@@ -149,8 +149,10 @@ t/s decode, 620 t/s prefill on this card) is the reference
 and top-1 87.2 % on the CPU, 0.2941 / 87.1 % served on the B60, against
 UD-Q3_K_XL's 0.1002 / 93.3 %. The 2-bit quant misses the answer-level bar;
 the engine adds nothing to it. The IQ3_XXS of the same series (0.2211 / 89.7 %)
-misses it too, and serves at 3.7 t/s: 10 of its layers carry IQ2_XS gate/up
-experts, which the expert cache does not take (no OpenCL kq kernel for IQ2_XS).
+misses it too. 10 of its layers carry IQ2_XS gate/up experts, which the
+expert cache took only with `contrib/llama.cpp` 0030: before it, those layers
+ran on the CPU and the answer decoded at 3.7 t/s; with it, at 27.6-28.0 t/s
+warm (13,000 MiB of slots, MTP 2), KL as served 0.2180, equal to the CPU's.
 
 **The expert cache** (`--llama-expert-cache MIB --llama-expert-profile FILE`
 with `--llama-cpu-moe 48`; `contrib/llama.cpp` 0021 and 0022). The hot

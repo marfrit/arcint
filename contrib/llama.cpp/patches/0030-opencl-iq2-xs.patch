@@ -1,0 +1,653 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index c157f3f..14f0020 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1025,19 +1025,19 @@ struct ggml_backend_opencl_context {
+     int       kq_quantize_sg = 0;   // > 0: kernel_kq_quantize_q8_1 is the sub-group kernel of that size
+     // per type, ggml_cl_kq_type_index: Q4_K, Q5_K, Q6_K (mul_mv_kq_q8_1.cl),
+     // IQ3_XXS, IQ4_XS, IQ4_NL, and the low-bit types IQ2_XXS, IQ2_S, IQ1_M,
+-    // Q2_0, IQ3_S (mul_mv_iq_q8_1.cl); [columns - 1][type], one build per
+-    // column count, 1 to 4
+-    cl_kernel kernel_mul_mv_kq_q8_1[4][11] = {};
+-    cl_kernel kernel_mul_mv_id_kq_q8_1[11] = {};
++    // Q2_0, IQ3_S, IQ2_XS (mul_mv_iq_q8_1.cl); [columns - 1][type], one build
++    // per column count, 1 to 4
++    cl_kernel kernel_mul_mv_kq_q8_1[4][12] = {};
++    cl_kernel kernel_mul_mv_id_kq_q8_1[12] = {};
+     // Intel: F16 (and BF16, stored as F16) weights times 2-8 columns, each
+     // weight row read once (mul_mv_iq_q8_1.cl, kernel_mul_mv_f16_f32_nc)
+     cl_kernel kernel_mul_mv_f16_f32_nc = nullptr;
+     cl_kernel kernel_mul_mv_f16_f32_ksplit = nullptr;   // few rows, long K
+     cl_kernel kernel_mul_mv_f16_f32_ksplit4 = nullptr;  // the same, 4 rows a work-group (a hyper-connection's down)
+-    // MUL_MAT_ID grouped by expert for 2-15 tokens (IQ and low-bit types, index 3-10)
+-    cl_kernel kernel_mul_mv_idg_kq_q8_1[11] = {};
+-    // MUL_MAT_ID grouped by expert from kernel_moe_pair_groups (the low-bit types, index 6-10)
+-    cl_kernel kernel_mul_mv_idgg_kq_q8_1[11] = {};
++    // MUL_MAT_ID grouped by expert for 2-15 tokens (IQ and low-bit types, index 3-11)
++    cl_kernel kernel_mul_mv_idg_kq_q8_1[12] = {};
++    // MUL_MAT_ID grouped by expert from kernel_moe_pair_groups (the low-bit types, index 6-11)
++    cl_kernel kernel_mul_mv_idgg_kq_q8_1[12] = {};
+     cl_kernel kernel_moe_pair_groups = nullptr;
+     ggml_cl_buffer prealloc_pair_grp, prealloc_pair_ngrp;
+     const ggml_tensor * pair_grp_t = nullptr; int pair_grp_split = 0;
+@@ -1076,12 +1076,12 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_mul_mm_kq2d[3] = {};
+     int       kq2d_tm = 64, kq2d_wg = 16;
+     int       kq2d_tm_t[3] = { 64, 64, 64 }, kq2d_wg_t[3] = { 16, 16, 16 };   // per type (GGML_OPENCL_KQ_2D_T<i>)
+-    cl_kernel kernel_mul_mm_kq_f16[11]    = {};
++    cl_kernel kernel_mul_mm_kq_f16[12]    = {};
+     cl_kernel kernel_mul_mm_f16w_f16      = nullptr;   // F16 / BF16 weights on the XMX tiles
+-    cl_kernel kernel_mul_mm_id_kq_f16[11] = {};
++    cl_kernel kernel_mul_mm_id_kq_f16[12] = {};
+     // MUL_MAT_ID with the tokens as the DPAS a operand (kernel_mul_mm_id2_*):
+     // KQ_ID2_XT pairs x KQ_ID2_XSG sub-groups of rows per work-group
+-    cl_kernel kernel_mul_mm_id2_kq_f16[11] = {};   // null past index 5: the low-bit types have none
++    cl_kernel kernel_mul_mm_id2_kq_f16[12] = {};   // null past index 5: the low-bit types have none
+     int       kq_id2_xt = 32, kq_id2_xsg = 16;
+     // the route in prealloc_kq_pairs / _tiles / _ntiles: a MoE layer's gate,
+     // up and down share their ids tensor, so it is computed once a layer
+@@ -2328,12 +2328,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                 const std::string iq_src = read_file("mul_mv_iq_q8_1.cl");
+ #endif
+                 // type index 3 + i
+-                const char * iq_n[8]    = { "kernel_mul_mv_iq3_xxs_q8_1", "kernel_mul_mv_iq4_xs_q8_1", "kernel_mul_mv_iq4_nl_q8_1",
++                const char * iq_n[9]    = { "kernel_mul_mv_iq3_xxs_q8_1", "kernel_mul_mv_iq4_xs_q8_1", "kernel_mul_mv_iq4_nl_q8_1",
+                                             "kernel_mul_mv_iq2_xxs_q8_1", "kernel_mul_mv_iq2_s_q8_1", "kernel_mul_mv_iq1_m_q8_1",
+-                                            "kernel_mul_mv_q2_0_q8_1", "kernel_mul_mv_iq3_s_q8_1" };
+-                const char * iq_id_n[8] = { "kernel_mul_mv_id_iq3_xxs_q8_1", "kernel_mul_mv_id_iq4_xs_q8_1", "kernel_mul_mv_id_iq4_nl_q8_1",
++                                            "kernel_mul_mv_q2_0_q8_1", "kernel_mul_mv_iq3_s_q8_1", "kernel_mul_mv_iq2_xs_q8_1" };
++                const char * iq_id_n[9] = { "kernel_mul_mv_id_iq3_xxs_q8_1", "kernel_mul_mv_id_iq4_xs_q8_1", "kernel_mul_mv_id_iq4_nl_q8_1",
+                                             "kernel_mul_mv_id_iq2_xxs_q8_1", "kernel_mul_mv_id_iq2_s_q8_1", "kernel_mul_mv_id_iq1_m_q8_1",
+-                                            "kernel_mul_mv_id_q2_0_q8_1", "kernel_mul_mv_id_iq3_s_q8_1" };
++                                            "kernel_mul_mv_id_q2_0_q8_1", "kernel_mul_mv_id_iq3_s_q8_1", "kernel_mul_mv_id_iq2_xs_q8_1" };
+                 // GGML_OPENCL_IQ_OPTS: defines added to these builds (measurement)
+                 const char * iq_opts_env = getenv("GGML_OPENCL_IQ_OPTS");
+                 const std::string iq_extra_opts = iq_opts_env != nullptr ? std::string(" ") + iq_opts_env : std::string();
+@@ -2346,7 +2346,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         GGML_LOG_WARN("ggml_opencl: IQ matvec for %d column(s) not built; IQ weights go to the CPU\n", nc);
+                         continue;
+                     }
+-                    for (int i = 0; i < 8; ++i) {
++                    for (int i = 0; i < 9; ++i) {
+                         CL_CHECK((backend_ctx->kernel_mul_mv_kq_q8_1[nc - 1][3 + i] = clCreateKernel(prog, iq_n[i], &err), err));
+                         if (nc == 1) {
+                             CL_CHECK((backend_ctx->kernel_mul_mv_id_kq_q8_1[3 + i] = clCreateKernel(prog, iq_id_n[i], &err), err));
+@@ -2364,7 +2364,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         CL_CHECK((backend_ctx->kernel_dsv4_hc_post = clCreateKernel(prog, "kernel_dsv4_hc_post", &err), err));
+                         CL_CHECK((backend_ctx->kernel_topk_moe = clCreateKernel(prog, "kernel_topk_moe_softmax_norm", &err), err));
+                         CL_CHECK((backend_ctx->kernel_scale_act = clCreateKernel(prog, "kernel_scale_act_f32", &err), err));
+-                        for (int i = 0; i < 8; ++i) {
++                        for (int i = 0; i < 9; ++i) {
+                             std::string g = iq_id_n[i];
+                             g.replace(g.find("_id_"), 4, "_idg_");
+                             CL_CHECK((backend_ctx->kernel_mul_mv_idg_kq_q8_1[3 + i] = clCreateKernel(prog, g.c_str(), &err), err));
+@@ -2606,14 +2606,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         }
+                     }
+                 }
+-                const char * mm_n[11] = { "kernel_mul_mm_q4_K_f16", "kernel_mul_mm_q5_K_f16", "kernel_mul_mm_q6_K_f16",
++                const char * mm_n[12] = { "kernel_mul_mm_q4_K_f16", "kernel_mul_mm_q5_K_f16", "kernel_mul_mm_q6_K_f16",
+                                           "kernel_mul_mm_iq3_xxs_f16", "kernel_mul_mm_iq4_xs_f16", "kernel_mul_mm_iq4_nl_f16",
+                                           "kernel_mul_mm_iq2_xxs_f16", "kernel_mul_mm_iq2_s_f16", "kernel_mul_mm_iq1_m_f16",
+-                                          "kernel_mul_mm_q2_0_f16", "kernel_mul_mm_iq3_s_f16" };
+-                const char * id_n[11] = { "kernel_mul_mm_id_q4_K_f16", "kernel_mul_mm_id_q5_K_f16", "kernel_mul_mm_id_q6_K_f16",
++                                          "kernel_mul_mm_q2_0_f16", "kernel_mul_mm_iq3_s_f16", "kernel_mul_mm_iq2_xs_f16" };
++                const char * id_n[12] = { "kernel_mul_mm_id_q4_K_f16", "kernel_mul_mm_id_q5_K_f16", "kernel_mul_mm_id_q6_K_f16",
+                                           "kernel_mul_mm_id_iq3_xxs_f16", "kernel_mul_mm_id_iq4_xs_f16", "kernel_mul_mm_id_iq4_nl_f16",
+                                           "kernel_mul_mm_id_iq2_xxs_f16", "kernel_mul_mm_id_iq2_s_f16", "kernel_mul_mm_id_iq1_m_f16",
+-                                          "kernel_mul_mm_id_q2_0_f16", "kernel_mul_mm_id_iq3_s_f16" };
++                                          "kernel_mul_mm_id_q2_0_f16", "kernel_mul_mm_id_iq3_s_f16", "kernel_mul_mm_id_iq2_xs_f16" };
+                 // the tokens-as-a MUL_MAT_ID kernel: pairs per tile, sub-groups per
+                 // work-group, 32 x 16 on SG 8 (measured-here, the coder's prefill on
+                 // an A770: 32 x 16, 32 x 32 and 16 x 32 within 3 %, 64 x 16 1.7x
+@@ -2653,7 +2653,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         }
+                     }
+                     if (backend_ctx->kernel_kq_cvt_f32_f16 != nullptr) {
+-                        for (int i = 0; i < 11; ++i) {
++                        for (int i = 0; i < 12; ++i) {
+                             cl_kernel & k = pass == 0 ? backend_ctx->kernel_mul_mm_kq_f16[i] : backend_ctx->kernel_mul_mm_id_kq_f16[i];
+                             CL_CHECK((k = clCreateKernel(mm_prog, pass == 0 ? mm_n[i] : id_n[i], &err), err));
+                             if (pass == 1 && i < 6) {   // the low-bit types have no tokens-as-a kernel
+@@ -11302,7 +11302,7 @@ static cl_mem ggml_cl_create_temp_download_buffer(
+ 
+ // USM host buffers: bytes by memcpy; IQ4_NL whole tensors split into scales
+ // and quants (as kernel_convert_block_iq4_nl lays them out), each 128-aligned
+-// patch 0022: the low-bit types IQ2_XXS, IQ2_S, Q2_0 and IQ3_S live on the card
++// patch 0022: the low-bit types IQ2_XXS, IQ2_S, Q2_0 and IQ3_S (and IQ2_XS, 0030) live on the card
+ // in planes, per weight slice (one 2-D matrix: an expert): each field of every
+ // block back to back (mul_mv_iq_q8_1.cl, lb_expand), so a lane reads aligned
+ // 32-bit words. A slice keeps its size and place, so slot / bank copies and
+@@ -11311,6 +11311,7 @@ struct ggml_cl_lb_field { int off, size; };
+ static int ggml_cl_lb_fields(ggml_type t, ggml_cl_lb_field f[5]) {
+     switch (t) {
+         case GGML_TYPE_IQ2_XXS: f[0] = { 0, 2 }; f[1] = { 2, 64 }; return 2;
++        case GGML_TYPE_IQ2_XS:  f[0] = { 0, 2 }; f[1] = { 2, 64 }; f[2] = { 66, 8 }; return 3;
+         case GGML_TYPE_IQ2_S:   f[0] = { 0, 2 }; f[1] = { 2, 32 }; f[2] = { 34, 32 }; f[3] = { 66, 8 }; f[4] = { 74, 8 }; return 5;
+         case GGML_TYPE_Q2_0:    f[0] = { 0, 2 }; f[1] = { 2, 16 }; return 2;
+         case GGML_TYPE_IQ3_S:   f[0] = { 0, 2 }; f[1] = { 2, 64 }; f[2] = { 66, 8 }; f[3] = { 74, 32 }; f[4] = { 106, 4 }; return 5;
+@@ -25583,7 +25584,7 @@ static cl_ulong     g_kq_pf_n16 = 0;
+ // the low-bit types
+ static bool ggml_cl_kq_as_stored(ggml_type t) {
+     return t == GGML_TYPE_IQ3_XXS || t == GGML_TYPE_IQ4_XS || t == GGML_TYPE_IQ2_XXS || t == GGML_TYPE_IQ2_S ||
+-           t == GGML_TYPE_IQ1_M || t == GGML_TYPE_Q2_0 || t == GGML_TYPE_IQ3_S;
++           t == GGML_TYPE_IQ1_M || t == GGML_TYPE_Q2_0 || t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ2_XS;
+ }
+ 
+ static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, cl_uint & a) {
+@@ -25664,6 +25665,7 @@ static int ggml_cl_kq_type_index(ggml_type t) {
+         case GGML_TYPE_IQ1_M:   return 8;
+         case GGML_TYPE_Q2_0:    return 9;
+         case GGML_TYPE_IQ3_S:   return 10;
++        case GGML_TYPE_IQ2_XS:  return 11;
+         default:                return -1;
+     }
+ }
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
+index 7fdfc0b..d381314 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
+@@ -577,6 +577,138 @@ constant ulong iq2xxs_grid[256] = {
+     0x2b2b082b08080808UL, 0x2b2b190808192b08UL, 0x2b2b2b0819190808UL, 0x2b2b2b1908081908UL,
+ };
+ 
++// IQ2_XS: 512 grid entries of 8 unsigned bytes (ggml-common.h iq2xs_grid)
++constant ulong iq2xs_grid[512] = {
++    0x0808080808080808UL, 0x080808080808082bUL, 0x0808080808081919UL, 0x0808080808082b08UL,
++    0x0808080808082b2bUL, 0x0808080808190819UL, 0x0808080808191908UL, 0x080808080819192bUL,
++    0x0808080808192b19UL, 0x08080808082b0808UL, 0x08080808082b082bUL, 0x08080808082b1919UL,
++    0x08080808082b2b08UL, 0x0808080819080819UL, 0x0808080819081908UL, 0x080808081908192bUL,
++    0x0808080819082b19UL, 0x0808080819190808UL, 0x080808081919082bUL, 0x0808080819191919UL,
++    0x0808080819192b08UL, 0x08080808192b0819UL, 0x08080808192b1908UL, 0x080808082b080808UL,
++    0x080808082b08082bUL, 0x080808082b081919UL, 0x080808082b082b08UL, 0x080808082b190819UL,
++    0x080808082b191908UL, 0x080808082b192b19UL, 0x080808082b2b0808UL, 0x0808081908080819UL,
++    0x0808081908081908UL, 0x080808190808192bUL, 0x0808081908082b19UL, 0x0808081908190808UL,
++    0x080808190819082bUL, 0x0808081908191919UL, 0x0808081908192b08UL, 0x0808081908192b2bUL,
++    0x08080819082b0819UL, 0x08080819082b1908UL, 0x0808081919080808UL, 0x080808191908082bUL,
++    0x0808081919081919UL, 0x0808081919082b08UL, 0x0808081919190819UL, 0x0808081919191908UL,
++    0x08080819192b0808UL, 0x08080819192b2b08UL, 0x080808192b080819UL, 0x080808192b081908UL,
++    0x080808192b190808UL, 0x0808082b08080808UL, 0x0808082b0808082bUL, 0x0808082b08081919UL,
++    0x0808082b08082b08UL, 0x0808082b08190819UL, 0x0808082b08191908UL, 0x0808082b082b0808UL,
++    0x0808082b19080819UL, 0x0808082b19081908UL, 0x0808082b19190808UL, 0x0808082b19191919UL,
++    0x0808082b2b080808UL, 0x0808082b2b082b2bUL, 0x0808190808080819UL, 0x0808190808081908UL,
++    0x080819080808192bUL, 0x0808190808082b19UL, 0x0808190808190808UL, 0x080819080819082bUL,
++    0x0808190808191919UL, 0x0808190808192b08UL, 0x08081908082b0819UL, 0x08081908082b1908UL,
++    0x0808190819080808UL, 0x080819081908082bUL, 0x0808190819081919UL, 0x0808190819082b08UL,
++    0x0808190819190819UL, 0x0808190819191908UL, 0x080819081919192bUL, 0x08081908192b0808UL,
++    0x080819082b080819UL, 0x080819082b081908UL, 0x080819082b190808UL, 0x0808191908080808UL,
++    0x080819190808082bUL, 0x0808191908081919UL, 0x0808191908082b08UL, 0x0808191908190819UL,
++    0x0808191908191908UL, 0x08081919082b0808UL, 0x0808191919080819UL, 0x0808191919081908UL,
++    0x0808191919190808UL, 0x08081919192b0819UL, 0x080819192b080808UL, 0x0808192b08080819UL,
++    0x0808192b08081908UL, 0x0808192b08190808UL, 0x0808192b082b192bUL, 0x0808192b19080808UL,
++    0x0808192b1908082bUL, 0x0808192b2b081908UL, 0x08082b0808080808UL, 0x08082b080808082bUL,
++    0x08082b0808081919UL, 0x08082b0808082b08UL, 0x08082b0808082b2bUL, 0x08082b0808190819UL,
++    0x08082b0808191908UL, 0x08082b08082b0808UL, 0x08082b08082b1919UL, 0x08082b0819080819UL,
++    0x08082b0819081908UL, 0x08082b0819190808UL, 0x08082b0819192b08UL, 0x08082b082b080808UL,
++    0x08082b082b2b0808UL, 0x08082b082b2b2b2bUL, 0x08082b1908080819UL, 0x08082b1908081908UL,
++    0x08082b1908190808UL, 0x08082b1919080808UL, 0x08082b192b080819UL, 0x08082b192b082b19UL,
++    0x08082b2b08080808UL, 0x08082b2b082b0808UL, 0x08082b2b082b2b08UL, 0x08082b2b2b19192bUL,
++    0x08082b2b2b2b0808UL, 0x0819080808080819UL, 0x0819080808081908UL, 0x081908080808192bUL,
++    0x0819080808082b19UL, 0x0819080808190808UL, 0x081908080819082bUL, 0x0819080808191919UL,
++    0x0819080808192b08UL, 0x08190808082b0819UL, 0x08190808082b1908UL, 0x0819080819080808UL,
++    0x081908081908082bUL, 0x0819080819081919UL, 0x0819080819082b08UL, 0x0819080819190819UL,
++    0x0819080819191908UL, 0x08190808192b0808UL, 0x08190808192b2b2bUL, 0x081908082b080819UL,
++    0x081908082b081908UL, 0x081908082b190808UL, 0x0819081908080808UL, 0x081908190808082bUL,
++    0x0819081908081919UL, 0x0819081908082b08UL, 0x0819081908190819UL, 0x0819081908191908UL,
++    0x08190819082b0808UL, 0x0819081919080819UL, 0x0819081919081908UL, 0x0819081919190808UL,
++    0x081908192b080808UL, 0x081908192b191908UL, 0x081908192b19192bUL, 0x0819082b08080819UL,
++    0x0819082b08081908UL, 0x0819082b0808192bUL, 0x0819082b08190808UL, 0x0819082b19080808UL,
++    0x0819082b192b0808UL, 0x0819190808080808UL, 0x081919080808082bUL, 0x0819190808081919UL,
++    0x0819190808082b08UL, 0x0819190808190819UL, 0x0819190808191908UL, 0x08191908082b0808UL,
++    0x0819190819080819UL, 0x0819190819081908UL, 0x0819190819082b19UL, 0x0819190819190808UL,
++    0x08191908192b1908UL, 0x081919082b080808UL, 0x0819191908080819UL, 0x0819191908081908UL,
++    0x0819191908190808UL, 0x0819191919080808UL, 0x0819192b08080808UL, 0x0819192b08191908UL,
++    0x0819192b19082b19UL, 0x08192b0808080819UL, 0x08192b0808081908UL, 0x08192b0808190808UL,
++    0x08192b080819082bUL, 0x08192b0819080808UL, 0x08192b0819191908UL, 0x08192b082b08192bUL,
++    0x08192b1908080808UL, 0x08192b1908081919UL, 0x08192b19192b192bUL, 0x08192b2b19190819UL,
++    0x08192b2b2b2b2b19UL, 0x082b080808080808UL, 0x082b08080808082bUL, 0x082b080808081919UL,
++    0x082b080808082b08UL, 0x082b080808082b2bUL, 0x082b080808190819UL, 0x082b080808191908UL,
++    0x082b0808082b0808UL, 0x082b080819080819UL, 0x082b080819081908UL, 0x082b080819190808UL,
++    0x082b08082b080808UL, 0x082b08082b2b0808UL, 0x082b081908080819UL, 0x082b081908081908UL,
++    0x082b081908190808UL, 0x082b081919080808UL, 0x082b081919082b08UL, 0x082b0819192b1919UL,
++    0x082b082b08080808UL, 0x082b082b082b082bUL, 0x082b082b2b080808UL, 0x082b082b2b2b2b08UL,
++    0x082b190808080819UL, 0x082b190808081908UL, 0x082b190808190808UL, 0x082b1908082b2b19UL,
++    0x082b190819080808UL, 0x082b191908080808UL, 0x082b191919080819UL, 0x082b19191919082bUL,
++    0x082b19192b192b19UL, 0x082b192b08080819UL, 0x082b192b08192b2bUL, 0x082b192b2b2b192bUL,
++    0x082b2b0808080808UL, 0x082b2b0808082b08UL, 0x082b2b0808082b2bUL, 0x082b2b08082b0808UL,
++    0x082b2b0819191919UL, 0x082b2b082b082b08UL, 0x082b2b082b2b082bUL, 0x082b2b19192b2b08UL,
++    0x082b2b192b190808UL, 0x082b2b2b08082b08UL, 0x082b2b2b082b0808UL, 0x082b2b2b2b08082bUL,
++    0x082b2b2b2b082b08UL, 0x082b2b2b2b082b2bUL, 0x1908080808080819UL, 0x1908080808081908UL,
++    0x190808080808192bUL, 0x1908080808082b19UL, 0x1908080808190808UL, 0x190808080819082bUL,
++    0x1908080808191919UL, 0x1908080808192b08UL, 0x19080808082b0819UL, 0x19080808082b1908UL,
++    0x1908080819080808UL, 0x190808081908082bUL, 0x1908080819081919UL, 0x1908080819082b08UL,
++    0x1908080819082b2bUL, 0x1908080819190819UL, 0x1908080819191908UL, 0x19080808192b0808UL,
++    0x19080808192b1919UL, 0x190808082b080819UL, 0x190808082b081908UL, 0x190808082b190808UL,
++    0x1908081908080808UL, 0x190808190808082bUL, 0x1908081908081919UL, 0x1908081908082b08UL,
++    0x1908081908190819UL, 0x1908081908191908UL, 0x19080819082b0808UL, 0x1908081919080819UL,
++    0x1908081919081908UL, 0x1908081919190808UL, 0x190808192b080808UL, 0x190808192b081919UL,
++    0x190808192b2b082bUL, 0x1908082b08080819UL, 0x1908082b08081908UL, 0x1908082b08190808UL,
++    0x1908082b0819082bUL, 0x1908082b082b2b19UL, 0x1908082b19080808UL, 0x1908190808080808UL,
++    0x190819080808082bUL, 0x1908190808081919UL, 0x1908190808082b08UL, 0x1908190808190819UL,
++    0x1908190808191908UL, 0x1908190808192b19UL, 0x19081908082b0808UL, 0x1908190819080819UL,
++    0x1908190819081908UL, 0x1908190819190808UL, 0x190819082b080808UL, 0x190819082b191908UL,
++    0x1908191908080819UL, 0x1908191908081908UL, 0x1908191908190808UL, 0x19081919082b1908UL,
++    0x1908191919080808UL, 0x190819192b192b2bUL, 0x1908192b08080808UL, 0x1908192b08082b2bUL,
++    0x1908192b19081908UL, 0x1908192b19190808UL, 0x19082b0808080819UL, 0x19082b0808081908UL,
++    0x19082b0808190808UL, 0x19082b0819080808UL, 0x19082b0819081919UL, 0x19082b0819191908UL,
++    0x19082b08192b082bUL, 0x19082b1908080808UL, 0x19082b1908190819UL, 0x19082b1919081908UL,
++    0x19082b1919190808UL, 0x19082b19192b2b19UL, 0x19082b2b08081908UL, 0x1919080808080808UL,
++    0x191908080808082bUL, 0x1919080808081919UL, 0x1919080808082b08UL, 0x1919080808190819UL,
++    0x1919080808191908UL, 0x19190808082b0808UL, 0x19190808082b2b08UL, 0x1919080819080819UL,
++    0x1919080819081908UL, 0x1919080819190808UL, 0x191908082b080808UL, 0x1919081908080819UL,
++    0x1919081908081908UL, 0x1919081908190808UL, 0x1919081908191919UL, 0x1919081919080808UL,
++    0x191908191908082bUL, 0x1919082b08080808UL, 0x1919082b19081908UL, 0x1919082b2b2b2b2bUL,
++    0x1919190808080819UL, 0x1919190808081908UL, 0x1919190808190808UL, 0x19191908082b0819UL,
++    0x1919190819080808UL, 0x19191908192b0808UL, 0x191919082b080819UL, 0x191919082b2b0819UL,
++    0x1919191908080808UL, 0x1919191908082b08UL, 0x191919192b080808UL, 0x191919192b082b08UL,
++    0x1919192b082b0819UL, 0x1919192b192b2b08UL, 0x1919192b2b2b0819UL, 0x19192b0808080808UL,
++    0x19192b0808191908UL, 0x19192b0819080819UL, 0x19192b0819190808UL, 0x19192b082b192b19UL,
++    0x19192b1908192b2bUL, 0x19192b1919080808UL, 0x19192b191908082bUL, 0x19192b2b2b081919UL,
++    0x192b080808080819UL, 0x192b080808081908UL, 0x192b080808190808UL, 0x192b080819080808UL,
++    0x192b080819191908UL, 0x192b0808192b082bUL, 0x192b08082b08192bUL, 0x192b08082b2b2b19UL,
++    0x192b081908080808UL, 0x192b082b082b1908UL, 0x192b082b19082b2bUL, 0x192b082b2b19082bUL,
++    0x192b190808080808UL, 0x192b19080819192bUL, 0x192b191908190808UL, 0x192b191919080808UL,
++    0x192b191919081919UL, 0x192b19192b2b1908UL, 0x192b2b0808080819UL, 0x192b2b08192b2b2bUL,
++    0x192b2b19082b1919UL, 0x192b2b2b0808192bUL, 0x192b2b2b19191908UL, 0x192b2b2b192b082bUL,
++    0x2b08080808080808UL, 0x2b0808080808082bUL, 0x2b08080808081919UL, 0x2b08080808082b08UL,
++    0x2b08080808190819UL, 0x2b08080808191908UL, 0x2b080808082b0808UL, 0x2b080808082b2b2bUL,
++    0x2b08080819080819UL, 0x2b08080819081908UL, 0x2b08080819190808UL, 0x2b0808082b080808UL,
++    0x2b0808082b08082bUL, 0x2b0808082b2b2b08UL, 0x2b0808082b2b2b2bUL, 0x2b08081908080819UL,
++    0x2b08081908081908UL, 0x2b0808190808192bUL, 0x2b08081908190808UL, 0x2b08081919080808UL,
++    0x2b08081919190819UL, 0x2b08081919192b19UL, 0x2b08082b08080808UL, 0x2b08082b082b0808UL,
++    0x2b08082b2b080808UL, 0x2b08082b2b08082bUL, 0x2b08082b2b2b0808UL, 0x2b08082b2b2b2b08UL,
++    0x2b08190808080819UL, 0x2b08190808081908UL, 0x2b08190808190808UL, 0x2b0819080819082bUL,
++    0x2b08190808191919UL, 0x2b08190819080808UL, 0x2b081908192b0808UL, 0x2b0819082b082b19UL,
++    0x2b08191908080808UL, 0x2b08191919081908UL, 0x2b0819192b2b1919UL, 0x2b08192b08192b08UL,
++    0x2b08192b192b2b2bUL, 0x2b082b0808080808UL, 0x2b082b0808082b08UL, 0x2b082b08082b1919UL,
++    0x2b082b0819192b2bUL, 0x2b082b082b080808UL, 0x2b082b082b08082bUL, 0x2b082b082b2b2b08UL,
++    0x2b082b190808192bUL, 0x2b082b2b082b082bUL, 0x2b082b2b2b080808UL, 0x2b082b2b2b082b08UL,
++    0x2b082b2b2b19192bUL, 0x2b082b2b2b2b2b08UL, 0x2b19080808080819UL, 0x2b19080808081908UL,
++    0x2b19080808190808UL, 0x2b19080819080808UL, 0x2b1908081919192bUL, 0x2b1908082b081908UL,
++    0x2b19081908080808UL, 0x2b190819082b082bUL, 0x2b190819192b1908UL, 0x2b19082b1919192bUL,
++    0x2b19082b2b082b19UL, 0x2b19190808080808UL, 0x2b19190808081919UL, 0x2b19190819081908UL,
++    0x2b19190819190808UL, 0x2b19190819192b08UL, 0x2b191919082b2b19UL, 0x2b1919192b190808UL,
++    0x2b1919192b19082bUL, 0x2b19192b19080819UL, 0x2b192b0819190819UL, 0x2b192b082b2b192bUL,
++    0x2b192b1919082b19UL, 0x2b192b2b08191919UL, 0x2b192b2b192b0808UL, 0x2b2b080808080808UL,
++    0x2b2b08080808082bUL, 0x2b2b080808082b08UL, 0x2b2b080808082b2bUL, 0x2b2b0808082b0808UL,
++    0x2b2b0808082b2b2bUL, 0x2b2b08082b2b0808UL, 0x2b2b081919190819UL, 0x2b2b081919192b19UL,
++    0x2b2b08192b2b192bUL, 0x2b2b082b08080808UL, 0x2b2b082b0808082bUL, 0x2b2b082b08082b08UL,
++    0x2b2b082b082b2b2bUL, 0x2b2b082b2b080808UL, 0x2b2b082b2b2b0808UL, 0x2b2b190819080808UL,
++    0x2b2b19082b191919UL, 0x2b2b192b192b1919UL, 0x2b2b192b2b192b08UL, 0x2b2b2b0808082b2bUL,
++    0x2b2b2b08082b0808UL, 0x2b2b2b08082b082bUL, 0x2b2b2b08082b2b08UL, 0x2b2b2b082b2b0808UL,
++    0x2b2b2b082b2b2b08UL, 0x2b2b2b1908081908UL, 0x2b2b2b192b081908UL, 0x2b2b2b192b08192bUL,
++    0x2b2b2b2b082b2b08UL, 0x2b2b2b2b082b2b2bUL, 0x2b2b2b2b2b190819UL, 0x2b2b2b2b2b2b2b2bUL,
++};
++
+ constant ulong iq2s_grid[1024] = {
+     0x0808080808080808UL, 0x080808080808082bUL, 0x0808080808081919UL, 0x0808080808082b08UL,
+     0x0808080808082b2bUL, 0x0808080808190819UL, 0x0808080808191908UL, 0x080808080819192bUL,
+@@ -1483,7 +1615,7 @@ constant uint iq3s_grid[512] = {
+ };
+ 
+ // ---- the low-bit types of the ISTA-DASLab GSQ-RCO files (patch 0022): kq type
+-// index 6 IQ2_XXS, 7 IQ2_S, 8 IQ1_M, 9 Q2_0, 10 IQ3_S, blocks as stored.
++// index 6 IQ2_XXS, 7 IQ2_S, 8 IQ1_M, 9 Q2_0, 10 IQ3_S, 11 IQ2_XS, blocks as stored.
+ // A 32-weight sub-block j32 of a row expands to its signed int8 values w[8]
+ // (weights 4i .. 4i+3 in w[i]) and two scales, s0 for weights 0..15 and s1
+ // for 16..31 (equal unless the type scales half sub-blocks: IQ2_S, IQ1_M).
+@@ -1491,7 +1623,7 @@ constant uint iq3s_grid[512] = {
+ // its scales carry the 1/8. After ggml-quants.c's dequantize_row_*. ----
+ 
+ // bytes per block, 32-weight sub-blocks per block
+-#define LB_BYTES(T) ((T) == 6 ? 66 : (T) == 7 ? 82 : (T) == 8 ? 56 : (T) == 9 ? 18 : 110)
++#define LB_BYTES(T) ((T) == 6 ? 66 : (T) == 7 ? 82 : (T) == 8 ? 56 : (T) == 9 ? 18 : (T) == 11 ? 74 : 110)
+ #define LB_SUBS(T)  ((T) == 9 ? 2 : 8)
+ #define LB_ROW_BYTES(T, n32) ((ulong)((n32) / LB_SUBS(T)) * LB_BYTES(T))
+ 
+@@ -1519,8 +1651,11 @@ static inline uint lb_u32(global const uchar * p) {
+ #define LB_GRID_XXS(i) LB_TAB2(iq2xxs_grid, (i))
+ #define LB_SIGNS_XXS(i) LB_TAB2(ksigns64, (i))
+ #define LB_GRID_1M(i) LB_TAB2(iq1s_grid, (i))
++#define LB_GRID_XS(i) LB_TAB2(iq2xs_grid, (i))
++#define LB_SIGNS_XS(i) LB_TAB2(ksigns64, (i))
+ // A low-bit slice (one weight matrix, nblk blocks) is kept in planes on the
+-// card (ggml-opencl's ggml_cl_lb_planes): IQ2_XXS d | qs[64]; IQ2_S d | qs[32]
++// card (ggml-opencl's ggml_cl_lb_planes): IQ2_XXS d | qs[64]; IQ2_XS d | qs[64] |
++// scales[8]; IQ2_S d | qs[32]
+ // | signs[32] | qh[8] | scales[8]; Q2_0 d | qs[16]; IQ3_S d | qs[64] | qh[8] |
+ // signs[32] | scales[4], each field of every block back to back, so a lane's
+ // sub-block fields are aligned 32-bit words (the GGUF blocks of 18, 66, 82 or
+@@ -1540,6 +1675,20 @@ static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk,
+             w[2 * l + 1] = lb_sgn4(g.s1, m.s1);
+         }
+         *s0 = *s1 = d * (0.5f + (float)(a1 >> 28)) * 0.25f;
++    } else if (TYPE == 11) {  // IQ2_XS: a code is a 9-bit grid index and a 7-bit sign index
++        const float d = vload_half(bi, (global const half *)S);
++        const uint2 a = vload2(bi * 8 + p, (global const uint *)(S + nblk * 2));
++        const uint qv[4] = { a.s0 & 0xFFFF, a.s0 >> 16, a.s1 & 0xFFFF, a.s1 >> 16 };
++        const uint sc = S[nblk * 66 + bi * 8 + p];
++        #pragma unroll
++        for (int l = 0; l < 4; ++l) {
++            const uint2 g = LB_GRID_XS(qv[l] & 511);
++            const uint2 m = LB_SIGNS_XS(qv[l] >> 9);
++            w[2 * l]     = lb_sgn4(g.s0, m.s0);
++            w[2 * l + 1] = lb_sgn4(g.s1, m.s1);
++        }
++        *s0 = d * (0.5f + (float)(sc & 0xF)) * 0.25f;
++        *s1 = d * (0.5f + (float)(sc >> 4)) * 0.25f;
+     } else if (TYPE == 7) {   // IQ2_S
+         const float d = vload_half(bi, (global const half *)S);
+         const uint qw = ((global const uint *)(S + nblk * 2))[bi * 8 + p];
+@@ -2058,6 +2207,18 @@ kernel void kernel_mul_mm_id_iq3_s_f16(global const uchar * q, ulong offq, globa
+     MM_BODY(deq_lb(10, wt, q + offq, wrow0, row0, ne01, ne00 / 32, ib))
+ }
+ 
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_mul_mm_iq2_xs_f16(global const uchar * q, ulong offq, global const half * dp, PLAIN_ARGS) {
++    PLAIN_COLS
++    MM_BODY(deq_lb(11, wt, q + offq, wrow0, row0, ne01, ne00 / 32, ib))
++}
++
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_mul_mm_id_iq2_xs_f16(global const uchar * q, ulong offq, global const half * dp, ID_ARGS) {
++    ID_COLS
++    MM_BODY(deq_lb(11, wt, q + offq, wrow0, row0, ne01, ne00 / 32, ib))
++}
++
+ // ---- MUL_MAT_ID with the tokens as the a operand (the shape of arcint's
+ // OpenVINO patch 0064): a work-group takes up to XT pairs of one expert (a
+ // tile of kernel_moe_route_tiles) and XSG * SG weight rows, one row per lane.
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
+index 3ba84e1..57fa793 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
+@@ -162,6 +162,138 @@ constant ulong iq2xxs_grid[256] = {
+     0x2b2b082b08080808UL, 0x2b2b190808192b08UL, 0x2b2b2b0819190808UL, 0x2b2b2b1908081908UL,
+ };
+ 
++// IQ2_XS: 512 grid entries of 8 unsigned bytes (ggml-common.h iq2xs_grid)
++constant ulong iq2xs_grid[512] = {
++    0x0808080808080808UL, 0x080808080808082bUL, 0x0808080808081919UL, 0x0808080808082b08UL,
++    0x0808080808082b2bUL, 0x0808080808190819UL, 0x0808080808191908UL, 0x080808080819192bUL,
++    0x0808080808192b19UL, 0x08080808082b0808UL, 0x08080808082b082bUL, 0x08080808082b1919UL,
++    0x08080808082b2b08UL, 0x0808080819080819UL, 0x0808080819081908UL, 0x080808081908192bUL,
++    0x0808080819082b19UL, 0x0808080819190808UL, 0x080808081919082bUL, 0x0808080819191919UL,
++    0x0808080819192b08UL, 0x08080808192b0819UL, 0x08080808192b1908UL, 0x080808082b080808UL,
++    0x080808082b08082bUL, 0x080808082b081919UL, 0x080808082b082b08UL, 0x080808082b190819UL,
++    0x080808082b191908UL, 0x080808082b192b19UL, 0x080808082b2b0808UL, 0x0808081908080819UL,
++    0x0808081908081908UL, 0x080808190808192bUL, 0x0808081908082b19UL, 0x0808081908190808UL,
++    0x080808190819082bUL, 0x0808081908191919UL, 0x0808081908192b08UL, 0x0808081908192b2bUL,
++    0x08080819082b0819UL, 0x08080819082b1908UL, 0x0808081919080808UL, 0x080808191908082bUL,
++    0x0808081919081919UL, 0x0808081919082b08UL, 0x0808081919190819UL, 0x0808081919191908UL,
++    0x08080819192b0808UL, 0x08080819192b2b08UL, 0x080808192b080819UL, 0x080808192b081908UL,
++    0x080808192b190808UL, 0x0808082b08080808UL, 0x0808082b0808082bUL, 0x0808082b08081919UL,
++    0x0808082b08082b08UL, 0x0808082b08190819UL, 0x0808082b08191908UL, 0x0808082b082b0808UL,
++    0x0808082b19080819UL, 0x0808082b19081908UL, 0x0808082b19190808UL, 0x0808082b19191919UL,
++    0x0808082b2b080808UL, 0x0808082b2b082b2bUL, 0x0808190808080819UL, 0x0808190808081908UL,
++    0x080819080808192bUL, 0x0808190808082b19UL, 0x0808190808190808UL, 0x080819080819082bUL,
++    0x0808190808191919UL, 0x0808190808192b08UL, 0x08081908082b0819UL, 0x08081908082b1908UL,
++    0x0808190819080808UL, 0x080819081908082bUL, 0x0808190819081919UL, 0x0808190819082b08UL,
++    0x0808190819190819UL, 0x0808190819191908UL, 0x080819081919192bUL, 0x08081908192b0808UL,
++    0x080819082b080819UL, 0x080819082b081908UL, 0x080819082b190808UL, 0x0808191908080808UL,
++    0x080819190808082bUL, 0x0808191908081919UL, 0x0808191908082b08UL, 0x0808191908190819UL,
++    0x0808191908191908UL, 0x08081919082b0808UL, 0x0808191919080819UL, 0x0808191919081908UL,
++    0x0808191919190808UL, 0x08081919192b0819UL, 0x080819192b080808UL, 0x0808192b08080819UL,
++    0x0808192b08081908UL, 0x0808192b08190808UL, 0x0808192b082b192bUL, 0x0808192b19080808UL,
++    0x0808192b1908082bUL, 0x0808192b2b081908UL, 0x08082b0808080808UL, 0x08082b080808082bUL,
++    0x08082b0808081919UL, 0x08082b0808082b08UL, 0x08082b0808082b2bUL, 0x08082b0808190819UL,
++    0x08082b0808191908UL, 0x08082b08082b0808UL, 0x08082b08082b1919UL, 0x08082b0819080819UL,
++    0x08082b0819081908UL, 0x08082b0819190808UL, 0x08082b0819192b08UL, 0x08082b082b080808UL,
++    0x08082b082b2b0808UL, 0x08082b082b2b2b2bUL, 0x08082b1908080819UL, 0x08082b1908081908UL,
++    0x08082b1908190808UL, 0x08082b1919080808UL, 0x08082b192b080819UL, 0x08082b192b082b19UL,
++    0x08082b2b08080808UL, 0x08082b2b082b0808UL, 0x08082b2b082b2b08UL, 0x08082b2b2b19192bUL,
++    0x08082b2b2b2b0808UL, 0x0819080808080819UL, 0x0819080808081908UL, 0x081908080808192bUL,
++    0x0819080808082b19UL, 0x0819080808190808UL, 0x081908080819082bUL, 0x0819080808191919UL,
++    0x0819080808192b08UL, 0x08190808082b0819UL, 0x08190808082b1908UL, 0x0819080819080808UL,
++    0x081908081908082bUL, 0x0819080819081919UL, 0x0819080819082b08UL, 0x0819080819190819UL,
++    0x0819080819191908UL, 0x08190808192b0808UL, 0x08190808192b2b2bUL, 0x081908082b080819UL,
++    0x081908082b081908UL, 0x081908082b190808UL, 0x0819081908080808UL, 0x081908190808082bUL,
++    0x0819081908081919UL, 0x0819081908082b08UL, 0x0819081908190819UL, 0x0819081908191908UL,
++    0x08190819082b0808UL, 0x0819081919080819UL, 0x0819081919081908UL, 0x0819081919190808UL,
++    0x081908192b080808UL, 0x081908192b191908UL, 0x081908192b19192bUL, 0x0819082b08080819UL,
++    0x0819082b08081908UL, 0x0819082b0808192bUL, 0x0819082b08190808UL, 0x0819082b19080808UL,
++    0x0819082b192b0808UL, 0x0819190808080808UL, 0x081919080808082bUL, 0x0819190808081919UL,
++    0x0819190808082b08UL, 0x0819190808190819UL, 0x0819190808191908UL, 0x08191908082b0808UL,
++    0x0819190819080819UL, 0x0819190819081908UL, 0x0819190819082b19UL, 0x0819190819190808UL,
++    0x08191908192b1908UL, 0x081919082b080808UL, 0x0819191908080819UL, 0x0819191908081908UL,
++    0x0819191908190808UL, 0x0819191919080808UL, 0x0819192b08080808UL, 0x0819192b08191908UL,
++    0x0819192b19082b19UL, 0x08192b0808080819UL, 0x08192b0808081908UL, 0x08192b0808190808UL,
++    0x08192b080819082bUL, 0x08192b0819080808UL, 0x08192b0819191908UL, 0x08192b082b08192bUL,
++    0x08192b1908080808UL, 0x08192b1908081919UL, 0x08192b19192b192bUL, 0x08192b2b19190819UL,
++    0x08192b2b2b2b2b19UL, 0x082b080808080808UL, 0x082b08080808082bUL, 0x082b080808081919UL,
++    0x082b080808082b08UL, 0x082b080808082b2bUL, 0x082b080808190819UL, 0x082b080808191908UL,
++    0x082b0808082b0808UL, 0x082b080819080819UL, 0x082b080819081908UL, 0x082b080819190808UL,
++    0x082b08082b080808UL, 0x082b08082b2b0808UL, 0x082b081908080819UL, 0x082b081908081908UL,
++    0x082b081908190808UL, 0x082b081919080808UL, 0x082b081919082b08UL, 0x082b0819192b1919UL,
++    0x082b082b08080808UL, 0x082b082b082b082bUL, 0x082b082b2b080808UL, 0x082b082b2b2b2b08UL,
++    0x082b190808080819UL, 0x082b190808081908UL, 0x082b190808190808UL, 0x082b1908082b2b19UL,
++    0x082b190819080808UL, 0x082b191908080808UL, 0x082b191919080819UL, 0x082b19191919082bUL,
++    0x082b19192b192b19UL, 0x082b192b08080819UL, 0x082b192b08192b2bUL, 0x082b192b2b2b192bUL,
++    0x082b2b0808080808UL, 0x082b2b0808082b08UL, 0x082b2b0808082b2bUL, 0x082b2b08082b0808UL,
++    0x082b2b0819191919UL, 0x082b2b082b082b08UL, 0x082b2b082b2b082bUL, 0x082b2b19192b2b08UL,
++    0x082b2b192b190808UL, 0x082b2b2b08082b08UL, 0x082b2b2b082b0808UL, 0x082b2b2b2b08082bUL,
++    0x082b2b2b2b082b08UL, 0x082b2b2b2b082b2bUL, 0x1908080808080819UL, 0x1908080808081908UL,
++    0x190808080808192bUL, 0x1908080808082b19UL, 0x1908080808190808UL, 0x190808080819082bUL,
++    0x1908080808191919UL, 0x1908080808192b08UL, 0x19080808082b0819UL, 0x19080808082b1908UL,
++    0x1908080819080808UL, 0x190808081908082bUL, 0x1908080819081919UL, 0x1908080819082b08UL,
++    0x1908080819082b2bUL, 0x1908080819190819UL, 0x1908080819191908UL, 0x19080808192b0808UL,
++    0x19080808192b1919UL, 0x190808082b080819UL, 0x190808082b081908UL, 0x190808082b190808UL,
++    0x1908081908080808UL, 0x190808190808082bUL, 0x1908081908081919UL, 0x1908081908082b08UL,
++    0x1908081908190819UL, 0x1908081908191908UL, 0x19080819082b0808UL, 0x1908081919080819UL,
++    0x1908081919081908UL, 0x1908081919190808UL, 0x190808192b080808UL, 0x190808192b081919UL,
++    0x190808192b2b082bUL, 0x1908082b08080819UL, 0x1908082b08081908UL, 0x1908082b08190808UL,
++    0x1908082b0819082bUL, 0x1908082b082b2b19UL, 0x1908082b19080808UL, 0x1908190808080808UL,
++    0x190819080808082bUL, 0x1908190808081919UL, 0x1908190808082b08UL, 0x1908190808190819UL,
++    0x1908190808191908UL, 0x1908190808192b19UL, 0x19081908082b0808UL, 0x1908190819080819UL,
++    0x1908190819081908UL, 0x1908190819190808UL, 0x190819082b080808UL, 0x190819082b191908UL,
++    0x1908191908080819UL, 0x1908191908081908UL, 0x1908191908190808UL, 0x19081919082b1908UL,
++    0x1908191919080808UL, 0x190819192b192b2bUL, 0x1908192b08080808UL, 0x1908192b08082b2bUL,
++    0x1908192b19081908UL, 0x1908192b19190808UL, 0x19082b0808080819UL, 0x19082b0808081908UL,
++    0x19082b0808190808UL, 0x19082b0819080808UL, 0x19082b0819081919UL, 0x19082b0819191908UL,
++    0x19082b08192b082bUL, 0x19082b1908080808UL, 0x19082b1908190819UL, 0x19082b1919081908UL,
++    0x19082b1919190808UL, 0x19082b19192b2b19UL, 0x19082b2b08081908UL, 0x1919080808080808UL,
++    0x191908080808082bUL, 0x1919080808081919UL, 0x1919080808082b08UL, 0x1919080808190819UL,
++    0x1919080808191908UL, 0x19190808082b0808UL, 0x19190808082b2b08UL, 0x1919080819080819UL,
++    0x1919080819081908UL, 0x1919080819190808UL, 0x191908082b080808UL, 0x1919081908080819UL,
++    0x1919081908081908UL, 0x1919081908190808UL, 0x1919081908191919UL, 0x1919081919080808UL,
++    0x191908191908082bUL, 0x1919082b08080808UL, 0x1919082b19081908UL, 0x1919082b2b2b2b2bUL,
++    0x1919190808080819UL, 0x1919190808081908UL, 0x1919190808190808UL, 0x19191908082b0819UL,
++    0x1919190819080808UL, 0x19191908192b0808UL, 0x191919082b080819UL, 0x191919082b2b0819UL,
++    0x1919191908080808UL, 0x1919191908082b08UL, 0x191919192b080808UL, 0x191919192b082b08UL,
++    0x1919192b082b0819UL, 0x1919192b192b2b08UL, 0x1919192b2b2b0819UL, 0x19192b0808080808UL,
++    0x19192b0808191908UL, 0x19192b0819080819UL, 0x19192b0819190808UL, 0x19192b082b192b19UL,
++    0x19192b1908192b2bUL, 0x19192b1919080808UL, 0x19192b191908082bUL, 0x19192b2b2b081919UL,
++    0x192b080808080819UL, 0x192b080808081908UL, 0x192b080808190808UL, 0x192b080819080808UL,
++    0x192b080819191908UL, 0x192b0808192b082bUL, 0x192b08082b08192bUL, 0x192b08082b2b2b19UL,
++    0x192b081908080808UL, 0x192b082b082b1908UL, 0x192b082b19082b2bUL, 0x192b082b2b19082bUL,
++    0x192b190808080808UL, 0x192b19080819192bUL, 0x192b191908190808UL, 0x192b191919080808UL,
++    0x192b191919081919UL, 0x192b19192b2b1908UL, 0x192b2b0808080819UL, 0x192b2b08192b2b2bUL,
++    0x192b2b19082b1919UL, 0x192b2b2b0808192bUL, 0x192b2b2b19191908UL, 0x192b2b2b192b082bUL,
++    0x2b08080808080808UL, 0x2b0808080808082bUL, 0x2b08080808081919UL, 0x2b08080808082b08UL,
++    0x2b08080808190819UL, 0x2b08080808191908UL, 0x2b080808082b0808UL, 0x2b080808082b2b2bUL,
++    0x2b08080819080819UL, 0x2b08080819081908UL, 0x2b08080819190808UL, 0x2b0808082b080808UL,
++    0x2b0808082b08082bUL, 0x2b0808082b2b2b08UL, 0x2b0808082b2b2b2bUL, 0x2b08081908080819UL,
++    0x2b08081908081908UL, 0x2b0808190808192bUL, 0x2b08081908190808UL, 0x2b08081919080808UL,
++    0x2b08081919190819UL, 0x2b08081919192b19UL, 0x2b08082b08080808UL, 0x2b08082b082b0808UL,
++    0x2b08082b2b080808UL, 0x2b08082b2b08082bUL, 0x2b08082b2b2b0808UL, 0x2b08082b2b2b2b08UL,
++    0x2b08190808080819UL, 0x2b08190808081908UL, 0x2b08190808190808UL, 0x2b0819080819082bUL,
++    0x2b08190808191919UL, 0x2b08190819080808UL, 0x2b081908192b0808UL, 0x2b0819082b082b19UL,
++    0x2b08191908080808UL, 0x2b08191919081908UL, 0x2b0819192b2b1919UL, 0x2b08192b08192b08UL,
++    0x2b08192b192b2b2bUL, 0x2b082b0808080808UL, 0x2b082b0808082b08UL, 0x2b082b08082b1919UL,
++    0x2b082b0819192b2bUL, 0x2b082b082b080808UL, 0x2b082b082b08082bUL, 0x2b082b082b2b2b08UL,
++    0x2b082b190808192bUL, 0x2b082b2b082b082bUL, 0x2b082b2b2b080808UL, 0x2b082b2b2b082b08UL,
++    0x2b082b2b2b19192bUL, 0x2b082b2b2b2b2b08UL, 0x2b19080808080819UL, 0x2b19080808081908UL,
++    0x2b19080808190808UL, 0x2b19080819080808UL, 0x2b1908081919192bUL, 0x2b1908082b081908UL,
++    0x2b19081908080808UL, 0x2b190819082b082bUL, 0x2b190819192b1908UL, 0x2b19082b1919192bUL,
++    0x2b19082b2b082b19UL, 0x2b19190808080808UL, 0x2b19190808081919UL, 0x2b19190819081908UL,
++    0x2b19190819190808UL, 0x2b19190819192b08UL, 0x2b191919082b2b19UL, 0x2b1919192b190808UL,
++    0x2b1919192b19082bUL, 0x2b19192b19080819UL, 0x2b192b0819190819UL, 0x2b192b082b2b192bUL,
++    0x2b192b1919082b19UL, 0x2b192b2b08191919UL, 0x2b192b2b192b0808UL, 0x2b2b080808080808UL,
++    0x2b2b08080808082bUL, 0x2b2b080808082b08UL, 0x2b2b080808082b2bUL, 0x2b2b0808082b0808UL,
++    0x2b2b0808082b2b2bUL, 0x2b2b08082b2b0808UL, 0x2b2b081919190819UL, 0x2b2b081919192b19UL,
++    0x2b2b08192b2b192bUL, 0x2b2b082b08080808UL, 0x2b2b082b0808082bUL, 0x2b2b082b08082b08UL,
++    0x2b2b082b082b2b2bUL, 0x2b2b082b2b080808UL, 0x2b2b082b2b2b0808UL, 0x2b2b190819080808UL,
++    0x2b2b19082b191919UL, 0x2b2b192b192b1919UL, 0x2b2b192b2b192b08UL, 0x2b2b2b0808082b2bUL,
++    0x2b2b2b08082b0808UL, 0x2b2b2b08082b082bUL, 0x2b2b2b08082b2b08UL, 0x2b2b2b082b2b0808UL,
++    0x2b2b2b082b2b2b08UL, 0x2b2b2b1908081908UL, 0x2b2b2b192b081908UL, 0x2b2b2b192b08192bUL,
++    0x2b2b2b2b082b2b08UL, 0x2b2b2b2b082b2b2bUL, 0x2b2b2b2b2b190819UL, 0x2b2b2b2b2b2b2b2bUL,
++};
++
+ constant ulong iq2s_grid[1024] = {
+     0x0808080808080808UL, 0x080808080808082bUL, 0x0808080808081919UL, 0x0808080808082b08UL,
+     0x0808080808082b2bUL, 0x0808080808190819UL, 0x0808080808191908UL, 0x080808080819192bUL,
+@@ -1076,7 +1208,7 @@ constant uint iq3s_grid[512] = {
+ // its scales carry the 1/8. After ggml-quants.c's dequantize_row_*. ----
+ 
+ // bytes per block, 32-weight sub-blocks per block
+-#define LB_BYTES(T) ((T) == 6 ? 66 : (T) == 7 ? 82 : (T) == 8 ? 56 : (T) == 9 ? 18 : 110)
++#define LB_BYTES(T) ((T) == 6 ? 66 : (T) == 7 ? 82 : (T) == 8 ? 56 : (T) == 9 ? 18 : (T) == 11 ? 74 : 110)
+ #define LB_SUBS(T)  ((T) == 9 ? 2 : 8)
+ #define LB_ROW_BYTES(T, n32) ((ulong)((n32) / LB_SUBS(T)) * LB_BYTES(T))
+ 
+@@ -1104,8 +1236,11 @@ static inline uint lb_u32(global const uchar * p) {
+ #define LB_GRID_XXS(i) vload2((i), lt)
+ #define LB_SIGNS_XXS(i) vload2(256 + (i), lt)
+ #define LB_GRID_1M(i) vload2((i), lt)
++#define LB_GRID_XS(i) vload2((i), lt)
++#define LB_SIGNS_XS(i) vload2(512 + (i), lt)
+ // A low-bit slice (one weight matrix, nblk blocks) is kept in planes on the
+-// card (ggml-opencl's ggml_cl_lb_planes): IQ2_XXS d | qs[64]; IQ2_S d | qs[32]
++// card (ggml-opencl's ggml_cl_lb_planes): IQ2_XXS d | qs[64]; IQ2_XS d | qs[64] |
++// scales[8]; IQ2_S d | qs[32]
+ // | signs[32] | qh[8] | scales[8]; Q2_0 d | qs[16]; IQ3_S d | qs[64] | qh[8] |
+ // signs[32] | scales[4], each field of every block back to back, so a lane's
+ // sub-block fields are aligned 32-bit words (the GGUF blocks of 18, 66, 82 or
+@@ -1125,6 +1260,20 @@ static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk,
+             w[2 * l + 1] = lb_sgn4(g.s1, m.s1);
+         }
+         *s0 = *s1 = d * (0.5f + (float)(a1 >> 28)) * 0.25f;
++    } else if (TYPE == 11) {  // IQ2_XS: a code is a 9-bit grid index and a 7-bit sign index
++        const float d = vload_half(bi, (global const half *)S);
++        const uint2 a = vload2(bi * 8 + p, (global const uint *)(S + nblk * 2));
++        const uint qv[4] = { a.s0 & 0xFFFF, a.s0 >> 16, a.s1 & 0xFFFF, a.s1 >> 16 };
++        const uint sc = S[nblk * 66 + bi * 8 + p];
++        #pragma unroll
++        for (int l = 0; l < 4; ++l) {
++            const uint2 g = LB_GRID_XS(qv[l] & 511);
++            const uint2 m = LB_SIGNS_XS(qv[l] >> 9);
++            w[2 * l]     = lb_sgn4(g.s0, m.s0);
++            w[2 * l + 1] = lb_sgn4(g.s1, m.s1);
++        }
++        *s0 = d * (0.5f + (float)(sc & 0xF)) * 0.25f;
++        *s1 = d * (0.5f + (float)(sc >> 4)) * 0.25f;
+     } else if (TYPE == 7) {   // IQ2_S
+         const float d = vload_half(bi, (global const half *)S);
+         const uint qw = ((global const uint *)(S + nblk * 2))[bi * 8 + p];
+@@ -1467,9 +1616,9 @@ static inline void mv_iq(const int TYPE, global const uchar * q, global const ha
+ // up its own entries, and gathers from constant memory measured 74 GB/s
+ // against 200 for the IQ4 types (A770).
+ // the local table's size in 64-bit words, per type: IQ3_XXS's signs, or a
+-// low-bit grid (IQ2_XXS + signs, IQ2_S, IQ1_M, IQ3_S); the IQ4 types 128
++// low-bit grid (IQ2_XXS or IQ2_XS + signs, IQ1_M); the IQ4 types 128
+ // IQ2_S and IQ3_S keep constant grids (a local copy per work-group cost more: 146 -> 245, 255 -> 335 us, B60)
+-#define LB_LT_ULONGS(T) ((T) == 8 ? 2048 : (T) == 6 ? 384 : 128)
++#define LB_LT_ULONGS(T) ((T) == 8 ? 2048 : (T) == 11 ? 640 : (T) == 6 ? 384 : 128)
+ #define LOCAL_TABLES(TYPE)                                                                     \
+     local uint  lgrid[256];                                                                    \
+     local ulong lsigns[LB_LT_ULONGS(TYPE)];   /* IQ3_XXS's signs, or a low-bit grid */       \
+@@ -1486,12 +1635,17 @@ static inline void mv_iq(const int TYPE, global const uchar * q, global const ha
+                 const ulong v_ = i_ < 256 ? iq2xxs_grid[i_] : ksigns64[i_ - 256];              \
+                 lt_[2 * i_] = (uint)v_; lt_[2 * i_ + 1] = (uint)(v_ >> 32);                    \
+             }                                                                                  \
++        } else if ((TYPE) == 11) {                                                             \
++            for (int i_ = lid_; i_ < 640; i_ += lsz_) {                                        \
++                const ulong v_ = i_ < 512 ? iq2xs_grid[i_] : ksigns64[i_ - 512];               \
++                lt_[2 * i_] = (uint)v_; lt_[2 * i_ + 1] = (uint)(v_ >> 32);                    \
++            }                                                                                  \
+         } else if ((TYPE) == 8) {                                                              \
+             for (int i_ = lid_; i_ < 2048; i_ += lsz_) {                                       \
+                 const ulong v_ = iq1s_grid[i_]; lt_[2 * i_] = (uint)v_; lt_[2 * i_ + 1] = (uint)(v_ >> 32); \
+             }                                                                                  \
+         }                                                                                      \
+-        if ((TYPE) == 0 || (TYPE) == 6 || (TYPE) == 8) barrier(CLK_LOCAL_MEM_FENCE);                          \
++        if ((TYPE) == 0 || (TYPE) == 6 || (TYPE) == 8 || (TYPE) == 11) barrier(CLK_LOCAL_MEM_FENCE);                          \
+     }
+ 
+ // row byte strides of the blocked types: IQ3_XXS nb*98, IQ4_XS nb*136
+@@ -1532,6 +1686,7 @@ MV_KERNEL(kernel_mul_mv_iq2_s_q8_1, 7)
+ MV_KERNEL(kernel_mul_mv_iq1_m_q8_1, 8)
+ MV_KERNEL(kernel_mul_mv_q2_0_q8_1, 9)
+ MV_KERNEL(kernel_mul_mv_iq3_s_q8_1, 10)
++MV_KERNEL(kernel_mul_mv_iq2_xs_q8_1, 11)
+ 
+ // ---- MUL_MAT_ID (NCOLS = 1 builds): pair k = get_group_id(2), slot
+ // i = k % n_used, token t = k / n_used; expert ids[t][i], column
+@@ -1667,6 +1822,7 @@ MV_ID_KERNEL(kernel_mul_mv_id_iq2_s_q8_1, 7)
+ MV_ID_KERNEL(kernel_mul_mv_id_iq1_m_q8_1, 8)
+ MV_ID_KERNEL(kernel_mul_mv_id_q2_0_q8_1, 9)
+ MV_ID_KERNEL(kernel_mul_mv_id_iq3_s_q8_1, 10)
++MV_ID_KERNEL(kernel_mul_mv_id_iq2_xs_q8_1, 11)
+ 
+ // ---- MUL_MAT_ID grouped by expert, the low-bit types (NCOLS = 1 builds): a
+ // work-group takes a block of rows of one expert and every entry routed to it
+@@ -1759,6 +1915,7 @@ MV_IDGG_KERNEL(kernel_mul_mv_idgg_iq2_s_q8_1, 7)
+ MV_IDGG_KERNEL(kernel_mul_mv_idgg_iq1_m_q8_1, 8)
+ MV_IDGG_KERNEL(kernel_mul_mv_idgg_q2_0_q8_1, 9)
+ MV_IDGG_KERNEL(kernel_mul_mv_idgg_iq3_s_q8_1, 10)
++MV_IDGG_KERNEL(kernel_mul_mv_idgg_iq2_xs_q8_1, 11)
+ 
+ // ---- F16 weights (BF16 is stored as F16 on the device) times 2 to 8 f32
+ // columns, as a verify window or an MTP step brings them: each weight row
+@@ -1992,6 +2149,7 @@ MV_IDG_KERNEL(kernel_mul_mv_idg_iq2_s_q8_1, 7)
+ MV_IDG_KERNEL(kernel_mul_mv_idg_iq1_m_q8_1, 8)
+ MV_IDG_KERNEL(kernel_mul_mv_idg_q2_0_q8_1, 9)
+ MV_IDG_KERNEL(kernel_mul_mv_idg_iq3_s_q8_1, 10)
++MV_IDG_KERNEL(kernel_mul_mv_idg_iq2_xs_q8_1, 11)
+ 
+ // ---- the DeepSeek-V4-style hyper-connection ops (GGML_OP_DSV4_HC_PRE /
+ // _POST, as ggml-sycl/dsv4-hc.cpp computes them): Qwen3.8-Flash-Next's mixers
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+index d5d4097..aba1b00 100644
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -175,10 +175,11 @@ static bool qualify(const llama_model & model, const llama_model_loader & ml, in
+     }
+     // the types whose kq kernels skip a pair (gate/up), or whose down
+     // projection takes the zero-entry tables (Q8_0)
+-    // and the low-bit types of patch 0022 (IQ2_XXS, IQ2_S, IQ1_M, Q2_0, IQ3_S)
++    // and the low-bit types of patches 0022 (IQ2_XXS, IQ2_S, IQ1_M, Q2_0, IQ3_S) and 0030 (IQ2_XS)
+     auto kq_skip = [](ggml_type ty) {
+         return ty == GGML_TYPE_IQ3_XXS || ty == GGML_TYPE_IQ4_XS || ty == GGML_TYPE_IQ4_NL || ty == GGML_TYPE_IQ2_XXS ||
+-               ty == GGML_TYPE_IQ2_S || ty == GGML_TYPE_IQ1_M || ty == GGML_TYPE_Q2_0 || ty == GGML_TYPE_IQ3_S;
++               ty == GGML_TYPE_IQ2_S || ty == GGML_TYPE_IQ1_M || ty == GGML_TYPE_Q2_0 || ty == GGML_TYPE_IQ3_S ||
++               ty == GGML_TYPE_IQ2_XS;
+     };
+     if (!kq_skip(t[0]->type) || !kq_skip(t[1]->type) || !(kq_skip(t[2]->type) || t[2]->type == GGML_TYPE_Q8_0)) {
+         if (warn) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index db758ec..e72b159 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10505,6 +10505,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // IQ2_XS (patch 0030): the gate / up experts of Flash-Next GSQ-RCO IQ3_XXS's IQ2_XS layers (2560 -> 640),
++    // through the matvec (1 token), the grouped paths (2-15) and the GEMM
++    for (int n : {1, 2, 3, 4, 8, 17, 64}) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 16, 4, false, 64, n, 2560));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 128, n, 2560, {1, 1}, {1, 1}));
++    }
++
+     for (ggml_type type_a : other_types) {
+         for (ggml_type type_b : {GGML_TYPE_F32}) {
+             if (ggml_blck_size(type_a) != 256) {
+@@ -11855,7 +11862,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+ 
+     // Qwen3.8-Flash-Next GSQ-RCO IQ2_XS: 512 experts, 10 used, gate/up 2560 -> 640, down 640 -> 2560; decode and a verify
+     for (int bs : {1, 3}) {
+-        for (ggml_type type_a : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_0}) {
++        for (ggml_type type_a : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_0, GGML_TYPE_IQ2_XS}) {
+             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, bs, 2560));
+             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, bs, 640));
+         }

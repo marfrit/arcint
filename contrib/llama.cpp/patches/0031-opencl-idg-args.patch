@@ -1,0 +1,80 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 14f0020..b7775cd 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -28631,7 +28631,9 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+         const char * nm = src0->name;
+         const size_t ln = strlen(nm);
+         const bool cache_t = (ln > 6 && strcmp(nm + ln - 6, ".slots") == 0) || (ln > 5 && strcmp(nm + ln - 5, ".bank") == 0);
+-        if (cache_t && gemm) {   // the matvec writes a skipped pair's zeros itself
++        // the per-pair matvec writes a skipped pair's zeros itself; the GEMM and the
++        // grouped matvec (GGML_OPENCL_KQ_IDG) drop the pair and leave its rows
++        if (cache_t && (gemm || idg)) {
+             const cl_float zero = 0.0f;
+             CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, extrad->data_device, &zero, sizeof(zero), offsetd, ggml_nbytes(dst), 0, NULL, NULL));
+         }
+@@ -28853,18 +28855,24 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+                 perm     = backend_ctx->prealloc_pair_perm.buffer;
+                 pf_first = pf ? backend_ctx->prealloc_pair_first.buffer : nullptr;
+             }
+-            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &perm));
+-            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &pf_first));
+-            if (pf && pf_first != nullptr) {
+-                CL_CHECK(backend_ctx->usm_set_arg_ptr(kernel, a++, g_kq_pf_src));
+-                CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &g_kq_pf_dst));
++            if (idg) {
++                // the grouped kernel takes the route's tiles instead (below) and
++                // copies nothing for the next projection
++                if (pf) backend_ctx->moe_pf = {};
+             } else {
+-                const cl_mem none = nullptr;
+-                CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &none));
+-                CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &none));
+-                if (pf) backend_ctx->moe_pf = {};   // no copy made: the next projection reads its misses where they lie
++                CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &perm));
++                CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &pf_first));
++                if (pf && pf_first != nullptr) {
++                    CL_CHECK(backend_ctx->usm_set_arg_ptr(kernel, a++, g_kq_pf_src));
++                    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &g_kq_pf_dst));
++                } else {
++                    const cl_mem none = nullptr;
++                    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &none));
++                    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &none));
++                    if (pf) backend_ctx->moe_pf = {};   // no copy made: the next projection reads its misses where they lie
++                }
++                CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &g_kq_pf_n16));
+             }
+-            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &g_kq_pf_n16));
+         }
+         const int rows_per_wg = backend_ctx->kq_q8_1_ndst * 4;
+         if (idg) {
+@@ -28895,13 +28903,8 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+             size_t r_local[1] = { 256 }, r_global[1] = { 256 };
+             backend_ctx->enqueue_ndrange_kernel(kr, 1, r_global, r_local, dst);
+             backend_ctx->kq_route.ids = nullptr;   // the GEMM's route cache no longer holds these buffers' contents
+-            if (g_kq_single_q == nullptr) {
+-                // an expert cache's two-branch graph routes -1 for the other
+-                // branch's pairs: the router drops them, their rows must read zero
+-                const float zero = 0.0f;
+-                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, extrad->data_device, &zero, sizeof(zero), offsetd,
+-                                             ggml_nbytes(dst), 0, NULL, NULL));
+-            }
++            // an expert cache's two-branch graph routes -1 for the other branch's
++            // pairs: the router drops them, and their rows were zeroed above
+             CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &pairs));
+             CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &tiles));
+             CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &ntiles));
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index e72b159..996da46 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10506,7 +10506,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     }
+ 
+     // IQ2_XS (patch 0030): the gate / up experts of Flash-Next GSQ-RCO IQ3_XXS's IQ2_XS layers (2560 -> 640),
+-    // through the matvec (1 token), the grouped paths (2-15) and the GEMM
++    // through the matvec (1 token), the per-pair matvec (2-15; the grouped kernels with GGML_OPENCL_KQ_IDG=1
++    // or GGML_OPENCL_KQ_GROUPED=1) and the GEMM
+     for (int n : {1, 2, 3, 4, 8, 17, 64}) {
+         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 16, 4, false, 64, n, 2560));
+         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 128, n, 2560, {1, 1}, {1, 1}));

@@ -1692,3 +1692,97 @@ Q4_K_M, q8_0 KV):
   answer on each at once, with the reuse fix): 21.6-21.7 t/s a lane, 43.3
   together, against 15.9 + 15.8 taking turns. One lane's text equals its
   run alone.
+
+## 0030-opencl-iq2-xs.patch
+
+Intel: IQ2_XS joins 0022's low-bit types as kernel type 11, so the expert
+cache takes it. The GSQ-RCO IQ3_XXS quant of Flash-Next carries IQ2_XS
+gate/up experts in 10 of its 48 layers (6 with Q2_0 down, 4 with IQ4_NL
+down). Without kernels for them, the cache refused those layers and their
+experts ran on the CPU. The 300-token answer decoded at 3.7 t/s.
+
+- **The type:** a 74-byte block is `d`, 32 codes of 16 bits and 8 scale
+  bytes. A code is a 9-bit index into the 512-entry `iq2xs_grid` and a
+  7-bit index into the sign table that IQ2_XXS already uses; a scale byte's
+  nibbles scale the sub-block's two halves, as with IQ2_S
+  (`dequantize_row_iq2_xs`).
+- **On the card** in planes, like the other low-bit types: `d | qs[64] |
+  scales[8]`.
+- **Tables:** the matvec reads the grid and the signs from local memory, as
+  IQ2_XXS does (640 entries). The GEMM reads them from constant memory.
+- **Kernels:** the matvec (1-4 columns), MUL_MAT_ID, the grouped paths
+  (`idg`, `idgg`) and the XMX GEMM (`mul_mm`, `mul_mm_id`).
+- **The expert cache's type filter** takes IQ2_XS.
+
+Measured (`measured-here`, 2026-10-09):
+
+- **`test-backend-ops`:**
+  - B60: MUL_MAT 1221/1221; MUL_MAT_ID 468/542, where the 74 failures are
+    the pin's own MXFP4 cases;
+  - A770: 542/542 and 1221/1221;
+  - the IQ2_XS cases run on the card (22 MUL_MAT_ID, before: not
+    supported), including Flash-Next's shape (2560 -> 640, 1-64 tokens);
+  - the red case: the sign index off by one fails MUL_MAT and MUL_MAT_ID
+    (ERR 1.0-1.4 against 5e-4);
+  - the grouped kernels run only when switched on. With
+    `GGML_OPENCL_KQ_GROUPED=1` the IQ2_XS cases pass 22/22 on both cards,
+    and the mutant fails 10 of them. `GGML_OPENCL_KQ_IDG=1` aborted for
+    every low-bit type; 0031 fixes that.
+- **Flash-Next IQ3_XXS served on the B60:** 13,000 MiB of slots, 32,768
+  context, MTP 2.
+  - all 48 layers cached (38 before);
+  - 7,814 slots on the card and a 27.43 GiB bank in host memory;
+  - the capital, the 20k needle and the long answer right;
+  - the 300-token answer decodes at 27.6-28.0 t/s from the second answer on,
+    against 3.7 t/s without the patch.
+  - The first long answer of a process is slower: 8.2-9.3 t/s after the
+    needle and 6.3 without it.
+    - Not xe eviction: the process's GTT stays at the bank's 28.1 GB and
+      VRAM at 21.7 GB with 2.7 GB free on the card (fdinfo every 0.5 s).
+    - The cache hits 86.8 % of decode's routed experts there and 93.5 %
+      from the second answer on. Missed experts run on the CPU; that this
+      costs the 3x is likely, not measured.
+- **KL as served** (16 x 512 against unsloth's Q8_0): 0.2180 nats, top-1
+  89.90 %. The CPU arm gives 0.2211 / 89.73 %, within the error bars.
+
+## 0031-opencl-idg-args.patch
+
+Intel: the opt-in grouped MUL_MAT_ID matvec (`GGML_OPENCL_KQ_IDG=1`, 2-15
+tokens, one read of an expert's weights for its tokens) aborted with
+`CL_INVALID_ARG_INDEX` for every low-bit type. The per-pair kernel's last
+arguments (the pair order, the next projection's prefetch) were also set on
+the grouped kernel, which takes the route's tiles in their place. Found in
+0030's review. The grouped branch now skips them and, like
+`GGML_OPENCL_KQ_GROUPED`, drops an armed prefetch (it copies nothing for the
+next projection). The default path is unchanged.
+
+Its review found a second defect on that path: with an expert cache, a
+9-15-token batch (a two-branch graph, ids -1 for the pairs the other branch
+serves) left those pairs' rows unwritten in the slot projection. The router
+drops a -1 pair; the per-pair kernel writes zeros for it, the grouped kernel
+does not. The zero fill there was keyed on the call (no single branch)
+instead of the tensor. It now covers every slot or bank tensor on the
+grouped path, as it does for the GEMM. test-backend-ops cannot reach this:
+it has no cache and no -1 ids.
+
+Measured (`measured-here`, 2026-10-09):
+
+- **KL as served**, Flash-Next IQ3_XXS on the B60 with 13,000 MiB of
+  slots, 2 x 512 tokens in ubatches of 12 against unsloth's Q8_0:
+
+  | arm | mean KL | top-1 |
+  |---|---|---|
+  | the default path, before | 0.218212 | 89.877 % |
+  | `GGML_OPENCL_KQ_IDG=1`, before the fix | 6.378638 | 28.333 % |
+  | `GGML_OPENCL_KQ_IDG=1`, with it | 0.217460 | 89.706 % |
+  | the default path, after | 0.218212 | 89.877 % |
+
+  The default path's values are the same before and after the fix.
+
+`test-backend-ops -o MUL_MAT_ID`:
+
+- **The red case:** before the patch, `GGML_OPENCL_KQ_IDG=1` aborts at the
+  first IQ2_XXS case.
+- **B60:** 468/542 with the switch, as without it; the 74 failures are the
+  pin's own MXFP4 cases.
+- **A770:** 542/542 both ways.

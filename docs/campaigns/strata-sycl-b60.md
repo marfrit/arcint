@@ -134,8 +134,16 @@ unsloth's Q8_0 on the CPU backend, 16 chunks of 512, reference PPL 1.8554):
   0022 has none for IQ2_XS), so their experts run on the CPU; 38 layers have
   7,620 slots (13.00 GiB) and a 19.81 GiB bank, and 90.9 % of decode's routed
   experts in those layers hit the card. That the 10 CPU layers cost the
-  decode is the likely cause, not measured. An IQ2_XS kq kernel would be
-  needed to serve this quant, for a quality still short of the bar.
+  decode is the likely cause, not measured.
+- **IQ3_XXS with llama.cpp 0030** (an IQ2_XS kernel set, `measured-here`,
+  2026-10-09, the same arm). All 48 layers are cached: 7,814 slots
+  (13.03 GiB) and a 27.43 GiB bank. The answers are right.
+  - The 300-token answer decodes at 27.6-28.0 t/s from the second answer
+    on. The first answer of a process runs at 6.3-9.3 t/s: the cache hits
+    86.8 % against 93.5 % warm, and xe evicts nothing (fdinfo).
+  - KL as served: 0.2180 / 89.90 %, equal to the CPU arm (0.2211 /
+    89.73 %): the kernels are faithful, and the quant is still short of
+    the bar against UD-Q3_K_XL (+0.118 nats, -3.4 points).
 - **The served arm of UD-Q3_K_XL** was killed by the host's OOM (its pinned
   expert bank is larger than data's RAM). The CPU arm measures the same
   quant.
