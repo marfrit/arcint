@@ -113,6 +113,7 @@ unsloth's Q8_0 on the CPU backend, 16 chunks of 512, reference PPL 1.8554):
 | UD-Q3_K_XL (CPU) | 0.1002 | 93.31 % | 1.042 |
 | IQ2_XS (CPU) | 0.2944 | 87.21 % | 1.140 |
 | IQ2_XS as served (B60, expert cache 9,500 MiB, `-ncmoe 48`) | 0.2941 | 87.08 % | 1.144 |
+| IQ3_XXS (ISTA-DASLab GSQ-RCO, CPU) | 0.2211 | 89.73 % | 1.070 |
 
 - **The bar:** IQ2_XS misses the answer-level bar against UD-Q3_K_XL by
   +0.194 nats and -6.2 points of top-1.
@@ -121,7 +122,20 @@ unsloth's Q8_0 on the CPU backend, 16 chunks of 512, reference PPL 1.8554):
 - **The quant's own record** (`paper` class): ISTA-DASLab report IQ2_XS
   about 4 points under BF16 on AIME25 / GPQA-D / LCB v6, and IQ3_XXS within
   0.6.
-- **Next:** the IQ3_XXS of the same series (75.8 GB), KL and speed.
+- **IQ3_XXS** (the same series, 75.8 GB): 0.073 nats and 2.5 points better
+  than IQ2_XS, and still short of the bar against UD-Q3_K_XL by +0.121 nats
+  and -3.6 points. It is a mixed quant: 10 of its 48 layers carry IQ2_XS
+  gate/up experts (6 with Q2_0 down, 4 with IQ4_NL down).
+- **IQ3_XXS served** (`measured-here`, 2026-10-09, B60, arcint 0.7.1,
+  expert cache 13,000 MiB, 32,768 ctx, MTP 2): the capital, the needle and
+  the long answer right; the 20,045-token needle prefills at 27.9 t/s, the
+  300-token answer decodes at 3.7 t/s. The 10 IQ2_XS layers are not cached
+  (`code`: the cache takes only types with an OpenCL kq kernel, and patch
+  0022 has none for IQ2_XS), so their experts run on the CPU; 38 layers have
+  7,620 slots (13.00 GiB) and a 19.81 GiB bank, and 90.9 % of decode's routed
+  experts in those layers hit the card. That the 10 CPU layers cost the
+  decode is the likely cause, not measured. An IQ2_XS kq kernel would be
+  needed to serve this quant, for a quality still short of the bar.
 - **The served arm of UD-Q3_K_XL** was killed by the host's OOM (its pinned
   expert bank is larger than data's RAM). The CPU arm measures the same
   quant.

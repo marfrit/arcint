@@ -148,7 +148,9 @@ t/s decode, 620 t/s prefill on this card) is the reference
 (2026-10-09, KL against unsloth's Q8_0 on the CPU, 16 x 512): IQ2_XS 0.2944 nats
 and top-1 87.2 % on the CPU, 0.2941 / 87.1 % served on the B60, against
 UD-Q3_K_XL's 0.1002 / 93.3 %. The 2-bit quant misses the answer-level bar;
-the engine adds nothing to it.
+the engine adds nothing to it. The IQ3_XXS of the same series (0.2211 / 89.7 %)
+misses it too, and serves at 3.7 t/s: 10 of its layers carry IQ2_XS gate/up
+experts, which the expert cache does not take (no OpenCL kq kernel for IQ2_XS).
 
 **The expert cache** (`--llama-expert-cache MIB --llama-expert-profile FILE`
 with `--llama-cpu-moe 48`; `contrib/llama.cpp` 0021 and 0022). The hot
