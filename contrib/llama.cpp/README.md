@@ -1835,3 +1835,34 @@ Measured (`measured-here`, 2026-10-10, B60, Flash-Next IQ2_XS,
   passes.
 - **VRAM:** a ring of 4 takes 4 x 187.7 MiB = 751 MiB. That is why it is
   opt-in until the served configurations are checked for eviction.
+- **Review** (an outside model, after the first push; fixed before the
+  measurements below):
+  - A slot now records the order index its last copy holds, and an
+    "issued ahead" tensor is read from its slot only if the slot still
+    holds it. Otherwise it gathers. The earlier check accepted any index
+    issued in the graph, which would have read another bank after a
+    deviation from the learnt order.
+  - The per-graph state resets on every graph (the backend's graph
+    counter), not only when the order's first tensor comes round.
+  - Each graph's copies wait for a marker of the main queue's work before
+    the graph. Decode's swaps rewrite bank entries on that queue, and the
+    copies' ordering against them had rested on host waits made for other
+    reasons.
+  - A tensor larger than the ring's slots gathers instead of being cut.
+  - A USM base that changed (a model reloaded in-process) relearns the
+    order.
+  - The main queue is flushed after the copies are issued.
+  - Not changed: the barrier still precedes the route and convert kernels,
+    not only the GEMM.
+- **After the fixes** (`measured-here`, 2026-10-10):
+  - KL with the stream on: 0.294050 / 87.083 %, unchanged; the red case
+    aborts.
+  - The deployed unit's configuration (9,500 MiB of slots, 131,072 ctx,
+    MTP 2), served needle: off 406.6 t/s, ring 4 **494.9 t/s (+21.7 %)**,
+    ring 2 392.9 t/s (one tensor of lookahead is not enough). Answers
+    right in every arm.
+  - Nothing evicted: GTT stays at the bank's 24,482 MiB. With a ring of 4,
+    VRAM peaks at 24,243 MiB against 23,448 off.
+  - These served arms ran inside the host's weekly backup window (loads of
+    ~15 min). Their decode figures (25.2 off, 22.7 / 23.0 on) are void
+    until re-measured outside it.
