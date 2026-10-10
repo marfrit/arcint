@@ -1786,3 +1786,52 @@ Measured (`measured-here`, 2026-10-09):
 - **B60:** 468/542 with the switch, as without it; the 74 failures are the
   pin's own MXFP4 cases.
 - **A770:** 542/542 both ways.
+
+## 0032-opencl-bank-stream.patch
+
+Intel, an expert cache's prefill, opt-in (`GGML_OPENCL_BANK_STREAM=1`).
+A prefill ubatch reads each layer's bank experts, those not in VRAM slots,
+from USM host memory. Until now a gather kernel copied the routed ones into
+a card-side mirror on the compute queue, ahead of each projection's GEMM:
+~0.83 s of a 2,048-token chunk's ~4 s of kernels on Flash-Next IQ2_XS, with
+the copy engine idle (2 % busy). This patch copies each bank tensor whole on
+a second in-order queue into a ring of VRAM slots, ahead of the GEMM that
+reads it. It follows Strata's prefill ring (`src/prefill/prefill.cpp:71-104`)
+and Infernix's expert stream: the copy engine works while the compute
+engine runs the earlier projections.
+
+- **The order:** the first prefill graph learns the order of its bank
+  tensors and gathers as before. From the next graph on, each bank tensor's
+  copy is queued `ring - 1` tensors ahead
+  (`GGML_OPENCL_BANK_STREAM_RING`, default 4).
+- **Events:** a GEMM waits for its copy; a copy waits for the GEMM that
+  last read its slot.
+- **Lookahead stays inside a graph.** Decode's swaps change the banks
+  between graphs.
+- **Not streamed:** IQ4_NL banks (scales and quants split) still gather.
+- **The slots' layout is the bank's,** as the gather's mirror's was, so the
+  GEMM reads them unchanged.
+- **Red switch:** `GGML_OPENCL_BANK_STREAM_RED=1` fills each slot from the
+  next bank tensor.
+
+Measured (`measured-here`, 2026-10-10, B60, Flash-Next IQ2_XS,
+13,000 MiB of slots):
+
+- **Overlap first.** A standalone probe: a 2 GiB USM-host-to-card copy on a
+  second queue (150 ms, 14.3 GB/s) ran entirely under a compute-bound or
+  memory-bound kernel on the first queue. The B70 recipe's trap (no overlap
+  within one process on Level Zero) does not apply on this OpenCL path.
+- **Served needle prefill, 20,045 tokens** (MTP 2, 32,768 ctx, one build):
+
+  | | prefill | compute engine | copy engine | answer |
+  |---|---|---|---|---|
+  | off | 416.1 t/s | 96 % | 2 % | right |
+  | on | 497.6 t/s | 95 % | 88 % | right |
+
+- **KL as served** (16 x 512 against unsloth's Q8_0, 141 bank tensors
+  streamed, the copy engine up to 94 % busy): 0.294050 / 87.083 %, the same
+  as off.
+- **The red case** aborts the run at the next synchronisation; it never
+  passes.
+- **VRAM:** a ring of 4 takes 4 x 187.7 MiB = 751 MiB. That is why it is
+  opt-in until the served configurations are checked for eviction.

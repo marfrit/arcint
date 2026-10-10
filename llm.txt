@@ -24,7 +24,7 @@ pinned OpenVINO nightly 71640275 with patches 0003-0074
 Flash-Next tier's opt-in switches MOE_CPU_TIER_ADAPTIVE and MOE_DOORBELL.
 Two engines: OpenVINO (default; Flash-Next, the coder's way back) and
 libllama (the agent and, since 2026-10-05, the coder service; --engine llama --gguf,
-llama.cpp bed0a85 with contrib/llama.cpp/patches 0001-0031, ggml's OpenCL
+llama.cpp bed0a85 with contrib/llama.cpp/patches 0001-0032, ggml's OpenCL
 backend). The libllama engine decodes faster with the GGUF's MTP head.
 --llama-kv q8_0 (or q8_0:q4_0) quantizes its KV cache on arcint's
 attention kernels (0015). With MTP and an 8:8 cache the dense model serves

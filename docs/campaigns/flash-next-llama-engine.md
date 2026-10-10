@@ -777,3 +777,26 @@ The levers from `research-b70-field.md`, tried on the B60. All
     say otherwise. Kernel timestamps from unitrace leave about half of the
     prefill's GPU time unattributed; use the backend's own event profiling
     or the engine counters for totals.
+- **Where a prefill chunk goes, counted fully** (`measured-here`, a
+  `GGML_OPENCL_PROFILING` build; per-kernel event times sum to ~4.0 s a
+  2,048-token graph, ~85 % of its wall time; unitrace covered about half):
+
+  | part | per chunk |
+  |---|---|
+  | the expert GEMMs (IQ2_S, Q2_0, IQ2_XXS, IQ1_M) | ~1.67 s (42 %) |
+  | the bank gathers | ~0.83 s (21 %) |
+  | the dense IQ4_XS / F16 products and conversions | ~0.63 s (16 %) |
+  | GDN, hyper-connections, norms | ~0.4 s |
+  | attention at depth 0 | ~0.06 s |
+
+  The expert GEMMs run ~9.7 TFLOP a chunk at ~5.8 TFLOPS, about a tenth of
+  the card's matrix throughput.
+- **The bank stream** (patch 0032, opt-in): the gathers move to the copy
+  engine, ahead of the GEMMs (Strata's prefill ring). Served needle prefill
+  416.1 -> 497.6 t/s, KL unchanged, the red case aborts.
+  - **Open:** eviction with the deployed slot budgets (+751 MiB at a ring
+    of 4); a ring of 2 or 3.
+  - **Next lever:** the expert GEMMs' efficiency. Strata's notes put its
+    Intel prompt path's bound in the dequant that feeds XMX; the B70
+    recipe's MoE kernel decodes in registers into DPAS operands, in 32-row
+    blocks.
