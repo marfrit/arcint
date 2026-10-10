@@ -756,3 +756,24 @@ The levers from `research-b70-field.md`, tried on the B60. All
   bandwidth. The A770 runs the same call in 26.7 us. The next decode step
   is a stall profile of that kernel (unitrace `VectorEngineStalls`), not
   the sign source.
+- **Is the GPU fed during prefill?** (`measured-here`, 2026-10-10; arcint
+  0.7.2 and llama-bench pp2048, 2,048-token ubatches)
+  - **The prefill graph** runs in two splits: the input and n-gram embedding
+    lookups on the CPU, then one OpenCL split. There is no CPU island
+    inside it (`GGML_SCHED_DEBUG=2`).
+  - **The host** (unitrace `-h`) enqueues a chunk's ~4,900 kernels in about
+    0.1 s (9 us a launch), then waits: the longest single
+    `clWaitForEvents` was 4.0 s. `perf` puts 71 % of the host's prefill
+    time in the driver's spin wait (`clock_gettime` and syscall entry), and
+    under 5 % in real work.
+  - **The card's own engine counters** (xe fdinfo `drm-cycles-ccs` against
+    `drm-total-cycles-ccs`, per second), served needle: the compute engine
+    97 % busy through the 47 s prefill (min 61 %), the copy engine 2 %.
+    During the 300-token decode: compute 91 %, copy 81 %.
+  - **Prefill is kernel-bound.** Host-side batching (Strata's recorded
+    graphs, the B70 recipe's async step) has nothing to win here.
+  - **A trap:** unitrace's device timing summed to about half a chunk's
+    wall time, which read like a GPU idle half the time. The engine counters
+    say otherwise. Kernel timestamps from unitrace leave about half of the
+    prefill's GPU time unattributed; use the backend's own event profiling
+    or the engine counters for totals.
