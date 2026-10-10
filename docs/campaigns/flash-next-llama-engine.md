@@ -706,3 +706,53 @@ kernels at window 21).
 
 `contrib/llama.cpp/patches/` (ggml-opencl kernels, later the expert tier);
 `src/exec/backend_llama.cpp` (placement flags).
+
+### Stage 5 — the B70 projects' tricks on the B60 (2026-10-10)
+
+The levers from `research-b70-field.md`, tried on the B60. All
+`measured-here`: Flash-Next IQ2_XS on the ext4 NVMe, 13,000 MiB of slots,
+32,768 ctx, MTP 2, fresh processes. Answers right in every arm.
+
+- **Larger prefill chunks** (sybil-solutions' recipe stages experts once per
+  8k chunk). arcint 0.7.2's `--prefill-chunk` (= the ubatch with the expert
+  cache), the 20,045-token needle:
+
+  | chunk | slots | prefill | peak VRAM | decode, 300 tokens |
+  |---|---|---|---|---|
+  | 2,048 | 13,000 | 422.1 | 21.2 GB | 28.2 |
+  | 4,096 | 13,000 | 443.9 | 22.2 GB | 29.8 |
+  | 8,192 | 13,000 | 435.0 | 24.3 GB | 30.5 |
+  | 8,192 | 11,500 | 432.4 | 22.8 GB | 27.5 |
+
+  GTT stayed at the bank: nothing was evicted. +3-5 % at most.
+  - arcint's prefill is not bound by expert ingestion or by small
+    per-expert matrices at 2,048 tokens, which is what the recipe's large
+    chunks fix.
+  - How this differs from the reference: the recipe stages experts from
+    NVMe; arcint's bank is already in pinned host memory, read in place by
+    the kernels.
+- **Sign masks in registers** for IQ2_XXS / IQ2_XS / IQ3_XXS (valarauca's
+  SYCL rework, `vecdotq.hpp:634-642`: `ksigns_iq2xs[i]` = the 7 bits plus
+  their parity, expanded to byte masks with ALU ops), against the table.
+  One build, `GGML_OPENCL_IQ_OPTS=-DLB_SIGNS_TABLE` selecting the table.
+  test-backend-ops passes both ways on both cards.
+  - **Kernels** (MUL_MAT_ID, Flash-Next's 512-expert / top-10 /
+    2560 -> 640 shape):
+
+    | kernel | B60, computed | B60, table | A770, computed | A770, table |
+    |---|---|---|---|---|
+    | IQ2_XXS, 1 token | 47.5 us | 40.5 | 27.5 | 26.7 |
+    | IQ2_XXS, 3 tokens | 114.9 us | 96.1 | 64.2 | 69.2 |
+    | IQ2_XS, 1 token | 48.5 us | 43.8 | 31.8 | 31.9 |
+
+  - **Served:** Flash-Next 26.3-28.0 / 34.3-34.9 t/s either way. The coder
+    (IQ3_XXS experts, A770) 33.5 / 42.1 t/s both ways, the text identical.
+  - **Not adopted.** How this differs from the reference: valarauca's table
+    sat in global memory, while arcint's is in local memory (0022), which
+    the computed masks do not beat. The table stays; the patch is kept on
+    the llama.cpp tree's branch `p0032-regsigns`, not in the series.
+- **What the kernel rates show instead:** the IQ2_XXS expert matvec reads
+  ~4.2 MB in 40.5 us at one token, ~104 GB/s, about a quarter of the card's
+  bandwidth. The A770 runs the same call in 26.7 us. The next decode step
+  is a stall profile of that kernel (unitrace `VectorEngineStalls`), not
+  the sign source.
