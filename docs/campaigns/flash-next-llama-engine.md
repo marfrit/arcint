@@ -997,3 +997,69 @@ kernel):
     buy decode either. Its replay was not measured: no release records
     kernels yet. The dense agent's +0.8 % is within one run's spread but
     repeated.
+
+### Stage 7 — the VRAM budget against Strata's (2026-10-11)
+
+Strata keeps 12,332 experts on the B60 (16.53 GiB) at 32K, arcint 9,432
+(12.88 GiB) at the same context. Each expert a token does not find on the
+card costs ~50 us over the link (stage 6), so the budget is a decode lever.
+
+**Where each engine's VRAM goes at 32,768 tokens** (`measured-here`, B60;
+Strata from its own load log, arcint 0.7.3 from llama.cpp's buffer lines,
+its expert-cache line and fdinfo; 13,000 MiB expert budget, MTP 2, the bank
+stream on):
+
+| item | arcint | Strata |
+|---|---|---|
+| expert slots | 9,432, 12.88 GiB | 12,332, 16.53 GiB (sized per expert, 1.37 MiB mean) |
+| dense weights | 3,264 MiB | ~2,940 MiB (1,466 from its pack, 1,475 read natively) |
+| MTP draft model | 1,944 MiB (Q4_K / IQ4_NL experts, Q6_K head) | 839 MiB (Q2_0 experts) + 138 MiB draft head |
+| KV cache | 1,040 MiB (f16) | int8 |
+| recurrent state | 338 MiB (MTP 2: three copies) | |
+| compute buffers | 1,217 MiB, reserved at load for 2,048-token batches | allocated per request by its prompt path |
+| bank-stream ring | 751 MiB (4 x 187.7 MiB, at the first prefill) | |
+| gather mirror | 187.7 MiB | |
+| VRAM | 19,695 MiB after load, 21,128 after the first answer, 21,932 peak in the 20k needle | 1,559 MiB free with everything loaded |
+
+- Slots are sized per layer from the layer's own tensors (`code`,
+  `llama-expert-cache.cpp:310-333`): no padding. The GGUF's experts are
+  1.123-1.440 MiB (mean 1.376).
+- The growth on the first answer is not scratch: the lazily grown
+  `ggml_cl_buffer`s add 1.4 MiB on it (an env-gated allocation log in the dev
+  tree, `measured-here`), and 751 MiB of ring plus ~50 MiB on the needle. xe
+  makes pages resident on first touch, so the compute buffers reserved at
+  load show in fdinfo only after the first answer.
+- Strata's draft experts are Q2_0, "the same format as the main model's
+  experts", picked by measured draft acceptance (`code`, Strata
+  `tools/mtp_pack.py:1-15`). Ours are Q4_K gate/up and IQ4_NL down. A
+  Q2_0-expert draft model (`mtp-flash-next-q8e2n`, 1,767 MiB file against
+  2,452) had been built on 2026-10-06 and never measured.
+
+**The levers** (VRAM freed for slots): Q2_0 draft experts ~0.68 GiB; q8_0 KV
+~0.5 GiB at 32K and ~1.9 GiB at 131K (an earlier q8_0 arm, 0.6.0, was
+slower: 23.6 against 31.3 t/s); prefill buffers per request instead of
+resident, up to ~2 GiB (Strata's prompt path); the dense weights ~0.3 GiB.
+
+**The levers measured** (`measured-here`, B60, the unit's configuration:
+131,072 tokens, MTP 2, the bank stream; each arm's freed VRAM given to slots;
+one process per arm, the needle and two different long answers; answers
+right in every arm; the card has 24,480 MiB, xe debugfs `vram_mm`):
+
+| arm | slots | hit rate | drafts accepted | prefill | decode | peak VRAM |
+|---|---|---|---|---|---|---|
+| A: today (Q4_K/IQ4_NL draft experts, f16 KV, 9,500 MiB) | 6,877 | 89.3 % | 339/518 | 646.9 | 27.4 / 29.4 | 24,259 MiB |
+| B: Q2_0 draft experts, 10,150 MiB | 7,351 | 90.5 % | 320/556 | 642.6 | 26.7 / 29.4 | 24,208 |
+| C: q8_0 KV, 11,300 MiB | 8,191 | 91.5 % | 334/531 | 521.5 | 13.3 / 13.4 | 24,102 |
+| D: both, 11,950 MiB | 8,669 | 92.2 % | 315/566 | 519.4 | 12.5 / 12.6 | 24,033 |
+
+- **Q2_0 draft experts** (Strata's choice) lose about as many accepted
+  drafts (65 -> 58 %) as the 474 extra slots gain in hits: no decode gain.
+  Not adopted on this evidence; Strata's choice was measured on its engine.
+- **q8_0 KV** halves Flash-Next's decode and costs 19 % of prefill, while
+  the dense agent runs q8_0 KV at f16's speed (agent-context). The quantized
+  cache takes a slow path in Flash-Next's attention (QSA, 256-wide heads):
+  a kernel gap, not a property of q8_0 KV. Not adopted until it is found; it
+  would free ~1.9 GiB at 131K.
+- The KL of q8_0 against f16 KV was not measured: the perplexity run
+  thrashed on the first shard's memory-mapped reads from the ZFS pool with
+  the pinned bank in host memory (126 GB read in 31 min), and was stopped.

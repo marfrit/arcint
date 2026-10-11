@@ -282,9 +282,8 @@ prompt is answered (prefill 1,059 s, 184.6 t/s; decode at that depth 12.0
 t/s); the acceptance task 10/10 greedy (one run); KL 0.005950 / 97.30 %
 against q8_0's 0.004099 / 97.75 %; 4k and 128k prompts as fast as with q8_0
 (on the deployed unit at 196,608: 4k 836.9 / 36.6 t/s, 128k 256.8 / 17.7,
-against q8_0's 786.8 / 37.8 and 256.1 / 16.6); VRAM peak 22,773 of 23,255 MiB, nothing evicted. 212,992 tokens
-also run, 8 MiB under the card's limit; the model's 262,144 would peak ~1.3
-GiB over it (arithmetic from the probes).
+against q8_0's 786.8 / 37.8 and 256.1 / 16.6); VRAM peak 22,773 MiB of the card's 24,480, nothing evicted. 212,992 tokens
+also run (peak 23,247 MiB); larger sizes are open (docs/campaigns/agent-context.md).
 
 **Dense 27B, B60, with MTP** (5 drafts, the 40,960-id head) and
 `--llama-kv q8_0`:

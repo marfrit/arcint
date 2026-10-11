@@ -1,6 +1,6 @@
 # agent-context — the dense agent's context past 131,072 tokens on the 24 GB card
 
-**Closed 2026-10-11** (operator: "work on extending the agent context"): the agent serves 196,608 tokens with q8_0:q4_0 KV.
+**Open again 2026-10-11** (operator: "work on extending the agent context"): the agent serves 196,608 tokens with q8_0:q4_0 KV; the card turned out to hold 24,480 MiB, not the 22.71 GiB first assumed, so larger sizes are being measured.
 
 ## Charter
 
@@ -34,12 +34,13 @@ holds, with the answers right at the new depth.
   KiB a token (4.25 GiB at 131,072; the lanes campaign measured 5.44 GiB for
   163,840 cells), 8:4 26 KiB (41 % of f16). The MTP layer adds its own KV in
   the draft context.
-- **The card:** 22.71 GiB usable. The unit holds 21,867 MiB resident after
+- **The card:** 24,480 MiB, 24,433 free when idle (xe debugfs `vram_mm`; the
+  "22.71 GiB usable" this section first used was wrong, see below). The unit holds 21,867 MiB resident after
   load and three answers (2026-10-11, fdinfo, a check before the windows); its
   record has a 23.06 GB peak at a 128k prompt.
 - **Arithmetic, not a measurement:** with 8:4, 196,608 tokens take ~0.6 GiB
   more than today (~22.0 GiB); 262,144 would need ~2 GiB more than the card
-  holds with these weights. The compute buffer's growth with n_ctx comes on
+  holds with these weights (against the wrong 22.71 GiB; corrected below). The compute buffer's growth with n_ctx comes on
   top and is measured below.
 
 ## Gate
@@ -63,8 +64,7 @@ Two windows on the B60 (`measured-here`, 2026-10-11, the packaged arcint
 0.7.3, the unit's flags, MTP 5; the prompts are the release tree's sources,
 the needle a sentence at 40 % depth).
 
-**Load probes** (VRAM after load, and the peak after one short answer;
-23,255 MiB usable):
+**Load probes** (VRAM after load, and the peak after one short answer):
 
 | KV, n_ctx | KV buffer (main context; the MTP draft context adds 208-338 MiB) | after load | peak |
 |---|---|---|---|
@@ -94,8 +94,10 @@ the needle a sentence at 40 % depth).
 | 212,992 | 209,291 | 1,199 s (174.5 t/s) | right | 13.0 t/s (300 tokens) | 23,247 / 26 MiB |
 | 196,608 | 195,451 | 1,059 s (184.6 t/s) | right | 12.0 t/s (274 tokens) | 22,773 / 26 MiB |
 
-212,992 runs 8 MiB under the card's limit: not deployable. 196,608 keeps 482
-MiB.
+**Corrected 2026-10-11:** the margins were first computed against "22.71 GiB usable". The
+card has 24,480 MiB (24,433 free when idle, xe debugfs `vram_mm`; Flash-Next runs at a
+24,259 MiB peak without eviction). 196,608 keeps ~1,660 MiB at the deepest prompt, 212,992
+~1,190 MiB: both are deployable, and larger sizes are open (being measured).
 
 **The gate at 196,608, 8:4:**
 - the capital and the needle right;
@@ -121,8 +123,9 @@ take `--n-ctx 196608 --llama-kv q8_0:q4_0`. Checked after the deployment,
 outside the windows: the endpoint and the proxy report n_ctx 196608, the
 capital is right.
 
-**Not reached** (arithmetic from the measured probes): the model's 262,144
-would peak ~1.3 GiB above the card's usable memory with these weights and MTP
+**Not reached** (arithmetic from the measured probes, corrected for the
+card's real size): the model's 262,144 would peak ~24,540 MiB, ~110 MiB above
+the idle free memory, with these weights and MTP
 5 (+442 MiB after load per 16,384 tokens, times four, on 196,608's deep
 peak). The levers would be smaller weights (a quality question) or fewer MTP
 drafts (~150 MiB of recurrent state each, decode speed).
