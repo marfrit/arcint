@@ -173,6 +173,17 @@ on the card (TOP_K, F32<->I32 casts, F16 FILL/REPEAT/SET_ROWS) -- without
 them the scheduler ran four CPU islands per attention layer, each draining
 the queue (decode 32.0 -> 33.0-34.2, prefill 381 -> 422).
 
+**Prefill since 0.7.3** (`contrib/llama.cpp` 0032, 0033): with
+`GGML_OPENCL_BANK_STREAM=1` prefill copies each bank tensor whole on a copy
+queue into a ring of VRAM slots (`GGML_OPENCL_BANK_STREAM_RING`, default 4,
+~750 MiB at Flash-Next's sizes) ahead of its GEMM, and the B60's
+MUL_MAT_ID tile is 4,4,2,4. Measured (`measured-here`, 2026-10-11, B60):
+the needle prefills at 640-645 t/s with 9,500 MiB of slots and 131,072
+context (408 before), decode equal (27-29 t/s in that configuration),
+nothing evicted, VRAM peak 24.27 of 24.48 GB. 0034 and 0035 make the IQ
+kernels' byte arithmetic and the IQ4 codebook cheaper (Flash-Next decode
+~5 % at 13,000 MiB; the coder on the A770 +2 %).
+
 The UD-Q3_K_XL file (52 GiB of experts) serves the same way at 235 t/s
 prefill and 12-13 t/s decode without MTP (2026-10-06).
 

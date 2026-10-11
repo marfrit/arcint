@@ -38,6 +38,12 @@ top-1 -0.10 points against Q4_K_M, acceptance 10/10). The libllama engine keeps 
 checkpoints (--llama-checkpoints): a follow-up after a thinking turn or an
 edited message resumes instead of re-prefilling (24.3k tokens: 38.75 s ->
 0.61 s on the B60, measured-here); no shared prefix cache across lanes.
+Release 0.7.3 (2026-10-11), measured-here: contrib/llama.cpp 0030-0035.
+Flash-Next IQ2_XS's 20k needle prefill 408 -> 640-645 t/s on the B60 with
+GGML_OPENCL_BANK_STREAM=1 (0032, opt-in: banks streamed on a copy queue)
+and the B60 MUL_MAT_ID tile 4,4,2,4 (0033); the IQ kernels' byte arithmetic
+in 32-bit words (0034, Flash-Next decode ~5 %) and the IQ4 codebook in local
+memory (0035, the coder on the A770 +2 %); IQ2_XS on the card (0030).
 Release 0.7.2 (2026-10-09), measured-here: lanes in one decode. With MTP,
 two busy lanes share each draft and verify step in one llama_decode: 21.6 +
 21.7 t/s on the dense agent against 15.9 + 15.8 taking turns (+37 %), a lane
@@ -96,7 +102,9 @@ on the GPU.
   engine, B60: --llama-cpu-moe 48 --llama-expert-cache 14500
   --llama-expert-profile (Strata's) --llama-mtp 2 --llama-mtp-gguf
   (tools/flash_next_mtp_gguf.sh). 20045-token needle: prefill 422 t/s;
-  500-token answer: decode 33.0-34.8 t/s, 72-74 % of drafts accepted. KL
+  500-token answer: decode 33.0-34.8 t/s, 72-74 % of drafts accepted.
+  0.7.3 with GGML_OPENCL_BANK_STREAM=1, 9,500 MiB of slots, 131,072 context:
+  prefill 640-645 t/s, decode 27-29 t/s. KL
   against unsloth's Q8_0 (2026-10-09): 0.294 nats, top-1 87.1 %, against
   UD-Q3_K_XL's 0.100 / 93.3 %: the 2-bit quant misses the answer-level bar.
   The series' IQ3_XXS: 0.221 / 89.7 %, also short; with contrib/llama.cpp

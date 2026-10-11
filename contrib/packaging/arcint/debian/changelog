@@ -1,3 +1,18 @@
+arcint (0.7.3-1) trixie; urgency=medium
+
+  * 0.7.3: Flash-Next and the IQ kernels on the libllama engine, llama.cpp
+    patches 0030-0035. 0030: IQ2_XS on the card (the IQ3_XXS quant's 10
+    IQ2_XS layers no longer run on the CPU). 0031: the opt-in grouped
+    MUL_MAT_ID path fixed. 0032 (opt-in, GGML_OPENCL_BANK_STREAM=1): prefill
+    streams the expert cache's banks on a copy queue. 0033: the B60's
+    MUL_MAT_ID tile 4,4,2,4; with 0032, Flash-Next's 20k prefill 408 -> 640-645
+    t/s on the B60. 0034: the IQ / low-bit kernels' byte arithmetic in 32-bit
+    words (B60 kernels 23-39 % faster, Flash-Next decode ~5 %). 0035: the IQ4
+    codebook in local memory on both cards (the coder on the A770 41.0-42.1
+    -> 42.0-43.0 t/s). Runtime floor unchanged at marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 11 Oct 2026 14:00:00 +0200
+
 arcint (0.7.2-1) trixie; urgency=medium
 
   * 0.7.2: lanes in one decode. With --llama-mtp, two busy lanes share each

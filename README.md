@@ -165,6 +165,9 @@ patches 0059–0067).
 B60, 14,500 MiB of expert slots, MTP 2: the 20,045-token needle prefills at
 422 t/s, the 500-token long answer decodes at 33.0-34.8 t/s, the needle
 answered (0.6.0; Strata's own engine: 620 / 37.2-37.8 t/s on the same card).
+Since 0.7.3 (`contrib/llama.cpp` 0032 with `GGML_OPENCL_BANK_STREAM=1`, and
+0033) the needle prefills at 640-645 t/s with 9,500 MiB of slots and a
+131,072-token context, decode 27-29 t/s in that configuration.
 Quality (`measured-here`, KL against unsloth's Q8_0, 16 x 512): IQ2_XS 0.294
 nats, top-1 87.1 %, against UD-Q3_K_XL's 0.100, 93.3 %; the 2-bit quant
 misses the answer-level bar, the served engine adds nothing to it. The same
