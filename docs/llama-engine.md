@@ -278,11 +278,13 @@ The prices, KL and speed are in the 0015 section of
 **Dense 27B, B60, 196,608 tokens** (since 2026-10-11,
 `docs/campaigns/agent-context.md`, `measured-here`, arcint 0.7.3, MTP 5):
 `--n-ctx 196608 --llama-kv q8_0:q4_0`. The needle at 40 % of a 195,451-token
-prompt is answered (prefill 1,059 s, 184.6 t/s; decode at that depth 12-14
-t/s); the acceptance task 10/10 greedy; KL 0.005950 / 97.30 % against
-q8_0's 0.004099 / 97.75 %; 4k and 128k prompts as fast as with q8_0; VRAM
-peak 22,773 of 23,255 MiB, nothing evicted. 212,992 tokens also run, 8 MiB
-under the card's limit; the model's 262,144 would need ~2 GiB more.
+prompt is answered (prefill 1,059 s, 184.6 t/s; decode at that depth 12.0
+t/s); the acceptance task 10/10 greedy (one run); KL 0.005950 / 97.30 %
+against q8_0's 0.004099 / 97.75 %; 4k and 128k prompts as fast as with q8_0
+(on the deployed unit at 196,608: 4k 836.9 / 36.6 t/s, 128k 256.8 / 17.7,
+against q8_0's 786.8 / 37.8 and 256.1 / 16.6); VRAM peak 22,773 of 23,255 MiB, nothing evicted. 212,992 tokens
+also run, 8 MiB under the card's limit; the model's 262,144 would peak ~1.3
+GiB over it (arithmetic from the probes).
 
 **Dense 27B, B60, with MTP** (5 drafts, the 40,960-id head) and
 `--llama-kv q8_0`:

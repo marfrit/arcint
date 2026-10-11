@@ -17,9 +17,11 @@
 # Since 2026-10-11: 196,608 tokens with q8_0:q4_0 KV (K in q8_0, V in q4_0;
 # docs/campaigns/agent-context.md). Measured on the B60 with arcint 0.7.3 and
 # exactly these flags: the needle at 40 % of a 195,451-token prompt right
-# (prefill 1,059 s, 184.6 t/s; decode there 12-14 t/s); acceptance task 10/10
-# (temperature 0); KL 0.005950 / top-1 97.30 % against q8_0 KV's 0.004099 /
-# 97.75 %, inside the answer-level bar; 4k and 128k prompts as fast as q8_0;
+# (prefill 1,059 s, 184.6 t/s; decode there 12.0 t/s); acceptance task 10/10
+# (temperature 0, one run); KL 0.005950 / top-1 97.30 % against q8_0 KV's
+# 0.004099 / 97.75 %, inside the answer-level bar; 4k and 128k prompts as fast
+# as q8_0 at 131,072 and on this unit at 196,608 (4k: 836.9 / 36.6 t/s; 128k:
+# 256.8 / 17.7 against q8_0's 786.8 / 37.8 and 256.1 / 16.6);
 # VRAM peak 22,773 of 23,255 MiB usable, nothing evicted. 212,992 tokens also
 # run but peak 8 MiB under the card's limit. Back: --n-ctx 131072 --llama-kv q8_0.
 #

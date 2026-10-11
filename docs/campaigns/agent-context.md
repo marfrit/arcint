@@ -18,7 +18,7 @@ holds, with the answers right at the new depth.
 - **Its price on this model** (`measured-here`, 0015's section of
   `contrib/llama.cpp/README.md`, B60, KL against the CPU reference):
 
-  | KV | KL | top-1 | prefill 4k / decode |
+  | KV | KL | top-1 | prefill 4k / decode (llama-bench, no MTP) |
   |---|---|---|---|
   | 8:8 (the unit today) | 0.003966 | 97.65 % | 896 / 18.9 t/s |
   | 8:4 | 0.005756 | 97.33 % | 893 / 18.9 t/s |
@@ -35,8 +35,8 @@ holds, with the answers right at the new depth.
   163,840 cells), 8:4 26 KiB (41 % of f16). The MTP layer adds its own KV in
   the draft context.
 - **The card:** 22.71 GiB usable. The unit holds 21,867 MiB resident after
-  load and three answers (2026-10-11, fdinfo); its record has a 23.06 GB
-  peak at a 128k prompt.
+  load and three answers (2026-10-11, fdinfo, a check before the windows); its
+  record has a 23.06 GB peak at a 128k prompt.
 - **Arithmetic, not a measurement:** with 8:4, 196,608 tokens take ~0.6 GiB
   more than today (~22.0 GiB); 262,144 would need ~2 GiB more than the card
   holds with these weights. The compute buffer's growth with n_ctx comes on
@@ -66,7 +66,7 @@ the needle a sentence at 40 % depth).
 **Load probes** (VRAM after load, and the peak after one short answer;
 23,255 MiB usable):
 
-| KV, n_ctx | KV buffer | after load | peak |
+| KV, n_ctx | KV buffer (main context; the MTP draft context adds 208-338 MiB) | after load | peak |
 |---|---|---|---|
 | q8_0, 131,072 (the unit before) | 4,352 MiB | 21,389 | 21,926 |
 | 8:4, 131,072 | 3,328 | 20,301 | 20,557 |
@@ -77,9 +77,9 @@ the needle a sentence at 40 % depth).
 - The recurrent state takes 897.75 MiB whatever the context: six copies of
   the GDN state, one per MTP draft position plus one (`n_rs_seq` = the draft
   count; `code`, llama.cpp `src/llama-memory-recurrent.cpp:101`).
-- A deep prompt adds ~0.6-0.7 GiB over the load (runtime OpenCL buffers).
+- A deep prompt adds 704-736 MiB over the load (runtime OpenCL buffers).
 
-**8:8 against 8:4 at 131,072** (same prompts, one process each):
+**8:8 against 8:4 at n_ctx 131,072** (same prompts, one process each, one run per cell):
 
 | | 8:8 | 8:4 |
 |---|---|---|
@@ -91,25 +91,41 @@ the needle a sentence at 40 % depth).
 
 | n_ctx | prompt | prefill | needle | decode at depth | peak VRAM / GTT |
 |---|---|---|---|---|---|
-| 212,992 | 209,291 | 1,199 s (174.5 t/s) | right | 13.0 t/s | 23,247 / 26 MiB |
-| 196,608 | 195,451 | 1,059 s (184.6 t/s) | right | 12.0-14.0 t/s | 22,773 / 26 MiB |
+| 212,992 | 209,291 | 1,199 s (174.5 t/s) | right | 13.0 t/s (300 tokens) | 23,247 / 26 MiB |
+| 196,608 | 195,451 | 1,059 s (184.6 t/s) | right | 12.0 t/s (274 tokens) | 22,773 / 26 MiB |
 
 212,992 runs 8 MiB under the card's limit: not deployable. 196,608 keeps 482
 MiB.
 
-**The gate at 196,608, 8:4:** the capital and the needle right; the
-acceptance task 10/10 greedy (the unit's record 8/10); KL on today's tree
-against `dense-ref.kld`, 16 x 512: 8:8 0.004099 / 97.745 %, 8:4 0.005950 /
-97.304 % (+0.0019 nats, -0.44 points: inside the bar); GTT flat; speed at 4k
-and 128k within the spread. **Passed.**
+**The gate at 196,608, 8:4:**
+- the capital and the needle right;
+- the acceptance task 10/10 greedy, one run (the unit's record 8/10);
+- KL on today's tree against `dense-ref.kld`, 16 x 512: 8:8 0.004099 /
+  97.745 %, 8:4 0.005950 / 97.304 % (+0.0019 nats, -0.44 points: inside the
+  bar);
+- GTT flat at both depths;
+- speed: **amended after the measurement.** The gate named the 8:8 unit's
+  2026-10-08 record (36.6 / 19.3 t/s decode, 824-910 / 252-272 t/s
+  prefill). This session's own 8:8 arm on these prompts falls below that
+  record too (4k prefill 786.8; 128k decode 16.6), so the record's prompts
+  and build are not comparable. The comparison made is 8:4 against the
+  same-session 8:8 arm, one run per cell: equal within one run's spread.
+  The same two prompts on the deployed unit at 196,608 (8:4, after the
+  windows): 4k prefill 836.9 t/s, decode 36.6; 128,840 tokens prefill
+  256.8 t/s, decode 17.7 -- against 8:8's 786.8 / 37.8 and 256.1 / 16.6.
+
+**Passed** on that comparison.
 
 **Deployed** 2026-10-11: the agent unit and `contrib/systemd/arcint-agent.service`
-take `--n-ctx 196608 --llama-kv q8_0:q4_0`; the endpoint reports n_ctx 196608
-and answers right.
+take `--n-ctx 196608 --llama-kv q8_0:q4_0`. Checked after the deployment,
+outside the windows: the endpoint and the proxy report n_ctx 196608, the
+capital is right.
 
-**Not reached:** the model's 262,144 needs ~2 GiB more than the card has
-with these weights and MTP 5. The levers would be smaller weights (a quality
-question) or fewer MTP drafts (150 MiB each, decode speed).
+**Not reached** (arithmetic from the measured probes): the model's 262,144
+would peak ~1.3 GiB above the card's usable memory with these weights and MTP
+5 (+442 MiB after load per 16,384 tokens, times four, on 196,608's deep
+peak). The levers would be smaller weights (a quality question) or fewer MTP
+drafts (~150 MiB of recurrent state each, decode speed).
 
 ## Where it lives
 
