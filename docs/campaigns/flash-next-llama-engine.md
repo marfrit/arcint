@@ -824,3 +824,40 @@ The levers from `research-b70-field.md`, tried on the B60. All
     ~220 MiB of the card free in that configuration (24.26 of 24.48 GB),
     and the xe eviction lesson says thin margins bite. Turning it on for
     the unit is the operator's call.
+- **In service** (2026-10-11): `arcint-flashnext` runs arcint 0.7.2 with
+  llama.cpp 0001-0033 and `GGML_OPENCL_BANK_STREAM=1` (operator).
+  - Measured through the unit on :8089: needle prefill 645.1 t/s, decode
+    27.3 / 28.4 t/s, answers right, nothing evicted (VRAM peak 24,267 MiB).
+  - Neither change touches the dense agent (no experts) or the coder (its
+    experts are resident: no bank; on the B60 they take the tokens-as-a
+    kernel, which does not read the tile).
+
+### Stage 6 — the low-bit expert matvecs (decode), 2026-10-11
+
+**Where they stall** (`measured-here`, B60, unitrace hardware metrics over
+`test-backend-ops perf` at Flash-Next's 512-expert shapes; time-weighted per
+kernel):
+
+| kernel | XVE active | stalled | ALU1 (int) busy | main stall |
+|---|---|---|---|---|
+| IQ2_XXS MUL_MAT_ID matvec | 88.3 % | 10.7 % | 83.5 % | ALU write-back 12.7 % |
+| Q2_0 MUL_MAT_ID matvec (the down projections) | 93.5 % | 5.9 % | 89.7 % | ALU write-back 9.5 % |
+| Q4_K matvec (reference) | 51.6 % | 48.0 % | 41.4 % | SBID (memory) 53.3 %, 431 GB/s |
+
+- The low-bit expert kernels are bound by integer instruction issue, not
+  by memory: unpacking the weights before each `dp4a` fills the pipe.
+  Strata's Intel notes record the same for its expert kernels (77 % XVE
+  active, ALU-bound). This is also why computing the sign masks in
+  registers (stage 5) lost: it moved local-memory loads onto the full
+  pipe.
+- **Levers, in order of cost:**
+  1. **One-term activations.** The matvec dots each weight block with two
+     int8 activation terms (the main one and a residual, for accuracy).
+     `-DKQ_ONE_TERM` halves the dots; the bar decides.
+  2. **Q2_0 unpacked by plane.** Today ~8-9 ALU operations per 4 weights;
+     `(w >> 2k) & 0x03030303` on a 32-bit word gives 4 weights in 2
+     operations. It needs activations in the matching transposed order (the
+     quantize pass, once per token) and the -1 offset as one block-sum
+     correction.
+  3. The grid types (IQ2_XXS, IQ2_S, IQ1_M): fewer operations around each
+     lookup.
