@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index b7775cd..1751275 100644
+index b7775cd..e483ea7 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -1096,6 +1096,24 @@ struct ggml_backend_opencl_context {
@@ -36,14 +36,15 @@ index b7775cd..1751275 100644
  
      cl_event evt;
      CL_CHECK(clEnqueueBarrierWithWaitList(backend_ctx->queue, 0, nullptr, &evt));
-@@ -10750,6 +10770,24 @@ bool ggml_backend_is_opencl(ggml_backend_t backend) {
+@@ -10750,6 +10770,25 @@ bool ggml_backend_is_opencl(ggml_backend_t backend) {
  // split (ids at or above it are the bank's, gathered into the mirror)
  static std::unordered_map<const ggml_tensor *, std::pair<const ggml_tensor *, int>> g_cache_pairs;
  
 +// patch 0032: the contexts whose bank stream learnt an order. The learnt state
 +// drained and dropped (the copy queue finished first): a USM bank of its order
 +// freed, or a changed USM base seen at a call.
-+static std::vector<ggml_backend_opencl_context *> g_bstream_ctxs;
++// immortal, as the contexts are: a buffer freed after main() returns may still look here
++static std::vector<ggml_backend_opencl_context *> & g_bstream_ctxs = *new std::vector<ggml_backend_opencl_context *>();
 +static void ggml_cl_bank_stream_reset(ggml_backend_opencl_context * ctx) {
 +    auto & bs = ctx->bstream;
 +    if (bs.q) CL_CHECK(clFinish(bs.q));
@@ -61,7 +62,7 @@ index b7775cd..1751275 100644
  struct ggml_backend_opencl_buffer_context {
      // A buffer context can hold multiple cl_mem objects. This is for flattening
      // quantized weights and should be used with GGML_OPENCL_SMALL_ALLOC where
-@@ -10773,6 +10811,7 @@ struct ggml_backend_opencl_buffer_context {
+@@ -10773,6 +10812,7 @@ struct ggml_backend_opencl_buffer_context {
  
      ~ggml_backend_opencl_buffer_context() {
          if (usm && usm_free) {
@@ -69,7 +70,7 @@ index b7775cd..1751275 100644
              usm_free(usm_ctx, usm);
          }
          for (cl_mem buf : buffer) {
-@@ -25580,6 +25619,110 @@ static const void * g_kq_pf_src = nullptr;
+@@ -25580,6 +25620,106 @@ static const void * g_kq_pf_src = nullptr;
  static cl_mem       g_kq_pf_dst = nullptr;
  static cl_ulong     g_kq_pf_n16 = 0;
  
@@ -159,12 +160,8 @@ index b7775cd..1751275 100644
 +        // issued ahead: only if its slot still holds it (a deviation from the learnt order reuses slots)
 +        if (bs.slot_of[i] < 0 || bs.holds[bs.slot_of[i]] != i) return false;   // gather
 +    } else {
-+        while (bs.issued_upto < i) {
-+            const int j = bs.issued_upto + 1;
-+            const ggml_tensor * t = bs.order[j];
-+            if (t->nb[2] * (size_t) t->ne[2] > bs.max_bytes) return false;
-+            issue(j);
-+        }
++        // every tensor of the order fits a slot (max_bytes is their maximum, the call's own checked above)
++        while (bs.issued_upto < i) issue(bs.issued_upto + 1);
 +    }
 +    const int s = bs.slot_of[i];
 +    // the next ring-1 tensors of this graph, behind the GEMMs that free their slots
@@ -180,7 +177,7 @@ index b7775cd..1751275 100644
  // blocks as the GGUF stores them (buffer, byte offset): IQ3_XXS, IQ4_XS and
  // the low-bit types
  static bool ggml_cl_kq_as_stored(ggml_type t) {
-@@ -28690,6 +28833,8 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -28690,6 +28830,8 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
                      }
                  }
              }
@@ -189,7 +186,7 @@ index b7775cd..1751275 100644
          } else if (bctx0->usm && backend_ctx->kernel_moe_gather_experts != nullptr) {
              auto gather = [&](const void * src, ggml_cl_buffer & stage, size_t per_expert, int n_split) {
                  GGML_ASSERT(per_expert % 16 == 0);
-@@ -28757,6 +28902,18 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -28757,6 +28899,18 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
          }
      }
      struct kq_stage_reset { ~kq_stage_reset() { g_kq_stage_q = g_kq_stage_d = g_kq_single_q = g_kq_single_d = nullptr; g_kq_single_split = 0; g_kq_single_nbank = 0; g_kq_single_ptr = nullptr; g_kq_pf_src = nullptr; g_kq_pf_dst = nullptr; g_kq_pf_n16 = 0; } } kq_stage_reset_;

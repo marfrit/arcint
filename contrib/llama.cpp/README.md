@@ -1891,3 +1891,35 @@ Measured (`measured-here`, 2026-10-10, B60, Flash-Next IQ2_XS,
   - KL with the stream and 4,4,2,4: 0.294050 / 87.083 %, unchanged.
   - 0.7.2 prefills the needle at ~416-422 t/s; the stream and this tile at
     634.1, above Strata's own engine on this card (620.5).
+
+## 0033-opencl-b60-mm-id-tile.patch
+
+Intel, sub-group-16 devices (the B60): MUL_MAT_ID's GEMM tile defaults to
+`4,4,2,4` (RG, TG, NSGM, NSGN: 64 rows x 256 tokens, 8 sub-groups) instead
+of `2,2,1,1` (16 rows x 32 tokens, one sub-group). The tile kernel
+dequantises its weight block once per token tile. With the old shape an
+expert of Flash-Next, at ~40 tokens per 2,048-token ubatch, paid one full
+and one nearly empty tile; a larger tile shares each dequantised block
+across more tokens and rows. The SG 8 tile (A770) is unchanged.
+`GGML_OPENCL_KQ_MM_ID_TILE` still overrides it.
+
+Measured (`measured-here`, 2026-10-11, B60):
+
+- **The served needle** (Flash-Next IQ2_XS, 13,000 MiB, 32,768 ctx,
+  0032's stream on), by tile; the table is under 0032.
+  - With this default and no override: 647.7 t/s, answers right.
+  - KL with 0032's stream and this tile: 0.294050 / 87.083 %, unchanged.
+- **The deployed configuration** (9,500 MiB, 131,072 ctx, MTP 2), two
+  processes each:
+  - prefill 408.3 / 408.2 (0.7.2's behaviour) -> 639.8 / 644.5 with
+    0032's stream and this tile;
+  - decode equal: 26.6-29.1 against 26.7-28.6, one baseline outlier 16.0;
+  - nothing evicted; VRAM peaks at 24.2-24.3 GB (0032's ring) against 23.4.
+- **The coder on the B60** (its IQ3_XXS / IQ4_XS experts take the
+  tokens-as-a kernel, which does not read this tile): pp4096 1,905.5 ->
+  1,906.0.
+- **test-backend-ops:** MUL_MAT_ID 468/542 (the pin's 74 MXFP4 cases),
+  MUL_MAT 1221/1221.
+- **Review:** sound. Local memory 32 KiB (the plain tile's), 128 work-items,
+  the route tiles' buffer bounded for any tile, rows clamped; the
+  tokens-as-a path does not read the tile.

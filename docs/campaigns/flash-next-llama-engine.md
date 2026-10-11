@@ -815,3 +815,12 @@ The levers from `research-b70-field.md`, tried on the B60. All
   - Before it becomes the B60's default: the coder's prefill on the B60
     with it, and decode in the deployed configuration outside the backup
     window.
+- **Adopted** (`measured-here`, 2026-10-11):
+  - 0033 makes `4,4,2,4` the B60's MUL_MAT_ID tile.
+  - In the deployed configuration (9,500 MiB of slots, 131,072 ctx,
+    MTP 2): prefill 408 -> 640-645 t/s with 0032's stream on. Decode equal,
+    nothing evicted, answers right.
+  - The stream stays opt-in (`GGML_OPENCL_BANK_STREAM=1`). Its ring leaves
+    ~220 MiB of the card free in that configuration (24.26 of 24.48 GB),
+    and the xe eviction lesson says thin margins bite. Turning it on for
+    the unit is the operator's call.

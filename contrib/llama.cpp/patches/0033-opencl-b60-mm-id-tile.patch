@@ -1,0 +1,26 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index e483ea7..6e8da4c 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -2587,7 +2587,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+             // the GEMM: fp16 DPAS at the device's DPAS sub-group size. Tiles
+             // (measured-here: an A770 at 2000 MHz, a B60), as RG,TG,NSGM,NSGN:
+             // plain 4,4,2,8 on both; MUL_MAT_ID (tiles of one expert's pairs)
+-            // SG 8 2,4,2,2, SG 16 2,2,1,1.
++            // SG 8 2,4,2,2, SG 16 4,4,2,4 (patch 0033; 2,2,1,1 before).
+             // GGML_OPENCL_KQ_MM=0 keeps ggml's GEMM; GGML_OPENCL_KQ_MM_TILE /
+             // GGML_OPENCL_KQ_MM_ID_TILE = "RG,TG,NSGM,NSGN" override.
+             static const char * mm_env = getenv("GGML_OPENCL_KQ_MM");
+@@ -2608,7 +2608,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                 // prefill (measured-here: 1,613 -> 1,740 t/s at 512 tokens,
+                 // 1,345 -> 1,431 at 4,096; KL unchanged)
+                 backend_ctx->kq_mm_plain = ggml_cl_kq_tile{ 4, 4, 2, 8 };
+-                backend_ctx->kq_mm_id    = sg8 ? ggml_cl_kq_tile{ 2, 4, 2, 2 }  : ggml_cl_kq_tile{ 2, 2, 1, 1 };
++                // SG 16 (B60): MUL_MAT_ID 4,4,2,4 (patch 0033): a work-group of 64 rows x 256 tokens shares
++                // each dequantised weight block across more tokens (the old 2,2,1,1 dequantised 16 rows per
++                // 32 tokens). Flash-Next IQ2_XS needle prefill 494.7 -> 634.1 t/s with 0032's stream, KL
++                // unchanged; the coder's pp4096 (its experts take the tokens-as-a kernel) 1,905.5 -> 1,906.0
++                backend_ctx->kq_mm_id    = sg8 ? ggml_cl_kq_tile{ 2, 4, 2, 2 }  : ggml_cl_kq_tile{ 4, 4, 2, 4 };
+                 for (auto [env, tile] : { std::pair<const char *, ggml_cl_kq_tile *>{ "GGML_OPENCL_KQ_MM_TILE", &backend_ctx->kq_mm_plain },
+                                           std::pair<const char *, ggml_cl_kq_tile *>{ "GGML_OPENCL_KQ_MM_ID_TILE", &backend_ctx->kq_mm_id } }) {
+                     if (const char * t = getenv(env)) {
