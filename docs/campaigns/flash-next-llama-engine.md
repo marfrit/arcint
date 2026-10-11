@@ -871,3 +871,20 @@ kernel):
     weights' unpacking is.
   - Its KL arm (0.294050) does not count: llama-perplexity's 512-token
     batches take the GEMM, which the matvec's one-term mode does not touch.
+- **Q2_0 unpacked by plane, tried** (`measured-here`, 2026-10-11; llama.cpp
+  tree branch `p0034-q2-planes`):
+  - The idea: `(w >> 2k) & 0x03030303` gives four weights in two
+    operations (about nine before), with the activations' 16 bytes
+    transposed to match.
+  - test-backend-ops passes on both cards; the red switch (activations not
+    transposed) fails 49 of 87 Q2_0 cases.
+  - **B60:** the 16-lane path is unchanged (33.0 against 33.4 us at one
+    token). The 4-lane down path is slower: 52.1 against 32.1 us at one
+    token, 152.7 against 90.0 at three, because each lane transposes the
+    activations for its single row.
+  - **A770:** 7-14 % faster.
+  - **Served decode (B60):** 29.8-31.2 against 30.3-31.8 t/s. Not adopted.
+  - **What it shows:** cutting the unpacking's instructions by about two
+    thirds did not move the 16-lane path. The integer pipe's load is not
+    mainly the unpacking. Next suspect: the per-sub-block index arithmetic
+    in 64-bit integers (`ulong` block indices, emulated on Intel GPUs).
