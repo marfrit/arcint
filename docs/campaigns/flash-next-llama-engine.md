@@ -950,3 +950,12 @@ kernel):
     the spread.
   - The coder on the A770: 41.0-42.1 -> 41.9-42.9 t/s.
   - Bit-identical outputs.
+- **Release 0.7.3 in service** (`measured-here`, 2026-10-11, the package's
+  `/usr/bin/arcint`, `87259ef`):
+  - `arcint-flashnext` (B60, 9,500 MiB of slots, 131,072 context, MTP 2,
+    `GGML_OPENCL_BANK_STREAM=1`), live through Roundhouse: the capital, the
+    needle and both long answers right; 20k prefill 648.5 t/s; decode 28.2
+    / 29.9 t/s; VRAM peak 24.24 GB.
+  - The coder (A770, 98,304 context): decode 42.9 / 41.8 t/s, answers right.
+  - The dense agent (B60, 131,072 context): decode 37.2 / 44.6 t/s, answers
+    right.
