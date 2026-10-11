@@ -959,3 +959,41 @@ kernel):
   - The coder (A770, 98,304 context): decode 42.9 / 41.8 t/s, answers right.
   - The dense agent (B60, 131,072 context): decode 37.2 / 44.6 t/s, answers
     right.
+- **OpenCL on Level Zero ("LEO") and command buffers** (2026-10-11).
+  - **The driver's own plan** (`code`, intel/compute-runtime
+    `documentation/LEO.md`, `LEO_COMMAND_BUFFER.md`): LEO re-implements
+    OpenCL on Level Zero. There `cl_khr_command_buffer` is a regular Level
+    Zero command list, the primitive SYCL graphs replay. It is partial and
+    off by default (`NEOReadDebugKeys=1 EnableLEO=1
+    EnableClKhrCommandBuffer=1`); mutable dispatch is not implemented.
+  - **Which release has what** (`measured-here`): 26.27 (installed) has LEO
+    but no command buffer. 26.35, in the test container, exposes the
+    extension, but recording a kernel (`clCommandNDRangeKernelKHR`)
+    resolves to null; that entry point landed in the source after the
+    release.
+  - **LEO's enqueue cost** (`measured-here`, B60, the chain of 2,000
+    dependent tiny kernels): 1.6-1.9 us a kernel against native 2.63 (26.27);
+    2.06 against 2.66 (26.35).
+  - **LEO and our kernels** (`measured-here`): LEO reports no non-uniform
+    work-groups (native: yes). test-backend-ops MUL_MAT and FLASH_ATTN_EXT
+    abort on `CL_INVALID_WORK_GROUP_SIZE`, e.g. upstream's Q1_0 conversion
+    (64-wide work-groups over a global size that is not a multiple of 64).
+    MUL_MAT_ID passes (468/542 B60, the same as native). ggml-opencl falls
+    back for devices without non-uniform work-groups in three places only.
+  - **Served under LEO** (`measured-here`, B60, the units' configurations,
+    two processes per arm, answers right in every arm):
+
+    | | native | LEO |
+    |---|---|---|
+    | dense agent decode | 36.8 / 40.2, 36.8 / 40.2 | 37.1 / 40.5, 37.1 / 40.5 |
+    | Flash-Next decode | 28.7 / 28.6, 28.2 / 30.3 | 28.6 / 30.2, 27.9 / 30.1 |
+    | Flash-Next needle prefill | 632.1, 646.4 | 632.5, 631.7 |
+
+  - **What it shows:** a 25-40 % cheaper enqueue does not move Flash-Next's
+    decode, so the GPU is not waiting on enqueues. Stage 3e's idle stretches
+    (8.8 ms a round between the last draft and the next verify) are sync
+    waits and host work (graph building, reading routing ids). A command
+    buffer removes enqueue time as well, so on this evidence it would not
+    buy decode either. Its replay was not measured: no release records
+    kernels yet. The dense agent's +0.8 % is within one run's spread but
+    repeated.
