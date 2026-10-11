@@ -861,3 +861,13 @@ kernel):
      correction.
   3. The grid types (IQ2_XXS, IQ2_S, IQ1_M): fewer operations around each
      lookup.
+- **One-term activations, tried** (`measured-here`, 2026-10-11, B60,
+  `GGML_OPENCL_IQ_OPTS=-DKQ_ONE_TERM`):
+  - Kernels only 3-11 % faster: IQ2_XXS 40.7 -> 38.5 us at one token,
+    IQ2_S 50.6 -> 48.4, Q2_0 down 32.0 -> 28.5.
+  - Served decode slightly slower: 29.9-31.9 against 31.3-32.6 t/s, two
+    processes each, answers right.
+  - Not adopted. The residual dot is not where the time goes; the
+    weights' unpacking is.
+  - Its KL arm (0.294050) does not count: llama-perplexity's 512-token
+    batches take the GEMM, which the matvec's one-term mode does not touch.
