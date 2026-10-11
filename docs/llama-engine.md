@@ -275,6 +275,15 @@ The prices, KL and speed are in the 0015 section of
 - it costs 4-5 % of decode;
 - its KL is within the noise of f16's.
 
+**Dense 27B, B60, 196,608 tokens** (since 2026-10-11,
+`docs/campaigns/agent-context.md`, `measured-here`, arcint 0.7.3, MTP 5):
+`--n-ctx 196608 --llama-kv q8_0:q4_0`. The needle at 40 % of a 195,451-token
+prompt is answered (prefill 1,059 s, 184.6 t/s; decode at that depth 12-14
+t/s); the acceptance task 10/10 greedy; KL 0.005950 / 97.30 % against
+q8_0's 0.004099 / 97.75 %; 4k and 128k prompts as fast as with q8_0; VRAM
+peak 22,773 of 23,255 MiB, nothing evicted. 212,992 tokens also run, 8 MiB
+under the card's limit; the model's 262,144 would need ~2 GiB more.
+
 **Dense 27B, B60, with MTP** (5 drafts, the 40,960-id head) and
 `--llama-kv q8_0`:
 - serves `--n-ctx 131072` (peak VRAM 23.06 of 25.7 GB). With f16 KV, MTP
