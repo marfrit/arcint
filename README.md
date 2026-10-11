@@ -110,7 +110,9 @@ Production (operator, 2026-10-04):
   B60: 422 t/s prefill at 20k tokens, 33-35 t/s decode with MTP 2
   (`measured-here`; Strata's own engine: 620 / 37.5 on the same card).
   At 131,072 tokens of context, 9,500 MiB of slots: 408 t/s and 19.8 t/s
-  (`contrib/systemd/arcint-flashnext.service`).
+  (`contrib/systemd/arcint-flashnext.service`). Since 0.7.3, with the bank
+  stream (`GGML_OPENCL_BANK_STREAM=1`, `contrib/llama.cpp` 0032, 0033) in
+  that configuration: 640-645 t/s prefill, 27-29 t/s decode.
 - One model across two different Arc cards (since 0.7.0,
   `--device GPU.0,GPU.1 --llama-layer-split K`;
   `docs/campaigns/layer-split-two-cards.md` on the `qfndev` branch):

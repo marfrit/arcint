@@ -144,8 +144,18 @@ then the 500-token long answer, greedy, thinking off): prefill 421-431 t/s,
 decode 33.0-34.8 t/s with 72-74 % of the drafts accepted; the capital, the
 needle and the long answer right. Strata's own engine (its SYCL port, 37.2-37.8
 t/s decode, 620 t/s prefill on this card) is the reference
-(`docs/campaigns/strata-sycl-b60.md` (on the `qfndev` branch)). The KL of IQ2_XS against a reference
-is owed (the existing CPU reference is the UD-Q3_K_XL file).
+(`docs/campaigns/strata-sycl-b60.md` (on the `qfndev` branch)). Its quality, measured since
+(2026-10-09, KL against unsloth's Q8_0 on the CPU, 16 x 512): IQ2_XS 0.2944 nats
+and top-1 87.2 % on the CPU, 0.2941 / 87.1 % served on the B60, against
+UD-Q3_K_XL's 0.1002 / 93.3 %. The 2-bit quant misses the answer-level bar;
+the engine adds nothing to it. The IQ3_XXS of the same series (0.2211 / 89.7 %)
+misses it too. 10 of its layers carry IQ2_XS gate/up experts, which the
+expert cache took only with `contrib/llama.cpp` 0030: before it, those layers
+ran on the CPU. With it every layer is cached and the KL as served is 0.2180,
+within the error bars of the CPU's (0.2211). From the ZFS pool the answer still decodes at 4-5 t/s
+(3.7 before): about 1 GB of storage reads an answer
+(`docs/campaigns/strata-sycl-b60.md` (on the `qfndev` branch); an earlier 28 t/s was a warm page
+cache from a repeated prompt, retracted).
 
 **The expert cache** (`--llama-expert-cache MIB --llama-expert-profile FILE`
 with `--llama-cpu-moe 48`; `contrib/llama.cpp` 0021 and 0022). The hot
@@ -162,6 +172,17 @@ Q2_0 kernels in planes, F16/BF16 products on XMX, and the QSA indexer's ops
 on the card (TOP_K, F32<->I32 casts, F16 FILL/REPEAT/SET_ROWS) -- without
 them the scheduler ran four CPU islands per attention layer, each draining
 the queue (decode 32.0 -> 33.0-34.2, prefill 381 -> 422).
+
+**Prefill since 0.7.3** (`contrib/llama.cpp` 0032, 0033): with
+`GGML_OPENCL_BANK_STREAM=1` prefill copies each bank tensor whole on a copy
+queue into a ring of VRAM slots (`GGML_OPENCL_BANK_STREAM_RING`, default 4,
+~750 MiB at Flash-Next's sizes) ahead of its GEMM, and the B60's
+MUL_MAT_ID tile is 4,4,2,4. Measured (`measured-here`, 2026-10-11, B60):
+the needle prefills at 640-645 t/s with 9,500 MiB of slots and 131,072
+context (408 before), decode equal (27-29 t/s in that configuration),
+nothing evicted, VRAM peak 24.2-24.3 of 24.48 GB. 0034 and 0035 make the IQ
+kernels' byte arithmetic and the IQ4 codebook cheaper (Flash-Next decode
+~5 % at 13,000 MiB; the coder on the A770 +2 %).
 
 The UD-Q3_K_XL file (52 GiB of experts) serves the same way at 235 t/s
 prefill and 12-13 t/s decode without MTP (2026-10-06).

@@ -1264,7 +1264,8 @@ the decode-path work Flash-Next and its MTP verify needed on Intel:
   ~650 us a projection on a 4-token step, profiled).
 - **IQ4 codebook per card**: register selects where the device has 8-wide
   sub-groups (A770: MV_ID 34 -> 28 us), constant gathers elsewhere (B60:
-  130 vs 146 us dense).
+  130 vs 146 us dense). Superseded by patch 0035 (a local-memory codebook
+  on both cards).
 - **SCALE -> SILU and SCALE -> SIGMOID [-> SCALE] fused** into one
   elementwise kernel (`kernel_scale_act_f32`, `GGML_OPENCL_FUSE_SCALE_ACT=0`
   turns it off): fewer launches a step, the served text identical; no
@@ -1318,7 +1319,8 @@ the decode-path work Flash-Next and its MTP verify needed on Intel:
   verify's distinct experts (logged every 200 steps). `GGML_OPENCL_IQ_OPTS` adds defines to the IQ
   matvec builds. Measured slower and removed: the IQ4 codebook by byte
   pairs and per lane in local memory, a per-work-group scan for the pair
-  order.
+  order. (Patch 0035's local codebook is a different build: one table per
+  work-group, with each value already in its byte.)
 
 `test-backend-ops` against the CPU (`measured-here`, B60 and A770): MUL_MAT
 557/557 and MUL_MAT_ID 181/181 for the IQ, low-bit, F16 and BF16 types,
@@ -1692,3 +1694,379 @@ Q4_K_M, q8_0 KV):
   answer on each at once, with the reuse fix): 21.6-21.7 t/s a lane, 43.3
   together, against 15.9 + 15.8 taking turns. One lane's text equals its
   run alone.
+
+## 0030-opencl-iq2-xs.patch
+
+Intel: IQ2_XS joins 0022's low-bit types as kernel type 11, so the expert
+cache takes it. The GSQ-RCO IQ3_XXS quant of Flash-Next carries IQ2_XS
+gate/up experts in 10 of its 48 layers (6 with Q2_0 down, 4 with IQ4_NL
+down). Without kernels for them, the cache refused those layers and their
+experts ran on the CPU. The 300-token answer decoded at 3.7 t/s.
+
+- **The type:** a 74-byte block is `d`, 32 codes of 16 bits and 8 scale
+  bytes. A code is a 9-bit index into the 512-entry `iq2xs_grid` and a
+  7-bit index into the sign table that IQ2_XXS already uses; a scale byte's
+  nibbles scale the sub-block's two halves, as with IQ2_S
+  (`dequantize_row_iq2_xs`).
+- **On the card** in planes, like the other low-bit types: `d | qs[64] |
+  scales[8]`.
+- **Tables:** the matvec reads the grid and the signs from local memory, as
+  IQ2_XXS does (640 entries). The GEMM reads them from constant memory.
+- **Kernels:** the matvec (1-4 columns), MUL_MAT_ID, the grouped paths
+  (`idg`, `idgg`) and the XMX GEMM (`mul_mm`, `mul_mm_id`).
+- **The expert cache's type filter** takes IQ2_XS.
+
+Measured (`measured-here`, 2026-10-09):
+
+- **`test-backend-ops`:**
+  - B60: MUL_MAT 1221/1221; MUL_MAT_ID 468/542, where the 74 failures are
+    the pin's own MXFP4 cases;
+  - A770: 542/542 and 1221/1221;
+  - the IQ2_XS cases run on the card (22 MUL_MAT_ID, before: not
+    supported), including Flash-Next's shape (2560 -> 640, 1-64 tokens);
+  - the red case: the sign index off by one fails MUL_MAT and MUL_MAT_ID
+    (ERR 1.0-1.4 against 5e-4);
+  - the grouped kernels run only when switched on. With
+    `GGML_OPENCL_KQ_GROUPED=1` the IQ2_XS cases pass 22/22 on both cards,
+    and the mutant fails 10 of them. `GGML_OPENCL_KQ_IDG=1` aborted for
+    every low-bit type; 0031 fixes that.
+- **Flash-Next IQ3_XXS served on the B60:** 13,000 MiB of slots, 32,768
+  context, MTP 2.
+  - all 48 layers cached (38 before);
+  - 7,814 slots on the card and a 27.43 GiB bank in host memory;
+  - the capital, the 20k needle and the long answer right;
+  - speed: 4.2-5.0 t/s on 300-token answers to three different prompts,
+    against 3.7 t/s without the patch. The decode is bound by storage
+    reads: 4,000-4,700 major faults and ~1 GB per answer from the ZFS pool
+    where this file sits. IQ2_XS on the NVMe decodes ~33 t/s.
+  - **Retracted:** "27.6-28.0 t/s from the second answer on". Those answers
+    repeated one prompt, whose pages were already in the page cache; the
+    "first answer slower because of the hit rate" reading goes with it.
+  - xe evicts nothing: the process's GTT stays at the bank's 28.1 GB
+    (fdinfo every 0.5 s).
+- **KL as served** (16 x 512 against unsloth's Q8_0): 0.2180 nats, top-1
+  89.90 %. The CPU arm gives 0.2211 / 89.73 %, within the error bars.
+
+## 0031-opencl-idg-args.patch
+
+Intel: the opt-in grouped MUL_MAT_ID matvec (`GGML_OPENCL_KQ_IDG=1`, 2-15
+tokens, one read of an expert's weights for its tokens) aborted with
+`CL_INVALID_ARG_INDEX` for every low-bit type. The per-pair kernel's last
+arguments (the pair order, the next projection's prefetch) were also set on
+the grouped kernel, which takes the route's tiles in their place. Found in
+0030's review. The grouped branch now skips them and, like
+`GGML_OPENCL_KQ_GROUPED`, drops an armed prefetch (it copies nothing for the
+next projection). The default path is unchanged.
+
+Its review found a second defect on that path: with an expert cache, a
+9-15-token batch (a two-branch graph, ids -1 for the pairs the other branch
+serves) left those pairs' rows unwritten in the slot projection. The router
+drops a -1 pair; the per-pair kernel writes zeros for it, the grouped kernel
+does not. The zero fill there was keyed on the call (no single branch)
+instead of the tensor. It now covers every slot or bank tensor on the
+grouped path, as it does for the GEMM. test-backend-ops cannot reach this:
+it has no cache and no -1 ids.
+
+Measured (`measured-here`, 2026-10-09):
+
+- **KL as served**, Flash-Next IQ3_XXS on the B60 with 13,000 MiB of
+  slots, 2 x 512 tokens in ubatches of 12 against unsloth's Q8_0:
+
+  | arm | mean KL | top-1 |
+  |---|---|---|
+  | the default path, before | 0.218212 | 89.877 % |
+  | `GGML_OPENCL_KQ_IDG=1`, before the fix | 6.378638 | 28.333 % |
+  | `GGML_OPENCL_KQ_IDG=1`, with it | 0.217460 | 89.706 % |
+  | the default path, after | 0.218212 | 89.877 % |
+
+  The default path's values are the same before and after the fix.
+
+`test-backend-ops -o MUL_MAT_ID`:
+
+- **The red case:** before the patch, `GGML_OPENCL_KQ_IDG=1` aborts at the
+  first IQ2_XXS case.
+- **B60:** 468/542 with the switch, as without it; the 74 failures are the
+  pin's own MXFP4 cases.
+- **A770:** 542/542 both ways.
+
+## 0032-opencl-bank-stream.patch
+
+Intel, an expert cache's prefill, opt-in (`GGML_OPENCL_BANK_STREAM=1`).
+A prefill ubatch reads each layer's bank experts, those not in VRAM slots,
+from USM host memory. Until now a gather kernel copied the routed ones into
+a card-side mirror on the compute queue, ahead of each projection's GEMM:
+~0.83 s of a 2,048-token chunk's ~4 s of kernels on Flash-Next IQ2_XS, with
+the copy engine idle (2 % busy). This patch copies each bank tensor whole on
+a second in-order queue into a ring of VRAM slots, ahead of the GEMM that
+reads it. It follows Strata's prefill ring (`src/prefill/prefill.cpp:71-104`)
+and Infernix's expert stream: the copy engine works while the compute
+engine runs the earlier projections.
+
+- **The order:** the first prefill graph learns the order of its bank
+  tensors and gathers as before. From the next graph on, each bank tensor's
+  copy is queued `ring - 1` tensors ahead
+  (`GGML_OPENCL_BANK_STREAM_RING`, default 4).
+- **Events:** a GEMM waits for its copy; a copy waits for the GEMM that
+  last read its slot.
+- **Lookahead stays inside a graph.** Decode's swaps change the banks
+  between graphs.
+- **Not streamed:** IQ4_NL banks (scales and quants split) still gather.
+- **The slots' layout is the bank's,** as the gather's mirror's was, so the
+  GEMM reads them unchanged.
+- **Red switch:** `GGML_OPENCL_BANK_STREAM_RED=1` fills each slot from the
+  next bank tensor.
+
+Measured (`measured-here`, 2026-10-10, B60, Flash-Next IQ2_XS,
+13,000 MiB of slots):
+
+- **Overlap first.** A standalone probe: a 2 GiB USM-host-to-card copy on a
+  second queue (150 ms, 14.3 GB/s) ran entirely under a compute-bound or
+  memory-bound kernel on the first queue. The B70 recipe's trap (no overlap
+  within one process on Level Zero) does not apply on this OpenCL path.
+- **Served needle prefill, 20,045 tokens** (MTP 2, 32,768 ctx, one build):
+
+  | | prefill | compute engine | copy engine | answer |
+  |---|---|---|---|---|
+  | off | 416.1 t/s | 96 % | 2 % | right |
+  | on | 497.6 t/s | 95 % | 88 % | right |
+
+- **KL as served** (16 x 512 against unsloth's Q8_0, 141 bank tensors
+  streamed, the copy engine up to 94 % busy): 0.294050 / 87.083 %, the same
+  as off.
+- **The red case** aborts the run at the next synchronisation; it never
+  passes.
+- **VRAM:** a ring of 4 takes 4 x 187.7 MiB = 751 MiB. That is why it is
+  opt-in until the served configurations are checked for eviction.
+- **Review** (an outside model, after the first push; fixed before the
+  measurements below):
+  - A slot now records the order index its last copy holds, and an
+    "issued ahead" tensor is read from its slot only if the slot still
+    holds it. Otherwise it gathers. The earlier check accepted any index
+    issued in the graph, which would have read another bank after a
+    deviation from the learnt order.
+  - The per-graph state resets on every graph (the backend's graph
+    counter), not only when the order's first tensor comes round.
+  - Each graph's copies wait for a marker of the main queue's work before
+    the graph. Decode's swaps rewrite bank entries on that queue, and the
+    copies' ordering against them had rested on host waits made for other
+    reasons.
+  - A tensor larger than the ring's slots gathers instead of being cut.
+  - A USM base that changed (a model reloaded in-process) relearns the
+    order.
+  - The main queue is flushed after the copies are issued.
+  - Not changed: the barrier still precedes the route and convert kernels,
+    not only the GEMM.
+- **After the fixes** (`measured-here`, 2026-10-10):
+  - KL with the stream on: 0.294050 / 87.083 %, unchanged; the red case
+    aborts.
+  - The deployed unit's configuration (9,500 MiB of slots, 131,072 ctx,
+    MTP 2), served needle: off 406.6 t/s, ring 4 **494.9 t/s (+21.7 %)**,
+    ring 2 392.9 t/s (one tensor of lookahead is not enough). Answers
+    right in every arm.
+  - Nothing evicted: GTT stays at the bank's 24,482 MiB. With a ring of 4,
+    VRAM peaks at 24,243 MiB against 23,448 off.
+  - These served arms ran inside the host's weekly backup window (loads of
+    ~15 min). Their decode figures (25.2 off, 22.7 / 23.0 on) are void
+    until re-measured outside it.
+- **A second review** (of the fixes): sound, with three more changes.
+  - A graph entering the learnt order at index i issues from i, not from 0.
+  - Freeing a USM bank in the order drains the copy queue and drops the
+    learnt state (the in-process reload case).
+  - `synchronize` drains the copy queue too: a copy a GEMM never consumed
+    still reads host memory.
+  - KL afterwards: 0.294050 / 87.083 %, unchanged.
+- **With a larger expert-GEMM tile** (`GGML_OPENCL_KQ_MM_ID_TILE`;
+  `measured-here`, 2026-10-11, served needle, stream on, 13,000 MiB,
+  32,768 ctx). The B60's default `2,2,1,1` dequantises a 16-row block for
+  every 32 tokens; a larger tile shares the dequant across more tokens and
+  rows:
+
+  | tile (rows x tokens, sub-groups) | prefill | decode |
+  |---|---|---|
+  | 2,2,1,1 (16 x 32, 1), the default | 494.7 | 30.7 |
+  | 4,4,2,2 (64 x 128, 4) | 600.5 | 31.3 |
+  | 4,4,2,4 (64 x 256, 8) | **634.1** | 30.4 |
+  | 4,4,4,2 (128 x 128, 8) | 589.5 | 29.0 |
+  | 4,8,2,2 (64 x 256, 4) | 475.7 | 31.3 |
+
+  - Answers right in every arm.
+  - KL with the stream and 4,4,2,4: 0.294050 / 87.083 %, unchanged.
+  - 0.7.2 prefills the needle at ~416-422 t/s; the stream and this tile at
+    634.1, above Strata's own engine on this card (620.5).
+
+## 0033-opencl-b60-mm-id-tile.patch
+
+Intel, sub-group-16 devices (the B60): MUL_MAT_ID's GEMM tile defaults to
+`4,4,2,4` (RG, TG, NSGM, NSGN: 64 rows x 256 tokens, 8 sub-groups) instead
+of `2,2,1,1` (16 rows x 32 tokens, one sub-group). The tile kernel
+dequantises its weight block once per token tile. With the old shape an
+expert of Flash-Next, at ~40 tokens per 2,048-token ubatch, paid one full
+and one nearly empty tile; a larger tile shares each dequantised block
+across more tokens and rows. The SG 8 tile (A770) is unchanged.
+`GGML_OPENCL_KQ_MM_ID_TILE` still overrides it.
+
+Measured (`measured-here`, 2026-10-11, B60):
+
+- **The served needle** (Flash-Next IQ2_XS, 13,000 MiB, 32,768 ctx,
+  0032's stream on), by tile; the table is under 0032.
+  - With this default and no override: 647.7 t/s, answers right.
+  - KL with 0032's stream and this tile: 0.294050 / 87.083 %, unchanged.
+- **The deployed configuration** (9,500 MiB, 131,072 ctx, MTP 2), two
+  processes each:
+  - prefill 408.3 / 408.2 (0.7.2's behaviour) -> 639.8 / 644.5 with
+    0032's stream and this tile;
+  - decode equal: 26.6-29.1 against 26.7-28.6, one baseline outlier 16.0;
+  - nothing evicted; VRAM peaks at 24.2-24.3 GB (0032's ring) against 23.4.
+- **The coder on the B60** (its IQ3_XXS / IQ4_XS experts take the
+  tokens-as-a kernel, which does not read this tile): pp4096 1,905.5 ->
+  1,906.0.
+- **test-backend-ops:** MUL_MAT_ID 468/542 (the pin's 74 MXFP4 cases),
+  MUL_MAT 1221/1221.
+- **Review:** sound. Local memory 32 KiB (the plain tile's), 128 work-items,
+  the route tiles' buffer bounded for any tile, rows clamped; the
+  tokens-as-a path does not read the tile.
+
+## 0034-opencl-iq-swar.patch
+
+The low-bit expert kernels (`mul_mv_iq_q8_1.cl`, and the expand helpers
+shared with `mul_mm_kq_f16.cl`) do their per-byte weight arithmetic on
+32-bit words instead of on `char4` vectors:
+
+- **The sign step** (IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S): four grid
+  bytes negated under a sign mask, `(g ^ m) + (m & 0x01010101)` in place of
+  `char4(g ^ m) - char4(m)`.
+  - Exact because no grid byte is 0 (IQ2 grids: 8, 25, 43; IQ3_XXS: 4-62;
+    IQ3_S: odd 1-15), so `~g + 1` never carries out of a byte.
+- **IQ1_M's ±delta** and **Q2_0's -1 offset**: the same trick with a
+  0x80808080 bias, so a byte's borrow cannot cross into the next byte.
+
+Why: in the B60's ISA (`ocloc compile -device bmg`, disassembled), IGC
+lowers `char4` arithmetic to one byte at a time. It moves each byte into
+its own register, widens it, computes, and packs the result back. Those
+moves were more than half of the matvecs' instructions.
+`-DLB_CHAR4_ARITH` (through `GGML_OPENCL_IQ_OPTS`) keeps the `char4` form
+for measurement.
+
+Measured (`measured-here`, 2026-10-11):
+
+- **ISA, B60** (total instructions / movs per kernel, before -> after):
+
+  | kernel | total | movs |
+  |---|---|---|
+  | IQ2_XXS | 1,405 -> 1,052 | 526 -> 206 |
+  | IQ2_S | 1,585 -> 1,230 | 541 -> 221 |
+  | IQ1_M | 1,355 -> 1,138 | 408 -> 222 |
+  | Q2_0 | 1,291 -> 1,069 | 384 -> 194 |
+
+  The dp4a count is unchanged (32 in each).
+- **B60 kernels** (`test-backend-ops perf`, MUL_MAT_ID at Flash-Next's
+  shapes, one token):
+
+  | kernel | before | after |
+  |---|---|---|
+  | IQ2_XXS | 40.7 us | 25.0 us |
+  | IQ2_S | 50.6 us | 31.1 us |
+  | Q2_0 gate/up | 33.4 us | 21.7 us |
+  | Q2_0 down | 32.1 us | 24.9 us |
+
+  Three tokens, Q2_0 down: 89.9 -> 63.5 us.
+- **A770 kernels:** within ±7 %. IQ2_S and Q2_0 are 4-11 % faster; IQ2_XXS
+  at three tokens is 6 % slower (73.6 against 69.2 us).
+- **Served Flash-Next** (IQ2_XS, B60, the unit's configuration, two
+  processes each way): decode 31.7-33.5 against 30.7-31.9 t/s; prefill
+  equal (637-650 against 639-651). The answers are right (capital, needle).
+- **The coder** (IQ3_XXS / IQ4_XS experts, A770): served decode 42.1
+  against 42.1 t/s, two processes each way. IQ3_XXS kernels are equal
+  (237.7 against 239.0 us at one token); IQ4_XS is 1-4 % faster.
+- **KL:** 0.294050 / 87.083 %, unchanged.
+- **test-backend-ops:**
+  - B60: MUL_MAT_ID 468/542 (the pin's 74 MXFP4 cases), MUL_MAT 1221/1221;
+  - A770: 542/542 and 1221/1221.
+- **Review:** the word forms are bit-exact against the `char4` forms over
+  every byte value each one is used on, checked exhaustively.
+
+## 0035-opencl-iq4-local-codebook.patch
+
+The IQ4 codebook lookup (`kv4`, used by the IQ4_XS and IQ4_NL matvecs:
+dense, MUL_MAT_ID and the grouped kernel) reads four tables from local
+memory and ORs the results:
+
+- **The tables:** the 16 codebook values, once per byte position, each
+  already shifted into its byte (64 words). `LOCAL_TABLES` copies them per
+  work-group, as it does IQ3_XXS's grid.
+- **The lookup:** a word of four weights is `t[n0] | t[16 + n1] | t[32 + n2]
+  | t[48 + n3]`.
+- **On both cards.** It replaces the constant-memory byte lookups
+  assembled as a `char4` (the B60) and the register selects (the A770,
+  `IQ4_KV_SELECT`).
+- **Switches** (`GGML_OPENCL_IQ_OPTS`, for measurement): `-DIQ4_KV_CHAR4`
+  (the old form), `-DIQ4_KV_SHIFTED` (the same tables in constant memory),
+  `-DIQ4_KV_SELECT`, and `-DIQ4_LT_RED` (the test's red case: two entries
+  swapped).
+
+Why (`measured-here`, B60):
+
+- **ALU-bound, not memory-bound.** The dense IQ4_XS matvec was bound by
+  the integer pipe, like the low-bit kernels (stage 6):
+
+  | kernel | XVE active | ALU1 utilisation | memory (SBID) stall |
+  |---|---|---|---|
+  | IQ4_XS | 68 % | 62 % | 35 % |
+  | Q4_K | 52 % | 41 % | 53 % |
+
+  At 4096×14336 (larger than L2), the same bytes per weight within 6 %,
+  IQ4_XS streamed 170-237 GB/s and Q4_K 415-426.
+- **The ISA** (`ocloc`, `bmg`) showed two costs:
+  - each constant lookup widened its index to a 64-bit address;
+  - IGC assembled the `char4` one byte at a time. A shift/OR form compiled
+    to the same code.
+- **Instruction counts:**
+  - pre-shifted tables in constant memory: dense kernel 761 -> 693
+    instructions; slower, because the 64-bit gathers remain;
+  - in local memory: 761 -> 630, movs 267 -> 86.
+- **Stage 3c's local-memory codebook was a different build.** It measured
+  slower (59.5 against 44.2 us), with a 16-byte copy per lane.
+
+Measured (`measured-here`, 2026-10-11):
+
+- **B60 kernels** (test-backend-ops perf, `char4` -> local):
+
+  | case | 1 column | 3 columns |
+  |---|---|---|
+  | dense IQ4_XS, 4096×14336 | 131.1 -> 92.3 us | 199.6 -> 155.9 us |
+  | dense IQ4_XS, 6144×2560 | 43.4 -> 24.9 us | 49.7 -> 35.7 us |
+  | dense IQ4_XS, 2560×6144 | 35.5 -> 21.8 us | 41.5 -> 30.6 us |
+  | IQ4_NL, 6144×2560 | 37.7 -> 21.6 us | |
+
+  MUL_MAT_ID IQ4_XS: 36.7 -> 22.1 us.
+- **A770 kernels** (selects -> local):
+  - dense 4096×14336: 115.2 -> 91.2 us;
+  - dense 6144×2560: 29.8 -> 21.9 us;
+  - MUL_MAT_ID: 26.4 -> 20.9 us;
+  - three columns: mixed (34.9 -> 36.6, 43.5 -> 36.7 us).
+- **Served Flash-Next, device time** (B60, the unit's configuration, a
+  profiling build, the same session, local against `char4`):
+  - the dense IQ4_XS calls are 12-20 % shorter (the 10240×2560 QKV
+    projection 78.2 -> 62.9 us, the output head 1,772 -> 1,401 us);
+  - per token: dense matvecs 11.13 -> 10.35 ms, all kernels 26.89 -> 26.09
+    ms;
+  - the same answers and draft acceptance.
+- **Served Flash-Next, wall** (B60): inside the run-to-run spread.
+  - Plain build, 13,000 MiB, two processes each way: 32.3-33.4 against
+    33.0-34.4 t/s.
+  - Profiling build: 28.6 / 29.0 against 28.1 / 28.7 t/s.
+- **The coder on the A770** (IQ4_XS experts, MTP 4), two processes each
+  way: select 41.0-42.1 t/s, local 41.9-42.9; with the host's selects
+  removed (the patch as adopted) 42.0-43.0. Same answers.
+- **test-backend-ops:**
+  - B60: MUL_MAT 1221/1221, MUL_MAT_ID 468/542 (the pin's 74 MXFP4
+    cases);
+  - A770: 1221/1221 and 542/542;
+  - the red case (`-DIQ4_LT_RED`, no other switch) fails 6-7 of 14 IQ4
+    MUL_MAT cases and 1-2 of 3-4 MUL_MAT_ID cases on both cards.
+- **Exactness:** the same int8 values reach the same dot products, so the
+  outputs are bit-identical to the old forms. KL is unaffected; the
+  perplexity runs' 512-token batches take the GEMM, which this patch does
+  not touch.
+- **Review:** no defects. One nit fixed: `-DIQ4_KV_CHAR4` now cancels the
+  local table.

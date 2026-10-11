@@ -24,6 +24,14 @@
 # q8_0 KV was slower on this model (23.6 against 31-33 t/s at 32k).
 #
 # Loading takes ~7 minutes (the slots and the bank are filled from the file).
+#
+# Since 0.7.3 (contrib/llama.cpp 0032, 0033) prefill streams the bank tensors
+# to the card on a copy queue (GGML_OPENCL_BANK_STREAM=1, opt-in, below; a
+# ring of 4 slots, ~750 MiB of VRAM). Measured in this configuration on the
+# B60 (2026-10-11): the 20k prompt read at 640-645 t/s (408 without), decode
+# 27-29 t/s, the needle and the capital right, nothing evicted, VRAM peak
+# 24.2-24.3 of 24.48 GB. Thin: drop the Environment= line if a larger slot
+# budget or another process needs the room.
 
 [Unit]
 Description=arcint-flashnext — Qwen3.8-Flash-Next IQ2_XS on libllama, expert cache + MTP, GPU.0, :8089
@@ -33,6 +41,7 @@ Conflicts=arcint-agent.service arcint-writer.service
 
 [Service]
 Type=simple
+Environment=GGML_OPENCL_BANK_STREAM=1
 ExecStart=/usr/bin/arcint \
     --engine llama \
     --gguf /models/gguf/qwen38-flash-next-iq2xs/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \

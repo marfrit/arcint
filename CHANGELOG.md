@@ -18,6 +18,45 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.7.3 — 2026-10-11
+
+**Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine
+builds llama.cpp `bed0a85` with `contrib/llama.cpp/patches` 0001-0035. No
+change to arcint's own sources: the release is the six llama.cpp patches.
+Every number is `measured-here`; the details are in
+`contrib/llama.cpp/README.md`.
+
+- **Patch 0030:** IQ2_XS on the card (matvec, MUL_MAT_ID, the grouped paths
+  and the XMX GEMM), so the expert cache takes it. Flash-Next's GSQ-RCO
+  IQ3_XXS quant carries IQ2_XS gate/up experts in 10 of its 48 layers; they
+  ran on the CPU before. Its KL as served is 0.2180 nats, within the error
+  bars of the CPU's (0.2211).
+- **Patch 0031:** the opt-in grouped MUL_MAT_ID matvec
+  (`GGML_OPENCL_KQ_IDG=1`) no longer aborts for the low-bit types, and it
+  zero-fills the pairs another branch serves (KL 6.38 -> 0.2175 on that
+  path). The default path is unchanged.
+- **Patch 0032 (opt-in, `GGML_OPENCL_BANK_STREAM=1`):** prefill copies the
+  expert cache's bank tensors whole, on a second in-order queue, into a ring
+  of VRAM slots ahead of the GEMMs that read them (`_RING`, default 4). The
+  ring costs ~750 MiB of VRAM at Flash-Next's sizes, so it stays opt-in.
+- **Patch 0033:** the B60's MUL_MAT_ID tile is 4,4,2,4 (was 2,2,1,1); the
+  A770's is unchanged. With 0032, Flash-Next IQ2_XS's 20,045-token needle
+  prefills at 640-645 t/s on the B60 (9,500 MiB of slots, 131,072 context),
+  against 408 in 0.7.2; decode equal, nothing evicted, KL unchanged
+  (0.294050). The coder's prefill on the B60 is unchanged.
+- **Patch 0034:** the IQ and low-bit kernels do their per-byte weight
+  arithmetic on 32-bit words; IGC had split the `char4` arithmetic into
+  per-byte moves. B60 kernels 22-39 % faster, Flash-Next decode ~5 % at
+  13,000 MiB of slots (31.7-33.5 against 30.7-31.9 t/s), the coder equal.
+  Bit-exact.
+- **Patch 0035:** the IQ4 codebook as four pre-shifted tables in local
+  memory, on both cards (the A770's register selects and the B60's
+  constant-memory lookups before). Dense IQ4_XS kernels 22-43 % faster on
+  the B60, 21-27 % on the A770 at one column (one three-column case 5 %
+  slower); the coder (A770) 41.0-42.1 -> 42.0-43.0 t/s; Flash-Next's kernel
+  time per token -3 %, its wall decode inside the run-to-run spread.
+  Bit-identical outputs.
+
 ## 0.7.2 — 2026-10-09
 
 **Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine

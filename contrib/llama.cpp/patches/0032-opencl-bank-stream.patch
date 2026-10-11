@@ -1,0 +1,207 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index b7775cd..e483ea7 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1096,6 +1096,24 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_moe_gather_experts = nullptr;   // an expert cache's bank -> a card-side mirror
+     cl_kernel kernel_moe_gather_pairs   = nullptr;   // the same for one token (distinct experts)
+     ggml_cl_buffer prealloc_kq_stage_q, prealloc_kq_stage_d;
++    // GGML_OPENCL_BANK_STREAM=1 (patch 0032): prefill's bank tensors copied whole, ahead of their GEMMs, on a
++    // copy queue (Strata's prefill ring, prefill.cpp:71-104; Infernix's expert stream): the copy engine works
++    // while the compute engine runs the previous projections, instead of a gather kernel on the compute queue
++    struct bank_stream_state {
++        cl_command_queue q = nullptr;
++        std::vector<const ggml_tensor *> order;               // a prefill graph's bank tensors, in its order (learnt)
++        std::unordered_map<const ggml_tensor *, int> pos;
++        bool   frozen    = false;                              // the order complete: streaming from the next graph
++        size_t max_bytes = 0;
++        std::vector<ggml_cl_buffer> ring;
++        std::vector<cl_event> copied, used;                    // per ring slot: its copy, its last GEMM
++        std::vector<int> slot_of;                              // per order index: its ring slot in this graph
++        std::vector<int> holds;                                // per ring slot: the order index its last copy holds
++        std::vector<const void *> usm_of;                      // per order index: its buffer's USM base (a reload: relearn)
++        cl_event gmark = nullptr;                              // the main queue at this graph's first copy
++        uint64_t gen = 0;                                      // the graph the per-graph state belongs to
++        int next = 0, issued_upto = -1;
++    } bstream;
+     int             kq_mm_sg = 16;
+     ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
+     int       kq_q8_1_ndst = 4;
+@@ -8575,6 +8593,8 @@ static bool ggml_backend_opencl_cpy_tensor_async(ggml_backend_t backend, const g
+ 
+ static void ggml_backend_opencl_synchronize(ggml_backend_t backend) {
+     auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
++    // patch 0032: a copy not consumed by a GEMM (a deviation from the learnt order) still reads host memory
++    if (backend_ctx->bstream.q) CL_CHECK(clFinish(backend_ctx->bstream.q));
+ 
+     cl_event evt;
+     CL_CHECK(clEnqueueBarrierWithWaitList(backend_ctx->queue, 0, nullptr, &evt));
+@@ -10750,6 +10770,25 @@ bool ggml_backend_is_opencl(ggml_backend_t backend) {
+ // split (ids at or above it are the bank's, gathered into the mirror)
+ static std::unordered_map<const ggml_tensor *, std::pair<const ggml_tensor *, int>> g_cache_pairs;
+ 
++// patch 0032: the contexts whose bank stream learnt an order. The learnt state
++// drained and dropped (the copy queue finished first): a USM bank of its order
++// freed, or a changed USM base seen at a call.
++// immortal, as the contexts are: a buffer freed after main() returns may still look here
++static std::vector<ggml_backend_opencl_context *> & g_bstream_ctxs = *new std::vector<ggml_backend_opencl_context *>();
++static void ggml_cl_bank_stream_reset(ggml_backend_opencl_context * ctx) {
++    auto & bs = ctx->bstream;
++    if (bs.q) CL_CHECK(clFinish(bs.q));
++    bs.order.clear(); bs.pos.clear(); bs.usm_of.clear(); bs.slot_of.clear();
++    std::fill(bs.holds.begin(), bs.holds.end(), -1);
++    bs.max_bytes = 0; bs.frozen = false; bs.issued_upto = -1; bs.gen = 0;
++}
++static void ggml_cl_bank_stream_forget(const void * usm) {
++    for (ggml_backend_opencl_context * ctx : g_bstream_ctxs) {
++        auto & u = ctx->bstream.usm_of;
++        if (std::find(u.begin(), u.end(), usm) != u.end()) ggml_cl_bank_stream_reset(ctx);
++    }
++}
++
+ struct ggml_backend_opencl_buffer_context {
+     // A buffer context can hold multiple cl_mem objects. This is for flattening
+     // quantized weights and should be used with GGML_OPENCL_SMALL_ALLOC where
+@@ -10773,6 +10812,7 @@ struct ggml_backend_opencl_buffer_context {
+ 
+     ~ggml_backend_opencl_buffer_context() {
+         if (usm && usm_free) {
++            ggml_cl_bank_stream_forget(usm);   // no copy reads it any more, and the learnt order goes
+             usm_free(usm_ctx, usm);
+         }
+         for (cl_mem buf : buffer) {
+@@ -25580,6 +25620,106 @@ static const void * g_kq_pf_src = nullptr;
+ static cl_mem       g_kq_pf_dst = nullptr;
+ static cl_ulong     g_kq_pf_n16 = 0;
+ 
++// GGML_OPENCL_BANK_STREAM (patch 0032). The first prefill graph learns the order
++// of its bank tensors (and gathers as before); from the next one each bank tensor
++// is copied whole into a ring slot on the copy queue, the next ring-1 ahead of
++// the GEMM that reads it. A copy waits for the GEMM that last read its slot; a
++// GEMM waits for its copy. Lookahead stays inside a graph: decode's swaps change
++// the banks between graphs. Returns true with g_kq_stage_q set, or false (gather).
++static int g_bstream_slot = -1;   // the slot the current MUL_MAT_ID reads (released after its GEMM)
++static bool ggml_cl_bank_stream(ggml_backend_opencl_context * ctx, const ggml_tensor * bank, ggml_backend_opencl_buffer_context * bctx) {
++    static const char * on_env = getenv("GGML_OPENCL_BANK_STREAM");
++    static const bool   on     = on_env != nullptr && atoi(on_env) != 0;
++    static const char * k_env  = getenv("GGML_OPENCL_BANK_STREAM_RING");
++    static const int    K      = k_env != nullptr && atoi(k_env) >= 2 ? atoi(k_env) : 4;
++    if (!on || bctx->usm == nullptr) return false;
++    auto & bs = ctx->bstream;
++    const size_t bytes = bank->nb[2] * (size_t) bank->ne[2];
++    if (!bs.frozen) {
++        auto it = bs.pos.find(bank);
++        if (it == bs.pos.end()) {
++            if (bs.order.empty() && std::find(g_bstream_ctxs.begin(), g_bstream_ctxs.end(), ctx) == g_bstream_ctxs.end()) {
++                g_bstream_ctxs.push_back(ctx);
++            }
++            bs.pos[bank] = (int) bs.order.size();
++            bs.order.push_back(bank);
++            bs.usm_of.push_back(bctx->usm);
++            bs.max_bytes = std::max(bs.max_bytes, bytes);
++            return false;
++        }
++        if (it->second != 0 || bs.order.size() < 2) return false;
++        // the first tensor again: a new graph, the order complete
++        cl_int err;
++        if (bs.q == nullptr) CL_CHECK((bs.q = clCreateCommandQueue(ctx->context, ctx->device, 0, &err), err));
++        if (bs.ring.empty()) bs.ring.resize(K);   // kept across a relearn (it only grows)
++        for (auto & b : bs.ring) b.allocate(ctx->context, bs.max_bytes);
++        if (bs.copied.empty()) bs.copied.assign(K, nullptr);
++        if (bs.used.empty())   bs.used.assign(K, nullptr);
++        bs.holds.assign(K, -1);
++        bs.slot_of.assign(bs.order.size(), -1);
++        bs.gen = 0;
++        bs.frozen = true;
++        GGML_LOG_WARN("ggml_opencl: bank stream: %zu bank tensors a prefill graph, a ring of %d x %.1f MiB\n",
++                      bs.order.size(), K, bs.max_bytes / 1048576.0);
++    }
++    auto it = bs.pos.find(bank);
++    if (it == bs.pos.end() || bytes > bs.max_bytes) return false;
++    const int i = it->second;
++    if (bs.usm_of[i] != bctx->usm) {
++        // another model's buffers (an unload and reload in this process): learn again
++        ggml_cl_bank_stream_reset(ctx);
++        return false;
++    }
++    if (bs.gen != ctx->graph_gen) {
++        // a new graph: nothing issued for it yet, and its copies wait for the main queue's work so far (decode's
++        // swaps rewrite bank entries on that queue between graphs)
++        bs.gen = ctx->graph_gen;
++        bs.issued_upto = i - 1;   // a graph entering the order at i issues from i
++        std::fill(bs.holds.begin(), bs.holds.end(), -1);
++        std::fill(bs.slot_of.begin(), bs.slot_of.end(), -1);
++        if (bs.gmark) CL_CHECK(clReleaseEvent(bs.gmark));
++        CL_CHECK(clEnqueueMarkerWithWaitList(ctx->queue, 0, nullptr, &bs.gmark));
++        CL_CHECK(clFlush(ctx->queue));
++    }
++    // GGML_OPENCL_BANK_STREAM_RED=1: the red case, each slot filled from the next bank tensor of the order
++    static const char * red_env = getenv("GGML_OPENCL_BANK_STREAM_RED");
++    static const bool   red     = red_env != nullptr && atoi(red_env) != 0;
++    auto issue = [&](int j) {
++        const ggml_tensor * t = bs.order[red ? (j + 1) % (int) bs.order.size() : j];
++        auto * tc = (ggml_backend_opencl_buffer_context *) t->buffer->context;
++        ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) t->extra;
++        const char * src = (const char *) tc->usm + e->offset + t->view_offs;
++        const int s = bs.next;
++        bs.next = (bs.next + 1) % K;
++        if (bs.copied[s]) CL_CHECK(clReleaseEvent(bs.copied[s]));
++        cl_event wl[2];
++        cl_uint  nw = 0;
++        if (bs.used[s]) wl[nw++] = bs.used[s];   // the GEMM that last read the slot
++        if (bs.gmark)   wl[nw++] = bs.gmark;     // the main queue's work before this graph
++        CL_CHECK(clEnqueueWriteBuffer(bs.q, bs.ring[s].buffer, CL_FALSE, 0, t->nb[2] * (size_t) t->ne[2], src,
++                                      nw, nw ? wl : nullptr, &bs.copied[s]));
++        bs.slot_of[j] = s;
++        bs.holds[s]   = j;
++        bs.issued_upto = j;
++    };
++    if (bs.issued_upto >= i) {
++        // issued ahead: only if its slot still holds it (a deviation from the learnt order reuses slots)
++        if (bs.slot_of[i] < 0 || bs.holds[bs.slot_of[i]] != i) return false;   // gather
++    } else {
++        // every tensor of the order fits a slot (max_bytes is their maximum, the call's own checked above)
++        while (bs.issued_upto < i) issue(bs.issued_upto + 1);
++    }
++    const int s = bs.slot_of[i];
++    // the next ring-1 tensors of this graph, behind the GEMMs that free their slots
++    while (bs.issued_upto < std::min(i + K - 1, (int) bs.order.size() - 1)) issue(bs.issued_upto + 1);
++    CL_CHECK(clFlush(bs.q));
++    CL_CHECK(clFlush(ctx->queue));   // the markers the copies wait for
++    CL_CHECK(clEnqueueBarrierWithWaitList(ctx->queue, 1, &bs.copied[s], nullptr));
++    g_kq_stage_q     = bs.ring[s].buffer;
++    g_bstream_slot   = s;
++    return true;
++}
++
+ // blocks as the GGUF stores them (buffer, byte offset): IQ3_XXS, IQ4_XS and
+ // the low-bit types
+ static bool ggml_cl_kq_as_stored(ggml_type t) {
+@@ -28690,6 +28830,8 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+                     }
+                 }
+             }
++        } else if (bctx0->usm && gemm && !single && bank0->type != GGML_TYPE_IQ4_NL && ggml_cl_bank_stream(backend_ctx, bank0, bctx0)) {
++            // streamed: g_kq_stage_q is the ring slot holding bank0 whole (the bank's layout, as the gather's mirror)
+         } else if (bctx0->usm && backend_ctx->kernel_moe_gather_experts != nullptr) {
+             auto gather = [&](const void * src, ggml_cl_buffer & stage, size_t per_expert, int n_split) {
+                 GGML_ASSERT(per_expert % 16 == 0);
+@@ -28757,6 +28899,18 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+         }
+     }
+     struct kq_stage_reset { ~kq_stage_reset() { g_kq_stage_q = g_kq_stage_d = g_kq_single_q = g_kq_single_d = nullptr; g_kq_single_split = 0; g_kq_single_nbank = 0; g_kq_single_ptr = nullptr; g_kq_pf_src = nullptr; g_kq_pf_dst = nullptr; g_kq_pf_n16 = 0; } } kq_stage_reset_;
++    // a streamed ring slot is free again once the GEMM enqueued below has run
++    struct bank_stream_release {
++        ggml_backend_opencl_context * ctx;
++        ~bank_stream_release() {
++            const int s = g_bstream_slot;
++            g_bstream_slot = -1;
++            if (s < 0) return;
++            auto & bs = ctx->bstream;
++            if (bs.used[s]) CL_CHECK(clReleaseEvent(bs.used[s]));
++            CL_CHECK(clEnqueueMarkerWithWaitList(ctx->queue, 0, nullptr, &bs.used[s]));
++        }
++    } bank_stream_release_{ backend_ctx };
+ 
+     cl_uint a = 0;
+     if (!gemm) {
