@@ -80,9 +80,9 @@ on the GPU.
   prefill 1379 t/s at 4096 tokens, 1209 at 16384; decode 43.9 / 42.4 t/s;
   task 10/10.
 - Dense agent, production from 0.5.6: B60, libllama engine, Qwen3.8-27B
-  Q4_K_M GGUF, MTP 5 drafts (40,960-id head); since 2026-10-11 n_ctx 196608
-  with --llama-kv q8_0:q4_0 (needle at 195k right, task 10/10, KL 0.0060 vs
-  q8_0's 0.0041, VRAM peak 22,773 MiB of the card's 24,480; docs/campaigns/agent-context.md),
+  Q4_K_M GGUF, MTP 5 drafts (40,960-id head); since 2026-10-12 n_ctx 229376
+  with --llama-kv q8_0:q4_0 (needle at 224k right, task 10/10, KL 0.0060 vs
+  q8_0's 0.0041, VRAM peak 23,721 MiB of the card's 24,480; docs/campaigns/agent-context.md),
   before n_ctx 131072 with --llama-kv q8_0: decode 47.1 t/s on the task prompt, task 10/10. Depth (2026-10-08,
   one lane, the repository's source as context, cold prefix, 400 tokens
   greedy): 4,109 / 28,833 / 129,981 prompt tokens prefill at 824-910 /

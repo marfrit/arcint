@@ -1,6 +1,6 @@
 # agent-context — the dense agent's context past 131,072 tokens on the 24 GB card
 
-**Open again 2026-10-11** (operator: "work on extending the agent context"): the agent serves 196,608 tokens with q8_0:q4_0 KV; the card turned out to hold 24,480 MiB, not the 22.71 GiB first assumed, so larger sizes are being measured.
+**Closed 2026-10-12** (operator: "work on extending the agent context"): the agent serves 229,376 tokens with q8_0:q4_0 KV (196,608 on 2026-10-11, before the card's real size was known).
 
 ## Charter
 
@@ -129,6 +129,19 @@ the idle free memory, with these weights and MTP
 5 (+442 MiB after load per 16,384 tokens, times four, on 196,608's deep
 peak). The levers would be smaller weights (a quality question) or fewer MTP
 drafts (~150 MiB of recurrent state each, decode speed).
+
+**Larger sizes** (`measured-here`, 2026-10-12, the same build, flags and prompts; margins
+against the 24,433 MiB free on the idle card):
+
+| n_ctx | prompt | prefill | needle | decode at depth | peak VRAM | margin |
+|---|---|---|---|---|---|---|
+| 229,376 | 223,628 | 1,356 s (164.9 t/s) | right | 13.3 t/s | 23,721 MiB | 712 MiB |
+| 245,760 | 236,938 | 1,507 s (157.2 t/s) | right | 11.5 t/s | 24,195 MiB | 238 MiB |
+
+GTT flat in both. At 229,376 the acceptance task scores 10/10 greedy (one run).
+**Deployed 229,376** (2026-10-12): the endpoint reports n_ctx 229376 and answers right.
+245,760 runs too, with a 238 MiB margin (the Flash-Next unit runs at 174 MiB); an eviction
+there would make the agent crawl rather than fail, so the deployed size keeps 712 MiB.
 
 ## Where it lives
 

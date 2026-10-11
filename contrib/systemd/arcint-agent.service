@@ -23,13 +23,16 @@
 # as q8_0 at 131,072 and on this unit at 196,608 (4k: 836.9 / 36.6 t/s; 128k:
 # 256.8 / 17.7 against q8_0's 786.8 / 37.8 and 256.1 / 16.6);
 # VRAM peak 22,773 MiB of the card's 24,480, nothing evicted. 212,992 tokens
-# also run (peak 23,247 MiB). Back: --n-ctx 131072 --llama-kv q8_0.
+# also run (peak 23,247 MiB). Since 2026-10-12: 229,376 tokens -- the needle at
+# 40 % of a 223,628-token prompt right (prefill 1,356 s, 164.9 t/s; decode there
+# 13.3 t/s), acceptance task 10/10, VRAM peak 23,721 MiB of 24,480, nothing
+# evicted. 245,760 runs with a 238 MiB margin. Back: --n-ctx 131072 --llama-kv q8_0.
 #
 # --llama-mtp-vocab: the draft head scores a 40,960-token vocabulary
 # (HyperQwen's, docs/campaigns/research-hyperqwen.md) instead of the full one.
 
 [Unit]
-Description=arcint-agent — Qwen3.8-27B dense + MTP on libllama (q8_0:q4_0 KV, 196608 tokens), GPU.0, :8087
+Description=arcint-agent — Qwen3.8-27B dense + MTP on libllama (q8_0:q4_0 KV, 229376 tokens), GPU.0, :8087
 Documentation=https://github.com/marfrit/arcint
 After=default.target
 # One card, one resident model: the units that want the same card
@@ -44,7 +47,7 @@ ExecStart=/usr/bin/arcint \
     --device GPU.0 \
     --host 0.0.0.0 \
     --port 8087 \
-    --n-ctx 196608 \
+    --n-ctx 229376 \
     --llama-kv q8_0:q4_0 \
     --llama-mtp 5 \
     --llama-mtp-vocab %h/.local/share/arcint/hyperqwen-40960.json \
