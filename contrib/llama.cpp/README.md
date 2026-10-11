@@ -1923,3 +1923,62 @@ Measured (`measured-here`, 2026-10-11, B60):
 - **Review:** sound. Local memory 32 KiB (the plain tile's), 128 work-items,
   the route tiles' buffer bounded for any tile, rows clamped; the
   tokens-as-a path does not read the tile.
+
+## 0034-opencl-iq-swar.patch
+
+The low-bit expert kernels (`mul_mv_iq_q8_1.cl`, and the expand helpers
+shared with `mul_mm_kq_f16.cl`) do their per-byte weight arithmetic on
+32-bit words instead of on `char4` vectors:
+
+- **The sign step** (IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S): four grid
+  bytes negated under a sign mask, `(g ^ m) + (m & 0x01010101)` in place of
+  `char4(g ^ m) - char4(m)`.
+  - Exact because no grid byte is 0 (IQ2 grids: 8, 25, 43; IQ3_XXS: 4-62;
+    IQ3_S: odd 1-15), so `~g + 1` never carries out of a byte.
+- **IQ1_M's ±delta** and **Q2_0's -1 offset**: the same trick with a
+  0x80808080 bias, so a byte's borrow cannot cross into the next byte.
+
+Why: in the B60's ISA (`ocloc compile -device bmg`, disassembled), IGC
+lowers `char4` arithmetic to one byte at a time. It moves each byte into
+its own register, widens it, computes, and packs the result back. Those
+moves were more than half of the matvecs' instructions.
+`-DLB_CHAR4_ARITH` (through `GGML_OPENCL_IQ_OPTS`) keeps the `char4` form
+for measurement.
+
+Measured (`measured-here`, 2026-10-11):
+
+- **ISA, B60** (total instructions / movs per kernel, before -> after):
+
+  | kernel | total | movs |
+  |---|---|---|
+  | IQ2_XXS | 1,405 -> 1,052 | 526 -> 206 |
+  | IQ2_S | 1,585 -> 1,230 | 541 -> 221 |
+  | IQ1_M | 1,355 -> 1,138 | 408 -> 222 |
+  | Q2_0 | 1,291 -> 1,069 | 384 -> 194 |
+
+  The dp4a count is unchanged (32 in each).
+- **B60 kernels** (`test-backend-ops perf`, MUL_MAT_ID at Flash-Next's
+  shapes, one token):
+
+  | kernel | before | after |
+  |---|---|---|
+  | IQ2_XXS | 40.7 us | 25.0 us |
+  | IQ2_S | 50.6 us | 31.1 us |
+  | Q2_0 gate/up | 33.4 us | 21.7 us |
+  | Q2_0 down | 32.1 us | 24.9 us |
+
+  Three tokens, Q2_0 down: 89.9 -> 63.5 us.
+- **A770 kernels:** within ±7 %. IQ2_S and Q2_0 are 4-11 % faster; IQ2_XXS
+  at three tokens is 6 % slower (73.6 against 69.2 us).
+- **Served Flash-Next** (IQ2_XS, B60, the unit's configuration, two
+  processes each way): decode 31.7-33.5 against 30.7-31.9 t/s; prefill
+  equal (637-650 against 639-651). The answers are right (capital, needle).
+- **The coder** (IQ3_XXS / IQ4_XS experts, A770): served decode 42.1
+  against 42.1 t/s, two processes each way. IQ3_XXS kernels are equal
+  (237.7 against 239.0 us at one token); IQ4_XS is 1-4 % faster.
+- **KL:** 0.294050 / 87.083 %, unchanged.
+- **test-backend-ops:**
+  - B60: MUL_MAT_ID 468/542 (the pin's 74 MXFP4 cases), MUL_MAT 1221/1221;
+  - A770: 542/542 and 1221/1221.
+- **Review:** the word forms are bit-exact against the `char4` forms over
+  every byte value each one is used on, checked exhaustively.

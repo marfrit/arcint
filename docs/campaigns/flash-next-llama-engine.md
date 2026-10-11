@@ -888,3 +888,20 @@ kernel):
     thirds did not move the 16-lane path. The integer pipe's load is not
     mainly the unpacking. Next suspect: the per-sub-block index arithmetic
     in 64-bit integers (`ulong` block indices, emulated on Intel GPUs).
+- **The ISA, read** (`measured-here`, 2026-10-11, `ocloc compile -device bmg`
+  plus `ocloc disasm`):
+  - IGC lowers `char4` arithmetic one byte at a time: a move into a byte
+    register, a widen, the operation, a pack back.
+  - Moves are 526 of the IQ2_XXS matvec's 1,405 instructions, the largest
+    class. The 64-bit index arithmetic (stage 6's suspect) was not counted
+    separately.
+- **Patch 0034, adopted:** the per-byte arithmetic on 32-bit words (SWAR),
+  bit-exact. The details are in `contrib/llama.cpp/README.md`.
+  - Movs fall by about half (IQ2_XXS 526 -> 206).
+  - B60 kernels are 23-39 % faster: IQ2_XXS 40.7 -> 25.0 us, Q2_0 down
+    32.1 -> 24.9.
+  - Served Flash-Next decode is ~5 % faster: 31.7-33.5 against 30.7-31.9
+    t/s, answers right, KL unchanged.
+  - The coder on the A770: 42.1 t/s both ways.
+  - A 23-39 % kernel gain gives ~5 % served: the expert matvecs are only a
+    part of the decode round. Their share after 0034 is not measured yet.

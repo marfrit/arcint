@@ -1,0 +1,117 @@
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
+index d381314..1c3b383 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
+@@ -1635,9 +1635,18 @@ static inline uint lb_signmask4(uint b) {
+     return (m >> 7) * 0xFFu;
+ }
+ 
+-// four unsigned grid bytes, negated where m's bytes are 0xFF
++// four unsigned grid bytes, negated where m's bytes are 0xFF. In 32-bit words
++// (patch 0034): IGC splits char4 arithmetic per byte (moves to byte registers,
++// widens, packs back: more than half of a low-bit matvec's instructions on the
++// B60). Exact because no grid byte is 0 (the IQ2 grids hold 8, 25, 43; IQ3_XXS
++// 4..62; IQ3_S odd 1..15): ~g + 1 never carries out of a byte.
++// -DLB_CHAR4_ARITH keeps the char4 form (measurement).
+ static inline uint lb_sgn4(uint g, uint m) {
++#ifdef LB_CHAR4_ARITH
+     return as_uint(as_char4(g ^ m) - as_char4(m));
++#else
++    return (g ^ m) + (m & 0x01010101u);
++#endif
+ }
+ 
+ // a 64-bit table entry as two 32-bit halves
+@@ -1718,8 +1727,16 @@ static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk,
+         #pragma unroll
+         for (int l = 0; l < 4; ++l) {
+             const uint2 g = LB_GRID_1M(idx[l]);
++#ifdef LB_CHAR4_ARITH
+             w[2 * l]     = as_uint(as_char4(g.s0) * (char4)(8) + (char4)(dl[l]));
+             w[2 * l + 1] = as_uint(as_char4(g.s1) * (char4)(8) + (char4)(dl[l]));
++#else
++            // 8 g per byte (g in -1..1: the shift's spill masked off), then +-1 per byte with the
++            // top bit flipped around it: no carry or borrow crosses a byte
++            const uint t0 = ((g.s0 << 3) & 0xF8F8F8F8u) ^ 0x80808080u, t1 = ((g.s1 << 3) & 0xF8F8F8F8u) ^ 0x80808080u;
++            w[2 * l]     = (dl[l] > 0 ? t0 + 0x01010101u : t0 - 0x01010101u) ^ 0x80808080u;
++            w[2 * l + 1] = (dl[l] > 0 ? t1 + 0x01010101u : t1 - 0x01010101u) ^ 0x80808080u;
++#endif
+         }
+         *s0 = d * (float)(2 * (s & 7) + 1) * 0.125f;
+         *s1 = d * (float)(2 * ((s >> 3) & 7) + 1) * 0.125f;
+@@ -1731,7 +1748,11 @@ static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk,
+         for (int i = 0; i < 8; ++i) {
+             const uint b = (cw[i >> 2] >> (8 * (i & 3))) & 0xFF;
+             const uint v = (b & 3) | (((b >> 2) & 3) << 8) | (((b >> 4) & 3) << 16) | (((b >> 6) & 3) << 24);
++#ifdef LB_CHAR4_ARITH
+             w[i] = as_uint(as_char4(v) - (char4)(1));
++#else
++            w[i] = ((v | 0x80808080u) - 0x01010101u) ^ 0x80808080u;   // v - 1 per byte (v in 0..3), no borrow across bytes
++#endif
+         }
+         *s0 = *s1 = d;
+     } else {                  // IQ3_S
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
+index 57fa793..fe77be4 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
+@@ -1220,9 +1220,18 @@ static inline uint lb_signmask4(uint b) {
+     return (m >> 7) * 0xFFu;
+ }
+ 
+-// four unsigned grid bytes, negated where m's bytes are 0xFF
++// four unsigned grid bytes, negated where m's bytes are 0xFF. In 32-bit words
++// (patch 0034): IGC splits char4 arithmetic per byte (moves to byte registers,
++// widens, packs back: more than half of a low-bit matvec's instructions on the
++// B60). Exact because no grid byte is 0 (the IQ2 grids hold 8, 25, 43; IQ3_XXS
++// 4..62; IQ3_S odd 1..15): ~g + 1 never carries out of a byte.
++// -DLB_CHAR4_ARITH keeps the char4 form (measurement).
+ static inline uint lb_sgn4(uint g, uint m) {
++#ifdef LB_CHAR4_ARITH
+     return as_uint(as_char4(g ^ m) - as_char4(m));
++#else
++    return (g ^ m) + (m & 0x01010101u);
++#endif
+ }
+ 
+ // a 64-bit table entry as two 32-bit halves
+@@ -1303,8 +1312,16 @@ static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk,
+         #pragma unroll
+         for (int l = 0; l < 4; ++l) {
+             const uint2 g = LB_GRID_1M(idx[l]);
++#ifdef LB_CHAR4_ARITH
+             w[2 * l]     = as_uint(as_char4(g.s0) * (char4)(8) + (char4)(dl[l]));
+             w[2 * l + 1] = as_uint(as_char4(g.s1) * (char4)(8) + (char4)(dl[l]));
++#else
++            // 8 g per byte (g in -1..1: the shift's spill masked off), then +-1 per byte with the
++            // top bit flipped around it: no carry or borrow crosses a byte
++            const uint t0 = ((g.s0 << 3) & 0xF8F8F8F8u) ^ 0x80808080u, t1 = ((g.s1 << 3) & 0xF8F8F8F8u) ^ 0x80808080u;
++            w[2 * l]     = (dl[l] > 0 ? t0 + 0x01010101u : t0 - 0x01010101u) ^ 0x80808080u;
++            w[2 * l + 1] = (dl[l] > 0 ? t1 + 0x01010101u : t1 - 0x01010101u) ^ 0x80808080u;
++#endif
+         }
+         *s0 = d * (float)(2 * (s & 7) + 1) * 0.125f;
+         *s1 = d * (float)(2 * ((s >> 3) & 7) + 1) * 0.125f;
+@@ -1316,7 +1333,11 @@ static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk,
+         for (int i = 0; i < 8; ++i) {
+             const uint b = (cw[i >> 2] >> (8 * (i & 3))) & 0xFF;
+             const uint v = (b & 3) | (((b >> 2) & 3) << 8) | (((b >> 4) & 3) << 16) | (((b >> 6) & 3) << 24);
++#ifdef LB_CHAR4_ARITH
+             w[i] = as_uint(as_char4(v) - (char4)(1));
++#else
++            w[i] = ((v | 0x80808080u) - 0x01010101u) ^ 0x80808080u;   // v - 1 per byte (v in 0..3), no borrow across bytes
++#endif
+         }
+         *s0 = *s1 = d;
+     } else {                  // IQ3_S
+@@ -1399,8 +1420,8 @@ static inline float iq3xxs_expand(global const uchar * bp, int p, uint * w,
+         const ulong m = signs[(aux >> (7 * l)) & 127];   // 0xFF in the bytes to negate
+         const uint m1 = (uint)m, m2 = (uint)(m >> 32);
+         const uint g1 = grid[idx[2 * l]], g2 = grid[idx[2 * l + 1]];
+-        w[2 * l]     = as_uint(as_char4(g1 ^ m1) - as_char4(m1));
+-        w[2 * l + 1] = as_uint(as_char4(g2 ^ m2) - as_char4(m2));
++        w[2 * l]     = lb_sgn4(g1, m1);
++        w[2 * l + 1] = lb_sgn4(g2, m2);
+     }
+     return d * (0.5f + (float)(aux >> 28)) * 0.5f;
+ }
