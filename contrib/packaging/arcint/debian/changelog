@@ -7,7 +7,7 @@ arcint (0.7.3-1) trixie; urgency=medium
     streams the expert cache's banks on a copy queue. 0033: the B60's
     MUL_MAT_ID tile 4,4,2,4; with 0032, Flash-Next's 20k prefill 408 -> 640-645
     t/s on the B60. 0034: the IQ / low-bit kernels' byte arithmetic in 32-bit
-    words (B60 kernels 23-39 % faster, Flash-Next decode ~5 %). 0035: the IQ4
+    words (B60 kernels 22-39 % faster, Flash-Next decode ~5 %). 0035: the IQ4
     codebook in local memory on both cards (the coder on the A770 41.0-42.1
     -> 42.0-43.0 t/s). Runtime floor unchanged at marfrit-openvino +p25.
 

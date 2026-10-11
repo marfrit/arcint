@@ -901,12 +901,12 @@ kernel):
 - **Patch 0034, adopted:** the per-byte arithmetic on 32-bit words (SWAR),
   bit-exact. The details are in `contrib/llama.cpp/README.md`.
   - Movs fall by about half (IQ2_XXS 526 -> 206).
-  - B60 kernels are 23-39 % faster: IQ2_XXS 40.7 -> 25.0 us, Q2_0 down
+  - B60 kernels are 22-39 % faster: IQ2_XXS 40.7 -> 25.0 us, Q2_0 down
     32.1 -> 24.9.
   - Served Flash-Next decode is ~5 % faster: 31.7-33.5 against 30.7-31.9
     t/s, answers right, KL unchanged.
   - The coder on the A770: 42.1 t/s both ways.
-  - A 23-39 % kernel gain gives ~5 % served: the expert matvecs are only a
+  - A 22-39 % kernel gain gives ~5 % served: the expert matvecs are only a
     part of the decode round. Their share after 0034 is not measured yet.
   - **In the unit** (`measured-here`, 2026-10-11): `arcint-flashnext` runs
     0.7.2 + 0001-0034 since 0034's adoption, in the deployed configuration

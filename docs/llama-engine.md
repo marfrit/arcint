@@ -152,7 +152,7 @@ the engine adds nothing to it. The IQ3_XXS of the same series (0.2211 / 89.7 %)
 misses it too. 10 of its layers carry IQ2_XS gate/up experts, which the
 expert cache took only with `contrib/llama.cpp` 0030: before it, those layers
 ran on the CPU. With it every layer is cached and the KL as served is 0.2180,
-equal to the CPU's. From the ZFS pool the answer still decodes at 4-5 t/s
+within the error bars of the CPU's (0.2211). From the ZFS pool the answer still decodes at 4-5 t/s
 (3.7 before): about 1 GB of storage reads an answer
 (`docs/campaigns/strata-sycl-b60.md`; an earlier 28 t/s was a warm page
 cache from a repeated prompt, retracted).
@@ -180,7 +180,7 @@ queue into a ring of VRAM slots (`GGML_OPENCL_BANK_STREAM_RING`, default 4,
 MUL_MAT_ID tile is 4,4,2,4. Measured (`measured-here`, 2026-10-11, B60):
 the needle prefills at 640-645 t/s with 9,500 MiB of slots and 131,072
 context (408 before), decode equal (27-29 t/s in that configuration),
-nothing evicted, VRAM peak 24.27 of 24.48 GB. 0034 and 0035 make the IQ
+nothing evicted, VRAM peak 24.2-24.3 of 24.48 GB. 0034 and 0035 make the IQ
 kernels' byte arithmetic and the IQ4 codebook cheaper (Flash-Next decode
 ~5 % at 13,000 MiB; the coder on the A770 +2 %).
 

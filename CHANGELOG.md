@@ -28,7 +28,8 @@ Every number is `measured-here`; the details are in
 - **Patch 0030:** IQ2_XS on the card (matvec, MUL_MAT_ID, the grouped paths
   and the XMX GEMM), so the expert cache takes it. Flash-Next's GSQ-RCO
   IQ3_XXS quant carries IQ2_XS gate/up experts in 10 of its 48 layers; they
-  ran on the CPU before. Its KL as served is 0.2180 nats, equal to the CPU's.
+  ran on the CPU before. Its KL as served is 0.2180 nats, within the error
+  bars of the CPU's (0.2211).
 - **Patch 0031:** the opt-in grouped MUL_MAT_ID matvec
   (`GGML_OPENCL_KQ_IDG=1`) no longer aborts for the low-bit types, and it
   zero-fills the pairs another branch serves (KL 6.38 -> 0.2175 on that
@@ -44,15 +45,16 @@ Every number is `measured-here`; the details are in
   (0.294050). The coder's prefill on the B60 is unchanged.
 - **Patch 0034:** the IQ and low-bit kernels do their per-byte weight
   arithmetic on 32-bit words; IGC had split the `char4` arithmetic into
-  per-byte moves. B60 kernels 23-39 % faster, Flash-Next decode ~5 % at
+  per-byte moves. B60 kernels 22-39 % faster, Flash-Next decode ~5 % at
   13,000 MiB of slots (31.7-33.5 against 30.7-31.9 t/s), the coder equal.
   Bit-exact.
 - **Patch 0035:** the IQ4 codebook as four pre-shifted tables in local
   memory, on both cards (the A770's register selects and the B60's
   constant-memory lookups before). Dense IQ4_XS kernels 22-43 % faster on
-  the B60, 21-27 % on the A770; the coder (A770) 41.0-42.1 -> 42.0-43.0
-  t/s; Flash-Next's kernel time per token -3 %, its wall decode inside the
-  run-to-run spread. Bit-identical outputs.
+  the B60, 21-27 % on the A770 at one column (one three-column case 5 %
+  slower); the coder (A770) 41.0-42.1 -> 42.0-43.0 t/s; Flash-Next's kernel
+  time per token -3 %, its wall decode inside the run-to-run spread.
+  Bit-identical outputs.
 
 ## 0.7.2 — 2026-10-09
 
