@@ -905,3 +905,13 @@ kernel):
   - The coder on the A770: 42.1 t/s both ways.
   - A 23-39 % kernel gain gives ~5 % served: the expert matvecs are only a
     part of the decode round. Their share after 0034 is not measured yet.
+  - **In the unit** (`measured-here`, 2026-10-11): `arcint-flashnext` runs
+    0.7.2 + 0001-0034 since 0034's adoption, in the deployed configuration
+    (9,500 MiB, 131,072 ctx, MTP 2, 0032's stream). The live check through
+    Roundhouse:
+    - answers right (capital, needle);
+    - 20k prefill 648.0 t/s;
+    - decode 27.5 / 29.3 t/s, against 27.3 / 28.4 on the 0033 binary. That
+      is inside the spread: with 9,500 MiB the misses take a larger share of
+      the round than in the 13,000 MiB A/B;
+    - VRAM peak 24.24 GB, nothing evicted.
