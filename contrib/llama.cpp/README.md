@@ -1264,7 +1264,8 @@ the decode-path work Flash-Next and its MTP verify needed on Intel:
   ~650 us a projection on a 4-token step, profiled).
 - **IQ4 codebook per card**: register selects where the device has 8-wide
   sub-groups (A770: MV_ID 34 -> 28 us), constant gathers elsewhere (B60:
-  130 vs 146 us dense).
+  130 vs 146 us dense). Superseded by patch 0035 (a local-memory codebook
+  on both cards).
 - **SCALE -> SILU and SCALE -> SIGMOID [-> SCALE] fused** into one
   elementwise kernel (`kernel_scale_act_f32`, `GGML_OPENCL_FUSE_SCALE_ACT=0`
   turns it off): fewer launches a step, the served text identical; no
@@ -1318,7 +1319,8 @@ the decode-path work Flash-Next and its MTP verify needed on Intel:
   verify's distinct experts (logged every 200 steps). `GGML_OPENCL_IQ_OPTS` adds defines to the IQ
   matvec builds. Measured slower and removed: the IQ4 codebook by byte
   pairs and per lane in local memory, a per-work-group scan for the pair
-  order.
+  order. (Patch 0035's local codebook is a different build: one table per
+  work-group, with each value already in its byte.)
 
 `test-backend-ops` against the CPU (`measured-here`, B60 and A770): MUL_MAT
 557/557 and MUL_MAT_ID 181/181 for the IQ, low-bit, F16 and BF16 types,
@@ -1982,3 +1984,89 @@ Measured (`measured-here`, 2026-10-11):
   - A770: 542/542 and 1221/1221.
 - **Review:** the word forms are bit-exact against the `char4` forms over
   every byte value each one is used on, checked exhaustively.
+
+## 0035-opencl-iq4-local-codebook.patch
+
+The IQ4 codebook lookup (`kv4`, used by the IQ4_XS and IQ4_NL matvecs:
+dense, MUL_MAT_ID and the grouped kernel) reads four tables from local
+memory and ORs the results:
+
+- **The tables:** the 16 codebook values, once per byte position, each
+  already shifted into its byte (64 words). `LOCAL_TABLES` copies them per
+  work-group, as it does IQ3_XXS's grid.
+- **The lookup:** a word of four weights is `t[n0] | t[16 + n1] | t[32 + n2]
+  | t[48 + n3]`.
+- **On both cards.** It replaces the constant-memory byte lookups
+  assembled as a `char4` (the B60) and the register selects (the A770,
+  `IQ4_KV_SELECT`).
+- **Switches** (`GGML_OPENCL_IQ_OPTS`, for measurement): `-DIQ4_KV_CHAR4`
+  (the old form), `-DIQ4_KV_SHIFTED` (the same tables in constant memory),
+  `-DIQ4_KV_SELECT`, and `-DIQ4_LT_RED` (the test's red case: two entries
+  swapped).
+
+Why (`measured-here`, B60):
+
+- **ALU-bound, not memory-bound.** The dense IQ4_XS matvec was bound by
+  the integer pipe, like the low-bit kernels (stage 6):
+
+  | kernel | XVE active | ALU1 utilisation | memory (SBID) stall |
+  |---|---|---|---|
+  | IQ4_XS | 68 % | 62 % | 35 % |
+  | Q4_K | 52 % | 41 % | 53 % |
+
+  At 4096×14336 (larger than L2), the same bytes per weight within 6 %,
+  IQ4_XS streamed 170-237 GB/s and Q4_K 415-426.
+- **The ISA** (`ocloc`, `bmg`) showed two costs:
+  - each constant lookup widened its index to a 64-bit address;
+  - IGC assembled the `char4` one byte at a time. A shift/OR form compiled
+    to the same code.
+- **Instruction counts:**
+  - pre-shifted tables in constant memory: dense kernel 761 -> 693
+    instructions; slower, because the 64-bit gathers remain;
+  - in local memory: 761 -> 630, movs 267 -> 86.
+- **Stage 3c's local-memory codebook was a different build.** It measured
+  slower (59.5 against 44.2 us), with a 16-byte copy per lane.
+
+Measured (`measured-here`, 2026-10-11):
+
+- **B60 kernels** (test-backend-ops perf, `char4` -> local):
+
+  | case | 1 column | 3 columns |
+  |---|---|---|
+  | dense IQ4_XS, 4096×14336 | 131.1 -> 92.3 us | 199.6 -> 155.9 us |
+  | dense IQ4_XS, 6144×2560 | 43.4 -> 24.9 us | 49.7 -> 35.7 us |
+  | dense IQ4_XS, 2560×6144 | 35.5 -> 21.8 us | 41.5 -> 30.6 us |
+  | IQ4_NL, 6144×2560 | 37.7 -> 21.6 us | |
+
+  MUL_MAT_ID IQ4_XS: 36.7 -> 22.1 us.
+- **A770 kernels** (selects -> local):
+  - dense 4096×14336: 115.2 -> 91.2 us;
+  - dense 6144×2560: 29.8 -> 21.9 us;
+  - MUL_MAT_ID: 26.4 -> 20.9 us;
+  - three columns: mixed (34.9 -> 36.6, 43.5 -> 36.7 us).
+- **Served Flash-Next, device time** (B60, the unit's configuration, a
+  profiling build, the same session, local against `char4`):
+  - the dense IQ4_XS calls are 12-20 % shorter (the 10240×2560 QKV
+    projection 78.2 -> 62.9 us, the output head 1,772 -> 1,401 us);
+  - per token: dense matvecs 11.13 -> 10.35 ms, all kernels 26.89 -> 26.09
+    ms;
+  - the same answers and draft acceptance.
+- **Served Flash-Next, wall** (B60): inside the run-to-run spread.
+  - Plain build, 13,000 MiB, two processes each way: 32.3-33.4 against
+    33.0-34.4 t/s.
+  - Profiling build: 28.6 / 29.0 against 28.1 / 28.7 t/s.
+- **The coder on the A770** (IQ4_XS experts, MTP 4), two processes each
+  way: select 41.0-42.1 t/s, local 41.9-42.9; with the host's selects
+  removed (the patch as adopted) 42.0-43.0. Same answers.
+- **test-backend-ops:**
+  - B60: MUL_MAT 1221/1221, MUL_MAT_ID 468/542 (the pin's 74 MXFP4
+    cases);
+  - A770: 1221/1221 and 542/542;
+  - the red case (`-DIQ4_LT_RED`, no other switch) fails 6-7 of 14 IQ4
+    MUL_MAT cases and 1-2 of 3-4 MUL_MAT_ID cases on both cards.
+- **Exactness:** the same int8 values reach the same dot products, so the
+  outputs are bit-identical to the old forms. KL is unaffected; the
+  perplexity runs' 512-token batches take the GEMM, which this patch does
+  not touch.
+- **Review:** no defects. One nit fixed: `-DIQ4_KV_CHAR4` now cancels the
+  local table.

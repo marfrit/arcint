@@ -379,7 +379,10 @@ Kernel microbenchmarks (test-backend-ops perf, B60, weights in VRAM):
 | BF16 320 x 10240, 3 columns | 17.9 us | 4 rows a K-split work-group (`GGML_OPENCL_F16_KSPLIT4=1`): 12.7 | faster in isolation (weights in L2); off by default |
 
 The constant-memory gathers stay the fastest IQ4 decode found on the B60
-(register selects were slower too, stage 3b). Layout is not the bound at a
+(register selects were slower too, stage 3b). (Superseded on 2026-10-11 by
+patch 0035, stage 6: one table per work-group in local memory, with each
+value already in its byte. The local-memory row above copied 16 bytes per
+lane, a different build.) Layout is not the bound at a
 verify's width either: IQ4_NL in flat planes against IQ4_XS as stored, the
 same codebook, 6144 x 2560: 36.2 vs 44.3 us at one column, 47.8 vs 49.2 at
 three. A planar IQ4_XS was not built.
@@ -915,3 +918,35 @@ kernel):
       is inside the spread: with 9,500 MiB the misses take a larger share of
       the round than in the 13,000 MiB A/B;
     - VRAM peak 24.24 GB, nothing evicted.
+- **The decode round after 0034** (`measured-here`, 2026-10-11, B60, the
+  unit's configuration):
+  - profile: a profiling build of the same tree, served, the second long
+    answer's decode only (300 tokens, MTP 2, ~2.3 tokens a round);
+  - 35.6 ms a token of wall time, 26.9 ms of it kernels (1,810 launches a
+    token).
+
+  | share of a token | time |
+  |---|---|
+  | expert matvecs | 10.8 ms |
+  | dense matvecs | 11.1 ms (IQ4_XS 4.5, F16 4.2, the draft head's Q6_K 1.05) |
+  | the rest | 4.9 ms |
+
+  - **The expert matvecs are bound by the misses' link time,** not by
+    their ALU work: an IQ2_S call takes 30-50 us when all its experts hit
+    and ~50 us more for each expert read over the link (a llama-bench
+    profile's duration histogram). That fits 0034's kernel gain showing
+    less at 9,500 MiB than at 13,000; it was not measured further.
+  - **The dense IQ4_XS matvec was ALU-bound** (XVE active 68 %, ALU1 62 %;
+    Q4_K 52 / 41 % with a 53 % memory stall) at half of Q4_K's bandwidth:
+    patch 0035.
+  - **The F16 products** (the hyper-connection pair 2.9 ms, the router 0.44,
+    the injects 0.39) were measured in stage 3c: `KSPLIT4` was faster in
+    isolation and not served, and the fused hyper-connection read was no
+    faster. Not repeated.
+- **Patch 0035, adopted:** the IQ4 codebook as four pre-shifted tables in
+  local memory, on both cards. The details are in `contrib/llama.cpp/README.md`.
+  - Kernels 22-43 % faster on the B60, 21-27 % on the A770 at one column.
+  - Served Flash-Next: device time 26.89 -> 26.09 ms a token; wall inside
+    the spread.
+  - The coder on the A770: 41.0-42.1 -> 41.9-42.9 t/s.
+  - Bit-identical outputs.

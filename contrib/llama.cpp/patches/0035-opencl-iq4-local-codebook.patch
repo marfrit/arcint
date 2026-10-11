@@ -1,0 +1,183 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 6e8da4c..55ed4cc 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -2358,7 +2358,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                 for (int nc = 1; nc <= 4; ++nc) {
+                     const std::string opts = compile_opts + " -DN_DST=" + std::to_string(backend_ctx->kq_q8_1_ndst) +
+                         " -DN_SIMDGROUP=4 -DNCOLS=" + std::to_string(nc) + (nc > 1 ? " -cl-intel-256-GRF-per-thread" : "") +
+-                        (sg8 ? " -DIQ4_KV_SELECT" : "") + one_term + iq_extra_opts;
++                        one_term + iq_extra_opts;   // the IQ4 codebook in local memory on every card (0035; -DIQ4_KV_SELECT: the A770's selects before)
+                     cl_program prog = build_program_from_source_optional(backend_ctx, iq_src.c_str(), opts);
+                     if (prog == nullptr) {
+                         GGML_LOG_WARN("ggml_opencl: IQ matvec for %d column(s) not built; IQ weights go to the CPU\n", nc);
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
+index fe77be4..6d83343 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
+@@ -1377,19 +1377,48 @@ static inline int dot8_ss(const uint * w, uint4 x0, uint4 x1) {
+     return a;
+ }
+ 
+-// four 4-bit codes (one per byte, low nibble) -> four int8 kvalues
++// four 4-bit codes (one per byte, low nibble) -> four int8 kvalues (patch
++// 0035). IGC assembles a char4 one byte at a time, and the constant table's
++// lookups each widen their index to a 64-bit address: on the B60 that was a
++// third of the dense IQ4_XS matvec's instructions. By default the codebook is
++// four tables with each value already in its byte, copied into local memory
++// by LOCAL_TABLES (32-bit addresses), and a word is their OR.
++// On the A770 too, where it replaced the register selects below (coder
++// decode 41.0-42.1 -> 41.9-42.9 t/s). IQ4_KV_SHIFTED: the same tables in
++// constant memory; IQ4_KV_CHAR4: the char4 form; IQ4_KV_SELECT: the selects
++// (measurement).
++#if !defined(IQ4_KV_CHAR4) && !defined(IQ4_KV_SHIFTED) && !defined(IQ4_KV_SELECT)
++#define IQ4_KV_LOCAL
++#endif
++#if defined(IQ4_KV_CHAR4)
++#undef IQ4_KV_LOCAL
+ static inline uint kv4(uint n) {
+     return as_uint((char4)(kvalues_iq4nl[n & 0xF], kvalues_iq4nl[(n >> 8) & 0xF],
+                            kvalues_iq4nl[(n >> 16) & 0xF], kvalues_iq4nl[(n >> 24) & 0xF]));
+ }
++#else
++constant uint kvalues_iq4nl_sh[64] = {
++#define KV_ROW(s) (0x81u << s), (0x98u << s), (0xADu << s), (0xBFu << s), (0xCFu << s), (0xDDu << s), (0xEAu << s), (0xF6u << s), \
++                  (0x01u << s), (0x0Du << s), (0x19u << s), (0x26u << s), (0x35u << s), (0x45u << s), (0x59u << s), (0x71u << s)
++    KV_ROW(0), KV_ROW(8), KV_ROW(16), KV_ROW(24)
++#undef KV_ROW
++};
++#ifdef IQ4_KV_LOCAL
++#define kv4(n) (kvt[(n) & 0xF] | kvt[16 + (((n) >> 8) & 0xF)] | kvt[32 + (((n) >> 16) & 0xF)] | kvt[48 + (((n) >> 24) & 0xF)])
++#else
++static inline uint kv4(uint n) {
++    return kvalues_iq4nl_sh[n & 0xF] | kvalues_iq4nl_sh[16 + ((n >> 8) & 0xF)] |
++           kvalues_iq4nl_sh[32 + ((n >> 16) & 0xF)] | kvalues_iq4nl_sh[48 + ((n >> 24) & 0xF)];
++}
++#endif
++#endif
+ 
+ // 16 code bytes -> the 32 weights' int8 values: low nibbles are weights
+ // 0..15, high nibbles 16..31 (dequantize_row_iq4_nl / _iq4_xs)
+-#ifdef IQ4_KV_SELECT
++#if defined(IQ4_KV_SELECT) && !defined(IQ4_KV_LOCAL)
+ // the codebook as four packed words, picked with selects and shifts: faster
+ // than the constant gathers on the A770 (MV_ID 34 -> 28 us, dense 137 -> 120),
+-// slower on the B60 (130 -> 146; measured-here), so per card (IQ4_KV_SELECT
+-// where the device has 8-wide sub-groups)
++// slower on the B60 (130 -> 146; measured-here); the A770's default until 0035
+ static inline uint kv1(uint i) {
+     const uint w = (i & 8) ? ((i & 4) ? 0x71594535u : 0x26190D01u) : ((i & 4) ? 0xF6EADDCFu : 0xBFAD9881u);
+     return (w >> (8 * (i & 3))) & 0xFFu;
+@@ -1397,7 +1426,7 @@ static inline uint kv1(uint i) {
+ #undef kv4
+ #define kv4(n) (kv1((n) & 0xF) | (kv1(((n) >> 8) & 0xF) << 8) | (kv1(((n) >> 16) & 0xF) << 16) | (kv1(((n) >> 24) & 0xF) << 24))
+ #endif
+-static inline void iq4_expand(uint4 q, uint * w) {
++static inline void iq4_expand(uint4 q, uint * w, local const uint * kvt) {
+     w[0] = kv4(q.s0 & 0x0F0F0F0Fu);        w[1] = kv4(q.s1 & 0x0F0F0F0Fu);
+     w[2] = kv4(q.s2 & 0x0F0F0F0Fu);        w[3] = kv4(q.s3 & 0x0F0F0F0Fu);
+     w[4] = kv4((q.s0 >> 4) & 0x0F0F0F0Fu); w[5] = kv4((q.s1 >> 4) & 0x0F0F0F0Fu);
+@@ -1427,12 +1456,12 @@ static inline float iq3xxs_expand(global const uchar * bp, int p, uint * w,
+ }
+ 
+ // IQ4_XS sub-block p of the block at bp (136 bytes): values and scale
+-static inline float iq4xs_expand(global const uchar * bp, int p, uint * w) {
++static inline float iq4xs_expand(global const uchar * bp, int p, uint * w, local const uint * kvt) {
+     const float d = vload_half(0, (global const half *)bp);
+     const uint sh = ((global const ushort *)bp)[1];
+     const uint sl = bp[4 + p / 2];
+     const int ls = ((sl >> (4 * (p & 1))) & 0xF) | (((sh >> (2 * p)) & 3) << 4);
+-    iq4_expand(vload4(0, (global const uint *)(bp + 8 + 16 * p)), w);
++    iq4_expand(vload4(0, (global const uint *)(bp + 8 + 16 * p)), w, kvt);
+     return d * (float)(ls - 32);
+ }
+ 
+@@ -1545,7 +1574,7 @@ static inline void mv_lb4(const int TYPE, global const uchar * S, int n32, int f
+ // multiple of 32 only: Flash-Next's down projections have K = 640)
+ static inline void mv_iq4_nl(global const uchar * q, global const half * dp, ulong blk0, int n32, int first_row, int ne01,
+                              global const char * xq, global const float * xd, ulong res,
+-                             global float * out, ulong ostride) {
++                             global float * out, ulong ostride, local const uint * kvt) {
+     const int lane = get_sub_group_local_id();
+     const int ne00 = n32 * 32;
+     global const char  * xq2 = xq + res;
+@@ -1573,7 +1602,7 @@ static inline void mv_iq4_nl(global const uchar * q, global const half * dp, ulo
+             if (first_row + r >= ne01) break;
+             const ulong blk = blk0 + (ulong)r * n32 + b32;
+             uint w[8];
+-            iq4_expand(vload4(0, (global const uint *)(q + blk * 16)), w);
++            iq4_expand(vload4(0, (global const uint *)(q + blk * 16)), w, kvt);
+             const float s = vload_half(blk, dp);
+             #pragma unroll
+             for (int c = 0; c < NCOLS; ++c) {
+@@ -1620,7 +1649,7 @@ static inline void mv_iq(const int TYPE, global const uchar * q, global const ha
+             if (TYPE == 0) {
+                 s = iq3xxs_expand(q + row0_off + (ulong)r * row_bytes + (ulong)ib * 98, p, w, grid, signs);
+             } else {
+-                s = iq4xs_expand(q + row0_off + (ulong)r * row_bytes + (ulong)ib * 136, p, w);
++                s = iq4xs_expand(q + row0_off + (ulong)r * row_bytes + (ulong)ib * 136, p, w, (local const uint *)signs);
+             }
+             #pragma unroll
+             for (int c = 0; c < NCOLS; ++c) {
+@@ -1640,6 +1669,17 @@ static inline void mv_iq(const int TYPE, global const uchar * q, global const ha
+ // low-bit grid (IQ2_XXS or IQ2_XS + signs, IQ1_M); the IQ4 types 128
+ // IQ2_S and IQ3_S keep constant grids (a local copy per work-group cost more: 146 -> 245, 255 -> 335 us, B60)
+ #define LB_LT_ULONGS(T) ((T) == 8 ? 2048 : (T) == 11 ? 640 : (T) == 6 ? 384 : 128)
++#ifdef IQ4_KV_LOCAL
++#define IQ4_LT 1
++#ifndef IQ4_LT_RED   // the red case of the test: two codebook entries swapped
++#define IQ4_LT_VAL(i) kvalues_iq4nl_sh[i]
++#else
++#define IQ4_LT_VAL(i) kvalues_iq4nl_sh[(i) ^ 1]
++#endif
++#else
++#define IQ4_LT 0
++#define IQ4_LT_VAL(i) 0u
++#endif
+ #define LOCAL_TABLES(TYPE)                                                                     \
+     local uint  lgrid[256];                                                                    \
+     local ulong lsigns[LB_LT_ULONGS(TYPE)];   /* IQ3_XXS's signs, or a low-bit grid */       \
+@@ -1665,8 +1705,11 @@ static inline void mv_iq(const int TYPE, global const uchar * q, global const ha
+             for (int i_ = lid_; i_ < 2048; i_ += lsz_) {                                       \
+                 const ulong v_ = iq1s_grid[i_]; lt_[2 * i_] = (uint)v_; lt_[2 * i_ + 1] = (uint)(v_ >> 32); \
+             }                                                                                  \
++        } else if (IQ4_LT && ((TYPE) == 1 || (TYPE) == 2)) {                                   \
++            for (int i_ = lid_; i_ < 64; i_ += lsz_) lt_[i_] = IQ4_LT_VAL(i_);                 \
+         }                                                                                      \
+-        if ((TYPE) == 0 || (TYPE) == 6 || (TYPE) == 8 || (TYPE) == 11) barrier(CLK_LOCAL_MEM_FENCE);                          \
++        if ((TYPE) == 0 || (TYPE) == 6 || (TYPE) == 8 || (TYPE) == 11 || (IQ4_LT && ((TYPE) == 1 || (TYPE) == 2))) \
++            barrier(CLK_LOCAL_MEM_FENCE);                                                      \
+     }
+ 
+ // row byte strides of the blocked types: IQ3_XXS nb*98, IQ4_XS nb*136
+@@ -1692,7 +1735,7 @@ kernel void NAME(global const uchar * q, ulong offq, global const half * dp,
+     }                                                                                          \
+     if ((TYPE) == 2) {                                                                         \
+         mv_iq4_nl(q + offq, dp, (ulong)first_row * (ne00 / 32), ne00 / 32, first_row, ne01,    \
+-                  xq, xd, (ulong)ne00 * NCOLS, (global float *)(dst + offd), nb1 / sizeof(float)); \
++                  xq, xd, (ulong)ne00 * NCOLS, (global float *)(dst + offd), nb1 / sizeof(float), (local const uint *)lsigns); \
+         return;                                                                                \
+     }                                                                                          \
+     mv_iq(TYPE, q + offq, dp, (ulong)first_row * ROW_BYTES(TYPE, nb), ROW_BYTES(TYPE, nb), nb,        \
+@@ -1828,7 +1871,7 @@ kernel void NAME(global const uchar * q, ulong offq, global const half * dp,
+     if ((TYPE) == 2) {                                                                         \
+         mv_iq4_nl(q + offq, dp, ((ulong)e * ne01 + first_row) * (ne00 / 32), ne00 / 32, first_row, ne01, \
+                   xq + (ulong)col * ne00, xd + (ulong)col * (ne00 / 32), res,                  \
+-                  (global float *)(dst + offd + t * nb2 + i * nb1), 0);                        \
++                  (global float *)(dst + offd + t * nb2 + i * nb1), 0, (local const uint *)lsigns); \
+         return;                                                                                \
+     }                                                                                          \
+     mv_iq(TYPE, q + offq, dp, ((ulong)e * ne01 + first_row) * ROW_BYTES(TYPE, nb), ROW_BYTES(TYPE, nb), nb, \
+@@ -2107,10 +2150,10 @@ static inline void mv_group(const int TYPE, global const uchar * q, global const
+             if (TYPE == 0) {
+                 s0[r] = s1[r] = iq3xxs_expand(q + row * rb + (ulong)(b32 >> 3) * 98, b32 & 7, w[r], grid, signs);
+             } else if (TYPE == 1) {
+-                s0[r] = s1[r] = iq4xs_expand(q + row * rb + (ulong)(b32 >> 3) * 136, b32 & 7, w[r]);
++                s0[r] = s1[r] = iq4xs_expand(q + row * rb + (ulong)(b32 >> 3) * 136, b32 & 7, w[r], (local const uint *)signs);
+             } else if (TYPE == 2) {
+                 const ulong blk = row * n32 + b32;
+-                iq4_expand(vload4(0, (global const uint *)(q + blk * 16)), w[r]);
++                iq4_expand(vload4(0, (global const uint *)(q + blk * 16)), w[r], (local const uint *)signs);
+                 s0[r] = s1[r] = vload_half(blk, dp);
+             } else {
+                 lb_expand(TYPE, lb_S, lb_nblk, LB_BI(TYPE, row % ne01, lb_nbr, b32), LB_P(TYPE, b32), w[r], &s0[r], &s1[r],
