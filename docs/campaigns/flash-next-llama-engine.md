@@ -800,3 +800,18 @@ The levers from `research-b70-field.md`, tried on the B60. All
     Intel prompt path's bound in the dequant that feeds XMX; the B70
     recipe's MoE kernel decodes in registers into DPAS operands, in 32-row
     blocks.
+- **The expert GEMM's tile** (`measured-here`, 2026-10-11). The B60's
+  MUL_MAT_ID tile `2,2,1,1` is one sub-group of 16 rows x 32 tokens; it
+  dequantises its weights once per 32 tokens. At ~40 tokens an expert per
+  2,048-token chunk, each expert paid one full and one nearly empty tile.
+  This is also why larger chunks did not help: more tokens meant more
+  tiles, each dequantising again.
+  - llama-bench pp2048 at depth 4,096, stream on: 424 (default) -> 617 t/s
+    at `4,4,2,2`.
+  - Served needle: 494.7 (default) -> **634.1 t/s at `4,4,2,4`**, answers
+    right, KL unchanged (0.294050).
+  - With the stream: 0.7.2's 416-422 -> 634 t/s, above Strata's own engine
+    on this card (620.5).
+  - Before it becomes the B60's default: the coder's prefill on the B60
+    with it, and decode in the deployed configuration outside the backup
+    window.

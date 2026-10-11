@@ -1866,3 +1866,28 @@ Measured (`measured-here`, 2026-10-10, B60, Flash-Next IQ2_XS,
   - These served arms ran inside the host's weekly backup window (loads of
     ~15 min). Their decode figures (25.2 off, 22.7 / 23.0 on) are void
     until re-measured outside it.
+- **A second review** (of the fixes): sound, with three more changes.
+  - A graph entering the learnt order at index i issues from i, not from 0.
+  - Freeing a USM bank in the order drains the copy queue and drops the
+    learnt state (the in-process reload case).
+  - `synchronize` drains the copy queue too: a copy a GEMM never consumed
+    still reads host memory.
+  - KL afterwards: 0.294050 / 87.083 %, unchanged.
+- **With a larger expert-GEMM tile** (`GGML_OPENCL_KQ_MM_ID_TILE`;
+  `measured-here`, 2026-10-11, served needle, stream on, 13,000 MiB,
+  32,768 ctx). The B60's default `2,2,1,1` dequantises a 16-row block for
+  every 32 tokens; a larger tile shares the dequant across more tokens and
+  rows:
+
+  | tile (rows x tokens, sub-groups) | prefill | decode |
+  |---|---|---|
+  | 2,2,1,1 (16 x 32, 1), the default | 494.7 | 30.7 |
+  | 4,4,2,2 (64 x 128, 4) | 600.5 | 31.3 |
+  | 4,4,2,4 (64 x 256, 8) | **634.1** | 30.4 |
+  | 4,4,4,2 (128 x 128, 8) | 589.5 | 29.0 |
+  | 4,8,2,2 (64 x 256, 4) | 475.7 | 31.3 |
+
+  - Answers right in every arm.
+  - KL with the stream and 4,4,2,4: 0.294050 / 87.083 %, unchanged.
+  - 0.7.2 prefills the needle at ~416-422 t/s; the stream and this tile at
+    634.1, above Strata's own engine on this card (620.5).
