@@ -1063,3 +1063,20 @@ right in every arm; the card has 24,480 MiB, xe debugfs `vram_mm`):
 - The KL of q8_0 against f16 KV was not measured: the perplexity run
   thrashed on the first shard's memory-mapped reads from the ZFS pool with
   the pinned bank in host memory (126 GB read in 31 min), and was stopped.
+
+**Open after stage 7** (2026-10-12):
+- **Why q8_0 KV halves Flash-Next's decode.** The slowdown shows on 300-token
+  answers over an almost empty cache, so it is a fixed per-token cost, not
+  attention length. `--llama-kv` also types the QSA indexer's key cache,
+  whose scoring is plain ops; the first check is the scheduler's split dump
+  (`GGML_SCHED_DEBUG=2`), f16 against q8_0. A window for it was aborted:
+  the load stalled (below).
+- **The served GGUF's first shard is on the ZFS pool.** The model directory
+  on the NVMe holds shard 2 (the 28.8 GB n-gram table) and a symlink for
+  shard 1 (39 GB: dense weights and experts) into the pool
+  (`measured-here`). After other models' runs had pushed it out of the page
+  cache, a Flash-Next load sat 20 minutes in ZFS reads (50 % I/O pressure),
+  and a KL run read 126 GB in 31 minutes. Moving shard 1 to the NVMe needs
+  ~32 GB freed there first (7.2 GB free).
+- **Prefill buffers per request** (Strata's prompt path): up to ~2 GiB more
+  for expert slots; needs code.
