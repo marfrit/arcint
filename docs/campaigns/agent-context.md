@@ -1,6 +1,6 @@
 # agent-context — the dense agent's context past 131,072 tokens on the 24 GB card
 
-**Closed 2026-10-12** (operator: "work on extending the agent context"): the agent serves 229,376 tokens with q8_0:q4_0 KV (196,608 on 2026-10-11, before the card's real size was known).
+**Closed 2026-10-12** (operator: "work on extending the agent context", then "Extend the context"): the agent serves 245,760 tokens with q8_0:q4_0 KV (196,608 on 2026-10-11, 229,376 earlier on 2026-10-12).
 
 ## Charter
 
@@ -140,8 +140,11 @@ against the 24,433 MiB free on the idle card):
 
 GTT flat in both. At 229,376 the acceptance task scores 10/10 greedy (one run).
 **Deployed 229,376** (2026-10-12): the endpoint reports n_ctx 229376 and answers right.
-245,760 runs too, with a 238 MiB margin (the Flash-Next unit runs at 174 MiB); an eviction
-there would make the agent crawl rather than fail, so the deployed size keeps 712 MiB.
+245,760 runs too, with a 238 MiB margin (the Flash-Next unit runs at 174 MiB).
+**Deployed 245,760** on the operator's word ("Extend the context", 2026-10-12): the endpoint
+reports n_ctx 245760; the capital right and the acceptance task 10/10 greedy on the live
+unit; 24,132 MiB resident, GTT 20 MiB. If the margin proves too thin (GTT grows, a verify
+takes seconds), 229,376 is the step back.
 
 ## Where it lives
 

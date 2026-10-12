@@ -75,7 +75,7 @@ ranking (`research-reference-audit.md` §4).
 | [served-prefill-determinism](served-prefill-determinism.md) | B60 run-to-run variance, located in the GDN state; not gating | upstream openvinotoolkit/openvino#38099 |
 | [lanes-agent-subagent](lanes-agent-subagent.md) | opened 2026-10-07: an agent lane and a smaller subagent lane in one process, picked by name, a shared KV pool; recon done | llama.cpp server `--parallel --kv-unified --kv-unified-per-slot` (`tools/server/server.cpp:170-177`, `server-context.cpp:4221-4229`) |
 | [layer-split-two-cards](layer-split-two-cards.md) | opened 2026-10-07: Flash-Next across the B60 and the A770, a layer range, KV and expert cache per card; recon done, two OpenCL platforms (`measured-here`), design: a context per card (0023), an expert cache per card (0024) | Strata `src/program/generate.cpp:690-708, 2286-2391, 2860-2906`, `src/core/verify.cpp:815-820, 1128-1171`, `src/prefill/prefill.cpp:1866-1882` |
-| [agent-context](agent-context.md) | closed 2026-10-12: the dense agent at 229,376 tokens with q8_0:q4_0 KV on the B60 (needle at 224k right, task 10/10, KL inside the bar, peak 23,721 of 24,480 MiB); 245,760 runs with a 238 MiB margin | llama.cpp `-ctk`/`-ctv`; `contrib/llama.cpp` 0015 |
+| [agent-context](agent-context.md) | closed 2026-10-12: the dense agent at 245,760 tokens with q8_0:q4_0 KV on the B60 (needle at 237k right, task 10/10, KL inside the bar, peak 24,195 of 24,480 MiB) | llama.cpp `-ctk`/`-ctv`; `contrib/llama.cpp` 0015 |
 | [direct-submission-fault](direct-submission-fault.md) | mechanism on record; the N ≥ 5 confirmation on the current kernel owed | upstream `linux-7.1.y` ring-ordering fix |
 
 FreeToken paths are under `~/src/FreeToken-ref/python/freetoken/`; Strata
