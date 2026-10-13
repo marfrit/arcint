@@ -1,0 +1,498 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index b05e5ba..3eba599 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1115,6 +1115,14 @@ struct ggml_backend_opencl_context {
+         uint64_t gen = 0;                                      // the graph the per-graph state belongs to
+         int next = 0, issued_upto = -1;
+     } bstream;
++    // patch 0042: an expert cache's swaps on their own in-order queue (Strata's adapt stream,
++    // generate.cpp:4396-4480): copies between slots and bank entries no table points at,
++    // ordered after the compute queue only where a fence says so
++    struct adapt_stream_state {
++        cl_command_queue q = nullptr;
++        std::vector<cl_event> marks;                          // per ticket: the queue's marker, null once released
++                                                              // (emptied whenever none is outstanding)
++    } astream;
+     int             kq_mm_sg = 16;
+     ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
+     int       kq_q8_1_ndst = 4;
+@@ -14768,6 +14776,11 @@ static void ggml_backend_opencl_get_tensors(const ggml_tensor * const * tensors,
+ static void ggml_backend_opencl_get_tensors_async(const ggml_tensor * const * tensors, void * const * dsts, int n);
+ static void ggml_backend_opencl_get_tensor_slices(const ggml_tensor * tensor, void * data, int64_t i2, int64_t n);
+ static void ggml_backend_opencl_exchange_slices(ggml_tensor * a, int64_t sa, ggml_tensor * b, int64_t sb);
++static void ggml_backend_opencl_adapt_copy(ggml_tensor * dst, int64_t di, const ggml_tensor * src, int64_t si);
++static void ggml_backend_opencl_adapt_fence(const ggml_tensor * t);
++static int  ggml_backend_opencl_adapt_record(const ggml_tensor * t);
++static bool ggml_backend_opencl_adapt_done(const ggml_tensor * t, int ticket);
++static void ggml_backend_opencl_adapt_finish(const ggml_tensor * t);
+ 
+ static void ggml_backend_opencl_pair_bank(const ggml_tensor * slot, const ggml_tensor * bank, int n_split) {
+     g_cache_pairs[slot] = { bank, n_split };
+@@ -14806,6 +14819,11 @@ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, c
+     if (strcmp(name, "ggml_backend_opencl_exchange_slices") == 0) {
+         return (void *) ggml_backend_opencl_exchange_slices;
+     }
++    if (strcmp(name, "ggml_backend_opencl_adapt_copy") == 0)   return (void *) ggml_backend_opencl_adapt_copy;
++    if (strcmp(name, "ggml_backend_opencl_adapt_fence") == 0)  return (void *) ggml_backend_opencl_adapt_fence;
++    if (strcmp(name, "ggml_backend_opencl_adapt_record") == 0) return (void *) ggml_backend_opencl_adapt_record;
++    if (strcmp(name, "ggml_backend_opencl_adapt_done") == 0)   return (void *) ggml_backend_opencl_adapt_done;
++    if (strcmp(name, "ggml_backend_opencl_adapt_finish") == 0) return (void *) ggml_backend_opencl_adapt_finish;
+     if (strcmp(name, "ggml_backend_opencl_reserve_gather") == 0) {
+         return (void *) ggml_backend_opencl_reserve_gather;
+     }
+@@ -15365,6 +15383,96 @@ static void ggml_backend_opencl_exchange_slices(ggml_tensor * a, int64_t sa, ggm
+     }
+ }
+ 
++// Patch 0042, an expert cache's non-blocking swaps (Strata's adapt stream): copy
++// slice si of `src` into slice di of `dst` (the same type and shape per slice; a
++// slot on the card, a bank entry in USM host memory or on the card) on the
++// device's adapt queue. Nothing orders it against the compute queue but a
++// fence: the caller copies only between slices no table points at.
++static ggml_backend_opencl_context * ggml_cl_adapt_ctx(const ggml_tensor * t) {
++    ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) t->buffer->buft->device->context;
++    ggml_backend_opencl_context * bctx = dev_ctx->backend_ctx;
++    if (bctx->astream.q == nullptr) {
++        cl_int err;
++        CL_CHECK((bctx->astream.q = clCreateCommandQueue(bctx->context, bctx->device, 0, &err), err));
++    }
++    return bctx;
++}
++
++static void ggml_backend_opencl_adapt_copy(ggml_tensor * dst, int64_t di, const ggml_tensor * src, int64_t si) {
++    GGML_ASSERT(dst->type == src->type && dst->ne[0] == src->ne[0] && dst->ne[1] == src->ne[1]);
++    GGML_ASSERT(dst->buffer->buft->device == src->buffer->buft->device);
++    GGML_ASSERT(di >= 0 && di < dst->ne[2] && si >= 0 && si < src->ne[2]);
++    ggml_backend_opencl_context * bctx = ggml_cl_adapt_ctx(dst);
++    cl_command_queue q = bctx->astream.q;
++    ggml_cl_region rd[2], rs[2];
++    const int n = ggml_cl_regions(dst, rd);
++    GGML_ASSERT(ggml_cl_regions(src, rs) == n);
++    for (int i = 0; i < n; ++i) {
++        GGML_ASSERT(rd[i].per == rs[i].per);
++        const size_t per = rd[i].per, od = rd[i].off + (size_t) di * per, os = rs[i].off + (size_t) si * per;
++        if (rd[i].mem && rs[i].mem) {
++            CL_CHECK(clEnqueueCopyBuffer(q, rs[i].mem, rd[i].mem, os, od, per, 0, NULL, NULL));
++        } else if (rd[i].mem) {
++            CL_CHECK(clEnqueueWriteBuffer(q, rd[i].mem, CL_FALSE, od, per, rs[i].usm + (size_t) si * per, 0, NULL, NULL));
++        } else if (rs[i].mem) {
++            CL_CHECK(clEnqueueReadBuffer(q, rs[i].mem, CL_FALSE, os, per, rd[i].usm + (size_t) di * per, 0, NULL, NULL));
++        } else {
++            GGML_ABORT("adapt_copy: both slices in host memory");
++        }
++    }
++}
++
++// The adapt queue's next commands wait for everything enqueued on the compute
++// queue so far (a table upload, and the graphs that read the old tables)
++static void ggml_backend_opencl_adapt_fence(const ggml_tensor * t) {
++    ggml_backend_opencl_context * bctx = ggml_cl_adapt_ctx(t);
++    cl_event m;
++    CL_CHECK(clEnqueueMarkerWithWaitList(bctx->queue, 0, nullptr, &m));
++    CL_CHECK(clFlush(bctx->queue));
++    CL_CHECK(clEnqueueBarrierWithWaitList(bctx->astream.q, 1, &m, nullptr));
++    CL_CHECK(clReleaseEvent(m));
++}
++
++// A ticket for what the adapt queue holds so far; the queue is flushed (the
++// copies start without a wait)
++static int ggml_backend_opencl_adapt_record(const ggml_tensor * t) {
++    ggml_backend_opencl_context * bctx = ggml_cl_adapt_ctx(t);
++    cl_event m;
++    CL_CHECK(clEnqueueMarkerWithWaitList(bctx->astream.q, 0, nullptr, &m));
++    CL_CHECK(clFlush(bctx->astream.q));
++    auto & marks = bctx->astream.marks;
++    if (std::all_of(marks.begin(), marks.end(), [](cl_event e) { return e == nullptr; })) {
++        marks.clear();   // every earlier ticket released: the list does not grow with the run
++    }
++    marks.push_back(m);
++    return (int) bctx->astream.marks.size() - 1;
++}
++
++// Without a wait: the ticket's copies have landed (the ticket is released then)
++static bool ggml_backend_opencl_adapt_done(const ggml_tensor * t, int ticket) {
++    ggml_backend_opencl_context * bctx = ggml_cl_adapt_ctx(t);
++    GGML_ASSERT(ticket >= 0 && ticket < (int) bctx->astream.marks.size());
++    cl_event & m = bctx->astream.marks[ticket];
++    if (m == nullptr) {
++        return true;
++    }
++    cl_int st = CL_QUEUED;
++    CL_CHECK(clGetEventInfo(m, CL_EVENT_COMMAND_EXECUTION_STATUS, sizeof(st), &st, nullptr));
++    GGML_ASSERT(st >= 0 && "an expert cache swap failed on the adapt queue");
++    if (st != CL_COMPLETE) {
++        return false;
++    }
++    CL_CHECK(clReleaseEvent(m));
++    m = nullptr;
++    return true;
++}
++
++// Waits for the adapt queue (teardown, a check that reads what it wrote)
++static void ggml_backend_opencl_adapt_finish(const ggml_tensor * t) {
++    ggml_backend_opencl_context * bctx = ggml_cl_adapt_ctx(t);
++    CL_CHECK(clFinish(bctx->astream.q));
++}
++
+ // Reads n small plain tensors (not a converted layout) with one wait: an
+ // expert cache's per-layer router ids, read once per decode step.
+ static void ggml_backend_opencl_get_tensors(const ggml_tensor * const * tensors, void * const * dsts, int n) {
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+index aba1b00..896c55b 100644
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -65,6 +65,13 @@ static bool read_profile(const char * path, int n_layers, int n_expert, std::vec
+ }
+ 
+ llama_expert_cache::~llama_expert_cache() {
++    if (pend_phase != 0 && adapt_finish && !layers.empty()) {
++        adapt_finish(layers[0].slot[0]);
++    }
++    if (n_deferred > 0) {
++        LLAMA_LOG_INFO("%s: %s: %llu swaps put off for want of a spare bank entry in their layer\n", __func__,
++                       dev_ ? ggml_backend_dev_name(dev_) : "-", (unsigned long long) n_deferred);
++    }
+     if (n_multi_steps > 0) {
+         LLAMA_LOG_INFO("%s: %s: %llu multi-token decode steps: %.1f routed pairs, %.1f distinct experts (%.1f in the bank) a step over its layers\n",
+                        __func__, dev_ ? ggml_backend_dev_name(dev_) : "-", (unsigned long long) n_multi_steps, (double) n_multi_pairs / n_multi_steps,
+@@ -288,6 +295,23 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+         LLAMA_LOG_WARN("%s: %s lacks the expert cache's entry points (contrib/llama.cpp patch 0021)\n", __func__, ggml_backend_dev_name(dev));
+         return false;
+     }
++    adapt_copy   = (decltype(adapt_copy))   ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_adapt_copy");
++    adapt_fence  = (decltype(adapt_fence))  ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_adapt_fence");
++    adapt_record = (decltype(adapt_record)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_adapt_record");
++    adapt_done   = (decltype(adapt_done))   ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_adapt_done");
++    adapt_finish = (decltype(adapt_finish)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_adapt_finish");
++    {
++        const char * e = getenv("LLAMA_EXPERT_CACHE_NB");
++        nb = adapt_copy && adapt_fence && adapt_record && adapt_done && adapt_finish && (e == nullptr || atoi(e) != 0);
++    }
++    // spare bank entries a layer: Strata reserves 96 exchange buffers over all
++    // layers (expert_source.cpp:1332-1357, min(adapt_swaps, 96)); here they
++    // live in each layer's bank tensors, 4 a layer by default
++    int n_spare = 0;
++    if (nb) {
++        const char * e = getenv("LLAMA_EXPERT_CACHE_SPARES");
++        n_spare = e != nullptr ? std::max(1, atoi(e)) : 4;
++    }
+ 
+     // the ranking: Strata's profile, else expert-major round robin
+     std::vector<int> layer_of(model.layers.size(), -1);
+@@ -341,8 +365,17 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+         }
+         L.n_slots = (int) chosen[i].size();
+         L.n_bank  = L.n_expert - L.n_slots;
++        // the bank with its zero entry and spares within the GEMM's 512 matrices
++        // (ggml_cl_mul_mat_id_kq refuses more; a layer with few slots gets fewer)
++        L.n_spare = std::min(n_spare, std::max(0, 512 - (L.n_bank + 1)));
++        if (L.n_spare < n_spare) {
++            LLAMA_LOG_WARN("%s: layer %d: %d spare bank entries (%d slots, the bank's 512-matrix cap)\n", __func__, L.il, L.n_spare, L.n_slots);
++        }
+         L.expert_of.assign(L.n_slots + 1, -1);
+-        L.bexpert_of.assign(L.n_bank + 1, -1);
++        L.bexpert_of.assign(L.n_bank + 1 + L.n_spare, -1);
++        for (int x = L.n_bank + L.n_spare; x > L.n_bank; --x) {
++            L.spare.push_back(x);   // taken from the back: the lowest first
++        }
+         for (int s = 0; s < L.n_slots; ++s) {
+             L.expert_of[s]          = chosen[i][s];
+             L.slot_of[chosen[i][s]] = s;
+@@ -367,7 +400,7 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+             // the bank in USM host memory, read by the kq kernels over the link;
+             // a Q8_0 bank (the general MoE path, no pointer arguments) on the card
+             ggml_context * bctx = L.src[k]->type == GGML_TYPE_Q8_0 ? ctx : bank_ctx_;
+-            L.bank[k] = ggml_new_tensor_3d(bctx, L.src[k]->type, L.src[k]->ne[0], L.src[k]->ne[1], L.n_bank + 1);
++            L.bank[k] = ggml_new_tensor_3d(bctx, L.src[k]->type, L.src[k]->ne[0], L.src[k]->ne[1], L.n_bank + 1 + L.n_spare);
+             ggml_format_name(L.bank[k], "%s.bank", ggml_get_name(L.src[k]));
+         }
+         L.tab_slot = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, L.n_expert);
+@@ -409,7 +442,7 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+         for (auto & L : layers) {
+             for (int k = 0; k < 3; ++k) {
+                 if (L.bank[k]->type == GGML_TYPE_Q8_0) continue;
+-                const size_t n = (size_t) L.n_bank + 1;
++                const size_t n = (size_t) L.bank[k]->ne[2];
+                 if (L.bank[k]->type == GGML_TYPE_IQ4_NL) {
+                     const size_t bps = (size_t) L.src[k]->ne[0] * L.src[k]->ne[1] / 32;
+                     q = std::max(q, n * bps * 16);
+@@ -445,11 +478,11 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+     for (auto & L : layers) {
+         for (int k = 0; k < 3; ++k) {
+             for (int part = 0; part < 2; ++part) {
+-                const std::vector<int32_t> & who = part == 0 ? L.expert_of : L.bexpert_of;   // the last entry -1: zeros
++                const std::vector<int32_t> & who = part == 0 ? L.expert_of : L.bexpert_of;   // -1: zeros (the zero slot / entry, spares)
+                 ggml_tensor * t = part == 0 ? L.slot[k] : L.bank[k];
+                 std::vector<uint8_t> host(who.size() * L.nb2[k], 0);
+-                for (size_t s = 0; s + 1 < who.size(); ++s) {
+-                    if (!read_expert(L, who[s], k, host.data() + s * L.nb2[k])) {
++                for (size_t s = 0; s < who.size(); ++s) {
++                    if (who[s] >= 0 && !read_expert(L, who[s], k, host.data() + s * L.nb2[k])) {
+                         LLAMA_LOG_WARN("%s: read failed (layer %d expert %d)\n", __func__, L.il, who[s]);
+                         return false;
+                     }
+@@ -498,10 +531,11 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+         }
+     }
+     LLAMA_LOG_WARN("%s: %s: %zu layers (%d-%d), %lld expert slots (%lld-%lld a layer), %.2f GiB on the card (with the Q8_0 banks), "
+-                   "bank %.2f GiB in host memory, budget %.2f GiB, from %s; filled in %.1f s\n",
++                   "bank %.2f GiB in host memory, budget %.2f GiB, from %s; filled in %.1f s; swaps %s\n",
+                    __func__, ggml_backend_dev_name(dev), layers.size(), layers.front().il, layers.back().il, (long long) n_slots_all,
+                    (long long) lo, (long long) hi, n_bytes / 1073741824.0, n_bank_bytes / 1073741824.0, budget / 1073741824.0,
+-                   from_profile ? profile : "round robin", (ggml_time_us() - t_fill) / 1e6);
++                   from_profile ? profile : "round robin", (ggml_time_us() - t_fill) / 1e6,
++                   nb ? format("on their own queue, %d spare bank entries a layer", n_spare).c_str() : "on the compute queue");
+     return true;
+ }
+ 
+@@ -569,7 +603,9 @@ void llama_expert_cache::candidates(std::vector<llama_expert_cache_swap> & out)
+             }
+         }
+         for (int s = 0; s < L.n_slots; ++s) {
+-            v.emplace_back(L.usage[L.expert_of[s]], s);
++            if (L.expert_of[s] >= 0) {
++                v.emplace_back(L.usage[L.expert_of[s]], s);
++            }
+         }
+         std::sort(c.begin(), c.end(), [](auto & a, auto & b) { return a.first > b.first; });
+         std::sort(v.begin(), v.end(), [](auto & a, auto & b) { return a.first < b.first; });
+@@ -615,6 +651,36 @@ void llama_expert_cache::adapt(const std::vector<llama_expert_cache_swap> & all_
+     if (all.empty()) {
+         return;
+     }
++    if (nb) {
++        // Strata's adapt stream: each victim's bytes first copied out of its
++        // slot into a spare entry of its layer's bank (resident_stage_swaps);
++        // the tables change once they have landed (progress)
++        const int64_t t0 = ggml_time_us();
++        for (auto & c : all) {
++            auto & L = layers[c.layer];
++            if (L.spare.empty()) {
++                n_deferred++;   // as Strata's beyond the exchange buffers' room: a later adapt
++                continue;
++            }
++            const int x = L.spare.back();
++            L.spare.pop_back();
++            pend.push_back({ c.layer, c.expert, L.expert_of[c.slot], c.slot, L.bank_of[c.expert], x });
++            n_swaps++;
++        }
++        if (pend.empty()) {
++            return;
++        }
++        // a spare entry was a newcomer's bank entry until a table upload: the
++        // graphs before it may still read it. The copies themselves go out
++        // after the next graph (after_graph): the copy engine also writes
++        // that graph's inputs, which must not queue behind them
++        adapt_fence(layers[0].slot[0]);
++        pend_phase  = 1;
++        pend_issued = false;
++        pend_check  = n_swaps == pend.size();   // the first adapt
++        n_apply_us += (uint64_t) (ggml_time_us() - t0);
++        return;
++    }
+     // an exchange on the card's queue: the newcomer from its bank entry into the
+     // victim's slot, the victim into that bank entry (no host copy; the next
+     // graph runs after it)
+@@ -665,6 +731,84 @@ void llama_expert_cache::adapt(const std::vector<llama_expert_cache_swap> & all_
+     n_apply_us += (uint64_t) (ggml_time_us() - t0);
+ }
+ 
++// The swaps in flight, polled between ubatches without a wait (Strata's
++// apply_pending(false), generate.cpp:4413-4428)
++void llama_expert_cache::progress() {
++    if (pend_phase == 0 || !pend_issued) {
++        return;
++    }
++    const ggml_tensor * any = layers[0].slot[0];
++    if (!adapt_done(any, pend_ticket)) {
++        return;
++    }
++    const int64_t t0 = ggml_time_us();
++    std::vector<char> touched(layers.size(), 0);
++    if (pend_phase == 1) {
++        // the victims' bytes are in their spare entries: served from the bank
++        // from the next graph on, their slots unread
++        for (auto & p : pend) {
++            auto & L = layers[p.layer];
++            L.slot_of[p.e_out]  = -1;   L.bank_of[p.e_out] = p.x;
++            L.bexpert_of[p.x]   = p.e_out;
++            L.expert_of[p.slot] = -1;
++            touched[p.layer] = 1;
++        }
++        for (size_t i = 0; i < layers.size(); ++i) {
++            if (touched[i]) {
++                upload_tables(layers[i]);
++            }
++        }
++        // the refills wait for the graphs that still read the victims there
++        // (the fence is placed now, before the next graph; the copies after it)
++        adapt_fence(any);
++        pend_phase  = 2;
++        pend_issued = false;
++        n_apply_us += (uint64_t) (ggml_time_us() - t0);
++        return;
++    }
++    // the newcomers are in their slots: served from them from the next graph
++    // on; their old bank entries hold no expert (spares, written only after a
++    // fence behind this upload)
++    for (auto & p : pend) {
++        auto & L = layers[p.layer];
++        L.slot_of[p.e_in]   = p.slot;   L.expert_of[p.slot] = p.e_in;
++        L.bank_of[p.e_in]   = -1;       L.bexpert_of[p.b_in] = -1;
++        L.spare.push_back(p.b_in);
++        touched[p.layer] = 1;
++    }
++    if (mutate) {   // the red case: one swapped slot's bytes corrupted after it landed
++        const auto & p = pend.front();
++        auto & L = layers[p.layer];
++        std::vector<uint8_t> bad(L.nb2[0]);
++        if (read_expert(L, p.e_in, 0, bad.data())) {
++            bad[bad.size() / 2] ^= 0x5a;
++            write_slices(L.slot[0], p.slot, bad.data(), L.nb2[0]);
++            get_slices(L.slot[0], bad.data(), p.slot, 1);   // a blocking read: the write has landed before `bad` goes
++        }
++        mutate = 0;
++    }
++    for (size_t i = 0; i < layers.size(); ++i) {
++        if (touched[i]) {
++            upload_tables(layers[i]);
++        }
++    }
++    if (pend_check) {
++        const auto & p = pend.front();
++        const auto & L = layers[p.layer];
++        int bad = 0;
++        for (int k = 0; k < 3; ++k) {
++            bad += verify(L, L.slot[k], k, p.slot, p.e_in) ? 0 : 1;
++            bad += verify(L, L.bank[k], k, p.x, p.e_out) ? 0 : 1;
++        }
++        LLAMA_LOG_WARN("%s: swap check, %s, layer %d slot %d <- expert %d, bank %d <- expert %d: %d of 6 copies differ from the file\n",
++                       __func__, ggml_backend_dev_name(dev_), L.il, p.slot, p.e_in, p.x, p.e_out, bad);
++        pend_check = false;
++    }
++    pend.clear();
++    pend_phase = 0;
++    n_apply_us += (uint64_t) (ggml_time_us() - t0);
++}
++
+ // The owner context's ubatch: counts the previous decode ubatch's routing;
+ // true when an adapt is due
+ bool llama_expert_cache::advance(ggml_backend_sched_t sched, uint32_t n_tokens) {
+@@ -678,6 +822,7 @@ bool llama_expert_cache::advance(ggml_backend_sched_t sched, uint32_t n_tokens)
+     if (last_n > 0 && last_n <= decode_max) {
+         count(last_n);   // waits for the queue
+     }
++    progress();
+     last_n = n_tokens;
+     // the exchanges and the next graph share the card's in-order queue
+     if (n_tokens <= decode_max) {
+@@ -693,11 +838,13 @@ bool llama_expert_cache::advance(ggml_backend_sched_t sched, uint32_t n_tokens)
+ void llama_expert_cache::step(const std::vector<std::unique_ptr<llama_expert_cache>> & caches, ggml_backend_sched_t sched,
+                               uint32_t n_tokens) {
+     // every cache counts its own layers; they share the owner and the cadence
+-    bool due = false;
++    bool due = false, busy = false;
+     for (const auto & ec : caches) {
+-        due = ec->advance(sched, n_tokens) || due;
++        due  = ec->advance(sched, n_tokens) || due;
++        busy = busy || ec->pend_phase != 0;
+     }
+-    if (due) {
++    // Strata plans no adapt while the previous swaps are in flight (generate.cpp:4431)
++    if (due && !busy) {
+         plan(caches);
+     }
+ }
+@@ -707,6 +854,24 @@ void llama_expert_cache::after_graph(ggml_backend_sched_t sched, uint32_t n_toke
+         ggml_backend_sched_synchronize(owner_sched);   // an unconsumed read still targets ids_host
+     }
+     ids_pending = 0;
++    if (pend_phase != 0 && !pend_issued && sched == owner_sched) {
++        // the swaps' copies on the adapt queue, behind the fence placed before
++        // this graph: they run while it computes (patch 0042)
++        const int64_t t0 = ggml_time_us();
++        for (auto & p : pend) {
++            auto & L = layers[p.layer];
++            for (int k = 0; k < 3; ++k) {
++                if (pend_phase == 1) {
++                    adapt_copy(L.bank[k], p.x, L.slot[k], p.slot);
++                } else {
++                    adapt_copy(L.slot[k], p.slot, L.bank[k], p.b_in);
++                }
++            }
++        }
++        pend_ticket = adapt_record(layers[0].slot[0]);
++        pend_issued = true;
++        n_apply_us += (uint64_t) (ggml_time_us() - t0);
++    }
+     if (!async_ids || sched != owner_sched || n_tokens == 0 || n_tokens > decode_max) {
+         return;
+     }
+diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
+index 143bda3..c5534c6 100644
+--- a/src/llama-expert-cache.h
++++ b/src/llama-expert-cache.h
+@@ -13,9 +13,17 @@
+ // branches run there, summed before the router weights (llama-graph.cpp,
+ // build_moe_ffn): no GPU-CPU hand-off. Decode's routed ids are read back once
+ // per step and counted; every adapt_every decode tokens hot bank experts swap
+-// with cold slot experts of the same layer: an exchange of the two on the
+-// card's queue (newcomer into the slot, victim into its bank entry), ahead of
+-// the next graph, with no host copy.
++// with cold slot experts of the same layer. Patch 0042 (Strata's adapt stream,
++// generate.cpp:122-158, 4396-4480): the swaps run on their own queue while the
++// graphs run, in two steps polled between ubatches: the victim is copied out
++// of its slot into a spare bank entry and then served from there, the
++// newcomer is copied into the freed slot and served from it once that has
++// landed; its old bank entry becomes a spare. The tables change only between
++// graphs, so no graph reads a slice that is being written; the copies go out
++// right after a graph is enqueued, so they run while it computes and do not
++// hold up the next graph's input writes on the copy engine.
++// (LLAMA_EXPERT_CACHE_NB=0: the exchange of the two on the card's queue
++// ahead of the next graph, as before.)
+ //
+ // Under a layer split (LLAMA_SPLIT_MODE_LAYER) each GPU gets its own cache
+ // over the layers it runs (Strata's per-stage expert cache, generate.cpp
+@@ -42,7 +50,9 @@ struct llama_expert_cache_layer {
+     int      n_bank   = 0;              // bank entry n_bank holds zeros: a slot expert's row in the bank branch
+     ggml_tensor * src [3] = {};         // gate, up, down as llama.cpp loaded them (host memory, not computed)
+     ggml_tensor * slot[3] = {};         // [ne0, ne1, n_slots + 1] on the card
+-    ggml_tensor * bank[3] = {};         // [ne0, ne1, n_bank + 1] in GPU-visible host memory
++    ggml_tensor * bank[3] = {};         // [ne0, ne1, n_bank + 1 + n_spare] in GPU-visible host memory
++    int      n_spare  = 0;              // bank entries after the zero entry that hold no expert at load
++    std::vector<int32_t> spare;         // the entries that hold no expert now (a swap's victim goes there)
+     ggml_tensor * tab_slot = nullptr;   // I32 [1, n_expert] on the card: slot, or -1
+     ggml_tensor * tab_bank = nullptr;   // I32 [1, n_expert] on the card: bank entry, or -1
+     // a down projection outside the kq kernels (Q8_0: the general MoE path,
+@@ -58,7 +68,7 @@ struct llama_expert_cache_layer {
+     std::vector<int32_t> slot_of;       // expert -> slot, -1
+     std::vector<int32_t> expert_of;     // slot -> expert
+     std::vector<int32_t> bank_of;       // expert -> bank entry, -1
+-    std::vector<int32_t> bexpert_of;    // bank entry -> expert
++    std::vector<int32_t> bexpert_of;    // bank entry -> expert, -1 (the zero entry, a spare)
+     std::vector<float>   usage;         // decode routing counts, decayed each adapt
+     ggml_tensor * ids_out = nullptr;    // the last graph's routed ids (a copy, marked output)
+     std::vector<int32_t> tab_host[5];   // the tables' bytes, alive until their non-blocking write lands
+@@ -152,6 +162,21 @@ private:
+     bool               async_ids = true;
+     void (*get_slices)(const ggml_tensor *, void *, int64_t, int64_t) = nullptr;
+     void (*exchange)(ggml_tensor *, int64_t, ggml_tensor *, int64_t) = nullptr;
++    // patch 0042: the adapt queue (null: an older backend, the exchange)
++    void (*adapt_copy)(ggml_tensor *, int64_t, const ggml_tensor *, int64_t) = nullptr;
++    void (*adapt_fence)(const ggml_tensor *) = nullptr;
++    int  (*adapt_record)(const ggml_tensor *) = nullptr;
++    bool (*adapt_done)(const ggml_tensor *, int) = nullptr;
++    void (*adapt_finish)(const ggml_tensor *) = nullptr;
++    bool nb = false;                    // the swaps off the compute queue
++    // one adapt's swaps in flight: phase 1 the victims' copies out, phase 2 the newcomers' copies in
++    struct pending_swap { int layer, e_in, e_out, slot, b_in, x; };
++    std::vector<pending_swap> pend;
++    int  pend_phase = 0, pend_ticket = -1;
++    bool pend_issued = false;           // the phase's copies enqueued (after_graph), the ticket theirs
++    bool pend_check = false;            // the first adapt's swap: its bytes against the file once landed
++    uint64_t n_deferred = 0;            // swaps put off for want of a spare entry in their layer
++    void progress();
+ 
+     uint32_t           since_adapt = 0;
+     ggml_backend_sched_t owner_sched = nullptr;   // the context that drives the cache

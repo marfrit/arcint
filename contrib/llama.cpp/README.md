@@ -2439,3 +2439,74 @@ Measured (`measured-here`, 2026-10-13, B60):
   checked against sycl-tla's builtin wrappers. Order: each chain's
   accumulation sequence equals the one-chunk form's for head sizes 256 and
   128, and the coordinates stay inside the surface. No defects.
+
+## 0042-expert-cache-nb-admission.patch
+
+The expert cache's swaps (0021) leave the compute queue: Strata's adapt
+stream (`code`, Strata `src/program/generate.cpp:122-158`, `:4396-4480`).
+
+- **Why:** an adapt exchanged its experts between slots and bank entries on
+  the card's in-order queue, ahead of the next graph. The copies (a swap
+  moves an expert's ~1.4 MB each way over the link; 1,800-3,100 swaps a
+  300-token answer) held up the next verify: its input writes waited 2.5-6
+  ms against 0.93-1.0 ms with no swaps (`measured-here`, Flash-Next, B60;
+  `LLAMA_EXPERT_CACHE_MAX_SWAPS=0` as the discriminator).
+- **What:**
+  - Each layer's bank tensors get spare entries after the zero entry
+    (`LLAMA_EXPERT_CACHE_SPARES`, 4 by default, ~263 MB more pinned host
+    memory for Flash-Next). Strata reserves 96 exchange buffers over all
+    layers (`expert_source.cpp:1332-1357`); here they sit in each layer's
+    bank, so a swap beyond its layer's spares waits for a later adapt, as
+    Strata's beyond its buffers' room do.
+  - A swap runs in two steps on a second in-order queue, polled between
+    ubatches without a wait: the victim's bytes are copied out of its slot
+    into a spare entry; once that has landed the victim is served from the
+    bank and the newcomer is copied into the freed slot; once that has
+    landed the newcomer is served from the slot and its old bank entry
+    becomes a spare. No adapt is planned while a swap is in flight
+    (Strata, `generate.cpp:4431`).
+  - The tables change only between graphs; a fence (a marker on the compute
+    queue, a barrier on the adapt queue) placed after each table upload
+    keeps a copy from writing a slice an earlier graph still reads.
+  - The copies are enqueued right after the owner's graph (`after_graph`),
+    not before the next one: the copy engine also writes a graph's inputs,
+    and the first build, which enqueued them in `step()`, left the verify's
+    input wait where it was (2.4-5.9 ms) and lost ~1.5 % (below).
+  - The first landed swap is checked against the file; the red case
+    (`LLAMA_EXPERT_CACHE_MUTATE=1`, one landed slot corrupted) reports 1 of
+    6. `LLAMA_EXPERT_CACHE_NB=0` restores the exchange. A layer whose bank
+    would pass the GEMM's 512 matrices gets fewer spares; swaps put off for
+    want of a spare are logged at teardown.
+- **Overlap, the mechanism checked** (`measured-here`, B60, a probe): a 48
+  MiB copy from USM host memory on a second queue finishes in 3.5 ms while
+  a 37.5 ms kernel runs on the first, the pair in 37.5 ms.
+
+Measured (`measured-here`, 2026-10-13, B60, Flash-Next with the unit's
+flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream; one binary,
+arcint with the lazy n-gram table, 0001-0042; A B A B, one process an arm;
+the capital, the 20k needle, three 300-token answers):
+
+| | the exchange (`NB=0`) | 0042, the copies behind the graph |
+|---|---|---|
+| decode: hash table / compiler / TCP | 32.3, 32.3 / 36.2, 36.1 / 34.5, 34.4 t/s | 33.1, 33.1 / 37.0, 36.9 / 35.2, 35.4 |
+| the verify's input wait | 2.6-6.0 ms | 0.94-0.95 |
+| decode experts on the card | 89.9 / 93.8 / 92.2 % | 88.5 / 93.3 / 91.3 |
+| 20k needle prefill | 673.3, 673.9 t/s | 673.1, 673.2 |
+| swap check | 0 of 6 | 0 of 6 (red case 1 of 6) |
+
+Decode +2.4 % on the mean. The newcomers land two verifies later than the
+exchange's, which costs ~1 point of hits; the waits saved outweigh it. The
+first build (the copies enqueued before the next graph) decoded 31.5, 31.6
+/ 35.8, 35.9 / 33.9, 33.9 against the exchange's 32.2, 32.3 / 36.2, 36.1 /
+34.5, 34.4 in its own A/B. Answers right in every arm, the draft acceptance
+counts identical (170/259, 169/262, 163/252): a hit and a bank read run the
+same kernel on the same bytes.
+
+- **Reviewed** before the push by a second model: no race found (a slice
+  is written on the adapt queue only while no table maps it, behind a fence
+  covering the compute work before the last table change); the review's
+  points went in: the spares clamped so a bank stays within the GEMM's 512
+  matrices, the ticket list emptied whenever no ticket is outstanding, the
+  deferred swaps logged. The build with them (`measured-here`, B60, the
+  same flags): decode 33.1 / 36.9 / 35.3 t/s, swap check 0 of 6 (red case 1
+  of 6), no layer clamped, prefill 672.8 t/s.

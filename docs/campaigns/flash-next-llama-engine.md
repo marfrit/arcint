@@ -1109,3 +1109,118 @@ restores the f32 recurrent state only; 0036's README section).
   f16: 664.6 / 31.2 against 653.0 / 31.1, answers the same.
 - **The served GGUF's first shard** is a real file on the NVMe since
   2026-10-13 (sha256 = Hugging Face's); loads no longer read the ZFS pool.
+
+### Stage 8 — the verify's prologue: what the GPU waits for before each verify (2026-10-13)
+
+Stage 3e left ~10 ms a round outside the kernels; LEO (stage 6) ruled out
+the enqueue cost. Where it goes (`measured-here`, B60, the 0.7.4 package,
+the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
+`LLAMA_DECODE_TIMING=1`, `GGML_SCHED_TIMING=1`; 300-token answers):
+
+- A verify graph runs in two splits: on the CPU the token embedding and the
+  n-gram table's rows (`GET_ROWS` from `per_layer_token_embd`, 27,465 MiB),
+  then one OpenCL split with 34 inputs. The drafts have been synchronized,
+  so the GPU idles through everything before the OpenCL split's first
+  kernel:
+  - the CPU split: 0.9-8.9 ms a verify over the exploration runs and the
+    cadence sweep below, depending on the page cache;
+  - the OpenCL split's input copies: 0.94 ms a verify without swaps (the
+    sweep's "off" arm; its first block, 1.85 ms, holds prefill graphs),
+    plus 0.4-5 ms waiting for the expert cache's swaps;
+  - the expert cache's step (counting the previous verify's routing):
+    0.68 ms.
+- **The n-gram rows were synchronous faults.** The CPU split costs 36 us
+  when every row is in the page cache (a repeated prompt, 0 major faults)
+  and 1.2-5.4 ms otherwise (the second exploration run: ~20 major faults a
+  verify, 2,162-2,370 an answer).
+  - The cause (`code`): llama.cpp marks the table for lazy reading
+    (`TENSOR_READ_LAZY`: `MADV_RANDOM` on its range, each graph's rows
+    prefetched with `MADV_WILLNEED`, `llama_prefetch_rows`), but its AUTO
+    lazy mode resolves to OFF for any device without mmap support
+    (`src/llama-model.cpp:1525-1533`), the OpenCL device among them. The
+    table was then an ordinary mapped weight: no prefetch, and each fault
+    read the file's readahead around the row (the loader's
+    `POSIX_FADV_SEQUENTIAL` makes the kernel double it), which also evicted the table's
+    own pages (54-73 % resident with the bank pinned).
+  - A file probe (`measured-here`, 48 random rows a gather, the table 70 %
+    resident): plain faults through an `MADV_RANDOM` mapping 1,433 us
+    (median), `MADV_WILLNEED` a row then the reads 258 us, `O_DIRECT` on 8
+    threads 874 us. The last is not Strata's reader: that runs 16 I/O
+    threads (`src/platform/direct_file.cpp:313`), a submit worker and an
+    8-way row cache (`src/ngram/ple_reader.cpp:34-97`), and the probe's
+    `O_DIRECT` reads skip the page cache that served ~70 % of the other two
+    arms' rows. Not a verdict on it.
+  - **Fix** (arcint `2e3b964`; the measured binary was a build of the same change before its comment was extended): `--llama-cpu-moe` (the memory-mapped load)
+    sets `LLAMA_LAZY_MODE_ON`; it applies only to tensors an arch marks
+    lazy (`qwen4exp`, `gemma4`). A/B, A B A B, one process per arm, the
+    capital, the 20k needle, three 300-token answers (`measured-here`):
+
+    | | 0.7.4 package (two runs) | lazy table (dev build of `2e3b964` + 0001-0041) |
+    |---|---|---|
+    | CPU split a verify | 2.0-7.7 ms | 0.30-0.59 ms |
+    | decode: hash table / compiler / TCP | 30.5, 31.8 / 33.8, 35.7 / 32.6, 34.0 t/s | 32.2, 32.3 / 36.2, 36.2 / 34.4, 34.5 |
+    | 20k needle prefill | 661.2, 662.8 t/s | 671.6, 673.2 |
+    | load to listening | 137, 126 s | 92, 86 s |
+
+    The dev build also carries 0041, a prompt-attention kernel: it can
+    account for part of the prefill row, not for the decode rows. The load
+    is shorter because the shard holding the table is no longer mapped with
+    `MAP_POPULATE` (`code`, `src/llama-mmap.cpp:492-493`): its other weights
+    are faulted on demand.
+
+    Decode +3.7 % on the mean and steady across runs; the answers right in
+    every arm, the draft acceptance counts identical (170/259, 169/262,
+    163/252): the same tokens.
+- **The swaps wait on the compute queue.** Each adapt exchanges experts
+  between slots and the bank on the card's in-order queue ahead of the next
+  graph (stage 2b), so the copies' link time stalls the GPU. The cadence
+  priced (`measured-here`, one process per arm, three answers):
+
+  | adapt every | decode t/s | hit rate | swaps an answer | input copies a verify |
+  |---|---|---|---|---|
+  | 6 tokens (today) | 31.5 / 34.9 / 33.3 | 90.0-93.9 % | 1,789-3,144 | 1.3-3.0 ms |
+  | 12 | 31.7 / 35.8 / 33.7 | 88.7-93.8 % | 1,798-2,768 | 2.4-5.8 ms |
+  | 24 | 28.6 / 32.9 / 32.1 | 84.8-92.2 % | 1,536-1,604 | 2.4-3.3 ms |
+  | off | 23.3 / 24.5 / 21.1 | 65.3-72.3 % | 0 | 0.95 ms |
+
+  Adapting is worth +45 % of decode (the means, 33.2 against 23.0 t/s; +35
+  to +58 % an answer); its copies cost 0.4-5 ms a verify on
+  top, and with the n-gram rows fixed nothing on the host overlaps them any
+  more. Strata (`code`, `src/program/generate.cpp:4396-4480`,
+  `resident_stage_swaps` at 122-158) runs them on a separate non-blocking
+  stream: in its resident RAM mode (the analogue of arcint's bank) the
+  victim's bytes are copied back into a spare RAM buffer, waited for on the
+  adapt thread, and it is evicted (served from RAM), the newcomer is copied into the freed slot,
+  and its table entry changes only once an event says the copy landed,
+  polled each round. arcint's blocking exchange is a deviation from that
+  mechanism, not from its tuning.
+- **The swaps off the compute queue: patch 0042** (`contrib/llama.cpp/README.md`
+  has the mechanism and the table).
+  - The discriminator (`measured-here`): adapting with
+    `LLAMA_EXPERT_CACHE_MAX_SWAPS=0` (no copies, no table uploads) leaves the
+    verify's input wait at 0.93-1.0 ms, against 2.5-6 ms with the exchange:
+    the swaps are the wait.
+  - The first build moved the copies to a second queue but enqueued them
+    just before the next verify: the wait stayed (2.4-5.9 ms) and decode
+    lost ~1.5 %. A probe showed the second queue does overlap a kernel (a 48
+    MiB copy in 3.5 ms beside a 37.5 ms kernel, the pair in 37.5 ms), so what the verify waited for
+    was its own input writes on the copy engine, queued behind the swaps.
+    Enqueued right after the graph instead, the copies run while it
+    computes: the wait 0.94-0.95 ms, decode +2.4 % (33.1 / 37.0 / 35.3
+    against 32.3 / 36.2 / 34.5 t/s, means of two runs), prefill equal,
+    answers and draft counts identical.
+  - An adapt's table uploads are separate small writes (Flash-Next: 3 a
+    touched layer): 240 of 2 KiB take 1.64 ms on the B60 against 54 us as
+    one write (`measured-here`, a probe). Not changed yet.
+- **Where decode stands** (`measured-here`, B60, the unit's flags): the
+  0.7.4 package 30.5-31.8 / 33.8-35.7 / 32.6-34.0 t/s on the three answers;
+  with the lazy table and 0042 33.1 / 36.9-37.0 / 35.2-35.4. Strata on this
+  card: 37.2-37.8 (stage 3, its long-answer run).
+- **The input copies.** The OpenCL backend has no events and no async copy,
+  so the scheduler synchronizes the queue and writes blocking for each of a
+  verify's 34 inputs (positions, masks, indices): 17 us a pair on the B60
+  (`measured-here`, a probe: a sync 10.6 us, a blocking 1 KiB write 10.4,
+  USM-staged non-blocking copies 4.1 us an input). 0.94 ms a verify
+  measured, against 34 x 17.3 us = 0.59 ms from the probe: the larger
+  inputs (masks, the rotations) take longer than its 1 KiB. A draft graph
+  (17 inputs) spends ~0.4 ms (the first exploration run).
