@@ -2571,4 +2571,40 @@ keeps `GGML_OPENCL_KQ_MM_ID_MIN_TOK`'s 16).
   the hundredth): 173 tokens 1.84 s streamed against 1.56 gathered; 317:
   1.84 / 1.96; 461: 1.85 / 2.26; 702: 1.90 / 2.64; 1,470: 2.36 / 3.51. A
   stream threshold near 250 tokens would save at most ~0.3 s on prompts of
-  64-250 tokens; not built.
+  64-250 tokens; built as 0044.
+
+## 0044-opencl-bank-stream-min-tok.patch
+
+The bank stream (0032) runs from 256 tokens a ubatch
+(`GGML_OPENCL_BANK_STREAM_MIN_TOK` overrides; 0 streams every GEMM ubatch as
+before); below that a MoE GEMM gathers its routed bank experts into the
+card-side mirror instead of copying every bank tensor whole.
+
+- **Why:** 0043's open item. The streamed GEMM costs ~1.84 s a graph at
+  Flash-Next's sizes up to ~1,000 tokens whatever its tokens; gathered, 173
+  tokens take 1.56 s and 317 take 1.96 (the crossover near 250).
+- **Measured** (`measured-here`, 2026-10-14, B60, Flash-Next with the unit's
+  flags, one binary: the 0.7.6 tree + 0044, the old behaviour by the switch
+  set to 0; A B A B, one process an arm; the stream's order learnt first on
+  a 2,665-token prompt):
+
+  | prompt | 0044 | the stream for every GEMM ubatch |
+  |---|---|---|
+  | 77 tokens | 1.11 s | 1.84 |
+  | 173 tokens | 1.54 s | 1.83 |
+  | 269 tokens | 1.83 s | 1.83-1.84 |
+  | 317-702 tokens | 1.83-1.90 s | 1.83-1.90 |
+  | 20,045 tokens | 29.67-29.68 s | 29.66-29.67 |
+  | 28 tokens (the matvec, 0043) | 0.58 s | 0.58 |
+
+  The 300-token answer after them decoded at 32.3-32.4 t/s in every arm,
+  the draft acceptance the same (166 of 267): the gather fills the mirror
+  in the bank's layout, as the ring does, and the GEMM reads the same bytes
+  (`code`); the needle right in every arm.
+- **Reviewed** before the push by a second model: a graph streams all its
+  bank tensors or gathers all of them (the gate reads the ubatch's tokens),
+  a gathered graph touches no stream state, the learnt order and the
+  per-graph ring state survive alternation, the load-time mirror holds a
+  whole bank tensor; the series 0001-0044 applies onto the pin. No defect.
+  The ring is now allocated at the second prompt of 256 tokens or more
+  instead of the second of 64 or more (the same VRAM, later).

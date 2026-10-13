@@ -1230,7 +1230,9 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
   bar (`contrib/llama.cpp/README.md`, 0043, has the tables). Open: the
   streamed GEMM costs ~1.84 s a graph up to ~1,000 tokens; gathered is
   faster only below ~250 tokens (173: 1.56 against 1.84; 317: 1.96 against
-  1.84), at most ~0.3 s: priced, not built.
+  1.84), at most ~0.3 s: priced; built as patch 0044 (the stream from 256
+  tokens a ubatch: 77 tokens 1.84 -> 1.11 s, 173 1.83 -> 1.54, 269 and up and
+  the 20k needle unchanged, the same tokens; `measured-here`, README 0044).
 - **Where decode stands** (`measured-here`, B60, the unit's flags): the
   0.7.4 package 30.5-31.8 / 33.8-35.7 / 32.6-34.0 t/s on the three answers;
   with the lazy table and 0042 33.1 / 36.9-37.0 / 35.2-35.4. Strata on this
