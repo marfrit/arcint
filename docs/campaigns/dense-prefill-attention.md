@@ -190,6 +190,19 @@ ranges loosely (fixed with the next patch to the same files).
   is about 730 here, against 451.6 at 133k; at 128k the gap was 3x and is
   now about 1.6x.
 
+## Stage 4: patch 0041, Q's reads
+
+- **The cause:** v2's ablation (`measured-here`, B60, f16, causal, 65k
+  keys): Q's 32 small 2D reads a tile cost ~9 of 31 ms; K's and V's
+  together ~11.
+- **The fix:** two-block reads, 8 a tile.
+  - With each chain's summation order kept, the results are bit-identical
+    (KL 0.005950 in both forms, the acceptance answer the same file).
+  - f16 at 65k keys 30.46 -> 28.41 ms, q8_0:q4_0 56.55 -> 53.78.
+- **Interleaving the chains lost.** It kept KL inside the bar but flipped
+  the agent's greedy acceptance answer to 2/10. Recorded in the README,
+  0041.
+
 ## Next
 
 1. **The ISA audit** (operator, 2026-10-13), ranked by device time, the hot

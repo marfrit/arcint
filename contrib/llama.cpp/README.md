@@ -2381,3 +2381,61 @@ Measured (`measured-here`, 2026-10-13, the A770):
   `(x - c) * d`) and the host's release paths. Its one optional note: the
   conversion kernel stays allocated when the main kernel fails its size
   check (harmless, never dispatched).
+
+## 0041-opencl-fa-dpas2-q-pairs.patch
+
+`flash_attn_dpas2.cl` (0038) reads Q two 16-dim chunks at a time, each of
+S's two DPAS chains keeping its order.
+
+- **Why:** an ablation of the kernel (B60, f16, causal, 65,536 keys, 512
+  rows; each run removes one part) put the 32 small 2D reads of Q a tile at
+  ~9 of 31 ms, more than K's and V's reads together:
+
+  | removed | time |
+  |---|---|
+  | nothing | 30.8 ms |
+  | K's reads | 30.2 |
+  | V's reads | 28.7 |
+  | Q's reads | 21.9 |
+  | K's and V's reads | 19.3 |
+  | the prefetch | 49.4 (it carries the kernel) |
+
+- **What:** one `u16 m8k16v2` read brings two adjacent chunks (8 rows x 32
+  halves, as two 16-wide blocks): 8 reads a tile at head size 256 instead
+  of 32. The first chain still sums chunks 0..7 in order and the second
+  8..15, so the results are bit-identical. `-DFA2_Q1` keeps the one-chunk
+  reads.
+- **What lost on the way:**
+  - *Interleaving the chains* (even chunks into one, odd into the other)
+    kept KL (0.005748 against 0.005950). But it flipped the dense agent's
+    greedy acceptance answer to a different, wrong program: 2/10 three
+    times out of three, against 10/10. A sum reordered inside the bar can
+    still move a greedy answer; the task gate caught it.
+  - *Holding part of Q in registers across tiles* spilled from four chunk
+    pairs on (offline ISA).
+
+Measured (`measured-here`, 2026-10-13, B60):
+
+- **test-backend-ops FLASH_ATTN_EXT, head sizes 256 and 128:** 866/867, the
+  same three failures; the keys-off red case fails 94; the A770 is
+  unchanged (sub-group 8 does not use this kernel).
+- **Identity** (dense 27B, q8_0:q4_0): KL 0.005950 / 97.304 % in both
+  forms; the acceptance answer is the same file in both (md5 `c76c468a`,
+  10/10).
+- **Perf** (512 rows, causal):
+
+  | shape | one-chunk reads | 0041 |
+  |---|---|---|
+  | f16, 8,192 keys | 4.02 ms | 3.72 |
+  | f16, 65,536 keys | 30.46 ms | 28.41 |
+  | q8_0:q4_0, 8,192 keys | 7.55 ms | 7.26 |
+  | q8_0:q4_0, 65,536 keys | 56.55 ms | 53.78 |
+
+- **Served** (the agent's flags at 245,760): the 132,874-token needle
+  prefill went 452.0 -> 464.2 t/s with the interleaved form. The ordered
+  form runs the same reads, with the chains in the old order.
+- **Reviewed** before the push by a second model, both forms. Layout: the
+  two-block read gives chunks 2j and 2j+1 in the one-chunk operand layout,
+  checked against sycl-tla's builtin wrappers. Order: each chain's
+  accumulation sequence equals the one-chunk form's for head sizes 256 and
+  128, and the coordinates stay inside the surface. No defects.

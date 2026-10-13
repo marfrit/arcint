@@ -1,0 +1,67 @@
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_dpas2.cl b/ggml/src/ggml-opencl/kernels/flash_attn_dpas2.cl
+index f79d0ea..2f928b3 100644
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_dpas2.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_dpas2.cl
+@@ -11,7 +11,8 @@
+ // work-group, 32-key tiles) and sycl-tla's mainloop (xe_fmha_fwd_mainloop.hpp:
+ // K and V straight from global memory into registers by 2D block reads, the
+ // next tile prefetched into the cache, no local memory, no barrier).
+-// - S = Q K^T: the a operand a 2D read of 8 rows x 16 dims of Q (re-read
++// - S = Q K^T: the a operands 2D reads of 8 rows x 32 dims of Q, two 16-dim
++//   chunks a read (16 dims a read under -DFA2_Q1; re-read
+ //   each tile as sycl-tla does: Q in registers left no room at head size
+ //   256), the b operand a transposed 2D read of 16 keys x 16 dims (lane =
+ //   key, 8 dwords = dims);
+@@ -45,10 +46,13 @@
+ // functions: those write a private array, and IGC kept such arrays in
+ // memory (a store and a load a read). Width, height and pitch minus one.
+ ushort8 __builtin_IB_subgroup_block_read_flat_u16_m8k16v1(long base, int w, int h, int p, int2 c);
++ushort16 __builtin_IB_subgroup_block_read_flat_u16_m8k16v2(long base, int w, int h, int p, int2 c);
+ uint8   __builtin_IB_subgroup_block_read_flat_transpose_u32_k8(long base, int w, int h, int p, int2 c);
+ uint8   __builtin_IB_subgroup_block_read_flat_transform_u16_k16(long base, int w, int h, int p, int2 c);
+ // Q rows y .. y + 7, dims 16 c .. 16 c + 15: lane = dim, component = row (the a operand)
+ #define QREAD(c, y) as_short8(__builtin_IB_subgroup_block_read_flat_u16_m8k16v1((long) qb, DK * 2 - 1, n_q - 1, qp - 1, (int2)(16 * (c), (y))))
++// Q rows y .. y + 7, dims 32 j .. 32 j + 31: two a operands from one read
++#define QREAD2(j, y) __builtin_IB_subgroup_block_read_flat_u16_m8k16v2((long) qb, DK * 2 - 1, n_q - 1, qp - 1, (int2)(32 * (j), (y)))
+ // 16 keys from row y, dims 16 c .. 16 c + 15: lane = key (the b operand of S)
+ #define KREAD(c, y) as_int8(__builtin_IB_subgroup_block_read_flat_transpose_u32_k8((long) kb, kw - 1, n_kv - 1, kp - 1, (int2)(8 * (c), (y) + FA2_RED_SHIFT)))
+ // the red case (-DFA2_RED): every key read one row off
+@@ -205,10 +209,29 @@ kernel void flash_attn_f32_f16_dpas2(
+ #define mclass mclass_red
+ #endif
+         if (mclass == MCLS_NONE) continue;
+-        // S: c outer, the reduction split in two chains a key group
++        // S: chunk pairs outer, the reduction split in two chains a key group
+         float8 s0[NKB], s1[NKB];
+         _Pragma("unroll")
+         for (int g = 0; g < NKB; ++g) { s0[g] = (float8)(0.f); s1[g] = (float8)(0.f); }
++#ifndef FA2_Q1
++        // Q two chunks a read, each chain keeping its chunks in the one-chunk
++        // order (s0 over 0 .. KC/2 - 1, s1 over KC/2 .. KC - 1): 8 reads of two
++        // blocks a tile at head size 256, where 32 one-block reads cost ~9 of
++        // 31 ms at 65k keys. (Interleaving the chains instead, even chunks into
++        // s0 and odd into s1, reordered the sums: KL alike, but the dense
++        // agent's greedy acceptance answer flipped from 10/10 to 2/10.)
++        _Pragma("unroll")
++        for (int j = 0; j < KC / 4; ++j) {
++            const ushort16 q0 = QREAD2(j, q_sg), q1 = QREAD2(j + KC / 4, q_sg);
++            _Pragma("unroll")
++            for (int g = 0; g < NKB; ++g) {
++                s0[g] = DPAS(as_short8(q0.lo), KREAD(2 * j,              t0 + 16 * g), s0[g]);
++                s1[g] = DPAS(as_short8(q1.lo), KREAD(2 * j + KC / 2,     t0 + 16 * g), s1[g]);
++                s0[g] = DPAS(as_short8(q0.hi), KREAD(2 * j + 1,          t0 + 16 * g), s0[g]);
++                s1[g] = DPAS(as_short8(q1.hi), KREAD(2 * j + 1 + KC / 2, t0 + 16 * g), s1[g]);
++            }
++        }
++#else
+         _Pragma("unroll")
+         for (int c = 0; c < KC / 2; ++c) {
+             _Pragma("unroll")
+@@ -217,6 +240,7 @@ kernel void flash_attn_f32_f16_dpas2(
+                 s1[g] = DPAS(QREAD(c + KC / 2, q_sg), KREAD(c + KC / 2, t0 + 16 * g), s1[g]);
+             }
+         }
++#endif
+         float8 s[NKB];
+         _Pragma("unroll")
+         for (int g = 0; g < NKB; ++g) s[g] = s0[g] + s1[g];
