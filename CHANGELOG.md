@@ -31,12 +31,16 @@ llama.cpp patch; no change to arcint's own sources. Every number is
   Flash-Next unit runs) copies every bank tensor whole over the link,
   whatever its tokens: a 24-token follow-up prompt took ~1.9 s to prefill.
   An expert cache's tensors now take the GEMM from 64 tokens
-  (`GGML_OPENCL_KQ_MM_ID_CACHE_MIN_TOK=N` overrides; every other MoE
-  tensor keeps 16).
+  (`GGML_OPENCL_KQ_MM_ID_CACHE_MIN_TOK=N` overrides, not below the 16;
+  every other MoE tensor keeps 16).
   - Prefill (the unit's flags: 131,072 ctx, q8_0 KV, 11,300 MiB of slots,
     MTP 2, the bank stream): 24 tokens 1.86-1.87 -> 0.64-0.65 s, 28 tokens
     1.82-1.83 -> 0.57 s; 64 tokens and up unchanged (694 tokens 1.93 s, the
-    20k needle 29.7 s either way).
+    20k needle 29.7 s either way; a 166-token cell at 1.51 s in the
+    README's table is the stream's learning graph, gathered, not a gain).
+    Prompts of 64 tokens and up still stream the whole bank, ~1.8 s a graph
+    up to ~1,000 tokens; gathering would win below ~250 tokens by at most
+    ~0.3 s (priced in the README, not built).
   - The prompt's tokens take the matvec's arithmetic (decode's), so the
     text after a short prompt can differ: KL against the CPU reference 16 x
     512 with 32-token ubatches 0.294000 / 87.181 % against the GEMM's
