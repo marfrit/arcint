@@ -2131,3 +2131,68 @@ Measured (`measured-here`, 2026-10-13):
   the same numbers. The served needle did not catch the red kernel either
   (the indexer's top-k selection survives a perturbed scale), hence the
   test above.
+
+## 0037-opencl-fa-dpas-f16kv.patch
+
+A quantized prompt's K/V go to f16 in blocks of keys, and the f16 DPAS
+flash-attention kernel runs on each block (Intel Xe2, sub-group 16).
+
+- **What it fixes:** the quantized builds of `flash_attn_dpas.cl` (0008)
+  dequantize K/V in every work-group, so each value is converted once per
+  query head and query block, 24 times in a 512-row chunk of the dense 27B.
+  The byte and word unpacking adds 527 instructions to a tile's main loop
+  (1,893 against the f16 build's 1,366; offline ISA, `ocloc -device bmg`).
+  Served at 58k tokens with q8_0:q4_0 KV, attention took 75.2 s against
+  f16's 56.3 s.
+- **The reference:** llama.cpp's CUDA backend converts a quantized K/V to
+  f16 once a call (`launch_fattn`, `need_f16_K/V`) and runs the f16 kernel.
+  **Deviation:** CUDA converts the whole view. At the dense agent's 245,760
+  tokens that is 960 MiB, more than the unit's margin, so here the
+  conversion runs a block of keys at a time (16,384 keys: two 32 MiB
+  scratch buffers, plus 14 MB of carried state at 512 rows).
+- **The carry:** the f16 kernel built with `FA_CARRY` takes `kv0`, offsets
+  the mask by it, and keeps its online-softmax state between blocks. The
+  state is O, m and l per lane in f32, stored in the registers' own layout,
+  so l keeps its per-lane partial sums as in one pass. Loading O row by row
+  spilled 1,408 bytes, and IGC then recompiled the kernel with rolled loops,
+  4x slower; vector loads straight into the accumulators do not spill.
+- **The conversion:** `flash_attn_kv_to_f16`, a work-item per 8 values,
+  using the kernel's own `load8`, so the f16 values equal what the
+  quantized build stages.
+- **Switches:**
+  - `GGML_OPENCL_FA_DPAS_F16KV=0` keeps the quantized kernels;
+  - `GGML_OPENCL_FA_DPAS_F16KV_BLOCK` sets the keys a block;
+  - `-DFA_CARRY_RED` (through `GGML_OPENCL_FA_DPAS_OPTS`) drops the carried
+    sums: the red case.
+  - The path sits under the quantized DPAS kernels' gate, so
+    `GGML_OPENCL_FA_DPAS_Q=0` turns it off too.
+- **Also in the patch:** a test-backend-ops perf case, prompt attention at
+  depth for the dense 27B's geometry, f16 and q8_0/q4_0.
+
+Measured (`measured-here`, 2026-10-13):
+
+- **test-backend-ops FLASH_ATTN_EXT, head size 256:**
+  - 260/261 on the B60 and the A770, the same three failures as without the
+    patch;
+  - 260/261 with 64-key blocks, so the carry runs;
+  - the red case fails 18 quantized prompt cases.
+- **Perf** (B60, 512 rows, 24 query heads on 4): q8_0:q4_0 at 8,192 keys
+  14.6 -> 12.3 ms, at 65,536 keys 111.9 -> 92.5 ms (f16: 8.3 and 63.0). The
+  test's quantized arms include a per-call unflattening of the uploaded K/V
+  (~2.8 ms at 8k) that a served cache does not have.
+- **Served** (the dense agent's model and flags, q8_0:q4_0, n_ctx 131,072, a
+  58,269-token prompt, the profiling build): prefill 425.9 -> 479.1 t/s;
+  attention 75.2 s -> 57.7 s, plus 2.2 s of conversion. The f16-KV arm runs
+  498.8 t/s.
+- **Gate** (the agent's flags at 245,760): the dev arcint with 0001-0037 on the B60, the dense
+  agent's flags (q8_0:q4_0, n_ctx 245,760, MTP 5):
+  - **Answers:** the capital right; the needle at 40 % of a 231,786-token
+    prompt right (prefill 192.0 t/s, peak 24,275 MiB, GTT 28 MiB); the
+    acceptance task 10/10 greedy.
+  - **A/B at 132,874 tokens**, the same window, the needle right in both:
+    prefill 249.0 t/s without the path, 292.3 t/s with it (+17 %); peak
+    24,144 / 24,224 MiB.
+  - **KL** (16 x 512 against `dense-ref.kld`): 0.005950 / 97.304 % without
+    the path, with it, and with 64-key blocks. With 64-key blocks and the
+    carried sums dropped (the red case), KL is 4.4957 / 36.7 %. So the path
+    and the carry run, and with them KL is identical to six digits.
