@@ -7,7 +7,8 @@ arcint (0.7.5-1) trixie; urgency=medium
     expert cache's swaps on their own queue, issued behind each graph: the
     verify's input wait 2.6-6.0 -> 0.94 ms, decode +2.4 %. Together 30.5-35.7
     -> 33.1-37.0 t/s on the B60, answers right. 0041: the B60's prompt
-    attention reads Q two chunks at a time, bit-identical, ~5-7 % faster.
+    attention reads Q two chunks at a time, bit-identical, the kernel 5-7 %
+    faster at 65k keys.
     Runtime floor unchanged at marfrit-openvino +p25.
 
  -- Markus Fritsche <mfritsche@reauktion.de>  Tue, 13 Oct 2026 22:15:00 +0200

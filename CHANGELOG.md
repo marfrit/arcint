@@ -35,28 +35,35 @@ branch).
     verify while the GPU waited.
   - `--llama-cpu-moe` (the memory-mapped load) now requests lazy mode ON:
     `MADV_RANDOM` and each graph's rows prefetched together. It applies only
-    to tensors an arch marks for lazy reading (qwen4exp, gemma4); the dense
-    agent and the coder are unchanged.
+    to tensors an arch marks for lazy reading (qwen4exp, gemma4). The dense
+    agent and the coder do not take that path (`code`: the flag is set only
+    under `--llama-cpu-moe`, and their archs mark no tensor lazy).
   - The CPU split takes 0.3-0.6 ms; decode +3.7 % on three 300-token
     answers (30.5-31.8 / 33.8-35.7 / 32.6-34.0 -> 32.2-32.3 / 36.2 /
     34.4-34.5 t/s); the shard is no longer `MAP_POPULATE`d, so loading
     takes ~40 s less (137 / 126 -> 92 / 86 s to listening).
 - **Patch 0042:** the expert cache's swaps run on their own queue
   (Strata's adapt stream). A victim is copied out of its slot into a spare
-  bank entry (4 a layer, ~263 MB more pinned host memory) and served from
+  bank entry (4 a layer, `LLAMA_EXPERT_CACHE_SPARES=N` sets it; ~263 MB more
+  pinned host memory at Flash-Next's sizes, by size) and served from
   there; the newcomer is copied into the freed slot and served from it once
   the copy has landed. The copies go out right after a graph, so they run
   while it computes instead of holding up the next verify's inputs on the
   copy engine. The verify's input wait 2.6-6.0 -> 0.94 ms; decode +2.4 %
-  (32.3 / 36.2 / 34.5 -> 33.1 / 37.0 / 35.3 t/s). `LLAMA_EXPERT_CACHE_NB=0`
-  restores the exchange.
+  (32.3 / 36.2 / 34.5 -> 33.1 / 36.9-37.0 / 35.3 t/s), at ~1 point fewer
+  experts on the card (newcomers land two verifies later).
+  `LLAMA_EXPERT_CACHE_NB=0` restores the exchange.
 - **Patch 0041:** the B60's prompt attention (0038) reads Q two 16-dim
   chunks at a time, each DPAS chain in its old order: bit-identical, the
   kernel 30.46 -> 28.41 ms at 65,536 keys (f16) and 56.55 -> 53.78 ms
-  (q8_0:q4_0). The dense agent's acceptance answer is the same file.
+  (q8_0:q4_0). The dense agent's acceptance answer is the same file. No
+  runtime switch (`-DFA2_Q1` at build time keeps the old reads).
 - **Together, Flash-Next** (IQ2_XS, the unit's flags: 131,072 ctx, q8_0 KV,
   11,300 MiB of slots, MTP 2, the bank stream): decode 30.5-35.7 -> 33.1-37.0
-  t/s on the three answers, the 20k needle prefill 661-663 -> 673 t/s;
+  t/s on the three answers (two A/Bs chained: the package against the lazy
+  table, then 0042 on and off; the shared arms agree), the 20k needle
+  prefill 661-663 -> 672-674 t/s; the packaged 0.7.5 pre-tag build 33.1 /
+  37.0 / 35.4 and 673.1;
   answers right, the draft acceptance counts identical (the same tokens).
 
 ## 0.7.4 — 2026-10-13

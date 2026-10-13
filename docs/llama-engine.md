@@ -200,8 +200,9 @@ slots, MTP 2, the bank stream; three 300-token answers):
   goes to; `LLAMA_EXPERT_CACHE_NB=0` brings back the exchange on the
   compute queue.
 
-Decode 30.5-35.7 -> 33.1-37.0 t/s over the 0.7.4 package, prefill 661-663 ->
-673 t/s, the answers and the drafts' acceptance identical.
+Decode 30.5-35.7 -> 33.1-37.0 t/s against the 0.7.4 package (two A/Bs
+chained, their shared arms agreeing), prefill 661-663 -> 672-674 t/s, the
+answers and the drafts' acceptance identical.
 
 The UD-Q3_K_XL file (52 GiB of experts) serves the same way at 235 t/s
 prefill and 12-13 t/s decode without MTP (2026-10-06).
