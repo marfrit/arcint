@@ -38,6 +38,10 @@ top-1 -0.10 points against Q4_K_M, acceptance 10/10). The libllama engine keeps 
 checkpoints (--llama-checkpoints): a follow-up after a thinking turn or an
 edited message resumes instead of re-prefilling (24.3k tokens: 38.75 s ->
 0.61 s on the B60, measured-here); no shared prefix cache across lanes.
+Release 0.7.6 (2026-10-13), measured-here: patch 0043, Flash-Next's short
+prompts on the B60: an expert cache's MUL_MAT_ID takes the GEMM from 64
+tokens (below that the bank stream copied every bank tensor whole), a
+24-token prompt 1.87 -> 0.64 s, 64 tokens and up unchanged, KL +0.0004.
 Release 0.7.5 (2026-10-13), measured-here: Flash-Next decode on the B60
 30.5-35.7 -> 33.1-37.0 t/s (three 300-token answers): its n-gram table read
 lazily (llama.cpp's AUTO lazy mode is OFF on OpenCL; ON for --llama-cpu-moe:
