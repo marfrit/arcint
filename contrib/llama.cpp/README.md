@@ -2196,3 +2196,93 @@ Measured (`measured-here`, 2026-10-13):
     the path, with it, and with 64-key blocks. With 64-key blocks and the
     carried sums dropped (the red case), KL is 4.4957 / 36.7 %. So the path
     and the carry run, and with them KL is identical to six digits.
+
+## 0038-opencl-fa-dpas2.patch
+
+A second prompt flash-attention kernel for Intel Xe2, `flash_attn_dpas2.cl`,
+after vLLM's head-256 policy and sycl-tla's mainloop. It runs f16 K/V in
+place and 0037's f16 blocks, and adds a mask pre-pass.
+
+- **The reference:**
+  - vllm-xpu-kernels `csrc/xpu/attn/fmha_utils.hpp`, `chunk_policy_head256`
+    (`code`): 8 query rows a sub-group with all output columns, 32
+    sub-groups a work-group, 32-key tiles;
+  - sycl-tla `xe_fmha_fwd_mainloop.hpp` (`code`): K and V straight from
+    global memory into registers by 2D block reads, the next tile
+    prefetched, no local memory, Q re-read each tile.
+- **What changes against 0008's kernel:**
+  - K arrives as the b operand of Q K^T by a transposed 2D read, V as the
+    b operand of P V by a VNNI-transforming one. The local-memory staging,
+    the scalar 16-bit transposing stores of V and the barriers are gone.
+  - The main loop runs 972 instructions per 64 DPAS instead of 1,366
+    (offline ISA, `ocloc -device bmg`).
+  - Q goes to f16 once a call (`flash_attn_q_to_f16`, scaled) and is read
+    by 2D reads; holding it in registers, as 0008 does, left no room at head
+    size 256 (O alone is 128 GRF).
+- **IGC's value-returning builtins** (`__builtin_IB_subgroup_block_read_flat_*`)
+  do the reads. The extension's functions write a private array, and in this
+  kernel that put the accumulators in scratch memory without a spill being
+  reported.
+- **The mask by blocks** (after llama.cpp's Vulkan
+  `flash_attn_mask_opt.comp`): `flash_attn_mask_cls` writes a byte per 8
+  rows x 32 keys, mixed / all zero / nothing visible, once a call. All-zero
+  blocks skip the mask reads; blocks with nothing visible are skipped by
+  that sub-group, which v2 can do because its loop has no barrier.
+- **Switches:**
+  - `GGML_OPENCL_FA_DPAS2=0` keeps 0008's kernel;
+  - `GGML_OPENCL_FA_DPAS2_MCLS=0` turns the mask classes off;
+  - `GGML_OPENCL_FA_DPAS2_NSG` sets the sub-groups a work-group (32 or 16);
+  - the red cases are `-DFA2_RED` (keys one row off), `-DFA2_MCLS_RED`
+    (mixed blocks taken as all zero) and `-DFA_CARRY_RED`.
+  - The f16 path needs 64-byte aligned heads and a row pitch of a multiple
+    of 16 bytes; otherwise the old kernel runs.
+- **Also in the patch:**
+  - `test_flash_attn_ext_causal`: a causal mask as llama.cpp builds it, so
+    all three block classes occur; correctness cases at 512 and 300 rows,
+    and perf cases at depth;
+  - comment fixes from 0037's review.
+
+Measured (`measured-here`, 2026-10-13, B60):
+
+- **test-backend-ops FLASH_ATTN_EXT, head sizes 256 and 128:**
+  - 864/865 with the classes, without them, and with 64-key blocks, the
+    same three failures as the old kernel; the A770 is unchanged (sub-group
+    8 keeps 0008's kernel);
+  - red cases: keys one row off fails 90 prompt cases; mixed blocks as all
+    zero fails 62, 4 of them causal.
+- **Perf** (512 rows, 24 query heads on 4, a causal mask):
+
+  | shape | 0008 | v2 without classes | v2 |
+  |---|---|---|---|
+  | f16, 8,192 keys | 8.21 ms | 5.43 ms | 4.02 ms |
+  | f16, 65,536 keys | 63.0 ms (13.1 TFLOPS) | 43.1 ms | 30.6 ms (26.9 TFLOPS) |
+  | q8_0:q4_0, 65,536 keys (0037) | 92.2 ms | 68.4 ms | 56.5 ms |
+
+- **Served without the classes** (the dense agent's model and flags,
+  q8_0:q4_0):
+  - prefill at 58,269 tokens 479.1 -> 568.3 t/s (n_ctx 131,072);
+  - at 132,874 tokens 292.3 -> 375.0 t/s (n_ctx 245,760);
+  - at 231,786 tokens 192.0 -> 257.4 t/s;
+  - the needle right in every arm, the acceptance task 10/10;
+  - KL 0.005950 / 97.304 % as before (the keys-off red case 0.6815).
+- **Served with the classes** (the same window, n_ctx 245,760 unless stated):
+  - prefill at 58,269 tokens 641.2 t/s (n_ctx 131,072; attention 26.2 s,
+    30 % of device time, level with the Q4_K GEMM);
+  - at 132,874 tokens 383.4 -> 451.6 t/s with the classes on;
+  - at 231,786 tokens 324.2 t/s;
+  - the capital, both needles and the acceptance task (10/10) right;
+    decode unchanged (16.2 t/s at 128k); peak 24,283 MiB, GTT flat;
+  - KL 0.005950 / 97.304 % with the classes off, on, and with 64-key blocks;
+    the red case (mixed blocks taken as all zero) 0.4797 / 77.7 %.
+  - Against arcint 0.7.3 (0001-0035) on the same prompts: 425.9 -> 641.2 t/s
+    at 58k, 249.0 -> 451.6 at 133k, 157.2 (the 0.7.3 record at 236,938) ->
+    324.2 at 232k.
+  - These served arms ran the tree before the review. The review added the
+    pitch >= width term to the surface check (no real view fails it) and the
+    all-zero-mask test, which passes on both cards (866/867, same three
+    failures; the keys-off red case fails it).
+- **Reviewed** before the push by a second model: no defects. It checked the
+  2D-read argument conventions against sycl-tla's builtin wrappers, the
+  class-map indexing in the carry case, the host's argument order for both
+  kernels, and that nothing reaches the A770 or masks with ALiBi, softcap or
+  sinks.

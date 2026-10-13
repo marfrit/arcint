@@ -146,53 +146,81 @@ A770's sub-group-8 path untouched). Noted: `GGML_OPENCL_FA_DPAS_Q=0` turns
 the path off too (in the README now); two comments describe half-open
 ranges loosely (fixed with the next patch to the same files).
 
+## Stage 2: patch 0038, the attention kernel after vLLM's head-256 policy
+
+`flash_attn_dpas2.cl` (README section 0038):
+- **The shape:** vLLM's Xe2 head-256 shape (8 rows a sub-group with all
+  columns, 32 sub-groups, 32-key tiles).
+- **The mainloop, from sycl-tla:** K and V by 2D block reads straight into
+  registers, transposed for Q K^T and VNNI-transformed for P V. No local
+  memory, no barriers. Q is f16 and re-read each tile.
+- **The mask by blocks, from Vulkan's `flash_attn_mask_opt`:** a byte per
+  8 rows x 32 keys; all-zero blocks skip the reads, blocks with nothing
+  visible are skipped by the sub-group.
+
+**Development, on the record** (offline ISA unless stated):
+- **First build:** the main loop came to 992 instructions per 64 DPAS
+  against 1,366, but the accumulators sat in private memory. The loop over
+  output columns was not unrolled, so `o[c]` was indexed at run time. No
+  spill was reported.
+- **Unrolled:** it spilled 3,968 bytes. O (128 GRF), Q (64 GRF), S and the
+  reads in flight do not fit in 256.
+- **Q re-read each tile, as sycl-tla does,** through IGC's value-returning
+  block-read builtins: no spill, no private memory, 972 instructions.
+- **What is left a tile:** about 180 instructions of mask handling, the
+  largest executed share; the class map removes them for all-zero blocks.
+
+**Results** (`measured-here`, B60, the agent's flags, q8_0:q4_0):
+
+| prompt | 0.7.3 | + 0037 | + 0038 without classes | + 0038 |
+|---|---|---|---|---|
+| 58,269 tokens (n_ctx 131,072) | 425.9 t/s | 479.1 | 568.3 | 641.2 |
+| 132,874 tokens (245,760) | 249.0 | 292.3 | 375.0 / 383.4 | 451.6 |
+| 231,786 tokens (245,760) | 157.2 (0.7.3's record at 236,938) | 192.0 | 257.4 | 324.2 |
+
+- **Answers:** the needle and the capital right in every arm; the
+  acceptance task 10/10; decode unchanged.
+- **KL:** 0.005950 / 97.304 % in every arm; the red cases 0.6815 (keys one
+  row off) and 0.4797 (mixed blocks as all zero).
+- **Memory:** peak 24,283 MiB, GTT flat.
+- **The kernel alone** (test-backend-ops, causal mask, 65k keys): f16 13.1
+  -> 26.9 TFLOPS, 27 % of the card's 98.3.
+- **Against the field** (`research-b70-field.md`, `paper`): stock vLLM on a
+  B70 keeps ~1,170 t/s at 110k, with ~1.6x the B60's compute. Scaled, that
+  is about 730 here, against 451.6 at 133k; at 128k the gap was 3x and is
+  now about 1.6x.
+
 ## Next
 
 1. **The ISA audit** (operator, 2026-10-13), ranked by device time, the hot
    loops offline (B60 build):
 
-   | kernel | prefill share (58k) | instructions | DPAS | mov | finding |
+   | kernel | prefill share (58k, before 0037) | instructions | DPAS | mov | finding |
    |---|---|---|---|---|---|
    | FA DPAS, q8_0:q4_0 | 56 % | 1,893 | 64 | 579 | the dequantization's byte/word unpacking: **0037** |
-   | FA DPAS, f16 | (after 0037) | 1,366 | 64 | 223 | see 2 |
-   | Q4_K, int8 activations | 22 % | 839 | 36 (int8, k32) | 115 | half ops packed already (0013's vISA `mad16`) |
+   | FA DPAS, f16 | | 1,366 | 64 | 223 | V's 16-bit transposing stores, the mask: **0038** (972, and the class map) |
+   | Q4_K, int8 activations | 22 % (30 % after 0038) | 839 | 36 (int8, k32) | 115 | half ops packed already (0013's vISA `mad16`) |
    | Q6_K | 6 % | 1,204 | 128 | 203 | half ops packed already: all 256 run 32-wide |
    | Q5_K | 2 % | 1,228 | 128 | 174 | the same |
 
-   - **The FA f16 build's unpacked 16-bit work** (`code`, its ISA):
-     - V's transpose through local memory: 48 word moves and 33
-       word-to-dword widenings feed 32 scalar 16-bit stores a tile;
-     - the explicit mask: 16 scalar half loads, 91 `cmp`, 62 `sel` a tile.
    - **The Q4_K kernel's 32 activation copies are not worth a window.**
      They serve the four DPAS of the first sub-block of a 256-block, a
      register move across the `kb` loop. A ping-pong buffer left the ISA
-     unchanged (offline). The ceiling is 32 of 839 instructions in a kernel
-     that is 22 % of prefill, under 1 %. Not pursued.
-2. **The f16 core after vLLM's head-256 policy** (`code`, vllm-xpu-kernels
-   `5210e3d`, `csrc/xpu/attn/fmha_utils.hpp:101` `chunk_policy_head256` and
-   `:194` `_b16`, dispatched by `xe_2/fmha_xe2.cpp`):
-   - **Same split as ours:** 8 query rows a sub-group with all 256 output
-     columns.
-   - **What differs:**
-     - 32 sub-groups, so 256 rows a work-group (ours: 16 sub-groups, 128
-       rows);
-     - 32-key tiles;
-     - K and V by 2D block loads straight into registers (sycl-tla's
-       mainloop), with no local memory, no V transpose and no barrier but
-       the split one.
-   - **The mask:** the reference computes the causal mask by index. ggml
-     passes an explicit mask, so the ggml-native form is Vulkan's
-     `flash_attn_mask_opt` pre-pass: all-zero tiles skip the mask reads,
-     all -inf tiles are skipped.
-   - **The bound:** the ablations show the core without any K/V traffic at
-     21.3 TFLOPS. The limit is instructions per DPAS, and the rewrite
-     removes the local-memory traffic and most of the mask work.
-   - **Two side effects of 0037:** its f16 copies are laid out by us, so
-     they can be laid out for 2D block reads; and the A770's sub-group-8
-     build has no carry yet (the coder also serves q8_0:q4_0).
+     unchanged (offline). The ceiling is 32 of 839 instructions, under 1 %
+     of prefill. Not pursued.
+   - **The Q4_K GEMM is now the largest kernel.** Its record is
+     `llama-engine-kernel-gap.md` (0013).
+2. **Attention, what is left** (27 % of peak in the kernel):
+   - the O rescale when a row's max rises;
+   - the 2D read payload setup, about 90 scalar movs a tile;
+   - the mixed-tile mask path on the diagonal.
+3. **The A770:** its sub-group-8 build has neither the carry nor v2, and the
+   coder serves q8_0:q4_0 there.
 
 ## Where it lives
 
 - `contrib/llama.cpp/patches/0037-opencl-fa-dpas-f16kv.patch`, its README
   section.
 - `GGML_OPENCL_FA_DPAS_F16KV`, `GGML_OPENCL_FA_DPAS_F16KV_BLOCK`.
+- `contrib/llama.cpp/patches/0038-opencl-fa-dpas2.patch`; `GGML_OPENCL_FA_DPAS2`,
+  `GGML_OPENCL_FA_DPAS2_MCLS`, `GGML_OPENCL_FA_DPAS2_NSG`.

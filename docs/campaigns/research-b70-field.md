@@ -77,6 +77,9 @@ cores. Scaled numbers below are estimates.
   the B70's ~1.6x compute), 256 t/s at 128k against ~1,170 at 110k (about
   3x), 157 t/s at 237k. The gap grows with depth, so it is attention, not the
   GEMMs (`agent-context.md`).
+  **Narrowed 2026-10-13** (`dense-prefill-attention.md`, patches 0037/0038,
+  `measured-here`): 451.6 t/s at 133k, 324.2 at 232k; scaled for compute the
+  B70's ~1,170 at 110k is now about 1.6x ahead, not 3x.
 - **Decode: no contradiction.**
   - Flash-Next: arcint 33-35 t/s exact against the B70's 25.6-30.6,
     approximate and without MTP.
