@@ -225,14 +225,55 @@ ranges loosely (fixed with the next patch to the same files).
    - **Not taken here:** v2's no-local-memory design. The A770 has no 2D
      block I/O, and at head size 256 a sub-group cannot hold enough rows to
      reuse K/V reads.
-   - **Next on the A770:** the mask classes at sub-group level, and two
-     work-groups a core (local memory under 32 KB).
+   - **Ablations after 0039** (`measured-here`, the 16-sub-group q8_0:q4_0
+     build, 32,768 keys, causal; each run removes one part, results wrong):
+
+     | removed | time |
+     |---|---|
+     | nothing | 69.8 ms |
+     | the K/V staging | 39.7 |
+     | only V's transposing stores | 57.9 |
+     | the S DPAS | 64.6 |
+     | the P V DPAS | 57.7 |
+     | the mask path | 60.3 |
+     | the exp | 69.7 |
+     | staging, S and P V | 9.7 |
+
+   - **Tried and not taken** (`measured-here`, each a verdict on the build
+     named, not on the mechanism):
+     - *The mask classes at sub-group level*, in this kernel with its
+       local-memory staging and barriers. The class-capable quantized build
+       ran 74.6 ms with the classes on, against 0039's 70.8, though its
+       static loop is nearly the same (2,810 against 2,741 instructions).
+       Taken out; on the B60, v2 (no barriers) gains with them.
+     - *0037's mechanism*: K/V converted to f16 once a call in key blocks,
+       V transposed, so the staging is plain vector copies. Correct (the
+       carry's red case bites), but the attention kernel ran 2 x 36.9 =
+       73.7 ms against the quantized kernel's 65.7 (unitrace). The f16
+       staging reads twice the bytes. Together with 0039's numbers
+       (16-sub-group f16 slower than quantized), the staging is
+       load-bound, and compressed K/V helps it. Reverted.
+     - *Word-wise dequantization* (0040): identical by construction
+       (`code`), ~1 %. Kept.
+     - *V's transposing stores as dword pairs*: a `shuffle_xor` between
+       lanes 2i and 2i + 1 so each lane writes 4 dwords (key pairs)
+       instead of 8 halves. The loop drops 2,723 -> 2,201 instructions,
+       but the q8_0:q4_0 case ran 82.2 ms against 70.3. Not measured, but
+       likely the cause: the odd lane's dims sit 4 rows (96 dwords) away,
+       a multiple of the bank count, so each pair's two stores hit one
+       bank. Correct (the pair-swap red case fails 92), reverted.
+   - **Next on the A770:**
+     - V's transposing stores (~12 ms of 70): the dword-pair form lost
+       (above); a conflict-free layout for it is untried;
+     - the P V DPAS (~12 ms);
+     - the mask path (~9.5 ms).
 
 ## Where it lives
 
 - `contrib/llama.cpp/patches/0037-opencl-fa-dpas-f16kv.patch`, its README
   section.
 - `GGML_OPENCL_FA_DPAS_F16KV`, `GGML_OPENCL_FA_DPAS_F16KV_BLOCK`.
+- `contrib/llama.cpp/patches/0040-opencl-fa-sg8-load8-words.patch`; `-DFA_LOAD8_BYTES`.
 - `contrib/llama.cpp/patches/0039-opencl-fa-sg8-q-global.patch`; `GGML_OPENCL_FA_SG8_QG`, `GGML_OPENCL_FA_SG8_NSG`.
 - `contrib/llama.cpp/patches/0038-opencl-fa-dpas2.patch`; `GGML_OPENCL_FA_DPAS2`,
   `GGML_OPENCL_FA_DPAS2_MCLS`, `GGML_OPENCL_FA_DPAS2_NSG`.

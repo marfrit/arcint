@@ -2346,3 +2346,38 @@ Measured (`measured-here`, 2026-10-13, the A770 at its pinned 2000 MHz):
   the kernel's Q base ignores `q_offset` (the host passes 0), and a failure
   to create the conversion kernel would leave the FA_QG kernel in use with
   f32 Q.
+
+## 0040-opencl-fa-sg8-load8-words.patch
+
+The sub-group-8 prompt flash attention (the A770) turns q8_0 / q4_0 codes
+into halves with word operations, and takes 0039's review points.
+
+- **`load8` for sub-group 8:**
+  - the codes become halves 1024 + u by integer operations on whole words
+    (0006's form): four 2-byte loads (the 34- and 18-byte blocks are 2-byte
+    aligned), `^ 0x80808080` for q8_0, the nibble mask for q4_0, 0x6400 as
+    the exponent;
+  - the value is (x - 1152) or (x - 1032), an exact integer, times the
+    scale, rounded once as before: identical by construction (`code`; the
+    tests judge within a tolerance, so they do not show bit identity);
+  - the main loop's byte-typed operations go 282 -> 10 and its movs 797 ->
+    607 (offline ISA);
+  - `-DFA_LOAD8_BYTES` keeps the byte conversion.
+- **From 0039's review:** the global-Q base adds `q_offset`, and a failure to
+  create the conversion kernel drops the global-Q build instead of running
+  it on f32 Q.
+
+Measured (`measured-here`, 2026-10-13, the A770):
+
+- **test-backend-ops FLASH_ATTN_EXT, head sizes 256 and 128:** 866/867 on
+  the A770, the same with the byte conversion forced, and on the B60.
+- **Perf** (q8_0:q4_0, 512 rows, causal): 8,192 keys 16.29 ms against the
+  byte form's 16.34-16.37; 32,768 keys 69.9-70.2 against 70.7-70.9. That is
+  ~1 %: at 16 sub-groups the staging is load-bound, not conversion-bound
+  (`dense-prefill-attention.md`, stage 3).
+- **Reviewed** before the push by a second model: no defects. It checked the
+  bit manipulation against ggml's block layouts, the bit-identity argument
+  (no denormal flushing in the build options, no contraction of
+  `(x - c) * d`) and the host's release paths. Its one optional note: the
+  conversion kernel stays allocated when the main kernel fails its size
+  check (harmless, never dispatched).
