@@ -1,3 +1,15 @@
+arcint (0.7.6-1) trixie; urgency=medium
+
+  * 0.7.6: Flash-Next's short prompts on the libllama engine, llama.cpp
+    patch 0043. An expert cache's MUL_MAT_ID takes the GEMM from 64 tokens:
+    below that the GEMM's bank stream copied every bank tensor whole for a
+    few tokens. A 24-token prompt prefills in 0.64 s instead of 1.87 on the
+    B60; 64 tokens and up unchanged; KL +0.0004 nats, answers right.
+    GGML_OPENCL_KQ_MM_ID_CACHE_MIN_TOK overrides the 64. Runtime floor
+    unchanged at marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Tue, 13 Oct 2026 23:55:00 +0200
+
 arcint (0.7.5-1) trixie; urgency=medium
 
   * 0.7.5: Flash-Next's decode on the libllama engine, llama.cpp patches

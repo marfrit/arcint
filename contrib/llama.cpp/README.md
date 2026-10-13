@@ -2510,3 +2510,65 @@ same kernel on the same bytes.
   deferred swaps logged. The build with them (`measured-here`, B60, the
   same flags): decode 33.1 / 36.9 / 35.3 t/s, swap check 0 of 6 (red case 1
   of 6), no layer clamped, prefill 672.8 t/s.
+
+## 0043-opencl-cache-mm-id-min-tok.patch
+
+An expert cache's tensors (its slots and its bank, named `.slots` / `.bank`)
+take `MUL_MAT_ID`'s GEMM from 64 tokens instead of 16
+(`GGML_OPENCL_KQ_MM_ID_CACHE_MIN_TOK` overrides the 64; every other MoE tensor
+keeps `GGML_OPENCL_KQ_MM_ID_MIN_TOK`'s 16).
+
+- **Why:** a prefill ubatch on the GEMM path with the bank stream on (0032)
+  copies each bank tensor whole into the VRAM ring, the whole bank over the
+  link (22.37 GiB at Flash-Next's sizes, the load log's bank line) whatever
+  the token count. A short follow-up prompt
+  paid ~1.9 s for 24 tokens (`measured-here`, B60, the 0.7.5 package, the
+  unit's flags). Priced first with the switches alone (one process an arm,
+  seconds to prefill):
+
+  | prompt | the bank stream (0.7.5) | the gather (stream off) | GEMM from 64 | GEMM from 512 |
+  |---|---|---|---|---|
+  | 24 tokens (a second request) | 1.87 | 0.78 | 0.64 | 0.65 |
+  | 166 tokens | 1.86 | 1.51 | 1.51 | 1.54 |
+  | 694 tokens | 1.94 | 2.64 | 1.93 | 2.63 |
+  | 20,045 tokens | 29.69 | 37.79 | 29.69 | 29.72 |
+
+  The bank stream learns its order on a process's first GEMM graph and
+  gathers there (`ggml_cl_bank_stream`). With a threshold of 64 that graph
+  was the 166-token prompt's, with 512 the 694-token one's: those cells are
+  the gather's cost (1.51, 2.63), not the threshold's.
+
+- **Measured** (`measured-here`, 2026-10-13, B60, Flash-Next with the unit's
+  flags, one binary: the 0.7.5 tree + 0043; 16 restored by the switch; A B A
+  B, one process an arm):
+
+  | prompt | 0043 | GEMM from 16 |
+  |---|---|---|
+  | 24 tokens (the first request) | 0.74-0.77 s | 0.87-0.88 (the stream's learning graph: gathered) |
+  | 24 tokens | 0.64-0.65 s | 1.86-1.87 |
+  | 28 tokens | 0.57 s | 1.82-1.83 |
+  | 166 tokens | 1.51-1.52 s (the learning graph: gathered) | 1.85-1.86 |
+  | 694 tokens | 1.93 s | 1.93 |
+  | 20,045 tokens | 29.67-29.68 s | 29.69-29.70 |
+
+  - The prompt's tokens now take the matvec's arithmetic (q8_1 activations,
+    as decode always has) instead of the GEMM's: the texts differ. The
+    hash-table answer after a 28-token prompt accepted 166 of 267 drafts
+    (33.0 / 32.9 t/s) against 170 of 259 (34.6 / 34.6), the same in both
+    runs of each arm; the answers right in every arm.
+  - KL (`llama-perplexity`, 16 x 512 against the CPU reference
+    `fn-ref-q8.kld`, q8_0 KV, the expert cache; 32-token ubatches so that
+    the two thresholds take different paths): 0.294000 / 87.181 % against
+    the GEMM's 0.293562 / 87.279 % (+0.0004 nats, -0.10 points: inside the
+    bar); 8.53 against 25.48 s a pass. The 512-token arm (the GEMM either
+    way) reads 0.294037 / 87.353 %, stage 7's value.
+- The coder (its experts resident, no `.slots` / `.bank` tensors) and the
+  dense models do not take this branch (`code`).
+- **Open, priced:** a prompt of 64 tokens or more still streams the whole
+  bank once the order is learnt, ~1.84 s a graph up to ~1,000 tokens. The
+  crossover against the gather (`measured-here`, B60, the 0043 binary, the
+  order learnt on a 2,665-token prompt first, two runs each, identical to
+  the hundredth): 173 tokens 1.84 s streamed against 1.56 gathered; 317:
+  1.84 / 1.96; 461: 1.85 / 2.26; 702: 1.90 / 2.64; 1,470: 2.36 / 3.51. A
+  stream threshold near 250 tokens would save at most ~0.3 s on prompts of
+  64-250 tokens; not built.

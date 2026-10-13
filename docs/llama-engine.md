@@ -204,6 +204,13 @@ Decode 30.5-35.7 -> 33.1-37.0 t/s against the 0.7.4 package (two A/Bs
 chained, their shared arms agreeing), prefill 661-663 -> 672-674 t/s, the
 answers and the drafts' acceptance identical.
 
+**Short prompts since 0.7.6** (`contrib/llama.cpp` 0043, `measured-here`,
+B60, the configuration above): an expert cache's MUL_MAT_ID takes the GEMM
+from 64 tokens (`GGML_OPENCL_KQ_MM_ID_CACHE_MIN_TOK`); below that the bank
+stream copied every bank tensor whole for a few tokens. A 24-token prompt
+prefills in 0.64 s instead of 1.87; 64 tokens and up unchanged; KL +0.0004
+nats.
+
 The UD-Q3_K_XL file (52 GiB of experts) serves the same way at 235 t/s
 prefill and 12-13 t/s decode without MTP (2026-10-06).
 
