@@ -2339,3 +2339,10 @@ Measured (`measured-here`, 2026-10-13, the A770 at its pinned 2000 MHz):
   - The acceptance task: 9/10 greedy in both arms, with the identical
     answer. The deployed 0.7.3 package scores the same 9/10 with the same
     answer today, so neither this patch nor 0036-0038 moved it.
+- **Reviewed** before the push by a second model: no defects in this build.
+  It checked the layout, padding and work-group geometry, that 0037's
+  carry path cannot be reached on sub-group 8, and that the Xe2 path is
+  unchanged. Two robustness points go into the next patch to these files:
+  the kernel's Q base ignores `q_offset` (the host passes 0), and a failure
+  to create the conversion kernel would leave the FA_QG kernel in use with
+  f32 Q.
