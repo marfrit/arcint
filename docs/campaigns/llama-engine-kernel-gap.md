@@ -354,6 +354,27 @@ multi-threaded enqueue. A hazard: with two OpenCL devices registered every
 node runs `sync_with_other_backends`; arcint sets `GGML_OPENCL_DEVICE`, which
 keeps one.
 
+### Lever 7, the int8 Q4_K GEMM's ceiling (2026-10-14)
+
+`kernel_mul_mm_kq2d_q4_K_i8` (0013) runs the dense agent's gate/up at 84.5
+TOPS, ~43 % of the B60's int8 peak. Its super-block loop (`measured-here`,
+offline ISA, `ocloc -device bmg`, the shipped defines: TMM 32, KSYNC_I8 32,
+256 GRF): 839 instructions for 36 DPAS (32 int8, 4 fp16 for the constant
+term), ~23 a DPAS. Per sub-block (4 int8 DPAS): 32 `mad16`, the 6-bit scale
+applied per (token, column), which no operand can absorb (the scaled codes
+leave int8; the split scale lost in 0013); ~34 decode operations (shift,
+mask, add, xor: ~3-4 a dword); ~14 moves. The vector pipe binds before the
+matrix unit.
+- **64 tokens a sub-group** (each decode feeding 8 DPAS, `code` estimate
+  ~15 instructions a DPAS): spills 8,000 bytes, 5,760 with the block's sums
+  and token scales read late, and IGC recompiles with rolled loops. Not
+  viable as written.
+- **The sums and token scales read late** at 32 tokens: 832 against 839
+  instructions, the same DPAS; no lever.
+- What is left needs a different structure (sub-groups sharing decoded
+  weights through local memory, so a decode feeds more DPAS without more
+  registers in one thread). Priced as a redesign, not built.
+
 ### What the outside references add (web and source research, 2026-10-03)
 
 A research pass over Intel's stacks (the agent's reading; `code` where it
