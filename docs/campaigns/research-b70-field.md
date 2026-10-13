@@ -39,6 +39,24 @@ cores. Scaled numbers below are estimates.
     upstream SYCL ran prefill without XMX unless built with
     `GGML_SYCL_F16`.
 
+- **Stock vLLM, dense Qwen3.8-27B, all-INT4** (a forum post of 2026-10-11,
+  `Lets-Fafo/Qwen3.8-27B-FAFO-W4A16-G32-B70` on Hugging Face; Intel's
+  `llm-scaler-vllm:0.26.0-b2` container, no custom kernels, eager mode, MTP
+  off; all `paper`, no code read).
+  - Weights: W4A16, group 32, BF16 scales, all 400 text projections, from
+    the BF16 checkpoint without calibration; 18.66 GiB on the card;
+    perplexity +3.3 % against BF16 on a small set (an INT4/FP8 mix: +0.25 %).
+  - One stream: decode 26.4 t/s at 512 in, 20.2 t/s at 110k; prefill from
+    TTFT about 1,670 t/s at 8,192, 1,517 at 32,768, 1,354 at 65,536, 1,173 at
+    110,000 tokens.
+  - The headline "1,798 t/s" is total throughput (prompt plus output) at 32
+    clients with prefix caching; 296.5 output t/s sustained at 64 clients.
+  - "ActiveKV" (KV kept on the host, the GPU holding a working set; peak
+    31.89 -> 23.14 GiB, "exact outputs") is announced, without code or
+    method.
+  - A commenter's two B70s (FP8, TP2, MTP 2): prefill 2,910 t/s at 16.5k,
+    1,533 at 131k, 1,213 at 197k; decode 91 -> 56 t/s over that range.
+
 ## Against arcint (B60)
 
 - **Flash-Next prefill is our gap.**
@@ -53,6 +71,12 @@ cores. Scaled numbers below are estimates.
       into two VRAM buffers. MoE was 1.24 s of a 5.4 s 8k forward.
 - **Dense 27B prefill:** arcint's 664 at 20k is about 70-80 % of the B70's
   fp16 path scaled, and above llama.cpp on the B70 scaled.
+- **Dense 27B prefill at depth is our gap** (2026-10-11/12, arcint
+  `measured-here` on the B60, MTP 5, q8_0:q4_0 KV; the stock-vLLM B70 numbers
+  above, `paper`): 787-837 t/s at 4k against ~1,670 at 8k (about 1.3x after
+  the B70's ~1.6x compute), 256 t/s at 128k against ~1,170 at 110k (about
+  3x), 157 t/s at 237k. The gap grows with depth, so it is attention, not the
+  GEMMs (`agent-context.md`).
 - **Decode: no contradiction.**
   - Flash-Next: arcint 33-35 t/s exact against the B70's 25.6-30.6,
     approximate and without MTP.
