@@ -1212,6 +1212,24 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
   - An adapt's table uploads are separate small writes (Flash-Next: 3 a
     touched layer): 240 of 2 KiB take 1.64 ms on the B60 against 54 us as
     one write (`measured-here`, a probe). Not changed yet.
+- **A round's kernels** (`measured-here`, a `GGML_OPENCL_PROFILING` build of
+  the 0.7.5 tree, the unit's flags, two 300-token answers; the build decoded
+  31.5 / 34.6 t/s against 33.1 / 36.9 for the plain one): 17.1 s of kernel
+  time in the whole run (three short prefills and the capital's step
+  included) over the answers' 261 rounds: at most ~65.5 ms of kernels in a
+  round of ~69.6 ms (the plain build), so at least ~4.1 ms of it is not
+  kernel time. Stage 3e measured
+  Strata's kernels at ~64 ms a round on this card; what remains between the
+  engines is mostly tokens per round on these texts, not idle time.
+- **Short prompts: patch 0043** (`measured-here`). Every request on Flash-Next paid ~1.9 s to
+  prefill a 24-30-token prompt: a GEMM ubatch with the bank stream copies
+  each bank tensor whole (~22 GiB over the link) whatever its tokens. An
+  expert cache's tensors now take the GEMM from 64 tokens: 24 tokens 1.87 ->
+  0.64 s, 28 tokens 1.82 -> 0.57; 64 tokens and up unchanged (a 166-token
+  figure of 1.51 was the stream's learning graph, gathered), KL inside the
+  bar (`contrib/llama.cpp/README.md`, 0043, has the tables). Open: the
+  streamed GEMM costs ~1.85 s a graph whatever its tokens; a mid-size prompt
+  gathered is faster (166 tokens 1.51 s), the crossover is unmeasured.
 - **Where decode stands** (`measured-here`, B60, the unit's flags): the
   0.7.4 package 30.5-31.8 / 33.8-35.7 / 32.6-34.0 t/s on the three answers;
   with the lazy table and 0042 33.1 / 36.9-37.0 / 35.2-35.4. Strata on this

@@ -1,0 +1,26 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 3eba599..1bccd26 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -29227,7 +29227,20 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+     // expert's whole slice. GGML_OPENCL_KQ_MM_ID_MIN_TOK overrides the 16.
+     static const char * mt_env = getenv("GGML_OPENCL_KQ_MM_ID_MIN_TOK");
+     static const int    mm_id_min_tok = mt_env ? atoi(mt_env) : 16;
+-    const bool gemm = n_tok >= mm_id_min_tok && backend_ctx->kernel_mul_mm_id_kq_f16[ti] != nullptr && n_expert <= 512;
++    // Patch 0043: an expert cache's tensors (its slots, its bank in USM host
++    // memory) from 64 tokens. Below that the GEMM's prefill path copies whole
++    // bank tensors (the bank stream, 0032) or gathers them for a few pairs: a
++    // short follow-up prompt on Flash-Next (B60) paid ~1.9 s for 24 tokens
++    // against ~0.65 s on the matvec, 694 tokens and 20k unchanged.
++    // GGML_OPENCL_KQ_MM_ID_CACHE_MIN_TOK overrides the 64.
++    static const char * mc_env = getenv("GGML_OPENCL_KQ_MM_ID_CACHE_MIN_TOK");
++    static const int    mm_id_cache_min_tok = mc_env ? atoi(mc_env) : 64;
++    // an expert cache's tensor by its name, as the zero fill below tells them
++    const char * nm0 = ggml_get_name(src0);
++    const size_t ln0 = strlen(nm0);
++    const bool   cache_src = (ln0 > 6 && strcmp(nm0 + ln0 - 6, ".slots") == 0) || (ln0 > 5 && strcmp(nm0 + ln0 - 5, ".bank") == 0);
++    const bool gemm = n_tok >= (cache_src ? std::max(mm_id_min_tok, mm_id_cache_min_tok) : mm_id_min_tok) &&
++                      backend_ctx->kernel_mul_mm_id_kq_f16[ti] != nullptr && n_expert <= 512;
+     // the tokens-as-a kernel (kernel_mul_mm_id2_*) beat the tile kernel at its
+     // old tile (the coder's prefill on an A770 1,032 -> 1,231 t/s at 512
+     // tokens). With its tile searched (2,4,2,2) the tile kernel is faster than
