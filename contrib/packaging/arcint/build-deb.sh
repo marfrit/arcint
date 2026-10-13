@@ -14,7 +14,7 @@
 # kernels).
 set -euo pipefail
 
-PKGVER=0.7.3
+PKGVER=0.7.4
 UPSTREAM_TAG=v${PKGVER}
 PKGREL=1
 # The public repository, not the fleet one. The fleet repo (still named

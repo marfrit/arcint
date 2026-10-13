@@ -1,0 +1,305 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 55ed4cc..49ac1a4 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -927,6 +927,7 @@ struct ggml_backend_opencl_context {
+     ggml_cl_adreno_xmem_attn_state adreno_xmem_attn;
+ #endif
+     cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0, kernel_get_rows_i32;
++    cl_kernel kernel_get_rows_q8_0 = nullptr, kernel_get_rows_q8_0_flat = nullptr;   // patch 0036
+     cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
+     cl_kernel kernel_set_rows_h16_i64 = nullptr, kernel_set_rows_h16_i32 = nullptr;   // F16 rows into F16
+     cl_kernel kernel_set_rows_q8_0_i64, kernel_set_rows_q8_0_i32;
+@@ -2068,6 +2069,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+         CL_CHECK((backend_ctx->kernel_get_rows_f16  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_f16", &err), err));
+         CL_CHECK((backend_ctx->kernel_get_rows_q4_0 = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_q4_0", &err), err));
+         CL_CHECK((backend_ctx->kernel_get_rows_i32  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_i32", &err), err));
++        CL_CHECK((backend_ctx->kernel_get_rows_q8_0 = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_q8_0", &err), err));
++        CL_CHECK((backend_ctx->kernel_get_rows_q8_0_flat = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_q8_0_flat", &err), err));
+         GGML_LOG_CONT(".");
+     }
+ 
+@@ -10219,6 +10222,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                 case GGML_TYPE_F16:
+                 case GGML_TYPE_I32:
+                     return true;
++                case GGML_TYPE_Q8_0:
++                    // both layouts (patch 0036): a quantized KV / QSA indexer cache in
++                    // plain blocks, a weight flattened by set_tensor
++                    return backend_ctx->kernel_get_rows_q8_0 != nullptr;
+                 case GGML_TYPE_Q4_0:
+ #ifdef GGML_OPENCL_SOA_Q
+                     // We do not support flattened Q4_0 (and possibly other Q's)
+@@ -14986,14 +14993,67 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
+ 
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+ 
+-    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+     ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+-
+-    cl_ulong offset0 = extra0->offset + src0->view_offs;
+     cl_ulong offset1 = extra1->offset + src1->view_offs;
+     cl_ulong offsetd = extrad->offset + dst->view_offs;
+ 
++    // q8_0 (patch 0036): a weight that set_tensor flattened carries a
++    // ggml_tensor_extra_cl_q8_0, listed by its buffer context; a view keeps the
++    // extra it was created with, so the parent's decides; a quantized KV or QSA
++    // indexer cache keeps ggml's plain blocks
++    if (src0->type == GGML_TYPE_Q8_0) {
++        const ggml_tensor * base = src0->view_src ? src0->view_src : src0;
++        bool flat = false;
++        if (base->buffer) {
++            auto * bctx = (ggml_backend_opencl_buffer_context *) base->buffer->context;
++            for (auto * e : bctx->temp_tensor_extras_q8_0_in_use) {
++                if ((void *) e == base->extra) { flat = true; break; }
++            }
++        }
++        cl_kernel k = flat ? backend_ctx->kernel_get_rows_q8_0_flat : backend_ctx->kernel_get_rows_q8_0;
++        int a = 0;
++        if (flat) {
++            auto * e = (ggml_tensor_extra_cl_q8_0 *) base->extra;
++            const cl_ulong block0 = src0->view_offs / (sizeof(ggml_fp16_t) + 32);
++            CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &e->q));
++            CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &e->d));
++            CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &block0));
++        } else {
++            ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
++            const cl_ulong offset0 = extra0->offset + src0->view_offs;
++            CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &extra0->data_device));
++            CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &offset0));
++        }
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &extra1->data_device));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &offset1));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &extrad->data_device));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &offsetd));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &ne00));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &nb01));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &nb02));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &nb03));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &ne10));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &nb10));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &nb11));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &nb12));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &nb1));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &nb2));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &nb3));
++        int nth = 1;
++        const int max_wg = backend_ctx->get_kernel_workgroup_size(k);
++        while (nth < ne00 && 2*nth <= max_wg) {
++            nth *= 2;
++        }
++        size_t global_work_size[] = {(size_t)ne10*nth, (size_t)ne11, (size_t)ne12};
++        size_t local_work_size[] = {(size_t)nth, 1, 1};
++        backend_ctx->enqueue_ndrange_kernel(k, 3, global_work_size, local_work_size, dst);
++        return;
++    }
++
++    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
++    cl_ulong offset0 = extra0->offset + src0->view_offs;
++
+     cl_kernel kernel;
+ 
+     switch (src0->type) {
+diff --git a/ggml/src/ggml-opencl/kernels/get_rows.cl b/ggml/src/ggml-opencl/kernels/get_rows.cl
+index d7ab0b7..a8c550f 100644
+--- a/ggml/src/ggml-opencl/kernels/get_rows.cl
++++ b/ggml/src/ggml-opencl/kernels/get_rows.cl
+@@ -236,3 +236,101 @@ kernel void kernel_get_rows_q4_0(
+         *(((global float16 *) ((global char *) dst + i12*nb3 + i11*nb2 + i10*nb1)) + ind) = temp;
+     }
+ }
++
++//------------------------------------------------------------------------------
++// GET_ROWS of q8_0 (patch 0036): a quantized KV or QSA indexer cache keeps
++// ggml's plain 34-byte blocks (written by SET_ROWS / CPY); a q8_0 weight uploaded
++// through set_tensor is flattened into a quant buffer and a scale buffer.
++// One work-item an output element, so the reads and writes coalesce.
++//------------------------------------------------------------------------------
++#define QK8_0 32
++struct block_q8_0
++{
++    half d;
++    int8_t qs[QK8_0];
++};
++
++kernel void kernel_get_rows_q8_0(
++        global void * src0,
++        ulong offset0,
++        global int * src1,
++        ulong offset1,
++        global float * dst,
++        ulong offsetd,
++        int ne00,
++        ulong nb01,
++        ulong nb02,
++        ulong nb03,
++        int ne10,
++        ulong nb10,
++        ulong nb11,
++        ulong nb12,
++        ulong nb1,
++        ulong nb2,
++        ulong nb3
++) {
++    src0 = (global void*)((global char*)src0 + offset0);
++    src1 = (global int*)((global char*)src1 + offset1);
++    dst = (global float*)((global char*)dst + offsetd);
++
++    const int i10 = get_group_id(0);
++    const int i11 = get_group_id(1);
++    const int i12 = get_group_id(2);
++
++    const int r = ((global int32_t *) ((global char *) src1 + i12*nb12 + i11*nb11 + i10*nb10))[0];
++
++    global struct block_q8_0 * x = (global struct block_q8_0 *) ((global char *) src0 + r*nb01 + i11*nb02 + i12*nb03);
++    global float * y = (global float *) ((global char *) dst + i12*nb3 + i11*nb2 + i10*nb1);
++
++    for (int i = get_local_id(0); i < ne00; i += get_local_size(0)) {
++#ifndef GET_ROWS_Q8_RED   // the red case of the test: the scale of the next block
++        y[i] = vload_half(0, &x[i / QK8_0].d) * (float) x[i / QK8_0].qs[i % QK8_0];
++#else
++        y[i] = vload_half(0, &x[i / QK8_0 + 1].d) * (float) x[i / QK8_0].qs[i % QK8_0];
++#endif
++    }
++}
++
++// the flattened layout: quants at q + 32 b, scales at d + b, b the logical block index
++kernel void kernel_get_rows_q8_0_flat(
++        global char * q,
++        global half * d,
++        ulong block0,
++        global int * src1,
++        ulong offset1,
++        global float * dst,
++        ulong offsetd,
++        int ne00,
++        ulong nb01,
++        ulong nb02,
++        ulong nb03,
++        int ne10,
++        ulong nb10,
++        ulong nb11,
++        ulong nb12,
++        ulong nb1,
++        ulong nb2,
++        ulong nb3
++) {
++    src1 = (global int*)((global char*)src1 + offset1);
++    dst = (global float*)((global char*)dst + offsetd);
++
++    const int i10 = get_group_id(0);
++    const int i11 = get_group_id(1);
++    const int i12 = get_group_id(2);
++
++    const int r = ((global int32_t *) ((global char *) src1 + i12*nb12 + i11*nb11 + i10*nb10))[0];
++
++    // nb are in bytes of the logical 34-byte blocks
++    const ulong b0 = block0 + (r*nb01 + i11*nb02 + i12*nb03) / (2 + QK8_0);
++    global float * y = (global float *) ((global char *) dst + i12*nb3 + i11*nb2 + i10*nb1);
++
++    for (int i = get_local_id(0); i < ne00; i += get_local_size(0)) {
++        const ulong b = b0 + i / QK8_0;
++#ifndef GET_ROWS_Q8_RED
++        y[i] = vload_half(b, d) * (float) q[b * QK8_0 + i % QK8_0];
++#else
++        y[i] = vload_half(b + 1, d) * (float) q[b * QK8_0 + i % QK8_0];
++#endif
++    }
++}
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 996da46..7b34bcf 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -2523,6 +2523,80 @@ static void init_set_rows_row_ids(ggml_tensor * t, int num_rows) {
+ }
+ 
+ // GGML_OP_SET_ROWS
++// GET_ROWS from a quantized cache (arcint patch 0036): SET_ROWS writes rows of a
++// destination that is never uploaded (as a KV / QSA indexer cache, written only by
++// kernels), and GET_ROWS reads the same rows back. On OpenCL a q8_0 tensor that
++// set_tensor uploads is flattened; this one keeps ggml's plain blocks.
++struct test_get_rows_cache : public test_case {
++    const ggml_type type;
++    const int64_t n;  // cols
++    const int64_t m;  // rows of the cache
++    const int r;      // rows written and read back
++
++    std::string vars() override {
++        return VARS_TO_STR4(type, n, m, r);
++    }
++
++    test_get_rows_cache(ggml_type type = GGML_TYPE_Q8_0, int64_t n = 256, int64_t m = 16, int r = 4)
++        : type(type), n(n), m(m), r(r) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        // the cache is first filled with f32 zeros by SET_ROWS over all its rows, inside the
++        // graph: written by a kernel (never uploaded), no uninitialized memory
++        ggml_tensor * zeros = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, m);
++        ggml_set_name(zeros, "zeros");
++        ggml_tensor * all = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, m);
++        ggml_set_name(all, "all");
++        ggml_tensor * cache = ggml_set_rows(ctx, ggml_new_tensor_2d(ctx, type, n, m), zeros, all);
++        ggml_set_name(cache, "cache");
++        ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, r);
++        ggml_set_name(src, "src");
++        ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, r);
++        ggml_set_name(idx, "idx");
++        ggml_tensor * idx32 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, r);
++        ggml_set_name(idx32, "idx32");
++
++        ggml_tensor * written = ggml_set_rows(ctx, cache, src, idx);
++        ggml_set_name(written, "written");
++        ggml_tensor * out = ggml_get_rows(ctx, written, idx32);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        // the same distinct rows for both index tensors; the cache itself is not uploaded
++        std::vector<int64_t> rows(m);
++        for (int64_t i = 0; i < m; i++) rows[i] = i;
++        std::shuffle(rows.begin(), rows.end(), std::default_random_engine(1234));
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (ggml_is_view_op(t->op) || t->op != GGML_OP_NONE) {
++                continue;
++            }
++            if (t->type == GGML_TYPE_I64 && strcmp(t->name, "all") == 0) {
++                std::vector<int64_t> a(m);
++                for (int64_t i = 0; i < m; i++) a[i] = i;
++                ggml_backend_tensor_set(t, a.data(), 0, m * sizeof(int64_t));
++            } else if (t->type == GGML_TYPE_I64) {
++                ggml_backend_tensor_set(t, rows.data(), 0, r * sizeof(int64_t));
++            } else if (t->type == GGML_TYPE_I32) {
++                std::vector<int32_t> r32(rows.begin(), rows.begin() + r);
++                ggml_backend_tensor_set(t, r32.data(), 0, r * sizeof(int32_t));
++            } else if (t->type == GGML_TYPE_F32 && strcmp(t->name, "zeros") == 0) {
++                std::vector<float> z(ggml_nelements(t), 0.0f);
++                ggml_backend_tensor_set(t, z.data(), 0, z.size() * sizeof(float));
++            } else if (t->type == GGML_TYPE_F32) {
++                init_tensor_uniform(t);
++            }
++        }
++    }
++
++    double max_nmse_err() override {
++        // one quantized value off by one, as test_set_rows estimates it
++        double err = 1.0/8.0/8.0;
++        return err*err / (0.25*double(n*r));
++    }
++};
++
+ struct test_set_rows : public test_case {
+     const ggml_type type_src;
+     const ggml_type type_dst;
+@@ -9458,6 +9532,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
++    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
++        test_cases.emplace_back(new test_get_rows_cache(type, 256, 16, 4));
++        test_cases.emplace_back(new test_get_rows_cache(type, 512, 64, 7));
++    }
+ 
+     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
+     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)

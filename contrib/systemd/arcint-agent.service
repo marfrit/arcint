@@ -14,12 +14,29 @@
 # The price against the OpenVINO agent: no shared prefix cache, prefill 896
 # instead of 1,141 t/s at 4k.
 #
+# Since 2026-10-11: 196,608 tokens with q8_0:q4_0 KV (K in q8_0, V in q4_0;
+# docs/campaigns/agent-context.md on the qfndev branch). Measured on the B60 with arcint 0.7.3 and
+# exactly these flags: the needle at 40 % of a 195,451-token prompt right
+# (prefill 1,059 s, 184.6 t/s; decode there 12.0 t/s); acceptance task 10/10
+# (temperature 0, one run); KL 0.005950 / top-1 97.30 % against q8_0 KV's
+# 0.004099 / 97.75 %, inside the answer-level bar; 4k and 128k prompts as fast
+# as q8_0 at 131,072 and on this unit at 196,608 (4k: 836.9 / 36.6 t/s; 128k:
+# 256.8 / 17.7 against q8_0's 786.8 / 37.8 and 256.1 / 16.6);
+# VRAM peak 22,773 MiB of the card's 24,480, nothing evicted. 212,992 tokens
+# also run (peak 23,247 MiB). Since 2026-10-12: 229,376 tokens -- the needle at
+# 40 % of a 223,628-token prompt right (prefill 1,356 s, 164.9 t/s; decode there
+# 13.3 t/s), acceptance task 10/10, VRAM peak 23,721 MiB of 24,480, nothing
+# evicted. Since 2026-10-12 245,760: the needle in a 236,938-token prompt right
+# (prefill 157.2 t/s, decode there 11.5 t/s), acceptance task 10/10, VRAM peak
+# 24,195 MiB (238 MiB margin): thin; 229,376 is the step back. Back to the
+# start: --n-ctx 131072 --llama-kv q8_0.
+#
 # --llama-mtp-vocab: the draft head scores a 40,960-token vocabulary
 # (HyperQwen's; docs/campaigns/research-hyperqwen.md on the qfndev branch)
 # instead of the full one.
 
 [Unit]
-Description=arcint-agent — Qwen3.8-27B dense + MTP on libllama (q8_0 KV, 131072 tokens), GPU.0, :8087
+Description=arcint-agent — Qwen3.8-27B dense + MTP on libllama (q8_0:q4_0 KV, 245760 tokens), GPU.0, :8087
 Documentation=https://github.com/marfrit/arcint
 After=default.target
 # One card, one resident model: the units that want the same card
@@ -34,8 +51,8 @@ ExecStart=/usr/bin/arcint \
     --device GPU.0 \
     --host 0.0.0.0 \
     --port 8087 \
-    --n-ctx 131072 \
-    --llama-kv q8_0 \
+    --n-ctx 245760 \
+    --llama-kv q8_0:q4_0 \
     --llama-mtp 5 \
     --llama-mtp-vocab %h/.local/share/arcint/hyperqwen-40960.json \
     --queue-timeout 30 \

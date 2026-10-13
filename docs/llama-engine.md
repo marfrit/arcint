@@ -276,6 +276,19 @@ The prices, KL and speed are in the 0015 section of
 - it costs 4-5 % of decode;
 - its KL is within the noise of f16's.
 
+**Dense 27B, B60, 245,760 tokens** (since 2026-10-12; 196,608 on 2026-10-11,
+`docs/campaigns/agent-context.md` on the `qfndev` branch, `measured-here`, arcint 0.7.3, MTP 5):
+`--n-ctx 196608 --llama-kv q8_0:q4_0`. The needle at 40 % of a 195,451-token
+prompt is answered (prefill 1,059 s, 184.6 t/s; decode at that depth 12.0
+t/s); the acceptance task 10/10 greedy (one run); KL 0.005950 / 97.30 %
+against q8_0's 0.004099 / 97.75 %; 4k and 128k prompts as fast as with q8_0
+(on the deployed unit at 196,608: 4k 836.9 / 36.6 t/s, 128k 256.8 / 17.7,
+against q8_0's 786.8 / 37.8 and 256.1 / 16.6); VRAM peak 22,773 MiB of the card's 24,480, nothing evicted. 212,992 tokens
+also run (peak 23,247 MiB). At 229,376 (the deployed size): the needle at 40 % of a
+223,628-token prompt right (prefill 164.9 t/s, decode there 13.3 t/s), the task 10/10,
+peak 23,721 MiB. At 245,760 (deployed): the needle in a 236,938-token prompt right
+(prefill 157.2 t/s, decode there 11.5 t/s), the task 10/10, peak 24,195 MiB (238 MiB margin).
+
 **Dense 27B, B60, with MTP** (5 drafts, the 40,960-id head) and
 `--llama-kv q8_0`:
 - serves `--n-ctx 131072` (peak VRAM 23.06 of 25.7 GB). With f16 KV, MTP

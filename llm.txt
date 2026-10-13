@@ -12,7 +12,7 @@
 > sampling and HTTP serving. NInfer philosophy (specialize, then be honest
 > about numbers), Intel substrate.
 
-## Status (0.7.2)
+## Status (0.7.4)
 
 Runtime floor: marfrit-openvino +p25 = OpenVINO upstream commit 71640275 (the
 2026.4.0 nightly of 2026-08-21) + patches 0003-0074
@@ -23,14 +23,20 @@ and MOE_DOORBELL.
 Two engines (README "Two engines"): OpenVINO (default; Flash-Next, the
 coder's way back) and libllama (--engine llama --gguf, the agent service
 from 0.5.6, the coder service from 2026-10-05: llama.cpp
-bed0a85 with contrib/llama.cpp/patches 0001-0035, ggml's OpenCL backend,
+bed0a85 with contrib/llama.cpp/patches 0001-0040, ggml's OpenCL backend,
 arcint's Intel kernels; MTP from the GGUF's own head; --llama-kv q8_0 or
 q8_0:q4_0 quantizes its KV cache). libllama, measured-here:
 - coder (A770): decode 79.3 t/s with 4 drafts, prefill 1,431 t/s at 4k;
 - dense 27B (B60): decode 52.6 t/s with 5 drafts, prefill 935 t/s at 4k.
 
-With MTP and an 8:8 KV cache the dense model serves 131,072 tokens on the
-B60. The coder serves 98,304 tokens on the A770 from a searched GGUF
+With MTP and a q8_0:q4_0 KV cache the dense model serves 245,760 tokens on
+the B60 (0.7.3; the needle at 237k answered, acceptance 10/10). 0.7.4 makes
+its long prompts faster (llama.cpp patches 0036-0040): prompt attention on
+the B60 reads K/V by 2D block reads after vLLM's head-256 policy, and the
+quantized K/V go to f16 in key blocks. Prefill goes 249.0 -> 451.6 t/s at
+133k tokens and reaches 324.2 at 232k (0.7.3's record: 157.2 at 237k). On the
+A770, Q leaves local memory so 16 sub-groups share each K/V tile: the coder
+goes 410.1 -> 616.2 t/s at 57k. Answers and KL unchanged. The coder serves 98,304 tokens on the A770 from a searched GGUF
 (per-layer expert types, 14.6 GB; top-1 -0.10 points against Q4_K_M,
 acceptance 10/10). 0.5.12 adds llama.cpp server's context checkpoints
 (--llama-checkpoints): a follow-up after a thinking turn or an edited

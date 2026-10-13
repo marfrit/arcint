@@ -1,0 +1,266 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 49ac1a4..497d445 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1178,6 +1178,8 @@ struct ggml_backend_opencl_context {
+     // [0] head size 256, [1] 128
+     cl_kernel kernel_fa_dpas_dk[2] = {};
+     cl_kernel kernel_fa_dpas_q_dk[2][3] = {};     // quantized K/V: q8_0/q8_0, q8_0/q4_0, q4_0/q4_0
++    cl_kernel kernel_fa_dpas_carry_dk[2] = {};    // f16 K/V a block of keys at a time (FA_CARRY, sub-group 16)
++    cl_kernel kernel_fa_kv_to_f16 = nullptr;      // and the block's quantized K/V to f16
+     // Intel Xe2, decode / verify rows on the XMX units, a KV head's query
+     // heads and rows in one pass (flash_attn_gqa_dpas.cl): f16, q8q8, q8q4, q4q4
+     cl_kernel kernel_fa_gqa_dk[2][4] = {};        // [0] head size 256, [1] 128
+@@ -4422,6 +4424,37 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                     }
+                     CL_CHECK(clReleaseProgram(p));
+                 }
++                // a quantized prompt's K/V dequantized to f16 a block of keys at a
++                // time, the softmax state carried between the blocks (FA_CARRY;
++                // the sub-group 16 kernel only)
++                if (backend_ctx->kernel_fa_dpas_dk[di] != nullptr && sg == 16) {
++                    cl_program pc = build_program_from_source_optional(backend_ctx, kernel_src.c_str(),
++                        compile_opts + " -cl-intel-256-GRF-per-thread -DDK=" + std::to_string(dk) + " -DFA_SG=16" +
++                        " -DNSG=" + std::to_string(nsg) + " -DBK=32 -DFA_CARRY" +
++                        (getenv("GGML_OPENCL_FA_DPAS_OPTS") ? std::string(" ") + getenv("GGML_OPENCL_FA_DPAS_OPTS") : std::string()));
++                    if (pc != nullptr) {
++                        cl_kernel kc = clCreateKernel(pc, "flash_attn_f32_f16_dpas", &err);
++                        size_t   wg = 0;
++                        cl_ulong lm = 0, lm_dev = 0;
++                        if (err == CL_SUCCESS) {
++                            CL_CHECK(clGetKernelWorkGroupInfo(kc, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg), &wg, NULL));
++                            CL_CHECK(clGetKernelWorkGroupInfo(kc, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE, sizeof(lm), &lm, NULL));
++                            CL_CHECK(clGetDeviceInfo(backend_ctx->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(lm_dev), &lm_dev, NULL));
++                            if (wg >= (size_t)nthr && lm <= lm_dev) {
++                                backend_ctx->kernel_fa_dpas_carry_dk[di] = kc;
++                                if (backend_ctx->kernel_fa_kv_to_f16 == nullptr) {
++                                    backend_ctx->kernel_fa_kv_to_f16 = clCreateKernel(pc, "flash_attn_kv_to_f16", &err);
++                                    if (err != CL_SUCCESS) {
++                                        backend_ctx->kernel_fa_kv_to_f16 = nullptr;
++                                    }
++                                }
++                            } else {
++                                CL_CHECK(clReleaseKernel(kc));
++                            }
++                        }
++                        CL_CHECK(clReleaseProgram(pc));
++                    }
++                }
+                 // the same with quantized K/V (KT/VT: 1 q8_0, 2 q4_0), staged to
+                 // f16 in local memory; GGML_OPENCL_FA_DPAS_Q=0 leaves quantized
+                 // caches to flash_attn_f32_q8_0.cl / the host dequantization
+@@ -20222,8 +20255,103 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+         sinks == nullptr && max_bias == 0.0f && logit_softcap == 0.0f &&
+         q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
+         (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q))) {
+-        cl_kernel kd = kd_sel;
+         cl_mem    nomask = nullptr;
++        // quantized K/V: dequantized to f16 a block of keys at a time and run
++        // by the f16 kernel, the softmax state carried between the blocks
++        // (llama.cpp's CUDA backend converts a quantized K/V to f16 once a
++        // call, launch_fattn; in blocks here, so the copy stays small at any
++        // depth). The in-kernel dequantization repeats per work-group, every
++        // value once per query head and query block, and its byte and word
++        // unpacking costs 38 % more instructions a tile (527 of 1,893 in the
++        // main loop's ISA, B60).
++        // GGML_OPENCL_FA_DPAS_F16KV=0 keeps the quantized kernels;
++        // GGML_OPENCL_FA_DPAS_F16KV_BLOCK: keys a block (16384)
++        static const char * f16kv_env  = getenv("GGML_OPENCL_FA_DPAS_F16KV");
++        static const char * f16kvb_env = getenv("GGML_OPENCL_FA_DPAS_F16KV_BLOCK");
++        cl_kernel kc = backend_ctx->kernel_fa_dpas_carry_dk[fa_dki];
++        if (!is_mixed && kvq >= 0 && kc != nullptr && backend_ctx->kernel_fa_kv_to_f16 != nullptr && (f16kv_env == nullptr || atoi(f16kv_env) != 0)) {
++            const int blk = std::max(32, f16kvb_env ? atoi(f16kvb_env) / 32 * 32 : 16384);
++            const int nkb = std::min(blk, n_kv);
++            ggml_cl_buffer & kf = backend_ctx->scratch_buffer("fa_dpas_kf16");
++            ggml_cl_buffer & vf = backend_ctx->scratch_buffer("fa_dpas_vf16");
++            ggml_cl_buffer & cr = backend_ctx->scratch_buffer("fa_dpas_carry");
++            kf.allocate(backend_ctx->context, (size_t) d_head_q * nkb * k->ne[2] * k->ne[3] * sizeof(cl_half));
++            vf.allocate(backend_ctx->context, (size_t) d_head_v * nkb * v->ne[2] * v->ne[3] * sizeof(cl_half));
++            if (n_kv > blk) {
++                // per 8-row group of the padded rows: (d_head_v / 16 + 2) x 16 lanes x 8 floats
++                const size_t bq = (size_t) backend_ctx->fa_dpas_bq;
++                const size_t n_g = (size_t) CEIL_DIV(n_q, (int) bq) * bq / 8;
++                cr.allocate(backend_ctx->context, (size_t) n_batch * n_head * n_g * (d_head_v / 16 + 2) * 128 * sizeof(float));
++            }
++            cl_mem carry = n_kv > blk ? cr.buffer : kf.buffer;   // unread unless there are blocks to carry
++            // rows kv0 .. kv0 + nb of a K/V view to [dim][key][head][batch] f16
++            auto dequant = [&](const ggml_tensor * t, cl_mem src, cl_ulong off, cl_ulong nb1, cl_ulong nb2, cl_ulong nb3,
++                               int kv0, int nb, cl_mem out) {
++                cl_kernel kq = backend_ctx->kernel_fa_kv_to_f16;
++                const cl_ulong soff = off + (cl_ulong) kv0 * nb1;
++                const cl_int tt = t->type == GGML_TYPE_Q8_0 ? 1 : 2, d = (cl_int) t->ne[0], ne2 = (cl_int) t->ne[2];
++                CL_CHECK(clSetKernelArg(kq, 0, sizeof(cl_mem),   &src));
++                CL_CHECK(clSetKernelArg(kq, 1, sizeof(cl_ulong), &soff));
++                CL_CHECK(clSetKernelArg(kq, 2, sizeof(cl_ulong), &nb1));
++                CL_CHECK(clSetKernelArg(kq, 3, sizeof(cl_ulong), &nb2));
++                CL_CHECK(clSetKernelArg(kq, 4, sizeof(cl_ulong), &nb3));
++                CL_CHECK(clSetKernelArg(kq, 5, sizeof(cl_int),   &tt));
++                CL_CHECK(clSetKernelArg(kq, 6, sizeof(cl_int),   &d));
++                CL_CHECK(clSetKernelArg(kq, 7, sizeof(cl_int),   &nb));
++                CL_CHECK(clSetKernelArg(kq, 8, sizeof(cl_int),   &ne2));
++                CL_CHECK(clSetKernelArg(kq, 9, sizeof(cl_mem),   &out));
++                size_t lws[3] = { (size_t) d / 8, 4, 1 };
++                size_t gws[3] = { (size_t) d / 8, (size_t) CEIL_DIV(nb, 4) * 4, (size_t) ne2 * (size_t) t->ne[3] };
++                backend_ctx->enqueue_ndrange_kernel(kq, 3, gws, lws, dst);
++            };
++            for (int kv0 = 0; kv0 < n_kv; kv0 += blk) {
++                const int nb = std::min(blk, n_kv - kv0);
++                dequant(k, k_data_device, offset_k, k_nb1, k_nb2, k_nb3, kv0, nb, kf.buffer);
++                dequant(v, v_data_device, offset_v, v_nb1, v_nb2, v_nb3, kv0, nb, vf.buffer);
++                const cl_ulong zero = 0;
++                const cl_ulong fk1 = (cl_ulong) d_head_q * sizeof(cl_half), fk2 = fk1 * nb, fk3 = fk2 * k->ne[2];
++                const cl_ulong fv1 = (cl_ulong) d_head_v * sizeof(cl_half), fv2 = fv1 * nb, fv3 = fv2 * v->ne[2];
++                int a = 0;
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(cl_mem),   &extra_q->data_device));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(cl_ulong), &offset_q));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(cl_mem),   &kf.buffer));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(cl_ulong), &zero));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(cl_mem),   &vf.buffer));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(cl_ulong), &zero));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(cl_mem),   mask_buffer ? &mask_buffer : &nomask));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(cl_ulong), &offset_mask));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(cl_mem),   &extra_o->data_device));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(cl_ulong), &offset_o));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(float),    &scale));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(int),      &n_q));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(int),      &nb));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(int),      &n_head));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(int),      &n_head_kv));
++                const cl_ulong nbs[15] = { q_nb1, q_nb2, q_nb3, fk1, fk2, fk3, fv1, fv2, fv3,
++                                           o_nb1, o_nb2, o_nb3, mask_nb1, mask_nb2, mask_nb3 };
++                for (const cl_ulong & nbv : nbs) {
++                    CL_CHECK(clSetKernelArg(kc, a++, sizeof(cl_ulong), &nbv));
++                }
++                const int mne2 = mask ? mask_ne2 : 1, mne3 = mask ? mask_ne3 : 1;
++                const int k_ne3 = (int) k->ne[3], v_ne3 = (int) v->ne[3];
++                const int carry_in = kv0 > 0, carry_out = kv0 + nb < n_kv;
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(int),    &mne2));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(int),    &mne3));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(int),    &n_batch));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(int),    &k_ne3));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(int),    &v_ne3));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(cl_mem), &carry));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(int),    &kv0));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(int),    &carry_in));
++                CL_CHECK(clSetKernelArg(kc, a++, sizeof(int),    &carry_out));
++                const size_t bq = (size_t) backend_ctx->fa_dpas_bq, nthr = (size_t) backend_ctx->fa_dpas_nthr;
++                size_t gws[3] = { (size_t) CEIL_DIV(n_q, (int) bq) * nthr, (size_t) n_head, (size_t) n_batch };
++                size_t lws[3] = { nthr, 1, 1 };
++                backend_ctx->enqueue_ndrange_kernel(kc, 3, gws, lws, dst);
++            }
++            return;
++        }
++        cl_kernel kd = kd_sel;
+         int a = 0;
+         CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   &extra_q->data_device));
+         CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &offset_q));
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
+index d0d852b..a781d1c 100644
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
+@@ -87,6 +87,19 @@ static inline half8 load8(const int t, const global char * row, const int c8) {
+     const uchar8 n = (c8 & 2) ? (q >> (uchar8)(4)) : (q & (uchar8)(15));
+     return convert_half8((convert_float8(n) - 8.f) * d);
+ }
++#ifdef FA_CARRY
++// keys 0 .. nkeys of a quantized K or V view (type t, head size d) to f16,
++// [dim][key][head][batch]: a work-item per 8 values, the attention kernel's
++// own conversion (load8), one 16-byte store
++kernel void flash_attn_kv_to_f16(global const char * src, ulong off, ulong nb1, ulong nb2, ulong nb3,
++                                 int t, int d, int nkeys, int ne2, global half * dst) {
++    const int c8 = get_global_id(0), key = get_global_id(1);
++    const int h = get_global_id(2) % ne2, b = get_global_id(2) / ne2;
++    if (c8 >= d / 8 || key >= nkeys) return;
++    const half8 x = load8(t, src + off + (ulong) key * nb1 + (ulong) h * nb2 + (ulong) b * nb3, c8);
++    vstore8(x, 0, dst + (((ulong) b * ne2 + h) * nkeys + key) * d + 8 * c8);
++}
++#endif
+ #if SG == 8
+ #define LOAD_A(p) as_int8(intel_sub_group_block_read8((local const uint *)(p)))
+ #endif
+@@ -107,7 +120,14 @@ kernel void flash_attn_f32_f16_dpas(
+         ulong v_nb1, ulong v_nb2, ulong v_nb3,
+         ulong o_nb1, ulong o_nb2, ulong o_nb3,
+         ulong mask_nb1, ulong mask_nb2, ulong mask_nb3, int mask_ne2, int mask_ne3,
+-        int n_batch, int k_ne3, int v_ne3) {
++        int n_batch, int k_ne3, int v_ne3
++#ifdef FA_CARRY
++        // one block of keys a call (kv0..kv0 + n_kv of the mask): the online
++        // softmax state (m, l, O unnormalised, f32) per row carried in
++        // `carry` from the previous block (carry_in) to the next (carry_out)
++        , global float * carry, int kv0, int carry_in, int carry_out
++#endif
++        ) {
+     local half kv[BK * DK];     // one buffer (16 KB at DK 256): K, then rewritten as V
+ 
+     const int lane = get_sub_group_local_id(), sg = get_sub_group_id(), lid = get_local_id(0);
+@@ -121,6 +141,9 @@ kernel void flash_attn_f32_f16_dpas(
+     global const half * mb = mask_void != 0
+         ? (global const half *)(mask_void + mask_offset + (batch % mask_ne3) * mask_nb3 + (head % mask_ne2) * mask_nb2)
+         : 0;
++#ifdef FA_CARRY
++    if (mb != 0) mb += kv0;
++#endif
+ 
+     // the last key any row of the work-group sees: a row a work-item, its
+     // masked tail scanned backwards (short for a causal mask)
+@@ -188,6 +211,25 @@ kernel void flash_attn_f32_f16_dpas(
+         if (u < BK * DK / 8) { const int key = u / (DK / 8), c8 = u % (DK / 8); vstore8(kp3, 0, kv + key * DK + 8 * c8); }
+     }
+ 
++#ifdef FA_CARRY
++    // the carried state in the registers' own layout, per 8-row group:
++    // [NDC + 2][lane][8] floats, a work-item's float8 of O per c, then its
++    // m and l shares (l unreduced: the sum runs as in one pass). Loaded only
++    // here: gathering O row by row spilled the build past 256 GRF.
++    const int n_g = (n_q + BQ - 1) / BQ * (BQ / 8);
++    global float * cb = carry + (((ulong) batch * n_head + head) * n_g + q_sg / 8) * (ulong) ((NDC + 2) * 128) + lane * 8;
++    if (carry_in) {
++        for (int c = 0; c < NDC; ++c) o[c] = vload8(0, cb + c * 128);
++        const float8 mv = vload8(0, cb + NDC * 128);
++#ifndef FA_CARRY_RED
++        const float8 lv8 = vload8(0, cb + (NDC + 1) * 128);
++#else
++        const float8 lv8 = (float8)(0.f);   // the red case: the earlier blocks' sums dropped
++#endif
++        m[0] = mv.s0; m[1] = mv.s1; m[2] = mv.s2; m[3] = mv.s3; m[4] = mv.s4; m[5] = mv.s5; m[6] = mv.s6; m[7] = mv.s7;
++        l[0] = lv8.s0; l[1] = lv8.s1; l[2] = lv8.s2; l[3] = lv8.s3; l[4] = lv8.s4; l[5] = lv8.s5; l[6] = lv8.s6; l[7] = lv8.s7;
++    }
++#endif
+     for (int t0 = 0; t0 < kv_end; t0 += BK) {
+         // prefetch this tile's V into registers before the barrier, so the
+         // loads are already in flight while the work-group syncs
+@@ -319,6 +361,14 @@ kernel void flash_attn_f32_f16_dpas(
+         }
+     }
+ 
++#ifdef FA_CARRY
++    if (carry_out) {
++        for (int c = 0; c < NDC; ++c) vstore8(o[c], 0, cb + c * 128);
++        vstore8((float8)(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]), 0, cb + NDC * 128);
++        vstore8((float8)(l[0], l[1], l[2], l[3], l[4], l[5], l[6], l[7]), 0, cb + (NDC + 1) * 128);
++        return;
++    }
++#endif
+     float lv[8];
+     for (int r = 0; r < 8; ++r) lv[r] = sub_group_reduce_add(l[r]);
+     for (int c = 0; c < NDC; ++c) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 7b34bcf..0020e89 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11713,6 +11713,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32,
+                                                         GGML_TYPE_F16, GGML_TYPE_F16));
+     }
++    // prompt attention at depth, the dense 27B's geometry (head size 256, 24
++    // query heads on 4), f16 and the agent's q8_0:q4_0 cache
++    for (auto kvt : {std::pair<ggml_type, ggml_type>{GGML_TYPE_F16, GGML_TYPE_F16}, std::pair<ggml_type, ggml_type>{GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}}) {
++        for (int64_t kv : {8192, 32768, 65536}) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32,
++                                                            kvt.first, kvt.second));
++        }
++    }
+     // decode (1 row) and MTP verify (6 rows) attention at depth, a dense
+     // 27B's geometry (head size 256, 24 query heads on 4)
+     for (auto kt : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {

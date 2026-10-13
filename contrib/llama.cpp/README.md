@@ -2070,3 +2070,314 @@ Measured (`measured-here`, 2026-10-11):
   not touch.
 - **Review:** no defects. One nit fixed: `-DIQ4_KV_CHAR4` now cancels the
   local table.
+
+## 0036-opencl-get-rows-q8-0.patch
+
+OpenCL GET_ROWS takes q8_0 sources. Before it, GET_ROWS took f32, f16, i32
+and plain Q4_0 only (`ggml_opencl_supports_op`), so every gather from a
+q8_0 tensor ran on the CPU.
+
+- **What it hit:** Flash-Next with `--llama-kv q8_0`. The KV type also types
+  the QSA indexer's key cache, and the indexer gathers rows of it
+  (`gather_key_gate`, `gather_pooled`, `src/models/qwen4exp.cpp`). The
+  scheduler copied each layer's 8 MB indexer cache to the CPU, gathered
+  there and copied back, in the target graph and in every MTP draft.
+- **Two layouts:**
+  - A quantized KV or indexer cache is written by kernels (SET_ROWS), so
+    it keeps ggml's plain 34-byte blocks: `kernel_get_rows_q8_0`. arcint
+    never writes it from the host: its only state restore, a lane's
+    checkpoint, passes `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`, which restores
+    the f32 recurrent state and skips the attention and indexer caches
+    (`code`: `src/exec/backend_llama.cpp`, `llama_memory_hybrid_idx::state_read`).
+    A full-state restore (llama-server's slot load) would go through
+    `set_tensor`, which flattens a whole contiguous q8_0 tensor and has no
+    guard for a partial write; that path is pre-existing and not used here.
+  - A q8_0 tensor uploaded through `set_tensor` is flattened into a quant
+    and a scale buffer: `kernel_get_rows_q8_0_flat`.
+  - The host tells them apart by the tensor's extra: the buffer context
+    lists the flattened extras. A view keeps the extra it was created with,
+    so the parent's (`view_src`) decides.
+  - One work-item per output element.
+- **The test** `GET_ROWS(type=q8_0|f16, n, m, r)` (`test_get_rows_cache`):
+  SET_ROWS fills a never-uploaded cache with zeros, then writes rows into
+  it, and GET_ROWS reads them back. That covers the plain layout, which
+  `set_tensor`-initialized tests cannot reach. `-DGET_ROWS_Q8_RED` (the
+  next block's scale) is the red case of both kernels.
+
+Measured (`measured-here`, 2026-10-13):
+
+- **test-backend-ops GET_ROWS:** 41/41 on the B60 and on the A770. The red
+  case fails both cache cases (ERR 0.070 and 0.068 against limits of 9.5e-7 and 2.7e-7)
+  and the four flattened q8_0 cases (31/41).
+- **The scheduler** (`GGML_SCHED_DEBUG=2`, Flash-Next IQ2_XS, 32K): with
+  q8_0 KV, an 80-token answer had 222 of 444 splits on the CPU, against 52
+  of 104 with f16 KV. With the patch the same pair of served arms had 481
+  and 493 CPU splits of 962 and 986 over four requests: q8_0 no longer adds
+  any. (In the f16 dump the CPU splits are the token-embedding gathers, whose
+  tables live in host memory.)
+- **Served Flash-Next** (B60, 131,072 ctx, MTP 2, the bank stream; each
+  arm's freed VRAM given to the expert slots):
+
+  | KV | expert budget | needle prefill | decode | hit rate |
+  |---|---|---|---|---|
+  | f16 | 9,500 MiB | 649.8 | 30.0 / 31.3 | 89.3 % |
+  | q8_0, before the patch | 11,300 MiB | 521.5 | 13.3 / 13.4 | 91.5 % |
+  | q8_0, with it | 11,300 MiB | 617.2 | 30.9 / 31.0 | 91.4 % |
+
+  The capital, the 20k needle and both long answers right in every arm.
+- **KL** (16 x 512 against unsloth's Q8_0, 13,000 MiB): f16 KV 0.294050 /
+  87.08 %, q8_0 KV 0.294037 / 87.35 %, inside the answer-level bar. These
+  512-token chunks do not reach the indexer gather: the red kernel gives
+  the same numbers. The served needle did not catch the red kernel either
+  (the indexer's top-k selection survives a perturbed scale), hence the
+  test above.
+
+## 0037-opencl-fa-dpas-f16kv.patch
+
+A quantized prompt's K/V go to f16 in blocks of keys, and the f16 DPAS
+flash-attention kernel runs on each block (Intel Xe2, sub-group 16).
+
+- **What it fixes:** the quantized builds of `flash_attn_dpas.cl` (0008)
+  dequantize K/V in every work-group, so each value is converted once per
+  query head and query block, 24 times in a 512-row chunk of the dense 27B.
+  The byte and word unpacking adds 527 instructions to a tile's main loop
+  (1,893 against the f16 build's 1,366; offline ISA, `ocloc -device bmg`).
+  Served at 58k tokens with q8_0:q4_0 KV, attention took 75.2 s against
+  f16's 56.3 s.
+- **The reference:** llama.cpp's CUDA backend converts a quantized K/V to
+  f16 once a call (`launch_fattn`, `need_f16_K/V`) and runs the f16 kernel.
+  **Deviation:** CUDA converts the whole view. At the dense agent's 245,760
+  tokens that is 960 MiB, more than the unit's margin, so here the
+  conversion runs a block of keys at a time (16,384 keys: two 32 MiB
+  scratch buffers, plus 14 MB of carried state at 512 rows).
+- **The carry:** the f16 kernel built with `FA_CARRY` takes `kv0`, offsets
+  the mask by it, and keeps its online-softmax state between blocks. The
+  state is O, m and l per lane in f32, stored in the registers' own layout,
+  so l keeps its per-lane partial sums as in one pass. Loading O row by row
+  spilled 1,408 bytes, and IGC then recompiled the kernel with rolled loops,
+  4x slower; vector loads straight into the accumulators do not spill.
+- **The conversion:** `flash_attn_kv_to_f16`, a work-item per 8 values,
+  using the kernel's own `load8`, so the f16 values equal what the
+  quantized build stages.
+- **Switches:**
+  - `GGML_OPENCL_FA_DPAS_F16KV=0` keeps the quantized kernels;
+  - `GGML_OPENCL_FA_DPAS_F16KV_BLOCK` sets the keys a block;
+  - `-DFA_CARRY_RED` (through `GGML_OPENCL_FA_DPAS_OPTS`) drops the carried
+    sums: the red case.
+  - The path sits under the quantized DPAS kernels' gate, so
+    `GGML_OPENCL_FA_DPAS_Q=0` turns it off too.
+- **Also in the patch:** a test-backend-ops perf case, prompt attention at
+  depth for the dense 27B's geometry, f16 and q8_0/q4_0.
+
+Measured (`measured-here`, 2026-10-13):
+
+- **test-backend-ops FLASH_ATTN_EXT, head size 256:**
+  - 260/261 on the B60 and the A770, the same three failures as without the
+    patch;
+  - 260/261 with 64-key blocks, so the carry runs;
+  - the red case fails 18 quantized prompt cases.
+- **Perf** (B60, 512 rows, 24 query heads on 4): q8_0:q4_0 at 8,192 keys
+  14.6 -> 12.3 ms, at 65,536 keys 111.9 -> 92.5 ms (f16: 8.3 and 63.0). The
+  test's quantized arms include a per-call unflattening of the uploaded K/V
+  (~2.8 ms at 8k) that a served cache does not have.
+- **Served** (the dense agent's model and flags, q8_0:q4_0, n_ctx 131,072, a
+  58,269-token prompt, the profiling build): prefill 425.9 -> 479.1 t/s;
+  attention 75.2 s -> 57.7 s, plus 2.2 s of conversion. The f16-KV arm runs
+  498.8 t/s.
+- **Gate** (the agent's flags at 245,760): the dev arcint with 0001-0037 on the B60, the dense
+  agent's flags (q8_0:q4_0, n_ctx 245,760, MTP 5):
+  - **Answers:** the capital right; the needle at 40 % of a 231,786-token
+    prompt right (prefill 192.0 t/s, peak 24,275 MiB, GTT 28 MiB); the
+    acceptance task 10/10 greedy.
+  - **A/B at 132,874 tokens**, the same window, the needle right in both:
+    prefill 249.0 t/s without the path, 292.3 t/s with it (+17 %); peak
+    24,144 / 24,224 MiB.
+  - **KL** (16 x 512 against `dense-ref.kld`): 0.005950 / 97.304 % without
+    the path, with it, and with 64-key blocks. With 64-key blocks and the
+    carried sums dropped (the red case), KL is 4.4957 / 36.7 %. So the path
+    and the carry run, and with them KL is identical to six digits.
+
+## 0038-opencl-fa-dpas2.patch
+
+A second prompt flash-attention kernel for Intel Xe2, `flash_attn_dpas2.cl`,
+after vLLM's head-256 policy and sycl-tla's mainloop. It runs f16 K/V in
+place and 0037's f16 blocks, and adds a mask pre-pass.
+
+- **The reference:**
+  - vllm-xpu-kernels `csrc/xpu/attn/fmha_utils.hpp`, `chunk_policy_head256`
+    (`code`): 8 query rows a sub-group with all output columns, 32
+    sub-groups a work-group, 32-key tiles;
+  - sycl-tla `xe_fmha_fwd_mainloop.hpp` (`code`): K and V straight from
+    global memory into registers by 2D block reads, the next tile
+    prefetched, no local memory, Q re-read each tile.
+- **What changes against 0008's kernel:**
+  - K arrives as the b operand of Q K^T by a transposed 2D read, V as the
+    b operand of P V by a VNNI-transforming one. The local-memory staging,
+    the scalar 16-bit transposing stores of V and the barriers are gone.
+  - The main loop runs 972 instructions per 64 DPAS instead of 1,366
+    (offline ISA, `ocloc -device bmg`).
+  - Q goes to f16 once a call (`flash_attn_q_to_f16`, scaled) and is read
+    by 2D reads; holding it in registers, as 0008 does, left no room at head
+    size 256 (O alone is 128 GRF).
+- **IGC's value-returning builtins** (`__builtin_IB_subgroup_block_read_flat_*`)
+  do the reads. The extension's functions write a private array, and in this
+  kernel that put the accumulators in scratch memory without a spill being
+  reported.
+- **The mask by blocks** (after llama.cpp's Vulkan
+  `flash_attn_mask_opt.comp`): `flash_attn_mask_cls` writes a byte per 8
+  rows x 32 keys, mixed / all zero / nothing visible, once a call. All-zero
+  blocks skip the mask reads; blocks with nothing visible are skipped by
+  that sub-group, which v2 can do because its loop has no barrier.
+- **Switches:**
+  - `GGML_OPENCL_FA_DPAS2=0` keeps 0008's kernel;
+  - `GGML_OPENCL_FA_DPAS2_MCLS=0` turns the mask classes off;
+  - `GGML_OPENCL_FA_DPAS2_NSG` sets the sub-groups a work-group (32 or 16);
+  - the red cases are `-DFA2_RED` (keys one row off), `-DFA2_MCLS_RED`
+    (mixed blocks taken as all zero) and `-DFA_CARRY_RED`.
+  - The f16 path needs 64-byte aligned heads and a row pitch of a multiple
+    of 16 bytes; otherwise the old kernel runs.
+- **Also in the patch:**
+  - `test_flash_attn_ext_causal`: a causal mask as llama.cpp builds it, so
+    all three block classes occur; correctness cases at 512 and 300 rows,
+    and perf cases at depth;
+  - comment fixes from 0037's review.
+
+Measured (`measured-here`, 2026-10-13, B60):
+
+- **test-backend-ops FLASH_ATTN_EXT, head sizes 256 and 128:**
+  - 864/865 with the classes, without them, and with 64-key blocks, the
+    same three failures as the old kernel; the A770 is unchanged (sub-group
+    8 keeps 0008's kernel);
+  - red cases: keys one row off fails 90 prompt cases; mixed blocks as all
+    zero fails 62, 4 of them causal.
+- **Perf** (512 rows, 24 query heads on 4, a causal mask):
+
+  | shape | 0008 | v2 without classes | v2 |
+  |---|---|---|---|
+  | f16, 8,192 keys | 8.21 ms | 5.43 ms | 4.02 ms |
+  | f16, 65,536 keys | 63.0 ms (13.1 TFLOPS) | 43.1 ms | 30.6 ms (26.9 TFLOPS) |
+  | q8_0:q4_0, 65,536 keys (0037) | 92.2 ms | 68.4 ms | 56.5 ms |
+
+- **Served without the classes** (the dense agent's model and flags,
+  q8_0:q4_0):
+  - prefill at 58,269 tokens 479.1 -> 568.3 t/s (n_ctx 131,072);
+  - at 132,874 tokens 292.3 -> 375.0 t/s (n_ctx 245,760);
+  - at 231,786 tokens 192.0 -> 257.4 t/s;
+  - the needle right in every arm, the acceptance task 10/10;
+  - KL 0.005950 / 97.304 % as before (the keys-off red case 0.6815).
+- **Served with the classes** (the same window, n_ctx 245,760 unless stated):
+  - prefill at 58,269 tokens 641.2 t/s (n_ctx 131,072; attention 26.2 s,
+    30 % of device time, level with the Q4_K GEMM);
+  - at 132,874 tokens 383.4 -> 451.6 t/s with the classes on;
+  - at 231,786 tokens 324.2 t/s;
+  - the capital, both needles and the acceptance task (10/10) right;
+    decode unchanged (16.2 t/s at 128k); peak 24,283 MiB, GTT flat;
+  - KL 0.005950 / 97.304 % with the classes off, on, and with 64-key blocks;
+    the red case (mixed blocks taken as all zero) 0.4797 / 77.7 %.
+  - Against arcint 0.7.3 (0001-0035) on the same prompts: 425.9 -> 641.2 t/s
+    at 58k, 249.0 -> 451.6 at 133k, 157.2 (the 0.7.3 record at 236,938) ->
+    324.2 at 232k.
+  - These served arms ran the tree before the review. The review added the
+    pitch >= width term to the surface check (no real view fails it) and the
+    all-zero-mask test, which passes on both cards (866/867, same three
+    failures; the keys-off red case fails it).
+- **Reviewed** before the push by a second model: no defects. It checked the
+  2D-read argument conventions against sycl-tla's builtin wrappers, the
+  class-map indexing in the carry case, the host's argument order for both
+  kernels, and that nothing reaches the A770 or masks with ALiBi, softcap or
+  sinks.
+
+## 0039-opencl-fa-sg8-q-global.patch
+
+The sub-group-8 prompt flash attention (Intel Xe-HPG, the A770) keeps Q out
+of local memory, so a work-group can take 16 sub-groups instead of 8.
+
+- **What it fixes:** 0008's sub-group-8 build staged Q in local memory next
+  to the K and V tiles: 58 KB of the core's 64 (the build's `slm_size`,
+  offline ISA). A core therefore ran one 8-thread work-group, half a thread
+  per EU, with nothing to hide latency. Served on the coder (44k tokens),
+  attention was 63 % of prefill device time at ~2.9 TFLOPS.
+- **Why not 0038's design here:** the A770 has no 2D block I/O, and with
+  head size 256 a sub-group cannot keep enough rows in registers to reuse
+  K/V reads (O alone is 128 GRF). So the local-memory K/V sharing stays and
+  more sub-groups share it.
+- **`FA_QG`:** Q goes to f16 once a call (`flash_attn_q_to_f16_blk`), in
+  the a-operand blocks the kernel used to write into local memory, and is
+  read by `intel_sub_group_block_read8`. Local memory falls to 45 KB (one
+  work-group a core), now with 16 sub-groups: 16 threads.
+- **Switches:** default on for sub-group 8.
+  - `GGML_OPENCL_FA_SG8_QG=0` restores the old build;
+  - `GGML_OPENCL_FA_SG8_NSG` sets 8, 16 or 32;
+  - `-DFA_QG_RED` (through `GGML_OPENCL_FA_DPAS_OPTS`) reads Q one chunk
+    off: the red case.
+  - Sub-group 16 (Xe2) is unchanged.
+
+Measured (`measured-here`, 2026-10-13, the A770 at its pinned 2000 MHz):
+
+- **test-backend-ops FLASH_ATTN_EXT, head sizes 256 and 128:** 866/867 at
+  8, 16 and 32 sub-groups, the same three failures as before; the red case
+  fails 92 prompt cases.
+- **Perf** (512 rows, causal mask, 24 query heads on 4):
+
+  | shape | before | Q global, 8 | 16 | 32 |
+  |---|---|---|---|---|
+  | q8_0:q4_0, 32,768 keys | 142.5 ms | 144.2 | 70.8 | 73.2 |
+  | f16, 32,768 keys | 108.5 ms | 108.3 | 83.0 | 66.7 |
+
+  Q out of local memory alone changes nothing; the work-group size does,
+  so occupancy was the limit. 16 is the best quantized arm, the coder's
+  case.
+- **Served:** the coder's model and unit flags (q8_0:q4_0, n_ctx 98,304,
+  MTP 4).
+  - Speed: prefill at 44,329 tokens 476.6 -> 685.5 t/s (attention 55.6 ->
+    27.1 s); at 56,800 tokens 410.1 -> 616.2 t/s in one window; decode
+    unchanged (36 t/s).
+  - Answers: the needle right at 56,800 in both arms and at 88,853, the
+    capital right.
+  - KL (16 x 512 against `coder-ref-q8.kld`): 0.026908 / 92.402 % in both
+    arms; the red case 1.1127 / 56.3 %.
+  - The acceptance task: 9/10 greedy in both arms, with the identical
+    answer. The deployed 0.7.3 package scores the same 9/10 with the same
+    answer today, so neither this patch nor 0036-0038 moved it.
+- **Reviewed** before the push by a second model: no defects in this build.
+  It checked the layout, padding and work-group geometry, that 0037's
+  carry path cannot be reached on sub-group 8, and that the Xe2 path is
+  unchanged. Two robustness points go into the next patch to these files:
+  the kernel's Q base ignores `q_offset` (the host passes 0), and a failure
+  to create the conversion kernel would leave the FA_QG kernel in use with
+  f32 Q.
+
+## 0040-opencl-fa-sg8-load8-words.patch
+
+The sub-group-8 prompt flash attention (the A770) turns q8_0 / q4_0 codes
+into halves with word operations, and takes 0039's review points.
+
+- **`load8` for sub-group 8:**
+  - the codes become halves 1024 + u by integer operations on whole words
+    (0006's form): four 2-byte loads (the 34- and 18-byte blocks are 2-byte
+    aligned), `^ 0x80808080` for q8_0, the nibble mask for q4_0, 0x6400 as
+    the exponent;
+  - the value is (x - 1152) or (x - 1032), an exact integer, times the
+    scale, rounded once as before: identical by construction (`code`; the
+    tests judge within a tolerance, so they do not show bit identity);
+  - the main loop's byte-typed operations go 282 -> 10 and its movs 797 ->
+    607 (offline ISA);
+  - `-DFA_LOAD8_BYTES` keeps the byte conversion.
+- **From 0039's review:** the global-Q base adds `q_offset`, and a failure to
+  create the conversion kernel drops the global-Q build instead of running
+  it on f32 Q.
+
+Measured (`measured-here`, 2026-10-13, the A770):
+
+- **test-backend-ops FLASH_ATTN_EXT, head sizes 256 and 128:** 866/867 on
+  the A770, the same with the byte conversion forced, and on the B60.
+- **Perf** (q8_0:q4_0, 512 rows, causal): 8,192 keys 16.29 ms against the
+  byte form's 16.34-16.37; 32,768 keys 69.9-70.2 against 70.7-70.9. That is
+  ~1 %: at 16 sub-groups the staging is load-bound, not conversion-bound
+  (`docs/campaigns/dense-prefill-attention.md` on the `qfndev` branch, stage 3).
+- **Reviewed** before the push by a second model: no defects. It checked the
+  bit manipulation against ggml's block layouts, the bit-identity argument
+  (no denormal flushing in the build options, no contraction of
+  `(x - c) * d`) and the host's release paths. Its one optional note: the
+  conversion kernel stays allocated when the main kernel fails its size
+  check (harmless, never dispatched).

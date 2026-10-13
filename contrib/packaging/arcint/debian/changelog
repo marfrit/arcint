@@ -1,3 +1,19 @@
+arcint (0.7.4-1) trixie; urgency=medium
+
+  * 0.7.4: prompt attention on the libllama engine, llama.cpp patches
+    0036-0040. 0036: OpenCL GET_ROWS from q8_0 (Flash-Next with q8_0 KV no
+    longer gathers the QSA indexer on the CPU: decode 13.3 -> 30.9 t/s).
+    0037: a quantized prompt's K/V as f16 in key blocks on Xe2. 0038:
+    flash_attn_dpas2.cl, the B60's prompt attention after vLLM's head-256
+    policy (K/V by 2D block reads, no local memory) with the mask by blocks.
+    The dense agent (q8_0:q4_0 KV) prefills 249 -> 452 t/s at 133k tokens
+    and to 324 at 232k (0.7.3's record: 157 at 237k). 0039: the A770's prompt attention with Q out of
+    local memory and 16 sub-groups a work-group; the coder 410 -> 617 t/s
+    at 57k. 0040: its dequantization by word operations. Answers and KL
+    unchanged. Runtime floor unchanged at marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Tue, 13 Oct 2026 18:30:00 +0200
+
 arcint (0.7.3-1) trixie; urgency=medium
 
   * 0.7.3: Flash-Next and the IQ kernels on the libllama engine, llama.cpp
