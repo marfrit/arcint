@@ -1095,5 +1095,17 @@ expert slots than the f16 arm (11,300 against 9,500 MiB) at 131K, room the
 deployed unit (peak 24,259 of 24,480 MiB) could keep as margin or spend on
 slots. A lane's checkpoint restore does not touch the q8_0 caches (it
 restores the f32 recurrent state only; 0036's README section).
+- **Adopted with 0.7.4** (2026-10-13): the unit runs q8_0 KV with 11,300
+  MiB of slots (`measured-here`: the 0.7.4 package, the unit's flags, one
+  window; the needle, the capital and a long answer right in both arms):
+
+  | arm | prefill (20k) | decode | peak VRAM |
+  |---|---|---|---|
+  | q8_0 KV, 11,300 MiB | 662.7 t/s | 31.7 t/s | 24,241 MiB |
+  | f16 KV, 9,500 MiB | 660.9 t/s | 28.9 t/s | 24,278 MiB |
+
+  An earlier f16 run in the same session decoded at 31.2 t/s, so decode is
+  equal within that spread. 0.7.4's attention kernels against 0.7.3's on
+  f16: 664.6 / 31.2 against 653.0 / 31.1, answers the same.
 - **The served GGUF's first shard** is a real file on the NVMe since
   2026-10-13 (sha256 = Hugging Face's); loads no longer read the ZFS pool.
