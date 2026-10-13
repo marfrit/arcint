@@ -214,13 +214,25 @@ ranges loosely (fixed with the next patch to the same files).
    - the O rescale when a row's max rises;
    - the 2D read payload setup, about 90 scalar movs a tile;
    - the mixed-tile mask path on the diagonal.
-3. **The A770:** its sub-group-8 build has neither the carry nor v2, and the
-   coder serves q8_0:q4_0 there.
+3. **The A770, stage 3 (0039):**
+   - **The cause** (offline ISA and `code`): the coder's prompt attention was
+     63 % of prefill device time at 44k, ~2.9 TFLOPS. The sub-group-8 kernel
+     took 58 KB of the core's 64 KB of local memory, so a core ran one
+     8-thread work-group.
+   - **The fix:** Q out of local memory, 16 sub-groups a work-group.
+   - **Served on the coder:** 476.6 -> 685.5 t/s at 44k and 410.1 -> 616.2
+     at 56,800; answers and KL unchanged (`measured-here`).
+   - **Not taken here:** v2's no-local-memory design. The A770 has no 2D
+     block I/O, and at head size 256 a sub-group cannot hold enough rows to
+     reuse K/V reads.
+   - **Next on the A770:** the mask classes at sub-group level, and two
+     work-groups a core (local memory under 32 KB).
 
 ## Where it lives
 
 - `contrib/llama.cpp/patches/0037-opencl-fa-dpas-f16kv.patch`, its README
   section.
 - `GGML_OPENCL_FA_DPAS_F16KV`, `GGML_OPENCL_FA_DPAS_F16KV_BLOCK`.
+- `contrib/llama.cpp/patches/0039-opencl-fa-sg8-q-global.patch`; `GGML_OPENCL_FA_SG8_QG`, `GGML_OPENCL_FA_SG8_NSG`.
 - `contrib/llama.cpp/patches/0038-opencl-fa-dpas2.patch`; `GGML_OPENCL_FA_DPAS2`,
   `GGML_OPENCL_FA_DPAS2_MCLS`, `GGML_OPENCL_FA_DPAS2_NSG`.

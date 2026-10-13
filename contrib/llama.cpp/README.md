@@ -2286,3 +2286,56 @@ Measured (`measured-here`, 2026-10-13, B60):
   class-map indexing in the carry case, the host's argument order for both
   kernels, and that nothing reaches the A770 or masks with ALiBi, softcap or
   sinks.
+
+## 0039-opencl-fa-sg8-q-global.patch
+
+The sub-group-8 prompt flash attention (Intel Xe-HPG, the A770) keeps Q out
+of local memory, so a work-group can take 16 sub-groups instead of 8.
+
+- **What it fixes:** 0008's sub-group-8 build staged Q in local memory next
+  to the K and V tiles: 58 KB of the core's 64 (the build's `slm_size`,
+  offline ISA). A core therefore ran one 8-thread work-group, half a thread
+  per EU, with nothing to hide latency. Served on the coder (44k tokens),
+  attention was 63 % of prefill device time at ~2.9 TFLOPS.
+- **Why not 0038's design here:** the A770 has no 2D block I/O, and with
+  head size 256 a sub-group cannot keep enough rows in registers to reuse
+  K/V reads (O alone is 128 GRF). So the local-memory K/V sharing stays and
+  more sub-groups share it.
+- **`FA_QG`:** Q goes to f16 once a call (`flash_attn_q_to_f16_blk`), in
+  the a-operand blocks the kernel used to write into local memory, and is
+  read by `intel_sub_group_block_read8`. Local memory falls to 45 KB (one
+  work-group a core), now with 16 sub-groups: 16 threads.
+- **Switches:** default on for sub-group 8.
+  - `GGML_OPENCL_FA_SG8_QG=0` restores the old build;
+  - `GGML_OPENCL_FA_SG8_NSG` sets 8, 16 or 32;
+  - `-DFA_QG_RED` (through `GGML_OPENCL_FA_DPAS_OPTS`) reads Q one chunk
+    off: the red case.
+  - Sub-group 16 (Xe2) is unchanged.
+
+Measured (`measured-here`, 2026-10-13, the A770 at its pinned 2000 MHz):
+
+- **test-backend-ops FLASH_ATTN_EXT, head sizes 256 and 128:** 866/867 at
+  8, 16 and 32 sub-groups, the same three failures as before; the red case
+  fails 92 prompt cases.
+- **Perf** (512 rows, causal mask, 24 query heads on 4):
+
+  | shape | before | Q global, 8 | 16 | 32 |
+  |---|---|---|---|---|
+  | q8_0:q4_0, 32,768 keys | 142.5 ms | 144.2 | 70.8 | 73.2 |
+  | f16, 32,768 keys | 108.5 ms | 108.3 | 83.0 | 66.7 |
+
+  Q out of local memory alone changes nothing; the work-group size does,
+  so occupancy was the limit. 16 is the best quantized arm, the coder's
+  case.
+- **Served:** the coder's model and unit flags (q8_0:q4_0, n_ctx 98,304,
+  MTP 4).
+  - Speed: prefill at 44,329 tokens 476.6 -> 685.5 t/s (attention 55.6 ->
+    27.1 s); at 56,800 tokens 410.1 -> 616.2 t/s in one window; decode
+    unchanged (36 t/s).
+  - Answers: the needle right at 56,800 in both arms and at 88,853, the
+    capital right.
+  - KL (16 x 512 against `coder-ref-q8.kld`): 0.026908 / 92.402 % in both
+    arms; the red case 1.1127 / 56.3 %.
+  - The acceptance task: 9/10 greedy in both arms, with the identical
+    answer. The deployed 0.7.3 package scores the same 9/10 with the same
+    answer today, so neither this patch nor 0036-0038 moved it.
