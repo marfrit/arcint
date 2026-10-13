@@ -38,6 +38,13 @@ top-1 -0.10 points against Q4_K_M, acceptance 10/10). The libllama engine keeps 
 checkpoints (--llama-checkpoints): a follow-up after a thinking turn or an
 edited message resumes instead of re-prefilling (24.3k tokens: 38.75 s ->
 0.61 s on the B60, measured-here); no shared prefix cache across lanes.
+Release 0.7.4 (2026-10-13), measured-here: llama.cpp patches 0036-0040, prompt attention.
+The B60's dense agent with q8_0:q4_0 KV prefills 249.0 -> 451.6 t/s at 133k
+tokens and reaches 324.2 at 232k (0038: 2D block reads after vLLM's head-256
+policy, the mask by blocks; 0037: quantized K/V to f16 in key blocks). The
+A770's coder goes 410.1 -> 616.2 at 57k (0039: Q out of local memory, 16
+sub-groups). Flash-Next with q8_0 KV decodes at f16's speed (0036). Answers
+and KL unchanged.
 Release 0.7.3 (2026-10-11), measured-here: contrib/llama.cpp 0030-0035.
 Flash-Next IQ2_XS's 20k needle prefill 408 -> 640-645 t/s on the B60 with
 GGML_OPENCL_BANK_STREAM=1 (0032, opt-in: banks streamed on a copy queue)

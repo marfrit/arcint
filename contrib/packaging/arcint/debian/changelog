@@ -7,7 +7,7 @@ arcint (0.7.4-1) trixie; urgency=medium
     flash_attn_dpas2.cl, the B60's prompt attention after vLLM's head-256
     policy (K/V by 2D block reads, no local memory) with the mask by blocks.
     The dense agent (q8_0:q4_0 KV) prefills 249 -> 452 t/s at 133k tokens
-    and 157 -> 324 at 232k. 0039: the A770's prompt attention with Q out of
+    and to 324 at 232k (0.7.3's record: 157 at 237k). 0039: the A770's prompt attention with Q out of
     local memory and 16 sub-groups a work-group; the coder 410 -> 617 t/s
     at 57k. 0040: its dequantization by word operations. Answers and KL
     unchanged. Runtime floor unchanged at marfrit-openvino +p25.

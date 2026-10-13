@@ -21,36 +21,44 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 **Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine
 builds llama.cpp `bed0a85` with `contrib/llama.cpp/patches` 0001-0040. No
-change to arcint's own sources: the release is five llama.cpp patches for
-prompt attention and one gather. Every number is `measured-here`; the details
-are in `contrib/llama.cpp/README.md`.
+change to arcint's own sources: the release is five llama.cpp patches, four
+for prompt attention (0037-0040) and one gather (0036). Every number is
+`measured-here`; the details are in `contrib/llama.cpp/README.md`.
 
 - **Patch 0036:** OpenCL GET_ROWS takes q8_0 sources.
   - Flash-Next with `--llama-kv q8_0` gathered its QSA indexer keys on the
-    CPU in every graph. Decode was 13.3 t/s; it is now 30.9-31.0 at 131K,
-    f16's speed, with 1,800 MiB more for expert slots.
+    CPU in every graph.
+  - On the B60 (IQ2_XS, 131,072 ctx, MTP 2, the bank stream, 11,300 MiB of
+    expert slots), decode went 13.3 -> 30.9-31.0 t/s. That is f16 KV's
+    speed, which needs 1,800 MiB less for slots.
 - **Patch 0037:** a quantized prompt's K/V go to f16 in blocks of 16,384
   keys on Xe2 (llama.cpp CUDA's conversion, blocked to fit), instead of
   every work-group dequantizing them again.
 - **Patch 0038:** `flash_attn_dpas2.cl`, the B60's prompt attention.
   - What it is: vLLM's head-256 shape; K/V read straight into registers by
-    2D block reads, with no local memory; a mask pre-pass that skips
-    all-zero and fully masked blocks.
-  - With 0037, the dense agent's prefill with q8_0:q4_0 KV: 425.9 ->
-    641.2 t/s at 58k tokens, 249.0 -> 451.6 at 133k, 157.2 -> 324.2 at
-    232k. Needles, the acceptance task (10/10) and KL unchanged.
+    2D block reads, with no local memory; a mask pre-pass by 8 x 32 blocks.
+    Blocks with nothing visible are skipped, and all-zero blocks skip the
+    mask reads.
+  - With 0037, the dense agent's prefill with q8_0:q4_0 KV:
+    - 425.9 -> 641.2 t/s at 58k tokens (n_ctx 131,072);
+    - 249.0 -> 451.6 at 133k (n_ctx 245,760);
+    - 324.2 at 232k, against 0.7.3's record of 157.2 at 237k (a different
+      prompt).
+  - Needles, the acceptance task (10/10) and KL unchanged.
 - **Patch 0039:** the A770's prompt attention keeps Q out of local memory.
   - A work-group now takes 16 sub-groups instead of 8: the old layout left
     one 8-thread work-group per core.
-  - The coder's prefill: 476.6 -> 685.5 t/s at 44k tokens, 410.1 -> 616.2
-    at 57k. Needles and KL unchanged.
+  - The coder (q8_0:q4_0, n_ctx 98,304, MTP 4, the A770 pinned at
+    2000 MHz): 476.6 -> 685.5 t/s at 44k tokens, 410.1 -> 616.2 at 57k.
+    Needles and KL unchanged.
 - **Patch 0040:** the A770's dequantization by word operations, ~1 %.
-- **Switches** (each defaults to on; `0` restores the old path):
-  `GGML_OPENCL_FA_DPAS_F16KV`, `GGML_OPENCL_FA_DPAS2`,
-  `GGML_OPENCL_FA_DPAS2_MCLS`, `GGML_OPENCL_FA_SG8_QG`.
+- **Switches** (each defaults to on):
+  - `0` restores 0.7.3's kernels for `GGML_OPENCL_FA_DPAS_F16KV`,
+    `GGML_OPENCL_FA_DPAS2` and `GGML_OPENCL_FA_SG8_QG`;
+  - `GGML_OPENCL_FA_DPAS2_MCLS=0` runs 0038's kernel without the mask
+    classes.
 - **The acceptance task on the coder** scores 9/10 with this release and
-  with 0.7.3 alike, the same answer. It lies inside that harness's recorded
-  8-10/10 spread for the deployed coder.
+  with 0.7.3 alike, the identical answer. It was 9/10 at 0.6.0 as well.
 
 ## 0.7.3 — 2026-10-11
 
