@@ -21,7 +21,8 @@
 # - 32,768 tokens with 14,500 MiB of slots decode at 33-35 t/s;
 # - 98,304 tokens with 11,500 MiB at 21.0 t/s;
 # - 131,072 tokens with 9,500 MiB at 19.8 t/s.
-# q8_0 KV was slower on this model (23.6 against 31-33 t/s at 32k).
+# q8_0 KV was slower on this model (23.6 against 31-33 t/s at 32k) until
+# 0.7.4 (below).
 #
 # Loading takes ~7 minutes (the slots and the bank are filled from the file).
 #
@@ -32,6 +33,15 @@
 # 27-29 t/s, the needle and the capital right, nothing evicted, VRAM peak
 # 24.2-24.3 of 24.48 GB. Thin: drop the Environment= line if a larger slot
 # budget or another process needs the room.
+#
+# Since 0.7.4: q8_0 KV and 11,300 MiB of slots.
+# - Why it is viable now: contrib/llama.cpp 0036 gathers the QSA indexer's
+#   q8_0 keys on the card; they ran on the CPU before, which halved decode.
+# - Measured on the B60 (2026-10-13, 131,072 tokens), against f16 KV with
+#   9,500 MiB in the same window: the 20k prompt read at 662.7 against
+#   660.9 t/s; decode 31.7 against 28.9 t/s; VRAM peak 24,241 against
+#   24,278 MiB; the needle, the capital and a long answer right in both.
+# - The KL of q8_0 against f16 KV: 0.294037 against 0.294050 (0036).
 
 [Unit]
 Description=arcint-flashnext — Qwen3.8-Flash-Next IQ2_XS on libllama, expert cache + MTP, GPU.0, :8089
@@ -52,7 +62,8 @@ ExecStart=/usr/bin/arcint \
     --n-ctx 131072 \
     --llama-cpu-moe 48 \
     --llama-threads 8 \
-    --llama-expert-cache 9500 \
+    --llama-expert-cache 11300 \
+    --llama-kv q8_0 \
     --llama-expert-profile %h/.local/share/arcint/expert-profile-strata.bin \
     --llama-mtp 2 \
     --llama-mtp-gguf /models/gguf/fn-mtp/mtp-flash-next-q8e4n.gguf \

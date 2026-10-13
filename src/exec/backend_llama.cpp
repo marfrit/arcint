@@ -308,6 +308,15 @@ public:
             buft_overrides_.push_back({ nullptr, nullptr });
             mp.tensor_buft_overrides = buft_overrides_.data();
             mp.load_mode             = LLAMA_LOAD_MODE_MMAP;
+            // The tensors an arch reads row by row on the host (Flash-Next's
+            // 27 GiB n-gram table) as llama.cpp means them: MADV_RANDOM and
+            // each graph's rows prefetched together. AUTO resolves to OFF for
+            // a device without mmap support (llama-model.cpp:1525-1533), the
+            // OpenCL one among them; the table was then an ordinary mapped
+            // weight, each row a synchronous fault with the file's readahead
+            // around it. The shard holding it also loses MAP_POPULATE
+            // (llama-mmap.cpp:493): its other weights are faulted on demand
+            mp.lazy_mode             = LLAMA_LAZY_MODE_ON;
         }
         const auto t_load     = clock_type::now();
         model_                = llama_model_load_from_file(cfg.gguf_path.c_str(), mp);

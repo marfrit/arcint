@@ -184,6 +184,26 @@ nothing evicted, VRAM peak 24.2-24.3 of 24.48 GB. 0034 and 0035 make the IQ
 kernels' byte arithmetic and the IQ4 codebook cheaper (Flash-Next decode
 ~5 % at 13,000 MiB; the coder on the A770 +2 %).
 
+**Decode since 0.7.5.** Two waits before every verify are gone
+(`measured-here`, 2026-10-13, B60, 131,072 context, q8_0 KV, 11,300 MiB of
+slots, MTP 2, the bank stream; three 300-token answers):
+- The n-gram table (27 GiB, read row by row on the host) is read lazily
+  with `--llama-cpu-moe`: `MADV_RANDOM`, each graph's rows prefetched
+  together. llama.cpp's AUTO lazy mode is OFF on OpenCL devices, and each
+  row had been a synchronous page fault: 2.0-7.7 ms a verify, now 0.3-0.6.
+  The load is ~40 s shorter.
+- The expert cache's swaps run on their own queue (`contrib/llama.cpp`
+  0042, after Strata's adapt stream), issued right behind each graph: the
+  verify's input copies no longer wait for them (2.6-6.0 -> 0.94 ms).
+  `LLAMA_EXPERT_CACHE_SPARES` (default 4 a layer, ~263 MB of pinned host
+  memory at Flash-Next's sizes) sets the spare bank entries a swap's victim
+  goes to; `LLAMA_EXPERT_CACHE_NB=0` brings back the exchange on the
+  compute queue.
+
+Decode 30.5-35.7 -> 33.1-37.0 t/s against the 0.7.4 package (two A/Bs
+chained, their shared arms agreeing), prefill 661-663 -> 672-674 t/s, the
+answers and the drafts' acceptance identical.
+
 The UD-Q3_K_XL file (52 GiB of experts) serves the same way at 235 t/s
 prefill and 12-13 t/s decode without MTP (2026-10-06).
 
