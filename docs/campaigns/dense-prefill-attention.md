@@ -258,13 +258,14 @@ ranges loosely (fixed with the next patch to the same files).
      - *V's transposing stores as dword pairs*: a `shuffle_xor` between
        lanes 2i and 2i + 1 so each lane writes 4 dwords (key pairs)
        instead of 8 halves. The loop drops 2,723 -> 2,201 instructions,
-       but the q8_0:q4_0 case ran 82.2 ms against 70.3. Not measured, but
-       likely the cause: the odd lane's dims sit 4 rows (96 dwords) away,
-       a multiple of the bank count, so each pair's two stores hit one
-       bank. Correct (the pair-swap red case fails 92), reverted.
+       but the q8_0:q4_0 case ran 82.2 ms against 70.3. Not bank
+       conflicts: across V row strides of 34, 36, 40, 48 and 56 halves the
+       pairs lose 10-12 ms every time (halves at 56: 69.3 ms, ~1 %, not
+       taken). The cause is unmeasured. Correct (the pair-swap red case
+       fails 92), reverted.
    - **Next on the A770:**
-     - V's transposing stores (~12 ms of 70): the dword-pair form lost
-       (above); a conflict-free layout for it is untried;
+     - V's transposing stores (~12 ms of 70): the dword-pair form lost at
+       every stride (above);
      - the P V DPAS (~12 ms);
      - the mask path (~9.5 ms).
 
