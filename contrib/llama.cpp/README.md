@@ -2564,8 +2564,11 @@ keeps `GGML_OPENCL_KQ_MM_ID_MIN_TOK`'s 16).
     way) reads 0.294037 / 87.353 %, stage 7's value.
 - The coder (its experts resident, no `.slots` / `.bank` tensors) and the
   dense models do not take this branch (`code`).
-- **Open:** a prompt of 64 tokens or more still streams the whole bank once
-  the order is learnt, ~1.85 s a graph whatever its tokens; 166 tokens
-  gathered take 1.51 s, 694 take 2.64 against the stream's 1.94. Single-
-  ubatch prompts below a crossover (unmeasured, between 166 and 694) would
-  be faster gathered.
+- **Open, priced:** a prompt of 64 tokens or more still streams the whole
+  bank once the order is learnt, ~1.84 s a graph up to ~1,000 tokens. The
+  crossover against the gather (`measured-here`, B60, the 0043 binary, the
+  order learnt on a 2,665-token prompt first, two runs each, identical to
+  the hundredth): 173 tokens 1.84 s streamed against 1.56 gathered; 317:
+  1.84 / 1.96; 461: 1.85 / 2.26; 702: 1.90 / 2.64; 1,470: 2.36 / 3.51. A
+  stream threshold near 250 tokens would save at most ~0.3 s on prompts of
+  64-250 tokens; not built.
