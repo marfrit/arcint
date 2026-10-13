@@ -2070,3 +2070,64 @@ Measured (`measured-here`, 2026-10-11):
   not touch.
 - **Review:** no defects. One nit fixed: `-DIQ4_KV_CHAR4` now cancels the
   local table.
+
+## 0036-opencl-get-rows-q8-0.patch
+
+OpenCL GET_ROWS takes q8_0 sources. Before it, GET_ROWS took f32, f16, i32
+and plain Q4_0 only (`ggml_opencl_supports_op`), so every gather from a
+q8_0 tensor ran on the CPU.
+
+- **What it hit:** Flash-Next with `--llama-kv q8_0`. The KV type also types
+  the QSA indexer's key cache, and the indexer gathers rows of it
+  (`gather_key_gate`, `gather_pooled`, `src/models/qwen4exp.cpp`). The
+  scheduler copied each layer's 8 MB indexer cache to the CPU, gathered
+  there and copied back, in the target graph and in every MTP draft.
+- **Two layouts:**
+  - A quantized KV or indexer cache is written by kernels (SET_ROWS), so
+    it keeps ggml's plain 34-byte blocks: `kernel_get_rows_q8_0`. arcint
+    never writes it from the host: its only state restore, a lane's
+    checkpoint, passes `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`, which restores
+    the f32 recurrent state and skips the attention and indexer caches
+    (`code`: `src/exec/backend_llama.cpp`, `llama_memory_hybrid_idx::state_read`).
+    A full-state restore (llama-server's slot load) would go through
+    `set_tensor`, which flattens a whole contiguous q8_0 tensor and has no
+    guard for a partial write; that path is pre-existing and not used here.
+  - A q8_0 tensor uploaded through `set_tensor` is flattened into a quant
+    and a scale buffer: `kernel_get_rows_q8_0_flat`.
+  - The host tells them apart by the tensor's extra: the buffer context
+    lists the flattened extras. A view keeps the extra it was created with,
+    so the parent's (`view_src`) decides.
+  - One work-item per output element.
+- **The test** `GET_ROWS(type=q8_0|f16, n, m, r)` (`test_get_rows_cache`):
+  SET_ROWS fills a never-uploaded cache with zeros, then writes rows into
+  it, and GET_ROWS reads them back. That covers the plain layout, which
+  `set_tensor`-initialized tests cannot reach. `-DGET_ROWS_Q8_RED` (the
+  next block's scale) is the red case of both kernels.
+
+Measured (`measured-here`, 2026-10-13):
+
+- **test-backend-ops GET_ROWS:** 41/41 on the B60 and on the A770. The red
+  case fails both cache cases (ERR 0.070 and 0.068 against limits of 9.5e-7 and 2.7e-7)
+  and the four flattened q8_0 cases (31/41).
+- **The scheduler** (`GGML_SCHED_DEBUG=2`, Flash-Next IQ2_XS, 32K): with
+  q8_0 KV, an 80-token answer had 222 of 444 splits on the CPU, against 52
+  of 104 with f16 KV. With the patch the same pair of served arms had 481
+  and 493 CPU splits of 962 and 986 over four requests: q8_0 no longer adds
+  any. (In the f16 dump the CPU splits are the token-embedding gathers, whose
+  tables live in host memory.)
+- **Served Flash-Next** (B60, 131,072 ctx, MTP 2, the bank stream; each
+  arm's freed VRAM given to the expert slots):
+
+  | KV | expert budget | needle prefill | decode | hit rate |
+  |---|---|---|---|---|
+  | f16 | 9,500 MiB | 649.8 | 30.0 / 31.3 | 89.3 % |
+  | q8_0, before the patch | 11,300 MiB | 521.5 | 13.3 / 13.4 | 91.5 % |
+  | q8_0, with it | 11,300 MiB | 617.2 | 30.9 / 31.0 | 91.4 % |
+
+  The capital, the 20k needle and both long answers right in every arm.
+- **KL** (16 x 512 against unsloth's Q8_0, 13,000 MiB): f16 KV 0.294050 /
+  87.08 %, q8_0 KV 0.294037 / 87.35 %, inside the answer-level bar. These
+  512-token chunks do not reach the indexer gather: the red kernel gives
+  the same numbers. The served needle did not catch the red kernel either
+  (the indexer's top-k selection survives a perturbed scale), hence the
+  test above.

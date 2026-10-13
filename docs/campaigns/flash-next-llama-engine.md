@@ -1080,3 +1080,20 @@ right in every arm; the card has 24,480 MiB, xe debugfs `vram_mm`):
   ~32 GB freed there first (7.2 GB free).
 - **Prefill buffers per request** (Strata's prompt path): up to ~2 GiB more
   for expert slots; needs code.
+
+**Stage 7, the q8_0 KV slowdown found** (2026-10-13): OpenCL GET_ROWS had
+no q8_0 source, so the QSA indexer's gathers from a q8_0 key cache ran on
+the CPU. The scheduler copied each layer's 8 MB cache across, in the target
+graph and in every MTP draft (`measured-here`: 222 of 444 splits on the CPU
+against 52 of 104 with f16 KV). Patch 0036 adds the kernel. At the unit's
+131K with the freed VRAM given to slots: decode 30.9 / 31.0 t/s against f16's
+30.0 / 31.3 (13.3 before), hit rate 91.4 against 89.3 %, needle prefill 617
+against 650, answers right, KL 0.294037 against 0.294050. The decode gain is
+inside the spread: at this budget the extra 2 points of hits do not show.
+What q8_0 KV buys the unit is room: the q8_0 arm ran with 1,800 MiB more
+expert slots than the f16 arm (11,300 against 9,500 MiB) at 131K, room the
+deployed unit (peak 24,259 of 24,480 MiB) could keep as margin or spend on
+slots. A lane's checkpoint restore does not touch the q8_0 caches (it
+restores the f32 recurrent state only; 0036's README section).
+- **The served GGUF's first shard** is a real file on the NVMe since
+  2026-10-13 (sha256 = Hugging Face's); loads no longer read the ZFS pool.
