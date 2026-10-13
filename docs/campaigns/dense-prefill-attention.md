@@ -203,6 +203,13 @@ ranges loosely (fixed with the next patch to the same files).
   the agent's greedy acceptance answer to 2/10. Recorded in the README,
   0041.
 
+**The prefetch distance, tried** (`measured-here`, B60, causal, 512 rows):
+prefetching 2, 3 or 4 tiles ahead instead of 1 ran 39.2 ms against 28.2 at
+65k keys (f16) and 63.8 against 53.8 (q8_0:q4_0). The cost appears only
+when K's and V's reads are both removed (the ablation), so it looks like
+latency. But a longer lead loses: apparently the prefetched lines do not
+survive until they are used. One tile ahead stays.
+
 ## Next
 
 1. **The ISA audit** (operator, 2026-10-13), ranked by device time, the hot
