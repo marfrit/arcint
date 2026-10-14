@@ -374,6 +374,33 @@ matrix unit.
 - What is left needs a different structure (sub-groups sharing decoded
   weights through local memory, so a decode feeds more DPAS without more
   registers in one thread). Priced as a redesign, not built.
+- **The shared decode, built and measured (2026-10-14, not taken).** After
+  llama.cpp CUDA's MMQ (`code`, `ggml-cuda/mmq-load-tiles.cuh`
+  `load_tiles_q4_K`: a weight tile's codes and sub-block scales unpacked once
+  into shared memory, read by every warp's MMA). `kernel_mul_mm_kq2d_q4_K_i8s`
+  (llama tree `p0050-q4k-i8-shared`, unmerged): a work-group of 4 token
+  groups x 4 row groups of sub-groups, each with the same 16-row x 32-token
+  register tile; per super-block the four sub-groups of a row group each
+  decode one 32-byte code chunk (int8 codes, the 6-bit scales, the constant
+  part) into a double-buffered local tile (~36 KB), one barrier, every
+  sub-group reading its b operands by block read.
+  - Correct: `test-backend-ops -o MUL_MAT` 1,221/1,221 (B60); the red case
+    (the pair's scales swapped) fails 9.
+  - ISA (offline, bmg): 977 -> 838 instructions, no spill, the same 36 DPAS:
+    the `mad16` scaling (32 a sub-block) is most of what is left, as it is
+    in MMQ (a float FMA per sub-block and output there).
+  - **46-59 % slower** at every dense shape (`measured-here`, B60, 512 and
+    2,048 tokens): gate/up 1,098 -> 1,654 us, down 1,195 -> 1,751, q 794 ->
+    1,184, out 401 -> 637 at 512 tokens.
+  - Ablations (timing only): without the barrier 1,429 / 1,707; without the
+    local reads 1,476 / 1,591; without both 1,353 / 1,691; the same with one
+    buffer (18 KB) 1,223 / 1,380, still 11-16 % behind the current kernel.
+    The per-super-block barrier and the local tile's traffic and occupancy
+    cost more than the ~14 % of instructions the shared decode removes, and
+    the 128-token x 64-row tiling alone is slower than 32 x 256.
+  - So the int8 Q4_K kernel stays at its ceiling for this design; what
+    binds it is the per-(token, column) scale application, which the
+    references pay too.
 
 ### What the outside references add (web and source research, 2026-10-03)
 
