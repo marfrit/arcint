@@ -447,6 +447,21 @@ arms of the same configuration).
   the MoE matvec runs to 15 tokens). Every arm: Paris, the needle; the
   texts differ between draft counts (the verify's shape changes the last
   bits; the answer-level bar allows it).
+
+  **The context is the price of the slots** (`measured-here`, the same
+  request, 3 drafts with the stop, the 20k needle first; decode after the
+  needle unchanged in each, so nothing evicted; VRAM residency from fdinfo
+  every 2 s). Strata's run held 12,332 slots at 32K with int8 KV; the unit
+  holds 8,191 at 131,072 (the KV 2.0 GiB at q8_0, the compute buffer 3.0):
+
+  | context / slots | decode, first / second run | experts on the card | peak VRAM |
+  |---|---|---|---|
+  | 131,072 / 11,300 MiB (8,191) | 35.0 / 38.0 t/s | 85.2 / 88.1 % | (the unit's 24.2-24.3 GB) |
+  | 65,536 / 12,500 MiB (9,069) | 36.7 / 41.0 | 87.3 / 91.1 % | 22.12 GiB |
+  | 32,768 / 13,700 MiB (9,939) | 39.0 / 43.9 | 89.5 / 93.6 % | 21.95 GiB |
+
+  Every arm: Paris, the needle, the same text. At Strata's context arcint
+  decodes 5-16 % faster than Strata on Strata's request.
 - **The gap between kernels** (a chain of 4096-wide ADDs, test-backend-ops
   perf): 3.03 us a kernel. compute-runtime debug keys: skipping the walker's
   post-sync 2.91 us, optimized in-order barriers, L3 prefetch, relaxed
