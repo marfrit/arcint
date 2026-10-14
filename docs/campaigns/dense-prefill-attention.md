@@ -264,8 +264,19 @@ survive until they are used. One tile ahead stays.
 2. **Attention, what is left** (~36 TFLOPS a full wave, 37 % of peak; 34.5 at
    0045's 512-row split, 35 %):
    - the O rescale when a row's max rises;
-   - the 2D read payload setup, about 90 scalar movs a tile;
    - the mixed-tile mask path on the diagonal.
+   - **The 2D read payloads, tried** (2026-10-14): sycl-tla builds its
+     block-read payloads once (`code`, `copy_traits_xe_2d.hpp`
+     `prepare_payloads`, `__builtin_IB_subgroup_createBlock2DAddressPayload`)
+     and moves them a tile with one scalar write, the chunk offsets as
+     immediates of the send. The same in `flash_attn_dpas2.cl` (`FA2_AP`:
+     `_ap_` reads, one payload a tensor, Y set a tile; correct, its red case
+     fails 94) compiles to the same 1,733 instructions and 385 movs as the
+     flat builtins (`measured-here`, offline ISA, bmg): IGC already keeps the
+     flat reads' payloads, so the "90 scalar movs" were not payload setup to
+     remove. Timed it is 1-9 % slower (f16 65k keys, 512 rows 23.9 -> 26.0
+     ms; q8_0:q4_0 2,048 rows 118.1 -> 126.1); the cause is unmeasured. A
+     verdict on this build, not on the mechanism. Not taken.
 3. **The A770, stage 3 (0039):**
    - **The cause** (offline ISA and `code`): the coder's prompt attention was
      63 % of prefill device time at 44k, ~2.9 TFLOPS. The sub-group-8 kernel
