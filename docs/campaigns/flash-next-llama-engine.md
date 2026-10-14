@@ -510,6 +510,22 @@ arms of the same configuration).
   over the link, ~0.25 s. The hazard: a graph that writes into the lent
   range while it holds experts corrupts weights without changing the
   answer's look; the loan needs a per-graph bound check.
+
+  **The reservation is a worst case** (`measured-here`, the load logs at
+  chunk 2,048): the compute buffer grows with the context, 988 MiB at
+  32,768, 1,631 at 65,536, 3,048 at 131,072 (the draft context 229 / 410 /
+  770). Over all eight points it is ~90 MiB + chunk x (0.146 MiB + 10.7 bytes
+  x cache cells): the QSA selection mask is cells x chunk tokens in f16,
+  built as a repeat, a `set_rows` into it and an add with the attention
+  mask (`qwen4exp.cpp` `build_qsa_sel`, its own TODO: "reduce the large
+  compute buffer"). The scheduler reserves for a full 131,072-cell cache,
+  which only the last chunks of a 131K prompt reach; a 20k prompt's chunks
+  see at most ~20k cells. The loan's alternative, without moving any
+  weights: reserve for a budget (a 512-token chunk at the full context,
+  ~790 MiB) and cut each prompt chunk to what fits the budget at the
+  cache's current fill: 2,048 tokens to ~18-20k cells, ~1,000 at 65K, 512
+  at 131K. Planned as patch 0052; the decode price is the 32K arm's hit
+  rate, the prefill price falls only on prompts past ~20k tokens.
 - **The gap between kernels** (a chain of 4096-wide ADDs, test-backend-ops
   perf): 3.03 us a kernel. compute-runtime debug keys: skipping the walker's
   post-sync 2.91 us, optimized in-order barriers, L3 prefetch, relaxed
