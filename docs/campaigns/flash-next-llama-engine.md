@@ -548,6 +548,39 @@ arms of the same configuration).
   46.7 ms a round. With no miss the first run is no slower than the second:
   the first-run gap is the misses. The CPU backend computes ten IQ2_S
   experts for one token in 174 us (16 threads, ~29 GB/s).
+
+- **The misses on the CPU, Strata's doorbell tier, on the libllama engine**
+  (`measured-here`, 2026-10-15; llama tree `p0053-cpu-misses`, not in the
+  series). At a decode layer's first expert projection a kernel publishes
+  the activation and marks the first N missed pairs -1 in the combined ids
+  (the card's three projections then skip them) and publishes those pairs
+  and their bank rows to USM host memory with a system-scope release; a
+  coordinator thread with a spinning pool computes their gate, up, SwiGLU
+  and down from the bank in host RAM with ggml-cpu's dot products (the
+  planar bank rows gathered per row); after the down projection a kernel
+  polls the done flag with L1/L3-uncached loads (0077's form) and copies the
+  rows in. Strata's request, the 0.7.9 flags, one binary:
+
+  | CPU takes a layer | verify a round, first / second run | decode |
+  |---|---|---|
+  | none | 63.0 / 55.6 ms | 38.6 / 43.2 t/s |
+  | up to 1 | 61.0 / 55.4 | 39.7 / 41.5 |
+  | up to 2 | 60.4 / 55.3 | 39.0 / 43.1 |
+  | up to 3 | 61.7 / 57.0 | 40.4 / 42.0 |
+  | up to 4 | 64.4 / 57.8 | 38.5 / 40.3 |
+  | all (6 / 8 threads) | 75.7 / 65.2, 73.2 / 62.7 | 31.5 / 38.1, 32.4 / 39.4 |
+
+  Answers right, the texts differ (the CPU's single q8 term). The hand-off
+  itself is nearly free: with the CPU computing nothing (a table bug in the
+  first build) the doorbell's publish and poll in all 48 layers ran at the
+  ceiling's speed (49.2 / 50.0 against 49.8 / 50.6 t/s). The cost is the
+  CPU's: ggml-cpu's IQ2_S dot product decodes ~1.9 GB/s a thread on this
+  host's 8-core Zen 3 with DDR4, so a missed expert is no faster on the CPU
+  than over the link. How this differs from Strata's: its own AVX kernels
+  that decode a block once for the whole window (`code`,
+  `src/kernels/cpu/iq_avx2.cpp`), a Zen 4 with AVX-512 and DDR5 (`paper`),
+  and a recorded pass. Not a verdict on the mechanism: on this host it
+  needs a CPU expert kernel at least twice as fast as ggml-cpu's.
 - **The gap between kernels** (a chain of 4096-wide ADDs, test-backend-ops
   perf): 3.03 us a kernel. compute-runtime debug keys: skipping the walker's
   post-sync 2.91 us, optimized in-order barriers, L3 prefetch, relaxed
