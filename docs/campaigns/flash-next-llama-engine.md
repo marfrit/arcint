@@ -461,7 +461,20 @@ arms of the same configuration).
   | 32,768 / 13,700 MiB (9,939) | 39.0 / 43.9 | 89.5 / 93.6 % | 21.95 GiB |
 
   Every arm: Paris, the needle, the same text. At Strata's context arcint
-  decodes 5-16 % faster than Strata on Strata's request.
+  decodes 5-16 % faster than Strata on Strata's request. The operator keeps 131,072 (2026-10-14).
+
+  At 131,072 the prefill chunk is the other VRAM lever: with the expert
+  cache the ubatch is the whole chunk (`backend_llama.cpp`), and the
+  compute buffer scales with it. `--prefill-chunk 1024` (`measured-here`,
+  same request, the needle first):
+
+  | chunk / slots | compute buffer | 20k needle prefill | decode, first / second | peak VRAM |
+  |---|---|---|---|---|
+  | 2,048 / 11,300 MiB (8,191) | 3,048 MiB | 657 t/s (30.5 s) | 34.8 / 38.1 t/s | 23.83 GiB |
+  | 1,024 / 12,500 MiB (9,069) | 1,543 MiB | 538 t/s (37.3 s) | 36.8 / 41.1 | 23.40 GiB |
+
+  Decode +6-8 % and 0.4 GiB more margin for prefill -18 %: each chunk
+  streams the bank once, so half the chunk streams it twice as often.
 - **The gap between kernels** (a chain of 4096-wide ADDs, test-backend-ops
   perf): 3.03 us a kernel. compute-runtime debug keys: skipping the walker's
   post-sync 2.91 us, optimized in-order barriers, L3 prefetch, relaxed
