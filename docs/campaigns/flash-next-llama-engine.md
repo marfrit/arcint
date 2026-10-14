@@ -592,7 +592,22 @@ arms of the same configuration).
   kernel lever that remains is the IQ2_S expert matvec at 165-215 GB/s with
   every expert on the card (Q2_0 reaches 234-295); its hit-only time is
   ~19 % of decode kernel time, and the local-memory grid was already
-  measured slower (stage 3b); the next step there is an ISA reading.
+  measured slower (stage 3b); the next step there is an ISA reading. Rows a sub-group (`GGML_OPENCL_KQ_Q8_1_NDST`,
+  global), test-backend-ops perf in isolation: 8 against 4 is faster for
+  gate/up (K 2,560, 640 rows: IQ2_S 31.2 -> 23.1 us at one token, 71.3 ->
+  67.5 at three; Q2_0 52.0 -> 49.0 at three) and slower for down (K 640,
+  2,560 rows: 63.6 -> 81.1 us at three); 1 and 2 are slower everywhere. A
+  per-shape choice would gain ~5 % of gate/up at a verify's width.
+
+- **The draft head's LM head quantized** (`measured-here`, 2026-10-15,
+  B60, the 0.7.9 package and unit flags; Strata's request twice and two
+  gate answers): Q6_K (deployed, 521 MB) propose 1.44 s a 500-token
+  answer, acceptance 79.4 %, 38.6 / 43.1 t/s; IQ4_XS (322 MiB) propose 1.35
+  s, acceptance 75.6 %, 37.2 / 41.3 (the IQ4_XS matvec reads ~240 GB/s, and
+  the head loses drafts); Q4_K (341 MiB, `mtp-flash-next-q8e4n-hk.gguf`)
+  propose 1.27 s, acceptance 79.8 %, 38.6 / 43.0, and on the answer whose
+  text stayed the same 38.8 against 38.4 t/s. Q4_K is worth ~1 % and frees
+  ~180 MB for slots: a unit change for the operator.
 - **The gap between kernels** (a chain of 4096-wide ADDs, test-backend-ops
   perf): 3.03 us a kernel. compute-runtime debug keys: skipping the walker's
   post-sync 2.91 us, optimized in-order barriers, L3 prefetch, relaxed
