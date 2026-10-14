@@ -530,8 +530,24 @@ arms of the same configuration).
   alone frees ~1 GiB (decode +2-3 % spent on slots, everything else
   unchanged); with `--llama-reserve-cells 20480` and 13,400 MiB of slots
   decode is 38.4 / 43.0 t/s against 34.8 / 38.0 at 131,072 tokens, the 20k
-  prefill unchanged, a 72k prompt 128.7 -> 173.0 s. The unit needs a
-  release with 0049-0052 before either applies.
+  prefill unchanged, a 72k prompt 128.7 -> 173.0 s. Released in 0.7.9; the
+  Flash-Next unit carries it (`--llama-reserve-cells 20480`, 13,400 MiB).
+
+- **What the misses cost after 0052** (`measured-here`, 2026-10-15, B60, the
+  unit's 0.7.9 flags). A `GGML_OPENCL_PROFILING` build of 7014a61 on Strata's
+  request and two gate answers: decode-side kernel time 26.7 s; the expert
+  matvecs 10.0 s, of which 5.05 s (18.9 % of all decode-side kernel time)
+  is each call's excess over the fastest call of its kernel and token
+  count: the missed experts read over the link inside the same launch (a
+  three-token IQ2_S projection 73 us with no miss, up to ~231 us). In
+  isolation (test-backend-ops perf, all experts on the card) the IQ2_S
+  expert matvec runs 31 us at one token and 71 us at three (165-215 GB/s),
+  Q2_0 22 / 52 us. The ceiling, `LLAMA_EXPERT_CACHE_CEILING=1` (bank pairs
+  read the slots' zero matrix: wrong answers, the time of a hit): Strata's
+  request 38.5 / 43.1 -> 49.9 / 50.6 t/s, a verify 63.3 / 55.7 -> 45.3 /
+  46.7 ms a round. With no miss the first run is no slower than the second:
+  the first-run gap is the misses. The CPU backend computes ten IQ2_S
+  experts for one token in 174 us (16 threads, ~29 GB/s).
 - **The gap between kernels** (a chain of 4096-wide ADDs, test-backend-ops
   perf): 3.03 us a kernel. compute-runtime debug keys: skipping the walker's
   post-sync 2.91 us, optimized in-order barriers, L3 prefetch, relaxed
