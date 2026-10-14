@@ -2814,8 +2814,20 @@ write each and without a wait each.
   - test-backend-ops alone cannot catch a staging fault: its CPU reference
     reads its inputs back from the GPU buffer, so both sides see the same
     bytes. The served red case is the one that bites.
-  - The dense agent and the coder copy their inputs the same way. Their
-    decode was not measured here.
+  - **The dense agent (B60) and the coder (A770)**, each with its unit's
+    flags, the same binary and switches, A B A B, three 300-token answers
+    each (`measured-here`):
+
+    | | old | 0047 |
+    |---|---|---|
+    | agent, input copies a graph (draft / verify) | 203 / 245-249 us | 65-67 / 114-118 |
+    | agent decode | 36.8 / 39.4 / 37.1 t/s | 37.1-37.2 / 39.7-39.8 / 37.5-37.6 |
+    | coder (A770), input copies a graph | 1,930-2,020 us | 133-255 |
+    | coder decode | 42.9-43.0 / 39.9 / 36.9-37.0 t/s | 49.3-49.4 / 45.9-46.0 / 42.6 |
+
+    The same text in every arm (md5s), the capital right. The coder gains
+    14-15 %: the A770 sits behind the chipset's PCIe 3.0 x4 link, where a
+    sync and a blocking write cost ~60 us an input.
 - **Reviewed** before the push by a second model:
   - one wait a split is enough (non-user inputs between user inputs, several
     splits on one backend, the CPU backend, events present);

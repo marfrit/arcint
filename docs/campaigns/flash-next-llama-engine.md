@@ -1256,4 +1256,6 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
   inputs 926-949 -> 582-593 us, a draft's 395-404 -> 134-141; decode +1.1 to
   +1.4 % on each of the three answers (31.6 / 36.8 / 35.3 -> 32.0 / 37.3 /
   35.7-35.8 t/s, two A/B pairs), prefill and the text unchanged
-  (`measured-here`).
+  (`measured-here`). The same path on the other units: the dense agent's
+  decode +0.8-1.3 %, the coder's on the A770 +14-15 % (its inputs ~2.0 ->
+  0.13-0.25 ms a graph behind the chipset link), the same text.
