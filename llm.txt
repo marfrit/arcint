@@ -12,7 +12,7 @@
 > sampling and HTTP serving. NInfer philosophy (specialize, then be honest
 > about numbers), Intel substrate.
 
-## Status (0.7.7)
+## Status (0.7.8)
 
 Runtime floor: marfrit-openvino +p25 = OpenVINO upstream commit 71640275 (the
 2026.4.0 nightly of 2026-08-21) + patches 0003-0074
@@ -23,7 +23,7 @@ and MOE_DOORBELL.
 Two engines (README "Two engines"): OpenVINO (default; Flash-Next, the
 coder's way back) and libllama (--engine llama --gguf, the agent service
 from 0.5.6, the coder service from 2026-10-05: llama.cpp
-bed0a85 with contrib/llama.cpp/patches 0001-0045, ggml's OpenCL backend,
+bed0a85 with contrib/llama.cpp/patches 0001-0048, ggml's OpenCL backend,
 arcint's Intel kernels; MTP from the GGUF's own head; --llama-kv q8_0 or
 q8_0:q4_0 quantizes its KV cache). libllama, measured-here:
 - coder (A770): decode 79.3 t/s with 4 drafts, prefill 1,431 t/s at 4k;
@@ -91,7 +91,12 @@ GEMM gathers its routed experts): Flash-Next's 77-token prompt 1.84 -> 1.11 s,
 the same tokens; patch 0045, the B60's prompt attention splits a call's keys
 across work-groups when a wave would run part empty (llama.cpp CUDA's
 parallel_blocks): the dense agent's prefill at 228k 342.9 -> 370.1 t/s, 138k
-461.6 -> 490.1, KL 0.005652 vs 0.005950, answers right. Every
+461.6 -> 490.1, KL 0.005652 vs 0.005950, answers right.
+0.7.8: patch 0047, a graph's inputs staged in a USM host ring and one
+scheduler wait a split: the coder's decode on the A770 +14-15 % (43.0 -> 49.4
+t/s), Flash-Next +1.1-1.4 % and the agent +0.8-1.3 % on the B60, the same
+text; 0046, an expert cache's tables in one write; 0048, the A770's prompt
+attention with f16 V 20-28 % faster (quantized V unchanged). Every
 number below is measured-here on the named card; DESIGN.md §7 has each one's
 standing value and evidence class. The dated measurement record, campaigns
 and design notes live on the development branch `qfndev`, not on `main`.

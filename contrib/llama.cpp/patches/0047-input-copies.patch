@@ -1,0 +1,116 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 8457718..e4675ad 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1837,6 +1837,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         }
+ 
+         const int64_t st_t0 = st_on ? ggml_time_us() : 0;
++        // the split backend is waited for once before its user inputs: each
++        // copy below is synchronous and nothing in this loop computes, so one
++        // wait covers them all (GGML_SCHED_INPUT_SYNC_EACH=1: a wait each, as
++        // upstream; patch 0047)
++        static const bool sync_each = getenv("GGML_SCHED_INPUT_SYNC_EACH") != nullptr && atoi(getenv("GGML_SCHED_INPUT_SYNC_EACH")) != 0;
++        bool user_synced = false;
+         // copy the input tensors to the split backend
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
+@@ -1847,8 +1853,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+-                } else {
++                } else if (sync_each || !user_synced) {
+                     ggml_backend_synchronize(split_backend);
++                    user_synced = true;
+                 }
+                 ggml_backend_tensor_copy(input, input_cpy);
+             } else {
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index ffbecdc..9e25799 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1062,6 +1062,11 @@ struct ggml_backend_opencl_context {
+     // ggml_backend_opencl_set_tensor_slices keeps until this queue has passed them
+     ggml_cl_buffer prealloc_exchange;
+     std::vector<std::vector<uint8_t>> slices_keep;
++    // small writes into computed buffers (a graph's inputs) staged in a USM
++    // host ring and enqueued without a wait (GGML_OPENCL_STAGE_INPUTS=0: blocking)
++    int    stage_on   = -1;          // -1: not decided yet
++    char * stage_ring = nullptr;
++    size_t stage_size = 0, stage_head = 0;
+     // the MoE router's softmax + top-k + normalized weights in one kernel, Intel
+     cl_kernel kernel_topk_moe = nullptr;
+     // SCALE -> SILU / SCALE -> SIGMOID -> SCALE fused, Intel
+@@ -1509,6 +1514,12 @@ struct ggml_backend_opencl_context {
+                 if (kv.second.sub_buffer) { CL_CHECK(clReleaseMemObject(kv.second.sub_buffer)); }
+             }
+             kq_img_pool.clear();
++            if (stage_ring && usm_mem_free) {
++                usm_mem_free(context, stage_ring);
++                stage_ring = nullptr;
++            }
++            stage_on   = -1;   // the context lives on: a later write allocates the ring again
++            stage_head = 0;
+             for (auto & kv : kqv_img_pool) {
+                 if (kv.second.image)      { CL_CHECK(clReleaseMemObject(kv.second.image)); }
+                 if (kv.second.sub_buffer) { CL_CHECK(clReleaseMemObject(kv.second.sub_buffer)); }
+@@ -11574,6 +11585,48 @@ static void ggml_cl_usm_set_tensor(ggml_backend_opencl_buffer_context * ctx, ggm
+     memcpy(base + offset, data, size);
+ }
+ 
++// A write of at most 4 MiB into a buffer that holds no weights (a graph's
++// inputs: positions, masks, ids): the bytes copied into a USM host ring and the
++// copy enqueued without a wait, so the caller may reuse `data` at once. A
++// blocking write cost ~10.4 us an input on the B60 against ~4.1 staged
++// (patch 0047). The ring is reused after a clFinish when it wraps.
++// One thread writes a context's tensors (the ring head is not atomic).
++static bool ggml_cl_stage_write(ggml_backend_opencl_context * ctx, ggml_backend_buffer_t buffer, cl_mem dst, size_t off,
++                                const void * data, size_t size) {
++    if (size == 0 || size > (4u << 20) || ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++        return false;
++    }
++    if (ctx->stage_on < 0) {
++        const char * e = getenv("GGML_OPENCL_STAGE_INPUTS");
++        ctx->stage_on = (e == nullptr || atoi(e) != 0) && ctx->usm_host_alloc != nullptr && ctx->usm_mem_free != nullptr;
++        if (ctx->stage_on) {
++            cl_int err = CL_SUCCESS;
++            ctx->stage_size = 32u << 20;
++            ctx->stage_ring = (char *) ctx->usm_host_alloc(ctx->context, NULL, ctx->stage_size, 128, &err);
++            if (ctx->stage_ring == nullptr || err != CL_SUCCESS) {
++                ctx->stage_ring = nullptr;
++                ctx->stage_on   = 0;
++            }
++        }
++    }
++    if (!ctx->stage_on || ctx->stage_ring == nullptr) {
++        return false;
++    }
++    const size_t a = (size + 127) & ~(size_t) 127;
++    if (ctx->stage_head + a > ctx->stage_size) {
++        CL_CHECK(clFinish(ctx->queue));   // every staged copy has landed
++        ctx->stage_head = 0;
++    }
++    char * p = ctx->stage_ring + ctx->stage_head;
++    ctx->stage_head += a;
++    static const bool red = getenv("GGML_OPENCL_STAGE_RED") && atoi(getenv("GGML_OPENCL_STAGE_RED")) != 0;   // the red case: the ring's stale bytes go
++    if (!red) {
++        memcpy(p, data, size);
++    }
++    CL_CHECK(clEnqueueWriteBuffer(ctx->queue, dst, CL_FALSE, off, size, p, 0, NULL, NULL));
++    return true;
++}
++
+ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     if (((ggml_backend_opencl_buffer_context *) buffer->context)->usm) {
+         ggml_cl_usm_set_tensor((ggml_backend_opencl_buffer_context *) buffer->context, tensor, data, offset, size);
+@@ -13246,6 +13299,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+     ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
+     GGML_ASSERT(extra);
+ 
++    if (ggml_cl_stage_write(backend_ctx, buffer, extra->data_device, extra->offset + offset, data, size)) {
++        return;
++    }
+     CL_CHECK(clEnqueueWriteBuffer(
+         queue, extra->data_device, CL_TRUE, extra->offset + offset,
+         size, data, 0, NULL, NULL));

@@ -2654,7 +2654,7 @@ row tiles would leave a wave part empty, after llama.cpp CUDA's
     - 866/867 with and without splits; the one failure is the same
       logit-softcap case in both;
     - the red case (`-DFA_SPLIT_RED`, the states added without their maxima)
-      fails 94;
+      fails 92 (first written 94: the count included two summary lines);
     - the A770 is unchanged (sub-group 8 does not use this kernel).
   - **Offline ISA:** no spill, no private memory and no recompile retry, in
     the plain and carry kernels and in the merge kernel.
@@ -2706,3 +2706,238 @@ row tiles would leave a wave part empty, after llama.cpp CUDA's
     24 row tiles) can get 4 splits that cost as much as one: the reference
     has the same rounding, and it costs only on short blocks.
   - Only the comment naming the cap of 16 changed after the measured build.
+
+## 0046-expert-cache-tables-one-write.patch
+
+An expert cache's residency tables are rows of one tensor per card, written
+in one call per adapt step, after Strata's one residency table and its one
+upload (`code`, `src/program/generate.cpp:3589-3606`, `res_upload` at
+`4406-4413`).
+
+- **Why** (`measured-here`, 0042's record): each table was its own tensor and
+  its own non-blocking write. Flash-Next has 3 a layer and an adapt touches up
+  to 48 layers in each of its two phases (the victims out, the newcomers in),
+  so up to ~290 writes of 2 KiB. A probe timed 240 of them at 1.64 ms on the
+  B60, against 54 us as one write.
+- **What:**
+  - `tab_all`, I32 [1, n_expert, rows]: each layer's tables (slot, bank, the
+    single branch's slot-or-bank, then the Q8_0 down pair) are views of its
+    rows; the graph's `get_rows` reads them with the view offset (`code`).
+  - One host copy; `upload_tables` fills a layer's rows, and `flush_tables`
+    writes the changed range in one non-blocking `set_slices`. The host copy
+    changes again only at a later adapt step, after a graph has passed, as the
+    per-table copies did.
+  - **A table check:** the tables read back (a blocking read) against
+    `slot_of`/`bank_of`, at load and at the first adapt; the red case
+    (`LLAMA_EXPERT_CACHE_MUTATE=2`, the write leaving out its last row) and
+    the slot red case (`=1`) are separate now.
+- **Measured** (`measured-here`, 2026-10-14, B60, Flash-Next with the unit's
+  flags: 131,072 ctx, q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
+  the 0.7.7 package against the 0.7.7 tree + 0046, A B A B, one process an
+  arm; the capital, the 20k needle, three 300-token answers):
+
+  | answer | 0.7.7 | 0046 |
+  |---|---|---|
+  | hash table | 31.4 / 31.5 t/s | 31.6 / 31.5 |
+  | compiler | 36.6 / 36.7 | 36.7 / 36.8 |
+  | TCP | 35.1 / 35.1 | 35.3 / 35.3 |
+  | time writing swaps and tables, an answer | 0.09 / 0.06 / 0.07 s | 0.05 / 0.03 / 0.04 |
+
+  - The same text in all four arms (md5 of each answer), the same hit rates
+    (87.6-93.2 %), the capital and the needle right; the swap check 0 of 6.
+  - The table check: 0 of 144 rows at load and at the first adapt; the red
+    case 1 of 144.
+  - Prefill: adapt steps are planned on ubatches of up to 8 tokens only
+    (`code`, `advance()`), so a prompt's ubatches write no tables beyond
+    the landing of swaps already in flight.
+- **Reviewed** before the push by a second model:
+  - the views' allocation (the parent first in the context);
+  - every reader honours the view offset (only the six `get_rows`);
+  - the views as VIEW nodes in the scheduler;
+  - the host copy's lifetime against the in-order queue and the adapt fence;
+  - the range arithmetic and both red cases.
+
+  No defect. It found one pre-existing issue: the cache's context was sized
+  at 8 tensors a layer, but a layer with a Q8_0 down projection needs 9.
+  The context is now sized exactly. That fix and a reworded load log line
+  came after the measured build. The final build, checked on Flash-Next:
+  the capital, the needle, the hash-table answer's same text (md5
+  `d2069d0a`) at 31.6 t/s, and the table checks at 0 of 144.
+
+## 0047-input-copies.patch
+
+A graph's inputs (positions, masks, ids) reach the card without a blocking
+write each and without a wait each.
+
+- **Why** (`measured-here`, stage 8 of `docs/campaigns/flash-next-llama-engine.md`):
+  - With one GPU the scheduler creates no events (`n_copies == 1`,
+    `ggml-backend.cpp`, `code`). So for each user input of a split it
+    synchronizes the backend and then copies synchronously. CUDA on one GPU
+    runs the same sequence; there, the calls are cheaper.
+  - On the B60 a sync costs ~10.6 us and a blocking 1 KiB write ~10.4 us.
+  - Flash-Next's verify has 34 inputs (0.93-0.95 ms a graph) and a draft
+    graph 17 (0.40 ms). The GPU idles through them.
+- **What:**
+  - **The scheduler** waits once before a split's first user input instead
+    of before each. Each copy is synchronous and nothing in the input loop
+    computes, so one wait covers them all (`code`; reviewed).
+    `GGML_SCHED_INPUT_SYNC_EACH=1` restores the wait per input.
+  - **The OpenCL backend:**
+    - a write of at most 4 MiB into a buffer that holds no weights is
+      copied into a 32 MiB USM host ring and enqueued without a wait, so the
+      caller may reuse its bytes at once;
+    - the ring is reused after a `clFinish` when it wraps;
+    - weights, USM buffers and converted layouts keep their own paths;
+    - `GGML_OPENCL_STAGE_INPUTS=0` writes blocking again.
+- **Measured** (`measured-here`, 2026-10-14, B60):
+  - **Flash-Next, the unit's flags** (131,072 ctx, q8_0 KV, 11,300 MiB of
+    slots, MTP 2, the bank stream). One binary (the 0.7.7 tree + 0046 +
+    0047); the old behaviour by both switches; A B A B; `GGML_SCHED_TIMING`:
+
+    | | old | 0047 |
+    |---|---|---|
+    | a verify's input copies | 926-949 us | 582-593 us |
+    | a draft's input copies | 395-404 us | 134-141 us |
+    | hash table, 300 tokens | 31.6 / 31.6 t/s | 32.0 / 32.0 |
+    | compiler | 36.8 / 36.8 | 37.3 / 37.3 |
+    | TCP | 35.3 / 35.3 | 35.8 / 35.7 |
+    | the 20k needle's prefill | 650.4 / 650.3 t/s | 650.9 / 650.5 |
+
+  - **Answers:** the same text in every arm (md5 of each answer), and the
+    capital and the needle right.
+  - **The red case** (`GGML_OPENCL_STAGE_RED=1`: the ring's stale bytes
+    reach the card): the capital answered "!!!!!!!!", the needle empty, the
+    answer all "!".
+  - **test-backend-ops** (the full suite, the B60): 11,143 of 11,294 with
+    staging and without, the same 151 failing cases (the error values differ
+    run to run: the inputs are random). The red case fails 1,066.
+  - test-backend-ops alone cannot catch a staging fault: its CPU reference
+    reads its inputs back from the GPU buffer, so both sides see the same
+    bytes. The served red case is the one that bites.
+  - **The dense agent (B60) and the coder (A770)**, each with its unit's
+    flags, the same binary and switches, A B A B, three 300-token answers
+    each (`measured-here`):
+
+    | | old | 0047 |
+    |---|---|---|
+    | agent, input copies a graph (draft / verify) | 203 / 245-249 us | 65-67 / 114-118 |
+    | agent decode | 36.8 / 39.4 / 37.1 t/s | 37.1-37.2 / 39.7-39.8 / 37.5-37.6 |
+    | coder (A770), input copies a graph | 1,930-2,020 us | 133-255 |
+    | coder decode | 42.9-43.0 / 39.9 / 36.9-37.0 t/s | 49.3-49.4 / 45.9-46.0 / 42.6 |
+
+    The same text in every arm (md5s), the capital right. The coder gains
+    14-15 %: the A770 sits behind the chipset's PCIe 3.0 x4 link, where a
+    sync and a blocking write cost ~60 us an input.
+- **Reviewed** before the push by a second model:
+  - one wait a split is enough (non-user inputs between user inputs, several
+    splits on one backend, the CPU backend, events present);
+  - the ring's ordering against the backend's other queues (the bank stream
+    and the expert cache's adapt queue read no buffer this path writes);
+  - which buffers stage;
+  - the threading (one thread writes a context's tensors).
+
+  It found two defects, fixed before the final build:
+  - After the context's last free the ring was freed but still marked on, so
+    a write after a reload in the same process would have used it. The ring
+    is now decided again.
+  - `GGML_OPENCL_STAGE_RED` was first offered as a test-backend-ops red case,
+    which cannot fail (above); the served red case replaced it.
+
+  Its notes, taken: the ring is allocated only for a staging candidate, and
+  the red switch is read as a number. The final build: the capital, the
+  needle, the hash-table answer's same text at 32.0 t/s, inputs 591 / 138 us.
+
+## 0048-opencl-fa-sg8-v-pairs.patch
+
+The A770's prompt attention (`flash_attn_dpas.cl`, sub-group 8) with f16 V
+stages V a key pair a work-item: two keys' 8 values packed into 8 uints (the
+P V b operand's pairs) and stored as 8 dwords, one a dim, instead of 16
+scalar halves. The pair is keys j and j + 8 of a 16-key group, so P's a
+operand comes straight from S's two 8-key halves without shuffles, and a
+sub-group's V loads read 8 consecutive rows. `GGML_OPENCL_FA_SG8_VBLK=0`
+keeps the old staging; `-DFA_VBLK_RED` (through `GGML_OPENCL_FA_DPAS_OPTS`)
+swaps the pair: the red case. Quantized V keeps the old staging (below).
+
+- **Why:** the A770's ablations after 0039 put V's transposing stores at ~12
+  ms of 70 (`docs/campaigns/dense-prefill-attention.md`, A770 stage).
+- **The forms tried** (`measured-here`, 2026-10-14, the A770 at its pinned
+  2000 MHz, test-backend-ops perf, causal, 24 heads on 4, 512 rows, 65,536
+  keys; offline ISA from ocloc acm-g10):
+
+  | form | f16 | q8_0:q4_0 | ISA |
+  |---|---|---|---|
+  | old (transposed tile, 8 scalar stores) | 166.1 ms | 139.8 | f16 spills 2,304 B |
+  | V in the b operand's blocked layout, block reads | 155.6 | 162.8 | spills 1,760 B: the block reads' addresses |
+  | key pairs (2i, 2i+1), 8 dword stores, a separate pass | 137.8 | 155.4 | no spill |
+  | the same fused into K's loop / V before K | 137.1 / 136.6 | 158.9 / 156.7 | no spill |
+  | pairs (j, j + 8), no shuffles (this patch) | 128.6-129.0 | 150-152 | no spill, 2,732 instructions (f16) |
+  | the same with the pair decoded packed / loads batched | | 150.0 / 148.6 | |
+
+  The quantized loss is the decode: with V read as plain halves instead
+  (timing only), the old form takes 168.6 ms and the pair form 133.7. The
+  old loop hides V's dequantization under its loads; the pair form exposes
+  it, and neither decoding into packed pairs nor batching the loads won it
+  back. So the define reaches the f16 program only (the kernel refuses a
+  quantized V at compile time).
+- **Measured** (`measured-here`, the final build, two runs each):
+  - **Kernel** (f16): 32,768 keys 82.7 -> 64.0 ms, 65,536 keys at 256 /
+    512 / 1,024 rows 103.3 -> 74.4, 166.1 -> 128.6, 352.3 -> 280.1 (-20 to
+    -28 %); q8_0:q4_0 unchanged (140.1 / 140.2).
+  - **test-backend-ops FLASH_ATTN_EXT** (the A770): 2,808 of 2,812 with
+    and without, the same 4 failing cases; the red case fails 70.
+  - **Served** (the coder's model with `--llama-kv f16` at 49,152, MTP 4,
+    one binary, the switch off in the other arm, A B A B): the 40,841-token
+    needle 661.6-665.8 -> 734.4-741.2 t/s (+11 %), 18,413 tokens 903-912
+    -> 933-973; the needles and the capital right; the acceptance task
+    10/10 in all four arms, the same program; peak VRAM 15,818-15,834 MiB.
+  - **KL** (16 x 512 at 512 rows a call, against `coder-ref-q8.kld`, f16
+    KV): 0.024717 / 93.04 % against 0.024837 / 93.14 %; the red case
+    1.3828 / 51.8 %.
+  - The deployed coder runs q8_0:q4_0 at 98,304 and does not take this
+    path. f16 KV at 98,304 would not fit the card (49,152 peaks at 15.8
+    GB). At 49,152 its 41k prefill (734-741 t/s) is no better than the
+    deployed q8_0:q4_0 today: 725.8 t/s on the same 40,841-token needle at
+    98,304 (0049's gate below, with 0047 in the tree). An earlier note set
+    it against 0039's 685 t/s, a stale number; retracted.
+- **Reviewed** before the push by a second model:
+  - the pairing against the DPAS operand layout (the same permutation of
+    the 16 keys in P and V, so the contraction is unchanged);
+  - the staging indices, bounds and tail clamps;
+  - the barriers, and the old path being untouched without the define;
+  - that only the f16 program gets the define.
+
+  No defect. Two comments on the shuffle path were updated afterwards
+  (comments only).
+
+**Tried after 0048, not taken: quantized K/V to f16 once a call on the A770**
+(llama.cpp CUDA's need_f16_K/V, `code`, `fattn-common.cuh` `launch_fattn`).
+For a quantized prompt call, sub-group 8 converted both views to f16 scratch
+(the quantized kernel's own `load8`, so the same halves) and ran 0048's f16
+kernel on them (`GGML_OPENCL_FA_SG8_KV2F16`; llama tree `p0049-a770-kv2f16`,
+unmerged). Measured (`measured-here`, 2026-10-14, A770):
+- **Correct:** test-backend-ops the same 4 failing cases with and without,
+  the red case failing 95; KL (q8_0:q4_0, 512 rows a call) 0.026847 /
+  92.75 % against 0.026908 / 92.40 %, the red case 1.38.
+- **Served** (the coder's unit flags, q8_0:q4_0 at 98,304, A B A B, the
+  pairs identical): the 40,841-token needle 725.8 -> 732.4 t/s (+0.9 %),
+  81,974 tokens 502.9 -> 509.6 (+1.3 %); the needles right, the task 10/10
+  against 9/10.
+- **The price:** peak VRAM 15,977 -> 16,139 MiB of the card's 16,288: the
+  scratch grows with the depth (~201 MB at 98,304 for the coder's two KV
+  heads) and leaves 149 MiB. A thin margin is the known way into xe
+  eviction (memory `project-xe-eviction-thrash-margin`); a 1 % gain does not
+  pay for it.
+- **The premise was overstated:** test-backend-ops' quantized arms include
+  a per-call unflattening of the test's set_tensor-uploaded K/V that a served
+  cache does not have, so its "f16 8 % faster than quantized" at one shape
+  was mostly that; served, the quantized kernel is within ~1 % of the f16
+  one. Kernel-level quantized-vs-f16 comparisons on this test need that cost
+  subtracted.
+
+**Failure counts corrected (2026-10-14):** the counts of failing
+test-backend-ops cases in 0047, 0048 and its addendum were `grep -c FAIL`,
+which also counted the two summary lines ("Backend OpenCL: FAIL" and the
+closing "FAIL"); each is two lower than first written (153 -> 151, 6 -> 4,
+the red cases 1,068 -> 1,066, 72 -> 70, 97 -> 95). 0045's red case was
+counted the same way: 92, not 94. The passed/total pairs came from the
+summary line and stand.

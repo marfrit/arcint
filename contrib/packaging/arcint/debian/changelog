@@ -1,3 +1,19 @@
+arcint (0.7.8-1) trixie; urgency=medium
+
+  * 0.7.8: three llama.cpp patches. 0047: a graph's inputs (positions,
+    masks, ids) are staged in a USM host ring and enqueued without a wait,
+    and the scheduler waits once a split instead of once an input
+    (GGML_OPENCL_STAGE_INPUTS=0 / GGML_SCHED_INPUT_SYNC_EACH=1 restore the
+    old behaviour). Decode: the coder on the A770 +14-15 % (43.0 -> 49.4
+    t/s; its inputs behind the chipset link ~2.0 -> 0.13-0.25 ms a graph),
+    Flash-Next +1.1-1.4 %, the dense agent +0.8-1.3 %, the same text.
+    0046: an expert cache's residency tables written in one call an adapt
+    step (Flash-Next decode +0.1-0.6 %). 0048: the A770's prompt attention
+    with f16 V 20-28 % faster (no deployed unit runs f16 KV on the A770).
+    Runtime floor unchanged at marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Wed, 14 Oct 2026 12:05:00 +0200
+
 arcint (0.7.7-1) trixie; urgency=medium
 
   * 0.7.7: two llama.cpp patches on the B60. 0044: the bank stream runs

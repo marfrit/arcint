@@ -1,0 +1,251 @@
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+index 896c55b..fc79055 100644
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -137,35 +137,65 @@ bool llama_expert_cache::verify(const llama_expert_cache_layer & L, ggml_tensor
+     return memcmp(dev.data(), ref.data(), L.nb2[k]) == 0;
+ }
+ 
+-// the residency tables, written without a wait (their host copies live in
+-// the layer until the next write, after a graph has passed)
+-void llama_expert_cache::upload_tables(llama_expert_cache_layer & L) {
+-    auto & ts = L.tab_host[0], & tb = L.tab_host[1];
+-    ts.resize(L.n_expert); tb.resize(L.n_expert);
++// a layer's residency tables, its n_tab rows of tab_all from `r` on
++void llama_expert_cache::fill_tables(const llama_expert_cache_layer & L, int32_t * r) const {
++    const int64_t ne = tab_all->ne[1];
++    int32_t * ts = r, * tb = r + ne, * tc = r + 2 * ne;
+     for (int e = 0; e < L.n_expert; ++e) {
+         ts[e] = L.slot_of[e];   // -1: the kernels skip the pair in this branch
+         tb[e] = L.bank_of[e];
+-    }
+-    write_slices(L.tab_slot, 0, (const uint8_t *) ts.data(), ts.size() * sizeof(int32_t));
+-    write_slices(L.tab_bank, 0, (const uint8_t *) tb.data(), tb.size() * sizeof(int32_t));
+-    auto & tc = L.tab_host[4];
+-    tc.resize(L.n_expert);
+-    for (int e = 0; e < L.n_expert; ++e) {
+         tc[e] = L.slot_of[e] >= 0 ? L.slot_of[e] : L.n_slots + L.bank_of[e];
+     }
+-    write_slices(L.tab_comb, 0, (const uint8_t *) tc.data(), tc.size() * sizeof(int32_t));
+     if (L.tab_slot_dn) {
+-        auto & ts2 = L.tab_host[2], & tb2 = L.tab_host[3];
+-        ts2.resize(L.n_expert); tb2.resize(L.n_expert);
++        int32_t * ts2 = r + 3 * ne, * tb2 = r + 4 * ne;
+         for (int e = 0; e < L.n_expert; ++e) {
+             ts2[e] = L.slot_of[e] >= 0 ? L.slot_of[e] : L.n_slots;
+             tb2[e] = L.bank_of[e] >= 0 ? L.bank_of[e] : L.n_bank;
+         }
+-        write_slices(L.tab_slot_dn, 0, (const uint8_t *) ts2.data(), ts2.size() * sizeof(int32_t));
+-        write_slices(L.tab_bank_dn, 0, (const uint8_t *) tb2.data(), tb2.size() * sizeof(int32_t));
+     }
+ }
+ 
++// a layer's tables into the host copy of tab_all; flush_tables writes them
++void llama_expert_cache::upload_tables(llama_expert_cache_layer & L) {
++    fill_tables(L, tab_host.data() + L.tab_row * tab_all->ne[1]);
++    tab_lo = std::min(tab_lo, L.tab_row);
++    tab_hi = std::max(tab_hi, L.tab_row + L.n_tab);
++}
++
++// the rows upload_tables changed, in one write without a wait (the host copy
++// is next changed by a later adapt step, after a graph has passed)
++void llama_expert_cache::flush_tables() {
++    if (tab_lo >= tab_hi) {
++        return;
++    }
++    const int32_t * src = tab_host.data() + tab_lo * tab_all->ne[1];
++    if (set_slices) {
++        set_slices(tab_all, src, tab_lo, tab_hi - tab_lo);
++    } else {
++        ggml_backend_tensor_set(tab_all, src, (size_t) tab_lo * tab_all->nb[2], (size_t) (tab_hi - tab_lo) * tab_all->nb[2]);
++    }
++    tab_lo = INT32_MAX;
++    tab_hi = 0;
++}
++
++// the tables on the card (a blocking read) against slot_of / bank_of: the rows that differ
++int llama_expert_cache::check_tables() const {
++    const int64_t ne = tab_all->ne[1], n_rows = tab_all->ne[2];
++    std::vector<int32_t> want((size_t) (n_rows * ne), 0), dev((size_t) (n_rows * ne), 0);
++    for (const auto & L : layers) {
++        fill_tables(L, want.data() + L.tab_row * ne);
++    }
++    get_slices(tab_all, dev.data(), 0, n_rows);
++    int bad = 0;
++    for (const auto & L : layers) {
++        for (int k = 0; k < L.n_tab; ++k) {
++            const size_t o = (size_t) ((L.tab_row + k) * ne);
++            bad += memcmp(want.data() + o, dev.data() + o, (size_t) ne * sizeof(int32_t)) != 0;
++        }
++    }
++    return bad;
++}
++
+ // Layer il as init() caches it on `dev`: its experts in host buffers, the
+ // layer itself on `dev` (a GPU), types whose kernels take the cache, its
+ // tensors' bytes in a GGUF file. `out` (when not null) gets the layer.
+@@ -390,9 +420,29 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+     }
+ 
+     // tensors: slots and tables on the card, the banks in host memory
+-    ggml_init_params ip = { ggml_tensor_overhead() * (layers.size() * 8 + 1), nullptr, true };
++    // the tables: each layer's rows of tab_all (slot, bank, comb, then the _dn pair)
++    int    n_rows = 0;
++    size_t n_ctx  = 2;   // tab_all, tab_id
++    for (auto & L : layers) {
++        GGML_ASSERT(L.n_expert == n_expert);
++        L.tab_row = n_rows;
++        L.n_tab   = L.src[2]->type == GGML_TYPE_Q8_0 ? 5 : 3;
++        n_rows   += L.n_tab;
++        n_ctx    += 3 + L.n_tab;   // slots, table views
++        for (int k = 0; k < 3; ++k) {
++            n_ctx += L.src[k]->type == GGML_TYPE_Q8_0;   // a Q8_0 bank lives on the card
++        }
++    }
++    ggml_init_params ip = { ggml_tensor_overhead() * n_ctx, nullptr, true };
+     ctx       = ggml_init(ip);
++    ip.mem_size = ggml_tensor_overhead() * layers.size() * 3;
+     bank_ctx_ = ggml_init(ip);
++    tab_all = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 1, n_expert, n_rows);
++    ggml_set_name(tab_all, "expert_tables");
++    tab_host.assign((size_t) n_rows * n_expert, 0);
++    auto tab_view = [&](int row) {
++        return ggml_view_2d(ctx, tab_all, 1, n_expert, tab_all->nb[1], (size_t) row * tab_all->nb[2]);
++    };
+     for (auto & L : layers) {
+         for (int k = 0; k < 3; ++k) {
+             L.slot[k] = ggml_new_tensor_3d(ctx, L.src[k]->type, L.src[k]->ne[0], L.src[k]->ne[1], L.n_slots + 1);
+@@ -403,13 +453,13 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+             L.bank[k] = ggml_new_tensor_3d(bctx, L.src[k]->type, L.src[k]->ne[0], L.src[k]->ne[1], L.n_bank + 1 + L.n_spare);
+             ggml_format_name(L.bank[k], "%s.bank", ggml_get_name(L.src[k]));
+         }
+-        L.tab_slot = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, L.n_expert);
+-        L.tab_bank = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, L.n_expert);
+-        L.tab_comb = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, L.n_expert);
++        L.tab_slot = tab_view(L.tab_row);
++        L.tab_bank = tab_view(L.tab_row + 1);
++        L.tab_comb = tab_view(L.tab_row + 2);
+         ggml_format_name(L.tab_comb, "blk.%d.expert_slot_or_bank", L.il);
+-        if (L.src[2]->type == GGML_TYPE_Q8_0) {
+-            L.tab_slot_dn = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, L.n_expert);
+-            L.tab_bank_dn = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, L.n_expert);
++        if (L.n_tab == 5) {
++            L.tab_slot_dn = tab_view(L.tab_row + 3);
++            L.tab_bank_dn = tab_view(L.tab_row + 4);
+             ggml_format_name(L.tab_slot_dn, "blk.%d.expert_slot_of_down", L.il);
+             ggml_format_name(L.tab_bank_dn, "blk.%d.expert_bank_of_down", L.il);
+         }
+@@ -495,6 +545,9 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+         lo = std::min<int64_t>(lo, L.n_slots);
+         hi = std::max<int64_t>(hi, L.n_slots);
+     }
++    flush_tables();
++    LLAMA_LOG_INFO("%s: table check, %s: %d of %d rows differ (written as one)\n", __func__, ggml_backend_dev_name(dev),
++                   check_tables(), (int) tab_all->ne[2]);
+     {
+         std::vector<int32_t> id(n_expert);
+         for (int e = 0; e < n_expert; ++e) {
+@@ -701,7 +754,7 @@ void llama_expert_cache::adapt(const std::vector<llama_expert_cache_swap> & all_
+         touched[c.layer] = 1;
+         n_swaps++;
+     }
+-    if (mutate) {   // the red case: one swapped slot's bytes corrupted after the exchange
++    if (mutate == 1) {   // the red case: one swapped slot's bytes corrupted after the exchange
+         auto & c = all.front();
+         auto & L = layers[c.layer];
+         std::vector<uint8_t> bad(L.nb2[0]);
+@@ -717,6 +770,11 @@ void llama_expert_cache::adapt(const std::vector<llama_expert_cache_swap> & all_
+             upload_tables(layers[i]);
+         }
+     }
++    if (mutate == 2) {   // the red case: the write leaves out the last changed row
++        tab_hi--;
++        mutate = 0;
++    }
++    flush_tables();
+     if (check) {
+         const auto & c   = all.front();
+         const auto & L   = layers[c.layer];
+@@ -725,6 +783,8 @@ void llama_expert_cache::adapt(const std::vector<llama_expert_cache_swap> & all_
+             bad += verify(L, L.slot[k], k, c.slot, c.expert) ? 0 : 1;
+             bad += verify(L, L.bank[k], k, first_entry, first_victim) ? 0 : 1;
+         }
++        LLAMA_LOG_WARN("%s: table check, %s: %d of %d rows differ\n", __func__, ggml_backend_dev_name(dev_), check_tables(),
++                       (int) tab_all->ne[2]);
+         LLAMA_LOG_WARN("%s: swap check, %s, layer %d slot %d <- expert %d, bank %d <- expert %d: %d of 6 copies differ from the file\n",
+                        __func__, ggml_backend_dev_name(dev_), L.il, c.slot, c.expert, first_entry, first_victim, bad);
+     }
+@@ -758,6 +818,7 @@ void llama_expert_cache::progress() {
+                 upload_tables(layers[i]);
+             }
+         }
++        flush_tables();
+         // the refills wait for the graphs that still read the victims there
+         // (the fence is placed now, before the next graph; the copies after it)
+         adapt_fence(any);
+@@ -776,7 +837,7 @@ void llama_expert_cache::progress() {
+         L.spare.push_back(p.b_in);
+         touched[p.layer] = 1;
+     }
+-    if (mutate) {   // the red case: one swapped slot's bytes corrupted after it landed
++    if (mutate == 1) {   // the red case: one swapped slot's bytes corrupted after it landed
+         const auto & p = pend.front();
+         auto & L = layers[p.layer];
+         std::vector<uint8_t> bad(L.nb2[0]);
+@@ -792,6 +853,11 @@ void llama_expert_cache::progress() {
+             upload_tables(layers[i]);
+         }
+     }
++    if (mutate == 2) {   // the red case: the write leaves out the last changed row
++        tab_hi--;
++        mutate = 0;
++    }
++    flush_tables();
+     if (pend_check) {
+         const auto & p = pend.front();
+         const auto & L = layers[p.layer];
+@@ -800,6 +866,8 @@ void llama_expert_cache::progress() {
+             bad += verify(L, L.slot[k], k, p.slot, p.e_in) ? 0 : 1;
+             bad += verify(L, L.bank[k], k, p.x, p.e_out) ? 0 : 1;
+         }
++        LLAMA_LOG_WARN("%s: table check, %s: %d of %d rows differ\n", __func__, ggml_backend_dev_name(dev_), check_tables(),
++                       (int) tab_all->ne[2]);
+         LLAMA_LOG_WARN("%s: swap check, %s, layer %d slot %d <- expert %d, bank %d <- expert %d: %d of 6 copies differ from the file\n",
+                        __func__, ggml_backend_dev_name(dev_), L.il, p.slot, p.e_in, p.x, p.e_out, bad);
+         pend_check = false;
+diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
+index c5534c6..c6545b8 100644
+--- a/src/llama-expert-cache.h
++++ b/src/llama-expert-cache.h
+@@ -71,7 +71,8 @@ struct llama_expert_cache_layer {
+     std::vector<int32_t> bexpert_of;    // bank entry -> expert, -1 (the zero entry, a spare)
+     std::vector<float>   usage;         // decode routing counts, decayed each adapt
+     ggml_tensor * ids_out = nullptr;    // the last graph's routed ids (a copy, marked output)
+-    std::vector<int32_t> tab_host[5];   // the tables' bytes, alive until their non-blocking write lands
++    int      tab_row  = 0;              // the first of its tables' rows in the cache's tab_all
++    int      n_tab    = 0;              // its tables: 3, or 5 with the _dn pair
+     llama_expert_cache * owner = nullptr;
+ };
+ 
+@@ -126,6 +127,11 @@ struct llama_expert_cache {
+ 
+     std::vector<llama_expert_cache_layer> layers;
+     ggml_tensor * tab_id = nullptr;     // I32 [1, n_expert] identity: the routed ids' copy for read-back
++    // every layer's tables as rows of one tensor (the layers' tab_* are views),
++    // uploaded in one write as Strata's residency table (generate.cpp:4406-4413)
++    ggml_tensor * tab_all = nullptr;    // I32 [1, n_expert, rows]
++    std::vector<int32_t> tab_host;      // its bytes, alive until their non-blocking write lands
++    int      tab_lo = INT32_MAX, tab_hi = 0;   // the rows written since the last upload
+ 
+     // Strata's constants (generate.cpp:358, :380, :4428-4484)
+     float    min_usage   = 2.0f;
+@@ -148,6 +154,9 @@ private:
+     void write_slices(ggml_tensor * t, int64_t i2, const uint8_t * data, size_t nb2);
+     bool verify(const llama_expert_cache_layer & L, ggml_tensor * t, int k, int i2, int expert) const;
+     void upload_tables(llama_expert_cache_layer & L);
++    void flush_tables();
++    void fill_tables(const llama_expert_cache_layer & L, int32_t * r) const;
++    int  check_tables() const;
+ 
+     ggml_backend_dev_t dev_ = nullptr;  // the card of these layers: slots, tables, the bank's context, the queue
+     std::vector<int>   fds;             // per GGUF file
