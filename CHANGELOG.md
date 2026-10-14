@@ -17,6 +17,42 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.7.8 — 2026-10-14
+
+**Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine
+builds llama.cpp `bed0a85` with `contrib/llama.cpp/patches` 0001-0048. Three
+llama.cpp patches; no change to arcint's own sources. Every number is
+`measured-here` on the named card; the details are in
+`contrib/llama.cpp/README.md` (0046-0048),
+`docs/campaigns/flash-next-llama-engine.md` and
+`docs/campaigns/dense-prefill-attention.md` (both on the `qfndev` branch).
+
+- **Patch 0047: a graph's inputs without a wait each.** With one GPU the
+  scheduler synchronized the backend and wrote each user input blocking
+  (positions, masks, ids). The scheduler now waits once a split, and the
+  OpenCL backend copies writes of up to 4 MiB into non-weight buffers to a
+  USM host ring and enqueues them without a wait.
+  `GGML_SCHED_INPUT_SYNC_EACH=1` and `GGML_OPENCL_STAGE_INPUTS=0` restore
+  the old behaviour.
+  - The coder (A770, behind the chipset's PCIe 3.0 x4 link): input copies
+    ~2.0 -> 0.13-0.25 ms a graph, decode 42.9-43.0 / 39.9 / 36.9-37.0 ->
+    49.3-49.4 / 45.9-46.0 / 42.6 t/s on three answers (+14-15 %).
+  - Flash-Next (B60): a verify's inputs 926-949 -> 582-593 us, a draft's
+    395-404 -> 134-141; decode 31.6 / 36.8 / 35.3 -> 32.0 / 37.3 / 35.7-35.8.
+  - The dense agent (B60): decode +0.8-1.3 %.
+  - The same text in every arm; with the ring's bytes left stale (the red
+    case) Flash-Next answers "!!!!!!!!".
+- **Patch 0046: an expert cache's tables in one write.** Every layer's
+  residency tables are rows of one tensor, uploaded in one call per adapt
+  step, after Strata's one residency table (`code`). Flash-Next decode
+  +0.1-0.6 % an answer, the same text; a table check at load and at the
+  first adapt.
+- **Patch 0048: the A770's prompt attention with f16 V.** V is staged a key
+  pair a work-item, and P's operand needs no shuffles: the kernel 20-28 %
+  faster, the coder's model with f16 KV +11 % at a 41k prompt, KL and the
+  acceptance task alike. Quantized V keeps the old staging, so the deployed
+  coder (q8_0:q4_0) is unchanged by it.
+
 ## 0.7.7 — 2026-10-14
 
 **Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine
