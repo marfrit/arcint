@@ -2846,3 +2846,63 @@ write each and without a wait each.
   Its notes, taken: the ring is allocated only for a staging candidate, and
   the red switch is read as a number. The final build: the capital, the
   needle, the hash-table answer's same text at 32.0 t/s, inputs 591 / 138 us.
+
+## 0048-opencl-fa-sg8-v-pairs.patch
+
+The A770's prompt attention (`flash_attn_dpas.cl`, sub-group 8) with f16 V
+stages V a key pair a work-item: two keys' 8 values packed into 8 uints (the
+P V b operand's pairs) and stored as 8 dwords, one a dim, instead of 16
+scalar halves. The pair is keys j and j + 8 of a 16-key group, so P's a
+operand comes straight from S's two 8-key halves without shuffles, and a
+sub-group's V loads read 8 consecutive rows. `GGML_OPENCL_FA_SG8_VBLK=0`
+keeps the old staging; `-DFA_VBLK_RED` (through `GGML_OPENCL_FA_DPAS_OPTS`)
+swaps the pair: the red case. Quantized V keeps the old staging (below).
+
+- **Why:** the A770's ablations after 0039 put V's transposing stores at ~12
+  ms of 70 (`docs/campaigns/dense-prefill-attention.md`, A770 stage).
+- **The forms tried** (`measured-here`, 2026-10-14, the A770 at its pinned
+  2000 MHz, test-backend-ops perf, causal, 24 heads on 4, 512 rows, 65,536
+  keys; offline ISA from ocloc acm-g10):
+
+  | form | f16 | q8_0:q4_0 | ISA |
+  |---|---|---|---|
+  | old (transposed tile, 8 scalar stores) | 166.1 ms | 139.8 | f16 spills 2,304 B |
+  | V in the b operand's blocked layout, block reads | 155.6 | 162.8 | spills 1,760 B: the block reads' addresses |
+  | key pairs (2i, 2i+1), 8 dword stores, a separate pass | 137.8 | 155.4 | no spill |
+  | the same fused into K's loop / V before K | 137.1 / 136.6 | 158.9 / 156.7 | no spill |
+  | pairs (j, j + 8), no shuffles (this patch) | 128.6-129.0 | 150-152 | no spill, 2,732 instructions (f16) |
+  | the same with the pair decoded packed / loads batched | | 150.0 / 148.6 | |
+
+  The quantized loss is the decode: with V read as plain halves instead
+  (timing only), the old form takes 168.6 ms and the pair form 133.7. The
+  old loop hides V's dequantization under its loads; the pair form exposes
+  it, and neither decoding into packed pairs nor batching the loads won it
+  back. So the define reaches the f16 program only (the kernel refuses a
+  quantized V at compile time).
+- **Measured** (`measured-here`, the final build, two runs each):
+  - **Kernel** (f16): 32,768 keys 82.7 -> 64.0 ms, 65,536 keys at 256 /
+    512 / 1,024 rows 103.3 -> 74.4, 166.1 -> 128.6, 352.3 -> 280.1 (-20 to
+    -28 %); q8_0:q4_0 unchanged (140.1 / 140.2).
+  - **test-backend-ops FLASH_ATTN_EXT** (the A770): 2,808 of 2,812 with
+    and without, the same 6 failing cases; the red case fails 72.
+  - **Served** (the coder's model with `--llama-kv f16` at 49,152, MTP 4,
+    one binary, the switch off in the other arm, A B A B): the 40,841-token
+    needle 661.6-665.8 -> 734.4-741.2 t/s (+11 %), 18,413 tokens 903-912
+    -> 933-973; the needles and the capital right; the acceptance task
+    10/10 in all four arms, the same program; peak VRAM 15,818-15,834 MiB.
+  - **KL** (16 x 512 at 512 rows a call, against `coder-ref-q8.kld`, f16
+    KV): 0.024717 / 93.04 % against 0.024837 / 93.14 %; the red case
+    1.3828 / 51.8 %.
+  - The deployed coder runs q8_0:q4_0 at 98,304 and does not take this
+    path. f16 KV at 98,304 would not fit the card (49,152 peaks at 15.8
+    GB); at 49,152 its 41k prefill (740 t/s) beats the deployed q8_0:q4_0
+    at 44k (685 t/s, 0039). Which to run is the operator's call.
+- **Reviewed** before the push by a second model:
+  - the pairing against the DPAS operand layout (the same permutation of
+    the 16 keys in P and V, so the contraction is unchanged);
+  - the staging indices, bounds and tail clamps;
+  - the barriers, and the old path being untouched without the define;
+  - that only the f16 program gets the define.
+
+  No defect. Two comments on the shuffle path were updated afterwards
+  (comments only).

@@ -263,8 +263,18 @@ survive until they are used. One tile ahead stays.
      `llama-engine-kernel-gap.md` (0013).
 2. **Attention, what is left** (~36 TFLOPS a full wave, 37 % of peak; 34.5 at
    0045's 512-row split, 35 %):
-   - the O rescale when a row's max rises;
-   - the mixed-tile mask path on the diagonal.
+   - **Sized** (`measured-here`, 2026-10-14, B60, test-backend-ops perf,
+     65k keys, 512 rows, each part removed, timing only): the O rescale
+     ~0 (23.88 -> 24.13 ms), the mixed-tile mask path 0 (23.87), the exp
+     -0.5 ms (2 %), the next-tile prefetch +15 ms when removed (39.27).
+     With every tile's K/V read from the first tile (cache-resident) and no
+     prefetch the kernel takes 21.5 ms: streaming K/V costs ~10 %, and the
+     rest is the reads' and DPAS's issue (72 2D reads for 64 DPAS a tile).
+     vllm-xpu-kernels' head-256 prefill policy is this geometry exactly
+     (`code`, `fmha_utils.hpp` `chunk_policy_head256`: 256 rows, 32
+     sub-groups of 8, 32-key tiles), so no reference reuses the reads
+     more. The named items are spent; the kernel is at the reference's
+     shape.
    - **The 2D read payloads, tried** (2026-10-14): sycl-tla builds its
      block-read payloads once (`code`, `copy_traits_xe_2d.hpp`
      `prepare_payloads`, `__builtin_IB_subgroup_createBlock2DAddressPayload`)
@@ -335,8 +345,17 @@ survive until they are used. One tile ahead stays.
      `measured-here` from its GGUF) at a 512-row ubatch makes 128
      work-groups, two full waves: 0045's key split would gain nothing there.
      Only a prompt's short last ubatch runs a part-empty wave.
+   - **Patch 0048, V a key pair a work-item** (`measured-here`, README
+     0048): with f16 V the kernel runs 20-28 % faster (65k keys, 512 rows
+     166.1 -> 128.6 ms; the coder's model with f16 KV, 41k needle 662-666 ->
+     734-741 t/s, KL 0.024717 vs 0.024837, the task 10/10 alike). With
+     quantized V every pair form lost 6-11 %: the old loop hides V's
+     dequantization under its loads, the pair form exposes it (with V read
+     as halves, the pair form wins 133.7 against 168.6). Quantized V keeps
+     the old staging; the deployed coder (q8_0:q4_0) is unchanged.
    - **Next on the A770:**
-     - V's transposing stores (~12 ms of 70): the dword-pair form lost at
+     - V's transposing stores for a quantized V (~12 ms of 70); the f16
+       case is 0048's. The dword-pair form lost at
        every stride (above);
      - the P V DPAS (~12 ms);
      - the mask path (~9.5 ms).
