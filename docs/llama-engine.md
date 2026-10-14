@@ -211,6 +211,12 @@ stream copied every bank tensor whole for a few tokens. A 24-token prompt
 prefills in 0.64 s instead of 1.87; 64 tokens and up unchanged; KL +0.0004
 nats.
 
+**Prompts below 256 tokens since 0.7.7** (`contrib/llama.cpp` 0044,
+`measured-here`, B60, the configuration above): the bank stream runs from
+256 tokens a ubatch (`GGML_OPENCL_BANK_STREAM_MIN_TOK`); below that a MoE
+GEMM gathers its routed bank experts. 77 tokens 1.84 -> 1.11 s, 173 tokens
+1.83 -> 1.54; 269 and up unchanged; the same tokens.
+
 The UD-Q3_K_XL file (52 GiB of experts) serves the same way at 235 t/s
 prefill and 12-13 t/s decode without MTP (2026-10-06).
 
@@ -314,6 +320,11 @@ also run (peak 23,247 MiB). At 229,376 (the deployed size): the needle at 40 % o
 223,628-token prompt right (prefill 164.9 t/s, decode there 13.3 t/s), the task 10/10,
 peak 23,721 MiB. At 245,760 (deployed): the needle in a 236,938-token prompt right
 (prefill 157.2 t/s, decode there 11.5 t/s), the task 10/10, peak 24,195 MiB (238 MiB margin).
+Since 0.7.7 (`contrib/llama.cpp` 0045, `measured-here`, the deployed flags) the
+prompt attention splits a call's keys across work-groups when a wave would run
+part empty: prefill 54,895 tokens 668.0 -> 690.6 t/s, 138,028 461.6 -> 490.1,
+228,120 342.9 -> 370.1; the needles right, the task 10/10, KL 0.005652 against
+0.005950, peak 24,291 MiB.
 
 **Dense 27B, B60, with MTP** (5 drafts, the 40,960-id head) and
 `--llama-kv q8_0`:
