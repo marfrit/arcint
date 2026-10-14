@@ -353,7 +353,18 @@ survive until they are used. One tile ahead stays.
      dequantization under its loads, the pair form exposes it (with V read
      as halves, the pair form wins 133.7 against 168.6). Quantized V keeps
      the old staging; the deployed coder (q8_0:q4_0) is unchanged.
-   - **Next on the A770:**
+   - **Quantized K/V to f16 once a call, tried after 0048** (`measured-here`,
+     README 0048's addendum): correct, served +0.9-1.3 % on the coder's
+     41k and 82k needles, at +162 MiB peak leaving 149 MiB of the card: not
+     taken. Served, the quantized kernel is within ~1 % of the f16 one;
+     test-backend-ops' quantized arms carry a per-call unflattening a served
+     cache does not have, which overstated the gap.
+   - **Where the A770's quantized staging stands:** every restructuring of
+     the V staging tried (blocked, pairs, fused, V first, packed decode,
+     batched loads, f16 conversion) lost or gained ~1 %; the old loop hides
+     V's dequantization under its loads and the kernel is load-bound. Spent
+     at this design.
+   - **Next on the A770 (older list):**
      - V's transposing stores for a quantized V (~12 ms of 70); the f16
        case is 0048's. The dword-pair form lost at
        every stride (above);

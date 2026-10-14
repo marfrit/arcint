@@ -2895,8 +2895,10 @@ swaps the pair: the red case. Quantized V keeps the old staging (below).
     1.3828 / 51.8 %.
   - The deployed coder runs q8_0:q4_0 at 98,304 and does not take this
     path. f16 KV at 98,304 would not fit the card (49,152 peaks at 15.8
-    GB); at 49,152 its 41k prefill (740 t/s) beats the deployed q8_0:q4_0
-    at 44k (685 t/s, 0039). Which to run is the operator's call.
+    GB). At 49,152 its 41k prefill (734-741 t/s) is no better than the
+    deployed q8_0:q4_0 today: 725.8 t/s on the same 40,841-token needle at
+    98,304 (0049's gate below, with 0047 in the tree). An earlier note set
+    it against 0039's 685 t/s, a stale number; retracted.
 - **Reviewed** before the push by a second model:
   - the pairing against the DPAS operand layout (the same permutation of
     the 16 keys in P and V, so the contraction is unchanged);
@@ -2906,3 +2908,28 @@ swaps the pair: the red case. Quantized V keeps the old staging (below).
 
   No defect. Two comments on the shuffle path were updated afterwards
   (comments only).
+
+**Tried after 0048, not taken: quantized K/V to f16 once a call on the A770**
+(llama.cpp CUDA's need_f16_K/V, `code`, `fattn-common.cuh` `launch_fattn`).
+For a quantized prompt call, sub-group 8 converted both views to f16 scratch
+(the quantized kernel's own `load8`, so the same halves) and ran 0048's f16
+kernel on them (`GGML_OPENCL_FA_SG8_KV2F16`; llama tree `p0049-a770-kv2f16`,
+unmerged). Measured (`measured-here`, 2026-10-14, A770):
+- **Correct:** test-backend-ops the same 6 failing cases with and without,
+  the red case failing 97; KL (q8_0:q4_0, 512 rows a call) 0.026847 /
+  92.75 % against 0.026908 / 92.40 %, the red case 1.38.
+- **Served** (the coder's unit flags, q8_0:q4_0 at 98,304, A B A B, the
+  pairs identical): the 40,841-token needle 725.8 -> 732.4 t/s (+0.9 %),
+  81,974 tokens 502.9 -> 509.6 (+1.3 %); the needles right, the task 10/10
+  against 9/10.
+- **The price:** peak VRAM 15,977 -> 16,139 MiB of the card's 16,288: the
+  scratch grows with the depth (~201 MB at 98,304 for the coder's two KV
+  heads) and leaves 149 MiB. A thin margin is the known way into xe
+  eviction (memory `project-xe-eviction-thrash-margin`); a 1 % gain does not
+  pay for it.
+- **The premise was overstated:** test-backend-ops' quantized arms include
+  a per-call unflattening of the test's set_tensor-uploaded K/V that a served
+  cache does not have, so its "f16 8 % faster than quantized" at one shape
+  was mostly that; served, the quantized kernel is within ~1 % of the f16
+  one. Kernel-level quantized-vs-f16 comparisons on this test need that cost
+  subtracted.
