@@ -12,7 +12,8 @@ arcint (0.7.9-1) trixie; urgency=medium
     instead of the whole context, deeper prompt chunks cut to fit, and the
     QSA indexer's ReLU in place; Flash-Next at 131,072 tokens with 20,480
     cells and 13,400 MiB of expert slots decodes 38.4 / 43.0 t/s against
-    34.8 / 38.0, the 20k prefill unchanged. Every answer's text unchanged.
+    34.8 / 38.0 (3 drafts with the stop at 0.5, Strata's long request), the
+    20k prefill unchanged. Every answer's text unchanged.
     Runtime floor unchanged at marfrit-openvino +p25.
 
  -- Markus Fritsche <mfritsche@reauktion.de>  Wed, 14 Oct 2026 22:45:00 +0200

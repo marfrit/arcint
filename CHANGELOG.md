@@ -22,8 +22,9 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 **Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine
 builds llama.cpp `bed0a85` with `contrib/llama.cpp/patches` 0001-0052. Four
 llama.cpp patches and one arcint flag. Every number is `measured-here` on
-the named card, the units' flags, one binary with the patch's switch off in
-the other arm; the details are in `contrib/llama.cpp/README.md` (0049-0052)
+the named card, the units' flags (0052 and the Strata comparison: 3 drafts
+with the stop at 0.5 on Strata's long request), one binary with the patch's
+switch off in the other arm; the details are in `contrib/llama.cpp/README.md` (0049-0052)
 and `docs/campaigns/flash-next-llama-engine.md` (on the `qfndev` branch).
 
 - **Patch 0049: fewer decode kernels, the same bits.** llama.cpp CUDA's
@@ -49,16 +50,18 @@ and `docs/campaigns/flash-next-llama-engine.md` (on the `qfndev` branch).
 - **Patch 0052 and `--llama-reserve-cells N`: compute buffers to a
   budget.** The scheduler reserved Flash-Next's buffers for a 2,048-token
   prompt chunk at a full 131,072-cell cache (3,048 + 770 MiB for the whole
-  session). The QSA indexer's ReLU now runs in place (-1 GiB, the same
+  session). The QSA indexer's ReLU now runs in place (~1 GiB, the same
   bits), and with `--llama-reserve-cells N` the reservation covers N cells
   while deeper prompt chunks are cut to fit. At 131,072 tokens, N = 20,480
   and 13,400 MiB of expert slots: decode 34.8 / 38.0 -> 38.4 / 43.0 t/s on
-  Strata's request, the 20k needle's prefill unchanged (657 -> 662 t/s), a
+  Strata's request with 3 drafts and the stop at 0.5, the 20k needle's prefill unchanged (657 -> 662 t/s), a
   72k prompt 128.7 -> 173.0 s, peak VRAM 23.82 -> 23.35 GiB; the same text.
 - **Flash-Next against Strata** (the charter's B3): on Strata's own request
-  and card a round costs the same (63.1 against 63.4 ms); with 3 drafts and
-  Strata's stop at 0.5 (`--llama-mtp 3 --llama-mtp-min-p 0.5`) arcint
-  decodes 37.9 t/s against Strata's 37.8, and 43.0 with 0052.
+  and card a round costs the same at Strata's draft setting, 2 drafts with
+  the stop (63.1 against 63.4 ms); with 3 drafts and Strata's stop at 0.5
+  (`--llama-mtp 3 --llama-mtp-min-p 0.5`) arcint decodes 37.9 t/s against
+  Strata's 37.8 on the warm run (the first run 35.1 against 37.2), and 43.0
+  with 0052.
 
 ## 0.7.8 — 2026-10-14
 

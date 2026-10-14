@@ -224,7 +224,8 @@ in the kernel (0051), all with the same text. `--llama-reserve-cells N`
 (0052) reserves the compute buffers for N cache cells instead of the whole
 context and cuts deeper prompt chunks to fit: Flash-Next at 131,072 tokens
 with N = 20,480 and 13,400 MiB of expert slots decodes 38.4 / 43.0 t/s
-against 34.8 / 38.0, the 20k prefill unchanged, a 72k prompt 128.7 ->
+against 34.8 / 38.0 (3 drafts with the stop at 0.5, Strata's long
+request), the 20k prefill unchanged, a 72k prompt 128.7 ->
 173.0 s.
 
 **Inputs since 0.7.8** (`contrib/llama.cpp` 0047, `measured-here`, B60, the configuration
