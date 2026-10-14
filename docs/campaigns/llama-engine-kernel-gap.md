@@ -299,7 +299,15 @@ items of the fifth review are listed separately below.
      prefetch does not help, and 8 threads an XVE (128 GRF) does not fit;
    - Q6_K (658 of 2,968 ms of K-quant GEMM device time in a 4,096-token
      prefill, before KSYNC) has signed 8-bit scales per 16: no int8 form
-     found;
+     found. Priced 2026-10-15 (`measured-here`, B60): test-backend-ops
+     perf at 512 columns, Q4_K int8 73-83 TFLOPS, Q6_K 51-66, Q5_K 51-70;
+     the served 58k profile's Q6_K 7.5 s against Q4_K 26.3 s for 17.1 %
+     against 76.5 % of the weights (1.28x a weight). At Q4_K's rate: ~1.6 s,
+     ~2 % of that prefill, an upper bound. The reference's form (CUDA MMQ,
+     `mmq-vec-dot.cuh`, `code`) is one int8 MMA a 16-weight sub-block
+     (m16n8k16); the Intel int8 matrix builtin is k32 only (`code`), so the
+     per-16 scale costs two DPAS a 32-block with half the operand zero, the
+     fp16 kernel's DPAS rate. Not built;
    - Q5_K on int8 (the fifth bit makes codes 0..31: s8 code - 16 fits the
      same 16-bit bound at activations of 7 bits only).
 8. **GDN conv chain and decode fusions** (dense −20 ms prefill, −4.5 ms per
