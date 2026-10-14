@@ -211,18 +211,19 @@ stream copied every bank tensor whole for a few tokens. A 24-token prompt
 prefills in 0.64 s instead of 1.87; 64 tokens and up unchanged; KL +0.0004
 nats.
 
-**Inputs since 0.7.8** (`contrib/llama.cpp` 0047, `measured-here`): a
-graph's inputs are staged in a USM host ring and the scheduler waits once a
-split: a verify's input copies 926-949 -> 582-593 us, decode +1.1-1.4 %; on
-the coder (A770, behind the chipset link) ~2.0 -> 0.13-0.25 ms a graph,
-decode +14-15 %. 0046 writes an adapt step's expert tables in one call
-(+0.1-0.6 %).
-
 **Prompts below 256 tokens since 0.7.7** (`contrib/llama.cpp` 0044,
 `measured-here`, B60, the configuration above): the bank stream runs from
 256 tokens a ubatch (`GGML_OPENCL_BANK_STREAM_MIN_TOK`); below that a MoE
 GEMM gathers its routed bank experts. 77 tokens 1.84 -> 1.11 s, 173 tokens
 1.83 -> 1.54; 269 and up unchanged; the same tokens.
+
+**Inputs since 0.7.8** (`contrib/llama.cpp` 0047, `measured-here`, B60, the configuration
+above): a
+graph's inputs are staged in a USM host ring and the scheduler waits once a
+split: a verify's input copies 926-949 -> 582-593 us, decode +1.1-1.4 %; on
+the coder (A770, behind the chipset link) ~2.0 -> 0.13-0.25 ms a graph,
+decode +14-15 %. 0046 writes an adapt step's expert tables in one call
+(+0.1-0.6 %).
 
 The UD-Q3_K_XL file (52 GiB of experts) serves the same way at 235 t/s
 prefill and 12-13 t/s decode without MTP (2026-10-06).

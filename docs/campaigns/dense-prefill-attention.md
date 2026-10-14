@@ -281,7 +281,7 @@ survive until they are used. One tile ahead stays.
      and moves them a tile with one scalar write, the chunk offsets as
      immediates of the send. The same in `flash_attn_dpas2.cl` (`FA2_AP`:
      `_ap_` reads, one payload a tensor, Y set a tile; correct, its red case
-     fails 94) compiles to the same 1,733 instructions and 385 movs as the
+     fails 92) compiles to the same 1,733 instructions and 385 movs as the
      flat builtins (`measured-here`, offline ISA, bmg): IGC already keeps the
      flat reads' payloads, so the "90 scalar movs" were not payload setup to
      remove. Timed it is 1-9 % slower (f16 65k keys, 512 rows 23.9 -> 26.0

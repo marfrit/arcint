@@ -2654,7 +2654,7 @@ row tiles would leave a wave part empty, after llama.cpp CUDA's
     - 866/867 with and without splits; the one failure is the same
       logit-softcap case in both;
     - the red case (`-DFA_SPLIT_RED`, the states added without their maxima)
-      fails 94;
+      fails 92 (first written 94: the count included two summary lines);
     - the A770 is unchanged (sub-group 8 does not use this kernel).
   - **Offline ISA:** no spill, no private memory and no recompile retry, in
     the plain and carry kernels and in the merge kernel.
@@ -2809,8 +2809,8 @@ write each and without a wait each.
     reach the card): the capital answered "!!!!!!!!", the needle empty, the
     answer all "!".
   - **test-backend-ops** (the full suite, the B60): 11,143 of 11,294 with
-    staging and without, the same 153 failing cases (the error values differ
-    run to run: the inputs are random). The red case fails 1,068.
+    staging and without, the same 151 failing cases (the error values differ
+    run to run: the inputs are random). The red case fails 1,066.
   - test-backend-ops alone cannot catch a staging fault: its CPU reference
     reads its inputs back from the GPU buffer, so both sides see the same
     bytes. The served red case is the one that bites.
@@ -2884,7 +2884,7 @@ swaps the pair: the red case. Quantized V keeps the old staging (below).
     512 / 1,024 rows 103.3 -> 74.4, 166.1 -> 128.6, 352.3 -> 280.1 (-20 to
     -28 %); q8_0:q4_0 unchanged (140.1 / 140.2).
   - **test-backend-ops FLASH_ATTN_EXT** (the A770): 2,808 of 2,812 with
-    and without, the same 6 failing cases; the red case fails 72.
+    and without, the same 4 failing cases; the red case fails 70.
   - **Served** (the coder's model with `--llama-kv f16` at 49,152, MTP 4,
     one binary, the switch off in the other arm, A B A B): the 40,841-token
     needle 661.6-665.8 -> 734.4-741.2 t/s (+11 %), 18,413 tokens 903-912
@@ -2915,8 +2915,8 @@ For a quantized prompt call, sub-group 8 converted both views to f16 scratch
 (the quantized kernel's own `load8`, so the same halves) and ran 0048's f16
 kernel on them (`GGML_OPENCL_FA_SG8_KV2F16`; llama tree `p0049-a770-kv2f16`,
 unmerged). Measured (`measured-here`, 2026-10-14, A770):
-- **Correct:** test-backend-ops the same 6 failing cases with and without,
-  the red case failing 97; KL (q8_0:q4_0, 512 rows a call) 0.026847 /
+- **Correct:** test-backend-ops the same 4 failing cases with and without,
+  the red case failing 95; KL (q8_0:q4_0, 512 rows a call) 0.026847 /
   92.75 % against 0.026908 / 92.40 %, the red case 1.38.
 - **Served** (the coder's unit flags, q8_0:q4_0 at 98,304, A B A B, the
   pairs identical): the 40,841-token needle 725.8 -> 732.4 t/s (+0.9 %),
@@ -2933,3 +2933,11 @@ unmerged). Measured (`measured-here`, 2026-10-14, A770):
   was mostly that; served, the quantized kernel is within ~1 % of the f16
   one. Kernel-level quantized-vs-f16 comparisons on this test need that cost
   subtracted.
+
+**Failure counts corrected (2026-10-14):** the counts of failing
+test-backend-ops cases in 0047, 0048 and its addendum were `grep -c FAIL`,
+which also counted the two summary lines ("Backend OpenCL: FAIL" and the
+closing "FAIL"); each is two lower than first written (153 -> 151, 6 -> 4,
+the red cases 1,068 -> 1,066, 72 -> 70, 97 -> 95). 0045's red case was
+counted the same way: 92, not 94. The passed/total pairs came from the
+summary line and stand.
