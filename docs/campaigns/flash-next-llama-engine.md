@@ -417,6 +417,36 @@ arms of the same configuration).
   The probability was a double-precision softmax over all 248,320 logits on
   the host, ~0.8 ms a draft; now summed in float over the logits within 16
   of the top.
+
+  **Re-measured on 0001-0051 (2026-10-14, `measured-here`, B60, the unit's
+  flags otherwise, one binary).** The verify's rows got cheaper since; the
+  stop pays now at 3 drafts. Three 300-token answers (the gate's), total
+  time: 2 drafts 25.21-25.25 s (two arms), 3 drafts 25.25, 3 drafts with
+  the stop at 0.5 25.01 (+0.9 %), 4 with the stop 32.51 (-29 %), 2 with
+  the stop 24.99 (+1.0 %). Strata's own request (the RFC 4180 long answer,
+  500 tokens, `~/wp/smoke-0076-long.json` on the dev host; second run, the
+  first is 2-7 % slower on each arm):
+
+  | drafts | decode | rounds | tokens a round | ms a round |
+  |---|---|---|---|---|
+  | 2 | 35.4 t/s | 209 | 2.39 | 67.6 |
+  | 2, stop 0.5 | 36.2 | 219 | 2.28 | 63.1 |
+  | 3, stop 0.5 | **37.9** | 181 | 2.76 | 72.9 |
+  | 4, stop 0.5 | 29.6 | 169 | 2.96 | ~100 |
+  | Strata (`--spec 4 --spec-min-p 0.5`, its run log, 2026-10-06) | 37.8 | 212 | 2.36 | 63.4 |
+
+  Strata's log shows it captured only 2- and 3-token verify windows: 433
+  drafts in 212 rounds, at most 2 a round. At that setting the two engines'
+  rounds cost the same (63.1 against 63.4 ms); Strata's head offers more
+  drafts past the same stop (2.04 a round against 1.56). Strata normalizes
+  the draft probability over its 106,299-token subset (`code`, `mtp.cpp`),
+  which raises it: a likely cause, not measured. With a third draft arcint
+  matches Strata's decode on Strata's text. A 5-row verify costs ~100 ms
+  against ~73 for 4: a cliff between 4 and 5 rows, not located (the K-quant
+  dense matmuls take the few-column kernel to 16 columns on the B60, and
+  the MoE matvec runs to 15 tokens). Every arm: Paris, the needle; the
+  texts differ between draft counts (the verify's shape changes the last
+  bits; the answer-level bar allows it).
 - **The gap between kernels** (a chain of 4096-wide ADDs, test-backend-ops
   perf): 3.03 us a kernel. compute-runtime debug keys: skipping the walker's
   post-sync 2.91 us, optimized in-order barriers, L3 prefetch, relaxed
