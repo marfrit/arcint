@@ -581,6 +581,18 @@ arms of the same configuration).
   `src/kernels/cpu/iq_avx2.cpp`), a Zen 4 with AVX-512 and DDR5 (`paper`),
   and a recorded pass. Not a verdict on the mechanism: on this host it
   needs a CPU expert kernel at least twice as fast as ggml-cpu's.
+
+- **Not taken, 2026-10-15** (`measured-here`, B60, the 0.7.9 flags): the
+  hyper-connection gate (`hc_gate`, f16 10,240 x 320, ~32 us a call, 4.3 %
+  of decode kernel time) one row a work-item instead of four rows a
+  sub-group with a cross-lane reduction (llama tree `p0053-f16-rowlane`):
+  MUL_MAT f16 283/283, but served decode unchanged (on the answer whose text
+  stayed the same, verify 6.85 against 6.80-6.81 s); the gate's time is not
+  on the round's critical path, or the kernel is no faster in place. The
+  kernel lever that remains is the IQ2_S expert matvec at 165-215 GB/s with
+  every expert on the card (Q2_0 reaches 234-295); its hit-only time is
+  ~19 % of decode kernel time, and the local-memory grid was already
+  measured slower (stage 3b); the next step there is an ISA reading.
 - **The gap between kernels** (a chain of 4096-wide ADDs, test-backend-ops
   perf): 3.03 us a kernel. compute-runtime debug keys: skipping the walker's
   post-sync 2.91 us, optimized in-order barriers, L3 prefetch, relaxed
