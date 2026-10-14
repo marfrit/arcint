@@ -2706,3 +2706,60 @@ row tiles would leave a wave part empty, after llama.cpp CUDA's
     24 row tiles) can get 4 splits that cost as much as one: the reference
     has the same rounding, and it costs only on short blocks.
   - Only the comment naming the cap of 16 changed after the measured build.
+
+## 0046-expert-cache-tables-one-write.patch
+
+An expert cache's residency tables are rows of one tensor per card, written
+in one call per adapt step, after Strata's one residency table and its one
+upload (`code`, `src/program/generate.cpp:3589-3606`, `res_upload` at
+`4406-4413`).
+
+- **Why** (`measured-here`, 0042's record): each table was its own tensor and
+  its own non-blocking write. Flash-Next has 3 a layer and an adapt touches up
+  to 48 layers in each of its two phases (the victims out, the newcomers in),
+  so up to ~290 writes of 2 KiB. A probe timed 240 of them at 1.64 ms on the
+  B60, against 54 us as one write.
+- **What:**
+  - `tab_all`, I32 [1, n_expert, rows]: each layer's tables (slot, bank, the
+    single branch's slot-or-bank, then the Q8_0 down pair) are views of its
+    rows; the graph's `get_rows` reads them with the view offset (`code`).
+  - One host copy; `upload_tables` fills a layer's rows, and `flush_tables`
+    writes the changed range in one non-blocking `set_slices`. The host copy
+    changes again only at a later adapt step, after a graph has passed, as the
+    per-table copies did.
+  - **A table check:** the tables read back (a blocking read) against
+    `slot_of`/`bank_of`, at load and at the first adapt; the red case
+    (`LLAMA_EXPERT_CACHE_MUTATE=2`, the write leaving out its last row) and
+    the slot red case (`=1`) are separate now.
+- **Measured** (`measured-here`, 2026-10-14, B60, Flash-Next with the unit's
+  flags: 131,072 ctx, q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
+  the 0.7.7 package against the 0.7.7 tree + 0046, A B A B, one process an
+  arm; the capital, the 20k needle, three 300-token answers):
+
+  | answer | 0.7.7 | 0046 |
+  |---|---|---|
+  | hash table | 31.4 / 31.5 t/s | 31.6 / 31.5 |
+  | compiler | 36.6 / 36.7 | 36.7 / 36.8 |
+  | TCP | 35.1 / 35.1 | 35.3 / 35.3 |
+  | time writing swaps and tables, an answer | 0.09 / 0.06 / 0.07 s | 0.05 / 0.03 / 0.04 |
+
+  - The same text in all four arms (md5 of each answer), the same hit rates
+    (87.6-93.2 %), the capital and the needle right; the swap check 0 of 6.
+  - The table check: 0 of 144 rows at load and at the first adapt; the red
+    case 1 of 144.
+  - Prefill: adapt steps are planned on ubatches of up to 8 tokens only
+    (`code`, `advance()`), so a prompt's ubatches write no tables beyond
+    the landing of swaps already in flight.
+- **Reviewed** before the push by a second model:
+  - the views' allocation (the parent first in the context);
+  - every reader honours the view offset (only the six `get_rows`);
+  - the views as VIEW nodes in the scheduler;
+  - the host copy's lifetime against the in-order queue and the adapt fence;
+  - the range arithmetic and both red cases.
+
+  No defect. It found one pre-existing issue: the cache's context was sized
+  at 8 tensors a layer, but a layer with a Q8_0 down projection needs 9.
+  The context is now sized exactly. That fix and a reworded load log line
+  came after the measured build. The final build, checked on Flash-Next:
+  the capital, the needle, the hash-table answer's same text (md5
+  `d2069d0a`) at 31.6 t/s, and the table checks at 0 of 144.

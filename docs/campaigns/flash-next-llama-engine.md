@@ -1211,7 +1211,12 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
     answers and draft counts identical.
   - An adapt's table uploads are separate small writes (Flash-Next: 3 a
     touched layer): 240 of 2 KiB take 1.64 ms on the B60 against 54 us as
-    one write (`measured-here`, a probe). Not changed yet.
+    one write (`measured-here`, a probe). Built as patch 0046, after Strata's
+    one residency table and one upload (`code`, `generate.cpp:3589-3606`,
+    `4406-4413`): every layer's tables are rows of one tensor, written in one
+    call per adapt step. Decode +0.1-0.6 % on each of the three answers (two
+    A/B pairs against the 0.7.7 package), the time writing 0.06-0.09 -> 0.03-0.05 s
+    an answer, the same text; the record is README 0046.
 - **A round's kernels** (`measured-here`, a `GGML_OPENCL_PROFILING` build of
   the 0.7.5 tree, the unit's flags, two 300-token answers; the build decoded
   31.5 / 34.6 t/s against 33.1 / 36.9 for the plain one): 17.1 s of kernel
