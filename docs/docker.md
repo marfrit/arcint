@@ -144,6 +144,56 @@ ggml's OpenCL backend, which is why the image carries the ICD loader and
 the Intel compute-runtime driver (`ocl-icd`, `intel-compute-runtime`).
 See `docs/llama-engine.md` for that engine's own flags.
 
+### The three services as the project runs them (0.7.8)
+
+The command lines below are the ones the project's own services use;
+`docker/docker-compose.example.yaml` carries all three as compose profiles.
+Paths are placeholders under the read-only `/models` mount.
+
+**The coder** (Qwen3.6-35B-A3B coder GGUF, the A770 or any 16 GB card):
+
+```bash
+--engine llama --gguf /models/<coder>.gguf --served-model-name qwen3.6-coder \
+--device GPU.0 --n-ctx 98304 --llama-mtp 4 --llama-kv q8_0:q4_0 --queue-timeout 30
+```
+
+**The dense agent** (Qwen3.8-27B Q4_K_M, a 24 GB card):
+
+```bash
+--engine llama --gguf /models/<qwen3.8-27b-q4_k_m>.gguf --served-model-name qwen3.8-agent \
+--device GPU.0 --n-ctx 245760 --llama-kv q8_0:q4_0 --llama-mtp 5 \
+--llama-mtp-vocab /models/<draft-vocab>.json --queue-timeout 30 --repetition-penalty 1.0
+```
+
+`--llama-mtp-vocab` restricts the MTP head's output to a token subset, so the
+draft head costs a fraction of the full vocabulary. It is optional; the
+project's agent runs with it, and an arm without it was not measured for
+this release.
+
+**Qwen3.8-Flash-Next** (IQ2_XS GGUF, every expert through an expert cache on
+a 24 GB card, the rest in host memory):
+
+```bash
+# environment: GGML_OPENCL_BANK_STREAM=1
+--engine llama --gguf /models/<flash-next-iq2_xs-00001-of-00002>.gguf \
+--served-model-name qwen3.8-flash-next --device GPU.0 --n-ctx 131072 \
+--llama-cpu-moe 48 --llama-threads 8 --llama-expert-cache 11300 \
+--llama-expert-profile /models/<expert-profile>.bin --llama-mtp 2 \
+--llama-mtp-gguf /models/<flash-next-mtp-head>.gguf --llama-kv q8_0 --queue-timeout 30
+```
+
+Flash-Next needs more from the host than the other two:
+- **pinned host memory:** the expert bank (~22 GiB for IQ2_XS) lives in
+  USM host memory that the driver pins. The host's TTM page limit must
+  allow it (`/sys/module/ttm/parameters/pages_limit`; the default is half
+  of system RAM, which on a 64 GB host leaves little room beside the bank),
+  and the container needs no extra capability for it;
+- **the GGUF on fast local storage:** experts not in the bank or the cache
+  are read from the file; with the file on a ZFS pool the record has a
+  Flash-Next quant decoding at 4-5 t/s (README, current numbers);
+- **a VRAM margin:** 11,300 MiB of expert slots peaks at ~24.2 GB of a
+  24.5 GB card. Do not run anything else on that card.
+
 ## CPU baseline: the image is portable, and that costs something
 
 A container is built once and run anywhere, so the CPU instruction set has to
@@ -217,7 +267,15 @@ built from this tree in a privileged Debian container with podman, the A770
 bound in): the coder (`--engine llama`, its production GGUF, MTP 4, q8_0:q4_0
 KV) answered the capital check and decoded the 500-token long answer at
 43.4 t/s with 42.7 % of drafts accepted -- the same as the `.deb` on the
-host (43.3-43.5 t/s, 42.7 %).
+host (43.3-43.5 t/s, 42.7 %). That image predates 0.7.8: the `.deb` has
+since gained llama.cpp patches 0042-0048, among them 0047, which raised the
+coder's decode on the A770 by 14-15 % (`contrib/llama.cpp/README.md`). An
+image built from the 0.7.8 tree carries the same patches; it has not been
+re-measured from a container.
+
+**No image is published yet.** `.github/workflows/build-toolbox.yml` has
+not been dispatched on this repository; build the two tiers locally as
+above, or dispatch the workflow from a fork.
 
 ## What CI covers, and what it cannot
 
