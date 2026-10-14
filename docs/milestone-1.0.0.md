@@ -51,8 +51,10 @@ reference mechanism, and B3's gap is explained or closed.
 
 ## Order of work, proposed
 
-1. B1 and B2's open references, by price: the GDN stage (in progress, patch
-   0050), then OpenVINO-style post-op fusion of the activation quantization.
+1. B1 and B2's open references, by price: the GDN stage (patch 0050, the
+   snapshots into the cache, done: +1.2-5.3 % decode by service; the gating
+   and the conv stage next), then OpenVINO-style post-op fusion of the
+   activation quantization.
 2. B3: measure Strata's tokens per round on the same texts; build only what
    that measurement prices.
 3. A2, A6, A5: operator decisions, priced where possible.
