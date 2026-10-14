@@ -2608,3 +2608,101 @@ card-side mirror instead of copying every bank tensor whole.
   whole bank tensor; the series 0001-0044 applies onto the pin. No defect.
   The ring is now allocated at the second prompt of 256 tokens or more
   instead of the second of 64 or more (the same VRAM, later).
+
+## 0045-opencl-fa-dpas2-split-kv.patch
+
+`flash_attn_dpas2.cl` (0038) splits a call's keys across work-groups when its
+row tiles would leave a wave part empty, after llama.cpp CUDA's
+`parallel_blocks` (`code`, `ggml-cuda/fattn-common.cuh` `launch_fattn` and
+`flash_attn_combine_results`, at bed0a85).
+
+- **Why** (`measured-here`, B60, f16, causal, 65,536 keys, 32 sub-groups):
+  a work-group takes 256 query rows of one head and a Xe core holds one (32
+  sub-groups at 256 GRF), so the B60 runs 20 at a time. The time is the
+  number of waves times 9.4 ms:
+
+  | rows | work-groups | waves | time |
+  |---|---|---|---|
+  | 256 | 24 | 2 | 18.9 ms |
+  | 512 | 48 | 3 | 28.2 |
+  | 768 | 72 | 4 | 37.6 |
+  | 1,280 | 120 | 6 | 56.9 |
+  | 2,048 | 192 | 10 | 93.9 |
+
+  The agent's 512-token ubatch gives 48 work-groups, and the third wave is
+  40 % full. vLLM's prefill uses the same 256-row tile without a split
+  (`code`, `XeFHMAIndividualTileScheduler`), but its prompt chunks are
+  thousands of tokens long, so its last wave is a small share of the work.
+- **What:**
+  - **The split count:** the reference's rule. Take the fewest splits whose
+    waves are at least 95 % full, else the fullest, at most the call's 32-key
+    tiles and 16 (`GGML_OPENCL_FA_DPAS2_SPLIT` lowers the cap; 1 turns the
+    split off).
+  - **The wave size:** `CL_DEVICE_MAX_COMPUTE_UNITS` (the vector engines,
+    160 on the B60) / 8 x 32 / sub-groups a work-group, which is 20 on the
+    B60; `GGML_OPENCL_FA_DPAS2_WAVE` overrides it. At 512 rows the B60 gets
+    two splits.
+  - **The state:** each split's work-groups take their key range with their
+    own online-softmax state, in the carry layout (0037). Split 0's state is
+    the carry, so it can take in the earlier key blocks' state; the others
+    use slots of a scratch buffer.
+  - **The merge:** `flash_attn_split_combine` merges the states into the
+    carry (more key blocks follow) or into O.
+  - **One split:** the old paths run unchanged.
+- **Measured** (`measured-here`, 2026-10-14, B60):
+  - **test-backend-ops FLASH_ATTN_EXT, head sizes 256 and 128:**
+    - 866/867 with and without splits; the one failure is the same
+      logit-softcap case in both;
+    - the red case (`-DFA_SPLIT_RED`, the states added without their maxima)
+      fails 94;
+    - the A770 is unchanged (sub-group 8 does not use this kernel).
+  - **Offline ISA:** no spill, no private memory and no recompile retry, in
+    the plain and carry kernels and in the merge kernel.
+  - **Perf** (causal, the same binary, two runs each):
+
+    | shape | no split | 0045 |
+    |---|---|---|
+    | f16, 65,536 keys, 512 rows | 28.17 ms | 23.89 (34.5 TFLOPS) |
+    | f16, 65,536 keys, 256 rows | 18.9 ms | 12.34 |
+    | f16, 8,192 keys, 512 rows | 3.72 ms | 3.39 |
+    | q8_0:q4_0, 65,536 keys, 512 rows (with the test's ~22 ms unflattening) | 53.95 ms | 50.37 |
+    | 768 rows and more | | unchanged |
+
+  - **Served** (the dense agent's flags at 245,760, q8_0:q4_0; one dev
+    binary, 0.7.6 tree + 0045, splits off by the switch; server-side
+    prefill):
+
+    | prompt | no split | 0045 |
+    |---|---|---|
+    | 54,895 tokens | 668.0 t/s | 690.6 (+3.4 %) |
+    | 138,028 tokens, the needle | 461.6 | 490.1 (+6.2 %) |
+    | 228,120 tokens, the needle | 342.9 | 370.1 (+7.9 %) |
+
+  - **Answers:** the capital and both needles right in both arms.
+  - **Acceptance task:** 10/10 three times in each arm. With the splits it
+    is a different program (md5 `9b6b7a99` against `c76c468a`): the merge
+    reorders the softmax sums, and the answer moved but stayed right.
+  - **VRAM:** peak 24,271 -> 24,291 MiB (the scratch slots); GTT flat at
+    28 MiB.
+  - **KL** (16 x 512, `-b 512`, so a call has 512 rows and splits in two):
+    0.005652 / 97.475 % against 0.005950 / 97.304 % without splits. The red
+    case gives 0.216763 / 83.1 %.
+  - **A blind run first:** with llama-perplexity's default batch (four
+    sequences, 2,048 rows a call, 192 work-groups) the rule chooses one
+    split. KL was then identical in all three arms, the red case included,
+    so that run measured nothing.
+- **Reviewed** before the push by a second model. It checked:
+  - the carry and slot addressing against the merge's;
+  - the work-group arithmetic;
+  - argument order (the v1 carry kernel gets none of the new arguments);
+  - that a split boundary keeps the mask and mask-class indexing;
+  - empty and all-masked splits (`M_INIT` weighs 0, or 1 when no split saw
+    a key);
+  - mixed split and unsplit key blocks on the shared carry buffer;
+  - that one split is bit-identical to the old path.
+
+  No defect. Its notes:
+  - The 95 % rule scores waves, not tiles. A short key block (160 keys,
+    24 row tiles) can get 4 splits that cost as much as one: the reference
+    has the same rounding, and it costs only on short blocks.
+  - Only the comment naming the cap of 16 changed after the measured build.

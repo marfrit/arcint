@@ -210,6 +210,36 @@ when K's and V's reads are both removed (the ablation), so it looks like
 latency. But a longer lead loses: apparently the prefetched lines do not
 survive until they are used. One tile ahead stays.
 
+## Stage 5: patch 0045, the waves
+
+- **The cause** (`measured-here`, B60, f16, causal, 65k keys): a work-group
+  takes 256 rows of one head and a Xe core holds one, so the B60 runs 20 at
+  a time. The time is the number of waves times 9.4 ms, for 256 to 2,048
+  rows. The agent's 512-token ubatch makes 48 work-groups: three waves, the
+  last 40 % full. At full waves the kernel reaches 36 TFLOPS.
+- **The fix:** llama.cpp CUDA's `parallel_blocks` (`code`,
+  `fattn-common.cuh` `launch_fattn`). A call's keys are split across
+  work-groups by the reference's 95 % wave rule, each split keeps its own
+  online-softmax state in 0037's carry layout, and a merge kernel combines
+  the states (`flash_attn_combine_results`'s arithmetic). At 512 rows the
+  B60 gets two splits. vLLM's prefill keeps the 256-row tile without a
+  split (`code`), on chunks of thousands of tokens.
+- **Kernel:** f16 at 65k keys 28.17 -> 23.89 ms; 256 rows 18.9 -> 12.34 ms;
+  768 rows and up unchanged.
+- **Served** (the agent's flags at 245,760, q8_0:q4_0, one binary, the
+  split switched off in the other arm):
+  - 54,895 tokens 668.0 -> 690.6 t/s;
+  - the 138,028-token needle 461.6 -> 490.1;
+  - the 228,120-token needle 342.9 -> 370.1 (+7.9 %).
+- **Answers and quality:** answers right; the acceptance task 10/10 three
+  times in each arm (a different correct program with the splits); KL
+  inside the bar (0.005652 against 0.005950, the red case 0.2168); +20 MiB
+  peak VRAM. The tables are in the README, 0045.
+- **On the record:** the first KL run used llama-perplexity's 2,048-row
+  batches, where the rule picks one split. All three arms were identical,
+  the red case included, so that run measured nothing; it was rerun at 512
+  rows a call.
+
 ## Next
 
 1. **The ISA audit** (operator, 2026-10-13), ranked by device time, the hot
@@ -230,7 +260,7 @@ survive until they are used. One tile ahead stays.
      of prefill. Not pursued.
    - **The Q4_K GEMM is now the largest kernel.** Its record is
      `llama-engine-kernel-gap.md` (0013).
-2. **Attention, what is left** (27 % of peak in the kernel):
+2. **Attention, what is left** (35 % of peak in the kernel at full waves, 0045):
    - the O rescale when a row's max rises;
    - the 2D read payload setup, about 90 scalar movs a tile;
    - the mixed-tile mask path on the diagonal.
