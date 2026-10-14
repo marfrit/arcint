@@ -1,0 +1,202 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index f4c023d..6e99907 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -704,6 +704,7 @@ struct ggml_backend_opencl_context {
+     bool disable_fusion;
+     bool fuse_mm_glu = true;                     // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
+     bool fuse_rms_add = true;                    // opt-out GGML_OPENCL_FUSE_RMS_ADD=0 (fused rms_norm*w + residual)
++    int  fuse_0050 = 1;                          // patch 0050's GDN-stage fusions (GGML_OPENCL_FUSE_0050=<mask>): 1 the snapshots into the cache
+     int  fuse_0049 = 7;                          // patch 0049's fusions, a bit each: 1 rms_norm + scale, 2 ssm_conv + silu,
+                                                  // 4 sigmoid + mul (GGML_OPENCL_FUSE_0049=<mask>; 0: off)
+     bool f16_mrow = true;                        // opt-out GGML_OPENCL_F16_MROW=0 (multi-row-per-WG f16 decode GEMV for attn proj + lm_head)
+@@ -8073,6 +8074,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
+     if (const char * env = getenv("GGML_OPENCL_FUSE_RMS_ADD")) {
+         backend_ctx->fuse_rms_add = atoi(env) != 0;
+     }
++    if (const char * env = getenv("GGML_OPENCL_FUSE_0050")) {
++        backend_ctx->fuse_0050 = atoi(env);
++    }
+     if (const char * env = getenv("GGML_OPENCL_FUSE_0049")) {
+         backend_ctx->fuse_0049 = atoi(env);
+     } else if (const char * env2 = getenv("GGML_OPENCL_FUSE_RMS_SCALE")) {   // the gate's first switch: 0 = all off
+@@ -9250,6 +9254,11 @@ inline bool use_q4k_tiled(const ggml_backend_opencl_context *backend_ctx, const
+ inline bool use_q4_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);
+ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);   // defined below
+ 
++// the K > 1 snapshots written straight into the recurrent cache (patch 0050):
++// the cpy that would move them there, its destination and slot stride
++struct ggml_cl_gdn_snap { const ggml_tensor * cpy_dst = nullptr; };
++static bool ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * dst, const ggml_cl_gdn_snap * snap);
++
+ // patch 0049's fused forms, defined with the ops below
+ static void ggml_cl_rms_norm_impl(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst, float post, ggml_tensor * out);
+ static void ggml_cl_ssm_conv_impl(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+@@ -10047,6 +10056,40 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+             i++;
+             continue;
+         }
++        // the GDN's K rollback snapshots written straight into the recurrent
++        // cache instead of copied there by the cpy that follows it
++        // (delta-net-base.cpp build_recurrent_attn), as vllm-xpu-kernels' delta
++        // stage updates the state in place (gdn_attn/gated_delta_rule.hpp;
++        // patch 0050): one kernel and its ~2.4 MB copy a GDN layer fewer
++        if (!backend_ctx->disable_fusion && (backend_ctx->fuse_0050 & 1) && node->op == GGML_OP_GATED_DELTA_NET &&
++            ggml_get_op_params_i32(node, 0) > 1 && node->type == GGML_TYPE_F32) {
++            int j = i + 1;
++            while (j < cgraph->n_nodes && ggml_op_is_empty(cgraph->nodes[j]->op)) j++;
++            ggml_tensor * cp = j < cgraph->n_nodes ? cgraph->nodes[j] : nullptr;
++            const ggml_tensor * sv = node->src[2];   // v: [S_v, H_v, n_tokens, n_seqs]
++            if (cp != nullptr && cp->op == GGML_OP_CPY && (cp->flags & GGML_TENSOR_FLAG_COMPUTE) &&
++                cp->src[0]->view_src == node && cp->src[1] != nullptr &&
++                cp->src[0]->type == GGML_TYPE_F32 && cp->src[1]->type == GGML_TYPE_F32 && cp->src[1]->extra != nullptr) {
++                const ggml_tensor * sn = cp->src[0], * cd = cp->src[1];
++                const int64_t S_v = sv->ne[0], H_v = sv->ne[1], n_tok = sv->ne[2], n_seqs = sv->ne[3];
++                const int64_t D = S_v * S_v * H_v, K = ggml_get_op_params_i32(node, 0);
++                const size_t  f = sizeof(float);
++                const bool ok =
++                    sn->view_offs == (size_t) (S_v * H_v * n_tok * n_seqs) * f &&
++                    sn->ne[0] == D && sn->ne[1] == n_seqs && sn->ne[2] == std::min<int64_t>(n_tok, K) && sn->ne[3] == 1 &&
++                    sn->nb[1] == (size_t) D * f && sn->nb[2] == (size_t) D * n_seqs * f &&
++                    cd->ne[0] == D && cd->ne[1] == n_seqs && cd->ne[2] == sn->ne[2] && cd->ne[3] == 1 &&
++                    cd->nb[0] == f && cd->nb[1] == (size_t) D * f && cd->nb[2] % f == 0;
++                if (ok) {
++                    ggml_cl_gdn_snap snap;
++                    snap.cpy_dst = cd;
++                    if (ggml_cl_gated_delta_net_impl(backend, node, &snap)) {
++                        i = j;   // the cpy is done
++                        continue;
++                    }
++                }
++            }
++        }
+         // sigmoid + mul of the same shape, as llama.cpp CUDA fuses it (ggml-cuda.cu,
+         // {UNARY, MUL} with SIGMOID; unary.cu ggml_cuda_op_unary_mul: same shape,
+         // contiguous): one kernel (patch 0049)
+@@ -33655,6 +33698,11 @@ static void ggml_cl_glu(ggml_backend_t backend, const ggml_tensor * src0, const
+ }
+ 
+ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
++    ggml_cl_gated_delta_net_impl(backend, dst, nullptr);
++}
++
++// false (and nothing enqueued) when `snap` was asked for and this kernel cannot take it
++static bool ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * dst, const ggml_cl_gdn_snap * snap) {
+     GGML_ASSERT(dst);
+     GGML_ASSERT(dst->extra);
+ 
+@@ -33718,6 +33766,9 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
+         kernel = tgpp == 0 ? backend_ctx->kernel_gdn_intel_tg : backend_ctx->kernel_gdn_intel_pp;
+     }
+     GGML_ASSERT(kernel != nullptr);
++    if (snap != nullptr && !gdn_intel) {
++        return false;
++    }
+ 
+     const cl_uint s_off = S_v * H_v * n_tokens * n_seqs;
+ 
+@@ -33784,6 +33835,23 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
+     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &rq3));
+     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(float),    &scale));
+     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),    &K));
++    if (gdn_intel) {
++        cl_mem   sbuf    = extra_dst->data_device;
++        cl_ulong soff    = off_dst + (cl_ulong) s_off * sizeof(float);
++        cl_ulong sstride = (cl_ulong) S_v * S_v * H_v * n_seqs;   // a snapshot's floats
++        if (snap != nullptr) {
++            const ggml_tensor * cd = snap->cpy_dst;
++            ggml_tensor_extra_cl * ec = (ggml_tensor_extra_cl *) cd->extra;
++            sbuf    = ec->data_device;
++            soff    = ec->offset + cd->view_offs;
++            sstride = cd->nb[2] / sizeof(float);
++            static const bool red = getenv("GGML_OPENCL_FUSE_0050_RED") != nullptr && atoi(getenv("GGML_OPENCL_FUSE_0050_RED")) != 0;
++            if (red) sstride = 0;   // the red case: every slot written over slot 0
++        }
++        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &sbuf));
++        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &soff));
++        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &sstride));
++    }
+ 
+     if (gdn_intel) {
+         // gated_delta_net_intel.cl: the work-group's sub-groups, R rows each
+@@ -33794,7 +33862,7 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
+         size_t global_work_size[3] = { (size_t) H_v * sg, (size_t) n_seqs * nsg, (size_t) S_v / rows };
+         size_t local_work_size[3]  = { sg, nsg, 1 };
+         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+-        return;
++        return true;
+     }
+ 
+     // Subgroup size is 64 for Adreno and 32 for Intel
+@@ -33847,6 +33915,7 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
+     local_work_size[2]  = 1;
+ 
+     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++    return true;
+ }
+ 
+ //------------------------------------------------------------------------------
+diff --git a/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl b/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
+index 7256709..8455661 100644
+--- a/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
++++ b/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
+@@ -92,7 +92,11 @@ kernel void kernel_gated_delta_net_pp(
+         uint  H_k,
+         uint  rq3,
+         float scale,
+-        uint K) {
++        uint K,
++        // the K snapshots' destination (patch 0050): dst after the attention
++        // output (snap_buf = dst_buf), or the recurrent cache's rows when the
++        // cpy into them is fused; snap_stride = floats from one slot to the next
++        global char * snap_buf, ulong off_snap, ulong snap_stride) {
+     global const float * data_q     = (global const float *)(q_buf     + off_q);
+     global const float * data_k     = (global const float *)(k_buf     + off_k);
+     global const float * data_v     = (global const float *)(v_buf     + off_v);
+@@ -115,7 +119,6 @@ kernel void kernel_gated_delta_net_pp(
+     const uint iq3 = seq / rq3;
+     const ulong state_size = (ulong)S_V * S_V;
+     const ulong state_base = ((ulong)seq * H_v + head) * state_size;
+-    const ulong snap_size  = state_size * H_v * n_seqs;
+     const ulong q_base  = (ulong)iq3 * sq3 + (ulong)iq1 * sq1;
+     const ulong v_base  = (ulong)seq * sv3 + (ulong)head * sv1;
+     const ulong gb_base = (ulong)seq * sb3 + (ulong)head * sb1;
+@@ -191,7 +194,7 @@ kernel void kernel_gated_delta_net_pp(
+             if (K > 1u) {
+                 const int slot = (int)n_tokens - 1 - (int)(c * TC + tt);
+                 if (slot >= 0 && slot < (int)K) {
+-                    global float * sb = data_dst + s_off + (ulong)slot * snap_size + state_base;
++                    global float * sb = (global float *)(snap_buf + off_snap) + (ulong)slot * snap_stride + state_base;
+                     #pragma unroll
+                     for (int r = 0; r < R; ++r)
+                         #pragma unroll
+@@ -240,7 +243,11 @@ kernel void kernel_gated_delta_net_tg(
+         uint  H_k,
+         uint  rq3,
+         float scale,
+-        uint K) {
++        uint K,
++        // the K snapshots' destination (patch 0050): dst after the attention
++        // output (snap_buf = dst_buf), or the recurrent cache's rows when the
++        // cpy into them is fused; snap_stride = floats from one slot to the next
++        global char * snap_buf, ulong off_snap, ulong snap_stride) {
+     global const float * data_q     = (global const float *)(q_buf     + off_q);
+     global const float * data_k     = (global const float *)(k_buf     + off_k);
+     global const float * data_v     = (global const float *)(v_buf     + off_v);
+@@ -258,7 +265,6 @@ kernel void kernel_gated_delta_net_tg(
+     const uint iq3 = seq / rq3;
+     const ulong state_size = (ulong)S_V * S_V;
+     const ulong state_base = ((ulong)seq * H_v + head) * state_size;
+-    const ulong snap_size  = state_size * H_v * n_seqs;
+     const ulong q_base  = (ulong)iq3 * sq3 + (ulong)iq1 * sq1;   // q and k share strides
+     const ulong v_base  = (ulong)seq * sv3 + (ulong)head * sv1;
+     const ulong gb_base = (ulong)seq * sb3 + (ulong)head * sb1;
+@@ -338,7 +344,7 @@ kernel void kernel_gated_delta_net_tg(
+         if (K > 1u) {
+             const int slot = (int)n_tokens - 1 - (int)t;
+             if (slot >= 0 && slot < (int)K) {
+-                global float * sb = data_dst + s_off + (ulong)slot * snap_size + state_base;
++                global float * sb = (global float *)(snap_buf + off_snap) + (ulong)slot * snap_stride + state_base;
+                 #pragma unroll
+                 for (int r = 0; r < R; ++r)
+                     #pragma unroll

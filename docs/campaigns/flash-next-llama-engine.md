@@ -1254,6 +1254,17 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
   quantizations (one before each quantized matvec), the f16 hyper-connection
   matvecs with their scale_act, and the norms; each fusion is worth ~0.4 % of
   decode a hundred launches.
+- **The GDN stage after vllm-xpu-kernels (patch 0050 and on).** Intel's
+  Xe2 GDN for speculative decode is two fused stages a layer (`code`,
+  `csrc/xpu/gdn_attn/gdn_attn_interface.cpp`): the conv stage (conv1d,
+  SiLU, the q/k l2-norm, the conv cache advanced by the accepted count) and
+  the delta stage (the a/b gating inside, the state updated in place). Built
+  so far: 0050, the snapshots written into the cache by the kernel (README
+  0050: Flash-Next +1.2-1.9 %, the dense agent +5.1-5.3 %, the coder +1.8-2.0
+  %, bit-identical). Next: the gating into the GDN kernel (4 launches a
+  layer), the conv state's concat and snapshots into the conv kernel; the
+  rollback by an accepted-count offset instead of K snapshots is the larger
+  change, priced separately.
 - **The input copies.** The OpenCL backend has no events and no async copy,
   so the scheduler synchronizes the queue and writes blocking for each of a
   verify's 34 inputs (positions, masks, indices): 17 us a pair on the B60

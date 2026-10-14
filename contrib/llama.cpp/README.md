@@ -2999,3 +2999,44 @@ Four changes, three of them llama.cpp CUDA's fusions (`code`, `ggml-cuda.cu`
   against the existing fusions; no defect. It flagged the fast-math
   regrouping as compiler-contingent, which the per-fusion md5 test then
   confirmed and the opaque zero fixed.
+
+## 0050-gdn-snapshots-in-cache.patch
+
+The gated delta net's K rollback snapshots go straight into the recurrent
+cache. In the rollback path (`delta-net-base.cpp` `build_recurrent_attn`, K =
+n_rs_seq + 1 > 1) the op wrote the attention output and K state snapshots
+into its own output, and a `ggml_cpy` then moved the snapshots into
+`ssm_states_all`: one more kernel and a copy of K x 128 x 128 x heads floats
+per GDN layer every verify. vllm-xpu-kernels' delta stage updates the state
+in place (`code`, `csrc/xpu/gdn_attn/gated_delta_rule.hpp`); here the Intel
+GDN kernels (`gated_delta_net_intel.cl`, `_tg` and `_pp`) take the
+snapshots' destination (buffer, offset, slot stride). When the GDN node's
+next real node is that `CPY`, with the shapes and strides the graph builder
+gives it, they write into the cache rows and the `CPY` is skipped.
+`GGML_OPENCL_FUSE_0050=0` keeps the copy; `GGML_OPENCL_FUSE_0050_RED=1`
+writes every slot over slot 0 (the red case).
+
+- **Measured** (`measured-here`, 2026-10-14, the units' flags, one binary,
+  the switch off in the other arm, A B A B, three 300-token answers):
+
+  | service | off | on |
+  |---|---|---|
+  | dense agent (B60, MTP 5: K = 6) | 37.3 / 39.9 / 37.7 t/s | 39.2-39.3 / 42.0 / 39.6 (+5.1-5.3 %) |
+  | coder (A770, MTP 4: K = 5) | 49.7 / 46.2-46.3 / 42.9 | 50.7 / 47.1 / 43.6-43.7 (+1.8-2.0 %) |
+  | Flash-Next (B60, MTP 2: K = 3) | 32.2 / 37.5-37.6 / 35.9-36.0 | 32.6-32.7 / 38.2 / 36.6-36.7 (+1.2-1.9 %) |
+
+  - Every answer's md5 and every draft-acceptance figure equal in both
+    arms; the capital and the needle right. The red case changed all three
+    Flash-Next texts: the rollback reads the slots the kernel writes.
+  - test-backend-ops GATED_DELTA_NET 42/42 on both cards, on and off (single
+    ops: the fused pattern is not in them, so the suite checks the unfused
+    path with the new arguments; the served md5s check the fused one).
+  - The scheduler's host time a graph does not move: the saving is the copy
+    on the card.
+- **Reviewed** before the push by a second model: the unfused addresses
+  identical to the old ones, K = 1 untouched, the generic kernel not given the
+  new arguments, the fusion's shape and stride checks against
+  `delta-net-base.cpp`'s views, the slot count, that nothing else reads the
+  snapshot region, the node order and the scheduler's splits. No defect. Its
+  notes, applied after the measured build: the unused `snap_size` dropped, and
+  the `CPY`'s compute flag required, as the graph loop does.
