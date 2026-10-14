@@ -486,6 +486,30 @@ arms of the same configuration).
   chunk measured (+6-8 % decode for 1.5 GiB) without the prefill's loss, and
   a larger chunk could take the borrowed memory during a prompt (fewer bank
   passes). Not built; the price is the table above.
+
+  What decode needs of it (`measured-here`, the unit's flags loaded with
+  `--prefill-chunk N`, the scheduler's reservation from the load log; the
+  ubatch is the chunk with the expert cache, the draft context's capped at
+  512):
+
+  | chunk | main context | draft context |
+  |---|---|---|
+  | 4 (a 3-draft verify) | 93 MiB | 84 MiB |
+  | 16 | 99 | 90 |
+  | 64 | 122 | 112 |
+  | 256 | 406 | 394 |
+  | 2,048 (the unit) | 3,048 | 770 |
+
+  About 3.5 GiB of the reservation serves prompts of 256 tokens and more
+  only; as slots it is ~2,700 more (8,191 -> ~10,900), about the 32K arm's
+  hit rate (39.0 / 43.9 t/s there). The design facts: the slots are three
+  tensors a layer in one buffer (`llama-expert-cache.cpp`), so a contiguous
+  loan is whole layers' slots (~240 MB a layer); a prompt ubatch of 256
+  tokens and more streams each bank tensor whole (0043/0044), so a lent
+  layer costs a long prefill little; the refill after a prompt is ~3.5 GiB
+  over the link, ~0.25 s. The hazard: a graph that writes into the lent
+  range while it holds experts corrupts weights without changing the
+  answer's look; the loan needs a per-graph bound check.
 - **The gap between kernels** (a chain of 4096-wide ADDs, test-backend-ops
   perf): 3.03 us a kernel. compute-runtime debug keys: skipping the walker's
   post-sync 2.91 us, optimized in-order barriers, L3 prefetch, relaxed
