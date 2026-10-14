@@ -2941,3 +2941,61 @@ closing "FAIL"); each is two lower than first written (153 -> 151, 6 -> 4,
 the red cases 1,068 -> 1,066, 72 -> 70, 97 -> 95). 0045's red case was
 counted the same way: 92, not 94. The passed/total pairs came from the
 summary line and stand.
+
+## 0049-decode-launches.patch
+
+Fewer kernels in a decode graph, the same bits. A Flash-Next verify graph
+launched ~4,150 kernels (`measured-here`, the 0.7.5 profile: 58.4 ms of
+kernel time); at ~3 us an enqueue that is ~12 ms of host time a graph.
+Four changes, three of them llama.cpp CUDA's fusions (`code`, `ggml-cuda.cu`
+`ggml_cuda_can_fuse`):
+
+- **The rollback snapshots without a `cont`** (`src/models/qwen4exp.cpp`
+  `build_conv_state_at`): each of the K = n_rs_seq + 1 conv-state snapshots
+  was `ggml_cpy(ggml_cont(tail), dst)`, two kernels; now `ggml_cpy(tail,
+  dst)` as `delta-net-base.cpp` `build_conv_state` does. A pure move: the
+  same bytes.
+- **rms_norm + scale** (bias 0; the GDN q/k l2-norm, `build_gdn_l2_norm`):
+  `kernel_rms_norm` takes the scale. Under `-cl-fast-relaxed-math` IGC
+  regrouped `(x * scale) * post` to `x * (scale * post)`, one rounding fewer:
+  KL stayed inside the bar but the texts changed and MTP's draft acceptance
+  fell (the coder 40.7 -> 36.4 % on one answer). The intermediate now passes
+  through an XOR with a kernel argument that is always 0, which keeps the two
+  roundings: the same bits as the two ops.
+- **ssm_conv + silu**: the conv kernels apply `kernel_silu`'s expression.
+- **sigmoid + mul** of the same shape (the GDN z gate; CUDA's
+  `ggml_cuda_op_unary_mul` conditions): one kernel.
+- **Switches:** `GGML_OPENCL_FUSE_0049=<mask>` (1 rms_norm + scale, 2
+  ssm_conv + silu, 4 sigmoid + mul; 0 off; `GGML_OPENCL_FUSE_RMS_SCALE=0` is
+  the same as 0). `GGML_OPENCL_FUSE_0049_RED=1` drops the folded scale: the
+  red case.
+- **Measured** (`measured-here`, 2026-10-14, the units' flags, A B A B,
+  three 300-token answers):
+  - **Bit-identical:** every answer's md5 and every draft-acceptance figure
+    equal to the unfused arm (Flash-Next against the 0.7.8 package, the agent
+    and the coder against the mask 0), the capital and the needle right.
+  - Flash-Next (B60): the verify graph 12,346-12,407 -> 11,666-11,678 us of
+    scheduler time; decode 32.0-32.1 / 37.3-37.4 / 35.7-35.8 -> 32.2-32.3 /
+    37.5-37.6 / 36.0-36.1 t/s.
+  - The dense agent (B60): the verify graph 8,640-8,662 -> 8,139-8,143 us;
+    decode 37.2 / 39.8 / 37.5-37.6 -> 37.3 / 39.9 / 37.7.
+  - The coder (A770): the verify graph 6,695-6,699 -> 6,380-6,422 us; decode
+    49.4 / 45.9 / 42.5 -> 49.8 / 46.4 / 43.0.
+  - Per fusion on the coder before the fix: masks 2 and 4 already gave the
+    unfused bits; mask 1 alone changed them.
+  - KL (the first build, the regrouped norm; 16 x 512 against the
+    references): Flash-Next 0.293942 / 87.18 % against 0.292021 / 87.40 % at
+    512 rows a call, 0.294093 against 0.294000 at 32; the dense 27B 0.005650
+    / 97.33 % against 0.005652 / 97.48 %; the coder 0.026801 / 92.45 %
+    against 0.026908 / 92.40 %. The final build is bit-identical to the
+    unfused path, so these bound it from above.
+  - test-backend-ops (the full suite, the B60): 11,143 of 11,294 with the
+    fusions on and off, the same 151 failing cases.
+  - The red case crashed the server on its first request (the GDN state
+    blows up without the q/k scale): the fused path runs.
+- **Reviewed** before the push by a second model (the first form): the cpy
+  without the cont against the OpenCL copy kernels and the CPU, the fusion
+  checks (single use, shapes, contiguity), argument indices, the order
+  against the existing fusions; no defect. It flagged the fast-math
+  regrouping as compiler-contingent, which the per-fusion md5 test then
+  confirmed and the opaque zero fixed.

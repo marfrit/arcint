@@ -1242,6 +1242,18 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
   0.7.4 package 30.5-31.8 / 33.8-35.7 / 32.6-34.0 t/s on the three answers;
   with the lazy table and 0042 33.1 / 36.9-37.0 / 35.2-35.4. Strata on this
   card: 37.2-37.8 (stage 3, its long-answer run).
+- **The kernel count (2026-10-14, patch 0049, README 0049):** the 0.7.5
+  profile's verify graph: ~4,150 launches, 58.4 ms of kernels; the small ones
+  dominate the count (quantize 284, rms_norm_mul 202, state copies 274,
+  hc_pre/post 202, scale_act 210 a graph). Built: the rollback snapshots
+  without a cont, and llama.cpp CUDA's rms_norm+scale, ssm_conv+silu and
+  sigmoid+mul fusions, bit-identical (an opaque zero keeps the fused norm's
+  two roundings; regrouped, it passed KL but cut draft acceptance). The
+  verify graph's scheduler time 12.35-12.41 -> 11.67-11.68 ms; decode +0.5 to
+  +1.1 %, the same text. What remains of the count: the activation
+  quantizations (one before each quantized matvec), the f16 hyper-connection
+  matvecs with their scale_act, and the norms; each fusion is worth ~0.4 % of
+  decode a hundred launches.
 - **The input copies.** The OpenCL backend has no events and no async copy,
   so the scheduler synchronizes the queue and writes blocking for each of a
   verify's 34 inputs (positions, masks, indices): 17 us a pair on the B60
