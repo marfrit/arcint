@@ -315,6 +315,15 @@ survive until they are used. One tile ahead stays.
        pairs lose 10-12 ms every time (halves at 56: 69.3 ms, ~1 %, not
        taken). The cause is unmeasured. Correct (the pair-swap red case
        fails 92), reverted.
+   - **The grid on the A770** (`measured-here`, 2026-10-14, the 0045 test
+     build, 65,536 keys, causal, 24 heads, two runs, the 16-sub-group kernel
+     at 64 rows a work-group): the time is the number of waves of 64
+     work-groups (32 Xe cores x 2) times ~52-58 ms. 96 work-groups take 103
+     ms (1.5 waves), 144 take 158, 192 take 166, 288 take 273, 480 take 461
+     (f16; q8_0:q4_0 the same shape at 82-586 ms). The coder (16 heads,
+     `measured-here` from its GGUF) at a 512-row ubatch makes 128
+     work-groups, two full waves: 0045's key split would gain nothing there.
+     Only a prompt's short last ubatch runs a part-empty wave.
    - **Next on the A770:**
      - V's transposing stores (~12 ms of 70): the dword-pair form lost at
        every stride (above);
