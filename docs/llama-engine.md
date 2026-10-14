@@ -217,6 +217,17 @@ nats.
 GEMM gathers its routed bank experts. 77 tokens 1.84 -> 1.11 s, 173 tokens
 1.83 -> 1.54; 269 and up unchanged; the same tokens.
 
+**Decode since 0.7.9** (`contrib/llama.cpp` 0049-0052, `measured-here`):
+fused decode launches (0049), the delta net's rollback snapshots written
+into the recurrent cache (0050: the dense agent +5.1-5.3 %) and its gating
+in the kernel (0051), all with the same text. `--llama-reserve-cells N`
+(0052) reserves the compute buffers for N cache cells instead of the whole
+context and cuts deeper prompt chunks to fit: Flash-Next at 131,072 tokens
+with N = 20,480 and 13,400 MiB of expert slots decodes 38.4 / 43.0 t/s
+against 34.8 / 38.0 (3 drafts with the stop at 0.5, Strata's long
+request), the 20k prefill unchanged, a 72k prompt 128.7 ->
+173.0 s.
+
 **Inputs since 0.7.8** (`contrib/llama.cpp` 0047, `measured-here`, B60, the configuration
 above): a
 graph's inputs are staged in a USM host ring and the scheduler waits once a

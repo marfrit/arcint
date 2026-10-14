@@ -1,0 +1,185 @@
+diff --git a/include/llama.h b/include/llama.h
+index c9b9371..9fbad1f 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -437,6 +437,11 @@ extern "C" {
+         // a source/target/parent context
+         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
+         struct llama_context * ctx_other;
++
++        // the cache cells the compute buffers are reserved for (0 = the whole cache). With a cap, a
++        // batch's ubatches are cut so that ubatch tokens x cells stay within n_ubatch x n_kv_reserve:
++        // a long context does not reserve a full-context prompt's buffers for the whole session
++        uint32_t n_kv_reserve;
+     };
+ 
+     struct llama_model_tensor_override {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 761fc59..e8b4196 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -250,6 +250,7 @@ llama_context::llama_context(
+     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
+ 
+     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
++    cparams.n_kv_reserve = params.n_kv_reserve == 0 ? 0 : GGML_PAD(params.n_kv_reserve, 256);
+ 
+     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
+     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
+@@ -616,6 +617,13 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
+     return (int) users.size();
+ }
+ 
++// the reservation's cell cap for the memory's full context (llama_kv_reserve_cap), restored on exit
++struct llama_kv_reserve_scope {
++    uint32_t prev;
++    explicit llama_kv_reserve_scope(uint32_t cap) : prev(llama_kv_reserve_cap) { llama_kv_reserve_cap = cap; }
++    ~llama_kv_reserve_scope() { llama_kv_reserve_cap = prev; }
++};
++
+ void llama_context::sched_reserve() {
+     if (!sched_need_reserve) {
+         return;
+@@ -647,7 +655,11 @@ void llama_context::sched_reserve() {
+     llama_memory_context_ptr mctx;
+     if (memory) {
+         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
++        llama_kv_reserve_scope cap(cparams.n_kv_reserve);
+         mctx = memory->init_full();
++        if (cparams.n_kv_reserve > 0) {
++            LLAMA_LOG_INFO("%s: compute buffers reserved for %u cache cells (n_kv_reserve)\n", __func__, cparams.n_kv_reserve);
++        }
+         if (!mctx) {
+             throw std::runtime_error("failed to initialize memory module");
+         }
+@@ -889,6 +901,7 @@ bool llama_context::memory_update(bool optimize) {
+ 
+     // if the memory module did any computation, we have to reserve a new worst-case graph
+     {
++        llama_kv_reserve_scope cap(cparams.n_kv_reserve);
+         const auto mctx = memory->init_full();
+         if (!mctx) {
+             throw std::runtime_error("failed to initialize memory context");
+@@ -1854,8 +1867,31 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+ 
+     llama_memory_context_ptr mctx;
+ 
++    // the compute buffers hold n_ubatch x n_kv_reserve token-cells: a batch that ends
++    // deeper in the cache takes smaller ubatches (the batch's last position stands
++    // for the cells its graphs reach)
++    uint32_t n_ubatch_eff = cparams.n_ubatch;
++    if (cparams.n_kv_reserve > 0) {
++        const llama_batch & b = balloc->get_batch();
++        llama_pos p_end = 0;
++        for (int32_t i = 0; i < b.n_tokens; ++i) {
++            p_end = std::max(p_end, b.pos[i] + 1);
++        }
++        const uint64_t cells  = GGML_PAD((uint64_t) std::max<llama_pos>(p_end, 1), 256);
++        const uint64_t budget = (uint64_t) cparams.n_ubatch * cparams.n_kv_reserve;
++        // never below a split's indivisible tail: every sequence's last n_rs_seq + 1 tokens
++        // in one ubatch (split_equal's n_keep_tail), so a small cap cannot abort the split
++        const uint64_t floor_u = std::min<uint64_t>(cparams.n_ubatch, (uint64_t) cparams.n_seq_max * (cparams.n_rs_seq + 1) + 1);
++        n_ubatch_eff = (uint32_t) std::max<uint64_t>(floor_u, std::min<uint64_t>(cparams.n_ubatch, budget / cells));
++        static const bool log_cut = getenv("LLAMA_KV_RESERVE_LOG") != nullptr;
++        if (log_cut && n_ubatch_eff < cparams.n_ubatch && (uint32_t) b.n_tokens > n_ubatch_eff) {
++            LLAMA_LOG_INFO("%s: %d tokens to position %d: ubatches of %u (n_kv_reserve %u)\n", __func__,
++                           b.n_tokens, p_end, n_ubatch_eff, cparams.n_kv_reserve);
++        }
++    }
++
+     while (true) {
+-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
++        mctx = memory->init_batch(*balloc, n_ubatch_eff, output_all);
+         if (!mctx) {
+             return -2;
+         }
+@@ -3851,6 +3887,7 @@ llama_context_params llama_context_default_params() {
+         /*.sampler                     =*/ nullptr,
+         /*.n_sampler                   =*/ 0,
+         /*.ctx_other                   =*/ nullptr,
++        /*.n_kv_reserve                =*/ 0,
+     };
+ 
+     return result;
+@@ -4183,6 +4220,7 @@ struct ggml_cgraph * llama_graph_reserve(
+     auto memory = ctx->get_memory();
+     llama_memory_context_ptr mctx;
+     if (memory) {
++        llama_kv_reserve_scope cap(ctx->get_cparams().n_kv_reserve);
+         mctx = memory->init_full();
+     }
+     return ctx->graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 004fec5..f91fc1d 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -12,6 +12,7 @@ struct llama_cparams {
+     uint32_t n_ctx_seq;       // context for a single sequence
+     uint32_t n_batch;
+     uint32_t n_ubatch;
++    uint32_t n_kv_reserve;    // the cells the compute buffers are reserved for, 0 = all (llama_context_params)
+     uint32_t n_seq_max;
+     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
+     uint32_t n_outputs_max;   // max outputs supported by the context
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 897b4e9..6e7adfe 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2993,9 +2993,15 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
+ 
+ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
+ 
++thread_local uint32_t llama_kv_reserve_cap = 0;
++
+ llama_kv_cache_context::llama_kv_cache_context(
+         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
+     n_kv = kv->get_size();
++    // a reservation for fewer cells than the cache holds (llama_context_params::n_kv_reserve)
++    if (llama_kv_reserve_cap > 0 && llama_kv_reserve_cap < n_kv) {
++        n_kv = llama_kv_reserve_cap;
++    }
+ 
+     const uint32_t n_stream = kv->get_n_stream();
+ 
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index f514041..28421b5 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -510,3 +510,7 @@ private:
+     // set_seq_windows: the parts of a ubatch of several windowed sequences
+     std::vector<llama_kv_cache::win_part> win_parts;
+ };
++
++// the full-cache context's cell count while a llama_context reserves its compute
++// buffers (llama_context_params::n_kv_reserve), 0 outside a reservation
++extern thread_local uint32_t llama_kv_reserve_cap;
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index 0bfba3c..503709f 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -526,7 +526,9 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
+         mem->kpool_layout_update();
+         auto st = kpool_build_sizes();
+         const auto * idx = mem->get_mem_idx();
+-        const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max();
++        // a reservation for fewer cells (llama_context_params::n_kv_reserve) reserves their pools only
++        const uint32_t cells = llama_kv_reserve_cap > 0 ? std::min<uint32_t>(idx->get_size(), llama_kv_reserve_cap) : idx->get_size();
++        const uint64_t n_pool_max = uint64_t(cells / mem->get_kpool()) * idx->get_n_seq_max();
+         GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
+         st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
+         st.n_new   = st.n_pool_real;
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 353c84d..35e0c23 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -817,7 +817,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
+     ggml_tensor * kq = ggml_mul_mat(ctx0,
+             ggml_reshape_2d(ctx0, pooled, idx_dim, n_pool),
+             ggml_reshape_2d(ctx0, q, idx_dim, n_idx_h*n_tokens)); // [n_pool, n_idx_h*n_tokens]
+-    kq = ggml_relu(ctx0, ggml_reshape_3d(ctx0, kq, n_pool, n_idx_h, n_tokens));
++    // in place: the product's only reader, and a separate result is as large as the product
++    // (the pools x 4 heads x the ubatch's tokens in f32: 1 GiB at 131K cells and 2,048 tokens)
++    kq = ggml_relu_inplace(ctx0, ggml_reshape_3d(ctx0, kq, n_pool, n_idx_h, n_tokens));
+ 
+     ggml_tensor * score = nullptr;
+     for (int64_t h = 0; h < n_idx_h; ++h) {

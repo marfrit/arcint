@@ -2941,3 +2941,219 @@ closing "FAIL"); each is two lower than first written (153 -> 151, 6 -> 4,
 the red cases 1,068 -> 1,066, 72 -> 70, 97 -> 95). 0045's red case was
 counted the same way: 92, not 94. The passed/total pairs came from the
 summary line and stand.
+
+## 0049-decode-launches.patch
+
+Fewer kernels in a decode graph, the same bits. A Flash-Next verify graph
+launched ~4,150 kernels (`measured-here`, the 0.7.5 profile: 58.4 ms of
+kernel time); at ~3 us an enqueue that is ~12 ms of host time a graph.
+Four changes, three of them llama.cpp CUDA's fusions (`code`, `ggml-cuda.cu`
+`ggml_cuda_can_fuse`):
+
+- **The rollback snapshots without a `cont`** (`src/models/qwen4exp.cpp`
+  `build_conv_state_at`): each of the K = n_rs_seq + 1 conv-state snapshots
+  was `ggml_cpy(ggml_cont(tail), dst)`, two kernels; now `ggml_cpy(tail,
+  dst)` as `delta-net-base.cpp` `build_conv_state` does. A pure move: the
+  same bytes.
+- **rms_norm + scale** (bias 0; the GDN q/k l2-norm, `build_gdn_l2_norm`):
+  `kernel_rms_norm` takes the scale. Under `-cl-fast-relaxed-math` IGC
+  regrouped `(x * scale) * post` to `x * (scale * post)`, one rounding fewer:
+  KL stayed inside the bar but the texts changed and MTP's draft acceptance
+  fell (the coder 40.7 -> 36.4 % on one answer). The intermediate now passes
+  through an XOR with a kernel argument that is always 0, which keeps the two
+  roundings: the same bits as the two ops.
+- **ssm_conv + silu**: the conv kernels apply `kernel_silu`'s expression.
+- **sigmoid + mul** of the same shape (the GDN z gate; CUDA's
+  `ggml_cuda_op_unary_mul` conditions): one kernel.
+- **Switches:** `GGML_OPENCL_FUSE_0049=<mask>` (1 rms_norm + scale, 2
+  ssm_conv + silu, 4 sigmoid + mul; 0 off; `GGML_OPENCL_FUSE_RMS_SCALE=0` is
+  the same as 0). `GGML_OPENCL_FUSE_0049_RED=1` drops the folded scale: the
+  red case.
+- **Measured** (`measured-here`, 2026-10-14, the units' flags, A B A B,
+  three 300-token answers):
+  - **Bit-identical:** every answer's md5 and every draft-acceptance figure
+    equal to the unfused arm (Flash-Next against the 0.7.8 package, the agent
+    and the coder against the mask 0), the capital and the needle right.
+  - Flash-Next (B60): the verify graph 12,346-12,407 -> 11,666-11,678 us of
+    scheduler time; decode 32.0-32.1 / 37.3-37.4 / 35.7-35.8 -> 32.2-32.3 /
+    37.5-37.6 / 36.0-36.1 t/s.
+  - The dense agent (B60): the verify graph 8,640-8,662 -> 8,139-8,143 us;
+    decode 37.2 / 39.8 / 37.5-37.6 -> 37.3 / 39.9 / 37.7.
+  - The coder (A770): the verify graph 6,695-6,699 -> 6,380-6,422 us; decode
+    49.4 / 45.9 / 42.5 -> 49.8 / 46.4 / 43.0.
+  - Per fusion on the coder before the fix: masks 2 and 4 already gave the
+    unfused bits; mask 1 alone changed them.
+  - KL (the first build, the regrouped norm; 16 x 512 against the
+    references): Flash-Next 0.293942 / 87.18 % against 0.292021 / 87.40 % at
+    512 rows a call, 0.294093 against 0.294000 at 32; the dense 27B 0.005650
+    / 97.33 % against 0.005652 / 97.48 %; the coder 0.026801 / 92.45 %
+    against 0.026908 / 92.40 %. The final build is bit-identical to the
+    unfused path, so these bound it from above.
+  - test-backend-ops (the full suite, the B60): 11,143 of 11,294 with the
+    fusions on and off, the same 151 failing cases.
+  - The red case crashed the server on its first request (the GDN state
+    blows up without the q/k scale): the fused path runs.
+- **Reviewed** before the push by a second model (the first form): the cpy
+  without the cont against the OpenCL copy kernels and the CPU, the fusion
+  checks (single use, shapes, contiguity), argument indices, the order
+  against the existing fusions; no defect. It flagged the fast-math
+  regrouping as compiler-contingent, which the per-fusion md5 test then
+  confirmed and the opaque zero fixed.
+
+## 0050-gdn-snapshots-in-cache.patch
+
+The gated delta net's K rollback snapshots go straight into the recurrent
+cache. In the rollback path (`delta-net-base.cpp` `build_recurrent_attn`, K =
+n_rs_seq + 1 > 1) the op wrote the attention output and K state snapshots
+into its own output, and a `ggml_cpy` then moved the snapshots into
+`ssm_states_all`: one more kernel and a copy of K x 128 x 128 x heads floats
+per GDN layer every verify. vllm-xpu-kernels' delta stage updates the state
+in place (`code`, `csrc/xpu/gdn_attn/gated_delta_rule.hpp`); here the Intel
+GDN kernels (`gated_delta_net_intel.cl`, `_tg` and `_pp`) take the
+snapshots' destination (buffer, offset, slot stride). When the GDN node's
+next real node is that `CPY`, with the shapes and strides the graph builder
+gives it, they write into the cache rows and the `CPY` is skipped.
+`GGML_OPENCL_FUSE_0050=0` keeps the copy; `GGML_OPENCL_FUSE_0050_RED=1`
+writes every slot over slot 0 (the red case).
+
+- **Measured** (`measured-here`, 2026-10-14, the units' flags, one binary,
+  the switch off in the other arm, A B A B, three 300-token answers):
+
+  | service | off | on |
+  |---|---|---|
+  | dense agent (B60, MTP 5: K = 6) | 37.3 / 39.9 / 37.7 t/s | 39.2-39.3 / 42.0 / 39.6 (+5.1-5.3 %) |
+  | coder (A770, MTP 4: K = 5) | 49.7 / 46.2-46.3 / 42.9 | 50.7 / 47.1 / 43.6-43.7 (+1.8-2.0 %) |
+  | Flash-Next (B60, MTP 2: K = 3) | 32.2 / 37.5-37.6 / 35.9-36.0 | 32.6-32.7 / 38.2 / 36.6-36.7 (+1.2-1.9 %) |
+
+  - Every answer's md5 and every draft-acceptance figure equal in both
+    arms; the capital and the needle right. The red case changed all three
+    Flash-Next texts: the rollback reads the slots the kernel writes.
+  - test-backend-ops GATED_DELTA_NET 42/42 on both cards, on and off (single
+    ops: the fused pattern is not in them, so the suite checks the unfused
+    path with the new arguments; the served md5s check the fused one).
+  - The scheduler's host time a graph does not move: the saving is the copy
+    on the card.
+- **Reviewed** before the push by a second model: the unfused addresses
+  identical to the old ones, K = 1 untouched, the generic kernel not given the
+  new arguments, the fusion's shape and stride checks against
+  `delta-net-base.cpp`'s views, the slot count, that nothing else reads the
+  snapshot region, the node order and the scheduler's splits. No defect. Its
+  notes, applied after the measured build: the unused `snap_size` dropped, and
+  the `CPY`'s compute flag required, as the graph loop does.
+
+## 0051-gdn-gating.patch
+
+The gated delta net's gating computed inside the Intel GDN kernels.
+`build_recurrent_attn`'s callers form the gate as
+`softplus(alpha + dt_bias) * A` and beta as `sigmoid(b)`: four small ops a
+layer ahead of the GDN. vllm-xpu-kernels' delta stage takes a and b raw with
+A_log and dt_bias and gates inside (`code`,
+`csrc/xpu/gdn_attn/gated_delta_rule.hpp`). Here the OpenCL backend, before
+each graph, finds the chain in a window before each GDN node (every
+intermediate used once), skips the ADD, SOFTPLUS, MUL and SIGMOID, and gives
+`gated_delta_net_intel.cl` the raw projections with dt and A a head. The
+kernel repeats the separate kernels' expressions with an always-0 XOR
+between the steps, so the roundings are the separate kernels'.
+
+The kernel reads alpha and b when the GDN runs, later than the allocator
+keeps them: it frees alpha after the ADD. So `delta-net-base.cpp`
+(`gdn_keep_gating_inputs`) attaches them as extra sources of the GDN node
+(`src[6]` alpha, `src[7]` b), which keeps them alive; the op's meaning does
+not change and the CPU ignores them. The backend folds only when those
+sources are the chain's raw inputs, and refuses a fold if any computed node
+between the chain and the GDN writes over their bytes.
+
+`GGML_OPENCL_FUSE_0050` bit 2 is the switch (default 3: 0050 and 0051);
+`GGML_OPENCL_FUSE_0051_PART` folds the gate (1), beta (2) or both (3);
+`GGML_OPENCL_FUSE_0051_RED=1` passes A in place of dt (the red case).
+
+- **Measured** (`measured-here`, 2026-10-14, the units' flags, one binary,
+  the bit off in the other arm, A B A B, three 300-token answers):
+
+  | service | off | on |
+  |---|---|---|
+  | dense agent (B60, 48 GDN layers) | 39.2 / 42.0 / 39.6-39.7 t/s | 39.4 / 42.1 / 39.7-39.8 (+0.3 %) |
+  | coder (A770, 30 GDN layers) | 50.7 / 47.0-47.1 / 43.6-43.7 | 51.2 / 47.6 / 44.1-44.2 (+0.9-1.2 %) |
+  | Flash-Next (B60, 36 GDN layers) | 32.7-32.8 / 38.2-38.3 / 36.6-36.7 | 32.7-32.8 / 38.3 / 36.6-36.7 (neutral) |
+
+  - Every answer's md5 equal in both arms on all three; every GDN node
+    folded (36/36, 48/48, 30/30); the red case changed all three Flash-Next
+    texts and lost the needle.
+  - Flash-Next's verify graph spends 0.3-0.4 ms less enqueueing (11.5-11.6
+    -> 11.1-11.4 ms of host time), but its ~63 ms round is not host-bound.
+  - test-backend-ops GATED_DELTA_NET 42/42 on both cards (single ops: the
+    unfused path with the new arguments). The four kernel shapes compile
+    offline with no spill and no recompile; the gating adds 6-20 % to the
+    kernels' instruction count.
+- **Not bit-identical at first, and why.** The first build's helpers sat
+  inside `#ifdef GDN_PP`: the generation program did not compile and the
+  backend fell back to `gated_delta_net.cl` silently (its "42/42" and md5s
+  measured the generic kernel). Fixed, the fold changed every md5 while the
+  answers stayed right. A switch per part showed beta's fold bit-identical
+  and the gate's not; the ISA of the fused gate matched the separate kernels
+  instruction for instruction. An overlap check then refused 36 of 36 folds:
+  alpha's memory was reused between the ADD and the GDN. The extra sources
+  fixed it. A map over the whole graph each compute, in the first pre-pass,
+  cost about what the launches saved; it is a window search now.
+- **Reviewed** twice by a second model. The first review read the version
+  before the liveness fix: its one finding, the reshaped gate's own use
+  count, is checked now. The second read the final diff, including every
+  place in ggml, the allocator, the scheduler and the other backends that
+  iterates a node's sources. It found no defect, and made two notes. A
+  model whose beta is `reshape(sigmoid(b))` (qwen3next) folds nothing, as
+  the match requires the sigmoid first; none of the served models builds it
+  that way. And upstream's `graph_optimize` hook with `add_alloc_dep`, which
+  CUDA uses, would keep alpha and b alive without touching the graph
+  builder: the cleaner route at a rebase.
+
+## 0052-reserve-cells.patch
+
+The compute buffers sized for the prompts that need them, not for a full
+cache. The scheduler reserves for a prompt ubatch at a completely full
+cache: 2,048 tokens (the expert cache's whole chunk) against 131,072 cells
+for Flash-Next, 3,048 MiB on the B60 plus 770 for the MTP draft context,
+for the whole session. A listing of the reservation's largest tensors
+(`measured-here`) named the QSA indexer's head scores, pools x 4 heads x
+the ubatch's tokens in f32, 1,026 MiB, with a ReLU copy of the same size,
+and the selection mask, cells x tokens in f16.
+
+Two changes, the values unchanged:
+- The indexer's ReLU in place (`qwen4exp.cpp`): the product's only reader.
+  On its own, 3,048 -> 2,278 MiB and 770 -> 577.
+- `llama_context_params::n_kv_reserve` (arcint `--llama-reserve-cells N`):
+  the reservation sees min(cache, N) cells and their pools, and
+  `llama_context::decode` cuts a batch's ubatches so that tokens x cells
+  stays within n_ubatch x N (the batch's last position stands for the
+  cells). The MTP draft context gets the same budget over its own ubatch.
+  At 20,480 cells: 915 and 380 MiB. A prompt keeps whole 2,048-token
+  chunks to ~20k tokens; deeper chunks are cut (1,861 tokens at 22.5k
+  cells, 580 at 72k).
+
+- **Measured** (`measured-here`, 2026-10-14, B60, Flash-Next at 131,072
+  tokens, 3 drafts with the stop at 0.5, one binary; the capital, the 20k
+  needle, Strata's long request twice, a 72k-token needle):
+
+  | arm | slots | decode, first / second | 20k prefill | 72k prefill | peak VRAM |
+  |---|---|---|---|---|---|
+  | before | 8,191 (11,300 MiB) | 34.8 / 38.0 t/s | 657 t/s | 560 t/s (128.7 s) | 23.82 GiB |
+  | ReLU in place | 8,191 | 34.8 / 38.0 | 658 | 560 | 22.85 |
+  | ReLU, 11,850 MiB | 8,595 | 35.6 / 39.3 | 658 | 560 | 23.37 |
+  | ReLU, `--llama-reserve-cells 20480`, 13,400 MiB | 9,724 | 38.4 / 43.0 | 662 | 416 (173.0 s) | 23.35 |
+
+  Every arm: Paris, both needles, the same text (md5). The deep prompt's
+  cost is the bank streamed once per (smaller) ubatch.
+- **Not taken on the way:** a first build capped the cells but not the
+  indexer's pool count (reserved from the cache size): 3,048 -> 2,613 MiB
+  only, and an arm that spent the expected saving on slots ran 1.8 GiB
+  over the card (26.2 GB resident, a 24-token prompt in 7 s); stopped by
+  pid, the card recovered without a reboot.
+- **Reviewed** before the push by a second model: no defect that changes an
+  answer. Applied after the measured build: the cut ubatch never falls below
+  a split's rollback tail (n_seq_max x (n_rs_seq + 1) + 1 tokens), so a small
+  `--llama-reserve-cells` cannot abort `split_equal`. Its limits, recorded:
+  the budget bounds the tensors that grow with tokens x cells; those that
+  grow with cells alone (the re-pool after an early edit of a deep lane)
+  can grow the buffer once by ~100-150 MiB at 131K, and named lanes without
+  KV windows count cells by position, which undercounts them (growth back
+  toward the old reservation, not corruption). The Flash-Next unit runs
+  one lane.

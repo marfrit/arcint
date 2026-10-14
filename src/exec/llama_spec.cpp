@@ -328,7 +328,7 @@ class LlamaMtp final : public LlamaSpec {
 public:
     LlamaMtp(llama_model* model, llama_context* ctx_tgt, int n_draft, int n_seq, int n_batch, int n_ubatch,
              int threads, const std::string& gguf, const std::string& vocab, double min_p, ggml_type type_k,
-             ggml_type type_v, bool kv_unified, std::string& err)
+             ggml_type type_v, bool kv_unified, uint32_t n_kv_reserve, std::string& err)
         : ctx_tgt_(ctx_tgt), n_draft_(n_draft), min_p_(static_cast<float>(min_p)) {
         const int n_heads = llama_model_n_layer_nextn(model);
         if (n_heads <= 0) {
@@ -372,6 +372,8 @@ public:
         // fast (Flash-Next: 774 MiB of buffer at the target's 2,048, on the card
         // the expert slots compete for)
         cp.n_ubatch        = static_cast<uint32_t>(std::min(n_ubatch, 512));
+        // the target's budget of ubatch tokens x cells, over this context's smaller ubatch
+        cp.n_kv_reserve    = n_kv_reserve == 0 ? 0 : static_cast<uint32_t>((uint64_t) n_kv_reserve * n_ubatch / cp.n_ubatch);
         cp.n_seq_max       = static_cast<uint32_t>(n_seq);
         cp.n_rs_seq        = 0;
         cp.n_outputs_max_per_seq = 1;   // one drafted token a step
@@ -700,9 +702,9 @@ private:
 std::unique_ptr<LlamaSpec> make_llama_mtp(llama_model* model, llama_context* ctx_tgt, int n_draft, int n_seq,
                                           int n_batch, int n_ubatch, int threads, const std::string& gguf,
                                           const std::string& vocab, double min_p, ggml_type type_k, ggml_type type_v,
-                                          bool kv_unified, std::string& err) {
+                                          bool kv_unified, uint32_t n_kv_reserve, std::string& err) {
     auto s = std::make_unique<LlamaMtp>(model, ctx_tgt, n_draft, n_seq, n_batch, n_ubatch, threads, gguf, vocab,
-                                        min_p, type_k, type_v, kv_unified, err);
+                                        min_p, type_k, type_v, kv_unified, n_kv_reserve, err);
     if (!s->ok() || !err.empty()) return nullptr;
     if (s->head_rows() > 0) log::info("mtp", "draft head: %zu token rows", s->head_rows());
     return s;

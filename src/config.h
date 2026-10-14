@@ -41,6 +41,12 @@ struct Config {
     // probability under the MTP head is at least P, and a draft below P is
     // not verified (Strata's --spec-min-p); 0 drafts --llama-mtp tokens always
     double llama_mtp_min_p = 0.0;
+    // --llama-reserve-cells N: the compute buffers are reserved for a prompt
+    // ubatch at N cache cells instead of the whole context, and a prompt chunk
+    // deeper in the cache takes smaller ubatches to stay inside them (contrib
+    // llama.cpp 0052): the full-context reservation's VRAM goes to the expert
+    // slots. 0: reserve for the whole context
+    uint32_t llama_reserve_cells = 0;
     // --llama-kv K[:V]: the libllama engine's attention cache types, f16,
     // q8_0 or q8_0:q4_0 (V defaults to K). Quantized K/V run on the Intel
     // attention kernels of contrib/llama.cpp 0015.

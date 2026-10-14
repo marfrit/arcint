@@ -1,0 +1,335 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 1bc2b4d..f4c023d 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -704,6 +704,8 @@ struct ggml_backend_opencl_context {
+     bool disable_fusion;
+     bool fuse_mm_glu = true;                     // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
+     bool fuse_rms_add = true;                    // opt-out GGML_OPENCL_FUSE_RMS_ADD=0 (fused rms_norm*w + residual)
++    int  fuse_0049 = 7;                          // patch 0049's fusions, a bit each: 1 rms_norm + scale, 2 ssm_conv + silu,
++                                                 // 4 sigmoid + mul (GGML_OPENCL_FUSE_0049=<mask>; 0: off)
+     bool f16_mrow = true;                        // opt-out GGML_OPENCL_F16_MROW=0 (multi-row-per-WG f16 decode GEMV for attn proj + lm_head)
+     int  f16_mrow_rpt = 1;                       // GGML_OPENCL_F16_MROW_RPT={1,2,4,8,16} rows-per-subgroup register blocking
+ 
+@@ -1181,6 +1183,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_conv_2d_f32;
+     cl_kernel kernel_conv_2d_f16_f32;
+     cl_kernel kernel_ssm_conv_f32_f32, kernel_ssm_conv_f32_f32_4;
++    cl_kernel kernel_sigmoid_mul_f32 = nullptr;   // sigmoid(a) * b (patch 0049)
+     // [size_idx][kda][tgpp] where size_idx: 0=S_V=16, 1=32, 2=64, 3=128; kda: 0 or 1.
+     // tgpp 0 = TG variant (COLS_PER_LANE_GROUP=1), tgpp 1 = prefill variant (COLS_PER_LANE_GROUP=4).
+     cl_kernel kernel_gated_delta_net_f32[4][2][2] = {};
+@@ -3810,6 +3813,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+ 
+         CL_CHECK((backend_ctx->kernel_sigmoid_f32 = clCreateKernel(backend_ctx->program_sigmoid, "kernel_sigmoid_f32", &err), err));
+         CL_CHECK((backend_ctx->kernel_sigmoid_f16 = clCreateKernel(backend_ctx->program_sigmoid, "kernel_sigmoid_f16", &err), err));
++        backend_ctx->kernel_sigmoid_mul_f32 = clCreateKernel(backend_ctx->program_sigmoid, "kernel_sigmoid_mul_f32", &err);
++        if (err != CL_SUCCESS) backend_ctx->kernel_sigmoid_mul_f32 = nullptr;
+         GGML_LOG_CONT(".");
+     }
+ 
+@@ -8068,6 +8073,11 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
+     if (const char * env = getenv("GGML_OPENCL_FUSE_RMS_ADD")) {
+         backend_ctx->fuse_rms_add = atoi(env) != 0;
+     }
++    if (const char * env = getenv("GGML_OPENCL_FUSE_0049")) {
++        backend_ctx->fuse_0049 = atoi(env);
++    } else if (const char * env2 = getenv("GGML_OPENCL_FUSE_RMS_SCALE")) {   // the gate's first switch: 0 = all off
++        backend_ctx->fuse_0049 = atoi(env2) != 0 ? 7 : 0;
++    }
+     if (const char * env = getenv("GGML_OPENCL_F16_MROW")) {
+         backend_ctx->f16_mrow = atoi(env) != 0;
+     }
+@@ -9240,6 +9250,11 @@ inline bool use_q4k_tiled(const ggml_backend_opencl_context *backend_ctx, const
+ inline bool use_q4_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);
+ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);   // defined below
+ 
++// patch 0049's fused forms, defined with the ops below
++static void ggml_cl_rms_norm_impl(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst, float post, ggml_tensor * out);
++static void ggml_cl_ssm_conv_impl(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
++                                  int act, ggml_tensor * out);
++
+ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
+ 
+     // glu(mul_mat(Wg,x), mul_mat(Wu,x)) — the FFN gate/up GEMVs + GLU. This is a
+@@ -10032,6 +10047,69 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+             i++;
+             continue;
+         }
++        // sigmoid + mul of the same shape, as llama.cpp CUDA fuses it (ggml-cuda.cu,
++        // {UNARY, MUL} with SIGMOID; unary.cu ggml_cuda_op_unary_mul: same shape,
++        // contiguous): one kernel (patch 0049)
++        if (!backend_ctx->disable_fusion && (backend_ctx->fuse_0049 & 4) && backend_ctx->kernel_sigmoid_mul_f32 != nullptr &&
++            node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID &&
++            i + 1 < cgraph->n_nodes && cgraph->nodes[i+1]->op == GGML_OP_MUL &&
++            ggml_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL })) {
++            ggml_tensor * m = cgraph->nodes[i+1];
++            const ggml_tensor * other = m->src[0] == node ? m->src[1] : m->src[0];
++            if (node->type == GGML_TYPE_F32 && m->type == GGML_TYPE_F32 && other->type == GGML_TYPE_F32 &&
++                ggml_are_same_shape(node, other) && ggml_are_same_shape(node, m) &&
++                ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(other) && ggml_is_contiguous(m) &&
++                node->src[0]->type == GGML_TYPE_F32 && ggml_are_same_shape(node->src[0], node)) {
++                ggml_backend_opencl_context * bctx = (ggml_backend_opencl_context *) backend->context;
++                ggml_tensor_extra_cl * e0 = (ggml_tensor_extra_cl *) node->src[0]->extra;
++                ggml_tensor_extra_cl * e1 = (ggml_tensor_extra_cl *) other->extra;
++                ggml_tensor_extra_cl * ed = (ggml_tensor_extra_cl *) m->extra;
++                const cl_ulong o0 = e0->offset + node->src[0]->view_offs, o1 = e1->offset + other->view_offs, od = ed->offset + m->view_offs;
++                cl_kernel k = bctx->kernel_sigmoid_mul_f32;
++                CL_CHECK(clSetKernelArg(k, 0, sizeof(cl_mem),   &e0->data_device));
++                CL_CHECK(clSetKernelArg(k, 1, sizeof(cl_ulong), &o0));
++                CL_CHECK(clSetKernelArg(k, 2, sizeof(cl_mem),   &e1->data_device));
++                CL_CHECK(clSetKernelArg(k, 3, sizeof(cl_ulong), &o1));
++                CL_CHECK(clSetKernelArg(k, 4, sizeof(cl_mem),   &ed->data_device));
++                CL_CHECK(clSetKernelArg(k, 5, sizeof(cl_ulong), &od));
++                size_t gws[] = { (size_t) ggml_nelements(m), 1, 1 };
++                bctx->enqueue_ndrange_kernel(k, 1, gws, nullptr, m);
++                i++;
++                continue;
++            }
++        }
++        // ssm_conv + silu, as llama.cpp CUDA fuses it (ggml-cuda.cu, {SSM_CONV,
++        // UNARY} with SILU): the activation in the conv's store (patch 0049;
++        // GGML_OPENCL_FUSE_RMS_SCALE=0 turns this one off too)
++        if (!backend_ctx->disable_fusion && (backend_ctx->fuse_0049 & 2) && node->op == GGML_OP_SSM_CONV &&
++            i + 1 < cgraph->n_nodes && cgraph->nodes[i+1]->op == GGML_OP_UNARY &&
++            ggml_get_unary_op(cgraph->nodes[i+1]) == GGML_UNARY_OP_SILU &&
++            ggml_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY })) {
++            ggml_tensor * u = cgraph->nodes[i+1];
++            if (u->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 && ggml_are_same_shape(u, node) &&
++                ggml_is_contiguous(u) && ggml_is_contiguous(node)) {
++                ggml_cl_ssm_conv_impl(backend, node->src[0], node->src[1], node, 1, u);
++                i++;
++                continue;
++            }
++        }
++        // rms_norm + scale (bias 0), as llama.cpp CUDA fuses it (ggml-cuda.cu,
++        // {RMS_NORM, SCALE}): the scale applied by the norm's kernel (patch 0049;
++        // GGML_OPENCL_FUSE_RMS_SCALE=0: off)
++        if (!backend_ctx->disable_fusion && (backend_ctx->fuse_0049 & 1) &&
++            ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE })) {
++            ggml_tensor * sc = cgraph->nodes[i+1];
++            float s0, b0;
++            memcpy(&s0, ((int32_t *) sc->op_params) + 0, sizeof(float));
++            memcpy(&b0, ((int32_t *) sc->op_params) + 1, sizeof(float));
++            if (b0 == 0.0f && sc->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 && ggml_is_contiguous(sc) &&
++                ggml_are_same_shape(sc, node)) {
++                static const bool red = getenv("GGML_OPENCL_FUSE_0049_RED") != nullptr && atoi(getenv("GGML_OPENCL_FUSE_0049_RED")) != 0;
++                ggml_cl_rms_norm_impl(backend, node->src[0], node, red ? 1.0f : s0, sc);   // red: the folded scale dropped
++                i++;
++                continue;
++            }
++        }
+         // Fuse mul_mat(Wg,x) + mul_mat(Wu,x) + glu — fold the FFN's two decode
+         // GEMVs and the GLU into one dispatch. q4_K only (guarded below); the
+         // fused kernel uses the same accumulation/reduction order and the same
+@@ -16798,7 +16876,16 @@ static void ggml_cl_ssm_scan(ggml_backend_t backend, ggml_tensor * dst) {
+     backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+ }
+ 
++// ssm_conv, a following SILU folded in when act (its output `out`; patch 0049)
++static void ggml_cl_ssm_conv_impl(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
++                                  int act, ggml_tensor * out);
++
+ static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    ggml_cl_ssm_conv_impl(backend, src0, src1, dst, 0, dst);
++}
++
++static void ggml_cl_ssm_conv_impl(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
++                                  int act, ggml_tensor * out) {
+     GGML_ASSERT(src0);
+     GGML_ASSERT(src0->extra);
+     GGML_ASSERT(src1);
+@@ -16810,11 +16897,11 @@ static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, c
+ 
+     ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+     ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+-    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)out->extra;
+ 
+     cl_ulong offset0 = extra0->offset + src0->view_offs;
+     cl_ulong offset1 = extra1->offset + src1->view_offs;
+-    cl_ulong offsetd = extrad->offset + dst->view_offs;
++    cl_ulong offsetd = extrad->offset + out->view_offs;
+ 
+     int ne01 = src0->ne[1];
+     cl_ulong nb00 = src0->nb[0];
+@@ -16850,6 +16937,7 @@ static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, c
+     CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb0));
+     CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb1));
+     CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &nb2));
++    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &act));
+ 
+     size_t global_work_size[] = {(size_t)ne01, (size_t)ne1, (size_t)ne2};
+     size_t local_work_size[]  = {64, 1, 1};
+@@ -16859,7 +16947,7 @@ static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, c
+         local_work_size_ptr = nullptr;
+     }
+ 
+-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, out);
+ }
+ 
+ static void ggml_cl_gelu(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+@@ -17270,13 +17358,19 @@ static void ggml_cl_norm(ggml_backend_t backend, const ggml_tensor * src0, const
+     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+ }
+ 
++// rms_norm, a following scale (`post`, written to `out`) folded in when out != dst (patch 0049)
++static void ggml_cl_rms_norm_impl(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst, float post, ggml_tensor * out);
++
+ static void ggml_cl_rms_norm(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    UNUSED(src1);
++    ggml_cl_rms_norm_impl(backend, src0, dst, 1.0f, dst);
++}
++
++static void ggml_cl_rms_norm_impl(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst, float post, ggml_tensor * out) {
+     GGML_ASSERT(src0);
+     GGML_ASSERT(src0->extra);
+     GGML_ASSERT(dst);
+-    GGML_ASSERT(dst->extra);
+-
+-    UNUSED(src1);
++    GGML_ASSERT(out->extra);
+ 
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+ 
+@@ -17284,10 +17378,10 @@ static void ggml_cl_rms_norm(ggml_backend_t backend, const ggml_tensor * src0, c
+     //    (ggml_backend_opencl_device_context *)backend->device->context;
+ 
+     ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+-    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)out->extra;
+ 
+     cl_ulong offset0 = extra0->offset + src0->view_offs;
+-    cl_ulong offsetd = extrad->offset + dst->view_offs;
++    cl_ulong offsetd = extrad->offset + out->view_offs;
+ 
+     float eps;
+     memcpy(&eps, dst->op_params, sizeof(float));
+@@ -17341,8 +17435,11 @@ static void ggml_cl_rms_norm(ggml_backend_t backend, const ggml_tensor * src0, c
+     CL_CHECK(clSetKernelArg(kernel, 11, sizeof(float),     &eps));
+     // This is local memory - the size depends on subgroup size.
+     CL_CHECK(clSetKernelArg(kernel, 12, sizeof(float)*nth/sgs,  NULL));
++    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(float),     &post));
++    const cl_uint opaque = 0;
++    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_uint),   &opaque));
+ 
+-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, out);
+ }
+ 
+ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor) {
+diff --git a/ggml/src/ggml-opencl/kernels/rms_norm.cl b/ggml/src/ggml-opencl/kernels/rms_norm.cl
+index 9908562..47124be 100644
+--- a/ggml/src/ggml-opencl/kernels/rms_norm.cl
++++ b/ggml/src/ggml-opencl/kernels/rms_norm.cl
+@@ -40,7 +40,9 @@ kernel void kernel_rms_norm(
+         ulong nb02,
+         ulong nb03,
+         float eps,
+-        local float * sum // Note, the size depends on number of subgroups
++        local float * sum, // Note, the size depends on number of subgroups
++        float post,       // a following GGML_OP_SCALE folded in (1 when none, patch 0049)
++        uint  opaque      // 0 from the host: the compiler cannot regroup (x * scale) * post through it
+ ) {
+     src0 = (global void*)((global char*)src0 + offset0);
+     dst = (global float*)((global char*)dst + offsetd);
+@@ -86,11 +88,14 @@ kernel void kernel_rms_norm(
+     global float4 * y = (global float4 *) (dst + i03*ne02*ne01*ne00 + i02*ne01*ne00 + i01*ne00);
+     global float * y_scalar = (global float *) y;
+     for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
+-        y[i00] = x[i00] * scale;
++        // rounded as the norm and the scale were: x * scale first (the norm's
++        // store), then * post (the scale's); under -cl-fast-relaxed-math IGC
++        // regrouped the plain form to x * (scale * post) and the text changed
++        y[i00] = as_float4(as_uint4(x[i00] * scale) ^ opaque) * post;
+     }
+     if (get_local_id(0) == 0) {
+         for (int i00 = 4 * (ne00 / 4); i00 < ne00; i00++) {
+-            y_scalar[i00] = x_scalar[i00] * scale;
++            y_scalar[i00] = as_float(as_uint(x_scalar[i00] * scale) ^ opaque) * post;
+         }
+     }
+ }
+diff --git a/ggml/src/ggml-opencl/kernels/sigmoid.cl b/ggml/src/ggml-opencl/kernels/sigmoid.cl
+index e3f669d..fe2ccfa 100644
+--- a/ggml/src/ggml-opencl/kernels/sigmoid.cl
++++ b/ggml/src/ggml-opencl/kernels/sigmoid.cl
+@@ -27,3 +27,22 @@ kernel void kernel_sigmoid_f16(
+ 
+     dst[get_global_id(0)] = 1.0f / (1.0f + exp(-src0[get_global_id(0)]));
+ }
++
++// sigmoid(src0) * src1, the same shape, contiguous (patch 0049, after llama.cpp
++// CUDA's {UNARY, MUL} fusion with SIGMOID): kernel_sigmoid_f32's formula, then
++// the product
++kernel void kernel_sigmoid_mul_f32(
++        global float * src0,
++        ulong offset0,
++        global float * src1,
++        ulong offset1,
++        global float * dst,
++        ulong offsetd
++) {
++    src0 = (global float*)((global char*)src0 + offset0);
++    src1 = (global float*)((global char*)src1 + offset1);
++    dst = (global float*)((global char*)dst + offsetd);
++    const size_t i = get_global_id(0);
++    const float s = 1.0f / (1.0f + exp(-src0[i]));
++    dst[i] = s * src1[i];
++}
+diff --git a/ggml/src/ggml-opencl/kernels/ssm_conv.cl b/ggml/src/ggml-opencl/kernels/ssm_conv.cl
+index 7ae21ac..ee8b0a8 100644
+--- a/ggml/src/ggml-opencl/kernels/ssm_conv.cl
++++ b/ggml/src/ggml-opencl/kernels/ssm_conv.cl
+@@ -12,7 +12,8 @@ kernel void kernel_ssm_conv_f32_f32(
+     ulong         nb11,
+     ulong         nb0,
+     ulong         nb1,
+-    ulong         nb2
++    ulong         nb2,
++    int           act     // 1: a following SILU folded in (kernel_silu's formula; patch 0049)
+ ){
+     src0 = src0 + offset0;
+     src1 = src1 + offset1;
+@@ -34,7 +35,7 @@ kernel void kernel_ssm_conv_f32_f32(
+         sumf += s[i0] * c[i0];
+     }
+ 
+-    d[0] = sumf;
++    d[0] = act ? sumf / (1.0f + exp(-sumf)) : sumf;
+ }
+ 
+ kernel void kernel_ssm_conv_f32_f32_4(
+@@ -51,7 +52,8 @@ kernel void kernel_ssm_conv_f32_f32_4(
+     ulong         nb11,
+     ulong         nb0,
+     ulong         nb1,
+-    ulong         nb2
++    ulong         nb2,
++    int           act     // 1: a following SILU folded in (kernel_silu's formula; patch 0049)
+ ) {
+     src0 = src0 + offset0;
+     src1 = src1 + offset1;
+@@ -73,5 +75,5 @@ kernel void kernel_ssm_conv_f32_f32_4(
+         sumf += dot(s[i0], c[i0]);
+     }
+ 
+-    d[0] = sumf;
++    d[0] = act ? sumf / (1.0f + exp(-sumf)) : sumf;
+ }
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index facab0e..353c84d 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1361,7 +1361,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+                 conv_states_all->nb[1],
+                 (slot * mem_size + kv_head) * row_size);
+ 
+-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
++        // the strided tail copied as it is, as delta-net-base.cpp's build_conv_state
++        // does: a ggml_cont first cost a second kernel a slot (patch 0049)
++        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
+     }
+ 
+     return conv_input;

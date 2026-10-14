@@ -18,6 +18,52 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.7.9 — 2026-10-14
+
+**Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine
+builds llama.cpp `bed0a85` with `contrib/llama.cpp/patches` 0001-0052. Four
+llama.cpp patches and one arcint flag. Every number is `measured-here` on
+the named card, the units' flags (0052 and the Strata comparison: 3 drafts
+with the stop at 0.5 on Strata's long request), one binary with the patch's
+switch off in the other arm; the details are in `contrib/llama.cpp/README.md` (0049-0052)
+and `docs/campaigns/flash-next-llama-engine.md` (on the `qfndev` branch).
+
+- **Patch 0049: fewer decode kernels, the same bits.** llama.cpp CUDA's
+  rms_norm+scale, ssm_conv+silu and sigmoid+mul fusions in the OpenCL
+  backend, and Flash-Next's rollback snapshots without a cont. Flash-Next's
+  verify graph 12.35-12.41 -> 11.67 ms; decode +0.5-1.1 % (Flash-Next),
+  +0.3-0.5 % (the dense agent), +0.8-1.2 % (the coder). An always-zero
+  operand keeps the fused norm's two roundings: regrouped, it had passed
+  the KL bar and cut the coder's draft acceptance.
+- **Patch 0050: the delta net's rollback snapshots in the cache.** The
+  Intel gated-delta-net kernels write the speculative rollback snapshots
+  straight into the recurrent cache, as vllm-xpu-kernels' delta stage
+  updates its state in place; the copy after the op is gone. Decode: the
+  dense agent 37.3 / 39.9 / 37.7 -> 39.2-39.3 / 42.0 / 39.6 t/s (+5.1-5.3 %),
+  the coder +1.8-2.0 %, Flash-Next +1.2-1.9 %. Every md5 equal.
+- **Patch 0051: the delta net's gating in its kernel.** The gate
+  (softplus(alpha + dt) x A) and beta (sigmoid) computed inside the Intel
+  kernels from the raw projections; four launches a layer gone. The coder
+  +0.9-1.2 %, the agent +0.3 %, Flash-Next neutral; every md5 equal. The
+  raw inputs are kept alive as extra sources of the op: without that, the
+  first build read memory the allocator had reused and still answered
+  right.
+- **Patch 0052 and `--llama-reserve-cells N`: compute buffers to a
+  budget.** The scheduler reserved Flash-Next's buffers for a 2,048-token
+  prompt chunk at a full 131,072-cell cache (3,048 + 770 MiB for the whole
+  session). The QSA indexer's ReLU now runs in place (~1 GiB, the same
+  bits), and with `--llama-reserve-cells N` the reservation covers N cells
+  while deeper prompt chunks are cut to fit. At 131,072 tokens, N = 20,480
+  and 13,400 MiB of expert slots: decode 34.8 / 38.0 -> 38.4 / 43.0 t/s on
+  Strata's request with 3 drafts and the stop at 0.5, the 20k needle's prefill unchanged (657 -> 662 t/s), a
+  72k prompt 128.7 -> 173.0 s, peak VRAM 23.82 -> 23.35 GiB; the same text.
+- **Flash-Next against Strata** (the charter's B3): on Strata's own request
+  and card a round costs the same at Strata's draft setting, 2 drafts with
+  the stop (63.1 against 63.4 ms); with 3 drafts and Strata's stop at 0.5
+  (`--llama-mtp 3 --llama-mtp-min-p 0.5`) arcint decodes 37.9 t/s against
+  Strata's 37.8 on the warm run (the first run 35.1 against 37.2), and 43.0
+  with 0052.
+
 ## 0.7.8 — 2026-10-14
 
 **Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine

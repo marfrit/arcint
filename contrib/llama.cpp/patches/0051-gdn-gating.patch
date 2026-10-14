@@ -1,0 +1,394 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 6e99907..b52a0f7 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -704,7 +704,13 @@ struct ggml_backend_opencl_context {
+     bool disable_fusion;
+     bool fuse_mm_glu = true;                     // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
+     bool fuse_rms_add = true;                    // opt-out GGML_OPENCL_FUSE_RMS_ADD=0 (fused rms_norm*w + residual)
+-    int  fuse_0050 = 1;                          // patch 0050's GDN-stage fusions (GGML_OPENCL_FUSE_0050=<mask>): 1 the snapshots into the cache
++    int  fuse_0050 = 3;                          // the GDN-stage fusions (GGML_OPENCL_FUSE_0050=<mask>): 1 the snapshots into the cache
++                                                 // (patch 0050), 2 the gating into the GDN kernel (patch 0051)
++    // patch 0051: per graph, the GDN nodes whose gating chains are folded in,
++    // and the chains' nodes the loop skips
++    struct gdn_gate_src { const ggml_tensor * alpha, * dt, * a, * beta; int parts; };
++    std::unordered_map<const ggml_tensor *, gdn_gate_src> gdn_gate;
++    std::vector<uint8_t> gdn_skip;               // by node index
+     int  fuse_0049 = 7;                          // patch 0049's fusions, a bit each: 1 rms_norm + scale, 2 ssm_conv + silu,
+                                                  // 4 sigmoid + mul (GGML_OPENCL_FUSE_0049=<mask>; 0: off)
+     bool f16_mrow = true;                        // opt-out GGML_OPENCL_F16_MROW=0 (multi-row-per-WG f16 decode GEMV for attn proj + lm_head)
+@@ -9954,12 +9960,130 @@ static bool ggml_cl_moe_prefetch_on() {
+     return on;
+ }
+ 
++// patch 0051: the gated delta net's gating folded into its kernel, as
++// vllm-xpu-kernels' delta stage takes A_log and dt_bias itself
++// (csrc/xpu/gdn_attn/gated_delta_rule.hpp). For each GDN node whose g is
++// reshape(mul(softplus(add(alpha, dt)), A)) and whose beta is sigmoid(b),
++// every intermediate used once and computed in this graph, the four ops are
++// skipped and the kernel reads alpha and b raw.
++static void ggml_cl_gdn_gate_prepass(ggml_backend_opencl_context * ctx, const ggml_cgraph * cgraph) {
++    ctx->gdn_gate.clear();
++    ctx->gdn_skip.clear();
++    if (ctx->disable_fusion || !(ctx->fuse_0050 & 2) || ctx->kernel_gdn_intel_tg == nullptr) {
++        return;
++    }
++    // host time a graph matters (every node costs an enqueue): no map over the
++    // whole graph; the chain's nodes are looked for in a window before the GDN
++    constexpr int WIN = 160;
++    auto find_idx = [&](const ggml_tensor * t, int before) {
++        for (int k = before - 1; k >= 0 && k >= before - WIN; --k) {
++            if (cgraph->nodes[k] == t) return k;
++        }
++        return -1;
++    };
++    // the kernel reads the raw projections when the GDN runs, later than the
++    // allocator keeps them alive (it frees alpha after the ADD, b after the
++    // SIGMOID): a node in between that is computed and writes over their bytes
++    // refuses the fold
++    auto clobbered = [&](const ggml_tensor * raw, int from, int to, const ggml_tensor * const * skip, int n_skip) {
++        if (raw->buffer == nullptr || raw->data == nullptr) return true;
++        const char * r0 = (const char *) raw->data, * r1 = r0 + ggml_nbytes(raw);
++        for (int k = from + 1; k < to; ++k) {
++            const ggml_tensor * n = cgraph->nodes[k];
++            if ((n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_op_is_empty(n->op) || n->buffer != raw->buffer || n->data == nullptr) continue;
++            bool skipped = false;
++            for (int q = 0; q < n_skip; ++q) skipped = skipped || n == skip[q];
++            if (skipped) continue;
++            const char * n0 = (const char *) n->data, * n1 = n0 + ggml_nbytes(n);
++            if (n0 < r1 && r0 < n1) return true;
++        }
++        return false;
++    };
++    int n_clobbered = 0;
++    auto once = [&](int idx) {
++        return idx >= 0 && ggml_node_has_n_uses(cgraph, idx, 1) && cgraph->nodes[idx]->type == GGML_TYPE_F32;
++    };
++    auto is_unary = [](const ggml_tensor * t, ggml_unary_op u) { return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == u; };
++    int n_gdn = 0;
++    for (int i = 0; i < cgraph->n_nodes; ++i) {
++        const ggml_tensor * gd = cgraph->nodes[i];
++        if (gd->op != GGML_OP_GATED_DELTA_NET || gd->type != GGML_TYPE_F32) continue;
++        ++n_gdn;
++        const ggml_tensor * v = gd->src[2], * g = gd->src[3], * b = gd->src[4];
++        const int64_t H = v->ne[1];
++        if (v->ne[0] != 128 || g->ne[0] != 1) continue;   // the Intel kernels: S_v 128, a scalar gate a head
++        const ggml_tensor * m = g->op == GGML_OP_RESHAPE ? g->src[0] : g;
++        const int i_m = find_idx(m, i);
++        if (m->op != GGML_OP_MUL || !once(i_m)) continue;
++        if (g != m) {   // the reshape itself: read by the GDN only, not an output
++            const int i_g = find_idx(g, i);
++            if (i_g < 0 || ggml_node_get_use_count(cgraph, i_g) != 1 || (g->flags & GGML_TENSOR_FLAG_OUTPUT)) continue;
++        }
++        const ggml_tensor * sp = is_unary(m->src[0], GGML_UNARY_OP_SOFTPLUS) ? m->src[0] : m->src[1];
++        const ggml_tensor * A  = sp == m->src[0] ? m->src[1] : m->src[0];
++        if (!is_unary(sp, GGML_UNARY_OP_SOFTPLUS)) continue;
++        const int i_sp = find_idx(sp, i_m);
++        if (!once(i_sp)) continue;
++        const ggml_tensor * ad = sp->src[0];
++        const int i_ad = ad->op == GGML_OP_ADD ? find_idx(ad, i_sp) : -1;
++        if (!once(i_ad)) continue;
++        const ggml_tensor * al = ggml_nelements(ad->src[0]) == ggml_nelements(ad) ? ad->src[0] : ad->src[1];
++        const ggml_tensor * dt = al == ad->src[0] ? ad->src[1] : ad->src[0];
++        const int i_b = is_unary(b, GGML_UNARY_OP_SIGMOID) ? find_idx(b, i) : -1;
++        if (!once(i_b)) continue;
++        const ggml_tensor * br = b->src[0];
++        const bool ok =
++            ggml_nelements(A) == H && ggml_nelements(dt) == H && ggml_is_contiguous(A) && ggml_is_contiguous(dt) &&
++            A->type == GGML_TYPE_F32 && dt->type == GGML_TYPE_F32 &&
++            al->type == GGML_TYPE_F32 && br->type == GGML_TYPE_F32 &&
++            ggml_nelements(al) == ggml_nelements(g) && ggml_nelements(br) == ggml_nelements(b) &&
++            ggml_is_contiguous(al) && ggml_is_contiguous(br) && ggml_is_contiguous(g) && ggml_is_contiguous(b) &&
++            ggml_nelements(m) == ggml_nelements(g) && al->ne[0] == H && br->ne[1] == H && g->ne[1] == H && b->ne[1] == H &&
++            al->extra != nullptr && br->extra != nullptr && A->extra != nullptr && dt->extra != nullptr;
++        if (!ok) continue;
++        // the graph keeps the raw inputs alive to the GDN (delta-net-base.cpp
++        // gdn_keep_gating_inputs); without that, no fold
++        int part_ok = 0;
++        if (gd->src[6] == al) part_ok |= 1;
++        if (gd->src[7] == br) part_ok |= 2;
++        static const int part = getenv("GGML_OPENCL_FUSE_0051_PART") ? atoi(getenv("GGML_OPENCL_FUSE_0051_PART")) : 3;
++        const int parts = part & part_ok & 3;
++        if (parts == 0) continue;
++        {
++            const ggml_tensor * chain[4];   // the nodes the loop will skip
++            int n_chain = 0;
++            if (parts & 1) { chain[n_chain++] = ad; chain[n_chain++] = sp; chain[n_chain++] = m; }
++            if (parts & 2) { chain[n_chain++] = b; }
++            const bool ca = (parts & 1) && clobbered(al, i_ad, i, chain, n_chain);
++            const bool cb = (parts & 2) && clobbered(br, i_b, i, chain, n_chain);
++            if (ca || cb) { ++n_clobbered; continue; }
++        }
++        ctx->gdn_gate[gd] = { al, dt, A, br, parts };
++        if (ctx->gdn_skip.empty()) {
++            ctx->gdn_skip.assign(cgraph->n_nodes, 0);
++        }
++        if (parts & 1) {
++            ctx->gdn_skip[i_ad] = ctx->gdn_skip[i_sp] = ctx->gdn_skip[i_m] = 1;
++        }
++        if (parts & 2) {
++            ctx->gdn_skip[i_b] = 1;
++        }
++    }
++    static bool told = false;
++    if (!told) {
++        told = true;
++        GGML_LOG_INFO("ggml_opencl: GDN gating folded into the kernel for %zu of %d GDN nodes (%d refused: a raw input overwritten before the GDN)\n",
++                      ctx->gdn_gate.size(), n_gdn, n_clobbered);
++    }
++}
++
+ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+     backend_ctx->graph_gen++;
+     backend_ctx->pair_perm_t = nullptr;
+     backend_ctx->pair_grp_t = nullptr;
+     backend_ctx->moe_pf = {};
++    ggml_cl_gdn_gate_prepass(backend_ctx, cgraph);
+ 
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_tensor * node = cgraph->nodes[i];
+@@ -9976,6 +10100,9 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+             continue;
+         }
++        if (!backend_ctx->gdn_skip.empty() && backend_ctx->gdn_skip[i]) {
++            continue;   // a gating op the GDN kernel computes itself (patch 0051)
++        }
+ 
+         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse_hc_mix(backend_ctx, cgraph, i)) {
+             ggml_cl_hc_mix_fused(backend, cgraph, i);
+@@ -33798,8 +33925,8 @@ static bool ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
+     const cl_ulong off_q     = extra_q->offset     + src_q->view_offs;
+     const cl_ulong off_k     = extra_k->offset     + src_k->view_offs;
+     const cl_ulong off_v     = extra_v->offset     + src_v->view_offs;
+-    const cl_ulong off_g     = extra_g->offset     + src_g->view_offs;
+-    const cl_ulong off_beta  = extra_beta->offset  + src_beta->view_offs;
++    cl_ulong off_g     = extra_g->offset     + src_g->view_offs;
++    cl_ulong off_beta  = extra_beta->offset  + src_beta->view_offs;
+     const cl_ulong off_state = extra_state->offset + src_state->view_offs;
+     const cl_ulong off_dst   = extra_dst->offset   + dst->view_offs;
+ 
+@@ -33851,6 +33978,40 @@ static bool ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
+         CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &sbuf));
+         CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &soff));
+         CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &sstride));
++        // the gating (patch 0051): g and beta replaced by the raw projections
++        auto gg = backend_ctx->gdn_gate.find(dst);
++        cl_uint gating = gg != backend_ctx->gdn_gate.end() ? (cl_uint) gg->second.parts : 0;
++        const cl_uint opaque = 0;
++        cl_mem dtb = extra_g->data_device, ab = extra_g->data_device;
++        cl_ulong dto = 0, ao = 0;
++        if (gating) {
++            const auto & gs = gg->second;
++            ggml_tensor_extra_cl * ea  = (ggml_tensor_extra_cl *) gs.alpha->extra;
++            ggml_tensor_extra_cl * eb  = (ggml_tensor_extra_cl *) gs.beta->extra;
++            ggml_tensor_extra_cl * edt = (ggml_tensor_extra_cl *) gs.dt->extra;
++            ggml_tensor_extra_cl * eA  = (ggml_tensor_extra_cl *) gs.a->extra;
++            static const bool red = getenv("GGML_OPENCL_FUSE_0051_RED") != nullptr && atoi(getenv("GGML_OPENCL_FUSE_0051_RED")) != 0;
++            const ggml_tensor * dsrc = red ? gs.a : gs.dt;   // the red case: A in place of dt
++            ggml_tensor_extra_cl * ed = red ? eA : edt;
++            off_g    = ea->offset + gs.alpha->view_offs;
++            off_beta = eb->offset + gs.beta->view_offs;
++            if (gating & 1) {
++                CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_mem),   &ea->data_device));
++                CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_ulong), &off_g));
++            }
++            if (gating & 2) {
++                CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_mem),   &eb->data_device));
++                CL_CHECK(clSetKernelArg(kernel, 9, sizeof(cl_ulong), &off_beta));
++            }
++            dtb = ed->data_device;  dto = ed->offset + dsrc->view_offs;
++            ab  = eA->data_device;  ao  = eA->offset + gs.a->view_offs;
++        }
++        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &dtb));
++        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &dto));
++        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &ab));
++        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &ao));
++        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &gating));
++        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &opaque));
+     }
+ 
+     if (gdn_intel) {
+diff --git a/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl b/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
+index 8455661..54cd6f0 100644
+--- a/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
++++ b/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
+@@ -36,6 +36,21 @@
+ #define BLOCK_WRITE_F(p, v) intel_sub_group_block_write((global uint *)(p), as_uint(v))
+ #define LBLOCK_READ_F(p)    as_float(intel_sub_group_block_read((local const uint *)(p)))
+ 
++// the gating folded in (patch 0051): g = softplus(alpha + dt) * A and
++// beta = sigmoid(b) from the raw projections, with kernel_add_row's,
++// kernel_softplus_f32's, kernel_mul_row's and kernel_sigmoid_f32's
++// expressions; the XOR with an always-0 argument after each step keeps the
++// separate ops' roundings under -cl-fast-relaxed-math (as 0049's norm)
++static inline float gdn_gate(float a, float dt, float A, uint opaque) {
++    float t = as_float(as_uint(a + dt) ^ opaque);
++    float sp = (t > 20.0f) ? t : log(1.0f + exp(t));
++    sp = as_float(as_uint(sp) ^ opaque);
++    return as_float(as_uint(sp * A) ^ opaque);
++}
++static inline float gdn_beta(float b, uint opaque) {
++    return as_float(as_uint(1.0f / (1.0f + exp(-b))) ^ opaque);
++}
++
+ #ifdef GDN_PP
+ 
+ #ifndef NSG
+@@ -55,7 +70,8 @@
+ static inline float chunk_load(int e, uint t0, uint n_tokens,
+         global const float * dq, global const float * dk, global const float * dv,
+         global const float * dg, global const float * db,
+-        ulong q_base, ulong v_base, ulong gb_base, uint sq2, uint sv2, uint sb2, uint row0) {
++        ulong q_base, ulong v_base, ulong gb_base, uint sq2, uint sv2, uint sb2, uint row0,
++        float dt_h, float a_h, uint gating, uint opaque) {
+     int t, x;
+     if (e < TC * S_V)                 { t = e / S_V; x = e % S_V;
+         return t0 + t < n_tokens ? dq[q_base + (ulong)(t0 + t) * sq2 + x] : 0.f; }
+@@ -66,9 +82,13 @@ static inline float chunk_load(int e, uint t0, uint n_tokens,
+     if (e < TC * ROWS)                { t = e / ROWS; x = e % ROWS;
+         return t0 + t < n_tokens ? dv[v_base + (ulong)(t0 + t) * sv2 + row0 + x] : 0.f; }
+     e -= TC * ROWS;
+-    if (e < TC)                       { return t0 + e < n_tokens ? dg[gb_base + (ulong)(t0 + e) * sb2] : 0.f; }
++    if (e < TC)                       { if (t0 + e >= n_tokens) return 0.f;
++                                        const float x = dg[gb_base + (ulong)(t0 + e) * sb2];
++                                        return (gating & 1) ? gdn_gate(x, dt_h, a_h, opaque) : x; }
+     e -= TC;
+-    if (e < TC)                       { return t0 + e < n_tokens ? db[gb_base + (ulong)(t0 + e) * sb2] : 0.f; }
++    if (e < TC)                       { if (t0 + e >= n_tokens) return 0.f;
++                                        const float x = db[gb_base + (ulong)(t0 + e) * sb2];
++                                        return (gating & 2) ? gdn_beta(x, opaque) : x; }
+     return 0.f;
+ }
+ 
+@@ -96,7 +116,10 @@ kernel void kernel_gated_delta_net_pp(
+         // the K snapshots' destination (patch 0050): dst after the attention
+         // output (snap_buf = dst_buf), or the recurrent cache's rows when the
+         // cpy into them is fused; snap_stride = floats from one slot to the next
+-        global char * snap_buf, ulong off_snap, ulong snap_stride) {
++        global char * snap_buf, ulong off_snap, ulong snap_stride,
++        // gating (patch 0051): bit 1, g_buf holds the raw alpha; bit 2, beta_buf the raw beta
++        // projections, dt and A per head: g and beta are computed here
++        global const char * dt_buf, ulong off_dt, global const char * a_buf, ulong off_a, uint gating, uint opaque) {
+     global const float * data_q     = (global const float *)(q_buf     + off_q);
+     global const float * data_k     = (global const float *)(k_buf     + off_k);
+     global const float * data_v     = (global const float *)(v_buf     + off_v);
+@@ -108,6 +131,8 @@ kernel void kernel_gated_delta_net_pp(
+     local float buf[2][CH_FLOATS];
+ 
+     const uint head = get_group_id(0);
++    const float dt_h = (gating & 1) ? ((global const float *)(dt_buf + off_dt))[head] : 0.f;
++    const float a_h  = (gating & 1) ? ((global const float *)(a_buf  + off_a ))[head] : 0.f;
+     const uint seq  = get_group_id(1);
+     const uint wrow = get_group_id(2) * ROWS;         // the work-group's first row
+     const uint sg   = get_sub_group_id();
+@@ -135,7 +160,7 @@ kernel void kernel_gated_delta_net_pp(
+     for (int i = 0; i < PER_THR; ++i) {
+         const int e = tid + i * NTHR;
+         if (e < CH_FLOATS) buf[0][e] = chunk_load(e, 0, n_tokens, data_q, data_k, data_v, data_g, data_beta,
+-                                                  q_base, v_base, gb_base, sq2, sv2, sb2, wrow);
++                                                  q_base, v_base, gb_base, sq2, sv2, sb2, wrow, dt_h, a_h, gating, opaque);
+     }
+     barrier(CLK_LOCAL_MEM_FENCE);
+ 
+@@ -150,7 +175,7 @@ kernel void kernel_gated_delta_net_pp(
+         for (int i = 0; i < PER_THR; ++i) {
+             const int e = tid + i * NTHR;
+             nxt[i] = (c + 1 < n_chunks && e < CH_FLOATS)
+-                ? chunk_load(e, t1, n_tokens, data_q, data_k, data_v, data_g, data_beta, q_base, v_base, gb_base, sq2, sv2, sb2, wrow)
++                ? chunk_load(e, t1, n_tokens, data_q, data_k, data_v, data_g, data_beta, q_base, v_base, gb_base, sq2, sv2, sb2, wrow, dt_h, a_h, gating, opaque)
+                 : 0.f;
+         }
+ 
+@@ -247,7 +272,10 @@ kernel void kernel_gated_delta_net_tg(
+         // the K snapshots' destination (patch 0050): dst after the attention
+         // output (snap_buf = dst_buf), or the recurrent cache's rows when the
+         // cpy into them is fused; snap_stride = floats from one slot to the next
+-        global char * snap_buf, ulong off_snap, ulong snap_stride) {
++        global char * snap_buf, ulong off_snap, ulong snap_stride,
++        // gating (patch 0051): bit 1, g_buf holds the raw alpha; bit 2, beta_buf the raw beta
++        // projections, dt and A per head: g and beta are computed here
++        global const char * dt_buf, ulong off_dt, global const char * a_buf, ulong off_a, uint gating, uint opaque) {
+     global const float * data_q     = (global const float *)(q_buf     + off_q);
+     global const float * data_k     = (global const float *)(k_buf     + off_k);
+     global const float * data_v     = (global const float *)(v_buf     + off_v);
+@@ -257,6 +285,8 @@ kernel void kernel_gated_delta_net_tg(
+     global       float * data_dst   = (global       float *)(dst_buf   + off_dst);
+ 
+     const uint head = get_group_id(0);
++    const float dt_h = (gating & 1) ? ((global const float *)(dt_buf + off_dt))[head] : 0.f;
++    const float a_h  = (gating & 1) ? ((global const float *)(a_buf  + off_a ))[head] : 0.f;
+     const uint seq  = get_group_id(1);
+     const uint row0 = get_group_id(2) * R;
+     const uint lane = get_sub_group_local_id();
+@@ -286,8 +316,8 @@ kernel void kernel_gated_delta_net_tg(
+         }
+         #pragma unroll
+         for (int r = 0; r < R; ++r) vn[r] = data_v[v_base + row0 + r];
+-        gn = data_g[gb_base];
+-        bn = data_beta[gb_base];
++        gn = (gating & 1) ? gdn_gate(data_g[gb_base], dt_h, a_h, opaque) : data_g[gb_base];
++        bn = (gating & 2) ? gdn_beta(data_beta[gb_base], opaque) : data_beta[gb_base];
+     }
+ 
+     ulong attn_off = ((ulong)seq * n_tokens * H_v + head) * S_V;
+@@ -309,8 +339,8 @@ kernel void kernel_gated_delta_net_tg(
+             #pragma unroll
+             for (int r = 0; r < R; ++r) vn[r] = data_v[vo + row0 + r];
+             const ulong go = gb_base + (ulong)(t + 1) * sb2;
+-            gn = data_g[go];
+-            bn = data_beta[go];
++            gn = (gating & 1) ? gdn_gate(data_g[go], dt_h, a_h, opaque) : data_g[go];
++            bn = (gating & 2) ? gdn_beta(data_beta[go], opaque) : data_beta[go];
+         }
+ 
+         // kv_r = (g S_r).k: the R reductions are independent and interleave
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index ad66126..a86536b 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -11,6 +11,27 @@ static ggml_tensor * get_slice_2d(ggml_context * ctx0, ggml_tensor * t, int64_t
+         t->nb[1], t->nb[2], t->nb[3], t->nb[2] * c);
+ }
+ 
++// patch 0051: the raw projections the gating starts from, kept as extra sources
++// of the GDN node (src[6] alpha, src[7] b), as vllm-xpu-kernels' delta stage
++// takes a and b with A_log and dt_bias. A backend that folds the gating into its
++// kernel reads them when the GDN runs; the extra sources keep them alive until
++// then (without them the allocator frees alpha after the ADD). The op's
++// semantics do not change: g and beta stay its inputs and the CPU ignores
++// these.
++static void gdn_keep_gating_inputs(ggml_tensor * gdn, ggml_tensor * g, ggml_tensor * b) {
++    const auto unary = [](const ggml_tensor * t, ggml_unary_op u) { return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == u; };
++    ggml_tensor * m = g->op == GGML_OP_RESHAPE ? g->src[0] : g;
++    if (m->op == GGML_OP_MUL) {
++        ggml_tensor * sp = unary(m->src[0], GGML_UNARY_OP_SOFTPLUS) ? m->src[0] : m->src[1];
++        if (unary(sp, GGML_UNARY_OP_SOFTPLUS) && sp->src[0]->op == GGML_OP_ADD) {
++            gdn->src[6] = sp->src[0]->src[0];
++        }
++    }
++    if (unary(b, GGML_UNARY_OP_SIGMOID)) {
++        gdn->src[7] = b->src[0];
++    }
++}
++
+ llm_build_delta_net_base::llm_build_delta_net_base(const llm_graph_params & params) : llm_graph_context(params) {}
+ 
+ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net_chunking(
+@@ -400,6 +421,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
+ 
+     // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
+     ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
++    gdn_keep_gating_inputs(result, g, b);
+     if (n_tokens == 1) {
+         res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
+     } else {
+@@ -565,6 +587,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+ 
+     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
+     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
++    gdn_keep_gating_inputs(gdn_out, g, b);
+     if (n_seq_tokens > 1) {
+         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+     } else {

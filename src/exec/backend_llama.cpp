@@ -417,6 +417,7 @@ public:
         // over the link once: the whole batch in one ubatch reads them once per
         // n_batch tokens instead of per 512
         cp.n_ubatch        = static_cast<uint32_t>(ec_on ? n_batch_ : std::min(n_batch_, 512));
+        cp.n_kv_reserve    = cfg.llama_reserve_cells;
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
         cp.type_k          = kv_type(cfg.llama_kv_k);
         cp.type_v          = kv_type(cfg.llama_kv_v);
@@ -487,7 +488,8 @@ public:
             std::string err;
             spec_ = make_llama_mtp(mtp_model, ctx_, cfg.llama_mtp, lanes_, n_batch_, static_cast<int>(cp.n_ubatch),
                                    threads, cfg.llama_mtp_gguf.empty() ? cfg.gguf_path : cfg.llama_mtp_gguf,
-                                   cfg.llama_mtp_vocab, cfg.llama_mtp_min_p, cp.type_k, cp.type_v, cp.kv_unified, err);
+                                   cfg.llama_mtp_vocab, cfg.llama_mtp_min_p, cp.type_k, cp.type_v, cp.kv_unified,
+                                   cp.n_kv_reserve, err);
             if (!spec_) throw std::runtime_error(log::format("--llama-mtp %d: %s", cfg.llama_mtp, err.c_str()));
             n_draft_ = cfg.llama_mtp;
             if (windows_ && !spec_->set_kv_windows(windows.data(), lanes_))

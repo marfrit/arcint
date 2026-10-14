@@ -90,7 +90,7 @@ public:
 std::unique_ptr<LlamaSpec> make_llama_mtp(llama_model* model, llama_context* ctx_tgt, int n_draft, int n_seq,
                                           int n_batch, int n_ubatch, int threads, const std::string& gguf,
                                           const std::string& vocab, double min_p, ggml_type type_k, ggml_type type_v,
-                                          bool kv_unified, std::string& err);
+                                          bool kv_unified, uint32_t n_kv_reserve, std::string& err);
 
 }  // namespace lgc
 

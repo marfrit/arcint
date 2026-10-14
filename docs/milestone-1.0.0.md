@@ -1,0 +1,63 @@
+# 1.0.0 — feature complete, almost no gains by obvious changes
+
+**Draft** (2026-10-14). The operator's definition: arcint is 1.0 when it is
+feature complete and almost no gains are left in obvious changes. This
+charter turns the two halves into checkable criteria. Each criterion names
+its evidence and its state. The operator amends it; an agent does not.
+
+## A. Feature complete
+
+"Complete" means for the services arcint is built for: the dense agent and
+the coder on the libllama engine, Flash-Next on one GPU plus host RAM, on the
+two Arc cards. It does not mean every model or every engine feature.
+
+| # | criterion | state (2026-10-14) |
+|---|---|---|
+| A1 | The three services run from the released package, on the engine the README names as the default, with answers right (facts, needle, the acceptance task) | met in practice: all three run libllama from 0.7.8 (`measured-here`, the 0.7.8 pre-tag check). **Open:** the README still calls OpenVINO "the default" |
+| A2 | Flash-Next's serving shape is settled: one quant, one KV type, one context, one expert-cache size, with the quant inside the answer-level bar or the shortfall recorded as accepted | **open:** IQ2_XS misses the bar against unsloth's Q8_0 (KL 0.294, README); UD-Q3_K_XL meets it but decodes at 12-13 t/s. Accept IQ2_XS, or name what replaces it |
+| A3 | Speculative decoding works on all three (MTP) with rollback of the recurrent state | met (`measured-here`, acceptance counts in every gate today) |
+| A4 | Long context at the deployed sizes: the agent at 245,760, the coder at 98,304, Flash-Next at 131,072, with needles right and nothing evicted | met (`measured-here`, the 0045 and 0.7.8 gates) |
+| A5 | Checkpoints and prefix reuse on the libllama engine (`--llama-checkpoints`) | met for one lane; **decide** whether a shared prefix cache across lanes belongs in 1.0 (not built) |
+| A6 | The OpenVINO engine's role is decided: kept as the documented alternative with its own gates, or retired from the default build | **open** |
+| A7 | Every switch that 1.0 keeps is documented; diagnostic and red-case switches are named as such | **open:** dozens of `GGML_OPENCL_*` and `LLAMA_*` variables exist; there is no list of which ones are supported |
+
+## B. Almost no gains by obvious changes
+
+"Obvious" means one of these: a mechanism one of the reference engines uses
+for the same model or layer that arcint does not have; a lever an ablation
+or a profile names with a price; or a known fault in a kernel. A gain counts
+if it moves served tokens per second of a deployed service with the answers
+unchanged.
+
+| # | criterion | state (2026-10-14) |
+|---|---|---|
+| B1 | No priced lever of 2 % or more of served decode or prefill is left unbuilt on any service | **open:** Flash-Next's prompt buffers: built as 0052 (reserve to a cell budget, +10-13 % decode at 131K, `measured-here`), not yet on the unit; the GDN stage's conv-stage fusion (vllm-xpu-kernels' conv stage; the delta stage is built: 0050 +1.2-5.3 %, 0051's gating +0-1.2 % by service, Flash-Next neutral); the activation quantization folded into its producers (~0.6 %); the rest of the decode kernel count (~13 % of a Flash-Next round, the sum of many small fusions, none obvious alone) |
+| B2 | Every reference engine's mechanism for the served models is either built, measured as not paying here, or set aside by the operator. The references are Strata, FreeToken and Infernix for Flash-Next; llama.cpp's CUDA and Vulkan backends; vllm-xpu-kernels and sycl-tla on Xe2; and OpenVINO's GPU plugin | mostly met: this week's audits built or measured the reference's prompt attention, its wave split, CUDA's per-call K/V conversion, MMQ's shared tile, sycl-tla's payloads and Strata's tables. **Open:** vllm-xpu-kernels' GDN spec-decode rollback (one conv cache advanced by the accepted count instead of K snapshot copies); OpenVINO's post-op fusion |
+| B3 | Flash-Next is at parity with Strata on the same card, or the gap is explained by a measured cause | prefill: met (677 t/s at the 20k needle against Strata's 620, `measured-here`). Decode on Strata's own request (`measured-here`, 2026-10-14): a round costs the same (63.1 against 63.4 ms at Strata's draft setting); with 3 drafts and Strata's stop at 0.5 arcint decodes 37.9 t/s against Strata's 37.8 (warm run; the first run 35.1 against 37.2). **Met** on the warm run once the Flash-Next unit takes `--llama-mtp 3 --llama-mtp-min-p 0.5` (operator's call); the first run's gap is the expert cache's warm-up |
+| B4 | The kernels that dominate device time are at their measured ceiling for their design | met for the B60's prompt attention, the A770's quantized attention staging and the int8 Q4_K GEMM (`measured-here`, the campaign docs); open for the Q5_K/Q6_K GEMMs (not audited at that depth) |
+
+B is met when B1 has no unbuilt entry of 2 % or more, B2 has no untried
+reference mechanism, and B3's gap is explained or closed.
+
+## C. Fit to release as 1.0
+
+| # | criterion | state |
+|---|---|---|
+| C1 | DESIGN.md §7 and the README describe what ships: engines, numbers, the default | **open:** §7.0's milestone table and numbers predate the libllama engine (Flash-Next at 6.5 t/s decode) |
+| C2 | A soak: several days of the three services under real use on both cards with no wedge, no eviction and no restart, logged | **open:** the record has the B60's wedge after a long idle, xe eviction at thin VRAM margins and copy-engine resets, each recovered, none soaked |
+| C3 | The dependency base is a stated choice: llama.cpp at a pin with N patches and how a rebase is done; marfrit-openvino +pN and its role | **open:** 49 patches over llama.cpp `bed0a85`; no rebase procedure recorded |
+| C4 | The interface promise: the HTTP surface, the unit flags and the supported environment switches that stay stable within 1.x | **open** (see A7) |
+| C5 | The release procedure as used for 0.7.x (pre-tag served check, second-model review, signed repository, fresh container) | met |
+
+## Order of work, proposed
+
+1. B1 and B2's open references, by price: the GDN stage (patch 0050, the
+   snapshots into the cache, done: +1.2-5.3 % decode by service; 0051, the
+   gating, done: +0-1.2 %; the conv stage next), then OpenVINO-style post-op fusion of the
+   activation quantization.
+2. B3: measure Strata's tokens per round on the same texts; build only what
+   that measurement prices.
+3. A2, A6, A5: operator decisions, priced where possible.
+4. C1, A7 and C4 together: the re-baselined DESIGN/README and the list of
+   supported switches.
+5. C3, then C2, the soak, as the last gate before the tag.

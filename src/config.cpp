@@ -453,6 +453,10 @@ std::string usage_text() {
         "  --llama-mtp-min-p P       libllama: stop drafting at a token the MTP head\n"
         "                            gives less than P, and leave it out of the verify\n"
         "                            (0-1; 0 off: always --llama-mtp drafts)\n"
+        "  --llama-reserve-cells N   libllama: reserve the compute buffers for a\n"
+        "                            prompt ubatch at N cache cells, not the whole\n"
+        "                            context; deeper prompt chunks take smaller\n"
+        "                            ubatches (0: the whole context)\n"
         "  --llama-checkpoints N     libllama: per lane, up to N snapshots of a hybrid\n"
         "                            model's recurrent state (near the prompt's end,\n"
         "                            at user messages), so a follow-up or an edited\n"
@@ -560,6 +564,11 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--llama-mtp-min-p") {
             if (!value(v) || !parse_double(v, cfg.llama_mtp_min_p) || cfg.llama_mtp_min_p < 0.0 || cfg.llama_mtp_min_p > 1.0)
                 return fail("--llama-mtp-min-p needs a probability from 0 to 1");
+        } else if (arg == "--llama-reserve-cells") {
+            int n = 0;
+            if (!value(v) || !parse_int(v, n) || n < 0)
+                return fail("--llama-reserve-cells needs a cell count (0: the whole context)");
+            cfg.llama_reserve_cells = static_cast<uint32_t>(n);
         } else if (arg == "--llama-mtp-vocab") {
             if (!value(v)) return fail("--llama-mtp-vocab needs a file of token ids");
             cfg.llama_mtp_vocab = std::string(v);
@@ -1125,9 +1134,10 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.llama_cpu_moe > 0 || cfg.llama_threads > 0 || cfg.llama_mtp > 0 || !cfg.llama_mtp_vocab.empty() ||
         !cfg.llama_mtp_gguf.empty() || cfg.llama_mtp_min_p > 0.0 ||
         cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192 ||
-        cfg.llama_expert_cache_on() || !cfg.llama_expert_profile.empty() || cfg.llama_layer_split > 0 || cfg.llama_mtp_card >= 0)
+        cfg.llama_expert_cache_on() || !cfg.llama_expert_profile.empty() || cfg.llama_layer_split > 0 || cfg.llama_mtp_card >= 0 ||
+        cfg.llama_reserve_cells > 0)
         return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab/-gguf/-min-p, --llama-kv, --llama-checkpoints/-step, "
-                    "--llama-expert-cache/-profile, --llama-layer-split and --llama-mtp-card are --engine llama options");
+                    "--llama-expert-cache/-profile, --llama-layer-split, --llama-mtp-card and --llama-reserve-cells are --engine llama options");
     if (!cfg.gguf_path.empty() && cfg.model_path.empty()) return fail("--gguf needs --model (the template IR directory)");
     if (!cfg.gguf_path.empty() && !cfg.paged) return fail("--gguf serves on the paged path only");
     }
