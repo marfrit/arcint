@@ -320,7 +320,7 @@ also run (peak 23,247 MiB). At 229,376 (the deployed size): the needle at 40 % o
 223,628-token prompt right (prefill 164.9 t/s, decode there 13.3 t/s), the task 10/10,
 peak 23,721 MiB. At 245,760 (deployed): the needle in a 236,938-token prompt right
 (prefill 157.2 t/s, decode there 11.5 t/s), the task 10/10, peak 24,195 MiB (238 MiB margin).
-Since 0.7.7 (`contrib/llama.cpp` 0045, `measured-here`, the deployed flags) the
+Since 0.7.7 (`contrib/llama.cpp` 0045, `measured-here`, the deployed flags: q8_0:q4_0, MTP 5) the
 prompt attention splits a call's keys across work-groups when a wave would run
 part empty: prefill 54,895 tokens 668.0 -> 690.6 t/s, 138,028 461.6 -> 490.1,
 228,120 342.9 -> 370.1; the needles right, the task 10/10, KL 0.005652 against

@@ -22,17 +22,17 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 **Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine
 builds llama.cpp `bed0a85` with `contrib/llama.cpp/patches` 0001-0045. Two
 llama.cpp patches; no change to arcint's own sources. Every number is
-`measured-here` on the B60; the details are in `contrib/llama.cpp/README.md`
-(0044, 0045), `docs/campaigns/flash-next-llama-engine.md` and
+`measured-here` on the B60 (the A770 check excepted); the details are in
+`contrib/llama.cpp/README.md` (0044, 0045), `docs/campaigns/flash-next-llama-engine.md` and
 `docs/campaigns/dense-prefill-attention.md` (stage 5; both on the `qfndev`
 branch).
 
 - **Patch 0044: Flash-Next's prompts below 256 tokens.** The bank stream
   (`GGML_OPENCL_BANK_STREAM=1`, as the Flash-Next unit runs) costs ~1.84 s
-  a graph at Flash-Next's sizes whatever its tokens. It now runs from 256
-  tokens a ubatch (`GGML_OPENCL_BANK_STREAM_MIN_TOK=N` overrides; 0 streams
-  every GEMM ubatch as before); below that a MoE GEMM gathers its routed
-  bank experts into the card-side mirror.
+  a graph at Flash-Next's sizes up to ~1,000 tokens, whatever its tokens.
+  It now runs from 256 tokens a ubatch (`GGML_OPENCL_BANK_STREAM_MIN_TOK=N`
+  overrides; 0 streams every GEMM ubatch as before); below that a MoE GEMM
+  gathers its routed bank experts into the card-side mirror.
   - Prefill (the unit's flags): 77 tokens 1.84 -> 1.11 s, 173 tokens 1.83
     -> 1.54 s; 269 tokens and up, the 20k needle and decode unchanged.
   - The same tokens: the gather fills the mirror in the bank's layout and
@@ -52,7 +52,8 @@ branch).
     three times (a different program: the merge reorders the softmax sums).
   - KL (16 x 512 at 512 rows a call): 0.005652 / 97.475 % against
     0.005950 / 97.304 % without splits. VRAM peak +20 MiB (24,291 MiB).
-  - The A770 does not use this kernel and is unchanged.
+  - The A770 does not use this kernel; its test-backend-ops results are
+    unchanged.
 
 ## 0.7.6 — 2026-10-13
 

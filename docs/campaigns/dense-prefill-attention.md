@@ -216,7 +216,8 @@ survive until they are used. One tile ahead stays.
   takes 256 rows of one head and a Xe core holds one, so the B60 runs 20 at
   a time. The time is the number of waves times 9.4 ms, for 256 to 2,048
   rows. The agent's 512-token ubatch makes 48 work-groups: three waves, the
-  last 40 % full. At full waves the kernel reaches 36 TFLOPS.
+  last 40 % full. At full waves the kernel reaches ~36 TFLOPS (37 % of the
+  card's 98.3).
 - **The fix:** llama.cpp CUDA's `parallel_blocks` (`code`,
   `fattn-common.cuh` `launch_fattn`). A call's keys are split across
   work-groups by the reference's 95 % wave rule, each split keeps its own
@@ -260,7 +261,8 @@ survive until they are used. One tile ahead stays.
      of prefill. Not pursued.
    - **The Q4_K GEMM is now the largest kernel.** Its record is
      `llama-engine-kernel-gap.md` (0013).
-2. **Attention, what is left** (35 % of peak in the kernel at full waves, 0045):
+2. **Attention, what is left** (~36 TFLOPS a full wave, 37 % of peak; 34.5 at
+   0045's 512-row split, 35 %):
    - the O rescale when a row's max rises;
    - the 2D read payload setup, about 90 scalar movs a tile;
    - the mixed-tile mask path on the diagonal.
