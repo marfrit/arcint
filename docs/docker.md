@@ -273,9 +273,13 @@ coder's decode on the A770 by 14-15 % (`contrib/llama.cpp/README.md`). An
 image built from the 0.7.8 tree carries the same patches; it has not been
 re-measured from a container.
 
-**No image is published yet.** `.github/workflows/build-toolbox.yml` has
-not been dispatched on this repository; build the two tiers locally as
-above, or dispatch the workflow from a fork.
+**Published images** (2026-10-14, `.github/workflows/build-toolbox.yml` on
+the 0.7.8 tag's tree): `ghcr.io/marfrit/arcint-ov:2026.4.0-ov71640275-marfrit-p27`
+(tier 1) and `ghcr.io/marfrit/arcint:20261014T180418`, `:edge` (tier 2, digest
+`sha256:7b88942b18ef…`). They carry 0.7.8, not later releases; the workflow's
+smoke test is device-free, and no GPU run of these images is recorded. GHCR
+publishes a new package as private; pulling it from another account needs
+its visibility set by the owner.
 
 ## What CI covers, and what it cannot
 
