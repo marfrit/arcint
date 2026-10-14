@@ -474,7 +474,18 @@ arms of the same configuration).
   | 1,024 / 12,500 MiB (9,069) | 1,543 MiB | 538 t/s (37.3 s) | 36.8 / 41.1 | 23.40 GiB |
 
   Decode +6-8 % and 0.4 GiB more margin for prefill -18 %: each chunk
-  streams the bank once, so half the chunk streams it twice as often.
+  streams the bank once, so half the chunk streams it twice as often. The operator keeps 2,048 (2026-10-14).
+
+  **Next: the prompt buffers borrowed from the expert cache** (Strata's
+  default, `code`: `generate.cpp:333` "the prompt path borrows the top
+  expert-cache slots for its buffers and refills them after the prompt",
+  `prefill.cpp:513-721`; `--prefill auto` takes the largest chunk, up to
+  8,192, whose buffers the slots can lend). arcint reserves the prefill's
+  3,048 MiB compute buffer for the whole session; decode needs a fraction of
+  it. Lent to the slots between prompts, it is worth about what the 1,024
+  chunk measured (+6-8 % decode for 1.5 GiB) without the prefill's loss, and
+  a larger chunk could take the borrowed memory during a prompt (fewer bank
+  passes). Not built; the price is the table above.
 - **The gap between kernels** (a chain of 4096-wide ADDs, test-backend-ops
   perf): 3.03 us a kernel. compute-runtime debug keys: skipping the walker's
   post-sync 2.91 us, optimized in-order barriers, L3 prefetch, relaxed
