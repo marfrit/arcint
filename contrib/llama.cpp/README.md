@@ -3105,3 +3105,55 @@ between the chain and the GDN writes over their bytes.
   that way. And upstream's `graph_optimize` hook with `add_alloc_dep`, which
   CUDA uses, would keep alpha and b alive without touching the graph
   builder: the cleaner route at a rebase.
+
+## 0052-reserve-cells.patch
+
+The compute buffers sized for the prompts that need them, not for a full
+cache. The scheduler reserves for a prompt ubatch at a completely full
+cache: 2,048 tokens (the expert cache's whole chunk) against 131,072 cells
+for Flash-Next, 3,048 MiB on the B60 plus 770 for the MTP draft context,
+for the whole session. A listing of the reservation's largest tensors
+(`measured-here`) named the QSA indexer's head scores, pools x 4 heads x
+the ubatch's tokens in f32, 1,026 MiB, with a ReLU copy of the same size,
+and the selection mask, cells x tokens in f16.
+
+Two changes, the values unchanged:
+- The indexer's ReLU in place (`qwen4exp.cpp`): the product's only reader.
+  On its own, 3,048 -> 2,278 MiB and 770 -> 577.
+- `llama_context_params::n_kv_reserve` (arcint `--llama-reserve-cells N`):
+  the reservation sees min(cache, N) cells and their pools, and
+  `llama_context::decode` cuts a batch's ubatches so that tokens x cells
+  stays within n_ubatch x N (the batch's last position stands for the
+  cells). The MTP draft context gets the same budget over its own ubatch.
+  At 20,480 cells: 915 and 380 MiB. A prompt keeps whole 2,048-token
+  chunks to ~20k tokens; deeper chunks are cut (1,861 tokens at 22.5k
+  cells, 580 at 72k).
+
+- **Measured** (`measured-here`, 2026-10-14, B60, Flash-Next at 131,072
+  tokens, 3 drafts with the stop at 0.5, one binary; the capital, the 20k
+  needle, Strata's long request twice, a 72k-token needle):
+
+  | arm | slots | decode, first / second | 20k prefill | 72k prefill | peak VRAM |
+  |---|---|---|---|---|---|
+  | before | 8,191 (11,300 MiB) | 34.8 / 38.0 t/s | 657 t/s | 560 t/s (128.7 s) | 23.82 GiB |
+  | ReLU in place | 8,191 | 34.8 / 38.0 | 658 | 560 | 22.85 |
+  | ReLU, 11,850 MiB | 8,595 | 35.6 / 39.3 | 658 | 560 | 23.37 |
+  | ReLU, `--llama-reserve-cells 20480`, 13,400 MiB | 9,724 | 38.4 / 43.0 | 662 | 416 (173.0 s) | 23.35 |
+
+  Every arm: Paris, both needles, the same text (md5). The deep prompt's
+  cost is the bank streamed once per (smaller) ubatch.
+- **Not taken on the way:** a first build capped the cells but not the
+  indexer's pool count (reserved from the cache size): 3,048 -> 2,613 MiB
+  only, and an arm that spent the expected saving on slots ran 1.8 GiB
+  over the card (26.2 GB resident, a 24-token prompt in 7 s); stopped by
+  pid, the card recovered without a reboot.
+- **Reviewed** before the push by a second model: no defect that changes an
+  answer. Applied after the measured build: the cut ubatch never falls below
+  a split's rollback tail (n_seq_max x (n_rs_seq + 1) + 1 tokens), so a small
+  `--llama-reserve-cells` cannot abort `split_equal`. Its limits, recorded:
+  the budget bounds the tensors that grow with tokens x cells; those that
+  grow with cells alone (the re-pool after an early edit of a deep lane)
+  can grow the buffer once by ~100-150 MiB at 131K, and named lanes without
+  KV windows count cells by position, which undercounts them (growth back
+  toward the old reservation, not corruption). The Flash-Next unit runs
+  one lane.

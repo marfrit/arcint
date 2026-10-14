@@ -524,8 +524,14 @@ arms of the same configuration).
   weights: reserve for a budget (a 512-token chunk at the full context,
   ~790 MiB) and cut each prompt chunk to what fits the budget at the
   cache's current fill: 2,048 tokens to ~18-20k cells, ~1,000 at 65K, 512
-  at 131K. Planned as patch 0052; the decode price is the 32K arm's hit
-  rate, the prefill price falls only on prompts past ~20k tokens.
+  at 131K. Built as patch 0052 (README 0052, `measured-here`): the
+  dominant tensor was the indexer's head scores (pools x 4 heads x tokens,
+  f32, 1 GiB at 131K) and its ReLU copy, not the mask. The ReLU in place
+  alone frees ~1 GiB (decode +2-3 % spent on slots, everything else
+  unchanged); with `--llama-reserve-cells 20480` and 13,400 MiB of slots
+  decode is 38.4 / 43.0 t/s against 34.8 / 38.0 at 131,072 tokens, the 20k
+  prefill unchanged, a 72k prompt 128.7 -> 173.0 s. The unit needs a
+  release with 0049-0052 before either applies.
 - **The gap between kernels** (a chain of 4096-wide ADDs, test-backend-ops
   perf): 3.03 us a kernel. compute-runtime debug keys: skipping the walker's
   post-sync 2.91 us, optimized in-order barriers, L3 prefetch, relaxed
