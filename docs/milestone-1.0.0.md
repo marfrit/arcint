@@ -19,7 +19,7 @@ two Arc cards. It does not mean every model or every engine feature.
 | A4 | Long context at the deployed sizes: the agent at 245,760, the coder at 98,304, Flash-Next at 131,072, with needles right and nothing evicted | met (`measured-here`, the 0045 and 0.7.8 gates) |
 | A5 | Checkpoints and prefix reuse on the libllama engine (`--llama-checkpoints`) | met for one lane; **decide** whether a shared prefix cache across lanes belongs in 1.0 (not built) |
 | A6 | The OpenVINO engine's role is decided: kept as the documented alternative with its own gates, or retired from the default build | **open** |
-| A7 | Every switch that 1.0 keeps is documented; diagnostic and red-case switches are named as such | **open:** dozens of `GGML_OPENCL_*` and `LLAMA_*` variables exist; there is no list of which ones are supported |
+| A7 | Every switch that 1.0 keeps is documented; diagnostic and red-case switches are named as such | **drafted** (2026-10-15): `docs/switches.md` lists the 90 switches of the llama.cpp series and arcint's 38 in six classes (operational, tuning, opt-in alternative, off switch, red case, diagnostic) with default, patch and evidence. **Operator:** which stay stable in 1.x (C4), and whether to remove the seven opt-in alternatives that measured slower or neutral, `GGML_OPENCL_FUSE_RMS_SCALE` (an alias of `FUSE_0049`) and `ARCINT_PA_HOST_INPUTS` (no recorded result) |
 
 ## B. Almost no gains by obvious changes
 
