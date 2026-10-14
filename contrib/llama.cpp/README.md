@@ -2763,3 +2763,74 @@ upload (`code`, `src/program/generate.cpp:3589-3606`, `res_upload` at
   came after the measured build. The final build, checked on Flash-Next:
   the capital, the needle, the hash-table answer's same text (md5
   `d2069d0a`) at 31.6 t/s, and the table checks at 0 of 144.
+
+## 0047-input-copies.patch
+
+A graph's inputs (positions, masks, ids) reach the card without a blocking
+write each and without a wait each.
+
+- **Why** (`measured-here`, stage 8 of `docs/campaigns/flash-next-llama-engine.md`):
+  - With one GPU the scheduler creates no events (`n_copies == 1`,
+    `ggml-backend.cpp`, `code`). So for each user input of a split it
+    synchronizes the backend and then copies synchronously. CUDA on one GPU
+    runs the same sequence; there, the calls are cheaper.
+  - On the B60 a sync costs ~10.6 us and a blocking 1 KiB write ~10.4 us.
+  - Flash-Next's verify has 34 inputs (0.93-0.95 ms a graph) and a draft
+    graph 17 (0.40 ms). The GPU idles through them.
+- **What:**
+  - **The scheduler** waits once before a split's first user input instead
+    of before each. Each copy is synchronous and nothing in the input loop
+    computes, so one wait covers them all (`code`; reviewed).
+    `GGML_SCHED_INPUT_SYNC_EACH=1` restores the wait per input.
+  - **The OpenCL backend:**
+    - a write of at most 4 MiB into a buffer that holds no weights is
+      copied into a 32 MiB USM host ring and enqueued without a wait, so the
+      caller may reuse its bytes at once;
+    - the ring is reused after a `clFinish` when it wraps;
+    - weights, USM buffers and converted layouts keep their own paths;
+    - `GGML_OPENCL_STAGE_INPUTS=0` writes blocking again.
+- **Measured** (`measured-here`, 2026-10-14, B60):
+  - **Flash-Next, the unit's flags** (131,072 ctx, q8_0 KV, 11,300 MiB of
+    slots, MTP 2, the bank stream). One binary (the 0.7.7 tree + 0046 +
+    0047); the old behaviour by both switches; A B A B; `GGML_SCHED_TIMING`:
+
+    | | old | 0047 |
+    |---|---|---|
+    | a verify's input copies | 926-949 us | 582-593 us |
+    | a draft's input copies | 395-404 us | 134-141 us |
+    | hash table, 300 tokens | 31.6 / 31.6 t/s | 32.0 / 32.0 |
+    | compiler | 36.8 / 36.8 | 37.3 / 37.3 |
+    | TCP | 35.3 / 35.3 | 35.8 / 35.7 |
+    | the 20k needle's prefill | 650.4 / 650.3 t/s | 650.9 / 650.5 |
+
+  - **Answers:** the same text in every arm (md5 of each answer), and the
+    capital and the needle right.
+  - **The red case** (`GGML_OPENCL_STAGE_RED=1`: the ring's stale bytes
+    reach the card): the capital answered "!!!!!!!!", the needle empty, the
+    answer all "!".
+  - **test-backend-ops** (the full suite, the B60): 11,143 of 11,294 with
+    staging and without, the same 153 failing cases (the error values differ
+    run to run: the inputs are random). The red case fails 1,068.
+  - test-backend-ops alone cannot catch a staging fault: its CPU reference
+    reads its inputs back from the GPU buffer, so both sides see the same
+    bytes. The served red case is the one that bites.
+  - The dense agent and the coder copy their inputs the same way. Their
+    decode was not measured here.
+- **Reviewed** before the push by a second model:
+  - one wait a split is enough (non-user inputs between user inputs, several
+    splits on one backend, the CPU backend, events present);
+  - the ring's ordering against the backend's other queues (the bank stream
+    and the expert cache's adapt queue read no buffer this path writes);
+  - which buffers stage;
+  - the threading (one thread writes a context's tensors).
+
+  It found two defects, fixed before the final build:
+  - After the context's last free the ring was freed but still marked on, so
+    a write after a reload in the same process would have used it. The ring
+    is now decided again.
+  - `GGML_OPENCL_STAGE_RED` was first offered as a test-backend-ops red case,
+    which cannot fail (above); the served red case replaced it.
+
+  Its notes, taken: the ring is allocated only for a staging candidate, and
+  the red switch is read as a number. The final build: the capital, the
+  needle, the hash-table answer's same text at 32.0 t/s, inputs 591 / 138 us.

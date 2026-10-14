@@ -1250,3 +1250,10 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
   measured, against 34 x 17.3 us = 0.59 ms from the probe: the larger
   inputs (masks, the rotations) take longer than its 1 KiB. A draft graph
   (17 inputs) spends ~0.4 ms (the first exploration run).
+  Built as patch 0047 (README 0047): the scheduler waits once a split
+  before its user inputs, and the OpenCL backend stages small writes into
+  non-weight buffers in a USM host ring, enqueued without a wait. A verify's
+  inputs 926-949 -> 582-593 us, a draft's 395-404 -> 134-141; decode +1.1 to
+  +1.4 % on each of the three answers (31.6 / 36.8 / 35.3 -> 32.0 / 37.3 /
+  35.7-35.8 t/s, two A/B pairs), prefill and the text unchanged
+  (`measured-here`).
