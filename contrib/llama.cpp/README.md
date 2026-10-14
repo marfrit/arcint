@@ -3040,3 +3040,68 @@ writes every slot over slot 0 (the red case).
   snapshot region, the node order and the scheduler's splits. No defect. Its
   notes, applied after the measured build: the unused `snap_size` dropped, and
   the `CPY`'s compute flag required, as the graph loop does.
+
+## 0051-gdn-gating.patch
+
+The gated delta net's gating computed inside the Intel GDN kernels.
+`build_recurrent_attn`'s callers form the gate as
+`softplus(alpha + dt_bias) * A` and beta as `sigmoid(b)`: four small ops a
+layer ahead of the GDN. vllm-xpu-kernels' delta stage takes a and b raw with
+A_log and dt_bias and gates inside (`code`,
+`csrc/xpu/gdn_attn/gated_delta_rule.hpp`). Here the OpenCL backend, before
+each graph, finds the chain in a window before each GDN node (every
+intermediate used once), skips the ADD, SOFTPLUS, MUL and SIGMOID, and gives
+`gated_delta_net_intel.cl` the raw projections with dt and A a head. The
+kernel repeats the separate kernels' expressions with an always-0 XOR
+between the steps, so the roundings are the separate kernels'.
+
+The kernel reads alpha and b when the GDN runs, later than the allocator
+keeps them: it frees alpha after the ADD. So `delta-net-base.cpp`
+(`gdn_keep_gating_inputs`) attaches them as extra sources of the GDN node
+(`src[6]` alpha, `src[7]` b), which keeps them alive; the op's meaning does
+not change and the CPU ignores them. The backend folds only when those
+sources are the chain's raw inputs, and refuses a fold if any computed node
+between the chain and the GDN writes over their bytes.
+
+`GGML_OPENCL_FUSE_0050` bit 2 is the switch (default 3: 0050 and 0051);
+`GGML_OPENCL_FUSE_0051_PART` folds the gate (1), beta (2) or both (3);
+`GGML_OPENCL_FUSE_0051_RED=1` passes A in place of dt (the red case).
+
+- **Measured** (`measured-here`, 2026-10-14, the units' flags, one binary,
+  the bit off in the other arm, A B A B, three 300-token answers):
+
+  | service | off | on |
+  |---|---|---|
+  | dense agent (B60, 48 GDN layers) | 39.2 / 42.0 / 39.6-39.7 t/s | 39.4 / 42.1 / 39.7-39.8 (+0.3 %) |
+  | coder (A770, 30 GDN layers) | 50.7 / 47.0-47.1 / 43.6-43.7 | 51.2 / 47.6 / 44.1-44.2 (+0.9-1.2 %) |
+  | Flash-Next (B60, 36 GDN layers) | 32.7-32.8 / 38.2-38.3 / 36.6-36.7 | 32.7-32.8 / 38.3 / 36.6-36.7 (neutral) |
+
+  - Every answer's md5 equal in both arms on all three; every GDN node
+    folded (36/36, 48/48, 30/30); the red case changed all three Flash-Next
+    texts and lost the needle.
+  - Flash-Next's verify graph spends 0.3-0.4 ms less enqueueing (11.5-11.6
+    -> 11.1-11.4 ms of host time), but its ~63 ms round is not host-bound.
+  - test-backend-ops GATED_DELTA_NET 42/42 on both cards (single ops: the
+    unfused path with the new arguments). The four kernel shapes compile
+    offline with no spill and no recompile; the gating adds 6-20 % to the
+    kernels' instruction count.
+- **Not bit-identical at first, and why.** The first build's helpers sat
+  inside `#ifdef GDN_PP`: the generation program did not compile and the
+  backend fell back to `gated_delta_net.cl` silently (its "42/42" and md5s
+  measured the generic kernel). Fixed, the fold changed every md5 while the
+  answers stayed right. A switch per part showed beta's fold bit-identical
+  and the gate's not; the ISA of the fused gate matched the separate kernels
+  instruction for instruction. An overlap check then refused 36 of 36 folds:
+  alpha's memory was reused between the ADD and the GDN. The extra sources
+  fixed it. A map over the whole graph each compute, in the first pre-pass,
+  cost about what the launches saved; it is a window search now.
+- **Reviewed** twice by a second model. The first review read the version
+  before the liveness fix: its one finding, the reshaped gate's own use
+  count, is checked now. The second read the final diff, including every
+  place in ggml, the allocator, the scheduler and the other backends that
+  iterates a node's sources. It found no defect, and made two notes. A
+  model whose beta is `reshape(sigmoid(b))` (qwen3next) folds nothing, as
+  the match requires the sigmoid first; none of the served models builds it
+  that way. And upstream's `graph_optimize` hook with `add_alloc_dep`, which
+  CUDA uses, would keep alpha and b alive without touching the graph
+  builder: the cleaner route at a rebase.

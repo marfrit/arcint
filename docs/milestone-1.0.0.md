@@ -31,7 +31,7 @@ unchanged.
 
 | # | criterion | state (2026-10-14) |
 |---|---|---|
-| B1 | No priced lever of 2 % or more of served decode or prefill is left unbuilt on any service | **open:** the GDN stage's fusions (vllm-xpu-kernels' conv and delta stages, ~1.5-2 % of Flash-Next decode estimated); the activation quantization folded into its producers (~0.6 %); the rest of the decode kernel count (~13 % of a Flash-Next round, the sum of many small fusions, none obvious alone) |
+| B1 | No priced lever of 2 % or more of served decode or prefill is left unbuilt on any service | **open:** the GDN stage's conv-stage fusion (vllm-xpu-kernels' conv stage; the delta stage is built: 0050 +1.2-5.3 %, 0051's gating +0-1.2 % by service, Flash-Next neutral); the activation quantization folded into its producers (~0.6 %); the rest of the decode kernel count (~13 % of a Flash-Next round, the sum of many small fusions, none obvious alone) |
 | B2 | Every reference engine's mechanism for the served models is either built, measured as not paying here, or set aside by the operator. The references are Strata, FreeToken and Infernix for Flash-Next; llama.cpp's CUDA and Vulkan backends; vllm-xpu-kernels and sycl-tla on Xe2; and OpenVINO's GPU plugin | mostly met: this week's audits built or measured the reference's prompt attention, its wave split, CUDA's per-call K/V conversion, MMQ's shared tile, sycl-tla's payloads and Strata's tables. **Open:** vllm-xpu-kernels' GDN spec-decode rollback (one conv cache advanced by the accepted count instead of K snapshot copies); OpenVINO's post-op fusion |
 | B3 | Flash-Next is at parity with Strata on the same card, or the gap is explained by a measured cause | prefill: met (677 t/s at the 20k needle against Strata's 620, `measured-here`). Decode: 32-37 against 37.2-37.8 t/s on the same texts; the record names tokens per round, which is not yet measured on Strata's side |
 | B4 | The kernels that dominate device time are at their measured ceiling for their design | met for the B60's prompt attention, the A770's quantized attention staging and the int8 Q4_K GEMM (`measured-here`, the campaign docs); open for the Q5_K/Q6_K GEMMs (not audited at that depth) |
@@ -52,8 +52,8 @@ reference mechanism, and B3's gap is explained or closed.
 ## Order of work, proposed
 
 1. B1 and B2's open references, by price: the GDN stage (patch 0050, the
-   snapshots into the cache, done: +1.2-5.3 % decode by service; the gating
-   and the conv stage next), then OpenVINO-style post-op fusion of the
+   snapshots into the cache, done: +1.2-5.3 % decode by service; 0051, the
+   gating, done: +0-1.2 %; the conv stage next), then OpenVINO-style post-op fusion of the
    activation quantization.
 2. B3: measure Strata's tokens per round on the same texts; build only what
    that measurement prices.

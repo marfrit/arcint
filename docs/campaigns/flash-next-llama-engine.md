@@ -1261,8 +1261,17 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
   the delta stage (the a/b gating inside, the state updated in place). Built
   so far: 0050, the snapshots written into the cache by the kernel (README
   0050: Flash-Next +1.2-1.9 %, the dense agent +5.1-5.3 %, the coder +1.8-2.0
-  %, bit-identical). Next: the gating into the GDN kernel (4 launches a
-  layer), the conv state's concat and snapshots into the conv kernel; the
+  %, bit-identical). 0051, the gating into the GDN kernel (README 0051, 4
+  launches a layer): bit-identical; Flash-Next neutral (32.7-32.8 / 38.3 /
+  36.6-36.7 against 32.7-32.8 / 38.2-38.3 / 36.6-36.7), the dense agent +0.3
+  %, the coder +0.9-1.2 % (`measured-here`). The launches leave the host
+  (Flash-Next's verify graph 11.5-11.6 -> 11.1-11.4 ms of enqueue time), but
+  Flash-Next's round (~63 ms) is not set by the host: a launch fusion pays
+  where the host is the bound (the coder on the A770). Two traps on the
+  way, both in the README: the first build read raw alpha after the
+  allocator had reused its memory (answers still right, md5s moved), and a
+  map over the whole graph each compute cost what the launches saved.
+  Next: the conv state's concat and snapshots into the conv kernel; the
   rollback by an accepted-count offset instead of K snapshots is the larger
   change, priced separately.
 - **The input copies.** The OpenCL backend has no events and no async copy,
