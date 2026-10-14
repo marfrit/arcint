@@ -1,3 +1,18 @@
+arcint (0.7.7-1) trixie; urgency=medium
+
+  * 0.7.7: two llama.cpp patches on the B60. 0044: the bank stream runs
+    from 256 tokens a ubatch (GGML_OPENCL_BANK_STREAM_MIN_TOK); below that
+    a MoE GEMM gathers its routed experts. Flash-Next's 77-token prompt
+    1.84 -> 1.11 s, 173 tokens 1.83 -> 1.54; 269 and up unchanged, the
+    same tokens. 0045: prompt attention splits a call's keys across
+    work-groups when a wave would run part empty (llama.cpp CUDA's
+    parallel_blocks; GGML_OPENCL_FA_DPAS2_SPLIT=1 turns it off). The dense
+    agent's prefill at 245,760 ctx: 55k tokens 668 -> 691 t/s, 138k 462 ->
+    490, 228k 343 -> 370; KL inside the bar, answers right. Runtime floor
+    unchanged at marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Wed, 14 Oct 2026 07:05:00 +0200
+
 arcint (0.7.6-1) trixie; urgency=medium
 
   * 0.7.6: Flash-Next's short prompts on the libllama engine, llama.cpp
