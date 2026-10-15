@@ -49,16 +49,16 @@ KL (DESIGN §7.2).
 
 ## Current numbers
 
-0.7.12, the release build with each unit's flags, one fresh process per
-service, `measured-here` on the named card. "task" is the acceptance task: a
+0.8.0's pre-tag check: the release package with each unit's flags, two fresh
+processes per service, the model on the NVMe, `measured-here` on the named card. "task" is the acceptance task: a
 Lua CSV parser to RFC 4180, ten named cases, the candidate code executed, one
 point per case, at temperature 0.
 
 | service | card | prefill | decode | answers |
 |---|---|---|---|---|
-| agent | B60 | 695.3 t/s at 54,895 tokens, 491.8 at 138,028 | not in this check (36.6 / 32.3 / 19.3 t/s at 4k / 29k / 130k on 2026-10-08, before 0016-0051) | the needle at 138k; task 10/10 |
-| coder | A770 | 721.0 t/s at 40,841 tokens | 51.1 / 47.6 / 44.0 t/s on three 300-token answers | the needle; task 9/10 |
-| Flash-Next | B60 + 20.3 GiB host bank | 690.3 t/s at 20,045 tokens | 43.4 t/s | the needle |
+| agent | B60 | 695.2 t/s at 54,895 tokens, 491.8 at 138,028 | not in this check (36.6 / 32.3 / 19.3 t/s at 4k / 29k / 130k on 2026-10-08, before 0016-0051) | the needle at 138k; task 10/10 |
+| coder | A770 | 725.5 t/s at 40,841 tokens | 51.1 / 47.5 / 44.0 t/s on three 300-token answers | the needle; task 9/10 |
+| Flash-Next | B60 + 20.3 GiB host bank | 665.6 t/s at 20,045 tokens (asked right after the capital) | 42.3 t/s | the needle |
 
 Strata's own engine (its SYCL port) on the same B60: 620 t/s at the 20k
 needle and 37.8 t/s decode on its own request, where arcint decodes

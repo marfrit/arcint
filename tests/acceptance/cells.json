@@ -127,7 +127,36 @@
     "reports": "peak VRAM and GTT",
     "external": null,
     "timeout_seconds": 3600,
-    "references": null
+    "references": [
+      {
+        "metric": "prefill-55k",
+        "value": 695.2,
+        "gate_at": 694.9,
+        "unit": "t/s",
+        "direction": "lower-is-worse",
+        "samples": 2,
+        "spread_pct": 0.03,
+        "config": "24 GB card, the agent unit's flags (245,760 ctx, q8_0:q4_0 KV, MTP 5, the draft vocabulary), one fresh process a run, the model staged on the NVMe",
+        "prompt_tokens": 54895,
+        "design": "§5",
+        "measured": "2026-10-15",
+        "binary": "the 0.8.0 pre-tag package (ee8c458), two processes back to back; the floor is the lower run minus the spread between them (operator, 2026-10-15)"
+      },
+      {
+        "metric": "prefill-138k",
+        "value": 491.75,
+        "gate_at": 491.3,
+        "unit": "t/s",
+        "direction": "lower-is-worse",
+        "samples": 2,
+        "spread_pct": 0.06,
+        "config": "24 GB card, the agent unit's flags (245,760 ctx, q8_0:q4_0 KV, MTP 5, the draft vocabulary), one fresh process a run, the model staged on the NVMe",
+        "prompt_tokens": 138028,
+        "design": "§5",
+        "measured": "2026-10-15",
+        "binary": "the 0.8.0 pre-tag package (ee8c458), two processes back to back; the floor is the lower run minus the spread between them (operator, 2026-10-15)"
+      }
+    ]
   },
   {
     "name": "coder-served",
@@ -153,7 +182,64 @@
     "reports": "peak VRAM and GTT",
     "external": null,
     "timeout_seconds": 3600,
-    "references": null
+    "references": [
+      {
+        "metric": "decode-a",
+        "value": 51.1,
+        "gate_at": 51.1,
+        "unit": "t/s",
+        "direction": "lower-is-worse",
+        "samples": 2,
+        "spread_pct": 0.0,
+        "config": "16 GiB card, the coder unit's flags (98,304 ctx, q8_0:q4_0 KV, MTP 4), one fresh process a run, the model staged on the NVMe; decode a/b/c: 300-token answers on hash tables, compilers, TCP",
+        "prompt_tokens": null,
+        "design": "§5",
+        "measured": "2026-10-15",
+        "binary": "the 0.8.0 pre-tag package (ee8c458), two processes back to back; the floor is the lower run minus the spread between them (operator, 2026-10-15)"
+      },
+      {
+        "metric": "decode-b",
+        "value": 47.5,
+        "gate_at": 47.5,
+        "unit": "t/s",
+        "direction": "lower-is-worse",
+        "samples": 2,
+        "spread_pct": 0.0,
+        "config": "16 GiB card, the coder unit's flags (98,304 ctx, q8_0:q4_0 KV, MTP 4), one fresh process a run, the model staged on the NVMe; decode a/b/c: 300-token answers on hash tables, compilers, TCP",
+        "prompt_tokens": null,
+        "design": "§5",
+        "measured": "2026-10-15",
+        "binary": "the 0.8.0 pre-tag package (ee8c458), two processes back to back; the floor is the lower run minus the spread between them (operator, 2026-10-15)"
+      },
+      {
+        "metric": "decode-c",
+        "value": 44.05,
+        "gate_at": 43.9,
+        "unit": "t/s",
+        "direction": "lower-is-worse",
+        "samples": 2,
+        "spread_pct": 0.23,
+        "config": "16 GiB card, the coder unit's flags (98,304 ctx, q8_0:q4_0 KV, MTP 4), one fresh process a run, the model staged on the NVMe; decode a/b/c: 300-token answers on hash tables, compilers, TCP",
+        "prompt_tokens": null,
+        "design": "§5",
+        "measured": "2026-10-15",
+        "binary": "the 0.8.0 pre-tag package (ee8c458), two processes back to back; the floor is the lower run minus the spread between them (operator, 2026-10-15)"
+      },
+      {
+        "metric": "prefill-41k",
+        "value": 725.45,
+        "gate_at": 725.3,
+        "unit": "t/s",
+        "direction": "lower-is-worse",
+        "samples": 2,
+        "spread_pct": 0.01,
+        "config": "16 GiB card, the coder unit's flags (98,304 ctx, q8_0:q4_0 KV, MTP 4), one fresh process a run, the model staged on the NVMe; decode a/b/c: 300-token answers on hash tables, compilers, TCP",
+        "prompt_tokens": 40841,
+        "design": "§5",
+        "measured": "2026-10-15",
+        "binary": "the 0.8.0 pre-tag package (ee8c458), two processes back to back; the floor is the lower run minus the spread between them (operator, 2026-10-15)"
+      }
+    ]
   },
   {
     "name": "flashnext-served",
@@ -179,7 +265,36 @@
     "reports": "peak VRAM and GTT",
     "external": null,
     "timeout_seconds": 3600,
-    "references": null
+    "references": [
+      {
+        "metric": "prefill-20k",
+        "value": 665.6,
+        "gate_at": 665.0,
+        "unit": "t/s",
+        "direction": "lower-is-worse",
+        "samples": 2,
+        "spread_pct": 0.06,
+        "config": "24 GB card + host bank, the Flash-Next unit's flags (IQ2_XS, 131,072 ctx, q8_0 KV, 13,400 MiB of slots, MTP 3, the CPU misses, the bank stream), one fresh process a run, the files staged on the NVMe; decode: the 300-token hash-table answer after the needle",
+        "prompt_tokens": 20045,
+        "design": "§5",
+        "measured": "2026-10-15",
+        "binary": "the 0.8.0 pre-tag package (ee8c458), two processes back to back; the floor is the lower run minus the spread between them (operator, 2026-10-15)"
+      },
+      {
+        "metric": "decode",
+        "value": 42.25,
+        "gate_at": 42.1,
+        "unit": "t/s",
+        "direction": "lower-is-worse",
+        "samples": 2,
+        "spread_pct": 0.24,
+        "config": "24 GB card + host bank, the Flash-Next unit's flags (IQ2_XS, 131,072 ctx, q8_0 KV, 13,400 MiB of slots, MTP 3, the CPU misses, the bank stream), one fresh process a run, the files staged on the NVMe; decode: the 300-token hash-table answer after the needle",
+        "prompt_tokens": null,
+        "design": "§5",
+        "measured": "2026-10-15",
+        "binary": "the 0.8.0 pre-tag package (ee8c458), two processes back to back; the floor is the lower run minus the spread between them (operator, 2026-10-15)"
+      }
+    ]
   },
   {
     "name": "sanitizers",
