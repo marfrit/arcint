@@ -7,7 +7,7 @@ This is a proposal. The operator decides which switches stay stable within
 1.x (charter C4). Until then nothing here is a promise.
 
 A switch here is an environment variable read by arcint, by one of its tools,
-or by the llama.cpp patch series in `contrib/llama.cpp/patches` (0001-0055).
+or by the llama.cpp patch series in `contrib/llama.cpp/patches` (0001-0056).
 Each switch is in exactly one class:
 
 - **operational**: changes how a service runs; a unit file may set it.
@@ -44,6 +44,7 @@ Two kinds of name are not in a table:
 | `GGML_OPENCL_DEVICES` | unset: one platform, as before | `P:D[,P:D...]` picks OpenCL devices by platform and device index, across platforms. Overrides `GGML_OPENCL_PLATFORM` / `GGML_OPENCL_DEVICE`. | 0023 | `0:0,1:0` lists both cards; unset lists the B60 alone (`measured-here`). |
 | `LLAMA_EXPERT_CACHE_MIB` | unset: no cache unless the API sets a budget | Expert-cache budget in MiB, `A,B` for one budget a device. Used only when the API gives none. | 0021, 0024 | — |
 | `LLAMA_EXPERT_CACHE_PROFILE` | unset: expert-major round robin | Path of a Strata STRP decode profile that ranks the cached experts. Read together with `LLAMA_EXPERT_CACHE_MIB`. | 0021 | — |
+| `LLAMA_EXPERT_CACHE_CPU_MISSES` | off | `1`: a share of each decode layer's missed experts computed on the CPU from the bank (Strata's doorbell tier and its multi-token AVX2 rows, README 0056). | 0056 | Flash-Next decode +15.2 % on six answers, KL +0.0028 nats, B60 (`measured-here`). |
 
 ### Tuning
 
@@ -79,6 +80,8 @@ Two kinds of name are not in a table:
 | `GGML_OPENCL_PAIR_ORDER` | 1 | Order of a verify's expert pairs: 1 bank pairs first, 2 last, 0 token order. | 0022 | 30.7 t/s first, 29.8 token order, 29.3 last (Flash-Next MTP 2, B60, `measured-here`). |
 | `LLAMA_EXPERT_CACHE_ADAPT_EVERY` | 6 | Decode tokens between adapt rounds; 0 never adapts. | 0021 | Hit rate 89.9-90.7 % across the constants (`measured-here`). |
 | `LLAMA_EXPERT_CACHE_DECAY` | 0.7 | Decay of the routing counts at each adapt. | 0022 | Same. |
+| `LLAMA_EXPERT_CACHE_CPU_MISS_THREADS` | 8 | Threads of the CPU miss path (the coordinator and its workers). | 0056 | 6 lower, 10 and 12 as 8 (`measured-here`). |
+| `GGML_OPENCL_CPU_MISS_MAX` | 16 | Missed pairs a decode layer hands to the CPU; the card reads the rest over the link. | 0056 | 2 / 4 / 8 / 16 / 24 / 32: +4.2 / +8.5 / +11.3 / +13.4 / below 16 (`measured-here`). |
 | `LLAMA_EXPERT_CACHE_MAX_SWAPS` | 96 | Largest swaps a plan makes; 0 is the discriminator in the swap-queue measurement. | 0022 | Same. |
 | `LLAMA_EXPERT_CACHE_MIN_GAIN` | 1.5 | Least gain for a swap. | 0022 | Same. |
 | `LLAMA_EXPERT_CACHE_MIN_USAGE` | 2.0 | Least usage for a swap. | 0022 | Same. |
@@ -136,6 +139,7 @@ Two kinds of name are not in a table:
 | `GGML_SCHED_INPUT_SYNC_EACH` | off | `1`: the scheduler waits for the backend before each input copy, as upstream does. | 0047 | Same measurement as `STAGE_INPUTS`. |
 | `LLAMA_EXPERT_CACHE_ASYNC_IDS` | on (needs the async get) | `0`: `step()` reads the expert ids with a wait. | 0022 | — |
 | `LLAMA_EXPERT_CACHE_NB` | on (needs the adapt entry points) | `0`: swaps go back to the exchange on the compute queue. | 0042 | Verify input wait 2.6-6.0 -> 0.94-0.95 ms; decode 32.3 -> 33.1 t/s (`measured-here`). |
+| `GGML_OPENCL_CPU_MISS_MT` | on (AVX2, FMA, F16C) | `0`: the CPU miss path on ggml-cpu's single-token dot products, as its prototype. | 0056 | ggml-cpu's Q2_0 dot product 661 against 72 us a matrix (`measured-here`). |
 
 ### Red case
 
@@ -149,6 +153,7 @@ Two kinds of name are not in a table:
 | `GGML_OPENCL_HC_MIX_RED` | off | The fused hyper-connection mix is scaled by 1.05. | 0022 | — |
 | `GGML_OPENCL_STAGE_RED` | off | The staging ring's bytes are not copied, so stale bytes reach the card. | 0047 | The capital answered "!!!!!!!!", the needle empty (`measured-here`). |
 | `LLAMA_EXPERT_CACHE_MUTATE` | 0 | `1` corrupts one landed slot; `2` leaves out the last changed row of a table write. | 0021 (`2` from 0046) | `1`: the swap check reports 1 of 6 (`measured-here`). |
+| `GGML_OPENCL_CPU_MISS_RED` | off | The CPU's rows left zero. | 0056 | KL 0.3700 -> 0.4364, top-1 84.4 -> 81.9 % (`measured-here`). |
 
 ### Diagnostic
 

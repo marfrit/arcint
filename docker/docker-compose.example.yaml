@@ -4,7 +4,7 @@
 # + seccomp unconfined. Models are mounted read-only, never baked in.
 #
 # Three services, one compose profile each -- the command lines the project's
-# own services run (0.7.8; docs/docker.md, "The three services"):
+# own services run (0.7.11; docs/docker.md, "The three services"):
 #   docker compose --profile coder up        # the coder, a 16 GB card
 #   docker compose --profile agent up        # the dense 27B agent, a 24 GB card
 #   docker compose --profile flashnext up    # Qwen3.8-Flash-Next, a 24 GB card + ~23 GB pinned host memory
@@ -71,8 +71,8 @@ services:
       GGML_OPENCL_KERNEL_CACHE_DIR: /var/cache/arcint/opencl
       # the expert bank streamed for prompts of 256 tokens and more (patches 0032, 0044)
       GGML_OPENCL_BANK_STREAM: "1"
-      # Infernix's LFRU expert-cache policy instead of Strata's adapt (patch 0055)
-      LLAMA_EXPERT_CACHE_POLICY: lfru
+      # a share of the expert cache's decode misses computed on the CPU (patch 0056)
+      LLAMA_EXPERT_CACHE_CPU_MISSES: "1"
     command: [--engine, llama, --gguf, /models/gguf/<flash-next-iq2_xs-00001-of-00002>.gguf,
               --served-model-name, qwen3.8-flash-next, --device, GPU.0,
               --host, 0.0.0.0, --port, "8089",

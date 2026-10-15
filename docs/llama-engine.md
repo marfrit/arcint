@@ -217,6 +217,16 @@ nats.
 GEMM gathers its routed bank experts. 77 tokens 1.84 -> 1.11 s, 173 tokens
 1.83 -> 1.54; 269 and up unchanged; the same tokens.
 
+**Flash-Next since 0.7.11** (`contrib/llama.cpp` 0056, `measured-here`, B60,
+the Flash-Next unit's flags): with `LLAMA_EXPERT_CACHE_CPU_MISSES=1` up to 16
+missed (token, expert) pairs of a decode layer are computed on the CPU from
+the bank in host memory, with Strata's multi-token AVX2 rows, while the card
+computes the hits and reads the other misses over the link. Decode 36.3 ->
+41.8 t/s on the mean of six answers (+15.2 %; the code answer, whose cache
+hits least, +32 %), KL +0.0028 nats, Paris and the needle right. It keeps 8
+CPU threads busy while Flash-Next decodes; the coder decoding at the same
+time on the A770 loses ~1 %.
+
 **Flash-Next since 0.7.10** (`contrib/llama.cpp` 0053-0055, `measured-here`,
 B60, the Flash-Next unit's flags): the low-bit expert kernels' weight decode
 (IQ2_S / IQ3_S signs, Q2_0's fields) by multiplies, the same values: decode

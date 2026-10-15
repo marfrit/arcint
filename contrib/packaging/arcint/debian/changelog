@@ -1,3 +1,16 @@
+arcint (0.7.11-1) trixie; urgency=medium
+
+  * 0.7.11: llama.cpp patch 0056, the expert cache's decode misses on the
+    CPU (Strata's doorbell tier with its multi-token AVX2 rows for IQ2_S,
+    IQ2_XXS and Q2_0), opt-in with LLAMA_EXPERT_CACHE_CPU_MISSES=1: up to
+    16 missed pairs of a decode layer computed from the bank in host memory
+    while the card computes the hits. Flash-Next decode +15.2 % on six
+    answers, KL +0.0028 nats, answers right. The dense agent and the coder
+    have no expert cache and are unchanged. Runtime floor unchanged at
+    marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Thu, 15 Oct 2026 11:45:00 +0200
+
 arcint (0.7.10-1) trixie; urgency=medium
 
   * 0.7.10: three llama.cpp patches for Flash-Next. 0053: the low-bit
