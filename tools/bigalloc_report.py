@@ -10,7 +10,7 @@ live at the dump (`live`) or by bytes ever allocated (`total`).
 
 The report prints, per stack, its bytes and the first N symbolised frames that
 are not the allocator itself, and a roll-up by the first frame inside the
-libraries named with `--own` (default: the OpenVINO core and GPU plugin), which
+libraries named with `--own` (default: the GPU runtime and arcint), which
 is the frame that decided to allocate.
 """
 
@@ -94,7 +94,7 @@ def main():
     ap.add_argument("--frames", type=int, default=10)
     ap.add_argument("--own", action="append", default=[], help="library basename prefix that owns a decision")
     args = ap.parse_args()
-    own = args.own or ["libopenvino_intel_gpu_plugin", "libopenvino.so", "arcint"]
+    own = args.own or ["libigdrcl", "libOpenCL", "arcint"]
     sym_map = dict(s.split("=", 1) for s in args.sym)
     st = Symtab(sym_map)
     fields, stacks = parse(args.dump)

@@ -33,14 +33,9 @@ two lines means the citation identifies nothing; a resolved line number that
 disagrees with the prose is the drift above.
 
 This leg is not automatic and cannot be: only a human knows which line a
-sentence meant. It covers the citations that carry contract weight -- the OTD
-handshake, the paged-port inventory, the slice-bytes constant, the slot
-ceiling. `tests/python/test_serving_shape.py` goes further for its own
-inventory and does not write the numbers down at all: its ports table derives
-every one of its citations from an anchor at import, and the number of rows is
-never written either -- every count printed about it is a `len()` of the table.
-That rule is scoped to THE SUITE, which is where a recited count can rot
-against a gate. Prose outside it (the CHANGELOG, the design note) does name the
+sentence meant. It covers the citations that carry contract weight. The registry is
+empty since the OpenVINO engine left the tree (docs/history.md); its
+mechanism is exercised by a self-test. Prose outside it (the CHANGELOG, the design note) does name the
 number, and is dated and revisable in the ordinary way.
 
 LEG 2, RESOLVABILITY. The weak, total one. Every `file:line` in tracked prose
@@ -93,50 +88,10 @@ _FOREIGN_CITATION_FILES = {
 # on it. Do not add rows mechanically; an anchor nobody checked is decoration
 # with a test around it.
 _ANCHORED = [
-    # -- the OTD / expert-slot handshake, both sides ------------------------
-    ("tools/q4e/serving_shape.py", "backend_ov.cpp:580",
-     "src/exec/backend_ov.cpp", "std::optional<SlotPoolIr> slot_pool_from_ir"),
-    ("tools/q4e/serving_shape.py", "backend_ov.cpp:569-572",
-     "src/exec/backend_ov.cpp", "this function never guesses"),
-    ("tests/python/test_serving_shape.py", "backend_ov.cpp:588",
-     "src/exec/backend_ov.cpp",
-     'if (tname.find("moe") == std::string::npos) continue;'),
-    ("tests/python/test_serving_shape.py", "backend_ov.cpp:607",
-     "src/exec/backend_ov.cpp",
-     "per_expert_bytes += elems * konst->get_element_type().size();"),
-    ("tools/q4e/serving_shape.py", "backend_ov.cpp:603-607",
-     "src/exec/backend_ov.cpp",
-     "per_expert_bytes += elems * konst->get_element_type().size();"),
-    # -- the constants the residency arithmetic is checked against ----------
-    ("tests/python/test_serving_shape.py", "flash_next_offload.h:45",
-     "src/exec/flash_next_offload.h", "kFlashNextSliceBytes  = 2'457'600"),
-    ("tools/q4e/serving_shape.py", "exec/flash_next_offload.h:45",
-     "src/exec/flash_next_offload.h", "kFlashNextSliceBytes  = 2'457'600"),
-    ("tests/python/test_serving_shape.py", "fit.h:96",
-     "src/exec/fit.h", "inline uint64_t expert_slot_bytes("),
-    ("tools/q4e/serving_shape.py", "src/exec/fit.h:96",
-     "src/exec/fit.h", "inline uint64_t expert_slot_bytes("),
-    # -- the port names the serving path declares and feeds -----------------
-    ("tests/python/test_serving_shape.py", "backend_ov.cpp:101",
-     "src/exec/backend_ov.cpp", 'kPositionIds   = "position_ids"'),
-    ("tests/python/test_serving_shape.py", "src/exec/ngram_row_ids.h:59",
-     "src/exec/ngram_row_ids.h", "int num_ngram_heads() const"),
-    # -- the `_c` binding CF-RESIDENT's ast scan found ----------------------
-    ("tools/q4e/serving_shape.py", "backbone.py:70",
-     "tools/q4e/backbone.py", "from .gdn import _c"),
-    # -- THE REPACK's four coordinates: a reader acts on every one of these --
-    ("tests/python/test_repack_route.py", "gguf_repack.cpp:260",
-     "src/core/gguf_repack.cpp", "bool repack_supported(int32_t t)"),
-    ("tests/python/test_repack_route.py", "gguf_repack.cpp:266",
-     "src/core/gguf_repack.cpp",
-     "if (t.dims.size() != 2) throw std::runtime_error("),
-    ("tests/python/test_repack_route.py", "gguf_repack.cpp:486",
-     "src/core/gguf_repack.cpp", "double repack_bound_steps(int32_t ggml_type)"),
-    ("tests/python/test_repack_route.py", "design-gguf-native.md:52",
-     "docs/design-gguf-native.md", "uses codebooks and sign tables"),
-    ("tests/python/test_repack_route.py", "serving_shape.py:174",
-     "tools/q4e/serving_shape.py",
-     "shipped tensor is IQ4_NL, which OpenVINO has no element type for"),
+    # Empty since the OpenVINO engine left the tree (docs/history.md): every
+    # row anchored into a file that went with it. The mechanism stays and is
+    # exercised by the self-test below; add a row when prose cites code that a
+    # reader would act on.
 ]
 
 
@@ -184,11 +139,15 @@ def test_an_anchored_citation_names_the_line_its_anchor_resolves_to(
           "next reader is sent to the wrong line.")
 
 
-def test_the_anchored_registry_is_not_empty():
-    """A registry of nothing passes every row above vacuously."""
-    assert len(_ANCHORED) >= 10, f"only {len(_ANCHORED)} anchored citations"
-    citing = {c for c, _, _, _ in _ANCHORED}
-    assert len(citing) >= 2, f"only {citing} covered; the registry is too narrow"
+def test_the_anchor_resolver_catches_drift_and_ambiguity(tmp_path, monkeypatch):
+    """LEG 1's own red, with the registry empty: the resolver must find the one
+    line an anchor names, report a vanished anchor as zero hits and a repeated
+    one as several."""
+    monkeypatch.setitem(globals(), "REPO_ROOT", tmp_path)
+    (tmp_path / "x.cpp").write_text("a\nb unique_anchor\nc dup\nd dup\n")
+    assert _resolve("x.cpp", "unique_anchor") == [2]
+    assert _resolve("x.cpp", "gone_anchor") == []
+    assert _resolve("x.cpp", "dup") == [3, 4]
 
 
 def _tracked_files():
@@ -270,14 +229,14 @@ def test_the_resolvability_scan_detects_a_line_past_the_end():
     """LEG 2's own red, in tree. The scan's arithmetic, applied to a citation
     that cannot resolve, must reject it -- otherwise the cell above passes for
     files it never really checked."""
-    n = len((REPO_ROOT / "tools" / "q4e" / "ple.py").read_text().splitlines())
-    for cite, want_bad in ((f"ple.py:{n}", False), (f"ple.py:{n + 1}", True),
-                           (f"ple.py:1-{n + 400}", True), ("ple.py:1", False)):
+    n = len((REPO_ROOT / "src" / "config.h").read_text().splitlines())
+    for cite, want_bad in ((f"config.h:{n}", False), (f"config.h:{n + 1}", True),
+                           (f"config.h:1-{n + 400}", True), ("config.h:1", False)):
         m = _CITE.fullmatch(cite)
         assert m, cite
         hi = int(m.group(3) or m.group(2))
         assert (hi > n) == want_bad, (
             f"{cite} against a {n}-line file: expected "
             f"{'rejected' if want_bad else 'accepted'}")
-    print(f"[cite-resolve] red probe: tools/q4e/ple.py is {n} lines; a "
+    print(f"[cite-resolve] red probe: src/config.h is {n} lines; a "
           f"citation at {n + 1} is rejected, at {n} accepted")
