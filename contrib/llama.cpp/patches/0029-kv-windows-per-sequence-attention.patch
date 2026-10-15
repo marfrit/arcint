@@ -1,8 +1,8 @@
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 814261f..d5e094e 100644
+index 01904dc1c..6ebf73bab 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -505,6 +505,9 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
+@@ -560,6 +560,9 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
  
      bool res = true;
  
@@ -12,7 +12,7 @@ index 814261f..d5e094e 100644
      res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
    //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
  
-@@ -1137,6 +1140,12 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
+@@ -1192,6 +1195,12 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
  
      res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
  
@@ -24,8 +24,8 @@ index 814261f..d5e094e 100644
 +
      res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
  
-     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
-@@ -2986,6 +2995,44 @@ ggml_tensor * llm_graph_context::build_attn(
+     res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
+@@ -3235,6 +3244,44 @@ ggml_tensor * llm_graph_context::build_attn(
              ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
          }
  
@@ -71,10 +71,10 @@ index 814261f..d5e094e 100644
          v = mctx_cur->get_v(ctx0, il);
      }
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 3daa425..a45b212 100644
+index e853a0269..2ddb5c9a1 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
-@@ -24,6 +24,19 @@ struct llama_prec_policy;
+@@ -27,6 +27,19 @@ class llama_moe_cache;
  struct llama_memory_context_i;
  
  class llama_kv_cache_context;
@@ -94,7 +94,7 @@ index 3daa425..a45b212 100644
  class llama_kv_cache_dsa_context;
  class llama_kv_cache_dsa_iswa_context;
  class llama_kv_cache_msa_context;
-@@ -346,6 +359,11 @@ public:
+@@ -359,6 +372,11 @@ public:
      ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
      ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
  
@@ -107,10 +107,10 @@ index 3daa425..a45b212 100644
      ggml_tensor * self_k_rot = nullptr;
      ggml_tensor * self_v_rot = nullptr;
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index dab9cf9..897b4e9 100644
+index 14bd4c2a3..7ac108708 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -1039,7 +1039,14 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+@@ -1059,7 +1059,14 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
              if (mixed) {
                  // a ubatch of several sequences (a hybrid memory's equal split) has no single window:
                  // each token takes a cell in its own sequence's window, and the views span the stream
@@ -125,7 +125,7 @@ index dab9cf9..897b4e9 100644
                  std::vector<uint8_t>  taken_map(cells.size(), 0);
                  for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                      const llama_seq_id si = ubatch.seq_id[i][0];
-@@ -1288,6 +1295,39 @@ int32_t llama_kv_cache::win_of(uint32_t idx) const {
+@@ -1310,6 +1317,39 @@ int32_t llama_kv_cache::win_of(uint32_t idx) const {
      return -1;
  }
  
@@ -165,7 +165,7 @@ index dab9cf9..897b4e9 100644
  bool llama_kv_cache::set_seq_windows(const uint32_t * n_cells, int32_t n_seq) {
      if (n_seq <= 0) {
          win_base.clear();
-@@ -3011,6 +3051,17 @@ bool llama_kv_cache_context::apply() {
+@@ -3039,6 +3079,17 @@ bool llama_kv_cache_context::apply() {
      kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
      n_kv = kv->get_n_kv(sinfos[i_cur]);
  
@@ -183,7 +183,7 @@ index dab9cf9..897b4e9 100644
      return true;
  }
  
-@@ -3028,6 +3079,20 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
+@@ -3056,6 +3107,20 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
      return n_kv;
  }
  
@@ -205,7 +205,7 @@ index dab9cf9..897b4e9 100644
      return sinfos.empty() ? 0 : sinfos[i_cur].kv_off;
  }
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 8bfc3c4..f514041 100644
+index 00b81a6e5..b2dfc371b 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -191,6 +191,13 @@ public:
@@ -245,7 +245,7 @@ index 8bfc3c4..f514041 100644
 +    std::vector<llama_kv_cache::win_part> win_parts;
  };
 diff --git a/tools/perplexity/perplexity.cpp b/tools/perplexity/perplexity.cpp
-index 4d1f51f..9dd3744 100644
+index 4d1f51fd0..9dd37440c 100644
 --- a/tools/perplexity/perplexity.cpp
 +++ b/tools/perplexity/perplexity.cpp
 @@ -1774,6 +1774,11 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {

@@ -14,7 +14,7 @@
 # kernels).
 set -euo pipefail
 
-PKGVER=0.7.11
+PKGVER=0.7.12
 UPSTREAM_TAG=v${PKGVER}
 PKGREL=1
 # The public repository, not the fleet one. The fleet repo (still named
@@ -28,9 +28,9 @@ ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-c84a13e243632b108cf8ea9a9dcb0399c
 # The libllama engine (--engine llama) builds against llama.cpp at this pin
 # with contrib/llama.cpp/patches applied (contrib/llama.cpp/README.md): the
 # GitHub tarball of the commit, checked by sha256.
-LLAMA_COMMIT=bed0a856606ee4a24a164066f73d2379447033f5
+LLAMA_COMMIT=3e4dfa8f39f904e681737d9f512a6e6338d848aa
 LLAMA_URL="https://github.com/ggml-org/llama.cpp/archive/${LLAMA_COMMIT}.tar.gz"
-LLAMA_TARBALL_SHA256=0984123c33b7e959f8003f9169e9109897112d9448b681737813911083eca4cc
+LLAMA_TARBALL_SHA256=f9046074c9b71eaf9abd5491001e4d09c327591fed6b9e2bfcfddbb575dc5255
 OV_PREFIX=/usr/lib/marfrit-openvino
 # The ABI is the nightly, not the patch level: floor the patch level, cap at
 # the next nightly. An exact pin (Depends: = +p1-1) made apt REMOVE arcint when
@@ -129,7 +129,13 @@ cmake -S "$SRC" -B build \
     -DCMAKE_INSTALL_PREFIX=/usr \
     -DCMAKE_INSTALL_RPATH="$OV_PREFIX/openvino/libs" \
     -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-    -DCMAKE_SKIP_BUILD_RPATH=OFF
+    -DCMAKE_SKIP_BUILD_RPATH=OFF \
+    -DGGML_NATIVE=ON
+# ggml turns GGML_NATIVE off by default when SOURCE_DATE_EPOCH is set (it reads that as a reproducible
+# build), which left every package's ggml-cpu at the SSE2 baseline although docs/docker.md says the .deb is
+# built native on its host: Flash-Next with the CPU misses decoded 45.6 against 49.4 t/s (measured-here,
+# 2026-10-15). Asked for explicitly, and checked.
+grep -q '^GGML_NATIVE:BOOL=ON$' build/CMakeCache.txt || { echo "GGML_NATIVE ist nicht ON (ggml-cpu ohne -march=native)" >&2; exit 1; }
 cmake --build build -j"$(nproc)"
 
 # The gates are the product. A package built from a tree whose unit tests fail
@@ -154,6 +160,16 @@ STRAY=$(cd "$ROOT" && find . -path ./usr/include -prune -print -o \( -name '*.a'
 # probe below).
 grep -qa kernel_mul_mm_kq2d_q4_K_i8 "$ROOT/usr/bin/arcint" || {
     echo "die libllama-Engine fehlt im Binary (ARCINT_LLAMA?)" >&2; exit 1; }
+# The result of GGML_NATIVE=ON, not only the ask: this host is the target host, so a ggml-cpu dot product
+# without AVX2 here is the SSE-only ggml-cpu of the packages before 0.7.12 (0 ymm registers in 0.7.11's,
+# 58 in a native build). A ggml-cpu function, because the CPU miss rows carry AVX2 in any build. Captured
+# once (no pipe, see the RPATH probe).
+DIS=$(objdump -d --no-show-raw-insn --disassemble=ggml_vec_dot_q4_K_q8_K "$ROOT/usr/bin/arcint")
+case "$DIS" in
+    *"%ymm"*) ;;
+    *) echo "ggml_vec_dot_q4_K_q8_K ohne AVX2 (ggml-cpu ohne -march=native)" >&2; exit 1 ;;
+esac
+unset DIS
 
 # RPATH-Probe. This is the whole reason the unit file carries no
 # LD_LIBRARY_PATH: if the binary cannot find its runtime by itself, the failure

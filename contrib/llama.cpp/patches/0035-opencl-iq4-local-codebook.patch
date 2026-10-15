@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 6e8da4c..55ed4cc 100644
+index 2cb917681..a28b1f652 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -2358,7 +2358,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2384,7 +2384,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                  for (int nc = 1; nc <= 4; ++nc) {
                      const std::string opts = compile_opts + " -DN_DST=" + std::to_string(backend_ctx->kq_q8_1_ndst) +
                          " -DN_SIMDGROUP=4 -DNCOLS=" + std::to_string(nc) + (nc > 1 ? " -cl-intel-256-GRF-per-thread" : "") +
@@ -12,7 +12,7 @@ index 6e8da4c..55ed4cc 100644
                      if (prog == nullptr) {
                          GGML_LOG_WARN("ggml_opencl: IQ matvec for %d column(s) not built; IQ weights go to the CPU\n", nc);
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
-index fe77be4..6d83343 100644
+index fe77be4a5..6d83343ef 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
 @@ -1377,19 +1377,48 @@ static inline int dot8_ss(const uint * w, uint4 x0, uint4 x1) {

@@ -44,8 +44,8 @@ COPY . /src/arcint
 # to the pin is a bug in contrib/llama.cpp/patches, not a reason to move the
 # pin. The pin and checksum are gated against the recipe below, so the image
 # cannot claim an engine the recipe does not build.
-ARG LLAMA_COMMIT=bed0a856606ee4a24a164066f73d2379447033f5
-ARG LLAMA_TARBALL_SHA256=0984123c33b7e959f8003f9169e9109897112d9448b681737813911083eca4cc
+ARG LLAMA_COMMIT=3e4dfa8f39f904e681737d9f512a6e6338d848aa
+ARG LLAMA_TARBALL_SHA256=f9046074c9b71eaf9abd5491001e4d09c327591fed6b9e2bfcfddbb575dc5255
 ARG LLAMA_URL=https://github.com/ggml-org/llama.cpp/archive
 COPY contrib/packaging/arcint/build-deb.sh /opt/recipe-build-deb.sh
 RUN set -eu; \

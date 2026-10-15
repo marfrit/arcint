@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 28bfc64..bdec375 100644
+index cc60b57ab..f6b3b65b2 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -1081,11 +1081,12 @@ struct ggml_backend_opencl_context {
+@@ -1091,11 +1091,12 @@ struct ggml_backend_opencl_context {
      // (one token) and prompt kernels and their shapes
      cl_kernel kernel_gdn_intel_tg = nullptr;
      // Intel, prompt attention on the XMX units (flash_attn_dpas.cl; SG 16 or 8)
@@ -18,7 +18,7 @@ index 28bfc64..bdec375 100644
      int       fa_gqa_sides = 2;                   // sub-groups per 8 rows the kernels were built for
      int       fa_dpas_bq = 0, fa_dpas_nthr = 0;   // query rows and work-items a work-group
      cl_kernel kernel_gdn_intel_pp = nullptr;
-@@ -4231,59 +4232,65 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -4257,59 +4258,65 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
              const int sg   = sg8 ? 8 : 16;
              const int nsg  = sg8 ? 8 : 16;
              const int nthr = nsg * sg, bq = sg8 ? nsg / 2 * 8 : nsg * 8;
@@ -130,7 +130,7 @@ index 28bfc64..bdec375 100644
              }
              // decode / verify rows, a KV head's query heads and rows in one
              // pass (Xe2 only: sub-group 16 without 8); GGML_OPENCL_FA_GQA=0
-@@ -4303,29 +4310,32 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -4329,29 +4336,32 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                  const std::string gqa_src = read_file("flash_attn_gqa_dpas.cl");
  #endif
                  const int gkv[4][2] = { {0, 0}, {1, 1}, {1, 2}, {2, 2} };
@@ -183,7 +183,7 @@ index 28bfc64..bdec375 100644
                      GGML_LOG_WARN("ggml_opencl: flash_attn_gqa_dpas.cl not built; flash_attn_f32_f16.cl takes decode\n");
                  }
              }
-@@ -18938,8 +18948,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -19211,8 +19221,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      // A prompt goes to flash_attn_dpas.cl here; up to 8 rows with quantized
      // K/V to flash_attn_*_q1_split_intel further down.
      // Intel, a prompt: flash_attn_dpas.cl (the XMX units), f16 or quantized K/V
@@ -197,7 +197,7 @@ index 28bfc64..bdec375 100644
          sinks == nullptr && max_bias == 0.0f && logit_softcap == 0.0f &&
          q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
          (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q))) {
-@@ -19247,11 +19260,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -19528,11 +19541,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      static const char * fgr_env = getenv("GGML_OPENCL_FA_GQA_MIN_ROWS");
      static const int    fg_min_rows = fgr_env ? atoi(fgr_env) : 4;
      bool use_fd_gqa = false;
@@ -213,7 +213,7 @@ index 28bfc64..bdec375 100644
          }
      }
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
-index f40702b..5fc1740 100644
+index f40702b27..5fc1740df 100644
 --- a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
 @@ -44,7 +44,7 @@
@@ -226,7 +226,7 @@ index f40702b..5fc1740 100644
  // from S (lane = key) by shuffles
  #define BQ (NSG / 2 * 8)
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
-index b9ca909..137789e 100644
+index b9ca909aa..137789e57 100644
 --- a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
 @@ -28,11 +28,13 @@
@@ -246,10 +246,10 @@ index b9ca909..137789e 100644
  #ifndef GQA_SIDES
  #define GQA_SIDES 2             // sub-groups sharing 8 rows, each a column range
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 0140cb8..7a58fd2 100644
+index 76f2a890c..b9cd6b6fc 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11206,6 +11206,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11766,6 +11766,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
              }
          }
      }
@@ -267,7 +267,7 @@ index 0140cb8..7a58fd2 100644
      // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
      test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-@@ -11515,6 +11526,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12117,6 +12128,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      std::vector<std::unique_ptr<test_case>> test_cases;
  

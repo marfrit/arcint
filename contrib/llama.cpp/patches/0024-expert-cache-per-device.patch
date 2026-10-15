@@ -1,8 +1,8 @@
 diff --git a/include/llama.h b/include/llama.h
-index 4e3e760..9433013 100644
+index 7e640b6fe..52b11296c 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -350,8 +350,16 @@ extern "C" {
+@@ -351,8 +351,16 @@ extern "C" {
          // memory (src/llama-expert-cache.h): this many bytes of slots on the
          // card, ranked by expert_cache_profile (Strata's STRP file; NULL:
          // round robin). 0 off.
@@ -19,7 +19,7 @@ index 4e3e760..9433013 100644
  
          // Keep the booleans together to avoid misalignment during copy-by-value.
          bool vocab_only;      // only load the vocabulary, no weights
-@@ -571,8 +579,9 @@ extern "C" {
+@@ -574,8 +582,9 @@ extern "C" {
      LLAMA_API size_t llama_max_parallel_sequences(void);
      LLAMA_API size_t llama_max_tensor_buft_overrides(void);
  
@@ -31,7 +31,7 @@ index 4e3e760..9433013 100644
      struct llama_expert_cache_info {
          uint64_t decode_hits;     // routed (token, expert) pairs of decode ubatches served from a slot
          uint64_t decode_misses;   // ... read from the bank in host memory
-@@ -584,6 +593,11 @@ extern "C" {
+@@ -587,6 +596,11 @@ extern "C" {
          size_t   bank_bytes;      // the other experts in GPU-visible host memory
      };
      LLAMA_API bool llama_model_expert_cache_info(const struct llama_model * model, struct llama_expert_cache_info * info);
@@ -44,10 +44,10 @@ index 4e3e760..9433013 100644
      LLAMA_API bool llama_supports_mmap       (void);
      LLAMA_API bool llama_supports_mlock      (void);
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 49fb982..07ab52b 100644
+index 39239c048..8b74d5d9b 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -1933,14 +1933,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2044,14 +2044,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
          // graphs; decode tokens are counted toward the next adapt
          if (dt && n_outputs_prev == 0) dt->t_pre += ggml_time_us() - dt_t0;   // the first ubatch: everything before it
          const int64_t dt_s0 = dt ? ggml_time_us() : 0;
@@ -71,7 +71,7 @@ index 49fb982..07ab52b 100644
          const int64_t dt_p0 = dt ? ggml_time_us() : 0;
          struct dt_post_t { decode_timing * dt; int64_t t0; ~dt_post_t() { if (dt) dt->t_post += ggml_time_us() - t0; } } dt_post_ { dt, dt_p0 };
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
-index 1343a3e..d5d4097 100644
+index 1343a3e61..d5d4097a4 100644
 --- a/src/llama-expert-cache.cpp
 +++ b/src/llama-expert-cache.cpp
 @@ -66,8 +66,8 @@ static bool read_profile(const char * path, int n_layers, int n_expert, std::vec
@@ -387,7 +387,7 @@ index 1343a3e..d5d4097 100644
          if (L.ids_out == nullptr || L.ids_out->buffer == nullptr || L.ids_out->ne[1] != (int64_t) n_tokens ||
              ggml_backend_buffer_get_type(L.ids_out->buffer) != ggml_backend_buffer_get_type(L.slot[0]->buffer)) {
 diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
-index 0314ca0..143bda3 100644
+index 0314ca02d..143bda33c 100644
 --- a/src/llama-expert-cache.h
 +++ b/src/llama-expert-cache.h
 @@ -16,11 +16,18 @@
@@ -487,11 +487,11 @@ index 0314ca0..143bda3 100644
      ggml_context *     ctx = nullptr;
      ggml_context *     bank_ctx_ = nullptr;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 6cac5b7..a6dd118 100644
+index 7d20d2e84..7acb32c3a 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -1959,28 +1959,65 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
-     }
+@@ -2025,28 +2025,65 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     load_tensors_hadamard();
  
      // LLAMA_EXPERT_CACHE_MIB / LLAMA_EXPERT_CACHE_PROFILE: the same for tools
 -    // that do not set the parameters (llama-bench, llama-perplexity)
@@ -568,7 +568,7 @@ index 6cac5b7..a6dd118 100644
      info->decode_hits   = s.decode_hits;
      info->decode_misses = s.decode_misses;
      info->swaps         = s.swaps;
-@@ -1989,9 +2026,48 @@ bool llama_model_expert_cache_info(const llama_model * model, llama_expert_cache
+@@ -2055,6 +2092,25 @@ bool llama_model_expert_cache_info(const llama_model * model, llama_expert_cache
      info->slots         = s.slots;
      info->bytes         = s.bytes;
      info->bank_bytes    = s.bank_bytes;
@@ -591,9 +591,13 @@ index 6cac5b7..a6dd118 100644
 +        sum.bank_bytes    += s.bank_bytes;
 +    }
 +    llama_expert_cache_info_from(sum, info);
-+    return true;
-+}
-+
+     return true;
+ }
+ 
+@@ -2389,6 +2445,26 @@ void llama_model_base::load_tensors_hadamard() {
+             __func__, hdmd.rot.size() + hdmd.inv.size(), hdmd.inv.size(), rotations.size(), sign_tensors.size());
+ }
+ 
 +int llama_model_expert_cache_count(const llama_model * model) {
 +    return model ? (int) model->expert_caches.size() : 0;
 +}
@@ -603,9 +607,9 @@ index 6cac5b7..a6dd118 100644
 +        return false;
 +    }
 +    llama_expert_cache_info_from(model->expert_caches[i]->stats(), info);
-     return true;
- }
- 
++    return true;
++}
++
 +const char * llama_model_expert_cache_device(const llama_model * model, int i) {
 +    if (model == nullptr || i < 0 || i >= (int) model->expert_caches.size()) {
 +        return nullptr;
@@ -615,9 +619,9 @@ index 6cac5b7..a6dd118 100644
 +}
 +
  ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
-     return ml.create_tensor(
-@@ -2962,6 +3038,8 @@ llama_model_params llama_model_default_params() {
+     const buft_list_t * buft_list_layer = nullptr;
+     if (tn.bid != -1) {
+@@ -3376,6 +3452,8 @@ llama_model_params llama_model_default_params() {
          /*.kv_overrides                =*/ nullptr,
          /*.expert_cache_bytes          =*/ 0,
          /*.expert_cache_profile        =*/ nullptr,
@@ -627,10 +631,10 @@ index 6cac5b7..a6dd118 100644
          /*.check_tensors               =*/ false,
          /*.use_extra_bufts             =*/ true,
 diff --git a/src/llama-model.h b/src/llama-model.h
-index 946e22f..b33ee43 100644
+index 618ec10e9..1c72cfb8d 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
-@@ -721,8 +721,10 @@ struct llama_model {
+@@ -813,8 +813,10 @@ struct llama_model {
  
      std::vector<llama_layer> layers;
  

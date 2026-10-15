@@ -12,7 +12,7 @@
 > sampling and HTTP serving. NInfer philosophy (specialize, then be honest
 > about numbers), Intel substrate.
 
-## Status (0.7.11)
+## Status (0.7.12)
 
 Runtime floor: marfrit-openvino +p25 = OpenVINO upstream commit 71640275 (the
 2026.4.0 nightly of 2026-08-21) + patches 0003-0074
@@ -23,7 +23,7 @@ and MOE_DOORBELL.
 Two engines (README "Two engines"): OpenVINO (default; Flash-Next, the
 coder's way back) and libllama (--engine llama --gguf, the agent service
 from 0.5.6, the coder service from 2026-10-05: llama.cpp
-bed0a85 with contrib/llama.cpp/patches 0001-0056, ggml's OpenCL backend,
+3e4dfa8 with contrib/llama.cpp/patches 0001-0056, ggml's OpenCL backend,
 arcint's Intel kernels; MTP from the GGUF's own head; --llama-kv q8_0 or
 q8_0:q4_0 quantizes its KV cache). libllama, measured-here:
 - coder (A770): decode 79.3 t/s with 4 drafts, prefill 1,431 t/s at 4k;
@@ -47,7 +47,7 @@ IQ2_XS GGUF with every expert on the B60 through an expert cache (VRAM slots,
 a USM bank in host memory; --llama-expert-cache, --llama-expert-profile) and
 the checkpoint's MTP layer from a separate GGUF (--llama-mtp-gguf,
 tools/flash_next_mtp_gguf.sh): then 422 t/s prefill at 20k tokens, 33-35 t/s
-decode with MTP 2 (at 0.7.11 660-690 t/s and 36 t/s, 42 with 0056), the needle answered; the KL of IQ2_XS against a
+decode with MTP 2 (at 0.7.12 660-690 t/s, 36 t/s, 42-46 with 0056), the needle answered; the KL of IQ2_XS against a
 reference is owed. Patch 0022's kernels lift the residents: the agent 35.5
 -> 38.3 t/s (identical text), the coder 40.5 -> 43.3 t/s (KL +0.0001
 nats, acceptance task unchanged). 0.7.0 adds named lanes
@@ -114,7 +114,14 @@ against the 0.7.9 package +2.7 % on the gate set.
 (Strata's doorbell tier with its multi-token AVX2 rows), opt-in through
 LLAMA_EXPERT_CACHE_CPU_MISSES=1 and set on the Flash-Next unit: decode 36.3
 -> 41.8 t/s on the mean of six answers (+15.2 %), KL +0.0028 nats, answers
-right; the coder decoding alongside on the A770 -1 %. Every
+right; the coder decoding alongside on the A770 -1 %.
+0.7.12: llama.cpp moved from bed0a85 to upstream master 3e4dfa8 (288 commits)
+with the 56 patches ported; suites pass on both cards, KL and the three
+services on par (Flash-Next +1.3 %; the patches' red cases and four-sequence
+KL arms not re-run). The package's ggml-cpu is native (GGML_NATIVE had been
+off under SOURCE_DATE_EPOCH since 0.5.5: Flash-Next with the CPU misses 45.6
+against 49.4 t/s on one answer). The Flash-Next unit's draft head is Q4_K
+(+1.5 %, 156 MiB less VRAM). Every
 number below is measured-here on the named card; DESIGN.md §7 has each one's
 standing value and evidence class. The dated measurement record, campaigns
 and design notes live on the development branch `qfndev`, not on `main`.

@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
-index d381314..1c3b383 100644
+index d38131424..1c3b38386 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
 @@ -1635,9 +1635,18 @@ static inline uint lb_signmask4(uint b) {
@@ -52,7 +52,7 @@ index d381314..1c3b383 100644
          *s0 = *s1 = d;
      } else {                  // IQ3_S
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
-index 57fa793..fe77be4 100644
+index 57fa793bd..fe77be4a5 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
 @@ -1220,9 +1220,18 @@ static inline uint lb_signmask4(uint b) {

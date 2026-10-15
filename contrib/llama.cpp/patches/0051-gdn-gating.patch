@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 6e99907..b52a0f7 100644
+index 9b7f408e1..05e005cb5 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -704,7 +704,13 @@ struct ggml_backend_opencl_context {
+@@ -713,7 +713,13 @@ struct ggml_backend_opencl_context {
      bool disable_fusion;
      bool fuse_mm_glu = true;                     // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
      bool fuse_rms_add = true;                    // opt-out GGML_OPENCL_FUSE_RMS_ADD=0 (fused rms_norm*w + residual)
@@ -17,7 +17,7 @@ index 6e99907..b52a0f7 100644
      int  fuse_0049 = 7;                          // patch 0049's fusions, a bit each: 1 rms_norm + scale, 2 ssm_conv + silu,
                                                   // 4 sigmoid + mul (GGML_OPENCL_FUSE_0049=<mask>; 0: off)
      bool f16_mrow = true;                        // opt-out GGML_OPENCL_F16_MROW=0 (multi-row-per-WG f16 decode GEMV for attn proj + lm_head)
-@@ -9954,12 +9960,130 @@ static bool ggml_cl_moe_prefetch_on() {
+@@ -10147,12 +10153,130 @@ static bool ggml_cl_moe_prefetch_on() {
      return on;
  }
  
@@ -148,7 +148,7 @@ index 6e99907..b52a0f7 100644
  
      for (int i = 0; i < cgraph->n_nodes; i++) {
          ggml_tensor * node = cgraph->nodes[i];
-@@ -9976,6 +10100,9 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+@@ -10169,6 +10293,9 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
          if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
              continue;
          }
@@ -158,7 +158,7 @@ index 6e99907..b52a0f7 100644
  
          if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse_hc_mix(backend_ctx, cgraph, i)) {
              ggml_cl_hc_mix_fused(backend, cgraph, i);
-@@ -33798,8 +33925,8 @@ static bool ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
+@@ -34116,8 +34243,8 @@ static bool ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
      const cl_ulong off_q     = extra_q->offset     + src_q->view_offs;
      const cl_ulong off_k     = extra_k->offset     + src_k->view_offs;
      const cl_ulong off_v     = extra_v->offset     + src_v->view_offs;
@@ -169,7 +169,7 @@ index 6e99907..b52a0f7 100644
      const cl_ulong off_state = extra_state->offset + src_state->view_offs;
      const cl_ulong off_dst   = extra_dst->offset   + dst->view_offs;
  
-@@ -33851,6 +33978,40 @@ static bool ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
+@@ -34169,6 +34296,40 @@ static bool ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
          CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &sbuf));
          CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &soff));
          CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &sstride));
@@ -211,7 +211,7 @@ index 6e99907..b52a0f7 100644
  
      if (gdn_intel) {
 diff --git a/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl b/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
-index 8455661..54cd6f0 100644
+index 84556615a..54cd6f0b2 100644
 --- a/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
 +++ b/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
 @@ -36,6 +36,21 @@
@@ -345,7 +345,7 @@ index 8455661..54cd6f0 100644
  
          // kv_r = (g S_r).k: the R reductions are independent and interleave
 diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
-index ad66126..a86536b 100644
+index 2e15777ee..a970709d4 100644
 --- a/src/models/delta-net-base.cpp
 +++ b/src/models/delta-net-base.cpp
 @@ -11,6 +11,27 @@ static ggml_tensor * get_slice_2d(ggml_context * ctx0, ggml_tensor * t, int64_t
@@ -376,7 +376,7 @@ index ad66126..a86536b 100644
  llm_build_delta_net_base::llm_build_delta_net_base(const llm_graph_params & params) : llm_graph_context(params) {}
  
  std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net_chunking(
-@@ -400,6 +421,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
+@@ -397,6 +418,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
  
      // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
      ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
@@ -384,7 +384,7 @@ index ad66126..a86536b 100644
      if (n_tokens == 1) {
          res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
      } else {
-@@ -565,6 +587,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+@@ -562,6 +584,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
  
      // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
      ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);

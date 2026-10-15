@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 55ed4cc..49ac1a4 100644
+index a28b1f652..f8ef8a4fc 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -927,6 +927,7 @@ struct ggml_backend_opencl_context {
+@@ -936,6 +936,7 @@ struct ggml_backend_opencl_context {
      ggml_cl_adreno_xmem_attn_state adreno_xmem_attn;
  #endif
      cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0, kernel_get_rows_i32;
@@ -10,7 +10,7 @@ index 55ed4cc..49ac1a4 100644
      cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
      cl_kernel kernel_set_rows_h16_i64 = nullptr, kernel_set_rows_h16_i32 = nullptr;   // F16 rows into F16
      cl_kernel kernel_set_rows_q8_0_i64, kernel_set_rows_q8_0_i32;
-@@ -2068,6 +2069,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2094,6 +2095,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
          CL_CHECK((backend_ctx->kernel_get_rows_f16  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_f16", &err), err));
          CL_CHECK((backend_ctx->kernel_get_rows_q4_0 = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_q4_0", &err), err));
          CL_CHECK((backend_ctx->kernel_get_rows_i32  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_i32", &err), err));
@@ -19,7 +19,7 @@ index 55ed4cc..49ac1a4 100644
          GGML_LOG_CONT(".");
      }
  
-@@ -10219,6 +10222,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -10432,6 +10435,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                  case GGML_TYPE_F16:
                  case GGML_TYPE_I32:
                      return true;
@@ -30,7 +30,7 @@ index 55ed4cc..49ac1a4 100644
                  case GGML_TYPE_Q4_0:
  #ifdef GGML_OPENCL_SOA_Q
                      // We do not support flattened Q4_0 (and possibly other Q's)
-@@ -14986,14 +14993,67 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
+@@ -15208,14 +15215,67 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
  
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
  
@@ -102,7 +102,7 @@ index 55ed4cc..49ac1a4 100644
  
      switch (src0->type) {
 diff --git a/ggml/src/ggml-opencl/kernels/get_rows.cl b/ggml/src/ggml-opencl/kernels/get_rows.cl
-index d7ab0b7..a8c550f 100644
+index d7ab0b7ee..a8c550f51 100644
 --- a/ggml/src/ggml-opencl/kernels/get_rows.cl
 +++ b/ggml/src/ggml-opencl/kernels/get_rows.cl
 @@ -236,3 +236,101 @@ kernel void kernel_get_rows_q4_0(
@@ -208,10 +208,10 @@ index d7ab0b7..a8c550f 100644
 +    }
 +}
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 996da46..7b34bcf 100644
+index ff4b0b18c..889ef0f2f 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -2523,6 +2523,80 @@ static void init_set_rows_row_ids(ggml_tensor * t, int num_rows) {
+@@ -2535,6 +2535,80 @@ static void init_set_rows_row_ids(ggml_tensor * t, int num_rows) {
  }
  
  // GGML_OP_SET_ROWS
@@ -292,7 +292,7 @@ index 996da46..7b34bcf 100644
  struct test_set_rows : public test_case {
      const ggml_type type_src;
      const ggml_type type_dst;
-@@ -9458,6 +9532,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9883,6 +9957,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
      test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));

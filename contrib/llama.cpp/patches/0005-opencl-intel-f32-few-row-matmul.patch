@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index ed28a33..45d12d0 100644
+index dd9bb46b9..33c3dddcc 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -732,6 +732,7 @@ struct ggml_backend_opencl_context {
+@@ -741,6 +741,7 @@ struct ggml_backend_opencl_context {
      // scratch copy of the router weights to avoid dst aliasing
      ggml_cl_buffer prealloc_moe_combine_w;
      ggml_cl_buffer prealloc_kq_xq;   // q8_1 activation of the K-quant matvec: int8 codes
@@ -10,7 +10,7 @@ index ed28a33..45d12d0 100644
      ggml_cl_buffer prealloc_kq_xd;   // per-32 scale (float)
      ggml_cl_buffer prealloc_kq_xs;   // per-32 sum (float)
      // what the activation buffers hold, and the graph count that dates it
-@@ -1084,6 +1085,7 @@ struct ggml_backend_opencl_context {
+@@ -1096,6 +1097,7 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_mul_mv_id_mxfp4_f32_flat;
      cl_kernel kernel_mul_mm_f32_f32_l4_lm;
      cl_kernel kernel_gemv_f32_f32_mc;  // multi-column (small-N) f32 GEMV for spec/MTP verify
@@ -18,7 +18,7 @@ index ed28a33..45d12d0 100644
      cl_kernel kernel_mul_mm_f16_f32_l4_lm;
      cl_kernel kernel_mul_mm_q1_0_f32_l4_lm;
      cl_kernel kernel_mul_mm_q4_0_f32_l4_lm;
-@@ -2794,6 +2796,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2820,6 +2822,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
  
          CL_CHECK((backend_ctx->kernel_mul_mm_f32_f32_l4_lm = clCreateKernel(backend_ctx->program_mul_mm_f32_f32_l4_lm, "kernel_mul_mm_f32_f32_l4_lm", &err), err));
          CL_CHECK((backend_ctx->kernel_gemv_f32_f32_mc = clCreateKernel(backend_ctx->program_mul_mm_f32_f32_l4_lm, "kernel_gemv_f32_f32_mc", &err), err));
@@ -26,7 +26,7 @@ index ed28a33..45d12d0 100644
          GGML_LOG_CONT(".");
      }
  
-@@ -23983,6 +23986,105 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
+@@ -24285,6 +24288,105 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
  }
  #endif // GGML_OPENCL_SOA_Q
  
@@ -132,7 +132,7 @@ index ed28a33..45d12d0 100644
  static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -23997,6 +24099,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -24299,6 +24401,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
  
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
  
@@ -144,7 +144,7 @@ index ed28a33..45d12d0 100644
      // used for non-contiguous src0 (the usual head-major permuted K view when n_head_kv>1)
      // AND for the contiguous case that occurs when n_head_kv==1 (e.g. Gemma-4 E2B)
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_f32_f32_l4_lm.cl b/ggml/src/ggml-opencl/kernels/mul_mm_f32_f32_l4_lm.cl
-index 9dc9862..6990965 100644
+index 9dc9862be..6990965cb 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mm_f32_f32_l4_lm.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mm_f32_f32_l4_lm.cl
 @@ -194,3 +194,23 @@ kernel void kernel_gemv_f32_f32_mc(
@@ -172,12 +172,12 @@ index 9dc9862..6990965 100644
 +    dst[i] = s;
 +}
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 8497555..a23a133 100644
+index dd1bebe4a..1c8386946 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10274,6 +10274,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
-     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1, 509, 2051, {1, 1}, {1, 1}));
-     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1, 509, 2051, {1, 1}, {1, 1}));
+@@ -10747,6 +10747,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 16, 8400000, 32, {1, 1}, {2, 1}));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 16, 8400000, 32, {1, 1}, {2, 1}));
  
 +    // F32 weights of few rows (the gated delta-net's ssm_alpha / ssm_beta, a
 +    // MoE router), one token to a prompt; a split K on some backends

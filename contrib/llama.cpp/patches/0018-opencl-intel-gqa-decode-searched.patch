@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index bdec375..9c3baa2 100644
+index f6b3b65b2..1b36a47d1 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -19408,6 +19408,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -19689,6 +19689,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
              fd_kv_per_split = kps_env && atoi(kps_env) > 0 ? atoi(kps_env) : 128;
              fd_max_splits   = 256;
          }
@@ -18,7 +18,7 @@ index bdec375..9c3baa2 100644
          if (n_splits < (use_fd_intel ? 1 : FD_MIN_SPLITS)) { n_splits = use_fd_intel ? 1 : FD_MIN_SPLITS; }
          if (n_splits > fd_max_splits) { n_splits = fd_max_splits; }
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
-index 137789e..f938712 100644
+index 137789e57..f9387124c 100644
 --- a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
 @@ -39,6 +39,15 @@
@@ -134,10 +134,10 @@ index 137789e..f938712 100644
          for (int r = 0; r < 8; ++r) mnew[r] = m[r];
          for (int g = 0; g < NKB; ++g) {
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 7a58fd2..7fba62b 100644
+index b9cd6b6fc..d9c962f01 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11536,7 +11536,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -12138,7 +12138,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      // 27B's geometry (head size 256, 24 query heads on 4)
      for (auto kt : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
          for (int64_t kv : {8192, 32768, 131072}) {

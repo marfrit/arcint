@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
-index a38875c..4684ece 100644
+index a38875cc3..4684ece47 100644
 --- a/ggml/src/ggml-opencl/CMakeLists.txt
 +++ b/ggml/src/ggml-opencl/CMakeLists.txt
 @@ -219,6 +219,7 @@ set(GGML_OPENCL_KERNELS
@@ -11,10 +11,10 @@ index a38875c..4684ece 100644
      sum_rows
      cumsum
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index bbdcb56..40f14ab 100644
+index 08e07838b..0e673c13f 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -1057,6 +1057,9 @@ struct ggml_backend_opencl_context {
+@@ -1067,6 +1067,9 @@ struct ggml_backend_opencl_context {
      // Intel, S_V = 128, scalar gate (gated_delta_net_intel.cl): generation
      // (one token) and prompt kernels and their shapes
      cl_kernel kernel_gdn_intel_tg = nullptr;
@@ -24,7 +24,7 @@ index bbdcb56..40f14ab 100644
      cl_kernel kernel_gdn_intel_pp = nullptr;
      int gdn_intel_sg = 0, gdn_intel_r_tg = 0, gdn_intel_r_pp = 0, gdn_intel_nsg = 0;
      cl_kernel kernel_ssm_scan_f32 = nullptr;
-@@ -3984,6 +3987,66 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -4010,6 +4013,66 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
          }
      }
  
@@ -91,7 +91,7 @@ index bbdcb56..40f14ab 100644
      // moe_combine (fused router-weight mul + cross-expert sum)
      {
      #ifdef GGML_OPENCL_EMBED_KERNELS
-@@ -18448,6 +18511,48 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -18721,6 +18784,48 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      max_bias      = params[1];
      logit_softcap = params[2];
  
@@ -142,7 +142,7 @@ index bbdcb56..40f14ab 100644
      bool use_local_tile = false;
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
 new file mode 100644
-index 0000000..00a30ee
+index 000000000..00a30ee6e
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
 @@ -0,0 +1,368 @@

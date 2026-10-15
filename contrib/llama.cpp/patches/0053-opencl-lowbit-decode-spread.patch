@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
-index 6d83343..b5c243d 100644
+index 6d83343ef..b5c243d34 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
 @@ -1234,6 +1234,36 @@ static inline uint lb_sgn4(uint g, uint m) {

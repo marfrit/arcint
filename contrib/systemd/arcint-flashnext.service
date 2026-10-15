@@ -42,6 +42,14 @@
 #   660.9 t/s; decode 31.7 against 28.9 t/s; VRAM peak 24,241 against
 #   24,278 MiB; the needle, the capital and a long answer right in both.
 # - The KL of q8_0 against f16 KV: 0.294037 against 0.294050 (0036).
+#
+# Since 0.7.9-0.7.12, measured on the B60 (docs/llama-engine.md, CHANGELOG):
+# - --llama-reserve-cells 20480 (0052) frees the compute buffers for 13,400 MiB
+#   of slots; 3 drafts with Strata's stop at 0.5;
+# - LLAMA_EXPERT_CACHE_CPU_MISSES=1 (0056): up to 16 missed experts a layer on
+#   the CPU, decode +15.2 % on six answers; 8 threads busy while decoding;
+# - the draft head with its LM head Q4_K (tools/flash_next_mtp_gguf.sh):
+#   +1.5 %, 156 MiB less VRAM.
 
 [Unit]
 Description=arcint-flashnext — Qwen3.8-Flash-Next IQ2_XS on libllama, expert cache + MTP, GPU.0, :8089
@@ -52,6 +60,7 @@ Conflicts=arcint-agent.service arcint-writer.service
 [Service]
 Type=simple
 Environment=GGML_OPENCL_BANK_STREAM=1
+Environment=LLAMA_EXPERT_CACHE_CPU_MISSES=1
 ExecStart=/usr/bin/arcint \
     --engine llama \
     --gguf /models/gguf/qwen38-flash-next-iq2xs/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
@@ -62,11 +71,13 @@ ExecStart=/usr/bin/arcint \
     --n-ctx 131072 \
     --llama-cpu-moe 48 \
     --llama-threads 8 \
-    --llama-expert-cache 11300 \
+    --llama-expert-cache 13400 \
     --llama-kv q8_0 \
     --llama-expert-profile %h/.local/share/arcint/expert-profile-strata.bin \
-    --llama-mtp 2 \
-    --llama-mtp-gguf /models/gguf/fn-mtp/mtp-flash-next-q8e4n.gguf \
+    --llama-mtp 3 \
+    --llama-mtp-min-p 0.5 \
+    --llama-reserve-cells 20480 \
+    --llama-mtp-gguf /models/gguf/fn-mtp/mtp-flash-next-q8e4n-hq4k.gguf \
     --queue-timeout 30
 Restart=on-failure
 RestartSec=30

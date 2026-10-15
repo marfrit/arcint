@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index b05e5ba..3eba599 100644
+index 6b89ce37b..d27d8c294 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -1115,6 +1115,14 @@ struct ggml_backend_opencl_context {
+@@ -1125,6 +1125,14 @@ struct ggml_backend_opencl_context {
          uint64_t gen = 0;                                      // the graph the per-graph state belongs to
          int next = 0, issued_upto = -1;
      } bstream;
@@ -17,7 +17,7 @@ index b05e5ba..3eba599 100644
      int             kq_mm_sg = 16;
      ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
      int       kq_q8_1_ndst = 4;
-@@ -14768,6 +14776,11 @@ static void ggml_backend_opencl_get_tensors(const ggml_tensor * const * tensors,
+@@ -14990,6 +14998,11 @@ static void ggml_backend_opencl_get_tensors(const ggml_tensor * const * tensors,
  static void ggml_backend_opencl_get_tensors_async(const ggml_tensor * const * tensors, void * const * dsts, int n);
  static void ggml_backend_opencl_get_tensor_slices(const ggml_tensor * tensor, void * data, int64_t i2, int64_t n);
  static void ggml_backend_opencl_exchange_slices(ggml_tensor * a, int64_t sa, ggml_tensor * b, int64_t sb);
@@ -29,7 +29,7 @@ index b05e5ba..3eba599 100644
  
  static void ggml_backend_opencl_pair_bank(const ggml_tensor * slot, const ggml_tensor * bank, int n_split) {
      g_cache_pairs[slot] = { bank, n_split };
-@@ -14806,6 +14819,11 @@ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, c
+@@ -15028,6 +15041,11 @@ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, c
      if (strcmp(name, "ggml_backend_opencl_exchange_slices") == 0) {
          return (void *) ggml_backend_opencl_exchange_slices;
      }
@@ -41,7 +41,7 @@ index b05e5ba..3eba599 100644
      if (strcmp(name, "ggml_backend_opencl_reserve_gather") == 0) {
          return (void *) ggml_backend_opencl_reserve_gather;
      }
-@@ -15365,6 +15383,96 @@ static void ggml_backend_opencl_exchange_slices(ggml_tensor * a, int64_t sa, ggm
+@@ -15587,6 +15605,96 @@ static void ggml_backend_opencl_exchange_slices(ggml_tensor * a, int64_t sa, ggm
      }
  }
  
@@ -139,7 +139,7 @@ index b05e5ba..3eba599 100644
  // expert cache's per-layer router ids, read once per decode step.
  static void ggml_backend_opencl_get_tensors(const ggml_tensor * const * tensors, void * const * dsts, int n) {
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
-index aba1b00..896c55b 100644
+index aba1b0003..896c55b14 100644
 --- a/src/llama-expert-cache.cpp
 +++ b/src/llama-expert-cache.cpp
 @@ -65,6 +65,13 @@ static bool read_profile(const char * path, int n_layers, int n_expert, std::vec
@@ -430,7 +430,7 @@ index aba1b00..896c55b 100644
          return;
      }
 diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
-index 143bda3..c5534c6 100644
+index 143bda33c..c5534c64f 100644
 --- a/src/llama-expert-cache.h
 +++ b/src/llama-expert-cache.h
 @@ -13,9 +13,17 @@

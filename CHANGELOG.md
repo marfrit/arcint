@@ -18,6 +18,41 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.7.12 — 2026-10-15
+
+**Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine
+builds llama.cpp **`3e4dfa8`** (upstream master of 2026-10-15; until now
+`bed0a85`) with `contrib/llama.cpp/patches` 0001-0056. Every number is
+`measured-here` on the named card with the units' flags; dev builds of the
+old and the new base, alternated for Flash-Next; the record is
+`contrib/llama.cpp/README.md`, "Moving the pin", and
+`docs/campaigns/research-upstream-llama-2026-10.md` (on the `qfndev` branch).
+
+- **The llama.cpp base moved** 288 commits forward. 46 patches applied
+  unchanged, ten were resolved by hand. Running it found two semantic
+  changes: upstream builds Flash-Next's indexer as `ggml_lightning_indexer`,
+  which OpenCL has no kernel for, with its support probe off (0052 turns the
+  probe on and keeps the unfused graph on such a device); and an MTP
+  context's hidden state is now a state embedding (arcint's draft batch
+  moved to `llama_batch_ext_set_embd_state`). Suites (12 op families) pass
+  on both cards; KL as served: Flash-Next 0.3700 -> 0.3693, the dense agent
+  and the coder identical. Served: Flash-Next +1.3 % on six answers, the
+  dense agent's prefill 697.7 / 493.4 -> 695.5 / 491.9 t/s at 55k / 138k,
+  the coder 51.2 / 47.5 / 44.1 -> 51.1 / 47.6 / 44.1 t/s with the same
+  texts; the needles, the facts and the acceptance task unchanged. Owed for
+  this move: the patches' own red cases and four-sequence KL arms.
+- **The package's ggml-cpu is native.** The recipe exports
+  `SOURCE_DATE_EPOCH`, which ggml reads as a reproducible build and answers
+  with `GGML_NATIVE=OFF`: every package's ggml-cpu since 0.5.5 was SSE-only. With
+  Flash-Next's CPU misses that cost 7.7 % (45.6 against 49.4 t/s on one
+  answer; a dev build configured as the package otherwise decoded 49.3-49.4,
+  and without the CPU misses the package matched it). The
+  recipe now asks for `GGML_NATIVE=ON` and checks the CMake cache.
+- **Flash-Next's draft head Q4_K** (a unit change, measured on 0.7.11): the
+  MTP file with its LM head Q4_K and the rest as before decodes +1.5 % on
+  six answers with 156 MiB less VRAM; `tools/flash_next_mtp_gguf.sh` writes
+  it.
+
 ## 0.7.11 — 2026-10-15
 
 **Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine

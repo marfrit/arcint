@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 9e25799..1bc2b4d 100644
+index 9a902b1bc..316867248 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -4435,13 +4435,18 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -4461,13 +4461,18 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
              const int    sgn     = sgn_env ? atoi(sgn_env) : 16;
              const int    nsg     = sg8 ? (qg && (sgn == 8 || sgn == 16 || sgn == 32) ? sgn : 8) : 16;
              const std::string qg_opt = qg ? " -DFA_QG" : "";
@@ -23,7 +23,7 @@ index 9e25799..1bc2b4d 100644
                  if (p != nullptr) {
                      CL_CHECK((backend_ctx->kernel_fa_dpas_dk[di] = clCreateKernel(p, "flash_attn_f32_f16_dpas", &err), err));
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
-index d9dbcb6..9a29458 100644
+index d9dbcb634..9a29458ea 100644
 --- a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
 @@ -54,7 +54,8 @@

@@ -4,7 +4,7 @@
 // devices: the tensor_split that puts layers [0, K) on the first and [K,
 // n_layer) plus the output on the second. Device-free, for the unit tests.
 //
-// llama.cpp (src/llama-model.cpp, load_tensors, at bed0a85) places
+// llama.cpp (src/llama-model.cpp, load_tensors, at bed0a85; unchanged at 3e4dfa8) places
 // n_layer + 1 slots (the layers, then the output) with every layer on a GPU:
 // slot il goes to the first device whose cumulative normalised split exceeds
 // il / (n_layer + 1) (std::upper_bound, in float). n_layer is the GGUF's

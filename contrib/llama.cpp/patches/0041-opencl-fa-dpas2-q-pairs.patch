@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_dpas2.cl b/ggml/src/ggml-opencl/kernels/flash_attn_dpas2.cl
-index f79d0ea..2f928b3 100644
+index f79d0eaa7..2f928b3e8 100644
 --- a/ggml/src/ggml-opencl/kernels/flash_attn_dpas2.cl
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_dpas2.cl
 @@ -11,7 +11,8 @@

@@ -1,8 +1,8 @@
 diff --git a/include/llama.h b/include/llama.h
-index 9433013..c9b9371 100644
+index 52b11296c..40fa844a9 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -849,6 +849,17 @@ extern "C" {
+@@ -852,6 +852,17 @@ extern "C" {
              llama_memory_t mem,
                llama_seq_id seq_id);
  
@@ -21,7 +21,7 @@ index 9433013..c9b9371 100644
      LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
  
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 07ab52b..761fc59 100644
+index 8b74d5d9b..3402ef526 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -8,6 +8,9 @@
@@ -33,8 +33,8 @@ index 07ab52b..761fc59 100644
 +#include "llama-memory-hybrid-idx.h"
  #include "llama-mmap.h"
  #include "llama-model.h"
- #include "llama-ext.h"
-@@ -4296,6 +4299,31 @@ llama_pos llama_memory_seq_pos_min(
+ #include "llama-moe-cache.h"
+@@ -4519,6 +4522,31 @@ llama_pos llama_memory_seq_pos_min(
      return mem->seq_pos_min(seq_id);
  }
  
@@ -67,10 +67,10 @@ index 07ab52b..761fc59 100644
          llama_memory_t mem,
            llama_seq_id seq_id) {
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 9fd35f3..814261f 100644
+index ee11cc9e8..01904dc1c 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -43,6 +43,9 @@ static ggml_tensor * build_attn_inp_kq_mask(
+@@ -44,6 +44,9 @@ static ggml_tensor * build_attn_inp_kq_mask(
      ggml_set_input(res);
      ggml_set_name(res, "attn_inp_kq_mask");
  
@@ -80,7 +80,7 @@ index 9fd35f3..814261f 100644
      return res;
  }
  
-@@ -62,6 +65,9 @@ static bool can_reuse_kq_mask(
+@@ -63,6 +66,9 @@ static bool can_reuse_kq_mask(
      res &= (kq_mask->ne[2] == 1);
      res &= (kq_mask->ne[3] == n_stream);
  
@@ -91,10 +91,10 @@ index 9fd35f3..814261f 100644
  }
  
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 1d0554f..dab9cf9 100644
+index b7dfadef4..14bd4c2a3 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -372,6 +372,10 @@ void llama_kv_cache::clear(bool data) {
+@@ -394,6 +394,10 @@ void llama_kv_cache::clear(bool data) {
          v_heads[s] = 0;
      }
  
@@ -105,7 +105,7 @@ index 1d0554f..dab9cf9 100644
      if (data) {
          for (auto & [_, buf] : ctxs_bufs) {
              ggml_backend_buffer_clear(buf.get(), 0);
-@@ -460,6 +464,12 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
+@@ -482,6 +486,12 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
      const auto s0 = seq_to_stream[seq_id_src];
      const auto s1 = seq_to_stream[seq_id_dst];
  
@@ -118,7 +118,7 @@ index 1d0554f..dab9cf9 100644
      if (s0 == s1) {
          // since both sequences are in the same stream, no data copy is necessary
          // we just have to update the cells meta data
-@@ -751,6 +761,9 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool
+@@ -771,6 +781,9 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool
  llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
      llama_kv_cache::slot_info_vec_t res;
  
@@ -128,7 +128,7 @@ index 1d0554f..dab9cf9 100644
      struct state_t {
          slot_info sinfo; // slot info for the ubatch
  
-@@ -807,6 +820,8 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
+@@ -827,6 +840,8 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
          }
      }
  
@@ -137,7 +137,7 @@ index 1d0554f..dab9cf9 100644
      if (!success) {
          return {};
      }
-@@ -1000,14 +1015,81 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+@@ -1020,14 +1035,81 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
  
          uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
  
@@ -224,7 +224,7 @@ index 1d0554f..dab9cf9 100644
              return { };
          }
  
-@@ -1018,9 +1100,9 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+@@ -1038,9 +1120,9 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
          const uint32_t n_test = cont ? n_tokens : 1;
  
          while (true) {
@@ -237,7 +237,7 @@ index 1d0554f..dab9cf9 100644
                  continue;
              }
  
-@@ -1077,7 +1159,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+@@ -1097,7 +1179,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                  res.idxs[s].clear();
              }
  
@@ -246,7 +246,7 @@ index 1d0554f..dab9cf9 100644
                  //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
                  return { };
              }
-@@ -1183,6 +1265,71 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch &
+@@ -1205,6 +1287,71 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch &
  
          head = sinfo.idxs[s].back() + 1;
      }
@@ -318,7 +318,7 @@ index 1d0554f..dab9cf9 100644
  }
  
  bool llama_kv_cache::get_can_shift() const {
-@@ -1264,6 +1411,15 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+@@ -1286,6 +1433,15 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
      // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
      const uint32_t n_pad_cur = std::max(n_pad, 256u);
  
@@ -334,7 +334,7 @@ index 1d0554f..dab9cf9 100644
      for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
          const auto & cells = v_cells[sinfo.strm[s]];
  
-@@ -1290,7 +1446,7 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
+@@ -1312,7 +1468,7 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
              ggml_row_size(k->type, hparams.n_embd_head_k(il)),
              ggml_row_size(k->type, n_embd_k_gqa),
              ggml_row_size(k->type, n_embd_k_gqa*kv_size),
@@ -343,7 +343,7 @@ index 1d0554f..dab9cf9 100644
  }
  
  ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
-@@ -1313,7 +1469,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
+@@ -1335,7 +1491,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
                  ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
                  ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
                  ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
@@ -352,7 +352,7 @@ index 1d0554f..dab9cf9 100644
      }
  
      // note: v->nb[1] > v->nb[2]
-@@ -1322,7 +1478,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
+@@ -1344,7 +1500,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
              ggml_row_size(v->type, kv_size*hparams.n_embd_head_v(il)),  // v->nb[1]
              ggml_row_size(v->type, kv_size),                        // v->nb[2]
              ggml_row_size(v->type, kv_size*n_embd_v_gqa),           // v->nb[3]
@@ -361,7 +361,7 @@ index 1d0554f..dab9cf9 100644
  }
  
  ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
-@@ -1561,6 +1717,8 @@ struct args_set_input_kq_mask {
+@@ -1566,6 +1722,8 @@ struct args_set_input_kq_mask {
      int64_t n_kv;
      int64_t n_stream;
      int64_t n_tps;
@@ -370,7 +370,7 @@ index 1d0554f..dab9cf9 100644
  };
  
  template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
-@@ -1578,6 +1736,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
+@@ -1583,6 +1741,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
      const int64_t n_stream = args.n_stream;
      const int64_t n_tps    = args.n_tps;
  
@@ -379,7 +379,7 @@ index 1d0554f..dab9cf9 100644
      const T mask_keep = llama_cast<T>(0.0f);
      const T mask_drop = llama_cast<T>(-INFINITY);
  
-@@ -1653,16 +1813,16 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
+@@ -1658,16 +1818,16 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                      }
                  }
  
@@ -399,7 +399,7 @@ index 1d0554f..dab9cf9 100644
  
                  if (!alibi) {
                      if (!prev) {
-@@ -1682,7 +1842,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
+@@ -1687,7 +1847,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                      // M-RoPE causal mask
                      if (is_2d) {
                          if (p0 == p1) {
@@ -408,7 +408,7 @@ index 1d0554f..dab9cf9 100644
  
                              if (p0_ext.is_2d_gt(p1_x, p1_y)) {
                                  goto skip;
-@@ -1753,7 +1913,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
+@@ -1758,7 +1918,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
      }
  }
  
@@ -417,7 +417,7 @@ index 1d0554f..dab9cf9 100644
      const uint32_t n_tokens = ubatch->n_tokens;
  
      GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-@@ -1784,6 +1944,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+@@ -1789,6 +1949,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
          /*.n_kv             =*/ n_kv,
          /*.n_stream         =*/ n_stream,
          /*.n_tps            =*/ n_tps,
@@ -425,7 +425,7 @@ index 1d0554f..dab9cf9 100644
      };
  
      if (dst->type == GGML_TYPE_F16) {
-@@ -1797,7 +1958,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+@@ -1802,7 +1963,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
      //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
  }
  
@@ -434,7 +434,7 @@ index 1d0554f..dab9cf9 100644
      const int64_t n_tokens = ubatch->n_tokens;
  
      GGML_ASSERT(n_stream == 1 && "TODO: support multiple streams");
-@@ -1814,7 +1975,7 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch
+@@ -1819,7 +1980,7 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch
          for (int i = 0; i < n_tokens; ++i) {
              for (int j = 0; j < n_kv; ++j) {
                  // the position when the cells is empty is irrelevant - it will be masked out later in the attention
@@ -443,7 +443,7 @@ index 1d0554f..dab9cf9 100644
  
                  data[h*(n_kv*n_tokens) + i*n_kv + j] = llama_relative_position_bucket(p0, ubatch->pos[i], hparams.n_rel_attn_bkts, false);
              }
-@@ -2462,6 +2623,12 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
+@@ -2476,6 +2637,12 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
      } else {
          // whole KV cache restore
  
@@ -456,7 +456,7 @@ index 1d0554f..dab9cf9 100644
          if (cell_count > cells.size()) {
              LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
              return false;
-@@ -2861,6 +3028,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
+@@ -2889,6 +3056,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
      return n_kv;
  }
  
@@ -467,7 +467,7 @@ index 1d0554f..dab9cf9 100644
  ggml_type llama_kv_cache_context::type_k() const {
      return kv->type_k();
  }
-@@ -2914,11 +3085,11 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
+@@ -2942,11 +3113,11 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
  }
  
  void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
@@ -482,7 +482,7 @@ index 1d0554f..dab9cf9 100644
  
  void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 52cc8cd..8bfc3c4 100644
+index 9bfb8f231..00b81a6e5 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -42,6 +42,11 @@ public:
@@ -547,7 +547,7 @@ index 52cc8cd..8bfc3c4 100644
      ggml_type type_v() const;
  
 diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
-index 9c0d51e..be0b6ac 100644
+index 9c0d51e4e..be0b6ac76 100644
 --- a/src/llama-kv-cells.h
 +++ b/src/llama-kv-cells.h
 @@ -98,6 +98,16 @@ public:
@@ -568,7 +568,7 @@ index 9c0d51e..be0b6ac 100644
          return has_shift;
      }
 diff --git a/tools/perplexity/perplexity.cpp b/tools/perplexity/perplexity.cpp
-index 601361a..4d1f51f 100644
+index 601361acd..4d1f51fd0 100644
 --- a/tools/perplexity/perplexity.cpp
 +++ b/tools/perplexity/perplexity.cpp
 @@ -1771,6 +1771,11 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {

@@ -1,16 +1,16 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 6298ce3..bbdcb56 100644
+index d201ad77c..08e07838b 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -491,6 +491,7 @@ struct ggml_opencl_fa_kernels {
+@@ -493,6 +493,7 @@ struct ggml_opencl_fa_kernels {
      std::map<std::pair<int, int>, cl_kernel> f32_f16_split_k_img;    // DK=512 prefill split, K via image1d_buffer_t
      std::map<std::pair<int, int>, cl_kernel> f32_f16_q1;
      std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_split;       // flash-decoding K-split
 +    std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_split_intel; // the same, lanes along the head dimension
      // vec decode
      std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec;
-     // kv-head-coalesced vec decode
-@@ -733,6 +734,7 @@ struct ggml_backend_opencl_context {
+     bool f32_f16_vec_512_attempted = false;
+@@ -742,6 +743,7 @@ struct ggml_backend_opencl_context {
      ggml_cl_buffer prealloc_moe_combine_w;
      ggml_cl_buffer prealloc_kq_xq;   // q8_1 activation of the K-quant matvec: int8 codes
      ggml_cl_buffer prealloc_f32_splitk;   // K slices of the skinny F32 GEMM (ggml_cl_mul_mat_f32_skinny)
@@ -18,7 +18,7 @@ index 6298ce3..bbdcb56 100644
      ggml_cl_buffer prealloc_kq_xd;   // per-32 scale (float)
      ggml_cl_buffer prealloc_kq_xs;   // per-32 sum (float)
      // what the activation buffers hold, and the graph count that dates it
-@@ -5795,6 +5797,9 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
+@@ -5863,6 +5865,9 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
  
      if (backend_ctx->gpu_family == INTEL) {
          opts += " -D FA_SG=32";
@@ -28,7 +28,7 @@ index 6298ce3..bbdcb56 100644
      }
  
      const bool is_split = variant == FA_VARIANT_F32_F16_SPLIT ||
-@@ -6179,6 +6184,13 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
+@@ -6368,6 +6373,13 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                  backend_ctx->fa.f32_f16_q1_split[{dk, dv}] = k_split;
                  ggml_opencl_log_fa_kernel_spill(backend_ctx, k_split, "flash_attn_f32_f16_q1_split", dk, dv);
              }
@@ -42,7 +42,7 @@ index 6298ce3..bbdcb56 100644
              // q1_vec decode kernel (DV-split + subgroup reduce)
              cl_kernel k_q1_vec = clCreateKernel(prog, "flash_attn_f32_f16_q1_vec", &err);
              if (err == CL_SUCCESS) {
-@@ -18780,6 +18792,21 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -19061,6 +19073,21 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
              fd_mq_wg   = 64;
          }
      }
@@ -64,7 +64,7 @@ index 6298ce3..bbdcb56 100644
      if (fd_k_split == NULL &&
          n_q >= 1 && n_q <= fd_max_n_q && n_kv >= FD_MIN_N_KV && !is_causal &&
          d_head_q <= FD_MAX_DK &&
-@@ -18915,8 +18942,13 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -19196,8 +19223,13 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          int fd_max_splits   = use_fd_mq ? FD_MQ_MAX_SPLITS   : FD_MAX_SPLITS;
          if (fd_env_kv_per_split > 0) { fd_kv_per_split = fd_env_kv_per_split; }
          if (fd_env_max_splits   > 0) { fd_max_splits   = fd_env_max_splits; }
@@ -77,58 +77,34 @@ index 6298ce3..bbdcb56 100644
 -        if (n_splits < FD_MIN_SPLITS) { n_splits = FD_MIN_SPLITS; }
 +        if (n_splits < (use_fd_intel ? 1 : FD_MIN_SPLITS)) { n_splits = use_fd_intel ? 1 : FD_MIN_SPLITS; }
          if (n_splits > fd_max_splits) { n_splits = fd_max_splits; }
-         const int kv_per_split = (n_kv + n_splits - 1) / n_splits;
- 
-@@ -18924,16 +18956,26 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
-         const size_t partial_size_bytes =
-             (size_t) n_batch * n_head * n_q * n_splits * fa_partial_floats * sizeof(float);
- 
--        ggml_cl_flash_attn_temp_buffer temp_partial;
--        cl_int err;
--        temp_partial.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE,
--                                           partial_size_bytes, NULL, &err);
--        if (err != CL_SUCCESS) {
--            CL_CHECK(clFinish(backend_ctx->queue));
--            temp_partial.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE,
--                                               partial_size_bytes, NULL, &err);
-+        // Intel: a buffer kept across calls (the queue is in order, so a
-+        // call's merge has read it before the next split writes); otherwise
-+        // one created per call
-+        ggml_cl_flash_attn_temp_buffer temp_partial_own;
-+        struct { cl_mem data; } temp_partial = { nullptr };
-+        if (use_fd_intel) {
+         if (use_fd_mq_decode) {
+             const size_t wg_per_split = (size_t) n_head_kv * n_batch;
+@@ -19223,6 +19255,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+                 pool.allocate(backend_ctx->context, partial_size_bytes);
+             }
+             partial_buffer = pool.buffer;
++        } else if (use_fd_intel) {
++            // Intel: a buffer kept across calls (the queue is in order, so a
++            // call's merge has read it before the next split writes)
 +            backend_ctx->prealloc_fa_partial.allocate(backend_ctx->context, partial_size_bytes);
-+            temp_partial.data = backend_ctx->prealloc_fa_partial.buffer;
-+        } else {
-+            cl_int err;
-+            temp_partial_own.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE,
-+                                                   partial_size_bytes, NULL, &err);
-+            if (err != CL_SUCCESS) {
-+                CL_CHECK(clFinish(backend_ctx->queue));
-+                temp_partial_own.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE,
-+                                                       partial_size_bytes, NULL, &err);
-+            }
-+            CL_CHECK(err);
-+            temp_partial.data = temp_partial_own.data;
-         }
--        CL_CHECK(err);
- 
-         cl_kernel k_split = fd_k_split;
-         int argi = 0;
-@@ -19007,7 +19049,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
++            partial_buffer = backend_ctx->prealloc_fa_partial.buffer;
+         } else {
+             temp_partial.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE,
+                                                partial_size_bytes, NULL, &err);
+@@ -19307,7 +19344,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
  
          // MQ split kernel uses MQ_NSG_SPLIT subgroups and one WG per (kv_head, batch, split)
          // matches Q1_WG_SIZE * NSG (MQ_GQA=4 -> 256; MQ_GQA=8 -> 192)
 -        const size_t fd_wg = use_fd_mq ? fd_mq_wg : 64;
 +        const size_t fd_wg = use_fd_mq ? fd_mq_wg : (use_fd_intel ? 16 : 64);
          const size_t fd_head_dim = use_fd_mq
-             ? (size_t)(n_head_kv * n_batch)
+             ? (size_t)(n_head_kv * fd_head_sub * n_batch)
              : (size_t)(n_head     * n_batch);
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_f32_f16.cl b/ggml/src/ggml-opencl/kernels/flash_attn_f32_f16.cl
-index bf7695a..846ca51 100644
+index d1cc14801..dc077b838 100644
 --- a/ggml/src/ggml-opencl/kernels/flash_attn_f32_f16.cl
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_f32_f16.cl
-@@ -2652,5 +2652,144 @@ __kernel void flash_attn_f32_merge(
+@@ -2771,5 +2771,144 @@ __kernel void flash_attn_f32_merge(
      global O_DATA_TYPE4 * o_row = (global O_DATA_TYPE4 *) ((global char *) o_void + o_offset + o_row_offset);
      o_row[lane] = CONVERT_O_DATA4(o);
  }

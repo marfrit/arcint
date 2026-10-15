@@ -1,16 +1,16 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 6d62658..5088b0e 100644
+index e94a2c2cc..27c788418 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -938,6 +938,7 @@ struct ggml_backend_opencl_context {
-     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_f32_f32_pack, kernel_cpy_i32_i32;
+@@ -948,6 +948,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_cpy_f32_f32_pack = nullptr;
      cl_kernel kernel_cpy_f32_i32 = nullptr, kernel_cpy_i32_f32 = nullptr;   // the casts
      cl_kernel kernel_cpy_f32_f32_flat = nullptr;
 +    cl_kernel kernel_cpy_f32_f32_rows = nullptr;
      cl_kernel kernel_mul_mat_f32_f32;
      cl_kernel kernel_mul_mat_f16_f16;
      cl_kernel kernel_mul_mat_f16_f32_1row;
-@@ -1848,6 +1849,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -1874,6 +1875,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                  backend_ctx->kernel_cpy_f32_f32_flat = k;
              }
          }
@@ -24,7 +24,7 @@ index 6d62658..5088b0e 100644
          CL_CHECK((backend_ctx->kernel_cpy_i32_i32 = clCreateKernel(prog, "kernel_cpy_i32_i32", &err), err));
          CL_CHECK((backend_ctx->kernel_cpy_f32_i32 = clCreateKernel(prog, "kernel_cpy_f32_i32", &err), err));
          CL_CHECK((backend_ctx->kernel_cpy_i32_f32 = clCreateKernel(prog, "kernel_cpy_i32_f32", &err), err));
-@@ -31465,6 +31473,42 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const
+@@ -31782,6 +31790,42 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const
          return;
      }
  
@@ -68,10 +68,10 @@ index 6d62658..5088b0e 100644
  
      switch (src0t) {
 diff --git a/ggml/src/ggml-opencl/kernels/cpy.cl b/ggml/src/ggml-opencl/kernels/cpy.cl
-index 936e366..6484ca8 100644
+index 969b63e1f..2b42f528c 100644
 --- a/ggml/src/ggml-opencl/kernels/cpy.cl
 +++ b/ggml/src/ggml-opencl/kernels/cpy.cl
-@@ -312,6 +312,46 @@ kernel void kernel_cpy_f32_f32_flat(
+@@ -314,6 +314,46 @@ kernel void kernel_cpy_f32_f32_flat(
      }
  }
  
@@ -119,10 +119,10 @@ index 936e366..6484ca8 100644
  kernel void kernel_cpy_f32_i32(
          global float * src0,
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index cf72e6c..db758ec 100644
+index 7b9408735..4c1207787 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -9950,6 +9950,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10391,6 +10391,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {128, 2, 3, 1}, {128, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {128, 4, 3, 1})); // strided dst
      test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {64, 16, 1, 1}, {1, 64, 16, 1}, {1, 2, 0, 3}, {0, 0, 0, 0}, false, {32, 64, 16, 1})); // permuted src, strided dst
      test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {64, 16, 1, 1}, {1, 64, 16, 1}, {1, 2, 0, 3}, {0, 0, 0, 0}, false, {32, 64, 16, 1})); // permuted src, strided dst
@@ -132,7 +132,7 @@ index cf72e6c..db758ec 100644
  
      // CPY - different src/dst shapes (reshaping via CPY)
      // Use permutations of {3, 5, 7, 32}. Total elements: 3*5*7*32 = 3360.
-@@ -11747,6 +11750,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -12357,6 +12360,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {768, 1024, 256, 1}, {-1,-1,-1,-1}, {1, 0, 2, 3}, {0, 0, 0, 0}));
      test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, GGML_TYPE_BF16, {768, 1024, 256, 1}, {-1,-1,-1,-1}, {1, 0, 2, 3}, {0, 0, 0, 0}));
  

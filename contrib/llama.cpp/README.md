@@ -2,11 +2,11 @@
 
 The `--engine llama` executor (`src/exec/backend_llama.cpp`,
 `docs/llama-engine.md`) builds llama.cpp as a subproject from
-`ARCINT_LLAMA_DIR`. The pin is ggml-org/llama.cpp commit `bed0a85`
-(2026-10-02); the tree is that commit with the patches below applied in
-order:
+`ARCINT_LLAMA_DIR`. The pin is ggml-org/llama.cpp commit `3e4dfa8`
+(2026-10-15; until then `bed0a85` of 2026-10-02, see "Moving the pin"); the
+tree is that commit with the patches below applied in order:
 
-    git -C <llama.cpp> checkout bed0a85
+    git -C <llama.cpp> checkout 3e4dfa8
     git -C <llama.cpp> apply <arcint>/contrib/llama.cpp/patches/*.patch
 
 A patch that does not apply cleanly to the pin is a bug in this directory, not
@@ -41,7 +41,8 @@ The procedure:
 
 1. A branch at the new commit; the GitHub tarball's sha256 in
    `contrib/packaging/arcint/build-deb.sh` (`LLAMA_COMMIT`,
-   `LLAMA_TARBALL_SHA256`) and the pin named here.
+   `LLAMA_TARBALL_SHA256`), the same two ARGs in `docker/Dockerfile.arcint`
+   (its build checks them against the recipe), and the pin named here.
 2. The patches ported in order, each committed and then regenerated as a
    patch against its predecessor, so each stays PR-shaped and applies with
    `git apply` on the new pin.
@@ -54,6 +55,59 @@ The procedure:
    upstream's own changes is recorded with its cause, not absorbed.
 5. Released like any other version: the pre-tag served check, the second
    review, the fresh container.
+
+**Moved to `3e4dfa8`, 2026-10-15** (upstream master that day, 288 commits on;
+the survey of what upstream changed and what is open there is
+`docs/campaigns/research-upstream-llama-2026-10.md`, on the `qfndev` branch):
+
+- **The port** (`code`): the 56 patches carried one commit at a time; 46
+  applied unchanged, 10 resolved by hand. 0001 and 0002 above upstream's
+  split-out compile options; 0005 and 0022 test cases beside upstream's;
+  0007's Intel partials buffer beside upstream's pooled one; 0021's
+  `build_moe_ffn` taken whole with upstream's MoE-cache `slots` passed
+  where the experts are the model's own tensors (upstream's cache is off
+  unless `moe_cache_size` is set; a layer our cache holds gets no upstream
+  slots at all, so the two never cache the same layer, a defect of the first
+  port found in its review); 0022's
+  scheduler timing beside upstream's `ggml_backend_sched_copy_input`; 0024's
+  accessors beside upstream's Hadamard loading; 0047's single wait for a
+  split's user inputs moved into `ggml_backend_sched_copy_input`; 0052
+  beside upstream's `sched_new` and `embd_all`, and qwen4exp's indexer
+  (below); 0056's test target beside upstream's consolidated state tests.
+- **Reviewed** by a second model (`code`): the regenerated patches rebuild
+  the port tree exactly and the tarball checksum is right; one defect (both
+  MoE caches could hold one layer when a tool enabled both), fixed in 0021.
+- **Two semantic changes found by running it** (`measured-here`):
+  - upstream's qwen4exp builds `ggml_lightning_indexer`, which OpenCL has no
+    kernel for, and its probe is off (`auto_flid = false`), so the op ran on
+    the CPU; 0052 now turns the probe on and keeps the unfused graph (the
+    product, the ReLU in place, the heads summed) where the op is missing:
+    "Lightning Indexer not supported, set to disabled" on both cards;
+  - the batch API checks a token's embedding against the model's input
+    width; an MTP context's hidden state is now a state embedding. arcint's
+    draft batch (`src/exec/llama_spec.cpp`) uses
+    `llama_batch_ext_set_embd_state`; with the token setter the first draft
+    failed (`embedding size mismatch, got 1 rows x 10240`).
+- **Suites** (`measured-here`, test-backend-ops, both cards, each op family
+  the series touches: MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT, GATED_DELTA_NET,
+  SSM_CONV, GET_ROWS, CPY, SET_ROWS, TOP_K, FILL, RMS_NORM, SOFT_MAX): every
+  case passes on both bases; the new base carries upstream's added cases
+  (MUL_MAT 1,221 -> 2,170). Owed by step 3 of the procedure and not done
+  for this move: the patches' own red cases and the four-sequence KL arms;
+  0056's test passes and its red mode fails.
+- **KL as served** (`measured-here`, the old base against the new on the
+  same card): Flash-Next (8 x 512, ubatch 4, the CPU misses on) 0.370044 /
+  84.41 % -> 0.369325 / 84.07 %; the dense agent (16 x 512, q8_0 KV)
+  0.004099 / 97.745 % on both; the coder (A770) 0.025383 / 92.770 % on both.
+- **Served** (`measured-here`, dev builds of the old and the new base, the
+  units' flags; Flash-Next as its unit runs since 0.7.11 with the Q4_K draft
+  head, two processes each, alternated): Flash-Next 44.8-44.9 / 43.0-43.1 /
+  42.1 / 45.1-45.2 / 37.8-37.9 / 36.1-36.2 -> 44.9-46.0 / 43.1-43.3 / 42.1 /
+  46.5-46.8 / 37.1-37.3 / 37.6-37.8 t/s (+1.3 % on the mean), Paris and the
+  needle, peak VRAM 23,741-23,781 -> 23,771-23,775 MiB; the dense agent's
+  prefill 697.7 / 493.4 -> 695.5 / 491.9 t/s at 55k / 138k, the needle, the
+  acceptance task 10/10 (the same program); the coder 51.2 / 47.5 / 44.1 ->
+  51.1 / 47.6 / 44.1 t/s, the same texts (md5), the needle, the task 9/10.
 
 ## 0001-opencl-intel-kquant-integer-dot-and-xmx.patch
 

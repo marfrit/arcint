@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 3eba599..1bccd26 100644
+index d27d8c294..260542ece 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -29227,7 +29227,20 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -29532,7 +29532,20 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
      // expert's whole slice. GGML_OPENCL_KQ_MM_ID_MIN_TOK overrides the 16.
      static const char * mt_env = getenv("GGML_OPENCL_KQ_MM_ID_MIN_TOK");
      static const int    mm_id_min_tok = mt_env ? atoi(mt_env) : 16;

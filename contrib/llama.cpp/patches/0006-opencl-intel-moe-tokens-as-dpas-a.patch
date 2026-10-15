@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 45d12d0..6298ce3 100644
+index 33c3dddcc..d201ad77c 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -989,6 +989,19 @@ struct ggml_backend_opencl_context {
+@@ -999,6 +999,19 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_kq_cvt_f32_f16 = nullptr;
      cl_kernel kernel_mul_mm_kq_f16[6]    = {};
      cl_kernel kernel_mul_mm_id_kq_f16[6] = {};
@@ -22,7 +22,7 @@ index 45d12d0..6298ce3 100644
      cl_kernel kernel_moe_route_tiles = nullptr;
      int             kq_mm_sg = 16;
      ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
-@@ -2248,9 +2261,28 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2274,9 +2287,28 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                                           "kernel_mul_mm_iq3_xxs_f16", "kernel_mul_mm_iq4_xs_f16", "kernel_mul_mm_iq4_nl_f16" };
                  const char * id_n[6] = { "kernel_mul_mm_id_q4_K_f16", "kernel_mul_mm_id_q5_K_f16", "kernel_mul_mm_id_q6_K_f16",
                                           "kernel_mul_mm_id_iq3_xxs_f16", "kernel_mul_mm_id_iq4_xs_f16", "kernel_mul_mm_id_iq4_nl_f16" };
@@ -51,7 +51,7 @@ index 45d12d0..6298ce3 100644
                          " -DSG=" + std::to_string(backend_ctx->kq_mm_sg) + " -DRG=" + std::to_string(t.rg) +
                          " -DTG=" + std::to_string(t.tg) + " -DNSGM=" + std::to_string(t.nsgm) + " -DNSGN=" + std::to_string(t.nsgn);
                      cl_program mm_prog = build_program_from_source_optional(backend_ctx, mm_src.c_str(), mm_opts);
-@@ -2266,6 +2298,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2292,6 +2324,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                          for (int i = 0; i < 6; ++i) {
                              cl_kernel & k = pass == 0 ? backend_ctx->kernel_mul_mm_kq_f16[i] : backend_ctx->kernel_mul_mm_id_kq_f16[i];
                              CL_CHECK((k = clCreateKernel(mm_prog, pass == 0 ? mm_n[i] : id_n[i], &err), err));
@@ -63,7 +63,7 @@ index 45d12d0..6298ce3 100644
                          }
                      }
                      CL_CHECK(clReleaseProgram(mm_prog));
-@@ -26530,7 +26567,13 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -26840,7 +26877,13 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
      static const char * mt_env = getenv("GGML_OPENCL_KQ_MM_ID_MIN_TOK");
      static const int    mm_id_min_tok = mt_env ? atoi(mt_env) : 16;
      const bool gemm = n_tok >= mm_id_min_tok && backend_ctx->kernel_mul_mm_id_kq_f16[ti] != nullptr && n_expert <= 512;
@@ -78,7 +78,7 @@ index 45d12d0..6298ce3 100644
      if (kernel == nullptr) {
          return false;
      }
-@@ -26582,26 +26625,38 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -26892,26 +26935,38 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
      const ggml_cl_kq_tile & t = backend_ctx->kq_mm_id;
      const int sg        = backend_ctx->kq_mm_sg;
      const int n_pairs   = n_used * n_tok;
@@ -131,7 +131,7 @@ index 45d12d0..6298ce3 100644
  
      ggml_cl_kq_weight_args(kernel, src0, a);
      CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xh.buffer));
-@@ -26617,6 +26672,12 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -26927,6 +26982,12 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
      CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb2));
      CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne00));
      CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01));
@@ -145,7 +145,7 @@ index 45d12d0..6298ce3 100644
      size_t local_work_size[]  = { (size_t)sg, (size_t)t.nsg(), 1 };
      backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
-index a796787..ffa87e7 100644
+index a796787d5..ffa87e7d2 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
 @@ -500,3 +500,366 @@ kernel void kernel_mul_mm_id_iq4_nl_f16(global const uchar * q, ulong offq, glob

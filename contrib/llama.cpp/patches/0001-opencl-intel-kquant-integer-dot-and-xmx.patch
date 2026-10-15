@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
-index 97b862a..cfe16bd 100644
+index 97b862aff..cfe16bd2b 100644
 --- a/ggml/src/ggml-opencl/CMakeLists.txt
 +++ b/ggml/src/ggml-opencl/CMakeLists.txt
 @@ -98,6 +98,8 @@ set(GGML_OPENCL_KERNELS
@@ -12,10 +12,10 @@ index 97b862a..cfe16bd 100644
      mul_mv_q5_0_f32_flat
      mul_mv_q5_1_f32
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 4f1f937..658f2df 100644
+index 17ceacc7a..434a833d4 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -628,6 +628,23 @@ struct ggml_cl_adreno_xmem_attn_state {
+@@ -637,6 +637,23 @@ struct ggml_cl_adreno_xmem_attn_state {
  #endif
  
  // backend context
@@ -39,7 +39,7 @@ index 4f1f937..658f2df 100644
  struct ggml_backend_opencl_context {
      int ref_count;
  
-@@ -656,6 +673,7 @@ struct ggml_backend_opencl_context {
+@@ -665,6 +682,7 @@ struct ggml_backend_opencl_context {
      bool has_vector_subgroup_broadcast;
      bool has_subgroup_shuffle = false;       // cl_khr_subgroup_shuffle or cl_qcom_subgroup_shuffle
      bool has_integer_dot      = false;       // cl_khr_integer_dot_product or cl_qcom_dot_product8
@@ -47,7 +47,7 @@ index 4f1f937..658f2df 100644
      bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
      bool disable_fusion;
      bool fuse_mm_glu = true;                     // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
-@@ -713,6 +731,17 @@ struct ggml_backend_opencl_context {
+@@ -722,6 +740,17 @@ struct ggml_backend_opencl_context {
      ggml_cl_buffer prealloc_moe_sa;   // per-block s  [tok_slots * ne00/32] (half)
      // scratch copy of the router weights to avoid dst aliasing
      ggml_cl_buffer prealloc_moe_combine_w;
@@ -65,7 +65,7 @@ index 4f1f937..658f2df 100644
      ggml_cl_buffer prealloc_splitk_partial;  // [ksplit * M] partials for split-K GEMV
  
      // pool of persistent image1d_buffer views over kv-cache layers, keyed by
-@@ -946,6 +975,22 @@ struct ggml_backend_opencl_context {
+@@ -956,6 +985,22 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_mul_mv_q5_1_f32_flat;
      cl_kernel kernel_mul_mv_q4_K_f32;
      cl_kernel kernel_mul_mv_q4_K_f32_flat;
@@ -88,7 +88,7 @@ index 4f1f937..658f2df 100644
      cl_kernel kernel_mul_mv_q5_K_f32;
      cl_kernel kernel_mul_mv_q5_K_f32_flat;
      cl_kernel kernel_mul_mv_q6_K_f32;
-@@ -1405,6 +1450,22 @@ static cl_program build_program_from_source(ggml_backend_opencl_context * backen
+@@ -1422,6 +1467,22 @@ static cl_program build_program_from_source(ggml_backend_opencl_context * backen
      return p;
  }
  
@@ -111,7 +111,7 @@ index 4f1f937..658f2df 100644
  static cl_program build_program_from_binary(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, size_t bin_size = 0) {
      cl_program p;
      char *program_log;
-@@ -1469,6 +1530,19 @@ static bool use_adreno_bin_kernels(ggml_backend_opencl_context * backend_ctx) {
+@@ -1486,6 +1547,19 @@ static bool use_adreno_bin_kernels(ggml_backend_opencl_context * backend_ctx) {
  #endif // GGML_OPENCL_USE_ADRENO_BIN_KERNELS
  }
  
@@ -128,10 +128,10 @@ index 4f1f937..658f2df 100644
 +    return kq_on && backend_ctx->gpu_family == INTEL && backend_ctx->has_integer_dot;
 +}
 +
- static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
-     if (backend_ctx->kernels_loaded) {
-         return;
-@@ -2019,6 +2093,120 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+ static std::string ggml_opencl_make_compile_opts(const ggml_backend_opencl_context * backend_ctx) {
+     auto opencl_c_std =
+         std::string("CL") + std::to_string(backend_ctx->opencl_c_version.major) + "." + std::to_string(backend_ctx->opencl_c_version.minor);
+@@ -2045,6 +2119,120 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
          GGML_LOG_CONT(".");
      }
  
@@ -252,7 +252,7 @@ index 4f1f937..658f2df 100644
      // mul_mv_q5_0_f32
      {
  #ifdef GGML_OPENCL_EMBED_KERNELS
-@@ -6741,6 +6929,10 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
+@@ -6930,6 +7118,10 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
      // while cl_khr_integer_dot_product uses signed * signed -- we stick with khr for now
      backend_ctx->has_integer_dot =
          strstr(ext_buffer.data(), "cl_khr_integer_dot_product") != NULL;
@@ -263,7 +263,7 @@ index 4f1f937..658f2df 100644
  
      cl_uint base_align_in_bits;
      CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MEM_BASE_ADDR_ALIGN, sizeof(cl_uint), &base_align_in_bits, NULL));
-@@ -8417,6 +8609,7 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
+@@ -8610,6 +8802,7 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
  
  static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
@@ -271,7 +271,7 @@ index 4f1f937..658f2df 100644
  
      for (int i = 0; i < cgraph->n_nodes; i++) {
          ggml_tensor * node = cgraph->nodes[i];
-@@ -9084,6 +9277,16 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -9297,6 +9490,16 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                  // trans-weight GEMM, which needs both a GEMM kernel for the type and
                  // use_adreno_kernels(). Decline the large-N shapes that would otherwise
                  // fall through to the GEMV.
@@ -288,7 +288,7 @@ index 4f1f937..658f2df 100644
                  {
                      const ggml_type t = op->src[0]->type;
                      const bool type_has_gemm = (t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 ||
-@@ -9113,6 +9316,13 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -9332,6 +9535,13 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                      return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
                  }
              }
@@ -302,7 +302,7 @@ index 4f1f937..658f2df 100644
              // q4_0, q8_0 and mxfp4 have general MUL_MAT_ID support,
              // the quantizations here currently do not - they are only supported by Adreno with certain shapes
              if (op->src[0]->type == GGML_TYPE_Q4_1 ||
-@@ -23384,6 +23594,195 @@ static cl_mem ggml_cl_img_pool_get_or_create(
+@@ -23686,6 +23896,195 @@ static cl_mem ggml_cl_img_pool_get_or_create(
      return img;
  }
  
@@ -498,7 +498,7 @@ index 4f1f937..658f2df 100644
  static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -23459,6 +23858,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -23771,6 +24170,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
  
      GGML_ASSERT(ne00 == ne10);
  
@@ -511,7 +511,7 @@ index 4f1f937..658f2df 100644
  #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
      // adreno GEMM/GEMV kernels do not support broadcast, assuming ne2 and ne3 are 1 for src1
      // so we handle broadcast here
-@@ -25793,6 +26198,127 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
+@@ -26103,6 +26508,127 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
      CL_CHECK(clReleaseMemObject(emap_buf));
  }
  
@@ -639,7 +639,7 @@ index 4f1f937..658f2df 100644
  static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -25877,6 +26403,12 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
+@@ -26187,6 +26713,12 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
  
      const int r2 = ne12/ne02;
      const int r3 = ne13/ne03;
@@ -654,7 +654,7 @@ index 4f1f937..658f2df 100644
      GGML_ASSERT(ne00 == ne10);
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
 new file mode 100644
-index 0000000..d1f504d
+index 000000000..d1f504d52
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
 @@ -0,0 +1,336 @@
@@ -996,7 +996,7 @@ index 0000000..d1f504d
 +}
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl
 new file mode 100644
-index 0000000..3302bc2
+index 000000000..3302bc27d
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl
 @@ -0,0 +1,335 @@

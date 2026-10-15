@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
-index 4684ece..1a93b11 100644
+index 4684ece47..1a93b1152 100644
 --- a/ggml/src/ggml-opencl/CMakeLists.txt
 +++ b/ggml/src/ggml-opencl/CMakeLists.txt
 @@ -101,6 +101,7 @@ set(GGML_OPENCL_KERNELS
@@ -11,10 +11,10 @@ index 4684ece..1a93b11 100644
      mul_mv_q5_0_f32_flat
      mul_mv_q5_1_f32
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 40f14ab..2c8b9f1 100644
+index 0e673c13f..f0ba4185f 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -738,10 +738,13 @@ struct ggml_backend_opencl_context {
+@@ -747,10 +747,13 @@ struct ggml_backend_opencl_context {
      ggml_cl_buffer prealloc_kq_xd;   // per-32 scale (float)
      ggml_cl_buffer prealloc_kq_xs;   // per-32 sum (float)
      // what the activation buffers hold, and the graph count that dates it
@@ -29,7 +29,7 @@ index 40f14ab..2c8b9f1 100644
      ggml_cl_buffer prealloc_kq_pairs;  // MUL_MAT_ID GEMM: (token, slot) pairs sorted by expert
      ggml_cl_buffer prealloc_kq_tiles;  // its tiles (expert, first pair, count)
      ggml_cl_buffer prealloc_kq_ntiles; // and their number
-@@ -1008,6 +1011,11 @@ struct ggml_backend_opencl_context {
+@@ -1018,6 +1021,11 @@ struct ggml_backend_opencl_context {
      int             kq_mm_sg = 16;
      ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
      int       kq_q8_1_ndst = 4;
@@ -41,7 +41,7 @@ index 40f14ab..2c8b9f1 100644
      cl_kernel kernel_mul_mv_q5_K_f32;
      cl_kernel kernel_mul_mv_q5_K_f32_flat;
      cl_kernel kernel_mul_mv_q6_K_f32;
-@@ -2226,6 +2234,60 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2252,6 +2260,60 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                  }
              }
  
@@ -102,7 +102,7 @@ index 40f14ab..2c8b9f1 100644
              // the GEMM: fp16 DPAS at the device's DPAS sub-group size. Tiles
              // (measured-here: an A770 at 2000 MHz, a B60), rows x columns per
              // work-group: plain SG 8 32 x 512, SG 16 64 x 256; MUL_MAT_ID
-@@ -24129,6 +24191,70 @@ static bool ggml_cl_mul_mv_kq_q8_1(ggml_backend_opencl_context * backend_ctx, co
+@@ -24426,6 +24488,70 @@ static bool ggml_cl_mul_mv_kq_q8_1(ggml_backend_opencl_context * backend_ctx, co
      return true;
  }
  
@@ -173,7 +173,7 @@ index 40f14ab..2c8b9f1 100644
  // Intel: a K-quant weight times more than 4 f32 columns -- the columns as
  // f16, the weights dequantized to f16 per work-group tile, fp16 DPAS on the
  // XMX units (mul_mm_kq_f16.cl).
-@@ -24349,7 +24475,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -24656,7 +24782,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
      GGML_ASSERT(ne00 == ne10);
  
  #ifdef GGML_OPENCL_SOA_Q
@@ -185,7 +185,7 @@ index 40f14ab..2c8b9f1 100644
  #endif
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_few.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_few.cl
 new file mode 100644
-index 0000000..3052094
+index 000000000..305209459
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_few.cl
 @@ -0,0 +1,343 @@
@@ -533,10 +533,10 @@ index 0000000..3052094
 +    FEW_EPILOGUE
 +}
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index a23a133..221e357 100644
+index 1c8386946..c8778e2c8 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10246,6 +10246,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10711,6 +10711,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  8, 16*256, { 1,  1}, {1, 1}));
      }
  

@@ -1,5 +1,5 @@
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
-index 896c55b..fc79055 100644
+index 896c55b14..fc79055fa 100644
 --- a/src/llama-expert-cache.cpp
 +++ b/src/llama-expert-cache.cpp
 @@ -137,35 +137,65 @@ bool llama_expert_cache::verify(const llama_expert_cache_layer & L, ggml_tensor
@@ -214,7 +214,7 @@ index 896c55b..fc79055 100644
                         __func__, ggml_backend_dev_name(dev_), L.il, p.slot, p.e_in, p.x, p.e_out, bad);
          pend_check = false;
 diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
-index c5534c6..c6545b8 100644
+index c5534c64f..c6545b8a0 100644
 --- a/src/llama-expert-cache.h
 +++ b/src/llama-expert-cache.h
 @@ -71,7 +71,8 @@ struct llama_expert_cache_layer {
