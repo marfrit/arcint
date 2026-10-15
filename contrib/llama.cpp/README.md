@@ -24,7 +24,8 @@ The pin moves only as a release decision of its own (charter C3,
 `docs/milestone-1.0.0.md`), never to make a patch apply.
 
 What a move costs (`measured-here`, 2026-10-15, a clone of upstream master
-`e467e5b` against `bed0a85`, 274 commits apart): 43 of the 55 patches touch
+`e467e5b` against `bed0a85`, 274 commits apart; counted at 0055, 0056 adds one
+to each count): 43 of the 55 patches touch
 `ggml/src/ggml-opencl/ggml-opencl.cpp`, where upstream changed 445 lines in
 8 commits, among them `f2cc728`, which split `load_cl_kernels` (the
 function most of the series extends; patch 0001 already fails there). 13
@@ -3396,12 +3397,12 @@ product has no SIMD form.
 
   | CPU takes a layer | decode | mean |
   |---|---|---|
-  | none (4 processes) | 38.7-39.0 / 38.7-38.8 / 41.7-41.8 / 34.8-34.9 / 31.8-31.9 / 31.6 | 36.3 |
+  | none (6 processes) | 38.7-39.0 / 38.6-38.8 / 41.7-41.8 / 34.7-34.9 / 31.8-31.9 / 31.5-31.6 | 36.3 |
   | up to 2 | 41.5 / 39.1 / 40.7 / 37.6 / 35.3 / 32.5 | 37.8 (+4.2 %) |
   | up to 4 (2) | 44.0 / 41.8-41.9 / 41.4-41.5 / 39.9 / 36.8 / 32.2 | 39.4 (+8.5 %) |
   | up to 8 (2) | 42.8-42.9 / 40.9 / 41.8 / 43.2-43.3 / 37.3 / 36.0-36.1 | 40.4 (+11.3 %) |
   | up to 16, 6 threads | 42.6 / 42.8 / 43.5 / 44.8 / 38.5 / 34.6 | 41.1 (+13.4 %) |
-  | up to 16, 8 threads (the default; 2) | 43.9 / 43.1-43.2 / 43.7 / 45.8-45.9 / 38.9 / 35.1 | 41.8 (+15.2 %) |
+  | up to 16, 8 threads (the default; 4, two of them after the review's fixes) | 43.8-44.0 / 43.1-43.3 / 43.7-43.9 / 45.8-46.1 / 38.9 / 35.0-35.1 | 41.8 (+15.2 %) |
   | up to 16, 10 / 12 threads | 43.9 / 43.0 / 43.6-43.7 / 46.1-46.4 / 38.9 / 34.9 | as 8 |
   | up to 24 / 32 | 42.6 / 41.1 / 43.5 / 45.6 / 38.3 / 35.5; 42.2 / 44.0 / 43.2 / 44.4 / 37.1 / 33.3 | below 16 |
 
@@ -3447,6 +3448,6 @@ product has no SIMD form.
     NaN rows reached the sampler;
   - a publish now runs below the kernel checks, on the per-pair matvec only,
     and waits out a job never merged before it rewrites the shared buffer.
-- **Operator:** whether the Flash-Next unit sets
-  `LLAMA_EXPERT_CACHE_CPU_MISSES=1` (an `Environment=` line; it spins 8
-  threads at 100 % while Flash-Next decodes).
+- **On the unit** (operator, 2026-10-15): the Flash-Next unit sets
+  `LLAMA_EXPERT_CACHE_CPU_MISSES=1` from 0.7.11 on (an `Environment=` line;
+  it spins 8 threads at 100 % while Flash-Next decodes).

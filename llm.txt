@@ -17,8 +17,9 @@
 ## Status
 
 Release 0.6.0 (2026-10-07): Qwen3.8-Flash-Next on the libllama engine
-(IQ2_XS, every expert on the B60 through an expert cache, MTP; 422 t/s
-prefill at 20k, 33-35 t/s decode; docs/llama-engine.md). Runtime dependency: marfrit-openvino +p25, the
+(IQ2_XS, every expert on the B60 through an expert cache, MTP; then 422 t/s
+prefill at 20k, 33-35 t/s decode; at 0.7.11 660-690 t/s and 36 t/s, 42 with
+0056's CPU misses; docs/llama-engine.md). Runtime dependency: marfrit-openvino +p25, the
 pinned OpenVINO nightly 71640275 with patches 0003-0074
 (contrib/packaging/marfrit-openvino/patches/); +p27 (0076-0077) for the
 Flash-Next tier's opt-in switches MOE_CPU_TIER_ADAPTIVE and MOE_DOORBELL.

@@ -191,8 +191,14 @@ Flash-Next needs more from the host than the other two:
 - **the GGUF on fast local storage:** experts not in the bank or the cache
   are read from the file; with the file on a ZFS pool the record has a
   Flash-Next quant decoding at 4-5 t/s (README, current numbers);
-- **a VRAM margin:** 11,300 MiB of expert slots peaks at ~24.2 GB of a
-  24.5 GB card. Do not run anything else on that card.
+- **a VRAM margin:** 13,400 MiB of expert slots with `--llama-reserve-cells
+  20480` (0052) peaks at 23.35 GiB of a 24.5 GB card (the earlier 11,300 MiB
+  without the reserve peaked at ~24.2 GB). Do not run anything else on that
+  card;
+- **CPU threads:** with `LLAMA_EXPERT_CACHE_CPU_MISSES=1` (0056) a
+  coordinator and 7 workers (`LLAMA_EXPERT_CACHE_CPU_MISS_THREADS`, 8 in
+  all) spin at 100 % while Flash-Next decodes; the coder decoding on a second
+  card of the same host loses ~1 % (`measured-here`).
 
 ## CPU baseline: the image is portable, and that costs something
 

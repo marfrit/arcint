@@ -4,7 +4,7 @@
 # + seccomp unconfined. Models are mounted read-only, never baked in.
 #
 # Three services, one compose profile each -- the command lines the project's
-# own services run (0.7.8; docs/docker.md, "The three services"):
+# own services run (0.7.11; docs/docker.md, "The three services"):
 #   docker compose --profile coder up        # the coder, a 16 GB card
 #   docker compose --profile agent up        # the dense 27B agent, a 24 GB card
 #   docker compose --profile flashnext up    # Qwen3.8-Flash-Next, a 24 GB card + ~23 GB pinned host memory

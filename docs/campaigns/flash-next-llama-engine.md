@@ -1621,7 +1621,7 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
   at the same time loses ~1 %. On Strata's own request Flash-Next now
   decodes 43.8-44.0 t/s against Strata's 37.8 on this card (the B3
   comparison of 2026-10-14; Strata not re-run). Opt-in
-  (`LLAMA_EXPERT_CACHE_CPU_MISSES=1`); the unit is the operator's call.
+  (`LLAMA_EXPERT_CACHE_CPU_MISSES=1`), set on the Flash-Next unit from 0.7.11 on (operator).
 - **A tool trap:** `llama-perplexity` on Flash-Next with the expert cache
   was killed by the container's memory limit at 54 GB of anonymous memory:
   its default load mode `auto` reads the whole file into memory when a

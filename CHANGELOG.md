@@ -24,7 +24,9 @@ builds llama.cpp `bed0a85` with `contrib/llama.cpp/patches` 0001-0056. One
 llama.cpp patch, for Flash-Next; the dense agent and the coder have no
 expert cache and are unchanged. Every number is `measured-here` on the B60
 with the Flash-Next unit's flags and Strata's adapt rule, one binary with
-the switch off in the other arm, fresh processes alternated; the details are
+the switch off in the other arm, fresh processes, except the kernel times
+(one thread on the host's CPU, seeded data) and the coder's line (its own
+unit on the A770 while Flash-Next decodes); the details are
 in `contrib/llama.cpp/README.md` (0056) and
 `docs/campaigns/flash-next-llama-engine.md` (on the `qfndev` branch).
 
