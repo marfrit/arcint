@@ -1524,6 +1524,37 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
     that is ~1.1 %.
   A fold keeps the quantization work and removes the launch: below the
   charter's 2 % on each service; not built.
+- **Infernix's LFRU against Strata's adapt: patch 0055** (`measured-here`,
+  2026-10-15, B60, the 0.7.9 unit's flags with 0053/0054, one binary an
+  arm pair; README 0055). Infernix scores an expert uses / (now - last + 1)
+  with uses never reset, protects the round's routed experts and admits a
+  miss only over a lower-scoring victim (`code`, `expert_cache.cpp`
+  `LfruPolicy`). Here per layer, inside the existing slots and swap queue
+  (`LLAMA_EXPERT_CACHE_POLICY=lfru`, opt-in), up to 4 admissions a layer
+  an adapt:
+
+  | arm | decode t/s, Strata's request 500 / 300 / 300 tokens | on the card |
+  |---|---|---|
+  | Strata's adapt, 5 processes | 38.7-39.4 / 38.6-39.0 / 41.7-42.0 | 89.0 / 93.3 / 95.4 % |
+  | LFRU, budget 1, 2 | 38.2-38.9 / 39.6 / 42.1 | 88.3 / 94.4 / 95.8 % |
+  | LFRU, budget 4, 4 | 39.0-39.5 / 39.9-40.2 / 42.1-42.4 | 89.6 / 95.1 / 96.2 % |
+  | LFRU, budget 8, 1 | 39.1 / 40.0 / 42.0 | 89.6 / 95.1 / 96.2 % |
+  | LFRU 4, rejected drafts not credited, 1 | 38.8 / 39.8 / 42.0 | 89.5 / 94.9 / 96.0 % |
+  | LFRU 4, Infernix's exact clock and candidates, 2 | 39.0 / 39.8 / 42.2-42.4 | 89.3 / 94.6 / 96.0 % |
+
+  Every arm: Paris, the 20k needle in 30.8-31.2 s, the same texts (md5).
+  Budget 4: +1.3 % on the means (40.4 against 39.8 t/s), hit rate +0.6 to
+  +1.8 points; the short answer after the 20k prompt sits lower (53 against
+  59 % of its 24 tokens' experts, the needle time unchanged). Not crediting
+  rejected drafts (Infernix's `live` columns, the next ubatch's position
+  minus the last) did not help and is not in the patch. The review noted
+  the port's two departures from the reference (a clock tick a step, not a
+  layer call; every used bank expert a candidate, not only the step's
+  misses); the exact form (`LLAMA_EXPERT_CACHE_LFRU_EXACT=1`) measured
+  between the port and Strata's rule, so the reference's mechanism pays
+  here too. Infernix's global
+  pool (one capacity over all layers) is not built: the slots are
+  per-layer tensors.
 - **The input copies.** The OpenCL backend has no events and no async copy,
   so the scheduler synchronizes the queue and writes blocking for each of a
   verify's 34 inputs (positions, masks, indices): 17 us a pair on the B60

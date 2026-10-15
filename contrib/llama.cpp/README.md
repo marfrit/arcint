@@ -3247,3 +3247,49 @@ build now also takes `GGML_OPENCL_IQ_OPTS`, so one binary can A/B it.
 - **Reviewed** by a second model: no defect. Noted: `-DLB_CHAR4_ARITH`
   through `GGML_OPENCL_IQ_OPTS` now selects the GEMM's char4 forms as well
   as the matvec's; label such prefill cells accordingly.
+
+## 0055-expert-cache-lfru.patch
+
+Infernix's expert-cache policy as an opt-in alternative to Strata's adapt
+rule (`LLAMA_EXPERT_CACHE_POLICY=lfru`). Infernix (`code`,
+`src/models/qwen4_exp/program/expert_cache/expert_cache.cpp`, `LfruPolicy`)
+scores an expert uses / (now - last + 1), its uses never reset, protects
+the round's routed experts from eviction and admits a miss only over a
+lower-scoring victim, within a budget. Here, per layer inside the existing
+slots and swap queue (0042): at each adapt (every 6 decode tokens) up to
+`LLAMA_EXPERT_CACHE_LFRU_BUDGET` (4) admissions a layer, the round's experts
+protected, the plan's global cap (96 swaps) unchanged.
+
+Two forms:
+- the default (the port): one clock tick a counted decode step, every
+  bank expert used before a candidate;
+- `LLAMA_EXPERT_CACHE_LFRU_EXACT=1`, Infernix's form: its clock ticks once a
+  routed layer call (a round ages an expert by the layer count), and only
+  the step's misses are candidates. Admission still runs at the adapt, not
+  every layer call.
+
+- **Measured** (`measured-here`, 2026-10-15, B60, Flash-Next with the 0.7.9
+  unit's flags and 0053/0054; Strata's request, two 300-token answers, the
+  20k needle; one binary an arm pair):
+
+  | arm | decode t/s | on the card |
+  |---|---|---|
+  | Strata's adapt (5 processes) | 38.7-39.4 / 38.6-39.0 / 41.7-42.0 | 89.0 / 93.3 / 95.4 % |
+  | LFRU port, budget 4 (4) | 39.0-39.5 / 39.9-40.2 / 42.1-42.4 | 89.6 / 95.1 / 96.2 % |
+  | LFRU exact, budget 4 (2) | 39.0 / 39.8 / 42.2-42.4 | 89.3 / 94.6 / 96.0 % |
+  | LFRU port, budget 1 (2) / 8 (1) | 38.2-38.9 / 39.6 / 42.1; 39.1 / 40.0 / 42.0 | |
+
+  The port +1.3-1.8 % on the means; every arm Paris, the needle in
+  30.8-31.2 s, the same texts (md5): the policy moves which experts are
+  read over the link, not the values. Not taken: no credit for the
+  columns of rejected drafts (Infernix's `live`; the next ubatch's position
+  minus the last): 38.8 / 39.7-39.8 / 41.9-42.0, no gain. Not built:
+  Infernix's single pool over all layers (the slots are per-layer
+  tensors) and its warm start from saved state.
+- **Reviewed** by a second model: no defect in the tables, the counts or the
+  default path (Strata's rule unchanged; the plan never double-books a slot,
+  as for Strata's rule, since it runs only when no swap is in flight). Its
+  notes became the exact form above. Recorded: a budget that does not parse
+  (`LLAMA_EXPERT_CACHE_LFRU_BUDGET=abc`) is 0, no admissions.
+- **Operator:** which policy the Flash-Next unit runs (a unit flag, not a
+  default change).
