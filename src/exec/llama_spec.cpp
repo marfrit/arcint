@@ -676,7 +676,9 @@ private:
         if (b == bd_) ++nd_;
         const llama_pos p = static_cast<llama_pos>(pos);
         llama_batch_ext_set_pos(b, idx, &p);
-        if (row != nullptr && !llama_batch_ext_set_embd_token(b, idx, llama_embd{ row, 1, static_cast<size_t>(n_embd_) }))
+        // the target's hidden state rides as the token's state embedding (llama.cpp 3e4dfa8: the token
+        // embedding slot takes the model's own input width only; set_embd_state is what common_batch uses)
+        if (row != nullptr && !llama_batch_ext_set_embd_state(b, idx, llama_embd{ row, 1, static_cast<size_t>(n_embd_) }))
             return false;
         if (out) llama_batch_ext_set_output_logits(b, idx, true);
         return true;
