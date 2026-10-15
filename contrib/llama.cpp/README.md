@@ -3513,16 +3513,24 @@ product has no SIMD form.
   B60, ISTA-DASLab's IQ3_XXS file, 2026-10-15). A layer whose types the
   multi-token rows do not take goes through ggml-cpu's dot products, which
   read each weight row as GGUF blocks. An IQ4_NL tensor in USM host memory
-  is not stored that way: `ggml_cl_usm_set_tensor` keeps its scales and its
-  quants as two arrays. The slow path read the split as blocks, so a layer
-  with an IQ4_NL down projection (18 of the IQ3_XXS file's 48; none in the
-  IQ2_XS file) produced NaN rows. The next layer's router saw NaN, the fused
-  top-k wrote INT_MAX as every expert id, and the combined-id gather read
-  past its table: the first CPU-miss request faulted in the next fast-path
-  layer (a SIGSEGV in `row_iq<IQ2_XXS>`, layer 1 publishing bank row
-  1,911,949,923 of 329). Found by instrumenting the publish (the ids, the
-  table and the routed ids at that node). The row reader now rebuilds the
-  GGUF blocks from the two arrays (`ggml_cl_miss_cpu_join_iq4nl`).
-  `test-opencl-miss-cpu` checks rows of a two-slice split bank against the
-  GGUF bytes; its red mode, and `GGML_OPENCL_CPU_MISS_SPLIT_RED=1` served,
-  read the split as blocks.
+  is not stored that way: its first write (`ggml_cl_usm_set_tensor`) keeps
+  its scales and its quants as two arrays. The slow path read the split as
+  blocks: layer 0 of the IQ3_XXS file (IQ2_XS gate/up, IQ4_NL down; 18 of
+  its 48 layers have an IQ4_NL down, the IQ2_XS file none) returned 13,230
+  non-finite values in 40,960, layer 1's whole input was non-finite, its
+  fused top-k chose no expert (INT_MAX ids), and its first CPU pair carried
+  bank row 1,911,949,923 of 329: a fault in `row_iq<IQ2_XXS>` at the first
+  request. Found by instrumenting the publish and the CPU path (the ids,
+  the table and the routed ids at that node; non-finite counts a layer).
+  The row reader rebuilds GGUF blocks from the two arrays
+  (`ggml_cl_miss_cpu_join_iq4nl`), and the arrays are looked up at a layer's
+  first publish: a first fix looked them up at registration, which comes
+  before the bank's fill, and was measured inert. With the fix: no
+  non-finite row; IQ3_XXS at 12,000 MiB of slots decodes 33.9 / 37.5 / 37.3
+  / 33.5 / 30.6 / 30.9 t/s on six answers with the misses against 20.7 /
+  26.2 / 28.9 / 18.7 / 21.2 / 18.5 without (+52 % on the mean), KL 0.290954
+  / 86.618 % against 0.286562 / 86.765 % (8 x 512, ubatch 4), Paris and the
+  needle right; the IQ2_XS unit's six texts unchanged (md5).
+  `test-opencl-miss-cpu` checks split rows against the GGUF bytes; its red
+  mode, and `GGML_OPENCL_CPU_MISS_SPLIT_RED=1` served (a fault at the first
+  request), read the split as blocks.

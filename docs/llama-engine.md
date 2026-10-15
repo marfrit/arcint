@@ -310,7 +310,7 @@ and served name, one at a time (`measured-here` unless marked):
 | GGUF | KL / top-1 vs Q8_0 (16 x 512) | host bank at the unit's slots | state |
 |---|---|---|---|
 | ISTA-DASLab GSQ-RCO IQ2_XS (shard 1 39.2 GB) | 0.294 / 87.1 % | 20.32 GiB at 13,400 MiB | production, 43.4 t/s decode, 690 t/s prefill at 20k (0.7.12) |
-| ISTA-DASLab GSQ-RCO IQ3_XXS (shard 1 47.0 GB) | 0.218 / 89.7 % (served) | 28.72 GiB at 12,000 MiB | on demand (`arcint-flashnext-iq3xxs`), 12,000 MiB of slots, without the CPU misses: 595.7 t/s at the 20k needle, 20.7 / 26.2 / 28.9 / 18.7 / 21.2 / 18.5 t/s on six answers, the same texts as at 13,400 MiB, peak 23,290 MiB (13,400 MiB from ZFS thrashed: 6.4-11.7 t/s at peak 24,440); the CPU misses: DESIGN §8.3 |
+| ISTA-DASLab GSQ-RCO IQ3_XXS (shard 1 47.0 GB) | 0.218 / 89.7 % (served) | 28.72 GiB at 12,000 MiB | on demand (`arcint-flashnext-iq3xxs`), 12,000 MiB of slots with the CPU misses: 597.9 t/s at the 20k needle, 33.9 / 37.5 / 37.3 / 33.5 / 30.6 / 30.9 t/s on six answers (20.7 / 26.2 / 28.9 / 18.7 / 21.2 / 18.5 without), KL 0.2910 against 0.2866 without (8 x 512), peak 23,306 MiB (13,400 MiB from ZFS thrashed: 6.4-11.7 t/s at peak 24,440) |
 | unsloth UD-Q3_K_XL (3 shards, 90 GB) | 0.100 / 93.3 %, inside the bar | ~39 GiB | 235 t/s prefill, 12-13 t/s decode without MTP (2026-10-06, before the bank stream and the CPU misses); needs the planned 96 GB host |
 
 The IQ3_XXS file mixes its expert types by layer: gate/up IQ2_S in 10
