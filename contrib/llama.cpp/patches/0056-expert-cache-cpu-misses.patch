@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
-index f878649..531a37f 100644
+index f8786499e..531a37f7f 100644
 --- a/ggml/src/ggml-opencl/CMakeLists.txt
 +++ b/ggml/src/ggml-opencl/CMakeLists.txt
 @@ -7,6 +7,8 @@ ggml_add_backend_library(${TARGET_NAME}
@@ -13,7 +13,7 @@ index f878649..531a37f 100644
  target_include_directories(${TARGET_NAME} PRIVATE ${OpenCL_INCLUDE_DIRS})
 diff --git a/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.cpp b/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.cpp
 new file mode 100644
-index 0000000..faebcfe
+index 000000000..faebcfe9a
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.cpp
 @@ -0,0 +1,306 @@
@@ -325,7 +325,7 @@ index 0000000..faebcfe
 +#endif
 diff --git a/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.h b/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.h
 new file mode 100644
-index 0000000..a53c017
+index 000000000..a53c01779
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.h
 @@ -0,0 +1,14 @@
@@ -344,7 +344,7 @@ index 0000000..a53c017
 +void   ggml_cl_miss_cpu_rows(ggml_type t, const void * slice, bool planar, int64_t ne0, int64_t ne1,
 +                             const void * const * act, int nt, float * const * out, int r0, int r1);
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 855d1e9..a50f64b 100644
+index aad8e2fa6..572d3c8b2 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -14,6 +14,7 @@
@@ -355,9 +355,9 @@ index 855d1e9..a50f64b 100644
  
  #ifdef GGML_OPENCL_USE_ADRENO_BIN_KERNELS
  #include "libdl.h"
-@@ -52,6 +53,10 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
- #include <regex>
+@@ -53,6 +54,10 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
  #include <set>
+ #include <tuple>
  #include <unordered_set>
 +#include <thread>
 +#include <atomic>
@@ -366,7 +366,7 @@ index 855d1e9..a50f64b 100644
  
  #undef MIN
  #undef MAX
-@@ -774,6 +779,7 @@ struct ggml_backend_opencl_context {
+@@ -783,6 +788,7 @@ struct ggml_backend_opencl_context {
      // what the activation buffers hold, and the graph count that dates it
      ggml_cl_kq_act kq_q8, kq_f16, kq_few, kq_i8;
      uint64_t       graph_gen = 0;
@@ -374,7 +374,7 @@ index 855d1e9..a50f64b 100644
      ggml_cl_buffer prealloc_kq_xh;     // f16 activation of the K-quant GEMMs
      ggml_cl_buffer prealloc_kq2_xq;    // the int8 2D GEMM's activations [token][K] (kernel_quant_i8)
      ggml_cl_buffer prealloc_kq2_xd;    // their scales per 256 [K / 256][tokens padded]
-@@ -15122,6 +15128,489 @@ static void ggml_backend_opencl_chain_prefetch(const ggml_tensor * a, const ggml
+@@ -15344,6 +15350,489 @@ static void ggml_backend_opencl_chain_prefetch(const ggml_tensor * a, const ggml
      g_cache_chain[a] = b;
  }
  
@@ -864,7 +864,7 @@ index 855d1e9..a50f64b 100644
  // an expert cache's gather mirror, allocated at load (not inside a request)
  static void ggml_backend_opencl_reserve_gather(ggml_backend_dev_t dev, size_t q, size_t d) {
      ggml_backend_opencl_context * ctx = ((ggml_backend_opencl_device_context *) dev->context)->backend_ctx;
-@@ -15160,6 +15649,9 @@ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, c
+@@ -15382,6 +15871,9 @@ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, c
      if (strcmp(name, "ggml_backend_opencl_chain_prefetch") == 0) {
          return (void *) ggml_backend_opencl_chain_prefetch;
      }
@@ -874,7 +874,7 @@ index 855d1e9..a50f64b 100644
      if (strcmp(name, "ggml_backend_opencl_pair_bank") == 0) {
          return (void *) ggml_backend_opencl_pair_bank;
      }
-@@ -29723,6 +30215,11 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -30028,6 +30520,11 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
      GGML_ASSERT(ne12 == n_tok && src1->ne[3] == 1 && src0->ne[3] == 1);
      GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ne00 % ggml_cl_kq_k_unit(src0->type) == 0 &&
                  src0->view_offs == 0);
@@ -886,7 +886,7 @@ index 855d1e9..a50f64b 100644
  
      ggml_tensor_extra_cl * extra2 = (ggml_tensor_extra_cl *)ids->extra;
      ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-@@ -30195,6 +30692,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
+@@ -30500,6 +30997,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
  
  #ifdef GGML_OPENCL_SOA_Q
      if (ggml_cl_mul_mat_id_kq(backend_ctx, src0, src1, src2, dst)) {
@@ -897,7 +897,7 @@ index 855d1e9..a50f64b 100644
      }
  #endif
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
-index 93eac4e..2b1b89e 100644
+index 93eac4e5e..2b1b89e72 100644
 --- a/src/llama-expert-cache.cpp
 +++ b/src/llama-expert-cache.cpp
 @@ -3,6 +3,7 @@
@@ -945,14 +945,13 @@ index 93eac4e..2b1b89e 100644
      // missed experts (the same routed ids) into a card-side mirror
      if (chain_prefetch) {
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 96d910a..f79e065 100644
+index 991bf5479..83122f68e 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -149,6 +149,14 @@ if (LLAMA_LLGUIDANCE)
- endif ()
+@@ -178,6 +178,14 @@ set(LLAMA_CONTEXT_TEST_SRC
+ )
+ llama_build(${LLAMA_CONTEXT_TEST_SRC})
  
- llama_build(test-recurrent-state-rollback.cpp)
-+
 +# patch 0056: the OpenCL expert cache's CPU miss rows against ggml-cpu
 +if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
 +    add_executable(test-opencl-miss-cpu test-opencl-miss-cpu.cpp ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.cpp)
@@ -960,12 +959,13 @@ index 96d910a..f79e065 100644
 +    target_link_libraries(test-opencl-miss-cpu PRIVATE ggml ggml-base ggml-cpu)
 +    add_test(NAME test-opencl-miss-cpu COMMAND $<TARGET_FILE:test-opencl-miss-cpu>)
 +endif()
- llama_build(test-save-load-state.cpp)
- 
++
  if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
+     llama_build_and_test(test-unicode.cpp LINK llama)
 diff --git a/tests/test-opencl-miss-cpu.cpp b/tests/test-opencl-miss-cpu.cpp
 new file mode 100644
-index 0000000..80b38fa
+index 000000000..80b38fa14
 --- /dev/null
 +++ b/tests/test-opencl-miss-cpu.cpp
 @@ -0,0 +1,62 @@

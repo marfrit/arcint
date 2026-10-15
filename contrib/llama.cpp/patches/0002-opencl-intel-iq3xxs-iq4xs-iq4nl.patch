@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
-index cfe16bd..ae0e3e4 100644
+index cfe16bd2b..ae0e3e467 100644
 --- a/ggml/src/ggml-opencl/CMakeLists.txt
 +++ b/ggml/src/ggml-opencl/CMakeLists.txt
 @@ -99,6 +99,7 @@ set(GGML_OPENCL_KERNELS
@@ -11,10 +11,10 @@ index cfe16bd..ae0e3e4 100644
      mul_mv_q5_0_f32
      mul_mv_q5_0_f32_flat
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 658f2df..eb8f617 100644
+index 434a833d4..4e9196a68 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -977,16 +977,16 @@ struct ggml_backend_opencl_context {
+@@ -987,16 +987,16 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_mul_mv_q4_K_f32_flat;
      // Intel: K-quant x q8_1 matvec with integer dot products (mul_mv_kq_q8_1.cl)
      cl_kernel kernel_kq_quantize_q8_1 = nullptr;
@@ -40,7 +40,7 @@ index 658f2df..eb8f617 100644
      cl_kernel kernel_moe_route_tiles = nullptr;
      int             kq_mm_sg = 16;
      ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
-@@ -1543,6 +1543,28 @@ static bool kq_q8_1_enabled(const ggml_backend_opencl_context * backend_ctx) {
+@@ -1560,6 +1560,28 @@ static bool kq_q8_1_enabled(const ggml_backend_opencl_context * backend_ctx) {
      return kq_on && backend_ctx->gpu_family == INTEL && backend_ctx->has_integer_dot;
  }
  
@@ -66,10 +66,10 @@ index 658f2df..eb8f617 100644
 +    return !mm || backend_ctx->kernel_mul_mm_kq_f16[ti] != nullptr;
 +}
 +
- static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
-     if (backend_ctx->kernels_loaded) {
-         return;
-@@ -2133,14 +2155,44 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+ static std::string ggml_opencl_make_compile_opts(const ggml_backend_opencl_context * backend_ctx) {
+     auto opencl_c_std =
+         std::string("CL") + std::to_string(backend_ctx->opencl_c_version.major) + "." + std::to_string(backend_ctx->opencl_c_version.minor);
+@@ -2159,14 +2181,44 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                      CL_CHECK((backend_ctx->kernel_mul_mv_kq_q8_1[nc - 1][i] = clCreateKernel(prog, mv_n[i], &err), err));
                  }
                  if (nc == 1) {
@@ -117,7 +117,7 @@ index 658f2df..eb8f617 100644
  
              // the GEMM: fp16 DPAS at the device's DPAS sub-group size. Tiles
              // (measured-here: an A770 at 2000 MHz, a B60), rows x columns per
-@@ -2178,8 +2230,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2204,8 +2256,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                          }
                      }
                  }
@@ -130,7 +130,7 @@ index 658f2df..eb8f617 100644
                  for (int pass = 0; pass < 2; ++pass) {
                      const ggml_cl_kq_tile & t = pass == 0 ? backend_ctx->kq_mm_plain : backend_ctx->kq_mm_id;
                      const std::string mm_opts = compile_opts + " -cl-intel-256-GRF-per-thread" +
-@@ -2187,7 +2241,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2213,7 +2267,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                          " -DTG=" + std::to_string(t.tg) + " -DNSGM=" + std::to_string(t.nsgm) + " -DNSGN=" + std::to_string(t.nsgn);
                      cl_program mm_prog = build_program_from_source_optional(backend_ctx, mm_src.c_str(), mm_opts);
                      if (mm_prog == nullptr) {
@@ -139,7 +139,7 @@ index 658f2df..eb8f617 100644
                          continue;
                      }
                      if (pass == 0) {
-@@ -2195,7 +2249,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2221,7 +2275,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                          CL_CHECK((backend_ctx->kernel_moe_route_tiles = clCreateKernel(mm_prog, "kernel_moe_route_tiles", &err), err));
                      }
                      if (backend_ctx->kernel_kq_cvt_f32_f16 != nullptr) {
@@ -148,7 +148,7 @@ index 658f2df..eb8f617 100644
                              cl_kernel & k = pass == 0 ? backend_ctx->kernel_mul_mm_kq_f16[i] : backend_ctx->kernel_mul_mm_id_kq_f16[i];
                              CL_CHECK((k = clCreateKernel(mm_prog, pass == 0 ? mm_n[i] : id_n[i], &err), err));
                          }
-@@ -9241,6 +9295,23 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -9454,6 +9508,23 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
          case GGML_OP_GROUP_NORM:
              return ggml_is_contiguous(op->src[0]);
          case GGML_OP_MUL_MAT:
@@ -172,7 +172,7 @@ index 658f2df..eb8f617 100644
              if (op->src[0]->type == GGML_TYPE_F16) {
                  return true;
              } else if (op->src[0]->type == GGML_TYPE_BF16) {
-@@ -9277,16 +9348,6 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -9490,16 +9561,6 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                  // trans-weight GEMM, which needs both a GEMM kernel for the type and
                  // use_adreno_kernels(). Decline the large-N shapes that would otherwise
                  // fall through to the GEMV.
@@ -189,7 +189,7 @@ index 658f2df..eb8f617 100644
                  {
                      const ggml_type t = op->src[0]->type;
                      const bool type_has_gemm = (t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 ||
-@@ -9317,10 +9378,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -9536,10 +9597,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                  }
              }
  #ifdef GGML_OPENCL_SOA_Q
@@ -204,7 +204,7 @@ index 658f2df..eb8f617 100644
              }
  #endif
              // q4_0, q8_0 and mxfp4 have general MUL_MAT_ID support,
-@@ -23660,10 +23721,24 @@ static void ggml_cl_kq_convert_src1_f16(ggml_backend_opencl_context * backend_ct
+@@ -23962,10 +24023,24 @@ static void ggml_cl_kq_convert_src1_f16(ggml_backend_opencl_context * backend_ct
      backend_ctx->kq_f16 = { src1, extra1->data_device, offset1, n_vals, backend_ctx->graph_gen };
  }
  
@@ -231,7 +231,7 @@ index 658f2df..eb8f617 100644
          ggml_tensor_extra_cl_q4_K * e = (ggml_tensor_extra_cl_q4_K *)soa0->extra;
          CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &e->q));
          CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &e->s));
-@@ -23686,14 +23761,34 @@ static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, c
+@@ -23988,14 +24063,34 @@ static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, c
  }
  
  static int ggml_cl_kq_type_index(ggml_type t) {
@@ -268,7 +268,7 @@ index 658f2df..eb8f617 100644
             src0->ne[2] == 1 && src0->ne[3] == 1 && ggml_is_contiguous(src0) && src0->view_offs == 0 &&
             ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
  }
-@@ -23703,12 +23798,13 @@ static bool ggml_cl_kq_mul_mat_shape(const ggml_tensor * src0, const ggml_tensor
+@@ -24005,12 +24100,13 @@ static bool ggml_cl_kq_mul_mat_shape(const ggml_tensor * src0, const ggml_tensor
  // products, each weight read once for all of them (mul_mv_kq_q8_1.cl).
  static bool ggml_cl_mul_mv_kq_q8_1(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src0,
                                     const ggml_tensor * src1, ggml_tensor * dst) {
@@ -284,7 +284,7 @@ index 658f2df..eb8f617 100644
          return false;
      }
      cl_kernel kernel = backend_ctx->kernel_mul_mv_kq_q8_1[ncols - 1][ti];
-@@ -23727,7 +23823,7 @@ static bool ggml_cl_mul_mv_kq_q8_1(ggml_backend_opencl_context * backend_ctx, co
+@@ -24029,7 +24125,7 @@ static bool ggml_cl_mul_mv_kq_q8_1(ggml_backend_opencl_context * backend_ctx, co
      ggml_cl_kq_weight_args(kernel, src0, a);
      CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_xq.buffer));
      CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_xd.buffer));
@@ -293,7 +293,7 @@ index 658f2df..eb8f617 100644
          CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_xs.buffer));
      }
      CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extrad->data_device));
-@@ -26224,14 +26320,13 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -26534,14 +26630,13 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
      static const char * mt_env = getenv("GGML_OPENCL_KQ_MM_ID_MIN_TOK");
      static const int    mm_id_min_tok = mt_env ? atoi(mt_env) : 16;
      const bool gemm = n_tok >= mm_id_min_tok && backend_ctx->kernel_mul_mm_id_kq_f16[ti] != nullptr && n_expert <= 512;
@@ -311,7 +311,7 @@ index 658f2df..eb8f617 100644
  
      ggml_tensor_extra_cl * extra2 = (ggml_tensor_extra_cl *)ids->extra;
      ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-@@ -26248,7 +26343,7 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -26558,7 +26653,7 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
          ggml_cl_kq_weight_args(kernel, src0, a);
          CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_xq.buffer));
          CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_xd.buffer));
@@ -321,7 +321,7 @@ index 658f2df..eb8f617 100644
          }
          CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extra2->data_device));
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
-index d1f504d..a796787 100644
+index d1f504d52..a796787d5 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
 @@ -55,6 +55,65 @@ typedef short8 a8_t;
@@ -529,7 +529,7 @@ index d1f504d..a796787 100644
 +}
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
 new file mode 100644
-index 0000000..127ee84
+index 000000000..127ee84d2
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
 @@ -0,0 +1,328 @@

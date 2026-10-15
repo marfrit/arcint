@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index d5e832e..b05e5ba 100644
+index 39c70e18d..6b89ce37b 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -4423,26 +4423,32 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -4449,26 +4449,32 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                  if (p != nullptr) {
                      CL_CHECK((backend_ctx->kernel_fa_dpas_dk[di] = clCreateKernel(p, "flash_attn_f32_f16_dpas", &err), err));
                      if (qg) {
@@ -47,7 +47,7 @@ index d5e832e..b05e5ba 100644
                      CL_CHECK(clReleaseProgram(p));
                  }
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
-index 3ae1d44..d9dbcb6 100644
+index 3ae1d4404..d9dbcb634 100644
 --- a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
 @@ -77,7 +77,25 @@ static inline half8 load8(const int t, const global char * row, const int c8) {

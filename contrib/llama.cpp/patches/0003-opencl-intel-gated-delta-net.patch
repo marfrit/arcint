@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
-index ae0e3e4..a38875c 100644
+index ae0e3e467..a38875cc3 100644
 --- a/ggml/src/ggml-opencl/CMakeLists.txt
 +++ b/ggml/src/ggml-opencl/CMakeLists.txt
 @@ -218,6 +218,7 @@ set(GGML_OPENCL_KERNELS
@@ -11,10 +11,10 @@ index ae0e3e4..a38875c 100644
      sum_rows
      cumsum
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index eb8f617..8414b16 100644
+index 4e9196a68..f5fc435f2 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -1037,6 +1037,11 @@ struct ggml_backend_opencl_context {
+@@ -1047,6 +1047,11 @@ struct ggml_backend_opencl_context {
      // [size_idx][kda][tgpp] where size_idx: 0=S_V=16, 1=32, 2=64, 3=128; kda: 0 or 1.
      // tgpp 0 = TG variant (COLS_PER_LANE_GROUP=1), tgpp 1 = prefill variant (COLS_PER_LANE_GROUP=4).
      cl_kernel kernel_gated_delta_net_f32[4][2][2] = {};
@@ -26,7 +26,7 @@ index eb8f617..8414b16 100644
      cl_kernel kernel_ssm_scan_f32 = nullptr;
      cl_kernel kernel_ssm_scan_f32_mamba2_d128 = nullptr;
      cl_kernel kernel_ssm_scan_f32_mamba2_d256 = nullptr;
-@@ -3843,6 +3848,93 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -3869,6 +3874,93 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
          GGML_LOG_CONT(".");
      }
  
@@ -120,7 +120,7 @@ index eb8f617..8414b16 100644
      // moe_combine (fused router-weight mul + cross-expert sum)
      {
      #ifdef GGML_OPENCL_EMBED_KERNELS
-@@ -30100,6 +30192,10 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
+@@ -30423,6 +30515,10 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
      const int spw  = (tgpp == 0) ? 1 : 1;
  
      cl_kernel kernel = backend_ctx->kernel_gated_delta_net_f32[si][kda][tgpp];
@@ -131,7 +131,7 @@ index eb8f617..8414b16 100644
      GGML_ASSERT(kernel != nullptr);
  
      const cl_uint s_off = S_v * H_v * n_tokens * n_seqs;
-@@ -30168,6 +30264,18 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
+@@ -30491,6 +30587,18 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
      CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(float),    &scale));
      CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),    &K));
  
@@ -152,7 +152,7 @@ index eb8f617..8414b16 100644
      if (sg_size < 0) {
 diff --git a/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl b/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
 new file mode 100644
-index 0000000..7256709
+index 000000000..725670923
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
 @@ -0,0 +1,359 @@
@@ -516,12 +516,12 @@ index 0000000..7256709
 +
 +#endif // GDN_PP
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 98ce061..8497555 100644
+index ba7f7eb4e..dd1bebe4a 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11398,6 +11398,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
-     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
-     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+@@ -12000,6 +12000,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   4, 2, 1, false, true,  /*K=*/4));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32,   4, 2, 2, false, true,  /*K=*/4));
  
 +    // head size 128 at the Qwen3.5/3.6 shapes (16 q/k heads, 32 or 48 v heads):
 +    // the prompt path in chunks, a partial last chunk, two sequences, strided inputs

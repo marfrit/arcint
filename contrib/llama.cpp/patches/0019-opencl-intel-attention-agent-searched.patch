@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
-index 5fc1740..a5703eb 100644
+index 5fc1740df..a5703eb16 100644
 --- a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
 @@ -41,6 +41,14 @@
@@ -257,7 +257,7 @@ index 5fc1740..a5703eb 100644
  
      float lv[8];
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
-index f938712..f175e14 100644
+index f9387124c..f175e14ae 100644
 --- a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
 @@ -12,13 +12,14 @@

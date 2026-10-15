@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index c157f3f..14f0020 100644
+index b9d7c33a7..c84515c53 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -1025,19 +1025,19 @@ struct ggml_backend_opencl_context {
+@@ -1035,19 +1035,19 @@ struct ggml_backend_opencl_context {
      int       kq_quantize_sg = 0;   // > 0: kernel_kq_quantize_q8_1 is the sub-group kernel of that size
      // per type, ggml_cl_kq_type_index: Q4_K, Q5_K, Q6_K (mul_mv_kq_q8_1.cl),
      // IQ3_XXS, IQ4_XS, IQ4_NL, and the low-bit types IQ2_XXS, IQ2_S, IQ1_M,
@@ -30,7 +30,7 @@ index c157f3f..14f0020 100644
      cl_kernel kernel_moe_pair_groups = nullptr;
      ggml_cl_buffer prealloc_pair_grp, prealloc_pair_ngrp;
      const ggml_tensor * pair_grp_t = nullptr; int pair_grp_split = 0;
-@@ -1076,12 +1076,12 @@ struct ggml_backend_opencl_context {
+@@ -1086,12 +1086,12 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_mul_mm_kq2d[3] = {};
      int       kq2d_tm = 64, kq2d_wg = 16;
      int       kq2d_tm_t[3] = { 64, 64, 64 }, kq2d_wg_t[3] = { 16, 16, 16 };   // per type (GGML_OPENCL_KQ_2D_T<i>)
@@ -46,7 +46,7 @@ index c157f3f..14f0020 100644
      int       kq_id2_xt = 32, kq_id2_xsg = 16;
      // the route in prealloc_kq_pairs / _tiles / _ntiles: a MoE layer's gate,
      // up and down share their ids tensor, so it is computed once a layer
-@@ -2328,12 +2328,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2354,12 +2354,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                  const std::string iq_src = read_file("mul_mv_iq_q8_1.cl");
  #endif
                  // type index 3 + i
@@ -63,7 +63,7 @@ index c157f3f..14f0020 100644
                  // GGML_OPENCL_IQ_OPTS: defines added to these builds (measurement)
                  const char * iq_opts_env = getenv("GGML_OPENCL_IQ_OPTS");
                  const std::string iq_extra_opts = iq_opts_env != nullptr ? std::string(" ") + iq_opts_env : std::string();
-@@ -2346,7 +2346,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2372,7 +2372,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                          GGML_LOG_WARN("ggml_opencl: IQ matvec for %d column(s) not built; IQ weights go to the CPU\n", nc);
                          continue;
                      }
@@ -72,7 +72,7 @@ index c157f3f..14f0020 100644
                          CL_CHECK((backend_ctx->kernel_mul_mv_kq_q8_1[nc - 1][3 + i] = clCreateKernel(prog, iq_n[i], &err), err));
                          if (nc == 1) {
                              CL_CHECK((backend_ctx->kernel_mul_mv_id_kq_q8_1[3 + i] = clCreateKernel(prog, iq_id_n[i], &err), err));
-@@ -2364,7 +2364,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2390,7 +2390,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                          CL_CHECK((backend_ctx->kernel_dsv4_hc_post = clCreateKernel(prog, "kernel_dsv4_hc_post", &err), err));
                          CL_CHECK((backend_ctx->kernel_topk_moe = clCreateKernel(prog, "kernel_topk_moe_softmax_norm", &err), err));
                          CL_CHECK((backend_ctx->kernel_scale_act = clCreateKernel(prog, "kernel_scale_act_f32", &err), err));
@@ -81,7 +81,7 @@ index c157f3f..14f0020 100644
                              std::string g = iq_id_n[i];
                              g.replace(g.find("_id_"), 4, "_idg_");
                              CL_CHECK((backend_ctx->kernel_mul_mv_idg_kq_q8_1[3 + i] = clCreateKernel(prog, g.c_str(), &err), err));
-@@ -2606,14 +2606,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2632,14 +2632,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                          }
                      }
                  }
@@ -100,7 +100,7 @@ index c157f3f..14f0020 100644
                  // the tokens-as-a MUL_MAT_ID kernel: pairs per tile, sub-groups per
                  // work-group, 32 x 16 on SG 8 (measured-here, the coder's prefill on
                  // an A770: 32 x 16, 32 x 32 and 16 x 32 within 3 %, 64 x 16 1.7x
-@@ -2653,7 +2653,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2679,7 +2679,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                          }
                      }
                      if (backend_ctx->kernel_kq_cvt_f32_f16 != nullptr) {
@@ -109,7 +109,7 @@ index c157f3f..14f0020 100644
                              cl_kernel & k = pass == 0 ? backend_ctx->kernel_mul_mm_kq_f16[i] : backend_ctx->kernel_mul_mm_id_kq_f16[i];
                              CL_CHECK((k = clCreateKernel(mm_prog, pass == 0 ? mm_n[i] : id_n[i], &err), err));
                              if (pass == 1 && i < 6) {   // the low-bit types have no tokens-as-a kernel
-@@ -11302,7 +11302,7 @@ static cl_mem ggml_cl_create_temp_download_buffer(
+@@ -11524,7 +11524,7 @@ static cl_mem ggml_cl_create_temp_download_buffer(
  
  // USM host buffers: bytes by memcpy; IQ4_NL whole tensors split into scales
  // and quants (as kernel_convert_block_iq4_nl lays them out), each 128-aligned
@@ -118,7 +118,7 @@ index c157f3f..14f0020 100644
  // in planes, per weight slice (one 2-D matrix: an expert): each field of every
  // block back to back (mul_mv_iq_q8_1.cl, lb_expand), so a lane reads aligned
  // 32-bit words. A slice keeps its size and place, so slot / bank copies and
-@@ -11311,6 +11311,7 @@ struct ggml_cl_lb_field { int off, size; };
+@@ -11533,6 +11533,7 @@ struct ggml_cl_lb_field { int off, size; };
  static int ggml_cl_lb_fields(ggml_type t, ggml_cl_lb_field f[5]) {
      switch (t) {
          case GGML_TYPE_IQ2_XXS: f[0] = { 0, 2 }; f[1] = { 2, 64 }; return 2;
@@ -126,7 +126,7 @@ index c157f3f..14f0020 100644
          case GGML_TYPE_IQ2_S:   f[0] = { 0, 2 }; f[1] = { 2, 32 }; f[2] = { 34, 32 }; f[3] = { 66, 8 }; f[4] = { 74, 8 }; return 5;
          case GGML_TYPE_Q2_0:    f[0] = { 0, 2 }; f[1] = { 2, 16 }; return 2;
          case GGML_TYPE_IQ3_S:   f[0] = { 0, 2 }; f[1] = { 2, 64 }; f[2] = { 66, 8 }; f[3] = { 74, 32 }; f[4] = { 106, 4 }; return 5;
-@@ -25583,7 +25584,7 @@ static cl_ulong     g_kq_pf_n16 = 0;
+@@ -25880,7 +25881,7 @@ static cl_ulong     g_kq_pf_n16 = 0;
  // the low-bit types
  static bool ggml_cl_kq_as_stored(ggml_type t) {
      return t == GGML_TYPE_IQ3_XXS || t == GGML_TYPE_IQ4_XS || t == GGML_TYPE_IQ2_XXS || t == GGML_TYPE_IQ2_S ||
@@ -135,7 +135,7 @@ index c157f3f..14f0020 100644
  }
  
  static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, cl_uint & a) {
-@@ -25664,6 +25665,7 @@ static int ggml_cl_kq_type_index(ggml_type t) {
+@@ -25961,6 +25962,7 @@ static int ggml_cl_kq_type_index(ggml_type t) {
          case GGML_TYPE_IQ1_M:   return 8;
          case GGML_TYPE_Q2_0:    return 9;
          case GGML_TYPE_IQ3_S:   return 10;
@@ -144,7 +144,7 @@ index c157f3f..14f0020 100644
      }
  }
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
-index 7fdfc0b..d381314 100644
+index 7fdfc0bba..d38131424 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
 @@ -577,6 +577,138 @@ constant ulong iq2xxs_grid[256] = {
@@ -358,7 +358,7 @@ index 7fdfc0b..d381314 100644
  // OpenVINO patch 0064): a work-group takes up to XT pairs of one expert (a
  // tile of kernel_moe_route_tiles) and XSG * SG weight rows, one row per lane.
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
-index 3ba84e1..57fa793 100644
+index 3ba84e10c..57fa793bd 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
 @@ -162,6 +162,138 @@ constant ulong iq2xxs_grid[256] = {
@@ -607,7 +607,7 @@ index 3ba84e1..57fa793 100644
  // ---- the DeepSeek-V4-style hyper-connection ops (GGML_OP_DSV4_HC_PRE /
  // _POST, as ggml-sycl/dsv4-hc.cpp computes them): Qwen3.8-Flash-Next's mixers
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
-index d5d4097..aba1b00 100644
+index d5d4097a4..aba1b0003 100644
 --- a/src/llama-expert-cache.cpp
 +++ b/src/llama-expert-cache.cpp
 @@ -175,10 +175,11 @@ static bool qualify(const llama_model & model, const llama_model_loader & ml, in
@@ -625,10 +625,10 @@ index d5d4097..aba1b00 100644
      if (!kq_skip(t[0]->type) || !kq_skip(t[1]->type) || !(kq_skip(t[2]->type) || t[2]->type == GGML_TYPE_Q8_0)) {
          if (warn) {
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index db758ec..e72b159 100644
+index 4c1207787..b8af23549 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10505,6 +10505,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11016,6 +11016,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -642,7 +642,7 @@ index db758ec..e72b159 100644
      for (ggml_type type_a : other_types) {
          for (ggml_type type_b : {GGML_TYPE_F32}) {
              if (ggml_blck_size(type_a) != 256) {
-@@ -11855,7 +11862,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -12476,7 +12483,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
  
      // Qwen3.8-Flash-Next GSQ-RCO IQ2_XS: 512 experts, 10 used, gate/up 2560 -> 640, down 640 -> 2560; decode and a verify
      for (int bs : {1, 3}) {

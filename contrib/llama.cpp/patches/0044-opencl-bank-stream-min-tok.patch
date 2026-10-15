@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 1bccd26..ba08f34 100644
+index 260542ece..c989ffb69 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -26139,6 +26139,16 @@ static cl_ulong     g_kq_pf_n16 = 0;
+@@ -26436,6 +26436,16 @@ static cl_ulong     g_kq_pf_n16 = 0;
  // GEMM waits for its copy. Lookahead stays inside a graph: decode's swaps change
  // the banks between graphs. Returns true with g_kq_stage_q set, or false (gather).
  static int g_bstream_slot = -1;   // the slot the current MUL_MAT_ID reads (released after its GEMM)
@@ -19,7 +19,7 @@ index 1bccd26..ba08f34 100644
  static bool ggml_cl_bank_stream(ggml_backend_opencl_context * ctx, const ggml_tensor * bank, ggml_backend_opencl_buffer_context * bctx) {
      static const char * on_env = getenv("GGML_OPENCL_BANK_STREAM");
      static const bool   on     = on_env != nullptr && atoi(on_env) != 0;
-@@ -29355,7 +29365,8 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -29660,7 +29670,8 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
                      }
                  }
              }

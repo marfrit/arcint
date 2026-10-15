@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 8414b16..ed28a33 100644
+index f5fc435f2..dd9bb46b9 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -977,6 +977,7 @@ struct ggml_backend_opencl_context {
+@@ -987,6 +987,7 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_mul_mv_q4_K_f32_flat;
      // Intel: K-quant x q8_1 matvec with integer dot products (mul_mv_kq_q8_1.cl)
      cl_kernel kernel_kq_quantize_q8_1 = nullptr;
@@ -10,7 +10,7 @@ index 8414b16..ed28a33 100644
      // per type, ggml_cl_kq_type_index: Q4_K, Q5_K, Q6_K (mul_mv_kq_q8_1.cl),
      // IQ3_XXS, IQ4_XS, IQ4_NL (mul_mv_iq_q8_1.cl); [columns - 1][type], one
      // build per column count, 1 to 4
-@@ -2150,7 +2151,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2176,7 +2177,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
              const char * mv_n[3] = { "kernel_mul_mv_q4_K_q8_1", "kernel_mul_mv_q5_K_q8_1", "kernel_mul_mv_q6_K_q8_1" };
              for (int nc = 1; nc <= 4; ++nc) {
                  const std::string opts = compile_opts + " -DN_DST=" + std::to_string(backend_ctx->kq_q8_1_ndst) +
@@ -20,7 +20,7 @@ index 8414b16..ed28a33 100644
                  cl_program prog = build_program_from_source_optional(backend_ctx, kernel_src.c_str(), opts);
                  if (prog == nullptr) {
                      GGML_LOG_WARN("ggml_opencl: K-quant matvec for %d column(s) not built; ggml's kernels take it\n", nc);
-@@ -2161,7 +2163,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2187,7 +2189,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                  }
                  if (nc == 1) {
                      const char * id_n[3] = { "kernel_mul_mv_id_q4_K_q8_1", "kernel_mul_mv_id_q5_K_q8_1", "kernel_mul_mv_id_q6_K_q8_1" };
@@ -34,7 +34,7 @@ index 8414b16..ed28a33 100644
                      for (int i = 0; i < 3; ++i) {
                          CL_CHECK((backend_ctx->kernel_mul_mv_id_kq_q8_1[i] = clCreateKernel(prog, id_n[i], &err), err));
                      }
-@@ -14337,7 +14344,10 @@ static void ggml_cl_mul(ggml_backend_t backend, const ggml_tensor * src0, const
+@@ -14559,7 +14566,10 @@ static void ggml_cl_mul(ggml_backend_t backend, const ggml_tensor * src0, const
  
          backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
      } else {
@@ -46,7 +46,7 @@ index 8414b16..ed28a33 100644
          size_t global_work_size[] = {ne01*nth, (size_t)ne02, (size_t)ne03};
          size_t local_work_size[] = {nth, 1, 1};
  
-@@ -23785,8 +23795,10 @@ static void ggml_cl_kq_quantize_src1(ggml_backend_opencl_context * backend_ctx,
+@@ -24087,8 +24097,10 @@ static void ggml_cl_kq_quantize_src1(ggml_backend_opencl_context * backend_ctx,
      CL_CHECK(clSetKernelArg(kq, 3, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xd.buffer));
      CL_CHECK(clSetKernelArg(kq, 4, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xs.buffer));
      CL_CHECK(clSetKernelArg(kq, 5, sizeof(int),      &n_vals));
@@ -58,7 +58,7 @@ index 8414b16..ed28a33 100644
      backend_ctx->enqueue_ndrange_kernel(kq, 1, q_global, q_local, dst);
      backend_ctx->kq_q8 = { src1, extra1->data_device, offset1, n_vals, backend_ctx->graph_gen };
  }
-@@ -30125,9 +30137,15 @@ static void ggml_cl_glu(ggml_backend_t backend, const ggml_tensor * src0, const
+@@ -30448,9 +30460,15 @@ static void ggml_cl_glu(ggml_backend_t backend, const ggml_tensor * src0, const
          CL_CHECK(clSetKernelArg(kernel, 13, sizeof(float), &alpha));
      }
  
@@ -77,7 +77,7 @@ index 8414b16..ed28a33 100644
  
      backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 diff --git a/ggml/src/ggml-opencl/kernels/glu.cl b/ggml/src/ggml-opencl/kernels/glu.cl
-index 30bad00..be91ba2 100644
+index 30bad00f7..be91ba2e3 100644
 --- a/ggml/src/ggml-opencl/kernels/glu.cl
 +++ b/ggml/src/ggml-opencl/kernels/glu.cl
 @@ -30,7 +30,7 @@ kernel void kernel_geglu(
@@ -198,7 +198,7 @@ index 30bad00..be91ba2 100644
          const half x1 = src1_row[i0];
  
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl
-index 3302bc2..454d62b 100644
+index 3302bc27d..454d62be4 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl
 @@ -52,6 +52,51 @@ kernel void kernel_quantize_q8_1(global const char * src, ulong offs, global cha

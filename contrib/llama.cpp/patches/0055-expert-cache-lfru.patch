@@ -1,5 +1,5 @@
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
-index fc79055..93eac4e 100644
+index fc79055fa..93eac4e5e 100644
 --- a/src/llama-expert-cache.cpp
 +++ b/src/llama-expert-cache.cpp
 @@ -266,6 +266,9 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
@@ -81,7 +81,7 @@ index fc79055..93eac4e 100644
              if (L.slot_of[e] < 0 && L.usage[e] >= min_usage) {
                  c.emplace_back(L.usage[e], e);
 diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
-index c6545b8..e04a134 100644
+index c6545b8a0..e04a13429 100644
 --- a/src/llama-expert-cache.h
 +++ b/src/llama-expert-cache.h
 @@ -70,6 +70,12 @@ struct llama_expert_cache_layer {

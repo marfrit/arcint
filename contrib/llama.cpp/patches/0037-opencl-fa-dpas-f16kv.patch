@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 49ac1a4..497d445 100644
+index f8ef8a4fc..a3790c445 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -1178,6 +1178,8 @@ struct ggml_backend_opencl_context {
+@@ -1188,6 +1188,8 @@ struct ggml_backend_opencl_context {
      // [0] head size 256, [1] 128
      cl_kernel kernel_fa_dpas_dk[2] = {};
      cl_kernel kernel_fa_dpas_q_dk[2][3] = {};     // quantized K/V: q8_0/q8_0, q8_0/q4_0, q4_0/q4_0
@@ -11,7 +11,7 @@ index 49ac1a4..497d445 100644
      // Intel Xe2, decode / verify rows on the XMX units, a KV head's query
      // heads and rows in one pass (flash_attn_gqa_dpas.cl): f16, q8q8, q8q4, q4q4
      cl_kernel kernel_fa_gqa_dk[2][4] = {};        // [0] head size 256, [1] 128
-@@ -4422,6 +4424,37 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -4448,6 +4450,37 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                      }
                      CL_CHECK(clReleaseProgram(p));
                  }
@@ -49,7 +49,7 @@ index 49ac1a4..497d445 100644
                  // the same with quantized K/V (KT/VT: 1 q8_0, 2 q4_0), staged to
                  // f16 in local memory; GGML_OPENCL_FA_DPAS_Q=0 leaves quantized
                  // caches to flash_attn_f32_q8_0.cl / the host dequantization
-@@ -20222,8 +20255,103 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -20495,8 +20528,103 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          sinks == nullptr && max_bias == 0.0f && logit_softcap == 0.0f &&
          q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
          (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q))) {
@@ -155,7 +155,7 @@ index 49ac1a4..497d445 100644
          CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   &extra_q->data_device));
          CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &offset_q));
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
-index d0d852b..a781d1c 100644
+index d0d852b66..a781d1cac 100644
 --- a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
 @@ -87,6 +87,19 @@ static inline half8 load8(const int t, const global char * row, const int c8) {
@@ -246,10 +246,10 @@ index d0d852b..a781d1c 100644
      for (int r = 0; r < 8; ++r) lv[r] = sub_group_reduce_add(l[r]);
      for (int c = 0; c < NDC; ++c) {
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 7b34bcf..0020e89 100644
+index 889ef0f2f..78827a353 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11713,6 +11713,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -12314,6 +12314,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32,
                                                          GGML_TYPE_F16, GGML_TYPE_F16));
      }

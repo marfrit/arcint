@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 17ba18b..fa1c275 100644
+index bbaf4d4a8..a292188ff 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -24351,7 +24351,7 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
+@@ -24648,7 +24648,7 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
              CL_CHECK(clSetKernelArg(k2, a++, sizeof(int),      &ne01));
              CL_CHECK(clSetKernelArg(k2, a++, sizeof(int),      &ncols));
              const size_t wgn = (size_t)backend_ctx->kq2d_wg * 16;
@@ -12,7 +12,7 @@ index 17ba18b..fa1c275 100644
              backend_ctx->enqueue_ndrange_kernel(k2, 3, global_work_size, local_work_size, dst);
              return true;
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
-index 19cfa91..10f06a6 100644
+index 19cfa91d1..10f06a65c 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
 @@ -75,24 +75,33 @@ static inline void put_b(const float * y, int8 * b0, int8 * b1) {

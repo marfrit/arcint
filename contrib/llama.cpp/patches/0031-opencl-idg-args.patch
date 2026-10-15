@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 14f0020..b7775cd 100644
+index c84515c53..9871a353b 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -28631,7 +28631,9 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -28936,7 +28936,9 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
          const char * nm = src0->name;
          const size_t ln = strlen(nm);
          const bool cache_t = (ln > 6 && strcmp(nm + ln - 6, ".slots") == 0) || (ln > 5 && strcmp(nm + ln - 5, ".bank") == 0);
@@ -13,7 +13,7 @@ index 14f0020..b7775cd 100644
              const cl_float zero = 0.0f;
              CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, extrad->data_device, &zero, sizeof(zero), offsetd, ggml_nbytes(dst), 0, NULL, NULL));
          }
-@@ -28853,18 +28855,24 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -29158,18 +29160,24 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
                  perm     = backend_ctx->prealloc_pair_perm.buffer;
                  pf_first = pf ? backend_ctx->prealloc_pair_first.buffer : nullptr;
              }
@@ -48,7 +48,7 @@ index 14f0020..b7775cd 100644
          }
          const int rows_per_wg = backend_ctx->kq_q8_1_ndst * 4;
          if (idg) {
-@@ -28895,13 +28903,8 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -29200,13 +29208,8 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
              size_t r_local[1] = { 256 }, r_global[1] = { 256 };
              backend_ctx->enqueue_ndrange_kernel(kr, 1, r_global, r_local, dst);
              backend_ctx->kq_route.ids = nullptr;   // the GEMM's route cache no longer holds these buffers' contents
@@ -65,10 +65,10 @@ index 14f0020..b7775cd 100644
              CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &tiles));
              CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &ntiles));
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index e72b159..996da46 100644
+index b8af23549..ff4b0b18c 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10506,7 +10506,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11017,7 +11017,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      }
  
      // IQ2_XS (patch 0030): the gate / up experts of Flash-Next GSQ-RCO IQ3_XXS's IQ2_XS layers (2560 -> 640),

@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
-index 1a93b11..e4f6d08 100644
+index 1a93b1152..e4f6d08b0 100644
 --- a/ggml/src/ggml-opencl/CMakeLists.txt
 +++ b/ggml/src/ggml-opencl/CMakeLists.txt
 @@ -102,6 +102,7 @@ set(GGML_OPENCL_KERNELS
@@ -11,10 +11,10 @@ index 1a93b11..e4f6d08 100644
      mul_mv_q5_0_f32_flat
      mul_mv_q5_1_f32
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 2c8b9f1..17ba18b 100644
+index f0ba4185f..bbaf4d4a8 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -675,6 +675,7 @@ struct ggml_backend_opencl_context {
+@@ -684,6 +684,7 @@ struct ggml_backend_opencl_context {
      bool has_subgroup_shuffle = false;       // cl_khr_subgroup_shuffle or cl_qcom_subgroup_shuffle
      bool has_integer_dot      = false;       // cl_khr_integer_dot_product or cl_qcom_dot_product8
      bool has_intel_dpas       = false;       // cl_intel_subgroup_matrix_multiply_accumulate
@@ -22,7 +22,7 @@ index 2c8b9f1..17ba18b 100644
      bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
      bool disable_fusion;
      bool fuse_mm_glu = true;                     // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
-@@ -992,6 +993,10 @@ struct ggml_backend_opencl_context {
+@@ -1002,6 +1003,10 @@ struct ggml_backend_opencl_context {
      // Intel: x f16 GEMM on the XMX units (mul_mm_kq_f16.cl), per type, plain
      // and MUL_MAT_ID; the sub-group size and tiles
      cl_kernel kernel_kq_cvt_f32_f16 = nullptr;
@@ -33,7 +33,7 @@ index 2c8b9f1..17ba18b 100644
      cl_kernel kernel_mul_mm_kq_f16[6]    = {};
      cl_kernel kernel_mul_mm_id_kq_f16[6] = {};
      // MUL_MAT_ID with the tokens as the DPAS a operand (kernel_mul_mm_id2_*):
-@@ -2288,6 +2293,62 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2314,6 +2319,62 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                  }
              }
  
@@ -96,7 +96,7 @@ index 2c8b9f1..17ba18b 100644
              // the GEMM: fp16 DPAS at the device's DPAS sub-group size. Tiles
              // (measured-here: an A770 at 2000 MHz, a B60), rows x columns per
              // work-group: plain SG 8 32 x 512, SG 16 64 x 256; MUL_MAT_ID
-@@ -7263,6 +7324,8 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
+@@ -7452,6 +7513,8 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
          strstr(ext_buffer.data(), "cl_intel_subgroup_matrix_multiply_accumulate") != NULL &&
          strstr(ext_buffer.data(), "cl_intel_subgroup_local_block_io") != NULL &&
          strstr(ext_buffer.data(), "cl_intel_subgroups_short") != NULL;
@@ -105,7 +105,7 @@ index 2c8b9f1..17ba18b 100644
  
      cl_uint base_align_in_bits;
      CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MEM_BASE_ADDR_ALIGN, sizeof(cl_uint), &base_align_in_bits, NULL));
-@@ -24265,6 +24328,35 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
+@@ -24562,6 +24625,35 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
      if (ti < 0 || ncols <= 4 || !ggml_cl_kq_mul_mat_shape(src0, src1, dst)) {
          return false;
      }
@@ -143,7 +143,7 @@ index 2c8b9f1..17ba18b 100644
          return false;
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
 new file mode 100644
-index 0000000..19cfa91
+index 000000000..19cfa91d1
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
 @@ -0,0 +1,208 @@
@@ -356,10 +356,10 @@ index 0000000..19cfa91
 +    EPILOGUE
 +}
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 221e357..7e3535c 100644
+index c8778e2c8..4e4477b71 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10246,6 +10246,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10711,6 +10711,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  8, 16*256, { 1,  1}, {1, 1}));
      }
  

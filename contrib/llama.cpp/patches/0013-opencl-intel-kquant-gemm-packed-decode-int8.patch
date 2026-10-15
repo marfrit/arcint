@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index fa1c275..ecc826b 100644
+index a292188ff..9d2556ec3 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -636,6 +636,7 @@ struct ggml_cl_kq_act {
+@@ -645,6 +645,7 @@ struct ggml_cl_kq_act {
      cl_ulong            off  = 0;
      int                 n    = 0;
      uint64_t            gen  = 0;
@@ -10,7 +10,7 @@ index fa1c275..ecc826b 100644
  };
  
  // a K-quant fp16-DPAS GEMM tile: NSGM x NSGN sub-groups of RG*8 rows x TG*SG columns
-@@ -739,9 +740,12 @@ struct ggml_backend_opencl_context {
+@@ -748,9 +749,12 @@ struct ggml_backend_opencl_context {
      ggml_cl_buffer prealloc_kq_xd;   // per-32 scale (float)
      ggml_cl_buffer prealloc_kq_xs;   // per-32 sum (float)
      // what the activation buffers hold, and the graph count that dates it
@@ -24,7 +24,7 @@ index fa1c275..ecc826b 100644
      ggml_cl_buffer prealloc_kq_xscale; // and its per-column scale
      ggml_cl_buffer prealloc_kq_fa;     // the few-column product's tiled f16 activation (mul_mm_kq_few.cl)
      ggml_cl_buffer prealloc_kq_fs;     // its sums per 16 values
-@@ -993,6 +997,9 @@ struct ggml_backend_opencl_context {
+@@ -1003,6 +1007,9 @@ struct ggml_backend_opencl_context {
      // Intel: x f16 GEMM on the XMX units (mul_mm_kq_f16.cl), per type, plain
      // and MUL_MAT_ID; the sub-group size and tiles
      cl_kernel kernel_kq_cvt_f32_f16 = nullptr;
@@ -34,7 +34,7 @@ index fa1c275..ecc826b 100644
      // Intel Xe2: the K-quant GEMM on 2D block loads (mul_mm_kq_2d.cl), Q4_K,
      // Q5_K, Q6_K; its token tile and sub-groups a work-group
      cl_kernel kernel_mul_mm_kq2d[3] = {};
-@@ -2333,11 +2340,43 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2359,11 +2366,43 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                                                            CL_KERNEL_WORK_GROUP_SIZE, sizeof(wgs), &wgs, NULL));
                          fits = fits && wgs >= (size_t)wg * 16;
                      }
@@ -78,7 +78,7 @@ index fa1c275..ecc826b 100644
                          GGML_LOG_WARN("ggml_opencl: K-quant 2D GEMM does not fit a work-group\n");
                      }
                      backend_ctx->kq2d_tm = tm;
-@@ -24072,8 +24111,10 @@ static cl_mem ggml_cl_img_pool_get_or_create(
+@@ -24369,8 +24408,10 @@ static cl_mem ggml_cl_img_pool_get_or_create(
  
  #ifdef GGML_OPENCL_SOA_Q
  // The activation of the Intel K-quant kernels: src1 (n_vals contiguous f32)
@@ -91,7 +91,7 @@ index fa1c275..ecc826b 100644
  // graph -- within one graph a computed tensor does not change before its last
  // consumer (ggml-alloc reuses memory in place only for a single child), so
  // matmuls that share an input (q/k/v, gate/up) convert it once. The key is the
-@@ -24115,17 +24156,20 @@ static void ggml_cl_kq_quantize_src1(ggml_backend_opencl_context * backend_ctx,
+@@ -24412,17 +24453,20 @@ static void ggml_cl_kq_quantize_src1(ggml_backend_opencl_context * backend_ctx,
      backend_ctx->kq_q8 = { src1, extra1->data_device, offset1, n_vals, backend_ctx->graph_gen };
  }
  
@@ -115,7 +115,7 @@ index fa1c275..ecc826b 100644
      CL_CHECK(clSetKernelArg(kc, 0, sizeof(cl_mem),   &extra1->data_device));
      CL_CHECK(clSetKernelArg(kc, 1, sizeof(cl_ulong), &offset1));
      CL_CHECK(clSetKernelArg(kc, 2, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xh.buffer));
-@@ -24134,7 +24178,7 @@ static void ggml_cl_kq_convert_src1_f16(ggml_backend_opencl_context * backend_ct
+@@ -24431,7 +24475,7 @@ static void ggml_cl_kq_convert_src1_f16(ggml_backend_opencl_context * backend_ct
      size_t c_local[1]  = { 256 };
      size_t c_global[1] = { (size_t)ncols * 256 };
      backend_ctx->enqueue_ndrange_kernel(kc, 1, c_global, c_local, dst);
@@ -124,7 +124,7 @@ index fa1c275..ecc826b 100644
  }
  
  // the weight's planes in the kernels' argument order: a K-quant's flat
-@@ -24339,7 +24383,50 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
+@@ -24636,7 +24680,50 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
              ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
              const cl_ulong offsetd = extrad->offset + dst->view_offs;
              const cl_ulong nb1 = dst->nb[1];
@@ -177,7 +177,7 @@ index fa1c275..ecc826b 100644
              ggml_cl_kq_weight_args(k2, src0, a);
              CL_CHECK(clSetKernelArg(k2, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xh.buffer));
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
-index 10f06a6..98fcb37 100644
+index 10f06a65c..98fcb3705 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
 @@ -14,9 +14,12 @@

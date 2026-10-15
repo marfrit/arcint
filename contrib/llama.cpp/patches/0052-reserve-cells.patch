@@ -1,8 +1,8 @@
 diff --git a/include/llama.h b/include/llama.h
-index c9b9371..9fbad1f 100644
+index 40fa844a9..44a9e437d 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -437,6 +437,11 @@ extern "C" {
+@@ -440,6 +440,11 @@ extern "C" {
          // a source/target/parent context
          // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
          struct llama_context * ctx_other;
@@ -15,10 +15,10 @@ index c9b9371..9fbad1f 100644
  
      struct llama_model_tensor_override {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 761fc59..e8b4196 100644
+index 3402ef526..c762deabf 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -250,6 +250,7 @@ llama_context::llama_context(
+@@ -336,6 +336,7 @@ llama_context::llama_context(
      cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
  
      cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
@@ -26,8 +26,8 @@ index 761fc59..e8b4196 100644
  
      cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
      cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
-@@ -616,6 +617,13 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
-     return (int) users.size();
+@@ -716,6 +717,13 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
+     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
  }
  
 +// the reservation's cell cap for the memory's full context (llama_kv_reserve_cap), restored on exit
@@ -40,7 +40,7 @@ index 761fc59..e8b4196 100644
  void llama_context::sched_reserve() {
      if (!sched_need_reserve) {
          return;
-@@ -647,7 +655,11 @@ void llama_context::sched_reserve() {
+@@ -747,7 +755,11 @@ void llama_context::sched_reserve() {
      llama_memory_context_ptr mctx;
      if (memory) {
          LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
@@ -52,7 +52,7 @@ index 761fc59..e8b4196 100644
          if (!mctx) {
              throw std::runtime_error("failed to initialize memory module");
          }
-@@ -889,6 +901,7 @@ bool llama_context::memory_update(bool optimize) {
+@@ -991,6 +1003,7 @@ bool llama_context::memory_update(bool optimize) {
  
      // if the memory module did any computation, we have to reserve a new worst-case graph
      {
@@ -60,7 +60,7 @@ index 761fc59..e8b4196 100644
          const auto mctx = memory->init_full();
          if (!mctx) {
              throw std::runtime_error("failed to initialize memory context");
-@@ -1854,8 +1867,31 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -1965,8 +1978,31 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
  
      llama_memory_context_ptr mctx;
  
@@ -88,12 +88,12 @@ index 761fc59..e8b4196 100644
 +    }
 +
      while (true) {
--        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
-+        mctx = memory->init_batch(*balloc, n_ubatch_eff, output_all);
+-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
++        mctx = memory->init_batch(*balloc, n_ubatch_eff, embd_all);
          if (!mctx) {
              return -2;
          }
-@@ -3851,6 +3887,7 @@ llama_context_params llama_context_default_params() {
+@@ -4074,6 +4110,7 @@ llama_context_params llama_context_default_params() {
          /*.sampler                     =*/ nullptr,
          /*.n_sampler                   =*/ 0,
          /*.ctx_other                   =*/ nullptr,
@@ -101,7 +101,7 @@ index 761fc59..e8b4196 100644
      };
  
      return result;
-@@ -4183,6 +4220,7 @@ struct ggml_cgraph * llama_graph_reserve(
+@@ -4406,6 +4443,7 @@ struct ggml_cgraph * llama_graph_reserve(
      auto memory = ctx->get_memory();
      llama_memory_context_ptr mctx;
      if (memory) {
@@ -110,7 +110,7 @@ index 761fc59..e8b4196 100644
      }
      return ctx->graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
 diff --git a/src/llama-cparams.h b/src/llama-cparams.h
-index 004fec5..f91fc1d 100644
+index f4eb181a7..a8e5cbbf7 100644
 --- a/src/llama-cparams.h
 +++ b/src/llama-cparams.h
 @@ -12,6 +12,7 @@ struct llama_cparams {
@@ -122,10 +122,10 @@ index 004fec5..f91fc1d 100644
      uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
      uint32_t n_outputs_max;   // max outputs supported by the context
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 897b4e9..6e7adfe 100644
+index 7ac108708..491f0c8ef 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -2993,9 +2993,15 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
+@@ -3021,9 +3021,15 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
  
  llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
  
@@ -142,7 +142,7 @@ index 897b4e9..6e7adfe 100644
      const uint32_t n_stream = kv->get_n_stream();
  
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index f514041..28421b5 100644
+index b2dfc371b..a4a118c20 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -510,3 +510,7 @@ private:
@@ -154,10 +154,10 @@ index f514041..28421b5 100644
 +// buffers (llama_context_params::n_kv_reserve), 0 outside a reservation
 +extern thread_local uint32_t llama_kv_reserve_cap;
 diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
-index 0bfba3c..503709f 100644
+index 2c5a57680..d06e8054e 100644
 --- a/src/llama-memory-hybrid-idx.cpp
 +++ b/src/llama-memory-hybrid-idx.cpp
-@@ -526,7 +526,9 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
+@@ -484,7 +484,9 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
          mem->kpool_layout_update();
          auto st = kpool_build_sizes();
          const auto * idx = mem->get_mem_idx();
@@ -169,17 +169,62 @@ index 0bfba3c..503709f 100644
          st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
          st.n_new   = st.n_pool_real;
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 353c84d..35e0c23 100644
+index dac25b220..b68f72cee 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -817,7 +817,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
-     ggml_tensor * kq = ggml_mul_mat(ctx0,
-             ggml_reshape_2d(ctx0, pooled, idx_dim, n_pool),
-             ggml_reshape_2d(ctx0, q, idx_dim, n_idx_h*n_tokens)); // [n_pool, n_idx_h*n_tokens]
--    kq = ggml_relu(ctx0, ggml_reshape_3d(ctx0, kq, n_pool, n_idx_h, n_tokens));
-+    // in place: the product's only reader, and a separate result is as large as the product
-+    // (the pools x 4 heads x the ubatch's tokens in f32: 1 GiB at 131K cells and 2,048 tokens)
-+    kq = ggml_relu_inplace(ctx0, ggml_reshape_3d(ctx0, kq, n_pool, n_idx_h, n_tokens));
+@@ -679,7 +679,7 @@ public:
+     ggml_tensor * k_idxs        = nullptr; // I64 [n_tokens]
+     ggml_tensor * pool_cells    = nullptr; // I32 [n_pool]         cell caching each block's pooled key
+     ggml_tensor * pool_idxs     = nullptr; // I32 [kpool, n_pool]  member cells per block, n_kv sentinel for the padded blocks
+-    ggml_tensor * pool_mask     = nullptr; // F16 [n_pool, n_tokens]
++    ggml_tensor * pool_mask     = nullptr; // F16 [n_pool, n_tokens] (F32 without the fused lightning indexer)
+     ggml_tensor * tail_idxs     = nullptr; // I32 [kpool - 1, n_tokens]
+     ggml_tensor * new_pool_idxs = nullptr; // I32 [kpool, n_new]   members of the blocks to re-pool this ubatch
+     ggml_tensor * new_pool_rep  = nullptr; // I64 [n_new]          cell to write each new pooled key into
+@@ -704,7 +704,8 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
+     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+     inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
+     inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
+-    inp->pool_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
++    // F16 for the lightning indexer; F32 for the graph a backend without it runs (patch 0052, resolve_fused_ops)
++    inp->pool_mask  = ggml_new_tensor_2d(ctx0, cparams.fused_lid ? GGML_TYPE_F16 : GGML_TYPE_F32, n_pool, n_tokens);
+     inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
+     ggml_set_input(inp->pool_cells);
+     ggml_set_input(inp->pool_idxs);
+@@ -799,11 +800,31 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
+             ext_factor, attn_factor, beta_fast, beta_slow);
+     cb(q, "indexer_q", il);
  
-     ggml_tensor * score = nullptr;
-     for (int64_t h = 0; h < n_idx_h; ++h) {
+-    // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
+-    // which is the lightning indexer with every head weight set to that scale
+-    ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
+-    ggml_tensor * score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
+-    res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
++    ggml_tensor * score = nullptr;
++    if (cparams.fused_lid) {
++        // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
++        // which is the lightning indexer with every head weight set to that scale
++        ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
++        score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
++        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
++    } else {
++        // a backend without the lightning indexer (resolve_fused_ops cleared fused_lid, e.g. OpenCL): the
++        // graph before it (patch 0052). The reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim):
++        // one product for all heads, then the heads are summed as slices, so nothing is transposed
++        ggml_tensor * kq = ggml_mul_mat(ctx0,
++                ggml_reshape_2d(ctx0, pooled, idx_dim, n_pool),
++                ggml_reshape_2d(ctx0, q, idx_dim, n_idx_h*n_tokens)); // [n_pool, n_idx_h*n_tokens]
++        // in place: the product's only reader, and a separate result is as large as the product
++        // (the pools x 4 heads x the ubatch's tokens in f32: 1 GiB at 131K cells and 2,048 tokens)
++        kq = ggml_relu_inplace(ctx0, ggml_reshape_3d(ctx0, kq, n_pool, n_idx_h, n_tokens));
++
++        for (int64_t h = 0; h < n_idx_h; ++h) {
++            ggml_tensor * slice = ggml_view_2d(ctx0, kq, n_pool, n_tokens, kq->nb[2], h*kq->nb[1]);
++            score = score ? ggml_add(ctx0, score, slice) : ggml_cont(ctx0, slice);
++        }
++        score = ggml_scale(ctx0, score, 1.0f/sqrtf((float) idx_dim));
++        score = ggml_add(ctx0, score, inp_kpool->pool_mask); // [n_pool, n_tokens]
++    }
+     cb(score, "indexer_score", il);
+ 
+     const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);

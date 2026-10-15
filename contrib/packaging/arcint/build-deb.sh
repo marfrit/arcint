@@ -28,9 +28,9 @@ ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-c84a13e243632b108cf8ea9a9dcb0399c
 # The libllama engine (--engine llama) builds against llama.cpp at this pin
 # with contrib/llama.cpp/patches applied (contrib/llama.cpp/README.md): the
 # GitHub tarball of the commit, checked by sha256.
-LLAMA_COMMIT=bed0a856606ee4a24a164066f73d2379447033f5
+LLAMA_COMMIT=3e4dfa8f39f904e681737d9f512a6e6338d848aa
 LLAMA_URL="https://github.com/ggml-org/llama.cpp/archive/${LLAMA_COMMIT}.tar.gz"
-LLAMA_TARBALL_SHA256=0984123c33b7e959f8003f9169e9109897112d9448b681737813911083eca4cc
+LLAMA_TARBALL_SHA256=f9046074c9b71eaf9abd5491001e4d09c327591fed6b9e2bfcfddbb575dc5255
 OV_PREFIX=/usr/lib/marfrit-openvino
 # The ABI is the nightly, not the patch level: floor the patch level, cap at
 # the next nightly. An exact pin (Depends: = +p1-1) made apt REMOVE arcint when

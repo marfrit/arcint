@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index f4c023d..6e99907 100644
+index 0f399e7ea..9b7f408e1 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -704,6 +704,7 @@ struct ggml_backend_opencl_context {
+@@ -713,6 +713,7 @@ struct ggml_backend_opencl_context {
      bool disable_fusion;
      bool fuse_mm_glu = true;                     // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
      bool fuse_rms_add = true;                    // opt-out GGML_OPENCL_FUSE_RMS_ADD=0 (fused rms_norm*w + residual)
@@ -10,7 +10,7 @@ index f4c023d..6e99907 100644
      int  fuse_0049 = 7;                          // patch 0049's fusions, a bit each: 1 rms_norm + scale, 2 ssm_conv + silu,
                                                   // 4 sigmoid + mul (GGML_OPENCL_FUSE_0049=<mask>; 0: off)
      bool f16_mrow = true;                        // opt-out GGML_OPENCL_F16_MROW=0 (multi-row-per-WG f16 decode GEMV for attn proj + lm_head)
-@@ -8073,6 +8074,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
+@@ -8266,6 +8267,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
      if (const char * env = getenv("GGML_OPENCL_FUSE_RMS_ADD")) {
          backend_ctx->fuse_rms_add = atoi(env) != 0;
      }
@@ -20,7 +20,7 @@ index f4c023d..6e99907 100644
      if (const char * env = getenv("GGML_OPENCL_FUSE_0049")) {
          backend_ctx->fuse_0049 = atoi(env);
      } else if (const char * env2 = getenv("GGML_OPENCL_FUSE_RMS_SCALE")) {   // the gate's first switch: 0 = all off
-@@ -9250,6 +9254,11 @@ inline bool use_q4k_tiled(const ggml_backend_opencl_context *backend_ctx, const
+@@ -9443,6 +9447,11 @@ inline bool use_q4k_tiled(const ggml_backend_opencl_context *backend_ctx, const
  inline bool use_q4_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);
  inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);   // defined below
  
@@ -32,7 +32,7 @@ index f4c023d..6e99907 100644
  // patch 0049's fused forms, defined with the ops below
  static void ggml_cl_rms_norm_impl(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst, float post, ggml_tensor * out);
  static void ggml_cl_ssm_conv_impl(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
-@@ -10047,6 +10056,40 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+@@ -10240,6 +10249,40 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
              i++;
              continue;
          }
@@ -73,7 +73,7 @@ index f4c023d..6e99907 100644
          // sigmoid + mul of the same shape, as llama.cpp CUDA fuses it (ggml-cuda.cu,
          // {UNARY, MUL} with SIGMOID; unary.cu ggml_cuda_op_unary_mul: same shape,
          // contiguous): one kernel (patch 0049)
-@@ -33655,6 +33698,11 @@ static void ggml_cl_glu(ggml_backend_t backend, const ggml_tensor * src0, const
+@@ -33973,6 +34016,11 @@ static void ggml_cl_glu(ggml_backend_t backend, const ggml_tensor * src0, const
  }
  
  static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
@@ -85,7 +85,7 @@ index f4c023d..6e99907 100644
      GGML_ASSERT(dst);
      GGML_ASSERT(dst->extra);
  
-@@ -33718,6 +33766,9 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
+@@ -34036,6 +34084,9 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
          kernel = tgpp == 0 ? backend_ctx->kernel_gdn_intel_tg : backend_ctx->kernel_gdn_intel_pp;
      }
      GGML_ASSERT(kernel != nullptr);
@@ -95,7 +95,7 @@ index f4c023d..6e99907 100644
  
      const cl_uint s_off = S_v * H_v * n_tokens * n_seqs;
  
-@@ -33784,6 +33835,23 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
+@@ -34102,6 +34153,23 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
      CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &rq3));
      CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(float),    &scale));
      CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),    &K));
@@ -119,7 +119,7 @@ index f4c023d..6e99907 100644
  
      if (gdn_intel) {
          // gated_delta_net_intel.cl: the work-group's sub-groups, R rows each
-@@ -33794,7 +33862,7 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
+@@ -34112,7 +34180,7 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
          size_t global_work_size[3] = { (size_t) H_v * sg, (size_t) n_seqs * nsg, (size_t) S_v / rows };
          size_t local_work_size[3]  = { sg, nsg, 1 };
          backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
@@ -128,7 +128,7 @@ index f4c023d..6e99907 100644
      }
  
      // Subgroup size is 64 for Adreno and 32 for Intel
-@@ -33847,6 +33915,7 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
+@@ -34165,6 +34233,7 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
      local_work_size[2]  = 1;
  
      backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
@@ -137,7 +137,7 @@ index f4c023d..6e99907 100644
  
  //------------------------------------------------------------------------------
 diff --git a/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl b/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
-index 7256709..8455661 100644
+index 725670923..84556615a 100644
 --- a/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
 +++ b/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
 @@ -92,7 +92,11 @@ kernel void kernel_gated_delta_net_pp(

@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 9e59b0c..e4023f1 100644
+index 72d66be1e..17d17878d 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -43,6 +43,7 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
@@ -10,15 +10,15 @@ index 9e59b0c..e4023f1 100644
  #include <memory>
  #include <charconv>
  #include <mutex>
-@@ -492,6 +493,7 @@ struct ggml_opencl_fa_kernels {
+@@ -494,6 +495,7 @@ struct ggml_opencl_fa_kernels {
      std::map<std::pair<int, int>, cl_kernel> f32_f16_q1;
      std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_split;       // flash-decoding K-split
      std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_split_intel; // the same, lanes along the head dimension
 +    std::map<std::pair<int, int>, std::array<cl_kernel, 3>> q_q1_split_intel; // quantized K/V: q8q8, q8q4, q4q4
      // vec decode
      std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec;
-     // kv-head-coalesced vec decode
-@@ -1080,6 +1082,7 @@ struct ggml_backend_opencl_context {
+     bool f32_f16_vec_512_attempted = false;
+@@ -1090,6 +1092,7 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_gdn_intel_tg = nullptr;
      // Intel, prompt attention on the XMX units (flash_attn_dpas.cl; SG 16 or 8)
      cl_kernel kernel_fa_dpas = nullptr;
@@ -26,7 +26,7 @@ index 9e59b0c..e4023f1 100644
      int       fa_dpas_bq = 0, fa_dpas_nthr = 0;   // query rows and work-items a work-group
      cl_kernel kernel_gdn_intel_pp = nullptr;
      int gdn_intel_sg = 0, gdn_intel_r_tg = 0, gdn_intel_r_pp = 0, gdn_intel_nsg = 0;
-@@ -4248,6 +4251,33 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -4274,6 +4277,33 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                  }
                  CL_CHECK(clReleaseProgram(p));
              }
@@ -60,7 +60,7 @@ index 9e59b0c..e4023f1 100644
              if (backend_ctx->kernel_fa_dpas == nullptr) {
                  GGML_LOG_WARN("ggml_opencl: flash_attn_dpas.cl not built; flash_attn_f32_f16.cl takes the prompt\n");
              }
-@@ -6462,6 +6492,15 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
+@@ -6651,6 +6681,15 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                  if (err == CL_SUCCESS) {
                      backend_ctx->fa.f32_f16_q1_split_intel[{dk, dv}] = k_si;
                      ggml_opencl_log_fa_kernel_spill(backend_ctx, k_si, "flash_attn_f32_f16_q1_split_intel", dk, dv);
@@ -76,7 +76,7 @@ index 9e59b0c..e4023f1 100644
                  }
              }
              // q1_vec decode kernel (DV-split + subgroup reduce)
-@@ -18588,6 +18627,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -18847,6 +18886,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      const bool is_mixed = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
      const bool is_q8_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0;
      const bool is_q4_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_Q4_0;
@@ -92,7 +92,7 @@ index 9e59b0c..e4023f1 100644
  
  #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
      if (use_fa_bin_kernels_prefill(backend_ctx, q, k, v)) {
-@@ -18723,47 +18771,6 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -18996,47 +19044,6 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      max_bias      = params[1];
      logit_softcap = params[2];
  
@@ -140,7 +140,7 @@ index 9e59b0c..e4023f1 100644
  
      bool use_q1_vec = false;
      bool use_q1_vec_mq = false;
-@@ -18877,6 +18884,58 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -19150,6 +19157,58 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      ggml_cl_flash_attn_reconstruct_aos(backend_ctx, v, temp_v_aos,
                                         v_data_device, offset_v, v_nb1, v_nb2, v_nb3);
  
@@ -199,7 +199,7 @@ index 9e59b0c..e4023f1 100644
      // currently FA kernels support KV cache with f16, f32, q4_0 and q8_0.
      // there two cases that these kernels cannot cover,
      //   1. KV cache types are q4_0 or q8_0, but the FA kernels fail to compile
-@@ -18886,7 +18945,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -19159,7 +19218,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      // For q4_0 or q8_0 cases that fail kernel compilation, dequant happens in GPU;
      // for types that do not have FA kernels, dequant happens on host.
      if (!use_native_q8_0_q1 && !use_native_q8_0 &&
@@ -208,7 +208,7 @@ index 9e59b0c..e4023f1 100644
          // for q4_0, q8_0 FA kernels that fail to compile
          bool k_done = false;
          bool v_done = false;
-@@ -19124,6 +19183,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -19405,6 +19464,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          fd_k_split   = backend_ctx->fa.f32_f16_q1_split_intel.at(dk_dv);
          use_fd_intel = true;
      }
@@ -221,7 +221,7 @@ index 9e59b0c..e4023f1 100644
          n_q >= 1 && n_q <= fd_max_n_q && n_kv >= FD_MIN_N_KV && !is_causal &&
          d_head_q <= FD_MAX_DK &&
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
-index 00a30ee..f40702b 100644
+index 00a30ee6e..f40702b27 100644
 --- a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
 @@ -55,6 +55,26 @@
@@ -284,10 +284,10 @@ index 00a30ee..f40702b 100644
              for (int j = 0; j < 8; ++j) vt[(8 * c8 + j) * BK + key] = vv[j];
          }
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_f32_f16.cl b/ggml/src/ggml-opencl/kernels/flash_attn_f32_f16.cl
-index 846ca51..70cab84 100644
+index dc077b838..c50f42146 100644
 --- a/ggml/src/ggml-opencl/kernels/flash_attn_f32_f16.cl
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_f32_f16.cl
-@@ -2679,6 +2679,119 @@ static inline void fdi_row(const global half * p, float * out) {
+@@ -2798,6 +2798,119 @@ static inline void fdi_row(const global half * p, float * out) {
          out[8 * b + 4] = f.s4; out[8 * b + 5] = f.s5; out[8 * b + 6] = f.s6; out[8 * b + 7] = f.s7;
      }
  }
@@ -407,7 +407,7 @@ index 846ca51..70cab84 100644
  __attribute__((intel_reqd_sub_group_size(FDI_SG)))
  __kernel void flash_attn_f32_f16_q1_split_intel(
      const global void * q_void, ulong q_offset,
-@@ -2789,6 +2902,15 @@ __kernel void flash_attn_f32_f16_q1_split_intel(
+@@ -2908,6 +3021,15 @@ __kernel void flash_attn_f32_f16_q1_split_intel(
      #pragma unroll
      for (int i = 0; i < FDI_E; ++i) rec[2 + i * FDI_SG + lane] = o[i];
  }
@@ -424,10 +424,10 @@ index 846ca51..70cab84 100644
  
  #endif  // !FA_MQ_ONLY (q1_split + merge)
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 1fffe51..37ea953 100644
+index 24a77fe1f..fc754b64d 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11180,6 +11180,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11740,6 +11740,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  

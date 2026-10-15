@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
-index e4f6d08..b873702 100644
+index e4f6d08b0..b87370255 100644
 --- a/ggml/src/ggml-opencl/CMakeLists.txt
 +++ b/ggml/src/ggml-opencl/CMakeLists.txt
 @@ -222,6 +222,7 @@ set(GGML_OPENCL_KERNELS
@@ -11,10 +11,10 @@ index e4f6d08..b873702 100644
      sum_rows
      cumsum
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index e4023f1..28bfc64 100644
+index 17d17878d..cc60b57ab 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -1083,6 +1083,10 @@ struct ggml_backend_opencl_context {
+@@ -1093,6 +1093,10 @@ struct ggml_backend_opencl_context {
      // Intel, prompt attention on the XMX units (flash_attn_dpas.cl; SG 16 or 8)
      cl_kernel kernel_fa_dpas = nullptr;
      cl_kernel kernel_fa_dpas_q[3] = {};           // quantized K/V: q8_0/q8_0, q8_0/q4_0, q4_0/q4_0
@@ -25,7 +25,7 @@ index e4023f1..28bfc64 100644
      int       fa_dpas_bq = 0, fa_dpas_nthr = 0;   // query rows and work-items a work-group
      cl_kernel kernel_gdn_intel_pp = nullptr;
      int gdn_intel_sg = 0, gdn_intel_r_tg = 0, gdn_intel_r_pp = 0, gdn_intel_nsg = 0;
-@@ -4281,6 +4285,50 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -4307,6 +4311,50 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
              if (backend_ctx->kernel_fa_dpas == nullptr) {
                  GGML_LOG_WARN("ggml_opencl: flash_attn_dpas.cl not built; flash_attn_f32_f16.cl takes the prompt\n");
              }
@@ -76,7 +76,7 @@ index e4023f1..28bfc64 100644
              GGML_LOG_CONT(".");
          } else if (!sg8 && !sg16) {
              GGML_LOG_WARN("ggml_opencl: no sub-group size 8 or 16 reported; flash_attn_f32_f16.cl takes the prompt\n");
-@@ -19188,6 +19236,25 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -19469,6 +19517,25 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          fd_k_split   = backend_ctx->fa.q_q1_split_intel.at(dk_dv)[kvq];
          use_fd_intel = true;
      }
@@ -102,7 +102,7 @@ index e4023f1..28bfc64 100644
      if (fd_k_split == NULL &&
          n_q >= 1 && n_q <= fd_max_n_q && n_kv >= FD_MIN_N_KV && !is_causal &&
          d_head_q <= FD_MAX_DK &&
-@@ -19437,6 +19504,13 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -19732,6 +19799,13 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          size_t fd_lws[3] = { fd_wg, 1, 1 };
          // gid(2) packs q_idx * n_splits + split_idx.
          size_t fd_gws[3] = { fd_wg, fd_head_dim, (size_t)(n_splits * n_q) };
@@ -118,7 +118,7 @@ index e4023f1..28bfc64 100644
          cl_kernel k_merge = backend_ctx->fa.f32_merge.at(dk_dv);
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
 new file mode 100644
-index 0000000..b9ca909
+index 000000000..b9ca909aa
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
 @@ -0,0 +1,257 @@
@@ -380,10 +380,10 @@ index 0000000..b9ca909
 +    }
 +}
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 37ea953..0140cb8 100644
+index fc754b64d..76f2a890c 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11195,6 +11195,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11755,6 +11755,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
              }
          }
      }
@@ -401,7 +401,7 @@ index 37ea953..0140cb8 100644
      // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
      test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-@@ -11504,6 +11515,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12106,6 +12117,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      std::vector<std::unique_ptr<test_case>> test_cases;
  
