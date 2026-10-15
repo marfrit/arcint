@@ -55,6 +55,14 @@ a host upgraded from 0.7.x may keep it installed as the way back to 0.7.12.
   stays the shape; ISTA-DASLab's IQ3_XXS serves on demand on the same port
   (`contrib/systemd/arcint-flashnext-iq3xxs.service`, 12,000 MiB of slots,
   the CPU misses); UD-Q3_K_XL waits for the host's 96 GB.
+- **Measured before the tag** (`measured-here`, the 0.8.0 package, each
+  model staged on the NVMe, two fresh processes a service): the agent
+  695.3 / 695.1 t/s at 55k and 491.9 / 491.6 at 138k, the acceptance task
+  10/10; the coder 51.1 / 47.5 / 44.0 t/s decode and 725.5 at 41k, the task
+  9/10; Flash-Next 665.8 / 665.4 t/s at the 20k needle asked right after the
+  capital and 42.2 / 42.3 t/s decode; the equivalence and concurrency suites
+  pass on the agent and the coder; the sanitizers pass. These are the
+  served cells' floors from now on.
 - **Package and image**: the recipe builds the one engine and refuses to
   build a 0.7.x tag; the image is one Fedora 43 image with Intel's compute
   runtime (`docs/docker.md`); the 0.7.12 images were published on
