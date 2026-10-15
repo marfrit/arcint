@@ -39,7 +39,7 @@ tag [`openvino-history`](https://github.com/marfrit/arcint/tree/openvino-history
 |---|---|---|---|---|
 | agent | Qwen3.8-27B (`qwen35`, dense, 64 layers, MTP layer) | Q4_K_M GGUF | Arc Pro B60 | 245,760 tokens, q8_0:q4_0 KV, MTP 5 |
 | coder | Qwen3.6-27B-A3B-Coder (`qwen35moe`, 184 experts, MTP layer) | a searched per-layer quant mix (14.6 GB) | Arc A770 | 98,304 tokens, q8_0:q4_0 KV, MTP 4 |
-| Flash-Next | Qwen3.8-Flash-Next (`qwen4exp`, 125B-A6B, 512 experts, n-gram table) | ISTA-DASLab's IQ2_XS GGUF, every expert computed on the card through an expert cache; its MTP layer from the checkpoint | Arc Pro B60 + host RAM, on demand | 131,072 tokens, q8_0 KV, MTP 3 |
+| Flash-Next | Qwen3.8-Flash-Next (`qwen4exp`, 125B-A6B, 512 experts, n-gram table) | ISTA-DASLab's IQ2_XS GGUF through an expert cache: the hot experts in VRAM, the rest in host RAM, read over the link or computed on the CPU; its MTP layer from the checkpoint | Arc Pro B60 + host RAM, on demand | 131,072 tokens, q8_0 KV, MTP 3 |
 | writer | Cydonia 24B v4.3 (Mistral Small 3.2, `llama`) | imatrix Q4_K_M | Arc Pro B60, on demand | 98,304 tokens, q8_0 KV |
 
 The engine admits these architectures (`qwen35`, `qwen35moe`, `qwen4exp`, and
@@ -56,7 +56,7 @@ point per case, at temperature 0.
 
 | service | card | prefill | decode | answers |
 |---|---|---|---|---|
-| agent | B60 | 695.3 t/s at 54,895 tokens, 491.8 at 138,028 | 36.6 / 32.3 / 19.3 t/s at 4k / 29k / 130k (2026-10-08) | the needle at 138k; task 10/10 |
+| agent | B60 | 695.3 t/s at 54,895 tokens, 491.8 at 138,028 | not in this check (36.6 / 32.3 / 19.3 t/s at 4k / 29k / 130k on 2026-10-08, before 0016-0051) | the needle at 138k; task 10/10 |
 | coder | A770 | 721.0 t/s at 40,841 tokens | 51.1 / 47.6 / 44.0 t/s on three 300-token answers | the needle; task 9/10 |
 | Flash-Next | B60 + 20.3 GiB host bank | 690.3 t/s at 20,045 tokens | 43.4 t/s | the needle |
 

@@ -18,7 +18,7 @@
         "ARCINT_EXTRA_ARGS": "--llama-kv q8_0:q4_0 --llama-mtp 5"
       }
     },
-    "flags": "--engine llama, ARCINT_EXTRA_ARGS=--llama-kv q8_0:q4_0 --llama-mtp 5 (the suite's own --n-ctx and lane flags)",
+    "flags": "--engine llama, ARCINT_EXTRA_ARGS=--llama-kv q8_0:q4_0 --llama-mtp 5 (the suite's own --n-ctx and lane flags) (the unit's KV and MTP depth; its draft vocabulary is left out)",
     "gates": "the answers right in every arm: two greedy runs, a lane's reused prefix against a fresh process, a checkpoint resume against a full re-prefill, MTP on against off, one lane against two",
     "reports": "byte equality of each pair (tripwire, §3.4 point 5)",
     "external": null,
@@ -70,7 +70,7 @@
         "ARCINT_EXTRA_ARGS": "--llama-kv q8_0:q4_0 --llama-mtp 5"
       }
     },
-    "flags": "--engine llama, two named lanes, ARCINT_EXTRA_ARGS=--llama-kv q8_0:q4_0 --llama-mtp 5",
+    "flags": "--engine llama, two named lanes, ARCINT_EXTRA_ARGS=--llama-kv q8_0:q4_0 --llama-mtp 5 (the unit's KV and MTP depth; its draft vocabulary is left out)",
     "gates": "no cross-lane bleed in both start orders, both lanes used, the 404 for an unknown lane name, cancellation, the 503 with the lane's numbers after the queue timeout",
     "reports": null,
     "external": null,

@@ -422,7 +422,7 @@ the lane's free count; it never takes another lane.
 
 ### 4.3 Admission
 
-The context is configuration: `--n-ctx` (default 32,768), or `--lane-ctx`
+The context is configuration: `--n-ctx` (default the smaller of 32,768 and the trained context), or `--lane-ctx`
 per lane. Whether it fits is decided once, by measurement at the deepest
 admitted prompt (§3.3), not per request. A request is refused only by §3.8
 (400) or by a full lane after `--queue-timeout` (503).
@@ -567,7 +567,7 @@ GGUF repack) is at the tag `openvino-history`.
 
 | line | content | state |
 |---|---|---|
-| 0.1-0.5.4 | the OpenVINO engine: paged KV, prefix cache, MTP, two lanes, the K-quant plugin series, Flash-Next's serving shape and expert tier | retired; `openvino-history` |
+| 0.1-0.5.4 | the OpenVINO engine: paged KV, prefix cache, MTP, two lanes, the K-quant plugin series, Flash-Next's serving shape and expert tier (shipped beside the libllama engine until 0.7.12) | retired; `openvino-history` |
 | 0.5.5-0.5.12 | the libllama engine: Intel kernels 0001-0020, MTP drafting, quantized KV, context checkpoints; the agent (0.5.6), the writer (0.5.8) and the coder (2026-10-05) on it | done |
 | 0.6.0-0.6.x | Flash-Next on the libllama engine: the expert cache, the IQ kernels, its MTP layer | done |
 | 0.7.0-0.7.12 | named lanes and the step combiner, two cards by layers, the bank stream, decode launches, GDN snapshots, the CPU misses, the pin moved to `3e4dfa8` | done; 0.7.12 released 2026-10-15 |
@@ -611,10 +611,10 @@ The IQ2_XS file is the serving shape; the others stay available as
 on-demand configurations on the same endpoint (`decision`, operator,
 2026-10-15; `docs/llama-engine.md`, "Flash-Next quant options"):
 
-| GGUF | KL / top-1 against Q8_0 | host bank | state |
+| GGUF | KL / top-1 against unsloth's Q8_0 on the CPU (16 x 512) | host bank | state |
 |---|---|---|---|
 | ISTA-DASLab IQ2_XS | 0.294 / 87.1 % | 20.32 GiB | production |
-| ISTA-DASLab IQ3_XXS | 0.218 / 89.7 % (served) | 28.72 GiB at 12,000 MiB of slots | on-demand unit `arcint-flashnext-iq3xxs`: 597.9 t/s at the 20k needle, 30.6-37.5 t/s on six answers with the CPU misses (`measured-here`, 2026-10-15) |
+| ISTA-DASLab IQ3_XXS | 0.218 / 89.7 % (served) | 28.72 GiB at 12,000 MiB of slots | on-demand unit `arcint-flashnext-iq3xxs`: 597.9 t/s at the 20k needle, 30.6-37.5 t/s on six answers with the CPU misses; their KL cost +0.0044 nats against the misses off on the served reference capture (8 x 512, ubatch 4: 0.2910 / 0.2866), a different window from this column's (`measured-here`, 2026-10-15) |
 | unsloth UD-Q3_K_XL | 0.100 / 93.3 % | ~39 GiB | inside the bar; needs the planned 96 GB host |
 
 ### 7.3 Retractions
@@ -691,8 +691,9 @@ Which switches and flags stay stable within 1.x is the operator's
 (`docs/switches.md`). 0.8.0 changes the surface: the OpenVINO engine's
 flags are refused by name, `/props` and `/health` lose its fields (the
 reservation, the prefix cache, the paged-KV block), `/props` gains
-`model.architecture`, `quant` names the GGUF's file type, and `kv_dtype`
-reports `--llama-kv` (it read "f16" whatever the flag said before).
+`model.architecture`, `quant` names the GGUF's file type, `kv_dtype`
+reports `--llama-kv` (it read "f16" whatever the flag said before), and
+the 503 bodies lose `reservation` and `kv_blocks_free`.
 
 ### 8.8 Other open items
 

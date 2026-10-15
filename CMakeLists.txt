@@ -242,7 +242,7 @@ if(ARCINT_ACCEPTANCE)
   set(ARCINT_ACCEPTANCE_GGUF_FLASHNEXT "" CACHE FILEPATH
       "The Flash-Next GGUF (first shard) the acceptance cells serve")
   set(ARCINT_ACCEPTANCE_PROMPT_DIR "" CACHE PATH
-      "Directory the served cells write their sized prompts to")
+      "The served cells' assets: corpus.txt, needle-20k.json, expert-profile.bin, mtp-flash-next.gguf, mtp-vocab.json (tests/acceptance/cells/served_check.py)")
   set(ARCINT_ACCEPTANCE_DEVICE_LARGE "GPU.0" CACHE STRING
       "Device string (--device) for the 24 GB card in acceptance cells")
   set(ARCINT_ACCEPTANCE_DEVICE_SMALL "GPU.1" CACHE STRING

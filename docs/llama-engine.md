@@ -127,7 +127,7 @@ replaced it at no measured decode cost on either card.
 
 Qwen3.8-Flash-Next (`qwen4exp`) serves on the B60 from ISTA-DASLab's IQ2_XS
 GGUF (`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`, revision `ed59f920`),
-with every expert computed on the card and its MTP layer drafting:
+its experts through an expert cache (the hot ones in VRAM, the others in host RAM, read over the link or, with `LLAMA_EXPERT_CACHE_CPU_MISSES=1`, computed on the CPU) and its MTP layer drafting:
 
     arcint --engine llama --gguf Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
         --device GPU.0 --n-ctx 32768 --llama-cpu-moe 48 \
@@ -307,7 +307,7 @@ IQ2_XS is the production file, its KL shortfall against unsloth's Q8_0
 accepted; the other quants stay available on demand, on the same endpoint
 and served name, one at a time (`measured-here` unless marked):
 
-| GGUF | KL / top-1 vs Q8_0 (16 x 512) | host bank at the unit's slots | state |
+| GGUF | KL / top-1 vs unsloth's Q8_0 on the CPU (16 x 512) | host bank at the unit's slots | state |
 |---|---|---|---|
 | ISTA-DASLab GSQ-RCO IQ2_XS (shard 1 39.2 GB) | 0.294 / 87.1 % | 20.32 GiB at 13,400 MiB | production, 43.4 t/s decode, 690 t/s prefill at 20k (0.7.12) |
 | ISTA-DASLab GSQ-RCO IQ3_XXS (shard 1 47.0 GB) | 0.218 / 89.7 % (served) | 28.72 GiB at 12,000 MiB | on demand (`arcint-flashnext-iq3xxs`), 12,000 MiB of slots with the CPU misses: 597.9 t/s at the 20k needle, 33.9 / 37.5 / 37.3 / 33.5 / 30.6 / 30.9 t/s on six answers (20.7 / 26.2 / 28.9 / 18.7 / 21.2 / 18.5 without), KL 0.2910 against 0.2866 without (8 x 512), peak 23,306 MiB (13,400 MiB from ZFS thrashed: 6.4-11.7 t/s at peak 24,440) |

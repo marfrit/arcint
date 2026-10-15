@@ -41,7 +41,7 @@ Things worth copying rather than re-learning:
 - **`--queue-timeout 30`**: a request for a busy lane waits that long and
   then gets a 503 with the lane's numbers, instead of an immediate refusal.
 - **Flash-Next needs its host memory free**: the bank (20.32 GiB for IQ2_XS)
-  is pinned, beside the page cache of a 39 GB file and the 27 GiB n-gram
+  is pinned, beside the page cache of its GGUF (39.2 GB for the IQ2_XS shard 1) and the 27 GiB n-gram
   table read lazily. Serve the GGUF from local NVMe, not a network or ZFS
   pool: the first answers read about 1 GB from storage.
 - `TimeoutStartSec=20min` (30 for Flash-Next): loading Flash-Next fills the

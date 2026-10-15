@@ -12,7 +12,7 @@ Every 77 (skip) must be named on that command line, or the run does not count as
 ## Cells
 
 - [ ] `agent-equivalence` -- tests/equivalence/run.sh (§5, §3.4)
-      flags: --engine llama, ARCINT_EXTRA_ARGS=--llama-kv q8_0:q4_0 --llama-mtp 5 (the suite's own --n-ctx and lane flags)
+      flags: --engine llama, ARCINT_EXTRA_ARGS=--llama-kv q8_0:q4_0 --llama-mtp 5 (the suite's own --n-ctx and lane flags) (the unit's KV and MTP depth; its draft vocabulary is left out)
       gates: the answers right in every arm: two greedy runs, a lane's reused prefix against a fresh process, a checkpoint resume against a full re-prefill, MTP on against off, one lane against two
       reports: byte equality of each pair (tripwire, §3.4 point 5)
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
@@ -24,7 +24,7 @@ Every 77 (skip) must be named on that command line, or the run does not count as
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 
 - [ ] `agent-concurrency` -- tests/concurrency/run.py (§4.1, §5)
-      flags: --engine llama, two named lanes, ARCINT_EXTRA_ARGS=--llama-kv q8_0:q4_0 --llama-mtp 5
+      flags: --engine llama, two named lanes, ARCINT_EXTRA_ARGS=--llama-kv q8_0:q4_0 --llama-mtp 5 (the unit's KV and MTP depth; its draft vocabulary is left out)
       gates: no cross-lane bleed in both start orders, both lanes used, the 404 for an unknown lane name, cancellation, the 503 with the lane's numbers after the queue timeout
       references: not yet filled
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)

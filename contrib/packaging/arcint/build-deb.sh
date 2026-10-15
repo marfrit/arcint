@@ -39,9 +39,9 @@ HERE=$(dirname "$(readlink -f "$0")")
 
 export SOURCE_DATE_EPOCH=1787990400
 
-# Fail in a second, not after the downloads: the tools and the second
-# engine's build dependencies.
-for t in curl git python3 cmake; do
+# Fail in a second, not after the downloads: the tools and the engine's
+# build dependencies.
+for t in curl git python3 cmake objdump; do
     command -v "$t" >/dev/null || { echo "$t fehlt (Build-Abhaengigkeit)" >&2; exit 1; }
 done
 [ -f /usr/include/CL/cl.h ] || { echo "opencl-headers fehlen (/usr/include/CL/cl.h)" >&2; exit 1; }

@@ -126,6 +126,20 @@ def metric(name, value, unit="t/s"):
     print(f"ACCEPTANCE-METRIC {name} {value:.1f} {unit}", flush=True)
 
 
+def prefill(name, line, lo, hi):
+    # the depth actually read, from the slot line: the floor holds only at the reference's depth
+    n = int(line[0])
+    gate(lo <= n <= hi, f"{name} read {n} tokens (band {lo}-{hi})")
+    metric(name, float(line[2]))
+
+
+def decodes(names, min_tok=100):
+    d = [x for x in slot_lines("decode") if int(x[0]) >= min_tok][-len(names):]
+    gate(len(d) == len(names), f"{len(names)} decodes of at least {min_tok} tokens (got {len(d)})")
+    for name, x in zip(names, d):
+        metric(name, float(x[2]))
+
+
 try:
     for _ in range(3600):
         try:
@@ -146,26 +160,24 @@ try:
         a = text(post(needle_prompt(133000, 3.58), 24))
         gate("violet-harbor-42" in a.lower(), f"the needle at 138k ({a.strip()[:40]!r})")
         p = slot_lines("prefill")
-        metric("prefill-55k", float(p[-2][2]))
-        metric("prefill-138k", float(p[-1][2]))
+        prefill("prefill-55k", p[-2], 52000, 58000)
+        prefill("prefill-138k", p[-1], 131000, 145000)
     elif svc == "coder":
         for q in ("Explain in about 250 words how a hash table handles collisions.",
                   "Describe in about 250 words how a compiler turns source code into machine code.",
                   "Explain in about 250 words how TCP congestion control works."):
             gate(len(text(post(q, 300))) > 200, f"an answer to {q[:40]!r}")
-        d = [x for x in slot_lines("decode") if int(x[0]) >= 250]
-        for name, x in zip(("decode-a", "decode-b", "decode-c"), d[-3:]):
-            metric(name, float(x[2]))
+        decodes(("decode-a", "decode-b", "decode-c"))
         a = text(post(needle_prompt(44000, 3.45), 24))
         gate("violet-harbor-42" in a.lower(), f"the needle at 41k ({a.strip()[:40]!r})")
-        metric("prefill-41k", float(slot_lines("prefill")[-1][2]))
+        prefill("prefill-41k", slot_lines("prefill")[-1], 38000, 44000)
     else:
         a = text(post_body(json.load(open(A("needle-20k.json")))))
         gate("orange-falcon-77" in a.lower(), f"the 20k needle ({a.strip()[:40]!r})")
-        metric("prefill-20k", float(slot_lines("prefill")[-1][2]))
+        prefill("prefill-20k", slot_lines("prefill")[-1], 19500, 20500)
         gate(len(text(post("Explain in about 250 words how a hash table handles collisions.", 300))) > 200,
              "the long answer")
-        metric("decode", float([x for x in slot_lines("decode") if int(x[0]) >= 250][-1][2]))
+        decodes(("decode",))
 finally:
     proc.terminate()
     try:

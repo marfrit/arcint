@@ -15,8 +15,8 @@
 
 ## Status
 
-- Version 0.7.12 (2026-10-15); 0.8.0 in progress (the OpenVINO engine and
-  the marfrit-openvino dependency removed, charter A6).
+- Version 0.8.0 (2026-10-15): the OpenVINO engine and the marfrit-openvino
+  dependency removed (charter A6).
 - Production: the agent on the B60 (245,760 ctx, q8_0:q4_0 KV, MTP 5), the
   coder on the A770 (98,304 ctx, q8_0:q4_0 KV, MTP 4), Flash-Next on the
   B60 on demand (IQ2_XS, 131,072 ctx, q8_0 KV, expert cache 13,400 MiB,
@@ -141,7 +141,8 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
   enumeration order (GPU.0 = B60, GPU.1 = A770 on the dev host).
 - --host ADDR (127.0.0.1), --port N (8090), --http-threads N.
 - --served-model-name NAME[,NAME2] with --lane-ctx CA,CB; --parallel N;
-  --n-ctx N (default 32,768); --queue-timeout S.
+  --n-ctx N (default the smaller of 32,768 and the trained context);
+  --queue-timeout S; --prefill-chunk N.
 - Sampler defaults: --temp, --top-p, --top-k, --min-p,
   --repetition-penalty, --presence-penalty,
   --chat-template-kwarg enable_thinking=BOOL.

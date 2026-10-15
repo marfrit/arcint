@@ -165,10 +165,13 @@ gate(len(hits) > 0 and int(hits[-1]) > 1000, f"the warm request reused the lane'
 tripwire(cold_a, warm, "warm against cold, one process")
 
 # checkpoint: the last question edited; the recurrent state cannot be cut back,
-# so the lane resumes from its newest checkpoint inside the shared prefix
+# so the lane resumes from its newest checkpoint inside the shared prefix. The
+# warm request above may already have resumed (its one re-run token is a cut on
+# a hybrid model): gate on a resume by this request, not on any in the log
+resumes_before = log_text().count("resumes from its checkpoint")
 edited, _ = ask(needle(Q2))
 gate(right(edited, WORD), f"the needle is right after an edited question ({edited.strip()[:40]!r})")
-gate("resumes from its checkpoint" in log_text(), "the edited request resumed from a checkpoint")
+gate(log_text().count("resumes from its checkpoint") > resumes_before, "the edited request resumed from a checkpoint")
 
 start("b", [])
 cold_b, _ = ask(needle(Q1))

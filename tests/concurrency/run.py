@@ -26,6 +26,7 @@ The server runs two named lanes. The gates, each able to fail:
 """
 import json
 import os
+import tempfile
 import re
 import shlex
 import socket
@@ -240,11 +241,11 @@ def check_busy_lane_is_a_503(srv):
     busy.join()
     if isinstance(second, tuple) and second[1] == 503:
         ok("a second request for a busy lane is a 503")
-        msg = json.dumps(second[2])
-        if LANES[0] in msg or "lane" in msg:
-            ok(f"the 503 names the lane ({msg[:120]})")
+        sl = second[2].get("slots", {})
+        if sl.get("lane") == LANES[0] and sl.get("free") == 0 and sl.get("total") == 1:
+            ok(f"the 503 carries the lane's numbers ({json.dumps(sl)[:120]})")
         else:
-            fail(f"the 503 names the lane (body {msg[:200]})")
+            fail(f"the 503 carries the lane's numbers (slots {json.dumps(sl)[:200]})")
     else:
         fail(f"a second request for a busy lane is a 503 (got {second if isinstance(second, tuple) else 'an answer'})")
     if right(other, "paris"):
@@ -281,8 +282,7 @@ def main():
         return 2
     binary, model = sys.argv[1], sys.argv[2]
     device = sys.argv[3] if len(sys.argv) > 3 else "GPU.0"
-    work = "/tmp/arcint-concurrency"
-    os.makedirs(work, exist_ok=True)
+    work = tempfile.mkdtemp(prefix="arcint-cc-")   # per run: two cells may run at once on two cards
     print(f"== arcint concurrency suite: {os.path.basename(model)} on {device}", flush=True)
     srv = Server(binary, model, device, f"{work}/main.log")
     try:

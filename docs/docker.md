@@ -70,7 +70,7 @@ The command lines below are the ones the project's own services use;
 `docker/docker-compose.example.yaml` carries all three as compose profiles.
 Paths are placeholders under the read-only `/models` mount.
 
-**The coder** (Qwen3.6-35B-A3B coder GGUF, the A770 or any 16 GB card):
+**The coder** (Qwen3.6-27B-A3B coder GGUF, the A770 or any 16 GB card):
 
 ```bash
 --engine llama --gguf /models/<coder>.gguf --served-model-name qwen3.6-coder \
@@ -103,7 +103,7 @@ a 24 GB card, the rest in host memory):
 ```
 
 Flash-Next needs more from the host than the other two:
-- **pinned host memory:** the expert bank (~22 GiB for IQ2_XS) lives in
+- **pinned host memory:** the expert bank (20.32 GiB for IQ2_XS) lives in
   USM host memory that the driver pins. The host's TTM page limit must
   allow it (`/sys/module/ttm/parameters/pages_limit`; the default is half
   of system RAM, which on a 64 GB host leaves little room beside the bank),
@@ -112,7 +112,7 @@ Flash-Next needs more from the host than the other two:
   are read from the file; with the file on a ZFS pool the record has a
   Flash-Next quant decoding at 4-5 t/s (README, current numbers);
 - **a VRAM margin:** 13,400 MiB of expert slots with `--llama-reserve-cells
-  20480` (0052) peaks at 23.35 GiB of a 24.5 GB card (the earlier 11,300 MiB
+  20480` (0052) peaks at 23,787 MiB of the card's 24,480 (0.7.12) (the earlier 11,300 MiB
   without the reserve peaked at ~24.2 GB). Do not run anything else on that
   card;
 - **CPU threads:** with `LLAMA_EXPERT_CACHE_CPU_MISSES=1` (0056) a
