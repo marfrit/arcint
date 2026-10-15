@@ -476,11 +476,12 @@ check "named lanes: the same prompt fits the agent lane" "$([[ $code == 200 ]] &
 
 # Hold the subagent lane with a slow stream, then ask for it again: a 503
 # for that lane, while the agent lane still serves.
-curl -sN --max-time 8 "${LANES_BASE}/v1/chat/completions" -H 'Content-Type: application/json' \
+curl -sN --max-time 40 "${LANES_BASE}/v1/chat/completions" -H 'Content-Type: application/json' \
   -d '{"model":"sub","messages":[{"role":"user","content":"x"}],"stream":true,"max_tokens":200}' \
   -o /dev/null >/dev/null 2>&1 &
 HOLD_PID=$!
-for _ in $(seq 1 50); do
+# up to 30 s for the held stream to take the lane: a loaded host (a parallel build) took longer than 5 s once
+for _ in $(seq 1 300); do
   curl -sS "${LANES_BASE}/health" -o "${WORK}/lanes-health.json"
   jassert "${WORK}/lanes-health.json" 'd["lanes"][1]["slots_free"]==0' && break
   sleep 0.1
