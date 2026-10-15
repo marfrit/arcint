@@ -2,7 +2,6 @@
 
 #include "core/sampling.h"
 
-#include <array>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
@@ -14,8 +13,6 @@
 
 namespace lgc {
 namespace {
-
-constexpr const char* kDefaultStubModel = "qwen3.6-27b-a3b-coder";
 
 bool parse_int(std::string_view s, int& out) {
     if (s.empty()) return false;
@@ -63,157 +60,67 @@ bool parse_double(std::string_view s, double& out) {
     return true;
 }
 
-// Bit width per --paged-kv value, per docs/design-m8-asymmetric-kv.md §3:
-// the same five element types the plugin's own KV_CACHE_PRECISION
-// validation accepts. This is the
-// single source of truth for both "is this a legal value at all"
-// (is_paged_kv_value, parse_paged_kv) and "does an actual compiled port
-// match what was requested" (kv_precision_bitwidth_matches, the M8 port
-// audit in backend_ov.cpp) -- one table, so the two rules cannot quietly
-// drift onto different alphabets.
-struct PagedKvValue {
-    const char* name;
-    int         bits;
-};
-constexpr std::array<PagedKvValue, 5> kPagedKvValues = {{
-    {"f16", 16},
-    {"u8", 8},
-    {"i8", 8},
-    {"u4", 4},
-    {"i4", 4},
-}};
+}  // namespace
 
-bool paged_kv_bits(std::string_view value, int& bits) {
-    for (const auto& v : kPagedKvValues) {
-        if (value == v.name) {
-            bits = v.bits;
-            return true;
-        }
-    }
+bool is_retired_flag(const std::string& flag) {
+    static const char* const kRetired[] = {
+    "--model",
+    "--model-id",
+    "--quant",
+    "--paged-kv",
+    "--offload-ratio",
+    "--moe-cpu-tier",
+    "--moe-cpu-tier-threads",
+    "--moe-per-expert-dispatch",
+    "--dflash",
+    "--dflash-device",
+    "--dflash-block",
+    "--dflash-select",
+    "--dflash-lambda",
+    "--dflash-topk",
+    "--mtp",
+    "--mtp-layer",
+    "--mtp-device",
+    "--emb-device",
+    "--draft",
+    "--draft-ngram",
+    "--gguf-mode",
+    "--gguf-native",
+    "--gguf-mins",
+    "--gguf-q6k",
+    "--gguf-embed",
+    "--gguf-check",
+    "--ngram-gguf",
+    "--flash-next-ngram",
+    "--prefix-cache-mib",
+    "--prefix-cache-reserve",
+    "--cache-grid",
+    "--cache-host-mib",
+    "--cache-dir",
+    "--fit-margin-mib",
+    "--fit-ledger-dir",
+    "--kv-block-size",
+    "--kv-dtype",
+    "--kv-pool-pages",
+    "--no-paged",
+    "--no-logits-slice",
+    "--custom-kernels",
+    "--pin-dispatch",
+    "--gate-pad",
+    "--dyn-quant",
+    "--vision",
+    "--inspect-artifact",
+    "--flash-next-offload-plan",
+    "--gdn-checkpoint-budget",
+    "--paged-attention-max-partitions"
+    };
+    for (const char* r : kRetired)
+        if (flag == r) return true;
     return false;
 }
 
-bool is_paged_kv_value(std::string_view s) {
-    int bits = 0;
-    return paged_kv_bits(s, bits);
-}
-
-// The one known packed-4-bit shape (on-card finding, 2026-09-02): a 4-bit
-// request stored in an 8-bit-typed port. Int-only so both
-// kv_precision_bitwidth_matches and kv_precision_is_packed_four_bit share
-// one definition of "known packing" rather than two that could drift.
-bool kv_precision_is_packed_four_bit_bits(int requested_bits, int actual_bits) {
-    return requested_bits == 4 && actual_bits == 8;
-}
-
-}  // namespace
-
-bool parse_paged_kv(const std::string& spec, std::string& key, std::string& value) {
-    const size_t colon = spec.find(':');
-    if (colon == std::string::npos) {
-        if (!is_paged_kv_value(spec)) return false;
-        key = value = spec;
-        return true;
-    }
-    // At most one colon: "u8:i4:x" is not a two-sided spec, it is garbage.
-    if (spec.find(':', colon + 1) != std::string::npos) return false;
-    const std::string k = spec.substr(0, colon);
-    const std::string v = spec.substr(colon + 1);
-    if (!is_paged_kv_value(k) || !is_paged_kv_value(v)) return false;
-    key   = k;
-    value = v;
-    return true;
-}
-
-// M8 port audit rule (docs/design-m8-asymmetric-kv.md §4b; red case found
-// on the card 2026-09-02): a plugin is free to store a u8 request as i8 (or
-// a u4 request as i4) -- that is its own signedness choice, not a precision
-// downgrade, and comparing exact element types refused every symmetric u8
-// load over exactly this (the plugin compiled key_cache/value_cache as i8
-// for a u8 request). The actual hazard the audit exists to catch is a side
-// that kept the OLD bitwidth when a DIFFERENT one was requested -- an
-// asymmetric u8:i4 request silently served as u8:u8, say -- so the
-// comparison is BITWIDTH only.
-//
-// Amended (on-card finding, 2026-09-02): this GPU plugin generation stores
-// paged KV in 8-bit-TYPED ports always -- an honest 4-bit-typed port breaks
-// the plugin's own compile, and the working §7.0.3 u4 deployment ran
-// 8-bit-typed ports throughout. A 4-bit precision (u4/i4) is therefore
-// config-side packing that is INVISIBLE at the port level: a 4-bit request
-// landing on an 8-bit port is the expected shape on this plugin generation,
-// not a downgrade, so it passes too (the caller logs it, see backend_ov.cpp).
-//
-// Consequence, stated honestly: for a 4-bit request this audit can no
-// longer catch a silently-unpacked world (an i4 request served as plain u8
-// data in an 8-bit container would look identical to correctly packed i4 at
-// this port-type level). The plugin-side config-level guard (patches/0009
-// v3) covers the asymmetric-corruption case instead, and symmetric packing
-// is verified by measured KV footprint (kv_bytes_token_ / the cost model
-// below), not by this audit.
-//
-// `requested` and `actual` are each one of --paged-kv's five values;
-// anything outside that alphabet counts as a mismatch rather than passing
-// by default.
-bool kv_precision_bitwidth_matches(const std::string& requested, const std::string& actual) {
-    int requested_bits = 0, actual_bits = 0;
-    if (!paged_kv_bits(requested, requested_bits) || !paged_kv_bits(actual, actual_bits)) {
-        return false;
-    }
-    if (requested_bits == actual_bits) return true;
-    return kv_precision_is_packed_four_bit_bits(requested_bits, actual_bits);
-}
-
-// True exactly for the known packed-4-bit shape above: a 4-bit request
-// (u4/i4) landing on this plugin generation's 8-bit-typed port. Split out
-// from kv_precision_bitwidth_matches so the caller can pick the right log
-// message (the "packed 4-bit" wording vs. the generic same-bitwidth-alias
-// wording) without re-deriving the bit widths itself.
-bool kv_precision_is_packed_four_bit(const std::string& requested, const std::string& actual) {
-    int requested_bits = 0, actual_bits = 0;
-    if (!paged_kv_bits(requested, requested_bits) || !paged_kv_bits(actual, actual_bits)) {
-        return false;
-    }
-    return kv_precision_is_packed_four_bit_bits(requested_bits, actual_bits);
-}
-
-// See config.h for the full account of what changed and why (patch 0018,
-// DESIGN §7.0.2ae). The refusal condition itself: refuse exactly when the
-// tier is on, a prefix cache is actually requested, and the plugin does not
-// report a static (history-independent) residency partition -- any other
-// corner has nothing to guard (tier off, or no cache) or is already safe
-// (a static-partition report).
-std::optional<std::string> tier_prefix_cache_decision(bool static_partition_reported, bool tier_on,
-                                                       int prefix_cache_mib) {
-    if (!tier_on || prefix_cache_mib <= 0) return std::nullopt;
-    if (static_partition_reported) return std::nullopt;
-    return "--moe-cpu-tier with --prefix-cache-mib > 0 is refused at load: "
-           "the plugin does not report a static residency partition, so "
-           "expert placement follows the conversation (an ADAPTIVE tier). "
-           "DESIGN §3.4 (amended 2026-10-01) admits the pair at the "
-           "answer-level bar; lifting this refusal is owed. Until then, drop "
-           "--prefix-cache-mib or run without the tier";
-}
-
-bool parse_u64_strict(const std::string& s, uint64_t& out) {
-    if (s.empty()) return false;
-
-    char*                    end = nullptr;
-    errno                        = 0;
-    const unsigned long long v   = std::strtoull(s.c_str(), &end, 10);
-
-    // Full consumption: refuses trailing garbage ("8e9" parses 8 and leaves
-    // "e9" unconsumed) and empty input (end == s.c_str()).
-    if (end != s.c_str() + s.size()) return false;
-    if (errno == ERANGE) return false;
-    // Round-trip: refuses anything that would not print back as itself --
-    // a leading '-' (strtoull wraps it to a huge unsigned value rather than
-    // rejecting it), a leading '+', or leading zeros. This is what actually
-    // catches the '-' case, not a sign check, because strtoull's own
-    // consumption of a leading '-' already satisfies the check above.
-    if (std::to_string(v) != s) return false;
-
-    out = static_cast<uint64_t>(v);
-    return true;
+std::string llama_kv_dtype(const Config& cfg) {
+    return cfg.llama_kv_k == cfg.llama_kv_v ? cfg.llama_kv_k : cfg.llama_kv_k + ":" + cfg.llama_kv_v;
 }
 
 std::string usage_text() {
@@ -221,110 +128,54 @@ std::string usage_text() {
         "usage: arcint [options]\n"
         "\n"
         "model\n"
-        "  --model PATH              OpenVINO IR directory to serve\n"
-        "  --stub                    serve the M0 stub backend (no model, no GPU)\n"
+        "  --gguf FILE               serve this GGUF (the first shard of a split file) on\n"
+        "                            the libllama engine: ggml's OpenCL backend. The\n"
+        "                            tokenizer and the chat template come from the file\n"
+        "  --engine llama            the executor; llama is the only value, kept for the\n"
+        "                            units' sake (a bare --gguf selects it). The OpenVINO\n"
+        "                            engine was retired in 0.8.0: docs/history.md, tag\n"
+        "                            openvino-history\n"
+        "  --stub                    serve the stub backend (no model, no GPU): the whole\n"
+        "                            HTTP surface for the device-free suites\n"
         "  --stub-delay-ms N         stub only: artificial latency per token\n"
-        "  --model-id ID             allowlist entry to assert (default: from the\n"
-        "                            artifact directory name)\n"
-        "  --quant q4|q8             weight format (default: q4)\n"
-        "  --device DEV              OpenVINO device (default: GPU.0); --engine llama:\n"
-        "                            GPU.N or a device name substring (B60), or two\n"
-        "                            cards GPU.0,GPU.1 for --llama-layer-split\n"
-        "  --cache-dir PATH          compiled-blob cache directory\n"
-        "  --vision                  (reserved; refused) v1 is text-only; the vision\n"
-        "                            tower and projector IRs a VLM checkpoint ships are\n"
-        "                            never loaded\n"
+        "  --device DEV              the N-th GPU in OpenCL enumeration (GPU.N, default\n"
+        "                            GPU.0) or a device-name substring (B60); two cards\n"
+        "                            GPU.0,GPU.1 for --llama-layer-split\n"
         "\n"
         "server\n"
         "  --host ADDR               bind address (default: 127.0.0.1)\n"
         "  --port N                  bind port (default: 8090)\n"
-        "  --served-model-name NAME  the name this endpoint reports on\n"
-        "                            /v1/models and /props (default: the\n"
-        "                            artifact's allowlist id). Presentation\n"
-        "                            only: --model-id still decides which\n"
-        "                            artifact is accepted\n"
-        "                            A,B (libllama, with --lane-ctx): named lanes,\n"
-        "                            one per name; the request's model field picks\n"
-        "                            the lane (empty: the first; unknown: 404)\n"
-        "  --lane-ctx CA,CB          libllama: each named lane's context, paired with\n"
+        "  --served-model-name NAME  the name this endpoint reports on /v1/models and\n"
+        "                            /props (default: the GGUF file's name; the stub:\n"
+        "                            stub). There is no allowlist: the file is admitted\n"
+        "                            by its architecture\n"
+        "                            A,B (with --lane-ctx): named lanes, one per name;\n"
+        "                            the request's model field picks the lane (empty:\n"
+        "                            the first; unknown: 404)\n"
+        "  --lane-ctx CA,CB          each named lane's context, paired with\n"
         "                            --served-model-name A,B by index; multiples of\n"
         "                            256, at most 4 lanes. The lanes share one KV pool\n"
         "                            of their sum (llama.cpp's kv_unified); --parallel\n"
         "                            and --n-ctx follow from them\n"
         "  --parallel N              number of lanes (default: 1)\n"
-        "  --queue-timeout S         seconds a request waits for a lane before a\n"
-        "                            503 with the reservation numbers (default: 0)\n"
+        "  --queue-timeout S         seconds a request waits for a lane before a 503\n"
+        "                            with the lane's free count (default: 0, refuse at\n"
+        "                            once)\n"
         "  --http-threads N          HTTP worker threads (default: library default)\n"
-        "  --pin-dispatch N          pin each lane's dispatch thread to N+lane_index\n"
-        "                            (default: -1, off). Linux only. The pin persists on\n"
-        "                            the pooled OS thread, not the request -- it is never\n"
-        "                            undone once set\n"
-        "  --moe-cpu-tier            compute expert FFNs that would evict a device\n"
-        "                            slot on the host CPU instead (needs --offload-ratio;\n"
-        "                            --prefix-cache-mib > 0 is still refused at load\n"
-        "                            unless the plugin reports the static residency\n"
-        "                            partition; DESIGN §3.4 (amended 2026-10-01) admits\n"
-        "                            the pair, and lifting the refusal is owed)\n"
-        "  --moe-cpu-tier-threads N  worker threads for that tier (0 = auto)\n"
-        "  --moe-per-expert-dispatch dispatch routed experts via per-expert GPU\n"
-        "                            kernels (needs --offload-ratio + --moe-cpu-tier)\n"
         "\n"
         "memory\n"
-        "  --n-ctx N                 context length. Omitted: adopts whatever the\n"
-        "                            paged path's auto-fit computes (M7) -- that\n"
-        "                            adoption IS the fit, and it can come out below\n"
-        "                            the model's own maximum. --n-ctx 0 (typed) is\n"
-        "                            NOT the same as omitting the flag: it asks\n"
-        "                            explicitly for the model's own maximum, checked\n"
-        "                            against the fit like any other explicit value --\n"
-        "                            it can refuse where omission would have adopted\n"
-        "                            a smaller number instead\n"
-        "  --kv-block-size 16|32     KV page size in tokens (default: 32)\n"
-        "  --prefill-chunk N         prefill chunk in tokens, 0 = unchunked\n"
-        "                            (default: 2048; bounds activation memory)\n"
-        "  --paged-kv KEY[:VALUE]    KV precision on the paged path (default: u8). KEY and\n"
-        "                            VALUE each one of f16, u8, i8, u4, i4; omitting :VALUE\n"
-        "                            applies KEY to both the key and value cache (\"u8\" and\n"
-        "                            \"f16\" mean exactly what they always did). A colon pair\n"
-        "                            asks for asymmetric precision (M8) and is refused unless\n"
-        "                            the compiled paged model actually carries the requested\n"
-        "                            widths per side.\n"
-        "                            u8 is 11.3 KiB/token against f16's 20.0, which\n"
-        "                            is what makes two lanes at depth fit. It is the\n"
-        "                            default because it is the setting that does not\n"
-        "                            refuse, not because it is faster -- f16 wins on\n"
-        "                            prefill and, past ~50k, on decode too. f16 also\n"
-        "                            costs prefix-cache reserve: the pool is sized in\n"
-        "                            bytes and live pages are a fixed count, so the\n"
-        "                            whole difference lands there\n"
-        "  --cache-grid N            prefix-cache snapshot grid in tokens (default: 0 = the\n"
-        "                            prefill chunk). A snapshot lands on the last multiple of N\n"
-        "                            below the prompt length; a coarser grid re-prefills the\n"
-        "                            remainder on every continuation. DESIGN 7.0.2j.\n"
-        "  --cache-host-mib N        host tier for evicted prefixes: an entry evicted for its\n"
-        "                            KV pages parks them in host RAM instead and comes back\n"
-        "                            over the link on a hit (default: 0, off). DESIGN 4.4.\n"
-        "  --kv-pool-pages N         cap the KV pool at N pages (default: 0, sized by memory).\n"
-        "                            A test knob: the way to make the cache evict on demand.\n"
-        "  --prefix-cache-reserve PCT\n"
-        "                            auto-fit only (--n-ctx omitted): hold back PCT percent of\n"
-        "                            the PER-LANE budget-affordable pages as spare for cached\n"
-        "                            prefixes, so the adopted depth is reduced instead of eating\n"
-        "                            the whole budget (default: 0, off -- today's behaviour, and\n"
-        "                            what the \"0 spare pages\" warning names). PCT applies per\n"
-        "                            lane; the pool actually allocated is lane-wide (--parallel\n"
-        "                            lanes' worth), net of a small per-lane guard-page overhead --\n"
-        "                            the load log names both the per-lane reserve and the pool-\n"
-        "                            wide pages actually held. Integer 0..90; needs\n"
-        "                            --prefix-cache-mib > 0 (nothing to reserve pages for\n"
-        "                            otherwise) and refuses with an explicit --n-ctx -- an\n"
-        "                            explicit depth already defines the reserve as whatever\n"
-        "                            remains after the request.\n"
+        "  --n-ctx N                 context length (default: the model's trained\n"
+        "                            context, at most 32768). There is no auto-fit: the\n"
+        "                            value is configuration, and whether it fits the\n"
+        "                            card is measured at the deepest admitted prompt\n"
+        "                            (DESIGN 3.3)\n"
+        "  --prefill-chunk N         prefill chunk in tokens (llama.cpp's n_batch;\n"
+        "                            default: 2048, 0 the same). Bounds activation\n"
+        "                            memory; chunk boundaries are not bit-exact\n"
         "\n"
-        "serving defaults (the operator layer: request > these > artifact > family card;\n"
+        "serving defaults (the operator layer: request > these > the GGUF's own;\n"
         "any of them flips the served sampler provenance to 'operator')\n"
-        "  --temp X                  default temperature (0 = greedy, which is also what\n"
-        "                            lets the MTP drafter engage)\n"
+        "  --temp X                  default temperature (0 = greedy)\n"
         "  --top-p X                 default nucleus mass\n"
         "  --top-k N                 default top-k (0 disables)\n"
         "  --min-p X                 default min-p: keep p >= X * p_max, before\n"
@@ -336,154 +187,54 @@ std::string usage_text() {
         "                            chat_template_kwargs.enable_thinking nor\n"
         "                            reasoning_effort; only enable_thinking exists\n"
         "\n"
-        "  --gate-pad N              widen the shared-expert gate to N columns (default: 0,\n"
-        "                            off). 16 is the measured setting: -13% prefill wall,\n"
-        "                            -5% decode; pays off below ~500 answer tokens per 12k\n"
-        "                            prompt tokens. See DESIGN 7.0.2g.\n"
-        "  --prefix-cache-mib N      prefix-cache budget in MiB (default: 0, off)\n"
-        "  --fit-margin-mib N        headroom the paged-path auto-fit budget leaves\n"
-        "                            unclaimed (default: 256). The only policy term in\n"
-        "                            the reservation; every other term is measured\n"
-        "  --fit-ledger-dir PATH     persist the admission fit terms (slot pool,\n"
-        "                            activation fit, chunk cap) to skip the load-time\n"
-        "                            probes on subsequent starts (default: off)\n"
-        "  --paged-attention-max-partitions N\n"
-        "                            bound the GPU plugin's mixed-stage paged-attention\n"
-        "                            partition count (default: 0, unbounded). Passed to\n"
-        "                            a patched plugin as PAGED_ATTENTION_MAX_PARTITIONS;\n"
-        "                            ignored, with a log line, on a plugin that does not\n"
-        "                            carry the key (0015)\n"
-        "  --no-logits-slice         compute logits for every prompt token (slower,\n"
-        "                            and runs out of memory past a few thousand)\n"
-        "  --kv-dtype fp16|fp32      stored KV element type (default: fp16;\n"
-        "                            fp32 is what the artifact exports)\n"
-        "  --gdn-checkpoint-budget N GDN checkpoint budget in MiB (default: 512)\n"
-        "  --mtp on|off|auto         speculative decoding (default: auto)\n"
-        "  --draft N                 speculative draft length, 0 = off\n"
-        "  --draft-ngram K           drafter match length (default: 3)\n"
-        "  --custom-kernels FILE     OpenVINO custom-layer XML (hand-written OpenCL)\n"
-        "  --offload-ratio N         % of MoE expert weights to stream, 0 = all resident\n"
-        "  --no-paged                stateful reference path instead of the paged executor\n"
-        "  --emb-device DEV          run the embeddings gather elsewhere (default: --device)\n"
-        "  --mtp-device DEV          run the MTP head elsewhere (default: --device)\n"
-        "  --gguf FILE               serve this GGUF's weights on --model's topology (the\n"
-        "                            served IR of the same architecture is the template);\n"
-        "                            K-quant rows go to the card as stored, decoded in the\n"
-        "                            kernel. Needs --model and a plugin at +p7 or later\n"
-        "  --gguf-mode repack|native|mixed\n"
-        "                            how the file's projections reach the graph (default:\n"
-        "                            mixed, Q4_K repacked and every other type native rows)\n"
-        "  --gguf-native             alias for --gguf-mode native\n"
-        "  --gguf-mins exact|shared|nibble|split\n"
-        "                            the repacked projections' mins packing (default: exact,\n"
-        "                            +12.5% on the Q4_K set; shared +6.25%, nibble +3.1%,\n"
-        "                            both inexact; split: the min term a separate term on\n"
-        "                            the group sums, K the model's, a decode lever)\n"
-        "  --gguf-q6k aligned|file   native Q6_K rows in 224-byte dword-aligned blocks\n"
-        "                            (default: aligned) or the file's own 210-byte rows\n"
-        "  --gguf-embed file|template\n"
-        "                            the token embedding rows from the file, dequantised on\n"
-        "                            the host per token (default), or the template's\n"
-        "  --gguf-check once|always  keep each repacked projection's deviation verdict\n"
-        "                            between loads of the same file (default) or re-check\n"
-        "  --ngram-gguf FILE         the GGUF shard whose per_layer_token_embd.weight binds\n"
-        "                            the IR's ngram_table.K ports (a serving-shape IR that\n"
-        "                            carries the n-gram table as ports). Opened for that\n"
-        "                            tensor only: no template rewrite, no geometry check.\n"
-        "                            Refused with --gguf, and when the IR declares no ports\n"
-        "  --flash-next-ngram PATH   Flash-Next per_layer_token_embd table (24-byte\n"
-        "                            ARCINGRM header + block-quantised payload). The\n"
-        "                            artifact's config.json must declare an n-gram table\n"
-        "                            (ngram_size, ple_embed_dim, ...) or the file is\n"
-        "                            refused. Design: docs/design-qwen-flash-next.md FIX D.\n"
-        "  --dyn-quant on|off        the runtime's per-token int8 activation quantization on\n"
-        "                            compressed weights; default: the runtime's own for an IR,\n"
-        "                            off for a GGUF-opened model (f16 activations reproduce the\n"
-        "                            native path's greedy output byte for byte, at the same rate)\n"
-        "  --dflash DIR              DFlash2 block drafter directory (7 drafts per\n"
-        "                            verify pass; greedy only, like --mtp). One\n"
-        "                            drafter per server: conflicts with --mtp on\n"
-        "                            and --draft N\n"
-        "  --dflash-device DEV       run the drafter elsewhere (default: --device)\n"
-        "  --dflash-block N          override the block size the drafter's config.json\n"
-        "                            declares, N in [2, 32] (default: 0, take the json).\n"
-        "                            Needs --dflash\n"
-        "  --dflash-select MODE      greedy | viterbi: selector strategy over the DFlash\n"
-        "                            lattice (default: greedy, today's behaviour). viterbi\n"
-        "                            finds the exact maximum-score path instead of\n"
-        "                            committing row by row\n"
-        "  --dflash-lambda X         weight on the bilinear codebook term of the selector's\n"
-        "                            score, unary + X*bilinear (default: 1.0). 0 scores on\n"
-        "                            the target lm_head logit alone\n"
-        "  --dflash-topk K           override the selector's top-k the drafter's config.json\n"
-        "                            declares, K in [1, 64] (default: 0, take the json).\n"
-        "                            Needs --dflash\n"
-        "  --mtp-layer WHICH         auto | reconstructed | exported: which MTP layer graph to\n"
-        "                            draft with when the artifact carries both (default: auto,\n"
-        "                            the reconstructed one when present)\n"
-        "\n"
         "misc\n"
         "  -v, -vv                   raise console verbosity\n"
-        "  --flash-next-offload-plan HIT\n"
-        "                            print the Flash-Next expert-offload serving\n"
-        "                            plan for the target card at measured per-layer\n"
-        "                            LRU hit-rate HIT (0..1), then exit (WP7 dry-run)\n"
-        "  --inspect-artifact        with --model PATH, print the artifact contract\n"
-        "                            the runtime drives (geometry, segment chain,\n"
-        "                            expert-body blob, the one buffer set it implies,\n"
-        "                            whether the allowlist admits the directory) and\n"
-        "                            exit. Device-free; the directory needs no entry\n"
-        "                            yet -- reading a contract is what precedes a pin.\n"
         "  --version                 print version and exit\n"
-        "  --engine ov|llama         the executor: OpenVINO (--model IR) or ggml OpenCL via\n"
-        "                            libllama (--gguf); default: libllama for --gguf\n"
-        "                            without --model, else OpenVINO\n"
-        "  --llama-cpu-moe N         libllama: the first N layers' experts stay in host\n"
-        "                            memory, computed by the CPU (experts beyond VRAM)\n"
-        "  --llama-threads N         libllama: CPU threads (default: half the hardware\n"
-        "                            threads)\n"
-        "  --llama-mtp N             libllama: draft up to N tokens a step with the\n"
-        "                            GGUF's MTP head, verified in one pass (0-7; 0 off)\n"
-        "  --llama-mtp-vocab FILE    libllama: the token ids the MTP head may draft\n"
-        "                            (int32, or a JSON list): a draft step reads only\n"
-        "                            those rows of the output head\n"
-        "  --llama-mtp-gguf FILE     libllama: the MTP layer from this MTP-only GGUF\n"
-        "                            (llama.cpp's converter --mtp) instead of the\n"
-        "                            model's own file\n"
-        "  --llama-mtp-min-p P       libllama: stop drafting at a token the MTP head\n"
-        "                            gives less than P, and leave it out of the verify\n"
-        "                            (0-1; 0 off: always --llama-mtp drafts)\n"
-        "  --llama-reserve-cells N   libllama: reserve the compute buffers for a\n"
-        "                            prompt ubatch at N cache cells, not the whole\n"
-        "                            context; deeper prompt chunks take smaller\n"
-        "                            ubatches (0: the whole context)\n"
-        "  --llama-checkpoints N     libllama: per lane, up to N snapshots of a hybrid\n"
-        "                            model's recurrent state (near the prompt's end,\n"
-        "                            at user messages), so a follow-up or an edited\n"
-        "                            message resumes instead of re-prefilling\n"
-        "                            (default 32; 0 off)\n"
-        "  --llama-checkpoint-step T libllama: the least spacing of snapshots at\n"
-        "                            earlier user messages (default 8192)\n"
-        "  --llama-expert-cache MIB  libllama: MIB of expert slots on the card for the\n"
-        "                            MoE layers --llama-cpu-moe keeps in host memory;\n"
-        "                            the other experts in a bank in host memory (pinned)\n"
-        "                            read by the card over the link; hot experts swapped\n"
-        "                            in during decode. The card also holds a Q8_0 down\n"
+        "  -h, --help                print this help and exit\n"
+        "\n"
+        "libllama engine\n"
+        "  --llama-cpu-moe N         the first N layers' experts stay in host memory,\n"
+        "                            computed by the CPU (experts beyond VRAM)\n"
+        "  --llama-threads N         CPU threads (default: half the hardware threads)\n"
+        "  --llama-mtp N             draft up to N tokens a step with the GGUF's MTP\n"
+        "                            head, verified in one pass (0-7; 0 off). Works for\n"
+        "                            sampled requests as well as greedy ones\n"
+        "  --llama-mtp-vocab FILE    the token ids the MTP head may draft (int32, or a\n"
+        "                            JSON list): a draft step reads only those rows of\n"
+        "                            the output head\n"
+        "  --llama-mtp-gguf FILE     the MTP layer from this MTP-only GGUF (llama.cpp's\n"
+        "                            converter --mtp) instead of the model's own file\n"
+        "  --llama-mtp-min-p P       stop drafting at a token the MTP head gives less\n"
+        "                            than P, and leave it out of the verify (0-1; 0 off:\n"
+        "                            always --llama-mtp drafts)\n"
+        "  --llama-reserve-cells N   reserve the compute buffers for a prompt ubatch at N\n"
+        "                            cache cells, not the whole context; deeper prompt\n"
+        "                            chunks take smaller ubatches (0: the whole context)\n"
+        "  --llama-checkpoints N     per lane, up to N snapshots of a hybrid model's\n"
+        "                            recurrent state (near the prompt's end, at user\n"
+        "                            messages), so a follow-up or an edited message\n"
+        "                            resumes instead of re-prefilling (default 32; 0 off)\n"
+        "  --llama-checkpoint-step T the least spacing of snapshots at earlier user\n"
+        "                            messages (default 8192)\n"
+        "  --llama-expert-cache MIB  MIB of expert slots on the card for the MoE layers\n"
+        "                            --llama-cpu-moe keeps in host memory; the other\n"
+        "                            experts in a bank in host memory (pinned) read by\n"
+        "                            the card over the link; hot experts swapped in\n"
+        "                            during decode. The card also holds a Q8_0 down\n"
         "                            projection's bank and a gather mirror beyond MIB\n"
         "                            (default 0, off; contrib/llama.cpp 0021). Two cards:\n"
         "                            A,B, a cache per card for its own layers, in\n"
         "                            --device order (0: none on that card; 0024)\n"
-        "  --llama-layer-split K     libllama, two cards (--device GPU.0,GPU.1): layers\n"
-        "                            [0, K) on the first, the rest, the output head and\n"
-        "                            the MTP layer on the second (contrib/llama.cpp 0023)\n"
-        "  --llama-mtp-card N        libllama, two cards: the card running the\n"
-        "                            --llama-mtp-gguf model (default 0, the first)\n"
-        "  --llama-expert-profile F  libllama: the expert ranking that fills the cache\n"
-        "                            (Strata's STRP profile; default round robin)\n"
-        "  --llama-kv K[:V]          libllama: the attention cache types, f16, q8_0 or\n"
-        "                            q8_0:q4_0 (default f16): q8_0 takes the cache to\n"
-        "                            53 %, q8_0:q4_0 to 41 %\n"
-        "  -h, --help                print this help and exit\n";
+        "  --llama-layer-split K     two cards (--device GPU.0,GPU.1): layers [0, K) on\n"
+        "                            the first, the rest, the output head and the MTP\n"
+        "                            layer on the second (contrib/llama.cpp 0023)\n"
+        "  --llama-mtp-card N        two cards: the card running the --llama-mtp-gguf\n"
+        "                            model (default 0, the first)\n"
+        "  --llama-expert-profile F  the expert ranking that fills the cache (Strata's\n"
+        "                            STRP profile; default round robin)\n"
+        "  --llama-kv K[:V]          the attention cache types, f16, q8_0 or q8_0:q4_0\n"
+        "                            (default f16): q8_0 takes the cache to 53 %,\n"
+        "                            q8_0:q4_0 to 41 %\n";
 }
 
 ArgParse parse_args(int argc, char** argv, Config& cfg) {
@@ -515,13 +266,13 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             cfg.verbosity = 2;
         } else if (arg == "--stub") {
             cfg.stub = true;
-        } else if (arg == "--model") {
-            if (!value(v)) return fail("--model needs a path");
-            cfg.model_path = std::string(v);
         } else if (arg == "--engine") {
-            if (!value(v)) return fail("--engine needs ov or llama");
+            if (!value(v)) return fail("--engine needs llama");
+            if (v == "ov")
+                return fail("--engine ov was retired with the OpenVINO engine in 0.8.0: the last release "
+                            "that has it is the tag openvino-history (see docs/history.md)");
+            if (v != "llama") return fail("--engine takes llama (the only engine)");
             cfg.engine = std::string(v);
-            if (cfg.engine != "ov" && cfg.engine != "llama") return fail("--engine is ov or llama");
         } else if (arg == "--llama-cpu-moe") {
             if (!value(v) || !parse_int(v, cfg.llama_cpu_moe) || cfg.llama_cpu_moe < 0)
                 return fail("--llama-cpu-moe needs a layer count >= 0");
@@ -589,88 +340,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--gguf") {
             if (!value(v)) return fail("--gguf needs a path");
             cfg.gguf_path = std::string(v);
-        } else if (arg == "--ngram-gguf") {
-            if (!value(v)) return fail("--ngram-gguf needs the path of the GGUF shard holding per_layer_token_embd.weight");
-            cfg.ngram_gguf_path = std::string(v);
-        } else if (arg == "--flash-next-ngram") {
-            if (!value(v)) return fail("--flash-next-ngram needs a path to the per_layer_token_embd table");
-            cfg.flash_next_ngram_path = std::string(v);
-        } else if (arg == "--flash-next-offload-plan") {
-            double h = 0.0;
-            if (!value(v) || !parse_double(v, h)) {
-                return fail("--flash-next-offload-plan needs the measured per-layer LRU hit-rate (0..1)");
-            }
-            if (!(h >= 0.0 && h <= 1.0)) {
-                return fail("--flash-next-offload-plan hit-rate must be in [0, 1]");
-            }
-            cfg.flash_next_offload_plan = true;
-            cfg.flash_next_offload_hit = h;
-        } else if (arg == "--inspect-artifact") {
-            cfg.inspect_artifact = true;
-        } else if (arg == "--gguf-native") {
-            cfg.gguf_native = true;
-            cfg.gguf_mode = 1;
-        } else if (arg == "--gguf-mode") {
-            if (!value(v)) return fail("--gguf-mode needs repack, native or mixed");
-            if (v == "repack") cfg.gguf_mode = 0;
-            else if (v == "native") cfg.gguf_mode = 1;
-            else if (v == "mixed") cfg.gguf_mode = 2;
-            else return fail("--gguf-mode needs repack, native or mixed");
-            cfg.gguf_native = cfg.gguf_mode == 1;
-        } else if (arg == "--gguf-mins") {
-            if (!value(v)) return fail("--gguf-mins needs exact, shared, nibble or split");
-            if (v == "exact") cfg.gguf_mins = 0;
-            else if (v == "shared") cfg.gguf_mins = 1;
-            else if (v == "nibble") cfg.gguf_mins = 2;
-            else if (v == "split") cfg.gguf_mins = 3;
-            else return fail("--gguf-mins needs exact, shared, nibble or split");
-        } else if (arg == "--gguf-q6k") {
-            if (!value(v)) return fail("--gguf-q6k needs aligned or file");
-            if (v == "aligned") cfg.gguf_q6k_aligned = true;
-            else if (v == "file") cfg.gguf_q6k_aligned = false;
-            else return fail("--gguf-q6k needs aligned or file");
-        } else if (arg == "--gguf-embed") {
-            if (!value(v)) return fail("--gguf-embed needs file or template");
-            if (v == "file") cfg.gguf_embed_file = true;
-            else if (v == "template") cfg.gguf_embed_file = false;
-            else return fail("--gguf-embed needs file or template");
-        } else if (arg == "--gguf-check") {
-            if (!value(v)) return fail("--gguf-check needs once or always");
-            if (v == "once") cfg.gguf_check_once = true;
-            else if (v == "always") cfg.gguf_check_once = false;
-            else return fail("--gguf-check needs once or always");
-        } else if (arg == "--dyn-quant") {
-            if (!value(v)) return fail("--dyn-quant needs on or off");
-            if (v == "off") cfg.dyn_quant = 2;
-            else if (v == "on") cfg.dyn_quant = 1;
-            else return fail("--dyn-quant takes on or off");
-        } else if (arg == "--model-id") {
-            if (!value(v)) return fail("--model-id needs a value");
-            cfg.model_id = std::string(v);
-        } else if (arg == "--quant") {
-            if (!value(v)) return fail("--quant needs a value");
-            const auto q = quant_parse(v);
-            if (!q) return fail("--quant must be q4 or q8");
-            cfg.quant = *q;
         } else if (arg == "--device") {
             if (!value(v)) return fail("--device needs a value");
             cfg.device = std::string(v);
-        } else if (arg == "--cache-dir") {
-            if (!value(v)) return fail("--cache-dir needs a path");
-            cfg.cache_dir = std::string(v);
-        } else if (arg == "--vision") {
-            // Reserved, not implemented (M13, docs/milestone-0.3.0.md): the
-            // served artifacts are `*ForConditionalGeneration` VLM exports
-            // whose vision tower and projector IRs (openvino_vision_embeddings_model,
-            // _pos_model, _merger_model) sit on disk beside the language model but
-            // are never read by the loader (src/core/artifact.cpp) or compiled by
-            // the backend (src/exec/backend_ov.cpp). Refusing loudly here -- for
-            // both a bare flag and one given a value -- means a mistyped
-            // invocation cannot look multimodal; there is no Config field for it,
-            // because a refusal needs no state that could later be flipped
-            // without a test.
-            return fail("--vision is reserved and refused: v1 is text-only, and the "
-                        "vision IRs are never loaded");
         } else if (arg == "--host") {
             if (!value(v)) return fail("--host needs a value");
             cfg.host = std::string(v);
@@ -693,12 +365,6 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
                 if (!parse_int(it, c)) return fail("--lane-ctx needs a context per named lane (CA,CB in tokens), not '" + it + "'");
                 cfg.lane_ctx.push_back(c);
             }
-        } else if (arg == "--cache-grid") {
-            if (!value(v) || !parse_int(v, cfg.cache_grid)) return fail("--cache-grid needs an integer");
-        } else if (arg == "--cache-host-mib") {
-            if (!value(v) || !parse_int(v, cfg.cache_host_mib)) return fail("--cache-host-mib needs an integer");
-        } else if (arg == "--kv-pool-pages") {
-            if (!value(v) || !parse_int(v, cfg.kv_pool_pages)) return fail("--kv-pool-pages needs an integer");
         } else if (arg == "--temp") {
             double d = 0.0;
             if (!value(v) || !parse_double(v, d)) return fail("--temp needs a number");
@@ -741,11 +407,6 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             } else {
                 return fail("--chat-template-kwarg enable_thinking needs true or false");
             }
-        } else if (arg == "--gate-pad") {
-            if (!value(v) || !parse_int(v, cfg.gate_pad)) return fail("--gate-pad needs an integer");
-        } else if (arg == "--paged-kv") {
-            if (!value(v)) return fail("--paged-kv needs KEY[:VALUE]");
-            cfg.paged_kv = std::string(v);
         } else if (arg == "--served-model-name") {
             // An empty value is refused rather than folded into "not given":
             // `--served-model-name ""` asks for a name, and silently serving the
@@ -777,148 +438,20 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, cfg.prefill_chunk)) {
                 return fail("--prefill-chunk needs an integer");
             }
-        } else if (arg == "--prefix-cache-mib") {
-            if (!value(v) || !parse_int(v, cfg.prefix_cache_mib)) {
-                return fail("--prefix-cache-mib needs an integer");
-            }
-        } else if (arg == "--prefix-cache-reserve") {
-            if (!value(v) || !parse_int(v, cfg.prefix_cache_reserve_pct)) {
-                return fail("--prefix-cache-reserve needs an integer percent");
-            }
-        } else if (arg == "--fit-margin-mib") {
-            if (!value(v) || !parse_int(v, cfg.fit_margin_mib)) {
-                return fail("--fit-margin-mib needs an integer");
-            }
-        } else if (arg == "--fit-ledger-dir") {
-            if (!value(v)) return fail("--fit-ledger-dir needs a path");
-            cfg.fit_ledger_dir = std::string(v);
-        } else if (arg == "--paged-attention-max-partitions") {
-            if (!value(v) || !parse_int(v, cfg.paged_attention_max_partitions)) {
-                return fail("--paged-attention-max-partitions needs an integer");
-            }
-        } else if (arg == "--no-logits-slice") {
-            cfg.slice_logits = false;
-        } else if (arg == "--kv-block-size") {
-            if (!value(v) || !parse_int(v, cfg.kv_block_size)) {
-                return fail("--kv-block-size needs an integer");
-            }
-        } else if (arg == "--kv-dtype") {
-            if (!value(v)) return fail("--kv-dtype needs a value");
-            cfg.kv_dtype = std::string(v);
-        } else if (arg == "--gdn-checkpoint-budget") {
-            if (!value(v) || !parse_int(v, cfg.gdn_checkpoint_budget_mib)) {
-                return fail("--gdn-checkpoint-budget needs an integer");
-            }
-        } else if (arg == "--draft") {
-            if (!value(v) || !parse_int(v, cfg.draft_tokens)) {
-                return fail("--draft needs an integer");
-            }
-        } else if (arg == "--draft-ngram") {
-            if (!value(v) || !parse_int(v, cfg.draft_ngram)) {
-                return fail("--draft-ngram needs an integer");
-            }
-        } else if (arg == "--custom-kernels") {
-            if (!value(v)) return fail("--custom-kernels needs a path");
-            cfg.custom_kernels = std::string(v);
-        } else if (arg == "--no-paged") {
-            cfg.paged = false;
-        } else if (arg == "--emb-device") {
-            if (!value(v)) return fail("--emb-device needs a device");
-            cfg.emb_device = std::string(v);
-        } else if (arg == "--dflash") {
-            if (!value(v)) return fail("--dflash needs a draft-model directory");
-            cfg.dflash = std::string(v);
-        } else if (arg == "--dflash-device") {
-            if (!value(v)) return fail("--dflash-device needs a device");
-            cfg.dflash_device = std::string(v);
-        } else if (arg == "--dflash-block") {
-            if (!value(v) || !parse_int(v, cfg.dflash_block)) {
-                return fail("--dflash-block needs an integer");
-            }
-            cfg.dflash_block_set = true;
-        } else if (arg == "--dflash-select") {
-            if (!value(v)) return fail("--dflash-select needs greedy or viterbi");
-            cfg.dflash_select     = std::string(v);
-            cfg.dflash_select_set = true;
-        } else if (arg == "--dflash-lambda") {
-            double d = 0.0;
-            if (!value(v) || !parse_double(v, d)) return fail("--dflash-lambda needs a number");
-            cfg.dflash_lambda     = static_cast<float>(d);
-            cfg.dflash_lambda_set = true;
-        } else if (arg == "--dflash-topk") {
-            if (!value(v) || !parse_int(v, cfg.dflash_topk)) {
-                return fail("--dflash-topk needs an integer");
-            }
-            cfg.dflash_topk_set = true;
-        } else if (arg == "--mtp-layer") {
-            if (!value(v)) return fail("--mtp-layer needs auto, reconstructed or exported");
-            cfg.mtp_layer = std::string(v);
-        } else if (arg == "--mtp-device") {
-            if (!value(v)) return fail("--mtp-device needs a device");
-            cfg.mtp_device = std::string(v);
-        } else if (arg == "--offload-ratio") {
-            if (!value(v) || !parse_int(v, cfg.offload_ratio)) {
-                return fail("--offload-ratio needs an integer");
-            }
-            cfg.offload_ratio_set = true;
-        } else if (arg == "--mtp") {
-            if (!value(v)) return fail("--mtp needs a value");
-            cfg.mtp = std::string(v);
-        } else if (arg == "--pin-dispatch") {
-            if (!value(v) || !parse_int(v, cfg.pin_dispatch)) {
-                return fail("--pin-dispatch needs an integer");
-            }
-        } else if (arg == "--moe-cpu-tier") {
-            cfg.moe_cpu_tier = true;
-        } else if (arg == "--moe-per-expert-dispatch") {
-            cfg.moe_per_expert_dispatch = true;
-        } else if (arg == "--moe-cpu-tier-threads") {
-            if (!value(v) || !parse_int(v, cfg.moe_cpu_tier_threads)) {
-                return fail("--moe-cpu-tier-threads needs an integer");
-            }
+        } else if (is_retired_flag(std::string(arg))) {
+            return fail(std::string(arg) + " was retired with the OpenVINO engine in 0.8.0 (see docs/history.md)");
         } else {
             return fail(log::format("unknown option '%s' (try --help)",
                                     std::string(arg).c_str()));
         }
     }
 
-    if (cfg.show_help || cfg.show_version || cfg.flash_next_offload_plan) return {};
+    if (cfg.show_help || cfg.show_version) return {};
 
     // ------------------------------------------------------------ validation
-    if (cfg.model_path.empty() && !cfg.stub && !(cfg.engine != "ov" && !cfg.gguf_path.empty())) {
-        return fail("nothing to serve: pass --model PATH, --engine llama --gguf FILE, or --stub for the M0 skeleton");
-    }
-    if (!cfg.model_path.empty() && cfg.stub) {
-        return fail("--model and --stub are mutually exclusive");
-    }
-#ifndef ARCINT_OPENVINO
-    if (!cfg.model_path.empty()) {
-        return fail("this build has no OpenVINO backend (configure with -DARCINT_OPENVINO=ON)");
-    }
-#endif
-
-    // With --model the allowlist entry comes from the artifact's own directory
-    // name, so --model-id is optional there; when it is given it is a claim that
-    // load_artifact checks against what it actually read.
-    if (cfg.model_id.empty() && cfg.stub) cfg.model_id = kDefaultStubModel;
-
-    const ModelEntry* entry = nullptr;
-    if (!cfg.model_id.empty()) {
-        entry = find_model(cfg.model_id);
-        if (entry == nullptr) {
-            std::string known;
-            for (const std::string& id : model_ids()) {
-                if (!known.empty()) known += ", ";
-                known += id;
-            }
-            return fail(log::format("'%s' is not in the allowlist (known: %s)",
-                                    cfg.model_id.c_str(), known.c_str()));
-        }
-        if (!entry->accepts(cfg.quant)) {
-            return fail(log::format("%s does not allow quant %s", cfg.model_id.c_str(),
-                                    quant_name(cfg.quant)));
-        }
-    }
+    if (cfg.stub && !cfg.gguf_path.empty()) return fail("--gguf and --stub are mutually exclusive");
+    if (!cfg.stub && cfg.gguf_path.empty())
+        return fail("nothing to serve: pass --gguf FILE, or --stub for the device-free stub backend");
 
     if (cfg.port < 1 || cfg.port > 65535) return fail("--port must be in [1, 65535]");
     // A served name that is empty or blank would put an unusable id on
@@ -953,121 +486,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.device.empty()) return fail("--device must not be empty");
     if (cfg.stub_delay_ms > 0 && !cfg.stub) return fail("--stub-delay-ms only applies to --stub");
     if (cfg.n_ctx < 0) return fail("--n-ctx must be >= 0");
-    if (cfg.kv_block_size != 16 && cfg.kv_block_size != 32) {
-        return fail("--kv-block-size must be 16 or 32");
-    }
-    if (cfg.kv_dtype == "q8") {
-        // Refused deliberately. Retyping the KV state to i8 is a numeric cast,
-        // not quantisation: there are no scales, so every value rounds to an
-        // integer. It does not crash or produce garbage — it produces a
-        // plausible, quietly worse answer, which is the failure mode this
-        // engine exists to refuse. Real q8 KV needs per-block scales, and the
-        // paged path already gets them from the plugin (DESIGN.md §3.3).
-        return fail("--kv-dtype q8 is not implemented: a plain cast to int8 has no scales and "
-                    "silently degrades the answer. Use fp16, or the paged path once it lands.");
-    }
-    if (cfg.cache_host_mib < 0) return fail("--cache-host-mib must be >= 0");
-    if (cfg.kv_pool_pages < 0) return fail("--kv-pool-pages must be >= 0");
-    if (cfg.cache_grid < 0 || cfg.cache_grid > 65536) {
-        return fail(log::format("--cache-grid must be 0 (the chunk) or 1..65536, not %d", cfg.cache_grid));
-    }
-    if (cfg.gate_pad < 0 || cfg.gate_pad == 1 || cfg.gate_pad > 4096) {
-        return fail(log::format("--gate-pad must be 0 (off) or 2..4096, not %d", cfg.gate_pad));
-    }
-    {
-        std::string pk_key, pk_value;
-        if (!parse_paged_kv(cfg.paged_kv, pk_key, pk_value)) {
-            return fail(log::format(
-                "--paged-kv must be KEY[:VALUE] with each side one of f16, u8, i8, u4, i4, "
-                "not '%s'",
-                cfg.paged_kv.c_str()));
-        }
-    }
-    if (!cfg.dflash.empty() && cfg.mtp == "on") {
-        return fail("--dflash and --mtp on are two drafters for one verify loop; pick one");
-    }
-    if (!cfg.dflash.empty() && cfg.draft_tokens > 0) {
-        return fail("--dflash and --draft are two drafters for one verify loop; pick one");
-    }
-    if (cfg.dflash_block_set && cfg.dflash.empty()) {
-        return fail("--dflash-block needs --dflash: there is no block size to override");
-    }
-    if (cfg.dflash_block_set && (cfg.dflash_block < 2 || cfg.dflash_block > 32)) {
-        return fail(log::format("--dflash-block must be in [2, 32], not %d", cfg.dflash_block));
-    }
-    // Review follow-up: --dflash-select and --dflash-lambda are as
-    // inert without --dflash as --dflash-block/--dflash-topk are, so they
-    // are refused the same way rather than silently accepted and ignored.
-    if (cfg.dflash_select_set && cfg.dflash.empty()) {
-        return fail("--dflash-select needs --dflash: there is no selector to configure");
-    }
-    if (cfg.dflash_select != "greedy" && cfg.dflash_select != "viterbi") {
-        return fail("--dflash-select must be greedy or viterbi");
-    }
-    if (cfg.dflash_lambda_set && cfg.dflash.empty()) {
-        return fail("--dflash-lambda needs --dflash: there is no selector to configure");
-    }
-    // parse_double already refuses nan/inf at the argument-parsing stage
-    // (config.cpp's parse_double calls std::isfinite before this is ever
-    // reached); this check is what catches the one case that survives that
-    // stage: a double that parses as finite but overflows to +-inf on the
-    // narrowing cast to float (e.g. --dflash-lambda 1e39, the review red case).
-    if (!std::isfinite(cfg.dflash_lambda)) {
-        return fail("--dflash-lambda must be a finite number");
-    }
-    if (cfg.dflash_topk_set && cfg.dflash.empty()) {
-        return fail("--dflash-topk needs --dflash: there is no selector to override");
-    }
-    if (cfg.dflash_topk_set && (cfg.dflash_topk < 1 || cfg.dflash_topk > 64)) {
-        return fail(log::format("--dflash-topk must be in [1, 64], not %d", cfg.dflash_topk));
-    }
-    if (cfg.kv_dtype != "fp16" && cfg.kv_dtype != "fp32") {
-        return fail("--kv-dtype must be fp16 or fp32");
-    }
-    if (cfg.offload_ratio < 0 || cfg.offload_ratio > 100) {
-        return fail("--offload-ratio must be a percentage in [0, 100]");
-    }
-    if (cfg.pin_dispatch < -1 || cfg.pin_dispatch > 1023) {
-        return fail("--pin-dispatch must be -1 (off) or a core number in [0, 1023]");
-    }
-    if (cfg.moe_cpu_tier_threads < 0 || cfg.moe_cpu_tier_threads > 1023) {
-        return fail("--moe-cpu-tier-threads must be 0 (auto) or in [1, 1023]");
-    }
-    if (!cfg.moe_cpu_tier && cfg.moe_cpu_tier_threads != 0) {
-        return fail("--moe-cpu-tier-threads needs --moe-cpu-tier: without the tier "
-                    "there is no pool to size");
-    }
-    if (cfg.moe_cpu_tier && cfg.offload_ratio == 0 && !cfg.moe_per_expert_dispatch) {
-        return fail("--moe-cpu-tier needs --offload-ratio > 0 (or an explicit 0 with "
-                    "--moe-per-expert-dispatch, the all-resident native route): with "
-                    "every expert resident and no dispatch there is nothing for the "
-                    "host tier to compute");
-    }
-    if (cfg.moe_per_expert_dispatch && !cfg.moe_cpu_tier && cfg.offload_ratio > 0) {
-        return fail("--moe-per-expert-dispatch needs --moe-cpu-tier while experts are "
-                    "offloaded: non-resident experts fall back to the CPU tier");
-    }
-    if (cfg.moe_per_expert_dispatch && cfg.offload_ratio == 0) {
-        // Ergonomics (operator 2026-09-25). The all-resident native route is
-        // reachable as `--offload-ratio 0 --moe-per-expert-dispatch`; the
-        // plugin's dispatch path hoists the tier's x/routing-weight host
-        // buffers (moe_3gemm_swiglu_opt.cpp:1141), so the tier must be ON
-        // internally even though, with every expert resident, it computes
-        // nothing (measured: cpu_tier_pairs=0). Enable it here rather than
-        // making the operator pass a flag that does no work. Stated, not
-        // silent: backend_ov.cpp logs "MoE host compute tier enabled".
-        cfg.moe_cpu_tier = true;
-    }
-    // The --moe-cpu-tier / --prefix-cache-mib refusal USED to live here
-    // (DESIGN §7.0.2ae's F0). Since plugin patch 0018 the answer depends on
-    // a GPU-plugin property (MOE_CPU_TIER_STATIC_PARTITION) that only exists
-    // once the backend's executor is up, so config parsing can no longer
-    // decide it: this combination now parses, and backend_ov.cpp's load
-    // path (tier_prefix_cache_decision, config.h) makes the call instead.
     if (cfg.prefill_chunk < 0) return fail("--prefill-chunk must be >= 0");
-    // The default follows what was given: a GGUF alone is the libllama
-    // engine's model, an IR directory the OpenVINO executor's.
-    if (cfg.engine.empty()) cfg.engine = (!cfg.gguf_path.empty() && cfg.model_path.empty()) ? "llama" : "ov";
+    // The libllama engine is the only one; a bare --gguf selects it.
+    if (cfg.engine.empty()) cfg.engine = "llama";
     // Named lanes (DESIGN §4.2, amended 2026-10-07): the libllama engine's
     // shared KV pool (docs/campaigns/lanes-agent-subagent.md), and the stub's
     // admission for the device-free suites
@@ -1098,111 +519,45 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         if (cfg.parallel_explicit && cfg.parallel != static_cast<int>(cfg.lane_names.size()))
             return fail(log::format("--parallel %d disagrees with %zu named lanes (the lane count is the number of names)",
                                     cfg.parallel, cfg.lane_names.size()));
-        if (!cfg.stub && cfg.engine != "llama")
-            return fail("--served-model-name A,B --lane-ctx CA,CB: named lanes are the libllama engine's (--engine llama --gguf)");
         cfg.parallel = static_cast<int>(cfg.lane_names.size());
     }
-    if (cfg.engine == "llama") {
-        if (cfg.gguf_path.empty()) return fail("--engine llama serves a GGUF: give --gguf");
-        if (!cfg.llama_mtp_vocab.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-vocab needs --llama-mtp");
-        if (!cfg.llama_mtp_gguf.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-gguf needs --llama-mtp");
-        if (cfg.llama_mtp_min_p > 0.0 && cfg.llama_mtp <= 0) return fail("--llama-mtp-min-p needs --llama-mtp");
-        if (cfg.llama_expert_cache_on() && cfg.llama_cpu_moe <= 0)
-            return fail("--llama-expert-cache caches experts --llama-cpu-moe keeps in host memory: give --llama-cpu-moe");
-        if (!cfg.llama_expert_profile.empty() && !cfg.llama_expert_cache_on())
-            return fail("--llama-expert-profile needs --llama-expert-cache");
-        // --device: one card, or the two of a layer split (no automatic split:
-        // the split point decides each card's VRAM, so it is the operator's)
-        if (!split_list(cfg.device, cfg.llama_devices))
-            return fail("--device GPU.0,GPU.1: a list of cards, none empty");
-        for (size_t i = 0; i < cfg.llama_devices.size(); ++i)
-            for (size_t j = 0; j < i; ++j)
-                if (cfg.llama_devices[i] == cfg.llama_devices[j]) return fail("--device names " + cfg.llama_devices[i] + " twice");
-        if (cfg.llama_devices.size() > 2) return fail("--device takes one card, or two for --llama-layer-split");
-        if (cfg.llama_devices.size() == 2 && cfg.llama_layer_split <= 0)
-            return fail("two cards need --llama-layer-split K (layers [0, K) on the first card; there is no automatic split)");
-        if (cfg.llama_layer_split > 0 && cfg.llama_devices.size() != 2)
-            return fail("--llama-layer-split needs two cards: --device GPU.0,GPU.1");
-        if (cfg.llama_mtp_card >= 0 && (cfg.llama_devices.size() != 2 || cfg.llama_mtp_card >= static_cast<int>(cfg.llama_devices.size())))
-            return fail("--llama-mtp-card N: a card of the layer split (0 or 1)");
-        if (cfg.llama_mtp_card >= 0 && cfg.llama_mtp_gguf.empty())
-            return fail("--llama-mtp-card places the --llama-mtp-gguf model (the GGUF's own MTP layer runs with the last layer)");
-        if (cfg.llama_devices.size() == 2 && cfg.llama_mtp_card < 0) cfg.llama_mtp_card = 0;
-        if (!cfg.llama_expert_cache_mib_dev.empty() && cfg.llama_expert_cache_mib_dev.size() != cfg.llama_devices.size())
-            return fail("--llama-expert-cache takes one size per --device card (A,B in MiB; 0: none on that card)");
-    } else {
-    if (cfg.llama_cpu_moe > 0 || cfg.llama_threads > 0 || cfg.llama_mtp > 0 || !cfg.llama_mtp_vocab.empty() ||
-        !cfg.llama_mtp_gguf.empty() || cfg.llama_mtp_min_p > 0.0 ||
-        cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192 ||
-        cfg.llama_expert_cache_on() || !cfg.llama_expert_profile.empty() || cfg.llama_layer_split > 0 || cfg.llama_mtp_card >= 0 ||
-        cfg.llama_reserve_cells > 0)
-        return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab/-gguf/-min-p, --llama-kv, --llama-checkpoints/-step, "
-                    "--llama-expert-cache/-profile, --llama-layer-split, --llama-mtp-card and --llama-reserve-cells are --engine llama options");
-    if (!cfg.gguf_path.empty() && cfg.model_path.empty()) return fail("--gguf needs --model (the template IR directory)");
-    if (!cfg.gguf_path.empty() && !cfg.paged) return fail("--gguf serves on the paged path only");
+    if (cfg.stub) {
+        if (cfg.llama_cpu_moe > 0 || cfg.llama_threads > 0 || cfg.llama_mtp > 0 || !cfg.llama_mtp_vocab.empty() ||
+            !cfg.llama_mtp_gguf.empty() || cfg.llama_mtp_min_p > 0.0 ||
+            cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192 ||
+            cfg.llama_expert_cache_on() || !cfg.llama_expert_profile.empty() || cfg.llama_layer_split > 0 || cfg.llama_mtp_card >= 0 ||
+            cfg.llama_reserve_cells > 0)
+            return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab/-gguf/-min-p, --llama-kv, --llama-checkpoints/-step, "
+                        "--llama-expert-cache/-profile, --llama-layer-split, --llama-mtp-card and --llama-reserve-cells are options of "
+                        "the libllama engine (--gguf), not of --stub");
+        return {};
     }
-    if (!cfg.ngram_gguf_path.empty() && cfg.model_path.empty()) return fail("--ngram-gguf needs --model (the IR whose ngram_table.K ports it binds)");
-    if (!cfg.ngram_gguf_path.empty() && !cfg.paged) return fail("--ngram-gguf serves on the paged path only (the ports are bound per lane request)");
-    if (!cfg.ngram_gguf_path.empty() && !cfg.gguf_path.empty()) return fail("--ngram-gguf and --gguf both open a GGUF for the ngram_table ports; give one");
-    if (cfg.gguf_native && cfg.gguf_path.empty()) return fail("--gguf-native needs --gguf");
-    if (cfg.gguf_mode != 2 && cfg.gguf_path.empty()) return fail("--gguf-mode needs --gguf");
-
-    // The prefill grid and the cache grid have to be the same grid. A cache hit
-    // is where a warm run starts, and a warm run must present the model the same
-    // chunk boundaries a cold one did, or the two compute different logits for
-    // the same tokens (DESIGN §3.2). That requires every checkpoint position to
-    // be a prefill boundary, so the chunk size must be a whole number of blocks.
-    if (cfg.prefix_cache_mib > 0) {
-        if (cfg.prefill_chunk == 0) {
-            return fail("prefix caching needs a prefill grid to align to: "
-                        "--prefill-chunk 0 (unchunked) cannot guarantee that a warm "
-                        "run matches a cold one");
-        }
-        if (cfg.kv_block_size <= 0 || cfg.prefill_chunk % cfg.kv_block_size != 0) {
-            return fail(log::format(
-                "--prefill-chunk (%d) must be a multiple of --kv-block-size (%d) so that "
-                "cache checkpoints land on prefill boundaries",
-                cfg.prefill_chunk, cfg.kv_block_size));
-        }
-    }
-    if (cfg.draft_tokens < 0) return fail("--draft must be >= 0");
-    if (cfg.draft_ngram < 1) return fail("--draft-ngram must be >= 1");
-    if (cfg.prefix_cache_mib < 0) return fail("--prefix-cache-mib must be >= 0");
-    // M9: --prefix-cache-reserve PCT is an option under auto-fit, not a
-    // standalone knob -- PCT 0 is a no-op indistinguishable from the flag
-    // never having been passed, so only a nonzero PCT is "the flag" for the
-    // three refusals below.
-    if (cfg.prefix_cache_reserve_pct != 0) {
-        if (cfg.prefix_cache_reserve_pct < 0 || cfg.prefix_cache_reserve_pct > 90) {
-            return fail(log::format("--prefix-cache-reserve must be 0..90, not %d",
-                                    cfg.prefix_cache_reserve_pct));
-        }
-        if (cfg.prefix_cache_mib <= 0) {
-            return fail("--prefix-cache-reserve needs --prefix-cache-mib > 0: "
-                        "there is nothing to reserve pages for otherwise");
-        }
-        if (cfg.n_ctx_explicit) {
-            return fail("--prefix-cache-reserve only applies under auto-fit: an explicit "
-                        "--n-ctx already defines the reserve as whatever remains after "
-                        "the request");
-        }
-    }
-    if (cfg.fit_margin_mib < 0) return fail("--fit-margin-mib must be >= 0");
-    if (cfg.paged_attention_max_partitions < 0) {
-        return fail("--paged-attention-max-partitions must be >= 0");
-    }
-    if (cfg.gdn_checkpoint_budget_mib < 0) {
-        return fail("--gdn-checkpoint-budget must be >= 0");
-    }
-    if (cfg.mtp != "on" && cfg.mtp != "off" && cfg.mtp != "auto") {
-        return fail("--mtp must be on, off, or auto");
-    }
-    if (cfg.mtp_layer != "auto" && cfg.mtp_layer != "reconstructed" && cfg.mtp_layer != "exported") {
-        return fail("--mtp-layer must be auto, reconstructed or exported");
-    }
-    if (cfg.mtp == "on" && entry != nullptr && !entry->has_mtp_head) {
-        return fail(log::format("--mtp on: %s ships no MTP head", cfg.model_id.c_str()));
-    }
+    if (!cfg.llama_mtp_vocab.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-vocab needs --llama-mtp");
+    if (!cfg.llama_mtp_gguf.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-gguf needs --llama-mtp");
+    if (cfg.llama_mtp_min_p > 0.0 && cfg.llama_mtp <= 0) return fail("--llama-mtp-min-p needs --llama-mtp");
+    if (cfg.llama_expert_cache_on() && cfg.llama_cpu_moe <= 0)
+        return fail("--llama-expert-cache caches experts --llama-cpu-moe keeps in host memory: give --llama-cpu-moe");
+    if (!cfg.llama_expert_profile.empty() && !cfg.llama_expert_cache_on())
+        return fail("--llama-expert-profile needs --llama-expert-cache");
+    // --device: one card, or the two of a layer split (no automatic split:
+    // the split point decides each card's VRAM, so it is the operator's)
+    if (!split_list(cfg.device, cfg.llama_devices))
+        return fail("--device GPU.0,GPU.1: a list of cards, none empty");
+    for (size_t i = 0; i < cfg.llama_devices.size(); ++i)
+        for (size_t j = 0; j < i; ++j)
+            if (cfg.llama_devices[i] == cfg.llama_devices[j]) return fail("--device names " + cfg.llama_devices[i] + " twice");
+    if (cfg.llama_devices.size() > 2) return fail("--device takes one card, or two for --llama-layer-split");
+    if (cfg.llama_devices.size() == 2 && cfg.llama_layer_split <= 0)
+        return fail("two cards need --llama-layer-split K (layers [0, K) on the first card; there is no automatic split)");
+    if (cfg.llama_layer_split > 0 && cfg.llama_devices.size() != 2)
+        return fail("--llama-layer-split needs two cards: --device GPU.0,GPU.1");
+    if (cfg.llama_mtp_card >= 0 && (cfg.llama_devices.size() != 2 || cfg.llama_mtp_card >= static_cast<int>(cfg.llama_devices.size())))
+        return fail("--llama-mtp-card N: a card of the layer split (0 or 1)");
+    if (cfg.llama_mtp_card >= 0 && cfg.llama_mtp_gguf.empty())
+        return fail("--llama-mtp-card places the --llama-mtp-gguf model (the GGUF's own MTP layer runs with the last layer)");
+    if (cfg.llama_devices.size() == 2 && cfg.llama_mtp_card < 0) cfg.llama_mtp_card = 0;
+    if (!cfg.llama_expert_cache_mib_dev.empty() && cfg.llama_expert_cache_mib_dev.size() != cfg.llama_devices.size())
+        return fail("--llama-expert-cache takes one size per --device card (A,B in MiB; 0: none on that card)");
 
     return {};
 }

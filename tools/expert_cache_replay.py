@@ -22,8 +22,8 @@ against the residency at the step, as the engine counts them. Frames are
 counted, not bytes: the layers' experts are not one size.
 
 Usage: expert_cache_replay.py <trace> [--budget N] [--delay N]   (needs numpy)
-The older tools/expert_lru_replay.py and expert_policy_compare.py replay the
-OpenVINO engine's traces and policies.
+The older replay tools for the retired engine's traces and policies are at the
+tag openvino-history (docs/history.md).
 """
 import struct, argparse
 import numpy as np

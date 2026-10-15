@@ -8,8 +8,8 @@ Two reference formats:
     tell agreement from noise but not to localise a head (four printed
     decimals on values near 1e-4).
 
-Our side is a .npy: a boot-driver cut dump (`forward_1.npy`, rows [T, X]) or
-a `ref_forward_real.py` tap. llama's data is ne0-fastest, so its numpy
+Our side is a .npy of rows [T, X] (any reference forward's tap, e.g. a cut dump
+from the retired engine's boot driver, see docs/history.md). llama's data is ne0-fastest, so its numpy
 shape is (ne3, ne2, ne1, ne0) squeezed; ours is reshaped to that (a [T,
 hc*H] residual becomes [T, hc, H], the same memory order as llama's
 {H, hc, T}).

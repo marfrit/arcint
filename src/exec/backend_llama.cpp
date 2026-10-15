@@ -1,4 +1,4 @@
-// The libllama executor (0.5.3.1459): arcint without OpenVINO. The GGUF is
+// The libllama executor (since 0.5.3). The GGUF is
 // the model; ggml's OpenCL backend runs it on the Arc card (each Arc card is
 // its own OpenCL platform under the NEO driver). arcint keeps the server,
 // the chat template rendering, the sampler, stop handling and the lanes;
@@ -357,8 +357,8 @@ public:
         }
 #endif
 
-        // The models this engine serves, by the GGUF's own architecture; the
-        // allowlist rule (DESIGN §3.1) holds here as on the OpenVINO path.
+        // The models this engine serves, by the GGUF's own architecture (there
+        // is no allowlist, DESIGN §3.1).
         // 'llama' is admitted at one geometry only, the Mistral Small 24B
         // family's: served for creative writing with Mistral Small 3.2's
         // finetune Cydonia 24B (operator, 2026-10-04). Others of the family
@@ -532,7 +532,16 @@ public:
         status_.n_ctx_train = llama_model_n_ctx_train(model_);
         status_.n_layer     = llama_model_n_layer(model_);
         status_.weights_bytes = llama_model_size(model_);
-        status_.kv_precision  = "f16";
+        status_.kv_precision  = llama_kv_dtype(cfg);
+        status_.arch          = arch;
+        {
+            // llama_model_desc is "<arch> <size label> <file type>"; the file
+            // type ("Q4_K - Medium", "IQ2_XS - 2.3125 bpw") is the quant
+            const std::string d_s(desc);
+            const size_t      a = d_s.find(' ');
+            const size_t      b = a == std::string::npos ? a : d_s.find(' ', a + 1);
+            status_.quant       = b == std::string::npos ? std::string() : d_s.substr(b + 1);
+        }
         status_.think_tags_extended = mistral_small_24b_;
         SamplerDefaults d;
         d.temperature        = 0.7f;

@@ -118,7 +118,7 @@ int lane_n_ctx(const Context& ctx, int lane);
 double decode_other_seconds(const GenerationStats& stats);
 
 // Takes a lane for one request, or returns the 503 that says why not — with
-// the reservation arithmetic in it, so "busy" is a number and not a mood.
+// the lane counts in it (slots.total, slots.free), so "busy" is a number and not a mood.
 std::optional<HttpResult> acquire_slot(const Context& ctx, SlotPool::Lease& out);
 // The same for a request resolved to `lane` (resolve_lane; -1: no named
 // lanes). `slot` is the backend sequence to generate on: the lease's index
