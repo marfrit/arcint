@@ -95,7 +95,7 @@ if ! cmake -S "$REPO_ROOT" -B "$BUILD" \
        -DCMAKE_BUILD_TYPE=Debug \
        -DCMAKE_CXX_FLAGS="$SANFLAGS" \
        -DARCINT_TESTS=ON \
-       -DARCINT_OPENVINO=OFF \
+       -DARCINT_LLAMA=OFF \
        -DARCINT_ACCEPTANCE=OFF \
        > "$WORK/configure.log" 2>&1; then
   echo "  FAIL configure"

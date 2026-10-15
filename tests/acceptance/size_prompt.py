@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Build a prompt of a target token count against a running server's own
 tokenizer -- never assumed, always read back from the response's
-usage.prompt_tokens field (docs/design-0.3.1-test-ladder.md, Increment 2:
-tier_reference.sh and depth_ladder.sh both need a prompt sized to a specific
-depth, and a runner "must never claim a token count you did not read back").
+usage.prompt_tokens field (docs/design-0.3.1-test-ladder.md, Increment 2: the
+served cells need a prompt sized to a specific depth, and a runner "must never
+claim a token count you did not read back").
 
 Tiles a committed seed paragraph (tests/acceptance/prompts/*.txt) enough
 times to approximate the target by a characters-per-token heuristic, asks

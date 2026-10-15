@@ -277,45 +277,6 @@ int SlotPool::queue_depth() const {
 }
 
 // ------------------------------------------------------------- admission
-namespace {
-
-// The startup arithmetic, in the shape a client can read. Every term is
-// measured (§7.0.2a); `null` when the backend has no card under it.
-json reservation_json(const Reservation& r) {
-    if (!r.measured) return json(nullptr);
-    auto gib = [](uint64_t b) { return static_cast<double>(b) / static_cast<double>(1ull << 30); };
-    const uint64_t kv_per_lane = r.kv_bytes_per_token * static_cast<uint64_t>(r.n_ctx);
-    // Activations are a single figure for the whole compiled model: the GPU
-    // plugin pools intermediate buffers per model, so a second lane adds none
-    // (measured, DESIGN.md §7.2). Everything else really is per lane.
-    return json{{"lanes", r.lanes},
-                {"n_ctx", r.n_ctx},
-                {"prefill_chunk", r.prefill_chunk},
-                {"device_total_gib", gib(r.device_total_bytes)},
-                {"weights_gib", gib(r.weights_bytes)},
-                {"drafters_gib", gib(r.drafter_bytes)},
-                {"expert_slot_pool_gib", gib(r.expert_slot_bytes)},
-                {"expert_slot_source", r.slot_source},
-                // M7 defect fix: the config/IR-derived figure prices the
-                // HOST (GTT) pool, not device VRAM -- see backend_ov.cpp
-                // Phase B. Informational: NOT part of total_gib below, and
-                // never subtracted from device_total_gib.
-                {"expert_slot_host_gib", gib(r.expert_slot_host_bytes)},
-                {"activation_all_lanes_gib", gib(r.activation_bytes)},
-                {"gdn_slab_per_lane_gib", gib(r.la_slab_bytes)},
-                {"kv_per_lane_gib", gib(kv_per_lane)},
-                {"kv_bytes_per_token", r.kv_bytes_per_token},
-                {"kv_block_tokens", r.kv_block_tokens},
-                {"pool_blocks", r.pool_blocks},
-                {"margin_gib", gib(r.margin_bytes)},
-                {"total_gib", gib(r.weights_bytes + r.drafter_bytes + r.expert_slot_bytes +
-                                  r.margin_bytes + r.activation_bytes +
-                                  static_cast<uint64_t>(r.lanes) *
-                                      (r.la_slab_bytes + kv_per_lane))}};
-}
-
-}  // namespace
-
 std::optional<HttpResult> acquire_slot(const Context& ctx, SlotPool::Lease& out) {
     // under named lanes every request is admitted on its lane's own pool
     if (!ctx.lanes.empty()) throw std::logic_error("acquire_slot without a lane under named lanes");
@@ -323,41 +284,11 @@ std::optional<HttpResult> acquire_slot(const Context& ctx, SlotPool::Lease& out)
     out = ctx.slots->acquire_for(timeout);
     if (out.index() >= 0) return std::nullopt;
 
-    // Not "server busy": the numbers that say why there are exactly this many
-    // lanes. An engine that refuses at startup with its arithmetic (§7.0.2a)
-    // owes the same courtesy at request time.
-    const ModelStatus& st = ctx.backend->status();
-    const Reservation& r  = st.reservation;
-    std::string        why =
+    // Not "server busy": the numbers that say how many lanes there are and
+    // how many are free (the body's slots object carries them).
+    std::string why =
         log::format("all %d lane%s are busy", ctx.slots->total(),
                     ctx.slots->total() == 1 ? "" : "s");
-    if (r.measured) {
-        const double gib = 1.0 / static_cast<double>(1ull << 30);
-        // M7: drafters and the expert slot pool are their own terms now
-        // rather than folded into activations (the pre-M7 under-count,
-        // DESIGN §7.0.2s) -- itemized here too, so a 503 quotes the same
-        // arithmetic the load-time reservation and /props print.
-        why += log::format(
-            "; %d lane%s of n_ctx %d %s what was reserved: weights+graph %.2f + drafters %.2f + "
-            "expert slots %.2f (%s) + activations %.2f + margin %.2f + %d x (GDN rows %.3f + KV "
-            "%.2f) = %.2f GiB of %.2f",
-            r.lanes, r.lanes == 1 ? "" : "s", r.n_ctx, r.lanes == 1 ? "is" : "are",
-            static_cast<double>(r.weights_bytes) * gib,
-            static_cast<double>(r.drafter_bytes) * gib,
-            static_cast<double>(r.expert_slot_bytes) * gib,
-            r.slot_source.empty() ? "off" : r.slot_source.c_str(),
-            static_cast<double>(r.activation_bytes) * gib,
-            static_cast<double>(r.margin_bytes) * gib, r.lanes,
-            static_cast<double>(r.la_slab_bytes) * gib,
-            static_cast<double>(r.kv_bytes_per_token) * static_cast<double>(r.n_ctx) * gib,
-            static_cast<double>(r.weights_bytes + r.drafter_bytes + r.expert_slot_bytes +
-                                r.margin_bytes + r.activation_bytes +
-                                static_cast<uint64_t>(r.lanes) *
-                                    (r.la_slab_bytes +
-                                     r.kv_bytes_per_token * static_cast<uint64_t>(r.n_ctx))) *
-                gib,
-            static_cast<double>(r.device_total_bytes) * gib);
-    }
     why += timeout > 0.0
                ? log::format("; waited %.1f s. Retry, or raise --parallel with the memory to "
                              "back it.", timeout)
@@ -369,8 +300,6 @@ std::optional<HttpResult> acquire_slot(const Context& ctx, SlotPool::Lease& out)
                      {"free", ctx.slots->free()},
                      {"queue_depth", ctx.slots->queue_depth()},
                      {"queue_timeout_s", timeout}};
-    body["reservation"]        = reservation_json(r);
-    body["kv_blocks_free"]     = ctx.backend->free_blocks();
     return HttpResult{503, std::move(body)};
 }
 
@@ -479,24 +408,7 @@ std::optional<HttpResult> acquire_slot(const Context& ctx, int lane, SlotPool::L
                      {"queue_depth", l.pool->queue_depth()},
                      {"queue_timeout_s", timeout}};
     body["lanes"]          = lanes_json(ctx);   // as /health has them
-    body["reservation"]    = reservation_json(ctx.backend->status().reservation);
-    body["kv_blocks_free"] = ctx.backend->free_blocks();
     return HttpResult{503, std::move(body)};
-}
-
-// The prefix cache as the operator sees it: how many prefixes it holds, how
-// many of those are parked on the host, and what it has served. Tokens from
-// cache against tokens looked up is the number DESIGN 7.0.2j had no value for.
-json cache_json(const PrefixCacheStats& c) {
-    return json{{"entries", c.entries},
-                {"tiered_entries", c.tiered_entries},
-                {"host_mib", c.host_bytes / (1024 * 1024)},
-                {"kv_pages_held", c.blocks_held},
-                {"lookups", c.lookups},
-                {"hits", c.hits},
-                {"hit_tokens", c.hit_tokens},
-                {"demotions", c.demotions},
-                {"promotions", c.promotions}};
 }
 
 // ----------------------------------------------------------------- /health
@@ -508,10 +420,7 @@ json health(const Context& ctx) {
                 {"stub", st.stub},
                 {"slots_free", slots_free(ctx)},
                 {"slots_total", slots_total(ctx)},
-                {"queue_depth", queue_depth(ctx)},
-                {"kv_blocks_free", ctx.backend->free_blocks()},
-                {"kv_blocks_total", st.reservation.pool_blocks},
-                {"cache", cache_json(ctx.backend->cache_stats())}};
+                {"queue_depth", queue_depth(ctx)}};
     // named lanes: each lane's own counts (the totals above sum them)
     if (!ctx.lanes.empty()) h["lanes"] = lanes_json(ctx);
     return h;
@@ -531,7 +440,7 @@ json props(const Context& ctx) {
                   {"served_model_name", cfg.served_model_name.empty()
                                             ? json(nullptr)
                                             : json(cfg.served_model_name)},
-                  {"quant", quant_name(st.quant)},
+                  {"quant", st.quant.empty() ? json(nullptr) : json(st.quant)},
                   {"loaded", st.loaded},
                   {"stub", st.stub},
                   {"n_ctx", st.n_ctx}};
@@ -553,70 +462,25 @@ json props(const Context& ctx) {
     model["answers_to"]             = std::move(answers_to);
     model["enforces_model_field"]   = !ctx.lanes.empty();
 
-    // Zero means "not pinned in the allowlist and not reported by the artifact"
-    // — null says that; 0 would be a lie.
+    // Zero means "the backend reports nothing" (the stub): null says that; 0
+    // would be a lie.
     auto maybe_int = [](int v) { return v > 0 ? json(v) : json(nullptr); };
+    auto maybe_str = [](const std::string& v) { return v.empty() ? json(nullptr) : json(v); };
+    model["architecture"]  = maybe_str(st.arch);
+    model["n_ctx_train"]   = maybe_int(st.n_ctx_train);
     model["n_layer"]       = maybe_int(st.n_layer);
-    model["n_gdn_layer"]   = maybe_int(st.n_gdn_layer);
-    model["n_attn_layer"]  = maybe_int(st.n_attn_layer);
-    // QSA (campaign qsa, step 3): whether the served graph actually bound an
-    // indexer, and how many layers carry one. `qsa` is the manifest flag
-    // resolved at load, not a Config default.
-    model["n_qsa_layer"]   = maybe_int(st.n_qsa_layer);
-    model["qsa"]           = st.qsa_enabled;
     model["weights_bytes"] = st.weights_bytes > 0 ? json(st.weights_bytes) : json(nullptr);
-
-    // Keyed by the canonical id on purpose: the served name is presentation and
-    // is not in the registry at all.
-    const ModelEntry* entry = find_model(st.id);
-    if (entry != nullptr) {
-        auto maybe_hash = [](const std::string& h) { return h.empty() ? json(nullptr) : json(h); };
-
-        model["ov_arch"]                 = entry->ov_arch;
-        model["model_type"]              = entry->model_type;
-        model["moe"]                     = entry->moe;
-        model["n_expert"]                = entry->moe ? json(entry->n_expert) : json(nullptr);
-        model["n_embd"]                  = maybe_int(entry->n_embd);
-        model["full_attention_interval"] = maybe_int(entry->full_attention_interval);
-        model["n_ctx_train"]             = maybe_int(entry->n_ctx_train);
-        model["has_mtp_head"]            = entry->has_mtp_head;
-        model["arch_hash"]               = maybe_hash(entry->arch_hash);
-        model["template_hash"]           = maybe_hash(entry->template_hash);
-        model["tokenizer_hash"]          = maybe_hash(entry->tokenizer_hash);
-        // What the Prüfstand says about this artifact (DESIGN.md §3.1: the
-        // calibration lesson is part of the contract, not folklore).
-        model["status"] = entry->status;
-        model["weights_bytes_expected"] =
-            entry->weights_bytes > 0 ? json(entry->weights_bytes) : json(nullptr);
-    }
 
     json p = json{
         {"model", std::move(model)},
         {"chat_template_caps", ctx.backend->template_caps()},
         // What is actually served, not a Config default the load path may
-        // never have read (the M3 defect this replaced: a stub and a paged
-        // u8:i4 agent server reported the identical hardcoded block).
-        // `kv_dtype` and `prefix_cache` come off ModelStatus, which the two load paths in
-        // backend_ov.cpp set from the fact they each resolved (effective_
-        // paged_kv on the paged path, cfg.kv_dtype on the stateful one); the
-        // stub backend leaves st.kv_precision empty on purpose, which is what
-        // lets this print null instead of guessing.
-        {"cache",
-         {{"path", st.stub ? json(nullptr) : json(cfg.paged ? "paged" : "stateful")},
-          {"kv_dtype", st.kv_precision.empty() ? json(nullptr) : json(st.kv_precision)},
-          {"kv_block_tokens", (st.reservation.measured && st.reservation.kv_block_tokens > 0)
-                                  ? json(st.reservation.kv_block_tokens)
-                                  : json(nullptr)},
-          // --kv-block-size is the prefix cache's checkpoint granularity (see
-          // PrefixCache's `block_size` constructor argument, src/core/
-          // prefix_cache.h) and the stateful path's KV block -- NOT the
-          // paged page size, which is kv_block_tokens above and can differ
-          // from it (u8:i4 pages at 16 tokens against a 32-token cache grid).
-          {"kv_block_size", cfg.kv_block_size},
-          {"prefix_cache", st.prefix_cache_enabled},
-          {"prefix_cache_mib", cfg.prefix_cache_mib},
-          {"gdn_checkpoint_budget_mib", cfg.gdn_checkpoint_budget_mib}}},
-        {"mtp", {{"requested", cfg.engine == "llama" ? std::string(cfg.llama_mtp > 0 ? "on" : "off") : cfg.mtp},
+        // never have read. `kv_dtype` comes off ModelStatus, which the llama
+        // backend fills from --llama-kv (config.h's llama_kv_dtype); the stub
+        // leaves it empty on purpose, which is what lets this print null
+        // instead of guessing.
+        {"cache", {{"kv_dtype", st.kv_precision.empty() ? json(nullptr) : json(st.kv_precision)}}},
+        {"mtp", {{"requested", std::string(cfg.llama_mtp > 0 ? "on" : "off")},
                  {"enabled", st.mtp_enabled}}},
         {"sampler_defaults",
          {{"temperature", sd.temperature},
@@ -629,7 +493,6 @@ json props(const Context& ctx) {
         {"slots",
          {{"total", slots_total(ctx)},
           {"queue_timeout_s", cfg.queue_timeout_s}}},
-        {"reservation", reservation_json(st.reservation)},
         {"build",
          {{"version", ARCINT_VERSION},
           {"git", ARCINT_GIT_SHA},
@@ -671,7 +534,7 @@ json models(const Context& ctx) {
                {"owned_by", "arcint"},
                {"n_ctx", maybe_int(n_ctx)},
                {"n_ctx_train", maybe_int(st.n_ctx_train)},
-               {"quant", quant_name(st.quant)},
+               {"quant", st.quant.empty() ? json(nullptr) : json(st.quant)},
                {"lanes", lanes}};
         // The artifact this endpoint actually serves, which --served-model-name
         // may have renamed. Always present, so a rename never hides identity.

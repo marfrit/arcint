@@ -34,7 +34,7 @@ disagrees with the prose is the drift above.
 
 This leg is not automatic and cannot be: only a human knows which line a
 sentence meant. It covers the citations that carry contract weight. The registry is
-empty since the OpenVINO engine left the tree (docs/history.md); its
+empty since the retired engine left the tree (docs/history.md); its
 mechanism is exercised by a self-test. Prose outside it (the CHANGELOG, the design note) does name the
 number, and is dated and revisable in the ordinary way.
 
@@ -88,7 +88,7 @@ _FOREIGN_CITATION_FILES = {
 # on it. Do not add rows mechanically; an anchor nobody checked is decoration
 # with a test around it.
 _ANCHORED = [
-    # Empty since the OpenVINO engine left the tree (docs/history.md): every
+    # Empty since the retired engine left the tree (docs/history.md): every
     # row anchored into a file that went with it. The mechanism stays and is
     # exercised by the self-test below; add a row when prose cites code that a
     # reader would act on.
@@ -195,7 +195,7 @@ def test_every_resolvable_citation_points_at_a_line_that_exists():
             cands = by_name.get(Path(m.group(1)).name, [])
             if not cands:
                 # names a file this repository does not track -- the pinned
-                # transformers reference, an OpenVINO header, a plugin source
+                # transformers reference, a vendor header, a plugin source
                 untracked += 1
                 continue
             if len(cands) > 1:
@@ -212,7 +212,7 @@ def test_every_resolvable_citation_points_at_a_line_that_exists():
     print(f"\n[cite-resolve] {scanned} file:line citations in tracked prose")
     print(f"  {resolved:>4} resolved to a tracked file and range-checked")
     print(f"  {untracked:>4} name a file this repo does not track "
-          f"(the pin, OpenVINO, plugin sources) -- out of reach, not skipped")
+          f"(the pin, vendor headers, plugin sources) -- out of reach, not skipped")
     print(f"  {ambiguous:>4} basename matches several tracked files")
     print(f"  {foreign:>4} in files that cite another repository "
           f"({', '.join(sorted(_FOREIGN_CITATION_FILES))})")

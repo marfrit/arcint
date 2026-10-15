@@ -1,6 +1,5 @@
 #include <algorithm>
 #include <chrono>
-#include <cstdlib>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -12,12 +11,15 @@
 namespace lgc {
 namespace {
 
+// The stub's fixed identity (its plausible trained context is backend.h's
+// kStubNCtxTrain).
+constexpr const char* kStubId = "stub";
+
 // ---------------------------------------------------------------- tokenizer
 //
 // A reversible, deterministic splitter — emphatically not a BPE. Token counts
-// will differ from the real tokenizer, which is exactly why the allowlist ships
-// no context numbers for the stub to pretend against. M1 replaces this with
-// openvino_tokenizers out of the artifact (DESIGN.md §3.7).
+// will differ from the real tokenizer (the llama engine uses the GGUF's own,
+// DESIGN.md §3.7), which is why the stub claims no real context numbers.
 class StubTokenizer final : public Tokenizer {
 public:
     StubTokenizer() {
@@ -87,22 +89,18 @@ private:
 // ------------------------------------------------------------------ backend
 class StubBackend final : public Backend {
 public:
-    StubBackend(const ModelEntry& entry, Quant quant, int n_ctx, int delay_ms,
-                const std::string& served_name, const std::vector<int>& lane_ctx)
+    StubBackend(int n_ctx, int delay_ms, const std::string& served_name,
+                const std::vector<int>& lane_ctx, const SamplerDefaults& sampler)
         : delay_ms_(delay_ms), lane_ctx_(lane_ctx) {
-        status_.id               = entry.id;
-        status_.served_id        = served_name.empty() ? entry.id : served_name;
-        status_.n_ctx_train      = entry.n_ctx_train;
-        status_.quant            = quant;
+        status_.id               = kStubId;
+        status_.served_id        = served_name.empty() ? std::string(kStubId) : served_name;
+        status_.n_ctx_train      = kStubNCtxTrain;
         status_.loaded           = true;
         status_.stub             = true;
         status_.n_ctx            = n_ctx;
-        status_.n_layer          = entry.n_layer;
-        status_.n_gdn_layer      = entry.n_gdn_layer;
-        status_.n_attn_layer     = entry.n_attn_layer;
         status_.mtp_enabled      = false;
         status_.weights_bytes    = 0;
-        status_.sampler_defaults = entry.sampler;
+        status_.sampler_defaults = sampler;
     }
 
     const ModelStatus& status() const override { return status_; }
@@ -186,9 +184,9 @@ private:
 
     std::string synthesise(const GenerationInput& in, int prompt_tokens) const {
         std::string out = log::format(
-            "arcint stub backend \xc2\xb7 no model loaded \xc2\xb7 %s %s\n"
+            "arcint stub backend \xc2\xb7 no model loaded \xc2\xb7 %s (%s)\n"
             "prompt %d tokens, sampler %s. Gr\xc3\xbc\xc3\x9f""e aus der Werkstatt.",
-            status_.served_id.c_str(), quant_name(status_.quant), prompt_tokens,
+            status_.served_id.c_str(), kStubId, prompt_tokens,
             in.sampler.greedy() ? "greedy"
                                 : log::format("temp %.2f", in.sampler.temperature).c_str());
 
@@ -224,32 +222,10 @@ const char* finish_reason_name(FinishReason r) {
     return "stop";
 }
 
-bool profile_cycle_enabled() { return std::getenv("ARCINT_PROFILE_CYCLE") != nullptr; }
-
-bool draft_f32_enabled() { return std::getenv("ARCINT_DRAFT_F32") != nullptr; }
-
-bool draft_rope_f16_enabled() { return std::getenv("ARCINT_DRAFT_ROPE_F16") != nullptr; }
-
-std::string format_profile_cycle_line(size_t past, size_t n, size_t accepted, double propose_ms,
-                                      double propose_embed_ms, double propose_mask_ms,
-                                      double propose_layer_ms, double propose_head_ms,
-                                      double verify_embed_ms, double verify_index_ms,
-                                      double verify_infer_ms, double verify_logits_ms,
-                                      double verify_hidden_ms, double accept_ms, double wait_ms,
-                                      double cycle_ms, int frag) {
-    return log::format(
-        "past %zu n %zu accepted %zu | propose %.2f (embed %.2f mask %.2f layer %.2f "
-        "head %.2f) | verify embed %.2f index %.2f infer %.2f logits %.2f hidden %.2f | "
-        "accept %.2f wait %.2f total %.2f ms | frag %d",
-        past, n, accepted, propose_ms, propose_embed_ms, propose_mask_ms, propose_layer_ms,
-        propose_head_ms, verify_embed_ms, verify_index_ms, verify_infer_ms, verify_logits_ms,
-        verify_hidden_ms, accept_ms, wait_ms, cycle_ms, frag);
-}
-
-std::unique_ptr<Backend> make_stub_backend(const ModelEntry& entry, Quant quant, int n_ctx,
-                                           int delay_ms, const std::string& served_name,
-                                           const std::vector<int>& lane_ctx) {
-    return std::make_unique<StubBackend>(entry, quant, n_ctx, delay_ms, served_name, lane_ctx);
+std::unique_ptr<Backend> make_stub_backend(int n_ctx, int delay_ms, const std::string& served_name,
+                                           const std::vector<int>& lane_ctx,
+                                           const SamplerDefaults& sampler) {
+    return std::make_unique<StubBackend>(n_ctx, delay_ms, served_name, lane_ctx, sampler);
 }
 
 }  // namespace lgc

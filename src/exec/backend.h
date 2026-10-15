@@ -6,13 +6,11 @@
 #include <string_view>
 #include <vector>
 
-#include "core/prefix_cache.h"
 #include <nlohmann/json.hpp>
 #include "core/chat.h"
-#include "core/model_registry.h"
 #include "core/sampling.h"
 
-// The seam between "arcint owns the state" and "OV owns the math"
+// The seam between "arcint owns the serving" and "llama.cpp owns the math"
 // (DESIGN.md §1). Everything above this interface — HTTP, scheduling, stop
 // handling, tool-call parsing, usage accounting — is backend-agnostic and
 // testable on a machine with no GPU in it.
@@ -28,102 +26,42 @@ public:
     virtual int              eos_id() const                       = 0;
 };
 
-// The startup reservation (DESIGN.md §7.0.2a), every term measured rather than
-// assumed. It is carried on the status so that /props can print it and an
-// admission refusal can quote it: a refusal without numbers is the failure mode
-// this engine exists to avoid, and with two lanes the arithmetic is the whole
-// argument for why there are exactly two.
-struct Reservation {
-    bool     measured           = false;
-    uint64_t device_total_bytes = 0;
-    uint64_t weights_bytes      = 0;   // weights + graph, device-resident after compile
-    uint64_t activation_bytes   = 0;   // per lane, at the chunk actually served
-    uint64_t la_slab_bytes      = 0;   // per lane: its GDN checkpoint rows
-    uint64_t kv_bytes_per_token = 0;
-    uint64_t margin_bytes       = 0;
-    uint64_t pool_blocks        = 0;   // the shared KV page pool
-    int      kv_block_tokens    = 0;
-    int      lanes              = 1;
-    int      prefill_chunk      = 0;
-    int      n_ctx              = 0;
-
-    // M7 (the auto-fit design, §2/§4): the terms the pre-M7 budget did not
-    // charge for. `drafter_bytes` is the resident delta from compiling
-    // embeddings/MTP/DFlash after the main model (previously folded into
-    // activation_bytes, attributed to the wrong line).
-    //
-    // The expert slot pool is two ledgers, not one (measured on the card,
-    // see backend_ov.cpp Phase B): `expert_slot_bytes` is the DEVICE (VRAM)
-    // charge -- the OTD LRU working set --offload-ratio > 0 actually keeps
-    // resident, and the only one counted in the device budget below.
-    // `expert_slot_host_bytes` is the HOST (GTT) estimate -- everything the
-    // ratio makes eligible to be paged in -- informational only, never
-    // subtracted from device_total_bytes. Both are zero when offload is
-    // off. `slot_source` says how the DEVICE figure was priced: "forced"
-    // (ARCINT_FIT_SLOT_BYTES), "probe" (the plateau probe under the LRU
-    // partition), "probe-static" (the same probe under patch 0018's static
-    // partition -- it saturates as the pinned set fills on first use
-    // instead of by eviction; the pinned pool's analytic ceiling is logged
-    // beside it as a cross-check, never charged: on the 16 GiB card the
-    // driver keeps most of that pool host-mapped and charging it refused a
-    // configuration the card serves), or "static" (the analytic ceiling,
-    // used only as an upper-bound fallback when the probe threw under the
-    // static partition); empty when offload is off or the probe failed
-    // under LRU with an explicit --n-ctx to fall back on.
-    uint64_t    expert_slot_bytes      = 0;
-    uint64_t    expert_slot_host_bytes = 0;
-    uint64_t    drafter_bytes          = 0;
-    std::string slot_source;
-};
-
 struct ModelStatus {
-    // Two names, and the distinction matters at every boundary. `id` is the
-    // allowlist's canonical name: it is artifact identity, it is what the model
-    // registry is keyed by, and it never moves. `served_id` is what the outside
-    // world is told — the same thing unless --served-model-name says otherwise
+    // Two names. `id` is the served file's own name (the GGUF's file name; the
+    // stub's "stub") and never moves. `served_id` is what the outside world is
+    // told — the same thing unless --served-model-name says otherwise
     // (DESIGN.md §4.2). A roster or proxy that discovers names from /v1/models
     // pins itself to whatever it finds there, so that name has to be settable
-    // without touching which artifact is asserted.
+    // without touching which file is asserted.
     std::string id;
     std::string served_id;
-    Quant       quant        = Quant::Q4;
+    // The weight format the file carries (llama.cpp's file-type name, "Q4_K -
+    // Medium", "IQ2_XS - 2.3125 bpw"); empty when nothing is loaded (the stub),
+    // which /v1/models and /props print as null.
+    std::string quant;
+    // The GGUF's general.architecture ("qwen35", "qwen35moe", ...); empty for
+    // the stub.
+    std::string arch;
     bool        loaded       = false;
     bool        stub         = false;
     int         n_ctx        = 0;   // what this server is running with
-    int         n_ctx_train  = 0;   // what the artifact was trained for
+    int         n_ctx_train  = 0;   // what the model was trained for
     int         n_layer      = 0;
-    int         n_gdn_layer  = 0;
-    int         n_attn_layer = 0;
-    // QSA (campaign qsa, step 3): of `n_attn_layer`, how many are QSA-served
-    // (the manifest's `qsa`), and whether the loader actually bound one. The
-    // raw-key history is state, not KV, which is why /props reports it apart.
-    int         n_qsa_layer  = 0;
-    bool        qsa_enabled  = false;
     bool        mtp_enabled  = false;
     uint64_t    weights_bytes = 0;
 
-    // The KV precision actually served, not the one Config asked for: on the
-    // paged path --paged-kv can be overridden at load by ARCINT_PAGED_KV
-    // (backend_ov.cpp's effective_paged_kv), and cfg.kv_dtype is a different
-    // field entirely -- the STATEFUL path's precision, meaningless on a paged
-    // server. /props (src/api/handlers.cpp) reads this instead of guessing
-    // from cfg. Empty when nothing is loaded (the stub backend), which is
-    // what lets /props print null rather than a default that was never
-    // served.
+    // The KV precision actually served, as --llama-kv set it ("f16", "q8_0",
+    // "q8_0:q4_0"; config.h's llama_kv_dtype): /props reads this instead of
+    // guessing from cfg. Empty when nothing is loaded (the stub backend),
+    // which is what lets /props print null rather than a default that was
+    // never served.
     std::string kv_precision;
-    // Whether a prefix cache is actually serving. Set once, where prefix_
-    // cache_ is constructed (backend_ov.cpp), which already knows the true
-    // answer (cfg.prefix_cache_mib > 0) for both the paged and stateful
-    // paths -- kept here rather than re-derived at /props time so a future
-    // load path that decides differently cannot drift from what /props says.
-    bool prefix_cache_enabled = false;
     // The model may open a think block with "<thinking>" or "[THINK]" as well
     // as "<think>": set by the llama engine for the Mistral Small 24B family
     // (Cydonia 24B, Magistral tunes). The Qwens keep "<think>" alone, so an
     // answer of theirs that merely starts with such text stays content.
     bool think_tags_extended = false;
 
-    Reservation     reservation;
     SamplerDefaults sampler_defaults;
 };
 
@@ -224,57 +162,6 @@ struct GenerationStats {
     }
 };
 
-// M11 step profile (DESIGN §7.0.2aa row, the M11 design note (not in the
-// repository)): one line per drafting cycle on the paged serving path,
-// naming every segment that had no timer before it (propose, verify's
-// index build and infer/logits/hidden split, the accept loop, the
-// turnstile wait). Gated on ARCINT_PROFILE_CYCLE, off by default. Declared
-// here (defined in backend_stub.cpp, which every build links, matching
-// finish_reason_name above) so the gating and formatting are each one
-// definition and each testable without a GPU.
-bool profile_cycle_enabled();
-
-std::string format_profile_cycle_line(size_t past, size_t n, size_t accepted, double propose_ms,
-                                      double propose_embed_ms, double propose_mask_ms,
-                                      double propose_layer_ms, double propose_head_ms,
-                                      double verify_embed_ms, double verify_index_ms,
-                                      double verify_infer_ms, double verify_logits_ms,
-                                      double verify_hidden_ms, double accept_ms, double wait_ms,
-                                      double cycle_ms, int frag);
-
-// M11 §2 (DESIGN §7.0.2ag): ARCINT_DRAFT_F32, the discriminator for the
-// zero-acceptance-at-depth hypothesis -- neither drafter graph (MTP
-// layer/head, DFlash) is compiled with a precision hint, so both run the
-// GPU plugin's default INFERENCE_PRECISION_HINT=f16, and DFlash's own
-// exporter states the problem outright: the residual stream "peaks at
-// ~128k and f16 tops out at 65504" (export_dflash.py), fixed there by a
-// pre-scale fold that export_mtp.py carries no equivalent of. Setting this
-// (presence-armed, env value ignored, same idiom as ARCINT_PROFILE_CYCLE
-// above) makes backend_ov.cpp compile both drafter graphs with
-// ov::hint::inference_precision(f32) instead. No default change: absent,
-// both compiles are exactly what they were before this switch existed.
-// Declared here / defined in backend_stub.cpp for the same reason
-// profile_cycle_enabled is: the env-to-decision mapping is the only part
-// of this switch that is pure enough to unit-test without a card or an
-// OpenVINO build, and it needs to be tested that way regardless of which
-// build compiled backend_ov.cpp.
-bool draft_f32_enabled();
-
-// M11 §2, RoPE follow-up (DESIGN §7.0.2ag): with ARCINT_DRAFT_F32 as the
-// discriminator confirming the f16-overflow hypothesis, this is the
-// production, per-node fix -- src/exec/rope_precision.h's
-// mark_rope_no_fp16_compression walks each drafter graph (MTP layer,
-// DFlash) right after read_model() and marks its rotary subgraph to stay
-// in f32 through the plugin's ConvertPrecision pass, instead of forcing
-// the WHOLE drafter graph to f32 the way ARCINT_DRAFT_F32 does. Applied by
-// DEFAULT (unlike every other switch in this file); ARCINT_DRAFT_ROPE_F16
-// (presence-armed, env value ignored) is the A/B lever that turns it back
-// OFF -- named after the state it restores (RoPE running in the plugin's
-// default f16), not after the fix. Declared here / defined in
-// backend_stub.cpp for the same reason draft_f32_enabled is: testable
-// without a card or an OpenVINO build.
-bool draft_rope_f16_enabled();
-
 class Backend {
 public:
     virtual ~Backend() = default;
@@ -302,36 +189,28 @@ public:
     virtual FinishReason generate(const GenerationInput& in, int slot,
                                   const TokenCallback& on_piece, GenerationStats& stats) = 0;
 
-    // KV pages not currently held by a sequence or by the prefix cache. Live,
-    // so /health can show the pool draining and a refusal can quote it.
-    virtual uint64_t free_blocks() const { return 0; }
-    // The prefix cache's counters, for /health; empty when there is no cache.
-    virtual PrefixCacheStats cache_stats() const { return {}; }
 };
 
-// M0: no OpenVINO, no weights, deterministic synthetic output.
+// The stub's trained context: a plausible stand-in (the larger Qwen3 family's),
+// so n_ctx_train and the context default have something to differ from.
+inline constexpr int kStubNCtxTrain = 262144;
+
+// The stub: no weights, no card, deterministic synthetic output, with a fixed
+// identity (id "stub", `served_name` when given) and a plausible trained
+// context, so the whole HTTP surface runs in the device-free suites.
 // `delay_ms` inserts artificial per-token latency so that cancellation and
 // streaming can be observed; zero for the fastest possible round-trip.
 // `lane_ctx`: named lanes' caps (--lane-ctx), by slot; generation on a lane
 // stops at its cap. Empty: every slot at n_ctx.
-std::unique_ptr<Backend> make_stub_backend(const ModelEntry& entry, Quant quant, int n_ctx,
-                                           int delay_ms = 0,
+std::unique_ptr<Backend> make_stub_backend(int n_ctx, int delay_ms = 0,
                                            const std::string& served_name = {},
-                                           const std::vector<int>& lane_ctx = {});
+                                           const std::vector<int>& lane_ctx = {},
+                                           const SamplerDefaults& sampler = {});
 
 #ifdef ARCINT_LLAMA
-// 0.5.3.1459: the libllama executor (ggml OpenCL), the GGUF in --gguf.
+// The libllama executor (ggml OpenCL), the GGUF in --gguf.
 struct Config;
 std::unique_ptr<Backend> make_llama_backend(const Config& cfg, int n_ctx);
-#endif
-
-#ifdef ARCINT_OPENVINO
-struct Artifact;
-
-// M1: the OpenVINO executor. Throws std::runtime_error with a readable message
-// if the artifact cannot be compiled or validated.
-struct Config;
-std::unique_ptr<Backend> make_ov_backend(const Artifact& artifact, const Config& cfg, int n_ctx);
 #endif
 
 }  // namespace lgc

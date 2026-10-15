@@ -1,5 +1,5 @@
 #include "config.h"
-#include "core/model_registry.h"
+#include "core/sampling.h"
 #include "exec/llama_layer_split.h"
 #include "harness.h"
 
@@ -24,99 +24,37 @@ bool rejected(std::vector<const char*> args) {
 
 }  // namespace
 
-// WP7: --flash-next-offload-plan takes the measured per-layer hit-rate, sets the
-// dry-run flag, and (like --help/--version) does not require something to serve.
-TEST(config_flash_next_offload_plan_parses_hit) {
-    Config cfg;
-    CHECK(run({"--flash-next-offload-plan", "0.944"}, cfg).ok);
-    CHECK(cfg.flash_next_offload_plan);
-    CHECK_NEAR(cfg.flash_next_offload_hit, 0.944, 1e-9);
-    // no --model / --stub needed: the dry-run is device-free
-    CHECK(!cfg.stub);
-}
 
-TEST(config_flash_next_offload_plan_rejects_out_of_range) {
-    CHECK(rejected({"--flash-next-offload-plan", "1.5"}));    // > 1
-    CHECK(rejected({"--flash-next-offload-plan", "-0.1"}));   // < 0
-    CHECK(rejected({"--flash-next-offload-plan"}));           // missing value
-    CHECK(rejected({"--flash-next-offload-plan", "abc"}));    // not a number
-}
 
 TEST(config_stub_defaults) {
     Config cfg;
     CHECK(run({"--stub"}, cfg).ok);
     CHECK(cfg.stub);
-    CHECK_EQ(cfg.model_id, std::string("qwen3.6-27b-a3b-coder"));
     CHECK_EQ(cfg.host, std::string("127.0.0.1"));
     CHECK_EQ(cfg.port, 8090);
     CHECK_EQ(cfg.parallel, 1);
-    CHECK_EQ(cfg.kv_block_size, 32);
-    CHECK_EQ(cfg.kv_dtype, std::string("fp16"));
-    CHECK_EQ(cfg.mtp, std::string("auto"));
+    CHECK_EQ(cfg.engine, std::string("llama"));
+    CHECK(cfg.gguf_path.empty());
+    CHECK_EQ(cfg.prefill_chunk, 2048);
+    CHECK_EQ(cfg.device, std::string("GPU.0"));
 }
 
-// FULL-DEPTH (2026-09-13): --ngram-gguf opens one shard for the ngram_table.K
-// ports of a serving-shape IR. It needs the IR (--model), the paged path (the
-// ports are bound per lane request), and it is exclusive with --gguf, which
-// opens a file of its own for the same binding site.
-TEST(config_ngram_gguf_needs_model_paged_and_no_second_gguf) {
-    CHECK(rejected({"--ngram-gguf", "/shards/x.gguf"}));
-    CHECK(rejected({"--model", "/models/ov/x", "--model-id", "qwen3.8-27b", "--no-paged",
-                    "--ngram-gguf", "/shards/x.gguf"}));
-    CHECK(rejected({"--model", "/models/ov/x", "--model-id", "qwen3.8-27b", "--gguf", "/y.gguf",
-                    "--ngram-gguf", "/shards/x.gguf"}));
-#ifdef ARCINT_OPENVINO
-    Config cfg;
-    CHECK(run({"--model", "/models/ov/x", "--model-id", "qwen3.8-27b", "--ngram-gguf",
-               "/shards/x.gguf"},
-              cfg)
-              .ok);
-    CHECK_EQ(cfg.ngram_gguf_path, std::string("/shards/x.gguf"));
-    CHECK(cfg.gguf_path.empty());
-#endif
-}
 
 TEST(config_needs_something_to_serve) {
     CHECK(rejected({}));
-}
-
-TEST(config_model_and_stub_are_exclusive) {
-    CHECK(rejected({"--stub", "--model", "/models/ov/x"}));
-}
-
-TEST(config_model_needs_an_openvino_build) {
-    // Without the OV backend --model must refuse rather than start something
-    // that cannot run; with it, the same arguments must be accepted. The build
-    // that runs on the card has ARCINT_OPENVINO, and asserting only the first
-    // half made this case fail there for reasons that had nothing to do with it.
-#ifdef ARCINT_OPENVINO
     Config cfg;
-    CHECK(run({"--model", "/models/ov/x", "--model-id", "qwen3.8-27b"}, cfg).ok);
-    CHECK_EQ(cfg.model_path, std::string("/models/ov/x"));
-#else
-    CHECK(rejected({"--model", "/models/ov/x", "--model-id", "qwen3.8-27b"}));
-    CHECK(rejected({"--model", "/models/ov/x"}));
-#endif
+    const ArgParse r = run({"--port", "8090"}, cfg);
+    CHECK(!r.ok);
+    CHECK(r.error.find("--gguf FILE") != std::string::npos);
 }
 
-TEST(config_device_and_cache_dir) {
-    Config cfg;
-    CHECK(run({"--stub", "--device", "GPU.1", "--cache-dir", "/tmp/blobs"}, cfg).ok);
-    CHECK_EQ(cfg.device, std::string("GPU.1"));
-    CHECK_EQ(cfg.cache_dir, std::string("/tmp/blobs"));
-
-    Config def;
-    CHECK(run({"--stub"}, def).ok);
-    CHECK_EQ(def.device, std::string("GPU.0"));
-    CHECK(def.cache_dir.empty());
-    CHECK(rejected({"--stub", "--device"}));
+TEST(config_gguf_and_stub_are_exclusive) {
+    CHECK(rejected({"--stub", "--gguf", "/m/q.gguf"}));
 }
 
-TEST(config_enforces_the_allowlist) {
-    CHECK(rejected({"--stub", "--model-id", "llama-3-8b"}));
-    Config cfg;
-    CHECK(run({"--stub", "--model-id", "qwen3.8-27b"}, cfg).ok);
-}
+
+
+
 
 TEST(config_long_arguments_do_not_dangle) {
     // strtol's out-pointer addresses the buffer it parsed; a temporary
@@ -142,47 +80,20 @@ TEST(config_validates_ranges) {
     CHECK(rejected({"--stub", "--port", "eighty"}));
     CHECK(rejected({"--stub", "--parallel", "0"}));
     CHECK(rejected({"--stub", "--n-ctx", "-1"}));
-    CHECK(rejected({"--stub", "--kv-block-size", "24"}));
-    CHECK(rejected({"--stub", "--kv-dtype", "bf16"}));
-    // q8 is refused on purpose: a plain int8 cast has no scales and degrades
-    // the answer without failing, which is worse than not offering it.
-    CHECK(rejected({"--stub", "--kv-dtype", "q8"}));
-    CHECK(rejected({"--stub", "--mtp", "maybe"}));
-    CHECK(rejected({"--stub", "--quant", "q2"}));
+    CHECK(rejected({"--stub", "--prefill-chunk", "-1"}));
 }
 
 TEST(config_accepts_the_documented_choices) {
-    for (const char* bs : {"16", "32"}) {
+    for (const char* dev : {"GPU.0", "GPU.1", "B60"}) {
         Config cfg;
-        CHECK(run({"--stub", "--kv-block-size", bs}, cfg).ok);
+        CHECK(run({"--stub", "--device", dev}, cfg).ok);
+        CHECK_EQ(cfg.device, std::string(dev));
     }
-    for (const char* dt : {"fp16", "fp32"}) {
-        Config cfg;
-        CHECK(run({"--stub", "--kv-dtype", dt}, cfg).ok);
-    }
-    for (const char* m : {"off", "auto"}) {
-        Config cfg;
-        CHECK(run({"--stub", "--model-id", "qwen3.8-27b", "--mtp", m}, cfg).ok);
-    }
+    Config chunk;
+    CHECK(run({"--stub", "--prefill-chunk", "0"}, chunk).ok);
+    CHECK(rejected({"--stub", "--device", ""}));
 }
 
-TEST(config_mtp_on_requires_an_mtp_head) {
-    // --mtp on must refuse where there is nothing to switch on, rather than
-    // quietly do ordinary decoding while claiming speculation. The dense export
-    // carries a head now, so it is the one model that accepts it.
-    Config cfg;
-    CHECK(run({"--stub", "--model-id", "qwen3.8-27b", "--mtp", "on"}, cfg).ok);
-    for (const std::string& id : model_ids()) {
-        // Every entry that carries a head accepts the switch; every other
-        // entry refuses it. Intel's 3.8 export is the second one with a head.
-        if (find_model(id)->has_mtp_head) {
-            Config c;
-            CHECK(run({"--stub", "--model-id", id.c_str(), "--mtp", "on"}, c).ok);
-            continue;
-        }
-        CHECK(rejected({"--stub", "--model-id", id.c_str(), "--mtp", "on"}));
-    }
-}
 
 TEST(config_stub_delay_is_stub_only_and_non_negative) {
     Config cfg;
@@ -200,7 +111,7 @@ TEST(config_stub_delay_is_stub_only_and_non_negative) {
 TEST(config_rejects_unknown_and_dangling_options) {
     CHECK(rejected({"--stub", "--turbo"}));
     CHECK(rejected({"--stub", "--port"}));
-    CHECK(rejected({"--model-id"}));
+    CHECK(rejected({"--gguf"}));
 }
 
 TEST(config_help_and_version_short_circuit_validation) {
@@ -226,21 +137,6 @@ TEST(config_verbosity_flags) {
 }
 
 
-// The prefill grid and the cache grid must be one grid: a hit is where a warm
-// run starts, and it has to traverse the boundaries a cold run did.
-TEST(config_prefix_cache_requires_an_aligned_prefill_grid) {
-    Config cfg;
-    CHECK(run({"--stub", "--prefix-cache-mib", "512", "--kv-block-size", "32",
-               "--prefill-chunk", "2048"}, cfg).ok);
-    CHECK(rejected({"--stub", "--prefix-cache-mib", "512", "--prefill-chunk", "0"}));
-    CHECK(rejected({"--stub", "--prefix-cache-mib", "512", "--kv-block-size", "48",
-                    "--prefill-chunk", "2048"}));
-    // Without the cache there is nothing to align to, so unchunked stays legal.
-    // A fresh Config: parse_args mutates rather than resets, so reusing the one
-    // above would carry --prefix-cache-mib into this case.
-    Config nocache;
-    CHECK(run({"--stub", "--prefill-chunk", "0"}, nocache).ok);
-}
 
 TEST(config_queue_timeout_is_a_finite_number_of_seconds) {
     Config cfg;
@@ -265,13 +161,10 @@ TEST(config_queue_timeout_is_a_finite_number_of_seconds) {
     CHECK(rejected({"--stub", "--queue-timeout", "abc"}));
 }
 
-TEST(config_served_model_name_is_presentation_only) {
+TEST(config_served_model_name_is_a_nonblank_name) {
     Config cfg;
     CHECK(run({"--stub", "--served-model-name", "qwen3.6-coder"}, cfg).ok);
     CHECK_EQ(cfg.served_model_name, std::string("qwen3.6-coder"));
-    // It does not touch which artifact is asserted: --model-id is still the
-    // allowlist name, and still defaulted for the stub.
-    CHECK_EQ(cfg.model_id, std::string("qwen3.6-27b-a3b-coder"));
 
     Config def;
     CHECK(run({"--stub"}, def).ok);
@@ -282,223 +175,26 @@ TEST(config_served_model_name_is_presentation_only) {
     CHECK(rejected({"--stub", "--served-model-name", ""}));
     CHECK(rejected({"--stub", "--served-model-name", "   "}));
     CHECK(rejected({"--stub", "--served-model-name"}));
-
-    // And it is not a way past the allowlist.
-    CHECK(rejected({"--stub", "--model-id", "qwen3.6-coder",
-                    "--served-model-name", "qwen3.6-coder"}));
 }
 
-TEST(config_paged_kv_is_a_documented_choice) {
-    Config def;
-    CHECK(run({"--stub"}, def).ok);
-    // u8 by default, and the reason is the reservation rather than the
-    // throughput: it is what lets two lanes reach depth and the A770 reach
-    // depth at all (DESIGN §7.0.3). It costs prefill up to 22% at 115k.
-    CHECK_EQ(def.paged_kv, std::string("u8"));
 
-    Config cfg;
-    CHECK(run({"--stub", "--paged-kv", "f16"}, cfg).ok);
-    CHECK_EQ(cfg.paged_kv, std::string("f16"));
 
-    CHECK(rejected({"--stub", "--paged-kv", "q8"}));
-    CHECK(rejected({"--stub", "--paged-kv", "fp16"}));
-    CHECK(rejected({"--stub", "--paged-kv"}));
-}
 
-// M8: --paged-kv KEY[:VALUE], asymmetric precision for the paged path
-// (docs/design-m8-asymmetric-kv.md §3). Red first: before this milestone
-// "u8:i4" was refused by the plain u8/f16 check above -- these cases prove
-// the wider grammar without loosening what a bare value still means.
-TEST(config_paged_kv_accepts_an_asymmetric_pair) {
-    Config cfg;
-    CHECK(run({"--stub", "--paged-kv", "u8:i4"}, cfg).ok);
-    CHECK_EQ(cfg.paged_kv, std::string("u8:i4"));
 
-    // Every documented side value, symmetric and mixed.
-    for (const char* side : {"f16", "u8", "i8", "u4", "i4"}) {
-        Config c;
-        CHECK(run({"--stub", "--paged-kv", side}, c).ok);
-    }
-    Config c2;
-    CHECK(run({"--stub", "--paged-kv", "i8:u4"}, c2).ok);
-}
 
-TEST(config_paged_kv_rejects_a_junk_pair) {
-    CHECK(rejected({"--stub", "--paged-kv", "u8:q8"}));   // right side not in the set
-    CHECK(rejected({"--stub", "--paged-kv", "q8:u8"}));   // left side not in the set
-    CHECK(rejected({"--stub", "--paged-kv", "u8:i4:f16"}));  // more than one colon
-    CHECK(rejected({"--stub", "--paged-kv", "u8:"}));     // empty side
-    CHECK(rejected({"--stub", "--paged-kv", ":i4"}));     // empty side
-}
 
-// parse_paged_kv is the shared parser --paged-kv's validation and
-// backend_ov.cpp's ARCINT_PAGED_KV override both call, so a value's meaning
-// cannot drift between the two call sites (that drift was the u4/i4 bug this
-// milestone found: the env override silently mapped anything unrecognised to
-// u8). Exercised directly here rather than only through argv parsing.
-TEST(parse_paged_kv_single_value_mirrors_to_both_sides) {
-    std::string key, value;
-    CHECK(parse_paged_kv("u8", key, value));
-    CHECK_EQ(key, std::string("u8"));
-    CHECK_EQ(value, std::string("u8"));
 
-    CHECK(parse_paged_kv("f16", key, value));
-    CHECK_EQ(key, std::string("f16"));
-    CHECK_EQ(value, std::string("f16"));
-}
 
-TEST(parse_paged_kv_pair_splits_key_and_value) {
-    std::string key, value;
-    CHECK(parse_paged_kv("u8:i4", key, value));
-    CHECK_EQ(key, std::string("u8"));
-    CHECK_EQ(value, std::string("i4"));
-}
 
-TEST(parse_paged_kv_refuses_garbage) {
-    std::string key, value;
-    // The exact silent-u8 bug this milestone found: an unrecognised value
-    // must be refused, never quietly accepted as u8.
-    CHECK(!parse_paged_kv("garbage", key, value));
-    CHECK(!parse_paged_kv("i4garbage", key, value));
-    CHECK(!parse_paged_kv("", key, value));
-    CHECK(!parse_paged_kv("u8:garbage", key, value));
-    CHECK(!parse_paged_kv("garbage:u8", key, value));
-    CHECK(!parse_paged_kv("u8:i4:u8", key, value));
-}
 
-TEST(parse_paged_kv_accepts_the_full_documented_set) {
-    std::string key, value;
-    for (const char* side : {"f16", "u8", "i8", "u4", "i4"}) {
-        CHECK(parse_paged_kv(side, key, value));
-        CHECK_EQ(key, std::string(side));
-        CHECK_EQ(value, std::string(side));
-    }
-}
 
-// M8 port audit rule, found on the card 2026-09-02: an unpatched plugin
-// compiled a plain --paged-kv u8 request's KV cache ports as i8 -- same 8
-// bits, its own signedness choice -- and an exact-element-type audit refused
-// every symmetric u8 load over exactly that false positive. The audit must
-// compare bitwidth, not exact type: same-bitwidth aliasing (u8<->i8,
-// u4<->i4) passes, a genuinely different bitwidth still refuses.
-TEST(kv_precision_bitwidth_matches_same_width_aliases_pass) {
-    // The exact false positive measured on the card.
-    CHECK(kv_precision_bitwidth_matches("u8", "i8"));
-    CHECK(kv_precision_bitwidth_matches("i8", "u8"));
-    CHECK(kv_precision_bitwidth_matches("u4", "i4"));
-    CHECK(kv_precision_bitwidth_matches("i4", "u4"));
-    // Exact match is of course still fine.
-    CHECK(kv_precision_bitwidth_matches("u8", "u8"));
-    CHECK(kv_precision_bitwidth_matches("f16", "f16"));
-}
 
-// Amended (on-card finding, 2026-09-02, docs/design-m8-asymmetric-kv.md
-// review): this GPU plugin generation stores paged KV in 8-bit-TYPED ports
-// always -- an honest 4-bit-typed port breaks the plugin's own compile, and
-// the working §7.0.3 u4 deployment ran 8-bit-typed ports throughout. A
-// 4-bit request (u4/i4) landing on an 8-bit port is therefore the EXPECTED
-// shape on this plugin generation, not a downgrade. This is the exact red
-// case the review found: before this amendment, (u4 requested, u8 actual)
-// FAILED the audit and broke every legitimate 4-bit request.
-TEST(kv_precision_bitwidth_matches_accepts_four_bit_packed_in_eight_bit_port) {
-    CHECK(kv_precision_bitwidth_matches("u4", "u8"));  // the exact red case
-    CHECK(kv_precision_bitwidth_matches("i4", "i8"));
-    // Sign does not matter either, same as the 8-bit alias case above.
-    CHECK(kv_precision_bitwidth_matches("i4", "u8"));
-    CHECK(kv_precision_bitwidth_matches("u4", "i8"));
-}
 
-TEST(kv_precision_bitwidth_matches_refuses_a_real_width_change) {
-    // The strict rule still applies outside the one known 4-in-8 packing
-    // shape: an 8/16-bit request must still land on a same-width port.
-    CHECK(!kv_precision_bitwidth_matches("u8", "i4"));   // wrong direction: 8 requested, 4 got
-    CHECK(!kv_precision_bitwidth_matches("f16", "u8"));  // must still refuse
-    CHECK(!kv_precision_bitwidth_matches("u8", "f16"));  // must still refuse
-    CHECK(!kv_precision_bitwidth_matches("u4", "f16"));  // 4-bit request, but NOT the 8-bit shape
-    CHECK(!kv_precision_bitwidth_matches("f16", "i4"));
-}
 
-TEST(kv_precision_bitwidth_matches_rejects_unknown_values) {
-    CHECK(!kv_precision_bitwidth_matches("garbage", "u8"));
-    CHECK(!kv_precision_bitwidth_matches("u8", "garbage"));
-    CHECK(!kv_precision_bitwidth_matches("", ""));
-}
 
-// kv_precision_is_packed_four_bit tells the caller (backend_ov.cpp's port
-// audit) which log message to print: this is true ONLY for the specific
-// 4-in-8 packing shape, not for a generic same-bitwidth alias (u8<->i8) or
-// for any other passing/failing combination.
-TEST(kv_precision_is_packed_four_bit_identifies_the_known_shape) {
-    CHECK(kv_precision_is_packed_four_bit("u4", "u8"));
-    CHECK(kv_precision_is_packed_four_bit("i4", "i8"));
-    CHECK(kv_precision_is_packed_four_bit("i4", "u8"));
-    CHECK(kv_precision_is_packed_four_bit("u4", "i8"));
-}
 
-TEST(kv_precision_is_packed_four_bit_false_for_everything_else) {
-    CHECK(!kv_precision_is_packed_four_bit("u8", "u8"));   // exact match, not this shape
-    CHECK(!kv_precision_is_packed_four_bit("u8", "i8"));   // the OTHER alias shape
-    CHECK(!kv_precision_is_packed_four_bit("u4", "u4"));   // an honest 4-bit port, if one existed
-    CHECK(!kv_precision_is_packed_four_bit("u8", "u4"));   // wrong direction
-    CHECK(!kv_precision_is_packed_four_bit("u4", "f16"));  // not 8-bit
-    CHECK(!kv_precision_is_packed_four_bit("garbage", "u8"));
-}
 
-// (review 2026-09-02): ARCINT_MOE_DEVICE_POOL_BYTES used to go into the
-// plugin's AnyMap as a raw string, and the plugin's own stoull() has no
-// full-consumption check -- "8e9" silently became 8 bytes ('e9' unconsumed
-// and ignored), and a leading '-' silently wrapped through strtoull's
-// two's-complement rule to a huge unsigned value. parse_u64_strict is the
-// arcint-side refusal: red case first, since this milestone's whole premise
-// is that a typo must refuse rather than quietly change the request.
-TEST(parse_u64_strict_refuses_scientific_notation) {
-    uint64_t out = 0;
-    // The exact false-negative measured on the card: "8e9" must be refused,
-    // never silently truncated to the "8" strtoull alone would parse.
-    CHECK(!parse_u64_strict("8e9", out));
-}
 
-TEST(parse_u64_strict_accepts_a_plain_decimal) {
-    uint64_t out = 0;
-    CHECK(parse_u64_strict("8589934592", out));  // 8 GiB, in bytes
-    CHECK_EQ(out, 8589934592ull);
-}
-
-TEST(parse_u64_strict_refuses_a_negative_wraparound) {
-    uint64_t out = 0;
-    // strtoull("-1", ...) alone returns ULLONG_MAX with no error -- the
-    // round-trip check is what catches it (ULLONG_MAX prints back as
-    // "18446744073709551615", not "-1").
-    CHECK(!parse_u64_strict("-1", out));
-}
-
-TEST(parse_u64_strict_refuses_trailing_garbage_and_empty) {
-    uint64_t out = 0;
-    CHECK(!parse_u64_strict("123abc", out));
-    CHECK(!parse_u64_strict("", out));
-    // strtoull itself skips leading whitespace (fully consumes " 123"), so
-    // this one is refused by the round-trip check, not the end pointer.
-    CHECK(!parse_u64_strict(" 123", out));
-    CHECK(!parse_u64_strict("+123", out));   // round-trip: "+123" != "123"
-    CHECK(!parse_u64_strict("007", out));    // round-trip: "007" != "7"
-}
-
-TEST(parse_u64_strict_accepts_zero_and_a_large_value) {
-    uint64_t out = 0;
-    CHECK(parse_u64_strict("0", out));
-    CHECK_EQ(out, 0ull);
-    CHECK(parse_u64_strict("18446744073709551615", out));  // UINT64_MAX
-    CHECK_EQ(out, 18446744073709551615ull);
-}
-
-TEST(config_mtp_layer_choice) {
-    for (const char* w : {"auto", "reconstructed", "exported"}) {
-        Config cfg;
-        CHECK(run({"--stub", "--mtp-layer", w}, cfg).ok);
-        CHECK_EQ(cfg.mtp_layer, std::string(w));
-    }
-    CHECK(rejected({"--stub", "--mtp-layer", "intel"}));
-}
 
 TEST(config_operator_sampler_flags) {
     Config cfg;
@@ -546,242 +242,31 @@ TEST(config_chat_template_kwarg_rejects_unknown_keys) {
     CHECK(rejected({"--stub", "--chat-template-kwarg", "enable_thinking"}));
 }
 
-TEST(config_dflash_flags) {
-    Config cfg;
-    CHECK(run({"--stub", "--dflash", "/models/draft", "--dflash-device", "GPU.1"}, cfg).ok);
-    CHECK_EQ(cfg.dflash, std::string("/models/draft"));
-    CHECK_EQ(cfg.dflash_device, std::string("GPU.1"));
-}
 
-TEST(config_one_drafter_per_server) {
-    CHECK(rejected({"--stub", "--dflash", "/d", "--mtp", "on"}));
-    CHECK(rejected({"--stub", "--dflash", "/d", "--draft", "4"}));
-    // mtp auto yields to the requested drafter rather than conflicting
-    Config cfg;
-    CHECK(run({"--stub", "--dflash", "/d"}, cfg).ok);
-}
 
-TEST(config_pin_dispatch_defaults_off) {
-    Config cfg;
-    CHECK(run({"--stub"}, cfg).ok);
-    CHECK_EQ(cfg.pin_dispatch, -1);
-}
 
-TEST(config_pin_dispatch_accepts_a_core) {
-    Config cfg;
-    CHECK(run({"--stub", "--pin-dispatch", "0"}, cfg).ok);
-    CHECK_EQ(cfg.pin_dispatch, 0);
 
-    Config cfg2;
-    CHECK(run({"--stub", "--pin-dispatch", "7"}, cfg2).ok);
-    CHECK_EQ(cfg2.pin_dispatch, 7);
-}
 
-TEST(config_pin_dispatch_rejects_garbage) {
-    CHECK(rejected({"--stub", "--pin-dispatch", "-2"}));
-    CHECK(rejected({"--stub", "--pin-dispatch", "1024"}));
-    CHECK(rejected({"--stub", "--pin-dispatch", "not-a-core"}));
-}
 
-TEST(config_moe_cpu_tier_defaults_off) {
-    Config cfg;
-    CHECK(run({"--stub"}, cfg).ok);
-    CHECK(!cfg.moe_cpu_tier);
-    CHECK_EQ(cfg.moe_cpu_tier_threads, 0);
-}
 
-TEST(config_moe_cpu_tier_accepts_with_offload_ratio) {
-    Config cfg;
-    CHECK(run({"--stub", "--offload-ratio", "20", "--moe-cpu-tier"}, cfg).ok);
-    CHECK(cfg.moe_cpu_tier);
 
-    Config cfg2;
-    CHECK(run({"--stub", "--offload-ratio", "20", "--moe-cpu-tier",
-               "--moe-cpu-tier-threads", "7"}, cfg2).ok);
-    CHECK_EQ(cfg2.moe_cpu_tier_threads, 7);
-}
 
-TEST(config_moe_cpu_tier_needs_offload_ratio) {
-    CHECK(rejected({"--stub", "--moe-cpu-tier"}));
-}
 
-TEST(config_offload_ratio_zero_is_distinguishable_from_unset) {
-    // plugin patch 0051: an explicit 0 is the all-resident native pool, and it
-    // must be distinguishable from "offload off".
-    Config cfg;
-    CHECK(run({"--stub"}, cfg).ok);
-    CHECK(!cfg.offload_ratio_set);
-    CHECK_EQ(cfg.offload_ratio, 0);
 
-    Config cfg2;
-    CHECK(run({"--stub", "--offload-ratio", "0"}, cfg2).ok);
-    CHECK(cfg2.offload_ratio_set);
-    CHECK_EQ(cfg2.offload_ratio, 0);
-}
 
-TEST(config_all_resident_native_dispatch_is_accepted) {
-    // The all-resident native route: an explicit 0 plus per-expert dispatch,
-    // with or without the tier.
-    Config cfg;
-    CHECK(run({"--stub", "--offload-ratio", "0", "--moe-per-expert-dispatch"}, cfg).ok);
-    CHECK(cfg.offload_ratio_set);
-    CHECK(cfg.moe_per_expert_dispatch);
-    // Ergonomics: the dispatch form auto-enables the tier (the plugin hoists
-    // the tier's host buffers at moe_3gemm_swiglu_opt.cpp:1141 even when no
-    // expert misses), so the operator does not pass an otherwise no-op flag.
-    // Red-first: removing the auto-enable fails this line.
-    CHECK(cfg.moe_cpu_tier);
 
-    Config cfg2;
-    CHECK(run({"--stub", "--offload-ratio", "0", "--moe-cpu-tier",
-               "--moe-per-expert-dispatch"}, cfg2).ok);
-    CHECK(cfg2.moe_cpu_tier);
-}
 
-TEST(config_dispatch_still_needs_tier_while_offloaded) {
-    // The guard protects a real fallback: while experts are offloaded, a
-    // dispatched miss needs the tier.
-    CHECK(rejected({"--stub", "--offload-ratio", "20", "--moe-per-expert-dispatch"}));
-    // ratio 0, tier, no dispatch: still nothing for the tier to compute.
-    CHECK(rejected({"--stub", "--moe-cpu-tier"}));
-}
 
-TEST(config_offload_active_covers_the_all_resident_native_case) {
-    // Red-first for the swallowed-property defect: reverting backend_ov.cpp to
-    // `ratio > 0` (or dropping the explicit-0 plumbing) makes the
-    // explicit-0-native case below fail.
-    CHECK(!moe_offload_active(0, false, "native"));  // unset -> no offload
-    CHECK( moe_offload_active(0, true,  "native"));  // explicit 0 + native -> all-resident pool
-    CHECK(!moe_offload_active(0, true,  "u4"));      // affine explicit 0 -> unchanged path
-    CHECK( moe_offload_active(50, false, ""));       // ratio > 0 -> offload
-    CHECK(!moe_offload_active(0, true,  ""));        // no declared format -> no offload
-}
 
-TEST(config_moe_cpu_tier_threads_needs_tier) {
-    // A thread count without the tier would be accepted and silently ignored
-    // (found in review); refuse it so a mistyped invocation cannot look tuned.
-    CHECK(rejected({"--stub", "--offload-ratio", "20", "--moe-cpu-tier-threads", "7"}));
-}
 
-TEST(config_moe_cpu_tier_rejects_garbage) {
-    CHECK(rejected({"--stub", "--offload-ratio", "20", "--moe-cpu-tier",
-                    "--moe-cpu-tier-threads", "-1"}));
-    CHECK(rejected({"--stub", "--offload-ratio", "20", "--moe-cpu-tier",
-                    "--moe-cpu-tier-threads", "lots"}));
-}
 
-// M9 note (not in the repository): with the CPU tier on, greedy output
-// depends on the process's request history -- the expert LRU residency
-// selects device f16 vs host f32 arithmetic, and the two are not bit-equal --
-// so a continuation restored from the prefix cache is not byte-identical to
-// a cold run. That USED to be a config-parse-time refusal (DESIGN §3.4,
-// §7.0.2ae's F0). Since plugin patch 0018 the answer depends on a
-// GPU-plugin property (MOE_CPU_TIER_STATIC_PARTITION) that only exists once
-// the backend's executor is up: config parsing cannot query it, so it now
-// accepts the combination unconditionally, and backend_ov.cpp's load path
-// (tier_prefix_cache_decision, tested below) makes the call instead. (F1, a
-// bit-equal host kernel, was retired by review -- see the design note this
-// repository's DESIGN.md §7.0.2ae records; 0018 ships as F2, a static
-// residency partition, instead.)
-TEST(config_moe_cpu_tier_accepts_prefix_cache_at_parse) {
-    Config cfg;
-    CHECK(run({"--stub", "--offload-ratio", "20", "--moe-cpu-tier",
-               "--prefix-cache-mib", "512"}, cfg).ok);
-    CHECK(cfg.moe_cpu_tier);
-    CHECK_EQ(cfg.prefix_cache_mib, 512);
-}
 
-TEST(config_moe_cpu_tier_accepts_prefix_cache_at_zero) {
-    Config cfg;
-    CHECK(run({"--stub", "--offload-ratio", "20", "--moe-cpu-tier",
-               "--prefix-cache-mib", "0"}, cfg).ok);
-    CHECK(cfg.moe_cpu_tier);
-    CHECK_EQ(cfg.prefix_cache_mib, 0);
-}
 
-// tier_prefix_cache_decision's own four corners (DESIGN §7.0.2ae, plugin
-// patch 0018): this is the pure function backend_ov.cpp's load path now
-// calls where config.cpp's old refusal used to sit. It refuses exactly one
-// corner -- the tier on, a prefix cache actually requested, and the plugin
-// NOT reporting a static (history-independent) residency partition -- and
-// allows every other corner, including a false static-partition report when
-// there is nothing to guard (tier off, or no cache requested).
-TEST(tier_prefix_cache_decision_tier_off_allows_regardless_of_static_partition) {
-    CHECK(!tier_prefix_cache_decision(/*static_partition_reported=*/false, /*tier_on=*/false,
-                                       /*prefix_cache_mib=*/512)
-               .has_value());
-}
 
-TEST(tier_prefix_cache_decision_no_cache_allows_regardless_of_static_partition) {
-    CHECK(!tier_prefix_cache_decision(/*static_partition_reported=*/false, /*tier_on=*/true,
-                                       /*prefix_cache_mib=*/0)
-               .has_value());
-}
 
-TEST(tier_prefix_cache_decision_tier_and_cache_without_static_partition_refuses) {
-    const auto reason =
-        tier_prefix_cache_decision(/*static_partition_reported=*/false, /*tier_on=*/true,
-                                    /*prefix_cache_mib=*/512);
-    CHECK(reason.has_value());
-    CHECK(reason->find("§3.4") != std::string::npos);
-    CHECK(reason->find("static residency partition") != std::string::npos);
-}
 
-TEST(tier_prefix_cache_decision_tier_and_cache_with_static_partition_allows) {
-    CHECK(!tier_prefix_cache_decision(/*static_partition_reported=*/true, /*tier_on=*/true,
-                                       /*prefix_cache_mib=*/512)
-               .has_value());
-}
 
-TEST(config_fit_margin_mib_defaults_256) {
-    Config cfg;
-    CHECK(run({"--stub"}, cfg).ok);
-    CHECK_EQ(cfg.fit_margin_mib, 256);
-}
 
-TEST(config_fit_margin_mib_accepts_a_value) {
-    Config cfg;
-    CHECK(run({"--stub", "--fit-margin-mib", "512"}, cfg).ok);
-    CHECK_EQ(cfg.fit_margin_mib, 512);
-
-    Config cfg2;
-    CHECK(run({"--stub", "--fit-margin-mib", "0"}, cfg2).ok);
-    CHECK_EQ(cfg2.fit_margin_mib, 0);
-}
-
-TEST(config_fit_margin_mib_rejects_garbage) {
-    CHECK(rejected({"--stub", "--fit-margin-mib", "-1"}));
-    CHECK(rejected({"--stub", "--fit-margin-mib", "not-a-number"}));
-}
-
-// Round-6 review, finding 7: 0015 engine side. Same three-shape coverage
-// as --fit-margin-mib above (default, accept, reject) -- the flag exists
-// only to be threaded to backend_ov.cpp's plugin-key probe, which is not
-// unit-testable without a card, so this file's job is the parsing/
-// validation contract alone.
-TEST(config_paged_attention_max_partitions_defaults_0) {
-    Config cfg;
-    CHECK(run({"--stub"}, cfg).ok);
-    CHECK_EQ(cfg.paged_attention_max_partitions, 0);
-}
-
-TEST(config_paged_attention_max_partitions_accepts_a_value) {
-    Config cfg;
-    CHECK(run({"--stub", "--paged-attention-max-partitions", "32"}, cfg).ok);
-    CHECK_EQ(cfg.paged_attention_max_partitions, 32);
-
-    // 0 is a valid, meaningful value here (not just the default) --
-    // "the plugin carries the bound key; N = 0 leaves partials unbounded"
-    // is a real, distinct state backend_ov.cpp's own load-time log names.
-    Config cfg2;
-    CHECK(run({"--stub", "--paged-attention-max-partitions", "0"}, cfg2).ok);
-    CHECK_EQ(cfg2.paged_attention_max_partitions, 0);
-}
-
-TEST(config_paged_attention_max_partitions_rejects_garbage) {
-    CHECK(rejected({"--stub", "--paged-attention-max-partitions", "-1"}));
-    CHECK(rejected({"--stub", "--paged-attention-max-partitions", "not-a-number"}));
-}
 
 TEST(config_n_ctx_explicit_defaults_false) {
     Config cfg;
@@ -790,28 +275,7 @@ TEST(config_n_ctx_explicit_defaults_false) {
     CHECK_EQ(cfg.n_ctx, 0);
 }
 
-// M13 (docs/milestone-0.3.0.md): --vision is reserved, not served. The
-// artifacts arcint loads are VLM exports whose vision tower and projector
-// IRs are never read (src/core/artifact.cpp, src/exec/backend_ov.cpp), so
-// the flag must refuse loudly -- both bare and with a value -- rather than
-// silently doing nothing, which is how a mistyped invocation could look
-// multimodal. No Config field backs it: see config.cpp's --vision arm.
-TEST(config_vision_flag_is_reserved_and_refused) {
-    Config     cfg;
-    const ArgParse r = run({"--stub", "--vision"}, cfg);
-    CHECK(!r.ok);
-    CHECK(r.error.find("reserved") != std::string::npos);
-}
 
-TEST(config_vision_flag_with_a_value_is_still_refused) {
-    // A generic "unknown option" catch-all would already reject this, so
-    // assert the reserved-flag message specifically -- otherwise this case
-    // would pass without --vision's own handling ever running.
-    Config     cfg;
-    const ArgParse r = run({"--stub", "--vision", "true"}, cfg);
-    CHECK(!r.ok);
-    CHECK(r.error.find("reserved") != std::string::npos);
-}
 
 TEST(config_n_ctx_explicit_true_when_passed) {
     Config cfg;
@@ -828,195 +292,22 @@ TEST(config_n_ctx_explicit_true_when_passed) {
     CHECK_EQ(cfg2.n_ctx, 0);
 }
 
-// M9: --prefix-cache-reserve PCT -- an option under auto-fit, default 0
-// (today's behaviour, no reserve).
-TEST(config_prefix_cache_reserve_defaults_zero) {
-    Config cfg;
-    CHECK(run({"--stub"}, cfg).ok);
-    CHECK_EQ(cfg.prefix_cache_reserve_pct, 0);
-}
 
-TEST(config_prefix_cache_reserve_accepts_the_full_range) {
-    Config lo;
-    CHECK(run({"--stub", "--prefix-cache-mib", "512", "--prefix-cache-reserve", "0"}, lo).ok);
-    CHECK_EQ(lo.prefix_cache_reserve_pct, 0);
 
-    Config mid;
-    CHECK(run({"--stub", "--prefix-cache-mib", "512", "--prefix-cache-reserve", "25"}, mid).ok);
-    CHECK_EQ(mid.prefix_cache_reserve_pct, 25);
 
-    Config hi;
-    CHECK(run({"--stub", "--prefix-cache-mib", "512", "--prefix-cache-reserve", "90"}, hi).ok);
-    CHECK_EQ(hi.prefix_cache_reserve_pct, 90);
-}
 
-// Refusal 1: PCT outside 0..90.
-TEST(config_prefix_cache_reserve_rejects_out_of_range_pct) {
-    CHECK(rejected({"--stub", "--prefix-cache-mib", "512", "--prefix-cache-reserve", "91"}));
-    CHECK(rejected({"--stub", "--prefix-cache-mib", "512", "--prefix-cache-reserve", "-1"}));
-    CHECK(rejected({"--stub", "--prefix-cache-mib", "512", "--prefix-cache-reserve", "100"}));
-}
 
-// Refusal 2: the flag without --prefix-cache-mib > 0 -- nothing to reserve
-// pages for.
-TEST(config_prefix_cache_reserve_needs_a_prefix_cache_budget) {
-    CHECK(rejected({"--stub", "--prefix-cache-reserve", "25"}));
-    CHECK(rejected({"--stub", "--prefix-cache-mib", "0", "--prefix-cache-reserve", "25"}));
-    // PCT 0 is a no-op, so it does not need the budget either -- it is
-    // indistinguishable from the flag never having been passed.
-    Config cfg;
-    CHECK(run({"--stub", "--prefix-cache-reserve", "0"}, cfg).ok);
-}
 
-// Refusal 3: the flag together with an explicit --n-ctx -- an explicit
-// depth already defines the reserve as whatever remains.
-TEST(config_prefix_cache_reserve_rejects_explicit_n_ctx) {
-    CHECK(rejected({"--stub", "--prefix-cache-mib", "512", "--prefix-cache-reserve", "25",
-                    "--n-ctx", "8192"}));
-    Config cfg;
-    const ArgParse r = run({"--stub", "--prefix-cache-mib", "512", "--prefix-cache-reserve", "25",
-                            "--n-ctx", "8192"}, cfg);
-    CHECK(!r.ok);
-    CHECK(r.error.find("explicit") != std::string::npos ||
-          r.error.find("--n-ctx") != std::string::npos);
-}
 
-// M11 (the M11 design note (not in the repository) Q): --dflash-block overrides the block size read
-// from the drafter's config.json. RED first: before this flag existed there
-// was no way to ask for a different block, so the acceptance case below would
-// have failed on "unknown option".
-TEST(config_dflash_block_flag) {
-    Config cfg;
-    CHECK(run({"--stub", "--dflash", "/d", "--dflash-block", "12"}, cfg).ok);
-    CHECK_EQ(cfg.dflash_block, 12);
 
-    Config def;
-    CHECK(run({"--stub", "--dflash", "/d"}, def).ok);
-    CHECK_EQ(def.dflash_block, 0);   // 0 = take the head's own json
-}
 
-// The override means nothing without a drafter to apply it to.
-TEST(config_dflash_block_needs_dflash) {
-    CHECK(rejected({"--stub", "--dflash-block", "8"}));
-}
 
-TEST(config_dflash_block_rejects_out_of_range) {
-    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-block", "1"}));
-    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-block", "33"}));
-    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-block", "not-a-number"}));
 
-    // The boundaries themselves are legal.
-    Config lo;
-    CHECK(run({"--stub", "--dflash", "/d", "--dflash-block", "2"}, lo).ok);
-    CHECK_EQ(lo.dflash_block, 2);
-    Config hi;
-    CHECK(run({"--stub", "--dflash", "/d", "--dflash-block", "32"}, hi).ok);
-    CHECK_EQ(hi.dflash_block, 32);
-}
 
-// M11 (the M11 design note (not in the repository) V/K/lambda): the selector's strategy, top-k and
-// bilinear weight.
-TEST(config_dflash_select_flags_default) {
-    Config cfg;
-    CHECK(run({"--stub"}, cfg).ok);
-    CHECK_EQ(cfg.dflash_select, std::string("greedy"));
-    CHECK_NEAR(static_cast<double>(cfg.dflash_lambda), 1.0, 1e-9);
-    CHECK_EQ(cfg.dflash_topk, 0);
-}
 
-TEST(config_dflash_select_accepts_the_documented_choices) {
-    for (const char* mode : {"greedy", "viterbi"}) {
-        Config cfg;
-        CHECK(run({"--stub", "--dflash", "/d", "--dflash-select", mode}, cfg).ok);
-        CHECK_EQ(cfg.dflash_select, std::string(mode));
-    }
-    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-select", "beam"}));
-    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-select"}));
-}
 
-// Review follow-up: --dflash-select and --dflash-lambda are as inert
-// without --dflash as --dflash-block/--dflash-topk are, and must refuse the
-// same way rather than being silently accepted and ignored.
-TEST(config_dflash_select_needs_dflash) {
-    CHECK(rejected({"--stub", "--dflash-select", "viterbi"}));
-    // Even the value that equals the default is still refused: the flag was
-    // typed, so "not given" is not what happened.
-    CHECK(rejected({"--stub", "--dflash-select", "greedy"}));
-}
 
-TEST(config_dflash_lambda_needs_dflash) {
-    CHECK(rejected({"--stub", "--dflash-lambda", "0.5"}));
-    CHECK(rejected({"--stub", "--dflash-lambda", "1"}));   // equals the default; still refused
-}
 
-TEST(config_dflash_lambda_accepts_any_finite_weight) {
-    Config zero;
-    CHECK(run({"--stub", "--dflash", "/d", "--dflash-lambda", "0"}, zero).ok);
-    CHECK_NEAR(static_cast<double>(zero.dflash_lambda), 0.0, 1e-9);
-
-    Config two;
-    CHECK(run({"--stub", "--dflash", "/d", "--dflash-lambda", "2"}, two).ok);
-    CHECK_NEAR(static_cast<double>(two.dflash_lambda), 2.0, 1e-9);
-
-    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-lambda", "nan"}));
-    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-lambda", "inf"}));
-    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-lambda", "warm"}));
-    //: a double that parses as finite but overflows on the narrowing cast
-    // to float -- parse_double's own isfinite check does not catch this
-    // (1e39 IS finite as a double), so this is what actually exercises
-    // config.cpp's separate `!std::isfinite(cfg.dflash_lambda)` check.
-    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-lambda", "1e39"}));
-}
-
-TEST(config_dflash_topk_flag) {
-    Config cfg;
-    CHECK(run({"--stub", "--dflash", "/d", "--dflash-topk", "32"}, cfg).ok);
-    CHECK_EQ(cfg.dflash_topk, 32);
-}
-
-TEST(config_dflash_topk_needs_dflash) {
-    CHECK(rejected({"--stub", "--dflash-topk", "8"}));
-}
-
-TEST(config_dflash_topk_rejects_out_of_range) {
-    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-topk", "0"}));
-    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-topk", "-1"}));
-    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-topk", "65"}));
-
-    Config lo;
-    CHECK(run({"--stub", "--dflash", "/d", "--dflash-topk", "1"}, lo).ok);
-    CHECK_EQ(lo.dflash_topk, 1);
-    Config hi;
-    CHECK(run({"--stub", "--dflash", "/d", "--dflash-topk", "64"}, hi).ok);
-    CHECK_EQ(hi.dflash_topk, 64);
-}
-
-// 0.5.3.1459: a GGUF alone selects the libllama engine; with an IR directory
-// it stays the OpenVINO template path.
-TEST(config_engine_follows_what_was_given) {
-    {
-        Config cfg;
-        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf"};
-        const auto r = parse_args(3, const_cast<char**>(argv), cfg);
-        CHECK(r.ok);
-        CHECK_EQ(cfg.engine, std::string("llama"));
-    }
-#ifdef ARCINT_OPENVINO   // a build without it refuses --model at parse
-    {
-        Config cfg;
-        const char* argv[] = {"arcint", "--model", "/m/ir", "--gguf", "/m/q.gguf"};
-        const auto r = parse_args(5, const_cast<char**>(argv), cfg);
-        CHECK(r.ok);
-        CHECK_EQ(cfg.engine, std::string("ov"));
-    }
-#endif
-    {
-        Config cfg;
-        const char* argv[] = {"arcint", "--engine", "llama", "--model", "/m/ir"};
-        const auto r = parse_args(5, const_cast<char**>(argv), cfg);
-        CHECK(!r.ok);   // the llama engine needs its GGUF
-    }
-}
 
 TEST(config_llama_kv) {
     {
@@ -1057,8 +348,8 @@ TEST(config_llama_kv) {
     }
     {
         Config cfg;
-        const char* argv[] = {"arcint", "--model", "/m/ir", "--llama-kv", "q8_0"};
-        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // an --engine llama option
+        const char* argv[] = {"arcint", "--stub", "--llama-kv", "q8_0"};
+        CHECK(!parse_args(4, const_cast<char**>(argv), cfg).ok);   // an option of the libllama engine, not of the stub
     }
 }
 
@@ -1126,17 +417,10 @@ TEST(config_llama_cpu_moe_and_threads) {
         const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-cpu-moe", "-1"};
         CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // a count, not a sign
     }
-#ifdef ARCINT_OPENVINO
-    {
-        Config cfg;
-        const char* argv[] = {"arcint", "--model", "/m/ir", "--llama-cpu-moe", "4"};
-        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // an option of the libllama engine only
-    }
-#endif
     {
         Config cfg;
         const char* argv[] = {"arcint", "--stub", "--llama-threads", "4"};
-        CHECK(!parse_args(4, const_cast<char**>(argv), cfg).ok);   // --stub runs the OpenVINO-less skeleton, not libllama
+        CHECK(!parse_args(4, const_cast<char**>(argv), cfg).ok);   // --stub runs the model-less stub, not libllama
     }
     {
         Config cfg;
@@ -1273,7 +557,7 @@ TEST(config_llama_layer_split) {
     CHECK(rejected({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.0", "--llama-layer-split", "24"}));   // one card twice
     CHECK(rejected({"--stub", "--llama-layer-split", "24"}));   // an option of the libllama engine only
     {
-        // OpenVINO's own device strings keep their commas
+        // the stub takes any device string, commas included
         Config cfg;
         CHECK(run({"--stub", "--device", "HETERO:GPU.0,GPU.1"}, cfg).ok);
         CHECK_EQ(cfg.device, std::string("HETERO:GPU.0,GPU.1"));
@@ -1403,8 +687,6 @@ TEST(config_named_lanes_refusals) {
     // that its proxy name never reaches
     CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a, b", "--lane-ctx", "512,256"}, "whitespace"));
     CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a ,b", "--lane-ctx", "512,256"}, "whitespace"));
-    // named lanes are the libllama engine's
-    CHECK(rejected({"--model", "/m/ir", "--served-model-name", "a,b", "--lane-ctx", "512,256"}));
     // lists of different lengths
     CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "512"}, "--lane-ctx"));
     CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b,c", "--lane-ctx", "512,256"}, "--lane-ctx"));
@@ -1447,4 +729,94 @@ TEST(config_one_name_is_unchanged) {
     CHECK(run({"--gguf", "/m/q.gguf", "--parallel", "2"}, eq).ok);
     CHECK(!eq.named_lanes());
     CHECK_EQ(eq.parallel, 2);
+}
+
+
+// The engine flag: llama is the only value; "ov" is the retired engine and is
+// refused by a message that names the history tag (DESIGN 4.4).
+TEST(config_engine_is_llama_only_and_ov_names_the_tag) {
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf"}, cfg).ok);
+        CHECK_EQ(cfg.engine, std::string("llama"));   // a bare --gguf selects it
+    }
+    {
+        Config cfg;
+        CHECK(run({"--engine", "llama", "--gguf", "/m/q.gguf"}, cfg).ok);
+        CHECK_EQ(cfg.engine, std::string("llama"));
+    }
+    {
+        Config cfg;
+        const ArgParse r = run({"--engine", "ov", "--gguf", "/m/q.gguf"}, cfg);
+        CHECK(!r.ok);
+        CHECK(r.error.find("openvino-history") != std::string::npos);
+        CHECK(r.error.find("retired") != std::string::npos);
+    }
+    {
+        Config cfg;
+        const ArgParse r = run({"--engine", "vulkan", "--gguf", "/m/q.gguf"}, cfg);
+        CHECK(!r.ok);
+        CHECK(r.error.find("llama") != std::string::npos);
+    }
+    CHECK(rejected({"--engine"}));
+    CHECK(rejected({"--engine", "llama"}));   // the engine serves a GGUF: give --gguf
+}
+
+// The retired engine's options are refused by name, with the version that
+// retired them, rather than as unknown options. The list is the one the engine
+// had: a flag that is neither retired nor known still reads "unknown option".
+TEST(config_retired_flags_are_refused_by_name) {
+    const char* const retired[] = {
+        "--model", "--model-id", "--quant", "--paged-kv", "--offload-ratio", "--moe-cpu-tier",
+        "--moe-cpu-tier-threads", "--moe-per-expert-dispatch", "--dflash", "--dflash-device", "--dflash-block",
+        "--dflash-select", "--dflash-lambda", "--dflash-topk", "--mtp", "--mtp-layer", "--mtp-device",
+        "--emb-device", "--draft", "--draft-ngram", "--gguf-mode", "--gguf-native", "--gguf-mins", "--gguf-q6k",
+        "--gguf-embed", "--gguf-check", "--ngram-gguf", "--flash-next-ngram", "--prefix-cache-mib",
+        "--prefix-cache-reserve", "--cache-grid", "--cache-host-mib", "--cache-dir", "--fit-margin-mib",
+        "--fit-ledger-dir", "--kv-block-size", "--kv-dtype", "--kv-pool-pages", "--no-paged", "--no-logits-slice",
+        "--custom-kernels", "--pin-dispatch", "--gate-pad", "--dyn-quant", "--vision", "--inspect-artifact",
+        "--flash-next-offload-plan", "--gdn-checkpoint-budget", "--paged-attention-max-partitions"};
+    for (const char* flag : retired) {
+        CHECK(is_retired_flag(flag));
+        // bare, and with a value behind it, next to a valid invocation
+        for (int with_value = 0; with_value < 2; ++with_value) {
+            Config cfg;
+            const ArgParse r = with_value ? run({"--stub", flag, "1"}, cfg) : run({"--stub", flag}, cfg);
+            CHECK(!r.ok);
+            const std::string want = std::string(flag) + " was retired with the OpenVINO engine in 0.8.0 (see docs/history.md)";
+            CHECK_EQ(r.error, want);
+        }
+    }
+    // not retired, not known: the generic message
+    CHECK(!is_retired_flag("--turbo"));
+    CHECK(!is_retired_flag("--llama-kv"));
+    CHECK(!is_retired_flag("--gguf"));
+    Config cfg;
+    const ArgParse r = run({"--stub", "--turbo"}, cfg);
+    CHECK(!r.ok);
+    CHECK(r.error.find("unknown option") != std::string::npos);
+    // a retired flag is refused even where nothing else is wrong with the line
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--model", "/models/ov/x"}));
+    // and the help does not offer any of them
+    const std::string help = usage_text();
+    for (const char* flag : retired) CHECK(help.find(std::string(flag) + " ") == std::string::npos &&
+                                           help.find(std::string(flag) + "\n") == std::string::npos);
+}
+
+// What /props publishes as cache.kv_dtype is built from --llama-kv; this is
+// the cell that fails when it ignores the configured type (the llama backend
+// reported "f16" whatever the unit said until 0.8.0).
+TEST(config_llama_kv_dtype_reports_the_configured_type) {
+    struct Case { std::vector<const char*> args; const char* want; };
+    const std::vector<Case> cases = {
+        {{"--gguf", "/m/q.gguf"}, "f16"},
+        {{"--gguf", "/m/q.gguf", "--llama-kv", "f16"}, "f16"},
+        {{"--gguf", "/m/q.gguf", "--llama-kv", "q8_0"}, "q8_0"},
+        {{"--gguf", "/m/q.gguf", "--llama-kv", "q8_0:q4_0"}, "q8_0:q4_0"},
+    };
+    for (const Case& c : cases) {
+        Config cfg;
+        CHECK(run(c.args, cfg).ok);
+        CHECK_EQ(llama_kv_dtype(cfg), std::string(c.want));
+    }
 }

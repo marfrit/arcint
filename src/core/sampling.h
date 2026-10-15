@@ -5,12 +5,26 @@
 #include <string>
 #include <vector>
 
-#include "core/model_registry.h"
-
 // DESIGN.md §3.6. Greedy, temperature, top-k, top-p, min-p, repetition
-// penalty (min-p since 0.5.9, for role play: operator, 2026-10-04). Model-aware defaults come from the allowlist entry;
+// penalty (min-p since 0.5.9, for role play: operator, 2026-10-04). Defaults come from the served GGUF and the operator flags;
 // explicit request fields always win.
 namespace lgc {
+
+// The sampler regime a request starts from, before its own fields apply.
+struct SamplerDefaults {
+    float temperature        = 0.7f;
+    float top_p              = 0.8f;
+    int   top_k              = 20;
+    float min_p              = 0.0f;
+    float repetition_penalty = 1.05f;
+    float presence_penalty   = 0.0f;
+
+    // "provisional" -- the Qwen3-family card values, carried because no
+    //                  GGUF key is read yet; /props reports this so nobody
+    //                  mistakes an inherited default for a measured one.
+    // "operator"    -- at least one --temp/--top-p/... flag set it.
+    std::string provenance = "provisional";
+};
 
 struct SamplerParams {
     float    temperature        = 0.7f;
