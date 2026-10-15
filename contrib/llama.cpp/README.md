@@ -3225,3 +3225,25 @@ through `GGML_OPENCL_IQ_OPTS` keep the old forms (measurement);
   build's default source is otherwise the same). Recorded: the prompt GEMM's
   own copy of the IQ2_S / IQ3_S decode (`mul_mm_kq_f16.cl`) still uses
   `lb_signmask4`; 0053 is decode only.
+
+## 0054-opencl-lowbit-gemm-decode.patch
+
+0053's two decodes in the prompt GEMM's own copy of the low-bit decode
+(`mul_mm_kq_f16.cl`, the expert GEMM from 64 tokens): the IQ2_S / IQ3_S sign
+bits and Q2_0's fields spread by multiplies, the same text and the same
+switches and red cases (the 0053 review had named this copy). The GEMM
+build now also takes `GGML_OPENCL_IQ_OPTS`, so one binary can A/B it.
+
+- **Suites** (`measured-here`, 2026-10-15): MUL_MAT and MUL_MAT_ID for
+  IQ2_S, IQ3_S and Q2_0 pass on the B60 and the A770. With 0054 the red
+  cases fail every case of these types on the B60 (IQ2_S 13/13 + 4/4, IQ3_S
+  13/13 + 12/12, Q2_0 20/20 + 87/87), where 0053's alone left the GEMM
+  cases passing.
+- **Served** (`measured-here`, B60, Flash-Next with the unit's 0.7.9 flags,
+  one binary, two processes an arm, the old forms through
+  `GGML_OPENCL_IQ_OPTS`): the 20k needle's prefill 664.0 / 664.2 -> 665.8 /
+  665.3 t/s (+0.2 %), short prompts inside the spread; the needle right,
+  the same texts (md5).
+- **Reviewed** by a second model: no defect. Noted: `-DLB_CHAR4_ARITH`
+  through `GGML_OPENCL_IQ_OPTS` now selects the GEMM's char4 forms as well
+  as the matvec's; label such prefill cells accordingly.
