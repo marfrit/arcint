@@ -1555,7 +1555,19 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
   here too. The cadence (Infernix admits every round; here at each adapt):
   every 6 tokens at budget 4 39.1 / 39.9 / 42.2 t/s, every 3 at budget 2 or
   4 38.8-38.9 / 39.7 / 42.1-42.2, every 12 at budget 8 38.3 / 39.6 / 42.3
-  (one process each, the same texts): the defaults stay. Infernix's global
+  (one process each, the same texts): the defaults stay.
+- **Infernix's warm start, tried** (`measured-here`, 2026-10-15, B60, the
+  LFRU policy; llama tree `p0056-warm`, not in the series): the live
+  placement written at exit as an STRP profile (`LLAMA_EXPERT_CACHE_SAVE`:
+  the slotted experts first, then by use) and loaded as
+  `--llama-expert-profile`. Warmed on three 300-token answers, measured on
+  Strata's request and the needle: 89.5 % on the card, 38.4 t/s, against
+  the static calibration profile's 90.1 % and 38.9 (twice); the needle and
+  the texts unchanged. The calibration profile is the better seed here.
+  How this differs from Infernix (PI:2353-2357): it saves the policy's
+  counts and fills half the frames from them; this saves a ranking and
+  fills all slots. Not a verdict on a warm start seeded from the same
+  workload. Infernix's global
   pool (one capacity over all layers) is not built: the slots are
   per-layer tensors.
 - **The input copies.** The OpenCL backend has no events and no async copy,

@@ -168,7 +168,11 @@ checkout, with these abbreviations:
 2. **A GPU-planned CPU miss service** over a mapped doorbell, with the shared
    and resident experts overlapping the CPU wait. A B60 spin needs the LSC
    uncached loads (memory `project-b60-host-flag-needs-lsc-uncached`).
-3. **Warm start** from the saved live state. Cheap.
+3. **Warm start** from the saved live state. Cheap. **Tried 2026-10-15**
+   (`measured-here`): a live placement saved from other prompts seeded
+   Flash-Next worse than the static calibration profile (89.5 against
+   90.1 % hits, 38.4 against 38.9 t/s); Infernix seeds half its frames from
+   saved counts, this all slots from a ranking.
 4. **The MTP length policy** and the p < 0.5 cut: per-step draft
    probabilities.
 
