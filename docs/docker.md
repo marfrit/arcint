@@ -234,7 +234,12 @@ possible follow-up.
 **The `.deb` does not have this problem, and that is the distinction worth
 keeping.** `contrib/packaging/arcint/build-deb.sh` is run by hand on the
 target trixie host, so `-march=native` there optimises for the machine that
-will actually run it. The package and the image differ in *who owns the ISA
+will actually run it. Until 0.7.12 it did not: the recipe exports
+`SOURCE_DATE_EPOCH`, ggml reads that as a reproducible build and turns
+`GGML_NATIVE` off, so the packages' ggml-cpu was SSE-only. With Flash-Next's
+CPU misses that cost 7.7 % of decode (45.6 against 49.4 t/s on one answer,
+`measured-here`); without them it did not show. The recipe now asks for
+`GGML_NATIVE=ON` and checks the CMake cache. The package and the image differ in *who owns the ISA
 decision*: the packager, or the image. If you need the last of the CPU-side
 performance on a specific host, build the `.deb` there.
 

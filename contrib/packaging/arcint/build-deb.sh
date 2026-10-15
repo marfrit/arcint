@@ -129,7 +129,13 @@ cmake -S "$SRC" -B build \
     -DCMAKE_INSTALL_PREFIX=/usr \
     -DCMAKE_INSTALL_RPATH="$OV_PREFIX/openvino/libs" \
     -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-    -DCMAKE_SKIP_BUILD_RPATH=OFF
+    -DCMAKE_SKIP_BUILD_RPATH=OFF \
+    -DGGML_NATIVE=ON
+# ggml turns GGML_NATIVE off by default when SOURCE_DATE_EPOCH is set (it reads that as a reproducible
+# build), which left every package's ggml-cpu at the SSE2 baseline although docs/docker.md says the .deb is
+# built native on its host: Flash-Next with the CPU misses decoded 45.6 against 49.4 t/s (measured-here,
+# 2026-10-15). Asked for explicitly, and checked.
+grep -q '^GGML_NATIVE:BOOL=ON$' build/CMakeCache.txt || { echo "GGML_NATIVE ist nicht ON (ggml-cpu ohne -march=native)" >&2; exit 1; }
 cmake --build build -j"$(nproc)"
 
 # The gates are the product. A package built from a tree whose unit tests fail
