@@ -13,13 +13,15 @@ exactly its flags.
 | `arcint-agent.service` | GPU.0 (Arc Pro B60, 24 GB) | Qwen3.8-27B dense, Q4_K_M GGUF, q8_0:q4_0 KV, 245,760 tokens, MTP 5 | 8087 |
 | `arcint-writer.service` | GPU.0, on demand | Cydonia 24B v4.3 (Mistral Small 3.2 finetune), imatrix Q4_K_M GGUF, q8_0 KV, 98,304 tokens | 8088 |
 | `arcint-flashnext.service` | GPU.0, on demand | Qwen3.8-Flash-Next IQ2_XS: expert cache (13,400 MiB of slots, the rest in pinned host memory), the CPU misses, the bank stream for prefill, MTP 3 with Strata's stop, 131,072 tokens, q8_0 KV | 8089 |
+| `arcint-flashnext-iq3xxs.service` | GPU.0, on demand | the same model from ISTA-DASLab's IQ3_XXS (KL 0.218 against IQ2_XS's 0.294): 12,000 MiB of slots, without the CPU misses | 8089 |
 | `arcint-coder.service` | GPU.1 (Arc A770, 16 GB) | Qwen3.6-27B-A3B coder, the searched `c5f495ac shq8` GGUF, q8_0:q4_0 KV, 98,304 tokens, MTP 4 | 8080 |
 
 The GPU.0 units take turns on one card (`Conflicts=`); on the host they come
 from, a unit manager switches between them on demand. Flash-Next's other
-quants (IQ3_XXS, UD-Q3_K_XL; `docs/llama-engine.md`, "Flash-Next quant
-options") run as variants of `arcint-flashnext.service` with the same port
-and served name, conflicting with it and with each other.
+quants run as variants of `arcint-flashnext.service` with the same port and
+served name, conflicting with it and with each other: IQ3_XXS now,
+UD-Q3_K_XL once the host has 96 GB (`docs/llama-engine.md`, "Flash-Next
+quant options").
 
 Things worth copying rather than re-learning:
 

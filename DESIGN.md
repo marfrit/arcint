@@ -614,7 +614,7 @@ on-demand configurations on the same endpoint (`decision`, operator,
 | GGUF | KL / top-1 against Q8_0 | host bank | state |
 |---|---|---|---|
 | ISTA-DASLab IQ2_XS | 0.294 / 87.1 % | 20.32 GiB | production |
-| ISTA-DASLab IQ3_XXS | 0.218 / 89.7 % (served) | 27.35 GiB at 13,400 MiB of slots | its slot budget and the CPU misses on its layer mix are open (§8) |
+| ISTA-DASLab IQ3_XXS | 0.218 / 89.7 % (served) | 28.72 GiB at 12,000 MiB of slots | on-demand unit `arcint-flashnext-iq3xxs`: 595.7 t/s at the 20k needle, 18.5-28.9 t/s on six answers without the CPU misses (`measured-here`, 2026-10-15); the misses on its layer mix in §8.3 |
 | unsloth UD-Q3_K_XL | 0.100 / 93.3 % | ~39 GiB | inside the bar; needs the planned 96 GB host |
 
 ### 7.3 Retractions
@@ -651,11 +651,14 @@ before a move past it).
 
 ### 8.3 Flash-Next's quant options
 
-- **IQ3_XXS**: the CPU misses (0056) fault on its layer mix (down IQ4_NL ×
-  18 and Q2_0 × 30; gate/up IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS); without
-  them it decodes 6.4-11.7 t/s at a peak of 24,440 MiB, thrashing: its slot
-  budget must come down to about 12,000-12,700 MiB (`measured-here`,
-  2026-10-15).
+- **IQ3_XXS**: at 12,000 MiB of slots, from the NVMe, without the CPU
+  misses it serves 18.5-28.9 t/s on six answers (peak 23,290 MiB); at
+  13,400 MiB from the ZFS pool it thrashed at 6.4-11.7 t/s (`measured-here`,
+  2026-10-15). With the CPU misses (0056) its first request faulted: the
+  slow path read an IQ4_NL bank (18 of its 48 down projections) as GGUF
+  blocks, though the bank keeps scales and quants apart, and the NaN rows
+  reached the next layer's router (`measured-here`, instrumented); fixed in
+  0056, served check owed.
 - **UD-Q3_K_XL**: served at 235 t/s prefill and 12-13 t/s decode without
   MTP before the bank stream and the CPU misses (2026-10-06); re-measure on
   the 96 GB host.
