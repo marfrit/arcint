@@ -8,7 +8,7 @@ the lanes; llama.cpp keeps the weights, tokenizer, attention KV and the gated
 delta-net state, one sequence per lane.
 
 Build: `-DARCINT_LLAMA=ON -DARCINT_LLAMA_DIR=<llama.cpp tree>`, the tree at
-commit `bed0a85` (ggml-org/llama.cpp, 2026-10-02) with
+commit `3e4dfa8` (ggml-org/llama.cpp, 2026-10-15; `bed0a85` until then) with
 `contrib/llama.cpp/patches` applied (`contrib/llama.cpp/README.md`; configure
 warns when they are missing). It builds as a static subproject with
 `GGML_OPENCL=ON`, Adreno kernels off, kernels embedded. `--device GPU.N` is

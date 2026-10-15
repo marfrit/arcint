@@ -272,7 +272,7 @@ A build that serves a model needs OpenVINO:
     cmake --build build-ov -j"$(nproc)"
     cmake --install build-ov --prefix ~/.local
 
-The libllama engine needs a llama.cpp tree at the pinned commit (`bed0a85`)
+The libllama engine needs a llama.cpp tree at the pinned commit (`3e4dfa8`)
 with `contrib/llama.cpp/patches` applied, plus the OpenCL headers and ICD
 loader:
 
