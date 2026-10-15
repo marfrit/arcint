@@ -160,12 +160,14 @@ STRAY=$(cd "$ROOT" && find . -path ./usr/include -prune -print -o \( -name '*.a'
 # probe below).
 grep -qa kernel_mul_mm_kq2d_q4_K_i8 "$ROOT/usr/bin/arcint" || {
     echo "die libllama-Engine fehlt im Binary (ARCINT_LLAMA?)" >&2; exit 1; }
-# The result of GGML_NATIVE=ON, not only the ask: this host is the target host, so a binary without AVX2
-# here is the SSE-only ggml-cpu of the packages before 0.7.12. Captured once (no pipe, see the RPATH probe).
-DIS=$(objdump -d --no-show-raw-insn "$ROOT/usr/bin/arcint")
+# The result of GGML_NATIVE=ON, not only the ask: this host is the target host, so a ggml-cpu dot product
+# without AVX2 here is the SSE-only ggml-cpu of the packages before 0.7.12 (0 ymm registers in 0.7.11's,
+# 58 in a native build). A ggml-cpu function, because the CPU miss rows carry AVX2 in any build. Captured
+# once (no pipe, see the RPATH probe).
+DIS=$(objdump -d --no-show-raw-insn --disassemble=ggml_vec_dot_q4_K_q8_K "$ROOT/usr/bin/arcint")
 case "$DIS" in
     *"%ymm"*) ;;
-    *) echo "kein AVX2 im Binary (ggml-cpu ohne -march=native)" >&2; exit 1 ;;
+    *) echo "ggml_vec_dot_q4_K_q8_K ohne AVX2 (ggml-cpu ohne -march=native)" >&2; exit 1 ;;
 esac
 unset DIS
 
