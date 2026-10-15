@@ -1566,6 +1566,41 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
   every 6 tokens at budget 4 39.1 / 39.9 / 42.2 t/s, every 3 at budget 2 or
   4 38.8-38.9 / 39.7 / 42.1-42.2, every 12 at budget 8 38.3 / 39.6 / 42.3
   (one process each, the same texts): the defaults stay.
+- **Infernix's global pool, priced by a trace** (`measured-here`, 2026-10-15,
+  B60, the 0.7.10 package's source with a measurement switch,
+  `LLAMA_EXPERT_CACHE_TRACE`, llama tree `p0057-trace`, not in the series):
+  every counted decode step's routed ids per layer written to a file over
+  eight requests (Paris, Strata's request, the two gate answers, the 20k
+  needle, a Python function, a German explanation, a history summary; 788
+  steps, 1.22 M routed pairs) and replayed offline under each policy
+  (`tools/expert_cache_replay.py`: the adapt every 6 tokens, the 96-swap cap, no plan while
+  swaps are in flight, the swaps landing two steps later). The simulation
+  tracks the engine: Strata's rule 89.8 % on the card against 89.0 %
+  measured, the per-layer LFRU 89.8 % against 89.2 %. One pool over the 48
+  layers (a swap may move a frame between layers, Infernix's form): 90.2 %
+  (the exact clock 90.1 %), budget 4, 8 or 16 alike, one-step landing
+  90.9 % against 90.5 %. The pool moves frames (140-256 a layer from the
+  profile, 97-356 at the end), but the hits move +0.4 points; at the
+  LFRU's measured ratio (+0.6-1.8 points for +1.6 %) that is ~0.5 % of
+  decode, below the charter's 2 % bar, not built. The layers' experts are
+  not one size (1.18, 1.31, 1.51 MB), which a real pool would also have to
+  absorb; the simulation counts frames.
+- **LFRU outside the gate set** (`measured-here`, 2026-10-15, after the
+  0.7.10 tag; B60, the 0.7.10 package, the unit's flags, fresh processes
+  alternated, two an arm, the same texts in every arm): six 300-token
+  answers (a Python function, a German explanation, a history summary, a
+  Bash script, a story, public-key cryptography). Strata's adapt 38.6-39.1 /
+  29.4 / 32.5-32.6 / 30.6-31.2 / 30.6-30.7 / 37.1-37.4 t/s, 85.7 % on the
+  card; LFRU 37.9 / 29.5-29.6 / 31.5 / 30.2 / 28.6-28.7 / 37.7, 85.2 %: -2.1 %
+  on the means, per prompt -6.5 to +1.2 %, with 1.5-2x the swaps. The hit
+  counts repeat exactly across the processes of an arm. The 0055 gain is
+  the gate set's (Strata's request and two answers), not general.
+  What the same runs show about Flash-Next itself: away from the gate set
+  it decodes 29-39 t/s with 79-91 % of the routed experts on the card,
+  against 39-42 t/s and 89-96 % on the gate set; the code and the German
+  answer sit lowest (29.4 / 32.5 t/s, 82 / 85 %). The gate set flatters the
+  service, and the expert cache's misses are its decode lever on other
+  text.
 - **Infernix's warm start, tried** (`measured-here`, 2026-10-15, B60, the
   LFRU policy; llama tree `p0056-warm`, not in the series): the live
   placement written at exit as an STRP profile (`LLAMA_EXPERT_CACHE_SAVE`:

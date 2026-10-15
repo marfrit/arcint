@@ -82,7 +82,7 @@ Two kinds of name are not in a table:
 | `LLAMA_EXPERT_CACHE_MAX_SWAPS` | 96 | Largest swaps a plan makes; 0 is the discriminator in the swap-queue measurement. | 0022 | Same. |
 | `LLAMA_EXPERT_CACHE_MIN_GAIN` | 1.5 | Least gain for a swap. | 0022 | Same. |
 | `LLAMA_EXPERT_CACHE_MIN_USAGE` | 2.0 | Least usage for a swap. | 0022 | Same. |
-| `LLAMA_EXPERT_CACHE_POLICY` | Strata's adapt | `lfru`: Infernix's LFRU per layer (README 0055). Opt-in alternative. | 0055 | Flash-Next decode +1.6 %, hit rate +0.6-1.8 points (`measured-here`). |
+| `LLAMA_EXPERT_CACHE_POLICY` | Strata's adapt | `lfru`: Infernix's LFRU per layer (README 0055). Opt-in alternative. | 0055 | Flash-Next decode +1.6 % on the gate set, -2.1 % on six other prompts (`measured-here`). |
 | `LLAMA_EXPERT_CACHE_LFRU_BUDGET` | 4 | Admissions a layer an adapt under `lfru`; a value that does not parse is 0. | 0055 | 4 and 8 alike, 1 lower (`measured-here`). |
 | `LLAMA_EXPERT_CACHE_LFRU_EXACT` | off | Infernix's clock (a tick a layer call) and candidates (the step's misses). Opt-in alternative. | 0055 | Between the port and Strata's rule (`measured-here`). |
 | `LLAMA_EXPERT_CACHE_SPARES` | 4 a layer (minimum 1 when set) | Spare bank entries a layer for swaps. | 0042 | ~263 MB more pinned host memory for Flash-Next (`measured-here`). |

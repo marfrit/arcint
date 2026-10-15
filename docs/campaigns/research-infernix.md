@@ -162,9 +162,12 @@ checkout, with these abbreviations:
    by rule: a reference choice for the operator to price, not to drop.
    **Priced 2026-10-15** (`measured-here`, patch 0055, opt-in): the score,
    the protected round and the budgeted admission per layer give Flash-Next
-   +1.6 % decode (first written +1.3 %, an arithmetic slip) and +0.6-1.8 points of hits on the B60; no credit for
-   rejected drafts did not help; the global pool is not built (per-layer
-   slot tensors). `flash-next-llama-engine.md` has the table.
+   +1.6 % decode (first written +1.3 %, an arithmetic slip) and +0.6-1.8 points of hits on the B60
+   on the gate set, but -2.1 % and -0.5 points on six other prompts (code, German, a story, ...); no credit for
+   rejected drafts did not help. The global pool, priced by replaying a
+   routing trace (`measured-here`, 2026-10-15): +0.4 points of hits over
+   the per-layer LFRU, ~0.5 % of decode, not built.
+   `flash-next-llama-engine.md` has the tables.
 2. **A GPU-planned CPU miss service** over a mapped doorbell, with the shared
    and resident experts overlapping the CPU wait. A B60 spin needs the LSC
    uncached loads (memory `project-b60-host-flag-needs-lsc-uncached`).

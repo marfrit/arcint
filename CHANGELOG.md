@@ -45,8 +45,15 @@ details are in `contrib/llama.cpp/README.md` (0053-0055) and
   `LLAMA_EXPERT_CACHE_LFRU_EXACT=1` is the reference's clock and candidates.
   Decode +1.6 % over Strata's adapt rule on the means (40.4 against 39.8 t/s;
   per answer +0.6 / +3.2 / +1.1 %; the exact form +1.4 %), 0.6-1.8
-  points more experts served from the card, the same texts. Strata's rule
-  stays the default.
+  points more experts served from the card, the same texts, on Strata's
+  request and the two gate answers. Measured after the tag (2026-10-15,
+  `measured-here`, B60, the unit's flags): on six prompts outside that set
+  (a Python function, a German explanation, a history summary, a Bash
+  script, a story, public-key cryptography; the 0.7.10 package, fresh
+  processes, two an arm) LFRU decodes 32.6 against Strata's 33.3 t/s (-2.1
+  %, per prompt -6.5 to +1.2 %), 85.2 against 85.7 % of the experts on the
+  card: the gain is the gate set's, not general. Strata's rule stays the
+  default.
 - **The series against 0.7.9:** Flash-Next with 0001-0055 and the policy
   decodes 39.4 / 40.2 / 42.5 t/s against the 0.7.9 package's 38.5-39.0 /
   38.4-38.8 / 41.4-41.7 (+2.7 %) on Strata's request and two 300-token

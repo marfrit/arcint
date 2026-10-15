@@ -41,8 +41,9 @@ edited message resumes instead of re-prefilling (24.3k tokens: 38.75 s ->
 Release 0.7.10 (2026-10-15), measured-here: patches 0053/0054 (the low-bit
 expert decode's sign bits and 2-bit fields spread by multiplies, the same
 values) and 0055 (Infernix's LFRU expert-cache policy, opt-in through
-LLAMA_EXPERT_CACHE_POLICY=lfru): Flash-Next decode +0.9 % (0053), +1.6 %
-more with the policy, the same text; the series against 0.7.9 +2.7 %.
+LLAMA_EXPERT_CACHE_POLICY=lfru): Flash-Next decode +0.9 % (0053); the policy
++1.6 % on the gate set but -2.1 % on six other prompts, the same text; the
+series against 0.7.9 +2.7 % on the gate set.
 Release 0.7.9 (2026-10-14), measured-here: patches 0049-0051 (decode launch
 fusions; the delta net's snapshots written into the cache and its gating in
 the kernel), end to end: the dense agent +5.6-6.1 %, the coder +3.6-4.0 %,
