@@ -65,12 +65,17 @@ the survey of what upstream changed and what is open there is
   0007's Intel partials buffer beside upstream's pooled one; 0021's
   `build_moe_ffn` taken whole with upstream's MoE-cache `slots` passed
   where the experts are the model's own tensors (upstream's cache is off
-  unless `moe_cache_size` is set, and our cache's branches pass none); 0022's
+  unless `moe_cache_size` is set; a layer our cache holds gets no upstream
+  slots at all, so the two never cache the same layer, a defect of the first
+  port found in its review); 0022's
   scheduler timing beside upstream's `ggml_backend_sched_copy_input`; 0024's
   accessors beside upstream's Hadamard loading; 0047's single wait for a
   split's user inputs moved into `ggml_backend_sched_copy_input`; 0052
   beside upstream's `sched_new` and `embd_all`, and qwen4exp's indexer
   (below); 0056's test target beside upstream's consolidated state tests.
+- **Reviewed** by a second model (`code`): the regenerated patches rebuild
+  the port tree exactly and the tarball checksum is right; one defect (both
+  MoE caches could hold one layer when a tool enabled both), fixed in 0021.
 - **Two semantic changes found by running it** (`measured-here`):
   - upstream's qwen4exp builds `ggml_lightning_indexer`, which OpenCL has no
     kernel for, and its probe is off (`auto_flid = false`), so the op ran on
@@ -86,9 +91,9 @@ the survey of what upstream changed and what is open there is
   the series touches: MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT, GATED_DELTA_NET,
   SSM_CONV, GET_ROWS, CPY, SET_ROWS, TOP_K, FILL, RMS_NORM, SOFT_MAX): every
   case passes on both bases; the new base carries upstream's added cases
-  (MUL_MAT 1,221 -> 2,170). The patches' own red cases and the four-sequence
-  KL arms were not re-run for the move; 0056's test passes and its red mode
-  fails.
+  (MUL_MAT 1,221 -> 2,170). Owed by step 3 of the procedure and not done
+  for this move: the patches' own red cases and the four-sequence KL arms;
+  0056's test passes and its red mode fails.
 - **KL as served** (`measured-here`, the old base against the new on the
   same card): Flash-Next (8 x 512, ubatch 4, the CPU misses on) 0.370044 /
   84.41 % -> 0.369325 / 84.07 %; the dense agent (16 x 512, q8_0 KV)

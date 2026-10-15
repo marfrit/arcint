@@ -1638,7 +1638,7 @@ index 000000000..0ae85b93f
 +llama_expert_cache_layer * llama_expert_cache_lookup(const ggml_tensor * down_exps);
 +llama_expert_cache * llama_expert_cache_owner(const llama_expert_cache_layer * layer);
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 6cadda971..aa61a2697 100644
+index 6cadda971..ee11cc9e8 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -1,4 +1,5 @@
@@ -1657,7 +1657,7 @@ index 6cadda971..aa61a2697 100644
      cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
  
      if (weight_before_ffn) {
-@@ -2294,158 +2292,219 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2294,158 +2292,221 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          cb(cur, "ffn_moe_weighted", il);
      }
  
@@ -1675,7 +1675,9 @@ index 6cadda971..aa61a2697 100644
 +    // the experts' FFN over `ids`: [n_embd, n_expert_used, n_tokens]
 +    // the experts of host-resident layers may be read from the MoE cache (upstream's; our expert
 +    // cache's branches below pass their own slot and bank tensors and no slots)
-+    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
++    // a layer our expert cache holds never also gets upstream's slots (both on would double the bank)
++    ggml_tensor * slots = down_exps && llama_expert_cache_lookup(down_exps) != nullptr ? nullptr
++        : build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
 +    ggml_tensor * mm_slots = slots;
 +
 +    auto build_experts = [&](ggml_tensor * x, ggml_tensor * up_t, ggml_tensor * gate_t, ggml_tensor * gate_up_t,
@@ -1767,9 +1769,9 @@ index 6cadda971..aa61a2697 100644
 +            }
          }
 -    }
- 
--    const bool has_gate = gate_exps || gate_up_exps;
 -
+-    const bool has_gate = gate_exps || gate_up_exps;
+ 
 -    switch (type_op) {
 -        case LLM_FFN_SILU:
 -            if (gate_exps) {

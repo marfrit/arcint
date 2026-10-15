@@ -1,5 +1,5 @@
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index a04b719cb..0c1a8be06 100644
+index 01904dc1c..6ebf73bab 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -560,6 +560,9 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -25,7 +25,7 @@ index a04b719cb..0c1a8be06 100644
      res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
  
      res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
-@@ -3233,6 +3242,44 @@ ggml_tensor * llm_graph_context::build_attn(
+@@ -3235,6 +3244,44 @@ ggml_tensor * llm_graph_context::build_attn(
              ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
          }
  

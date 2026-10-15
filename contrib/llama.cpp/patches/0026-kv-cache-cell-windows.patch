@@ -67,7 +67,7 @@ index 8b74d5d9b..3402ef526 100644
          llama_memory_t mem,
            llama_seq_id seq_id) {
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index aa61a2697..a04b719cb 100644
+index ee11cc9e8..01904dc1c 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -44,6 +44,9 @@ static ggml_tensor * build_attn_inp_kq_mask(
