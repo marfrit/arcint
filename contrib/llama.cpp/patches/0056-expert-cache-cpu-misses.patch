@@ -13,10 +13,10 @@ index f8786499e..531a37f7f 100644
  target_include_directories(${TARGET_NAME} PRIVATE ${OpenCL_INCLUDE_DIRS})
 diff --git a/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.cpp b/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.cpp
 new file mode 100644
-index 000000000..faebcfe9a
+index 000000000..e3d7afa42
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.cpp
-@@ -0,0 +1,306 @@
+@@ -0,0 +1,318 @@
 +// patch 0056: the CPU half of the expert cache's miss path, several tokens at once.
 +//
 +// Strata's AVX2 expert rows (src/kernels/cpu/iq_avx2.cpp, q2_avx2.cpp; MIT, Copyright (c) 2026 Niko1221
@@ -35,6 +35,18 @@ index 000000000..faebcfe9a
 +#include "ggml.h"
 +
 +#include "ggml-opencl-miss-cpu.h"
++
++#include <cstring>
++
++// plain C++, every host: the slow path's IQ4_NL rows (any CPU, any build)
++void ggml_cl_miss_cpu_join_iq4nl(const void * d, const void * q, int64_t i0, int64_t n, void * dst) {
++    const size_t qb = sizeof(block_iq4_nl) - sizeof(ggml_half);
++    for (int64_t i = 0; i < n; ++i) {
++        block_iq4_nl * o = (block_iq4_nl *) dst + i;
++        memcpy(&o->d, (const char *) d + (size_t) (i0 + i) * sizeof(ggml_half), sizeof(ggml_half));
++        memcpy(o->qs, (const char *) q + (size_t) (i0 + i) * qb, qb);
++    }
++}
 +
 +#include <algorithm>
 +#include <cmath>
@@ -325,10 +337,10 @@ index 000000000..faebcfe9a
 +#endif
 diff --git a/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.h b/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.h
 new file mode 100644
-index 000000000..a53c01779
+index 000000000..a64cca2b5
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.h
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,17 @@
 +#pragma once
 +// patch 0056: the CPU half of the expert cache's miss path (ggml-opencl-miss-cpu.cpp)
 +#include "ggml.h"
@@ -343,8 +355,11 @@ index 000000000..a53c01779
 +// out[k][r] = row r of the ne0 x ne1 matrix `slice` (in planes when `planar`) . act[k], r in [r0, r1), k < nt
 +void   ggml_cl_miss_cpu_rows(ggml_type t, const void * slice, bool planar, int64_t ne0, int64_t ne1,
 +                             const void * const * act, int nt, float * const * out, int r0, int r1);
++// n IQ4_NL blocks from i0 on, as GGUF blocks, out of a USM bank that holds the tensor's scales and its
++// quants as two arrays (ggml_cl_usm_set_tensor): the rows ggml-cpu's dot products read
++void   ggml_cl_miss_cpu_join_iq4nl(const void * d, const void * q, int64_t i0, int64_t n, void * dst);
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index aad8e2fa6..572d3c8b2 100644
+index aad8e2fa6..71b8e3938 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -14,6 +14,7 @@
@@ -374,7 +389,7 @@ index aad8e2fa6..572d3c8b2 100644
      ggml_cl_buffer prealloc_kq_xh;     // f16 activation of the K-quant GEMMs
      ggml_cl_buffer prealloc_kq2_xq;    // the int8 2D GEMM's activations [token][K] (kernel_quant_i8)
      ggml_cl_buffer prealloc_kq2_xd;    // their scales per 256 [K / 256][tokens padded]
-@@ -15344,6 +15350,489 @@ static void ggml_backend_opencl_chain_prefetch(const ggml_tensor * a, const ggml
+@@ -15344,6 +15350,511 @@ static void ggml_backend_opencl_chain_prefetch(const ggml_tensor * a, const ggml
      g_cache_chain[a] = b;
  }
  
@@ -407,6 +422,10 @@ index aad8e2fa6..572d3c8b2 100644
 +    const ggml_tensor * bank[3] = {};
 +    const char *        bptr[3] = {};    // the bank's slice 0 in host memory
 +    bool                planar[3] = {};
++    const char *        split_d[3] = {};   // an IQ4_NL bank: its scales and its quants as two arrays
++    const char *        split_q[3] = {};   // (ggml_cl_usm_set_tensor), not GGUF blocks
++    const ggml_backend_opencl_buffer_context * bctx[3] = {};
++    bool                split_seen = false;   // the split exists from the bank's first write, after registration
 +    ggml_cl_vec_dot_fn    vec_dot[3] = {};
 +    ggml_type             vd_type[3] = {};
 +    ggml_cl_from_float_fn from_float[3] = {};
@@ -480,6 +499,12 @@ index aad8e2fa6..572d3c8b2 100644
 +    const int64_t bpr  = t->ne[0] / ggml_blck_size(t->type);
 +    const char *  sl   = L.bptr[k] + (size_t) b * t->nb[2];
 +    GGML_ASSERT((size_t) bpr * blk <= 4096);   // the callers' scratch
++    static const bool split_red = getenv("GGML_OPENCL_CPU_MISS_SPLIT_RED") != nullptr;   // red case: the split read as blocks
++    if (L.split_d[k] != nullptr && !split_red) {
++        // the block index over the whole tensor: the scales and quants arrays span every slice
++        ggml_cl_miss_cpu_join_iq4nl(L.split_d[k], L.split_q[k], (b * t->ne[1] + row) * bpr, bpr, scratch);
++        return scratch;
++    }
 +    if (!L.planar[k]) {
 +        return sl + (size_t) row * bpr * blk;
 +    }
@@ -733,6 +758,7 @@ index aad8e2fa6..572d3c8b2 100644
 +        GGML_ASSERT(bctx->usm != nullptr);
 +        L->bptr[k]       = (const char *) bctx->usm + e->offset + bank[k]->view_offs;
 +        L->planar[k]     = ggml_cl_lb_planar(bank[k]);
++        L->bctx[k]       = bctx;
 +        L->vec_dot[k]    = (ggml_cl_vec_dot_fn) vec_dot[k];
 +        L->vd_type[k]    = (ggml_type) vd_type[k];
 +        L->from_float[k] = (ggml_cl_from_float_fn) from_float[k];
@@ -805,6 +831,17 @@ index aad8e2fa6..572d3c8b2 100644
 +        }
 +        L.pending = false;
 +    }
++    if (!L.split_seen) {
++        // registered before the bank's fill, whose first write sets an IQ4_NL tensor's split up: look it
++        // up here, once, on the thread that writes tensors (the coordinator only reads the pointers)
++        for (int k = 0; k < 3; ++k) {
++            if (const auto sp = L.bctx[k]->usm_split.find(L.bank[k]); sp != L.bctx[k]->usm_split.end()) {
++                L.split_d[k] = sp->second.first;
++                L.split_q[k] = sp->second.second;
++            }
++        }
++        L.split_seen = true;
++    }
 +    L.gen = ctx->graph_gen;
 +    L.seq += 1;
 +    L.n_tok = n_tok; L.n_used = n_used;
@@ -864,7 +901,7 @@ index aad8e2fa6..572d3c8b2 100644
  // an expert cache's gather mirror, allocated at load (not inside a request)
  static void ggml_backend_opencl_reserve_gather(ggml_backend_dev_t dev, size_t q, size_t d) {
      ggml_backend_opencl_context * ctx = ((ggml_backend_opencl_device_context *) dev->context)->backend_ctx;
-@@ -15382,6 +15871,9 @@ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, c
+@@ -15382,6 +15893,9 @@ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, c
      if (strcmp(name, "ggml_backend_opencl_chain_prefetch") == 0) {
          return (void *) ggml_backend_opencl_chain_prefetch;
      }
@@ -874,7 +911,7 @@ index aad8e2fa6..572d3c8b2 100644
      if (strcmp(name, "ggml_backend_opencl_pair_bank") == 0) {
          return (void *) ggml_backend_opencl_pair_bank;
      }
-@@ -30028,6 +30520,11 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -30028,6 +30542,11 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
      GGML_ASSERT(ne12 == n_tok && src1->ne[3] == 1 && src0->ne[3] == 1);
      GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ne00 % ggml_cl_kq_k_unit(src0->type) == 0 &&
                  src0->view_offs == 0);
@@ -886,7 +923,7 @@ index aad8e2fa6..572d3c8b2 100644
  
      ggml_tensor_extra_cl * extra2 = (ggml_tensor_extra_cl *)ids->extra;
      ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-@@ -30500,6 +30997,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
+@@ -30500,6 +31019,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
  
  #ifdef GGML_OPENCL_SOA_Q
      if (ggml_cl_mul_mat_id_kq(backend_ctx, src0, src1, src2, dst)) {
@@ -965,12 +1002,15 @@ index 991bf5479..83122f68e 100644
      llama_build_and_test(test-unicode.cpp LINK llama)
 diff --git a/tests/test-opencl-miss-cpu.cpp b/tests/test-opencl-miss-cpu.cpp
 new file mode 100644
-index 000000000..80b38fa14
+index 000000000..531a03ddf
 --- /dev/null
 +++ b/tests/test-opencl-miss-cpu.cpp
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,88 @@
 +// patch 0056: the expert cache's CPU miss rows (ggml-opencl-miss-cpu.cpp) against ggml-cpu's vec_dot, the
-+// weights in planes as the bank holds them, 1-6 tokens a pass. `red` reads the planes as GGUF blocks: it must fail.
++// weights in planes as the bank holds them, 1-6 tokens a pass; and the slow path's IQ4_NL rows out of a
++// split bank. `red` reads the planes and the split as GGUF blocks: it must fail.
++#define GGML_COMMON_DECL_CPP
++#include "ggml-common.h"
 +#include "ggml.h"
 +#include "ggml-cpu.h"
 +#include "ggml-opencl-miss-cpu.h"
@@ -991,11 +1031,34 @@ index 000000000..80b38fa14
 +}
 +int main(int argc, char ** argv) {
 +    const bool red = argc > 1 && !strcmp(argv[1], "red");   // red case: the planes read as GGUF blocks
-+    if (!ggml_cl_miss_cpu_ok()) { printf("skipped: no AVX2/FMA/F16C\n"); return 0; }
-+    ggml_cpu_init();
 +    std::mt19937 rng(7);
 +    std::normal_distribution<float> nd(0.f, 1.f);
 +    int fails = 0;
++    {
++        // the slow path's IQ4_NL rows out of a split bank (two slices, as ggml_cl_usm_set_tensor lays a
++        // USM tensor out: the scales, then the quants, each 128-aligned); `red` reads the split as blocks
++        const int64_t ne0 = 640, ne1 = 2560, ns = 2, bpr = ne0 / QK4_NL, nblk = bpr * ne1 * ns;
++        std::vector<float> wf(ne0 * ne1 * ns); for (auto & v : wf) v = nd(rng) * 0.02f;
++        std::vector<uint8_t> gguf(nblk * sizeof(block_iq4_nl));
++        ggml_quantize_chunk(GGML_TYPE_IQ4_NL, wf.data(), gguf.data(), 0, ne1 * ns, ne0, nullptr);
++        const size_t qb = sizeof(block_iq4_nl) - sizeof(ggml_half);
++        std::vector<uint8_t> usm(nblk * sizeof(block_iq4_nl) + 256);
++        uint8_t * d = (uint8_t *) (((uintptr_t) usm.data() + 127) & ~(uintptr_t) 127);
++        uint8_t * q = (uint8_t *) (((uintptr_t) (d + nblk * sizeof(ggml_half)) + 127) & ~(uintptr_t) 127);
++        for (int64_t i = 0; i < nblk; ++i) { memcpy(d + i * 2, &gguf[i * sizeof(block_iq4_nl)], 2); memcpy(q + i * qb, &gguf[i * sizeof(block_iq4_nl) + 2], qb); }
++        int bad = 0;
++        std::vector<uint8_t> row(bpr * sizeof(block_iq4_nl));
++        for (int64_t b = 0; b < ns; ++b) for (int64_t r : { (int64_t) 0, (int64_t) 1, ne1 / 2, ne1 - 1 }) {
++            const int64_t i0 = (b * ne1 + r) * bpr;
++            if (red) memcpy(row.data(), d + i0 * sizeof(block_iq4_nl), row.size());   // the defect: the split read as blocks
++            else     ggml_cl_miss_cpu_join_iq4nl(d, q, i0, bpr, row.data());
++            bad += memcmp(row.data(), &gguf[i0 * sizeof(block_iq4_nl)], row.size()) != 0;
++        }
++        printf("iq4_nl split rows: %d of %d differ %s\n", bad, (int) (4 * ns), bad ? "FAIL" : "ok");
++        fails += bad != 0;
++    }
++    if (!ggml_cl_miss_cpu_ok()) { printf("rows skipped: no AVX2/FMA/F16C\n%s: %d failing\n", red ? "red" : "test", fails); return fails ? 1 : 0; }
++    ggml_cpu_init();
 +    struct cs { ggml_type t; int64_t ne0, ne1; } cases[] = { { GGML_TYPE_IQ2_S, 2560, 640 }, { GGML_TYPE_IQ2_XXS, 2560, 640 }, { GGML_TYPE_Q2_0, 640, 2560 } };
 +    for (auto c : cases) {
 +        const size_t bs = ggml_type_size(c.t); const int64_t bpr = c.ne0 / ggml_blck_size(c.t), nblk = bpr * c.ne1;

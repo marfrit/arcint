@@ -2,23 +2,26 @@ Source: arcint
 Section: misc
 Priority: optional
 Maintainer: Markus Fritsche <mfritsche@reauktion.de>
-Build-Depends: cmake (>= 3.20), g++ (>= 13), marfrit-openvino
+Build-Depends: cmake (>= 3.20), g++ (>= 13), opencl-headers, ocl-icd-opencl-dev, git, python3
 Standards-Version: 4.6.2
 Homepage: https://github.com/marfrit/arcint
 
 Package: arcint
 Architecture: amd64
-Depends: ${misc:Depends}, libc6 (>= 2.34), libstdc++6 (>= 13), marfrit-openvino
+Depends: ${misc:Depends}, libc6 (>= 2.34), libstdc++6 (>= 13), libgomp1, ocl-icd-libopencl1
 Recommends: intel-opencl-icd
 Description: Narrow LLM inference engine for Intel Arc GPUs
- arcint serves exactly three Qwen models on exactly two Intel Arc cards over an
- OpenAI-compatible HTTP surface. It owns its scheduler, paged KV cache, GDN
- ledger, exact prefix cache, speculation and sampling; OpenVINO supplies the
- compiler and kernels.
+ arcint serves a short list of hybrid Qwen models (and one Mistral Small
+ finetune) on the Intel Arc A770 and Arc Pro B60 over an OpenAI-compatible
+ HTTP surface. GGUF files run through libllama (llama.cpp at a pinned commit,
+ compiled in) with ggml's OpenCL backend and arcint's Intel kernels; arcint
+ owns the lanes, MTP speculation, context checkpoints, the expert cache's
+ policy and sampling. Needs Intel's compute runtime (intel-opencl-icd) and
+ the xe kernel driver.
  .
  LAN use only: no authentication, permissive CORS — the same warning class
  llama-server prints.
  .
- The systemd user unit and its environment file ship as templates in
- /usr/share/arcint/; copy them to ~/.config/systemd/user/ (on a host with the fleet's unit managers,
- through that manager, and commit them).
+ The systemd user unit ships as a template in /usr/share/arcint/; copy it to
+ ~/.config/systemd/user/ and edit the flags in ExecStart (on a host with a unit
+ manager, hand it the file rather than installing it by hand).

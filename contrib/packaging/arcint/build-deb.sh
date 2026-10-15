@@ -7,14 +7,14 @@
 # comment in the CI workflow). There is no debian-amd64 runner yet —
 # until there is, this recipe is run on a trixie amd64 host by hand.
 #
-# Build dependency: marfrit-openvino must be INSTALLED, not merely available.
-# It carries the CMake package, the headers and the runtime that arcint links.
-# Since 0.5.5 also the second engine's: opencl-headers, ocl-icd-opencl-dev,
-# git (applies contrib/llama.cpp/patches) and python3 (embeds the OpenCL
-# kernels).
+# Build dependencies: opencl-headers, ocl-icd-opencl-dev, git (applies
+# contrib/llama.cpp/patches), python3 (embeds the OpenCL kernels), cmake, g++.
+# Until 0.7.12 the package also linked the OpenVINO engine against an
+# installed marfrit-openvino; that engine was retired in 0.8.0
+# (docs/history.md), and older tags are built with the recipe at their tag.
 set -euo pipefail
 
-PKGVER=0.7.12
+PKGVER=0.8.0
 UPSTREAM_TAG=v${PKGVER}
 PKGREL=1
 # The public repository, not the fleet one. The fleet repo (still named
@@ -31,42 +31,17 @@ ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-53a2555690649a70d4abaf658e1e2a31a
 LLAMA_COMMIT=3e4dfa8f39f904e681737d9f512a6e6338d848aa
 LLAMA_URL="https://github.com/ggml-org/llama.cpp/archive/${LLAMA_COMMIT}.tar.gz"
 LLAMA_TARBALL_SHA256=f9046074c9b71eaf9abd5491001e4d09c327591fed6b9e2bfcfddbb575dc5255
-OV_PREFIX=/usr/lib/marfrit-openvino
-# The ABI is the nightly, not the patch level: floor the patch level, cap at
-# the next nightly. An exact pin (Depends: = +p1-1) made apt REMOVE arcint when
-# the runtime was upgraded to +p3 on 2026-09-04; never render "=" here again.
-# +p25-2: the same +p25 binaries with their RUNPATH set to $ORIGIN (+p25-1 found its
-# own libtbb.so.12 and plugins only on the host it was built on; fresh trixie, 2026-10-07).
-OV_DEP_VERSION="2026.4.0~dev20260821+p25-2"
-# 0.5.5 to 0.6.0 keep the +p25 floor: what they add over 0.5.4 needs no newer
-# runtime by default. Patches 0076 (+p26) and 0077 (+p27) serve opt-in switches of the
-# Flash-Next CPU tier (MOE_CPU_TIER_ADAPTIVE=1, MOE_DOORBELL=1); those need a
-# +p27 runtime built from marfrit-openvino/.
-# The +p25 floor is 0.5.4's (patches 0068-0074: the CPU tier's decode and prefill
-# kernels, the host expert bank, and patch 0073's QSA selection input to
-# PagedAttention, which the served QSA route needs).
-# The +p20 floor was 0.5.0.1's (patches 0044-0067: the native expert formats' OpenCL
-# decode, the all-resident native pool and its dispatch; an older runtime has no
-# native per-expert route at all). +p18 was the floor after patch 0042 (patch 0037's hybrid prefill patch 0037's hybrid prefill
-# launched its gather over every token-expert pair while the tables held only the
-# resident ones — a page fault on Xe2; +p16 and +p17 carry 0037 without the fix).
-# The +p15 floor is 0.4.4's (patch 0033: with four-bit values the verify pass read the
-# value rows through the f16 row's alignment, the agent configuration's alternating
-# text; DESIGN §7.0.2bu -- every +p14 runtime serves that configuration wrong, so the
-# floor is what makes apt pull the fix); +p12 was 0.4.3's (patch 0030), +p11 0.4.1's and
-# 0.4.2's (patches 0022-0029), +p7 0.4.0's (patch 0021). Building an older tag with it
-# would re-issue a released version string under different Depends. Refused.
-case "$PKGVER" in 0.3.*|0.4.0|0.4.1|0.4.2|0.4.3) echo "the +p15 floor is 0.4.4's; bump PKGVER and the tarball sha at the tag" >&2; exit 1 ;; esac
-case "$PKGVER" in 0.4.*|0.5.0) echo "the +p20 floor is 0.5.0.1's; bump PKGVER and the tarball sha at the tag" >&2; exit 1 ;; esac
-case "$PKGVER" in 0.5.0.*|0.5.1|0.5.2|0.5.3) echo "the +p25 floor is 0.5.4's; bump PKGVER and the tarball sha at the tag" >&2; exit 1 ;; esac
-OV_DEP_NEXT_NIGHTLY="2026.4.0~dev20260822"
+# 0.7.12 and older link the OpenVINO engine and depend on marfrit-openvino:
+# building one of them here would re-issue a released version without that
+# Depends. Refused; their recipe is the one at their tag.
+case "$PKGVER" in 0.[0-7].*) echo "$PKGVER links OpenVINO: build it with the recipe at its tag" >&2; exit 1 ;; esac
 HERE=$(dirname "$(readlink -f "$0")")
 
 export SOURCE_DATE_EPOCH=1787990400
 
-# Fail in a second, not after the downloads: the tools and the second
-# engine's build dependencies.
-for t in curl git python3 cmake; do
+# Fail in a second, not after the downloads: the tools and the engine's
+# build dependencies.
+for t in curl git python3 cmake objdump; do
     command -v "$t" >/dev/null || { echo "$t fehlt (Build-Abhaengigkeit)" >&2; exit 1; }
 done
 [ -f /usr/include/CL/cl.h ] || { echo "opencl-headers fehlen (/usr/include/CL/cl.h)" >&2; exit 1; }
@@ -93,8 +68,8 @@ tar xzf arcint.tar.gz
 SRC=$(find . -maxdepth 1 -mindepth 1 -type d | head -1)
 [ -f "$SRC/CMakeLists.txt" ] || { echo "Tarball-Layout unerwartet: kein CMakeLists.txt" >&2; exit 1; }
 
-# The second engine: llama.cpp at the pin, the patches from the arcint tarball
-# itself, so the package and its source agree on them by construction.
+# The engine: llama.cpp at the pin, the patches from the arcint tarball itself,
+# so the package and its source agree on them by construction.
 mkdir llama && cd llama
 curl --connect-timeout 10 --max-time 600 --retry 3 --retry-delay 5 -sSLfo llama.tar.gz "$LLAMA_URL"
 echo "$LLAMA_TARBALL_SHA256  llama.tar.gz" | sha256sum -c
@@ -113,23 +88,15 @@ cd "$work"
 GIT_SHA=${ARCINT_GIT_SHA:-}
 [ -n "$GIT_SHA" ] || { echo "ARCINT_GIT_SHA fehlt — /props wuerde 'unknown' melden" >&2; exit 1; }
 
-[ -f "$OV_PREFIX/openvino/cmake/OpenVINOConfig.cmake" ] || {
-    echo "marfrit-openvino ist nicht installiert ($OV_PREFIX fehlt)" >&2; exit 1; }
-
 cmake -S "$SRC" -B build \
     -DCMAKE_BUILD_TYPE=Release \
-    -DARCINT_OPENVINO=ON \
     -DARCINT_LLAMA=ON \
     -DARCINT_LLAMA_DIR="$LLAMA_DIR" \
     -DARCINT_WERROR=ON \
     -DARCINT_TESTS=ON \
     -DARCINT_GIT_SHA="$GIT_SHA" \
-    -DOpenVINO_DIR="$OV_PREFIX/openvino/cmake" \
-    -DARCINT_TOKENIZERS_SO="$OV_PREFIX/openvino_tokenizers/lib/libopenvino_tokenizers.so" \
+    -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF \
     -DCMAKE_INSTALL_PREFIX=/usr \
-    -DCMAKE_INSTALL_RPATH="$OV_PREFIX/openvino/libs" \
-    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-    -DCMAKE_SKIP_BUILD_RPATH=OFF \
     -DGGML_NATIVE=ON
 # ggml turns GGML_NATIVE off by default when SOURCE_DATE_EPOCH is set (it reads that as a reproducible
 # build), which left every package's ggml-cpu at the SSE2 baseline although docs/docker.md says the .deb is
@@ -155,15 +122,15 @@ DESTDIR="$ROOT" cmake --install build >/dev/null
 # package (headers, static libraries, CMake and pkg-config files).
 STRAY=$(cd "$ROOT" && find . -path ./usr/include -prune -print -o \( -name '*.a' -o -name '*.pc' -o -path '*/cmake/*' -o -name 'libggml*' -o -name 'libllama*' \) -print)
 [ -z "$STRAY" ] || { echo "llama.cpp-Installationsreste im Paket:" >&2; echo "$STRAY" >&2; exit 1; }
-# The binary carries the second engine (its OpenCL kernels are embedded).
-# No pipe: `strings | grep -q` takes SIGPIPE under pipefail (see the RPATH
+# The binary carries the engine (its OpenCL kernels are embedded).
+# No pipe: `strings | grep -q` takes SIGPIPE under pipefail (see the ldd
 # probe below).
 grep -qa kernel_mul_mm_kq2d_q4_K_i8 "$ROOT/usr/bin/arcint" || {
     echo "die libllama-Engine fehlt im Binary (ARCINT_LLAMA?)" >&2; exit 1; }
 # The result of GGML_NATIVE=ON, not only the ask: this host is the target host, so a ggml-cpu dot product
 # without AVX2 here is the SSE-only ggml-cpu of the packages before 0.7.12 (0 ymm registers in 0.7.11's,
 # 58 in a native build). A ggml-cpu function, because the CPU miss rows carry AVX2 in any build. Captured
-# once (no pipe, see the RPATH probe).
+# once (no pipe, see the ldd probe).
 DIS=$(objdump -d --no-show-raw-insn --disassemble=ggml_vec_dot_q4_K_q8_K "$ROOT/usr/bin/arcint")
 case "$DIS" in
     *"%ymm"*) ;;
@@ -171,22 +138,11 @@ case "$DIS" in
 esac
 unset DIS
 
-# RPATH-Probe. This is the whole reason the unit file carries no
-# LD_LIBRARY_PATH: if the binary cannot find its runtime by itself, the failure
-# shows up minutes into a model load on the target host.
-# No pipe here reads part of its input and walks away, and that is deliberate.
-# The old form was `objdump -x … | awk '…{print $2; exit}'`: awk exits at the
-# first match, objdump takes SIGPIPE, and under `set -o pipefail` that kills the
-# script with 141 — after a full build, with no message. It survived 0.2.0 only
-# because objdump's output still fit in the 64 KiB pipe buffer; a slightly
-# larger binary made it deterministic.
-RP=$(objdump -x "$ROOT/usr/bin/arcint" | awk '/RUNPATH|RPATH/ && !seen {seen=1; print $2}')
-case "$RP" in
-    *"$OV_PREFIX/openvino/libs"*) ;;
-    *) echo "RPATH zeigt nicht auf $OV_PREFIX/openvino/libs (ist: '$RP')" >&2; exit 1 ;;
-esac
-# And prove it resolves, here, where it is cheap. Captured once and matched
-# twice: `ldd | grep -q` carries the same SIGPIPE hazard as the probe above.
+# The binary must resolve its libraries by itself (the unit file carries no
+# LD_LIBRARY_PATH): prove it here, where it is cheap, not minutes into a model
+# load on the target host. Captured once and matched twice: `ldd | grep -q`
+# under `set -o pipefail` takes SIGPIPE when grep exits at its first match,
+# and the script dies with 141 after a full build, with no message.
 LDD_OUT=$(ldd "$ROOT/usr/bin/arcint")
 case "$LDD_OUT" in
     *"not found"*)
@@ -194,9 +150,10 @@ case "$LDD_OUT" in
         printf '%s\n' "$LDD_OUT" | grep "not found" >&2
         exit 1 ;;
 esac
+# The retired engine's runtime must not come back through a stale build cache.
 case "$LDD_OUT" in
-    *"$OV_PREFIX/openvino/libs/libopenvino.so"*) ;;
-    *)  echo "libopenvino wird nicht aus $OV_PREFIX geladen" >&2
+    *openvino*|*libtbb*)
+        echo "das Binary linkt OpenVINO (seit 0.8.0 entfernt)" >&2
         printf '%s\n' "$LDD_OUT" >&2
         exit 1 ;;
 esac
@@ -234,16 +191,18 @@ Section: misc
 Priority: optional
 Architecture: amd64
 Installed-Size: ${INSTALLED_KB}
-Depends: libc6 (>= 2.34), libstdc++6 (>= 13), libgomp1, ocl-icd-libopencl1, marfrit-openvino (>= ${OV_DEP_VERSION}), marfrit-openvino (<< ${OV_DEP_NEXT_NIGHTLY})
+Depends: libc6 (>= 2.34), libstdc++6 (>= 13), libgomp1, ocl-icd-libopencl1
 Recommends: intel-opencl-icd
 Maintainer: Markus Fritsche <mfritsche@reauktion.de>
 Homepage: https://github.com/marfrit/arcint
 Description: Narrow LLM inference engine for Intel Arc GPUs
- arcint serves exactly three Qwen models on exactly two Intel Arc cards over an
- OpenAI-compatible HTTP surface. It owns its scheduler, paged KV cache, GDN
- ledger, exact prefix cache, speculation and sampling; OpenVINO supplies the
- compiler and kernels. A second engine (--engine llama) runs GGUF models
- through libllama with ggml's OpenCL backend and arcint's Intel kernels.
+ arcint serves a short list of hybrid Qwen models (and one Mistral Small
+ finetune) on the Intel Arc A770 and Arc Pro B60 over an OpenAI-compatible
+ HTTP surface. GGUF files run through libllama (llama.cpp at a pinned commit,
+ compiled in) with ggml's OpenCL backend and arcint's Intel kernels; arcint
+ owns the lanes, MTP speculation, context checkpoints, the expert cache's
+ policy and sampling. Needs Intel's compute runtime (intel-opencl-icd) and
+ the xe kernel driver.
  .
  LAN use only: no authentication, permissive CORS — the same warning class
  llama-server prints.

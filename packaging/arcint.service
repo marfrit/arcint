@@ -2,7 +2,7 @@
 #
 # Install (package host, which is the normal case):
 #   cp /usr/share/arcint/arcint.service ~/.config/systemd/user/
-#   $EDITOR ~/.config/systemd/user/arcint.service     # model, card, port, name
+#   $EDITOR ~/.config/systemd/user/arcint.service     # GGUF, card, port, name
 #   systemctl --user daemon-reload && systemctl --user enable --now arcint
 #
 # If a unit manager owns ~/.config/systemd/user on your host, hand it this file
@@ -21,9 +21,9 @@
 #     ExecStart: behind an env-file indirection none of that is visible to it,
 #     and neither is it greppable in a journal. One file, self-describing.
 #
-# The binary resolves its own OpenVINO libraries via RPATH, so there is no
-# LD_LIBRARY_PATH here on purpose. If you see "libopenvino.so not found", the
-# build was configured without OpenVINO's location or was moved after install.
+# The binary carries llama.cpp compiled in; at run time it needs the OpenCL
+# ICD loader and Intel's compute runtime on the host (README, "Building").
+# There is no LD_LIBRARY_PATH here on purpose.
 
 [Unit]
 Description=arcint — LLM inference for Intel Arc
@@ -34,51 +34,51 @@ Documentation=https://github.com/marfrit/arcint
 After=default.target
 # One card, one resident model: anything else holding this GPU must not run at
 # the same time. Name the neighbours that actually collide on this host.
-#Conflicts=openarc-coder.service
+#Conflicts=arcint-writer.service
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/arcint \
-    --model /models/ov/qwen36-coder-b5-ov \
-    --model-id qwen3.6-27b-a3b-coder \
-    --served-model-name qwen3.6-coder \
+    --engine llama \
+    --gguf /models/gguf/Qwen3.8-27B-Q4_K_M.gguf \
+    --served-model-name qwen3.8-agent \
     --device GPU.0 \
     --host 0.0.0.0 \
     --port 8080 \
-    --n-ctx 262144 \
-    --prefix-cache-mib 8192 \
-    --cache-dir %h/.cache/arcint \
+    --n-ctx 131072 \
+    --llama-kv q8_0 \
+    --llama-mtp 5 \
     --queue-timeout 30
 
-# --model-id and --served-model-name are two different questions and both are
-# worth spelling out. --model-id is the allowlist assertion: which artifact this
-# process will accept, and it refuses to start on the wrong one.
 # --served-model-name is what /v1/models reports, which is what a discovering
-# proxy pins its roster to and therefore what clients must send. Renaming the
-# endpoint is a one-flag edit; it never weakens the assertion.
+# proxy pins its roster to and therefore what clients must send. The GGUF
+# behind it can change without the clients noticing.
+#
+# --n-ctx is checked by measurement, not by the process: size it at the
+# deepest prompt you will admit and watch the card's peak (DESIGN §3.3). A
+# prompt longer than it is refused with HTTP 400, never truncated.
 #
 # --queue-timeout 30 is deliberate for a *service* endpoint. The engine default
-# is 0 — refuse a request that finds no free lane, with the reservation numbers
-# — because a lane is a memory claim and an unbounded queue is indistinguishable
-# from a hang. But an OpenAI-compatible client generally does not retry a 503,
-# so on a shared endpoint the older, kinder behaviour is the right one.
+# is 0 -- refuse a request that finds no free lane -- because an unbounded
+# queue is indistinguishable from a hang. But an OpenAI-compatible client
+# generally does not retry a 503, so on a shared endpoint waiting is kinder.
 #
-# Other flags worth knowing, none of them enabled here:
-#   --parallel 2          two client sessions at once (DESIGN §4.1). A memory
-#                         claim as much as a flag: the reservation must hold two
-#                         lanes at --n-ctx or the service refuses to start, with
-#                         the arithmetic. At 262144 context it will refuse.
-#   --mtp on              the Qwen3.8 MTP head, where the export carries one
-#   --draft 4             prompt-lookup drafting
-#   --custom-kernels ...  hand-written OpenCL (measurement switch)
+# Other flags worth knowing, none of them enabled here (arcint --help):
+#   --llama-kv q8_0:q4_0  a deeper context in the same VRAM (the agent unit
+#                         runs 245,760 tokens with it on a 24 GB card)
+#   --served-model-name A,B --lane-ctx CA,CB
+#                         two named lanes on one copy of the weights
+#   --llama-checkpoints N recurrent-state checkpoints a lane resumes from
+#                         (default 32)
+#   Flash-Next's expert cache: contrib/systemd/arcint-flashnext.service
 
 # The card holds the model's VRAM for the process lifetime, so a restart is a
 # full reload (minutes). Restart on failure, but do not thrash.
 Restart=on-failure
 RestartSec=30s
 
-# Loading a 13 GiB model and compiling the graph takes minutes on a cold blob
-# cache. systemd must not call that a hung start.
+# Loading a large GGUF and building the OpenCL kernels on a cold kernel cache
+# takes minutes. systemd must not call that a hung start.
 TimeoutStartSec=20min
 TimeoutStopSec=60s
 
@@ -86,11 +86,12 @@ TimeoutStopSec=60s
 StandardOutput=journal
 StandardError=journal
 
-# It reads model artifacts and writes only its blob cache.
+# It reads model files and writes only the OpenCL kernel cache, under /tmp by
+# default (ggml's GGML_OPENCL_KERNEL_CACHE_DIR moves it; keep it persistent, a
+# cold cache rebuilds every kernel at start).
 NoNewPrivileges=true
 PrivateTmp=false
 ProtectHome=read-only
-ReadWritePaths=%h/.cache/arcint
 
 [Install]
 WantedBy=default.target

@@ -1,28 +1,34 @@
 #!/usr/bin/env python3
-"""The M6 gates (DESIGN.md §4.1, §5). Needs a real card, like the equivalence
-suite, and for the same reason: what is being gated is what the GPU does with
-two sequences on it at once.
+"""The lane gates (DESIGN.md §4.1, §4.2, §5) on the libllama engine. Needs a
+real card: what is gated is what the card does with two sequences at once.
 
-    run.py <arcint> <model-dir> [device]
+    run.py <arcint> <model.gguf> [device]
 
-Every check here can fail, and each was run against a deliberately broken build
-before being trusted:
+ARCINT_EXTRA_ARGS is appended to every start (the unit's KV and MTP flags).
+The server runs two named lanes. The gates, each able to fail:
 
-  no cross-slot bleed    two prompts interleaved produce exactly the bytes each
-                         produces alone, in both start orders. This is the gate
-                         the whole milestone rests on: a lane that reads another
-                         lane's KV pages, GDN rows or logits buffer answers a
-                         plausible and different thing, which is the failure
-                         mode this engine exists to refuse.
-  cold/warm per lane     §3.4's invariant, held while the other lane is busy
-  cancellation           one lane's client disappearing leaves the other's bytes
-                         alone and gives the lane back
-  admission              a third concurrent request is a 503 carrying the
-                         reservation numbers, not an allocation failure
+  no cross-lane bleed    two lanes asked at once, each about its own context
+                         with its own code word, in both start orders: each
+                         answers its own word. A lane that read the other's KV,
+                         recurrent state or logits answers a plausible and
+                         different thing. Byte equality with the solo run is a
+                         tripwire (§3.4 point 5): with both lanes busy the
+                         step combiner verifies them in one batch, which may
+                         move a near-tie.
+  both lanes used        the console shows lane 1 working
+  routing                an unknown model name is a 404, not another lane
+  cancellation           one client walking away mid-stream leaves the other
+                         lane's answer right and gives its lane back
+  a busy lane            a second request for a busy lane is a 503 naming the
+                         lane (--queue-timeout 0), never another lane's slot
+  warm under load        a lane's reused prefix while the other lane decodes:
+                         the answer right and the cache hit reported
 """
 import json
 import os
+import tempfile
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -35,12 +41,16 @@ FAILED = []
 
 
 def ok(msg):
-    print(f"  ok   {msg}")
+    print(f"  ok   {msg}", flush=True)
 
 
 def fail(msg):
-    print(f"  FAIL {msg}")
+    print(f"  FAIL {msg}", flush=True)
     FAILED.append(msg)
+
+
+def note(msg):
+    print(f"  --   {msg}", flush=True)
 
 
 def free_port():
@@ -51,26 +61,26 @@ def free_port():
     return p
 
 
+LANES = ("cc-a", "cc-b")
+
+
 class Server:
-    def __init__(self, binary, model, device, log_path, *extra):
+    def __init__(self, binary, model, device, log_path):
         self.port = free_port()
         self.log_path = log_path
         self.log = open(log_path, "wb")
-        # ARCINT_EXTRA_ARGS: the same channel tests/equivalence/run.sh honours.
-        # The acceptance cells (tests/acceptance/cells.json) pass their served
-        # configuration this way; the positional list ends at the device, and
-        # anything after it is dropped, which a cell must never rely on.
-        extra_env = os.environ.get("ARCINT_EXTRA_ARGS", "").split()
+        extra = shlex.split(os.environ.get("ARCINT_EXTRA_ARGS", ""))
         self.proc = subprocess.Popen(
-            [binary, "--model", model, "--device", device, "--host", "127.0.0.1",
-             "--port", str(self.port), *extra_env, *extra],
+            [binary, "--engine", "llama", "--gguf", model, "--device", device, "--host", "127.0.0.1",
+             "--port", str(self.port), "--served-model-name", ",".join(LANES), "--lane-ctx", "12288,12288",
+             "--queue-timeout", "0", *extra],
             stdout=self.log, stderr=subprocess.STDOUT)
 
     @property
     def url(self):
         return f"http://127.0.0.1:{self.port}"
 
-    def wait_ready(self, seconds=2400):
+    def wait_ready(self, seconds=3600):
         for _ in range(seconds):
             try:
                 urllib.request.urlopen(self.url + "/health", timeout=2).read()
@@ -78,16 +88,11 @@ class Server:
             except Exception:                                    # noqa: BLE001
                 if self.proc.poll() is not None:
                     print("server died:")
-                    print(self.tail(30))
+                    print(self.text()[-3000:])
                     return False
                 time.sleep(1)
         print("server never became ready")
         return False
-
-    def tail(self, n=20):
-        self.log.flush()
-        with open(self.log_path, "r", errors="replace") as f:
-            return "".join(f.readlines()[-n:])
 
     def text(self):
         self.log.flush()
@@ -100,107 +105,109 @@ class Server:
     def close(self):
         self.proc.terminate()
         try:
-            self.proc.wait(timeout=30)
+            self.proc.wait(timeout=90)
         except subprocess.TimeoutExpired:
             self.proc.kill()
         self.log.close()
 
 
-def body(prompt, max_tokens, stream=False):
-    return {"messages": [{"role": "user", "content": prompt}],
+def body(prompt, model, max_tokens, stream=False):
+    return {"model": model, "messages": [{"role": "user", "content": prompt}],
             "temperature": 0, "max_tokens": max_tokens, "stream": stream,
             "chat_template_kwargs": {"enable_thinking": False}}
 
 
-def ask(url, prompt, max_tokens=48):
+def ask(url, prompt, model, max_tokens=32):
     """One non-streaming greedy answer, or ('HTTP', status, body) on refusal."""
     req = urllib.request.Request(url + "/v1/chat/completions",
-                                 data=json.dumps(body(prompt, max_tokens)).encode(),
+                                 data=json.dumps(body(prompt, model, max_tokens)).encode(),
                                  headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=1800) as r:
+        with urllib.request.urlopen(req, timeout=3600) as r:
             o = json.load(r)
             return o["choices"][0]["message"]["content"] or ""
     except urllib.error.HTTPError as e:
-        return ("HTTP", e.code, json.loads(e.read().decode("utf-8", "replace")))
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            return ("HTTP", e.code, json.loads(raw))
+        except ValueError:
+            return ("HTTP", e.code, {"raw": raw})
 
 
-def ask_async(url, prompt, out, key, max_tokens=48, delay=0.0):
+def ask_async(url, prompt, model, out, key, max_tokens=32, delay=0.0):
     def run():
         if delay:
             time.sleep(delay)
-        out[key] = ask(url, prompt, max_tokens)
+        out[key] = ask(url, prompt, model, max_tokens)
     t = threading.Thread(target=run)
     t.start()
     return t
 
 
-FILLER = ("A gated delta network folds every token it has seen into a fixed-size "
-          "recurrent state. ")
-PROMPT_A = ("Explain in one paragraph, without bullet points, why a recurrent "
-            "linear-attention state cannot be truncated the way an attention KV "
-            "cache can. " + FILLER * 40)
-PROMPT_B = ("Write a short Python function that merges two sorted lists, then "
-            "explain its complexity in one sentence. " + FILLER * 40)
+def context(seed, word):
+    lines = []
+    x = seed
+    for _ in range(160):
+        x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+        lines.append(f"Entry {x % 10007}: crate {x % 97} shipped to dock {x % 13} on day {x % 365}.")
+    lines.insert(70, f"The secret code word is {word}. Remember it.")
+    return " ".join(lines) + "\n\nWhat is the secret code word? Answer with the code word only."
 
 
-def check_no_cross_slot_bleed(srv):
-    """Two prompts at once must be byte-identical to each one alone."""
-    solo_a = ask(srv.url, PROMPT_A)
-    solo_b = ask(srv.url, PROMPT_B)
-    if not isinstance(solo_a, str) or not isinstance(solo_b, str) or not solo_a or not solo_b:
-        fail(f"solo baselines produced answers (got {solo_a!r:.80} / {solo_b!r:.80})")
+WORD_A, WORD_B = "VIOLET-HARBOR-42", "ORANGE-FALCON-77"
+PROMPT_A, PROMPT_B = context(3, WORD_A), context(5, WORD_B)
+
+
+def right(text, word):
+    return isinstance(text, str) and word.lower() in text.lower()
+
+
+def check_no_cross_lane_bleed(srv):
+    solo_a = ask(srv.url, PROMPT_A, LANES[0])
+    solo_b = ask(srv.url, PROMPT_B, LANES[1])
+    if not right(solo_a, WORD_A) or not right(solo_b, WORD_B):
+        fail(f"solo baselines answer their own word (got {str(solo_a)[:40]!r} / {str(solo_b)[:40]!r})")
         return
-    ok(f"solo baselines: {len(solo_a)} and {len(solo_b)} chars")
-
-    for order, (first, second) in (("A then B", (PROMPT_A, PROMPT_B)),
-                                   ("B then A", (PROMPT_B, PROMPT_A))):
+    ok("solo baselines answer their own word")
+    for order, first in (("a then b", 0), ("b then a", 1)):
         got = {}
-        t1 = ask_async(srv.url, first, got, "first")
-        # Long enough that the first request is in decode, short enough that it
-        # is nowhere near finished: the interleaving has to be real.
-        t2 = ask_async(srv.url, second, got, "second", delay=0.7)
+        prompts = {0: (PROMPT_A, LANES[0], WORD_A, solo_a), 1: (PROMPT_B, LANES[1], WORD_B, solo_b)}
+        p1, p2 = prompts[first], prompts[1 - first]
+        t1 = ask_async(srv.url, p1[0], p1[1], got, p1[1], max_tokens=64)
+        t2 = ask_async(srv.url, p2[0], p2[1], got, p2[1], max_tokens=64, delay=0.5)
         t1.join()
         t2.join()
-        want = {"first": solo_a if first is PROMPT_A else solo_b,
-                "second": solo_a if second is PROMPT_A else solo_b}
-        for key in ("first", "second"):
-            if got.get(key) == want[key]:
-                ok(f"interleaved ({order}), {key} request is byte-identical to its solo run")
+        for prompt, lane, word, solo in (p1, p2):
+            if right(got.get(lane), word):
+                ok(f"concurrent ({order}): lane {lane} answers its own word")
             else:
-                fail(f"interleaved ({order}), {key} request is byte-identical to its solo run")
-                print(f"       solo: {want[key][:160]!r}")
-                print(f"       conc: {str(got.get(key))[:160]!r}")
-
-    # Equality proves nothing if the two never actually shared the card.
+                fail(f"concurrent ({order}): lane {lane} answers its own word (got {str(got.get(lane))[:60]!r})")
+            if got.get(lane) == solo:
+                ok(f"concurrent ({order}): lane {lane} byte-identical to its solo run")
+            else:
+                note(f"concurrent ({order}): lane {lane} DIFFERS from its solo run (tripwire, reported, not gated)")
     if re.search(r"slot 1: (prefill|decode)", srv.text()):
         ok("both lanes were used (the console shows slot 1 working)")
     else:
-        fail("both lanes were used -- everything ran on slot 0, so equality proved nothing")
+        fail("both lanes were used -- everything ran on slot 0, so the check proved nothing")
 
 
-def check_stall_is_reported(srv):
-    """The console must say what the other lane cost, or the bound is a claim."""
-    if re.search(r"stall p95 +\d+ ms", srv.text()):
-        line = [l for l in srv.text().splitlines() if "stall p95" in l][-1]
-        ok(f"the console reports the stall ({line.split('|')[-1].strip()})")
+def check_routing(srv):
+    r = ask(srv.url, "Say hello.", "no-such-lane", 8)
+    if isinstance(r, tuple) and r[1] == 404:
+        ok("an unknown model name is a 404")
     else:
-        fail("the console reports the stall a lane suffered (no 'stall p95' line)")
+        fail(f"an unknown model name is a 404 (got {r if isinstance(r, tuple) else 'an answer'})")
 
 
 def check_cancel_leaves_the_other_alone(srv):
-    """One client walking away must not touch the other's bytes or its lane."""
-    solo_b = ask(srv.url, PROMPT_B)
-
     got = {}
-    keep = ask_async(srv.url, PROMPT_B, got, "kept", delay=0.5)
-
-    # A streaming request that is abandoned mid-decode: the socket closes, and
-    # §3.7 says the work stops at the next boundary.
+    keep = ask_async(srv.url, PROMPT_B, LANES[1], got, "kept", delay=0.5)
     req = urllib.request.Request(srv.url + "/v1/chat/completions",
-                                 data=json.dumps(body(PROMPT_A, 512, stream=True)).encode(),
+                                 data=json.dumps(body(PROMPT_A + " Then explain it at length.", LANES[0], 512,
+                                                      stream=True)).encode(),
                                  headers={"Content-Type": "application/json"})
-    resp = urllib.request.urlopen(req, timeout=600)
+    resp = urllib.request.urlopen(req, timeout=3600)
     seen = 0
     for raw in resp:
         if raw.startswith(b"data: "):
@@ -208,101 +215,70 @@ def check_cancel_leaves_the_other_alone(srv):
         if seen > 4:
             break
     resp.close()                      # the client is gone
-
     keep.join()
-    if got.get("kept") == solo_b:
-        ok("cancelling one lane leaves the other's bytes untouched")
+    if right(got.get("kept"), WORD_B):
+        ok("cancelling one lane leaves the other's answer right")
     else:
-        fail("cancelling one lane leaves the other's bytes untouched")
-        print(f"       solo: {solo_b[:160]!r}")
-        print(f"       with: {str(got.get('kept'))[:160]!r}")
-
-    for _ in range(60):
+        fail(f"cancelling one lane leaves the other's answer right (got {str(got.get('kept'))[:60]!r})")
+    h = {}
+    for _ in range(120):
         h = srv.health()
-        if h["slots_free"] == h["slots_total"]:
+        if h.get("slots_free") == h.get("slots_total"):
             break
         time.sleep(0.5)
-    h = srv.health()
-    if h["slots_free"] == h["slots_total"]:
+    if h.get("slots_free") == h.get("slots_total"):
         ok(f"the cancelled lane came back ({h['slots_free']}/{h['slots_total']} free)")
     else:
-        fail(f"the cancelled lane came back (only {h['slots_free']}/{h['slots_total']} free)")
-
-    if h["kv_blocks_free"] == h["kv_blocks_total"]:
-        ok(f"its KV pages came back too ({h['kv_blocks_free']} of {h['kv_blocks_total']})")
-    else:
-        fail(f"its KV pages came back too ({h['kv_blocks_free']} of {h['kv_blocks_total']} "
-             f"-- pages leaked)")
+        fail(f"the cancelled lane came back (only {h.get('slots_free')}/{h.get('slots_total')} free)")
 
 
-def check_third_request_is_a_clean_503(srv):
-    """A lane is a memory reservation; a third one is refused with the numbers."""
+def check_busy_lane_is_a_503(srv):
     got = {}
-    busy = [ask_async(srv.url, PROMPT_A, got, f"busy{i}", 256) for i in range(2)]
-    time.sleep(1.0)                    # both lanes in flight
-    third = ask(srv.url, "Say hello.", 16)
-    for t in busy:
-        t.join()
-
-    if not (isinstance(third, tuple) and third[0] == "HTTP"):
-        fail("a third concurrent request is refused rather than served (it was served)")
-        return
-    status, payload = third[1], third[2]
-    if status != 503:
-        fail(f"a third concurrent request is refused with 503 (got {status})")
-        return
-    ok("a third concurrent request is refused with 503")
-
-    message = payload.get("error", {}).get("message", "")
-    if payload.get("reservation") and re.search(r"\d+\.\d+ GiB", message):
-        ok(f"the refusal carries the numbers ({message[:120]}...)")
+    # a long generation, so the lane stays busy while the second request arrives
+    busy = ask_async(srv.url, "Write a story of at least 600 words about a lighthouse keeper.", LANES[0], got, "busy", 600)
+    for _ in range(200):              # until /health shows lane a taken
+        lanes = {l.get("name"): l for l in srv.health().get("lanes", [])}
+        if lanes.get(LANES[0], {}).get("slots_free", 1) == 0:
+            break
+        time.sleep(0.1)
+    second = ask(srv.url, "Say hello.", LANES[0], 8)
+    other = ask(srv.url, "What is the capital of France? Answer in one word.", LANES[1], 8)
+    busy.join()
+    if isinstance(second, tuple) and second[1] == 503:
+        ok("a second request for a busy lane is a 503")
+        sl = second[2].get("slots", {})
+        if sl.get("lane") == LANES[0] and sl.get("free") == 0 and sl.get("total") == 1:
+            ok(f"the 503 carries the lane's numbers ({json.dumps(sl)[:120]})")
+        else:
+            fail(f"the 503 carries the lane's numbers (slots {json.dumps(sl)[:200]})")
     else:
-        fail("the refusal carries the reservation numbers")
-        print(f"       body: {json.dumps(payload)[:300]}")
-
-    if "CL_OUT_OF_RESOURCES" not in srv.text():
-        ok("nothing hit an allocation failure on the card")
+        fail(f"a second request for a busy lane is a 503 (got {second if isinstance(second, tuple) else 'an answer'})")
+    if right(other, "paris"):
+        ok("the other lane serves meanwhile")
     else:
-        fail("nothing hit an allocation failure on the card (CL_OUT_OF_RESOURCES in the log)")
+        fail(f"the other lane serves meanwhile (got {other!r:.60})")
 
 
-def check_cold_warm_under_load(binary, model, device, work):
-    """§3.4's invariant, held while the other lane is busy."""
-    srv = Server(binary, model, device, f"{work}/cache.log", "--n-ctx", "8192",
-                 "--parallel", "2", "--prefix-cache-mib", "4096",
-                 "--kv-block-size", "32", "--prefill-chunk", "64")
-    try:
-        if not srv.wait_ready():
-            fail("the prefix-cache server started")
-            return
-        cold = ask(srv.url, PROMPT_A)          # populates
-        got = {}
-        noise = ask_async(srv.url, PROMPT_B, got, "noise", 256)
-        time.sleep(0.5)                        # the other lane is decoding
-        warm = ask(srv.url, PROMPT_A)          # must hit, on the other lane
-        noise.join()
-
-        if warm == cold:
-            ok("warm output is byte-identical to cold with the other lane busy")
-        else:
-            fail("warm output is byte-identical to cold with the other lane busy")
-            print(f"       cold: {cold[:160]!r}")
-            print(f"       warm: {warm[:160]!r}")
-
-        if "cache hit" in srv.text():
-            hit = [l for l in srv.text().splitlines() if "cache hit" in l][-1]
-            ok(f"the cache actually hit ({hit.split('|')[-1].strip()})")
-        else:
-            fail("the cache actually hit (no hit, so the equality above proved nothing)")
-
-        h = srv.health()
-        if h["kv_blocks_free"] < h["kv_blocks_total"]:
-            ok(f"the cache is holding KV pages ({h['kv_blocks_total'] - h['kv_blocks_free']} "
-               f"of {h['kv_blocks_total']})")
-        else:
-            fail("the cache is holding KV pages (it holds none, so nothing was shared)")
-    finally:
-        srv.close()
+def check_warm_under_load(srv):
+    cold = ask(srv.url, PROMPT_A, LANES[0])
+    got = {}
+    noise = ask_async(srv.url, PROMPT_B, LANES[1], got, "noise", 256)
+    time.sleep(0.5)                   # the other lane is busy
+    warm = ask(srv.url, PROMPT_A, LANES[0])
+    noise.join()
+    if right(warm, WORD_A):
+        ok("a lane's reused prefix answers right with the other lane busy")
+    else:
+        fail(f"a lane's reused prefix answers right with the other lane busy (got {str(warm)[:60]!r})")
+    hits = re.findall(r"slot 0: prefill .*cache hit (\d+) tok", srv.text())
+    if hits and int(hits[-1]) > 1000:
+        ok(f"the lane reused its prefix (cache hit {hits[-1]} tok)")
+    else:
+        fail("the lane reused its prefix (no cache hit on slot 0, so the check proved nothing)")
+    if warm == cold:
+        ok("warm byte-identical to cold under load")
+    else:
+        note("warm DIFFERS from cold under load (tripwire, reported, not gated)")
 
 
 def main():
@@ -311,24 +287,20 @@ def main():
         return 2
     binary, model = sys.argv[1], sys.argv[2]
     device = sys.argv[3] if len(sys.argv) > 3 else "GPU.0"
-    work = "/tmp/arcint-concurrency"
-    subprocess.run(["mkdir", "-p", work], check=True)
-
-    print(f"== arcint concurrency suite on {device}")
-    srv = Server(binary, model, device, f"{work}/main.log", "--n-ctx", "8192", "--parallel", "2")
+    work = tempfile.mkdtemp(prefix="arcint-cc-")   # per run: two cells may run at once on two cards
+    print(f"== arcint concurrency suite: {os.path.basename(model)} on {device}", flush=True)
+    srv = Server(binary, model, device, f"{work}/main.log")
     try:
         if not srv.wait_ready():
             fail("the two-lane server started")
         else:
-            check_no_cross_slot_bleed(srv)
-            check_stall_is_reported(srv)
+            check_no_cross_lane_bleed(srv)
+            check_routing(srv)
             check_cancel_leaves_the_other_alone(srv)
-            check_third_request_is_a_clean_503(srv)
+            check_busy_lane_is_a_503(srv)
+            check_warm_under_load(srv)
     finally:
         srv.close()
-
-    check_cold_warm_under_load(binary, model, device, work)
-
     print()
     if FAILED:
         print(f"concurrency: {len(FAILED)} check(s) failed")

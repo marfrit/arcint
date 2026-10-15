@@ -1,74 +1,53 @@
-# Two cards, two engines: the dev fleet's units as an example
+# Two cards, four services: the dev fleet's units as an example
 
 These are the user units one host runs in production, with the operator-local
 detail taken out. `packaging/arcint.service` is the *template* the package
-installs; these are what it looks like once two cards and two models are on
-one machine. Every flag is literal in `ExecStart` on purpose: a unit manager
-and a journal can both read the port, the served name and the context there.
+installs; these are what it looks like once two cards and several models are
+on one machine. Every flag is literal in `ExecStart` on purpose: a unit
+manager and a journal can both read the port, the served name and the
+context there. Each unit's header comment carries what was measured with
+exactly its flags.
 
 | unit | card | model | port |
 |---|---|---|---|
-| `arcint-agent.service` | GPU.0 (Arc Pro B60, 24 GB) | Qwen3.8-27B dense, Q4_K_M GGUF on the libllama engine, q8_0:q4_0 KV, 245,760 tokens, MTP 5 | 8087 |
-| `arcint-writer.service` | GPU.0, on demand | Cydonia 24B v4.3 (Mistral Small 3.2 finetune), Q4_K_M GGUF on the libllama engine, 98,304 tokens | 8088 |
-| `arcint-flashnext.service` | GPU.0, on demand | Qwen3.8-Flash-Next IQ2_XS on the libllama engine: expert cache (9,500 MiB of slots, the rest in pinned host memory), MTP 2, 131,072 tokens; since 0.7.3 the bank stream for prefill (`GGML_OPENCL_BANK_STREAM=1`) | 8089 |
-| `arcint-coder.service` | GPU.1 (Arc A770, 16 GB) | Qwen3.6-27B-A3B coder, the searched `c5f495ac shq8` GGUF on the libllama engine, q8_0:q4_0 KV, 98,304 tokens, MTP 4 | 8080 |
-| `arcint-coder-openvino.service` | GPU.1 | the coder's OpenVINO export (the b5 IR); the coder until 2026-10-05, kept as its rollback | 8080 |
-| `arcint-agent-openvino.service` | GPU.0 | Qwen3.8-27B dense, Intel's public int4 IR on the OpenVINO engine, MTP on; the agent until 0.5.5 | 8087 |
-| `arcint-qwen38-mtp.service` | GPU.0 | Qwen3.8-27B, Intel's public int4 IR with the reconstructed MTP head | 8088 — an example, not deployed |
+| `arcint-agent.service` | GPU.0 (Arc Pro B60, 24 GB) | Qwen3.8-27B dense, Q4_K_M GGUF, q8_0:q4_0 KV, 245,760 tokens, MTP 5 | 8087 |
+| `arcint-writer.service` | GPU.0, on demand | Cydonia 24B v4.3 (Mistral Small 3.2 finetune), imatrix Q4_K_M GGUF, q8_0 KV, 98,304 tokens | 8088 |
+| `arcint-flashnext.service` | GPU.0, on demand | Qwen3.8-Flash-Next IQ2_XS: expert cache (13,400 MiB of slots, the rest in pinned host memory), the CPU misses, the bank stream for prefill, MTP 3 with Strata's stop, 131,072 tokens, q8_0 KV | 8089 |
+| `arcint-flashnext-iq3xxs.service` | GPU.0, on demand | the same model from ISTA-DASLab's IQ3_XXS (KL 0.218 against IQ2_XS's 0.294): 12,000 MiB of slots, the CPU misses | 8089 |
+| `arcint-coder.service` | GPU.1 (Arc A770, 16 GB) | Qwen3.6-27B-A3B coder, the searched `c5f495ac shq8` GGUF, q8_0:q4_0 KV, 98,304 tokens, MTP 4 | 8080 |
 
-The three GPU.0 units take turns on one card (`Conflicts=`); on the host
-they come from, a unit manager switches between them on demand. The
-OpenVINO units' notes below (`--paged-kv`, `--prefill-chunk`,
-`--cache-host-mib`, the reservation) apply to the `-openvino` units; the
-libllama units take their context from `--n-ctx` and their KV type from
-`--llama-kv`.
+The GPU.0 units take turns on one card (`Conflicts=`); on the host they come
+from, a unit manager switches between them on demand. Flash-Next's other
+quants run as variants of `arcint-flashnext.service` with the same port and
+served name, conflicting with it and with each other: IQ3_XXS now,
+UD-Q3_K_XL once the host has 96 GB (`docs/llama-engine.md`, "Flash-Next
+quant options").
 
 Things worth copying rather than re-learning:
 
-- **Size an expert cache for what a request takes, not for what is free
-  after the load** (`arcint-flashnext.service`). On the B60 the first request
-  keeps ~0.9 GiB and a 20k prefill needs ~3 GiB more for a while; with less
-  room, xe evicts buffers to host memory and leaves them there (verify 4.5 s
-  instead of ~25 ms). Watch the process's `drm-resident-gtt` in
+- **Size the VRAM for what a request takes, not for what is free after the
+  load.** On the B60 the first request keeps ~0.9 GiB and a 20k prefill
+  needs ~3 GiB more for a while; with less room, xe evicts buffers to host
+  memory and leaves them there (a verify took 4.5 s instead of ~25 ms). Each
+  unit's context and slot budget were set from the peak at its deepest
+  admitted prompt. Watch the process's `drm-resident-gtt` in
   `/proc/<pid>/fdinfo`: above the bank's size, something was evicted.
-
 - **`Conflicts=`, not arithmetic, keeps a card exclusive.** A resident model
-  holds its VRAM for the process lifetime, and a second engine loading beside
-  it fails with allocation errors at best. Each unit names the other units
-  that want the same card, including retired ones kept as rollback paths —
-  starting a retired unit then stops the live one instead of colliding with it.
-- **`--served-model-name` names the endpoint, `--model-id` asserts the
-  artifact.** A proxy pins its roster to the former; the latter refuses to
-  start on the wrong directory.
-- **The reservation decides the context, not the flag.** `--n-ctx 151552` on
-  the 24 GB card and `--n-ctx 131072` on the 16 GB card are the flags; the
-  actual served context is whatever the reservation arithmetic on that card
-  allows, printed at boot, not a defect.
-- **`--gate-pad 16` is a no-op on a dense model.** It matters only for MoE
-  traffic patterns (the old 35B agent); the dense 27B agent omits it. On the
-  coder (also dense, one-shot coding traffic that is decode-bound) it was never
-  set. DESIGN 7.0.2g has the break-even for MoE.
-- **`--paged-kv u8:i4`** on the agent (half-precision keys, quarter-precision
-  values) extends the context window; `--paged-kv u8` on the coder halves the
-  KV pages. Both are byte-equal on the acceptance task.
-- **`--prefill-chunk 512`** on the agent keeps prompt ingestion chunked so
-  chunked-prefill scheduling works; the coder leaves it at the default.
-- **`--cache-host-mib 4096`** on the agent enables the host KV tier (§4.4):
-  evicted prefix-cache entries are demoted to host RAM instead of being
-  discarded, so a returning session restores from host memory (~0.1 s) rather
-  than re-prefilling from scratch (~35 s).
-- `TimeoutStartSec=20min`: a cold blob cache means minutes of graph compile
-  before the port answers, and systemd must not call that a hung start.
+  holds its VRAM for the process lifetime, and a second process loading
+  beside it fails at best and faults the card at worst.
+- **`--served-model-name` names the endpoint.** A proxy pins its roster to
+  it and reads the context from `/v1/models`; the GGUF behind it can change
+  without the clients noticing.
+- **`--queue-timeout 30`**: a request for a busy lane waits that long and
+  then gets a 503 with the lane's numbers, instead of an immediate refusal.
+- **Flash-Next needs its host memory free**: the bank (20.32 GiB for IQ2_XS)
+  is pinned, beside the page cache of its GGUF (39.2 GB for the IQ2_XS shard 1) and the 27 GiB n-gram
+  table read lazily. Serve the GGUF from local NVMe, not a network or ZFS
+  pool: the first answers read about 1 GB from storage.
+- `TimeoutStartSec=20min` (30 for Flash-Next): loading Flash-Next fills the
+  slots and the bank from the file, several minutes.
 - A restart is a full reload of the model; `RestartSec=30` so a crash loop
   does not thrash the card.
 
-Adjust `--model` to where your artifacts are, `--cache-dir` to a writable
-place (it is the only thing the process writes), and the `Conflicts=` lines to
-the units that actually share a card on your host.
-
-A GGUF-opened unit (0.4.0 stage 1) is the same unit with `--gguf FILE` added
-and `--model` naming the served IR of the same architecture as the template;
-it needs `marfrit-openvino` at `+p7` (patch 0021). None of the units above is
-served that way yet: the K-quant path prefills at chunk 256 and decodes at
-about half the IR's rate on the 24 GB card (*FURTHER-READING.md*'s *Measured*
-section), which is 0.4.1's work.
+Adjust `--gguf` to where your files are and the `Conflicts=` lines to the
+units that actually share a card on your host.

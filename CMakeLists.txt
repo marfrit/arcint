@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 0.7.12 LANGUAGES CXX)
+project(arcint VERSION 0.8.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,8 +10,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-option(ARCINT_OPENVINO "Build the OpenVINO executor backend (M1+)" OFF)
-# 0.5.3.1459: the libllama executor -- ggml's OpenCL backend runs the GGUF.
+# The libllama executor -- ggml's OpenCL backend runs the GGUF.
 # ARCINT_LLAMA_DIR is a llama.cpp source tree at the pinned commit with
 # contrib/llama.cpp/patches applied (contrib/llama.cpp/README.md); it is built
 # as a subproject, static, OpenCL on.
@@ -19,13 +18,6 @@ option(ARCINT_LLAMA "Build the libllama (ggml OpenCL) executor backend" OFF)
 set(ARCINT_LLAMA_DIR "" CACHE PATH "llama.cpp source tree for ARCINT_LLAMA")
 option(ARCINT_WERROR   "Treat compiler warnings as errors"         OFF)
 option(ARCINT_TESTS    "Build the test binaries"                   ON)
-
-# The tokenizers extension ships with the OpenVINO wheel rather than with the
-# runtime, so its path is deployment configuration. Baking the configure-time
-# location in is what lets the installed binary start without a wrapper script
-# that has to know where a Python virtualenv lives.
-set(ARCINT_TOKENIZERS_SO "" CACHE FILEPATH
-    "Path to libopenvino_tokenizers.so (default: found next to the OpenVINO runtime)")
 
 find_package(Threads REQUIRED)
 
@@ -68,31 +60,14 @@ target_include_directories(arcint_vendor SYSTEM INTERFACE "${CMAKE_CURRENT_SOURC
 add_library(arcint_core STATIC
   src/config.cpp
   src/util/log.cpp
-  src/util/sha256.cpp
   src/util/utf8.cpp
   src/util/text.cpp
-  src/core/affinity.cpp
-  src/core/artifact.cpp
-  src/core/block_pool.cpp
-  src/core/gguf.cpp
-  src/core/gguf_dequant.cpp
-  src/core/gguf_map.cpp
-  src/core/gguf_repack.cpp
-  src/core/model_registry.cpp
-  src/core/ngram_header.cpp
-  src/exec/ngram_table.cpp
-  src/exec/ngram_reader.cpp
-  src/core/prefix_cache.cpp
   src/core/reasoning.cpp
   src/core/sampler.cpp
   src/core/sampling.cpp
   src/core/stop.cpp
   src/core/toolcall.cpp
   src/core/chat.cpp
-  src/core/dflash_select.cpp
-  src/core/drafter.cpp
-  src/core/draft_policy.cpp
-  src/core/turnstile.cpp
   src/exec/backend_stub.cpp
   src/api/error.cpp
   src/api/handlers.cpp
@@ -105,40 +80,6 @@ target_link_libraries(arcint_core PUBLIC arcint_vendor Threads::Threads)
 target_compile_options(arcint_core PRIVATE -Wall -Wextra -Wpedantic)
 if(ARCINT_WERROR)
   target_compile_options(arcint_core PRIVATE -Werror)
-endif()
-
-if(ARCINT_OPENVINO)
-  find_package(OpenVINO REQUIRED COMPONENTS Runtime)
-  target_sources(arcint_core PRIVATE src/exec/backend_ov.cpp src/exec/gguf_graph.cpp)
-  target_link_libraries(arcint_core PUBLIC openvino::runtime)
-  target_compile_definitions(arcint_core PUBLIC ARCINT_OPENVINO=1)
-
-  # Where OpenVINO's own shared objects live; the installed binary needs to
-  # find them without LD_LIBRARY_PATH being set by hand at every start.
-  get_target_property(_ov_lib openvino::runtime IMPORTED_LOCATION_RELEASE)
-  if(NOT _ov_lib)
-    get_target_property(_ov_lib openvino::runtime IMPORTED_LOCATION)
-  endif()
-  if(_ov_lib)
-    get_filename_component(ARCINT_OV_LIBDIR "${_ov_lib}" DIRECTORY)
-  endif()
-
-  if(NOT ARCINT_TOKENIZERS_SO AND ARCINT_OV_LIBDIR)
-    # The wheel puts it in a sibling package, not beside the runtime.
-    file(GLOB _tok
-         "${ARCINT_OV_LIBDIR}/../../openvino_tokenizers/lib/libopenvino_tokenizers.so"
-         "${ARCINT_OV_LIBDIR}/libopenvino_tokenizers.so")
-    if(_tok)
-      list(GET _tok 0 _tok0)
-      get_filename_component(ARCINT_TOKENIZERS_SO "${_tok0}" REALPATH)
-    endif()
-  endif()
-  if(ARCINT_TOKENIZERS_SO)
-    message(STATUS "arcint: tokenizers extension ${ARCINT_TOKENIZERS_SO}")
-  else()
-    message(WARNING "arcint: libopenvino_tokenizers.so not found; set "
-                    "ARCINT_TOKENIZERS_SO at configure time or in the environment")
-  endif()
 endif()
 
 if(ARCINT_LLAMA)
@@ -183,10 +124,6 @@ if(ARCINT_LLAMA)
   endif()
 endif()
 
-# Generated last on purpose: it bakes in the tokenizers path discovered above,
-# and a configure_file that runs before the discovery writes an empty one (which
-# is a binary that cannot start without a wrapper -- exactly what the baked path
-# exists to avoid).
 configure_file(cmake/build_info.h.in "${CMAKE_CURRENT_BINARY_DIR}/generated/build_info.h" @ONLY)
 
 # ----------------------------------------------------------------------- exe
@@ -196,21 +133,10 @@ target_compile_options(arcint PRIVATE -Wall -Wextra -Wpedantic)
 
 # ------------------------------------------------------------------- install
 #
-# Enough to run the engine from a systemd unit: a binary that resolves its own
-# shared objects, so the unit carries flags rather than a library search path.
-if(ARCINT_OV_LIBDIR)
-  get_filename_component(_tok_dir "${ARCINT_TOKENIZERS_SO}" DIRECTORY)
-  set_target_properties(arcint PROPERTIES
-    INSTALL_RPATH "${ARCINT_OV_LIBDIR};${_tok_dir}"
-    BUILD_WITH_INSTALL_RPATH FALSE)
-endif()
-
+# Enough to run the engine from a systemd unit: the unit carries flags, the
+# binary links ggml statically and finds the OpenCL ICD loader by itself.
 include(GNUInstallDirs)
 install(TARGETS arcint RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
-install(FILES models/allowlist-raw.json
-        DESTINATION "${CMAKE_INSTALL_DATADIR}/arcint")
-install(PROGRAMS tools/export_mtp.py
-        DESTINATION "${CMAKE_INSTALL_DATADIR}/arcint/tools")
 # The unit ships as a template rather than being installed into a user's
 # systemd directory: arcint runs as a *user* unit, and on the fleet that
 # directory is a git repo owned by the unit manager. Installed from here so the
@@ -227,7 +153,7 @@ install(FILES packaging/arcint.service
 # carry LABELS acceptance instead so the partition is assertable
 # (`ctest -N -L acceptance` must list zero tests in a default build).
 option(ARCINT_ACCEPTANCE
-       "Register the card-requiring acceptance cells (tests/acceptance/cells.json); needs ARCINT_OPENVINO" OFF)
+       "Register the card-requiring acceptance cells (tests/acceptance/cells.json); needs ARCINT_LLAMA" OFF)
 
 if(ARCINT_ACCEPTANCE AND NOT ARCINT_TESTS)
   message(FATAL_ERROR
@@ -235,9 +161,9 @@ if(ARCINT_ACCEPTANCE AND NOT ARCINT_TESTS)
     "cells register nowhere and `ctest -L acceptance` reports zero tests, green.")
 endif()
 
-if(ARCINT_ACCEPTANCE AND NOT ARCINT_OPENVINO)
+if(ARCINT_ACCEPTANCE AND NOT ARCINT_LLAMA)
   message(FATAL_ERROR
-    "ARCINT_ACCEPTANCE=ON requires ARCINT_OPENVINO=ON. A stub binary would "
+    "ARCINT_ACCEPTANCE=ON requires ARCINT_LLAMA=ON. A stub binary would "
     "'pass' a card cell by serving stub bytes, which is worse than refusing "
     "to configure at all (docs/design-0.3.1-test-ladder.md §7).")
 endif()
@@ -246,54 +172,25 @@ if(ARCINT_TESTS)
   enable_testing()
   add_executable(arcint-test
     tests/test_main.cpp
-    tests/test_patches_mirror.cpp
     tests/test_utf8.cpp
     tests/test_toolcall.cpp
     tests/test_sampler.cpp
     tests/test_sampling.cpp
     tests/test_stop.cpp
-    tests/test_registry.cpp
     tests/test_chat.cpp
-    tests/test_dflash_select.cpp
-    tests/test_dflash_window.cpp
-    tests/test_drafter.cpp
     tests/test_text.cpp
     tests/test_config.cpp
     tests/test_verify_walk.cpp
     tests/test_token_ids.cpp
     tests/test_props.cpp
     tests/test_lanes.cpp
-    tests/test_artifact.cpp
-    tests/test_ngram_admit.cpp
-    tests/test_prefix_cache.cpp
     tests/test_reasoning.cpp
-    tests/test_block_pool.cpp
-    tests/test_turnstile.cpp
-    tests/test_provenance.cpp
-    tests/test_sha256.cpp
-    tests/test_gguf.cpp
-    tests/test_gguf_graph.cpp
-    tests/test_gguf_repack.cpp
-    tests/test_gguf_parallel.cpp
-    tests/test_affinity.cpp
-    tests/test_fit.cpp
-    tests/test_flash_next_offload.cpp
-    tests/test_ngram_gather.cpp
-    tests/test_ngram_row_ids.cpp
-    tests/test_ngram_lookup.cpp
-    tests/test_ngram_ports.cpp
-    tests/test_ngram_staging.cpp
     tests/test_decode_stats.cpp
-    tests/test_profile_cycle.cpp
-    tests/test_rope_precision.cpp
-    tests/test_segments.cpp
-    tests/test_segment_runtime.cpp
-    tests/test_pinned_nvme_fill.cpp
-    tests/test_qsa_runtime.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
-  # The provenance test reads models/allowlist-raw.json from the source tree.
+  # test_props.cpp reads src/exec/backend_llama.cpp (the KV-precision tripwire:
+  # the llama backend cannot be constructed without a card).
   target_compile_definitions(arcint-test PRIVATE
     ARCINT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
   target_compile_options(arcint-test PRIVATE -Wall -Wextra -Wpedantic)
@@ -302,15 +199,7 @@ if(ARCINT_TESTS)
   # --allow-skip <case> (tests/harness.h's SKIP_UNLESS). Local, filtered runs
   # (`./build/arcint-test some_filter`) are unaffected; this only binds ctest's
   # own invocation.
-  # gguf_real_file_spot_check (docs/design-gguf-native.md stage 0) and
-  # gguf_iq_decoders_match_gguf_py_on_the_real_shard are the named exceptions:
-  # both run only with ARCINT_GGUF_REAL=<path> set to a real GGUF file not
-  # shipped with the repo, so they skip in every default build. (The second
-  # was added without its name here, so `ctest -L unit` failed in every build
-  # without the shard -- found by the 0.5.0.1 acceptance's sanitizer cell.)
-  add_test(NAME unit COMMAND arcint-test --max-skips 0
-           --allow-skip gguf_real_file_spot_check
-           --allow-skip gguf_iq_decoders_match_gguf_py_on_the_real_shard)
+  add_test(NAME unit COMMAND arcint-test --max-skips 0)
   set_tests_properties(unit PROPERTIES LABELS unit)
 
   add_test(NAME roundtrip
@@ -346,12 +235,18 @@ if(ARCINT_ACCEPTANCE)
   # Parameters for the card-requiring cells, resolved at configure time into a
   # generated run manifest alongside $<TARGET_FILE:arcint> -- not environment,
   # which does not appear in the ctest log (docs/design-0.3.1-test-ladder.md §2).
-  set(ARCINT_ACCEPTANCE_MODEL_ROOT "" CACHE PATH
-      "Root directory holding the model IR directories the acceptance cells serve")
+  set(ARCINT_ACCEPTANCE_GGUF_AGENT "" CACHE FILEPATH
+      "The agent GGUF (the dense 27B) the acceptance cells serve")
+  set(ARCINT_ACCEPTANCE_GGUF_CODER "" CACHE FILEPATH
+      "The coder GGUF the acceptance cells serve")
+  set(ARCINT_ACCEPTANCE_GGUF_FLASHNEXT "" CACHE FILEPATH
+      "The Flash-Next GGUF (first shard) the acceptance cells serve")
+  set(ARCINT_ACCEPTANCE_PROMPT_DIR "" CACHE PATH
+      "The served cells' assets: corpus.txt, needle-20k.json, expert-profile.bin, mtp-flash-next.gguf, mtp-vocab.json (tests/acceptance/cells/served_check.py)")
   set(ARCINT_ACCEPTANCE_DEVICE_LARGE "GPU.0" CACHE STRING
-      "OpenVINO device string for the 24 GB card in acceptance cells")
+      "Device string (--device) for the 24 GB card in acceptance cells")
   set(ARCINT_ACCEPTANCE_DEVICE_SMALL "GPU.1" CACHE STRING
-      "OpenVINO device string for the 16 GB card in acceptance cells")
+      "Device string (--device) for the 16 GB card in acceptance cells")
   # The one external cell's command (docs/design-pruefstand-cell.md §1): the
   # operator's wrapper that reaches the Prüfstand harness from this host and
   # prints `ACCEPTANCE-METRIC score <n> points`. Empty (the default) means the
@@ -359,20 +254,28 @@ if(ARCINT_ACCEPTANCE)
   # never in a tracked file, which is the point of configuring it here.
   set(ARCINT_ACCEPTANCE_PRUEFSTAND "" CACHE STRING
       "Command line of the operator's Prüfstand wrapper for the external acceptance cell (empty: the cell skips; backslashes and double quotes are escaped into the manifest, generator expressions are not supported)")
-  # A command line, unlike the four paths above, may well carry a double
+  set(ARCINT_ACCEPTANCE_PRUEFSTAND_AGENT "" CACHE STRING
+      "Command line of the operator's Prüfstand wrapper for the agent cell (empty: the cell skips; escaped like ARCINT_ACCEPTANCE_PRUEFSTAND)")
+  # A command line, unlike the paths above, may well carry a double
   # quote; unescaped it would break the whole manifest, and run.py would die
   # in json.load before any cell ran.
   string(REPLACE "\\" "\\\\" _arcint_pruefstand_json "${ARCINT_ACCEPTANCE_PRUEFSTAND}")
   string(REPLACE "\"" "\\\"" _arcint_pruefstand_json "${_arcint_pruefstand_json}")
+  string(REPLACE "\\" "\\\\" _arcint_pruefstand_agent_json "${ARCINT_ACCEPTANCE_PRUEFSTAND_AGENT}")
+  string(REPLACE "\"" "\\\"" _arcint_pruefstand_agent_json "${_arcint_pruefstand_agent_json}")
 
   set(ARCINT_ACCEPTANCE_MANIFEST "${CMAKE_CURRENT_BINARY_DIR}/acceptance/run_manifest.json")
   file(GENERATE OUTPUT "${ARCINT_ACCEPTANCE_MANIFEST}" CONTENT
 "{
   \"binary\": \"$<TARGET_FILE:arcint>\",
-  \"model_root\": \"${ARCINT_ACCEPTANCE_MODEL_ROOT}\",
   \"device_large\": \"${ARCINT_ACCEPTANCE_DEVICE_LARGE}\",
   \"device_small\": \"${ARCINT_ACCEPTANCE_DEVICE_SMALL}\",
-  \"pruefstand\": \"${_arcint_pruefstand_json}\"
+  \"gguf_agent\": \"${ARCINT_ACCEPTANCE_GGUF_AGENT}\",
+  \"gguf_coder\": \"${ARCINT_ACCEPTANCE_GGUF_CODER}\",
+  \"gguf_flashnext\": \"${ARCINT_ACCEPTANCE_GGUF_FLASHNEXT}\",
+  \"prompt_dir\": \"${ARCINT_ACCEPTANCE_PROMPT_DIR}\",
+  \"pruefstand\": \"${_arcint_pruefstand_json}\",
+  \"pruefstand_agent\": \"${_arcint_pruefstand_agent_json}\"
 }
 ")
 

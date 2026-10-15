@@ -26,10 +26,8 @@ determined. "—" means no number recorded. Numbers are as the patch README
 states them. Unless said otherwise, the boolean switches read `atoi(value)`:
 `0` is off, anything else is on.
 
-Two kinds of name are not in a table:
+One name is not in a table:
 
-- `HOME` and `XDG_CACHE_HOME` are read by arcint only to place the GGUF
-  verdict cache (`src/exec/backend_ov.cpp`). They are not switches.
 - `GGML_GALLOC_TOP` is a debug commit on the llama.cpp checkout, not in the
   series. It lists the N largest tensors of a reservation (N up to 64). If it
   stays, it is a diagnostic; it needs a patch first.
@@ -154,6 +152,7 @@ Two kinds of name are not in a table:
 | `GGML_OPENCL_STAGE_RED` | off | The staging ring's bytes are not copied, so stale bytes reach the card. | 0047 | The capital answered "!!!!!!!!", the needle empty (`measured-here`). |
 | `LLAMA_EXPERT_CACHE_MUTATE` | 0 | `1` corrupts one landed slot; `2` leaves out the last changed row of a table write. | 0021 (`2` from 0046) | `1`: the swap check reports 1 of 6 (`measured-here`). |
 | `GGML_OPENCL_CPU_MISS_RED` | off | The CPU's rows left zero. | 0056 | KL 0.3700 -> 0.4364, top-1 84.4 -> 81.9 % (`measured-here`). |
+| `GGML_OPENCL_CPU_MISS_SPLIT_RED` | off | The slow path reads an IQ4_NL bank's split scales and quants as GGUF blocks (the defect fixed in 0.8.0). | 0056 | IQ3_XXS: a fault at the first request (`measured-here`). |
 
 ### Diagnostic
 
@@ -166,72 +165,8 @@ Two kinds of name are not in a table:
 
 ## arcint
 
-The OpenVINO engine reads most of these (`src/exec/backend_ov.cpp`).
-
-### Operational
-
-| switch | default | what it does | patch | evidence |
-|---|---|---|---|---|
-| `ARCINT_MOE_DEVICE_POOL_BYTES` | unset: the slot pool sits in host memory | Bytes of expert slots held in VRAM. Parsed strictly: a typo is refused. | arcint (`src/exec/backend_ov.cpp`) | In `docs/serving-config-flash-next.md` (`code`). |
-| `ARCINT_TOKENIZERS_SO` | the path compiled in (`ARCINT_TOKENIZERS_SO_DEFAULT`) | Path of the OpenVINO tokenizers library. | arcint (`src/exec/backend_ov.cpp`) | — |
-
-### Tuning
-
-| switch | default | what it does | patch | evidence |
-|---|---|---|---|---|
-| `ARCINT_DYN_QUANT_GROUP` | unset: the runtime's own (128 for a hybrid linear-attention model) | Dynamic-quantization group size along K, a number or `max`; needs `--dyn-quant on`. | arcint (`src/exec/backend_ov.cpp`) | Added 0.4.2 as a measurement switch (`code`). |
-| `ARCINT_MTP_DRAFTS` | 3 (clamped 1-8) | Drafts a chained MTP window proposes at most. | arcint (`src/exec/backend_ov.cpp`) | ? |
-| `ARCINT_MTP_MIN_P` | 0.5 | Probability under which the MTP chain stops. | arcint (`src/exec/backend_ov.cpp`) | ? |
-| `ARCINT_PAGED_KV` | unset: the `--paged-kv` flag | Overrides `--paged-kv` at load, for A/B runs (`KEY[:VALUE]`, from f16, u8, i8, u4, i4). | arcint (`src/exec/backend_ov.cpp`) | `DESIGN.md` names it an A/B override (`code`). |
-
-### Opt-in alternative
-
-| switch | default | what it does | patch | evidence |
-|---|---|---|---|---|
-| `ARCINT_PA_HOST_INPUTS` | off (set at all = on) | Paged-attention index inputs live in USM host memory. | arcint (`src/exec/backend_ov.cpp`) | Added in 0.2.10 as an experiment; no result found (?). |
-
-### Off switch
-
-| switch | default | what it does | patch | evidence |
-|---|---|---|---|---|
-| `ARCINT_DRAFT_POLICY` | on | `0`: every draft and proposal is verified, with no cost policy. | arcint (`src/exec/backend_ov.cpp`) | — |
-| `ARCINT_DRAFT_ROPE_F16` | RoPE of the drafter graphs kept in f32 | Set at all: RoPE runs in the plugin's default f16 again (the A/B lever). | arcint (`src/exec/backend_stub.cpp`) | The f16 overflow hypothesis was confirmed with `ARCINT_DRAFT_F32` (`measured-here`, CHANGELOG). |
-| `ARCINT_NGRAM_READER` | on | `0`: staged n-gram rows use the synchronous `pread`. | arcint (`src/exec/backend_ov.cpp`) | — |
-| `ARCINT_PREFILL_CHUNK_CAP` | on | `off`: removes the prefill chunk cap and the belt. | arcint (`src/exec/backend_ov.cpp`) | Used for a 118,454-token full-depth rung (`measured-here`, `src/exec/fit.h`). |
-
-### Red case
-
-| switch | default | what it does | patch | evidence |
-|---|---|---|---|---|
-| `ARCINT_FIT_SLOT_BYTES` | unset | Forces the expert slot pool to N bytes and skips the fit probe. `0` on an `--offload-ratio` run reproduces the pre-M7 arithmetic. | arcint (`src/exec/backend_ov.cpp`) | A green real figure and an OOM at 0 on one binary (`code`). |
-
-### Diagnostic
-
-| switch | default | what it does | patch | evidence |
-|---|---|---|---|---|
-| `ARCINT_BENCH_FORWARD` | off | Runs `bench_forward()` after warm-up. | arcint (`src/exec/backend_ov.cpp`) | — |
-| `ARCINT_BLOCK_AB_HASH_ROWS` | off | `native_moe_block_ab` prints an FNV-1a hash of the first k output rows. | arcint (`tools/native_moe_block_ab.cpp`) | — |
-| `ARCINT_BLOCK_AB_REPEAT` | off | `native_moe_block_ab` runs the GPU request N more times and prints mean, min, median. | arcint (`tools/native_moe_block_ab.cpp`) | — |
-| `ARCINT_DFLASH_DUMP` | off | Dumps the DFlash lattice and per-cycle lines. | arcint (`src/exec/backend_ov.cpp`) | — |
-| `ARCINT_DRAFT_F32` | off (set at all = on) | Compiles both drafter graphs in f32. A discriminator for the f16 overflow. | arcint (`src/exec/backend_stub.cpp`) | Confirmed the hypothesis (`measured-here`, CHANGELOG). |
-| `ARCINT_FORWARD_SPLIT` | off | `1`: wall clock of the graph, logits and hidden-state readbacks over 64 forwards. `2`: also repeats the forward. | arcint (`src/exec/backend_ov.cpp`) | — |
-| `ARCINT_LOGITS_DUMP` | off | Appends every paged forward's logits to a file (the served half of the KL gate). Reads logits back for every forward. | arcint (`src/exec/backend_ov.cpp`) | In `DESIGN.md` (`code`). |
-| `ARCINT_PROFILE` | off (set at all = on) | Turns on plugin profiling and prints step profiles after warm-up. | arcint (`src/exec/backend_ov.cpp`) | In `DESIGN.md`, `docs/prefill-baseline.md` (`code`). |
-| `ARCINT_PROFILE_CYCLE` | off (set at all = on) | One line per drafting cycle on the paged path, naming each segment. | arcint (`src/exec/backend_stub.cpp`) | In `DESIGN.md` (`code`). |
-| `ARCINT_PROFILE_MWALL` | built-in token counts | Comma list of token counts for the M-wall profile. | arcint (`src/exec/backend_ov.cpp`) | — |
-| `ARCINT_PROFILE_MWALL_LA` | off (set at all = on) | Passes the served verify's checkpoint rows in the M-wall profile. | arcint (`src/exec/backend_ov.cpp`) | — |
-| `ARCINT_PROFILE_NODES` | off (set at all = on) | Lists every node of the decode step by name. | arcint (`src/exec/backend_ov.cpp`) | — |
-| `ARCINT_PROFILE_PAST` | 0 | Profiles the chunk after prefilling to depth n. | arcint (`src/exec/backend_ov.cpp`) | In `docs/prefill-baseline.md` (`code`). |
-| `ARCINT_PROFILE_RUNTIME_MODEL` | off | Path to dump the compiled graph (node names, op types, plugin layer names). | arcint (`src/exec/backend_ov.cpp`) | — |
-| `ARCINT_PROFILE_SWEEP` | off | Comma list that bisects the token count where kernel selection changes. | arcint (`src/exec/backend_ov.cpp`) | — |
-| `ARCINT_PROFILE_TOKENS` | fixed ids | `random`: pseudo-random token ids for profiling. | arcint (`src/exec/backend_ov.cpp`) | — |
-| `ARCINT_TRACE_TOKENS` | off (set at all = on) | Traces each committed token. | arcint (`src/exec/backend_ov.cpp`) | — |
-| `BIGALLOC_MIN` | 8 MiB | Smallest allocation `bigalloc.so` records. | arcint (`tools/bigalloc.c`) | — |
-| `BIGALLOC_ONLY` | all programs | Traces only the program with this short name. | arcint (`tools/bigalloc.c`) | — |
-| `BIGALLOC_OUT` | `bigalloc.<pid>.txt` | Output file of the allocation trace. | arcint (`tools/bigalloc.c`) | — |
-| `BIGALLOC_PERIOD` | 5 s | Seconds between rewrites of the trace. | arcint (`tools/bigalloc.c`) | — |
-| `BIGALLOC_STEP` | 256 MiB | Logs each new peak of the live total, in steps of this size. | arcint (`tools/bigalloc.c`) | — |
-| `CLDUMP_BINARIES` | off | `cldump.so` also saves program binaries. | arcint (`tools/cldump.c`) | — |
-| `CLDUMP_DIR` | `/tmp/cldump` | Output directory of `cldump.so`. | arcint (`tools/cldump.c`) | — |
-| `CLDUMP_SERIALIZE` | off | `cldump.so` calls `clFinish()` after each kernel enqueue. | arcint (`tools/cldump.c`) | Used 2026-09-20 to cut a B60 layer (`measured-here`, source comment). |
-| `IGADIS_DUMP` | off | `igadis` writes the disassembly beside the input as `<file>.asm`. | arcint (`tools/igadis.cpp`) | — |
+arcint itself reads no environment switch since 0.8.0: its flags are on the
+command line (`arcint --help`, `llm.txt`). The 38 switches it read before
+belonged to the retired OpenVINO engine (`src/exec/backend_ov.cpp`); they are
+listed in this file at the tag `openvino-history`
+(`git show openvino-history:docs/switches.md`).

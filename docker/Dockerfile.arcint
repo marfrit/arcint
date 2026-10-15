@@ -1,44 +1,42 @@
 # syntax=docker/dockerfile:1
 # ---------------------------------------------------------------------------
-# Tier 2: the arcint engine image -- BOTH engines (OpenVINO and libllama).
+# The arcint image: the engine (libllama with contrib/llama.cpp/patches, built
+# in) on Fedora 43 with Intel's compute runtime and the OpenCL ICD loader.
 #
-# FROM the tier-1 patched-OpenVINO base for both stages: the base carries the
-# CMake package, headers and libopenvino_tokenizers.so, so the engine build
-# needs only a compiler and the OpenCL dev packages on top of it.
+# The CMake flags follow contrib/packaging/arcint/build-deb.sh -- the image and
+# the .deb consume the same recipe, neither forks the other -- except
+# GGML_NATIVE: the image is built for the x86-64-v3 baseline, the .deb for the
+# host that builds it.
 #
-# The CMake flags are byte-for-byte contrib/packaging/arcint/build-deb.sh --
-# the image and the .deb consume the same recipe, neither forks the other.
+# Until 0.7.12 this was tier 2 on a patched-OpenVINO base image; that engine
+# was retired in 0.8.0 (docs/history.md). Design, caveats and the CPU-baseline
+# rationale: docs/docker.md.
 #
-# Design, caveats and the CPU-baseline rationale: docs/docker.md.
-#
-# Build from the REPO ROOT (needs the tier-1 image built or pulled):
-#   docker build -t arcint:dev \
-#     --build-arg OV_BASE=arcint-ov:2026.4.0-ov71640275-marfrit-p27 \
-#     -f docker/Dockerfile.arcint .
+# Build from the REPO ROOT:
+#   docker build -t arcint:dev -f docker/Dockerfile.arcint .
 # ---------------------------------------------------------------------------
 
-ARG OV_BASE=arcint-ov:2026.4.0-ov71640275-marfrit-p27
+ARG BASE=registry.fedoraproject.org/fedora:43
 
 # --- builder ---------------------------------------------------------------
-FROM ${OV_BASE} AS builder
+FROM ${BASE} AS builder
 
 # opencl-headers + ocl-icd-devel: the libllama engine's `find_package(OpenCL
 # REQUIRED)` (CMakeLists.txt:166) and the deb recipe's own gate, the presence
-# of /usr/include/CL/cl.h. python3 (already in the base) is what embeds the
-# OpenCL kernels; git is what applies the patch series.
+# of /usr/include/CL/cl.h. python3 is what embeds the OpenCL kernels; git is
+# what applies the patch series.
 RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
-      gcc gcc-c++ cmake git which binutils curl python3 \
+      gcc gcc-c++ cmake git which binutils curl python3 libgomp \
       opencl-headers ocl-icd-devel \
   && dnf clean all && rm -rf /var/cache/dnf/*
 RUN [ -f /usr/include/CL/cl.h ] || { echo "opencl-headers did not provide /usr/include/CL/cl.h" >&2; exit 1; }
 
 ARG ARCINT_GIT_SHA=unknown
-ARG OV_PREFIX=/usr/lib/marfrit-openvino
 
 WORKDIR /src
 COPY . /src/arcint
 
-# The second engine: llama.cpp at the pin, fetched as a GitHub tarball of the
+# The engine: llama.cpp at the pin, fetched as a GitHub tarball of the
 # commit and checked by sha256, then contrib/llama.cpp/patches/*.patch applied
 # in order -- the same way build-deb.sh does it. A patch that does not apply
 # to the pin is a bug in contrib/llama.cpp/patches, not a reason to move the
@@ -57,7 +55,7 @@ RUN set -eu; \
       || { echo "LLAMA_COMMIT=${LLAMA_COMMIT} != ${r_commit} in contrib/packaging/arcint/build-deb.sh" >&2; exit 1; }; \
     [ "${LLAMA_TARBALL_SHA256}" = "$r_sha" ] \
       || { echo "LLAMA_TARBALL_SHA256 != the recipe's -- the image would build an unverified llama.cpp" >&2; exit 1; }; \
-    echo "tier 2 agrees with the deb recipe: llama.cpp ${r_commit:0:12}"
+    echo "the image agrees with the deb recipe: llama.cpp ${r_commit:0:12}"
 
 RUN set -eu; mkdir -p /src/llama && cd /src/llama; \
     curl --connect-timeout 10 --max-time 600 --retry 3 --retry-delay 5 \
@@ -79,43 +77,27 @@ RUN set -eu; mkdir -p /src/llama && cd /src/llama; \
 # turns "ctest found nothing to run" into a build failure.
 RUN cmake -S /src/arcint -B /src/build \
       -DCMAKE_BUILD_TYPE=Release \
-      -DARCINT_OPENVINO=ON \
       -DARCINT_LLAMA=ON \
       -DARCINT_LLAMA_DIR="/src/llama/llama.cpp-${LLAMA_COMMIT}" \
       -DGGML_NATIVE=OFF \
       -DARCINT_WERROR=ON \
       -DARCINT_TESTS=ON \
       -DARCINT_GIT_SHA="${ARCINT_GIT_SHA}" \
-      -DOpenVINO_DIR="${OV_PREFIX}/openvino/cmake" \
-      -DARCINT_TOKENIZERS_SO="${OV_PREFIX}/openvino_tokenizers/lib/libopenvino_tokenizers.so" \
+      -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF \
       -DCMAKE_INSTALL_PREFIX=/usr \
-      -DCMAKE_INSTALL_RPATH="${OV_PREFIX}/openvino/libs" \
-      -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-      -DCMAKE_SKIP_BUILD_RPATH=OFF \
   && cmake --build /src/build -j"$(nproc)" \
   && ctest --test-dir /src/build --output-on-failure --no-tests=error -L unit
 
 RUN DESTDIR=/install cmake --install /src/build > /dev/null \
   && [ -x /install/usr/bin/arcint ] || { echo "MISSING: /usr/bin/arcint" >&2; exit 1; }
 
-# RPATH probe (from build-deb.sh — the same SIGPIPE-safe shape).
-RUN RP=$(objdump -x /install/usr/bin/arcint | awk '/RUNPATH|RPATH/ && !seen {seen=1; print $2}'); \
-    case "$RP" in *"${OV_PREFIX}/openvino/libs"*) ;; \
-      *) echo "RPATH does not point at ${OV_PREFIX}/openvino/libs (is: '$RP')" >&2; exit 1 ;; esac
+# ldd probe (from build-deb.sh -- the same SIGPIPE-safe shape): everything
+# resolves, and nothing of the retired OpenVINO runtime is linked.
 RUN LDD_OUT=$(ldd /install/usr/bin/arcint); \
     case "$LDD_OUT" in *"not found"*) echo "unresolved libraries:" >&2; printf '%s\n' "$LDD_OUT" >&2; exit 1 ;; esac; \
-    case "$LDD_OUT" in *"${OV_PREFIX}/openvino/libs/libopenvino.so"*) ;; \
-      *) echo "libopenvino not loading from ${OV_PREFIX}" >&2; printf '%s\n' "$LDD_OUT" >&2; exit 1 ;; esac
+    case "$LDD_OUT" in *openvino*|*libtbb*) echo "the binary links OpenVINO (retired in 0.8.0)" >&2; printf '%s\n' "$LDD_OUT" >&2; exit 1 ;; esac
 
-# The base runtime must be the level this engine was built against -- checking
-# at build time beats finding out at load time that the base was an older
-# tier-1 tag. The level string is a usable identity (docs/docker.md, Tagging).
-ARG OV_LEVEL=marfrit-p27
-RUN strings -a ${OV_PREFIX}/openvino/libs/libopenvino.so.2640 \
-      | grep -F -- "${OV_LEVEL}" > /dev/null \
-  || { echo "base runtime is not ${OV_LEVEL} — wrong tier-1 base image?" >&2; exit 1; }
-
-# Both engines must be in the binary. The `--help` text advertises
+# The engine must be in the binary. The `--help` text advertises
 # `--engine llama` whether or not the backend was compiled in, so check the
 # linked artifacts instead: the libllama symbols, and -- with
 # GGML_OPENCL_EMBED_KERNELS=ON (CMakeLists.txt:154) -- one of the Intel
@@ -125,7 +107,7 @@ RUN nm -C /install/usr/bin/arcint 2>/dev/null | grep -qE '\bllama_(backend_init|
   || { echo "binary carries no libllama symbols -- ARCINT_LLAMA did not link" >&2; exit 1; };
 RUN strings -a /install/usr/bin/arcint | grep -qF 'mul_mv_kq_q8_1' \
   || { echo "the patched Intel K-quant kernels are not embedded -- contrib/llama.cpp/patches did not reach the build" >&2; exit 1; }; \
-    echo "both engines linked: $(nm -C /install/usr/bin/arcint | grep -cE '\bllama_[a-z_]+\b') libllama symbols, patched OpenCL kernels embedded"
+    echo "libllama linked: $(nm -C /install/usr/bin/arcint | grep -cE '\bllama_[a-z_]+\b') libllama symbols, patched OpenCL kernels embedded"
 
 # Portability gate: assert the x86-64-v3 baseline rather than trusting
 # -DGGML_NATIVE=OFF. zmm registers mean AVX-512 got in; their total absence
@@ -141,7 +123,18 @@ RUN if objdump -d /install/usr/bin/arcint 2>/dev/null | grep -qE '%zmm[0-9]+'; t
     echo "portability gate: no AVX-512 (zmm), AVX2 (ymm) present -- x86-64-v3 baseline confirmed"
 
 # --- final -----------------------------------------------------------------
-FROM ${OV_BASE}
+FROM ${BASE}
+
+# The GPU runtime stack: intel-compute-runtime is Intel's OpenCL driver for the
+# Arc cards (the engine's route), ocl-icd the loader the binary links (the
+# deb's Depends: ocl-icd-libopencl1). libgomp: ggml-cpu links OpenMP; the
+# builder has it through gcc, the runtime would not (the .deb missed it the
+# same way until arcint 0.6.0-2).
+RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
+      bash ca-certificates libatomic libstdc++ libgcc libgomp \
+      hwdata pciutils procps-ng curl \
+      intel-compute-runtime ocl-icd \
+  && dnf clean all && rm -rf /var/cache/dnf/*
 
 COPY --from=builder /install/usr /usr
 
@@ -153,8 +146,8 @@ RUN LDD_OUT=$(ldd /usr/bin/arcint); \
     /usr/bin/arcint --version
 
 # The stub smoke test needs no GPU: the engine serves its HTTP surface
-# without a model. If /props answers, the binary, its RPATH and the
-# tokenizer .so all resolve inside the image.
+# without a model. If /props answers, the binary and its libraries resolve
+# inside the image.
 RUN /usr/bin/arcint --stub --port 8090 & STUB=$!; \
     sleep 2; \
     curl -fsS http://127.0.0.1:8090/props > /dev/null \

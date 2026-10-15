@@ -80,6 +80,7 @@ struct Lanes {
         cfg.parallel          = 2;
         cfg.queue_timeout_s   = queue_timeout_s;
         backend.st.id          = "canonical-gguf";
+        backend.st.quant       = "Q4_K - Medium";
         backend.st.served_id   = "agent";
         backend.st.loaded      = true;
         backend.st.n_ctx       = 512;
@@ -355,7 +356,7 @@ TEST(lanes_v1_models_lists_each_name_at_its_context) {
         // every field a proxy reads today, on every entry
         CHECK_EQ(e.at("object").get<std::string>(), std::string("model"));
         CHECK_EQ(e.at("n_ctx_train").get<int>(), 262144);
-        CHECK_EQ(e.at("quant").get<std::string>(), std::string("q4"));
+        CHECK_EQ(e.at("quant").get<std::string>(), std::string("Q4_K - Medium"));
         CHECK_EQ(e.at("lanes").get<int>(), 1);
         CHECK_EQ(e.at("canonical_id").get<std::string>(), std::string("canonical-gguf"));
     }

@@ -2,21 +2,71 @@
 
 The human record of what each release changed and what it depends on. The
 package record lives in `contrib/packaging/arcint/debian/changelog` (one
-entry per built package) and the plugin patch record in
-`contrib/packaging/marfrit-openvino/patches/README.md`; this file names the
-same releases by tag and adds what a reader upgrading needs first: the
-runtime dependency. Every number here was measured; the measurement
-protocol and the retractions are in `DESIGN.md` §7. A `docs/` path named
-below that is absent on `main` is on the development branch, `qfndev`.
+entry per built package) and the kernel patch record in
+`contrib/llama.cpp/README.md`; this file names the same releases by tag and
+adds what a reader upgrading needs first: the runtime dependency. Every number here was measured; the measurement
+protocol and the retractions are in `DESIGN.md` §7 and the campaign documents.
 
-Runtime dependency throughout: `marfrit-openvino`, a source build of OpenVINO
-at the pinned upstream commit `71640275` (the 2026.4.0 nightly of 2026-08-21)
-with the patch series in `patches/` applied. The patch level is part of the
-package version (`+p1` … `+p4`) and a release names the level it was built
-and measured against. The dependency pins the nightly, because a different
-nightly is a different ABI, and since 0.3.0 floors the patch level within
-it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
-pin made apt remove arcint when the runtime was upgraded to +p3.
+Runtime dependency: from 0.8.0, llama.cpp at the commit the recipe pins,
+with `contrib/llama.cpp/patches` applied, compiled into arcint; the host
+needs the OpenCL ICD loader and Intel's compute runtime. Before 0.8.0 arcint
+also depended on `marfrit-openvino`, a source build of OpenVINO at the pinned
+upstream commit `71640275` (the 2026.4.0 nightly of 2026-08-21) with a GPU
+plugin patch series, its patch level part of the package version (`+p1` …
+`+p27`); since 0.3.0 the dependency floored the level within the nightly
+(`>= +pN`, `<<` the next nightly) instead of pinning it exactly. That engine
+was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
+point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
+
+## 0.8.0 — 2026-10-15
+
+**Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` 0001-0056,
+compiled in; the package depends on the OpenCL ICD loader and recommends
+Intel's compute runtime. **`marfrit-openvino` is no longer a dependency**:
+a host upgraded from 0.7.x may keep it installed as the way back to 0.7.12.
+
+- **The OpenVINO engine is retired** (operator, 2026-10-15; charter A6).
+  The documentation and the design were rewritten for the libllama engine
+  first (README, DESIGN, llm.txt, DEVELOPMENT, docs/history.md); then the
+  executor, its allowlist, the GPU-plugin patch series and its recipe, the
+  IR exporters and the OpenVINO-only tests left the tree. Everything of the
+  era is at the tag `openvino-history` (`docs/history.md`).
+- **Interface** (DESIGN §8.7): the OpenVINO engine's flags (`--model`,
+  `--paged-kv`, `--prefix-cache-mib`, `--offload-ratio`, `--dflash`, ...) and
+  `--model-id` are refused by name; `--engine ov` is refused; `/props` and
+  `/health` lose the reservation, the prefix cache and the paged-KV fields;
+  `/props` gains `model.architecture`; `quant` is the GGUF's file type;
+  `cache.kv_dtype` reports `--llama-kv` (it read "f16" whatever the flag
+  said); the 503 bodies lose `reservation` and `kv_blocks_free`; the stub
+  serves as `stub`.
+- **Gates** (operator, 2026-10-15; DESIGN §5): the equivalence and
+  concurrency suites run on `--engine llama` with the answers gated and
+  byte equality a reported tripwire; per-service served floors at the last
+  release's pre-tag numbers minus their spread (`*-served` cells); the
+  acceptance task at least 9/10, 10/10 the target, for the coder and the
+  agent.
+- **Patch 0056: IQ4_NL banks on the CPU-miss slow path.** The slow path
+  read an IQ4_NL bank's split scales and quants as GGUF blocks; Flash-Next's
+  IQ3_XXS file (18 IQ4_NL down projections) faulted at its first request
+  with the CPU misses on. Fixed; IQ3_XXS with the misses decodes 30.6-37.5
+  t/s on six answers against 18.5-28.9 without, KL +0.0044 nats
+  (`measured-here`, B60; `contrib/llama.cpp/README.md`, 0056).
+- **Flash-Next quant options** (operator, 2026-10-15; charter A2): IQ2_XS
+  stays the shape; ISTA-DASLab's IQ3_XXS serves on demand on the same port
+  (`contrib/systemd/arcint-flashnext-iq3xxs.service`, 12,000 MiB of slots,
+  the CPU misses); UD-Q3_K_XL waits for the host's 96 GB.
+- **Measured before the tag** (`measured-here`, the 0.8.0 package, each
+  model staged on the NVMe, two fresh processes a service): the agent
+  695.3 / 695.1 t/s at 55k and 491.9 / 491.6 at 138k, the acceptance task
+  10/10; the coder 51.1 / 47.5 / 44.0 t/s decode and 725.5 at 41k, the task
+  9/10; Flash-Next 665.8 / 665.4 t/s at the 20k needle asked right after the
+  capital and 42.2 / 42.3 t/s decode; the equivalence and concurrency suites
+  pass on the agent and the coder; the sanitizers pass. These are the
+  served cells' floors from now on.
+- **Package and image**: the recipe builds the one engine and refuses to
+  build a 0.7.x tag; the image is one Fedora 43 image with Intel's compute
+  runtime (`docs/docker.md`); the 0.7.12 images were published on
+  2026-10-15 (`ghcr.io/marfrit/arcint:20261015T141859`).
 
 ## 0.7.12 — 2026-10-15
 

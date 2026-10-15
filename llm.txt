@@ -1,602 +1,185 @@
 # arcint
 
-> Intel Arc LLM inference engine, deliberately narrow (Arc A770 16 GiB, Arc
-> Pro B60 24 GB), with an OpenAI-compatible HTTP API. Serves an allowlist:
-> the hybrid GatedDeltaNet/attention Qwens Qwen3.6-27B-A3B-Coder and
-> Qwen3.6-35B-A3B (qwen3_5_moe), Qwen3.8-27B dense (qwen3_5) and Qwen3.8
-> Flash-Next (qwen4_exp), plus Cydonia 24B (llama) for writing. Two engines:
-> OpenVINO with a published GPU-plugin patch series on a pinned nightly, and
-> libllama (llama.cpp with arcint's OpenCL kernels for Intel). arcint owns
-> scheduling, the KV cache and the GDN recurrent state, prefix caching and
-> context checkpoints, admission, expert placement, speculative decoding,
-> sampling and HTTP serving. NInfer philosophy (specialize, then be honest
-> about numbers), Intel substrate.
+> Intel Arc LLM inference server, deliberately narrow (Arc A770 16 GiB, Arc
+> Pro B60 24 GB, xe driver), with an OpenAI-compatible HTTP API. Serves the
+> hybrid GatedDeltaNet/attention Qwen family from GGUF files: Qwen3.8-27B
+> (dense, the agent), Qwen3.6-27B-A3B-Coder (MoE, the coder) and
+> Qwen3.8-Flash-Next (512-expert MoE on one card plus host RAM), plus
+> Cydonia 24B (llama architecture) for writing. One engine: libllama
+> (llama.cpp at pinned commit 3e4dfa8) with ggml's OpenCL backend and
+> arcint's Intel kernel series (contrib/llama.cpp/patches, 0001-0056).
+> arcint owns the HTTP surface, chat templates, tool calls, the sampler,
+> named lanes, MTP speculative decoding, context checkpoints and the expert
+> cache's policy. The OpenVINO engine of 0.1-0.7.12 was retired in 0.8.0;
+> its record is at git tag openvino-history (docs/history.md).
 
-## Status (0.7.12)
+## Status
 
-Runtime floor: marfrit-openvino +p25 = OpenVINO upstream commit 71640275 (the
-2026.4.0 nightly of 2026-08-21) + patches 0003-0074
-(contrib/packaging/marfrit-openvino/patches/, mirrored in patches/); +p27
-(0076-0077) for the Flash-Next tier's opt-in switches MOE_CPU_TIER_ADAPTIVE
-and MOE_DOORBELL.
+- Version 0.8.0 (2026-10-15): the OpenVINO engine and the marfrit-openvino
+  dependency removed (charter A6).
+- Production: the agent on the B60 (245,760 ctx, q8_0:q4_0 KV, MTP 5), the
+  coder on the A770 (98,304 ctx, q8_0:q4_0 KV, MTP 4), Flash-Next on the
+  B60 on demand (IQ2_XS, 131,072 ctx, q8_0 KV, expert cache 13,400 MiB,
+  MTP 3), the writer on the B60 on demand.
+- 1.0 charter: docs/milestone-1.0.0.md (feature complete, almost no gains
+  by obvious changes).
 
-Two engines (README "Two engines"): OpenVINO (default; Flash-Next, the
-coder's way back) and libllama (--engine llama --gguf, the agent service
-from 0.5.6, the coder service from 2026-10-05: llama.cpp
-3e4dfa8 with contrib/llama.cpp/patches 0001-0056, ggml's OpenCL backend,
-arcint's Intel kernels; MTP from the GGUF's own head; --llama-kv q8_0 or
-q8_0:q4_0 quantizes its KV cache). libllama, measured-here:
-- coder (A770): decode 79.3 t/s with 4 drafts, prefill 1,431 t/s at 4k;
-- dense 27B (B60): decode 52.6 t/s with 5 drafts, prefill 935 t/s at 4k.
+## Current numbers (measured-here, 0.8.0 pre-tag, the units' flags, two processes)
 
-With MTP and a q8_0:q4_0 KV cache the dense model serves 245,760 tokens on
-the B60 (0.7.3; the needle at 237k answered, acceptance 10/10). 0.7.4 makes
-its long prompts faster (llama.cpp patches 0036-0040): prompt attention on
-the B60 reads K/V by 2D block reads after vLLM's head-256 policy, and the
-quantized K/V go to f16 in key blocks. Prefill goes 249.0 -> 451.6 t/s at
-133k tokens and reaches 324.2 at 232k (0.7.3's record: 157.2 at 237k). On the
-A770, Q leaves local memory so 16 sub-groups share each K/V tile: the coder
-goes 410.1 -> 616.2 t/s at 57k. Answers and KL unchanged. The coder serves 98,304 tokens on the A770 from a searched GGUF
-(per-layer expert types, 14.6 GB; top-1 -0.10 points against Q4_K_M,
-acceptance 10/10). 0.5.12 adds llama.cpp server's context checkpoints
-(--llama-checkpoints): a follow-up after a thinking turn or an edited
-message resumes instead of re-prefilling (24.3k tokens: 38.75 -> 0.61 s on
-the B60, 34.06 -> 0.54 s on the A770); no prefix cache shared across lanes
-yet. 0.6.0 serves Qwen3.8-Flash-Next on the libllama engine: ISTA-DASLab's
-IQ2_XS GGUF with every expert on the B60 through an expert cache (VRAM slots,
-a USM bank in host memory; --llama-expert-cache, --llama-expert-profile) and
-the checkpoint's MTP layer from a separate GGUF (--llama-mtp-gguf,
-tools/flash_next_mtp_gguf.sh): then 422 t/s prefill at 20k tokens, 33-35 t/s
-decode with MTP 2 (at 0.7.12 660-690 t/s, 36 t/s, 42-46 with 0056), the needle answered; the KL of IQ2_XS against a
-reference is owed. Patch 0022's kernels lift the residents: the agent 35.5
--> 38.3 t/s (identical text), the coder 40.5 -> 43.3 t/s (KL +0.0001
-nats, acceptance task unchanged). 0.7.0 adds named lanes
-(--served-model-name A,B --lane-ctx CA,CB): an agent and a subagent lane on
-one set of weights, picked by the model field, each in its own window of
-one KV pool (patch 0026); the dense agent's subagent lane decodes 32.0-32.1
-t/s whether the agent lane holds 20k, 64k or 118k tokens, KL equal to one
-lane. It adds one model across two different Arc cards (patches 0023, 0024;
---device GPU.0,GPU.1 --llama-layer-split K, --llama-expert-cache A,B,
---llama-mtp-card): Flash-Next at 131,072 tokens decodes 21.7 t/s split at
-layer 36 against 19.8 on the B60 alone. Patch 0025 fixes MTP with two
-sequences configured and one busy (10.9 -> 40.9 t/s). 0.7.1: patch 0027
-fixes a defect shipped with 0022 (llama.cpp batches whose ubatches mix
-sequences reused a stale K-quant activation: KL 0.2438 -> 0.0041 on the
-B60); arcint decodes one sequence a call and was not affected (the dense
-agent and Flash-Next give the same answers with and without it). 0.7.2:
-lanes in one decode. With MTP, two busy lanes share each draft and verify
-step in one llama_decode (patches 0028, 0029): 21.7 + 22.0 t/s on the dense
-agent against 15.9 + 15.8 taking turns, a lane alone unchanged, the mixed
-path's KL equal to one sequence (0.004099). 0.7.3: llama.cpp patches
-0030-0035. With GGML_OPENCL_BANK_STREAM=1 (0032, opt-in: prefill streams
-the expert cache's banks on a copy queue) and the B60's MUL_MAT_ID tile
-4,4,2,4 (0033), Flash-Next IQ2_XS's 20k needle prefills at 640-645 t/s on
-the B60 with 9,500 MiB of slots and 131,072 context (408 before), decode
-27-29 t/s; the IQ kernels' byte arithmetic in 32-bit words (0034,
-Flash-Next decode ~5 %) and the IQ4 codebook in local memory (0035, the
-coder on the A770 +2 %); IQ2_XS on the card (0030). 0.7.5: Flash-Next's
-decode on the B60 goes 30.5-35.7 -> 33.1-37.0 t/s (three 300-token answers;
-the unit's flags: 131,072 ctx, q8_0 KV, 11,300 MiB of slots, MTP 2, the bank
-stream). Its n-gram table is read lazily (llama.cpp's AUTO lazy mode is OFF
-on OpenCL devices; ON for --llama-cpu-moe: the verify's CPU split 2.0-7.7 ->
-0.3-0.6 ms), and patch 0042 runs the expert cache's swaps on their own queue,
-issued behind each graph (the verify's input wait 2.6-6.0 -> 0.94 ms). 0041:
-the B60's prompt attention reads Q two chunks at a time, bit-identical.
-0.7.6: patch 0043, Flash-Next's short prompts: an expert cache's MUL_MAT_ID
-takes the GEMM from 64 tokens (below that the bank stream copied every bank
-tensor whole for a few tokens): a 24-token prompt 1.87 -> 0.64 s on the B60,
-64 tokens and up unchanged, KL +0.0004 nats.
-0.7.7: patch 0044, the bank stream from 256 tokens a ubatch (below that a MoE
-GEMM gathers its routed experts): Flash-Next's 77-token prompt 1.84 -> 1.11 s,
-the same tokens; patch 0045, the B60's prompt attention splits a call's keys
-across work-groups when a wave would run part empty (llama.cpp CUDA's
-parallel_blocks): the dense agent's prefill at 228k 342.9 -> 370.1 t/s, 138k
-461.6 -> 490.1, KL 0.005652 vs 0.005950, answers right.
-0.7.8: patch 0047, a graph's inputs staged in a USM host ring and one
-scheduler wait a split: the coder's decode on the A770 +14-15 % (43.0 -> 49.4
-t/s), Flash-Next +1.1-1.4 % and the agent +0.8-1.3 % on the B60, the same
-text; 0046, an expert cache's tables in one write; 0048, the A770's prompt
-attention with f16 V 20-28 % faster (quantized V unchanged).
-0.7.9: patches 0049-0051 (decode launch fusions; the delta net's rollback
-snapshots written into the recurrent cache and its gating in the kernel),
-end to end: the dense agent +5.6-6.1 %, the coder +3.6-4.0 %, the same
-text; 0052 with --llama-reserve-cells 20480 and 13,400 MiB of expert slots:
-Flash-Next at 131,072 tokens 34.8 / 38.0 -> 38.4 / 43.0 t/s (3 drafts with
-the stop at 0.5, Strata's long request), the 20k prefill unchanged; on that
-request at parity with Strata on the warm run (37.9 vs 37.8).
-0.7.10, Flash-Next: patches 0053/0054 (the low-bit expert decode's sign bits
-and 2-bit fields spread by multiplies, the same values): decode +0.9 %,
-prefill +0.2 %; 0055, Infernix's LFRU expert-cache policy, opt-in through
-LLAMA_EXPERT_CACHE_POLICY=lfru: decode +1.6 % over Strata's adapt rule on
-the gate set but -2.1 % on six other prompts, the same text; the series
-against the 0.7.9 package +2.7 % on the gate set.
-0.7.11, Flash-Next: patch 0056, the expert cache's decode misses on the CPU
-(Strata's doorbell tier with its multi-token AVX2 rows), opt-in through
-LLAMA_EXPERT_CACHE_CPU_MISSES=1 and set on the Flash-Next unit: decode 36.3
--> 41.8 t/s on the mean of six answers (+15.2 %), KL +0.0028 nats, answers
-right; the coder decoding alongside on the A770 -1 %.
-0.7.12: llama.cpp moved from bed0a85 to upstream master 3e4dfa8 (288 commits)
-with the 56 patches ported; suites pass on both cards, KL and the three
-services on par (Flash-Next +1.3 %; the patches' red cases and four-sequence
-KL arms not re-run). The package's ggml-cpu is native (GGML_NATIVE had been
-off under SOURCE_DATE_EPOCH since 0.5.5: Flash-Next with the CPU misses 45.6
-against 49.4 t/s on one answer). The Flash-Next unit's draft head is Q4_K
-(+1.5 %, 156 MiB less VRAM). Every
-number below is measured-here on the named card; DESIGN.md §7 has each one's
-standing value and evidence class. The dated measurement record, campaigns
-and design notes live on the development branch `qfndev`, not on `main`.
+- agent, B60: prefill 695.3 / 695.1 t/s at 54,895 tokens, 491.9 / 491.6 at 138,028; the
+  needle at 138k; acceptance task 10/10.
+- coder, A770: prefill 725.5 t/s at 40,841 tokens; decode 51.1 / 47.5 /
+  44.0 t/s on three 300-token answers; the needle; acceptance task 9/10.
+- Flash-Next, B60 + 20.32 GiB host bank: prefill 665.6 t/s at 20,045
+  tokens right after the capital; decode 42.3 t/s; the needle. Strata's SYCL port on the same card:
+  620 t/s and 37.8 t/s (2026-10-14).
+- Quality (KL vs Q8_0 or CPU reference, 16 x 512): agent q8_0:q4_0 KV
+  0.0057 nats; coder's searched quant 0.0237; Flash-Next IQ2_XS 0.294 nats,
+  top-1 87.1 % (accepted shortfall; IQ3_XXS 0.218 and UD-Q3_K_XL 0.100 are
+  on-demand options).
 
-Served configurations:
-- coder (from 2026-10-05): Qwen3.6-27B-A3B-Coder, the searched GGUF
-  c5f495ac shq8 on the libllama engine, A770, --llama-kv q8_0:q4_0,
-  --n-ctx 98304, MTP 4 drafts. Acceptance task 10/10 greedy, 10 of 10
-  sampled; decode 57.5 t/s on its prompt, 19.5 t/s at 95k; prefill 285 t/s
-  on a 94,926-token prompt.
-- coder until 2026-10-05, now the way back: Qwen3.6-27B-A3B-Coder b5 int4
-  (184 experts) on OpenVINO, A770, u8 KV, prefix cache 2 GiB. Acceptance
-  task 10/10. Decode 47.6 t/s warm at ~1k tokens,
-  40.3 t/s at 71.7k; prefill ~510 t/s at ~1k, 621 t/s at 98k. Same artifact
-  on the B60: 66.5 t/s decode, 2,821 t/s prefill at ~1k (the >= 60 t/s bar).
-- agent (from 0.5.6): Qwen3.8-27B Q4_K_M GGUF on the libllama engine, B60,
-  --llama-kv q8_0, --n-ctx 131072, MTP 5 drafts from a 40,960-id head.
-  Acceptance task 8/10 greedy, sampled mean 7.4 over 30 (f16: 8.13, within
-  the noise); decode 47.1 t/s on its prompt; at 62,597 tokens of depth
-  0.5.7 decodes at 15.6 t/s (0.5.6: 11.0). Depth re-measured 2026-10-08
-  (the development build, one lane: the same path as 0.6.0 by code; the
-  repository's source as context, cold prefix, 400 tokens greedy):
-  4,109 / 28,833 / 129,981 prompt tokens prefill at 824-910 / 589-638 /
-  252-272 t/s and decode at 36.6 / 32.3 / 19.3 t/s with MTP 5 (37-47 % of
-  drafts accepted), 18.4 / 15.1 / 9.7 t/s without; the 130k answer right
-  (0.5.6 had 166 t/s prefill and 7.5 t/s decode at 128k). Before 0.5.6:
-  qwen38-b7c1-ov on OpenVINO, i8:u8 KV, 122,880 tokens, DFlash2 drafter,
-  prefix cache 8 GiB, host KV tier 4 GiB.
+## Correctness rule (operator, 2026-10-01; CLAUDE.md, DESIGN 3.4)
 
-- writer (from 0.5.8, on demand on the B60): Cydonia 24B v4.3 (Mistral Small
-  3.2 finetune) Q4_K_M GGUF on the libllama engine, q8_0 KV, 98,304 tokens;
-  prefill 1,225 t/s at 4k, decode 25.2 t/s short and 8.4 at 89k; KL against
-  its Q8_0 0.0199.
-
-Other measured configurations:
-- Qwen3.6-35B-A3B all-resident on the A770: native-format artifact
-  qwen3.6-35b-a3b-native-d40packed-u8 (the GGUF's IQ2_S gate/up blocks
-  verbatim over IQ3_XXS/IQ4_NL down, dense projections u8 group-16),
-  --offload-ratio 0 --moe-per-expert-dispatch, u8 KV, chunk 1024: 13.11 GiB
-  device-resident, max ctx 112,288 per lane, prefill ~960 t/s at 4,096 and
-  779 t/s at 32,768 (chunk 2048; 781 at 1024), decode 28.1 t/s after 4,096,
-  10/10.
-- Qwen3.6-35B-A3B stock int4 on the A770 via expert offload (ratio 50, 8 GiB
-  device pool) + host CPU tier: decode 18.2 t/s (12.5 without the tier),
-  prefill 27.9 t/s. On the B60 resident: 62.7 t/s decode at 53.5k, 1,584 t/s
-  prefill, 10/10 greedy.
-- Speculation, dense Qwen3.8-27B on the B60 (int4, u8 KV, greedy): plain 24.0,
-  MTP 33.0 (76.7%), DFlash2 44.8 t/s (3.13 tokens/cycle) on short prompts; at
-  77k plain 15.3, DFlash2 18.8, MTP 4.9. MTP does not beat plain at depth on
-  this artifact; DFlash2 does.
-- GGUF, dense Qwen3.8-27B Q4_K_M on the B60 (--gguf on the dense IR template,
-  u8 KV): mixed form (default) 16.54 GiB, prefill 1,008 / 464 t/s and decode
-  18.5 / 13.7 t/s at 856 / 71.7k tokens, 10/10; native rows 15.22 GiB, 662 /
-  395 and 19.5 / 14.2; Intel's int4 IR 1,609 / 552 and 23.1 / 16.5. MTP on a
-  GGUF-opened model: 73.0% accepted.
-- Qwen3.8 Flash-Next (qwen4_exp, 512 experts top-10, 48 layers) at full
-  depth, qwen3.8-flash-next-d48n (the checkpoint's own IQ3_XXS/IQ4_XS/IQ4_NL/
-  Q8_0 expert blocks), A770, --offload-ratio 75 --moe-cpu-tier
-  --moe-per-expert-dispatch, u8 KV, chunk 2048: 8.06 GiB device-resident,
-  prefill 15.1 t/s over 32,768 tokens, decode 0.5 t/s (a quarter of the
-  experts on the CPU tier). Against the model's own f32 forward: exact to
-  0.2% through 24 layers, short-prompt logits KL 0.017 nats (llama.cpp 0.053);
-  on a 2,735-token window mean 0.37 / median 0.18 nats, argmax 0.83. The
-  n-gram table is staged from the GGUF per forward (2.9 MiB instead of a
-  26.8 GiB pin).
-
-Milestones: M0-M14 closed (M10 superseded by the native expert formats);
-0.4.x GGUF in process; 0.5.x Flash-Next at full depth, native expert formats,
-the all-resident 35B. DESIGN.md §7 is the table.
+- Correctness is judged at the answer: the answers stay right (facts,
+  needle, task battery); the candidate's mean KL against the reference is at
+  most 0.03 nats worse than the baseline arm's on the same card and window;
+  argmax agreement drops by at most 1 point.
+- Bit-identical output across configurations, placements, timing or request
+  history is not required. Integrity checks on copied data (expert slots,
+  bank entries, restored checkpoints) stay exact.
+- Byte-equality cells in the suites are tripwires: a red one is reported,
+  not a veto.
+- Gates are per phase: a change that improves prefill or decode and does not
+  regress the other beyond the run-to-run spread is adopted if it passes the
+  answer-level bar.
+- Release gates (operator, 2026-10-15): acceptance task >= 9/10 through the
+  deployed package (10/10 the target); performance floors per service = the
+  last release's pre-tag numbers minus their run-to-run spread; the
+  equivalence and concurrency suites on --engine llama.
 
 ## Contracts
 
 - HTTP: POST /v1/chat/completions, POST /v1/completions (OpenAI-compatible,
-  SSE streaming, token-id prompts on /v1/completions), GET /health, GET
-  /props, GET /v1/models. No UI. /health and /props publish the lanes, the
-  reservation terms and the served cache block; a refusal quotes them.
-- The served NAME and CONTEXT are contracts with a discovering proxy (DESIGN
-  4.2): --served-model-name sets what /v1/models and /props report and what a
-  completion echoes; --model-id stays the allowlist assertion. The model
-  object carries n_ctx (what the process runs with) and n_ctx_train (the
-  artifact's ceiling), plus quant, lanes, canonical_id.
-- Console: llama.cpp-style one-line state/timing prints on stderr, with where
-  each request's time went (graph, embed, sample, emit, wait for the other
-  lane).
-- Model input: an OpenVINO IR directory validated against a compiled-in
-  allowlist (architecture/template/tokenizer hashes, geometry, weight byte
-  count); a GGUF opens on top of one (--gguf); serving-shape artifacts are
-  built from GGUF shards (tools/export_serving_artifact.py). Anything else is
-  rejected at load.
-- Hard invariant (DESIGN 3.4, gated): for any prompt and any cache state,
-  greedy output is byte-identical to a cold run, per lane with the other lane
-  active, and independent of the process's own request history. NOT claimed
-  across chunked/unchunked prefill or speculation on/off: advancing the state
-  by two tokens in one forward differs from twice by one (GDN scan, matmul
-  tiling), so any change to how a sequence is split can flip a near-tie. Those
-  comparisons are reported; determinism at a fixed configuration and non-zero
-  draft acceptance are gated. Prefill chunks and cache checkpoints sit on one
-  absolute grid so warm and cold runs see the same split.
-- Context overflow = HTTP 400 with prompt_tokens/n_ctx/overflow. No
-  truncation, no context shift (a GDN recurrent state cannot un-see tokens).
-- Admission: a lane is a memory reservation; every term measured (weights
-  after compile, activations by probe forwards, GDN rows, KV at the served
-  precision, drafter state, expert slots on two ledgers, one policy margin).
-  What does not fit is refused at startup with every term; a request beyond
-  the lanes is a 503 with the numbers (--queue-timeout S restores queueing).
+  SSE streaming; /v1/completions also takes token-id prompts), GET /health,
+  GET /props, GET /v1/models. No UI.
+- --served-model-name NAME sets the id /v1/models and /props report. The
+  model object carries id, n_ctx (running), n_ctx_train, quant, lanes.
+- Named lanes: --served-model-name A,B --lane-ctx CA,CB serves lanes of
+  different context from one process and one KV pool of their sum
+  (kv_unified, a cell window per lane). The model field picks the lane
+  (empty or the canonical id: the first; unknown: 404); the 400 quotes that
+  lane's context; a busy lane is a 503 for itself after --queue-timeout
+  (DESIGN 4.2, amended 2026-10-07).
+- Context overflow is HTTP 400 with prompt_tokens/n_ctx/overflow. No
+  truncation, no context shift (GDN state cannot un-see tokens; DESIGN 3.8,
+  an operator invariant).
+- Client disconnect aborts at the next step boundary.
+- Tool calls parsed server-side into OpenAI tool_calls (JSON body and the
+  coder's <function=>/<parameter=> XML with schema-driven coercion);
+  deterministic call ids; never executed; no tools declared = raw text.
+- Reasoning: text before </think> goes to reasoning_content;
+  enable_thinking and reasoning_effort honoured.
+- Sampling defaults: request > operator flags > the GGUF's defaults; /props
+  names the provenance.
+- Console: one-line state/timing prints on stderr (load, expert cache,
+  per-slot prefill/decode rates, draft acceptance).
+- Security: no authentication, permissive CORS, no TLS. LAN or a reverse
+  proxy only.
 
-## Key design points
+## Model input
 
-- Paged executor is the served path (SDPAToPagedAttention: paged KV ports,
-  GDN state tables on their own block table); the stateful executor stays
-  behind --no-paged as the equivalence reference. Serving-shape IRs are paged
-  only.
-- Two lanes in one process (--parallel 2): per-lane InferRequests, GDN rows
-  and KV block tables over a shared refcounted page pool; a FIFO turnstile
-  orders graph executions (a correctness mechanism: the GPU plugin pools
-  intermediates per compiled model); sequences are never batched into one
-  graph call.
-- Prefix cache: keyed 128-bit block hashes with token verification; a hit
-  restores KV pages by reference and the GDN checkpoint row together; evicted
-  entries can park in host RAM (--cache-host-mib) and come back byte-exact.
-- KV precision (--paged-kv KEY[:VALUE]): u8 default (11.3 KiB/token on the
-  coder, the setting that does not refuse); u8:i4 = +28% auto-fit context,
-  u8's prefill rate from +p6 (micro-SDPA, values unpacked in registers); f16
-  faster at depth, costs prefix-cache reserve; u4 a capacity lever only.
-- Speculation (greedy only): a draft is accepted only if it equals the
-  sampler's pick from the verify pass's row; rollback on the paged path is
-  checkpoint-row promotion, zero bytes. MTP head reconstructed by
-  tools/export_mtp.py ((1+w) norms, per-head interleaved q/gate, sigmoid
-  gate); DFlash2 via tools/export_dflash.py; n-gram drafter. Drafters' rotary
-  kept f32 (f16 overflowed at 65,504), MTP state charged in the reservation.
-- MoE routes: fused int4 resident; --offload-ratio with a device-resident
-  slot pool; --moe-cpu-tier computes capacity misses on the CPU under a static
-  residency partition (patch 0018; census-seeded with 0046) so output stays
-  history-independent; --moe-per-expert-dispatch computes only the routed
-  experts with per-expert kernels decoding the checkpoint's own blocks
-  (IQ2_S, IQ2_S-packed, IQ3_XXS, IQ4_NL, Q8_0), all-resident at
-  --offload-ratio 0 (the 35B route above: batched and expert-grouped
-  launches, several rows per load, the IQ2_S gate/up on the matrix unit with
-  exact operands, decode routing on the device).
-- GGUF (--gguf FILE --model DIR): the file's K-quant rows replace the
-  template IR's projections; --gguf-mode mixed (default: Q4_K repacked into
-  the runtime's compressed form within a measured bound, 1/64 step for Q4_K;
-  Q5_K/Q6_K as the file's rows through a K-quant kernel), repack, native;
-  --gguf-mins exact|split|shared|nibble; --gguf-q6k aligned|file;
-  --gguf-embed file|template; --gguf-check once|always; f16 activations on a
-  GGUF-opened model.
-- Fit: --n-ctx omitted adopts the maximum admissible depth (auto-fit, audited
-  and trimmed at allocation); --n-ctx given is verify-only, never lowered;
-  --prefix-cache-reserve PCT keeps spare pages under auto-fit;
-  --fit-ledger-dir persists the probed terms to skip load-time probes.
-- Tokenizer + chat template ship in the artifact (hashes pinned);
-  incremental UTF-8-safe detokenization; reasoning split into
-  reasoning_content; tool calls parsed into OpenAI tool_calls (both Qwen wire
-  forms), never executed; no tools declared = parser never runs.
-- Sampling: host-side, penalties before the greedy decision, seeded and
-  logged; defaults request > operator flags > artifact > model card, with
-  provenance on /props.
-- Divergence policy (DESIGN 1.1): smallest sufficient divergence — upstream
-  PR, else a numbered PR-shaped patch series applied at build time and
-  published, else (last resort) a fork with an exit condition. The per-patch
-  record is contrib/packaging/marfrit-openvino/patches/README.md.
-- Per-card facts: the B60's GDN state output is one-ulp nondeterministic run
-  to run on the served Flash-Next path (open, reported upstream); the A770 is
-  bit-identical, so floors and byte-identity are read there.
+- A GGUF as published (--gguf FILE; the first shard of a split file). The
+  engine admits general.architecture qwen35, qwen35moe, qwen4exp, and llama
+  at the Mistral Small 24B geometry; anything else is refused at load. No
+  allowlist (retired with the OpenVINO engine, operator 2026-10-15).
+- Flash-Next's MTP layer: an MTP-only GGUF built from the checkpoint's 31
+  mtp.* tensors by tools/flash_next_mtp_gguf.sh (--llama-mtp-gguf); its
+  expert ranking: Strata's decode profile (--llama-expert-profile).
+
+## Mechanisms
+
+- Kernels (contrib/llama.cpp/patches, README per patch): K-quant integer-dot
+  matvec and fp16/int8 DPAS GEMMs with 2D block loads; IQ2/IQ3/IQ4/Q2_0 in
+  planes; the gated delta-net with rollback snapshots in the recurrent cache;
+  split decode attention, XMX prompt attention, quantized KV attention, GQA
+  verify attention; fused decode launches; inputs staged in a USM ring.
+- KV: llama.cpp's cache, --llama-kv f16 | q8_0 | q8_0:q4_0 (others refused);
+  --llama-reserve-cells N reserves compute buffers for N cells.
+- Speculative decoding: the model's own MTP head (--llama-mtp N), draft 0
+  from the catch-up batch, --llama-mtp-min-p stop, verify walk in the
+  sampler's order (greedy and seeded sampled); rollback by recurrent
+  snapshot. Both lanes busy: one draft loop and one verify for both.
+- Context checkpoints (--llama-checkpoints N, --llama-checkpoint-step T):
+  per lane, the recurrent state at user messages and near the prompt's end,
+  in host memory; a follow-up or an edited message resumes from the newest
+  at or below the shared prefix. No prefix cache across lanes or restarts.
+- Expert cache (Flash-Next; --llama-cpu-moe 48 --llama-expert-cache MIB
+  --llama-expert-profile F): hot experts in VRAM slots, the rest in a pinned
+  USM host bank read by the card over the link; swaps by Strata's adapt rule
+  on their own queue (Infernix's LFRU opt-in: LLAMA_EXPERT_CACHE_POLICY=lfru);
+  up to 16 decode misses a layer computed on the CPU with Strata's AVX2 rows
+  (LLAMA_EXPERT_CACHE_CPU_MISSES=1); prefill streams bank tensors through a
+  VRAM ring (GGML_OPENCL_BANK_STREAM=1). The 27 GiB n-gram table is read
+  lazily.
+- Two cards by layers: --device GPU.0,GPU.1 --llama-layer-split K, an expert
+  cache per card (--llama-expert-cache A,B), --llama-mtp-card N.
+- Environment switches: docs/switches.md (operational, tuning, opt-in,
+  off, red case, diagnostic).
+
+## Divergence policy (DESIGN 1.1)
+
+Upstream PR first; else a numbered, PR-shaped patch against the pinned
+llama.cpp in contrib/llama.cpp/patches, documented with its measurement,
+KL and red case; a fork only with a stated reason and exit condition (none
+exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
 
 ## Command-line options (arcint --help)
 
-Generated from the binary's --help (src/config.cpp usage_text); the source is
-authoritative when the two disagree. A docs/ path the help names that is not
-on this branch lives on the development branch `qfndev`.
-
-```
-usage: arcint [options]
-
-model
-  --model PATH              OpenVINO IR directory to serve
-  --stub                    serve the M0 stub backend (no model, no GPU)
-  --stub-delay-ms N         stub only: artificial latency per token
-  --model-id ID             allowlist entry to assert (default: from the
-                            artifact directory name)
-  --quant q4|q8             weight format (default: q4)
-  --device DEV              OpenVINO device (default: GPU.0); --engine llama:
-                            GPU.N or a device name substring (B60), or two
-                            cards GPU.0,GPU.1 for --llama-layer-split
-  --cache-dir PATH          compiled-blob cache directory
-  --vision                  (reserved; refused) v1 is text-only; the vision
-                            tower and projector IRs a VLM checkpoint ships are
-                            never loaded
-
-server
-  --host ADDR               bind address (default: 127.0.0.1)
-  --port N                  bind port (default: 8090)
-  --served-model-name NAME  the name this endpoint reports on
-                            /v1/models and /props (default: the
-                            artifact's allowlist id). Presentation
-                            only: --model-id still decides which
-                            artifact is accepted
-                            A,B (libllama, with --lane-ctx): named lanes,
-                            one per name; the request's model field picks
-                            the lane (empty: the first; unknown: 404)
-  --lane-ctx CA,CB          libllama: each named lane's context, paired with
-                            --served-model-name A,B by index; multiples of
-                            256, at most 4 lanes. The lanes share one KV pool
-                            of their sum (llama.cpp's kv_unified); --parallel
-                            and --n-ctx follow from them
-  --parallel N              number of lanes (default: 1)
-  --queue-timeout S         seconds a request waits for a lane before a
-                            503 with the reservation numbers (default: 0)
-  --http-threads N          HTTP worker threads (default: library default)
-  --pin-dispatch N          pin each lane's dispatch thread to N+lane_index
-                            (default: -1, off). Linux only. The pin persists on
-                            the pooled OS thread, not the request -- it is never
-                            undone once set
-  --moe-cpu-tier            compute expert FFNs that would evict a device
-                            slot on the host CPU instead (needs --offload-ratio;
-                            --prefix-cache-mib > 0 is still refused at load
-                            unless the plugin reports the static residency
-                            partition; DESIGN §3.4 (amended 2026-10-01) admits
-                            the pair, and lifting the refusal is owed)
-  --moe-cpu-tier-threads N  worker threads for that tier (0 = auto)
-  --moe-per-expert-dispatch dispatch routed experts via per-expert GPU
-                            kernels (needs --offload-ratio + --moe-cpu-tier)
-
-memory
-  --n-ctx N                 context length. Omitted: adopts whatever the
-                            paged path's auto-fit computes (M7) -- that
-                            adoption IS the fit, and it can come out below
-                            the model's own maximum. --n-ctx 0 (typed) is
-                            NOT the same as omitting the flag: it asks
-                            explicitly for the model's own maximum, checked
-                            against the fit like any other explicit value --
-                            it can refuse where omission would have adopted
-                            a smaller number instead
-  --kv-block-size 16|32     KV page size in tokens (default: 32)
-  --prefill-chunk N         prefill chunk in tokens, 0 = unchunked
-                            (default: 2048; bounds activation memory)
-  --paged-kv KEY[:VALUE]    KV precision on the paged path (default: u8). KEY and
-                            VALUE each one of f16, u8, i8, u4, i4; omitting :VALUE
-                            applies KEY to both the key and value cache ("u8" and
-                            "f16" mean exactly what they always did). A colon pair
-                            asks for asymmetric precision (M8) and is refused unless
-                            the compiled paged model actually carries the requested
-                            widths per side.
-                            u8 is 11.3 KiB/token against f16's 20.0, which
-                            is what makes two lanes at depth fit. It is the
-                            default because it is the setting that does not
-                            refuse, not because it is faster -- f16 wins on
-                            prefill and, past ~50k, on decode too. f16 also
-                            costs prefix-cache reserve: the pool is sized in
-                            bytes and live pages are a fixed count, so the
-                            whole difference lands there
-  --cache-grid N            prefix-cache snapshot grid in tokens (default: 0 = the
-                            prefill chunk). A snapshot lands on the last multiple of N
-                            below the prompt length; a coarser grid re-prefills the
-                            remainder on every continuation. DESIGN 7.0.2j.
-  --cache-host-mib N        host tier for evicted prefixes: an entry evicted for its
-                            KV pages parks them in host RAM instead and comes back
-                            over the link on a hit (default: 0, off). DESIGN 4.4.
-  --kv-pool-pages N         cap the KV pool at N pages (default: 0, sized by memory).
-                            A test knob: the way to make the cache evict on demand.
-  --prefix-cache-reserve PCT
-                            auto-fit only (--n-ctx omitted): hold back PCT percent of
-                            the PER-LANE budget-affordable pages as spare for cached
-                            prefixes, so the adopted depth is reduced instead of eating
-                            the whole budget (default: 0, off -- today's behaviour, and
-                            what the "0 spare pages" warning names). PCT applies per
-                            lane; the pool actually allocated is lane-wide (--parallel
-                            lanes' worth), net of a small per-lane guard-page overhead --
-                            the load log names both the per-lane reserve and the pool-
-                            wide pages actually held. Integer 0..90; needs
-                            --prefix-cache-mib > 0 (nothing to reserve pages for
-                            otherwise) and refuses with an explicit --n-ctx -- an
-                            explicit depth already defines the reserve as whatever
-                            remains after the request.
-
-serving defaults (the operator layer: request > these > artifact > family card;
-any of them flips the served sampler provenance to 'operator')
-  --temp X                  default temperature (0 = greedy, which is also what
-                            lets the MTP drafter engage)
-  --top-p X                 default nucleus mass
-  --top-k N                 default top-k (0 disables)
-  --min-p X                 default min-p: keep p >= X * p_max, before
-                            temperature, as llama.cpp (0 disables)
-  --repetition-penalty X    default repetition penalty
-  --presence-penalty X      default presence penalty
-  --chat-template-kwarg enable_thinking=BOOL
-                            template default when the request sends neither
-                            chat_template_kwargs.enable_thinking nor
-                            reasoning_effort; only enable_thinking exists
-
-  --gate-pad N              widen the shared-expert gate to N columns (default: 0,
-                            off). 16 is the measured setting: -13% prefill wall,
-                            -5% decode; pays off below ~500 answer tokens per 12k
-                            prompt tokens. See DESIGN 7.0.2g.
-  --prefix-cache-mib N      prefix-cache budget in MiB (default: 0, off)
-  --fit-margin-mib N        headroom the paged-path auto-fit budget leaves
-                            unclaimed (default: 256). The only policy term in
-                            the reservation; every other term is measured
-  --fit-ledger-dir PATH     persist the admission fit terms (slot pool,
-                            activation fit, chunk cap) to skip the load-time
-                            probes on subsequent starts (default: off)
-  --paged-attention-max-partitions N
-                            bound the GPU plugin's mixed-stage paged-attention
-                            partition count (default: 0, unbounded). Passed to
-                            a patched plugin as PAGED_ATTENTION_MAX_PARTITIONS;
-                            ignored, with a log line, on a plugin that does not
-                            carry the key (0015)
-  --no-logits-slice         compute logits for every prompt token (slower,
-                            and runs out of memory past a few thousand)
-  --kv-dtype fp16|fp32      stored KV element type (default: fp16;
-                            fp32 is what the artifact exports)
-  --gdn-checkpoint-budget N GDN checkpoint budget in MiB (default: 512)
-  --mtp on|off|auto         speculative decoding (default: auto)
-  --draft N                 speculative draft length, 0 = off
-  --draft-ngram K           drafter match length (default: 3)
-  --custom-kernels FILE     OpenVINO custom-layer XML (hand-written OpenCL)
-  --offload-ratio N         % of MoE expert weights to stream, 0 = all resident
-  --no-paged                stateful reference path instead of the paged executor
-  --emb-device DEV          run the embeddings gather elsewhere (default: --device)
-  --mtp-device DEV          run the MTP head elsewhere (default: --device)
-  --gguf FILE               serve this GGUF's weights on --model's topology (the
-                            served IR of the same architecture is the template);
-                            K-quant rows go to the card as stored, decoded in the
-                            kernel. Needs --model and a plugin at +p7 or later
-  --gguf-mode repack|native|mixed
-                            how the file's projections reach the graph (default:
-                            mixed, Q4_K repacked and every other type native rows)
-  --gguf-native             alias for --gguf-mode native
-  --gguf-mins exact|shared|nibble|split
-                            the repacked projections' mins packing (default: exact,
-                            +12.5% on the Q4_K set; shared +6.25%, nibble +3.1%,
-                            both inexact; split: the min term a separate term on
-                            the group sums, K the model's, a decode lever)
-  --gguf-q6k aligned|file   native Q6_K rows in 224-byte dword-aligned blocks
-                            (default: aligned) or the file's own 210-byte rows
-  --gguf-embed file|template
-                            the token embedding rows from the file, dequantised on
-                            the host per token (default), or the template's
-  --gguf-check once|always  keep each repacked projection's deviation verdict
-                            between loads of the same file (default) or re-check
-  --ngram-gguf FILE         the GGUF shard whose per_layer_token_embd.weight binds
-                            the IR's ngram_table.K ports (a serving-shape IR that
-                            carries the n-gram table as ports). Opened for that
-                            tensor only: no template rewrite, no geometry check.
-                            Refused with --gguf, and when the IR declares no ports
-  --flash-next-ngram PATH   Flash-Next per_layer_token_embd table (24-byte
-                            ARCINGRM header + block-quantised payload). The
-                            artifact's config.json must declare an n-gram table
-                            (ngram_size, ple_embed_dim, ...) or the file is
-                            refused. Design: docs/design-qwen-flash-next.md FIX D.
-  --dyn-quant on|off        the runtime's per-token int8 activation quantization on
-                            compressed weights; default: the runtime's own for an IR,
-                            off for a GGUF-opened model (f16 activations reproduce the
-                            native path's greedy output byte for byte, at the same rate)
-  --dflash DIR              DFlash2 block drafter directory (7 drafts per
-                            verify pass; greedy only, like --mtp). One
-                            drafter per server: conflicts with --mtp on
-                            and --draft N
-  --dflash-device DEV       run the drafter elsewhere (default: --device)
-  --dflash-block N          override the block size the drafter's config.json
-                            declares, N in [2, 32] (default: 0, take the json).
-                            Needs --dflash
-  --dflash-select MODE      greedy | viterbi: selector strategy over the DFlash
-                            lattice (default: greedy, today's behaviour). viterbi
-                            finds the exact maximum-score path instead of
-                            committing row by row
-  --dflash-lambda X         weight on the bilinear codebook term of the selector's
-                            score, unary + X*bilinear (default: 1.0). 0 scores on
-                            the target lm_head logit alone
-  --dflash-topk K           override the selector's top-k the drafter's config.json
-                            declares, K in [1, 64] (default: 0, take the json).
-                            Needs --dflash
-  --mtp-layer WHICH         auto | reconstructed | exported: which MTP layer graph to
-                            draft with when the artifact carries both (default: auto,
-                            the reconstructed one when present)
-
-misc
-  -v, -vv                   raise console verbosity
-  --flash-next-offload-plan HIT
-                            print the Flash-Next expert-offload serving
-                            plan for the target card at measured per-layer
-                            LRU hit-rate HIT (0..1), then exit (WP7 dry-run)
-  --inspect-artifact        with --model PATH, print the artifact contract
-                            the runtime drives (geometry, segment chain,
-                            expert-body blob, the one buffer set it implies,
-                            whether the allowlist admits the directory) and
-                            exit. Device-free; the directory needs no entry
-                            yet -- reading a contract is what precedes a pin.
-  --version                 print version and exit
-  --engine ov|llama         the executor: OpenVINO (--model IR) or ggml OpenCL via
-                            libllama (--gguf); default: libllama for --gguf
-                            without --model, else OpenVINO
-  --llama-cpu-moe N         libllama: the first N layers' experts stay in host
-                            memory, computed by the CPU (experts beyond VRAM)
-  --llama-threads N         libllama: CPU threads (default: half the hardware
-                            threads)
-  --llama-mtp N             libllama: draft up to N tokens a step with the
-                            GGUF's MTP head, verified in one pass (0-7; 0 off)
-  --llama-mtp-vocab FILE    libllama: the token ids the MTP head may draft
-                            (int32, or a JSON list): a draft step reads only
-                            those rows of the output head
-  --llama-mtp-gguf FILE     libllama: the MTP layer from this MTP-only GGUF
-                            (llama.cpp's converter --mtp) instead of the
-                            model's own file
-  --llama-mtp-min-p P       libllama: stop drafting at a token the MTP head
-                            gives less than P, and leave it out of the verify
-                            (0-1; 0 off: always --llama-mtp drafts)
-  --llama-reserve-cells N   libllama: reserve the compute buffers for a
-                            prompt ubatch at N cache cells, not the whole
-                            context; deeper prompt chunks take smaller
-                            ubatches (0: the whole context)
-  --llama-checkpoints N     libllama: per lane, up to N snapshots of a hybrid
-                            model's recurrent state (near the prompt's end,
-                            at user messages), so a follow-up or an edited
-                            message resumes instead of re-prefilling
-                            (default 32; 0 off)
-  --llama-checkpoint-step T libllama: the least spacing of snapshots at
-                            earlier user messages (default 8192)
-  --llama-expert-cache MIB  libllama: MIB of expert slots on the card for the
-                            MoE layers --llama-cpu-moe keeps in host memory;
-                            the other experts in a bank in host memory (pinned)
-                            read by the card over the link; hot experts swapped
-                            in during decode. The card also holds a Q8_0 down
-                            projection's bank and a gather mirror beyond MIB
-                            (default 0, off; contrib/llama.cpp 0021). Two cards:
-                            A,B, a cache per card for its own layers, in
-                            --device order (0: none on that card; 0024)
-  --llama-layer-split K     libllama, two cards (--device GPU.0,GPU.1): layers
-                            [0, K) on the first, the rest, the output head and
-                            the MTP layer on the second (contrib/llama.cpp 0023)
-  --llama-mtp-card N        libllama, two cards: the card running the
-                            --llama-mtp-gguf model (default 0, the first)
-  --llama-expert-profile F  libllama: the expert ranking that fills the cache
-                            (Strata's STRP profile; default round robin)
-  --llama-kv K[:V]          libllama: the attention cache types, f16, q8_0 or
-                            q8_0:q4_0 (default f16): q8_0 takes the cache to
-                            53 %, q8_0:q4_0 to 41 %
-  -h, --help                print this help and exit
-```
+- --engine llama --gguf FILE: the engine (llama is its only value) and the
+  file.
+- --device GPU.N | NAME-SUBSTRING | GPU.0,GPU.1: the card(s), in OpenCL
+  enumeration order (GPU.0 = B60, GPU.1 = A770 on the dev host).
+- --host ADDR (127.0.0.1), --port N (8090), --http-threads N.
+- --served-model-name NAME[,NAME2] with --lane-ctx CA,CB; --parallel N;
+  --n-ctx N (default the smaller of 32,768 and the trained context);
+  --queue-timeout S; --prefill-chunk N.
+- Sampler defaults: --temp, --top-p, --top-k, --min-p,
+  --repetition-penalty, --presence-penalty,
+  --chat-template-kwarg enable_thinking=BOOL.
+- --llama-kv K[:V]; --llama-threads N; --llama-reserve-cells N.
+- --llama-mtp N, --llama-mtp-gguf FILE, --llama-mtp-vocab FILE,
+  --llama-mtp-min-p P, --llama-mtp-card N.
+- --llama-checkpoints N (32), --llama-checkpoint-step T (8192).
+- --llama-cpu-moe N, --llama-expert-cache MIB[,MIB],
+  --llama-expert-profile FILE, --llama-layer-split K.
+- --stub, --stub-delay-ms N (the device-free test backend); -v, -vv;
+  --version.
 
 ## Layout
 
-- README.md: intro, building, the measured tables, supported models and
-  formats.
-- FURTHER-READING.md: the fuller measured record, scope, artifact provenance
-  and calibration, features, non-goals, status, deploying, why-not-X.
-- DESIGN.md: the current state — architecture (§3), invariants (§3.4, §3.8),
-  serving (§4), gates (§5, the generated acceptance row in §5.1), evidence
-  against the upstream pipeline layer (§6), milestones and the standing value
-  of every subsystem (§7, with the record index §7.0.2), open questions (§8).
-- CHANGELOG.md: per-release changes and the runtime (patch level) each
-  release depends on; the Debian changelogs under contrib/ are the package
-  record.
-- DEVELOPMENT.md: hardware, dependencies, how to run the suites.
-- contrib/packaging/: the Debian recipes for arcint and the patched runtime,
-  with the patch series and its per-patch record; patches/ mirrors the series.
-- contrib/systemd/: the two deployed units as examples.
-- models/allowlist-raw.json: raw IR metadata, the allowlist's provenance.
-- src/: config, util/, core/ (model_registry, sampler, stop, toolcall, chat,
-  prefix_cache, block_pool, turnstile, gguf reader/dequant/repack), exec/
-  (backend interface, stub, backend_ov, fit arithmetic, graph rewrites, the
-  n-gram staging), api/, http/.
-- tools/: exporters (export_mtp.py, export_dflash.py,
-  export_serving_artifact.py and q4e/), measurement instruments, the
-  acceptance manifest generator.
-- tests/: `unit` (what bare ctest runs, device-free: the hand-rolled harness
-  where a skip is a failure unless named, roundtrip.sh, concurrency/stress.sh,
-  the acceptance enumeration's own checks) and `acceptance` (card-requiring
-  cells enumerated in tests/acceptance/cells.json and run by
-  tests/acceptance/run.py; equivalence/run.sh and concurrency/run.py are its
-  runners; the Prüfstand is the external cell). docs/release-checklist.md and
-  the DESIGN §5.1 acceptance row are generated from that enumeration.
-- docs/: the release checklist, the SOP for card windows, and the few design
-  notes the tooling cites; everything else on the development branch.
-- third_party/: cpp-httplib, nlohmann/json, single headers.
+- README.md: what arcint is, models, numbers, building, running, scope.
+- DESIGN.md: architecture (3), reuse and the correctness rule (3.4), MTP
+  (3.5), the overflow invariant (3.8), the expert cache (3.9), lanes and two
+  cards (3.10), serving (4), test gates (5), state of play (7), open items (8).
+- docs/llama-engine.md: the engine's record, mechanism by mechanism.
+- contrib/llama.cpp/: the pin, the patch series and its README.
+- docs/switches.md: every environment switch, classified.
+- docs/campaigns/: one document per open defect or lever, plus research-*.md
+  surveys of prior art (research-reference-audit.md first).
+- docs/sop-card-window.md (the card window), docs/release-checklist.md
+  (generated from tests/acceptance/cells.json), docs/docker.md,
+  docs/milestone-1.0.0.md, docs/history.md (the retired OpenVINO record).
+- CHANGELOG.md: per-release changes and dependencies.
+- src/: config, util/, core/ (sampling, stop, toolcall, chat), exec/
+  (backend interface, stub, backend_llama, llama_spec, verify_walk,
+  llama_layer_split), api/, http/.
+- tools/: the Flash-Next MTP GGUF builder, KL and reference tooling, kernel
+  tuning, expert-cache trace replay.
+- tests/: `unit` label (bare ctest, device-free) and the acceptance cells in
+  tests/acceptance/cells.json run by tests/acceptance/run.py on a card.
+- contrib/packaging/arcint/ (the Debian recipe), contrib/systemd/ (units),
+  docker/ (the image).
+- third_party/: cpp-httplib, nlohmann/json, minja.
 
 ## Build
 
@@ -604,17 +187,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ctest --test-dir build --output-on-failure -L unit
 ./build/arcint --stub --port 8090 -v
 
--DARCINT_OPENVINO=ON builds the served executor against the patched runtime;
--DARCINT_WERROR=ON is warning-clean. Clean under ASan+UBSan with
--fno-sanitize-recover, but ASan must run on x86_64: it aborts at startup on
-aarch64.
-
-## Provenance
-
-Design grounded in 2026-08 measurement campaigns on this hardware: OpenVINO
-60 t/s vs Vulkan 7.9 t/s on the B60 for the same checkpoint; SE calibration
-degenerates greedy on dense Qwen3.8; OV GenAI's CB path diverges from its
-stateful path under greedy (upstream issue openvino.genai#4367, CI equality
-test skipped since 2025-02); OV model-cache import bug and workaround
-(openvinotoolkit/openvino#37607). Performance bar: beat 60 t/s (27B q4, B60)
-while holding the equivalence invariants — held at 66.5 t/s.
+Serving build: -DARCINT_LLAMA=ON -DARCINT_LLAMA_DIR=<llama.cpp at 3e4dfa8
+with contrib/llama.cpp/patches applied> -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF;
+needs OpenCL headers and the ICD loader, and Intel's compute runtime to run.
+-DARCINT_WERROR=ON is warning-clean; ASan+UBSan clean on x86_64.

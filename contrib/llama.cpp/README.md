@@ -18,6 +18,10 @@ batch (`llama-perplexity -b 4*c`, ubatches that mix the sequences). arcint
 decodes one sequence per call, but llama.cpp's own batching does not. 0022
 shipped a defect only the second arm sees (fixed by 0027).
 
+Where a section below compares with "the OpenVINO path" or cites a
+`marfrit-openvino` plugin patch, it means arcint's retired OpenVINO engine and
+its runtime; both are at the tag `openvino-history` (`docs/history.md`).
+
 ## Moving the pin
 
 The pin moves only as a release decision of its own (charter C3,
@@ -2860,7 +2864,7 @@ upload (`code`, `src/program/generate.cpp:3589-3606`, `res_upload` at
 A graph's inputs (positions, masks, ids) reach the card without a blocking
 write each and without a wait each.
 
-- **Why** (`measured-here`, stage 8 of `docs/campaigns/flash-next-llama-engine.md`):
+- **Why** (`measured-here`, stage 8 of `docs/campaigns/flash-next-llama-engine.md` (on the `qfndev` branch)):
   - With one GPU the scheduler creates no events (`n_copies == 1`,
     `ggml-backend.cpp`, `code`). So for each user input of a split it
     synchronizes the backend and then copies synchronously. CUDA on one GPU
@@ -2950,7 +2954,7 @@ keeps the old staging; `-DFA_VBLK_RED` (through `GGML_OPENCL_FA_DPAS_OPTS`)
 swaps the pair: the red case. Quantized V keeps the old staging (below).
 
 - **Why:** the A770's ablations after 0039 put V's transposing stores at ~12
-  ms of 70 (`docs/campaigns/dense-prefill-attention.md`, A770 stage).
+  ms of 70 (`docs/campaigns/dense-prefill-attention.md` (on the `qfndev` branch), A770 stage).
 - **The forms tried** (`measured-here`, 2026-10-14, the A770 at its pinned
   2000 MHz, test-backend-ops perf, causal, 24 heads on 4, 512 rows, 65,536
   keys; offline ISA from ocloc acm-g10):
@@ -3506,3 +3510,28 @@ product has no SIMD form.
 - **On the unit** (operator, 2026-10-15): the Flash-Next unit sets
   `LLAMA_EXPERT_CACHE_CPU_MISSES=1` from 0.7.11 on (an `Environment=` line;
   it spins 8 threads at 100 % while Flash-Next decodes).
+- **Fixed after 0.7.12: IQ4_NL banks on the slow path** (`measured-here`,
+  B60, ISTA-DASLab's IQ3_XXS file, 2026-10-15). A layer whose types the
+  multi-token rows do not take goes through ggml-cpu's dot products, which
+  read each weight row as GGUF blocks. An IQ4_NL tensor in USM host memory
+  is not stored that way: its first write (`ggml_cl_usm_set_tensor`) keeps
+  its scales and its quants as two arrays. The slow path read the split as
+  blocks: layer 0 of the IQ3_XXS file (IQ2_XS gate/up, IQ4_NL down; 18 of
+  its 48 layers have an IQ4_NL down, the IQ2_XS file none) returned 13,230
+  non-finite values in 40,960, layer 1's whole input was non-finite, its
+  fused top-k chose no expert (INT_MAX ids), and its first CPU pair carried
+  bank row 1,911,949,923 of 329: a fault in `row_iq<IQ2_XXS>` at the first
+  request. Found by instrumenting the publish and the CPU path (the ids,
+  the table and the routed ids at that node; non-finite counts a layer).
+  The row reader rebuilds GGUF blocks from the two arrays
+  (`ggml_cl_miss_cpu_join_iq4nl`), and the arrays are looked up at a layer's
+  first publish: a first fix looked them up at registration, which comes
+  before the bank's fill, and was measured inert. With the fix: no
+  non-finite row; IQ3_XXS at 12,000 MiB of slots decodes 33.9 / 37.5 / 37.3
+  / 33.5 / 30.6 / 30.9 t/s on six answers with the misses against 20.7 /
+  26.2 / 28.9 / 18.7 / 21.2 / 18.5 without (+52 % on the mean), KL 0.290954
+  / 86.618 % against 0.286562 / 86.765 % (8 x 512, ubatch 4), Paris and the
+  needle right; the IQ2_XS unit's six texts unchanged (md5).
+  `test-opencl-miss-cpu` checks split rows against the GGUF bytes; its red
+  mode, and `GGML_OPENCL_CPU_MISS_SPLIT_RED=1` served (a fault at the first
+  request), read the split as blocks.

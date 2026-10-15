@@ -89,31 +89,27 @@ check "/health reports slots and queue depth" $?
 
 # ------------------------------------------------------------------- /props
 curl -sS "${BASE}/props" -o "${WORK}/props.json"
-jassert "${WORK}/props.json" 'd["model"]["id"]=="qwen3.6-27b-a3b-coder" and d["model"]["n_ctx"]==256'
+jassert "${WORK}/props.json" 'd["model"]["id"]=="stub" and d["model"]["n_ctx"]==256'
 check "/props reports the served model and context" $?
-# A stub loads nothing: the served path, precision and page size are all
-# unknowable, so they must read null rather than a stateful-path default the
-# stub never ran (the M3 defect this contract replaces -- every stub and
-# every real server used to report the identical hardcoded block).
+# A stub loads nothing: the KV precision, the quant and the architecture are
+# unknowable, so they must read null rather than a default the stub never ran
+# (the M3 defect this contract replaces -- every stub and every real server
+# used to report the identical hardcoded block).
 jassert "${WORK}/props.json" \
-  'd["cache"]["path"] is None and d["cache"]["kv_dtype"] is None and \
-   d["cache"]["kv_block_tokens"] is None and d["cache"]["prefix_cache"] is False and \
-   d["cache"]["prefix_cache_mib"]==0 and d["cache"]["kv_block_size"]==32'
+  'd["cache"]["kv_dtype"] is None and d["model"]["quant"] is None and d["model"]["architecture"] is None'
 check "/props reports the cache configuration (stub: nothing served, no guessing)" $?
 jassert "${WORK}/props.json" 'd["sampler_defaults"]["provenance"]=="provisional"'
 check "/props marks provisional sampler defaults as such" $?
-jassert "${WORK}/props.json" 'd["model"]["arch_hash"]=="6745cfe3d57e3f0f" and d["model"]["template_hash"]=="e84f32a23fdda276"'
-check "/props reports the pinned artifact hashes" $?
-jassert "${WORK}/props.json" 'd["model"]["n_layer"]==40 and d["model"]["n_gdn_layer"]==30 and d["model"]["n_attn_layer"]==10'
-check "/props reports the measured layer split" $?
-jassert "${WORK}/props.json" '"10/10" in d["model"]["status"]'
-check "/props carries the artifact's Pruefstand status" $?
+jassert "${WORK}/props.json" 'not any(k in d for k in ("reservation",)) and not any(k in d["cache"] for k in ("path", "kv_block_size", "prefix_cache")) and not any(k in d["model"] for k in ("ov_arch", "arch_hash", "qsa"))'
+check "/props carries none of the retired engine's fields" $?
+jassert "${WORK}/health.json" 'not any(k in d for k in ("kv_blocks_free", "kv_blocks_total", "cache"))'
+check "/health carries none of the retired engine's fields" $?
 jassert "${WORK}/props.json" 'bool(d["build"]["version"]) and bool(d["build"]["compiler"])'
 check "/props carries build info" $?
 
 # --------------------------------------------------------------- /v1/models
 curl -sS "${BASE}/v1/models" -o "${WORK}/models.json"
-jassert "${WORK}/models.json" 'len(d["data"])==1 and d["data"][0]["id"]=="qwen3.6-27b-a3b-coder"'
+jassert "${WORK}/models.json" 'len(d["data"])==1 and d["data"][0]["id"]=="stub"'
 check "/v1/models lists exactly the served model" $?
 # The context has to be here and nowhere else: a discovering proxy reads it from
 # this object and asks /props for nothing but template capabilities, so a
@@ -122,7 +118,7 @@ jassert "${WORK}/models.json" 'd["data"][0]["n_ctx"]==256'
 check "/v1/models carries the context the server is running with" $?
 jassert "${WORK}/models.json" 'd["data"][0]["n_ctx_train"]==262144 and d["data"][0]["n_ctx"]!=d["data"][0]["n_ctx_train"]'
 check "/v1/models tells the served context from the trained one" $?
-jassert "${WORK}/models.json" 'd["data"][0]["quant"]=="q4" and d["data"][0]["lanes"]==1 and d["data"][0]["canonical_id"]=="qwen3.6-27b-a3b-coder"'
+jassert "${WORK}/models.json" 'd["data"][0]["quant"] is None and d["data"][0]["lanes"]==1 and d["data"][0]["canonical_id"]=="stub"'
 check "/v1/models carries quant, lanes and the canonical id" $?
 
 # ------------------------------------------------------- chat, non-streaming
@@ -383,7 +379,7 @@ wait "$CANCEL_PID" 2>/dev/null
 # A second server, because the name is fixed at startup. What is being gated is
 # that the presented name moves and artifact identity does not: a roster that
 # discovers names from /v1/models pins itself to whatever it finds, so renaming
-# has to be possible without touching which artifact the allowlist accepts.
+# has to be possible without touching which file is served.
 ALIAS_PORT=$(free_port); need_port "$ALIAS_PORT"
 ALIAS_LOG="${WORK}/alias.log"
 "$BIN" --stub --host 127.0.0.1 --port "$ALIAS_PORT" --n-ctx 40960 \
@@ -399,20 +395,16 @@ done
 curl -sS "${ALIAS_BASE}/v1/models" -o "${WORK}/alias-models.json"
 jassert "${WORK}/alias-models.json" 'd["data"][0]["id"]=="qwen3.6-coder"'
 check "--served-model-name renames the id on /v1/models" $?
-jassert "${WORK}/alias-models.json" 'd["data"][0]["canonical_id"]=="qwen3.6-27b-a3b-coder"'
-check "the artifact behind the name is still visible" $?
+jassert "${WORK}/alias-models.json" 'd["data"][0]["canonical_id"]=="stub"'
+check "the file behind the name is still visible" $?
 jassert "${WORK}/alias-models.json" 'd["data"][0]["n_ctx"]==40960'
 check "the renamed entry carries the served context, not the trained one" $?
 
 curl -sS "${ALIAS_BASE}/props" -o "${WORK}/alias-props.json"
-jassert "${WORK}/alias-props.json" 'd["model"]["id"]=="qwen3.6-coder" and d["model"]["canonical_id"]=="qwen3.6-27b-a3b-coder"'
+jassert "${WORK}/alias-props.json" 'd["model"]["id"]=="qwen3.6-coder" and d["model"]["canonical_id"]=="stub"'
 check "/props agrees with /v1/models about the name" $?
-jassert "${WORK}/alias-props.json" 'set(d["model"]["answers_to"])=={"qwen3.6-coder","qwen3.6-27b-a3b-coder"} and d["model"]["enforces_model_field"] is False'
+jassert "${WORK}/alias-props.json" 'set(d["model"]["answers_to"])=={"qwen3.6-coder","stub"} and d["model"]["enforces_model_field"] is False'
 check "/props says which names a request may use" $?
-# The registry lookup is keyed by the canonical id, so a rename must not cost
-# the artifact metadata that /props enriches from it.
-jassert "${WORK}/alias-props.json" 'd["model"]["arch_hash"] and d["model"]["n_expert"]==184'
-check "a renamed model keeps its allowlist metadata" $?
 
 curl -sS "${ALIAS_BASE}/v1/chat/completions" -H 'Content-Type: application/json' \
   -d '{"model":"qwen3.6-coder","messages":[{"role":"user","content":"hallo"}],"temperature":0}' \
@@ -532,13 +524,19 @@ check "usage says which regime the request got (draft counters present)" $?
 
 kill -TERM "$OP_PID" 2>/dev/null; wait "$OP_PID" 2>/dev/null; OP_PID=""
 
-# The allowlist assertion is a separate knob and must not have moved: a wrong
-# artifact is still refused, whatever the endpoint is called.
-if "$BIN" --stub --model-id qwen3.6-coder --port "$ALIAS_PORT" >"${WORK}/refuse.log" 2>&1; then
-  fail "--model-id outside the allowlist is still refused"
+# The retired engine's options are refused by name, and its engine value by a
+# message that names the history tag.
+if "$BIN" --stub --model /models/ov/x --port "$ALIAS_PORT" >"${WORK}/refuse.log" 2>&1; then
+  fail "a retired flag is refused"
 else
-  grep -q 'is not in the allowlist' "${WORK}/refuse.log"
-  check "--model-id outside the allowlist is still refused" $?
+  grep -q -- '--model was retired with the OpenVINO engine in 0.8.0' "${WORK}/refuse.log"
+  check "a retired flag is refused by name" $?
+fi
+if "$BIN" --engine ov --gguf /m/q.gguf --port "$ALIAS_PORT" >"${WORK}/refuse-ov.log" 2>&1; then
+  fail "--engine ov is refused"
+else
+  grep -q 'openvino-history' "${WORK}/refuse-ov.log"
+  check "--engine ov is refused with the history tag named" $?
 fi
 if "$BIN" --stub --served-model-name "" --port "$ALIAS_PORT" >"${WORK}/blank.log" 2>&1; then
   fail "--served-model-name refuses a blank name"

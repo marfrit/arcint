@@ -56,7 +56,7 @@ sglang-jax (#1675), Megatron-LM (trainable QSA with TileLang, #7060).
    kernel (#11: waves 8–15 silently shrank the top-k to ~927), and
    rollback/state-restore coverage for the cache (#28699, 2x4ever).
 
-## Against arcint's served QSA (measured here, 2026-09-30; `docs/campaigns/qsa.md`)
+## Against arcint's served QSA (measured here, 2026-09-30; `docs/campaigns/qsa.md` (at the tag `openvino-history`))
 
 - arcint's indexer (`q4e.attention._qsa_mask_dynamic`) pools, norms and
   ropes the **whole raw-key history on every call**, the exact per-token cost

@@ -1,107 +1,44 @@
-# Container images
+# Container image
 
-arcint can be packed as a pull-and-run container set the way other Arc
-serving stacks are. Two images, because the two halves of the dependency
-have very different change rates:
+arcint can be packed as a pull-and-run container the way other Arc serving
+stacks are: one image, `arcint`, carrying the engine built against llama.cpp
+at the recipe's pin with `contrib/llama.cpp/patches` applied, and the
+userspace GPU stack (the OpenCL ICD loader and Intel's compute runtime). The
+host supplies the kernel driver and `/dev/dri`; models are mounted, never
+baked in.
 
-| Tier | Image | Rebuilds when | Build cost |
-|---|---|---|---|
-| 1 | `arcint-ov` — the **patched** OpenVINO runtime | the patch series or the pin changes | heavy (~35 min) |
-| 2 | `arcint` — the engine, both engines in one binary | every commit | light |
-
-Splitting them is the whole point. Building them together would recompile a
-pinned OpenVINO nightly on every engine commit.
-
-The split is *per layer of divergence*, not per backend. The patch series
-in `contrib/packaging/marfrit-openvino/patches/` is why a single
-"install OpenVINO" Dockerfile is not available: the runtime arcint is
-measured against is a source build, not a release.
-
-Tier 2 builds **both** engines the `.deb` builds — `-DARCINT_OPENVINO=ON`
-and `-DARCINT_LLAMA=ON` with llama.cpp at the recipe's pin and
-`contrib/llama.cpp/patches` applied. Since 0.5.5 the units this project
-serves run `--engine llama`, so an image carrying the OpenVINO path alone
-would not be the thing the project ships.
+Until 0.7.12 there were two images: a tier-1 base carrying the patched
+OpenVINO runtime (`arcint-ov`) and the engine on top. That base was retired
+with the OpenVINO engine in 0.8.0 (`docs/history.md`); the published
+`arcint-ov` images stay as they are.
 
 ## Building
 
 From the repo root:
 
 ```bash
-# tier 1 — the patched OpenVINO base
-docker build -t arcint-ov:2026.4.0-ov71640275-marfrit-p27 \
-  -f docker/Dockerfile.openvino-patched .
-
-# tier 2 — the engine on top of it
-docker build -t arcint:local \
-  --build-arg OV_BASE=arcint-ov:2026.4.0-ov71640275-marfrit-p27 \
-  -f docker/Dockerfile.arcint .
+docker build -t arcint:local -f docker/Dockerfile.arcint .
 ```
 
-Or dispatch `.github/workflows/build-toolbox.yml`, which builds both and
-publishes to GHCR under the running repo's own namespace. It takes a
-`tiers` input (`ov`, `arcint`, or `all`) and a `channel` input. No
-configuration is needed to run it from a fork — the namespace is derived
-from `GITHUB_REPOSITORY_OWNER`.
+Or dispatch `.github/workflows/build-toolbox.yml`, which builds the image
+and publishes it to GHCR under the running repo's own namespace, with a
+`channel` input for the moving tag. No configuration is needed to run it
+from a fork: the namespace is derived from `GITHUB_REPOSITORY_OWNER`.
 
 ### Operational notes
 
-**First run must include tier 1.** Tier 2 takes its base with `FROM` on the
-registry, so a `tiers=arcint` dispatch with no tier-1 image published yet
-fails at the first `FROM`. Use `tiers=all` (or `ov,arcint`) the first time.
-
-**GHCR packages are private on first push.** To let others pull the images,
+**GHCR packages are private on first push.** To let others pull the image,
 set the package visibility to public after the first push, or have them log
 in with a PAT carrying `read:packages`.
 
-**Tier 1 needs runner disk space freed first.** The OpenVINO clone and build
-is larger than a GitHub runner ships with, so the tier-1 job removes the
-unused SDK trees (`dotnet`, `android`, `ghc`, `CodeQL`) and prunes the
-Docker image and builder caches before building. A tier-1 build on a
-runner that has not been cleaned can fail partway with no space left on the
-device.
+## Tagging and the gated build args
 
-## Tagging: the tag names the pin and the package level
-
-The tier-1 tag is the OpenVINO pin plus the package level the recipe is at:
-
-```
-2026.4.0-ov71640275-marfrit-p27
-```
-
-The `ov71640275` component is the recipe's `PIN` verbatim — eight hex
-characters, as `build-openvino.sh` names it. The full 40-char commit the
-image was actually built from is in the `ai.arcint.ov.pin` label.
-
-The level is a usable identity: since the `+p20` package, a release names
-its package level (`contrib/packaging/marfrit-openvino/patches/README.md`).
-
-The **patch ceiling** — the highest patch actually applied — is still
-recorded, as an OCI label, so a running container can be asked without
-opening it:
-
-```bash
-docker inspect --format '{{index .Config.Labels "ai.arcint.ov.patchceiling"}}' <image>
-```
-
-Labels carried by the tier-1 image: `ai.arcint.ov.pin`,
-`ai.arcint.ov.patchlevel`, `ai.arcint.ov.patchceiling`.
-
-### The tag is derived, and the build args are gated
-
-The workflow does not have the tag written down: it reads `PIN` and
-`PATCHLEVEL` out of
-`contrib/packaging/marfrit-openvino/build-openvino.sh` and names the tier-1
-tag from them. The Dockerfiles then gate their own build args against the
-same recipes — tier 1 checks `OV_PIN`/`PATCHLEVEL`/`CEILING` against
-`build-openvino.sh` and the contents of `patches/`, tier 2 checks
-`LLAMA_COMMIT`/`LLAMA_TARBALL_SHA256` against
-`contrib/packaging/arcint/build-deb.sh` and the base image's version string
-against the level it expects.
-
-That is deliberate: if the recipe and the image ever disagree, the build
-fails in seconds instead of publishing a base whose tag describes a
-runtime nobody built.
+The image is tagged with the build's UTC timestamp and the channel
+(`:edge`); its labels carry the arcint version and the llama.cpp commit.
+The Dockerfile gates its build args against the recipe: `LLAMA_COMMIT` and
+`LLAMA_TARBALL_SHA256` must equal `contrib/packaging/arcint/build-deb.sh`'s,
+so if the recipe and the image ever disagree the build fails in seconds
+instead of publishing an image built from another base.
 
 ## Running
 
@@ -116,33 +53,16 @@ docker run --rm -it \
   -v "$MODELS:/models:ro" \
   -p 8080:8080 \
   arcint:local \
-  --model /models/ov/<ir-dir> --model-id <id> \
-  --device GPU.0 --host 0.0.0.0 --port 8080
-```
-
-`docker/docker-compose.example.yaml` is the same thing in compose form,
-including the writable blob-cache volume — a cold kernel cache turns every
-start into a recompile, so make that volume persistent.
-
-Models are never baked into an image. They are mounted read-only.
-
-The same image serves the GGUF path — the engine the served units use:
-
-```bash
-docker run --rm -it \
-  --device /dev/dri --group-add video --group-add render \
-  --security-opt seccomp=unconfined \
-  -v "$MODELS:/models:ro" \
-  -p 8080:8080 \
-  arcint:local \
   --engine llama --gguf /models/gguf/<model>.gguf \
   --device GPU.0 --host 0.0.0.0 --port 8080
 ```
 
-`--engine` selects the executor; `--engine llama` serves a GGUF through
-ggml's OpenCL backend, which is why the image carries the ICD loader and
-the Intel compute-runtime driver (`ocl-icd`, `intel-compute-runtime`).
-See `docs/llama-engine.md` for that engine's own flags.
+`--engine llama` serves the GGUF through ggml's OpenCL backend, which is why
+the image carries the ICD loader and the Intel compute-runtime driver
+(`ocl-icd`, `intel-compute-runtime`). See `docs/llama-engine.md` for the
+engine's flags. `docker/docker-compose.example.yaml` is the same thing in
+compose form; a cold OpenCL kernel cache recompiles the kernels at every
+start, so keep `GGML_OPENCL_KERNEL_CACHE_DIR` on a persistent volume.
 
 ### The three services as the project runs them (0.7.12)
 
@@ -150,7 +70,7 @@ The command lines below are the ones the project's own services use;
 `docker/docker-compose.example.yaml` carries all three as compose profiles.
 Paths are placeholders under the read-only `/models` mount.
 
-**The coder** (Qwen3.6-35B-A3B coder GGUF, the A770 or any 16 GB card):
+**The coder** (Qwen3.6-27B-A3B coder GGUF, the A770 or any 16 GB card):
 
 ```bash
 --engine llama --gguf /models/<coder>.gguf --served-model-name qwen3.6-coder \
@@ -183,7 +103,7 @@ a 24 GB card, the rest in host memory):
 ```
 
 Flash-Next needs more from the host than the other two:
-- **pinned host memory:** the expert bank (~22 GiB for IQ2_XS) lives in
+- **pinned host memory:** the expert bank (20.32 GiB for IQ2_XS) lives in
   USM host memory that the driver pins. The host's TTM page limit must
   allow it (`/sys/module/ttm/parameters/pages_limit`; the default is half
   of system RAM, which on a 64 GB host leaves little room beside the bank),
@@ -192,7 +112,7 @@ Flash-Next needs more from the host than the other two:
   are read from the file; with the file on a ZFS pool the record has a
   Flash-Next quant decoding at 4-5 t/s (README, current numbers);
 - **a VRAM margin:** 13,400 MiB of expert slots with `--llama-reserve-cells
-  20480` (0052) peaks at 23.35 GiB of a 24.5 GB card (the earlier 11,300 MiB
+  20480` (0052) peaks at 23,787 MiB of the card's 24,480 (0.7.12) (the earlier 11,300 MiB
   without the reserve peaked at ~24.2 GB). Do not run anything else on that
   card;
 - **CPU threads:** with `LLAMA_EXPERT_CACHE_CPU_MISSES=1` (0056) a
@@ -250,32 +170,15 @@ the installed binary must show **no `zmm`** registers (AVX-512 would SIGILL
 elsewhere) and **must show `ymm`** (their absence means the build fell back
 to SSE-only, which would be a silent performance cliff of its own).
 
-## The patched runtime finds itself through `$ORIGIN`
-
-The upstream wheel's libraries are self-locating (`$ORIGIN`). The source
-build's libraries carry the build tree as `DT_RUNPATH`
-(`/opt/ov/temp/Linux_x86_64/tbb/lib`, `/opt/ov/bin/intel64/Release`), paths
-that do not exist in the final image, so `libopenvino` would not find its
-bundled `libtbb.so.12` or the plugins each other. Tier 1 sets the RUNPATH of
-every patched library to `$ORIGIN` with `patchelf` -- they sit side by side in
-`openvino/libs`, so that is the whole lookup -- and fails the build if any
-library under the prefix still points outside it. No `ld.so.conf.d` entry is
-needed, which keeps the image on the deb's discipline: the nightly runtime
-never shadows anything on the system's search path.
-
-The `.deb` had the same defect until `marfrit-openvino +p25-2` (2026-10-07):
-it worked on the host that built it, where the build tree exists, and nowhere
-else. Its recipe now sets `$ORIGIN` the same way.
-
 ## The GPU runtime
 
 The image takes Fedora's `intel-compute-runtime` (26.18.38308.4 with IGC
 2.34.4 in Fedora 43, 2026-10-07). The numbers in this repository were
 measured on compute-runtime 26.27.39122.11 with IGC 2.38.2 (Intel's release
 packages, on Debian trixie). Debian trixie ships no Intel compute runtime at
-all, which is one reason the image is Fedora-based.
+all, which is why the image is Fedora-based.
 
-Served from these images (`measured-here`, 2026-10-07, tier 1 and tier 2
+Served from the two-tier images of 0.7.x (`measured-here`, 2026-10-07, both
 built from this tree in a privileged Debian container with podman, the A770
 bound in): the coder (`--engine llama`, its production GGUF, MTP 4, q8_0:q4_0
 KV) answered the capital check and decoded the 500-token long answer at
@@ -286,24 +189,22 @@ coder's decode on the A770 by 14-15 % (`contrib/llama.cpp/README.md`). An
 image built from the 0.7.8 tree carries the same patches; it has not been
 re-measured from a container.
 
-**Published images** (2026-10-14, `.github/workflows/build-toolbox.yml` on
-`main` at c4b87e5, v0.7.8 plus its recipe commit): `ghcr.io/marfrit/arcint-ov:2026.4.0-ov71640275-marfrit-p27`
-(tier 1) and `ghcr.io/marfrit/arcint:20261014T180418`, `:edge` (tier 2, digest
-`sha256:7b88942b18ef…`). They carry 0.7.8, not later releases; the workflow's
-smoke test is device-free, and no GPU run of these images is recorded. GHCR
-publishes a new package as private; pulling it from another account needs
-its visibility set by the owner.
+**Published images**: the last two-tier set is 0.7.12's (2026-10-15,
+`.github/workflows/build-toolbox.yml` on the tag v0.7.12):
+`ghcr.io/marfrit/arcint-ov:2026.4.0-ov71640275-marfrit-p27` and
+`ghcr.io/marfrit/arcint:20261015T141859`, `:edge` (digest
+`sha256:91f3bebe3b58…`). The workflow's smoke test is device-free, and no GPU
+run of a published image is recorded. GHCR publishes a new package as
+private; pulling it from another account needs its visibility set by the
+owner.
 
 ## What CI covers, and what it cannot
 
 Covered, no GPU required:
 
-- the full device-free unit ladder (`ctest -L unit`), run inside the tier-2 build;
-- the tier-1 gates: the pin fetch, the whole patch series under
-  `git apply --check`, and the shipped `libopenvino` carrying the level;
-- the tier-2 gates: the llama.cpp tarball's sha256, its patch series, the
-  RPATH/`ldd` probes, and `nm` on the installed binary for the libllama
-  symbols (the `--help` text advertises `--engine llama` whether or not the
+- the full device-free unit ladder (`ctest -L unit`), run inside the build;
+- the gates: the llama.cpp tarball's sha256, its patch series, the `ldd`
+  probe, and `nm` on the installed binary for the libllama symbols (the `--help` text advertises `--engine llama` whether or not the
   backend was compiled in, so the usage string proves nothing);
 - a stub + `/props` smoke test against the **final** image, before the
   moving channel tag is published. The smoke test has to run inside the
@@ -313,5 +214,5 @@ Covered, no GPU required:
 Not covered, by design: anything that touches a real card. Card-requiring
 acceptance cells live in the test ladder (`docs/design-0.3.1-test-ladder.md`)
 and need a card. A green container build means the engine compiles against
-the patched runtime and serves without one. It is not a claim about served
+the patched llama.cpp and serves without a card. It is not a claim about served
 quality or throughput.
