@@ -74,7 +74,7 @@ that touches a design decision, a mechanism, a milestone or a campaign:
    what someone concluded from the evidence they had; check what that was.
 6. A negative that was never tried is not verified.
 7. Touching a GPU? `docs/sop-card-window.md` first — sampler before the
-   leg, card identity by PCI id (DRM numbering is INVERTED vs OpenVINO),
+   leg, card identity by PCI id (DRM numbering is INVERTED vs arcint's GPU.N),
    zombie sweep by pid.
 
 The cost of ignoring this is on the record in `AGENTS.md`: a 0.5.1 serving

@@ -34,23 +34,21 @@ pattern matched the shell wrapper and voided a round's `fdinfo`/`RSS` columns.
 
 ## 2. Card identity is established by PCI id, never by number
 
-**DRM numbering is INVERTED relative to OpenVINO numbering on the dev
-hardware:**
+**DRM numbering is INVERTED relative to arcint's `GPU.N` (the OpenCL
+enumeration) on the dev hardware:**
 
-| DRM node | PCI id | card | OpenVINO device |
+| DRM node | PCI id | card | arcint device (OpenCL platform:device) |
 |---|---|---|---|
-| `card0` | `8086:56a0` | Arc A770, 16 GiB | **GPU.1** |
-| `card1` | `8086:e211` | Arc Pro B60, 24 GiB | **GPU.0** |
+| `card0` | `8086:56a0` | Arc A770, 16 GiB | **GPU.1** (`GGML_OPENCL_DEVICES=1:0`) |
+| `card1` | `8086:e211` | Arc Pro B60, 24 GiB | **GPU.0** (`0:0`) |
 
 Anything read per `/sys/class/drm/cardN` or per-card `fdinfo` and reported as
 "GPU.N" is attributed to the **wrong card** unless mapped through
-`/sys/class/drm/cardN/device/{vendor,device}` first. Confirm the OpenVINO
-side from the plugin, not from memory:
-
-```
-core.get_property(dev, "FULL_DEVICE_NAME")
-core.get_property(dev, "GPU_DEVICE_TOTAL_MEM_SIZE")
-```
+`/sys/class/drm/cardN/device/{vendor,device}` first. Confirm the OpenCL
+side from the process, not from memory: arcint's load log names the device
+(`ggml_opencl: device: 'Intel(R) Arc(TM) Pro B60 Graphics'`), and `clinfo -l`
+lists the platforms. The two generations are two OpenCL platforms: the A770
+is platform 1, device 0 (`1:0`), not `0:1`.
 
 **`act_freq` is not a contention signal on every node.** The A770's node
 returns a constant `act_freq=8517` with `cur_freq` and `max_freq` EMPTY (an
@@ -70,9 +68,9 @@ enumeration cross-checked the same hour.
       **name and PCI id**, the tree, and the expected duration.
 - [ ] Tree byte-verified both ends (per-file sha256 list, `LC_ALL=C` sorted,
       `cmp`), and the chain hash recorded.
-- [ ] The runtime the leg will link named explicitly — two venvs on the dev
-      host carry different OpenVINO builds and their numbers are not
-      comparable.
+- [ ] The binary the leg runs named explicitly, with its sha256 (a package
+      leg: `dpkg -V arcint`); a dev build and the package can differ in more
+      than the source (the package's ggml-cpu was SSE-only until 0.7.12).
 - [ ] ARC state recorded at the start: ZFS `arc_c_max` is a large fraction of
       the host and **ARC is not counted in `MemAvailable`**, so a leg begun
       against a warm ARC races its eviction and reads a false ceiling.

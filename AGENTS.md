@@ -44,7 +44,7 @@ their basis does not.
 on the host", "no code path needs it" are claims that require an attempt.
 
 **7. Touching a GPU? `docs/sop-card-window.md` first.** Sampler before the
-leg, card identity by PCI id (DRM numbering is INVERTED vs OpenVINO), zombie
+leg, card identity by PCI id (DRM numbering is INVERTED vs arcint's GPU.N), zombie
 sweep by pid. Every rule there has a dated incident behind it.
 
 **8. Expert engines over our own negatives.** The references are Strata

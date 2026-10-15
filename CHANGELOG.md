@@ -2,20 +2,21 @@
 
 The human record of what each release changed and what it depends on. The
 package record lives in `contrib/packaging/arcint/debian/changelog` (one
-entry per built package) and the plugin patch record in
-`contrib/packaging/marfrit-openvino/patches/README.md`; this file names the
-same releases by tag and adds what a reader upgrading needs first: the
-runtime dependency. Every number here was measured; the measurement
-protocol and the retractions are in `DESIGN.md` §7.
+entry per built package) and the kernel patch record in
+`contrib/llama.cpp/README.md`; this file names the same releases by tag and
+adds what a reader upgrading needs first: the runtime dependency. Every number here was measured; the measurement
+protocol and the retractions are in `DESIGN.md` §7 and the campaign documents.
 
-Runtime dependency throughout: `marfrit-openvino`, a source build of OpenVINO
-at the pinned upstream commit `71640275` (the 2026.4.0 nightly of 2026-08-21)
-with the patch series in `patches/` applied. The patch level is part of the
-package version (`+p1` … `+p4`) and a release names the level it was built
-and measured against. The dependency pins the nightly, because a different
-nightly is a different ABI, and since 0.3.0 floors the patch level within
-it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
-pin made apt remove arcint when the runtime was upgraded to +p3.
+Runtime dependency: from 0.8.0, llama.cpp at the commit the recipe pins,
+with `contrib/llama.cpp/patches` applied, compiled into arcint; the host
+needs the OpenCL ICD loader and Intel's compute runtime. Before 0.8.0 arcint
+also depended on `marfrit-openvino`, a source build of OpenVINO at the pinned
+upstream commit `71640275` (the 2026.4.0 nightly of 2026-08-21) with a GPU
+plugin patch series, its patch level part of the package version (`+p1` …
+`+p27`); since 0.3.0 the dependency floored the level within the nightly
+(`>= +pN`, `<<` the next nightly) instead of pinning it exactly. That engine
+was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
+point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
 ## 0.7.12 — 2026-10-15
 

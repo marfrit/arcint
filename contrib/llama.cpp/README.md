@@ -18,6 +18,10 @@ batch (`llama-perplexity -b 4*c`, ubatches that mix the sequences). arcint
 decodes one sequence per call, but llama.cpp's own batching does not. 0022
 shipped a defect only the second arm sees (fixed by 0027).
 
+Where a section below compares with "the OpenVINO path" or cites a
+`marfrit-openvino` plugin patch, it means arcint's retired OpenVINO engine and
+its runtime; both are at the tag `openvino-history` (`docs/history.md`).
+
 ## Moving the pin
 
 The pin moves only as a release decision of its own (charter C3,

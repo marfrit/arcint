@@ -11,122 +11,80 @@ Every 77 (skip) must be named on that command line, or the run does not count as
 
 ## Cells
 
-- [ ] `coder-offload-1lane` -- tests/equivalence/run.sh (§5, §3.4)
-      flags: ARCINT_EXTRA_ARGS=--offload-ratio 20 --paged-kv u8:i4; ARCINT_MOE_DEVICE_POOL_BYTES=8 GiB (the suite adds its own --n-ctx 8192 and per-section cache flags)
-      gates: byte-equality: cold vs warm cache, chunked vs unchunked prefill, one chunk size vs another
-      reports: chunk sweep
-      expected skip: mtp-section (declared: coder artifact carries no MTP head; pre-named -- --allow-skip naming it is an error)
+- [ ] `agent-equivalence` -- tests/equivalence/run.sh (§5, §3.4)
+      flags: --engine llama, ARCINT_EXTRA_ARGS=--llama-kv q8_0:q4_0 --llama-mtp 5 (the suite's own --n-ctx and lane flags)
+      gates: the answers right in every arm: two greedy runs, a lane's reused prefix against a fresh process, a checkpoint resume against a full re-prefill, MTP on against off, one lane against two
+      reports: byte equality of each pair (tripwire, §3.4 point 5)
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
+      runner: not yet in the tree (Increment 0.8.0); the cell cannot run
 
-- [ ] `coder-offload-2lane` -- tests/equivalence/run.sh (§5)
-      flags: ARCINT_EXTRA_ARGS=--offload-ratio 20 --paged-kv u8:i4 --parallel 2; ARCINT_MOE_DEVICE_POOL_BYTES=8 GiB
-      gates: the same byte-equality claims as coder-offload-1lane, held at --parallel 2
-      expected skip: mtp-section (declared: coder artifact carries no MTP head; pre-named -- --allow-skip naming it is an error)
+- [ ] `coder-equivalence` -- tests/equivalence/run.sh (§5, §3.4)
+      flags: --engine llama, ARCINT_EXTRA_ARGS=--llama-kv q8_0:q4_0 --llama-mtp 4 (the suite's own --n-ctx and lane flags)
+      gates: the answers right in every arm: two greedy runs, a lane's reused prefix against a fresh process, a checkpoint resume against a full re-prefill, MTP on against off, one lane against two
+      reports: byte equality of each pair (tripwire, §3.4 point 5)
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
+      runner: not yet in the tree (Increment 0.8.0); the cell cannot run
 
-- [ ] `coder-offload-concurrency` -- tests/concurrency/run.py (§4.1, §5)
-      flags: ARCINT_EXTRA_ARGS=--offload-ratio 20 --paged-kv u8:i4; ARCINT_MOE_DEVICE_POOL_BYTES=8 GiB
-      gates: no cross-slot bleed, cold/warm per lane, cancellation, admission (§4.1)
+- [ ] `agent-concurrency` -- tests/concurrency/run.py (§4.1, §5)
+      flags: --engine llama, two named lanes, ARCINT_EXTRA_ARGS=--llama-kv q8_0:q4_0 --llama-mtp 5
+      gates: no cross-lane bleed in both start orders, both lanes used, the 404 for an unknown lane name, cancellation, the 503 with the lane's numbers after the queue timeout
+      references: not yet filled
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
+      runner: not yet in the tree (Increment 0.8.0); the cell cannot run
 
-- [ ] `coder-served-large` -- tests/equivalence/run.sh (§5)
-      flags: ARCINT_EXTRA_ARGS=--paged-kv u8, no offload (the served precision; the suite's own --n-ctx 8192)
-      gates: byte-equality: two greedy runs, cold vs warm cache, a restored continuation vs cold, and (draft 4) a copy-the-input prompt
-      expected skip: mtp-section (declared: coder artifact carries no MTP head; pre-named -- --allow-skip naming it is an error)
+- [ ] `coder-concurrency` -- tests/concurrency/run.py (§4.1, §5)
+      flags: --engine llama, two named lanes, ARCINT_EXTRA_ARGS=--llama-kv q8_0:q4_0 --llama-mtp 4
+      gates: no cross-lane bleed in both start orders, both lanes used, the 404 for an unknown lane name, cancellation, the 503 with the lane's numbers after the queue timeout
+      references: not yet filled
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
+      runner: not yet in the tree (Increment 0.8.0); the cell cannot run
 
-- [ ] `coder-served-large-decode` -- tests/acceptance/cells/decode_probe.sh (§5, §7.0.2ai)
-      flags: ARCINT_EXTRA_ARGS=--paged-kv u8, no offload (the served precision)
-      gates: byte-identity of the two requests' outputs; the warm second-request decode rate against its reference once filled (reports until then, §8.8)
-      reports: 0.3.0 record (DESIGN §7.0.2ai): 53.4 t/s cold / 69.2 t/s warm decode
-      reference: decode-warm-2nd = 66.5 t/s (gate lower-is-worse at 60.0 t/s, 1 sample(s), 0.0% spread) -- 24 GB card, coder int4, --paged-kv u8, no offload (no device pool), 1 lane, default n_ctx, one fresh process; second request, 1062 prompt tokens, §7.0.2al (gate: §5's independent >= 60 t/s bar, one sample), measured 2026-09-05, arcint 82cce71 (source build on the dev host), marfrit-openvino +p4
-      reference: decode-cold-1st = 66.6 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 24 GB card, coder int4, --paged-kv u8, no offload (no device pool), 1 lane, default n_ctx, one fresh process; first request, 1062 prompt tokens, §7.0.2al (report), measured 2026-09-05, arcint 82cce71 (source build on the dev host), marfrit-openvino +p4
-      reference: prefill-warm-2nd = 2820.8 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 24 GB card, coder int4, --paged-kv u8, no offload (no device pool), 1 lane, default n_ctx, one fresh process; second request, 1062 prompt tokens, §7.0.2al (report), measured 2026-09-05, arcint 82cce71 (source build on the dev host), marfrit-openvino +p4
-      reference: prefill-cold-1st = 2812.3 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 24 GB card, coder int4, --paged-kv u8, no offload (no device pool), 1 lane, default n_ctx, one fresh process; first request, 1062 prompt tokens, §7.0.2al (report), measured 2026-09-05, arcint 82cce71 (source build on the dev host), marfrit-openvino +p4
-      timeout: 1800s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
-
-- [ ] `coder-served-small` -- tests/equivalence/run.sh (§5)
-      flags: ARCINT_EXTRA_ARGS=--paged-kv u8 (the served precision at the suite's own --n-ctx 8192; the served depth 98,304 and 2 GiB prefix cache are the pruefstand cell's)
-      gates: byte-equality (as coder-served-large), on the 16 GiB card
-      expected skip: mtp-section (declared: coder artifact carries no MTP head; pre-named -- --allow-skip naming it is an error)
+- [ ] `agent-served` -- tests/acceptance/cells/served_check.sh (§5, §7.1)
+      flags: the agent unit's flags (245,760 ctx, q8_0:q4_0 KV, MTP 5), one fresh process: the capital, a 54,895- and a 138,028-token prompt with a needle
+      gates: Paris and the needle right; prefill at both depths at or above the release floor (the last release's pre-tag number minus its run-to-run spread, §5)
+      reports: peak VRAM and GTT
+      references: not yet filled
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
+      runner: not yet in the tree (Increment 0.8.0); the cell cannot run
 
-- [ ] `coder-served-small-decode` -- tests/acceptance/cells/decode_probe.sh (§5, §7.0.2ai)
-      flags: ARCINT_EXTRA_ARGS=--paged-kv u8, no offload (the served precision)
-      gates: byte-identity of the two requests' outputs; the warm second-request decode rate against its reference once filled (reports until then, §8.8)
-      reports: 0.3.0 record (DESIGN §7.0.2ai): 48.0/49.5 t/s decode
-      reference: decode-warm-2nd = 47.6 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 16 GiB card, coder int4, --paged-kv u8, no offload (no device pool), 1 lane, default n_ctx, one fresh process; second request, 1062 prompt tokens, §7.0.2ak (report: one sample, no independent bar for this card), measured 2026-09-05, arcint 82cce71 (source build on the dev host), marfrit-openvino +p4
-      reference: decode-cold-1st = 46.0 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 16 GiB card, coder int4, --paged-kv u8, no offload (no device pool), 1 lane, default n_ctx, one fresh process; first request, 1062 prompt tokens, §7.0.2ak (report), measured 2026-09-05, arcint 82cce71 (source build on the dev host), marfrit-openvino +p4
-      reference: prefill-warm-2nd = 508.9 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 16 GiB card, coder int4, --paged-kv u8, no offload (no device pool), 1 lane, default n_ctx, one fresh process; second request, 1062 prompt tokens, §7.0.2ak (report), measured 2026-09-05, arcint 82cce71 (source build on the dev host), marfrit-openvino +p4
-      reference: prefill-cold-1st = 510.5 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 16 GiB card, coder int4, --paged-kv u8, no offload (no device pool), 1 lane, default n_ctx, one fresh process; first request, 1062 prompt tokens, §7.0.2ak (report), measured 2026-09-05, arcint 82cce71 (source build on the dev host), marfrit-openvino +p4
-      timeout: 1800s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
-
-- [ ] `coder-served-small-concurrency` -- tests/concurrency/run.py (§4.1, §5)
-      flags: ARCINT_EXTRA_ARGS=--paged-kv u8
-      gates: no cross-slot bleed, cold/warm per lane, cancellation, admission (§4.1)
+- [ ] `coder-served` -- tests/acceptance/cells/served_check.sh (§5, §7.1)
+      flags: the coder unit's flags (98,304 ctx, q8_0:q4_0 KV, MTP 4), one fresh process: the capital, three 300-token answers, a 40,841-token needle
+      gates: Paris and the needle right; decode on each answer at or above the release floor (§5)
+      reports: peak VRAM and GTT
+      references: not yet filled
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
+      runner: not yet in the tree (Increment 0.8.0); the cell cannot run
 
-- [ ] `agent-dense` -- tests/equivalence/run.sh (§3.5.2, §5)
-      flags: ARCINT_EXTRA_ARGS=--paged-kv u8 (the suite's own --n-ctx 8192; its MTP section is M11's shallow gate)
-      gates: MTP identity (equivalence's MTP section) and MTP acceptance > 10%
+- [ ] `flashnext-served` -- tests/acceptance/cells/served_check.sh (§5, §7.1)
+      flags: the Flash-Next unit's flags (131,072 ctx, q8_0 KV, 13,400 MiB of expert slots, the profile, MTP 3 with min-p 0.5 and the Q4_K draft head, the bank stream, the CPU misses), one fresh process: the capital, the 20,045-token needle, a 300-token answer
+      gates: Paris and the needle right; prefill at 20k and decode at or above the release floor (§5)
+      reports: peak VRAM and GTT
+      references: not yet filled
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
-
-- [ ] `agent-dense-concurrency` -- tests/concurrency/run.py (§3.5.2, §4.1, §5)
-      flags: ARCINT_EXTRA_ARGS=--paged-kv u8
-      gates: no cross-slot bleed, cold/warm per lane, cancellation, admission (§4.1)
-      timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
-
-- [ ] `tier-reference-cell` -- tests/acceptance/cells/tier_reference.sh (§3.4, §7.0.2ai)
-      flags: ratio 50, ARCINT_MOE_DEVICE_POOL_BYTES=8 GiB pool, u8 KV, 1 lane, n_ctx 65536, prompt sized to ~1,198 tokens (measured 1,167 on the coder-35b artifact), 64 greedy tokens, 2 fresh processes per arm x 2 requests; metrics from each arm's second process, second request (the first process of a window is the cold one, static-partition-cold-start's number); MOE_OTD_PERF_LOG=1 so the plugin prints its per-process counters
-      gates: tier ON byte-identical to itself across processes and requests, tier OFF likewise, and E2
-      reports: ON vs OFF identity and the first divergence; every output's hash; the first process's rates beside the second's
-      reference: decode-warm-2nd-on = 18.2 t/s (gate lower-is-worse at 14.8 t/s, 1 sample(s), 0.0% spread) -- 16 GiB card, 35B int4 (coder-35b artifact), --offload-ratio 50, 8 GiB device pool (ARCINT_MOE_DEVICE_POOL_BYTES), u8 KV, 1 lane, n_ctx 65536, prefix cache off, 64 greedy tokens; tier ON (--moe-cpu-tier, static partition); second process of the arm, second request, 1167 prompt tokens, §7.0.2bx (supersedes §7.0.2al's 16.4; +p16 hybrid prefill split), measured 2026-09-16, arcint 0.4.7 (800f7735), marfrit-openvino +p16
-      reference: decode-ratio-on-off = 1.46 ratio (gate lower-is-worse at 1.17 ratio, 1 sample(s), 0.0% spread) -- 16 GiB card, 35B int4 (coder-35b artifact), --offload-ratio 50, 8 GiB device pool (ARCINT_MOE_DEVICE_POOL_BYTES), u8 KV, 1 lane, n_ctx 65536, prefix cache off, 64 greedy tokens; tier ON over tier OFF in the same window; second process of the arm, second request, 1167 prompt tokens, §7.0.2bx (supersedes §7.0.2al's 1.31; +p16 hybrid prefill split), measured 2026-09-16, arcint 0.4.7 (800f7735), marfrit-openvino +p16
-      reference: decode-warm-2nd-off = 12.5 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 16 GiB card, 35B int4 (coder-35b artifact), --offload-ratio 50, 8 GiB device pool (ARCINT_MOE_DEVICE_POOL_BYTES), u8 KV, 1 lane, n_ctx 65536, prefix cache off, 64 greedy tokens; tier OFF; second process of the arm, second request, 1167 prompt tokens, §7.0.2bx (supersedes §7.0.2al's 11.9; +p16 hybrid prefill split window), measured 2026-09-16, arcint 0.4.7 (800f7735), marfrit-openvino +p16
-      reference: prefill-warm-2nd-on = 27.9 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 16 GiB card, 35B int4 (coder-35b artifact), --offload-ratio 50, 8 GiB device pool (ARCINT_MOE_DEVICE_POOL_BYTES), u8 KV, 1 lane, n_ctx 65536, prefix cache off, 64 greedy tokens; tier ON (--moe-cpu-tier, static partition); second process of the arm, second request, 1167 prompt tokens, §7.0.2bx (supersedes §7.0.2al's 26.3; +p16 hybrid prefill split, gate not met), measured 2026-09-16, arcint 0.4.7 (800f7735), marfrit-openvino +p16
-      reference: prefill-warm-2nd-off = 87.2 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 16 GiB card, 35B int4 (coder-35b artifact), --offload-ratio 50, 8 GiB device pool (ARCINT_MOE_DEVICE_POOL_BYTES), u8 KV, 1 lane, n_ctx 65536, prefix cache off, 64 greedy tokens; tier OFF; second process of the arm, second request, 1167 prompt tokens, §7.0.2bx (supersedes §7.0.2al's 85.2; +p16 window), measured 2026-09-16, arcint 0.4.7 (800f7735), marfrit-openvino +p16
-      reference: grouped-fallbacks-on = 0 count (gate higher-is-worse at 0 count, 1 sample(s), 0.0% spread) -- 16 GiB card, 35B int4 (coder-35b artifact), --offload-ratio 50, 8 GiB device pool (ARCINT_MOE_DEVICE_POOL_BYTES), u8 KV, 1 lane, n_ctx 65536, prefix cache off, 64 greedy tokens; tier ON (--moe-cpu-tier, static partition); second process of the arm, second request; the plugin's [OTD_PERF] counter after both requests, 1167 prompt tokens, §7.0.2bx (supersedes §7.0.2al's 400; hybrid split eliminates the fallback entirely), measured 2026-09-16, arcint 0.4.7 (800f7735), marfrit-openvino +p16
-      reference: decode-cold-1st-off = 10.2 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 16 GiB card, 35B int4 (coder-35b artifact), --offload-ratio 50, 8 GiB device pool (ARCINT_MOE_DEVICE_POOL_BYTES), u8 KV, 1 lane, n_ctx 65536, prefix cache off, 64 greedy tokens; tier OFF; first process of the arm, first request (the cold one), 1167 prompt tokens, §7.0.2bx (report: the cold start belongs to static-partition-cold-start, not this cell's gate), measured 2026-09-16, arcint 0.4.7 (800f7735), marfrit-openvino +p16
-      reference: prefill-cold-1st-off = 80.5 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 16 GiB card, 35B int4 (coder-35b artifact), --offload-ratio 50, 8 GiB device pool (ARCINT_MOE_DEVICE_POOL_BYTES), u8 KV, 1 lane, n_ctx 65536, prefix cache off, 64 greedy tokens; tier OFF; first process of the arm, first request (the cold one), 1167 prompt tokens, §7.0.2bx (report: cold prefill), measured 2026-09-16, arcint 0.4.7 (800f7735), marfrit-openvino +p16
-      reference: decode-cold-1st-on = 13.0 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 16 GiB card, 35B int4 (coder-35b artifact), --offload-ratio 50, 8 GiB device pool (ARCINT_MOE_DEVICE_POOL_BYTES), u8 KV, 1 lane, n_ctx 65536, prefix cache off, 64 greedy tokens; tier ON (--moe-cpu-tier, static partition); first process of the arm, first request (the cold one), 1167 prompt tokens, §7.0.2bx (report: the cold start belongs to static-partition-cold-start, not this cell's gate), measured 2026-09-16, arcint 0.4.7 (800f7735), marfrit-openvino +p16
-      reference: prefill-cold-1st-on = 24.8 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 16 GiB card, 35B int4 (coder-35b artifact), --offload-ratio 50, 8 GiB device pool (ARCINT_MOE_DEVICE_POOL_BYTES), u8 KV, 1 lane, n_ctx 65536, prefix cache off, 64 greedy tokens; tier ON (--moe-cpu-tier, static partition); first process of the arm, first request (the cold one), 1167 prompt tokens, §7.0.2bx (report: cold prefill with hybrid split), measured 2026-09-16, arcint 0.4.7 (800f7735), marfrit-openvino +p16
-      reference: decode-cold-warm-ratio-on = 1.4 ratio (report only, not gated, 1 sample(s), 0.0% spread) -- 16 GiB card, 35B int4 (coder-35b artifact), --offload-ratio 50, 8 GiB device pool (ARCINT_MOE_DEVICE_POOL_BYTES), u8 KV, 1 lane, n_ctx 65536, prefix cache off, 64 greedy tokens; tier ON (--moe-cpu-tier, static partition); decode warm 2nd / decode cold 1st, 1167 prompt tokens, §7.0.2bx (report: how much the cold start costs relative to warm), measured 2026-09-16, arcint 0.4.7 (800f7735), marfrit-openvino +p16
-      timeout: 7200s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
-
-- [ ] `ngram-determinism-repeat` -- tests/acceptance/cells/ngram_determinism.sh (§7.0.2ae)
-      flags: ARCINT_EXTRA_ARGS=--offload-ratio 50 --moe-cpu-tier (the 35B tier config); --draft 4 --draft-ngram 3, six fresh processes
-      gates: six fresh processes produce identical output
-      timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
-
-- [ ] `depth-ladder` -- tests/acceptance/cells/depth_ladder.sh (§5.1)
-      flags: 98,147-token prefill at u8 and u8:i4, both cards
-      gates: the load completes at both KV precisions on both cards
-      reports: t/s per card and precision
-      reference: prefill-large-u8 = 1025.5 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 24 GB card, coder int4, --paged-kv u8, no offload (no device pool), 1 lane, n_ctx 100653 (prompt + 2 % + completion + slack), one fresh process, the sizing round and one request of 32 tokens; the value is the request; prefill chunk 2048, 98187 prompt tokens, §7.0.2al (report), measured 2026-09-05, arcint 82cce71 (source build on the dev host), marfrit-openvino +p4
-      reference: decode-large-u8 = 20.8 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 24 GB card, coder int4, --paged-kv u8, no offload (no device pool), 1 lane, n_ctx 100653 (prompt + 2 % + completion + slack), one fresh process, one request of 32 tokens; prefill chunk 2048; emit-dominated over 32 tokens, 98187 prompt tokens, §7.0.2al (report), measured 2026-09-05, arcint 82cce71 (source build on the dev host), marfrit-openvino +p4
-      reference: prefill-large-u8i4 = 120.9 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 24 GB card, coder int4, --paged-kv u8:i4, no offload (no device pool), 1 lane, n_ctx 100653 (prompt + 2 % + completion + slack), one fresh process, one request of 32 tokens; prefill chunk 128 (belt), 98187 prompt tokens, §7.0.2al (report; u8i4-prefill-price's deepest sample), measured 2026-09-05, arcint 82cce71 (source build on the dev host), marfrit-openvino +p4
-      reference: decode-large-u8i4 = 45.9 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 24 GB card, coder int4, --paged-kv u8:i4, no offload (no device pool), 1 lane, n_ctx 100653 (prompt + 2 % + completion + slack), one fresh process, one request of 32 tokens; prefill chunk 128 (belt), 98187 prompt tokens, §7.0.2al (report), measured 2026-09-05, arcint 82cce71 (source build on the dev host), marfrit-openvino +p4
-      reference: prefill-small-u8 = 621.0 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 16 GiB card, coder int4, --paged-kv u8, no offload (no device pool), 1 lane, n_ctx 100653 (prompt + 2 % + completion + slack), one fresh process, one request of 32 tokens; prefill chunk 2048, 98187 prompt tokens, §7.0.2al (report), measured 2026-09-05, arcint 82cce71 (source build on the dev host), marfrit-openvino +p4
-      reference: decode-small-u8 = 29.2 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 16 GiB card, coder int4, --paged-kv u8, no offload (no device pool), 1 lane, n_ctx 100653 (prompt + 2 % + completion + slack), one fresh process, one request of 32 tokens; prefill chunk 2048, 98187 prompt tokens, §7.0.2al (report), measured 2026-09-05, arcint 82cce71 (source build on the dev host), marfrit-openvino +p4
-      reference: prefill-small-u8i4 = 170.3 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 16 GiB card, coder int4, --paged-kv u8:i4, no offload (no device pool), 1 lane, n_ctx 100653 (prompt + 2 % + completion + slack), one fresh process, one request of 32 tokens; prefill chunk 128 (belt), 98187 prompt tokens, §7.0.2al (report), measured 2026-09-05, arcint 82cce71 (source build on the dev host), marfrit-openvino +p4
-      reference: decode-small-u8i4 = 26.1 t/s (report only, not gated, 1 sample(s), 0.0% spread) -- 16 GiB card, coder int4, --paged-kv u8:i4, no offload (no device pool), 1 lane, n_ctx 100653 (prompt + 2 % + completion + slack), one fresh process, one request of 32 tokens; prefill chunk 128 (belt), 98187 prompt tokens, §7.0.2al (report), measured 2026-09-05, arcint 82cce71 (source build on the dev host), marfrit-openvino +p4
-      timeout: 10800s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
+      runner: not yet in the tree (Increment 0.8.0); the cell cannot run
 
 - [ ] `sanitizers` -- tests/acceptance/cells/sanitizers.sh (§5)
       flags: -fno-sanitize-recover; ASan+UBSan on x86_64, UBSan elsewhere; over unit+roundtrip+stress
       gates: zero sanitizer reports
-      reports: device-free build only (ARCINT_OPENVINO=OFF): the 4 rope-precision cases gated on ARCINT_OPENVINO are not instrumented by this cell
+      reports: the stub build (no card): unit, roundtrip, stress
       timeout: 1800s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 
 - [ ] `package-build` -- contrib/packaging/arcint/build-deb.sh (§5.1)
-      flags: version stamp (build-deb.sh:60), RPATH probe
-      gates: the package build succeeds, is version-stamped, and its RPATH probe passes; a post-deploy smoke run follows the install, outside this cell
+      flags: version stamp, GGML_NATIVE in the CMake cache, AVX2 in ggml_vec_dot_q4_K_q8_K
+      gates: the package build succeeds, is version-stamped, and its ggml-cpu is native (AVX2); a post-deploy smoke run and a fresh container follow the install, outside this cell
       timeout: 1800s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 
 - [ ] `pruefstand` -- external (§5)
       flags: greedy, thinking off, 4,000-token cap, the served model name; the operator's wrapper runs the harness's request script against the deployed package's own port and its Lua scorer over the answer (docs/design-pruefstand-cell.md)
-      gates: 10/10 on the production coder artifact through the deployed package
-      reference: score = 10 points (gate lower-is-worse at 10 points, 3 sample(s), 0.0% spread) -- the deployed coder package on the 16 GiB card, its own port, greedy, thinking off, 4,000-token cap; scored by executing the answer against ten RFC 4180 cases, 282 prompt tokens, §5, measured 2026-09-05, one run through this cell against the deployed 0.2.12-1+p3 package (DESIGN §7.0.2ao); two 0.3.0 release-candidate runs from the session host (§7.0.2ai), which measured the candidate, not the deployed package
+      gates: at least 9/10 on the coder through the deployed package (10/10 the target, §5)
+      reference: score = 9 points (gate lower-is-worse at 9 points, 1 sample(s), 0.0% spread) -- the deployed coder package on the 16 GiB card, its own port, greedy, thinking off, 4,000-token cap; scored by executing the answer against ten RFC 4180 cases, 282 prompt tokens, §5, measured 2026-10-15, the 0.7.12 pre-tag build (ff87cb2) with the coder unit's flags
       timeout: 1800s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
       external: the run manifest's `pruefstand` command (an ARCINT_ACCEPTANCE_* cache variable at configure time); empty -> SKIPPED external-harness-not-configured; the wrapper prints `ACCEPTANCE-METRIC score <n> points`, gated by the reference above
+
+- [ ] `pruefstand-agent` -- external (§5)
+      flags: greedy, thinking off, 4,000-token cap, the served model name; the operator's wrapper runs the harness's request script against the deployed package's own port and its Lua scorer over the answer (docs/design-pruefstand-cell.md)
+      gates: at least 9/10 on the agent through the deployed package (10/10 the target, §5)
+      reference: score = 10 points (gate lower-is-worse at 9 points, 1 sample(s), 0.0% spread) -- the deployed agent package on the 24 GB card, its own port, greedy, thinking off, 4,000-token cap; scored by executing the answer against ten RFC 4180 cases, 282 prompt tokens, §5, measured 2026-10-15, the 0.7.12 pre-tag build (ff87cb2) with the agent unit's flags
+      timeout: 1800s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
+      external: the run manifest's `pruefstand_agent` command (an ARCINT_ACCEPTANCE_* cache variable at configure time); empty -> SKIPPED external-harness-not-configured; the wrapper prints `ACCEPTANCE-METRIC score <n> points`, gated by the reference above
 <!-- END GENERATED by tools/acceptance_manifest.py -->

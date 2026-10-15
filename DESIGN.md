@@ -1,269 +1,254 @@
 # arcint — Design
 
-Full history of this document: `git show b0447b8:DESIGN.md`.
+State as of 2026-10-15: arcint **0.7.12** on llama.cpp **`3e4dfa8`** with the
+patch series `contrib/llama.cpp/patches` 0001-0056. One engine: libllama with
+ggml's OpenCL backend and arcint's Intel kernels. Three services run in
+production on two Intel Arc cards: the dense Qwen3.8-27B agent and
+Qwen3.8-Flash-Next (125B-A6B, on demand) on the 24 GB Arc Pro B60, the MoE
+coder on the 16 GiB Arc A770.
 
-State as of 2026-10-01: arcint **0.5.4**, runtime `marfrit-openvino` **+p25**
-(plugin patches 0003–0074 on the pinned OpenVINO nightly `71640275`). Two
-units serve in production: the MoE coder on the 16 GiB Arc A770 and the dense
-Qwen3.8-27B agent on the 24 GB Arc Pro B60. The development target is
-Qwen3.8-Flash-Next (125B-A6B) on the B60 plus host RAM.
+**History.** Until 0.7.12 arcint also had an OpenVINO engine: OpenVINO IRs on
+a patched GPU plugin (`marfrit-openvino`, plugin patches 0003-0077), with
+arcint's own paged KV, prefix cache, host prefix tier, measured admission and
+a Flash-Next expert tier between card and RAM. It was retired by the
+operator's decision of 2026-10-15 (charter item A6,
+`docs/milestone-1.0.0.md`). Its design, its record index (§7.0.2a-§7.0.2da)
+and every document of that era are kept at the tag **`openvino-history`**:
+`git show openvino-history:DESIGN.md`, or
+<https://github.com/marfrit/arcint/tree/openvino-history>.
+`docs/history.md` lists the retired documents. A citation of the form "DESIGN
+§7.0.2x" anywhere in the record points into that tagged DESIGN.md.
 
 Every disposition below carries its evidence class: `paper` (a published
-text), `code` (read in source), `measured-here` (run on this project's cards),
-or `decision` (the operator's, dated). Measurements name card, depth, KV
-precision and configuration. Retractions, rejected alternatives and the
-debugging narrative of every section live in git history, not here.
+text), `code` (read in source), `measured-here` (run on this project's
+cards), or `decision` (the operator's, dated). Measurements name card,
+depth, KV precision and configuration. Debugging narratives and superseded
+numbers live in the campaign documents and in git history, not here.
 
-How to read it: §1–§6 are the architecture, the rules and the serving
-surface; §7 is the state of play and an index of the dated records that
-other files cite; §8 is the open work, each item against the reference
-engine that already does it.
+How to read it: §1-§6 are the architecture, the rules and the serving
+surface; §7 is the state of play; §8 is the open work, each item against the
+reference that already does it.
 
 ## 1. The one idea
 
-OpenVINO is the compiler and kernel library; arcint is everything else:
-scheduling, the paged KV cache and recurrent-state ledger, prefix caching,
-speculative decoding, the MoE expert placement, sampling and the HTTP
-surface. OpenVINO's GPU plugin emits good Xe code (3.4× llama.cpp-SYCL and
-7.6× llama.cpp-Vulkan on Battlemage for the same checkpoint at the project's
-start, `measured-here`); OpenVINO GenAI's pipeline layer makes choices arcint
-does not accept (§6).
+llama.cpp is the model runtime and ggml's OpenCL backend the kernel library;
+arcint is the serving layer and the Intel work below it. arcint owns the HTTP
+surface, chat templates, tool calls and reasoning, the sampler, named lanes
+and their admission, speculative decoding with the model's own MTP head, the
+context checkpoints a lane resumes from, the expert-cache policy and the
+CPU's share of its misses, and the kernels that make ggml fast on Arc. The
+GGUF is served as published, with no export step.
+
+The kernels are the reason the engine is usable here at all. Stock ggml
+OpenCL is tuned for Adreno: on the B60 the dense 27B prefilled 71 t/s and
+decoded 10.3 t/s, and the coder's K-quant experts ran on the CPU
+(`measured-here`, llama-bench, 2026-10-03). With the series the same files
+serve at 695 t/s prefill at 55k tokens, the coder decodes 44-51 t/s and
+Flash-Next 43 t/s (§7).
 
 **References first.** Inference-engine expertise lives in the reference
 engines, and their source is the design reference (operator rule,
-2026-10-01; `CLAUDE.md`, `AGENTS.md` rule 8):
+2026-10-01; `CLAUDE.md`, `AGENTS.md`):
 
 - **Strata** (`~/src/Strata-ref`), written for Qwen3.8-Flash-Next on one
-  12 GB GPU plus RAM. Its README reports, on an RTX 5070 + Ryzen 5 7600 +
-  64 GB DDR5, IQ3_XXS: 62 t/s decode on a short chat, 49 t/s at 128K, 1,750
-  t/s prompt reading at 32K (`paper`: `README.md`). Paper:
-  `docs/paper/Strata-Paper.pdf`.
+  12 GB GPU plus RAM: expert cache with an adapt rule, CPU-computed misses
+  through a doorbell, multi-token MTP drafting, prefill streaming of the
+  non-resident experts (`code`; paper `docs/paper/Strata-Paper.pdf`). Its
+  README reports, on an RTX 5070 + Ryzen 5 7600 + 64 GB DDR5, IQ3_XXS: 62
+  t/s decode on a short chat, 49 t/s at 128K, 1,750 t/s prompt reading at
+  32K (`paper`).
 - **FreeToken** (`~/src/FreeToken-ref`), an edge-MoE engine: CPU-resident
   experts, one GPU LRU expert pool, bandwidth-adaptive split, double-buffered
   prefill streaming (`code`; paper arXiv 2608.16157).
-- **llama.cpp** (ggml's CPU and GPU kernels) and **NInfer** (`~/src/ninfer`;
-  models fully resident on one GPU, the dense 27Bs and the Qwen3.6-35B-A3B,
-  no expert offload; `code`: `README.md`, `src/ops/sparse_moe/`).
+- **Infernix** (`~/src/Infernix-ref`), CUDA Flash-Next on one GPU: a global
+  LFRU expert cache, layer-walk prefill, a shared prefix cache
+  (`docs/campaigns/research-infernix.md`).
+- **llama.cpp** itself (CUDA and Vulkan backends for kernel shapes, its
+  server for checkpoints and slot batching), **NInfer** (`~/src/ninfer`;
+  dense models fully resident on one GPU), **vllm-xpu-kernels** and
+  **sycl-tla** (Xe2 kernels).
 
-An arcint measurement counts against a reference technique only if it
-tested the reference's mechanism; a conflict between a reference mechanism
-and an invariant here goes to the operator. The audit that applies this rule
-to the record is `docs/campaigns/research-reference-audit.md`.
+An arcint measurement counts against a reference technique only if it tested
+the reference's mechanism; a conflict between a reference mechanism and an
+invariant here goes to the operator, priced. The audit that applies this
+rule to the record is `docs/campaigns/research-reference-audit.md`.
 
-### 1.1 When a kernel has to change: smallest sufficient divergence
+### 1.1 When llama.cpp has to change: smallest sufficient divergence
 
 In order: (1) an upstream PR written to upstream's conventions; (2) a
-numbered patch against the pinned version, carried in
-`contrib/packaging/marfrit-openvino/patches/` and applied at build time,
-each patch PR-shaped and documented in that directory's `README.md`; (3) a
-maintained fork, only with a stated reason and an exit condition (none
-exists). Whatever is carried is published; a number that depends on a patch
-nobody else has is reproducible from that directory. The patch level is
-part of the package version (`+pN`) and every release names it
-(`CHANGELOG.md`). Upstream reports filed from this work include
-openvino.genai#4367, openvino#37607, openvino#38099 (a sibling comment) and
-compute-runtime#948 (a comment).
+numbered patch against the pinned commit, carried in
+`contrib/llama.cpp/patches/` and applied at build time, each patch
+PR-shaped and documented in that directory's `README.md` with its
+measurement and its red case; (3) a maintained fork, only with a stated
+reason and an exit condition (none exists). Whatever is carried is
+published; a number that depends on a patch nobody else has is reproducible
+from that directory. The pin and the patch count are part of every release
+note (`CHANGELOG.md`).
+
+Moving the pin is a procedure, not an event: survey upstream, port the
+series one commit at a time, run the op suites on both cards, the patches'
+own red cases, KL as served and the three services
+(`contrib/llama.cpp/README.md`, "Moving the pin"; the move of 2026-10-15 is
+`docs/campaigns/research-upstream-llama-2026-10.md`).
 
 ## 2. Target constraints
 
-All models are hybrid GatedDeltaNet / attention transformers: most layers
-carry a fixed-size recurrent state (conv + delta-rule state), a minority are
-attention layers with a KV cache. One tokenizer (hash `87a7830d63fcf43b`) is
-shared by all of them (`code`: `src/core/model_registry.cpp`).
+All served Qwen models are hybrid GatedDeltaNet / attention transformers:
+most layers carry a fixed-size recurrent state (conv + delta-rule state), a
+minority are attention layers with a KV cache. The engine admits a GGUF by
+its own `general.architecture`: `qwen35`, `qwen35moe`, `qwen4exp`, and
+`llama` at the Mistral Small 24B geometry only (`code`:
+`src/exec/backend_llama.cpp`); anything else is refused at load.
 
-| model | layers (GDN + attn) | experts | hidden | served form | card |
-|---|---|---|---|---|---|
-| Qwen3.6-27B-A3B-Coder | 40 (30 + 10) | 184 (the 35B pruned) | 2048 | int4 AWQ IR, 12.8 GiB | A770, production |
-| Qwen3.6-35B-A3B | 40 (30 + 10) | 256, top-8 | 2048 | int4 IR 17.4 GiB (offload + tier); native packed u8 IR all-resident 13.11 GiB | A770, development |
-| Qwen3.8-27B | 64 (48 + 16) | dense | 5120 | int4 AWQ IR 13.4 GiB, MTP head reconstructed; or its GGUF via `--gguf` | B60, production |
-| Qwen3.8-Flash-Next | 48 (36 + 12 sparse attention) | 512, top-10, + shared | 2560 | serving-shape IR from the GGUF, native expert formats, Q8_0 dense (`d48q8`, 60.7 GiB `.bin`) | B60 + host RAM, development |
+| service | model | architecture | served file | card |
+|---|---|---|---|---|
+| agent | Qwen3.8-27B | `qwen35`, 64 layers (48 GDN + 16 attention), dense, MTP layer | Q4_K_M GGUF | B60, production |
+| coder | Qwen3.6-27B-A3B-Coder | `qwen35moe`, 40 layers (30 + 10), 184 experts (the 35B pruned), MTP layer | a searched per-layer quant mix (`c5f495ac-shq8`, 14.6 GB, `docs/llama-engine.md`) | A770, production |
+| Flash-Next | Qwen3.8-Flash-Next | `qwen4exp`, 48 layers (36 GDN + 12 sparse attention), 512 experts, top-10 + shared, n-gram embedding table | ISTA-DASLab's IQ2_XS GGUF (GSQ-RCO), the MTP layer from a separate GGUF built from the checkpoint | B60 + host RAM, on demand |
+| writer | Cydonia 24B v4.3 (Mistral Small 3.2) | `llama`, 40 attention layers | imatrix Q4_K_M | B60, on demand |
 
-Geometry is `code` (the registry and the artifacts' configs); Flash-Next's
-36 + 12 split and its sparse attention (at most ~2,048 selected positions per
-query) are also Strata's `paper` §2.
+Geometry is `code` (the GGUFs' metadata); Flash-Next's 36 + 12 split and its
+sparse attention are also Strata's `paper` §2.
 
-The cards, measured here unless marked:
+The cards (`measured-here` unless marked):
 
-| | Arc A770 (16 GiB, 15.11 usable) | Arc Pro B60 (24 GB, 22.71 usable) |
+| | Arc A770 (16 GiB) | Arc Pro B60 (24,480 MiB) |
 |---|---|---|
-| silicon | ACM-G10 (DG2-512), PCI `8086:56a0`, Xe-HPG: subgroup 8 or 16 by kernel, 128 GRF, no 2D block loads | Xe2 (BMG), PCI `8086:e211`: subgroup 16 only, 2D block loads |
-| OpenVINO device | `GPU.1` | `GPU.0` |
-| host link | PCIe 3.0 x4 behind the chipset, 1.8 GB/s H2D | PCIe 4.0 x8: 13.9 GB/s H2D from pinned memory, 11.2–13.2 GB/s from pageable, for 2.46 MB expert copies (OpenCL microbench, 16–64 chunks, 2026-09-28) |
-| random-read ceiling | 414–418 GB/s (nominal 560, `paper`) | 453 GB/s (nominal 456, `paper`) |
-| run-to-run determinism of the served Flash-Next path | bit-identical | not bit-identical (GDN state output, §7.0.2cb) |
+| silicon | ACM-G10 (DG2-512), PCI `8086:56a0`, Xe-HPG: subgroup 8 or 16 by kernel, 128 GRF, no 2D block loads | Xe2 (BMG), PCI `8086:e211`: subgroup 16, 2D block loads, 160 compute units |
+| arcint device | `GPU.1` | `GPU.0` |
+| OpenCL platform (`GGML_OPENCL_DEVICES`) | `1:0` | `0:0` |
+| host link | PCIe 3.0 x4 behind the chipset, 1.8 GB/s H2D | PCIe 4.0 x8, 13.9-14.3 GB/s H2D from pinned memory |
+| random-read ceiling | 414-418 GB/s (nominal 560, `paper`) | 453 GB/s (nominal 456, `paper`) |
 
-- Xe KMD only. Measured on it (`measured-here`, B60, Qwen3.8-27B Q4_K_M at
-  1k, §7.0.2bf): arcint's OpenVINO OpenCL path 309 t/s prefill and 13.4 t/s
-  decode (mixed form; 937 / 16.3 repacked), llama.cpp SYCL 249 / 14.2 (on
-  its OpenCL backend; its Level Zero path segfaulted in the container, whose
-  loader is absent), llama.cpp Vulkan 126 / 7.8. OpenVINO's OpenCL path
-  serves both cards in production.
+- The xe kernel driver only; OpenCL through Intel's compute runtime is the
+  route on both cards. SYCL aborts under xe (a memcpy abort) and Vulkan is
+  slow on Battlemage (126 / 7.8 t/s against llama.cpp SYCL's 249 / 14.2 on
+  the dense 27B at 1k, 2026-09, `measured-here`).
+- The two generations are two OpenCL platforms in Intel's runtime; a
+  two-card process gives each its own context (`contrib/llama.cpp` 0023).
 - The dev host is an 8-core / 16-thread AVX2 CPU (Zen 3, no AVX-512) with
-  52 GiB of RAM in the development container and an NVMe store
-  (`measured-here`). Host RAM is the binding resource for Flash-Next: its
-  expert constants are 56.4 GiB (`measured-here`).
+  52 GiB of RAM in the serving container and an NVMe store
+  (`measured-here`); the host's RAM goes to 96 GB (operator, planned
+  2026-10-15).
+  Host RAM bounds Flash-Next: its non-resident experts sit in a host bank
+  (20.32 GiB for IQ2_XS, ~39 GiB for UD-Q3_K_XL).
 
 ## 3. Architecture
 
 ```
-             ┌────────────────────────────────────────────────┐
-             │ HTTP server (one thread pool, no framework)    │
-             │  /v1/chat/completions  /v1/completions         │
-             │  /v1/models  /health  /props                   │
-             └───────────────┬────────────────────────────────┘
-                             │ request objects
-             ┌───────────────▼───────────────┐
-             │ SlotPool: admission by memory │  N lanes = N InferRequests
-             │ reservation (§4.3)            │  on one CompiledModel
-             └───────────────┬───────────────┘
-                             │ Turnstile (FIFO ticket lock, §4.1)
-     ┌───────────────────────▼─────────────────────────┐
-     │ Executor (paged by default; stateful reference) │
-     │  ┌───────────────┐   ┌──────────────────────┐   │
-     │  │ Cache manager │   │ OV compiled models   │   │
-     │  │  paged KV pool│◄─►│  language model      │   │
-     │  │  GDN rows     │   │  embeddings gather   │   │
-     │  │  prefix cache │   │  MTP layer + lm_head │   │
-     │  │  host tier    │   │  DFlash2 drafter     │   │
-     │  └───────────────┘   └──────────────────────┘   │
-     │  sampling, drafting/verify, detokenise, emit    │
-     └─────────────────────────────────────────────────┘
-       MoE experts: GPU plugin OTD pool + CPU tier (§3.9)
+         ┌──────────────────────────────────────────────────┐
+         │ HTTP server (cpp-httplib thread pool)            │
+         │  /v1/chat/completions  /v1/completions           │
+         │  /v1/models  /health  /props                     │
+         └────────────────────────┬─────────────────────────┘
+                                  │ request objects, routed by `model`
+         ┌────────────────────────▼─────────────────────────┐
+         │ lanes: one slot pool per named lane, its context │
+         │ cap, --queue-timeout, the §3.8 400               │
+         └────────────────────────┬─────────────────────────┘
+                                  │ step combiner (both lanes in one decode)
+   ┌──────────────────────────────▼─────────────────────────────────┐
+   │ LlamaBackend (src/exec/backend_llama.cpp)                      │
+   │  chat template (minja) · tool calls · reasoning split          │
+   │  sampler (src/core/sampler.cpp) · verify walk (verify_walk.h)  │
+   │  MTP drafter (llama_spec.cpp) · context checkpoints per lane   │
+   └──────────────────────────────┬─────────────────────────────────┘
+                                  │ libllama C API
+   ┌──────────────────────────────▼─────────────────────────────────┐
+   │ llama.cpp 3e4dfa8 + contrib/llama.cpp/patches 0001-0056        │
+   │  model, tokenizer, unified KV with a window per lane,          │
+   │  recurrent state with per-token snapshots,                     │
+   │  expert cache: VRAM slots + USM host bank + CPU misses         │
+   │  ggml-opencl: Intel K-quant/IQ/attention/GDN kernels           │
+   └────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.1 Model artifacts
+### 3.1 Model files
 
-- **Allowlist.** arcint validates every artifact against a compiled-in
-  registry (`src/core/model_registry.cpp`, transcribed from
-  `models/allowlist-raw.json`): architecture hash (`lm_xml_sha`), chat
-  template and tokenizer hashes, layer geometry, trained context, weight
-  bytes. Anything else is refused. Provenance is part of the contract:
-  scale-estimation calibration degenerated greedy decoding on the dense 3.8
-  (0/10) where AWQ-only held (7/10) (`measured-here`). Unpinned fields are
-  reported as `null` on `/props`, not invented.
-- **OpenVINO IR** (optimum-intel export), one directory per model. The
-  exports are VLMs; serving is text-only (`decision`, operator, undated in
-  the record): the vision IRs are never loaded and `--vision` is refused
-  (`code`, §7.0.2y).
-- **GGUF on a template IR.** `--gguf FILE --model TEMPLATE_IR` opens a GGUF
-  in process: the file's Q4_K/Q5_K/Q6_K/Q8_0 rows replace the template's
-  projections (`src/exec/gguf_graph.*`, `src/core/gguf*.{h,cpp}`); the
-  template's AWQ activation multipliers are set to one; the value-head
-  reorder is inverted by a gather. Forms (`--gguf-mode`): `mixed` (default:
-  Q4_K repacked into the runtime's compressed form, Q5_K/Q6_K native rows in
-  the K-quant kernel, patches 0021–0030), `repack`, `native`. Mins
-  (`--gguf-mins exact|split|shared|nibble`; exact default, refuses any weight
-  over a per-type deviation bound of 1/64–1/16 of a quantisation step).
-  `--gguf-q6k aligned` (224-byte blocks, default), `--gguf-embed file`,
-  `--gguf-check once` (verdict cache). Paged path only. Dense 27B Q4_K_M on
-  the B60, u8 KV: warm prefill 1,001 t/s at 856 tokens and 464 t/s at 71.7k,
-  decode step 54.8 / 73.7 ms, 16.54 GiB, Prüfstand 10/10; the native form
-  51.3 ms at 15.22 GiB (`measured-here`, §7.0.2bn–bp). The same file through
-  llama.cpp SYCL on the same card: 249 t/s prefill, 14.2 t/s decode at 1k
-  (`measured-here`, §7.0.2bf).
-- **Serving-shape IR** (Flash-Next, the 35B native forms). Emitted from the
-  GGUF by `tools/q4e/serving_shape.py` and
-  `tools/export_serving_artifact.py`. Fill conventions that only an outside
-  reference shows (`measured-here` against llama.cpp tensors, `code` in
-  llama.cpp's consumer): the GGUF stores plain-RMSNorm gammas folded as
-  `(1 + w)` and `ssm_a` as `−exp(A_log)`, both undone at the feed
-  (`q4e.gguf_feed`); the GDN output gate is sigmoid
-  (`output_gate_type: sigmoid`); key heads pair with value heads as
-  `h % 16` (`gdn_key_head_map: tiled`). BF16 tensors are read through
-  `gguf.quants` (the raw-byte cast was a defect until 2026-09-28).
-  Expert blocks ship in their native formats (IQ3_XXS / IQ4_XS gate-up,
-  IQ4_NL / Q8_0 down; IQ2_S-packed for the 35B) through the fused op's
-  `weight_format` (patches 0043, 0045, 0050–0052, 0054–0057); dense
-  projections in the checkpoint's Q8_0/Q6_K form (the `--dense-q8`,
-  `--dense-u8` and `--dense-fp16` export options; also `--expert-format`,
-  `--native-packed`, `--qsa`). The Flash-Next n-gram table is either bound
-  as pinned USM-host ports from the shard (`--ngram-gguf`, 26.82 GiB) or
-  **staged per forward** (`--ngram-staging-rows N` at export: one
-  `[N, 90 B]` buffer, 2.884 MiB, filled by `pread` of the named rows), as
-  FreeToken's disk backend does (`python/freetoken/models/qwen4_exp/ple_disk.py`).
-- **Blob cache.** Opt-in (`--cache-dir`); a cached blob is proven by a real
-  forward at load and discarded on failure, because the shipped 2026.4
-  runtime imports blobs whose MoE weight provider is uninitialised
-  (`measured-here`, openvino#37607).
+- **The GGUF as published**, one file or the first shard of a split file
+  (`--gguf FILE`). Tokenizer and chat template come from the GGUF; arcint
+  renders the template with minja and derives the user-message delimiter by
+  rendering it twice (`docs/llama-engine.md`, checkpoints).
+- **No allowlist** (`decision`, operator, 2026-10-15): the OpenVINO era's
+  compiled-in registry of artifact hashes is retired with that engine. What
+  is admitted is decided by the GGUF's architecture (§2); what is served is
+  stated on `/props` (the file, its architecture, the context, the KV types,
+  MTP, the build).
+- **The MTP layer.** The dense 27B and the coder carry it in their GGUF.
+  Flash-Next's GGUFs do not: `tools/flash_next_mtp_gguf.sh` builds an
+  MTP-only GGUF from the checkpoint's 31 `mtp.*` tensors (the head at Q4_K
+  since 0.7.12: +1.5 % decode, 156 MiB less VRAM, `measured-here`), loaded
+  with `--llama-mtp-gguf` as a second model on the card.
+- **The expert profile** that fills Flash-Next's cache at load is Strata's
+  decode profile (`--llama-expert-profile`, Strata's `data/expert-profile.bin`,
+  MIT).
 
-### 3.2 Graph strategy
+### 3.2 Kernels: the patch series
 
-- **The paged executor is the served path.** OpenVINO's
-  `SDPAToPagedAttention` turns the exported stateful graph into a paged one
-  (`key_cache.N`, `value_cache.N`, the `la.*` linear-attention block tables);
-  arcint owns the page tables, the GDN rows and their checkpoint interval.
-  Against the stateful graph on the same IR the paged decode step is 1.68×
-  faster (11.3 vs 19.0 ms, coder, B60): the GDN transposes vanish and the
-  paged GDN kernel is the optimised one (`measured-here`, §7.0). `--no-paged`
-  keeps the stateful executor as the reference implementation the suites
-  compare against.
-- **Logits slice.** The LM-head input is sliced to the rows anything samples
-  (the last row, plus `1 + draft` rows under speculation); the token axis is
-  read from the head's declared shape (0 for `[tokens, 1, hidden]`, 1 for a
-  serving-shape `[1, tokens, hidden]`), and a probe forward at load verifies
-  it or the load refuses (`code`: `slice_logits_to_last_token`,
-  `paged_logits_token_axis`). `--no-logits-slice` exists for measurement.
-  The slice works for a K-quant head too (`measured-here`, §7.0.2bg).
-- **Prefill chunking on an absolute grid.** Chunks are multiples of
-  `--prefill-chunk` counted from position 0, and prefix-cache checkpoints
-  fall only on that grid, so a warm run presents the model the same
-  boundaries a cold run did; `--prefill-chunk` must be a multiple of
-  `--kv-block-size` when the cache is on (`code`: `src/config.cpp`).
-  Different chunkings of the same tokens give different (equally valid)
-  floating-point results; the default chunk is 2,048, capped by the fit.
-  `--cache-grid N` snapshots on a finer grid by cutting a chunk (exact on
-  the paged path; ~0.45 s fixed per continuation, `measured-here`).
-- **The prefill is chunked to bound activations** and the activation peak is
-  probed upward at load (§4.3); a chunk that does not fit is lowered, never
-  silently raised (`code`: `src/exec/fit.h`).
-- **Static shapes.** Constant dedup in the GPU plugin is per compile
-  (`code`: `ops/constant.cpp`; `measured-here`: two compiles of one model
-  double its residency), so arcint compiles one language model and runs N
-  requests on it.
-- Main-model inference precision is the plugin's default f16. The drafters'
-  rotary subgraphs are marked `disable_conversion` and stay f32 (an f16
-  absolute position overflows at 65,504, `measured-here`).
+`contrib/llama.cpp/patches` holds 56 patches against the pin, each with its
+measurement, KL, red case and review in `contrib/llama.cpp/README.md`
+(`measured-here` throughout). By what they change:
 
-### 3.3 Memory: paged KV + GDN ledger
+| area | patches | what |
+|---|---|---|
+| K-quant products | 0001, 0009, 0011-0014 | integer-dot matvec for 1-4 columns, few-column XMX for verify rows, the fp16/int8 DPAS GEMMs with 2D block loads, tiles from a genetic search |
+| low-bit and IQ types | 0002, 0022, 0030, 0034, 0035, 0053, 0054 | IQ2_XS/IQ2_S/IQ2_XXS/IQ3/IQ4/Q2_0 in planes, cheaper sign and codebook decode |
+| gated delta-net | 0003, 0050, 0051 | the GDN kernel, rollback snapshots written into the recurrent cache, gating in the kernel |
+| attention | 0007, 0008, 0015-0020, 0028, 0037-0041, 0045, 0048 | split decode attention, XMX prompt attention, quantized KV (q8_0, q8_0:q4_0), GQA verify attention, head size 128, the key split by wave |
+| MoE | 0006, 0033, 0043 | tokens as the DPAS A operand, the B60 tile, the cache's GEMM threshold |
+| expert cache | 0021, 0024, 0042, 0046, 0055, 0056 | VRAM slots and a USM bank, per device, non-blocking admission on its own queue, Infernix's LFRU (opt-in), the misses on the CPU |
+| prefill bank stream | 0032, 0044 | each bank tensor copied whole into a VRAM ring ahead of its GEMM, from 256 tokens |
+| decode launches and inputs | 0004, 0005, 0027, 0031, 0047, 0049 | small ops, few-row F32, fewer launches, inputs staged in a USM ring with one wait a split |
+| lanes and devices | 0023, 0025, 0026, 0029 | one OpenCL context per platform, a KV cell window per lane, per-sequence attention windows |
+| graph and buffers | 0010, 0036, 0052 | MTP masked rows, Q8_0 GET_ROWS, compute buffers reserved for N cells |
 
-- **KV.** The plugin's paged cache: 16-token pages; precision per side
-  (`--paged-kv KEY[:VALUE]` over f16/u8/i8/u4/i4). **u8 is the default**
-  (11.3 KiB/token on the coder against f16's 20.0); `u8:i4` (u8 keys,
-  4-bit values; 8.8 KiB/token on the 35B) buys +28 % auto-fit context on
-  both served configurations and since `+p6` prefills on micro-SDPA at u8's
-  rate (patches 0008–0010, 0020; `measured-here`, §7.0.2w, §7.0.2y,
-  §7.0.2as). Precision choice and its measured price: §7.0.3.
-  `ARCINT_PAGED_KV` overrides the flag for A/B runs.
-- **Pool.** Sized at startup from the measured reservation (§4.3), refcounted
-  (`src/core/block_pool.h`): a page is live in a sequence, held by a prefix
-  cache entry, or both; a hit only ever maps complete pages, which are never
-  written again. When a lane needs pages, cached prefixes are dropped (or
-  demoted to the host tier, §4.4) first; a live sequence's pages are never
-  taken (`code`).
-- **GDN ledger.** One fixed-size state row per lane plus checkpoint rows;
-  fresh rows are zeroed on the device from a resident zero row
-  (`measured-here`, §7.0.2bt); `--gdn-checkpoint-budget` caps checkpoint
-  rows. A prefix hit restores KV pages and the GDN checkpoint at the same
-  block boundary, both or neither.
-- **Stateful reference path.** KV state retyped to fp16 by graph surgery
-  (`--kv-dtype`, half of fp32's 40,960 B/token); a plain int8 cast is
-  refused because it has no scales (`measured-here`: it produced a fluent,
-  worse answer).
+Every switch the series reads is classified in `docs/switches.md`
+(operational, tuning, opt-in alternative, off switch, red case, diagnostic).
 
-### 3.4 Prefix caching, and the correctness rule
+### 3.3 Memory
 
-**Mechanism.** A hash chain over token blocks (keyed 128-bit content hash,
-token identity verified on hit). A hit restores KV pages by reference and the
-GDN checkpoint at the same boundary; the paged cache entry holds page
-references plus a host GDN blob (~32 MiB per row on the coder).
-`--prefix-cache-mib`, `--kv-block-size`, `--prefix-cache-reserve PCT`. Real
-agent sessions replayed against this policy hit on 97 % of turns and serve
-96 % of prompt tokens from cache (`measured-here`, §7.0.2j).
+- **Attention KV** is llama.cpp's cache. Types per side with
+  `--llama-kv K[:V]`: f16 (default), q8_0, or q8_0:q4_0, on the Intel
+  attention kernels of 0015; any other pair is refused, because it has no
+  kernel and would dequantize K and V on every call, and 4:4 is refused
+  because it moves the dense 27B's top-1 agreement by 1.2 points, past the
+  answer-level bar (`measured-here`). A quantized V forces flash attention
+  on.
+- **Recurrent state.** One GDN state per lane, with per-token snapshots for
+  the verify (`n_rs_seq` = the draft count): a rejected draft is rolled back
+  by choosing the snapshot, and since 0050 the snapshots are written into
+  the recurrent cache, with no copy back (`code`, `measured-here`).
+- **Compute buffers.** `--llama-reserve-cells N` (0052) reserves them for N
+  cache cells instead of the whole context and cuts deeper prompt chunks to
+  fit; on Flash-Next at 131,072 tokens it buys +10-13 % decode
+  (`measured-here`).
+- **VRAM is sized by measurement, not by an admission model.** Each unit's
+  context, KV types and expert-slot budget were set from the peak VRAM and
+  GTT at the deepest prompt the unit admits, needle answered (§7). A thin
+  post-load margin is not enough: under xe a request that allocates past the
+  card evicts the process's buffers to host memory and they stay there
+  (Flash-Next 24 tokens in 49 s, `measured-here`, 2026-10-11). Peaks: the
+  agent 24,311 MiB of 24,480 at 138k, Flash-Next 23,787, the coder 15,971 of
+  16,384 (`measured-here`, 0.7.12).
 
-**The correctness rule** (`decision`, operator, 2026-10-01; this replaces
-the earlier byte-identity invariant and its two same-day amendments, all in
-git history; precedent, `paper`: Strata's expert cache changes the top-1
-pick at 2–5 % of positions at equal perplexity,
+### 3.4 Reuse, and the correctness rule
+
+**Mechanism.** A lane reuses the prefix it holds. A hybrid model's recurrent
+state cannot be cut back to an earlier token, so each lane keeps **context
+checkpoints** of that state in host memory, llama.cpp server's mechanism
+(`tools/server/server-context.cpp` at the pin, `code`): at the start of the
+batch that begins the last user message, at a user message more than
+`--llama-checkpoint-step` (8,192) tokens past the newest checkpoint, and
+4 + n_ubatch and 4 tokens before the prompt's end; at most `--llama-checkpoints` (32) a lane; restore from the
+newest at or below the shared prefix, the attention KV trimmed there. A
+thinking turn's follow-up or an edited message resumes instead of
+re-prefilling: 38.75 -> 0.61 s on a 24.3k-token conversation (dense 27B,
+B60, MTP 5, `measured-here`). There is no prefix cache shared between lanes
+(`decision`, operator, 2026-10-15) and none kept across a restart (§8).
+
+**The correctness rule** (`decision`, operator, 2026-10-01; this replaced an
+earlier byte-identity invariant; precedent, `paper`: Strata's expert cache
+changes the top-1 pick at 2-5 % of positions at equal perplexity,
 `~/src/Strata-ref/bench/results/2026-09-27-cache-parity/README.md`):
 
 1. **Correctness is judged at the answer.** The bar for any equivalence or
@@ -274,145 +259,126 @@ pick at 2–5 % of positions at equal perplexity,
    **1 point**. The tolerances are the operator's to change. Bit-identical
    *output* across configurations, placements, timing or request history is
    not required anywhere.
-2. **Integrity checks on copied data stay exact**: expert stores, slots,
-   staged tables, restored pages and rows.
+2. **Integrity checks on copied data stay exact**: expert slots and bank
+   entries, restored checkpoints and states.
 3. **Deterministic replay is a cheap default, not a law.** The same request
    sequence giving the same output is kept where it costs nothing (it makes
    measurements comparable) and may be dropped by a mechanism that buys
-   measured speed (non-blocking cache admission, a timing-probed miss split).
-4. **The prefix cache may load together with an adaptive expert tier**, as
-   in both references. A restored continuation is held to the answer-level
-   bar. `tier_prefix_cache_decision` (`code`: `src/config.cpp`) still refuses
-   `--moe-cpu-tier` + `--prefix-cache-mib > 0` unless the plugin reports a
-   static partition; changing that refusal is owed (§8).
+   measured speed (non-blocking cache admission, the CPU's share of the
+   misses).
+4. **Checkpoints may load together with an adaptive expert cache**, as in
+   the references: Flash-Next resumes from a checkpoint while its cache
+   follows the conversation. A restored continuation is held to the
+   answer-level bar.
 5. The byte-equality cells in §5 stay as **tripwires**: a red one on a
    change that passes the answer-level bar is reported, not a veto.
 
-What holds today, measured: on the dense and non-tier configurations a warm
-run is byte-identical to a cold one, per lane, with the other lane active
-(`measured-here`, the equivalence and concurrency suites).
+What holds today, measured: a resumed turn against a full re-prefill with
+the same batch breaks gives the same text (193/193 and 209/209 characters);
+against a re-prefill with other batch breaks the text moves and the answers
+stay right (`measured-here`, 2026-10-05, `docs/llama-engine.md`). Both
+mutants (state not loaded; an older checkpoint's state under a newer one's
+count) fail that test.
 
 ### 3.5 Speculative decoding
 
-- **Machinery** (`code`; `measured-here`). Current scope: greedy requests
-  only; speculation for sampled requests is open (§8.3). Acceptance is the
-  sampler's own decision (penalties applied first), and a drafted token clears
-  the same gates as a sampled one (EOS, `max_tokens`, `n_ctx`). On the paged
-  path a verify pass checkpoints the GDN state after every token into scratch
-  rows (`la.cache_interval = 1`) and rollback is choosing which row to keep:
-  zero bytes copied; attention KV rolls back by `past_lens`. The verify pass
-  is a multi-token forward, so a near-tie can resolve differently from a
-  one-token step; that is admissible under §3.4 and reported by the suite.
-- **MTP head, Qwen3.8 dense** (`--mtp on`). No public implementation
-  consumed the checkpoint's `mtp.*` tensors when it was built (2026-08-28,
-  `code`: transformers 5.16.1, optimum-intel), so `tools/export_mtp.py`
-  reconstructs the layer and extracts the base lm_head; every forward-pass
-  choice was set by acceptance (zero-centred `(1 + w)` norms, per-head
-  q/gate interleave, sigmoid gate; `measured-here`). Acceptance 93 % on our
-  export; Intel's public `Qwen3.8-27B-int4-ov` pairs with our lm_head
-  (`--mtp-layer exported`), 90.8 % acceptance, 10/10, +36–48 % decode at
-  short depth (`measured-here`, §7.0.2n). The MTP layer's own KV is charged in
-  the reservation at 8 KiB/token (`measured-here`, §7.0.2ag). The head and
-  the embeddings gather can run on the other card (`--mtp-device`,
-  `--emb-device`).
-- **MTP head, Qwen3.6 MoE** (`qwen3.6-35b-a3b-mtp`): exported with the MoE
-  geometry; 93.9 % / 75.4 % acceptance (code / prose); with patch 0003 and an
-  int4 head +17 % on code (`measured-here`, §7.0.2o–p).
-- **DFlash2 drafter** (`--dflash DIR`, block-diffusion head for the 3.8):
-  44.8 t/s against 24.0 plain on the B60 at short depth, 3.13 accepted per
-  verify cycle; at 77k 18.8 t/s against 15.3 plain (`measured-here`,
-  §7.0.2r, §7.0.2ag). Block and selector options, `ARCINT_PROFILE_CYCLE`.
-- **Prompt lookup** (`--draft N --draft-ngram K`), off by default (`code`).
-- Speculative decoding on Flash-Next, multi-token drafting and MTP at depth
-  are open items (§8.3).
+- **The model's own MTP head** (`--llama-mtp N`) drafts up to N tokens; the
+  target verifies them in one decode, and arcint's sampler walks the verified
+  rows in order, keeping the draft while it agrees, so the emitted tokens are
+  what the plain loop would sample, greedy or seeded sampled
+  (`src/exec/verify_walk.h`, a pure function with its own tests). The drafter
+  is the single-head case of llama.cpp's `draft-mtp` rebuilt on libllama
+  (`src/exec/llama_spec.cpp`): llama.cpp's common library would compile a
+  second cpp-httplib into the binary (`code`).
+- Draft 0 comes from the catch-up batch, as Strata's does (0010).
+  `--llama-mtp-min-p P` stops drafting at a token the head gives less than P
+  (Strata's `--spec-min-p`); `--llama-mtp-vocab FILE` drafts from a subset of
+  the vocabulary; the logits rows are bounded to 1 + N per lane.
+- Served: the agent 5 drafts, the coder 4, Flash-Next 3 with the stop at 0.5
+  (Strata's setting: 37.9 against Strata's 37.8 t/s on Strata's request,
+  2026-10-14, `measured-here`).
+- DFlash2 drafting exists in llama.cpp at the pin (`draft-dflash`, `code`)
+  and is not wired here (§8).
 
 ### 3.6 Sampling
 
 Greedy, temperature, top-k, top-p, min-p, repetition, presence and frequency
 penalties, host-side (`src/core/sampler.cpp`). Penalties apply before the
-greedy decision. min-p (since 0.5.9, for role play, operator 2026-10-04)
-follows llama.cpp (`src/llama-sampler.cpp` `llama_sampler_min_p_apply`,
+greedy decision. min-p follows llama.cpp (`llama_sampler_min_p_apply`,
 `code`): it keeps p >= min_p · p_max on the logits before temperature, after
-top-p; both cuts keep a prefix of the sorted candidates. Top-p is taken on
-the tempered probabilities, normalised over the whole vocabulary also when
-only a probe of the largest logits was sorted. Seeded; an unseeded request
-gets a logged seed. Defaults chain request > operator flags (`--temp`,
-`--top-p`, `--top-k`, `--min-p`, `--repetition-penalty`,
-`--presence-penalty`, `--chat-template-kwarg enable_thinking=BOOL`) >
-artifact `generation_config.json` > model-card defaults; `/props` reports
-values and provenance. `code`.
+top-p. Seeded; an unseeded request gets a logged seed. Defaults chain request
+> operator flags (`--temp`, `--top-p`, `--top-k`, `--min-p`,
+`--repetition-penalty`, `--presence-penalty`, `--chat-template-kwarg
+enable_thinking=BOOL`) > the GGUF's defaults; `/props` reports values and
+provenance (`code`).
 
 ### 3.7 Tokenizer, templates, tool calls
 
-- Tokenizer and chat template come from the artifact; the template hash is
-  pinned. Rendered prompts are byte-identical to reference jinja2
-  (`measured-here`).
+- Tokenizer and chat template come from the GGUF.
 - Incremental detokenisation never splits a UTF-8 code point across SSE
   chunks; stop strings and token ids; `usage` in every response (`code`,
   unit-tested).
-- **Reasoning.** When the rendered prompt ends inside `<think>`, the server
-  splits everything before the first `</think>` into `reasoning_content`
-  (`split_reasoning`, `ReasoningStreamer`); `enable_thinking` and
-  `reasoning_effort` are honoured (`code`).
+- **Reasoning.** When the rendered prompt ends inside `<think>`, everything
+  before the first `</think>` goes to `reasoning_content`; `enable_thinking`
+  and `reasoning_effort` are honoured (`code`).
 - **Tool calls.** The models' native format is parsed into OpenAI
   `tool_calls`; requests without `tools` get raw text. A template that
-  iterates arguments as a mapping is handed the parsed object
-  (`tool_call_arguments_for_template`); minja polyfills stay off (`code`).
-- **Cancellation.** A dropped connection aborts at the next scheduler
-  boundary and frees the lane's pages (`code`; gated by the concurrency
-  suite).
+  iterates arguments as a mapping is handed the parsed object; minja
+  polyfills stay off (`code`).
+- **Cancellation.** A dropped connection aborts at the next step boundary
+  and frees the lane (`code`; gated by the concurrency suite, §5).
 
 ### 3.8 Context-overflow policy
 
 A prompt or continuation that exceeds the context is **rejected with HTTP
 400** and a JSON body with `prompt_tokens`, `n_ctx` and `overflow`. No
 server-side truncation, context shift or sliding window: a server-side
-history edit changes what the model saw and breaks prefix-cache identity,
-and a GDN state cannot un-see a token, so any shift is an approximation.
-History management is the client's job. This invariant is unamended
-(`decision`, operator, undated in the record; `code`: the 400 and its
-numbers are unit-tested).
+history edit changes what the model saw and breaks prefix reuse, and a GDN
+state cannot un-see a token, so any shift is an approximation. History
+management is the client's job. With named lanes the 400 quotes the lane's
+own context. This invariant is unamended (`decision`, operator; `code`: the
+400 and its numbers are unit-tested).
 
 ### 3.9 MoE expert execution
 
-The GPU plugin's fused MoE op owns routing; arcint configures it through
-compile properties and patches. Pieces in service, with where they live:
+The coder's 184 experts are all resident on the A770. Flash-Next's 512
+experts a layer are not: with `--llama-cpu-moe 48` their weights load into
+host memory and the **expert cache** (0021, after Strata) serves them:
 
 | piece | what it does | where | evidence |
 |---|---|---|---|
-| OTD offload | `--offload-ratio R`: R % of experts not resident; resident slots in a pool, misses loaded on demand from the weight file | stock plugin `OFFLOAD_RATIO`; pool size `floor(E·(100−R)/100)` per layer is the served truth (the fit ledger's `ceil` is a ledger ceiling only) | `code`, `measured-here` |
-| device slot pool | slots in VRAM up to a byte budget, async batched uploads | patches 0004–0007; budget `ARCINT_MOE_DEVICE_POOL_BYTES` → `MOE_OTD_DEVICE_POOL_BYTES`; 0070 extends it to the per-expert route | `measured-here` (35B on the A770: 0.4 → 9.1 t/s, §7.0.2v) |
-| CPU tier | non-resident experts computed on the host instead of uploaded | `--moe-cpu-tier` (patches 0011/0012, 0017); `--moe-cpu-tier-threads` | `measured-here` (§7.0.2x) |
-| static partition | placement a pure function of (layer key, expert, configuration), pinned at bind; the default tier mode | patch 0018, property `MOE_CPU_TIER_STATIC_PARTITION`; its LRU mode (`MOE_CPU_TIER_PARTITION=lru`) is replaced by the adaptive cache of §8.1 | `code` |
-| census seed | the resident set chosen from a recorded routing census instead of a hash rank | patch 0046, `MOE_CPU_TIER_SEED=<file>` (`# space=layer_key`); tools `tools/expert_policy_compare.py`, hot-set census tools | `measured-here` (§7.0.2cc) |
-| hybrid prefill | grouped GEMM over the resident subset, host tier for the rest | patches 0037, 0042 | `measured-here` |
-| per-expert dispatch | experts computed by a per-expert GPU kernel with in-kernel dequant, bypassing the fused GEMM; misses on the host | `--moe-per-expert-dispatch`; patches 0038–0041, 0045, 0047, 0059–0061, 0064, 0069 | `measured-here` |
-| all-resident native pool | every expert in a slot, filled at bind; decode routing on the device | patches 0051, 0058, 0062, 0067 | `measured-here` (35B, A770: decode 19.3 → 28.1 t/s, §7.0.2cs) |
-| CPU tier kernels | native formats decoded once per call, AVX2 row decode, jobs per lane, two-phase split over the pool, quantised-domain dot for decode-shaped calls (≤ 8 jobs) | patches 0043, 0065, 0066, 0068, 0071, 0074 (`MOE_CPU_TIER_Q8_DOT=0` reverts 0074) | `measured-here` (§7.0.2cp–cq, §7.0.2cx; 0074: decode +10 %, KL +0.018 nats) |
-| host expert bank | tier experts read from a RAM bank filled at load by sequential O_DIRECT reads instead of page faults | patch 0072, `MOE_CPU_BANK_BYTES`, `MOE_CPU_BANK_SEED`, `MOE_CPU_BANK_FILL_PER_LAYER` (anonymous `MAP_NORESERVE`; a budget above free RAM ends in an OOM kill) | `measured-here` (first answer −18…−21 %, §7.0.2da) |
-| NVMe pinned fill | the pinned expert set DMA'd from an NVMe expert store into VRAM at load (arcwell, B60 only) | patches 0048–0049 | `measured-here` (cold TTFT 92.5 vs 99.7 s at depth 4, §7.0.2ch) |
-| perf counters | `MOE_OTD_PERF_LOG=1`, routing histogram/trace | patches 0004, 0013, 0044 | `code` |
+| slots | the hot experts in VRAM, sized in bytes (`--llama-expert-cache MIB`), filled in the profile's rank order | 0021, 0024 (one cache per card) | `measured-here` |
+| bank | every other expert in USM host memory the card reads by pointer: a decode miss is read over the link in place, as Strata's kernels read its pinned mirror | 0021 | `measured-here` |
+| adapt | swaps from decayed usage counts on Strata's constants (`LLAMA_EXPERT_CACHE_{ADAPT_EVERY,MAX_SWAPS,MIN_GAIN,MIN_USAGE,DECAY}`), on their own queue right behind a graph, the victim to a spare bank entry (non-blocking admission) | 0042, 0046 | `measured-here` (verify input copies 2.6-6.0 -> 0.94 ms) |
+| policy | Strata's rule by default; Infernix's LFRU opt-in (`LLAMA_EXPERT_CACHE_POLICY=lfru`): +1.6 % on the gate set, -2.1 % on six other prompts, not a general gain | 0055 | `measured-here` |
+| CPU misses | up to 16 missed (token, expert) pairs of a decode layer computed on the CPU from the bank with Strata's multi-token AVX2 rows while the card computes the hits and reads the other misses (`LLAMA_EXPERT_CACHE_CPU_MISSES=1`, 8 threads) | 0056 | `measured-here` (decode +15.2 % on six answers, KL +0.0028) |
+| prefill | the bank stream: from 256 tokens a ubatch each bank tensor is copied whole on a copy queue into a VRAM ring ahead of its GEMM (`GGML_OPENCL_BANK_STREAM=1`); below, a GEMM gathers its routed bank experts; below 64 tokens the cache's matvec path | 0032, 0043, 0044 | `measured-here` (the 20k needle 408 -> 645 t/s in 0.7.3; 690 in 0.7.12) |
+| n-gram table | the 27 GiB embedding table read lazily (`MADV_RANDOM`, a graph's rows prefetched together) | arcint, 0.7.5 | `measured-here` (2.0-7.7 -> 0.3-0.6 ms a verify) |
 
-Two facts every MoE measurement must state:
-- **The partition's layer key is the `.bin` offset of the layer's
-  `weight_0` constant** (patch 0013), so any export that shifts the file
-  layout moves every static resident set (`measured-here`, §7.0.2cz). Control
-  it with a census seed until the key is fixed (§8).
-- **Residency can move arithmetic.** Under per-expert dispatch a resident
-  expert runs on the GPU kernel and a miss on the host tier; native-format
-  GPU and host paths are not bit-identical (affine ones are). Under §3.4 that
-  is admissible; it means outputs depend on the resident set (`measured-here`,
-  §7.0.2cf).
+Two facts every expert-cache measurement must state: the slot budget and
+the profile, and whether the bank's pages were warm (a repeated prompt hides
+the page cache: an IQ3_XXS "28 t/s" was warm pages, 4-5 t/s from ZFS,
+`measured-here`). Serve Flash-Next from the NVMe, not from the ZFS pool.
 
-The reference development configuration for Flash-Next (B60, `d48q8`,
-`--offload-ratio 75 --moe-cpu-tier --moe-per-expert-dispatch`, census seed
-of 128 experts per layer, 30 GiB host bank, u8 KV, chunk 2,048, plugin with
-0074): 20,085-token needle answered, prefill 63.1 t/s, decode 6.5 t/s; a
-27,603-token needle at `n_ctx` 32,768 answered, prefill 61.2 t/s, decode
-6.6 t/s. Per decode token 308 experts run on the CPU tier against 170 GPU
-hits (36 %), and the GPU idles ~46–50 % of decode wall waiting on the tier
-(`measured-here`, `docs/campaigns/host-expert-bank.md` 2026-10-01). The
-references' levers for exactly this are §8.1–§8.6.
+### 3.10 Lanes and two cards
+
+- **Named lanes** (`--served-model-name A,B --lane-ctx CA,CB`): one process,
+  one copy of the weights, a context per lane, one unified KV pool in which
+  each lane attends over its own window of cells (0026, 0029). With both
+  lanes decoding, a step combiner drafts for both in one MTP loop and
+  verifies both in one `llama_decode` (0028): 21.6 + 21.7 t/s against 15.9 +
+  15.8 taking turns (dense agent, MTP 5, `measured-here`). Recurrent state
+  and checkpoints stay per lane. Flash-Next's indexed memory refuses
+  windows. The production agent runs one lane: the two-lane test drive of
+  2026-10-08 ended because a lane slowed with the other's pool fill before
+  0026 (`docs/campaigns/lanes-agent-subagent.md`).
+- **Two cards** (`--device GPU.0,GPU.1 --llama-layer-split K`): layers
+  [0, K) on the first card, [K, n_layer) and the output head on the second,
+  each card with its own KV, recurrent state and expert cache
+  (`--llama-expert-cache A,B`), after Strata's layer split. Flash-Next at
+  131,072 tokens: 21.7 t/s split at layer 36 against 19.8 on the B60 alone
+  (`measured-here`, 0.7.0; `docs/campaigns/layer-split-two-cards.md`). Not
+  a production configuration.
 
 ## 4. Serving surface
 
@@ -420,203 +386,180 @@ references' levers for exactly this are §8.1–§8.6.
 |---|---|
 | `POST /v1/chat/completions` | OpenAI-compatible; SSE and non-stream; `chat_template_kwargs.enable_thinking`, `reasoning_effort`; `tools` |
 | `POST /v1/completions` | raw completion; accepts token-id prompts |
-| `GET /v1/models` | the served model with the context it is **running with** (§4.2) |
-| `GET /health` | model, loaded, slots free/total, queue depth, prefix-cache counters (`cache.{entries,tiered_entries,host_mib,hits,demotions,promotions}`) |
-| `GET /props` | model identity and hashes, context, quant, the served path and KV precision (`cache.path`, `kv_dtype`, `kv_block_tokens`, `kv_block_size`, `prefix_cache`, `prefix_cache_mib`), MTP state, sampler defaults and provenance, build info |
+| `GET /v1/models` | one entry per served name with the context it is **running with** (§4.2) |
+| `GET /health` | model, loaded, slots free/total, queue depth; per lane with named lanes |
+| `GET /props` | the served file and architecture, context, KV types, MTP state, sampler defaults and provenance, build info |
 
 `usage.completion_tokens_details` carries `accepted_prediction_tokens` /
 `rejected_prediction_tokens`. Console output goes to stderr, one greppable
-line per event (`lgc  load:`, `mem:`, `http:`, `slot N: prefill … | decode …`
-with graph / embed / sample / emit / wait terms and a stall p95); `-v`, `-vv`.
-The stub backend (`--stub`) serves the whole surface without a model for the
-device-free suites.
+line per event (`lgc  load:`, `llama:`, `http:`, `slot N: prefill … |
+decode …`, `expert cache:` per request); `-v`, `-vv`. The stub backend
+(`--stub`) serves the whole surface without a model for the device-free
+suites.
 
-### 4.1 Two lanes (M6)
+### 4.1 Lanes
 
-`--parallel N` (gated at 2). A lane is one sequence's mutable state: its own
-`InferRequest`s (language model, embeddings gather, MTP layer and head), GDN
-rows, KV block table and output buffers. Compiled models and the page pool
-are shared. Current scope: each graph execution runs one sequence (open
-item: NInfer batches the active requests' decode steps into one forward,
-"startup-bounded batched decode", `paper`: its `README.md`).
-
-The **turnstile** (`src/core/turnstile.h`) orders graph executions FIFO. It
-is a correctness mechanism: the GPU plugin pools intermediates per compiled
-model, so a request's output tensor is valid only until the next execution
-on that model by anyone, and each lane copies its outputs inside its turn
-(`measured-here`: a second request adds 0.00 GiB). A decode step waits for
-at most one other execution, so the worst stall is one prefill chunk; the
-console reports the wait as its own term. The prefill grid is configuration,
-never a scheduling variable. Measured on the B60 coder: a second lane costs
-1.7 % single-stream decode; agent session + subagent split the card evenly,
-stall p95 17 ms, max one chunk; Prüfstand 10/10 on each lane concurrently
-(`measured-here`, §7.2).
+`--parallel N` equal lanes, or named lanes (§3.10), up to 4. A lane is one
+sequence's state: its KV cells, its recurrent state, its checkpoints, its MTP
+draft state. Each lane has its own slot pool: a request for a busy lane
+waits up to `--queue-timeout S` (the units set 30) and then gets a 503 with
+the lane's free count; it never takes another lane.
 
 ### 4.2 The name, and the context, are contracts with a proxy
 
 - `--served-model-name NAME` sets the id on `/v1/models`, `/props` and in
-  responses; `--model-id` stays the artifact assertion against the
-  allowlist. Both names are accepted in a request's `model` field;
-  `/props` publishes `model.canonical_id`, `answers_to` and
-  `enforces_model_field: false`.
+  responses. With one name, any `model` value is served and `/props`
+  publishes `enforces_model_field: false`.
 - The `/v1/models` entry carries `n_ctx` (what this process runs with),
   `n_ctx_train`, `quant` and `lanes`, because a discovering proxy reads
-  context only from there (`code`; both learned by breaking a proxy).
-- [Amended 2026-10-07, operator.] Named lanes on the libllama engine
-  (`--served-model-name A,B --lane-ctx CA,CB`) make the `model` field
-  binding: a lane's name picks that lane. An empty name and the artifact's
-  canonical id go to the first lane, and an unknown name gets a 404.
-  `/health` adds a `lanes` array with each lane's free count. `/v1/models` carries one entry per
-  lane name with that lane's `n_ctx`, and `/props` reports
-  `enforces_model_field: true` there. One name keeps the behaviour above.
-  `docs/campaigns/lanes-agent-subagent.md`.
+  context only from there (`code`; learned by breaking a proxy).
+- [Amended 2026-10-07, operator.] Named lanes (`--served-model-name A,B
+  --lane-ctx CA,CB`) make the `model` field binding: a lane's name picks
+  that lane. An empty name and the GGUF's canonical id go to the first lane,
+  and an unknown name gets a 404. `/health` adds a `lanes` array with each
+  lane's free count; `/v1/models` carries one entry per lane name with that
+  lane's `n_ctx`; `/props` reports `enforces_model_field: true`.
 
-### 4.3 Admission: a lane is a memory reservation
+### 4.3 Admission
 
-At startup the fit (`src/exec/fit.h`) reserves, per card and measured where
-it can be: weights + graph (`GPU_MEMORY_STATISTICS` after compile, device
-and host-mapped ledgers kept apart), drafter residency, MTP state
-(8 KiB/token), the activation peak at the chosen chunk (probed upward by
-doubling; the plugin's intermediate pool never shrinks, so an over-large
-probe is a permanent tax), GDN rows per lane, the expert slot pool
-(plateau probe, `source: probe` / `probe-static`), KV, and a margin
-(`--fit-margin-mib`, 256 default). With `--n-ctx` omitted it adopts the
-largest admissible depth and corrects by a residency audit; an explicit
-`--n-ctx` is verify-only and never lowered (`code`, `measured-here`). An inadmissible request is
-refused at startup with every term; an N+1-th concurrent sequence gets a
-503 with the same terms unless `--queue-timeout S` lets it wait (the
-production unit sets 30). `--fit-ledger-dir` persists the probes so a second
-matching load skips them (`measured-here`: 14–27 min saved on per-expert
-loads). The context ceiling is the depth at which the prefix-cache reserve
-reaches zero (§7.0.3).
+The context is configuration: `--n-ctx` (default 32,768), or `--lane-ctx`
+per lane. Whether it fits is decided once, by measurement at the deepest
+admitted prompt (§3.3), not per request. A request is refused only by §3.8
+(400) or by a full lane after `--queue-timeout` (503).
 
-### 4.4 A host tier for evicted prefixes
+### 4.4 The command line
 
-`--cache-host-mib N` (0 = off): an evicted prefix entry is demoted (its KV
-pages copied to host memory by page runs through `RemoteTensor` ROI views,
-references released) and promoted on a hit; one LRU order across both
-tiers. Pages come back byte-exact. Measured on the B60: a 4,096-token hit
-from the host tier in 0.02 s against a 1.79 s cold prefill
-(`measured-here`). Production: `--cache-host-mib 4096` on the agent unit,
-sized from the replay's 37 % of prefill spent re-prefilling evicted sessions
-(`measured-here`, §7.0.2j).
+`--engine llama --gguf FILE` selects the engine and the file (`--engine` is
+kept for the units' compatibility; `llama` is its only value, and `ov` is
+refused with a pointer to the `openvino-history` tag). The engine's flags
+are `--llama-*`; `arcint --help` and `llm.txt` list them. The units in
+`contrib/systemd/` carry the production flags.
 
 ## 5. Testing and acceptance
 
 **The bar** is the answer-level bar of §3.4 / `CLAUDE.md`, per phase: a
 change that measurably improves prefill or decode and does not regress the
 other beyond the run-to-run spread is adopted if it passes the answer-level
-bar (`decision`, operator, 2026-10-01). The byte-equality cells listed below
-(cold/warm, chunked/unchunked, restored continuation, MTP identity,
-`tier-reference-cell`) are tripwires: reported, not a veto. The cells' own
-text and the generated manifest still say "byte-equality" and are owed an
-update to say so (§8).
+bar (`decision`, operator, 2026-10-01). Byte-equality cells are tripwires:
+reported, not a veto.
 
-- **Prüfstand** (the acceptance task: a Lua CSV parser to RFC 4180, ten
-  cases, scored by executing the candidate). 10/10 is the bar for the
-  production coder artifact, through the deployed package
-  (`tests/acceptance/cells.json`, cell `pruefstand`; harness path from the
-  run manifest, `ARCINT_ACCEPTANCE_PRUEFSTAND`). The score is a floor, not a
-  fingerprint: two different programs can both score 10/10.
-- **Equivalence suite** (`tests/equivalence/run.sh`, on a card):
-  determinism, warm vs cold, restored continuation, logits slice, drafter
-  determinism and acceptance, MTP; `ARCINT_EXTRA_ARGS="--parallel 2"` runs it
-  on two lanes; `ARCINT_SKIP_STATEFUL=1` for paged-only models.
-- **Concurrency suite** (`tests/concurrency/run.py`): no cross-lane bleed in
-  both start orders, both lanes used, cold/warm per lane, the cache holds
-  pages, cancellation, admission 503 with numbers, the stall printed.
+- **The acceptance task (Prüfstand)**: a Lua CSV parser to RFC 4180, ten
+  cases, scored by executing the candidate. Through the deployed package, at
+  temperature 0: **≥ 9/10 is the bar, 10/10 the target**, for the coder and
+  the agent (`decision`, operator, 2026-10-15). The score is a floor, not a
+  fingerprint: two different programs can both score 10/10, and a greedy
+  score is one trajectory (a batch layout can flip one case; the sampled
+  task separates configurations, `docs/llama-engine.md`).
+- **Facts and needles**: every served check asks the capital of France and
+  finds a needle at depth (20k for Flash-Next, 55k and 138k for the agent,
+  41k for the coder).
+- **KL as served** against a reference on the CPU or a higher quant
+  (`llama-perplexity -lm mmap --no-repack`, `-ub 4` where the expert cache
+  is on; the batch must exercise the changed path), baseline arm and
+  candidate on the same card and window.
+- **Performance floors**: per service, the last release's pre-tag served
+  numbers minus their run-to-run spread (`decision`, operator, 2026-10-15).
+  The references are 0.7.12's (§7); the `*-served` cells carry them.
+- **Equivalence suite** (`tests/equivalence/run.sh`, on a card, `--engine
+  llama --gguf`): two greedy runs, a lane's reused prefix against a fresh
+  process (warm against cold), a checkpoint resume against a full
+  re-prefill, MTP on against off, one lane against two. Answers right in
+  every arm is the gate; byte equality is the tripwire.
+- **Concurrency suite** (`tests/concurrency/run.py`): no cross-lane bleed
+  in both start orders, both lanes used, the 404 for an unknown lane name,
+  cancellation, the 503 with the lane's numbers after the queue timeout.
   Verified red before green.
+- **Op suites**: `test-backend-ops` on both cards for each op family the
+  series touches (MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT, GATED_DELTA_NET,
+  SSM_CONV, GET_ROWS, CPY, SET_ROWS, TOP_K, FILL, RMS_NORM, SOFT_MAX), and
+  each patch's red case (`contrib/llama.cpp/README.md`). A wrong backend
+  name skips every case and prints OK: check the case count.
 - **Unit tests** (`ctest -L unit`, device-free, stub build): config and the
-  refusal ladder, fit arithmetic, decode accounting, HTTP round-trip
-  (`tests/roundtrip.sh`), lane stress, acceptance enumeration consistency.
-  Warning-clean under `-Wall -Wextra -Wpedantic -Werror`.
-- **Sanitizers**: ASan + UBSan, no-recover, on x86_64 (ASan aborts at
-  startup on the aarch64 build container).
-- **Plugin unit tests** each patch carries (`ov_gpu_unit_tests` filters; the
-  tier cells build standalone without `ENABLE_TESTS`), red-first.
-- **KLD against the model's own f32 forward** (Flash-Next):
-  `tools/ref_forward_stream.py` captures; `tools/kld_served.py --replay` plus
-  `ARCINT_LOGITS_DUMP` and `--no-logits-slice` on the served side;
-  `kld_vs_capture.py`. Rows at or above position 2,051 of every capture
-  before 2026-09-28 are void (indexer fed garbage); re-capture owed.
-- **Performance bars**: B60 coder warm decode ≥ 60 t/s (gated, reference
-  66.5); tier cell warm ON decode ≥ 14.8 t/s and ON/OFF ratio ≥ 1.17
-  (gated). Prefill is a first-class metric on every card.
+  refusals, the verify walk, lanes and the step combiner's rules, chat
+  rendering and tool calls, the HTTP round trip (`tests/roundtrip.sh`), lane
+  stress, the acceptance enumeration's consistency. Warning-clean under
+  `-Wall -Wextra -Wpedantic -Werror`.
+- **Sanitizers**: ASan + UBSan, no-recover, on x86_64.
 - **A test must be able to fail**: the red case runs first.
 
 ### 5.1 The test ladder: what runs when
 
 | class | cadence | card time | members |
 |---|---|---|---|
-| Unit tests | every commit | seconds to minutes | `ctest -L unit` in the stub build, plus the plugin unit tests of any patch that changes |
-| Milestone gates | once per milestone increment | one card window | the equivalence and concurrency suites on the configuration the milestone changes, plus its own measurement cell, one process per configuration |
-| Acceptance | once per release, before the tag | hours | <!-- BEGIN GENERATED by tools/acceptance_manifest.py; verify with its check mode -->`coder-offload-1lane` gates byte-equality: cold vs warm cache, chunked vs unchunked prefill, one chunk size vs another (reports chunk sweep) (expected skip: mtp-section (coder artifact carries no MTP head)); `coder-offload-2lane` gates the same byte-equality claims as coder-offload-1lane, held at --parallel 2 (expected skip: mtp-section (coder artifact carries no MTP head)); `coder-offload-concurrency` gates no cross-slot bleed, cold/warm per lane, cancellation, admission (§4.1); `coder-served-large` gates byte-equality: two greedy runs, cold vs warm cache, a restored continuation vs cold, and (draft 4) a copy-the-input prompt (expected skip: mtp-section (coder artifact carries no MTP head)); `coder-served-large-decode` gates byte-identity of the two requests' outputs; the warm second-request decode rate against its reference once filled (reports until then, §8.8) (reports 0.3.0 record (DESIGN §7.0.2ai): 53.4 t/s cold / 69.2 t/s warm decode) (references: decode-warm-2nd 66.5 t/s (gate lower-is-worse at 60.0 t/s); decode-cold-1st 66.6 t/s (report only, not gated); prefill-warm-2nd 2820.8 t/s (report only, not gated); prefill-cold-1st 2812.3 t/s (report only, not gated)); `coder-served-small` gates byte-equality (as coder-served-large), on the 16 GiB card (expected skip: mtp-section (coder artifact carries no MTP head)); `coder-served-small-decode` gates byte-identity of the two requests' outputs; the warm second-request decode rate against its reference once filled (reports until then, §8.8) (reports 0.3.0 record (DESIGN §7.0.2ai): 48.0/49.5 t/s decode) (references: decode-warm-2nd 47.6 t/s (report only, not gated); decode-cold-1st 46.0 t/s (report only, not gated); prefill-warm-2nd 508.9 t/s (report only, not gated); prefill-cold-1st 510.5 t/s (report only, not gated)); `coder-served-small-concurrency` gates no cross-slot bleed, cold/warm per lane, cancellation, admission (§4.1); `agent-dense` gates MTP identity (equivalence's MTP section) and MTP acceptance > 10%; `agent-dense-concurrency` gates no cross-slot bleed, cold/warm per lane, cancellation, admission (§4.1); `tier-reference-cell` gates tier ON byte-identical to itself across processes and requests, tier OFF likewise, and E2 (reports ON vs OFF identity and the first divergence; every output's hash; the first process's rates beside the second's) (references: decode-warm-2nd-on 18.2 t/s (gate lower-is-worse at 14.8 t/s); decode-ratio-on-off 1.46 ratio (gate lower-is-worse at 1.17 ratio); decode-warm-2nd-off 12.5 t/s (report only, not gated); prefill-warm-2nd-on 27.9 t/s (report only, not gated); prefill-warm-2nd-off 87.2 t/s (report only, not gated); grouped-fallbacks-on 0 count (gate higher-is-worse at 0 count); decode-cold-1st-off 10.2 t/s (report only, not gated); prefill-cold-1st-off 80.5 t/s (report only, not gated); decode-cold-1st-on 13.0 t/s (report only, not gated); prefill-cold-1st-on 24.8 t/s (report only, not gated); decode-cold-warm-ratio-on 1.4 ratio (report only, not gated)); `ngram-determinism-repeat` gates six fresh processes produce identical output; `depth-ladder` gates the load completes at both KV precisions on both cards (reports t/s per card and precision) (references: prefill-large-u8 1025.5 t/s (report only, not gated); decode-large-u8 20.8 t/s (report only, not gated); prefill-large-u8i4 120.9 t/s (report only, not gated); decode-large-u8i4 45.9 t/s (report only, not gated); prefill-small-u8 621.0 t/s (report only, not gated); decode-small-u8 29.2 t/s (report only, not gated); prefill-small-u8i4 170.3 t/s (report only, not gated); decode-small-u8i4 26.1 t/s (report only, not gated)); `sanitizers` gates zero sanitizer reports (reports device-free build only (ARCINT_OPENVINO=OFF): the 4 rope-precision cases gated on ARCINT_OPENVINO are not instrumented by this cell); `package-build` gates the package build succeeds, is version-stamped, and its RPATH probe passes; a post-deploy smoke run follows the install, outside this cell; `pruefstand` gates 10/10 on the production coder artifact through the deployed package (references: score 10 points (gate lower-is-worse at 10 points)) <!-- END GENERATED by tools/acceptance_manifest.py --> |
+| Unit tests | every commit | seconds to minutes | `ctest -L unit` in the stub build; the op suites and red case of any patch that changes |
+| Milestone gates | once per increment | one card window | KL as served, the op suites, and the served check of the service the change touches, one process per configuration |
+| Acceptance | once per release, before the tag | about an hour per card | <!-- BEGIN GENERATED by tools/acceptance_manifest.py; verify with its check mode -->`agent-equivalence` gates the answers right in every arm: two greedy runs, a lane's reused prefix against a fresh process, a checkpoint resume against a full re-prefill, MTP on against off, one lane against two (reports byte equality of each pair (tripwire, §3.4 point 5)) [runner lands in Increment 0.8.0]; `coder-equivalence` gates the answers right in every arm: two greedy runs, a lane's reused prefix against a fresh process, a checkpoint resume against a full re-prefill, MTP on against off, one lane against two (reports byte equality of each pair (tripwire, §3.4 point 5)) [runner lands in Increment 0.8.0]; `agent-concurrency` gates no cross-lane bleed in both start orders, both lanes used, the 404 for an unknown lane name, cancellation, the 503 with the lane's numbers after the queue timeout (references: not yet filled) [runner lands in Increment 0.8.0]; `coder-concurrency` gates no cross-lane bleed in both start orders, both lanes used, the 404 for an unknown lane name, cancellation, the 503 with the lane's numbers after the queue timeout (references: not yet filled) [runner lands in Increment 0.8.0]; `agent-served` gates Paris and the needle right; prefill at both depths at or above the release floor (the last release's pre-tag number minus its run-to-run spread, §5) (reports peak VRAM and GTT) (references: not yet filled) [runner lands in Increment 0.8.0]; `coder-served` gates Paris and the needle right; decode on each answer at or above the release floor (§5) (reports peak VRAM and GTT) (references: not yet filled) [runner lands in Increment 0.8.0]; `flashnext-served` gates Paris and the needle right; prefill at 20k and decode at or above the release floor (§5) (reports peak VRAM and GTT) (references: not yet filled) [runner lands in Increment 0.8.0]; `sanitizers` gates zero sanitizer reports (reports the stub build (no card): unit, roundtrip, stress); `package-build` gates the package build succeeds, is version-stamped, and its ggml-cpu is native (AVX2); a post-deploy smoke run and a fresh container follow the install, outside this cell; `pruefstand` gates at least 9/10 on the coder through the deployed package (10/10 the target, §5) (references: score 9 points (gate lower-is-worse at 9 points)); `pruefstand-agent` gates at least 9/10 on the agent through the deployed package (10/10 the target, §5) (references: score 10 points (gate lower-is-worse at 9 points)) <!-- END GENERATED by tools/acceptance_manifest.py --> |
 
-Section numbers inside the generated cell list (§8.8 and the like) point
-into `docs/design-0.3.1-test-ladder.md`, not into this document. Long
-prefills are acceptance work. Within one arm, repeated decode samples
-may reuse a warm prefix; with an adaptive tier, state the tier's history.
-The arcint unit ladder runs on the exact tree before every tag.
+The release procedure around it (pre-tag served check, second-model review,
+the package built and checked, a fresh container) is
+`docs/release-checklist.md`. The unit ladder runs on the exact tree before
+every tag.
 
 ### 5.2 Operating facts that prevent damage
 
-- **Card identity by PCI id**, never by DRM number: DRM numbering is inverted
-  against OpenVINO's (`docs/sop-card-window.md`). `GPU.0` = B60, `GPU.1` =
-  A770.
+- **Card identity by PCI id**, never by DRM number: DRM numbering is
+  inverted against arcint's `GPU.N` (`docs/sop-card-window.md`). `GPU.0` =
+  B60, `GPU.1` = A770.
 - **The cards are full while the production units run.** Stop the owning
-  unit for a window and restore it after; two arcint processes on one card
-  under xe produce GPU faults (job timeouts, coredumps, resets), not slow
-  sharing. Test zombies ignore SIGTERM: sweep by pid with SIGKILL and verify
-  with a real completion.
+  unit for a window and restore it after; two processes on one card under
+  xe produce GPU faults (job timeouts, resets), not slow sharing. Wedged
+  tests ignore SIGTERM: kill by pid with SIGKILL and verify the card with a
+  real completion.
 - **A wedged xe card** (GuC job timeouts, an oops in the xe scheduler, a
   process stuck in `dma_fence_default_wait`) has only been recovered by a
   host reboot, and **rebooting the dev host is the operator's call**, every
-  time (`decision`). Read the host's captured kernel log first so the
-  request carries the kernel's own signature.
+  time (`decision`). Read the host's captured kernel log first. A
+  copy-engine CAT error after an out-of-bounds probe is recovered by killing
+  the stuck process (`measured-here`).
+- **The B60's first job after a long idle can wedge**: run legs back to
+  back, or hold the device's runtime power on.
 - **Forecast host memory before any launch**: visible + driver-side
   (`drm-resident-*` in fdinfo) + page cache / ZFS ARC (absent from
-  `MemAvailable`) + the fence. The GPU plugin stages constants in host
-  memory at compile: compare constant bytes with host RAM before compiling
-  (the first full-depth Flash-Next compile was refused by the host with
-  `CL_OUT_OF_HOST_MEMORY`, `measured-here`). A
-  `MAP_NORESERVE` bank above free memory ends in an OOM kill.
-- **VRAM exhaustion under xe** shows as `VM worker error: -12` and an exec
-  queue reset; the reservation is the defence. The runtime's
-  direct-submission semaphore can be evicted under VRAM pressure with
-  concurrent load (a CAT error at a fixed address); fallback
-  `NEOReadDebugKeys=1 EnableDirectSubmission=0` (`measured-here`, §7.0.2ad).
-- **The A770's GT clock is pinned at 2000 MHz** (operator decision,
-  2026-09-27; host-side oneshot service): 35B decode +14 %, prefill −9 %, the
-  coder −5 % decode (§7.0.2cw). Any clock A/B states the pin.
-- **One fresh process per measurement cell**: a GPU fault or failed compile
-  poisons later cells in the same process. A fresh process's first request
-  compiles kernels for its row count (~120–320 ms at 856 tokens); warm
-  figures come from request 2.
-- **Measure floors on the A770**: the B60's served Flash-Next path is not
-  run-to-run deterministic (KL 0.136 nats mean between identical forwards;
-  `measured-here`, §7.0.2cb).
-- **Verify the artifact carries the change**: `dpkg -V marfrit-openvino`, the
-  plugin's sha in every leg header, `LD_LIBRARY_PATH` exported to the
-  intended plugin; drop `__pycache__` on every source bend.
-- **Clear the GPU model cache** when upgrading across a plugin level that
-  changes the option schema (0015 did; `measured-here`, §7.0.2ac).
+  `MemAvailable`) + pinned memory (the expert bank is pinned USM) + the
+  fence.
+- **VRAM**: size the peak at the deepest prompt, not the post-load free
+  (§3.3); sample fdinfo's `resident-vram0` against `resident-gtt` during a
+  leg.
+- **The A770's GT clock is pinned at 2000 MHz** (operator, 2026-09-27):
+  any clock A/B states the pin.
+- **One fresh process per measurement cell**; a fresh process's first
+  request compiles kernels: label first against warm.
+- **Different prompts per repeated answer** (a repeated prompt hides page
+  cache and expert-cache warmth), and the depth, card, KV types and flags of
+  every number.
+- **Verify the artifact carries the change**: the binary's sha in every leg
+  header; `dpkg -V arcint` for a package leg; the package's ggml-cpu must
+  carry AVX2 (`build-deb.sh` checks `ggml_vec_dot_q4_K_q8_K` for `%ymm`).
 - **One measurement: at most 2 hours**, forecast from a bounded leg; above
   it, the row is "to be determined" (`decision`, operator).
-- Profiles: `PERF_COUNT` reports ~55 % of a kernel's device time and no
-  transfers; use the OpenCL intercept device timeline for shares; a past-0
-  chunk is the cheapest chunk and overstates every node share.
-- Plugin timing tests must allocate operands as `usm_device`
-  (`allocate_memory(layout)` is host memory) and warm three executions.
+- Profiles taken at a past-0 chunk overstate every node share.
 
-## 6. Why the pipeline layer is rewritten
+## 6. Why one engine, and why this one
 
-OpenVINO GenAI's continuous-batching path diverged from its stateful path
-under greedy on this hardware (−2/10 on the code task; openvino.genai#4367),
-its CB-vs-stateful equality test is skipped upstream, and its hybrid-state
-prefix cache checkpoints at memory-tuned intervals; its CB admission refuses
-the coder on the A770 where arcint's measured reservation serves it
-(`measured-here`). The kernels are OpenVINO's; the state, scheduling and
-admission are arcint's.
+The OpenVINO engine came first (0.1-0.5.4): OpenVINO's GPU plugin emitted
+good Xe code and arcint built the serving layer around it. The libllama
+engine (0.5.5, 2026-10-03) replaced it service by service, on measurement
+(`measured-here`):
+
+- **The dense agent** (0.5.6): decode with MTP about twice the OpenVINO
+  service's (47 against 24.6 t/s on the acceptance prompt); prefill at depth
+  since caught up and passed it (695 t/s at 55k, 492 at 138k in 0.7.12,
+  against the OpenVINO service's 852 at 16k and 377.5 at 71.7k).
+- **The coder** (2026-10-05): a searched GGUF that fits 98,304 tokens with
+  MTP on the 16 GiB card and passes the answer-level bar.
+- **Flash-Next** (0.6.0): the OpenVINO engine's best full-depth decode was
+  6.5 t/s with 63 t/s prefill at 20k (the CPU tier computing 64 % of the
+  routed experts); the libllama engine with the expert cache decodes 43.4 and
+  prefills 690 t/s at 20k (0.7.12).
+- **No export step**: the GGUF as published, against a per-model IR export,
+  a template IR for GGUF weights, and the plugin patch series 0003-0077 on
+  a pinned OpenVINO nightly.
+
+From 2026-10-05 nothing in production ran OpenVINO, and the operator retired
+it on 2026-10-15 after this document was rewritten (charter item A6). What
+the OpenVINO era measured and established (the paged executor, the exact
+prefix cache, admission by measured reservation, the plugin's MoE tier, the
+GGUF repack) is at the tag `openvino-history`.
 
 ## 7. State of play
 
@@ -624,403 +567,142 @@ admission are arcint's.
 
 | line | content | state |
 |---|---|---|
-| M0–M6 | skeleton, executor, paged KV + GDN ledger, prefix cache, MTP, all models, two lanes | done (paged path served since 2026-08-29) |
-| M7–M14 (0.3.0) | fit pass, u8:i4 KV, offload v2, M10 re-scoped (§7.0.2ah), drafting II, exporter lowering, vision reserved, CPU tier | done; 0.3.1 tagged 2026-09-05 (`+p6` floor) |
-| 0.4.0–0.4.7 | GGUF checkpoints on a template IR, the K-quant kernel series, host prefix tier | done (`+p7`…`+p15`) |
-| 0.5.0 | Flash-Next serving shape at full depth | released (0.5.0, 0.5.0.1) |
-| 0.5.1 BERLIN, 0.5.2 VENICE, 0.5.3 LISBON, 0.5.4 LYON | Flash-Next fill and quality, expert residency, NVMe/host tiers, stateful prefill and QSA | acceptance closed 2026-10-01 under the operator's re-gating, on readable rows (`docs/window-051.md`…`054.md`); 0.5.4 shipped on `+p25` |
-| next, in order | the adaptive expert cache with the miss split and the pinned bank (§8.1, §8.4, §8.6), the doorbell hand-off (§8.5), multi-draft MTP for Flash-Next (ROMA, §8.3), prefill on the GPU (§8.2) | open (`decision`, operator's architect, 2026-10-01) |
+| 0.1-0.5.4 | the OpenVINO engine: paged KV, prefix cache, MTP, two lanes, the K-quant plugin series, Flash-Next's serving shape and expert tier | retired; `openvino-history` |
+| 0.5.5-0.5.12 | the libllama engine: Intel kernels 0001-0020, MTP drafting, quantized KV, context checkpoints; the agent (0.5.6), the writer (0.5.8) and the coder (2026-10-05) on it | done |
+| 0.6.0-0.6.x | Flash-Next on the libllama engine: the expert cache, the IQ kernels, its MTP layer | done |
+| 0.7.0-0.7.12 | named lanes and the step combiner, two cards by layers, the bank stream, decode launches, GDN snapshots, the CPU misses, the pin moved to `3e4dfa8` | done; 0.7.12 released 2026-10-15 |
+| 0.8.0 | the OpenVINO engine and `marfrit-openvino` retired; this document | in progress (A6) |
+| 1.0.0 | feature complete, almost no gains by obvious changes | charter `docs/milestone-1.0.0.md` |
 
-Charters live in `docs/milestone-0.3.0.md`, `0.4.0`, `0.4.1`, `0.5.0`;
-every open defect or lever since 0.3.1 is a campaign in `docs/campaigns/`.
+Every open lever or defect is a campaign in `docs/campaigns/`.
 
-Current served and development numbers (`measured-here`):
+### 7.1 Current numbers
 
-| configuration | prefill | decode | quality |
+0.7.12's pre-tag check: the release build, the units' flags, one fresh
+process per service, `measured-here`, 2026-10-15. Decode is a 300-token
+answer; prefill excludes nothing (cold lanes).
+
+| service | card | configuration | prefill | decode | answers |
+|---|---|---|---|---|---|
+| agent | B60 | Q4_K_M, 245,760 ctx, q8_0:q4_0 KV, MTP 5 | 695.3 t/s at 54,895 tokens, 491.8 at 138,028 | not in the pre-tag check | Paris, the needle at 138k, the task 10/10 |
+| coder | A770 | `c5f495ac-shq8`, 98,304 ctx, q8_0:q4_0 KV, MTP 4 | 721.0 t/s at 40,841 tokens | 51.1 / 47.6 / 44.0 t/s on three answers | Paris, the needle, the task 9/10 |
+| Flash-Next | B60 + host | IQ2_XS, 131,072 ctx, q8_0 KV, 13,400 MiB of slots (9,724 slots), bank 20.32 GiB, MTP 3 with min-p 0.5, Q4_K draft head, the bank stream, the CPU misses | 690.3 t/s at 20,045 tokens | 43.4 t/s | Paris, the needle |
+
+The agent's decode in the same release: 36.6 / 32.3 / 19.3 t/s at 4k / 29k /
+130k prompt tokens (2026-10-08 protocol; since then 0016-0051 moved it,
+not re-measured as a table). The writer: 25.2 t/s short, 18.2 at 16k
+(0.5.8).
+
+**Against the reference**: Strata's SYCL port on the same B60 decodes 37.8
+t/s on its own request and prefills 620 t/s at the 20k needle
+(`measured-here`, 2026-10-14); arcint 43.8-44.0 and 690 on the same
+request and needle with the CPU misses (charter B3).
+
+**Quality**: Flash-Next IQ2_XS has KL 0.294 nats and top-1 87.1 % against
+unsloth's Q8_0 (16 x 512), outside the answer-level bar; the operator
+accepted the shortfall for the serving shape (A2, 2026-10-15). The other
+quants are options (§7.2). The dense agent's q8_0:q4_0 KV: KL 0.005652 /
+97.30 % against the CPU reference; the coder's searched quant: 0.02367 /
+95.43 % against Q8_0 (`measured-here`, `docs/llama-engine.md`).
+
+### 7.2 Flash-Next quant options
+
+The IQ2_XS file is the serving shape; the others stay available as
+on-demand configurations on the same endpoint (`decision`, operator,
+2026-10-15; `docs/llama-engine.md`, "Flash-Next quant options"):
+
+| GGUF | KL / top-1 against Q8_0 | host bank | state |
 |---|---|---|---|
-| coder, A770 (pinned 2000 MHz), u8, prefill/decode after 4,096 tokens | 1,351 t/s | 44.0–44.3 t/s | Prüfstand 10/10 |
-| coder, B60, u8, ~1k prompt, warm | 2,821 t/s | 66.5 t/s | 10/10 |
-| dense agent, B60, `u8:i4`, MTP on, 151,552 ctx, 850-token prompt | 1,436 t/s | 23.5 t/s | 10/10 |
-| dense agent, same unit, 71.7k-token prompt | 377.5 t/s | 2.2 t/s (MTP at depth, §8.3) | — |
-| 35B native all-resident + dispatch, A770, 4,096 tokens | 961 t/s | 28.1 t/s (32.1 pinned) | 10/10 |
-| Flash-Next `d48q8`, B60, 20k / 27.6k tokens (§3.9) | 63.1 / 61.2 t/s | 6.5 / 6.6 t/s | needle answered; KL below 2,051 0.319 vs base 0.300 |
-| Strata, IQ3_XXS, RTX 5070 + 64 GB (`paper`, README) | 1,750 t/s at 32K | 62 t/s short, 49 at 128K | KL 0.022 against llama.cpp (paper finding 3) |
+| ISTA-DASLab IQ2_XS | 0.294 / 87.1 % | 20.32 GiB | production |
+| ISTA-DASLab IQ3_XXS | 0.218 / 89.7 % (served) | 27.35 GiB at 13,400 MiB of slots | its slot budget and the CPU misses on its layer mix are open (§8) |
+| unsloth UD-Q3_K_XL | 0.100 / 93.3 % | ~39 GiB | inside the bar; needs the planned 96 GB host |
 
-### 7.0.1 Retractions
+### 7.3 Retractions
 
 A mechanism that was narrated and not measured is retracted on the record
-when it falls, rather than edited away (the house rule `CLAUDE.md` cites);
-since 2026-10-01 the retracted text lives in git history and this document
-carries only the corrected fact. The first such correction, kept as a fact:
-decode of a resident model is kernel-bound, and PCIe carries tokens, not
-weights (0.3–1.7 % of a decode step; `measured-here`). The bus is the cost
-only for state snapshots, host round-trips of experts, and offload streaming.
-
-### 7.0.2 Record index
-
-Dated records that other files cite, one line each: what it established that
-is still true. Ids not listed recorded work since superseded or rejected;
-their text is in `git show b0447b8:DESIGN.md`.
-
-| id | established | class |
-|---|---|---|
-| 7.0 | paged decode step 11.3 vs 19.0 ms stateful on the same IR and card (1.68×): the basis for serving the paged path | measured-here |
-| 7.0.0a | at 32k the stateful engine beat GenAI CB 2.8× prefill, 1.5× decode (B60 coder) | measured-here |
-| 7.0.0b | rooflines are quoted from parameter arithmetic (active bytes / bandwidth), never as measured traffic | decision (method) |
-| 7.0.2 | the two cards select different kernels for one graph; a kernel conclusion on one does not transfer | measured-here |
-| 7.0.2a | admission by measured reservation; `GPU_MEMORY_STATISTICS` lumps `usm_host` with device memory if summed blindly | measured-here, code |
-| 7.0.2b | prefill attention runs micro-SDPA with `dpas` (IGC shader dump, u8 and f16); `exec_type` cannot tell micro from opt; head size 256 sits exactly at the micro-SDPA ceiling | measured-here, code |
-| 7.0.2c | served prefill is >99 % graph time; the shared-expert gate at M ≥ 128 is a oneDNN catalog miss (ref kernel) | measured-here |
-| 7.0.2d | the OpenCL device timeline is the share instrument; PERF_COUNT sees ~55 % of kernel time and no transfers | measured-here |
-| 7.0.2e | logits slice on the paged layout, verified by a probe forward at load: prefill +27 %, 2.09 GiB of activation reservation back | measured-here |
-| 7.0.2f | coder decode on its IR (B60, 2026-08-30) was launch-bound in the plugin's per-node host path (~1,130 launches, ~12 µs each; device ~6.5 ms of a ~15 ms step) | measured-here |
-| 7.0.2g, 7.0.2i | `--gate-pad N`: the gate on the jit path, prefill −13 % wall, decode −5 %; off by default | measured-here |
-| 7.0.2h | decode histogram: 2,315 primitives walked, 1,171 launched; ~4 µs per walked, ~3.5 µs more per launched | measured-here |
-| 7.0.2j | prefix-cache replay of real sessions: 97 % of turns hit; 37 % of agent prefill re-prefills evicted sessions | measured-here |
-| 7.0.2k | tool-call arguments handed to the template as an object when it requires one | code |
-| 7.0.2l | `--cache-grid N`: exact on the paged path, ~0.45 s fixed per continuation | measured-here |
-| 7.0.2m | reasoning split into `reasoning_content`; `reasoning_effort` accepted | code |
-| 7.0.2n | the reconstructed MTP head pairs with Intel's public Qwen3.8 IR: 90.8–96.3 % acceptance, +36–48 % decode, 10/10 | measured-here |
-| 7.0.2o, 7.0.2p | Qwen3.6 MoE MTP head (93.9 / 75.4 %); patch 0003 removes 20,480 subbuffer creations per verify | measured-here |
-| 7.0.2q | operator sampler flags and per-response prediction counts | code |
-| 7.0.2r | DFlash2 drafter: 44.8 vs 24.0 t/s plain (dense, B60) | measured-here |
-| 7.0.2t | two-ledger reservation (device vs host-mapped); auto-fit within 0.02 % of the hand-tuned depth | measured-here |
-| 7.0.2u | the served MoE fusion entry is the tiled block (`ConvertTiledMoeBlockToGatherMatmuls`); exporter `--moe-lowering tiled`; `--pin-dispatch` is an opt-in instrument | code, measured-here |
-| 7.0.2v | patches 0004–0007: device slot pool, async uploads; 35B on the A770 0.4 → 9.1 t/s | measured-here |
-| 7.0.2w | `--paged-kv u8:i4` (patches 0008–0010): 8.8 vs 11.3 KiB/token | measured-here |
-| 7.0.2x | CPU tier (0011/0012): 35B A770 ratio 50, 15.0/15.5 vs 10.4/10.6 t/s; the CPU kernel needs a per-source `-O3` | measured-here |
-| 7.0.2y | u8:i4 +28 % auto-fit context on both served configurations; vision IRs never loaded; routing histogram (0013) | measured-here |
-| 7.0.2z | DFlash block/selector options, the cycle dump and the offline oracle (re-rank headroom ≥ +0.744 accepted/cycle) | measured-here |
-| 7.0.2aa | depth table, dense agent, B60, u8: plain decode 22.3/19.9/16.3/12.9 t/s at 9k/38k/76k/143k; DFlash2 window fix (0014) | measured-here |
-| 7.0.2ab | VRAM exhaustion signature under xe; the prefill-chunk belt for 4-bit values on the generic kernel | measured-here, code |
-| 7.0.2ac | patch 0015: `--paged-attention-max-partitions`; clear the model cache across it | measured-here |
-| 7.0.2ad | deep-prompt crash = direct-submission semaphore evicted under VRAM pressure + concurrent load; the reservation is the defence | measured-here |
-| 7.0.2ae | patch 0018 static partition (the default tier mode) and its load-time fixes; its LRU mode is replaced by the adaptive cache (§8.1); adaptive placement is admissible under §3.4 | measured-here, code |
-| 7.0.2af | patch 0017: the tier's 283 µs "readback" was the host waiting for the GPU to reach the layer's router; export `ARCINT_MOE_DEVICE_POOL_BYTES` | measured-here |
-| 7.0.2ag | drafters' rotary kept f32 (overflow at 65,504 zeroed acceptance); MTP state charged 8 KiB/token; at 77k DFlash 18.8, plain 15.3, MTP 4.9 t/s | measured-here |
-| 7.0.2ah | M10 re-scoped: context via u8:i4; the per-expert kernel is `sub4bit-vram-kernel` | decision 2026-09-05 |
-| 7.0.2ai | 0.3.0 gate: plateau probe under the static partition; tier ON decodes faster than OFF (the current references are the generated manifest's, §5.1: `tier-reference-cell` warm 18.2 vs 12.5 t/s, ratio 1.46) | measured-here |
-| 7.0.2aj, 7.0.2ak, 7.0.2al | acceptance runner corrections and the filled references (current values in the generated manifest, §5.1: tier 18.2 t/s, ratio 1.46; coder B60 66.5) | measured-here, code |
-| 7.0.2am, 7.0.2an | turnstile tests synchronise on `issued()`; roundtrip servers probe their own ports (TIME-WAIT collisions) | measured-here |
-| 7.0.2ao | the Prüfstand cell runs through the run manifest and gates the score at 10 | code |
-| 7.0.2ap | patch 0019: the per-expert prefill weight answer is three-way | measured-here |
-| 7.0.2aq | cold start: ~170 s of load-time probe forwards at tier speed, plus the disk; kernel JIT 7 s; lever landed as `--fit-ledger-dir` | measured-here |
-| 7.0.2ar, 7.0.2as | patch 0020: u8:i4 mixed stage on micro-SDPA; prefill parity with u8 at a held chunk | measured-here |
-| 7.0.2at, 7.0.2au, 7.0.2av | the micro path allocates no generic partials; its chunk cap is 2,048; 118k tokens served at every chunk to 2,048 on both cards; package floor `+p6` | measured-here |
-| 7.0.2aw | 0.3.1 deployed; an explicit `--n-ctx` is verify-only | measured-here |
-| 7.0.2ax | agent unit: u8:i4, chunk 512, MTP on, 151,552 tokens | measured-here |
-| 7.0.2ay | GGUF stage 1 (patch 0021, `--gguf`), 10/10 | measured-here |
-| 7.0.2az | patch 0022: K-quant decode split by architecture | measured-here |
-| 7.0.2ba | repack at load into the runtime's compressed form, mins as exact columns, per-type deviation bound | measured-here |
-| 7.0.2bc | patch 0023: decode kernel in llama.cpp's mmvq shape, +20 % served decode at 1k | measured-here |
-| 7.0.2bd | timing method (warm three executions; cold-kernel-cache stall with direct submission); depth captures walk in served chunks | measured-here |
-| 7.0.2be | `--gguf-mode mixed` default, file embedding, `--gguf-check once`, `+p8` | measured-here |
-| 7.0.2bf | same GGUF on the B60: arcint mixed 309 / 13.4, llama.cpp SYCL 249 / 14.2, Vulkan 126 / 7.8 t/s at 1k | measured-here |
-| 7.0.2bg | decode device timeline: fully-connected kernels at 86–89 % of the 453 GB/s ceiling; logits slice for a K-quant head | measured-here |
-| 7.0.2bh, 7.0.2bi, 7.0.2bj | Q6_K decode: read probe, patches 0024–0026 (no shuffles, 224-byte blocks): 400 → 204 µs on the down projection | measured-here |
-| 7.0.2bk | patch 0027: the plugin's runtime fusion check accepts the K-quant kernel; 79 queue drains per step gone | measured-here, code |
-| 7.0.2bl | `--gguf-mins shared|nibble` (inexact, flags) | measured-here |
-| 7.0.2bm, 7.0.2bn | patches 0028–0029: tile in matrix-unit layout, 2D block loads, 64-row tile at 256 GRF on Xe2 | measured-here |
-| 7.0.2bo | `--gguf-mins split`; the runtime's int4 gemm on the repacked set runs at 88 % of the f16 matrix roof | measured-here |
-| 7.0.2bp | patch 0030: 32-row activation reads; warm 1k prefill 1,001 t/s | measured-here |
-| 7.0.2bq | Q5_K served decode row 279 GB/s; open lever a re-blocked Q5_K layout | measured-here |
-| 7.0.2br | A770 read ceiling 414–418 GB/s; parallel repack check; patch 0031 (oneDNN deterministic attribute on f16-activation compressed FCs) | measured-here |
-| 7.0.2bs | patch 0032: micro-SDPA next-K-tile prefetch out of bounds (upstream PR #37878) | measured-here |
-| 7.0.2bt | kernel census of both forms; recurrent-state rows zeroed on the device | measured-here |
-| 7.0.2bu | patch 0033: u8:i4 micro-SDPA V alignment from the value precision; page-order test fills | measured-here |
-| 7.0.2bv | `/props` reports the served path; patch 0035 test fill; patched vs stock runtime identical output and rate on a matched configuration | measured-here |
-| 7.0.2bw | the hidden-state tap knows the K-quant head; MTP on a GGUF-opened model accepts 73 % | measured-here |
-| 7.0.2bx, 7.0.2by | patches 0037/0042: hybrid grouped prefill; gather over the filled count | measured-here |
-| 7.0.2bz | Flash-Next fill: folds undone at the feed, sigmoid gate, tiled key-head pairing; Paris served | measured-here, code |
-| 7.0.2ca | patch 0043: native expert formats; layer 0 corr 0.99991 against llama.cpp | measured-here |
-| 7.0.2cb | B60 GDN state output nondeterministic run to run (0.136 nats); A770 bit-identical; reported upstream as a #38099 sibling | measured-here |
-| 7.0.2cc | patch 0046: census seed; the served pool is `floor(512·(100−R)/100)` slots | measured-here, code |
-| 7.0.2cd | patch 0047: resident-sized slot pool on the per-expert route | measured-here |
-| 7.0.2ce, 7.0.2cf | per-expert route rate and card-vs-host arithmetic, measured before patch 0056; re-measurement owed | measured-here |
-| 7.0.2cg | staged n-gram table: 2.884 MiB instead of 26.82 GiB, depth-4 output byte-identical | measured-here |
-| 7.0.2ch | patch 0049: NVMe → VRAM pinned fill at load (arcwell, B60) | measured-here |
-| 7.0.2ci | 35B full depth all-resident on the A770 (0054–0058, `--dense-u8`); q, k and v all compressed are miscomputed by the plugin's horizontal fusion, so k/v and the shared expert stay plain | measured-here |
-| 7.0.2cj, 7.0.2ck, 7.0.2cl, 7.0.2cm, 7.0.2cn, 7.0.2co | 35B native prefill @4096: 12.5 → 143.9 (0059) → 222.9 (0060) → 349.9 (logits axis, CPU embeddings in RAM) → 625.7 (0061) → 653.7 (0062) → 952.1 t/s (0064) | measured-here |
-| 7.0.2cp, 7.0.2cq | patches 0065/0066: Flash-Next prefill 1.04 → 6.4 t/s (A770) | measured-here |
-| 7.0.2cr, 7.0.2cs | 40 per-layer routing waits; patch 0067 routes decode on the device: 19.3 → 28.1 t/s | measured-here |
-| 7.0.2ct, 7.0.2cv | A770: served dense decode GEMMs run up to 3.7× their isolated time; after a ≥ 20 MiB read-only kernel the next GEMM is slower; open | measured-here |
-| 7.0.2cu | the tier-off offload rate depends on the host page cache; a ctest allow-list fix | measured-here |
-| 7.0.2cw | A770 clock pin 2000 MHz: frequency transitions removed | measured-here |
-| 7.0.2cx | patch 0068: Flash-Next decode 1.8–2.2× (A770) | measured-here |
-| 7.0.2cy | one Flash-Next compile in 40.1 s, under the 45.2 s bound | measured-here |
-| 7.0.2cz | the partition keys on `weight_0`'s `.bin` offset; equal resident sets give equal bits; the in-graph IQ4_NL scale decode made f16-exact | measured-here, code |
-| 7.0.2da | patch 0072: host expert bank, first answer −18…−21 % (B60) | measured-here |
-| 7.0.3 | KV precision, below | measured-here |
-| 7.1 | the 35B runs on the A770 through `OFFLOAD_RATIO`; superseded in rate by the native all-resident route | measured-here |
-| 7.2 | two lanes, below | measured-here |
-
-### 7.0.3 KV precision on the paged path
-
-`measured-here`, coder unless named:
-- u8 costs 11.3 KiB/token against f16's 20.0 (0.565×: per-block scales); at
-  262,144 tokens 2.83 against 5.00 GiB.
-- Decode: u8 +2.5 % at 32k, f16 +7.8 % at 53.5k (the crossover between them
-  is not located). Prefill: u8 +3.1 % at 14k, −16.5 % at 58k, −22 % at 115k.
-- Symmetric u4 quarters the memory and costs 6 % decode at 32k (the attention
-  kernel +63 %).
-- u8:i4 on `+p6`: prefill at u8's rate at a held chunk; context +28 %.
-- **Default u8**, chosen on what fits rather than what benchmarks: it is the
-  setting that does not refuse (B60, two lanes at 262,144: u8 22.04 of
-  22.71 GiB, f16 refused). `--paged-kv f16` suits a one-lane deep-context
-  endpoint with room.
-- The pool is sized in bytes and live pages are a count
-  (`n_ctx / 16 + 2` per lane), so everything that costs bytes comes out of
-  the prefix-cache reserve; the context ceiling is the depth where that
-  reserve reaches zero. Auto-fit leaves no reserve unless
-  `--prefix-cache-reserve PCT` asks for one.
-
-### 7.1 The 35B on the A770
-
-`--offload-ratio` (the plugin's `OFFLOAD_RATIO`) first made the 17.4 GiB
-int4 35B load on the 15.1 GiB card; with the device slot pool and the CPU
-tier it serves at 15–18 t/s decode (§7.0.2v, §7.0.2x, §7.0.2ai); the native
-packed-u8 artifact serves it all-resident at 28.1 t/s decode and 961 t/s
-prefill (§7.0.2cs). `measured-here`.
-
-### 7.2 Two lanes, measured (M6)
-
-B60 coder, u8, `--parallel 2` (`measured-here`): the second lane's
-activations cost 0.001–0.003 GiB (pooled per compiled model); single-stream
-decode 67.6 vs 68.8 t/s (−1.7 %); an agent session plus a subagent: 32.5 and
-31.1 t/s, stall p95 17 ms, max 516 ms (one 309-token chunk); Prüfstand 10/10
-on each lane concurrently. Admission on the A770 at two lanes: 44,608
-tokens per lane at `n_ctx` 8,192 / chunk 256, refusal with the terms at
-65,536.
+when it falls, rather than edited away (`CLAUDE.md`). The retracted text
+lives in git history and in the campaign documents; this document carries
+the corrected fact. Two that shaped the work: a repeated prompt's warm page
+cache was once read as a 28 t/s IQ3_XXS decode (4-5 t/s from ZFS); and every
+package from 0.5.5 to 0.7.11 shipped an SSE-only ggml-cpu (the recipe's
+`SOURCE_DATE_EPOCH` turned `GGML_NATIVE` off), found in 0.7.12 when the
+CPU misses made it cost 7.7 %.
 
 ## 8. Open items, against the references
 
-Each item names the reference implementation to follow (paths verified in
-`~/src/Strata-ref` at `c499bd1` and `~/src/FreeToken-ref`), the reference's
-measured effect, and arcint's measured starting point. Where arcint built
-something differently before, the item says what to match; it does not
-carry a verdict.
+Each item names the reference to follow and the measured starting point.
 
-Build order (`decision`, operator's architect, 2026-10-01): the adaptive
-expert cache with its miss split and the pinned bank (§8.1, §8.6, §8.4: one
-mechanism in Strata, one campaign, `expert-hot-set-lru`), then the doorbell
-(§8.5), then multi-draft MTP (§8.3), then prefill on the GPU (§8.2).
+### 8.1 The soak (charter C2)
 
-### 8.1 Let the GPU expert cache learn the conversation
+Several days of the three services under real use on both cards, logged:
+no wedge, no eviction, no restart. The record has the B60's wedge after a
+long idle, xe eviction at thin VRAM margins and copy-engine resets, each
+recovered, none soaked.
 
-The design follows Strata alone, the reference written for this model
-(`decision`, operator's architect, 2026-10-01).
-- **Reference** (`code`, `~/src/Strata-ref`). Per-layer slot budgets fixed
-  at start, slots sized in bytes per layer, the budgets drawn from one
-  global usage profile built from decode routing (`tools/make_profile.py`;
-  the fill in `src/program/generate.cpp:2826–2845`;
-  `include/strata/core/expert_cache.hpp:72` `open_sized`). Swaps are
-  batched within each layer from decayed usage counts
-  (`generate.cpp:4413–4482`): candidates with usage ≥ 2.0, victims by least
-  usage, a swap only when the gain exceeds 1.5, the top 96 swaps by gain
-  across layers, every count decayed ×0.7 per adapt call; Strata adapts
-  every 4 verify windows (`adapt_every` :358, `adapt_swaps` :380). Admission
-  never blocks: the victim leaves the residency table at once (the CPU
-  computes it meanwhile) and the newcomer is admitted when its copy lands
-  (`pending`, `apply_pending`). Slot storage and the byte-compare
-  `verify_slot` are `src/core/expert_cache.cpp`.
-- **Effect** (`paper`, Strata §6): profile fill 0.50 → adaptive 0.72 hit
-  rate (finding 4); no-wait admission 91.7 → 94.4 t/s (finding 10); slots
-  sized in bytes per layer +13 % decode (finding 8).
-- **arcint now**: static partition + census seed; 36 % GPU hits, 308 tier
-  experts per decode token on Flash-Next `d48q8`, B60 (`measured-here`). An
-  offline replay of arcint's own routing: per-layer LRU 55.6 / 69.2 % against
-  the census partition's 21.2 / 38.5 % at 32 / 64 slots per layer
-  (`measured-here`, `docs/campaigns/expert-hot-set-lru.md`). In progress
-  (campaign `expert-hot-set-lru`; plugin patch 0076, replacing the
-  `MOE_CPU_TIER_PARTITION=lru` mode on the kept slot pool of 0005–0007 and
-  0070). arcint has no Flash-Next MTP yet, so the cache adapts every 12
-  decode tokens (Strata's 4 windows of 2.4–3.2 tokens) until MTP lands.
-- **Owed in the same build**: the bank pinned (§8.4) and the
-  `tier_prefix_cache_decision` change (§3.4). The partition layer key
-  (§8.10) matters only for static census seeds.
+### 8.2 Owed from the pin move to `3e4dfa8`
 
-### 8.2 Read prompts on the GPU, streaming the missing experts
+The patches' own red cases and the four-sequence KL arms on the new base
+(`contrib/llama.cpp/README.md`, "Moving the pin", step 3). Upstream's open
+work that meets the series (`docs/campaigns/research-upstream-llama-2026-10.md`):
+the OpenCL backend split into per-op files (#29354, the natural shape for
+upstreaming), #30345 (supersedes 0010), #26631 (MUL_MAT_ID id -1), #30539
+(OpenCL declining tensors above the device's largest allocation: check
+before a move past it).
 
-- **Reference.** Strata: from chunk 1,024 every non-resident expert of every
-  layer streams in a fixed order through a ring of slots borrowed from the
-  expert cache, copies overlapping compute, quantised (MMQ) grouped kernels,
-  chunks up to 8,192 (`src/prefill/prefill.cpp:71–102`,
-  `include/strata/prefill/moe_mmq.hpp`; the comment there records 384 ring
-  slots at 8,192-token chunks at 1,294 t/s). FreeToken: two whole-layer
-  buffers, the next layer copied on `prefill_copy_stream` with ready/release
-  events while the current one computes
-  (`python/freetoken/moe/offload_cache.py:606–691`,
-  `python/freetoken/layers/moe.py:344–370`).
-- **Effect**: Strata IQ3_XXS 1,750 t/s at 32K (`paper`, README); prompt
-  speed flat from 4K to 262K, 539 → 496 t/s on Q2_0 (`paper`, finding 11).
-- **arcint now**: 61–68 t/s at 20–27k on Flash-Next `d48q8`, B60; the CPU
-  tier takes ~138–152 ms per MoE layer call at chunk 512 (`measured-here`).
-  The campaign's first build used CPU-thread copies into separate pinned
-  staging beside the bank, one queue, no prefetch and chunk 512 (2,048
-  crashed, uninvestigated); match the references instead: a batch-sized ring
-  borrowed from the slot pool so the bank keeps the whole host tier, a second
-  queue with cross-queue events, the next layer prefetched, chunk ≥ 2,048
-  (`docs/campaigns/prefill-expert-streaming.md`). Depends on §8.4.
+### 8.3 Flash-Next's quant options
 
-### 8.3 Draft several tokens with the model's own MTP layer
+- **IQ3_XXS**: the CPU misses (0056) fault on its layer mix (down IQ4_NL ×
+  18 and Q2_0 × 30; gate/up IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS); without
+  them it decodes 6.4-11.7 t/s at a peak of 24,440 MiB, thrashing: its slot
+  budget must come down to about 12,000-12,700 MiB (`measured-here`,
+  2026-10-15).
+- **UD-Q3_K_XL**: served at 235 t/s prefill and 12-13 t/s decode without
+  MTP before the bank stream and the CPU misses (2026-10-06); re-measure on
+  the 96 GB host.
 
-- **Reference.** Strata fetches the 31 `mtp.*` tensors from the BF16
-  checkpoint (`tools/mtp_fetch.py`), drafts up to 3 tokens kept while the
-  MTP layer is ≥ 50 % confident, verifies them in one window through all 48
-  layers, and lets the MTP layer attend only to the last 32,768 positions
-  (`include/strata/core/mtp.hpp`, `src/core/mtp.cpp`; `paper` §3.3, §3.7).
-- **Effect**: 1.6–1.8× decode with CPU-held experts, 47–57 → 82–92 t/s at
-  4K (`paper`, finding 2); speculative output token-for-token equal to
-  greedy (finding 3).
-- **arcint now**: the Flash-Next head's 31 tensors were fetched on
-  2026-09-11 (`tools/fetch_safetensors_tensors.py`, 4.856 GiB, sha-checked)
-  but never exported or served for Flash-Next (ROMA R1). Speculation serves
-  greedy requests only (§3.5); sampled requests are open (Strata's paper
-  lists temperature sampling by rejection in the verify window, `paper` §7).
-  On the dense agent arcint drafts one
-  token per cycle and the MTP layer keeps f32 state over the whole prompt
-  (8 KiB/token): at 77k the cycle is 390 ms against a 130 ms break-even
-  (4.9 t/s against plain 15.3), and the served unit decodes 2.2 t/s at 71.7k
-  (`measured-here`; campaign `mtp-cycle-wall`). Build multi-draft MTP with a
-  bounded MTP attention window; use DFlash2 at depth meanwhile.
-
-### 8.4 A pinned host bank
-
-- **Reference.** Strata keeps every expert in one pinned RAM arena, the
-  source of its swap copies and of the GPU's miss reads
-  (`include/strata/core/pinned.hpp` `PinnedArena`, `src/core/pinned.cu`;
-  `code`).
-- **arcint now**: the bank (patch 0072) is anonymous pageable memory. The
-  dev host's TTM pinned cap was raised to 40 GiB on 2026-10-01 (operator), so
-  a 30 GiB pinned bank fits. Owed in the same build as §8.1 (campaign
-  `expert-hot-set-lru`): allocate the bank as pinned USM-host. §8.1, §8.2
-  and §8.6 depend on it.
-
-### 8.5 Take the host out of the per-layer hand-off
-
-- **Reference.** Strata's doorbell: a kernel writes x, the expert ids and the
-  weights into mapped pinned memory with a system fence, the CPU spins on it,
-  a GPU wait kernel polls a host flag, and the whole pass is a recorded graph
-  replayed per window (`src/core/layer.cpp`: `doorbell_init`, `moe_route`;
-  `src/kernels/cuda/elementwise.cu:206–311`;
-  `src/kernels/cuda/verify_kernels.cu:426`; capture and replay in
-  `src/core/verify.cpp:889–1058`). FreeToken's GPU-slot decode is device-side
-  with fixed shapes and graph-capturable
-  (`python/freetoken/layers/moe.py:255–268`). Intel equivalents:
-  `cl_khr_command_buffer`, Level Zero command lists (the pinned plugin's L0
-  runtime creates immediate lists only, `code`, so a replayable pass is
-  plugin work).
-- **arcint now**: on the Flash-Next tier route the GPU idles ~46–50 % of
-  decode wall; per token 47.2 ms waits on the tier's writeback and 31.3 ms
-  is readback/staging round trips (`measured-here`). Device-side routing on
-  the all-resident 35B gave +45 % decode (§7.0.2cs). Patch 0075 (not in the
-  series) removed only the writeback copies; the x/id readback hops and the
-  per-layer host block remain. Build the doorbell shape on the tier route.
-
-### 8.6 Split each layer's misses between the link and the CPU
-
-- **Reference** (`code`, Strata). A share of each layer's distinct missed
-  experts is read by the GPU over the link from the pinned arena while the
-  CPU computes the rest, concurrently; those experts are not cached (the
-  cache changes only by the swaps of §8.1)
-  (`src/core/expert_source.cpp:1614–1696`; `src/program/generate.cpp:355`
-  `pcie_mode`; `include/strata/core/verify.hpp:150`). The share for
-  native/i-quant packs is set from a link probe at load
-  (`generate.cpp:1709–1724`): `pcie_frac = min(0.55, max(0.05, 0.55 ×
-  link_GBps / 26))`, the full 0.55 from 20 GB/s up, none below 4 GB/s.
-- **Effect** (`paper`, Strata finding 9): 55 % of misses over the link for
-  i-quants on its x16 card, IQ3_XXS 56 → 65 t/s.
-- **arcint now**: the CPU tier computes every miss. At this host's pinned
-  link (13.9 GB/s, §2) the formula gives a share of about 0.29. Built in the
-  same campaign as §8.1 (`docs/campaigns/expert-hot-set-lru.md`), from the
-  pinned bank (§8.4), the link probed at load.
-
-### 8.7 Keep conversation state between requests
+### 8.4 Conversation state across a restart
 
 - **Reference.** Strata parks conversations (GDN state, PLE tails, KV) and
-  reuses them on token equality, beside its adaptive expert cache
-  (`include/strata/core/conversation_cache.hpp`, `conversation_snapshot.hpp`;
-  README: follow-ups read only what is new). FreeToken snapshots recurrent
-  state at tool-call anchors (`python/freetoken/scheduler/cache.py:151`
-  `snapshot_toolcall_anchor`).
-- **Effect**: the largest single improvement for agents (`paper`, Strata §7:
-  a 30-second re-read of a long chat becomes a fraction of a second).
-- **arcint now**: the prefix cache and its host tier exist (§3.4, §4.4); with
-  the CPU tier the code still refuses the pair. The libllama engine keeps
-  llama.cpp server's context checkpoints of the recurrent state in process
-  (`docs/llama-engine.md`, 2026-10-05). Restart persistence is the
-  `kv-checkpoint-restore` campaign (backlog).
+  reuses them on token equality (`include/strata/core/conversation_cache.hpp`,
+  `conversation_snapshot.hpp`); FreeToken snapshots recurrent state at
+  tool-call anchors (`python/freetoken/scheduler/cache.py:151`).
+- **arcint now**: checkpoints in process only (§3.4); the campaign is
+  `kv-checkpoint-restore` (backlog).
 
-### 8.8 The CPU tier's arithmetic
+### 8.5 DFlash2 on the agent
 
-- **Reference.** ggml dots in the quantised domain against an activation
-  quantised once per token (`vec_dot_iq3_xxs_q8_K`, `vec_dot_iq4_nl_q8_0`,
-  read in llama.cpp's source for `docs/campaigns/host-expert-bank.md`;
-  llama.cpp is not checked out under `~/src`), with a batched path for
-  prefill; Strata: decoding once for several tokens 2.0–2.4×, i-quants
-  ~5 GB/s per core (`paper`, finding 7).
-- **arcint now**: patch 0074 brings the decode-shaped call to 651 µs per
-  layer against llama.cpp's `mul_mat_id` at ~540 µs (1.21×); prefill calls
-  keep the f32 path at ~152 ms against 116.5 ms per chunk-512 call (1.30×)
-  (`measured-here`). Port ggml's batched prefill dot. Worker spin before
-  sleeping measured +6.4 % prefill with decode unchanged (0075's spin arm,
-  `measured-here`) and passes the per-phase gate: re-land it on its own.
-  Per-core pinning: llama.cpp at cold DRAM is 10–30 % faster on 8 physical
-  cores than 16 SMT threads (`measured-here`).
+llama.cpp at the pin carries DFlash and DFlash2 drafting (`draft-dflash`,
+`src/models/dflash.cpp`, `code`). On the OpenVINO engine DFlash2 decoded
+44.8 against MTP's 33.0 t/s at short depth (`measured-here`, 2026-09). Not
+wired on the libllama engine, unmeasured.
 
-### 8.9 Sparse attention served as the reference serves it
+### 8.6 Levers priced below 2 % (charter B1)
 
-- **Reference.** Strata serves Qwen Sparse Attention natively: indexer,
-  selection and sparse decode/prompt attention kernels
-  (`src/kernels/cuda/native_qsa_indexer.cu`, `qsa_select.cu`,
-  `qsa_decode_attn.cu`, `qsa_prompt_attn.cu`), the indexer appended at
-  commit so speculation works with it (`src/core/verify.cpp:990`).
-- **Effect**: prompt speed flat to 262K (finding 11); long context costs
-  VRAM, not compute (finding 12) (`paper`).
-- **arcint now**: QSA serves correctly but non-default through patch 0073
-  (`d48q8qsa`): decode 0.87× dense, prefill 1.27× slower, `n_ctx` ≤ 32,768
-  under a fixed block cap (`measured-here`; `docs/campaigns/qsa.md`). Its
-  refusals of `--parallel` > 1, the prefix cache and paged speculation are
-  owed a change: Strata appends to the indexer at commit
-  (`src/core/verify.cpp:990`, `native_qsa_indexer_append`; `code`), so the
-  indexer state follows the accepted tokens.
+Priced by a ceiling and not built (`measured-here`, 2026-10-15): the GDN
+conv stage fused (vllm-xpu-kernels; ~1.1 % of the agent's decode, ~1.4 % of
+the coder's); the activation quantization folded into its producers
+(OpenVINO's post-op fusion; at most ~1.4 % of a round); Infernix's global
+expert pool (+0.4 points of hits, ~0.5 %); the rest of the decode kernel
+count (~13 % of a Flash-Next round, many small fusions, none obvious alone).
 
-### 8.10 Other open items
+### 8.7 Interface (charters A7, C4)
 
-- **Partition layer key** independent of the `.bin` layout (plugin; moves
-  every recorded static-partition digest and the seed key space;
-  `measured-here`, §7.0.2cz).
-- **The KLD reference re-capture** with the fixed BF16 feed; until then rows
-  ≥ 2,051 and the `d48q8` served KL/argmax row are owed (`measured-here`;
-  `qsa` T8).
-- **§5's cells and generated manifest** restated to the answer-level bar
-  (`decision`, 2026-10-01).
-- **B60 GDN run-to-run nondeterminism**: mechanism open at execution level in
-  the GDN state output (`measured-here`;
-  `docs/campaigns/served-prefill-determinism.md`).
-- **A770 dense GEMM slowdown in the served graph** and the post-footprint
-  penalty (`measured-here`, §7.0.2ct, §7.0.2cv); per-kernel hardware
-  counters not yet obtained.
-- **Horizontal fusion of compressed q/k/v** in the plugin miscomputes; k/v
-  stay plain until its mechanism is found (`measured-here`, §7.0.2ci).
-- **Per-expert dispatch readings before patch 0056** to re-measure
-  (`measured-here`, §7.0.2ce–cf).
-- **Hybrid prefill descriptor M** keyed on the routing-dependent filled count
-  can rebuild grouped primitives per prompt; bucket it (`code`, §7.0.2by).
-- **Plugin framework**: `primitive_inst::realloc_intermediates` changes an
-  intermediate's identity without forcing an argument rebind (`code`; patch
-  0015 carries a local fix); upstream.
-- **GGUF path**: a re-blocked Q5_K layout (§7.0.2bq); an 85-token prompt
-  alternates between two texts on the GGUF forms (unattributed;
-  `measured-here`).
-- **KV codec beyond u8/i4**: NInfer's int8 group-64 codec with a fused
-  256-wide Hadamard pre-rotation (`code`:
-  `~/src/ninfer/src/ops/kv_cache/int8_g64_codec.cuh`, `hadamard_d256.cuh`);
-  a custom kernel here ships with a fusion-impact profile of the surrounding
-  graph.
-- **Direct-submission fault**: the kernel-side ring-ordering fix
-  (`drm/xe` "Order ring writes before ring tail updates", in 7.1.y stable;
-  `code`) on the dev host is the operator's decision.
+Which switches and flags stay stable within 1.x is the operator's
+(`docs/switches.md`). `/props` reports `kv_dtype` "f16" whatever
+`--llama-kv` says (`code`: `backend_llama.cpp`), owed a fix with the
+interface cleanup.
+
+### 8.8 Other open items
+
+- **The B60's run-to-run determinism** on this engine is not measured; the
+  OpenVINO path's GDN state output was not bit-identical on the B60 (0.136
+  nats mean between identical forwards) and was on the A770.
+- **xe page faults** with compute-engine resets logged in windows where
+  `test-backend-ops` ran (2026-10-03); a full `MUL_MAT`/`MUL_MAT_ID` run
+  reproduced none; not attributed.
+- **The direct-submission fault**: the kernel-side ring-ordering fix
+  (`drm/xe` "Order ring writes before ring tail updates") on the dev host is
+  the operator's decision.
 - **Multimodal**, an Anthropic Messages adapter and a local CLI: not
-  committed (`decision`, operator, undated in the record); the request
-  parser rejects non-text content parts.
+  committed (`decision`, operator); the request parser rejects non-text
+  content parts.

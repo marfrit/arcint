@@ -1,7 +1,13 @@
 # prefill-expert-streaming — Flash-Next prefill computes every expert on the card, streaming the non-resident ones
 
-**Open** (reopened 2026-10-01 against the references). Lever 2 of
-`research-reference-audit.md` §4.
+**Closed 2026-10-11** on the libllama engine: `contrib/llama.cpp` 0032 (with
+`GGML_OPENCL_BANK_STREAM=1` each bank tensor is copied whole on a copy queue
+into a ring of VRAM slots ahead of its GEMM) and 0044 (the stream from 256
+tokens a ubatch, a gather below). Flash-Next's 20k needle on the B60: 408 ->
+640-645 t/s in 0.7.3, 690.3 in 0.7.12 against Strata's 620 on the same card
+(`measured-here`). The text below is the plan as written on 2026-10-01
+against the OpenVINO engine's CPU tier (retired, `docs/history.md`); the
+reference reading still holds.
 
 ## Charter
 

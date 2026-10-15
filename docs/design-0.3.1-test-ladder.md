@@ -6,7 +6,8 @@
 HTTP round trip, the stub-only stress test, and the acceptance enumeration's
 own checks `acceptance-enumeration` and `acceptance-runner`). Card-requiring
 cells are registered only under `-DARCINT_ACCEPTANCE=ON`, which configure
-refuses without `-DARCINT_OPENVINO=ON`, each with `LABELS acceptance`. Bare
+refuses without a serving engine (`-DARCINT_LLAMA=ON` since 0.8.0;
+`-DARCINT_OPENVINO=ON` before), each with `LABELS acceptance`. Bare
 `ctest` in a default build therefore runs exactly the unit set; the package
 recipe runs `ctest -L unit`. A unit case asserts only properties of arcint's
 own code; where it needs a host capability it probes and skips with a reason,
@@ -16,7 +17,8 @@ and `unit` runs with `--max-skips 0`.
 
 The cells are enumerated in `tests/acceptance/cells.json` (runner, artifact and
 card class, flags, gates, reports, references, timeout). Their parameters come
-from CMake cache variables (`ARCINT_ACCEPTANCE_MODEL_ROOT`,
+from CMake cache variables (since 0.8.0 the GGUFs, `ARCINT_ACCEPTANCE_GGUF_*`,
+and before them `ARCINT_ACCEPTANCE_MODEL_ROOT`,
 `ARCINT_ACCEPTANCE_DEVICE_LARGE`, `ARCINT_ACCEPTANCE_DEVICE_SMALL`,
 `ARCINT_ACCEPTANCE_PRUEFSTAND`) written into a generated `run_manifest.json`.
 The acceptance entry point is `tests/acceptance/run.py`, never bare `ctest`: a

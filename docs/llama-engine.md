@@ -1,6 +1,6 @@
 # The libllama engine (since 0.5.5)
 
-arcint serves without OpenVINO: `--engine llama --gguf FILE` runs the GGUF
+arcint's engine: `--engine llama --gguf FILE` runs the GGUF
 through libllama with ggml's OpenCL backend on the Arc card
 (`src/exec/backend_llama.cpp`). arcint keeps the HTTP server, the chat
 template rendering (the GGUF's own template), the sampler, stop handling and
@@ -33,7 +33,7 @@ the weights dequantized per work-group tile, for `MUL_MAT` and `MUL_MAT_ID`
 
 Patches 0002-0008 add the IQ types (Flash-Next), the gated delta-net,
 the decode's small kernels, the few-row F32 projections, a MoE GEMM in the
-shape of arcint's OpenVINO patch 0064, decode attention that does not
+shape of arcint's OpenVINO plugin patch 0064 (at the tag `openvino-history`), decode attention that does not
 slow with context, and prompt attention on the XMX units
 (`contrib/llama.cpp/README.md`, one section per patch).
 
@@ -74,7 +74,7 @@ The coder's step from 20.9 to 37.7 t/s decode in 0001 was the placement
 fix alone: the same kernels, the 60 small tensors of its gated delta-net
 layers on the card.
 
-For scale, the OpenVINO path (README): coder 1,379 prefill (4k) / 43.9
+For scale, the retired OpenVINO engine (`docs/history.md`): coder 1,379 prefill (4k) / 43.9
 decode, dense 1,141 / 24.6 (MTP on), 24.0 plain. What is left
 (`measured-here`, profiles with `GGML_OPENCL_PROFILING`; the ranked levers
 are in `docs/campaigns/llama-engine-kernel-gap.md`):
@@ -300,6 +300,30 @@ GGUF's MTP layers count only when this GGUF's MTP block is loaded
 - The load log has an `expert cache:` line per card, and after each request
   a line per card next to the summed one.
 
+### Flash-Next quant options
+
+The operator settled the serving shape on 2026-10-15 (charter A2): ISTA-DASLab's
+IQ2_XS is the production file, its KL shortfall against unsloth's Q8_0
+accepted; the other quants stay available on demand, on the same endpoint
+and served name, one at a time (`measured-here` unless marked):
+
+| GGUF | KL / top-1 vs Q8_0 (16 x 512) | host bank at the unit's slots | state |
+|---|---|---|---|
+| ISTA-DASLab GSQ-RCO IQ2_XS (shard 1 39.2 GB) | 0.294 / 87.1 % | 20.32 GiB at 13,400 MiB | production, 43.4 t/s decode, 690 t/s prefill at 20k (0.7.12) |
+| ISTA-DASLab GSQ-RCO IQ3_XXS (shard 1 47.0 GB) | 0.218 / 89.7 % (served) | 27.35 GiB at 13,400 MiB; 28.72 GiB at 12,000 | open: at 13,400 MiB of slots the card thrashes (peak 24,440 MiB, 6.4-11.7 t/s without the CPU misses); the CPU misses fault on its layer mix (DESIGN §8.3) |
+| unsloth UD-Q3_K_XL (3 shards, 90 GB) | 0.100 / 93.3 %, inside the bar | ~39 GiB | 235 t/s prefill, 12-13 t/s decode without MTP (2026-10-06, before the bank stream and the CPU misses); needs the planned 96 GB host |
+
+The IQ3_XXS file mixes its expert types by layer: gate/up IQ2_S in 10
+layers, IQ2_XS in 10, IQ2_XXS in 9, IQ3_S in 13, IQ3_XXS in 6; down IQ4_NL
+in 18, Q2_0 in 30 (`code`, gguf-py).
+
+Every option needs its file on the NVMe, not the ZFS pool (an IQ3_XXS answer
+from ZFS decodes at 4-5 t/s, bound by storage reads), its host bank free
+beside the page cache (the bank is pinned), and a slot budget measured at the
+20k needle against the card's peak (`--llama-expert-cache`, §"The expert
+cache"). The units are on-demand variants of the Flash-Next unit with the
+same port and served name, conflicting with each other.
+
 ## MTP (`--llama-mtp N`)
 
 The GGUF's own MTP head drafts up to N tokens; the target verifies them in
@@ -447,8 +471,9 @@ drafting (`code`):
 - the converter in `convert_hf_to_gguf.py`.
 
 arcint's engine wires only the GGUF's MTP head (`src/exec/llama_spec.cpp`).
-DFlash2 runs on the OpenVINO engine (`--dflash`). Wiring llama.cpp's
-DFlash2 into this engine is open and unmeasured.
+DFlash2 ran on the retired OpenVINO engine (`--dflash`, 44.8 t/s against
+MTP's 33.0 there). Wiring llama.cpp's DFlash2 into this engine is open and
+unmeasured (DESIGN §8.5).
 
 **Verify attention at depth (0.5.7, `contrib/llama.cpp` 0016).** On the
 B60, MTP verify calls (4-8 rows) take a kernel that reads K/V once per KV
@@ -516,7 +541,7 @@ logits, a larger slice than the table above). Served with `--n-ctx 98304
 Both pass the answer-level bar against Q4_K_M (top-1 -0.20 and -0.10
 points, KL lower). The operator moved the coder service to this engine with
 `c5f495ac` on 2026-10-05, and to `shq8` the same evening. The OpenVINO
-service stays as the way back.
+service was its way back until that engine was retired (0.8.0).
 
 llama.cpp's own loop (`llama-speculative-simple`, raw prompt) for
 reference: coder 68.1 t/s with 2 drafts, dense 31.9 with 3; four drafts
@@ -699,7 +724,7 @@ A context is a multiple of 256, at most the model's trained context, at most
   (`docs/campaigns/lanes-agent-subagent.md`). Without MTP the lanes still
   take turns, one lane per `llama_decode`.
 
-## Not yet on this engine
+## Open on this engine
 
 Conversation state kept across a restart (P6; in process it is the context
 checkpoints above) and GPU prefill from the pinned bank (P5) are open.
