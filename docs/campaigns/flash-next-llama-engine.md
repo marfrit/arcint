@@ -1552,7 +1552,10 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
   layer call; every used bank expert a candidate, not only the step's
   misses); the exact form (`LLAMA_EXPERT_CACHE_LFRU_EXACT=1`) measured
   between the port and Strata's rule, so the reference's mechanism pays
-  here too. Infernix's global
+  here too. The cadence (Infernix admits every round; here at each adapt):
+  every 6 tokens at budget 4 39.1 / 39.9 / 42.2 t/s, every 3 at budget 2 or
+  4 38.8-38.9 / 39.7 / 42.1-42.2, every 12 at budget 8 38.3 / 39.6 / 42.3
+  (one process each, the same texts): the defaults stay. Infernix's global
   pool (one capacity over all layers) is not built: the slots are
   per-layer tensors.
 - **The input copies.** The OpenCL backend has no events and no async copy,
