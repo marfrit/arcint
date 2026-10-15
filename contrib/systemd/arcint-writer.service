@@ -17,7 +17,7 @@
 Description=arcint-writer — Cydonia 24B v4.3 on libllama, GPU.0, :8088, on demand
 Documentation=https://github.com/marfrit/arcint
 After=default.target
-Conflicts=arcint-agent.service arcint-flashnext.service arcint-flashnext-iq3xxs.service
+Conflicts=arcint-agent.service arcint-flashnext.service arcint-flashnext-iq2xs.service
 
 [Service]
 Type=simple
