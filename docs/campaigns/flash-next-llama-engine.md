@@ -1508,6 +1508,22 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
   `num_accepted - 1`, no copy back; its conv kernel keeps one window and
   stages a multi-token step through a temporary) is a change to the memory
   module's rollback, not a fusion. Below the charter's 2 %; not built.
+- **The activation quantize, priced** (`measured-here`, 2026-10-15, llama
+  tree `p0054-conv-ceiling`, not in the series): the OpenVINO-style post-op
+  fold would write the q8_1 activation in its producer instead of a launch
+  of its own (one a quantized matvec input; q/k/v and gate/up already share
+  one). `GGML_OPENCL_KQ_QUANT_CEILING=1` skips the launch (the matvec reads a
+  stale buffer):
+  - the dense agent (B60, MTP 5): every draft rejected but the answers right
+    (its 6-row verify does not take this path); at 4.95 drafts a round the
+    propose step 8.9 -> 8.3 ms and the verify 61.2 -> 60.8 ms, ~1.4 % of a
+    ~70 ms round as the whole ceiling;
+  - the coder and Flash-Next: empty answers (their verify depends on it), no
+    round to compare. Flash-Next's verify graph has 284 quantize launches
+    (0.7.5 profile); at 0049's rate (~0.4 % of decode a hundred launches)
+    that is ~1.1 %.
+  A fold keeps the quantization work and removes the launch: below the
+  charter's 2 % on each service; not built.
 - **The input copies.** The OpenCL backend has no events and no async copy,
   so the scheduler synchronizes the queue and writes blocking for each of a
   verify's 34 inputs (positions, masks, indices): 17 us a pair on the B60
