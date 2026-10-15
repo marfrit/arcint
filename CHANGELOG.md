@@ -18,6 +18,43 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.7.10 — 2026-10-15
+
+**Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine
+builds llama.cpp `bed0a85` with `contrib/llama.cpp/patches` 0001-0055. Three
+llama.cpp patches, all for Flash-Next; the dense agent and the coder have
+no tensors of the types 0053/0054 touch and 0055 is Flash-Next's expert
+cache. Every number is `measured-here` on the B60 with the Flash-Next unit's
+0.7.9 flags, one binary with the patch's switch off in the other arm, except
+the kernel times (test-backend-ops perf, MUL_MAT_ID with 512 experts and top
+10) and the series line (the installed 0.7.9 package against the head); the
+details are in `contrib/llama.cpp/README.md` (0053-0055) and
+`docs/campaigns/flash-next-llama-engine.md` (on the `qfndev` branch).
+
+- **Patch 0053: the low-bit expert decode by multiplies, the same values.**
+  Flash-Next's expert matvecs are bound by integer issue. The IQ2_S / IQ3_S
+  sign bits spread to four bytes by one multiply
+  (`((b & 0xF) * 0x00204081) & 0x01010101`), Q2_0's four 2-bit fields by
+  two; both identities hold for every byte (checked exhaustively). IQ2_S
+  at three tokens 70.9 -> 63.6 us; decode +0.9 %, the same texts.
+- **Patch 0054: the same decode in the prompt GEMM's copy.** The 20k
+  needle's prefill 664 -> 665-666 t/s (+0.2 %).
+- **Patch 0055: Infernix's LFRU expert-cache policy, opt-in.**
+  `LLAMA_EXPERT_CACHE_POLICY=lfru` scores an expert uses / (now - last + 1),
+  protects the round's experts and admits a miss only over a lower-scoring
+  victim, up to `LLAMA_EXPERT_CACHE_LFRU_BUDGET` (4) a layer at each adapt;
+  `LLAMA_EXPERT_CACHE_LFRU_EXACT=1` is the reference's clock and candidates.
+  Decode +1.6 % over Strata's adapt rule on the means (40.4 against 39.8 t/s;
+  per answer +0.6 / +3.2 / +1.1 %; the exact form +1.4 %), 0.6-1.8
+  points more experts served from the card, the same texts. Strata's rule
+  stays the default.
+- **The series against 0.7.9:** Flash-Next with 0001-0055 and the policy
+  decodes 39.4 / 40.2 / 42.5 t/s against the 0.7.9 package's 38.5-39.0 /
+  38.4-38.8 / 41.4-41.7 (+2.7 %) on Strata's request and two 300-token
+  answers, the same texts, the needle right. One head process's first answer
+  ran at 25.5 t/s with the same hit rate (all of it in verify, nothing in the
+  kernel log): not explained, not counted.
+
 ## 0.7.9 — 2026-10-14
 
 **Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine

@@ -3157,3 +3157,143 @@ Two changes, the values unchanged:
   KV windows count cells by position, which undercounts them (growth back
   toward the old reservation, not corruption). The Flash-Next unit runs
   one lane.
+
+## 0053-opencl-lowbit-decode-spread.patch
+
+Fewer integer operations in the low-bit expert matvecs' weight decode,
+the same values. Flash-Next's expert kernels are bound by integer issue,
+not by memory (stage 3d of `docs/campaigns/flash-next-llama-engine.md`,
+on the `qfndev` branch).
+Two decodes did per-byte work with shifts and masks:
+- **IQ2_S and IQ3_S signs.** Eight sign bits per eight weights became a
+  byte mask through `lb_signmask4` (seven operations per four weights).
+  Now the four bits spread to the bytes' low bits by one multiply,
+  `((b & 0xF) * 0x00204081) & 0x01010101` (copies at shifts 0, 7, 14, 21 do
+  not overlap), and the signed value is `(g ^ (s * 0xFF)) + s`.
+- **Q2_0's fields.** Four 2-bit fields of a byte went to four bytes with
+  three shifts, four masks and three ors. Now fields 0, 2 and 1, 3 spread by
+  one multiply each (`* 0x1001` and `* 0x40040` after masking `0x33` and
+  `0xCC`).
+
+Both identities hold for every input byte (checked exhaustively), so the
+results are bit-identical. `-DLB_SIGN_MASK4` and `-DQ2_SPREAD_SHIFT`
+through `GGML_OPENCL_IQ_OPTS` keep the old forms (measurement);
+`-DLB_SIGN_RED` and `-DQ2_SPREAD_RED` are the red cases.
+
+- **Kernels** (`measured-here`, 2026-10-15, B60, test-backend-ops perf,
+  MUL_MAT_ID with 512 experts and top 10, two repeats each):
+
+  | kernel | before | 0053 | instructions (offline ISA, bmg) |
+  |---|---|---|---|
+  | IQ2_S 640 x 2560, 1 / 3 tokens | 31.1 / 70.9 us | 29.1 / 63.6 | 487 -> 425 |
+  | Q2_0 640 x 2560, 1 / 3 tokens | 21.8 / 52.0 | 20.9 / 49.7 | 372 -> 340 |
+  | Q2_0 2560 x 640, 1 / 3 tokens | 24.8 / 63.5 | 24.6 / 62.3 | |
+  | IQ3_S | | | 553 -> 489 |
+
+- **Suites:** MUL_MAT and MUL_MAT_ID for IQ2_S, IQ3_S, Q2_0, IQ2_XXS,
+  IQ2_XS and IQ1_M pass on the B60 and the A770. The red cases fail on the
+  B60: signs 6/13 + 2/4 (IQ2_S), 6/13 + 8/12 (IQ3_S); Q2_0's fields 10/20
+  + 49/87.
+- **Served** (`measured-here`, 2026-10-15, B60, Flash-Next with the unit's
+  0.7.9 flags, one binary, the old forms through `GGML_OPENCL_IQ_OPTS`,
+  two processes each; Strata's request twice and two 300-token answers):
+
+  | arm | decode t/s | verify s |
+  |---|---|---|
+  | before | 38.6 / 43.0-43.1 / 38.3-38.4 / 41.4 | 11.43-11.44 / 10.08-10.09 / 6.81-6.82 / 6.24 |
+  | 0053 | 38.7-39.2 / 43.3-43.4 / 38.6-38.8 / 41.8-42.0 | 11.22-11.37 / 10.00-10.01 / 6.71-6.76 / 6.13-6.17 |
+
+  +0.9 % on the mean; Paris, the 20k needle, the same texts (md5), prefill
+  664 t/s in both. The coder and the dense agent have no tensors of these
+  types.
+- **Not taken on the way** (`measured-here`, the same harness):
+  - The low-bit MUL_MAT_ID at 8 rows a sub-group where 16 lanes divide a
+    row (gate/up only; down keeps 4 rows and its 4-lane rows, `MV_LB4`,
+    which compiles only at 4): faster in isolation (IQ2_S 71.3 -> 67.5 us
+    at three tokens) but ~1 % slower served (verify 11.44 -> 11.57-11.70
+    s), with or without the sign change. Half the work-groups cover the
+    missed experts' link reads less well; not measured further.
+  - IQ2_S's grid as 16-bit codes (its bytes take three values): slower in
+    every form tried; the campaign document has the table.
+- **Reviewed** before the push by a second model: no value change and no
+  build break; it rechecked both identities exhaustively (every IQ2_S and
+  IQ3_S grid word against every sign byte) and found every IQ2_S, IQ3_S and
+  Q2_0 kernel family (dense, MUL_MAT_ID, grouped, 4-lane rows) through
+  `lb_expand`. Applied: a red case stacked on a switch that keeps the old
+  form (`LB_SIGN_RED` with `LB_SIGN_MASK4` or `LB_CHAR4_ARITH`,
+  `Q2_SPREAD_RED` with `Q2_SPREAD_SHIFT`) is a compile error instead of a
+  green run that tests nothing (preprocessor lines only; the measured
+  build's default source is otherwise the same). Recorded: the prompt GEMM's
+  own copy of the IQ2_S / IQ3_S decode (`mul_mm_kq_f16.cl`) still uses
+  `lb_signmask4`; 0053 is decode only.
+
+## 0054-opencl-lowbit-gemm-decode.patch
+
+0053's two decodes in the prompt GEMM's own copy of the low-bit decode
+(`mul_mm_kq_f16.cl`, the expert GEMM from 64 tokens): the IQ2_S / IQ3_S sign
+bits and Q2_0's fields spread by multiplies, the same text and the same
+switches and red cases (the 0053 review had named this copy). The GEMM
+build now also takes `GGML_OPENCL_IQ_OPTS`, so one binary can A/B it.
+
+- **Suites** (`measured-here`, 2026-10-15): MUL_MAT and MUL_MAT_ID for
+  IQ2_S, IQ3_S and Q2_0 pass on the B60 and the A770. With 0054 the red
+  cases fail every case of these types on the B60 (IQ2_S 13/13 + 4/4, IQ3_S
+  13/13 + 12/12, Q2_0 20/20 + 87/87), where 0053's alone left the GEMM
+  cases passing.
+- **Served** (`measured-here`, B60, Flash-Next with the unit's 0.7.9 flags,
+  one binary, two processes an arm, the old forms through
+  `GGML_OPENCL_IQ_OPTS`): the 20k needle's prefill 664.0 / 664.2 -> 665.8 /
+  665.3 t/s (+0.2 %), short prompts inside the spread; the needle right,
+  the same texts (md5).
+- **Reviewed** by a second model: no defect. Noted: `-DLB_CHAR4_ARITH`
+  through `GGML_OPENCL_IQ_OPTS` now selects the GEMM's char4 forms as well
+  as the matvec's; label such prefill cells accordingly.
+
+## 0055-expert-cache-lfru.patch
+
+Infernix's expert-cache policy as an opt-in alternative to Strata's adapt
+rule (`LLAMA_EXPERT_CACHE_POLICY=lfru`). Infernix (`code`,
+`src/models/qwen4_exp/program/expert_cache/expert_cache.cpp`, `LfruPolicy`)
+scores an expert uses / (now - last + 1), its uses never reset, protects
+the round's routed experts from eviction and admits a miss only over a
+lower-scoring victim, within a budget. Here, per layer inside the existing
+slots and swap queue (0042): at each adapt (every 6 decode tokens) up to
+`LLAMA_EXPERT_CACHE_LFRU_BUDGET` (4) admissions a layer, the round's experts
+protected, the plan's global cap (96 swaps) unchanged.
+
+Two forms:
+- the default (the port): one clock tick a counted decode step, every
+  bank expert used before a candidate;
+- `LLAMA_EXPERT_CACHE_LFRU_EXACT=1`, Infernix's form: its clock ticks once a
+  routed layer call (a round ages an expert by the layer count), and only
+  the step's misses are candidates. Admission still runs at the adapt, not
+  every layer call.
+
+- **Measured** (`measured-here`, 2026-10-15, B60, Flash-Next with the 0.7.9
+  unit's flags and 0053/0054; Strata's request, two 300-token answers, the
+  20k needle; one binary an arm pair):
+
+  | arm | decode t/s | on the card |
+  |---|---|---|
+  | Strata's adapt (5 processes) | 38.7-39.4 / 38.6-39.0 / 41.7-42.0 | 89.0 / 93.3 / 95.4 % |
+  | LFRU port, budget 4 (4) | 39.0-39.5 / 39.9-40.2 / 42.1-42.4 | 89.6 / 95.1 / 96.2 % |
+  | LFRU exact, budget 4 (2) | 39.0 / 39.8 / 42.2-42.4 | 89.3 / 94.6 / 96.0 % |
+  | LFRU port, budget 1 (2) / 8 (1) | 38.2-38.9 / 39.6 / 42.1; 39.1 / 40.0 / 42.0 | |
+
+  The port +1.6 % on the means (40.4 against 39.8 t/s over the four and
+  five processes; per answer +0.6 / +3.2 / +1.1 %), the exact form +1.4 %.
+  First recorded as +1.3-1.8 %, an arithmetic slip on the same runs
+  (corrected 2026-10-15 in the 0.7.10 release review). Every arm Paris, the needle in
+  30.8-31.2 s, the same texts (md5): the policy moves which experts are
+  read over the link, not the values. Not taken: no credit for the
+  columns of rejected drafts (Infernix's `live`; the next ubatch's position
+  minus the last): 38.8 / 39.7-39.8 / 41.9-42.0, no gain. Not built:
+  Infernix's single pool over all layers (the slots are per-layer
+  tensors) and its warm start from saved state.
+- **Reviewed** by a second model: no defect in the tables, the counts or the
+  default path (Strata's rule unchanged; the plan never double-books a slot,
+  as for Strata's rule, since it runs only when no swap is in flight). Its
+  notes became the exact form above. Recorded: a budget that does not parse
+  (`LLAMA_EXPERT_CACHE_LFRU_BUDGET=abc`) is 0, no admissions.
+- **Operator:** which policy the Flash-Next unit runs (a unit flag, not a
+  default change).

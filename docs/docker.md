@@ -144,7 +144,7 @@ ggml's OpenCL backend, which is why the image carries the ICD loader and
 the Intel compute-runtime driver (`ocl-icd`, `intel-compute-runtime`).
 See `docs/llama-engine.md` for that engine's own flags.
 
-### The three services as the project runs them (0.7.8)
+### The three services as the project runs them (0.7.10)
 
 The command lines below are the ones the project's own services use;
 `docker/docker-compose.example.yaml` carries all three as compose profiles.
@@ -174,12 +174,12 @@ this release.
 a 24 GB card, the rest in host memory):
 
 ```bash
-# environment: GGML_OPENCL_BANK_STREAM=1
+# environment: GGML_OPENCL_BANK_STREAM=1 LLAMA_EXPERT_CACHE_POLICY=lfru
 --engine llama --gguf /models/<flash-next-iq2_xs-00001-of-00002>.gguf \
 --served-model-name qwen3.8-flash-next --device GPU.0 --n-ctx 131072 \
---llama-cpu-moe 48 --llama-threads 8 --llama-expert-cache 11300 \
---llama-expert-profile /models/<expert-profile>.bin --llama-mtp 2 \
---llama-mtp-gguf /models/<flash-next-mtp-head>.gguf --llama-kv q8_0 --queue-timeout 30
+--llama-cpu-moe 48 --llama-threads 8 --llama-expert-cache 13400 \
+--llama-reserve-cells 20480 --llama-expert-profile /models/<expert-profile>.bin \
+--llama-mtp 3 --llama-mtp-min-p 0.5 --llama-mtp-gguf /models/<flash-next-mtp-head>.gguf --llama-kv q8_0 --queue-timeout 30
 ```
 
 Flash-Next needs more from the host than the other two:

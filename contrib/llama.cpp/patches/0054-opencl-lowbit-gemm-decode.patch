@@ -1,0 +1,88 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index b52a0f7..855d1e9 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -2702,7 +2702,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                     const std::string mm_opts = compile_opts + " -cl-intel-256-GRF-per-thread" +
+                         " -DXT=" + std::to_string(backend_ctx->kq_id2_xt) + " -DXSG=" + std::to_string(backend_ctx->kq_id2_xsg) +
+                         " -DSG=" + std::to_string(backend_ctx->kq_mm_sg) + " -DRG=" + std::to_string(t.rg) +
+-                        " -DTG=" + std::to_string(t.tg) + " -DNSGM=" + std::to_string(t.nsgm) + " -DNSGN=" + std::to_string(t.nsgn);
++                        " -DTG=" + std::to_string(t.tg) + " -DNSGM=" + std::to_string(t.nsgm) + " -DNSGN=" + std::to_string(t.nsgn) +
++                        // GGML_OPENCL_IQ_OPTS reaches the low-bit GEMM's decode too (0054, measurement)
++                        (getenv("GGML_OPENCL_IQ_OPTS") ? std::string(" ") + getenv("GGML_OPENCL_IQ_OPTS") : std::string());
+                     cl_program mm_prog = build_program_from_source_optional(backend_ctx, mm_src.c_str(), mm_opts);
+                     if (mm_prog == nullptr) {
+                         GGML_LOG_WARN("ggml_opencl: XMX GEMM (%s) not built; ggml's kernels take the K-quants, the IQ types go to the CPU\n", pass == 0 ? "MUL_MAT" : "MUL_MAT_ID");
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
+index 1c3b383..6d24bcd 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
+@@ -1649,6 +1649,34 @@ static inline uint lb_sgn4(uint g, uint m) {
+ #endif
+ }
+ 
++// patch 0054: the IQ2_S / IQ3_S signs and Q2_0's fields spread to bytes by
++// multiplies, as in mul_mv_iq_q8_1.cl (0053); -DLB_SIGN_MASK4 and
++// -DQ2_SPREAD_SHIFT keep the old forms, -DLB_SIGN_RED and -DQ2_SPREAD_RED are
++// the red cases
++#if defined(LB_SIGN_RED) && (defined(LB_SIGN_MASK4) || defined(LB_CHAR4_ARITH))
++#error "LB_SIGN_RED mutates the multiply form; LB_SIGN_MASK4 / LB_CHAR4_ARITH select the old one"
++#endif
++#if defined(Q2_SPREAD_RED) && defined(Q2_SPREAD_SHIFT)
++#error "Q2_SPREAD_RED mutates the multiply form; Q2_SPREAD_SHIFT selects the old one"
++#endif
++static inline uint lb_sgnb4(uint g, uint b) {
++#if defined(LB_SIGN_MASK4) || defined(LB_CHAR4_ARITH)
++    return lb_sgn4(g, lb_signmask4(b));
++#else
++#ifndef LB_SIGN_RED
++    const uint s = ((b & 0xFu) * 0x00204081u) & 0x01010101u;
++#else
++    const uint s = ((b & 0xFu) * 0x00204081u) & 0x01010100u;
++#endif
++    return (g ^ (s * 0xFFu)) + s;
++#endif
++}
++#ifndef Q2_SPREAD_RED
++#define Q2_SPREAD_HI 0x03000300u
++#else
++#define Q2_SPREAD_HI 0x00000300u
++#endif
++
+ // a 64-bit table entry as two 32-bit halves
+ #define LB_TAB2(T, i) vload2((i), (constant const uint *)(T))
+ 
+@@ -1707,8 +1735,8 @@ static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk,
+         for (int l = 0; l < 4; ++l) {
+             const uint2 g = LB_TAB2(iq2s_grid, ((qw >> (8 * l)) & 0xFF) | ((qh << (8 - 2 * l)) & 0x300));
+             const uint sb = (sw >> (8 * l)) & 0xFF;
+-            w[2 * l]     = lb_sgn4(g.s0, lb_signmask4(sb));
+-            w[2 * l + 1] = lb_sgn4(g.s1, lb_signmask4(sb >> 4));
++            w[2 * l]     = lb_sgnb4(g.s0, sb);
++            w[2 * l + 1] = lb_sgnb4(g.s1, sb >> 4);
+         }
+         *s0 = d * (0.5f + (float)(sc & 0xF)) * 0.25f;
+         *s1 = d * (0.5f + (float)(sc >> 4)) * 0.25f;
+@@ -1747,7 +1775,11 @@ static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk,
+         #pragma unroll
+         for (int i = 0; i < 8; ++i) {
+             const uint b = (cw[i >> 2] >> (8 * (i & 3))) & 0xFF;
++#ifdef Q2_SPREAD_SHIFT
+             const uint v = (b & 3) | (((b >> 2) & 3) << 8) | (((b >> 4) & 3) << 16) | (((b >> 6) & 3) << 24);
++#else
++            const uint v = (((b & 0x33u) * 0x1001u) & 0x00030003u) | (((b & 0xCCu) * 0x40040u) & Q2_SPREAD_HI);
++#endif
+ #ifdef LB_CHAR4_ARITH
+             w[i] = as_uint(as_char4(v) - (char4)(1));
+ #else
+@@ -1767,8 +1799,8 @@ static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk,
+             const uint g1 = iq3s_grid[(qv[l] & 0xFF) | ((qh << (8 - 2 * l)) & 256)];
+             const uint g2 = iq3s_grid[(qv[l] >> 8)   | ((qh << (7 - 2 * l)) & 256)];
+             const uint sb = (sw >> (8 * l)) & 0xFF;
+-            w[2 * l]     = lb_sgn4(g1, lb_signmask4(sb));
+-            w[2 * l + 1] = lb_sgn4(g2, lb_signmask4(sb >> 4));
++            w[2 * l]     = lb_sgnb4(g1, sb);
++            w[2 * l + 1] = lb_sgnb4(g2, sb >> 4);
+         }
+         *s0 = *s1 = d * (float)(1 + 2 * sc);
+     }

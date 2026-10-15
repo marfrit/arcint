@@ -217,6 +217,15 @@ nats.
 GEMM gathers its routed bank experts. 77 tokens 1.84 -> 1.11 s, 173 tokens
 1.83 -> 1.54; 269 and up unchanged; the same tokens.
 
+**Flash-Next since 0.7.10** (`contrib/llama.cpp` 0053-0055, `measured-here`,
+B60, the Flash-Next unit's flags): the low-bit expert kernels' weight decode
+(IQ2_S / IQ3_S signs, Q2_0's fields) by multiplies, the same values: decode
++0.9 % (0053), the prompt GEMM's copy +0.2 % prefill (0054). Infernix's LFRU
+expert-cache policy (0055), opt-in with `LLAMA_EXPERT_CACHE_POLICY=lfru`:
++1.6 % decode over Strata's adapt rule, more experts served from the
+card, the same text. Against the 0.7.9 package the series with the policy
+decodes +2.7 %.
+
 **Decode since 0.7.9** (`contrib/llama.cpp` 0049-0052, `measured-here`):
 fused decode launches (0049), the delta net's rollback snapshots written
 into the recurrent cache (0050: the dense agent +5.1-5.3 %) and its gating
