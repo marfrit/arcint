@@ -23,8 +23,7 @@
     "reports": "byte equality of each pair (tripwire, §3.4 point 5)",
     "external": null,
     "timeout_seconds": 3600,
-    "references": [],
-    "increment": "0.8.0"
+    "references": []
   },
   {
     "name": "coder-equivalence",
@@ -50,8 +49,7 @@
     "reports": "byte equality of each pair (tripwire, §3.4 point 5)",
     "external": null,
     "timeout_seconds": 3600,
-    "references": [],
-    "increment": "0.8.0"
+    "references": []
   },
   {
     "name": "agent-concurrency",
@@ -77,8 +75,7 @@
     "reports": null,
     "external": null,
     "timeout_seconds": 3600,
-    "references": null,
-    "increment": "0.8.0"
+    "references": null
   },
   {
     "name": "coder-concurrency",
@@ -104,8 +101,7 @@
     "reports": null,
     "external": null,
     "timeout_seconds": 3600,
-    "references": null,
-    "increment": "0.8.0"
+    "references": null
   },
   {
     "name": "agent-served",
@@ -131,8 +127,7 @@
     "reports": "peak VRAM and GTT",
     "external": null,
     "timeout_seconds": 3600,
-    "references": null,
-    "increment": "0.8.0"
+    "references": null
   },
   {
     "name": "coder-served",
@@ -158,8 +153,7 @@
     "reports": "peak VRAM and GTT",
     "external": null,
     "timeout_seconds": 3600,
-    "references": null,
-    "increment": "0.8.0"
+    "references": null
   },
   {
     "name": "flashnext-served",
@@ -185,8 +179,7 @@
     "reports": "peak VRAM and GTT",
     "external": null,
     "timeout_seconds": 3600,
-    "references": null,
-    "increment": "0.8.0"
+    "references": null
   },
   {
     "name": "sanitizers",

@@ -16,28 +16,24 @@ Every 77 (skip) must be named on that command line, or the run does not count as
       gates: the answers right in every arm: two greedy runs, a lane's reused prefix against a fresh process, a checkpoint resume against a full re-prefill, MTP on against off, one lane against two
       reports: byte equality of each pair (tripwire, §3.4 point 5)
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
-      runner: not yet in the tree (Increment 0.8.0); the cell cannot run
 
 - [ ] `coder-equivalence` -- tests/equivalence/run.sh (§5, §3.4)
       flags: --engine llama, ARCINT_EXTRA_ARGS=--llama-kv q8_0:q4_0 --llama-mtp 4 (the suite's own --n-ctx and lane flags)
       gates: the answers right in every arm: two greedy runs, a lane's reused prefix against a fresh process, a checkpoint resume against a full re-prefill, MTP on against off, one lane against two
       reports: byte equality of each pair (tripwire, §3.4 point 5)
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
-      runner: not yet in the tree (Increment 0.8.0); the cell cannot run
 
 - [ ] `agent-concurrency` -- tests/concurrency/run.py (§4.1, §5)
       flags: --engine llama, two named lanes, ARCINT_EXTRA_ARGS=--llama-kv q8_0:q4_0 --llama-mtp 5
       gates: no cross-lane bleed in both start orders, both lanes used, the 404 for an unknown lane name, cancellation, the 503 with the lane's numbers after the queue timeout
       references: not yet filled
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
-      runner: not yet in the tree (Increment 0.8.0); the cell cannot run
 
 - [ ] `coder-concurrency` -- tests/concurrency/run.py (§4.1, §5)
       flags: --engine llama, two named lanes, ARCINT_EXTRA_ARGS=--llama-kv q8_0:q4_0 --llama-mtp 4
       gates: no cross-lane bleed in both start orders, both lanes used, the 404 for an unknown lane name, cancellation, the 503 with the lane's numbers after the queue timeout
       references: not yet filled
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
-      runner: not yet in the tree (Increment 0.8.0); the cell cannot run
 
 - [ ] `agent-served` -- tests/acceptance/cells/served_check.sh (§5, §7.1)
       flags: the agent unit's flags (245,760 ctx, q8_0:q4_0 KV, MTP 5), one fresh process: the capital, a 54,895- and a 138,028-token prompt with a needle
@@ -45,7 +41,6 @@ Every 77 (skip) must be named on that command line, or the run does not count as
       reports: peak VRAM and GTT
       references: not yet filled
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
-      runner: not yet in the tree (Increment 0.8.0); the cell cannot run
 
 - [ ] `coder-served` -- tests/acceptance/cells/served_check.sh (§5, §7.1)
       flags: the coder unit's flags (98,304 ctx, q8_0:q4_0 KV, MTP 4), one fresh process: the capital, three 300-token answers, a 40,841-token needle
@@ -53,7 +48,6 @@ Every 77 (skip) must be named on that command line, or the run does not count as
       reports: peak VRAM and GTT
       references: not yet filled
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
-      runner: not yet in the tree (Increment 0.8.0); the cell cannot run
 
 - [ ] `flashnext-served` -- tests/acceptance/cells/served_check.sh (§5, §7.1)
       flags: the Flash-Next unit's flags (131,072 ctx, q8_0 KV, 13,400 MiB of expert slots, the profile, MTP 3 with min-p 0.5 and the Q4_K draft head, the bank stream, the CPU misses), one fresh process: the capital, the 20,045-token needle, a 300-token answer
@@ -61,7 +55,6 @@ Every 77 (skip) must be named on that command line, or the run does not count as
       reports: peak VRAM and GTT
       references: not yet filled
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
-      runner: not yet in the tree (Increment 0.8.0); the cell cannot run
 
 - [ ] `sanitizers` -- tests/acceptance/cells/sanitizers.sh (§5)
       flags: -fno-sanitize-recover; ASan+UBSan on x86_64, UBSan elsewhere; over unit+roundtrip+stress
