@@ -90,20 +90,21 @@ draft head costs a fraction of the full vocabulary. It is optional; the
 project's agent runs with it, and an arm without it was not measured for
 this release.
 
-**Qwen3.8-Flash-Next** (IQ2_XS GGUF, every expert through an expert cache on
-a 24 GB card, the rest in host memory):
+**Qwen3.8-Flash-Next** (the IQ3_XXS GGUF through an expert cache on a 24 GB
+card, the rest in host memory; for the IQ2_XS file: `--llama-expert-cache
+13400`):
 
 ```bash
 # environment: GGML_OPENCL_BANK_STREAM=1 LLAMA_EXPERT_CACHE_CPU_MISSES=1
---engine llama --gguf /models/<flash-next-iq2_xs-00001-of-00002>.gguf \
+--engine llama --gguf /models/<flash-next-iq3_xxs-00001-of-00002>.gguf \
 --served-model-name qwen3.8-flash-next --device GPU.0 --n-ctx 131072 \
---llama-cpu-moe 48 --llama-threads 8 --llama-expert-cache 13400 \
+--llama-cpu-moe 48 --llama-threads 8 --llama-expert-cache 12000 \
 --llama-reserve-cells 20480 --llama-expert-profile /models/<expert-profile>.bin \
 --llama-mtp 3 --llama-mtp-min-p 0.5 --llama-mtp-gguf /models/<flash-next-mtp-head>.gguf --llama-kv q8_0 --queue-timeout 30
 ```
 
 Flash-Next needs more from the host than the other two:
-- **pinned host memory:** the expert bank (20.32 GiB for IQ2_XS) lives in
+- **pinned host memory:** the expert bank (28.72 GiB for IQ3_XXS, 20.32 for IQ2_XS) lives in
   USM host memory that the driver pins. The host's TTM page limit must
   allow it (`/sys/module/ttm/parameters/pages_limit`; the default is half
   of system RAM, which on a 64 GB host leaves little room beside the bank),

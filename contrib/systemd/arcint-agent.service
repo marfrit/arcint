@@ -39,7 +39,7 @@ Description=arcint-agent — Qwen3.8-27B dense + MTP on libllama (q8_0:q4_0 KV, 
 Documentation=https://github.com/marfrit/arcint
 After=default.target
 # One card, one resident model: the units that want the same card
-Conflicts=arcint-writer.service arcint-flashnext.service arcint-flashnext-iq3xxs.service
+Conflicts=arcint-writer.service arcint-flashnext.service arcint-flashnext-iq2xs.service
 
 [Service]
 Type=simple

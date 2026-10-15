@@ -19,8 +19,8 @@
   dependency removed (charter A6).
 - Production: the agent on the B60 (245,760 ctx, q8_0:q4_0 KV, MTP 5), the
   coder on the A770 (98,304 ctx, q8_0:q4_0 KV, MTP 4), Flash-Next on the
-  B60 on demand (IQ2_XS, 131,072 ctx, q8_0 KV, expert cache 13,400 MiB,
-  MTP 3), the writer on the B60 on demand.
+  B60 on demand (IQ3_XXS since 2026-10-15, IQ2_XS the faster option;
+  131,072 ctx, q8_0 KV, expert cache 12,000 MiB, MTP 3), the writer on the B60 on demand.
 - 1.0 charter: docs/milestone-1.0.0.md (feature complete, almost no gains
   by obvious changes).
 
@@ -30,13 +30,14 @@
   needle at 138k; acceptance task 10/10.
 - coder, A770: prefill 725.5 t/s at 40,841 tokens; decode 51.1 / 47.5 /
   44.0 t/s on three 300-token answers; the needle; acceptance task 9/10.
-- Flash-Next, B60 + 20.32 GiB host bank: prefill 665.6 t/s at 20,045
-  tokens right after the capital; decode 42.3 t/s; the needle. Strata's SYCL port on the same card:
-  620 t/s and 37.8 t/s (2026-10-14).
+- Flash-Next IQ3_XXS (the default), B60 + 28.72 GiB host bank: prefill
+  595.1 t/s at 20,045 tokens right after the capital; decode 35.1 t/s; the
+  needle. The IQ2_XS option: 665.6 t/s and 42.3 t/s. Strata's SYCL port on
+  the same card (IQ2_XS): 620 t/s and 37.8 t/s (2026-10-14).
 - Quality (KL vs Q8_0 or CPU reference, 16 x 512): agent q8_0:q4_0 KV
-  0.0057 nats; coder's searched quant 0.0237; Flash-Next IQ2_XS 0.294 nats,
-  top-1 87.1 % (accepted shortfall; IQ3_XXS 0.218 and UD-Q3_K_XL 0.100 are
-  on-demand options).
+  0.0057 nats; coder's searched quant 0.0237; Flash-Next IQ3_XXS 0.218 nats,
+  top-1 89.7 % (the default; IQ2_XS 0.294 and UD-Q3_K_XL 0.100 are on-demand
+  options; IQ2_XS and IQ3_XXS outside the bar, accepted).
 
 ## Correctness rule (operator, 2026-10-01; CLAUDE.md, DESIGN 3.4)
 

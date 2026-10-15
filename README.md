@@ -39,7 +39,7 @@ tag [`openvino-history`](https://github.com/marfrit/arcint/tree/openvino-history
 |---|---|---|---|---|
 | agent | Qwen3.8-27B (`qwen35`, dense, 64 layers, MTP layer) | Q4_K_M GGUF | Arc Pro B60 | 245,760 tokens, q8_0:q4_0 KV, MTP 5 |
 | coder | Qwen3.6-27B-A3B-Coder (`qwen35moe`, 184 experts, MTP layer) | a searched per-layer quant mix (14.6 GB) | Arc A770 | 98,304 tokens, q8_0:q4_0 KV, MTP 4 |
-| Flash-Next | Qwen3.8-Flash-Next (`qwen4exp`, 125B-A6B, 512 experts, n-gram table) | ISTA-DASLab's IQ2_XS GGUF through an expert cache: the hot experts in VRAM, the rest in host RAM, read over the link or computed on the CPU; its MTP layer from the checkpoint | Arc Pro B60 + host RAM, on demand | 131,072 tokens, q8_0 KV, MTP 3 |
+| Flash-Next | Qwen3.8-Flash-Next (`qwen4exp`, 125B-A6B, 512 experts, n-gram table) | ISTA-DASLab's IQ3_XXS GGUF (IQ2_XS as the faster option) through an expert cache: the hot experts in VRAM, the rest in host RAM, read over the link or computed on the CPU; its MTP layer from the checkpoint | Arc Pro B60 + host RAM, on demand | 131,072 tokens, q8_0 KV, MTP 3 |
 | writer | Cydonia 24B v4.3 (Mistral Small 3.2, `llama`) | imatrix Q4_K_M | Arc Pro B60, on demand | 98,304 tokens, q8_0 KV |
 
 The engine admits these architectures (`qwen35`, `qwen35moe`, `qwen4exp`, and
@@ -58,7 +58,8 @@ point per case, at temperature 0.
 |---|---|---|---|---|
 | agent | B60 | 695.2 t/s at 54,895 tokens, 491.8 at 138,028 | not in this check (36.6 / 32.3 / 19.3 t/s at 4k / 29k / 130k on 2026-10-08, before 0016-0051) | the needle at 138k; task 10/10 |
 | coder | A770 | 725.5 t/s at 40,841 tokens | 51.1 / 47.5 / 44.0 t/s on three 300-token answers | the needle; task 9/10 |
-| Flash-Next | B60 + 20.3 GiB host bank | 665.6 t/s at 20,045 tokens (asked right after the capital) | 42.3 t/s | the needle |
+| Flash-Next, IQ3_XXS | B60 + 28.7 GiB host bank | 595.1 t/s at 20,045 tokens (asked right after the capital) | 35.1 t/s | the needle |
+| Flash-Next, IQ2_XS option | B60 + 20.3 GiB host bank | 665.6 t/s, the same protocol | 42.3 t/s | the needle |
 
 Strata's own engine (its SYCL port) on the same B60: 620 t/s at the 20k
 needle and 37.8 t/s decode on its own request, where arcint decodes
@@ -66,8 +67,8 @@ needle and 37.8 t/s decode on its own request, where arcint decodes
 
 Quality: KL against a Q8_0 or CPU reference, 16 x 512 tokens. The agent's
 q8_0:q4_0 KV 0.0057 nats; the coder's searched quant 0.0237, inside the
-answer-level bar against its Q4_K_M; Flash-Next IQ2_XS 0.294 nats, top-1
-87.1 %, an accepted shortfall (UD-Q3_K_XL: 0.100, 93.3 %).
+answer-level bar against its Q4_K_M; Flash-Next IQ3_XXS 0.218 nats, top-1
+89.7 % (IQ2_XS 0.294, 87.1 %), an accepted shortfall (UD-Q3_K_XL: 0.100, 93.3 %).
 
 ## Building
 

@@ -36,7 +36,7 @@ FLAGS = {
     "agent": ["--n-ctx", "245760", "--llama-kv", "q8_0:q4_0", "--llama-mtp", "5",
               "--llama-mtp-vocab", A("mtp-vocab.json"), "--queue-timeout", "30", "--repetition-penalty", "1.0"],
     "coder": ["--n-ctx", "98304", "--llama-mtp", "4", "--llama-kv", "q8_0:q4_0", "--queue-timeout", "30"],
-    "flashnext": ["--n-ctx", "131072", "--llama-cpu-moe", "48", "--llama-threads", "8", "--llama-expert-cache", "13400",
+    "flashnext": ["--n-ctx", "131072", "--llama-cpu-moe", "48", "--llama-threads", "8", "--llama-expert-cache", "12000",
                   "--llama-expert-profile", A("expert-profile.bin"), "--llama-mtp", "3", "--llama-mtp-min-p", "0.5",
                   "--llama-reserve-cells", "20480", "--llama-mtp-gguf", A("mtp-flash-next.gguf"), "--llama-kv", "q8_0",
                   "--queue-timeout", "30"],

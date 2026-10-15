@@ -1,61 +1,31 @@
-# arcint-flashnext — Qwen3.8-Flash-Next (IQ2_XS) on the 24 GB card, on demand.
+# arcint-flashnext — Qwen3.8-Flash-Next from ISTA-DASLab's IQ3_XXS GGUF on the 24 GB card, on demand. The default
+# since 2026-10-15 (operator); the IQ2_XS file is the option arcint-flashnext-iq2xs.service, same port and name.
 #
-# The libllama engine (arcint 0.6.0, contrib/llama.cpp 0021 + 0022) with the
-# expert cache: 9,500 MiB of expert slots on the card, every other expert in a
-# bank of pinned host memory (~24 GiB) that the card reads over its link, MTP 2
-# from an MTP-only GGUF (tools/flash_next_mtp_gguf.sh), f16 KV.
+# The quality step over IQ2_XS: KL 0.218 against unsloth's Q8_0 (IQ2_XS 0.294), top-1 89.7 % (87.1 %)
+# (docs/llama-engine.md, "Flash-Next quant options"). Its host bank is larger (28.72 GiB at these slots), so
+# the slot budget is 12,000 MiB, not the IQ2_XS unit's 13,400: at 13,400 the card thrashed (peak 24,440 MiB,
+# 6.4-11.7 t/s, from the ZFS pool).
 #
-# Measured on the Arc Pro B60 (2026-10-07, 131,072 tokens of context):
-# - a 20k-token prompt read at 408 t/s; the long answer decoded at 19.8 t/s
-#   with 84 % of the routed experts on the card;
-# - the needle and the capital right;
-# - no eviction (the process's GTT stayed at the bank's size).
+# Measured on the Arc Pro B60 with exactly these flags (arcint 321fc1d, the file on the NVMe, 2026-10-15):
+# - the 20,045-token needle read at 597.9 t/s and answered; Paris;
+# - six answers (Strata's request, a hash table, a compiler, Python, German, a story) at 33.9 / 37.5 /
+#   37.3 / 33.5 / 30.6 / 30.9 t/s with the CPU misses, against 20.7 / 26.2 / 28.9 / 18.7 / 21.2 / 18.5
+#   without them (+52 % on the mean), 80-90 % of the routed experts on the card;
+# - KL against unsloth's Q8_0 (8 x 512, ubatch 4) 0.290954 / top-1 86.618 % with the misses, 0.286562 /
+#   86.765 % without (+0.0044 nats, inside the answer-level bar);
+# - peak VRAM 23,306 MiB of 24,480, GTT 29,573 MiB (the bank); nothing evicted.
 #
-# Size the slots for the VRAM a request takes after the load, not for what
-# is free after it:
-# - the first request keeps ~0.9 GiB;
-# - a 20k prefill needs ~3 GiB more for a while.
-# Neither is in the cache's budget. With less room, xe evicts buffers to host
-# memory and leaves them there: a verify took 4.5 s instead of ~25 ms.
-# The trade on this card, all measured:
-# - 32,768 tokens with 14,500 MiB of slots decode at 33-35 t/s;
-# - 98,304 tokens with 11,500 MiB at 21.0 t/s;
-# - 131,072 tokens with 9,500 MiB at 19.8 t/s.
-# q8_0 KV was slower on this model (23.6 against 31-33 t/s at 32k) until
-# 0.7.4 (below).
+# The CPU misses on this file need 0056 as of 0.8.0: before it, the slow path read the IQ4_NL banks of
+# 18 layers wrong and the first request faulted (contrib/llama.cpp/README.md, 0056).
 #
-# Loading takes ~7 minutes (the slots and the bank are filled from the file).
-#
-# Since 0.7.3 (contrib/llama.cpp 0032, 0033) prefill streams the bank tensors
-# to the card on a copy queue (GGML_OPENCL_BANK_STREAM=1, opt-in, below; a
-# ring of 4 slots, ~750 MiB of VRAM). Measured in this configuration on the
-# B60 (2026-10-11): the 20k prompt read at 640-645 t/s (408 without), decode
-# 27-29 t/s, the needle and the capital right, nothing evicted, VRAM peak
-# 24.2-24.3 of 24.48 GB. Thin: drop the Environment= line if a larger slot
-# budget or another process needs the room.
-#
-# Since 0.7.4: q8_0 KV and 11,300 MiB of slots.
-# - Why it is viable now: contrib/llama.cpp 0036 gathers the QSA indexer's
-#   q8_0 keys on the card; they ran on the CPU before, which halved decode.
-# - Measured on the B60 (2026-10-13, 131,072 tokens), against f16 KV with
-#   9,500 MiB in the same window: the 20k prompt read at 662.7 against
-#   660.9 t/s; decode 31.7 against 28.9 t/s; VRAM peak 24,241 against
-#   24,278 MiB; the needle, the capital and a long answer right in both.
-# - The KL of q8_0 against f16 KV: 0.294037 against 0.294050 (0036).
-#
-# Since 0.7.9-0.7.12, measured on the B60 (docs/llama-engine.md, CHANGELOG):
-# - --llama-reserve-cells 20480 (0052) frees the compute buffers for 13,400 MiB
-#   of slots; 3 drafts with Strata's stop at 0.5;
-# - LLAMA_EXPERT_CACHE_CPU_MISSES=1 (0056): up to 16 missed experts a layer on
-#   the CPU, decode +15.2 % on six answers; 8 threads busy while decoding;
-# - the draft head with its LM head Q4_K (tools/flash_next_mtp_gguf.sh):
-#   +1.5 %, 156 MiB less VRAM.
+# The GGUF and the draft head must be on local NVMe: from the ZFS pool an answer reads ~1 GB of experts
+# from storage.
 
 [Unit]
-Description=arcint-flashnext — Qwen3.8-Flash-Next IQ2_XS on libllama, expert cache + MTP, GPU.0, :8089
+Description=arcint-flashnext — Qwen3.8-Flash-Next IQ3_XXS on libllama, expert cache + MTP, GPU.0, :8089
 Documentation=https://github.com/marfrit/arcint
 After=default.target
-Conflicts=arcint-agent.service arcint-writer.service arcint-flashnext-iq3xxs.service
+Conflicts=arcint-agent.service arcint-writer.service arcint-flashnext-iq2xs.service
 
 [Service]
 Type=simple
@@ -63,7 +33,7 @@ Environment=GGML_OPENCL_BANK_STREAM=1
 Environment=LLAMA_EXPERT_CACHE_CPU_MISSES=1
 ExecStart=/usr/bin/arcint \
     --engine llama \
-    --gguf /models/gguf/qwen38-flash-next-iq2xs/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
+    --gguf /models/gguf/qwen38-flash-next-iq3xxs/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
     --served-model-name qwen3.8-flash-next \
     --device GPU.0 \
     --host 0.0.0.0 \
@@ -71,7 +41,7 @@ ExecStart=/usr/bin/arcint \
     --n-ctx 131072 \
     --llama-cpu-moe 48 \
     --llama-threads 8 \
-    --llama-expert-cache 13400 \
+    --llama-expert-cache 12000 \
     --llama-kv q8_0 \
     --llama-expert-profile %h/.local/share/arcint/expert-profile-strata.bin \
     --llama-mtp 3 \
