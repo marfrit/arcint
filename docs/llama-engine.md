@@ -136,8 +136,11 @@ with every expert computed on the card and its MTP layer drafting:
 
 - `expert-profile.bin` is Strata's decode profile (`data/expert-profile.bin`
   in github.com/Niko1221/Strata, MIT; it fills the slots in rank order).
-- `mtp-flash-next-q8e4n.gguf` is built by `tools/flash_next_mtp_gguf.sh`
-  from the checkpoint's 31 `mtp.*` tensors (the GGUFs carry no MTP layer).
+- `mtp-flash-next-q8e4n.gguf` (the head Q6_K, as measured below) was built
+  by `tools/flash_next_mtp_gguf.sh` from the checkpoint's 31 `mtp.*` tensors
+  (the GGUFs carry no MTP layer). Since 2026-10-15 the tool writes
+  `mtp-flash-next-q8e4n-hq4k.gguf`, the head Q4_K: +2.2 % decode on 0.7.11,
+  156 MiB less VRAM (`measured-here`, the campaign document).
 
 Measured on the B60 (`measured-here`, 2026-10-07, the 20,045-token needle,
 then the 500-token long answer, greedy, thinking off): prefill 421-431 t/s,

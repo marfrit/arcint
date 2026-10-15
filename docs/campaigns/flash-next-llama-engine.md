@@ -1622,6 +1622,19 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
   decodes 43.8-44.0 t/s against Strata's 37.8 on this card (the B3
   comparison of 2026-10-14; Strata not re-run). Opt-in
   (`LLAMA_EXPERT_CACHE_CPU_MISSES=1`), set on the Flash-Next unit from 0.7.11 on (operator).
+- **The draft head's LM head Q4_K, again, on 0.7.11** (`measured-here`,
+  2026-10-15, B60, the 0.7.11 package, the unit's flags with the CPU misses,
+  two processes a head, alternated; the six answers above). The earlier
+  Q4_K file (`-hk`, stage note above) also changed the token embedding to
+  Q8_0 (644 against 497 MiB), so its "frees ~180 MB" counted the head only;
+  a file that changes the head only (`mtp-flash-next-q8e4n-hq4k.gguf`:
+  `--output-tensor-type q4_K --token-embedding-type q6_K`, the rest as
+  q8e4n; 2.407 against 2.571 GB) decodes 43.9-44.0 / 41.8-41.9 / 40.5-40.6 /
+  42.0-42.2 / 37.4-37.5 / 36.0-36.2 against Q6_K's 42.3-42.4 / 41.3 /
+  40.5-40.9 / 43.0-43.8 / 37.1-37.4 / 33.5-33.6 t/s (+2.2 % on the mean),
+  peak VRAM 23,757 against 23,913 MiB, Paris and the needle right. On the
+  unit since 2026-10-15 (operator: "integrate if better");
+  `tools/flash_next_mtp_gguf.sh` now writes this head.
 - **A tool trap:** `llama-perplexity` on Flash-Next with the expert cache
   was killed by the container's memory limit at 54 GB of anonymous memory:
   its default load mode `auto` reads the whole file into memory when a

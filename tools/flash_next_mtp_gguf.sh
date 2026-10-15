@@ -3,8 +3,9 @@
 # Flash-Next's GGUFs carry no MTP layer; the checkpoint has it as 31 mtp.* tensors. This builds a stub HF
 # directory (config and tokenizer of the pinned revision, the mtp.* tensors, the embedding and the LM head,
 # about 7.3 GB fetched by range requests), converts it with the pinned llama.cpp's converter (--mtp, BF16),
-# and quantizes it as served: Q8_0 dense, Q4_K gate/up experts, IQ4_NL down experts, the head and the
-# embedding Q6_K (mtp-flash-next-q8e4n.gguf, 2.4 GiB).
+# and quantizes it as served: Q8_0 dense, Q4_K gate/up experts, IQ4_NL down experts, the embedding Q6_K
+# and the head Q4_K (mtp-flash-next-q8e4n-hq4k.gguf, 2.24 GiB; until 2026-10-15 the head was Q6_K,
+# mtp-flash-next-q8e4n.gguf: the Q4_K head decodes +2.2 % on 0.7.11, docs/campaigns/flash-next-llama-engine.md).
 #
 # usage: tools/flash_next_mtp_gguf.sh <llama.cpp tree (the pin with contrib/llama.cpp/patches)> <out dir>
 #   PYTHON (default python3) needs safetensors, numpy, torch-free gguf-py deps of the converter;
@@ -45,6 +46,6 @@ print(len(idx["weight_map"]), "tensors indexed")
 PY
 cd "$LLAMA"
 "$PY" convert_hf_to_gguf.py "$HF" --mtp --outtype bf16 --outfile "$OUT/mtp-flash-next-bf16.gguf"
-"$QUANTIZE" --output-tensor-type q6_K --token-embedding-type q6_K --tensor-type ffn_gate_exps=q4_K --tensor-type ffn_up_exps=q4_K --tensor-type ffn_down_exps=iq4_nl \
-    "$OUT/mtp-flash-next-bf16.gguf" "$OUT/mtp-flash-next-q8e4n.gguf" q8_0
+"$QUANTIZE" --output-tensor-type q4_K --token-embedding-type q6_K --tensor-type ffn_gate_exps=q4_K --tensor-type ffn_up_exps=q4_K --tensor-type ffn_down_exps=iq4_nl \
+    "$OUT/mtp-flash-next-bf16.gguf" "$OUT/mtp-flash-next-q8e4n-hq4k.gguf" q8_0
 ls -la "$OUT"
