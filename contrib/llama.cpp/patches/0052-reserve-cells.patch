@@ -15,10 +15,22 @@ index 40fa844a9..44a9e437d 100644
  
      struct llama_model_tensor_override {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 3402ef526..c762deabf 100644
+index 3402ef526..64fd7931f 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -336,6 +336,7 @@ llama_context::llama_context(
+@@ -324,8 +324,10 @@ llama_context::llama_context(
+     cparams.fused_gdn_ch = true;
+     cparams.auto_fgdn    = false;
+ 
++    // probed (resolve_fused_ops), so a backend without the lightning indexer gets the graph before it (qwen4exp,
++    // patch 0052) instead of the op on the CPU; upstream leaves the op unconditional
+     cparams.fused_lid = true;
+-    cparams.auto_flid = false;
++    cparams.auto_flid = true;
+ 
+     cparams.fused_dsv4_hc_pre  = true;
+     cparams.fused_dsv4_hc_comb = true;
+@@ -336,6 +338,7 @@ llama_context::llama_context(
      cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
  
      cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
@@ -26,7 +38,7 @@ index 3402ef526..c762deabf 100644
  
      cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
      cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
-@@ -716,6 +717,13 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
+@@ -716,6 +719,13 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
      ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
  }
  
@@ -40,7 +52,7 @@ index 3402ef526..c762deabf 100644
  void llama_context::sched_reserve() {
      if (!sched_need_reserve) {
          return;
-@@ -747,7 +755,11 @@ void llama_context::sched_reserve() {
+@@ -747,7 +757,11 @@ void llama_context::sched_reserve() {
      llama_memory_context_ptr mctx;
      if (memory) {
          LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
@@ -52,7 +64,7 @@ index 3402ef526..c762deabf 100644
          if (!mctx) {
              throw std::runtime_error("failed to initialize memory module");
          }
-@@ -991,6 +1003,7 @@ bool llama_context::memory_update(bool optimize) {
+@@ -991,6 +1005,7 @@ bool llama_context::memory_update(bool optimize) {
  
      // if the memory module did any computation, we have to reserve a new worst-case graph
      {
@@ -60,7 +72,7 @@ index 3402ef526..c762deabf 100644
          const auto mctx = memory->init_full();
          if (!mctx) {
              throw std::runtime_error("failed to initialize memory context");
-@@ -1965,8 +1978,31 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -1965,8 +1980,31 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
  
      llama_memory_context_ptr mctx;
  
@@ -93,7 +105,7 @@ index 3402ef526..c762deabf 100644
          if (!mctx) {
              return -2;
          }
-@@ -4074,6 +4110,7 @@ llama_context_params llama_context_default_params() {
+@@ -4074,6 +4112,7 @@ llama_context_params llama_context_default_params() {
          /*.sampler                     =*/ nullptr,
          /*.n_sampler                   =*/ 0,
          /*.ctx_other                   =*/ nullptr,
@@ -101,7 +113,7 @@ index 3402ef526..c762deabf 100644
      };
  
      return result;
-@@ -4406,6 +4443,7 @@ struct ggml_cgraph * llama_graph_reserve(
+@@ -4406,6 +4445,7 @@ struct ggml_cgraph * llama_graph_reserve(
      auto memory = ctx->get_memory();
      llama_memory_context_ptr mctx;
      if (memory) {
