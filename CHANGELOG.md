@@ -18,6 +18,48 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 0.8.0 — 2026-10-15
+
+**Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` 0001-0056,
+compiled in; the package depends on the OpenCL ICD loader and recommends
+Intel's compute runtime. **`marfrit-openvino` is no longer a dependency**:
+a host upgraded from 0.7.x may keep it installed as the way back to 0.7.12.
+
+- **The OpenVINO engine is retired** (operator, 2026-10-15; charter A6).
+  The documentation and the design were rewritten for the libllama engine
+  first (README, DESIGN, llm.txt, DEVELOPMENT, docs/history.md); then the
+  executor, its allowlist, the GPU-plugin patch series and its recipe, the
+  IR exporters and the OpenVINO-only tests left the tree. Everything of the
+  era is at the tag `openvino-history` (`docs/history.md`).
+- **Interface** (DESIGN §8.7): the OpenVINO engine's flags (`--model`,
+  `--paged-kv`, `--prefix-cache-mib`, `--offload-ratio`, `--dflash`, ...) and
+  `--model-id` are refused by name; `--engine ov` is refused; `/props` and
+  `/health` lose the reservation, the prefix cache and the paged-KV fields;
+  `/props` gains `model.architecture`; `quant` is the GGUF's file type;
+  `cache.kv_dtype` reports `--llama-kv` (it read "f16" whatever the flag
+  said); the 503 bodies lose `reservation` and `kv_blocks_free`; the stub
+  serves as `stub`.
+- **Gates** (operator, 2026-10-15; DESIGN §5): the equivalence and
+  concurrency suites run on `--engine llama` with the answers gated and
+  byte equality a reported tripwire; per-service served floors at the last
+  release's pre-tag numbers minus their spread (`*-served` cells); the
+  acceptance task at least 9/10, 10/10 the target, for the coder and the
+  agent.
+- **Patch 0056: IQ4_NL banks on the CPU-miss slow path.** The slow path
+  read an IQ4_NL bank's split scales and quants as GGUF blocks; Flash-Next's
+  IQ3_XXS file (18 IQ4_NL down projections) faulted at its first request
+  with the CPU misses on. Fixed; IQ3_XXS with the misses decodes 30.6-37.5
+  t/s on six answers against 18.5-28.9 without, KL +0.0044 nats
+  (`measured-here`, B60; `contrib/llama.cpp/README.md`, 0056).
+- **Flash-Next quant options** (operator, 2026-10-15; charter A2): IQ2_XS
+  stays the shape; ISTA-DASLab's IQ3_XXS serves on demand on the same port
+  (`contrib/systemd/arcint-flashnext-iq3xxs.service`, 12,000 MiB of slots,
+  the CPU misses); UD-Q3_K_XL waits for the host's 96 GB.
+- **Package and image**: the recipe builds the one engine and refuses to
+  build a 0.7.x tag; the image is one Fedora 43 image with Intel's compute
+  runtime (`docs/docker.md`); the 0.7.12 images were published on
+  2026-10-15 (`ghcr.io/marfrit/arcint:20261015T141859`).
+
 ## 0.7.12 — 2026-10-15
 
 **Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine

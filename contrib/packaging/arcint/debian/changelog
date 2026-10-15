@@ -1,3 +1,16 @@
+arcint (0.8.0-1) trixie; urgency=medium
+
+  * 0.8.0: the OpenVINO engine retired (its record at the tag
+    openvino-history): the package builds the libllama engine alone and no
+    longer depends on marfrit-openvino; it depends on the OpenCL ICD loader
+    and recommends intel-opencl-icd. The OpenVINO engine's flags and
+    --model-id are refused by name; /props and /health lose its fields;
+    /props reports the configured KV types. Patch 0056: an IQ4_NL bank's
+    rows on the CPU-miss slow path (Flash-Next IQ3_XXS faulted with the
+    misses). The recipe refuses to build 0.7.x tags.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Thu, 15 Oct 2026 21:00:00 +0200
+
 arcint (0.7.12-1) trixie; urgency=medium
 
   * 0.7.12: llama.cpp moved from bed0a85 to upstream master 3e4dfa8 (288
