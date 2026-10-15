@@ -98,7 +98,7 @@ def post(content, n):
 
 
 def post_body(body):
-    body = dict(body, model="m")
+    body = dict(body, model="m", stream=False, max_tokens=24, temperature=0)
     r = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", json.dumps(body).encode(),
                                {"Content-Type": "application/json"})
     return json.load(urllib.request.urlopen(r, timeout=7200))
