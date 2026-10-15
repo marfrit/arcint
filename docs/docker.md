@@ -144,7 +144,7 @@ ggml's OpenCL backend, which is why the image carries the ICD loader and
 the Intel compute-runtime driver (`ocl-icd`, `intel-compute-runtime`).
 See `docs/llama-engine.md` for that engine's own flags.
 
-### The three services as the project runs them (0.7.10)
+### The three services as the project runs them (0.7.11)
 
 The command lines below are the ones the project's own services use;
 `docker/docker-compose.example.yaml` carries all three as compose profiles.
@@ -174,7 +174,7 @@ this release.
 a 24 GB card, the rest in host memory):
 
 ```bash
-# environment: GGML_OPENCL_BANK_STREAM=1 LLAMA_EXPERT_CACHE_POLICY=lfru
+# environment: GGML_OPENCL_BANK_STREAM=1 LLAMA_EXPERT_CACHE_CPU_MISSES=1
 --engine llama --gguf /models/<flash-next-iq2_xs-00001-of-00002>.gguf \
 --served-model-name qwen3.8-flash-next --device GPU.0 --n-ctx 131072 \
 --llama-cpu-moe 48 --llama-threads 8 --llama-expert-cache 13400 \

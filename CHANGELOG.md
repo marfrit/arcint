@@ -17,6 +17,35 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.7.11 — 2026-10-15
+
+**Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine
+builds llama.cpp `bed0a85` with `contrib/llama.cpp/patches` 0001-0056. One
+llama.cpp patch, for Flash-Next; the dense agent and the coder have no
+expert cache and are unchanged. Every number is `measured-here` on the B60
+with the Flash-Next unit's flags and Strata's adapt rule, one binary with
+the switch off in the other arm, fresh processes alternated; the details are
+in `contrib/llama.cpp/README.md` (0056) and
+`docs/campaigns/flash-next-llama-engine.md` (on the `qfndev` branch).
+
+- **Patch 0056: the expert cache's decode misses on the CPU.** Strata's
+  doorbell tier with Strata's CPU kernels: at a decode layer's first expert
+  projection the first 16 missed (token, expert) pairs go to a CPU pool
+  (8 threads) that computes them from the bank in host memory with
+  multi-token AVX2 rows (each 32-value chunk decoded once for the tokens of
+  a verify), while the card computes the hits and reads the other misses
+  over the link. Opt-in with `LLAMA_EXPERT_CACHE_CPU_MISSES=1`. On Strata's
+  request, the two gate answers, a Python function, a German explanation and
+  a story: 38.7-39.0 / 38.6-38.8 / 41.7-41.8 / 34.7-34.9 / 31.8-31.9 /
+  31.5-31.6 -> 43.8-44.0 / 43.1-43.3 / 43.7-43.9 / 45.8-46.1 / 38.9 /
+  35.0-35.1 t/s (+15.2 % on the mean). KL as served 0.3700 against 0.3673
+  (the bar allows +0.03), top-1 +0.05 points; Paris and the needle right.
+  A prototype on ggml-cpu's dot products did not pay: ggml-cpu's Q2_0 dot
+  product has no SIMD form (661 against 72 us a matrix). The coder decoding
+  on the A770 at the same time loses ~1 %.
+- **0.7.10's LFRU policy** stays opt-in and off on the unit: measured after
+  that tag on six other prompts it decodes -2.1 %.
+
 ## 0.7.10 — 2026-10-15
 
 **Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine
