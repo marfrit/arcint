@@ -2,9 +2,8 @@
 #
 # The coder endpoint since 2026-10-05. The GGUF is the kernel GA's searched
 # quantization, genome c5f495ac in its shq8 variant, 14.6 GB
-# (docs/llama-engine.md). The OpenVINO export it replaced stays as the
-# rollback: arcint-coder-openvino.service, same port and served name, so a
-# proxy finds either.
+# (docs/llama-engine.md). It replaced the coder's OpenVINO export (that engine
+# was retired in 0.8.0, docs/history.md).
 #
 # Measured on the Arc A770 with exactly these flags (arcint 0.5.11):
 # - VRAM peak 16.67 of 17.08 GB at a 94,926-token prompt, no paging. Prefill
@@ -18,7 +17,6 @@
 Description=arcint-coder — Qwen3.6-27B-A3B-Coder on libllama, GPU.1, :8080, 98k
 Documentation=https://github.com/marfrit/arcint
 After=default.target
-Conflicts=arcint-coder-openvino.service
 
 [Service]
 Type=simple

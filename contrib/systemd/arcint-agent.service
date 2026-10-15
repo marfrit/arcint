@@ -1,7 +1,7 @@
 # arcint-agent — Qwen3.8-27B dense + MTP on the libllama engine, the 24 GB card.
 #
 # The agent endpoint since 0.5.6 (2026-10-04). Before it, the same model on the
-# OpenVINO engine: arcint-agent-openvino.service.
+# OpenVINO engine (retired in 0.8.0, docs/history.md).
 #
 # Measured on the Arc Pro B60 with exactly these flags (arcint 0.5.6,
 # contrib/llama.cpp 0015 for the quantized KV):
@@ -39,7 +39,7 @@ Description=arcint-agent — Qwen3.8-27B dense + MTP on libllama (q8_0:q4_0 KV, 
 Documentation=https://github.com/marfrit/arcint
 After=default.target
 # One card, one resident model: the units that want the same card
-Conflicts=arcint-writer.service arcint-flashnext.service arcint-agent-openvino.service
+Conflicts=arcint-writer.service arcint-flashnext.service
 
 [Service]
 Type=simple
