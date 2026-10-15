@@ -45,7 +45,7 @@ reference mechanism, and B3's gap is explained or closed.
 |---|---|---|
 | C1 | DESIGN.md §7 and the README describe what ships: engines, numbers, the default | **open:** §7.0's milestone table and numbers predate the libllama engine (Flash-Next at 6.5 t/s decode) |
 | C2 | A soak: several days of the three services under real use on both cards with no wedge, no eviction and no restart, logged | **open:** the record has the B60's wedge after a long idle, xe eviction at thin VRAM margins and copy-engine resets, each recovered, none soaked |
-| C3 | The dependency base is a stated choice: llama.cpp at a pin with N patches and how a rebase is done; marfrit-openvino +pN and its role | **open:** 49 patches over llama.cpp `bed0a85`; no rebase procedure recorded |
+| C3 | The dependency base is a stated choice: llama.cpp at a pin with N patches and how a rebase is done; marfrit-openvino +pN and its role | **open:** 53 patches over llama.cpp `bed0a85` (2026-10-02); no rebase procedure recorded. A dry run (`measured-here`, 2026-10-15): upstream master `a0e6dc7` (2026-10-14) is 269 commits on, 8 of them in `ggml-opencl`, and patch 0001 already conflicts in `load_cl_kernels`, which upstream's `f2cc728` split (`ggml_opencl_make_compile_opts`) and which most of the series extends. A rebase is a port of the backend part, not a re-apply |
 | C4 | The interface promise: the HTTP surface, the unit flags and the supported environment switches that stay stable within 1.x | **open** (see A7) |
 | C5 | The release procedure as used for 0.7.x (pre-tag served check, second-model review, signed repository, fresh container) | met |
 
