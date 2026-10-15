@@ -1,3 +1,16 @@
+arcint (0.7.12-1) trixie; urgency=medium
+
+  * 0.7.12: llama.cpp moved from bed0a85 to upstream master 3e4dfa8 (288
+    commits) with patches 0001-0056 ported (ten by hand; the lightning
+    indexer probed so OpenCL keeps the unfused indexer graph; the MTP draft
+    batch passes the target's hidden state as the state embedding). Suites
+    pass on both cards; KL and the three services on par (Flash-Next +1.3 %).
+    ggml-cpu built with -march=native again: GGML_NATIVE was off under
+    SOURCE_DATE_EPOCH, which cost Flash-Next with the CPU misses 7.7 %.
+    Runtime floor unchanged at marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Thu, 15 Oct 2026 16:00:00 +0200
+
 arcint (0.7.11-1) trixie; urgency=medium
 
   * 0.7.11: llama.cpp patch 0056, the expert cache's decode misses on the

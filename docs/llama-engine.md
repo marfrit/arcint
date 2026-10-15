@@ -220,6 +220,15 @@ nats.
 GEMM gathers its routed bank experts. 77 tokens 1.84 -> 1.11 s, 173 tokens
 1.83 -> 1.54; 269 and up unchanged; the same tokens.
 
+**Since 0.7.12** (`measured-here`, the units' flags): llama.cpp `3e4dfa8`
+(upstream master of 2026-10-15) with the 56 patches ported; the dense agent
+and the coder decode and prefill as on `bed0a85`, Flash-Next +1.3 %
+(`contrib/llama.cpp/README.md`, "Moving the pin"). The package's ggml-cpu is
+built with `-march=native` again (until 0.7.12 it was SSE-only, which cost
+Flash-Next with the CPU misses 7.7 % of decode). Flash-Next's draft head is
+`mtp-flash-next-q8e4n-hq4k.gguf` (its LM head Q4_K: +2.2 %, 156 MiB less
+VRAM).
+
 **Flash-Next since 0.7.11** (`contrib/llama.cpp` 0056, `measured-here`, B60,
 the Flash-Next unit's flags): with `LLAMA_EXPERT_CACHE_CPU_MISSES=1` up to 16
 missed (token, expert) pairs of a decode layer are computed on the CPU from

@@ -144,7 +144,7 @@ ggml's OpenCL backend, which is why the image carries the ICD loader and
 the Intel compute-runtime driver (`ocl-icd`, `intel-compute-runtime`).
 See `docs/llama-engine.md` for that engine's own flags.
 
-### The three services as the project runs them (0.7.11)
+### The three services as the project runs them (0.7.12)
 
 The command lines below are the ones the project's own services use;
 `docker/docker-compose.example.yaml` carries all three as compose profiles.
