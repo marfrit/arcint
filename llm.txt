@@ -107,8 +107,9 @@ request at parity with Strata on the warm run (37.9 vs 37.8).
 0.7.10, Flash-Next: patches 0053/0054 (the low-bit expert decode's sign bits
 and 2-bit fields spread by multiplies, the same values): decode +0.9 %,
 prefill +0.2 %; 0055, Infernix's LFRU expert-cache policy, opt-in through
-LLAMA_EXPERT_CACHE_POLICY=lfru: decode +1.6 % over Strata's adapt rule, the
-same text; the series against the 0.7.9 package +2.7 %. Every
+LLAMA_EXPERT_CACHE_POLICY=lfru: decode +1.6 % over Strata's adapt rule on
+the gate set but -2.1 % on six other prompts, the same text; the series
+against the 0.7.9 package +2.7 % on the gate set. Every
 number below is measured-here on the named card; DESIGN.md §7 has each one's
 standing value and evidence class. The dated measurement record, campaigns
 and design notes live on the development branch `qfndev`, not on `main`.

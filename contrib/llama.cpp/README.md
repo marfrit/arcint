@@ -3295,5 +3295,20 @@ Two forms:
   as for Strata's rule, since it runs only when no swap is in flight). Its
   notes became the exact form above. Recorded: a budget that does not parse
   (`LLAMA_EXPERT_CACHE_LFRU_BUDGET=abc`) is 0, no admissions.
+- **Outside the gate set** (`measured-here`, 2026-10-15, after the 0.7.10
+  tag; B60, the 0.7.10 package, the unit's flags, fresh processes
+  alternated, two an arm; six 300-token answers: a Python function, a
+  German explanation, a history summary, a Bash script, a story, public-key
+  cryptography; the same texts in every arm):
+
+  | arm | decode t/s | on the card |
+  |---|---|---|
+  | Strata's adapt | 38.6-39.1 / 29.4 / 32.5-32.6 / 30.6-31.2 / 30.6-30.7 / 37.1-37.4 | 85.7 % |
+  | LFRU, budget 4 | 37.9 / 29.5-29.6 / 31.5 / 30.2 / 28.6-28.7 / 37.7 | 85.2 % |
+
+  LFRU -2.1 % on the means (32.6 against 33.3), per prompt -6.5 to +1.2 %;
+  it swaps 1.5-2x as often (3,840-5,376 swaps a request against
+  2,265-3,359). The hit counts repeat exactly across processes of an arm.
+  The +1.6 % above is the gate set's, not general.
 - **Operator:** which policy the Flash-Next unit runs (a unit flag, not a
   default change).
