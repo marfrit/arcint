@@ -621,6 +621,12 @@ arms of the same configuration).
   43.3-43.4 / 38.6-38.8 / 41.8-42.0 t/s), the same texts, the needle right.
   The per-shape 8 rows, measured with it, lost ~1 % served and is not in
   the patch.
+  The same multiply for IQ2_XXS's signs (the eighth sign the parity of
+  seven, by `popcount`, instead of the local `ksigns` table; llama tree
+  `p0056-iq2xxs-sign`, not in the series): 333 -> 394 instructions and
+  24.5-25.0 / 55.3-55.5 -> 25.6 / 56.6-56.8 us at one / three tokens
+  (`measured-here`, B60, two repeats; suites pass, its red case fails 8/18
+  + 37/75). The local table stays, as stage 5 found for its register form.
 
 - **The draft head's LM head quantized** (`measured-here`, 2026-10-15,
   B60, the 0.7.9 package and unit flags; Strata's request twice and two
