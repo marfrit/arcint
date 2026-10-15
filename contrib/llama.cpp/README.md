@@ -3509,3 +3509,20 @@ product has no SIMD form.
 - **On the unit** (operator, 2026-10-15): the Flash-Next unit sets
   `LLAMA_EXPERT_CACHE_CPU_MISSES=1` from 0.7.11 on (an `Environment=` line;
   it spins 8 threads at 100 % while Flash-Next decodes).
+- **Fixed after 0.7.12: IQ4_NL banks on the slow path** (`measured-here`,
+  B60, ISTA-DASLab's IQ3_XXS file, 2026-10-15). A layer whose types the
+  multi-token rows do not take goes through ggml-cpu's dot products, which
+  read each weight row as GGUF blocks. An IQ4_NL tensor in USM host memory
+  is not stored that way: `ggml_cl_usm_set_tensor` keeps its scales and its
+  quants as two arrays. The slow path read the split as blocks, so a layer
+  with an IQ4_NL down projection (18 of the IQ3_XXS file's 48; none in the
+  IQ2_XS file) produced NaN rows. The next layer's router saw NaN, the fused
+  top-k wrote INT_MAX as every expert id, and the combined-id gather read
+  past its table: the first CPU-miss request faulted in the next fast-path
+  layer (a SIGSEGV in `row_iq<IQ2_XXS>`, layer 1 publishing bank row
+  1,911,949,923 of 329). Found by instrumenting the publish (the ids, the
+  table and the routed ids at that node). The row reader now rebuilds the
+  GGUF blocks from the two arrays (`ggml_cl_miss_cpu_join_iq4nl`).
+  `test-opencl-miss-cpu` checks rows of a two-slice split bank against the
+  GGUF bytes; its red mode, and `GGML_OPENCL_CPU_MISS_SPLIT_RED=1` served,
+  read the split as blocks.

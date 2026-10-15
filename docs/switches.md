@@ -152,6 +152,7 @@ One name is not in a table:
 | `GGML_OPENCL_STAGE_RED` | off | The staging ring's bytes are not copied, so stale bytes reach the card. | 0047 | The capital answered "!!!!!!!!", the needle empty (`measured-here`). |
 | `LLAMA_EXPERT_CACHE_MUTATE` | 0 | `1` corrupts one landed slot; `2` leaves out the last changed row of a table write. | 0021 (`2` from 0046) | `1`: the swap check reports 1 of 6 (`measured-here`). |
 | `GGML_OPENCL_CPU_MISS_RED` | off | The CPU's rows left zero. | 0056 | KL 0.3700 -> 0.4364, top-1 84.4 -> 81.9 % (`measured-here`). |
+| `GGML_OPENCL_CPU_MISS_SPLIT_RED` | off | The slow path reads an IQ4_NL bank's split scales and quants as GGUF blocks (the defect fixed after 0.7.12). | 0056 | IQ3_XXS: NaN rows, then a fault in the next layer (`measured-here`). |
 
 ### Diagnostic
 
