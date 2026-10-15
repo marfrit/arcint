@@ -234,8 +234,13 @@ def check_cancel_leaves_the_other_alone(srv):
 
 def check_busy_lane_is_a_503(srv):
     got = {}
-    busy = ask_async(srv.url, PROMPT_A, LANES[0], got, "busy", 256)
-    time.sleep(1.5)                   # lane a in flight
+    # a long generation, so the lane stays busy while the second request arrives
+    busy = ask_async(srv.url, "Write a story of at least 600 words about a lighthouse keeper.", LANES[0], got, "busy", 600)
+    for _ in range(200):              # until /health shows lane a taken
+        lanes = {l.get("name"): l for l in srv.health().get("lanes", [])}
+        if lanes.get(LANES[0], {}).get("slots_free", 1) == 0:
+            break
+        time.sleep(0.1)
     second = ask(srv.url, "Say hello.", LANES[0], 8)
     other = ask(srv.url, "What is the capital of France? Answer in one word.", LANES[1], 8)
     busy.join()
