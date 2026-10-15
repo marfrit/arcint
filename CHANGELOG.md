@@ -24,7 +24,9 @@ builds llama.cpp `bed0a85` with `contrib/llama.cpp/patches` 0001-0055. Three
 llama.cpp patches, all for Flash-Next; the dense agent and the coder have
 no tensors of the types 0053/0054 touch and 0055 is Flash-Next's expert
 cache. Every number is `measured-here` on the B60 with the Flash-Next unit's
-0.7.9 flags, one binary with the patch's switch off in the other arm; the
+0.7.9 flags, one binary with the patch's switch off in the other arm, except
+the kernel times (test-backend-ops perf, MUL_MAT_ID with 512 experts and top
+10) and the series line (the installed 0.7.9 package against the head); the
 details are in `contrib/llama.cpp/README.md` (0053-0055) and
 `docs/campaigns/flash-next-llama-engine.md` (on the `qfndev` branch).
 
@@ -41,13 +43,16 @@ details are in `contrib/llama.cpp/README.md` (0053-0055) and
   protects the round's experts and admits a miss only over a lower-scoring
   victim, up to `LLAMA_EXPERT_CACHE_LFRU_BUDGET` (4) a layer at each adapt;
   `LLAMA_EXPERT_CACHE_LFRU_EXACT=1` is the reference's clock and candidates.
-  Decode +1.3-1.8 % over Strata's adapt rule (the exact form +1.2 %), 0.6-1.8
+  Decode +1.6 % over Strata's adapt rule on the means (40.4 against 39.8 t/s;
+  per answer +0.6 / +3.2 / +1.1 %; the exact form +1.4 %), 0.6-1.8
   points more experts served from the card, the same texts. Strata's rule
   stays the default.
 - **The series against 0.7.9:** Flash-Next with 0001-0055 and the policy
   decodes 39.4 / 40.2 / 42.5 t/s against the 0.7.9 package's 38.5-39.0 /
   38.4-38.8 / 41.4-41.7 (+2.7 %) on Strata's request and two 300-token
-  answers, the same texts, the needle right.
+  answers, the same texts, the needle right. One head process's first answer
+  ran at 25.5 t/s with the same hit rate (all of it in verify, nothing in the
+  kernel log): not explained, not counted.
 
 ## 0.7.9 — 2026-10-14
 

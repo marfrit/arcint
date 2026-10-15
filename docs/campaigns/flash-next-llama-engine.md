@@ -1552,7 +1552,8 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
   | LFRU 4, Infernix's exact clock and candidates, 2 | 39.0 / 39.8 / 42.2-42.4 | 89.3 / 94.6 / 96.0 % |
 
   Every arm: Paris, the 20k needle in 30.8-31.2 s, the same texts (md5).
-  Budget 4: +1.3 % on the means (40.4 against 39.8 t/s), hit rate +0.6 to
+  Budget 4: +1.6 % on the means (40.4 against 39.8 t/s; first written +1.3 %,
+  an arithmetic slip corrected in the 0.7.10 release review), hit rate +0.6 to
   +1.8 points; the short answer after the 20k prompt sits lower (53 against
   59 % of its 24 tokens' experts, the needle time unchanged). Not crediting
   rejected drafts (Infernix's `live` columns, the next ubatch's position

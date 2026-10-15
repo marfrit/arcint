@@ -3279,7 +3279,10 @@ Two forms:
   | LFRU exact, budget 4 (2) | 39.0 / 39.8 / 42.2-42.4 | 89.3 / 94.6 / 96.0 % |
   | LFRU port, budget 1 (2) / 8 (1) | 38.2-38.9 / 39.6 / 42.1; 39.1 / 40.0 / 42.0 | |
 
-  The port +1.3-1.8 % on the means; every arm Paris, the needle in
+  The port +1.6 % on the means (40.4 against 39.8 t/s over the four and
+  five processes; per answer +0.6 / +3.2 / +1.1 %), the exact form +1.4 %.
+  First recorded as +1.3-1.8 %, an arithmetic slip on the same runs
+  (corrected 2026-10-15 in the 0.7.10 release review). Every arm Paris, the needle in
   30.8-31.2 s, the same texts (md5): the policy moves which experts are
   read over the link, not the values. Not taken: no credit for the
   columns of rejected drafts (Infernix's `live`; the next ubatch's position

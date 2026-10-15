@@ -71,13 +71,15 @@ services:
       GGML_OPENCL_KERNEL_CACHE_DIR: /var/cache/arcint/opencl
       # the expert bank streamed for prompts of 256 tokens and more (patches 0032, 0044)
       GGML_OPENCL_BANK_STREAM: "1"
+      # Infernix's LFRU expert-cache policy instead of Strata's adapt (patch 0055)
+      LLAMA_EXPERT_CACHE_POLICY: lfru
     command: [--engine, llama, --gguf, /models/gguf/<flash-next-iq2_xs-00001-of-00002>.gguf,
               --served-model-name, qwen3.8-flash-next, --device, GPU.0,
               --host, 0.0.0.0, --port, "8089",
               --n-ctx, "131072", --llama-cpu-moe, "48", --llama-threads, "8",
-              --llama-expert-cache, "11300",
+              --llama-expert-cache, "13400", --llama-reserve-cells, "20480",
               --llama-expert-profile, /models/<expert-profile>.bin,
-              --llama-mtp, "2", --llama-mtp-gguf, /models/<flash-next-mtp-head>.gguf,
+              --llama-mtp, "3", --llama-mtp-min-p, "0.5", --llama-mtp-gguf, /models/<flash-next-mtp-head>.gguf,
               --llama-kv, q8_0, --queue-timeout, "30"]
 
 volumes:

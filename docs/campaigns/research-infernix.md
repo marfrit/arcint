@@ -162,7 +162,7 @@ checkout, with these abbreviations:
    by rule: a reference choice for the operator to price, not to drop.
    **Priced 2026-10-15** (`measured-here`, patch 0055, opt-in): the score,
    the protected round and the budgeted admission per layer give Flash-Next
-   +1.3 % decode and +0.6-1.8 points of hits on the B60; no credit for
+   +1.6 % decode (first written +1.3 %, an arithmetic slip) and +0.6-1.8 points of hits on the B60; no credit for
    rejected drafts did not help; the global pool is not built (per-layer
    slot tensors). `flash-next-llama-engine.md` has the table.
 2. **A GPU-planned CPU miss service** over a mapped doorbell, with the shared
