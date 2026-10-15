@@ -1488,6 +1488,26 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
   Next: the conv state's concat and snapshots into the conv kernel; the
   rollback by an accepted-count offset instead of K snapshots is the larger
   change, priced separately.
+- **The conv stage, priced** (`measured-here`, 2026-10-15, one binary with
+  0053; llama tree `p0054-conv-ceiling`, not in the series).
+  `LLAMA_CONV_SNAP_CEILING=1` drops the conv state's K-1 non-final rollback
+  snapshots (one strided copy each, a GDN layer): rollbacks restore stale
+  state, acceptance falls, so the comparison is a verify round at the same
+  draft rows, rounds = tokens - accepted.
+
+  | service | rounds, drafts a round | verify a round, with / without the copies |
+  |---|---|---|
+  | dense agent, B60, MTP 5 | 108 / 45, 4.97 / 5.1 | 61.1 / 60.4 ms (-1.1 %) |
+  | coder, A770, MTP 4 | 115 / 197, 3.96 / 3.95 | 37.4 / 36.8 ms (-1.6 %) |
+
+  Two processes an arm, identical numbers. A conv kernel that writes its
+  snapshots and takes the concat too saves about K / (K - 1) of that:
+  ~1.3 % and ~2.0 % of a verify, ~1.1 % and ~1.4 % of decode. The
+  reference's form (`code`, vllm-xpu-kernels `gated_delta_rule.hpp`: every
+  token's state to its own slot, the next step reading slot
+  `num_accepted - 1`, no copy back; its conv kernel keeps one window and
+  stages a multi-token step through a temporary) is a change to the memory
+  module's rollback, not a fusion. Below the charter's 2 %; not built.
 - **The input copies.** The OpenCL backend has no events and no async copy,
   so the scheduler synchronizes the queue and writes blocking for each of a
   verify's 34 inputs (positions, masks, indices): 17 us a pair on the B60
