@@ -270,7 +270,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v)) return fail("--engine needs llama");
             if (v == "ov")
                 return fail("--engine ov was retired with the OpenVINO engine in 0.8.0: the last release "
-                            "that has it is the tag openvino-history (see docs/history.md)");
+                            "that has it is 0.7.12, its record the tag openvino-history (see docs/history.md)");
             if (v != "llama") return fail("--engine takes llama (the only engine)");
             cfg.engine = std::string(v);
         } else if (arg == "--llama-cpu-moe") {
