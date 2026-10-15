@@ -598,6 +598,29 @@ arms of the same configuration).
   67.5 at three; Q2_0 52.0 -> 49.0 at three) and slower for down (K 640,
   2,560 rows: 63.6 -> 81.1 us at three); 1 and 2 are slower everywhere. A
   per-shape choice would gain ~5 % of gate/up at a verify's width.
+  Down lost because `MV_LB4` (4 lanes a row where 16 lanes do not divide
+  K = 640) is compiled only at 4 rows (`code`, `mul_mv_iq_q8_1.cl`).
+- **IQ2_S's grid packed, not taken** (`measured-here`, 2026-10-15, B60,
+  test-backend-ops perf, MUL_MAT_ID 512 experts, top 10, 640 x 2560, two
+  repeats): the grid's bytes take three values (8, 25, 43), so its 1,024
+  entries fit 16-bit codes (2 KiB against 8). Expanded with integer
+  operations from constant memory 43.6 / 101.4 us at one / three tokens,
+  from local memory 46.8 / 105.5, through a local byte table (four codes to
+  four bytes) 39.3 / 82.1, against the 64-bit constant grid's 31.1 / 70.8.
+  The constant gather is not the bound; the kernel's integer issue is (the
+  ISA, offline, bmg: 487 instructions with the 64-bit grid, 594-737
+  packed). Its red case (43 read as 42) failed 1 of 13 MUL_MAT cases and no
+  MUL_MAT_ID case: a one-level grid error is near the suite's tolerance.
+- **Fewer operations in the decode: patch 0053** (`measured-here`,
+  2026-10-15, B60; README 0053). IQ2_S / IQ3_S sign bits and Q2_0's 2-bit
+  fields spread to bytes by multiplies instead of shifts and masks, exact
+  for every input byte. IQ2_S 31.1 / 70.9 -> 29.1 / 63.6 us at one / three
+  tokens (487 -> 425 instructions), Q2_0 gate/up 21.8 / 52.0 -> 20.9 / 49.7.
+  Served (the 0.7.9 unit's flags, one binary, two processes an arm):
+  decode +0.9 % on the mean (38.6 / 43.0 / 38.3 / 41.4 -> 38.7-39.2 /
+  43.3-43.4 / 38.6-38.8 / 41.8-42.0 t/s), the same texts, the needle right.
+  The per-shape 8 rows, measured with it, lost ~1 % served and is not in
+  the patch.
 
 - **The draft head's LM head quantized** (`measured-here`, 2026-10-15,
   B60, the 0.7.9 package and unit flags; Strata's request twice and two

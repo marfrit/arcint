@@ -3157,3 +3157,71 @@ Two changes, the values unchanged:
   KV windows count cells by position, which undercounts them (growth back
   toward the old reservation, not corruption). The Flash-Next unit runs
   one lane.
+
+## 0053-opencl-lowbit-decode-spread.patch
+
+Fewer integer operations in the low-bit expert matvecs' weight decode,
+the same values. Flash-Next's expert kernels are bound by integer issue,
+not by memory (stage 3d of `docs/campaigns/flash-next-llama-engine.md`).
+Two decodes did per-byte work with shifts and masks:
+- **IQ2_S and IQ3_S signs.** Eight sign bits per eight weights became a
+  byte mask through `lb_signmask4` (seven operations per four weights).
+  Now the four bits spread to the bytes' low bits by one multiply,
+  `((b & 0xF) * 0x00204081) & 0x01010101` (copies at shifts 0, 7, 14, 21 do
+  not overlap), and the signed value is `(g ^ (s * 0xFF)) + s`.
+- **Q2_0's fields.** Four 2-bit fields of a byte went to four bytes with
+  three shifts, four masks and three ors. Now fields 0, 2 and 1, 3 spread by
+  one multiply each (`* 0x1001` and `* 0x40040` after masking `0x33` and
+  `0xCC`).
+
+Both identities hold for every input byte (checked exhaustively), so the
+results are bit-identical. `-DLB_SIGN_MASK4` and `-DQ2_SPREAD_SHIFT`
+through `GGML_OPENCL_IQ_OPTS` keep the old forms (measurement);
+`-DLB_SIGN_RED` and `-DQ2_SPREAD_RED` are the red cases.
+
+- **Kernels** (`measured-here`, 2026-10-15, B60, test-backend-ops perf,
+  MUL_MAT_ID with 512 experts and top 10, two repeats each):
+
+  | kernel | before | 0053 | instructions (offline ISA, bmg) |
+  |---|---|---|---|
+  | IQ2_S 640 x 2560, 1 / 3 tokens | 31.1 / 70.9 us | 29.1 / 63.6 | 487 -> 425 |
+  | Q2_0 640 x 2560, 1 / 3 tokens | 21.8 / 52.0 | 20.9 / 49.7 | 372 -> 340 |
+  | Q2_0 2560 x 640, 1 / 3 tokens | 24.8 / 63.5 | 24.6 / 62.3 | |
+  | IQ3_S | | | 553 -> 489 |
+
+- **Suites:** MUL_MAT and MUL_MAT_ID for IQ2_S, IQ3_S, Q2_0, IQ2_XXS,
+  IQ2_XS and IQ1_M pass on the B60 and the A770. The red cases fail on the
+  B60: signs 6/13 + 2/4 (IQ2_S), 6/13 + 8/12 (IQ3_S); Q2_0's fields 10/20
+  + 49/87.
+- **Served** (`measured-here`, 2026-10-15, B60, Flash-Next with the unit's
+  0.7.9 flags, one binary, the old forms through `GGML_OPENCL_IQ_OPTS`,
+  two processes each; Strata's request twice and two 300-token answers):
+
+  | arm | decode t/s | verify s |
+  |---|---|---|
+  | before | 38.6 / 43.0-43.1 / 38.3-38.4 / 41.4 | 11.43-11.44 / 10.08-10.09 / 6.81-6.82 / 6.24 |
+  | 0053 | 38.7-39.2 / 43.3-43.4 / 38.6-38.8 / 41.8-42.0 | 11.22-11.37 / 10.00-10.01 / 6.71-6.76 / 6.13-6.17 |
+
+  +0.9 % on the mean; Paris, the 20k needle, the same texts (md5), prefill
+  664 t/s in both. The coder and the dense agent have no tensors of these
+  types.
+- **Not taken on the way** (`measured-here`, the same harness):
+  - The low-bit MUL_MAT_ID at 8 rows a sub-group where 16 lanes divide a
+    row (gate/up only; down keeps 4 rows and its 4-lane rows, `MV_LB4`,
+    which compiles only at 4): faster in isolation (IQ2_S 71.3 -> 67.5 us
+    at three tokens) but ~1 % slower served (verify 11.44 -> 11.57-11.70
+    s), with or without the sign change. Half the work-groups cover the
+    missed experts' link reads less well; not measured further.
+  - IQ2_S's grid as 16-bit codes (its bytes take three values): slower in
+    every form tried; the campaign document has the table.
+- **Reviewed** before the push by a second model: no value change and no
+  build break; it rechecked both identities exhaustively (every IQ2_S and
+  IQ3_S grid word against every sign byte) and found every IQ2_S, IQ3_S and
+  Q2_0 kernel family (dense, MUL_MAT_ID, grouped, 4-lane rows) through
+  `lb_expand`. Applied: a red case stacked on a switch that keeps the old
+  form (`LB_SIGN_RED` with `LB_SIGN_MASK4` or `LB_CHAR4_ARITH`,
+  `Q2_SPREAD_RED` with `Q2_SPREAD_SHIFT`) is a compile error instead of a
+  green run that tests nothing (preprocessor lines only; the measured
+  build's default source is otherwise the same). Recorded: the prompt GEMM's
+  own copy of the IQ2_S / IQ3_S decode (`mul_mm_kq_f16.cl`) still uses
+  `lb_signmask4`; 0053 is decode only.

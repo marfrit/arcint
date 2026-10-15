@@ -65,7 +65,7 @@ Two kinds of name are not in a table:
 | `GGML_OPENCL_FA_SG8_NSG` | 16 (8, 16 or 32; used with the global-Q build) | Sub-groups a work-group in the sub-group-8 prompt attention. | 0039 | — |
 | `GGML_OPENCL_FUSE_0051_PART` | 3 | Which GDN gating inputs fold into the kernel: 1 gate, 2 beta, 3 both. | 0051 | Both: +0.3 % dense agent, +0.9-1.2 % coder, neutral Flash-Next (`measured-here`). |
 | `GGML_OPENCL_GATHER_CHUNKS` | 16 | Work-groups an expert's bytes are cut into in the gather. | 0022 | Did not move the gathers' time (`measured-here`). |
-| `GGML_OPENCL_IQ_OPTS` | none | Extra defines for the IQ matvec builds (measurement). | 0022 | Carries `-DLB_CHAR4_ARITH`, `-DIQ4_KV_CHAR4` (README 0035). |
+| `GGML_OPENCL_IQ_OPTS` | none | Extra defines for the IQ matvec builds (measurement). | 0022 | Carries `-DLB_CHAR4_ARITH`, `-DIQ4_KV_CHAR4` (README 0035), `-DLB_SIGN_MASK4` and `-DQ2_SPREAD_SHIFT` (the decodes before 0053), and the red cases `-DLB_SIGN_RED`, `-DQ2_SPREAD_RED` (README 0053). |
 | `GGML_OPENCL_KQ_2D_OPTS` | none | Extra defines for the 2D K-quant GEMM programs. | 0014 | — |
 | `GGML_OPENCL_KQ_2D_SHAPE` | `64,16,32` | `TM,WG,AT`: token tile, sub-groups, activation read height (8 or 32). | 0011 | Shape as measured in patch 0029 of marfrit-openvino (`measured-here`). |
 | `GGML_OPENCL_KQ_2D_T<i>` (i = 0, 1, 2) | unset: the `KQ_2D_SHAPE` values | `TM,WG,AT,KSYNC` for Q4_K, Q5_K, Q6_K. Read by `tools/kq_tune`. A shape that does not build is ignored with a warning. | 0014 | — |
