@@ -1519,7 +1519,10 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
     propose step 8.9 -> 8.3 ms and the verify 61.2 -> 60.8 ms, ~1.4 % of a
     ~70 ms round as the whole ceiling;
   - the coder and Flash-Next: empty answers (their verify depends on it), no
-    round to compare. Flash-Next's verify graph has 284 quantize launches
+    round to compare (Flash-Next's arm also faulted the B60, `xe` "Fault
+  response: Unsuccessful -ENOENT" with a coredump: a stale activation
+  buffer read as indices; the card served normally in every run after,
+  no reboot). Flash-Next's verify graph has 284 quantize launches
     (0.7.5 profile); at 0049's rate (~0.4 % of decode a hundred launches)
     that is ~1.1 %.
   A fold keeps the quantization work and removes the launch: below the
@@ -1567,7 +1570,15 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
   How this differs from Infernix (PI:2353-2357): it saves the policy's
   counts and fills half the frames from them; this saves a ranking and
   fills all slots. Not a verdict on a warm start seeded from the same
-  workload. Infernix's global
+  workload.
+- **The series head against 0.7.9** (`measured-here`, 2026-10-15, B60, the
+  unit's flags, the installed package against 0001-0055 with
+  `LLAMA_EXPERT_CACHE_POLICY=lfru`, alternated): the package 38.5-39.0 /
+  38.4-38.8 / 41.4-41.7 t/s, the head 39.4 / 40.2 / 42.5 (+2.7 % on the
+  means; a second head process ran its first answer at 25.5 t/s with the
+  same hit rate, all of it in verify, nothing in the kernel log: not
+  explained, not counted). The head with Strata's rule 38.8 / 38.7 / 41.7.
+  Paris, the 20k needle and the texts (md5) the same in every arm. Infernix's global
   pool (one capacity over all layers) is not built: the slots are
   per-layer tensors.
 - **The input copies.** The OpenCL backend has no events and no async copy,
