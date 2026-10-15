@@ -1,7 +1,7 @@
 # Sub-4-bit weight execution on GPUs — a 2026-09-05 survey
 
 Scope: sub-4-bit weight execution on GPUs, especially Intel Arc, feeding
-`sub4bit-vram-kernel.md` (per-expert GEMM kernel with in-kernel dequant
+`sub4bit-vram-kernel.md` (at the tag `openvino-history`) (per-expert GEMM kernel with in-kernel dequant
 for routing-aware expert execution; sub-4-bit as a cache-headroom lever) and `kquant-host-storage.md` (host CPU kernel for native
 K-quant/IQ-class blocks). Each entry: format, kernel approach, measured
 numbers (MARKETING = vendor claim, unverified), license, Arc status, URL.

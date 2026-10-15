@@ -24,7 +24,7 @@ link, the doorbell), replacing the per-layer split.
 ## Reference to follow
 
 - Strata (`~/src/Strata-ref`, `code`; source map and effects in
-  `expert-hot-set-lru.md` and `tier-handoff-doorbell.md`, which built the
+  `expert-hot-set-lru.md` and `tier-handoff-doorbell.md` (at the tag `openvino-history`), which built the
   same mechanisms on the OpenVINO path): the expert cache
   (`src/core/expert_cache.cpp`, `src/program/generate.cpp:4413-4482`), the
   miss split (`src/core/expert_source.cpp:1614-1696`), the doorbell

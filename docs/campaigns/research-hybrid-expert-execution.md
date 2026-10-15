@@ -271,7 +271,7 @@ the rows come from the GitHub and Hugging Face write-ups of the same setups.
 | Ryzen 9 5900X, 64 GB DDR4, RTX 3080 10 GB (a commenter on the same thread) | llama.cpp, 4.25 bpw, q4 KV, 99 % RAM used plus NVMe paging | experts on the CPU | 130 t/s at a 35k prompt | 13–15 t/s |
 | Strix Halo, 128 GB unified, 70 W (r/LocalLLM benchmark thread) | Halogen 0.14 / gufo / CIRU | everything in unified memory | ~800–1,150 t/s at 32k–130k | 28–40 t/s with MTP (70–85 % accept), flat with depth |
 
-Against arcint (`measured-here`, 2026-09-30, `docs/campaigns/qsa.md`): the
+Against arcint (`measured-here`, 2026-09-30, `docs/campaigns/qsa.md` (at the tag `openvino-history`)): the
 B60 24 GB with 52 GiB of host RAM, d48q8 native, ratio 75 + census128 +
 30 GiB bank, 20,085-token prompt: **68.5 t/s prefill, 6.0 t/s decode, no
 MTP**.
