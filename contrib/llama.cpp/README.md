@@ -18,6 +18,42 @@ batch (`llama-perplexity -b 4*c`, ubatches that mix the sequences). arcint
 decodes one sequence per call, but llama.cpp's own batching does not. 0022
 shipped a defect only the second arm sees (fixed by 0027).
 
+## Moving the pin
+
+The pin moves only as a release decision of its own (charter C3,
+`docs/milestone-1.0.0.md`), never to make a patch apply.
+
+What a move costs (`measured-here`, 2026-10-15, a clone of upstream master
+`e467e5b` against `bed0a85`, 274 commits apart): 43 of the 55 patches touch
+`ggml/src/ggml-opencl/ggml-opencl.cpp`, where upstream changed 445 lines in
+8 commits, among them `f2cc728`, which split `load_cl_kernels` (the
+function most of the series extends; patch 0001 already fails there). 13
+patches touch llama's `src/` (0010, 0021, 0022, 0024, 0026, 0029, 0030,
+0042, 0046, 0049, 0051, 0052, 0055), where upstream made 53 commits, most of
+the churn in `llama-context.cpp` (278 lines) and `llama-graph.cpp` (454).
+`tests/test-backend-ops.cpp` (650 lines) is the third shared file. The
+kernel files are almost all the series' own (`flash_attn_f32_f16.cl` 170
+and `cpy.cl` 2 upstream lines are the exceptions). A move is a port of the
+host side, not a re-apply.
+
+The procedure:
+
+1. A branch at the new commit; the GitHub tarball's sha256 in
+   `contrib/packaging/arcint/build-deb.sh` (`LLAMA_COMMIT`,
+   `LLAMA_TARBALL_SHA256`) and the pin named here.
+2. The patches ported in order, each committed and then regenerated as a
+   patch against its predecessor, so each stays PR-shaped and applies with
+   `git apply` on the new pin.
+3. Each patch's own record re-run on the port: its test-backend-ops suites on
+   both cards, its red case failing and its old-form switch passing, and
+   the KL arms where the patch carries one (one and four sequences a batch).
+4. The three services against the last release on the same cards: the
+   answers (facts, the needle, the acceptance task) and the answer-level
+   bar, and decode / prefill against the pin's build; a slowdown from
+   upstream's own changes is recorded with its cause, not absorbed.
+5. Released like any other version: the pre-tag served check, the second
+   review, the fresh container.
+
 ## 0001-opencl-intel-kquant-integer-dot-and-xmx.patch
 
 ggml's OpenCL kernels are tuned for Adreno; on Intel Arc the K-quant matrix
