@@ -41,7 +41,8 @@ The procedure:
 
 1. A branch at the new commit; the GitHub tarball's sha256 in
    `contrib/packaging/arcint/build-deb.sh` (`LLAMA_COMMIT`,
-   `LLAMA_TARBALL_SHA256`) and the pin named here.
+   `LLAMA_TARBALL_SHA256`), the same two ARGs in `docker/Dockerfile.arcint`
+   (its build checks them against the recipe), and the pin named here.
 2. The patches ported in order, each committed and then regenerated as a
    patch against its predecessor, so each stays PR-shaped and applies with
    `git apply` on the new pin.

@@ -1630,11 +1630,29 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
   a file that changes the head only (`mtp-flash-next-q8e4n-hq4k.gguf`:
   `--output-tensor-type q4_K --token-embedding-type q6_K`, the rest as
   q8e4n; 2.407 against 2.571 GB) decodes 43.9-44.0 / 41.8-41.9 / 40.5-40.6 /
-  42.0-42.2 / 37.4-37.5 / 36.0-36.2 against Q6_K's 42.3-42.4 / 41.3 /
-  40.5-40.9 / 43.0-43.8 / 37.1-37.4 / 33.5-33.6 t/s (+2.2 % on the mean),
+  42.0-42.2 / 37.4-37.5 / 36.2-36.3 against Q6_K's 42.4 / 41.3 / 40.5-40.7 /
+  43.1-43.8 / 37.1-37.3 / 33.6 t/s (+1.5 % on the mean; the runs on a quiet
+  host; a first pair overlapped a package build and is not counted; first
+  written +2.2 %, an arithmetic slip corrected in the 0.7.12 release review),
   peak VRAM 23,757 against 23,913 MiB, Paris and the needle right. On the
   unit since 2026-10-15 (operator: "integrate if better");
   `tools/flash_next_mtp_gguf.sh` now writes this head.
+- **The packages' ggml-cpu was SSE-only** (`measured-here`, 2026-10-15,
+  B60, the unit's flags with the CPU misses and the Q6_K draft head; one
+  400-token answer, the Python function prompt, a fresh process each,
+  alternated). The 0.7.11 package (`/usr/bin/arcint`, also run from a copy
+  elsewhere) 45.5-46.2 t/s in 8 processes; a dev build of the same code
+  (libllama only) 48.4-48.8; that dev build with OpenVINO and TBB preloaded
+  48.6-48.8; a dev build configured as the package (both engines, the
+  recipe's flags) 49.3-49.4. Same thread count (25 while decoding), the
+  same compile flags for ggml-opencl and the CPU rows, but the package's
+  `.text` 365 KB smaller: the recipe exports `SOURCE_DATE_EPOCH`, ggml reads
+  it as a reproducible build and sets `GGML_NATIVE=OFF` (its kept build tree's
+  cache), so ggml-cpu was SSE2-only in every package since the engine
+  shipped (0.5.5). Without the CPU misses the package matched the dev build
+  on six answers (38.7 / 38.6-38.7 / 41.7 / 34.7-34.8 / 31.8 t/s, two
+  processes each): the cost shows when the CPU is saturated. The recipe asks
+  for `GGML_NATIVE=ON` and checks it from 0.7.12 on.
 - **A tool trap:** `llama-perplexity` on Flash-Next with the expert cache
   was killed by the container's memory limit at 54 GB of anonymous memory:
   its default load mode `auto` reads the whole file into memory when a

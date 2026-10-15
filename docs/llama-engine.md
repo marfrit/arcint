@@ -139,7 +139,7 @@ with every expert computed on the card and its MTP layer drafting:
 - `mtp-flash-next-q8e4n.gguf` (the head Q6_K, as measured below) was built
   by `tools/flash_next_mtp_gguf.sh` from the checkpoint's 31 `mtp.*` tensors
   (the GGUFs carry no MTP layer). Since 2026-10-15 the tool writes
-  `mtp-flash-next-q8e4n-hq4k.gguf`, the head Q4_K: +2.2 % decode on 0.7.11,
+  `mtp-flash-next-q8e4n-hq4k.gguf`, the head Q4_K: +1.5 % decode on 0.7.11,
   156 MiB less VRAM (`measured-here`, the campaign document).
 
 Measured on the B60 (`measured-here`, 2026-10-07, the 20,045-token needle,
@@ -224,9 +224,10 @@ GEMM gathers its routed bank experts. 77 tokens 1.84 -> 1.11 s, 173 tokens
 (upstream master of 2026-10-15) with the 56 patches ported; the dense agent
 and the coder decode and prefill as on `bed0a85`, Flash-Next +1.3 %
 (`contrib/llama.cpp/README.md`, "Moving the pin"). The package's ggml-cpu is
-built with `-march=native` again (until 0.7.12 it was SSE-only, which cost
-Flash-Next with the CPU misses 7.7 % of decode). Flash-Next's draft head is
-`mtp-flash-next-q8e4n-hq4k.gguf` (its LM head Q4_K: +2.2 %, 156 MiB less
+built with `-march=native` (every package since 0.5.5 was SSE-only, which
+cost Flash-Next with the CPU misses 7.7 % on one answer, 45.6 against 49.4
+t/s). Flash-Next's draft head is
+`mtp-flash-next-q8e4n-hq4k.gguf` (its LM head Q4_K: +1.5 %, 156 MiB less
 VRAM).
 
 **Flash-Next since 0.7.11** (`contrib/llama.cpp` 0056, `measured-here`, B60,

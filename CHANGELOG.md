@@ -40,14 +40,15 @@ old and the new base, alternated for Flash-Next; the record is
   the coder 51.2 / 47.5 / 44.1 -> 51.1 / 47.6 / 44.1 t/s with the same
   texts; the needles, the facts and the acceptance task unchanged. Owed for
   this move: the patches' own red cases and four-sequence KL arms.
-- **The package's ggml-cpu is native again.** The recipe exports
+- **The package's ggml-cpu is native.** The recipe exports
   `SOURCE_DATE_EPOCH`, which ggml reads as a reproducible build and answers
-  with `GGML_NATIVE=OFF`: every package's ggml-cpu was SSE-only. With
+  with `GGML_NATIVE=OFF`: every package's ggml-cpu since 0.5.5 was SSE-only. With
   Flash-Next's CPU misses that cost 7.7 % (45.6 against 49.4 t/s on one
-  answer; a dev build configured as the package otherwise was fast). The
+  answer; a dev build configured as the package otherwise decoded 49.3-49.4,
+  and without the CPU misses the package matched it). The
   recipe now asks for `GGML_NATIVE=ON` and checks the CMake cache.
 - **Flash-Next's draft head Q4_K** (a unit change, measured on 0.7.11): the
-  MTP file with its LM head Q4_K and the rest as before decodes +2.2 % on
+  MTP file with its LM head Q4_K and the rest as before decodes +1.5 % on
   six answers with 156 MiB less VRAM; `tools/flash_next_mtp_gguf.sh` writes
   it.
 

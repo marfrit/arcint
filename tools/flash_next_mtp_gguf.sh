@@ -5,7 +5,7 @@
 # about 7.3 GB fetched by range requests), converts it with the pinned llama.cpp's converter (--mtp, BF16),
 # and quantizes it as served: Q8_0 dense, Q4_K gate/up experts, IQ4_NL down experts, the embedding Q6_K
 # and the head Q4_K (mtp-flash-next-q8e4n-hq4k.gguf, 2.24 GiB; until 2026-10-15 the head was Q6_K,
-# mtp-flash-next-q8e4n.gguf: the Q4_K head decodes +2.2 % on 0.7.11, docs/campaigns/flash-next-llama-engine.md).
+# mtp-flash-next-q8e4n.gguf: the Q4_K head decodes +1.5 % on 0.7.11, docs/campaigns/flash-next-llama-engine.md).
 #
 # usage: tools/flash_next_mtp_gguf.sh <llama.cpp tree (the pin with contrib/llama.cpp/patches)> <out dir>
 #   PYTHON (default python3) needs safetensors, numpy, torch-free gguf-py deps of the converter;
