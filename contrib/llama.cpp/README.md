@@ -3347,3 +3347,106 @@ Two forms:
   The +1.6 % above is the gate set's, not general.
 - **Operator:** which policy the Flash-Next unit runs (a unit flag, not a
   default change).
+
+## 0056-expert-cache-cpu-misses.patch
+
+Strata's doorbell tier for the expert cache's decode misses, with Strata's
+CPU kernels. Opt-in with `LLAMA_EXPERT_CACHE_CPU_MISSES=1`. At a decode
+layer's first expert projection a kernel hands the first
+`GGML_OPENCL_CPU_MISS_MAX` (16) missed (token, expert) pairs to the CPU: -1
+in the combined ids, so the card's three projections skip them, and the pairs
+and the activation published to USM host memory behind a release store. The
+card reads the other misses over the link as before. A coordinator thread and
+a spinning pool (`LLAMA_EXPERT_CACHE_CPU_MISS_THREADS`, 8) compute the pairs'
+gate, up, SwiGLU and down from the bank in host RAM while the card computes
+the hits. After the down projection a kernel polls the done flag with
+L1/L3-uncached loads (0077's form) and copies the rows in.
+
+The CPU's rows are Strata's multi-token AVX2 kernels (`code`, Strata
+`src/kernels/cpu/iq_avx2.cpp`, `q2_avx2.cpp`, MIT; `ggml-opencl-miss-cpu.cpp`):
+a 32-value chunk is decoded once and every token of the window applies it.
+The pairs are grouped by expert, so an expert missed by several tokens of a
+verify is decoded once. Two departures: the weights are read from the bank's
+planes (0022) instead of GGUF blocks, and the activations' quantizers are
+written here (ggml's q8_K rule for IQ2_S / IQ2_XXS, Strata's 32-value chunks
+for Q2_0). A layer of another type (Flash-Next's three IQ1_M layers) uses
+ggml-cpu's dot products, as does `GGML_OPENCL_CPU_MISS_MT=0`.
+
+A prototype with ggml-cpu's dot products (stage 3c of
+`docs/campaigns/flash-next-llama-engine.md`) did not pay: ggml-cpu's Q2_0 dot
+product has no SIMD form.
+
+- **The kernels** (`measured-here`, 2026-10-15, the host's Ryzen 7 5700X, one
+  thread, seeded data):
+
+  | kernel | ggml-cpu, 1 / 4 tokens | Strata's rows, 1 / 4 tokens |
+  |---|---|---|
+  | IQ2_S 2560 x 640 (gate, up) | 98 / 394 us | 127 / 168 us |
+  | Q2_0 640 x 2560 (down) | 661 / 2,637 us (0.7 GB/s) | 72 / 153 us |
+
+- **Test** (`tests/test-opencl-miss-cpu.cpp`, ctest): the rows against
+  ggml-cpu's `vec_dot` for IQ2_S, IQ2_XXS and Q2_0 in planes, 1-6 tokens a
+  pass: the i-quants exact, Q2_0 within 2.7e-4 (Strata's activation chunks
+  against ggml's q8_0). Its red mode (the planes read as GGUF blocks) fails
+  18 of 18.
+- **Served** (`measured-here`, 2026-10-15, B60, Flash-Next with the 0.7.10
+  unit's flags and Strata's adapt rule, one binary, fresh processes; Strata's
+  request, the two gate answers, a Python function, a German explanation and
+  a story, 500 / 300 tokens; decode t/s):
+
+  | CPU takes a layer | decode | mean |
+  |---|---|---|
+  | none (4 processes) | 38.7-39.0 / 38.7-38.8 / 41.7-41.8 / 34.8-34.9 / 31.8-31.9 / 31.6 | 36.3 |
+  | up to 2 | 41.5 / 39.1 / 40.7 / 37.6 / 35.3 / 32.5 | 37.8 (+4.2 %) |
+  | up to 4 (2) | 44.0 / 41.8-41.9 / 41.4-41.5 / 39.9 / 36.8 / 32.2 | 39.4 (+8.5 %) |
+  | up to 8 (2) | 42.8-42.9 / 40.9 / 41.8 / 43.2-43.3 / 37.3 / 36.0-36.1 | 40.4 (+11.3 %) |
+  | up to 16, 6 threads | 42.6 / 42.8 / 43.5 / 44.8 / 38.5 / 34.6 | 41.1 (+13.4 %) |
+  | up to 16, 8 threads (the default; 2) | 43.9 / 43.1-43.2 / 43.7 / 45.8-45.9 / 38.9 / 35.1 | 41.8 (+15.2 %) |
+  | up to 16, 10 / 12 threads | 43.9 / 43.0 / 43.6-43.7 / 46.1-46.4 / 38.9 / 34.9 | as 8 |
+  | up to 24 / 32 | 42.6 / 41.1 / 43.5 / 45.6 / 38.3 / 35.5; 42.2 / 44.0 / 43.2 / 44.4 / 37.1 / 33.3 | below 16 |
+
+  Every arm Paris and the 20k needle (30.6-30.9 s). The texts differ from
+  the card-only arm (the CPU's sums are not the card's) and repeat exactly
+  across processes of an arm. The gain is largest where the cache misses
+  most: the code answer (78 % of its experts on the card) +32 %.
+- **KL as served** (`measured-here`, `llama-perplexity` against the
+  Flash-Next reference capture, 8 x 512 tokens in ubatches of 4, so every
+  ubatch takes the decode path and its misses go to the CPU; the cache
+  through `LLAMA_EXPERT_CACHE_MIB` / `_PROFILE`, `--no-repack -lm mmap` as
+  arcint loads):
+
+  | arm | mean KL | top-1 |
+  |---|---|---|
+  | card only (2 runs) | 0.367287 | 84.363 % |
+  | CPU up to 8 | 0.369126 | 84.412 % |
+  | CPU up to 16 | 0.370044 | 84.412 % |
+  | red case (`GGML_OPENCL_CPU_MISS_RED=1`: the CPU's rows left zero) | 0.436437 | 81.912 % |
+
+  +0.0028 nats and +0.05 points against the bar's +0.03 and -1; the red case
+  fails it.
+- **The coder at the same time** (`measured-here`, the A770's unit answering
+  300-token questions in a loop while Flash-Next decodes on the B60, two
+  processes an arm): the coder 42.0 t/s end to end with Flash-Next's CPU
+  misses against 42.4 without (-1 %); Flash-Next keeps its gain under that
+  load (+14 %).
+- **Reviewed** by a second model before the commit (`code`): the plane
+  addressing, each decoder against ggml's references and Strata's, the
+  quantizers, the SwiGLU clamp, the bounds, the memory ordering and the swap
+  copies against the CPU's reads were found correct. Four defects, fixed
+  and re-measured (the same texts, KL and decode as above):
+  - the pool's claim could race with a new run's reset (a worker woken
+    between the reset and the epoch bump), hanging the coordinator: the
+    claim is now one CAS on a word holding the run's epoch, task count and
+    next index;
+  - the sign table's static initializer sat under the AVX2 target pragma,
+    so loading the library could fault on a CPU without AVX2: it is built
+    before the pragma (its initializer disassembles to SSE2 only), and
+    clang gets the attribute form of the pragma;
+  - the publish is flushed to the card, and the CPU's wait for it is a 30 s
+    hang guard that aborts with a message instead of a 2 s timeout whose
+    NaN rows reached the sampler;
+  - a publish now runs below the kernel checks, on the per-pair matvec only,
+    and waits out a job never merged before it rewrites the shared buffer.
+- **Operator:** whether the Flash-Next unit sets
+  `LLAMA_EXPERT_CACHE_CPU_MISSES=1` (an `Environment=` line; it spins 8
+  threads at 100 % while Flash-Next decodes).

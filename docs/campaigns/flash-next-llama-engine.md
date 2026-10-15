@@ -580,7 +580,8 @@ arms of the same configuration).
   that decode a block once for the whole window (`code`,
   `src/kernels/cpu/iq_avx2.cpp`), a Zen 4 with AVX-512 and DDR5 (`paper`),
   and a recorded pass. Not a verdict on the mechanism: on this host it
-  needs a CPU expert kernel at least twice as fast as ggml-cpu's.
+  needs a CPU expert kernel at least twice as fast as ggml-cpu's. Built with
+  Strata's kernels as patch 0056 (2026-10-15, below): +15 % decode.
 
 - **Not taken, 2026-10-15** (`measured-here`, B60, the 0.7.9 flags): the
   hyper-connection gate (`hc_gate`, f16 10,240 x 320, ~32 us a call, 4.3 %
@@ -1601,6 +1602,32 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
   answer sit lowest (29.4 / 32.5 t/s, 82 / 85 %). The gate set flatters the
   service, and the expert cache's misses are its decode lever on other
   text.
+- **The misses on the CPU with Strata's kernels: patch 0056**
+  (`measured-here`, 2026-10-15, B60, the 0.7.10 unit's flags and Strata's
+  rule; README 0056). The prototype above lost on ggml-cpu's dot products:
+  measured alone on this host's Zen 3, ggml-cpu's Q2_0 dot product has no
+  SIMD form (661 us a 2560 x 640 down matrix, 0.7 GB/s a thread) and its
+  i-quant ones are single-token (IQ2_S 98 us at one token, 394 at four).
+  Strata's multi-token AVX2 rows (`code`, `src/kernels/cpu/iq_avx2.cpp`,
+  `q2_avx2.cpp`) decode a chunk once for the window: Q2_0 72 / 153 us, IQ2_S
+  127 / 168 us at one / four tokens. Ported to read the bank's planes, the
+  pairs grouped by expert, 16 pairs a layer to the CPU and the rest over the
+  link: decode 38.7-39.0 / 38.6-38.8 / 41.7-41.8 / 34.7-34.9 / 31.8-31.9 /
+  31.5-31.6 -> 43.8-44.0 / 43.1-43.3 / 43.7-43.9 / 45.8-46.1 / 38.9 /
+  35.0-35.1 t/s on Strata's request, the two gate answers, a Python function,
+  a German explanation and a story (+15.2 % on the mean, +32 % on the code
+  answer, whose cache hits least); KL as served +0.0028 nats, top-1 +0.05
+  points; Paris and the needle in every arm. The coder on the A770 decoding
+  at the same time loses ~1 %. On Strata's own request Flash-Next now
+  decodes 43.8-44.0 t/s against Strata's 37.8 on this card (the B3
+  comparison of 2026-10-14; Strata not re-run). Opt-in
+  (`LLAMA_EXPERT_CACHE_CPU_MISSES=1`); the unit is the operator's call.
+- **A tool trap:** `llama-perplexity` on Flash-Next with the expert cache
+  was killed by the container's memory limit at 54 GB of anonymous memory:
+  its default load mode `auto` reads the whole file into memory when a
+  device cannot map (the OpenCL device cannot). `-lm mmap` (and
+  `--no-repack`, as arcint disables the repacked copies with a cache) runs it
+  in the limit.
 - **Infernix's warm start, tried** (`measured-here`, 2026-10-15, B60, the
   LFRU policy; llama tree `p0056-warm`, not in the series): the live
   placement written at exit as an STRP profile (`LLAMA_EXPERT_CACHE_SAVE`:

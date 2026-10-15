@@ -1,0 +1,1033 @@
+diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
+index f878649..531a37f 100644
+--- a/ggml/src/ggml-opencl/CMakeLists.txt
++++ b/ggml/src/ggml-opencl/CMakeLists.txt
+@@ -7,6 +7,8 @@ ggml_add_backend_library(${TARGET_NAME}
+                          ggml-opencl.cpp
+                          cl-program-cache.cpp
+                          cl-program-cache.h
++                         ggml-opencl-miss-cpu.cpp
++                         ggml-opencl-miss-cpu.h
+                          ../../include/ggml-opencl.h)
+ target_link_libraries(${TARGET_NAME} PRIVATE ${OpenCL_LIBRARIES})
+ target_include_directories(${TARGET_NAME} PRIVATE ${OpenCL_INCLUDE_DIRS})
+diff --git a/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.cpp b/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.cpp
+new file mode 100644
+index 0000000..faebcfe
+--- /dev/null
++++ b/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.cpp
+@@ -0,0 +1,306 @@
++// patch 0056: the CPU half of the expert cache's miss path, several tokens at once.
++//
++// Strata's AVX2 expert rows (src/kernels/cpu/iq_avx2.cpp, q2_avx2.cpp; MIT, Copyright (c) 2026 Niko1221
++// and the Strata contributors): a 32-value chunk of weights is decoded once - the grid lookups, one sign
++// vector, one scale vector - and every token of the verify window applies it with a load, a sign, a
++// maddubs, a madd and an add. ggml-cpu's dot products are single-token, and its Q2_0 one has no SIMD form
++// (~0.7 GB/s a thread here against Strata's 6.4). Two departures: the weights are read from the bank's
++// planes (patch 0022, ggml_cl_lb_fields: each field of every block back to back per expert slice) instead
++// of GGUF blocks, and the activations' quantizers are written here (ggml-cpu's rules: q8_K for the i-quants,
++// Strata's 32-value chunks with the -1 offset's correction for Q2_0).
++//
++// Compiled for AVX2 + FMA + F16C by the target pragma below; ggml_cl_miss_cpu_ok() checks the CPU at run time.
++#define GGML_COMMON_DECL_CPP
++#define GGML_COMMON_IMPL_CPP
++#include "ggml-common.h"
++#include "ggml.h"
++
++#include "ggml-opencl-miss-cpu.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++
++#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
++#define GGML_CL_MISS_CPU 1
++namespace {
++// IQ2_XXS's 7-bit sign index -> 8 sign bytes (the 8th bit by parity), as 64-bit words. Built at load,
++// before the target pragma below: a static initializer runs on every host, AVX2 or not.
++struct EvenSigns {
++    uint64_t v[128];
++    EvenSigns() {
++        for (int i = 0; i < 128; ++i) {
++            const uint8_t s = ksigns_iq2xs[i];
++            uint64_t w = 0;
++            for (int b = 0; b < 8; ++b) w |= (uint64_t) ((s >> b) & 1 ? 0xFF : 0x01) << (8 * b);
++            v[i] = w;
++        }
++    }
++};
++static const EvenSigns even_signs;
++}  // namespace
++
++bool ggml_cl_miss_cpu_ok(void) {
++    static const bool ok = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
++    return ok;
++}
++
++bool ggml_cl_miss_cpu_type(ggml_type t) {
++    return t == GGML_TYPE_IQ2_S || t == GGML_TYPE_IQ2_XXS || t == GGML_TYPE_Q2_0;
++}
++
++// AVX2 + FMA + F16C for everything below; ggml_cl_miss_cpu_ok() checks the CPU at run time
++#if defined(__clang__)
++#pragma clang attribute push (__attribute__((target("avx2,fma,f16c"))), apply_to = function)
++#else
++#pragma GCC push_options
++#pragma GCC target("avx2,fma,f16c")
++#endif
++#endif
++
++#if GGML_CL_MISS_CPU
++#include <immintrin.h>
++
++namespace {
++
++inline float h2f(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) h))); }
++inline uint32_t u32(const uint8_t * p) { uint32_t v; memcpy(&v, p, 4); return v; }
++inline uint16_t u16(const uint8_t * p) { uint16_t v; memcpy(&v, p, 2); return v; }
++inline uint64_t u64(const uint8_t * p) { uint64_t v; memcpy(&v, p, 8); return v; }
++
++// ggml's bit_selector sign vector: byte i of the 32 is -1 where bit i of m is set, +1 elsewhere
++inline __m256i sgn_vec(uint32_t m) {
++    const __m256i shuf = _mm256_set_epi64x(0x0303030303030303LL, 0x0202020202020202LL, 0x0101010101010101LL, 0);
++    const __m256i bsel = _mm256_set1_epi64x((long long) 0x8040201008040201ULL);
++    const __m256i b = _mm256_shuffle_epi8(_mm256_set1_epi32((int) m), shuf);
++    return _mm256_or_si256(_mm256_cmpeq_epi8(_mm256_and_si256(b, bsel), bsel), _mm256_set1_epi8(1));
++}
++inline __m256i sc16(int a, int b) { return _mm256_set_m128i(_mm_set1_epi16((short) b), _mm_set1_epi16((short) a)); }
++inline __m256i sc32(int s) { return _mm256_set1_epi16((short) s); }
++
++
++inline float hsum8(__m256 v) {
++    const __m128 h = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
++    const __m128 s = _mm_add_ps(h, _mm_movehl_ps(h, h));
++    return _mm_cvtss_f32(_mm_add_ss(s, _mm_movehdup_ps(s)));
++}
++
++// one weight matrix (an expert slice) as fields: in planes, field q of block i at f[q] + i * size[q];
++// in GGUF blocks, at base + i * block + off[q]
++struct Fields {
++    const uint8_t * f[5];
++    size_t          step[5];
++    inline const uint8_t * at(int q, int64_t i) const { return f[q] + (size_t) i * step[q]; }
++};
++
++inline bool fields_of(ggml_type t, const uint8_t * slice, bool planar, int64_t ne0, int64_t ne1, Fields & F) {
++    struct fd { int off, size; } fl[5];
++    int nf = 0;
++    switch (t) {
++        case GGML_TYPE_IQ2_XXS: fl[0] = { 0, 2 }; fl[1] = { 2, 64 }; nf = 2; break;
++        case GGML_TYPE_IQ2_S:   fl[0] = { 0, 2 }; fl[1] = { 2, 32 }; fl[2] = { 34, 32 }; fl[3] = { 66, 8 }; fl[4] = { 74, 8 }; nf = 5; break;
++        case GGML_TYPE_Q2_0:    fl[0] = { 0, 2 }; fl[1] = { 2, 16 }; nf = 2; break;
++        default: return false;
++    }
++    const size_t blk = ggml_type_size(t);
++    const int64_t nblk = ne0 * ne1 / ggml_blck_size(t);
++    size_t plane = 0;
++    for (int q = 0; q < nf; ++q) {
++        if (planar) { F.f[q] = slice + plane; F.step[q] = (size_t) fl[q].size; plane += (size_t) nblk * fl[q].size; }
++        else        { F.f[q] = slice + fl[q].off; F.step[q] = blk; }
++    }
++    return true;
++}
++
++// ---- the i-quants against q8_K activations (Strata's Fmt32 decoders, fields from planes)
++
++// IQ2_S: d, grid bytes [32], sign bytes [32], qh [8], scales [8]; chunk = 64-value group j, 32-value half
++inline void dec_iq2s(const Fields & F, int64_t i, int j, int half, __m256i & g, __m256i & sgn, __m256i & sc) {
++    const uint8_t * qs = F.at(1, i) + 8 * j;
++    const uint8_t   h  = F.at(3, i)[2 * j + half];
++    const int o = 4 * half;
++    g = _mm256_set_epi64x((long long) iq2s_grid[qs[o + 3] | ((h << 2) & 0x300)],
++                          (long long) iq2s_grid[qs[o + 2] | ((h << 4) & 0x300)],
++                          (long long) iq2s_grid[qs[o + 1] | ((h << 6) & 0x300)],
++                          (long long) iq2s_grid[qs[o] | ((h << 8) & 0x300)]);
++    const uint64_t m = u64(F.at(2, i) + 8 * j);
++    sgn = sgn_vec(half ? (uint32_t) (m >> 32) : (uint32_t) m);
++    const uint8_t sb = F.at(4, i)[2 * j + half];
++    sc = sc16(2 * (sb & 15) + 1, 2 * (sb >> 4) + 1);
++}
++
++// IQ2_XXS: d, qs [64] (per 64-value group: 4 grid bytes, then 4 x 7-bit sign index + 4-bit scale)
++inline void dec_iq2xxs(const Fields & F, int64_t i, int j, int half, __m256i & g, __m256i & sgn, __m256i & sc) {
++    const uint8_t * q = F.at(1, i) + 16 * j + 8 * half;
++    const uint32_t w0 = u32(q), w1 = u32(q + 4);
++    g = _mm256_set_epi64x((long long) iq2xxs_grid[w0 >> 24], (long long) iq2xxs_grid[(w0 >> 16) & 255],
++                          (long long) iq2xxs_grid[(w0 >> 8) & 255], (long long) iq2xxs_grid[w0 & 255]);
++    sgn = _mm256_set_epi64x((long long) even_signs.v[(w1 >> 21) & 127], (long long) even_signs.v[(w1 >> 14) & 127],
++                            (long long) even_signs.v[(w1 >> 7) & 127], (long long) even_signs.v[w1 & 127]);
++    sc = sc32(2 * (int) (w1 >> 28) + 1);
++}
++
++template <int TY, int NT>
++inline void row_iq(const Fields & F, int64_t i0, int nblocks, const block_q8_K * const * y, float * res) {
++    __m256 accf[NT];
++    for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
++    for (int b = 0; b < nblocks; ++b) {
++        const int64_t i = i0 + b;
++        __m256i acci[NT];
++        for (int t = 0; t < NT; ++t) acci[t] = _mm256_setzero_si256();
++        for (int j = 0; j < 4; ++j) {
++            for (int half = 0; half < 2; ++half) {
++                __m256i g, sgn, sc;
++                if constexpr (TY == GGML_TYPE_IQ2_S) dec_iq2s(F, i, j, half, g, sgn, sc);
++                else                                 dec_iq2xxs(F, i, j, half, g, sgn, sc);
++                const int off = 64 * j + 32 * half;
++                for (int t = 0; t < NT; ++t) {
++                    const __m256i yv = _mm256_loadu_si256((const __m256i *) (y[t][b].qs + off));
++                    const __m256i ys = _mm256_sign_epi8(yv, sgn);
++                    acci[t] = _mm256_add_epi32(acci[t], _mm256_madd_epi16(_mm256_maddubs_epi16(g, ys), sc));
++                }
++            }
++        }
++        const float dx = h2f(u16(F.at(0, i))) * 0.125f;
++        for (int t = 0; t < NT; ++t) {
++            accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][b].d), _mm256_cvtepi32_ps(acci[t]), accf[t]);
++        }
++    }
++    for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
++}
++
++// ---- Q2_0 against 32-value int8 chunks (Strata's q2_avx2.cpp): codes 0..3, the -1 offset as a correction
++
++struct ActQ2 {   // a token's activation: q[n], per 32 values scale, scale x sum (hx)
++    int8_t * q; float * scale; float * hx;
++};
++
++inline void unpack64(const uint8_t * codes, __m256i & lo, __m256i & hi) {
++    const __m128i b = _mm_loadu_si128((const __m128i *) codes);
++    const __m128i m3 = _mm_set1_epi8(3);
++    const __m128i c0 = _mm_and_si128(b, m3);
++    const __m128i c1 = _mm_and_si128(_mm_srli_epi16(b, 2), m3);
++    const __m128i c2 = _mm_and_si128(_mm_srli_epi16(b, 4), m3);
++    const __m128i c3 = _mm_and_si128(_mm_srli_epi16(b, 6), m3);
++    const __m128i a0 = _mm_unpacklo_epi8(c0, c1), a1 = _mm_unpacklo_epi8(c2, c3);
++    const __m128i b0 = _mm_unpackhi_epi8(c0, c1), b1 = _mm_unpackhi_epi8(c2, c3);
++    lo = _mm256_set_m128i(_mm_unpackhi_epi16(a0, a1), _mm_unpacklo_epi16(a0, a1));
++    hi = _mm256_set_m128i(_mm_unpackhi_epi16(b0, b1), _mm_unpacklo_epi16(b0, b1));
++}
++
++template <int NT>
++inline void row_q2(const Fields & F, int64_t i0, int nblocks, const ActQ2 * a, float * res) {
++    __m256 acc[NT];
++    float corr[NT];
++    for (int t = 0; t < NT; ++t) { acc[t] = _mm256_setzero_ps(); corr[t] = 0.f; }
++    const __m256i ones = _mm256_set1_epi16(1);
++    for (int b = 0; b < nblocks; ++b) {
++        const int64_t i = i0 + b;
++        const float d = h2f(u16(F.at(0, i)));
++        __m256i lo, hi;
++        unpack64(F.at(1, i), lo, hi);
++        for (int t = 0; t < NT; ++t) {
++            const int8_t * q = a[t].q + b * 64;
++            const __m256i s0 = _mm256_madd_epi16(_mm256_maddubs_epi16(lo, _mm256_loadu_si256((const __m256i *) q)), ones);
++            const __m256i s1 = _mm256_madd_epi16(_mm256_maddubs_epi16(hi, _mm256_loadu_si256((const __m256i *) (q + 32))), ones);
++            acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * a[t].scale[2 * b]), _mm256_cvtepi32_ps(s0), acc[t]);
++            acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * a[t].scale[2 * b + 1]), _mm256_cvtepi32_ps(s1), acc[t]);
++            corr[t] += d * (a[t].hx[2 * b] + a[t].hx[2 * b + 1]);
++        }
++    }
++    for (int t = 0; t < NT; ++t) res[t] = hsum8(acc[t]) - corr[t];
++}
++
++template <int NT>
++void rows_nt(ggml_type t, const Fields & F, int64_t ne0, const void * const * act, float * const * out, int r0, int r1) {
++    float res[NT];
++    if (t == GGML_TYPE_Q2_0) {
++        const int nb = (int) (ne0 / 64);
++        ActQ2 a[NT];
++        for (int k = 0; k < NT; ++k) {
++            const char * p = (const char *) act[k];
++            a[k].q = (int8_t *) p; a[k].scale = (float *) (p + ne0); a[k].hx = a[k].scale + ne0 / 32;
++        }
++        for (int r = r0; r < r1; ++r) {
++            row_q2<NT>(F, (int64_t) r * nb, nb, a, res);
++            for (int k = 0; k < NT; ++k) out[k][r] = res[k];
++        }
++        return;
++    }
++    const int nb = (int) (ne0 / QK_K);
++    const block_q8_K * y[NT];
++    for (int k = 0; k < NT; ++k) y[k] = (const block_q8_K *) act[k];
++    for (int r = r0; r < r1; ++r) {
++        if (t == GGML_TYPE_IQ2_S) row_iq<GGML_TYPE_IQ2_S, NT>(F, (int64_t) r * nb, nb, y, res);
++        else                      row_iq<GGML_TYPE_IQ2_XXS, NT>(F, (int64_t) r * nb, nb, y, res);
++        for (int k = 0; k < NT; ++k) out[k][r] = res[k];
++    }
++}
++
++}  // namespace
++
++size_t ggml_cl_miss_cpu_act_size(ggml_type t, int64_t n) {
++    return t == GGML_TYPE_Q2_0 ? (size_t) n + (size_t) (n / 32) * 2 * sizeof(float) : (size_t) (n / QK_K) * sizeof(block_q8_K);
++}
++
++void ggml_cl_miss_cpu_quant(ggml_type t, const float * x, int64_t n, void * y) {
++    if (t == GGML_TYPE_Q2_0) {
++        // Strata's act_quant_q8_1: per 32 values s = amax / 127, q = round-half-away(x / s), hx = s x sum(q)
++        int8_t * q = (int8_t *) y;
++        float * scale = (float *) ((char *) y + n), * hx = scale + n / 32;
++        for (int64_t c = 0; c < n / 32; ++c) {
++            const float * xb = x + 32 * c;
++            float amax = 0.f;
++            for (int j = 0; j < 32; ++j) amax = std::max(amax, fabsf(xb[j]));
++            const float s = amax > 0.f ? amax / 127.f : 0.f, inv = s > 0.f ? 1.f / s : 0.f;
++            int sum = 0;
++            for (int j = 0; j < 32; ++j) {
++                const float v = xb[j] * inv;
++                int qi = (int) (v + (v >= 0.f ? 0.5f : -0.5f));
++                qi = qi < -127 ? -127 : qi > 127 ? 127 : qi;
++                q[32 * c + j] = (int8_t) qi; sum += qi;
++            }
++            scale[c] = s; hx[c] = s * (float) sum;
++        }
++        return;
++    }
++    // ggml's quantize_row_q8_K_ref
++    block_q8_K * b = (block_q8_K *) y;
++    for (int64_t i = 0; i < n / QK_K; ++i, x += QK_K) {
++        float amax = 0.f, mx = 0.f;
++        for (int j = 0; j < QK_K; ++j) { const float a = fabsf(x[j]); if (a > amax) { amax = a; mx = x[j]; } }
++        if (!amax) { b[i].d = 0.f; memset(b[i].qs, 0, QK_K); memset(b[i].bsums, 0, sizeof(b[i].bsums)); continue; }
++        const float iscale = -127.f / mx;
++        for (int j = 0; j < QK_K; ++j) { const int v = (int) nearbyintf(iscale * x[j]); b[i].qs[j] = (int8_t) (v > 127 ? 127 : v); }
++        for (int j = 0; j < QK_K / 16; ++j) { int s = 0; for (int l = 0; l < 16; ++l) s += b[i].qs[16 * j + l]; b[i].bsums[j] = (int16_t) s; }
++        b[i].d = 1.f / iscale;
++    }
++}
++
++void ggml_cl_miss_cpu_rows(ggml_type t, const void * slice, bool planar, int64_t ne0, int64_t ne1,
++                           const void * const * act, int nt, float * const * out, int r0, int r1) {
++    Fields F;
++    if (!fields_of(t, (const uint8_t *) slice, planar, ne0, ne1, F)) return;
++    for (int t0 = 0; t0 < nt; t0 += 4) {
++        const int k = nt - t0 < 4 ? nt - t0 : 4;
++        switch (k) {
++            case 1: rows_nt<1>(t, F, ne0, act + t0, out + t0, r0, r1); break;
++            case 2: rows_nt<2>(t, F, ne0, act + t0, out + t0, r0, r1); break;
++            case 3: rows_nt<3>(t, F, ne0, act + t0, out + t0, r0, r1); break;
++            default: rows_nt<4>(t, F, ne0, act + t0, out + t0, r0, r1); break;
++        }
++    }
++}
++
++#if defined(__clang__)
++#pragma clang attribute pop
++#else
++#pragma GCC pop_options
++#endif
++#else
++bool   ggml_cl_miss_cpu_ok(void) { return false; }
++bool   ggml_cl_miss_cpu_type(ggml_type) { return false; }
++size_t ggml_cl_miss_cpu_act_size(ggml_type, int64_t) { return 0; }
++void   ggml_cl_miss_cpu_quant(ggml_type, const float *, int64_t, void *) {}
++void   ggml_cl_miss_cpu_rows(ggml_type, const void *, bool, int64_t, int64_t, const void * const *, int, float * const *, int, int) {}
++#endif
+diff --git a/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.h b/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.h
+new file mode 100644
+index 0000000..a53c017
+--- /dev/null
++++ b/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.h
+@@ -0,0 +1,14 @@
++#pragma once
++// patch 0056: the CPU half of the expert cache's miss path (ggml-opencl-miss-cpu.cpp)
++#include "ggml.h"
++#include <cstddef>
++#include <cstdint>
++
++bool   ggml_cl_miss_cpu_ok(void);                     // AVX2 + FMA + F16C at run time
++bool   ggml_cl_miss_cpu_type(ggml_type t);            // IQ2_S, IQ2_XXS, Q2_0
++// a token's quantized activation for rows of type t over n values: its bytes, and the quantizer
++size_t ggml_cl_miss_cpu_act_size(ggml_type t, int64_t n);
++void   ggml_cl_miss_cpu_quant(ggml_type t, const float * x, int64_t n, void * y);
++// out[k][r] = row r of the ne0 x ne1 matrix `slice` (in planes when `planar`) . act[k], r in [r0, r1), k < nt
++void   ggml_cl_miss_cpu_rows(ggml_type t, const void * slice, bool planar, int64_t ne0, int64_t ne1,
++                             const void * const * act, int nt, float * const * out, int r0, int r1);
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 855d1e9..a50f64b 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -14,6 +14,7 @@
+ #include "ggml.h"
+ 
+ #include "cl-program-cache.h"
++#include "ggml-opencl-miss-cpu.h"
+ 
+ #ifdef GGML_OPENCL_USE_ADRENO_BIN_KERNELS
+ #include "libdl.h"
+@@ -52,6 +53,10 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
+ #include <regex>
+ #include <set>
+ #include <unordered_set>
++#include <thread>
++#include <atomic>
++#include <functional>
++#include <chrono>
+ 
+ #undef MIN
+ #undef MAX
+@@ -774,6 +779,7 @@ struct ggml_backend_opencl_context {
+     // what the activation buffers hold, and the graph count that dates it
+     ggml_cl_kq_act kq_q8, kq_f16, kq_few, kq_i8;
+     uint64_t       graph_gen = 0;
++    cl_kernel kernel_miss_publish = nullptr, kernel_miss_wait = nullptr;   // patch 0056
+     ggml_cl_buffer prealloc_kq_xh;     // f16 activation of the K-quant GEMMs
+     ggml_cl_buffer prealloc_kq2_xq;    // the int8 2D GEMM's activations [token][K] (kernel_quant_i8)
+     ggml_cl_buffer prealloc_kq2_xd;    // their scales per 256 [K / 256][tokens padded]
+@@ -15122,6 +15128,489 @@ static void ggml_backend_opencl_chain_prefetch(const ggml_tensor * a, const ggml
+     g_cache_chain[a] = b;
+ }
+ 
++// patch 0056: an expert cache's missed experts computed on the CPU, Strata's
++// doorbell tier (src/core/layer.cpp, src/kernels/cuda/elementwise.cu:186-311;
++// arcint's OpenVINO patch 0077 for the OpenCL form): at a decode layer's first
++// expert projection a kernel hands the first GGML_OPENCL_CPU_MISS_MAX (16)
++// missed pairs to the CPU (-1 in the combined ids, so the card's projections
++// skip them; the card reads the other misses over the link as before),
++// publishes the activation and those pairs into USM host memory and
++// release-stores a sequence number; a coordinator thread spins on it, computes
++// the pairs' gate, up, SwiGLU and down from the bank in host RAM and rings
++// done; after the down projection a kernel polls the done flag with
++// L1/L3-uncached loads (the only load the B60 was seen to read a host write
++// with, 0077) and copies the rows into the missed pairs. The CPU's rows are
++// Strata's multi-token AVX2 kernels for IQ2_S, IQ2_XXS and Q2_0 (ggml-opencl-
++// miss-cpu.cpp), the pairs grouped by expert so each expert's weights are
++// decoded once for the tokens that missed it; a layer with another type uses
++// ggml-cpu's single-token dot products (passed in by the cache).
++#if defined(__x86_64__) || defined(__i386__)
++#define GGML_CL_PAUSE() __builtin_ia32_pause()
++#else
++#define GGML_CL_PAUSE() std::this_thread::yield()
++#endif
++typedef void (*ggml_cl_vec_dot_fn)(int n, float * s, size_t bs, const void * x, size_t bx, const void * y, size_t by, int nrc);
++typedef void (*ggml_cl_from_float_fn)(const float * x, void * y, int64_t k);
++
++struct ggml_cl_miss_layer {
++    const ggml_tensor * slot[3] = {};
++    const ggml_tensor * bank[3] = {};
++    const char *        bptr[3] = {};    // the bank's slice 0 in host memory
++    bool                planar[3] = {};
++    ggml_cl_vec_dot_fn    vec_dot[3] = {};
++    ggml_type             vd_type[3] = {};
++    ggml_cl_from_float_fn from_float[3] = {};
++    int   n_slots = 0, n_expert = 0;
++    float clamp = 0.0f;
++    bool  fast  = false;         // patch 0056: all three types on the multi-token kernels (ggml-opencl-miss-cpu.cpp)
++    uint32_t * pub  = nullptr;   // [0] seq, [1] CPU pairs; [16..) their pair index, [16+PMAX..) bank row; floats from 512: x
++    uint32_t * back = nullptr;   // [16] done, [17] failed; [64] count; [65..) pairs; floats from 256: rows
++    uint32_t seq = 0;
++    uint64_t gen = 0;
++    bool     pending = false;
++    int      n_tok = 0, n_used = 0;
++};
++static const int GGML_CL_MISS_PMAX = 128;   // pairs a call: n_used x tokens
++static_assert(GGML_CL_MISS_PMAX == 128, "kernel_miss_publish defines PMAX 128");
++static std::unordered_map<const ggml_tensor *, std::pair<ggml_cl_miss_layer *, int>> g_miss_by_slot;
++static std::vector<std::unique_ptr<ggml_cl_miss_layer>> g_miss_layers;
++static int g_miss_threads = 6;
++
++// the CPU half: one coordinator (FIFO = layer order) and a spinning pool
++struct ggml_cl_miss_job { ggml_cl_miss_layer * L; uint32_t seq; int n_tok, n_used; };
++struct ggml_cl_miss_pool {
++    std::vector<std::thread> th;
++    std::atomic<bool>     stop{false};
++    // a run's tasks: one word, epoch (24 bits) | task count (20) | next index (20), claimed by CAS,
++    // so a worker can only take an index of the run the word names, and only while it is below the
++    // count; `fn` is written before the word (release) and kept until every claimed task is done
++    std::atomic<uint64_t> next{0};
++    std::atomic<int>      done{0};
++    uint64_t epoch = 0;
++    std::function<void(int)> fn;
++    // the job ring (one producer: the enqueueing thread; one consumer: the coordinator)
++    std::vector<ggml_cl_miss_job> ring = std::vector<ggml_cl_miss_job>(256);
++    std::atomic<uint64_t> head{0}, tail{0};
++    std::thread coord;
++    static constexpr uint64_t M20 = (1u << 20) - 1;
++    bool claim_one() {   // true: ran one task
++        uint64_t cur = next.load(std::memory_order_acquire);
++        while ((cur & M20) < ((cur >> 20) & M20)) {
++            if (next.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
++                fn((int) (cur & M20));
++                done.fetch_add(1, std::memory_order_release);
++                return true;
++            }
++        }
++        return false;
++    }
++    void run(int n, std::function<void(int)> f) {
++        GGML_ASSERT(n >= 0 && (uint64_t) n <= M20);
++        fn = std::move(f);
++        done.store(0, std::memory_order_relaxed);
++        epoch = (epoch + 1) & ((1u << 24) - 1);
++        next.store((epoch << 40) | ((uint64_t) n << 20), std::memory_order_release);
++        while (claim_one()) {}
++        while (done.load(std::memory_order_acquire) < n) { GGML_CL_PAUSE(); }
++    }
++    void worker() {
++        int idle = 0;
++        while (!stop.load(std::memory_order_relaxed)) {
++            if (claim_one()) { idle = 0; continue; }
++            if (++idle < 200000) { GGML_CL_PAUSE(); } else { std::this_thread::sleep_for(std::chrono::microseconds(50)); }
++        }
++    }
++};
++static ggml_cl_miss_pool * g_miss_pool = nullptr;
++
++// one row of a bank slice as GGUF blocks: a planar slice's fields gathered
++static inline const void * ggml_cl_miss_row(const ggml_cl_miss_layer & L, int k, int64_t b, int64_t row, char * scratch) {
++    const ggml_tensor * t = L.bank[k];
++    const size_t  blk  = ggml_type_size(t->type);
++    const int64_t bpr  = t->ne[0] / ggml_blck_size(t->type);
++    const char *  sl   = L.bptr[k] + (size_t) b * t->nb[2];
++    GGML_ASSERT((size_t) bpr * blk <= 4096);   // the callers' scratch
++    if (!L.planar[k]) {
++        return sl + (size_t) row * bpr * blk;
++    }
++    ggml_cl_lb_field f[5];
++    const int nf = ggml_cl_lb_fields(t->type, f);
++    const int64_t nblk = t->ne[0] * t->ne[1] / ggml_blck_size(t->type);
++    size_t plane = 0;
++    for (int q = 0; q < nf; ++q) {
++        const char * src = sl + plane + (size_t) row * bpr * f[q].size;
++        for (int64_t i = 0; i < bpr; ++i) {
++            memcpy(scratch + i * blk + f[q].off, src + i * f[q].size, f[q].size);
++        }
++        plane += (size_t) nblk * f[q].size;
++    }
++    return scratch;
++}
++
++static void ggml_cl_miss_compute(const ggml_cl_miss_job & job) {
++    ggml_cl_miss_layer & L = *job.L;
++    const float * x = (const float *) (L.pub + 512);
++    const int64_t ne_in  = L.bank[0]->ne[0];   // n_embd
++    const int64_t ne_ff  = L.bank[0]->ne[1];   // the expert's width
++    const int64_t ne_out = L.bank[2]->ne[1];   // n_embd
++    // the pairs the card handed over (its publish marked them -1 in the ids it reads)
++    struct miss { int pair, tok; int64_t b; };
++    std::vector<miss> ms;
++    const int n_cpu = (int) std::min<uint32_t>(L.pub[1], GGML_CL_MISS_PMAX);
++    for (int i = 0; i < n_cpu; ++i) {
++        const int p = (int) L.pub[16 + i];
++        ms.push_back({ p, p / job.n_used, (int64_t) L.pub[16 + GGML_CL_MISS_PMAX + i] });
++    }
++    const int nm = (int) ms.size();
++    uint32_t * back = L.back;
++    float * rows = (float *) (back + 256);
++    if (nm > 0 && L.fast) {
++        // patch 0056: the pairs grouped by expert, so each expert's rows are decoded once for all
++        // the tokens that missed it (Strata's multi-token rows); the activations quantized once a token
++        static std::vector<std::vector<int>> grp;   // the coordinator's; the pool reads them
++        static std::vector<int64_t> grp_b;
++        grp.clear(); grp_b.clear();
++        for (int m = 0; m < nm; ++m) {
++            size_t gi = 0;
++            while (gi < grp_b.size() && grp_b[gi] != ms[m].b) ++gi;
++            if (gi == grp_b.size()) { grp_b.push_back(ms[m].b); grp.emplace_back(); }
++            grp[gi].push_back(m);
++        }
++        const ggml_type t0 = L.bank[0]->type, t1 = L.bank[1]->type, t2 = L.bank[2]->type;
++        const size_t a0 = ggml_cl_miss_cpu_act_size(t0, ne_in), a1 = ggml_cl_miss_cpu_act_size(t1, ne_in);
++        const size_t a2 = ggml_cl_miss_cpu_act_size(t2, ne_ff);
++        static std::vector<char> xq0, xq1, hq;
++        static std::vector<float> g, u, h;
++        xq0.resize(a0 * job.n_tok); xq1.resize(a1 * job.n_tok);
++        for (int t = 0; t < job.n_tok; ++t) {
++            ggml_cl_miss_cpu_quant(t0, x + t * ne_in, ne_in, xq0.data() + t * a0);
++            if (t1 != t0) ggml_cl_miss_cpu_quant(t1, x + t * ne_in, ne_in, xq1.data() + t * a1);
++        }
++        const char * xq1p = t1 != t0 ? xq1.data() : xq0.data();
++        g.resize((size_t) nm * ne_ff); u.resize((size_t) nm * ne_ff);
++        const int RB = 32;
++        const int tg = (int) ((ne_ff + RB - 1) / RB), ng = (int) grp.size();
++        g_miss_pool->run(ng * tg * 2, [&](int task) {
++            const int proj = task % 2, rest = task / 2, gi = rest / tg, rb = rest % tg;
++            const auto & G = grp[gi];
++            const int nt = (int) G.size();
++            const void * act[GGML_CL_MISS_PMAX]; float * out[GGML_CL_MISS_PMAX];
++            for (int k = 0; k < nt; ++k) {
++                const int m = G[k];
++                act[k] = proj == 0 ? (const void *) (xq0.data() + ms[m].tok * a0) : (const void *) (xq1p + ms[m].tok * a1);
++                out[k] = (proj == 0 ? g.data() : u.data()) + (size_t) m * ne_ff;
++            }
++            const char * slice = L.bptr[proj] + (size_t) grp_b[gi] * L.bank[proj]->nb[2];
++            ggml_cl_miss_cpu_rows(proj == 0 ? t0 : t1, slice, L.planar[proj], ne_in, ne_ff, act, nt, out,
++                                  rb * RB, (int) std::min<int64_t>(ne_ff, (int64_t) (rb + 1) * RB));
++        });
++        // SwiGLU, clamped as build_experts does (up to [-c, c], silu(gate) to <= c), quantized for the down rows
++        hq.resize(a2 * nm); h.resize(ne_ff);
++        for (int m = 0; m < nm; ++m) {
++            for (int64_t i = 0; i < ne_ff; ++i) {
++                float gv = g[(size_t) m * ne_ff + i], uv = u[(size_t) m * ne_ff + i];
++                float sg = gv / (1.0f + expf(-gv));
++                if (L.clamp > 0.0f) { sg = std::min(sg, L.clamp); uv = std::max(-L.clamp, std::min(uv, L.clamp)); }
++                h[i] = sg * uv;
++            }
++            ggml_cl_miss_cpu_quant(t2, h.data(), ne_ff, hq.data() + m * a2);
++        }
++        const int RD = 128;
++        const int td = (int) ((ne_out + RD - 1) / RD);
++        g_miss_pool->run(ng * td, [&](int task) {
++            const int gi = task / td, rb = task % td;
++            const auto & G = grp[gi];
++            const int nt = (int) G.size();
++            const void * act[GGML_CL_MISS_PMAX]; float * out[GGML_CL_MISS_PMAX];
++            for (int k = 0; k < nt; ++k) { act[k] = hq.data() + G[k] * a2; out[k] = rows + (size_t) G[k] * ne_out; }
++            const char * slice = L.bptr[2] + (size_t) grp_b[gi] * L.bank[2]->nb[2];
++            ggml_cl_miss_cpu_rows(t2, slice, L.planar[2], ne_ff, ne_out, act, nt, out,
++                                  rb * RD, (int) std::min<int64_t>(ne_out, (int64_t) (rb + 1) * RD));
++        });
++    } else if (nm > 0) {
++        // the activation quantized once a token for each projection's dot type
++        const size_t qs0 = ggml_row_size(L.vd_type[0], ne_in), qs1 = ggml_row_size(L.vd_type[1], ne_in);
++        static thread_local std::vector<char> xq0, xq1, hq;
++        static thread_local std::vector<float> g, u;
++        xq0.resize(qs0 * job.n_tok); xq1.resize(qs1 * job.n_tok);
++        for (int t = 0; t < job.n_tok; ++t) {
++            L.from_float[0](x + t * ne_in, xq0.data() + t * qs0, ne_in);
++            L.from_float[1](x + t * ne_in, xq1.data() + t * qs1, ne_in);
++        }
++        g.assign((size_t) nm * ne_ff, 0.0f); u.assign((size_t) nm * ne_ff, 0.0f);
++        const int RB = 32;   // rows a task
++        const int tg = (int) ((ne_ff + RB - 1) / RB);
++        const char * xq0p = xq0.data(); const char * xq1p = xq1.data();
++        float * gp = g.data(); float * up = u.data();
++        g_miss_pool->run(nm * tg * 2, [&](int task) {
++            alignas(64) char scratch[4096];
++            const int proj = task % 2, rest = task / 2, m = rest / tg, rb = rest % tg;
++            const auto & mm = ms[m];
++            const char * xq = (proj == 0 ? xq0p + mm.tok * qs0 : xq1p + mm.tok * qs1);
++            float * o = (proj == 0 ? gp : up) + (size_t) m * ne_ff;
++            for (int64_t r = (int64_t) rb * RB; r < std::min<int64_t>(ne_ff, (int64_t) (rb + 1) * RB); ++r) {
++                const void * w = ggml_cl_miss_row(L, proj, mm.b, r, scratch);
++                L.vec_dot[proj]((int) ne_in, o + r, 0, w, 0, xq, 0, 1);
++            }
++        });
++        // SwiGLU, clamped as build_experts does (up to [-c, c], silu(gate) to <= c)
++        const size_t qsd = ggml_row_size(L.vd_type[2], ne_ff);
++        hq.resize(qsd * nm);
++        std::vector<float> h(ne_ff);
++        for (int m = 0; m < nm; ++m) {
++            for (int64_t i = 0; i < ne_ff; ++i) {
++                float gv = g[(size_t) m * ne_ff + i], uv = u[(size_t) m * ne_ff + i];
++                float sg = gv / (1.0f + expf(-gv));
++                if (L.clamp > 0.0f) { sg = std::min(sg, L.clamp); uv = std::max(-L.clamp, std::min(uv, L.clamp)); }
++                h[i] = sg * uv;
++            }
++            L.from_float[2](h.data(), hq.data() + m * qsd, ne_ff);
++        }
++        const int td = (int) ((ne_out + RB * 4 - 1) / (RB * 4));
++        const char * hqp = hq.data();
++        g_miss_pool->run(nm * td, [&](int task) {
++            alignas(64) char scratch[4096];
++            const int m = task / td, rb = task % td;
++            float * o = rows + (size_t) m * ne_out;
++            for (int64_t r = (int64_t) rb * RB * 4; r < std::min<int64_t>(ne_out, (int64_t) (rb + 1) * RB * 4); ++r) {
++                const void * w = ggml_cl_miss_row(L, 2, ms[m].b, r, scratch);
++                L.vec_dot[2]((int) ne_ff, o + r, 0, w, 0, hqp + m * qsd, 0, 1);
++            }
++        });
++    }
++    static const bool red = getenv("GGML_OPENCL_CPU_MISS_RED") != nullptr;   // red case: the CPU's rows left zero
++    if (red && nm > 0) memset(rows, 0, sizeof(float) * (size_t) nm * ne_out);
++    for (int m = 0; m < nm; ++m) back[65 + m] = (uint32_t) ms[m].pair;
++    back[64] = (uint32_t) nm;
++    __atomic_store_n(&back[16], job.seq, __ATOMIC_RELEASE);
++}
++
++static void ggml_cl_miss_coordinator() {
++    ggml_cl_miss_pool & P = *g_miss_pool;
++    int idle = 0;
++    while (!P.stop.load(std::memory_order_relaxed)) {
++        const uint64_t t = P.tail.load(std::memory_order_relaxed);
++        if (t == P.head.load(std::memory_order_acquire)) {
++            if (++idle < 200000) { GGML_CL_PAUSE(); } else { std::this_thread::sleep_for(std::chrono::microseconds(50)); }
++            continue;
++        }
++        idle = 0;
++        const ggml_cl_miss_job job = P.ring[t % P.ring.size()];
++        // the card's publish: its sequence number, released after the data
++        const auto t0 = std::chrono::steady_clock::now();
++        bool ok = true;
++        while (__atomic_load_n(&job.L->pub[0], __ATOMIC_ACQUIRE) < job.seq) {
++            GGML_CL_PAUSE();
++            if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) { ok = false; break; }   // a hang guard, not a latency bound
++        }
++        if (ok) {
++            ggml_cl_miss_compute(job);
++        } else {
++            // the card never ran the publish: its queue is wedged; the wait kernel would write NaN
++            GGML_ABORT("ggml_opencl: the CPU misses' publish never arrived (seq %u)", job.seq);
++        }
++        P.tail.store(t + 1, std::memory_order_release);
++    }
++}
++
++static const char * g_miss_kernels_src = R"CLC(
++#define PMAX 128
++enum MISS_LDCC { MISS_LDCC_DEFAULT = 0, MISS_L1UC_L3UC = 1 };
++extern uint __builtin_IB_lsc_load_global_uint(const __global uint * base, int immElemOff, enum MISS_LDCC cacheOpt);
++kernel void kernel_miss_publish(global const char * xb, ulong xoff, global char * ib, ulong ioff,
++                                global uint * pub, int n_x, int n_ids, uint seq, int n_slots, int n_cpu_max) {
++    global const float * x = (global const float *) (xb + xoff);
++    global int * ids = (global int *) (ib + ioff);   // the layer's combined ids (slot, or n_slots + bank row)
++    const int lid = get_local_id(0), lsz = get_local_size(0);
++    if (lid == 0) {
++        // the first n_cpu_max missed pairs to the CPU: -1 here, so the card's three projections skip them
++        int n = 0;
++        for (int p = 0; p < n_ids && n < n_cpu_max; ++p) {
++            const int c = ids[p];
++            if (c >= n_slots) { pub[16 + n] = (uint) p; pub[16 + PMAX + n] = (uint) (c - n_slots); ids[p] = -1; ++n; }
++        }
++        pub[1] = (uint) n;
++    }
++    global float * px = (global float *) (pub + 512);
++    for (int i = lid; i < n_x; i += lsz) px[i] = x[i];
++    atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_release, memory_scope_all_svm_devices);
++    barrier(CLK_GLOBAL_MEM_FENCE);
++    if (lid == 0) {
++        atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_release, memory_scope_all_svm_devices);
++        atomic_store_explicit((global atomic_uint *) pub, seq, memory_order_release, memory_scope_all_svm_devices);
++    }
++}
++kernel void kernel_miss_wait(global const uint * back, global char * yb, ulong yoff, uint seq, uint limit, int n_embd, int y_rows) {
++    global uint * y = (global uint *) (yb + yoff);
++    local uint seen;
++    const int lid = get_local_id(0), lsz = get_local_size(0);
++    if (lid == 0) {
++        uint polls = 0, ok = 0;
++        while (polls < limit) {
++            if (__builtin_IB_lsc_load_global_uint(back + 16, 0, MISS_L1UC_L3UC) >= seq) { ok = 1; break; }
++            atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_acquire, memory_scope_all_svm_devices);
++            ++polls;
++        }
++        atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_acquire, memory_scope_all_svm_devices);
++        const uint failed = ok && __builtin_IB_lsc_load_global_uint(back + 17, 0, MISS_L1UC_L3UC) == seq;
++        seen = ok && !failed;
++    }
++    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
++    if (!seen) {
++        for (int w = lid; w < y_rows * n_embd; w += lsz) y[w] = 0x7FC00000u;   // NaN: a lost call is not a right token
++        return;
++    }
++    const uint n = __builtin_IB_lsc_load_global_uint(back + 64, 0, MISS_L1UC_L3UC);
++    for (uint r = 0; r < n; ++r) {
++        const uint flat = __builtin_IB_lsc_load_global_uint(back + 65 + r, 0, MISS_L1UC_L3UC);
++        for (int w = lid; w < n_embd; w += lsz)
++            y[(long) flat * n_embd + w] = __builtin_IB_lsc_load_global_uint(back + 256 + (long) r * n_embd + w, 0, MISS_L1UC_L3UC);
++    }
++}
++)CLC";
++
++// registered by the expert cache (llama-expert-cache.cpp) for each decode layer
++// whose three projections are kq types: the slots, the banks, the host's copy
++// the SwiGLU clamp and ggml-cpu's dot products
++static void ggml_backend_opencl_miss_layer(const ggml_tensor * const * slot, const ggml_tensor * const * bank, int n_slots, int n_expert,
++                                           float clamp, void * const * vec_dot, const int * vd_type, void * const * from_float, int n_threads) {
++    auto L = std::make_unique<ggml_cl_miss_layer>();
++    for (int k = 0; k < 3; ++k) {
++        L->slot[k] = slot[k];
++        L->bank[k] = bank[k];
++        auto * bctx = (ggml_backend_opencl_buffer_context *) bank[k]->buffer->context;
++        ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) bank[k]->extra;
++        GGML_ASSERT(bctx->usm != nullptr);
++        L->bptr[k]       = (const char *) bctx->usm + e->offset + bank[k]->view_offs;
++        L->planar[k]     = ggml_cl_lb_planar(bank[k]);
++        L->vec_dot[k]    = (ggml_cl_vec_dot_fn) vec_dot[k];
++        L->vd_type[k]    = (ggml_type) vd_type[k];
++        L->from_float[k] = (ggml_cl_from_float_fn) from_float[k];
++    }
++    L->n_slots = n_slots; L->n_expert = n_expert; L->clamp = clamp;
++    static const bool mt = getenv("GGML_OPENCL_CPU_MISS_MT") == nullptr || atoi(getenv("GGML_OPENCL_CPU_MISS_MT")) != 0;
++    L->fast = mt && ggml_cl_miss_cpu_ok();
++    for (int k = 0; k < 3; ++k) L->fast = L->fast && ggml_cl_miss_cpu_type(bank[k]->type);
++    g_miss_threads = std::max(1, n_threads);
++    for (int k = 0; k < 3; ++k) g_miss_by_slot[slot[k]] = { L.get(), k };
++    g_miss_layers.push_back(std::move(L));
++}
++
++static bool ggml_cl_miss_ready(ggml_backend_opencl_context * ctx) {
++    static bool tried = false, ok = false;
++    if (tried) return ok;
++    tried = true;
++    if (ctx->usm_host_alloc == nullptr || ctx->usm_set_arg_ptr == nullptr) {
++        GGML_LOG_WARN("ggml_opencl: the CPU misses need USM host memory; off\n");
++        return false;
++    }
++    cl_program prog = build_program_from_source_optional(ctx, g_miss_kernels_src, ctx->kernel_compile_opts);
++    if (prog == nullptr) {
++        GGML_LOG_WARN("ggml_opencl: the CPU misses' kernels did not build; off\n");
++        return false;
++    }
++    cl_int err;
++    ctx->kernel_miss_publish = clCreateKernel(prog, "kernel_miss_publish", &err); CL_CHECK(err);
++    ctx->kernel_miss_wait    = clCreateKernel(prog, "kernel_miss_wait", &err);    CL_CHECK(err);
++    for (auto & L : g_miss_layers) {
++        const int64_t n_embd = L->bank[2]->ne[1];
++        const size_t pub_b  = (512 + (size_t) 8 * L->bank[0]->ne[0]) * sizeof(uint32_t);
++        const size_t back_b = (256 + (size_t) GGML_CL_MISS_PMAX * n_embd) * sizeof(uint32_t);
++        L->pub  = (uint32_t *) ctx->usm_host_alloc(ctx->context, nullptr, pub_b, 4096, &err);  CL_CHECK(err);
++        L->back = (uint32_t *) ctx->usm_host_alloc(ctx->context, nullptr, back_b, 4096, &err); CL_CHECK(err);
++        memset(L->pub, 0, pub_b); memset(L->back, 0, back_b);
++    }
++    g_miss_pool = new ggml_cl_miss_pool();
++    for (int i = 0; i < g_miss_threads - 1; ++i) g_miss_pool->th.emplace_back([] { g_miss_pool->worker(); });
++    g_miss_pool->coord = std::thread(ggml_cl_miss_coordinator);
++    int n_fast = 0;
++    for (auto & L : g_miss_layers) n_fast += L->fast;
++    GGML_LOG_INFO("ggml_opencl: the expert cache's misses on the CPU: %zu layers (%d on the multi-token rows), %d threads (the coordinator and %d workers)\n",
++                  g_miss_layers.size(), n_fast, g_miss_threads, g_miss_threads - 1);
++    ok = true;
++    return true;
++}
++
++// at a decode layer's first expert projection: publish its activation and ids
++static void ggml_cl_miss_publish(ggml_backend_opencl_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                                 const ggml_tensor * ids, int n_tok, int n_used) {
++    auto it = g_miss_by_slot.find(src0);
++    if (it == g_miss_by_slot.end() || it->second.second == 2) return;
++    ggml_cl_miss_layer & L = *it->second.first;
++    if (L.gen == ctx->graph_gen || !ggml_cl_miss_ready(ctx)) return;
++    const ggml_tensor * eids = ids;   // the combined ids the three projections read
++    if (eids->type != GGML_TYPE_I32 || !ggml_is_contiguous(eids) || ggml_nelements(eids) != (int64_t) n_tok * n_used || n_tok * n_used > GGML_CL_MISS_PMAX || n_tok > 8 ||
++        !ggml_is_contiguous(src1) || src1->ne[0] != L.bank[0]->ne[0] || ggml_nelements(src1) != (int64_t) n_tok * src1->ne[0]) {
++        return;
++    }
++    if (L.pending) {
++        // the previous publish was never merged (its down projection took another path): its
++        // job may still read pub, so wait for it before rewriting; its rows were lost
++        static bool said = false;
++        if (!said) { GGML_LOG_ERROR("ggml_opencl: a CPU miss job was never merged (seq %u); its pairs stayed zero\n", L.seq); said = true; }
++        const auto t0 = std::chrono::steady_clock::now();
++        while (__atomic_load_n(&L.back[16], __ATOMIC_ACQUIRE) < L.seq) {
++            GGML_CL_PAUSE();
++            if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) GGML_ABORT("ggml_opencl: the CPU misses' job %u never finished", L.seq);
++        }
++        L.pending = false;
++    }
++    L.gen = ctx->graph_gen;
++    L.seq += 1;
++    L.n_tok = n_tok; L.n_used = n_used;
++    ggml_tensor_extra_cl * ex = (ggml_tensor_extra_cl *) src1->extra;
++    ggml_tensor_extra_cl * ei = (ggml_tensor_extra_cl *) eids->extra;
++    const cl_ulong xoff = ex->offset + src1->view_offs, ioff = ei->offset + eids->view_offs;
++    const int n_x = (int) (n_tok * src1->ne[0]), n_ids = n_tok * n_used;
++    cl_kernel k = ctx->kernel_miss_publish;
++    CL_CHECK(clSetKernelArg(k, 0, sizeof(cl_mem),   &ex->data_device));
++    CL_CHECK(clSetKernelArg(k, 1, sizeof(cl_ulong), &xoff));
++    CL_CHECK(clSetKernelArg(k, 2, sizeof(cl_mem),   &ei->data_device));
++    CL_CHECK(clSetKernelArg(k, 3, sizeof(cl_ulong), &ioff));
++    CL_CHECK(ctx->usm_set_arg_ptr(k, 4, L.pub));
++    CL_CHECK(clSetKernelArg(k, 5, sizeof(int),      &n_x));
++    CL_CHECK(clSetKernelArg(k, 6, sizeof(int),      &n_ids));
++    CL_CHECK(clSetKernelArg(k, 7, sizeof(cl_uint),  &L.seq));
++    static const char * mx_env = getenv("GGML_OPENCL_CPU_MISS_MAX");
++    static const int n_cpu_max = mx_env ? atoi(mx_env) : 16;   // 16 measured best (B60, Flash-Next: 2 / 4 / 8 / 16 / 24 / 32)
++    CL_CHECK(clSetKernelArg(k, 8, sizeof(int),      &L.n_slots));
++    CL_CHECK(clSetKernelArg(k, 9, sizeof(int),      &n_cpu_max));
++    size_t gws[1] = { 256 }, lws[1] = { 256 };
++    CL_CHECK(clEnqueueNDRangeKernel(ctx->queue, k, 1, nullptr, gws, lws, 0, nullptr, nullptr));
++    CL_CHECK(clFlush(ctx->queue));   // the publish must reach the card: the CPU spins on it
++    // the coordinator's job
++    ggml_cl_miss_pool & P = *g_miss_pool;
++    const uint64_t h = P.head.load(std::memory_order_relaxed);
++    while (h - P.tail.load(std::memory_order_acquire) >= P.ring.size()) { GGML_CL_PAUSE(); }
++    P.ring[h % P.ring.size()] = { &L, L.seq, n_tok, n_used };
++    P.head.store(h + 1, std::memory_order_release);
++    L.pending = true;
++}
++
++// after a decode layer's down projection: the CPU's rows into the missed pairs
++static void ggml_cl_miss_merge(ggml_backend_opencl_context * ctx, const ggml_tensor * src0, ggml_tensor * dst) {
++    auto it = g_miss_by_slot.find(src0);
++    if (it == g_miss_by_slot.end() || it->second.second != 2) return;
++    ggml_cl_miss_layer & L = *it->second.first;
++    if (!L.pending || L.gen != ctx->graph_gen) return;
++    L.pending = false;
++    GGML_ASSERT(ggml_is_contiguous(dst) && dst->ne[0] == L.bank[2]->ne[1] && dst->type == GGML_TYPE_F32);
++    ggml_tensor_extra_cl * ed = (ggml_tensor_extra_cl *) dst->extra;
++    const cl_ulong yoff = ed->offset + dst->view_offs;
++    const cl_uint limit = 40000000;
++    const int n_embd = (int) dst->ne[0], y_rows = L.n_tok * L.n_used;
++    cl_kernel k = ctx->kernel_miss_wait;
++    CL_CHECK(ctx->usm_set_arg_ptr(k, 0, L.back));
++    CL_CHECK(clSetKernelArg(k, 1, sizeof(cl_mem),   &ed->data_device));
++    CL_CHECK(clSetKernelArg(k, 2, sizeof(cl_ulong), &yoff));
++    CL_CHECK(clSetKernelArg(k, 3, sizeof(cl_uint),  &L.seq));
++    CL_CHECK(clSetKernelArg(k, 4, sizeof(cl_uint),  &limit));
++    CL_CHECK(clSetKernelArg(k, 5, sizeof(int),      &n_embd));
++    CL_CHECK(clSetKernelArg(k, 6, sizeof(int),      &y_rows));
++    size_t gws[1] = { 256 }, lws[1] = { 256 };
++    CL_CHECK(clEnqueueNDRangeKernel(ctx->queue, k, 1, nullptr, gws, lws, 0, nullptr, nullptr));
++}
++
+ // an expert cache's gather mirror, allocated at load (not inside a request)
+ static void ggml_backend_opencl_reserve_gather(ggml_backend_dev_t dev, size_t q, size_t d) {
+     ggml_backend_opencl_context * ctx = ((ggml_backend_opencl_device_context *) dev->context)->backend_ctx;
+@@ -15160,6 +15649,9 @@ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, c
+     if (strcmp(name, "ggml_backend_opencl_chain_prefetch") == 0) {
+         return (void *) ggml_backend_opencl_chain_prefetch;
+     }
++    if (strcmp(name, "ggml_backend_opencl_miss_layer") == 0) {
++        return (void *) ggml_backend_opencl_miss_layer;
++    }
+     if (strcmp(name, "ggml_backend_opencl_pair_bank") == 0) {
+         return (void *) ggml_backend_opencl_pair_bank;
+     }
+@@ -29723,6 +30215,11 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+     GGML_ASSERT(ne12 == n_tok && src1->ne[3] == 1 && src0->ne[3] == 1);
+     GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ne00 % ggml_cl_kq_k_unit(src0->type) == 0 &&
+                 src0->view_offs == 0);
++    // patch 0056: a decode layer's misses to the CPU, published before its first projection
++    // (the per-pair matvec only: it writes zeros for the -1 pairs the publish hands over)
++    if (!gemm && !idg && !grouped && cache_src && !g_miss_by_slot.empty()) {
++        ggml_cl_miss_publish(backend_ctx, src0, src1, ids, n_tok, n_used);
++    }
+ 
+     ggml_tensor_extra_cl * extra2 = (ggml_tensor_extra_cl *)ids->extra;
+     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+@@ -30195,6 +30692,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
+ 
+ #ifdef GGML_OPENCL_SOA_Q
+     if (ggml_cl_mul_mat_id_kq(backend_ctx, src0, src1, src2, dst)) {
++        if (!g_miss_by_slot.empty()) {
++            ggml_cl_miss_merge(backend_ctx, src0, dst);   // patch 0056
++        }
+         return;
+     }
+ #endif
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+index 93eac4e..2b1b89e 100644
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -3,6 +3,7 @@
+ #include "llama-impl.h"
+ #include "llama-model.h"
+ #include "llama-model-loader.h"
++#include "ggml-cpu.h"
+ 
+ #include <algorithm>
+ #include <cerrno>
+@@ -519,6 +520,35 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+             }
+         }
+     }
++    // patch 0056 (LLAMA_EXPERT_CACHE_CPU_MISSES=1): a share of decode's missed experts
++    // on the CPU, Strata's doorbell tier; the backend computes them from the bank in
++    // host memory while the card computes the hits and reads the other misses (its
++    // multi-token rows, or for other types ggml-cpu's dot products passed in here)
++    if (const char * cm = getenv("LLAMA_EXPERT_CACHE_CPU_MISSES"); cm != nullptr && atoi(cm) != 0) {
++        typedef void (*miss_layer_t)(const ggml_tensor * const *, const ggml_tensor * const *, int, int, float,
++                                     void * const *, const int *, void * const *, int);
++        auto miss_layer = (miss_layer_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_miss_layer");
++        const char * te = getenv("LLAMA_EXPERT_CACHE_CPU_MISS_THREADS");
++        const int n_th = te ? std::max(1, atoi(te)) : 8;   // 8 measured as 10 and 12
++        int n_reg = 0;
++        for (auto & L : layers) {
++            bool ok = miss_layer != nullptr;
++            void * vd[3] = {}; int vt[3] = {}; void * ff[3] = {};
++            for (int k = 0; k < 3 && ok; ++k) {
++                const auto * tr = ggml_get_type_traits_cpu(L.slot[k]->type);
++                ok = L.slot[k]->type != GGML_TYPE_Q8_0 && tr != nullptr && tr->vec_dot != nullptr &&
++                     ggml_get_type_traits_cpu(tr->vec_dot_type)->from_float != nullptr;
++                if (ok) { vd[k] = (void *) tr->vec_dot; vt[k] = (int) tr->vec_dot_type; ff[k] = (void *) ggml_get_type_traits_cpu(tr->vec_dot_type)->from_float; }
++            }
++            if (!ok) continue;
++            const float c = model.hparams.swiglu_clamp_exp[L.il];
++            const ggml_tensor * sl[3] = { L.slot[0], L.slot[1], L.slot[2] };
++            const ggml_tensor * bk[3] = { L.bank[0], L.bank[1], L.bank[2] };
++            miss_layer(sl, bk, L.n_slots, L.n_expert, c > 1e-6f ? c : 0.0f, vd, vt, ff, n_th);
++            ++n_reg;
++        }
++        LLAMA_LOG_INFO("%s: the misses of %d of %zu layers on the CPU (%d threads)\n", __func__, n_reg, layers.size(), n_th);
++    }
+     // gate -> up -> down: each projection's decode matvec copies the next one's
+     // missed experts (the same routed ids) into a card-side mirror
+     if (chain_prefetch) {
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 96d910a..f79e065 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -149,6 +149,14 @@ if (LLAMA_LLGUIDANCE)
+ endif ()
+ 
+ llama_build(test-recurrent-state-rollback.cpp)
++
++# patch 0056: the OpenCL expert cache's CPU miss rows against ggml-cpu
++if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
++    add_executable(test-opencl-miss-cpu test-opencl-miss-cpu.cpp ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.cpp)
++    target_include_directories(test-opencl-miss-cpu PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl)
++    target_link_libraries(test-opencl-miss-cpu PRIVATE ggml ggml-base ggml-cpu)
++    add_test(NAME test-opencl-miss-cpu COMMAND $<TARGET_FILE:test-opencl-miss-cpu>)
++endif()
+ llama_build(test-save-load-state.cpp)
+ 
+ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+diff --git a/tests/test-opencl-miss-cpu.cpp b/tests/test-opencl-miss-cpu.cpp
+new file mode 100644
+index 0000000..80b38fa
+--- /dev/null
++++ b/tests/test-opencl-miss-cpu.cpp
+@@ -0,0 +1,62 @@
++// patch 0056: the expert cache's CPU miss rows (ggml-opencl-miss-cpu.cpp) against ggml-cpu's vec_dot, the
++// weights in planes as the bank holds them, 1-6 tokens a pass. `red` reads the planes as GGUF blocks: it must fail.
++#include "ggml.h"
++#include "ggml-cpu.h"
++#include "ggml-opencl-miss-cpu.h"
++#include <cstdio>
++#include <cstring>
++#include <cmath>
++#include <random>
++#include <vector>
++#include <chrono>
++struct fd { int off, size; };
++static int fields(ggml_type t, fd f[5]) {
++    switch (t) {
++        case GGML_TYPE_IQ2_XXS: f[0] = { 0, 2 }; f[1] = { 2, 64 }; return 2;
++        case GGML_TYPE_IQ2_S:   f[0] = { 0, 2 }; f[1] = { 2, 32 }; f[2] = { 34, 32 }; f[3] = { 66, 8 }; f[4] = { 74, 8 }; return 5;
++        case GGML_TYPE_Q2_0:    f[0] = { 0, 2 }; f[1] = { 2, 16 }; return 2;
++        default: return 0;
++    }
++}
++int main(int argc, char ** argv) {
++    const bool red = argc > 1 && !strcmp(argv[1], "red");   // red case: the planes read as GGUF blocks
++    if (!ggml_cl_miss_cpu_ok()) { printf("skipped: no AVX2/FMA/F16C\n"); return 0; }
++    ggml_cpu_init();
++    std::mt19937 rng(7);
++    std::normal_distribution<float> nd(0.f, 1.f);
++    int fails = 0;
++    struct cs { ggml_type t; int64_t ne0, ne1; } cases[] = { { GGML_TYPE_IQ2_S, 2560, 640 }, { GGML_TYPE_IQ2_XXS, 2560, 640 }, { GGML_TYPE_Q2_0, 640, 2560 } };
++    for (auto c : cases) {
++        const size_t bs = ggml_type_size(c.t); const int64_t bpr = c.ne0 / ggml_blck_size(c.t), nblk = bpr * c.ne1;
++        // real weights: quantize random floats (ggml's quantizer needs the i-quant tables)
++        std::vector<float> wf(c.ne0 * c.ne1); for (auto & v : wf) v = nd(rng) * 0.02f;
++        std::vector<uint8_t> gguf(nblk * bs);
++        if (c.t == GGML_TYPE_IQ2_S || c.t == GGML_TYPE_IQ2_XXS) ggml_quantize_init(c.t);
++        std::vector<float> im(c.ne0, 1.0f); ggml_quantize_chunk(c.t, wf.data(), gguf.data(), 0, c.ne1, c.ne0, ggml_quantize_requires_imatrix(c.t) ? im.data() : nullptr);
++        std::vector<uint8_t> planes(nblk * bs);
++        fd f[5]; const int nf = fields(c.t, f); size_t plane = 0;
++        for (int q = 0; q < nf; ++q) { for (int64_t i = 0; i < nblk; ++i) memcpy(&planes[plane + i * f[q].size], &gguf[i * bs + f[q].off], f[q].size); plane += nblk * f[q].size; }
++        const auto * tr = ggml_get_type_traits_cpu(c.t); const auto * tv = ggml_get_type_traits_cpu(tr->vec_dot_type);
++        for (int nt = 1; nt <= 6; ++nt) {
++            std::vector<std::vector<float>> x(nt, std::vector<float>(c.ne0));
++            for (auto & v : x) for (auto & e : v) e = nd(rng);
++            std::vector<std::vector<char>> aq(nt, std::vector<char>(ggml_cl_miss_cpu_act_size(c.t, c.ne0))), rq(nt, std::vector<char>(ggml_row_size(tr->vec_dot_type, c.ne0)));
++            std::vector<std::vector<float>> out(nt, std::vector<float>(c.ne1)), ref(nt, std::vector<float>(c.ne1));
++            const void * act[8]; float * op[8];
++            for (int k = 0; k < nt; ++k) { ggml_cl_miss_cpu_quant(c.t, x[k].data(), c.ne0, aq[k].data()); act[k] = aq[k].data(); op[k] = out[k].data(); tv->from_float(x[k].data(), rq[k].data(), c.ne0); }
++            const auto t0 = std::chrono::steady_clock::now();
++            ggml_cl_miss_cpu_rows(c.t, planes.data(), !red, c.ne0, c.ne1, act, nt, op, 0, (int) c.ne1);
++            const double us = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() * 1e6;
++            double emax = 0, rmax = 0;
++            for (int k = 0; k < nt; ++k) for (int64_t r = 0; r < c.ne1; ++r) {
++                tr->vec_dot((int) c.ne0, &ref[k][r], 0, &gguf[r * bpr * bs], 0, rq[k].data(), 0, 1);
++                emax = std::max(emax, (double) fabsf(out[k][r] - ref[k][r])); rmax = std::max(rmax, (double) fabsf(ref[k][r]));
++            }
++            const double rel = emax / rmax; const double tol = c.t == GGML_TYPE_Q2_0 ? 1e-3 : 1e-5;   // Q2_0: Strata's activation chunks, not ggml's q8_0
++            const bool ok = rel < tol; fails += !ok;
++            printf("%-8s nt=%d rel err %.2e (tol %.0e) %s  %.0f us\n", ggml_type_name(c.t), nt, rel, tol, ok ? "ok" : "FAIL", us);
++        }
++    }
++    printf("%s: %d failing\n", red ? "red" : "test", fails);
++    return fails ? 1 : 0;
++}

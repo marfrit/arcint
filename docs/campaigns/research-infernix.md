@@ -171,6 +171,11 @@ checkout, with these abbreviations:
 2. **A GPU-planned CPU miss service** over a mapped doorbell, with the shared
    and resident experts overlapping the CPU wait. A B60 spin needs the LSC
    uncached loads (memory `project-b60-host-flag-needs-lsc-uncached`).
+   **Built 2026-10-15** in Strata's form (patch 0056, opt-in; `measured-here`):
+   the first 16 missed pairs of a layer on the CPU with Strata's multi-token
+   AVX2 rows, the rest over the link; Flash-Next decode +15.2 %, KL +0.0028.
+   Infernix's split rule (`min(16, M - M/divisor)` by the link's speed) is
+   not ported; a fixed 16 measured best of 2-32.
 3. **Warm start** from the saved live state. Cheap. **Tried 2026-10-15**
    (`measured-here`): a live placement saved from other prompts seeded
    Flash-Next worse than the static calibration profile (89.5 against
