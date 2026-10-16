@@ -30,6 +30,16 @@ measured or set aside, the switches documented and the 1.x promise stated
 **Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (54
 patches), compiled in; dependencies as in 0.8.0.
 
+**Pre-tag check** (`measured-here`, 2026-10-16, the package): the release
+gate `tests/acceptance/ab.py` against 0.8.1's binary, alternated, two runs
+each: the agent 695.5 / 491.9 t/s at 55k / 138k (0.8.1 695.5 / 491.75), the
+coder 51.2 / 47.6 / 44.2 t/s and 725.6 at 41k (0.8.1 51.05 / 47.55 / 44.1,
+725.4), Flash-Next 595.25 / 34.7 (0.8.1 595.1 / 34.6): every metric equal
+within the window's spread, every answer right, the agent's and the coder's
+the same bytes; the equivalence and concurrency suites, the sanitizers, the
+acceptance task 10/10 (agent) and 9/10 (coder); DFlash2 opt-in answers and
+drafts from the package.
+
 - **DFlash2 drafting on the libllama engine, opt-in** (charter B2,
   `docs/campaigns/dflash2-agent.md`): `--llama-dflash-gguf FILE` drafts with
   a DFlash2 drafter in place of the MTP head, `--llama-dflash N` (1-7,
