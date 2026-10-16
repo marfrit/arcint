@@ -31,9 +31,14 @@ own servers.
         5 the rejected rows left in the drafter            a request fails or the window check fires
         6 checkpoints without the drafter's state          the resumed request accepts less (reported)
         7 drafts accepted without the target's verdict     an answer check fails or every answer differs
-      and one equivalence arm, which must not fire:
+      and two equivalence arms, which must not fire:
         8 the reference's prefill (every prompt row)       answers right, tokens a verify within 0.15 of green
                                                            (code, prose, 4k context, the resumed request)
+        9 the drafter loaded and injecting, no drafts      no more answers differing from plain's bytes than
+                                                           plain's own repeat differs (the B60's run-to-run
+                                                           determinism on this engine is not measured, DESIGN
+                                                           §8.8): the target's layer inputs as graph outputs
+                                                           leave its numerics alone
       Every red log must name its case (the mutant is in the loaded binary).
 
 Options: --device GPU.0, --n-ctx 212992 (every arm), --arms a,b,..,
@@ -80,8 +85,12 @@ def arms_table(drafter, assets):
     return {
         "plain": [],
         "mtp5": ["--llama-mtp", "5", "--llama-mtp-vocab", os.path.join(assets, "mtp-vocab.json")],
+        # 8-row verifies without the drafter: what DFlash2 7's verify shape does to the answers
+        "mtp7": ["--llama-mtp", "7", "--llama-mtp-vocab", os.path.join(assets, "mtp-vocab.json")],
         "dflash7": d + ["--llama-dflash", "7"],
         "dflash5": d + ["--llama-dflash", "5"],
+        # the reference's draft ubatch (the target's 512): its VRAM against the default 64's
+        "dflash7-ub512": d + ["--llama-dflash", "7", "--llama-dflash-ubatch", "512"],
         "dflash7-p03": d + ["--llama-dflash", "7", "--llama-dflash-min-p", "0.3"],
         "dflash7-p05": d + ["--llama-dflash", "7", "--llama-dflash-min-p", "0.5"],
     }
@@ -357,13 +366,16 @@ def red(a):
         return f
 
     run.serve("green", a.arcint, flags, cells("green"))
+    if os.path.exists(os.path.join(a.red_dir, "arcint-red-9")):   # build 9's reference: the served binary, no drafter
+        run.serve("plain", a.arcint, [], cells("plain"))
+        run.serve("plain-again", a.arcint, [], cells("plain-again"))
     for r in run.rows:   # the comparison needs a green arm that answers right
         if r.get("arm") == "green" and (r.get("answer_ok") is False or r.get("error")):
             run.gate(False, f"green {r['cell']}: {r.get('error') or 'the answer'}")
     g = {c: get(run.rows, "green", c, "tokens_a_verify") or 0 for c in ("code-1", "prose-1", "ckpt-edited")}
     green_md5 = {r["cell"]: r["md5"] for r in run.rows if r.get("arm") == "green" and "md5" in r}
     green_ok = {r["cell"]: r.get("answer_ok") for r in run.rows if r.get("arm") == "green" and "md5" in r}
-    for n in range(1, 9):
+    for n in range(1, 10):
         b = os.path.join(a.red_dir, f"arcint-red-{n}")
         if not os.path.exists(b):
             print(f"== red {n}: {b} missing, skipped", flush=True)
@@ -382,6 +394,15 @@ def red(a):
         elif n in (4, 5):
             fired = errors or window > 0
             detail = f"request errors {errors}, window check {window}"
+        elif n == 9:
+            # no drafts: one-row steps as plain's, with the layer inputs extracted and injected
+            md5 = lambda arm_: {r["cell"]: r["md5"] for r in run.rows if r.get("arm") == arm_ and "md5" in r}   # noqa: E731
+            p1, p2 = md5("plain"), md5("plain-again")
+            diff = [r["cell"] for r in mine if "md5" in r and p1.get(r["cell"]) not in (None, r["md5"])]
+            noise = [c for c in p1 if p2.get(c) not in (None, p1[c])]
+            run.gate(len(diff) <= len(noise), f"build 9 (no drafts) against plain: {len(diff)} answers differ "
+                     f"({', '.join(diff) or '-'}); plain against itself: {len(noise)} ({', '.join(noise) or '-'})")
+            continue
         elif n == 8:
             # the prefill's window-only injection against the reference's every row: the same drafter state
             cells8 = ("code-1", "prose-1", "ctx4k", "ckpt-edited")
@@ -425,7 +446,7 @@ def main():
         p.add_argument("--out", default=f"dflash-legs-{time.strftime('%Y%m%d-%H%M%S')}")
         p.add_argument("--pruefstand", default="")
         if mode == "served":
-            p.add_argument("--arms", default="plain,mtp5,dflash7,dflash5,dflash7-p03,dflash7-p05")
+            p.add_argument("--arms", default="plain,mtp5,mtp7,dflash7,dflash5,dflash7-ub512,dflash7-p03,dflash7-p05")
             p.add_argument("--depths", default="55000,130000,200000")
             p.add_argument("--deep-arms", default="mtp5,dflash7")
         else:

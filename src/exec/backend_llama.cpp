@@ -975,6 +975,11 @@ private:
             stats.decode_sample_seconds += seconds_since(t_walk) - emit_s;
             stats.completion_tokens += w.emitted;
             stats.draft_accepted += w.accepted;
+            // -vv: a line a verify, to set a run's acceptance beside another
+            // engine's step by step (llama-server's trace: accepted a/n)
+            if (log::enabled(log::Level::Debug))
+                log::debug("spec", "lane %d: verify at %zu: accepted %d/%zu, emitted %d", seq, have.size(), w.accepted,
+                           draft.size(), w.emitted);
             have.push_back(id_last);
             have.insert(have.end(), draft.begin(), draft.begin() + w.accepted);
             id_last = w.last;

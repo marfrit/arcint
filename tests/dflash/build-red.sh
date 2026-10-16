@@ -3,17 +3,18 @@
 # (ARCINT_DFLASH_RED=N: src/exec/llama_dflash.cpp, and case 7 in the verify
 # loop of src/exec/backend_llama.cpp), each copied to <out-dir>/arcint-red-N.
 # One build tree for all: a case recompiles two files.
-#   build-red.sh <arcint-source> <llama.cpp-tree> <out-dir> [cases, default "1 2 3 4 5 6 7 8"]
-# Build 8 is not a mutant: the reference's prefill (every prompt row into the
-# drafter), the equivalence arm of the prefill's window-only injection.
+#   build-red.sh <arcint-source> <llama.cpp-tree> <out-dir> [cases, default "1 2 3 4 5 6 7 8 9"]
+# Builds 8 and 9 are not mutants: 8 the reference's prefill (every prompt row
+# into the drafter), the equivalence arm of the window-only injection; 9 the
+# drafter loaded and injecting but drafting nothing, against plain's bytes.
 # The llama.cpp tree is the one the served binary builds against (the pin
 # with contrib/llama.cpp's patches); the build tree is <out-dir>/build.
 set -euo pipefail
-[ $# -ge 3 ] || { sed -n '2,11p' "$0"; exit 2; }
+[ $# -ge 3 ] || { sed -n '2,12p' "$0"; exit 2; }
 src=$1
 llama=$2
 out=$3
-cases=${4:-1 2 3 4 5 6 7 8}
+cases=${4:-1 2 3 4 5 6 7 8 9}
 mkdir -p "$out"
 for n in $cases; do
   cmake -S "$src" -B "$out/build" -DARCINT_LLAMA=ON -DARCINT_LLAMA_DIR="$llama" -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF \

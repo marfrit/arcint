@@ -260,6 +260,9 @@ public:
         for (size_t k = 0; k < n_parts; ++k) {
             DraftPart& p = parts[k];
             p.out->clear();
+#if ARCINT_DFLASH_RED == 9
+            continue;   // the diagnostic: no drafts, the layer inputs and the injection as served
+#endif
             if (p.n_max <= 0) continue;
             check_window(p.seq, p.pos0);
             for (int i = 0; i < n_block; ++i) {
