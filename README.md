@@ -44,8 +44,9 @@ tag [`openvino-history`](https://github.com/marfrit/arcint/tree/openvino-history
 
 The engine admits these architectures (`qwen35`, `qwen35moe`, `qwen4exp`, and
 `llama` at the Mistral Small 24B geometry) and refuses others at load.
-Flash-Next's IQ3_XXS and UD-Q3_K_XL files are on-demand options with better
-KL (DESIGN §7.2).
+Flash-Next's other files are on-demand options on the same endpoint: IQ2_XS,
+faster and less exact, and UD-Q3_K_XL, inside the KL bar once the host has
+the RAM for its bank (DESIGN §7.2).
 
 ## Current numbers
 

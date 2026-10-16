@@ -1,5 +1,6 @@
 # arcint-flashnext — Qwen3.8-Flash-Next from ISTA-DASLab's IQ3_XXS GGUF on the 24 GB card, on demand. The default
-# since 2026-10-15 (operator); the IQ2_XS file is the option arcint-flashnext-iq2xs.service, same port and name.
+# since 2026-10-15 (operator). IQ2_XS, faster and less exact, runs from this unit with its file as --gguf and
+# --llama-expert-cache 13400 (docs/llama-engine.md, "Flash-Next quant options").
 #
 # The quality step over IQ2_XS: KL 0.218 against unsloth's Q8_0 (IQ2_XS 0.294), top-1 89.7 % (87.1 %)
 # (docs/llama-engine.md, "Flash-Next quant options"). Its host bank is larger (28.72 GiB at these slots), so
@@ -25,7 +26,7 @@
 Description=arcint-flashnext — Qwen3.8-Flash-Next IQ3_XXS on libllama, expert cache + MTP, GPU.0, :8089
 Documentation=https://github.com/marfrit/arcint
 After=default.target
-Conflicts=arcint-agent.service arcint-writer.service arcint-flashnext-iq2xs.service
+Conflicts=arcint-agent.service arcint-writer.service
 
 [Service]
 Type=simple

@@ -312,7 +312,7 @@ marked):
 
 | GGUF | KL / top-1 vs unsloth's Q8_0 on the CPU (16 x 512) | host bank at the unit's slots | state |
 |---|---|---|---|
-| ISTA-DASLab GSQ-RCO IQ2_XS (shard 1 39.2 GB) | 0.294 / 87.1 % | 20.32 GiB at 13,400 MiB | on demand (`arcint-flashnext-iq2xs`), the faster option: 665.6 t/s at the 20k needle, 42.3 t/s (0.8.0's served check) |
+| ISTA-DASLab GSQ-RCO IQ2_XS (shard 1 39.2 GB) | 0.294 / 87.1 % | 20.32 GiB at 13,400 MiB | on demand, the faster option (the Flash-Next unit with this `--gguf` and 13,400 MiB of slots): 665.6 t/s at the 20k needle, 42.3 t/s (0.8.0's served check) |
 | ISTA-DASLab GSQ-RCO IQ3_XXS (shard 1 47.0 GB) | 0.218 / 89.7 % (served) | 28.72 GiB at 12,000 MiB | the default (`arcint-flashnext`), 12,000 MiB of slots with the CPU misses: 595.1 t/s at the 20k needle and 35.1 t/s in 0.8.0's served check; 597.9 t/s at the 20k needle, 33.9 / 37.5 / 37.3 / 33.5 / 30.6 / 30.9 t/s on six answers (20.7 / 26.2 / 28.9 / 18.7 / 21.2 / 18.5 without), KL 0.2910 against 0.2866 without (8 x 512), peak 23,306 MiB (13,400 MiB from ZFS thrashed: 6.4-11.7 t/s at peak 24,440) |
 | unsloth UD-Q3_K_XL (3 shards, 90 GB) | 0.100 / 93.3 %, inside the bar | ~39 GiB | 235 t/s prefill, 12-13 t/s decode without MTP (2026-10-06, before the bank stream and the CPU misses); needs the planned 96 GB host |
 
@@ -324,8 +324,8 @@ Every option needs its file on the NVMe, not the ZFS pool (an IQ3_XXS answer
 from ZFS decodes at 4-5 t/s, bound by storage reads), its host bank free
 beside the page cache (the bank is pinned), and a slot budget measured at the
 20k needle against the card's peak (`--llama-expert-cache`, §"The expert
-cache"). The units are on-demand variants of the Flash-Next unit with the
-same port and served name, conflicting with each other.
+cache"). An option runs from the Flash-Next unit with its own `--gguf` and
+`--llama-expert-cache`, on the same port and served name.
 
 ## MTP (`--llama-mtp N`)
 

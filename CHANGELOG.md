@@ -23,8 +23,9 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 - **Flash-Next serves IQ3_XXS by default** (operator, 2026-10-15, for its
   accuracy: KL 0.218 / top-1 89.7 % against IQ2_XS's 0.294 / 87.1 % vs
   unsloth's Q8_0). `contrib/systemd/arcint-flashnext.service` takes the
-  IQ3_XXS file with 12,000 MiB of expert slots and the CPU misses; IQ2_XS is
-  the option `arcint-flashnext-iq2xs.service`. Measured with the 0.8.0
+  IQ3_XXS file with 12,000 MiB of expert slots and the CPU misses; IQ2_XS
+  stays an option, run from the same unit with its file and 13,400 MiB of
+  slots. Measured with the 0.8.0
   package (`measured-here`, B60, the files on the NVMe, two processes):
   595.2 / 595.0 t/s at the 20k needle, 35.6 / 34.5 t/s decode, Paris and the
   needle, peak VRAM 23,312 MiB; the `flashnext-served` cell's floors follow.
