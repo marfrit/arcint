@@ -488,7 +488,8 @@ json props(const Context& ctx) {
                  {"enabled", st.mtp_enabled}}},
         {"dflash", {{"requested", std::string(cfg.llama_dflash_on() ? "on" : "off")},
                     {"enabled", st.dflash_enabled},
-                    {"drafts", cfg.llama_dflash_on() ? json(cfg.llama_dflash) : json(nullptr)}}},
+                    // the drafter's own count: --llama-dflash capped by its trained block
+                    {"drafts", st.dflash_drafts > 0 ? json(st.dflash_drafts) : json(nullptr)}}},
         {"sampler_defaults",
          {{"temperature", sd.temperature},
           {"top_p", sd.top_p},

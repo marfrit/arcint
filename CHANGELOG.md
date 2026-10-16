@@ -58,18 +58,28 @@ drafts from the package.
   212,992 tokens, the Q4_K drafter, against MTP 5 in the same build): +27 %
   on a code answer, -5 % prose, -8 % at 4k, -2 % at 55k, -33 % at 130k,
   -36 % at 200k; the reference's own server loses past ~60k too (+30 % at
-  4k, +15 % at 58k, -26 % at 135k). At
-  212,992 tokens its acceptance task scored 0/10, twice the same bytes, where MTP 5 and MTP 7 scored 10/10 and plain decoding 8/10 in the same build (at 32,768 tokens DFlash2 scored 10/10): the target's greedy text depends on how many rows each verify carries, and DFlash2's 8-row verifies take a different path through it. Not on the agent unit, which keeps MTP 5
-  at 245,760 tokens (operator, 2026-10-16): its sessions are long, and the
-  drafter's VRAM would cost ~32k of context. The red builds (`tests/dflash/`)
+  4k, +15 % at 58k, -26 % at 135k); below ~60k the reference gains and the
+  port does not, open. At 212,992 tokens its acceptance task scored 0/10,
+  twice the same bytes, where MTP 5 and MTP 7 scored 10/10 and plain
+  decoding 8/10 in the same build (at 32,768 tokens DFlash2 scored 10/10):
+  the target's greedy text depends on how many rows each verify carries,
+  but MTP 7's verifies carry 8 rows too; not attributed further (open). Not
+  on the agent unit, which keeps MTP 5 at 245,760 tokens (operator,
+  2026-10-16): its sessions are long, and the drafter's VRAM would cost
+  ~32k of context (arithmetic from file sizes and the measured peaks: it
+  fits at 212,992, not at 245,760). `/props` reports the drafter's own draft
+  count (`dflash.drafts`: `--llama-dflash` capped by the drafter's trained
+  block). The red builds (`tests/dflash/`)
   catch shuffled features, a stale block, kept rejected rows and unverified
   drafts; three mutants (wrong layers, a block off by one, no checkpoint
   state) did not move the measurements and need stronger forms.
 
 **Release speed gate:** `tests/acceptance/ab.py` serves the last release's
 binary and the candidate alternately in one window (old, new, old, new) and
-fails the candidate only if it is slower beyond that window's run-to-run
-spread, or an answer is wrong (operator, 2026-10-16; DESIGN §5). The
+fails the candidate if it is slower than the old binary beyond the old
+arm's run-to-run spread (at least 0.5 %), if its own spread exceeds the old
+arm's by more than 0.5 %, or if an answer is wrong (operator, 2026-10-16;
+DESIGN §5). Each binary is named with its sha256. The
 `*-served` cells' references carry `"gate": "report"`: run.py still prints
 REGRESSED against the recorded floors but they no longer fail the run.
 

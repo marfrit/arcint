@@ -49,6 +49,7 @@ struct ModelStatus {
     int         n_layer      = 0;
     bool        mtp_enabled  = false;
     bool        dflash_enabled = false;   // --llama-dflash-gguf: the DFlash2 drafter loaded
+    int         dflash_drafts  = 0;       // its drafts a verify: --llama-dflash capped by its block
     uint64_t    weights_bytes = 0;
 
     // The KV precision actually served, as --llama-kv set it ("f16", "q8_0",

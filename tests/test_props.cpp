@@ -130,13 +130,14 @@ TEST(props_reports_the_dflash_drafter) {
         FakeBackend backend;
         backend.st.loaded         = true;
         backend.st.dflash_enabled = true;
+        backend.st.dflash_drafts  = 5;   // a drafter trained on a block of 6 caps --llama-dflash 7
         SlotPool slots(1);
         Context  ctx{&cfg, &backend, &slots};
 
         const nlohmann::json j = lgc::api::props(ctx);
         CHECK_EQ(j.at("dflash").at("requested").get<std::string>(), std::string("on"));
         CHECK(j.at("dflash").at("enabled").get<bool>());
-        CHECK_EQ(j.at("dflash").at("drafts").get<int>(), 7);
+        CHECK_EQ(j.at("dflash").at("drafts").get<int>(), 5);   // what is served, not the flag
         CHECK_EQ(j.at("mtp").at("requested").get<std::string>(), std::string("off"));
         CHECK(!j.at("mtp").at("enabled").get<bool>());
     }

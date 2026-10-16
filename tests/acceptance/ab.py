@@ -14,10 +14,18 @@ cells.json are a report, not a veto.
 
 Per metric (`ACCEPTANCE-METRIC <name> <value> <unit>` lines of the runs):
 
-    spread  = the larger, over the two arms, of (max - min) / mean within
-              the arm: what the window itself varies by
-    passes  = mean(new) >= mean(old) * (1 - spread - TOLERANCE)
+    spread  = (max - min) / mean within an arm: what the window varies by
+    allow   = max(spread(old), FLOOR) + TOLERANCE: the old binary's own
+              spread, never below FLOOR; the candidate's spread does not
+              widen its own allowance
+    passes  = mean(new) >= mean(old) * (1 - allow)
+              and spread(new) <= spread(old) + FLOOR (a candidate that
+              varies more than the release did is a new instability)
               (for a unit where less is better -- s, ms -- mirrored)
+
+(operator, 2026-10-16, the release review of 1.0.0: before, the larger of
+the two arms' spreads was the allowance, so a noisy candidate passed on its
+own noise.)
 
 An answer gate (a `  FAIL` line of served_check.py) or a run that dies, in
 any run of either arm, fails the A/B. The `texts md5` line (the answers'
@@ -25,9 +33,11 @@ bytes) is compared and reported, never gated: the byte tripwire.
 
 Exit status: 0 the candidate is not slower and every answer is right; 1
 otherwise. With one round there is one run an arm and no spread to measure:
-the spread is 0 and the table says so; use --rounds 2 or more for a gate.
+the spread is 0, the allowance is FLOOR, and the table says so; use
+--rounds 2 or more for a gate.
 """
 import argparse
+import hashlib
 import os
 import re
 import subprocess
@@ -37,6 +47,13 @@ import sys
 # as a fraction (0.01 = 1 %). Default 0.0: the spread alone is the allowance.
 # The operator may set it (DESIGN.md §5); nothing else in this file does.
 TOLERANCE = 0.0
+
+# The least allowance and the most a candidate's spread may exceed the old
+# arm's, as a fraction: 0.5 %, the within-window run-to-run variation of the
+# served cells (0.8.1's and 1.0.0's A/Bs: 0.0-0.2 % on prefill and the
+# coder's decode, Flash-Next's decode 1.2-2.3 %; `measured-here`). Set by the
+# operator (2026-10-16), like TOLERANCE.
+FLOOR = 0.005
 
 # Units where a smaller number is better; every other unit (t/s) is a rate.
 LESS_IS_BETTER_UNITS = ("s", "ms")
@@ -90,15 +107,17 @@ def arm_stats(values):
     return mean, spread
 
 
-def decide(old_runs, new_runs, tolerance=None):
+def decide(old_runs, new_runs, tolerance=None, floor=None):
     """Per metric verdicts from the parsed runs of both arms.
 
     old_runs, new_runs: lists of parse_run() results. Returns (rows,
     failures): rows is a list of dicts (metric, unit, old, new, mean_old,
-    mean_new, spread_old, spread_new, spread, limit, ok, note), failures a
+    mean_new, spread_old, spread_new, spread (the allowance), limit, ok,
+    unsteady, note), failures a
     list of strings (answer gates and incomplete runs, each naming its arm
     and run) that fail the A/B independently of the numbers."""
     tol = TOLERANCE if tolerance is None else tolerance
+    flo = FLOOR if floor is None else floor
     failures = []
     for arm, runs in (("old", old_runs), ("new", new_runs)):
         for i, r in enumerate(runs, 1):
@@ -129,15 +148,17 @@ def decide(old_runs, new_runs, tolerance=None):
             continue
         mo, so = arm_stats(arms["old"][0])
         mn, sn = arm_stats(arms["new"][0])
-        spread = max(so, sn)
+        spread = max(so, flo)
         if row["unit"] in LESS_IS_BETTER_UNITS:
             limit = mo * (1 + spread + tol)
-            ok = mn <= limit
+            fast = mn <= limit
         else:
             limit = mo * (1 - spread - tol)
-            ok = mn >= limit
+            fast = mn >= limit
+        unsteady = sn > so + flo
         row.update(mean_old=mo, mean_new=mn, spread_old=so, spread_new=sn,
-                   spread=spread, limit=limit, ok=ok)
+                   spread=spread, limit=limit, ok=fast and not unsteady,
+                   slow=not fast, unsteady=unsteady)
         if len(arms["old"][0]) < 2:
             row["note"] = "one run an arm: no spread measured"
         rows.append(row)
@@ -164,22 +185,37 @@ def fmt(vals):
 
 def render(rows, failures, texts_line):
     out = [f"{'metric':<16} {'unit':<5} {'old runs':<22} {'new runs':<22} "
-           f"{'mean old':>9} {'mean new':>9} {'spread':>7} {'limit':>9}  verdict"]
+           f"{'mean old':>9} {'mean new':>9} {'sp old':>7} {'sp new':>7} {'allow':>7} {'limit':>9}  verdict"]
     for r in rows:
         if "mean_old" not in r:
             out.append(f"{r['metric']:<16} {r['unit']:<5} {fmt(r['old']):<22} {fmt(r['new']):<22} "
-                       f"{'-':>9} {'-':>9} {'-':>7} {'-':>9}  FAIL ({r['note']})")
+                       f"{'-':>9} {'-':>9} {'-':>7} {'-':>7} {'-':>7} {'-':>9}  FAIL ({r['note']})")
             continue
-        verdict = "ok" if r["ok"] else "FAIL (slower than the old beyond the spread)"
+        why = []
+        if r["slow"]:
+            why.append("slower than the old beyond the allowance")
+        if r["unsteady"]:
+            why.append("the new arm varies more than the old beyond the floor")
+        verdict = "ok" if r["ok"] else "FAIL (" + "; ".join(why) + ")"
         if r["note"] and r["ok"]:
             verdict += f" ({r['note']})"
         out.append(f"{r['metric']:<16} {r['unit']:<5} {fmt(r['old']):<22} {fmt(r['new']):<22} "
-                   f"{r['mean_old']:>9.2f} {r['mean_new']:>9.2f} {r['spread'] * 100:>6.2f}% "
+                   f"{r['mean_old']:>9.2f} {r['mean_new']:>9.2f} {r['spread_old'] * 100:>6.2f}% "
+                   f"{r['spread_new'] * 100:>6.2f}% {r['spread'] * 100:>6.2f}% "
                    f"{r['limit']:>9.2f}  {verdict}")
     out.append(texts_line)
     for f in failures:
         out.append(f"FAIL {f}")
     return "\n".join(out)
+
+
+def sha16(path):
+    """The first 16 hex digits of a file's sha256: which binary ran."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()[:16]
 
 
 def run_one(args, binary, arm, n):
@@ -209,16 +245,21 @@ def main(argv=None):
         p.error("--rounds must be at least 1")
     if args.out:
         os.makedirs(args.out, exist_ok=True)
+    binaries = {arm: f"{path} sha256 {sha16(path)}" for arm, path in (("old", args.old), ("new", args.new))}
+    for arm in ("old", "new"):
+        print(f"== {arm}: {binaries[arm]}", flush=True)
     old_runs, new_runs = [], []
     for n in range(1, args.rounds + 1):
         old_runs.append(run_one(args, args.old, "old", n))
         new_runs.append(run_one(args, args.new, "new", n))
     rows, failures = decide(old_runs, new_runs)
     print()
+    for arm in ("old", "new"):
+        print(f"{arm}: {binaries[arm]}")
     print(render(rows, failures, compare_texts(old_runs, new_runs)))
     bad = bool(failures) or not all(r["ok"] for r in rows)
     print("\nA/B " + ("FAIL" if bad else "PASS") + f": {args.service}, {args.rounds} round(s), "
-          f"tolerance {TOLERANCE * 100:.1f} %")
+          f"floor {FLOOR * 100:.1f} %, tolerance {TOLERANCE * 100:.1f} %")
     return 1 if bad else 0
 
 

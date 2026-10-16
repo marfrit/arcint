@@ -50,7 +50,7 @@ def main():
     r = rows[0]
     check("spread of the old arm is (max-min)/mean", near(r["spread_old"], 2 / 101), True)
     check("spread of a constant arm is 0", r["spread_new"], 0.0)
-    check("the window's spread is the larger of the arms", near(r["spread"], 2 / 101), True)
+    check("the allowance is the old arm's spread", near(r["spread"], 2 / 101), True)
     check("means per arm", (r["mean_old"], r["mean_new"]), (101.0, 100.0))
     check("limit = mean(old) * (1 - spread)", near(r["limit"], 101 * (1 - 2 / 101)), True)
     rows, _ = ab.decide(runs(100, 100), runs(90, 94))
@@ -63,10 +63,27 @@ def main():
     check("new 1.5 % slower, old spread 2 % -> pass", verdict((100, 102), (99.5, 99.5)), True)
     check("new faster -> pass", verdict((100, 100), (120, 120)), True)
 
+    # the operator's rule (2026-10-16): the old arm's spread, at least FLOOR, is the
+    # allowance; the candidate's own spread never widens it
+    check("floor 0.5 % by default", ab.FLOOR, 0.005)
+    rows, _ = ab.decide(runs(100, 100), runs(100, 104))
+    check("a steady old arm: the allowance is the floor", near(rows[0]["spread"], 0.005), True)
+    check("RED: a noisy candidate does not pass on its own noise (old 34.6/34.6, new 34.7/31.0)",
+          verdict((34.6, 34.6), (34.7, 31.0)), False)
+    check("RED: a candidate varying more than the old beyond the floor fails though faster",
+          verdict((100, 100), (100, 110)), False)
+    rows, _ = ab.decide(runs(100, 100), runs(100, 110))
+    check("the unsteady verdict is named", (rows[0]["slow"], rows[0]["unsteady"]), (False, True))
+    check("new spread within old + floor passes", verdict((100, 101), (100.5, 101.5)), True)
+    check("GREEN: 0.4 % slower, steady arms: inside the floor", verdict((100, 100), (99.6, 99.6)), True)
+    check("RED: 0.6 % slower, steady arms: outside the floor", verdict((100, 100), (99.4, 99.4)), False)
+    check("1.0.0's Flash-Next decode A/B passes (old 34.2/35.0, new 34.5/34.9)",
+          verdict((34.2, 35.0), (34.5, 34.9)), True)
+
     check("tolerance 0.0 by default", ab.TOLERANCE, 0.0)
     check("RED/GREEN: a 1 % shortfall fails at tolerance 0, passes at 0.02",
           (verdict((100, 100), (99, 99)), verdict((100, 100), (99, 99), tolerance=0.02)), (False, True))
-    check("exactly at the limit passes", verdict((100, 100), (95, 95), tolerance=0.05), True)
+    check("exactly at the limit passes", verdict((100, 100), (95, 95), tolerance=0.05, floor=0.0), True)
 
     rows, _ = ab.decide(runs(10, 10, unit="s"), runs(12, 12, unit="s"))
     check("RED: seconds, new 20 % longer -> FAIL", rows[0]["ok"], False)
@@ -116,6 +133,11 @@ def main():
     def a_b(old, new, rounds=2):
         with tempfile.TemporaryDirectory() as d:
             env = dict(os.environ, AB_FAKE_STATE=d)
+            os.makedirs(os.path.join(d, "bin"))
+            old, new = os.path.join(d, "bin", old), os.path.join(d, "bin", new)
+            for path in (old, new):
+                with open(path, "w") as f:
+                    f.write(os.path.basename(path))
             proc = subprocess.run([sys.executable, os.path.join(HERE, "ab.py"), "coder", "--old", old, "--new", new,
                                    "--gguf", "m.gguf", "--device", "GPU.1", "--assets", d, "--rounds", str(rounds),
                                    "--out", os.path.join(d, "out"), "--served-check", fake],
@@ -130,6 +152,10 @@ def main():
     check("end to end: new slower within the spread -> exit 0", rc, 0)
     rc, out = a_b("100,101", "x")
     check("RED end to end: an answer gate FAIL in the new arm -> exit 1", rc, 1)
+    rc, out = a_b("100,100", "100,110")
+    check("RED end to end: a candidate varying more than the old -> exit 1",
+          (rc, "varies more than the old" in out), (1, True))
+    check("end to end: both binaries named with their sha256", out.count(" sha256 "), 4)
     rc, out = a_b("100,101", "100,101", rounds=1)
     check("end to end: one round runs old and new once each", out.count("== old run") + out.count("== new run"), 2)
 

@@ -331,8 +331,12 @@ cache"). An option runs from the Flash-Next unit with its own `--gguf` and
 
 The GGUF's own MTP head drafts up to N tokens; the target verifies them in
 one decode, and arcint's sampler walks the verified rows in order, keeping
-the draft while it agrees -- the emitted tokens are what the plain loop
-would sample. The drafter is the single-head case of llama.cpp's `draft-mtp`
+the draft while it agrees -- every emitted token is the target's own pick
+at its row. The text is not byte for byte the plain loop's: the target's
+numbers depend on how many rows a verify carries (`measured-here`, the B60,
+2026-10-16: plain and MTP 5 give different texts, the acceptance task 8/10
+and 10/10 at 212,992 tokens); the answer-level bar is the gate. The drafter
+is the single-head case of llama.cpp's `draft-mtp`
 (`common/speculative.cpp` at the pin) rebuilt on libllama in
 `src/exec/llama_spec.cpp`: llama.cpp's common library compiles another
 cpp-httplib (0.58) than arcint's (0.18) into the binary, and the server
@@ -428,10 +432,19 @@ In arcint (`measured-here`, 2026-10-16, the B60, the agent's Q4_K_M at
 build): +27 % on a code answer, -5 % prose, -8 % at 4k, -2 % at 55k, -33 %
 at 130k, -36 % at 200k; the reference's own server loses past ~60k too
 (+30 % at 4k, +15 % at 58k, -26 % at 135k, its drafts accepted 37 -> 16 %),
-so the depth collapse is the drafter's or llama.cpp's, not the port's. The
-verify is lossless (red builds: unverified drafts change every answer, a
-drafter that drafts nothing gives plain's bytes). At 212,992 tokens its acceptance task scored 0/10, twice the same bytes, where MTP 5 and MTP 7 scored 10/10 and plain decoding 8/10 in the same build (at 32,768 tokens DFlash2 scored 10/10): the target's greedy text depends on how many rows each verify carries, and DFlash2's 8-row verifies take a different path through it. Opt-in: the agent unit
-keeps MTP 5 at 245,760 tokens (operator, 2026-10-16); the legs and the red cases are `tests/dflash/legs.sh` and
+so the loss past ~60k is the reference's too. Below it the reference gains
+(+30 % at 4k, +15 % at 58k) and the port does not (-8 %, -2 %): that gap is
+open, not attributed. Every draft passes the target's verify (red builds:
+drafts kept without the target's verdict change every answer, a drafter
+that drafts nothing gives plain's bytes). At 212,992 tokens its acceptance
+task scored 0/10, twice the same bytes, where MTP 5 and MTP 7 scored 10/10
+and plain decoding 8/10 in the same build (at 32,768 tokens DFlash2 scored
+10/10). The target's greedy text depends on how many rows each verify
+carries (red build 5, `measured-here`), but MTP 7's verifies carry 8 rows
+too, so the row count alone does not explain the 0/10; where the verifies
+fall in the text differs between the drafters. Not attributed further
+(open). Opt-in: the agent unit keeps MTP 5 at 245,760 tokens (operator,
+2026-10-16); the legs and the red cases are `tests/dflash/legs.sh` and
 `tests/dflash/build-red.sh`.
 
 ## Quantized KV (`--llama-kv K[:V]`)

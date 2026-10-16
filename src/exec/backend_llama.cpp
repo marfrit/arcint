@@ -523,6 +523,7 @@ public:
         }
         status_.mtp_enabled    = n_draft_ > 0 && !dflash_;
         status_.dflash_enabled = dflash_;
+        status_.dflash_drafts  = dflash_ ? n_draft_ : 0;
         slot_tokens_.resize(static_cast<size_t>(lanes_));
         comb_decoding_.assign(static_cast<size_t>(lanes_), false);
         comb_stalled_.assign(static_cast<size_t>(lanes_), false);

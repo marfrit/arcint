@@ -121,8 +121,9 @@
   Opt-in: against MTP 5 on the agent +27 % on code, -5 to -8 % on prose
   and at 4k, -33 to -36 % at 130-200k (the reference likewise past ~60k);
   the acceptance task 0/10 at 212,992 tokens (a different greedy path of
-  the same target, 10/10 at 32,768);
-  the agent unit keeps MTP 5 (docs/campaigns/dflash2-agent.md).
+  the same target, MTP 5 and MTP 7 10/10, not attributed; DFlash2 10/10 at
+  32,768); /props dflash.drafts is the drafter's own count; the agent
+  unit keeps MTP 5 (docs/campaigns/dflash2-agent.md).
 - Context checkpoints (--llama-checkpoints N, --llama-checkpoint-step T):
   per lane, the recurrent state at user messages and near the prompt's end,
   in host memory; a follow-up or an edited message resumes from the newest

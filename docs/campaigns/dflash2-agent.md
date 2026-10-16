@@ -1,6 +1,13 @@
 # dflash2-agent — DFlash2 block drafting for the dense agent on the libllama engine
 
-**Closed 2026-10-16** (charter B2): built on the libllama engine, opt-in (`--llama-dflash-gguf`); measured as not paying for the agent's long sessions (the reference's own server likewise past ~60k); the agent unit keeps MTP 5 at 245,760 tokens (operator, 2026-10-16). Open for 1.x: the depth collapse (Second card run, below) and three red mutants too weak to fire.
+**Closed 2026-10-16** (charter B2): built on the libllama engine, opt-in
+(`--llama-dflash-gguf`); measured as not paying for the agent's long
+sessions (the reference's own server likewise past ~60k); the acceptance
+task 0/10 at 212,992 tokens (MTP 5 and MTP 7 10/10, not attributed); the
+agent unit keeps MTP 5 at 245,760 tokens (operator, 2026-10-16). Open for
+1.x (Second card run, below): the depth collapse past ~60k; the gap below
+it (the reference +30 % at 4k and +15 % at 58k, the port -8 % and -2 %);
+the 0/10 at 212,992; three red mutants too weak to fire.
 
 ## Charter
 
@@ -276,7 +283,10 @@ drafter; `legs.py served` and `red`; each arm a fresh process):
   147,456 tokens, MTP 5 against DFlash2 7 on corpus prompts: 3,754 tokens
   32.7 -> 42.5 t/s (+30 %), 58,084 24.2 -> 27.9 (+15 %), 134,951 15.3 ->
   11.3 (-26 %; drafts accepted 37 % -> 16 %). Not attributed between the
-  drafter's training length and llama.cpp's DFlash path.
+  drafter's training length and llama.cpp's DFlash path. Below ~60k the
+  reference gains and the port does not (-8 % at 4k, -2 % at 55k, its
+  drafts at about MTP 5's tokens a verify: 2.75 and 2.95 against 2.82 and
+  2.74): open, not attributed.
 - **Against the reference at short context** (32,768 tokens, phase 0's
   prompts, warm): arcint's DFlash2 cycle costs 74.6 ms against
   llama-server's ~75 (drafting 8.8 ms a cycle, the drafter's graphs in 1-2
@@ -290,7 +300,10 @@ drafter; `legs.py served` and `red`; each arm a fresh process):
   greedy text depends on how many rows each verify carries (its answer
   became plain's bytes), and red build 9 (the drafter loaded, drafting
   nothing) gives plain's bytes exactly: the 0/10 is a different greedy path
-  of the same target, not a lossy verify. Red build 7 (drafts kept without
+  of the same target, not a lossy verify. Why that path fails the task and
+  MTP 7's does not is not attributed (open): MTP 7's verifies carry 8 rows
+  too, and where the verifies fall in the text differs between the
+  drafters. Red build 7 (drafts kept without
   the target's verdict) changes every answer: an unverified draft is seen.
 - **The red builds:** 2 (shuffled feature rows: code 5.65 -> 1.85 tokens a
   verify), 4 (the block left in the drafter: every request fails), 5
@@ -307,7 +320,8 @@ save makes the real checkpoints differ from the plan, and a resumed request
 drafts from a stale window: acceptance only); the window-only injection
 assumes every drafter layer is a sliding-window layer (the Qwen3.8 drafter
 is; a mixed drafter would miss rows: acceptance only); `/props`'s
-`dflash.drafts` reports the requested count, not the block-limited one;
+`dflash.drafts` reported the requested count, not the block-limited one
+(fixed in 1.0.0: the drafter's own count);
 enabling the target's layer inputs adds ~200 MiB of pinned host memory at
 a 2,048 batch and copies every prompt row's five layer inputs to the host,
 injected or not; red builds 1, 3 and 6 need stronger mutants, and the

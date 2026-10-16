@@ -286,9 +286,13 @@ count) fail that test.
 
 - **The model's own MTP head** (`--llama-mtp N`) drafts up to N tokens; the
   target verifies them in one decode, and arcint's sampler walks the verified
-  rows in order, keeping the draft while it agrees, so the emitted tokens are
-  what the plain loop would sample, greedy or seeded sampled
-  (`src/exec/verify_walk.h`, a pure function with its own tests). The drafter
+  rows in order, keeping the draft while it agrees, so every emitted token is
+  the target's own pick at its row, greedy or seeded sampled
+  (`src/exec/verify_walk.h`, a pure function with its own tests). The text is
+  not byte for byte the plain loop's: the target's numbers depend on how many
+  rows a verify carries (`measured-here`, the B60, 2026-10-16: plain and
+  MTP 5 give different texts at 212,992 tokens, the acceptance task 8/10 and
+  10/10); the answer-level bar is the gate (§3.4). The drafter
   is the single-head case of llama.cpp's `draft-mtp` rebuilt on libllama
   (`src/exec/llama_spec.cpp`): llama.cpp's common library would compile a
   second cpp-httplib into the binary (`code`).
@@ -308,8 +312,8 @@ count) fail that test.
   (`src/exec/dflash_walk.h`, pure, with its own tests). The verify walk and
   the recurrent rollback are the MTP path's: every emitted token is the
   target's own pick, though the target's picks depend on how many rows a
-  verify carries, so the text is not the plain loop's. A checkpoint carries the drafter's window, as llama.cpp's
-  server's does; a prefill injects only the rows the window and the
+  verify carries, so the text is not the plain loop's. A checkpoint carries
+  the drafter's window, as llama.cpp's server's does; a prefill injects only the rows the window and the
   checkpoints need (the operator's call, beyond the reference). Built and
   opt-in; measured in §8.5.
 
@@ -478,10 +482,13 @@ reported, not a veto.
   0.0-0.4 %); 0.8.1's pre-tag check showed the dev host drifting more than
   that in a day (0.8.0's own binary 0.3 % below its prefill floors and 1 %
   below its decode floors the afternoon after a cold start, `measured-here`),
-  so the floors in the `*-served` cells (0.8.1's numbers, §7.1) are now a
+  so the floors in the `*-served` cells (1.0.0's numbers, §7.1) are now a
   report, not a veto. The gate is `tests/acceptance/ab.py` (old, new, old,
-  new; per metric the larger within-arm spread is the allowance; an answer
-  failure in any run fails it; the answer bytes are compared and reported).
+  new; per metric the old arm's within-arm spread is the allowance, never
+  below a floor of 0.5 %, and the candidate fails when its own spread
+  exceeds the old arm's by more than that floor (operator, 2026-10-16: a
+  noisy candidate does not widen its own allowance); an answer failure in
+  any run fails it; the answer bytes are compared and reported).
 - **Equivalence suite** (`tests/equivalence/run.sh`, on a card, `--engine
   llama --gguf`): two greedy runs, a lane's reused prefix against a fresh
   process (warm against cold), a checkpoint resume against a full
@@ -621,9 +628,11 @@ over a day (§5).
 | Flash-Next | B60 + host | IQ3_XXS, 131,072 ctx, q8_0 KV, 12,000 MiB of slots (7,208 slots), bank 28.72 GiB, MTP 3 with min-p 0.5, Q4_K draft head, the bank stream, the CPU misses | 595.4 / 595.1 t/s at 20,045 tokens | 34.5 / 34.9 t/s | Paris, the needle |
 | Flash-Next, IQ2_XS option | B60 + host | IQ2_XS, 13,400 MiB of slots (9,724), bank 20.32 GiB, the rest as above | 665.8 / 665.4 t/s | 42.2 / 42.3 t/s | Paris, the needle |
 
-The agent's decode in the same release: 36.6 / 32.3 / 19.3 t/s at 4k / 29k /
-130k prompt tokens (2026-10-08 protocol; since then 0016-0051 moved it,
-not re-measured as a table). The writer: 25.2 t/s short, 18.2 at 16k
+The agent's decode, not in the release gate: 38.9 / 25.6 / 16.6 / 13.5 t/s
+at 4k / 55k / 130k / 200k prompt tokens, 59.2 on a code answer and 33.0 on
+prose (MTP 5 at 212,992 tokens, the 1.0.0 series, `measured-here`,
+2026-10-16, `docs/campaigns/dflash2-agent.md`; the unit runs 245,760). The
+writer: 25.2 t/s short, 18.2 at 16k
 (0.5.8).
 
 **Against the reference**: Strata's SYCL port on the same B60 decodes 37.8
@@ -721,16 +730,25 @@ llama.cpp at the pin carries DFlash and DFlash2 drafting (`draft-dflash`,
 reference's own server at the pin, on the B60 (`measured-here`, 2026-10-16,
 32,768 tokens, greedy): the Q4_K drafter at 7 drafts decoded +52 % on code,
 +40 % on prose and +16-23 % at a 4k context over MTP 5, with the same
-answer bytes. **State: built and opt-in (2026-10-16)** (`measured-here`, 2026-10-16, the B60, the agent's Q4_K_M at
-212,992 tokens, the Q4_K drafter, draft ubatch 64, against MTP 5 in the same
-build): +27 % on a code answer, -5 % prose, -8 % at 4k, -2 % at 55k, -33 %
-at 130k, -36 % at 200k; the reference's own server loses past ~60k too
+answer bytes. **State: built and opt-in (2026-10-16)** (`measured-here`,
+2026-10-16, the B60, the agent's Q4_K_M at 212,992 tokens, the Q4_K
+drafter, draft ubatch 64, against MTP 5 in the same build): +27 % on a code
+answer, -5 % prose, -8 % at 4k, -2 % at 55k, -33 % at 130k, -36 % at 200k; the reference's own server loses past ~60k too
 (+30 % at 4k, +15 % at 58k, -26 % at 135k, its drafts accepted 37 -> 16 %),
-so the depth collapse is the drafter's or llama.cpp's, not the port's. The
-verify is lossless (red builds: unverified drafts change every answer, a
-drafter that drafts nothing gives plain's bytes). At 212,992 tokens its acceptance task scored 0/10, twice the same bytes, where MTP 5 and MTP 7 scored 10/10 and plain decoding 8/10 in the same build (at 32,768 tokens DFlash2 scored 10/10): the target's greedy text depends on how many rows each verify carries, and DFlash2's 8-row verifies take a different path through it. Opt-in: the agent unit
-keeps MTP 5 at 245,760 tokens (operator, 2026-10-16). The
-legs are `tests/dflash/legs.sh` (`docs/campaigns/dflash2-agent.md`).
+so the loss past ~60k is the reference's too. Below it the reference gains
+(+30 % at 4k, +15 % at 58k) and the port does not (-8 %, -2 %): that gap is
+open, not attributed. Every draft passes the target's verify (red builds:
+drafts kept without the target's verdict change every answer, a drafter
+that drafts nothing gives plain's bytes). At 212,992 tokens its acceptance
+task scored 0/10, twice the same bytes, where MTP 5 and MTP 7 scored 10/10
+and plain decoding 8/10 in the same build (at 32,768 tokens DFlash2 scored
+10/10). The target's greedy text depends on how many rows each verify
+carries (red build 5, `measured-here`), but MTP 7's verifies carry 8 rows
+too, so the row count alone does not explain the 0/10; where the verifies
+fall in the text differs between the drafters. Not attributed further
+(open). Opt-in: the agent unit keeps MTP 5 at 245,760 tokens (operator,
+2026-10-16). The legs are `tests/dflash/legs.sh`
+(`docs/campaigns/dflash2-agent.md`).
 
 ### 8.6 Levers priced below 2 % (charter B1)
 
@@ -743,9 +761,13 @@ count (~13 % of a Flash-Next round, many small fusions, none obvious alone).
 
 ### 8.7 Interface (charters A7, C4)
 
-Which switches and flags stay stable within 1.x is the operator's
-(`docs/switches.md`). 0.8.0 changes the surface: the OpenVINO engine's
-flags are refused by name, `/props` and `/health` lose its fields (the
+Stable within 1.x (charter C4, operator, 2026-10-16): the HTTP surface, the
+command-line flags and the operational switches (`docs/switches.md`, the
+class a unit file may set); tuning, off-switch, red-case and diagnostic
+switches may change without notice. 1.0.0 adds `/props`'s `dflash` block
+(`requested`, `enabled`, `drafts`: the drafter's own draft count,
+`--llama-dflash` capped by its trained block). 0.8.0 changed the surface:
+the OpenVINO engine's flags are refused by name, `/props` and `/health` lose its fields (the
 reservation, the prefix cache, the paged-KV block), `/props` gains
 `model.architecture`, `quant` names the GGUF's file type, `kv_dtype`
 reports `--llama-kv` (it read "f16" whatever the flag said before), and
