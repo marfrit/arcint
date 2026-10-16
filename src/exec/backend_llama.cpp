@@ -428,15 +428,17 @@ public:
                                                     : std::max(1, static_cast<int>(std::thread::hardware_concurrency()) / 2);
         cp.n_threads       = threads;
         cp.n_threads_batch = threads;
-        // --llama-mtp: per-token snapshots of the recurrent state, so a
-        // rejected draft rolls back on the device (llama_memory_seq_rm)
-        if (cfg.llama_mtp > 0) cp.n_rs_seq = static_cast<uint32_t>(cfg.llama_mtp);
+        // --llama-mtp / --llama-dflash: per-token snapshots of the recurrent
+        // state, so a rejected draft rolls back on the device
+        // (llama_memory_seq_rm); a verify of N + 1 rows rolls back up to N
+        const int n_spec = cfg.llama_dflash_on() ? cfg.llama_dflash : std::max(cfg.llama_mtp, 0);
+        if (n_spec > 0) cp.n_rs_seq = static_cast<uint32_t>(n_spec);
         // logits rows: the last token a step, or a verify's 1 + drafts, per
         // lane (as llama.cpp's speculative loop sets them). Unbounded,
         // llama.cpp reserves them for a whole ubatch, vocabulary-wide: the
         // coder with its MTP layer then no longer fit the A770 (engine
         // resets, measured-here)
-        cp.n_outputs_max_per_seq = static_cast<uint32_t>(1 + std::max(cfg.llama_mtp, 0));
+        cp.n_outputs_max_per_seq = static_cast<uint32_t>(1 + n_spec);
         cp.n_outputs_max         = cp.n_outputs_max_per_seq * static_cast<uint32_t>(lanes_);
         ctx_               = llama_init_from_model(model_, cp);
         if (ctx_ == nullptr) throw std::runtime_error("llama.cpp could not create a context");
@@ -496,7 +498,31 @@ public:
                 log::warn("load", "named lanes: the MTP draft context takes no cell windows; its attention spans "
                                   "the pool's used cells");
         }
-        status_.mtp_enabled = n_draft_ > 0;
+        if (cfg.llama_dflash_on()) {
+            // --llama-dflash-gguf: the DFlash2 drafter as a second model,
+            // every tensor on the card (llama.cpp's draft model,
+            // common/speculative.cpp:2671-2689); the target's embeddings and
+            // LM head are shared through ctx_other, not loaded twice.
+            // config.cpp refuses it with --llama-mtp and under the layer split
+            llama_model_params dp = llama_model_default_params();
+            dp.n_gpu_layers       = 999;
+            dflash_model_         = llama_model_load_from_file(cfg.llama_dflash_gguf.c_str(), dp);
+            if (dflash_model_ == nullptr)
+                throw std::runtime_error(log::format("llama.cpp could not load %s", cfg.llama_dflash_gguf.c_str()));
+            std::string err;
+            int         n_dft = cfg.llama_dflash;   // the drafter's block may allow fewer
+            spec_ = make_llama_dflash(dflash_model_, ctx_, n_dft, lanes_, static_cast<int>(cp.n_ubatch), threads,
+                                      cfg.llama_dflash_min_p, cp.kv_unified, err);
+            if (!spec_)
+                throw std::runtime_error(log::format("--llama-dflash-gguf %s: %s", cfg.llama_dflash_gguf.c_str(), err.c_str()));
+            n_draft_ = n_dft;
+            dflash_  = true;
+            if (windows_ && !spec_->set_kv_windows(windows.data(), lanes_))
+                log::warn("load", "named lanes: the DFlash draft context takes no cell windows (a sliding-window "
+                                  "cache); its attention spans its own window");
+        }
+        status_.mtp_enabled    = n_draft_ > 0 && !dflash_;
+        status_.dflash_enabled = dflash_;
         slot_tokens_.resize(static_cast<size_t>(lanes_));
         comb_decoding_.assign(static_cast<size_t>(lanes_), false);
         comb_stalled_.assign(static_cast<size_t>(lanes_), false);
@@ -562,7 +588,7 @@ public:
                   desc, arch, static_cast<double>(llama_model_size(model_)) / (1u << 30), card_names.c_str(),
                   split ? "devices" : "platform", split ? cl_ids.c_str() : std::to_string(cards[0].platform).c_str(),
                   seconds_since(t_load), lane_desc.c_str(),
-                  n_draft_ > 0 ? log::format("; MTP drafts up to %d", n_draft_).c_str() : "");
+                  n_draft_ > 0 ? log::format("; %s drafts up to %d", dflash_ ? "DFlash2" : "MTP", n_draft_).c_str() : "");
         if (named_) {
             // one line per lane, and the pool they share
             for (int i = 0; i < lanes_; ++i)
@@ -572,7 +598,7 @@ public:
                       llama_n_ctx(ctx_), lanes_,
                       windows_ ? "a cell window per lane: a lane attends over its own cells"
                                : "a lane's attention runs over the pool's used cells, masked",
-                      spec_ ? "; the MTP draft context likewise" : "");
+                      spec_ ? "; the draft context likewise" : "");
         }
         if (split)
             log::info("load", "layer split: layers 0-%d on %s, %d-%d and the output on %s (tensor_split %.1f/%.1f)%s",
@@ -584,6 +610,7 @@ public:
     ~LlamaBackend() override {
         spec_.reset();   // its draft context reads the target's
         if (ctx_ != nullptr) llama_free(ctx_);
+        if (dflash_model_ != nullptr) llama_model_free(dflash_model_);
         if (mtp_model_ != nullptr) llama_model_free(mtp_model_);
         if (model_ != nullptr) llama_model_free(model_);
     }
@@ -927,6 +954,12 @@ private:
                 stats.draft_verify_seconds += req.t_verify;
             }
             stats.draft_proposed += static_cast<int>(draft.size());
+            ++stats.draft_steps;
+#if ARCINT_DFLASH_RED == 7
+            // red case (DFlash2's lossless check): every draft token accepted
+            // whatever the target's rows say -- the answers must suffer
+            for (size_t i = 0; i < draft.size(); ++i) rows[i * n_vocab_ + static_cast<size_t>(draft[i])] = 1e30f;
+#endif
             double     emit_s = 0.0;
             const auto t_walk = clock_type::now();
             const VerifyWalk w = walk_verify(
@@ -1293,6 +1326,8 @@ private:
     std::vector<llama_model_tensor_buft_override> buft_overrides_;
     llama_model*                          model_ = nullptr;
     llama_model*                          mtp_model_ = nullptr;   // --llama-mtp-gguf
+    llama_model*                          dflash_model_ = nullptr;   // --llama-dflash-gguf
+    bool                                  dflash_    = false;     // the drafter is DFlash2's
     llama_context*                        ctx_   = nullptr;
     const llama_vocab*                    vocab_ = nullptr;
     std::unique_ptr<LlamaTokenizer>       tokenizer_;
@@ -1319,7 +1354,7 @@ private:
     uint64_t                              n_uneven_      = 0;   // of them, verifies of different lengths
     std::chrono::microseconds             comb_wait_{ 20000 };
     std::vector<std::vector<int>>         slot_tokens_;
-    std::unique_ptr<LlamaSpec>            spec_;      // --llama-mtp
+    std::unique_ptr<LlamaSpec>            spec_;      // --llama-mtp, --llama-dflash-gguf
     int                                   n_draft_ = 0;
     // --llama-checkpoints: per lane, the recurrent state at token counts the
     // lane's tokens still match, oldest first

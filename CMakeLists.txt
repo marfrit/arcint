@@ -105,7 +105,15 @@ if(ARCINT_LLAMA)
   set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
   add_subdirectory("${ARCINT_LLAMA_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/llama.cpp" EXCLUDE_FROM_ALL)
   find_package(OpenCL REQUIRED)
-  target_sources(arcint_core PRIVATE src/exec/backend_llama.cpp src/exec/llama_spec.cpp)
+  target_sources(arcint_core PRIVATE src/exec/backend_llama.cpp src/exec/llama_spec.cpp src/exec/llama_dflash.cpp)
+  # The DFlash2 drafter's red cases (tests/dflash/legs.sh): a build with a
+  # mutant compiled in, which says so at load. 0 is the served build; the
+  # cases are listed in src/exec/llama_dflash.cpp and tests/dflash/legs.sh
+  set(ARCINT_DFLASH_RED "0" CACHE STRING "DFlash2 red-case mutant (0: none; a test build only)")
+  if(NOT ARCINT_DFLASH_RED STREQUAL "0")
+    message(WARNING "ARCINT_DFLASH_RED=${ARCINT_DFLASH_RED}: a DFlash2 red-case build, not for serving")
+  endif()
+  target_compile_definitions(arcint_core PRIVATE ARCINT_DFLASH_RED=${ARCINT_DFLASH_RED})
   # llama-ext.h: the pinned llama.cpp's staging API (nextn embeddings, MTP)
   target_include_directories(arcint_core PRIVATE "${ARCINT_LLAMA_DIR}/src")
   target_link_libraries(arcint_core PUBLIC llama OpenCL::OpenCL)

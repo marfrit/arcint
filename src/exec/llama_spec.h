@@ -1,6 +1,7 @@
-// The libllama engine's speculative decoding: the GGUF's MTP head drafting
-// (llama.cpp's draft-mtp, rebuilt on libllama in llama_spec.cpp), the target
-// verifying, behind a narrow interface.
+// The libllama engine's speculative decoding behind a narrow interface: the
+// GGUF's MTP head drafting (llama.cpp's draft-mtp, rebuilt on libllama in
+// llama_spec.cpp) or a DFlash2 drafter (llama.cpp's draft-dflash, rebuilt in
+// llama_dflash.cpp), the target verifying.
 #pragma once
 
 #ifdef ARCINT_LLAMA
@@ -95,6 +96,20 @@ std::unique_ptr<LlamaSpec> make_llama_mtp(llama_model* model, llama_context* ctx
                                           int n_batch, int n_ubatch, int threads, const std::string& gguf,
                                           const std::string& vocab, double min_p, ggml_type type_k, ggml_type type_v,
                                           bool kv_unified, uint32_t n_kv_reserve, std::string& err);
+
+// model_dft: a DFlash2 drafter (general.architecture "dflash" with a
+// selector), loaded on the target's card; ctx_tgt: n_rs_seq >= n_draft,
+// n_outputs_max_per_seq >= 1 + n_draft. The draft context is llama.cpp's
+// (common/speculative.cpp:2572-2700): the target's n_ctx and kv_unified,
+// ctx_other = ctx_tgt (the target's embeddings and LM head), f16 K/V, a
+// sliding-window cache. min_p: the selector's stop (0: n_draft always).
+// n_ubatch: the target's; the draft context takes min(n_ubatch, 512), at
+// least a block a lane. n_draft: requested, and set to what the drafter's
+// trained block allows (block_size - 1). Null with `err` set when the GGUF
+// is not a DFlash2 drafter for this target or the context cannot be made.
+std::unique_ptr<LlamaSpec> make_llama_dflash(llama_model* model_dft, llama_context* ctx_tgt, int& n_draft, int n_seq,
+                                             int n_ubatch, int threads, double min_p, bool kv_unified,
+                                             std::string& err);
 
 }  // namespace lgc
 
