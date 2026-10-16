@@ -143,6 +143,9 @@ def validate_cells(cells):
             if ref["gate_at"] is not None and not _is_number(ref["gate_at"]):
                 errors.append(f"{name}/{metric}: gate_at must be a number or null "
                               f"(report-only), got {ref['gate_at']!r}")
+            if ref.get("gate", "gated") not in ("gated", "report"):
+                errors.append(f"{name}/{metric}: gate must be absent, \"gated\" or "
+                              f"\"report\", got {ref['gate']!r}")
             if metric in seen_metrics:
                 errors.append(f"{name}/{metric}: duplicate reference for this metric")
             seen_metrics.add(metric)
@@ -176,6 +179,9 @@ def gate_phrase(ref):
     span and the checklist cannot disagree about which a reference is."""
     if ref["gate_at"] is None:
         return "report only, not gated"
+    if ref.get("gate") == "report":
+        return (f"report, not a veto: {ref['direction']} than {ref['gate_at']} "
+                f"{ref['unit']} is printed REGRESSED, the gate is the A/B")
     return f"gate {ref['direction']} at {ref['gate_at']} {ref['unit']}"
 
 
@@ -221,6 +227,18 @@ def render_checklist(cells):
     lines.append("")
     lines.append("Every 77 (skip) must be named on that command line, or the "
                  "run does not count as a release gate (docs/design-0.3.1-test-ladder.md §2).")
+    lines.append("")
+    lines.append("## Speed against the last release")
+    lines.append("")
+    lines.append("The served cells' floors are a report; the speed gate is a same-window "
+                 "A/B (DESIGN.md §5). For each service on its card, with the units' flags:")
+    lines.append("")
+    lines.append("    tests/acceptance/ab.py <agent|coder|flashnext> --old <last release's arcint> "
+                 "--new <candidate's arcint> --gguf <model> --device GPU.N --assets <dir> [--rounds 2] [--out DIR]")
+    lines.append("")
+    lines.append("- [ ] agent: exit 0 (candidate not slower than the last release beyond the window's spread; answers right)")
+    lines.append("- [ ] coder: exit 0")
+    lines.append("- [ ] flashnext: exit 0")
     lines.append("")
     lines.append("## Cells")
     lines.append("")

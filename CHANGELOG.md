@@ -18,6 +18,15 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## Unreleased
+
+**Release speed gate:** `tests/acceptance/ab.py` serves the last release's
+binary and the candidate alternately in one window (old, new, old, new) and
+fails the candidate only if it is slower beyond that window's run-to-run
+spread, or an answer is wrong (operator, 2026-10-16; DESIGN §5). The
+`*-served` cells' references carry `"gate": "report"`: run.py still prints
+REGRESSED against the recorded floors but they no longer fail the run.
+
 ## 0.8.1 — 2026-10-16
 
 **Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (54

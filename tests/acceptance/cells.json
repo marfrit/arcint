@@ -140,7 +140,8 @@
         "prompt_tokens": 54895,
         "design": "§5",
         "measured": "2026-10-16",
-        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
+        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)",
+        "gate": "report"
       },
       {
         "metric": "prefill-138k",
@@ -154,7 +155,8 @@
         "prompt_tokens": 138028,
         "design": "§5",
         "measured": "2026-10-16",
-        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
+        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)",
+        "gate": "report"
       }
     ]
   },
@@ -195,7 +197,8 @@
         "prompt_tokens": null,
         "design": "§5",
         "measured": "2026-10-16",
-        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
+        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)",
+        "gate": "report"
       },
       {
         "metric": "decode-b",
@@ -209,7 +212,8 @@
         "prompt_tokens": null,
         "design": "§5",
         "measured": "2026-10-16",
-        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
+        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)",
+        "gate": "report"
       },
       {
         "metric": "decode-c",
@@ -223,7 +227,8 @@
         "prompt_tokens": null,
         "design": "§5",
         "measured": "2026-10-16",
-        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
+        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)",
+        "gate": "report"
       },
       {
         "metric": "prefill-41k",
@@ -237,7 +242,8 @@
         "prompt_tokens": 40841,
         "design": "§5",
         "measured": "2026-10-16",
-        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
+        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)",
+        "gate": "report"
       }
     ]
   },
@@ -278,7 +284,8 @@
         "prompt_tokens": 20045,
         "design": "§5",
         "measured": "2026-10-16",
-        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
+        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)",
+        "gate": "report"
       },
       {
         "metric": "decode",
@@ -292,7 +299,8 @@
         "prompt_tokens": null,
         "design": "§5",
         "measured": "2026-10-16",
-        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
+        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)",
+        "gate": "report"
       }
     ]
   },

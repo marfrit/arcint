@@ -229,6 +229,11 @@ if(ARCINT_TESTS)
   add_test(NAME acceptance-runner
            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/acceptance/selftest.py")
   set_tests_properties(acceptance-runner PROPERTIES LABELS unit)
+
+  # The release speed gate's decision function and parser (tests/acceptance/ab.py).
+  add_test(NAME acceptance-ab
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/acceptance/ab_selftest.py")
+  set_tests_properties(acceptance-ab PROPERTIES LABELS unit)
 endif()
 
 if(ARCINT_ACCEPTANCE)

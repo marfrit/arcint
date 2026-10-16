@@ -51,7 +51,9 @@ cells.json: worse than a reference's `gate_at` is a FAIL unless named
 regression there is exit 1 unconditionally); a metric with no reference, or
 a reference nothing printed, is a FAIL regardless of mode -- a gate that can
 go silently uncompared measures nothing, which is this mechanism's entire
-premise. A cell whose `references` is JSON `null` (not `[]`) opts out
+premise. A reference carrying `"gate": "report"` still prints REGRESSED but
+is not a failure (the served cells' floors; the speed gate is ab.py, DESIGN
+§5). A cell whose `references` is JSON `null` (not `[]`) opts out
 entirely: its metrics are reports, not gates, until the fill window writes
 real numbers in (§8's amendment).
 
@@ -276,6 +278,11 @@ def _reference_shape_error(cell_name, ref):
     # a comparison can use -- a "14.8" string would compare as text or crash.
     if ref["gate_at"] is not None and not _is_number(ref["gate_at"]):
         return f"reference {ref['metric']!r} has a non-numeric gate_at {ref['gate_at']!r} (null or a number)"
+    # "gate": "report" (operator, 2026-10-16) keeps the comparison and prints
+    # REGRESSED, but the run does not fail on it: the served cells' floors
+    # are a report, the speed gate is tests/acceptance/ab.py. Absent = gated.
+    if ref.get("gate", "gated") not in ("gated", "report"):
+        return f"reference {ref['metric']!r} has unknown gate {ref['gate']!r} (absent, \"gated\" or \"report\")"
     return None
 
 
@@ -388,7 +395,12 @@ def compare_metrics(cell_name, cell, metrics):
             is_regression = value > gate_at
             is_improvement = value < target
 
-        if is_regression:
+        if is_regression and ref.get("gate") == "report":
+            # reported as before, never a failure; not in `regressed`, so
+            # neither the exit status nor --allow-regress is involved
+            messages.append(f"REGRESSED {qualified}: {value_str} {unit} against gate {gate_at} {unit} "
+                            "(report only, not a failure)")
+        elif is_regression:
             regressed.append(qualified)
             messages.append(f"REGRESSED {qualified}: {value_str} {unit} against gate {gate_at} {unit}")
         elif is_improvement:

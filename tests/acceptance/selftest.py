@@ -190,6 +190,8 @@ def main():
     at_gate = subset(["metric-at-gate"])
     below_band = subset(["metric-below-band"])
     above_band = subset(["metric-above-band"])
+    below_report = subset(["metric-below-band-report"])
+    bad_gate = subset(["metric-below-band-badgate"])
     far_better = subset(["metric-far-better"])
     unknown_name = subset(["metric-unknown-name"])
     missing = subset(["metric-missing"])
@@ -234,6 +236,14 @@ def main():
               run(below_band) == 0, False)
         check("the same, named via --allow-regress -> exit 0",
               run(below_band, allow_regress=["metric-below-band/fake-decode"]) == 0, True)
+        # "gate": "report" (operator, 2026-10-16): the same 15.0 against 18.0
+        # that fails above is printed REGRESSED and does not fail the run.
+        rc, stderr = run_capture(below_report)
+        check("report-only gate, metric below band -> exit 0", rc == 0, True)
+        check("... REGRESSED is still printed, marked report only, and none counted as regressed",
+              "REGRESSED metric-below-band-report/fake-decode" in stderr and "report only" in stderr
+              and " 0 regressed" in stderr, True)
+        check("an unknown gate value -> exit != 0", run(bad_gate) == 0, False)
         check("metric above band (higher-is-worse; proves direction honoured) -> exit != 0",
               run(above_band) == 0, False)
         rc, stderr = run_capture(far_better)
