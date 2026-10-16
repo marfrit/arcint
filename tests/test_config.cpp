@@ -440,8 +440,19 @@ TEST(config_llama_dflash) {
         CHECK_EQ(cfg.llama_dflash_gguf, std::string("/m/d.gguf"));
         CHECK_EQ(cfg.llama_dflash, 7);
         CHECK(cfg.llama_dflash_min_p == 0.0);
+        CHECK_EQ(cfg.llama_dflash_ubatch, 64);
         CHECK_EQ(cfg.llama_mtp, 0);
     }
+    {
+        // the draft context's ubatch: 8 to 512, the drafter's only
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash-ubatch", "512"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dflash_ubatch, 512);
+    }
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash-ubatch", "4"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash-ubatch", "1024"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash-ubatch", "64"}));
+    CHECK(rejected({"--stub", "--llama-dflash-ubatch", "64"}));
     {
         Config cfg;
         CHECK(run({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash", "5",
@@ -455,6 +466,7 @@ TEST(config_llama_dflash) {
         CHECK(run({"--gguf", "/m/q.gguf"}, cfg).ok);
         CHECK(!cfg.llama_dflash_on());
         CHECK_EQ(cfg.llama_dflash, 0);
+        CHECK_EQ(cfg.llama_dflash_ubatch, 0);
     }
     // the range: 1 to 7 (a block of up to 8 positions, the drafter's trained size)
     CHECK(!rejected({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash", "1"}));
@@ -507,6 +519,7 @@ TEST(config_llama_dflash) {
     CHECK(help.find("--llama-dflash-gguf FILE") != std::string::npos);
     CHECK(help.find("--llama-dflash N") != std::string::npos);
     CHECK(help.find("--llama-dflash-min-p P") != std::string::npos);
+    CHECK(help.find("--llama-dflash-ubatch N") != std::string::npos);
 }
 
 TEST(config_llama_checkpoints) {

@@ -112,8 +112,8 @@ std::unique_ptr<LlamaSpec> make_llama_mtp(llama_model* model, llama_context* ctx
 // (common/speculative.cpp:2572-2700): the target's n_ctx and kv_unified,
 // ctx_other = ctx_tgt (the target's embeddings and LM head), f16 K/V, a
 // sliding-window cache. min_p: the selector's stop (0: n_draft always).
-// n_ubatch: the target's; the draft context takes min(n_ubatch, 512), at
-// least a block a lane. n_draft: requested, and set to what the drafter's
+// n_ubatch: the draft context's (--llama-dflash-ubatch), raised to a block a
+// lane. n_draft: requested, and set to what the drafter's
 // trained block allows (block_size - 1). Null with `err` set when the GGUF
 // is not a DFlash2 drafter for this target or the context cannot be made.
 std::unique_ptr<LlamaSpec> make_llama_dflash(llama_model* model_dft, llama_context* ctx_tgt, int& n_draft, int n_seq,

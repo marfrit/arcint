@@ -48,9 +48,16 @@ struct Config {
     // (llama.cpp's p_min on the softmax over a position's candidate scores);
     // 0 drafts N always. One drafter a context: refused with --llama-mtp and
     // under --llama-layer-split.
+    // --llama-dflash-ubatch N: the draft context's ubatch (llama.cpp's
+    // --spec-draft-n-ubatch, "use a smaller value to spare VRAM"). llama.cpp
+    // reserves the drafter's compute buffer for a token ubatch of this size,
+    // its logits n x the vocabulary in f32 (512: 485 MiB at 248,320 tokens);
+    // drafts are a block a lane and injections are cut into chunks of it.
+    // At least a block a lane (the drafter raises it). 0: unset, 64.
     std::string llama_dflash_gguf;
-    int         llama_dflash       = 0;
-    double      llama_dflash_min_p = 0.0;
+    int         llama_dflash        = 0;
+    double      llama_dflash_min_p  = 0.0;
+    int         llama_dflash_ubatch = 0;
     bool        llama_dflash_on() const { return !llama_dflash_gguf.empty(); }
     // --llama-reserve-cells N: the compute buffers are reserved for a prompt
     // ubatch at N cache cells instead of the whole context, and a prompt chunk

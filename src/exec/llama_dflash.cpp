@@ -156,11 +156,16 @@ public:
         cp.n_ctx           = llama_n_ctx(ctx_tgt);
         cp.kv_unified      = kv_unified;
         cp.swa_full        = false;
-        // an injection chunk and every lane's block fit one ubatch (the
-        // selector reads whole blocks of one ubatch, dflash.cpp:560-567);
-        // the batch is the ubatch: chunks are cut to it anyway
+        // every lane's block fits one ubatch (the selector reads whole
+        // blocks of one ubatch, dflash.cpp:560-567); injections are cut into
+        // chunks of it; the batch is the ubatch. llama.cpp reserves the
+        // compute buffer for a token ubatch of this size, and the dflash
+        // graph computes the LM head for every row: n_ubatch x the
+        // vocabulary in f32 (the target's 512: 485 MiB at 248,320 tokens).
+        // llama.cpp's draft context takes --spec-draft-n-ubatch for it
+        // (common/arg.cpp:4178, speculative.cpp:2609-2611)
         const int block_rows = n_seq * (n_draft_ + 1);
-        cp.n_ubatch        = static_cast<uint32_t>(std::max(std::min(n_ubatch, 512), block_rows));
+        cp.n_ubatch        = static_cast<uint32_t>(std::max(n_ubatch, block_rows));
         cp.n_batch         = cp.n_ubatch;
         cp.n_seq_max       = static_cast<uint32_t>(n_seq);
         cp.n_rs_seq        = 0;

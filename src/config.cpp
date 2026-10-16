@@ -217,6 +217,8 @@ std::string usage_text() {
         "  --llama-dflash-min-p P    stop the DFlash2 block at a position whose pick\n"
         "                            has less than P of its candidates' softmax (0-1;\n"
         "                            0 off: always --llama-dflash drafts)\n"
+        "  --llama-dflash-ubatch N   the DFlash2 drafter's ubatch, 8-512 (default 64):\n"
+        "                            its compute buffer holds N rows of logits\n"
         "  --llama-reserve-cells N   reserve the compute buffers for a prompt ubatch at N\n"
         "                            cache cells, not the whole context; deeper prompt\n"
         "                            chunks take smaller ubatches (0: the whole context)\n"
@@ -335,6 +337,10 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_double(v, cfg.llama_dflash_min_p) || cfg.llama_dflash_min_p < 0.0 ||
                 cfg.llama_dflash_min_p > 1.0)
                 return fail("--llama-dflash-min-p needs a probability from 0 to 1");
+        } else if (arg == "--llama-dflash-ubatch") {
+            if (!value(v) || !parse_int(v, cfg.llama_dflash_ubatch) || cfg.llama_dflash_ubatch < 8 ||
+                cfg.llama_dflash_ubatch > 512)
+                return fail("--llama-dflash-ubatch needs a ubatch from 8 to 512");
         } else if (arg == "--llama-reserve-cells") {
             int n = 0;
             if (!value(v) || !parse_int(v, n) || n < 0)
@@ -544,7 +550,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.stub) {
         if (cfg.llama_cpu_moe > 0 || cfg.llama_threads > 0 || cfg.llama_mtp > 0 || !cfg.llama_mtp_vocab.empty() ||
             !cfg.llama_mtp_gguf.empty() || cfg.llama_mtp_min_p > 0.0 || cfg.llama_dflash_on() || cfg.llama_dflash > 0 ||
-            cfg.llama_dflash_min_p > 0.0 ||
+            cfg.llama_dflash_min_p > 0.0 || cfg.llama_dflash_ubatch > 0 ||
             cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192 ||
             cfg.llama_expert_cache_on() || !cfg.llama_expert_profile.empty() || cfg.llama_layer_split > 0 || cfg.llama_mtp_card >= 0 ||
             cfg.llama_reserve_cells > 0)
@@ -558,11 +564,14 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.llama_dflash > 0 && !cfg.llama_dflash_on()) return fail("--llama-dflash needs --llama-dflash-gguf (the drafter)");
     if (cfg.llama_dflash_min_p > 0.0 && !cfg.llama_dflash_on())
         return fail("--llama-dflash-min-p needs --llama-dflash-gguf (the drafter)");
+    if (cfg.llama_dflash_ubatch > 0 && !cfg.llama_dflash_on())
+        return fail("--llama-dflash-ubatch needs --llama-dflash-gguf (the drafter)");
     if (cfg.llama_dflash_on() && (cfg.llama_mtp > 0 || !cfg.llama_mtp_vocab.empty() || !cfg.llama_mtp_gguf.empty() ||
                                   cfg.llama_mtp_min_p > 0.0))
         return fail("--llama-dflash-gguf and --llama-mtp (-vocab, -gguf, -min-p) are exclusive: one drafter a context, "
                     "the DFlash2 drafter or the MTP head");
     if (cfg.llama_dflash_on() && cfg.llama_dflash == 0) cfg.llama_dflash = 7;   // the drafter's block of 8
+    if (cfg.llama_dflash_on() && cfg.llama_dflash_ubatch == 0) cfg.llama_dflash_ubatch = 64;
     if (!cfg.llama_mtp_vocab.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-vocab needs --llama-mtp");
     if (!cfg.llama_mtp_gguf.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-gguf needs --llama-mtp");
     if (cfg.llama_mtp_min_p > 0.0 && cfg.llama_mtp <= 0) return fail("--llama-mtp-min-p needs --llama-mtp");

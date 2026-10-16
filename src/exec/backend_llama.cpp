@@ -511,7 +511,7 @@ public:
                 throw std::runtime_error(log::format("llama.cpp could not load %s", cfg.llama_dflash_gguf.c_str()));
             std::string err;
             int         n_dft = cfg.llama_dflash;   // the drafter's block may allow fewer
-            spec_ = make_llama_dflash(dflash_model_, ctx_, n_dft, lanes_, static_cast<int>(cp.n_ubatch), threads,
+            spec_ = make_llama_dflash(dflash_model_, ctx_, n_dft, lanes_, cfg.llama_dflash_ubatch, threads,
                                       cfg.llama_dflash_min_p, cp.kv_unified, err);
             if (!spec_)
                 throw std::runtime_error(log::format("--llama-dflash-gguf %s: %s", cfg.llama_dflash_gguf.c_str(), err.c_str()));
