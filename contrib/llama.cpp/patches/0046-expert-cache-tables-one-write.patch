@@ -1,5 +1,5 @@
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
-index 896c55b14..fc79055fa 100644
+index 891a99df9..7fee63712 100644
 --- a/src/llama-expert-cache.cpp
 +++ b/src/llama-expert-cache.cpp
 @@ -137,35 +137,65 @@ bool llama_expert_cache::verify(const llama_expert_cache_layer & L, ggml_tensor
@@ -84,7 +84,7 @@ index 896c55b14..fc79055fa 100644
  // Layer il as init() caches it on `dev`: its experts in host buffers, the
  // layer itself on `dev` (a GPU), types whose kernels take the cache, its
  // tensors' bytes in a GGUF file. `out` (when not null) gets the layer.
-@@ -390,9 +420,29 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+@@ -388,9 +418,29 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
      }
  
      // tensors: slots and tables on the card, the banks in host memory
@@ -115,7 +115,7 @@ index 896c55b14..fc79055fa 100644
      for (auto & L : layers) {
          for (int k = 0; k < 3; ++k) {
              L.slot[k] = ggml_new_tensor_3d(ctx, L.src[k]->type, L.src[k]->ne[0], L.src[k]->ne[1], L.n_slots + 1);
-@@ -403,13 +453,13 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+@@ -401,13 +451,13 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
              L.bank[k] = ggml_new_tensor_3d(bctx, L.src[k]->type, L.src[k]->ne[0], L.src[k]->ne[1], L.n_bank + 1 + L.n_spare);
              ggml_format_name(L.bank[k], "%s.bank", ggml_get_name(L.src[k]));
          }
@@ -135,7 +135,7 @@ index 896c55b14..fc79055fa 100644
              ggml_format_name(L.tab_slot_dn, "blk.%d.expert_slot_of_down", L.il);
              ggml_format_name(L.tab_bank_dn, "blk.%d.expert_bank_of_down", L.il);
          }
-@@ -495,6 +545,9 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+@@ -485,6 +535,9 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
          lo = std::min<int64_t>(lo, L.n_slots);
          hi = std::max<int64_t>(hi, L.n_slots);
      }
@@ -145,7 +145,7 @@ index 896c55b14..fc79055fa 100644
      {
          std::vector<int32_t> id(n_expert);
          for (int e = 0; e < n_expert; ++e) {
-@@ -701,7 +754,7 @@ void llama_expert_cache::adapt(const std::vector<llama_expert_cache_swap> & all_
+@@ -691,7 +744,7 @@ void llama_expert_cache::adapt(const std::vector<llama_expert_cache_swap> & all_
          touched[c.layer] = 1;
          n_swaps++;
      }
@@ -154,7 +154,7 @@ index 896c55b14..fc79055fa 100644
          auto & c = all.front();
          auto & L = layers[c.layer];
          std::vector<uint8_t> bad(L.nb2[0]);
-@@ -717,6 +770,11 @@ void llama_expert_cache::adapt(const std::vector<llama_expert_cache_swap> & all_
+@@ -707,6 +760,11 @@ void llama_expert_cache::adapt(const std::vector<llama_expert_cache_swap> & all_
              upload_tables(layers[i]);
          }
      }
@@ -166,7 +166,7 @@ index 896c55b14..fc79055fa 100644
      if (check) {
          const auto & c   = all.front();
          const auto & L   = layers[c.layer];
-@@ -725,6 +783,8 @@ void llama_expert_cache::adapt(const std::vector<llama_expert_cache_swap> & all_
+@@ -715,6 +773,8 @@ void llama_expert_cache::adapt(const std::vector<llama_expert_cache_swap> & all_
              bad += verify(L, L.slot[k], k, c.slot, c.expert) ? 0 : 1;
              bad += verify(L, L.bank[k], k, first_entry, first_victim) ? 0 : 1;
          }
@@ -175,7 +175,7 @@ index 896c55b14..fc79055fa 100644
          LLAMA_LOG_WARN("%s: swap check, %s, layer %d slot %d <- expert %d, bank %d <- expert %d: %d of 6 copies differ from the file\n",
                         __func__, ggml_backend_dev_name(dev_), L.il, c.slot, c.expert, first_entry, first_victim, bad);
      }
-@@ -758,6 +818,7 @@ void llama_expert_cache::progress() {
+@@ -748,6 +808,7 @@ void llama_expert_cache::progress() {
                  upload_tables(layers[i]);
              }
          }
@@ -183,7 +183,7 @@ index 896c55b14..fc79055fa 100644
          // the refills wait for the graphs that still read the victims there
          // (the fence is placed now, before the next graph; the copies after it)
          adapt_fence(any);
-@@ -776,7 +837,7 @@ void llama_expert_cache::progress() {
+@@ -766,7 +827,7 @@ void llama_expert_cache::progress() {
          L.spare.push_back(p.b_in);
          touched[p.layer] = 1;
      }
@@ -192,7 +192,7 @@ index 896c55b14..fc79055fa 100644
          const auto & p = pend.front();
          auto & L = layers[p.layer];
          std::vector<uint8_t> bad(L.nb2[0]);
-@@ -792,6 +853,11 @@ void llama_expert_cache::progress() {
+@@ -782,6 +843,11 @@ void llama_expert_cache::progress() {
              upload_tables(layers[i]);
          }
      }
@@ -204,7 +204,7 @@ index 896c55b14..fc79055fa 100644
      if (pend_check) {
          const auto & p = pend.front();
          const auto & L = layers[p.layer];
-@@ -800,6 +866,8 @@ void llama_expert_cache::progress() {
+@@ -790,6 +856,8 @@ void llama_expert_cache::progress() {
              bad += verify(L, L.slot[k], k, p.slot, p.e_in) ? 0 : 1;
              bad += verify(L, L.bank[k], k, p.x, p.e_out) ? 0 : 1;
          }

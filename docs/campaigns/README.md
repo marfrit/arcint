@@ -59,7 +59,7 @@ the retired OpenVINO engine are at the tag `openvino-history`
 
 The build order of 2026-10-01 (the adaptive expert cache with its miss
 split and a pinned bank, the doorbell, multi-draft MTP, prefill on the GPU)
-is built on the libllama engine: 0021/0042/0055, 0056, `--llama-mtp`,
+is built on the libllama engine: 0021/0042 (0055's LFRU measured and dropped), 0056, `--llama-mtp`,
 0032/0044. What is open follows the charter (`docs/milestone-1.0.0.md`) and
 the audit's ranking (`research-reference-audit.md` §4).
 

@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index bf58c7d0f..2cb917681 100644
+index 026442212..0d766d2e4 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -2613,7 +2613,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2577,7 +2577,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
              // the GEMM: fp16 DPAS at the device's DPAS sub-group size. Tiles
              // (measured-here: an A770 at 2000 MHz, a B60), as RG,TG,NSGM,NSGN:
              // plain 4,4,2,8 on both; MUL_MAT_ID (tiles of one expert's pairs)
@@ -11,7 +11,7 @@ index bf58c7d0f..2cb917681 100644
              // GGML_OPENCL_KQ_MM=0 keeps ggml's GEMM; GGML_OPENCL_KQ_MM_TILE /
              // GGML_OPENCL_KQ_MM_ID_TILE = "RG,TG,NSGM,NSGN" override.
              static const char * mm_env = getenv("GGML_OPENCL_KQ_MM");
-@@ -2634,7 +2634,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2598,7 +2598,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                  // prefill (measured-here: 1,613 -> 1,740 t/s at 512 tokens,
                  // 1,345 -> 1,431 at 4,096; KL unchanged)
                  backend_ctx->kq_mm_plain = ggml_cl_kq_tile{ 4, 4, 2, 8 };

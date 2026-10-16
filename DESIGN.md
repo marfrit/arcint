@@ -1,7 +1,7 @@
 # arcint — Design
 
 State as of 2026-10-15: arcint **0.8.0** on llama.cpp **`3e4dfa8`** with the
-patch series `contrib/llama.cpp/patches` 0001-0056. One engine: libllama with
+patch series `contrib/llama.cpp/patches` 0001-0056 (54 patches). One engine: libllama with
 ggml's OpenCL backend and arcint's Intel kernels. Three services run in
 production on two Intel Arc cards: the dense Qwen3.8-27B agent and
 Qwen3.8-Flash-Next (125B-A6B, on demand) on the 24 GB Arc Pro B60, the MoE
@@ -197,9 +197,9 @@ measurement, KL, red case and review in `contrib/llama.cpp/README.md`
 | gated delta-net | 0003, 0050, 0051 | the GDN kernel, rollback snapshots written into the recurrent cache, gating in the kernel |
 | attention | 0007, 0008, 0015-0020, 0028, 0037-0041, 0045, 0048 | split decode attention, XMX prompt attention, quantized KV (q8_0, q8_0:q4_0), GQA verify attention, head size 128, the key split by wave |
 | MoE | 0006, 0033, 0043 | tokens as the DPAS A operand, the B60 tile, the cache's GEMM threshold |
-| expert cache | 0021, 0024, 0042, 0046, 0055, 0056 | VRAM slots and a USM bank, per device, non-blocking admission on its own queue, Infernix's LFRU (opt-in), the misses on the CPU |
+| expert cache | 0021, 0024, 0042, 0046, 0056 | VRAM slots and a USM bank, per device, non-blocking admission on its own queue, the misses on the CPU |
 | prefill bank stream | 0032, 0044 | each bank tensor copied whole into a VRAM ring ahead of its GEMM, from 256 tokens |
-| decode launches and inputs | 0004, 0005, 0027, 0031, 0047, 0049 | small ops, few-row F32, fewer launches, inputs staged in a USM ring with one wait a split |
+| decode launches and inputs | 0004, 0005, 0027, 0047, 0049 | small ops, few-row F32, fewer launches, inputs staged in a USM ring with one wait a split |
 | lanes and devices | 0023, 0025, 0026, 0029 | one OpenCL context per platform, a KV cell window per lane, per-sequence attention windows |
 | graph and buffers | 0010, 0036, 0052 | MTP masked rows, Q8_0 GET_ROWS, compute buffers reserved for N cells |
 
@@ -351,7 +351,7 @@ host memory and the **expert cache** (0021, after Strata) serves them:
 | slots | the hot experts in VRAM, sized in bytes (`--llama-expert-cache MIB`), filled in the profile's rank order | 0021, 0024 (one cache per card) | `measured-here` |
 | bank | every other expert in USM host memory the card reads by pointer: a decode miss is read over the link in place, as Strata's kernels read its pinned mirror | 0021 | `measured-here` |
 | adapt | swaps from decayed usage counts on Strata's constants (`LLAMA_EXPERT_CACHE_{ADAPT_EVERY,MAX_SWAPS,MIN_GAIN,MIN_USAGE,DECAY}`), on their own queue right behind a graph, the victim to a spare bank entry (non-blocking admission) | 0042, 0046 | `measured-here` (verify input copies 2.6-6.0 -> 0.94 ms) |
-| policy | Strata's rule by default; Infernix's LFRU opt-in (`LLAMA_EXPERT_CACHE_POLICY=lfru`): +1.6 % on the gate set, -2.1 % on six other prompts, not a general gain | 0055 | `measured-here` |
+| policy | Strata's rule. Infernix's LFRU was built as 0055 and measured +1.6 % on the gate set, -2.1 % on six other prompts, not a general gain; dropped in 0.8.1 (operator, 2026-10-16) | — | `measured-here` |
 | CPU misses | up to 16 missed (token, expert) pairs of a decode layer computed on the CPU from the bank with Strata's multi-token AVX2 rows while the card computes the hits and reads the other misses (`LLAMA_EXPERT_CACHE_CPU_MISSES=1`, 8 threads) | 0056 | `measured-here` (decode +15.2 % on six answers, KL +0.0028) |
 | prefill | the bank stream: from 256 tokens a ubatch each bank tensor is copied whole on a copy queue into a VRAM ring ahead of its GEMM (`GGML_OPENCL_BANK_STREAM=1`); below, a GEMM gathers its routed bank experts; below 64 tokens the cache's matvec path | 0032, 0043, 0044 | `measured-here` (the 20k needle 408 -> 645 t/s in 0.7.3; 690 in 0.7.12) |
 | n-gram table | the 27 GiB embedding table read lazily (`MADV_RANDOM`, a graph's rows prefetched together) | arcint, 0.7.5 | `measured-here` (2.0-7.7 -> 0.3-0.6 ms a verify) |
@@ -649,6 +649,13 @@ Several days of the three services under real use on both cards, logged:
 no wedge, no eviction, no restart. The record has the B60's wedge after a
 long idle, xe eviction at thin VRAM margins and copy-engine resets, each
 recovered, none soaked.
+
+The operator's reason: a week of the dev host for a test of rare events.
+What a soak would find comes from time and request count, not chance, and
+can be checked in hours (optional, not a gate): a few thousand requests in
+a loop with the process's RSS, VRAM and GTT sampled for drift; a long idle
+followed by a request (the B60's wedge); the same on Flash-Next after a
+unit switch.
 
 ### 8.2 Owed from the pin move to `3e4dfa8`
 

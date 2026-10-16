@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index c989ffb69..645f65c00 100644
+index dfced04cb..80b5e17ee 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -1203,6 +1203,10 @@ struct ggml_backend_opencl_context {
+@@ -1186,6 +1186,10 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_fa_dpas2_dk[2] = {}, kernel_fa_dpas2_carry_dk[2] = {}, kernel_fa_q_to_f16_dk[2] = {};
      cl_kernel kernel_fa_mask_cls = nullptr;       // the mask by 8 x 32 blocks (flash_attn_dpas2.cl)
      int       fa_dpas2_bq = 0, fa_dpas2_nthr = 0;
@@ -13,7 +13,7 @@ index c989ffb69..645f65c00 100644
      // Intel Xe2, decode / verify rows on the XMX units, a KV head's query
      // heads and rows in one pass (flash_attn_gqa_dpas.cl): f16, q8q8, q8q4, q4q4
      cl_kernel kernel_fa_gqa_dk[2][4] = {};        // [0] head size 256, [1] 128
-@@ -4588,6 +4592,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -4552,6 +4556,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                                  ok = false;
                              } else {
                                  (carry ? backend_ctx->kernel_fa_dpas2_carry_dk : backend_ctx->kernel_fa_dpas2_dk)[di] = k2;
@@ -24,7 +24,7 @@ index c989ffb69..645f65c00 100644
                                  if (!carry) {
                                      backend_ctx->kernel_fa_q_to_f16_dk[di] = clCreateKernel(p2, "flash_attn_q_to_f16", &err);
                                      if (err != CL_SUCCESS) { backend_ctx->kernel_fa_q_to_f16_dk[di] = nullptr; ok = false; }
-@@ -4605,10 +4613,21 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -4569,10 +4577,21 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                      if (ok) {
                          backend_ctx->fa_dpas2_bq = nsg2 * 8;
                          backend_ctx->fa_dpas2_nthr = nthr2;
@@ -47,7 +47,7 @@ index c989ffb69..645f65c00 100644
                              if (*kk) { CL_CHECK(clReleaseKernel(*kk)); *kk = nullptr; }
                          }
                      }
-@@ -20798,7 +20817,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -20575,7 +20594,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          // one call of a prompt kernel (v1 or v2, plain or carry) over keys kv0 .. kv0 + nkv
          auto run_fa = [&](cl_kernel kd, bool v2, cl_mem kbuf, cl_ulong koff, cl_ulong knb1, cl_ulong knb2, cl_ulong knb3,
                            cl_mem vbuf, cl_ulong voff, cl_ulong vnb1, cl_ulong vnb2, cl_ulong vnb3, int nkv,
@@ -57,7 +57,7 @@ index c989ffb69..645f65c00 100644
              int a = 0;
              CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   v2 ? &q16 : &extra_q->data_device));
              CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), v2 ? &zero_ul : &offset_q));
-@@ -20837,19 +20857,92 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -20614,19 +20634,92 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                  CL_CHECK(clSetKernelArg(kd, a++, sizeof(int),    &kv0));
                  CL_CHECK(clSetKernelArg(kd, a++, sizeof(int),    &carry_in));
                  CL_CHECK(clSetKernelArg(kd, a++, sizeof(int),    &carry_out));
@@ -151,7 +151,7 @@ index c989ffb69..645f65c00 100644
              run_fa(k2, true, k_data_device, offset_k, k_nb1, k_nb2, k_nb3, v_data_device, offset_v, v_nb1, v_nb2, v_nb3, n_kv,
                     false, nullptr, 0, 0, 0);
              return;
-@@ -20913,6 +21006,16 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -20690,6 +20783,16 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                  dequant(v, v_data_device, offset_v, v_nb1, v_nb2, v_nb3, kv0, nb, vf.buffer);
                  const cl_ulong fk1 = (cl_ulong) d_head_q * sizeof(cl_half), fk2 = fk1 * nb, fk3 = fk2 * k->ne[2];
                  const cl_ulong fv1 = (cl_ulong) d_head_v * sizeof(cl_half), fv2 = fv1 * nb, fv3 = fv2 * v->ne[2];
@@ -304,10 +304,10 @@ index 2f928b3e8..0eb4bafed 100644
 +}
 +#endif
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 1bb1d7052..7da58f07b 100644
+index 4dd708900..4fedb4479 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -12390,6 +12390,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -12389,6 +12389,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                                                                     kvt.first, kvt.second));
          }
      }

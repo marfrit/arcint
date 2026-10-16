@@ -11,10 +11,10 @@ index b87370255..f8786499e 100644
      sub
      sum_rows
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index a3790c445..f371485bb 100644
+index 1745a8a4f..516f48dd7 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -1190,6 +1190,10 @@ struct ggml_backend_opencl_context {
+@@ -1173,6 +1173,10 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_fa_dpas_q_dk[2][3] = {};     // quantized K/V: q8_0/q8_0, q8_0/q4_0, q4_0/q4_0
      cl_kernel kernel_fa_dpas_carry_dk[2] = {};    // f16 K/V a block of keys at a time (FA_CARRY, sub-group 16)
      cl_kernel kernel_fa_kv_to_f16 = nullptr;      // and the block's quantized K/V to f16
@@ -25,7 +25,7 @@ index a3790c445..f371485bb 100644
      // Intel Xe2, decode / verify rows on the XMX units, a KV head's query
      // heads and rows in one pass (flash_attn_gqa_dpas.cl): f16, q8q8, q8q4, q4q4
      cl_kernel kernel_fa_gqa_dk[2][4] = {};        // [0] head size 256, [1] 128
-@@ -4514,6 +4518,70 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -4478,6 +4482,70 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
              } else if (backend_ctx->kernel_fa_dpas_dk[1] == nullptr) {
                  GGML_LOG_WARN("ggml_opencl: flash_attn_dpas.cl not built at head size 128; flash_attn_f32_f16.cl takes those prompts\n");
              }
@@ -96,7 +96,7 @@ index a3790c445..f371485bb 100644
              // decode / verify rows, a KV head's query heads and rows in one
              // pass (Xe2 only: sub-group 16 without 8); GGML_OPENCL_FA_GQA=0
              // leaves them to flash_attn_f32_f16_q1_split_intel
-@@ -20529,6 +20597,131 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -20306,6 +20374,131 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
          (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q))) {
          cl_mem    nomask = nullptr;
@@ -228,7 +228,7 @@ index a3790c445..f371485bb 100644
          // quantized K/V: dequantized to f16 a block of keys at a time and run
          // by the f16 kernel, the softmax state carried between the blocks
          // (llama.cpp's CUDA backend converts a quantized K/V to f16 once a
-@@ -20550,14 +20743,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -20327,14 +20520,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
              ggml_cl_buffer & cr = backend_ctx->scratch_buffer("fa_dpas_carry");
              kf.allocate(backend_ctx->context, (size_t) d_head_q * nkb * k->ne[2] * k->ne[3] * sizeof(cl_half));
              vf.allocate(backend_ctx->context, (size_t) d_head_v * nkb * v->ne[2] * v->ne[3] * sizeof(cl_half));
@@ -246,7 +246,7 @@ index a3790c445..f371485bb 100644
              auto dequant = [&](const ggml_tensor * t, cl_mem src, cl_ulong off, cl_ulong nb1, cl_ulong nb2, cl_ulong nb3,
                                 int kv0, int nb, cl_mem out) {
                  cl_kernel kq = backend_ctx->kernel_fa_kv_to_f16;
-@@ -20577,50 +20771,18 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -20354,50 +20548,18 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                  size_t gws[3] = { (size_t) d / 8, (size_t) CEIL_DIV(nb, 4) * 4, (size_t) ne2 * (size_t) t->ne[3] };
                  backend_ctx->enqueue_ndrange_kernel(kq, 3, gws, lws, dst);
              };
@@ -655,7 +655,7 @@ index 000000000..f79d0eaa7
 +    }
 +}
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 78827a353..1bb1d7052 100644
+index c81da9ebc..4dd708900 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -8678,6 +8678,62 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
@@ -721,7 +721,7 @@ index 78827a353..1bb1d7052 100644
  // GGML_OP_CROSS_ENTROPY_LOSS
  struct test_cross_entropy_loss : public test_case {
      const ggml_type type;
-@@ -12096,6 +12152,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12095,6 +12151,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  
      // FLASH_ATTN_EXT: large logits
      test_cases.emplace_back(new test_flash_attn_ext_large_logits( 64,  64, 16, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -741,7 +741,7 @@ index 78827a353..1bb1d7052 100644
      test_cases.emplace_back(new test_flash_attn_ext_large_logits(128, 128,  8, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 10.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-@@ -12314,6 +12383,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -12313,6 +12382,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32,
                                                          GGML_TYPE_F16, GGML_TYPE_F16));
      }

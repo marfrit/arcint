@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index a28b1f652..f8ef8a4fc 100644
+index 6449fc8a7..d14f6296a 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -936,6 +936,7 @@ struct ggml_backend_opencl_context {
+@@ -931,6 +931,7 @@ struct ggml_backend_opencl_context {
      ggml_cl_adreno_xmem_attn_state adreno_xmem_attn;
  #endif
      cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0, kernel_get_rows_i32;
@@ -10,7 +10,7 @@ index a28b1f652..f8ef8a4fc 100644
      cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
      cl_kernel kernel_set_rows_h16_i64 = nullptr, kernel_set_rows_h16_i32 = nullptr;   // F16 rows into F16
      cl_kernel kernel_set_rows_q8_0_i64, kernel_set_rows_q8_0_i32;
-@@ -2094,6 +2095,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2077,6 +2078,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
          CL_CHECK((backend_ctx->kernel_get_rows_f16  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_f16", &err), err));
          CL_CHECK((backend_ctx->kernel_get_rows_q4_0 = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_q4_0", &err), err));
          CL_CHECK((backend_ctx->kernel_get_rows_i32  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_i32", &err), err));
@@ -19,18 +19,21 @@ index a28b1f652..f8ef8a4fc 100644
          GGML_LOG_CONT(".");
      }
  
-@@ -10432,6 +10435,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -10216,6 +10219,13 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                  case GGML_TYPE_F16:
                  case GGML_TYPE_I32:
                      return true;
 +                case GGML_TYPE_Q8_0:
 +                    // both layouts (patch 0036): a quantized KV / QSA indexer cache in
-+                    // plain blocks, a weight flattened by set_tensor
++                    // plain blocks, a weight flattened by set_tensor. The kernels load at the
++                    // first buffer allocation: build them first, or a support query that comes
++                    // before any allocation (test-backend-ops) answers no
++                    load_cl_kernels(backend_ctx);
 +                    return backend_ctx->kernel_get_rows_q8_0 != nullptr;
                  case GGML_TYPE_Q4_0:
  #ifdef GGML_OPENCL_SOA_Q
                      // We do not support flattened Q4_0 (and possibly other Q's)
-@@ -15208,14 +15215,67 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
+@@ -14982,14 +14992,67 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
  
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
  
@@ -208,7 +211,7 @@ index d7ab0b7ee..a8c550f51 100644
 +    }
 +}
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index ff4b0b18c..889ef0f2f 100644
+index a9028da68..1fef6d89c 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -2535,6 +2535,80 @@ static void init_set_rows_row_ids(ggml_tensor * t, int num_rows) {

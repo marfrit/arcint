@@ -1365,13 +1365,9 @@ the decode-path work Flash-Next and its MTP verify needed on Intel:
   elementwise kernel (`kernel_scale_act_f32`, `GGML_OPENCL_FUSE_SCALE_ACT=0`
   turns it off): fewer launches a step, the served text identical; no
   decode change measurable above the run-to-run spread.
-- The gather's shape for 2+ tokens is switchable for measurement:
-  `GGML_OPENCL_GATHER_PAIRS_MULTI=1` takes the per-pair grid back,
-  `GGML_OPENCL_GATHER_CHUNKS` sets the per-expert split. Served, the shape
-  did not move the gathers' time (their bytes over the link do).
-- A matvec grouped by expert for 2-15 tokens (`kernel_mul_mv_idg_*`), opt-in
-  only (`GGML_OPENCL_KQ_IDG=1`): slower than a pair a work-group where the
-  matvec is not bandwidth-bound (the coder's verify 7.85 -> 9.18 s, A770).
+- `GGML_OPENCL_GATHER_CHUNKS` sets the gather's per-expert split for
+  measurement. Served, the gather's shape did not move its time (its bytes
+  over the link do).
 - **The expert cache's decode matvec reads a missed expert where it lies**
   (USM host memory, by pointer argument; Strata's expert kernels read its
   pinned host mirror the same way): no gather into the card-side mirror
@@ -1397,18 +1393,19 @@ the decode-path work Flash-Next and its MTP verify needed on Intel:
   scheduler ran four CPU islands per attention layer (98 splits a Flash-Next
   verify graph), each draining the queue: decode 32.0 -> 33.0-34.2 t/s,
   the needle 381 -> 422-425 t/s, the long text identical.
-- Opt-in, measured no faster served: the hyper-connection read fused into
-  three kernels (`GGML_OPENCL_FUSE_HC_MIX=1`, after Strata's `fused_gr` v3
-  split by stream and K half; 30.8 t/s off, 30.4 on), a projection's matvec copying the next
-  projection's misses into a card-side mirror (`GGML_OPENCL_MOE_PREFETCH=1`,
-  31.4 -> 31.6), the K-split F16 kernel with 4 rows a work-group
-  (`GGML_OPENCL_F16_KSPLIT4=1`); measured slower and kept opt-in: a verify's
-  pairs grouped by expert and decoded once (`GGML_OPENCL_KQ_GROUPED=1`,
-  30.5 -> 29.5); the activation as one int8 term in the K-quant and IQ
-  matvecs (`GGML_OPENCL_KQ_ONE_TERM=1`, llama.cpp's and Strata's single
-  q8_1 instead of codes plus residual codes): IQ4_XS 49.6 -> 43.9 us at 3
-  columns, Flash-Next 31.0 -> 31.6-31.8 t/s, but the coder 43.3 -> 40.7 (its
-  MTP drafts accepted 42.7 -> 38.2 %). The expert cache's adaptation constants take
+- Built, measured no faster or slower served, and removed in 0.8.1 with
+  their switches (operator, 2026-10-16; the code is in 0.8.0's patch): the
+  hyper-connection read fused into three kernels (after Strata's
+  `fused_gr` v3 split by stream and K half; 30.8 t/s off, 30.4 on), a
+  projection's matvec copying the next projection's misses into a
+  card-side mirror (31.4 -> 31.6), a K-split F16 kernel with 4 rows a
+  work-group, the per-pair gather grid for a few tokens, a matvec grouped
+  by expert for 2-15 tokens (the coder's verify 7.85 -> 9.18 s, A770), a
+  verify's pairs grouped by expert and decoded once (30.5 -> 29.5), and
+  the activation as one int8 term in the K-quant and IQ matvecs (llama.cpp's
+  and Strata's single q8_1 instead of codes plus residual codes: IQ4_XS
+  49.6 -> 43.9 us at 3 columns, Flash-Next 31.0 -> 31.6-31.8 t/s, but the
+  coder 43.3 -> 40.7, its MTP drafts accepted 42.7 -> 38.2 %). The expert cache's adaptation constants take
   `LLAMA_EXPERT_CACHE_{ADAPT_EVERY,MAX_SWAPS,MIN_GAIN,MIN_USAGE,DECAY}`
   (the hit rate stayed at 89.9-90.7 % across them), and it counts a
   verify's distinct experts (logged every 200 steps). `GGML_OPENCL_IQ_OPTS` adds defines to the IQ
@@ -1426,7 +1423,8 @@ MXFP4 MoE path on Xe2 that predates this patch, not a type it touches. The
 final tree (B60): MUL_MAT f16/bf16 434/434 (the XMX path's red case, K cut
 by 16, fails 7), MUL_MAT_ID IQ/low-bit 193/193 (with Q2_0 at K 640, 384 and
 320; the 4-lane path's red case fails 47 of 87), HC_MIX 10/10 fused (its red
-case, the mix 5 % off, fails 9 of 10), MUL_MAT IQ4_XS/Q4_K 94/94. Run
+case, the mix 5 % off, fails 9 of 10; since 0.8.1 the case checks the
+unfused chain), MUL_MAT IQ4_XS/Q4_K 94/94. Run
 `test-backend-ops` from its own `bin/` when the kernels are not embedded,
 and with `-b GPUOpenCL`: a wrong backend name skips everything and still
 prints OK.
@@ -1476,7 +1474,6 @@ devices. With the patch:
   - the transpose, `get_tensor` and cumsum scratch buffers;
   - 0021's USM entry points (resolved per platform);
   - its exchange scratch and its keep ring (finished on the owning queue);
-  - 0022's prefetch state.
   `get_tensors(_async)` and `exchange_slices` assert that their tensors
   share one device.
 - **Synchronisation:** `sync_with_other_backends` waits only on backends in
@@ -1807,8 +1804,9 @@ experts ran on the CPU. The 300-token answer decoded at 3.7 t/s.
   scales[8]`.
 - **Tables:** the matvec reads the grid and the signs from local memory, as
   IQ2_XXS does (640 entries). The GEMM reads them from constant memory.
-- **Kernels:** the matvec (1-4 columns), MUL_MAT_ID, the grouped paths
-  (`idg`, `idgg`) and the XMX GEMM (`mul_mm`, `mul_mm_id`).
+- **Kernels:** the matvec (1-4 columns), MUL_MAT_ID and the XMX GEMM
+  (`mul_mm`, `mul_mm_id`); until 0.8.1 also the grouped paths (`idg`,
+  `idgg`), removed with their switches.
 - **The expert cache's type filter** takes IQ2_XS.
 
 Measured (`measured-here`, 2026-10-09):
@@ -1821,7 +1819,7 @@ Measured (`measured-here`, 2026-10-09):
     supported), including Flash-Next's shape (2560 -> 640, 1-64 tokens);
   - the red case: the sign index off by one fails MUL_MAT and MUL_MAT_ID
     (ERR 1.0-1.4 against 5e-4);
-  - the grouped kernels run only when switched on. With
+  - the grouped kernels (removed in 0.8.1) ran only when switched on. With
     `GGML_OPENCL_KQ_GROUPED=1` the IQ2_XS cases pass 22/22 on both cards,
     and the mutant fails 10 of them. `GGML_OPENCL_KQ_IDG=1` aborted for
     every low-bit type; 0031 fixes that.
@@ -1842,7 +1840,11 @@ Measured (`measured-here`, 2026-10-09):
 - **KL as served** (16 x 512 against unsloth's Q8_0): 0.2180 nats, top-1
   89.90 %. The CPU arm gives 0.2211 / 89.73 %, within the error bars.
 
-## 0031-opencl-idg-args.patch
+## 0031-opencl-idg-args (dropped in 0.8.1)
+
+**Dropped from the series in 0.8.1** with the grouped matvec it fixed,
+which was removed with its switches (0022, operator 2026-10-16); the rest
+of the series keeps its numbers. The record follows.
 
 Intel: the opt-in grouped MUL_MAT_ID matvec (`GGML_OPENCL_KQ_IDG=1`, 2-15
 tokens, one read of an expert's weights for its tokens) aborted with
@@ -2171,6 +2173,14 @@ Measured (`measured-here`, 2026-10-11):
 OpenCL GET_ROWS takes q8_0 sources. Before it, GET_ROWS took f32, f16, i32
 and plain Q4_0 only (`ggml_opencl_supports_op`), so every gather from a
 q8_0 tensor ran on the CPU.
+
+- **Fixed in 0.8.1** (`measured-here`, 2026-10-16, the red-case run of the
+  pin move): on `3e4dfa8` the kernels load at the first buffer allocation,
+  and the support check read the q8_0 kernel before that. A support query
+  that came first (a test-backend-ops run filtered to these cases) answered
+  "not supported", 0/0 on both cards; the unfiltered suite and the served
+  graphs (weights allocated before the scheduler asks) were not affected.
+  The check now builds the kernels first, as the others in the series do.
 
 - **What it hit:** Flash-Next with `--llama-kv q8_0`. The KV type also types
   the QSA indexer's key cache, and the indexer gathers rows of it
@@ -3061,8 +3071,8 @@ Four changes, three of them llama.cpp CUDA's fusions (`code`, `ggml-cuda.cu`
 - **sigmoid + mul** of the same shape (the GDN z gate; CUDA's
   `ggml_cuda_op_unary_mul` conditions): one kernel.
 - **Switches:** `GGML_OPENCL_FUSE_0049=<mask>` (1 rms_norm + scale, 2
-  ssm_conv + silu, 4 sigmoid + mul; 0 off; `GGML_OPENCL_FUSE_RMS_SCALE=0` is
-  the same as 0). `GGML_OPENCL_FUSE_0049_RED=1` drops the folded scale: the
+  ssm_conv + silu, 4 sigmoid + mul; 0 off; until 0.8.1 also the alias
+  `GGML_OPENCL_FUSE_RMS_SCALE`). `GGML_OPENCL_FUSE_0049_RED=1` drops the folded scale: the
   red case.
 - **Measured** (`measured-here`, 2026-10-14, the units' flags, A B A B,
   three 300-token answers):
@@ -3343,7 +3353,12 @@ build now also takes `GGML_OPENCL_IQ_OPTS`, so one binary can A/B it.
   through `GGML_OPENCL_IQ_OPTS` now selects the GEMM's char4 forms as well
   as the matvec's; label such prefill cells accordingly.
 
-## 0055-expert-cache-lfru.patch
+## 0055-expert-cache-lfru (dropped in 0.8.1)
+
+**Dropped from the series in 0.8.1** (operator, 2026-10-16): not a general
+gain (+1.6 % on the gate set, -2.1 % on six other prompts, below), and the
+unit never ran it. Strata's adapt rule is the policy. The patch is in
+0.8.0's series; the record of what it measured follows.
 
 Infernix's expert-cache policy as an opt-in alternative to Strata's adapt
 rule (`LLAMA_EXPERT_CACHE_POLICY=lfru`). Infernix (`code`,
@@ -3404,8 +3419,7 @@ Two forms:
   it swaps 1.5-2x as often (3,840-5,376 swaps a request against
   2,265-3,359). The hit counts repeat exactly across processes of an arm.
   The +1.6 % above is the gate set's, not general.
-- **Operator:** which policy the Flash-Next unit runs (a unit flag, not a
-  default change).
+- **Operator** (2026-10-16): dropped, see above.
 
 ## 0056-expert-cache-cpu-misses.patch
 

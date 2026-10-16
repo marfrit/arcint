@@ -19,6 +19,7 @@ The assets directory holds what the repository cannot ship:
   mtp-flash-next.gguf     Flash-Next's MTP-only GGUF (tools/flash_next_mtp_gguf.sh)
   mtp-vocab.json          the agent's draft vocabulary (--llama-mtp-vocab)
 """
+import hashlib
 import json
 import os
 import re
@@ -104,8 +105,13 @@ def post_body(body):
     return json.load(urllib.request.urlopen(r, timeout=7200))
 
 
+TEXTS = []   # md5 prefixes of the answers, in order: the byte tripwire between builds (not gated)
+
+
 def text(r):
-    return r["choices"][0]["message"]["content"] or ""
+    t = r["choices"][0]["message"]["content"] or ""
+    TEXTS.append(hashlib.md5(t.encode()).hexdigest()[:8])
+    return t
 
 
 def slot_lines(kind):
@@ -185,4 +191,5 @@ finally:
     except subprocess.TimeoutExpired:
         proc.kill()
 print(f"  peak VRAM {peak[0]} MiB, GTT {peak[1]} MiB", flush=True)
+print(f"  texts md5 {' '.join(TEXTS)}", flush=True)
 sys.exit(1 if failed else 0)

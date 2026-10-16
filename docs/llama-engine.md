@@ -246,7 +246,7 @@ time on the A770 loses ~1 %.
 B60, the Flash-Next unit's flags): the low-bit expert kernels' weight decode
 (IQ2_S / IQ3_S signs, Q2_0's fields) by multiplies, the same values: decode
 +0.9 % (0053), the prompt GEMM's copy +0.2 % prefill (0054). Infernix's LFRU
-expert-cache policy (0055), opt-in with `LLAMA_EXPERT_CACHE_POLICY=lfru`:
+expert-cache policy (0055, an opt-in, dropped from the series in 0.8.1):
 +1.6 % decode over Strata's adapt rule on the gate set (Strata's request
 and two answers), but -2.1 % on six other prompts (code, German, history,
 a script, a story, cryptography: 32.6 against 33.3 t/s), the same texts.

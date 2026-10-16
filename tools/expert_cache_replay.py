@@ -7,11 +7,12 @@ llama tree's branch p0057-trace, not in contrib/llama.cpp/patches): a header
 as u64 and the slotted experts at load) and per counted decode step its tokens
 and each layer's routed ids (u32 count, i32 ids).
 
-Policies, as src/llama-expert-cache.cpp runs them (patches 0021, 0042, 0055):
+Policies (strata as src/llama-expert-cache.cpp runs it, patches 0021 and 0042;
+lfru as patch 0055 ran it, dropped from the series in 0.8.1):
   strata  per-layer usage counts decayed by 0.7 an adapt, a swap while the bank
           expert's usage beats the slot's by 1.5 (Strata's adapt);
   lfru    Infernix's score uses / (now - last + 1) per layer, the round's
-          experts protected, up to --budget admissions a layer (patch 0055);
+          experts protected, up to --budget admissions a layer;
   glfru   the same score over one pool of frames for all layers, so a swap may
           move a frame from one layer to another (Infernix's global LFRU).
 "exact" uses Infernix's clock (a round ages an expert by the layer count) and

@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
-index 6d83343ef..b5c243d34 100644
+index a5dd44718..723d3d30a 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
-@@ -1234,6 +1234,36 @@ static inline uint lb_sgn4(uint g, uint m) {
+@@ -1225,6 +1225,36 @@ static inline uint lb_sgn4(uint g, uint m) {
  #endif
  }
  
@@ -39,7 +39,7 @@ index 6d83343ef..b5c243d34 100644
  // a 64-bit table entry as two 32-bit halves
  #define LB_TAB2(T, i) vload2((i), (constant const uint *)(T))
  
-@@ -1292,8 +1322,8 @@ static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk,
+@@ -1283,8 +1313,8 @@ static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk,
          for (int l = 0; l < 4; ++l) {
              const uint2 g = LB_TAB2(iq2s_grid, ((qw >> (8 * l)) & 0xFF) | ((qh << (8 - 2 * l)) & 0x300));
              const uint sb = (sw >> (8 * l)) & 0xFF;
@@ -50,7 +50,7 @@ index 6d83343ef..b5c243d34 100644
          }
          *s0 = d * (0.5f + (float)(sc & 0xF)) * 0.25f;
          *s1 = d * (0.5f + (float)(sc >> 4)) * 0.25f;
-@@ -1332,7 +1362,13 @@ static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk,
+@@ -1323,7 +1353,13 @@ static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk,
          #pragma unroll
          for (int i = 0; i < 8; ++i) {
              const uint b = (cw[i >> 2] >> (8 * (i & 3))) & 0xFF;
@@ -64,7 +64,7 @@ index 6d83343ef..b5c243d34 100644
  #ifdef LB_CHAR4_ARITH
              w[i] = as_uint(as_char4(v) - (char4)(1));
  #else
-@@ -1352,8 +1388,8 @@ static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk,
+@@ -1343,8 +1379,8 @@ static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk,
              const uint g1 = iq3s_grid[(qv[l] & 0xFF) | ((qh << (8 - 2 * l)) & 256)];
              const uint g2 = iq3s_grid[(qv[l] >> 8)   | ((qh << (7 - 2 * l)) & 256)];
              const uint sb = (sw >> (8 * l)) & 0xFF;
