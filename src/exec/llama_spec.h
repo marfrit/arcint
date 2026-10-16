@@ -6,6 +6,7 @@
 #ifdef ARCINT_LLAMA
 
 #include <cstddef>
+#include <cstdint>
 #include <ggml.h>
 #include <memory>
 #include <string>
@@ -65,13 +66,16 @@ public:
     // memory refuses (beyond its recurrent snapshots), and then both are
     // cleared for the sequence.
     virtual bool seq_rm(int seq, size_t from) = 0;
-    // The carried hidden row of a sequence that holds exactly n tokens (the
-    // target's row of position n - 1), empty when the drafter carries none
-    // there; stored with a context checkpoint and set back after its restore
-    // and the cut to n, as llama.cpp's server stashes the draft state with
-    // each checkpoint (common_speculative_get_state).
-    virtual std::vector<float> carried_row(int seq, size_t n) const = 0;
-    virtual void               set_carried_row(int seq, size_t n, const std::vector<float>& row) = 0;
+    // The drafter's state of a sequence that holds exactly n tokens, as
+    // opaque bytes (exec/spec_state.h): the MTP drafter's carried hidden row
+    // (the target's row of position n - 1; empty when it carries none
+    // there), the DFlash2 drafter's sliding-window K/V. Stored with a context
+    // checkpoint and set back after its restore and the cut to n, as
+    // llama.cpp's server stashes the draft side with each checkpoint
+    // (common_speculative_get_state and the draft context's partial state).
+    // A state that is not this drafter's at n is not loaded.
+    virtual std::vector<uint8_t> carried_state(int seq, size_t n) = 0;
+    virtual void                 set_carried_state(int seq, size_t n, const std::vector<uint8_t>& state) = 0;
     // Named lanes: the draft context's cell windows, as the target's
     // (llama_memory_seq_windows, contrib/llama.cpp 0026); false when its
     // memory cannot take them.

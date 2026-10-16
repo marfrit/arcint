@@ -191,7 +191,7 @@ class LlamaBackend final : public Backend {
         size_t               n_tokens = 0;
         uint64_t             req      = 0;   // the prefill that made it
         std::vector<uint8_t> state;          // the memory's PARTIAL_ONLY state
-        std::vector<float>   dft_row;        // the drafter's carried row, --llama-mtp
+        std::vector<uint8_t> dft_state;      // the drafter's (exec/spec_state.h): MTP's carried row, DFlash2's window
     };
 
 public:
@@ -878,7 +878,7 @@ private:
                     common = c != nullptr ? c->n_tokens : 0;
                 }
                 if (!spec_->seq_rm(seq, common)) common = 0;
-                else if (c != nullptr) spec_->set_carried_row(seq, common, c->dft_row);
+                else if (c != nullptr) spec_->set_carried_state(seq, common, c->dft_state);
             }
             drop_ckpts_after_locked(seq, common);
             have.resize(common);
@@ -1058,7 +1058,7 @@ private:
             log::warn("slot", "lane %d: checkpoint at %zu tokens failed", seq, n_tokens);
             return;
         }
-        if (spec_) c.dft_row = spec_->carried_row(seq, n_tokens);
+        if (spec_) c.dft_state = spec_->carried_state(seq, n_tokens);
         size_t last = SIZE_MAX;   // the condition re-checked each step: only as many as make room
         for (auto it = list.begin(); list.size() + 1 >= static_cast<size_t>(ckpt_max_) && it != list.end();) {
             if (it->req != ckpt_req_ && last != SIZE_MAX && it->n_tokens <= last + ckpt_step_) {
