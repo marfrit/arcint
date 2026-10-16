@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 0e92209e6..b9d7c33a7 100644
+index 3d656682c..29e32b426 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -20051,6 +20051,36 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -19825,6 +19825,36 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      const int n_head_kv = k->ne[2];
      const int n_batch = q->ne[3];
  

@@ -246,7 +246,7 @@ time on the A770 loses ~1 %.
 B60, the Flash-Next unit's flags): the low-bit expert kernels' weight decode
 (IQ2_S / IQ3_S signs, Q2_0's fields) by multiplies, the same values: decode
 +0.9 % (0053), the prompt GEMM's copy +0.2 % prefill (0054). Infernix's LFRU
-expert-cache policy (0055), opt-in with `LLAMA_EXPERT_CACHE_POLICY=lfru`:
+expert-cache policy (0055, an opt-in, dropped from the series in 0.8.1):
 +1.6 % decode over Strata's adapt rule on the gate set (Strata's request
 and two answers), but -2.1 % on six other prompts (code, German, history,
 a script, a story, cryptography: 32.6 against 33.3 t/s), the same texts.
@@ -276,8 +276,7 @@ The UD-Q3_K_XL file (52 GiB of experts) serves the same way at 235 t/s
 prefill and 12-13 t/s decode without MTP (2026-10-06).
 
 **Two cards** (`--device GPU.0,GPU.1 --llama-layer-split K`;
-`contrib/llama.cpp` 0023 and 0024, `docs/campaigns/layer-split-two-cards.md` on
-the `qfndev` branch).
+`contrib/llama.cpp` 0023 and 0024, `docs/campaigns/layer-split-two-cards.md` (on the `qfndev` branch)).
 llama.cpp's layer split runs layers [0, K) on the
 first card and [K, n_layer) with the output head on the second; each card
 keeps the KV and recurrent state of its own layers. The cards are named as
@@ -313,7 +312,7 @@ marked):
 
 | GGUF | KL / top-1 vs unsloth's Q8_0 on the CPU (16 x 512) | host bank at the unit's slots | state |
 |---|---|---|---|
-| ISTA-DASLab GSQ-RCO IQ2_XS (shard 1 39.2 GB) | 0.294 / 87.1 % | 20.32 GiB at 13,400 MiB | on demand (`arcint-flashnext-iq2xs`), the faster option: 665.6 t/s at the 20k needle, 42.3 t/s (0.8.0's served check) |
+| ISTA-DASLab GSQ-RCO IQ2_XS (shard 1 39.2 GB) | 0.294 / 87.1 % | 20.32 GiB at 13,400 MiB | on demand, the faster option (the Flash-Next unit with this `--gguf` and 13,400 MiB of slots): 665.6 t/s at the 20k needle, 42.3 t/s (0.8.0's served check) |
 | ISTA-DASLab GSQ-RCO IQ3_XXS (shard 1 47.0 GB) | 0.218 / 89.7 % (served) | 28.72 GiB at 12,000 MiB | the default (`arcint-flashnext`), 12,000 MiB of slots with the CPU misses: 595.1 t/s at the 20k needle and 35.1 t/s in 0.8.0's served check; 597.9 t/s at the 20k needle, 33.9 / 37.5 / 37.3 / 33.5 / 30.6 / 30.9 t/s on six answers (20.7 / 26.2 / 28.9 / 18.7 / 21.2 / 18.5 without), KL 0.2910 against 0.2866 without (8 x 512), peak 23,306 MiB (13,400 MiB from ZFS thrashed: 6.4-11.7 t/s at peak 24,440) |
 | unsloth UD-Q3_K_XL (3 shards, 90 GB) | 0.100 / 93.3 %, inside the bar | ~39 GiB | 235 t/s prefill, 12-13 t/s decode without MTP (2026-10-06, before the bank stream and the CPU misses); needs the planned 96 GB host |
 
@@ -325,8 +324,8 @@ Every option needs its file on the NVMe, not the ZFS pool (an IQ3_XXS answer
 from ZFS decodes at 4-5 t/s, bound by storage reads), its host bank free
 beside the page cache (the bank is pinned), and a slot budget measured at the
 20k needle against the card's peak (`--llama-expert-cache`, §"The expert
-cache"). The units are on-demand variants of the Flash-Next unit with the
-same port and served name, conflicting with each other.
+cache"). An option runs from the Flash-Next unit with its own `--gguf` and
+`--llama-expert-cache`, on the same port and served name.
 
 ## MTP (`--llama-mtp N`)
 
@@ -390,7 +389,7 @@ The prices, KL and speed are in the 0015 section of
 - its KL is within the noise of f16's.
 
 **Dense 27B, B60, 245,760 tokens** (since 2026-10-12; 196,608 on 2026-10-11,
-`docs/campaigns/agent-context.md` on the `qfndev` branch, `measured-here`, arcint 0.7.3, MTP 5):
+`docs/campaigns/agent-context.md` (on the `qfndev` branch), `measured-here`, arcint 0.7.3, MTP 5):
 `--n-ctx 196608 --llama-kv q8_0:q4_0`. The needle at 40 % of a 195,451-token
 prompt is answered (prefill 1,059 s, 184.6 t/s; decode at that depth 12.0
 t/s); the acceptance task 10/10 greedy (one run); KL 0.005950 / 97.30 %
@@ -706,8 +705,7 @@ A context is a multiple of 256, at most the model's trained context, at most
   MTP draft context: lane i finds its cells in its own range and attends
   over that range only. The subagent's 300-token answer decodes 32.0-32.1
   t/s whether the agent lane holds 20k, 64k or 118k tokens; KL equals one
-  lane's (`docs/campaigns/lanes-agent-subagent.md` on the `qfndev` branch).
-  Flash-Next's indexed
+  lane's (`docs/campaigns/lanes-agent-subagent.md` (on the `qfndev` branch)). Flash-Next's indexed
   memory refuses windows and keeps the whole-pool views, with a warning at
   load. The expert cache's counters are the model's: with more than one lane
   its per-request line is labelled process-wide.
@@ -718,14 +716,16 @@ A context is a multiple of 256, at most the model's trained context, at most
   llama.cpp's server batches its slots. Accept and rollback stay per lane;
   a failed shared decode is retried lane by lane. A lane that misses the
   wait (its client stalls the stream) is not waited for again until it
-  posts. Such a step mixes sequences in one ubatch: `contrib/llama.cpp`
-  0029 gives each sequence's rows attention over its own window, and 0028
-  runs 9-64 query rows in blocks of 8 on 0016's kernel. Measured
-  (`measured-here`, the dense agent, MTP 5, B60): 21.7 + 22.0 t/s with both
-  lanes busy against 15.9 + 15.8 taking turns; a lane alone 31.7-31.9 t/s as
-  before; the mixed path's KL equals one sequence's (0.004099); the capital,
-  the needle and the acceptance task as on one lane. Without MTP the lanes
-  still take turns, one lane per `llama_decode`.
+  posts. Such a step mixes
+  sequences in one ubatch: `contrib/llama.cpp` 0029 gives each sequence's
+  rows attention over its own window, and 0028 runs the 9-64 query rows of
+  a shared verify in blocks of 8 on 0016's kernel. Measured (`measured-here`,
+  the dense agent, MTP 5, B60): 21.6 + 21.7 t/s with both lanes busy against
+  15.9 + 15.8 taking turns (+37 %); a lane alone 31.7-31.8 t/s as before;
+  the mixed path's KL equals one sequence's (0.004099); the capital, the
+  needle and the acceptance task as on one lane
+  (`docs/campaigns/lanes-agent-subagent.md` (on the `qfndev` branch)). Without MTP the lanes still
+  take turns, one lane per `llama_decode`.
 
 ## Open on this engine
 

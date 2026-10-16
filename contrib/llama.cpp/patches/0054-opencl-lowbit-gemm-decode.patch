@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 05e005cb5..aad8e2fa6 100644
+index 7ad5ca83a..c5cef2e78 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -2728,7 +2728,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2692,7 +2692,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                      const std::string mm_opts = compile_opts + " -cl-intel-256-GRF-per-thread" +
                          " -DXT=" + std::to_string(backend_ctx->kq_id2_xt) + " -DXSG=" + std::to_string(backend_ctx->kq_id2_xsg) +
                          " -DSG=" + std::to_string(backend_ctx->kq_mm_sg) + " -DRG=" + std::to_string(t.rg) +
@@ -14,7 +14,7 @@ index 05e005cb5..aad8e2fa6 100644
                      if (mm_prog == nullptr) {
                          GGML_LOG_WARN("ggml_opencl: XMX GEMM (%s) not built; ggml's kernels take the K-quants, the IQ types go to the CPU\n", pass == 0 ? "MUL_MAT" : "MUL_MAT_ID");
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
-index 1c3b38386..6d24bcd37 100644
+index c0b3b1c0d..7a9114b32 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
 @@ -1649,6 +1649,34 @@ static inline uint lb_sgn4(uint g, uint m) {

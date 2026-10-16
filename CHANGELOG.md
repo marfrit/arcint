@@ -18,13 +18,59 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
-## Unreleased
+## 0.8.1 — 2026-10-16
 
+**Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (54
+patches: 0001-0056 without 0031 and 0055), compiled in; dependencies as in
+0.8.0. The pin move's step 3 (every patch's red case and the KL arms of one
+and four sequences a batch on the new base) is done (charter C3).
+
+**Pre-tag check** (`measured-here`, 2026-10-16, the package, two processes a
+service): answers, needles, the equivalence and concurrency suites and the
+sanitizers pass; the acceptance task 10/10 (agent) and 9/10 (coder). The
+speeds sat 0.1-1 % under 0.8.0's floors (agent 694.3 / 490.9 t/s, coder
+50.6 / 47.2 / 43.8, Flash-Next 594.1 / 34.7-34.8); 0.8.0's binary,
+alternated with the package in the same window, measured the same and missed
+the same floors (the dev host's drift over a day). Tagged on that A/B, and
+the speed gate is now the same-window A/B against the last release, the
+floors a report (operator, 2026-10-16; DESIGN §5).
+
+- **The opt-in alternatives are out of the llama.cpp series** (operator,
+  2026-10-16): the mechanisms that measured slower or neutral and were left
+  behind a switch (the hyper-connection fusion, the K-split F16 matvec, the
+  per-pair gather grid, the two grouped MoE matvecs, one activation term,
+  the bank prefetch) are removed from the patches that added them (0022,
+  0023, 0030, 0035, 0049; the context of 0032, 0044, 0050, 0051 and 0056
+  follows), with their red-case and debug switches and the `FUSE_RMS_SCALE`
+  alias; patch 0031 (fixes to the grouped matvec) and patch 0055
+  (Infernix's LFRU policy, +1.6 % on the gate set and -2.1 % on six other
+  prompts) are dropped, the other patches keep their numbers. The default
+  paths' code is unchanged except for the prefetch's dead kernel arguments,
+  its per-launch bookkeeping, and the MoE GEMM's expert bound back at 512
+  (raised to 1024 only for the grouped matvec). Measured against the
+  deployed 0.8.0 (`measured-here`, 2026-10-16): test-backend-ops on both
+  cards over the series' op families gives the same counts and the same
+  failing cases (the pin's 74 MXFP4 MUL_MAT_ID cases on the B60, three
+  head-64 FLASH_ATTN_EXT cases on the A770); served with the units' flags,
+  old/new/old/new, the three services answer with the same bytes (md5) and
+  the same rates (Flash-Next 595.0 / 594.6 -> 594.7 / 594.7 t/s at the 20k
+  needle, 34.3 / 34.9 -> 34.4 / 34.4 t/s; the agent 695.7 / 695.4 -> 695.8 /
+  695.3 at 55k, 491.9 / 491.8 -> 491.9 / 491.7 at 138k; the coder 51.0-51.1 /
+  47.5-47.6 / 44.1 -> 51.1-51.2 / 47.5-47.6 / 44.1, prefill 725.3 / 725.5 ->
+  725.1 / 725.8 at 41k); the coder's peak VRAM 15,950 -> 15,885 MiB, cause
+  not measured. `docs/switches.md`
+  lists 86 switches in five classes.
+- **0036's support check builds the kernels first**: since the pin move to
+  `3e4dfa8` they load at the first buffer allocation, and a q8_0 GET_ROWS
+  support query before it answered no. Found by the pin move's red-case
+  run (a filtered test-backend-ops run tested nothing); serving was not
+  affected.
 - **Flash-Next serves IQ3_XXS by default** (operator, 2026-10-15, for its
   accuracy: KL 0.218 / top-1 89.7 % against IQ2_XS's 0.294 / 87.1 % vs
   unsloth's Q8_0). `contrib/systemd/arcint-flashnext.service` takes the
-  IQ3_XXS file with 12,000 MiB of expert slots and the CPU misses; IQ2_XS is
-  the option `arcint-flashnext-iq2xs.service`. Measured with the 0.8.0
+  IQ3_XXS file with 12,000 MiB of expert slots and the CPU misses; IQ2_XS
+  stays an option, run from the same unit with its file and 13,400 MiB of
+  slots. Measured with the 0.8.0
   package (`measured-here`, B60, the files on the NVMe, two processes):
   595.2 / 595.0 t/s at the 20k needle, 35.6 / 34.5 t/s decode, Paris and the
   needle, peak VRAM 23,312 MiB; the `flashnext-served` cell's floors follow.

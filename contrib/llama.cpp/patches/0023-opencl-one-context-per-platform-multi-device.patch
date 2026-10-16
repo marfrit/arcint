@@ -62,7 +62,7 @@ index 1a4a28117..425ffcf1e 100644
      std::vector<uint8_t> file;
      file.reserve(16 + bin.size());
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 29e5e0f45..e94a2c2cc 100644
+index f8b74f4b3..785dfc815 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -478,6 +478,12 @@ struct ggml_backend_opencl_device_context {
@@ -87,7 +87,7 @@ index 29e5e0f45..e94a2c2cc 100644
  
      // FA bin kernels
  #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-@@ -660,6 +668,17 @@ struct ggml_cl_kq_tile {
+@@ -660,6 +668,13 @@ struct ggml_cl_kq_tile {
      int nsg() const { return nsgm * nsgn; }
  };
  
@@ -98,14 +98,10 @@ index 29e5e0f45..e94a2c2cc 100644
 +typedef cl_int (*ggml_cl_mem_free_t)(cl_context, void *);
 +typedef cl_int (*ggml_cl_set_arg_ptr_t)(cl_kernel, cl_uint, const void *);
 +
-+// GGML_OPENCL_MOE_PREFETCH: the mirror the previous projection's matvec filled
-+// for the next one (per backend: reset at each graph_compute)
-+struct ggml_cl_pf_state { const ggml_tensor * slot = nullptr; const ggml_tensor * ids = nullptr; cl_mem mirror = nullptr; };
-+
  struct ggml_backend_opencl_context {
      int ref_count;
  
-@@ -768,6 +787,12 @@ struct ggml_backend_opencl_context {
+@@ -767,6 +782,12 @@ struct ggml_backend_opencl_context {
      ggml_cl_buffer prealloc_kq_tiles;  // its tiles (expert, first pair, count)
      ggml_cl_buffer prealloc_kq_ntiles; // and their number
      ggml_cl_buffer prealloc_splitk_partial;  // [ksplit * M] partials for split-K GEMV
@@ -118,7 +114,7 @@ index 29e5e0f45..e94a2c2cc 100644
  
      // pool of persistent image1d_buffer views over kv-cache layers, keyed by
      // (parent buffer, offset within parent)
-@@ -1036,6 +1061,15 @@ struct ggml_backend_opencl_context {
+@@ -1024,6 +1045,14 @@ struct ggml_backend_opencl_context {
      // the ids tensor the permutation was computed for (reset at each graph: a later
      // graph's ids reuse the tensors with new contents)
      const ggml_tensor * pair_perm_t = nullptr; int pair_perm_split = 0;
@@ -126,7 +122,6 @@ index 29e5e0f45..e94a2c2cc 100644
 +    ggml_cl_host_alloc_t  usm_host_alloc  = nullptr;
 +    ggml_cl_mem_free_t    usm_mem_free    = nullptr;
 +    ggml_cl_set_arg_ptr_t usm_set_arg_ptr = nullptr;
-+    ggml_cl_pf_state      moe_pf;           // GGML_OPENCL_MOE_PREFETCH state of the current graph
 +    // ggml_backend_opencl_exchange_slices' staging slice, and the host copies
 +    // ggml_backend_opencl_set_tensor_slices keeps until this queue has passed them
 +    ggml_cl_buffer prealloc_exchange;
@@ -134,7 +129,7 @@ index 29e5e0f45..e94a2c2cc 100644
      // the MoE router's softmax + top-k + normalized weights in one kernel, Intel
      cl_kernel kernel_topk_moe = nullptr;
      // SCALE -> SILU / SCALE -> SIGMOID -> SCALE fused, Intel
-@@ -1512,7 +1546,9 @@ static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev,
+@@ -1500,7 +1529,9 @@ static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev,
              return NULL;
          }
  
@@ -145,7 +140,7 @@ index 29e5e0f45..e94a2c2cc 100644
          if (err == CL_SUCCESS) {
              return p;
          }
-@@ -1590,7 +1626,7 @@ static cl_program build_program_from_binary(cl_context ctx, cl_device_id dev, co
+@@ -1578,7 +1609,7 @@ static cl_program build_program_from_binary(cl_context ctx, cl_device_id dev, co
          exit(1);
      }
  
@@ -154,7 +149,7 @@ index 29e5e0f45..e94a2c2cc 100644
      if(err < 0) {
          clGetProgramBuildInfo(p, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
          program_log = (char*) malloc(log_size + 1);
-@@ -6593,7 +6629,7 @@ static bool ggml_opencl_ensure_fa_f32_f16_prefill_512(ggml_backend_opencl_contex
+@@ -6562,7 +6593,7 @@ static bool ggml_opencl_ensure_fa_f32_f16_prefill_512(ggml_backend_opencl_contex
      auto & target = split ? backend_ctx->fa.f32_f16_split : backend_ctx->fa.f32_f16;
      if (target.count(dk_dv) > 0) { return true; }
  
@@ -163,7 +158,7 @@ index 29e5e0f45..e94a2c2cc 100644
      if (failed[split ? 1 : 0]) { return false; }
  
      const ggml_opencl_fa_dim * cfg = nullptr;
-@@ -7407,6 +7443,50 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
+@@ -7376,6 +7407,50 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
      cl_device * candidate_devices    = nullptr;
      unsigned    n_candidate_devices  = 0;
  
@@ -214,7 +209,7 @@ index 29e5e0f45..e94a2c2cc 100644
      unsigned n;
      if (user_platform_string != NULL && sscanf(user_platform_string, " %u", &n) == 1 && n < n_platforms) {
          user_platform_number = (int)n;
-@@ -7414,7 +7494,10 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
+@@ -7383,7 +7458,10 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
      if (user_device_string != NULL && sscanf(user_device_string, " %u", &n) == 1 && n < n_devices) {
          user_device_number = (int)n;
      }
@@ -226,7 +221,7 @@ index 29e5e0f45..e94a2c2cc 100644
          cl_platform* platform = &platforms[user_platform_number];
          if ((unsigned)user_device_number >= platform->n_devices) {
              GGML_LOG_ERROR("ggml_opencl: invalid device number %d\n", user_device_number);
-@@ -7476,34 +7559,62 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
+@@ -7445,34 +7523,62 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
          }
      }
  
@@ -307,7 +302,7 @@ index 29e5e0f45..e94a2c2cc 100644
          auto dev_ctx = std::unique_ptr<ggml_backend_opencl_device_context>(new ggml_backend_opencl_device_context{
              /*.platform         =*/dev->platform->id,
              /*.platform_nane    =*/dev->platform->name,
-@@ -7513,7 +7624,7 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
+@@ -7482,7 +7588,7 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
              /*.device_version   =*/dev->version,
              /*.backend_ctx      =*/nullptr,
              /*.buffer_type      =*/{},
@@ -316,7 +311,7 @@ index 29e5e0f45..e94a2c2cc 100644
          });
  
          found_devices.push_back(ggml_backend_device{
-@@ -7528,6 +7639,12 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
+@@ -7497,6 +7603,12 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
              continue;
          }
  
@@ -329,7 +324,7 @@ index 29e5e0f45..e94a2c2cc 100644
          g_ggml_backend_opencl_dev_ctxs.push_back(std::move(dev_ctx));
      }
  
-@@ -7899,6 +8016,12 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
+@@ -7868,6 +7980,12 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
  #endif
      CL_CHECK((backend_ctx->queue = clCreateCommandQueue(context, device, command_queue_props, &err), err));
  
@@ -342,7 +337,7 @@ index 29e5e0f45..e94a2c2cc 100644
      // delay kernel loading until the first buffer is created
      // load_cl_kernels(backend_ctx.get());
  
-@@ -7963,7 +8086,7 @@ static void transpose_2d(
+@@ -7932,7 +8050,7 @@ static void transpose_2d(
      bool blocking = true,
      bool auto_local = false // let driver pick local size for non-uniform workgroups
  ) {
@@ -351,7 +346,7 @@ index 29e5e0f45..e94a2c2cc 100644
  
      cl_event evt;
      cl_int err;
-@@ -8603,9 +8726,9 @@ struct ggml_tensor_extra_cl_q6_K {
+@@ -8572,9 +8690,9 @@ struct ggml_tensor_extra_cl_q6_K {
  // backend
  //
  static const char * ggml_backend_opencl_name(ggml_backend_t backend) {
@@ -364,7 +359,7 @@ index 29e5e0f45..e94a2c2cc 100644
  }
  
  static void ggml_backend_opencl_free(ggml_backend_t backend) {
-@@ -8647,6 +8770,16 @@ static void ggml_backend_opencl_synchronize(ggml_backend_t backend) {
+@@ -8616,6 +8734,16 @@ static void ggml_backend_opencl_synchronize(ggml_backend_t backend) {
  // Synchronizes the 'backend_ctx's device with others so that commands
  // enqueued to it won't start until commands in the other devices have
  // completed.
@@ -381,7 +376,7 @@ index 29e5e0f45..e94a2c2cc 100644
  static void sync_with_other_backends(ggml_backend_opencl_context * backend_ctx) {
      if (g_ggml_backend_opencl_devices.size() < 2) {
          return; // No other devices to synchronize with.
-@@ -8659,7 +8792,8 @@ static void sync_with_other_backends(ggml_backend_opencl_context * backend_ctx)
+@@ -8628,7 +8756,8 @@ static void sync_with_other_backends(ggml_backend_opencl_context * backend_ctx)
          ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) backend_dev.context;
          auto * other_backend_ctx = dev_ctx->backend_ctx;
  
@@ -391,7 +386,7 @@ index 29e5e0f45..e94a2c2cc 100644
              cl_event ev;
              CL_CHECK(clEnqueueMarkerWithWaitList(other_backend_ctx->queue, 0, nullptr, &ev));
              CL_CHECK(clFlush(other_backend_ctx->queue));
-@@ -8667,6 +8801,10 @@ static void sync_with_other_backends(ggml_backend_opencl_context * backend_ctx)
+@@ -8636,6 +8765,10 @@ static void sync_with_other_backends(ggml_backend_opencl_context * backend_ctx)
          }
      }
  
@@ -402,30 +397,7 @@ index 29e5e0f45..e94a2c2cc 100644
      CL_CHECK(clEnqueueBarrierWithWaitList(backend_ctx->queue, events.size(), events.data(), nullptr));
      for (auto ev : events) {
          CL_CHECK(clReleaseEvent(ev));
-@@ -9772,10 +9910,10 @@ static void ggml_cl_scale_act_fused(ggml_backend_t backend, ggml_cgraph * cgraph
- // GGML_OPENCL_MOE_PREFETCH: an expert cache's decode matvec of one projection
- // copies the next projection's missed experts of the same layer (gate -> up ->
- // down, the same ids) into a card-side mirror while it computes, and the next
--// projection reads its misses there: their link time overlaps a matvec
-+// projection reads its misses there: their link time overlaps a matvec. The
-+// chain is keyed by tensor (process-wide); the mirror filled for the next
-+// projection is per device (ggml_backend_opencl_context::moe_pf)
- static std::unordered_map<const ggml_tensor *, const ggml_tensor *> g_cache_chain;
--struct ggml_cl_pf_state { const ggml_tensor * slot = nullptr; const ggml_tensor * ids = nullptr; cl_mem mirror = nullptr; };
--static ggml_cl_pf_state g_pf;
- static bool ggml_cl_moe_prefetch_on() {
-     static const char * env = getenv("GGML_OPENCL_MOE_PREFETCH");
-     static const bool on = env != nullptr && atoi(env) != 0;
-@@ -9787,7 +9925,7 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
-     backend_ctx->graph_gen++;
-     backend_ctx->pair_perm_t = nullptr;
-     backend_ctx->pair_grp_t = nullptr;
--    g_pf = {};
-+    backend_ctx->moe_pf = {};
- 
-     for (int i = 0; i < cgraph->n_nodes; i++) {
-         ggml_tensor * node = cgraph->nodes[i];
-@@ -10820,13 +10958,8 @@ bool ggml_backend_is_opencl(ggml_backend_t backend) {
+@@ -10609,13 +10742,8 @@ bool ggml_backend_is_opencl(ggml_backend_t backend) {
  // USM host memory (cl_intel_unified_shared_memory) for an expert cache's
  // bank: kernels read it over the link through pointer arguments (a cl_mem
  // over host memory is migrated to the card by the driver: 1.1 TB/s kernel
@@ -441,7 +413,7 @@ index 29e5e0f45..e94a2c2cc 100644
  // an expert cache's single branch (decode): slot tensor -> its bank and the
  // split (ids at or above it are the bank's, gathered into the mirror)
  static std::unordered_map<const ggml_tensor *, std::pair<const ggml_tensor *, int>> g_cache_pairs;
-@@ -10847,11 +10980,14 @@ struct ggml_backend_opencl_buffer_context {
+@@ -10636,11 +10764,14 @@ struct ggml_backend_opencl_buffer_context {
      // IQ4_NL tensors as their scales, then their quants
      void *     usm     = nullptr;
      cl_context usm_ctx = nullptr;
@@ -458,7 +430,7 @@ index 29e5e0f45..e94a2c2cc 100644
          }
          for (cl_mem buf : buffer) {
              CL_CHECK(clReleaseMemObject(buf));
-@@ -13360,10 +13496,10 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+@@ -13149,10 +13280,10 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
              return;
          }
          if (use_adreno_kernels(backend_ctx, tensor)) {
@@ -473,7 +445,7 @@ index 29e5e0f45..e94a2c2cc 100644
  
              cl_int M = tensor->ne[1];
              cl_int K = tensor->ne[0];
-@@ -13763,9 +13899,9 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+@@ -13552,9 +13683,9 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
  
  #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
          if (use_adreno_kernels(backend_ctx, tensor)) {
@@ -486,7 +458,7 @@ index 29e5e0f45..e94a2c2cc 100644
  
              cl_int M = tensor->ne[1];
              cl_int K = tensor->ne[0];
-@@ -13924,10 +14060,10 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+@@ -13713,10 +13844,10 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
              size_t size_dm = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
              size_t size_s  = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*12;
  
@@ -501,7 +473,7 @@ index 29e5e0f45..e94a2c2cc 100644
  
              buf_trans_q.allocate(backend_ctx->context, size_q);
              buf_trans_d.allocate(backend_ctx->context, size_d);
-@@ -14039,11 +14175,11 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+@@ -13828,11 +13959,11 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
              size_t size_d  = extra->size_d;
              size_t size_dm = extra->size_dm;
  
@@ -518,7 +490,7 @@ index 29e5e0f45..e94a2c2cc 100644
  
              buf_trans_q.allocate(backend_ctx->context, size_q);
              buf_trans_qh.allocate(backend_ctx->context, size_qh);
-@@ -14205,11 +14341,11 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+@@ -13994,11 +14125,11 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
              return;
          }
          if (use_adreno_kernels(backend_ctx, tensor) && !use_flat_gemv_for_large_m_q6_K(backend_ctx, tensor)) {
@@ -535,7 +507,7 @@ index 29e5e0f45..e94a2c2cc 100644
  
              cl_int M = tensor->ne[1];   // ne01
              cl_int K = tensor->ne[0];   // ne00
-@@ -14377,13 +14513,16 @@ static ggml_backend_buffer_i ggml_backend_opencl_buffer_interface = {
+@@ -14166,13 +14297,16 @@ static ggml_backend_buffer_i ggml_backend_opencl_buffer_interface = {
  //
  
  static const char * ggml_backend_opencl_buffer_type_get_name(ggml_backend_buffer_type_t buffer_type) {
@@ -556,7 +528,7 @@ index 29e5e0f45..e94a2c2cc 100644
  static bool g_opencl_alloc_host = false;
  static void ggml_backend_opencl_set_alloc_host(bool host) { g_opencl_alloc_host = host; }
  
-@@ -14402,14 +14541,11 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
+@@ -14191,14 +14325,11 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
      cl_int err;
      cl_mem mem = nullptr;
      if (g_opencl_alloc_host) {
@@ -576,7 +548,7 @@ index 29e5e0f45..e94a2c2cc 100644
          if (usm == nullptr) {
              GGML_LOG_ERROR("%s: failed to allocate %.2f MiB of USM host memory (err=%d)\n", __func__, size / 1024.0 / 1024.0, err);
              return nullptr;
-@@ -14417,8 +14553,10 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
+@@ -14206,8 +14337,10 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
          mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, 64, NULL, &err);   // a placeholder for the tensors' extras
          CL_CHECK(err);
          ggml_backend_opencl_buffer_context * hctx = new ggml_backend_opencl_buffer_context(mem);
@@ -589,7 +561,7 @@ index 29e5e0f45..e94a2c2cc 100644
          return ggml_backend_buffer_init(buffer_type, ggml_backend_opencl_buffer_interface, hctx, size);
      }
      mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, size, NULL, &err);
-@@ -14470,17 +14608,12 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
+@@ -14259,17 +14392,12 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
  }
  
  static size_t ggml_backend_opencl_buffer_type_get_alignment(ggml_backend_buffer_type_t buffer_type) {
@@ -610,7 +582,7 @@ index 29e5e0f45..e94a2c2cc 100644
  }
  
  static bool ggml_backend_opencl_buffer_type_supports_backend(ggml_backend_buffer_type_t buft, ggml_backend_t backend) {
-@@ -14523,9 +14656,8 @@ static ggml_backend_buffer_type_i ggml_backend_opencl_buffer_type_interface = {
+@@ -14312,9 +14440,8 @@ static ggml_backend_buffer_type_i ggml_backend_opencl_buffer_type_interface = {
  //
  
  static const char * ggml_backend_opencl_device_get_name(ggml_backend_dev_t dev) {
@@ -622,7 +594,7 @@ index 29e5e0f45..e94a2c2cc 100644
  }
  
  static const char * ggml_backend_opencl_device_get_description(ggml_backend_dev_t dev) {
-@@ -14616,11 +14748,12 @@ static bool ggml_backend_opencl_device_supports_buft(ggml_backend_dev_t dev, ggm
+@@ -14405,11 +14532,12 @@ static bool ggml_backend_opencl_device_supports_buft(ggml_backend_dev_t dev, ggm
          return false;
      }
  
@@ -640,7 +612,7 @@ index 29e5e0f45..e94a2c2cc 100644
  }
  
  namespace /* anonymous */ {
-@@ -15193,13 +15326,15 @@ static int ggml_cl_regions(const ggml_tensor * t, ggml_cl_region r[2]) {
+@@ -14972,13 +15100,15 @@ static int ggml_cl_regions(const ggml_tensor * t, ggml_cl_region r[2]) {
  // after them.
  static void ggml_backend_opencl_exchange_slices(ggml_tensor * a, int64_t sa, ggml_tensor * b, int64_t sb) {
      GGML_ASSERT(a->type == b->type && a->ne[0] == b->ne[0] && a->ne[1] == b->ne[1]);
@@ -657,7 +629,7 @@ index 29e5e0f45..e94a2c2cc 100644
      for (int i = 0; i < n; ++i) {
          const size_t per = ra[i].per, oa = ra[i].off + (size_t) sa * per, ob = rb[i].off + (size_t) sb * per;
          scratch.allocate(bctx->context, per);
-@@ -15224,6 +15359,8 @@ static void ggml_backend_opencl_get_tensors(const ggml_tensor * const * tensors,
+@@ -15003,6 +15133,8 @@ static void ggml_backend_opencl_get_tensors(const ggml_tensor * const * tensors,
      cl_command_queue queue = dev_ctx->backend_ctx->queue;
      for (int i = 0; i < n; ++i) {
          const ggml_tensor * t = tensors[i];
@@ -666,7 +638,7 @@ index 29e5e0f45..e94a2c2cc 100644
          ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) t->extra;
          CL_CHECK(clEnqueueReadBuffer(queue, extra->data_device, CL_FALSE, extra->offset + t->view_offs, ggml_nbytes(t), dsts[i], 0, NULL, NULL));
      }
-@@ -15241,6 +15378,8 @@ static void ggml_backend_opencl_get_tensors_async(const ggml_tensor * const * te
+@@ -15020,6 +15152,8 @@ static void ggml_backend_opencl_get_tensors_async(const ggml_tensor * const * te
      cl_command_queue queue = dev_ctx->backend_ctx->queue;
      for (int i = 0; i < n; ++i) {
          const ggml_tensor * t = tensors[i];
@@ -675,7 +647,7 @@ index 29e5e0f45..e94a2c2cc 100644
          ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) t->extra;
          CL_CHECK(clEnqueueReadBuffer(queue, extra->data_device, CL_FALSE, extra->offset + t->view_offs, ggml_nbytes(t), dsts[i], 0, NULL, NULL));
      }
-@@ -15302,7 +15441,8 @@ static void ggml_backend_opencl_set_tensor_slices(ggml_tensor * tensor, const vo
+@@ -15081,7 +15215,8 @@ static void ggml_backend_opencl_set_tensor_slices(ggml_tensor * tensor, const vo
              d = e->d; q = e->q;
          }
          // non-blocking: the split copies live in a ring until the queue has passed them
@@ -685,7 +657,7 @@ index 29e5e0f45..e94a2c2cc 100644
          keep.push_back(std::move(dh));
          keep.push_back(std::move(qh));
          const auto & kd = keep[keep.size() - 2];
-@@ -25710,17 +25850,17 @@ static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, c
+@@ -25484,17 +25619,17 @@ static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, c
              if (ggml_cl_kq_as_stored(src0->type)) {
                  ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *)src0->extra;
                  const cl_ulong off = e->offset + src0->view_offs;
@@ -707,32 +679,7 @@ index 29e5e0f45..e94a2c2cc 100644
              return;
          }
      }
-@@ -28774,12 +28914,12 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
-             g_kq_single_nbank = (int) bank0->ne[2];
-             // this projection's misses, copied by the previous projection's matvec
-             cl_mem read_mirror = nullptr;
--            if (g_pf.slot == src0 && g_pf.ids == ids && g_pf.mirror != nullptr) {
--                read_mirror     = g_pf.mirror;
-+            if (backend_ctx->moe_pf.slot == src0 && backend_ctx->moe_pf.ids == ids && backend_ctx->moe_pf.mirror != nullptr) {
-+                read_mirror     = backend_ctx->moe_pf.mirror;
-                 g_kq_single_ptr = nullptr;
-                 g_kq_single_q   = g_kq_single_d = read_mirror;
-             }
--            g_pf = {};
-+            backend_ctx->moe_pf = {};
-             // the next projection's, copied by this one
-             auto ic = ggml_cl_moe_prefetch_on() ? g_cache_chain.find(src0) : g_cache_chain.end();
-             if (ic != g_cache_chain.end() && backend_ctx->prealloc_kq_pf_b.buffer != nullptr) {
-@@ -28795,7 +28935,7 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
-                         g_kq_pf_src = (const char *) nctx->usm + en->offset + nb_->view_offs;
-                         g_kq_pf_dst = dstm;
-                         g_kq_pf_n16 = nb_->nb[2] / 16;
--                        g_pf = { ic->second, ids, dstm };
-+                        backend_ctx->moe_pf = { ic->second, ids, dstm };
-                     }
-                 }
-             }
-@@ -28817,7 +28957,7 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -28532,7 +28667,7 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
                      // expert two tokens route to is copied once (the pair grid spent
                      // ~650 us a projection on a 4-token step, B60, profiled)
                      cl_kernel kg = backend_ctx->kernel_moe_gather_pairs;
@@ -741,7 +688,7 @@ index 29e5e0f45..e94a2c2cc 100644
                      CL_CHECK(clSetKernelArg(kg, 1, sizeof(cl_mem),   &stage.buffer));
                      CL_CHECK(clSetKernelArg(kg, 2, sizeof(cl_ulong), &n16));
                      CL_CHECK(clSetKernelArg(kg, 3, sizeof(cl_mem),   &extra2->data_device));
-@@ -28831,7 +28971,7 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -28546,7 +28681,7 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
                      return stage.buffer;
                  }
                  cl_kernel kg = backend_ctx->kernel_moe_gather_experts;
@@ -750,7 +697,7 @@ index 29e5e0f45..e94a2c2cc 100644
                  CL_CHECK(clSetKernelArg(kg, 1, sizeof(cl_mem),   &stage.buffer));
                  CL_CHECK(clSetKernelArg(kg, 2, sizeof(cl_ulong), &n16));
                  CL_CHECK(clSetKernelArg(kg, 3, sizeof(cl_mem),   &extra2->data_device));
-@@ -28896,8 +29036,8 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -28610,8 +28745,8 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
              const cl_mem d2 = g_kq_single_d != nullptr ? g_kq_single_d : extrad->data_device;
              const int    ns = g_kq_single_q != nullptr ? g_kq_single_split : INT_MAX;
              if (g_kq_single_ptr != nullptr) {
@@ -761,32 +708,7 @@ index 29e5e0f45..e94a2c2cc 100644
              } else {
                  CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &q2));
                  CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &d2));
-@@ -28924,7 +29064,7 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
-                 }
-                 CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_pair_grp.buffer));
-                 CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_pair_ngrp.buffer));
--                g_pf = {};   // the grouped kernel copies nothing for the next projection
-+                backend_ctx->moe_pf = {};   // the grouped kernel copies nothing for the next projection
-                 const int rows_per_wg_g = backend_ctx->kq_q8_1_ndst * 4;
-                 size_t gws_g[] = { (size_t)CEIL_DIV(ne01, rows_per_wg_g) * 16, 4, (size_t)n_used * n_tok };
-                 size_t lws_g[] = { 16, 4, 1 };
-@@ -28967,13 +29107,13 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
-             CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &perm));
-             CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &pf_first));
-             if (pf && pf_first != nullptr) {
--                CL_CHECK(g_cl_set_arg_ptr(kernel, a++, g_kq_pf_src));
-+                CL_CHECK(backend_ctx->usm_set_arg_ptr(kernel, a++, g_kq_pf_src));
-                 CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &g_kq_pf_dst));
-             } else {
-                 const cl_mem none = nullptr;
-                 CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &none));
-                 CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &none));
--                if (pf) g_pf = {};   // no copy made: the next projection reads its misses where they lie
-+                if (pf) backend_ctx->moe_pf = {};   // no copy made: the next projection reads its misses where they lie
-             }
-             CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &g_kq_pf_n16));
-         }
-@@ -32592,7 +32732,7 @@ static void ggml_cl_cumsum(ggml_backend_t backend, const ggml_tensor * src0, con
+@@ -32220,7 +32355,7 @@ static void ggml_cl_cumsum(ggml_backend_t backend, const ggml_tensor * src0, con
      const cl_ulong nbt2 = net1*nbt1;
      const cl_ulong nbt3 = net2*nbt2;
  

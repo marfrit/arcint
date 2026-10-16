@@ -359,7 +359,7 @@ index 000000000..a64cca2b5
 +// quants as two arrays (ggml_cl_usm_set_tensor): the rows ggml-cpu's dot products read
 +void   ggml_cl_miss_cpu_join_iq4nl(const void * d, const void * q, int64_t i0, int64_t n, void * dst);
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index aad8e2fa6..71b8e3938 100644
+index c5cef2e78..37d747293 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -14,6 +14,7 @@
@@ -381,7 +381,7 @@ index aad8e2fa6..71b8e3938 100644
  
  #undef MIN
  #undef MAX
-@@ -783,6 +788,7 @@ struct ggml_backend_opencl_context {
+@@ -779,6 +784,7 @@ struct ggml_backend_opencl_context {
      // what the activation buffers hold, and the graph count that dates it
      ggml_cl_kq_act kq_q8, kq_f16, kq_few, kq_i8;
      uint64_t       graph_gen = 0;
@@ -389,8 +389,8 @@ index aad8e2fa6..71b8e3938 100644
      ggml_cl_buffer prealloc_kq_xh;     // f16 activation of the K-quant GEMMs
      ggml_cl_buffer prealloc_kq2_xq;    // the int8 2D GEMM's activations [token][K] (kernel_quant_i8)
      ggml_cl_buffer prealloc_kq2_xd;    // their scales per 256 [K / 256][tokens padded]
-@@ -15344,6 +15350,511 @@ static void ggml_backend_opencl_chain_prefetch(const ggml_tensor * a, const ggml
-     g_cache_chain[a] = b;
+@@ -15121,6 +15127,511 @@ static void ggml_backend_opencl_pair_bank(const ggml_tensor * slot, const ggml_t
+     g_cache_pairs[slot] = { bank, n_split };
  }
  
 +// patch 0056: an expert cache's missed experts computed on the CPU, Strata's
@@ -901,9 +901,9 @@ index aad8e2fa6..71b8e3938 100644
  // an expert cache's gather mirror, allocated at load (not inside a request)
  static void ggml_backend_opencl_reserve_gather(ggml_backend_dev_t dev, size_t q, size_t d) {
      ggml_backend_opencl_context * ctx = ((ggml_backend_opencl_device_context *) dev->context)->backend_ctx;
-@@ -15382,6 +15893,9 @@ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, c
-     if (strcmp(name, "ggml_backend_opencl_chain_prefetch") == 0) {
-         return (void *) ggml_backend_opencl_chain_prefetch;
+@@ -15155,6 +15666,9 @@ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, c
+     if (strcmp(name, "ggml_backend_opencl_reserve_gather") == 0) {
+         return (void *) ggml_backend_opencl_reserve_gather;
      }
 +    if (strcmp(name, "ggml_backend_opencl_miss_layer") == 0) {
 +        return (void *) ggml_backend_opencl_miss_layer;
@@ -911,19 +911,19 @@ index aad8e2fa6..71b8e3938 100644
      if (strcmp(name, "ggml_backend_opencl_pair_bank") == 0) {
          return (void *) ggml_backend_opencl_pair_bank;
      }
-@@ -30028,6 +30542,11 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -29769,6 +30283,11 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
      GGML_ASSERT(ne12 == n_tok && src1->ne[3] == 1 && src0->ne[3] == 1);
      GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ne00 % ggml_cl_kq_k_unit(src0->type) == 0 &&
                  src0->view_offs == 0);
 +    // patch 0056: a decode layer's misses to the CPU, published before its first projection
 +    // (the per-pair matvec only: it writes zeros for the -1 pairs the publish hands over)
-+    if (!gemm && !idg && !grouped && cache_src && !g_miss_by_slot.empty()) {
++    if (!gemm && cache_src && !g_miss_by_slot.empty()) {
 +        ggml_cl_miss_publish(backend_ctx, src0, src1, ids, n_tok, n_used);
 +    }
  
      ggml_tensor_extra_cl * extra2 = (ggml_tensor_extra_cl *)ids->extra;
      ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-@@ -30500,6 +31019,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
+@@ -30119,6 +30638,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
  
  #ifdef GGML_OPENCL_SOA_Q
      if (ggml_cl_mul_mat_id_kq(backend_ctx, src0, src1, src2, dst)) {
@@ -934,7 +934,7 @@ index aad8e2fa6..71b8e3938 100644
      }
  #endif
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
-index 93eac4e5e..2b1b89e72 100644
+index 7fee63712..c89581cbd 100644
 --- a/src/llama-expert-cache.cpp
 +++ b/src/llama-expert-cache.cpp
 @@ -3,6 +3,7 @@
@@ -945,7 +945,7 @@ index 93eac4e5e..2b1b89e72 100644
  
  #include <algorithm>
  #include <cerrno>
-@@ -519,6 +520,35 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+@@ -511,6 +512,35 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
              }
          }
      }
@@ -978,9 +978,9 @@ index 93eac4e5e..2b1b89e72 100644
 +        }
 +        LLAMA_LOG_INFO("%s: the misses of %d of %zu layers on the CPU (%d threads)\n", __func__, n_reg, layers.size(), n_th);
 +    }
-     // gate -> up -> down: each projection's decode matvec copies the next one's
-     // missed experts (the same routed ids) into a card-side mirror
-     if (chain_prefetch) {
+ 
+     // fill: each tensor whole (a converted layout is set up by its first write)
+     const int64_t t_fill = ggml_time_us();
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
 index 991bf5479..83122f68e 100644
 --- a/tests/CMakeLists.txt

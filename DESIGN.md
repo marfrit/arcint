@@ -1,7 +1,7 @@
 # arcint — Design
 
-State as of 2026-10-15: arcint **0.8.0** on llama.cpp **`3e4dfa8`** with the
-patch series `contrib/llama.cpp/patches` 0001-0056. One engine: libllama with
+State as of 2026-10-16: arcint **0.8.1** on llama.cpp **`3e4dfa8`** with the
+patch series `contrib/llama.cpp/patches` 0001-0056 (54 patches). One engine: libllama with
 ggml's OpenCL backend and arcint's Intel kernels. Three services run in
 production on two Intel Arc cards: the dense Qwen3.8-27B agent and
 Qwen3.8-Flash-Next (125B-A6B, on demand) on the 24 GB Arc Pro B60, the MoE
@@ -186,7 +186,8 @@ The cards (`measured-here` unless marked):
 
 ### 3.2 Kernels: the patch series
 
-`contrib/llama.cpp/patches` holds 56 patches against the pin, each with its
+`contrib/llama.cpp/patches` holds 54 patches against the pin (0001-0056; 0031
+and 0055 dropped in 0.8.1), each with its
 measurement, KL, red case and review in `contrib/llama.cpp/README.md`
 (`measured-here` throughout). By what they change:
 
@@ -197,9 +198,9 @@ measurement, KL, red case and review in `contrib/llama.cpp/README.md`
 | gated delta-net | 0003, 0050, 0051 | the GDN kernel, rollback snapshots written into the recurrent cache, gating in the kernel |
 | attention | 0007, 0008, 0015-0020, 0028, 0037-0041, 0045, 0048 | split decode attention, XMX prompt attention, quantized KV (q8_0, q8_0:q4_0), GQA verify attention, head size 128, the key split by wave |
 | MoE | 0006, 0033, 0043 | tokens as the DPAS A operand, the B60 tile, the cache's GEMM threshold |
-| expert cache | 0021, 0024, 0042, 0046, 0055, 0056 | VRAM slots and a USM bank, per device, non-blocking admission on its own queue, Infernix's LFRU (opt-in), the misses on the CPU |
+| expert cache | 0021, 0024, 0042, 0046, 0056 | VRAM slots and a USM bank, per device, non-blocking admission on its own queue, the misses on the CPU |
 | prefill bank stream | 0032, 0044 | each bank tensor copied whole into a VRAM ring ahead of its GEMM, from 256 tokens |
-| decode launches and inputs | 0004, 0005, 0027, 0031, 0047, 0049 | small ops, few-row F32, fewer launches, inputs staged in a USM ring with one wait a split |
+| decode launches and inputs | 0004, 0005, 0027, 0047, 0049 | small ops, few-row F32, fewer launches, inputs staged in a USM ring with one wait a split |
 | lanes and devices | 0023, 0025, 0026, 0029 | one OpenCL context per platform, a KV cell window per lane, per-sequence attention windows |
 | graph and buffers | 0010, 0036, 0052 | MTP masked rows, Q8_0 GET_ROWS, compute buffers reserved for N cells |
 
@@ -351,7 +352,7 @@ host memory and the **expert cache** (0021, after Strata) serves them:
 | slots | the hot experts in VRAM, sized in bytes (`--llama-expert-cache MIB`), filled in the profile's rank order | 0021, 0024 (one cache per card) | `measured-here` |
 | bank | every other expert in USM host memory the card reads by pointer: a decode miss is read over the link in place, as Strata's kernels read its pinned mirror | 0021 | `measured-here` |
 | adapt | swaps from decayed usage counts on Strata's constants (`LLAMA_EXPERT_CACHE_{ADAPT_EVERY,MAX_SWAPS,MIN_GAIN,MIN_USAGE,DECAY}`), on their own queue right behind a graph, the victim to a spare bank entry (non-blocking admission) | 0042, 0046 | `measured-here` (verify input copies 2.6-6.0 -> 0.94 ms) |
-| policy | Strata's rule by default; Infernix's LFRU opt-in (`LLAMA_EXPERT_CACHE_POLICY=lfru`): +1.6 % on the gate set, -2.1 % on six other prompts, not a general gain | 0055 | `measured-here` |
+| policy | Strata's rule. Infernix's LFRU was built as 0055 and measured +1.6 % on the gate set, -2.1 % on six other prompts, not a general gain; dropped in 0.8.1 (operator, 2026-10-16) | — | `measured-here` |
 | CPU misses | up to 16 missed (token, expert) pairs of a decode layer computed on the CPU from the bank with Strata's multi-token AVX2 rows while the card computes the hits and reads the other misses (`LLAMA_EXPERT_CACHE_CPU_MISSES=1`, 8 threads) | 0056 | `measured-here` (decode +15.2 % on six answers, KL +0.0028) |
 | prefill | the bank stream: from 256 tokens a ubatch each bank tensor is copied whole on a copy queue into a VRAM ring ahead of its GEMM (`GGML_OPENCL_BANK_STREAM=1`); below, a GEMM gathers its routed bank experts; below 64 tokens the cache's matvec path | 0032, 0043, 0044 | `measured-here` (the 20k needle 408 -> 645 t/s in 0.7.3; 690 in 0.7.12) |
 | n-gram table | the 27 GiB embedding table read lazily (`MADV_RANDOM`, a graph's rows prefetched together) | arcint, 0.7.5 | `measured-here` (2.0-7.7 -> 0.3-0.6 ms a verify) |
@@ -458,10 +459,16 @@ reported, not a veto.
   (`llama-perplexity -lm mmap --no-repack`, `-ub 4` where the expert cache
   is on; the batch must exercise the changed path), baseline arm and
   candidate on the same card and window.
-- **Performance floors**: per service, the last release's pre-tag served
-  numbers minus their run-to-run spread (`decision`, operator, 2026-10-15).
-  The `*-served` cells carry 0.8.0's (§7.1): two processes a service, the
-  floor the lower run minus their spread, which back to back was 0.0-0.4 %.
+- **Speed against the last release** (`decision`, operator, 2026-10-16):
+  the release candidate and the last release's binary served alternately in
+  one window (old/new/old/new, the units' flags); the candidate may not be
+  slower beyond that window's spread. Until 0.8.1 the gate was an absolute
+  floor per service (the last pre-tag numbers minus a two-run spread of
+  0.0-0.4 %); 0.8.1's pre-tag check showed the dev host drifting more than
+  that in a day (0.8.0's own binary 0.3 % below its prefill floors and 1 %
+  below its decode floors the afternoon after a cold start, `measured-here`),
+  so the floors in the `*-served` cells (0.8.1's numbers, §7.1) are now a
+  report, not a veto.
 - **Equivalence suite** (`tests/equivalence/run.sh`, on a card, `--engine
   llama --gguf`): two greedy runs, a lane's reused prefix against a fresh
   process (warm against cold), a checkpoint resume against a full
@@ -490,7 +497,7 @@ reported, not a veto.
 |---|---|---|---|
 | Unit tests | every commit | seconds to minutes | `ctest -L unit` in the stub build; the op suites and red case of any patch that changes |
 | Milestone gates | once per increment | one card window | KL as served, the op suites, and the served check of the service the change touches, one process per configuration |
-| Acceptance | once per release, before the tag | about an hour per card | <!-- BEGIN GENERATED by tools/acceptance_manifest.py; verify with its check mode -->`agent-equivalence` gates the answers right in every arm: two greedy runs, a lane's reused prefix against a fresh process, a checkpoint resume against a full re-prefill, MTP on against off, one lane against two (reports byte equality of each pair (tripwire, §3.4 point 5)); `coder-equivalence` gates the answers right in every arm: two greedy runs, a lane's reused prefix against a fresh process, a checkpoint resume against a full re-prefill, MTP on against off, one lane against two (reports byte equality of each pair (tripwire, §3.4 point 5)); `agent-concurrency` gates no cross-lane bleed in both start orders, both lanes used, the 404 for an unknown lane name, cancellation, the 503 with the lane's numbers after the queue timeout (references: not yet filled); `coder-concurrency` gates no cross-lane bleed in both start orders, both lanes used, the 404 for an unknown lane name, cancellation, the 503 with the lane's numbers after the queue timeout (references: not yet filled); `agent-served` gates Paris and the needle right; prefill at both depths at or above the release floor (the last release's pre-tag number minus its run-to-run spread, §5) (reports peak VRAM and GTT) (references: prefill-55k 695.2 t/s (gate lower-is-worse at 694.9 t/s); prefill-138k 491.75 t/s (gate lower-is-worse at 491.3 t/s)); `coder-served` gates Paris and the needle right; decode on each answer at or above the release floor (§5) (reports peak VRAM and GTT) (references: decode-a 51.1 t/s (gate lower-is-worse at 51.1 t/s); decode-b 47.5 t/s (gate lower-is-worse at 47.5 t/s); decode-c 44.05 t/s (gate lower-is-worse at 43.9 t/s); prefill-41k 725.45 t/s (gate lower-is-worse at 725.3 t/s)); `flashnext-served` gates Paris and the needle right; prefill at 20k and decode at or above the release floor (§5) (reports peak VRAM and GTT) (references: prefill-20k 595.1 t/s (gate lower-is-worse at 594.8 t/s); decode 35.05 t/s (gate lower-is-worse at 33.4 t/s)); `sanitizers` gates zero sanitizer reports (reports the stub build (no card): unit, roundtrip, stress); `package-build` gates the package build succeeds, is version-stamped, and its ggml-cpu is native (AVX2); a post-deploy smoke run and a fresh container follow the install, outside this cell; `pruefstand` gates at least 9/10 on the coder through the deployed package (10/10 the target, §5) (references: score 9 points (gate lower-is-worse at 9 points)); `pruefstand-agent` gates at least 9/10 on the agent through the deployed package (10/10 the target, §5) (references: score 10 points (gate lower-is-worse at 9 points)) <!-- END GENERATED by tools/acceptance_manifest.py --> |
+| Acceptance | once per release, before the tag | about an hour per card | <!-- BEGIN GENERATED by tools/acceptance_manifest.py; verify with its check mode -->`agent-equivalence` gates the answers right in every arm: two greedy runs, a lane's reused prefix against a fresh process, a checkpoint resume against a full re-prefill, MTP on against off, one lane against two (reports byte equality of each pair (tripwire, §3.4 point 5)); `coder-equivalence` gates the answers right in every arm: two greedy runs, a lane's reused prefix against a fresh process, a checkpoint resume against a full re-prefill, MTP on against off, one lane against two (reports byte equality of each pair (tripwire, §3.4 point 5)); `agent-concurrency` gates no cross-lane bleed in both start orders, both lanes used, the 404 for an unknown lane name, cancellation, the 503 with the lane's numbers after the queue timeout (references: not yet filled); `coder-concurrency` gates no cross-lane bleed in both start orders, both lanes used, the 404 for an unknown lane name, cancellation, the 503 with the lane's numbers after the queue timeout (references: not yet filled); `agent-served` gates Paris and the needle right; prefill at both depths reported against the release floor (the last pre-tag numbers; the speed gate is the same-window A/B against the last release, §5) (reports peak VRAM and GTT) (references: prefill-55k 694.3 t/s (gate lower-is-worse at 694.3 t/s); prefill-138k 490.85 t/s (gate lower-is-worse at 490.7 t/s)); `coder-served` gates Paris and the needle right; decode on each answer reported against the release floor (the speed gate is the same-window A/B, §5) (reports peak VRAM and GTT) (references: decode-a 50.6 t/s (gate lower-is-worse at 50.6 t/s); decode-b 47.2 t/s (gate lower-is-worse at 47.2 t/s); decode-c 43.75 t/s (gate lower-is-worse at 43.6 t/s); prefill-41k 724.6 t/s (gate lower-is-worse at 724.3 t/s)); `flashnext-served` gates Paris and the needle right; prefill at 20k and decode reported against the release floor (the speed gate is the same-window A/B, §5) (reports peak VRAM and GTT) (references: prefill-20k 594.1 t/s (gate lower-is-worse at 594.1 t/s); decode 34.75 t/s (gate lower-is-worse at 34.6 t/s)); `sanitizers` gates zero sanitizer reports (reports the stub build (no card): unit, roundtrip, stress); `package-build` gates the package build succeeds, is version-stamped, and its ggml-cpu is native (AVX2); a post-deploy smoke run and a fresh container follow the install, outside this cell; `pruefstand` gates at least 9/10 on the coder through the deployed package (10/10 the target, §5) (references: score 9 points (gate lower-is-worse at 9 points)); `pruefstand-agent` gates at least 9/10 on the agent through the deployed package (10/10 the target, §5) (references: score 10 points (gate lower-is-worse at 9 points)) <!-- END GENERATED by tools/acceptance_manifest.py --> |
 
 The release procedure around it (pre-tag served check, second-model review,
 the package built and checked, a fresh container) is
@@ -574,25 +581,29 @@ GGUF repack) is at the tag `openvino-history`.
 | 0.6.0-0.6.x | Flash-Next on the libllama engine: the expert cache, the IQ kernels, its MTP layer | done |
 | 0.7.0-0.7.12 | named lanes and the step combiner, two cards by layers, the bank stream, decode launches, GDN snapshots, the CPU misses, the pin moved to `3e4dfa8` | done; 0.7.12 released 2026-10-15 |
 | 0.8.0 | the OpenVINO engine and `marfrit-openvino` retired; this document; the suites on the libllama engine; IQ3_XXS as a Flash-Next option | released 2026-10-15 |
-| 1.0.0 | feature complete, almost no gains by obvious changes | charter `docs/milestone-1.0.0.md` |
+| 0.8.1 | the llama.cpp series' opt-in alternatives removed (0031, 0055 dropped); the pin move's red cases and KL arms (C3) | released 2026-10-16 |
+| 1.0.0 | feature complete, almost no gains by obvious changes; DFlash2 on the agent | charter `docs/milestone-1.0.0.md` |
 
 Every open lever or defect is a campaign in `docs/campaigns/`.
 
 ### 7.1 Current numbers
 
-0.8.0's pre-tag check: the release package, the units' flags, the served
+0.8.1's pre-tag check: the release package, the units' flags, the served
 check of each service (`tests/acceptance/cells/served_check.py`) in two fresh
-processes, the model on the NVMe, `measured-here`, 2026-10-15. Decode is a
-300-token answer; prefill excludes nothing (cold lanes). Flash-Next asks the
-needle right after the capital, with fewer warm-up requests than 0.7.12's
-check had (690.3 t/s and 43.4 there); the 0.8.0 dev build under that older
-order decoded the same answer at 43.4.
+processes, the model on the NVMe, `measured-here`, 2026-10-16 (the IQ2_XS
+row: 0.8.0's, 2026-10-15). Decode is a 300-token answer; prefill excludes
+nothing (cold lanes). Flash-Next asks the needle right after the capital.
+The deployed 0.8.0 binary, alternated with the 0.8.1 package and a dev
+build of the same series in one window, measured the same within 0.2 %
+(agent 694.5 / 693.4 against 693.8 at 55k; coder 50.7 / 47.0-47.2 / 43.5-43.7
+against 50.7-50.8 / 47.1-47.2 / 43.7-43.8): the 0.1-1 % below 0.8.0's own
+pre-tag numbers is the dev host's drift over a day, not the release (§5).
 
 | service | card | configuration | prefill | decode | answers |
 |---|---|---|---|---|---|
-| agent | B60 | Q4_K_M, 245,760 ctx, q8_0:q4_0 KV, MTP 5 | 695.3 / 695.1 t/s at 54,895 tokens, 491.9 / 491.6 at 138,028 | not in the pre-tag check | Paris, the needle at 138k, the task 10/10 |
-| coder | A770 | `c5f495ac-shq8`, 98,304 ctx, q8_0:q4_0 KV, MTP 4 | 725.5 / 725.4 t/s at 40,841 tokens | 51.1 / 47.5 / 44.0-44.1 t/s on three answers | Paris, the needle, the task 9/10 |
-| Flash-Next | B60 + host | IQ3_XXS, 131,072 ctx, q8_0 KV, 12,000 MiB of slots (7,208 slots), bank 28.72 GiB, MTP 3 with min-p 0.5, Q4_K draft head, the bank stream, the CPU misses | 595.2 / 595.0 t/s at 20,045 tokens | 35.6 / 34.5 t/s | Paris, the needle |
+| agent | B60 | Q4_K_M, 245,760 ctx, q8_0:q4_0 KV, MTP 5 | 694.3 / 694.3 t/s at 54,895 tokens, 490.8 / 490.9 at 138,028 | not in the pre-tag check | Paris, the needle at 138k, the task 10/10 |
+| coder | A770 | `c5f495ac-shq8`, 98,304 ctx, q8_0:q4_0 KV, MTP 4 | 724.5 / 724.7 t/s at 40,841 tokens | 50.6 / 47.2 / 43.7-43.8 t/s on three answers | Paris, the needle, the task 9/10 |
+| Flash-Next | B60 + host | IQ3_XXS, 131,072 ctx, q8_0 KV, 12,000 MiB of slots (7,208 slots), bank 28.72 GiB, MTP 3 with min-p 0.5, Q4_K draft head, the bank stream, the CPU misses | 594.1 / 594.1 t/s at 20,045 tokens | 34.8 / 34.7 t/s | Paris, the needle |
 | Flash-Next, IQ2_XS option | B60 + host | IQ2_XS, 13,400 MiB of slots (9,724), bank 20.32 GiB, the rest as above | 665.8 / 665.4 t/s | 42.2 / 42.3 t/s | Paris, the needle |
 
 The agent's decode in the same release: 36.6 / 32.3 / 19.3 t/s at 4k / 29k /
@@ -622,7 +633,7 @@ on the same endpoint (`decision`, operator, 2026-10-15; `docs/llama-engine.md`,
 
 | GGUF | KL / top-1 against unsloth's Q8_0 on the CPU (16 x 512) | host bank | state |
 |---|---|---|---|
-| ISTA-DASLab IQ2_XS | 0.294 / 87.1 % | 20.32 GiB at 13,400 MiB of slots | on-demand unit `arcint-flashnext-iq2xs`, the faster option: 665.6 t/s at the 20k needle, 42.3 t/s |
+| ISTA-DASLab IQ2_XS | 0.294 / 87.1 % | 20.32 GiB at 13,400 MiB of slots | the faster option, from the Flash-Next unit with its own `--gguf` and slot budget: 665.6 t/s at the 20k needle, 42.3 t/s |
 | ISTA-DASLab IQ3_XXS | 0.218 / 89.7 % (served) | 28.72 GiB at 12,000 MiB of slots | the default (`arcint-flashnext`): 595.1 t/s at the 20k needle, 34.5-35.6 t/s on the hash-table answer (0.8.0), 30.6-37.5 t/s on six answers with the CPU misses; their KL cost +0.0044 nats against the misses off on the served reference capture (8 x 512, ubatch 4: 0.2910 / 0.2866), a different window from this column's (`measured-here`, 2026-10-15) |
 | unsloth UD-Q3_K_XL | 0.100 / 93.3 % | ~39 GiB | inside the bar; needs the planned 96 GB host |
 
@@ -641,18 +652,27 @@ CPU misses made it cost 7.7 %.
 
 Each item names the reference to follow and the measured starting point.
 
-### 8.1 The soak (charter C2)
+### 8.1 The soak (charter C2): dropped
+
+Not a 1.0 criterion (operator, 2026-10-16). What a soak would have tested:
 
 Several days of the three services under real use on both cards, logged:
 no wedge, no eviction, no restart. The record has the B60's wedge after a
 long idle, xe eviction at thin VRAM margins and copy-engine resets, each
 recovered, none soaked.
 
-### 8.2 Owed from the pin move to `3e4dfa8`
+The operator's reason: a week of the dev host for a test of rare events.
+What a soak would find comes from time and request count, not chance, and
+can be checked in hours (optional, not a gate): a few thousand requests in
+a loop with the process's RSS, VRAM and GTT sampled for drift; a long idle
+followed by a request (the B60's wedge); the same on Flash-Next after a
+unit switch.
 
-The patches' own red cases and the four-sequence KL arms on the new base
-(`contrib/llama.cpp/README.md`, "Moving the pin", step 3). Upstream's open
-work that meets the series (`docs/campaigns/research-upstream-llama-2026-10.md` (on the `qfndev` branch)):
+### 8.2 Upstream work that meets the series
+
+The pin move's step 3 (every patch's red case and the KL arms on the new
+base) was done in 0.8.1 (`contrib/llama.cpp/README.md`, "Moving the pin").
+Upstream's open work that meets the series (`docs/campaigns/research-upstream-llama-2026-10.md` (on the `qfndev` branch)):
 the OpenCL backend split into per-op files (#29354, the natural shape for
 upstreaming), #30345 (supersedes 0010), #26631 (MUL_MAT_ID id -1), #30539
 (OpenCL declining tensors above the device's largest allocation: check
@@ -660,8 +680,8 @@ before a move past it).
 
 ### 8.3 Flash-Next's quant options
 
-- **IQ3_XXS**: served as an option since 0.8.0 (§7.2). Its 18 IQ4_NL down
-  projections made the CPU misses fault before (the slow path read the
+- **IQ3_XXS**: the default since 2026-10-15 (§7.2). Its 18 IQ4_NL down
+  projections made the CPU misses fault before 0.8.0 (the slow path read the
   split IQ4_NL bank as GGUF blocks; fixed in 0056, `measured-here`). Owed:
   its slot budget searched finer than the two points measured (12,000 MiB
   serves, 13,400 thrashed).

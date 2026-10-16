@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 316867248..0f399e7ea 100644
+index 45bb77a02..380acd221 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -713,6 +713,8 @@ struct ggml_backend_opencl_context {
+@@ -709,6 +709,8 @@ struct ggml_backend_opencl_context {
      bool disable_fusion;
      bool fuse_mm_glu = true;                     // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
      bool fuse_rms_add = true;                    // opt-out GGML_OPENCL_FUSE_RMS_ADD=0 (fused rms_norm*w + residual)
@@ -11,7 +11,7 @@ index 316867248..0f399e7ea 100644
      bool f16_mrow = true;                        // opt-out GGML_OPENCL_F16_MROW=0 (multi-row-per-WG f16 decode GEMV for attn proj + lm_head)
      int  f16_mrow_rpt = 1;                       // GGML_OPENCL_F16_MROW_RPT={1,2,4,8,16} rows-per-subgroup register blocking
  
-@@ -1191,6 +1193,7 @@ struct ggml_backend_opencl_context {
+@@ -1174,6 +1176,7 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_conv_2d_f32;
      cl_kernel kernel_conv_2d_f16_f32;
      cl_kernel kernel_ssm_conv_f32_f32, kernel_ssm_conv_f32_f32_4;
@@ -19,7 +19,7 @@ index 316867248..0f399e7ea 100644
      // [size_idx][kda][tgpp] where size_idx: 0=S_V=16, 1=32, 2=64, 3=128; kda: 0 or 1.
      // tgpp 0 = TG variant (COLS_PER_LANE_GROUP=1), tgpp 1 = prefill variant (COLS_PER_LANE_GROUP=4).
      cl_kernel kernel_gated_delta_net_f32[4][2][2] = {};
-@@ -3836,6 +3839,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -3800,6 +3803,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
  
          CL_CHECK((backend_ctx->kernel_sigmoid_f32 = clCreateKernel(backend_ctx->program_sigmoid, "kernel_sigmoid_f32", &err), err));
          CL_CHECK((backend_ctx->kernel_sigmoid_f16 = clCreateKernel(backend_ctx->program_sigmoid, "kernel_sigmoid_f16", &err), err));
@@ -28,19 +28,17 @@ index 316867248..0f399e7ea 100644
          GGML_LOG_CONT(".");
      }
  
-@@ -8261,6 +8266,11 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
+@@ -8225,6 +8230,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
      if (const char * env = getenv("GGML_OPENCL_FUSE_RMS_ADD")) {
          backend_ctx->fuse_rms_add = atoi(env) != 0;
      }
 +    if (const char * env = getenv("GGML_OPENCL_FUSE_0049")) {
 +        backend_ctx->fuse_0049 = atoi(env);
-+    } else if (const char * env2 = getenv("GGML_OPENCL_FUSE_RMS_SCALE")) {   // the gate's first switch: 0 = all off
-+        backend_ctx->fuse_0049 = atoi(env2) != 0 ? 7 : 0;
 +    }
      if (const char * env = getenv("GGML_OPENCL_F16_MROW")) {
          backend_ctx->f16_mrow = atoi(env) != 0;
      }
-@@ -9433,6 +9443,11 @@ inline bool use_q4k_tiled(const ggml_backend_opencl_context *backend_ctx, const
+@@ -9397,6 +9405,11 @@ inline bool use_q4k_tiled(const ggml_backend_opencl_context *backend_ctx, const
  inline bool use_q4_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);
  inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);   // defined below
  
@@ -52,7 +50,7 @@ index 316867248..0f399e7ea 100644
  static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
  
      // glu(mul_mat(Wg,x), mul_mat(Wu,x)) — the FFN gate/up GEMVs + GLU. This is a
-@@ -10225,6 +10240,69 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+@@ -10009,6 +10022,67 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
              i++;
              continue;
          }
@@ -88,8 +86,7 @@ index 316867248..0f399e7ea 100644
 +            }
 +        }
 +        // ssm_conv + silu, as llama.cpp CUDA fuses it (ggml-cuda.cu, {SSM_CONV,
-+        // UNARY} with SILU): the activation in the conv's store (patch 0049;
-+        // GGML_OPENCL_FUSE_RMS_SCALE=0 turns this one off too)
++        // UNARY} with SILU): the activation in the conv's store (patch 0049)
 +        if (!backend_ctx->disable_fusion && (backend_ctx->fuse_0049 & 2) && node->op == GGML_OP_SSM_CONV &&
 +            i + 1 < cgraph->n_nodes && cgraph->nodes[i+1]->op == GGML_OP_UNARY &&
 +            ggml_get_unary_op(cgraph->nodes[i+1]) == GGML_UNARY_OP_SILU &&
@@ -103,8 +100,7 @@ index 316867248..0f399e7ea 100644
 +            }
 +        }
 +        // rms_norm + scale (bias 0), as llama.cpp CUDA fuses it (ggml-cuda.cu,
-+        // {RMS_NORM, SCALE}): the scale applied by the norm's kernel (patch 0049;
-+        // GGML_OPENCL_FUSE_RMS_SCALE=0: off)
++        // {RMS_NORM, SCALE}): the scale applied by the norm's kernel (patch 0049)
 +        if (!backend_ctx->disable_fusion && (backend_ctx->fuse_0049 & 1) &&
 +            ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE })) {
 +            ggml_tensor * sc = cgraph->nodes[i+1];
@@ -122,7 +118,7 @@ index 316867248..0f399e7ea 100644
          // Fuse mul_mat(Wg,x) + mul_mat(Wu,x) + glu — fold the FFN's two decode
          // GEMVs and the GLU into one dispatch. q4_K only (guarded below); the
          // fused kernel uses the same accumulation/reduction order and the same
-@@ -17020,7 +17098,16 @@ static void ggml_cl_ssm_scan(ggml_backend_t backend, ggml_tensor * dst) {
+@@ -16797,7 +16871,16 @@ static void ggml_cl_ssm_scan(ggml_backend_t backend, ggml_tensor * dst) {
      backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
  }
  
@@ -139,7 +135,7 @@ index 316867248..0f399e7ea 100644
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
      GGML_ASSERT(src1);
-@@ -17032,11 +17119,11 @@ static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, c
+@@ -16809,11 +16892,11 @@ static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, c
  
      ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
      ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
@@ -153,7 +149,7 @@ index 316867248..0f399e7ea 100644
  
      int ne01 = src0->ne[1];
      cl_ulong nb00 = src0->nb[0];
-@@ -17072,6 +17159,7 @@ static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, c
+@@ -16849,6 +16932,7 @@ static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, c
      CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb0));
      CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb1));
      CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &nb2));
@@ -161,7 +157,7 @@ index 316867248..0f399e7ea 100644
  
      size_t global_work_size[] = {(size_t)ne01, (size_t)ne1, (size_t)ne2};
      size_t local_work_size[]  = {64, 1, 1};
-@@ -17081,7 +17169,7 @@ static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, c
+@@ -16858,7 +16942,7 @@ static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, c
          local_work_size_ptr = nullptr;
      }
  
@@ -170,7 +166,7 @@ index 316867248..0f399e7ea 100644
  }
  
  static void ggml_cl_gelu(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-@@ -17532,13 +17620,19 @@ static void ggml_cl_norm(ggml_backend_t backend, const ggml_tensor * src0, const
+@@ -17309,13 +17393,19 @@ static void ggml_cl_norm(ggml_backend_t backend, const ggml_tensor * src0, const
      backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
  }
  
@@ -193,7 +189,7 @@ index 316867248..0f399e7ea 100644
  
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
  
-@@ -17546,10 +17640,10 @@ static void ggml_cl_rms_norm(ggml_backend_t backend, const ggml_tensor * src0, c
+@@ -17323,10 +17413,10 @@ static void ggml_cl_rms_norm(ggml_backend_t backend, const ggml_tensor * src0, c
      //    (ggml_backend_opencl_device_context *)backend->device->context;
  
      ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
@@ -206,7 +202,7 @@ index 316867248..0f399e7ea 100644
  
      float eps;
      memcpy(&eps, dst->op_params, sizeof(float));
-@@ -17603,8 +17697,11 @@ static void ggml_cl_rms_norm(ggml_backend_t backend, const ggml_tensor * src0, c
+@@ -17380,8 +17470,11 @@ static void ggml_cl_rms_norm(ggml_backend_t backend, const ggml_tensor * src0, c
      CL_CHECK(clSetKernelArg(kernel, 11, sizeof(float),     &eps));
      // This is local memory - the size depends on subgroup size.
      CL_CHECK(clSetKernelArg(kernel, 12, sizeof(float)*nth/sgs,  NULL));

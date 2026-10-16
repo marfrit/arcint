@@ -1,20 +1,32 @@
 # Switches
 
-Draft for charter item A7 (`docs/milestone-1.0.0.md`): every switch that 1.0
-keeps is documented, and diagnostic and red-case switches are named as such.
+Charter item A7 (`docs/milestone-1.0.0.md`, met 2026-10-16): every switch that
+1.0 keeps is documented, and diagnostic and red-case switches are named as such.
 
-This is a proposal. The operator decides which switches stay stable within
-1.x (charter C4). Until then nothing here is a promise.
+The promise (charter C4, operator 2026-10-16): the **operational** switches
+are stable within 1.x, like the HTTP surface and the command-line flags.
+Tuning, off-switch, red-case and diagnostic switches are for measuring and
+may change or go without notice.
 
 A switch here is an environment variable read by arcint, by one of its tools,
-or by the llama.cpp patch series in `contrib/llama.cpp/patches` (0001-0056).
+or by the llama.cpp patch series in `contrib/llama.cpp/patches` (0001-0056,
+without 0031 and 0055).
 Each switch is in exactly one class:
 
 - **operational**: changes how a service runs; a unit file may set it.
 - **tuning**: a shape or threshold whose default was measured. Override it to
   measure.
-- **opt-in alternative**: a mechanism left off because it measured slower or
-  neutral.
+- **opt-in alternative**: none left. The eight that measured slower or
+  neutral were removed from the series in 0.8.1 (operator, 2026-10-16),
+  with their red-case and debug switches: the hyper-connection read fused
+  (`FUSE_HC_MIX`, `HC_MIX_RED`, `HC_MIX_DEBUG`), the K-split F16 matvec
+  (`F16_KSPLIT4`), the per-pair gather grid for a few tokens
+  (`GATHER_PAIRS_MULTI`), the two grouped MoE matvecs (`KQ_GROUPED`,
+  `KQ_IDG`), one int8 activation term (`KQ_ONE_TERM`), the bank prefetch
+  (`MOE_PREFETCH`) and Infernix's LFRU cache policy
+  (`LLAMA_EXPERT_CACHE_POLICY`, `_LFRU_BUDGET`, `_LFRU_EXACT`; patch 0055
+  dropped whole); also `FUSE_RMS_SCALE`, an alias of `FUSE_0049`. They are
+  in 0.8.0's patches.
 - **off switch**: turns a default-on mechanism off, to compare or to fall back.
 - **red case**: breaks something on purpose, to prove a test can fail.
 - **diagnostic**: logging, timing, profiling, debug dumps.
@@ -26,7 +38,12 @@ determined. "—" means no number recorded. Numbers are as the patch README
 states them. Unless said otherwise, the boolean switches read `atoi(value)`:
 `0` is off, anything else is on.
 
-One name is not in a table:
+Four names are not in a table:
+
+- `LLAMA_PPL_SEQ_WINDOWS`, `LLAMA_PPL_PER_SEQ`, `LLAMA_PPL_SEQ_FLIP` (0026)
+  are test hooks of `llama-perplexity`, not of the library: a KV window per
+  sequence, each sequence decoded on its own, the sequences' order flipped.
+  They shape the KL arms of 0026 and 0029 (`contrib/llama.cpp/README.md`).
 
 - `GGML_GALLOC_TOP` is a debug commit on the llama.cpp checkout, not in the
   series. It lists the N largest tensors of a reservation (N up to 64). If it
@@ -83,22 +100,7 @@ One name is not in a table:
 | `LLAMA_EXPERT_CACHE_MAX_SWAPS` | 96 | Largest swaps a plan makes; 0 is the discriminator in the swap-queue measurement. | 0022 | Same. |
 | `LLAMA_EXPERT_CACHE_MIN_GAIN` | 1.5 | Least gain for a swap. | 0022 | Same. |
 | `LLAMA_EXPERT_CACHE_MIN_USAGE` | 2.0 | Least usage for a swap. | 0022 | Same. |
-| `LLAMA_EXPERT_CACHE_POLICY` | Strata's adapt | `lfru`: Infernix's LFRU per layer (README 0055). Opt-in alternative. | 0055 | Flash-Next decode +1.6 % on the gate set, -2.1 % on six other prompts (`measured-here`). |
-| `LLAMA_EXPERT_CACHE_LFRU_BUDGET` | 4 | Admissions a layer an adapt under `lfru`; a value that does not parse is 0. | 0055 | 4 and 8 alike, 1 lower (`measured-here`). |
-| `LLAMA_EXPERT_CACHE_LFRU_EXACT` | off | Infernix's clock (a tick a layer call) and candidates (the step's misses). Opt-in alternative. | 0055 | Between the port and Strata's rule (`measured-here`). |
 | `LLAMA_EXPERT_CACHE_SPARES` | 4 a layer (minimum 1 when set) | Spare bank entries a layer for swaps. | 0042 | ~263 MB more pinned host memory for Flash-Next (`measured-here`). |
-
-### Opt-in alternative
-
-| switch | default | what it does | patch | evidence |
-|---|---|---|---|---|
-| `GGML_OPENCL_F16_KSPLIT4` | off | K-split F16 matvec with 4 rows a work-group, for K >= 8192 and 64+ rows. | 0022 | Measured slower, kept opt-in; no number in the README (`measured-here`). |
-| `GGML_OPENCL_FUSE_HC_MIX` | off | The hyper-connection read as three kernels instead of five. | 0022 | Flash-Next MTP 2, B60: 30.8 t/s off, 30.4 on (README); the code comment says 31.2 and 30.8 (`measured-here`). |
-| `GGML_OPENCL_GATHER_PAIRS_MULTI` | off | The per-pair gather grid for a few tokens too. | 0022 | Served, the shape did not move the gathers' time (`measured-here`). |
-| `GGML_OPENCL_KQ_GROUPED` | off | A verify's 2-4 token pairs grouped by expert and decoded once, low-bit types. | 0022 | 30.5 -> 29.5 t/s (`measured-here`). |
-| `GGML_OPENCL_KQ_IDG` | off | MUL_MAT_ID matvec grouped by expert for 2-15 tokens. | 0022 (fixed in 0030, 0031) | Coder verify 7.85 -> 9.18 s on the A770; Flash-Next 125 -> 131 ms a verify (`measured-here`). |
-| `GGML_OPENCL_KQ_ONE_TERM` | off | One int8 activation term in the K-quant and IQ dot products, as llama.cpp and Strata do. | 0022 | Flash-Next 31.0 -> 31.6-31.8 t/s; coder 43.3 -> 40.7, draft acceptance 42.7 -> 38.2 % (`measured-here`). |
-| `GGML_OPENCL_MOE_PREFETCH` | off | A projection's matvec copies the next projection's misses into a card-side mirror. | 0022 | 31.4 -> 31.6 t/s (`measured-here`). |
 
 ### Off switch
 
@@ -119,7 +121,6 @@ One name is not in a table:
 | `GGML_OPENCL_FA_SG8_VBLK` | on (sub-group 8, f16 V) | `0`: the old V staging. | 0048 | V's transposing stores ~12 ms of 70 on the A770 (`measured-here`). |
 | `GGML_OPENCL_FUSE_0049` | 7 | Mask: 1 rms_norm + scale, 2 ssm_conv + silu, 4 sigmoid + mul; 0 off. | 0049 | Flash-Next verify graph 12,346-12,407 -> 11,666-11,678 us; decode 32.0 -> 32.2 t/s (`measured-here`). |
 | `GGML_OPENCL_FUSE_0050` | 3 | Mask: bit 1 GDN snapshots written into the cache, bit 2 the gating fold (0051). `0` keeps the copy. | 0050 | Decode +5.1-5.3 % dense agent, +1.8-2.0 % coder, +1.2-1.9 % Flash-Next (`measured-here`). |
-| `GGML_OPENCL_FUSE_RMS_SCALE` | unset | Alias of `FUSE_0049`: `0` is mask 0, other values mask 7. Ignored when `FUSE_0049` is set. | 0049 | — |
 | `GGML_OPENCL_FUSE_SCALE_ACT` | on | `0`: SCALE + SILU / SIGMOID not fused. | 0022 | Fewer launches, text identical, no decode change above the spread (`measured-here`). |
 | `GGML_OPENCL_FUSE_TOPK_MOE` | on | `0`: the MoE routing chain not fused into one kernel. | 0022 | TOPK_MOE 416/416 in test-backend-ops (`measured-here`). |
 | `GGML_OPENCL_GDN_INTEL` | on (Intel) | `0`: keeps `gated_delta_net.cl`. `Rtg,Rpp,NSG,TC` overrides the shape. | 0003 | 512 tokens, harness: B60 875 against 5,692, A770 451 against 12,042 (`measured-here`). |
@@ -148,7 +149,6 @@ One name is not in a table:
 | `GGML_OPENCL_FUSE_0049_RED` | off | The folded rms_norm scale is dropped. | 0049 | — |
 | `GGML_OPENCL_FUSE_0050_RED` | off | Every GDN snapshot slot is written over slot 0. | 0050 | Changed the Flash-Next texts (`measured-here`). |
 | `GGML_OPENCL_FUSE_0051_RED` | off | The gating fold reads A in place of dt. | 0051 | Changed all three Flash-Next texts and lost the needle (`measured-here`). |
-| `GGML_OPENCL_HC_MIX_RED` | off | The fused hyper-connection mix is scaled by 1.05. | 0022 | — |
 | `GGML_OPENCL_STAGE_RED` | off | The staging ring's bytes are not copied, so stale bytes reach the card. | 0047 | The capital answered "!!!!!!!!", the needle empty (`measured-here`). |
 | `LLAMA_EXPERT_CACHE_MUTATE` | 0 | `1` corrupts one landed slot; `2` leaves out the last changed row of a table write. | 0021 (`2` from 0046) | `1`: the swap check reports 1 of 6 (`measured-here`). |
 | `GGML_OPENCL_CPU_MISS_RED` | off | The CPU's rows left zero. | 0056 | KL 0.3700 -> 0.4364, top-1 84.4 -> 81.9 % (`measured-here`). |
@@ -158,7 +158,6 @@ One name is not in a table:
 
 | switch | default | what it does | patch | evidence |
 |---|---|---|---|---|
-| `GGML_OPENCL_HC_MIX_DEBUG` | off | Logs why the hyper-connection read was not fused (first 4 times, 1-4 tokens). | 0022 | — |
 | `GGML_SCHED_TIMING` | off | Logs the host's time per graph in input copies and split computes, every 50 graphs. | 0047 | Used for the 0047 numbers (`measured-here`). |
 | `LLAMA_DECODE_TIMING` | off | Logs where a decode call spends its time. | 0022 | — |
 | `LLAMA_KV_RESERVE_LOG` | off (set at all = on) | Logs a prompt cut into smaller ubatches by the KV reserve. | 0052 | — |

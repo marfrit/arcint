@@ -50,10 +50,10 @@ index 0096331a7..89e96c678 100644
          }
  
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 645f65c00..9a902b1bc 100644
+index 80b5e17ee..4696e82b9 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -1072,6 +1072,11 @@ struct ggml_backend_opencl_context {
+@@ -1055,6 +1055,11 @@ struct ggml_backend_opencl_context {
      // ggml_backend_opencl_set_tensor_slices keeps until this queue has passed them
      ggml_cl_buffer prealloc_exchange;
      std::vector<std::vector<uint8_t>> slices_keep;
@@ -65,7 +65,7 @@ index 645f65c00..9a902b1bc 100644
      // the MoE router's softmax + top-k + normalized weights in one kernel, Intel
      cl_kernel kernel_topk_moe = nullptr;
      // SCALE -> SILU / SCALE -> SIGMOID -> SCALE fused, Intel
-@@ -1526,6 +1531,12 @@ struct ggml_backend_opencl_context {
+@@ -1509,6 +1514,12 @@ struct ggml_backend_opencl_context {
                  if (kv.second.sub_buffer) { CL_CHECK(clReleaseMemObject(kv.second.sub_buffer)); }
              }
              kq_img_pool.clear();
@@ -78,7 +78,7 @@ index 645f65c00..9a902b1bc 100644
              for (auto & kv : kqv_img_pool) {
                  if (kv.second.image)      { CL_CHECK(clReleaseMemObject(kv.second.image)); }
                  if (kv.second.sub_buffer) { CL_CHECK(clReleaseMemObject(kv.second.sub_buffer)); }
-@@ -11796,6 +11807,48 @@ static void ggml_cl_usm_set_tensor(ggml_backend_opencl_buffer_context * ctx, ggm
+@@ -11583,6 +11594,48 @@ static void ggml_cl_usm_set_tensor(ggml_backend_opencl_buffer_context * ctx, ggm
      memcpy(base + offset, data, size);
  }
  
@@ -127,7 +127,7 @@ index 645f65c00..9a902b1bc 100644
  static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
      if (((ggml_backend_opencl_buffer_context *) buffer->context)->usm) {
          ggml_cl_usm_set_tensor((ggml_backend_opencl_buffer_context *) buffer->context, tensor, data, offset, size);
-@@ -13468,6 +13521,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+@@ -13255,6 +13308,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
      ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
      GGML_ASSERT(extra);
  

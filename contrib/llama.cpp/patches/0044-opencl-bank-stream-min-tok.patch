@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 260542ece..c989ffb69 100644
+index e64745d4e..dfced04cb 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -26436,6 +26436,16 @@ static cl_ulong     g_kq_pf_n16 = 0;
+@@ -26208,6 +26208,16 @@ static const void * g_kq_single_ptr = nullptr;
  // GEMM waits for its copy. Lookahead stays inside a graph: decode's swaps change
  // the banks between graphs. Returns true with g_kq_stage_q set, or false (gather).
  static int g_bstream_slot = -1;   // the slot the current MUL_MAT_ID reads (released after its GEMM)
@@ -19,10 +19,10 @@ index 260542ece..c989ffb69 100644
  static bool ggml_cl_bank_stream(ggml_backend_opencl_context * ctx, const ggml_tensor * bank, ggml_backend_opencl_buffer_context * bctx) {
      static const char * on_env = getenv("GGML_OPENCL_BANK_STREAM");
      static const bool   on     = on_env != nullptr && atoi(on_env) != 0;
-@@ -29660,7 +29670,8 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
-                     }
-                 }
-             }
+@@ -29375,7 +29385,8 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+             g_kq_single_ptr   = (const char *) bctx0->usm + e0->offset + bank0->view_offs;
+             g_kq_single_q     = g_kq_single_d = extrad->data_device;   // non-null: the single branch
+             g_kq_single_split = n_split;
 -        } else if (bctx0->usm && gemm && !single && bank0->type != GGML_TYPE_IQ4_NL && ggml_cl_bank_stream(backend_ctx, bank0, bctx0)) {
 +        } else if (bctx0->usm && gemm && !single && bank0->type != GGML_TYPE_IQ4_NL && n_tok >= ggml_cl_bank_stream_min_tok() &&
 +                   ggml_cl_bank_stream(backend_ctx, bank0, bctx0)) {

@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 9871a353b..bf58c7d0f 100644
+index c2e18afab..026442212 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -1106,6 +1106,24 @@ struct ggml_backend_opencl_context {
+@@ -1089,6 +1089,24 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_moe_gather_experts = nullptr;   // an expert cache's bank -> a card-side mirror
      cl_kernel kernel_moe_gather_pairs   = nullptr;   // the same for one token (distinct experts)
      ggml_cl_buffer prealloc_kq_stage_q, prealloc_kq_stage_d;
@@ -27,7 +27,7 @@ index 9871a353b..bf58c7d0f 100644
      int             kq_mm_sg = 16;
      ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
      int       kq_q8_1_ndst = 4;
-@@ -8768,6 +8786,8 @@ static bool ggml_backend_opencl_cpy_tensor_async(ggml_backend_t backend, const g
+@@ -8732,6 +8750,8 @@ static bool ggml_backend_opencl_cpy_tensor_async(ggml_backend_t backend, const g
  
  static void ggml_backend_opencl_synchronize(ggml_backend_t backend) {
      auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
@@ -36,7 +36,7 @@ index 9871a353b..bf58c7d0f 100644
  
      cl_event evt;
      CL_CHECK(clEnqueueBarrierWithWaitList(backend_ctx->queue, 0, nullptr, &evt));
-@@ -10972,6 +10992,25 @@ bool ggml_backend_is_opencl(ggml_backend_t backend) {
+@@ -10756,6 +10776,25 @@ bool ggml_backend_is_opencl(ggml_backend_t backend) {
  // split (ids at or above it are the bank's, gathered into the mirror)
  static std::unordered_map<const ggml_tensor *, std::pair<const ggml_tensor *, int>> g_cache_pairs;
  
@@ -62,7 +62,7 @@ index 9871a353b..bf58c7d0f 100644
  struct ggml_backend_opencl_buffer_context {
      // A buffer context can hold multiple cl_mem objects. This is for flattening
      // quantized weights and should be used with GGML_OPENCL_SMALL_ALLOC where
-@@ -10995,6 +11034,7 @@ struct ggml_backend_opencl_buffer_context {
+@@ -10779,6 +10818,7 @@ struct ggml_backend_opencl_buffer_context {
  
      ~ggml_backend_opencl_buffer_context() {
          if (usm && usm_free) {
@@ -70,9 +70,9 @@ index 9871a353b..bf58c7d0f 100644
              usm_free(usm_ctx, usm);
          }
          for (cl_mem buf : buffer) {
-@@ -25877,6 +25917,106 @@ static const void * g_kq_pf_src = nullptr;
- static cl_mem       g_kq_pf_dst = nullptr;
- static cl_ulong     g_kq_pf_n16 = 0;
+@@ -25646,6 +25686,106 @@ static int    g_kq_single_split = 0;
+ // default on): the matvec's mirror argument
+ static const void * g_kq_single_ptr = nullptr;
  
 +// GGML_OPENCL_BANK_STREAM (patch 0032). The first prefill graph learns the order
 +// of its bank tensors (and gathers as before); from the next one each bank tensor
@@ -177,19 +177,19 @@ index 9871a353b..bf58c7d0f 100644
  // blocks as the GGUF stores them (buffer, byte offset): IQ3_XXS, IQ4_XS and
  // the low-bit types
  static bool ggml_cl_kq_as_stored(ggml_type t) {
-@@ -28995,6 +29135,8 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
-                     }
-                 }
-             }
+@@ -28707,6 +28847,8 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+             g_kq_single_ptr   = (const char *) bctx0->usm + e0->offset + bank0->view_offs;
+             g_kq_single_q     = g_kq_single_d = extrad->data_device;   // non-null: the single branch
+             g_kq_single_split = n_split;
 +        } else if (bctx0->usm && gemm && !single && bank0->type != GGML_TYPE_IQ4_NL && ggml_cl_bank_stream(backend_ctx, bank0, bctx0)) {
 +            // streamed: g_kq_stage_q is the ring slot holding bank0 whole (the bank's layout, as the gather's mirror)
          } else if (bctx0->usm && backend_ctx->kernel_moe_gather_experts != nullptr) {
              auto gather = [&](const void * src, ggml_cl_buffer & stage, size_t per_expert, int n_split) {
                  GGML_ASSERT(per_expert % 16 == 0);
-@@ -29062,6 +29204,18 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -28769,6 +28911,18 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
          }
      }
-     struct kq_stage_reset { ~kq_stage_reset() { g_kq_stage_q = g_kq_stage_d = g_kq_single_q = g_kq_single_d = nullptr; g_kq_single_split = 0; g_kq_single_nbank = 0; g_kq_single_ptr = nullptr; g_kq_pf_src = nullptr; g_kq_pf_dst = nullptr; g_kq_pf_n16 = 0; } } kq_stage_reset_;
+     struct kq_stage_reset { ~kq_stage_reset() { g_kq_stage_q = g_kq_stage_d = g_kq_single_q = g_kq_single_d = nullptr; g_kq_single_split = 0; g_kq_single_ptr = nullptr; } } kq_stage_reset_;
 +    // a streamed ring slot is free again once the GEMM enqueued below has run
 +    struct bank_stream_release {
 +        ggml_backend_opencl_context * ctx;

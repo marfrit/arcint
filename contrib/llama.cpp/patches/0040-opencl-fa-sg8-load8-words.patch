@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 39c70e18d..6b89ce37b 100644
+index 553974292..746cfde56 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -4449,26 +4449,32 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -4413,26 +4413,32 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                  if (p != nullptr) {
                      CL_CHECK((backend_ctx->kernel_fa_dpas_dk[di] = clCreateKernel(p, "flash_attn_f32_f16_dpas", &err), err));
                      if (qg) {

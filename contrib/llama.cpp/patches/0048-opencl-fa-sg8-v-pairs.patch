@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 9a902b1bc..316867248 100644
+index 4696e82b9..45bb77a02 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -4461,13 +4461,18 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -4425,13 +4425,18 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
              const int    sgn     = sgn_env ? atoi(sgn_env) : 16;
              const int    nsg     = sg8 ? (qg && (sgn == 8 || sgn == 16 || sgn == 32) ? sgn : 8) : 16;
              const std::string qg_opt = qg ? " -DFA_QG" : "";

@@ -77,18 +77,10 @@ index ffbcba366..0096331a7 100644
  }
  
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 44de857c1..29e5e0f45 100644
+index 44de857c1..f8b74f4b3 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -764,6 +764,7 @@ struct ggml_backend_opencl_context {
-     ggml_cl_buffer prealloc_kq_fs;     // its sums per 16 values
-     ggml_cl_buffer prealloc_kq_fc;     // and scales per 32
-     ggml_cl_buffer prealloc_kq_pairs;  // MUL_MAT_ID GEMM: (token, slot) pairs sorted by expert
-+    ggml_cl_buffer prealloc_hc_mix;    // the fused hyper-connection read: partial dots and sums of squares
-     ggml_cl_buffer prealloc_kq_tiles;  // its tiles (expert, first pair, count)
-     ggml_cl_buffer prealloc_kq_ntiles; // and their number
-     ggml_cl_buffer prealloc_splitk_partial;  // [ksplit * M] partials for split-K GEMV
-@@ -891,6 +892,7 @@ struct ggml_backend_opencl_context {
+@@ -891,6 +891,7 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_sigmoid_f32, kernel_sigmoid_f16;
      cl_kernel kernel_tri;
      cl_kernel kernel_fill;
@@ -96,7 +88,7 @@ index 44de857c1..29e5e0f45 100644
      cl_kernel kernel_clamp, kernel_clamp_nc;
      cl_kernel kernel_geglu, kernel_reglu, kernel_swiglu, kernel_swiglu_oai, kernel_swiglu_clamp, kernel_geglu_erf,
                kernel_geglu_quick, kernel_geglu_f16, kernel_reglu_f16, kernel_swiglu_f16, kernel_swiglu_clamp_f16,
-@@ -910,6 +912,7 @@ struct ggml_backend_opencl_context {
+@@ -910,6 +911,7 @@ struct ggml_backend_opencl_context {
  #endif
      cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0, kernel_get_rows_i32;
      cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
@@ -104,7 +96,7 @@ index 44de857c1..29e5e0f45 100644
      cl_kernel kernel_set_rows_q8_0_i64, kernel_set_rows_q8_0_i32;
      cl_kernel kernel_set_rows_q8_0_soa_i64, kernel_set_rows_q8_0_soa_i32;
      cl_kernel kernel_set_rows_q4_0_i64, kernel_set_rows_q4_0_i32;
-@@ -918,6 +921,7 @@ struct ggml_backend_opencl_context {
+@@ -918,6 +920,7 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
      cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_i32_i32;
      cl_kernel kernel_cpy_f32_f32_pack = nullptr;
@@ -112,7 +104,7 @@ index 44de857c1..29e5e0f45 100644
      cl_kernel kernel_cpy_f32_f32_flat = nullptr;
      cl_kernel kernel_mul_mat_f32_f32;
      cl_kernel kernel_mul_mat_f16_f16;
-@@ -1004,10 +1008,38 @@ struct ggml_backend_opencl_context {
+@@ -1004,10 +1007,27 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_kq_quantize_q8_1 = nullptr;
      int       kq_quantize_sg = 0;   // > 0: kernel_kq_quantize_q8_1 is the sub-group kernel of that size
      // per type, ggml_cl_kq_type_index: Q4_K, Q5_K, Q6_K (mul_mv_kq_q8_1.cl),
@@ -129,22 +121,11 @@ index 44de857c1..29e5e0f45 100644
 +    // weight row read once (mul_mv_iq_q8_1.cl, kernel_mul_mv_f16_f32_nc)
 +    cl_kernel kernel_mul_mv_f16_f32_nc = nullptr;
 +    cl_kernel kernel_mul_mv_f16_f32_ksplit = nullptr;   // few rows, long K
-+    cl_kernel kernel_mul_mv_f16_f32_ksplit4 = nullptr;  // the same, 4 rows a work-group (a hyper-connection's down)
-+    // MUL_MAT_ID grouped by expert for 2-15 tokens (IQ and low-bit types, index 3-10)
-+    cl_kernel kernel_mul_mv_idg_kq_q8_1[11] = {};
-+    // MUL_MAT_ID grouped by expert from kernel_moe_pair_groups (the low-bit types, index 6-10)
-+    cl_kernel kernel_mul_mv_idgg_kq_q8_1[11] = {};
-+    cl_kernel kernel_moe_pair_groups = nullptr;
-+    ggml_cl_buffer prealloc_pair_grp, prealloc_pair_ngrp;
-+    const ggml_tensor * pair_grp_t = nullptr; int pair_grp_split = 0;
 +    // GGML_OP_DSV4_HC_PRE / _POST (identity comb), Intel
 +    cl_kernel kernel_dsv4_hc_pre = nullptr, kernel_dsv4_hc_post = nullptr;
-+    // a hyper-connection read (RMS_NORM .. DSV4_HC_PRE) fused into two kernels, Intel
-+    cl_kernel kernel_hc_mix_down = nullptr, kernel_hc_mix_lo = nullptr, kernel_hc_mix_up = nullptr;
 +    // an expert cache's verify: the order its pairs' work-groups take (GGML_OPENCL_PAIR_ORDER)
 +    cl_kernel kernel_moe_pair_perm = nullptr;
-+    ggml_cl_buffer prealloc_pair_perm, prealloc_pair_first;
-+    ggml_cl_buffer prealloc_kq_pf_b;   // the second prefetch mirror (the first is prealloc_kq_stage_q)
++    ggml_cl_buffer prealloc_pair_perm;
 +    // the ids tensor the permutation was computed for (reset at each graph: a later
 +    // graph's ids reuse the tensors with new contents)
 +    const ggml_tensor * pair_perm_t = nullptr; int pair_perm_split = 0;
@@ -155,7 +136,7 @@ index 44de857c1..29e5e0f45 100644
      // Intel: x f16 GEMM on the XMX units (mul_mm_kq_f16.cl), per type, plain
      // and MUL_MAT_ID; the sub-group size and tiles
      cl_kernel kernel_kq_cvt_f32_f16 = nullptr;
-@@ -1019,11 +1051,12 @@ struct ggml_backend_opencl_context {
+@@ -1019,11 +1039,12 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_mul_mm_kq2d[3] = {};
      int       kq2d_tm = 64, kq2d_wg = 16;
      int       kq2d_tm_t[3] = { 64, 64, 64 }, kq2d_wg_t[3] = { 16, 16, 16 };   // per type (GGML_OPENCL_KQ_2D_T<i>)
@@ -171,7 +152,7 @@ index 44de857c1..29e5e0f45 100644
      int       kq_id2_xt = 32, kq_id2_xsg = 16;
      // the route in prealloc_kq_pairs / _tiles / _ntiles: a MoE layer's gate,
      // up and down share their ids tensor, so it is computed once a layer
-@@ -1056,10 +1089,12 @@ struct ggml_backend_opencl_context {
+@@ -1056,10 +1077,12 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_mul_mv_iq4_nl_f32_flat;
      cl_kernel kernel_solve_tri_f32;
      cl_kernel kernel_im2col_f32, kernel_im2col_f16;
@@ -184,7 +165,7 @@ index 44de857c1..29e5e0f45 100644
      cl_kernel kernel_pad;
      cl_kernel kernel_tanh_f32, kernel_tanh_f32_4, kernel_tanh_f32_nc;
      cl_kernel kernel_tanh_f16, kernel_tanh_f16_4, kernel_tanh_f16_nc;
-@@ -1591,6 +1626,7 @@ static void load_cl_kernels_argsort(ggml_backend_opencl_context *backend_ctx) {
+@@ -1591,6 +1614,7 @@ static void load_cl_kernels_argsort(ggml_backend_opencl_context *backend_ctx) {
              build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
  
          CL_CHECK((backend_ctx->kernel_argsort_f32_i32 = clCreateKernel(backend_ctx->program_argsort_f32_i32, "kernel_argsort_f32_i32", &err), err));
@@ -192,7 +173,7 @@ index 44de857c1..29e5e0f45 100644
          backend_ctx->kernels_loaded_argsort = true;
      }
  }
-@@ -1751,6 +1787,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -1751,6 +1775,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
              build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
  
          CL_CHECK((backend_ctx->kernel_fill = clCreateKernel(prog, "kernel_fill_f32", &err), err));
@@ -200,7 +181,7 @@ index 44de857c1..29e5e0f45 100644
          GGML_LOG_CONT(".");
  
          CL_CHECK(clReleaseProgram(prog));
-@@ -1802,6 +1839,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -1802,6 +1827,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
              }
          }
          CL_CHECK((backend_ctx->kernel_cpy_i32_i32 = clCreateKernel(prog, "kernel_cpy_i32_i32", &err), err));
@@ -209,23 +190,7 @@ index 44de857c1..29e5e0f45 100644
          GGML_LOG_CONT(".");
      }
  
-@@ -2230,10 +2269,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
-             // columns 106 -> 355 GB/s on Q4_K, the cost of one column). A build
-             // the device refuses leaves its kernels null: ggml's path then.
-             const char * mv_n[3] = { "kernel_mul_mv_q4_K_q8_1", "kernel_mul_mv_q5_K_q8_1", "kernel_mul_mv_q6_K_q8_1" };
-+            // GGML_OPENCL_KQ_ONE_TERM=1: the activation's residual term left out of
-+            // the K-quant and IQ dot products (llama.cpp's and Strata's single q8_1)
-+            static const char * ot_env = getenv("GGML_OPENCL_KQ_ONE_TERM");
-+            const std::string one_term = ot_env != nullptr && atoi(ot_env) != 0 ? " -DKQ_ONE_TERM" : "";
-             for (int nc = 1; nc <= 4; ++nc) {
-                 const std::string opts = compile_opts + " -DN_DST=" + std::to_string(backend_ctx->kq_q8_1_ndst) +
-                     " -DN_SIMDGROUP=4 -DNCOLS=" + std::to_string(nc) + (nc > 1 ? " -cl-intel-256-GRF-per-thread" : "") +
--                    " -DQSG=" + std::to_string(sg8 ? 8 : 16);
-+                    " -DQSG=" + std::to_string(sg8 ? 8 : 16) + one_term;
-                 cl_program prog = build_program_from_source_optional(backend_ctx, kernel_src.c_str(), opts);
-                 if (prog == nullptr) {
-                     GGML_LOG_WARN("ggml_opencl: K-quant matvec for %d column(s) not built; ggml's kernels take it\n", nc);
-@@ -2266,22 +2309,55 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2266,22 +2293,40 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
  #else
                  const std::string iq_src = read_file("mul_mv_iq_q8_1.cl");
  #endif
@@ -245,7 +210,7 @@ index 44de857c1..29e5e0f45 100644
                      const std::string opts = compile_opts + " -DN_DST=" + std::to_string(backend_ctx->kq_q8_1_ndst) +
 -                        " -DN_SIMDGROUP=4 -DNCOLS=" + std::to_string(nc) + (nc > 1 ? " -cl-intel-256-GRF-per-thread" : "");
 +                        " -DN_SIMDGROUP=4 -DNCOLS=" + std::to_string(nc) + (nc > 1 ? " -cl-intel-256-GRF-per-thread" : "") +
-+                        (sg8 ? " -DIQ4_KV_SELECT" : "") + one_term + iq_extra_opts;
++                        (sg8 ? " -DIQ4_KV_SELECT" : "") + iq_extra_opts;
                      cl_program prog = build_program_from_source_optional(backend_ctx, iq_src.c_str(), opts);
                      if (prog == nullptr) {
                          GGML_LOG_WARN("ggml_opencl: IQ matvec for %d column(s) not built; IQ weights go to the CPU\n", nc);
@@ -261,31 +226,16 @@ index 44de857c1..29e5e0f45 100644
 +                    if (nc == 1) {
 +                        CL_CHECK((backend_ctx->kernel_mul_mv_f16_f32_nc = clCreateKernel(prog, "kernel_mul_mv_f16_f32_nc", &err), err));
 +                        CL_CHECK((backend_ctx->kernel_mul_mv_f16_f32_ksplit = clCreateKernel(prog, "kernel_mul_mv_f16_f32_ksplit", &err), err));
-+                        CL_CHECK((backend_ctx->kernel_mul_mv_f16_f32_ksplit4 = clCreateKernel(prog, "kernel_mul_mv_f16_f32_ksplit4", &err), err));
 +                        CL_CHECK((backend_ctx->kernel_dsv4_hc_pre  = clCreateKernel(prog, "kernel_dsv4_hc_pre",  &err), err));
-+                        CL_CHECK((backend_ctx->kernel_hc_mix_down  = clCreateKernel(prog, "kernel_hc_mix_down",  &err), err));
-+                        CL_CHECK((backend_ctx->kernel_hc_mix_lo    = clCreateKernel(prog, "kernel_hc_mix_lo",    &err), err));
-+                        CL_CHECK((backend_ctx->kernel_hc_mix_up    = clCreateKernel(prog, "kernel_hc_mix_up",    &err), err));
 +                        CL_CHECK((backend_ctx->kernel_moe_pair_perm = clCreateKernel(prog, "kernel_moe_pair_perm", &err), err));
 +                        CL_CHECK((backend_ctx->kernel_dsv4_hc_post = clCreateKernel(prog, "kernel_dsv4_hc_post", &err), err));
 +                        CL_CHECK((backend_ctx->kernel_topk_moe = clCreateKernel(prog, "kernel_topk_moe_softmax_norm", &err), err));
 +                        CL_CHECK((backend_ctx->kernel_scale_act = clCreateKernel(prog, "kernel_scale_act_f32", &err), err));
-+                        for (int i = 0; i < 8; ++i) {
-+                            std::string g = iq_id_n[i];
-+                            g.replace(g.find("_id_"), 4, "_idg_");
-+                            CL_CHECK((backend_ctx->kernel_mul_mv_idg_kq_q8_1[3 + i] = clCreateKernel(prog, g.c_str(), &err), err));
-+                            if (i >= 3) {   // the low-bit types
-+                                std::string gg = iq_id_n[i];
-+                                gg.replace(gg.find("_id_"), 4, "_idgg_");
-+                                CL_CHECK((backend_ctx->kernel_mul_mv_idgg_kq_q8_1[3 + i] = clCreateKernel(prog, gg.c_str(), &err), err));
-+                            }
-+                        }
-+                        CL_CHECK((backend_ctx->kernel_moe_pair_groups = clCreateKernel(prog, "kernel_moe_pair_groups", &err), err));
 +                    }
                      CL_CHECK(clReleaseProgram(prog));
                      GGML_LOG_CONT(".");
                  }
-@@ -2512,10 +2588,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2512,10 +2557,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                          }
                      }
                  }
@@ -304,7 +254,7 @@ index 44de857c1..29e5e0f45 100644
                  // the tokens-as-a MUL_MAT_ID kernel: pairs per tile, sub-groups per
                  // work-group, 32 x 16 on SG 8 (measured-here, the coder's prefill on
                  // an A770: 32 x 16, 32 x 32 and 16 x 32 within 3 %, 64 x 16 1.7x
-@@ -2550,12 +2630,15 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2550,12 +2599,15 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                          CL_CHECK((backend_ctx->kernel_moe_route_tiles = clCreateKernel(mm_prog, "kernel_moe_route_tiles", &err), err));
                          CL_CHECK((backend_ctx->kernel_moe_gather_experts = clCreateKernel(mm_prog, "kernel_moe_gather_experts", &err), err));
                          CL_CHECK((backend_ctx->kernel_moe_gather_pairs   = clCreateKernel(mm_prog, "kernel_moe_gather_pairs", &err), err));
@@ -322,7 +272,7 @@ index 44de857c1..29e5e0f45 100644
                                  std::string id2 = id_n[i];
                                  id2.replace(id2.find("_id_"), 4, "_id2_");
                                  CL_CHECK((backend_ctx->kernel_mul_mm_id2_kq_f16[i] = clCreateKernel(mm_prog, id2.c_str(), &err), err));
-@@ -3686,6 +3769,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -3686,6 +3738,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
          cl_program prog =
              build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
          CL_CHECK((backend_ctx->kernel_repeat_f32 = clCreateKernel(prog, "kernel_repeat_f32", &err), err));
@@ -330,7 +280,7 @@ index 44de857c1..29e5e0f45 100644
          CL_CHECK(clReleaseProgram(prog));
          GGML_LOG_CONT(".");
      }
-@@ -3959,6 +4043,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -3959,6 +4012,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
          CL_CHECK((backend_ctx->kernel_set_rows_f32_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f32_i32", &err), err));
          CL_CHECK((backend_ctx->kernel_set_rows_f16_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f16_i64", &err), err));
          CL_CHECK((backend_ctx->kernel_set_rows_f16_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f16_i32", &err), err));
@@ -339,7 +289,7 @@ index 44de857c1..29e5e0f45 100644
          CL_CHECK((backend_ctx->kernel_set_rows_q8_0_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_q8_0_i64", &err), err));
          CL_CHECK((backend_ctx->kernel_set_rows_q8_0_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_q8_0_i32", &err), err));
          CL_CHECK((backend_ctx->kernel_set_rows_q8_0_soa_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_q8_0_soa_i64", &err), err));
-@@ -9385,9 +9471,323 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
+@@ -9385,9 +9440,148 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
      backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
  }
  
@@ -414,166 +364,6 @@ index 44de857c1..29e5e0f45 100644
 +    backend_ctx->enqueue_ndrange_kernel(kk, 1, gws, lws, n[8]);
 +}
 +
-+// a hyper-connection read, as qwen4exp's build_hc_mix builds it (fused
-+// DSV4_HC_PRE, no inject in between): RMS_NORM(x [n_embd, hc, T]) -> MUL
-+// (w_norm) -> RESHAPE (xn, [hc * n_embd, T]; a later inject product reads it)
-+// -> RESHAPE (xn 3D) -> MUL_MAT (w_down) -> SCALE -> SILU -> MUL_MAT (w_up) ->
-+// RESHAPE (gate 3D) -> DSV4_HC_PRE (gated). F16 / BF16 weights, 1 to 4 tokens.
-+static bool ggml_opencl_can_fuse_hc_mix(const ggml_backend_opencl_context * backend_ctx, const ggml_cgraph * cgraph, int i) {
-+    // opt-in (GGML_OPENCL_FUSE_HC_MIX=1): served it measured no faster than the five
-+    // kernels it replaces (Flash-Next MTP 2, B60, one binary: 31.2 t/s off, 30.8 on)
-+    static const char * env = getenv("GGML_OPENCL_FUSE_HC_MIX");
-+    if (backend_ctx->kernel_hc_mix_down == nullptr || env == nullptr || atoi(env) == 0 || i + 10 > cgraph->n_nodes) {
-+        return false;
-+    }
-+    ggml_tensor ** n = cgraph->nodes + i;
-+    if (n[0]->op != GGML_OP_RMS_NORM || n[1]->op != GGML_OP_MUL) {
-+        return false;
-+    }
-+    if (n[2]->op != GGML_OP_RESHAPE || n[3]->op != GGML_OP_RESHAPE || n[4]->op != GGML_OP_MUL_MAT ||
-+        n[5]->op != GGML_OP_SCALE || n[6]->op != GGML_OP_UNARY || n[7]->op != GGML_OP_MUL_MAT ||
-+        n[8]->op != GGML_OP_RESHAPE || n[9]->op != GGML_OP_DSV4_HC_PRE) {
-+        return false;
-+    }
-+    const ggml_tensor * x = n[0]->src[0];
-+    const ggml_tensor * g = n[1]->src[0] == n[0] ? n[1]->src[1] : n[1]->src[0];
-+    const ggml_tensor * wd = n[4]->src[0];
-+    const ggml_tensor * wu = n[7]->src[0];
-+    const int64_t n_embd = x->ne[0], hc = x->ne[1], T = x->ne[2], lr = wd->ne[1];
-+    // the checks, each a bit of `bad` (GGML_OPENCL_HC_MIX_DEBUG=1 prints the first few with up to 4 tokens)
-+    unsigned bad = 0;
-+    bad |= (x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || x->ne[3] != 1) << 0;
-+    bad |= (hc > 4 || T < 1 || T > 4 || n_embd % 256 != 0 || (n_embd / 2) * T > 5120) << 1;
-+    bad |= (lr % 8 != 0 || lr > 512) << 2;
-+    bad |= !((wd->type == GGML_TYPE_F16 || wd->type == GGML_TYPE_BF16) && wu->type == wd->type) << 3;
-+    bad |= (g->type != GGML_TYPE_F32 || !ggml_is_contiguous(g) || g->ne[0] != n_embd || g->ne[1] != hc) << 4;
-+    bad |= ((n[1]->src[0] != n[0] && n[1]->src[1] != n[0]) || !ggml_is_contiguous(n[1])) << 5;
-+    bad |= (n[2]->src[0] != n[1] || n[3]->src[0] != n[2]) << 6;
-+    bad |= (n[4]->src[1] != n[2] || !ggml_is_contiguous(wd) || wd->ne[0] != hc * n_embd || wd->ne[2] != 1) << 7;
-+    bad |= (n[5]->src[0] != n[4] || n[6]->src[0] != n[5] || ggml_get_unary_op(n[6]) != GGML_UNARY_OP_SILU) << 8;
-+    bad |= (n[7]->src[1] != n[6] || !ggml_is_contiguous(wu) || wu->ne[0] != lr || wu->ne[1] != hc * n_embd || wu->ne[2] != 1) << 9;
-+    bad |= (n[8]->src[0] != n[7] || n[9]->src[0] != n[3] || n[9]->src[1] != n[8]) << 10;
-+    bad |= (ggml_get_op_params_i32(n[9], 1) == 0 || !ggml_is_contiguous(n[9])) << 11;
-+    static const enum ggml_op ops[10] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_RESHAPE, GGML_OP_MUL_MAT,
-+                                          GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE };
-+    // the normed rows (MUL, and its 2D view that a later inject product reads) are
-+    // written by the fused kernels; the mix is the read's output
-+    const int outs[3] = { i + 1, i + 2, i + 9 };
-+    if (bad == 0 && !ggml_can_fuse_subgraph(cgraph, i, 10, ops, outs, 3)) {
-+        bad |= 1u << 12;
-+    }
-+    static const char * dbg_env = getenv("GGML_OPENCL_HC_MIX_DEBUG");
-+    static int dbg_left = 4;
-+    if (bad != 0) {
-+        if (dbg_env != nullptr && atoi(dbg_env) != 0 && dbg_left > 0 && T <= 4) {
-+            --dbg_left;
-+            GGML_LOG_INFO("ggml_opencl: hc mix not fused at node %d: checks 0x%x failed (T %d, n_embd %d, hc %d, lr %d, w %s/%s, g %s %dx%d)\n",
-+                          i, bad, (int) T, (int) n_embd, (int) hc, (int) lr, ggml_type_name(wd->type), ggml_type_name(wu->type),
-+                          ggml_type_name(g->type), (int) g->ne[0], (int) g->ne[1]);
-+        }
-+        return false;
-+    }
-+    static bool logged = false;
-+    if (!logged) {
-+        logged = true;
-+        GGML_LOG_INFO("ggml_opencl: hyper-connection read fused (%d tokens, lr %d)\n", (int) T, (int) lr);
-+    }
-+    return true;
-+}
-+
-+static void ggml_cl_hc_mix_fused(ggml_backend_t backend, ggml_cgraph * cgraph, int i) {
-+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
-+    ggml_tensor ** n = cgraph->nodes + i;
-+    const ggml_tensor * x  = n[0]->src[0];
-+    const ggml_tensor * g  = n[1]->src[0] == n[0] ? n[1]->src[1] : n[1]->src[0];
-+    const ggml_tensor * wd = n[4]->src[0];
-+    const ggml_tensor * wu = n[7]->src[0];
-+    ggml_tensor * xn = n[1];
-+    ggml_tensor * mx = n[9];
-+    const int n_embd = (int) x->ne[0], hc = (int) x->ne[1], T = (int) x->ne[2], lr = (int) wd->ne[1];
-+    float eps = 0.0f, s_lo = 1.0f, b_lo = 0.0f, s_mix = 1.0f;
-+    memcpy(&eps,   (const float *) n[0]->op_params + 0, sizeof(float));
-+    memcpy(&s_lo,  (const float *) n[5]->op_params + 0, sizeof(float));
-+    memcpy(&b_lo,  (const float *) n[5]->op_params + 1, sizeof(float));
-+    memcpy(&s_mix, (const float *) n[9]->op_params + 0, sizeof(float));
-+    // GGML_OPENCL_HC_MIX_RED=1: the mix off by 5 % (the red case of the fusion's test)
-+    static const char * red_env = getenv("GGML_OPENCL_HC_MIX_RED");
-+    if (red_env != nullptr && atoi(red_env) != 0) s_mix *= 1.05f;
-+    // scratch: partial dots [T][hc][2][lr], sums of squares [T][hc][2], lo [T][lr], rs [T][hc]
-+    backend_ctx->prealloc_hc_mix.allocate(backend_ctx->context,
-+        (size_t) T * (hc * 2 * lr + hc * 2 + lr + hc) * sizeof(float));
-+    cl_mem part = backend_ctx->prealloc_hc_mix.buffer;
-+    ggml_tensor_extra_cl * ex  = (ggml_tensor_extra_cl *) x->extra;
-+    ggml_tensor_extra_cl * eg  = (ggml_tensor_extra_cl *) g->extra;
-+    ggml_tensor_extra_cl * ewd = (ggml_tensor_extra_cl *) wd->extra;
-+    ggml_tensor_extra_cl * ewu = (ggml_tensor_extra_cl *) wu->extra;
-+    ggml_tensor_extra_cl * exn = (ggml_tensor_extra_cl *) xn->extra;
-+    ggml_tensor_extra_cl * emx = (ggml_tensor_extra_cl *) mx->extra;
-+    const cl_ulong offx = ex->offset + x->view_offs, offg = eg->offset + g->view_offs;
-+    const cl_ulong offwd = ewd->offset + wd->view_offs, offwu = ewu->offset + wu->view_offs;
-+    const cl_ulong offxn = exn->offset + xn->view_offs, offm = emx->offset + mx->view_offs;
-+    const cl_ulong nbx1 = x->nb[1], nbx2 = x->nb[2], nbxn2 = xn->nb[2], nbm1 = mx->nb[1];
-+    {
-+        cl_kernel k = backend_ctx->kernel_hc_mix_down;
-+        int a = 0;
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &ex->data_device));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &offx));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &nbx1));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &nbx2));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &eg->data_device));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &offg));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &ewd->data_device));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &offwd));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &part));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &n_embd));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &hc));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &lr));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &T));
-+        size_t lws[3] = { 128, 1, 1 }, gws[3] = { (size_t) CEIL_DIV(lr, 8) * 128, (size_t) hc, 2 };
-+        backend_ctx->enqueue_ndrange_kernel(k, 3, gws, lws, n[4]);
-+    }
-+    {
-+        cl_kernel k = backend_ctx->kernel_hc_mix_lo;
-+        int a = 0;
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem), &part));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(int),    &n_embd));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(int),    &hc));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(int),    &lr));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(int),    &T));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(float),  &eps));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(float),  &s_lo));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(float),  &b_lo));
-+        size_t lws[1] = { 256 }, gws[1] = { 256 };
-+        backend_ctx->enqueue_ndrange_kernel(k, 1, gws, lws, n[6]);
-+    }
-+    {
-+        cl_kernel k = backend_ctx->kernel_hc_mix_up;
-+        int a = 0;
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &ex->data_device));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &offx));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &nbx1));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &nbx2));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &eg->data_device));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &offg));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &ewu->data_device));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &offwu));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &part));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &exn->data_device));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &offxn));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &nbxn2));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &emx->data_device));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &offm));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &nbm1));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &n_embd));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &hc));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &lr));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &T));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(float),    &s_mix));
-+        size_t lws[1] = { 256 }, gws[1] = { (size_t) CEIL_DIV(n_embd, 16) * 256 };
-+        backend_ctx->enqueue_ndrange_kernel(k, 1, gws, lws, mx);
-+    }
-+}
-+
 +// SCALE (s, bias b) -> SILU, or SCALE -> SIGMOID [-> SCALE (s2, no bias)], on
 +// contiguous f32 of one shape: the count of nodes fused (0: none)
 +static int ggml_opencl_can_fuse_scale_act(const ggml_backend_opencl_context * backend_ctx, const ggml_cgraph * cgraph, int i,
@@ -641,37 +431,17 @@ index 44de857c1..29e5e0f45 100644
 +    backend_ctx->enqueue_ndrange_kernel(k, 1, gws, lws, d);
 +}
 +
-+// GGML_OPENCL_MOE_PREFETCH: an expert cache's decode matvec of one projection
-+// copies the next projection's missed experts of the same layer (gate -> up ->
-+// down, the same ids) into a card-side mirror while it computes, and the next
-+// projection reads its misses there: their link time overlaps a matvec
-+static std::unordered_map<const ggml_tensor *, const ggml_tensor *> g_cache_chain;
-+struct ggml_cl_pf_state { const ggml_tensor * slot = nullptr; const ggml_tensor * ids = nullptr; cl_mem mirror = nullptr; };
-+static ggml_cl_pf_state g_pf;
-+static bool ggml_cl_moe_prefetch_on() {
-+    static const char * env = getenv("GGML_OPENCL_MOE_PREFETCH");
-+    static const bool on = env != nullptr && atoi(env) != 0;
-+    return on;
-+}
-+
  static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
      backend_ctx->graph_gen++;
 +    backend_ctx->pair_perm_t = nullptr;
-+    backend_ctx->pair_grp_t = nullptr;
-+    g_pf = {};
  
      for (int i = 0; i < cgraph->n_nodes; i++) {
          ggml_tensor * node = cgraph->nodes[i];
-@@ -9405,6 +9805,25 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+@@ -9405,6 +9599,20 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
              continue;
          }
  
-+        if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse_hc_mix(backend_ctx, cgraph, i)) {
-+            ggml_cl_hc_mix_fused(backend, cgraph, i);
-+            i += 9;
-+            continue;
-+        }
 +        if (!backend_ctx->disable_fusion) {
 +            int act = 0; float s2 = 1.0f;
 +            const int nf = ggml_opencl_can_fuse_scale_act(backend_ctx, cgraph, i, &act, &s2);
@@ -689,7 +459,7 @@ index 44de857c1..29e5e0f45 100644
          if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
              ggml_opencl_op_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
              i += 2;
-@@ -9858,6 +10277,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -9858,6 +10066,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                  // TODO: add support
                  // ref: https://github.com/ggml-org/llama.cpp/pull/14274
  #pragma message("TODO: implement BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL support (https://github.com/ggml-org/llama.cpp/pull/14661)")
@@ -699,7 +469,7 @@ index 44de857c1..29e5e0f45 100644
                  if (op->src[0]->type != GGML_TYPE_F32) {
                      return false;
                  }
-@@ -9880,6 +10302,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -9880,6 +10091,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                          case GGML_TYPE_F16:
                          case GGML_TYPE_F32:
                              return true;
@@ -708,7 +478,7 @@ index 44de857c1..29e5e0f45 100644
                          default:
                              return false;
                      }
-@@ -9895,6 +10319,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -9895,6 +10108,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                      switch (op->type) {
                          case GGML_TYPE_I32:
                              return true;
@@ -717,7 +487,7 @@ index 44de857c1..29e5e0f45 100644
                          default:
                              return false;
                      }
-@@ -9977,7 +10403,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -9977,7 +10192,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
          case GGML_OP_TRI:
              return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
          case GGML_OP_FILL:
@@ -726,7 +496,7 @@ index 44de857c1..29e5e0f45 100644
          case GGML_OP_CLAMP:
              return op->src[0]->type == GGML_TYPE_F32;
          case GGML_OP_SOFT_MAX:
-@@ -9988,7 +10414,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -9988,7 +10203,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
          case GGML_OP_L2_NORM:
              return ggml_is_contiguous_rows(op->src[0]);
          case GGML_OP_REPEAT:
@@ -736,7 +506,7 @@ index 44de857c1..29e5e0f45 100644
          case GGML_OP_PAD:
              // TODO: add circular padding support for opencl, see https://github.com/ggml-org/llama.cpp/pull/16985
              if (ggml_get_op_params_i32(op, 8) != 0) {
-@@ -10037,6 +10464,14 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -10037,6 +10253,14 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
              }
          case GGML_OP_TIMESTEP_EMBEDDING:
              return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
@@ -751,7 +521,7 @@ index 44de857c1..29e5e0f45 100644
          case GGML_OP_GROUP_NORM:
              return ggml_is_contiguous(op->src[0]);
          case GGML_OP_MUL_MAT:
-@@ -10045,6 +10480,11 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -10045,6 +10269,11 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
              // (ggml_cl_mul_mv_kq_q8_1, ggml_cl_mul_mm_kq_f16), and are the only
              // path for IQ3_XXS / IQ4_XS; ahead of the Adreno rule below that
              // declines 512 or more columns without the Adreno GEMM
@@ -763,7 +533,7 @@ index 44de857c1..29e5e0f45 100644
              if (ggml_cl_kq_type_index(op->src[0]->type) >= 0 && kq_q8_1_enabled(backend_ctx) &&
                  op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % ggml_cl_kq_k_unit(op->src[0]->type) == 0 &&
                  op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 && op->src[0]->view_offs == 0 &&
-@@ -10129,6 +10569,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -10129,6 +10358,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                  }
              }
  #ifdef GGML_OPENCL_SOA_Q
@@ -774,7 +544,7 @@ index 44de857c1..29e5e0f45 100644
              if (ggml_cl_kq_type_index(op->src[0]->type) >= 0 && kq_q8_1_enabled(backend_ctx)) {
                  return op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % ggml_cl_kq_k_unit(op->src[0]->type) == 0 &&
                         op->src[0]->view_offs == 0 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
-@@ -10199,6 +10643,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -10199,6 +10432,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
  
              return cols <= max_workgroup_size && op->src[0]->type == GGML_TYPE_F32;
          }
@@ -785,7 +555,7 @@ index 44de857c1..29e5e0f45 100644
          case GGML_OP_SUM_ROWS:
          case GGML_OP_CUMSUM:
              return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
-@@ -10932,6 +11380,49 @@ static cl_mem ggml_cl_create_temp_download_buffer(
+@@ -10932,6 +11169,49 @@ static cl_mem ggml_cl_create_temp_download_buffer(
  
  // USM host buffers: bytes by memcpy; IQ4_NL whole tensors split into scales
  // and quants (as kernel_convert_block_iq4_nl lays them out), each 128-aligned
@@ -835,7 +605,7 @@ index 44de857c1..29e5e0f45 100644
  static void ggml_cl_usm_set_tensor(ggml_backend_opencl_buffer_context * ctx, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
      ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
      char * base = (char *) ctx->usm + e->offset + tensor->view_offs;
-@@ -10949,6 +11440,11 @@ static void ggml_cl_usm_set_tensor(ggml_backend_opencl_buffer_context * ctx, ggm
+@@ -10949,6 +11229,11 @@ static void ggml_cl_usm_set_tensor(ggml_backend_opencl_buffer_context * ctx, ggm
          ctx->usm_split[tensor] = { d, q };
          return;
      }
@@ -847,7 +617,7 @@ index 44de857c1..29e5e0f45 100644
      memcpy(base + offset, data, size);
  }
  
-@@ -10963,6 +11459,16 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+@@ -10963,6 +11248,16 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
      cl_context context = backend_ctx->context;
      cl_command_queue queue = backend_ctx->queue;
  
@@ -864,7 +634,7 @@ index 44de857c1..29e5e0f45 100644
  #ifdef GGML_OPENCL_SOA_Q
      if (tensor->type == GGML_TYPE_Q1_0) {
          ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
-@@ -12623,6 +13129,21 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+@@ -12623,6 +12918,21 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
  
  static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
      GGML_ASSERT(tensor->extra);
@@ -886,7 +656,7 @@ index 44de857c1..29e5e0f45 100644
  
      ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer->buft->device->context;
      ggml_backend_opencl_context *backend_ctx = dev_ctx->backend_ctx;
-@@ -14148,6 +14669,7 @@ static ggml_backend_dev_t ggml_backend_opencl_reg_device_get(ggml_backend_reg_t
+@@ -14148,6 +14458,7 @@ static ggml_backend_dev_t ggml_backend_opencl_reg_device_get(ggml_backend_reg_t
  static void ggml_backend_opencl_set_tensor_slices(ggml_tensor * tensor, const void * data, int64_t i2, int64_t n);
  
  static void ggml_backend_opencl_get_tensors(const ggml_tensor * const * tensors, void * const * dsts, int n);
@@ -894,26 +664,7 @@ index 44de857c1..29e5e0f45 100644
  static void ggml_backend_opencl_get_tensor_slices(const ggml_tensor * tensor, void * data, int64_t i2, int64_t n);
  static void ggml_backend_opencl_exchange_slices(ggml_tensor * a, int64_t sa, ggml_tensor * b, int64_t sb);
  
-@@ -14155,11 +14677,18 @@ static void ggml_backend_opencl_pair_bank(const ggml_tensor * slot, const ggml_t
-     g_cache_pairs[slot] = { bank, n_split };
- }
- 
-+// slot tensor `a`'s decode matvec prefetches the misses of `b` (the next
-+// projection of the same layer)
-+static void ggml_backend_opencl_chain_prefetch(const ggml_tensor * a, const ggml_tensor * b) {
-+    g_cache_chain[a] = b;
-+}
-+
- // an expert cache's gather mirror, allocated at load (not inside a request)
- static void ggml_backend_opencl_reserve_gather(ggml_backend_dev_t dev, size_t q, size_t d) {
-     ggml_backend_opencl_context * ctx = ((ggml_backend_opencl_device_context *) dev->context)->backend_ctx;
-     if (q) ctx->prealloc_kq_stage_q.allocate(ctx->context, q);
-     if (d) ctx->prealloc_kq_stage_d.allocate(ctx->context, d);
-+    if (q && ggml_cl_moe_prefetch_on()) ctx->prealloc_kq_pf_b.allocate(ctx->context, q);
- }
- 
- static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
-@@ -14172,6 +14701,9 @@ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, c
+@@ -14172,6 +14483,9 @@ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, c
      if (strcmp(name, "ggml_backend_opencl_get_tensors") == 0) {
          return (void *) ggml_backend_opencl_get_tensors;
      }
@@ -923,17 +674,7 @@ index 44de857c1..29e5e0f45 100644
      if (strcmp(name, "ggml_backend_opencl_get_tensor_slices") == 0) {
          return (void *) ggml_backend_opencl_get_tensor_slices;
      }
-@@ -14181,6 +14713,9 @@ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, c
-     if (strcmp(name, "ggml_backend_opencl_reserve_gather") == 0) {
-         return (void *) ggml_backend_opencl_reserve_gather;
-     }
-+    if (strcmp(name, "ggml_backend_opencl_chain_prefetch") == 0) {
-+        return (void *) ggml_backend_opencl_chain_prefetch;
-+    }
-     if (strcmp(name, "ggml_backend_opencl_pair_bank") == 0) {
-         return (void *) ggml_backend_opencl_pair_bank;
-     }
-@@ -14582,6 +15117,9 @@ static void ggml_backend_opencl_get_tensor_slices(const ggml_tensor * tensor, vo
+@@ -14582,6 +14896,9 @@ static void ggml_backend_opencl_get_tensor_slices(const ggml_tensor * tensor, vo
                      memcpy(dst + b * blk, dq.first + (i2 * bps + b) * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
                      memcpy(dst + b * blk + sizeof(ggml_fp16_t), dq.second + (i2 * bps + b) * qb, qb);
                  }
@@ -943,7 +684,7 @@ index 44de857c1..29e5e0f45 100644
              } else {
                  ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
                  memcpy(data, (const char *) bctx->usm + e->offset + (size_t) i2 * tensor->nb[2], (size_t) n * tensor->nb[2]);
-@@ -14692,6 +15230,22 @@ static void ggml_backend_opencl_get_tensors(const ggml_tensor * const * tensors,
+@@ -14692,6 +15009,22 @@ static void ggml_backend_opencl_get_tensors(const ggml_tensor * const * tensors,
      CL_CHECK(clFinish(queue));
  }
  
@@ -966,7 +707,7 @@ index 44de857c1..29e5e0f45 100644
  // Writes slices [i2, i2 + n) along dimension 2 of a weight tensor from
  // GGUF-layout bytes, in the layout the tensor keeps on the card: Q8_0 (once
  // converted) and IQ4_NL as all scales, then all quants, block by block as
-@@ -14714,6 +15268,9 @@ static void ggml_backend_opencl_set_tensor_slices(ggml_tensor * tensor, const vo
+@@ -14714,6 +15047,9 @@ static void ggml_backend_opencl_set_tensor_slices(ggml_tensor * tensor, const vo
                      memcpy(dq.first + (i2 * bps + b) * sizeof(ggml_fp16_t), src + b * blk, sizeof(ggml_fp16_t));
                      memcpy(dq.second + (i2 * bps + b) * qb, src + b * blk + sizeof(ggml_fp16_t), qb);
                  }
@@ -976,7 +717,7 @@ index 44de857c1..29e5e0f45 100644
              } else {
                  ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
                  memcpy((char *) bctx->usm + e->offset + (size_t) i2 * tensor->nb[2], data, (size_t) n * tensor->nb[2]);
-@@ -14759,6 +15316,10 @@ static void ggml_backend_opencl_set_tensor_slices(ggml_tensor * tensor, const vo
+@@ -14759,6 +15095,10 @@ static void ggml_backend_opencl_set_tensor_slices(ggml_tensor * tensor, const vo
          return;
      }
  #endif
@@ -987,7 +728,7 @@ index 44de857c1..29e5e0f45 100644
      {
          // a plain tensor: a non-blocking write; the caller keeps `data` until the
          // next synchronization (llama_expert_cache's tables live in the layer)
-@@ -14837,6 +15398,12 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
+@@ -14837,6 +15177,12 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
                              : backend_ctx->kernel_set_rows_f32_i32;
                  break;
              case GGML_TYPE_F16:
@@ -1000,7 +741,7 @@ index 44de857c1..29e5e0f45 100644
                  kernel = (src1->type == GGML_TYPE_I64)
                              ? backend_ctx->kernel_set_rows_f16_i64
                              : backend_ctx->kernel_set_rows_f16_i32;
-@@ -15001,9 +15568,17 @@ static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const
+@@ -15001,9 +15347,17 @@ static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const
  
      cl_kernel kernel;
  
@@ -1021,7 +762,7 @@ index 44de857c1..29e5e0f45 100644
          GGML_ASSERT(ggml_is_contiguous(src0));
          GGML_ASSERT(ne11 == 1);
      }
-@@ -15012,7 +15587,7 @@ static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const
+@@ -15012,7 +15366,7 @@ static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const
          GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
          if (bcast_row) {
              kernel = backend_ctx->kernel_add_row;
@@ -1030,7 +771,7 @@ index 44de857c1..29e5e0f45 100644
              CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
              CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
              CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra1->data_device));
-@@ -16236,13 +16811,21 @@ static void ggml_cl_fill(ggml_backend_t backend, const ggml_tensor * src0, const
+@@ -16236,13 +16590,21 @@ static void ggml_cl_fill(ggml_backend_t backend, const ggml_tensor * src0, const
      memcpy(&v, ((int32_t *) dst->op_params), sizeof(float));
  
      const int64_t n = ggml_nelements(dst);
@@ -1055,7 +796,7 @@ index 44de857c1..29e5e0f45 100644
  
      size_t local_work_size[1] = { 256 };
      size_t global_work_size[1] = { ((size_t)n + local_work_size[0] - 1) / local_work_size[0] * local_work_size[0] };
-@@ -17487,7 +18070,7 @@ static void ggml_cl_repeat(ggml_backend_t backend, const ggml_tensor * src0, con
+@@ -17487,7 +17849,7 @@ static void ggml_cl_repeat(ggml_backend_t backend, const ggml_tensor * src0, con
      const cl_ulong nb2 = dst->nb[2];
      const cl_ulong nb3 = dst->nb[3];
  
@@ -1064,7 +805,7 @@ index 44de857c1..29e5e0f45 100644
  
      CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
      CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
-@@ -17839,6 +18422,70 @@ static void ggml_cl_concat(ggml_backend_t backend, const ggml_tensor * src0, con
+@@ -17839,6 +18201,70 @@ static void ggml_cl_concat(ggml_backend_t backend, const ggml_tensor * src0, con
      }
  }
  
@@ -1135,18 +876,13 @@ index 44de857c1..29e5e0f45 100644
  static void ggml_cl_timestep_embedding(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -25030,6 +25677,21 @@ static cl_mem g_kq_stage_q = nullptr, g_kq_stage_d = nullptr;
+@@ -25030,6 +25456,16 @@ static cl_mem g_kq_stage_q = nullptr, g_kq_stage_d = nullptr;
  // the single branch: the mirror for the matvec's trailing arguments
  static cl_mem g_kq_single_q = nullptr, g_kq_single_d = nullptr;
  static int    g_kq_single_split = 0;
-+static int    g_kq_single_nbank = 0;   // the bank's entries: ids run to split + nbank
 +// the decode branch reading the USM bank by pointer (GGML_OPENCL_BANK_DIRECT,
 +// default on): the matvec's mirror argument
 +static const void * g_kq_single_ptr = nullptr;
-+// the next projection's copy this matvec makes (GGML_OPENCL_MOE_PREFETCH): source bank, mirror, 16-byte units an expert
-+static const void * g_kq_pf_src = nullptr;
-+static cl_mem       g_kq_pf_dst = nullptr;
-+static cl_ulong     g_kq_pf_n16 = 0;
 +
 +// blocks as the GGUF stores them (buffer, byte offset): IQ3_XXS, IQ4_XS and
 +// the low-bit types
@@ -1157,7 +893,7 @@ index 44de857c1..29e5e0f45 100644
  
  static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, cl_uint & a) {
      const ggml_tensor * soa0 = src0->view_src != nullptr ? src0->view_src : src0;
-@@ -25045,7 +25707,7 @@ static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, c
+@@ -25045,7 +25481,7 @@ static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, c
          // base and the offset, or IQ4_NL's scales and quants)
          auto * bctx = (ggml_backend_opencl_buffer_context *) soa0->buffer->context;
          if (bctx->usm) {
@@ -1166,7 +902,7 @@ index 44de857c1..29e5e0f45 100644
                  ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *)src0->extra;
                  const cl_ulong off = e->offset + src0->view_offs;
                  CL_CHECK(g_cl_set_arg_ptr(kernel, a++, bctx->usm));
-@@ -25053,7 +25715,7 @@ static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, c
+@@ -25053,7 +25489,7 @@ static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, c
                  CL_CHECK(g_cl_set_arg_ptr(kernel, a++, bctx->usm));
                  return;
              }
@@ -1175,7 +911,7 @@ index 44de857c1..29e5e0f45 100644
              const auto & dq = bctx->usm_split.at(soa0);
              const cl_ulong off = 0;
              CL_CHECK(g_cl_set_arg_ptr(kernel, a++, dq.second));
-@@ -25062,7 +25724,7 @@ static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, c
+@@ -25062,7 +25498,7 @@ static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, c
              return;
          }
      }
@@ -1184,7 +920,7 @@ index 44de857c1..29e5e0f45 100644
          ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *)src0->extra;
          const cl_ulong off = e->offset + src0->view_offs;
          CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &e->data_device));
-@@ -25104,13 +25766,19 @@ static int ggml_cl_kq_type_index(ggml_type t) {
+@@ -25104,13 +25540,19 @@ static int ggml_cl_kq_type_index(ggml_type t) {
          case GGML_TYPE_IQ3_XXS: return 3;
          case GGML_TYPE_IQ4_XS:  return 4;
          case GGML_TYPE_IQ4_NL:  return 5;
@@ -1206,7 +942,7 @@ index 44de857c1..29e5e0f45 100644
  }
  
  // Q4_K and Q5_K subtract a min per sub-block: their kernels read the
-@@ -25359,14 +26027,28 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
+@@ -25359,14 +25801,28 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
  // over a work-group; more: the tiled GEMM with K cut into slices run as its
  // batch dimension, then the slices summed. GGML_OPENCL_F32_SKINNY=0 keeps
  // ggml's paths. Returns whether it took the product.
@@ -1236,7 +972,7 @@ index 44de857c1..29e5e0f45 100644
          !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
          return false;
      }
-@@ -25464,10 +26146,111 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -25464,10 +25920,105 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
  
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
  
@@ -1321,13 +1057,7 @@ index 44de857c1..29e5e0f45 100644
 +        const cl_ulong offa = e0->offset + src0->view_offs, offb = e1->offset + src1->view_offs, offd = ed->offset + dst->view_offs;
 +        const cl_ulong nb11 = src1->nb[1], nb1 = dst->nb[1];
 +        const int ne00_ = (int) src0->ne[0], ne01_ = (int) src0->ne[1], nc = (int) src1->ne[1];
-+        // GGML_OPENCL_F16_KSPLIT4=1: 4 rows a work-group for a long K and 64+ rows
-+        static const char * k4_env = getenv("GGML_OPENCL_F16_KSPLIT4");
-+        static const bool   k4_on  = k4_env != nullptr && atoi(k4_env) != 0;
-+        const bool k4 = f16_ksplit && k4_on && backend_ctx->kernel_mul_mv_f16_f32_ksplit4 != nullptr &&
-+                        src0->ne[0] >= 8192 && src0->ne[1] >= 64;
-+        cl_kernel k = k4 ? backend_ctx->kernel_mul_mv_f16_f32_ksplit4 :
-+                      f16_ksplit ? backend_ctx->kernel_mul_mv_f16_f32_ksplit : backend_ctx->kernel_mul_mv_f16_f32_nc;
++        cl_kernel k = f16_ksplit ? backend_ctx->kernel_mul_mv_f16_f32_ksplit : backend_ctx->kernel_mul_mv_f16_f32_nc;
 +        CL_CHECK(clSetKernelArg(k,  0, sizeof(cl_mem),   &e0->data_device));
 +        CL_CHECK(clSetKernelArg(k,  1, sizeof(cl_ulong), &offa));
 +        CL_CHECK(clSetKernelArg(k,  2, sizeof(cl_mem),   &e1->data_device));
@@ -1340,7 +1070,7 @@ index 44de857c1..29e5e0f45 100644
 +        CL_CHECK(clSetKernelArg(k,  9, sizeof(int),      &ne01_));
 +        CL_CHECK(clSetKernelArg(k, 10, sizeof(int),      &nc));
 +        size_t lws[1] = { f16_ksplit ? (size_t) 256 : (size_t) 64 };   // ksplit: a row a work-group; nc: four sub-groups of 16, four rows each
-+        size_t gws[1] = { k4 ? (size_t) CEIL_DIV(ne01_, 4) * 256 : f16_ksplit ? (size_t) ne01_ * 256 : (size_t) CEIL_DIV(ne01_, 16) * 64 };
++        size_t gws[1] = { f16_ksplit ? (size_t) ne01_ * 256 : (size_t) CEIL_DIV(ne01_, 16) * 64 };
 +        backend_ctx->enqueue_ndrange_kernel(k, 1, gws, lws, dst);
 +        return;
 +    }
@@ -1348,35 +1078,7 @@ index 44de857c1..29e5e0f45 100644
      // quant kv without FA
      // used for non-contiguous src0 (the usual head-major permuted K view when n_head_kv>1)
      // AND for the contiguous case that occurs when n_head_kv==1 (e.g. Gemma-4 E2B)
-@@ -27916,6 +28699,27 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
-     const bool id2 = gemm && (id2_env == nullptr ? id2_default : atoi(id2_env) != 0) && backend_ctx->kernel_mul_mm_id2_kq_f16[ti] != nullptr;
-     cl_kernel kernel = id2 ? backend_ctx->kernel_mul_mm_id2_kq_f16[ti] :
-                        gemm ? backend_ctx->kernel_mul_mm_id_kq_f16[ti] : backend_ctx->kernel_mul_mv_id_kq_q8_1[ti];
-+    // 2-15 tokens (a verify window): the matvec grouped by expert, one read of
-+    // an expert's weights for its tokens. Opt-in (GGML_OPENCL_KQ_IDG=1): slower
-+    // than one pair a work-group where the matvec is not bandwidth-bound (the
-+    // coder's MTP 4 verify on the A770 7.85 -> 9.18 s for 500 tokens, Flash-Next
-+    // IQ2_XS MTP 2 on the B60 125 -> 131 ms a verify; measured-here)
-+    static const char * idg_env = getenv("GGML_OPENCL_KQ_IDG");
-+    const bool idg = !gemm && n_tok >= 2 && (idg_env != nullptr && atoi(idg_env) != 0) &&
-+                     backend_ctx->kernel_mul_mv_idg_kq_q8_1[ti] != nullptr;
-+    if (idg) {
-+        kernel = backend_ctx->kernel_mul_mv_idg_kq_q8_1[ti];
-+    }
-+    // GGML_OPENCL_KQ_GROUPED=1: 2-4 tokens of a low-bit type in rows 16 lanes divide,
-+    // grouped by expert from kernel_moe_pair_groups (an expert two tokens share read
-+    // and decoded once, as Strata's verify does)
-+    static const char * gg_env = getenv("GGML_OPENCL_KQ_GROUPED");
-+    const bool grouped = !gemm && !idg && n_tok >= 2 && n_tok <= 4 && ti >= 6 && (ne00 / 32) % 16 == 0 &&
-+                         gg_env != nullptr && atoi(gg_env) != 0 && backend_ctx->kernel_mul_mv_idgg_kq_q8_1[ti] != nullptr &&
-+                         backend_ctx->kernel_moe_pair_groups != nullptr && n_used * n_tok <= 256;
-+    if (grouped) {
-+        kernel = backend_ctx->kernel_mul_mv_idgg_kq_q8_1[ti];
-+    }
-     if (kernel == nullptr) {
-         return false;
-     }
-@@ -27956,14 +28760,62 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -27956,14 +28507,30 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
              if (it != g_cache_pairs.end()) { bank0 = it->second.first; n_split = it->second.second; single = true; }
          }
          auto * bctx0 = (ggml_backend_opencl_buffer_context *) bank0->buffer->context;
@@ -1392,34 +1094,6 @@ index 44de857c1..29e5e0f45 100644
 +            g_kq_single_ptr   = (const char *) bctx0->usm + e0->offset + bank0->view_offs;
 +            g_kq_single_q     = g_kq_single_d = extrad->data_device;   // non-null: the single branch
 +            g_kq_single_split = n_split;
-+            g_kq_single_nbank = (int) bank0->ne[2];
-+            // this projection's misses, copied by the previous projection's matvec
-+            cl_mem read_mirror = nullptr;
-+            if (g_pf.slot == src0 && g_pf.ids == ids && g_pf.mirror != nullptr) {
-+                read_mirror     = g_pf.mirror;
-+                g_kq_single_ptr = nullptr;
-+                g_kq_single_q   = g_kq_single_d = read_mirror;
-+            }
-+            g_pf = {};
-+            // the next projection's, copied by this one
-+            auto ic = ggml_cl_moe_prefetch_on() ? g_cache_chain.find(src0) : g_cache_chain.end();
-+            if (ic != g_cache_chain.end() && backend_ctx->prealloc_kq_pf_b.buffer != nullptr) {
-+                auto ib = g_cache_pairs.find(ic->second);
-+                if (ib != g_cache_pairs.end()) {
-+                    const ggml_tensor * nb_ = ib->second.first;
-+                    auto * nctx = (ggml_backend_opencl_buffer_context *) nb_->buffer->context;
-+                    ggml_tensor_extra_cl * en = (ggml_tensor_extra_cl *) nb_->extra;
-+                    cl_mem dstm = read_mirror == backend_ctx->prealloc_kq_stage_q.buffer ? backend_ctx->prealloc_kq_pf_b.buffer
-+                                                                                    : backend_ctx->prealloc_kq_stage_q.buffer;
-+                    if (nctx->usm && nb_->type != GGML_TYPE_IQ4_NL && nb_->nb[2] % 16 == 0 && ib->second.second == n_split &&
-+                        dstm != nullptr) {
-+                        g_kq_pf_src = (const char *) nctx->usm + en->offset + nb_->view_offs;
-+                        g_kq_pf_dst = dstm;
-+                        g_kq_pf_n16 = nb_->nb[2] / 16;
-+                        g_pf = { ic->second, ids, dstm };
-+                    }
-+                }
-+            }
 +        } else if (bctx0->usm && backend_ctx->kernel_moe_gather_experts != nullptr) {
              auto gather = [&](const void * src, ggml_cl_buffer & stage, size_t per_expert, int n_split) {
                  GGML_ASSERT(per_expert % 16 == 0);
@@ -1428,14 +1102,10 @@ index 44de857c1..29e5e0f45 100644
 -                if (!gemm && backend_ctx->kernel_moe_gather_pairs != nullptr) {
 -                    // a few tokens (a decode step, a verify): a grid over the pairs (a
 -                    // repeated expert is copied twice, the same bytes)
-+                // GGML_OPENCL_GATHER_PAIRS_MULTI=1: the pair grid (an expert two pairs
-+                // share copied by the first) for a few tokens too; GGML_OPENCL_GATHER_CHUNKS:
-+                // the work-groups an expert's bytes are cut into (16)
-+                static const char * gpm_env = getenv("GGML_OPENCL_GATHER_PAIRS_MULTI");
-+                static const bool   gpm     = gpm_env != nullptr && atoi(gpm_env) != 0;
++                // GGML_OPENCL_GATHER_CHUNKS: the work-groups an expert's bytes are cut into (16)
 +                static const char * gch_env = getenv("GGML_OPENCL_GATHER_CHUNKS");
 +                static const size_t gch     = gch_env != nullptr && atoi(gch_env) > 0 ? (size_t) atoi(gch_env) : 16;
-+                if (!gemm && (n_tok == 1 || gpm) && backend_ctx->kernel_moe_gather_pairs != nullptr) {
++                if (!gemm && n_tok == 1 && backend_ctx->kernel_moe_gather_pairs != nullptr) {
 +                    // one token (a decode step): a grid over its pairs, distinct experts.
 +                    // Several (a verify window) take the per-expert grid below: an
 +                    // expert two tokens route to is copied once (the pair grid spent
@@ -1443,7 +1113,7 @@ index 44de857c1..29e5e0f45 100644
                      cl_kernel kg = backend_ctx->kernel_moe_gather_pairs;
                      CL_CHECK(g_cl_set_arg_ptr(kg, 0, src));
                      CL_CHECK(clSetKernelArg(kg, 1, sizeof(cl_mem),   &stage.buffer));
-@@ -27974,7 +28826,7 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -27974,7 +28541,7 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
                      CL_CHECK(clSetKernelArg(kg, 6, sizeof(int),      &n_used));
                      CL_CHECK(clSetKernelArg(kg, 7, sizeof(int),      &n_split));
                      size_t g_local[2]  = { 256, 1 };
@@ -1452,7 +1122,7 @@ index 44de857c1..29e5e0f45 100644
                      backend_ctx->enqueue_ndrange_kernel(kg, 2, g_global, g_local, dst);
                      return stage.buffer;
                  }
-@@ -27987,8 +28839,10 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -27987,8 +28554,10 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
                  CL_CHECK(clSetKernelArg(kg, 5, sizeof(cl_ulong), &nbi1));
                  CL_CHECK(clSetKernelArg(kg, 6, sizeof(int),      &n_used));
                  CL_CHECK(clSetKernelArg(kg, 7, sizeof(int),      &n_tok));
@@ -1464,21 +1134,16 @@ index 44de857c1..29e5e0f45 100644
                  backend_ctx->enqueue_ndrange_kernel(kg, 2, g_global, g_local, dst);
                  return stage.buffer;
              };
-@@ -28006,11 +28860,12 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
-                 // goes in the matvec's trailing ones (below)
-                 g_kq_single_q = g_kq_stage_q; g_kq_single_d = g_kq_stage_d != nullptr ? g_kq_stage_d : g_kq_stage_q;
-                 g_kq_single_split = n_split;
-+                g_kq_single_nbank = (int) bank0->ne[2];
-                 g_kq_stage_q = g_kq_stage_d = nullptr;
+@@ -28010,7 +28579,7 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
              }
          }
      }
 -    struct kq_stage_reset { ~kq_stage_reset() { g_kq_stage_q = g_kq_stage_d = g_kq_single_q = g_kq_single_d = nullptr; g_kq_single_split = 0; } } kq_stage_reset_;
-+    struct kq_stage_reset { ~kq_stage_reset() { g_kq_stage_q = g_kq_stage_d = g_kq_single_q = g_kq_single_d = nullptr; g_kq_single_split = 0; g_kq_single_nbank = 0; g_kq_single_ptr = nullptr; g_kq_pf_src = nullptr; g_kq_pf_dst = nullptr; g_kq_pf_n16 = 0; } } kq_stage_reset_;
++    struct kq_stage_reset { ~kq_stage_reset() { g_kq_stage_q = g_kq_stage_d = g_kq_single_q = g_kq_single_d = nullptr; g_kq_single_split = 0; g_kq_single_ptr = nullptr; } } kq_stage_reset_;
  
      cl_uint a = 0;
      if (!gemm) {
-@@ -28040,11 +28895,132 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -28040,9 +28609,44 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
              const cl_mem q2 = g_kq_single_q != nullptr ? g_kq_single_q : extrad->data_device;
              const cl_mem d2 = g_kq_single_d != nullptr ? g_kq_single_d : extrad->data_device;
              const int    ns = g_kq_single_q != nullptr ? g_kq_single_split : INT_MAX;
@@ -1492,34 +1157,6 @@ index 44de857c1..29e5e0f45 100644
 +                CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &d2));
 +            }
              CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),    &ns));
-+            if (grouped) {
-+                // the groups of these ids (kept for the layer's other projections)
-+                if (backend_ctx->pair_grp_t != ids || backend_ctx->pair_grp_split != ns) {
-+                    backend_ctx->prealloc_pair_grp.allocate(backend_ctx->context, 256 * 5 * sizeof(cl_int));
-+                    backend_ctx->prealloc_pair_ngrp.allocate(backend_ctx->context, sizeof(cl_int));
-+                    cl_kernel kg = backend_ctx->kernel_moe_pair_groups;
-+                    const int n_pairs_g = n_used * n_tok;
-+                    CL_CHECK(clSetKernelArg(kg, 0, sizeof(cl_mem),   &extra2->data_device));
-+                    CL_CHECK(clSetKernelArg(kg, 1, sizeof(cl_ulong), &offseti));
-+                    CL_CHECK(clSetKernelArg(kg, 2, sizeof(cl_ulong), &nbi1));
-+                    CL_CHECK(clSetKernelArg(kg, 3, sizeof(int),      &n_used));
-+                    CL_CHECK(clSetKernelArg(kg, 4, sizeof(int),      &n_pairs_g));
-+                    CL_CHECK(clSetKernelArg(kg, 5, sizeof(int),      &ns));
-+                    CL_CHECK(clSetKernelArg(kg, 6, sizeof(cl_mem),   &backend_ctx->prealloc_pair_grp.buffer));
-+                    CL_CHECK(clSetKernelArg(kg, 7, sizeof(cl_mem),   &backend_ctx->prealloc_pair_ngrp.buffer));
-+                    size_t gl[1] = { 256 }, gg[1] = { 256 };
-+                    backend_ctx->enqueue_ndrange_kernel(kg, 1, gg, gl, dst);
-+                    backend_ctx->pair_grp_t = ids; backend_ctx->pair_grp_split = ns;
-+                }
-+                CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_pair_grp.buffer));
-+                CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_pair_ngrp.buffer));
-+                g_pf = {};   // the grouped kernel copies nothing for the next projection
-+                const int rows_per_wg_g = backend_ctx->kq_q8_1_ndst * 4;
-+                size_t gws_g[] = { (size_t)CEIL_DIV(ne01, rows_per_wg_g) * 16, 4, (size_t)n_used * n_tok };
-+                size_t lws_g[] = { 16, 4, 1 };
-+                backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws_g, lws_g, dst);
-+                return true;
-+            }
 +            // GGML_OPENCL_PAIR_ORDER: 1 the bank's pairs (read over the link) first,
 +            // 2 last, 0 in token order; a permutation per ids, kept for the layer's
 +            // other projections
@@ -1528,12 +1165,10 @@ index 44de857c1..29e5e0f45 100644
 +            static const char * po_env = getenv("GGML_OPENCL_PAIR_ORDER");
 +            static const int    po     = po_env != nullptr ? atoi(po_env) : 1;
 +            const int n_pairs_po = n_used * n_tok;
-+            const bool pf = g_kq_pf_src != nullptr;
-+            cl_mem perm = nullptr, pf_first = nullptr;
-+            if (!idg && (po != 0 || pf) && g_kq_single_q != nullptr && backend_ctx->kernel_moe_pair_perm != nullptr && n_pairs_po <= 256) {
++            cl_mem perm = nullptr;
++            if (po != 0 && g_kq_single_q != nullptr && backend_ctx->kernel_moe_pair_perm != nullptr && n_pairs_po <= 256) {
 +                if (backend_ctx->pair_perm_t != ids || backend_ctx->pair_perm_split != g_kq_single_split) {
 +                    backend_ctx->prealloc_pair_perm.allocate(backend_ctx->context, 256 * sizeof(cl_int));
-+                    backend_ctx->prealloc_pair_first.allocate(backend_ctx->context, 256 * sizeof(cl_int));
 +                    cl_kernel kp = backend_ctx->kernel_moe_pair_perm;
 +                    const int bank_first = po;
 +                    const int split = g_kq_single_split;
@@ -1545,75 +1180,17 @@ index 44de857c1..29e5e0f45 100644
 +                    CL_CHECK(clSetKernelArg(kp, 5, sizeof(int),      &split));
 +                    CL_CHECK(clSetKernelArg(kp, 6, sizeof(int),      &bank_first));
 +                    CL_CHECK(clSetKernelArg(kp, 7, sizeof(cl_mem),   &backend_ctx->prealloc_pair_perm.buffer));
-+                    CL_CHECK(clSetKernelArg(kp, 8, sizeof(cl_mem),   &backend_ctx->prealloc_pair_first.buffer));
 +                    size_t pl[1] = { 256 }, pg[1] = { 256 };
 +                    backend_ctx->enqueue_ndrange_kernel(kp, 1, pg, pl, dst);
 +                    backend_ctx->pair_perm_t = ids; backend_ctx->pair_perm_split = g_kq_single_split;
 +                }
-+                perm     = backend_ctx->prealloc_pair_perm.buffer;
-+                pf_first = pf ? backend_ctx->prealloc_pair_first.buffer : nullptr;
++                perm = backend_ctx->prealloc_pair_perm.buffer;
 +            }
 +            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &perm));
-+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &pf_first));
-+            if (pf && pf_first != nullptr) {
-+                CL_CHECK(g_cl_set_arg_ptr(kernel, a++, g_kq_pf_src));
-+                CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &g_kq_pf_dst));
-+            } else {
-+                const cl_mem none = nullptr;
-+                CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &none));
-+                CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &none));
-+                if (pf) g_pf = {};   // no copy made: the next projection reads its misses where they lie
-+            }
-+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &g_kq_pf_n16));
          }
          const int rows_per_wg = backend_ctx->kq_q8_1_ndst * 4;
-+        if (idg) {
-+            // the pairs sorted by expert into tiles of up to 8 (IDG_MAX); with an
-+            // expert cache's single branch the ids run past n_expert (slots, then
-+            // split + bank entries)
-+            const int n_pairs  = n_used * n_tok;
-+            const int n_route  = g_kq_single_q != nullptr ? g_kq_single_split + g_kq_single_nbank : n_expert;
-+            const int tile     = 8;
-+            const int max_tiles = CEIL_DIV(n_pairs, tile) + std::min(n_route, n_pairs);
-+            GGML_ASSERT(n_route <= 1024);
-+            backend_ctx->prealloc_kq_pairs.allocate(backend_ctx->context, (size_t)n_pairs * sizeof(cl_int));
-+            backend_ctx->prealloc_kq_tiles.allocate(backend_ctx->context, (size_t)max_tiles * sizeof(cl_int4));
-+            backend_ctx->prealloc_kq_ntiles.allocate(backend_ctx->context, sizeof(cl_int));
-+            cl_mem pairs = backend_ctx->prealloc_kq_pairs.buffer, tiles = backend_ctx->prealloc_kq_tiles.buffer,
-+                   ntiles = backend_ctx->prealloc_kq_ntiles.buffer;
-+            cl_kernel kr = backend_ctx->kernel_moe_route_tiles;
-+            CL_CHECK(clSetKernelArg(kr, 0, sizeof(cl_mem),   &extra2->data_device));
-+            CL_CHECK(clSetKernelArg(kr, 1, sizeof(cl_ulong), &offseti));
-+            CL_CHECK(clSetKernelArg(kr, 2, sizeof(cl_ulong), &nbi1));
-+            CL_CHECK(clSetKernelArg(kr, 3, sizeof(int),      &n_used));
-+            CL_CHECK(clSetKernelArg(kr, 4, sizeof(int),      &n_tok));
-+            CL_CHECK(clSetKernelArg(kr, 5, sizeof(int),      &n_route));
-+            CL_CHECK(clSetKernelArg(kr, 6, sizeof(int),      &tile));
-+            CL_CHECK(clSetKernelArg(kr, 7, sizeof(cl_mem),   &pairs));
-+            CL_CHECK(clSetKernelArg(kr, 8, sizeof(cl_mem),   &tiles));
-+            CL_CHECK(clSetKernelArg(kr, 9, sizeof(cl_mem),   &ntiles));
-+            size_t r_local[1] = { 256 }, r_global[1] = { 256 };
-+            backend_ctx->enqueue_ndrange_kernel(kr, 1, r_global, r_local, dst);
-+            backend_ctx->kq_route.ids = nullptr;   // the GEMM's route cache no longer holds these buffers' contents
-+            if (g_kq_single_q == nullptr) {
-+                // an expert cache's two-branch graph routes -1 for the other
-+                // branch's pairs: the router drops them, their rows must read zero
-+                const float zero = 0.0f;
-+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, extrad->data_device, &zero, sizeof(zero), offsetd,
-+                                             ggml_nbytes(dst), 0, NULL, NULL));
-+            }
-+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &pairs));
-+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &tiles));
-+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &ntiles));
-+            size_t global_work_size[] = { (size_t)CEIL_DIV(ne01, rows_per_wg) * 16, 4, (size_t)max_tiles };
-+            size_t local_work_size[]  = { 16, 4, 1 };
-+            backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
-+            return true;
-+        }
          size_t global_work_size[] = { (size_t)CEIL_DIV(ne01, rows_per_wg) * 16, 4, (size_t)n_used * n_tok };
-         size_t local_work_size[]  = { 16, 4, 1 };
-         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
-@@ -30679,6 +31655,9 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const
+@@ -30679,6 +31283,9 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const
                                         ? backend_ctx->kernel_cpy_f32_f32_pack
                                         : backend_ctx->kernel_cpy_f32_f32;
                      break;
@@ -1623,7 +1200,7 @@ index 44de857c1..29e5e0f45 100644
                  default:
                      GGML_ASSERT(false && "not implemented");
              }
-@@ -30700,6 +31679,9 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const
+@@ -30700,6 +31307,9 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const
                  case GGML_TYPE_I32:
                      kernel = backend_ctx->kernel_cpy_i32_i32;
                      break;
@@ -1633,7 +1210,7 @@ index 44de857c1..29e5e0f45 100644
                  default:
                      GGML_ASSERT(false && "not implemented");
              }
-@@ -31413,6 +32395,49 @@ static void ggml_cl_im2col(ggml_backend_t backend, const ggml_tensor * src0, con
+@@ -31413,6 +32023,49 @@ static void ggml_cl_im2col(ggml_backend_t backend, const ggml_tensor * src0, con
      backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
  }
  
@@ -1683,7 +1260,7 @@ index 44de857c1..29e5e0f45 100644
  static void ggml_cl_argsort(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -32273,6 +33298,18 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+@@ -32273,6 +32926,18 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
              }
              ggml_cl_timestep_embedding(backend, tensor->src[0], tensor);
              return true;
@@ -1702,7 +1279,7 @@ index 44de857c1..29e5e0f45 100644
          case GGML_OP_MUL_MAT:
              if (!any_on_device && !ggml_cl_can_mul_mat(tensor->src[0], tensor->src[1], tensor)) {
                  return false;
-@@ -32342,6 +33379,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+@@ -32342,6 +33007,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
              }
              func = ggml_cl_argsort;
              break;
@@ -1908,7 +1485,7 @@ index 9b73938d9..6700aa564 100644
 +    }
 +}
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
-index 45ad5c7b5..7fdfc0bba 100644
+index 45ad5c7b5..45dc59102 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
 @@ -510,6 +510,1149 @@ static inline void deq_iq4_nl(local half * wt, global const uchar * q, global co
@@ -3061,7 +2638,7 @@ index 45ad5c7b5..7fdfc0bba 100644
  // ---- the GEMM body. Per token group: the lane's column `tok` (an f16
  // column of xh, any valid one when the lane has none) and its output byte
  // offset in dst (`outp`, negative: none); `wrow0` is the weight matrix's
-@@ -650,12 +1793,37 @@ kernel void kernel_mul_mm_q6_K_f16(global const uchar * ql, global const uchar *
+@@ -650,6 +1793,29 @@ kernel void kernel_mul_mm_q6_K_f16(global const uchar * ql, global const uchar *
      MM_BODY(deq_q6_K(wt, ql, qh, s, d, wrow0, row0, ne01 , nb, ib))
  }
  
@@ -3091,16 +2668,7 @@ index 45ad5c7b5..7fdfc0bba 100644
  // ---- MUL_MAT_ID routing: the (token, slot) pairs sorted by expert and cut
  // into tiles of `tile` pairs of one expert (expert, first pair, count); one
  // work-group. ----
- 
- #ifndef MAX_EXPERT
--#define MAX_EXPERT 512
-+// 1024: an expert cache's single branch routes slot ids and n_split + bank
-+// entries, past n_expert (patch 0022's grouped decode)
-+#define MAX_EXPERT 1024
- #endif
- 
- // one work-group
-@@ -696,15 +1864,18 @@ kernel void kernel_moe_route_tiles(global const char * ids, ulong offi, ulong nb
+@@ -696,15 +1862,18 @@ kernel void kernel_moe_route_tiles(global const char * ids, ulong offi, ulong nb
  // copied into a card-side mirror at the same offsets with 16-byte loads (the
  // link's rate; the MoE kernels' own loads reach a tenth of it over the link).
  // Group (c, e): expert e, chunk c of its bytes. ----
@@ -3121,7 +2689,7 @@ index 45ad5c7b5..7fdfc0bba 100644
      }
      barrier(CLK_LOCAL_MEM_FENCE);
      if (!used) return;
-@@ -725,6 +1896,10 @@ kernel void kernel_moe_gather_pairs(global const uint4 * src, global uint4 * dst
+@@ -725,6 +1894,10 @@ kernel void kernel_moe_gather_pairs(global const uint4 * src, global uint4 * dst
      const int p = get_group_id(1);
      int e = ((global const int *)(ids + offi + (p / n_used) * nbi1))[p % n_used];
      if (e < n_split) return;
@@ -3132,7 +2700,7 @@ index 45ad5c7b5..7fdfc0bba 100644
      e -= n_split;
      // chunk c: a contiguous slice, streamed by the group (page by page)
      const ulong base = (ulong) e * n16;
-@@ -823,6 +1998,66 @@ kernel void kernel_mul_mm_id_iq4_nl_f16(global const uchar * q, ulong offq, glob
+@@ -823,6 +1996,66 @@ kernel void kernel_mul_mm_id_iq4_nl_f16(global const uchar * q, ulong offq, glob
      MM_BODY(deq_iq4_nl(wt, q + offq, dp, wrow0, row0, ne01, ne00 / 32, ib))
  }
  
@@ -3200,26 +2768,10 @@ index 45ad5c7b5..7fdfc0bba 100644
  // OpenVINO patch 0064): a work-group takes up to XT pairs of one expert (a
  // tile of kernel_moe_route_tiles) and XSG * SG weight rows, one row per lane.
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
-index 22e8eee1d..3ba84e10c 100644
+index 22e8eee1d..3aed98720 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
-@@ -25,6 +25,15 @@
- #ifndef NCOLS
- #define NCOLS 1
- #endif
-+// the activation's residual term (kernel_quantize_q8_1: x = d q + d2 q2);
-+// -DKQ_ONE_TERM drops it from the dot products, as llama.cpp's and Strata's
-+// single q8_1 do (the residual's loads are then dead)
-+#ifdef KQ_ONE_TERM
-+#define KQ_RES(e) 0.f
-+#else
-+#define KQ_RES(e) (e)
-+#endif
-+
- #define QK_K 256
- 
- // ggml-common.h tables (byte-exact copies)
-@@ -86,6 +95,1105 @@ constant char kvalues_iq4nl[16] = {
+@@ -86,6 +86,1105 @@ constant char kvalues_iq4nl[16] = {
      -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
  };
  
@@ -4325,7 +3877,7 @@ index 22e8eee1d..3ba84e10c 100644
  static inline int dot8_ss(const uint * w, uint4 x0, uint4 x1) {
      int a = 0;
      a = dot_acc_sat_4x8packed_ss_int(w[0], x0.s0, a);
-@@ -107,6 +1215,18 @@ static inline uint kv4(uint n) {
+@@ -107,6 +1206,18 @@ static inline uint kv4(uint n) {
  
  // 16 code bytes -> the 32 weights' int8 values: low nibbles are weights
  // 0..15, high nibbles 16..31 (dequantize_row_iq4_nl / _iq4_xs)
@@ -4344,7 +3896,7 @@ index 22e8eee1d..3ba84e10c 100644
  static inline void iq4_expand(uint4 q, uint * w) {
      w[0] = kv4(q.s0 & 0x0F0F0F0Fu);        w[1] = kv4(q.s1 & 0x0F0F0F0Fu);
      w[2] = kv4(q.s2 & 0x0F0F0F0Fu);        w[3] = kv4(q.s3 & 0x0F0F0F0Fu);
-@@ -158,6 +1278,96 @@ static inline void reduce_store(float acc[N_DST][NCOLS], global float * out, ulo
+@@ -158,6 +1269,96 @@ static inline void reduce_store(float acc[N_DST][NCOLS], global float * out, ulo
      }
  }
  
@@ -4395,8 +3947,8 @@ index 22e8eee1d..3ba84e10c 100644
 +            lb_expand(TYPE, S, nblk, LB_BI(TYPE, first_row + r, nbr, b32), LB_P(TYPE, b32), w, &s0, &s1, lt);
 +            #pragma unroll
 +            for (int c = 0; c < NCOLS; ++c) {
-+                acc[r][c] += s0 * (dx[c] * (float)dot4_ss(w, xa[c]) + KQ_RES(dy[c] * (float)dot4_ss(w, ya[c]))) +
-+                             s1 * (dx[c] * (float)dot4_ss(w + 4, xb[c]) + KQ_RES(dy[c] * (float)dot4_ss(w + 4, yb[c])));
++                acc[r][c] += s0 * (dx[c] * (float)dot4_ss(w, xa[c]) + dy[c] * (float)dot4_ss(w, ya[c])) +
++                             s1 * (dx[c] * (float)dot4_ss(w + 4, xb[c]) + dy[c] * (float)dot4_ss(w + 4, yb[c]));
 +            }
 +        }
 +    }
@@ -4427,8 +3979,8 @@ index 22e8eee1d..3ba84e10c 100644
 +            uint w[8];
 +            float s0, s1;
 +            lb_expand(TYPE, S, nblk, LB_BI(TYPE, row, nbr, b32), LB_P(TYPE, b32), w, &s0, &s1, lt);
-+            acc += s0 * (dx * (float)dot4_ss(w, xa) + KQ_RES(dy * (float)dot4_ss(w, ya))) +
-+                   s1 * (dx * (float)dot4_ss(w + 4, xb) + KQ_RES(dy * (float)dot4_ss(w + 4, yb)));
++            acc += s0 * (dx * (float)dot4_ss(w, xa) + dy * (float)dot4_ss(w, ya)) +
++                   s1 * (dx * (float)dot4_ss(w + 4, xb) + dy * (float)dot4_ss(w + 4, yb));
 +        }
 +    }
 +    acc += intel_sub_group_shuffle_xor(acc, 1);
@@ -4441,25 +3993,7 @@ index 22e8eee1d..3ba84e10c 100644
  // TYPE 0: IQ3_XXS, 1: IQ4_XS (row_bytes: the row stride in bytes), 2: IQ4_NL
  // flat (q: code plane, dp: scale plane, rows of nb*8 blocks). xq/xd: column
  // 0's codes and scales, the residual term at + res.
-@@ -197,7 +1407,7 @@ static inline void mv_iq4_nl(global const uchar * q, global const half * dp, ulo
-             const float s = vload_half(blk, dp);
-             #pragma unroll
-             for (int c = 0; c < NCOLS; ++c) {
--                acc[r][c] += s * (dx[c] * (float)dot8_ss(w, xa[c], xb[c]) + dy[c] * (float)dot8_ss(w, ya[c], yb[c]));
-+                acc[r][c] += s * (dx[c] * (float)dot8_ss(w, xa[c], xb[c]) + KQ_RES(dy[c] * (float)dot8_ss(w, ya[c], yb[c])));
-             }
-         }
-     }
-@@ -244,7 +1454,7 @@ static inline void mv_iq(const int TYPE, global const uchar * q, global const ha
-             }
-             #pragma unroll
-             for (int c = 0; c < NCOLS; ++c) {
--                acc[r][c] += s * (dx[c] * (float)dot8_ss(w, xa[c], xb[c]) + dy[c] * (float)dot8_ss(w, ya[c], yb[c]));
-+                acc[r][c] += s * (dx[c] * (float)dot8_ss(w, xa[c], xb[c]) + KQ_RES(dy[c] * (float)dot8_ss(w, ya[c], yb[c])));
-             }
-         }
-     }
-@@ -256,15 +1466,32 @@ static inline void mv_iq(const int TYPE, global const uchar * q, global const ha
+@@ -256,15 +1457,32 @@ static inline void mv_iq(const int TYPE, global const uchar * q, global const ha
  // IQ3_XXS reads its grid and sign tables from local memory: each lane looks
  // up its own entries, and gathers from constant memory measured 74 GB/s
  // against 200 for the IQ4 types (A770).
@@ -4498,7 +4032,7 @@ index 22e8eee1d..3ba84e10c 100644
      }
  
  // row byte strides of the blocked types: IQ3_XXS nb*98, IQ4_XS nb*136
-@@ -282,6 +1509,12 @@ kernel void NAME(global const uchar * q, ulong offq, global const half * dp,
+@@ -282,6 +1500,12 @@ kernel void NAME(global const uchar * q, ulong offq, global const half * dp,
      const int first_row = FIRST_ROW;                                                           \
      if (first_row >= ne01) return;                                                             \
      const int nb = ne00 / QK_K;                                                                \
@@ -4511,7 +4045,7 @@ index 22e8eee1d..3ba84e10c 100644
      if ((TYPE) == 2) {                                                                         \
          mv_iq4_nl(q + offq, dp, (ulong)first_row * (ne00 / 32), ne00 / 32, first_row, ne01,    \
                    xq, xd, (ulong)ne00 * NCOLS, (global float *)(dst + offd), nb1 / sizeof(float)); \
-@@ -294,25 +1527,105 @@ kernel void NAME(global const uchar * q, ulong offq, global const half * dp,
+@@ -294,25 +1518,55 @@ kernel void NAME(global const uchar * q, ulong offq, global const half * dp,
  MV_KERNEL(kernel_mul_mv_iq3_xxs_q8_1, 0)
  MV_KERNEL(kernel_mul_mv_iq4_xs_q8_1, 1)
  MV_KERNEL(kernel_mul_mv_iq4_nl_q8_1, 2)
@@ -4529,10 +4063,8 @@ index 22e8eee1d..3ba84e10c 100644
 +// link, first or last; GGML_OPENCL_PAIR_ORDER), computed once for the ids a
 +// layer's three projections share: perm[k] is the pair work-group k takes.
 +// One work-group of up to 256 lanes, a lane a pair.
-+// first[p]: pair p is a bank pair and the first that routes to its expert (the
-+// one whose work-groups copy that expert for the next projection)
 +kernel void kernel_moe_pair_perm(global const char * ids, ulong offi, ulong nbi1, int n_used, int n_pairs,
-+                                 int n_split, int bank_first, global int * perm, global int * first) {
++                                 int n_split, int bank_first, global int * perm) {
 +    const int p = get_local_id(0);
 +    const int id = p < n_pairs ? ((global const int *)(ids + offi + (p / n_used) * nbi1))[p % n_used] : -1;
 +    const int bank = p < n_pairs && id >= n_split;
@@ -4541,45 +4073,6 @@ index 22e8eee1d..3ba84e10c 100644
 +    if (p >= n_pairs) return;
 +    const int rs = p - rb;   // slot pairs before p
 +    perm[bank_first == 1 ? (bank ? rb : nbk + rs) : bank_first == 2 ? (bank ? (n_pairs - nbk) + rb : rs) : p] = p;
-+    int fst = bank;
-+    for (int q = 0; q < p && fst; ++q)
-+        if (((global const int *)(ids + offi + (q / n_used) * nbi1))[q % n_used] == id) fst = 0;
-+    first[p] = fst;
-+}
-+
-+// the groups of a verify's pairs, one per distinct expert (a pair's expert at
-+// most once a token, so at most GRP_MAX entries with up to GRP_MAX tokens),
-+// the bank's experts first: grp[g * (GRP_MAX + 1)] the entry count, then the
-+// pairs; n_grp[0] the group count. One work-group of 256 lanes, a lane a pair.
-+#define GRP_MAX 4
-+kernel void kernel_moe_pair_groups(global const char * ids, ulong offi, ulong nbi1, int n_used, int n_pairs,
-+                                   int n_split, global int * grp, global int * n_grp) {
-+    local int gof[256];
-+    const int p = get_local_id(0);
-+    const int id = p < n_pairs ? ((global const int *)(ids + offi + (p / n_used) * nbi1))[p % n_used] : -1;
-+    int fst = p < n_pairs, rank = 0, cnt = 0;
-+    for (int q = 0; q < n_pairs; ++q) {
-+        const int iq = ((global const int *)(ids + offi + (q / n_used) * nbi1))[q % n_used];
-+        if (iq == id) {
-+            if (q < p) { fst = 0; ++rank; }
-+            ++cnt;
-+        }
-+    }
-+    const int bank = id >= n_split;
-+    const int rb  = work_group_scan_exclusive_add(fst && bank);
-+    const int nb  = work_group_reduce_add(fst && bank);
-+    const int rs  = work_group_scan_exclusive_add(fst && !bank);
-+    const int ng  = work_group_reduce_add(fst);
-+    if (fst) gof[p] = bank ? rb : nb + rs;
-+    barrier(CLK_LOCAL_MEM_FENCE);
-+    if (p >= n_pairs) return;
-+    int first_q = p;
-+    for (int q = 0; q < p; ++q)
-+        if (((global const int *)(ids + offi + (q / n_used) * nbi1))[q % n_used] == id) { first_q = q; break; }
-+    const int g = gof[first_q];
-+    if (rank < GRP_MAX) grp[g * (GRP_MAX + 1) + 1 + rank] = p;
-+    if (fst) grp[g * (GRP_MAX + 1)] = min(cnt, GRP_MAX);
-+    if (p == 0) n_grp[0] = ng;
 +}
 +
 +// 4 lanes a row where 16 do not divide a row's sub-blocks (N_DST 4 rows a
@@ -4598,20 +4091,11 @@ index 22e8eee1d..3ba84e10c 100644
                   global char * dst, ulong offd, ulong nb1, ulong nb2, int ne00, int ne01, ulong res, \
 -                 global const uchar * q2, global const half * dp2, int n_split) {               \
 +                 global const uchar * q2, global const half * dp2, int n_split,                \
-+                 global const int * perm, global const int * pf_first,                          \
-+                 global const uint4 * pf_src, global uint4 * pf_dst, ulong pf_n16) {            \
++                 global const int * perm) {                                                    \
      LOCAL_TABLES(TYPE)                                                                         \
 +    const int k = perm != 0 ? perm[get_group_id(2)] : (int)get_group_id(2);                   \
 +    const int i = k % n_used, t = k / n_used;                                                  \
 +    int e = ((global const int *)(ids + offi + t * nbi1))[i];                                  \
-+    /* the next projection's copy of this pair's bank expert, a slice per row block */         \
-+    if (pf_src != 0 && pf_first[k]) {                                                          \
-+        const ulong eb = (ulong)(e - n_split) * pf_n16;                                        \
-+        const ulong len = (pf_n16 + get_num_groups(0) - 1) / get_num_groups(0);                \
-+        const ulong lo = get_group_id(0) * len, hi = min(lo + len, pf_n16);                    \
-+        const int nl = get_local_size(0) * get_local_size(1);                                  \
-+        for (ulong j = lo + get_local_linear_id(); j < hi; j += nl) pf_dst[eb + j] = pf_src[eb + j]; \
-+    }                                                                                          \
      const int first_row = FIRST_ROW;                                                           \
      if (first_row >= ne01) return;                                                             \
      const int nb = ne00 / QK_K;                                                                \
@@ -4621,7 +4105,7 @@ index 22e8eee1d..3ba84e10c 100644
      /* an expert cache's single branch: ids >= n_split are bank experts, gathered into the     \
         mirror q2 / dp2 at e - n_split */                                                       \
      if (e >= n_split) { q = q2; offq = 0; dp = dp2; e -= n_split; }                            \
-@@ -324,6 +1637,18 @@ kernel void NAME(global const uchar * q, ulong offq, global const half * dp,
+@@ -324,6 +1578,18 @@ kernel void NAME(global const uchar * q, ulong offq, global const half * dp,
          return;                                                                                \
      }                                                                                          \
      const int col = (i % ne11) + t * ne11;                                                     \
@@ -4640,7 +4124,7 @@ index 22e8eee1d..3ba84e10c 100644
      if ((TYPE) == 2) {                                                                         \
          mv_iq4_nl(q + offq, dp, ((ulong)e * ne01 + first_row) * (ne00 / 32), ne00 / 32, first_row, ne01, \
                    xq + (ulong)col * ne00, xd + (ulong)col * (ne00 / 32), res,                  \
-@@ -337,3 +1662,624 @@ kernel void NAME(global const uchar * q, ulong offq, global const half * dp,
+@@ -337,3 +1603,211 @@ kernel void NAME(global const uchar * q, ulong offq, global const half * dp,
  MV_ID_KERNEL(kernel_mul_mv_id_iq3_xxs_q8_1, 0)
  MV_ID_KERNEL(kernel_mul_mv_id_iq4_xs_q8_1, 1)
  MV_ID_KERNEL(kernel_mul_mv_id_iq4_nl_q8_1, 2)
@@ -4649,98 +4133,6 @@ index 22e8eee1d..3ba84e10c 100644
 +MV_ID_KERNEL(kernel_mul_mv_id_iq1_m_q8_1, 8)
 +MV_ID_KERNEL(kernel_mul_mv_id_q2_0_q8_1, 9)
 +MV_ID_KERNEL(kernel_mul_mv_id_iq3_s_q8_1, 10)
-+
-+// ---- MUL_MAT_ID grouped by expert, the low-bit types (NCOLS = 1 builds): a
-+// work-group takes a block of rows of one expert and every entry routed to it
-+// (kernel_moe_pair_groups: up to GRP_MAX, the bank's experts first), expands
-+// each 32-weight sub-block once and applies it to the entries' activations,
-+// as Strata's row_dot_multi does for a verify (iq_kernels.cu, GRP_NC 4): an
-+// expert two tokens share is read and decoded once. Rows of n32 sub-blocks
-+// that 16 lanes divide. ----
-+static inline void mv_lb_grp(const int TYPE, global const uchar * S, int n32, int first_row, int ne01,
-+                             global const char * xq, global const float * xd, ulong res, int ne00,
-+                             const int * colj, int cnt, global char * dst, const ulong * outj, local const uint * lt) {
-+    const int lane = get_sub_group_local_id();
-+    const int   nbr  = n32 / LB_SUBS(TYPE);
-+    const ulong nblk = (ulong)ne01 * nbr;
-+    float acc[N_DST][GRP_MAX];
-+    #pragma unroll
-+    for (int r = 0; r < N_DST; ++r)
-+        #pragma unroll
-+        for (int j = 0; j < GRP_MAX; ++j) acc[r][j] = 0.f;
-+    for (int b32 = lane; b32 < n32; b32 += 16) {
-+        uint4 xa[GRP_MAX], xb[GRP_MAX], ya[GRP_MAX], yb[GRP_MAX];
-+        float dx[GRP_MAX], dy[GRP_MAX];
-+        #pragma unroll
-+        for (int j = 0; j < GRP_MAX; ++j) {
-+            if (j < cnt) {
-+                global const char * xc = xq + (ulong)colj[j] * ne00 + b32 * 32;
-+                global const char * yc = xc + res;
-+                xa[j] = vload4(0, (global const uint *)xc); xb[j] = vload4(0, (global const uint *)(xc + 16));
-+                ya[j] = vload4(0, (global const uint *)yc); yb[j] = vload4(0, (global const uint *)(yc + 16));
-+                dx[j] = xd[(ulong)colj[j] * n32 + b32]; dy[j] = xd[res / 32 + (ulong)colj[j] * n32 + b32];
-+            }
-+        }
-+        #pragma unroll
-+        for (int r = 0; r < N_DST; ++r) {
-+            if (first_row + r >= ne01) break;
-+            uint w[8];
-+            float s0, s1;
-+            lb_expand(TYPE, S, nblk, LB_BI(TYPE, first_row + r, nbr, b32), LB_P(TYPE, b32), w, &s0, &s1, lt);
-+            #pragma unroll
-+            for (int j = 0; j < GRP_MAX; ++j) {
-+                if (j < cnt) {
-+                    acc[r][j] += s0 * (dx[j] * (float)dot4_ss(w, xa[j]) + KQ_RES(dy[j] * (float)dot4_ss(w, ya[j]))) +
-+                                 s1 * (dx[j] * (float)dot4_ss(w + 4, xb[j]) + KQ_RES(dy[j] * (float)dot4_ss(w + 4, yb[j])));
-+                }
-+            }
-+        }
-+    }
-+    #pragma unroll
-+    for (int j = 0; j < GRP_MAX; ++j) {
-+        #pragma unroll
-+        for (int r = 0; r < N_DST; ++r) {
-+            const float t = sub_group_reduce_add(acc[r][j]);
-+            if (lane == 0 && j < cnt && first_row + r < ne01) ((global float *)(dst + outj[j]))[first_row + r] = t;
-+        }
-+    }
-+}
-+
-+#define MV_IDGG_KERNEL(NAME, TYPE)                                                             \
-+__attribute__((intel_reqd_sub_group_size(16)))                                                 \
-+kernel void NAME(global const uchar * q, ulong offq, global const half * dp,                   \
-+                 global const char * xq, global const float * xd,                              \
-+                 global const char * ids, ulong offi, ulong nbi1, int n_used, int ne11,        \
-+                 global char * dst, ulong offd, ulong nb1, ulong nb2, int ne00, int ne01, ulong res, \
-+                 global const uchar * q2, global const half * dp2, int n_split,                \
-+                 global const int * grp, global const int * n_grp) {                           \
-+    LOCAL_TABLES(TYPE)                                                                         \
-+    const int g = get_group_id(2);                                                             \
-+    if (g >= n_grp[0]) return;                                                                 \
-+    const int first_row = FIRST_ROW;                                                           \
-+    if (first_row >= ne01) return;                                                             \
-+    global const int * gp = grp + g * (GRP_MAX + 1);                                           \
-+    const int cnt = gp[0];                                                                     \
-+    int colj[GRP_MAX];                                                                         \
-+    ulong outj[GRP_MAX];                                                                       \
-+    int e = 0;                                                                                 \
-+    _Pragma("unroll")                                                                          \
-+    for (int j = 0; j < GRP_MAX; ++j) {                                                        \
-+        const int pj = gp[1 + min(j, cnt - 1)];                                                \
-+        const int i = pj % n_used, t = pj / n_used;                                            \
-+        colj[j] = (i % ne11) + t * ne11;                                                       \
-+        outj[j] = offd + (ulong)t * nb2 + (ulong)i * nb1;                                      \
-+        if (j == 0) e = ((global const int *)(ids + offi + t * nbi1))[i];                      \
-+    }                                                                                          \
-+    if (e >= n_split) { q = q2; offq = 0; e -= n_split; }                                      \
-+    mv_lb_grp(TYPE, q + offq + (ulong)e * ne01 * LB_ROW_BYTES(TYPE, ne00 / 32), ne00 / 32,     \
-+              first_row, ne01, xq, xd, res, ne00, colj, cnt, dst, outj, (local const uint *)lsigns); \
-+}
-+MV_IDGG_KERNEL(kernel_mul_mv_idgg_iq2_xxs_q8_1, 6)
-+MV_IDGG_KERNEL(kernel_mul_mv_idgg_iq2_s_q8_1, 7)
-+MV_IDGG_KERNEL(kernel_mul_mv_idgg_iq1_m_q8_1, 8)
-+MV_IDGG_KERNEL(kernel_mul_mv_idgg_q2_0_q8_1, 9)
-+MV_IDGG_KERNEL(kernel_mul_mv_idgg_iq3_s_q8_1, 10)
 +
 +// ---- F16 weights (BF16 is stored as F16 on the device) times 2 to 8 f32
 +// columns, as a verify window or an MTP step brings them: each weight row
@@ -4821,159 +4213,6 @@ index 22e8eee1d..3ba84e10c 100644
 +        ((global float *)(d + offd + (ulong)lid * nb1))[row] = t;
 +    }
 +}
-+
-+// ---- the K-split kernel with 4 rows a work-group (a hyper-connection's down
-+// projection: 320 rows of 10,240): each lane's activation chunks are loaded
-+// once for the 4 rows (the one-row kernel re-read 3 columns x 40 KB of them
-+// from cache for every 20 KB row) ----
-+__attribute__((intel_reqd_sub_group_size(16)))
-+kernel void kernel_mul_mv_f16_f32_ksplit4(global const char * a, ulong offa, global const char * b, ulong offb, ulong nb11,
-+                                          global char * d, ulong offd, ulong nb1, int ne00, int ne01, int ncols) {
-+    local float part[16][4][8];
-+    const int row0 = get_group_id(0) * 4;
-+    const int lid = get_local_id(0);
-+    global const half * w0 = (global const half *)(a + offa) + (ulong)row0 * ne00;
-+    float acc[4][8];
-+    #pragma unroll
-+    for (int r = 0; r < 4; ++r)
-+        #pragma unroll
-+        for (int c = 0; c < 8; ++c) acc[r][c] = 0.f;
-+    for (int k = lid * 8; k < ne00; k += 256 * 8) {
-+        float8 w[4];
-+        #pragma unroll
-+        for (int r = 0; r < 4; ++r) w[r] = row0 + r < ne01 ? vload_half8(0, w0 + (ulong)r * ne00 + k) : (float8)(0.f);
-+        #pragma unroll
-+        for (int c = 0; c < 8; ++c) {
-+            if (c < ncols) {
-+                const float8 x = vload8(0, (global const float *)(b + offb + (ulong)c * nb11) + k);
-+                #pragma unroll
-+                for (int r = 0; r < 4; ++r) acc[r][c] += dot(w[r].lo, x.lo) + dot(w[r].hi, x.hi);
-+            }
-+        }
-+    }
-+    const int sg = get_sub_group_id();
-+    #pragma unroll
-+    for (int r = 0; r < 4; ++r)
-+        #pragma unroll
-+        for (int c = 0; c < 8; ++c) {
-+            const float t = sub_group_reduce_add(acc[r][c]);
-+            if (get_sub_group_local_id() == 0) part[sg][r][c] = t;
-+        }
-+    barrier(CLK_LOCAL_MEM_FENCE);
-+    if (lid < 4 * ncols) {
-+        const int r = lid / ncols, c = lid % ncols;
-+        float t = 0.f;
-+        for (int i = 0; i < 16; ++i) t += part[i][r][c];
-+        if (row0 + r < ne01) ((global float *)(d + offd + (ulong)c * nb1))[row0 + r] = t;
-+    }
-+}
-+
-+// ---- MUL_MAT_ID grouped by expert (a verify window, a few lanes: 2 to 15
-+// tokens): kernel_moe_route_tiles cut the (token, slot) pairs into tiles of up
-+// to 8 pairs of one expert; a work-group takes a tile and a block of rows,
-+// expands each 32-weight block of its rows once and applies it to every pair
-+// of the tile (one read of an expert's weights for all the tokens routed to
-+// it, as Strata's verify does: src/core/verify.cpp, native_expert_grouped) ----
-+#define IDG_MAX 8
-+static inline void mv_group(const int TYPE, global const uchar * q, global const half * dp, ulong row0, int ne00,
-+                            int first_row, int ne01, global const char * xq, global const float * xd, ulong res,
-+                            global const int * pp, int np, int n_used, int ne11,
-+                            global char * dst, ulong nb1, ulong nb2, local const uint * grid, local const ulong * signs) {
-+    const int lane = get_sub_group_local_id();
-+    const int n32 = ne00 / 32;
-+    const ulong rb = TYPE == 0 ? (ulong)(ne00 / QK_K) * 98 : TYPE == 1 ? (ulong)(ne00 / QK_K) * 136 :
-+                     TYPE >= 6 ? LB_ROW_BYTES(TYPE, n32) : 0;
-+    // the low-bit types: expert row0 / ne01's slice, in planes
-+    const int   lb_nbr  = TYPE >= 6 ? n32 / LB_SUBS(TYPE) : 1;
-+    const ulong lb_nblk = (ulong)ne01 * lb_nbr;
-+    global const uchar * lb_S = q + (row0 / ne01) * ne01 * rb;
-+    int colk[IDG_MAX], tk[IDG_MAX], ik[IDG_MAX];
-+    #pragma unroll
-+    for (int k = 0; k < IDG_MAX; ++k) {
-+        const int p = pp[min(k, np - 1)];
-+        tk[k] = p / n_used; ik[k] = p % n_used;
-+        colk[k] = (ik[k] % ne11) + tk[k] * ne11;
-+    }
-+    float acc[N_DST][IDG_MAX];
-+    #pragma unroll
-+    for (int r = 0; r < N_DST; ++r)
-+        #pragma unroll
-+        for (int k = 0; k < IDG_MAX; ++k) acc[r][k] = 0.f;
-+
-+    for (int b32 = lane; b32 < n32; b32 += 16) {
-+        uint w[N_DST][8];
-+        float s0[N_DST], s1[N_DST];
-+        #pragma unroll
-+        for (int r = 0; r < N_DST; ++r) {
-+            s0[r] = s1[r] = 0.f;
-+            if (first_row + r >= ne01) continue;
-+            const ulong row = row0 + r;
-+            if (TYPE == 0) {
-+                s0[r] = s1[r] = iq3xxs_expand(q + row * rb + (ulong)(b32 >> 3) * 98, b32 & 7, w[r], grid, signs);
-+            } else if (TYPE == 1) {
-+                s0[r] = s1[r] = iq4xs_expand(q + row * rb + (ulong)(b32 >> 3) * 136, b32 & 7, w[r]);
-+            } else if (TYPE == 2) {
-+                const ulong blk = row * n32 + b32;
-+                iq4_expand(vload4(0, (global const uint *)(q + blk * 16)), w[r]);
-+                s0[r] = s1[r] = vload_half(blk, dp);
-+            } else {
-+                lb_expand(TYPE, lb_S, lb_nblk, LB_BI(TYPE, row % ne01, lb_nbr, b32), LB_P(TYPE, b32), w[r], &s0[r], &s1[r],
-+                          (local const uint *)signs);
-+            }
-+        }
-+        #pragma unroll
-+        for (int k = 0; k < IDG_MAX; ++k) {
-+            if (k >= np) break;
-+            global const char * xc = xq + (ulong)colk[k] * ne00 + b32 * 32;
-+            global const char * yc = xc + res;
-+            const uint4 xa = vload4(0, (global const uint *)xc), xb = vload4(0, (global const uint *)(xc + 16));
-+            const uint4 ya = vload4(0, (global const uint *)yc), yb = vload4(0, (global const uint *)(yc + 16));
-+            const float dx = xd[(ulong)colk[k] * n32 + b32], dy = xd[res / 32 + (ulong)colk[k] * n32 + b32];
-+            #pragma unroll
-+            for (int r = 0; r < N_DST; ++r) {
-+                acc[r][k] += s0[r] * (dx * (float)dot4_ss(w[r], xa) + KQ_RES(dy * (float)dot4_ss(w[r], ya))) +
-+                             s1[r] * (dx * (float)dot4_ss(w[r] + 4, xb) + KQ_RES(dy * (float)dot4_ss(w[r] + 4, yb)));
-+            }
-+        }
-+    }
-+    #pragma unroll
-+    for (int k = 0; k < IDG_MAX; ++k) {
-+        #pragma unroll
-+        for (int r = 0; r < N_DST; ++r) {
-+            const float t = sub_group_reduce_add(acc[r][k]);
-+            if (lane == 0 && k < np && first_row + r < ne01)
-+                ((global float *)(dst + (ulong)tk[k] * nb2 + (ulong)ik[k] * nb1))[first_row + r] = t;
-+        }
-+    }
-+}
-+
-+#define MV_IDG_KERNEL(NAME, TYPE)                                                              \
-+__attribute__((intel_reqd_sub_group_size(16)))                                                 \
-+kernel void NAME(global const uchar * q, ulong offq, global const half * dp,                   \
-+                 global const char * xq, global const float * xd,                              \
-+                 global const char * ids, ulong offi, ulong nbi1, int n_used, int ne11,        \
-+                 global char * dst, ulong offd, ulong nb1, ulong nb2, int ne00, int ne01, ulong res, \
-+                 global const uchar * q2, global const half * dp2, int n_split,               \
-+                 global const int * pairs, global const int4 * tiles, global const int * n_tiles) { \
-+    LOCAL_TABLES(TYPE)                                                                         \
-+    const int first_row = FIRST_ROW;                                                           \
-+    if (first_row >= ne01) return;                                                             \
-+    const int ti = get_group_id(2);                                                            \
-+    if (ti >= *n_tiles) return;                                                                \
-+    const int4 te = tiles[ti];                                                                 \
-+    int e = te.x;                                                                              \
-+    if (e >= n_split) { q = q2; offq = 0; dp = dp2; e -= n_split; }                            \
-+    mv_group(TYPE, q + offq, dp, (ulong)e * ne01 + first_row, ne00, first_row, ne01, xq, xd, res, \
-+             pairs + te.y, te.z, n_used, ne11, dst + offd, nb1, nb2, lgrid, lsigns);           \
-+}
-+MV_IDG_KERNEL(kernel_mul_mv_idg_iq3_xxs_q8_1, 0)
-+MV_IDG_KERNEL(kernel_mul_mv_idg_iq4_xs_q8_1, 1)
-+MV_IDG_KERNEL(kernel_mul_mv_idg_iq4_nl_q8_1, 2)
-+MV_IDG_KERNEL(kernel_mul_mv_idg_iq2_xxs_q8_1, 6)
-+MV_IDG_KERNEL(kernel_mul_mv_idg_iq2_s_q8_1, 7)
-+MV_IDG_KERNEL(kernel_mul_mv_idg_iq1_m_q8_1, 8)
-+MV_IDG_KERNEL(kernel_mul_mv_idg_q2_0_q8_1, 9)
-+MV_IDG_KERNEL(kernel_mul_mv_idg_iq3_s_q8_1, 10)
 +
 +// ---- the DeepSeek-V4-style hyper-connection ops (GGML_OP_DSV4_HC_PRE /
 +// _POST, as ggml-sycl/dsv4-hc.cpp computes them): Qwen3.8-Flash-Next's mixers
@@ -5097,214 +4336,6 @@ index 22e8eee1d..3ba84e10c 100644
 +    const float r = act == 0 ? v / (1.0f + exp(-v)) : s2 / (1.0f + exp(-v));
 +    ((global float *)(d + offd))[i] = r;
 +}
-+
-+// ---- a hyper-connection read fused (Qwen3.8-Flash-Next's build_hc_mix, after
-+// Strata's fused_gr.cu gr_down_v3 / gr_up_v3): RMS_NORM -> MUL (w_norm) -> the
-+// down product (hc * n_embd -> lr) -> SCALE -> SILU -> the up product (lr ->
-+// hc * n_embd) -> DSV4_HC_PRE (gated) in three kernels instead of five, for 1
-+// to HC_MAXT tokens and F16 weights. The rms scale is per stream, so the down
-+// kernel writes unscaled partial dots per stream and K half and the next
-+// kernel applies it: w . xn = sum_c rs_c sum_h (w_ch . (x_ch * g_ch)).
-+// Scratch (floats): part [T][hc][2][lr], ss [T][hc][2], lo [T][lr], rs [T][hc]. ----
-+#define HC_MAXT 4
-+#define HC_HALF 1280   // floats of a stream's K half staged per token: n_embd / 2
-+
-+// group (8-row block rb, stream c, K half h), 8 sub-groups a row each: the
-+// half-slice of x * w_norm for every token in local memory, its sums of
-+// squares (block 0 writes them), and the rows' partial dots
-+__attribute__((intel_reqd_sub_group_size(16)))
-+kernel void kernel_hc_mix_down(global const char * x, ulong offx, ulong nbx1, ulong nbx2,
-+                               global const char * g, ulong offg,
-+                               global const char * wd, ulong offwd,
-+                               global float * part,
-+                               int n_embd, int hc, int lr, int T) {
-+    local float xs[HC_MAXT * HC_HALF];
-+    local float red[8][HC_MAXT];
-+    global float * ss = part + T * hc * 2 * lr;
-+    const int rb = get_group_id(0), c = get_group_id(1), h = get_group_id(2);
-+    const int lid = get_local_id(0), lsz = get_local_size(0);
-+    const int sg = get_sub_group_id(), lane = get_sub_group_local_id();
-+    const int hn = n_embd / 2, k0 = h * hn;
-+    float ssp[HC_MAXT];
-+    #pragma unroll
-+    for (int t = 0; t < HC_MAXT; ++t) ssp[t] = 0.f;
-+    global const float * gr = (global const float *)(g + offg) + (ulong)c * n_embd + k0;
-+    for (int t = 0; t < T; ++t) {
-+        global const float * xr = (global const float *)(x + offx + c * nbx1 + t * nbx2) + k0;
-+        for (int i = lid; i < hn; i += lsz) {
-+            const float v = xr[i];
-+            ssp[t] += v * v;
-+            xs[t * hn + i] = v * gr[i];
-+        }
-+    }
-+    if (rb == 0) {
-+        #pragma unroll
-+        for (int t = 0; t < HC_MAXT; ++t) {
-+            const float sv = sub_group_reduce_add(ssp[t]);
-+            if (lane == 0) red[sg][t] = sv;
-+        }
-+    }
-+    barrier(CLK_LOCAL_MEM_FENCE);
-+    if (rb == 0 && lid < T) {
-+        float sv = 0.f;
-+        for (int i = 0; i < lsz / 16; ++i) sv += red[i][lid];
-+        ss[(lid * hc + c) * 2 + h] = sv;
-+    }
-+    const int row = rb * 8 + sg;
-+    if (row >= lr) return;
-+    global const half * w = (global const half *)(wd + offwd) + (ulong)row * hc * n_embd + (ulong)c * n_embd + k0;
-+    float acc[HC_MAXT];
-+    #pragma unroll
-+    for (int t = 0; t < HC_MAXT; ++t) acc[t] = 0.f;
-+    for (int k = lane * 8; k < hn; k += 128) {
-+        const float8 wv = vload_half8(0, w + k);
-+        #pragma unroll
-+        for (int t = 0; t < HC_MAXT; ++t) {
-+            if (t < T) {
-+                const float8 xv = vload8(0, xs + t * hn + k);
-+                acc[t] += dot(wv.lo, xv.lo) + dot(wv.hi, xv.hi);
-+            }
-+        }
-+    }
-+    #pragma unroll
-+    for (int t = 0; t < HC_MAXT; ++t) {
-+        const float sv = sub_group_reduce_add(acc[t]);
-+        if (lane == 0 && t < T) part[((t * hc + c) * 2 + h) * lr + row] = sv;
-+    }
-+}
-+
-+// one group: the rms scales from the halves' sums of squares, and
-+// lo = silu(sum_c rs_c sum_h part * s_lo + b_lo) for all lr rows
-+kernel void kernel_hc_mix_lo(global float * part, int n_embd, int hc, int lr, int T, float eps, float s_lo, float b_lo) {
-+    global const float * ss = part + T * hc * 2 * lr;
-+    global float * lo = part + T * hc * 2 * lr + T * hc * 2;
-+    global float * rs = lo + T * lr;
-+    local float rsl[HC_MAXT][4];
-+    const int lid = get_local_id(0), lsz = get_local_size(0);
-+    if (lid < T * hc) {
-+        const int t = lid / hc, c = lid % hc;
-+        const float r = 1.0f / sqrt((ss[(t * hc + c) * 2] + ss[(t * hc + c) * 2 + 1]) / (float)n_embd + eps);
-+        rsl[t][c] = r;
-+        rs[t * hc + c] = r;
-+    }
-+    barrier(CLK_LOCAL_MEM_FENCE);
-+    for (int i = lid; i < T * lr; i += lsz) {
-+        const int t = i / lr, r = i % lr;
-+        float sv = 0.f;
-+        for (int c = 0; c < hc; ++c)
-+            sv += rsl[t][c] * (part[((t * hc + c) * 2) * lr + r] + part[((t * hc + c) * 2 + 1) * lr + r]);
-+        const float v = sv * s_lo + b_lo;
-+        lo[t * lr + r] = v / (1.0f + exp(-v));
-+    }
-+}
-+
-+// group: 16 output columns d of every stream (hc x 16 up rows), 8 lanes a row
-+// (32 rows a pass). Each row's dot with lo is the gate of xn[c][d] = x * rs *
-+// w_norm (written: a later inject product reads it); the mix is s_mix * the
-+// sum over the streams of xn * sigmoid(gate)
-+__attribute__((intel_reqd_sub_group_size(16)))
-+kernel void kernel_hc_mix_up(global const char * x, ulong offx, ulong nbx1, ulong nbx2,
-+                             global const char * g, ulong offg,
-+                             global const char * wu, ulong offwu,
-+                             global const float * part,
-+                             global char * xn, ulong offxn, ulong nbxn2,
-+                             global char * mixed, ulong offm, ulong nbm1,
-+                             int n_embd, int hc, int lr, int T, float s_mix) {
-+    local float lo[HC_MAXT][512];
-+    local float rs[HC_MAXT][4];
-+    local float gs[HC_MAXT][4][16];
-+    global const float * lo_g = part + T * hc * 2 * lr + T * hc * 2;
-+    global const float * rs_g = lo_g + T * lr;
-+    const int lid = get_local_id(0), lsz = get_local_size(0);
-+    for (int i = lid; i < T * lr; i += lsz) lo[i / lr][i % lr] = lo_g[i];
-+    if (lid < T * hc) rs[lid / hc][lid % hc] = rs_g[lid];
-+    barrier(CLK_LOCAL_MEM_FENCE);
-+    const int d0 = get_group_id(0) * 16;
-+    const int l8 = lid & 7, rslot = lid >> 3, nslot = lsz >> 3;
-+    for (int q0 = 0; q0 < hc * 16; q0 += nslot) {
-+        const int q = q0 + rslot;
-+        const bool live = q < hc * 16 && d0 + (q % 16) < n_embd;
-+        const int c = q / 16, dd = q % 16, d = d0 + dd;
-+        float acc[HC_MAXT];
-+        #pragma unroll
-+        for (int t = 0; t < HC_MAXT; ++t) acc[t] = 0.f;
-+        if (live) {
-+            global const half * w = (global const half *)(wu + offwu) + ((ulong)c * n_embd + d) * lr;
-+            for (int k = l8 * 8; k < lr; k += 64) {
-+                const float8 wv = vload_half8(0, w + k);
-+                #pragma unroll
-+                for (int t = 0; t < HC_MAXT; ++t) {
-+                    if (t < T) {
-+                        const float8 lv = vload8(0, &lo[t][k]);
-+                        acc[t] += dot(wv.lo, lv.lo) + dot(wv.hi, lv.hi);
-+                    }
-+                }
-+            }
-+        }
-+        #pragma unroll
-+        for (int t = 0; t < HC_MAXT; ++t) {
-+            float v = acc[t];
-+            v += intel_sub_group_shuffle_xor(v, 1);
-+            v += intel_sub_group_shuffle_xor(v, 2);
-+            v += intel_sub_group_shuffle_xor(v, 4);
-+            if (live && l8 == 0 && t < T) {
-+                const ulong i = (ulong)c * n_embd + d;
-+                const float xv  = ((global const float *)(x + offx + c * nbx1 + t * nbx2))[d];
-+                const float xnv = xv * rs[t][c] * ((global const float *)(g + offg))[i];
-+                ((global float *)(xn + offxn + t * nbxn2))[i] = xnv;
-+                gs[t][c][dd] = xnv * (1.0f / (1.0f + exp(-v)));
-+            }
-+        }
-+    }
-+    barrier(CLK_LOCAL_MEM_FENCE);
-+    for (int i = lid; i < T * 16; i += lsz) {
-+        const int t = i / 16, dd = i % 16, d = d0 + dd;
-+        if (d >= n_embd) continue;
-+        float sv = 0.f;
-+        for (int c = 0; c < hc; ++c) sv += gs[t][c][dd];
-+        ((global float *)(mixed + offm + t * nbm1))[d] = s_mix * sv;
-+    }
-+}
-diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl
-index dcc15723d..70434b524 100644
---- a/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl
-+++ b/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl
-@@ -15,6 +15,15 @@
- // MUL_MAT_ID: work-group dimension 2 is one (expert slot, token) pair, whose
- // expert is read from `ids` on the device.
- 
-+// the activation's residual term (x = d q + d2 q2, below); -DKQ_ONE_TERM
-+// drops it from the dot products, as llama.cpp's and Strata's single q8_1 do
-+// (the residual's loads are then dead)
-+#ifdef KQ_ONE_TERM
-+#define KQ_RES(e) 0.f
-+#else
-+#define KQ_RES(e) (e)
-+#endif
-+
- #define QK_K 256
- #ifndef N_DST
- #define N_DST 4
-@@ -203,7 +212,7 @@ static inline void mv_q45_K(
-                         const int il = dot4_us(wl, xl[c]),  ih = dot4_us(wh, xh[c]);
-                 const int il2 = dot4_us(wl, xl2[c]), ih2 = dot4_us(wh, xh2[c]);
-                 // each sub-block's sum is split over two lanes (h = 0, 1): half each
--                acc[r][c] += d * (sc0 * (dl[c] * (float)il + dl2[c] * (float)il2) + sc1 * (dh[c] * (float)ih + dh2[c] * (float)ih2))
-+                acc[r][c] += d * (sc0 * (dl[c] * (float)il + KQ_RES(dl2[c] * (float)il2)) + sc1 * (dh[c] * (float)ih + KQ_RES(dh2[c] * (float)ih2)))
-                            - dm * 0.5f * (m0 * sl[c] + m1 * sh[c]);
-             }
-         }
-@@ -281,8 +290,8 @@ static inline void mv_q6_K(
-                 const int i2 = dot2_ss(w2, x2[cc]), i3 = dot2_ss(w3, x3[cc]);
-                 const int k0 = dot2_ss(w0, y0[cc]), k1 = dot2_ss(w1, y1[cc]);
-                 const int k2 = dot2_ss(w2, y2[cc]), k3 = dot2_ss(w3, y3[cc]);
--                acc[r][cc] += d * (s0 * (d0[cc] * (float)i0 + e0[cc] * (float)k0) + s1 * (d1[cc] * (float)i1 + e1[cc] * (float)k1) +
--                                   s2 * (d2[cc] * (float)i2 + e2[cc] * (float)k2) + s3 * (d3[cc] * (float)i3 + e3[cc] * (float)k3));
-+                acc[r][cc] += d * (s0 * (d0[cc] * (float)i0 + KQ_RES(e0[cc] * (float)k0)) + s1 * (d1[cc] * (float)i1 + KQ_RES(e1[cc] * (float)k1)) +
-+                                   s2 * (d2[cc] * (float)i2 + KQ_RES(e2[cc] * (float)k2)) + s3 * (d3[cc] * (float)i3 + KQ_RES(e3[cc] * (float)k3)));
-             }
-         }
-     }
 diff --git a/ggml/src/ggml-opencl/kernels/repeat.cl b/ggml/src/ggml-opencl/kernels/repeat.cl
 index 53951a554..53d967336 100644
 --- a/ggml/src/ggml-opencl/kernels/repeat.cl
@@ -5579,7 +4610,7 @@ index 08fb8854a..39239c048 100644
          if (!res) {
              // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
-index 5e585d413..1343a3e61 100644
+index 5e585d413..ffb30cfe7 100644
 --- a/src/llama-expert-cache.cpp
 +++ b/src/llama-expert-cache.cpp
 @@ -65,6 +65,11 @@ static bool read_profile(const char * path, int n_layers, int n_expert, std::vec
@@ -5622,7 +4653,7 @@ index 5e585d413..1343a3e61 100644
                             ggml_type_name(t[0]->type), ggml_type_name(t[1]->type), ggml_type_name(t[2]->type));
              continue;
          }
-@@ -237,11 +251,18 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+@@ -237,6 +251,11 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
      ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
      set_slices  = (decltype(set_slices)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_set_tensor_slices");
      get_tensors = (decltype(get_tensors)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_get_tensors");
@@ -5634,29 +4665,7 @@ index 5e585d413..1343a3e61 100644
      get_slices  = (decltype(get_slices)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_get_tensor_slices");
      exchange    = (decltype(exchange)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_exchange_slices");
      auto set_alloc_host = (void (*)(bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_set_alloc_host");
-     auto reserve_gather = (void (*)(ggml_backend_dev_t, size_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_reserve_gather");
-     auto pair_bank      = (void (*)(const ggml_tensor *, const ggml_tensor *, int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_pair_bank");
-+    // optional (an older backend has none): a projection's decode matvec copies the next one's misses
-+    auto chain_prefetch = (void (*)(const ggml_tensor *, const ggml_tensor *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_chain_prefetch");
-     if (!set_slices || !get_tensors || !get_slices || !exchange || !set_alloc_host || !reserve_gather || !pair_bank) {
-         LLAMA_LOG_WARN("%s: %s lacks the expert cache's entry points (contrib/llama.cpp patch 0021)\n", __func__, ggml_backend_dev_name(dev));
-         return false;
-@@ -388,6 +409,14 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
-             }
-         }
-     }
-+    // gate -> up -> down: each projection's decode matvec copies the next one's
-+    // missed experts (the same routed ids) into a card-side mirror
-+    if (chain_prefetch) {
-+        for (auto & L : layers) {
-+            if (L.slot[0]->type != GGML_TYPE_Q8_0 && L.slot[1]->type != GGML_TYPE_Q8_0) chain_prefetch(L.slot[0], L.slot[1]);
-+            if (L.slot[1]->type != GGML_TYPE_Q8_0 && L.slot[2]->type != GGML_TYPE_Q8_0) chain_prefetch(L.slot[1], L.slot[2]);
-+        }
-+    }
- 
-     // fill: each tensor whole (a converted layout is set up by its first write)
-     const int64_t t_fill = ggml_time_us();
-@@ -461,15 +490,24 @@ void llama_expert_cache::count(uint32_t n_tokens) {
+@@ -461,15 +480,24 @@ void llama_expert_cache::count(uint32_t n_tokens) {
              return;   // not the graph that just ran, or the ids not on the card
          }
      }
@@ -5690,7 +4699,7 @@ index 5e585d413..1343a3e61 100644
      for (size_t i = 0; i < layers.size(); ++i) {
          auto & L = layers[i];
          for (int32_t e : ids[i]) {
-@@ -479,6 +517,19 @@ void llama_expert_cache::count(uint32_t n_tokens) {
+@@ -479,6 +507,19 @@ void llama_expert_cache::count(uint32_t n_tokens) {
              L.usage[e] += 1.0f;
              (L.slot_of[e] >= 0 ? n_hits : n_misses) += 1;
          }
@@ -5710,7 +4719,7 @@ index 5e585d413..1343a3e61 100644
      }
  }
  
-@@ -590,6 +641,32 @@ void llama_expert_cache::step(ggml_backend_sched_t sched, uint32_t n_tokens) {
+@@ -590,6 +631,32 @@ void llama_expert_cache::step(ggml_backend_sched_t sched, uint32_t n_tokens) {
      }
  }
  
@@ -5780,7 +4789,7 @@ index 0ae85b93f..0314ca02d 100644
      int                mutate = 0;      // LLAMA_EXPERT_CACHE_MUTATE: corrupt one swapped slot (red case for the swap check)
  };
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index d9c962f01..7b9408735 100644
+index d9c962f01..72eb5df24 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -4483,6 +4483,81 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
@@ -5791,7 +4800,7 @@ index d9c962f01..7b9408735 100644
 +// DSV4_HC_PRE): grouped RMS norm x w_norm, the down product, silu(x / hc), the
 +// up product, the gated mean over the streams; and an inject product reading
 +// the normed rows, as the model's later hc_inject does. Verifies the normed
-+// rows, the mix and the inject (the OpenCL backend fuses the read).
++// rows, the mix and the inject.
 +struct test_hc_mix : public test_case {
 +    const ggml_type type_w;
 +    const int64_t n_embd, n_hc, n_lr, n_tokens;
@@ -5812,7 +4821,7 @@ index d9c962f01..7b9408735 100644
 +
 +    std::vector<ggml_tensor *> fusion_test_nodes() override { return { xn, mixed, out }; }
 +
-+    // F16 weights on both sides: ~1e-7 expected; the red case (the mix 5 % off) is 2.5e-3
++    // F16 weights on both sides: ~1e-7 expected
 +    double max_nmse_err() override { return 1e-5; }
 +
 +    test_hc_mix(ggml_type type_w = GGML_TYPE_F16, int64_t n_embd = 2560, int64_t n_hc = 4, int64_t n_lr = 320, int64_t n_tokens = 3)
@@ -5874,7 +4883,7 @@ index d9c962f01..7b9408735 100644
 +            test_cases.emplace_back(new test_hc_mix(tw, 2560, 4, 320, nt));
 +        }
 +    }
-+    test_cases.emplace_back(new test_hc_mix(GGML_TYPE_F16, 2560, 4, 320, 5));   // past the fused kernels' 4 tokens
++    test_cases.emplace_back(new test_hc_mix(GGML_TYPE_F16, 2560, 4, 320, 5));
 +    test_cases.emplace_back(new test_hc_mix(GGML_TYPE_F16, 1024, 4, 64, 3));
  
      test_cases.emplace_back(new test_dsv4_hc_post(1, 1));

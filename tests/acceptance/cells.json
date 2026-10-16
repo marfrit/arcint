@@ -123,38 +123,38 @@
       "env": {}
     },
     "flags": "the agent unit's flags (245,760 ctx, q8_0:q4_0 KV, MTP 5), one fresh process: the capital, a 54,895- and a 138,028-token prompt with a needle",
-    "gates": "Paris and the needle right; prefill at both depths at or above the release floor (the last release's pre-tag number minus its run-to-run spread, §5)",
+    "gates": "Paris and the needle right; prefill at both depths reported against the release floor (the last pre-tag numbers; the speed gate is the same-window A/B against the last release, §5)",
     "reports": "peak VRAM and GTT",
     "external": null,
     "timeout_seconds": 3600,
     "references": [
       {
         "metric": "prefill-55k",
-        "value": 695.2,
-        "gate_at": 694.9,
+        "value": 694.3,
+        "gate_at": 694.3,
         "unit": "t/s",
         "direction": "lower-is-worse",
         "samples": 2,
-        "spread_pct": 0.03,
+        "spread_pct": 0.0,
         "config": "24 GB card, the agent unit's flags (245,760 ctx, q8_0:q4_0 KV, MTP 5, the draft vocabulary), one fresh process a run, the model staged on the NVMe",
         "prompt_tokens": 54895,
         "design": "§5",
-        "measured": "2026-10-15",
-        "binary": "the 0.8.0 pre-tag package (ee8c458), two processes back to back; the floor is the lower run minus the spread between them (operator, 2026-10-15)"
+        "measured": "2026-10-16",
+        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
       },
       {
         "metric": "prefill-138k",
-        "value": 491.75,
-        "gate_at": 491.3,
+        "value": 490.85,
+        "gate_at": 490.7,
         "unit": "t/s",
         "direction": "lower-is-worse",
         "samples": 2,
-        "spread_pct": 0.06,
+        "spread_pct": 0.02,
         "config": "24 GB card, the agent unit's flags (245,760 ctx, q8_0:q4_0 KV, MTP 5, the draft vocabulary), one fresh process a run, the model staged on the NVMe",
         "prompt_tokens": 138028,
         "design": "§5",
-        "measured": "2026-10-15",
-        "binary": "the 0.8.0 pre-tag package (ee8c458), two processes back to back; the floor is the lower run minus the spread between them (operator, 2026-10-15)"
+        "measured": "2026-10-16",
+        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
       }
     ]
   },
@@ -178,15 +178,15 @@
       "env": {}
     },
     "flags": "the coder unit's flags (98,304 ctx, q8_0:q4_0 KV, MTP 4), one fresh process: the capital, three 300-token answers, a 40,841-token needle",
-    "gates": "Paris and the needle right; decode on each answer at or above the release floor (§5)",
+    "gates": "Paris and the needle right; decode on each answer reported against the release floor (the speed gate is the same-window A/B, §5)",
     "reports": "peak VRAM and GTT",
     "external": null,
     "timeout_seconds": 3600,
     "references": [
       {
         "metric": "decode-a",
-        "value": 51.1,
-        "gate_at": 51.1,
+        "value": 50.6,
+        "gate_at": 50.6,
         "unit": "t/s",
         "direction": "lower-is-worse",
         "samples": 2,
@@ -194,13 +194,13 @@
         "config": "16 GiB card, the coder unit's flags (98,304 ctx, q8_0:q4_0 KV, MTP 4), one fresh process a run, the model staged on the NVMe; decode a/b/c: 300-token answers on hash tables, compilers, TCP",
         "prompt_tokens": null,
         "design": "§5",
-        "measured": "2026-10-15",
-        "binary": "the 0.8.0 pre-tag package (ee8c458), two processes back to back; the floor is the lower run minus the spread between them (operator, 2026-10-15)"
+        "measured": "2026-10-16",
+        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
       },
       {
         "metric": "decode-b",
-        "value": 47.5,
-        "gate_at": 47.5,
+        "value": 47.2,
+        "gate_at": 47.2,
         "unit": "t/s",
         "direction": "lower-is-worse",
         "samples": 2,
@@ -208,13 +208,13 @@
         "config": "16 GiB card, the coder unit's flags (98,304 ctx, q8_0:q4_0 KV, MTP 4), one fresh process a run, the model staged on the NVMe; decode a/b/c: 300-token answers on hash tables, compilers, TCP",
         "prompt_tokens": null,
         "design": "§5",
-        "measured": "2026-10-15",
-        "binary": "the 0.8.0 pre-tag package (ee8c458), two processes back to back; the floor is the lower run minus the spread between them (operator, 2026-10-15)"
+        "measured": "2026-10-16",
+        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
       },
       {
         "metric": "decode-c",
-        "value": 44.05,
-        "gate_at": 43.9,
+        "value": 43.75,
+        "gate_at": 43.6,
         "unit": "t/s",
         "direction": "lower-is-worse",
         "samples": 2,
@@ -222,22 +222,22 @@
         "config": "16 GiB card, the coder unit's flags (98,304 ctx, q8_0:q4_0 KV, MTP 4), one fresh process a run, the model staged on the NVMe; decode a/b/c: 300-token answers on hash tables, compilers, TCP",
         "prompt_tokens": null,
         "design": "§5",
-        "measured": "2026-10-15",
-        "binary": "the 0.8.0 pre-tag package (ee8c458), two processes back to back; the floor is the lower run minus the spread between them (operator, 2026-10-15)"
+        "measured": "2026-10-16",
+        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
       },
       {
         "metric": "prefill-41k",
-        "value": 725.45,
-        "gate_at": 725.3,
+        "value": 724.6,
+        "gate_at": 724.3,
         "unit": "t/s",
         "direction": "lower-is-worse",
         "samples": 2,
-        "spread_pct": 0.01,
+        "spread_pct": 0.03,
         "config": "16 GiB card, the coder unit's flags (98,304 ctx, q8_0:q4_0 KV, MTP 4), one fresh process a run, the model staged on the NVMe; decode a/b/c: 300-token answers on hash tables, compilers, TCP",
         "prompt_tokens": 40841,
         "design": "§5",
-        "measured": "2026-10-15",
-        "binary": "the 0.8.0 pre-tag package (ee8c458), two processes back to back; the floor is the lower run minus the spread between them (operator, 2026-10-15)"
+        "measured": "2026-10-16",
+        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
       }
     ]
   },
@@ -261,38 +261,38 @@
       "env": {}
     },
     "flags": "the Flash-Next unit's flags (131,072 ctx, q8_0 KV, 12,000 MiB of expert slots, the profile, MTP 3 with min-p 0.5 and the Q4_K draft head, the bank stream, the CPU misses), one fresh process: the capital, the 20,045-token needle, a 300-token answer",
-    "gates": "Paris and the needle right; prefill at 20k and decode at or above the release floor (§5)",
+    "gates": "Paris and the needle right; prefill at 20k and decode reported against the release floor (the speed gate is the same-window A/B, §5)",
     "reports": "peak VRAM and GTT",
     "external": null,
     "timeout_seconds": 3600,
     "references": [
       {
         "metric": "prefill-20k",
-        "value": 595.1,
-        "gate_at": 594.8,
+        "value": 594.1,
+        "gate_at": 594.1,
         "unit": "t/s",
         "direction": "lower-is-worse",
         "samples": 2,
-        "spread_pct": 0.03,
+        "spread_pct": 0.0,
         "config": "24 GB card + host bank, the Flash-Next unit's flags (IQ3_XXS, 131,072 ctx, q8_0 KV, 12,000 MiB of slots, MTP 3, the CPU misses, the bank stream), one fresh process a run, the files on the NVMe; decode: the 300-token hash-table answer after the needle",
         "prompt_tokens": 20045,
         "design": "§5",
-        "measured": "2026-10-15",
-        "binary": "the deployed 0.8.0 package (111da0c), two processes back to back; the floor is the lower run minus the spread between them (operator, 2026-10-15)"
+        "measured": "2026-10-16",
+        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
       },
       {
         "metric": "decode",
-        "value": 35.05,
-        "gate_at": 33.4,
+        "value": 34.75,
+        "gate_at": 34.6,
         "unit": "t/s",
         "direction": "lower-is-worse",
         "samples": 2,
-        "spread_pct": 3.14,
+        "spread_pct": 0.29,
         "config": "24 GB card + host bank, the Flash-Next unit's flags (IQ3_XXS, 131,072 ctx, q8_0 KV, 12,000 MiB of slots, MTP 3, the CPU misses, the bank stream), one fresh process a run, the files on the NVMe; decode: the 300-token hash-table answer after the needle",
         "prompt_tokens": null,
         "design": "§5",
-        "measured": "2026-10-15",
-        "binary": "the deployed 0.8.0 package (111da0c), two processes back to back; the floor is the lower run minus the spread between them (operator, 2026-10-15)"
+        "measured": "2026-10-16",
+        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
       }
     ]
   },

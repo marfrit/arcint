@@ -71,7 +71,7 @@ index 39239c048..8b74d5d9b 100644
          const int64_t dt_p0 = dt ? ggml_time_us() : 0;
          struct dt_post_t { decode_timing * dt; int64_t t0; ~dt_post_t() { if (dt) dt->t_post += ggml_time_us() - t0; } } dt_post_ { dt, dt_p0 };
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
-index 1343a3e61..d5d4097a4 100644
+index ffb30cfe7..eabe1e7ac 100644
 --- a/src/llama-expert-cache.cpp
 +++ b/src/llama-expert-cache.cpp
 @@ -66,8 +66,8 @@ static bool read_profile(const char * path, int n_layers, int n_expert, std::vec
@@ -228,7 +228,7 @@ index 1343a3e61..d5d4097a4 100644
                         l0.ffn_gate_exps && l0.ffn_gate_exps->buffer ? ggml_backend_buffer_name(l0.ffn_gate_exps->buffer) : "-",
                         l0.ffn_down_exps && l0.ffn_down_exps->buffer ? ggml_backend_buffer_name(l0.ffn_down_exps->buffer) : "-",
                         l0.ffn_gate_up_exps != nullptr, d0 ? ggml_backend_dev_name(d0) : "-");
-@@ -464,7 +484,8 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+@@ -454,7 +474,8 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
                  }
              }
          }
@@ -238,7 +238,7 @@ index 1343a3e61..d5d4097a4 100644
          if (bad) {
              return false;
          }
-@@ -475,10 +496,11 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+@@ -465,10 +486,11 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
              g_registry[L.src[2]] = &L;
          }
      }
@@ -254,7 +254,7 @@ index 1343a3e61..d5d4097a4 100644
      return true;
  }
  
-@@ -487,7 +509,7 @@ void llama_expert_cache::count(uint32_t n_tokens) {
+@@ -477,7 +499,7 @@ void llama_expert_cache::count(uint32_t n_tokens) {
      for (auto & L : layers) {
          if (L.ids_out == nullptr || L.ids_out->buffer == nullptr || L.ids_out->ne[1] != (int64_t) n_tokens ||
              ggml_backend_buffer_get_type(L.ids_out->buffer) != ggml_backend_buffer_get_type(L.slot[0]->buffer)) {
@@ -263,7 +263,7 @@ index 1343a3e61..d5d4097a4 100644
          }
      }
      std::vector<std::vector<int32_t>> ids_read;
-@@ -527,15 +549,16 @@ void llama_expert_cache::count(uint32_t n_tokens) {
+@@ -517,15 +539,16 @@ void llama_expert_cache::count(uint32_t n_tokens) {
          }
      }
      if (n_tokens > 1 && ++n_multi_steps % 200 == 0) {
@@ -285,7 +285,7 @@ index 1343a3e61..d5d4097a4 100644
      for (int i = 0; i < (int) layers.size(); ++i) {
          auto & L = layers[i];
          std::vector<std::pair<float, int>> c, v;
-@@ -553,12 +576,34 @@ void llama_expert_cache::plan() {
+@@ -543,12 +566,34 @@ void llama_expert_cache::plan() {
              if (c[j].first < v[j].first + min_gain) {
                  break;
              }
@@ -323,7 +323,7 @@ index 1343a3e61..d5d4097a4 100644
      }
      for (auto & L : layers) {
          for (float & u : L.usage) {
-@@ -613,32 +658,47 @@ void llama_expert_cache::plan() {
+@@ -603,32 +648,47 @@ void llama_expert_cache::plan() {
              bad += verify(L, L.slot[k], k, c.slot, c.expert) ? 0 : 1;
              bad += verify(L, L.bank[k], k, first_entry, first_victim) ? 0 : 1;
          }
@@ -377,7 +377,7 @@ index 1343a3e61..d5d4097a4 100644
  }
  
  void llama_expert_cache::after_graph(ggml_backend_sched_t sched, uint32_t n_tokens) {
-@@ -649,6 +709,8 @@ void llama_expert_cache::after_graph(ggml_backend_sched_t sched, uint32_t n_toke
+@@ -639,6 +699,8 @@ void llama_expert_cache::after_graph(ggml_backend_sched_t sched, uint32_t n_toke
      if (!async_ids || sched != owner_sched || n_tokens == 0 || n_tokens > decode_max) {
          return;
      }

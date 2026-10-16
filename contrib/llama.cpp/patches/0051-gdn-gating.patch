@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 9b7f408e1..05e005cb5 100644
+index 7e5e2f254..7ad5ca83a 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -713,7 +713,13 @@ struct ggml_backend_opencl_context {
+@@ -709,7 +709,13 @@ struct ggml_backend_opencl_context {
      bool disable_fusion;
      bool fuse_mm_glu = true;                     // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
      bool fuse_rms_add = true;                    // opt-out GGML_OPENCL_FUSE_RMS_ADD=0 (fused rms_norm*w + residual)
@@ -17,8 +17,8 @@ index 9b7f408e1..05e005cb5 100644
      int  fuse_0049 = 7;                          // patch 0049's fusions, a bit each: 1 rms_norm + scale, 2 ssm_conv + silu,
                                                   // 4 sigmoid + mul (GGML_OPENCL_FUSE_0049=<mask>; 0: off)
      bool f16_mrow = true;                        // opt-out GGML_OPENCL_F16_MROW=0 (multi-row-per-WG f16 decode GEMV for attn proj + lm_head)
-@@ -10147,12 +10153,130 @@ static bool ggml_cl_moe_prefetch_on() {
-     return on;
+@@ -9936,10 +9942,128 @@ static void ggml_cl_scale_act_fused(ggml_backend_t backend, ggml_cgraph * cgraph
+     backend_ctx->enqueue_ndrange_kernel(k, 1, gws, lws, d);
  }
  
 +// patch 0051: the gated delta net's gating folded into its kernel, as
@@ -142,13 +142,11 @@ index 9b7f408e1..05e005cb5 100644
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
      backend_ctx->graph_gen++;
      backend_ctx->pair_perm_t = nullptr;
-     backend_ctx->pair_grp_t = nullptr;
-     backend_ctx->moe_pf = {};
 +    ggml_cl_gdn_gate_prepass(backend_ctx, cgraph);
  
      for (int i = 0; i < cgraph->n_nodes; i++) {
          ggml_tensor * node = cgraph->nodes[i];
-@@ -10169,6 +10293,9 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+@@ -9956,6 +10080,9 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
          if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
              continue;
          }
@@ -156,9 +154,9 @@ index 9b7f408e1..05e005cb5 100644
 +            continue;   // a gating op the GDN kernel computes itself (patch 0051)
 +        }
  
-         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse_hc_mix(backend_ctx, cgraph, i)) {
-             ggml_cl_hc_mix_fused(backend, cgraph, i);
-@@ -34116,8 +34243,8 @@ static bool ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
+         if (!backend_ctx->disable_fusion) {
+             int act = 0; float s2 = 1.0f;
+@@ -33735,8 +33862,8 @@ static bool ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
      const cl_ulong off_q     = extra_q->offset     + src_q->view_offs;
      const cl_ulong off_k     = extra_k->offset     + src_k->view_offs;
      const cl_ulong off_v     = extra_v->offset     + src_v->view_offs;
@@ -169,7 +167,7 @@ index 9b7f408e1..05e005cb5 100644
      const cl_ulong off_state = extra_state->offset + src_state->view_offs;
      const cl_ulong off_dst   = extra_dst->offset   + dst->view_offs;
  
-@@ -34169,6 +34296,40 @@ static bool ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
+@@ -33788,6 +33915,40 @@ static bool ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
          CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &sbuf));
          CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &soff));
          CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &sstride));
