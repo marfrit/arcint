@@ -121,6 +121,39 @@ TEST(props_reports_the_served_file_and_what_the_backend_knows) {
     CHECK_EQ(j.at("cache").at("kv_dtype").get<std::string>(), std::string("q8_0:q4_0"));
 }
 
+// --llama-dflash-gguf: /props says which drafter serves (one a context)
+TEST(props_reports_the_dflash_drafter) {
+    {
+        Config cfg;
+        cfg.llama_dflash_gguf = "/m/d.gguf";
+        cfg.llama_dflash      = 7;
+        FakeBackend backend;
+        backend.st.loaded         = true;
+        backend.st.dflash_enabled = true;
+        SlotPool slots(1);
+        Context  ctx{&cfg, &backend, &slots};
+
+        const nlohmann::json j = lgc::api::props(ctx);
+        CHECK_EQ(j.at("dflash").at("requested").get<std::string>(), std::string("on"));
+        CHECK(j.at("dflash").at("enabled").get<bool>());
+        CHECK_EQ(j.at("dflash").at("drafts").get<int>(), 7);
+        CHECK_EQ(j.at("mtp").at("requested").get<std::string>(), std::string("off"));
+        CHECK(!j.at("mtp").at("enabled").get<bool>());
+    }
+    {
+        Config      cfg;
+        FakeBackend backend;
+        backend.st.loaded = true;
+        SlotPool slots(1);
+        Context  ctx{&cfg, &backend, &slots};
+
+        const nlohmann::json j = lgc::api::props(ctx);
+        CHECK_EQ(j.at("dflash").at("requested").get<std::string>(), std::string("off"));
+        CHECK(!j.at("dflash").at("enabled").get<bool>());
+        CHECK(j.at("dflash").at("drafts").is_null());
+    }
+}
+
 TEST(props_carries_none_of_the_retired_engines_fields) {
     Config cfg;
     FakeBackend backend;

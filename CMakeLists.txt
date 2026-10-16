@@ -189,6 +189,8 @@ if(ARCINT_TESTS)
     tests/test_text.cpp
     tests/test_config.cpp
     tests/test_verify_walk.cpp
+    tests/test_dflash_walk.cpp
+    tests/test_spec_state.cpp
     tests/test_token_ids.cpp
     tests/test_props.cpp
     tests/test_lanes.cpp
