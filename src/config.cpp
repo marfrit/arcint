@@ -207,6 +207,16 @@ std::string usage_text() {
         "  --llama-mtp-min-p P       stop drafting at a token the MTP head gives less\n"
         "                            than P, and leave it out of the verify (0-1; 0 off:\n"
         "                            always --llama-mtp drafts)\n"
+        "  --llama-dflash-gguf FILE  draft with this DFlash2 drafter (llama.cpp's\n"
+        "                            'dflash' GGUF for the served model) instead of\n"
+        "                            an MTP head: one drafter pass proposes a block,\n"
+        "                            verified in one pass (not with --llama-mtp, not\n"
+        "                            under --llama-layer-split)\n"
+        "  --llama-dflash N          drafts a verify with the DFlash2 drafter (1-7,\n"
+        "                            default 7)\n"
+        "  --llama-dflash-min-p P    stop the DFlash2 block at a position whose pick\n"
+        "                            has less than P of its candidates' softmax (0-1;\n"
+        "                            0 off: always --llama-dflash drafts)\n"
         "  --llama-reserve-cells N   reserve the compute buffers for a prompt ubatch at N\n"
         "                            cache cells, not the whole context; deeper prompt\n"
         "                            chunks take smaller ubatches (0: the whole context)\n"
@@ -315,6 +325,16 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--llama-mtp-min-p") {
             if (!value(v) || !parse_double(v, cfg.llama_mtp_min_p) || cfg.llama_mtp_min_p < 0.0 || cfg.llama_mtp_min_p > 1.0)
                 return fail("--llama-mtp-min-p needs a probability from 0 to 1");
+        } else if (arg == "--llama-dflash-gguf") {
+            if (!value(v)) return fail("--llama-dflash-gguf needs a DFlash2 drafter GGUF");
+            cfg.llama_dflash_gguf = std::string(v);
+        } else if (arg == "--llama-dflash") {
+            if (!value(v) || !parse_int(v, cfg.llama_dflash) || cfg.llama_dflash < 1 || cfg.llama_dflash > 7)
+                return fail("--llama-dflash needs a draft count from 1 to 7 (a block of up to 8, the drafter's trained size)");
+        } else if (arg == "--llama-dflash-min-p") {
+            if (!value(v) || !parse_double(v, cfg.llama_dflash_min_p) || cfg.llama_dflash_min_p < 0.0 ||
+                cfg.llama_dflash_min_p > 1.0)
+                return fail("--llama-dflash-min-p needs a probability from 0 to 1");
         } else if (arg == "--llama-reserve-cells") {
             int n = 0;
             if (!value(v) || !parse_int(v, n) || n < 0)
@@ -523,15 +543,26 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     }
     if (cfg.stub) {
         if (cfg.llama_cpu_moe > 0 || cfg.llama_threads > 0 || cfg.llama_mtp > 0 || !cfg.llama_mtp_vocab.empty() ||
-            !cfg.llama_mtp_gguf.empty() || cfg.llama_mtp_min_p > 0.0 ||
+            !cfg.llama_mtp_gguf.empty() || cfg.llama_mtp_min_p > 0.0 || cfg.llama_dflash_on() || cfg.llama_dflash > 0 ||
+            cfg.llama_dflash_min_p > 0.0 ||
             cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192 ||
             cfg.llama_expert_cache_on() || !cfg.llama_expert_profile.empty() || cfg.llama_layer_split > 0 || cfg.llama_mtp_card >= 0 ||
             cfg.llama_reserve_cells > 0)
-            return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab/-gguf/-min-p, --llama-kv, --llama-checkpoints/-step, "
+            return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab/-gguf/-min-p, --llama-dflash/-gguf/-min-p, "
+                        "--llama-kv, --llama-checkpoints/-step, "
                         "--llama-expert-cache/-profile, --llama-layer-split, --llama-mtp-card and --llama-reserve-cells are options of "
                         "the libllama engine (--gguf), not of --stub");
         return {};
     }
+    // DFlash2: one drafter a context (the MTP layer is then not loaded)
+    if (cfg.llama_dflash > 0 && !cfg.llama_dflash_on()) return fail("--llama-dflash needs --llama-dflash-gguf (the drafter)");
+    if (cfg.llama_dflash_min_p > 0.0 && !cfg.llama_dflash_on())
+        return fail("--llama-dflash-min-p needs --llama-dflash-gguf (the drafter)");
+    if (cfg.llama_dflash_on() && (cfg.llama_mtp > 0 || !cfg.llama_mtp_vocab.empty() || !cfg.llama_mtp_gguf.empty() ||
+                                  cfg.llama_mtp_min_p > 0.0))
+        return fail("--llama-dflash-gguf and --llama-mtp (-vocab, -gguf, -min-p) are exclusive: one drafter a context, "
+                    "the DFlash2 drafter or the MTP head");
+    if (cfg.llama_dflash_on() && cfg.llama_dflash == 0) cfg.llama_dflash = 7;   // the drafter's block of 8
     if (!cfg.llama_mtp_vocab.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-vocab needs --llama-mtp");
     if (!cfg.llama_mtp_gguf.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-gguf needs --llama-mtp");
     if (cfg.llama_mtp_min_p > 0.0 && cfg.llama_mtp <= 0) return fail("--llama-mtp-min-p needs --llama-mtp");
@@ -551,6 +582,11 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         return fail("two cards need --llama-layer-split K (layers [0, K) on the first card; there is no automatic split)");
     if (cfg.llama_layer_split > 0 && cfg.llama_devices.size() != 2)
         return fail("--llama-layer-split needs two cards: --device GPU.0,GPU.1");
+    // the dense agent runs on one card, and no DFlash drafter for a split
+    // model is known (docs/campaigns/dflash2-agent.md, operator 2026-10-16)
+    if (cfg.llama_dflash_on() && cfg.llama_layer_split > 0)
+        return fail("--llama-dflash-gguf is not supported under --llama-layer-split: the DFlash2 drafter runs with a "
+                    "model on one card");
     if (cfg.llama_mtp_card >= 0 && (cfg.llama_devices.size() != 2 || cfg.llama_mtp_card >= static_cast<int>(cfg.llama_devices.size())))
         return fail("--llama-mtp-card N: a card of the layer split (0 or 1)");
     if (cfg.llama_mtp_card >= 0 && cfg.llama_mtp_gguf.empty())

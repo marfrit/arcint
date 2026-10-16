@@ -38,6 +38,20 @@ struct Config {
     // probability under the MTP head is at least P, and a draft below P is
     // not verified (Strata's --spec-min-p); 0 drafts --llama-mtp tokens always
     double llama_mtp_min_p = 0.0;
+    // --llama-dflash-gguf FILE: a DFlash2 drafter (llama.cpp's `dflash`
+    // architecture, converted with --target-model-dir) drafts a block a
+    // verify instead of the MTP head, conditioned on the target's hidden
+    // states (llama.cpp's draft-dflash; docs/campaigns/dflash2-agent.md).
+    // --llama-dflash N: drafts a verify, 1 to 7 (the drafter decodes a block
+    // of N + 1 every cycle); 0 here means unset, and parse_args makes it 7
+    // when a drafter is given. --llama-dflash-min-p P: the selector's stop
+    // (llama.cpp's p_min on the softmax over a position's candidate scores);
+    // 0 drafts N always. One drafter a context: refused with --llama-mtp and
+    // under --llama-layer-split.
+    std::string llama_dflash_gguf;
+    int         llama_dflash       = 0;
+    double      llama_dflash_min_p = 0.0;
+    bool        llama_dflash_on() const { return !llama_dflash_gguf.empty(); }
     // --llama-reserve-cells N: the compute buffers are reserved for a prompt
     // ubatch at N cache cells instead of the whole context, and a prompt chunk
     // deeper in the cache takes smaller ubatches to stay inside them (contrib
