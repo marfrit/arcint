@@ -37,9 +37,15 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   `--llama-layer-split`. `/props` gains a `dflash` block, the decode line
   the verifies and the tokens a verify. The reference's own server measured
   the Q4_K drafter at 7 drafts at +52 % (code), +40 % (prose) and +16-23 %
-  (4k context) decode over MTP 5 on the B60 (`measured-here`, phase 0);
-  arcint's build has run only device-free cells. The card legs and the red
-  builds are `tests/dflash/`.
+  (4k context) decode over MTP 5 on the B60 (`measured-here`, phase 0).
+  arcint's first card run (`measured-here`, 2026-10-16): 75.0 against MTP
+  5's 59.1 t/s on a code answer, level on prose, the acceptance task 0/10
+  (MTP 5 10/10; not attributed: the `mtp7` arm and red build 9 separate the
+  8-row verifies from the target's layer-input outputs), +1,140 MiB of peak
+  VRAM over MTP 5, most of it a 512-row logits reservation in the drafter's
+  compute buffer: `--llama-dflash-ubatch N` (default 64; llama.cpp's
+  `--spec-draft-n-ubatch`). The card legs and the red builds are
+  `tests/dflash/`.
 
 - **The opt-in alternatives are out of the llama.cpp series** (operator,
   2026-10-16): the mechanisms that measured slower or neutral and were left

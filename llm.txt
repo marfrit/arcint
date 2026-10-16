@@ -115,7 +115,8 @@
   7, --llama-dflash-min-p P; llama.cpp's draft-dflash on libllama): a block
   a drafter pass from the target's layer inputs, the selector's lattice
   walked greedily; not with --llama-mtp, not under --llama-layer-split.
-  Built, not measured on a card (docs/campaigns/dflash2-agent.md).
+  First card run: faster on code, level on prose, the acceptance task 0/10
+  (open), more VRAM than MTP 5 (docs/campaigns/dflash2-agent.md).
 - Context checkpoints (--llama-checkpoints N, --llama-checkpoint-step T):
   per lane, the recurrent state at user messages and near the prompt's end,
   in host memory; a follow-up or an edited message resumes from the newest
@@ -156,7 +157,8 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
 - --llama-kv K[:V]; --llama-threads N; --llama-reserve-cells N.
 - --llama-mtp N, --llama-mtp-gguf FILE, --llama-mtp-vocab FILE,
   --llama-mtp-min-p P, --llama-mtp-card N.
-- --llama-dflash-gguf FILE, --llama-dflash N (7), --llama-dflash-min-p P.
+- --llama-dflash-gguf FILE, --llama-dflash N (7), --llama-dflash-min-p P,
+  --llama-dflash-ubatch N (64).
 - --llama-checkpoints N (32), --llama-checkpoint-step T (8192).
 - --llama-cpu-moe N, --llama-expert-cache MIB[,MIB],
   --llama-expert-profile FILE, --llama-layer-split K.

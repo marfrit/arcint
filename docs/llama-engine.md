@@ -410,17 +410,26 @@ walk and recurrent rollback as MTP. The drafter is llama.cpp's
   of this model (architecture, width, vocabulary size, target layers, a
   mask token).
 - **Lanes**: one drafter decode drafts every lane's block.
+- **The draft ubatch** (`--llama-dflash-ubatch N`, default 64): llama.cpp
+  reserves the drafter's compute buffer for a token ubatch of N rows, each
+  with the LM head's 248,320 f32 logits (485 MiB at 512, 61 at 64);
+  llama.cpp's own knob is `--spec-draft-n-ubatch`. Injections are cut into
+  chunks of N.
 - **Logged**: the decode line carries the verifies and the tokens a verify;
-  `/props` a `dflash` block.
+  `/props` a `dflash` block; at `-vv` a line a verify (accepted a/n).
 
 Phase 0 measured the reference's own `llama-server` at the pin on the B60
 (`measured-here`, 2026-10-16, the agent at 32,768 tokens, q8_0:q4_0,
 greedy): DFlash2 with the Q4_K drafter at 7 drafts decoded 84.3-85.5 t/s on
 a code answer, 46.5-46.6 on prose and 37.0-38.3 at a 4k context, against
 MTP 5's 55.3-55.4, 33.3-33.4 and 31.1-33.0, with the same answer bytes.
-arcint's build is unmeasured: the card legs and the red cases are
-`tests/dflash/legs.sh` (served arms, depth cells, red builds from
-`tests/dflash/build-red.sh`).
+arcint's first card run (`measured-here`, 2026-10-16, 212,992 tokens):
+75.0 t/s on the legs' code cell against MTP 5's 59.1, prose level (31.1
+against 32.9), the acceptance task 0/10 against MTP 5's 10/10, and +1,140
+MiB of peak VRAM over MTP 5, before the draft ubatch fell to 64. The task
+and the VRAM are open (`docs/campaigns/dflash2-agent.md`, First card run);
+the legs and the red cases are `tests/dflash/legs.sh` and
+`tests/dflash/build-red.sh`.
 
 ## Quantized KV (`--llama-kv K[:V]`)
 

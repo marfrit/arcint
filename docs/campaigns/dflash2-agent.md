@@ -1,6 +1,6 @@
 # dflash2-agent — DFlash2 block drafting for the dense agent on the libllama engine
 
-**Open** (charter B2, operator 2026-10-16: to be built before 1.0). Recon, design and phase 0 done; **built on the libllama engine (branch `dflash2`, 2026-10-16), not measured on a card.**
+**Open** (charter B2, operator 2026-10-16: to be built before 1.0). Recon, design and phase 0 done; **built on the libllama engine (branch `dflash2`, 2026-10-16); the first card run fails the gate (the acceptance task 0/10, +1,140 MiB of VRAM over MTP 5): open.**
 
 ## Charter
 
@@ -175,6 +175,66 @@ aarch64 dev box; nothing ran on a GPU):
 - The card legs and red builds: `tests/dflash/legs.sh`,
   `tests/dflash/build-red.sh` (Measurement plan, below).
 - Deviations from the design and the reference: "Built: deviations" below.
+
+**First card run** (`measured-here`, 2026-10-16, the B60, branch `dflash2`
+at `d49a1df`, the agent's Q4_K_M at 212,992 tokens, q8_0:q4_0, the Q4_K
+drafter with F16 codebooks, `legs.py served`; the cells' prompts are not
+phase 0's):
+
+| arm | code | prose | 4k | tokens a verify (code / prose / 4k) |
+|---|---|---|---|---|
+| MTP 5 | 59.1 t/s | 32.9 | | 4.22 / 2.33 / |
+| DFlash2 7 | 75.0 | 31.1 | 35.6 | 5.65 / 2.33 / 2.75 |
+
+- Window edge, DFlash2 7 (MTP 5): 2,047 tokens 4.30 (2.95), 2,049 3.54
+  (3.01), 5,000 2.75 (2.86) tokens a verify; the checkpoint cells 2.71
+  (first) and 4.78 (resumed, another question).
+- **The acceptance task: 0/10 with DFlash2 7**, 10/10 MTP 5, 8/10 plain, the
+  same build; short answers byte-identical to MTP 5's. Below the floor.
+- **VRAM: peak 24,428 MiB at short context** against MTP 5's 23,288
+  (+1,140), and GTT 15.4 GB at the 55k needle (xe eviction).
+
+What the source says (`code`; the commits `2587e13`, `d0ead0f` carry the
+file:line):
+- *Acceptance*: no difference from the reference's cycle found (the rows
+  injected, their positions, the layer ids, the block's position, the walk,
+  the window mask); relative to MTP 5 the code cell sits where phase 0's did
+  (1.34 against ~1.3), prose does not (1.00 against ~1.17). Open until a
+  same-prompt run against llama-server; `-vv` logs a line a verify for it.
+- *The task*: the verify walk and the rollback are the MTP path's and
+  generic in N. Two differences from MTP 5 touch the target's numerics: 8-row
+  verifies (checked by the `mtp7` arm) and the target's five layer inputs
+  made graph outputs (checked by build 9: the drafter loaded and injecting,
+  no drafts, against plain's bytes and plain's own repeat). Not attributed.
+- *VRAM*: llama.cpp reserves the draft context's compute buffer for a
+  512-row token ubatch, and the dflash graph computes the LM head for every
+  row: 485 MiB of f32 logits for batches that are 8 rows. Fixed by
+  `--llama-dflash-ubatch` (default 64; llama.cpp's knob is
+  `--spec-draft-n-ubatch`). The account, by arithmetic from the code and
+  the files (the load log at `-v` names each buffer; not yet read):
+
+  | on the card | DFlash2 7 | MTP 5 |
+  |---|---|---|
+  | drafter weights (1.33 GB file; F16 codebooks 242 MiB of it) | 1,268 | |
+  | drafter K/V, window cache 2,560 cells x 5 layers, f16 | 50 | |
+  | drafter compute buffer at ubatch 512 (485 MiB logits + activations) | ~550-600 | |
+  | target: rollback snapshots, 7 against 5 (149.6 MiB each) | +299 | |
+  | target: five layer inputs kept as graph outputs (5 x 5,120 x 512 x 4 B) | ~50 | |
+  | MTP layer weights (`blk.64`) | | 276 |
+  | MTP context K/V (1 layer at 212,992, q8_0:q4_0) | | 338 |
+  | draft vocabulary head (40,960 Q6_K rows) | | 164 |
+  | MTP context compute buffer | | ~50-100 |
+  | **difference** | **~+1,340 to +1,440 predicted** | +1,140 measured |
+
+  What each knob saves (arithmetic): the draft ubatch 512 -> 64, ~480 MiB
+  (logits 485 -> 61 MiB, activations scale with it; costs 40-72 drafter
+  decodes a prompt's injection instead of 5-9, unmeasured); the codebooks
+  F16 -> Q8_0, 113 MiB (242 -> 129; re-quantize with `llama-quantize
+  --tensor-type` for `selector_predecessor` / `selector_successor`; GET_ROWS
+  q8_0 runs on the card since patch 0036); N 7 -> 5, 299 MiB (two snapshot
+  slots; phase 0: code 73 against 84 t/s, 4k level). All three: ~890 MiB,
+  ~+250 MiB over MTP 5 left (prediction). The 55k eviction says the margin
+  at 212,992 needs measuring after these, before the unit's context is set.
 
 Recon (before phase 0):
 
@@ -425,6 +485,9 @@ depth, KV types, binary sha and drafter quant.
 
       tests/dflash/legs.sh served <arcint> <agent Q4_K_M.gguf> <drafter.gguf> <assets> \
           --device GPU.0 --n-ctx 212992 --depths 55000,130000,<deepest> --out <dir>
+      # after the first run: the VRAM and the task's discriminators
+      tests/dflash/legs.sh served ... --arms mtp5,mtp7,dflash7,dflash7-ub512 --depths 55000 \
+          --pruefstand "<acceptance-task wrapper>"
       tests/dflash/build-red.sh <arcint source> <llama.cpp tree> <red-dir>
       tests/dflash/legs.sh red <red-dir> <arcint> <agent Q4_K_M.gguf> <drafter.gguf> <assets> \
           --device GPU.0 --n-ctx 212992 --out <dir>
@@ -436,7 +499,8 @@ depth, KV types, binary sha and drafter quant.
   edited message resumed from a checkpoint), MTP 5 and DFlash2 7 at depth,
   and `--pruefstand CMD` runs the acceptance task per arm. The red mode's
   builds 1-7 (the script's header) are the design's red cases 2 (builds 1,
-  2), 3 (4, 5), 4 (7) and 8 (6), and the block off by one (3); the design's
+  2), 3 (4, 5), 4 (7) and 8 (6), and the block off by one (3); builds 8 and
+  9 are equivalence arms (the reference's prefill; no drafts against plain); the design's
   5 and 6 are the served mode's depth and window-edge cells, its 1 and 9
   the unit cells. Build 8 is the reference's prefill (every prompt row into
   the drafter), the check open question 5 asked for: it must match green
@@ -520,6 +584,11 @@ From the design above and from the reference, each with its reason:
 - **Refused at load** besides the design's list: a DFlash1, LiliCorr or
   DSpark drafter (no selector or another walk), a drafter whose rows are
   not the model's width, a target layer outside the model, no mask token.
+- **The draft context's ubatch is 64 by default** (`--llama-dflash-ubatch`,
+  8-512); llama.cpp's default is the target's ubatch, with
+  `--spec-draft-n-ubatch` to lower it "to spare VRAM". Reason: the 512-row
+  token reservation (above, First card run); the reference's value is the
+  `dflash7-ub512` arm.
 - **The window check** runs before each draft (the server's `begin()`
   check, the drafter ending at pos0 - 1), counted and logged once a lane,
   not after each cycle.
