@@ -25,6 +25,16 @@ patches: 0001-0056 without 0031 and 0055), compiled in; dependencies as in
 0.8.0. The pin move's step 3 (every patch's red case and the KL arms of one
 and four sequences a batch on the new base) is done (charter C3).
 
+**Pre-tag check** (`measured-here`, 2026-10-16, the package, two processes a
+service): answers, needles, the equivalence and concurrency suites and the
+sanitizers pass; the acceptance task 10/10 (agent) and 9/10 (coder). The
+speeds sat 0.1-1 % under 0.8.0's floors (agent 694.3 / 490.9 t/s, coder
+50.6 / 47.2 / 43.8, Flash-Next 594.1 / 34.7-34.8); 0.8.0's binary,
+alternated with the package in the same window, measured the same and missed
+the same floors (the dev host's drift over a day). Tagged on that A/B, and
+the speed gate is now the same-window A/B against the last release, the
+floors a report (operator, 2026-10-16; DESIGN §5).
+
 - **The opt-in alternatives are out of the llama.cpp series** (operator,
   2026-10-16): the mechanisms that measured slower or neutral and were left
   behind a switch (the hyper-connection fusion, the K-split F16 matvec, the
