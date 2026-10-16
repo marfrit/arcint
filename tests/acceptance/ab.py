@@ -8,8 +8,9 @@ Serves the last release's binary (--old) and the release candidate (--new)
 alternately in one window -- old, new, old, new for two rounds -- each run a
 fresh process with the service's unit flags (cells/served_check.py, which
 this script runs unchanged). The candidate may not be slower than the old
-binary beyond that window's own run-to-run spread (operator, 2026-10-16,
-DESIGN.md §5 "Speed against the last release"). The absolute floors in
+binary beyond the old arm's run-to-run spread (at least FLOOR), nor vary
+more than the old arm by more than FLOOR (operator, 2026-10-16, DESIGN.md
+§5 "Speed against the last release"). The absolute floors in
 cells.json are a report, not a veto.
 
 Per metric (`ACCEPTANCE-METRIC <name> <value> <unit>` lines of the runs):
@@ -38,6 +39,7 @@ the spread is 0, the allowance is FLOOR, and the table says so; use
 """
 import argparse
 import hashlib
+import shutil
 import os
 import re
 import subprocess
@@ -112,8 +114,8 @@ def decide(old_runs, new_runs, tolerance=None, floor=None):
 
     old_runs, new_runs: lists of parse_run() results. Returns (rows,
     failures): rows is a list of dicts (metric, unit, old, new, mean_old,
-    mean_new, spread_old, spread_new, spread (the allowance), limit, ok,
-    unsteady, note), failures a
+    mean_new, spread_old, spread_new, spread (the allowance without
+    TOLERANCE), limit, ok, slow, unsteady, note), failures a
     list of strings (answer gates and incomplete runs, each naming its arm
     and run) that fail the A/B independently of the numbers."""
     tol = TOLERANCE if tolerance is None else tolerance
@@ -157,7 +159,7 @@ def decide(old_runs, new_runs, tolerance=None, floor=None):
             fast = mn >= limit
         unsteady = sn > so + flo
         row.update(mean_old=mo, mean_new=mn, spread_old=so, spread_new=sn,
-                   spread=spread, limit=limit, ok=fast and not unsteady,
+                   spread=spread, tol=tol, limit=limit, ok=fast and not unsteady,
                    slow=not fast, unsteady=unsteady)
         if len(arms["old"][0]) < 2:
             row["note"] = "one run an arm: no spread measured"
@@ -201,7 +203,7 @@ def render(rows, failures, texts_line):
             verdict += f" ({r['note']})"
         out.append(f"{r['metric']:<16} {r['unit']:<5} {fmt(r['old']):<22} {fmt(r['new']):<22} "
                    f"{r['mean_old']:>9.2f} {r['mean_new']:>9.2f} {r['spread_old'] * 100:>6.2f}% "
-                   f"{r['spread_new'] * 100:>6.2f}% {r['spread'] * 100:>6.2f}% "
+                   f"{r['spread_new'] * 100:>6.2f}% {(r['spread'] + r['tol']) * 100:>6.2f}% "
                    f"{r['limit']:>9.2f}  {verdict}")
     out.append(texts_line)
     for f in failures:
@@ -245,7 +247,14 @@ def main(argv=None):
         p.error("--rounds must be at least 1")
     if args.out:
         os.makedirs(args.out, exist_ok=True)
-    binaries = {arm: f"{path} sha256 {sha16(path)}" for arm, path in (("old", args.old), ("new", args.new))}
+    for arm in ("old", "new"):
+        # served_check.py starts the binary through PATH; resolve it the same way
+        path = getattr(args, arm)
+        path = shutil.which(path) or path
+        if not os.path.isfile(path):
+            p.error(f"--{arm} {path}: not found")
+        setattr(args, arm, path)
+    binaries = {arm: f"{getattr(args, arm)} sha256 {sha16(getattr(args, arm))}" for arm in ("old", "new")}
     for arm in ("old", "new"):
         print(f"== {arm}: {binaries[arm]}", flush=True)
     old_runs, new_runs = [], []

@@ -59,7 +59,7 @@ drafts from the package.
   on a code answer, -5 % prose, -8 % at 4k, -2 % at 55k, -33 % at 130k,
   -36 % at 200k; the reference's own server loses past ~60k too (+30 % at
   4k, +15 % at 58k, -26 % at 135k); below ~60k the reference gains and the
-  port does not, open. At 212,992 tokens its acceptance task scored 0/10,
+  port does not (open). At 212,992 tokens its acceptance task scored 0/10,
   twice the same bytes, where MTP 5 and MTP 7 scored 10/10 and plain
   decoding 8/10 in the same build (at 32,768 tokens DFlash2 scored 10/10):
   the target's greedy text depends on how many rows each verify carries,

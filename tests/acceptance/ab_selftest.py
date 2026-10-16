@@ -156,6 +156,11 @@ def main():
     check("RED end to end: a candidate varying more than the old -> exit 1",
           (rc, "varies more than the old" in out), (1, True))
     check("end to end: both binaries named with their sha256", out.count(" sha256 "), 4)
+    proc = subprocess.run([sys.executable, os.path.join(HERE, "ab.py"), "coder", "--old", "/nonexistent/arcint",
+                           "--new", "/nonexistent/arcint", "--gguf", "m", "--device", "GPU.1", "--assets", "."],
+                          capture_output=True, text=True)
+    check("RED: a binary that does not exist is refused before any run",
+          (proc.returncode, "not found" in proc.stderr, "== old run" in proc.stdout), (2, True, False))
     rc, out = a_b("100,101", "100,101", rounds=1)
     check("end to end: one round runs old and new once each", out.count("== old run") + out.count("== new run"), 2)
 

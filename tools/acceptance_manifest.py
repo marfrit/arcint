@@ -236,7 +236,8 @@ def render_checklist(cells):
     lines.append("    tests/acceptance/ab.py <agent|coder|flashnext> --old <last release's arcint> "
                  "--new <candidate's arcint> --gguf <model> --device GPU.N --assets <dir> [--rounds 2] [--out DIR]")
     lines.append("")
-    lines.append("- [ ] agent: exit 0 (candidate not slower than the last release beyond the window's spread; answers right)")
+    lines.append("- [ ] agent: exit 0 (candidate not slower than the last release beyond the old arm's spread, at least 0.5 %; "
+                 "its own spread at most 0.5 % above the old's; answers right)")
     lines.append("- [ ] coder: exit 0")
     lines.append("- [ ] flashnext: exit 0")
     lines.append("")

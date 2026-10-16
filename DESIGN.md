@@ -615,7 +615,8 @@ alternated in one window, two runs each, the model on the NVMe,
 `measured-here`, 2026-10-16 (the IQ2_XS row: 0.8.0's, 2026-10-15). Decode is
 a 300-token answer; prefill excludes nothing (cold lanes). Flash-Next asks
 the needle right after the capital. Every metric equal to 0.8.1's within the
-window's spread (0.00-0.21 %, Flash-Next's decode 2.3 %), the agent's and the
+gate's allowance (the old arm's spread, at least 0.5 %; the spreads
+0.00-0.21 %, Flash-Next's decode 2.3 %), the agent's and the
 coder's answers the same bytes in every run; Flash-Next's 1.0 runs gave two
 different texts (0.8.1's the same twice), every answer right (not
 attributed). The dev host drifts by up to 0.3 % (prefill) and 1 % (decode)
@@ -767,11 +768,11 @@ class a unit file may set); tuning, off-switch, red-case and diagnostic
 switches may change without notice. 1.0.0 adds `/props`'s `dflash` block
 (`requested`, `enabled`, `drafts`: the drafter's own draft count,
 `--llama-dflash` capped by its trained block). 0.8.0 changed the surface:
-the OpenVINO engine's flags are refused by name, `/props` and `/health` lose its fields (the
-reservation, the prefix cache, the paged-KV block), `/props` gains
-`model.architecture`, `quant` names the GGUF's file type, `kv_dtype`
-reports `--llama-kv` (it read "f16" whatever the flag said before), and
-the 503 bodies lose `reservation` and `kv_blocks_free`.
+the OpenVINO engine's flags were refused by name from then on, `/props` and
+`/health` lost its fields (the reservation, the prefix cache, the paged-KV
+block), `/props` gained `model.architecture`, `quant` named the GGUF's file
+type, `kv_dtype` reported `--llama-kv` (it had read "f16" whatever the flag
+said), and the 503 bodies lost `reservation` and `kv_blocks_free`.
 
 ### 8.8 Other open items
 

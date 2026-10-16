@@ -15,7 +15,7 @@ The served cells' floors are a report; the speed gate is a same-window A/B (DESI
 
     tests/acceptance/ab.py <agent|coder|flashnext> --old <last release's arcint> --new <candidate's arcint> --gguf <model> --device GPU.N --assets <dir> [--rounds 2] [--out DIR]
 
-- [ ] agent: exit 0 (candidate not slower than the last release beyond the window's spread; answers right)
+- [ ] agent: exit 0 (candidate not slower than the last release beyond the old arm's spread, at least 0.5 %; its own spread at most 0.5 % above the old's; answers right)
 - [ ] coder: exit 0
 - [ ] flashnext: exit 0
 

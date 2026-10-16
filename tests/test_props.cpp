@@ -142,6 +142,20 @@ TEST(props_reports_the_dflash_drafter) {
         CHECK(!j.at("mtp").at("enabled").get<bool>());
     }
     {
+        // requested but not (yet) loaded: no count to report
+        Config cfg;
+        cfg.llama_dflash_gguf = "/m/d.gguf";
+        cfg.llama_dflash      = 7;
+        FakeBackend backend;
+        SlotPool    slots(1);
+        Context     ctx{&cfg, &backend, &slots};
+
+        const nlohmann::json j = lgc::api::props(ctx);
+        CHECK_EQ(j.at("dflash").at("requested").get<std::string>(), std::string("on"));
+        CHECK(!j.at("dflash").at("enabled").get<bool>());
+        CHECK(j.at("dflash").at("drafts").is_null());
+    }
+    {
         Config      cfg;
         FakeBackend backend;
         backend.st.loaded = true;

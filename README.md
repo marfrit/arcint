@@ -59,7 +59,7 @@ point per case, at temperature 0.
 
 | service | card | prefill | decode | answers |
 |---|---|---|---|---|
-| agent | B60 | 695.5 t/s at 54,895 tokens, 491.9 at 138,028 | not in this check (38.9 / 25.6 / 16.6 / 13.5 t/s at 4k / 55k / 130k / 200k, 2026-10-16, the DFlash2 campaign's MTP 5 arm) | the needle at 138k; task 10/10 |
+| agent | B60 | 695.5 t/s at 54,895 tokens, 491.9 at 138,028 | not in this check (38.9 / 25.6 / 16.6 / 13.5 t/s at 4k / 55k / 130k / 200k, 2026-10-16, the DFlash2 campaign's MTP 5 arm at 212,992 ctx) | the needle at 138k; task 10/10 |
 | coder | A770 | 725.6 t/s at 40,841 tokens | 51.2 / 47.6 / 44.2 t/s on three 300-token answers | the needle; task 9/10 |
 | Flash-Next, IQ3_XXS | B60 + 28.7 GiB host bank | 595.3 t/s at 20,045 tokens (asked right after the capital) | 34.5-34.9 t/s | the needle |
 | Flash-Next, IQ2_XS option | B60 + 20.3 GiB host bank | 665.6 t/s, the same protocol | 42.3 t/s | the needle |
@@ -135,8 +135,8 @@ service's production flags, Flash-Next's expert cache included
   `model` field picks the lane.
 - Speculative decoding drafts with the model's own MTP head. A DFlash2
   drafter is opt-in (`--llama-dflash-gguf`, [docs/llama-engine.md](docs/llama-engine.md)):
-  on the dense agent it is faster on short code answers and slower past
-  ~60k tokens of context, it costs VRAM, and at 212,992 tokens its
+  on the dense agent it is faster on short code answers, slower on prose
+  and at every measured depth (-8 % at 4k to -36 % at 200k), it costs VRAM, and at 212,992 tokens its
   acceptance task scored 0/10 (MTP 10/10, not attributed), so the agent's
   unit keeps MTP.
 - One process holds its card's VRAM for its whole lifetime: whatever else
