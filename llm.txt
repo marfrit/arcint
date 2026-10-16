@@ -16,8 +16,9 @@
 
 ## Status
 
-- Version 0.8.0 (2026-10-15): the OpenVINO engine and the marfrit-openvino
-  dependency removed (charter A6).
+- Version 0.8.1 (2026-10-16): the llama.cpp series' opt-in alternatives
+  removed (54 patches); 0.8.0 (2026-10-15) removed the OpenVINO engine
+  (charter A6).
 - Production: the agent on the B60 (245,760 ctx, q8_0:q4_0 KV, MTP 5), the
   coder on the A770 (98,304 ctx, q8_0:q4_0 KV, MTP 4), Flash-Next on the
   B60 on demand (IQ3_XXS since 2026-10-15, IQ2_XS the faster option;

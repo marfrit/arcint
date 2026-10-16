@@ -18,7 +18,12 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
-## Unreleased
+## 0.8.1 — 2026-10-16
+
+**Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (54
+patches: 0001-0056 without 0031 and 0055), compiled in; dependencies as in
+0.8.0. The pin move's step 3 (every patch's red case and the KL arms of one
+and four sequences a batch on the new base) is done (charter C3).
 
 - **The opt-in alternatives are out of the llama.cpp series** (operator,
   2026-10-16): the mechanisms that measured slower or neutral and were left

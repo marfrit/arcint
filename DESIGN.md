@@ -1,6 +1,6 @@
 # arcint — Design
 
-State as of 2026-10-15: arcint **0.8.0** on llama.cpp **`3e4dfa8`** with the
+State as of 2026-10-16: arcint **0.8.1** on llama.cpp **`3e4dfa8`** with the
 patch series `contrib/llama.cpp/patches` 0001-0056 (54 patches). One engine: libllama with
 ggml's OpenCL backend and arcint's Intel kernels. Three services run in
 production on two Intel Arc cards: the dense Qwen3.8-27B agent and
@@ -574,7 +574,8 @@ GGUF repack) is at the tag `openvino-history`.
 | 0.6.0-0.6.x | Flash-Next on the libllama engine: the expert cache, the IQ kernels, its MTP layer | done |
 | 0.7.0-0.7.12 | named lanes and the step combiner, two cards by layers, the bank stream, decode launches, GDN snapshots, the CPU misses, the pin moved to `3e4dfa8` | done; 0.7.12 released 2026-10-15 |
 | 0.8.0 | the OpenVINO engine and `marfrit-openvino` retired; this document; the suites on the libllama engine; IQ3_XXS as a Flash-Next option | released 2026-10-15 |
-| 1.0.0 | feature complete, almost no gains by obvious changes | charter `docs/milestone-1.0.0.md` |
+| 0.8.1 | the llama.cpp series' opt-in alternatives removed (0031, 0055 dropped); the pin move's red cases and KL arms (C3) | released 2026-10-16 |
+| 1.0.0 | feature complete, almost no gains by obvious changes; DFlash2 on the agent | charter `docs/milestone-1.0.0.md` |
 
 Every open lever or defect is a campaign in `docs/campaigns/`.
 
