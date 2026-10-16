@@ -77,6 +77,15 @@ public:
     // A state that is not this drafter's at n is not loaded.
     virtual std::vector<uint8_t> carried_state(int seq, size_t n) = 0;
     virtual void                 set_carried_state(int seq, size_t n, const std::vector<uint8_t>& state) = 0;
+    // A prefill of the sequence is about to run up to n_end tokens and save
+    // context checkpoints at the token counts `ckpts`: a drafter may leave
+    // out prompt rows neither the drafts after n_end nor those checkpoints'
+    // states need. The MTP drafter takes every row.
+    virtual void prefill_plan(int seq, size_t n_end, const std::vector<size_t>& ckpts) {
+        (void) seq;
+        (void) n_end;
+        (void) ckpts;
+    }
     // Named lanes: the draft context's cell windows, as the target's
     // (llama_memory_seq_windows, contrib/llama.cpp 0026); false when its
     // memory cannot take them.

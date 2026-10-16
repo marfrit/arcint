@@ -26,6 +26,9 @@
 // MTP path's: nothing in them is MTP-specific.
 // A context checkpoint carries the drafter's window, as the server's does
 // (carried_state).
+// Beyond the reference: a prefill injects only the prompt rows the drafter's
+// window and the prefill's checkpoints need (kDflashPrefillRows,
+// prefill_plan).
 #include "exec/llama_spec.h"
 
 #ifdef ARCINT_LLAMA
@@ -36,6 +39,7 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "exec/dflash_walk.h"
@@ -48,6 +52,16 @@
 
 namespace lgc {
 namespace {
+
+// Prompt rows a prefill injects into the drafter: its 2,048-position window
+// plus a 512-row ubatch. Beyond the reference (llama.cpp injects every
+// prompt row): the drafter attends 2,048 positions, so rows further back
+// reach no draft; the operator's decision, 2026-10-16
+// (docs/campaigns/dflash2-agent.md, open question 5). The window before
+// each context checkpoint the same prefill takes is injected too
+// (prefill_plan), so a checkpoint carries the drafter state the reference
+// would have saved with it.
+constexpr size_t kDflashPrefillRows = 2560;
 
 class LlamaDflash final : public LlamaSpec {
 public:
@@ -333,22 +347,56 @@ public:
         llama_memory_seq_rm(md, seq, static_cast<llama_pos>(n), -1);
     }
 
+    // the prompt rows the drafter takes: the last kDflashPrefillRows before
+    // n_end (its window at the first draft; at least the window) and the
+    // window before each checkpoint (its saved state); the others stay out.
+    // A drafter without a sliding window attends every row: it takes them all
+    void prefill_plan(int seq, size_t n_end, const std::vector<size_t>& ckpts) override {
+        Lane& ln = lanes_[static_cast<size_t>(seq)];
+        ln.keep.clear();
+        if (n_swa_ <= 0) return;
+        const size_t w    = static_cast<size_t>(n_swa_);
+        const size_t rows = std::max(kDflashPrefillRows, w);
+        ln.keep.emplace_back(n_end > rows ? n_end - rows : 0, n_end);
+        for (size_t c : ckpts) ln.keep.emplace_back(c > w ? c - w : 0, c);
+    }
+
     bool set_kv_windows(const uint32_t* n_cells, int n) override {
         return llama_memory_seq_windows(llama_get_memory(ctx_dft_), n_cells, n);
     }
 
 private:
     struct Lane {
-        uint64_t mismatches = 0;   // drafts whose drafter did not end where the target does
+        // a prefill's prompt rows the drafter takes, [from, to) ranges
+        // (prefill_plan); none planned: every row
+        std::vector<std::pair<size_t, size_t>> keep;
+        uint64_t                               mismatches = 0;   // drafts whose drafter did not end where the target does
     };
 
     // The part's rows (from batch offset `off` of the target's decode) into
     // the drafter at their positions: the target layers' inputs side by side
-    // a token, in chunks of the draft ubatch (common/speculative.cpp:1209-1271),
-    // every row, as the reference injects them
+    // a token, in chunks of the draft ubatch (common/speculative.cpp:1209-1271).
+    // A prompt part injects its rows from the first one in a planned range
+    // on (the ranges end at batch boundaries: a checkpoint starts a batch,
+    // n_end ends the last, so a part's rows in them are its tail); a
+    // verify's are all injected, as the reference injects every row
     int inject(const SpecPart& p, size_t off) {
-        const size_t i0 = 0;
+        Lane&  ln = lanes_[static_cast<size_t>(p.seq)];
+        size_t i0 = 0;
+        if (!p.all_logits && !ln.keep.empty()) {
+            i0 = p.n;
+            for (const auto& [a, b] : ln.keep)
+                if (b > p.pos && a < p.pos + p.n) i0 = std::min(i0, a > p.pos ? a - p.pos : 0);
+        }
+        if (i0 >= p.n) return 0;
+        llama_memory_t  md    = llama_get_memory(ctx_dft_);
         const llama_pos start = static_cast<llama_pos>(p.pos + i0);
+        // past rows that stayed out: the drafter's cells start a new run (the
+        // rows before reach no draft; a checkpoint that needed them is saved)
+        if (!p.all_logits) {
+            const llama_pos pm = llama_memory_seq_pos_max(md, p.seq);
+            if (pm >= 0 && start > pm + 1) llama_memory_seq_rm(md, p.seq, -1, -1);
+        }
         std::vector<const float*> src(layers_.size());
         for (size_t k = 0; k < layers_.size(); ++k) {
             src[k] = llama_get_embeddings_layer_inp(ctx_tgt_, layers_[k]);

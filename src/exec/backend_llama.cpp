@@ -1035,30 +1035,55 @@ private:
         const auto& list   = ckpts_[static_cast<size_t>(seq)];
         auto newest        = [&] { return list.empty() ? size_t{0} : list.back().n_tokens; };
         auto is_user       = [&](size_t at) { return std::binary_search(users.begin(), users.end(), at); };
-        // where a batch stops early: a user start the checkpoint rule takes, or an end offset
-        auto breaks_at     = [&](size_t at) {
+        // where a batch stops early: a user start the checkpoint rule takes,
+        // or an end offset; `empty` and `newest_n` are the lane's checkpoints
+        auto breaks_at     = [&](size_t at, bool empty, size_t newest_n) {
             if (!ckpt) return false;
-            if (is_user(at) && (at == last_user || list.empty() || at > newest() + ckpt_step_)) return true;
+            if (is_user(at) && (at == last_user || empty || at > newest_n + ckpt_step_)) return true;
             return std::find(ends.begin(), ends.end(), at) != ends.end();
         };
-        for (size_t at = from; at < to;) {
-            size_t e = std::min(to, at + static_cast<size_t>(n_batch_));
+        // the batch from `at` (its end in `e`) and whether a checkpoint is
+        // taken at its start, given the lane's checkpoints
+        auto step          = [&](size_t at, bool empty, size_t newest_n, size_t& e) {
+            e = std::min(to, at + static_cast<size_t>(n_batch_));
             for (size_t i = at + 1; i < e; ++i)
-                if (breaks_at(i)) {
+                if (breaks_at(i, empty, newest_n)) {
                     e = i;
                     break;
                 }
-            if (ckpt && at > 0) {
-                // llama.cpp: a mid-prompt batch only when it starts a user
-                // message or ends within a ubatch of the prompt's end; then
-                // not within the step of the newest, unless it is the last
-                // user message or near the end
-                const bool near_end = P < e + nub;
-                const bool last_one = e == to;
-                bool       take     = last_one || is_user(at) || near_end;
-                take = take && (list.empty() || at == last_user || near_end || at > newest() + ckpt_step_);
-                if (take) save_ckpt_locked(seq, at);
+            if (!ckpt || at == 0) return false;
+            // llama.cpp: a mid-prompt batch only when it starts a user
+            // message or ends within a ubatch of the prompt's end; then not
+            // within the step of the newest, unless it is the last user
+            // message or near the end
+            const bool near_end = P < e + nub;
+            const bool last_one = e == to;
+            const bool take     = last_one || is_user(at) || near_end;
+            return take && (empty || at == last_user || near_end || at > newest_n + ckpt_step_);
+        };
+        if (spec_) {
+            // the drafter may leave out prompt rows (DFlash2: those its
+            // window never reaches), but not the rows before a checkpoint
+            // this prefill takes: its state is what a restore reads back.
+            // The checkpoints from a dry run of the same rules (a save makes
+            // its position the lane's newest)
+            std::vector<size_t> keep;
+            bool                empty    = list.empty();
+            size_t              newest_n = newest();
+            for (size_t at = from; at < to;) {
+                size_t e = at;
+                if (step(at, empty, newest_n, e)) {
+                    keep.push_back(at);
+                    empty    = false;
+                    newest_n = at;
+                }
+                at = e;
             }
+            spec_->prefill_plan(seq, to, keep);
+        }
+        for (size_t at = from; at < to;) {
+            size_t e = at;
+            if (step(at, list.empty(), newest(), e)) save_ckpt_locked(seq, at);
             if (!decode(prompt.data() + at, e - at, at))
                 throw std::runtime_error("llama_decode failed during prefill");
             have.insert(have.end(), prompt.begin() + static_cast<long>(at), prompt.begin() + static_cast<long>(e));
