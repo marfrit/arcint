@@ -71,11 +71,12 @@ services:
       GGML_OPENCL_BANK_STREAM: "1"
       # a share of the expert cache's decode misses computed on the CPU (patch 0056)
       LLAMA_EXPERT_CACHE_CPU_MISSES: "1"
-    command: [--engine, llama, --gguf, /models/gguf/<flash-next-iq2_xs-00001-of-00002>.gguf,
+    # IQ3_XXS, the default since 2026-10-15, at 12,000 MiB of slots (IQ2_XS: its file and 13,400)
+    command: [--engine, llama, --gguf, /models/gguf/<flash-next-iq3_xxs-00001-of-00002>.gguf,
               --served-model-name, qwen3.8-flash-next, --device, GPU.0,
               --host, 0.0.0.0, --port, "8089",
               --n-ctx, "131072", --llama-cpu-moe, "48", --llama-threads, "8",
-              --llama-expert-cache, "13400", --llama-reserve-cells, "20480",
+              --llama-expert-cache, "12000", --llama-reserve-cells, "20480",
               --llama-expert-profile, /models/<expert-profile>.bin,
               --llama-mtp, "3", --llama-mtp-min-p, "0.5", --llama-mtp-gguf, /models/<flash-next-mtp-head>.gguf,
               --llama-kv, q8_0, --queue-timeout, "30"]

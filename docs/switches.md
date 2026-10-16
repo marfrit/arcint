@@ -1,7 +1,7 @@
 # Switches
 
-Draft for charter item A7 (`docs/milestone-1.0.0.md`): every switch that 1.0
-keeps is documented, and diagnostic and red-case switches are named as such.
+Charter item A7 (`docs/milestone-1.0.0.md`, met 2026-10-16): every switch that
+1.0 keeps is documented, and diagnostic and red-case switches are named as such.
 
 The promise (charter C4, operator 2026-10-16): the **operational** switches
 are stable within 1.x, like the HTTP surface and the command-line flags.

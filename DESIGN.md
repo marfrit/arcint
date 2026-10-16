@@ -186,7 +186,8 @@ The cards (`measured-here` unless marked):
 
 ### 3.2 Kernels: the patch series
 
-`contrib/llama.cpp/patches` holds 56 patches against the pin, each with its
+`contrib/llama.cpp/patches` holds 54 patches against the pin (0001-0056; 0031
+and 0055 dropped in 0.8.1), each with its
 measurement, KL, red case and review in `contrib/llama.cpp/README.md`
 (`measured-here` throughout). By what they change:
 
@@ -658,11 +659,11 @@ a loop with the process's RSS, VRAM and GTT sampled for drift; a long idle
 followed by a request (the B60's wedge); the same on Flash-Next after a
 unit switch.
 
-### 8.2 Owed from the pin move to `3e4dfa8`
+### 8.2 Upstream work that meets the series
 
-The patches' own red cases and the four-sequence KL arms on the new base
-(`contrib/llama.cpp/README.md`, "Moving the pin", step 3). Upstream's open
-work that meets the series (`docs/campaigns/research-upstream-llama-2026-10.md`):
+The pin move's step 3 (every patch's red case and the KL arms on the new
+base) was done in 0.8.1 (`contrib/llama.cpp/README.md`, "Moving the pin").
+Upstream's open work that meets the series (`docs/campaigns/research-upstream-llama-2026-10.md`):
 the OpenCL backend split into per-op files (#29354, the natural shape for
 upstreaming), #30345 (supersedes 0010), #26631 (MUL_MAT_ID id -1), #30539
 (OpenCL declining tensors above the device's largest allocation: check

@@ -4,7 +4,7 @@
 #
 # The quality step over IQ2_XS: KL 0.218 against unsloth's Q8_0 (IQ2_XS 0.294), top-1 89.7 % (87.1 %)
 # (docs/llama-engine.md, "Flash-Next quant options"). Its host bank is larger (28.72 GiB at these slots), so
-# the slot budget is 12,000 MiB, not the IQ2_XS unit's 13,400: at 13,400 the card thrashed (peak 24,440 MiB,
+# the slot budget is 12,000 MiB, not IQ2_XS's 13,400: at 13,400 the card thrashed (peak 24,440 MiB,
 # 6.4-11.7 t/s, from the ZFS pool).
 #
 # Measured on the Arc Pro B60 with exactly these flags (arcint 321fc1d, the file on the NVMe, 2026-10-15):
