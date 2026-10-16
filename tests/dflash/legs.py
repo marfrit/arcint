@@ -31,6 +31,9 @@ own servers.
         5 the rejected rows left in the drafter            a request fails or the window check fires
         6 checkpoints without the drafter's state          the resumed request accepts less (reported)
         7 drafts accepted without the target's verdict     an answer check fails or every answer differs
+      and one equivalence arm, which must not fire:
+        8 the reference's prefill (every prompt row)       answers right, tokens a verify within 0.15 of green
+                                                           (code, prose, 4k context, the resumed request)
       Every red log must name its case (the mutant is in the loaded binary).
 
 Options: --device GPU.0, --n-ctx 212992 (every arm), --arms a,b,..,
@@ -360,7 +363,7 @@ def red(a):
     g = {c: get(run.rows, "green", c, "tokens_a_verify") or 0 for c in ("code-1", "prose-1", "ckpt-edited")}
     green_md5 = {r["cell"]: r["md5"] for r in run.rows if r.get("arm") == "green" and "md5" in r}
     green_ok = {r["cell"]: r.get("answer_ok") for r in run.rows if r.get("arm") == "green" and "md5" in r}
-    for n in range(1, 8):
+    for n in range(1, 9):
         b = os.path.join(a.red_dir, f"arcint-red-{n}")
         if not os.path.exists(b):
             print(f"== red {n}: {b} missing, skipped", flush=True)
@@ -379,6 +382,16 @@ def red(a):
         elif n in (4, 5):
             fired = errors or window > 0
             detail = f"request errors {errors}, window check {window}"
+        elif n == 8:
+            # the prefill's window-only injection against the reference's every row: the same drafter state
+            cells8 = ("code-1", "prose-1", "ctx4k", "ckpt-edited")
+            d8 = {c: (get(run.rows, arm, c, "tokens_a_verify") or 0) - (get(run.rows, "green", c, "tokens_a_verify") or 0)
+                  for c in cells8}
+            right = not any(r.get("answer_ok") is False or r.get("error") for r in mine)
+            same = all(abs(v) <= 0.15 for v in d8.values())
+            run.gate(right and same, "build 8 (every prompt row) matches green: answers right "
+                     f"{right}, tokens a verify minus green's {', '.join(f'{c} {v:+.2f}' for c, v in d8.items())}")
+            continue
         elif n == 6:
             tv6 = get(run.rows, arm, "ckpt-edited", "tokens_a_verify") or 0
             fired = tv6 < g["ckpt-edited"]
@@ -391,7 +404,8 @@ def red(a):
             detail = f"an answer green has right is wrong {wrong}, every answer differs from green {differs}"
         run.gate(fired, f"red {n} fired: {detail}")
     run.save()
-    print(f"== {len(run.failed)} failed" if run.failed else "== every red case fired", flush=True)
+    print(f"== {len(run.failed)} failed" if run.failed else "== every red case fired, the equivalence arm matched",
+          flush=True)
     return 1 if run.failed else 0
 
 

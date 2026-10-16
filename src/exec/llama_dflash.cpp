@@ -354,6 +354,11 @@ public:
     void prefill_plan(int seq, size_t n_end, const std::vector<size_t>& ckpts) override {
         Lane& ln = lanes_[static_cast<size_t>(seq)];
         ln.keep.clear();
+#if ARCINT_DFLASH_RED == 8
+        (void) n_end;
+        (void) ckpts;
+        return;   // the equivalence arm: every prompt row, as the reference injects them
+#endif
         if (n_swa_ <= 0) return;
         const size_t w    = static_cast<size_t>(n_swa_);
         const size_t rows = std::max(kDflashPrefillRows, w);
