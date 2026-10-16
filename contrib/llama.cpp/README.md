@@ -96,9 +96,62 @@ the survey of what upstream changed and what is open there is
   the series touches: MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT, GATED_DELTA_NET,
   SSM_CONV, GET_ROWS, CPY, SET_ROWS, TOP_K, FILL, RMS_NORM, SOFT_MAX): every
   case passes on both bases; the new base carries upstream's added cases
-  (MUL_MAT 1,221 -> 2,170). Owed by step 3 of the procedure and not done
-  for this move: the patches' own red cases and the four-sequence KL arms;
-  0056's test passes and its red mode fails.
+  (MUL_MAT 1,221 -> 2,170). The pin's own failures on `3e4dfa8`: 74 MXFP4
+  MUL_MAT_ID cases on the B60, three head-64 FLASH_ATTN_EXT cases on the
+  A770.
+- **Step 3, the red cases** (`measured-here`, 2026-10-16, the 54-patch
+  series after the switch removal, both cards): every patch's red case
+  re-run on the new base, each with the arm that must pass (the patch's off
+  switch with the fault kept, or the build without it).
+  - 95 test-backend-ops reds (a define, an environment switch or an edit of
+    the kernel file the test build loads), 24 of them designed for this
+    move for the 15 patches whose record had none or only prose (0001,
+    0002, 0004-0009, 0012, 0014, 0019, 0020, 0033, 0034, 0040): every one
+    fails its patch's cases and passes its control. Most counts equal the record (0016 42,
+    0038 62, 0041 and 0045 92, 0053 49 of 87, 0054 87 of 87, 0039 92 on
+    the A770); 0033's red reaches 1 case of 11 (it proves the suite runs
+    the new tile shape, not more). Two needed work: 0025's recorded red
+    (the destination's row stride from the source) changed nothing in its
+    own cases, whose source and destination differ in the plane stride:
+    re-designed on `nb2`, 2 of 6 fail as recorded; and 0036's cases tested
+    nothing, a defect of the port (see 0036, fixed).
+  - Host-code and served reds (a scratch tree rebuilt per red): 0006's
+    route cache keys dropped, coder KL 2.31 nats against 0.0254 (the cache
+    off: 0.0254); 0010's MTP rows in the old order, the coder's texts the
+    same bytes and decode 43.5 / 39.6 / 38.6 against 50.7 / 47.1 / 43.6
+    t/s; 0023's pre-patch tree lists one GPU of two; 0024's layer filter
+    dropped, both cards' caches claim layers 7-29 (green: 7-13 and 21-29);
+    0026's search head not reset, a 4k request after a 29k one in the same
+    lane 9.0 s against 6.3 (prefill 670 against 885 t/s); 0027's pre-patch
+    tree, four sequences a batch, 0.2438 / 81.96 % as recorded; 0029's
+    window offsets forced to 0, four sequences in windows (one unified KV
+    stream, `-kvu`), 1.3291 / 61.77 % as recorded (windows off on the same
+    build: 0.0041); 0028's mask
+    offset dropped, 423 of 2,820 attention cases fail (row blocks off:
+    2,820 pass); 0043's and 0044's thresholds removed under the bank
+    stream's red, NaN KL (the same red with the thresholds: 0.2875 and
+    0.2881); 0052's indexer score negated, Flash-Next keeps the capital and
+    loses the 20k needle and the long answer; 0052's reservation cap
+    ignored, the compute buffer for 20,480 cells 2,112 MiB against 945
+    (the draft context's 428 against 380).
+  - Served reds by switch (Flash-Next, the unit's flags): the cache's
+    checks report 1 of 6 copies (0021, 0042) and 1 of 144 table rows
+    (0046); 0032's stream red aborts; 0047's staging red answers garbage
+    and loses the needle (the copies unstaged: the same bytes as default);
+    0049's red crashes at the first request, 0050's changes the long
+    answer, 0051's loses the needle (each off: the same bytes); 0056's CPU
+    rows zeroed change the long answer, its IQ4_NL split red faults
+    (ggml-cpu's dot products: the same bytes); 0056's test fails 19 rows
+    in its red mode.
+  - Left: 0031 and 0055 dropped; 0052's ubatch cut (memory only, a 72k
+    prompt) not run.
+- **Step 3, the KL arms** (`measured-here`, one sequence a batch against
+  four): the dense agent 0.004376 / 97.819 % against 0.004099 / 97.745 %
+  (16 x 512, q8_0 KV, B60; four in one unified stream 0.004090 / 97.475 %,
+  with a window each 0.004118 / 97.917 %); the coder 0.025383 / 92.770 % both (A770);
+  Flash-Next IQ3_XXS 0.290954 / 86.618 % against 0.288792 / 86.716 % (8 x
+  512, ubatch 4, the CPU misses on, B60). Each pair inside the answer-level
+  bar.
 - **KL as served** (`measured-here`, the old base against the new on the
   same card): Flash-Next (8 x 512, ubatch 4, the CPU misses on) 0.370044 /
   84.41 % -> 0.369325 / 84.07 %; the dense agent (16 x 512, q8_0 KV)
