@@ -44,7 +44,7 @@ reference mechanism, and B3's gap is explained or closed.
 | # | criterion | state |
 |---|---|---|
 | C1 | DESIGN.md §7 and the README describe what ships: engines, numbers, the default | **met** by the overhaul of 2026-10-15: DESIGN §7 has 0.8.0's served numbers per service and the engine (Flash-Next's from IQ3_XXS since it became the default); the README the same (`measured-here`) |
-| C2 | A soak: several days of the three services under real use on both cards with no wedge, no eviction and no restart, logged | **open:** the record has the B60's wedge after a long idle, xe eviction at thin VRAM margins and copy-engine resets, each recovered, none soaked |
+| C2 | A soak: several days of the three services under real use on both cards with no wedge, no eviction and no restart, logged | **dropped** (operator, 2026-10-16): not a 1.0 criterion. The record keeps the B60's wedge after a long idle, xe eviction at thin VRAM margins and copy-engine resets, each recovered |
 | C3 | The dependency base is a stated choice: llama.cpp at a pin with N patches and how a rebase is done; marfrit-openvino +pN and its role | **llama.cpp: met, step 3 owed** (2026-10-15): the pin moved to upstream master `3e4dfa8` (288 commits on) with the 56 patches ported, the procedure and the move recorded (`contrib/llama.cpp/README.md`, "Moving the pin"; `docs/campaigns/research-upstream-llama-2026-10.md`), suites, KL and the three services measured on the new base (`measured-here`); owed: the patches' own red cases and the four-sequence KL arms on the new base. marfrit-openvino: retired with the OpenVINO engine (A6); removed from the dev host 2026-10-16, the published package kept as 0.7.x's dependency |
 | C4 | The interface promise: the HTTP surface, the unit flags and the supported environment switches that stay stable within 1.x | **open** (see A7) |
 | C5 | The release procedure as used for 0.7.x (pre-tag served check, second-model review, signed repository, fresh container) | met |
@@ -60,4 +60,4 @@ reference mechanism, and B3's gap is explained or closed.
 3. A2, A6, A5: operator decisions, priced where possible.
 4. C1, A7 and C4 together: the re-baselined DESIGN/README and the list of
    supported switches.
-5. C3, then C2, the soak, as the last gate before the tag.
+5. C3 as the last gate before the tag (C2, the soak, dropped by the operator, 2026-10-16).

@@ -641,7 +641,9 @@ CPU misses made it cost 7.7 %.
 
 Each item names the reference to follow and the measured starting point.
 
-### 8.1 The soak (charter C2)
+### 8.1 The soak (charter C2): dropped
+
+Not a 1.0 criterion (operator, 2026-10-16). What a soak would have tested:
 
 Several days of the three services under real use on both cards, logged:
 no wedge, no eviction, no restart. The record has the B60's wedge after a
