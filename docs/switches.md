@@ -3,8 +3,10 @@
 Draft for charter item A7 (`docs/milestone-1.0.0.md`): every switch that 1.0
 keeps is documented, and diagnostic and red-case switches are named as such.
 
-This is a proposal. The operator decides which switches stay stable within
-1.x (charter C4). Until then nothing here is a promise.
+The promise (charter C4, operator 2026-10-16): the **operational** switches
+are stable within 1.x, like the HTTP surface and the command-line flags.
+Tuning, off-switch, red-case and diagnostic switches are for measuring and
+may change or go without notice.
 
 A switch here is an environment variable read by arcint, by one of its tools,
 or by the llama.cpp patch series in `contrib/llama.cpp/patches` (0001-0056,
