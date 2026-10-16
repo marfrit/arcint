@@ -24,6 +24,8 @@
 //   cut at the accepted end (server-context.cpp:4529).
 // The target's recurrent rollback (n_rs_seq) and arcint's verify walk are the
 // MTP path's: nothing in them is MTP-specific.
+// A context checkpoint carries the drafter's window, as the server's does
+// (carried_state).
 #include "exec/llama_spec.h"
 
 #ifdef ARCINT_LLAMA
@@ -37,6 +39,7 @@
 #include <vector>
 
 #include "exec/dflash_walk.h"
+#include "exec/spec_state.h"
 #include "util/log.h"
 
 #ifndef ARCINT_DFLASH_RED
@@ -291,12 +294,43 @@ public:
         return true;
     }
 
-    // the drafter's window is not kept with a checkpoint yet: after a
-    // restore its sequence starts empty and the next injections refill it
-    std::vector<uint8_t> carried_state(int /*seq*/, size_t /*n*/) override { return {}; }
+    // the drafter's window K/V (its sliding-window cache: PARTIAL_ONLY
+    // writes the SWA caches only, llama-kv-cache.cpp:2280), as the server's
+    // checkpoint.update_dft (server-context.cpp:2597)
+    std::vector<uint8_t> carried_state(int seq, size_t n) override {
+#if ARCINT_DFLASH_RED == 6
+        (void) seq;
+        (void) n;
+        return {};   // red case: checkpoints without the drafter's state
+#else
+        if (n == 0) return {};
+        const size_t size = llama_state_seq_get_size_ext(ctx_dft_, seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (size == 0) return {};
+        std::vector<uint8_t> s = spec_state_alloc(SpecStateKind::DflashWindow, n, size);
+        if (llama_state_seq_get_data_ext(ctx_dft_, s.data() + kSpecStateHeader, size, seq,
+                                         LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != size)
+            return {};
+        return s;
+#endif
+    }
 
-    void set_carried_state(int seq, size_t /*n*/, const std::vector<uint8_t>& /*state*/) override {
-        llama_memory_seq_rm(llama_get_memory(ctx_dft_), seq, -1, -1);
+    // after a checkpoint's restore: its window back (the server's load_dft,
+    // server-context.cpp:3770-3771), cut to n; without one the drafter's
+    // sequence starts empty and the next injections refill it
+    void set_carried_state(int seq, size_t n, const std::vector<uint8_t>& state) override {
+        llama_memory_t md = llama_get_memory(ctx_dft_);
+        SpecStateView  v;
+        if (n == 0 || !spec_state_view(state, SpecStateKind::DflashWindow, n, v)) {
+            llama_memory_seq_rm(md, seq, -1, -1);
+            log::verbose("dflash", "lane %d: no drafter state with the checkpoint at %zu tokens: the window refills", seq, n);
+            return;
+        }
+        if (llama_state_seq_set_data_ext(ctx_dft_, v.data, v.size, seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != v.size) {
+            llama_memory_seq_rm(md, seq, -1, -1);
+            log::warn("dflash", "lane %d: loading the drafter's state at %zu tokens failed: the window refills", seq, n);
+            return;
+        }
+        llama_memory_seq_rm(md, seq, static_cast<llama_pos>(n), -1);
     }
 
     bool set_kv_windows(const uint32_t* n_cells, int n) override {
