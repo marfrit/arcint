@@ -47,6 +47,7 @@
 #include <fstream>
 #include <sstream>
 
+#include "exec/spec_state.h"
 #include "exec/token_ids.h"
 #include "util/log.h"
 
@@ -614,21 +615,25 @@ public:
         return true;
     }
 
-    std::vector<float> carried_row(int seq, size_t n) const override {
+    std::vector<uint8_t> carried_state(int seq, size_t n) override {
         const Lane& ln = lanes_[static_cast<size_t>(seq)];
         if (ln.pending <= 0 || ln.base + static_cast<size_t>(ln.pending) != n) return {};
-        const auto at = ln.rows.begin() + static_cast<long>(static_cast<size_t>(ln.pending - 1) * static_cast<size_t>(n_embd_));
-        return std::vector<float>(at, at + n_embd_);
+        const float* at = ln.rows.data() + static_cast<size_t>(ln.pending - 1) * static_cast<size_t>(n_embd_);
+        return spec_state_pack(SpecStateKind::MtpRow, n, at, static_cast<size_t>(n_embd_) * sizeof(float));
     }
 
     bool set_kv_windows(const uint32_t* n_cells, int n) override {
         return llama_memory_seq_windows(llama_get_memory(ctx_dft_), n_cells, n);
     }
 
-    void set_carried_row(int seq, size_t n, const std::vector<float>& row) override {
-        if (n == 0 || row.size() != static_cast<size_t>(n_embd_)) return;
-        Lane& ln   = lanes_[static_cast<size_t>(seq)];
-        ln.rows    = row;
+    void set_carried_state(int seq, size_t n, const std::vector<uint8_t>& state) override {
+        SpecStateView v;
+        if (n == 0 || !spec_state_view(state, SpecStateKind::MtpRow, n, v) ||
+            v.size != static_cast<size_t>(n_embd_) * sizeof(float))
+            return;
+        Lane& ln = lanes_[static_cast<size_t>(seq)];
+        ln.rows.resize(static_cast<size_t>(n_embd_));
+        std::memcpy(ln.rows.data(), v.data, v.size);
         ln.next.clear();
         ln.base    = n - 1;
         ln.pending = 1;

@@ -370,6 +370,70 @@ with decode at 22 t/s: VRAM paged over the link. The dense model serves
 prefills at 528 t/s at both 122,880 and 32,768, and a 120,945-token prompt
 in 579 s.
 
+## DFlash2 (`--llama-dflash-gguf FILE`, `--llama-dflash N`)
+
+Built 2026-10-16, not yet measured on a card
+(`docs/campaigns/dflash2-agent.md`). A DFlash2 drafter drafts a block in
+place of the MTP head: one drafter pass proposes up to N tokens (default 7,
+at most its trained block less one), conditioned on the target's hidden
+states, and the target verifies them in one decode through the same verify
+walk and recurrent rollback as MTP. The drafter is llama.cpp's
+`draft-dflash` at the pin rebuilt on libllama in `src/exec/llama_dflash.cpp`
+(`code`, the source map with file:line is in the campaign):
+
+- **The drafter**: a five-layer model of llama.cpp's `dflash` architecture
+  (`src/models/dflash.cpp`) with a sliding window of 2,048 positions,
+  loaded as a second model on the card. It borrows the target's embeddings
+  and LM head through `ctx_other`. The GGUF comes from llama.cpp's converter
+  at the pin (`convert_hf_to_gguf.py <DFlash2 dir> --target-model-dir <the
+  model's HF dir>`); phase 0 quantized it to Q4_K_M with the two selector
+  codebooks kept F16 (1.33 GB).
+- **What it reads**: the inputs of the target layers the GGUF names (for
+  Qwen3.8-27B-DFlash2: 6, 20, 34, 48, 62, the checkpoint's ids + 1). After
+  every target decode, prompt chunk or verify, those rows go into the
+  drafter as an embedding batch at their positions, where it writes them
+  as K/V. At prefill only the last 2,560 prompt rows go in, and the window
+  before each checkpoint the prefill takes (beyond the reference: the
+  operator's decision, 2026-10-16; the drafter attends 2,048 positions).
+- **A draft**: one drafter decode of the last token and N mask tokens per
+  lane; the DFlash2 selector packs each position's top-16 candidates and
+  their transition scores, and the walk (`src/exec/dflash_walk.h`, a pure
+  function with its own tests) picks greedily, each position from the
+  previous pick's transition row. `--llama-dflash-min-p P` stops at a pick
+  with less than P of its 16-way softmax. The block's K/V then leave the
+  drafter; after the verify both contexts are cut at the accepted end.
+- **Checkpoints**: a context checkpoint carries the drafter's window K/V,
+  as llama.cpp's server's do, and a restore loads it back
+  (`src/exec/spec_state.h`).
+- **Refused**: with `--llama-mtp` and its options (one drafter a context),
+  under `--llama-layer-split`, and for a GGUF that is not a DFlash2 drafter
+  of this model (architecture, width, vocabulary size, target layers, a
+  mask token).
+- **Lanes**: one drafter decode drafts every lane's block.
+- **The draft ubatch** (`--llama-dflash-ubatch N`, default 64): llama.cpp
+  reserves the drafter's compute buffer for a token ubatch of N rows, each
+  with the LM head's 248,320 f32 logits (485 MiB at 512, 61 at 64);
+  llama.cpp's own knob is `--spec-draft-n-ubatch`. Injections are cut into
+  chunks of N.
+- **Logged**: the decode line carries the verifies and the tokens a verify;
+  `/props` a `dflash` block; at `-vv` a line a verify (accepted a/n).
+
+Phase 0 measured the reference's own `llama-server` at the pin on the B60
+(`measured-here`, 2026-10-16, the agent at 32,768 tokens, q8_0:q4_0,
+greedy): DFlash2 with the Q4_K drafter at 7 drafts decoded 84.3-85.5 t/s on
+a code answer, 46.5-46.6 on prose and 37.0-38.3 at a 4k context, against
+MTP 5's 55.3-55.4, 33.3-33.4 and 31.1-33.0, with the same answer bytes.
+In arcint (`measured-here`, 2026-10-16, the B60, the agent's Q4_K_M at
+212,992 tokens, the Q4_K drafter, draft ubatch 64, against MTP 5 in the same
+build): +27 % on a code answer, -5 % prose, -8 % at 4k, -2 % at 55k, -33 %
+at 130k, -36 % at 200k; the reference's own server loses past ~60k too
+(+30 % at 4k, +15 % at 58k, -26 % at 135k, its drafts accepted 33 -> 16 %),
+so the depth collapse is the drafter's or llama.cpp's, not the port's. The
+verify is lossless (red builds: unverified drafts change every answer, a
+drafter that drafts nothing gives plain's bytes). Opt-in: the agent unit
+keeps MTP 5 at 245,760 tokens (operator, 2026-10-16); the legs and the red cases are `tests/dflash/legs.sh` and
+`tests/dflash/build-red.sh`.
+
 ## Quantized KV (`--llama-kv K[:V]`)
 
 `q8_0` and `q8_0:q4_0` run on the Intel attention kernels of
@@ -467,16 +531,11 @@ and the agent stays on this configuration. The deployed unit's own sampled
 runs: mean 7.2 over 10.
 
 **DFlash on this engine.** The pinned llama.cpp carries DFlash and DFlash2
-drafting (`code`):
-- `common/speculative.cpp`, type `draft-dflash`, which turns DFlash2 on when
-  the draft GGUF has a selector top-k;
-- `src/models/dflash.cpp`;
-- the converter in `convert_hf_to_gguf.py`.
-
-arcint's engine wires only the GGUF's MTP head (`src/exec/llama_spec.cpp`).
-DFlash2 ran on the retired OpenVINO engine (`--dflash`, 44.8 t/s against
-MTP's 33.0 there). Wiring llama.cpp's DFlash2 into this engine is open and
-unmeasured (DESIGN §8.5).
+drafting (`code`): `common/speculative.cpp` (type `draft-dflash`, DFlash2
+when the draft GGUF has a selector top-k), `src/models/dflash.cpp`, and the
+converter in `convert_hf_to_gguf.py`. DFlash2 ran on the retired OpenVINO
+engine (`--dflash`, 44.8 t/s against MTP's 33.0 there). On this engine it is
+built and not yet measured on a card (DFlash2 above, DESIGN §8.5).
 
 **Verify attention at depth (0.5.7, `contrib/llama.cpp` 0016).** On the
 B60, MTP verify calls (4-8 rows) take a kernel that reads K/V once per KV

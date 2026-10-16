@@ -20,6 +20,31 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
 ## Unreleased
 
+- **DFlash2 drafting on the libllama engine, opt-in** (charter B2,
+  `docs/campaigns/dflash2-agent.md`): `--llama-dflash-gguf FILE` drafts with
+  a DFlash2 drafter in place of the MTP head, `--llama-dflash N` (1-7,
+  default 7) drafts a verify, `--llama-dflash-min-p P` is the selector's
+  stop, `--llama-dflash-ubatch N` (default 64) the drafter's batch (a
+  512-row reservation cost ~480 MiB of logits). llama.cpp's `draft-dflash`
+  at the pin rebuilt on libllama (`src/exec/llama_dflash.cpp`): the target's
+  layer inputs injected into the drafter's 2,048-position window after
+  every target decode, one drafter pass a block, its selector's lattice
+  walked greedily (`src/exec/dflash_walk.h`), the verify walk and the
+  recurrent rollback the MTP path's; a context checkpoint carries the
+  drafter's window; a prefill injects only the last 2,560 prompt rows and
+  the window before each checkpoint (the operator's call, beyond the
+  reference). Refused with `--llama-mtp` and under `--llama-layer-split`.
+  Measured on the B60 (`measured-here`, 2026-10-16, the agent's Q4_K_M at
+  212,992 tokens, the Q4_K drafter, against MTP 5 in the same build): +27 %
+  on a code answer, -5 % prose, -8 % at 4k, -2 % at 55k, -33 % at 130k,
+  -36 % at 200k; the reference's own server loses past ~60k too (+30 % at
+  4k, +15 % at 58k, -26 % at 135k). Not on the agent unit, which keeps MTP 5
+  at 245,760 tokens (operator, 2026-10-16): its sessions are long, and the
+  drafter's VRAM would cost ~32k of context. The red builds (`tests/dflash/`)
+  catch shuffled features, a stale block, kept rejected rows and unverified
+  drafts; three mutants (wrong layers, a block off by one, no checkpoint
+  state) did not move the measurements and need stronger forms.
+
 **Release speed gate:** `tests/acceptance/ab.py` serves the last release's
 binary and the candidate alternately in one window (old, new, old, new) and
 fails the candidate only if it is slower beyond that window's run-to-run

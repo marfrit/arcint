@@ -48,6 +48,7 @@ struct ModelStatus {
     int         n_ctx_train  = 0;   // what the model was trained for
     int         n_layer      = 0;
     bool        mtp_enabled  = false;
+    bool        dflash_enabled = false;   // --llama-dflash-gguf: the DFlash2 drafter loaded
     uint64_t    weights_bytes = 0;
 
     // The KV precision actually served, as --llama-kv set it ("f16", "q8_0",
@@ -99,6 +100,9 @@ struct GenerationStats {
     int    cache_hit_tokens  = 0;
     int    draft_proposed    = 0;
     int    draft_accepted    = 0;
+    // verify steps (one target decode of [last, drafts...] each): the
+    // accepted drafts + steps over steps is the tokens a verify
+    int    draft_steps       = 0;
     // Wall time spent copying the whole model state so a rejected draft can be
     // rolled back. On the stateful path this is the price of speculation.
     // What the prefix cache costs on the way in. It is the same host round-trip
