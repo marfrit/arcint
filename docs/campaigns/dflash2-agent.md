@@ -129,6 +129,34 @@ the same binary, prompts and sampler for every arm.
 
 ## Current state
 
+**Phase 0** (`measured-here`, 2026-10-16, the reference's own `llama-server`
+at the pin with arcint's series, the B60, the agent's Q4_K_M at 32,768
+tokens, q8_0:q4_0 KV, greedy, 400 tokens, two passes each; decode t/s on a
+Lua CSV task / a prose answer / a 4k-token context):
+
+| arm | code | prose | 4k context | drafts accepted (code / prose / 4k) |
+|---|---|---|---|---|
+| no drafting | 18.7 | 18.8 | 18.6 | |
+| MTP 5 | 55.3-55.4 | 33.3-33.4 | 31.1-33.0 | 78.9 / 39.1 / 36-40 % |
+| DFlash2 Q4_K, 7 | 84.3-85.5 | 46.5-46.6 | 37.0-38.3 | 78.6 / 35.5 / 26-28 % |
+| DFlash2 Q4_K, 5 | 73.0-73.6 | 44.3 | 37.8-38.6 | 87.3 / 43.7 / 36-37 % |
+| DFlash2 Q8_0, 7 | 60.2-60.7 | 32.4 | 26.6-26.9 | 78.6 / 34.6 / 27 % |
+
+DFlash2 with the Q4_K drafter at 7 drafts: +52 % code, +40 % prose, +16-23 %
+at 4k over MTP 5, the same answer bytes (greedy). The Q8_0 drafter accepts
+the same drafts and decodes slower (not attributed). The drafter GGUF: the
+public checkpoint converted at the pin (`convert_hf_to_gguf.py
+--target-model-dir`, bf16), `llama-quantize` Q4_K_M with
+`selector_predecessor` / `selector_successor` kept F16 (1.33 GB).
+
+**Operator decisions** (2026-10-16): build it; the agent's context goes to
+~212,992 (sized by the load probes) for the drafter's VRAM; the drafter's
+window state is saved with each checkpoint, as llama.cpp does; refused with
+`--llama-layer-split`; at prefill only the last ~2,560 prompt rows are
+injected into the drafter (beyond the reference, the operator's call: the
+drafter attends a 2,048-row window).
+
+
 - **Engine (code):** arcint drafts only with MTP (`--llama-mtp`,
   `src/exec/llama_spec.cpp`); no DFlash code. The `LlamaSpec` interface
   (`src/exec/llama_spec.h`) is general: decode/decode_multi,
