@@ -16,9 +16,9 @@
 
 ## Status
 
-- Version 0.8.1 (2026-10-16): the llama.cpp series' opt-in alternatives
-  removed (54 patches); 0.8.0 (2026-10-15) removed the OpenVINO engine
-  (charter A6).
+- Version 1.0.0 (2026-10-16): the 1.0 charter met (docs/milestone-1.0.0.md);
+  DFlash2 drafting opt-in. 0.8.1 removed the series' opt-in alternatives
+  (54 patches); 0.8.0 removed the OpenVINO engine (charter A6).
 - Production: the agent on the B60 (245,760 ctx, q8_0:q4_0 KV, MTP 5), the
   coder on the A770 (98,304 ctx, q8_0:q4_0 KV, MTP 4), Flash-Next on the
   B60 on demand (IQ3_XXS since 2026-10-15, IQ2_XS the faster option;
@@ -120,6 +120,8 @@
   walked greedily; not with --llama-mtp, not under --llama-layer-split.
   Opt-in: against MTP 5 on the agent +27 % on code, -5 to -8 % on prose
   and at 4k, -33 to -36 % at 130-200k (the reference likewise past ~60k);
+  the acceptance task 0/10 at 212,992 tokens (a different greedy path of
+  the same target, 10/10 at 32,768);
   the agent unit keeps MTP 5 (docs/campaigns/dflash2-agent.md).
 - Context checkpoints (--llama-checkpoints N, --llama-checkpoint-step T):
   per lane, the recurrent state at user messages and near the prompt's end,

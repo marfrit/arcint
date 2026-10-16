@@ -18,7 +18,17 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
-## Unreleased
+## 1.0.0 — 2026-10-16
+
+arcint 1.0: the charter's criteria met (`docs/milestone-1.0.0.md`): the
+three services on the libllama engine from the released package, Flash-Next
+on one card plus host RAM, MTP drafting with recurrent rollback, the
+deployed contexts with their needles, every reference mechanism built,
+measured or set aside, the switches documented and the 1.x promise stated
+(the HTTP surface, the command-line flags and the operational switches).
+
+**Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (54
+patches), compiled in; dependencies as in 0.8.0.
 
 - **DFlash2 drafting on the libllama engine, opt-in** (charter B2,
   `docs/campaigns/dflash2-agent.md`): `--llama-dflash-gguf FILE` drafts with
@@ -38,7 +48,8 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   212,992 tokens, the Q4_K drafter, against MTP 5 in the same build): +27 %
   on a code answer, -5 % prose, -8 % at 4k, -2 % at 55k, -33 % at 130k,
   -36 % at 200k; the reference's own server loses past ~60k too (+30 % at
-  4k, +15 % at 58k, -26 % at 135k). Not on the agent unit, which keeps MTP 5
+  4k, +15 % at 58k, -26 % at 135k). At
+  212,992 tokens its acceptance task scored 0/10, twice the same bytes, where MTP 5 and MTP 7 scored 10/10 and plain decoding 8/10 in the same build (at 32,768 tokens DFlash2 scored 10/10): the target's greedy text depends on how many rows each verify carries, and DFlash2's 8-row verifies take a different path through it. Not on the agent unit, which keeps MTP 5
   at 245,760 tokens (operator, 2026-10-16): its sessions are long, and the
   drafter's VRAM would cost ~32k of context. The red builds (`tests/dflash/`)
   catch shuffled features, a stale block, kept rejected rows and unverified

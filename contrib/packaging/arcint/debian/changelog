@@ -1,3 +1,13 @@
+arcint (1.0.0-1) trixie; urgency=medium
+
+  * 1.0.0: the charter met (docs/milestone-1.0.0.md). DFlash2 drafting
+    on the libllama engine, opt-in (--llama-dflash-gguf, --llama-dflash,
+    --llama-dflash-min-p, --llama-dflash-ubatch); the release speed gate as
+    a same-window A/B against the last release (tests/acceptance/ab.py).
+    The units keep MTP. Dependencies unchanged.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Fri, 16 Oct 2026 22:00:00 +0200
+
 arcint (0.8.1-1) trixie; urgency=medium
 
   * 0.8.1: the llama.cpp series without its opt-in alternatives (the

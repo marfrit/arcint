@@ -372,7 +372,7 @@ in 579 s.
 
 ## DFlash2 (`--llama-dflash-gguf FILE`, `--llama-dflash N`)
 
-Built 2026-10-16, not yet measured on a card
+Built 2026-10-16, opt-in, measured below
 (`docs/campaigns/dflash2-agent.md`). A DFlash2 drafter drafts a block in
 place of the MTP head: one drafter pass proposes up to N tokens (default 7,
 at most its trained block less one), conditioned on the target's hidden
@@ -427,10 +427,10 @@ In arcint (`measured-here`, 2026-10-16, the B60, the agent's Q4_K_M at
 212,992 tokens, the Q4_K drafter, draft ubatch 64, against MTP 5 in the same
 build): +27 % on a code answer, -5 % prose, -8 % at 4k, -2 % at 55k, -33 %
 at 130k, -36 % at 200k; the reference's own server loses past ~60k too
-(+30 % at 4k, +15 % at 58k, -26 % at 135k, its drafts accepted 33 -> 16 %),
+(+30 % at 4k, +15 % at 58k, -26 % at 135k, its drafts accepted 37 -> 16 %),
 so the depth collapse is the drafter's or llama.cpp's, not the port's. The
 verify is lossless (red builds: unverified drafts change every answer, a
-drafter that drafts nothing gives plain's bytes). Opt-in: the agent unit
+drafter that drafts nothing gives plain's bytes). At 212,992 tokens its acceptance task scored 0/10, twice the same bytes, where MTP 5 and MTP 7 scored 10/10 and plain decoding 8/10 in the same build (at 32,768 tokens DFlash2 scored 10/10): the target's greedy text depends on how many rows each verify carries, and DFlash2's 8-row verifies take a different path through it. Opt-in: the agent unit
 keeps MTP 5 at 245,760 tokens (operator, 2026-10-16); the legs and the red cases are `tests/dflash/legs.sh` and
 `tests/dflash/build-red.sh`.
 
@@ -535,7 +535,8 @@ drafting (`code`): `common/speculative.cpp` (type `draft-dflash`, DFlash2
 when the draft GGUF has a selector top-k), `src/models/dflash.cpp`, and the
 converter in `convert_hf_to_gguf.py`. DFlash2 ran on the retired OpenVINO
 engine (`--dflash`, 44.8 t/s against MTP's 33.0 there). On this engine it is
-built and not yet measured on a card (DFlash2 above, DESIGN §8.5).
+built and opt-in, measured as not paying for the agent's long contexts
+(DFlash2 above, DESIGN §8.5).
 
 **Verify attention at depth (0.5.7, `contrib/llama.cpp` 0016).** On the
 B60, MTP verify calls (4-8 rows) take a kernel that reads K/V once per KV

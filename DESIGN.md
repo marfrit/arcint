@@ -1,6 +1,6 @@
 # arcint — Design
 
-State as of 2026-10-16: arcint **0.8.1** on llama.cpp **`3e4dfa8`** with the
+State as of 2026-10-16: arcint **1.0.0** on llama.cpp **`3e4dfa8`** with the
 patch series `contrib/llama.cpp/patches` 0001-0056 (54 patches). One engine: libllama with
 ggml's OpenCL backend and arcint's Intel kernels. Three services run in
 production on two Intel Arc cards: the dense Qwen3.8-27B agent and
@@ -306,11 +306,12 @@ count) fail that test.
   2,048-position window, injected after every target decode; one drafter
   pass drafts a block of N, and its selector's lattice is walked greedily
   (`src/exec/dflash_walk.h`, pure, with its own tests). The verify walk and
-  the recurrent rollback are the MTP path's, so the emitted tokens are the
-  plain loop's. A checkpoint carries the drafter's window, as llama.cpp's
+  the recurrent rollback are the MTP path's: every emitted token is the
+  target's own pick, though the target's picks depend on how many rows a
+  verify carries, so the text is not the plain loop's. A checkpoint carries the drafter's window, as llama.cpp's
   server's does; a prefill injects only the rows the window and the
-  checkpoints need (the operator's call, beyond the reference). Built; the
-  first card run fails the gate (§8.5).
+  checkpoints need (the operator's call, beyond the reference). Built and
+  opt-in; measured in §8.5.
 
 ### 3.6 Sampling
 
@@ -594,7 +595,7 @@ GGUF repack) is at the tag `openvino-history`.
 | 0.7.0-0.7.12 | named lanes and the step combiner, two cards by layers, the bank stream, decode launches, GDN snapshots, the CPU misses, the pin moved to `3e4dfa8` | done; 0.7.12 released 2026-10-15 |
 | 0.8.0 | the OpenVINO engine and `marfrit-openvino` retired; this document; the suites on the libllama engine; IQ3_XXS as a Flash-Next option | released 2026-10-15 |
 | 0.8.1 | the llama.cpp series' opt-in alternatives removed (0031, 0055 dropped); the pin move's red cases and KL arms (C3) | released 2026-10-16 |
-| 1.0.0 | feature complete, almost no gains by obvious changes; DFlash2 on the agent | charter `docs/milestone-1.0.0.md` |
+| 1.0.0 | feature complete, almost no gains by obvious changes (charter `docs/milestone-1.0.0.md`, met); DFlash2 opt-in; the release speed gate as a same-window A/B | released 2026-10-16 |
 
 Every open lever or defect is a campaign in `docs/campaigns/`.
 
@@ -722,10 +723,10 @@ answer bytes. **State: built and opt-in (2026-10-16)** (`measured-here`, 2026-10
 212,992 tokens, the Q4_K drafter, draft ubatch 64, against MTP 5 in the same
 build): +27 % on a code answer, -5 % prose, -8 % at 4k, -2 % at 55k, -33 %
 at 130k, -36 % at 200k; the reference's own server loses past ~60k too
-(+30 % at 4k, +15 % at 58k, -26 % at 135k, its drafts accepted 33 -> 16 %),
+(+30 % at 4k, +15 % at 58k, -26 % at 135k, its drafts accepted 37 -> 16 %),
 so the depth collapse is the drafter's or llama.cpp's, not the port's. The
 verify is lossless (red builds: unverified drafts change every answer, a
-drafter that drafts nothing gives plain's bytes). Opt-in: the agent unit
+drafter that drafts nothing gives plain's bytes). At 212,992 tokens its acceptance task scored 0/10, twice the same bytes, where MTP 5 and MTP 7 scored 10/10 and plain decoding 8/10 in the same build (at 32,768 tokens DFlash2 scored 10/10): the target's greedy text depends on how many rows each verify carries, and DFlash2's 8-row verifies take a different path through it. Opt-in: the agent unit
 keeps MTP 5 at 245,760 tokens (operator, 2026-10-16). The
 legs are `tests/dflash/legs.sh` (`docs/campaigns/dflash2-agent.md`).
 

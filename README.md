@@ -131,6 +131,10 @@ service's production flags, Flash-Next's expert cache included
 - Named lanes (`--served-model-name A,B --lane-ctx CA,CB`) serve two names
   with their own contexts from one copy of the weights; the request's
   `model` field picks the lane.
+- Speculative decoding drafts with the model's own MTP head. A DFlash2
+  drafter is opt-in (`--llama-dflash-gguf`, [docs/llama-engine.md](docs/llama-engine.md)):
+  on the dense agent it is faster on short code answers and slower past
+  ~60k tokens of context, and it costs VRAM, so the agent's unit keeps MTP.
 - One process holds its card's VRAM for its whole lifetime: whatever else
   was serving that card has to stop first.
 - **No authentication, permissive CORS, no TLS.** arcint is built for a LAN

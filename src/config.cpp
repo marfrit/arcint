@@ -554,7 +554,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192 ||
             cfg.llama_expert_cache_on() || !cfg.llama_expert_profile.empty() || cfg.llama_layer_split > 0 || cfg.llama_mtp_card >= 0 ||
             cfg.llama_reserve_cells > 0)
-            return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab/-gguf/-min-p, --llama-dflash/-gguf/-min-p, "
+            return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab/-gguf/-min-p, --llama-dflash/-gguf/-min-p/-ubatch, "
                         "--llama-kv, --llama-checkpoints/-step, "
                         "--llama-expert-cache/-profile, --llama-layer-split, --llama-mtp-card and --llama-reserve-cells are options of "
                         "the libllama engine (--gguf), not of --stub");

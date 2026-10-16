@@ -37,6 +37,7 @@
 #include <llama.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -190,6 +191,10 @@ public:
         for (uint32_t id : layers_) llama_set_embeddings_layer_inp(ctx_tgt, id, true);
         bt_ = llama_batch_ext_init(ctx_tgt);
         bd_ = llama_batch_ext_init(ctx_dft_);
+        if (bt_ == nullptr || bd_ == nullptr) {
+            err = "the batches for the target's layer inputs or the drafter could not be allocated";
+            return;
+        }
         lanes_.resize(static_cast<size_t>(n_seq));
 
         std::string ls;

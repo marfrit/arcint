@@ -301,6 +301,18 @@ drafter; `legs.py served` and `red`; each arm a fresh process):
 - **VRAM:** with the 64-row draft ubatch, peak 23,939-24,017 MiB at
   212,992 tokens (MTP 5: 23,286-23,354), nothing evicted.
 
+**Known limitations** (the code review of 2026-10-16, `code`): the
+prefill's dry run of its checkpoints assumes every save succeeds (a failed
+save makes the real checkpoints differ from the plan, and a resumed request
+drafts from a stale window: acceptance only); the window-only injection
+assumes every drafter layer is a sliding-window layer (the Qwen3.8 drafter
+is; a mixed drafter would miss rows: acceptance only); `/props`'s
+`dflash.drafts` reports the requested count, not the block-limited one;
+enabling the target's layer inputs adds ~200 MiB of pinned host memory at
+a 2,048 batch and copies every prompt row's five layer inputs to the host,
+injected or not; red builds 1, 3 and 6 need stronger mutants, and the
+legs check the red banner, not its case number.
+
 ## Design
 
 ### Flags
@@ -546,9 +558,9 @@ depth, KV types, binary sha and drafter quant.
   (answers right, tokens a verify within 0.15). Not in the legs: the KL
   window (the served engine exposes no logits rows) and the design's red
   case 7 (drafter parity against the reference forward).
-- **The agent unit's flags with DFlash2** (for after the load probes; the
-  unit file is changed then, not now; `--llama-dflash-min-p` only if a stop
-  arm wins):
+- **The agent unit's flags with DFlash2** (not taken: the operator kept MTP
+  5, 2026-10-16. **Warning:** at these flags the acceptance task scored 0/10
+  twice, Second card run above; run the task before serving them):
 
       --engine llama --gguf /models/gguf/Qwen3.8-27B-Q4_K_M.gguf
       --served-model-name qwen3.8-agent --device GPU.0 --host 0.0.0.0 --port 8087
