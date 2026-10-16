@@ -1,6 +1,6 @@
 # dflash2-agent — DFlash2 block drafting for the dense agent on the libllama engine
 
-**Open** (charter B2, operator 2026-10-16: to be built before 1.0). Recon and design done; nothing built.
+**Open** (charter B2, operator 2026-10-16: to be built before 1.0). Recon, design and phase 0 done; **built on the libllama engine (branch `dflash2`, 2026-10-16), not measured on a card.**
 
 ## Charter
 
@@ -156,15 +156,37 @@ window state is saved with each checkpoint, as llama.cpp does; refused with
 injected into the drafter (beyond the reference, the operator's call: the
 drafter attends a 2,048-row window).
 
+**Built (2026-10-16), not measured on a card** (`code`; the serving build
+compiles warning-clean with `-Werror` against the pin with the series, on an
+aarch64 dev box; nothing ran on a GPU):
 
-- **Engine (code):** arcint drafts only with MTP (`--llama-mtp`,
-  `src/exec/llama_spec.cpp`); no DFlash code. The `LlamaSpec` interface
+- `--llama-dflash-gguf FILE`, `--llama-dflash N` (1-7, default 7),
+  `--llama-dflash-min-p P`; refused with `--llama-mtp` and its options and
+  under `--llama-layer-split`, each with its own message (`src/config.cpp`).
+- The drafter (`src/exec/llama_dflash.cpp`): the loading, the draft context
+  and the cycle as the Design below says, the walk in
+  `src/exec/dflash_walk.h`. The `LlamaSpec` checkpoint pair carries opaque
+  bytes (`src/exec/spec_state.h`): the MTP row, the drafter's window K/V.
+- The prefill injects the last 2,560 prompt rows and the window before each
+  checkpoint the prefill takes (operator, below); verifies inject every row.
+- Device-free cells (`ctest -L unit`): the refusals, the walk on synthetic
+  lattices, the state bytes, `/props`; each with a red run (mutants listed
+  in the commit `tests: DFlash2's device-free cells`).
+- The card legs and red builds: `tests/dflash/legs.sh`,
+  `tests/dflash/build-red.sh` (Measurement plan, below).
+- Deviations from the design and the reference: "Built: deviations" below.
+
+Recon (before phase 0):
+
+- **Engine (code), at recon:** arcint drafted only with MTP (`--llama-mtp`,
+  `src/exec/llama_spec.cpp`). The `LlamaSpec` interface
   (`src/exec/llama_spec.h`) is general: decode/decode_multi,
   draft/draft_multi, accept, seq_rm on both contexts, a per-lane carried
   state for checkpoints, KV windows. MTP-specific: the carried hidden row
   and its pending-row bookkeeping, `DraftHead`, the `n_rs_seq` and
   `n_outputs_max_per_seq` sizing from `--llama-mtp`.
-- **Drafter GGUF: none usable exists.** The dev host's two DFlash GGUFs are
+- **Drafter GGUF at recon: none usable existed** (phase 0 then converted
+  the public checkpoint, above). The dev host's two DFlash GGUFs are
   other models' drafters (`code`, GGUF metadata read 2026-10-16):
   `dflash-kquant.gguf` is a MuseGlimmer drafter (hidden 6,656, vocabulary
   202,048, target layers 2/14/26/38/50, SWA 2,048, Q4_K/Q6_K, 1.62 GB);
@@ -398,6 +420,41 @@ depth, KV types, binary sha and drafter quant.
 - **Budget:** a deep cell is ~25 min of prefill (157 t/s at 237k); two arms
   at depth plus the short cells fit the 2 h budget if the deepest cell runs
   once per arm; a row above 2 h is TBD.
+- **The legs as built** (`tests/dflash/legs.sh`, paths only, no host
+  names; the agent unit stopped first, `docs/sop-card-window.md`):
+
+      tests/dflash/legs.sh served <arcint> <agent Q4_K_M.gguf> <drafter.gguf> <assets> \
+          --device GPU.0 --n-ctx 212992 --depths 55000,130000,<deepest> --out <dir>
+      tests/dflash/build-red.sh <arcint source> <llama.cpp tree> <red-dir>
+      tests/dflash/legs.sh red <red-dir> <arcint> <agent Q4_K_M.gguf> <drafter.gguf> <assets> \
+          --device GPU.0 --n-ctx 212992 --out <dir>
+
+  `<assets>` holds `corpus.txt` and `mtp-vocab.json` (as the served check).
+  The served mode runs the arms plain, MTP 5, DFlash2 7 and 5, DFlash2 7
+  with the stop at 0.3 and 0.5 on the short cells (the capital, code and
+  prose answers, a 4k context, prompts of 2,047 / 2,049 / 5,000 tokens, an
+  edited message resumed from a checkpoint), MTP 5 and DFlash2 7 at depth,
+  and `--pruefstand CMD` runs the acceptance task per arm. The red mode's
+  builds 1-7 (the script's header) are the design's red cases 2 (builds 1,
+  2), 3 (4, 5), 4 (7) and 8 (6), and the block off by one (3); the design's
+  5 and 6 are the served mode's depth and window-edge cells, its 1 and 9
+  the unit cells. Build 8 is the reference's prefill (every prompt row into
+  the drafter), the check open question 5 asked for: it must match green
+  (answers right, tokens a verify within 0.15). Not in the legs: the KL
+  window (the served engine exposes no logits rows) and the design's red
+  case 7 (drafter parity against the reference forward).
+- **The agent unit's flags with DFlash2** (for after the load probes; the
+  unit file is changed then, not now; `--llama-dflash-min-p` only if a stop
+  arm wins):
+
+      --engine llama --gguf /models/gguf/Qwen3.8-27B-Q4_K_M.gguf
+      --served-model-name qwen3.8-agent --device GPU.0 --host 0.0.0.0 --port 8087
+      --n-ctx 212992 --llama-kv q8_0:q4_0
+      --llama-dflash-gguf <the Q4_K_M drafter, selector codebooks F16> --llama-dflash 7
+      --queue-timeout 30 --repetition-penalty 1.0
+
+  (`--llama-mtp 5 --llama-mtp-vocab` leave the unit: one drafter a
+  context.)
 
 ### What decides it (arithmetic, to be replaced by phase 0)
 
@@ -438,14 +495,56 @@ attend the whole context, so the margin grows with depth.
    reference): the drafter keeps 2,048 positions, so injecting only a
    prompt's last ~2,560 rows gives the same drafter state with ~1 % less
    prefill work; llama.cpp injects every row. Build only with your yes and a
-   red case proving the identical state.
+   red case proving the identical state. (Decided 2026-10-16: built, with
+   the checkpoints' windows kept; the check is build 8 of `legs.sh red`.)
+
+## Built: deviations
+
+From the design above and from the reference, each with its reason:
+
+- **The prefill's injected rows** include, besides the last 2,560 (the
+  operator's call), the 2,048-row window before each checkpoint the
+  prefill takes, so a checkpoint carries the window the reference would
+  have saved (the operator's other decision). The backend's prefill runs
+  its batching and checkpoint rules once as a dry run to list those
+  checkpoints; its batches and checkpoints are unchanged. A drafter
+  without a sliding window takes every row. The equivalence check against
+  every row is build 8 of the red mode, not a unit cell: the drafter's
+  state needs a card.
+- **The draft context's batch is its ubatch** (min(the target's, 512), at
+  least a block a lane); llama.cpp's is the target's 2,048. Injection
+  chunks are ubatch-sized in both; the larger batch only sizes host output
+  buffers.
+- **`swa_full` set off explicitly**: common's default, llama.cpp's library
+  default is on (a window cache the size of the context).
+- **Refused at load** besides the design's list: a DFlash1, LiliCorr or
+  DSpark drafter (no selector or another walk), a drafter whose rows are
+  not the model's width, a target layer outside the model, no mask token.
+- **The window check** runs before each draft (the server's `begin()`
+  check, the drafter ending at pos0 - 1), counted and logged once a lane,
+  not after each cycle.
+- **Red cases 4 and 5** (the block's or the rejected rows' K/V left in the
+  drafter) make llama.cpp refuse the next batch's positions (`X <= Y` for
+  the M-RoPE draft), so the expected failure is a failed request or the
+  window check, not only lower acceptance.
+- **Not built**: drafter parity against the reference forward (design red
+  case 7), the KL window (needs a logits dump), `tests/equivalence` and
+  `tests/acceptance/cells.json` sections (the legs script carries the
+  cells for now), the unit file (after the load probes),
+  `docs/model_requirements.md` (no such file; the recipe is under "The
+  GGUF" above).
+- **Additions**: `/props` has a `dflash` block; the decode line logs the
+  verifies and the tokens a verify (for MTP too).
 
 ## Where it lives
 
-- Planned: `src/exec/llama_dflash.cpp`, `src/exec/dflash_walk.h`,
-  `src/exec/llama_spec.h`, `src/exec/backend_llama.cpp`, `src/config.*`,
-  `tests/test_dflash_walk.cpp`, `tests/equivalence/run.sh` (a DFlash2
-  section), `tests/acceptance/cells.json` (`agent-dense` with DFlash2),
+- Built: `src/exec/llama_dflash.cpp`, `src/exec/dflash_walk.h`,
+  `src/exec/spec_state.h`, `src/exec/llama_spec.{h,cpp}` (the state bytes,
+  `prefill_plan`), `src/exec/backend_llama.cpp`, `src/config.*`,
+  `tests/test_dflash_walk.cpp`, `tests/test_spec_state.cpp`,
+  `tests/test_config.cpp`, `tests/test_props.cpp`, `tests/dflash/`.
+- Planned: `tests/equivalence/run.sh` (a DFlash2 section),
+  `tests/acceptance/cells.json` (`agent-dense` with DFlash2),
   `contrib/systemd/arcint-agent.service`.
 - The reference: llama.cpp at the pin, `src/models/dflash.cpp`,
   `common/speculative.cpp` (`draft-dflash`), `tools/server/server-context.cpp`,

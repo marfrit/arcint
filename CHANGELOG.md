@@ -20,6 +20,27 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
 ## Unreleased
 
+- **DFlash2 drafting on the libllama engine, built, not measured on a
+  card** (charter B2, `docs/campaigns/dflash2-agent.md`):
+  `--llama-dflash-gguf FILE` drafts with a DFlash2 drafter in place of the
+  MTP head, `--llama-dflash N` (1-7, default 7) drafts a verify,
+  `--llama-dflash-min-p P` is the selector's stop. llama.cpp's
+  `draft-dflash` at the pin rebuilt on libllama
+  (`src/exec/llama_dflash.cpp`): the target's layer inputs injected into the
+  drafter's 2,048-position window after every target decode, one drafter
+  pass a block, its selector's lattice walked greedily
+  (`src/exec/dflash_walk.h`), the verify walk and the recurrent rollback the
+  MTP path's. A context checkpoint carries the drafter's window, as
+  llama.cpp's server's does; a prefill injects only the last 2,560 prompt
+  rows and the window before each checkpoint (the operator's call, beyond
+  the reference). Refused with `--llama-mtp` and under
+  `--llama-layer-split`. `/props` gains a `dflash` block, the decode line
+  the verifies and the tokens a verify. The reference's own server measured
+  the Q4_K drafter at 7 drafts at +52 % (code), +40 % (prose) and +16-23 %
+  (4k context) decode over MTP 5 on the B60 (`measured-here`, phase 0);
+  arcint's build has run only device-free cells. The card legs and the red
+  builds are `tests/dflash/`.
+
 - **The opt-in alternatives are out of the llama.cpp series** (operator,
   2026-10-16): the mechanisms that measured slower or neutral and were left
   behind a switch (the hyper-connection fusion, the K-split F16 matvec, the

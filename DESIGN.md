@@ -298,8 +298,18 @@ count) fail that test.
 - Served: the agent 5 drafts, the coder 4, Flash-Next 3 with the stop at 0.5
   (Strata's setting: 37.9 against Strata's 37.8 t/s on Strata's request,
   2026-10-14, `measured-here`).
-- DFlash2 drafting exists in llama.cpp at the pin (`draft-dflash`, `code`)
-  and is not wired here (§8).
+- **A DFlash2 drafter** (`--llama-dflash-gguf FILE`, `--llama-dflash N`)
+  drafts in place of the MTP head, one drafter a context: llama.cpp's
+  `draft-dflash` rebuilt on libllama (`src/exec/llama_dflash.cpp`, `code`).
+  A five-layer drafter keeps the target's layer inputs as K/V in a
+  2,048-position window, injected after every target decode; one drafter
+  pass drafts a block of N, and its selector's lattice is walked greedily
+  (`src/exec/dflash_walk.h`, pure, with its own tests). The verify walk and
+  the recurrent rollback are the MTP path's, so the emitted tokens are the
+  plain loop's. A checkpoint carries the drafter's window, as llama.cpp's
+  server's does; a prefill injects only the rows the window and the
+  checkpoints need (the operator's call, beyond the reference). Built, not
+  measured on a card (§8.5).
 
 ### 3.6 Sampling
 
@@ -691,8 +701,15 @@ before a move past it).
 
 llama.cpp at the pin carries DFlash and DFlash2 drafting (`draft-dflash`,
 `src/models/dflash.cpp`, `code`). On the OpenVINO engine DFlash2 decoded
-44.8 against MTP's 33.0 t/s at short depth (`measured-here`, 2026-09). Not
-wired on the libllama engine, unmeasured.
+44.8 against MTP's 33.0 t/s at short depth (`measured-here`, 2026-09). The
+reference's own server at the pin, on the B60 (`measured-here`, 2026-10-16,
+32,768 tokens, greedy): the Q4_K drafter at 7 drafts decoded +52 % on code,
++40 % on prose and +16-23 % at a 4k context over MTP 5, with the same
+answer bytes. **State: built on the libllama engine (2026-10-16), not
+measured on a card**: the served arms, the depth cells, the memory at the
+operator's ~212,992-token context and the red cases are
+`tests/dflash/legs.sh`; the KL clause of the gate needs a logits dump the
+served engine does not have (`docs/campaigns/dflash2-agent.md`).
 
 ### 8.6 Levers priced below 2 % (charter B1)
 
