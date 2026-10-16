@@ -140,6 +140,10 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
             stats.draft_accepted,
             stats.draft_proposed, stats.draft_propose_seconds, stats.draft_verify_seconds,
             stats.draft_reforward_seconds, stats.draft_rollback_seconds);
+        // the acceptance length: the tokens a verify emits on average
+        if (stats.draft_steps > 0)
+            decode_suffix += log::format(", %d verifies (%.2f tokens a verify)", stats.draft_steps,
+                                         static_cast<double>(stats.draft_accepted + stats.draft_steps) / stats.draft_steps);
     }
     // Visible even on a request that drafted nothing at all: a lane whose
     // drafter is currently off (disabled by an earlier failure, re-armed only
@@ -482,6 +486,10 @@ json props(const Context& ctx) {
         {"cache", {{"kv_dtype", st.kv_precision.empty() ? json(nullptr) : json(st.kv_precision)}}},
         {"mtp", {{"requested", std::string(cfg.llama_mtp > 0 ? "on" : "off")},
                  {"enabled", st.mtp_enabled}}},
+        {"dflash", {{"requested", std::string(cfg.llama_dflash_on() ? "on" : "off")},
+                    {"enabled", st.dflash_enabled},
+                    // the drafter's own count: --llama-dflash capped by its trained block
+                    {"drafts", st.dflash_drafts > 0 ? json(st.dflash_drafts) : json(nullptr)}}},
         {"sampler_defaults",
          {{"temperature", sd.temperature},
           {"top_p", sd.top_p},

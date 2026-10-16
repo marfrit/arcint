@@ -50,22 +50,24 @@ the RAM for its bank (DESIGN §7.2).
 
 ## Current numbers
 
-0.8.1's pre-tag check (2026-10-16): the release package with each unit's
-flags, two fresh processes per service, the model on the NVMe,
-`measured-here` on the named card; the IQ2_XS row is 0.8.0's. "task" is the acceptance task: a
+1.0.0's pre-tag check (2026-10-16): the release package with each unit's
+flags, alternated with 0.8.1's binary in one window (two runs each), the
+model on the NVMe, `measured-here` on the named card; the IQ2_XS row is
+0.8.0's. "task" is the acceptance task: a
 Lua CSV parser to RFC 4180, ten named cases, the candidate code executed, one
 point per case, at temperature 0.
 
 | service | card | prefill | decode | answers |
 |---|---|---|---|---|
-| agent | B60 | 694.3 t/s at 54,895 tokens, 490.9 at 138,028 | not in this check (36.6 / 32.3 / 19.3 t/s at 4k / 29k / 130k on 2026-10-08, before 0016-0051) | the needle at 138k; task 10/10 |
-| coder | A770 | 724.6 t/s at 40,841 tokens | 50.6 / 47.2 / 43.8 t/s on three 300-token answers | the needle; task 9/10 |
-| Flash-Next, IQ3_XXS | B60 + 28.7 GiB host bank | 594.1 t/s at 20,045 tokens (asked right after the capital) | 34.7-34.8 t/s | the needle |
+| agent | B60 | 695.5 t/s at 54,895 tokens, 491.9 at 138,028 | not in this check (38.9 / 25.6 / 16.6 / 13.5 t/s at 4k / 55k / 130k / 200k, 2026-10-16, the DFlash2 campaign's MTP 5 arm at 212,992 ctx) | the needle at 138k; task 10/10 |
+| coder | A770 | 725.6 t/s at 40,841 tokens | 51.2 / 47.6 / 44.2 t/s on three 300-token answers | the needle; task 9/10 |
+| Flash-Next, IQ3_XXS | B60 + 28.7 GiB host bank | 595.3 t/s at 20,045 tokens (asked right after the capital) | 34.5-34.9 t/s | the needle |
 | Flash-Next, IQ2_XS option | B60 + 20.3 GiB host bank | 665.6 t/s, the same protocol | 42.3 t/s | the needle |
 
-These are 0.1-1 % below 0.8.0's pre-tag numbers; 0.8.0's own binary,
-alternated with the package in the same window, measured the same (the
-dev host drifts by that much over a day).
+Every speed is equal to 0.8.1's in the same window (the release gate,
+`tests/acceptance/ab.py`); the dev host drifts by up to 0.3 % on prefill and
+1 % on decode over a day, so numbers from different windows differ by that
+much.
 
 Strata's own engine (its SYCL port) on the same B60: 620 t/s at the 20k
 needle and 37.8 t/s decode on its own request, where arcint decodes
@@ -131,6 +133,12 @@ service's production flags, Flash-Next's expert cache included
 - Named lanes (`--served-model-name A,B --lane-ctx CA,CB`) serve two names
   with their own contexts from one copy of the weights; the request's
   `model` field picks the lane.
+- Speculative decoding drafts with the model's own MTP head. A DFlash2
+  drafter is opt-in (`--llama-dflash-gguf`, [docs/llama-engine.md](docs/llama-engine.md)):
+  on the dense agent it is faster on short code answers, slower on prose
+  and at every measured depth (-8 % at 4k to -36 % at 200k), it costs VRAM, and at 212,992 tokens its
+  acceptance task scored 0/10 (MTP 10/10, not attributed), so the agent's
+  unit keeps MTP.
 - One process holds its card's VRAM for its whole lifetime: whatever else
   was serving that card has to stop first.
 - **No authentication, permissive CORS, no TLS.** arcint is built for a LAN

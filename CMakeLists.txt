@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 0.8.1 LANGUAGES CXX)
+project(arcint VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -105,7 +105,15 @@ if(ARCINT_LLAMA)
   set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
   add_subdirectory("${ARCINT_LLAMA_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/llama.cpp" EXCLUDE_FROM_ALL)
   find_package(OpenCL REQUIRED)
-  target_sources(arcint_core PRIVATE src/exec/backend_llama.cpp src/exec/llama_spec.cpp)
+  target_sources(arcint_core PRIVATE src/exec/backend_llama.cpp src/exec/llama_spec.cpp src/exec/llama_dflash.cpp)
+  # The DFlash2 drafter's red cases (tests/dflash/legs.sh): a build with a
+  # mutant compiled in, which says so at load. 0 is the served build; the
+  # cases are listed in src/exec/llama_dflash.cpp and tests/dflash/legs.sh
+  set(ARCINT_DFLASH_RED "0" CACHE STRING "DFlash2 red-case mutant (0: none; a test build only)")
+  if(NOT ARCINT_DFLASH_RED STREQUAL "0")
+    message(WARNING "ARCINT_DFLASH_RED=${ARCINT_DFLASH_RED}: a DFlash2 red-case build, not for serving")
+  endif()
+  target_compile_definitions(arcint_core PRIVATE ARCINT_DFLASH_RED=${ARCINT_DFLASH_RED})
   # llama-ext.h: the pinned llama.cpp's staging API (nextn embeddings, MTP)
   target_include_directories(arcint_core PRIVATE "${ARCINT_LLAMA_DIR}/src")
   target_link_libraries(arcint_core PUBLIC llama OpenCL::OpenCL)
@@ -181,6 +189,8 @@ if(ARCINT_TESTS)
     tests/test_text.cpp
     tests/test_config.cpp
     tests/test_verify_walk.cpp
+    tests/test_dflash_walk.cpp
+    tests/test_spec_state.cpp
     tests/test_token_ids.cpp
     tests/test_props.cpp
     tests/test_lanes.cpp
@@ -229,6 +239,11 @@ if(ARCINT_TESTS)
   add_test(NAME acceptance-runner
            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/acceptance/selftest.py")
   set_tests_properties(acceptance-runner PROPERTIES LABELS unit)
+
+  # The release speed gate's decision function and parser (tests/acceptance/ab.py).
+  add_test(NAME acceptance-ab
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/acceptance/ab_selftest.py")
+  set_tests_properties(acceptance-ab PROPERTIES LABELS unit)
 endif()
 
 if(ARCINT_ACCEPTANCE)

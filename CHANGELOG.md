@@ -18,6 +18,72 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.0.0 — 2026-10-16
+
+arcint 1.0: the charter's criteria met (`docs/milestone-1.0.0.md`): the
+three services on the libllama engine from the released package, Flash-Next
+on one card plus host RAM, MTP drafting with recurrent rollback, the
+deployed contexts with their needles, every reference mechanism built,
+measured or set aside, the switches documented and the 1.x promise stated
+(the HTTP surface, the command-line flags and the operational switches).
+
+**Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (54
+patches), compiled in; dependencies as in 0.8.0.
+
+**Pre-tag check** (`measured-here`, 2026-10-16, the package): the release
+gate `tests/acceptance/ab.py` against 0.8.1's binary, alternated, two runs
+each: the agent 695.5 / 491.9 t/s at 55k / 138k (0.8.1 695.5 / 491.75), the
+coder 51.2 / 47.6 / 44.2 t/s and 725.6 at 41k (0.8.1 51.05 / 47.55 / 44.1,
+725.4), Flash-Next 595.25 / 34.7 (0.8.1 595.1 / 34.6): every metric equal
+within the window's spread, every answer right, the agent's and the coder's
+the same bytes; the equivalence and concurrency suites, the sanitizers, the
+acceptance task 10/10 (agent) and 9/10 (coder); DFlash2 opt-in answers and
+drafts from the package.
+
+- **DFlash2 drafting on the libllama engine, opt-in** (charter B2,
+  `docs/campaigns/dflash2-agent.md`, on the `qfndev` branch):
+  `--llama-dflash-gguf FILE` drafts with
+  a DFlash2 drafter in place of the MTP head, `--llama-dflash N` (1-7,
+  default 7) drafts a verify, `--llama-dflash-min-p P` is the selector's
+  stop, `--llama-dflash-ubatch N` (default 64) the drafter's batch (a
+  512-row reservation cost ~480 MiB of logits). llama.cpp's `draft-dflash`
+  at the pin rebuilt on libllama (`src/exec/llama_dflash.cpp`): the target's
+  layer inputs injected into the drafter's 2,048-position window after
+  every target decode, one drafter pass a block, its selector's lattice
+  walked greedily (`src/exec/dflash_walk.h`), the verify walk and the
+  recurrent rollback the MTP path's; a context checkpoint carries the
+  drafter's window; a prefill injects only the last 2,560 prompt rows and
+  the window before each checkpoint (the operator's call, beyond the
+  reference). Refused with `--llama-mtp` and under `--llama-layer-split`.
+  Measured on the B60 (`measured-here`, 2026-10-16, the agent's Q4_K_M at
+  212,992 tokens, the Q4_K drafter, against MTP 5 in the same build): +27 %
+  on a code answer, -5 % prose, -8 % at 4k, -2 % at 55k, -33 % at 130k,
+  -36 % at 200k; the reference's own server loses past ~60k too (+30 % at
+  4k, +15 % at 58k, -26 % at 135k); below ~60k the reference gains and the
+  port does not (open). At 212,992 tokens its acceptance task scored 0/10,
+  twice the same bytes, where MTP 5 and MTP 7 scored 10/10 and plain
+  decoding 8/10 in the same build (at 32,768 tokens DFlash2 scored 10/10):
+  the target's greedy text depends on how many rows each verify carries,
+  but MTP 7's verifies carry 8 rows too; not attributed further (open). Not
+  on the agent unit, which keeps MTP 5 at 245,760 tokens (operator,
+  2026-10-16): its sessions are long, and the drafter's VRAM would cost
+  ~32k of context (arithmetic from file sizes and the measured peaks: it
+  fits at 212,992, not at 245,760). `/props` reports the drafter's own draft
+  count (`dflash.drafts`: `--llama-dflash` capped by the drafter's trained
+  block). The red builds (`tests/dflash/`)
+  catch shuffled features, a stale block, kept rejected rows and unverified
+  drafts; three mutants (wrong layers, a block off by one, no checkpoint
+  state) did not move the measurements and need stronger forms.
+
+**Release speed gate:** `tests/acceptance/ab.py` serves the last release's
+binary and the candidate alternately in one window (old, new, old, new) and
+fails the candidate if it is slower than the old binary beyond the old
+arm's run-to-run spread (at least 0.5 %), if its own spread exceeds the old
+arm's by more than 0.5 %, or if an answer is wrong (operator, 2026-10-16;
+DESIGN §5). Each binary is named with its sha256. The
+`*-served` cells' references carry `"gate": "report"`: run.py still prints
+REGRESSED against the recorded floors but they no longer fail the run.
+
 ## 0.8.1 — 2026-10-16
 
 **Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (54

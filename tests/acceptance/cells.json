@@ -130,31 +130,33 @@
     "references": [
       {
         "metric": "prefill-55k",
-        "value": 694.3,
-        "gate_at": 694.3,
+        "value": 695.5,
+        "gate_at": 694.9,
         "unit": "t/s",
         "direction": "lower-is-worse",
         "samples": 2,
-        "spread_pct": 0.0,
+        "spread_pct": 0.06,
         "config": "24 GB card, the agent unit's flags (245,760 ctx, q8_0:q4_0 KV, MTP 5, the draft vocabulary), one fresh process a run, the model staged on the NVMe",
         "prompt_tokens": 54895,
         "design": "§5",
         "measured": "2026-10-16",
-        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
+        "binary": "the 1.0.0 pre-tag package (3453a66), two runs alternated with 0.8.1's binary (tests/acceptance/ab.py); a report, the gate is the same-window A/B (operator, 2026-10-16)",
+        "gate": "report"
       },
       {
         "metric": "prefill-138k",
-        "value": 490.85,
-        "gate_at": 490.7,
+        "value": 491.9,
+        "gate_at": 491.6,
         "unit": "t/s",
         "direction": "lower-is-worse",
         "samples": 2,
-        "spread_pct": 0.02,
+        "spread_pct": 0.04,
         "config": "24 GB card, the agent unit's flags (245,760 ctx, q8_0:q4_0 KV, MTP 5, the draft vocabulary), one fresh process a run, the model staged on the NVMe",
         "prompt_tokens": 138028,
         "design": "§5",
         "measured": "2026-10-16",
-        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
+        "binary": "the 1.0.0 pre-tag package (3453a66), two runs alternated with 0.8.1's binary (tests/acceptance/ab.py); a report, the gate is the same-window A/B (operator, 2026-10-16)",
+        "gate": "report"
       }
     ]
   },
@@ -185,8 +187,8 @@
     "references": [
       {
         "metric": "decode-a",
-        "value": 50.6,
-        "gate_at": 50.6,
+        "value": 51.2,
+        "gate_at": 51.2,
         "unit": "t/s",
         "direction": "lower-is-worse",
         "samples": 2,
@@ -195,12 +197,13 @@
         "prompt_tokens": null,
         "design": "§5",
         "measured": "2026-10-16",
-        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
+        "binary": "the 1.0.0 pre-tag package (3453a66), two runs alternated with 0.8.1's binary (tests/acceptance/ab.py); a report, the gate is the same-window A/B (operator, 2026-10-16)",
+        "gate": "report"
       },
       {
         "metric": "decode-b",
-        "value": 47.2,
-        "gate_at": 47.2,
+        "value": 47.6,
+        "gate_at": 47.6,
         "unit": "t/s",
         "direction": "lower-is-worse",
         "samples": 2,
@@ -209,35 +212,38 @@
         "prompt_tokens": null,
         "design": "§5",
         "measured": "2026-10-16",
-        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
+        "binary": "the 1.0.0 pre-tag package (3453a66), two runs alternated with 0.8.1's binary (tests/acceptance/ab.py); a report, the gate is the same-window A/B (operator, 2026-10-16)",
+        "gate": "report"
       },
       {
         "metric": "decode-c",
-        "value": 43.75,
-        "gate_at": 43.6,
+        "value": 44.2,
+        "gate_at": 44.2,
         "unit": "t/s",
         "direction": "lower-is-worse",
         "samples": 2,
-        "spread_pct": 0.23,
+        "spread_pct": 0.0,
         "config": "16 GiB card, the coder unit's flags (98,304 ctx, q8_0:q4_0 KV, MTP 4), one fresh process a run, the model staged on the NVMe; decode a/b/c: 300-token answers on hash tables, compilers, TCP",
         "prompt_tokens": null,
         "design": "§5",
         "measured": "2026-10-16",
-        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
+        "binary": "the 1.0.0 pre-tag package (3453a66), two runs alternated with 0.8.1's binary (tests/acceptance/ab.py); a report, the gate is the same-window A/B (operator, 2026-10-16)",
+        "gate": "report"
       },
       {
         "metric": "prefill-41k",
-        "value": 724.6,
-        "gate_at": 724.3,
+        "value": 725.55,
+        "gate_at": 724.5,
         "unit": "t/s",
         "direction": "lower-is-worse",
         "samples": 2,
-        "spread_pct": 0.03,
+        "spread_pct": 0.1,
         "config": "16 GiB card, the coder unit's flags (98,304 ctx, q8_0:q4_0 KV, MTP 4), one fresh process a run, the model staged on the NVMe; decode a/b/c: 300-token answers on hash tables, compilers, TCP",
         "prompt_tokens": 40841,
         "design": "§5",
         "measured": "2026-10-16",
-        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
+        "binary": "the 1.0.0 pre-tag package (3453a66), two runs alternated with 0.8.1's binary (tests/acceptance/ab.py); a report, the gate is the same-window A/B (operator, 2026-10-16)",
+        "gate": "report"
       }
     ]
   },
@@ -268,31 +274,33 @@
     "references": [
       {
         "metric": "prefill-20k",
-        "value": 594.1,
-        "gate_at": 594.1,
+        "value": 595.25,
+        "gate_at": 594.8,
         "unit": "t/s",
         "direction": "lower-is-worse",
         "samples": 2,
-        "spread_pct": 0.0,
+        "spread_pct": 0.05,
         "config": "24 GB card + host bank, the Flash-Next unit's flags (IQ3_XXS, 131,072 ctx, q8_0 KV, 12,000 MiB of slots, MTP 3, the CPU misses, the bank stream), one fresh process a run, the files on the NVMe; decode: the 300-token hash-table answer after the needle",
         "prompt_tokens": 20045,
         "design": "§5",
         "measured": "2026-10-16",
-        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
+        "binary": "the 1.0.0 pre-tag package (3453a66), two runs alternated with 0.8.1's binary (tests/acceptance/ab.py); a report, the gate is the same-window A/B (operator, 2026-10-16)",
+        "gate": "report"
       },
       {
         "metric": "decode",
-        "value": 34.75,
-        "gate_at": 34.6,
+        "value": 34.7,
+        "gate_at": 34.1,
         "unit": "t/s",
         "direction": "lower-is-worse",
         "samples": 2,
-        "spread_pct": 0.29,
+        "spread_pct": 1.15,
         "config": "24 GB card + host bank, the Flash-Next unit's flags (IQ3_XXS, 131,072 ctx, q8_0 KV, 12,000 MiB of slots, MTP 3, the CPU misses, the bank stream), one fresh process a run, the files on the NVMe; decode: the 300-token hash-table answer after the needle",
         "prompt_tokens": null,
         "design": "§5",
         "measured": "2026-10-16",
-        "binary": "the 0.8.1 pre-tag package (5182a90), two processes back to back. Since 2026-10-16 the release gate is a same-window A/B against the previous release's binary (old/new alternated); these values and gate_at are a report (operator, 2026-10-16)"
+        "binary": "the 1.0.0 pre-tag package (3453a66), two runs alternated with 0.8.1's binary (tests/acceptance/ab.py); a report, the gate is the same-window A/B (operator, 2026-10-16)",
+        "gate": "report"
       }
     ]
   },

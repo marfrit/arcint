@@ -60,6 +60,28 @@
     ]
   },
   {
+    "name": "metric-below-band-report",
+    "runner": {"cmd": "fixtures/metric-below-band.sh", "args": [], "env": {}},
+    "external": null,
+    "references": [
+      {"metric": "fake-decode", "value": 20.0, "gate_at": 18.0, "unit": "t/s", "gate": "report",
+       "direction": "lower-is-worse", "samples": 2, "spread_pct": 0.0,
+       "config": "selftest fixture, not a measurement", "prompt_tokens": 100,
+       "design": "§5", "measured": "1970-01-01", "binary": "fixture"}
+    ]
+  },
+  {
+    "name": "metric-below-band-badgate",
+    "runner": {"cmd": "fixtures/metric-below-band.sh", "args": [], "env": {}},
+    "external": null,
+    "references": [
+      {"metric": "fake-decode", "value": 20.0, "gate_at": 18.0, "unit": "t/s", "gate": "advisory",
+       "direction": "lower-is-worse", "samples": 2, "spread_pct": 0.0,
+       "config": "selftest fixture, not a measurement", "prompt_tokens": 100,
+       "design": "§5", "measured": "1970-01-01", "binary": "fixture"}
+    ]
+  },
+  {
     "name": "metric-above-band",
     "runner": {"cmd": "fixtures/metric-above-band.sh", "args": [], "env": {}},
     "external": null,

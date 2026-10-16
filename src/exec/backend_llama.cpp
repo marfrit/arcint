@@ -191,7 +191,7 @@ class LlamaBackend final : public Backend {
         size_t               n_tokens = 0;
         uint64_t             req      = 0;   // the prefill that made it
         std::vector<uint8_t> state;          // the memory's PARTIAL_ONLY state
-        std::vector<float>   dft_row;        // the drafter's carried row, --llama-mtp
+        std::vector<uint8_t> dft_state;      // the drafter's (exec/spec_state.h): MTP's carried row, DFlash2's window
     };
 
 public:
@@ -428,15 +428,17 @@ public:
                                                     : std::max(1, static_cast<int>(std::thread::hardware_concurrency()) / 2);
         cp.n_threads       = threads;
         cp.n_threads_batch = threads;
-        // --llama-mtp: per-token snapshots of the recurrent state, so a
-        // rejected draft rolls back on the device (llama_memory_seq_rm)
-        if (cfg.llama_mtp > 0) cp.n_rs_seq = static_cast<uint32_t>(cfg.llama_mtp);
+        // --llama-mtp / --llama-dflash: per-token snapshots of the recurrent
+        // state, so a rejected draft rolls back on the device
+        // (llama_memory_seq_rm); a verify of N + 1 rows rolls back up to N
+        const int n_spec = cfg.llama_dflash_on() ? cfg.llama_dflash : std::max(cfg.llama_mtp, 0);
+        if (n_spec > 0) cp.n_rs_seq = static_cast<uint32_t>(n_spec);
         // logits rows: the last token a step, or a verify's 1 + drafts, per
         // lane (as llama.cpp's speculative loop sets them). Unbounded,
         // llama.cpp reserves them for a whole ubatch, vocabulary-wide: the
         // coder with its MTP layer then no longer fit the A770 (engine
         // resets, measured-here)
-        cp.n_outputs_max_per_seq = static_cast<uint32_t>(1 + std::max(cfg.llama_mtp, 0));
+        cp.n_outputs_max_per_seq = static_cast<uint32_t>(1 + n_spec);
         cp.n_outputs_max         = cp.n_outputs_max_per_seq * static_cast<uint32_t>(lanes_);
         ctx_               = llama_init_from_model(model_, cp);
         if (ctx_ == nullptr) throw std::runtime_error("llama.cpp could not create a context");
@@ -496,7 +498,32 @@ public:
                 log::warn("load", "named lanes: the MTP draft context takes no cell windows; its attention spans "
                                   "the pool's used cells");
         }
-        status_.mtp_enabled = n_draft_ > 0;
+        if (cfg.llama_dflash_on()) {
+            // --llama-dflash-gguf: the DFlash2 drafter as a second model,
+            // every tensor on the card (llama.cpp's draft model,
+            // common/speculative.cpp:2671-2689); the target's embeddings and
+            // LM head are shared through ctx_other, not loaded twice.
+            // config.cpp refuses it with --llama-mtp and under the layer split
+            llama_model_params dp = llama_model_default_params();
+            dp.n_gpu_layers       = 999;
+            dflash_model_         = llama_model_load_from_file(cfg.llama_dflash_gguf.c_str(), dp);
+            if (dflash_model_ == nullptr)
+                throw std::runtime_error(log::format("llama.cpp could not load %s", cfg.llama_dflash_gguf.c_str()));
+            std::string err;
+            int         n_dft = cfg.llama_dflash;   // the drafter's block may allow fewer
+            spec_ = make_llama_dflash(dflash_model_, ctx_, n_dft, lanes_, cfg.llama_dflash_ubatch, threads,
+                                      cfg.llama_dflash_min_p, cp.kv_unified, err);
+            if (!spec_)
+                throw std::runtime_error(log::format("--llama-dflash-gguf %s: %s", cfg.llama_dflash_gguf.c_str(), err.c_str()));
+            n_draft_ = n_dft;
+            dflash_  = true;
+            if (windows_ && !spec_->set_kv_windows(windows.data(), lanes_))
+                log::warn("load", "named lanes: the DFlash draft context takes no cell windows (a sliding-window "
+                                  "cache); its attention spans its own window");
+        }
+        status_.mtp_enabled    = n_draft_ > 0 && !dflash_;
+        status_.dflash_enabled = dflash_;
+        status_.dflash_drafts  = dflash_ ? n_draft_ : 0;
         slot_tokens_.resize(static_cast<size_t>(lanes_));
         comb_decoding_.assign(static_cast<size_t>(lanes_), false);
         comb_stalled_.assign(static_cast<size_t>(lanes_), false);
@@ -562,7 +589,7 @@ public:
                   desc, arch, static_cast<double>(llama_model_size(model_)) / (1u << 30), card_names.c_str(),
                   split ? "devices" : "platform", split ? cl_ids.c_str() : std::to_string(cards[0].platform).c_str(),
                   seconds_since(t_load), lane_desc.c_str(),
-                  n_draft_ > 0 ? log::format("; MTP drafts up to %d", n_draft_).c_str() : "");
+                  n_draft_ > 0 ? log::format("; %s drafts up to %d", dflash_ ? "DFlash2" : "MTP", n_draft_).c_str() : "");
         if (named_) {
             // one line per lane, and the pool they share
             for (int i = 0; i < lanes_; ++i)
@@ -572,7 +599,7 @@ public:
                       llama_n_ctx(ctx_), lanes_,
                       windows_ ? "a cell window per lane: a lane attends over its own cells"
                                : "a lane's attention runs over the pool's used cells, masked",
-                      spec_ ? "; the MTP draft context likewise" : "");
+                      spec_ ? "; the draft context likewise" : "");
         }
         if (split)
             log::info("load", "layer split: layers 0-%d on %s, %d-%d and the output on %s (tensor_split %.1f/%.1f)%s",
@@ -584,6 +611,7 @@ public:
     ~LlamaBackend() override {
         spec_.reset();   // its draft context reads the target's
         if (ctx_ != nullptr) llama_free(ctx_);
+        if (dflash_model_ != nullptr) llama_model_free(dflash_model_);
         if (mtp_model_ != nullptr) llama_model_free(mtp_model_);
         if (model_ != nullptr) llama_model_free(model_);
     }
@@ -878,7 +906,7 @@ private:
                     common = c != nullptr ? c->n_tokens : 0;
                 }
                 if (!spec_->seq_rm(seq, common)) common = 0;
-                else if (c != nullptr) spec_->set_carried_row(seq, common, c->dft_row);
+                else if (c != nullptr) spec_->set_carried_state(seq, common, c->dft_state);
             }
             drop_ckpts_after_locked(seq, common);
             have.resize(common);
@@ -927,6 +955,12 @@ private:
                 stats.draft_verify_seconds += req.t_verify;
             }
             stats.draft_proposed += static_cast<int>(draft.size());
+            ++stats.draft_steps;
+#if ARCINT_DFLASH_RED == 7
+            // red case (DFlash2's lossless check): every draft token accepted
+            // whatever the target's rows say -- the answers must suffer
+            for (size_t i = 0; i < draft.size(); ++i) rows[i * n_vocab_ + static_cast<size_t>(draft[i])] = 1e30f;
+#endif
             double     emit_s = 0.0;
             const auto t_walk = clock_type::now();
             const VerifyWalk w = walk_verify(
@@ -942,6 +976,11 @@ private:
             stats.decode_sample_seconds += seconds_since(t_walk) - emit_s;
             stats.completion_tokens += w.emitted;
             stats.draft_accepted += w.accepted;
+            // -vv: a line a verify, to set a run's acceptance beside another
+            // engine's step by step (llama-server's trace: accepted a/n)
+            if (log::enabled(log::Level::Debug))
+                log::debug("spec", "lane %d: verify at %zu: accepted %d/%zu, emitted %d", seq, have.size(), w.accepted,
+                           draft.size(), w.emitted);
             have.push_back(id_last);
             have.insert(have.end(), draft.begin(), draft.begin() + w.accepted);
             id_last = w.last;
@@ -1002,30 +1041,55 @@ private:
         const auto& list   = ckpts_[static_cast<size_t>(seq)];
         auto newest        = [&] { return list.empty() ? size_t{0} : list.back().n_tokens; };
         auto is_user       = [&](size_t at) { return std::binary_search(users.begin(), users.end(), at); };
-        // where a batch stops early: a user start the checkpoint rule takes, or an end offset
-        auto breaks_at     = [&](size_t at) {
+        // where a batch stops early: a user start the checkpoint rule takes,
+        // or an end offset; `empty` and `newest_n` are the lane's checkpoints
+        auto breaks_at     = [&](size_t at, bool empty, size_t newest_n) {
             if (!ckpt) return false;
-            if (is_user(at) && (at == last_user || list.empty() || at > newest() + ckpt_step_)) return true;
+            if (is_user(at) && (at == last_user || empty || at > newest_n + ckpt_step_)) return true;
             return std::find(ends.begin(), ends.end(), at) != ends.end();
         };
-        for (size_t at = from; at < to;) {
-            size_t e = std::min(to, at + static_cast<size_t>(n_batch_));
+        // the batch from `at` (its end in `e`) and whether a checkpoint is
+        // taken at its start, given the lane's checkpoints
+        auto step          = [&](size_t at, bool empty, size_t newest_n, size_t& e) {
+            e = std::min(to, at + static_cast<size_t>(n_batch_));
             for (size_t i = at + 1; i < e; ++i)
-                if (breaks_at(i)) {
+                if (breaks_at(i, empty, newest_n)) {
                     e = i;
                     break;
                 }
-            if (ckpt && at > 0) {
-                // llama.cpp: a mid-prompt batch only when it starts a user
-                // message or ends within a ubatch of the prompt's end; then
-                // not within the step of the newest, unless it is the last
-                // user message or near the end
-                const bool near_end = P < e + nub;
-                const bool last_one = e == to;
-                bool       take     = last_one || is_user(at) || near_end;
-                take = take && (list.empty() || at == last_user || near_end || at > newest() + ckpt_step_);
-                if (take) save_ckpt_locked(seq, at);
+            if (!ckpt || at == 0) return false;
+            // llama.cpp: a mid-prompt batch only when it starts a user
+            // message or ends within a ubatch of the prompt's end; then not
+            // within the step of the newest, unless it is the last user
+            // message or near the end
+            const bool near_end = P < e + nub;
+            const bool last_one = e == to;
+            const bool take     = last_one || is_user(at) || near_end;
+            return take && (empty || at == last_user || near_end || at > newest_n + ckpt_step_);
+        };
+        if (spec_) {
+            // the drafter may leave out prompt rows (DFlash2: those its
+            // window never reaches), but not the rows before a checkpoint
+            // this prefill takes: its state is what a restore reads back.
+            // The checkpoints from a dry run of the same rules (a save makes
+            // its position the lane's newest)
+            std::vector<size_t> keep;
+            bool                empty    = list.empty();
+            size_t              newest_n = newest();
+            for (size_t at = from; at < to;) {
+                size_t e = at;
+                if (step(at, empty, newest_n, e)) {
+                    keep.push_back(at);
+                    empty    = false;
+                    newest_n = at;
+                }
+                at = e;
             }
+            spec_->prefill_plan(seq, to, keep);
+        }
+        for (size_t at = from; at < to;) {
+            size_t e = at;
+            if (step(at, list.empty(), newest(), e)) save_ckpt_locked(seq, at);
             if (!decode(prompt.data() + at, e - at, at))
                 throw std::runtime_error("llama_decode failed during prefill");
             have.insert(have.end(), prompt.begin() + static_cast<long>(at), prompt.begin() + static_cast<long>(e));
@@ -1058,7 +1122,7 @@ private:
             log::warn("slot", "lane %d: checkpoint at %zu tokens failed", seq, n_tokens);
             return;
         }
-        if (spec_) c.dft_row = spec_->carried_row(seq, n_tokens);
+        if (spec_) c.dft_state = spec_->carried_state(seq, n_tokens);
         size_t last = SIZE_MAX;   // the condition re-checked each step: only as many as make room
         for (auto it = list.begin(); list.size() + 1 >= static_cast<size_t>(ckpt_max_) && it != list.end();) {
             if (it->req != ckpt_req_ && last != SIZE_MAX && it->n_tokens <= last + ckpt_step_) {
@@ -1293,6 +1357,8 @@ private:
     std::vector<llama_model_tensor_buft_override> buft_overrides_;
     llama_model*                          model_ = nullptr;
     llama_model*                          mtp_model_ = nullptr;   // --llama-mtp-gguf
+    llama_model*                          dflash_model_ = nullptr;   // --llama-dflash-gguf
+    bool                                  dflash_    = false;     // the drafter is DFlash2's
     llama_context*                        ctx_   = nullptr;
     const llama_vocab*                    vocab_ = nullptr;
     std::unique_ptr<LlamaTokenizer>       tokenizer_;
@@ -1319,7 +1385,7 @@ private:
     uint64_t                              n_uneven_      = 0;   // of them, verifies of different lengths
     std::chrono::microseconds             comb_wait_{ 20000 };
     std::vector<std::vector<int>>         slot_tokens_;
-    std::unique_ptr<LlamaSpec>            spec_;      // --llama-mtp
+    std::unique_ptr<LlamaSpec>            spec_;      // --llama-mtp, --llama-dflash-gguf
     int                                   n_draft_ = 0;
     // --llama-checkpoints: per lane, the recurrent state at token counts the
     // lane's tokens still match, oldest first

@@ -429,6 +429,99 @@ TEST(config_llama_cpu_moe_and_threads) {
     }
 }
 
+// --llama-dflash-gguf / --llama-dflash / --llama-dflash-min-p: the DFlash2
+// drafter (docs/campaigns/dflash2-agent.md). One drafter a context, one card.
+TEST(config_llama_dflash) {
+    {
+        // the drafter alone drafts its trained block less the anchor: 7
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf"}, cfg).ok);
+        CHECK(cfg.llama_dflash_on());
+        CHECK_EQ(cfg.llama_dflash_gguf, std::string("/m/d.gguf"));
+        CHECK_EQ(cfg.llama_dflash, 7);
+        CHECK(cfg.llama_dflash_min_p == 0.0);
+        CHECK_EQ(cfg.llama_dflash_ubatch, 64);
+        CHECK_EQ(cfg.llama_mtp, 0);
+    }
+    {
+        // the draft context's ubatch: 8 to 512, the drafter's only
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash-ubatch", "512"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dflash_ubatch, 512);
+    }
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash-ubatch", "4"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash-ubatch", "1024"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash-ubatch", "64"}));
+    CHECK(rejected({"--stub", "--llama-dflash-ubatch", "64"}));
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash", "5",
+                   "--llama-dflash-min-p", "0.3"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dflash, 5);
+        CHECK(cfg.llama_dflash_min_p == 0.3);
+    }
+    {
+        // no drafter: off, and nothing set
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf"}, cfg).ok);
+        CHECK(!cfg.llama_dflash_on());
+        CHECK_EQ(cfg.llama_dflash, 0);
+        CHECK_EQ(cfg.llama_dflash_ubatch, 0);
+    }
+    // the range: 1 to 7 (a block of up to 8 positions, the drafter's trained size)
+    CHECK(!rejected({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash", "1"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash", "0"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash", "8"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash", "-1"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash", "x"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash-min-p", "1.5"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash-min-p", "-0.1"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash-gguf"}));   // the file is missing
+    // the count and the stop need the drafter
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash", "5"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash-min-p", "0.5"}));
+    // one drafter a context: not with the MTP head or any of its options
+    {
+        Config         cfg;
+        const ArgParse r = run({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-mtp", "5"}, cfg);
+        CHECK(!r.ok);
+        CHECK(r.error.find("exclusive") != std::string::npos);
+    }
+    auto exclusive = [](std::vector<const char*> args) {
+        Config         cfg;
+        const ArgParse r = run(std::move(args), cfg);
+        return !r.ok && r.error.find("exclusive") != std::string::npos;
+    };
+    CHECK(exclusive({"--gguf", "/m/q.gguf", "--llama-mtp", "5", "--llama-dflash-gguf", "/m/d.gguf"}));   // either order
+    CHECK(exclusive({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-mtp", "5", "--llama-mtp-vocab",
+                     "/m/ids.json"}));
+    CHECK(exclusive({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-mtp-vocab", "/m/ids.json"}));
+    CHECK(exclusive({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-mtp-gguf", "/m/mtp.gguf"}));
+    CHECK(exclusive({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-mtp-min-p", "0.5"}));
+    // one card: refused under the layer split, with its own message
+    {
+        Config         cfg;
+        const ArgParse r = run({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1", "--llama-layer-split", "40",
+                                "--llama-dflash-gguf", "/m/d.gguf"}, cfg);
+        CHECK(!r.ok);
+        CHECK(r.error.find("--llama-layer-split") != std::string::npos);
+    }
+    // an option of the libllama engine only
+    CHECK(rejected({"--stub", "--llama-dflash-gguf", "/m/d.gguf"}));
+    CHECK(rejected({"--stub", "--llama-dflash", "5"}));
+    CHECK(rejected({"--stub", "--llama-dflash-min-p", "0.5"}));
+    // the OpenVINO engine's flag stays retired, the new ones are not
+    CHECK(is_retired_flag("--dflash"));
+    CHECK(!is_retired_flag("--llama-dflash"));
+    CHECK(!is_retired_flag("--llama-dflash-gguf"));
+    // the help offers all three
+    const std::string help = usage_text();
+    CHECK(help.find("--llama-dflash-gguf FILE") != std::string::npos);
+    CHECK(help.find("--llama-dflash N") != std::string::npos);
+    CHECK(help.find("--llama-dflash-min-p P") != std::string::npos);
+    CHECK(help.find("--llama-dflash-ubatch N") != std::string::npos);
+}
+
 TEST(config_llama_checkpoints) {
     {
         // the reference's defaults (llama.cpp server: 32 a slot, 8192 apart)

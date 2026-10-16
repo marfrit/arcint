@@ -1,11 +1,13 @@
-// The libllama engine's speculative decoding: the GGUF's MTP head drafting
-// (llama.cpp's draft-mtp, rebuilt on libllama in llama_spec.cpp), the target
-// verifying, behind a narrow interface.
+// The libllama engine's speculative decoding behind a narrow interface: the
+// GGUF's MTP head drafting (llama.cpp's draft-mtp, rebuilt on libllama in
+// llama_spec.cpp) or a DFlash2 drafter (llama.cpp's draft-dflash, rebuilt in
+// llama_dflash.cpp), the target verifying.
 #pragma once
 
 #ifdef ARCINT_LLAMA
 
 #include <cstddef>
+#include <cstdint>
 #include <ggml.h>
 #include <memory>
 #include <string>
@@ -65,13 +67,25 @@ public:
     // memory refuses (beyond its recurrent snapshots), and then both are
     // cleared for the sequence.
     virtual bool seq_rm(int seq, size_t from) = 0;
-    // The carried hidden row of a sequence that holds exactly n tokens (the
-    // target's row of position n - 1), empty when the drafter carries none
-    // there; stored with a context checkpoint and set back after its restore
-    // and the cut to n, as llama.cpp's server stashes the draft state with
-    // each checkpoint (common_speculative_get_state).
-    virtual std::vector<float> carried_row(int seq, size_t n) const = 0;
-    virtual void               set_carried_row(int seq, size_t n, const std::vector<float>& row) = 0;
+    // The drafter's state of a sequence that holds exactly n tokens, as
+    // opaque bytes (exec/spec_state.h): the MTP drafter's carried hidden row
+    // (the target's row of position n - 1; empty when it carries none
+    // there), the DFlash2 drafter's sliding-window K/V. Stored with a context
+    // checkpoint and set back after its restore and the cut to n, as
+    // llama.cpp's server stashes the draft side with each checkpoint
+    // (common_speculative_get_state and the draft context's partial state).
+    // A state that is not this drafter's at n is not loaded.
+    virtual std::vector<uint8_t> carried_state(int seq, size_t n) = 0;
+    virtual void                 set_carried_state(int seq, size_t n, const std::vector<uint8_t>& state) = 0;
+    // A prefill of the sequence is about to run up to n_end tokens and save
+    // context checkpoints at the token counts `ckpts`: a drafter may leave
+    // out prompt rows neither the drafts after n_end nor those checkpoints'
+    // states need. The MTP drafter takes every row.
+    virtual void prefill_plan(int seq, size_t n_end, const std::vector<size_t>& ckpts) {
+        (void) seq;
+        (void) n_end;
+        (void) ckpts;
+    }
     // Named lanes: the draft context's cell windows, as the target's
     // (llama_memory_seq_windows, contrib/llama.cpp 0026); false when its
     // memory cannot take them.
@@ -91,6 +105,20 @@ std::unique_ptr<LlamaSpec> make_llama_mtp(llama_model* model, llama_context* ctx
                                           int n_batch, int n_ubatch, int threads, const std::string& gguf,
                                           const std::string& vocab, double min_p, ggml_type type_k, ggml_type type_v,
                                           bool kv_unified, uint32_t n_kv_reserve, std::string& err);
+
+// model_dft: a DFlash2 drafter (general.architecture "dflash" with a
+// selector), loaded on the target's card; ctx_tgt: n_rs_seq >= n_draft,
+// n_outputs_max_per_seq >= 1 + n_draft. The draft context is llama.cpp's
+// (common/speculative.cpp:2572-2700): the target's n_ctx and kv_unified,
+// ctx_other = ctx_tgt (the target's embeddings and LM head), f16 K/V, a
+// sliding-window cache. min_p: the selector's stop (0: n_draft always).
+// n_ubatch: the draft context's (--llama-dflash-ubatch), raised to a block a
+// lane. n_draft: requested, and set to what the drafter's
+// trained block allows (block_size - 1). Null with `err` set when the GGUF
+// is not a DFlash2 drafter for this target or the context cannot be made.
+std::unique_ptr<LlamaSpec> make_llama_dflash(llama_model* model_dft, llama_context* ctx_tgt, int& n_draft, int n_seq,
+                                             int n_ubatch, int threads, double min_p, bool kv_unified,
+                                             std::string& err);
 
 }  // namespace lgc
 

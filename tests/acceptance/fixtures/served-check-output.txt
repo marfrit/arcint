@@ -1,0 +1,14 @@
+== served check: coder, model.gguf on GPU.1
+  ok   the capital
+  ok   an answer to 'Explain in about 250 words how a h'
+  ok   an answer to 'Describe in about 250 words how a '
+  ok   an answer to 'Explain in about 250 words how TCP'
+  ok   3 decodes of at least 100 tokens (got 3)
+ACCEPTANCE-METRIC decode-a 50.6 t/s
+ACCEPTANCE-METRIC decode-b 47.2 t/s
+ACCEPTANCE-METRIC decode-c 43.8 t/s
+  ok   the needle at 41k ('VIOLET-HARBOR-42')
+  FAIL   prefill-41k read 36000 tokens (band 38000-44000)
+ACCEPTANCE-METRIC prefill-41k 724.6 t/s
+  peak VRAM 15000 MiB, GTT 100 MiB
+  texts md5 aaaaaaaa bbbbbbbb cccccccc dddddddd eeeeeeee
