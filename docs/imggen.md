@@ -287,6 +287,44 @@ existing XMX f16-weights kernel** (`kernel_mul_mm_f16w_f16`, patch 0022) instead
 of the generic q8_0 one. If that nears the bar, the q8_0 XMX form is only for
 the memory fit; if it does not, the q8_0 XMX GEMM is the work.
 
+### Implementation findings (`measured-here`, 2026-10-17)
+
+**f16 DiT weights + the XMX f16-weights GEMM (0022)**, 512²/8 steps: steady
+step **1.32 s** against q8_0's 3.69, total 51.2 s against 65.1 -- **2.8x**, and
+faster than Vulkan (1.78). All weights on VRAM (te 7.67 + DiT 11.75 GB as f16 =
+19.6, sampler peak 21.1 GB), so 1024² would change the fit. The XMX GEMM
+(`kernel_mul_mm_f16w_f16`) is 22.8 % of device time: **31 % of the 98.3 TFLOP
+FP16 peak** (the generic q8_0 kernel was ~4 TFLOP).
+
+**Where the remaining device time is** (f16 profile, 512², 14,053 ms total):
+
+| kernel | share | what it is |
+|---|---|---|
+| `repeat_f32` + `mul` | 21.7 + 15.6 = **37 %** | the **generic RoPE** (below) |
+| `im2col_f16` + `mul_mat_f16_f16` | 22 % | the **VAE decode conv** via im2col + mul-mat f16 |
+| `kernel_mul_mm_f16w_f16` | 22.8 % | the XMX f16 GEMM |
+| misc (group_norm, scale, soft_max, ...) | ~18 % | |
+
+**Root cause of the 37 %.** Upstream mode defines `SD_USE_UPSTREAM_GGML`, so
+sd.cpp's `apply_rope` takes the generic path (`rope.hpp:1075`, lines
+1103-1122): per head it repeats `x_0` and `x_1` into a `[.,2]` copy and muls
+by `pe_0`/`pe_1` -- **2 repeats + 4 muls a layer a step** over 30 layers and 8
+steps = 1,056 of each. The reference's fused `GGML_OP_ROPE_APPLY` (fork commit
+`e05d18a1`, `ggml.c:4381`) does the same in one pass, but the fork implements
+it for **CPU, CUDA and Vulkan only -- no OpenCL** (`listing the fork's
+rope.cl`), so the upstream-mode OpenCL build cannot call it.
+
+**dp4a q8_0** (`GGML_OPENCL_Q8_DENSE_DP4A=1`): no change -- the generic kernel
+stayed at 68 % and the step at 3.81 s. A dead end, as the recorded expectation
+said.
+
+**Next implementation by measured share:** (1) the generic RoPE (**37 %**), the
+biggest single lever -- port `GGML_OP_ROPE_APPLY` with an OpenCL kernel, or at
+least run the repeat/mul at device bandwidth and cut the launch count; (2) the
+VAE decode conv (**22 %**) off im2col + mul-mat; (3) the XMX GEMM (**22.8 %**)
+from 31 % toward 70 % of the peak. The bar `§Performance target` and the
+campaign `docs/campaigns/imggen-q8_0-xmx-gemm.md` hold the target.
+
 ## Phases
 
 Per the charter `§4`: 0 inventory, 1 the image gate (`§3`), 2 the gaps the

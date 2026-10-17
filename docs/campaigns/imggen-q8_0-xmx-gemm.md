@@ -71,10 +71,18 @@ step is 12.3 TFLOP, at 1024² 49.2, so the bar is ~**0.18 s a step at 512²**,
 
 Steady step 3.69 s; Vulkan 1.78 s a step on the same card (B3). The B60's XMX
 FP16 peak is ~98.3 TFLOP/s (INT8 ~196.6); 512² a step is 12.3 TFLOP, so the
-3.69 s is **3.4 %** of the FP16 peak and the bar is 0.18 s. **Not started**:
-the cheap f16 test (`--type f16` so arcint's existing `kernel_mul_mm_f16w_f16`,
-patch 0022, takes the DiT GEMM), the `GGML_OPENCL_Q8_DENSE_DP4A=1`
-measurement, the Vulkan-path read, the kernel.
+3.69 s is **3.4 %** of the FP16 peak and the bar is 0.18 s.
+
+**Measured (2026-10-17):** the f16 route works -- `--type f16` puts arcint's
+existing `kernel_mul_mm_f16w_f16` (0022) on the DiT and gives **1.32 s a step**
+(2.8x, 51.2 s end to end), the GEMM at **31 % of the FP16 peak** (was ~4
+TFLOP). But it makes the DiT 11.75 GB and the peak 21.1 GB, so 1024² will not
+fit as f16: the q8_0 XMX form is the durable one. `GGML_OPENCL_Q8_DENSE_DP4A=1`
+changed nothing (the generic kernel stayed at 68 %): a dead end, as the
+recorded expectation said. **The GEMM is now only 22.8 % of the step** -- the
+campaign's gain is real but bounded by the surrounding levers (the RoPE 37 %,
+the VAE conv 22 %). Build the q8_0 XMX GEMM for the memory and the remaining
+GEMM time; the other campaigns carry the step.
 
 ## Where it lives
 
