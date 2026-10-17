@@ -10,7 +10,10 @@ may change or go without notice.
 
 A switch here is an environment variable read by arcint, by one of its tools,
 or by the llama.cpp patch series in `contrib/llama.cpp/patches` (0001-0056,
-without 0031 and 0055).
+without 0031 and 0055). Switches the pinned llama.cpp tree reads by itself
+(`GGML_OPENCL_PLATFORM`, `GGML_OPENCL_FUSE_RMS_ADD`, `GGML_OPENCL_F16_MROW` and
+the others in upstream's `ggml-opencl.cpp`) are upstream's and not listed;
+a patch that only carries one in its context does not add it.
 Each switch is in exactly one class:
 
 - **operational**: changes how a service runs; a unit file may set it.

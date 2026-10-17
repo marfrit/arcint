@@ -2200,7 +2200,7 @@ carries the dense 27B agent configuration: `qwen3.8-27b`, `--paged-kv u8:i4`,
 dense model (`--gate-pad`) or already the default (`--repetition-penalty 1.0`)
 are omitted; the recipe is a template, not a unit dump.
 
-## 0.4.5 — 2026-09-08
+## 0.4.5 — 2026-09-09
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033) —
 unchanged from 0.4.4. Patch 0034 is test-only and is in **no built package**:

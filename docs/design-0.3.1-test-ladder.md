@@ -31,7 +31,7 @@ Runners print `ACCEPTANCE-SKIP <check> <reason>` for a skipped section.
 ## 3. References
 
 A runner prints `ACCEPTANCE-METRIC <metric> <value> <unit>`; `run.py` compares
-it against the cell's `references` (`value`, `gate_at`, `direction`,
+it against the cell's `references` (`metric`, `value`, `gate_at`, `unit`, `direction`,
 `samples`, `spread_pct`, `config`, `prompt_tokens`, `design`, `measured`,
 `binary`). Worse than `gate_at` fails unless named with
 `--allow-regress <cell>/<metric>` in `--all`; a printed metric with no

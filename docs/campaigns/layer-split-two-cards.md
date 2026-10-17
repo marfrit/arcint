@@ -191,7 +191,7 @@ Our llama.cpp pin (bed0a85, patches 0001-0022), `code`:
 
 - **Device selection:** ggml-opencl probes one platform and makes one
   shared context (`ggml_opencl_probe_devices`). arcint selects one device
-  (`src/exec/backend_llama.cpp:139-148`).
+  (then: `LlamaBackend`'s constructor in `src/exec/backend_llama.cpp`).
 - **One-context assumptions:**
   - kernels are built with `clBuildProgram(p, 0, NULL, ...)` for every
     device in the context;

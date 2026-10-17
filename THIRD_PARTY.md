@@ -5,7 +5,7 @@ Vendored, single-header, licenses unchanged:
 | component | version | license | file |
 |---|---|---|---|
 | cpp-httplib | 0.18.3 | MIT | `third_party/httplib.h` |
-| nlohmann/json | 3.11.3 | MIT | `third_party/json.hpp` |
+| nlohmann/json | 3.11.3 | MIT | `third_party/nlohmann/json.hpp` |
 | minja (chat templating) | vendored | MIT | via `minja/chat-template.hpp` |
 
 Compiled in from a pinned source tree (not vendored): llama.cpp and ggml

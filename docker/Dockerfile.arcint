@@ -22,7 +22,7 @@ ARG BASE=registry.fedoraproject.org/fedora:43
 FROM ${BASE} AS builder
 
 # opencl-headers + ocl-icd-devel: the libllama engine's `find_package(OpenCL
-# REQUIRED)` (CMakeLists.txt:166) and the deb recipe's own gate, the presence
+# REQUIRED)` (CMakeLists.txt) and the deb recipe's own gate, the presence
 # of /usr/include/CL/cl.h. python3 is what embeds the OpenCL kernels; git is
 # what applies the patch series.
 RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
@@ -100,7 +100,7 @@ RUN LDD_OUT=$(ldd /install/usr/bin/arcint); \
 # The engine must be in the binary. The `--help` text advertises
 # `--engine llama` whether or not the backend was compiled in, so check the
 # linked artifacts instead: the libllama symbols, and -- with
-# GGML_OPENCL_EMBED_KERNELS=ON (CMakeLists.txt:154) -- one of the Intel
+# GGML_OPENCL_EMBED_KERNELS=ON (CMakeLists.txt) -- one of the Intel
 # kernel names this repo's own patches introduce, which stock llama.cpp
 # cannot produce.
 RUN nm -C /install/usr/bin/arcint 2>/dev/null | grep -qE '\bllama_(backend_init|init_from_model|model_load_from_file)\b' \
