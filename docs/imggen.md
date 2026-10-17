@@ -369,11 +369,47 @@ said.
 shares are (1) the q8_0 generic GEMM at **80.9 % of the q8_0 run** -- the
 campaign `docs/campaigns/imggen-q8_0-xmx-gemm.md` (the durable service form);
 (2) the VAE decode conv at **35.4 % of the f16 run** (1,095 im2col + 1,988
-mul_mat a run) off im2col + mul-mat -- a third campaign, the biggest single
-non-GEMM share; (3) the f16 XMX GEMM (36.9 % of the f16 run, 58.9 % of the
-DiT-only per-step mix) from 31 % toward 70 % of the peak. The elementwise
-dispatch flatten (the recon's second lever) is untouched. The bar
-`§Performance target` holds.
+mul_mat a run) off im2col + mul-mat -- the campaign
+`docs/campaigns/imggen-vae-conv.md`, the biggest single non-GEMM share; (3) the
+f16 XMX GEMM (36.9 % of the f16 run, 58.9 % of the DiT-only per-step mix) from
+31 % toward 70 % of the peak. The elementwise dispatch flatten (the recon's
+second lever) is untouched. The bar `§Performance target` holds.
+
+**1024² A2 with the fixed 0057** (`measured-here`, 2026-10-17): q8_0, 1024²/8,
+same prompt/seed. Steady step **13.14 s** (first 33.58 s) against pre-0057's
+15.78 -- a saving of ~21 s a run (7 x 2.64 + 2.9 first). No CPU island
+(`GGML_SCHED_DEBUG`); peak `drm-resident-vram0` **17,137 MiB** of 24,480, GTT
+66 MiB. So **A2 holds at 1024²**, and the q8_0 form carries it. The 1024² q8_0
+device profile: total 120,314 ms over 8 steps, the generic
+`kernel_mul_mm_q8_0_f32_l4_lm` **68.84 %** (82,822 ms), the VAE conv
+(`mul_mat_f16_f16`+`im2col_f16`) 13,513 ms (11.2 %), attention (`soft_max_4`)
+4.78 %.
+
+**The VAE decode conv, direct form** (`measured-here`, 2026-10-17): sd.cpp's
+`--conv-direct vae=on` builds `ggml_conv_2d_direct` (`GGML_OP_CONV_2D`), which
+OpenCL supports; on the B60 512²/8 f16 it is **2.7x faster on the device**
+(`kernel_conv_2d` 1,140 ms against im2col + mul-mat 3,081 ms) and **1.83x on
+the wall** (VAE decode 2.54 s against 4.64 s), and the final image is the same
+(the two arms' PSNR/SSIM against the reference are identical to six decimals;
+the finals against each other 69.4 dB). The auto probe never picks it:
+`sd_probe_conv_direct` tests `sd_backend_supports_conv_implicit_gemm`, which is
+CUDA/HIP/Vulkan-only (`code`, `ggml_extend_backend.cpp:572`), so OpenCL gets
+"off (no implicit GEMM path)" -- the wrong test, since the direct kernel is
+faster and equivalent here. Campaign: `docs/campaigns/imggen-vae-conv.md`.
+
+**A DiT trajectory not reproduced across processes** (`measured-here`,
+2026-10-17, **open defect**). In one window the same sd.cpp flags (auto flash,
+f16, 512²/8, seed 42) produced two images: one PASSes the CPU gate (cos worst
+**0.999987**, PSNR 46.87 dB) and one FAILs (cos worst **0.991745**, PSNR
+**21.43 dB**), while the **wall step is 0.649 s in both** -- a numeric
+difference the denoiser amplifies, not a speed one. The profiling csvs also
+differ (the failing arms' DiT kernels ~2.4x the launch counts,
+`mul_mm_f16w_f16` 3665 against 1613) at the same wall; that difference is
+unexplained and may be a profiling artifact. `flash attention auto: OpenCL ->
+off` prints in both kinds of arm, so the printed decision does not track the
+applied path. Deterministic within a process, varying across processes: **the
+image gate is only comparable when this trajectory is controlled.** Campaign:
+`docs/campaigns/imggen-attention-path.md`.
 
 ## Phases
 
