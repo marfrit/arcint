@@ -285,7 +285,7 @@ index 37d747293..b57150274 100644
                  return false;
 diff --git a/ggml/src/ggml-opencl/kernels/rope_apply_f32.cl b/ggml/src/ggml-opencl/kernels/rope_apply_f32.cl
 new file mode 100644
-index 000000000..ce1eb2c0b
+index 000000000..0878877b1
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/kernels/rope_apply_f32.cl
 @@ -0,0 +1,73 @@
@@ -358,9 +358,9 @@ index 000000000..ce1eb2c0b
 +
 +    // dst is contiguous F32 [head_dim, tokens, heads*batch]: nb0 == sizeof(float),
 +    // row stride ne0 floats.
-+    const ulong out_row = (ulong) row * (ulong) ne0;
-+    *((global float *) (dst + out_row + i0)) = y0;
-+    *((global float *) (dst + out_row + i1)) = y1;
++    const ulong out_row = (ulong) row * (ulong) ne0 * sizeof(float);
++    *((global float *) (dst + out_row + i0*sizeof(float))) = y0;
++    *((global float *) (dst + out_row + i1*sizeof(float))) = y1;
 +}
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 index 01dc8d05c..597b59393 100644
