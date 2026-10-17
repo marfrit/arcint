@@ -111,6 +111,50 @@ The tolerances are placeholders: `TOL_COS=0.001`, `TOL_MSE=0.05`,
 `PSNR_TOL=1.0 dB`, `SSIM_TOL=0.01`, printed with every verdict, the
 operator's to set (charter D6).
 
+## Speed reference (web, 2026-10-17)
+
+No own numbers exist yet (Phase 0 is the first card leg), so this is the external
+yardstick. Evidence class `web`: community or vendor reports read online, named
+by URL. **Only the sd.cpp rows are the same engine as ours**; the ComfyUI /
+PyTorch-XPU rows are context, not the B3 comparison, and the closest Intel Arc
+data point uses PyTorch, not sd.cpp.
+
+| card, engine | resolution / steps | figure | source |
+|---|---|---|---|
+| **sd.cpp Vulkan, RX 470 4 GB** | 512², Q3_K | 7 s/it (7.3 with `RADV_PERFTEST=nogttspill`) | discussion 1026 |
+| **sd.cpp Vulkan, RX 470** | 1024², Q4_K | 35 s/it | discussion 1026 |
+| **sd.cpp Vulkan, RX 580 4 GB** | 512², Q3_K | 20 s/it; Q4_K 17 s/it | discussion 1026 |
+| **sd.cpp Vulkan, RTX 2070** | 512², Q3_K_M | 1.19 s/it | discussion 1026 |
+| **sd.cpp Vulkan, RTX 3050 laptop** | 512² | 2.17 s/it | discussion 1026 |
+| **sd.cpp, RTX 2060 6 GB** | 1024² | 4 s/it (ComfyUI 2.5 after its fix) | reddit 1pchpjb |
+| **sd.cpp, RTX 2060S** | 1024² | 2.23 s/it | reddit 1pchpjb |
+| **sd.cpp, GTX 1080, Q6_K + Qwen3-4B Q6_K** | 1024² | ~30 s/it → ~220-240 s/image | reddit 1r1s3w1 |
+| **PyTorch XPU (SDNQ), Arc A770, Xe driver** | 1024², BF16, batch 4, 9 steps | 7.03 s/it; OOM past batch 4 (π.16 GB) | reddit 1p9xzhf |
+| **PyTorch XPU (SDNQ), Arc A770** | 1024², quantized, batch 1 | ~1.6 s/it; INT8 ~0.88 s/it (1.14 it/s) | reddit 1p9xzhf |
+| **ComfyUI / PyTorch, RTX 4090** | 1024², 8 steps | ~2.3 s | saascrmreview, runaihome |
+| **ComfyUI, RTX 5090 / Pro 6000 Blackwell** | 512² batch 16 (=4×1024²) | ~1.1 s / ~0.8 s a 512² image (÷4 ≈ 0.2-0.3 s a 1024²) | reddit 1pfyk0y |
+| **Measured 43-card board, ComfyUI** | Z-Image Turbo | B300 39.67, 5090 10.72, 4090 7.24, 16 GB 1.56 images/min | gpubattle |
+| **ComfyUI, 3080 laptop / 3090 Ti / 4070 Ti / M4 Pro** | 1024², 7 steps | interactive board, per-device load and gen times | miroleon |
+
+**A source gap:** no sd.cpp-on-Intel-Arc report was found for Z-Image Turbo.
+The `B580`/`B60` Vulkan discussion in llama.cpp is text models only, and the Arc
+A770 image row is PyTorch. Our B60 OpenCL number and the sd.cpp-Vulkan-on-Arc
+comparison (B3) fill that gap.
+
+**CPU (context):** sd.cpp advertises a CPU-only build, Z-Image included
+(`web`); a third-party CPU Z-Image build (3.51 GB) is published. Our own CPU
+reference is above (`measured-here`): 8.1 s/step at 256² means ~4× at 1024²
+plus the encoder and VAE -- about 5-6 min/image, which is why the reference
+arm in the gate is a slow but card-free cell.
+
+Sources: `https://github.com/leejet/stable-diffusion.cpp/discussions/1026`,
+`https://www.reddit.com/r/StableDiffusion/comments/1pchpjb/`,
+`1r1s3w1`, `1p9xzhf`, `1pfyk0y`,
+`https://gpubattle.com/guides/z-image-turbo-gpu-benchmarks`,
+`https://miroleon.github.io/z-image-turbo-benchmark/`,
+`https://saascrmreview.com/z-image-turbo-review/`,
+`https://runaihome.com/blog/z-image-turbo-16gb-vram-home-lab-image-gen-2026/`.
+
 ## Phases
 
 Per the charter `§4`: 0 inventory, 1 the image gate (`§3`), 2 the gaps the
