@@ -72,6 +72,50 @@ Z-Image-Turbo diffusion GGUF, the FLUX `ae.sft` AutoEncoderKL (Z-Image uses
 it), and the Qwen3-4B-Instruct-2507 text encoder. No 3D-convolution VAE yet;
 that is Qwen-Image's, Phase 4. The staged files and their hashes are below.
 
+## Phase 0 — first card cell (`measured-here`, 2026-10-17)
+
+One window on the B60 (GPU.0, `8086:e211`, OpenCL 0:0): the owning unit
+`arcint-agent.service` stopped and restored, the SOP sampler on the physical
+host, one fresh process. sd.cpp upstream mode + the series, Z-Image Turbo Q8_0
++ Qwen3-4B Q8_0 + `ae.safetensors`, 512x512, 8 steps, seed 42,
+`--cfg-scale 1.0`, `--sampling-method euler`, `--backend GPUOpenCL
+--auto-fit off`, `GGML_SCHED_DEBUG=1`.
+
+| module | params | placement | segments |
+|---|---|---|---|
+| text encoder (Qwen3) | 3,974 MB, 386 tensors | VRAM, OpenCL | 1 |
+| diffusion (Z-Image) | 6,273 MB, 452 tensors | VRAM, OpenCL | 1 |
+| VAE | 95 MB, 138 tensors | VRAM, OpenCL | 1 |
+
+**No CPU island for this cell**: every module ran as one segment on VRAM (the
+model-manager and compute-buffer lines read VRAM/OpenCL, "peak across 1
+segment"); nothing landed on RAM or disk, and no "not supported" fallback was
+logged. A2's "no op silently falls back to the CPU" holds here; other cells
+still need the same check.
+
+| figure | value |
+|---|---|
+| first step (kernel build + warm-up) | 24.03 s |
+| steady step, 512² | 3.69 s |
+| sampling, 8 steps | 49.85 s |
+| VAE decode, 512² | 4.50 s |
+| loads (te 10.67 + dit 20.22 + vae 1.02) | ~32 s |
+| `generate_image` total | 65.13 s |
+| peak `drm-resident-vram0` (sampler) | 12,185 MiB |
+| peak `drm-resident-gtt` | 66 MiB |
+
+3.69 s/step at 512² (1,024 image tokens) sits inside the sd.cpp-Vulkan web
+band (RX 470 7 s/it at 512², RTX 2070 1.19 s/it) but is `measured-here`, not
+comparable across engines. At 1024² the GEMMs quadruple and attention grows
+quadratically; the 8-step 512² run is the warm-up of the cell, and **B1's
+per-op profile is still open** -- no OpenCL Intercept layer on the host, so
+that needs a `GGML_OPENCL_PROFILING` build or the intercept shim. The 12,185
+MiB peak leaves a 24 GB card ~11 GiB for the 1024² activations.
+
+Next card cells: 1024²/8 steps (A2), a `GGML_OPENCL_PROFILING` per-op profile
+(B1), the same file/seed/steps on sd.cpp Vulkan (B3), and the red-first gate
+(Phase 1).
+
 ## Staged models (Phase 0/1)
 
 On the node that runs the legs, not in the repository (measured-here,
