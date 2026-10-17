@@ -147,7 +147,7 @@ native-tuned build on the same host.
 is the portable-and-fast option, but it requires `GGML_BACKEND_DL=ON` —
 without it CMake fails outright — and that makes the CPU backend a
 dynamically loaded shared library. arcint links llama.cpp statically as a
-subproject (`CMakeLists.txt:165`, `target_link_libraries(arcint_core PUBLIC
+subproject (`CMakeLists.txt`, `target_link_libraries(arcint_core PUBLIC
 llama OpenCL::OpenCL)`), so DL backends do not fit the current link model
 without rework. The floor was the cheap correct answer; all-variants is a
 possible follow-up.

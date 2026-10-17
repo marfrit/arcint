@@ -7,7 +7,7 @@ token ids, every intermediate of llama.cpp's own graph (`hc_mixed-0`,
 `attn_output-0`, `l_last-3`, …) as a file the emitter's cut dumps and the
 real-geometry reference (`tools/ref_forward_real.py`, at the tag `openvino-history`) could be compared with,
 element for element. The campaign that needed it:
-`docs/campaigns/serving-shape-logits.md` (on the `qfndev` branch) (at the tag `openvino-history`) (2026-09-18: the three fill
+`docs/campaigns/serving-shape-logits.md` (at the tag `openvino-history`) (2026-09-18: the three fill
 defects were found with it, and the depth-4 re-export was accepted with it).
 
 Build inside a llama.cpp checkout (the pinned one the KLD capture came

@@ -64,7 +64,9 @@ otherwise — better that the variable means nothing at all.
 **The score rides the metric channel that already exists.** The wrapper's
 contract is one line on stdout: `ACCEPTANCE-METRIC score <n> points`. The
 cell's `references` carry `score` with `value 10`, `gate_at 10`,
-`lower-is-worse`, so `compare_metrics` (§8.2) does the comparison: 9 is a
+`lower-is-worse` (the values of 2026-09-05; `tests/acceptance/cells.json` now
+carries value 9 / gate_at 9 for the coder and value 10 / gate_at 9 for the
+agent), so `compare_metrics` (§8.2) does the comparison: below `gate_at` is a
 regression (FAIL under `--cell`, `--allow-regress pruefstand/score` under
 `--all` — which a release should never pass), no line at all is the
 missing-metric rule (FAIL), a non-numeric score is a hard fail. Nothing
