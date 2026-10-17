@@ -155,6 +155,17 @@ The tolerances are placeholders: `TOL_COS=0.001`, `TOL_MSE=0.05`,
 `PSNR_TOL=1.0 dB`, `SSIM_TOL=0.01`, printed with every verdict, the
 operator's to set (charter D6).
 
+**First CPU-vs-B60 comparison** (`measured-here`, 2026-10-17; the same file,
+seed 42, 8 steps, euler): the CPU reference at 512² took a 51.33 s first step
+and ~31 s a step; the B60 OpenCL candidate's previews matched to cosine worst
+**0.999984** every step, MSE per step at most **1.61** (pixel-squared), and the
+decoded images read **PSNR 45.11 dB, SSIM 0.999783**. So the arcint OpenCL path
+reproduces the CPU reference to the eye. The MSE/PSNR/SSIM rows are **not
+gated** here: the rule is comparative, and the baseline arm (the unchanged
+OpenCL on the same card) is a Phase-2 cell, not yet run. The tool's first
+version gated the candidate's worst MSE against its own mean -- fixed: the
+comparative figures need the baseline, as charter §3 says.
+
 ## Speed reference (web, 2026-10-17)
 
 No own numbers exist yet (Phase 0 is the first card leg), so this is the external

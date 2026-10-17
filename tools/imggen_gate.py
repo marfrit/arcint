@@ -219,10 +219,6 @@ def compare_ref(refdir, canddir, basedir=None, tol_cos=TOL_COS, tol_mse=TOL_MSE,
     for i, cos, mse in rows:
         if cos < 1.0 - tol_cos:
             failures.append("step %d cosine %.6f < %.6f" % (i, cos, 1.0 - tol_cos))
-    ref_mse_mean = sum(r[2] for r in rows) / len(rows)
-    if worst_mse > ref_mse_mean * (1 + tol_mse):
-        failures.append("step MSE %.4f > ref mean %.4f * (1+%.3f)" %
-                        (worst_mse, ref_mse_mean, tol_mse))
 
     final = {}
     if ref_final and cand_final:
@@ -240,6 +236,10 @@ def compare_ref(refdir, canddir, basedir=None, tol_cos=TOL_COS, tol_mse=TOL_MSE,
             if brows:
                 baseline["step_cosine_mean"] = sum(r[1] for r in brows) / len(brows)
                 baseline["step_mse_worst"] = max(r[2] for r in brows)
+                if baseline["step_mse_worst"] is not None:
+                    if worst_mse > baseline["step_mse_worst"] * (1 + tol_mse):
+                        failures.append("step MSE %.4f > baseline %.4f * (1+%.3f)" %
+                                        (worst_mse, baseline["step_mse_worst"], tol_mse))
         # the baseline arm's own distance from the reference is the allowance's
         # other side: the candidate's figures are compared to the baseline's.
         if bfinal and cand_final:
@@ -267,6 +267,9 @@ def compare_ref(refdir, canddir, basedir=None, tol_cos=TOL_COS, tol_mse=TOL_MSE,
         print("  step(s) only on one side: %s" % miss)
     if basedir:
         print("  baseline present: %s" % basedir)
+    else:
+        print("  no baseline arm: cosine is gated; MSE/PSNR/SSIM are reported, not gated")
+        print("  (the gate is comparative against the unchanged OpenCL on the same card)")
     tol = {"tol_cos": tol_cos, "tol_mse": tol_mse, "psnr_tol": psnr_tol, "ssim_tol": ssim_tol}
     print("  tolerances (operator, D6): %s" % json.dumps(tol))
     if failures:
