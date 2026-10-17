@@ -48,6 +48,13 @@ series OFF in the same window); the final PSNR/SSIM against the baseline; the
 step time (seconds a step) against the last phase's. The red case first: a
 deliberately broken tile in the new GEMM turns the step curve red.
 
+**The bar (operator, 2026-10-17): >= 70 % of the B60's XMX peak.** The step is
+compute-bound (intensity ~1,900 FLOP/byte against the ridge 215; 456 GB/s is
+not the bind): the XMX FP16 peak is ~98.3 TFLOP/s, INT8 ~196.6. At 512² a DiT
+step is 12.3 TFLOP, at 1024² 49.2, so the bar is ~**0.18 s a step at 512²**,
+~0.72 at 1024². The generic q8_0 kernel runs at ~4 TFLOP effective; Vulkan
+1.78 s a step (7 %); this campaign's work is 10-20x over the generic kernel.
+
 ## Current state (2026-10-17)
 
 `measured-here`, B60, Z-Image Turbo Q8_0 + Qwen3-4B Q8_0 + `ae.safetensors`,
@@ -62,8 +69,12 @@ deliberately broken tile in the new GEMM turns the step curve red.
 | `kernel_im2col_f16` | 1,094.1 | 3.22 % |
 | `flash_attn_f32_f16` | 7.1 | 0.02 % |
 
-Steady step 3.69 s; Vulkan 1.78 s a step on the same card (B3). **Not started**:
-the `GGML_OPENCL_Q8_DENSE_DP4A=1` measurement, the Vulkan-path read, the kernel.
+Steady step 3.69 s; Vulkan 1.78 s a step on the same card (B3). The B60's XMX
+FP16 peak is ~98.3 TFLOP/s (INT8 ~196.6); 512² a step is 12.3 TFLOP, so the
+3.69 s is **3.4 %** of the FP16 peak and the bar is 0.18 s. **Not started**:
+the cheap f16 test (`--type f16` so arcint's existing `kernel_mul_mm_f16w_f16`,
+patch 0022, takes the DiT GEMM), the `GGML_OPENCL_Q8_DENSE_DP4A=1`
+measurement, the Vulkan-path read, the kernel.
 
 ## Where it lives
 

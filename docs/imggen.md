@@ -255,6 +255,38 @@ Sources: `https://github.com/leejet/stable-diffusion.cpp/discussions/1026`,
 `https://saascrmreview.com/z-image-turbo-review/`,
 `https://runaihome.com/blog/z-image-turbo-16gb-vram-home-lab-image-gen-2026/`.
 
+## Performance target (`web` + `arithmetic`, 2026-10-17)
+
+The operator set the bar (2026-10-17): **image-step performance at least 70 % of
+the limiting factor**, using the B60's compute and its memory bandwidth.
+
+**The B60 Pro (`web`, Intel datasheet / reports):** 20 Xe cores, 160 XMX
+units, 2400 MHz boost, 24 GB GDDR6 on a 192-bit bus at 19 Gbps -> **456 GB/s**;
+12.28 TFLOPS FP32 (the vector engines) and **197 TOPS INT8 dense (XMX)**. Xe2's
+XMX does 4096 INT8 OPS/clock per Xe core (2048 FP16), so the XMX FP16 peak is
+~**98.3 TFLOP/s** and INT8 ~196.6 (the advertised 197, `web`).
+
+**The step (`arithmetic`):** Z-Image Turbo's DiT is 6 B params; a step's MACs =
+params x tokens. 512² = 1,024 tokens -> **12.3 TFLOP a step**; 1024² = 4,096 ->
+**49.2 TFLOP**. Against the weights (1 byte a weight + a f16 scale per 32) the
+intensity is ~1,900 FLOP/byte, far above the ridge 215 FLOP/byte (98.3 TFLOP /
+456 GB/s), so the step is **compute-bound**: the limiting factor is the XMX
+peak, not the bandwidth (456 GB/s binds only below ~256 tokens, and the whole
+6.58 GB of weights is 14 ms a read).
+
+**The bar:** >= 70 % of that peak -- <= ~**0.18 s a step at 512²**, ~**0.72 s at
+1024²** for the DiT. Measured today: OpenCL 3.69 s a step (**3.4 %** of the
+98.3 TFLOP FP16 peak), Vulkan 1.78 s (**7 %**); the q8_0 GEMM that is 68 % of
+the step runs at ~4 TFLOP effective. The implementation target is a q8_0 XMX
+GEMM at 70 % of the XMX rate (int8 196 or fp16 98), 10-20x over the generic
+kernel.
+
+**Cheapest first implementation step** (no new kernel): the DiT weights as f16
+(`--type f16` or a `--tensor-type-rules` pattern) so the GEMM takes **arcint's
+existing XMX f16-weights kernel** (`kernel_mul_mm_f16w_f16`, patch 0022) instead
+of the generic q8_0 one. If that nears the bar, the q8_0 XMX form is only for
+the memory fit; if it does not, the q8_0 XMX GEMM is the work.
+
 ## Phases
 
 Per the charter `§4`: 0 inventory, 1 the image gate (`§3`), 2 the gaps the
