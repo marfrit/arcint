@@ -87,12 +87,41 @@ swapped half in the rotation kernel must turn the step curve red).
 3. Red case first: a swapped half or a wrong sign in the kernel turns the
    gate's step curve red; then the card A/B against the generic path.
 
-## Current state (2026-10-17)
+## Current state (2026-10-17, `measured-here`)
 
-Not started: reading the fork op, the repeat/mul bandwidth probe, the OpenCL
-kernel, the sd.cpp guard edit, the op in arcint's ggml core. `measured-here`:
-the generic path is 37 % of the B60 f16 step; the reference is `code` and the
-OpenCL form is ours (the fork has none).
+The lever fired. The op is ported as **`0057-opencl-intel-rope-apply-fused.patch`**
+(9 files: `ggml.h`, `ggml.c`, the CPU forward, `ggml-opencl.cpp`, the new
+`kernels/rope_apply_f32.cl`, the OpenCL CMake list), closed with the sd.cpp
+integration patch **`contrib/sdcpp/upstream-rope-apply.patch`** (removes the
+`SD_USE_UPSTREAM_GGML` guard around `rope.hpp:1075`; `build-sdcpp.sh` applies it
+idempotently). Applied in the dev host's sd.cpp workbench (llama.cpp at the pin with the 54-patch series, and sd.cpp at f0aac52);
+both rebuilds green; the released build is `57d888dd`.
+
+**B60, f16, 512², 8 steps, same prompt/seed (the A/B in one window, agent
+off, the production units restored after):**
+
+| arm | steady step | sampling total | first step | total |
+|---|---|---|---|---|
+| generic (`0056`, f16) | 1.32 s/step (0.758 it/s) | — | 22.42 s | 51.2 s |
+| fused (`0057`, f16) | **0.62 s/step (1.61 it/s)** | — | 22.17 s | **45.03 s** |
+
+The step is **2.1× faster**; the ~5.2 s the generic RoPE spent a run is gone
+(`repeat_f32`+`mul` were 37 % of device, `code`-predicted). The OpenCL kernel
+compiled at first use without aborting the run — `#pragma OPENCL FP_CONTRACT
+OFF` was accepted by the IGC. Peak VRAM f16 19895 MiB, unchanged memory
+profile.
+
+**Verdict: CONFIRMED.** Still open: the red case (a swapped half / wrong sign)
+and the **numeric image gate** (q8_0 0057 vs the CPU reference, and vs the
+series-OFF baseline) — the f16 leg's image is visually correct but the
+per-step cosine/PSNR compare has not run yet. Also not separately measured:
+how much of the gain is fewer launches vs less bandwidth (the op removes 2,112
+launches a run).
+
+**Remaining plan:** the red case, the q8_0 gate A/B, and the `test-backend-ops`
+cases (they need a llama.cpp test build besides sd.cpp's ggml-only build). The
+second lever in the recon — flattening the elementwise dispatch
+(`global={ne1*64, ne2, ne3}` for `ne0=2`, 125.8M workgroups) — is untouched.
 
 ## Where it lives
 

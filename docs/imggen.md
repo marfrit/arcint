@@ -296,11 +296,23 @@ faster than Vulkan (1.78). All weights on VRAM (te 7.67 + DiT 11.75 GB as f16 =
 (`kernel_mul_mm_f16w_f16`) is 22.8 % of device time: **31 % of the 98.3 TFLOP
 FP16 peak** (the generic q8_0 kernel was ~4 TFLOP).
 
-**Where the remaining device time is** (f16 profile, 512², 14,053 ms total):
+**The fused RoPE (`0057`), f16, same window, 512²/8 steps:** steady step
+**0.62 s** (1.61 it/s) against the generic **1.32** -- **2.1x**; sampling total
+45.03 s against 51.2. The op (`GGML_OP_ROPE_APPLY`) is ported to arcint's tree
+with an original OpenCL kernel as
+`contrib/llama.cpp/patches/0057-opencl-intel-rope-apply-fused.patch` (9 files),
+the sd.cpp upstream-mode guard is lifted by
+`contrib/sdcpp/upstream-rope-apply.patch` (applied by `build-sdcpp.sh`), and
+both builds rebuilt green. `measured-here`; **CONFIRMED** in the campaign
+`docs/campaigns/imggen-rope-apply-opencl.md`. The numeric image gate against
+the q8_0 CPU reference is still pending.
+
+**Where the remaining device time is** (f16 profile *before* 0057, 512²,
+14,053 ms total):
 
 | kernel | share | what it is |
 |---|---|---|
-| `repeat_f32` + `mul` | 21.7 + 15.6 = **37 %** | the **generic RoPE** (below) |
+| `repeat_f32` + `mul` | 21.7 + 15.6 = **37 %** | the **generic RoPE** -- **removed by 0057** |
 | `im2col_f16` + `mul_mat_f16_f16` | 22 % | the **VAE decode conv** via im2col + mul-mat f16 |
 | `kernel_mul_mm_f16w_f16` | 22.8 % | the XMX f16 GEMM |
 | misc (group_norm, scale, soft_max, ...) | ~18 % | |
@@ -318,12 +330,12 @@ rope.cl`), so the upstream-mode OpenCL build cannot call it.
 stayed at 68 % and the step at 3.81 s. A dead end, as the recorded expectation
 said.
 
-**Next implementation by measured share:** (1) the generic RoPE (**37 %**), the
-biggest single lever -- port `GGML_OP_ROPE_APPLY` with an OpenCL kernel, or at
-least run the repeat/mul at device bandwidth and cut the launch count; (2) the
-VAE decode conv (**22 %**) off im2col + mul-mat; (3) the XMX GEMM (**22.8 %**)
-from 31 % toward 70 % of the peak. The bar `§Performance target` and the
-campaign `docs/campaigns/imggen-q8_0-xmx-gemm.md` hold the target.
+**Next implementation by measured share:** with the RoPE gone the two
+remaining device shares are (1) the VAE decode conv (**22 %**) off im2col +
+mul-mat, and (2) the XMX GEMM (**22.8 %**) from 31 % toward 70 % of the peak --
+the `kernel_mul_mm_f16w_f16` share also rises once the 37 % is gone (the f16
+device total is not yet re-profiled at 0057). The bar `§Performance target`
+and the campaign `docs/campaigns/imggen-q8_0-xmx-gemm.md` hold the target.
 
 ## Phases
 
@@ -337,5 +349,6 @@ GroupNorm, CONV_3D only with Qwen-Image), 3 the service (package, unit,
 
 - The recipe: `contrib/sdcpp/build-sdcpp.sh`.
 - The engine: stable-diffusion.cpp `f0aac52` (reference source, not vendored).
-- The kernels: `contrib/llama.cpp/patches` (0001-0056 without 0031, 0055), and
+- The kernels: `contrib/llama.cpp/patches` (0001-0057 without 0031, 0055), the
+  sd.cpp integration patch `contrib/sdcpp/upstream-rope-apply.patch`, and
   `docs/campaigns/dense-prefill-attention.md` for the attention family.

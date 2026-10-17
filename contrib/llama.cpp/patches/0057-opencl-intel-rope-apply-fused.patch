@@ -1,0 +1,419 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index c37ba9471..62ac3e847 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -600,6 +600,7 @@ extern "C" {
+         GGML_OP_OPT_STEP_SGD,
+ 
+         GGML_OP_GLU,
++        GGML_OP_ROPE_APPLY,
+ 
+         GGML_OP_COUNT,
+     };
+@@ -1848,6 +1849,17 @@ extern "C" {
+             float                 scale,
+             float                 max_bias);
+ 
++    // Apply precomputed rotary matrices, with shapes in ne[] order:
++    // a: F32 [head_dim, heads, tokens, batch], pe: F32 [2, 2, head_dim/2, tokens].
++    // pe stores [[cos, -sin], [sin, cos]] for each pair and token, shared across heads/batches.
++    // Returns contiguous F32 [head_dim, tokens, heads*batch]. Input strides are preserved.
++    // Interleaved pairs are (2*i, 2*i+1); otherwise pairs are (i, i+head_dim/2).
++    GGML_API struct ggml_tensor * ggml_rope_apply(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            struct ggml_tensor  * pe,
++            bool                  interleaved);
++
+     // rotary position embedding
+     // if (mode & 1) - skip n_past elements (NOT SUPPORTED)
+     // if (mode & GGML_ROPE_TYPE_NEOX) - GPT-NeoX style
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 0da9659ea..5d0e004c4 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1929,6 +1929,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_soft_max_ext_back(params, tensor);
+             } break;
++        case GGML_OP_ROPE_APPLY:
++            {
++                ggml_compute_forward_rope_apply(params, tensor);
++            } break;
+         case GGML_OP_ROPE:
+             {
+                 ggml_compute_forward_rope(params, tensor);
+@@ -2394,6 +2398,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_SOFT_MAX_BACK:
+         case GGML_OP_ROPE:
+         case GGML_OP_ROPE_BACK:
++        case GGML_OP_ROPE_APPLY:
+         case GGML_OP_ADD_REL_POS:
+             {
+                 n_tasks = n_threads;
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 81ff5d79f..fa431a954 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -459,6 +459,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
+             return src1->type == GGML_TYPE_F32 ||
+                    src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type ||
+                    (src1->type == GGML_TYPE_BF16 && ggml_get_type_traits_cpu(src0->type)->vec_dot_type == GGML_TYPE_F32);
++        case GGML_OP_ROPE_APPLY:
++            return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
++                   op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
+         case GGML_OP_SOFT_MAX_BACK: {
+             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
+                 return false;
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 7a73e138e..fbe97871f 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -6245,6 +6245,48 @@ void ggml_compute_forward_clamp(
+     }
+ }
+ 
++// ggml_compute_forward_rope_apply
++
++void ggml_compute_forward_rope_apply(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * x  = dst->src[0];
++    const ggml_tensor * pe = dst->src[1];
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && pe->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(dst));
++
++    const bool interleaved = ggml_get_op_params_i32(dst, 0) != 0;
++    const int64_t half_dim = x->ne[0]/2;
++    const int64_t rows = x->ne[1]*x->ne[2]*x->ne[3];
++    const int64_t rows_per_thread = (rows + params->nth - 1)/params->nth;
++    const int64_t begin = rows_per_thread*params->ith;
++    const int64_t end = std::min(begin + rows_per_thread, rows);
++    for (int64_t row = begin; row < end; ++row) {
++        const int64_t token = row % x->ne[2];
++        const int64_t head  = (row / x->ne[2]) % x->ne[1];
++        const int64_t batch = row / (x->ne[2]*x->ne[1]);
++        const char * x_row = (const char *) x->data + head*x->nb[1] + token*x->nb[2] + batch*x->nb[3];
++        const char * pe_row = (const char *) pe->data + token*pe->nb[3];
++        float * out = (float *) dst->data + row*x->ne[0];
++        for (int64_t j = 0; j < half_dim; ++j) {
++            const int64_t i0 = interleaved ? 2*j : j;
++            const int64_t i1 = interleaved ? 2*j + 1 : j + half_dim;
++            const float a = *(const float *) (x_row + i0*x->nb[0]);
++            const float b = *(const float *) (x_row + i1*x->nb[0]);
++            const char * matrix = pe_row + j*pe->nb[2];
++            const float c = *(const float *) matrix;
++            const float s = *(const float *) (matrix + pe->nb[1]);
++            if (interleaved) {
++                const float neg_s = *(const float *) (matrix + pe->nb[0]);
++                const float c1 = *(const float *) (matrix + pe->nb[0] + pe->nb[1]);
++                out[i0] = a*c + b*neg_s;
++                out[i1] = a*s + b*c1;
++            } else {
++                out[i0] = a*c - b*s;
++                out[i1] = a*s + b*c;
++            }
++        }
++    }
++}
++
+ // ggml_compute_forward_rope
+ 
+ static float rope_yarn_ramp(const float low, const float high, const int i0) {
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 2728b08b6..f320c098f 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -60,6 +60,7 @@ void ggml_compute_forward_diag_mask_inf(const struct ggml_compute_params * param
+ void ggml_compute_forward_diag_mask_zero(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_soft_max(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_soft_max_ext_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_rope_apply(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_rope(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_rope_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_clamp(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
+index 531a37f7f..30f98fd8f 100644
+--- a/ggml/src/ggml-opencl/CMakeLists.txt
++++ b/ggml/src/ggml-opencl/CMakeLists.txt
+@@ -209,6 +209,7 @@ set(GGML_OPENCL_KERNELS
+     l2_norm
+     rms_norm
+     rope
++    rope_apply_f32
+     scale
+     set_rows
+     sigmoid
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 37d747293..b57150274 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -886,6 +886,7 @@ struct ggml_backend_opencl_context {
+     cl_program program_rms_norm;
+     cl_program program_group_norm;
+     cl_program program_rope;
++    cl_program program_rope_apply_f32;
+     cl_program program_silu;
+     cl_program program_sigmoid;
+     cl_program program_softmax_f32;
+@@ -955,6 +956,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_set_rows_q4_0_soa_i64, kernel_set_rows_q4_0_soa_i32;
+     cl_kernel kernel_rope_norm_f32, kernel_rope_norm_f16, kernel_rope_neox_f32, kernel_rope_neox_f16;
+     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
++    cl_kernel kernel_rope_apply_f32;   // the fused precomputed-RoPE op (GGML_OP_ROPE_APPLY)
+     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_i32_i32;
+     cl_kernel kernel_cpy_f32_f32_pack = nullptr;
+     cl_kernel kernel_cpy_f32_i32 = nullptr, kernel_cpy_i32_f32 = nullptr;   // the casts
+@@ -3568,6 +3570,21 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+         GGML_LOG_CONT(".");
+     }
+ 
++    // rope_apply_f32 (the fused precomputed-RoPE op; upstream ggml-org has no such op)
++    {
++#ifdef GGML_OPENCL_EMBED_KERNELS
++        const std::string kernel_src {
++            #include "rope_apply_f32.cl.h"
++        };
++#else
++        const std::string kernel_src = read_file("rope_apply_f32.cl");
++#endif
++        backend_ctx->program_rope_apply_f32 =
++            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
++        CL_CHECK((backend_ctx->kernel_rope_apply_f32 = clCreateKernel(backend_ctx->program_rope_apply_f32, "kernel_rope_apply_f32", &err), err));
++        GGML_LOG_CONT(".");
++    }
++
+     // scale
+     {
+ #ifdef GGML_OPENCL_EMBED_KERNELS
+@@ -10990,6 +11007,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+             return true;
+         case GGML_OP_DIAG_MASK_INF:
+             return op->ne[3] == 1;
++        case GGML_OP_ROPE_APPLY:
++            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
++                   op->type == GGML_TYPE_F32 && op->src[0]->ne[0] % 2 == 0 && ggml_is_contiguous(op);
+         case GGML_OP_ROPE: {
+             const int mode = ((const int32_t *) op->op_params)[2];
+             const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
+@@ -33552,6 +33572,75 @@ static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, c
+     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+ }
+ 
++static void ggml_cl_rope_apply(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    GGML_ASSERT(src0);
++    GGML_ASSERT(src0->extra);
++    GGML_ASSERT(src1);
++    GGML_ASSERT(src1->extra);
++    GGML_ASSERT(dst);
++    GGML_ASSERT(dst->extra);
++
++    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
++
++    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
++    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++
++    cl_ulong offset0 = extra0->offset + src0->view_offs;
++    cl_ulong offset1 = extra1->offset + src1->view_offs;
++    cl_ulong offsetd = extrad->offset + dst->view_offs;
++
++    const int ne00 = src0->ne[0];
++    const int ne01 = src0->ne[1];
++    const int ne02 = src0->ne[2];
++    const int ne03 = src0->ne[3];
++    const cl_ulong nb00 = src0->nb[0];
++    const cl_ulong nb01 = src0->nb[1];
++    const cl_ulong nb02 = src0->nb[2];
++    const cl_ulong nb03 = src0->nb[3];
++
++    const cl_ulong nb10 = src1->nb[0];
++    const cl_ulong nb11 = src1->nb[1];
++    const cl_ulong nb12 = src1->nb[2];
++    const cl_ulong nb13 = src1->nb[3];
++
++    const int ne0 = dst->ne[0];
++    const int half_dim = ne00/2;
++    const int pairs = half_dim * ne01 * ne02 * ne03;
++    const int interleaved = ggml_get_op_params_i32(dst, 0);
++
++    cl_kernel kernel = backend_ctx->kernel_rope_apply_f32;
++
++    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
++    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
++    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
++    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
++    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
++    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
++    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne02));
++    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne03));
++    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb00));
++    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb01));
++    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb02));
++    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &nb03));
++    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_ulong), &nb10));
++    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_ulong), &nb11));
++    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb12));
++    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &nb13));
++    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &ne0));
++    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &half_dim));
++    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &pairs));
++    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(int),      &interleaved));
++
++    // one work-item a (pair, row): a 1D grid, unlike the classic rope's per-channel one.
++    const int nth = 256;
++    size_t global_work_size[] = {(size_t) (((pairs + nth - 1)/nth)*nth), 1, 1};
++    size_t local_work_size[]  = {(size_t) nth, 1, 1};
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++}
++
+ static void ggml_cl_rope(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_ASSERT(src0);
+     GGML_ASSERT(src0->extra);
+@@ -34912,6 +35001,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+             }
+             func = ggml_cl_soft_max;
+             break;
++        case GGML_OP_ROPE_APPLY:
++            if (!any_on_device) {
++                return false;
++            }
++            func = ggml_cl_rope_apply;
++            break;
+         case GGML_OP_ROPE:
+             if (!any_on_device) {
+                 return false;
+diff --git a/ggml/src/ggml-opencl/kernels/rope_apply_f32.cl b/ggml/src/ggml-opencl/kernels/rope_apply_f32.cl
+new file mode 100644
+index 000000000..ce1eb2c0b
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/rope_apply_f32.cl
+@@ -0,0 +1,73 @@
++#pragma OPENCL FP_CONTRACT OFF
++
++kernel void kernel_rope_apply_f32(
++        global const char * src0,
++        ulong                    offset0,
++        global const char * src1,
++        ulong                    offset1,
++        global       char * dst,
++        ulong                    offsetd,
++        int     ne00,
++        int     ne01,
++        int     ne02,
++        int     ne03,
++        ulong   nb00,
++        ulong   nb01,
++        ulong   nb02,
++        ulong   nb03,
++        ulong   nb10,
++        ulong   nb11,
++        ulong   nb12,
++        ulong   nb13,
++        int     ne0,
++        int     half_dim,
++        int     pairs,
++        int     interleaved
++) {
++    src0 = src0 + offset0;
++    src1 = src1 + offset1;
++    dst  = dst  + offsetd;
++
++    const int gid = get_global_id(0);
++    if (gid >= pairs) {
++        return;
++    }
++
++    // one work-item handles one (pair j, row) -- what the fork's Vulkan kernel does,
++    // ported to the dispatch style here. row = (batch, head, token) in that order.
++    const int j     = gid % half_dim;
++    const int row   = gid / half_dim;
++    const int token = row % ne02;
++    const int head  = (row / ne02) % ne01;
++    const int batch = row / (ne02 * ne01);
++
++    const int i0 = interleaved != 0 ? 2*j           : j;
++    const int i1 = interleaved != 0 ? 2*j + 1       : j + half_dim;
++
++    const ulong x_row  = head*nb01 + token*nb02 + batch*nb03;
++    const ulong matrix = j*nb12 + token*nb13;
++
++    const float a = *((global const float *) (src0 + x_row + i0*nb00));
++    const float b = *((global const float *) (src0 + x_row + i1*nb00));
++    const float c = *((global const float *) (src1 + matrix));
++    const float s = *((global const float *) (src1 + matrix + nb11));
++
++    float y0;
++    float y1;
++    if (interleaved != 0) {
++        // pe stores [[cos, -sin], [sin, cos]]
++        const float neg_s = *((global const float *) (src1 + matrix + nb10));
++        const float c1    = *((global const float *) (src1 + matrix + nb10 + nb11));
++        y0 = a*c + b*neg_s;
++        y1 = a*s + b*c1;
++    } else {
++        y0 = a*c - b*s;
++        y1 = a*s + b*c;
++    }
++
++    // dst is contiguous F32 [head_dim, tokens, heads*batch]: nb0 == sizeof(float),
++    // row stride ne0 floats.
++    const ulong out_row = (ulong) row * (ulong) ne0;
++    *((global float *) (dst + out_row + i0)) = y0;
++    *((global float *) (dst + out_row + i1)) = y1;
++}
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 01dc8d05c..597b59393 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1110,9 +1110,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "OPT_STEP_SGD",
+ 
+     "GLU",
++    "ROPE_APPLY",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1225,9 +1226,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "sgd(x)",
+ 
+     "glu(x)",
++    "rope_apply(x,pe)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -4282,6 +4284,26 @@ struct ggml_tensor * ggml_soft_max_ext_back_inplace(
+     return ggml_soft_max_ext_back_impl(ctx, a, b, scale, max_bias, true);
+ }
+ 
++// ggml_rope_apply
++
++struct ggml_tensor * ggml_rope_apply(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        struct ggml_tensor  * pe,
++        bool                  interleaved) {
++    GGML_ASSERT(a->type == GGML_TYPE_F32 && pe->type == GGML_TYPE_F32);
++    GGML_ASSERT(a->ne[0] % 2 == 0);
++    GGML_ASSERT(pe->ne[0] == 2 && pe->ne[1] == 2);
++    GGML_ASSERT(pe->ne[2] == a->ne[0]/2 && pe->ne[3] == a->ne[2]);
++
++    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, a->type, a->ne[0], a->ne[2], a->ne[1]*a->ne[3]);
++    ggml_set_op_params_i32(result, 0, interleaved ? 1 : 0);
++    result->op     = GGML_OP_ROPE_APPLY;
++    result->src[0] = a;
++    result->src[1] = pe;
++    return result;
++}
++
+ // ggml_rope
+ 
+ static struct ggml_tensor * ggml_rope_impl(

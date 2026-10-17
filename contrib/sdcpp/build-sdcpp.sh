@@ -53,6 +53,19 @@ fi
 grep -Eq '^#\s*define\s+GGML_MAX_NAME\s+64$' "$GGML/include/ggml.h" \
     || { echo "$GGML/include/ggml.h is not the pin's (GGML_MAX_NAME 64); sd.cpp will set its own 160" >&2; exit 1; }
 
+# The upstream-mode RoPE guard: sd.cpp's apply_rope attempts ggml_rope_apply only
+# outside SD_USE_UPSTREAM_GGML (rope.hpp). Since 0057 the op exists in arcint's tree,
+# so the upstream-mode build wants the attempt: apply the small integration patch.
+# It is idempotent (applied only while the guard line is still there).
+ROPE_PATCH="$(cd "$(dirname "$0")" && pwd)/upstream-rope-apply.patch"
+if [ -f "$ROPE_PATCH" ] && [ -d "$SRC/.git" ] && grep -q '^#ifndef SD_USE_UPSTREAM_GGML' "$SRC/src/model/common/rope.hpp"; then
+    git -C "$SRC" apply --whitespace=nowarn "$ROPE_PATCH"
+fi
+# The op must be in the ggml tree, else the (patch-removed) guard would call a
+# missing ggml_rope_apply and fail the link.
+grep -q 'ggml_rope_apply' "$GGML/include/ggml.h" \
+    || { echo "$GGML lacks GGML_OP_ROPE_APPLY -- apply 0057; upstream-mode RoPE stays generic" >&2; exit 1; }
+
 cmake -S "$SRC" -B "$BUILD" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DSD_USE_UPSTREAM_GGML=ON \
