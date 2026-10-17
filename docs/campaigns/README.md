@@ -78,6 +78,7 @@ the audit's ranking (`research-reference-audit.md` §4).
 | [layer-split-two-cards](layer-split-two-cards.md) | opened 2026-10-07: Flash-Next across the B60 and the A770, a layer range, KV and expert cache per card; recon done, two OpenCL platforms (`measured-here`), design: a context per card (0023), an expert cache per card (0024) | Strata `src/program/generate.cpp:690-708, 2286-2391, 2860-2906`, `src/core/verify.cpp:815-820, 1128-1171`, `src/prefill/prefill.cpp:1866-1882` |
 | [agent-context](agent-context.md) | closed 2026-10-12: the dense agent at 245,760 tokens with q8_0:q4_0 KV on the B60 (needle at 237k right, task 10/10, KL inside the bar, peak 24,195 of 24,480 MiB) | llama.cpp `-ctk`/`-ctv`; `contrib/llama.cpp` 0015 |
 | [direct-submission-fault](direct-submission-fault.md) | mechanism on record; the N ≥ 5 confirmation on the current kernel owed | upstream `linux-7.1.y` ring-ordering fix |
+| [imggen-q8_0-xmx-gemm](imggen-q8_0-xmx-gemm.md) | opened 2026-10-17: the first image profile puts upstream's generic q8_0 GEMM at 68.17 % of Z-Image Turbo's device time on the B60; the DiT attention is 0.02 %; upstream's int8 dp4a q8_0 switch to measure first, then the XMX kernel | arcint's K-quant XMX GEMM (0001/0009/0011-0014) and `kernel_mul_mm_f16w_f16` (0022); Vulkan's q8_0 path (B3: 1.78 vs 3.69 s a step) |
 
 The OpenVINO engine's closed campaigns (the tier, the static partition, the
 host bank, the doorbell on the plugin, QSA, the u8:i4 KV) are listed in
