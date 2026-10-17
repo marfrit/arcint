@@ -49,6 +49,44 @@ PSNR/SSIM against the baseline; the step time against the prior phase. The bar
 is the milestone's performance target; the red case first (a wrong sign or a
 swapped half in the rotation kernel must turn the step curve red).
 
+## Recon (2026-10-17, `code`)
+
+- **The op to port** (the fork, `leejet/ggml` (sd.cpp's ggml submodule)):
+  `ggml_rope_apply` (API `ggml.h:1877`): `a` F32 `[head_dim, heads, tokens,
+  batch]`, `pe` F32 `[2, 2, head_dim/2, tokens]` (stores
+  `[[cos,-sin],[sin,cos]]`), returns contiguous F32 `[head_dim, tokens,
+  heads*batch]`; `interleaved` selects pairs `(2i, 2i+1)` against
+  `(i, i+head_dim/2)`. The CPU forward is `ops.cpp:6289` (read; the pair
+  arithmetic: non-interleaved `out[i0]=a*c - b*s`, `out[i1]=a*s + b*c`).
+  The fork has CUDA (`ggml-cuda/rope.cu`) and Vulkan (`rop_apply_f32.comp`) but
+  **no OpenCL**; upstream ggml-org at the pin has neither (`code`).
+- **sd.cpp gate** (`rope.hpp:1075`): the op is attempted only when
+  `SD_USE_UPSTREAM_GGML` is **not** defined. Upstream mode must provide the op
+  and the guard has to allow it when the backend supports it — a two-line
+  integration edit to the reference source we build.
+- **The OpenCL kernel** (ours): per row (head, token, batch) read the strided
+  F32 `x` and the `pe` pair, write `dst` contiguous; the CPU forward is the
+  exact model. `supports_op` + the dispatch + `test-backend-ops` cases.
+- **Alternative / second lever found while reading**: the generic path's
+  `repeat_f32` and `mul` dispatches use `global = {ne1*nth, ne2, ne3}` with
+  `nth=64` and a kernel that loops over `ne0`. For the RoPE operands
+  (`ne0=2`, `ne1=64`, `ne2=1024`, `ne3=30`) that is **125.8M workgroups a
+  launch**, ~62/64 threads idle — pure oversubscription, and it explains the
+  2.8 ms a call at ~8 MB. The same geometry hits every elementwise op on
+  small-`ne0` shapes (ADD, scale, cpy, ...). Flattening the elementwise
+  dispatch is a second, general patch; the fused op removes the launches
+  themselves, which is why it is the first lever.
+
+## Plan (a patch of the series)
+
+1. Port `GGML_OP_ROPE_APPLY` into arcint's tree: `ggml.h`/`ggml.c` (the fork's
+   op definition), the CPU forward from `ops.cpp:6289`, the OpenCL kernel +
+   `supports_op` + dispatch, and `test-backend-ops` cases.
+2. Allow sd.cpp's `rope.hpp` op attempt under upstream mode when
+   `ggml_backend_supports_op` holds.
+3. Red case first: a swapped half or a wrong sign in the kernel turns the
+   gate's step curve red; then the card A/B against the generic path.
+
 ## Current state (2026-10-17)
 
 Not started: reading the fork op, the repeat/mul bandwidth probe, the OpenCL
