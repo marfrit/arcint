@@ -1,8 +1,9 @@
 # imggen-rope-apply-opencl — the fused RoPE for the DiT (the generic path's 37 %)
 
-**Open** (2026-10-17). The f16 profile of Z-Image Turbo on the B60 puts the
-generic RoPE (`repeat_f32` + `mul`) at **37 %** of device time; the fused
-`GGML_OP_ROPE_APPLY` that sd.cpp uses in non-upstream mode has no OpenCL form
+**Open** (2026-10-17). The lever fired and its timing is CONFIRMED; the image
+gate then caught, and the fix removed, a port defect (the OpenCL kernel's `dst`
+byte offsets); the q8_0 and f16 gates now PASS and the red case FAILs. The fused
+`GGML_OP_ROPE_APPLY` that sd.cpp uses in non-upstream mode had no OpenCL form
 in the reference fork.
 
 ## Charter
@@ -89,13 +90,15 @@ swapped half in the rotation kernel must turn the step curve red).
 
 ## Current state (2026-10-17, `measured-here`)
 
-The lever fired. The op is ported as **`0057-opencl-intel-rope-apply-fused.patch`**
-(9 files: `ggml.h`, `ggml.c`, the CPU forward, `ggml-opencl.cpp`, the new
-`kernels/rope_apply_f32.cl`, the OpenCL CMake list), closed with the sd.cpp
-integration patch **`contrib/sdcpp/upstream-rope-apply.patch`** (removes the
+The lever fired and its **timing is CONFIRMED**; the campaign's numeric gate
+then caught a defect in the port, now fixed. The op is
+**`0057-opencl-intel-rope-apply-fused.patch`** (9 files: `ggml.h`, `ggml.c`, the
+CPU forward, `ggml-opencl.cpp`, the new `kernels/rope_apply_f32.cl`, the OpenCL
+CMake list), with the sd.cpp integration patch
+**`contrib/sdcpp/upstream-rope-apply.patch`** (removes the
 `SD_USE_UPSTREAM_GGML` guard around `rope.hpp:1075`; `build-sdcpp.sh` applies it
-idempotently). Applied in the dev host's sd.cpp workbench (llama.cpp at the pin with the 54-patch series, and sd.cpp at f0aac52);
-both rebuilds green; the released build is `57d888dd`.
+idempotently). Applied in the dev host's sd.cpp workbench (the patched llama.cpp
+tree at the pin with the series, and the sd.cpp tree); both rebuilds green.
 
 **B60, f16, 512², 8 steps, same prompt/seed (the A/B in one window, agent
 off, the production units restored after):**
@@ -105,23 +108,60 @@ off, the production units restored after):**
 | generic (`0056`, f16) | 1.32 s/step (0.758 it/s) | — | 22.42 s | 51.2 s |
 | fused (`0057`, f16) | **0.62 s/step (1.61 it/s)** | — | 22.17 s | **45.03 s** |
 
-The step is **2.1× faster**; the ~5.2 s the generic RoPE spent a run is gone
-(`repeat_f32`+`mul` were 37 % of device, `code`-predicted). The OpenCL kernel
-compiled at first use without aborting the run — `#pragma OPENCL FP_CONTRACT
-OFF` was accepted by the IGC. Peak VRAM f16 19895 MiB, unchanged memory
-profile.
+That **0.62 s** reading was taken with the defective kernel (below): the timing
+saving is real, the image was not. The ~5.2 s the generic RoPE spent a run is
+gone (`repeat_f32`+`mul` were 37 % of device, `code`-predicted). The OpenCL
+kernel compiled at first use — `#pragma OPENCL FP_CONTRACT OFF` was accepted by
+the IGC. Peak VRAM f16 19895 MiB, unchanged memory profile.
 
-**Verdict: CONFIRMED.** Still open: the red case (a swapped half / wrong sign)
-and the **numeric image gate** (q8_0 0057 vs the CPU reference, and vs the
-series-OFF baseline) — the f16 leg's image is visually correct but the
-per-step cosine/PSNR compare has not run yet. Also not separately measured:
-how much of the gain is fewer launches vs less bandwidth (the op removes 2,112
-launches a run).
+**The port's defect, found by the gate and fixed (`measured-here`,
+2026-10-17).** The OpenCL kernel offset its output rows by `row*ne0` and its
+elements by `i0`/`i1` added to a `global char * dst`: on a char pointer those
+are **byte** offsets, so every write landed at a quarter of the intended
+address and most `dst` cells were never written. The fork's CUDA kernel offsets
+a `float * out` by `row*half_dim*2`, element arithmetic (`code`,
+`ggml-cuda/rope.cu:12-70`); the port lost the `*sizeof(float)`. The first q8_0
+gate arm and the committed f16 leg produced an **all-white image** (cosine
+0.000000, PSNR ~9 dB) — the "visually correct" line above was never measured
+and was wrong. Two arms localised it: the fused **CPU** path was right (256²/4
+CPU A/B against the generic CPU reference, cosine worst 0.999979, PSNR
+45.18 dB), and a standalone CPU-vs-OpenCL op harness differed by up to 4.7e34
+on 1,023 of 1,024 cells. Fixed by adding `*sizeof(float)`; the patch
+regenerated from the worktree base..HEAD and byte-matched the stored file.
 
-**Remaining plan:** the red case, the q8_0 gate A/B, and the `test-backend-ops`
-cases (they need a llama.cpp test build besides sd.cpp's ggml-only build). The
-second lever in the recon — flattening the elementwise dispatch
-(`global={ne1*64, ne2, ne3}` for `ne0=2`, 125.8M workgroups) — is untouched.
+**Green, fixed kernel (`measured-here`, one window, same prompt/seed):**
+
+| arm | steady step | first step | gate vs the 512² CPU reference |
+|---|---|---|---|
+| q8_0, 512²/8 | **3.14 s** | 23.45 s | PASS: cos worst **0.999986**, MSE 1.434, PSNR 45.78 dB, SSIM 0.999814 |
+| f16, 512²/8 | **0.649 s (1.54 it/s)** | 20.66 s | PASS: cos worst **0.999987**, MSE 1.276, PSNR 46.87 dB, SSIM 0.999855 |
+
+The fixed f16 step is 0.649 s (from the generic 1.32, ~2.0x), a different
+window from the 0.62 reading.
+
+**Red case (`measured-here`).** A deliberately swapped cos/sin in the
+interleaved branch turns the q8_0 gate curve red: cos worst **0.890391**, MSE
+10,553, PSNR **9.70 dB**, SSIM 0.072 -> FAIL. Restoring the green kernel
+rebuilds the same binary sha and the arm PASSes again. The port's own defect
+above is red-first evidence of the same kind.
+
+**Device time (`measured-here`, profiling build, fixed kernel, 512²).** Full
+8-step run: f16 **8,714 ms** (14,053 before 0057); the fused `rope_apply_f32`
+**70 ms a run (9 ms a DiT step)** against the generic `repeat_f32`+`mul`'s
+5,242 ms (37 % of 14,053). q8_0 **28,678 ms**: the generic q8_0 GEMM 23,196 ms
+(**80.9 %**) and the VAE conv (`mul_mat_f16_f16`+`im2col_f16`) 3,082 ms
+(10.7 %); on the f16 run the VAE conv is 35.4 % and the XMX f16 GEMM 36.9 %.
+
+**Verdict: the timing lever CONFIRMED** (the generic RoPE's 5,172 ms a run is
+gone; step 1.32 -> 0.649, ~2.0x; q8_0 3.69 -> 3.14); **correctness now gated and
+green** (both arms PASS, the red case FAILs). Not separately measured: how much
+of the gain is fewer launches vs less bandwidth (the op removes 2,112 launches
+a run).
+
+**Remaining:** the `test-backend-ops` cases (they need a llama.cpp full test
+build besides sd.cpp's ggml-only build), and the second lever in the recon —
+flattening the elementwise dispatch (`global={ne1*64, ne2, ne3}` for `ne0=2`,
+125.8M workgroups).
 
 ## Where it lives
 

@@ -3601,3 +3601,44 @@ product has no SIMD form.
   `test-opencl-miss-cpu` checks split rows against the GGUF bytes; its red
   mode, and `GGML_OPENCL_CPU_MISS_SPLIT_RED=1` served (a fault at the first
   request), read the split as blocks.
+
+## 0057-opencl-intel-rope-apply-fused.patch
+
+The fork's `GGML_OP_ROPE_APPLY` (`code`, `leejet/ggml` `e05d18a1`,
+`ggml.h:1877`, `ggml.c:4381`): a precomputed `pe` (`[2,2,d/2,tokens]`,
+`[[cos,-sin],[sin,cos]]`) rotated against `a` (`F32 [d,heads,tokens,batch]`) in
+one pass, returning contiguous `F32 [d,tokens,heads*batch]`. Ported: the op
+definition (`ggml.h`, `ggml.c`), the CPU forward, the OpenCL kernel
+(`kernels/rope_apply_f32.cl`) and its `supports_op`/dispatch, and one
+`ggml-opencl` CMake entry. sd.cpp's `rope.hpp:1075` guard is lifted by
+`contrib/sdcpp/upstream-rope-apply.patch` (upstream mode otherwise takes the
+generic `repeat_f32`+`mul` path). The OpenCL kernel is an original port with
+the fork's CPU/CUDA pair arithmetic.
+
+**Served** (`measured-here`, B60, 512²/8, seed 42, Euler, upstream-mode sd.cpp):
+the generic RoPE was 37 % of device (`repeat_f32` 3,054 + `mul` 2,188 ms of
+14,053); the fused op is **70 ms a run (9 ms a DiT step)**, the f16 step
+**1.32 -> 0.649 s** (~2.0x) against the generic `0056` arm, the q8_0 step
+3.69 -> 3.14 s. The kernel compiles at first use with
+`#pragma OPENCL FP_CONTRACT OFF` (the IGC accepts it).
+
+**The port's defect and its fix** (`measured-here`, 2026-10-17, found by the
+image gate): the kernel added `row*ne0` and `i0`/`i1` to a `global char * dst`
+-- byte offsets on a char pointer -- so every write landed at a quarter of the
+intended address and most cells were never written. The q8_0 gate arm and the
+committed f16 leg produced an all-white image (cosine 0.000000, PSNR ~9 dB);
+the fused **CPU** path was right (a 256²/4 CPU A/B, cosine worst 0.999979,
+PSNR 45.18 dB) and a CPU-vs-OpenCL op harness differed by up to 4.7e34 on 1,023
+of 1,024 cells. The fork's CUDA kernel offsets a `float * out` by
+`row*half_dim*2` (`code`, `rope.cu:12-70`), element arithmetic; the port lost
+the `*sizeof(float)`. Fixed, the harness is exact and both gates PASS: q8_0
+cos worst 0.999986 / MSE 1.434 / PSNR 45.78 dB / SSIM 0.999814; f16 0.999987 /
+1.276 / 46.87 / 0.999855.
+
+**Red case** (`measured-here`, the image gate, 512²/8 q8_0): a swapped cos/sin
+in the interleaved branch FAILs -- cos worst 0.890391, PSNR 9.70 dB, SSIM
+0.072. Restoring the kernel rebuilds the same sha and the arm PASSes again.
+The port's own defect above is red-first evidence of the same kind.
+
+**Op suites:** not yet added (`test-backend-ops` needs a llama.cpp full build
+besides sd.cpp's ggml-only build).

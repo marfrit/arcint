@@ -296,26 +296,61 @@ faster than Vulkan (1.78). All weights on VRAM (te 7.67 + DiT 11.75 GB as f16 =
 (`kernel_mul_mm_f16w_f16`) is 22.8 % of device time: **31 % of the 98.3 TFLOP
 FP16 peak** (the generic q8_0 kernel was ~4 TFLOP).
 
-**The fused RoPE (`0057`), f16, same window, 512²/8 steps:** steady step
-**0.62 s** (1.61 it/s) against the generic **1.32** -- **2.1x**; sampling total
-45.03 s against 51.2. The op (`GGML_OP_ROPE_APPLY`) is ported to arcint's tree
-with an original OpenCL kernel as
+**The fused RoPE (`0057`), f16, same window, 512²/8 steps:** a steady step of
+**0.62 s** (1.61 it/s) against the generic **1.32** (2.1x), sampling total
+45.03 s against 51.2 -- taken with a kernel that turned out to have a defect
+(below): the fused op removed the generic RoPE and saved the time, but the
+image was **all-white** and the gate is what caught it. The op
+(`GGML_OP_ROPE_APPLY`) is ported to arcint's tree with an original OpenCL
+kernel as
 `contrib/llama.cpp/patches/0057-opencl-intel-rope-apply-fused.patch` (9 files),
 the sd.cpp upstream-mode guard is lifted by
 `contrib/sdcpp/upstream-rope-apply.patch` (applied by `build-sdcpp.sh`), and
-both builds rebuilt green. `measured-here`; **CONFIRMED** in the campaign
-`docs/campaigns/imggen-rope-apply-opencl.md`. The numeric image gate against
-the q8_0 CPU reference is still pending.
+both builds rebuilt green.
 
-**Where the remaining device time is** (f16 profile *before* 0057, 512²,
-14,053 ms total):
+**The defect and the fix (`measured-here`, 2026-10-17).** The ported OpenCL
+kernel offset its output rows by `row*ne0` and its elements by `i0`/`i1` added
+to a `global char * dst`: on a char pointer those are **byte** offsets, so
+every write landed at a quarter of the intended address and most `dst` cells
+were never written. The fork's CUDA kernel offsets a `float * out` by
+`row*half_dim*2`, element arithmetic (`code`, `ggml-cuda/rope.cu:12-70`); the
+port lost the `*sizeof(float)`. Two arms localised it: the fused **CPU** path
+was right (256²/4 CPU A/B against the generic CPU reference, cosine worst
+0.999979, PSNR 45.18 dB) and a standalone CPU-vs-OpenCL op harness differed by
+up to 4.7e34 on 1,023 of 1,024 cells. Fixed by adding `*sizeof(float)`; then,
+same window: the **q8_0** arm PASSes (step **3.14 s**, cos worst **0.999986**,
+MSE 1.434, PSNR 45.78 dB, SSIM 0.999814), the **f16** arm PASSes (step
+**0.649 s**, 1.54 it/s, cos worst **0.999987**, MSE 1.276, PSNR 46.87 dB,
+SSIM 0.999855). The deliberate **red case** (cos/sin swapped) FAILs the q8_0
+gate curve: cos worst **0.890391**, PSNR 9.70 dB, SSIM 0.072. `measured-here`;
+the timing is **CONFIRMED** in the campaign
+`docs/campaigns/imggen-rope-apply-opencl.md`, which now also carries the
+defect and the red case.
 
-| kernel | share | what it is |
+**Where the remaining device time is** (`measured-here`, profiling build,
+the **fixed** 0057, 512²; the full 8-step run and the DiT-only per-step mix
+from subtracting a 1-step run):
+
+f16, full 8-step run, device total **8,714 ms** (was 14,053 before 0057):
+
+| kernel | ms | share | what it is |
+|---|---|---|---|
+| `kernel_mul_mm_f16w_f16` | 3,213 | 36.9 % | the XMX f16 GEMM (58.9 % of the DiT-only per-step mix) |
+| `mul_mat_f16_f16` + `im2col_f16` | 1,988 + 1,095 | **35.4 %** | the **VAE decode conv** via im2col + mul-mat |
+| `kernel_mul_mm_f32_f32_l4_lm` | 895 | 10.3 % | upstream's generic f32 GEMM |
+| group_norm / scale / soft_max / rms / rope_apply | 311 / 227 / 178 / 151 / 70 | 3.6 / 2.6 / 2.0 / 1.7 / 0.8 % | |
+
+The old `repeat_f32`+`mul` RoPE (5,242 ms, 37 % of 14,053) is **gone**; the
+fused `rope_apply_f32` is **70 ms a run (9 ms a DiT step)**.
+
+q8_0, full 8-step run, device total **28,678 ms** (step 3.14 s):
+
+| kernel | ms | share |
 |---|---|---|
-| `repeat_f32` + `mul` | 21.7 + 15.6 = **37 %** | the **generic RoPE** -- **removed by 0057** |
-| `im2col_f16` + `mul_mat_f16_f16` | 22 % | the **VAE decode conv** via im2col + mul-mat f16 |
-| `kernel_mul_mm_f16w_f16` | 22.8 % | the XMX f16 GEMM |
-| misc (group_norm, scale, soft_max, ...) | ~18 % | |
+| `kernel_mul_mm_q8_0_f32_l4_lm` | 23,196 | **80.9 %** |
+| `mul_mat_f16_f16` + `im2col_f16` | 3,082 | 10.7 % |
+| `kernel_mul_mm_f32_f32_l4_lm` | 901 | 3.1 % |
+| rest | ~1,500 | ~5 % |
 
 **Root cause of the 37 %.** Upstream mode defines `SD_USE_UPSTREAM_GGML`, so
 sd.cpp's `apply_rope` takes the generic path (`rope.hpp:1075`, lines
@@ -330,12 +365,15 @@ rope.cl`), so the upstream-mode OpenCL build cannot call it.
 stayed at 68 % and the step at 3.81 s. A dead end, as the recorded expectation
 said.
 
-**Next implementation by measured share:** with the RoPE gone the two
-remaining device shares are (1) the VAE decode conv (**22 %**) off im2col +
-mul-mat, and (2) the XMX GEMM (**22.8 %**) from 31 % toward 70 % of the peak --
-the `kernel_mul_mm_f16w_f16` share also rises once the 37 % is gone (the f16
-device total is not yet re-profiled at 0057). The bar `§Performance target`
-and the campaign `docs/campaigns/imggen-q8_0-xmx-gemm.md` hold the target.
+**Next implementation by measured share** (fixed 0057): with the RoPE gone the
+shares are (1) the q8_0 generic GEMM at **80.9 % of the q8_0 run** -- the
+campaign `docs/campaigns/imggen-q8_0-xmx-gemm.md` (the durable service form);
+(2) the VAE decode conv at **35.4 % of the f16 run** (1,095 im2col + 1,988
+mul_mat a run) off im2col + mul-mat -- a third campaign, the biggest single
+non-GEMM share; (3) the f16 XMX GEMM (36.9 % of the f16 run, 58.9 % of the
+DiT-only per-step mix) from 31 % toward 70 % of the peak. The elementwise
+dispatch flatten (the recon's second lever) is untouched. The bar
+`§Performance target` holds.
 
 ## Phases
 
