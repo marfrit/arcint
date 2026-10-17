@@ -9,6 +9,10 @@ material: the per-op device time of a card leg (`docs/milestone-1.1.0.md` B1,
 
     imggen_profile.py cl_profiling.csv [--top 30] [--sort op|kernel] [--min-ms 1]
 
+The csv's first column is the **output tensor's name** (often `node_NNN` or
+`(view)`), so rank by `kernel` -- that is the useful key (B1's "per op" reads
+the kernel that ran).
+
 The kernel launches are in execution order, so two files -- a 1-step and an
 8-step run of the same configuration -- bracket the first step's extra work
 (kernel compilation and graph warm-up) by subtraction.
@@ -57,7 +61,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("csvs", nargs="+", help="one or more cl_profiling.csv dumps")
     ap.add_argument("--top", type=int, default=30)
-    ap.add_argument("--sort", choices=["op", "kernel"], default="op")
+    ap.add_argument("--sort", choices=["op", "kernel"], default="kernel")
     ap.add_argument("--min-ms", type=float, default=0.0,
                     help="drop entries below this device time")
     a = ap.parse_args()

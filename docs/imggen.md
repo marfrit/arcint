@@ -118,6 +118,49 @@ Next card cells: 1024²/8 steps (A2), a `GGML_OPENCL_PROFILING` per-op profile
 (B1), the same file/seed/steps on sd.cpp Vulkan (B3), and the red-first gate
 (Phase 1).
 
+### Phase 0 — second window (`measured-here`, 2026-10-17)
+
+One B60 window, the agent unit stopped and restored; the SOP sampler peaked at
+`drm-resident-vram0` **12,765 MiB**.
+
+**A2, 1024²/8 steps (GPUOpenCL).** 10,509 MB of params all on VRAM (text
+encoder 4,076, diffusion 6,273, VAE 160); the DiT ran one segment with a
+2,380 MB compute buffer, and the VAE the tiled decode (49 tiles). First step
+36.48 s, then **15.78 s a step**, `generate_image` **194.77 s**. No CPU island;
+the 24 GB card held it, so **A2 met**.
+
+**B1, the per-op profile (the `GGML_OPENCL_PROFILING` build, 512²).** Device
+total 34,025 ms over the 8-step run; a 1-step run's 7,395 ms is the first step
+separate. Ranked by kernel (the csv's first column is the output tensor, so the
+kernel is the key):
+
+| kernel | device ms | share | launches |
+|---|---|---|---|
+| `kernel_mul_mm_q8_0_f32_l4_lm` | 23,195.9 | **68.17 %** | 1,360 |
+| `kernel_repeat_f32` | 3,052.6 | 8.97 % | 1,096 |
+| `kernel_mul` | 2,187.9 | 6.43 % | 1,153 |
+| `kernel_mul_mat_f16_f16` | 1,991.3 | 5.85 % | 39 |
+| `kernel_im2col_f16` | 1,094.1 | 3.22 % | 39 |
+| `kernel_mul_mm_f32_f32_l4_lm` | 901.0 | 2.65 % | 629 |
+| `kernel_group_norm` | 310.5 | 0.91 % | 30 |
+| `flash_attn_f32_f16` | 7.1 | **0.02 %** | 6 |
+
+**The Phase-2 lever this names:** 68 % of device time is
+`kernel_mul_mm_q8_0_f32_l4_lm`, upstream's **generic** q8_0 GEMM -- the §0.3 gap
+("Q8_0 has no XMX path"). The DiT attention is 0.02 % and ran upstream's
+`flash_attn_f32_f16`, **not** arcint's `flash_attn_f32_f16_dpas` (the DPAS path
+was not selected for these shapes). The VAE's conv (im2col + f16 mul_mat) and
+GroupNorm are ~5 %. So Phase 2 starts at a **q8_0 XMX GEMM**, and the
+non-causal-attention tile search is not the first lever.
+
+**B3, sd.cpp Vulkan on the same B60 (`Vulkan1`, BMG G21), same file, seed and
+steps, 512²/8 steps.** First step 22.87 s, then **1.78 s a step** against
+OpenCL's 3.69; `generate_image` **49.52 s** against 65.13; all VRAM, one
+segment. The gate against the CPU reference: cosine worst 0.999984, PSNR
+45.08 dB, SSIM 0.999781 -- correct, and **~2.1x faster per step than the OpenCL
+path**. Closing that gap is B3's work, and the q8_0 GEMM is its likely lever
+(upstream's Vulkan q8_0 dequant GEMM runs faster than the OpenCL Adreno one).
+
 ## Staged models (Phase 0/1)
 
 On the node that runs the legs, not in the repository (measured-here,
