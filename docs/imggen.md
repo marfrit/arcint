@@ -107,9 +107,11 @@ still need the same check.
 3.69 s/step at 512² (1,024 image tokens) sits inside the sd.cpp-Vulkan web
 band (RX 470 7 s/it at 512², RTX 2070 1.19 s/it) but is `measured-here`, not
 comparable across engines. At 1024² the GEMMs quadruple and attention grows
-quadratically; the 8-step 512² run is the warm-up of the cell, and **B1's
-per-op profile is still open** -- no OpenCL Intercept layer on the host, so
-that needs a `GGML_OPENCL_PROFILING` build or the intercept shim. The 12,185
+quadratically. **B1's profile** is served by a `GGML_OPENCL_PROFILING` build
+(there is no OpenCL Intercept layer on the host): the backend dumps
+`cl_profiling.csv` (op, kernel, device ms) and `cl_trace.json` in its cwd at
+free, read by `tools/imggen_profile.py`. The profiling leg is the next card
+cell. The 12,185
 MiB peak leaves a 24 GB card ~11 GiB for the 1024² activations.
 
 Next card cells: 1024²/8 steps (A2), a `GGML_OPENCL_PROFILING` per-op profile
