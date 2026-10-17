@@ -70,7 +70,46 @@ Planned cells and flags (operator fills the numbers):
 Models (staged to the node that runs the legs, not into the repository): the
 Z-Image-Turbo diffusion GGUF, the FLUX `ae.sft` AutoEncoderKL (Z-Image uses
 it), and the Qwen3-4B-Instruct-2507 text encoder. No 3D-convolution VAE yet;
-that is Qwen-Image's, Phase 4.
+that is Qwen-Image's, Phase 4. The staged files and their hashes are below.
+
+## Staged models (Phase 0/1)
+
+On the node that runs the legs, not in the repository (measured-here,
+2026-10-17). One file set for both arms, so only the backend differs:
+
+| file | source | sha256 | size |
+|---|---|---|---|
+| Z-Image-Turbo diffusion | `leejet/Z-Image-Turbo-GGUF`, `Q8_0` | `df1c5baa…9a1` | 6.58 GB |
+| text encoder | `unsloth/Qwen3-4B-Instruct-2507-GGUF`, `Q8_0` | `391c1e41…068` | 4.28 GB |
+| VAE | `Comfy-Org/z_image_turbo`, `split_files/vae/ae.safetensors` | `afc8e282…e38` | 0.34 GB |
+
+`Q8_0` on both arms isolates the backend, not the quantisation. The gated
+`black-forest-labs/FLUX.1-schnell` `ae.safetensors` is the same VAE and needs
+a token; the Comfy-Org mirror is ungated.
+
+## Gate instrument (Phase 1, first form)
+
+`tools/imggen_gate.py`, stdlib only (the card host has no numpy, PIL or
+ffmpeg). Two subcommands: `run` drives sd-cli with the fixed flags and
+writes `final.png`, `prev_%03d.png` and `arm.json`; `compare` reads two arms
+and prints the per-step cosine and MSE and the final PSNR and a global SSIM,
+then PASS/FAIL against the tolerances.
+
+The per-step figure is a **latent proxy**: sd.cpp's `PREVIEW_PROJ` is the
+latent projected to RGB, the closest the CLI comes to the latent itself
+(`code`, `diffusion_engine.cpp:2145`). Raw F32 latents need a driver that
+hooks `sd_set_backend_eval_callback` or an sd.cpp change; the sampler's
+latents live in C++ between steps, so the graph-eval tensors are the denoiser
+output, not the state. The proxy is enough to move red-first; the raw hook is
+the next step if the operator wants the logits-equivalent figure.
+
+**Measured-here** (2026-10-17): the CPU reference arm at 256x256, 4 steps,
+seed 42, `--cfg-scale 1.0`, euler, runs in 70 s (first step 28-30 s, 8.1 s
+per step after; 2 x 6.0e9 x 256 MACs a step) and the tool's self-check
+(reference against itself) reads cosine 1.000000 and PSNR inf every step.
+The tolerances are placeholders: `TOL_COS=0.001`, `TOL_MSE=0.05`,
+`PSNR_TOL=1.0 dB`, `SSIM_TOL=0.01`, printed with every verdict, the
+operator's to set (charter D6).
 
 ## Phases
 
