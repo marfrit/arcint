@@ -402,7 +402,88 @@ faster and equivalent here. Campaign: `docs/campaigns/imggen-vae-conv.md`.
 f16, 512²/8, seed 42) produced two images: one PASSes the CPU gate (cos worst
 **0.999987**, PSNR 46.87 dB) and one FAILs (cos worst **0.991745**, PSNR
 **21.43 dB**), while the **wall step is 0.649 s in both** -- a numeric
-difference the denoiser amplifies, not a speed one. The profiling csvs also
+difference the denoiser amplifies, not a speed one.
+
+**The fresh-cache recheck did not reproduce it** (`measured-here`, 2026-10-17
+night, 512²/8, f16, seed 42): a pair in a fresh
+`GGML_OPENCL_KERNEL_CACHE_DIR` (`cache1-a`, `cache1-b`), a fresh-cache-disabled
+run (`cache2-off`), two global-cache runs (`global-a`, `global-b`), `bu-auto-g512`
+and `build-prof`'s `prof-auto-g512`, and the VAE arms `prof-conv-on512` -- **eight
+processes, all PASS** the `refcpu512` gate with the identical figures (cos worst
+0.999987, PSNR 46.87 dB) and the identical `mul_mm_f16w_f16` launch count
+**1613**. The only FAIL on the record, `prof-plain512`, ran **3665** launches of
+that kernel; the doubled path was not seen in any fresh process. So the
+per-process variant is not driven by the disk program cache, by `build-up` vs
+`build-prof`, or by the VAE conv -- but it is **not settled**: the mechanism of
+the doubled path is still unnamed.
+
+**Phase 3 opens a second, systematic variant** (`measured-here`, 2026-10-18,
+**open defect**). At 1024²/8/seed 42 the defect changes shape:
+
+- every `sd-cli` OpenCL arm tonight -- f16-DiT (`--tensor-type-rules
+  ^model\.=f16`), full f16 (`--type f16`), q8_0, and both `--flash-attn on` and
+  `--flash-attn off` -- **clusters together** (pairwise cos >= 0.9998, PSNR >=
+  38.55) and diverges from the CPU reference from step 1 on (step 0 cos
+  0.99988, step 1 cos 0.9889, worst cos **0.9867**, worst MSE ~710, final
+  **cos 0.990867, PSNR 21.36 dB** -- the same magnitude as the 512 FAIL), while
+  the wall step is 2.21 s for flash-on and 4.41 s for the genuine flash-off;
+- the **served image** (`sd-server`, the Phase-3 unit, same files/flags/seed,
+  request 1024²) is **identical across two separate server processes**
+  (served1 == served3, PSNR inf) and **differs from the whole CLI cluster**
+  (cos 0.9136, PSNR 9.26 dB, SSIM -0.114), and sits **further** from the CPU
+  reference (cos 0.9156, PSNR **9.30 dB**, SSIM -0.129) than the CLI cluster
+  does. `sd-server --log-level verbose` and `sd-cli --log-level verbose`
+  build the **same effective gen params** (txt_cfg 1.00, euler, 8 steps, seed
+  42, discrete scheduler, eta/flow_shift default), so the split is in the
+  process/graph state, not in the request. The server at 512² is correct
+  (cos 0.999975 vs `refcpu512`, PSNR 44.77, and cos 0.999997 vs
+  `bu-auto-g512`), so the split is resolution/token-count dependent.
+  The server also logged the `flash_attn_dpas2` tile selection and the
+  **lazy-compiled flash_attn prepass** (`DK=128 DV=128`) during its first
+  1024 request -- the suspect the campaign already names -- while one CLI
+  arm with the same flags (`fa-on1024`) logged it and another (`fa-off1024`)
+  did not, yet the two CLI images agree to cos 0.999826. `--flash-attn`
+  is therefore **not** the separator, and the printed `flash_attn_dpas2`
+  line does not track the assignment.
+
+**A service that renders a different image than its own CLI is not done.**
+The Phase-3 acceptance cannot be recorded as a PASS while this defect is open;
+Phase 3 and the defect now share one critical path. The next experiment (see
+`docs/campaigns/imggen-attention-path.md`): pin the RoPE path (the 0057 fused
+`rope_apply_f32` was gated at 512 only, and its 4096-token grid is untested),
+then re-run both binaries at 1024² against the CPU reference.
+
+**Phase-3 memory/speed measurements** (`measured-here`, 2026-10-18, B60, Z-Image
+Turbo Q8_0 + Qwen3-4B Q8_0 + `ae.safetensors`, 1024²/8/seed 42, pinned
+`--flash-attn off,diffusion=on --conv-direct auto,vae=on`, `--auto-fit off`,
+`build-up` sha 1e7e548e2f750c08):
+
+| arm | steady step | first step | peak `drm-resident-vram0` | outcome |
+|---|---|---|---|---|
+| q8_0 (no rule) | 10.96 s | 31.94 | 13,278 MiB | fits |
+| full f16 (`--type f16`) | 2.21 s | 22.71 | **22,340 MiB** | fits, thin (~2.1 GiB margin) |
+| DiT f16 (`^model\.=f16`, te Q8_0) | 2.21 s | 22.71 | **18,834 MiB** | fits, ~5.6 GiB margin -- adopted |
+| genuine `--flash-attn off` | 4.41 s | 22.9 | (not sampled) | not adopted |
+
+The tensor-rule namespace matters: `^layers\.` (the Z-Image GGUF's raw prefix)
+**does not match** -- the diffusion model is loaded under `model.diffusion_model.`,
+so `^layers\.=f16` silently left the DiT at q8_0 (10.96 s a step, 13,278 MiB,
+q8_0's figures). The working rule is `^model\.=f16`. Consequence: the service
+form is **DiT f16 + te Q8_0**, same step time as full f16 and 3.5 GiB less VRAM.
+
+**The service** (Phase 3, D2(a), D3 B60 on demand): `arcint-imggen` unit,
+`sd-server`, port 8085, `/v1/images/generations`, start stops `arcint-agent`
+(`Conflicts=`), flags as above. Over HTTP, 1024²/8/seed 42, prompt
+"a red cube on a white table, centered": **first request 61.06 s** (lazy
+kernel build + weights load), **steady request 24.08 s**; 512² steady 5.94 s
+and correct against `refcpu512`. The unit's `/v1/models` returns
+`sd-cpp-local`; sd-server has **no** `/health` or `/props` route (charter A4),
+`/sdcpp/v1/capabilities` is the closest defaults dump.
+
+**CPU reference at 1024²** (`measured-here`, 2026-10-18, `sd-cli` CPU, same
+file/seed/steps, `--flash-attn off`, 16 threads): first step 169.74 s, then
+149-164 s a step (the CPU reference is card-free but ~24 min an image). Its
+final is at the centre of the split above. The profiling csvs also
 differ (the failing arms' DiT kernels ~2.4x the launch counts,
 `mul_mm_f16w_f16` 3665 against 1613) at the same wall; that difference is
 unexplained and may be a profiling artifact. `flash attention auto: OpenCL ->
