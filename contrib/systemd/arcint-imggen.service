@@ -1,0 +1,51 @@
+# arcint-imggen — text-to-image (Z-Image Turbo, Qwen3-4B text encoder) on the
+# 24 GB card, on demand: sd.cpp's sd-server from the arcint-imggen package,
+# built against arcint's patched ggml tree (docs/imggen.md).
+#
+# Starting it stops the B60's language units (same card, Conflicts=).
+# OpenAI /v1/images/generations (data[0].b64_json), /health, /props; a seed
+# per request through the prompt suffix
+# <sd_cpp_extra_args>{"seed":N}</sd_cpp_extra_args>.
+#
+# The flags (docs/imggen.md, "The service"):
+# - the DiT stays q8_0: 0058's XMX GEMM runs it at the f16 route's step time
+#   in less memory;
+# - --flash-attn off,diffusion=on: the DPAS attention for the DiT only;
+# - --conv-direct auto: with contrib/sdcpp/conv-direct-probe-opencl.patch the
+#   probe times the direct conv on OpenCL and picks it for the VAE;
+# - the OpenCL program cache in the unit's cache directory, so a restart
+#   after the idle stop does not recompile the kernels.
+
+[Unit]
+Description=arcint-imggen — Z-Image Turbo via sd-server, GPU.0 (Arc Pro B60), :8085, on demand
+Documentation=https://github.com/marfrit/arcint
+After=default.target
+Conflicts=arcint-agent.service arcint-writer.service arcint-flashnext.service arcint-agent-lanes.service
+
+[Service]
+Type=simple
+CacheDirectory=arcint-imggen
+Environment=GGML_OPENCL_KERNEL_CACHE_DIR=%C/arcint-imggen/cl-cache
+ExecStart=/usr/bin/arcint-sd-server \
+    --diffusion-model /models/imggen/z_image_turbo-Q8_0.gguf \
+    --llm /models/imggen/Qwen3-4B-Instruct-2507-Q8_0.gguf \
+    --vae /models/imggen/ae.safetensors \
+    --backend GPUOpenCL \
+    --auto-fit off \
+    --flash-attn off,diffusion=on \
+    --conv-direct auto \
+    --width 1024 --height 1024 \
+    --steps 8 --seed 42 --cfg-scale 1.0 --sampling-method euler \
+    --listen-ip 0.0.0.0 --listen-port 8085
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=20min
+TimeoutStopSec=60s
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectHome=read-only
+
+[Install]
+WantedBy=default.target

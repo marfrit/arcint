@@ -1,0 +1,16 @@
+diff --git a/src/core/probe/conv_direct.cpp b/src/core/probe/conv_direct.cpp
+index 7f4666a..24c96c3 100644
+--- a/src/core/probe/conv_direct.cpp
++++ b/src/core/probe/conv_direct.cpp
+@@ -64,7 +64,10 @@ bool sd_probe_conv_direct(ggml_backend_t backend, bool conv3d) {
+             LOG_INFO("conv%dd direct auto: %s -> off (unsupported probe graph)", dims, name);
+             return false;
+         }
+-        if (sd_backend_is(backend, "Vulkan")) {
++        // arcint (contrib/sdcpp/conv-direct-probe-opencl.patch): OpenCL has no
++        // implicit GEMM either, but its direct CONV_2D kernel can still be the
++        // faster form, so it is timed like Vulkan rather than assumed off.
++        if (sd_backend_is(backend, "Vulkan") || sd_backend_is(backend, "OpenCL")) {
+             std::vector<BackendProbeCase> cases;
+             for (const auto& shape : {std::pair<int, int>{32, 64}, {16, 128}}) {
+                 BackendProbeCase test;

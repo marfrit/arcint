@@ -1,3 +1,20 @@
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index 482bd3666..ecf0a3a6d 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -8,10 +8,10 @@ extern "C" {
+ 
+ #define RPC_PROTO_MAJOR_VERSION    8
+ #define RPC_PROTO_MINOR_VERSION    0
+-#define RPC_PROTO_PATCH_VERSION    0
++#define RPC_PROTO_PATCH_VERSION    1
+ 
+ #ifdef  __cplusplus
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+ #endif
+ 
+ #define GGML_RPC_MAX_SERVERS       16
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index c37ba9471..62ac3e847 100644
 --- a/ggml/include/ggml.h
@@ -143,7 +160,7 @@ index 531a37f7f..30f98fd8f 100644
      set_rows
      sigmoid
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 37d747293..b57150274 100644
+index 37d747293..12f730178 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -886,6 +886,7 @@ struct ggml_backend_opencl_context {
@@ -184,17 +201,18 @@ index 37d747293..b57150274 100644
      // scale
      {
  #ifdef GGML_OPENCL_EMBED_KERNELS
-@@ -10990,6 +11007,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -10990,6 +11007,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
              return true;
          case GGML_OP_DIAG_MASK_INF:
              return op->ne[3] == 1;
 +        case GGML_OP_ROPE_APPLY:
 +            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-+                   op->type == GGML_TYPE_F32 && op->src[0]->ne[0] % 2 == 0 && ggml_is_contiguous(op);
++                   op->type == GGML_TYPE_F32 && op->src[0]->ne[0] % 2 == 0 && ggml_is_contiguous(op) &&
++                   ggml_nelements(op->src[0]) / 2 <= INT_MAX;   // the kernel indexes pairs in int
          case GGML_OP_ROPE: {
              const int mode = ((const int32_t *) op->op_params)[2];
              const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
-@@ -33552,6 +33572,75 @@ static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, c
+@@ -33552,6 +33573,75 @@ static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, c
      backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
  }
  
@@ -270,7 +288,7 @@ index 37d747293..b57150274 100644
  static void ggml_cl_rope(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -34912,6 +35001,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+@@ -34912,6 +35002,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
              }
              func = ggml_cl_soft_max;
              break;
@@ -417,3 +435,179 @@ index 01dc8d05c..597b59393 100644
  // ggml_rope
  
  static struct ggml_tensor * ggml_rope_impl(
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 4fedb4479..64c35a962 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -6556,6 +6556,148 @@ struct test_rope : public test_case {
+     }
+ };
+ 
++// GGML_OP_ROPE_APPLY (patch 0057, the sd.cpp fork's precomputed-RoPE op)
++//
++// a: F32 [d, heads, tokens, batch], pe: F32 [2, 2, d/2, tokens] holding
++// [[cos, -sin], [sin, cos]] per pair and token; out: contiguous F32
++// [d, tokens, heads*batch]. v selects the form of a:
++//   0: contiguous (Z-Image with qk_norm: the norm's output);
++//   1: sd.cpp's fused-qkv view (z_image.hpp, qk_norm off): the k slice of a
++//      [d, heads+2*heads, tokens, batch] tensor, non-contiguous, view_offs != 0;
++//   2: a view whose rows are padded in memory (nb[1] > d*4).
++// xcheck: the output is concat(fused, generic, 2), where generic is sd.cpp's
++// own decomposition of the same rotation (rope.hpp:1085-1122 at f0aac52), and
++// err() also compares the two halves of each backend's result. That checks
++// the CPU forward against the decomposition, not only a backend against the
++// CPU forward it was ported from.
++struct test_rope_apply : public test_case {
++    const int64_t d;
++    const int64_t heads;
++    const int64_t tokens;
++    const int64_t batch;
++    const bool    interleaved;
++    const int     v;
++    const bool    xcheck;
++
++    std::string vars() override {
++        return VARS_TO_STR7(d, heads, tokens, batch, interleaved, v, xcheck);
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "ROPE_APPLY";
++    }
++
++    test_rope_apply(int64_t d = 128, int64_t heads = 30, int64_t tokens = 64, int64_t batch = 1,
++                    bool interleaved = true, int v = 0, bool xcheck = false)
++        : d(d), heads(heads), tokens(tokens), batch(batch), interleaved(interleaved), v(v), xcheck(xcheck) {}
++
++    // sd.cpp's generic apply_rope (rope.hpp, f0aac52), x: [d, heads, tokens, batch]
++    ggml_tensor * generic(ggml_context * ctx, ggml_tensor * x, ggml_tensor * pe, bool il) {
++        const int64_t d_head = x->ne[0];
++        const int64_t n_head = x->ne[1];
++        const int64_t L      = x->ne[2];
++        const int64_t N      = x->ne[3];
++        x = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));
++        if (!il) {
++            ggml_tensor * x_0 = ggml_view_3d(ctx, x, d_head / 2, L, n_head * N, x->nb[1], x->nb[2], 0);
++            ggml_tensor * x_1 = ggml_view_3d(ctx, x, d_head / 2, L, n_head * N, x->nb[1], x->nb[2], (d_head / 2) * x->nb[0]);
++            ggml_tensor * pe_2 = ggml_cont(ctx, ggml_permute(ctx, pe, 2, 3, 0, 1));
++            ggml_tensor * cs   = ggml_view_2d(ctx, pe_2, d_head / 2, L, pe_2->nb[1], 0);
++            ggml_tensor * sn   = ggml_view_2d(ctx, pe_2, d_head / 2, L, pe_2->nb[1], pe_2->nb[3]);
++            ggml_tensor * part_0 = ggml_sub(ctx, ggml_mul(ctx, x_0, cs), ggml_mul(ctx, x_1, sn));
++            ggml_tensor * part_1 = ggml_add(ctx, ggml_mul(ctx, x_0, sn), ggml_mul(ctx, x_1, cs));
++            return ggml_concat(ctx, part_0, part_1, 0);
++        }
++        x = ggml_reshape_4d(ctx, x, 2, d_head / 2, L, n_head * N);
++        x = ggml_cont(ctx, ggml_permute(ctx, x, 3, 0, 1, 2));
++        int64_t offset = x->nb[2] * x->ne[2];
++        ggml_tensor * x_0 = ggml_view_3d(ctx, x, x->ne[0], x->ne[1], x->ne[2], x->nb[1], x->nb[2], offset * 0);
++        ggml_tensor * x_1 = ggml_view_3d(ctx, x, x->ne[0], x->ne[1], x->ne[2], x->nb[1], x->nb[2], offset * 1);
++        x_0 = ggml_reshape_4d(ctx, x_0, 1, x_0->ne[0], x_0->ne[1], x_0->ne[2]);
++        x_1 = ggml_reshape_4d(ctx, x_1, 1, x_1->ne[0], x_1->ne[1], x_1->ne[2]);
++        ggml_tensor * temp_x = ggml_new_tensor_4d(ctx, x_0->type, 2, x_0->ne[1], x_0->ne[2], x_0->ne[3]);
++        x_0 = ggml_repeat(ctx, x_0, temp_x);
++        x_1 = ggml_repeat(ctx, x_1, temp_x);
++        pe = ggml_cont(ctx, ggml_permute(ctx, pe, 3, 0, 1, 2));
++        offset = pe->nb[2] * pe->ne[2];
++        ggml_tensor * pe_0 = ggml_view_3d(ctx, pe, pe->ne[0], pe->ne[1], pe->ne[2], pe->nb[1], pe->nb[2], offset * 0);
++        ggml_tensor * pe_1 = ggml_view_3d(ctx, pe, pe->ne[0], pe->ne[1], pe->ne[2], pe->nb[1], pe->nb[2], offset * 1);
++        ggml_tensor * x_out = ggml_add(ctx, ggml_mul(ctx, x_0, pe_0), ggml_mul(ctx, x_1, pe_1));
++        return ggml_reshape_3d(ctx, x_out, d_head, L, n_head * N);
++    }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a;
++        if (v == 1) {
++            ggml_tensor * qkv = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, 3 * heads, tokens, batch);
++            ggml_set_name(qkv, "qkv");
++            a = ggml_view_4d(ctx, qkv, d, heads, tokens, batch, qkv->nb[1], qkv->nb[2], qkv->nb[3], heads * qkv->nb[1]);
++            ggml_set_name(a, "k_view");
++        } else if (v == 2) {
++            ggml_tensor * big = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d + 16, heads, tokens, batch);
++            ggml_set_name(big, "a_padded");
++            a = ggml_view_4d(ctx, big, d, heads, tokens, batch, big->nb[1], big->nb[2], big->nb[3], 0);
++            ggml_set_name(a, "a_view");
++        } else {
++            a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, heads, tokens, batch);
++            ggml_set_name(a, "a");
++        }
++        ggml_tensor * pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, d / 2, tokens);
++        ggml_set_name(pe, "pe");
++
++        ggml_tensor * out = ggml_rope_apply(ctx, a, pe, interleaved);
++        ggml_set_name(out, "out");
++        if (xcheck) {
++            ggml_tensor * ref = generic(ctx, a, pe, interleaved);
++            ggml_set_name(ref, "generic");
++            out = ggml_concat(ctx, out, ref, 2);
++            ggml_set_name(out, "fused_generic");
++        }
++        return out;
++    }
++
++    // pe as rotations: [[cos, -sin], [sin, cos]] at angle token * theta^(-2j/d),
++    // like sd.cpp's embed_nd -- uniform noise in pe would make the interleaved
++    // and the non-interleaved branches read different entries of a matrix that
++    // is not a rotation, which is fine for the backend comparison but not what
++    // the op sees.
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (strcmp(t->name, "pe") == 0) {
++                std::vector<float> data(ggml_nelements(t));
++                for (int64_t tok = 0; tok < tokens; ++tok) {
++                    for (int64_t j = 0; j < d / 2; ++j) {
++                        const double ang = (double) (tok % 997) * std::pow(256.0, -2.0 * (double) j / (double) d);
++                        const float c = (float) std::cos(ang), s = (float) std::sin(ang);
++                        float * m = data.data() + (tok * (d / 2) + j) * 4;
++                        m[0] = c; m[1] = -s; m[2] = s; m[3] = c;
++                    }
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
++            } else {
++                init_tensor_uniform(t);
++            }
++        }
++    }
++
++    double max_nmse_err() override {
++        return 1e-7;
++    }
++
++    // xcheck: the backends against each other, and on each backend the fused
++    // half against the generic half (only for the concatenated output node)
++    double err(const float * a, const float * b, size_t n) override {
++        const size_t n_out = (size_t) (d * tokens * heads * batch);
++        double e = nmse(a, b, n);
++        if (xcheck && n == 2 * n_out) {
++            e = std::max(e, nmse(a, a + n_out, n_out));
++            e = std::max(e, nmse(b, b + n_out, n_out));
++        }
++        return e;
++    }
++};
++
+ // GGML_OP_POOL2D
+ struct test_pool2d : public test_case {
+     enum ggml_op_pool pool_type;
+@@ -11638,6 +11780,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     // Real-model RoPE: F32 forward, packed Q, 512-token prefill.
+     test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256,  8, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 0.8B
+     test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256, 16, 512, 1},  64, GGML_ROPE_TYPE_IMROPE, 512, 1.0f, 0.0f, 1.0f, false, 0, true)); // qwen3.5 4B
++
++    // GGML_OP_ROPE_APPLY (0057): Z-Image's geometry (head_dim 128, 30 heads,
++    // 1024 / 4096 image tokens plus a padded text block), both pair layouts,
++    // the fused-qkv view sd.cpp builds without qk_norm, padded rows, batch 2,
++    // and the decomposition cross-check (xcheck)
++    for (bool il : {true, false}) {
++        for (int v : {0, 1, 2}) {
++            test_cases.emplace_back(new test_rope_apply(128, 30,   64, 1, il, v, false));
++            test_cases.emplace_back(new test_rope_apply(128, 30,   64, 1, il, v, true));
++            test_cases.emplace_back(new test_rope_apply( 64,  4,   37, 2, il, v, true));
++        }
++        test_cases.emplace_back(new test_rope_apply(  2,  3,    5, 1, il, 0, true));
++        test_cases.emplace_back(new test_rope_apply(128, 30, 1056, 1, il, 0, false)); // Z-Image 512^2
++        test_cases.emplace_back(new test_rope_apply(128, 30, 1056, 1, il, 1, true));
++        test_cases.emplace_back(new test_rope_apply(128, 30, 4128, 1, il, 0, false)); // Z-Image 1024^2
++    }
+     test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256,  8, 512, 1}, 256, GGML_ROPE_TYPE_NEOX,   512, 1.0f, 0.0f, 1.0f, false, 0, true)); // gemma4 E2B sliding
+     test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {512,  8, 512, 1}, 128, GGML_ROPE_TYPE_NEOX,   512, 1.0f, 0.0f, 1.0f, true,  0, true)); // gemma4 E4B global
+ 

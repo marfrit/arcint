@@ -30,8 +30,15 @@ Exit status: 0 inside the tolerance; 1 otherwise; 2 a usage or decode error.
                        --device NAME|cpu --prompt P [--steps 8 --seed 42 ...]
     imggen_gate.py compare --ref DIR --cand DIR [--baseline DIR]
 
-The `run` arm writes `final.png` and `prev_%03d.png` plus `arm.json` (the
-binary's sha256 and every flag), so a later session can re-read what was run.
+The `run` arm writes `final.png` and `prev_%03d.png`, `run.log` (sd-cli's
+output, the step times at `--log-level info`) and `arm.json` (the binary's
+sha256 and every flag), so a later session can re-read what was run.
+`compare` refuses arms whose `arm.json` is missing or whose image-defining
+flags (`PARITY`) differ, unless `--allow-unverified` is given.
+
+With `--baseline`, the baseline arm is measured against the same reference and
+the candidate may be at most the tolerance worse than it: per-step MSE, final
+PSNR and SSIM.
 
 Only the standard library is used: the card host may have no numpy, PIL or
 ffmpeg, and the gate must not need them.
@@ -205,8 +212,57 @@ def per_step(ref, cand):
     return rows, idx_missing
 
 
+# The flags that make two arms the same image: a comparison across arms that
+# differ in any of them measures the inputs, not the backend (a no-prompt arm
+# against a prompted one was once read as a defect, docs/imggen.md).
+PARITY = ("--diffusion-model", "--llm", "--vae", "-p", "--cfg-scale", "--steps",
+          "-W", "-H", "--seed", "--sampling-method", "--scheduler")
+
+
+def arm_header(d):
+    try:
+        return json.load(open(os.path.join(d, "arm.json")))
+    except (OSError, ValueError):
+        raise ValueError("%s has no readable arm.json: its parameters are unverifiable" % d)
+
+
+def arm_params(d):
+    cmd = arm_header(d).get("cmd") or []
+    return {k: (cmd[cmd.index(k) + 1] if k in cmd else None) for k in PARITY}
+
+
+def arm_mechanism(d):
+    """What may differ between arms: the binary, the other flags, the environment."""
+    h = arm_header(d)
+    cmd = h.get("cmd") or []
+    rest, i = [], 1
+    while i < len(cmd):
+        if cmd[i] in PARITY or cmd[i] in ("--preview-path", "-o"):
+            i += 2
+            continue
+        rest.append(cmd[i])
+        i += 1
+    return {"sha256_16": h.get("sha256_16"), "flags": " ".join(rest), "env": h.get("env", "(not recorded)")}
+
+
+def check_parity(dirs):
+    params = [(d, arm_params(d)) for d in dirs]
+    d0, p0 = params[0]
+    for d, p in params[1:]:
+        diff = [k for k in PARITY if p[k] != p0[k]]
+        if diff:
+            raise ValueError("%s and %s differ in %s: not the same image" % (
+                d0, d, ", ".join("%s (%r vs %r)" % (k, p0[k], p[k]) for k in diff)))
+    # Everything else is the mechanism under test: printed, so a reader sees
+    # what separated the arms next to the verdict.
+    for d in dirs:
+        print("  arm %s: %s" % (d, json.dumps(arm_mechanism(d))))
+
+
 def compare_ref(refdir, canddir, basedir=None, tol_cos=TOL_COS, tol_mse=TOL_MSE,
-                psnr_tol=PSNR_TOL, ssim_tol=SSIM_TOL):
+                psnr_tol=PSNR_TOL, ssim_tol=SSIM_TOL, allow_unverified=False):
+    if not allow_unverified:
+        check_parity([refdir, canddir] + ([basedir] if basedir else []))
     ref_prev, ref_final = read_dir(refdir)
     cand_prev, cand_final = read_dir(canddir)
     rows, miss = per_step(ref_prev, cand_prev)
@@ -229,31 +285,29 @@ def compare_ref(refdir, canddir, basedir=None, tol_cos=TOL_COS, tol_mse=TOL_MSE,
 
     baseline = None
     if basedir:
+        # The baseline arm's own distance from the reference is the allowance:
+        # the candidate may be at most the tolerance worse than it (charter §3).
         bprev, bfinal = read_dir(basedir)
         baseline = {}
-        if bprev and cand_prev:
-            brows, bmiss = per_step(bprev, cand_prev)
-            if brows:
-                baseline["step_cosine_mean"] = sum(r[1] for r in brows) / len(brows)
-                baseline["step_mse_worst"] = max(r[2] for r in brows)
-                if baseline["step_mse_worst"] is not None:
-                    if worst_mse > baseline["step_mse_worst"] * (1 + tol_mse):
-                        failures.append("step MSE %.4f > baseline %.4f * (1+%.3f)" %
-                                        (worst_mse, baseline["step_mse_worst"], tol_mse))
-        # the baseline arm's own distance from the reference is the allowance's
-        # other side: the candidate's figures are compared to the baseline's.
+        brows, _ = per_step(ref_prev, bprev)
+        if brows:
+            baseline["step_cosine_worst"] = min(r[1] for r in brows)
+            baseline["step_mse_worst"] = max(r[2] for r in brows)
+            if worst_mse > baseline["step_mse_worst"] * (1 + tol_mse):
+                failures.append("step MSE %.4f > baseline %.4f * (1+%.3f)" %
+                                (worst_mse, baseline["step_mse_worst"], tol_mse))
+        if bfinal and ref_final:
+            baseline["psnr_ref"], _ = psnr_mse(ref_final, bfinal)
+            baseline["ssim_ref"] = ssim_global(ref_final, bfinal)
         if bfinal and cand_final:
-            bps, bmse = psnr_mse(bfinal, cand_final)
-            baseline["psnr_cand_vs_baseline"] = bps
-            baseline["ssim_cand_vs_baseline"] = ssim_global(bfinal, cand_final)
-        if baseline.get("psnr_cand_vs_baseline") is not None and final.get("psnr_ref") is not None:
-            if final["psnr_ref"] < baseline["psnr_cand_vs_baseline"] - psnr_tol:
+            baseline["psnr_cand_vs_baseline"], _ = psnr_mse(bfinal, cand_final)
+        if baseline.get("psnr_ref") is not None and final.get("psnr_ref") is not None:
+            if final["psnr_ref"] < baseline["psnr_ref"] - psnr_tol:
                 failures.append("final PSNR %.2f < baseline %.2f - %.2f" %
-                                (final["psnr_ref"], baseline["psnr_cand_vs_baseline"], psnr_tol))
-        if baseline.get("ssim_cand_vs_baseline") is not None and final.get("ssim_ref") is not None:
-            if final["ssim_ref"] < baseline["ssim_cand_vs_baseline"] - ssim_tol:
+                                (final["psnr_ref"], baseline["psnr_ref"], psnr_tol))
+            if final["ssim_ref"] < baseline["ssim_ref"] - ssim_tol:
                 failures.append("final SSIM %.4f < baseline %.4f - %.4f" %
-                                (final["ssim_ref"], baseline["ssim_cand_vs_baseline"], ssim_tol))
+                                (final["ssim_ref"], baseline["ssim_ref"], ssim_tol))
 
     print("ACCEPTANCE-METRIC step_cosine_mean %.6f" % mean_cos)
     print("ACCEPTANCE-METRIC step_cosine_worst %.6f" % worst_cos)
@@ -266,7 +320,7 @@ def compare_ref(refdir, canddir, basedir=None, tol_cos=TOL_COS, tol_mse=TOL_MSE,
     if miss:
         print("  step(s) only on one side: %s" % miss)
     if basedir:
-        print("  baseline present: %s" % basedir)
+        print("  baseline %s: %s" % (basedir, json.dumps({k: round(v, 6) for k, v in baseline.items()})))
     else:
         print("  no baseline arm: cosine is gated; MSE/PSNR/SSIM are reported, not gated")
         print("  (the gate is comparative against the unchanged OpenCL on the same card)")
@@ -301,17 +355,19 @@ def run_arm(a):
            "--preview-path", os.path.join(out, "prev_%03d.png"),
            "-o", os.path.join(out, "final.png"),
            "--disable-image-metadata",
-           "--log-level", "warn"]
+           "--log-level", a.log_level]
     if a.scheduler:
         cmd += ["--scheduler", a.scheduler]
     if a.extra_args:
         cmd += a.extra_args
     sha = hashlib.sha256(open(a.sdcpp, "rb").read()).hexdigest()[:16] if os.path.isfile(a.sdcpp) else "?"
-    header = {"sdcpp": a.sdcpp, "sha256_16": sha, "cmd": cmd,
+    env = {k: v for k, v in sorted(os.environ.items()) if k.startswith(("GGML_", "SD_"))}
+    header = {"sdcpp": a.sdcpp, "sha256_16": sha, "cmd": cmd, "env": env,
               "diffusion_sha256": a.diffusion_sha, "llm_sha256": a.llm_sha, "vae_sha256": a.vae_sha}
     print("run: %s" % " ".join(cmd))
-    rc = subprocess.call(cmd)
     json.dump(header, open(os.path.join(out, "arm.json"), "w"), indent=2)
+    with open(os.path.join(out, "run.log"), "wb") as logf:
+        rc = subprocess.call(cmd, stdout=logf, stderr=subprocess.STDOUT)
     return rc
 
 
@@ -339,6 +395,7 @@ def main():
     r.add_argument("--diffusion-sha", default="")
     r.add_argument("--llm-sha", default="")
     r.add_argument("--vae-sha", default="")
+    r.add_argument("--log-level", default="info")  # info carries the step times
     r.add_argument("--extra-args", nargs=argparse.REMAINDER, default=[])
     r.set_defaults(func=run_arm)
 
@@ -350,8 +407,11 @@ def main():
     c.add_argument("--tol-mse", type=float, default=TOL_MSE)
     c.add_argument("--psnr-tol", type=float, default=PSNR_TOL)
     c.add_argument("--ssim-tol", type=float, default=SSIM_TOL)
+    c.add_argument("--allow-unverified", action="store_true",
+                   help="compare arms without arm.json or with differing flags (reported, never a gate)")
     c.set_defaults(func=lambda a: compare_ref(a.ref, a.cand, a.baseline,
-                                             a.tol_cos, a.tol_mse, a.psnr_tol, a.ssim_tol))
+                                             a.tol_cos, a.tol_mse, a.psnr_tol, a.ssim_tol,
+                                             a.allow_unverified))
 
     a = ap.parse_args()
     try:
