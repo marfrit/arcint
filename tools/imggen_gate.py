@@ -216,7 +216,9 @@ def per_step(ref, cand):
 # differ in any of them measures the inputs, not the backend (a no-prompt arm
 # against a prompted one was once read as a defect, docs/imggen.md).
 PARITY = ("--diffusion-model", "--llm", "--vae", "-p", "--cfg-scale", "--steps",
-          "-W", "-H", "--seed", "--sampling-method", "--scheduler")
+          "-W", "-H", "--seed", "--sampling-method", "--scheduler",
+          "--flow-shift", "--ref-image", "--mask", "--upscale-model",
+          "--upscale-repeats")
 MODEL_FLAGS = ("--diffusion-model", "--llm", "--vae")
 
 
@@ -365,6 +367,16 @@ def run_arm(a):
            "--log-level", a.log_level]
     if a.scheduler:
         cmd += ["--scheduler", a.scheduler]
+    if a.flow_shift is not None:
+        cmd += ["--flow-shift", str(a.flow_shift)]
+    if a.ref_image:
+        cmd += ["--ref-image", a.ref_image]
+    if a.mask:
+        cmd += ["--mask", a.mask]
+    if a.upscale_model:
+        cmd += ["--upscale-model", a.upscale_model]
+        if a.upscale_repeats:
+            cmd += ["--upscale-repeats", str(a.upscale_repeats)]
     if a.extra_args:
         cmd += a.extra_args
     sha = hashlib.sha256(open(a.sdcpp, "rb").read()).hexdigest()[:16] if os.path.isfile(a.sdcpp) else "?"
@@ -398,6 +410,11 @@ def main():
     r.add_argument("-H", "--height", type=int, default=512)
     r.add_argument("--sampling-method", default="euler")
     r.add_argument("--scheduler")  # omitted: sd.cpp's model-specific default
+    r.add_argument("--flow-shift", type=float, default=None)  # Qwen/VL flow shift
+    r.add_argument("--ref-image", default=None)               # edits: the source image
+    r.add_argument("--mask", default=None)                    # edits: the mask
+    r.add_argument("--upscale-model", default=None)           # ESRGAN
+    r.add_argument("--upscale-repeats", type=int, default=0)
     r.add_argument("--preview-interval", type=int, default=1)
     r.add_argument("--diffusion-sha", default="")
     r.add_argument("--llm-sha", default="")

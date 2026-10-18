@@ -107,6 +107,10 @@ layers on the CPU. **0059** adds `GGML_OP_CONV_3D` as an implicit GEMM on the
 conv2d tiling, with the depth folded into `CRS` — no im2col expansion in
 global memory. Campaign: `docs/campaigns/imggen-wan-vae-conv3d.md`.
 `IM2COL_3D` stays out until the VAE's device time is known (`arithmetic`).
+**0060** adds `GGML_OP_LEAKY_RELU` (f32/f16, contiguous or strided), which
+the ESRGAN upscaler needs; without it the mixed CPU/OpenCL upscaler graph
+segfaults in the CPU's own forward (`measured-here`). Campaign:
+`docs/campaigns/imggen-leaky-relu-esrgan.md`.
 
 ## 5. Editing
 
@@ -161,7 +165,53 @@ free one (an operator call). The exact wiring is fixed after the gates.
 6. **Release 1.1.1** by the existing procedure (the release session owns
    push/tag/package).
 
-## 9. References
+## 9. State as measured (2026-10-18)
+
+All on the B60 `8086:e211`, OpenCL 0:0, a card window per leg, the owning
+language unit stopped and restored; the files sha256-identical to their HF
+LFS pointers; every arm through `tools/imggen_gate.py` with its `arm.json`.
+
+**Qwen-Image** (512², 8 steps, seed 42, cfg 2.5, euler, `--flow-shift 3`):
+all **16.7 GB of params on VRAM** (DiT Q4_K_M 11.9, TE Q4_K_M 3.9, VAE
+0.24 GiB), no RAM fallback; the first request loads the TE in 17.1 s and the
+DiT in 47.9 s (from the ZFS mirror). 8 steps **55.7 s** (7.0 s a step); the
+Wan VAE decodes in **2.66 s** on the card -- with 0059 off the same graph
+crashes (`GGML_ASSERT(dst->extra)` in the OpenCL compute) because the
+unsupported 3D op is planned onto the card, so pre-0059 Qwen-Image does not
+run at all. The vision model reads the image's text as **"WILLKOMMEN"**, in
+black on a white sign against a green forest: the German-lettering mandate
+is met. Against the CPU reference (same binary, same files/prompt/steps,
+384 s): per-step cosine worst **0.998676**, PSNR 26.26 dB, SSIM 0.9912 --
+**outside the placeholder `TOL_COS 0.001`**; the DiT path, not the VAE (the
+0059 red arm's per-step previews are bit-identical to the green arm's: cos
+1.000000). 0059's own red shows in the final image: PSNR **8.70 dB**, SSIM
+0.0105 vs the green arm.
+
+**FLUX.2 klein 4B** (512², 4 steps, seed 42, cfg 1.0, euler): DiT Q8_0 +
+Qwen3-4B Q8_0 TE + the FLUX2 VAE (32 latent channels), ~8.5 GiB, fits
+comfortably. 4 steps **18.8 s**, VAE 2.53 s; the vision model confirms the
+prompt (a cat on a windowsill). Against the CPU reference (143.7 s): cosine
+worst **0.998115**, PSNR 25.31 dB -- outside the placeholder like Qwen-Image.
+
+**FLUX.2 klein edit** (`/v1/images/edits` shape, `--ref-image`, background
+swap): 4 steps **19.5 s**, VAE 2.13 s; the vision model confirms the swap (beach
+behind the cat). Against the CPU reference (227.1 s): cosine worst
+**0.999539**, PSNR 32.43 dB, SSIM 0.9966 -- **PASS**. The edit path matches
+the reference more closely than text-to-image does.
+
+**ESRGAN** (`--mode upscale`, `RealESRGAN_x4plus.safetensors`): 512² ->
+2048² in **27 s** on OpenCL after 0060; before 0060 the same command
+segfaulted in the CPU fallback. 4x from 1024² gives 4096² (~350 dpi on A3's
+short side, `arithmetic`).
+
+**Open**: the 1.1.1 gate tolerance (`TOL_COS` is the operator's D6): the two
+text-to-image curves sit 0.0013-0.0019 below 1.0, the edit curve inside
+0.001; the kernel equivalence itself is carried by the op suites (0058 151,
+0059 276, 0060 7 green and red). The CPU reference carries 0057's fused CPU
+ROPE_APPLY (the 1.1.0 reference deliberately used the generic path): a
+controlled rope-off arm was not run.
+
+## 10. References
 
 - stable-diffusion.cpp `f0aac52`: `src/core/ggml_extend.cpp:451`,
   `src/model/vae/wan_vae.hpp`, `src/model/diffusion/{qwen_image,flux}.hpp`,

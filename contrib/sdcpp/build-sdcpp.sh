@@ -57,8 +57,9 @@ if git -C "$LLAMA" rev-parse --git-dir >/dev/null 2>&1; then
 fi
 
 # The arcint series has to be compiled in: the kernels are its own files, which
-# upstream ggml does not carry. 0057 (ROPE_APPLY), 0058 (the q8_0 XMX GEMM) and
-# 0059 (CONV_3D, the Wan VAE) are the image service's own patches.
+# upstream ggml does not carry. 0057 (ROPE_APPLY), 0058 (the q8_0 XMX GEMM),
+# 0059 (CONV_3D, the Wan VAE) and 0060 (LEAKY_RELU, the ESRGAN upscaler) are
+# the image service's own patches.
 [ -f "$GGML/src/ggml-opencl/kernels/flash_attn_dpas.cl" ] \
     || { echo "arcint's OpenCL kernels are not in $GGML -- apply contrib/llama.cpp/patches first" >&2; exit 1; }
 grep -q 'ggml_rope_apply' "$GGML/include/ggml.h" \
@@ -116,8 +117,8 @@ grep -qa kernel_mul_mm_kq2d_q4_K_i8 "$CLI" \
     || { echo "$CLI carries no arcint XMX kernel" >&2; exit 1; }
 grep -qa flash_attn_f32_f16_dpas "$CLI" \
     || { echo "$CLI carries no arcint DPAS attention kernel" >&2; exit 1; }
-for k in kernel_mul_mm_q8_0_f16 kernel_rope_apply_f32 kernel_conv_3d; do
-    grep -qa "$k" "$CLI" || { echo "$CLI lacks $k (0057/0058/0059)" >&2; exit 1; }
+for k in kernel_mul_mm_q8_0_f16 kernel_rope_apply_f32 kernel_conv_3d kernel_leaky_relu; do
+    grep -qa "$k" "$CLI" || { echo "$CLI lacks $k (0057/0058/0059/0060)" >&2; exit 1; }
 done
 n160=$(grep -o -- '-DGGML_MAX_NAME=160' "$BUILD/build.ninja" | wc -l)
 [ "$n160" -gt 0 ] || { echo "GGML_MAX_NAME=160 was not applied to the build" >&2; exit 1; }

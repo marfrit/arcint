@@ -3751,3 +3751,32 @@ decode's device time. The campaign is
 only the direct op; the im2col form would turn the same GEMM into a
 `mul_mat` and hand the XMX tiles a flattened matrix, which is the shape to
 measure when the VAE's own time is known (`arithmetic`, not measured).
+
+## 0060-opencl-intel-leaky-relu.patch
+
+sd.cpp's ESRGAN upscaler (`src/model/upscaler/esrgan.hpp`, RRDBNet's
+`ggml_leaky_relu`) was the one unary the pin's OpenCL lacked, so a mixed
+CPU/OpenCL upscaler graph sent `GGML_OP_LEAKY_RELU` to the CPU and
+**segfaulted inside the CPU's own forward** (`measured-here`, 2026-10-18,
+the RepRap `process_tiles_2d` backtrace); the model itself is fine (the
+pure-CPU `--mode upscale` run completed). Note the op is **top-level**, not
+a `GGML_UNARY_OP` enum: `ggml.c:2787` sets `GGML_OP_LEAKY_RELU`
+(`code`). The patch adds it as six variants of the `unary_ext` shape
+(`leaky_relu.cl`: f32, f32_4, f16, f16_4, and the strided `_nc` pair), the
+negative slope the op's own parameter (`dst->op_params`, float) as the
+trailing argument. Admission: f32 or f16, contiguous or strided.
+`GGML_OPENCL_LEAKY_RELU_RED=1` negates the slope, so the negative branch
+moves -- the red case.
+
+**Op suite** (`measured-here`, B60, `test-backend-ops -o LEAKY_RELU -j 1`,
+the CPU reference): **7/7 pass**; with the red, 7/7 FAIL. Serial `-j 1` only:
+the driver aborts the process at `-j 4` (a Neo `reference_tracked_object`
+abort before any case reports, `measured-here`), and `-o ADD -j 4` is green
+in the same window, so it is the LEAKY_RELU cases, not the card, not the
+suite -- recorded, not explained.
+
+**Served** (`measured-here`, the same B60 window): `--mode upscale` ESRGAN
+4x, `RealESRGAN_x4plus.safetensors`, a 512² PNG to 2048², **27 s** on
+OpenCL; before the patch the same command segfaulted in the CPU fallback.
+The upscale is the print route; the campaign is
+`docs/campaigns/imggen-leaky-relu-esrgan.md`.
