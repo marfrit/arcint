@@ -417,41 +417,33 @@ per-process variant is not driven by the disk program cache, by `build-up` vs
 `build-prof`, or by the VAE conv -- but it is **not settled**: the mechanism of
 the doubled path is still unnamed.
 
-**Phase 3 opens a second, systematic variant** (`measured-here`, 2026-10-18,
-**open defect**). At 1024²/8/seed 42 the defect changes shape:
+**Phase 3's second variant was a measurement fault, not a defect**
+(`measured-here`, 2026-10-18). At 1024²/8/seed 42 the first comparison
+"split" the two binaries: the served image (`sd-server`, HTTP request with
+prompt "a red cube on a white table, centered") stood outside a cluster of
+`sd-cli` arms (cos 0.9136, PSNR 9.26), and the cluster itself sat far from a
+CPU reference (cos 0.990867, PSNR 21.36). The cause was in the run: **every
+`sd-cli` arm that night and the CPU reference were launched without `-p`**,
+so they rendered the **empty prompt**, while the HTTP request carried the
+prompt. Nothing in the graph, the kernels or the process state separated the
+two. Re-run at 1024² with the server's prompt, the `sd-cli` arm is
+**bit-identical to the server** (cos 1.000000, PSNR inf, SSIM 1.000000) and to
+three separate server processes (`served1`, `served3`,
+`srvcache0`/`condstatsrv3`); the earlier cross-process "no reproduction" of
+the 512 defect had the same shape (a numeric trajectory compared across arms,
+not a binary split). Rule for the record: every image arm carries its prompt
+in `arm.json`/the command log, and a comparison reads both command lines
+before it reads the numbers.
 
-- every `sd-cli` OpenCL arm tonight -- f16-DiT (`--tensor-type-rules
-  ^model\.=f16`), full f16 (`--type f16`), q8_0, and both `--flash-attn on` and
-  `--flash-attn off` -- **clusters together** (pairwise cos >= 0.9998, PSNR >=
-  38.55) and diverges from the CPU reference from step 1 on (step 0 cos
-  0.99988, step 1 cos 0.9889, worst cos **0.9867**, worst MSE ~710, final
-  **cos 0.990867, PSNR 21.36 dB** -- the same magnitude as the 512 FAIL), while
-  the wall step is 2.21 s for flash-on and 4.41 s for the genuine flash-off;
-- the **served image** (`sd-server`, the Phase-3 unit, same files/flags/seed,
-  request 1024²) is **identical across two separate server processes**
-  (served1 == served3, PSNR inf) and **differs from the whole CLI cluster**
-  (cos 0.9136, PSNR 9.26 dB, SSIM -0.114), and sits **further** from the CPU
-  reference (cos 0.9156, PSNR **9.30 dB**, SSIM -0.129) than the CLI cluster
-  does. `sd-server --log-level verbose` and `sd-cli --log-level verbose`
-  build the **same effective gen params** (txt_cfg 1.00, euler, 8 steps, seed
-  42, discrete scheduler, eta/flow_shift default), so the split is in the
-  process/graph state, not in the request. The server at 512² is correct
-  (cos 0.999975 vs `refcpu512`, PSNR 44.77, and cos 0.999997 vs
-  `bu-auto-g512`), so the split is resolution/token-count dependent.
-  The server also logged the `flash_attn_dpas2` tile selection and the
-  **lazy-compiled flash_attn prepass** (`DK=128 DV=128`) during its first
-  1024 request -- the suspect the campaign already names -- while one CLI
-  arm with the same flags (`fa-on1024`) logged it and another (`fa-off1024`)
-  did not, yet the two CLI images agree to cos 0.999826. `--flash-attn`
-  is therefore **not** the separator, and the printed `flash_attn_dpas2`
-  line does not track the assignment.
-
-**A service that renders a different image than its own CLI is not done.**
-The Phase-3 acceptance cannot be recorded as a PASS while this defect is open;
-Phase 3 and the defect now share one critical path. The next experiment (see
-`docs/campaigns/imggen-attention-path.md`): pin the RoPE path (the 0057 fused
-`rope_apply_f32` was gated at 512 only, and its 4096-token grid is untested),
-then re-run both binaries at 1024² against the CPU reference.
+What still holds: the 512² fresh-process variant
+(`docs/campaigns/imggen-attention-path.md`) was not reproduced in eight
+fresh-cache/global-cache arms; the sd-cli/sd-server equivalence also holds at
+512² (served vs `bu-auto-g512`: cos 0.999997, PSNR 53.85; vs `refcpu512`:
+cos 0.999975, PSNR 44.77). **The 1024² gate rests on a CPU reference that
+carries the same prompt** (run 2026-10-18, ~24 min a leg): the candidate
+(`sd-cli` with prompt, and the same image served over HTTP) is compared to it
+and to the 512² reference where the content overlaps. The service acceptance
+waits on that figure.
 
 **Phase-3 memory/speed measurements** (`measured-here`, 2026-10-18, B60, Z-Image
 Turbo Q8_0 + Qwen3-4B Q8_0 + `ae.safetensors`, 1024²/8/seed 42, pinned

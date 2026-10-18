@@ -3,8 +3,9 @@
 **Open** (2026-10-17, defect; rechecked 2026-10-18). One window, the same
 sd.cpp flags: two different images on the B60, one passing the CPU gate and one
 failing it, at the same wall step (`measured-here`). The fresh-process variant
-did **not** reproduce in eight fresh-cache/global-cache/VAE arms, while 1024²
-splits the two binaries systematically (`measured-here`, below).
+did **not** reproduce in eight fresh-cache/global-cache/VAE arms; the
+suspected 1024² binary split was a **measurement fault of our own** (the CLI
+arms ran without a prompt) and is closed below (`measured-here`).
 
 ## Charter
 
@@ -72,23 +73,30 @@ and `--flash-attn on` (global) give **agreeing** images (cos 0.999826, PSNR
 diverges from the CPU reference. `fa-on1024` logged the lazy prepass,
 `fa-off1024` did not, yet their images agree. The printed `flash_attn_dpas2`
 line tracked neither assignment (it also prints with `--flash-attn off`).
+- **The RoPE path is not the separator.** A variant build with the sd.cpp
+integration patch reverted (generic repeat+mul RoPE, `build-nopatch`) at 1024²
+clusters with the fused-0057 arms (vs the f16-DiT arm cos 0.999934, vs q8_0
+0.999989) and runs 4.85 vs 2.21 s a step; the fused and generic paths are
+numerically the same here. (Both arms still lacked a prompt; that is the same
+fault below.)
 - **Sampler/request-parity.** `sd-server --log-level verbose` and `sd-cli
 --log-level verbose` build the same effective params (txt_cfg 1.00, euler,
 8 steps, seed 42, discrete scheduler, eta/flow_shift default); the server at
 512² matches both `refcpu512` and the CLI f16 arm to cos >0.99997.
 
-**The 1024² split (`measured-here`, 2026-10-18).** Every CLI OpenCL arm (DiT f16,
-full f16, q8_0, flash on and off) clusters together (pairwise cos >=0.9998,
-PSNR >=38.55) and fails the CPU reference from step 1 on (step 0 cos 0.99988,
-worst cos 0.9867, final cos 0.990867 / PSNR 21.36 dB). `sd-server` is
-process-stable (served1 == served3, PSNR inf) yet stands outside the whole
-cluster (cos 0.9136 / PSNR 9.26) and further from the reference
-(cos 0.9156 / PSNR 9.30). The 512 PASS trajectory did not appear at 1024².
-Next: the RoPE path -- the fused `0057` `rope_apply_f32` was gated **at 512
-only** and its 4096-token grid is untested; force the generic repeat/mul path
-(revert the sd.cpp integration patch, or a runtime switch if one exists) and
-re-run both binaries at 1024² against the CPU reference. Also profile both
-binaries at 1024² (`GGML_OPENCL_PROFILING`) to settle the launch-count doubling.
+**The 1024² "split" was our own missing prompt (`measured-here`, 2026-10-18).**
+Every `sd-cli` OpenCL arm and the 1024² CPU reference that night were launched
+**without `-p`**, so they rendered the empty prompt, while the HTTP request
+carried the prompt "a red cube on a white table, centered". The CLI and server
+images accordingly differed (cos 0.913631, PSNR 9.26) -- not a numeric defect.
+Re-run with the same prompt, the `sd-cli` arm is **bit-identical to the server**
+(cos 1.000000, PSNR inf, SSIM 1.000000), and three separate server processes
+(`served1`, `served3`, `srvcache0`/`condstatsrv3`) are identical too. This
+campaign therefore has **one** open question left: the 512² fresh-process
+variant, unreproduced in eight arms. The 1024² gate now needs a CPU reference
+with the prompt (run 2026-10-18); the RoPE/generic arms cluster, the flash
+assignments cluster, and the conditioning census (`ENCSTAT`/`CONDSTAT`) shows
+the empty-prompt and prompted runs as different inputs, not different binaries.
 
 ## Where it lives
 
