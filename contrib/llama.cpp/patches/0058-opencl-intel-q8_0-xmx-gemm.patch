@@ -1,0 +1,143 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 12f730178..e94cb8e14 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1094,6 +1094,7 @@ struct ggml_backend_opencl_context {
+     int       kq2d_tm_t[3] = { 64, 64, 64 }, kq2d_wg_t[3] = { 16, 16, 16 };   // per type (GGML_OPENCL_KQ_2D_T<i>)
+     cl_kernel kernel_mul_mm_kq_f16[12]    = {};
+     cl_kernel kernel_mul_mm_f16w_f16      = nullptr;   // F16 / BF16 weights on the XMX tiles
++    cl_kernel kernel_mul_mm_q8_0_f16     = nullptr;   // Q8_0 code+scale on the same XMX tiles (0058)
+     cl_kernel kernel_mul_mm_id_kq_f16[12] = {};
+     // MUL_MAT_ID with the tokens as the DPAS a operand (kernel_mul_mm_id2_*):
+     // KQ_ID2_XT pairs x KQ_ID2_XSG sub-groups of rows per work-group
+@@ -2715,6 +2716,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         CL_CHECK((backend_ctx->kernel_moe_gather_pairs   = clCreateKernel(mm_prog, "kernel_moe_gather_pairs", &err), err));
+                         if (backend_ctx->kq_mm_sg != 8) {
+                             CL_CHECK((backend_ctx->kernel_mul_mm_f16w_f16 = clCreateKernel(mm_prog, "kernel_mul_mm_f16w_f16", &err), err));
++                            CL_CHECK((backend_ctx->kernel_mul_mm_q8_0_f16 = clCreateKernel(mm_prog, "kernel_mul_mm_q8_0_f16", &err), err));
+                         }
+                     }
+                     if (backend_ctx->kernel_kq_cvt_f32_f16 != nullptr) {
+@@ -27796,6 +27798,52 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+         }
+     }
+ 
++    // Intel: Q8_0 weights times 16 or more columns on the XMX tiles (the
++    // durable image form; 0058 q8_0 XMX GEMM). Only a flattened (SoA) Q8_0
++    // tensor carries the code/scale split; a view reads its view_src's.
++    // GGML_OPENCL_Q8_XMX=0 falls back to the generic q8_0 kernels.
++    // GGML_OPENCL_Q8_XMX_RED=1 zeroes the last 16 weights of every row (those
++    // K terms left out) -- the red case.
++    {
++        static const char * xq = getenv("GGML_OPENCL_Q8_XMX");
++        static const bool   q_on = xq == nullptr || atoi(xq) != 0;
++        if (q_on && backend_ctx->kernel_mul_mm_q8_0_f16 != nullptr && backend_ctx->kernel_kq_cvt_f32_f16 != nullptr &&
++            src0t == GGML_TYPE_Q8_0 && src1t == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
++            src1->ne[1] >= 16 && src0->ne[0] % 32 == 0 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
++            src1->ne[2] == 1 && src1->ne[3] == 1 && src0->view_offs == 0 &&
++            ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && dst->nb[0] == sizeof(float) &&
++            ggml_cl_is_q8_0_soa(src0)) {
++            cl_kernel kernel = backend_ctx->kernel_mul_mm_q8_0_f16;
++            const int ne00_ = (int) src0->ne[0], ne01_ = (int) src0->ne[1], ncols = (int) src1->ne[1];
++            static const char * red = getenv("GGML_OPENCL_Q8_XMX_RED");
++            const int kzero = red != nullptr && atoi(red) != 0 ? 16 : 0;
++            const ggml_tensor * soa0 = src0->view_src != nullptr ? src0->view_src : src0;
++            ggml_tensor_extra_cl_q8_0 * e0 = (ggml_tensor_extra_cl_q8_0 *) soa0->extra;
++            ggml_tensor_extra_cl * ed = (ggml_tensor_extra_cl *) dst->extra;
++            const cl_ulong offq = 0, offd = ed->offset + dst->view_offs, nb1 = dst->nb[1];
++            ggml_cl_kq_convert_src1_f16(backend_ctx, src1, (int) src0->ne[0], ncols, dst);
++            cl_uint a = 0;
++            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &e0->q));
++            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offq));
++            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &e0->d));
++            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &kzero));
++            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xh.buffer));
++            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xscale.buffer));
++            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &ed->data_device));
++            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offd));
++            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb1));
++            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne00_));
++            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01_));
++            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ncols));
++            const ggml_cl_kq_tile & t = backend_ctx->kq_mm_plain;
++            const int sg = backend_ctx->kq_mm_sg;
++            size_t gws[] = { (size_t)CEIL_DIV(ncols, t.nt(sg)) * sg, (size_t)CEIL_DIV(ne01_, t.mt()) * t.nsg(), 1 };
++            size_t lws[] = { (size_t)sg, (size_t)t.nsg(), 1 };
++            backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws, lws, dst);
++            return;
++        }
++    }
++
+     // Intel: F16 / BF16 weights times 2-8 columns (a verify window, an MTP
+     // step): one read of each weight row for all columns. The tiled GEMM
+     // below computes a 64-column tile for them: 2.8 ms for 4096 x 14336 at
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
+index 7a9114b32..8bb713a02 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
+@@ -2016,6 +2016,33 @@ kernel void kernel_mul_mm_f16w_f16(global const uchar * q, ulong offq, global co
+     PLAIN_COLS
+     MM_BODY(deq_f16w(wt, (global const half *)(q + offq), wrow0, row0, ne01, ne00, ib))
+ }
++
++// ---- Q8_0: int8 code + f16 block scale dequantized to f16, then fp16 DPAS.
++// The two device buffers are the tree's q8_0 split (codes per 32, scale per
++// 32). Same tile as the f16-weights GEMM. Chunks past ne00 are not written:
++// the GEMM's kmax never reads them. kzero > 0 writes the last kzero weights
++// of every row as zero (the red case: those K terms left out). ----
++static inline void deq_q8_0(local half * wt, global const uchar * q, ulong offq, global const half * dp,
++                            ulong wrow0, int row0, int ne01, int n32, int ib, int kzero) {
++    for (int u = get_local_linear_id(); u < MT * 16; u += NTHR) {
++        const int rr = u >> 4, c = u & 15;
++        const int r = min(row0 + rr, ne01 - 1);
++        const int kb = ib * 8 + (c >> 1);
++        if (kb >= n32) continue;
++        const ulong blk = (wrow0 + r) * (ulong)n32 + (ulong)kb;
++        const global const uchar * qq = q + offq + blk * 32 + (ulong)(c & 1) * 16;
++        const float sc = (float) vload_half(blk, dp);
++        const char16 cc = as_char16(vload4(0, (global const uint *) qq));
++        const bool zero = kzero > 0 && ib * QK_K + c * 16 >= n32 * 32 - kzero;
++        put16(wt, rr, c * 16, zero ? (float16)(0.f) : convert_float16(cc) * sc);   // k within the super-block
++    }
++}
++
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_mul_mm_q8_0_f16(global const uchar * q, ulong offq, global const half * dp, int kzero, PLAIN_ARGS) {
++    PLAIN_COLS
++    MM_BODY(deq_q8_0(wt, q, offq, dp, wrow0, row0, ne01, ne00 / 32, ib, kzero))
++}
+ #endif
+ 
+ // ---- MUL_MAT_ID routing: the (token, slot) pairs sorted by expert and cut
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 64c35a962..9bf7eae34 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11149,6 +11149,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
+ 
++    // Q8_0 x F32 with 16 or more columns, 2D, contiguous: the 0058 XMX branch
++    // on Xe2 (GGML_OPENCL_Q8_XMX). K not a multiple of the kernel's 256-wide
++    // super-block (288, 2080, 96 = a single partial super-block), odd m (row
++    // tail), n at and around the 16-column threshold and the column tile, the
++    // DiT's own shapes, a view of the first m rows of a larger weight (view_src
++    // set, view_offs 0: the extra the branch reads), and a 3D src1 that the
++    // dispatch flattens into 16 / 32 columns.
++    for (int64_t n : {16, 17, 31, 32, 65, 512}) {
++        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{33, 288}, {257, 2080}, {100, 96}, {64, 256}, {1001, 3840}}) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
++        }
++    }
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 3840, 64, 3840, {1, 1}, {1, 1}));   // Z-Image qkv-sized
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 257, 17, 10240, {1, 1}, {1, 1}));  // Z-Image FFN-down K
++    for (int64_t n : {16, 32}) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8,  n, 64,  {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 16));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 40, n, 288, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 64));
++    }
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 64, 4, 256, {1, 1}, {4, 1}));
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 64, 8, 288, {1, 1}, {4, 1}));
++
+     // few src1 rows (speculative verify): odd m, a single K block, long K, every tile width, broadcast batches
+     for (int64_t n : {2, 3, 5, 8, 9, 13, 16}) {
+         for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{40, 32}, {100, 96}, {1000, 5120}, {3000, 1024}, {6144, 5120}, {17408, 512}}) {

@@ -3602,3 +3602,113 @@ product has no SIMD form.
   `test-opencl-miss-cpu` checks split rows against the GGUF bytes; its red
   mode, and `GGML_OPENCL_CPU_MISS_SPLIT_RED=1` served (a fault at the first
   request), read the split as blocks.
+
+## 0057-opencl-intel-rope-apply-fused.patch
+
+The fork's `GGML_OP_ROPE_APPLY` (`code`, `leejet/ggml` `e05d18a1`,
+`ggml.h:1877`, `ggml.c:4381`): a precomputed `pe` (`[2,2,d/2,tokens]`,
+`[[cos,-sin],[sin,cos]]`) rotated against `a` (`F32 [d,heads,tokens,batch]`)
+in one pass, returning contiguous `F32 [d,tokens,heads*batch]`. Ported: the
+op definition (`ggml.h`, `ggml.c`, identical to the fork's), the CPU forward
+(identical to the fork's `ops.cpp`), an original OpenCL kernel
+(`kernels/rope_apply_f32.cl`) with the fork's CPU/CUDA pair arithmetic, its
+`supports_op` (F32, even `d`, contiguous `dst`, at most `INT_MAX` pairs: the
+kernel indexes in `int`) and dispatch, and `ggml-rpc.h`'s `GGML_OP_COUNT`
+assert with the protocol patch version (an RPC build failed to compile
+otherwise; the fork did the same in `087d92e7`). Nothing in libllama calls
+the op (`code`). sd.cpp reaches it through
+`contrib/sdcpp/upstream-rope-apply.patch`; upstream mode otherwise takes
+its generic two repeats and four muls a layer.
+
+**Served** (`measured-here`, B60, Z-Image Turbo, 8 steps, seed 42, the same
+window): a 1024² step **2.14 s against 4.77 s** with sd.cpp's generic RoPE
+(2.2x); at 512² the generic RoPE was 37 % of the f16 run's device time
+(`repeat_f32` 3,054 + `mul` 2,188 ms of 14,053) and the fused op is 70 ms
+a run. The program is built with `-cl-mad-enable -cl-fast-relaxed-math`, so
+`#pragma OPENCL FP_CONTRACT OFF` does not reproduce the fork's separately
+rounded CUDA arithmetic (`code`); the answer-level figure is the gate's.
+
+**The port's defect** (`measured-here`, 2026-10-17, found by the image gate):
+the kernel added `row*ne0` and `i0`/`i1` to a `global char * dst` -- byte
+offsets on a char pointer -- so most cells were never written and the image
+was white. Fixed with `*sizeof(float)`; every offset in the kernel is now in
+bytes (`code`).
+
+**Op suites**: `test_rope_apply` in `test-backend-ops`: Z-Image's geometry
+(head size 128, 30 heads, 64 / 1056 / 4128 tokens), both pair layouts, three
+forms of `a` (contiguous, the non-contiguous k view of a fused qkv as sd.cpp
+builds it without qk_norm, padded rows), batch 2, and an `xcheck` form whose
+output concatenates the fused op and sd.cpp's own generic decomposition
+(`rope.hpp:1085-1122`) so the CPU forward is checked against independent
+code. B60: 26/26 pass (`measured-here`); the CPU red (sign and swap) fails
+all 16 `xcheck` cases.
+
+**Red case**: a swapped cos/sin turns the image gate red (512² cos worst
+0.890391, PSNR 9.70 dB, against the CPU reference, both arms prompted,
+`measured-here`), and the op suite: with the kernel file mutated the same way
+0/26 `ROPE_APPLY` cases pass on the B60, 26/26 with the file restored
+(`measured-here`). The A770 passes the 26 too.
+
+## 0058-opencl-intel-q8_0-xmx-gemm.patch
+
+Upstream's generic q8_0 GEMM (`kernel_mul_mm_q8_0_f32_l4_lm`) was 68-81 % of
+the image step (`measured-here`, `docs/campaigns/imggen-q8_0-xmx-gemm.md` (on the `qfndev` branch)).
+The patch adds `deq_q8_0` (the int8 code and the f16 per-32 scale of the
+tree's SoA split to a f16 local tile) and `kernel_mul_mm_q8_0_f16` on the
+f16-weights GEMM's tile and `MM_BODY` (0022), the K-quant pattern
+(0001/0009/0011-0014): dequantize a 256-wide super-block to f16 in local
+memory, fp16 DPAS over k16, f32 accumulation. Dispatch: Q8_0 x F32 -> F32,
+16 or more src1 columns (after `ggml_cl_flat_cols`), `ne00 % 32 == 0`, 2D,
+contiguous, `view_offs == 0`, and only a flattened (SoA) Q8_0 tensor, read
+through a view's `view_src` (a plain extra cast to the SoA struct would hand
+the kernel a size as a buffer). The kernel is created only with sub-group 16:
+the Xe2 B60, not the A770 (`code`).
+
+Chunks past `ne00` are never written and never read (`kmax`, `code`).
+`GGML_OPENCL_Q8_XMX=0` falls back to upstream's kernels;
+`GGML_OPENCL_Q8_XMX_RED=1` zeroes the last 16 weights of every row (a kernel
+argument), the red case.
+
+**The language services.** The branch takes every 2D Q8_0 weight times a
+batch of 16 or more columns on the B60, which before ran upstream's f32
+kernels (16-31 columns the flat matvec, 32 or more the `l4_lm` GEMM), now
+with f16 weights and activations and f32 accumulation (`code`). In the
+served GGUFs the only Q8_0 weights on the B60 are in the MTP draft heads
+(the agent's `nextn.eh_proj`; 16 in Flash-Next's head, among them K = 320
+and 640); the agent's, Flash-Next's and the writer's main weights have none,
+and the coder runs on the A770 (`measured-here`, a GGUF census). Drafts are
+verified by the main model, so the answers cannot change; the speed is the
+release A/B's (A3-0058).
+
+**Served** (`measured-here`, B60, Z-Image Turbo Q8_0 + Qwen3-4B Q8_0, the
+service's flags, prompted, 8 steps, seed 42, Euler, one window):
+
+| arm | resolution | step | gate vs the CPU reference |
+|---|---|---|---|
+| 0058 | 1024² | **2.14 s** | PASS, cos worst 0.999926, PSNR 42.59 dB, SSIM 0.999257 |
+| 0058 off (`Q8_XMX=0`), the baseline arm | 1024² | 10.95 s | PASS, 0.999922, 42.40 dB |
+| 0058 red (`Q8_XMX_RED=1`) | 1024² | 2.14 s | FAIL, 0.987219, 19.56 dB |
+| 0058 | 512² | **0.476 s** | PASS, 0.999987, 46.54 dB |
+| 0058 off | 512² | 3.03 s | PASS, 0.999986, 45.84 dB |
+| 0058 red | 512² | 0.478 s | FAIL, 0.995502, 23.39 dB |
+
+5.1x on the 1024² step and 6.4x at 512²; a profile at 512² counts 1,605
+launches of `kernel_mul_mm_q8_0_f16` and none of the generic kernel. At
+1024² the kernel is 69 % of the step at ≈ 33.5 TFLOP/s, 34 % of the B60's
+XMX f16 peak. Faster than the f16 weights on 0022 (2.21 s) in 5.5 GiB less
+memory.
+
+**Op suites**: Q8_0 `MUL_MAT` cases for the branch (K off the 256
+super-block: 288, 2080, 96; odd m; n = 16, 17, 31, 32, 65, 512; the DiT's
+shapes; a view of the first rows of a larger weight; 3D src1 flattened to 16
+and 32 columns). B60: 151/151 pass with the branch and without it
+(`GGML_OPENCL_Q8_XMX=0`); with the red, 99/151 (`measured-here`). The A770,
+where the branch is not built, passes the 151.
+
+**The first build was wrong** (`measured-here`, 2026-10-18): the deq wrote a
+global K coordinate into the per-super-block tile; the gate caught it (cos
+worst 0.83). Fixed before the figures above.
+
+`GGML_OPENCL_F16_XMX_RED` (0022) shortens `ne00` the way 0058's first red
+did, so it misreads every row rather than leaving 16 of K out (`code`); it is
+a gross red, recorded, not changed here.

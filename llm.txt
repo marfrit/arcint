@@ -1,13 +1,16 @@
 # arcint
 
-> Intel Arc LLM inference server, deliberately narrow (Arc A770 16 GiB, Arc
-> Pro B60 24 GB, xe driver), with an OpenAI-compatible HTTP API. Serves the
+> Intel Arc inference server (Arc A770 16 GiB, Arc Pro B60 24 GB, xe
+> driver), with OpenAI-compatible HTTP APIs: language models through
+> libllama, and since 1.1.0 text-to-image (Z-Image Turbo) through
+> stable-diffusion.cpp's sd-server built against the same patched ggml tree
+> (package arcint-imggen, contrib/sdcpp, docs/imggen.md). Serves the
 > hybrid GatedDeltaNet/attention Qwen family from GGUF files: Qwen3.8-27B
 > (dense, the agent), Qwen3.6-27B-A3B-Coder (MoE, the coder) and
 > Qwen3.8-Flash-Next (512-expert MoE on one card plus host RAM), plus
 > Cydonia 24B (llama architecture) for writing. One engine: libllama
 > (llama.cpp at pinned commit 3e4dfa8) with ggml's OpenCL backend and
-> arcint's Intel kernel series (contrib/llama.cpp/patches, 0001-0056
+> arcint's Intel kernel series (contrib/llama.cpp/patches, 0001-0058
 > without 0031 and 0055).
 > arcint owns the HTTP surface, chat templates, tool calls, the sampler,
 > named lanes, MTP speculative decoding, context checkpoints and the expert
@@ -16,6 +19,11 @@
 
 ## Status
 
+- Version 1.1.0 (2026-10-18): image generation (docs/milestone-1.1.0.md):
+  Z-Image Turbo on the B60 on demand through the arcint-imggen package
+  (sd.cpp f0aac52's sd-server, /v1/images/generations, /health, /props);
+  patches 0057 (fused ROPE_APPLY, OpenCL) and 0058 (q8_0 GEMM on XMX, the
+  B60 only). 1024², 8 steps: 2.14 s a step, ~23.5 s a request steady.
 - Version 1.0.0 (2026-10-16): the 1.0 charter met (docs/milestone-1.0.0.md);
   DFlash2 drafting opt-in. 0.8.1 removed the series' opt-in alternatives
   (54 patches); 0.8.0 removed the OpenVINO engine (charter A6).
@@ -26,16 +34,20 @@
 - 1.0 charter: docs/milestone-1.0.0.md (feature complete, almost no gains
   by obvious changes).
 
-## Current numbers (measured-here, 1.0.0 pre-tag, the units' flags, A/B against 0.8.1)
+## Current numbers (measured-here, 1.1.0 pre-tag, the units' flags, A/B against 1.0.0)
 
-- agent, B60: prefill 695.5 t/s at 54,895 tokens, 491.9 at 138,028; the
-  needle at 138k; acceptance task 10/10.
-- coder, A770: prefill 725.6 t/s at 40,841 tokens; decode 51.2 / 47.6 /
-  44.2 t/s on three 300-token answers; the needle; acceptance task 9/10.
+- agent, B60: prefill 708.7 t/s at 54,895 tokens, 498.5 at 138,028 (1.0.0
+  695.7 / 491.9: 0058 runs the MTP head's Q8_0 weight in the prompt pass);
+  the needle at 138k; acceptance task 10/10.
+- coder, A770: prefill 724.3 t/s at 40,841 tokens; decode 51.1 / 47.5 /
+  44.0 t/s on three 300-token answers; the needle; acceptance task 9/10.
 - Flash-Next IQ3_XXS (the default), B60 + 28.72 GiB host bank: prefill
-  595.3 t/s at 20,045 tokens right after the capital; decode 34.5-34.9 t/s;
-  the needle. The IQ2_XS option (0.8.0): 665.6 t/s and 42.3 t/s.
-- Each equal to 0.8.1's binary in the same window (the release gate). Strata's SYCL port on
+  617.2 t/s at 20,045 tokens right after the capital (1.0.0 595.2); decode
+  35.2-35.4 t/s; the needle. The IQ2_XS option (0.8.0): 665.6 t/s and 42.3 t/s.
+- images, B60: Z-Image Turbo 1024², 8 steps: 2.14 s a step, VAE 6.3 s, peak
+  13.4 GiB, the image gate PASS (42.6 dB against a CPU reference); 512²
+  0.48 s a step; sd.cpp's Vulkan on the same card 7.64 s a 1024² step.
+- Each equal to or faster than 1.0.0's binary in the same window (the release gate). Strata's SYCL port on
   the same card (IQ2_XS): 620 t/s and 37.8 t/s (2026-10-14).
 - Quality (KL vs Q8_0 or CPU reference, 16 x 512): agent q8_0:q4_0 KV
   0.0057 nats; coder's searched quant 0.0237; Flash-Next IQ3_XXS 0.218 nats,

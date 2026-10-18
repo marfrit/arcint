@@ -1,0 +1,16 @@
+Source: arcint-imggen
+Section: graphics
+Priority: optional
+Maintainer: Markus Fritsche <mfritsche@reauktion.de>
+Build-Depends: cmake (>= 3.20), ninja-build, g++ (>= 13), opencl-headers, ocl-icd-opencl-dev, git, python3
+Standards-Version: 4.6.2
+Homepage: https://github.com/marfrit/arcint
+
+Package: arcint-imggen
+Architecture: amd64
+Depends: ${misc:Depends}, libc6 (>= 2.34), libstdc++6 (>= 13), libgomp1, ocl-icd-libopencl1
+Recommends: intel-opencl-icd
+Description: Text-to-image on Intel Arc GPUs (sd.cpp with arcint's kernels)
+ stable-diffusion.cpp's sd-server and sd-cli built against llama.cpp at
+ arcint's pin with arcint's Intel OpenCL kernels. The control file the recipe
+ writes is the authoritative one (build-deb.sh).

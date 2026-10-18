@@ -1,0 +1,10 @@
+arcint-imggen (1.1.0-1) trixie; urgency=medium
+
+  * First package: stable-diffusion.cpp f0aac52's sd-server and sd-cli in
+    upstream mode against llama.cpp 3e4dfa8 with arcint's patches 0001-0058
+    (0057 the fused ROPE_APPLY on OpenCL, 0058 the q8_0 XMX GEMM) and the
+    sd.cpp patches in contrib/sdcpp (the upstream-mode RoPE guard, /health
+    and /props). Installed as arcint-sd-server and arcint-sd-cli; unit
+    template arcint-imggen.service.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 18 Oct 2026 20:00:00 +0200

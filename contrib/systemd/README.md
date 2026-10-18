@@ -1,4 +1,4 @@
-# Two cards, four services: the dev fleet's units as an example
+# Two cards, five services: the dev fleet's units as an example
 
 These are the user units one host runs in production, with the operator-local
 detail taken out. `packaging/arcint.service` is the *template* the package
@@ -14,6 +14,7 @@ exactly its flags.
 | `arcint-writer.service` | GPU.0, on demand | Cydonia 24B v4.3 (Mistral Small 3.2 finetune), imatrix Q4_K_M GGUF, q8_0 KV, 98,304 tokens | 8088 |
 | `arcint-flashnext.service` | GPU.0, on demand | Qwen3.8-Flash-Next IQ3_XXS (since 2026-10-15): expert cache (12,000 MiB of slots, the rest in pinned host memory), the CPU misses, the bank stream for prefill, MTP 3 with Strata's stop, 131,072 tokens, q8_0 KV | 8089 |
 | `arcint-coder.service` | GPU.1 (Arc A770, 16 GB) | Qwen3.6-27B-A3B coder, the searched `c5f495ac shq8` GGUF, q8_0:q4_0 KV, 98,304 tokens, MTP 4 | 8080 |
+| `arcint-imggen.service` | GPU.0, on demand | Z-Image Turbo Q8_0 with the Qwen3-4B-Instruct-2507 Q8_0 encoder and `ae.safetensors`, 1024x1024, 8 steps; `arcint-sd-server` from the `arcint-imggen` package, not arcint | 8085 |
 
 The GPU.0 units take turns on one card (`Conflicts=`); on the host they come
 from, a unit manager switches between them on demand. Flash-Next's other

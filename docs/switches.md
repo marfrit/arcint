@@ -9,7 +9,7 @@ Tuning, off-switch, red-case and diagnostic switches are for measuring and
 may change or go without notice.
 
 A switch here is an environment variable read by arcint, by one of its tools,
-or by the llama.cpp patch series in `contrib/llama.cpp/patches` (0001-0056,
+or by the llama.cpp patch series in `contrib/llama.cpp/patches` (0001-0058,
 without 0031 and 0055). Switches the pinned llama.cpp tree reads by itself
 (`GGML_OPENCL_PLATFORM`, `GGML_OPENCL_FUSE_RMS_ADD`, `GGML_OPENCL_F16_MROW` and
 the others in upstream's `ggml-opencl.cpp`) are upstream's and not listed;
@@ -111,6 +111,7 @@ Four names are not in a table:
 |---|---|---|---|---|
 | `GGML_OPENCL_BANK_DIRECT` | on | `0`: the decode matvec gathers a missed expert into the card-side mirror instead of reading it from host memory. | 0022 | Flash-Next MTP 2, B60: 26.0 -> 28.2 t/s with it on (`measured-here`). |
 | `GGML_OPENCL_F16_XMX` | on | `0`: F16 / BF16 weights times 16+ columns use the tiled GEMM, not the XMX one. | 0022 | Needle prefill 342.8 -> 383.4 t/s with it on (`measured-here`). |
+| `GGML_OPENCL_Q8_XMX` | on | `0`: q8_0 weights times 16+ columns use upstream's q8_0 kernels, not the XMX GEMM. On the B60 only (the kernel needs sub-group 16). | 0058 | 1024² image step 2.14 -> 10.95 s with it off, 512² 0.476 -> 3.03 s (`measured-here`). |
 | `GGML_OPENCL_F32_SKINNY` | on (Intel) | `0`: skinny F32 products use ggml's paths. | 0005 | Coder router, 512-token prefill: 24.3 -> 9.0 ms, A770 (`measured-here`). |
 | `GGML_OPENCL_FA_DPAS` | on (Intel with DPAS) | `0`: prompt attention keeps `flash_attn_f32_f16.cl`. | 0008 | 512 rows x 4,096 keys: B60 8.2 ms, A770 22.4 ms (`measured-here`). |
 | `GGML_OPENCL_FA_DPAS2` | on (Xe2 only) | `0`: prompt attention keeps 0008's kernel. | 0038 | — |
@@ -148,7 +149,8 @@ Four names are not in a table:
 | switch | default | what it does | patch | evidence |
 |---|---|---|---|---|
 | `GGML_OPENCL_BANK_STREAM_RED` | off | Each ring slot is filled from the next bank tensor. | 0032 | The run aborts at the next synchronisation (`measured-here`). |
-| `GGML_OPENCL_F16_XMX_RED` | off | The last 16 of K left out of the XMX F16 GEMM. | 0022 | — |
+| `GGML_OPENCL_F16_XMX_RED` | off | The XMX F16 GEMM runs with K shortened by 16, which also shifts its row stride: every row misread, a gross red (`code`). | 0022 | — |
+| `GGML_OPENCL_Q8_XMX_RED` | off | The XMX q8_0 GEMM zeroes the last 16 weights of every row (those K terms left out). | 0058 | 1024² image gate cos worst 0.999926 -> 0.987219, PSNR 42.59 -> 19.56 dB; 52 of 151 Q8_0 op cases fail (`measured-here`). |
 | `GGML_OPENCL_FUSE_0049_RED` | off | The folded rms_norm scale is dropped. | 0049 | — |
 | `GGML_OPENCL_FUSE_0050_RED` | off | Every GDN snapshot slot is written over slot 0. | 0050 | Changed the Flash-Next texts (`measured-here`). |
 | `GGML_OPENCL_FUSE_0051_RED` | off | The gating fold reads A in place of dt. | 0051 | Changed all three Flash-Next texts and lost the needle (`measured-here`). |

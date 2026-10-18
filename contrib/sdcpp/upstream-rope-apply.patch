@@ -1,0 +1,20 @@
+diff --git a/src/model/common/rope.hpp b/src/model/common/rope.hpp
+index 93e457d..72c0ad8 100644
+--- a/src/model/common/rope.hpp
++++ b/src/model/common/rope.hpp
+@@ -1072,7 +1072,6 @@ namespace Rope {
+                                               ggml_tensor* pe,
+                                               bool rope_interleaved = true) {
+         auto ctx = runner_ctx->ggml_ctx;
+-#ifndef SD_USE_UPSTREAM_GGML
+         auto backend = runner_ctx->backend;
+         if (backend != nullptr && x->type == GGML_TYPE_F32 && pe->type == GGML_TYPE_F32 &&
+             x->ne[0] % 2 == 0 && pe->ne[0] == 2 && pe->ne[1] == 2 &&
+@@ -1082,7 +1081,6 @@ namespace Rope {
+                 return out;
+             }
+         }
+-#endif
+         // x: [N, L, n_head, d_head]
+         // pe: [L, d_head/2, 2, 2], [[cos, -sin], [sin, cos]]
+         int64_t d_head = x->ne[0];

@@ -1,0 +1,83 @@
+diff --git a/examples/server/CMakeLists.txt b/examples/server/CMakeLists.txt
+index 302a8d6..1797441 100644
+--- a/examples/server/CMakeLists.txt
++++ b/examples/server/CMakeLists.txt
+@@ -105,3 +105,8 @@ if(WIN32 AND NOT MSVC)
+ endif()
+ 
+ target_compile_features(${TARGET} PUBLIC c_std_11 cxx_std_17)
++
++# arcint: the build string /props reports (contrib/sdcpp/build-sdcpp.sh sets it).
++if(ARCINT_BUILD)
++    target_compile_definitions(${TARGET} PRIVATE ARCINT_BUILD="${ARCINT_BUILD}")
++endif()
+diff --git a/examples/server/routes_sdcpp.cpp b/examples/server/routes_sdcpp.cpp
+index a6c8a1e..0d9a115 100644
+--- a/examples/server/routes_sdcpp.cpp
++++ b/examples/server/routes_sdcpp.cpp
+@@ -9,6 +9,7 @@
+ #include "common/common.h"
+ #include "common/media_io.h"
+ #include "common/resource_owners.hpp"
++#include "ggml-backend.h"
+ 
+ namespace fs = std::filesystem;
+ 
+@@ -468,9 +469,57 @@ static bool parse_vid_gen_request(const json& body,
+     return true;
+ }
+ 
++#ifndef ARCINT_BUILD
++#define ARCINT_BUILD ""
++#endif
++
++// arcint (contrib/sdcpp/server-health-props.patch): the service probes of the
++// language units. /health answers once the server listens; the weights load
++// at the first request unless --eager-load is given.
++static json make_props_json(const ServerRuntime& runtime) {
++    const auto& ctx      = *runtime.ctx_params;
++    const auto& defaults = *runtime.default_gen_params;
++    auto base            = [](const std::string& p) { return p.empty() ? std::string() : fs::u8path(p).filename().u8string(); };
++    json devices         = json::array();
++    const std::string assigned = ctx.effective_backend.empty() ? ctx.backend : ctx.effective_backend;
++    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
++        const std::string name = ggml_backend_dev_name(dev);
++        if (!assigned.empty() && assigned.find(name) == std::string::npos) {
++            continue;
++        }
++        devices.push_back({{"name", name}, {"description", ggml_backend_dev_description(dev)}});
++    }
++    return {
++        {"model", base(resolve_display_model_path(runtime).u8string())},
++        {"text_encoder", base(ctx.llm_path)},
++        {"vae", base(ctx.vae_path)},
++        {"tensor_type_rules", ctx.tensor_type_rules},
++        {"backend", assigned},
++        {"devices", devices},
++        {"flash_attn", ctx.flash_attn_mode},
++        {"conv_direct", ctx.conv_direct_mode.empty() ? std::string("auto") : ctx.conv_direct_mode},
++        {"width", defaults.width},
++        {"height", defaults.height},
++        {"seed", defaults.seed},
++        {"sample", make_sample_params_json(defaults.sample_params, defaults.skip_layers)},
++        {"build", ARCINT_BUILD},
++    };
++}
++
+ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
+     ServerRuntime* runtime = &rt;
+ 
++    svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
++        res.status = 200;
++        res.set_content(R"({"status":"ok"})", "application/json");
++    });
++
++    svr.Get("/props", [runtime](const httplib::Request&, httplib::Response& res) {
++        res.status = 200;
++        res.set_content(make_props_json(*runtime).dump(), "application/json");
++    });
++
+     svr.Get("/sdcpp/v1/capabilities", [runtime](const httplib::Request&, httplib::Response& res) {
+         res.status = 200;
+         res.set_content(make_capabilities_json(*runtime).dump(), "application/json");

@@ -18,6 +18,65 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.1.0 — 2026-10-18
+
+Image generation (`docs/milestone-1.1.0.md`): text-to-image with Z-Image
+Turbo on the Arc Pro B60, on demand, served by stable-diffusion.cpp's own
+`sd-server` built against arcint's patched ggml tree, as the new package
+`arcint-imggen` and the unit `arcint-imggen.service`. arcint is no longer a
+language-only server (charter D1); multimodal input stays out.
+
+**Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (56
+patches, 0001-0058 without 0031 and 0055), compiled in; dependencies as in
+0.8.0. `arcint-imggen`: stable-diffusion.cpp `f0aac52` in upstream mode on
+the same tree, the OpenCL ICD loader and Intel's compute runtime.
+
+**Pre-tag check** (`measured-here`, 2026-10-18, the packages): the release
+gate `tests/acceptance/ab.py` against 1.0.0's binary, alternated: the agent
+708.65 / 498.45 t/s at 55k / 138k (1.0.0 695.65 / 491.9; 0058 takes its MTP
+head in the prompt pass), the coder 51.05 / 47.45 / 43.95 t/s and 724.25 at
+41k (1.0.0 51.10 / 47.50 / 44.10, 724.70), Flash-Next 617.17 / 35.27
+(1.0.0 595.17 / 35.30) in three rounds, after a two-round A/B that failed on
+the decode spread alone (the low runs occur in both binaries; tagged on the
+three-round pass by the operator's decision); every answer right and the
+same bytes in every run; the equivalence and concurrency suites, the
+sanitizers, the acceptance task 10/10 (agent) and 9/10 (coder).
+The image service in the same window, 1024², 8 steps: 2.14 s a step against
+10.95 with upstream's q8_0 GEMM and 4.77 with sd.cpp's generic RoPE, the VAE
+decode 6.33 s, peak VRAM 13.4 GiB, the image gate PASS against a CPU
+reference (cos worst 0.999926, 42.59 dB) within the baseline arm's
+tolerance, both red cases FAIL; 512² 0.476 s a step. sd.cpp's own Vulkan backend on the same card and files: 7.64 s a step at 1024², 1.78 at 512².
+
+- **0057, the fused `ROPE_APPLY` op** (CPU and OpenCL), ported from
+  stable-diffusion.cpp's ggml fork with an original OpenCL kernel; the sd.cpp
+  patch `contrib/sdcpp/upstream-rope-apply.patch` lets upstream mode use it.
+  `ggml-rpc.h`'s op count follows it. Unreachable from libllama.
+- **0058, the q8_0 GEMM on the XMX units** (the B60; the A770 does not build
+  it): a 1024² DiT step 5.1x faster. It also takes the language models'
+  Q8_0 weights in batches of 16 or more on the B60, which in the served
+  GGUFs are only the MTP draft heads (the agent's and Flash-Next's); the
+  answers cannot change, the speed is in the A/B above.
+  `GGML_OPENCL_Q8_XMX=0` is its off switch, `GGML_OPENCL_Q8_XMX_RED=1` its
+  red case.
+- **`test-backend-ops`** carries `test_rope_apply` (with a cross-check
+  against sd.cpp's own decomposition) and Q8_0 `MUL_MAT` cases for 0058.
+- **`contrib/sdcpp`**: the recipe `build-sdcpp.sh` (a pristine export of
+  sd.cpp `f0aac52`, the series asserted in tree and binary) and two sd.cpp
+  patches: the RoPE guard, and `/health` and `/props` for `sd-server` (model,
+  encoder, VAE, backend and card, defaults, build).
+- **`arcint-imggen` package** (`contrib/packaging/arcint-imggen`):
+  `/usr/bin/arcint-sd-server`, `/usr/bin/arcint-sd-cli`, the unit template
+  and the gate tool. The unit: port 8085, `Conflicts=` with the B60's
+  language units, the DiT as q8_0, the VAE with the direct conv
+  (`--conv-direct auto,vae=on`: 2.43x faster than im2col with the same image;
+  sd.cpp's `auto` picks im2col on OpenCL).
+- **`tools/imggen_gate.py`**: the image gate, per-step latent previews and
+  the final image against a CPU reference, comparative against a baseline
+  arm; it refuses arms whose prompt, size, steps, seed, sampler or models
+  differ. **`tools/imggen_profile.py`**: kernels ranked by device time.
+- The development record's two "defects" were arms that differed in prompt
+  or steps (`docs/campaigns/imggen-attention-path.md` (on the `qfndev` branch), closed).
+
 ## 1.0.0 — 2026-10-16
 
 arcint 1.0: the charter's criteria met (`docs/milestone-1.0.0.md`): the
