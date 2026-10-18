@@ -58,22 +58,26 @@ the RAM for its bank (DESIGN §7.2).
 
 ## Current numbers
 
-1.0.0's pre-tag check (2026-10-16): the release package with each unit's
-flags, alternated with 0.8.1's binary in one window (two runs each), the
-model on the NVMe, `measured-here` on the named card; the IQ2_XS row is
-0.8.0's. "task" is the acceptance task: a
+1.1.0's pre-tag check (2026-10-18): the release package with each unit's
+flags, alternated with 1.0.0's binary in one window (two runs each,
+Flash-Next three), the model on the NVMe, `measured-here` on the named card;
+the IQ2_XS row is 0.8.0's. "task" is the acceptance task: a
 Lua CSV parser to RFC 4180, ten named cases, the candidate code executed, one
 point per case, at temperature 0.
 
 | service | card | prefill | decode | answers |
 |---|---|---|---|---|
-| agent | B60 | 695.5 t/s at 54,895 tokens, 491.9 at 138,028 | not in this check (38.9 / 25.6 / 16.6 / 13.5 t/s at 4k / 55k / 130k / 200k, 2026-10-16, the DFlash2 campaign's MTP 5 arm at 212,992 ctx) | the needle at 138k; task 10/10 |
-| coder | A770 | 725.6 t/s at 40,841 tokens | 51.2 / 47.6 / 44.2 t/s on three 300-token answers | the needle; task 9/10 |
-| Flash-Next, IQ3_XXS | B60 + 28.7 GiB host bank | 595.3 t/s at 20,045 tokens (asked right after the capital) | 34.5-34.9 t/s | the needle |
+| agent | B60 | 708.7 t/s at 54,895 tokens, 498.5 at 138,028 | not in this check (38.9 / 25.6 / 16.6 / 13.5 t/s at 4k / 55k / 130k / 200k, 2026-10-16, the DFlash2 campaign's MTP 5 arm at 212,992 ctx) | the needle at 138k; task 10/10 |
+| coder | A770 | 724.3 t/s at 40,841 tokens | 51.1 / 47.5 / 44.0 t/s on three 300-token answers | the needle; task 9/10 |
+| Flash-Next, IQ3_XXS | B60 + 28.7 GiB host bank | 617.2 t/s at 20,045 tokens (asked right after the capital) | 35.2-35.4 t/s | the needle |
+| images, Z-Image Turbo | B60 | | 1024x1024, 8 steps: 2.14 s a step, the VAE 6.3 s, ~23.5 s a request; 512x512: 0.48 s a step | the image gate against a CPU reference: 42.6 dB |
 | Flash-Next, IQ2_XS option | B60 + 20.3 GiB host bank | 665.6 t/s, the same protocol | 42.3 t/s | the needle |
 
-Every speed is equal to 0.8.1's in the same window (the release gate,
-`tests/acceptance/ab.py`); the dev host drifts by up to 0.3 % on prefill and
+Every speed is equal to 1.0.0's in the same window or faster (the release
+gate, `tests/acceptance/ab.py`): the agent's and Flash-Next's prefill gained
+1-4 % from patch 0058, which runs their MTP heads' Q8_0 weights on the XMX
+units in the prompt pass. sd.cpp's own Vulkan backend on the same card takes
+7.64 s a 1024² step; the dev host drifts by up to 0.3 % on prefill and
 1 % on decode over a day, so numbers from different windows differ by that
 much.
 

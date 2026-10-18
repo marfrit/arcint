@@ -629,25 +629,28 @@ Every open lever or defect is a campaign in `docs/campaigns/`.
 
 ### 7.1 Current numbers
 
-1.0.0's pre-tag check: the release package, the units' flags, the served
+1.1.0's pre-tag check: the release package, the units' flags, the served
 check of each service (`tests/acceptance/cells/served_check.py`) through the
-release gate `tests/acceptance/ab.py`: the package and 0.8.1's binary
-alternated in one window, two runs each, the model on the NVMe,
-`measured-here`, 2026-10-16 (the IQ2_XS row: 0.8.0's, 2026-10-15). Decode is
-a 300-token answer; prefill excludes nothing (cold lanes). Flash-Next asks
-the needle right after the capital. Every metric equal to 0.8.1's within the
-gate's allowance (the old arm's spread, at least 0.5 %; the spreads
-0.00-0.21 %, Flash-Next's decode 2.3 %), the agent's and the
-coder's answers the same bytes in every run; Flash-Next's 1.0 runs gave two
-different texts (0.8.1's the same twice), every answer right (not
-attributed). The dev host drifts by up to 0.3 % (prefill) and 1 % (decode)
-over a day (§5).
+release gate `tests/acceptance/ab.py`: the package and 1.0.0's binary
+alternated in one window, two runs each (Flash-Next three), the model on
+the NVMe, `measured-here`, 2026-10-18 (the IQ2_XS row: 0.8.0's, 2026-10-15).
+Decode is a 300-token answer; prefill excludes nothing (cold lanes).
+Flash-Next asks the needle right after the capital. Every metric equal to
+1.0.0's within the gate's allowance (the old arm's spread, at least 0.5 %)
+or faster: the agent's prefill +1.9 / +1.3 % and Flash-Next's +3.7 %, from
+0058 taking their MTP heads' Q8_0 weights in the prompt pass. Every answer
+the same bytes in every run of both arms. Flash-Next's first, two-round
+A/B failed on the decode spread alone (33.9 / 35.2 against 34.2 / 35.3);
+the low runs occur in both binaries; the three-round A/B passed and the
+release was tagged on it (`decision`, operator, 2026-10-18). The dev host
+drifts by up to 0.3 % (prefill) and 1 % (decode) over a day (§5).
 
 | service | card | configuration | prefill | decode | answers |
 |---|---|---|---|---|---|
-| agent | B60 | Q4_K_M, 245,760 ctx, q8_0:q4_0 KV, MTP 5 | 695.7 / 695.3 t/s at 54,895 tokens, 492.0 / 491.8 at 138,028 | not in the pre-tag check | Paris, the needle at 138k, the task 10/10 |
-| coder | A770 | `c5f495ac-shq8`, 98,304 ctx, q8_0:q4_0 KV, MTP 4 | 725.2 / 725.9 t/s at 40,841 tokens | 51.2 / 47.6 / 44.2 t/s on three answers | Paris, the needle, the task 9/10 |
-| Flash-Next | B60 + host | IQ3_XXS, 131,072 ctx, q8_0 KV, 12,000 MiB of slots (7,208 slots), bank 28.72 GiB, MTP 3 with min-p 0.5, Q4_K draft head, the bank stream, the CPU misses | 595.4 / 595.1 t/s at 20,045 tokens | 34.5 / 34.9 t/s | Paris, the needle |
+| agent | B60 | Q4_K_M, 245,760 ctx, q8_0:q4_0 KV, MTP 5 | 708.7 / 708.6 t/s at 54,895 tokens, 498.4 / 498.5 at 138,028 | not in the pre-tag check | Paris, the needle at 138k, the task 10/10 |
+| coder | A770 | `c5f495ac-shq8`, 98,304 ctx, q8_0:q4_0 KV, MTP 4 | 724.0 / 724.5 t/s at 40,841 tokens | 51.1 / 47.5 / 43.9 and 51.0 / 47.4 / 44.0 t/s on three answers | Paris, the needle, the task 9/10 |
+| Flash-Next | B60 + host | IQ3_XXS, 131,072 ctx, q8_0 KV, 12,000 MiB of slots (7,208 slots), bank 28.72 GiB, MTP 3 with min-p 0.5, Q4_K draft head, the bank stream, the CPU misses | 617.2 / 617.6 / 616.7 t/s at 20,045 tokens | 35.4 / 35.2 / 35.2 t/s | Paris, the needle |
+| images | B60 | Z-Image Turbo Q8_0, Qwen3-4B Q8_0, `ae.safetensors`; 1024², 8 steps, the unit's flags (§3.11) | | 2.14 s a step, the VAE 6.33 s, peak 13,373 MiB | the image gate PASS, 42.59 dB against the CPU reference |
 | Flash-Next, IQ2_XS option | B60 + host | IQ2_XS, 13,400 MiB of slots (9,724), bank 20.32 GiB, the rest as above | 665.8 / 665.4 t/s | 42.2 / 42.3 t/s | Paris, the needle |
 
 The agent's decode, not in the release gate: 38.9 / 25.6 / 16.6 / 13.5 t/s
