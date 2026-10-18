@@ -636,7 +636,18 @@ public:
         ckpts_.resize(static_cast<size_t>(lanes_));
 
         const char* tmpl = llama_model_chat_template(model_, nullptr);
-        if (tmpl == nullptr) throw std::runtime_error(log::format("%s carries no chat template", cfg.gguf_path.c_str()));
+        if (tmpl == nullptr) {
+            // --tts: the audio-generation backbone (Qwen3-TTS) ships no chat
+            // template; its prompt is built by libmtmd's gen pipeline (text +
+            // codec language), not from these messages. Fall back to ChatML so
+            // a stray chat request renders rather than crashes — the speech
+            // routes are the unit's own contract.
+            if (!cfg.tts)
+                throw std::runtime_error(log::format("%s carries no chat template", cfg.gguf_path.c_str()));
+            log::warn("load", "%s carries no chat template: --tts, using the ChatML fallback for a stray chat request",
+                      cfg.gguf_path.c_str());
+            tmpl = "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+        }
         template_src_ = tmpl;
         const char* bos = llama_vocab_get_text(vocab_, llama_vocab_bos(vocab_));
         const char* eos = llama_vocab_get_text(vocab_, llama_vocab_eos(vocab_));
