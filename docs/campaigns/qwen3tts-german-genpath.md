@@ -96,22 +96,35 @@ transcribed with the same whisper model as the STT gate.
 
 | arm | backbone / mmproj | sampling | frames / audio | reported stop | hypothesis | WER | verdict |
 |---|---|---|---|---|---|---|---|
-| `q8-de-default` (red baseline) | Q8_0 | llama.cpp defaults (temp 0.8, top_k 40, top_p 0.95, repetition 1.05) | **512 cap** / 40.96 s, 150.3 s gen + 1.8 s vocoder | no `codec_eos` | "Ja." | 1.00 | **FAIL** |
-| `bf16-de-default` | **bf16** | same as the red arm | **44** / 3.52 s, 15.1 s gen | **`codec_eos` sampled** | "Der Zug fährt nach Berlin." exact | **0.00** | **PASS** |
-| `q8-de-qwen` (sampling lever alone) | Q8_0 | Qwen as shipped (temp 0.9, top_k 50, top_p 1.0, repetition 1.05, seed 42) | **512 cap** / 40.96 s | no `codec_eos` | "Ja, das ist so, wie gesagt." | 1.20 | **FAIL** |
+| `q8-de-default` (red baseline) | Q8_0 / Q8_0 | llama.cpp defaults (temp 0.8, top_k 40, top_p 0.95, repetition 1.05) | **512 cap** / 40.96 s, 150.3 s gen + 1.8 s vocoder | no `codec_eos` | "Ja." | 1.00 | **FAIL** |
+| `bf16-de-default` | bf16 / bf16 | same as the red arm | **44** / 3.52 s, 15.1 s gen | **`codec_eos` sampled** | "Der Zug fährt nach Berlin." exact | **0.00** | **PASS** |
+| `q8-de-qwen` (sampling lever alone) | Q8_0 / Q8_0 | Qwen as shipped (temp 0.9, top_k 50, top_p 1.0, repetition 1.05, seed 42) | **512 cap** / 40.96 s | no `codec_eos` | "Ja, das ist so, wie gesagt." | 1.20 | **FAIL** |
+| `q8-bk-bf16mm` (mmproj lever) | **Q8_0** / **bf16** | llama.cpp defaults | **37** / 2.96 s | **`codec_eos` sampled** | "Der Zug fährt nach Berlin." exact | **0.00** | **PASS** |
+| `bf16-bk-q8mm` (backbone lever, the mirror) | **bf16** / **Q8_0** | llama.cpp defaults | **512 cap** / 40.96 s | no `codec_eos` | "* Musik *" | 1.00 | **FAIL** |
 
-**Disposition so far:** the defect is **quantization of the talker** — the
-bf16 pair speaks the sentence exactly and reaches `codec_eos` at frame 44,
-where the Q8_0 arm runs to the cap under both the llama.cpp defaults and
-Qwen's own sampling values. Sampling is **not** the cause (the Qwen-sampling
-Q8_0 arm still fails), and the language path is consistent (candidate 2
-closed). The 1.2.0 model set's bf16 pair is the fix; the substitute for the
-Q8_0 model (`docs/milestone-1.2.0.md` §2). Open: the **card arm** at bf16
-through arcint's route (the milestone C4/B3 gate), and whether the mmproj
-(the code2wav/speaker half) also needs bf16 rather than its Q8_0 form — the
-arm above pairs bf16 backbone with bf16 mmproj, so that is a separate
-variable still to test on the card. The bf16 pair is 4.14 GB total against
-Q8_0's 2.30 GB (arithmetic from the HF sizes), inside one card's idle VRAM.
+**Disposition so far — the defect is the `mmproj`, not the backbone.** The
+2×2 on the same sentence and sampling isolates it: the **backbone quantization
+is irrelevant** (`bf16` backbone + `Q8_0` mmproj fails exactly as the all-Q8
+arm, and `Q8_0` backbone + `bf16` mmproj speaks the sentence and reaches
+`codec_eos` at frame 37). The Q8_0 mmproj carries the audio-generation half:
+the **code predictor** (`a.gen.code.*`, 35 `blk` tensors + `embd`/`head`/
+`proj_in`/`out_embd`), whose `is_eos` and `h_next` come from it, and the
+code2wav acoustic decoder (`a.gen.wav.tfm` 58 + `quant`/`up`), which turns the
+codes into PCM. In the `bf16` mmproj 107 of these go `Q8_0 → BF16`; 38 more
+speaker-encoder/other tensors go `F16 → BF16`. Since the Q8_0 mmproj arm never
+samples `codec_eos` and runs to the cap, the code predictor (which computes
+`is_eos`, `step_gen` `mtmd_gen_audio_process` GEN_CODE) is the primary
+suspect; which of `a.gen.code`, `a.gen.wav` or the remaining tensors owns it
+is the next CPU sub-experiment, by `llama-quantize --pure` requantizing the
+bf16 mmproj with one group at BF16 at a time (mixed arms running).
+
+Sampling is **not** the cause (the Qwen-sampling Q8_0 arm still fails), and
+the language path is consistent (candidate 2 closed). **The fix is a bf16
+`mmproj`**; the backbone can stay Q8_0. `Q8_0` backbone (1.85 GB) + bf16
+mmproj (0.67 GB) = **2.52 GB**, smaller than the bf16 pair's 4.14 GB
+(`arithmetic` from the HF sizes), inside one card's idle VRAM. Open: the
+**card arm** through arcint's route (milestone C4/B3), and the per-subgroup
+quantization probe above.
 
 ## Where it lives
 
