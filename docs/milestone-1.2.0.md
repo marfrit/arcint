@@ -474,18 +474,19 @@ and both load fixes, and the window ran a build of it):**
 | item | measured () |
 |---|---|
 | A4, it answers | `/v1/audio/speech` returned WAV bytes for the enrolled voices (`gate-de` and `gate-fleurs`, both from FLEURS `de_de` samples); the D5 refusals — a reference-audio field and an unknown voice — answered 400 (`measured-here`) |
-| C4, intelligibility | **FAIL**: round-trip corpus WER **2.0909** over 8 sentences at floor 0.20 (voice `gate-fleurs`, seed 42); the waveform is not intelligible German — the transcripts are unrelated phrases and `* Musik *` labels, and one sentence's own words never come back |
-| B3, real time | **FAIL**: generation hit the 512-frame cap (41.0 s of audio) at 140–180 s of process per sentence — a real-time factor of ~**0.29** (slower than real time); one sentence stopped at 48 frames, the rest at the cap, so end-of-speech is not being sampled |
+| C4, intelligibility (the greedy arm) | **FAIL**: round-trip corpus WER **2.0909** over 8 sentences at floor 0.20 (voice `gate-fleurs`, seed 42); the waveform is not intelligible German — the transcripts are unrelated phrases and `* Musik *` labels, and one sentence's own words never come back |
+| B3, real time (the greedy arm) | **FAIL**: generation hit the 512-frame cap (41.0 s of audio) at 140–180 s of process per sentence — a real-time factor of ~**0.29** (slower than real time); one sentence stopped at 48 frames, the rest at the cap |
+| the arm's own defect | the gate defaulted to a **greedy temperature 0** (a `body` field added silently by the first gate), where the reference `tools/tts/tts.cpp` samples the backbone's codec tokens with `common_params`' temperature 0.8 / top_k 40 / top_p 0.95 / repetition 1.0. Greedy derails the codec stream past the first frames and never reaches end-of-speech (`measured-here`): the 512-frame cap and the 2.09 WER are the **gate arm's**, not a verdict on the implementation. `tools/tts_gate.py` now carries the reference defaults as flags and prints the sampling with every verdict |
 | the window | a concurrent leg driver in the same workspace ran it (the wiring is on the branch); the physical-host sampler, the one-process-per-card check and the pid stop/restore all held, the B60's language unit restored after 100 s |
 
-**Open, and the next step is a campaign:** the `qwen3tts` gen path is wrong
-somewhere in the prompt/speaker/sampling hand-off — no intelligible German, no
-end-of-speech, an ~0.29 real-time factor. It needs its own campaign document
-(the reference's `mtmd-helper-gen.cpp` control loop read line by line against
-this build, red-first arms: the sampling settings the backbone needs, whether
-the sampled token is the semantic code or a special token, the language and
-spoken-text path, the speaker encoder's output). A4's WAV and the refusals are
-real; C4 and B3 fail. Do not adopt these numbers as a passing gate.
+**Open, and the next step:** re-run the card arm with the gate's corrected
+stochastic sampling (the reference's defaults, seed fixed). If it still fails,
+the `qwen3tts` gen path is wrong somewhere in the prompt/speaker/sampling
+hand-off (read `mtmd-helper-gen.cpp`'s control loop line by line against this
+build, red-first arms: the sampled token, the language and spoken-text path,
+the speaker encoder's output, end-of-speech) and it needs its own campaign
+document. A4's WAV and the refusals are real; C4 and B3 are **owed, not
+passing**. Do not adopt the greedy arm's numbers as a verdict on the code.
 
 The VLM phase-0 dispositions (the `vlm_gate` tool run, the CPU encoder B4
 reference, the op profile, the red case, the package/unit/probes) are still
