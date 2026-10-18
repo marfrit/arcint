@@ -3711,3 +3711,43 @@ worst 0.83). Fixed before the figures above.
 `GGML_OPENCL_F16_XMX_RED` (0022) shortens `ne00` the way 0058's first red
 did, so it misreads every row rather than leaving 16 of K out (`code`); it is
 a gross red, recorded, not changed here.
+
+## 0059-opencl-intel-conv-3d.patch
+
+`CONV_3D` and `IM2COL_3D` were the pin's two OpenCL gaps for image work
+(`docs/milestone-1.1.0.md` §0.1); sd.cpp's `ggml_ext_conv_3d`
+(`src/core/ggml_extend.cpp:451`) probes `IM2COL_3D` and falls to
+`ggml_conv_3d_direct` (`GGML_OP_CONV_3D`) on a backend that lacks it, and a
+backend with neither runs the Wan VAE's 3D convolutions on the CPU. The
+patch adds `GGML_OP_CONV_3D` on the **implicit GEMM**, the form CUDA's
+`im2col_3d` and Vulkan's `conv3d_mm` use, and the one arcint's
+`conv2d_f16_f32.cl` already has: no im2col matrix in global memory. The
+kernel folds the depth into the reduction axis (`K = OC`,
+`CRS = IC*KD*KH*KW`, `NPQ = N*OD*OH*OW`) and reuses the conv2d tile
+(`BS_K 64`, `BS_CRS 16`, `BS_NPQ 64`, `TS_K 4`, `TS_NPQ 8`, f32
+accumulation via `mad`) over `[KW, KH, KD, IC*OC]` weights,
+`[IW, IH, ID, IC*N]` input and `[OW, OH, OD, OC*N]` output. Two files:
+`conv3d.cl` (f32 weights) and `conv3d_f16_f32.cl` (f16 weights, the VAE's),
+the input always F32 and the output always F32 (`ggml_conv_3d_direct`'s own
+layout, `code`). Admission: `supports_op` takes (f16 weights x f32 input ->
+f32) and (f32 x f32 -> f32); `GGML_OPENCL_CONV_3D=0` returns false, the
+baseline arm. `GGML_OPENCL_CONV3D_RED=1` ignores the weights, so every
+output is 0 -- a gross tripwire, like 0022's f16 red.
+
+**Op suite** (`measured-here`, 2026-10-18, B60 `8086:e211`, OpenCL 0:0,
+`test-backend-ops -o CONV_3D`, the CPU reference): **276/276 pass** with the
+branch; the red FAILs 270 of the 276 (the 6 that pass are the `CRS = 0`
+degenerate shapes, 0 in both arms); `GGML_OPENCL_CONV_3D=0` reports every
+case unsupported. The 276 are the tree's own `test_conv_3d` cases -- strides
+2/3, padding 0-4, dilation 1/2, `KD/KH/KW` 1 and 3 (a 1-frame 3D plane, a
+5x1x3 kernel), `kernel_offset` 1, and the zero-size `KW`/`KH`/`KD` shapes
+(`code`).
+
+**Open**: the Qwen-Image image gate against the CPU reference and the VAE
+decode's device time. The campaign is
+`docs/campaigns/imggen-wan-vae-conv3d.md`.
+
+**No `IM2COL_3D`**: with a supported `CONV_3D`, sd.cpp's fallback needs
+only the direct op; the im2col form would turn the same GEMM into a
+`mul_mat` and hand the XMX tiles a flattened matrix, which is the shape to
+measure when the VAE's own time is known (`arithmetic`, not measured).
