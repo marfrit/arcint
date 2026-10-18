@@ -31,12 +31,21 @@ patches, 0001-0058 without 0031 and 0055), compiled in; dependencies as in
 0.8.0. `arcint-imggen`: stable-diffusion.cpp `f0aac52` in upstream mode on
 the same tree, the OpenCL ICD loader and Intel's compute runtime.
 
-**Pre-tag check** (`measured-here`, 2026-10-18, the packages): PRETAG-LLM
+**Pre-tag check** (`measured-here`, 2026-10-18, the packages): the release
+gate `tests/acceptance/ab.py` against 1.0.0's binary, alternated: the agent
+708.65 / 498.45 t/s at 55k / 138k (1.0.0 695.65 / 491.9; 0058 takes its MTP
+head in the prompt pass), the coder 51.05 / 47.45 / 43.95 t/s and 724.25 at
+41k (1.0.0 51.10 / 47.50 / 44.10, 724.70), Flash-Next 617.17 / 35.27
+(1.0.0 595.17 / 35.30) in three rounds, after a two-round A/B that failed on
+the decode spread alone (the low runs occur in both binaries; tagged on the
+three-round pass by the operator's decision); every answer right and the
+same bytes in every run; the equivalence and concurrency suites, the
+sanitizers, the acceptance task 10/10 (agent) and 9/10 (coder).
 The image service in the same window, 1024², 8 steps: 2.14 s a step against
 10.95 with upstream's q8_0 GEMM and 4.77 with sd.cpp's generic RoPE, the VAE
 decode 6.33 s, peak VRAM 13.4 GiB, the image gate PASS against a CPU
 reference (cos worst 0.999926, 42.59 dB) within the baseline arm's
-tolerance, both red cases FAIL; 512² 0.476 s a step. PRETAG-VK
+tolerance, both red cases FAIL; 512² 0.476 s a step. sd.cpp's own Vulkan backend on the same card and files: 7.64 s a step at 1024², 1.78 at 512².
 
 - **0057, the fused `ROPE_APPLY` op** (CPU and OpenCL), ported from
   stable-diffusion.cpp's ggml fork with an original OpenCL kernel; the sd.cpp

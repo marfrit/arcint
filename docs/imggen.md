@@ -21,6 +21,11 @@ with its `arm.json` (`measured-here`; the setup is the charter's §2 header).
 | DiT f16 (`^model\.=f16`, the dev unit's form), VAE im2col | 2.21 s | 15.12 s | 22,685 MiB | cos 0.999911, 41.67 dB; FAILs the baseline's per-step MSE (+15 %) |
 | 0057 off (sd.cpp's generic RoPE build), VAE im2col | 4.77 s | 15.40 s | 17,211 MiB | PASS, 0.999921, 42.85 dB |
 
+sd.cpp's own Vulkan backend on the same card, files, prompt, seed and steps
+(B3): 7.64 s a step at 1024², the VAE 10.48 s, gate PASS (cos worst
+0.999905, 41.39 dB); 1.78 s at 512². The development record's Vulkan arm
+has no `arm.json`; this one does.
+
 At 512² the service form takes **0.476 s a step** (2.10 it/s) against the
 generic q8_0 GEMM's 3.03 s (6.4x), PASS at 46.54 dB (baseline 45.84). The
 service serves the same image as `sd-cli` pixel for pixel; a 1024² request
