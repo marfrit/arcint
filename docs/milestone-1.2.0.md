@@ -492,6 +492,18 @@ and spoken-text path, and the speaker encoder's output. It needs its own
 campaign document. A4's WAV and the refusals are real; C4 and B3 **fail on the
 record and are not a passing gate**.
 
+**The upstream reference tool reproduces the German failure
+(measured-here, 2026-10-19):** `llama-tts`, built from the same pin + series
+on the card host and run on the **CPU** (`-ngl 0`) on the same model pair:
+the English "Hello world, this is a test." comes back as ` this is a test`
+(intelligible), while the German "Der Zug nach Berlin ..." comes back as an
+unrelated phrase (`Vielen Dank.`) both **with and without** the enrolled FLEURS
+speaker reference. So the defect is the `qwen3tts` gen path's language / model
+side, not arcint's loop — the loop is faithful to `tts.cpp` — and the campaign's
+first levers are the Q8_0 quant (§2's bf16 alternative is the accuracy option),
+the `<|codec_language_german|>` path, and end-of-speech (the reference hit its
+`-n` cap too: neither arm ever samples `codec_eos`).
+
 The VLM phase-0 dispositions (the `vlm_gate` tool run, the CPU encoder B4
 reference, the op profile, the red case, the package/unit/probes) are still
 open. The speech units' files are written (`contrib/systemd/`, ports
