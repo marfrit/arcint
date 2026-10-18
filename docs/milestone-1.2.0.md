@@ -401,19 +401,23 @@ or released (D9).
 ### 9.1 The card-window incident (measured-here, 2026-10-18, on the record)
 
 This is the window's own lesson, written down before it is lost. While the
-dev VLM server held the **B60**, a stale leg driver from a finished session
-(a deleted `` script still running under the physical host's init, spawning
-a 4k-context B60 server) held the same card, and the production language
-unit was restarted on it — **three processes on one card under xe**. Result:
+dev VLM server held the **B60**, the 1.1.1 **release session's** own card
+window also started a capital-check `arcint` on the B60 at 18:16:10 UTC (that
+session's report; the process hung mid-load; one of the three was not this
+window's), and the production language unit was restarted on it — **three
+processes on one card under xe**. Result:
 an `xe_pt_zap_ptes` NULL-pointer oops in the page-fault workqueue
 (`xe_po_move` → `xe_pt_zap_ptes`, CPU 5, `kworker/u65:3 exited with irqs
 disabled`) and an RCU self-detected stall with `kswapd0` spinning; the
 physical host stopped answering SSH. Per `docs/sop-card-window.md` and
 `CLAUDE.local.md`, that state has only been recovered by a host reboot, and
 the reboot is the operator's call. The lessons: **sweep stale leg drivers by
-pid before restoring production units**, and **never restore a unit onto a
-card a dev leg holds**; the SOP's “zombie sweep by pid” already said
-it, and this window paid for skipping it.
+pid before restoring production units**, **never restore a unit onto a card a
+dev leg holds**, and **read the owner of every card process from the process
+tree, not by assumption**: a process on the card can belong to another
+session (the release session uses short B60 gaps too), so the non-service
+holder check runs before **every** card step; the SOP's “zombie sweep by pid”
+already said it, and this window paid for skipping it.
 
 ### 9.2 STT measured (Phase 0, 2026-10-18 late)
 
@@ -478,7 +482,7 @@ and both load fixes, and the window ran a build of it):**
 | B3, real time (the greedy arm) | **FAIL**: generation hit the 512-frame cap (41.0 s of audio) at 140–180 s of process per sentence — a real-time factor of ~**0.29** (slower than real time); one sentence stopped at 48 frames, the rest at the cap |
 | the arm's own defect | the gate defaulted to a **greedy temperature 0** (a `body` field added silently by the first gate), where the reference `tools/tts/tts.cpp` samples the backbone's codec tokens with `common_params`' temperature 0.8 / top_k 40 / top_p 0.95 / repetition 1.0. Greedy derails the codec stream past the first frames and never reaches end-of-speech (`measured-here`): the 512-frame cap and the 2.09 WER are the **gate arm's**, not a verdict on the implementation. `tools/tts_gate.py` now carries the reference defaults as flags and prints the sampling with every verdict |
 | the corrected (stochastic) arm | **also FAIL**: corpus WER **2.1667** (floor 0.20) with the reference's sampling defaults and a fixed seed; every sentence still hit the 512-frame cap (41.0 s), so end-of-speech never arrives and the waveform is not intelligible German (`* Musik *` labels). The gate's greedy setting was one defect; the code path is the other |
-| the window | a concurrent leg driver in the same workspace ran it (the wiring is on the branch); the physical-host sampler, the one-process-per-card check and the pid stop/restore all held, the B60's language unit restored after 100 s |
+| the window | driven by this same session's own remote leg script — **there was no second session**: `--sh` returned after a few seconds while the remote `tts-leg-card.sh` (started by the remote daemon at 21:25:03 UTC) kept running for 20+ minutes (the wiring is on the branch); the physical-host sampler, the one-process-per-card check and the pid stop/restore all held, the B60's language unit restored after 100 s |
 
 **Open, and the next step is a campaign:** with both arms failing (WER 2.09
 greedy, 2.1667 stochastic), the `qwen3tts` gen path is wrong in the
