@@ -375,6 +375,19 @@ f16 XMX GEMM (36.9 % of the f16 run, 58.9 % of the DiT-only per-step mix) from
 31 % toward 70 % of the peak. The elementwise dispatch flatten (the recon's
 second lever) is untouched. The bar `§Performance target` holds.
 
+**The q8_0 XMX GEMM fired** (`measured-here`, 2026-10-18, patch
+`0058-opencl-intel-q8_0-xmx-gemm.patch`): `deq_q8_0` + `kernel_mul_mm_q8_0_f16`
+on the f16-weights tile/`PLAIN_ARGS`, the tree's q8_0 code+scale buffers read
+directly; `GGML_OPENCL_Q8_XMX=0` the generic fallback, `GGML_OPENCL_Q8_XMX_RED=1`
+the red case. At **1024²** the q8_0 step is **2.13 s against the generic
+10.95 s -- 5.1x**, near the f16 XMX route's 2.21 s, with the q8 footprint
+(peak 17,137 MiB of 24,480); the gate PASSes both arms (XMX cos worst
+0.999902 / PSNR 43.03 dB; generic 0.999898 / PSNR 42.75, same window). At
+512² the gain is marginal (2.92 against 3.02) because other ops dominate
+there. The red (last 16 of K left out) FAILs: cos worst 0.829442, PSNR
+7.21 dB. The campaign `docs/campaigns/imggen-q8_0-xmx-gemm.md` closed
+2026-10-18; the durable image form is now **q8_0 XMX at f16 step speed**.
+
 **1024² A2 with the fixed 0057** (`measured-here`, 2026-10-17): q8_0, 1024²/8,
 same prompt/seed. Steady step **13.14 s** (first 33.58 s) against pre-0057's
 15.78 -- a saving of ~21 s a run (7 x 2.64 + 2.9 first). No CPU island
@@ -500,6 +513,6 @@ GroupNorm, CONV_3D only with Qwen-Image), 3 the service (package, unit,
 
 - The recipe: `contrib/sdcpp/build-sdcpp.sh`.
 - The engine: stable-diffusion.cpp `f0aac52` (reference source, not vendored).
-- The kernels: `contrib/llama.cpp/patches` (0001-0057 without 0031, 0055), the
+- The kernels: `contrib/llama.cpp/patches` (0001-0058 without 0031, 0055), the
   sd.cpp integration patch `contrib/sdcpp/upstream-rope-apply.patch`, and
   `docs/campaigns/dense-prefill-attention.md` for the attention family.

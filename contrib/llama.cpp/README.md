@@ -3642,3 +3642,52 @@ The port's own defect above is red-first evidence of the same kind.
 
 **Op suites:** not yet added (`test-backend-ops` needs a llama.cpp full build
 besides sd.cpp's ggml-only build).
+
+## 0058-opencl-intel-q8_0-xmx-gemm.patch
+
+The image profile named the gap: upstream's generic Adreno q8_0 GEMM
+(`kernel_mul_mm_q8_0_f32_l4_lm`) was **68.17 %** of the first image profile,
+**80.9 %** of the 512² q8_0 run and **68.84 %** of the 1024² run with the fixed
+0057 (`measured-here`, `docs/campaigns/imggen-q8_0-xmx-gemm.md`), and q8_0 is
+the durable service form at 1024² (the DiT as f16 does not fit). arcint's
+K-quant XMX GEMM (`mul_mm_kq_f16.cl`, 0001/0009/0011-0014) dequantizes each
+weight super-block to f16 in local memory and runs fp16 DPAS over k16
+(`code`); Vulkan's q8_0 path does the same (`BUF_Q8_0_P16`,
+`dequant_funcs.glsl`, `code`); `kernel_mul_mm_f16w_f16` (0022) is the operand
+form to reuse -- one dispatch branch beside it, same tile and `PLAIN_ARGS`.
+
+The patch adds `deq_q8_0` (int8 code + f16 per-32 scale to a f16 local tile,
+signed `as_char16` -> `convert_float16`) and `kernel_mul_mm_q8_0_f16` on the
+same `MM_BODY`, registers it beside the f16-weights kernel, and dispatches
+Q8_0 x F32 x F32 (src1 F32 >= 16 columns, `ne00 % 32 == 0`, 2D, contiguous,
+`view_offs == 0`) to it. The tree's q8_0 split (`extra0_q8_0->q` codes,
+`->d` per-32 scales) is read directly, so no f16 dequant buffer.
+`GGML_OPENCL_Q8_XMX=0` falls back to the generic tiled q8_0 GEMM;
+`GGML_OPENCL_Q8_XMX_RED=1` skips the last 16 of K.
+
+**The first build was wrong** (`measured-here`, 2026-10-18). The deq wrote
+`put16(wt, rr, ib*QK_K + c*16, ...)` -- a *global* K coordinate -- into the
+per-super-block local tile (`deq_f16w` writes `c*16`), so the XMX arm wrote
+past the tile and the image FAILed the 512² gate at cos worst **0.83**; the
+red switch changed almost nothing (the normal arm was already broken). Fixed
+to `c*16`; red re-run FAILs, normal PASSes. Red-first on the record, and a
+measurement that had to explain its own first result.
+
+**Measured** (`measured-here`, B60, Z-Image Turbo Q8_0 + Qwen3-4B Q8_0 +
+`ae.safetensors`, pinned `--flash-attn off,diffusion=on --conv-direct
+auto,vae=on`, prompt "a red cube on a white table, centered", seed 42,
+8 steps, Euler, cfg 1.0):
+
+| arm | resolution | steady step | gate vs the CPU reference |
+|---|---|---|---|
+| q8_0 XMX (default) | 512² | 2.92 s | PASS cos worst 0.999989 |
+| generic q8_0 (`Q8_XMX=0`) | 512² | 3.02 s | PASS (same window) |
+| q8_0 XMX | 1024² | **2.13 s** | PASS cos worst 0.999902, PSNR 43.03 dB, SSIM 0.999333 |
+| generic q8_0 (`Q8_XMX=0`) | 1024² | **10.95 s** | PASS cos worst 0.999898, PSNR 42.75 dB (same window) |
+| q8_0 XMX red (`Q8_XMX_RED=1`) | 512² | — | FAIL cos worst 0.829442, PSNR 7.21 dB, SSIM 0.0435 |
+
+**5.1x** on the 1024² step, against the generic's ~4 TFLOP effective; the
+XMX figure is **2.13 s** against the f16 XMX route's 2.21 s while keeping the
+q8_0 weight footprint (17,137 MiB peak of 24,480 at 1024², `measured-here`).
+At 512² the gain is marginal (2.92 against 3.02) because other ops dominate
+there; the lever is the 1024² durable form. Switches in `docs/switches.md`.
