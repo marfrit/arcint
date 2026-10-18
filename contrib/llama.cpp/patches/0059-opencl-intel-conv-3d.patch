@@ -12,7 +12,7 @@ index 30f98fd8f..249abdae7 100644
      flash_attn_pre_f16
      flash_attn_f32_f16
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index e94cb8e14..6adcba5d5 100644
+index e94cb8e14..05e71a0b9 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -900,6 +900,8 @@ struct ggml_backend_opencl_context {
@@ -75,7 +75,7 @@ index e94cb8e14..6adcba5d5 100644
      // ssm_conv
      {
  #ifdef GGML_OPENCL_EMBED_KERNELS
-@@ -10835,6 +10874,19 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -10835,6 +10874,24 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
              return (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16) ||
                     (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) ||
                     (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
@@ -89,13 +89,18 @@ index e94cb8e14..6adcba5d5 100644
 +            if (!c_on) {
 +                return false;
 +            }
++            // The kernel indexes elements in 32 bits.
++            if (ggml_nelements(op->src[0]) > UINT32_MAX || ggml_nelements(op->src[1]) > UINT32_MAX ||
++                ggml_nelements(op) > UINT32_MAX) {
++                return false;
++            }
 +            return (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) ||
 +                   (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
 +        }
          case GGML_OP_SSM_CONV:
              return (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
          case GGML_OP_SSM_SCAN: {
-@@ -22758,6 +22810,134 @@ static void ggml_cl_conv_2d(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -22758,6 +22815,134 @@ static void ggml_cl_conv_2d(ggml_backend_t backend, const ggml_tensor * src0, co
      backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
  }
  
@@ -230,7 +235,7 @@ index e94cb8e14..6adcba5d5 100644
  // is_kq selects which of the two products this call is, and it is decided by the
  // CALLER -- the two admission arms in ggml_cl_mul_mat, each of which knows which
  // one it matched. It used to be re-derived here from nb01 > nb02, i.e. "K is
-@@ -34959,6 +35139,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+@@ -34959,6 +35144,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
              }
              func = ggml_cl_conv_2d;
              break;
@@ -650,3 +655,21 @@ index 000000000..b03bc1336
 +        }
 +    }
 +}
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 9bf7eae34..e668eb14f 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10519,6 +10519,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_conv_3d(1, 1, 2, 2, 2, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, kernel_type));
+         test_cases.emplace_back(new test_conv_3d(1, 1, 2, 2, 2, 1, 1, 0, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, kernel_type));
+         test_cases.emplace_back(new test_conv_3d(1, 1, 2, 2, 2, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, kernel_type));
++        // 0059: the Wan VAE's causal 3D convs for one frame (sd.cpp wan_vae.hpp): the
++        // time axis and the borders padded beforehand, so ID = KD = 3, p = 0, OD = 1;
++        // the decoder's 96/384-channel blocks, the 16 -> 384 conv1 and the 96 -> 3 head
++        test_cases.emplace_back(new test_conv_3d(1,  96, 3, 66, 66,  96, 3, 3, 3, 1, 1, 1, 0, 0, 0, 1, 1, 1, kernel_type));
++        test_cases.emplace_back(new test_conv_3d(1, 384, 3, 34, 34, 384, 3, 3, 3, 1, 1, 1, 0, 0, 0, 1, 1, 1, kernel_type));
++        test_cases.emplace_back(new test_conv_3d(1,  16, 3, 34, 34, 384, 3, 3, 3, 1, 1, 1, 0, 0, 0, 1, 1, 1, kernel_type));
++        test_cases.emplace_back(new test_conv_3d(1,  96, 3, 66, 66,   3, 3, 3, 3, 1, 1, 1, 0, 0, 0, 1, 1, 1, kernel_type));
+     }
+ 
+     for(uint32_t Cout : {1, 9}){

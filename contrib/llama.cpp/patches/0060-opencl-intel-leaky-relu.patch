@@ -11,7 +11,7 @@ index 249abdae7..501bec675 100644
      rms_norm
      rope
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 6adcba5d5..e48cec7fe 100644
+index 05e71a0b9..ce0db3e0b 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -1185,6 +1185,7 @@ struct ggml_backend_opencl_context {
@@ -65,7 +65,7 @@ index 6adcba5d5..e48cec7fe 100644
          case GGML_OP_GLU:
              switch (ggml_get_glu_op(op)) {
                  case GGML_GLU_OP_GEGLU:
-@@ -19134,6 +19164,86 @@ GGML_CL_UNARY_EXT_WRAP(ggml_cl_trunc,       trunc)
+@@ -19139,6 +19169,86 @@ GGML_CL_UNARY_EXT_WRAP(ggml_cl_trunc,       trunc)
  
  #undef GGML_CL_UNARY_EXT_WRAP
  
@@ -152,7 +152,7 @@ index 6adcba5d5..e48cec7fe 100644
  static void ggml_cl_softplus(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -34954,6 +35064,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+@@ -34959,6 +35069,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
              }
              func = ggml_cl_mean;
              break;
@@ -248,3 +248,46 @@ index 000000000..bc521b74a
 +#define LEAKY_RELU_BODY(NAME) LEAKY_RELU(NAME, x > 0.0f ? x : x * slope, select(x * slope, x, x > (float4)0.0f))
 +
 +LEAKY_RELU_BODY(leaky_relu)
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index e668eb14f..43f4f4c75 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -8651,21 +8651,26 @@ struct test_leaky_relu : public test_case {
+     const ggml_type type;
+     const std::array<int64_t, 4> ne_a;
+     const float negative_slope;
++    const bool nc; // a transposed (strided) input, not in place
+ 
+     std::string vars() override {
+-        return VARS_TO_STR3(type, ne_a, negative_slope);
++        return VARS_TO_STR4(type, ne_a, negative_slope, nc);
+     }
+ 
+     test_leaky_relu(ggml_type type = GGML_TYPE_F32,
+             std::array<int64_t, 4> ne_a = {10, 5, 4, 3},
+-            float negative_slope = 0.1f)
+-        : type(type), ne_a(ne_a), negative_slope(negative_slope)  {}
++            float negative_slope = 0.1f, bool nc = false)
++        : type(type), ne_a(ne_a), negative_slope(negative_slope), nc(nc)  {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+         ggml_set_name(a, "a");
+ 
+-        ggml_tensor * out = ggml_leaky_relu(ctx, a, negative_slope, true);
++        if (nc) {
++            a = ggml_transpose(ctx, a);
++            ggml_set_name(a, "a_t");
++        }
++        ggml_tensor * out = ggml_leaky_relu(ctx, a, negative_slope, !nc);
+         ggml_set_name(out, "out");
+ 
+         return out;
+@@ -11627,6 +11632,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_clamp     (type, {1024, 1024, 1, 1}));
+         test_cases.emplace_back(new test_leaky_relu(type, {7, 1, 5, 3}));
+         test_cases.emplace_back(new test_leaky_relu(type, {1024, 1024, 1, 1}));
++        test_cases.emplace_back(new test_leaky_relu(type, {33, 17, 3, 2}, 0.2f, true));   // 0060: the strided kernels
+         test_cases.emplace_back(new test_floor     (type, {7, 1, 5, 3}));
+         test_cases.emplace_back(new test_floor     (type, {1024, 1024, 1, 1}));
+         test_cases.emplace_back(new test_ceil      (type, {7, 1, 5, 3}));

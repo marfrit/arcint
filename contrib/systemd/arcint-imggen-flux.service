@@ -3,9 +3,11 @@
 # arcint's patched ggml. It is the edit-capable unit:
 #   POST /v1/images/generations   OpenAI shape, data[0].b64_json
 #   POST /v1/images/edits         multipart prompt + image[] (+ optional mask)
-# and it carries the ESRGAN for POST /sdcpp/v1/upscale.
+# and it serves sd.cpp's POST /sdcpp/v1/upscale from --hires-upscalers-dir
+# (a directory holding only RealESRGAN_x4plus.safetensors).
 #
-# Starting it stops the card's language units (same card, Conflicts=).
+# Starting it stops the card's language units and the other image units
+# (same card, Conflicts=).
 # A seed per request through the prompt suffix
 # <sd_cpp_extra_args>{"seed":N}</sd_cpp_extra_args>.
 #
@@ -18,7 +20,7 @@
 Description=arcint-imggen-flux — FLUX.2 klein via sd-server, GPU.0 (Arc Pro B60), :8082, on demand
 Documentation=https://github.com/marfrit/arcint
 After=default.target
-Conflicts=arcint-agent.service arcint-writer.service arcint-flashnext.service arcint-agent-lanes.service
+Conflicts=arcint-agent.service arcint-writer.service arcint-flashnext.service arcint-agent-lanes.service arcint-imggen.service arcint-imggen-qwen.service
 
 [Service]
 Type=simple
@@ -26,7 +28,7 @@ ExecStart=/usr/bin/arcint-sd-server \
     --diffusion-model /models/imggen/flux2-klein-4b-Q8_0.gguf \
     --llm /models/imggen/Qwen3-4B-Q8_0.gguf \
     --vae /models/imggen/flux2-klein-4b-vae.safetensors \
-    --upscale-model /models/imggen/RealESRGAN_x4plus.safetensors \
+    --hires-upscalers-dir /models/imggen/upscalers \
     --backend GPUOpenCL \
     --auto-fit off \
     --flash-attn off,diffusion=on \

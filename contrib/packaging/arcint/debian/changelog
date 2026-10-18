@@ -1,3 +1,12 @@
+arcint (1.1.1-1) trixie; urgency=medium
+
+  * 1.1.1: the llama.cpp series gains 0059 (CONV_3D on OpenCL, the Wan VAE
+    of Qwen-Image) and 0060 (LEAKY_RELU on OpenCL, the ESRGAN upscaler); 58
+    patches. Neither op is in a language-model graph; their programs build
+    at every OpenCL start. Dependencies unchanged.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 18 Oct 2026 23:00:00 +0200
+
 arcint (1.1.0-1) trixie; urgency=medium
 
   * 1.1.0: image generation (docs/milestone-1.1.0.md), served by the new
