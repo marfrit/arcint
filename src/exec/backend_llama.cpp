@@ -882,7 +882,7 @@ public:
             wrappers.push_back(w);   // its video_ctx is null: no --video input
         }
 
-        mtmd_input_text text{ in.prompt.c_str(), /*add_special*/ true, /*parse_special*/ true };
+        mtmd_input_text text{ in.prompt.c_str(), in.prompt.size(), /*add_special*/ true, /*parse_special*/ true };
         mtmd_input_chunks* chunks = mtmd_input_chunks_init();
         if (chunks == nullptr) throw std::runtime_error("libmtmd could not make the chunk list");
         const int rc = mtmd_tokenize(mctx_, chunks, &text, bitmaps.data(), bitmaps.size());
