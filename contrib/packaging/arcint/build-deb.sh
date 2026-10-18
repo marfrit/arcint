@@ -14,7 +14,7 @@
 # (docs/history.md), and older tags are built with the recipe at their tag.
 set -euo pipefail
 
-PKGVER=1.0.0
+PKGVER=1.1.0
 UPSTREAM_TAG=v${PKGVER}
 PKGREL=1
 # The public repository, not the fleet one. The fleet repo (still named
@@ -22,9 +22,9 @@ PKGREL=1
 # and carries operator-local notes; the published tree is the same code without
 # them, so the package is built from what anyone can check.
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
-# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v1.0.0.tar.gz,
+# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v1.1.0.tar.gz,
 # taken after the tag was pushed (recorded in the follow-up commit, as for every tag).
-ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-c1ed56c925054fcdcab58587faadb676d085155572be032adf3cd19d4ad6afd2}
+ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-}
 # The libllama engine (--engine llama) builds against llama.cpp at this pin
 # with contrib/llama.cpp/patches applied (contrib/llama.cpp/README.md): the
 # GitHub tarball of the commit, checked by sha256.
@@ -195,7 +195,7 @@ Depends: libc6 (>= 2.34), libstdc++6 (>= 13), libgomp1, ocl-icd-libopencl1
 Recommends: intel-opencl-icd
 Maintainer: Markus Fritsche <mfritsche@reauktion.de>
 Homepage: https://github.com/marfrit/arcint
-Description: Narrow LLM inference engine for Intel Arc GPUs
+Description: LLM inference engine for Intel Arc GPUs
  arcint serves a short list of hybrid Qwen models (and one Mistral Small
  finetune) on the Intel Arc A770 and Arc Pro B60 over an OpenAI-compatible
  HTTP surface. GGUF files run through libllama (llama.cpp at a pinned commit,

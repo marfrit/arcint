@@ -10,7 +10,7 @@ Package: arcint
 Architecture: amd64
 Depends: ${misc:Depends}, libc6 (>= 2.34), libstdc++6 (>= 13), libgomp1, ocl-icd-libopencl1
 Recommends: intel-opencl-icd
-Description: Narrow LLM inference engine for Intel Arc GPUs
+Description: LLM inference engine for Intel Arc GPUs
  arcint serves a short list of hybrid Qwen models (and one Mistral Small
  finetune) on the Intel Arc A770 and Arc Pro B60 over an OpenAI-compatible
  HTTP surface. GGUF files run through libllama (llama.cpp at a pinned commit,

@@ -217,6 +217,7 @@ def per_step(ref, cand):
 # against a prompted one was once read as a defect, docs/imggen.md).
 PARITY = ("--diffusion-model", "--llm", "--vae", "-p", "--cfg-scale", "--steps",
           "-W", "-H", "--seed", "--sampling-method", "--scheduler")
+MODEL_FLAGS = ("--diffusion-model", "--llm", "--vae")
 
 
 def arm_header(d):
@@ -228,7 +229,13 @@ def arm_header(d):
 
 def arm_params(d):
     cmd = arm_header(d).get("cmd") or []
-    return {k: (cmd[cmd.index(k) + 1] if k in cmd else None) for k in PARITY}
+    p = {k: (cmd[cmd.index(k) + 1] if k in cmd else None) for k in PARITY}
+    # A model is its file, not its directory: the reference may read the
+    # mirror and the card arm a sha-checked copy on another disk.
+    for k in MODEL_FLAGS:
+        if p[k]:
+            p[k] = os.path.basename(p[k])
+    return p
 
 
 def arm_mechanism(d):

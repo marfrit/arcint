@@ -1,3 +1,14 @@
+arcint (1.1.0-1) trixie; urgency=medium
+
+  * 1.1.0: image generation (docs/milestone-1.1.0.md), served by the new
+    arcint-imggen package (sd.cpp's sd-server against this tree's ggml).
+    The llama.cpp series gains 0057 (the fused ROPE_APPLY op, OpenCL and
+    CPU) and 0058 (the q8_0 GEMM on the XMX units, which also carries the
+    language models' Q8_0 weights in batches of 16 or more on the B60);
+    56 patches. Dependencies unchanged.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 18 Oct 2026 20:00:00 +0200
+
 arcint (1.0.0-1) trixie; urgency=medium
 
   * 1.0.0: the charter met (docs/milestone-1.0.0.md). DFlash2 drafting
