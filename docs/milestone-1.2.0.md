@@ -382,6 +382,14 @@ for B4 is not measured; the op profile per node is not taken; no red case
 yet; the endpoint is not package/unit/probe-complete. These are the open
 dispositions of the next card window.
 
+**BLOCKED (2026-10-18):** the host hang from §9.1 does not answer SSH (60 s
+and two later tries); every card leg, the STT build (which needs the card for
+its gate) and the TTS gate are behind it. Recovery is a host reboot, and
+rebooting that host is **the operator's call, every time** (`CLAUDE.local.md`,
+`docs/sop-card-window.md`); the restart of the production language unit is
+also the operator's call on a wedged card. Everything above is committed on
+the `v120` branch; nothing was pushed, tagged or released (D9).
+
 ### 9.1 The card-window incident (measured-here, 2026-10-18, on the record)
 
 This is the window's own lesson, written down before it is lost. While the
