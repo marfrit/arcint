@@ -30,13 +30,15 @@ Three candidates, one variable per experiment, in order:
    to the vocab's special token against Qwen's own reference (the talker
    `config.json` `codec_language_id`, the `<|codec_language_german|>` token).
    An off-by-one or a missing German entry would give exactly
-   English-OK/German-runaway. **Already checked** (below): the GGUF vs config
-   mapping is consistent.
+   English-OK/German-runaway. **Closed 2026-10-19** (below): the GGUF places
+   the talker codec rows at `151936 + config_id` by construction
+   (`text_vocab_size` 151936 ++ `vocab_size` 3072), so the mapping is
+   consistent and not the defect.
 3. **Sampling.** Qwen ships `generation_config.json` do_sample true,
    temperature 0.9, top_k 50, top_p 1.0, repetition_penalty 1.05, the
    subtalker the same values, and the talker suppresses every codec-special
    token in `[vocab_size-1024, vocab_size)` except `codec_eos`. llama.cpp's
-   `common_params` defaults (temp 0.8, top_k 40, top_p 0.95, repetition 1.0,
+   `common_params` defaults (temp 0.8, top_k 40, top_p 0.95, repetition 1.05,
    no suppress list) are not the same. Its own experiment.
 
 ## Reference to follow
@@ -84,6 +86,32 @@ set) across arms.
 | the Qwen3TTS pipeline's own default sampling is **Qwen's**: `mtmd_gen_inp_default` sets top_k 50, top_p 1.0, temp 0.9 for the code predictor. But `tools/tts/tts.cpp` **overrides** top_k/top_p from `common_params` (40 / 0.95) and samples the semantic code with the `common_sampler` (temp 0.8); no repetition penalty is passed anywhere | `code` (`tools/mtmd/mtmd.cpp:2051-2068`, `tools/tts/tts.cpp`) |
 | Qwen's own defaults: do_sample true, temp 0.9, top_k 50, top_p 1.0, repetition_penalty 1.05, subtalker the same; the talker **suppresses** `[2048, 3072)` except `codec_eos` | `code` (`generation_config.json`; `modeling_qwen3_tts.py:2036-2062`) |
 | Q8_0 pair and a Q8_0 `mmproj` measured on the card; a **bf16 pair** exists at the GGUF mirror (backbone 3,472,593,760 bytes, mmproj 669,081,472 bytes, public) | `measured-here` (HF sizes) |
+| the Qwen `text_vocab_size` is **151936** and `vocab_size` **3072**: `token_embd.weight` is `[2048, 155008] = 151936 + 3072`, i.e. `text_embedding` ++ `codec_embedding`; the codec column of config id `c` is `151936 + c`. The constant-offset identity is therefore the converter's construction | `code` (HF `config.json`; GGUF tensor shapes) |
+
+## Result of the 2026-10-19 CPU arms (upstream `llama-tts`, `-ngl 0`, German "Der Zug fährt nach Berlin.", no speaker, one sentence)
+
+`measured-here`, single card-free CPU window on the card host, one variable
+per arm. WER is the round-trip against the written sentence (5 words),
+transcribed with the same whisper model as the STT gate.
+
+| arm | backbone / mmproj | sampling | frames / audio | reported stop | hypothesis | WER | verdict |
+|---|---|---|---|---|---|---|---|
+| `q8-de-default` (red baseline) | Q8_0 | llama.cpp defaults (temp 0.8, top_k 40, top_p 0.95, repetition 1.05) | **512 cap** / 40.96 s, 150.3 s gen + 1.8 s vocoder | no `codec_eos` | "Ja." | 1.00 | **FAIL** |
+| `bf16-de-default` | **bf16** | same as the red arm | **44** / 3.52 s, 15.1 s gen | **`codec_eos` sampled** | "Der Zug fährt nach Berlin." exact | **0.00** | **PASS** |
+| `q8-de-qwen` (sampling lever alone) | Q8_0 | Qwen as shipped (temp 0.9, top_k 50, top_p 1.0, repetition 1.05, seed 42) | **512 cap** / 40.96 s | no `codec_eos` | "Ja, das ist so, wie gesagt." | 1.20 | **FAIL** |
+
+**Disposition so far:** the defect is **quantization of the talker** — the
+bf16 pair speaks the sentence exactly and reaches `codec_eos` at frame 44,
+where the Q8_0 arm runs to the cap under both the llama.cpp defaults and
+Qwen's own sampling values. Sampling is **not** the cause (the Qwen-sampling
+Q8_0 arm still fails), and the language path is consistent (candidate 2
+closed). The 1.2.0 model set's bf16 pair is the fix; the substitute for the
+Q8_0 model (`docs/milestone-1.2.0.md` §2). Open: the **card arm** at bf16
+through arcint's route (the milestone C4/B3 gate), and whether the mmproj
+(the code2wav/speaker half) also needs bf16 rather than its Q8_0 form — the
+arm above pairs bf16 backbone with bf16 mmproj, so that is a separate
+variable still to test on the card. The bf16 pair is 4.14 GB total against
+Q8_0's 2.30 GB (arithmetic from the HF sizes), inside one card's idle VRAM.
 
 ## Where it lives
 
