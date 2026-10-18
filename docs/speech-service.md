@@ -19,9 +19,13 @@ the operator fixes them.
 
 | unit | binary | model files | routes | state |
 |---|---|---|---|---|
-| `arcint-vlm` | `/usr/bin/arcint` (`arcint` package) | `Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf` + `mmproj-...-Q8_0.gguf` | `/v1/chat/completions` with `image_url` | **built** (chat path), package/unit/probes owed |
-| `arcint-tts` | `/usr/bin/arcint` (`arcint` package) | `Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` + `mmproj-Qwen3-TTS-...-Q8_0.gguf` | `POST /v1/audio/speech`, `GET /v1/audio/voices` | **planned** (the `libmtmd` `gen_audio` pipeline; D4) |
-| `arcint-stt` | `/usr/bin/arcint-whisper` (`arcint-stt` package) | `ggml-large-v3-turbo.bin` (or `ggml-large-v3.bin`) | `POST /v1/audio/transcriptions` | **engine built** (whisper.cpp on the installed ggml, card gate PASS; unit/package/`/props` owed) |
+| `arcint-vlm` | `/usr/bin/arcint` (`arcint` package) | `Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf` + `mmproj-...-Q8_0.gguf` | `/v1/chat/completions` with `image_url` | **built** (chat path + unit file; package and the `/props` multimodal fields owed) |
+| `arcint-tts` | `/usr/bin/arcint` (`arcint` package) | `Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` + `mmproj-Qwen3-TTS-...-Q8_0.gguf` | `POST /v1/audio/speech`, `GET /v1/audio/voices` | **built** (the `libmtmd` `gen_audio` path + routes + unit file; the card gate **FAIL**: round-trip WER 2.09, real-time factor ~0.29 — the generation is not intelligible German; campaign owed) |
+| `arcint-stt` | `/usr/bin/arcint-whisper` (`arcint-stt` package) | `ggml-large-v3-turbo.bin` (or `ggml-large-v3.bin`) | `POST /v1/audio/transcriptions` | **built** (whisper.cpp on the installed ggml, card gate PASS; unit file written; package and `/props` owed) |
+
+Ports (proposed; the operator fixes them): `arcint-vlm` 8083, `arcint-tts` 8084,
+`arcint-stt` 8091, beside 8080/8087 (language), 8081/8082/8085 (image),
+8086 (the image front) and 8088/8089 (the on-demand language units).
 
 The VLM and TTS share one binary (`libmtmd` links `ggml` + `llama` only, so one
 process with the pin's `GGML_MAX_NAME` 64, `docs/milestone-1.2.0.md §3`); the
@@ -44,13 +48,16 @@ front; the units carry the same `Conflicts=` as `arcint-imggen`.
   unchanged. One self-contained lane path: the request clears its lane's KV
   and uses no prefix cache, checkpoint or drafter (an image is not tokenisable
   text); the language requests on the same unit are untouched.
-- `POST /v1/audio/speech` — **planned.** OpenAI shape: `{model, input, voice,
-  response_format:"wav", speed?}` → the WAV bytes. `voice` is a **name from
-  the server's profile list** (`GET /v1/audio/voices`); the route MUST NOT
-  accept `reference_audio`, `speaker_file`, `sample_audio` or any equivalent
-  field, and refuses it 400 with a pointer to the enrolment route (D5).
+- `POST /v1/audio/speech` — **built.** OpenAI shape: `{model, input, voice,
+  response_format:"wav", speed?, temperature?, top_p?, top_k?, seed?}` → the WAV
+  bytes. `voice` is a **name from the server's profile list**
+  (`GET /v1/audio/voices`); the route refuses `reference_audio`, `speaker_file`,
+  `sample_audio`, `audio`, `reference`, `voice_sample`, `speaker_ref` or
+  `speaker_reference` with 400 and a pointer to the enrolment route (D5), as it
+  refuses an unknown `voice` and a non-WAV `response_format`. The reference
+  recording is read server-side from the profile only.
 - `POST /v1/audio/transcriptions` — **built for STT** (whisper.cpp's own server served with `--inference-path /v1/audio/transcriptions`, so no route patch is needed: `file`, `language` and `response_format` match the OpenAI shape and a plain `json` returns `{"text":...}`). OpenAI multipart: `file`, `model`, `language`, `response_format` (`json`/`text`) → `{"text":...}`. German first (D3).
-- `GET /v1/audio/voices` — **planned.** The enrolled names only; never a
+- `GET /v1/audio/voices` — **built.** The enrolled names only; never a
   reference, never a path, never audio bytes (D5).
 - `GET /health` and `GET /props` — existing; the service phase adds the
   mmproj/backbone/card, the enrolled-voice **count** (names not required on

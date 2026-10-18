@@ -437,6 +437,63 @@ and decoder; the service phase (the `arcint-stt` unit, the package, `/props`, th
 `.bin` loader path); and the operator's absolute C3 floor (D8: only the CPU
 comparison gates so far).
 
+### 9.3 TTS (Phase 0/4, 2026-10-18 late)
+
+The TTS work is split in two: the code is built, the card gate is **pending**.
+
+The code (`measured-here` as "it compiles and it loaded on the card"):
+
+- `--tts` enables the audio-generation path (`cp.embeddings = 1`, which
+  `llama_get_embeddings_ith` needs; the logits reservation lifts to n_batch for
+  the embedding batches). `--tts-profiles DIR` (or `$ARCINT_TTS_PROFILES`) and
+  `--tts-lang` (default `de`). Without `--tts` the speech routes refuse 400
+  clearly; without an audio-generation mmproj the boot fails.
+- `Backend::generate_speech` follows the reference `tools/tts/tts.cpp`:
+  `mtmd_helper::gen_audio` set_input/step_prompt loop, then per frame arcint's
+  own `lgc::Sampler` over `llama_get_logits_ith`, `h_state` from
+  `llama_get_embeddings_ith`, `step_gen(sampled, h, &h_next, &stop)`, and
+  `get_output` for the WAV bytes. The lane's KV is cleared before/after and the
+  synthesis holds the context mutex (the helper's internal decodes touch the
+  shared context).
+- `POST /v1/audio/speech` (WAV bytes), `GET /v1/audio/voices` (names only),
+  the D5 refusals of any reference-audio field and of an unknown voice, and the
+  `/props` `tts`/`voices` count/`multimodal` fields. The profile scan reads
+  `<dir>/<name>/profile.json` + `reference.wav`, enabled entries only.
+- Two load defects were found on the card and fixed: the `qwen3tts`
+  architecture was refused by the engine's model gate (admitted under `--tts`),
+  and the Qwen3-TTS backbone carries **no chat template** (a ChatML fallback
+  under `--tts` so a stray chat request renders; the speech prompt comes from
+  the gen pipeline, not the template).
+- The gate voice is `gate-de`, enrolled from a FLEURS `de_de` dev utterance
+  (CC-BY-4.0, pronunciation recorded in the profile's metadata); the sentence
+  set is ten short German sentences (operator-local, outside the repo).
+
+**Measured (the card window, FAIL; the branch carries the wiring `dd2cc59`
+and both load fixes, and the window ran a build of it):**
+
+| item | measured () |
+|---|---|
+| A4, it answers | `/v1/audio/speech` returned WAV bytes for the enrolled voices (`gate-de` and `gate-fleurs`, both from FLEURS `de_de` samples); the D5 refusals — a reference-audio field and an unknown voice — answered 400 (`measured-here`) |
+| C4, intelligibility | **FAIL**: round-trip corpus WER **2.0909** over 8 sentences at floor 0.20 (voice `gate-fleurs`, seed 42); the waveform is not intelligible German — the transcripts are unrelated phrases and `* Musik *` labels, and one sentence's own words never come back |
+| B3, real time | **FAIL**: generation hit the 512-frame cap (41.0 s of audio) at 140–180 s of process per sentence — a real-time factor of ~**0.29** (slower than real time); one sentence stopped at 48 frames, the rest at the cap, so end-of-speech is not being sampled |
+| the window | a concurrent leg driver in the same workspace ran it (the wiring is on the branch); the physical-host sampler, the one-process-per-card check and the pid stop/restore all held, the B60's language unit restored after 100 s |
+
+**Open, and the next step is a campaign:** the `qwen3tts` gen path is wrong
+somewhere in the prompt/speaker/sampling hand-off — no intelligible German, no
+end-of-speech, an ~0.29 real-time factor. It needs its own campaign document
+(the reference's `mtmd-helper-gen.cpp` control loop read line by line against
+this build, red-first arms: the sampling settings the backbone needs, whether
+the sampled token is the semantic code or a special token, the language and
+spoken-text path, the speaker encoder's output). A4's WAV and the refusals are
+real; C4 and B3 fail. Do not adopt these numbers as a passing gate.
+
+The VLM phase-0 dispositions (the `vlm_gate` tool run, the CPU encoder B4
+reference, the op profile, the red case, the package/unit/probes) are still
+open; this session's card time went to STT and the TTS wiring instead. The STT
+`arcint-stt` unit, `arcint-vlm` and `arcint-tts` unit files are written
+(`contrib/systemd/`, ports 8083/8084/8091 proposed), the packages and `/props`
+extensions owed.
+
 ## 10. References
 
 - llama.cpp `3e4dfa8`: `tools/mtmd/{mtmd.h,mtmd.cpp,mtmd-image.cpp,
