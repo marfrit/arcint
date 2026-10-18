@@ -1,5 +1,15 @@
 # imggen-rope-apply-opencl — the fused RoPE for the DiT (the generic path's 37 %)
 
+**Shipped in 1.1.0 (2026-10-18).** In the release window the fused op takes
+a 1024² step to 2.14 s against 4.77 s with sd.cpp's generic RoPE (2.2x, the
+same window, both arms gated PASS); `test-backend-ops` carries
+`test_rope_apply` (26 cases, B60 pass, a cross-check against sd.cpp's own
+decomposition); the RPC op count and an `INT_MAX` bound were added
+(`contrib/llama.cpp/README.md`). The "1.32 -> 0.62 s" below was the
+defective kernel, and "timing CONFIRMED" a cross-window comparison; the
+second lever (flattening the elementwise dispatch) is not started: after
+0058 every elementwise kernel is under 4 % of a step.
+
 **Open** (2026-10-17). The lever fired and its timing is CONFIRMED; the image
 gate then caught, and the fix removed, a port defect (the OpenCL kernel's `dst`
 byte offsets); the q8_0 and f16 gates now PASS and the red case FAILs. The fused

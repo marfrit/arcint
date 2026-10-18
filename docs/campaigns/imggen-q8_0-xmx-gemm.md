@@ -1,8 +1,15 @@
 # imggen-q8_0-xmx-gemm — a q8_0 GEMM on the XMX units for the DiT
 
-**Closed 2026-10-18.** Patch `0058`: 1024² image step 10.95 -> **2.13 s**
-(5.1x), the gate PASSes; the red case FAILs (0.999989 -> 0.829442). The
-durable image form is q8_0 XMX at f16-step speed.
+**Shipped in 1.1.0 (2026-10-18); open for its second lever.** Patch `0058`:
+the 1024² image step 10.95 -> **2.14 s** (5.1x), 512² 3.03 -> 0.476 s
+(6.4x), the gate PASSes against the baseline arm, the red case FAILs
+(`measured-here`, the release window, `contrib/llama.cpp/README.md`). The
+service runs the DiT as q8_0 on it. **Next lever (B2):** the kernel is 69 %
+of a 1024² step at ≈ 33.5 TFLOP/s, 34 % of the XMX f16 peak against the
+operator's 70 % bar; the tile shape was searched for the language models'
+prompts, not for M ≈ 4,096 image tokens times K = 3,840/10,240: a tile
+search with the GA's genome and seconds a step as the fitness
+(`docs/campaigns/kernel-autotune-ga.md`).
 
 ## Charter
 
@@ -44,7 +51,13 @@ deliberately broken tile turns the step curve red. **The operator's bar**:
 >= 70 % of the B60's XMX peak (~98.3 TFLOP FP16 / 196.6 INT8; ~0.18 s a step
 at 512², ~0.72 at 1024²).
 
-## What exists (`measured-here`, 2026-10-18)
+## What exists (`measured-here`, 2026-10-18, before the release review)
+
+The release review corrected this section (`docs/imggen.md`, "1.1.0 as
+released"): the 512² XMX step is 0.476 s (the log's 2.11 it/s), the red case
+now zeroes the last 16 weights of a row (the one below garbled every row's
+stride), the branch reads only SoA tensors through `view_src`, and the
+17,137 MiB peak is the im2col VAE's.
 
 Patch `0058-opencl-intel-q8_0-xmx-gemm.patch`: `deq_q8_0` + `kernel_mul_mm_q8_0_f16`
 on the f16w tile/`PLAIN_ARGS`, the two tree q8_0 buffers read directly, one

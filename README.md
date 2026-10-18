@@ -1,9 +1,9 @@
 # arcint
 
-An LLM inference server for Intel Arc, deliberately narrow: an
-OpenAI-compatible endpoint for a short list of models on the Arc A770 and the
-Arc Pro B60, from the dense Qwen3.8-27B to the 512-expert Qwen3.8-Flash-Next
-on one card plus host RAM.
+An inference server for Intel Arc: OpenAI-compatible endpoints for a short
+list of models on the Arc A770 and the Arc Pro B60, from the dense
+Qwen3.8-27B to the 512-expert Qwen3.8-Flash-Next on one card plus host RAM,
+and since 1.1.0 text-to-image with Z-Image Turbo.
 
 arcint runs GGUF files through libllama (llama.cpp at a pinned commit) with
 ggml's OpenCL backend and a published series of Intel kernels
@@ -15,6 +15,13 @@ surface, chat templates, tool calls and reasoning, the sampler, named lanes,
 speculative decoding with the model's own MTP head, and context checkpoints
 so a follow-up or an edited message resumes instead of re-reading the
 conversation.
+
+Images come from [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)'s
+own `sd-server`, built against the same patched ggml tree, so the diffusion
+transformer runs on the same Intel kernels; two patches of the series were
+written for it (0057, a fused RoPE; 0058, the q8_0 GEMM on the XMX units).
+It is its own package and unit, `arcint-imggen` ([contrib/sdcpp](contrib/sdcpp),
+[docs/imggen.md](docs/imggen.md)).
 
 The inspiration is [NInfer](https://github.com/Neroued/ninfer), a
 from-scratch engine for a closed set of checkpoints that beats every
@@ -41,6 +48,7 @@ tag [`openvino-history`](https://github.com/marfrit/arcint/tree/openvino-history
 | coder | Qwen3.6-27B-A3B-Coder (`qwen35moe`, 184 experts, MTP layer) | a searched per-layer quant mix (14.6 GB) | Arc A770 | 98,304 tokens, q8_0:q4_0 KV, MTP 4 |
 | Flash-Next | Qwen3.8-Flash-Next (`qwen4exp`, 125B-A6B, 512 experts, n-gram table) | ISTA-DASLab's IQ3_XXS GGUF (IQ2_XS as the faster option) through an expert cache: the hot experts in VRAM, the rest in host RAM, read over the link or computed on the CPU; its MTP layer from the checkpoint | Arc Pro B60 + host RAM, on demand | 131,072 tokens, q8_0 KV, MTP 3 |
 | writer | Cydonia 24B v4.3 (Mistral Small 3.2, `llama`) | imatrix Q4_K_M | Arc Pro B60, on demand | 98,304 tokens, q8_0 KV |
+| images | Z-Image Turbo (6B DiT) with the Qwen3-4B-Instruct-2507 encoder and the FLUX autoencoder | Q8_0 GGUFs, `ae.safetensors` | Arc Pro B60, on demand | 1024x1024, 8 steps |
 
 The engine admits these architectures (`qwen35`, `qwen35moe`, `qwen4exp`, and
 `llama` at the Mistral Small 24B geometry) and refuses others at load.
@@ -114,7 +122,10 @@ Every number here was measured on compute-runtime 26.27.39122.11 with IGC
 
 **Packaging.** `contrib/packaging/arcint/build-deb.sh` builds the Debian
 package from the release tarball and the llama.cpp pin, with ggml-cpu built
-native (and checked for AVX2). **Containers:** `docker/Dockerfile.arcint`
+native (and checked for AVX2); `contrib/packaging/arcint-imggen/build-deb.sh`
+builds the image service's package (`arcint-sd-server`, `arcint-sd-cli`)
+from the same tarball, the pin and stable-diffusion.cpp's tarball at
+`f0aac52`. **Containers:** `docker/Dockerfile.arcint`
 and `.github/workflows/build-toolbox.yml`; see [docs/docker.md](docs/docker.md).
 
 ## Running
@@ -150,8 +161,10 @@ service's production flags, Flash-Next's expert cache included
 - **Cards**: the Intel Arc A770 (16 GiB, Xe-HPG) and the Arc Pro B60 (24 GB,
   Xe2), under the xe kernel driver. One card per process, or two by layers
   for one model (`--llama-layer-split`, DESIGN §3.10).
+- **Images**: text-to-image through `arcint-imggen` (sd.cpp's `sd-server`,
+  a separate binary and process); one model, Z-Image Turbo.
 - **Not goals**: a web UI or dashboard (console and HTTP JSON only), a model
-  zoo, training or quantization tooling, multimodal input, Windows.
+  zoo, training or quantization tooling, multimodal input (images in), Windows.
 
 ## Why not just use …
 

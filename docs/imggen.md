@@ -6,6 +6,60 @@ for diffusion transformers (DiT/MMDiT) and their VAEs on the B60 and the A770.
 This document is the running record; the charter, its criteria A/B/C and its
 gate `§3` stay in the milestone document.
 
+## 1.1.0 as released (2026-10-18)
+
+The release review re-measured everything the service rests on, on the
+release build, in one B60 window, every arm through `tools/imggen_gate.py`
+with its `arm.json` (`measured-here`; the setup is the charter's §2 header).
+
+| 1024², 8 steps | step | VAE decode | peak VRAM | gate vs the CPU reference |
+|---|---|---|---|---|
+| **service form**: DiT q8_0 on 0058, VAE direct conv | 2.13 s | **6.33 s** | **13,373 MiB** | PASS, cos worst 0.999926, 42.59 dB |
+| DiT q8_0 on 0058, VAE im2col (`auto` on OpenCL) | 2.14 s | 15.41 s | 17,211 MiB | PASS, 0.999926, 42.59 dB |
+| 0058 off (the generic q8_0 GEMM), the baseline arm | 10.95 s | 15.40 s | 17,130 MiB | PASS, 0.999922, 42.40 dB |
+| 0058 red | 2.14 s | | | **FAIL**, 0.987219, 19.56 dB |
+| DiT f16 (`^model\.=f16`, the dev unit's form), VAE im2col | 2.21 s | 15.12 s | 22,685 MiB | cos 0.999911, 41.67 dB; FAILs the baseline's per-step MSE (+15 %) |
+| 0057 off (sd.cpp's generic RoPE build), VAE im2col | 4.77 s | 15.40 s | 17,211 MiB | PASS, 0.999921, 42.85 dB |
+
+At 512² the service form takes **0.476 s a step** (2.10 it/s) against the
+generic q8_0 GEMM's 3.03 s (6.4x), PASS at 46.54 dB (baseline 45.84). The
+service serves the same image as `sd-cli` pixel for pixel; a 1024² request
+takes ~23.5 s steady with the direct-conv VAE (32.5 s with im2col), and the
+first request after a start ~30 s more: the weight load from the disk the
+models live on (64.4 s with a warm and 64.9 s with an empty OpenCL program
+cache, 35.2 s from the NVMe; the program cache is worth ~0.5 s).
+
+Corrections to the record below (the release review, `measured-here` unless
+`code`):
+
+- **0058 at 512²** is 0.476 s a step, not "2.92 s, marginal": the run log
+  reads 2.11 it/s and was transcribed as seconds an iteration.
+- **0058's red case** shortened `ne00`, which shifted every row's and
+  column's stride and read one unwritten local chunk: a gross red, not "the
+  last 16 of K". It now zeroes the last 16 weights of every row (`code`);
+  red FAILs as above and in 52 of 151 Q8_0 op cases. 0058 also reads only a
+  flattened (SoA) Q8_0 tensor, through a view's `view_src` (`code`).
+- **"K past ne00 reads zero"**: nothing is zeroed; the GEMM's `kmax` never
+  reads past `ne00` (`code`).
+- **"q8 footprint 17,137 MiB"** is the im2col VAE's peak; with the direct
+  conv the service peaks at 13,373 MiB.
+- **"PASS" before the release** meant a per-step cosine of at least 0.999
+  against the CPU reference: the comparative mode measured the candidate
+  against the baseline arm instead of both against the reference, so a
+  candidate identical to the baseline failed; fixed.
+- **0057's "1.32 -> 0.62 s, 2.1x"** was the defective kernel; the fixed
+  kernel against the generic RoPE in one window is 2.14 against 4.77 s at
+  1024² (2.2x). `FP_CONTRACT OFF` does not give the fork's rounding: the
+  program is built with `-cl-mad-enable -cl-fast-relaxed-math` (`code`).
+- **The 512² "fresh-process variant"** was arms run at sd.cpp's default 20
+  steps against an 8-step reference (`docs/campaigns/imggen-attention-path.md`,
+  closed).
+- **`--conv-direct auto`** never picks the direct conv on OpenCL, also when
+  timed like Vulkan (the probe's small shapes favour im2col); the unit pins
+  `vae=on` (`contrib/sdcpp/README.md`).
+- **The CPU reference** of the release is made by a build without the RoPE
+  integration patch, so it does not run 0057's own CPU forward.
+
 ## Reference
 
 **stable-diffusion.cpp** (`f0aac52`, 2026-10-17, MIT): the engine, its
@@ -35,8 +89,9 @@ asserts both plus the arcint kernels before it configures:
     -DSD_USE_UPSTREAM_GGML=ON -DSD_GGML_SOURCE_DIR=<llama>/ggml
     -DSD_OPENCL=ON -DSD_VULKAN=ON -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF
 
-Upstream mode turns INT8/SageAttention off and FP8 to F16 at load, and takes
-RoPE's generic path (`code`, `cmake/ggml.cmake`, `rope.hpp`). `SD_GGML_SOURCE_DIR`
+Upstream mode turns INT8/SageAttention off and FP8 to F16 at load, and would
+take RoPE's generic path (`code`, `cmake/ggml.cmake`, `rope.hpp`); since 0057
+the recipe lifts that guard (`contrib/sdcpp/upstream-rope-apply.patch`). `SD_GGML_SOURCE_DIR`
 is the ggml **subtree**, so the llama.cpp root is not built.
 
 **Met** (`measured-here`, 2026-10-17): sd.cpp at `f0aac52` in upstream mode
@@ -383,8 +438,8 @@ the red case. At **1024²** the q8_0 step is **2.13 s against the generic
 10.95 s -- 5.1x**, near the f16 XMX route's 2.21 s, with the q8 footprint
 (peak 17,137 MiB of 24,480); the gate PASSes both arms (XMX cos worst
 0.999902 / PSNR 43.03 dB; generic 0.999898 / PSNR 42.75, same window). At
-512² the gain is marginal (2.92 against 3.02) because other ops dominate
-there. The red (last 16 of K left out) FAILs: cos worst 0.829442, PSNR
+512² the step is 0.47 s against 3.02 (the record first read the log's 2.11
+it/s as 2.92 s; corrected above). The red (last 16 of K left out) FAILs: cos worst 0.829442, PSNR
 7.21 dB. The campaign `docs/campaigns/imggen-q8_0-xmx-gemm.md` closed
 2026-10-18; the durable image form is now **q8_0 XMX at f16 step speed**.
 

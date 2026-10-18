@@ -1,6 +1,18 @@
 # imggen-vae-conv — the VAE decode conv off im2col + mul_mat
 
-**Open** (2026-10-17). After the fused RoPE, the largest non-GEMM share of the
+**Lever adopted in 1.1.0 (2026-10-18), the auto probe not fixed.** The
+service pins `--conv-direct auto,vae=on`: at 1024² the VAE decodes in 6.33 s
+against 15.41 s for im2col + mul_mat (2.43x), 1.73 against 3.69 s at 512²,
+with the same image (finals 69.4 dB apart, both PASS the gate) and a peak of
+13,373 against 17,211 MiB (`measured-here`, the release window, both arms in
+the same, controlled trajectory: the caveat below is void, see
+`imggen-attention-path.md`). Timing both forms on OpenCL as sd.cpp does on
+Vulkan does not make `auto` right: the probe's small shapes favour im2col
+(0.40 against 1.49 ms). Open: a probe at the VAE's own shapes, and the
+direct kernel itself (with it the decode is a quarter of a 1024² image's
+time; GroupNorm 1.27 s of it).
+
+Before (2026-10-17): After the fused RoPE, the largest non-GEMM share of the
 f16 run is the VAE decode conv: `mul_mat_f16_f16` 1,988 + `im2col_f16` 1,095 =
 3,083 ms, **35.4 %** of the 8,714 ms run (`measured-here`).
 

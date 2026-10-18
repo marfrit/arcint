@@ -11,10 +11,15 @@
 # - the DiT stays q8_0: 0058's XMX GEMM runs it at the f16 route's step time
 #   in less memory;
 # - --flash-attn off,diffusion=on: the DPAS attention for the DiT only;
-# - --conv-direct auto: with contrib/sdcpp/conv-direct-probe-opencl.patch the
-#   probe times the direct conv on OpenCL and picks it for the VAE;
-# - the OpenCL program cache in the unit's cache directory, so a restart
-#   after the idle stop does not recompile the kernels.
+# - --conv-direct auto,vae=on: the VAE decodes with the direct conv, 2.43x
+#   faster than im2col + mul_mat with the same image and 3.8 GiB less peak
+#   VRAM; sd.cpp's auto never picks it on OpenCL (contrib/sdcpp/README.md).
+#
+# Measured with exactly these flags on the Arc Pro B60 (1.1.0 pre-tag,
+# 2026-10-18), 1024x1024, 8 steps: 2.14 s a step, the VAE decode 6.3 s, peak
+# VRAM 13.4 GiB; the first request after a start ~30 s longer than the
+# others, which is the weight load from disk (the OpenCL program cache saves
+# 0.5 s of it).
 
 [Unit]
 Description=arcint-imggen — Z-Image Turbo via sd-server, GPU.0 (Arc Pro B60), :8085, on demand
@@ -24,8 +29,6 @@ Conflicts=arcint-agent.service arcint-writer.service arcint-flashnext.service ar
 
 [Service]
 Type=simple
-CacheDirectory=arcint-imggen
-Environment=GGML_OPENCL_KERNEL_CACHE_DIR=%C/arcint-imggen/cl-cache
 ExecStart=/usr/bin/arcint-sd-server \
     --diffusion-model /models/imggen/z_image_turbo-Q8_0.gguf \
     --llm /models/imggen/Qwen3-4B-Instruct-2507-Q8_0.gguf \
@@ -33,7 +36,7 @@ ExecStart=/usr/bin/arcint-sd-server \
     --backend GPUOpenCL \
     --auto-fit off \
     --flash-attn off,diffusion=on \
-    --conv-direct auto \
+    --conv-direct auto,vae=on \
     --width 1024 --height 1024 \
     --steps 8 --seed 42 --cfg-scale 1.0 --sampling-method euler \
     --listen-ip 0.0.0.0 --listen-port 8085

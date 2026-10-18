@@ -1,11 +1,24 @@
 # imggen-attention-path — the DiT's numeric path is not reproduced across processes
 
-**Open** (2026-10-17, defect; rechecked 2026-10-18). One window, the same
-sd.cpp flags: two different images on the B60, one passing the CPU gate and one
-failing it, at the same wall step (`measured-here`). The fresh-process variant
-did **not** reproduce in eight fresh-cache/global-cache/VAE arms; the
-suspected 1024² binary split was a **measurement fault of our own** (the CLI
-arms ran without a prompt) and is closed below (`measured-here`).
+**Closed 2026-10-18: no defect.** Both "variants" were measurement faults of
+our own (`measured-here`, the arm directories re-read in the 1.1.0 release
+review):
+
+- **512².** Every FAIL arm (`prof-plain512`, `prof-vae-on512`,
+  `prof-vae-off512`, `bu-vae-off512`) holds **20** step previews
+  (`prev_000`-`prev_019`), every PASS arm 8. The FAIL arms were launched
+  without `--steps 8` and ran sd.cpp's default 20 steps, then were compared
+  step for step with an 8-step reference: a different sigma schedule, so a
+  different trajectory. That is also the "2.4x launches at the same wall
+  step" (3665 against 1613 `mul_mm_f16w_f16` launches: 20 steps against 8 at
+  the same time a step). None of those arms wrote an `arm.json`; they were
+  launched outside the gate tool.
+- **1024².** The CLI arms and the CPU reference ran without `-p` (below).
+
+`tools/imggen_gate.py compare` now refuses arms without an `arm.json` or with
+different prompt, size, steps, seed, sampler, scheduler or model files, and
+prints what else separated them (binary, flags, `GGML_*` environment).
+The record of the investigation follows as it was written.
 
 ## Charter
 

@@ -12,7 +12,7 @@ index 302a8d6..1797441 100644
 +    target_compile_definitions(${TARGET} PRIVATE ARCINT_BUILD="${ARCINT_BUILD}")
 +endif()
 diff --git a/examples/server/routes_sdcpp.cpp b/examples/server/routes_sdcpp.cpp
-index a6c8a1e..0bcf168 100644
+index a6c8a1e..0d9a115 100644
 --- a/examples/server/routes_sdcpp.cpp
 +++ b/examples/server/routes_sdcpp.cpp
 @@ -9,6 +9,7 @@
@@ -23,7 +23,7 @@ index a6c8a1e..0bcf168 100644
  
  namespace fs = std::filesystem;
  
-@@ -468,9 +469,59 @@ static bool parse_vid_gen_request(const json& body,
+@@ -468,9 +469,57 @@ static bool parse_vid_gen_request(const json& body,
      return true;
  }
  
@@ -32,8 +32,8 @@ index a6c8a1e..0bcf168 100644
 +#endif
 +
 +// arcint (contrib/sdcpp/server-health-props.patch): the service probes of the
-+// language units. The context is built before the server listens, so a
-+// listening server is a loaded one.
++// language units. /health answers once the server listens; the weights load
++// at the first request unless --eager-load is given.
 +static json make_props_json(const ServerRuntime& runtime) {
 +    const auto& ctx      = *runtime.ctx_params;
 +    const auto& defaults = *runtime.default_gen_params;
@@ -61,8 +61,6 @@ index a6c8a1e..0bcf168 100644
 +        {"height", defaults.height},
 +        {"seed", defaults.seed},
 +        {"sample", make_sample_params_json(defaults.sample_params, defaults.skip_layers)},
-+        {"sdcpp_version", sd_version()},
-+        {"sdcpp_commit", sd_commit()},
 +        {"build", ARCINT_BUILD},
 +    };
 +}

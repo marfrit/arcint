@@ -11,7 +11,8 @@ repository; what is here is everything needed to build the same thing.
 The top-level `CHANGELOG.md` is the human record per release; the Debian
 changelog here is the package record.
 
-Kept in step by hand: every tagged release updates `arcint/build-deb.sh`
+Kept in step by hand: every tagged release updates `arcint/build-deb.sh` and
+`arcint-imggen/build-deb.sh`
 (PKGVER, PKGREL, the release tarball's sha256; the llama.cpp commit and its
 tarball's sha256 when the pin moves) and the changelog here in the same
 breath. A stale recipe is a broken instruction, which is the one thing this
@@ -29,6 +30,16 @@ directory exists to prevent.
                             engine's kernels in the binary, ggml-cpu built
                             native (GGML_NATIVE in the CMake cache, AVX2 in
                             ggml_vec_dot_q4_K_q8_K)
+      debian/               control, copyright, changelog
+    arcint-imggen/
+      build-deb.sh          builds the image service (sd.cpp's sd-server and
+                            sd-cli as arcint-sd-server / arcint-sd-cli) from
+                            the same arcint tarball, llama.cpp's at the pin
+                            and stable-diffusion.cpp's at f0aac52, each
+                            sha256-checked, through contrib/sdcpp/build-sdcpp.sh;
+                            then gates: 0057's, 0058's and the DPAS attention's
+                            kernels in sd-server, the /props build string, ldd
+                            resolution, no Vulkan
       debian/               control, copyright, changelog
 
 ## Two things worth knowing before you try

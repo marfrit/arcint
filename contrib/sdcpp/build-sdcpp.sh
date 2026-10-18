@@ -71,12 +71,10 @@ grep -Eq '^#\s*define\s+GGML_MAX_NAME\s+64$' "$GGML/include/ggml.h" \
 # arcint's sd.cpp patches, in order (contrib/sdcpp/README.md):
 #   upstream-rope-apply.patch       lifts the upstream-mode guard around ggml_rope_apply
 #                                   (rope.hpp): since 0057 the op exists in arcint's tree;
-#   server-health-props.patch       sd-server's /health and /props (charter A4);
-#   conv-direct-probe-opencl.patch  times the direct conv on OpenCL as on Vulkan, so
-#                                   --conv-direct auto can pick it (campaign imggen-vae-conv).
+#   server-health-props.patch       sd-server's /health and /props (charter A4).
 # Each is applied unless it is already in (its reverse applies), so a re-run is a no-op.
 HERE="$(cd "$(dirname "$0")" && pwd)"
-for p in upstream-rope-apply server-health-props conv-direct-probe-opencl; do
+for p in upstream-rope-apply server-health-props; do
     f="$HERE/$p.patch"
     [ -f "$f" ] || { echo "missing $f" >&2; exit 1; }
     if (cd "$SRC" && git apply --reverse --check "$f" 2>/dev/null); then

@@ -1,13 +1,16 @@
 # arcint
 
-> Intel Arc LLM inference server, deliberately narrow (Arc A770 16 GiB, Arc
-> Pro B60 24 GB, xe driver), with an OpenAI-compatible HTTP API. Serves the
+> Intel Arc inference server (Arc A770 16 GiB, Arc Pro B60 24 GB, xe
+> driver), with OpenAI-compatible HTTP APIs: language models through
+> libllama, and since 1.1.0 text-to-image (Z-Image Turbo) through
+> stable-diffusion.cpp's sd-server built against the same patched ggml tree
+> (package arcint-imggen, contrib/sdcpp, docs/imggen.md). Serves the
 > hybrid GatedDeltaNet/attention Qwen family from GGUF files: Qwen3.8-27B
 > (dense, the agent), Qwen3.6-27B-A3B-Coder (MoE, the coder) and
 > Qwen3.8-Flash-Next (512-expert MoE on one card plus host RAM), plus
 > Cydonia 24B (llama architecture) for writing. One engine: libllama
 > (llama.cpp at pinned commit 3e4dfa8) with ggml's OpenCL backend and
-> arcint's Intel kernel series (contrib/llama.cpp/patches, 0001-0056
+> arcint's Intel kernel series (contrib/llama.cpp/patches, 0001-0058
 > without 0031 and 0055).
 > arcint owns the HTTP surface, chat templates, tool calls, the sampler,
 > named lanes, MTP speculative decoding, context checkpoints and the expert
@@ -16,6 +19,11 @@
 
 ## Status
 
+- Version 1.1.0 (2026-10-18): image generation (docs/milestone-1.1.0.md):
+  Z-Image Turbo on the B60 on demand through the arcint-imggen package
+  (sd.cpp f0aac52's sd-server, /v1/images/generations, /health, /props);
+  patches 0057 (fused ROPE_APPLY, OpenCL) and 0058 (q8_0 GEMM on XMX, the
+  B60 only). 1024², 8 steps: 2.14 s a step, ~23.5 s a request steady.
 - Version 1.0.0 (2026-10-16): the 1.0 charter met (docs/milestone-1.0.0.md);
   DFlash2 drafting opt-in. 0.8.1 removed the series' opt-in alternatives
   (54 patches); 0.8.0 removed the OpenVINO engine (charter A6).

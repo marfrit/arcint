@@ -1,8 +1,9 @@
-# 1.1.0 — image generation on the Arc cards (draft)
+# 1.1.0 — image generation on the Arc cards
 
-**Draft** (2026-10-17, branch `imggen`). Nothing here is decided. The
-operator amends and decides this charter; an agent does not. Every claim
-carries its evidence class: `paper` (a published text, README, model card),
+The 1.1.0 charter, drafted 2026-10-17 and released 2026-10-18. §1 records
+the operator's decisions, §2 each criterion's state with its evidence; §0
+is the starting point as it was surveyed. The operator amends and decides
+this charter; an agent does not. Every claim carries its evidence class: `paper` (a published text, README, model card),
 `code` (read in source, file and commit named), `measured-here` (run on this
 project's cards), `arithmetic` (derived, not measured) or `decision` (the
 operator's, dated).
@@ -91,42 +92,51 @@ gate. Checked against the source:
   Q4_K ≈ 18 GB + Mistral Small 3.2 Q4_K_M ≈ 14 GB (they do not fit on one card
   together; see D4).
 
-## 1. The operator's decisions (open)
+## 1. The operator's decisions
 
-| # | question | options, with their price where known |
+| # | question | decided |
 |---|---|---|
-| D1 | Scope. README and DESIGN §8.8 name multimodal as a non-goal (`decision`). Image generation is output, not input, but it widens the scope from "LLM server" to "inference server" | (a) 1.1.0 takes in text-to-image; (b) a sister project on arcint's ggml; (c) kernel contributions only, the service stays sd.cpp |
-| D2 | The integration route | (a) sd.cpp's **sd-server**, built against arcint's patched ggml tree, as its own package and unit: the least code, arcint supplies kernels and gates; (b) an **arcint endpoint** `/v1/images/generations` over libstable-diffusion in the arcint process: one surface, but a second runtime in the process, and `GGML_MAX_NAME` has to change for libllama too; (c) a DiT path of arcint's own: dropped, sd.cpp is the reference and already has it |
-| D3 | Card and unit | the B60 on demand (`Conflicts=` with the agent, the writer, Flash-Next, like the writer) or the A770 (16 GiB, only without the coder); either way one card per process (DESIGN §3, README) |
-| D4 | First model | **Z-Image Turbo** (6B, 8 steps, Qwen3 encoder, AutoEncoderKL without 3D convolution): the smallest gap. Then Qwen-Image (needs CONV_3D for the Wan VAE) and FLUX.2 (32B + a 24B encoder: load the encoder and the DiT one after the other, or the encoder on the second card, sd.cpp `--backend te=...`) |
-| D5 | `GGML_MAX_NAME` | 160 for the whole build (libllama included; an A/B per DESIGN §5 must show the language services do not suffer), or 64 and sd.cpp built at 64 (sd.cpp's tensor names are longer: check for truncation) |
-| D6 | The gate (§3): tolerances | proposal in §3; the operator sets the numbers |
+| D1 | Scope: README and DESIGN §8.8 named multimodal a non-goal; image generation is output, not input, but widens "LLM server" to "inference server" | **(a)**, 1.1.0 takes in text-to-image, and arcint is no longer "deliberately narrow" (`decision`, operator, 2026-10-18). Multimodal *input* stays out (§8.8) |
+| D2 | The integration route | **(a)** sd.cpp's `sd-server` built against arcint's patched ggml tree, as its own package (`arcint-imggen`) and unit (`decision`, operator, 2026-10-17/18). (b) an arcint endpoint and (c) an own DiT path are not built |
+| D3 | Card and unit | **the B60 on demand**, `Conflicts=` with the agent, the writer, Flash-Next and the lanes unit (`decision`, operator, 2026-10-17). An on-demand front on the card host starts and stops it (operator-local) |
+| D4 | First model | **Z-Image Turbo** (6B, 8 steps, Qwen3-4B encoder, AutoEncoderKL). Qwen-Image and FLUX.2 are Phase 4, not in 1.1.0 |
+| D5 | `GGML_MAX_NAME` | follows from D2(a): **separate binaries**, sd.cpp's build at 160, arcint's libllama at the pin's 64; they never share a process (`code`, `contrib/sdcpp/build-sdcpp.sh`) |
+| D6 | The gate's tolerances (§3) | **open**: the release gated with the placeholders `tools/imggen_gate.py` prints with every verdict (per-step cosine ≥ 1 − 0.001; against the baseline arm per-step MSE ≤ +5 %, final PSNR ≥ −1 dB, SSIM ≥ −0.01). The numbers stay the operator's |
 
 ## 2. Criteria for 1.1.0
+
+The release measurements are 2026-10-18 on the dev host, `measured-here`
+unless marked: the B60, Z-Image Turbo Q8_0 + Qwen3-4B-Instruct-2507 Q8_0 +
+`ae.safetensors`, prompt "a red cube on a white table, centered", seed 42,
+8 steps, Euler, cfg 1.0, the service's flags (`--flash-attn
+off,diffusion=on`, `--auto-fit off`), sd.cpp `f0aac52` in upstream mode on
+llama.cpp `3e4dfa8` with patches 0001-0058, the CPU reference made by a
+build without the RoPE integration patch (sd.cpp's own generic RoPE), every
+arm through `tools/imggen_gate.py` with its `arm.json`.
 
 ### A. It runs
 
 | # | criterion | state |
 |---|---|---|
-| A1 | sd.cpp in upstream mode builds against the pin `3e4dfa8` with the series (0001-0056 without 0031, 0055) and `GGML_OPENCL_USE_ADRENO_KERNELS=OFF` | open |
-| A2 | The first model (D4) makes a 1024x1024 image on the chosen card (D3) at a fixed seed, with no op silently falling back to the CPU: `GGML_SCHED_DEBUG` counts the splits, every CPU island is named and either built or justified by its share of the time | open |
-| A3 | The language services stay as they are: the release A/B (`tests/acceptance/ab.py`) against 1.0.0 passes, the acceptance task ≥ 9/10 | open |
-| A4 | A service: unit, package, `/v1/images/generations` (OpenAI shape), `/health`, `/props` with model, card, steps, sampler | open |
+| A1 | sd.cpp in upstream mode builds against the pin `3e4dfa8` with the series and `GGML_OPENCL_USE_ADRENO_KERNELS=OFF` | **met**: `contrib/sdcpp/build-sdcpp.sh` builds it from a pristine export and asserts the series' kernels, 0057's and 0058's in the binary and `GGML_MAX_NAME=160` on the compile lines (`measured-here`, 2026-10-17, again on the release tree) |
+| A2 | A 1024x1024 image on the chosen card at a fixed seed, no op silently on the CPU | **met**: 1024² on the B60, all modules on VRAM in one segment; `GGML_SCHED_DEBUG` showed no CPU island (`measured-here`, 2026-10-17, on 0057; 0058 changes a kernel inside `MUL_MAT`, not `supports_op`, `code`); the release's profile has every kernel on the device |
+| A3 | The language services stay as they are: the release A/B against 1.0.0 passes, the acceptance task ≥ 9/10 | PENDING-A3 |
+| A4 | A service: unit, package, `/v1/images/generations` (OpenAI shape), `/health`, `/props` with model, card, steps, sampler | **met**: `contrib/systemd/arcint-imggen.service`, the `arcint-imggen` package (`contrib/packaging/arcint-imggen`), `/health` and `/props` by `contrib/sdcpp/server-health-props.patch`; served: `data[0].b64_json`, the `<sd_cpp_extra_args>{"seed":N}</sd_cpp_extra_args>` suffix honoured (seed 42 twice the same bytes, seed 7 another image), the served image equal to `sd-cli`'s pixel for pixel. PENDING-A4 |
 
 ### B. It is fast
 
 | # | criterion | state |
 |---|---|---|
-| B1 | A profile per op and step on the card (device time, the first step separate, since it builds kernels) | open |
-| B2 | Every kernel above 10 % of a step's time is set against its measured ceiling (as B4 of the 1.0 charter) or open as a campaign | open |
-| B3 | A comparison with a reference on Arc: sd.cpp on Vulkan on the same card, same file, same seed, same steps | open |
+| B1 | A profile per op and step on the card, the first step separate | **met**: `tools/imggen_profile.py` on a `GGML_OPENCL_PROFILING` build, an 8-step and a 1-step run at 1024²; the difference is 2,131 ms of device time a step against a 2.14 s wall step (the step is device-bound) |
+| B2 | Every kernel above 10 % of a step's time set against its measured ceiling or open as a campaign | **met by the second branch**: one kernel is above 10 %, 0058's `kernel_mul_mm_q8_0_f16` at **69 %** of a 1024² step (1,470 ms, ≈ 33.5 TFLOP/s, 34 % of the B60's XMX f16 peak against the operator's 70 % bar); its tile search is open in `docs/campaigns/imggen-q8_0-xmx-gemm.md`. Next: the DPAS attention 8.3 %, everything else under 4 %. Per image, the VAE decode (6.3 s at 1024² with the direct conv) |
+| B3 | A comparison with a reference on Arc: sd.cpp on Vulkan, same card, file, seed, steps | PENDING-B3 |
 
 ### C. It is right
 
 | # | criterion | state |
 |---|---|---|
-| C1 | The image gate (§3) passes for every model that ships | open |
-| C2 | Every new or changed kernel has its red case, which turns the gate red | open |
+| C1 | The image gate (§3) passes for every model that ships | **met** for Z-Image Turbo in the service form: 1024² cos worst **0.999926**, PSNR **42.59 dB**, SSIM 0.999257 against the CPU reference, inside the tolerance of the baseline arm (0058 off: 0.999922, 42.40 dB); 512² 0.999987, 46.54 dB (baseline 45.84 dB); the VAE's direct conv the same (42.59 dB; finals 69.4 dB apart) |
+| C2 | Every new or changed kernel has its red case, which turns the gate red | **met**: 0058's red (`GGML_OPENCL_Q8_XMX_RED=1`, the last 16 of K zeroed) FAILs the image gate (1024² cos worst 0.987219, PSNR 19.56 dB; 512² 0.995502) and 52 of 151 Q8_0 op cases; 0057's red (cos/sin swapped) FAILs the image gate (512² cos worst 0.890391, PSNR 9.70 dB) and every `test_rope_apply` case (0/26 pass with the kernel mutated, 26/26 restored). The op suites themselves are new: `test_rope_apply` (26 cases, with a cross-check against sd.cpp's own decomposition) and 0058's Q8_0 `MUL_MAT` cases, passing on the B60 and the A770 |
 
 ## 3. The gate
 
@@ -151,6 +161,15 @@ operator sets the numbers, D6):
 - **Speed**: seconds a step and an image at 1024x1024, a fresh process per
   cell, the first step separate; against the last release in the same
   window, as for the language services.
+
+As built (`tools/imggen_gate.py`): the per-step figure is a latent proxy
+(sd.cpp's `PREVIEW_PROJ` preview, the latent projected to RGB); `compare`
+refuses arms without an `arm.json` or with a different prompt, size, steps,
+seed, sampler, scheduler or model file, and prints each arm's binary, other
+flags and `GGML_*` environment. Two "defects" of the development record were
+arms that differed in exactly those (no `-p`; 20 steps against 8,
+`docs/campaigns/imggen-attention-path.md`). The content check of a fixed
+prompt set is not built.
 
 ## 4. Phases
 
@@ -177,7 +196,8 @@ operator sets the numbers, D6):
    measurement and red case (DESIGN §1.1).
 4. **Phase 3, the service** (after D1-D3): package, unit, endpoint, gates in
    `tests/acceptance/cells.json`.
-5. **Phase 4, more models** (Qwen-Image, FLUX.2), each with its own gate.
+5. **Phase 4, more models** (Qwen-Image, FLUX.2), each with its own gate:
+   not in 1.1.0.
 6. **Release 1.1.0** by the existing procedure (review, pre-tag check, fresh
    container, A/B against 1.0.0).
 
