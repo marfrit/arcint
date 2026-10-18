@@ -93,10 +93,12 @@ Re-run with the same prompt, the `sd-cli` arm is **bit-identical to the server**
 (cos 1.000000, PSNR inf, SSIM 1.000000), and three separate server processes
 (`served1`, `served3`, `srvcache0`/`condstatsrv3`) are identical too. This
 campaign therefore has **one** open question left: the 512² fresh-process
-variant, unreproduced in eight arms. The 1024² gate now needs a CPU reference
-with the prompt (run 2026-10-18); the RoPE/generic arms cluster, the flash
-assignments cluster, and the conditioning census (`ENCSTAT`/`CONDSTAT`) shows
-the empty-prompt and prompted runs as different inputs, not different binaries.
+variant, unreproduced in eight arms. The 1024² CPU reference with the same
+prompt was made and the gate PASSes (per-step cosine worst 0.999890, MSE worst
+11.639, final PSNR 41.42 dB, SSIM 0.999029); the led image is bit-identical to
+that gated `sd-cli` arm. The RoPE/generic arms cluster, the flash assignments
+cluster, and the conditioning census (`ENCSTAT`/`CONDSTAT`) shows the
+empty-prompt and prompted runs as different inputs, not different binaries.
 
 ## Where it lives
 

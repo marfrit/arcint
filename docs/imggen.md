@@ -439,11 +439,13 @@ What still holds: the 512² fresh-process variant
 (`docs/campaigns/imggen-attention-path.md`) was not reproduced in eight
 fresh-cache/global-cache arms; the sd-cli/sd-server equivalence also holds at
 512² (served vs `bu-auto-g512`: cos 0.999997, PSNR 53.85; vs `refcpu512`:
-cos 0.999975, PSNR 44.77). **The 1024² gate rests on a CPU reference that
-carries the same prompt** (run 2026-10-18, ~24 min a leg): the candidate
-(`sd-cli` with prompt, and the same image served over HTTP) is compared to it
-and to the 512² reference where the content overlaps. The service acceptance
-waits on that figure.
+cos 0.999975, PSNR 44.77). **The 1024² CPU reference with the same prompt was
+made (26 min a leg) and the gate PASSes** (`measured-here`, 2026-10-18):
+per-step cosine worst **0.999890**, MSE worst **11.639** (pixel-squared),
+final **PSNR 41.42 dB, SSIM 0.999029** -- the 512² CPU figure was 44.77
+against a 512² candidate, so the f16-DiT candidate stays inside the spread
+at twice the resolution. The served HTTP image is **bit-identical** to that
+gate-passing `sd-cli` arm, so the Phase-3 acceptance is met.
 
 **Phase-3 memory/speed measurements** (`measured-here`, 2026-10-18, B60, Z-Image
 Turbo Q8_0 + Qwen3-4B Q8_0 + `ae.safetensors`, 1024²/8/seed 42, pinned
@@ -473,16 +475,18 @@ and correct against `refcpu512`. The unit's `/v1/models` returns
 `/sdcpp/v1/capabilities` is the closest defaults dump.
 
 **CPU reference at 1024²** (`measured-here`, 2026-10-18, `sd-cli` CPU, same
-file/seed/steps, `--flash-attn off`, 16 threads): first step 169.74 s, then
-149-164 s a step (the CPU reference is card-free but ~24 min an image). Its
-final is at the centre of the split above. The profiling csvs also
-differ (the failing arms' DiT kernels ~2.4x the launch counts,
+file/seed/steps/backend-flags, 16 threads, `-p` the same prompt): first step
+148.28 s, then 128-130 s a step (the CPU reference is card-free but ~26 min an
+image), final `psnr_ref` 41.42 dB. The old `--flash-attn` auto prints
+(`flash attention auto: OpenCL -> off`) do not track the applied path; one
+first run of this leg stalled after step 1 and was killed by its 2 h timeout
+(a restarted leg completed). The profiling csvs of the two binaries differ
+(the first comparison's arms ~2.4x the launch counts,
 `mul_mm_f16w_f16` 3665 against 1613) at the same wall; that difference is
-unexplained and may be a profiling artifact. `flash attention auto: OpenCL ->
-off` prints in both kinds of arm, so the printed decision does not track the
-applied path. Deterministic within a process, varying across processes: **the
-image gate is only comparable when this trajectory is controlled.** Campaign:
-`docs/campaigns/imggen-attention-path.md`.
+unexplained and may be a profiling artifact. Deterministic within a process,
+varying across processes: **the image gate is only comparable when the
+trajectory is controlled** -- the controlled version is the padding-free gate
+above. Campaign: `docs/campaigns/imggen-attention-path.md`.
 
 ## Phases
 
