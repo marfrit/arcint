@@ -20,7 +20,7 @@ the operator fixes them.
 | unit | binary | model files | routes | state |
 |---|---|---|---|---|
 | `arcint-vlm` | `/usr/bin/arcint` (`arcint` package) | `Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf` + `mmproj-...-Q8_0.gguf` | `/v1/chat/completions` with `image_url` | **built** (chat path + unit file; package and the `/props` multimodal fields owed) |
-| `arcint-tts` | `/usr/bin/arcint` (`arcint` package) | `Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` + `mmproj-Qwen3-TTS-...-Q8_0.gguf` | `POST /v1/audio/speech`, `GET /v1/audio/voices` | **built** (the `libmtmd` `gen_audio` path + routes + unit file); the first card arm FAILed under the gate's greedy sampling (a gate-arm defect, now fixed: the reference's stochastic defaults), the corrected card arm owed |
+| `arcint-tts` | `/usr/bin/arcint` (`arcint` package) | `Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` + `mmproj-Qwen3-TTS-...-Q8_0.gguf` | `POST /v1/audio/speech`, `GET /v1/audio/voices` | **built** (the `libmtmd` `gen_audio` path + routes + unit file); the card gate **FAIL** on both arms (greedy WER 2.09, stochastic WER 2.1667, a 512-frame cap and no end-of-speech) — campaign owed |
 | `arcint-stt` | `/usr/bin/arcint-whisper` (`arcint-stt` package) | `ggml-large-v3-turbo.bin` (or `ggml-large-v3.bin`) | `POST /v1/audio/transcriptions` | **built** (whisper.cpp on the installed ggml, card gate PASS; unit file written; package and `/props` owed) |
 
 Ports (proposed; the operator fixes them): `arcint-vlm` 8083, `arcint-tts` 8084,

@@ -477,23 +477,25 @@ and both load fixes, and the window ran a build of it):**
 | C4, intelligibility (the greedy arm) | **FAIL**: round-trip corpus WER **2.0909** over 8 sentences at floor 0.20 (voice `gate-fleurs`, seed 42); the waveform is not intelligible German — the transcripts are unrelated phrases and `* Musik *` labels, and one sentence's own words never come back |
 | B3, real time (the greedy arm) | **FAIL**: generation hit the 512-frame cap (41.0 s of audio) at 140–180 s of process per sentence — a real-time factor of ~**0.29** (slower than real time); one sentence stopped at 48 frames, the rest at the cap |
 | the arm's own defect | the gate defaulted to a **greedy temperature 0** (a `body` field added silently by the first gate), where the reference `tools/tts/tts.cpp` samples the backbone's codec tokens with `common_params`' temperature 0.8 / top_k 40 / top_p 0.95 / repetition 1.0. Greedy derails the codec stream past the first frames and never reaches end-of-speech (`measured-here`): the 512-frame cap and the 2.09 WER are the **gate arm's**, not a verdict on the implementation. `tools/tts_gate.py` now carries the reference defaults as flags and prints the sampling with every verdict |
+| the corrected (stochastic) arm | **also FAIL**: corpus WER **2.1667** (floor 0.20) with the reference's sampling defaults and a fixed seed; every sentence still hit the 512-frame cap (41.0 s), so end-of-speech never arrives and the waveform is not intelligible German (`* Musik *` labels). The gate's greedy setting was one defect; the code path is the other |
 | the window | a concurrent leg driver in the same workspace ran it (the wiring is on the branch); the physical-host sampler, the one-process-per-card check and the pid stop/restore all held, the B60's language unit restored after 100 s |
 
-**Open, and the next step:** re-run the card arm with the gate's corrected
-stochastic sampling (the reference's defaults, seed fixed). If it still fails,
-the `qwen3tts` gen path is wrong somewhere in the prompt/speaker/sampling
-hand-off (read `mtmd-helper-gen.cpp`'s control loop line by line against this
-build, red-first arms: the sampled token, the language and spoken-text path,
-the speaker encoder's output, end-of-speech) and it needs its own campaign
-document. A4's WAV and the refusals are real; C4 and B3 are **owed, not
-passing**. Do not adopt the greedy arm's numbers as a verdict on the code.
+**Open, and the next step is a campaign:** with both arms failing (WER 2.09
+greedy, 2.1667 stochastic), the `qwen3tts` gen path is wrong in the
+prompt/speaker/sampling hand-off, not in the gate. Read
+`mtmd-helper-gen.cpp`'s control loop line by line against this build and
+red-first arms: no end-of-speech ever fires (the 512-frame cap every time),
+whether the token fed to `step_gen` is the semantic code the helper expects,
+how the helper's own backbone decode and logits rows line up with arcint's
+sampler (`llama_get_logits_ith(ctx_, -1)` after each `step_gen`), the language
+and spoken-text path, and the speaker encoder's output. It needs its own
+campaign document. A4's WAV and the refusals are real; C4 and B3 **fail on the
+record and are not a passing gate**.
 
 The VLM phase-0 dispositions (the `vlm_gate` tool run, the CPU encoder B4
 reference, the op profile, the red case, the package/unit/probes) are still
-open; this session's card time went to STT and the TTS wiring instead. The STT
-`arcint-stt` unit, `arcint-vlm` and `arcint-tts` unit files are written
-(`contrib/systemd/`, ports 8083/8084/8091 proposed), the packages and `/props`
-extensions owed.
+open. The speech units' files are written (`contrib/systemd/`, ports
+8083/8084/8091 proposed); the packages and `/props` extensions owed.
 
 ## 10. References
 
