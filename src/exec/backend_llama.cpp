@@ -455,10 +455,14 @@ public:
                                        llama_model_n_head(model_) == 32 && llama_model_n_head_kv(model_) == 8 &&
                                        std::string(head_dim) == "128" && llama_vocab_n_tokens(vocab_) == 131072;
         mistral_small_24b_ = mistral_small_24b;
-        if (a != "qwen35" && a != "qwen35moe" && a != "qwen4exp" && a != "qwen2vl" && !mistral_small_24b)
+        // --tts admits the audio-generation backbone's own architecture (Qwen3-TTS;
+        // docs/milestone-1.2.0.md D4): its gen half needs --mmproj, checked after
+        // this, and its text path is not served (the asset is not a language model).
+        const bool tts_arch = cfg.tts && a == "qwen3tts";
+        if (a != "qwen35" && a != "qwen35moe" && a != "qwen4exp" && a != "qwen2vl" && !mistral_small_24b && !tts_arch)
             throw std::runtime_error(log::format("%s is a '%s' model; --engine llama serves qwen35, qwen35moe, qwen4exp, "
-                                                 "qwen2vl (vision, with --mmproj) and Mistral Small 3.2 24B "
-                                                 "('llama', 40 x 5120, 32/8 heads)",
+                                                 "qwen2vl (vision, with --mmproj), Mistral Small 3.2 24B "
+                                                 "('llama', 40 x 5120, 32/8 heads) and, under --tts, qwen3tts",
                                                  cfg.gguf_path.c_str(), arch));
         tokenizer_ = std::make_unique<LlamaTokenizer>(vocab_);
         n_vocab_   = static_cast<size_t>(llama_vocab_n_tokens(vocab_));
