@@ -51,11 +51,14 @@ def wer(ref, hyp):
     return prev[-1] / max(1, len(r)), prev[-1], len(r)
 
 
-def synthesize(tts_url, model, voice, text, seed, timeout):
-    body = {"model": model, "input": text, "voice": voice, "response_format": "wav",
-            "temperature": 0}
-    if seed is not None:
-        body["seed"] = seed
+def synthesize(tts_url, model, voice, text, sampling, timeout):
+    # The reference tts.cpp runs the backbone's codec-token sampling stochastically
+    # (common_params defaults: temperature 0.8, top_k 40, top_p 0.95, repetition
+    # 1.0). A greedy temperature 0 made the codec stream derail past the first
+    # frames and never reach end-of-speech (measured-here, 2026-10-18). Fixed seed
+    # keeps the arm reproducible; the sampling is recorded in speech.json.
+    body = {"model": model, "input": text, "voice": voice, "response_format": "wav"}
+    body.update({k: v for k, v in sampling.items() if v is not None})
     req = urllib.request.Request(tts_url, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -103,9 +106,12 @@ def speech(args):
     """Phase A: synthesize every sentence to WAV (TTS up; no STT needed)."""
     texts, msha = load_texts(args)
     os.makedirs(args.out, exist_ok=True)
+    sampling = {"temperature": args.temperature, "top_p": args.top_p,
+                "top_k": args.top_k, "repetition_penalty": args.repetition_penalty,
+                "seed": args.seed}
     cases = []
     for i, text in enumerate(texts):
-        wav = synthesize(args.tts_url, args.model, args.voice, text, args.seed, args.timeout)
+        wav = synthesize(args.tts_url, args.model, args.voice, text, sampling, args.timeout)
         wav_path = os.path.join(args.out, "sent_%03d.wav" % i)
         open(wav_path, "wb").write(wav)
         cases.append({"text": text, "wav": wav_path, "wav_bytes": len(wav)})
@@ -113,6 +119,7 @@ def speech(args):
         sys.stdout.flush()
     json.dump({"n": len(cases), "cases": cases, "manifest_sha256": msha,
                "manifest": args.manifest, "voice": args.voice, "seed": args.seed,
+               "sampling": {k: v for k, v in sampling.items() if v is not None},
                "tts_url": args.tts_url, "model": args.model, "lang": args.lang,
                "floor": args.floor},
               open(os.path.join(args.out, "speech.json"), "w"), indent=1)
@@ -155,6 +162,7 @@ def transcribe_phase(args):
     os.makedirs(args.out, exist_ok=True)
     json.dump(result, open(os.path.join(args.out, "result.json"), "w"), indent=1)
     json.dump({"tts_url": sp["tts_url"], "model": sp["model"], "voice": sp["voice"],
+               "sampling": sp.get("sampling"),
                "stt_url": args.stt_url, "stt_model": args.stt_model, "lang": sp["lang"],
                "seed": sp["seed"], "floor": sp["floor"], "manifest": sp["manifest"],
                "manifest_sha256": sp["manifest_sha256"]},
@@ -213,6 +221,10 @@ def main():
     s.add_argument("--out", required=True)
     s.add_argument("--floor", type=float, default=FLOOR_DEFAULT)
     s.add_argument("--seed", type=int, default=None)
+    s.add_argument("--temperature", type=float, default=0.8)   # tts.cpp/common_params
+    s.add_argument("--top-p", type=float, default=0.95)
+    s.add_argument("--top-k", type=int, default=40)
+    s.add_argument("--repetition-penalty", type=float, default=1.0)
     s.add_argument("--lang", default="de")
     s.add_argument("--timeout", type=float, default=600)
     s.set_defaults(fn=speech)
