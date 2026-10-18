@@ -1,7 +1,11 @@
 # imggen-wan-vae-conv3d — the Wan VAE's 3D convolutions on the OpenCL card
 
-**Open** (1.1.1). 0059 is built and its op suite is measured; the Qwen-Image
-image gate and the speed figure are owed.
+**Closed 2026-10-18** (1.1.1). 0059 enables Qwen-Image on the card: with the
+kernel off the same graph crashes in the OpenCL compute, with it on the Wan
+VAE decodes in 2.66 s. The model-level OpenCL-vs-CPU per-step cosine (Qwen
+0.99868, FLUX.2 klein 0.99812 against the placeholder `TOL_COS` 0.001) is
+**not** this kernel's doing and sits with the operator's D6
+(`docs/milestone-1.1.1.md` §9).
 
 ## Charter
 
@@ -64,8 +68,21 @@ the two switches.
 | 0059 red (`CONV3D_RED=1`) | **270 FAIL**, 6 pass (the `CRS = 0` degenerate shapes, 0 in both) |
 | 0059 off (`CONV_3D=0`) | every case unsupported/skipped |
 
-The image gate and the VAE speed are open; the CPU reference for
-Qwen-Image is the next leg.
+**The image** (`measured-here`, 2026-10-18, 512²/8/seed 42, cfg 2.5, euler,
+`--flow-shift 3`): all 16.7 GB on VRAM; sampling 55.7 s, the Wan VAE decode
+**2.66 s** on the card. With `GGML_OPENCL_CONV_3D=0` the same arm crashes
+(`GGML_ASSERT(dst->extra)` in `ggml_cl_compute_forward`), so pre-0059
+Qwen-Image does not run on OpenCL at all. The red arm (`CONV3D_RED=1`)
+ignores the weights and lands 8.70 dB / SSIM 0.0105 from the green arm's
+final -- the 3D convs are on the path. The CPU reference (same binary, 384
+s) gives per-step cosine worst 0.998676, PSNR 26.26 dB, SSIM 0.9912; the red
+arm's previews are bit-identical to the green arm's (cos 1.000000), so the
+step-path divergence is the DiT/TE, not 0059. The vision model reads the
+image's German lettering: "WILLKOMMEN" legible at 512²/8 and at the
+production 1024²/20 (160.7 s, VAE 8.25 s).
+
+The 1.1.1 gate tolerance and the rope-off attribution are open with the
+operator; the kernel is delivered.
 
 ## Where it lives
 
