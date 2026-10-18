@@ -1,0 +1,48 @@
+# arcint-imggen-flux — FLUX.2 klein 4B (distilled, Apache-2.0) on the 24 GB
+# card, on demand: sd.cpp's sd-server from the arcint-imggen package, on
+# arcint's patched ggml. It is the edit-capable unit:
+#   POST /v1/images/generations   OpenAI shape, data[0].b64_json
+#   POST /v1/images/edits         multipart prompt + image[] (+ optional mask)
+# and it carries the ESRGAN for POST /sdcpp/v1/upscale.
+#
+# Starting it stops the card's language units (same card, Conflicts=).
+# A seed per request through the prompt suffix
+# <sd_cpp_extra_args>{"seed":N}</sd_cpp_extra_args>.
+#
+# Flags from the gated arms (docs/milestone-1.1.1.md §9), 512²/4/seed 42:
+# klein is distilled, cfg 1.0, euler; the reference-image edit passes the
+# image to the DiT (no vision mmproj). The VAE is FLUX.2's own
+# AutoencoderKLFlux2 (32 latent channels), not FLUX.1's ae.safetensors.
+
+[Unit]
+Description=arcint-imggen-flux — FLUX.2 klein via sd-server, GPU.0 (Arc Pro B60), :8082, on demand
+Documentation=https://github.com/marfrit/arcint
+After=default.target
+Conflicts=arcint-agent.service arcint-writer.service arcint-flashnext.service arcint-agent-lanes.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/arcint-sd-server \
+    --diffusion-model /models/imggen/flux2-klein-4b-Q8_0.gguf \
+    --llm /models/imggen/Qwen3-4B-Q8_0.gguf \
+    --vae /models/imggen/flux2-klein-4b-vae.safetensors \
+    --upscale-model /models/imggen/RealESRGAN_x4plus.safetensors \
+    --backend GPUOpenCL \
+    --auto-fit off \
+    --flash-attn off,diffusion=on \
+    --conv-direct auto,vae=on \
+    --width 1024 --height 1024 \
+    --steps 4 --seed 42 --cfg-scale 1.0 --sampling-method euler \
+    --listen-ip 0.0.0.0 --listen-port 8082
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=20min
+TimeoutStopSec=60s
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectHome=read-only
+
+[Install]
+WantedBy=default.target
