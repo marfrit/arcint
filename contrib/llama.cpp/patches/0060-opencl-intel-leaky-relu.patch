@@ -11,7 +11,7 @@ index 249abdae7..501bec675 100644
      rms_norm
      rope
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 05e71a0b9..ce0db3e0b 100644
+index 05e71a0b9..b51562b60 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -1185,6 +1185,7 @@ struct ggml_backend_opencl_context {
@@ -53,19 +53,22 @@ index 05e71a0b9..ce0db3e0b 100644
      // softplus
      {
  #ifdef GGML_OPENCL_EMBED_KERNELS
-@@ -10829,6 +10854,11 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -10829,6 +10854,14 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                  default:
                      return false;
              }
 +        case GGML_OP_LEAKY_RELU:
 +            // 0060: the ESRGAN upscaler's own top-level op (ggml.c sets
 +            // GGML_OP_LEAKY_RELU, not a UNARY enum). f32 or f16, contiguous
-+            // or strided (the _nc variants take strides).
-+            return op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16;
++            // only: the strided _nc kernels measured wrong on a row-padded
++            // view in the op suite (1.1.1 release review, not attributed), so
++            // a strided input stays on the CPU.
++            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
++                   ggml_is_contiguous(op->src[0]);
          case GGML_OP_GLU:
              switch (ggml_get_glu_op(op)) {
                  case GGML_GLU_OP_GEGLU:
-@@ -19139,6 +19169,86 @@ GGML_CL_UNARY_EXT_WRAP(ggml_cl_trunc,       trunc)
+@@ -19139,6 +19172,86 @@ GGML_CL_UNARY_EXT_WRAP(ggml_cl_trunc,       trunc)
  
  #undef GGML_CL_UNARY_EXT_WRAP
  
@@ -152,7 +155,7 @@ index 05e71a0b9..ce0db3e0b 100644
  static void ggml_cl_softplus(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -34959,6 +35069,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+@@ -34959,6 +35072,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
              }
              func = ggml_cl_mean;
              break;

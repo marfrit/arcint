@@ -72,6 +72,11 @@ licence tags, `measured-here` for the sizes and hashes). Notes:
   (BSD-3-Clause), the classic 4x photo upscaler; `--upscale-model` takes it
   (`code`, `examples/common/common.cpp:543`).
 
+Staged as (the names the units use): `Qwen_Image-Q4_K_M.gguf`,
+`Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf`, `qwen-image-vae.safetensors`,
+`flux2-klein-4b-Q8_0.gguf`, `Qwen3-4B-Q8_0.gguf`,
+`flux2-klein-4b-vae.safetensors`, and `RealESRGAN_x4plus.safetensors` in a
+directory of its own (the upscale route loads every file there).
 Staging list (operator-local, `/models/imggen/`): the seven files above;
 `docs/milestone-1.1.0.md`'s Z-Image set stays for the 1.1.0 unit. Nothing
 goes into `/flash-model` between legs (SOP).
@@ -79,8 +84,10 @@ goes into `/flash-model` between legs (SOP).
 ## 3. Memory on the 24 GB card
 
 The B60 reports 23,256 MB global / 24,480 MiB when idle (`measured-here`,
-OpenCL device query, 2026-10-18). The Qwen-Image **Q4_K_M** form: weights
-16.8 GiB (DiT 12.17 + TE 4.36 + VAE 0.24) plus activations; the Z-Image
+OpenCL device query, 2026-10-18). The Qwen-Image **Q4_K_M** form: the files
+are 13.07 + 4.68 + 0.25 GB (DiT, TE, VAE; 16.8 GiB as planned from the
+tensor sizes), sd.cpp's load reports 11.9 + 3.9 + 0.24 GiB of params on the
+card (§9); plus activations; the Z-Image
 service's f16 form peaked at 18.8 GiB with a 5.6 GiB margin
 (`measured-here`, `docs/imggen.md`), so the fit is thin but likely; the
 **Q4_K_S** DiT (11.3 GiB) is the fallback if it does not (D-quant note:
@@ -106,10 +113,12 @@ The pin's ggml OpenCL takes `CONV_2D`, `IM2COL`, `GROUP_NORM`, `UPSCALE` and
 layers on the CPU. **0059** adds `GGML_OP_CONV_3D` as an implicit GEMM on the
 conv2d tiling, with the depth folded into `CRS` — no im2col expansion in
 global memory. Campaign: `docs/campaigns/imggen-wan-vae-conv3d.md`.
-`IM2COL_3D` stays out until the VAE's device time is known (`arithmetic`).
+`IM2COL_3D` stays out: the VAE decodes in 2.66 s at 512² with the direct op
+(`measured-here`, §9).
 **0060** adds `GGML_OP_LEAKY_RELU` (f32/f16, contiguous or strided), which
 the ESRGAN upscaler needs; without it the mixed CPU/OpenCL upscaler graph
-segfaults in the CPU's own forward (`measured-here`). Campaign:
+segfaults (`measured-here`; the likelier mechanism an in-place op moved to
+the CPU over an OpenCL buffer's view, `code`, not measured). Campaign:
 `docs/campaigns/imggen-leaky-relu-esrgan.md`.
 
 ## 5. Editing
@@ -136,21 +145,20 @@ Print arithmetic: 4x from 1024² gives 4096², ~350 dpi on A3's short side
 ## 7. The service
 
 Each model its own **on-demand unit next to `arcint-imggen`**, its own
-port, the same `Conflicts=` (the B60's language units), the same contract:
-OpenAI shape, `data[0].b64_json`, the sd.cpp seed suffix, `/health` and
-`/props` (A4 of 1.1.0). The front and the client side are the operator's;
-the unit names, ports, model names and request formats are documented at
-the end of the work. Planned:
+port, `Conflicts=` with the B60's language units and with the other image
+units (one model on the card at a time), the same contract: OpenAI shape,
+`data[0].b64_json`, the sd.cpp seed suffix, `/health` and `/props` (A4 of
+1.1.0). As released (the contract in `docs/imggen-service.md`):
 
-| unit | port | model | pipes |
+| unit | port | model | routes |
 |---|---|---|---|
-| `arcint-imggen` | 8085 | Z-Image Turbo | 1.1.0, stays |
-| `arcint-imggen-qwen` | 8086? | Qwen-Image | :8086 is the front; the next free 8090-8098 |
-| `arcint-imggen-flux2klein` | next | FLUX.2 klein | `/v1/images/generations` + `/v1/images/edits` |
-| upscaler | next | (in-graph / one-shot) | an option on a unit or its own |
+| `arcint-imggen` | 8085 | Z-Image Turbo | `/v1/images/generations` (1.1.0, unchanged) |
+| `arcint-imggen-qwen` | 8081 | Qwen-Image | `/v1/images/generations`, `/sdcpp/v1/upscale` |
+| `arcint-imggen-flux` | 8082 | FLUX.2 klein 4B | `/v1/images/generations`, `/v1/images/edits`, `/sdcpp/v1/upscale` |
 
-Ports 8090-8098 are the card-window range; an on-demand service unit needs a
-free one (an operator call). The exact wiring is fixed after the gates.
+The upscaler is not a unit of its own: sd-server's upscale route runs
+ESRGAN from `--hires-upscalers-dir` on the loaded unit's backend. The front
+and the client side are the operator's.
 
 ## 8. Phases
 
@@ -176,15 +184,17 @@ all **16.7 GB of params on VRAM** (DiT Q4_K_M 11.9, TE Q4_K_M 3.9, VAE
 0.24 GiB), no RAM fallback; the first request loads the TE in 17.1 s and the
 DiT in 47.9 s (from the ZFS mirror). 8 steps **55.7 s** (7.0 s a step); the
 Wan VAE decodes in **2.66 s** on the card -- with 0059 off the same graph
-crashes (`GGML_ASSERT(dst->extra)` in the OpenCL compute) because the
-unsupported 3D op is planned onto the card, so pre-0059 Qwen-Image does not
-run at all. The vision model reads the image's text as **"WILLKOMMEN"**, in
+crashes (`GGML_ASSERT(dst->extra)` in the OpenCL compute; the likelier
+mechanism, from the scheduler's code and not measured, is the conv's bias
+`add_inplace` pinned to OpenCL by its weight while its destination is a view
+of the CPU buffer the moved conv wrote), so pre-0059 Qwen-Image does not run
+at all. The vision model reads the image's text as **"WILLKOMMEN"**, in
 black on a white sign against a green forest: the German-lettering mandate
 is met. Against the CPU reference (same binary, same files/prompt/steps,
 384 s): per-step cosine worst **0.998676**, PSNR 26.26 dB, SSIM 0.9912 --
-**outside the placeholder `TOL_COS 0.001`**; the DiT path, not the VAE (the
-0059 red arm's per-step previews are bit-identical to the green arm's: cos
-1.000000). 0059's own red shows in the final image: PSNR **8.70 dB**, SSIM
+**outside the placeholder `TOL_COS 0.001`**; the DiT or the text encoder,
+not the VAE (the previews are the latent projected to RGB, so the 0059 red
+arm's are bit-identical to the green arm's: cos 1.000000). 0059's own red shows in the final image: PSNR **8.70 dB**, SSIM
 0.0105 vs the green arm.
 
 **FLUX.2 klein 4B** (512², 4 steps, seed 42, cfg 1.0, euler): DiT Q8_0 +
@@ -204,12 +214,20 @@ the reference more closely than text-to-image does.
 segfaulted in the CPU fallback. 4x from 1024² gives 4096² (~350 dpi on A3's
 short side, `arithmetic`).
 
-**Open**: the 1.1.1 gate tolerance (`TOL_COS` is the operator's D6): the two
-text-to-image curves sit 0.0013-0.0019 below 1.0, the edit curve inside
-0.001; the kernel equivalence itself is carried by the op suites (0058 151,
-0059 276, 0060 7 green and red). The CPU reference carries 0057's fused CPU
-ROPE_APPLY (the 1.1.0 reference deliberately used the generic path): a
-controlled rope-off arm was not run.
+**The gate tolerance, D6** (`decision`, operator, 2026-10-18): per-model
+`TOL_COS`, about 0.003 for the 1.1.1 models, whose text-to-image curves sat
+0.0013-0.0019 below 1.0 (the edit curve inside 0.001). Encoded in
+`tools/imggen_gate.py`'s `MODEL_TOL`, keyed by the diffusion model's file:
+Qwen-Image and FLUX.2 klein 0.003, Z-Image Turbo 0.001 (its gap measured
+0.00007). The release review found the per-step gate blind to the VAE (the
+previews are the latent projected to RGB, so 0059's red passed it) and to an
+arm that crashed after sampling; without a baseline arm, which the unchanged
+build cannot give for Qwen-Image, the final image is now held to a floor
+against the CPU reference (Qwen-Image and klein 20 dB / SSIM 0.95, Z-Image
+30 dB / 0.99), and a missing final image or a one-sided preview step fails.
+The kernel equivalence itself is carried by the op suites.
+
+RELEASE-MEASUREMENTS
 
 ## 10. References
 

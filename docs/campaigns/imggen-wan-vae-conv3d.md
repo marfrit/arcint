@@ -19,8 +19,10 @@ Qwen-Image is not usable on the card yet. The lever is a device `CONV_3D`
 ## Reference to follow
 
 - **CUDA `im2col_3d`** (`ggml-cuda/im2col.cu:123-218`, `code`): the winner
-  folds the depth into the reduction axis of an implicit GEMM; CUDA has no
-  direct-conv 3D at all.
+  folds the depth into the reduction axis of an implicit GEMM. CUDA also has
+  `GGML_OP_CONV_3D` itself (`ggml-cuda/conv3d.cu`: a direct kernel and an
+  f16 implicit GEMM, `code`; the release review corrected "no direct-conv 3D
+  at all").
 - **Vulkan `conv3d_mm.comp`** (`code`): the cooperative-matrix implicit
   GEMM for `GGML_OP_CONV_3D`; Vulkan's `IM2COL_3D` is a separate pass.
 - **Metal `kernel_conv_3d`** (`ggml-metal/kernels/conv.metal:636`, `code`):

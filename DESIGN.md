@@ -1,11 +1,12 @@
 # arcint — Design
 
-State as of 2026-10-18: arcint **1.1.0** on llama.cpp **`3e4dfa8`** with the
-patch series `contrib/llama.cpp/patches` 0001-0058 (56 patches). One engine: libllama with
+State as of 2026-10-18: arcint **1.1.1** on llama.cpp **`3e4dfa8`** with the
+patch series `contrib/llama.cpp/patches` 0001-0060 (58 patches). One engine: libllama with
 ggml's OpenCL backend and arcint's Intel kernels. Three language services run
 in production on two Intel Arc cards: the dense Qwen3.8-27B agent and
 Qwen3.8-Flash-Next (125B-A6B, on demand) on the 24 GB Arc Pro B60, the MoE
-coder on the 16 GiB Arc A770. Since 1.1.0 an image service (Z-Image Turbo)
+coder on the 16 GiB Arc A770. Since 1.1.0 an image service (Z-Image Turbo;
+since 1.1.1 also Qwen-Image and FLUX.2 klein, one unit each)
 runs on the B60 on demand: stable-diffusion.cpp's `sd-server` built against
 the same patched ggml tree, a separate binary (§3.11).
 
@@ -158,7 +159,7 @@ The cards (`measured-here` unless marked):
    └──────────────────────────────┬─────────────────────────────────┘
                                   │ libllama C API
    ┌──────────────────────────────▼─────────────────────────────────┐
-   │ llama.cpp 3e4dfa8 + contrib/llama.cpp/patches 0001-0058        │
+   │ llama.cpp 3e4dfa8 + contrib/llama.cpp/patches 0001-0060        │
    │  model, tokenizer, unified KV with a window per lane,          │
    │  recurrent state with per-token snapshots,                     │
    │  expert cache: VRAM slots + USM host bank + CPU misses         │
@@ -188,7 +189,7 @@ The cards (`measured-here` unless marked):
 
 ### 3.2 Kernels: the patch series
 
-`contrib/llama.cpp/patches` holds 56 patches against the pin (0001-0058; 0031
+`contrib/llama.cpp/patches` holds 58 patches against the pin (0001-0060; 0031
 and 0055 dropped in 0.8.1), each with its
 measurement, KL, red case and review in `contrib/llama.cpp/README.md`
 (`measured-here` throughout). By what they change:
@@ -205,7 +206,7 @@ measurement, KL, red case and review in `contrib/llama.cpp/README.md`
 | decode launches and inputs | 0004, 0005, 0027, 0047, 0049 | small ops, few-row F32, fewer launches, inputs staged in a USM ring with one wait a split |
 | lanes and devices | 0023, 0025, 0026, 0029 | one OpenCL context per platform, a KV cell window per lane, per-sequence attention windows |
 | graph and buffers | 0010, 0036, 0052 | MTP masked rows, Q8_0 GET_ROWS, compute buffers reserved for N cells |
-| image generation | 0057, 0058 | the fused `ROPE_APPLY` op (CPU and OpenCL) for sd.cpp's DiTs; the Q8_0 GEMM on the XMX units, on the B60 (it also takes the language models' Q8_0 weights in batches of 16 or more, which in the served GGUFs are only MTP draft heads) |
+| image generation | 0057-0060 | the fused `ROPE_APPLY` op (CPU and OpenCL) for sd.cpp's DiTs; `CONV_3D` (Qwen-Image's Wan VAE) and `LEAKY_RELU` (the ESRGAN upscaler) on OpenCL, neither in a language graph; the Q8_0 GEMM on the XMX units, on the B60 (it also takes the language models' Q8_0 weights in batches of 16 or more, which in the served GGUFs are only MTP draft heads) |
 
 Every switch the series reads is classified in `docs/switches.md`
 (operational, tuning, opt-in alternative, off switch, red case, diagnostic).
@@ -405,17 +406,21 @@ the page cache: an IQ3_XXS "28 t/s" was warm pages, 4-5 t/s from ZFS,
 Text-to-image is not served by arcint's process. It is stable-diffusion.cpp
 (`f0aac52`, MIT) in upstream mode, its own `sd-server`, compiled against the
 same llama.cpp tree with the same series (`contrib/sdcpp/build-sdcpp.sh`),
-packaged as `arcint-imggen` and run as its own unit on the B60 on demand
-(`Conflicts=` with the card's language units). Two reasons for the
+packaged as `arcint-imggen` and run as one unit a model on the B60 on
+demand (`Conflicts=` with the card's language units; the 1.1.1 units also
+with each other). Two reasons for the
 separate binary: sd.cpp compiles ggml with `GGML_MAX_NAME=160`, which
 changes `ggml_tensor`'s layout against libllama's 64, and sd.cpp already is
 the reference implementation of the models, their text encoders, samplers
 and VAEs (`docs/milestone-1.1.0.md`, D2 and D5). arcint supplies the
-kernels (0057, 0058, and the series' attention and GEMMs), two sd.cpp
+kernels (0057-0060, and the series' attention and GEMMs), two sd.cpp
 patches (the upstream-mode RoPE guard; `/health` and `/props`), the unit's
 flags and the gate: `tools/imggen_gate.py`, per-step latent previews and
 the final image against a CPU reference, comparative against a baseline
-arm, with parameter parity enforced. The record is `docs/imggen.md`.
+arm or, where none exists, a per-model floor on the final image, with
+parameter parity enforced and per-model tolerances (D6). The record is
+`docs/imggen.md`, the 1.1.1 models' `docs/milestone-1.1.1.md`, the units'
+contract `docs/imggen-service.md`.
 
 ## 4. Serving surface
 
@@ -624,6 +629,7 @@ GGUF repack) is at the tag `openvino-history`.
 | 0.8.1 | the llama.cpp series' opt-in alternatives removed (0031, 0055 dropped); the pin move's red cases and KL arms (C3) | released 2026-10-16 |
 | 1.0.0 | feature complete, almost no gains by obvious changes (charter `docs/milestone-1.0.0.md`, met); DFlash2 opt-in; the release speed gate as a same-window A/B | released 2026-10-16 |
 | 1.1.0 | image generation (charter `docs/milestone-1.1.0.md`): Z-Image Turbo through sd.cpp's `sd-server` on arcint's ggml, patches 0057 and 0058, the `arcint-imggen` package | released 2026-10-18 |
+| 1.1.1 | more image models (charter `docs/milestone-1.1.1.md`): Qwen-Image (German lettering), FLUX.2 klein with editing, ESRGAN upscaling; patches 0059 and 0060; the gate's per-model tolerances | released 2026-10-18 |
 
 Every open lever or defect is a campaign in `docs/campaigns/`.
 

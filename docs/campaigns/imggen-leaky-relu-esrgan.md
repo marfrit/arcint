@@ -9,8 +9,12 @@ An A3 poster from a 1024² image wants a ~4x upscale (`arithmetic`). sd.cpp's
 ESRGAN upscaler (`src/model/upscaler/esrgan.hpp`, the `RRDBNet` 23-block 4x
 model behind `--upscale-model` / `--mode upscale`) is a 2D-conv CNN whose
 `ggml_leaky_relu` the pin's OpenCL did not support, so a mixed CPU/OpenCL
-graph sent `GGML_OP_LEAKY_RELU` to the CPU and segfaulted there
-(`measured-here`, 2026-10-18). The lever is the missing unary on the device.
+graph sent `GGML_OP_LEAKY_RELU` to the CPU and segfaulted (`measured-here`,
+2026-10-18). The likelier mechanism, from the scheduler's code (not
+measured): RRDBNet's `ggml_leaky_relu` is in place, so the node moved to the
+CPU writes through a view of an OpenCL buffer; the CPU forward is not at
+fault. The lever is the missing unary on the device, which removes the
+cross-backend in-place view.
 
 ## Reference to follow
 

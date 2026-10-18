@@ -3,9 +3,10 @@
 The 1.1.0 image service was one unit (`arcint-imggen`, Z-Image Turbo, port
 8085) behind an on-demand front. 1.1.1 adds the models the marketing work
 needs; each is its own **on-demand unit next to `arcint-imggen`**, on the
-same card, with the same `Conflicts=` (the card's language units) and the
-same contract (sd.cpp's `sd-server`). The front and the client side are the
-operator's (Claude's); the units and this contract live here.
+same card, with the same `Conflicts=` (the card's language units, and in
+the new units the other image units too: one model at a time on the card)
+and the same contract (sd.cpp's `sd-server`). The front and the client side
+are the operator's; the units and this contract live here.
 
 ## Units
 
@@ -15,14 +16,16 @@ operator's (Claude's); the units and this contract live here.
 | `arcint-imggen-qwen` | **8081** | Qwen-Image Q4_K_M + Qwen2.5-VL-7B Q4_K_M + `qwen-image-vae.safetensors` | `/v1/images/generations` | `/sdcpp/v1/upscale` |
 | `arcint-imggen-flux` | **8082** | FLUX.2 klein 4B Q8_0 + Qwen3-4B Q8_0 + `flux2-klein-4b-vae.safetensors` | `/v1/images/generations`, `/v1/images/edits` | `/sdcpp/v1/upscale` |
 
-Both carry `--upscale-model RealESRGAN_x4plus.safetensors`, so the ESRGAN
-4x runs on the same loaded context through sd.cpp's own
-`POST /sdcpp/v1/upscale` (the print route; the 1.1.1 gate measured 512² ->
-2048² in 27 s). The default widths are 1024²; each unit's defaults
-(steps/cfg/sampler) are in its unit file and per-request tunable.
-The ports are the first free ones on the card host (8080-8089 are the
-language units, 8085/8086 the 1.1.0 pair, 8090-8098 the dev-window range);
-8081/8082 are free. Renumbering is the operator's call.
+Both serve sd.cpp's own `POST /sdcpp/v1/upscale` (ESRGAN 4x, the print
+route). sd-server finds its upscalers only by scanning
+`--hires-upscalers-dir` (`code`, `examples/server/runtime.cpp:331`;
+`--upscale-model` is read by the CLI alone), and it loads every model file
+in that directory to read its scale, so the units point at a directory
+holding `RealESRGAN_x4plus.safetensors` and nothing else. The default sizes
+are 1024²; each unit's defaults (steps/cfg/sampler) are in its unit file and
+per-request tunable. 8081 and 8082 were free on the card host (the language
+units use 8080 and 8087-8089, the 1.1.0 pair 8085/8086, the dev windows
+8090-8098). Renumbering is the operator's call.
 
 ## The request contract
 
@@ -34,21 +37,30 @@ sd-server is sd.cpp's own server; the routes are unchanged from 1.1.0
   `{"created":.., "data":[{"b64_json":..}]}`.
 - `POST /v1/images/edits` — `multipart/form-data` with the text field
   `prompt` and one or more `image[]` files (or legacy `image`), an optional
-  `mask`, and the fields `n`, `size`, `output_format`; FLUX.2 klein passes
-  the reference image to the DiT (background swap, object removal, photo
-  variants). The edit gate passed on this path (`measured-here`,
-  `docs/milestone-1.1.1.md` §9).
+  `mask`, and the fields `n`, `size`, `output_format`. sd-server uses the
+  first image twice (`code`, `routes_openai.cpp`): as the **init image**
+  (img2img, at the unit's `strength`, sd.cpp's default **0.75**, settable
+  per request with `<sd_cpp_extra_args>{"strength":0.9}</sd_cpp_extra_args>`)
+  and as FLUX.2 klein's **reference image** (passed to the DiT). So the
+  served edit keeps the source's layout less strictly than a reference-only
+  edit (`sd-cli --ref-image` without `--init-img`); background swap, object
+  removal and photo variants both do. The release gated the served form
+  (`docs/milestone-1.1.1.md` §9).
 - **Seed per request** — append
   `<sd_cpp_extra_args>{"seed":N}</sd_cpp_extra_args>` to the prompt; the
   suffix also carries `steps`, `cfg_scale`, `width`, `height` and other
   sd.cpp generation args the unit's defaults do not already set.
-- `POST /sdcpp/v1/upscale` — sd.cpp's native upscale route (image in the
-  request, `factor`/`repeats` and the tile size in the body), for print
-  resolution.
+- `POST /sdcpp/v1/upscale` — sd.cpp's native upscale route, JSON body
+  `{image: <base64 PNG/JPEG>, upscaler?: "RealESRGAN_x4plus", repeats?: 1-4,
+  tile_size?, output_format?, output_compression?}`; the factor is the
+  model's (4x a repeat), the result at most 8192 x 8192
+  (`code`, `routes_sdcpp.cpp:479-640`). UPSCALE-REPLY
 - `GET /health` (`{"status":"ok"}` once listening), `GET /props` (model,
   TE, VAE, backends, devices, flash-attn/direct-conv modes, defaults,
   build string), `GET /v1/models` (`sd-cpp-local`; front maps it to the
   family name).
+- One request at a time a unit: sd-server serialises generation on its
+  context; an upscale waits for a running generation.
 
 ## The front's mapping (operator's side, proposal)
 
@@ -63,9 +75,13 @@ models it needs a name -> unit/port table, e.g.:
 
 The front already reports 503 while a card-window process holds the card
 and releases the B60 after 20 idle minutes; each new unit needs the same
-`Conflicts=` and the same "started by the front" bookkeeping. **No new
-package**: all three are `/usr/bin/arcint-sd-server` from the 1.1.0
-`arcint-imggen` package; only the unit files differ.
+"started by the front" bookkeeping, and since starting one image unit stops
+another (`Conflicts=`), the front has to treat a switch between image
+models like a switch from a language unit. All three run
+`/usr/bin/arcint-sd-server` from the **1.1.1** `arcint-imggen` package, which
+also installs the three unit templates in `/usr/share/arcint-imggen/`: the
+new models need 0059 (Qwen-Image's VAE) and 0060 (the upscaler), which the
+1.1.0 package's server does not have.
 
 ## After a card window
 

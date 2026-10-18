@@ -3730,9 +3730,14 @@ accumulation via `mad`) over `[KW, KH, KD, IC*OC]` weights,
 `conv3d.cl` (f32 weights) and `conv3d_f16_f32.cl` (f16 weights, the VAE's),
 the input always F32 and the output always F32 (`ggml_conv_3d_direct`'s own
 layout, `code`). Admission: `supports_op` takes (f16 weights x f32 input ->
-f32) and (f32 x f32 -> f32); `GGML_OPENCL_CONV_3D=0` returns false, the
-baseline arm. `GGML_OPENCL_CONV3D_RED=1` ignores the weights, so every
-output is 0 -- a gross tripwire, like 0022's f16 red.
+f32) and (f32 x f32 -> f32), at most 2^32 elements a tensor (the kernel
+indexes in 32 bits); `GGML_OPENCL_CONV_3D=0` returns false, which is the op
+suite's "unsupported" arm, **not** a served baseline: Qwen-Image's graph then
+crashes (`GGML_ASSERT(dst->extra)`). The likelier mechanism (`code`, the
+scheduler's passes read, not measured): the bias `ggml_add_inplace` after
+the conv is pinned to OpenCL by its weight while its destination is a view
+into the CPU buffer the moved conv wrote. `GGML_OPENCL_CONV3D_RED=1` ignores
+the weights, so every output is 0 -- a gross tripwire, like 0022's f16 red.
 
 **Op suite** (`measured-here`, 2026-10-18, B60 `8086:e211`, OpenCL 0:0,
 `test-backend-ops -o CONV_3D`, the CPU reference): **276/276 pass** with the
@@ -3743,9 +3748,15 @@ case unsupported. The 276 are the tree's own `test_conv_3d` cases -- strides
 5x1x3 kernel), `kernel_offset` 1, and the zero-size `KW`/`KH`/`KD` shapes
 (`code`).
 
-**Open**: the Qwen-Image image gate against the CPU reference and the VAE
-decode's device time. The campaign is
-`docs/campaigns/imggen-wan-vae-conv3d.md`.
+The 1.1.1 release adds the Wan VAE's own shapes to the suite: one frame
+with the causal time padding done beforehand (`ID = KD = 3`, `p = 0`,
+`OD = 1`), the 96- and 384-channel blocks, the 16 -> 384 conv1 and the
+96 -> 3 head, for both weight types. MEASURED-0059-TBO. Served: Qwen-Image's
+VAE decodes on the card (2.66 s at 512²); the image gate, with the 1.1.1
+per-model floors, is in `docs/milestone-1.1.1.md` §9. The campaign is
+`docs/campaigns/imggen-wan-vae-conv3d.md`. A lever (`arithmetic`, not
+measured): for one frame only the kernel's last time tap meets data, so two
+thirds of the VAE's conv FLOPs multiply padding.
 
 **No `IM2COL_3D`**: with a supported `CONV_3D`, sd.cpp's fallback needs
 only the direct op; the im2col form would turn the same GEMM into a
@@ -3757,9 +3768,13 @@ measure when the VAE's own time is known (`arithmetic`, not measured).
 sd.cpp's ESRGAN upscaler (`src/model/upscaler/esrgan.hpp`, RRDBNet's
 `ggml_leaky_relu`) was the one unary the pin's OpenCL lacked, so a mixed
 CPU/OpenCL upscaler graph sent `GGML_OP_LEAKY_RELU` to the CPU and
-**segfaulted inside the CPU's own forward** (`measured-here`, 2026-10-18,
-the RepRap `process_tiles_2d` backtrace); the model itself is fine (the
-pure-CPU `--mode upscale` run completed). Note the op is **top-level**, not
+**segfaulted** (`measured-here`, 2026-10-18,
+the ESRGAN/RRDBNet tile path's `process_tiles_2d` backtrace); the model itself is fine (the
+pure-CPU `--mode upscale` run completed). The likelier mechanism (`code`,
+not measured): RRDBNet calls `ggml_leaky_relu(..., inplace = true)`, so the
+node moved to the CPU writes through a view of an OpenCL buffer; the CPU
+forward itself is not at fault, and any other unsupported in-place op in an
+sd.cpp graph would crash the same way. Note the op is **top-level**, not
 a `GGML_UNARY_OP` enum: `ggml.c:2787` sets `GGML_OP_LEAKY_RELU`
 (`code`). The patch adds it as six variants of the `unary_ext` shape
 (`leaky_relu.cl`: f32, f32_4, f16, f16_4, and the strided `_nc` pair), the
@@ -3769,14 +3784,17 @@ trailing argument. Admission: f32 or f16, contiguous or strided.
 moves -- the red case.
 
 **Op suite** (`measured-here`, B60, `test-backend-ops -o LEAKY_RELU -j 1`,
-the CPU reference): **7/7 pass**; with the red, 7/7 FAIL. Serial `-j 1` only:
+the CPU reference): **7/7 pass**; with the red, 7/7 FAIL. The 1.1.1 release
+adds a row-padded strided case, so the `_nc` kernels run in the suite.
+MEASURED-0060-TBO. Serial `-j 1` only:
 the driver aborts the process at `-j 4` (a Neo `reference_tracked_object`
 abort before any case reports, `measured-here`), and `-o ADD -j 4` is green
 in the same window, so it is the LEAKY_RELU cases, not the card, not the
 suite -- recorded, not explained.
 
 **Served** (`measured-here`, the same B60 window): `--mode upscale` ESRGAN
-4x, `RealESRGAN_x4plus.safetensors`, a 512² PNG to 2048², **27 s** on
-OpenCL; before the patch the same command segfaulted in the CPU fallback.
+4x (the CLI), `RealESRGAN_x4plus.safetensors`, a 512² PNG to 2048², **27 s**
+on OpenCL; before the patch the same command segfaulted in the CPU fallback.
+Through sd-server's `POST /sdcpp/v1/upscale` (the units): MEASURED-0060-ROUTE.
 The upscale is the print route; the campaign is
 `docs/campaigns/imggen-leaky-relu-esrgan.md`.

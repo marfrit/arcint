@@ -270,7 +270,7 @@ def per_step(ref, cand):
 PARITY = ("--diffusion-model", "--llm", "--vae", "-p", "--cfg-scale", "--steps",
           "-W", "-H", "--seed", "--sampling-method", "--scheduler",
           "--flow-shift", "--ref-image", "--mask", "--upscale-model",
-          "--upscale-repeats")
+          "--upscale-repeats", "--init-img", "--strength")
 MODEL_FLAGS = ("--diffusion-model", "--llm", "--vae")
 
 

@@ -2,7 +2,8 @@
 
 > Intel Arc inference server (Arc A770 16 GiB, Arc Pro B60 24 GB, xe
 > driver), with OpenAI-compatible HTTP APIs: language models through
-> libllama, and since 1.1.0 text-to-image (Z-Image Turbo) through
+> libllama, and since 1.1.0 text-to-image (Z-Image Turbo; since 1.1.1
+> Qwen-Image, FLUX.2 klein with editing, ESRGAN upscaling) through
 > stable-diffusion.cpp's sd-server built against the same patched ggml tree
 > (package arcint-imggen, contrib/sdcpp, docs/imggen.md). Serves the
 > hybrid GatedDeltaNet/attention Qwen family from GGUF files: Qwen3.8-27B
@@ -10,7 +11,7 @@
 > Qwen3.8-Flash-Next (512-expert MoE on one card plus host RAM), plus
 > Cydonia 24B (llama architecture) for writing. One engine: libllama
 > (llama.cpp at pinned commit 3e4dfa8) with ggml's OpenCL backend and
-> arcint's Intel kernel series (contrib/llama.cpp/patches, 0001-0058
+> arcint's Intel kernel series (contrib/llama.cpp/patches, 0001-0060
 > without 0031 and 0055).
 > arcint owns the HTTP surface, chat templates, tool calls, the sampler,
 > named lanes, MTP speculative decoding, context checkpoints and the expert
@@ -19,6 +20,11 @@
 
 ## Status
 
+- Version 1.1.1 (2026-10-18): more image models (docs/milestone-1.1.1.md,
+  docs/imggen-service.md): Qwen-Image (German lettering) on :8081, FLUX.2
+  klein 4B with /v1/images/edits on :8082, ESRGAN 4x through
+  /sdcpp/v1/upscale; patches 0059 (CONV_3D, the Wan VAE) and 0060
+  (LEAKY_RELU); the image gate's per-model tolerances (D6).
 - Version 1.1.0 (2026-10-18): image generation (docs/milestone-1.1.0.md):
   Z-Image Turbo on the B60 on demand through the arcint-imggen package
   (sd.cpp f0aac52's sd-server, /v1/images/generations, /health, /props);

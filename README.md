@@ -3,7 +3,8 @@
 An inference server for Intel Arc: OpenAI-compatible endpoints for a short
 list of models on the Arc A770 and the Arc Pro B60, from the dense
 Qwen3.8-27B to the 512-expert Qwen3.8-Flash-Next on one card plus host RAM,
-and since 1.1.0 text-to-image with Z-Image Turbo.
+and since 1.1.0 text-to-image: Z-Image Turbo, Qwen-Image (lettering, German
+included), FLUX.2 klein with image editing, and an ESRGAN upscaler.
 
 arcint runs GGUF files through libllama (llama.cpp at a pinned commit) with
 ggml's OpenCL backend and a published series of Intel kernels
@@ -19,7 +20,9 @@ conversation.
 Images come from [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)'s
 own `sd-server`, built against the same patched ggml tree, so the diffusion
 transformer runs on the same Intel kernels; two patches of the series were
-written for it (0057, a fused RoPE; 0058, the q8_0 GEMM on the XMX units).
+written for it (0057, a fused RoPE; 0058, the q8_0 GEMM on the XMX units),
+two more for the 1.1.1 models (0059, the 3D convolution of Qwen-Image's
+VAE; 0060, the upscaler's leaky ReLU).
 It is its own package and unit, `arcint-imggen` ([contrib/sdcpp](contrib/sdcpp),
 [docs/imggen.md](docs/imggen.md)).
 
@@ -49,6 +52,8 @@ tag [`openvino-history`](https://github.com/marfrit/arcint/tree/openvino-history
 | Flash-Next | Qwen3.8-Flash-Next (`qwen4exp`, 125B-A6B, 512 experts, n-gram table) | ISTA-DASLab's IQ3_XXS GGUF (IQ2_XS as the faster option) through an expert cache: the hot experts in VRAM, the rest in host RAM, read over the link or computed on the CPU; its MTP layer from the checkpoint | Arc Pro B60 + host RAM, on demand | 131,072 tokens, q8_0 KV, MTP 3 |
 | writer | Cydonia 24B v4.3 (Mistral Small 3.2, `llama`) | imatrix Q4_K_M | Arc Pro B60, on demand | 98,304 tokens, q8_0 KV |
 | images | Z-Image Turbo (6B DiT) with the Qwen3-4B-Instruct-2507 encoder and the FLUX autoencoder | Q8_0 GGUFs, `ae.safetensors` | Arc Pro B60, on demand | 1024x1024, 8 steps |
+| images, lettering | Qwen-Image (20B MMDiT) with the Qwen2.5-VL-7B encoder and the Wan VAE | Q4_K_M GGUFs | Arc Pro B60, on demand | 1024x1024, 20 steps |
+| images, editing | FLUX.2 klein 4B with the Qwen3-4B encoder and its own VAE; ESRGAN 4x on every image unit | Q8_0 GGUFs | Arc Pro B60, on demand | 1024x1024, 4 steps; `/v1/images/edits` |
 
 The engine admits these architectures (`qwen35`, `qwen35moe`, `qwen4exp`, and
 `llama` at the Mistral Small 24B geometry) and refuses others at load.
@@ -165,8 +170,10 @@ service's production flags, Flash-Next's expert cache included
 - **Cards**: the Intel Arc A770 (16 GiB, Xe-HPG) and the Arc Pro B60 (24 GB,
   Xe2), under the xe kernel driver. One card per process, or two by layers
   for one model (`--llama-layer-split`, DESIGN §3.10).
-- **Images**: text-to-image through `arcint-imggen` (sd.cpp's `sd-server`,
-  a separate binary and process); one model, Z-Image Turbo.
+- **Images**: text-to-image and editing through `arcint-imggen` (sd.cpp's
+  `sd-server`, a separate binary and process): Z-Image Turbo, Qwen-Image and
+  FLUX.2 klein, one unit each, one at a time on the card
+  ([docs/imggen-service.md](docs/imggen-service.md)).
 - **Not goals**: a web UI or dashboard (console and HTTP JSON only), a model
   zoo, training or quantization tooling, multimodal input (images in), Windows.
 
