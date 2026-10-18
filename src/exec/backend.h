@@ -48,6 +48,10 @@ struct ModelStatus {
     int         n_ctx_train  = 0;   // what the model was trained for
     int         n_layer      = 0;
     bool        mtp_enabled  = false;
+    // --mmproj loaded: the chat endpoint takes image_url parts (docs/
+    // milestone-1.2.0.md A2). The stub is false, so the suite's text-only
+    // refusal still exercises that branch.
+    bool        mmproj_loaded = false;
     bool        dflash_enabled = false;   // --llama-dflash-gguf: the DFlash2 drafter loaded
     int         dflash_drafts  = 0;       // its drafts a verify: --llama-dflash capped by its block
     uint64_t    weights_bytes = 0;
@@ -81,6 +85,11 @@ enum class FinishReason { Stop, Length, Abort };
 const char* finish_reason_name(FinishReason r);
 
 struct GenerationInput {
+    // OpenAI image_url parts of this request, in the order their markers appear
+    // in `prompt` (`docs/milestone-1.2.0.md §3`). Empty on a text request; the
+    // backend's multimodal branch reads the bytes and encodes them.
+    std::vector<ImagePart> images;
+
     std::string   prompt;
     // When non-empty, THESE are the prompt and `prompt` is not tokenised
     // (CompletionRequest::prompt_ids; the KLD gate's replay of the reference

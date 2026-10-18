@@ -1,6 +1,6 @@
 # 1.2.0 — voice and vision on the Arc cards
 
-The 1.2.0 charter, drafted 2026-10-19 on the `v120` branch (from 1.1.1's
+The 1.2.0 charter, drafted 2026-10-18 on the `v120` branch (from 1.1.1's
 `imggen-111`). §1 is the operator's mandate as given to the session, §2 the
 model set it implies (licences and download counts), §3 the architecture, §4
 the enrolment rules, §5 the kernel gap, §6 the criteria with their gates, §7
@@ -9,7 +9,7 @@ the phases, §8 the risks. Every claim carries its evidence class: `paper`
 commit named), `measured-here` (run on this project's cards), `arithmetic`
 (derived, not measured) or `decision` (the operator's, dated).
 
-Goal (**decision**, operator, via the session's mandate, 2026-10-19): the
+Goal (**decision**, operator, via the session's mandate, 2026-10-18): the
 fleet's Arc cards get **voice and vision**. Three capabilities, each a
 service like the image units, on the same ggml OpenCL base and with the same
 Intel kernels:
@@ -30,7 +30,7 @@ Intel kernels:
 
 The 1.2.0 line is a **revision of DESIGN §8.8**: the "multimodal input is not
 committed" sentence is void for 1.2.0 by the operator (`decision`,
-2026-10-19). Image output was already in scope since 1.1.0; 1.2.0 takes in
+2026-10-18). Image output was already in scope since 1.1.0; 1.2.0 takes in
 image input, audio input and audio output and widens "inference server" to
 "voice and vision server". Nothing else of §8.8 changes.
 
@@ -38,7 +38,7 @@ image input, audio input and audio output and widens "inference server" to
 
 ### 0.1 What the plan assumes, and what of it holds
 
-The starting thesis (external, 2026-10-19): llama.cpp's multimodal library
+The starting thesis (external, 2026-10-18): llama.cpp's multimodal library
 (`libmtmd`) is the reference for both vision input and audio generation, and
 the pinned tree already carries it. Checked against the source at the pin
 `3e4dfa8` (`~/src/llama-port`):
@@ -53,8 +53,8 @@ the pinned tree already carries it. Checked against the source at the pin
 | arcint's chat endpoint accepts image input today | **no**: `src/core/chat.cpp:20-45` rejects every non-text part with "v1 is text-only" | `code` |
 | whisper.cpp can be built against this patched ggml | yes: `WHISPER_USE_SYSTEM_GGML` (`CMakeLists.txt:88`) takes a `find_package(ggml)` instead of vendoring (`:160-167`); a `ggml` package installed from the patched tree carries the OpenCL backend and the series | `code` |
 | The challenge is the ops, not the plumbing | the language kernels are built for the Qwen hybrid geometry; the vision tower, the codec decoder and the whisper encoder/decoder are new shapes and new op mixes | `arithmetic` |
-| Qwen3-TTS exists, is open, German-capable, cloning-capable | `Qwen/Qwen3-TTS-12Hz-1.7B-Base`: `license:apache-2.0`, 3,093,627 downloads, not gated (`measured-here`, HF API, 2026-10-19); the `tools/tts` README lists `--tts-lang` `de` and `--tts-speaker-file` (`code`) | `paper` / `measured-here` |
-| OuteTTS is gated | `OuteAI/OuteTTS-1.0-1B`'s HF API answers 401 "Invalid username or password" without a token (`measured-here`, 2026-10-19); a token on a command line is forbidden here (`CLAUDE.md`, the 1.1.1 aria2c incident) | `measured-here` |
+| Qwen3-TTS exists, is open, German-capable, cloning-capable | `Qwen/Qwen3-TTS-12Hz-1.7B-Base`: `license:apache-2.0`, 3,093,627 downloads, not gated (`measured-here`, HF API, 2026-10-18); the `tools/tts` README lists `--tts-lang` `de` and `--tts-speaker-file` (`code`) | `paper` / `measured-here` |
+| OuteTTS is gated | `OuteAI/OuteTTS-1.0-1B`'s HF API answers 401 "Invalid username or password" without a token (`measured-here`, 2026-10-18); a token on a command line is forbidden here (`CLAUDE.md`, the 1.1.1 aria2c incident) | `measured-here` |
 
 ### 0.2 What the pin's `libmtmd` brings (`code`, `3e4dfa8`)
 
@@ -99,7 +99,7 @@ the pinned tree already carries it. Checked against the source at the pin
 
 ## 1. The operator's mandate
 
-| # | question | decided (2026-10-19, via the session) |
+| # | question | decided (2026-10-18, via the session) |
 |---|---|---|
 | D1 | Scope | **(a)** 1.2.0 takes vision input, STT and TTS-with-cloning in; DESIGN §8.8's multimodal-input sentence is void for 1.2.0 |
 | D2 | VLM route | **arcint's own `/v1/chat/completions`** with OpenAI `image_url` content parts, `libmtmd` inside arcint's binary. Not llama.cpp's own `llama-server` as the serving surface (that would be a second surface) |
@@ -117,7 +117,7 @@ Rule (`decision`, operator, 2026-10-18/19): official or high-download
 (>10k downloads) weights only, safetensors or GGUF (here: also whisper.cpp's
 `.bin`) from known publishers; anything else only inside a container.
 Licences checked for private and commercial use. Sources checked on HF's API
-on 2026-10-19 (`measured-here` for downloads, licences are `paper` where the
+on 2026-10-18 (`measured-here` for downloads, licences are `paper` where the
 tag names a licence the publisher sets).
 
 | role | repo / file | licence | downloads | size | notes |

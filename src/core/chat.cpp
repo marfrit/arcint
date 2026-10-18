@@ -15,9 +15,12 @@ bool known_role(const std::string& r) {
 }
 
 // OpenAI allows `content` to be either a string or an array of typed parts.
-// v1 is text-only (DESIGN.md §8 defers multimodal), so text parts are joined
-// and anything else is a hard error rather than a silent drop.
-std::optional<std::string> read_content(const json& v, std::string& out, size_t index) {
+// 1.2.0 takes the `image_url` part when a multimodal projector is loaded
+// (docs/milestone-1.2.0.md); its marker joins the text in place, and the part
+// is recorded in `images` so the backend can read the bytes. Every other type
+// is still a hard error rather than a silent drop.
+std::optional<std::string> read_content(const json& v, std::string& out,
+                                        std::vector<ImagePart>& images, size_t index) {
     if (v.is_null()) {
         out.clear();
         return std::nullopt;
@@ -36,9 +39,21 @@ std::optional<std::string> read_content(const json& v, std::string& out, size_t 
             return log::format("messages[%zu].content parts must be typed objects", index);
         }
         const std::string type = part["type"].get<std::string>();
+        if (type == "image_url") {
+            if (!part.contains("image_url") || !part["image_url"].is_object() ||
+                !part["image_url"].contains("url") || !part["image_url"]["url"].is_string()) {
+                return log::format("messages[%zu].content: image_url part needs image_url.url", index);
+            }
+            ImagePart img;
+            img.url = part["image_url"]["url"].get<std::string>();
+            images.push_back(std::move(img));
+            joined += kMediaMarker;
+            continue;
+        }
         if (type != "text") {
             return log::format(
-                "messages[%zu].content: part type '%s' is not supported (v1 is text-only)",
+                "messages[%zu].content: part type '%s' is not supported (text and image_url "
+                "are; audio input belongs to the transcription route)",
                 index, type.c_str());
         }
         if (!part.contains("text") || !part["text"].is_string()) {
@@ -218,7 +233,7 @@ std::optional<std::string> parse_chat_request(const json& body, ChatRequest& out
         }
 
         if (m.contains("content")) {
-            if (auto e = read_content(m["content"], msg.content, index)) return e;
+            if (auto e = read_content(m["content"], msg.content, msg.images, index)) return e;
         }
         if (m.contains("name") && m["name"].is_string()) {
             msg.name = m["name"].get<std::string>();

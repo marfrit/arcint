@@ -12,6 +12,11 @@
 #include <gguf.h>
 #include <llama.h>
 
+#ifdef ARCINT_MTMD
+#include <mtmd.h>
+#include <mtmd-helper.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -21,6 +26,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <minja/chat-template.hpp>
 #include <mutex>
@@ -42,6 +49,78 @@ namespace lgc {
 namespace {
 
 using json = nlohmann::json;
+
+#ifdef ARCINT_MTMD
+// A standard-alphabet base64 decoder for the data: URIs the image parts carry.
+// Whitespace is tolerated; any other non-alphabet character fails.
+bool base64_decode(std::string_view text, std::vector<unsigned char>& out) {
+    static const char* alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int vals[256];
+    std::fill(std::begin(vals), std::end(vals), -1);
+    for (int i = 0; i < 64; ++i) vals[static_cast<unsigned char>(alpha[i])] = i;
+    int acc = 0, bits = 0;
+    for (char c : text) {
+        if (c == '=') break;
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
+        const int v = vals[static_cast<unsigned char>(c)];
+        if (v < 0) return false;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<unsigned char>((acc >> bits) & 0xff));
+        }
+    }
+    return true;
+}
+
+// An `image_url` as the OpenAI shape carries it: a data: URI or a local file
+// path. Remote http(s) URLs are not served yet (the gate uses data: URIs);
+// the bytes stb_image accepts are returned.
+bool read_image_url(const std::string& url, std::vector<unsigned char>& out, std::string& err) {
+    if (url.rfind("data:", 0) == 0) {
+        const size_t at = url.find(";base64,");
+        if (at == std::string::npos || url.find("image/", 5) != 5) {
+            err = "image_url: a data URI must be image/*;base64,...";
+            return false;
+        }
+        if (!base64_decode(std::string_view(url).substr(at + 8), out)) {
+            err = "image_url: base64 decode failed";
+            return false;
+        }
+        return !out.empty();
+    }
+    if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
+        err = "image_url: remote URLs are not served yet (a data: URI or a local path) ";
+        return false;
+    }
+    std::ifstream f(url, std::ios::binary);
+    if (!f) {
+        err = "image_url: cannot open " + url;
+        return false;
+    }
+    out.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    if (out.empty()) {
+        err = "image_url: " + url + " is empty";
+        return false;
+    }
+    return true;
+}
+
+// How many media markers the rendered prompt holds; mtmd_tokenize wants one
+// bitmap each, and a mismatch is the commonest client error.
+size_t marker_count(std::string_view s) {
+    const size_t mlen = std::strlen(kMediaMarker);
+    size_t       n    = 0;
+    for (size_t at = 0;;) {
+        at = s.find(kMediaMarker, at);
+        if (at == std::string_view::npos) break;
+        ++n;
+        at += mlen;
+    }
+    return n;
+}
+#endif
 
 // --llama-kv's names (config.cpp admits only these)
 ggml_type kv_type(const std::string& t) {
@@ -375,9 +454,10 @@ public:
                                        llama_model_n_head(model_) == 32 && llama_model_n_head_kv(model_) == 8 &&
                                        std::string(head_dim) == "128" && llama_vocab_n_tokens(vocab_) == 131072;
         mistral_small_24b_ = mistral_small_24b;
-        if (a != "qwen35" && a != "qwen35moe" && a != "qwen4exp" && !mistral_small_24b)
-            throw std::runtime_error(log::format("%s is a '%s' model; --engine llama serves qwen35, qwen35moe, qwen4exp "
-                                                 "and Mistral Small 3.2 24B ('llama', 40 x 5120, 32/8 heads)",
+        if (a != "qwen35" && a != "qwen35moe" && a != "qwen4exp" && a != "qwen2vl" && !mistral_small_24b)
+            throw std::runtime_error(log::format("%s is a '%s' model; --engine llama serves qwen35, qwen35moe, qwen4exp, "
+                                                 "qwen2vl (vision, with --mmproj) and Mistral Small 3.2 24B "
+                                                 "('llama', 40 x 5120, 32/8 heads)",
                                                  cfg.gguf_path.c_str(), arch));
         tokenizer_ = std::make_unique<LlamaTokenizer>(vocab_);
         n_vocab_   = static_cast<size_t>(llama_vocab_n_tokens(vocab_));
@@ -579,6 +659,27 @@ public:
         d.provenance         = "provisional";
         if (auto err = apply_operator_defaults(cfg, d)) throw std::runtime_error(*err);
         status_.sampler_defaults = d;
+#ifdef ARCINT_MTMD
+        // --mmproj: the multimodal projector (libmtmd) side by side with the
+        // backbone. Its own clip/gen graphs run on the same OpenCL backend
+        // (mtmd_context_params_default use_gpu). With no audio-generation
+        // model, the TTS branch later refuses (docs/milestone-1.2.0.md A4).
+        if (!cfg.mmproj_path.empty()) {
+            mtmd_context_params mtp = mtmd_context_params_default();
+            mtp.use_gpu       = true;
+            mtp.print_timings = cfg.verbosity >= 1;
+            mctx_ = mtmd_init_from_file(cfg.mmproj_path.c_str(), model_, mtp);
+            if (mctx_ == nullptr)
+                throw std::runtime_error(log::format("libmtmd could not load %s", cfg.mmproj_path.c_str()));
+            status_.mmproj_loaded = true;
+            const mtmd_gen_audio_info gen = mtmd_gen_audio_get_info(mctx_);
+            log::info("load", "mmproj: %s (image input%s; docs/milestone-1.2.0.md)", cfg.mmproj_path.c_str(),
+                      gen.type != MTMD_GEN_AUDIO_TYPE_NONE ? " + audio generation" : "");
+        }
+#else
+        if (!cfg.mmproj_path.empty())
+            throw std::runtime_error("--mmproj: this build's llama.cpp lacks libmtmd (tools/mtmd)");
+#endif
         std::string lane_desc = log::format("%d lane%s x %d ctx", lanes_, lanes_ == 1 ? "" : "s", n_ctx_);
         if (named_) {
             lane_desc = log::format("%d named lanes,", lanes_);
@@ -610,6 +711,9 @@ public:
 
     ~LlamaBackend() override {
         spec_.reset();   // its draft context reads the target's
+#ifdef ARCINT_MTMD
+        if (mctx_ != nullptr) mtmd_free(mctx_);
+#endif
         if (ctx_ != nullptr) llama_free(ctx_);
         if (dflash_model_ != nullptr) llama_model_free(dflash_model_);
         if (mtp_model_ != nullptr) llama_model_free(mtp_model_);
@@ -645,6 +749,7 @@ public:
 
     FinishReason generate(const GenerationInput& in, int slot, const TokenCallback& on_piece,
                           GenerationStats& stats) override {
+        if (!in.images.empty()) return generate_mm(in, slot, on_piece, stats);
         if (spec_) return generate_spec(in, slot, on_piece, stats);
         const int seq = std::min(std::max(slot, 0), lanes_ - 1);
         const int cap = cap_[static_cast<size_t>(seq)];   // the lane's context
@@ -747,6 +852,128 @@ public:
         log_expert_cache(seq);
         return reason;
     }
+
+#ifdef ARCINT_MTMD
+    // The multimodal branch: mtmd's encode->decode of the rendered prompt
+    // (text chunks as tokens, image chunks as the projector's embeddings),
+    // then the same plain sampler loop. It is a self-contained lane path: the
+    // lane's KV is cleared and no prefix cache, checkpoint or drafter applies
+    // -- an image is not tokenisable text, and this path is measured apart
+    // from the language services' (docs/milestone-1.2.0.md §3, recorded as a
+    // limitation; the language path is untouched).
+    FinishReason generate_mm(const GenerationInput& in, int slot, const TokenCallback& on_piece,
+                             GenerationStats& stats) {
+        if (mctx_ == nullptr) throw std::runtime_error("image parts without --mmproj");
+        const int seq = std::min(std::max(slot, 0), lanes_ - 1);
+        const int cap = cap_[static_cast<size_t>(seq)];
+
+        // the bitmaps, in the order their markers appear
+        std::vector<mtmd_bitmap*> bitmaps;
+        std::vector<mtmd_helper_bitmap_wrapper> wrappers;
+        for (const ImagePart& im : in.images) {
+            std::vector<unsigned char> bytes;
+            std::string                err;
+            if (!read_image_url(im.url, bytes, err)) throw std::runtime_error(err);
+            mtmd_helper_bitmap_wrapper w = mtmd_helper_bitmap_init_from_buf(
+                mctx_, bytes.data(), bytes.size(), /*placeholder*/ false, mtmd_helper_init_opt_default());
+            if (w.bitmap == nullptr)
+                throw std::runtime_error(log::format("libmtmd could not decode the image (%zu bytes)", bytes.size()));
+            bitmaps.push_back(w.bitmap);
+            wrappers.push_back(w);   // its video_ctx is null: no --video input
+        }
+
+        mtmd_input_text text{ in.prompt.c_str(), /*add_special*/ true, /*parse_special*/ true };
+        mtmd_input_chunks* chunks = mtmd_input_chunks_init();
+        if (chunks == nullptr) throw std::runtime_error("libmtmd could not make the chunk list");
+        const int rc = mtmd_tokenize(mctx_, chunks, &text, bitmaps.data(), bitmaps.size());
+        if (rc != 0) {
+            mtmd_input_chunks_free(chunks);
+            for (mtmd_bitmap* b : bitmaps) mtmd_bitmap_free(b);
+            throw std::runtime_error(log::format("libmtmd tokenize failed (%d): %zu images against %zu markers in the prompt",
+                                                 rc, bitmaps.size(), marker_count(in.prompt)));
+        }
+        const size_t n_tok = mtmd_helper_get_n_tokens(chunks);
+        stats.prompt_tokens = static_cast<int>(n_tok);
+        if (cap > 0 && static_cast<int>(n_tok) >= cap) {
+            mtmd_input_chunks_free(chunks);
+            for (mtmd_bitmap* b : bitmaps) mtmd_bitmap_free(b);
+            log::warn("slot", "lane %d: %zu multimodal tokens do not fit n_ctx %d", seq, n_tok, cap);
+            return FinishReason::Length;
+        }
+
+        uint64_t seed = in.sampler.seed;
+        if (!in.sampler.seeded) {
+            std::random_device rd;
+            seed = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+        }
+        Sampler sampler(in.sampler, seed);
+        sampler.set_prompt(tokenizer_->encode(in.prompt));
+
+        std::vector<int>&  have   = slot_tokens_[static_cast<size_t>(seq)];
+        std::vector<float> logits(n_vocab_);
+        llama_pos          n_past = 0;
+        stats.cache_hit_tokens = 0;
+
+        const auto t_pre = clock_type::now();
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            llama_memory_seq_rm(llama_get_memory(ctx_), seq, -1, -1);
+            have.clear();
+            const int r = mtmd_helper_eval_chunks(mctx_, ctx_, chunks, 0, seq, n_batch_, /*logits_last*/ true, &n_past);
+            if (r != 0) {
+                mtmd_input_chunks_free(chunks);
+                for (mtmd_bitmap* b : bitmaps) mtmd_bitmap_free(b);
+                throw std::runtime_error("mtmd_helper_eval_chunks failed");
+            }
+            copy_logits_locked(logits);
+            have.assign(static_cast<size_t>(std::max<llama_pos>(n_past, 0)), 0);
+        }
+        mtmd_input_chunks_free(chunks);
+        for (mtmd_bitmap* b : bitmaps) mtmd_bitmap_free(b);
+        stats.prefill_seconds = seconds_since(t_pre);
+
+        const auto   t_decode = clock_type::now();
+        FinishReason reason   = FinishReason::Stop;
+        const auto   t_s0     = clock_type::now();
+        int          next     = sampler.sample(logits.data(), n_vocab_);
+        stats.decode_sample_seconds += seconds_since(t_s0);
+        auto is_stop_token = [&](int tok) { return is_stop(in.sampler, tok); };
+        while (true) {
+            if (is_stop_token(next)) break;
+            if (in.sampler.max_tokens >= 0 && stats.completion_tokens >= in.sampler.max_tokens) {
+                reason = FinishReason::Length;
+                break;
+            }
+            if (static_cast<int>(have.size()) + 1 >= cap) {
+                reason = FinishReason::Length;
+                break;
+            }
+            ++stats.completion_tokens;
+            const auto    t_emit = clock_type::now();
+            const Control ctl    = on_piece(tokenizer_->decode_one(next), next);
+            stats.decode_emit_seconds += seconds_since(t_emit);
+            sampler.observe(next);
+            if (ctl != Control::Continue) {
+                reason = ctl == Control::Cancel ? FinishReason::Abort : FinishReason::Stop;
+                break;
+            }
+            const auto t_fwd = clock_type::now();
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (!decode_locked(seq, &next, 1, have.size(), true))
+                    throw std::runtime_error("llama_decode failed during decode");
+                copy_logits_locked(logits);
+                have.push_back(next);
+            }
+            stats.decode_forward_seconds += seconds_since(t_fwd);
+            const auto t_s = clock_type::now();
+            next           = sampler.sample(logits.data(), n_vocab_);
+            stats.decode_sample_seconds += seconds_since(t_s);
+        }
+        stats.decode_seconds = seconds_since(t_decode);
+        return reason;
+    }
+#endif
 
 private:
     // --llama-mtp: draft, verify [last, drafts...] in one target decode, keep
@@ -1360,6 +1587,9 @@ private:
     llama_model*                          dflash_model_ = nullptr;   // --llama-dflash-gguf
     bool                                  dflash_    = false;     // the drafter is DFlash2's
     llama_context*                        ctx_   = nullptr;
+#ifdef ARCINT_MTMD
+    mtmd_context*                         mctx_  = nullptr;   // --mmproj (libmtmd)
+#endif
     const llama_vocab*                    vocab_ = nullptr;
     std::unique_ptr<LlamaTokenizer>       tokenizer_;
     bool mistral_small_24b_ = false;   // the admitted llama geometry (think tags, BOS)

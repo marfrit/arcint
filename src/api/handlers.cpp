@@ -607,6 +607,18 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
                      req.model.c_str(), st.served_id.c_str());
     }
 
+    // An image part needs the multimodal projector. The parser accepts the
+    // part shape; this process admits it only when --mmproj loaded (docs/
+    // milestone-1.2.0.md A2), so a text-only server answers the same refusal
+    // it always did.
+    for (const ChatMessage& m : req.messages) {
+        if (m.images.empty()) continue;
+        if (!st.mmproj_loaded) {
+            return HttpResult{400, invalid_request("image_url parts need a multimodal projector "
+                                                    "(--mmproj; docs/milestone-1.2.0.md)")};
+        }
+    }
+
     PreparedChat prep;
     prep.req   = std::move(req);
     prep.lane  = lane;
@@ -641,6 +653,10 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
     if (auto err = finish_prepare(ctx, lane, prompt, prep.req.sampler, prep.input, prep.prompt_tokens)) {
         return err;
     }
+    // the media, in marker order across the whole request (the renderer put one
+    // marker per part into the prompt)
+    for (const ChatMessage& m : prep.req.messages)
+        for (const ImagePart& img : m.images) prep.input.images.push_back(img);
 
     prep.id      = next_id("chatcmpl");
     prep.created = now_seconds();

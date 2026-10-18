@@ -131,6 +131,10 @@ std::string usage_text() {
         "  --gguf FILE               serve this GGUF (the first shard of a split file) on\n"
         "                            the libllama engine: ggml's OpenCL backend. The\n"
         "                            tokenizer and the chat template come from the file\n"
+        "  --mmproj FILE             the multimodal projector (libmtmd, docs/\n"
+        "                            milestone-1.2.0.md): with it loaded the chat\n"
+        "                            endpoint takes OpenAI image_url parts, and the\n"
+        "                            audio endpoints its TTS/ASR counterparts\n"
         "  --engine llama            the executor; llama is the only value, kept for the\n"
         "                            units' sake (a bare --gguf selects it). The OpenVINO\n"
         "                            engine was retired in 0.8.0: docs/history.md, tag\n"
@@ -366,6 +370,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--gguf") {
             if (!value(v)) return fail("--gguf needs a path");
             cfg.gguf_path = std::string(v);
+        } else if (arg == "--mmproj") {
+            if (!value(v)) return fail("--mmproj needs a path");
+            cfg.mmproj_path = std::string(v);
         } else if (arg == "--device") {
             if (!value(v)) return fail("--device needs a value");
             cfg.device = std::string(v);

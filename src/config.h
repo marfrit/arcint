@@ -12,6 +12,11 @@ struct SamplerDefaults;  // core/sampling.h
 struct Config {
     // What gets served: the GGUF (--gguf), or the device-free stub (--stub).
     std::string gguf_path;   // --gguf: the file as published; the first shard of a split file
+    // --mmproj FILE: the multimodal projector of the model (libmtmd, docs/
+    // milestone-1.2.0.md). With it loaded, /v1/chat/completions accepts the
+    // OpenAI `image_url` content parts; without it the text-only refusal
+    // stands. The vision/backbone pair must come from the same family.
+    std::string mmproj_path;
     // --engine: "llama" (ggml's OpenCL backend through libllama; the model is
     // --gguf) is the only engine. The flag is kept for the units' sake;
     // "ov" is refused with a pointer to the tag openvino-history.

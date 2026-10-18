@@ -17,9 +17,19 @@ struct ToolSpec {
     nlohmann::json parameters;  // JSON Schema object, as declared by the client
 };
 
+// One media part of a message, as the OpenAI `image_url` part carries it: a
+// `data:` URI (base64) or a local file path. The bytes are read in the
+// backend, where the multimodal projector decides how to preprocess them
+// (docs/milestone-1.2.0.md §3). More media types (audio input) are the
+// transcription route's, not the chat's.
+struct ImagePart {
+    std::string url;
+};
+
 struct ChatMessage {
     std::string           role;
-    std::string           content;
+    std::string           content;   // text, with one media marker per image part
+    std::vector<ImagePart> images;   // in marker order, across the whole request
     std::string           name;          // function name, for role == "tool"
     std::string           tool_call_id;  // for role == "tool"
     std::vector<ToolCall> tool_calls;    // assistant turns replayed back to us
@@ -71,6 +81,12 @@ std::optional<std::string> parse_completion_request(const nlohmann::json& body,
 // Parameter types from the declared tool schemas, for coercing the coder
 // model's XML tool-call values (see core/toolcall.h).
 ToolSchemas tool_schemas(const std::vector<ToolSpec>& tools);
+
+// The media marker libmtmd replaces with the encoded media chunk
+// (mtmd_default_marker(), mtmd.cpp). The renderer puts one into a message's
+// content at each image part, so the model's own chat template carries it and
+// mtmd_tokenize() finds it (`docs/milestone-1.2.0.md §3`).
+inline constexpr const char* kMediaMarker = "<__media__>";
 
 // M0 stub prompt rendering.
 //

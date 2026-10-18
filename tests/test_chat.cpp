@@ -46,14 +46,44 @@ TEST(chat_accepts_typed_text_content_parts) {
     CHECK_EQ(req.messages[0].content, std::string("ab"));
 }
 
-TEST(chat_rejects_non_text_content_parts) {
-    // v1 is text-only; a dropped image part would silently change what the
-    // model was asked.
-    json body                      = minimal_chat();
-    body["messages"][0]["content"] = json::array({{{"type", "image_url"}, {"image_url", "x"}}});
+TEST(chat_accepts_image_url_content_parts) {
+    // 1.2.0 takes the OpenAI image_url part (docs/milestone-1.2.0.md); the
+    // marker joins the text in place and the part is recorded for the backend.
+    json body = minimal_chat();
+    body["messages"][0]["content"] =
+        json::array({{{"type", "text"}, {"text", "look at "}},
+                     {{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64,AAAA"}}}},
+                     {{"type", "text"}, {"text", " what is this"}}});
 
     ChatRequest req;
-    CHECK(parse_chat_request(body, req).has_value());
+    CHECK(!parse_chat_request(body, req).has_value());
+    CHECK_EQ(req.messages[0].content, std::string("look at <__media__> what is this"));
+    CHECK_EQ(req.messages[0].images.size(), size_t(1));
+    CHECK_EQ(req.messages[0].images[0].url, std::string("data:image/png;base64,AAAA"));
+}
+
+TEST(chat_rejects_audio_and_malformed_content_parts) {
+    // Audio input is the transcription route's, not the chat's, and an
+    // image_url part without a url object is still a hard 400.
+    {
+        json part;
+        part["type"]              = "input_audio";
+        part["input_audio"]       = json::object();
+        part["input_audio"]["data"] = "x";
+        json body                      = minimal_chat();
+        body["messages"][0]["content"] = json::array({part});
+        ChatRequest           req;
+        CHECK(parse_chat_request(body, req).has_value());
+    }
+    {
+        json part;
+        part["type"]      = "image_url";
+        part["image_url"] = "x";
+        json body                      = minimal_chat();
+        body["messages"][0]["content"] = json::array({part});
+        ChatRequest           req;
+        CHECK(parse_chat_request(body, req).has_value());
+    }
 }
 
 TEST(chat_rejects_a_non_string_content_part_type) {
