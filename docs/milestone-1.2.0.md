@@ -382,13 +382,21 @@ for B4 is not measured; the op profile per node is not taken; no red case
 yet; the endpoint is not package/unit/probe-complete. These are the open
 dispositions of the next card window.
 
-**BLOCKED (2026-10-18):** the host hang from §9.1 does not answer SSH (60 s
-and two later tries); every card leg, the STT build (which needs the card for
-its gate) and the TTS gate are behind it. Recovery is a host reboot, and
-rebooting that host is **the operator's call, every time** (`CLAUDE.local.md`,
-`docs/sop-card-window.md`); the restart of the production language unit is
-also the operator's call on a wedged card. Everything above is committed on
-the `v120` branch; nothing was pushed, tagged or released (D9).
+**RESOLVED (2026-10-18 evening, operator):** Markus power-cycled the card
+host after the §9.1 `xe` oops; the host, the guests and the production units
+are back (the B60's language unit active again, the A770's coder active, the
+image front idle). The cause was three processes on the B60 at once: the dev
+VLM server, a server respawned by a stale deleted-but-running leg driver, and
+the production agent restarted on top. The hard rules in force from then on,
+and the §9.2 window below ran under them: before ANY card window list every
+process holding that card's render node and every leg/driver still running
+(deleted-but-running included: `ls -l /proc/*/exe | grep deleted`); if any
+non-service process holds it, stop and investigate; one non-service process
+per card; stop a dev server by pid and verify the node is free before
+restarting production; for the B60 POST `/release` to the image front first;
+wrap every experiment in `timeout`; never put tokens on a command line.
+Everything above is committed on the `v120` branch; nothing was pushed, tagged
+or released (D9).
 
 ### 9.1 The card-window incident (measured-here, 2026-10-18, on the record)
 
@@ -406,6 +414,28 @@ the reboot is the operator's call. The lessons: **sweep stale leg drivers by
 pid before restoring production units**, and **never restore a unit onto a
 card a dev leg holds**; the SOP's “zombie sweep by pid” already said
 it, and this window paid for skipping it.
+
+### 9.2 STT measured (Phase 0, 2026-10-18 late)
+
+The whisper leg, on the dev host's B60 (PCI `8086:e211`, OpenCL `0:0`), built
+and measured in two windows after the host recovery:
+
+| item | measured () |
+|---|---|
+| A1/A3, the whisper binary | `whisper.cpp` at the pin `d1be6fde` (v1.9.5) built with `WHISPER_USE_SYSTEM_GGML` against the ggml installed from the card host's `3e4dfa8` + series tree; `whisper-server` and `whisper-cli`; both carry `kernel_mul_mv_kq_q8_1` and `ggml_opencl:` (the recipe's two markers). The recipe needed two fixes: the top-level `app/` executable cannot build with `LLAMA_BUILD_COMMON=OFF`, so it is `LLAMA_BUILD_APP=OFF`/`LLAMA_TOOLS_INSTALL=OFF` and `ggml`+`llama` are built for the install; the second marker is not a literal `Intel(R)` at this pin |
+| model | `ggml-large-v3-turbo.bin`, 1.62 GiB (MIT-tagged `openai/whisper-large-v3-turbo`); `.bin`, not GGUF, per the charter's risk |
+| route | `/v1/audio/transcriptions` served by `whisper-server --inference-path /v1/audio/transcriptions` (an existing flag, no patch); `language` and `response_format` match OpenAI; non-empty transcripts |
+| card named | `ggml_opencl: OpenCL device: Intel(R) Arc(TM) Pro B60 Graphics` (26.27.39122.11), `whisper_backend_init_gpu: using GPUOpenCL backend`; `fallbacks = 0 p / 0 h` over the set |
+| the German set | FLEURS `de_de` dev (CC-BY-4.0, `measured-here` licence tag), 12 clips 2.5–13.75 s of the dev split, normalised from the split's float32 WAV to 16 kHz mono PCM s16 (`arithmetic`); reference text from the split's TSV; manifest sha256 recorded, audio stays on the card host outside the repo |
+| B2, card vs CPU | encode 804.6 ms/run on the card vs 3,553.5 ms/run on the CPU (**4.4×**); decode 2.11 vs 11.48 ms/run (**5.4×**); mel (54.8 ms) and sample (132.9 ms) are the CPU-side front end; load 11.6 s card vs 8.95 s CPU, 16 threads both |
+| C3, the WER gate | card corpus WER **0.0547** (11 errors / 201 ref words) = CPU 0.0547 exactly; `compare` PASS (card ≤ CPU + 0.005); total 27.5 s for the 12 clips on the card |
+| window hygiene | two B60 windows: the first aborted on an over-strict render-node check (the A770's coder **enumerates both** render nodes incidentally; the check is now "non-service holders"); the CPU arm ran with the CPU `whisper-server` holding both render nodes **beside the active agent**, a rule breach with no B60 compute and no damage, recorded; card server stopped by pid, node free, unit restored |
+| the gate's own defect | the first gate arm returned 400 from `whisper-server`: the multipart builder had no CRLF before the closing boundary (RFC 2046); fixed in `stt_gate.py` and `tts_gate.py` |
+
+Open dispositions of the next window: B1's per-node profile for the whisper encoder
+and decoder; the service phase (the `arcint-stt` unit, the package, `/props`, the
+`.bin` loader path); and the operator's absolute C3 floor (D8: only the CPU
+comparison gates so far).
 
 ## 10. References
 

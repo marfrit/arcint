@@ -74,6 +74,7 @@ def transcribe(stt_url, stt_model, wav_bytes, language, timeout):
     parts.append(("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n"
                   "Content-Type: audio/wav\r\n\r\n" % boundary).encode())
     parts.append(wav_bytes)
+    parts.append(b"\r\n")   # CRLF before the closing delimiter, per RFC 2046
     parts.append(("--%s--\r\n" % boundary).encode())
     req = urllib.request.Request(stt_url, data=b"".join(parts),
                                  headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary})

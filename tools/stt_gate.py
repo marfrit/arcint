@@ -80,6 +80,7 @@ def multipart(audio_path, model, language, response_format):
     parts.append(("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
                   "Content-Type: audio/wav\r\n\r\n" % (boundary, os.path.basename(audio_path))).encode())
     parts.append(data)
+    parts.append(b"\r\n")   # CRLF before the closing delimiter, per RFC 2046
     parts.append(("--%s--\r\n" % boundary).encode())
     return b"".join(parts), "multipart/form-data; boundary=%s" % boundary
 

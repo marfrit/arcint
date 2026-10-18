@@ -36,17 +36,22 @@ Steps the recipe takes:
 
 1. Configure the llama tree for ggml only (`GGML_OPENCL=ON`,
    `GGML_OPENCL_USE_ADRENO_KERNELS=OFF`, `LLAMA_BUILD_TESTS/EXAMPLES/TOOLS/
-   COMMON=OFF`) and `cmake --install` it into `ggml-prefix/`; the installed
-   `ggml-config.cmake` is what whisper consumes. `GGML_MAX_NAME` stays the
-   pin's 64 (the arcint tree's), so the two binaries can never share a
-   process, as sd.cpp cannot.
+   COMMON=OFF`), the top-level `app/` executable OFF
+   (`LLAMA_BUILD_APP=OFF`, `LLAMA_TOOLS_INSTALL=OFF`: it needs `llama-common`,
+   which is off, and would otherwise fail the install), build `ggml` and
+   `llama` (the install rule wants `libllama.a`), and `cmake --install` it
+   into `ggml-prefix/`; the installed `ggml-config.cmake` is what whisper
+   consumes. `GGML_MAX_NAME` stays the pin's 64 (the arcint tree's), so the
+   two binaries can never share a process, as sd.cpp cannot.
 2. Export the pinned whisper.cpp export and configure it with
    `-DWHISPER_USE_SYSTEM_GGML=ON -Dggml_DIR=<prefix>/lib/cmake/ggml`
    `-DWHISPER_BUILD_EXAMPLES=ON` for `whisper-cli` and the server.
 3. Assert the whisper binary carries the OpenCL backend and the Intel kernels
    through the linked ggml: `strings` for a series kernel name
-   (`kernel_mul_mv_kq_q8_1`) and for `Intel`, and that the model loads with
-   `--device` named (a leg, not this recipe).
+   (`kernel_mul_mv_kq_q8_1`: no vendored whisper.cpp ggml has it) and for a
+   `ggml_opencl:` log string (there is no literal `Intel(R)` in the back-end
+   source at this pin), and that the model loads with `--device` named (a
+   leg, not this recipe).
 
 What is **not** here: the `/v1/audio/transcriptions` route. whisper.cpp's own
 server examples serve `/inference`, not the OpenAI shape; a thin

@@ -21,7 +21,7 @@ the operator fixes them.
 |---|---|---|---|---|
 | `arcint-vlm` | `/usr/bin/arcint` (`arcint` package) | `Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf` + `mmproj-...-Q8_0.gguf` | `/v1/chat/completions` with `image_url` | **built** (chat path), package/unit/probes owed |
 | `arcint-tts` | `/usr/bin/arcint` (`arcint` package) | `Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` + `mmproj-Qwen3-TTS-...-Q8_0.gguf` | `POST /v1/audio/speech`, `GET /v1/audio/voices` | **planned** (the `libmtmd` `gen_audio` pipeline; D4) |
-| `arcint-stt` | `/usr/bin/arcint-whisper` (`arcint-stt` package) | `ggml-large-v3-turbo.bin` (or `ggml-large-v3.bin`) | `POST /v1/audio/transcriptions` | **planned** (whisper.cpp on the installed ggml; D3) |
+| `arcint-stt` | `/usr/bin/arcint-whisper` (`arcint-stt` package) | `ggml-large-v3-turbo.bin` (or `ggml-large-v3.bin`) | `POST /v1/audio/transcriptions` | **engine built** (whisper.cpp on the installed ggml, card gate PASS; unit/package/`/props` owed) |
 
 The VLM and TTS share one binary (`libmtmd` links `ggml` + `llama` only, so one
 process with the pin's `GGML_MAX_NAME` 64, `docs/milestone-1.2.0.md §3`); the
@@ -49,9 +49,7 @@ front; the units carry the same `Conflicts=` as `arcint-imggen`.
   the server's profile list** (`GET /v1/audio/voices`); the route MUST NOT
   accept `reference_audio`, `speaker_file`, `sample_audio` or any equivalent
   field, and refuses it 400 with a pointer to the enrolment route (D5).
-- `POST /v1/audio/transcriptions` — **planned.** OpenAI multipart: `file`,
-  `model`, `language`, `response_format` (`json`/`text`) → `{"text":...}`.
-  German first (D3).
+- `POST /v1/audio/transcriptions` — **built for STT** (whisper.cpp's own server served with `--inference-path /v1/audio/transcriptions`, so no route patch is needed: `file`, `language` and `response_format` match the OpenAI shape and a plain `json` returns `{"text":...}`). OpenAI multipart: `file`, `model`, `language`, `response_format` (`json`/`text`) → `{"text":...}`. German first (D3).
 - `GET /v1/audio/voices` — **planned.** The enrolled names only; never a
   reference, never a path, never audio bytes (D5).
 - `GET /health` and `GET /props` — existing; the service phase adds the
@@ -83,6 +81,17 @@ Three rules, and they are absolute:
    path* on it, so the mechanism is proven before the real samples arrive. The
    gate voice's provenance and licence are in the leg's record, never the
    audio bytes in the repo.
+
+## The fixed German STT set
+
+The C3 set is 12 utterances of the FLEURS `de_de` dev split (CC-BY-4.0,
+attribution to Google FLEURS), 2.5–13.75 s of the split, normalised from its
+float32 WAV to 16 kHz mono PCM s16; the reference text comes from the split's
+TSV. Audio and manifest stay on the card host outside the repo (the manifest
+lists absolute paths, so it is operator-local); the corpus WER and the
+manifest sha256 are the record. The TTS gate voice is a separate freely
+licensed German sample, enrolled under a neutral name; its provenance and
+licence are in the leg's record, never the audio bytes in the repo.
 
 ## After a card window
 

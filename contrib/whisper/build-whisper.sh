@@ -43,9 +43,10 @@ cmake -S "$LLAMA_TREE" -B "$LLAMA_BUILD" -DCMAKE_BUILD_TYPE=Release \
       -DGGML_OPENCL_EMBED_KERNELS=ON \
       -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
       -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF \
+      -DLLAMA_BUILD_APP=OFF -DLLAMA_TOOLS_INSTALL=OFF \
       -DLLAMA_BUILD_COMMON=OFF -DBUILD_SHARED_LIBS=OFF \
       -DCMAKE_INSTALL_PREFIX="$GGML_PREFIX" >/dev/null
-cmake --build "$LLAMA_BUILD" --target ggml -j"$(nproc)"
+cmake --build "$LLAMA_BUILD" --target ggml llama -j"$(nproc)"
 cmake --install "$LLAMA_BUILD" >/dev/null
 if [ ! -e "$GGML_PREFIX/lib/cmake/ggml/ggml-config.cmake" ]; then
   echo "ggml install has no ggml-config.cmake" >&2; exit 2
@@ -75,9 +76,13 @@ BIN="$WHISPER_BUILD/bin/whisper-cli"
 [ -e "$BIN" ] || { echo "no whisper-cli built" >&2; exit 2; }
 # The binary must carry the Intel kernels and the OpenCL device string of the
 # linked ggml: a vendored ggml would not (this is the reason for the recipe)
-for s in kernel_mul_mv_kq_q8_1 "Intel(R)"; do
+# The one marker a vendored whisper.cpp ggml cannot have: arcint's series
+# kernel name, embedded into the system ggml by GGML_OPENCL_EMBED_KERNELS. The
+# OpenCL backend's own strings are a second marker (no literal "Intel(R)"
+# exists in the back-end source at this pin).
+for s in kernel_mul_mv_kq_q8_1 "ggml_opencl:"; do
   if ! strings -a "$BIN" | grep -q "$s"; then
-    echo "whisper-cli lacks '$s' (vendored ggml, not the system one?)" >&2; exit 2
+    echo "whisper-cli lacks '$s' (a vendored ggml, not the system one?)" >&2; exit 2
   fi
 done
 
