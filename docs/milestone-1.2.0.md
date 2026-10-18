@@ -356,7 +356,50 @@ identical inputs (the rule learned in `imggen-attention-path`).
   mmproj layout after a pin move. The VLM's model choice is recorded with its
   mmproj source for that reason.
 
-## 9. References
+## 9. State as measured (Phase 0, 2026-10-18)
+
+The VLM leg, on the dev host's B60 (PCI `8086:e211`, OpenCL GPU.0),
+the B60's language unit stopped for the window and the card host's sampler on
+the physical host, a fresh process: the staged dev build (libmtmd in arcint,
+`LLAMA_BUILD_MTMD`; the `mtmd_input_text` `text_len` fix), llama.cpp at the
+pin + the series through 0060. Models `Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf`
+(4,683,072,032 bytes) and `mmproj-...-Q8_0.gguf` (853,119,712 bytes), sizes
+equal to HF's LFS pointers (`measured-here`).
+
+| item | measured () |
+|---|---|
+| A1, `libmtmd` in arcint | builds: the `mtmd` target and the `arcint` binary; `LLAMA_BUILD_MTMD=ON`, no `llama-common`, the pin's `GGML_MAX_NAME` 64, the series' kernels present in the tree |
+| A2, a VLM request through the chat endpoint | yes: `/v1/chat/completions` with an `image_url` data URI answers; the OpenCL device is named for the mmproj graph, no CPU island reported (`-v` log) |
+| load | `qwen2vl` Q4_K - Medium (4.36 GiB) + Q8_0 mmproj on the B60, in 46.2 s; mmproj `image_min_pixels` 6272, `image_max_pixels` 3,211,264 |
+| C1/C2, content check | **4/4**: the generated Qwen-Image `WILLKOMMEN` imprinted on a white sign reads `Willkommen` (1024² and 512²); the FLUX.2 klein generations read `Cat` (the windowsill) and `Palm trees and beach.` (the edit's background). 1.1.0's open content check is closed for these images |
+| B1/B4, 1024² encode | 1369 image tokens (1407 with text), image slice encoded 1716 ms, image batch decoded 314 ms, prefill 2.34 s (600.9 t/s), decode 67.1 t/s; the first request compiles the clip kernels and is the slow one |
+| 512² encode | image slice 242-243 ms, image batch 7 ms, prefill 0.37 s (958-973 t/s) |
+| memory | peak VRAM 6445 MiB, GTT 46 MiB, RSS 745 MiB, physical host MemAvailable ~55 GiB during the requests (sampler) |
+
+The gate tool `tools/vlm_gate.py` is built but **not yet run as a tool** (the
+phase-0 set above was run by a scratch script); a CPU-side encoder reference
+for B4 is not measured; the op profile per node is not taken; no red case
+yet; the endpoint is not package/unit/probe-complete. These are the open
+dispositions of the next card window.
+
+### 9.1 The card-window incident (measured-here, 2026-10-18, on the record)
+
+This is the window's own lesson, written down before it is lost. While the
+dev VLM server held the **B60**, a stale leg driver from a finished session
+(a deleted `` script still running under the physical host's init, spawning
+a 4k-context B60 server) held the same card, and the production language
+unit was restarted on it — **three processes on one card under xe**. Result:
+an `xe_pt_zap_ptes` NULL-pointer oops in the page-fault workqueue
+(`xe_po_move` → `xe_pt_zap_ptes`, CPU 5, `kworker/u65:3 exited with irqs
+disabled`) and an RCU self-detected stall with `kswapd0` spinning; the
+physical host stopped answering SSH. Per `docs/sop-card-window.md` and
+`CLAUDE.local.md`, that state has only been recovered by a host reboot, and
+the reboot is the operator's call. The lessons: **sweep stale leg drivers by
+pid before restoring production units**, and **never restore a unit onto a
+card a dev leg holds**; the SOP's “zombie sweep by pid” already said
+it, and this window paid for skipping it.
+
+## 10. References
 
 - llama.cpp `3e4dfa8`: `tools/mtmd/{mtmd.h,mtmd.cpp,mtmd-image.cpp,
   mtmd-audio.cpp,mtmd-helper-gen.cpp,clip.cpp,models/*}`, `tools/tts/tts.cpp`,
