@@ -18,7 +18,7 @@
 Description=arcint-imggen-flux — FLUX.2 klein via sd-server, GPU.0 (Arc Pro B60), :8082, on demand
 Documentation=https://github.com/marfrit/arcint
 After=default.target
-Conflicts=arcint-agent.service arcint-writer.service arcint-flashnext.service arcint-agent-lanes.service
+Conflicts=arcint-agent.service arcint-writer.service arcint-flashnext.service arcint-agent-lanes.service arcint-vlm.service arcint-tts.service arcint-stt.service
 
 [Service]
 Type=simple

@@ -35,6 +35,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "config.h"
@@ -520,6 +521,19 @@ public:
         // resets, measured-here)
         cp.n_outputs_max_per_seq = static_cast<uint32_t>(1 + n_spec);
         cp.n_outputs_max         = cp.n_outputs_max_per_seq * static_cast<uint32_t>(lanes_);
+        // --tts (docs/milestone-1.2.0.md A4): the gen-audio pipeline feeds
+        // embedding batches to the backbone and reads its hidden states
+        // (llama_get_embeddings_ith), so the context needs embeddings=1. A
+        // llama.cpp embedding context outputs EVERY token of a batch, which
+        // the language path's logits reservation above cannot hold; lift it to
+        // llama.cpp's n_batch default for that path, as tts.cpp runs it. Else
+        // the helper's prompt decode fails: "pooled embedding requires that
+        // all tokens are output".
+        if (cfg.tts) {
+            cp.embeddings            = true;
+            cp.n_outputs_max         = 0;   // 0 = llama.cpp's n_batch
+            cp.n_outputs_max_per_seq = 0;   // 0 = n_outputs_max
+        }
         ctx_               = llama_init_from_model(model_, cp);
         if (ctx_ == nullptr) throw std::runtime_error("llama.cpp could not create a context");
         // llama.cpp pads the context to 256 (llama-context.cpp:291); the caps
@@ -673,6 +687,7 @@ public:
                 throw std::runtime_error(log::format("libmtmd could not load %s", cfg.mmproj_path.c_str()));
             status_.mmproj_loaded = true;
             const mtmd_gen_audio_info gen = mtmd_gen_audio_get_info(mctx_);
+            tts_info_ = gen;   // the gen half's type and sample rate, for --tts
             log::info("load", "mmproj: %s (image input%s; docs/milestone-1.2.0.md)", cfg.mmproj_path.c_str(),
                       gen.type != MTMD_GEN_AUDIO_TYPE_NONE ? " + audio generation" : "");
         }
@@ -680,6 +695,60 @@ public:
         if (!cfg.mmproj_path.empty())
             throw std::runtime_error("--mmproj: this build's llama.cpp lacks libmtmd (tools/mtmd)");
 #endif
+        // --tts: the enrolled voices' profiles (D5). One <dir>/<name>/ with a
+        // profile.json (tools/tts_enrol.py) and reference.wav; enabled entries
+        // only are exposed, as names, and their language rides along. The
+        // reference path never leaves this process and no bytes leave the host.
+        if (cfg.tts) {
+            if (tts_info_.type == MTMD_GEN_AUDIO_TYPE_NONE)
+                throw std::runtime_error("--tts: the mmproj carries no audio-generation half "
+                                         "(mtmd_gen_audio_get_info().type == none; docs/milestone-1.2.0.md D4)");
+            std::error_code ec;
+            if (!std::filesystem::is_directory(cfg.tts_profiles, ec))
+                throw std::runtime_error(log::format("--tts-profiles: %s is not a readable directory",
+                                                     cfg.tts_profiles.c_str()));
+            for (const std::filesystem::directory_entry& e : std::filesystem::directory_iterator(cfg.tts_profiles, ec)) {
+                if (!e.is_directory()) continue;
+                std::ifstream meta(e.path() / "profile.json");
+                if (!meta) continue;   // not a profile directory
+                json pr;
+                try {
+                    pr = json::parse(meta);
+                } catch (const json::exception& ex) {
+                    log::warn("load", "tts: %s/profile.json is not valid JSON (%s); skipped",
+                              e.path().string().c_str(), ex.what());
+                    continue;
+                }
+                TtsProfile p;
+                p.name          = pr.value("name", e.path().filename().string());
+                p.language      = pr.value("language", std::string());
+                p.enabled       = pr.value("enabled", false);
+                p.reference_wav = (e.path() / "reference.wav").string();
+                if (!p.enabled) continue;   // the API serves the enabled ones only
+                if (!std::filesystem::exists(p.reference_wav)) {
+                    log::warn("load", "tts: '%s' has no reference.wav; skipped", p.name.c_str());
+                    continue;
+                }
+                tts_profiles_.emplace(p.name, std::move(p));
+            }
+            for (const auto& [name, prof] : tts_profiles_) {
+                (void)prof;
+                status_.voices.push_back(name);
+            }
+            std::sort(status_.voices.begin(), status_.voices.end());
+            status_.tts = true;
+            tts_lang_   = cfg.tts_lang;
+            tts_gen_.resize(static_cast<size_t>(lanes_));
+            log::info("load", "tts: %zu enrolled voice%s from %s, language %s, gen pipeline %s (%d Hz)",
+                      status_.voices.size(), status_.voices.size() == 1 ? "" : "s",
+                      cfg.tts_profiles.c_str(), tts_lang_.c_str(),
+                      tts_info_.type == MTMD_GEN_AUDIO_TYPE_QWEN3TTS ? "qwen3tts"
+                                                                     : static_cast<int>(tts_info_.type) == MTMD_GEN_AUDIO_TYPE_POCKETTTS ? "pockettts" : "none",
+                      tts_info_.sample_rate);
+            if (status_.voices.empty())
+                log::warn("load", "tts: no enabled voice in %s: /v1/audio/speech refuses every voice until one "
+                                  "is enrolled (tools/tts_enrol.py)", cfg.tts_profiles.c_str());
+        }
         std::string lane_desc = log::format("%d lane%s x %d ctx", lanes_, lanes_ == 1 ? "" : "s", n_ctx_);
         if (named_) {
             lane_desc = log::format("%d named lanes,", lanes_);
@@ -972,6 +1041,149 @@ public:
         }
         stats.decode_seconds = seconds_since(t_decode);
         return reason;
+    }
+
+    // /v1/audio/speech: one enrolled profile's waveform (docs/milestone-1.2.0.md
+    // A4, D5). arcint's own sampler picks the backbone's semantic token from the
+    // logits of the embedding batch the helper decodes; the helper's pipeline
+    // turns the token into frames and a WAV. It is a self-contained lane path:
+    // the lane's KV is cleared before and after, and no prefix cache, checkpoint
+    // or drafter applies (the stream is codec tokens, not text).
+    //
+    // Differences from the reference (tools/tts/tts.cpp):
+    //  - the backbone token comes from arcint's lgc::Sampler over
+    //    llama_get_logits_ith(ctx_, -1) and n_vocab_, not common_sampler_sample;
+    //  - only top_k/top_p/seed reach mtmd_helper_gen_audio_inp, as the reference
+    //    passes them: a greedy backbone request does not make the codec/code-
+    //    predictor sampling greedy, and top_k/top_p <= 0 make the helper fall
+    //    back to mtmd_gen_inp_default rather than switch them off;
+    //  - the helper's internal llama_process calls touch the shared context, so
+    //    arcint holds its context mutex for the whole synthesis (the reference
+    //    has the context to itself);
+    //  - the logits reservation is lifted to n_batch under --tts, because an
+    //    embedding context outputs every token of a batch.
+    bool generate_speech(const SpeechInput& in, int slot, std::string& wav, std::string& error,
+                         GenerationStats& stats) override {
+        if (mctx_ == nullptr) { error = "the speech path needs --mmproj"; return false; }
+        if (tts_info_.type == MTMD_GEN_AUDIO_TYPE_NONE) {
+            error = "the loaded --mmproj carries no audio-generation half";
+            return false;
+        }
+        const auto it = tts_profiles_.find(in.voice);
+        if (it == tts_profiles_.end()) {
+            error = log::format("voice '%s' is not enrolled on this server", in.voice.c_str());
+            return false;
+        }
+        const TtsProfile& prof = it->second;
+        const int         seq  = std::min(std::max(slot, 0), lanes_ - 1);
+        const std::string lang = prof.language.empty() ? tts_lang_ : prof.language;
+
+        // One seed for the backbone sampler and the codec pipeline, so a fixed
+        // request seed makes the arm reproducible (milestone §8, the stochastic
+        // risk). Unset: random, as the reference's LLAMA_DEFAULT_SEED.
+        uint64_t sseed = in.sampler.seeded ? in.sampler.seed : 0;
+        if (!in.sampler.seeded) {
+            std::random_device rd;
+            sseed = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+        }
+
+        // The helper's internal llama_process calls run on the shared context,
+        // which is not thread-safe, and its embedding batches (output_all) read
+        // the whole ubatch; the synthesis holds the context mutex, as the
+        // reference has the context to itself.
+        std::lock_guard<std::mutex> lk(mu_);
+        llama_memory_seq_rm(llama_get_memory(ctx_), seq, -1, -1);
+        slot_tokens_[static_cast<size_t>(seq)].clear();
+        ckpts_[static_cast<size_t>(seq)].clear();
+
+        mtmd_helper_bitmap_wrapper wrap = mtmd_helper_bitmap_init_from_file(
+            mctx_, prof.reference_wav.c_str(), /*placeholder*/ false, mtmd_helper_init_opt_default());
+        mtmd::bitmap_ptr speaker(wrap.bitmap);
+        if (!speaker) {
+            error = log::format("voice '%s': its reference recording could not be read",
+                                prof.name.c_str());
+            return false;
+        }
+
+        std::unique_ptr<mtmd_helper::gen_audio>& pipe = tts_gen_[static_cast<size_t>(seq)];
+        if (!pipe) pipe = std::make_unique<mtmd_helper::gen_audio>(ctx_, mctx_);
+
+        Sampler sampler(in.sampler, sseed);
+        mtmd_helper_gen_audio_inp inp{};
+        inp.seq_id      = seq;
+        inp.prompt      = in.text.c_str();
+        inp.prompt_len  = in.text.size();
+        inp.speaker_ref = speaker.get();
+        inp.lang        = lang.c_str();
+        inp.top_k       = in.sampler.top_k;
+        inp.top_p       = in.sampler.top_p;
+        inp.seed        = in.sampler.seeded ? static_cast<uint32_t>(sseed) : UINT32_MAX;
+        inp.out_type    = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
+        if (pipe->set_input(&inp) != 0) {
+            error = "the gen-audio pipeline refused the input (the reference, the language, or the "
+                    "backbone's tokens)";
+            return false;
+        }
+
+        std::vector<float> logits(n_vocab_);
+        int32_t            ret = 1;
+        while (ret > 0) {
+            ret = pipe->step_prompt(n_batch_);
+            if (ret < 0) { error = "prompt processing failed"; return false; }
+        }
+        copy_logits_locked(logits);
+        int          sampled = sampler.sample(logits.data(), n_vocab_);
+        sampler.observe(sampled);   // the reference accepts each sampled token
+        const float* h       = llama_get_embeddings_ith(ctx_, -1);
+        if (h == nullptr) {
+            error = "llama.cpp returned no embeddings: the context lacks embeddings=1 (--tts)";
+            return false;
+        }
+
+        const int    max_frames = in.sampler.max_tokens >= 0 ? in.sampler.max_tokens : 512;
+        int          n_frames   = 0;
+        bool         stop       = false;
+        const float* h_next     = nullptr;
+        const auto   t_gen      = clock_type::now();
+        if (pipe->step_gen(sampled, h, &h_next, &stop) != 0) {
+            error = "step_gen failed at the first frame";
+            return false;
+        }
+        if (h_next != nullptr) {
+            n_frames = 1;
+            copy_logits_locked(logits);
+        }
+        // h_state passes through the helper's own buffer (stable across other
+        // lanes), so only step_gen and the logits copy need the context.
+        while (!stop && h_next != nullptr && n_frames < max_frames) {
+            const float* state = h_next;
+            h_next             = nullptr;
+            sampled            = sampler.sample(logits.data(), n_vocab_);
+            sampler.observe(sampled);
+            if (pipe->step_gen(sampled, state, &h_next, &stop) != 0) {
+                error = log::format("step_gen failed at frame %d", n_frames);
+                return false;
+            }
+            if (h_next == nullptr) break;
+            copy_logits_locked(logits);
+            ++n_frames;
+        }
+
+        int32_t     rate   = 0;
+        const char* data   = nullptr;
+        size_t      len    = 0;
+        int64_t     n_samp = 0;
+        if (pipe->get_output(&rate, &data, &len, &n_samp) != 0) { error = "get_output failed"; return false; }
+        wav.assign(data, data + len);
+        stats.completion_tokens = n_frames;
+        stats.decode_seconds    = seconds_since(t_gen);
+
+        // leave the lane as the text path expects to find it: the helper's
+        // embedding positions are not the tokens slot_tokens_ records
+        llama_memory_seq_rm(llama_get_memory(ctx_), seq, -1, -1);
+        slot_tokens_[static_cast<size_t>(seq)].clear();
+        ckpts_[static_cast<size_t>(seq)].clear();
+        return true;
     }
 #endif
 
@@ -1589,6 +1801,24 @@ private:
     llama_context*                        ctx_   = nullptr;
 #ifdef ARCINT_MTMD
     mtmd_context*                         mctx_  = nullptr;   // --mmproj (libmtmd)
+    mtmd_gen_audio_info                   tts_info_{};   // mtmd_gen_audio_get_info(mctx_)
+    // One profile per enrolled voice (D5): the name the API takes, the voice's
+    // own language and its reference recording's path. Names only reach the
+    // API; the path never leaves this process and the bytes never leave the
+    // host (the profile directory is operator-local).
+    struct TtsProfile {
+        std::string name;
+        std::string language;
+        std::string reference_wav;
+        bool        enabled = false;
+    };
+    std::unordered_map<std::string, TtsProfile> tts_profiles_;
+    std::string                                 tts_lang_ = "de";   // --tts-lang
+    // one gen_audio pipeline per lane, lazily built and reused: its special
+    // token cache and token-embedding copy survive across requests (the
+    // reference builds one for the process) and set_input() resets its
+    // per-generation state.
+    std::vector<std::unique_ptr<mtmd_helper::gen_audio>> tts_gen_;
 #endif
     const llama_vocab*                    vocab_ = nullptr;
     std::unique_ptr<LlamaTokenizer>       tokenizer_;

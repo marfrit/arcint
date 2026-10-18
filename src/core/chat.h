@@ -73,10 +73,26 @@ struct CompletionRequest {
     SamplerOverrides sampler;
 };
 
+// One /v1/audio/speech body: OpenAI's shape (docs/speech-service.md). `voice`
+// must be an enrolled name; the API-level refusal of any reference-audio field
+// and the availability/unknown-voice checks live in prepare_speech (handlers),
+// so this parser stays a body validator. `response_format` admits only "wav"
+// today; a non-1 `speed` is refused rather than silently ignored (the served
+// rate is the model's own).
+struct SpeechRequest {
+    std::string      model;
+    std::string      text;                    // OpenAI's `input`
+    std::string      voice;
+    std::string      response_format = "wav";
+    SamplerOverrides sampler;
+};
+
 // Both return an error message on rejection and leave the output untouched.
 std::optional<std::string> parse_chat_request(const nlohmann::json& body, ChatRequest& out);
 std::optional<std::string> parse_completion_request(const nlohmann::json& body,
                                                     CompletionRequest& out);
+std::optional<std::string> parse_speech_request(const nlohmann::json& body,
+                                                SpeechRequest& out);
 
 // Parameter types from the declared tool schemas, for coercing the coder
 // model's XML tool-call values (see core/toolcall.h).

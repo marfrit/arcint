@@ -1,0 +1,49 @@
+# arcint-tts — German text to speech with enrolled voice cloning
+# (Qwen3-TTS-12Hz-1.7B-Base, Apache-2.0) on the 24 GB card, on demand:
+# arcint's own voice-and-vision binary with libmtmd's gen_audio pipeline
+# (docs/milestone-1.2.0.md D4/§3, docs/speech-service.md). The backbone
+# samples the codec tokens and the mmproj's gen half (speaker encoder +
+# acoustic decoder) makes the waveform.
+#
+# Starting it stops the card's language, image and speech units (same card,
+# Conflicts=). Routes: POST /v1/audio/speech (OpenAI shape, `voice` a name
+# from the server's list) and GET /v1/audio/voices (names only); /health and
+# /props. The API refuses any reference-audio field 400 naming the enrolment
+# route (D5); cloning happens only from a profile already on the host, in
+# --tts-profiles (operator-local, outside the repository).
+#
+# --tts sets the context's embeddings=1 (the backbone-to-codec pipeline reads
+# hidden states) and lifts the logits reservation to n_batch; the enrolled
+# voice count and the tts flag are on /props (names on /v1/audio/voices).
+# Vocab/backbone flags mirror the reference tools/tts recipe; the sampler
+# (temperature/seed) is per request and printed with every gate verdict.
+
+[Unit]
+Description=arcint-tts — Qwen3-TTS speech with enrolled voices, GPU.0 (Arc Pro B60), :8084, on demand
+Documentation=https://github.com/marfrit/arcint
+After=default.target
+Conflicts=arcint-agent.service arcint-writer.service arcint-flashnext.service arcint-agent-lanes.service arcint-imggen.service arcint-imggen-qwen.service arcint-imggen-flux.service arcint-vlm.service arcint-stt.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/arcint \
+    --engine llama \
+    --gguf /models/tts-qwen3/Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
+    --mmproj /models/tts-qwen3/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
+    --tts --tts-profiles /models/tts-qwen3/profiles-de --tts-lang de \
+    --served-model-name qwen3-tts-12hz-1.7b \
+    --device GPU.0 \
+    --host 0.0.0.0 --port 8084 \
+    --n-ctx 4096 --queue-timeout 30
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=10min
+TimeoutStopSec=60s
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectHome=read-only
+
+[Install]
+WantedBy=default.target

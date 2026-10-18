@@ -51,7 +51,7 @@ def wer(ref, hyp):
     return prev[-1] / max(1, len(r)), prev[-1], len(r)
 
 
-def speech(tts_url, model, voice, text, seed, timeout):
+def synthesize(tts_url, model, voice, text, seed, timeout):
     body = {"model": model, "input": text, "voice": voice, "response_format": "wav",
             "temperature": 0}
     if seed is not None:
@@ -90,33 +90,61 @@ def sha256_file(path):
     return h.hexdigest()
 
 
-def run(args):
+def load_texts(args):
     manifest = json.load(open(args.manifest))
     texts = manifest if isinstance(manifest, list) else manifest.get("sentences", [])
     if not texts or not all(isinstance(t, str) for t in texts):
         print("manifest must be a non-empty list of sentences", file=sys.stderr)
-        return 2
-    msha = sha256_file(args.manifest)
+        raise SystemExit(2)
+    return texts, sha256_file(args.manifest)
+
+
+def speech(args):
+    """Phase A: synthesize every sentence to WAV (TTS up; no STT needed)."""
+    texts, msha = load_texts(args)
     os.makedirs(args.out, exist_ok=True)
-    cases, tot_d, tot_n = [], 0, 0
+    cases = []
     for i, text in enumerate(texts):
-        wav = speech(args.tts_url, args.model, args.voice, text, args.seed, args.timeout)
+        wav = synthesize(args.tts_url, args.model, args.voice, text, args.seed, args.timeout)
         wav_path = os.path.join(args.out, "sent_%03d.wav" % i)
         open(wav_path, "wb").write(wav)
-        hyp = transcribe(args.stt_url, args.stt_model, wav, args.lang, args.timeout)
-        w, d, n = wer(text, hyp)
+        cases.append({"text": text, "wav": wav_path, "wav_bytes": len(wav)})
+        print("wav %5d bytes  %s" % (len(wav), text[:50]))
+        sys.stdout.flush()
+    json.dump({"n": len(cases), "cases": cases, "manifest_sha256": msha,
+               "manifest": args.manifest, "voice": args.voice, "seed": args.seed,
+               "tts_url": args.tts_url, "model": args.model, "lang": args.lang,
+               "floor": args.floor},
+              open(os.path.join(args.out, "speech.json"), "w"), indent=1)
+    print("TTS speech phase: %d sentences -> %s" % (len(cases), args.out))
+    return 0
+
+
+def transcribe_phase(args):
+    """Phase B: transcribe the saved WAVs (STT up; no TTS needed) and score.
+
+    The two phases exist because one card holds one non-service process at a
+    time (docs/milestone-1.2.0.md §9.1): the TTS unit and the STT unit never
+    run beside each other on the same card, so a leg synthesizes first, stops
+    the TTS server, then transcribes."""
+    sp = json.load(open(os.path.join(args.speech, "speech.json")))
+    cases, tot_d, tot_n = [], 0, 0
+    for c in sp["cases"]:
+        wav = open(c["wav"], "rb").read()
+        hyp = transcribe(args.stt_url, args.stt_model, wav, sp["lang"], args.timeout)
+        w, d, n = wer(c["text"], hyp)
         tot_d += d
         tot_n += n
-        cases.append({"text": text, "wav": wav_path, "wav_bytes": len(wav),
+        cases.append({"text": c["text"], "wav": c["wav"], "wav_bytes": c["wav_bytes"],
                       "hypothesis": hyp, "wer": round(w, 4), "errors": d, "words": n})
-        print("wer %.3f  ref %-40s -> %s" % (w, text[:40], hyp[:50]))
+        print("wer %.3f  ref %-40s -> %s" % (w, c["text"][:40], hyp[:50]))
         sys.stdout.flush()
     corpus = tot_d / max(1, tot_n)
-    verdict = corpus <= args.floor
+    verdict = corpus <= sp["floor"]
     result = {"n": len(cases), "corpus_wer": corpus, "errors": tot_d, "ref_words": tot_n,
-              "floor": args.floor, "verdict": "PASS" if verdict else "FAIL",
-              "manifest_sha256": msha, "voice": args.voice, "seed": args.seed,
-              "cases": cases}
+              "floor": sp["floor"], "verdict": "PASS" if verdict else "FAIL",
+              "manifest_sha256": sp["manifest_sha256"], "voice": sp["voice"],
+              "seed": sp["seed"], "cases": cases}
     if args.embed_cmd:
         try:
             sim = float(subprocess.check_output(args.embed_cmd.split(),
@@ -124,17 +152,28 @@ def run(args):
             result["similarity"] = sim
         except Exception as e:
             print("embed-cmd failed: %s" % e, file=sys.stderr)
+    os.makedirs(args.out, exist_ok=True)
     json.dump(result, open(os.path.join(args.out, "result.json"), "w"), indent=1)
-    json.dump({"tts_url": args.tts_url, "model": args.model, "voice": args.voice,
-               "stt_url": args.stt_url, "stt_model": args.stt_model, "lang": args.lang,
-               "seed": args.seed, "floor": args.floor, "manifest": args.manifest,
-               "manifest_sha256": msha},
+    json.dump({"tts_url": sp["tts_url"], "model": sp["model"], "voice": sp["voice"],
+               "stt_url": args.stt_url, "stt_model": args.stt_model, "lang": sp["lang"],
+               "seed": sp["seed"], "floor": sp["floor"], "manifest": sp["manifest"],
+               "manifest_sha256": sp["manifest_sha256"]},
               open(os.path.join(args.out, "arm.json"), "w"), indent=1)
     print("TTS gate %s: round-trip corpus WER %.4f (floor %.4f)%s"
-          % (result["verdict"], corpus, args.floor,
+          % (result["verdict"], corpus, sp["floor"],
              "; similarity not measured (no --embed-cmd)" if "similarity" not in result else
              " similarity %.3f" % result["similarity"]))
     return 0 if verdict else 1
+
+
+def run(args):
+    """Both phases at once (both services up; convenient, not for a single-card
+    leg)."""
+    args.speech = args.out
+    rc = speech(args)
+    if rc:
+        return rc
+    return transcribe_phase(args)
 
 
 def compare(args):
@@ -166,6 +205,25 @@ def main():
     r.add_argument("--embed-cmd", default="")
     r.add_argument("--timeout", type=float, default=600)
     r.set_defaults(fn=run)
+    s = sub.add_parser("speech")
+    s.add_argument("--tts-url", required=True)
+    s.add_argument("--model", required=True)
+    s.add_argument("--voice", required=True)
+    s.add_argument("--manifest", required=True)
+    s.add_argument("--out", required=True)
+    s.add_argument("--floor", type=float, default=FLOOR_DEFAULT)
+    s.add_argument("--seed", type=int, default=None)
+    s.add_argument("--lang", default="de")
+    s.add_argument("--timeout", type=float, default=600)
+    s.set_defaults(fn=speech)
+    t = sub.add_parser("transcribe")
+    t.add_argument("--speech", required=True, help="the speech phase's out dir (speech.json)")
+    t.add_argument("--stt-url", required=True)
+    t.add_argument("--stt-model", required=True)
+    t.add_argument("--out", required=True)
+    t.add_argument("--embed-cmd", default="")
+    t.add_argument("--timeout", type=float, default=600)
+    t.set_defaults(fn=transcribe_phase)
     c = sub.add_parser("compare")
     c.add_argument("--ref", required=True)
     c.add_argument("--cand", required=True)

@@ -15,6 +15,9 @@ exactly its flags.
 | `arcint-flashnext.service` | GPU.0, on demand | Qwen3.8-Flash-Next IQ3_XXS (since 2026-10-15): expert cache (12,000 MiB of slots, the rest in pinned host memory), the CPU misses, the bank stream for prefill, MTP 3 with Strata's stop, 131,072 tokens, q8_0 KV | 8089 |
 | `arcint-coder.service` | GPU.1 (Arc A770, 16 GB) | Qwen3.6-27B-A3B coder, the searched `c5f495ac shq8` GGUF, q8_0:q4_0 KV, 98,304 tokens, MTP 4 | 8080 |
 | `arcint-imggen.service` | GPU.0, on demand | Z-Image Turbo Q8_0 with the Qwen3-4B-Instruct-2507 Q8_0 encoder and `ae.safetensors`, 1024x1024, 8 steps; `arcint-sd-server` from the `arcint-imggen` package, not arcint | 8085 |
+| `arcint-vlm.service` | GPU.0, on demand | Qwen2.5-VL-7B-Instruct Q4_K_M + its Q8_0 mmproj (vision tower), q8_0:q4_0 KV, 32,768 tokens; the `/v1/chat/completions` `image_url` path | 8083 |
+| `arcint-tts.service` | GPU.0, on demand | Qwen3-TTS-12Hz-1.7B-Base Q8_0 + its Q8_0 mmproj (speaker encoder + acoustic decoder), `--tts` with an enrolled profiles directory; `/v1/audio/speech`, `/v1/audio/voices` | 8084 |
+| `arcint-stt.service` | GPU.0, on demand | whisper.cpp large-v3-turbo `.bin`; the separate `arcint-whisper` binary from the `arcint-stt` package, `/v1/audio/transcriptions` | 8091 |
 
 The GPU.0 units take turns on one card (`Conflicts=`); on the host they come
 from, a unit manager switches between them on demand. Flash-Next's other

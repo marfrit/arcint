@@ -390,6 +390,55 @@ std::optional<std::string> parse_completion_request(const json& body, Completion
     return std::nullopt;
 }
 
+std::optional<std::string> parse_speech_request(const json& body, SpeechRequest& out) {
+    if (!body.is_object()) return "request body must be a JSON object";
+
+    SpeechRequest req;
+    if (body.contains("model") && body["model"].is_string()) {
+        req.model = body["model"].get<std::string>();
+    }
+
+    // OpenAI's `input` is the spoken text.
+    if (!body.contains("input") || !body["input"].is_string()) return "input must be a string";
+    req.text = body["input"].get<std::string>();
+    if (req.text.find_first_not_of(" \t\r\n") == std::string::npos)
+        return "input must not be empty (nothing to synthesize)";
+
+    // `voice` picks a server-side enrolled profile (D5); whether it exists is
+    // prepare_speech's check, where the server's list is available.
+    if (!body.contains("voice") || !body["voice"].is_string()) return "voice must be a string";
+    req.voice = body["voice"].get<std::string>();
+    if (req.voice.empty()) return "voice must not be empty (it names an enrolled voice)";
+
+    if (body.contains("response_format") && !body["response_format"].is_null()) {
+        if (!body["response_format"].is_string()) return "response_format must be a string";
+        req.response_format = body["response_format"].get<std::string>();
+    }
+    if (req.response_format != "wav") {
+        return log::format("response_format '%s' is not served: WAV is the only audio container "
+                           "(mtmd_helper_gen_audio_outtype WAV)",
+                           req.response_format.c_str());
+    }
+
+    // OpenAI's `speed` is a playback rate the server does not implement: the
+    // model synthesizes at its own sample rate. Accepting it and ignoring it
+    // would be the silent divergence DESIGN §3.6 forbids, so anything but 1 is
+    // a refusal and it is not carried into the sampler.
+    if (body.contains("speed") && !body["speed"].is_null()) {
+        if (!body["speed"].is_number()) return "speed must be a number";
+        const double speed = body["speed"].get<double>();
+        if (speed != 1.0)
+            return log::format("speed %.3f is not supported: arcint synthesizes at the model's own "
+                               "sample rate (the 1.0 playback rate)",
+                               speed);
+    }
+
+    if (auto e = read_sampler(body, req.sampler)) return e;
+
+    out = std::move(req);
+    return std::nullopt;
+}
+
 ToolSchemas tool_schemas(const std::vector<ToolSpec>& tools) {
     ToolSchemas schemas;
     for (const ToolSpec& t : tools) {
