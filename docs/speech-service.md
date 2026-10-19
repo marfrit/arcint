@@ -120,6 +120,25 @@ manifest sha256 are the record. The TTS gate voice is a separate freely
 licensed German sample, enrolled under a neutral name; its provenance and
 licence are in the leg's record, never the audio bytes in the repo.
 
+## The fixed German TTS set (C4) and the floors
+
+The C4 set is committed (`tools/tts_sentences_de.json`): 46 unique German
+sentences of 5-10 words, 303 words, **Tatoeba** (CC-BY 2.0 FR; attribution to
+Tatoeba and its contributors), drawn deterministically from the
+`deu_sentences.tsv.bz2` export (sha256 `ccd06372…`) with the selection rule in
+the manifest (no common names, no digits, no pre-1996 orthography). Text is
+public and licence-clear, so it is in the repo; the synthesized WAVs and the
+round-trip transcripts are operator-local, in the leg's record.
+
+The operator's C4 floor (D8, 2026-10-19): corpus round-trip WER <= 0.10 and no
+single sentence above 0.5, on this set; `tools/tts_gate.py` prints the corpus
+WER, the worst sentence and the share of sentences with WER <= 0.10. B3's floor
+is RTF >= 1.0 on the set (batch reading); time to first audio is recorded, not
+gated. The C3 floor is corpus WER <= 0.08 on the FLEURS set plus the card's
+WER <= the CPU's + 0.005. C5 uses the Seed-TTS-eval WavLM-large SV speaker
+model, calibrated against same-speaker vs cross-speaker recordings
+(`docs/milestone-1.2.0.md` §6/D8).
+
 ## After a card window
 
 Before a B60 window: release through the front (`POST /release`, check

@@ -108,7 +108,7 @@ the pinned tree already carries it. Checked against the source at the pin
 | D5 | Voice cloning | **enrolled voices only**: a server-side list of speaker profiles; the API must **not** accept arbitrary reference audio; reference recordings and profiles stay on the card host **outside the repository** and never in commits, logs or docs |
 | D6 | Card | **the A770 where it fits next to the coder, otherwise the B60 on demand** (the mandate) |
 | D7 | Units | each capability its own **on-demand unit**, the image units' discipline: `Conflicts=`, contract doc, `/health`, `/props` |
-| D8 | Gate tolerances | the operator sets the numbers when the first arms are on the record; until then the draft in §6 is a proposal, printed with every verdict |
+| D8 | Gate tolerances | **set by the operator 2026-10-19** (operator-set, replacing the §6 draft): C3 corpus WER ≤ 0.08 on the FLEURS `de` set and card ≤ CPU + 0.005; C4 corpus round-trip WER ≤ 0.10 with no single sentence above 0.5 on the enlarged ~300-word set; C5 the Seed-TTS-eval WavLM-large SV cosine, calibrated against same-speaker vs cross-speaker recordings; B3 RTF ≥ 1.0 (batch reading); time-to-first-audio recorded, not gated; naturalness listened, no automatic gate. Full text and sources in §6/D8 |
 | D9 | Repository | the rules stand: no host names or credentials in anything committed; do not push, tag, release or open package PRs from this session |
 
 ## 2. The model set
@@ -286,7 +286,7 @@ has its own on-demand unit with `/health` and `/props` (D7).
 |---|---|---|
 | B1 | A profile per capability: the VLM's encoder vs decode share, the whisper encode/decode split, the TTS backbone vs acoustic decoder | a `GGML_OPENCL_PROFILING`/timing run, every node over 10 % set against a measured ceiling or opened as a campaign (charter B2 of 1.1.0) |
 | B2 | STT: the card's transcription time against the same whisper on the CPU (identical inputs) | the card is faster than the CPU beyond the run-to-run spread; the WER gate is separate |
-| B3 | TTS: real-time factor (audio seconds per process second) at a fixed sentence set, first request separate | the card beats real time by a stated margin at the chosen quant |
+| B3 | TTS: real-time factor (audio seconds per process second) at the fixed sentence set | **RTF ≥ 1.0** on the sentence set (operator 2026-10-19; the 1.2.0 use case is reading files aloud, batch — real time is a later milestone). Time to first audio is recorded with every arm but not gated here |
 | B4 | VLM: prefill/encode time per image at a fixed size and token budget | reported against the CPU encoder on the same window |
 
 ### C. It is right
@@ -295,9 +295,9 @@ has its own on-demand unit with `/health` and `/props` (D7).
 |---|---|---|
 | C1 | The **VLM content check** on a fixed set of images with checkable content (an object, a count, a colour, a short lettering): answers match ground truth | a fixed question set per image; every answer checked; the gate is the set's pass rate, with the operator's threshold once measured |
 | C2 | The VLM closes 1.1.0's open content check: it reads the generated Qwen-Image `WILLKOMMEN` and the Z-Image lettering | the lettering is reported correctly; this is the 1.1.0 charter §3 "content check" that was left unbuilt |
-| C3 | STT **word error rate** on a fixed German test set against the **same model's CPU run** (identical inputs) and against a floor | WER = `(S+D+I)/N` per clip, corpus WER over the whole set; candidate ≤ CPU WER + tolerance, and under the operator's absolute floor |
-| C4 | TTS **intelligibility**: round-trip the synthesized German through the STT model, WER against the written sentences | corpus WER under the operator's floor on the fixed sentence set |
-| C5 | TTS **voice similarity**: the clone's embedding against the reference's, the gate voice and (later) the enrolled ones | a speaker-embedding cosine above the operator's floor; the embedding model named on the record |
+| C3 | STT **word error rate** on a fixed German test set against the **same model's CPU run** (identical inputs) and against a floor | WER = `(S+D+I)/N` per clip, corpus WER over the whole set; candidate ≤ CPU WER + 0.005, and **corpus WER ≤ 0.08** on the FLEURS `de` set (operator 2026-10-19) |
+| C4 | TTS **intelligibility**: round-trip the synthesized German through the STT model, WER against the written sentences on the fixed ~300-word set | **corpus WER ≤ 0.10 AND no single sentence above 0.5** (operator 2026-10-19); the share of sentences with WER ≤ 0.10 is reported with every verdict |
+| C5 | TTS **voice similarity**: the clone's embedding against the reference's, the gate voice and (later) the enrolled ones | the **Seed-TTS-eval** speaker model (fine-tuned WavLM-large SV), named on the record; the cosine is **calibrated**: the clone-vs-reference cosine must come near the cosine between two real recordings of the same person, and clearly above the cross-speaker cosine (operator 2026-10-19). Until the real recordings exist, prove the method with CC stand-ins: two clips of one FLEURS speaker against another speaker |
 | C6 | Every new or changed kernel has its red case, which turns the capability's gate red | a deliberate mutation fails the capability gate and its op suite, as 0057-0060's did |
 | C7 | The answer-level bar for the language path unchanged: the VLM/TTS unit must not perturb the language services' answers or KL | the A5 A/B and the existing KL arms |
 
@@ -306,6 +306,36 @@ the new gates are new tools (`tools/vlm_gate.py`, `tools/stt_gate.py`,
 `tools/tts_gate.py`), each printing its tolerances and refusing arms whose
 inputs differ, as `imggen_gate.py`'s parity check does. Gate comparisons use
 identical inputs (the rule learned in `imggen-attention-path`).
+
+### D8 — the operator's floors (operator-set, Markus 2026-10-19)
+
+The operator set the gate numbers from the community consensus the session
+researched. The §6 rows above carry them; the former "proposal, D8" labels in
+this document and in `tools/tts_gate.py` are void. Evidence class: the floors
+are `decision` (operator); the cited sources are `paper`.
+
+| # | floor (operator-set) |
+|---|---|
+| C3 | corpus WER ≤ 0.08 on the FLEURS `de` set, **and** the card ≤ the CPU's WER + 0.005 (the comparison unchanged from §9.2) |
+| C4 | corpus round-trip WER ≤ 0.10, **and no single sentence above 0.5**, on the enlarged sentence set (~300 words). One error in the old 66 words was 1.5 pp; ~300 words resolves it. The share of sentences with WER ≤ 0.10 is reported with every verdict |
+| C5 | use the **Seed-TTS-eval** speaker model (a fine-tuned WavLM-large SV), named on the record. The floor is **calibrated**, not absolute: the clone-vs-reference cosine must come near the cosine between two REAL recordings of the same person, and clearly above the cross-speaker cosine (Markus' clone against his wife's reference and the reverse). Until the real recordings exist, prove the method with CC stand-ins: two clips of one FLEURS speaker against another speaker |
+| B3 | the 1.2.0 use case is reading files aloud (batch); real time comes later. Floor: **RTF ≥ 1.0** (audio seconds per process second) on the sentence set. Time to first audio is recorded but not gated in 1.2.0; it becomes the gate of a later real-time milestone (community consensus: 200-300 ms TTFA with streaming) |
+| naturalness | no automatic gate: UTMOS is English-trained. The operator and his wife listen A/B against their own recordings |
+
+Sources (operator-provided, 2026-10-19): `github.com/BytedanceSpeech/
+seed-tts-eval` (the speaker model and its SIM metric); arXiv 2601.15621
+(Qwen3-TTS: German WER 1.235 at the 1.7B-12Hz); arXiv 2606.03455 (ground
+truth test-en WER 1.79, SIM-o 0.73 — the calibration anchor); arXiv
+2608.10606 (round-trip WER is a screening); arXiv 2605.26978 (the share of
+utterances with WER ≤ 10 %).
+
+The C4 sentence set (licence on record, §2's rule): `tools/tts_sentences_de.json`,
+46 unique German sentences of 5-10 words, **Tatoeba** (CC-BY 2.0 FR,
+attribution to Tatoeba and its contributors), drawn deterministically from the
+`deu_sentences.tsv.bz2` export (sha256 `ccd06372…`, 2026-10-17) with the
+selection rule recorded in the manifest; 303 words. The synthesized WAVs and
+the round-trip transcripts stay operator-local (the leg's record); the
+sentences themselves are public text, licence-clear, and committed.
 
 ## 7. Phases
 

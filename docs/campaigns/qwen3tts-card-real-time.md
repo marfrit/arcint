@@ -12,10 +12,11 @@ numbers; the hybrid stays the best arm. See the second measured section.
 
 ## Charter
 
-`docs/milestone-1.2.0.md` §6 B3: real-time factor (audio seconds per process
-second) at the fixed 8-sentence set, the first request separate; the card
-beats real time by a stated margin at the chosen quant. The measurement below
-was taken in the card arm that closed C4; it fails B3.
+`docs/milestone-1.2.0.md` §6 B3, floor operator-set (2026-10-19): real-time
+factor (audio seconds per process second) **>= 1.0** on the fixed sentence set
+(the enlarged ~300-word set, §6/D8; the 1.2.0 use case is reading files aloud,
+batch). The measurements below were taken on the earlier 8-sentence set and
+fail B3.
 
 Distinct from the closed `qwen3tts-german-genpath` (the Q8_0 mmproj's code
 predictor made German unintelligible and never stop): that defect is fixed
@@ -33,10 +34,15 @@ per-node profile. Evidence class: `code`.
 
 ## Gate
 
-B3, `measured-here`: the eight German sentences of the fixed set, one binary
-and model set, the round trip already green at the answer. The card's
-real-time factor at the fixed set beats real time (proposal, printed with
-every arm); the CPU arm of the same loop is the cross-check, and B1's
+B3, `measured-here`: one binary and model set, the round trip green at the
+answer. **Operator floor (D8, 2026-10-19): real-time factor >= 1.0** (audio
+seconds per process second) on the fixed sentence set — the 1.2.0 use case is
+reading files aloud (batch), and real time proper is a later milestone;
+time-to-first-audio is recorded but not gated. The C4 floor is now corpus
+round-trip WER <= 0.10 with no single sentence above 0.5 on the enlarged
+~300-word set (`docs/milestone-1.2.0.md` §6/D8); the campaign's own arms below
+stay measured on the earlier 8-sentence/66-word set at floor 0.20, kept as
+history. The CPU arm of the same loop is the cross-check, and B1's
 `GGML_OPENCL_PROFILING` per-node profile comes before any kernel work.
 
 ## Current state (measured-here, 2026-10-19, two windows)

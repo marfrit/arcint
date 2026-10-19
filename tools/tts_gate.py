@@ -6,8 +6,7 @@ There is no reference waveform: TTS is stochastic, and the honest answer-level
 gate for "does it say the words" is the STT round trip. Each fixed sentence is
 synthesized through `/v1/audio/speech` (OpenAI shape, `voice` a name from the
 server's enrolled list, D5), saved as WAV, transcribed by the STT unit, and
-scored word-error-rate against the written sentence. The corpus WER over the
-set is the gate. Voice similarity (C5) needs a named speaker-embedding model
+scored word-error-rate against the written sentence. The C4 floor (operator, D8 2026-10-19) is the **corpus WER <= 0.10 AND no single sentence above 0.5**; the verdict prints the corpus WER, the worst sentence and the share of sentences with WER <= 0.10. Voice similarity (C5) needs a named speaker-embedding model
 on the record; when `--embed-cmd` is given it is computed, otherwise it is
 reported as not measured (never omitted silently).
 
@@ -31,7 +30,8 @@ import subprocess
 import sys
 import urllib.request
 
-FLOOR_DEFAULT = 0.20   # corpus WER of the round trip (proposal, D8)
+FLOOR_DEFAULT = 0.10        # corpus round-trip WER (operator floor, D8, 2026-10-19)
+MAX_SENT_WER_DEFAULT = 0.5  # no single sentence above this (operator floor, D8)
 
 
 def norm_words(text):
@@ -121,7 +121,7 @@ def speech(args):
                "manifest": args.manifest, "voice": args.voice, "seed": args.seed,
                "sampling": {k: v for k, v in sampling.items() if v is not None},
                "tts_url": args.tts_url, "model": args.model, "lang": args.lang,
-               "floor": args.floor},
+               "floor": args.floor, "max_sentence_wer": args.max_sentence_wer},
               open(os.path.join(args.out, "speech.json"), "w"), indent=1)
     print("TTS speech phase: %d sentences -> %s" % (len(cases), args.out))
     return 0
@@ -135,6 +135,7 @@ def transcribe_phase(args):
     run beside each other on the same card, so a leg synthesizes first, stops
     the TTS server, then transcribes."""
     sp = json.load(open(os.path.join(args.speech, "speech.json")))
+    max_sent = sp.get("max_sentence_wer", MAX_SENT_WER_DEFAULT)
     cases, tot_d, tot_n = [], 0, 0
     for c in sp["cases"]:
         wav = open(c["wav"], "rb").read()
@@ -147,9 +148,13 @@ def transcribe_phase(args):
         print("wer %.3f  ref %-40s -> %s" % (w, c["text"][:40], hyp[:50]))
         sys.stdout.flush()
     corpus = tot_d / max(1, tot_n)
-    verdict = corpus <= sp["floor"]
+    worst = max((c["wer"] for c in cases), default=0.0)
+    le010 = sum(1 for c in cases if c["wer"] <= 0.10) / max(1, len(cases))
+    verdict = corpus <= sp["floor"] and worst <= max_sent
     result = {"n": len(cases), "corpus_wer": corpus, "errors": tot_d, "ref_words": tot_n,
-              "floor": sp["floor"], "verdict": "PASS" if verdict else "FAIL",
+              "floor": sp["floor"], "max_sentence_wer": max_sent,
+              "worst_sentence_wer": worst, "share_le_010": le010,
+              "verdict": "PASS" if verdict else "FAIL",
               "manifest_sha256": sp["manifest_sha256"], "voice": sp["voice"],
               "seed": sp["seed"], "cases": cases}
     if args.embed_cmd:
@@ -167,8 +172,9 @@ def transcribe_phase(args):
                "seed": sp["seed"], "floor": sp["floor"], "manifest": sp["manifest"],
                "manifest_sha256": sp["manifest_sha256"]},
               open(os.path.join(args.out, "arm.json"), "w"), indent=1)
-    print("TTS gate %s: round-trip corpus WER %.4f (floor %.4f)%s"
-          % (result["verdict"], corpus, sp["floor"],
+    print("TTS gate %s: round-trip corpus WER %.4f (floor %.4f), worst sentence %.3f "
+          "(bar %.3f), sentences WER<=0.10: %.1f%%%s"
+          % (result["verdict"], corpus, sp["floor"], worst, max_sent, 100 * le010,
              "; similarity not measured (no --embed-cmd)" if "similarity" not in result else
              " similarity %.3f" % result["similarity"]))
     return 0 if verdict else 1
@@ -190,9 +196,12 @@ def compare(args):
     if a.get("manifest_sha256") != b.get("manifest_sha256"):
         print("compare: different sentence lists", file=sys.stderr)
         return 2
-    ok = b["corpus_wer"] <= a["corpus_wer"]
-    print("reference: WER %.4f\ncandidate: WER %.4f %s"
-          % (a["corpus_wer"], b["corpus_wer"], "PASS" if ok else "FAIL"))
+    ok = (b["corpus_wer"] <= a["corpus_wer"]
+          and b.get("worst_sentence_wer", 0.0) <= a.get("worst_sentence_wer", 1.0))
+    print("reference: WER %.4f worst %.3f\ncandidate: WER %.4f worst %.3f %s"
+          % (a["corpus_wer"], a.get("worst_sentence_wer", 0.0),
+             b["corpus_wer"], b.get("worst_sentence_wer", 0.0),
+             "PASS" if ok else "FAIL"))
     return 0 if ok else 1
 
 
@@ -208,6 +217,7 @@ def main():
     r.add_argument("--manifest", required=True)
     r.add_argument("--out", required=True)
     r.add_argument("--floor", type=float, default=FLOOR_DEFAULT)
+    r.add_argument("--max-sentence-wer", type=float, default=MAX_SENT_WER_DEFAULT)
     r.add_argument("--seed", type=int, default=None)
     r.add_argument("--lang", default="de")
     r.add_argument("--embed-cmd", default="")
@@ -220,6 +230,7 @@ def main():
     s.add_argument("--manifest", required=True)
     s.add_argument("--out", required=True)
     s.add_argument("--floor", type=float, default=FLOOR_DEFAULT)
+    s.add_argument("--max-sentence-wer", type=float, default=MAX_SENT_WER_DEFAULT)
     s.add_argument("--seed", type=int, default=None)
     s.add_argument("--temperature", type=float, default=0.8)   # tts.cpp/common_params
     s.add_argument("--top-p", type=float, default=0.95)

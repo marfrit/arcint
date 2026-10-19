@@ -86,6 +86,8 @@ the audit's ranking (`research-reference-audit.md` §4).
 | [imggen-leaky-relu-esrgan](imggen-leaky-relu-esrgan.md) | **closed 2026-10-18**: 0060 adds `GGML_OP_LEAKY_RELU` (f32/f16, contiguous or strided) so sd.cpp's ESRGAN upscaler no longer falls to the CPU, where the split graph segfaulted; op suite 7/7 pass, red 7/7 FAIL, 512² -> 2048² in 27 s on the B60 (`measured-here`) | `ggml.c` `ggml_leaky_relu`; `unary_ext.cl` |
 | [qwen3tts-german-genpath](qwen3tts-german-genpath.md) | **closed 2026-10-19**: the Q8_0 `mmproj`'s code predictor `a.gen.code` owned the unintelligible-never-stop German; the fix is the bf16 mmproj with a Q8_0 backbone (2.52 GB); the card arm C4 PASS (WER 0.0455, floor 0.20, `codec_eos` at 46-69 frames); the real-time lever is the separate open campaign | upstream `tools/tts/tts.cpp`, `tools/mtmd/mtmd-helper-gen.cpp` at the pin; Qwen `Qwen/Qwen3-TTS-12Hz-1.7B-Base` |
 
+| [qwen3tts-voice-similarity](qwen3tts-voice-similarity.md) | opened 2026-10-19: C5's model is the Seed-TTS-eval WavLM-large+ECAPA-TDNN SV (`wavlm_large_finetune.pth`, sha256 `51f07e3b…`, mirrored `bezzam/wavlm_large_finetune_seed_tts_eval`, CC-BY-SA-3.0); `.pth` and zero-download, so it runs in a container; the reference's VoxCeleb anchors are same-speaker 0.60–0.69 vs different-speaker -0.17–0.18; the method is not measured yet | `microsoft/UniSpeech` `downstreams/speaker_verification`; `github.com/BytedanceSpeech/seed-tts-eval` |
+
 The OpenVINO engine's closed campaigns (the tier, the static partition, the
 host bank, the doorbell on the plugin, QSA, the u8:i4 KV) are listed in
 `docs/history.md` and kept at the tag `openvino-history`.
