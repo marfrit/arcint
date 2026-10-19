@@ -815,7 +815,12 @@ said), and the 503 bodies lost `reservation` and `kv_blocks_free`.
 - **The direct-submission fault**: the kernel-side ring-ordering fix
   (`drm/xe` "Order ring writes before ring tail updates") on the dev host is
   the operator's decision.
-- **Multimodal input**, an Anthropic Messages adapter and a local CLI: not
-  committed (`decision`, operator); the request parser rejects non-text
-  content parts. Image *output* is in scope since 1.1.0 (`decision`,
-  operator, 2026-10-18; §3.11).
+- **Multimodal input**, an Anthropic Messages adapter and a local CLI: the
+  non-goal is **void for 1.2.0** (`decision`, operator, 2026-10-19): vision
+  input, speech to text and text to speech with enrolled-voice cloning are
+  1.2.0's scope, on demand units on one card, the OpenAI `image_url` and
+  `/v1/audio/*` shapes (`docs/milestone-1.2.0.md`, `docs/speech-service.md`).
+  The request parser takes `image_url` parts when a multimodal projector is
+  loaded and rejects every other non-text part as before. An Anthropic
+  Messages adapter and a local CLI stay uncommitted. Image *output* has been
+  in scope since 1.1.0 (`decision`, operator, 2026-10-18; §3.11).

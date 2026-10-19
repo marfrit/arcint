@@ -162,15 +162,42 @@ struct PreparedCompletion {
     std::string       model;
 };
 
+// Everything a /v1/audio/speech request needs after its own validations: the
+// text, the enrolled voice name and the resolved sampler. No reference audio
+// is in it (D5).
+struct PreparedSpeech {
+    SpeechRequest req;
+    SpeechInput   input;
+    int           lane  = -1;
+    std::string   model;
+};
+
 // Everything that can be rejected happens here, before a single response byte
 // is committed — including the context-overflow 400 (§3.8).
 std::optional<HttpResult> prepare_chat(const Context& ctx, const nlohmann::json& body,
                                        PreparedChat& out);
 std::optional<HttpResult> prepare_completion(const Context& ctx, const nlohmann::json& body,
                                              PreparedCompletion& out);
+// /v1/audio/speech: the availability refusals ("this build has no TTS", no
+// mmproj, no gen half), the D5 refusal of any reference-audio field, the
+// unknown-voice 400 and the sampler.
+std::optional<HttpResult> prepare_speech(const Context& ctx, const nlohmann::json& body,
+                                         PreparedSpeech& out);
 
 HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot);
 HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, int slot);
+
+// What a speech request produced: the WAV bytes on success, an error envelope
+// otherwise (HTTP's envelope, not the backend's own error string).
+struct SpeechResult {
+    int               status = 200;
+    std::string       wav;
+    nlohmann::json    error;
+};
+SpeechResult run_speech(const Context& ctx, const PreparedSpeech& prep, int slot);
+
+// GET /v1/audio/voices: the enrolled names only (D5).
+nlohmann::json voices(const Context& ctx);
 
 void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
                  const SseWriter& write);

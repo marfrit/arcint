@@ -9,8 +9,8 @@ Tuning, off-switch, red-case and diagnostic switches are for measuring and
 may change or go without notice.
 
 A switch here is an environment variable read by arcint, by one of its tools,
-or by the llama.cpp patch series in `contrib/llama.cpp/patches` (0001-0058,
-without 0031 and 0055). Switches the pinned llama.cpp tree reads by itself
+or by the llama.cpp patch series in `contrib/llama.cpp/patches` (0001-0062,
+without the dropped 0031, 0055 and 0061). Switches the pinned llama.cpp tree reads by itself
 (`GGML_OPENCL_PLATFORM`, `GGML_OPENCL_FUSE_RMS_ADD`, `GGML_OPENCL_F16_MROW` and
 the others in upstream's `ggml-opencl.cpp`) are upstream's and not listed;
 a patch that only carries one in its context does not add it.
@@ -158,6 +158,7 @@ Four names are not in a table:
 | `LLAMA_EXPERT_CACHE_MUTATE` | 0 | `1` corrupts one landed slot; `2` leaves out the last changed row of a table write. | 0021 (`2` from 0046) | `1`: the swap check reports 1 of 6 (`measured-here`). |
 | `GGML_OPENCL_CPU_MISS_RED` | off | The CPU's rows left zero. | 0056 | KL 0.3700 -> 0.4364, top-1 84.4 -> 81.9 % (`measured-here`). |
 | `GGML_OPENCL_CPU_MISS_SPLIT_RED` | off | The slow path reads an IQ4_NL bank's split scales and quants as GGUF blocks (the defect fixed in 0.8.0). | 0056 | IQ3_XXS: a fault at the first request (`measured-here`). |
+| `MTMD_TTS_WAV_PAD` | off | Forces Qwen3-TTS's `GEN_WAV` graph and its input back to the padded 72-frame `wav_tfm_swa` window, the pre-patch behaviour. | 0062 | On the patch binary all 8 sentences are identical to the production padded arm (0.7285), where the default differs at <=191/32768 (0.8006) (`measured-here`). |
 
 ### Diagnostic
 

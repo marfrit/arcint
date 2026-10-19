@@ -48,6 +48,26 @@ struct ModelStatus {
     int         n_ctx_train  = 0;   // what the model was trained for
     int         n_layer      = 0;
     bool        mtp_enabled  = false;
+    // --mmproj loaded: the chat endpoint takes image_url parts (docs/
+    // milestone-1.2.0.md A2). The stub is false, so the suite's text-only
+    // refusal still exercises that branch.
+    bool        mmproj_loaded = false;
+    // The projector's own capabilities, from libmtmd's
+    // `mtmd_get_cap_from_file` (EXPERIMENTAL at the pin): whether its clip
+    // half takes images (`inp_vision`) and/or audio (`inp_audio`). /props
+    // reports them so the image path and the audio-generation path can be told
+    // apart from the projector alone, not only from --tts. False on the stub.
+    bool        mmproj_vision = false;
+    bool        mmproj_audio  = false;
+    // --tts and a mmproj whose gen half supports audio generation: the speech
+    // routes are served (docs/milestone-1.2.0.md A4). False on the stub and on
+    // a build without --tts, which is how the route refuses clearly.
+    bool        tts = false;
+    // The enrolled voices this process may serve, enabled entries only (D5),
+    // in the profile directory's name order. Names only — never a path, a
+    // reference or bytes, which is why /props carries the count and
+    // GET /v1/audio/voices the names.
+    std::vector<std::string> voices;
     bool        dflash_enabled = false;   // --llama-dflash-gguf: the DFlash2 drafter loaded
     int         dflash_drafts  = 0;       // its drafts a verify: --llama-dflash capped by its block
     uint64_t    weights_bytes = 0;
@@ -80,7 +100,24 @@ enum class FinishReason { Stop, Length, Abort };
 
 const char* finish_reason_name(FinishReason r);
 
+// One text-to-speech request, in the OpenAI /v1/audio/speech shape minus the
+// fields the API refuses (D5): no reference audio ever crosses this seam.
+// `voice` is an enrolled name (ModelStatus::voices); the backend resolves it
+// to its own server-side profile. `text` is what is spoken, `sampler` the
+// request's own sampling (temperature/top_p/top_k/seed/...), applied to the
+// backbone's codec-token sampling.
+struct SpeechInput {
+    std::string text;
+    std::string voice;
+    SamplerParams sampler;
+};
+
 struct GenerationInput {
+    // OpenAI image_url parts of this request, in the order their markers appear
+    // in `prompt` (`docs/milestone-1.2.0.md §3`). Empty on a text request; the
+    // backend's multimodal branch reads the bytes and encodes them.
+    std::vector<ImagePart> images;
+
     std::string   prompt;
     // When non-empty, THESE are the prompt and `prompt` is not tokenised
     // (CompletionRequest::prompt_ids; the KLD gate's replay of the reference
@@ -194,6 +231,20 @@ public:
     virtual FinishReason generate(const GenerationInput& in, int slot,
                                   const TokenCallback& on_piece, GenerationStats& stats) = 0;
 
+    // One enrolled voice's waveform for `in.text` (docs/milestone-1.2.0.md A4).
+    // `slot` is the lane. On success `wav` holds the container's bytes and
+    // `error` is empty; on refusal or failure `error` says why and `wav` is
+    // untouched. The container is named by the request's response_format
+    // (prepare_speech admits only WAV).
+    //
+    // The default refuses: a backend with no TTS (the stub) says so here; the
+    // route has already refused a build without --tts (prepare_speech).
+    virtual bool generate_speech(const SpeechInput& in, int slot, std::string& wav,
+                                 std::string& error, GenerationStats& stats) {
+        (void)in; (void)slot; (void)wav; (void)stats;
+        error = "this backend has no TTS";
+        return false;
+    }
 };
 
 // The stub's trained context: a plausible stand-in (the larger Qwen3 family's),

@@ -121,6 +121,45 @@ TEST(props_reports_the_served_file_and_what_the_backend_knows) {
     CHECK_EQ(j.at("cache").at("kv_dtype").get<std::string>(), std::string("q8_0:q4_0"));
 }
 
+// The projector's own halves: /props must report libmtmd's vision/audio caps,
+// so a client tells the image path from the audio-generation path without
+// reading the process's flags. A VLM mmproj carries vision, a TTS mmproj
+// audio; the stub is false/false.
+TEST(props_reports_the_projectors_own_halves) {
+    struct Case { bool vis; bool aud; };
+    for (const Case& c : {Case{true, false}, Case{false, true}, Case{false, false}}) {
+        FakeBackend backend;
+        backend.st.id            = "backbone.gguf";
+        backend.st.served_id     = backend.st.id;
+        backend.st.loaded        = true;
+        backend.st.mmproj_loaded = c.vis || c.aud;
+        backend.st.mmproj_vision = c.vis;
+        backend.st.mmproj_audio  = c.aud;
+
+        Config   cfg;
+        SlotPool slots(1);
+        Context  ctx{&cfg, &backend, &slots};
+
+        const nlohmann::json j = lgc::api::props(ctx);
+        CHECK_EQ(j.at("multimodal").at("backbone_loaded").get<bool>(), true);
+        CHECK_EQ(j.at("multimodal").at("mmproj_loaded").get<bool>(), c.vis || c.aud);
+        CHECK_EQ(j.at("multimodal").at("vision").get<bool>(), c.vis);
+        CHECK_EQ(j.at("multimodal").at("audio").get<bool>(), c.aud);
+    }
+}
+
+// The values come from libmtmd's own cap query, not from --tts or an
+// architecture name: the load site must call `mtmd_get_cap_from_file`.
+TEST(llama_backend_publishes_the_projectors_own_caps) {
+    std::ifstream in(std::string(ARCINT_SOURCE_DIR) + "/src/exec/backend_llama.cpp");
+    CHECK(in.good());
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const std::string src = ss.str();
+    CHECK(src.find("status_.mmproj_vision = mcap.inp_vision;") != std::string::npos);
+    CHECK(src.find("status_.mmproj_audio  = mcap.inp_audio;") != std::string::npos);
+}
+
 // --llama-dflash-gguf: /props says which drafter serves (one a context)
 TEST(props_reports_the_dflash_drafter) {
     {

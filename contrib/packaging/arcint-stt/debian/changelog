@@ -1,0 +1,11 @@
+arcint-stt (1.2.0-1) trixie; urgency=medium
+
+  * First package: whisper.cpp d1be6fde (v1.9.5) built against a ggml
+    installed from llama.cpp 3e4dfa8 with arcint's patches 0001-0062 through
+    contrib/whisper/build-whisper.sh (WHISPER_USE_SYSTEM_GGML, the Intel
+    kernels and the OpenCL backend). The server serves the OpenAI shape at
+    /v1/audio/transcriptions through its own --inference-path flag.
+    Installed as arcint-whisper (and arcint-whisper-cli); unit template
+    arcint-stt.service; the STT gate tool.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Mon, 19 Oct 2026 20:00:00 +0200

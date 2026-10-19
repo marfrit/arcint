@@ -506,9 +506,20 @@ json props(const Context& ctx) {
           {"git", ARCINT_GIT_SHA},
           {"type", ARCINT_BUILD_TYPE},
           {"compiler", ARCINT_COMPILER}}},
+        // The multimodal/audio presence: the backbone, the projector and its
+        // own halves (libmtmd's cap), the served TTS flag and the enrolled-voice
+        // count (names not required on /props by D5; GET /v1/audio/voices
+        // carries them). All describe what this server actually loaded.
+        {"multimodal",
+         {{"backbone_loaded", st.loaded && !st.stub},
+          {"mmproj_loaded", st.mmproj_loaded},
+          {"vision", st.mmproj_vision},
+          {"audio", st.mmproj_audio}}},
+        {"tts", st.tts},
+        {"voices", static_cast<int>(st.voices.size())},
         {"endpoints",
          json::array({"/health", "/props", "/v1/chat/completions", "/v1/completions",
-                      "/v1/models"})}};
+                      "/v1/models", "/v1/audio/speech", "/v1/audio/voices"})}};
     if (!ctx.lanes.empty()) {
         json lanes = json::array();
         for (const Lane& l : ctx.lanes) lanes.push_back(json{{"name", l.name}, {"n_ctx", l.n_ctx}, {"seq", l.seq}});
@@ -556,6 +567,16 @@ json models(const Context& ctx) {
         for (const Lane& l : ctx.lanes) data.push_back(entry(l.name, l.n_ctx, l.pool->total()));
     }
     return json{{"object", "list"}, {"data", std::move(data)}};
+}
+
+// -------------------------------------------------------- /v1/audio/voices
+json voices(const Context& ctx) {
+    // The enrolled names only, never a path or bytes (D5). Empty is normal: a
+    // server without --tts, or one whose profiles directory has no enabled
+    // entries yet. The list is a probe, not an admission gate.
+    json names = json::array();
+    for (const std::string& v : ctx.backend->status().voices) names.push_back(v);
+    return json{{"voices", std::move(names)}};
 }
 
 // ---------------------------------------------------------------- prepare
@@ -607,6 +628,18 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
                      req.model.c_str(), st.served_id.c_str());
     }
 
+    // An image part needs the multimodal projector. The parser accepts the
+    // part shape; this process admits it only when --mmproj loaded (docs/
+    // milestone-1.2.0.md A2), so a text-only server answers the same refusal
+    // it always did.
+    for (const ChatMessage& m : req.messages) {
+        if (m.images.empty()) continue;
+        if (!st.mmproj_loaded) {
+            return HttpResult{400, invalid_request("image_url parts need a multimodal projector "
+                                                    "(--mmproj; docs/milestone-1.2.0.md)")};
+        }
+    }
+
     PreparedChat prep;
     prep.req   = std::move(req);
     prep.lane  = lane;
@@ -641,6 +674,10 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
     if (auto err = finish_prepare(ctx, lane, prompt, prep.req.sampler, prep.input, prep.prompt_tokens)) {
         return err;
     }
+    // the media, in marker order across the whole request (the renderer put one
+    // marker per part into the prompt)
+    for (const ChatMessage& m : prep.req.messages)
+        for (const ImagePart& img : m.images) prep.input.images.push_back(img);
 
     prep.id      = next_id("chatcmpl");
     prep.created = now_seconds();
@@ -671,6 +708,75 @@ std::optional<HttpResult> prepare_completion(const Context& ctx, const json& bod
     prep.id      = next_id("cmpl");
     prep.created = now_seconds();
     out          = std::move(prep);
+    return std::nullopt;
+}
+
+std::optional<HttpResult> prepare_speech(const Context& ctx, const json& body, PreparedSpeech& out) {
+    if (!body.is_object()) return HttpResult{400, invalid_request("request body must be a JSON object")};
+
+    // D5, first: any reference-audio field is refused before the body is
+    // parsed. The enrolment route is the tool, not this endpoint, and the
+    // message says so rather than leaving a client to guess a field name.
+    static const char* const kReferenceFields[] = {
+        "reference_audio", "speaker_file", "sample_audio", "audio", "reference",
+        "voice_sample", "speaker_ref", "speaker_reference"};
+    for (const char* f : kReferenceFields) {
+        if (!body.contains(f)) continue;
+        return HttpResult{400, error_body(
+            log::format("'%s' is not accepted: voice cloning takes enrolled voices only. Enrol a voice "
+                        "with tools/tts_enrol.py (docs/speech-service.md D5), then ask for it by its "
+                        "name with `voice`; GET /v1/audio/voices lists the names this server serves.",
+                        f),
+            "invalid_request_error", "invalid_request_error", f)};
+    }
+
+    SpeechRequest req;
+    if (auto err = parse_speech_request(body, req)) return HttpResult{400, invalid_request(*err)};
+
+    int lane = -1;
+    if (auto err = resolve_lane(ctx, req.model, lane)) return err;
+
+    // The availability refusals, in the order a build would fail them. The
+    // process's own --tts is checked first, then the projector, so a text-only
+    // server answers the same clear "no TTS" it always would.
+    const ModelStatus& st = ctx.backend->status();
+    if (!ctx.cfg->tts)
+        return HttpResult{400, invalid_request("this build has no TTS: run with --tts and an "
+                                               "audio-generation --mmproj (docs/milestone-1.2.0.md D4)")};
+    if (!st.mmproj_loaded)
+        return HttpResult{400, invalid_request("the speech routes need an --mmproj with the "
+                                               "audio-generation half: this server loaded none")};
+    if (!st.tts)
+        return HttpResult{400, invalid_request("the loaded --mmproj carries no audio-generation half: "
+                                               "the speaker encoder and acoustic decoder are missing "
+                                               "(docs/milestone-1.2.0.md D4)")};
+
+    // The voice must be one the server enrolled (D5); the list is names only.
+    bool enrolled = false;
+    for (const std::string& v : st.voices) if (v == req.voice) { enrolled = true; break; }
+    if (!enrolled) {
+        std::string known;
+        for (const std::string& v : st.voices) known += (known.empty() ? "" : ", ") + v;
+        return HttpResult{400, invalid_request(log::format(
+            "The voice '%s' is not enrolled. This server serves %s (GET /v1/audio/voices). Enrol a "
+            "voice with tools/tts_enrol.py --name NAME --audio FILE --text FILE --profiles DIR "
+            "(docs/speech-service.md D5); the API never takes reference audio.",
+            req.voice.c_str(), known.empty() ? "no voices" : known.c_str()))};
+    }
+
+    PreparedSpeech prep;
+    prep.req   = std::move(req);
+    prep.lane  = lane;
+    prep.model = lane >= 0 ? ctx.lanes[static_cast<size_t>(lane)].name : st.served_id;
+
+    SamplerParams sampler = sampler_from_defaults(st.sampler_defaults);
+    if (auto err = sampler_apply(sampler, prep.req.sampler))
+        return HttpResult{400, invalid_request(*err)};
+    prep.input.text    = prep.req.text;
+    prep.input.voice   = prep.req.voice;
+    prep.input.sampler = std::move(sampler);
+
+    out = std::move(prep);
     return std::nullopt;
 }
 
@@ -738,6 +844,24 @@ HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, in
                                            {"finish_reason", finish_reason_name(reason)}}})},
                  {"usage", usage_json(stats)}};
     return HttpResult{200, std::move(body)};
+}
+
+// --------------------------------------------------------- speech synthesis
+SpeechResult run_speech(const Context& ctx, const PreparedSpeech& prep, int slot) {
+    GenerationStats stats;
+    std::string     wav;
+    std::string     err;
+    const bool ok = ctx.backend->generate_speech(prep.input, slot, wav, err, stats);
+    if (!ok) {
+        // Everything a client can get wrong was refused in prepare_speech, so
+        // a failure here is the server's: a profile file that vanished, a
+        // pipeline that refused the input, a decode error.
+        log::error(log::format("slot %d", slot), "speech '%s': %s", prep.input.voice.c_str(), err.c_str());
+        return SpeechResult{500, {}, error_body(err, "internal_error")};
+    }
+    log::info(log::format("slot %d", slot), "speech '%s': %d frames, %zu bytes WAV in %.2f s",
+              prep.input.voice.c_str(), stats.completion_tokens, wav.size(), stats.decode_seconds);
+    return SpeechResult{200, std::move(wav), json::object()};
 }
 
 // ----------------------------------------------------------------- streaming

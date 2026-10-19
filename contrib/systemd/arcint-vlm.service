@@ -1,0 +1,47 @@
+# arcint-vlm — image understanding (Qwen2.5-VL-7B, Apache-2.0) on the 24 GB
+# card, on demand: arcint's own /v1/chat/completions with the OpenAI
+# `image_url` content part, served by libmtmd inside the arcint binary (the
+# pin's GGML_MAX_NAME 64, one process; docs/milestone-1.2.0.md D2/§3,
+# docs/speech-service.md). The backbone is the language model and the mmproj
+# is the vision tower.
+#
+# Starting it stops the card's language and image units (same card,
+# Conflicts=). /health, /props; /props carries the mmproj/backbone state.
+# A remote http(s) image URL is refused 400 today; a data: URI and a local
+# file path are served.
+#
+# Measured (phase 0, B60, exactly this pair): the OpenCL device is named for
+# the mmproj graph (no CPU island), 1024² image slice 1716 ms, image batch
+# 314 ms, prefill 2.34 s, decode 67.1 t/s; peak VRAM 6445 MiB, physical host
+# MemAvailable ~55 GiB. The first request compiles the clip kernels and is
+# the slow one. Content check 4/4 on the fixed set (the generated WILLKOMMEN
+# lettering incl.; docs/milestone-1.2.0.md §9).
+
+[Unit]
+Description=arcint-vlm — Qwen2.5-VL-7B chat with image input, GPU.0 (Arc Pro B60), :8083, on demand
+Documentation=https://github.com/marfrit/arcint
+After=default.target
+Conflicts=arcint-agent.service arcint-writer.service arcint-flashnext.service arcint-agent-lanes.service arcint-imggen.service arcint-imggen-qwen.service arcint-imggen-flux.service arcint-tts.service arcint-stt.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/arcint \
+    --engine llama \
+    --gguf /models/vlm/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf \
+    --mmproj /models/vlm/mmproj-Qwen2.5-VL-7B-Instruct-Q8_0.gguf \
+    --served-model-name qwen2.5-vl-7b \
+    --device GPU.0 \
+    --host 0.0.0.0 --port 8083 \
+    --n-ctx 32768 --llama-kv q8_0:q4_0 --queue-timeout 30
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=10min
+TimeoutStopSec=60s
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectHome=read-only
+
+[Install]
+WantedBy=default.target

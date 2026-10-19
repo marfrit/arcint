@@ -174,6 +174,15 @@ public:
         return reason;
     }
 
+    // The stub loads no model and no projector: the route's own refusal has
+    // already fired for a build without --tts (prepare_speech), so this is the
+    // belt-and-braces answer for a caller that reached the seam directly.
+    bool generate_speech(const SpeechInput&, int, std::string&, std::string& error,
+                         GenerationStats&) override {
+        error = "this backend has no TTS: the stub loads no model";
+        return false;
+    }
+
 private:
     static Control emit_split(const std::string& piece, int id, const TokenCallback& on_piece) {
         const size_t cut = piece.size() / 2;
