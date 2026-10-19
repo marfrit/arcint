@@ -846,6 +846,29 @@ exist (`contrib/systemd/arcint-vlm.service`), `/props` publishes the
 mmproj/backbone state and the projector's own halves (§9.9), and the 1.2.0
 `arcint` package is the release phase's.
 
+### 9.11 The release check (pre-tag packages, 2026-10-19)
+
+The release review (a second model, `code`) found the image path reading
+any file named in `image_url`, a streamed bad image ending the process,
+image tokens passing the overflow rule, no image limits and whisper-server's
+`/load` open; they were fixed (§3's route table, `docs/speech-service.md`),
+and a second review of the fixes added the lane clear after a failed image
+prefill and the text path's overflow body for images and speech. The packages
+were then built from release-prep tarballs by their recipes (`arcint`
+1.2.0-1 with its unit ladder 6/6; `arcint-stt` 1.2.0-1) and measured on the
+dev host's cards, one process per card, the units restored after each
+window (`measured-here`):
+
+| item | value (`measured-here`) |
+|---|---|
+| A5/C7, the coder (A770, `ab.py`, 1.1.1 `ea908bdd…` against the pre-tag binary of `e5f6ff8`, two rounds) | **PASS**: decode 51.10 / 47.60 / 44.10 t/s on both arms, prefill at 41k 725.45 (1.1.1) against 725.20; the texts' md5 identical in every run of both arms; the acceptance task **9/10** (the deployed coder's score) |
+| A5/C7, the agent (B60, the same gate, the pre-tag binary of `59b3353`, sha256 `1b6f2e61…`) | **PASS**: prefill 709.35 / 498.90 t/s at 55k / 138k on both arms, the needle at 138k, the texts' md5 identical in every run; the acceptance task **10/10** |
+| C7, the KL arms | not run, by `code`: the llama.cpp trees of 1.1.1 and 1.2.0 differ only in three `tools/mtmd` files (0062), so ggml and libllama compile from identical sources and a `llama-perplexity` arm would compare the library with itself; the served greedy texts are byte-identical on both cards, the stronger check. Between the coder's binary (`e5f6ff8`) and the agent's (`59b3353`) only the multimodal and speech paths and the error mapping changed (`code`) |
+| C1/C2, the VLM gate on the package | **PASS 9/9** with whole-word matching; the same images with deliberately wrong expectations **FAIL 0/9** (the gate's red case on the real model) |
+| the image input fixes | on the package: a file path, 9 images, an unreadable image and a 5000×5000 image are 400 with the reason; a streamed bad image ends with an error event and `[DONE]`; text plus a 1024² image over a 2,048-cell lane is 400 `context_length_exceeded` (3,097 tokens); the lane answers "Paris" after every refusal and the process lives. **Red** (the v120 binary before the fixes, the same requests): the file path was opened and decoded (500), the streamed bad image ended the process |
+| A4/B3/C4, TTS on the package (the production set, `--tts-gen-device cpu`, `gate-fleurs`, seed 42, the D8 set) | **B3 PASS** RTF **1.1167** (182.960 s audio / 163.837 s process); **C4 PASS** corpus WER **0.0264**, worst 0.333, 89.1 % ≤ 0.10 (identical to §9.7; the round trip now through the card's STT); chat 400 naming the speech route; a 5,002-token text 400 `context_length_exceeded` |
+| A3/A6/C3, STT on the package (the B60) | `/props` names the model, `use_gpu`, the device "Intel(R) Arc(TM) Pro B60 Graphics" in use and the build string; `/load` 404 and the process alive; **C3 PASS** corpus WER **0.0547** (11 / 201), floor 0.08 (= §9.2) |
+
 ## 10. References
 
 - llama.cpp `3e4dfa8`: `tools/mtmd/{mtmd.h,mtmd.cpp,mtmd-image.cpp,
@@ -868,36 +891,32 @@ mmproj/backbone state and the projector's own halves (§9.9), and the 1.2.0
 - The 1.1.0 gate tool `tools/imggen_gate.py` (its parity check is the
   pattern for the three new gates) and `docs/milestone-1.1.0.md` §3.
 
-## 11. Release readiness (1.2.0, state 2026-10-19)
+## 11. Release readiness (1.2.0, final state 2026-10-19)
 
-Every §6 criterion with its measured verdict or the reason it is open. This
-is the checklist the release session works from; the release itself (push,
-tag, packages, fresh-container install, A/B) is that session's (D9).
+Every §6 criterion with its verdict at the release. The operator's decisions
+for the release (2026-10-19, `decision`): the hybrid TTS placement
+(`--tts-gen-device cpu`) accepted; the D8 floors (§6); C1's floor 1.0 on the
+fixed 9-question set; C5 stays METHOD PASS / FINAL OPEN until the household
+speakers' recordings exist (two per person, one held out as the same-speaker
+anchor), not a release blocker; naturalness by ear, later.
 
 | # | verdict | evidence / reason |
 |---|---|---|
-| A1 `libmtmd` in arcint at the pin, kernels present, `GGML_MAX_NAME` 64 | **PASS** | `code`+`measured-here`: built (§9.1, §9.10, the `mtmd` target, no `llama-common`); the gate binary named the OpenCL device for the mmproj graph |
-| A2 a VLM image request on the card, no op silently CPU | **PASS** | `measured-here` §9.10: 9/9; `GGML_SCHED_DEBUG=2` every node `[OpenC ]`, clip graph splits=1/1090, zero island |
-| A3 the whisper binary on the installed ggml, `/v1/audio/transcriptions`, a transcription on the card | **PASS** | `measured-here` §9.2: built with `WHISPER_USE_SYSTEM_GGML`; the route via `--inference-path`; the card named; non-empty transcripts; no decoder temperature fallback (`fallbacks = 0 p / 0 h`) |
-| A4 `/v1/audio/speech` on the card, the enrolled clone path, WAV out, the 400 refusals | **PASS** | `measured-here` §9.4, §9.7: WAV bytes; arbitrary-reference/unknown-voice 400; C4 PASS |
-| A5 the language services unchanged: the A/B vs the last release, acceptance ≥ 9/10 | **OPEN** | not re-run for 1.2.0 (owed at the release phase). By construction (`code`): 0062 touches only the TTS `GEN_WAV` graph and the generic gen-audio tail, no chat path builds it; the VLM/STT/TTS routes are separate processes. C7 rides with this |
-| A6 one unit, one package per binary, `/health`/`/props` | **PARTIAL, improved** | unit files exist (`contrib/systemd/arcint-{vlm,tts,stt}.service`), `/props` extended on the arcint binary (§9.9, §9.10); the new `arcint-stt` recipe is written and its pre-tag deb **builds** (1.2.0-1, `arcint-whisper` + `arcint-whisper-cli` + unit template + gate tool, kernel markers and ldd checked; not published, not installed); the 1.2.0 `arcint` deb is **owed** (its recipe needs the post-tag release-tarball sha); `arcint-whisper`'s `/props` is **owed** (it serves `/health`/`/load` only); no package PR (D9) |
-| B1 a profile per capability | **PASS (phase split) / a finer STT node profile optional** | VLM §9.10 (phase shares + op profile + no island); TTS §9.5/§9.7 (campaign `qwen3tts-card-real-time` closed); STT's criterion is the encode/decode split and §9.2 has it (encode 804.6 vs 3,553.5 ms, decode 2.11 vs 11.48, card named). No `CONV_1D` op needed a patch or a profile row: the encoder ran on the device, shown by its 4.4× over the CPU encoder on identical clips (§9.2, `measured-here`); a per-node placement dump of whisper's graphs was not taken |
-| B2 STT card faster than the CPU beyond the spread | **PASS** | `measured-here` §9.2: encode 4.4×, decode 5.4×, WER equal |
-| B3 TTS RTF ≥ 1.0 on the sentence set | **PASS** | `measured-here` §9.7: 1.1291 (pre) / 1.1597 (post) on the enlarged D8 set |
-| B4 VLM prefill/encode vs the CPU encoder | **PASS** | `measured-here` §9.10: the CPU encoder is 8-11× the card's on identical images; the CPU answers are the same; a separate CPU-only run |
-| C1 the VLM content check; the operator's threshold | **PASS at 1.0** | `measured-here` §9.10: 9/9 = 1.000, floor 1.0; the operator's floor is still unset |
-| C2 closes 1.1.0's content check (the WILLKOMMEN and the “Z-Image lettering”) | **PASS (WILLKOMMEN) / recorded gap** | `measured-here` §9.10: WILLKOMMEN (three generations) + object/colour/count right. The charter's “Z-Image lettering” has **no source image** in the 1.1.0/1.1.1 record (§9.10) — recorded, not hidden; the Z-Image case is its red cube |
-| C3 STT WER on the FLEURS `de` set: corpus ≤ 0.08 and card ≤ CPU + 0.005 | **PASS** | `measured-here` §9.2: card = CPU **0.0547**, corpus ≤ 0.08 |
-| C4 TTS round-trip WER ≤ 0.10 and no sentence > 0.5 | **PASS** | `measured-here` §9.7: corpus **0.0264**, worst **0.333**, share ≤ 0.10 **89.1 %** |
-| C5 voice similarity, the Seed-TTS-eval WavLM cosine, calibrated | **METHOD PASS / FINAL OPEN** | `measured-here` §9.8: the gate-voice clone-vs-reference mean **0.598** sits at the published same-speaker anchors and above the measured cross pair **0.262**; the calibration floor is the operator's real recordings (his own and his wife's) and is **owed** (D8) |
-| C6 a red case per new or changed kernel | **PASS for 0062 / vacuous for the VLM** | `measured-here` §9.5: the red `MTMD_TTS_WAV_PAD=1` restores the padded waveform (the test can fail); 0061 is dropped; the VLM added no kernel (§9.10); 0059/0060 were closed in 1.1.x |
-| C7 the language path's answers/KL unchanged | **OPEN (rides A5)** | `code`+`measured-here`: 0062's graph is not on any chat path; the served A/B and KL arms are owed with A5 |
-| naturalness, listened, no automatic gate | **OPEN** | operator ear against the real recordings, owed (D8) |
-| release mechanics: push, tag, packages, fresh container, A/B | **DEFERRED** | the release session's (D9); `tools/tts_gate.py` already carries `--embed-cmd` on `run`/`transcribe`, so every C4 arm can report the cosine once the reference WAV is handed to it (operator-local) |
-
-Open summary for the release phase: A5/C7 (the language A/B and KL), A6
-(the 1.2.0 `arcint` deb and the `arcint-stt` recipe), B1-STT (per-node
-profile), C5/naturalness (the operator's recordings), and the release
-mechanics. Everything measured is on the record in §9; nothing is pushed,
-tagged or packaged (D9).
+| A1 `libmtmd` in arcint at the pin, kernels present, `GGML_MAX_NAME` 64 | **PASS** | `code`+`measured-here`: built (§9.1, §9.10), and the release package by its recipe (§9.11) |
+| A2 a VLM image request on the card, no op silently CPU | **PASS** | `measured-here` §9.10 (schedule dump, zero island) and §9.11 (the package) |
+| A3 the whisper binary on the installed ggml, a transcription on the card | **PASS** | `measured-here` §9.2, §9.11 (the package names the B60 on `/props`) |
+| A4 `/v1/audio/speech` on the card, the enrolled clone path, the 400 refusals | **PASS** | `measured-here` §9.4, §9.7, §9.11 |
+| A5 the language services unchanged: the A/B against 1.1.1, the task ≥ 9/10 | **PASS** | `measured-here` §9.11: both A/Bs pass with byte-identical texts; the task 9/10 (coder) and 10/10 (agent) |
+| A6 one unit, one package per binary, `/health`/`/props` | **PASS** | `arcint` 1.2.0 (ships the vlm and tts unit templates and the enrolment tool) and `arcint-stt` 1.2.0 (`arcint-whisper` with `/props`); `measured-here` §9.11; the published packages and the fresh-container install are the release's own record (CHANGELOG) |
+| B1 a profile per capability | **PASS (phase split)** | VLM §9.10; TTS §9.5/§9.7; STT the encode/decode split §9.2 (a per-node dump of whisper's graphs was not taken) |
+| B2 STT card faster than the CPU | **PASS** | `measured-here` §9.2: encode 4.4×, decode 5.4×, WER equal |
+| B3 TTS RTF ≥ 1.0 on the sentence set | **PASS** | `measured-here` §9.7 (1.1291 / 1.1597), §9.11 on the package (1.1167) |
+| B4 VLM encode against the CPU encoder | **PASS** | `measured-here` §9.10: the CPU encoder 8-11× the card's |
+| C1 the VLM content check, floor 1.0 | **PASS** | `measured-here` §9.10, §9.11: 9/9, whole-word matching, red 0/9 |
+| C2 1.1.0's content check (WILLKOMMEN, the Z-Image lettering) | **PASS (WILLKOMMEN) / recorded gap** | §9.10: the Z-Image lettering has no source image in the record |
+| C3 STT WER ≤ 0.08 and card ≤ CPU + 0.005 | **PASS** | `measured-here` §9.2, §9.11: 0.0547 = CPU |
+| C4 TTS round-trip WER ≤ 0.10, no sentence > 0.5 | **PASS** | `measured-here` §9.7, §9.11: 0.0264, worst 0.333; the production mmproj's cost against the bf16 file is on record (§9.7) |
+| C5 voice similarity, calibrated | **METHOD PASS / FINAL OPEN** | `measured-here` §9.8: the clone 0.598 against the CC cross pair 0.262, just under the published same-speaker range (`paper`); the final calibration needs the household speakers' recordings (D8); not a release blocker (operator) |
+| C6 a red case per new or changed kernel | **PASS for 0062 / vacuous for the VLM** | `measured-here` §9.5; the VLM added no kernel |
+| C7 the language path's answers/KL unchanged | **PASS** | `measured-here` + `code` §9.11: byte-identical served texts on both cards; the KL arms would compare identical libraries |
+| naturalness, listened | **OPEN** | the operator's ear against the real recordings (D8), after the release |

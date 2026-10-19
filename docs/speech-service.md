@@ -130,7 +130,11 @@ Three rules, and they are absolute:
    each synthesized sentence round-tripped at WER 0.0000 (`measured-here`,
    milestone §9.4).
 4. **The two household speakers** record their own 10-30 s samples later; the
-   profile names and the recordings are entered with this tool. Until then the
+   profile names and the recordings are entered with this tool. Each records
+   **two** samples (operator, 2026-10-19): one is enrolled, the other stays a
+   held-out second recording of the same person, whose cosine against the
+   enrolled one is C5's same-speaker anchor (milestone §6 D8); both stay
+   operator-local. Until then the
    **gate voice** is one freely licensed German sample, staged on the card
    host and enrolled under a neutral name — the gate runs the *full clone
    path* on it, so the mechanism is proven before the real samples arrive. The

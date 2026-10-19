@@ -18,6 +18,62 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.2.0 — 2026-10-19
+
+Voice and vision (`docs/milestone-1.2.0.md`, the units' contract
+`docs/speech-service.md`): three on-demand units on the Arc Pro B60, each
+with `Conflicts=` against the card's language, image and other speech units.
+
+- **Vision input**, `arcint-vlm` on :8083: Qwen2.5-VL-7B-Instruct (Q4_K_M,
+  Q8_0 projector) through llama.cpp's `libmtmd`, now linked into arcint.
+  `/v1/chat/completions` takes OpenAI `image_url` parts as
+  `data:image/...;base64` URIs (a file path or a remote URL is 400), at most
+  8 images of at most 16.8 M pixels a request; an image prompt over the lane
+  is the usual 400 `context_length_exceeded`. `/props` reports the
+  projector's vision and audio halves.
+- **Text to speech with voice cloning**, `arcint-tts` on :8084: Qwen3-TTS
+  12Hz 1.7B Base, German. `--tts --tts-profiles DIR`; `/v1/audio/speech`
+  takes a voice **name** from the server's enrolled profiles
+  (`/v1/audio/voices`) and refuses any reference-audio field: a voice is
+  enrolled on the host with `tools/tts_enrol.py` (shipped in
+  `/usr/share/arcint/`), never through the API. `--tts-gen-device cpu`, the
+  unit's placement (operator's decision): the backbone on the card, the
+  projector's speaker encoder, code predictor and acoustic decoder on the
+  CPU. The production projector is Q8_0 with the code head and embedding at
+  f16. A TTS unit refuses chat with 400.
+- **Speech to text**, `arcint-stt` on :8091, the new package `arcint-stt`:
+  whisper.cpp v1.9.5's server (`arcint-whisper`) built against the ggml
+  installed from arcint's patched tree, Whisper large-v3-turbo,
+  `/v1/audio/transcriptions`; its patch adds `/props` (the model, the
+  decoding defaults, the GPU device in use, the build) and stops serving
+  upstream's `/load`.
+- **0062**, `libmtmd`'s Qwen3-TTS acoustic decoder decodes the frames it is
+  given instead of a padded 72-frame window (`tools/mtmd` only).
+- The arcint package ships the `arcint-vlm` and `arcint-tts` unit
+  templates beside `arcint.service`.
+
+**Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (59
+patches, 0001-0062 without 0031, 0055 and 0061), compiled in, with
+`libmtmd`; dependencies as in 0.8.0. `arcint-stt`: whisper.cpp `d1be6fde`
+on the same tree. `arcint-imggen` is unchanged (1.1.1).
+
+**Release check** (`measured-here`, 2026-10-19, the pre-tag packages;
+milestone §9.11): the release gate `tests/acceptance/ab.py` against 1.1.1's
+binary, alternated: the coder 51.10 / 47.60 / 44.10 t/s and 725.20 at 41k
+(1.1.1 the same decode, 725.45), the agent 709.35 / 498.90 t/s at 55k /
+138k (equal to 1.1.1), every answer right and the same bytes in every run of
+both binaries on both cards; the acceptance task 9/10 (coder) and 10/10
+(agent). No KL arm: the llama.cpp trees differ only in `tools/mtmd`. VLM
+gate 9/9 (floor 1.0, whole-word matching; its red, wrong expectations, 0/9);
+TTS real-time factor 1.1167 (floor 1.0) and round-trip WER 0.0264 (floor
+0.10, worst sentence 0.333, floor 0.5) on 46 Tatoeba sentences; STT WER
+0.0547 on 12 FLEURS `de` clips (floor 0.08, equal to the CPU run). The image
+input fixes against the pre-fix binary as their red: a file path in
+`image_url` was opened, a streamed bad image ended the process; on 1.2.0
+both are 400 / an error event, and the process serves on.
+Open after the release: the voice-similarity floor (C5) needs the household
+speakers' own recordings, two each; naturalness is judged by ear.
+
 ## 1.1.1 — 2026-10-18
 
 More image models (`docs/milestone-1.1.1.md`, the units' contract

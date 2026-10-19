@@ -25,6 +25,14 @@
 
 ## Status
 
+- Version 1.2.0 (2026-10-19): voice and vision (docs/milestone-1.2.0.md,
+  docs/speech-service.md), three on-demand units on the B60: arcint-vlm
+  :8083 (Qwen2.5-VL-7B, image_url data: URIs, --mmproj), arcint-tts :8084
+  (Qwen3-TTS 1.7B, German, enrolled voices only, --tts, the projector on the
+  CPU), arcint-stt :8091 (whisper.cpp's server on the same ggml, package
+  arcint-stt, /props). Patch 0062 (libmtmd's TTS decoder, valid frames).
+  Gates: VLM 9/9, TTS RTF 1.1167 and round-trip WER 0.0264, STT WER 0.0547;
+  the language services byte-identical to 1.1.1 on both cards.
 - Version 1.1.1 (2026-10-18): more image models (docs/milestone-1.1.1.md,
   docs/imggen-service.md): Qwen-Image (German lettering) on :8081, FLUX.2
   klein 4B with /v1/images/edits on :8082, ESRGAN 4x through

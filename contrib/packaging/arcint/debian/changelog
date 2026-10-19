@@ -6,8 +6,10 @@ arcint (1.2.0-1) trixie; urgency=medium
     speech with enrolled voices only (--tts, --tts-profiles,
     --tts-gen-device; /v1/audio/speech). The llama.cpp series gains 0062
     (libmtmd's Qwen3-TTS code2wav decodes only the valid frames); 59
-    patches. Speech to text is the new arcint-stt package. Dependencies
-    unchanged.
+    patches. image_url takes data: URIs only (8 images, 16.8 M pixels
+    each). The arcint-vlm and arcint-tts unit templates and tts_enrol.py
+    ship in /usr/share/arcint. Speech to text is the new arcint-stt
+    package. Dependencies unchanged.
 
  -- Markus Fritsche <mfritsche@reauktion.de>  Mon, 19 Oct 2026 20:00:00 +0200
 
