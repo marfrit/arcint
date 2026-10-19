@@ -30,6 +30,11 @@ model, the manifest's sha256, the floor). A manifest case is:
 The gate voice/format is the OpenAI chat `image_url` content part, which is
 what arcint's `/v1/chat/completions` takes (docs/milestone-1.2.0.md D2). Only
 the standard library is used.
+
+`expect` may be one substring or a list of accepted substrings (a count
+answer can be `["one", "1"]`); `image` resolves against the manifest's own
+directory, so the committed manifest carries only filenames and the images
+stay operator-local beside it (1.2.0 charter §4's rule).
 """
 import argparse
 import base64
@@ -93,6 +98,8 @@ def run(args):
     n_pass = 0
     for case in manifest:
         path = case["image"]
+        if not os.path.isabs(path):
+            path = os.path.join(os.path.dirname(os.path.abspath(args.manifest)), path)
         if not os.path.exists(path):
             print("case image missing: %s" % path, file=sys.stderr)
             return 2
@@ -104,7 +111,9 @@ def run(args):
         answer, dt, ptoks, ctoks = _ask(args.url, args.model, case["question"],
                                         uri, args.max_tokens, args.timeout)
         expect = case.get("expect", "")
-        hit = expect.lower() in answer.lower() if expect else True
+        alts = [expect] if isinstance(expect, str) else list(expect)
+        alts = [a for a in alts if a]
+        hit = any(a.lower() in answer.lower() for a in alts) if alts else True
         n_pass += hit
         cases.append({"image": path, "sha256": sha, "kind": case.get("kind", ""),
                       "question": case["question"], "expect": expect,
