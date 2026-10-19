@@ -505,14 +505,18 @@ curl -sN --max-time 40 "${LANES_BASE}/v1/chat/completions" -H 'Content-Type: app
   -d '{"model":"sub","messages":[{"role":"user","content":"x"}],"stream":true,"max_tokens":200}' \
   -o /dev/null >/dev/null 2>&1 &
 HOLD_PID=$!
-# up to 30 s for the held stream to take the lane: a loaded host (a parallel build) took longer than 5 s once
+# up to 30 s for the held stream to take the lane and the agent lane to be
+# free again: a loaded host (a parallel build) took longer than 5 s once, and
+# the 1.2.0 release build once caught the moment in between (the sub lane
+# held, the agent lane not yet reported free). The check still fails when the
+# state never arrives.
+LANES_STATE='d["slots_total"]==2 and d["slots_free"]==1 and [l["name"] for l in d["lanes"]]==["agent","sub"] and d["lanes"][0]["slots_free"]==1 and d["lanes"][1]["slots_free"]==0'
 for _ in $(seq 1 300); do
   curl -sS "${LANES_BASE}/health" -o "${WORK}/lanes-health.json"
-  jassert "${WORK}/lanes-health.json" 'd["lanes"][1]["slots_free"]==0' && break
+  jassert "${WORK}/lanes-health.json" "$LANES_STATE" && break
   sleep 0.1
 done
-jassert "${WORK}/lanes-health.json" \
-  'd["slots_total"]==2 and d["slots_free"]==1 and [l["name"] for l in d["lanes"]]==["agent","sub"] and d["lanes"][0]["slots_free"]==1 and d["lanes"][1]["slots_free"]==0'
+jassert "${WORK}/lanes-health.json" "$LANES_STATE"
 check "named lanes: /health reports each lane's free count" $?
 code=$(lanes_post /v1/chat/completions '{"model":"sub","messages":[{"role":"user","content":"hallo"}],"max_tokens":4}' "${WORK}/lanes-503.json")
 jassert "${WORK}/lanes-503.json" 'd["slots"]["lane"]=="sub" and d["slots"]["free"]==0 and [l["slots_free"] for l in d["lanes"]]==[1,0]'
