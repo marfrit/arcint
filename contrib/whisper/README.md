@@ -53,10 +53,29 @@ Steps the recipe takes:
    source at this pin), and that the model loads with `--device` named (a
    leg, not this recipe).
 
-What is **not** here: the `/v1/audio/transcriptions` route. whisper.cpp's own
-server examples serve `/inference`, not the OpenAI shape; a thin
-arcint-shaped wrapper or an arcint route is the service phase's work
-(`docs/speech-service.md`). The recipe only builds the engine.
+What is **not** here: the whisper server's `/props`. The
+`/v1/audio/transcriptions` route is **built** (2026-10-18, `measured-here`):
+whisper.cpp's own `whisper-server` serves it with
+`--inference-path /v1/audio/transcriptions` (an existing flag, no patch), and a
+plain `json` response_format returns `{"text":...}` in the OpenAI shape;
+`language` and `response_format` match (`docs/speech-service.md`, milestone
+§9.2). `/health` exists; **`/props` does not** — the server serves `/health`
+and `/load` only, so the service contract's `/props` fields are the service
+phase's owed work (`contrib/systemd/arcint-stt.service` says so).
+
+## The `.bin` loader path
+
+The whisper model is whisper.cpp's own `.bin` container, not a GGUF
+(milestone §2's risk). `whisper-server` loads it with `-m`/`--model FILE` via
+whisper.cpp's own loader (`whisper_init_from_file_with_params`; never arcint's
+GGUF engine), so the format check and the load error are whisper.cpp's. The
+service stages the file at an operator-local path (the measured one:
+`ggml-large-v3-turbo.bin`, 1.62 GiB, MIT-tagged `openai/whisper-large-v3-turbo`)
+and the unit passes `--model`; the `.bin` never goes through arcint's model
+gate or the mmproj path, which is a reason STT is a separate process
+(charter §3). Staging: the arcint engine takes safetensors/GGUF only; the STT
+model is the exception the charter names (`.bin`), and it stays
+operator-local.
 
 ## Why not `libmtmd`'s ASR instead
 

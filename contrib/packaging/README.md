@@ -11,8 +11,9 @@ repository; what is here is everything needed to build the same thing.
 The top-level `CHANGELOG.md` is the human record per release; the Debian
 changelog here is the package record.
 
-Kept in step by hand: every tagged release updates `arcint/build-deb.sh` and
-`arcint-imggen/build-deb.sh`
+Kept in step by hand: every tagged release updates `arcint/build-deb.sh`,
+`arcint-imggen/build-deb.sh` and
+`arcint-stt/build-deb.sh`
 (PKGVER, PKGREL, the release tarball's sha256; the llama.cpp commit and its
 tarball's sha256 when the pin moves) and the changelog here in the same
 breath. A stale recipe is a broken instruction, which is the one thing this
@@ -41,9 +42,14 @@ directory exists to prevent.
                             kernels in sd-server, the /props build string, ldd
                             resolution, no Vulkan
       debian/               control, copyright, changelog
-    arcint-stt/           (owed for 1.2.0) build-deb.sh for the whisper binary
-                          `arcint-whisper` from contrib/whisper/build-whisper.sh;
-                          no package PR in the 1.2.0 session (D9)
+    arcint-stt/           build-deb.sh for whisper.cpp's whisper-server as
+                          `arcint-whisper` from contrib/whisper/build-whisper.sh
+                          (the whisper.cpp and llama.cpp tarballs
+                          sha256-checked, arcint's patches applied); the
+                          pre-tag build takes ARCINT_SRC_TARBALL and warns
+                          without a release-tarball sha; no package PR in the
+                          1.2.0 session (D9). Built and verified in the 1.2.0
+                          session (the deb sha is in the handover)
 
 ## Two things worth knowing before you try
 

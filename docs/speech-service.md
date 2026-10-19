@@ -21,7 +21,7 @@ the operator fixes them.
 |---|---|---|---|---|
 | `arcint-vlm` | `/usr/bin/arcint` (`arcint` package) | `Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf` + `mmproj-...-Q8_0.gguf` | `/v1/chat/completions` with `image_url` | **built** (chat path + unit file; package and the `/props` multimodal fields owed) |
 | `arcint-tts` | `/usr/bin/arcint` (`arcint` package) | `Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` + **`mmproj-Qwen3-TTS-...-Q8_0-codeheadf16.gguf`** (the production set: requantized to Q8_0 with `gen.code.head`/`gen.code.embd` kept at f16; the official bf16 stays as fallback) | `POST /v1/audio/speech`, `GET /v1/audio/voices` | **built** (the `libmtmd` `gen_audio` path + routes + unit file; the unit takes `--tts-gen-device cpu`, the hybrid placement: the best measured TTS arm at 0.828 real-time factor, campaign `qwen3tts-card-real-time`); the first card gate **FAIL**ed on the Q8_0 mmproj (greedy WER 2.09, stochastic WER 2.1667, a 512-frame cap and no end-of-speech); `docs/campaigns/qwen3tts-german-genpath.md` (closed) isolated it to the mmproj's code predictor `a.gen.code` at Q8_0 and fixed it with a bf16 mmproj. The card arm at the fixed model (2026-10-19, `measured-here`) then moved to **C4 PASS** and **B3 PASS**: the production set (Q8_0 backbone + the `codeheadf16` mmproj, `--tts-gen-device cpu`) measures corpus round-trip WER **0.0264** (worst 0.333, 89.1 % <= 0.10) and **RTF 1.1291 / 1.1597** (before / after the card host's RAM upgrade) on the enlarged D8 set (46 sentences / 303 words, `codec_eos` sampled, no cap; `docs/campaigns/qwen3tts-card-real-time.md` lever (b), `measured-here`) |
-| `arcint-stt` | `/usr/bin/arcint-whisper` (`arcint-stt` package) | `ggml-large-v3-turbo.bin` (or `ggml-large-v3.bin`) | `POST /v1/audio/transcriptions` | **built** (whisper.cpp on the installed ggml, card gate PASS; unit file written; package and `/props` owed) |
+| `arcint-stt` | `/usr/bin/arcint-whisper` (`arcint-stt` package) | `ggml-large-v3-turbo.bin` (or `ggml-large-v3.bin`) | `POST /v1/audio/transcriptions` | **built** (whisper.cpp on the installed ggml, card gate PASS; unit file and the `arcint-stt` recipe written, the package builds; `arcint-whisper` serves `/health` and `/load` only — its `/props` is **owed**) |
 
 Ports (proposed; the operator fixes them): `arcint-vlm` 8083, `arcint-tts` 8084,
 `arcint-stt` 8091, beside 8080/8087 (language), 8081/8082/8085 (image),
@@ -78,11 +78,12 @@ any clip context on the card (`backend_llama.cpp` captures libmtmd's
 - `POST /v1/audio/transcriptions` — **built for STT** (whisper.cpp's own server served with `--inference-path /v1/audio/transcriptions`, so no route patch is needed: `file`, `language` and `response_format` match the OpenAI shape and a plain `json` returns `{"text":...}`). OpenAI multipart: `file`, `model`, `language`, `response_format` (`json`/`text`) → `{"text":...}`. German first (D3).
 - `GET /v1/audio/voices` — **built.** The enrolled names only; never a
   reference, never a path, never audio bytes (D5).
-- `GET /health` and `GET /props` — existing; landed: `multimodal` (backbone
+- `GET /health` and `GET /props` — existing on the two arcint binaries; landed: `multimodal` (backbone
   loaded, mmproj loaded, and the projector's own `vision`/`audio` halves from
   libmtmd's cap query, milestone §9.9), the `tts` flag and the enrolled-voice
-  **count** (names not required on `/props` by D5); the whisper binary reports
-  its own fields.
+  **count** (names not required on `/props` by D5). The whisper binary
+  (`arcint-whisper`) serves `/health` and `/load` only today; the STT `/props`
+  is the service phase's owed work (`contrib/whisper/README.md`).
 
 ## The enrolment (D5)
 

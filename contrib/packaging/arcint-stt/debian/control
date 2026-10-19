@@ -1,0 +1,16 @@
+Source: arcint-stt
+Section: sound
+Priority: optional
+Maintainer: Markus Fritsche <mfritsche@reauktion.de>
+Build-Depends: cmake (>= 3.20), ninja-build, g++ (>= 13), opencl-headers, ocl-icd-opencl-dev, git, python3
+Standards-Version: 4.6.2
+Homepage: https://github.com/marfrit/arcint
+
+Package: arcint-stt
+Architecture: amd64
+Depends: ${misc:Depends}, libc6 (>= 2.34), libstdc++6 (>= 13), libgomp1, ocl-icd-libopencl1
+Recommends: intel-opencl-icd
+Description: Speech to text on Intel Arc GPUs (whisper.cpp on arcint's ggml)
+ whisper.cpp's whisper-server built against a ggml installed from llama.cpp at
+ arcint's pin with arcint's Intel OpenCL kernels. The control file the recipe
+ writes is the authoritative one (build-deb.sh).
