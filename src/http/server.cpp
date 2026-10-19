@@ -162,9 +162,18 @@ void HttpServer::Impl::route() {
         res.set_chunked_content_provider(
             "text/event-stream",
             [this, prep, lease, slot](size_t, httplib::DataSink& sink) {
-                api::stream_chat(ctx, *prep, slot, [&sink](std::string_view data) {
-                    return sink.write(data.data(), data.size());
-                });
+                // The handlers turn a generation's exceptions into an error
+                // event; this is the last guard: nothing thrown here may leave
+                // httplib's worker thread, which would end the process.
+                try {
+                    api::stream_chat(ctx, *prep, slot, [&sink](std::string_view data) {
+                        return sink.write(data.data(), data.size());
+                    });
+                } catch (const std::exception& e) {
+                    log::error("http", "stream ended by an exception: %s", e.what());
+                } catch (...) {
+                    log::error("http", "%s", "stream ended by an unknown exception");
+                }
                 sink.done();
                 // httplib reads `false` as Error::Canceled and tears the
                 // connection down; the stream ended normally, so say so and let
@@ -200,9 +209,18 @@ void HttpServer::Impl::route() {
         res.set_chunked_content_provider(
             "text/event-stream",
             [this, prep, lease, slot](size_t, httplib::DataSink& sink) {
-                api::stream_completion(ctx, *prep, slot, [&sink](std::string_view data) {
-                    return sink.write(data.data(), data.size());
-                });
+                // The handlers turn a generation's exceptions into an error
+                // event; this is the last guard: nothing thrown here may leave
+                // httplib's worker thread, which would end the process.
+                try {
+                    api::stream_completion(ctx, *prep, slot, [&sink](std::string_view data) {
+                        return sink.write(data.data(), data.size());
+                    });
+                } catch (const std::exception& e) {
+                    log::error("http", "stream ended by an exception: %s", e.what());
+                } catch (...) {
+                    log::error("http", "%s", "stream ended by an unknown exception");
+                }
                 sink.done();
                 return true;
             });

@@ -377,7 +377,7 @@ the whole `gen.code` at bf16), not a new defect. B3 PASS closes this campaign.
 ## Where it lives
 
 - The loop: `src/exec/backend_llama.cpp` (`generate_speech`); upstream
-  `~/src/llama-port/tools/{tts,mtmd}`.
+  llama.cpp's `tools/{tts,mtmd}` at the pin `3e4dfa8`.
 - The backend coverage: `ggml/src/ggml-opencl/ggml-opencl.cpp`'s
   `supports_op`; the open classes above; `COL2IM_1D`/transposed conv is the
   milestone §5 prediction now measured on the card.

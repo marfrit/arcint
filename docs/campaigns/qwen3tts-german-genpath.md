@@ -46,7 +46,7 @@ sentences, seed 42, sampling t 0.8 / top_p 0.95 / top_k 40 / repetition 1.0,
   (`contrib/systemd/arcint-tts.service`).
 - The mixed Q8_0 file with `a.gen.code` at BF16 (0.56 GB, second option):
   `llama-quantize --pure --allow-requantize --tensor-type "gen\.code=bf16"`.
-- The gate `tools/tts_gate.py`; upstream `~/src/llama-port/tools/{tts,mtmd}`;
+- The gate `tools/tts_gate.py`; upstream llama.cpp's `tools/{tts,mtmd}` at the pin `3e4dfa8`;
   Qwen `Qwen/Qwen3-TTS-12Hz-1.7B-Base` config/generation_config/modeling code.
 - The model set and staging: `docs/milestone-1.2.0.md` §2/§9.3;
   `docs/speech-service.md`.

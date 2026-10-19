@@ -14,7 +14,7 @@ operator sets. The operator's floor (D8, 2026-10-19, operator-set): use the
 **Seed-TTS-eval** speaker model (fine-tuned WavLM-large SV), named on the
 record; the clone-vs-reference cosine must come near the cosine between two
 real recordings of the same person, and clearly above the cross-speaker cosine
-(the operator's own clone against his wife's reference and the reverse). Until
+(one household speaker's clone against the other's reference and the reverse). Until
 the real recordings exist, prove the method with CC stand-ins: two clips of one
 FLEURS speaker against another speaker.
 
@@ -50,8 +50,8 @@ ranges are the calibration anchors.
 reference's same-speaker anchors and clearly above the cross-speaker cosine;
 the clone-vs-reference cosine is reported with every C4 verdict through
 `tools/tts_gate.py --embed-cmd` (the embedding computation stays outside the
-gate as a one-number command). An absolute number only once the operator and
-his wife's real recordings exist.
+gate as a one-number command). An absolute number only once the two household
+speakers' real recordings exist.
 
 ## Current state (measured-here, 2026-10-19)
 

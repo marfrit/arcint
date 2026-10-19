@@ -15,6 +15,10 @@
 #ifdef ARCINT_MTMD
 #include <mtmd.h>
 #include <mtmd-helper.h>
+// stb_image's header-only probe, compiled into libmtmd (mtmd-helper.cpp defines
+// STB_IMAGE_IMPLEMENTATION, not STB_IMAGE_STATIC): the image's size from its
+// header, before anything is decoded.
+extern "C" int stbi_info_from_memory(unsigned char const* buffer, int len, int* x, int* y, int* comp);
 #endif
 
 #include <algorithm>
@@ -91,22 +95,18 @@ bool read_image_url(const std::string& url, std::vector<unsigned char>& out, std
         }
         return !out.empty();
     }
-    if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
-        err = "image_url: remote URLs are not served yet (a data: URI or a local path) ";
-        return false;
-    }
-    std::ifstream f(url, std::ios::binary);
-    if (!f) {
-        err = "image_url: cannot open " + url;
-        return false;
-    }
-    out.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
-    if (out.empty()) {
-        err = "image_url: " + url + " is empty";
-        return false;
-    }
-    return true;
+    // Only data: URIs. A local path would let any client of a unit that
+    // listens on the LAN read files of the host (and learn which exist), and a
+    // remote URL would make the server fetch for the client: both refused.
+    err = "image_url: only data:image/...;base64 URIs are served (no file paths, no remote URLs)";
+    return false;
 }
+
+// The image limits of one request: at most this many images, each at most
+// this many pixels by its header (read before the decode, so a small file
+// that inflates cannot exhaust the host's memory).
+constexpr size_t   kMaxImages      = 8;
+constexpr uint64_t kMaxImagePixels = 4096ull * 4096ull;
 
 // How many media markers the rendered prompt holds; mtmd_tokenize wants one
 // bitmap each, and a mismatch is the commonest client error.
@@ -724,7 +724,8 @@ public:
             // context takes one backend for all its halves (clip.cpp); the TTS
             // mmproj carries no vision half. "gpu" is the default.
             const bool cpu_request = cfg.tts && cfg.tts_gen_device == "cpu";
-            const bool forced_gpu = std::getenv("ARCINT_TTS_GEN_FORCE_GPU") != nullptr;
+            const char* force_env  = std::getenv("ARCINT_TTS_GEN_FORCE_GPU");
+            const bool  forced_gpu = force_env != nullptr && std::strcmp(force_env, "1") == 0;
             mtp.use_gpu       = !(cpu_request && !forced_gpu);
             mtp.print_timings = cfg.verbosity >= 1;
             mtmd_log_set(route_mtmd_log, nullptr);
@@ -1001,23 +1002,34 @@ public:
     // limitation; the language path is untouched).
     FinishReason generate_mm(const GenerationInput& in, int slot, const TokenCallback& on_piece,
                              GenerationStats& stats) {
-        if (mctx_ == nullptr) throw std::runtime_error("image parts without --mmproj");
+        if (mctx_ == nullptr) throw InputError("image parts without --mmproj");
         const int seq = std::min(std::max(slot, 0), lanes_ - 1);
         const int cap = cap_[static_cast<size_t>(seq)];
+        if (in.images.size() > kMaxImages)
+            throw InputError(log::format("%zu images; a request carries at most %zu", in.images.size(), kMaxImages));
 
-        // the bitmaps, in the order their markers appear
+        // the bitmaps, in the order their markers appear; freed on every exit
         std::vector<mtmd_bitmap*> bitmaps;
-        std::vector<mtmd_helper_bitmap_wrapper> wrappers;
+        struct BitmapsGuard {
+            std::vector<mtmd_bitmap*>& v;
+            ~BitmapsGuard() { for (mtmd_bitmap* b : v) mtmd_bitmap_free(b); }
+        } bitmaps_guard{bitmaps};
         for (const ImagePart& im : in.images) {
             std::vector<unsigned char> bytes;
             std::string                err;
-            if (!read_image_url(im.url, bytes, err)) throw std::runtime_error(err);
-            mtmd_helper_bitmap_wrapper w = mtmd_helper_bitmap_init_from_buf(
+            if (!read_image_url(im.url, bytes, err)) throw InputError(err);
+            int w = 0, h = 0, comp = 0;
+            if (bytes.size() > static_cast<size_t>(INT32_MAX) ||
+                stbi_info_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h, &comp) == 0)
+                throw InputError(log::format("image_url: not a readable image (%zu bytes)", bytes.size()));
+            if (w <= 0 || h <= 0 || static_cast<uint64_t>(w) * static_cast<uint64_t>(h) > kMaxImagePixels)
+                throw InputError(log::format("image_url: %d x %d pixels; at most %llu pixels an image",
+                                             w, h, static_cast<unsigned long long>(kMaxImagePixels)));
+            mtmd_helper_bitmap_wrapper wr = mtmd_helper_bitmap_init_from_buf(
                 mctx_, bytes.data(), bytes.size(), /*placeholder*/ false, mtmd_helper_init_opt_default());
-            if (w.bitmap == nullptr)
-                throw std::runtime_error(log::format("libmtmd could not decode the image (%zu bytes)", bytes.size()));
-            bitmaps.push_back(w.bitmap);
-            wrappers.push_back(w);   // its video_ctx is null: no --video input
+            if (wr.bitmap == nullptr)
+                throw InputError(log::format("libmtmd could not decode the image (%zu bytes)", bytes.size()));
+            bitmaps.push_back(wr.bitmap);   // its video_ctx is null: no --video input
         }
 
         mtmd_input_text text{ in.prompt.c_str(), in.prompt.size(), /*add_special*/ true, /*parse_special*/ true };
@@ -1026,17 +1038,18 @@ public:
         const int rc = mtmd_tokenize(mctx_, chunks, &text, bitmaps.data(), bitmaps.size());
         if (rc != 0) {
             mtmd_input_chunks_free(chunks);
-            for (mtmd_bitmap* b : bitmaps) mtmd_bitmap_free(b);
-            throw std::runtime_error(log::format("libmtmd tokenize failed (%d): %zu images against %zu markers in the prompt",
-                                                 rc, bitmaps.size(), marker_count(in.prompt)));
+            throw InputError(log::format("libmtmd tokenize failed (%d): %zu images against %zu markers in the prompt",
+                                         rc, bitmaps.size(), marker_count(in.prompt)));
         }
+        // Every token, text or image, takes a KV cell; the positions (M-RoPE
+        // counts an image by its grid, not its tokens) are fewer, so the lane's
+        // budget is the token count (DESIGN §3.8: refused, never truncated).
         const size_t n_tok = mtmd_helper_get_n_tokens(chunks);
         stats.prompt_tokens = static_cast<int>(n_tok);
         if (cap > 0 && static_cast<int>(n_tok) >= cap) {
             mtmd_input_chunks_free(chunks);
-            for (mtmd_bitmap* b : bitmaps) mtmd_bitmap_free(b);
-            log::warn("slot", "lane %d: %zu multimodal tokens do not fit n_ctx %d", seq, n_tok, cap);
-            return FinishReason::Length;
+            throw InputError(log::format("prompt is %zu tokens with its images, context is %d: %zu over. arcint does "
+                                         "not truncate or shift context.", n_tok, cap, n_tok - static_cast<size_t>(cap) + 1));
         }
 
         uint64_t seed = in.sampler.seed;
@@ -1057,17 +1070,16 @@ public:
             std::lock_guard<std::mutex> lk(mu_);
             llama_memory_seq_rm(llama_get_memory(ctx_), seq, -1, -1);
             have.clear();
+            ckpts_[static_cast<size_t>(seq)].clear();   // the lane's KV is gone, so are its checkpoints
             const int r = mtmd_helper_eval_chunks(mctx_, ctx_, chunks, 0, seq, n_batch_, /*logits_last*/ true, &n_past);
             if (r != 0) {
                 mtmd_input_chunks_free(chunks);
-                for (mtmd_bitmap* b : bitmaps) mtmd_bitmap_free(b);
                 throw std::runtime_error("mtmd_helper_eval_chunks failed");
             }
             copy_logits_locked(logits);
             have.assign(static_cast<size_t>(std::max<llama_pos>(n_past, 0)), 0);
         }
         mtmd_input_chunks_free(chunks);
-        for (mtmd_bitmap* b : bitmaps) mtmd_bitmap_free(b);
         stats.prefill_seconds = seconds_since(t_pre);
 
         const auto   t_decode = clock_type::now();
@@ -1082,7 +1094,7 @@ public:
                 reason = FinishReason::Length;
                 break;
             }
-            if (static_cast<int>(have.size()) + 1 >= cap) {
+            if (static_cast<int>(n_tok) + stats.completion_tokens + 1 >= cap) {   // cells, not positions
                 reason = FinishReason::Length;
                 break;
             }
@@ -1209,7 +1221,11 @@ public:
             return false;
         }
 
-        const int    max_frames = in.sampler.max_tokens >= 0 ? in.sampler.max_tokens : 512;
+        // A frame is a backbone token: the lane's context bounds it, whatever
+        // the client asked (a request past it would end in a decode failure).
+        const int    lane_cap   = cap_[static_cast<size_t>(std::min(std::max(slot, 0), lanes_ - 1))];
+        const int    asked      = in.sampler.max_tokens >= 0 ? in.sampler.max_tokens : 512;
+        const int    max_frames = lane_cap > 0 ? std::min(asked, lane_cap / 2) : asked;
         int          n_frames   = 0;
         bool         stop       = false;
         const float* h_next     = nullptr;

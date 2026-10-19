@@ -26,11 +26,13 @@ clips). Cosine, as upstream. See `THIRD_PARTY.md`.
 
 `stdin` reads the `cases` JSON that `tts_gate.py` pipes to `--embed-cmd` (a
 list of objects with a `wav` path), embeds the reference once and prints the
-mean cosine over the cases. `--model` defaults to the staged safetensors copy;
+mean cosine over the cases. `--model` (or `$ARCINT_SIM_MODEL`) is the staged
+safetensors copy of the speaker model, an operator-local path;
 `--config` is the backbone config (id or config.json path).
 """
 import argparse
 import json
+import os
 import struct
 import sys
 
@@ -41,7 +43,7 @@ import torch.nn.functional as F
 from safetensors.torch import load_file
 from transformers import WavLMConfig, WavLMModel
 
-DEFAULT_MODEL = "/models/.sim/wavlm_large_finetune_seed_tts_eval.safetensors"
+DEFAULT_MODEL = os.environ.get("ARCINT_SIM_MODEL", "")
 DEFAULT_CONFIG = "microsoft/wavlm-large"
 SR = 16000
 
@@ -311,6 +313,8 @@ def main():
         p.add_argument("--b", default="")
         p.add_argument("--wav", nargs="*", default=[])
     args = ap.parse_args()
+    if not args.model:
+        ap.error("--model (or $ARCINT_SIM_MODEL): the speaker model's safetensors copy")
     emb = Embedder(args.model, args.config, args.device)
     if args.cmd == "pair":
         sim = cosine(emb.embed(args.a), emb.embed(args.b))

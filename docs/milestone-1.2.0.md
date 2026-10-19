@@ -24,8 +24,8 @@ Intel kernels:
 3. **Text to speech with voice cloning (TTS)** — German first, OpenAI
    `/v1/audio/speech`; candidates evaluated at source and by licence, with
    the operator's enrolment rules (arbitrary reference audio is refused).
-   Markus and his wife will record their own reference samples later (about
-   10-30 s each); until then build and gate with a freely licensed sample
+   The operator and a second household speaker will record their own
+   reference samples later (about 10-30 s each); until then build and gate with a freely licensed sample
    voice and document exactly how a new voice is enrolled.
 
 The 1.2.0 line is a **revision of DESIGN §8.8**: the "multimodal input is not
@@ -41,7 +41,7 @@ image input, audio input and audio output and widens "inference server" to
 The starting thesis (external, 2026-10-18): llama.cpp's multimodal library
 (`libmtmd`) is the reference for both vision input and audio generation, and
 the pinned tree already carries it. Checked against the source at the pin
-`3e4dfa8` (`~/src/llama-port`):
+`3e4dfa8`:
 
 | thesis | finding | class |
 |---|---|---|
@@ -208,7 +208,7 @@ whole (`Conflicts=`), as the image units do.
   host **outside the repository**: `reference.wav` (a 10-30 s clean
   recording), its `reference.txt` transcript, and a `profile.json` with the
   name, language and provenance. The default list holds only the freely
-  licensed gate voice until Markus and his wife record theirs.
+  licensed gate voice until the two household speakers record theirs.
 - **The API never takes a reference.** `/v1/audio/speech` accepts `voice` as
   a **name from the server's list**; any `reference_audio`, `speaker_file`,
   `voice_sample`, `audio` or equivalent field is refused with 400 and a
@@ -224,7 +224,7 @@ whole (`Conflicts=`), as the image units do.
   profile into the card host's profile directory and validates the sample
   (length, sample rate, non-silence). The service manual (a new
   `docs/speech-service.md`) carries the exact steps, including the "clone two
-  voices: Markus and his wife" end state.
+  voices: the two household speakers" end state.
 - **The gate voice is freely licensed:** one short German sample from a
   public, licence-clear source (recorded provenance and licence in the
   service doc; the audio itself staged outside the repo). The gate runs the
@@ -307,7 +307,7 @@ the new gates are new tools (`tools/vlm_gate.py`, `tools/stt_gate.py`,
 inputs differ, as `imggen_gate.py`'s parity check does. Gate comparisons use
 identical inputs (the rule learned in `imggen-attention-path`).
 
-### D8 — the operator's floors (operator-set, Markus 2026-10-19)
+### D8 — the operator's floors (operator-set, 2026-10-19)
 
 The operator set the gate numbers from the community consensus the session
 researched. The §6 rows above carry them; the former "proposal, D8" labels in
@@ -318,9 +318,9 @@ are `decision` (operator); the cited sources are `paper`.
 |---|---|
 | C3 | corpus WER ≤ 0.08 on the FLEURS `de` set, **and** the card ≤ the CPU's WER + 0.005 (the comparison unchanged from §9.2) |
 | C4 | corpus round-trip WER ≤ 0.10, **and no single sentence above 0.5**, on the enlarged sentence set (~300 words). One error in the old 66 words was 1.5 pp; ~300 words resolves it. The share of sentences with WER ≤ 0.10 is reported with every verdict |
-| C5 | use the **Seed-TTS-eval** speaker model (a fine-tuned WavLM-large SV), named on the record. The floor is **calibrated**, not absolute: the clone-vs-reference cosine must come near the cosine between two REAL recordings of the same person, and clearly above the cross-speaker cosine (Markus' clone against his wife's reference and the reverse). Until the real recordings exist, prove the method with CC stand-ins: two clips of one FLEURS speaker against another speaker |
+| C5 | use the **Seed-TTS-eval** speaker model (a fine-tuned WavLM-large SV), named on the record. The floor is **calibrated**, not absolute: the clone-vs-reference cosine must come near the cosine between two REAL recordings of the same person, and clearly above the cross-speaker cosine (one household speaker's clone against the other's reference and the reverse). Until the real recordings exist, prove the method with CC stand-ins: two clips of one FLEURS speaker against another speaker |
 | B3 | the 1.2.0 use case is reading files aloud (batch); real time comes later. Floor: **RTF ≥ 1.0** (audio seconds per process second) on the sentence set. Time to first audio is recorded but not gated in 1.2.0; it becomes the gate of a later real-time milestone (community consensus: 200-300 ms TTFA with streaming) |
-| naturalness | no automatic gate: UTMOS is English-trained. The operator and his wife listen A/B against their own recordings |
+| naturalness | no automatic gate: UTMOS is English-trained. The two household speakers listen A/B against their own recordings |
 
 Sources (operator-provided, 2026-10-19): `github.com/BytedanceSpeech/
 seed-tts-eval` (the speaker model and its SIM metric); arXiv 2601.15621
@@ -426,7 +426,7 @@ compile record; the red case is **vacuous** because no VLM kernel was added or
 changed (the profile found no CPU island and no patch was needed); the
 endpoint's package/probe completion stays owed.
 
-**RESOLVED (2026-10-18 evening, operator):** Markus power-cycled the card
+**RESOLVED (2026-10-18 evening, operator):** the operator power-cycled the card
 host after the §9.1 `xe` oops; the host, the guests and the production units
 are back (the B60's language unit active again, the A770's coder active, the
 image front idle). The cause was three processes on the B60 at once: the dev
@@ -574,7 +574,7 @@ path on `gate-fleurs` (FLEURS `de_de`, CC-BY-4.0) through
 | A4/D5 | the route returns WAV; `reference_audio`, `speaker_file` and an unknown voice are all 400; `/v1/audio/voices` lists 4 names (record through the leg) |
 | C4 (the gate) | **PASS**: round-trip corpus WER **0.0455** (3 errors / 66 ref words), floor 0.20; `codec_eos` sampled, 46–69 frames per sentence, no cap |
 | B3 | **FAIL**: 36.48 s audio / 141.38 s process = **real-time factor 0.258**; the same loop on the CPU is 0.233, so the card is no faster — the gen graph's 947 splits and f32 CPU islands own it (campaign `qwen3tts-card-real-time`) |
-| enrolment proof (D5 end to end) | `tools/tts_enrol.py` enrolled the FLEURS stand-ins `markus-test` (10.0 s) and `frau-test` (10.8 s) into the operator-local profile dir; the server served them as names; one sentence each synthesized and round-tripped at WER **0.0000** |
+| enrolment proof (D5 end to end) | `tools/tts_enrol.py` enrolled two FLEURS stand-ins (10.0 s and 10.8 s; profile names operator-local) into the operator-local profile dir; the server served them as names; one sentence each synthesized and round-tripped at WER **0.0000** |
 | window hygiene | sampler on the physical host, leg aborts on a stale sampler log; non-service holder check before every card step; agent stopped by its unit and restored, `:8087` verified; one non-service process per card; dev servers killed by pid |
 
 The C4 reversal against §9.3's earlier FAIL confirms the campaign fix; B3 was

@@ -18,7 +18,9 @@ time, and a vendored ggml would not.
   place.
 - `<llama-tree>`: llama.cpp at arcint's pin `3e4dfa8` **with the series
   applied** (`contrib/llama.cpp/patches/*`). The recipe refuses one without
-  arcint's kernels or without `GGML_OPENCL`.
+  arcint's kernels, one without 0058's q8_0 XMX GEMM (an older cut of the
+  series), and a git tree that does not descend from the pin; a tarball tree
+  has no history to check.
 - `<build-dir>`: holds `llama/` (the ggml source build), `ggml-prefix/` (its
   install), `whisper-src/` (the pristine export) and `whisper/` (the built
   binary).
@@ -60,9 +62,10 @@ plain `json` response_format returns `{"text":...}` in the OpenAI shape;
 `language` and `response_format` match (`docs/speech-service.md`, milestone
 §9.2).
 
-**`server-props.patch`** (1.2.0, `examples/server/`): `GET /props`, which
-whisper-server lacked (it served `/health` and `/load` only). It reports the
-loaded model's file name (kept in step with `/load`), whether it is ready,
+**`server-props.patch`** (1.2.0, `examples/server/`) makes two changes.
+
+`GET /props`, which whisper-server lacked (it served `/health` and `/load`
+only). It reports the model's file name (the unit's `-m`), whether it is ready,
 the language, the inference path, threads, beam size and best-of, the GPU and
 flash-attention flags, ggml's GPU devices (name and description, the one in
 use marked) and the build string (`ARCINT_BUILD`, set by the recipe).
@@ -70,6 +73,16 @@ use marked) and the build string (`ARCINT_BUILD`, set by the recipe).
 without the build string. Red first (`measured-here`, a CPU-only build of the
 pin with `ggml-tiny.bin`): the unpatched server answers `/props` with 404, the
 patched one with 200 and the fields above.
+
+`POST /load` is no longer served: it answers 404, like any unknown path
+(the server's error handler maps every status but 400 and 500 to 404).
+Upstream it loads any path on the host that a client names, leaves the state
+at "loading" when the path is missing, and calls `exit(1)` when the file is
+not a model, so one request from the network could end the unit. Red first
+(`measured-here`, the same CPU build): on the unpatched server `/load` with
+`model=/etc/passwd` ended the process. On the patched one it answers 404,
+the process stays up, `/health` is ok and `/inference` still transcribes. The
+unit names its model with `-m`; another model is another unit.
 
 ## The `.bin` loader path
 

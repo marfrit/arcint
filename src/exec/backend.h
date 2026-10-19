@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -49,8 +50,8 @@ struct ModelStatus {
     int         n_layer      = 0;
     bool        mtp_enabled  = false;
     // --mmproj loaded: the chat endpoint takes image_url parts (docs/
-    // milestone-1.2.0.md A2). The stub is false, so the suite's text-only
-    // refusal still exercises that branch.
+    // milestone-1.2.0.md A2). The stub is false, so tests/roundtrip.sh's
+    // text-only refusal exercises that branch.
     bool        mmproj_loaded = false;
     // The projector's own capabilities, from libmtmd's
     // `mtmd_get_cap_from_file` (EXPERIMENTAL at the pin): whether its clip
@@ -110,6 +111,14 @@ struct SpeechInput {
     std::string text;
     std::string voice;
     SamplerParams sampler;
+};
+
+// A request the backend cannot serve because of its own content (an image it
+// cannot read or decode, too many or too large images, a prompt that with its
+// image tokens exceeds the lane): the handlers answer it with 400, every other
+// exception from generate() with 500. Thrown before any token is emitted.
+struct InputError : std::runtime_error {
+    using std::runtime_error::runtime_error;
 };
 
 struct GenerationInput {

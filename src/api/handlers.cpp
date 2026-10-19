@@ -1,6 +1,8 @@
 #include "api/handlers.h"
 
 #include <stdexcept>
+#include <optional>
+#include <functional>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -639,6 +641,12 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
                                                     "(--mmproj; docs/milestone-1.2.0.md)")};
         }
     }
+    // A speech unit's talker emits codec tokens, not text: a chat answer from
+    // it would be noise with a 200 (docs/milestone-1.2.0.md A4).
+    if (st.tts) {
+        return HttpResult{400, invalid_request("this unit serves speech (--tts): POST /v1/audio/speech; "
+                                               "chat completions are not served here")};
+    }
 
     PreparedChat prep;
     prep.req   = std::move(req);
@@ -694,6 +702,10 @@ std::optional<HttpResult> prepare_completion(const Context& ctx, const json& bod
 
     int lane = -1;
     if (auto err = resolve_lane(ctx, req.model, lane)) return err;
+    if (ctx.backend->status().tts) {
+        return HttpResult{400, invalid_request("this unit serves speech (--tts): POST /v1/audio/speech; "
+                                               "completions are not served here")};
+    }
 
     PreparedCompletion prep;
     prep.req   = std::move(req);
@@ -781,12 +793,33 @@ std::optional<HttpResult> prepare_speech(const Context& ctx, const json& body, P
 }
 
 // ------------------------------------------------------------- non-streaming
+// A generation's exceptions as an answer: the backend's InputError (the
+// request's own content: an image it cannot read, too many or too large
+// images, a prompt over the lane with its image tokens) is the client's 400,
+// anything else a 500. Without this an exception thrown while a streamed body
+// runs would leave httplib's worker and end the process.
+static std::optional<HttpResult> guarded(const std::function<void()>& run) {
+    try {
+        run();
+    } catch (const InputError& e) {
+        log::warn("req", "refused: %s", e.what());
+        return HttpResult{400, invalid_request(e.what(), "messages")};
+    } catch (const std::exception& e) {
+        log::error("req", "generation failed: %s", e.what());
+        return HttpResult{500, error_body(e.what(), "server_error")};
+    }
+    return std::nullopt;
+}
+
 HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     GenerationStats stats;
     std::string     raw;
-    const FinishReason reason =
-        drive(*ctx.backend, prep.input, slot,
-              [](std::string_view, const std::string&) { return true; }, stats, raw);
+    FinishReason reason = FinishReason::Stop;
+    if (auto err = guarded([&] {
+            reason = drive(*ctx.backend, prep.input, slot,
+                           [](std::string_view, const std::string&) { return true; }, stats, raw);
+        }))
+        return *err;
     log_stats(slot, stats, reason);
 
     const ReasoningSplit  split   = split_reasoning(raw, prep.think_open, prep.think_tags_extended);
@@ -827,9 +860,12 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
 HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, int slot) {
     GenerationStats stats;
     std::string     raw;
-    const FinishReason reason =
-        drive(*ctx.backend, prep.input, slot,
-              [](std::string_view, const std::string&) { return true; }, stats, raw);
+    FinishReason reason = FinishReason::Stop;
+    if (auto err = guarded([&] {
+            reason = drive(*ctx.backend, prep.input, slot,
+                           [](std::string_view, const std::string&) { return true; }, stats, raw);
+        }))
+        return *err;
     log_stats(slot, stats, reason);
 
     const std::string text = prep.req.echo ? prep.req.prompt + raw : raw;
@@ -910,7 +946,8 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     };
 
     GenerationStats stats;
-    const FinishReason reason = drive(
+    FinishReason reason = FinishReason::Stop;
+    if (auto err = guarded([&] { reason = drive(
         *ctx.backend, prep.input, slot,
         [&](std::string_view piece, const std::string&) -> bool {
             const ReasoningStreamer::Step step = reasoning.push(piece);
@@ -955,7 +992,12 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
             }
             return true;
         },
-        stats, raw);
+        stats, raw); })) {
+        // the 200 and the first chunk are out: the error goes in the stream
+        sse_send(write, err->body);
+        write("data: [DONE]\n\n");
+        return;
+    }
 
     log_stats(slot, stats, reason);
     if (gone) return;
@@ -1039,7 +1081,8 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep, int s
 
     GenerationStats stats;
     std::string     raw;
-    const FinishReason reason = drive(
+    FinishReason reason = FinishReason::Stop;
+    if (auto err = guarded([&] { reason = drive(
         *ctx.backend, prep.input, slot,
         [&](std::string_view piece, const std::string&) -> bool {
             const std::string safe = utf8_stream.push(piece);
@@ -1053,7 +1096,12 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep, int s
             }
             return true;
         },
-        stats, raw);
+        stats, raw); })) {
+        // the 200 and the first chunk are out: the error goes in the stream
+        sse_send(write, err->body);
+        write("data: [DONE]\n\n");
+        return;
+    }
 
     log_stats(slot, stats, reason);
     if (gone) return;

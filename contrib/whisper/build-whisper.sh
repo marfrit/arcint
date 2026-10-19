@@ -31,6 +31,16 @@ fi
 if [ ! -e "$LLAMA_TREE/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl" ]; then
   echo "$LLAMA_TREE lacks contrib/llama.cpp/patches (the Intel kernels)" >&2; exit 2
 fi
+# the series as arcint ships it, not an older cut of it: 0058's q8_0 XMX GEMM
+if ! grep -q 'kernel_mul_mm_q8_0_f16' "$LLAMA_TREE/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl" 2>/dev/null; then
+  echo "$LLAMA_TREE lacks the q8_0 XMX GEMM (patch 0058): an older series" >&2; exit 2
+fi
+# a git tree (a worktree's .git is a file) must sit on the pin; a tarball tree
+# has no history to check
+if [ -e "$LLAMA_TREE/.git" ]; then
+  git -C "$LLAMA_TREE" merge-base --is-ancestor "$LLAMA_COMMIT" HEAD \
+    || { echo "$LLAMA_TREE is not at/after the pin $LLAMA_COMMIT" >&2; exit 2; }
+fi
 
 mkdir -p "$BUILD"
 LLAMA_BUILD="$BUILD/llama"

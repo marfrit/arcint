@@ -12,7 +12,7 @@ index c082546..b95c34c 100644
 +    target_compile_definitions(${TARGET} PRIVATE ARCINT_BUILD="${ARCINT_BUILD}")
 +endif()
 diff --git a/examples/server/server.cpp b/examples/server/server.cpp
-index b745f4d..fb16efd 100644
+index b745f4d..70f77a8 100644
 --- a/examples/server/server.cpp
 +++ b/examples/server/server.cpp
 @@ -4,6 +4,7 @@
@@ -23,25 +23,24 @@ index b745f4d..fb16efd 100644
  
  #include <cfloat>
  #include <chrono>
-@@ -1172,6 +1173,9 @@ int main(int argc, char ** argv) {
+@@ -1172,7 +1173,15 @@ int main(int argc, char ** argv) {
                              "application/json");
          }
      });
-+    // arcint (contrib/whisper/server-props.patch): the model /props reports,
-+    // kept in step with /load.
-+    std::string props_model = params.model;
-     svr->Post(sparams.request_path + "/load", [&](const Request &req, Response &res){
+-    svr->Post(sparams.request_path + "/load", [&](const Request &req, Response &res){
++    // arcint (contrib/whisper/server-props.patch): the model /props reports.
++    const std::string props_model = params.model;
++    // arcint: /load is not served (404, as any unknown path). Upstream it
++    // loads any path on the host a client names, leaves the state at
++    // "loading" when the path is missing, and exits the process when the file
++    // is not a model. The unit names its model with -m; another model is
++    // another unit. The upstream handler stays, never registered, so the
++    // patch stays small.
++    if (false) svr->Post(sparams.request_path + "/load", [&](const Request &req, Response &res){
          std::lock_guard<std::mutex> lock(whisper_mutex);
          state.store(SERVER_STATE_LOADING_MODEL);
-@@ -1208,6 +1212,7 @@ int main(int argc, char ** argv) {
-         // initialize openvino encoder. this has no effect on whisper.cpp builds that don't have OpenVINO configured
-         whisper_ctx_init_openvino_encoder(ctx, nullptr, params.openvino_encode_device.c_str(), nullptr);
- 
-+        props_model = model;
-         state.store(SERVER_STATE_READY);
-         const std::string success = "Load was successful!";
-         res.set_content(success, "application/text");
-@@ -1215,6 +1220,43 @@ int main(int argc, char ** argv) {
+         if (!req.has_file("model"))
+@@ -1215,6 +1224,43 @@ int main(int argc, char ** argv) {
          // check if the model is in the file system
      });
  

@@ -103,11 +103,11 @@ Three rules, and they are absolute:
    existing profile. The service scans the profile directory at its **start**;
    there is no reload route yet, so a new enrolment is heard from the next
    start of the `arcint-tts` unit (restart it). The flow was proven end to end
-   on the card host with two FLEURS stand-ins, `markus-test` and `frau-test`
-   (CC-BY-4.0, outside the repository): the server served them as names and
+   on the card host with two FLEURS stand-ins (CC-BY-4.0, outside the
+   repository; their profile names are operator-local): the server served them as names and
    each synthesized sentence round-tripped at WER 0.0000 (`measured-here`,
    milestone §9.4).
-4. **Markus and his wife** record their own 10-30 s samples later; the
+4. **The two household speakers** record their own 10-30 s samples later; the
    profile names and the recordings are entered with this tool. Until then the
    **gate voice** is one freely licensed German sample, staged on the card
    host and enrolled under a neutral name — the gate runs the *full clone
