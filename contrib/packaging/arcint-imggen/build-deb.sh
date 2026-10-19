@@ -25,7 +25,7 @@ UPSTREAM_TAG=v${PKGVER}
 # and the build script; the package is built from what anyone can check. Its
 # sha256 is taken after the tag was pushed (the follow-up commit, as for arcint).
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
-ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-}
+ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-f53e95a01f6d2b653919bd6cff51be7e6c56e011318d20d01c8b9bb10cfe6e90}
 LLAMA_COMMIT=3e4dfa8f39f904e681737d9f512a6e6338d848aa
 LLAMA_URL="https://github.com/ggml-org/llama.cpp/archive/${LLAMA_COMMIT}.tar.gz"
 LLAMA_TARBALL_SHA256=f9046074c9b71eaf9abd5491001e4d09c327591fed6b9e2bfcfddbb575dc5255
