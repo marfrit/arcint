@@ -1048,8 +1048,7 @@ public:
         stats.prompt_tokens = static_cast<int>(n_tok);
         if (cap > 0 && static_cast<int>(n_tok) >= cap) {
             mtmd_input_chunks_free(chunks);
-            throw InputError(log::format("prompt is %zu tokens with its images, context is %d: %zu over. arcint does "
-                                         "not truncate or shift context.", n_tok, cap, n_tok - static_cast<size_t>(cap) + 1));
+            throw ContextOverflowError(static_cast<int>(n_tok), cap);
         }
 
         uint64_t seed = in.sampler.seed;
@@ -1073,6 +1072,10 @@ public:
             ckpts_[static_cast<size_t>(seq)].clear();   // the lane's KV is gone, so are its checkpoints
             const int r = mtmd_helper_eval_chunks(mctx_, ctx_, chunks, 0, seq, n_batch_, /*logits_last*/ true, &n_past);
             if (r != 0) {
+                // a partial prefill leaves cells behind while `have` is empty;
+                // the lane's next text request would start at position 0 on top
+                // of them, so the lane is cleared before the error goes out
+                llama_memory_seq_rm(llama_get_memory(ctx_), seq, -1, -1);
                 mtmd_input_chunks_free(chunks);
                 throw std::runtime_error("mtmd_helper_eval_chunks failed");
             }
@@ -1221,11 +1224,18 @@ public:
             return false;
         }
 
-        // A frame is a backbone token: the lane's context bounds it, whatever
-        // the client asked (a request past it would end in a decode failure).
-        const int    lane_cap   = cap_[static_cast<size_t>(std::min(std::max(slot, 0), lanes_ - 1))];
-        const int    asked      = in.sampler.max_tokens >= 0 ? in.sampler.max_tokens : 512;
-        const int    max_frames = lane_cap > 0 ? std::min(asked, lane_cap / 2) : asked;
+        // A frame is a backbone token: what the prompt and the reference left
+        // of the lane bounds it, whatever the client asked (a request past it
+        // would end in a decode failure). A text that leaves no room is the
+        // client's overflow, refused as the chat path refuses it (DESIGN §3.8).
+        const int lane_cap = cap_[static_cast<size_t>(seq)];
+        const int used     = static_cast<int>(llama_memory_seq_pos_max(llama_get_memory(ctx_), seq)) + 1;
+        const int asked    = in.sampler.max_tokens >= 0 ? in.sampler.max_tokens : 512;
+        if (lane_cap > 0 && used + 1 >= lane_cap) {
+            llama_memory_seq_rm(llama_get_memory(ctx_), seq, -1, -1);
+            throw ContextOverflowError(used, lane_cap);
+        }
+        const int    max_frames = lane_cap > 0 ? std::min(asked, lane_cap - used - 1) : asked;
         int          n_frames   = 0;
         bool         stop       = false;
         const float* h_next     = nullptr;
@@ -1258,6 +1268,9 @@ public:
         const char* data   = nullptr;
         size_t      len    = 0;
         int64_t     n_samp = 0;
+        if (!stop && n_frames >= max_frames)
+            log::warn(log::format("slot %d", slot), "speech stopped at %d frames (%s) before codec_eos: the audio "
+                      "is cut", n_frames, max_frames < asked ? "the lane is full" : "max_tokens");
         if (pipe->get_output(&rate, &data, &len, &n_samp) != 0) { error = "get_output failed"; return false; }
         wav.assign(data, data + len);
         stats.completion_tokens = n_frames;

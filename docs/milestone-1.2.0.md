@@ -181,7 +181,7 @@ Routes added to arcint (`src/http`, `src/api`):
 
 | route | shape | notes |
 |---|---|---|
-| `POST /v1/chat/completions` (existing) | `image_url` content parts accepted when a `--mmproj` is loaded; `data:image/...;base64` URIs only (a file path or a remote URL is 400: release review, 1.2.0), at most 8 images of at most 4096×4096 a request; without an mmproj the text-only refusal stands | VLM |
+| `POST /v1/chat/completions` (existing) | `image_url` content parts accepted when a `--mmproj` is loaded; `data:image/...;base64` URIs only (a file path or a remote URL is 400: release review, 1.2.0), at most 8 images a request of at most 16.8 M pixels (4096×4096) each; without an mmproj the text-only refusal stands | VLM |
 | `POST /v1/audio/speech` | OpenAI: `{model, input (text), voice, response_format (wav), speed?}` → the WAV bytes | TTS |
 | `POST /v1/audio/transcriptions` | OpenAI multipart: `file`, `model`, `language`, `response_format (json/text)` → `{"text":...}` | STT **in its own unit/binary**, exposed by whisper.cpp's own server shim or a thin arcint-shaped wrapper |
 | `GET /v1/audio/voices` | the enrolled profile names (names only, never audio) | TTS; not an OpenAI route, a probe |

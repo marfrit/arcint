@@ -66,11 +66,12 @@ any clip context on the card (`backend_llama.cpp` captures libmtmd's
   `image_url` content part (`{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`)
   the answer comes from the VLM. Only a `data:image/...;base64` URI is
   served; a file path or a remote `http(s)` URL is refused 400 (a path would
-  let any client read the card host's files). At most 8 images and
-  4096×4096 pixels each, checked from the image header before decoding; an
-  unreadable image, too many or too large images, and a prompt that with its
-  image tokens exceeds the lane are 400 with the reason, never a truncation
-  (DESIGN §3.8). While streaming, such an error ends the stream with an error
+  let any client read the card host's files). At most 8 images a request and
+  16.8 M pixels (4096×4096) each, checked from the image header before
+  decoding; an unreadable image and too many or too large images are 400 with
+  the reason, and a prompt that with its image tokens exceeds the lane is the
+  text path's 400 `context_length_exceeded`, never a truncation (DESIGN
+  §3.8). While streaming, such an error ends the stream with an error
   event and the process serves on. Without `--mmproj` the request is refused
   400, the text-only rule unchanged. One self-contained lane path: the request clears its lane's KV
   and uses no prefix cache, checkpoint or drafter (an image is not tokenisable
@@ -81,7 +82,10 @@ any clip context on the card (`backend_llama.cpp` captures libmtmd's
   (`GET /v1/audio/voices`); the route refuses `reference_audio`, `speaker_file`,
   `sample_audio`, `audio`, `reference`, `voice_sample`, `speaker_ref` or
   `speaker_reference` with 400 and a pointer to the enrolment route (D5), as it
-  refuses an unknown `voice` and a non-WAV `response_format`. The reference
+  refuses an unknown `voice` and a non-WAV `response_format`. A text that with
+  the reference leaves no room in the lane is 400 `context_length_exceeded`;
+  synthesis that reaches `max_tokens` or the lane's end before the codec's
+  end-of-speech returns the audio so far and logs that it was cut. The reference
   recording is read server-side from the profile only.
 - `POST /v1/audio/transcriptions` — **built for STT** (whisper.cpp's own server served with `--inference-path /v1/audio/transcriptions`, so no route patch is needed: `file`, `language` and `response_format` match the OpenAI shape and a plain `json` returns `{"text":...}`). OpenAI multipart: `file`, `model`, `language`, `response_format` (`json`/`text`) → `{"text":...}`. German first (D3).
 - `GET /v1/audio/voices` — **built.** The enrolled names only; never a

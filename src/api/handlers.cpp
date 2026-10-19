@@ -801,12 +801,15 @@ std::optional<HttpResult> prepare_speech(const Context& ctx, const json& body, P
 static std::optional<HttpResult> guarded(const std::function<void()>& run) {
     try {
         run();
+    } catch (const ContextOverflowError& e) {
+        log::warn("req", "refused: prompt %d tokens with its images, lane %d", e.prompt_tokens, e.n_ctx);
+        return HttpResult{400, context_overflow(e.prompt_tokens, e.n_ctx)};
     } catch (const InputError& e) {
         log::warn("req", "refused: %s", e.what());
         return HttpResult{400, invalid_request(e.what(), "messages")};
     } catch (const std::exception& e) {
         log::error("req", "generation failed: %s", e.what());
-        return HttpResult{500, error_body(e.what(), "server_error")};
+        return HttpResult{500, error_body(e.what(), "internal_error")};
     }
     return std::nullopt;
 }
@@ -887,7 +890,14 @@ SpeechResult run_speech(const Context& ctx, const PreparedSpeech& prep, int slot
     GenerationStats stats;
     std::string     wav;
     std::string     err;
-    const bool ok = ctx.backend->generate_speech(prep.input, slot, wav, err, stats);
+    bool ok = false;
+    try {
+        ok = ctx.backend->generate_speech(prep.input, slot, wav, err, stats);
+    } catch (const ContextOverflowError& e) {
+        log::warn(log::format("slot %d", slot), "speech refused: the text and the reference take %d of %d cells",
+                  e.prompt_tokens, e.n_ctx);
+        return SpeechResult{400, {}, context_overflow(e.prompt_tokens, e.n_ctx)};
+    }
     if (!ok) {
         // Everything a client can get wrong was refused in prepare_speech, so
         // a failure here is the server's: a profile file that vanished, a

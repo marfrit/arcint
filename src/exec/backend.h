@@ -121,6 +121,15 @@ struct InputError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// The prompt over the lane, counted with its image tokens: the handlers answer
+// it with the text path's context_length_exceeded body (DESIGN §3.8).
+struct ContextOverflowError : InputError {
+    ContextOverflowError(int prompt_tokens_, int n_ctx_)
+        : InputError("prompt over the lane"), prompt_tokens(prompt_tokens_), n_ctx(n_ctx_) {}
+    int prompt_tokens;
+    int n_ctx;
+};
+
 struct GenerationInput {
     // OpenAI image_url parts of this request, in the order their markers appear
     // in `prompt` (`docs/milestone-1.2.0.md §3`). Empty on a text request; the
