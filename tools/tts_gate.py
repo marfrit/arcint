@@ -28,7 +28,9 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.request
+import wave
 
 FLOOR_DEFAULT = 0.10        # corpus round-trip WER (operator floor, D8, 2026-10-19)
 MAX_SENT_WER_DEFAULT = 0.5  # no single sentence above this (operator floor, D8)
@@ -61,8 +63,10 @@ def synthesize(tts_url, model, voice, text, sampling, timeout):
     body.update({k: v for k, v in sampling.items() if v is not None})
     req = urllib.request.Request(tts_url, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
+    t0 = time.time()
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()   # the WAV bytes
+        wav = r.read()
+    return wav, time.time() - t0   # the WAV bytes and the process seconds
 
 
 def transcribe(stt_url, stt_model, wav_bytes, language, timeout):
@@ -109,21 +113,30 @@ def speech(args):
     sampling = {"temperature": args.temperature, "top_p": args.top_p,
                 "top_k": args.top_k, "repetition_penalty": args.repetition_penalty,
                 "seed": args.seed}
-    cases = []
+    cases, proc_tot, audio_tot = [], 0.0, 0.0
     for i, text in enumerate(texts):
-        wav = synthesize(args.tts_url, args.model, args.voice, text, sampling, args.timeout)
+        wav, dt = synthesize(args.tts_url, args.model, args.voice, text, sampling, args.timeout)
         wav_path = os.path.join(args.out, "sent_%03d.wav" % i)
         open(wav_path, "wb").write(wav)
-        cases.append({"text": text, "wav": wav_path, "wav_bytes": len(wav)})
-        print("wav %5d bytes  %s" % (len(wav), text[:50]))
+        with wave.open(wav_path, "rb") as w:
+            asec = w.getnframes() / float(w.getframerate())
+        proc_tot += dt
+        audio_tot += asec
+        cases.append({"text": text, "wav": wav_path, "wav_bytes": len(wav),
+                      "process_s": round(dt, 3), "audio_s": round(asec, 3)})
+        print("timed %8.3f s process  %7.3f s audio  %5d bytes  %s"
+              % (dt, asec, len(wav), text[:46]))
         sys.stdout.flush()
     json.dump({"n": len(cases), "cases": cases, "manifest_sha256": msha,
                "manifest": args.manifest, "voice": args.voice, "seed": args.seed,
                "sampling": {k: v for k, v in sampling.items() if v is not None},
                "tts_url": args.tts_url, "model": args.model, "lang": args.lang,
-               "floor": args.floor, "max_sentence_wer": args.max_sentence_wer},
+               "floor": args.floor, "max_sentence_wer": args.max_sentence_wer,
+               "process_s_total": round(proc_tot, 3), "audio_s_total": round(audio_tot, 3),
+               "rtf": round(audio_tot / proc_tot, 4) if proc_tot else None},
               open(os.path.join(args.out, "speech.json"), "w"), indent=1)
-    print("TTS speech phase: %d sentences -> %s" % (len(cases), args.out))
+    print("TTS speech phase: %d sentences -> %s (audio %.3f s / process %.3f s, rtf %.4f)"
+          % (len(cases), args.out, audio_tot, proc_tot, audio_tot / max(proc_tot, 1e-9)))
     return 0
 
 
@@ -156,7 +169,9 @@ def transcribe_phase(args):
               "worst_sentence_wer": worst, "share_le_010": le010,
               "verdict": "PASS" if verdict else "FAIL",
               "manifest_sha256": sp["manifest_sha256"], "voice": sp["voice"],
-              "seed": sp["seed"], "cases": cases}
+              "seed": sp["seed"], "rtf": sp.get("rtf"),
+              "process_s_total": sp.get("process_s_total"),
+              "audio_s_total": sp.get("audio_s_total"), "cases": cases}
     if args.embed_cmd:
         try:
             sim = float(subprocess.check_output(args.embed_cmd.split(),
@@ -173,8 +188,9 @@ def transcribe_phase(args):
                "manifest_sha256": sp["manifest_sha256"]},
               open(os.path.join(args.out, "arm.json"), "w"), indent=1)
     print("TTS gate %s: round-trip corpus WER %.4f (floor %.4f), worst sentence %.3f "
-          "(bar %.3f), sentences WER<=0.10: %.1f%%%s"
+          "(bar %.3f), sentences WER<=0.10: %.1f%%, rtf %.3f%s"
           % (result["verdict"], corpus, sp["floor"], worst, max_sent, 100 * le010,
+             sp.get("rtf") or 0.0,
              "; similarity not measured (no --embed-cmd)" if "similarity" not in result else
              " similarity %.3f" % result["similarity"]))
     return 0 if verdict else 1
