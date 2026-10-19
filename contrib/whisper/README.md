@@ -53,15 +53,23 @@ Steps the recipe takes:
    source at this pin), and that the model loads with `--device` named (a
    leg, not this recipe).
 
-What is **not** here: the whisper server's `/props`. The
-`/v1/audio/transcriptions` route is **built** (2026-10-18, `measured-here`):
-whisper.cpp's own `whisper-server` serves it with
+The `/v1/audio/transcriptions` route is **built** (2026-10-18,
+`measured-here`): whisper.cpp's own `whisper-server` serves it with
 `--inference-path /v1/audio/transcriptions` (an existing flag, no patch), and a
 plain `json` response_format returns `{"text":...}` in the OpenAI shape;
 `language` and `response_format` match (`docs/speech-service.md`, milestone
-§9.2). `/health` exists; **`/props` does not** — the server serves `/health`
-and `/load` only, so the service contract's `/props` fields are the service
-phase's owed work (`contrib/systemd/arcint-stt.service` says so).
+§9.2).
+
+**`server-props.patch`** (1.2.0, `examples/server/`): `GET /props`, which
+whisper-server lacked (it served `/health` and `/load` only). It reports the
+loaded model's file name (kept in step with `/load`), whether it is ready,
+the language, the inference path, threads, beam size and best-of, the GPU and
+flash-attention flags, ggml's GPU devices (name and description, the one in
+use marked) and the build string (`ARCINT_BUILD`, set by the recipe).
+`build-whisper.sh` applies it idempotently and refuses a server binary
+without the build string. Red first (`measured-here`, a CPU-only build of the
+pin with `ggml-tiny.bin`): the unpatched server answers `/props` with 404, the
+patched one with 200 and the fields above.
 
 ## The `.bin` loader path
 

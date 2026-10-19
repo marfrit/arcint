@@ -9,8 +9,8 @@
 # card, Conflicts=). Routes: POST /v1/audio/transcriptions (OpenAI multipart:
 # `file`, `language`, `response_format`; a plain `json` returns
 # {"text":...}); the route is whisper-server's own with
-# `--inference-path /v1/audio/transcriptions`, no patch. GET /health exists;
-# /props is the service phase's owed work.
+# `--inference-path /v1/audio/transcriptions`, no patch. GET /health and
+# GET /props (model, language, devices, build; contrib/whisper/server-props.patch).
 #
 # The model is whisper.cpp's own `.bin` format, not a GGUF. German first; the
 # gate is word error rate on the fixed German set against the same model's

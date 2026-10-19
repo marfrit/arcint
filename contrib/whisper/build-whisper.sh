@@ -65,11 +65,24 @@ else
   WHISPER_EXPORT="$WHISPER_SRC"   # tarball: no git to check
 fi
 
+# arcint's whisper.cpp patch (contrib/whisper/README.md): /props on
+# whisper-server. Applied unless its reverse already applies, so a re-run on a
+# patched tarball tree is a no-op.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+PROPS_PATCH="$HERE/server-props.patch"
+[ -f "$PROPS_PATCH" ] || { echo "missing $PROPS_PATCH" >&2; exit 2; }
+if ! (cd "$WHISPER_EXPORT" && git apply --reverse --check "$PROPS_PATCH" 2>/dev/null); then
+  (cd "$WHISPER_EXPORT" && git apply --whitespace=nowarn "$PROPS_PATCH") \
+    || { echo "server-props.patch does not apply to $WHISPER_EXPORT" >&2; exit 2; }
+fi
+BUILD_STRING=${ARCINT_BUILD:-whisper.cpp ${WHISPER_COMMIT:0:7} on llama.cpp $LLAMA_COMMIT + arcint series, OpenCL}
+
 WHISPER_BUILD="$BUILD/whisper"
 cmake -S "$WHISPER_EXPORT" -B "$WHISPER_BUILD" -DCMAKE_BUILD_TYPE=Release \
       -DWHISPER_USE_SYSTEM_GGML=ON \
       -Dggml_DIR="$GGML_PREFIX/lib/cmake/ggml" \
-      -DWHISPER_BUILD_EXAMPLES=ON -DWHISPER_BUILD_SERVER=ON -DBUILD_SHARED_LIBS=OFF >/dev/null
+      -DWHISPER_BUILD_EXAMPLES=ON -DWHISPER_BUILD_SERVER=ON -DBUILD_SHARED_LIBS=OFF \
+      -DARCINT_BUILD="$BUILD_STRING" >/dev/null
 cmake --build "$WHISPER_BUILD" -j"$(nproc)"
 
 BIN="$WHISPER_BUILD/bin/whisper-cli"
@@ -85,5 +98,10 @@ for s in kernel_mul_mv_kq_q8_1 "ggml_opencl:"; do
     echo "whisper-cli lacks '$s' (a vendored ggml, not the system one?)" >&2; exit 2
   fi
 done
+
+# /props reports the build string; only server-props.patch compiles it in.
+SRV="$WHISPER_BUILD/bin/whisper-server"
+grep -qaF "$BUILD_STRING" "$SRV" \
+  || { echo "whisper-server lacks the /props build string (server-props.patch)" >&2; exit 2; }
 
 echo "built: $BIN (whisper.cpp $WHISPER_COMMIT on llama.cpp $LLAMA_COMMIT + series, OpenCL)"
