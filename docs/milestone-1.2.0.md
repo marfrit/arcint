@@ -608,17 +608,28 @@ hygiene per the SOP, `arcint-agent` stopped and restored.
 sets `n_frames = 72` and the caller pads the codes to 72, so the decoder
 computes 72 frames for a 16- or 72-frame flush alike (1.766-1.78 s, 99.6 %
 compute; build/alloc/input/output 0.3 %; thread A/B 1.763-1.766 s over t=16..1,
-not threads; perf: bf16/f16 gemms ~28 %, im2col ~11 %). Computing only the
-valid frames (scratch `ARCINT_TTS_WAV_EXACT=1`) makes the flush proportional
+not threads; perf: bf16/f16 gemms ~28 %, im2col ~11 %). Computing only the valid frames makes the flush proportional
 (44 frames 1.11 s ... 64 1.59 s; 8-sentence total 14.25 -> 10.60 s) with a
 small CPU-vs-CPU sample diff (max 162/32767, one sentence identical, inside the
-placement arm's already-shown 483/32768). At window 72 the hybrid moves
-0.828 -> ~0.90 (still short of real time, flush 1.1-1.6 s, not <0.8 s); a
-lower window would get below 0.8 but reopens the seam. **C4 measured on CPU
-(no card): both the padded and exact arms round-trip at corpus WER 0.0455,
-PASS** (whisper-server `-ng`; the codec is the hybrid's own), the full `arcint`
-route's card gate still owed if the switch is adopted. The lever is real and
-the cost is explained (campaign `qwen3tts-card-real-time`).
+placement arm's already-shown 483/32768). **The full-route card gate ran
+(measured-here, 2026-10-19, window 72): the padded production arm 0.729
+(55.66 s / 40.56 s audio, 11.0 s first audio) against the valid-frames arm
+0.802 (50.58 s, 9.52 s), both round-trip corpus WER 0.0455 PASS (`codec_eos`
+sampled, no cap), the same-binary sample diff at most 191/32768 -- the lever
+is real, +10 %, still short of real time.** It landed as the engine **default**:
+patch `0062-mtmd-qwen3tts-gen-valid-frames` (`tools/mtmd/{clip.cpp,
+models/models.h, models/qwen3tts-gen.cpp}`), no env switch, no arcint flag; the
+patch binary's arm is bit-identical on all eight sentences to the scratch-switch
+arm, so the default engages the measured mechanism; the red
+`MTMD_TTS_WAV_PAD=1` restores the padded waveform (identical to the padded arm),
+so the test can fail. The `-1` default keeps the padded window for a no-codes
+caller and the `out_audio` null guard is kept (the upstream PocketTTS `GEN_WAV`
+path passes features, no codes); the pin + series application was checked clean.
+Sub-real-time still: lever (b), the code predictor, is the remaining wall
+(campaign `qwen3tts-card-real-time`). C7 (the language path's answers and KL
+must not move) is unaffected by construction: 0062 changes only the Qwen3-TTS
+`GEN_WAV` graph and the generic gen-audio `out_audio` tail block, and no chat
+path builds it (`code`); a served language arm was not re-run for the patch.
 
 ## 10. References
 

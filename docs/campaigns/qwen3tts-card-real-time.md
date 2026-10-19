@@ -176,16 +176,17 @@ seam), so there is nothing to overlap and lowering it costs both wall and
 waveform. **Accepted by the operator 2026-10-19:** the production TTS unit
 takes the hybrid placement (code2wav on the CPU, backbone on the card); its price is the
 0.828-and-17 %-short row against the far worse card-only (0.751, 0.420) and
-async (0.536) arms. Real time still needs the decoder's per-call cost reduced
-(lever a) or the predictor's per-node count reduced (lever b), not a placement
-or a thread.
+async (0.536) arms. Real time still needs the predictor's per-node count reduced
+(lever b); the decoder's per-call cost is reduced by the default patch 0062
+(lever a), not a placement or a thread.
 
 **Open levers, in order by measured share:** (a) the code2wav fixed per-call
-cost is now **explained** (above: the always-72-frame padded window; the
-valid-frames switch scales it with the flushed count and gives ~0.90 at window
-72, the C4 card gate owed); (b) the code predictor's node/launch count
-(`cache_set`'s concat+arange+get_rows and the per-step sampling, ~1,600 of
-6,792 nodes) — reduce nodes or fuse. Placement is settled by the disposition
+cost was **explained and its landing measured** (above: the always-72-frame
+padded window; the valid-frames computation scales it with the flushed count,
+C4 card PASS, and it is now the engine default patch
+`0062-mtmd-qwen3tts-gen-valid-frames`); (b) the code predictor's node/launch
+count (`cache_set`'s concat+arange+get_rows and the per-step sampling, ~1,600
+of 6,792 nodes) — reduce nodes or fuse. Placement is settled by the disposition
 above (the hybrid; accepted by the operator 2026-10-19); pipelining is closed
 by the measured refutation.
 
@@ -236,24 +237,46 @@ isolated flush (`-n 1`, window 1, ~96 % GEN_WAV): dense bf16/f16 `tinyBLAS`
 gemms ~28 %, `im2col` ~11 %, `add`/`mul`/`concat`/`sin`/`sqr` the rest — im2col
 is real but not dominant, the padded **matmul** work is.
 
-- **One-variable experiment: compute only the valid frames.** With the
-  scratch switch `ARCINT_TTS_WAV_EXACT=1` the graph takes the caller's frame
-  count instead of 72 (`models.h`/`qwen3tts-gen.cpp`/`clip.cpp`). The flush
-  becomes frame-proportional: 44 frames 1.11 s, 55 1.37, 60 1.49, 64 1.59
-  (against the fixed 1.77-1.79); the 8-sentence set's flush total falls
-  14.25 s -> 10.60 s (-26 %). The output is **not bit-identical**: CPU vs CPU
-  (the hybrid's own codec) differs by at most 162/32767 (rel 0.005) on
-  ~40-56 k of ~100 k samples, one sentence identical — within the window-72
-  card-vs-CPU diff the placement arm already showed (<=483/32768, 0.0147),
-  and the answer-level bar allows it. `measured-here` (CPU). **C4 measured
-  on CPU (no card): both arms round-trip at corpus WER 0.0455, verdict PASS**
-  (whisper-server `-ng`, the codec is the hybrid's own); the full `arcint`
-  route's card gate is still owed if the switch is adopted. At window 72 the
-  hybrid moves from 0.828 to about **0.90** (flush 1.1-1.6 s at 43-64 frames,
-  still above the 0.8 s/flush target); only a lower window (16 frames ->
-  ~0.39 s flush) gets below it, and that reopens the seam question (window 16
-  vs 72 differs up to 25,749/32768, measured). The lever is real and the
-  fixed cost is now explained.
+- **One-variable experiment: compute only the valid frames -- adopted and
+  landed as the engine default (`measured-here`, card + CPU, 2026-10-19).**
+  The GEN_WAV graph takes the caller's valid frame count instead of the fixed
+  72 (`models.h`/`qwen3tts-gen.cpp`/`clip.cpp`; patch
+  `0062-mtmd-qwen3tts-gen-valid-frames`, `code`; no env switch, no arcint
+  flag). On the CPU the flush becomes frame-proportional (44 frames 1.11 s,
+  55 1.37, 60 1.49, 64 1.59 against the fixed 1.77-1.79) and the 8-sentence
+  flush total falls 14.25 -> 10.60 s. On the B60 the one-variable card arm
+  (the 6e68d58 source built without and with the patch, the full
+  `/v1/audio/speech` route, `--tts-gen-device cpu`, window 72, the fixed
+  8-sentence gate, seed 42) measures the padded production arm at real-time
+  factor **0.729** (55.66 s process / 40.56 s audio, worst time-to-first-audio
+  11.0 s) against the valid-frames arm's **0.802** (50.58 s; 9.52 s) -- +10 %,
+  still short of real time. **C4 PASS on the card: both arms round-trip at
+  corpus WER 0.0455** through `whisper-server -ng`, and `codec_eos` is sampled
+  on both (40.56 s of audio, no cap). The same-binary sample diff is at most
+  **191/32768** (0.0058 of full scale), inside the window-72 card-vs-CPU bar
+  483/32768 already on record; the patch binary's own arm is bit-identical on
+  all 8 sentences to the switch arm measured first and differs from the padded
+  production arm exactly as that arm does -- the default engages the measured
+  mechanism. The red case `MTMD_TTS_WAV_PAD=1` forces the padded window back:
+  its 8 sentences are identical to the production padded arm and it runs 0.7285
+  (the default 0.8006), so the patch's own
+  claim (the flush scales with the frames) can fail by the repo's rule. The `-1`
+  default keeps the padded window for a no-codes caller, and the generic
+  `out_audio` block's null guard is kept (the upstream PocketTTS `GEN_WAV` path
+  passes features instead of codes and never dereferences a null codes pointer).
+  This arm's denominator and first-audio figures (11.0 s padded / 9.52 s
+  valid-frames) differ from the earlier placement window's 0.828 and
+  5.3-6.8 s on the same route and card: a different source window and its
+  sampled lengths on the same manifest (run-to-run and source-window
+  variation). The lever's **ratio** (+10 %) is what it claims. It is a
+  deviation from the reference (upstream's `clip.cpp`/`tts.cpp` pad every flush
+  to the attention window), named with its reason: the measured fixed per-call
+  cost; the `wav_tfm_swa` constant stays for the padded and no-codes fallback,
+  no invariant is at stake, and the answer-level bar permits it (`CLAUDE.md`
+  "References first"). `0062` applies cleanly to the pin + series (checked
+  against the 0001-0060 tree and the 0001-0058 tree). The lever is real, the
+  fixed cost is explained, and the engine's default now computes the caller's
+  frames.
 
 ## Where it lives
 
@@ -262,5 +285,8 @@ is real but not dominant, the padded **matmul** work is.
 - The backend coverage: `ggml/src/ggml-opencl/ggml-opencl.cpp`'s
   `supports_op`; the open classes above; `COL2IM_1D`/transposed conv is the
   milestone §5 prediction now measured on the card.
+- The valid-frames default: `contrib/llama.cpp/patches/
+  0062-mtmd-qwen3tts-gen-valid-frames.patch` (`tools/mtmd/{clip.cpp,
+  models/models.h, models/qwen3tts-gen.cpp}`).
 - The gate: `tools/tts_gate.py`; the model set `docs/milestone-1.2.0.md` §2.
 - The card arm's record: milestone §9.3, `docs/speech-service.md`.
