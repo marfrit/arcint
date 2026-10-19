@@ -1698,3 +1698,46 @@ the unit's flags: q8_0 KV, 11,300 MiB of slots, MTP 2, the bank stream;
   (`measured-here`). The same path on the other units: the dense agent's
   decode +0.8-1.3 %, the coder's on the A770 +14-15 % (its inputs ~2.0 ->
   0.13-0.25 ms a graph behind the chipset link), the same text.
+
+### Stage 9 — what the host's RAM upgrade buys (2026-10-19)
+
+The operator asked what Flash-Next gains now that the card host has 128 GB
+and the container's cap rose from 52 to 96 GiB. Arms ordered by cost, the
+gate as before: the answers right, the KL against unsloth's Q8_0.
+
+- **The bank already holds every non-slot expert** (`measured-here`, the
+  unit's load line: 7,208 slots / 12.07 GiB on the card, "the other experts
+  of its layers 28.72 GiB in host memory"; `code`: decode reads a miss from
+  the bank, over the link or on the CPU, and the loader drops the expert
+  pages from the page cache after the copy, `src/llama-expert-cache.cpp`).
+  No expert is served from the NVMe, so a larger pinned bank (the request's
+  second arm) has no mechanism: it would mean fewer VRAM slots. Not run.
+- **The page cache, cold against warm** (`measured-here`, the B60, the
+  1.2.0 package with the unit's flags and environment, four fresh processes
+  alternated cold / warm / cold / warm, the six answers of Stage 6 (Strata's
+  request and five 300-token answers), Paris and the 20k needle): after a
+  cold load 43.8 GiB of the 70.6 GiB of shards are resident, and every
+  answer ran with **0 major faults**, cold included. Decode on the six
+  answers: cold 33.40 / 33.48 t/s, warm (both shards read once, 21 s)
+  33.83 / 33.88 (+1.2 %, both rounds; each arm's spread 0.2 %); prefill at
+  the 20k needle 620.3-620.9 t/s in every run; load 55 s cold, 35 s warm;
+  the answers byte-identical in all four runs. The RAM upgrade leaves the
+  unit's working set resident; warming the rest buys 1.2 %. (0.7.11's
+  41.8 t/s on these answers was IQ2_XS; IQ3_XXS's 28.2-38.4 here sits in its
+  recorded 30.6-37.5 band.) Whether the old 52 GiB cap cost anything was
+  not measured (it would need the cap lowered for a window).
+- **IQ3_XXS's KL as served** (`measured-here`, `llama-perplexity` of the
+  1.2.0 llama tree, the unit's cache settings, 16 x 512 against
+  `fn-ref-q8.kld`): 0.2188 ± 0.0105 / top-1 89.71 % at ubatch 512, 0.2191 ±
+  0.0105 / 89.56 % at ubatch 4 with the CPU misses: the record's 0.218 / 89.7
+  reproduced, the same-window baseline for a UD-Q3_K_XL arm.
+- **UD-Q3_K_XL** (CPU KL 0.1002 / 93.3 %, 2026-10-09) does not fit the
+  host's limits yet (`code`, the GGUF headers): experts 51.99 GiB and
+  non-expert 31.81 GiB against IQ3_XXS's 39.97 / 30.66 (the PLE table is
+  26.82 GiB in both). Its card-side non-expert weights are ~1.15 GiB larger,
+  so at IQ3_XXS's VRAM peak its slots shrink and the bank grows to ~41.5
+  GiB, over the 40 GiB TTM pinned cap; more slots do not fit the card. The
+  pinned bank is not charged to the container's cgroup (`measured-here`:
+  the container's MemAvailable stayed 94.3-94.4 GiB while each process
+  held its 28.72 GiB bank), so it counts against the host's RAM directly.
+  The arm waits on the operator's decision on the TTM cap.
