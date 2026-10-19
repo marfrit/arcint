@@ -20,7 +20,7 @@ the operator fixes them.
 | unit | binary | model files | routes | state |
 |---|---|---|---|---|
 | `arcint-vlm` | `/usr/bin/arcint` (`arcint` package) | `Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf` + `mmproj-...-Q8_0.gguf` | `/v1/chat/completions` with `image_url` | **built** (chat path + unit file; package and the `/props` multimodal fields owed) |
-| `arcint-tts` | `/usr/bin/arcint` (`arcint` package) | `Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` + **`mmproj-Qwen3-TTS-...-bf16.gguf`** (the Q8_0 mmproj's code predictor is defective; the campaign) | `POST /v1/audio/speech`, `GET /v1/audio/voices` | **built** (the `libmtmd` `gen_audio` path + routes + unit file); the first card gate **FAIL**ed on the Q8_0 mmproj (greedy WER 2.09, stochastic WER 2.1667, a 512-frame cap and no end-of-speech); `docs/campaigns/qwen3tts-german-genpath.md` isolates it to the mmproj's code predictor `a.gen.code` at Q8_0 and fixes it with a bf16 mmproj — the card arm at the fixed model is owed |
+| `arcint-tts` | `/usr/bin/arcint` (`arcint` package) | `Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` + **`mmproj-Qwen3-TTS-...-bf16.gguf`** (the Q8_0 mmproj's code predictor is defective; the campaign) | `POST /v1/audio/speech`, `GET /v1/audio/voices` | **built** (the `libmtmd` `gen_audio` path + routes + unit file); the first card gate **FAIL**ed on the Q8_0 mmproj (greedy WER 2.09, stochastic WER 2.1667, a 512-frame cap and no end-of-speech); `docs/campaigns/qwen3tts-german-genpath.md` (closed) isolated it to the mmproj's code predictor `a.gen.code` at Q8_0 and fixed it with a bf16 mmproj. The card arm at the fixed model (2026-10-19, `measured-here`) is **C4 PASS** (round-trip corpus WER 0.0455, floor 0.20, `codec_eos` sampled at 46–69 frames) but **B3 FAIL** (real-time factor 0.258, no faster than the CPU's 0.233; `docs/campaigns/qwen3tts-card-real-time.md`) |
 | `arcint-stt` | `/usr/bin/arcint-whisper` (`arcint-stt` package) | `ggml-large-v3-turbo.bin` (or `ggml-large-v3.bin`) | `POST /v1/audio/transcriptions` | **built** (whisper.cpp on the installed ggml, card gate PASS; unit file written; package and `/props` owed) |
 
 Ports (proposed; the operator fixes them): `arcint-vlm` 8083, `arcint-tts` 8084,
@@ -78,9 +78,13 @@ Three rules, and they are absolute:
    --profiles <dir> [--language de --source ... --licence ...]` validates a
    WAV (10-30 s envelope, a shorter one warns), copies it into the profile
    directory and writes the transcript and the metadata. `--force` replaces an
-   existing profile. The service reloads the list at its start (and an
-   operator-triggered reload), so an enrolment is heard from the next
-   request.
+   existing profile. The service scans the profile directory at its **start**;
+   there is no reload route yet, so a new enrolment is heard from the next
+   start of the `arcint-tts` unit (restart it). The flow was proven end to end
+   on the card host with two FLEURS stand-ins, `markus-test` and `frau-test`
+   (CC-BY-4.0, outside the repository): the server served them as names and
+   each synthesized sentence round-tripped at WER 0.0000 (`measured-here`,
+   milestone §9.4).
 4. **Markus and his wife** record their own 10-30 s samples later; the
    profile names and the recordings are entered with this tool. Until then the
    **gate voice** is one freely licensed German sample, staged on the card

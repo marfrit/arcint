@@ -241,11 +241,14 @@ by a profile (`arithmetic`, profile owed):
   ggml presents them as `CONV_1D`/`CONV_2D`; the pin's `supports_op` takes
   `CONV_2D` (`code`) but whether whisper.cpp's call lands there and how it
   performs on Arc is open.
-- **The TTS acoustic decoder** — the Qwen3TTS gen half runs a codec decoder
-  (transposed conv / upsampling / vocoder-style ops); `CONV_TRANSPOSE_1D`/
-  `_2D` are not in the pin's case list (`code`), so those layers may fall to
-  the CPU, which would put the waveform step on the CPU. Size it; if it is
-  the whole cost, the acoustic decoder is the campaign.
+- **The TTS gen half** — measured on the card (2026-10-19, `measured-here`):
+  the `libmtmd` gen graph builds at **947 splits / 6492 nodes**, OpenCL
+  805.23 MiB / CPU 278.40 MiB, with f32 ops unsupported on OpenCL: `ARANGE`
+  ×354, `GET_ROWS` ×46, `SIN` ×29, `LOG` ×24, `PAD_REFLECT_1D` ×22, `SUM` ×15,
+  `COL2IM_1D` ×6; the code2wav transposed conv (`COL2IM_1D`) is among them
+  (the prediction above, now measured). The card arm's real-time factor is
+  **0.258×** (no faster than the CPU loop's 0.233) — campaign
+  `qwen3tts-card-real-time`.
 - **Flash attention in the vision tower** — Qwen2.5-VL uses full attention;
   the pin's `FLASH_ATTN_EXT` takes head sizes 128/256 (`code`, 1.1.0 §0.3);
   the ViT's head/gqa geometry may take the generic path. Size it.
@@ -443,7 +446,7 @@ comparison gates so far).
 
 ### 9.3 TTS (Phase 0/4, 2026-10-18 late)
 
-The TTS work is split in two: the code is built, the card gate is **pending**.
+The TTS work: the code is built; the card arm at the fixed model ran 2026-10-19 (**C4 PASS, B3 FAIL**, §9.4).
 
 The code (`measured-here` as "it compiles and it loaded on the card"):
 
@@ -490,8 +493,8 @@ not in the gate. The campaign `docs/campaigns/qwen3tts-german-genpath.md`
 (opened 2026-10-19) resolved it (see the paragraph below): the defect is the
 Q8_0 mmproj's code predictor, and the fix is a bf16 (or code-predictor-bf16
 mixed) mmproj. A4's WAV and the refusals are real; the earlier C4 and B3
-arms **fail on the record** and are not a passing gate; the card arm at the
-fixed model is owed.
+arms **fail on the record** and are not a passing gate. The card arm at the
+fixed model ran 2026-10-19: **C4 PASS, B3 FAIL** (§9.4).
 
 **The upstream reference tool reproduces the German failure
 (measured-here, 2026-10-19):** `llama-tts`, built from the same pin + series
@@ -511,13 +514,35 @@ predictor `a.gen.code`** — keeping only that subgroup at BF16 (or using the
 official bf16 mmproj) makes the sentence transcribe exactly and sample
 `codec_eos` at frame 44-50, while keeping the code2wav `a.gen.wav` at BF16 does
 not. The fix is `Q8_0 backbone + bf16 mmproj` (2.52 GB), or a mixed Q8_0
-mmproj with `a.gen.code` at BF16 (0.56 GB). Open: the **card arm** through
-arcint's own route (C4/B3), the milestone gate.
+mmproj with `a.gen.code` at BF16 (0.56 GB). The card arm through arcint's own
+route ran 2026-10-19 (§9.4): **C4 PASS, B3 FAIL**.
 
-The VLM phase-0 dispositions (the `vlm_gate` tool run, the CPU encoder B4
-reference, the op profile, the red case, the package/unit/probes) are still
-open. The speech units' files are written (`contrib/systemd/`, ports
-8083/8084/8091 proposed); the packages and `/props` extensions owed.
+### 9.4 The TTS card arm at the fixed model (Phase 3/4, 2026-10-19)
+
+The milestone C4/B3 gate, on the B60 (PCI `8086:e211`, OpenCL GPU.0), the
+B60's language unit stopped for the window, the physical-host sampler
+recording, one non-service process per card, the final unit restored and
+`:8087` verified (`measured-here`). The dev binary sha256 `0179adb5…`, `Q8_0`
+backbone `ac7931ae…` + **bf16 mmproj** `b9503e95…`, 4,096 ctx, the full clone
+path on `gate-fleurs` (FLEURS `de_de`, CC-BY-4.0) through
+`POST /v1/audio/speech`, sampling t 0.8 / top_p 0.95 / top_k 40 / repetition
+1.0, seed 42, fixed 8-sentence set.
+
+| item | measured |
+|---|---|
+| A4/D5 | the route returns WAV; `reference_audio`, `speaker_file` and an unknown voice are all 400; `/v1/audio/voices` lists 4 names (record through the leg) |
+| C4 (the gate) | **PASS**: round-trip corpus WER **0.0455** (3 errors / 66 ref words), floor 0.20; `codec_eos` sampled, 46–69 frames per sentence, no cap |
+| B3 | **FAIL**: 36.48 s audio / 141.38 s process = **real-time factor 0.258**; the same loop on the CPU is 0.233, so the card is no faster — the gen graph's 947 splits and f32 CPU islands own it (campaign `qwen3tts-card-real-time`) |
+| enrolment proof (D5 end to end) | `tools/tts_enrol.py` enrolled the FLEURS stand-ins `markus-test` (10.0 s) and `frau-test` (10.8 s) into the operator-local profile dir; the server served them as names; one sentence each synthesized and round-tripped at WER **0.0000** |
+| window hygiene | sampler on the physical host, leg aborts on a stale sampler log; non-service holder check before every card step; agent stopped by its unit and restored, `:8087` verified; one non-service process per card; dev servers killed by pid |
+
+The C4 reversal against §9.3's earlier FAIL confirms the campaign fix; B3
+stays open as its own campaign. The VLM phase-0 dispositions (the `vlm_gate`
+tool run, the CPU encoder B4 reference, the op profile, the red case, the
+package/unit/probes) are still open. The speech units' files are written
+(`contrib/systemd/`, ports 8083/8084/8091 proposed); the `/props` extensions
+landed (tts flag, enrolled-voice count, multimodal fields, on the record
+above); the packages remain owed.
 
 ## 10. References
 
