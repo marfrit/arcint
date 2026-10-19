@@ -15,6 +15,17 @@ the enlarged D8 set measures **RTF 1.1291 / 1.1597** (before / after the card
 host's RAM upgrade), **C4 PASS** (WER 0.0264, worst 0.333). See the measured
 sections.
 
+**Scope of the two negatives (release review, 2026-10-19, `code`).** "The
+window cannot be lowered seamlessly" and "pipelining is refuted" were measured
+on the padded decoder, before 0062. The pipelining verdict rests on a fixed
+per-call decoder cost; since 0062 the flush scales with the frames it decodes,
+so that premise no longer holds and the verdict is not a verdict on
+overlapped decoding with 0062 in. The seam finding (window 16 against 72
+moves the waveform) is about the decoder's `wav_tfm_swa` attention window and
+was not re-measured with 0062 either. Both are open for the real-time
+milestone (time to first audio), not for 1.2.0, whose B3 is met without
+them.
+
 ## Charter
 
 `docs/milestone-1.2.0.md` §6 B3, floor operator-set (2026-10-19): real-time
@@ -179,7 +190,8 @@ unchanged and PASS (WER 0.0455) on every arm**:
   worth measuring only if lever (a) first cuts the decoder's per-call cost.
   `not measured`.
 
-**Disposition (updated): the best measured arm stays the B1 hybrid at 0.828**
+**Disposition (updated; measured before 0062, see the scope note at the top):
+the best measured arm stays the B1 hybrid at 0.828**
 (mmproj graphs on the CPU, the backbone on the card); card-only real time
 remains out of reach, and the overlap hypothesis is **refuted with numbers**
 — the decoder's per-call cost is fixed, the flush window must stay 72 (its
@@ -347,7 +359,7 @@ window 72), the full clone path on `gate-fleurs`, seed 42, the enlarged D8 set
 | run | audio / process | RTF | C4 |
 |---|---|---|---|
 | q8codeheadf16, before the RAM upgrade | 182.960 / 162.041 | **1.1291** | corpus WER **0.0264**, worst **0.333**, WER<=0.10 **89.1 %**; PASS |
-| staged production mmproj, after the upgrade (128 GB, DDR4-3333 CL18) | 182.960 / 157.767 | **1.1597** | identical **0.0264** / **0.333**, PASS |
+| staged production mmproj, after the upgrade (more host RAM) | 182.960 / 157.767 | **1.1597** | identical **0.0264** / **0.333**, PASS |
 
 Both are **B3 PASS** (floor RTF >= 1.0) and **C4 PASS** (floor corpus <= 0.10,
 worst <= 0.5); the sampled lengths are identical (audio 182.960 s) and the two

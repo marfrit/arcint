@@ -181,7 +181,7 @@ Routes added to arcint (`src/http`, `src/api`):
 
 | route | shape | notes |
 |---|---|---|
-| `POST /v1/chat/completions` (existing) | `image_url` content parts accepted when a `--mmproj` is loaded; `data:` base64 and `http(s)` URLs; without an mmproj the text-only refusal stands | VLM |
+| `POST /v1/chat/completions` (existing) | `image_url` content parts accepted when a `--mmproj` is loaded; `data:image/...;base64` URIs only (a file path or a remote URL is 400: release review, 1.2.0), at most 8 images of at most 4096×4096 a request; without an mmproj the text-only refusal stands | VLM |
 | `POST /v1/audio/speech` | OpenAI: `{model, input (text), voice, response_format (wav), speed?}` → the WAV bytes | TTS |
 | `POST /v1/audio/transcriptions` | OpenAI multipart: `file`, `model`, `language`, `response_format (json/text)` → `{"text":...}` | STT **in its own unit/binary**, exposed by whisper.cpp's own server shim or a thin arcint-shaped wrapper |
 | `GET /v1/audio/voices` | the enrolled profile names (names only, never audio) | TTS; not an OpenAI route, a probe |
@@ -219,10 +219,12 @@ whole (`Conflicts=`), as the image units do.
   transcript of a real voice in a commit, a log, a doc or a `/props` body.
   The enrolment **procedure** and the tool are in the repo; the bytes are
   operator-local (`*.local.md`, the profiles directory).
-- **Enrolment is a documented command**, e.g. a repo tool
-  `tools/tts_enrol.py --name NAME --audio FILE --text FILE` that writes the
-  profile into the card host's profile directory and validates the sample
-  (length, sample rate, non-silence). The service manual (a new
+- **Enrolment is a documented command**: the repo tool
+  `tools/tts_enrol.py --name NAME --audio FILE --text FILE [--profiles DIR]`
+  writes the profile into the card host's profile directory. It checks that
+  the sample is a readable WAV and its length (a sample under 8 s warns, over
+  35 s is refused); it does not check the sample rate or for silence, which
+  the listener and the C4/C5 gates catch (`code`, release review). The service manual (a new
   `docs/speech-service.md`) carries the exact steps, including the "clone two
   voices: the two household speakers" end state.
 - **The gate voice is freely licensed:** one short German sample from a
@@ -293,7 +295,7 @@ has its own on-demand unit with `/health` and `/props` (D7).
 
 | # | criterion | gate |
 |---|---|---|
-| C1 | The **VLM content check** on a fixed set of images with checkable content (an object, a count, a colour, a short lettering): answers match ground truth | a fixed question set per image; every answer checked; the gate is the set's pass rate, with the operator's threshold once measured |
+| C1 | The **VLM content check** on a fixed set of images with checkable content (an object, a count, a colour, a short lettering): answers match ground truth | a fixed question set per image; every answer checked as a whole word; the gate is the set's pass rate, **floor 1.0 on the fixed 9-question set** (operator 2026-10-19) |
 | C2 | The VLM closes 1.1.0's open content check: it reads the generated Qwen-Image `WILLKOMMEN` and the Z-Image lettering | the lettering is reported correctly; this is the 1.1.0 charter §3 "content check" that was left unbuilt |
 | C3 | STT **word error rate** on a fixed German test set against the **same model's CPU run** (identical inputs) and against a floor | WER = `(S+D+I)/N` per clip, corpus WER over the whole set; candidate ≤ CPU WER + 0.005, and **corpus WER ≤ 0.08** on the FLEURS `de` set (operator 2026-10-19) |
 | C4 | TTS **intelligibility**: round-trip the synthesized German through the STT model, WER against the written sentences on the fixed ~300-word set | **corpus WER ≤ 0.10 AND no single sentence above 0.5** (operator 2026-10-19); the share of sentences with WER ≤ 0.10 is reported with every verdict |
@@ -320,6 +322,8 @@ are `decision` (operator); the cited sources are `paper`.
 | C4 | corpus round-trip WER ≤ 0.10, **and no single sentence above 0.5**, on the enlarged sentence set (~300 words). One error in the old 66 words was 1.5 pp; ~300 words resolves it. The share of sentences with WER ≤ 0.10 is reported with every verdict |
 | C5 | use the **Seed-TTS-eval** speaker model (a fine-tuned WavLM-large SV), named on the record. The floor is **calibrated**, not absolute: the clone-vs-reference cosine must come near the cosine between two REAL recordings of the same person, and clearly above the cross-speaker cosine (one household speaker's clone against the other's reference and the reverse). Until the real recordings exist, prove the method with CC stand-ins: two clips of one FLEURS speaker against another speaker |
 | B3 | the 1.2.0 use case is reading files aloud (batch); real time comes later. Floor: **RTF ≥ 1.0** (audio seconds per process second) on the sentence set. Time to first audio is recorded but not gated in 1.2.0; it becomes the gate of a later real-time milestone (community consensus: 200-300 ms TTFA with streaming) |
+| C1 | pass rate **1.0** on the fixed 9-question set (`tools/vlm_cases.json`) |
+| TTS placement | the hybrid, `--tts-gen-device cpu` (the backbone on the card, the mmproj's graphs on the CPU), accepted for the production unit |
 | naturalness | no automatic gate: UTMOS is English-trained. The two household speakers listen A/B against their own recordings |
 
 Sources (operator-provided, 2026-10-19): `github.com/BytedanceSpeech/
@@ -399,7 +403,7 @@ pin + the series through 0060. Models `Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf`
 (4,683,072,032 bytes) and `mmproj-...-Q8_0.gguf` (853,119,712 bytes), sizes
 equal to HF's LFS pointers (`measured-here`).
 
-| item | measured () |
+| item | value (`measured-here`) |
 |---|---|
 | A1, `libmtmd` in arcint | builds: the `mtmd` target and the `arcint` binary; `LLAMA_BUILD_MTMD=ON`, no `llama-common`, the pin's `GGML_MAX_NAME` 64, the series' kernels present in the tree |
 | A2, a VLM request through the chat endpoint | yes: `/v1/chat/completions` with an `image_url` data URI answers; the OpenCL device is named for the mmproj graph, no CPU island reported (`-v` log) |
@@ -468,12 +472,12 @@ already said it, and this window paid for skipping it.
 The whisper leg, on the dev host's B60 (PCI `8086:e211`, OpenCL `0:0`), built
 and measured in two windows after the host recovery:
 
-| item | measured () |
+| item | value (`measured-here`) |
 |---|---|
 | A1/A3, the whisper binary | `whisper.cpp` at the pin `d1be6fde` (v1.9.5) built with `WHISPER_USE_SYSTEM_GGML` against the ggml installed from the card host's `3e4dfa8` + series tree; `whisper-server` and `whisper-cli`; both carry `kernel_mul_mv_kq_q8_1` and `ggml_opencl:` (the recipe's two markers). The recipe needed two fixes: the top-level `app/` executable cannot build with `LLAMA_BUILD_COMMON=OFF`, so it is `LLAMA_BUILD_APP=OFF`/`LLAMA_TOOLS_INSTALL=OFF` and `ggml`+`llama` are built for the install; the second marker is not a literal `Intel(R)` at this pin |
 | model | `ggml-large-v3-turbo.bin`, 1.62 GiB (MIT-tagged `openai/whisper-large-v3-turbo`); `.bin`, not GGUF, per the charter's risk |
 | route | `/v1/audio/transcriptions` served by `whisper-server --inference-path /v1/audio/transcriptions` (an existing flag, no patch); `language` and `response_format` match OpenAI; non-empty transcripts |
-| card named | `ggml_opencl: OpenCL device: Intel(R) Arc(TM) Pro B60 Graphics` (26.27.39122.11), `whisper_backend_init_gpu: using GPUOpenCL backend`; `fallbacks = 0 p / 0 h` over the set |
+| card named | `ggml_opencl: OpenCL device: Intel(R) Arc(TM) Pro B60 Graphics` (26.27.39122.11), `whisper_backend_init_gpu: using GPUOpenCL backend`; `fallbacks = 0 p / 0 h` over the set (whisper.cpp's decoder temperature fallbacks, i.e. no segment was re-decoded; it says nothing about op placement, which the card's encode time against the CPU's shows, B2) |
 | the German set | FLEURS `de_de` dev (CC-BY-4.0, `measured-here` licence tag), 12 clips 2.5–13.75 s of the dev split, normalised from the split's float32 WAV to 16 kHz mono PCM s16 (`arithmetic`); reference text from the split's TSV; manifest sha256 recorded, audio stays on the card host outside the repo |
 | B2, card vs CPU | encode 804.6 ms/run on the card vs 3,553.5 ms/run on the CPU (**4.4×**); decode 2.11 vs 11.48 ms/run (**5.4×**); mel (54.8 ms) and sample (132.9 ms) are the CPU-side front end; load 11.6 s card vs 8.95 s CPU, 16 threads both |
 | C3, the WER gate | card corpus WER **0.0547** (11 errors / 201 ref words) = CPU 0.0547 exactly; `compare` PASS (card ≤ CPU + 0.005); total 27.5 s for the 12 clips on the card |
@@ -483,7 +487,7 @@ and measured in two windows after the host recovery:
 Open dispositions of the next window: B1's per-node profile for the whisper encoder
 and decoder; the service phase (the `arcint-stt` unit, the package, `/props`, the
 `.bin` loader path); and the operator's absolute C3 floor (D8: only the CPU
-comparison gates so far).
+comparison gates so far; since set, corpus WER ≤ 0.08, which 0.0547 passes, §6).
 
 ### 9.3 TTS (Phase 0/4, 2026-10-18 late)
 
@@ -519,7 +523,7 @@ The code (`measured-here` as "it compiles and it loaded on the card"):
 **Measured (the card window, FAIL; the branch carries the wiring `dd2cc59`
 and both load fixes, and the window ran a build of it):**
 
-| item | measured () |
+| item | value (`measured-here`) |
 |---|---|
 | A4, it answers | `/v1/audio/speech` returned WAV bytes for the enrolled voices (`gate-de` and `gate-fleurs`, both from FLEURS `de_de` samples); the D5 refusals — a reference-audio field and an unknown voice — answered 400 (`measured-here`) |
 | C4, intelligibility (the greedy arm) | **FAIL**: round-trip corpus WER **2.0909** over 8 sentences at floor 0.20 (voice `gate-fleurs`, seed 42); the waveform is not intelligible German — the transcripts are unrelated phrases and `* Musik *` labels, and one sentence's own words never come back |
@@ -727,7 +731,7 @@ mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0-codeheadf16.gguf`), `gate-fleurs`, seed
 | item | measured |
 |---|---|
 | q8codeheadf16, before the card host's RAM upgrade | **C4 PASS**: corpus WER **0.0264**, worst **0.333**, WER<=0.10 **89.1 %**; **B3 PASS**: **RTF 1.1291** (182.960 s audio / 162.041 s process) |
-| the staged production mmproj, after the upgrade (128 GB, DDR4-3333 CL18) | **C4 PASS** (identical WER 0.0264 / worst 0.333); **B3 PASS**: **RTF 1.1597** (182.960 / 157.767) |
+| the staged production mmproj, after the upgrade (more host RAM) | **C4 PASS** (identical WER 0.0264 / worst 0.333); **B3 PASS**: **RTF 1.1597** (182.960 / 157.767) |
 | the cross-check f16-all | **B3 FAIL**: RTF **0.8051** (172.560 / 214.324) — raising the whole mmproj to f16 does not reach real time; not adoptable, not re-run |
 | the cross-check f32-all | no output; dominated (121.1 ms predictor call, slowest of the family); not re-run |
 | the card window (after the upgrade) | peak resident vram0 **2,586 MiB**, min physical MemAvailable **116,787 MiB**, max container **4,066 MiB**; one non-service process per card; `arcint-agent` stopped by its unit and restored after 80 s, `:8087` health ok |
@@ -737,7 +741,12 @@ model set (`contrib/systemd/arcint-tts.service` points at the requantized file;
 the official bf16 stays as fallback); **B3 PASS** closes the campaign
 `qwen3tts-card-real-time`; the two-f16-tensor choice refines the closed
 `qwen3tts-german-genpath` (which tested the whole `gen.code` at bf16) and is not
-a new defect. C7 unchanged: the recipe changes only the mmproj file, no engine
+a new defect. **Its quality cost** (`measured-here`, the same binary
+`be754e8b…`, seed, voice and 46-sentence set as §9.6): the bf16 mmproj's
+round-trip WER 0.0066 (2 errors / 303 words, 97.8 % of sentences ≤ 0.10)
+becomes 0.0264 (8 errors, 89.1 %) with the production mmproj; the worst
+sentence stays 0.333. Both pass the D8 floor; the bf16 file stays the
+fallback where that margin matters more than real time (RTF 0.7995). C7 unchanged: the recipe changes only the mmproj file, no engine
 graph.
 
 ### 9.8 C5 voice similarity: the SIM method landed and measured (Phase 4, 2026-10-19)
@@ -759,12 +768,17 @@ forward pass, cosine — the `huggingface/open-tts-leaderboard` recipe
 | same audio vs itself (sanity) | 1.000000 |
 | **the gate-voice clone vs its reference** (46 synthesized `gate-fleurs` sentences) | **mean 0.598038**, min 0.439814, max 0.751893 |
 | two FLEURS files of one sentence, two different speakers (CC-BY-4.0, cross) | **0.262419** |
-| published same-speaker VoxCeleb1 range (this model) | 0.60 - 0.69 |
-| published cross-speaker VoxCeleb1 range (this model) | -0.17 - 0.18 |
+| published same-speaker VoxCeleb1 range (this model; `paper`, the leaderboard README's example clips) | 0.60 - 0.69 |
+| published cross-speaker VoxCeleb1 range (this model; `paper`, same source) | -0.17 - 0.18 |
+| published ground-truth SIM-o, test-en (D8's anchor; `paper`, arXiv 2606.03455) | 0.73 |
 
-**Disposition (`measured-here`):** the clone-vs-reference mean sits at the
-published same-speaker anchors and clearly above the measured CC cross pair;
-the method and its calibration hold. **A same-speaker FLEURS pair is not
+**Disposition (`measured-here` for the cosines, `paper` for the anchors):**
+the clone-vs-reference mean 0.598 sits at the low edge of, just under, the
+published same-speaker range (0.60-0.69) and below the D8 ground-truth anchor
+0.73, and clearly above both the measured CC cross pair (0.262) and the
+published cross range. The method separates same from cross speakers, which
+is what METHOD PASS claims; whether the clone comes "near" a real same-person
+pair is the final calibration, open until the real recordings exist. **A same-speaker FLEURS pair is not
 obtainable** (measured-here on the local `de_de` dev TSV and the canonical
 `google/fleurs`: neither carries a speaker field; the `id` column groups the
 2-3 speakers per sentence), so the reference's published anchors stand as the
@@ -798,7 +812,7 @@ the VLM unit's flags (Qwen2.5-VL Q4_K_M + Q8_0 mmproj, `--n-ctx` 32768,
 `q8_0:q4_0`, `-v`); a profiling sibling `arcint-241c171-prof` sha256
 `0ff0d66b…` (`GGML_OPENCL_PROFILING=ON`) carries B1.
 
-| item | measured () |
+| item | value (`measured-here`) |
 |---|---|
 | C1/C2, the gate tool | `tools/vlm_gate.py` with the committed manifest `tools/vlm_cases.json` (sha256 `7e95d05e…`): **9/9 = 1.000**, floor 1.0. Answers WILLKOMMEN, Willkommen ×2, Cat, cat, Palm trees and beach., Red, cube, 1. The first case 8.42 s (the one-time clip-kernel compile), the 2048² upscale 8.77 s, the rest 0.41-1.81 s |
 | the set | seven images from the 1.1.0/1.1.1 record, nine questions, kinds lettering/object/background/colour/count, each sha256-pinned; the images stay operator-local beside the committed manifest (charter §4) |
@@ -864,11 +878,11 @@ tag, packages, fresh-container install, A/B) is that session's (D9).
 |---|---|---|
 | A1 `libmtmd` in arcint at the pin, kernels present, `GGML_MAX_NAME` 64 | **PASS** | `code`+`measured-here`: built (§9.1, §9.10, the `mtmd` target, no `llama-common`); the gate binary named the OpenCL device for the mmproj graph |
 | A2 a VLM image request on the card, no op silently CPU | **PASS** | `measured-here` §9.10: 9/9; `GGML_SCHED_DEBUG=2` every node `[OpenC ]`, clip graph splits=1/1090, zero island |
-| A3 the whisper binary on the installed ggml, `/v1/audio/transcriptions`, a transcription on the card | **PASS** | `measured-here` §9.2: built with `WHISPER_USE_SYSTEM_GGML`; the route via `--inference-path`; the card named; non-empty transcripts; fallbacks 0/0 |
+| A3 the whisper binary on the installed ggml, `/v1/audio/transcriptions`, a transcription on the card | **PASS** | `measured-here` §9.2: built with `WHISPER_USE_SYSTEM_GGML`; the route via `--inference-path`; the card named; non-empty transcripts; no decoder temperature fallback (`fallbacks = 0 p / 0 h`) |
 | A4 `/v1/audio/speech` on the card, the enrolled clone path, WAV out, the 400 refusals | **PASS** | `measured-here` §9.4, §9.7: WAV bytes; arbitrary-reference/unknown-voice 400; C4 PASS |
 | A5 the language services unchanged: the A/B vs the last release, acceptance ≥ 9/10 | **OPEN** | not re-run for 1.2.0 (owed at the release phase). By construction (`code`): 0062 touches only the TTS `GEN_WAV` graph and the generic gen-audio tail, no chat path builds it; the VLM/STT/TTS routes are separate processes. C7 rides with this |
 | A6 one unit, one package per binary, `/health`/`/props` | **PARTIAL, improved** | unit files exist (`contrib/systemd/arcint-{vlm,tts,stt}.service`), `/props` extended on the arcint binary (§9.9, §9.10); the new `arcint-stt` recipe is written and its pre-tag deb **builds** (1.2.0-1, `arcint-whisper` + `arcint-whisper-cli` + unit template + gate tool, kernel markers and ldd checked; not published, not installed); the 1.2.0 `arcint` deb is **owed** (its recipe needs the post-tag release-tarball sha); `arcint-whisper`'s `/props` is **owed** (it serves `/health`/`/load` only); no package PR (D9) |
-| B1 a profile per capability | **PASS (phase split) / a finer STT node profile optional** | VLM §9.10 (phase shares + op profile + no island); TTS §9.5/§9.7 (campaign `qwen3tts-card-real-time` closed); STT's criterion is the encode/decode split and §9.2 has it (encode 804.6 vs 3,553.5 ms, decode 2.11 vs 11.48, card named, fallbacks 0/0). No `CONV_1D` op needed a patch or a profile row: the encoder ran on the device (§9.2) |
+| B1 a profile per capability | **PASS (phase split) / a finer STT node profile optional** | VLM §9.10 (phase shares + op profile + no island); TTS §9.5/§9.7 (campaign `qwen3tts-card-real-time` closed); STT's criterion is the encode/decode split and §9.2 has it (encode 804.6 vs 3,553.5 ms, decode 2.11 vs 11.48, card named). No `CONV_1D` op needed a patch or a profile row: the encoder ran on the device, shown by its 4.4× over the CPU encoder on identical clips (§9.2, `measured-here`); a per-node placement dump of whisper's graphs was not taken |
 | B2 STT card faster than the CPU beyond the spread | **PASS** | `measured-here` §9.2: encode 4.4×, decode 5.4×, WER equal |
 | B3 TTS RTF ≥ 1.0 on the sentence set | **PASS** | `measured-here` §9.7: 1.1291 (pre) / 1.1597 (post) on the enlarged D8 set |
 | B4 VLM prefill/encode vs the CPU encoder | **PASS** | `measured-here` §9.10: the CPU encoder is 8-11× the card's on identical images; the CPU answers are the same; a separate CPU-only run |

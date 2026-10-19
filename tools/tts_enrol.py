@@ -74,9 +74,6 @@ def main():
     if not os.path.exists(args.text):
         print("--text not found: %s" % args.text, file=sys.stderr)
         return 2
-    if not "../" not in os.path.abspath(profiles) and profiles.rstrip("/").endswith((".", "..")):
-        print("refusing a suspicious --profiles path", file=sys.stderr)
-        return 2
 
     try:
         info = wav_info(args.audio)
@@ -96,8 +93,8 @@ def main():
 
     dest = os.path.join(profiles, name)
     if os.path.exists(dest) and not args.force:
-        print("profile '%s' exists; --force to replace (and the API's listeners see the change "
-              "only after the TTS unit's enrolment reload)" % name, file=sys.stderr)
+        print("profile '%s' exists; --force to replace (the TTS unit reads the profiles at its "
+              "start: restart it to serve the change)" % name, file=sys.stderr)
         return 1
     os.makedirs(dest, exist_ok=True)
     shutil.copyfile(args.audio, os.path.join(dest, "reference.wav"))

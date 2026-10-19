@@ -24,15 +24,17 @@ model, the manifest's sha256, the floor). A manifest case is:
     {"image": "path/to.png",        # a local file (read and sent as a data URI)
      "sha256": "...",               # optional: checked when present
      "question": "What animal ...?",
-     "expect": "cat",               # substring, case-insensitive
+     "expect": "cat",               # a whole word or phrase, case-insensitive
      "kind": "object"}              # free label, for the report
 
 The gate voice/format is the OpenAI chat `image_url` content part, which is
 what arcint's `/v1/chat/completions` takes (docs/milestone-1.2.0.md D2). Only
 the standard library is used.
 
-`expect` may be one substring or a list of accepted substrings (a count
-answer can be `["one", "1"]`); `image` resolves against the manifest's own
+`expect` may be one word (or phrase) or a list of accepted ones (a count
+answer can be `["one", "1"]`). It matches as a whole word, so "cat" does not
+pass "catalog", "one" does not pass "none" and "1" does not pass "10"; a case
+without an `expect` is refused, never counted as a pass; `image` resolves against the manifest's own
 directory, so the committed manifest carries only filenames and the images
 stay operator-local beside it (1.2.0 charter §4's rule).
 """
@@ -42,10 +44,17 @@ import hashlib
 import json
 import os
 import sys
+import re
 import time
 import urllib.request
 
-DEFAULT_FLOOR = 1.0     # every answer right is the target; the operator sets it (D8)
+DEFAULT_FLOOR = 1.0     # every answer right: the operator's C1 floor (2026-10-19)
+
+
+def matches(answer, alts):
+    """Whether any accepted word or phrase is in the answer as a whole word."""
+    return any(re.search(r"(?<!\w)" + re.escape(a.lower()) + r"(?!\w)", answer.lower())
+               for a in alts)
 
 
 def _sha256_file(path):
@@ -103,6 +112,10 @@ def run(args):
         if not os.path.exists(path):
             print("case image missing: %s" % path, file=sys.stderr)
             return 2
+        exp = case.get("expect", "")
+        if not [e for e in ([exp] if isinstance(exp, str) else exp) if e]:
+            print("case without an expect: %s" % case.get("question", path), file=sys.stderr)
+            return 2
         sha = _sha256_file(path)
         if "sha256" in case and case["sha256"] != sha:
             print("case image sha256 mismatch: %s" % path, file=sys.stderr)
@@ -113,7 +126,7 @@ def run(args):
         expect = case.get("expect", "")
         alts = [expect] if isinstance(expect, str) else list(expect)
         alts = [a for a in alts if a]
-        hit = any(a.lower() in answer.lower() for a in alts) if alts else True
+        hit = matches(answer, alts)
         n_pass += hit
         cases.append({"image": path, "sha256": sha, "kind": case.get("kind", ""),
                       "question": case["question"], "expect": expect,

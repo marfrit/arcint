@@ -17,8 +17,8 @@
 # Starting it stops the card's language, image and speech units (same card,
 # Conflicts=). Routes: POST /v1/audio/speech (OpenAI shape, `voice` a name
 # from the server's list) and GET /v1/audio/voices (names only); /health and
-# /props. The API refuses any reference-audio field 400 naming the enrolment
-# route (D5); cloning happens only from a profile already on the host, in
+# /props; chat and text completions are refused 400 (speech only). The API
+# refuses any reference-audio field 400 naming the enrolment route (D5); cloning happens only from a profile already on the host, in
 # --tts-profiles (operator-local, outside the repository).
 #
 # --tts sets the context's embeddings=1 (the backbone-to-codec pipeline reads
@@ -28,9 +28,10 @@
 # (temperature/seed) is per request and printed with every gate verdict.
 # --tts-gen-device cpu is the hybrid placement (backbone on the card, the
 # mmproj's speaker encoder + code predictor + code2wav on the CPU); accepted
-# by the operator 2026-10-19. It is the best measured TTS arm, 0.828
-# real-time factor against the card-only 0.751 (the
-# campaign qwen3tts-card-real-time; the CPU codec is 1,692 ms/flush against
+# by the operator 2026-10-19. With this production set it measures RTF
+# 1.1291 / 1.1597 (B3 PASS, above); the placement itself was chosen on the
+# bf16 mmproj, where the hybrid's 0.828 beat the card-only 0.751 (campaign
+# qwen3tts-card-real-time: the CPU codec is 1,692 ms/flush against
 # 1,780-2,000 on the card, and the card-only predictor is 4.5x the single
 # CPU backend). It loads the mmproj clip graphs on the CPU and the boot
 # aborts if any of them lands on the card (the check in backend_llama.cpp).

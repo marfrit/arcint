@@ -14,11 +14,21 @@ Recipe (Apache-2.0, adapted from `huggingface/open-tts-leaderboard`
 `transformers/score_similarity.py`): the WavLM-Large backbone is an HF
 `WavLMModel` with the checkpoint's original-WavLM parameter names remapped
 onto it (no s3prl / torch.hub); the ECAPA-TDNN head is transcribed from
-UniSpeech (MIT) with upstream's module names so the checkpoint head loads
-strictly. Only the 256-d embedding is used; the training-time AM-softmax
+UniSpeech `downstreams/speaker_verification/models/ecapa_tdnn.py` with
+upstream's module names so the checkpoint head loads strictly. Only the 256-d embedding is used; the training-time AM-softmax
 `loss_calculator.*` is dropped. One clip per forward pass (instance norm and
 attentive pooling take time-axis statistics, so batching would shift shorter
 clips). Cosine, as upstream. See `THIRD_PARTY.md`.
+
+Licence of this file: CC-BY-SA-3.0, not the repository's Apache-2.0. The
+ECAPA-TDNN head below is an adaptation of `microsoft/UniSpeech` (Copyright
+(c) Microsoft Corporation; licensed CC-BY-SA-3.0 by the LICENSE at that
+repository's root, https://creativecommons.org/licenses/by-sa/3.0/; upstream
+notes that part of its code is borrowed from `lawlict/ECAPA-TDNN`). Changes:
+the classes are transcribed without the torchaudio front end and the
+training-time loss, and wired to an HF `WavLMModel`. The leaderboard script
+this recipe follows labels the same head "MIT"; the UniSpeech LICENSE file
+says otherwise.
 
     tts_voice_sim.py pair --a A.wav --b B.wav [--model X.safetensors]
     tts_voice_sim.py mean-vs-ref --ref R.wav --wav W1.wav [W2.wav ...]
@@ -85,7 +95,7 @@ def load_wav_16k_mono(path):
     return a
 
 
-# ── ECAPA-TDNN head, transcribed from UniSpeech (MIT), names match upstream ──
+# ── ECAPA-TDNN head, adapted from UniSpeech (CC-BY-SA-3.0), upstream's names ──
 class Res2Conv1dReluBn(nn.Module):
     def __init__(self, channels, kernel_size=1, stride=1, padding=0, dilation=1, bias=True, scale=4):
         super().__init__()

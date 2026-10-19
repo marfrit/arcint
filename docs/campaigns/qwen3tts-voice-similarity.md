@@ -107,6 +107,8 @@ same-person recordings (operator).
   stay operator-local.
 - The recipe source: `huggingface/open-tts-leaderboard`
   `transformers/score_similarity.py` (Apache-2.0); the head from
-  `microsoft/UniSpeech` (MIT).
+  `microsoft/UniSpeech`, which is **CC-BY-SA-3.0** by its root LICENSE
+  (`code`, release review 2026-10-19; the leaderboard's "MIT" label is wrong),
+  so `tools/tts_voice_sim.py` is CC-BY-SA-3.0 (`THIRD_PARTY.md`).
 - The model: `bezzam/wavlm_large_finetune_seed_tts_eval` (mirror),
   `microsoft/UniSpeech` `downstreams/speaker_verification`; `code`.

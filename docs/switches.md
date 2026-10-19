@@ -170,8 +170,17 @@ Four names are not in a table:
 
 ## arcint
 
-arcint itself reads no environment switch since 0.8.0: its flags are on the
-command line (`arcint --help`, `llm.txt`). The 38 switches it read before
-belonged to the retired OpenVINO engine (`src/exec/backend_ov.cpp`); they are
-listed in this file at the tag `openvino-history`
-(`git show openvino-history:docs/switches.md`).
+arcint's flags are on the command line (`arcint --help`, `llm.txt`). Since
+1.2.0 it reads two environment switches, both for the TTS unit; the 38 it
+read before 0.8.0 belonged to the retired OpenVINO engine
+(`src/exec/backend_ov.cpp`) and are listed in this file at the tag
+`openvino-history` (`git show openvino-history:docs/switches.md`).
+
+| switch | class | default | what it does | evidence |
+|---|---|---|---|---|
+| `ARCINT_TTS_PROFILES` | operational | unset | The enrolled voices' profile directory when `--tts-profiles` is not given (the flag wins); `tools/tts_enrol.py` reads it too. | `code`: `src/config.cpp` |
+| `ARCINT_TTS_GEN_FORCE_GPU` | red case | unset | `1` (exactly) builds the audio-generation mmproj on the card even under `--tts-gen-device cpu`, so the boot's placement check must refuse; any other value is ignored. | `measured-here`: red refuses naming the card backend, green boots with `CLIP using CPU backend` only (milestone §9.5, `tools/tts_placement_check.sh`) |
+
+The voice-similarity tool reads `ARCINT_SIM_MODEL`, the speaker model's
+safetensors path when `--model` is not given (`tools/tts_voice_sim.py`; a
+measuring tool, not a service switch).

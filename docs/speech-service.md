@@ -2,9 +2,9 @@
 
 The 1.2.0 charter (`docs/milestone-1.2.0.md`) adds vision input, speech to
 text and text to speech with voice cloning. This is the service contract:
-units, routes, the enrolment rules and the gate-voice handling. The **VLM chat
-path is the only route built so far** (phase 0, 2026-10-18); the audio routes
-below are the service phase's work and are marked **planned** until built.
+units, routes, the enrolment rules and the gate-voice handling. All three
+capabilities are built and ship in 1.2.0 (the `arcint` and `arcint-stt`
+packages); the state column below records what each one's gate measured.
 The front and the client side are the operator's; the units, packages and this
 contract live here.
 
@@ -19,11 +19,11 @@ the operator fixes them.
 
 | unit | binary | model files | routes | state |
 |---|---|---|---|---|
-| `arcint-vlm` | `/usr/bin/arcint` (`arcint` package) | `Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf` + `mmproj-...-Q8_0.gguf` | `/v1/chat/completions` with `image_url` | **built** (chat path + unit file; package and the `/props` multimodal fields owed) |
-| `arcint-tts` | `/usr/bin/arcint` (`arcint` package) | `Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` + **`mmproj-Qwen3-TTS-...-Q8_0-codeheadf16.gguf`** (the production set: requantized to Q8_0 with `gen.code.head`/`gen.code.embd` kept at f16; the official bf16 stays as fallback) | `POST /v1/audio/speech`, `GET /v1/audio/voices` | **built** (the `libmtmd` `gen_audio` path + routes + unit file; the unit takes `--tts-gen-device cpu`, the hybrid placement: the best measured TTS arm at 0.828 real-time factor, campaign `qwen3tts-card-real-time`); the first card gate **FAIL**ed on the Q8_0 mmproj (greedy WER 2.09, stochastic WER 2.1667, a 512-frame cap and no end-of-speech); `docs/campaigns/qwen3tts-german-genpath.md` (closed) isolated it to the mmproj's code predictor `a.gen.code` at Q8_0 and fixed it with a bf16 mmproj. The card arm at the fixed model (2026-10-19, `measured-here`) then moved to **C4 PASS** and **B3 PASS**: the production set (Q8_0 backbone + the `codeheadf16` mmproj, `--tts-gen-device cpu`) measures corpus round-trip WER **0.0264** (worst 0.333, 89.1 % <= 0.10) and **RTF 1.1291 / 1.1597** (before / after the card host's RAM upgrade) on the enlarged D8 set (46 sentences / 303 words, `codec_eos` sampled, no cap; `docs/campaigns/qwen3tts-card-real-time.md` lever (b), `measured-here`) |
-| `arcint-stt` | `/usr/bin/arcint-whisper` (`arcint-stt` package) | `ggml-large-v3-turbo.bin` (or `ggml-large-v3.bin`) | `POST /v1/audio/transcriptions` | **built** (whisper.cpp on the installed ggml, card gate PASS; unit file and the `arcint-stt` recipe written, the package builds; `arcint-whisper` serves `/health` and `/load` only — its `/props` is **owed**) |
+| `arcint-vlm` | `/usr/bin/arcint` (`arcint` package) | `Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf` + `mmproj-...-Q8_0.gguf` | `/v1/chat/completions` with `image_url` | **built** (chat path, unit file, the `/props` multimodal fields (milestone §9.9); C1 9/9 and C2 PASS, milestone §9.10) |
+| `arcint-tts` | `/usr/bin/arcint` (`arcint` package) | `Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` + **`mmproj-Qwen3-TTS-...-Q8_0-codeheadf16.gguf`** (the production set: requantized to Q8_0 with `gen.code.head`/`gen.code.embd` kept at f16; the official bf16 stays as fallback) | `POST /v1/audio/speech`, `GET /v1/audio/voices` | **built** (the `libmtmd` `gen_audio` path + routes + unit file; the unit takes `--tts-gen-device cpu`, the hybrid placement accepted by the operator, campaign `qwen3tts-card-real-time`); the first card gate **FAIL**ed on the Q8_0 mmproj (greedy WER 2.09, stochastic WER 2.1667, a 512-frame cap and no end-of-speech); `docs/campaigns/qwen3tts-german-genpath.md` (closed) isolated it to the mmproj's code predictor `a.gen.code` at Q8_0 and fixed it with a bf16 mmproj. The card arm at the fixed model (2026-10-19, `measured-here`) then moved to **C4 PASS** and **B3 PASS**: the production set (Q8_0 backbone + the `codeheadf16` mmproj, `--tts-gen-device cpu`) measures corpus round-trip WER **0.0264** (worst 0.333, 89.1 % <= 0.10) and **RTF 1.1291 / 1.1597** (before / after the card host's RAM upgrade) on the enlarged D8 set (46 sentences / 303 words, `codec_eos` sampled, no cap; `docs/campaigns/qwen3tts-card-real-time.md` lever (b), `measured-here`) |
+| `arcint-stt` | `/usr/bin/arcint-whisper` (`arcint-stt` package) | `ggml-large-v3-turbo.bin` (or `ggml-large-v3.bin`) | `POST /v1/audio/transcriptions` | **built** (whisper.cpp on the installed ggml, card gate PASS; unit file and the `arcint-stt` package; `arcint-whisper` serves `/health` and `/props` (`contrib/whisper/server-props.patch`); upstream's `/load` is not served) |
 
-Ports (proposed; the operator fixes them): `arcint-vlm` 8083, `arcint-tts` 8084,
+Ports (operator, 1.2.0): `arcint-vlm` 8083, `arcint-tts` 8084,
 `arcint-stt` 8091, beside 8080/8087 (language), 8081/8082/8085 (image),
 8086 (the image front) and 8088/8089 (the on-demand language units).
 
@@ -47,7 +47,10 @@ the hybrid's measured **0.828** (`measured-here`, 2026-10-19, C4 PASS on both;
 `docs/campaigns/qwen3tts-card-real-time.md`): the CPU codec flushes in 1,692 ms
 against the card's 1,780-2,000, and the card-only predictor is 4.5x the single
 CPU backend. **Accepted by the operator 2026-10-19:** `arcint-tts.service`
-carries `--tts-gen-device cpu`. The production model set is then the
+carries `--tts-gen-device cpu`. (The 0.751/0.828 pair is the placement
+comparison of the earlier windows, on the bf16 mmproj and the 8-sentence gate;
+the production set below measures the hybrid at RTF 1.1291 / 1.1597 on the
+enlarged D8 set, B3 PASS, milestone §9.7.) The production model set is then the
 requantized Q8_0 mmproj with `gen.code.head`/`gen.code.embd` kept at f16
 (lever (b), C4 + B3 PASS, campaign `qwen3tts-card-real-time`); the official
 bf16 mmproj stays as fallback. An `mmproj` context takes one backend for all its
@@ -61,10 +64,15 @@ any clip context on the card (`backend_llama.cpp` captures libmtmd's
 
 - `POST /v1/chat/completions` — the ordinary OpenAI chat body. With an
   `image_url` content part (`{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`)
-  the answer comes from the VLM. The URL forms served today are a `data:` URI
-  and a **local file path**; a remote `http(s)` URL is refused 400 for now
-  (open). Without `--mmproj` the request is refused 400, the text-only rule
-  unchanged. One self-contained lane path: the request clears its lane's KV
+  the answer comes from the VLM. Only a `data:image/...;base64` URI is
+  served; a file path or a remote `http(s)` URL is refused 400 (a path would
+  let any client read the card host's files). At most 8 images and
+  4096×4096 pixels each, checked from the image header before decoding; an
+  unreadable image, too many or too large images, and a prompt that with its
+  image tokens exceeds the lane are 400 with the reason, never a truncation
+  (DESIGN §3.8). While streaming, such an error ends the stream with an error
+  event and the process serves on. Without `--mmproj` the request is refused
+  400, the text-only rule unchanged. One self-contained lane path: the request clears its lane's KV
   and uses no prefix cache, checkpoint or drafter (an image is not tokenisable
   text); the language requests on the same unit are untouched.
 - `POST /v1/audio/speech` — **built.** OpenAI shape: `{model, input, voice,
@@ -82,8 +90,15 @@ any clip context on the card (`backend_llama.cpp` captures libmtmd's
   loaded, mmproj loaded, and the projector's own `vision`/`audio` halves from
   libmtmd's cap query, milestone §9.9), the `tts` flag and the enrolled-voice
   **count** (names not required on `/props` by D5). The whisper binary
-  (`arcint-whisper`) serves `/health` and `/load` only today; the STT `/props`
-  is the service phase's owed work (`contrib/whisper/README.md`).
+  (`arcint-whisper`) serves `/health` and `/props` (the model file, ready,
+  language, inference path, threads, beam size and best-of, GPU and
+  flash-attention flags, ggml's GPU devices with the one in use marked, the
+  build string; `contrib/whisper/README.md`). Its upstream `/load` is not
+  served (404): it loaded any host path a client named and exited on a file
+  that was not a model.
+- A TTS unit (`--tts`) serves speech only: `/v1/chat/completions` and
+  `/v1/completions` answer 400 naming `/v1/audio/speech` (its backbone has no
+  chat template and would answer codec noise).
 
 ## The enrolment (D5)
 
@@ -98,7 +113,7 @@ Three rules, and they are absolute:
 3. **Enrolment is a documented command.**
    `python3 tools/tts_enrol.py --name NAME --audio ref.wav --text ref.txt
    --profiles <dir> [--language de --source ... --licence ...]` validates a
-   WAV (10-30 s envelope, a shorter one warns), copies it into the profile
+   WAV (the 10-30 s envelope: under 8 s warns, over 35 s is refused), copies it into the profile
    directory and writes the transcript and the metadata. `--force` replaces an
    existing profile. The service scans the profile directory at its **start**;
    there is no reload route yet, so a new enrolment is heard from the next

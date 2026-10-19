@@ -816,7 +816,8 @@ said), and the 503 bodies lost `reservation` and `kv_blocks_free`.
   (`drm/xe` "Order ring writes before ring tail updates") on the dev host is
   the operator's decision.
 - **Multimodal input**, an Anthropic Messages adapter and a local CLI: the
-  non-goal is **void for 1.2.0** (`decision`, operator, 2026-10-19): vision
+  non-goal is **void for 1.2.0** (`decision`, operator, 2026-10-18,
+  milestone D1): vision
   input, speech to text and text to speech with enrolled-voice cloning are
   1.2.0's scope, on demand units on one card, the OpenAI `image_url` and
   `/v1/audio/*` shapes (`docs/milestone-1.2.0.md`, `docs/speech-service.md`).
