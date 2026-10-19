@@ -1171,6 +1171,14 @@ public:
             sseed = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
         }
 
+        // A text whose tokens alone fill the lane cannot be synthesized: the
+        // chat path's overflow, before anything runs (the helper exposes no
+        // prompt size, so the template and the reference's few cells are
+        // caught by the room check after the prompt, or fail in it).
+        if (const int text_tok = static_cast<int>(tokenizer_->encode(in.text).size());
+            cap_[static_cast<size_t>(seq)] > 0 && text_tok >= cap_[static_cast<size_t>(seq)])
+            throw ContextOverflowError(text_tok, cap_[static_cast<size_t>(seq)]);
+
         // The helper's internal llama_process calls run on the shared context,
         // which is not thread-safe, and its embedding batches (output_all) read
         // the whole ubatch; the synthesis holds the context mutex, as the

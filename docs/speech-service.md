@@ -82,8 +82,11 @@ any clip context on the card (`backend_llama.cpp` captures libmtmd's
   (`GET /v1/audio/voices`); the route refuses `reference_audio`, `speaker_file`,
   `sample_audio`, `audio`, `reference`, `voice_sample`, `speaker_ref` or
   `speaker_reference` with 400 and a pointer to the enrolment route (D5), as it
-  refuses an unknown `voice` and a non-WAV `response_format`. A text that with
-  the reference leaves no room in the lane is 400 `context_length_exceeded`;
+  refuses an unknown `voice` and a non-WAV `response_format`. A text whose
+  tokens fill the lane, or that with the reference leaves no room for a frame,
+  is 400 `context_length_exceeded` (a text a few cells short of the lane's end
+  can still fail in the prompt phase with 500: the helper reports no prompt
+  size to check against beforehand);
   synthesis that reaches `max_tokens` or the lane's end before the codec's
   end-of-speech returns the audio so far and logs that it was cut. The reference
   recording is read server-side from the profile only.
