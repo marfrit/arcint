@@ -164,9 +164,11 @@ esac
 # a user's ~/.config, and on a managed host that directory belongs to the unit
 # manager. Assert it landed, because a silently missing unit turns into a
 # puzzled operator on the target host.
-[ -f "$ROOT/usr/share/arcint/arcint.service" ] || {
-    echo "FEHLT: /usr/share/arcint/arcint.service — installiert CMake die Vorlage nicht mehr?" >&2
-    exit 1; }
+for f in arcint.service arcint-vlm.service arcint-tts.service tts_enrol.py; do
+    [ -f "$ROOT/usr/share/arcint/$f" ] || {
+        echo "FEHLT: /usr/share/arcint/$f — installiert CMake die Vorlage nicht mehr?" >&2
+        exit 1; }
+done
 # The separate env file is gone as of 0.2.2 (flags are literal in ExecStart, so
 # a unit manager and a journal can both see the port). If it comes back, it has
 # to be installed by CMake too, not by this recipe.
@@ -209,7 +211,10 @@ Description: LLM inference engine for Intel Arc GPUs
  .
  The systemd user unit ships as a template in /usr/share/arcint/; copy it to
  ~/.config/systemd/user/ and edit the flags in ExecStart (on a host with a unit
- manager, hand it the file rather than installing it by hand).
+ manager, hand it the file rather than installing it by hand). Since 1.2.0 the
+ same directory holds the vision (arcint-vlm) and speech (arcint-tts) unit
+ templates and tts_enrol.py, which enrols a voice on the host: the speech API
+ takes enrolled voices only, never a reference recording.
 EOF
 
 DEB_OUT=arcint_${PKGVER}-${PKGREL}_amd64.deb

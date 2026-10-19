@@ -165,6 +165,12 @@ install(TARGETS arcint RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
 # copying it separately and drifting.
 install(FILES packaging/arcint.service
         DESTINATION "${CMAKE_INSTALL_DATADIR}/arcint")
+# 1.2.0: the vision and speech units run this binary too (docs/speech-service.md),
+# shipped beside it as templates; the enrolment tool writes a voice profile on
+# the host (the API never takes a reference recording, D5).
+install(FILES contrib/systemd/arcint-vlm.service contrib/systemd/arcint-tts.service
+              tools/tts_enrol.py
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/arcint")
 
 # --------------------------------------------------------------------- tests
 #

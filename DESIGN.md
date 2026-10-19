@@ -1,14 +1,19 @@
 # arcint — Design
 
-State as of 2026-10-18: arcint **1.1.1** on llama.cpp **`3e4dfa8`** with the
-patch series `contrib/llama.cpp/patches` 0001-0060 (58 patches). One engine: libllama with
+State as of 2026-10-19: arcint **1.2.0** on llama.cpp **`3e4dfa8`** with the
+patch series `contrib/llama.cpp/patches` 0001-0062 (59 patches). One engine: libllama with
 ggml's OpenCL backend and arcint's Intel kernels. Three language services run
 in production on two Intel Arc cards: the dense Qwen3.8-27B agent and
 Qwen3.8-Flash-Next (125B-A6B, on demand) on the 24 GB Arc Pro B60, the MoE
 coder on the 16 GiB Arc A770. Since 1.1.0 an image service (Z-Image Turbo;
 since 1.1.1 also Qwen-Image and FLUX.2 klein, one unit each)
 runs on the B60 on demand: stable-diffusion.cpp's `sd-server` built against
-the same patched ggml tree, a separate binary (§3.11).
+the same patched ggml tree, a separate binary (§3.11). Since 1.2.0 voice
+and vision run on the B60 on demand, one unit each: image input
+(Qwen2.5-VL) and text to speech with enrolled voices (Qwen3-TTS) in
+arcint's own binary through llama.cpp's `libmtmd`, speech to text in
+whisper.cpp's server on the same ggml, a separate binary
+(`docs/speech-service.md`, `docs/milestone-1.2.0.md`).
 
 **History.** Until 0.7.12 arcint also had an OpenVINO engine: OpenVINO IRs on
 a patched GPU plugin (`marfrit-openvino`, plugin patches 0003-0077), with
@@ -159,7 +164,7 @@ The cards (`measured-here` unless marked):
    └──────────────────────────────┬─────────────────────────────────┘
                                   │ libllama C API
    ┌──────────────────────────────▼─────────────────────────────────┐
-   │ llama.cpp 3e4dfa8 + contrib/llama.cpp/patches 0001-0060        │
+   │ llama.cpp 3e4dfa8 + contrib/llama.cpp/patches 0001-0062        │
    │  model, tokenizer, unified KV with a window per lane,          │
    │  recurrent state with per-token snapshots,                     │
    │  expert cache: VRAM slots + USM host bank + CPU misses         │
@@ -189,8 +194,8 @@ The cards (`measured-here` unless marked):
 
 ### 3.2 Kernels: the patch series
 
-`contrib/llama.cpp/patches` holds 58 patches against the pin (0001-0060; 0031
-and 0055 dropped in 0.8.1), each with its
+`contrib/llama.cpp/patches` holds 59 patches against the pin (0001-0062; 0031
+and 0055 dropped in 0.8.1, 0061 reviewed and dropped in 1.2.0), each with its
 measurement, KL, red case and review in `contrib/llama.cpp/README.md`
 (`measured-here` throughout). By what they change:
 
@@ -207,6 +212,7 @@ measurement, KL, red case and review in `contrib/llama.cpp/README.md`
 | lanes and devices | 0023, 0025, 0026, 0029 | one OpenCL context per platform, a KV cell window per lane, per-sequence attention windows |
 | graph and buffers | 0010, 0036, 0052 | MTP masked rows, Q8_0 GET_ROWS, compute buffers reserved for N cells |
 | image generation | 0057-0060 | the fused `ROPE_APPLY` op (CPU and OpenCL) for sd.cpp's DiTs; `CONV_3D` (Qwen-Image's Wan VAE) and `LEAKY_RELU` (the ESRGAN upscaler) on OpenCL, neither in a language graph; the Q8_0 GEMM on the XMX units, on the B60 (it also takes the language models' Q8_0 weights in batches of 16 or more, which in the served GGUFs are only MTP draft heads) |
+| speech | 0062 | `libmtmd`'s Qwen3-TTS acoustic decoder decodes the frames it is given instead of a padded 72-frame window (`tools/mtmd` only; no language graph builds it) |
 
 Every switch the series reads is classified in `docs/switches.md`
 (operational, tuning, opt-in alternative, off switch, red case, diagnostic).

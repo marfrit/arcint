@@ -5,14 +5,19 @@
 > libllama, and since 1.1.0 text-to-image (Z-Image Turbo; since 1.1.1
 > Qwen-Image, FLUX.2 klein with editing, ESRGAN upscaling) through
 > stable-diffusion.cpp's sd-server built against the same patched ggml tree
-> (package arcint-imggen, contrib/sdcpp, docs/imggen.md). Serves the
+> (package arcint-imggen, contrib/sdcpp, docs/imggen.md), and since 1.2.0
+> voice and vision (docs/speech-service.md): image input on
+> /v1/chat/completions (Qwen2.5-VL, --mmproj, libmtmd), German text to
+> speech with enrolled-voice cloning on /v1/audio/speech (Qwen3-TTS,
+> --tts), and speech to text on /v1/audio/transcriptions (whisper.cpp's
+> server on the same ggml, package arcint-stt, contrib/whisper). Serves the
 > hybrid GatedDeltaNet/attention Qwen family from GGUF files: Qwen3.8-27B
 > (dense, the agent), Qwen3.6-27B-A3B-Coder (MoE, the coder) and
 > Qwen3.8-Flash-Next (512-expert MoE on one card plus host RAM), plus
 > Cydonia 24B (llama architecture) for writing. One engine: libllama
 > (llama.cpp at pinned commit 3e4dfa8) with ggml's OpenCL backend and
-> arcint's Intel kernel series (contrib/llama.cpp/patches, 0001-0060
-> without 0031 and 0055).
+> arcint's Intel kernel series (contrib/llama.cpp/patches, 0001-0062
+> without 0031, 0055 and 0061).
 > arcint owns the HTTP surface, chat templates, tool calls, the sampler,
 > named lanes, MTP speculative decoding, context checkpoints and the expert
 > cache's policy. The OpenVINO engine of 0.1-0.7.12 was retired in 0.8.0;

@@ -3,8 +3,10 @@
 An inference server for Intel Arc: OpenAI-compatible endpoints for a short
 list of models on the Arc A770 and the Arc Pro B60, from the dense
 Qwen3.8-27B to the 512-expert Qwen3.8-Flash-Next on one card plus host RAM,
-and since 1.1.0 text-to-image: Z-Image Turbo, Qwen-Image (lettering, German
-included), FLUX.2 klein with image editing, and an ESRGAN upscaler.
+since 1.1.0 text-to-image: Z-Image Turbo, Qwen-Image (lettering, German
+included), FLUX.2 klein with image editing, and an ESRGAN upscaler; and since
+1.2.0 voice and vision: image input to the chat endpoint, speech to text, and
+German text to speech that clones enrolled voices.
 
 arcint runs GGUF files through libllama (llama.cpp at a pinned commit) with
 ggml's OpenCL backend and a published series of Intel kernels
@@ -25,6 +27,17 @@ two more for the 1.1.1 models (0059, the 3D convolution of Qwen-Image's
 VAE; 0060, the upscaler's leaky ReLU).
 It is its own package and unit, `arcint-imggen` ([contrib/sdcpp](contrib/sdcpp),
 [docs/imggen.md](docs/imggen.md)).
+
+Voice and vision (1.2.0, [docs/speech-service.md](docs/speech-service.md),
+[docs/milestone-1.2.0.md](docs/milestone-1.2.0.md)) are three on-demand
+units on the B60. Image input and speech synthesis run in arcint's own binary
+through llama.cpp's `libmtmd`: OpenAI `image_url` parts on
+`/v1/chat/completions` with a multimodal projector (`--mmproj`), and
+`/v1/audio/speech` with Qwen3-TTS (`--tts`), whose voices are enrolled on the
+server: the API names a voice and never takes a reference recording. Speech
+to text is [whisper.cpp](https://github.com/ggml-org/whisper.cpp)'s own
+server built against the same patched ggml, its own package `arcint-stt`
+([contrib/whisper](contrib/whisper)).
 
 The inspiration is [NInfer](https://github.com/Neroued/ninfer), a
 from-scratch engine for a closed set of checkpoints that beats every
@@ -54,9 +67,13 @@ tag [`openvino-history`](https://github.com/marfrit/arcint/tree/openvino-history
 | images | Z-Image Turbo (6B DiT) with the Qwen3-4B-Instruct-2507 encoder and the FLUX autoencoder | Q8_0 GGUFs, `ae.safetensors` | Arc Pro B60, on demand | 1024x1024, 8 steps |
 | images, lettering | Qwen-Image (20B MMDiT) with the Qwen2.5-VL-7B encoder and the Wan VAE | Q4_K_M GGUFs | Arc Pro B60, on demand | 1024x1024, 20 steps |
 | images, editing | FLUX.2 klein 4B with the Qwen3-4B encoder and its own VAE; ESRGAN 4x on every image unit | Q8_0 GGUFs | Arc Pro B60, on demand | 1024x1024, 4 steps; `/v1/images/edits` |
+| vision | Qwen2.5-VL-7B-Instruct (`qwen2vl`) with its vision projector | Q4_K_M GGUF + Q8_0 mmproj | Arc Pro B60, on demand | 32,768 tokens, q8_0:q4_0 KV; `image_url` data URIs |
+| speech out | Qwen3-TTS-12Hz-1.7B-Base (`qwen3tts`) with its audio-generation projector (speaker encoder, code predictor, acoustic decoder) | Q8_0 GGUF + Q8_0 mmproj with the code head and embedding at f16 | backbone on the Arc Pro B60, the projector on the CPU; on demand | German; enrolled voices only |
+| speech in | Whisper large-v3-turbo (whisper.cpp) | whisper.cpp's `.bin` | Arc Pro B60, on demand | German first; `/v1/audio/transcriptions` |
 
-The engine admits these architectures (`qwen35`, `qwen35moe`, `qwen4exp`, and
-`llama` at the Mistral Small 24B geometry) and refuses others at load.
+The engine admits these architectures (`qwen35`, `qwen35moe`, `qwen4exp`,
+`llama` at the Mistral Small 24B geometry, `qwen2vl` for vision, and under
+`--tts` `qwen3tts`) and refuses others at load.
 Flash-Next's other files are on-demand options on the same endpoint: IQ2_XS,
 faster and less exact, and UD-Q3_K_XL, inside the KL bar once the host has
 the RAM for its bank (DESIGN §7.2).
