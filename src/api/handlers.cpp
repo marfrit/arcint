@@ -506,13 +506,15 @@ json props(const Context& ctx) {
           {"git", ARCINT_GIT_SHA},
           {"type", ARCINT_BUILD_TYPE},
           {"compiler", ARCINT_COMPILER}}},
-        // The multimodal/audio presence: the backbone file and the projector,
-        // the served TTS flag and the enrolled-voice count (names not required
-        // on /props by D5; GET /v1/audio/voices carries them). All describe
-        // what this server actually loaded.
+        // The multimodal/audio presence: the backbone, the projector and its
+        // own halves (libmtmd's cap), the served TTS flag and the enrolled-voice
+        // count (names not required on /props by D5; GET /v1/audio/voices
+        // carries them). All describe what this server actually loaded.
         {"multimodal",
          {{"backbone_loaded", st.loaded && !st.stub},
-          {"mmproj_loaded", st.mmproj_loaded}}},
+          {"mmproj_loaded", st.mmproj_loaded},
+          {"vision", st.mmproj_vision},
+          {"audio", st.mmproj_audio}}},
         {"tts", st.tts},
         {"voices", static_cast<int>(st.voices.size())},
         {"endpoints",

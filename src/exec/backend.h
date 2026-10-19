@@ -52,6 +52,13 @@ struct ModelStatus {
     // milestone-1.2.0.md A2). The stub is false, so the suite's text-only
     // refusal still exercises that branch.
     bool        mmproj_loaded = false;
+    // The projector's own capabilities, from libmtmd's
+    // `mtmd_get_cap_from_file` (EXPERIMENTAL at the pin): whether its clip
+    // half takes images (`inp_vision`) and/or audio (`inp_audio`). /props
+    // reports them so the image path and the audio-generation path can be told
+    // apart from the projector alone, not only from --tts. False on the stub.
+    bool        mmproj_vision = false;
+    bool        mmproj_audio  = false;
     // --tts and a mmproj whose gen half supports audio generation: the speech
     // routes are served (docs/milestone-1.2.0.md A4). False on the stub and on
     // a build without --tts, which is how the route refuses clearly.

@@ -409,11 +409,16 @@ equal to HF's LFS pointers (`measured-here`).
 | 512² encode | image slice 242-243 ms, image batch 7 ms, prefill 0.37 s (958-973 t/s) |
 | memory | peak VRAM 6445 MiB, GTT 46 MiB, RSS 745 MiB, physical host MemAvailable ~55 GiB during the requests (sampler) |
 
-The gate tool `tools/vlm_gate.py` is built but **not yet run as a tool** (the
-phase-0 set above was run by a scratch script); a CPU-side encoder reference
-for B4 is not measured; the op profile per node is not taken; no red case
-yet; the endpoint is not package/unit/probe-complete. These are the open
-dispositions of the next card window.
+**Phase-0 dispositions (`measured-here`, 2026-10-18).** A1: `libmtmd` builds
+inside arcint (`code`). A2: an `image_url` data URI answers and the OpenCL
+device is named for the mmproj graph, no CPU island reported (`measured-here`).
+B1/B4: 1024² 1369 image tokens (1407 with text), image slice 1716 ms, image
+batch 314 ms, prefill 2.34 s (600.9 t/s); 512² slice 242-243 ms, batch 7 ms,
+prefill 0.37 s (`measured-here`). C1/C2: the content check **4/4**
+(`measured-here`). The mmproj's own halves (vision/audio) are now published on
+`/props` (§9.9). **Open (owed):** `tools/vlm_gate.py` run as a tool (the set was
+driven by a scratch script), a CPU-side encoder B4 reference, the per-node op
+profile, a red case, and the endpoint's package/unit/probe completion.
 
 **RESOLVED (2026-10-18 evening, operator):** Markus power-cycled the card
 host after the §9.1 `xe` oops; the host, the guests and the production units
@@ -566,13 +571,15 @@ path on `gate-fleurs` (FLEURS `de_de`, CC-BY-4.0) through
 | enrolment proof (D5 end to end) | `tools/tts_enrol.py` enrolled the FLEURS stand-ins `markus-test` (10.0 s) and `frau-test` (10.8 s) into the operator-local profile dir; the server served them as names; one sentence each synthesized and round-tripped at WER **0.0000** |
 | window hygiene | sampler on the physical host, leg aborts on a stale sampler log; non-service holder check before every card step; agent stopped by its unit and restored, `:8087` verified; one non-service process per card; dev servers killed by pid |
 
-The C4 reversal against §9.3's earlier FAIL confirms the campaign fix; B3
-stays open as its own campaign. The VLM phase-0 dispositions (the `vlm_gate`
-tool run, the CPU encoder B4 reference, the op profile, the red case, the
-package/unit/probes) are still open. The speech units' files are written
-(`contrib/systemd/`, ports 8083/8084/8091 proposed); the `/props` extensions
-landed (tts flag, enrolled-voice count, multimodal fields, on the record
-above); the packages remain owed.
+The C4 reversal against §9.3's earlier FAIL confirms the campaign fix; B3 was
+later closed by lever (b) (§9.7). The VLM phase-0 dispositions are recorded in
+§9.1; the `vlm_gate` tool run, the CPU encoder B4 reference, the op profile, the
+red case and the endpoint's package/unit/probe completion stay open. The speech
+units' files are written (`contrib/systemd/`, ports 8083/8084/8091 proposed);
+`/props` carries the tts flag, the enrolled-voice count and, since §9.9, the
+projector's own `vision`/`audio` halves. The packages remain owed: the 1.2.0
+`arcint` deb after the feature freeze, and a new `arcint-stt` recipe for the
+`arcint-whisper` binary (no package PR, D9).
 
 ### 9.5 The TTS real-time profile (Phase 1, 2026-10-19)
 
@@ -760,6 +767,19 @@ Low-download CC alternatives with speaker labels were surveyed and not taken
 (Common Voice gated or empty; VoxPopuli `de` ungated with `speaker_id` but its
 smallest parquet 936 MB). The real same-person recordings remain the operator's
 final C5.
+
+### 9.9 `/props` projector halves: VLM vs TTS from the projector itself (Phase 4, 2026-10-19)
+
+`ModelStatus` gains `mmproj_vision`/`mmproj_audio`, filled at the mmproj load
+from libmtmd's `mtmd_get_cap_from_file` (`mtmd_caps.inp_vision`/`inp_audio`;
+EXPERIMENTAL at the pin). `/props` `multimodal` publishes them beside
+`backbone_loaded`/`mmproj_loaded`, so a client tells the image path from the
+audio-generation path without reading the process's `--tts` flag. The stub
+reports false/false. Unit tests: a synthetic-status cell covers vision-only,
+audio-only and none, and a source tripwire pins the cap call in the load site
+(`tests/test_props.cpp`); the bare `ctest -L unit` ladder is green (178 cases,
+0 failed, the stub roundtrip among them), `measured-here`. The omission was
+`code`: the field `mmproj_loaded` did not say which half the file carried.
 
 ## 10. References
 

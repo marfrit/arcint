@@ -78,9 +78,11 @@ any clip context on the card (`backend_llama.cpp` captures libmtmd's
 - `POST /v1/audio/transcriptions` — **built for STT** (whisper.cpp's own server served with `--inference-path /v1/audio/transcriptions`, so no route patch is needed: `file`, `language` and `response_format` match the OpenAI shape and a plain `json` returns `{"text":...}`). OpenAI multipart: `file`, `model`, `language`, `response_format` (`json`/`text`) → `{"text":...}`. German first (D3).
 - `GET /v1/audio/voices` — **built.** The enrolled names only; never a
   reference, never a path, never audio bytes (D5).
-- `GET /health` and `GET /props` — existing; the service phase adds the
-  mmproj/backbone/card, the enrolled-voice **count** (names not required on
-  `/props` by D5) and the whisper model's own fields.
+- `GET /health` and `GET /props` — existing; landed: `multimodal` (backbone
+  loaded, mmproj loaded, and the projector's own `vision`/`audio` halves from
+  libmtmd's cap query, milestone §9.9), the `tts` flag and the enrolled-voice
+  **count** (names not required on `/props` by D5); the whisper binary reports
+  its own fields.
 
 ## The enrolment (D5)
 

@@ -752,6 +752,9 @@ public:
                                     on_card.c_str()));
             }
             status_.mmproj_loaded = true;
+            const mtmd_caps mcap = mtmd_get_cap_from_file(cfg.mmproj_path.c_str());
+            status_.mmproj_vision = mcap.inp_vision;
+            status_.mmproj_audio  = mcap.inp_audio;
             const mtmd_gen_audio_info gen = mtmd_gen_audio_get_info(mctx_);
             tts_info_ = gen;   // the gen half's type and sample rate, for --tts
             log::info("load", "mmproj: %s (image input%s; docs/milestone-1.2.0.md)", cfg.mmproj_path.c_str(),

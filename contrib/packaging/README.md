@@ -41,6 +41,9 @@ directory exists to prevent.
                             kernels in sd-server, the /props build string, ldd
                             resolution, no Vulkan
       debian/               control, copyright, changelog
+    arcint-stt/           (owed for 1.2.0) build-deb.sh for the whisper binary
+                          `arcint-whisper` from contrib/whisper/build-whisper.sh;
+                          no package PR in the 1.2.0 session (D9)
 
 ## Two things worth knowing before you try
 
