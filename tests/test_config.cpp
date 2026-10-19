@@ -913,3 +913,39 @@ TEST(config_llama_kv_dtype_reports_the_configured_type) {
         CHECK_EQ(llama_kv_dtype(cfg), std::string(c.want));
     }
 }
+
+// --tts-gen-device cpu|gpu: where the audio-generation mmproj's own clip graphs
+// run. "gpu" (default) keeps them on the card with the backbone; "cpu" is the
+// hybrid placement the TTS real-time campaign measured as the best arm. The
+// flag needs --tts, takes exactly gpu or cpu, and the stub rejects it. The
+// placement itself is checked at load in backend_llama.cpp (a red if a cpu
+// request builds the graphs on the card); this cell is the spec.
+TEST(config_tts_gen_device_gpu_or_cpu) {
+    const auto tts_args = [](std::vector<const char*> extra) {
+        std::vector<const char*> a = {"--gguf", "/m/q.gguf", "--mmproj", "/m/mm.gguf",
+                                      "--tts", "--tts-profiles", "/m/voices"};
+        a.insert(a.end(), extra.begin(), extra.end());
+        return a;
+    };
+    {
+        Config cfg;
+        CHECK(run(tts_args({}), cfg).ok);
+        CHECK_EQ(cfg.tts_gen_device, std::string("gpu"));   // the card-only default
+    }
+    for (const char* v : {"gpu", "cpu"}) {
+        Config cfg;
+        CHECK(run(tts_args({"--tts-gen-device", v}), cfg).ok);
+        CHECK_EQ(cfg.tts_gen_device, std::string(v));
+    }
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--mmproj", "/m/mm.gguf", "--tts", "--tts-profiles", "/m/voices",
+                    "--tts-gen-device", "card"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--mmproj", "/m/mm.gguf", "--tts", "--tts-profiles", "/m/voices",
+                    "--tts-gen-device", "CPU"}));   // the values are lowercase
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--mmproj", "/m/mm.gguf", "--tts-gen-device", "cpu"}));   // needs --tts
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--tts-gen-device", "cpu"}));   // needs --tts
+    CHECK(rejected({"--stub", "--tts-gen-device", "cpu"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--mmproj", "/m/mm.gguf", "--tts", "--tts-profiles", "/m/voices",
+                    "--tts-gen-device"}));   // no value
+    const std::string help = usage_text();
+    CHECK(help.find("--tts-gen-device") != std::string::npos);
+}

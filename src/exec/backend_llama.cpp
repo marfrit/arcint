@@ -230,6 +230,28 @@ void route_llama_log(ggml_log_level level, const char* text, void*) {
     else log::verbose("llama", "%s", s.c_str());
 }
 
+#ifdef ARCINT_MTMD
+// --tts-gen-device (docs/speech-service.md, docs/campaigns/
+// qwen3tts-card-real-time.md): libmtmd's clip_init logs one
+// "CLIP using <backend> backend" line per clip context it builds (clip.cpp).
+// Capture those lines while mtmd_init_from_file runs and check that the
+// placement the flag asked for actually landed. The red switch
+// ARCINT_TTS_GEN_FORCE_GPU=1 negates a cpu request: the capture then shows a
+// card backend and the boot aborts, so a cpu request that served from the card
+// cannot happen silently. tools/tts_placement_check.sh runs both cases.
+thread_local std::string* g_mtmd_capture = nullptr;
+
+void route_mtmd_log(ggml_log_level level, const char* text, void*) {
+    std::string s(text != nullptr ? text : "");
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    if (s.empty()) return;
+    if (g_mtmd_capture != nullptr) g_mtmd_capture->append(s).append("\n");
+    if (level == GGML_LOG_LEVEL_ERROR) log::error("mtmd", "%s", s.c_str());
+    else if (level == GGML_LOG_LEVEL_WARN) log::warn("mtmd", "%s", s.c_str());
+    else log::verbose("mtmd", "%s", s.c_str());
+}
+#endif
+
 class LlamaTokenizer final : public Tokenizer {
 public:
     explicit LlamaTokenizer(const llama_vocab* v) : v_(v) {}
@@ -695,11 +717,40 @@ public:
         // model, the TTS branch later refuses (docs/milestone-1.2.0.md A4).
         if (!cfg.mmproj_path.empty()) {
             mtmd_context_params mtp = mtmd_context_params_default();
-            mtp.use_gpu       = true;
+            // --tts-gen-device cpu: the audio-generation mmproj's own clip graphs
+            // (speaker encoder, code predictor, code2wav) on the CPU, the
+            // backbone (libllama) on the card -- the hybrid placement the
+            // TTS real-time campaign measured as the best arm. One mmproj
+            // context takes one backend for all its halves (clip.cpp); the TTS
+            // mmproj carries no vision half. "gpu" is the default.
+            const bool cpu_request = cfg.tts && cfg.tts_gen_device == "cpu";
+            const bool forced_gpu = std::getenv("ARCINT_TTS_GEN_FORCE_GPU") != nullptr;
+            mtp.use_gpu       = !(cpu_request && !forced_gpu);
             mtp.print_timings = cfg.verbosity >= 1;
+            mtmd_log_set(route_mtmd_log, nullptr);
+            std::string clip_log;
+            g_mtmd_capture = &clip_log;
             mctx_ = mtmd_init_from_file(cfg.mmproj_path.c_str(), model_, mtp);
+            g_mtmd_capture = nullptr;
             if (mctx_ == nullptr)
                 throw std::runtime_error(log::format("libmtmd could not load %s", cfg.mmproj_path.c_str()));
+            if (cpu_request) {
+                // red if the mmproj graphs landed on the card: the clip_init
+                // line names the device it built
+                std::string on_card;
+                for (size_t p = 0; (p = clip_log.find("CLIP using ", p)) != std::string::npos; ) {
+                    const size_t e = clip_log.find("\n", p);
+                    const std::string line = clip_log.substr(p, e == std::string::npos ? std::string::npos : e - p);
+                    if (line.find("CLIP using CPU backend") == std::string::npos) on_card = line;
+                    p += line.size();
+                }
+                if (!on_card.empty())
+                    throw std::runtime_error(
+                        log::format("--tts-gen-device cpu: libmtmd built an mmproj clip context on the card, not the CPU "
+                                    "('%s'; the placement was not applied). ARCINT_TTS_GEN_FORCE_GPU=1 is the red switch that "
+                                    "negates the request for the placement check",
+                                    on_card.c_str()));
+            }
             status_.mmproj_loaded = true;
             const mtmd_gen_audio_info gen = mtmd_gen_audio_get_info(mctx_);
             tts_info_ = gen;   // the gen half's type and sample rate, for --tts

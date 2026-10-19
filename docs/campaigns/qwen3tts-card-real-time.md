@@ -203,6 +203,23 @@ record (the three raw diffs, the op log) and it is regenerable as
 `0061-*.patch` if a card-only path is ever adopted. The instrumentation is a
 scratch build; the arms above name their binaries.
 
+**The hybrid placement landed as a real option (2026-10-19, `code`).** The
+scratch switch refuted by the placement window is now the documented
+`--tts-gen-device cpu|gpu` flag (`gpu` default, the card-only line; `cpu` the
+hybrid), config-parsed and unit-tested like the other `--tts` options; a
+`cpu` request needs `--tts` and the device-free stub refuses it
+(`src/config.{h,cpp}`, `tests/test_config.cpp`). `contrib/systemd/
+arcint-tts.service` carries `--tts-gen-device cpu` (proposal, operator may
+veto; `docs/speech-service.md`). The flag is applied in `backend_llama.cpp`,
+which sets `mtmd_context_params.use_gpu = false` for a `cpu` request. **The
+placement is checked, not assumed:** the same code captures libmtmd's
+`clip_init` line (`clip.cpp:192`, "CLIP using %s backend") while the `mmproj`
+loads and refuses the boot if a `cpu` request built any clip context on the
+card; `ARCINT_TTS_GEN_FORCE_GPU=1` is the red switch and
+`tools/tts_placement_check.sh` runs red-then-green on the card host. C4 is
+unchanged (the placement is the same arm the campaign measured). This landing
+is `code`; the 0.828/0.751/1,692 ms numbers it rests on stay `measured-here`.
+
 ## Where it lives
 
 - The loop: `src/exec/backend_llama.cpp` (`generate_speech`); upstream

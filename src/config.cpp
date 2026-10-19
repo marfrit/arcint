@@ -150,6 +150,11 @@ std::string usage_text() {
         "                            repository (D5); default $ARCINT_TTS_PROFILES\n"
         "  --tts-lang LANG           the synthesised text's language, zh en de it pt es\n"
         "                            ja ko fr or ru (default de)\n"
+        "  --tts-gen-device DEV      where the audio-generation mmproj's clip graphs\n"
+        "                            run: gpu (default, on the card with the backbone)\n"
+        "                            or cpu (the hybrid: backbone on the card, the\n"
+        "                            speaker encoder, code predictor and code2wav on\n"
+        "                            the CPU; the best measured TTS arm)\n"
         "  --stub                    serve the stub backend (no model, no GPU): the whole\n"
         "                            HTTP surface for the device-free suites\n"
         "  --stub-delay-ms N         stub only: artificial latency per token\n"
@@ -392,6 +397,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--tts-lang") {
             if (!value(v)) return fail("--tts-lang needs a language code");
             cfg.tts_lang = std::string(v);
+        } else if (arg == "--tts-gen-device") {
+            if (!value(v)) return fail("--tts-gen-device needs a device");
+            cfg.tts_gen_device = std::string(v);
         } else if (arg == "--device") {
             if (!value(v)) return fail("--device needs a value");
             cfg.device = std::string(v);
@@ -585,11 +593,12 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             cfg.llama_dflash_min_p > 0.0 || cfg.llama_dflash_ubatch > 0 ||
             cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192 ||
             cfg.llama_expert_cache_on() || !cfg.llama_expert_profile.empty() || cfg.llama_layer_split > 0 || cfg.llama_mtp_card >= 0 ||
-            cfg.llama_reserve_cells > 0 || cfg.tts || !cfg.tts_profiles.empty() || cfg.tts_lang != "de")
+            cfg.llama_reserve_cells > 0 || cfg.tts || !cfg.tts_profiles.empty() || cfg.tts_lang != "de" ||
+            cfg.tts_gen_device != "gpu")
             return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab/-gguf/-min-p, --llama-dflash/-gguf/-min-p/-ubatch, "
                         "--llama-kv, --llama-checkpoints/-step, "
                         "--llama-expert-cache/-profile, --llama-layer-split, --llama-mtp-card, --llama-reserve-cells and --tts "
-                        "(-profiles/-lang) are options of "
+                        "(-profiles/-lang/-gen-device) are options of "
                         "the libllama engine (--gguf), not of --stub");
         return {};
     }
@@ -605,6 +614,10 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         return fail("--tts-profiles needs --tts (the audio-generation path)");
     if (!cfg.tts && cfg.tts_lang != "de")
         return fail("--tts-lang needs --tts");
+    if (!cfg.tts && cfg.tts_gen_device != "gpu")
+        return fail("--tts-gen-device needs --tts (the audio-generation path)");
+    if (cfg.tts_gen_device != "gpu" && cfg.tts_gen_device != "cpu")
+        return fail("--tts-gen-device takes gpu (the card, the default) or cpu (the hybrid: backbone on the card, the mmproj graphs on the CPU)");
     {
         static const char* const kTtsLangs[] = {"zh", "en", "de", "it", "pt", "es", "ja", "ko", "fr", "ru"};
         bool known = false;

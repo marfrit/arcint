@@ -20,7 +20,7 @@ the operator fixes them.
 | unit | binary | model files | routes | state |
 |---|---|---|---|---|
 | `arcint-vlm` | `/usr/bin/arcint` (`arcint` package) | `Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf` + `mmproj-...-Q8_0.gguf` | `/v1/chat/completions` with `image_url` | **built** (chat path + unit file; package and the `/props` multimodal fields owed) |
-| `arcint-tts` | `/usr/bin/arcint` (`arcint` package) | `Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` + **`mmproj-Qwen3-TTS-...-bf16.gguf`** (the Q8_0 mmproj's code predictor is defective; the campaign) | `POST /v1/audio/speech`, `GET /v1/audio/voices` | **built** (the `libmtmd` `gen_audio` path + routes + unit file); the first card gate **FAIL**ed on the Q8_0 mmproj (greedy WER 2.09, stochastic WER 2.1667, a 512-frame cap and no end-of-speech); `docs/campaigns/qwen3tts-german-genpath.md` (closed) isolated it to the mmproj's code predictor `a.gen.code` at Q8_0 and fixed it with a bf16 mmproj. The card arm at the fixed model (2026-10-19, `measured-here`) is **C4 PASS** (round-trip corpus WER 0.0455, floor 0.20, `codec_eos` sampled at 46–69 frames) but **B3 FAIL** (real-time factor 0.258, no faster than the CPU's 0.233; `docs/campaigns/qwen3tts-card-real-time.md`) |
+| `arcint-tts` | `/usr/bin/arcint` (`arcint` package) | `Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` + **`mmproj-Qwen3-TTS-...-bf16.gguf`** (the Q8_0 mmproj's code predictor is defective; the campaign) | `POST /v1/audio/speech`, `GET /v1/audio/voices` | **built** (the `libmtmd` `gen_audio` path + routes + unit file; the unit takes `--tts-gen-device cpu`, the hybrid placement: the best measured TTS arm at 0.828 real-time factor, campaign `qwen3tts-card-real-time`); the first card gate **FAIL**ed on the Q8_0 mmproj (greedy WER 2.09, stochastic WER 2.1667, a 512-frame cap and no end-of-speech); `docs/campaigns/qwen3tts-german-genpath.md` (closed) isolated it to the mmproj's code predictor `a.gen.code` at Q8_0 and fixed it with a bf16 mmproj. The card arm at the fixed model (2026-10-19, `measured-here`) is **C4 PASS** (round-trip corpus WER 0.0455, floor 0.20, `codec_eos` sampled at 46–69 frames) but **B3 FAIL** (real-time factor 0.258, no faster than the CPU's 0.233; `docs/campaigns/qwen3tts-card-real-time.md`) |
 | `arcint-stt` | `/usr/bin/arcint-whisper` (`arcint-stt` package) | `ggml-large-v3-turbo.bin` (or `ggml-large-v3.bin`) | `POST /v1/audio/transcriptions` | **built** (whisper.cpp on the installed ggml, card gate PASS; unit file written; package and `/props` owed) |
 
 Ports (proposed; the operator fixes them): `arcint-vlm` 8083, `arcint-tts` 8084,
@@ -37,6 +37,22 @@ two of these at once (`Conflicts=` covers the card, as the image units do).
 A770 where it fits next to the coder, otherwise the B60 on demand"). The B60
 is also shared with the image service: before a window, release through the
 front; the units carry the same `Conflicts=` as `arcint-imggen`.
+
+**TTS placement (operator's call).** `--tts-gen-device` selects where the
+audio-generation `mmproj`'s own clip graphs run: `gpu` (default, on the card
+with the backbone) or `cpu` (the hybrid: the speaker encoder, the code
+predictor and the code2wav decoder on the CPU, the backbone on the card). The
+flag needs `--tts`, and the card-only TTS arm is 0.751 real-time factor against
+the hybrid's measured **0.828** (`measured-here`, 2026-10-19, C4 PASS on both;
+`docs/campaigns/qwen3tts-card-real-time.md`): the CPU codec flushes in 1,692 ms
+against the card's 1,780-2,000, and the card-only predictor is 4.5x the single
+CPU backend. **Proposal, operator may veto:** `arcint-tts.service` carries
+`--tts-gen-device cpu`. An `mmproj` context takes one backend for all its
+halves, so the flag selects the whole `mmproj`; the TTS `mmproj` carries no
+vision half. The boot refuses with a placement error if a `cpu` request builds
+any clip context on the card (`backend_llama.cpp` captures libmtmd's
+`clip_init` backend line; `tools/tts_placement_check.sh` is the red-first gate,
+`ARCINT_TTS_GEN_FORCE_GPU=1` its red switch).
 
 ## The routes
 
@@ -121,6 +137,8 @@ page-fault oops and a hung host (`docs/milestone-1.2.0.md §9.1`,
 - The chat parser accepting `image_url`: `src/core/chat.cpp`, `src/api/
   handlers.cpp`.
 - The whisper recipe: `contrib/whisper/`.
-- The gates: `tools/vlm_gate.py`, `tools/stt_gate.py`, `tools/tts_gate.py`;
+- The gates: `tools/vlm_gate.py`, `tools/stt_gate.py`, `tools/tts_gate.py`,
+  `tools/tts_placement_check.sh` (the hybrid placement: red `ARCINT_TTS_GEN_FORCE_GPU=1`,
+  green `--tts-gen-device cpu`);
   the enrolment: `tools/tts_enrol.py`.
 - The models, licences and staging: `docs/milestone-1.2.0.md` §2.

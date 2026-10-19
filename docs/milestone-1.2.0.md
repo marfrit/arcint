@@ -591,6 +591,14 @@ hybrid remains the best arm and is the **proposed** production placement
 is green/red-green on the B60 but the patch is **dropped** (its only
 beneficiary, the card-only predictor, is not adopted).
 
+**The hybrid landed as a real option (2026-10-19, `code`).** The placement
+switch is the documented `--tts-gen-device cpu|gpu` (`gpu` default; `cpu` the
+hybrid), parsed and unit-tested with the other `--tts` flags, carried by
+`arcint-tts.service`, and applied in `backend_llama.cpp`; the boot refuses a
+`cpu` request that builds any `mmproj` clip context on the card (libmtmd's
+`clip_init` backend line is captured; `ARCINT_TTS_GEN_FORCE_GPU=1` the red
+switch, `tools/tts_placement_check.sh` the red-first gate). C4 is unchanged.
+
 ## 10. References
 
 - llama.cpp `3e4dfa8`: `tools/mtmd/{mtmd.h,mtmd.cpp,mtmd-image.cpp,

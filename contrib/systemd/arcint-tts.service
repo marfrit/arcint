@@ -20,6 +20,13 @@
 # voice count and the tts flag are on /props (names on /v1/audio/voices).
 # Vocab/backbone flags mirror the reference tools/tts recipe; the sampler
 # (temperature/seed) is per request and printed with every gate verdict.
+# --tts-gen-device cpu is the hybrid placement (backbone on the card, the
+# mmproj's speaker encoder + code predictor + code2wav on the CPU): the best
+# measured TTS arm, 0.828 real-time factor against the card-only 0.751 (the
+# campaign qwen3tts-card-real-time; the CPU codec is 1,692 ms/flush against
+# 1,780-2,000 on the card, and the card-only predictor is 4.5x the single
+# CPU backend). It loads the mmproj clip graphs on the CPU and the boot
+# aborts if any of them lands on the card (the check in backend_llama.cpp).
 
 [Unit]
 Description=arcint-tts — Qwen3-TTS speech with enrolled voices, GPU.0 (Arc Pro B60), :8084, on demand
@@ -34,6 +41,7 @@ ExecStart=/usr/bin/arcint \
     --gguf /models/tts-qwen3/Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
     --mmproj /models/tts-qwen3/mmproj-Qwen3-TTS-12Hz-1.7B-Base-bf16.gguf \
     --tts --tts-profiles /models/tts-qwen3/profiles-de --tts-lang de \
+    --tts-gen-device cpu \
     --served-model-name qwen3-tts-12hz-1.7b \
     --device GPU.0 \
     --host 0.0.0.0 --port 8084 \

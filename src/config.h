@@ -33,6 +33,14 @@ struct Config {
     // codec_language codes the backbone carries (default de, the 1.2.0
     // German-first mandate). A voice's own profile language wins when set.
     std::string tts_lang = "de";
+    // --tts-gen-device cpu|gpu: where the audio-generation mmproj's own clip
+    // graphs run -- the speaker encoder, the code predictor and the code2wav
+    // decoder. "gpu" (default) puts them on the card with the backbone; "cpu"
+    // is the hybrid placement (backbone on the card, the mmproj graphs on the
+    // CPU, the best measured arm for the TTS real-time campaign). An mmproj
+    // context takes one backend, so the flag selects the whole mmproj; the TTS
+    // mmproj carries no vision half.
+    std::string tts_gen_device = "gpu";
     // --engine: "llama" (ggml's OpenCL backend through libllama; the model is
     // --gguf) is the only engine. The flag is kept for the units' sake;
     // "ov" is refused with a pointer to the tag openvino-history.
