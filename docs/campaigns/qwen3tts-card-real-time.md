@@ -173,8 +173,8 @@ unchanged and PASS (WER 0.0455) on every arm**:
 remains out of reach, and the overlap hypothesis is **refuted with numbers**
 — the decoder's per-call cost is fixed, the flush window must stay 72 (its
 seam), so there is nothing to overlap and lowering it costs both wall and
-waveform. **Proposal, operator may veto:** the production TTS unit takes the
-hybrid placement (code2wav on the CPU, backbone on the card); its price is the
+waveform. **Accepted by the operator 2026-10-19:** the production TTS unit
+takes the hybrid placement (code2wav on the CPU, backbone on the card); its price is the
 0.828-and-17 %-short row against the far worse card-only (0.751, 0.420) and
 async (0.536) arms. Real time still needs the decoder's per-call cost reduced
 (lever a) or the predictor's per-node count reduced (lever b), not a placement
@@ -186,8 +186,8 @@ valid-frames switch scales it with the flushed count and gives ~0.90 at window
 72, the C4 card gate owed); (b) the code predictor's node/launch count
 (`cache_set`'s concat+arange+get_rows and the per-step sampling, ~1,600 of
 6,792 nodes) — reduce nodes or fuse. Placement is settled by the disposition
-above (the hybrid, operator may veto); pipelining is closed by the measured
-refutation.
+above (the hybrid; accepted by the operator 2026-10-19); pipelining is closed
+by the measured refutation.
 
 `0061` (OpenCL `ARANGE`) is **measured, reviewed and dropped from the numbered
 series.** Op suite on the B60 (the CPU reference): **2/2 PASS** green,
@@ -209,8 +209,8 @@ scratch switch refuted by the placement window is now the documented
 hybrid), config-parsed and unit-tested like the other `--tts` options; a
 `cpu` request needs `--tts` and the device-free stub refuses it
 (`src/config.{h,cpp}`, `tests/test_config.cpp`). `contrib/systemd/
-arcint-tts.service` carries `--tts-gen-device cpu` (proposal, operator may
-veto; `docs/speech-service.md`). The flag is applied in `backend_llama.cpp`,
+arcint-tts.service` carries `--tts-gen-device cpu` (accepted by the
+operator 2026-10-19; `docs/speech-service.md`). The flag is applied in `backend_llama.cpp`,
 which sets `mtmd_context_params.use_gpu = false` for a `cpu` request. **The
 placement is checked, not assumed:** the same code captures libmtmd's
 `clip_init` line (`clip.cpp:192`, "CLIP using %s backend") while the `mmproj`

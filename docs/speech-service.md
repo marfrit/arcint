@@ -46,8 +46,8 @@ flag needs `--tts`, and the card-only TTS arm is 0.751 real-time factor against
 the hybrid's measured **0.828** (`measured-here`, 2026-10-19, C4 PASS on both;
 `docs/campaigns/qwen3tts-card-real-time.md`): the CPU codec flushes in 1,692 ms
 against the card's 1,780-2,000, and the card-only predictor is 4.5x the single
-CPU backend. **Proposal, operator may veto:** `arcint-tts.service` carries
-`--tts-gen-device cpu`. An `mmproj` context takes one backend for all its
+CPU backend. **Accepted by the operator 2026-10-19:** `arcint-tts.service`
+carries `--tts-gen-device cpu`. An `mmproj` context takes one backend for all its
 halves, so the flag selects the whole `mmproj`; the TTS `mmproj` carries no
 vision half. The boot refuses with a placement error if a `cpu` request builds
 any clip context on the card (`backend_llama.cpp` captures libmtmd's

@@ -21,8 +21,9 @@
 # Vocab/backbone flags mirror the reference tools/tts recipe; the sampler
 # (temperature/seed) is per request and printed with every gate verdict.
 # --tts-gen-device cpu is the hybrid placement (backbone on the card, the
-# mmproj's speaker encoder + code predictor + code2wav on the CPU): the best
-# measured TTS arm, 0.828 real-time factor against the card-only 0.751 (the
+# mmproj's speaker encoder + code predictor + code2wav on the CPU); accepted
+# by the operator 2026-10-19. It is the best measured TTS arm, 0.828
+# real-time factor against the card-only 0.751 (the
 # campaign qwen3tts-card-real-time; the CPU codec is 1,692 ms/flush against
 # 1,780-2,000 on the card, and the card-only predictor is 4.5x the single
 # CPU backend). It loads the mmproj clip graphs on the CPU and the boot

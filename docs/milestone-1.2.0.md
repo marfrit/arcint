@@ -586,8 +586,8 @@ same sample count and WER). With `window_frames=72` a 51-69-frame sentence has
 one flush, so there is nothing to overlap; the async worker also drifts the
 sampled frames (66,50,45,72,48,57,60,54 against the deterministic
 62,61,56,66,51,64,69,51) — concurrent card use is not adoptable. **Update:** the
-hybrid remains the best arm and is the **proposed** production placement
-(operator may veto); pipelining is closed by the refutation; `0061`'s op suite
+hybrid remains the best arm and is the production placement **accepted by
+the operator 2026-10-19**; pipelining is closed by the refutation; `0061`'s op suite
 is green/red-green on the B60 but the patch is **dropped** (its only
 beneficiary, the card-only predictor, is not adopted).
 
