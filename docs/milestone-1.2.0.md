@@ -420,11 +420,11 @@ prefill 0.37 s (`measured-here`). C1/C2: the content check **4/4**
 driven by a scratch script), a CPU-side encoder B4 reference, the per-node op
 profile, a red case, and the endpoint's package/unit/probe completion.
 **Resolved by §9.10 (2026-10-19):** the gate tool run with a committed fixed
-set (C1/C2 9/9), the per-node op profile (A2/B1, no CPU island), and the
-one-time compile record; the red case is **vacuous** because no VLM kernel was
-added or changed (the profile found no CPU island and no patch was needed);
-the CPU-side B4 reference and the endpoint's package/probe completion stay
-owed.
+set (C1/C2 9/9), the per-node op profile (A2/B1, no CPU island), the CPU-side
+B4 reference (the reference CLI on the card CPU, §9.10) and the one-time
+compile record; the red case is **vacuous** because no VLM kernel was added or
+changed (the profile found no CPU island and no patch was needed); the
+endpoint's package/probe completion stays owed.
 
 **RESOLVED (2026-10-18 evening, operator):** Markus power-cycled the card
 host after the §9.1 `xe` oops; the host, the guests and the production units
@@ -803,6 +803,7 @@ the VLM unit's flags (Qwen2.5-VL Q4_K_M + Q8_0 mmproj, `--n-ctx` 32768,
 | C1/C2, the gate tool | `tools/vlm_gate.py` with the committed manifest `tools/vlm_cases.json` (sha256 `7e95d05e…`): **9/9 = 1.000**, floor 1.0. Answers WILLKOMMEN, Willkommen ×2, Cat, cat, Palm trees and beach., Red, cube, 1. The first case 8.42 s (the one-time clip-kernel compile), the 2048² upscale 8.77 s, the rest 0.41-1.81 s |
 | the set | seven images from the 1.1.0/1.1.1 record, nine questions, kinds lettering/object/background/colour/count, each sha256-pinned; the images stay operator-local beside the committed manifest (charter §4) |
 | B1/B4 card side | 1024² after the compile: image slice encoded 1280 ms, image batch decoded 317 ms (encoder 1.60 s), prompt prefill 1407 tokens in 1.73 s (813.4 t/s), completion 2 tokens 0.03 s; 512² slice 247 ms + 7 ms batch, prefill 362 tokens 0.39 s (938.7 t/s); 2048² (the upscaled cat) slice 7230 ms + batch 479/651 ms, prefill 4130 tokens 8.55 s (483.2 t/s). First 1024²: 5483 ms slice / 8.27 s prefill (kernel compile). Encoder share of the server's recorded phases ≈ 48 % at 1024², ≈ 46 % at 2048², < 10 % at 512² |
+| B4 CPU encoder reference | the reference `llama-mtmd-cli` built from the same pin + series through 0062 (sha256 `9c66c8a2…`, the CPU build's own ggml) with `--no-mmproj-offload -ngl 0 -t 16`, on the card-host CPU (Ryzen 5700X, 16 CPUs; a separate CPU-only run, identical images): CPU encode **14334 ms** (1024²) / **2836** (512²) / **65587** (2048²) / **2822** (512²) against the card's **1597** / **254** / **8360** / **254** → the CPU encoder is **8-11×** the card's; the CPU end-to-end wall 64/16/145/14 s is 16-37× the card's; all four CPU answers are the correct content-check answers. The CLI prints one whole `mtmd batch encoding` time (no slice/batch split), so the CPU/ card columns compare encoder+batch |
 | A2 | `GGML_SCHED_DEBUG=2` on the profiling build: every node `[OpenC ]` (OpenCL), the clip graph `splits = 1, nodes = 1090`; the profiling dump `cl_profiling.csv` holds 11,358 kernels / 1,753.07 ms device exec (includes the load warmup), **zero CPU island** |
 | memory | physical-host sampler (`/models/.tts-prof/vlm-gate.log`, `measured-here`): peak resident vram0 **7,567 MiB** (the 2048² case), GTT 40 MiB; physical MemAvailable min **117,319 MiB**; container peak 5,197 MiB |
 | hygiene | `released:false` (the front was idle); one non-service process per card each phase; `arcint-agent` restored after 85 s, `:8087` active; servers stopped by pid; no stale leg driver |
@@ -816,10 +817,10 @@ red cube (object, colour, count), read from the arms' logs; the charter's
 "Z-Image lettering" has no source image and is recorded as such. A2 holds: no
 op of the vision tower or the backbone fell to the CPU. B1: the vision slice
 is the largest single phase at 1024²/2048² and is **on the device**; no node
-over 10 % needs a ceiling or a campaign. C6 is **vacuous for the VLM**: no
-kernel was added or changed (the profile found no CPU island). B4's
-CPU-side encoder reference is **owed** (started with the reference
-`llama-mtmd-cli --no-mmproj-offload` on the card CPU; see the handover).
+over 10 % needs a ceiling or a campaign. B4: the CPU encoder is 8-11× the
+card's and the CPU answers are the same, so the card's vision path is the
+serving one and the CPU stays the correctness reference. C6 is **vacuous for
+the VLM**: no kernel was added or changed (the profile found no CPU island).
 **A trap:** the server's own phase log sums larger than the gate's endpoint
 wall for the first/warmup-heavy requests — the gate's per-case seconds are
 ≈ prefill + decode, i.e. they exclude the logged `image slice` / `image
@@ -852,3 +853,37 @@ mmproj/backbone state and the projector's own halves (§9.9), and the 1.2.0
   unit and contract form), `contrib/llama.cpp/patches` (0059, 0060, 0062).
 - The 1.1.0 gate tool `tools/imggen_gate.py` (its parity check is the
   pattern for the three new gates) and `docs/milestone-1.1.0.md` §3.
+
+## 11. Release readiness (1.2.0, state 2026-10-19)
+
+Every §6 criterion with its measured verdict or the reason it is open. This
+is the checklist the release session works from; the release itself (push,
+tag, packages, fresh-container install, A/B) is that session's (D9).
+
+| # | verdict | evidence / reason |
+|---|---|---|
+| A1 `libmtmd` in arcint at the pin, kernels present, `GGML_MAX_NAME` 64 | **PASS** | `code`+`measured-here`: built (§9.1, §9.10, the `mtmd` target, no `llama-common`); the gate binary named the OpenCL device for the mmproj graph |
+| A2 a VLM image request on the card, no op silently CPU | **PASS** | `measured-here` §9.10: 9/9; `GGML_SCHED_DEBUG=2` every node `[OpenC ]`, clip graph splits=1/1090, zero island |
+| A3 the whisper binary on the installed ggml, `/v1/audio/transcriptions`, a transcription on the card | **PASS** | `measured-here` §9.2: built with `WHISPER_USE_SYSTEM_GGML`; the route via `--inference-path`; the card named; non-empty transcripts; fallbacks 0/0 |
+| A4 `/v1/audio/speech` on the card, the enrolled clone path, WAV out, the 400 refusals | **PASS** | `measured-here` §9.4, §9.7: WAV bytes; arbitrary-reference/unknown-voice 400; C4 PASS |
+| A5 the language services unchanged: the A/B vs the last release, acceptance ≥ 9/10 | **OPEN** | not re-run for 1.2.0 (owed at the release phase). By construction (`code`): 0062 touches only the TTS `GEN_WAV` graph and the generic gen-audio tail, no chat path builds it; the VLM/STT/TTS routes are separate processes. C7 rides with this |
+| A6 one unit, one package per binary, `/health`/`/props` | **PARTIAL** | unit files exist (`contrib/systemd/arcint-{vlm,tts,stt}.service`), `/props` extended (§9.9, unit circuit §9.10); the 1.2.0 `arcint` deb and the new `arcint-stt` recipe are **owed** (`contrib/packaging/README.md`); no unit deployed on the 1.2.0 binary yet; no package PR (D9) |
+| B1 a profile per capability | **VLM PASS, TTS PASS, STT OPEN** | VLM §9.10 (phase shares + op profile + no island); TTS §9.5/§9.7 (campaign `qwen3tts-card-real-time` closed); STT has the phase split (§9.2: encode 804.6 vs 3,553.5 ms, decode 2.11 vs 11.48) but no per-node profile and no `CONV_1D` sizing |
+| B2 STT card faster than the CPU beyond the spread | **PASS** | `measured-here` §9.2: encode 4.4×, decode 5.4×, WER equal |
+| B3 TTS RTF ≥ 1.0 on the sentence set | **PASS** | `measured-here` §9.7: 1.1291 (pre) / 1.1597 (post) on the enlarged D8 set |
+| B4 VLM prefill/encode vs the CPU encoder | **PASS** | `measured-here` §9.10: the CPU encoder is 8-11× the card's on identical images; the CPU answers are the same; a separate CPU-only run |
+| C1 the VLM content check; the operator's threshold | **PASS at 1.0** | `measured-here` §9.10: 9/9 = 1.000, floor 1.0; the operator's floor is still unset |
+| C2 closes 1.1.0's content check (the WILLKOMMEN and the “Z-Image lettering”) | **PASS (WILLKOMMEN) / recorded gap** | `measured-here` §9.10: WILLKOMMEN (three generations) + object/colour/count right. The charter's “Z-Image lettering” has **no source image** in the 1.1.0/1.1.1 record (§9.10) — recorded, not hidden; the Z-Image case is its red cube |
+| C3 STT WER on the FLEURS `de` set: corpus ≤ 0.08 and card ≤ CPU + 0.005 | **PASS** | `measured-here` §9.2: card = CPU **0.0547**, corpus ≤ 0.08 |
+| C4 TTS round-trip WER ≤ 0.10 and no sentence > 0.5 | **PASS** | `measured-here` §9.7: corpus **0.0264**, worst **0.333**, share ≤ 0.10 **89.1 %** |
+| C5 voice similarity, the Seed-TTS-eval WavLM cosine, calibrated | **METHOD PASS / FINAL OPEN** | `measured-here` §9.8: the gate-voice clone-vs-reference mean **0.598** sits at the published same-speaker anchors and above the measured cross pair **0.262**; the calibration floor is the operator's real recordings (his own and his wife's) and is **owed** (D8) |
+| C6 a red case per new or changed kernel | **PASS for 0062 / vacuous for the VLM** | `measured-here` §9.5: the red `MTMD_TTS_WAV_PAD=1` restores the padded waveform (the test can fail); 0061 is dropped; the VLM added no kernel (§9.10); 0059/0060 were closed in 1.1.x |
+| C7 the language path's answers/KL unchanged | **OPEN (rides A5)** | `code`+`measured-here`: 0062's graph is not on any chat path; the served A/B and KL arms are owed with A5 |
+| naturalness, listened, no automatic gate | **OPEN** | operator ear against the real recordings, owed (D8) |
+| release mechanics: push, tag, packages, fresh container, A/B | **DEFERRED** | the release session's (D9); `tools/tts_gate.py` already carries `--embed-cmd` on `run`/`transcribe`, so every C4 arm can report the cosine once the reference WAV is handed to it (operator-local) |
+
+Open summary for the release phase: A5/C7 (the language A/B and KL), A6
+(the 1.2.0 `arcint` deb and the `arcint-stt` recipe), B1-STT (per-node
+profile), C5/naturalness (the operator's recordings), and the release
+mechanics. Everything measured is on the record in §9; nothing is pushed,
+tagged or packaged (D9).
