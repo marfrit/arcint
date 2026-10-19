@@ -80,6 +80,16 @@ the RAM for its bank (DESIGN §7.2).
 
 ## Current numbers
 
+1.2.0's release check (2026-10-19, `measured-here`, the pre-tag packages,
+`docs/milestone-1.2.0.md` §9.11): the agent and the coder alternated with
+1.1.1's binary are equal to it (709.4 / 498.9 t/s at 55k / 138k on the B60;
+51.1 / 47.6 / 44.1 t/s decode and 725 t/s at 41k on the A770), with the same
+answers byte for byte and the task at 10/10 and 9/10. The new services on the
+B60: vision 9/9 on the content check; speech out at 1.12× real time (182.96
+s of audio in 163.84 s) with a round-trip word error rate of 0.026 on 46
+German sentences; speech in at a word error rate of 0.055 on 12 FLEURS
+German clips, equal to the CPU.
+
 1.1.0's pre-tag check (2026-10-18): the release package with each unit's
 flags, alternated with 1.0.0's binary in one window (two runs each,
 Flash-Next three), the model on the NVMe, `measured-here` on the named card;
