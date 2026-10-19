@@ -20,7 +20,7 @@ the operator fixes them.
 | unit | binary | model files | routes | state |
 |---|---|---|---|---|
 | `arcint-vlm` | `/usr/bin/arcint` (`arcint` package) | `Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf` + `mmproj-...-Q8_0.gguf` | `/v1/chat/completions` with `image_url` | **built** (chat path + unit file; package and the `/props` multimodal fields owed) |
-| `arcint-tts` | `/usr/bin/arcint` (`arcint` package) | `Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` + **`mmproj-Qwen3-TTS-...-bf16.gguf`** (the Q8_0 mmproj's code predictor is defective; the campaign) | `POST /v1/audio/speech`, `GET /v1/audio/voices` | **built** (the `libmtmd` `gen_audio` path + routes + unit file; the unit takes `--tts-gen-device cpu`, the hybrid placement: the best measured TTS arm at 0.828 real-time factor, campaign `qwen3tts-card-real-time`); the first card gate **FAIL**ed on the Q8_0 mmproj (greedy WER 2.09, stochastic WER 2.1667, a 512-frame cap and no end-of-speech); `docs/campaigns/qwen3tts-german-genpath.md` (closed) isolated it to the mmproj's code predictor `a.gen.code` at Q8_0 and fixed it with a bf16 mmproj. The card arm at the fixed model (2026-10-19, `measured-here`) is **C4 PASS** (round-trip corpus WER 0.0455, floor 0.20, `codec_eos` sampled at 46–69 frames) but **B3 FAIL** (real-time factor 0.258, no faster than the CPU's 0.233; `docs/campaigns/qwen3tts-card-real-time.md`) |
+| `arcint-tts` | `/usr/bin/arcint` (`arcint` package) | `Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` + **`mmproj-Qwen3-TTS-...-Q8_0-codeheadf16.gguf`** (the production set: requantized to Q8_0 with `gen.code.head`/`gen.code.embd` kept at f16; the official bf16 stays as fallback) | `POST /v1/audio/speech`, `GET /v1/audio/voices` | **built** (the `libmtmd` `gen_audio` path + routes + unit file; the unit takes `--tts-gen-device cpu`, the hybrid placement: the best measured TTS arm at 0.828 real-time factor, campaign `qwen3tts-card-real-time`); the first card gate **FAIL**ed on the Q8_0 mmproj (greedy WER 2.09, stochastic WER 2.1667, a 512-frame cap and no end-of-speech); `docs/campaigns/qwen3tts-german-genpath.md` (closed) isolated it to the mmproj's code predictor `a.gen.code` at Q8_0 and fixed it with a bf16 mmproj. The card arm at the fixed model (2026-10-19, `measured-here`) then moved to **C4 PASS** and **B3 PASS**: the production set (Q8_0 backbone + the `codeheadf16` mmproj, `--tts-gen-device cpu`) measures corpus round-trip WER **0.0264** (worst 0.333, 89.1 % <= 0.10) and **RTF 1.1291 / 1.1597** (before / after the card host's RAM upgrade) on the enlarged D8 set (46 sentences / 303 words, `codec_eos` sampled, no cap; `docs/campaigns/qwen3tts-card-real-time.md` lever (b), `measured-here`) |
 | `arcint-stt` | `/usr/bin/arcint-whisper` (`arcint-stt` package) | `ggml-large-v3-turbo.bin` (or `ggml-large-v3.bin`) | `POST /v1/audio/transcriptions` | **built** (whisper.cpp on the installed ggml, card gate PASS; unit file written; package and `/props` owed) |
 
 Ports (proposed; the operator fixes them): `arcint-vlm` 8083, `arcint-tts` 8084,
@@ -47,7 +47,10 @@ the hybrid's measured **0.828** (`measured-here`, 2026-10-19, C4 PASS on both;
 `docs/campaigns/qwen3tts-card-real-time.md`): the CPU codec flushes in 1,692 ms
 against the card's 1,780-2,000, and the card-only predictor is 4.5x the single
 CPU backend. **Accepted by the operator 2026-10-19:** `arcint-tts.service`
-carries `--tts-gen-device cpu`. An `mmproj` context takes one backend for all its
+carries `--tts-gen-device cpu`. The production model set is then the
+requantized Q8_0 mmproj with `gen.code.head`/`gen.code.embd` kept at f16
+(lever (b), C4 + B3 PASS, campaign `qwen3tts-card-real-time`); the official
+bf16 mmproj stays as fallback. An `mmproj` context takes one backend for all its
 halves, so the flag selects the whole `mmproj`; the TTS `mmproj` carries no
 vision half. The boot refuses with a placement error if a `cpu` request builds
 any clip context on the card (`backend_llama.cpp` captures libmtmd's

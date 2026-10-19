@@ -128,7 +128,7 @@ tag names a licence the publisher sets).
 | **STT** | `ggerganov/whisper.cpp`, `ggml-large-v3-turbo.bin` (or `ggml-large-v3.bin`) | MIT (repo) / MIT (`openai/whisper-large-v3-turbo` tag) | canonical | ~1.5 / ~3.0 GB | whisper.cpp's own format, not GGUF |
 | STT alternative | `ggml-org/Qwen3-ASR-1.7B-GGUF` (+ mmproj) | (Qwen) | 33,955 | ~1.9 GB | in `libmtmd`; surveyed per D3 |
 | **TTS** backbone | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` → `ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF` | **apache-2.0** | 3,093,627 (HF) / 32,169 (GGUF) | Q8_0 1.85 GB, bf16 3.47 GB | German (`de`, `code`), cloning, not gated; **Q8_0 is fine** (the campaign measured the backbone quantization irrelevant) |
-| **TTS** mmproj | same GGUF repo: `mmproj-...-bf16.gguf` (the fix) or `mmproj-...-Q8_0.gguf` | apache-2.0 | (repo) | bf16 0.67 GB, Q8_0 0.45 GB | the speaker encoder **+ the code predictor and the code2wav acoustic decoder**; the **Q8_0 mmproj is defective**: its code predictor (`a.gen.code`) quantized at Q8_0 never samples `codec_eos` and makes German unintelligible (the campaign, `measured-here`). Use the bf16 mmproj, or a Q8_0 one with `a.gen.code` kept at BF16 (mixed, 0.56 GB) |
+| **TTS** mmproj | same GGUF repo: `mmproj-...-bf16.gguf` (the official fix, kept as fallback) or requantized to Q8_0 with `gen.code.head`/`gen.code.embd` at f16 (the production set) | apache-2.0 | (repo) | bf16 0.67 GB; production Q8_0-codeheadf16 0.45 GB | the speaker encoder **+ the code predictor and the code2wav acoustic decoder**; the **Q8_0 mmproj is defective**: its code predictor (`a.gen.code`) quantized at Q8_0 never samples `codec_eos` and makes German unintelligible (the campaign, `measured-here`). The whole-code-predictor bf16 fix (or the mixed `a.gen.code` BF16, 0.56 GB) passes; the production set is the cheaper `gen.code.head`/`gen.code.embd`-f16 recipe, which passes **C4 and B3** (§9.7, `measured-here`) |
 | TTS alternative | `OuteAI/OuteTTS-1.0-1B` | ? | 401 on the API (gated) | ~2.4 GB Q8 | in llama.cpp's TTS lineage; not primary, gated |
 | TTS alternative | `kyutai/pocket-tts` (language dirs) | cc-by-4.0 | 1,133 | ~ | gated `auto`; German among its languages |
 
@@ -682,9 +682,50 @@ hybrid TTS touches the card.
 | the card window | physical-host sampler: peak resident vram0 **2,586 MiB**, min physical MemAvailable **52,603 MiB**, no watchdog kill; image front released (`released:false`, idle); `arcint-agent` stopped by its unit and restored after 80 s with `:8087` health ok; one non-service process per card; no stale leg driver |
 | the set | `tools/tts_sentences_de.json`: Tatoeba (CC-BY 2.0 FR, attribution), 46 unique German sentences of 5-10 words, 303 words, deterministic selection from the `deu_sentences.tsv.bz2` export (sha256 `ccd06372…`); text is committed, the WAVs and transcripts stay operator-local (the leg's output) |
 
-C4 passes the operator's floor on the enlarged set; B3 stays FAIL and its lever
-(b) (the code predictor, campaign `qwen3tts-card-real-time`) is the next
-measurement. C7 unchanged (`code`): 0062's graph is untouched by this arm.
+C4 passes the operator's floor on the enlarged set; B3 stayed FAIL and its
+lever (b) (the code predictor, campaign `qwen3tts-card-real-time`) was the next
+measurement — landed in §9.7. C7 unchanged (`code`): 0062's graph is untouched
+by this arm.
+
+### 9.7 Lever (b): the code-predictor quantization, B3 PASS on the D8 set (Phase 2, 2026-10-19)
+
+The remaining wall after §9.6 was the code predictor (the mmproj graphs on the
+CPU under the accepted hybrid placement). A one-variable mmproj family
+requantized from the official bf16 (`llama-quantize --pure --allow-requantize`,
+single CPU backend) measures the predictor's per-call time: bf16-all 105.4 ms,
+f16-all 57.7 ms, f32-all 121.1 ms, Q8_0-all 30.2 ms (the code2wav flush stays
+~1.76 s on all). The production recipe requantizes the whole mmproj to Q8_0
+while keeping the two sampling tensors `gen.code.head` (sampling head) and
+`gen.code.embd` (code embedding) at f16:
+`llama-quantize --pure --allow-requantize --tensor-type gen\.code\.head=f16
+--tensor-type gen\.code\.embd=f16 <official-bf16-mmproj> <out> Q8_0 8`.
+`q8codeheadf16` measures 31.0 ms per call, against 57.6 ms when the whole
+`gen.code` stays f16: the 35 `gen.code.blk` matrices are the bulk speed. Which
+of head/embd is load-bearing was **not measured** (no head-only arm); the pair
+is the measured recipe that passes.
+
+The card arm, the full clone path through `/v1/audio/speech`, dev binary
+`arcint-def-exact` sha256 `be754e8b…` (0062 default, `--tts-gen-device cpu`,
+window 72), Q8_0 backbone `ac7931ae…` + the requantized mmproj sha256
+`4d28d3af…` (`/models/tts-qwen3/
+mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0-codeheadf16.gguf`), `gate-fleurs`, seed
+42, the enlarged D8 set (46 sentences / 303 words, manifest `e0592aab…`):
+
+| item | measured |
+|---|---|
+| q8codeheadf16, before the card host's RAM upgrade | **C4 PASS**: corpus WER **0.0264**, worst **0.333**, WER<=0.10 **89.1 %**; **B3 PASS**: **RTF 1.1291** (182.960 s audio / 162.041 s process) |
+| the staged production mmproj, after the upgrade (128 GB, DDR4-3333 CL18) | **C4 PASS** (identical WER 0.0264 / worst 0.333); **B3 PASS**: **RTF 1.1597** (182.960 / 157.767) |
+| the cross-check f16-all | **B3 FAIL**: RTF **0.8051** (172.560 / 214.324) — raising the whole mmproj to f16 does not reach real time; not adoptable, not re-run |
+| the cross-check f32-all | no output; dominated (121.1 ms predictor call, slowest of the family); not re-run |
+| the card window (after the upgrade) | peak resident vram0 **2,586 MiB**, min physical MemAvailable **116,787 MiB**, max container **4,066 MiB**; one non-service process per card; `arcint-agent` stopped by its unit and restored after 80 s, `:8087` health ok |
+
+**Disposition (`measured-here`, `code`):** the recipe is the production TTS
+model set (`contrib/systemd/arcint-tts.service` points at the requantized file;
+the official bf16 stays as fallback); **B3 PASS** closes the campaign
+`qwen3tts-card-real-time`; the two-f16-tensor choice refines the closed
+`qwen3tts-german-genpath` (which tested the whole `gen.code` at bf16) and is not
+a new defect. C7 unchanged: the recipe changes only the mmproj file, no engine
+graph.
 
 ## 10. References
 

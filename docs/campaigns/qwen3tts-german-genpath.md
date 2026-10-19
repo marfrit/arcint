@@ -39,7 +39,10 @@ sentences, seed 42, sampling t 0.8 / top_p 0.95 / top_k 40 / repetition 1.0,
 ## What exists
 
 - The arcint loop `src/exec/backend_llama.cpp` (`generate_speech`) and the
-  routes; `Q8_0` backbone + **bf16 mmproj** is the unit's model pair
+  routes; the unit's production model pair is now the requantized Q8_0 mmproj
+  with `gen.code.head`/`gen.code.embd` kept at f16 (`mmproj-...-Q8_0-
+  codeheadf16.gguf`, campaign `qwen3tts-card-real-time` lever (b), C4 + B3
+  PASS); the official **bf16 mmproj** stays as fallback
   (`contrib/systemd/arcint-tts.service`).
 - The mixed Q8_0 file with `a.gen.code` at BF16 (0.56 GB, second option):
   `llama-quantize --pure --allow-requantize --tensor-type "gen\.code=bf16"`.

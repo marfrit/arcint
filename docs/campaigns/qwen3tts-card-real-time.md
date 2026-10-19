@@ -1,14 +1,19 @@
-# qwen3tts-card-real-time — the Qwen3-TTS card arm is slower than real time, and not faster than the CPU: the gen graphs fall back to the CPU
+# qwen3tts-card-real-time — the Qwen3-TTS card arm was slower than real time and not faster than the CPU: the real-time factor reached 1.0 by quantizing the code predictor
 
-**Open 2026-10-19.** The fixed model speaks German and stops at `codec_eos`
-(`qwen3tts-german-genpath` closed), but the card arm through arcint's own
-`/v1/audio/speech` runs at about **0.26× real time** on the B60 — slower than
-real time, and no faster than the same loop on the CPU. The milestone
-criterion B3 and the unit's serving shape both need real time on the card. A second window (2026-10-19) then measured
-placement and pipelining, one variable each: the decoder's flush cost is
-fixed per call, the flush window (72, the decoder's `wav_tfm_swa`)
+**Closed 2026-10-19 (B3 PASS).** The fixed model speaks German and stops at
+`codec_eos` (`qwen3tts-german-genpath` closed). At open, the card arm through
+arcint's own `/v1/audio/speech` ran at about **0.26× real time** — slower than
+real time, and no faster than the same loop on the CPU; the milestone criterion
+B3 and the unit's serving shape both need real time on the card. Two windows
+then measured placement and pipelining, one variable each: the decoder's flush
+cost is fixed per call, the flush window (72, the decoder's `wav_tfm_swa`)
 cannot be lowered seamlessly, and the overlap hypothesis is refuted with
-numbers; the hybrid stays the best arm. See the second measured section.
+numbers; the hybrid stays the best arm. Lever (a) (the valid frames) and lever
+(b) (the code predictor's weight quantization, the mmproj's
+`gen.code.head`/`gen.code.embd` kept at f16) then landed: the production arm at
+the enlarged D8 set measures **RTF 1.1291 / 1.1597** (before / after the card
+host's RAM upgrade), **C4 PASS** (WER 0.0264, worst 0.333). See the measured
+sections.
 
 ## Charter
 
@@ -182,20 +187,20 @@ seam), so there is nothing to overlap and lowering it costs both wall and
 waveform. **Accepted by the operator 2026-10-19:** the production TTS unit
 takes the hybrid placement (code2wav on the CPU, backbone on the card); its price is the
 0.828-and-17 %-short row against the far worse card-only (0.751, 0.420) and
-async (0.536) arms. Real time still needs the predictor's per-node count reduced
-(lever b); the decoder's per-call cost is reduced by the default patch 0062
-(lever a), not a placement or a thread.
+async (0.536) arms. Real time then came from the predictor's weight
+quantization (lever (b), below) and the decoder's per-call cost from the
+default patch 0062 (lever (a)), not a placement or a thread.
 
-**Open levers, in order by measured share:** (a) the code2wav fixed per-call
-cost was **explained and its landing measured** (above: the always-72-frame
-padded window; the valid-frames computation scales it with the flushed count,
-C4 card PASS, and it is now the engine default patch
-`0062-mtmd-qwen3tts-gen-valid-frames`); (b) the code predictor's node/launch
-count (`cache_set`'s concat+arange+get_rows and the per-step sampling, ~1,600
-of 6,792 nodes) — reduce nodes or fuse; the D8-floor re-run below leaves it
-  the remaining wall. Placement is settled by the disposition
-above (the hybrid; accepted by the operator 2026-10-19); pipelining is closed
-by the measured refutation.
+**Levers, both landed.** (a) the code2wav fixed per-call cost was **explained
+and its landing measured** (above: the always-72-frame padded window; the
+valid-frames computation scales it with the flushed count, C4 card PASS, and it
+is now the engine default patch `0062-mtmd-qwen3tts-gen-valid-frames`); (b) the
+code predictor's weight quantization is the section below: requantizing the
+mmproj's body to Q8_0 while keeping `gen.code.head`/`gen.code.embd` at f16
+measures **RTF 1.1291 / 1.1597** (pre / post RAM upgrade) at the enlarged D8
+set, **C4 PASS** — **B3 PASS** against the operator floor. Placement is settled
+by the disposition above (the hybrid; accepted by the operator 2026-10-19);
+pipelining is closed by the measured refutation.
 
 `0061` (OpenCL `ARANGE`) is **measured, reviewed and dropped from the numbered
 series.** Op suite on the B60 (the CPU reference): **2/2 PASS** green,
@@ -304,7 +309,70 @@ valid-frames default on the enlarged set is 20 % short. The card window: B60
 resident vram0 2,586 MiB, min physical MemAvailable 52,603 MiB, one
 non-service process per card, sampler on the physical host, `arcint-agent`
 restored, `:8087` health ok. C4's floor is now resolved on the enlarged set;
-the remaining wall is lever (b).
+the remaining wall was lever (b).
+
+**Lever (b): the code predictor's weight quantization (`measured-here`,
+2026-10-19).** The D8-floor arm ran RTF 0.7995 with the whole mmproj at bf16.
+The predictor (mmproj graphs on the CPU under `--tts-gen-device cpu`) is the
+larger share of the process, and on the single CPU backend its per-frame weight
+matrices are the cost: a one-variable mmproj family (requantized from the
+official bf16 mmproj sha256 `b9503e95…` with
+`llama-quantize --pure --allow-requantize`, sha256 `10711c5d…`; single CPU
+backend, t=16, 139-163 frames) measures the predictor's per-call time at
+**bf16-all 105.4 ms, f16-all 57.7 ms, f32-all 121.1 ms, Q8_0-all 30.2 ms**; the
+code2wav flush stays ~1.76 s on every arm. The production recipe requantizes
+the whole mmproj to Q8_0 while keeping the two sampling tensors `gen.code.head`
+(sampling head) and `gen.code.embd` (code embedding) at f16:
+
+    llama-quantize --pure --allow-requantize \
+      --tensor-type gen\.code\.head=f16 --tensor-type gen\.code\.embd=f16 \
+      /models/tts-qwen3-bf16/mmproj-Qwen3-TTS-12Hz-1.7B-Base-bf16.gguf \
+      <out> Q8_0 8
+
+It keeps the speed (`q8codeheadf16` 31.0 ms per call, against `q8codef16` 57.6
+ms when the whole `gen.code` stays f16): the 35 `gen.code.blk` matrices at Q8_0
+are the bulk speed, and `head`/`embd` the intelligibility. **Which of the two
+is load-bearing was not measured** (no head-only arm); the pair is the measured
+recipe that passes.
+
+**The card arm and the production model set (`measured-here`, 2026-10-19).**
+The requantized mmproj (`/models/tts-qwen3/
+mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0-codeheadf16.gguf`, sha256 `4d28d3af…`,
+481,460,096 bytes) on the Q8_0 backbone (`ac7931ae…`), the dev binary
+`arcint-def-exact` sha256 `be754e8b…` (0062 default, `--tts-gen-device cpu`,
+window 72), the full clone path on `gate-fleurs`, seed 42, the enlarged D8 set
+(46 sentences / 303 words, manifest sha256 `e0592aab…`) through
+`/v1/audio/speech`:
+
+| run | audio / process | RTF | C4 |
+|---|---|---|---|
+| q8codeheadf16, before the RAM upgrade | 182.960 / 162.041 | **1.1291** | corpus WER **0.0264**, worst **0.333**, WER<=0.10 **89.1 %**; PASS |
+| staged production mmproj, after the upgrade (128 GB, DDR4-3333 CL18) | 182.960 / 157.767 | **1.1597** | identical **0.0264** / **0.333**, PASS |
+
+Both are **B3 PASS** (floor RTF >= 1.0) and **C4 PASS** (floor corpus <= 0.10,
+worst <= 0.5); the sampled lengths are identical (audio 182.960 s) and the two
+round-trips give the same WER, so the timing difference is the host change.
+The card window after the upgrade: peak resident vram0 **2,586 MiB**, min
+physical MemAvailable **116,787 MiB** (~114 GiB), max container **4,066 MiB**,
+one non-service process per card, `arcint-agent` stopped by its unit and
+restored after 80 s, `:8087` health ok.
+
+**The cross-check arms.** All-f16 (the whole mmproj at f16, the highest
+non-bf16 GGUF precision) **also B3 FAILs** (RTF **0.8051**, 172.560 / 214.324):
+raising precision does not reach real time; the quantization is the lever. That
+makes it non-adoptable and it is **not re-run**. f32-all never produced output
+(no `out-f32all`) and is dominated by the same direction (121.1 ms predictor
+call, the slowest of the family), so it is **not re-run** either. Neither is
+needed to explain the choice: the recipe above is the minimal correctness cost
+(the two sampling tensors f16, the body Q8_0) and the only arm that passes both
+gates.
+
+**Disposition.** The lever (b) recipe is the production TTS model set:
+`contrib/systemd/arcint-tts.service` points at
+`mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0-codeheadf16.gguf`; the official bf16
+mmproj stays on the host as the fallback. `measured-here`; the two-f16-tensor
+choice is a refinement of the closed `qwen3tts-german-genpath` (which tested
+the whole `gen.code` at bf16), not a new defect. B3 PASS closes this campaign.
 
 ## Where it lives
 
@@ -317,4 +385,7 @@ the remaining wall is lever (b).
   0062-mtmd-qwen3tts-gen-valid-frames.patch` (`tools/mtmd/{clip.cpp,
   models/models.h, models/qwen3tts-gen.cpp}`).
 - The gate: `tools/tts_gate.py`; the model set `docs/milestone-1.2.0.md` §2.
-- The card arm's record: milestone §9.4, `docs/speech-service.md`.
+- The code-predictor quantization recipe: `llama-quantize`'s
+  `--tensor-type gen\.code\.head=f16` / `gen\.code\.embd=f16` over the official
+  bf16 mmproj at `Q8_0`; the staged file and the unit's `--mmproj`.
+- The card arm's record: milestone §9.4/§9.6/§9.7, `docs/speech-service.md`.
