@@ -419,6 +419,12 @@ prefill 0.37 s (`measured-here`). C1/C2: the content check **4/4**
 `/props` (§9.9). **Open (owed):** `tools/vlm_gate.py` run as a tool (the set was
 driven by a scratch script), a CPU-side encoder B4 reference, the per-node op
 profile, a red case, and the endpoint's package/unit/probe completion.
+**Resolved by §9.10 (2026-10-19):** the gate tool run with a committed fixed
+set (C1/C2 9/9), the per-node op profile (A2/B1, no CPU island), and the
+one-time compile record; the red case is **vacuous** because no VLM kernel was
+added or changed (the profile found no CPU island and no patch was needed);
+the CPU-side B4 reference and the endpoint's package/probe completion stay
+owed.
 
 **RESOLVED (2026-10-18 evening, operator):** Markus power-cycled the card
 host after the §9.1 `xe` oops; the host, the guests and the production units
@@ -780,6 +786,50 @@ audio-only and none, and a source tripwire pins the cap call in the load site
 (`tests/test_props.cpp`); the bare `ctest -L unit` ladder is green (178 cases,
 0 failed, the stub roundtrip among them), `measured-here`. The omission was
 `code`: the field `mmproj_loaded` did not say which half the file carried.
+
+### 9.10 VLM gate, profile and content check (Phase 0/1, 2026-10-19)
+
+The card window: B60 (PCI `8086:e211`, OpenCL GPU.0), one non-service process
+per card sequentially, the image front released, `arcint-agent` stopped by its
+unit and restored after 85 s (`:8087` active), a physical-host sampler. The
+dev binary is `arcint-241c171` sha256 `65a95529…`, built from the staged v120
+HEAD (`241c171`) against the pin + series through 0062, `--device GPU.0` with
+the VLM unit's flags (Qwen2.5-VL Q4_K_M + Q8_0 mmproj, `--n-ctx` 32768,
+`q8_0:q4_0`, `-v`); a profiling sibling `arcint-241c171-prof` sha256
+`0ff0d66b…` (`GGML_OPENCL_PROFILING=ON`) carries B1.
+
+| item | measured () |
+|---|---|
+| C1/C2, the gate tool | `tools/vlm_gate.py` with the committed manifest `tools/vlm_cases.json` (sha256 `7e95d05e…`): **9/9 = 1.000**, floor 1.0. Answers WILLKOMMEN, Willkommen ×2, Cat, cat, Palm trees and beach., Red, cube, 1. The first case 8.42 s (the one-time clip-kernel compile), the 2048² upscale 8.77 s, the rest 0.41-1.81 s |
+| the set | seven images from the 1.1.0/1.1.1 record, nine questions, kinds lettering/object/background/colour/count, each sha256-pinned; the images stay operator-local beside the committed manifest (charter §4) |
+| B1/B4 card side | 1024² after the compile: image slice encoded 1280 ms, image batch decoded 317 ms (encoder 1.60 s), prompt prefill 1407 tokens in 1.73 s (813.4 t/s), completion 2 tokens 0.03 s; 512² slice 247 ms + 7 ms batch, prefill 362 tokens 0.39 s (938.7 t/s); 2048² (the upscaled cat) slice 7230 ms + batch 479/651 ms, prefill 4130 tokens 8.55 s (483.2 t/s). First 1024²: 5483 ms slice / 8.27 s prefill (kernel compile). Encoder share of the server's recorded phases ≈ 48 % at 1024², ≈ 46 % at 2048², < 10 % at 512² |
+| A2 | `GGML_SCHED_DEBUG=2` on the profiling build: every node `[OpenC ]` (OpenCL), the clip graph `splits = 1, nodes = 1090`; the profiling dump `cl_profiling.csv` holds 11,358 kernels / 1,753.07 ms device exec (includes the load warmup), **zero CPU island** |
+| memory | physical-host sampler (`/models/.tts-prof/vlm-gate.log`, `measured-here`): peak resident vram0 **7,567 MiB** (the 2048² case), GTT 40 MiB; physical MemAvailable min **117,319 MiB**; container peak 5,197 MiB |
+| hygiene | `released:false` (the front was idle); one non-service process per card each phase; `arcint-agent` restored after 85 s, `:8087` active; servers stopped by pid; no stale leg driver |
+
+**Dispositions (`measured-here`, `code`).** C1 PASS at the target 1.0; the
+operator's C1 floor is still unset and the pass rate is 1.000. C2: the 1.1.0
+content-check checkbox is closed for the Qwen-Image WILLKOMMEN (three
+generations) and the generated object/colour/count images. **No Z-Image
+lettering image exists in the 1.1.0/1.1.1 record** — the Z-Image case is its
+red cube (object, colour, count), read from the arms' logs; the charter's
+"Z-Image lettering" has no source image and is recorded as such. A2 holds: no
+op of the vision tower or the backbone fell to the CPU. B1: the vision slice
+is the largest single phase at 1024²/2048² and is **on the device**; no node
+over 10 % needs a ceiling or a campaign. C6 is **vacuous for the VLM**: no
+kernel was added or changed (the profile found no CPU island). B4's
+CPU-side encoder reference is **owed** (started with the reference
+`llama-mtmd-cli --no-mmproj-offload` on the card CPU; see the handover).
+**A trap:** the server's own phase log sums larger than the gate's endpoint
+wall for the first/warmup-heavy requests — the gate's per-case seconds are
+≈ prefill + decode, i.e. they exclude the logged `image slice` / `image
+decoded`; the two were not reconciled in this window. Report both, do not mix
+them.
+
+The endpoint's package/unit/probe completion stays owed: the unit files
+exist (`contrib/systemd/arcint-vlm.service`), `/props` publishes the
+mmproj/backbone state and the projector's own halves (§9.9), and the 1.2.0
+`arcint` package is the release phase's.
 
 ## 10. References
 
