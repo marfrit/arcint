@@ -3795,7 +3795,8 @@ The patch makes the graph take the caller's valid frames. `clip_get_graph_builde
 passes the codes-derived frame count to `clip_graph_qwen3tts_gen`'s new
 `gen_n_frames` field (default `-1` keeps the window for the no-codes path),
 `clip_encode`'s input no longer rear-pads to 72, and the output tail drop
-follows the caller's count. **`MTMD_TTS_WAV_PAD=1` is the red case**: it forces
+keys on the caller's count under the default (so it no longer fires) and on
+`wav_tfm_swa` under the red. **`MTMD_TTS_WAV_PAD=1` is the red case**: it forces
 the padded window back, so the pre-patch behaviour and the fixed per-call cost
 return and the patch's own test can fail. The default (variable unset) is the
 valid frames; there is no arcint flag.
@@ -3816,7 +3817,10 @@ backbone + bf16 mmproj, `--tts-gen-device cpu`, the fixed 8-sentence gate, seed
 runs real-time factor 0.729 (55.66 s process / 40.56 s audio, worst
 first-audio 11.0 s) against the valid-frames arm 0.802 (50.58 s; 9.52 s); both
 round-trip at corpus WER 0.0455 through `whisper-server -ng` (C4 PASS) and
-`codec_eos` is sampled on both. The same-binary sample diff is at most
+`codec_eos` is sampled on both. These 0.729/0.802 figures are the first run
+(the switch-source build); the final patch binary's red/green run on the same
+route measured the padded arm 0.7285 and the default 0.8006 (two builds,
+run-to-run variation). The same-binary sample diff is at most
 191/32768 (0.0058 of full scale), inside the window-72 card-vs-CPU bar
 483/32768 already on record; the patch binary's own arm is bit-identical to the
 scratch-switch arm measured first. **Red case (`measured-here`, 2026-10-19, one

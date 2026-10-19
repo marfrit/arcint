@@ -241,9 +241,10 @@ is real but not dominant, the padded **matmul** work is.
   landed as the engine default (`measured-here`, card + CPU, 2026-10-19).**
   The GEN_WAV graph takes the caller's valid frame count instead of the fixed
   72 (`models.h`/`qwen3tts-gen.cpp`/`clip.cpp`; patch
-  `0062-mtmd-qwen3tts-gen-valid-frames`, `code`; no env switch, no arcint
-  flag). On the CPU the flush becomes frame-proportional (44 frames 1.11 s,
-  55 1.37, 60 1.49, 64 1.59 against the fixed 1.77-1.79) and the 8-sentence
+  `0062-mtmd-qwen3tts-gen-valid-frames`, `code`; no operational or config
+  switch, no arcint flag (`MTMD_TTS_WAV_PAD` is the red-case switch). On the
+  CPU the flush becomes frame-proportional (44 frames 1.11 s, 55 1.37, 60
+  1.49, 64 1.59 against the fixed 1.77-1.79) and the 8-sentence
   flush total falls 14.25 -> 10.60 s. On the B60 the one-variable card arm
   (the 6e68d58 source built without and with the patch, the full
   `/v1/audio/speech` route, `--tts-gen-device cpu`, window 72, the fixed
@@ -261,14 +262,19 @@ is real but not dominant, the padded **matmul** work is.
   its 8 sentences are identical to the production padded arm and it runs 0.7285
   (the default 0.8006), so the patch's own
   claim (the flush scales with the frames) can fail by the repo's rule. The `-1`
-  default keeps the padded window for a no-codes caller, and the generic
-  `out_audio` block's null guard is kept (the upstream PocketTTS `GEN_WAV` path
+  default keeps the `wav_tfm_swa` fallback width for a no-codes caller, and the
+  generic `out_audio` block's null guard is kept (the upstream PocketTTS
+  `GEN_WAV` path builds its own graph and decodes the caller's latent frames; it
   passes features instead of codes and never dereferences a null codes pointer).
   This arm's denominator and first-audio figures (11.0 s padded / 9.52 s
   valid-frames) differ from the earlier placement window's 0.828 and
   5.3-6.8 s on the same route and card: a different source window and its
   sampled lengths on the same manifest (run-to-run and source-window
-  variation). The lever's **ratio** (+10 %) is what it claims. It is a
+  variation). The 0.729/0.802 pair is the first (switch-source) run and
+  0.7285/0.8006 the final patch binary's own red/green run on the same route
+  and window (both arms of that pair on one binary; the two runs are two
+  builds, run-to-run variation). The
+  lever's **ratio** (+10 %) is what it claims. It is a
   deviation from the reference (upstream's `clip.cpp`/`tts.cpp` pad every flush
   to the attention window), named with its reason: the measured fixed per-call
   cost; the `wav_tfm_swa` constant stays for the padded and no-codes fallback,
@@ -289,4 +295,4 @@ is real but not dominant, the padded **matmul** work is.
   0062-mtmd-qwen3tts-gen-valid-frames.patch` (`tools/mtmd/{clip.cpp,
   models/models.h, models/qwen3tts-gen.cpp}`).
 - The gate: `tools/tts_gate.py`; the model set `docs/milestone-1.2.0.md` §2.
-- The card arm's record: milestone §9.3, `docs/speech-service.md`.
+- The card arm's record: milestone §9.4, `docs/speech-service.md`.

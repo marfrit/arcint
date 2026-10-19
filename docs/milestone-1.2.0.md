@@ -618,13 +618,15 @@ placement arm's already-shown 483/32768). **The full-route card gate ran
 sampled, no cap), the same-binary sample diff at most 191/32768 -- the lever
 is real, +10 %, still short of real time.** It landed as the engine **default**:
 patch `0062-mtmd-qwen3tts-gen-valid-frames` (`tools/mtmd/{clip.cpp,
-models/models.h, models/qwen3tts-gen.cpp}`), no env switch, no arcint flag; the
+models/models.h, models/qwen3tts-gen.cpp}`), no operational or config switch, no
+arcint flag (`MTMD_TTS_WAV_PAD` the red-case switch); the
 patch binary's arm is bit-identical on all eight sentences to the scratch-switch
 arm, so the default engages the measured mechanism; the red
 `MTMD_TTS_WAV_PAD=1` restores the padded waveform (identical to the padded arm),
-so the test can fail. The `-1` default keeps the padded window for a no-codes
-caller and the `out_audio` null guard is kept (the upstream PocketTTS `GEN_WAV`
-path passes features, no codes); the pin + series application was checked clean.
+so the test can fail. The `-1` default keeps the `wav_tfm_swa` fallback width
+for a no-codes caller and the `out_audio` null guard is kept (the upstream
+PocketTTS `GEN_WAV` path decodes the caller's latent frames, passes features, no
+codes); the pin + series application was checked clean.
 Sub-real-time still: lever (b), the code predictor, is the remaining wall
 (campaign `qwen3tts-card-real-time`). C7 (the language path's answers and KL
 must not move) is unaffected by construction: 0062 changes only the Qwen3-TTS
@@ -649,6 +651,6 @@ path builds it (`code`); a served language arm was not re-run for the patch.
   `src/exec/backend_llama.cpp` (the encode→decode plumbing),
   `contrib/sdcpp/build-sdcpp.sh` (the separate-binary recipe form),
   `contrib/systemd/arcint-imggen*.service` and `docs/imggen-service.md` (the
-  unit and contract form), `contrib/llama.cpp/patches` (0059, 0060).
+  unit and contract form), `contrib/llama.cpp/patches` (0059, 0060, 0062).
 - The 1.1.0 gate tool `tools/imggen_gate.py` (its parity check is the
   pattern for the three new gates) and `docs/milestone-1.1.0.md` §3.
