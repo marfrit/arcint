@@ -1760,9 +1760,31 @@ gate as before: the answers right, the KL against unsloth's Q8_0.
     reproduced as served, 0.112 nats better than the default.
   - So UD-Q3_K_XL halves the KL and costs ~63 % of the decode (12.5
     against 33.4-33.9 t/s) and ~66 % of the prefill on this card: under the
-    20 t/s usability band. Why it is that much slower was not measured; the
-    candidates are fewer slots (4,115 against 7,208), the CPU misses' AVX2
-    rows covering the i-quants and Q2_0 but not Q3_K (`code`, 0056), and the
-    eviction in long prefills. The request's fourth arm (a GSQ-RCO quant one
-    step up) was conditional on UD-Q3_K_XL's KL not being clearly better and
-    is not proposed.
+    20 t/s usability band.
+  - **Correction and reference check** (same day). The first version of
+    this stage named "Q3_K not covered by the CPU rows" as a candidate; that
+    was wrong: UD-Q3_K_XL's routed experts are i-quants (`code`, its GGUF
+    header: gate/up IQ3_XXS in 47 layers and IQ4_XS in 1, down IQ4_NL in 43
+    and Q8_0 in 5), and all 48 layers were cached (`measured-here`, its load
+    log). What the log does show is the hit rate: 60-76 % of decode's routed
+    experts on the card, against IQ3_XXS's 87-89 %. The arm differs from the
+    reference's mechanism in two ways, so it is **not a verdict on more bits
+    per weight**:
+    - Strata computes every miss on the CPU (`code`,
+      `src/core/expert_source.cpp`: each routed expert that is not a hit is a
+      job for the CPU pool, no cap); 0056 hands at most
+      `GGML_OPENCL_CPU_MISS_MAX` (16) pairs a layer to the CPU and the card
+      reads the rest over the link. 16 was measured best at IQ2_XS /
+      IQ3_XXS hit rates (~88-90 %), not at 60-76 %.
+    - Strata's multi-token AVX2 rows cover IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+      IQ3_S and IQ4_NL (`code`, `src/kernels/cpu/iq_avx2.cpp`) and Q2_0;
+      0056 ported IQ2_S, IQ2_XXS and Q2_0 only (`code`,
+      `ggml-opencl-miss-cpu.cpp`), so UD-Q3_K_XL's misses (IQ3_XXS, IQ4_NL)
+      and those of the production IQ3_XXS file's IQ3_S, IQ3_XXS, IQ2_XS and
+      IQ4_NL layers run ggml-cpu's single-token dot products; Q8_0 down
+      layers are excluded from the CPU path altogether.
+    Strata's own README (`paper`) also has more bits slower on a fixed card
+    (IQ3_XXS 62 against IQ3_S 53 t/s on a 12 GB card, -15 %), with RAM a fit
+    question only; our -63 % for 1.3x the expert bytes is not that price.
+    The request's fourth arm (a GSQ-RCO quant one step up) was conditional on
+    UD-Q3_K_XL's KL not being clearly better and is not proposed.
