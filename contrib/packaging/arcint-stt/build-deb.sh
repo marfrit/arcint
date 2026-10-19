@@ -20,7 +20,7 @@ UPSTREAM_TAG=v${PKGVER}
 # follow-up commit, as for arcint); before that the pre-tag check builds from
 # ARCINT_SRC_TARBALL (a git archive of the staged commit) and this line warns.
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
-ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-}
+ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-b88acd5d2a494135abbdc93312a9957ce966d53513e5bb9a9b8cf23902b06faf}
 LLAMA_COMMIT=3e4dfa8f39f904e681737d9f512a6e6338d848aa
 LLAMA_URL="https://github.com/ggml-org/llama.cpp/archive/${LLAMA_COMMIT}.tar.gz"
 LLAMA_TARBALL_SHA256=f9046074c9b71eaf9abd5491001e4d09c327591fed6b9e2bfcfddbb575dc5255
