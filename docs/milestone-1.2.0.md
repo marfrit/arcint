@@ -544,6 +544,33 @@ package/unit/probes) are still open. The speech units' files are written
 landed (tts flag, enrolled-voice count, multimodal fields, on the record
 above); the packages remain owed.
 
+### 9.5 The TTS real-time profile (Phase 1, 2026-10-19)
+
+The B3 campaign `qwen3tts-card-real-time` measured its B1 profile on the B60
+(PCI `8086:e211`, the fixed Q8_0 backbone + bf16 mmproj, dev binaries named in
+the campaign, `gate-fleurs`, seed 42, reference sampling, the 8-sentence set):
+
+| arm | RTF | per frame | predictor | code2wav | GEN_CODE splits |
+|---|---|---|---|---|---|
+| wall (instrumented) | 0.267 | 280.3 ms | 272.4 ms (97 %) | 14.5 s | 1007 |
+| `0061` OpenCL ARANGE | 0.280 | 265.3 ms | 257.4 ms | 14.5 s | 299 |
+| hybrid (mmproj on CPU, backbone on card) | **0.828** | 72.2 ms | 61.9 ms | 13.5 s | 1 |
+
+`measured-here`:`GGML_OPENCL_PROFILING` puts OpenCL kernel execution at 18.6 s
+against 145.1 s of clip compute; the trace's host enqueue is 1.9 s. The**split
+count is not the cost** (`0061` cut 708 splits for ~15 ms), the **graph build is
+not** (0.65 ms/call). A `GGML_OPENCL=OFF` single-backend `llama-tts` runs the
+same 6792-node predictor in 59.9 ms/frame — the card is **4.5× slower** for the
+same graph, ~6,600 tiny device kernels per frame (per-node overhead, not copies
+or enqueue). The code2wav is ~1.8 s/flush on card and CPU alike.
+
+**Disposition:** card-only real time on this upstream graph path is **out of
+reach** without a node-count change to the code predictor or code2wav; the best
+measured arm (hybrid 0.828, CPU codec graphs + card backbone) is 17 % short and
+is an operator placement call, not a card-only B3. The earlier §9.4 "CPU
+0.233" was the OpenCL-enabled `llama-tts` (its clip graph still split), not a
+single-backend CPU arm; the corrected CPU predictor is 59.9 ms/frame.
+
 ## 10. References
 
 - llama.cpp `3e4dfa8`: `tools/mtmd/{mtmd.h,mtmd.cpp,mtmd-image.cpp,
