@@ -245,8 +245,10 @@ is real but not dominant, the padded **matmul** work is.
   (the hybrid's own codec) differs by at most 162/32767 (rel 0.005) on
   ~40-56 k of ~100 k samples, one sentence identical — within the window-72
   card-vs-CPU diff the placement arm already showed (<=483/32768, 0.0147),
-  and the answer-level bar allows it. `measured-here` (CPU).
-  **The C4 round trip on the card is owed** before adoption. At window 72 the
+  and the answer-level bar allows it. `measured-here` (CPU). **C4 measured
+  on CPU (no card): both arms round-trip at corpus WER 0.0455, verdict PASS**
+  (whisper-server `-ng`, the codec is the hybrid's own); the full `arcint`
+  route's card gate is still owed if the switch is adopted. At window 72 the
   hybrid moves from 0.828 to about **0.90** (flush 1.1-1.6 s at 43-64 frames,
   still above the 0.8 s/flush target); only a lower window (16 frames ->
   ~0.39 s flush) gets below it, and that reopens the seam question (window 16

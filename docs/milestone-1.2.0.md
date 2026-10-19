@@ -614,9 +614,11 @@ valid frames (scratch `ARCINT_TTS_WAV_EXACT=1`) makes the flush proportional
 small CPU-vs-CPU sample diff (max 162/32767, one sentence identical, inside the
 placement arm's already-shown 483/32768). At window 72 the hybrid moves
 0.828 -> ~0.90 (still short of real time, flush 1.1-1.6 s, not <0.8 s); a
-lower window would get below 0.8 but reopens the seam. **The C4 card gate is
-owed;** the lever is real and the cost is explained (campaign
-`qwen3tts-card-real-time`).
+lower window would get below 0.8 but reopens the seam. **C4 measured on CPU
+(no card): both the padded and exact arms round-trip at corpus WER 0.0455,
+PASS** (whisper-server `-ng`; the codec is the hybrid's own), the full `arcint`
+route's card gate still owed if the switch is adopted. The lever is real and
+the cost is explained (campaign `qwen3tts-card-real-time`).
 
 ## 10. References
 
