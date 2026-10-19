@@ -161,6 +161,13 @@ unchanged and PASS (WER 0.0455) on every arm**:
   flush, so a listener hears nothing until the whole sentence decodes:
   **5.3-6.8 s** (hybrid), **5.8-7.4 s** (seq). `measured-here`.
 
+- **CPU thread split (both graphs on the CPU) not run.** It is the refuted
+  async mechanism with the two clip contexts sharing the CPU's cores instead
+  of the card's; the fixed per-call decoder cost (~1.69 s) would still
+  multiply under a lowered window, and the two threads share cores. It is
+  worth measuring only if lever (a) first cuts the decoder's per-call cost.
+  `not measured`.
+
 **Disposition (updated): the best measured arm stays the B1 hybrid at 0.828**
 (mmproj graphs on the CPU, the backbone on the card); card-only real time
 remains out of reach, and the overlap hypothesis is **refuted with numbers**
