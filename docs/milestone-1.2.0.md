@@ -127,8 +127,8 @@ tag names a licence the publisher sets).
 | VLM fallback | `ggml-org/gemma-3-12b-it-GGUF` (+ `mmproj-model-f16.gguf`) | gemma | 11,330 | 7.3 GB | Gemma Terms, not OSI; used only if Qwen is not good enough |
 | **STT** | `ggerganov/whisper.cpp`, `ggml-large-v3-turbo.bin` (or `ggml-large-v3.bin`) | MIT (repo) / MIT (`openai/whisper-large-v3-turbo` tag) | canonical | ~1.5 / ~3.0 GB | whisper.cpp's own format, not GGUF |
 | STT alternative | `ggml-org/Qwen3-ASR-1.7B-GGUF` (+ mmproj) | (Qwen) | 33,955 | ~1.9 GB | in `libmtmd`; surveyed per D3 |
-| **TTS** backbone | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` → `ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF`, `...-Q8_0.gguf` | **apache-2.0** | 3,093,627 (HF) / 32,169 (GGUF) | ~1.9 GB | German (`de`, `code`), cloning, not gated |
-| **TTS** mmproj | same GGUF repo, `mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` | apache-2.0 | (repo) | ~1.6 GB | the speaker encoder + acoustic decoder |
+| **TTS** backbone | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` → `ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF` | **apache-2.0** | 3,093,627 (HF) / 32,169 (GGUF) | Q8_0 1.85 GB, bf16 3.47 GB | German (`de`, `code`), cloning, not gated; **Q8_0 is fine** (the campaign measured the backbone quantization irrelevant) |
+| **TTS** mmproj | same GGUF repo: `mmproj-...-bf16.gguf` (the fix) or `mmproj-...-Q8_0.gguf` | apache-2.0 | (repo) | bf16 0.67 GB, Q8_0 0.45 GB | the speaker encoder **+ the code predictor and the code2wav acoustic decoder**; the **Q8_0 mmproj is defective**: its code predictor (`a.gen.code`) quantized at Q8_0 never samples `codec_eos` and makes German unintelligible (the campaign, `measured-here`). Use the bf16 mmproj, or a Q8_0 one with `a.gen.code` kept at BF16 (mixed, 0.56 GB) |
 | TTS alternative | `OuteAI/OuteTTS-1.0-1B` | ? | 401 on the API (gated) | ~2.4 GB Q8 | in llama.cpp's TTS lineage; not primary, gated |
 | TTS alternative | `kyutai/pocket-tts` (language dirs) | cc-by-4.0 | 1,133 | ~ | gated `auto`; German among its languages |
 
@@ -485,16 +485,13 @@ and both load fixes, and the window ran a build of it):**
 | the window | driven by this same session's own remote leg script — **there was no second session**: `--sh` returned after a few seconds while the remote `tts-leg-card.sh` (started by the remote daemon at 21:25:03 UTC) kept running for 20+ minutes (the wiring is on the branch); the physical-host sampler, the one-process-per-card check and the pid stop/restore all held, the B60's language unit restored after 100 s |
 
 **Open, and the next step is a campaign:** with both arms failing (WER 2.09
-greedy, 2.1667 stochastic), the `qwen3tts` gen path is wrong in the
-prompt/speaker/sampling hand-off, not in the gate. Read
-`mtmd-helper-gen.cpp`'s control loop line by line against this build and
-red-first arms: no end-of-speech ever fires (the 512-frame cap every time),
-whether the token fed to `step_gen` is the semantic code the helper expects,
-how the helper's own backbone decode and logits rows line up with arcint's
-sampler (`llama_get_logits_ith(ctx_, -1)` after each `step_gen`), the language
-and spoken-text path, and the speaker encoder's output. It needs its own
-campaign document. A4's WAV and the refusals are real; C4 and B3 **fail on the
-record and are not a passing gate**.
+greedy, 2.1667 stochastic), the `qwen3tts` gen path is wrong on the model side,
+not in the gate. The campaign `docs/campaigns/qwen3tts-german-genpath.md`
+(opened 2026-10-19) resolved it (see the paragraph below): the defect is the
+Q8_0 mmproj's code predictor, and the fix is a bf16 (or code-predictor-bf16
+mixed) mmproj. A4's WAV and the refusals are real; the earlier C4 and B3
+arms **fail on the record** and are not a passing gate; the card arm at the
+fixed model is owed.
 
 **The upstream reference tool reproduces the German failure
 (measured-here, 2026-10-19):** `llama-tts`, built from the same pin + series
@@ -502,11 +499,20 @@ on the card host and run on the **CPU** (`-ngl 0`) on the same model pair:
 the English "Hello world, this is a test." comes back as ` this is a test`
 (intelligible), while the German "Der Zug nach Berlin ..." comes back as an
 unrelated phrase (`Vielen Dank.`) both **with and without** the enrolled FLEURS
-speaker reference. So the defect is the `qwen3tts` gen path's language / model
-side, not arcint's loop — the loop is faithful to `tts.cpp` — and the campaign's
-first levers are the Q8_0 quant (§2's bf16 alternative is the accuracy option),
-the `<|codec_language_german|>` path, and end-of-speech (the reference hit its
-`-n` cap too: neither arm ever samples `codec_eos`).
+speaker reference. So the defect is the `qwen3tts` gen path's model side, not
+arcint's loop — the loop is faithful to `tts.cpp`.
+
+**Resolved by the campaign (2026-10-19, `measured-here`):**
+`docs/campaigns/qwen3tts-german-genpath.md` isolates it with one variable per
+CPU arm: the **backbone quantization is irrelevant**, the **`codec_language`
+mapping is consistent**, **sampling is not the cause** (Qwen's own defaults on
+Q8_0 still run to the cap), and the defect is the **Q8_0 `mmproj`'s code
+predictor `a.gen.code`** — keeping only that subgroup at BF16 (or using the
+official bf16 mmproj) makes the sentence transcribe exactly and sample
+`codec_eos` at frame 44-50, while keeping the code2wav `a.gen.wav` at BF16 does
+not. The fix is `Q8_0 backbone + bf16 mmproj` (2.52 GB), or a mixed Q8_0
+mmproj with `a.gen.code` at BF16 (0.56 GB). Open: the **card arm** through
+arcint's own route (C4/B3), the milestone gate.
 
 The VLM phase-0 dispositions (the `vlm_gate` tool run, the CPU encoder B4
 reference, the op profile, the red case, the package/unit/probes) are still

@@ -20,7 +20,7 @@ the operator fixes them.
 | unit | binary | model files | routes | state |
 |---|---|---|---|---|
 | `arcint-vlm` | `/usr/bin/arcint` (`arcint` package) | `Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf` + `mmproj-...-Q8_0.gguf` | `/v1/chat/completions` with `image_url` | **built** (chat path + unit file; package and the `/props` multimodal fields owed) |
-| `arcint-tts` | `/usr/bin/arcint` (`arcint` package) | `Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` + `mmproj-Qwen3-TTS-...-Q8_0.gguf` | `POST /v1/audio/speech`, `GET /v1/audio/voices` | **built** (the `libmtmd` `gen_audio` path + routes + unit file); the card gate **FAIL** on both arms (greedy WER 2.09, stochastic WER 2.1667, a 512-frame cap and no end-of-speech) — campaign owed |
+| `arcint-tts` | `/usr/bin/arcint` (`arcint` package) | `Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` + **`mmproj-Qwen3-TTS-...-bf16.gguf`** (the Q8_0 mmproj's code predictor is defective; the campaign) | `POST /v1/audio/speech`, `GET /v1/audio/voices` | **built** (the `libmtmd` `gen_audio` path + routes + unit file); the first card gate **FAIL**ed on the Q8_0 mmproj (greedy WER 2.09, stochastic WER 2.1667, a 512-frame cap and no end-of-speech); `docs/campaigns/qwen3tts-german-genpath.md` isolates it to the mmproj's code predictor `a.gen.code` at Q8_0 and fixes it with a bf16 mmproj — the card arm at the fixed model is owed |
 | `arcint-stt` | `/usr/bin/arcint-whisper` (`arcint-stt` package) | `ggml-large-v3-turbo.bin` (or `ggml-large-v3.bin`) | `POST /v1/audio/transcriptions` | **built** (whisper.cpp on the installed ggml, card gate PASS; unit file written; package and `/props` owed) |
 
 Ports (proposed; the operator fixes them): `arcint-vlm` 8083, `arcint-tts` 8084,
