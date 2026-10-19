@@ -1833,5 +1833,16 @@ control differs from the base binary in four, so the difference is not only
 0063's rows and is not yet explained; KL is unchanged.
 
 Operator's rule (`decision`, 2026-10-19, relayed): UD-Q3_K_XL becomes the
-production quant if it reaches >= 20 t/s on this measure with 0063. As
-measured (16.68 at cap 64) it does not; IQ3_XXS stays, no unit changed.
+production quant if it reaches >= 20 t/s on this measure with 0063, at the
+best cap whose answers stay right. The top of the cap sweep is already 64
+(`code`: 10 experts a token, a verify window of at most 4 tokens, so at most
+40 pairs a layer call; from 64 on every miss is on the CPU, Strata's no-cap
+design). Measured to close it (`measured-here`, the same protocol): cap 128
+16.68 t/s (identical to 64), cap 64 with 12 miss threads 16.75, with 16
+threads 13.35 (the pool then competes with the decode's own 8 CPU threads on
+the 16 hardware threads); Paris and the needle right, host MemAvailable 95
+GiB, the coder serving throughout. **UD-Q3_K_XL tops out at ~16.7 t/s with
+0063; below the line, so IQ3_XXS stays the production quant; no unit
+changed.** IQ3_XXS's own gain (33.9 -> 36.1 t/s, 37.9 with the cap at 64,
+KL unchanged) is a candidate for a 1.2.1 package (0063 + the cap), the
+operator's to decide.
