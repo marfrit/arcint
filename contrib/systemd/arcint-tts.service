@@ -3,7 +3,10 @@
 # arcint's own voice-and-vision binary with libmtmd's gen_audio pipeline
 # (docs/milestone-1.2.0.md D4/§3, docs/speech-service.md). The backbone
 # samples the codec tokens and the mmproj's gen half (speaker encoder +
-# acoustic decoder) makes the waveform.
+# code predictor + code2wav acoustic decoder) makes the waveform. The
+# **bf16** mmproj is required: its codepredictor at Q8_0 never samples
+# `codec_eos` and makes German unintelligible (docs/campaigns/
+# qwen3tts-german-genpath.md, measured-here); the backbone may stay Q8_0.
 #
 # Starting it stops the card's language, image and speech units (same card,
 # Conflicts=). Routes: POST /v1/audio/speech (OpenAI shape, `voice` a name
@@ -29,7 +32,7 @@ Type=simple
 ExecStart=/usr/bin/arcint \
     --engine llama \
     --gguf /models/tts-qwen3/Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
-    --mmproj /models/tts-qwen3/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
+    --mmproj /models/tts-qwen3/mmproj-Qwen3-TTS-12Hz-1.7B-Base-bf16.gguf \
     --tts --tts-profiles /models/tts-qwen3/profiles-de --tts-lang de \
     --served-model-name qwen3-tts-12hz-1.7b \
     --device GPU.0 \

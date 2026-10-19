@@ -154,9 +154,9 @@ Notes (`paper`/`code`):
   option, Q8_0 the memory option.
 
 Staging list (operator-local, card host): the VLM pair, Qwen3-ASR's pair (if
-measured), the whisper `.bin`, the Qwen3-TTS backbone and mmproj, and one
-freely licensed German sample voice for the gate. Nothing goes into the
-fast-staging NVMe between legs (SOP).
+measured), the whisper `.bin`, the Qwen3-TTS backbone (Q8_0) and the **bf16**
+mmproj (the fix of the campaign), and one freely licensed German sample voice
+for the gate. Nothing goes into the fast-staging NVMe between legs (SOP).
 
 ## 3. Architecture
 
