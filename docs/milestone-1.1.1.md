@@ -227,7 +227,62 @@ against the CPU reference (Qwen-Image and klein 20 dB / SSIM 0.95, Z-Image
 30 dB / 0.99), and a missing final image or a one-sided preview step fails.
 The kernel equivalence itself is carried by the op suites.
 
-RELEASE-MEASUREMENTS
+### 9.1 The release check (`measured-here`, 2026-10-18)
+
+The release build (sd.cpp `f0aac52` on llama.cpp `3e4dfa8` + 0001-0060), the
+B60, one window, the 1.1.1 session's arms replayed with their own
+`arm.json` flags (identical inputs on both arms), the 1.1.1 session's CPU
+references reused, the gate with the per-model tolerances above:
+
+| arm | step | VAE | peak VRAM | gate vs the CPU reference |
+|---|---|---|---|---|
+| Qwen-Image 512², 8 steps, the German sign | 0.95 s (1.05 it/s) | 2.21 s | 16,995 MiB | PASS: cos worst 0.998676, 26.26 dB, SSIM 0.991232 |
+| Qwen-Image, 0059 red | | | | **FAIL**: the final floor (8.75 dB, SSIM 0.0108); the per-step cosine alone passed it |
+| FLUX.2 klein edit 512², 4 steps (reference only, the CLI arm) | 0.71 s | 2.13 s | 8,296 MiB | PASS: cos worst 0.999539, 32.43 dB, SSIM 0.996623 |
+| klein edit, 0058 red (the last 16 of K zeroed) | | | | passes at TOL_COS 0.003 (cos worst 0.999177, 26.41 dB) |
+| FLUX.2 klein **served** edit (`/v1/images/edits`: init image + reference, strength 0.75), B60 sd-server against a CPU sd-server given the same request | | | | **below the proposed floor**: final 17.21 dB, SSIM 0.905 (no previews: sd-server writes none, so no per-step figure) |
+| Qwen-Image 1024², 20 steps (the unit's default) through sd-server | 4.44 s | 8.24 s | **18,827 MiB** | 158.9 s a request; no CPU reference at 1024² |
+
+The release build reproduces the 1.1.1 session's B60 images pixel for
+pixel (Qwen-Image, the klein edit). §9's "8 steps 55.7 s (7.0 s a step)"
+for Qwen-Image at 512² is not a step time: the window's 8 steps ran at
+1.05 it/s, consistent with 4.44 s a step at 1024². Two limits of D6's
+0.003, recorded:
+klein's text-to-image curve sits at 0.0019, so a defect as small as 0058's
+red (−6 dB on the final image) passes the klein gate; it fails 52 of 151
+Q8_0 op cases, the op suite is the kernel's gate. Op suites on the release
+tree: `CONV_3D` 284/284 (the 8 new Wan VAE shapes included), red 6/284;
+LEAKY_RELU 7/7 with the red 0/7, after 0060 was narrowed to contiguous
+input (its strided kernels measured wrong on a row-padded view; the ESRGAN
+path is contiguous).
+
+**The rope-off attribution** (`measured-here`): the 1.1.1 references run
+0057's fused CPU RoPE. The same arms on a build without the RoPE
+integration patch (sd.cpp's generic RoPE) differ from them by a per-step
+cosine of 0.999809 (Qwen-Image; final 32.06 dB) and 0.999986 (the klein
+edit; 44.05 dB), and the OpenCL arm sits closer to the fused reference
+(0.998676) than to the rope-off one (0.998194). So 0057's CPU forward is
+~0.0002 of Qwen-Image's 0.0013 gap; the rest lies between the OpenCL and
+the CPU paths of the other ops, not attributed further.
+
+**Upscale through the units**: `POST /sdcpp/v1/upscale` with
+`--hires-upscalers-dir`, a 512² PNG to 2048² in 27.9 s on the flux unit
+(the 1.1.1 session's 27 s was the CLI). **Edits through the units**: the
+HTTP edit uses the init image as well (`docs/imggen-service.md`), so it is
+not the CLI arm above (10.96 dB apart, both valid edits by eye); the served
+form is gated separately (the row above) and falls below the floor: the
+two images agree within 1-7 levels over most of the frame and differ by
+~56 in one region (the lower left), so the img2img trajectory diverges
+locally. Not the VAE: with `--vae-on-cpu` the B60's edit is 43.72 dB from
+the all-OpenCL one and still 17.25 dB from the CPU reference. `sd-cli
+--init-img` does not reproduce the server's edit (it returned the
+reference-only image unchanged), so there is no per-step arm for it.
+Released with this gate open (`decision`, operator, 2026-10-18); the
+campaign is `docs/campaigns/imggen-served-edit-divergence.md`. **Unchanged paths**: Z-Image
+Turbo 512², seed 42, through the release build's sd-server is pixel-identical
+to the 1.1.0 service image; the 1.1.1 language binary (the pre-tag
+package) answers "Paris" on the B60 and on the A770, so 0059's and 0060's
+OpenCL programs, built at every OpenCL start, compile on both cards.
 
 ## 10. References
 

@@ -44,8 +44,10 @@ sd-server is sd.cpp's own server; the routes are unchanged from 1.1.0
   and as FLUX.2 klein's **reference image** (passed to the DiT). So the
   served edit keeps the source's layout less strictly than a reference-only
   edit (`sd-cli --ref-image` without `--init-img`); background swap, object
-  removal and photo variants both do. The release gated the served form
-  (`docs/milestone-1.1.1.md` §9).
+  removal and photo variants both do. The served form is 17.2 dB from the
+  same request on a CPU sd-server, below the gate's proposed floor; 1.1.1
+  ships with that gate open (`decision`, operator, 2026-10-18;
+  `docs/campaigns/imggen-served-edit-divergence.md`).
 - **Seed per request** — append
   `<sd_cpp_extra_args>{"seed":N}</sd_cpp_extra_args>` to the prompt; the
   suffix also carries `steps`, `cfg_scale`, `width`, `height` and other
@@ -54,7 +56,9 @@ sd-server is sd.cpp's own server; the routes are unchanged from 1.1.0
   `{image: <base64 PNG/JPEG>, upscaler?: "RealESRGAN_x4plus", repeats?: 1-4,
   tile_size?, output_format?, output_compression?}`; the factor is the
   model's (4x a repeat), the result at most 8192 x 8192
-  (`code`, `routes_sdcpp.cpp:479-640`). UPSCALE-REPLY
+  (`code`, `routes_sdcpp.cpp:479-640`); reply `{upscaler, scale, repeats,
+  width, height, images: [{b64_json}]}`. 512² to 2048² took 27.9 s on the
+  flux unit (`measured-here`).
 - `GET /health` (`{"status":"ok"}` once listening), `GET /props` (model,
   TE, VAE, backends, devices, flash-attn/direct-conv modes, defaults,
   build string), `GET /v1/models` (`sd-cpp-local`; front maps it to the

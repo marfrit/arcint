@@ -3751,7 +3751,8 @@ case unsupported. The 276 are the tree's own `test_conv_3d` cases -- strides
 The 1.1.1 release adds the Wan VAE's own shapes to the suite: one frame
 with the causal time padding done beforehand (`ID = KD = 3`, `p = 0`,
 `OD = 1`), the 96- and 384-channel blocks, the 16 -> 384 conv1 and the
-96 -> 3 head, for both weight types. MEASURED-0059-TBO. Served: Qwen-Image's
+96 -> 3 head, for both weight types: **284/284 pass** on the B60, the 8 new
+cases included; the red passes 6/284 (`measured-here`, the release window). Served: Qwen-Image's
 VAE decodes on the card (2.66 s at 512²); the image gate, with the 1.1.1
 per-model floors, is in `docs/milestone-1.1.1.md` §9. The campaign is
 `docs/campaigns/imggen-wan-vae-conv3d.md`. A lever (`arithmetic`, not
@@ -3786,7 +3787,11 @@ moves -- the red case.
 **Op suite** (`measured-here`, B60, `test-backend-ops -o LEAKY_RELU -j 1`,
 the CPU reference): **7/7 pass**; with the red, 7/7 FAIL. The 1.1.1 release
 adds a row-padded strided case, so the `_nc` kernels run in the suite.
-MEASURED-0060-TBO. Serial `-j 1` only:
+In the release window the strided cases measured wrong (ERR 1.4-1.7 on a
+row-padded view, `measured-here`; the kernel and the CPU reference read
+right, not attributed), so `supports_op` admits contiguous input only and a
+strided input stays on the CPU: 7/7 pass, the two strided cases reported
+unsupported on OpenCL, the red 0/7. Serial `-j 1` only:
 the driver aborts the process at `-j 4` (a Neo `reference_tracked_object`
 abort before any case reports, `measured-here`), and `-o ADD -j 4` is green
 in the same window, so it is the LEAKY_RELU cases, not the card, not the
@@ -3795,6 +3800,8 @@ suite -- recorded, not explained.
 **Served** (`measured-here`, the same B60 window): `--mode upscale` ESRGAN
 4x (the CLI), `RealESRGAN_x4plus.safetensors`, a 512² PNG to 2048², **27 s**
 on OpenCL; before the patch the same command segfaulted in the CPU fallback.
-Through sd-server's `POST /sdcpp/v1/upscale` (the units): MEASURED-0060-ROUTE.
+Through sd-server's `POST /sdcpp/v1/upscale` (the units, the upscaler
+found in `--hires-upscalers-dir`): 512² to 2048² in **27.9 s**
+(`measured-here`, the release window).
 The upscale is the print route; the campaign is
 `docs/campaigns/imggen-leaky-relu-esrgan.md`.
