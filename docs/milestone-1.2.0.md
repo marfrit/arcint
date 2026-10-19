@@ -581,7 +581,7 @@ is **cheapest on the CPU** (1,692 ms/flush against 1,780-2,000 on the card); the
 decoder's flush cost is **fixed per call** (256 codes 1.79 s against 992 codes
 1.95 s — the 6,492-node graph and its carried state, not the frame count), so
 chunking multiplies it; and window < 72 is **not seamless** (card-vs-CPU at
-window 72 differs ≤245/32768, window 16 vs 72 differs up to 25,749/32768 at the
+window 72 differs ≤483/32768 (0.0147), window 16 vs 72 differs up to 25,749/32768 at the
 same sample count and WER). With `window_frames=72` a 51-69-frame sentence has
 one flush, so there is nothing to overlap; the async worker also drifts the
 sampled frames (66,50,45,72,48,57,60,54 against the deterministic

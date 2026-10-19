@@ -137,9 +137,10 @@ unchanged and PASS (WER 0.0455) on every arm**:
   flushes multiplies decoder work (~28 flushes ≈ 50 s) and lands at 0.420.
   `measured-here`.
 - **Chunking below the window is not seamless.** At the same window the card
-  codec against the CPU codec differs by at most **245/32768** (mean ~4); at
-  window 16 against 72 the same sentence differs by up to **25,749/32768**
-  (0.79 of full scale) at the same sample count, WER still 0.0455. The
+  codec against the CPU codec differs by at most **483/32768** (0.0147; mean
+  ~3.8); at window 16 against 72 the same sentence differs by up to
+  **25,749/32768** (0.79 of full scale) at the same sample count, WER still
+  0.0455. The
   `clip.cpp:1945` `hparams.wav_tfm_swa = 72` (the same value the helper's
   `window_frames` "must match") is the reason. `measured-here`.
 - **Pipelining is refuted.** With `window_frames=72` a 51-69-frame sentence
