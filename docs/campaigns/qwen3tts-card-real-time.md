@@ -4,7 +4,11 @@
 (`qwen3tts-german-genpath` closed), but the card arm through arcint's own
 `/v1/audio/speech` runs at about **0.26× real time** on the B60 — slower than
 real time, and no faster than the same loop on the CPU. The milestone
-criterion B3 and the unit's serving shape both need real time on the card.
+criterion B3 and the unit's serving shape both need real time on the card. A second window (2026-10-19) then measured
+placement and pipelining, one variable each: the decoder's flush cost is
+fixed per call, the flush window (72, the decoder's `wav_tfm_swa`)
+cannot be lowered seamlessly, and the overlap hypothesis is refuted with
+numbers; the hybrid stays the best arm. See the second measured section.
 
 ## Charter
 
@@ -35,7 +39,7 @@ real-time factor at the fixed set beats real time (proposal, printed with
 every arm); the CPU arm of the same loop is the cross-check, and B1's
 `GGML_OPENCL_PROFILING` per-node profile comes before any kernel work.
 
-## Current state (measured-here, 2026-10-19)
+## Current state (measured-here, 2026-10-19, two windows)
 
 Card: B60 (PCI `8086:e211`), dev binary sha256 `0179adb5…`, Q8_0 backbone
 (`ac7931ae…`) + **bf16 mmproj** (`b9503e95…`), GPU.0, 4,096 ctx, the enrolled
@@ -108,25 +112,88 @@ on the device. Its 48.3 s process is predictor **29.7 s (61 %)** + code2wav
 prompt 0.57 + speaker 0.80. It is **17 % short of real time** and is *not* a
 card-only arm.
 
-**Disposition: on this (upstream) graph path, card-only real time is out of
-reach with numbers, without a node-count change to the code predictor.** The
-predictor is launch-bound on OpenCL (272 ms/frame vs 60 ms/frame single
-backend), and the code2wav is ~1.8 s/flush on card and CPU alike. The split
-reduction (`0061`) and per-op kernels for the six remaining unsupported classes
-do **not** address the dominant per-node overhead.
+**Placement and overlap, second window (measured-here, 2026-10-19):** the same
+B60 (PCI `8086:e211`), a second dev binary `arcint-pipe` `fd0890de…` (the B1
+scratch tree + a second GEN_WAV clip context + an optional code2wav worker),
+the fixed model pair, `gate-fleurs`, seed 42, the 8-sentence gate, **C4
+unchanged and PASS (WER 0.0455) on every arm**:
+
+| arm | placement | window_frames | process / 8 | RTF | frames / sentence |
+|---|---|---|---|---|---|
+| hybrid (B1, the reference) | predictor+codec CPU, backbone card | 72 | 48.3 s | 0.828 | 62,61,56,66,51,64,69,51 |
+| seq | predictor CPU, **codec card** | 72 | 53.3 s | 0.751 | same 62,61,56,66,51,64,69,51 |
+| seq16 | same, window 16 | 16 | 95.2 s | 0.420 | same counts; samples differ (below) |
+| async | same + code2wav on a worker thread | 16 | 74.6 s | 0.536 | **66,50,45,72,48,57,60,54** |
+
+- **Placement: the codec is cheapest on the CPU.** Its flush is 1,692 ms on
+  the CPU (hybrid) against 1,780-2,000 ms on the card (seq; 14.8 s over the
+  eight). The seq arm (predictor CPU, codec card, sequential) runs 0.751, **9 %
+  slower** than the hybrid's 0.828: putting the codec on the card where the
+  predictor does not need its CPU cores does not pay. `measured-here`.
+- **The decoder flush cost is fixed per call.** seq16 decodes 256 codes
+  (16 frames) in **1.78-1.80 s**, essentially the same as 992 codes (62
+  frames) in **1.95 s**; the cost is the 6,492-node code2wav graph and its
+  carried state, not the frame count. Splitting a sentence into 16-frame
+  flushes multiplies decoder work (~28 flushes ≈ 50 s) and lands at 0.420.
+  `measured-here`.
+- **Chunking below the window is not seamless.** At the same window the card
+  codec against the CPU codec differs by at most **245/32768** (mean ~4); at
+  window 16 against 72 the same sentence differs by up to **25,749/32768**
+  (0.79 of full scale) at the same sample count, WER still 0.0455. The
+  `clip.cpp:1945` `hparams.wav_tfm_swa = 72` (the same value the helper's
+  `window_frames` "must match") is the reason. `measured-here`.
+- **Pipelining is refuted.** With `window_frames=72` a 51-69-frame sentence
+  has **one** flush, at its end, so no intra-request flush exists to overlap;
+  the gate's requests are sequential. Overlap would need a lower window, which
+  multiplies the fixed per-call cost; the async worker (window 16, its own
+  clip context and scheduler) lands at 0.536, worse than both the hybrid
+  (0.828) and the sequential card arm (0.751). It does move CPU and card work
+  together (74.6 s against seq16's 95.2 s), but the card's decoder queue plus
+  the backbone's own card decode keep the wall a sum, not a max.
+- **The async arm also changes the output.** Same seed and gate, its sampled
+  frame counts drift to 66,50,45,72,48,57,60,54, where the deterministic arms
+  give 62,61,56,66,51,64,69,51 (seq and seq16 reproduce one another exactly):
+  the decoder on the card runs concurrently with the backbone decode on the
+  card. The mechanism is not adoptable on correctness grounds.
+  `measured-here`.
+- **Time to first audio.** At the default window the first flush is the only
+  flush, so a listener hears nothing until the whole sentence decodes:
+  **5.3-6.8 s** (hybrid), **5.8-7.4 s** (seq). `measured-here`.
+
+**Disposition (updated): the best measured arm stays the B1 hybrid at 0.828**
+(mmproj graphs on the CPU, the backbone on the card); card-only real time
+remains out of reach, and the overlap hypothesis is **refuted with numbers**
+— the decoder's per-call cost is fixed, the flush window must stay 72 (its
+seam), so there is nothing to overlap and lowering it costs both wall and
+waveform. **Proposal, operator may veto:** the production TTS unit takes the
+hybrid placement (code2wav on the CPU, backbone on the card); its price is the
+0.828-and-17 %-short row against the far worse card-only (0.751, 0.420) and
+async (0.536) arms. Real time still needs the decoder's per-call cost reduced
+(lever a) or the predictor's per-node count reduced (lever b), not a placement
+or a thread.
 
 **Open levers, in order by measured share:** (a) the code2wav node count
-(6492 nodes, 947→239 splits, 1.8 s/flush *both* engines) — a CPU-side or
-node-reducing restructure; (b) the code predictor's node/launch count
-(`cache_set`'s concat+arange+get_rows and the per-step sampling, ~1,600 of
-6,792 nodes) — reduce nodes or fuse; (c) the placement decision: the hybrid's
-0.828 is an operator call (a card-only B3 vs a CPU-codec arm), with the price
-of each side on this record.
+(6492 nodes, 1.8 s/flush *both* engines, **and a fixed per-call cost** — 256
+codes cost 1.79 s against 992 codes' 1.95 s) — a node-reducing or per-call-cost
+restructure, now the dominant open item; (b) the code predictor's node/launch
+count (`cache_set`'s concat+arange+get_rows and the per-step sampling, ~1,600 of
+6,792 nodes) — reduce nodes or fuse. Placement is settled by the disposition
+above (the hybrid, operator may veto); pipelining is closed by the measured
+refutation.
 
-`0061` (OpenCL `ARANGE`) is measured on the record (weak but non-regressing);
-its `test-backend-ops` red/green and review are **owed** before it is a numbered
-patch of the series. The instrumentation is a scratch build; the arms above name
-their binaries.
+`0061` (OpenCL `ARANGE`) is **measured, reviewed and dropped from the numbered
+series.** Op suite on the B60 (the CPU reference): **2/2 PASS** green,
+**0/2 FAIL** with `GGML_OPENCL_ARANGE_RED=1` (ERR 4.0, both cases), `support`
+reports ARANGE SUPPORTED; the diff is a correct f32 kernel plus its
+`supports_op`/dispatch, the red switch negating the step. `measured-here`. Its
+gain is weak (RTF 0.267→0.280, −4.8 % wall, 1,007→299 GEN_CODE splits) and its
+**only beneficiary is the card-only predictor path**, which the placement
+decision does **not** adopt (the hybrid's mmproj graphs have splits=1 and never
+run the card's ARANGE); a public PR-shaped patch whose path is out of reach
+pays no maintenance. **Proposal, operator may veto.** The artifacts stay on
+record (the three raw diffs, the op log) and it is regenerable as
+`0061-*.patch` if a card-only path is ever adopted. The instrumentation is a
+scratch build; the arms above name their binaries.
 
 ## Where it lives
 

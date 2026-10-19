@@ -571,6 +571,26 @@ is an operator placement call, not a card-only B3. The earlier §9.4 "CPU
 0.233" was the OpenCL-enabled `llama-tts` (its clip graph still split), not a
 single-backend CPU arm; the corrected CPU predictor is 59.9 ms/frame.
 
+**Placement and overlap (measured-here, 2026-10-19, second window):** a second
+dev binary (`arcint-pipe` `fd0890de…`, the B1 scratch tree + a second GEN_WAV
+clip context + an optional code2wav worker), the same B60, model pair,
+`gate-fleurs`, seed 42, **C4 PASS (WER 0.0455) on all arms**: hybrid 0.828
+(48.3 s), codec-on-card 0.751 (53.3 s), window-16 sequential 0.420 (95.2 s),
+window-16 async worker 0.536 (74.6 s). Three measured dispositions: the codec
+is **cheapest on the CPU** (1,692 ms/flush against 1,780-2,000 on the card); the
+decoder's flush cost is **fixed per call** (256 codes 1.79 s against 992 codes
+1.95 s — the 6,492-node graph and its carried state, not the frame count), so
+chunking multiplies it; and window < 72 is **not seamless** (card-vs-CPU at
+window 72 differs ≤245/32768, window 16 vs 72 differs up to 25,749/32768 at the
+same sample count and WER). With `window_frames=72` a 51-69-frame sentence has
+one flush, so there is nothing to overlap; the async worker also drifts the
+sampled frames (66,50,45,72,48,57,60,54 against the deterministic
+62,61,56,66,51,64,69,51) — concurrent card use is not adoptable. **Update:** the
+hybrid remains the best arm and is the **proposed** production placement
+(operator may veto); pipelining is closed by the refutation; `0061`'s op suite
+is green/red-green on the B60 but the patch is **dropped** (its only
+beneficiary, the card-only predictor, is not adopted).
+
 ## 10. References
 
 - llama.cpp `3e4dfa8`: `tools/mtmd/{mtmd.h,mtmd.cpp,mtmd-image.cpp,
