@@ -1731,13 +1731,38 @@ gate as before: the answers right, the KL against unsloth's Q8_0.
   `fn-ref-q8.kld`): 0.2188 ± 0.0105 / top-1 89.71 % at ubatch 512, 0.2191 ±
   0.0105 / 89.56 % at ubatch 4 with the CPU misses: the record's 0.218 / 89.7
   reproduced, the same-window baseline for a UD-Q3_K_XL arm.
-- **UD-Q3_K_XL** (CPU KL 0.1002 / 93.3 %, 2026-10-09) does not fit the
-  host's limits yet (`code`, the GGUF headers): experts 51.99 GiB and
-  non-expert 31.81 GiB against IQ3_XXS's 39.97 / 30.66 (the PLE table is
-  26.82 GiB in both). Its card-side non-expert weights are ~1.15 GiB larger,
-  so at IQ3_XXS's VRAM peak its slots shrink and the bank grows to ~41.5
-  GiB, over the 40 GiB TTM pinned cap; more slots do not fit the card. The
-  pinned bank is not charged to the container's cgroup (`measured-here`:
-  the container's MemAvailable stayed 94.3-94.4 GiB while each process
-  held its 28.72 GiB bank), so it counts against the host's RAM directly.
-  The arm waits on the operator's decision on the TTM cap.
+- **UD-Q3_K_XL** (CPU KL 0.1002 / 93.3 %, 2026-10-09; `code`, the GGUF
+  headers: experts 51.99 GiB and non-expert 31.81 GiB against IQ3_XXS's
+  39.97 / 30.66, the PLE table 26.82 GiB in both). Its bank at a VRAM-safe
+  slot budget is over 40 GiB, so the TTM pinned cap went from 40 to 48 GiB
+  (`decision`, operator, 2026-10-19: "raise limits appropriately"; not the
+  new half-of-RAM default of ~62.7 GiB, because the bank is not charged to
+  the container's cgroup: `measured-here`, the container's MemAvailable
+  stayed 94.3-94.4 GiB while each process held its bank). Measured on the
+  B60 (`measured-here`, the 1.2.0 package, the unit's flags with its own
+  `--llama-expert-cache`, the file on the NVMe, the page cache cold):
+  - At 10,800 MiB of slots (4,945 slots, 14.31 GiB on the card, the bank
+    38.66 GiB, 23,135 MiB after load) the first request thrashed: GTT
+    54,413 MiB against the 39,630 MiB bank (~15 GiB of VRAM buffers
+    evicted to host memory), the capital in 27.6 s with 45,971 major faults,
+    prefill 1.1 t/s. Stopped by hand.
+  - At 9,000 MiB (4,115 slots, 12.71 GiB on the card, the bank 40.29 GiB,
+    21,628 / 21,908 MiB after load), two processes: decode on the six
+    answers 11.6 / 15.0 / 14.1 / 10.0 / 10.3 / 13.8 t/s (mean **12.5**,
+    identical in both), prefill at the 20k needle **213.3** t/s, routed
+    experts on the card 17.7 % on the needle's decode, peak VRAM 24,233 MiB
+    and GTT 54,555 MiB during the needle (~13 GiB evicted above the bank in
+    the 20k prefill); Paris and the needle right, the answers byte-identical
+    across the two runs.
+  - KL as served against Q8_0 (16 x 512): **0.1066 ± 0.0052** / top-1
+    92.65 % at ubatch 512, 0.1068 ± 0.0052 / 92.67 % at ubatch 4, against
+    IQ3_XXS's 0.2188 / 89.71 % in the same session: the CPU's 0.1002
+    reproduced as served, 0.112 nats better than the default.
+  - So UD-Q3_K_XL halves the KL and costs ~63 % of the decode (12.5
+    against 33.4-33.9 t/s) and ~66 % of the prefill on this card: under the
+    20 t/s usability band. Why it is that much slower was not measured; the
+    candidates are fewer slots (4,115 against 7,208), the CPU misses' AVX2
+    rows covering the i-quants and Q2_0 but not Q3_K (`code`, 0056), and the
+    eviction in long prefills. The request's fourth arm (a GSQ-RCO quant one
+    step up) was conditional on UD-Q3_K_XL's KL not being clearly better and
+    is not proposed.
