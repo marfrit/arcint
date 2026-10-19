@@ -18,14 +18,14 @@
 # ocl-icd-opencl-dev, git (git apply), python3 (embeds the OpenCL kernels).
 set -euo pipefail
 
-PKGVER=1.1.0
+PKGVER=1.1.1
 PKGREL=1
 UPSTREAM_TAG=v${PKGVER}
 # arcint's release tarball carries the llama.cpp patches, the sd.cpp patches
 # and the build script; the package is built from what anyone can check. Its
 # sha256 is taken after the tag was pushed (the follow-up commit, as for arcint).
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
-ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-aafe69b20ab185ce550cd29336c01a658d4aea64cf284d19efa9a92c3c3ccb6a}
+ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-}
 LLAMA_COMMIT=3e4dfa8f39f904e681737d9f512a6e6338d848aa
 LLAMA_URL="https://github.com/ggml-org/llama.cpp/archive/${LLAMA_COMMIT}.tar.gz"
 LLAMA_TARBALL_SHA256=f9046074c9b71eaf9abd5491001e4d09c327591fed6b9e2bfcfddbb575dc5255
@@ -83,13 +83,15 @@ ROOT="$work/pkgroot"
 mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/bin" "$ROOT/usr/share/doc/arcint-imggen" "$ROOT/usr/share/arcint-imggen"
 install -m 755 build/bin/sd-server "$ROOT/usr/bin/arcint-sd-server"
 install -m 755 build/bin/sd-cli "$ROOT/usr/bin/arcint-sd-cli"
-install -m 644 arcint/contrib/systemd/arcint-imggen.service "$ROOT/usr/share/arcint-imggen/"
+for u in arcint-imggen arcint-imggen-qwen arcint-imggen-flux; do
+    install -m 644 "arcint/contrib/systemd/$u.service" "$ROOT/usr/share/arcint-imggen/"
+done
 install -m 644 arcint/tools/imggen_gate.py "$ROOT/usr/share/arcint-imggen/"
 
 # The kernels the series exists for, in the binary that serves (the build
 # script checks sd-cli; the package ships sd-server too). No pipes: grep -q
 # under pipefail takes SIGPIPE.
-for k in kernel_mul_mm_q8_0_f16 rope_apply_f32 flash_attn_f32_f16_dpas; do
+for k in kernel_mul_mm_q8_0_f16 rope_apply_f32 flash_attn_f32_f16_dpas kernel_conv_3d kernel_leaky_relu; do
     grep -qa "$k" "$ROOT/usr/bin/arcint-sd-server" || { echo "arcint-sd-server lacks $k" >&2; exit 1; }
 done
 grep -qa "$ARCINT_BUILD" "$ROOT/usr/bin/arcint-sd-server" || { echo "/props build string missing" >&2; exit 1; }

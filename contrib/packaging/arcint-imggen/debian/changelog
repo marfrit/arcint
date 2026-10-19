@@ -1,3 +1,14 @@
+arcint-imggen (1.1.1-1) trixie; urgency=medium
+
+  * 1.1.1: arcint-sd-server and arcint-sd-cli on patches 0001-0060: 0059's
+    CONV_3D runs Qwen-Image's Wan VAE on the card (before it the graph
+    crashed), 0060's LEAKY_RELU the ESRGAN upscaler. The unit templates
+    arcint-imggen-qwen.service (Qwen-Image, :8081) and
+    arcint-imggen-flux.service (FLUX.2 klein 4B with editing, :8082) beside
+    arcint-imggen.service; the image gate's per-model tolerances.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 18 Oct 2026 23:00:00 +0200
+
 arcint-imggen (1.1.0-1) trixie; urgency=medium
 
   * First package: stable-diffusion.cpp f0aac52's sd-server and sd-cli in

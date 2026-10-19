@@ -1,0 +1,52 @@
+# arcint-imggen-qwen — text-to-image with German lettering (Qwen-Image 20B,
+# Qwen2.5-VL-7B text encoder, the Wan VAE) on the 24 GB card, on demand:
+# sd.cpp's sd-server from the arcint-imggen package, on arcint's patched ggml.
+#
+# Starting it stops the card's language units and the other image units
+# (same card, Conflicts=).
+# OpenAI /v1/images/generations (data[0].b64_json), /health, /props; a seed
+# (or steps/cfg) per request through the prompt suffix
+# <sd_cpp_extra_args>{"seed":N}</sd_cpp_extra_args>.
+# It also serves sd.cpp's own POST /sdcpp/v1/upscale for the print route: the
+# server finds its upscalers by scanning --hires-upscalers-dir (a directory
+# holding only RealESRGAN_x4plus.safetensors; every file there is loaded to
+# read its scale). The image units conflict with each other too: one model
+# at a time on the card.
+#
+# The flags mirror the gated 512² arm (docs/milestone-1.1.1.md §9): euler,
+# cfg 2.5, --flow-shift 3; the Wan VAE's 3D convolutions run on 0059's
+# implicit-GEMM CONV_3D, and 1024² at Q4_K_M is ~16.8 GiB of weights,
+# measured all on VRAM at 512². Steps and size are per-request tunable.
+
+[Unit]
+Description=arcint-imggen-qwen — Qwen-Image via sd-server, GPU.0 (Arc Pro B60), :8081, on demand
+Documentation=https://github.com/marfrit/arcint
+After=default.target
+Conflicts=arcint-agent.service arcint-writer.service arcint-flashnext.service arcint-agent-lanes.service arcint-imggen.service arcint-imggen-flux.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/arcint-sd-server \
+    --diffusion-model /models/imggen/Qwen_Image-Q4_K_M.gguf \
+    --llm /models/imggen/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf \
+    --vae /models/imggen/qwen-image-vae.safetensors \
+    --hires-upscalers-dir /models/imggen/upscalers \
+    --backend GPUOpenCL \
+    --auto-fit off \
+    --flash-attn off,diffusion=on \
+    --conv-direct auto,vae=on \
+    --width 1024 --height 1024 \
+    --steps 20 --seed 42 --cfg-scale 2.5 --sampling-method euler --flow-shift 3 \
+    --listen-ip 0.0.0.0 --listen-port 8081
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=20min
+TimeoutStopSec=60s
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectHome=read-only
+
+[Install]
+WantedBy=default.target

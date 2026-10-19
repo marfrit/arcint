@@ -101,7 +101,7 @@ gate. Checked against the source:
 | D3 | Card and unit | **the B60 on demand**, `Conflicts=` with the agent, the writer, Flash-Next and the lanes unit (`decision`, operator, 2026-10-17). An on-demand front on the card host starts and stops it (operator-local) |
 | D4 | First model | **Z-Image Turbo** (6B, 8 steps, Qwen3-4B encoder, AutoEncoderKL). Qwen-Image and FLUX.2 are Phase 4, not in 1.1.0 |
 | D5 | `GGML_MAX_NAME` | follows from D2(a): **separate binaries**, sd.cpp's build at 160, arcint's libllama at the pin's 64; they never share a process (`code`, `contrib/sdcpp/build-sdcpp.sh`) |
-| D6 | The gate's tolerances (§3) | **open**: the release gated with the placeholders `tools/imggen_gate.py` prints with every verdict (per-step cosine ≥ 1 − 0.001; against the baseline arm per-step MSE ≤ +5 %, final PSNR ≥ −1 dB, SSIM ≥ −0.01). The numbers stay the operator's |
+| D6 | The gate's tolerances (§3) | **decided 2026-10-18** (`decision`, operator): per-model `TOL_COS`, about 0.003 for the 1.1.1 models; `tools/imggen_gate.py`'s `MODEL_TOL` holds Z-Image Turbo at 0.001 (its measured gap 0.00007), Qwen-Image and FLUX.2 klein at 0.003, and a final PSNR/SSIM floor per model where no baseline arm exists (`docs/milestone-1.1.1.md` §9). The 1.1.0 release gated with the placeholders (per-step cosine ≥ 1 − 0.001; against the baseline arm per-step MSE ≤ +5 %, final PSNR ≥ −1 dB, SSIM ≥ −0.01) |
 
 ## 2. Criteria for 1.1.0
 

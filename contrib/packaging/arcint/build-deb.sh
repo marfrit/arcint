@@ -14,7 +14,7 @@
 # (docs/history.md), and older tags are built with the recipe at their tag.
 set -euo pipefail
 
-PKGVER=1.1.0
+PKGVER=1.1.1
 UPSTREAM_TAG=v${PKGVER}
 PKGREL=1
 # The public repository, not the fleet one. The fleet repo (still named
@@ -22,9 +22,9 @@ PKGREL=1
 # and carries operator-local notes; the published tree is the same code without
 # them, so the package is built from what anyone can check.
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
-# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v1.1.0.tar.gz,
+# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v1.1.1.tar.gz,
 # taken after the tag was pushed (recorded in the follow-up commit, as for every tag).
-ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-aafe69b20ab185ce550cd29336c01a658d4aea64cf284d19efa9a92c3c3ccb6a}
+ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-}
 # The libllama engine (--engine llama) builds against llama.cpp at this pin
 # with contrib/llama.cpp/patches applied (contrib/llama.cpp/README.md): the
 # GitHub tarball of the commit, checked by sha256.

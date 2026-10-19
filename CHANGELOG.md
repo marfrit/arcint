@@ -18,6 +18,52 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.1.1 — 2026-10-18
+
+More image models (`docs/milestone-1.1.1.md`, the units' contract
+`docs/imggen-service.md`): **Qwen-Image** for lettering (German included),
+**FLUX.2 klein 4B** with image editing, and **ESRGAN 4x** upscaling for print,
+each model its own on-demand unit next to `arcint-imggen` on the Arc Pro
+B60: `arcint-imggen-qwen` on :8081, `arcint-imggen-flux` on :8082, both
+with `Conflicts=` against the card's language units and the other image
+units. `arcint-imggen` (Z-Image Turbo, :8085) is unchanged.
+
+**Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (58
+patches, 0001-0060 without 0031 and 0055); the `arcint-imggen` package's
+`arcint-sd-server` must be 1.1.1 for the new units (0059, 0060).
+
+**Release check** (`measured-here`, 2026-10-18, the release build, the
+1.1.1 session's arms replayed and its CPU references reused): Qwen-Image
+512² PASS (cos worst 0.998676, 26.26 dB) at 0.95 s a step, 1024² 20 steps
+in 158.9 s at a peak of 18,827 MiB; the klein edit PASS (0.999539,
+32.43 dB); the served edit (`/v1/images/edits`, init image +
+reference) 17.2 dB from a CPU sd-server running the same request, below the
+proposed 20 dB floor (a local divergence, not the VAE; released with that gate open by the operator's decision,
+`docs/campaigns/imggen-served-edit-divergence.md` (on the `qfndev` branch)); the upscale route 512² -> 2048² in 27.9 s; the
+red cases of 0059 (by the new final floor) and of the op suites FAIL.
+Unchanged paths: Z-Image Turbo 512² seed 42 pixel-identical to 1.1.0's;
+the 1.1.1 language binary answers the capital question on
+both cards (its new OpenCL programs build at start on the B60 and the A770). No full A/B against 1.1.0: the language path's code is
+unchanged but for two OpenCL programs it builds at start.
+
+- **0059, `CONV_3D` on OpenCL** (implicit GEMM, the depth folded into the
+  reduction): Qwen-Image's Wan VAE decodes on the card (2.2 s at 512²); before
+  it the graph crashed. Op cases at the VAE's own shapes; a 32-bit bound.
+- **0060, `LEAKY_RELU` on OpenCL**: the ESRGAN upscaler runs on the card
+  (before it segfaulted). Contiguous input only: the strided kernels
+  measured wrong in the suite and stay off.
+- **The image gate's tolerances (D6, operator, 2026-10-18)**: per model,
+  `tools/imggen_gate.py`'s `MODEL_TOL`: Qwen-Image and FLUX.2 klein 0.003,
+  Z-Image Turbo 0.001; without a baseline arm the final image is held to a
+  per-model PSNR/SSIM floor (the previews never pass the VAE, so a VAE
+  defect passed the per-step gate), and a missing final image fails.
+  Parity also covers `--flow-shift`, `--ref-image`, `--init-img`,
+  `--strength`, the mask and the upscaler.
+- **The units**: `/v1/images/edits` on the flux unit uses the uploaded image
+  as init image (strength 0.75, per request through the prompt suffix) and
+  as FLUX.2's reference; `/sdcpp/v1/upscale` on both new units from
+  `--hires-upscalers-dir`. The package installs all three unit templates.
+
 ## 1.1.0 — 2026-10-18
 
 Image generation (`docs/milestone-1.1.0.md`): text-to-image with Z-Image

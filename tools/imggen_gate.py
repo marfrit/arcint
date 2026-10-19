@@ -38,7 +38,10 @@ flags (`PARITY`) differ, unless `--allow-unverified` is given.
 
 With `--baseline`, the baseline arm is measured against the same reference and
 the candidate may be at most the tolerance worse than it: per-step MSE, final
-PSNR and SSIM.
+PSNR and SSIM. Without one (a model the unchanged build cannot run), the final
+image is held to the model's PSNR/SSIM floor (`MODEL_TOL`), since the per-step
+previews never pass through the VAE. A missing final image or a preview step
+present on one side only is a failure.
 
 Only the standard library is used: the card host may have no numpy, PIL or
 ffmpeg, and the gate must not need them.
@@ -58,6 +61,55 @@ TOL_COS = 0.001      # per-step cosine may fall this much below 1.0
 TOL_MSE = 0.05       # per-step MSE may grow this fraction on the reference's
 PSNR_TOL = 1.0       # dB below the baseline arm's final PSNR
 SSIM_TOL = 0.01      # below the baseline arm's final SSIM
+
+# Per-model tolerances: the operator's D6 (2026-10-18): per-model TOL_COS, about
+# 0.003 for the 1.1.1 models (Qwen-Image, FLUX.2 klein), whose CPU-vs-OpenCL
+# per-step gaps measured 0.0013-0.0019; Z-Image Turbo keeps 0.001, its gap
+# measured 0.00007 (1.1.0). Keyed by the diffusion model's file name -- arm.json's
+# --diffusion-model basename, the key check_parity already compares. A model
+# not listed keeps the placeholders above; an explicit --tol-cos / --psnr-floor
+# / --ssim-floor overrides the table.
+#
+# psnr_floor / ssim_floor gate the final image against the CPU reference and
+# apply only when there is no baseline arm: the per-step previews are the
+# latent projected to RGB, so a defect in the VAE alone (0059's red) leaves
+# every preview unchanged and the per-step cosine cannot see it. With a
+# baseline arm the comparative PSNR_TOL / SSIM_TOL rule applies instead.
+# "measured" is the evidence the values rest on; a size not listed there is
+# printed as unmeasured.
+MODEL_TOL = {
+    # 1.1.0 C1: 1024² cos worst 0.999926, 42.59 dB, SSIM 0.999257; 512²
+    # 0.999987, 46.54 dB. Reds: 0057 512² cos 0.890391 / 9.70 dB, 0058 1024²
+    # 0.987219 / 19.56 dB, 512² 0.995502.
+    "z_image_turbo-Q8_0.gguf": {
+        "tol_cos": 0.001, "psnr_floor": 30.0, "ssim_floor": 0.99,
+        "measured": ("1024x1024", "512x512")},
+    # 1.1.1 §9: 512²/8 cos worst 0.998676, 26.26 dB, SSIM 0.9912. Red: 0059
+    # previews cos 1.000000, final 8.70 dB / SSIM 0.0105 (vs the green arm).
+    "Qwen_Image-Q4_K_M.gguf": {
+        "tol_cos": 0.003, "psnr_floor": 20.0, "ssim_floor": 0.95,
+        "measured": ("512x512",)},
+    # 1.1.1 §9: 512²/4 text-to-image cos worst 0.998115, 25.31 dB (SSIM not
+    # recorded); edit cos worst 0.999539, 32.43 dB, SSIM 0.9966. No red on
+    # this model yet.
+    "flux2-klein-4b-Q8_0.gguf": {
+        "tol_cos": 0.003, "psnr_floor": 20.0, "ssim_floor": 0.95,
+        "measured": ("512x512",)},
+}
+
+
+def model_tolerances(canddir):
+    """(model file, size, entry or None) of the candidate arm, from arm.json."""
+    try:
+        cmd = arm_header(canddir).get("cmd") or []
+    except ValueError:
+        return None, None, None
+    def flag(k):
+        return cmd[len(cmd) - 1 - cmd[::-1].index(k) + 1] if k in cmd else None
+    model = flag("--diffusion-model")
+    model = os.path.basename(model) if model else None
+    size = "%sx%s" % (flag("-W"), flag("-H")) if flag("-W") else None
+    return model, size, MODEL_TOL.get(model)
 
 
 # --- a PNG reader for exactly what sd.cpp writes (8-bit, non-interlaced) ---
@@ -216,7 +268,9 @@ def per_step(ref, cand):
 # differ in any of them measures the inputs, not the backend (a no-prompt arm
 # against a prompted one was once read as a defect, docs/imggen.md).
 PARITY = ("--diffusion-model", "--llm", "--vae", "-p", "--cfg-scale", "--steps",
-          "-W", "-H", "--seed", "--sampling-method", "--scheduler")
+          "-W", "-H", "--seed", "--sampling-method", "--scheduler",
+          "--flow-shift", "--ref-image", "--mask", "--upscale-model",
+          "--upscale-repeats", "--init-img", "--strength")
 MODEL_FLAGS = ("--diffusion-model", "--llm", "--vae")
 
 
@@ -229,7 +283,9 @@ def arm_header(d):
 
 def arm_params(d):
     cmd = arm_header(d).get("cmd") or []
-    p = {k: (cmd[cmd.index(k) + 1] if k in cmd else None) for k in PARITY}
+    # The last occurrence: sd-cli's parser keeps the last value, so a flag
+    # repeated through --extra-args is what the arm actually ran.
+    p = {k: (cmd[len(cmd) - cmd[::-1].index(k)] if k in cmd else None) for k in PARITY}
     # A model is its file, not its directory: the reference may read the
     # mirror and the card arm a sha-checked copy on another disk.
     for k in MODEL_FLAGS:
@@ -266,10 +322,19 @@ def check_parity(dirs):
         print("  arm %s: %s" % (d, json.dumps(arm_mechanism(d))))
 
 
-def compare_ref(refdir, canddir, basedir=None, tol_cos=TOL_COS, tol_mse=TOL_MSE,
-                psnr_tol=PSNR_TOL, ssim_tol=SSIM_TOL, allow_unverified=False):
+def compare_ref(refdir, canddir, basedir=None, tol_cos=None, tol_mse=TOL_MSE,
+                psnr_tol=PSNR_TOL, ssim_tol=SSIM_TOL, allow_unverified=False,
+                psnr_floor=None, ssim_floor=None):
     if not allow_unverified:
         check_parity([refdir, canddir] + ([basedir] if basedir else []))
+    model, size, entry = model_tolerances(canddir)
+    entry = entry or {}
+    if tol_cos is None:
+        tol_cos = entry.get("tol_cos", TOL_COS)
+    if psnr_floor is None:
+        psnr_floor = entry.get("psnr_floor")
+    if ssim_floor is None:
+        ssim_floor = entry.get("ssim_floor")
     ref_prev, ref_final = read_dir(refdir)
     cand_prev, cand_final = read_dir(canddir)
     rows, miss = per_step(ref_prev, cand_prev)
@@ -282,6 +347,9 @@ def compare_ref(refdir, canddir, basedir=None, tol_cos=TOL_COS, tol_mse=TOL_MSE,
     for i, cos, mse in rows:
         if cos < 1.0 - tol_cos:
             failures.append("step %d cosine %.6f < %.6f" % (i, cos, 1.0 - tol_cos))
+    if miss:
+        # An arm that stopped early (or crashed after sampling) is not a pass.
+        failures.append("preview step(s) only on one side: %s" % miss)
 
     final = {}
     if ref_final and cand_final:
@@ -289,6 +357,17 @@ def compare_ref(refdir, canddir, basedir=None, tol_cos=TOL_COS, tol_mse=TOL_MSE,
         final["psnr_ref"] = ps
         final["mse_ref"] = pmse
         final["ssim_ref"] = ssim_global(ref_final, cand_final)
+    else:
+        # A missing final image is a failed decode (0059 off crashes in the
+        # VAE after every preview was written), never an ungated pass.
+        failures.append("final image missing: ref %s, cand %s" % (ref_final, cand_final))
+    if not basedir and final:
+        if psnr_floor is not None and final["psnr_ref"] < psnr_floor:
+            failures.append("final PSNR %.2f < floor %.2f (%s, no baseline arm)" %
+                            (final["psnr_ref"], psnr_floor, model))
+        if ssim_floor is not None and final["ssim_ref"] < ssim_floor:
+            failures.append("final SSIM %.4f < floor %.4f (%s, no baseline arm)" %
+                            (final["ssim_ref"], ssim_floor, model))
 
     baseline = None
     if basedir:
@@ -328,11 +407,17 @@ def compare_ref(refdir, canddir, basedir=None, tol_cos=TOL_COS, tol_mse=TOL_MSE,
         print("  step(s) only on one side: %s" % miss)
     if basedir:
         print("  baseline %s: %s" % (basedir, json.dumps({k: round(v, 6) for k, v in baseline.items()})))
+    elif psnr_floor is not None or ssim_floor is not None:
+        print("  no baseline arm: cosine per step, final PSNR/SSIM against the model's floor")
     else:
-        print("  no baseline arm: cosine is gated; MSE/PSNR/SSIM are reported, not gated")
-        print("  (the gate is comparative against the unchanged OpenCL on the same card)")
-    tol = {"tol_cos": tol_cos, "tol_mse": tol_mse, "psnr_tol": psnr_tol, "ssim_tol": ssim_tol}
-    print("  tolerances (operator, D6): %s" % json.dumps(tol))
+        print("  no baseline arm and no floor for %s: cosine is gated; MSE/PSNR/SSIM are"
+              " reported, not gated -- a VAE-only defect cannot fail this verdict" % model)
+    tol = {"tol_cos": tol_cos, "tol_mse": tol_mse, "psnr_tol": psnr_tol, "ssim_tol": ssim_tol,
+           "psnr_floor": psnr_floor, "ssim_floor": ssim_floor}
+    print("  tolerances (operator, D6) for %s at %s: %s" % (model, size, json.dumps(tol)))
+    if entry and size not in entry.get("measured", ()):
+        print("  WARNING: %s's tolerances were measured at %s, not %s" %
+              (model, "/".join(entry["measured"]), size))
     if failures:
         for f in failures:
             print("  FAIL %s" % f)
@@ -365,6 +450,16 @@ def run_arm(a):
            "--log-level", a.log_level]
     if a.scheduler:
         cmd += ["--scheduler", a.scheduler]
+    if a.flow_shift is not None:
+        cmd += ["--flow-shift", str(a.flow_shift)]
+    if a.ref_image:
+        cmd += ["--ref-image", a.ref_image]
+    if a.mask:
+        cmd += ["--mask", a.mask]
+    if a.upscale_model:
+        cmd += ["--upscale-model", a.upscale_model]
+        if a.upscale_repeats:
+            cmd += ["--upscale-repeats", str(a.upscale_repeats)]
     if a.extra_args:
         cmd += a.extra_args
     sha = hashlib.sha256(open(a.sdcpp, "rb").read()).hexdigest()[:16] if os.path.isfile(a.sdcpp) else "?"
@@ -398,6 +493,11 @@ def main():
     r.add_argument("-H", "--height", type=int, default=512)
     r.add_argument("--sampling-method", default="euler")
     r.add_argument("--scheduler")  # omitted: sd.cpp's model-specific default
+    r.add_argument("--flow-shift", type=float, default=None)  # Qwen/VL flow shift
+    r.add_argument("--ref-image", default=None)               # edits: the source image
+    r.add_argument("--mask", default=None)                    # edits: the mask
+    r.add_argument("--upscale-model", default=None)           # ESRGAN
+    r.add_argument("--upscale-repeats", type=int, default=0)
     r.add_argument("--preview-interval", type=int, default=1)
     r.add_argument("--diffusion-sha", default="")
     r.add_argument("--llm-sha", default="")
@@ -410,15 +510,20 @@ def main():
     c.add_argument("--ref", required=True)
     c.add_argument("--cand", required=True)
     c.add_argument("--baseline")
-    c.add_argument("--tol-cos", type=float, default=TOL_COS)
+    c.add_argument("--tol-cos", type=float, default=None,
+                   help="per-step cosine tolerance (default: MODEL_TOL, else %g)" % TOL_COS)
     c.add_argument("--tol-mse", type=float, default=TOL_MSE)
     c.add_argument("--psnr-tol", type=float, default=PSNR_TOL)
     c.add_argument("--ssim-tol", type=float, default=SSIM_TOL)
+    c.add_argument("--psnr-floor", type=float, default=None,
+                   help="final PSNR floor vs the reference without a baseline (default: MODEL_TOL)")
+    c.add_argument("--ssim-floor", type=float, default=None,
+                   help="final SSIM floor vs the reference without a baseline (default: MODEL_TOL)")
     c.add_argument("--allow-unverified", action="store_true",
                    help="compare arms without arm.json or with differing flags (reported, never a gate)")
     c.set_defaults(func=lambda a: compare_ref(a.ref, a.cand, a.baseline,
                                              a.tol_cos, a.tol_mse, a.psnr_tol, a.ssim_tol,
-                                             a.allow_unverified))
+                                             a.allow_unverified, a.psnr_floor, a.ssim_floor))
 
     a = ap.parse_args()
     try:
