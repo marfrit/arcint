@@ -180,11 +180,11 @@ async (0.536) arms. Real time still needs the decoder's per-call cost reduced
 (lever a) or the predictor's per-node count reduced (lever b), not a placement
 or a thread.
 
-**Open levers, in order by measured share:** (a) the code2wav node count
-(6492 nodes, 1.8 s/flush *both* engines, **and a fixed per-call cost** — 256
-codes cost 1.79 s against 992 codes' 1.95 s) — a node-reducing or per-call-cost
-restructure, now the dominant open item; (b) the code predictor's node/launch
-count (`cache_set`'s concat+arange+get_rows and the per-step sampling, ~1,600 of
+**Open levers, in order by measured share:** (a) the code2wav fixed per-call
+cost is now **explained** (above: the always-72-frame padded window; the
+valid-frames switch scales it with the flushed count and gives ~0.90 at window
+72, the C4 card gate owed); (b) the code predictor's node/launch count
+(`cache_set`'s concat+arange+get_rows and the per-step sampling, ~1,600 of
 6,792 nodes) — reduce nodes or fuse. Placement is settled by the disposition
 above (the hybrid, operator may veto); pipelining is closed by the measured
 refutation.
@@ -219,6 +219,39 @@ card; `ARCINT_TTS_GEN_FORCE_GPU=1` is the red switch and
 `tools/tts_placement_check.sh` runs red-then-green on the card host. C4 is
 unchanged (the placement is the same arm the campaign measured). This landing
 is `code`; the 0.828/0.751/1,692 ms numbers it rests on stay `measured-here`.
+
+**Lever (a) characterized (measured-here, CPU, 2026-10-19).** The fixed ~1.8 s
+code2wav flush is the **padded 72-frame `wav_tfm_swa` window**, not any of the
+other suspects. The GEN_WAV graph has a constant shape:
+`qwen3tts-gen.cpp build()` sets `n_frames = hparams.wav_tfm_swa` (72) and the
+caller pads the codes to `n_frames_w * n_codes` (`clip.cpp`), so the decoder
+computes 72 frames whether the caller flushes 16 or 72. A pure-CPU `llama-tts`
+(`GGML_OPENCL=OFF`) measures, per flush: 16 frames 1.766 s, 44 frames 1.760 s,
+62 frames 1.78 s, 72 frames 1.78 s; `compute_us` is 99.6 % of the flush
+(1.75-1.78 s) while build 0.6 ms, alloc 0.8 ms, input 1.0 ms and output 2.0 ms
+are 0.3 %: graph rebuild/realloc, per-call weight re-conversion and the input
+copy are not the cost. A thread A/B (t = 16, 12, 8, 4, 2, 1) holds the flush at
+1.763-1.766 s (t=1 the fastest): thread underuse is not it. `perf` on an
+isolated flush (`-n 1`, window 1, ~96 % GEN_WAV): dense bf16/f16 `tinyBLAS`
+gemms ~28 %, `im2col` ~11 %, `add`/`mul`/`concat`/`sin`/`sqr` the rest — im2col
+is real but not dominant, the padded **matmul** work is.
+
+- **One-variable experiment: compute only the valid frames.** With the
+  scratch switch `ARCINT_TTS_WAV_EXACT=1` the graph takes the caller's frame
+  count instead of 72 (`models.h`/`qwen3tts-gen.cpp`/`clip.cpp`). The flush
+  becomes frame-proportional: 44 frames 1.11 s, 55 1.37, 60 1.49, 64 1.59
+  (against the fixed 1.77-1.79); the 8-sentence set's flush total falls
+  14.25 s -> 10.60 s (-26 %). The output is **not bit-identical**: CPU vs CPU
+  (the hybrid's own codec) differs by at most 162/32767 (rel 0.005) on
+  ~40-56 k of ~100 k samples, one sentence identical — within the window-72
+  card-vs-CPU diff the placement arm already showed (<=483/32768, 0.0147),
+  and the answer-level bar allows it. `measured-here` (CPU).
+  **The C4 round trip on the card is owed** before adoption. At window 72 the
+  hybrid moves from 0.828 to about **0.90** (flush 1.1-1.6 s at 43-64 frames,
+  still above the 0.8 s/flush target); only a lower window (16 frames ->
+  ~0.39 s flush) gets below it, and that reopens the seam question (window 16
+  vs 72 differs up to 25,749/32768, measured). The lever is real and the
+  fixed cost is now explained.
 
 ## Where it lives
 

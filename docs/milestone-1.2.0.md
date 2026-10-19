@@ -598,6 +598,25 @@ hybrid), parsed and unit-tested with the other `--tts` flags, carried by
 `cpu` request that builds any `mmproj` clip context on the card (libmtmd's
 `clip_init` backend line is captured; `ARCINT_TTS_GEN_FORCE_GPU=1` the red
 switch, `tools/tts_placement_check.sh` the red-first gate). C4 is unchanged.
+The gate was then run on the B60 (2026-10-19, `measured-here`): **red
+FAIL-before** (`ARCINT_TTS_GEN_FORCE_GPU=1` refuses, naming the card backend),
+**green PASS** (`--tts-gen-device cpu`: boot up, CPU clip contexts only), card
+hygiene per the SOP, `arcint-agent` stopped and restored.
+
+**Lever (a), the code2wav fixed per-call cost (measured-here, CPU,
+2026-10-19):** it is the **padded 72-frame `wav_tfm_swa` window**. The graph
+sets `n_frames = 72` and the caller pads the codes to 72, so the decoder
+computes 72 frames for a 16- or 72-frame flush alike (1.766-1.78 s, 99.6 %
+compute; build/alloc/input/output 0.3 %; thread A/B 1.763-1.766 s over t=16..1,
+not threads; perf: bf16/f16 gemms ~28 %, im2col ~11 %). Computing only the
+valid frames (scratch `ARCINT_TTS_WAV_EXACT=1`) makes the flush proportional
+(44 frames 1.11 s ... 64 1.59 s; 8-sentence total 14.25 -> 10.60 s) with a
+small CPU-vs-CPU sample diff (max 162/32767, one sentence identical, inside the
+placement arm's already-shown 483/32768). At window 72 the hybrid moves
+0.828 -> ~0.90 (still short of real time, flush 1.1-1.6 s, not <0.8 s); a
+lower window would get below 0.8 but reopens the seam. **The C4 card gate is
+owed;** the lever is real and the cost is explained (campaign
+`qwen3tts-card-real-time`).
 
 ## 10. References
 
