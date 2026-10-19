@@ -1788,3 +1788,50 @@ gate as before: the answers right, the KL against unsloth's Q8_0.
     question only; our -63 % for 1.3x the expert bytes is not that price.
     The request's fourth arm (a GSQ-RCO quant one step up) was conditional on
     UD-Q3_K_XL's KL not being clearly better and is not proposed.
+
+### Stage 10 — Strata's CPU rows for the remaining types: patch 0063 (2026-10-19)
+
+The reference check of stage 9 found 0056's CPU rows covering only IQ2_S,
+IQ2_XXS and Q2_0, and a layer takes the fast path only if all three of its
+projections do (`code`), so every layer of both GGUFs with an IQ3_S,
+IQ3_XXS, IQ2_XS or IQ4_NL projection ran ggml-cpu's single-token dot
+products. Patch 0063 ports Strata's multi-token rows for those four
+(`src/kernels/cpu/iq_avx2.cpp`; one implementer a kernel, reviewed and
+integrated, then a second-model review of the kernels): IQ2_XS and IQ3_S
+from the bank's planes, IQ3_XXS from GGUF blocks, IQ4_NL from its split
+bank (scales and quants as two arrays) with Q8_0 activations; a single-token
+loop shaped like ggml's AVX2 one where the multi-token form lost at one
+token. Each kernel matched ggml-cpu's `vec_dot` exactly on quantized random
+weights (nt 1..8, both layouts, an odd-block slice; observed, the gate is a
+1e-4 tolerance) and failed on deliberate mutations; per 2560 x 640 matrix at
+four tokens 2.5-2.9x faster than ggml (`measured-here`, Zen 3, -O3), one
+token at parity or better.
+
+Served (`measured-here`, the B60, arcint v1.2.0 built against the 1.2.0
+llama tree without and with 0063, the unit's flags, fresh processes, the page
+cache cold, the six answers' mean decode):
+
+| arm | IQ3_XXS | UD-Q3_K_XL (9,000 MiB of slots) |
+|---|---|---|
+| without 0063 | 33.85 / 33.87 t/s | 12.48 / 12.47 t/s |
+| 0063 | 36.13 / 36.08 (+6.6 %) | 12.55 / 12.53 (+0.5 %) |
+| 0063, the old path forced (`GGML_OPENCL_CPU_MISS_MT=0`) | 32.83 | — |
+| 0063, `GGML_OPENCL_CPU_MISS_MAX=32` | 37.73 | — |
+| 0063, `GGML_OPENCL_CPU_MISS_MAX=64` | 37.93 (+12.0 %) | 16.68 (+33.7 %) |
+| KL as served, ubatch 4, with 0063 | 0.2178 / 89.66 % (without: 0.2191) | 0.1068 / 92.67 % |
+
+Prefill unchanged in every arm (621 / 168-214 t/s); Paris and the needle in
+every run. The control proves the new rows ran (the forced old path is back
+at the baseline). The cap of 16 pairs was measured best under the old
+single-token rows (0056); with the multi-token rows 32 and 64 are faster on
+IQ3_XXS, and on UD-Q3_K_XL (60-76 % hits) the cap is the lever: 0063 alone
+moves it 0.5 %, the cap at 64 33.7 %. Caps above 64 (Strata's own design has
+none) are not measured yet. Byte tripwire: each configuration is
+deterministic run to run; 0063 changes three of IQ3_XXS's eight answers
+(the long ones; capital and needle identical), and the forced-old-path
+control differs from the base binary in four, so the difference is not only
+0063's rows and is not yet explained; KL is unchanged.
+
+Operator's rule (`decision`, 2026-10-19, relayed): UD-Q3_K_XL becomes the
+production quant if it reaches >= 20 t/s on this measure with 0063. As
+measured (16.68 at cap 64) it does not; IQ3_XXS stays, no unit changed.
