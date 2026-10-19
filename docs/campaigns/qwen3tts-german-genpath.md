@@ -101,6 +101,9 @@ transcribed with the same whisper model as the STT gate.
 | `q8-de-qwen` (sampling lever alone) | Q8_0 / Q8_0 | Qwen as shipped (temp 0.9, top_k 50, top_p 1.0, repetition 1.05, seed 42) | **512 cap** / 40.96 s | no `codec_eos` | "Ja, das ist so, wie gesagt." | 1.20 | **FAIL** |
 | `q8-bk-bf16mm` (mmproj lever) | **Q8_0** / **bf16** | llama.cpp defaults | **37** / 2.96 s | **`codec_eos` sampled** | "Der Zug fährt nach Berlin." exact | **0.00** | **PASS** |
 | `bf16-bk-q8mm` (backbone lever, the mirror) | **bf16** / **Q8_0** | llama.cpp defaults | **512 cap** / 40.96 s | no `codec_eos` | "* Musik *" | 1.00 | **FAIL** |
+| `bf16-q8all` (control, `--pure` Q8_0 of the bf16 mmproj) | bf16 / pure-Q8_0 mmproj | llama.cpp defaults | **512 cap** | no `codec_eos` | "* Musik *" | 1.00 | **FAIL** |
+| `bf16-q8codebf` (subgroup lever) | bf16 / Q8_0 mmproj with **`a.gen.code` at BF16** | llama.cpp defaults | **50** / 4.00 s | **`codec_eos` sampled** | "Der Zug fährt nach Berlin." exact | **0.00** | **PASS** |
+| `bf16-q8wavbf` (subgroup mirror) | bf16 / Q8_0 mmproj with **`a.gen.wav` at BF16** (the rest Q8_0) | llama.cpp defaults | **512 cap** / 40.96 s | no `codec_eos` | "Ich habe es nicht." | 1.00 | **FAIL** |
 
 **Disposition so far — the defect is the `mmproj`, not the backbone.** The
 2×2 on the same sentence and sampling isolates it: the **backbone quantization
@@ -112,11 +115,18 @@ the **code predictor** (`a.gen.code.*`, 35 `blk` tensors + `embd`/`head`/
 code2wav acoustic decoder (`a.gen.wav.tfm` 58 + `quant`/`up`), which turns the
 codes into PCM. In the `bf16` mmproj 107 of these go `Q8_0 → BF16`; 38 more
 speaker-encoder/other tensors go `F16 → BF16`. Since the Q8_0 mmproj arm never
-samples `codec_eos` and runs to the cap, the code predictor (which computes
-`is_eos`, `step_gen` `mtmd_gen_audio_process` GEN_CODE) is the primary
-suspect; which of `a.gen.code`, `a.gen.wav` or the remaining tensors owns it
-is the next CPU sub-experiment, by `llama-quantize --pure` requantizing the
-bf16 mmproj with one group at BF16 at a time (mixed arms running).
+samples `codec_eos` and runs to the cap, the code predictor was the primary
+suspect and the **subgroup probe confirms it**: requantizing the bf16 mmproj
+with `llama-quantize --pure` to pure Q8_0 reproduces the failure
+(`bf16-q8all`, control), and keeping **only `a.gen.code` at BF16** while the
+rest is Q8_0 makes the sentence come out exactly and stop at frame 50
+(`bf16-q8codebf`) — so the **code predictor** (the five `a.gen.code.blk`
+layers, `embd`, `head`, `proj_in`, `out_embd`; it computes `is_eos`,
+`codes[1..15]` and `h_next` in `mtmd_gen_audio_process` GEN_CODE) owns the
+defect. Keeping `a.gen.wav` (the code2wav decoder) at BF16 does **not** stop
+it (`bf16-q8wavbf` runs to the cap and comes back as "Ich habe es nicht."),
+the mirror that rules the acoustic decoder out. The mixed file is 563 MB against the official bf16 mmproj's
+669 MB (`arithmetic`/measurement).
 
 Sampling is **not** the cause (the Qwen-sampling Q8_0 arm still fails), and
 the language path is consistent (candidate 2 closed). **The fix is a bf16
