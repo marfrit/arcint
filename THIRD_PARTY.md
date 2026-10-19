@@ -8,6 +8,12 @@ Vendored, single-header, licenses unchanged:
 | nlohmann/json | 3.11.3 | MIT | `third_party/nlohmann/json.hpp` |
 | minja (chat templating) | vendored | MIT | via `minja/chat-template.hpp` |
 
+Adapted (not verbatim) in `tools/tts_voice_sim.py`: the speaker-similarity
+recipe from `huggingface/open-tts-leaderboard`'s
+`transformers/score_similarity.py` (Apache-2.0), whose ECAPA-TDNN head is
+transcribed from `microsoft/UniSpeech` `downstreams/speaker_verification` (MIT).
+The SIM model itself is not shipped (CC-BY-SA-3.0, operator-local).
+
 Compiled in from a pinned source tree (not vendored): llama.cpp and ggml
 (MIT) at the commit `contrib/packaging/arcint/build-deb.sh` names, with
 `contrib/llama.cpp/patches` applied. Patch 0056's CPU rows follow Strata's

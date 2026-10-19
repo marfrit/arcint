@@ -727,6 +727,40 @@ the official bf16 stays as fallback); **B3 PASS** closes the campaign
 a new defect. C7 unchanged: the recipe changes only the mmproj file, no engine
 graph.
 
+### 9.8 C5 voice similarity: the SIM method landed and measured (Phase 4, 2026-10-19)
+
+C5's named model is the Seed-TTS-eval SIM model (WavLM-Large + ECAPA-TDNN, the
+UniSpeech `wavlm_large_finetune.pth`, sha256 `51f07e3b…`, mirror
+`bezzam/wavlm_large_finetune_seed_tts_eval`, CC-BY-SA-3.0). Per §2's rule and
+the operator's step-3 condition it is run in a torch **container** (an LXC) and
+the kept copy is converted to safetensors there
+(`wavlm_large_finetune_seed_tts_eval.safetensors`, 1,301,746,084 bytes). The
+backbone is an HF `WavLMModel` with the checkpoint's original-WavLM names
+remapped onto it, the ECAPA-TDNN head transcribed from UniSpeech, one clip per
+forward pass, cosine — the `huggingface/open-tts-leaderboard` recipe
+(Apache-2.0), landed as `tools/tts_voice_sim.py` and driven by
+`tools/tts_gate.py --embed-cmd`.
+
+| stand-in | cosine |
+|---|---|
+| same audio vs itself (sanity) | 1.000000 |
+| **the gate-voice clone vs its reference** (46 synthesized `gate-fleurs` sentences) | **mean 0.598038**, min 0.439814, max 0.751893 |
+| two FLEURS files of one sentence, two different speakers (CC-BY-4.0, cross) | **0.262419** |
+| published same-speaker VoxCeleb1 range (this model) | 0.60 - 0.69 |
+| published cross-speaker VoxCeleb1 range (this model) | -0.17 - 0.18 |
+
+**Disposition (`measured-here`):** the clone-vs-reference mean sits at the
+published same-speaker anchors and clearly above the measured CC cross pair;
+the method and its calibration hold. **A same-speaker FLEURS pair is not
+obtainable** (measured-here on the local `de_de` dev TSV and the canonical
+`google/fleurs`: neither carries a speaker field; the `id` column groups the
+2-3 speakers per sentence), so the reference's published anchors stand as the
+same-side calibration and the CC stand-ins are the measured cross pair.
+Low-download CC alternatives with speaker labels were surveyed and not taken
+(Common Voice gated or empty; VoxPopuli `de` ungated with `speaker_id` but its
+smallest parquet 936 MB). The real same-person recordings remain the operator's
+final C5.
+
 ## 10. References
 
 - llama.cpp `3e4dfa8`: `tools/mtmd/{mtmd.h,mtmd.cpp,mtmd-image.cpp,

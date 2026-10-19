@@ -1,6 +1,10 @@
 # qwen3tts-voice-similarity — C5: the clone's speaker embedding against the reference, calibrated
 
-**Open 2026-10-19.** C5's floor is calibrated, not absolute; the method, the named model and its anchors are owed.
+**Open 2026-10-19.** C5's floor is calibrated, not absolute. The named model,
+its safetensors conversion in a torch container, the `--embed-cmd` hook and a
+CC cross stand-in are **measured**; a two-clip same-speaker FLEURS pair proved
+not obtainable, and the real same-person recordings remain the operator's final
+step.
 
 ## Charter
 
@@ -49,24 +53,60 @@ the clone-vs-reference cosine is reported with every C4 verdict through
 gate as a one-number command). An absolute number only once the operator and
 his wife's real recordings exist.
 
-## Current state
+## Current state (measured-here, 2026-10-19)
 
-Not measured. The named model is `.pth`, not safetensors, and the mirror is
-zero-download; per `docs/milestone-1.2.0.md` §2's rule and the operator's
-step-3 condition ("safetensors and well known; if a low-download repo, run it
-in a container"), it runs in a **container** (torch) on the host and the kept
-local copy is converted to safetensors there. Stand-ins on the card host: the
-enrolled `gate-fleurs` and `gate-de` (different FLEURS speakers), and the
-`markus-test` / `frau-test` enrolment stand-ins. A same-speaker pair needs a
-FLEURS speaker with two clips; the `de_de` dev TSV carries only a gender column
-and no speaker id (`measured-here` on the TSV), so the reference's published
-same/cross anchors stand in until a two-clip same-speaker source is found, or
-the gate voice's own reference can be paired with a second recording. Open.
+**The method runs.** The named model is converted to safetensors in a torch
+**container** (an LXC) and embedded there: the mirror's `wavlm_large_finetune.pth`
+(`bezzam/wavlm_large_finetune_seed_tts_eval`, CC-BY-SA-3.0) is fetched, its
+sha256 verified (`51f07e3b…`), and saved as
+`wavlm_large_finetune_seed_tts_eval.safetensors` (1,301,746,084 bytes); the
+backbone is an HF `WavLMModel` with the checkpoint's original-WavLM names
+remapped onto it, the ECAPA-TDNN head transcribed from UniSpeech, one clip per
+forward pass, cosine — the `huggingface/open-tts-leaderboard`
+`transformers/score_similarity.py` recipe (Apache-2.0), re-landed as
+`tools/tts_voice_sim.py`.
+
+| stand-in | cosine | evidence |
+|---|---|---|
+| same audio vs itself (sanity) | 1.000000 | `measured-here` |
+| the gate-voice clone vs its reference (46 synthesized `gate-fleurs` sentences) | **mean 0.598038**, min 0.439814, max 0.751893 | `measured-here` |
+| two FLEURS files of one sentence, two different speakers (cross, CC-BY-4.0) | **0.262419** | `measured-here` |
+| published same-speaker VoxCeleb1 range (this model) | 0.60 – 0.69 | `paper`/`code`, mirror README |
+| published cross-speaker VoxCeleb1 range (this model) | -0.17 – 0.18 | `paper`/`code`, mirror README |
+
+The clone-vs-reference mean (0.598) sits at the published same-speaker anchors
+and clearly above the measured CC cross pair (0.262): the method's calibration
+holds. The cross pair is two files of the same FLEURS sentence, which by FLEURS'
+design are two different speakers (each sentence is recorded by 2-3 speakers).
+**A two-clip same-speaker FLEURS pair is not obtainable:** the local `de_de` dev
+TSV has no speaker column (its 7 fields carried `id` == sentence, file name,
+transcription, raw transcription, phonemes, samples, gender; 147 distinct `id`
+== 147 distinct sentences over 363 rows), and the canonical `google/fleurs` on
+the Hub lists no speaker field either; `measured-here` on both. Low-download CC
+alternatives with speaker labels were surveyed and **not taken**: Common Voice
+is gated (`common_voice_16_1` needs auth; `17_0` empty), VoxPopuli `de` is
+ungated with `speaker_id` (license `cc0-1.0`/other) but its smallest split
+parquet is **936 MB**, not low-download. The reference's published same/cross
+anchors therefore stand as the same-side calibration; the real recordings
+remain the final C5 (operator).
+
+**The gate hook.** `tools/tts_gate.py --embed-cmd` runs one command that reads
+the cases JSON on stdin and prints one cosine; the landed command is
+`tools/tts_voice_sim.py stdin --ref <voice reference.wav> --model
+<wavlm_large_finetune_seed_tts_eval.safetensors>`. The model file and the
+container venv stay operator-local, outside the repository. Open: the real
+same-person recordings (operator).
 
 ## Where it lives
 
 - The gate and its one-number cosine hook: `tools/tts_gate.py --embed-cmd`.
 - The C4 set and the enrolment envelope: `docs/milestone-1.2.0.md` §4/§6 D5,
   `docs/speech-service.md`.
+- The embedding command: `tools/tts_voice_sim.py` (`pair`, `mean-vs-ref`,
+  `stdin`); the model file, the container venv and the converted safetensors
+  stay operator-local.
+- The recipe source: `huggingface/open-tts-leaderboard`
+  `transformers/score_similarity.py` (Apache-2.0); the head from
+  `microsoft/UniSpeech` (MIT).
 - The model: `bezzam/wavlm_large_finetune_seed_tts_eval` (mirror),
   `microsoft/UniSpeech` `downstreams/speaker_verification`; `code`.
