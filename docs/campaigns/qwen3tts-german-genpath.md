@@ -99,6 +99,7 @@ transcribed with the same whisper model as the STT gate.
 | `q8-de-default` (red baseline) | Q8_0 / Q8_0 | llama.cpp defaults (temp 0.8, top_k 40, top_p 0.95, repetition 1.05) | **512 cap** / 40.96 s, 150.3 s gen + 1.8 s vocoder | no `codec_eos` | "Ja." | 1.00 | **FAIL** |
 | `bf16-de-default` | bf16 / bf16 | same as the red arm | **44** / 3.52 s, 15.1 s gen | **`codec_eos` sampled** | "Der Zug fährt nach Berlin." exact | **0.00** | **PASS** |
 | `q8-de-qwen` (sampling lever alone) | Q8_0 / Q8_0 | Qwen as shipped (temp 0.9, top_k 50, top_p 1.0, repetition 1.05, seed 42) | **512 cap** / 40.96 s | no `codec_eos` | "Ja, das ist so, wie gesagt." | 1.20 | **FAIL** |
+| `bf16-de-qwen` (sampling on the bf16 pair) | bf16 / bf16 | Qwen as shipped, seed 42 | **36** / 2.88 s | **`codec_eos` sampled** | "Der Zug fährt nach Berlin." exact | **0.00** | **PASS** |
 | `q8-bk-bf16mm` (mmproj lever) | **Q8_0** / **bf16** | llama.cpp defaults | **37** / 2.96 s | **`codec_eos` sampled** | "Der Zug fährt nach Berlin." exact | **0.00** | **PASS** |
 | `bf16-bk-q8mm` (backbone lever, the mirror) | **bf16** / **Q8_0** | llama.cpp defaults | **512 cap** / 40.96 s | no `codec_eos` | "* Musik *" | 1.00 | **FAIL** |
 | `bf16-q8all` (control, `--pure` Q8_0 of the bf16 mmproj) | bf16 / pure-Q8_0 mmproj | llama.cpp defaults | **512 cap** | no `codec_eos` | "* Musik *" | 1.00 | **FAIL** |
@@ -145,3 +146,4 @@ quantization probe above.
 - The gate: `tools/tts_gate.py`; the enrolment: `tools/tts_enrol.py`.
 - The models, staging and licences: `docs/milestone-1.2.0.md` §2.
 - Operator-local paths (card host, sentence set, gate voice): `*.local.md`.
+- The mixed-mmproj recipe (the subgroup probe): `llama-quantize --pure --allow-requantize --tensor-type "gen\.code=bf16" <bf16-mmproj> <out>.gguf Q8_0`, from a quantizer built at the series; the official `mmproj-...-bf16.gguf` is the production fix.
