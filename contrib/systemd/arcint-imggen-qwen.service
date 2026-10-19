@@ -22,7 +22,7 @@
 Description=arcint-imggen-qwen — Qwen-Image via sd-server, GPU.0 (Arc Pro B60), :8081, on demand
 Documentation=https://github.com/marfrit/arcint
 After=default.target
-Conflicts=arcint-agent.service arcint-writer.service arcint-flashnext.service arcint-agent-lanes.service arcint-imggen.service arcint-imggen-flux.service
+Conflicts=arcint-agent.service arcint-writer.service arcint-flashnext.service arcint-agent-lanes.service arcint-imggen.service arcint-imggen-flux.service arcint-vlm.service arcint-tts.service arcint-stt.service
 
 [Service]
 Type=simple

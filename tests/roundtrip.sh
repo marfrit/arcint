@@ -323,6 +323,39 @@ check "an unimplemented route returns 404" "$([[ $code == 404 ]] && echo 0 || ec
 jassert "${WORK}/404.json" 'd["error"]["code"]=="not_found"'
 check "404 uses the error envelope too" $?
 
+# ------------------------------------------- images and speech (1.2.0, D4)
+#
+# The stub loads no projector: an image part and the speech route are the
+# client's 400 with the reason, streamed or not, and the process lives on.
+IMG='{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}'
+code=$(curl -sS -o "${WORK}/img.json" -w '%{http_code}' "${BASE}/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":[{"type":"text","text":"what is this?"},'"$IMG"']}]}')
+check "an image part without --mmproj is a 400" "$([[ $code == 400 ]] && echo 0 || echo 1)"
+jassert "${WORK}/img.json" '"--mmproj" in d["error"]["message"]'
+check "the image refusal names the projector" $?
+code=$(curl -sS -o "${WORK}/img-stream.txt" -w '%{http_code}' "${BASE}/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -d '{"stream":true,"messages":[{"role":"user","content":['"$IMG"']}]}')
+check "a streamed image part without --mmproj is a 400 before any event" "$([[ $code == 400 ]] && echo 0 || echo 1)"
+code=$(curl -sS -o "${WORK}/speech.json" -w '%{http_code}' "${BASE}/v1/audio/speech" \
+  -H 'Content-Type: application/json' -d '{"input":"Guten Tag","voice":"anyone"}')
+check "/v1/audio/speech without --tts is a 400" "$([[ $code == 400 ]] && echo 0 || echo 1)"
+jassert "${WORK}/speech.json" '"--tts" in d["error"]["message"]'
+check "the speech refusal names --tts" $?
+curl -sS -o "${WORK}/voices.json" "${BASE}/v1/audio/voices"
+jassert "${WORK}/voices.json" 'd["voices"]==[]'
+check "/v1/audio/voices lists no voice without --tts" $?
+code=$(curl -sS -o /dev/null -w '%{http_code}' "${BASE}/health")
+check "the server answers after the refusals" "$([[ $code == 200 ]] && echo 0 || echo 1)"
+# bounded: a stub that took the flag would serve on and never return
+timeout 10 "$BIN" --stub --mmproj /nonexistent.gguf --port "$(free_port)" >"${WORK}/stub-mmproj.log" 2>&1
+rc=$?
+grep -q -- '--mmproj' "${WORK}/stub-mmproj.log"
+named=$?
+check "--stub refuses --mmproj (a projector it could never load)" \
+  "$([[ $rc != 0 && $rc != 124 && $named == 0 ]] && echo 0 || echo 1)"
+
 # ------------------------------------------- cancellation on disconnect (§3.7)
 #
 # Needs its own server: the zero-latency stub finishes before a client could

@@ -94,6 +94,41 @@ void HttpServer::Impl::route() {
         send_json(res, 200, api::models(ctx));
     });
 
+    // The TTS surface (docs/milestone-1.2.0.md D4/D5). Both routes refuse from
+    // prepare_speech with a clear message when the build has no --tts or no
+    // audio-generation mmproj; the voice list is a names-only probe.
+    svr.Get("/v1/audio/voices", [this](const httplib::Request&, httplib::Response& res) {
+        send_json(res, 200, api::voices(ctx));
+    });
+
+    svr.Post("/v1/audio/speech", [this](const httplib::Request& req, httplib::Response& res) {
+        json body;
+        if (!read_json(req, res, body)) return;
+
+        auto prep = std::make_shared<api::PreparedSpeech>();
+        if (auto err = api::prepare_speech(ctx, body, *prep)) {
+            send_json(res, err->status, err->body);
+            return;
+        }
+
+        // Same lane machinery as the chat routes: admission is a status code
+        // before any byte of the answer is committed.
+        auto lease = std::make_shared<api::SlotPool::Lease>();
+        int  slot  = -1;
+        if (auto err = api::acquire_slot(ctx, prep->lane, *lease, slot)) {
+            send_json(res, err->status, err->body);
+            return;
+        }
+
+        const api::SpeechResult r = api::run_speech(ctx, *prep, slot);
+        if (r.status != 200 || r.wav.empty()) {
+            send_json(res, r.status, r.error);
+            return;
+        }
+        res.status = 200;
+        res.set_content(r.wav, "audio/wav");
+    });
+
     svr.Post("/v1/chat/completions", [this](const httplib::Request& req, httplib::Response& res) {
         json body;
         if (!read_json(req, res, body)) return;
@@ -127,9 +162,18 @@ void HttpServer::Impl::route() {
         res.set_chunked_content_provider(
             "text/event-stream",
             [this, prep, lease, slot](size_t, httplib::DataSink& sink) {
-                api::stream_chat(ctx, *prep, slot, [&sink](std::string_view data) {
-                    return sink.write(data.data(), data.size());
-                });
+                // The handlers turn a generation's exceptions into an error
+                // event; this is the last guard: nothing thrown here may leave
+                // httplib's worker thread, which would end the process.
+                try {
+                    api::stream_chat(ctx, *prep, slot, [&sink](std::string_view data) {
+                        return sink.write(data.data(), data.size());
+                    });
+                } catch (const std::exception& e) {
+                    log::error("http", "stream ended by an exception: %s", e.what());
+                } catch (...) {
+                    log::error("http", "%s", "stream ended by an unknown exception");
+                }
                 sink.done();
                 // httplib reads `false` as Error::Canceled and tears the
                 // connection down; the stream ended normally, so say so and let
@@ -165,9 +209,18 @@ void HttpServer::Impl::route() {
         res.set_chunked_content_provider(
             "text/event-stream",
             [this, prep, lease, slot](size_t, httplib::DataSink& sink) {
-                api::stream_completion(ctx, *prep, slot, [&sink](std::string_view data) {
-                    return sink.write(data.data(), data.size());
-                });
+                // The handlers turn a generation's exceptions into an error
+                // event; this is the last guard: nothing thrown here may leave
+                // httplib's worker thread, which would end the process.
+                try {
+                    api::stream_completion(ctx, *prep, slot, [&sink](std::string_view data) {
+                        return sink.write(data.data(), data.size());
+                    });
+                } catch (const std::exception& e) {
+                    log::error("http", "stream ended by an exception: %s", e.what());
+                } catch (...) {
+                    log::error("http", "%s", "stream ended by an unknown exception");
+                }
                 sink.done();
                 return true;
             });

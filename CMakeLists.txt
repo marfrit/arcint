@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 1.1.1 LANGUAGES CXX)
+project(arcint VERSION 1.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -98,6 +98,12 @@ if(ARCINT_LLAMA)
   set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
   set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
   set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+  # the multimodal library (vision input, audio input, TTS audio generation):
+  # libmtmd links ggml + llama only, never llama-common (tools/mtmd/CMakeLists.txt),
+  # so one arcint process can serve it with GGML_MAX_NAME at the pin's 64
+  # (docs/milestone-1.2.0.md §3). MTMD_VIDEO needs the subprocess tool and is off.
+  set(LLAMA_BUILD_MTMD ON CACHE BOOL "" FORCE)
+  set(MTMD_VIDEO OFF CACHE BOOL "" FORCE)
   # not llama.cpp's common library: it compiles another cpp-httplib (0.58)
   # than arcint's (0.18) into the same binary, and the server then fails to
   # bind (measured-here); the MTP drafter is rebuilt in llama_spec.cpp
@@ -115,9 +121,16 @@ if(ARCINT_LLAMA)
   endif()
   target_compile_definitions(arcint_core PRIVATE ARCINT_DFLASH_RED=${ARCINT_DFLASH_RED})
   # llama-ext.h: the pinned llama.cpp's staging API (nextn embeddings, MTP)
-  target_include_directories(arcint_core PRIVATE "${ARCINT_LLAMA_DIR}/src")
-  target_link_libraries(arcint_core PUBLIC llama OpenCL::OpenCL)
+  target_include_directories(arcint_core PRIVATE "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/tools/mtmd")
+  target_link_libraries(arcint_core PUBLIC llama mtmd OpenCL::OpenCL)
   target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA=1)
+  # libmtmd present in the tree (docs/milestone-1.2.0.md A1): the mmproj flag
+  # and the multimodal branch are compiled only then
+  if(EXISTS "${ARCINT_LLAMA_DIR}/tools/mtmd/mtmd.h")
+    target_compile_definitions(arcint_core PUBLIC ARCINT_MTMD=1)
+  else()
+    message(WARNING "ARCINT_LLAMA_DIR lacks tools/mtmd: --mmproj is refused")
+  endif()
   # contrib/llama.cpp 0021 (the expert cache) adds llama_model_params fields;
   # without it --llama-expert-cache is refused at load
   file(READ "${ARCINT_LLAMA_DIR}/include/llama.h" ARCINT_LLAMA_H)
@@ -151,6 +164,12 @@ install(TARGETS arcint RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
 # package and a `cmake --install` agree on one file instead of the packaging
 # copying it separately and drifting.
 install(FILES packaging/arcint.service
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/arcint")
+# 1.2.0: the vision and speech units run this binary too (docs/speech-service.md),
+# shipped beside it as templates; the enrolment tool writes a voice profile on
+# the host (the API never takes a reference recording, D5).
+install(FILES contrib/systemd/arcint-vlm.service contrib/systemd/arcint-tts.service
+              tools/tts_enrol.py
         DESTINATION "${CMAKE_INSTALL_DATADIR}/arcint")
 
 # --------------------------------------------------------------------- tests

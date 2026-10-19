@@ -12,6 +12,35 @@ struct SamplerDefaults;  // core/sampling.h
 struct Config {
     // What gets served: the GGUF (--gguf), or the device-free stub (--stub).
     std::string gguf_path;   // --gguf: the file as published; the first shard of a split file
+    // --mmproj FILE: the multimodal projector of the model (libmtmd, docs/
+    // milestone-1.2.0.md). With it loaded, /v1/chat/completions accepts the
+    // OpenAI `image_url` content parts; without it the text-only refusal
+    // stands. The vision/backbone pair must come from the same family.
+    std::string mmproj_path;
+    // --tts: serve the audio-generation endpoints (docs/milestone-1.2.0.md
+    // D4, D5; GET /v1/audio/voices, POST /v1/audio/speech). It sets the llama
+    // context's embeddings=1, which llama_get_embeddings_ith needs for the
+    // backbone-to-codec pipeline. Needs --mmproj whose gen half supports
+    // audio generation; without one the speech routes refuse.
+    bool tts = false;
+    // --tts-profiles DIR (or $ARCINT_TTS_PROFILES): the server-side speaker
+    // profile directory, one <dir>/<name>/ per enrolled voice with
+    // reference.wav and profile.json (tools/tts_enrol.py, docs/
+    // speech-service.md D5). Operator-local, outside the repository; the API
+    // serves the enabled names only, never a path or audio bytes.
+    std::string tts_profiles;
+    // --tts-lang LANG: the language of the synthesised text, one of the
+    // codec_language codes the backbone carries (default de, the 1.2.0
+    // German-first mandate). A voice's own profile language wins when set.
+    std::string tts_lang = "de";
+    // --tts-gen-device cpu|gpu: where the audio-generation mmproj's own clip
+    // graphs run -- the speaker encoder, the code predictor and the code2wav
+    // decoder. "gpu" (default) puts them on the card with the backbone; "cpu"
+    // is the hybrid placement (backbone on the card, the mmproj graphs on the
+    // CPU, the best measured arm for the TTS real-time campaign). An mmproj
+    // context takes one backend, so the flag selects the whole mmproj; the TTS
+    // mmproj carries no vision half.
+    std::string tts_gen_device = "gpu";
     // --engine: "llama" (ggml's OpenCL backend through libllama; the model is
     // --gguf) is the only engine. The flag is kept for the units' sake;
     // "ov" is refused with a pointer to the tag openvino-history.

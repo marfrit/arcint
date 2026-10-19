@@ -1,0 +1,88 @@
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index fccb00c..496d681 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -1153,7 +1153,16 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const
+                 const auto  gen_process = params ? params->gen_process : CLIP_GEN_PROCESS_GEN_CODE;
+                 const int   top_k = params ? params->top_k : 50;
+                 const float top_p = params ? params->top_p : 1.0f;
+-                builder = std::make_unique<clip_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p);
++                // GEN_WAV computes the caller's valid frames, not the padded
++                // wav_tfm_swa window: the decoder's per-call cost scales with the
++                // flushed frames instead of a fixed 72 (measured-here, C4 PASS).
++                // MTMD_TTS_WAV_PAD=1 is the red case, forcing the padded window back
++                const bool  pad   = std::getenv("MTMD_TTS_WAV_PAD") != nullptr &&
++                                    atoi(std::getenv("MTMD_TTS_WAV_PAD")) != 0;
++                const bool  valid = params && gen_process == CLIP_GEN_PROCESS_GEN_WAV && !pad;
++                const int64_t n_codes_gen = ctx->model.gen_code_head_w->ne[2] + 1;
++                const int   gen_n_frames = valid && params->codes ? (int) (params->codes->size() / n_codes_gen) : -1;
++                builder = std::make_unique<clip_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p, gen_n_frames);
+             } break;
+         case PROJECTOR_TYPE_YOUTUVL:
+             {
+@@ -5472,10 +5481,13 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+                         }
+                     }
+ 
+-                    std::vector<int32_t> codes(n_frames_w * n_codes, 0);
++                    const bool    pad = std::getenv("MTMD_TTS_WAV_PAD") != nullptr &&
++                                        atoi(std::getenv("MTMD_TTS_WAV_PAD")) != 0;
++                    const int64_t use_frames = pad ? n_frames_w : n_frames;
++                    std::vector<int32_t> codes(use_frames * n_codes, 0);
+                     for (int64_t f = 0; f < n_frames; f++) {
+                         for (int64_t g = 0; g < n_codes; g++) {
+-                            codes[g * n_frames_w + f] = (*params->codes)[f * n_codes + g];
++                            codes[g * use_frames + f] = (*params->codes)[f * n_codes + g];
+                         }
+                     }
+                     set_input_i32("inp_codes", codes);
+@@ -6003,7 +6015,9 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+ 
+         // drop the tail audio that comes from the code-0 rear padding
+         const int64_t n_codes    = params->codes ? model.gen_code_head_w->ne[2] + 1 : 0;
+-        const int64_t n_frames_w = hparams.wav_tfm_swa;
++        const bool    pad = std::getenv("MTMD_TTS_WAV_PAD") != nullptr &&
++                            atoi(std::getenv("MTMD_TTS_WAV_PAD")) != 0;
++        const int64_t n_frames_w = (params->codes && !pad) ? (int64_t) params->codes->size() / n_codes : hparams.wav_tfm_swa;
+         const int64_t n_frames   = params->codes ? (int64_t) params->codes->size() / n_codes : n_frames_w;
+         if (n_frames < n_frames_w) {
+             const size_t hop = out_audio.size() / n_frames_w;
+diff --git a/tools/mtmd/models/models.h b/tools/mtmd/models/models.h
+index adb5ede..b415ff9 100644
+--- a/tools/mtmd/models/models.h
++++ b/tools/mtmd/models/models.h
+@@ -248,8 +248,8 @@ struct clip_graph_qwen3tts_spkenc : clip_graph {
+ };
+ 
+ struct clip_graph_qwen3tts_gen : clip_graph {
+-    clip_graph_qwen3tts_gen(clip_ctx * ctx, const clip_image_f32 & img, clip_gen_process_type gen_process, int top_k, float top_p)
+-        : clip_graph(ctx, img), gen_process(gen_process), top_k(top_k), top_p(top_p) {}
++    clip_graph_qwen3tts_gen(clip_ctx * ctx, const clip_image_f32 & img, clip_gen_process_type gen_process, int top_k, float top_p, int gen_n_frames = -1)
++        : clip_graph(ctx, img), gen_process(gen_process), top_k(top_k), top_p(top_p), gen_n_frames(gen_n_frames) {}
+     ggml_cgraph * build() override;
+ 
+     // which sub-graph build() constructs, fixed at graph-build time
+@@ -259,6 +259,10 @@ struct clip_graph_qwen3tts_gen : clip_graph {
+     int   top_k;
+     float top_p;
+ 
++    // GEN_WAV computes the caller's valid frames instead of the fixed
++    // wav_tfm_swa window (the padded-72 fixed per-call cost); -1 keeps the window
++    int   gen_n_frames;
++
+     //
+     // code_gen: backbone hidden state + sampled code0 -> 16 RVQ codes
+     // MTP-style code predictor, one token per codebook
+diff --git a/tools/mtmd/models/qwen3tts-gen.cpp b/tools/mtmd/models/qwen3tts-gen.cpp
+index 9826190..6429330 100644
+--- a/tools/mtmd/models/qwen3tts-gen.cpp
++++ b/tools/mtmd/models/qwen3tts-gen.cpp
+@@ -739,7 +739,7 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
+     cb(out_embd, "gen_audio_out", -1);
+ 
+     // ---- CLIP_GEN_PROCESS_GEN_WAV: 16 RVQ codes -> raw PCM ----
+-    const int n_frames = hparams.wav_tfm_swa; // frames per batch, == the attention window
++    const int n_frames = gen_n_frames > 0 ? gen_n_frames : (int) hparams.wav_tfm_swa; // GEN_WAV: the caller's valid frames, else the fixed window
+ 
+     ggml_tensor * inp_codes = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_frames, n_codes);
+     ggml_set_name(inp_codes, "inp_codes");

@@ -14,7 +14,7 @@
 # (docs/history.md), and older tags are built with the recipe at their tag.
 set -euo pipefail
 
-PKGVER=1.1.1
+PKGVER=1.2.0
 UPSTREAM_TAG=v${PKGVER}
 PKGREL=1
 # The public repository, not the fleet one. The fleet repo (still named
@@ -22,9 +22,9 @@ PKGREL=1
 # and carries operator-local notes; the published tree is the same code without
 # them, so the package is built from what anyone can check.
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
-# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v1.1.1.tar.gz,
+# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v1.2.0.tar.gz,
 # taken after the tag was pushed (recorded in the follow-up commit, as for every tag).
-ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-f53e95a01f6d2b653919bd6cff51be7e6c56e011318d20d01c8b9bb10cfe6e90}
+ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-}
 # The libllama engine (--engine llama) builds against llama.cpp at this pin
 # with contrib/llama.cpp/patches applied (contrib/llama.cpp/README.md): the
 # GitHub tarball of the commit, checked by sha256.
@@ -164,9 +164,11 @@ esac
 # a user's ~/.config, and on a managed host that directory belongs to the unit
 # manager. Assert it landed, because a silently missing unit turns into a
 # puzzled operator on the target host.
-[ -f "$ROOT/usr/share/arcint/arcint.service" ] || {
-    echo "FEHLT: /usr/share/arcint/arcint.service — installiert CMake die Vorlage nicht mehr?" >&2
-    exit 1; }
+for f in arcint.service arcint-vlm.service arcint-tts.service tts_enrol.py; do
+    [ -f "$ROOT/usr/share/arcint/$f" ] || {
+        echo "FEHLT: /usr/share/arcint/$f — installiert CMake die Vorlage nicht mehr?" >&2
+        exit 1; }
+done
 # The separate env file is gone as of 0.2.2 (flags are literal in ExecStart, so
 # a unit manager and a journal can both see the port). If it comes back, it has
 # to be installed by CMake too, not by this recipe.
@@ -209,7 +211,10 @@ Description: LLM inference engine for Intel Arc GPUs
  .
  The systemd user unit ships as a template in /usr/share/arcint/; copy it to
  ~/.config/systemd/user/ and edit the flags in ExecStart (on a host with a unit
- manager, hand it the file rather than installing it by hand).
+ manager, hand it the file rather than installing it by hand). Since 1.2.0 the
+ same directory holds the vision (arcint-vlm) and speech (arcint-tts) unit
+ templates and tts_enrol.py, which enrols a voice on the host: the speech API
+ takes enrolled voices only, never a reference recording.
 EOF
 
 DEB_OUT=arcint_${PKGVER}-${PKGREL}_amd64.deb

@@ -12,6 +12,15 @@
 #include <gguf.h>
 #include <llama.h>
 
+#ifdef ARCINT_MTMD
+#include <mtmd.h>
+#include <mtmd-helper.h>
+// stb_image's header-only probe, compiled into libmtmd (mtmd-helper.cpp defines
+// STB_IMAGE_IMPLEMENTATION, not STB_IMAGE_STATIC): the image's size from its
+// header, before anything is decoded.
+extern "C" int stbi_info_from_memory(unsigned char const* buffer, int len, int* x, int* y, int* comp);
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -21,6 +30,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <minja/chat-template.hpp>
 #include <mutex>
@@ -28,6 +39,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "config.h"
@@ -42,6 +54,74 @@ namespace lgc {
 namespace {
 
 using json = nlohmann::json;
+
+#ifdef ARCINT_MTMD
+// A standard-alphabet base64 decoder for the data: URIs the image parts carry.
+// Whitespace is tolerated; any other non-alphabet character fails.
+bool base64_decode(std::string_view text, std::vector<unsigned char>& out) {
+    static const char* alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int vals[256];
+    std::fill(std::begin(vals), std::end(vals), -1);
+    for (int i = 0; i < 64; ++i) vals[static_cast<unsigned char>(alpha[i])] = i;
+    int acc = 0, bits = 0;
+    for (char c : text) {
+        if (c == '=') break;
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
+        const int v = vals[static_cast<unsigned char>(c)];
+        if (v < 0) return false;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<unsigned char>((acc >> bits) & 0xff));
+        }
+    }
+    return true;
+}
+
+// An `image_url` as the OpenAI shape carries it: a data: URI or a local file
+// path. Remote http(s) URLs are not served yet (the gate uses data: URIs);
+// the bytes stb_image accepts are returned.
+bool read_image_url(const std::string& url, std::vector<unsigned char>& out, std::string& err) {
+    if (url.rfind("data:", 0) == 0) {
+        const size_t at = url.find(";base64,");
+        if (at == std::string::npos || url.find("image/", 5) != 5) {
+            err = "image_url: a data URI must be image/*;base64,...";
+            return false;
+        }
+        if (!base64_decode(std::string_view(url).substr(at + 8), out)) {
+            err = "image_url: base64 decode failed";
+            return false;
+        }
+        return !out.empty();
+    }
+    // Only data: URIs. A local path would let any client of a unit that
+    // listens on the LAN read files of the host (and learn which exist), and a
+    // remote URL would make the server fetch for the client: both refused.
+    err = "image_url: only data:image/...;base64 URIs are served (no file paths, no remote URLs)";
+    return false;
+}
+
+// The image limits of one request: at most this many images, each at most
+// this many pixels by its header (read before the decode, so a small file
+// that inflates cannot exhaust the host's memory).
+constexpr size_t   kMaxImages      = 8;
+constexpr uint64_t kMaxImagePixels = 4096ull * 4096ull;
+
+// How many media markers the rendered prompt holds; mtmd_tokenize wants one
+// bitmap each, and a mismatch is the commonest client error.
+size_t marker_count(std::string_view s) {
+    const size_t mlen = std::strlen(kMediaMarker);
+    size_t       n    = 0;
+    for (size_t at = 0;;) {
+        at = s.find(kMediaMarker, at);
+        if (at == std::string_view::npos) break;
+        ++n;
+        at += mlen;
+    }
+    return n;
+}
+#endif
 
 // --llama-kv's names (config.cpp admits only these)
 ggml_type kv_type(const std::string& t) {
@@ -149,6 +229,28 @@ void route_llama_log(ggml_log_level level, const char* text, void*) {
     else if (level == GGML_LOG_LEVEL_WARN) log::warn("llama", "%s", s.c_str());
     else log::verbose("llama", "%s", s.c_str());
 }
+
+#ifdef ARCINT_MTMD
+// --tts-gen-device (docs/speech-service.md, docs/campaigns/
+// qwen3tts-card-real-time.md): libmtmd's clip_init logs one
+// "CLIP using <backend> backend" line per clip context it builds (clip.cpp).
+// Capture those lines while mtmd_init_from_file runs and check that the
+// placement the flag asked for actually landed. The red switch
+// ARCINT_TTS_GEN_FORCE_GPU=1 negates a cpu request: the capture then shows a
+// card backend and the boot aborts, so a cpu request that served from the card
+// cannot happen silently. tools/tts_placement_check.sh runs both cases.
+thread_local std::string* g_mtmd_capture = nullptr;
+
+void route_mtmd_log(ggml_log_level level, const char* text, void*) {
+    std::string s(text != nullptr ? text : "");
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    if (s.empty()) return;
+    if (g_mtmd_capture != nullptr) g_mtmd_capture->append(s).append("\n");
+    if (level == GGML_LOG_LEVEL_ERROR) log::error("mtmd", "%s", s.c_str());
+    else if (level == GGML_LOG_LEVEL_WARN) log::warn("mtmd", "%s", s.c_str());
+    else log::verbose("mtmd", "%s", s.c_str());
+}
+#endif
 
 class LlamaTokenizer final : public Tokenizer {
 public:
@@ -375,9 +477,14 @@ public:
                                        llama_model_n_head(model_) == 32 && llama_model_n_head_kv(model_) == 8 &&
                                        std::string(head_dim) == "128" && llama_vocab_n_tokens(vocab_) == 131072;
         mistral_small_24b_ = mistral_small_24b;
-        if (a != "qwen35" && a != "qwen35moe" && a != "qwen4exp" && !mistral_small_24b)
-            throw std::runtime_error(log::format("%s is a '%s' model; --engine llama serves qwen35, qwen35moe, qwen4exp "
-                                                 "and Mistral Small 3.2 24B ('llama', 40 x 5120, 32/8 heads)",
+        // --tts admits the audio-generation backbone's own architecture (Qwen3-TTS;
+        // docs/milestone-1.2.0.md D4): its gen half needs --mmproj, checked after
+        // this, and its text path is not served (the asset is not a language model).
+        const bool tts_arch = cfg.tts && a == "qwen3tts";
+        if (a != "qwen35" && a != "qwen35moe" && a != "qwen4exp" && a != "qwen2vl" && !mistral_small_24b && !tts_arch)
+            throw std::runtime_error(log::format("%s is a '%s' model; --engine llama serves qwen35, qwen35moe, qwen4exp, "
+                                                 "qwen2vl (vision, with --mmproj), Mistral Small 3.2 24B "
+                                                 "('llama', 40 x 5120, 32/8 heads) and, under --tts, qwen3tts",
                                                  cfg.gguf_path.c_str(), arch));
         tokenizer_ = std::make_unique<LlamaTokenizer>(vocab_);
         n_vocab_   = static_cast<size_t>(llama_vocab_n_tokens(vocab_));
@@ -440,6 +547,19 @@ public:
         // resets, measured-here)
         cp.n_outputs_max_per_seq = static_cast<uint32_t>(1 + n_spec);
         cp.n_outputs_max         = cp.n_outputs_max_per_seq * static_cast<uint32_t>(lanes_);
+        // --tts (docs/milestone-1.2.0.md A4): the gen-audio pipeline feeds
+        // embedding batches to the backbone and reads its hidden states
+        // (llama_get_embeddings_ith), so the context needs embeddings=1. A
+        // llama.cpp embedding context outputs EVERY token of a batch, which
+        // the language path's logits reservation above cannot hold; lift it to
+        // llama.cpp's n_batch default for that path, as tts.cpp runs it. Else
+        // the helper's prompt decode fails: "pooled embedding requires that
+        // all tokens are output".
+        if (cfg.tts) {
+            cp.embeddings            = true;
+            cp.n_outputs_max         = 0;   // 0 = llama.cpp's n_batch
+            cp.n_outputs_max_per_seq = 0;   // 0 = n_outputs_max
+        }
         ctx_               = llama_init_from_model(model_, cp);
         if (ctx_ == nullptr) throw std::runtime_error("llama.cpp could not create a context");
         // llama.cpp pads the context to 256 (llama-context.cpp:291); the caps
@@ -538,7 +658,18 @@ public:
         ckpts_.resize(static_cast<size_t>(lanes_));
 
         const char* tmpl = llama_model_chat_template(model_, nullptr);
-        if (tmpl == nullptr) throw std::runtime_error(log::format("%s carries no chat template", cfg.gguf_path.c_str()));
+        if (tmpl == nullptr) {
+            // --tts: the audio-generation backbone (Qwen3-TTS) ships no chat
+            // template; its prompt is built by libmtmd's gen pipeline (text +
+            // codec language), not from these messages. Fall back to ChatML so
+            // a stray chat request renders rather than crashes — the speech
+            // routes are the unit's own contract.
+            if (!cfg.tts)
+                throw std::runtime_error(log::format("%s carries no chat template", cfg.gguf_path.c_str()));
+            log::warn("load", "%s carries no chat template: --tts, using the ChatML fallback for a stray chat request",
+                      cfg.gguf_path.c_str());
+            tmpl = "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+        }
         template_src_ = tmpl;
         const char* bos = llama_vocab_get_text(vocab_, llama_vocab_bos(vocab_));
         const char* eos = llama_vocab_get_text(vocab_, llama_vocab_eos(vocab_));
@@ -579,6 +710,115 @@ public:
         d.provenance         = "provisional";
         if (auto err = apply_operator_defaults(cfg, d)) throw std::runtime_error(*err);
         status_.sampler_defaults = d;
+#ifdef ARCINT_MTMD
+        // --mmproj: the multimodal projector (libmtmd) side by side with the
+        // backbone. Its own clip/gen graphs run on the same OpenCL backend
+        // (mtmd_context_params_default use_gpu). With no audio-generation
+        // model, the TTS branch later refuses (docs/milestone-1.2.0.md A4).
+        if (!cfg.mmproj_path.empty()) {
+            mtmd_context_params mtp = mtmd_context_params_default();
+            // --tts-gen-device cpu: the audio-generation mmproj's own clip graphs
+            // (speaker encoder, code predictor, code2wav) on the CPU, the
+            // backbone (libllama) on the card -- the hybrid placement the
+            // TTS real-time campaign measured as the best arm. One mmproj
+            // context takes one backend for all its halves (clip.cpp); the TTS
+            // mmproj carries no vision half. "gpu" is the default.
+            const bool cpu_request = cfg.tts && cfg.tts_gen_device == "cpu";
+            const char* force_env  = std::getenv("ARCINT_TTS_GEN_FORCE_GPU");
+            const bool  forced_gpu = force_env != nullptr && std::strcmp(force_env, "1") == 0;
+            mtp.use_gpu       = !(cpu_request && !forced_gpu);
+            mtp.print_timings = cfg.verbosity >= 1;
+            mtmd_log_set(route_mtmd_log, nullptr);
+            std::string clip_log;
+            g_mtmd_capture = &clip_log;
+            mctx_ = mtmd_init_from_file(cfg.mmproj_path.c_str(), model_, mtp);
+            g_mtmd_capture = nullptr;
+            if (mctx_ == nullptr)
+                throw std::runtime_error(log::format("libmtmd could not load %s", cfg.mmproj_path.c_str()));
+            if (cpu_request) {
+                // red if the mmproj graphs landed on the card: the clip_init
+                // line names the device it built
+                std::string on_card;
+                for (size_t p = 0; (p = clip_log.find("CLIP using ", p)) != std::string::npos; ) {
+                    const size_t e = clip_log.find("\n", p);
+                    const std::string line = clip_log.substr(p, e == std::string::npos ? std::string::npos : e - p);
+                    if (line.find("CLIP using CPU backend") == std::string::npos) on_card = line;
+                    p += line.size();
+                }
+                if (!on_card.empty())
+                    throw std::runtime_error(
+                        log::format("--tts-gen-device cpu: libmtmd built an mmproj clip context on the card, not the CPU "
+                                    "('%s'; the placement was not applied). ARCINT_TTS_GEN_FORCE_GPU=1 is the red switch that "
+                                    "negates the request for the placement check",
+                                    on_card.c_str()));
+            }
+            status_.mmproj_loaded = true;
+            const mtmd_caps mcap = mtmd_get_cap_from_file(cfg.mmproj_path.c_str());
+            status_.mmproj_vision = mcap.inp_vision;
+            status_.mmproj_audio  = mcap.inp_audio;
+            const mtmd_gen_audio_info gen = mtmd_gen_audio_get_info(mctx_);
+            tts_info_ = gen;   // the gen half's type and sample rate, for --tts
+            log::info("load", "mmproj: %s (image input%s; docs/milestone-1.2.0.md)", cfg.mmproj_path.c_str(),
+                      gen.type != MTMD_GEN_AUDIO_TYPE_NONE ? " + audio generation" : "");
+        }
+#else
+        if (!cfg.mmproj_path.empty())
+            throw std::runtime_error("--mmproj: this build's llama.cpp lacks libmtmd (tools/mtmd)");
+#endif
+        // --tts: the enrolled voices' profiles (D5). One <dir>/<name>/ with a
+        // profile.json (tools/tts_enrol.py) and reference.wav; enabled entries
+        // only are exposed, as names, and their language rides along. The
+        // reference path never leaves this process and no bytes leave the host.
+        if (cfg.tts) {
+            if (tts_info_.type == MTMD_GEN_AUDIO_TYPE_NONE)
+                throw std::runtime_error("--tts: the mmproj carries no audio-generation half "
+                                         "(mtmd_gen_audio_get_info().type == none; docs/milestone-1.2.0.md D4)");
+            std::error_code ec;
+            if (!std::filesystem::is_directory(cfg.tts_profiles, ec))
+                throw std::runtime_error(log::format("--tts-profiles: %s is not a readable directory",
+                                                     cfg.tts_profiles.c_str()));
+            for (const std::filesystem::directory_entry& e : std::filesystem::directory_iterator(cfg.tts_profiles, ec)) {
+                if (!e.is_directory()) continue;
+                std::ifstream meta(e.path() / "profile.json");
+                if (!meta) continue;   // not a profile directory
+                json pr;
+                try {
+                    pr = json::parse(meta);
+                } catch (const json::exception& ex) {
+                    log::warn("load", "tts: %s/profile.json is not valid JSON (%s); skipped",
+                              e.path().string().c_str(), ex.what());
+                    continue;
+                }
+                TtsProfile p;
+                p.name          = pr.value("name", e.path().filename().string());
+                p.language      = pr.value("language", std::string());
+                p.enabled       = pr.value("enabled", false);
+                p.reference_wav = (e.path() / "reference.wav").string();
+                if (!p.enabled) continue;   // the API serves the enabled ones only
+                if (!std::filesystem::exists(p.reference_wav)) {
+                    log::warn("load", "tts: '%s' has no reference.wav; skipped", p.name.c_str());
+                    continue;
+                }
+                tts_profiles_.emplace(p.name, std::move(p));
+            }
+            for (const auto& [name, prof] : tts_profiles_) {
+                (void)prof;
+                status_.voices.push_back(name);
+            }
+            std::sort(status_.voices.begin(), status_.voices.end());
+            status_.tts = true;
+            tts_lang_   = cfg.tts_lang;
+            tts_gen_.resize(static_cast<size_t>(lanes_));
+            log::info("load", "tts: %zu enrolled voice%s from %s, language %s, gen pipeline %s (%d Hz)",
+                      status_.voices.size(), status_.voices.size() == 1 ? "" : "s",
+                      cfg.tts_profiles.c_str(), tts_lang_.c_str(),
+                      tts_info_.type == MTMD_GEN_AUDIO_TYPE_QWEN3TTS ? "qwen3tts"
+                                                                     : static_cast<int>(tts_info_.type) == MTMD_GEN_AUDIO_TYPE_POCKETTTS ? "pockettts" : "none",
+                      tts_info_.sample_rate);
+            if (status_.voices.empty())
+                log::warn("load", "tts: no enabled voice in %s: /v1/audio/speech refuses every voice until one "
+                                  "is enrolled (tools/tts_enrol.py)", cfg.tts_profiles.c_str());
+        }
         std::string lane_desc = log::format("%d lane%s x %d ctx", lanes_, lanes_ == 1 ? "" : "s", n_ctx_);
         if (named_) {
             lane_desc = log::format("%d named lanes,", lanes_);
@@ -610,6 +850,9 @@ public:
 
     ~LlamaBackend() override {
         spec_.reset();   // its draft context reads the target's
+#ifdef ARCINT_MTMD
+        if (mctx_ != nullptr) mtmd_free(mctx_);
+#endif
         if (ctx_ != nullptr) llama_free(ctx_);
         if (dflash_model_ != nullptr) llama_model_free(dflash_model_);
         if (mtp_model_ != nullptr) llama_model_free(mtp_model_);
@@ -645,6 +888,7 @@ public:
 
     FinishReason generate(const GenerationInput& in, int slot, const TokenCallback& on_piece,
                           GenerationStats& stats) override {
+        if (!in.images.empty()) return generate_mm(in, slot, on_piece, stats);
         if (spec_) return generate_spec(in, slot, on_piece, stats);
         const int seq = std::min(std::max(slot, 0), lanes_ - 1);
         const int cap = cap_[static_cast<size_t>(seq)];   // the lane's context
@@ -747,6 +991,307 @@ public:
         log_expert_cache(seq);
         return reason;
     }
+
+#ifdef ARCINT_MTMD
+    // The multimodal branch: mtmd's encode->decode of the rendered prompt
+    // (text chunks as tokens, image chunks as the projector's embeddings),
+    // then the same plain sampler loop. It is a self-contained lane path: the
+    // lane's KV is cleared and no prefix cache, checkpoint or drafter applies
+    // -- an image is not tokenisable text, and this path is measured apart
+    // from the language services' (docs/milestone-1.2.0.md §3, recorded as a
+    // limitation; the language path is untouched).
+    FinishReason generate_mm(const GenerationInput& in, int slot, const TokenCallback& on_piece,
+                             GenerationStats& stats) {
+        if (mctx_ == nullptr) throw InputError("image parts without --mmproj");
+        const int seq = std::min(std::max(slot, 0), lanes_ - 1);
+        const int cap = cap_[static_cast<size_t>(seq)];
+        if (in.images.size() > kMaxImages)
+            throw InputError(log::format("%zu images; a request carries at most %zu", in.images.size(), kMaxImages));
+
+        // the bitmaps, in the order their markers appear; freed on every exit
+        std::vector<mtmd_bitmap*> bitmaps;
+        struct BitmapsGuard {
+            std::vector<mtmd_bitmap*>& v;
+            ~BitmapsGuard() { for (mtmd_bitmap* b : v) mtmd_bitmap_free(b); }
+        } bitmaps_guard{bitmaps};
+        for (const ImagePart& im : in.images) {
+            std::vector<unsigned char> bytes;
+            std::string                err;
+            if (!read_image_url(im.url, bytes, err)) throw InputError(err);
+            int w = 0, h = 0, comp = 0;
+            if (bytes.size() > static_cast<size_t>(INT32_MAX) ||
+                stbi_info_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h, &comp) == 0)
+                throw InputError(log::format("image_url: not a readable image (%zu bytes)", bytes.size()));
+            if (w <= 0 || h <= 0 || static_cast<uint64_t>(w) * static_cast<uint64_t>(h) > kMaxImagePixels)
+                throw InputError(log::format("image_url: %d x %d pixels; at most %llu pixels an image",
+                                             w, h, static_cast<unsigned long long>(kMaxImagePixels)));
+            mtmd_helper_bitmap_wrapper wr = mtmd_helper_bitmap_init_from_buf(
+                mctx_, bytes.data(), bytes.size(), /*placeholder*/ false, mtmd_helper_init_opt_default());
+            if (wr.bitmap == nullptr)
+                throw InputError(log::format("libmtmd could not decode the image (%zu bytes)", bytes.size()));
+            bitmaps.push_back(wr.bitmap);   // its video_ctx is null: no --video input
+        }
+
+        mtmd_input_text text{ in.prompt.c_str(), in.prompt.size(), /*add_special*/ true, /*parse_special*/ true };
+        mtmd_input_chunks* chunks = mtmd_input_chunks_init();
+        if (chunks == nullptr) throw std::runtime_error("libmtmd could not make the chunk list");
+        const int rc = mtmd_tokenize(mctx_, chunks, &text, bitmaps.data(), bitmaps.size());
+        if (rc != 0) {
+            mtmd_input_chunks_free(chunks);
+            throw InputError(log::format("libmtmd tokenize failed (%d): %zu images against %zu markers in the prompt",
+                                         rc, bitmaps.size(), marker_count(in.prompt)));
+        }
+        // Every token, text or image, takes a KV cell; the positions (M-RoPE
+        // counts an image by its grid, not its tokens) are fewer, so the lane's
+        // budget is the token count (DESIGN §3.8: refused, never truncated).
+        const size_t n_tok = mtmd_helper_get_n_tokens(chunks);
+        stats.prompt_tokens = static_cast<int>(n_tok);
+        if (cap > 0 && static_cast<int>(n_tok) >= cap) {
+            mtmd_input_chunks_free(chunks);
+            throw ContextOverflowError(static_cast<int>(n_tok), cap);
+        }
+
+        uint64_t seed = in.sampler.seed;
+        if (!in.sampler.seeded) {
+            std::random_device rd;
+            seed = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+        }
+        Sampler sampler(in.sampler, seed);
+        sampler.set_prompt(tokenizer_->encode(in.prompt));
+
+        std::vector<int>&  have   = slot_tokens_[static_cast<size_t>(seq)];
+        std::vector<float> logits(n_vocab_);
+        llama_pos          n_past = 0;
+        stats.cache_hit_tokens = 0;
+
+        const auto t_pre = clock_type::now();
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            llama_memory_seq_rm(llama_get_memory(ctx_), seq, -1, -1);
+            have.clear();
+            ckpts_[static_cast<size_t>(seq)].clear();   // the lane's KV is gone, so are its checkpoints
+            const int r = mtmd_helper_eval_chunks(mctx_, ctx_, chunks, 0, seq, n_batch_, /*logits_last*/ true, &n_past);
+            if (r != 0) {
+                // a partial prefill leaves cells behind while `have` is empty;
+                // the lane's next text request would start at position 0 on top
+                // of them, so the lane is cleared before the error goes out
+                llama_memory_seq_rm(llama_get_memory(ctx_), seq, -1, -1);
+                mtmd_input_chunks_free(chunks);
+                throw std::runtime_error("mtmd_helper_eval_chunks failed");
+            }
+            copy_logits_locked(logits);
+            have.assign(static_cast<size_t>(std::max<llama_pos>(n_past, 0)), 0);
+        }
+        mtmd_input_chunks_free(chunks);
+        stats.prefill_seconds = seconds_since(t_pre);
+
+        const auto   t_decode = clock_type::now();
+        FinishReason reason   = FinishReason::Stop;
+        const auto   t_s0     = clock_type::now();
+        int          next     = sampler.sample(logits.data(), n_vocab_);
+        stats.decode_sample_seconds += seconds_since(t_s0);
+        auto is_stop_token = [&](int tok) { return is_stop(in.sampler, tok); };
+        while (true) {
+            if (is_stop_token(next)) break;
+            if (in.sampler.max_tokens >= 0 && stats.completion_tokens >= in.sampler.max_tokens) {
+                reason = FinishReason::Length;
+                break;
+            }
+            if (static_cast<int>(n_tok) + stats.completion_tokens + 1 >= cap) {   // cells, not positions
+                reason = FinishReason::Length;
+                break;
+            }
+            ++stats.completion_tokens;
+            const auto    t_emit = clock_type::now();
+            const Control ctl    = on_piece(tokenizer_->decode_one(next), next);
+            stats.decode_emit_seconds += seconds_since(t_emit);
+            sampler.observe(next);
+            if (ctl != Control::Continue) {
+                reason = ctl == Control::Cancel ? FinishReason::Abort : FinishReason::Stop;
+                break;
+            }
+            const auto t_fwd = clock_type::now();
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (!decode_locked(seq, &next, 1, have.size(), true))
+                    throw std::runtime_error("llama_decode failed during decode");
+                copy_logits_locked(logits);
+                have.push_back(next);
+            }
+            stats.decode_forward_seconds += seconds_since(t_fwd);
+            const auto t_s = clock_type::now();
+            next           = sampler.sample(logits.data(), n_vocab_);
+            stats.decode_sample_seconds += seconds_since(t_s);
+        }
+        stats.decode_seconds = seconds_since(t_decode);
+        return reason;
+    }
+
+    // /v1/audio/speech: one enrolled profile's waveform (docs/milestone-1.2.0.md
+    // A4, D5). arcint's own sampler picks the backbone's semantic token from the
+    // logits of the embedding batch the helper decodes; the helper's pipeline
+    // turns the token into frames and a WAV. It is a self-contained lane path:
+    // the lane's KV is cleared before and after, and no prefix cache, checkpoint
+    // or drafter applies (the stream is codec tokens, not text).
+    //
+    // Differences from the reference (tools/tts/tts.cpp):
+    //  - the backbone token comes from arcint's lgc::Sampler over
+    //    llama_get_logits_ith(ctx_, -1) and n_vocab_, not common_sampler_sample;
+    //  - only top_k/top_p/seed reach mtmd_helper_gen_audio_inp, as the reference
+    //    passes them: a greedy backbone request does not make the codec/code-
+    //    predictor sampling greedy, and top_k/top_p <= 0 make the helper fall
+    //    back to mtmd_gen_inp_default rather than switch them off;
+    //  - the helper's internal llama_process calls touch the shared context, so
+    //    arcint holds its context mutex for the whole synthesis (the reference
+    //    has the context to itself);
+    //  - the logits reservation is lifted to n_batch under --tts, because an
+    //    embedding context outputs every token of a batch.
+    bool generate_speech(const SpeechInput& in, int slot, std::string& wav, std::string& error,
+                         GenerationStats& stats) override {
+        if (mctx_ == nullptr) { error = "the speech path needs --mmproj"; return false; }
+        if (tts_info_.type == MTMD_GEN_AUDIO_TYPE_NONE) {
+            error = "the loaded --mmproj carries no audio-generation half";
+            return false;
+        }
+        const auto it = tts_profiles_.find(in.voice);
+        if (it == tts_profiles_.end()) {
+            error = log::format("voice '%s' is not enrolled on this server", in.voice.c_str());
+            return false;
+        }
+        const TtsProfile& prof = it->second;
+        const int         seq  = std::min(std::max(slot, 0), lanes_ - 1);
+        const std::string lang = prof.language.empty() ? tts_lang_ : prof.language;
+
+        // One seed for the backbone sampler and the codec pipeline, so a fixed
+        // request seed makes the arm reproducible (milestone §8, the stochastic
+        // risk). Unset: random, as the reference's LLAMA_DEFAULT_SEED.
+        uint64_t sseed = in.sampler.seeded ? in.sampler.seed : 0;
+        if (!in.sampler.seeded) {
+            std::random_device rd;
+            sseed = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+        }
+
+        // A text whose tokens alone fill the lane cannot be synthesized: the
+        // chat path's overflow, before anything runs (the helper exposes no
+        // prompt size, so the template and the reference's few cells are
+        // caught by the room check after the prompt, or fail in it).
+        if (const int text_tok = static_cast<int>(tokenizer_->encode(in.text).size());
+            cap_[static_cast<size_t>(seq)] > 0 && text_tok >= cap_[static_cast<size_t>(seq)])
+            throw ContextOverflowError(text_tok, cap_[static_cast<size_t>(seq)]);
+
+        // The helper's internal llama_process calls run on the shared context,
+        // which is not thread-safe, and its embedding batches (output_all) read
+        // the whole ubatch; the synthesis holds the context mutex, as the
+        // reference has the context to itself.
+        std::lock_guard<std::mutex> lk(mu_);
+        llama_memory_seq_rm(llama_get_memory(ctx_), seq, -1, -1);
+        slot_tokens_[static_cast<size_t>(seq)].clear();
+        ckpts_[static_cast<size_t>(seq)].clear();
+
+        mtmd_helper_bitmap_wrapper wrap = mtmd_helper_bitmap_init_from_file(
+            mctx_, prof.reference_wav.c_str(), /*placeholder*/ false, mtmd_helper_init_opt_default());
+        mtmd::bitmap_ptr speaker(wrap.bitmap);
+        if (!speaker) {
+            error = log::format("voice '%s': its reference recording could not be read",
+                                prof.name.c_str());
+            return false;
+        }
+
+        std::unique_ptr<mtmd_helper::gen_audio>& pipe = tts_gen_[static_cast<size_t>(seq)];
+        if (!pipe) pipe = std::make_unique<mtmd_helper::gen_audio>(ctx_, mctx_);
+
+        Sampler sampler(in.sampler, sseed);
+        mtmd_helper_gen_audio_inp inp{};
+        inp.seq_id      = seq;
+        inp.prompt      = in.text.c_str();
+        inp.prompt_len  = in.text.size();
+        inp.speaker_ref = speaker.get();
+        inp.lang        = lang.c_str();
+        inp.top_k       = in.sampler.top_k;
+        inp.top_p       = in.sampler.top_p;
+        inp.seed        = in.sampler.seeded ? static_cast<uint32_t>(sseed) : UINT32_MAX;
+        inp.out_type    = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
+        if (pipe->set_input(&inp) != 0) {
+            error = "the gen-audio pipeline refused the input (the reference, the language, or the "
+                    "backbone's tokens)";
+            return false;
+        }
+
+        std::vector<float> logits(n_vocab_);
+        int32_t            ret = 1;
+        while (ret > 0) {
+            ret = pipe->step_prompt(n_batch_);
+            if (ret < 0) { error = "prompt processing failed"; return false; }
+        }
+        copy_logits_locked(logits);
+        int          sampled = sampler.sample(logits.data(), n_vocab_);
+        sampler.observe(sampled);   // the reference accepts each sampled token
+        const float* h       = llama_get_embeddings_ith(ctx_, -1);
+        if (h == nullptr) {
+            error = "llama.cpp returned no embeddings: the context lacks embeddings=1 (--tts)";
+            return false;
+        }
+
+        // A frame is a backbone token: what the prompt and the reference left
+        // of the lane bounds it, whatever the client asked (a request past it
+        // would end in a decode failure). A text that leaves no room is the
+        // client's overflow, refused as the chat path refuses it (DESIGN §3.8).
+        const int lane_cap = cap_[static_cast<size_t>(seq)];
+        const int used     = static_cast<int>(llama_memory_seq_pos_max(llama_get_memory(ctx_), seq)) + 1;
+        const int asked    = in.sampler.max_tokens >= 0 ? in.sampler.max_tokens : 512;
+        if (lane_cap > 0 && used + 1 >= lane_cap) {
+            llama_memory_seq_rm(llama_get_memory(ctx_), seq, -1, -1);
+            throw ContextOverflowError(used, lane_cap);
+        }
+        const int    max_frames = lane_cap > 0 ? std::min(asked, lane_cap - used - 1) : asked;
+        int          n_frames   = 0;
+        bool         stop       = false;
+        const float* h_next     = nullptr;
+        const auto   t_gen      = clock_type::now();
+        if (pipe->step_gen(sampled, h, &h_next, &stop) != 0) {
+            error = "step_gen failed at the first frame";
+            return false;
+        }
+        if (h_next != nullptr) {
+            n_frames = 1;
+            copy_logits_locked(logits);
+        }
+        // h_state passes through the helper's own buffer (stable across other
+        // lanes), so only step_gen and the logits copy need the context.
+        while (!stop && h_next != nullptr && n_frames < max_frames) {
+            const float* state = h_next;
+            h_next             = nullptr;
+            sampled            = sampler.sample(logits.data(), n_vocab_);
+            sampler.observe(sampled);
+            if (pipe->step_gen(sampled, state, &h_next, &stop) != 0) {
+                error = log::format("step_gen failed at frame %d", n_frames);
+                return false;
+            }
+            if (h_next == nullptr) break;
+            copy_logits_locked(logits);
+            ++n_frames;
+        }
+
+        int32_t     rate   = 0;
+        const char* data   = nullptr;
+        size_t      len    = 0;
+        int64_t     n_samp = 0;
+        if (!stop && n_frames >= max_frames)
+            log::warn(log::format("slot %d", slot), "speech stopped at %d frames (%s) before codec_eos: the audio "
+                      "is cut", n_frames, max_frames < asked ? "the lane is full" : "max_tokens");
+        if (pipe->get_output(&rate, &data, &len, &n_samp) != 0) { error = "get_output failed"; return false; }
+        wav.assign(data, data + len);
+        stats.completion_tokens = n_frames;
+        stats.decode_seconds    = seconds_since(t_gen);
+
+        // leave the lane as the text path expects to find it: the helper's
+        // embedding positions are not the tokens slot_tokens_ records
+        llama_memory_seq_rm(llama_get_memory(ctx_), seq, -1, -1);
+        slot_tokens_[static_cast<size_t>(seq)].clear();
+        ckpts_[static_cast<size_t>(seq)].clear();
+        return true;
+    }
+#endif
 
 private:
     // --llama-mtp: draft, verify [last, drafts...] in one target decode, keep
@@ -1360,6 +1905,27 @@ private:
     llama_model*                          dflash_model_ = nullptr;   // --llama-dflash-gguf
     bool                                  dflash_    = false;     // the drafter is DFlash2's
     llama_context*                        ctx_   = nullptr;
+#ifdef ARCINT_MTMD
+    mtmd_context*                         mctx_  = nullptr;   // --mmproj (libmtmd)
+    mtmd_gen_audio_info                   tts_info_{};   // mtmd_gen_audio_get_info(mctx_)
+    // One profile per enrolled voice (D5): the name the API takes, the voice's
+    // own language and its reference recording's path. Names only reach the
+    // API; the path never leaves this process and the bytes never leave the
+    // host (the profile directory is operator-local).
+    struct TtsProfile {
+        std::string name;
+        std::string language;
+        std::string reference_wav;
+        bool        enabled = false;
+    };
+    std::unordered_map<std::string, TtsProfile> tts_profiles_;
+    std::string                                 tts_lang_ = "de";   // --tts-lang
+    // one gen_audio pipeline per lane, lazily built and reused: its special
+    // token cache and token-embedding copy survive across requests (the
+    // reference builds one for the process) and set_input() resets its
+    // per-generation state.
+    std::vector<std::unique_ptr<mtmd_helper::gen_audio>> tts_gen_;
+#endif
     const llama_vocab*                    vocab_ = nullptr;
     std::unique_ptr<LlamaTokenizer>       tokenizer_;
     bool mistral_small_24b_ = false;   // the admitted llama geometry (think tags, BOS)

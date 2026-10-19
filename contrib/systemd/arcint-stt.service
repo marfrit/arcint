@@ -1,0 +1,50 @@
+# arcint-stt — speech to text (whisper.cpp large-v3-turbo, MIT) on the 24 GB
+# card, on demand: the whisper.cpp server from the arcint-stt package, built
+# with WHISPER_USE_SYSTEM_GGML against a ggml installed from arcint's patched
+# llama.cpp tree, so the encoder and decoder run on the same OpenCL backend
+# and the same Intel kernels as the language services
+# (contrib/whisper/README.md, docs/milestone-1.2.0.md D3/A3/C3).
+#
+# Starting it stops the card's language, image and other speech units (same
+# card, Conflicts=). Routes: POST /v1/audio/transcriptions (OpenAI multipart:
+# `file`, `language`, `response_format`; a plain `json` returns
+# {"text":...}); the route is whisper-server's own with
+# `--inference-path /v1/audio/transcriptions`, no patch. GET /health and
+# GET /props (model, language, devices, build; contrib/whisper/server-props.patch).
+#
+# The model is whisper.cpp's own `.bin` format, not a GGUF. German first; the
+# gate is word error rate on the fixed German set against the same model's
+# CPU run (docs/speech-service.md). GGML_OPENCL_DEVICES=0:0 registers only
+# this card, since the whisper binary would otherwise consider both.
+#
+# Measured (phase 0, B60, this model and flag set): `whisper_backend_init_gpu`
+# chose GPUOpenCL, the log named the card; card encode 804.6 ms/run and decode
+# 2.11 ms/run against the CPU's 3553.5 / 11.48 (4.4x and 5.4x); corpus WER
+# 0.0547 equal to the CPU arm; fallbacks 0/0 (docs/milestone-1.2.0.md §9.2).
+
+[Unit]
+Description=arcint-stt — whisper.cpp German transcription, GPU.0 (Arc Pro B60), :8091, on demand
+Documentation=https://github.com/marfrit/arcint
+After=default.target
+Conflicts=arcint-agent.service arcint-writer.service arcint-flashnext.service arcint-agent-lanes.service arcint-imggen.service arcint-imggen-qwen.service arcint-imggen-flux.service arcint-vlm.service arcint-tts.service
+
+[Service]
+Type=simple
+Environment=GGML_OPENCL_DEVICES=0:0
+ExecStart=/usr/bin/arcint-whisper \
+    --model /models/whisper/ggml-large-v3-turbo.bin \
+    --host 0.0.0.0 --port 8091 \
+    --inference-path /v1/audio/transcriptions \
+    -l de -t 16
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=5min
+TimeoutStopSec=60s
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectHome=read-only
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,68 @@
+# arcint-tts — German text to speech with enrolled voice cloning
+# (Qwen3-TTS-12Hz-1.7B-Base, Apache-2.0) on the 24 GB card, on demand:
+# arcint's own voice-and-vision binary with libmtmd's gen_audio pipeline
+# (docs/milestone-1.2.0.md D4/§3, docs/speech-service.md). The backbone
+# samples the codec tokens and the mmproj's gen half (speaker encoder +
+# code predictor + code2wav acoustic decoder) makes the waveform. Its code
+# predictor must keep `gen.code.head` (sampling) and `gen.code.embd` at f16:
+# the whole code body at Q8_0 never samples `codec_eos` and makes German
+# unintelligible (docs/campaigns/qwen3tts-german-genpath.md (on the `qfndev` branch), measured-here);
+# the backbone may stay Q8_0. The production set is the **Q8_0 mmproj with
+# those two tensors at f16** (requantized from the official bf16; C4 + B3 PASS
+# on the enlarged D8 set, campaign qwen3tts-card-real-time lever (b),
+# measured-here): the code body at Q8_0 is what reaches real time (RTF 1.1291
+# / 1.1597, pre / post the card host's RAM upgrade), the two f16 tensors what
+# keeps it intelligible.
+#
+# Starting it stops the card's language, image and speech units (same card,
+# Conflicts=). Routes: POST /v1/audio/speech (OpenAI shape, `voice` a name
+# from the server's list) and GET /v1/audio/voices (names only); /health and
+# /props; chat and text completions are refused 400 (speech only). The API
+# refuses any reference-audio field 400 naming the enrolment route (D5); cloning happens only from a profile already on the host, in
+# --tts-profiles (operator-local, outside the repository).
+#
+# --tts sets the context's embeddings=1 (the backbone-to-codec pipeline reads
+# hidden states) and lifts the logits reservation to n_batch; the enrolled
+# voice count and the tts flag are on /props (names on /v1/audio/voices).
+# Vocab/backbone flags mirror the reference tools/tts recipe; the sampler
+# (temperature/seed) is per request and printed with every gate verdict.
+# --tts-gen-device cpu is the hybrid placement (backbone on the card, the
+# mmproj's speaker encoder + code predictor + code2wav on the CPU); accepted
+# by the operator 2026-10-19. With this production set it measures RTF
+# 1.1291 / 1.1597 (B3 PASS, above); the placement itself was chosen on the
+# bf16 mmproj, where the hybrid's 0.828 beat the card-only 0.751 (campaign
+# qwen3tts-card-real-time: the CPU codec is 1,692 ms/flush against
+# 1,780-2,000 on the card, and the card-only predictor is 4.5x the single
+# CPU backend). It loads the mmproj clip graphs on the CPU and the boot
+# aborts if any of them lands on the card (the check in backend_llama.cpp).
+
+[Unit]
+Description=arcint-tts — Qwen3-TTS speech with enrolled voices, GPU.0 (Arc Pro B60), :8084, on demand
+Documentation=https://github.com/marfrit/arcint
+After=default.target
+Conflicts=arcint-agent.service arcint-writer.service arcint-flashnext.service arcint-agent-lanes.service arcint-imggen.service arcint-imggen-qwen.service arcint-imggen-flux.service arcint-vlm.service arcint-stt.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/arcint \
+    --engine llama \
+    --gguf /models/tts-qwen3/Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
+    --mmproj /models/tts-qwen3/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0-codeheadf16.gguf \
+    --tts --tts-profiles /models/tts-qwen3/profiles-de --tts-lang de \
+    --tts-gen-device cpu \
+    --served-model-name qwen3-tts-12hz-1.7b \
+    --device GPU.0 \
+    --host 0.0.0.0 --port 8084 \
+    --n-ctx 4096 --queue-timeout 30
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=10min
+TimeoutStopSec=60s
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectHome=read-only
+
+[Install]
+WantedBy=default.target

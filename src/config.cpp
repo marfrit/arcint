@@ -131,10 +131,30 @@ std::string usage_text() {
         "  --gguf FILE               serve this GGUF (the first shard of a split file) on\n"
         "                            the libllama engine: ggml's OpenCL backend. The\n"
         "                            tokenizer and the chat template come from the file\n"
+        "  --mmproj FILE             the multimodal projector (libmtmd, docs/\n"
+        "                            milestone-1.2.0.md): with it loaded the chat\n"
+        "                            endpoint takes OpenAI image_url parts, and the\n"
+        "                            audio endpoints its TTS/ASR counterparts\n"
         "  --engine llama            the executor; llama is the only value, kept for the\n"
         "                            units' sake (a bare --gguf selects it). The OpenVINO\n"
         "                            engine was retired in 0.8.0: docs/history.md, tag\n"
         "                            openvino-history\n"
+        "  --tts                     serve the audio-generation endpoints: the enrolled\n"
+        "                            voices' profile list (GET /v1/audio/voices) and\n"
+        "                            speech synthesis (POST /v1/audio/speech). Needs\n"
+        "                            --mmproj with an audio-generation gen half; it sets\n"
+        "                            the context's embeddings=1 for the pipeline\n"
+        "  --tts-profiles DIR        the server-side speaker profiles (one <DIR>/<name>/\n"
+        "                            with reference.wav and profile.json, written by\n"
+        "                            tools/tts_enrol.py). Operator-local, outside this\n"
+        "                            repository (D5); default $ARCINT_TTS_PROFILES\n"
+        "  --tts-lang LANG           the synthesised text's language, zh en de it pt es\n"
+        "                            ja ko fr or ru (default de)\n"
+        "  --tts-gen-device DEV      where the audio-generation mmproj's clip graphs\n"
+        "                            run: gpu (default, on the card with the backbone)\n"
+        "                            or cpu (the hybrid: backbone on the card, the\n"
+        "                            speaker encoder, code predictor and code2wav on\n"
+        "                            the CPU; the best measured TTS arm)\n"
         "  --stub                    serve the stub backend (no model, no GPU): the whole\n"
         "                            HTTP surface for the device-free suites\n"
         "  --stub-delay-ms N         stub only: artificial latency per token\n"
@@ -366,6 +386,20 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--gguf") {
             if (!value(v)) return fail("--gguf needs a path");
             cfg.gguf_path = std::string(v);
+        } else if (arg == "--mmproj") {
+            if (!value(v)) return fail("--mmproj needs a path");
+            cfg.mmproj_path = std::string(v);
+        } else if (arg == "--tts") {
+            cfg.tts = true;
+        } else if (arg == "--tts-profiles") {
+            if (!value(v)) return fail("--tts-profiles needs a directory");
+            cfg.tts_profiles = std::string(v);
+        } else if (arg == "--tts-lang") {
+            if (!value(v)) return fail("--tts-lang needs a language code");
+            cfg.tts_lang = std::string(v);
+        } else if (arg == "--tts-gen-device") {
+            if (!value(v)) return fail("--tts-gen-device needs a device");
+            cfg.tts_gen_device = std::string(v);
         } else if (arg == "--device") {
             if (!value(v)) return fail("--device needs a value");
             cfg.device = std::string(v);
@@ -478,6 +512,12 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.stub && !cfg.gguf_path.empty()) return fail("--gguf and --stub are mutually exclusive");
     if (!cfg.stub && cfg.gguf_path.empty())
         return fail("nothing to serve: pass --gguf FILE, or --stub for the device-free stub backend");
+    // --tts (docs/milestone-1.2.0.md D4/D5): the operator-local profile
+    // directory may come from the environment instead of the flag.
+    if (cfg.tts && cfg.tts_profiles.empty()) {
+        if (const char* env = std::getenv("ARCINT_TTS_PROFILES"); env != nullptr && *env != '\0')
+            cfg.tts_profiles = env;
+    }
 
     if (cfg.port < 1 || cfg.port > 65535) return fail("--port must be in [1, 65535]");
     // A served name that is empty or blank would put an unusable id on
@@ -553,12 +593,37 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             cfg.llama_dflash_min_p > 0.0 || cfg.llama_dflash_ubatch > 0 ||
             cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192 ||
             cfg.llama_expert_cache_on() || !cfg.llama_expert_profile.empty() || cfg.llama_layer_split > 0 || cfg.llama_mtp_card >= 0 ||
-            cfg.llama_reserve_cells > 0)
+            cfg.llama_reserve_cells > 0 || cfg.tts || !cfg.tts_profiles.empty() || cfg.tts_lang != "de" ||
+            cfg.tts_gen_device != "gpu" || !cfg.mmproj_path.empty())
             return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab/-gguf/-min-p, --llama-dflash/-gguf/-min-p/-ubatch, "
                         "--llama-kv, --llama-checkpoints/-step, "
-                        "--llama-expert-cache/-profile, --llama-layer-split, --llama-mtp-card and --llama-reserve-cells are options of "
+                        "--llama-expert-cache/-profile, --llama-layer-split, --llama-mtp-card, --llama-reserve-cells, --mmproj and --tts "
+                        "(-profiles/-lang/-gen-device) are options of "
                         "the libllama engine (--gguf), not of --stub");
         return {};
+    }
+    // --tts: a mmproj with the audio-generation half and the enrolled voices'
+    // directory. The flag without either is a boot error, not a request-time
+    // one: the process could never answer the routes it was told to serve.
+    if (cfg.tts && cfg.mmproj_path.empty())
+        return fail("--tts needs --mmproj (the audio-generation projector: the speaker encoder and the acoustic decoder)");
+    if (cfg.tts && cfg.tts_profiles.empty())
+        return fail("--tts needs --tts-profiles DIR (or $ARCINT_TTS_PROFILES): the enrolled voices' profile "
+                    "directory (tools/tts_enrol.py, docs/speech-service.md D5)");
+    if (!cfg.tts && !cfg.tts_profiles.empty())
+        return fail("--tts-profiles needs --tts (the audio-generation path)");
+    if (!cfg.tts && cfg.tts_lang != "de")
+        return fail("--tts-lang needs --tts");
+    if (!cfg.tts && cfg.tts_gen_device != "gpu")
+        return fail("--tts-gen-device needs --tts (the audio-generation path)");
+    if (cfg.tts_gen_device != "gpu" && cfg.tts_gen_device != "cpu")
+        return fail("--tts-gen-device takes gpu (the card, the default) or cpu (the hybrid: backbone on the card, the mmproj graphs on the CPU)");
+    {
+        static const char* const kTtsLangs[] = {"zh", "en", "de", "it", "pt", "es", "ja", "ko", "fr", "ru"};
+        bool known = false;
+        for (const char* l : kTtsLangs) if (cfg.tts_lang == l) known = true;
+        if (!known)
+            return fail("--tts-lang takes one of the backbone's codec_language codes: zh, en, de, it, pt, es, ja, ko, fr, ru");
     }
     // DFlash2: one drafter a context (the MTP layer is then not loaded)
     if (cfg.llama_dflash > 0 && !cfg.llama_dflash_on()) return fail("--llama-dflash needs --llama-dflash-gguf (the drafter)");

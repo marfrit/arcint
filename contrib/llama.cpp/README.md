@@ -62,7 +62,7 @@ The procedure:
 
 **Moved to `3e4dfa8`, 2026-10-15** (upstream master that day, 288 commits on;
 the survey of what upstream changed and what is open there is
-`docs/campaigns/research-upstream-llama-2026-10.md`, on the `qfndev` branch):
+`docs/campaigns/research-upstream-llama-2026-10.md` (on the `qfndev` branch)):
 
 - **The port** (`code`): the 56 patches carried one commit at a time; 46
   applied unchanged, 10 resolved by hand. 0001 and 0002 above upstream's
@@ -661,7 +661,7 @@ from K = 512, Q6_K from K = 1,024. It is built only where the device's base
 alignment is a multiple of 64 bytes, since the planes are sub-buffers at that
 alignment. It serves only within the extension's 2^24 limits.
 
-Why (`measured-here`, B60, docs/campaigns/llama-engine-kernel-gap.md on the `qfndev` branch, lever
+Why (`measured-here`, B60, docs/campaigns/llama-engine-kernel-gap.md (on the `qfndev` branch) lever
 7): `mul_mm_kq_f16.cl` was 73 % of a 4,096-token dense prefill. unitrace
 showed its threads waiting on loads 52 % of the time, with every thread
 slot full.
@@ -2532,7 +2532,7 @@ Measured (`measured-here`, 2026-10-13, the A770):
 - **Perf** (q8_0:q4_0, 512 rows, causal): 8,192 keys 16.29 ms against the
   byte form's 16.34-16.37; 32,768 keys 69.9-70.2 against 70.7-70.9. That is
   ~1 %: at 16 sub-groups the staging is load-bound, not conversion-bound
-  (`docs/campaigns/dense-prefill-attention.md` on the `qfndev` branch, stage 3).
+  (`dense-prefill-attention.md`, stage 3).
 - **Reviewed** before the push by a second model: no defects. It checked the
   bit manipulation against ggml's block layouts, the bit-identity argument
   (no denormal flushing in the build options, no contraction of
@@ -3320,8 +3320,7 @@ Two changes, the values unchanged:
 
 Fewer integer operations in the low-bit expert matvecs' weight decode,
 the same values. Flash-Next's expert kernels are bound by integer issue,
-not by memory (stage 3d of `docs/campaigns/flash-next-llama-engine.md`,
-on the `qfndev` branch).
+not by memory (stage 3d of `docs/campaigns/flash-next-llama-engine.md` (on the `qfndev` branch)).
 Two decodes did per-byte work with shifts and masks:
 - **IQ2_S and IQ3_S signs.** Eight sign bits per eight weights became a
   byte mask through `lb_signmask4` (seven operations per four weights).
@@ -3500,7 +3499,7 @@ for Q2_0). A layer of another type (Flash-Next's three IQ1_M layers) uses
 ggml-cpu's dot products, as does `GGML_OPENCL_CPU_MISS_MT=0`.
 
 A prototype with ggml-cpu's dot products (stage 3c of
-`docs/campaigns/flash-next-llama-engine.md`, on the `qfndev` branch) did not pay: ggml-cpu's Q2_0 dot
+`docs/campaigns/flash-next-llama-engine.md` (on the `qfndev` branch)) did not pay: ggml-cpu's Q2_0 dot
 product has no SIMD form.
 
 - **The kernels** (`measured-here`, 2026-10-15, the host's Ryzen 7 5700X, one
@@ -3806,3 +3805,59 @@ found in `--hires-upscalers-dir`): 512² to 2048² in **27.9 s**
 (`measured-here`, the release window).
 The upscale is the print route; the campaign is
 `docs/campaigns/imggen-leaky-relu-esrgan.md` (on the `qfndev` branch).
+
+## 0062-mtmd-qwen3tts-gen-valid-frames.patch
+
+Qwen3-TTS's `GEN_WAV` code2wav decoder built a **fixed 72-frame** graph: the
+graph took `hparams.wav_tfm_swa` (the decoder's attention window) as its frame
+count and the caller padded the codes to that window, so the decoder computed
+72 frames for a 16- or a 72-frame flush alike (`clip.cpp`). The per-call cost
+was therefore fixed (1.766-1.79 s per flush on a pure CPU backend, 99.6 %
+compute) and a chunked flush multiplied it (`measured-here`, 2026-10-19; the
+campaign's lever (a), `docs/campaigns/qwen3tts-card-real-time.md` (on the `qfndev` branch)).
+
+The patch makes the graph take the caller's valid frames. `clip_get_graph_builder`
+passes the codes-derived frame count to `clip_graph_qwen3tts_gen`'s new
+`gen_n_frames` field (default `-1` keeps the window for the no-codes path),
+`clip_encode`'s input no longer rear-pads to 72, and the output tail drop
+keys on the caller's count under the default (so it no longer fires) and on
+`wav_tfm_swa` under the red. **`MTMD_TTS_WAV_PAD=1` is the red case**: it forces
+the padded window back, so the pre-patch behaviour and the fixed per-call cost
+return and the patch's own test can fail. The default (variable unset) is the
+valid frames; there is no arcint flag.
+
+The generic `out_audio` block (`clip.cpp`, shared with other gen-audio models)
+keeps its null guard: `n_frames_w` falls back to `hparams.wav_tfm_swa` when
+`params->codes` is null, and `n_frames` was already guarded. A `GEN_WAV` caller
+with features instead of codes -- the upstream PocketTTS path -- therefore never
+dereferences a null codes pointer and computes its own frame count (`wav_tfm_swa`
+is 0 for PocketTTS); for Qwen3-TTS a no-codes `GEN_WAV` call aborts at the
+pre-existing `GGML_ASSERT(params->codes != nullptr)`.
+
+**CPU** (the same window): the flush becomes frame-proportional, 44 frames
+1.11 s, 55 1.37, 60 1.49, 64 1.59 against the fixed 1.77-1.79; the 8-sentence
+flush total falls 14.25 -> 10.60 s. **Card** (B60 `8086:e211`, pinned Q8_0
+backbone + bf16 mmproj, `--tts-gen-device cpu`, the fixed 8-sentence gate, seed
+42, window 72, the full `/v1/audio/speech` route): the padded production arm
+runs real-time factor 0.729 (55.66 s process / 40.56 s audio, worst
+first-audio 11.0 s) against the valid-frames arm 0.802 (50.58 s; 9.52 s); both
+round-trip at corpus WER 0.0455 through `whisper-server -ng` (C4 PASS) and
+`codec_eos` is sampled on both. These 0.729/0.802 figures are the first run
+(the switch-source build); the final patch binary's red/green run on the same
+route measured the padded arm 0.7285 and the default 0.8006 (two builds,
+run-to-run variation). The same-binary sample diff is at most
+191/32768 (0.0058 of full scale), inside the window-72 card-vs-CPU bar
+483/32768 already on record; the patch binary's own arm is bit-identical to the
+scratch-switch arm measured first. **Red case (`measured-here`, 2026-10-19, one
+binary, the same B60 window):** `MTMD_TTS_WAV_PAD=1` returns the padded arm's
+waveform -- identical on all 8 sentences to the production padded arm (real-time
+factor 0.7285) -- while the default differs from it at <=191/32768 and runs
+0.8006; C4 is 0.0455 on the default. The red breaks the lever's own claim (the
+flush scales with the frames), so the test can fail by the repo's rule; the
+classification is in `docs/switches.md` (red case).
+Sub-real-time still: it is lever (a), not B3. `0062` applies cleanly on the
+0001-0060 and the 0001-0058 trees.
+
+Evidence class: `measured-here`. The campaign is
+`docs/campaigns/qwen3tts-card-real-time.md` (on the `qfndev` branch); the milestone record is
+`docs/milestone-1.2.0.md` §9.5.

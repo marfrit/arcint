@@ -15,9 +15,12 @@ bool known_role(const std::string& r) {
 }
 
 // OpenAI allows `content` to be either a string or an array of typed parts.
-// v1 is text-only (DESIGN.md §8 defers multimodal), so text parts are joined
-// and anything else is a hard error rather than a silent drop.
-std::optional<std::string> read_content(const json& v, std::string& out, size_t index) {
+// 1.2.0 takes the `image_url` part when a multimodal projector is loaded
+// (docs/milestone-1.2.0.md); its marker joins the text in place, and the part
+// is recorded in `images` so the backend can read the bytes. Every other type
+// is still a hard error rather than a silent drop.
+std::optional<std::string> read_content(const json& v, std::string& out,
+                                        std::vector<ImagePart>& images, size_t index) {
     if (v.is_null()) {
         out.clear();
         return std::nullopt;
@@ -36,9 +39,21 @@ std::optional<std::string> read_content(const json& v, std::string& out, size_t 
             return log::format("messages[%zu].content parts must be typed objects", index);
         }
         const std::string type = part["type"].get<std::string>();
+        if (type == "image_url") {
+            if (!part.contains("image_url") || !part["image_url"].is_object() ||
+                !part["image_url"].contains("url") || !part["image_url"]["url"].is_string()) {
+                return log::format("messages[%zu].content: image_url part needs image_url.url", index);
+            }
+            ImagePart img;
+            img.url = part["image_url"]["url"].get<std::string>();
+            images.push_back(std::move(img));
+            joined += kMediaMarker;
+            continue;
+        }
         if (type != "text") {
             return log::format(
-                "messages[%zu].content: part type '%s' is not supported (v1 is text-only)",
+                "messages[%zu].content: part type '%s' is not supported (text and image_url "
+                "are; audio input belongs to the transcription route)",
                 index, type.c_str());
         }
         if (!part.contains("text") || !part["text"].is_string()) {
@@ -218,7 +233,7 @@ std::optional<std::string> parse_chat_request(const json& body, ChatRequest& out
         }
 
         if (m.contains("content")) {
-            if (auto e = read_content(m["content"], msg.content, index)) return e;
+            if (auto e = read_content(m["content"], msg.content, msg.images, index)) return e;
         }
         if (m.contains("name") && m["name"].is_string()) {
             msg.name = m["name"].get<std::string>();
@@ -369,6 +384,55 @@ std::optional<std::string> parse_completion_request(const json& body, Completion
     }
 
     if (auto e = read_stream(body, req.stream, req.stream_include_usage)) return e;
+    if (auto e = read_sampler(body, req.sampler)) return e;
+
+    out = std::move(req);
+    return std::nullopt;
+}
+
+std::optional<std::string> parse_speech_request(const json& body, SpeechRequest& out) {
+    if (!body.is_object()) return "request body must be a JSON object";
+
+    SpeechRequest req;
+    if (body.contains("model") && body["model"].is_string()) {
+        req.model = body["model"].get<std::string>();
+    }
+
+    // OpenAI's `input` is the spoken text.
+    if (!body.contains("input") || !body["input"].is_string()) return "input must be a string";
+    req.text = body["input"].get<std::string>();
+    if (req.text.find_first_not_of(" \t\r\n") == std::string::npos)
+        return "input must not be empty (nothing to synthesize)";
+
+    // `voice` picks a server-side enrolled profile (D5); whether it exists is
+    // prepare_speech's check, where the server's list is available.
+    if (!body.contains("voice") || !body["voice"].is_string()) return "voice must be a string";
+    req.voice = body["voice"].get<std::string>();
+    if (req.voice.empty()) return "voice must not be empty (it names an enrolled voice)";
+
+    if (body.contains("response_format") && !body["response_format"].is_null()) {
+        if (!body["response_format"].is_string()) return "response_format must be a string";
+        req.response_format = body["response_format"].get<std::string>();
+    }
+    if (req.response_format != "wav") {
+        return log::format("response_format '%s' is not served: WAV is the only audio container "
+                           "(mtmd_helper_gen_audio_outtype WAV)",
+                           req.response_format.c_str());
+    }
+
+    // OpenAI's `speed` is a playback rate the server does not implement: the
+    // model synthesizes at its own sample rate. Accepting it and ignoring it
+    // would be the silent divergence DESIGN §3.6 forbids, so anything but 1 is
+    // a refusal and it is not carried into the sampler.
+    if (body.contains("speed") && !body["speed"].is_null()) {
+        if (!body["speed"].is_number()) return "speed must be a number";
+        const double speed = body["speed"].get<double>();
+        if (speed != 1.0)
+            return log::format("speed %.3f is not supported: arcint synthesizes at the model's own "
+                               "sample rate (the 1.0 playback rate)",
+                               speed);
+    }
+
     if (auto e = read_sampler(body, req.sampler)) return e;
 
     out = std::move(req);
