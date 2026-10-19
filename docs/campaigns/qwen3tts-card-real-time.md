@@ -192,7 +192,8 @@ padded window; the valid-frames computation scales it with the flushed count,
 C4 card PASS, and it is now the engine default patch
 `0062-mtmd-qwen3tts-gen-valid-frames`); (b) the code predictor's node/launch
 count (`cache_set`'s concat+arange+get_rows and the per-step sampling, ~1,600
-of 6,792 nodes) — reduce nodes or fuse. Placement is settled by the disposition
+of 6,792 nodes) — reduce nodes or fuse; the D8-floor re-run below leaves it
+  the remaining wall. Placement is settled by the disposition
 above (the hybrid; accepted by the operator 2026-10-19); pipelining is closed
 by the measured refutation.
 
@@ -289,6 +290,21 @@ is real but not dominant, the padded **matmul** work is.
   against the 0001-0060 tree and the 0001-0058 tree). The lever is real, the
   fixed cost is explained, and the engine's default now computes the caller's
   frames.
+
+**C4 and B3 on the enlarged D8 set (`measured-here`, 2026-10-19).** The
+operator D8 floors are recorded (milestone §6); the current default (0062,
+`--tts-gen-device cpu`, window 72) re-ran C4 on the enlarged Tatoeba set (46
+sentences / 303 words, manifest `tools/tts_sentences_de.json`,
+CC-BY 2.0 FR): **C4 PASS** — corpus WER **0.0066** (2 errors / 303), worst
+sentence **0.333** (`rechtzeitig fertigmachen` -> `fertig machen`), share
+WER <= 0.10 **97.8 %**. The same gate reports **RTF 0.7995** (177.28 s audio /
+221.745 s process) — **B3 FAIL** against the operator floor RTF >= 1.0: the
+valid-frames default on the enlarged set is 20 % short. The card window: B60
+(PCI `8086:e211`), dev binary `arcint-def-exact` sha256 `be754e8b…`, peak
+resident vram0 2,586 MiB, min physical MemAvailable 52,603 MiB, one
+non-service process per card, sampler on the physical host, `arcint-agent`
+restored, `:8087` health ok. C4's floor is now resolved on the enlarged set;
+the remaining wall is lever (b).
 
 ## Where it lives
 

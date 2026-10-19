@@ -663,6 +663,29 @@ must not move) is unaffected by construction: 0062 changes only the Qwen3-TTS
 `GEN_WAV` graph and the generic gen-audio `out_audio` tail block, and no chat
 path builds it (`code`); a served language arm was not re-run for the patch.
 
+### 9.6 C4 with the D8 floor on the enlarged set (Phase 3/4, 2026-10-19)
+
+The D8 floors are recorded in §6; the C4 re-run on the enlarged Tatoeba set and
+the current default (patch 0062, `--tts-gen-device cpu`, window 72) measured
+(`measured-here`): the B60 (PCI `8086:e211`), dev binary `arcint-def-exact`
+sha256 `be754e8b…` (the source built against the pin + series with the 0062
+default; the D8 commits touch docs and the gate only, no engine source), Q8_0 backbone + bf16 mmproj, the full clone path on `gate-fleurs`, seed
+42, reference sampling, 46 sentences / 303 words (manifest
+`tools/tts_sentences_de.json`, sha256 `e0592aab…`). The gate's speech phase
+times the RTF; the round-trip runs the CPU whisper-server (`-ng`), so only the
+hybrid TTS touches the card.
+
+| item | measured |
+|---|---|
+| C4 (D8 floor 0.10 / 0.5) | **PASS**: corpus round-trip WER **0.0066** (2 errors / 303 words), worst sentence **0.333** (one sentence: `rechtzeitig fertigmachen` -> `rechtzeitig fertig machen`, a compound split counted as two), sentences with WER <= 0.10: **97.8 %** (45 of 46); `codec_eos` sampled, 55-57 frames at the top of the set, no cap |
+| B3 (D8 floor RTF >= 1.0) | **FAIL**: 177.28 s audio / 221.745 s process = **RTF 0.7995** — the valid-frames default on the enlarged set, still 20 % short; the earlier 8-sentence arms (0.729 padded / 0.802 valid) were a shorter set, so the numbers are not comparable |
+| the card window | physical-host sampler: peak resident vram0 **2,586 MiB**, min physical MemAvailable **52,603 MiB**, no watchdog kill; image front released (`released:false`, idle); `arcint-agent` stopped by its unit and restored after 80 s with `:8087` health ok; one non-service process per card; no stale leg driver |
+| the set | `tools/tts_sentences_de.json`: Tatoeba (CC-BY 2.0 FR, attribution), 46 unique German sentences of 5-10 words, 303 words, deterministic selection from the `deu_sentences.tsv.bz2` export (sha256 `ccd06372…`); text is committed, the WAVs and transcripts stay operator-local (the leg's output) |
+
+C4 passes the operator's floor on the enlarged set; B3 stays FAIL and its lever
+(b) (the code predictor, campaign `qwen3tts-card-real-time`) is the next
+measurement. C7 unchanged (`code`): 0062's graph is untouched by this arm.
+
 ## 10. References
 
 - llama.cpp `3e4dfa8`: `tools/mtmd/{mtmd.h,mtmd.cpp,mtmd-image.cpp,

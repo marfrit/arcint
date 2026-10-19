@@ -139,6 +139,12 @@ WER <= the CPU's + 0.005. C5 uses the Seed-TTS-eval WavLM-large SV speaker
 model, calibrated against same-speaker vs cross-speaker recordings
 (`docs/milestone-1.2.0.md` §6/D8).
 
+**Measured on the current default (2026-10-19, `measured-here`):** C4 PASS —
+corpus round-trip WER **0.0066** (2 errors / 303), worst sentence 0.333, share
+WER <= 0.10 97.8 %, on the B60 with the hybrid placement and patch 0062; the
+same arm reports RTF 0.7995, so B3 stays FAIL (`docs/milestone-1.2.0.md` §9.6,
+campaign `qwen3tts-card-real-time`).
+
 ## After a card window
 
 Before a B60 window: release through the front (`POST /release`, check
