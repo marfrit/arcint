@@ -48,8 +48,9 @@ directory exists to prevent.
                           sha256-checked, arcint's patches applied); the
                           pre-tag build takes ARCINT_SRC_TARBALL and warns
                           without a release-tarball sha; no package PR in the
-                          1.2.0 session (D9). Built and verified in the 1.2.0
-                          session (the deb sha is in the handover)
+                          1.2.0 session (D9). The 1.2.0 pre-tag build produced
+                          `arcint-stt_1.2.0-1_amd64.deb` sha256 `93a8a05d…`
+                          (operator-local, not published, not installed)
 
 ## Two things worth knowing before you try
 
