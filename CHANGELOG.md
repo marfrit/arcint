@@ -74,6 +74,16 @@ both are 400 / an error event, and the process serves on.
 Open after the release: the voice-similarity floor (C5) needs the household
 speakers' own recordings, two each; naturalness is judged by ear.
 
+**Published** (2026-10-19): `arcint` 1.2.0-1 and `arcint-stt` 1.2.0-1 built
+by their recipes from the v1.2.0 tag tarball (sha256 `b88acd5d…`) and
+published to the trixie repository (index verified). A fresh trixie
+container installed both from the pool and ran each new service once from
+the shipped unit flags on the B60: an image question ("Cat", and "Paris"
+for text), a WAV in an enrolled voice, and that WAV transcribed back word
+for word. One release build failed the round-trip test's named-lanes
+`/health` check (a sampling race in the test, not the server; the rebuild
+passed, and the check now waits for the whole state).
+
 ## 1.1.1 — 2026-10-18
 
 More image models (`docs/milestone-1.1.1.md`, the units' contract
