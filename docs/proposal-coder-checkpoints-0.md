@@ -1,12 +1,14 @@
 # Unit change proposal — coder: `--llama-checkpoints 0`
 
-Status: **proposal, not applied.** The production unit
-(`arcint-coder-llama.service`) is unchanged as of this writing: it still runs
-without the flag, i.e. checkpoints on (up to 32 a lane, 8192 apart). The
-decision is the operator's. Every number is `measured-here`, 2026-10-20, on
-the coder host's A770 (`card0`, PCI `8086:56a0`, GPU.1), `arcint 1.2.1
-(83d7609)`, sha256 `86b33f88fd4f609a`, model
-`qwen36-coder-iwo3-c5f495ac-shq8.gguf` (`27931997cfeec31f`).
+Status: **applied by the operator, 2026-10-20** (the flag is in
+`arcint-coder-llama.service`'s `ExecStart`; the unit has run with it since
+12:48 UTC and every sampled batch below was taken with it in place). This
+document is the evidence for that change, and it now also records the pass bar
+the operator set on the same day — see "The bar is a MEAN, not a count".
+Every number is `measured-here`, 2026-10-20, on the coder host's A770
+(`card0`, PCI `8086:56a0`, GPU.1), `arcint 1.2.1 (83d7609)`, sha256
+`86b33f88fd4f609a`, model `qwen36-coder-iwo3-c5f495ac-shq8.gguf`
+(`27931997cfeec31f`).
 
 ## The change
 
@@ -67,22 +69,92 @@ pointed at the coder in earnest would raise it by an order of magnitude. The
 flag also frees the host memory the checkpoints held: 62.8 MiB each, up to 32
 a lane.
 
-## The honest limit of the change
+## The bar is a MEAN, not a count (`decision`, operator, 2026-10-20)
 
-**It does not meet the bar the task was set with.** 27 of 30 is not 30 of 30.
-The three losses are the same bug class in its other variants. And 27/30 is
-the best this repository has ever measured for this model at 0.7 — the 0.5.12
-arm got the same 27 at 10/10, 3 at 9.
+The pass bar for the coder service, as the operator set it after seeing this
+batch's spread:
 
-At a true per-run rate p, the probability that all 30 sampled runs score 10/10
-is p^30. At the best measured p ≈ 0.90 that is **4 %**. To pass 30/30 with
-even 50 % confidence needs p ≥ 0.978. No arm in the record — 606 scored runs
-under `~/pruefstand*/logs` plus the tables in `docs/llama-engine.md` — shows
-p anywhere near that at n = 30; the arms that read "all 10/10" did so at n = 9
-or 10, where p = 0.90 already gives a 35-39 % chance of looking perfect. So
-"30 sampled runs, all 10/10" is not a target the sampled task can express for
-this model; it is a demand for p ≈ 1, and the model's own sampled behaviour
-sits at 0.90.
+- **greedy: 5 of 5 runs at 10/10**, and
+- **mean ≥ 9.8 over 30 sampled runs at 0.7**.
+
+The earlier "at least 27 of 30 at 10/10" wording is **dropped**, on this
+session's own measurement: the no-knob anchor scored 26/30 and 25/30 in two
+batches of the same configuration, so a count bar would fail the production
+unit on most measurements of itself. A mean is the right statistic because it
+weights a 0/10 run correctly — see below.
+
+### What the mean bar actually demands (`measured-here`, arithmetic)
+
+Scores are 0–10 over 30 runs, so `mean = (Σ scores)/30`. One zero-score run
+caps the batch mean at `10 × 29 / 30 = 9.667`. **A single 0/10 run makes
+mean ≥ 9.8 arithmetically unreachable**, whatever else happens:
+
+| zeros in the batch | highest mean attainable | mean ≥ 9.8 |
+|---|---|---|
+| 0 | 10.000 | needs ≥ 24 of 30 at 10/10 |
+| 1 | 9.667 | **impossible** |
+| 2 | 9.333 | **impossible** |
+
+So the mean bar is not softer than the count bar — it is a **zero-rate bar**
+wearing a friendlier face. Passing means: no zero-score run in 30, and at
+least 24 of the 30 at 10/10.
+
+### The zero is a different defect from the loop bug
+
+The 9/10 losses are the parser's LF branch spinning (`ZEITLIMIT: Instruktions-
+budget erschoepft`) — a bug in the *generated program's logic*, costing one
+point. The 0/10 runs are **programs that do not parse**: `LADEFEHLER: :50:
+syntax error near 'end'`, `:19: syntax error near 'else'`. Different defect,
+different cost, and under the mean bar it is the one that decides the gate.
+
+Zero-runs at 0.7 are not new to this repository: `docs/llama-engine.md:99-101`
+records the dense 27B sampling `9, 0, 10, 10, 0, 10`, and `:109` records
+builds whose KL agreed to four places scoring `10/10` and `0/10`. The defect
+is the task's, at temperature, not this unit's.
+
+### Production measured against the mean bar
+
+Seven 30-run batches of the shipping configuration (`--llama-checkpoints 0`,
+no sampler knob, thinking off, cap 4,000), same day, same unit:
+
+| batch | mean | ±SE | hist |
+|---|---|---|---|
+| window leg | 9.900 | 0.056 | 27×10, 3×9 |
+| anchor 1 | 9.867 | 0.063 | 26×10, 4×9 |
+| anchor 2 | 9.800 | 0.088 | 25×10, 4×9, 1×8 |
+| mean-bar 1 | 9.900 | 0.056 | 27×10, 3×9 |
+| mean-bar 2 | **9.233** | 0.462 | 25×10, 3×9, **2×0** |
+| zero-rate anchor 1 | 9.833 | 0.061 | 25×10, 5×9 |
+| zero-rate anchor 2 | 9.800 | 0.088 | 25×10, 4×9, 1×8 |
+| **pooled, n = 210** | **9.762** | **0.071** | 180×10, 26×9, 2×8, **2×0** |
+
+**The bar is not established for production as it runs today.** Pooled
+9.762 ± 0.071, 95 % CI [9.62, 9.90] — the bar at 9.8 sits inside that
+interval, so the honest verdict is *not established*, not *failed*. Batch
+means scatter 9.233–9.900 (sd 0.29 between batches, four times the
+within-batch SE), and all of that scatter is the zero-rate.
+
+At the measured rates — zero-rate **0.0095 a run** (2 of 210), perfect-rate
+0.865 among non-zero runs — a batch clears the bar with probability ≈ **0.68**:
+0.75 that no zero appears in 30, times 0.90 that ≥ 24 of them are perfect.
+That second factor is the ceiling: **even with a zero-rate of exactly nil this
+configuration clears the bar only about 90 % of the time.** To clear it 80 %
+of the time the zero-rate must be ≤ 0.0039 a run (1 in 254); it is currently
+1 in 105.
+
+Settling the bar to ±0.03 would take about **1,190 sampled runs** (≈ 40
+batches of 30, ≈ 4.7 h of the unit). Nobody should spend that to argue about
+a tenth of a point; the honest report is the interval above.
+
+### Consequence for the flag under debate
+
+`--llama-checkpoints 0` is **not supported by the mean bar**. Its seven
+batches pool to 9.762; the one pre-change batch measured on this unit
+(checkpoints on) scored 9.833. The difference, 0.071 ± 0.128, is not
+significant — but the flag's justification was greedy 10/10, and the mean bar
+does not contradict that either. The flag is carried for the greedy cell; the
+sampled mean is orthogonal to it and is governed by the zero-rate, which the
+flag does not touch.
 
 Two arms were measured against that demand and both lose:
 
@@ -136,6 +208,20 @@ greedy arm at all — they are levers for the sampled bar only.
 | **`min_p 0.1`, second batch** | **22** | 9.733 | **did not replicate** |
 | **anchor, second batch** | **25** | 9.800 | **beat it** |
 
+Scored against the mean bar instead of a count: `min_p 0.1` pooled over four
+batches (n = 120) gives **9.767 ± 0.089** against production's **9.762 ±
+0.071** — a difference of −0.005 ± 0.114. The knob is neutral on the mean too.
+
+A second hypothesis was formed from this sweep and then killed by its own
+test. `min_p 0.1` had produced **no** zero-score run in its first 60 runs while
+the no-knob arm produced 2 in 150, which under a mean bar is the only
+difference that matters. A balanced design (two batches of each, interleaved,
+`zerorate.sh`) settled it: `min_p 0.1` produced a zero in its fourth batch
+(mean 9.500) and the overall zero-rates came out **0.0095 a run** for no-knob
+against **0.0083 a run** for `min_p 0.1` — 3 zeros in 330 runs, indistinguishable.
+The knob does not suppress the defect. Recorded because the hypothesis was
+reasonable and the check that killed it was cheap.
+
 `min_p 0.1` winning by three runs and then losing by three is the same shape
 the KV-precision A/B has in `docs/llama-engine.md:214-219`: pooling the six
 neutral arms (both anchors, both `min_p`, both `top_k`) gives 180 perfect runs
@@ -150,30 +236,46 @@ line of different programs. Tightening top_p pushes the model into malformed
 control flow, which scores zero instead of nine. So top_p is not neutral here,
 it is harmful; `min_p` and `top_k` are neutral.
 
-**Disposition:** no sampler knob moves the sampled bar. The lever that does
-exist is the one already applied, `--llama-checkpoints 0`.
+**Disposition:** no sampler knob moves the sampled mean. The lever that does
+exist is the one already applied, `--llama-checkpoints 0`, and it moves the
+greedy cell, not the mean.
 
 ## Recommendation
 
-Take the flag for the greedy cell, and treat the sampled criterion as a
-separate decision:
+Under the mean bar the decision splits cleanly, because the two criteria are
+governed by two different defects:
 
-1. **Apply `--llama-checkpoints 0`** if the greedy 10/10 is what the gate
-   checks and 34 s per follow-up is acceptable on this unit. It is free in
-   VRAM and it removes a reproducible defect rather than masking it.
-2. **Do not expect 30/30.** Measured odds at the observed per-run rate
-   (p̂ = 0.857, 180 of 210 sampled runs perfect across the six neutral arms):
-   27/30 in about 36 % of batches, 30/30 in 1 %. To reach 30/30 with even 50 %
-   confidence the per-run rate would have to be 0.977 — no arm in the 606-run
-   record has ever held that. Sampler knobs are now measured and do not get
-   there (§ above); a new quant is the expensive route and the KV evidence
-   says precision is not what moves this score.
-3. **Untouched lever worth one more window** if the sampled number matters
-   more than the 34 s: `--llama-mtp 0` (plain decoding). The record notes the
-   target's greedy text depends on how many rows each verify carries, and the
-   only catastrophic task failure on record (0/10, twice the same bytes) came
-   from a drafter. MTP 0 would be a third batch-layout arm at a decode cost of
-   roughly 70 → 47 t/s on this model.
+1. **Greedy (5 of 5 at 10/10): apply `--llama-checkpoints 0`.** Already in the
+   unit, free in VRAM (+2 MiB), removes a reproducible defect rather than
+   masking it, and costs about 34 s of re-prefill per long follow-up — a small
+   bill on this unit's measured traffic (5 such follow-ups in seven days). The
+   mean bar neither supports nor contradicts it.
+2. **Sampled mean >= 9.8: not established, and no knob found here establishes
+   it.** Production pools to 9.762 +/- 0.071 over 210 runs. Sampler knobs are
+   measured and neutral (`min_p`, `top_k`) or harmful (`top_p`). The bar's
+   binding constraint is the **zero-rate** — 1 run in 105 emits Lua that does
+   not parse — and its ceiling: P(>= 24 perfect) = 0.90 even at a zero-rate of
+   nil. State the bar with its measured probability (about 0.68 of a batch) or
+   move the model; do not treat 9.8 as a property of this configuration.
+3. **The lever the mean bar points at, and it is not a card lever.** Removing
+   the two zeros from those same batches lifts the mean from 9.762 to **9.856
+   +/- 0.026**, clearing the bar with the interval off it. That is reachable
+   only by rejecting an unparseable answer and regenerating it: a syntax guard
+   (`luac5.4 -p` is on the host, and `pruefstand.lua` proves the same thing by
+   loading the file) in front of the coder, not inside the engine. Price: one
+   extra generation in about 1 in 105 requests, roughly 7 s. **This is a
+   conflict between a measured gain and a DESIGN invariant, so it is the
+   operator's call, not mine**: a retry loop in the served path changes what
+   the service promises about determinism, and the answer-level bar judges
+   correctness at the answer, which such a guard would be intervening in. Not
+   built, not claimed done — recorded as the only measured route to 9.8.
+4. **`--llama-mtp 0` is now the weakest candidate, not the strongest.** It was
+   listed as the untouched lever while the count bar was in force. Under the
+   mean bar the zeros dominate, and `docs/llama-engine.md:440-444` records a
+   drafter producing 0/10 twice with the same bytes, so MTP 0 might reduce
+   them — but the zeros seen here are syntax errors at :19/:50/:60 in the
+   middle of a program, not drafter artefacts, and the arm costs a card window
+   plus 70 -> 47 t/s. Spend it only for the batch-layout measurement itself.
 
 ## Reproduce
 

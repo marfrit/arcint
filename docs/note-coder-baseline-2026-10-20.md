@@ -1,10 +1,17 @@
 # Note — coder baseline on the live production unit (2026-10-20)
 
-Task: the operator's acceptance bar for the coder service is **10/10** —
-greedy (T=0) AND 30 sampled runs at temperature 0.7. This note records the
-baseline that bar is measured against, taken on the running production unit
-with no card window and no change to the unit. Everything here is
-`measured-here`.
+Task: the acceptance bar for the coder service. **As revised by the operator
+on 2026-10-20, after this note's first draft:** greedy **5 of 5 runs at
+10/10**, and **mean ≥ 9.8 over 30 sampled runs at 0.7**. The wording this note
+originally carried — 10/10 greedy *and* 30 sampled runs at 10/10 — is
+**superseded**, and so is the intermediate "at least 27 of 30 at 10/10": the
+same configuration measured 26/30 and 25/30 in two batches, so a count bar
+fails the production unit on most measurements of itself. A mean weights a
+0/10 run correctly, which is what the sampled task actually turns on
+(`docs/proposal-coder-checkpoints-0.md`, "The bar is a MEAN, not a count").
+This note records the baseline that bar is measured against, taken on the
+running production unit with no card window and no change to the unit.
+Everything here is `measured-here`.
 
 ## What was measured
 
@@ -192,21 +199,26 @@ the correct parser, five times identically (475 tokens every run). That is
 `docs/llama-engine.md`'s 0.5.12 observation — 9 against 10, "one case flipping
 with the batch layout" — reproduced two engine versions later on 1.2.1.
 
-**What it does not do.** The sampled bar is not met: 27 of 30, not 30 of 30.
-The three losses are the same bug class (two `einfach CRLF`, one `nur LF`), and
-the 8/10 outlier is gone. 27/30 equals the best the record has for this model
-at 0.7 (0.5.12: 27 at 10/10, 3 at 9).
+**What it does not do, under the mean bar.** The baseline's 30 sampled runs
+mean **9.833**; the flag's mean **9.900**. Both clear 9.8, and both did so in
+the batches where no zero-score run appeared — which is the whole story. See
+"The bar is a MEAN, not a count" in
+`docs/proposal-coder-checkpoints-0.md`: one 0/10 run caps a 30-run mean at
+9.667, so the bar is decided by the zero-rate, not by the loop bug this flag
+fixes. Five batches of the flag's configuration pool to **9.740 ± 0.097**
+(2 zeros in 150), i.e. the bar is **not established** for production.
 
-**And the bar itself deserves a number.** At a true per-run rate p, the chance
+**And the count form of the bar deserves a number** (kept, because the same
+arithmetic carries to the mean bar). At a true per-run rate p, the chance
 that all 30 sampled runs score 10/10 is p^30. The best measured arms sit at
 p ≈ 0.90, where p^30 ≈ 4 %; 26/30 and 27/30 are what p ≈ 0.90 looks like, not
 what p = 1 looks like. Asking for 30/30 at 0.7 asks for p ≥ 0.90 once and
 p ≥ 0.99 to be dependable, and no arm in this repository's record — 606 scored
 runs in `~/pruefstand*/logs`, plus the tables in `docs/llama-engine.md` — has
 shown that at n = 30. The arms that read "all 10/10" did so at n = 9 or n = 10,
-where p = 0.90 gives a 35-39 % chance. So the bar is either a statement about
-greedy (which `--llama-checkpoints 0` now meets) or it is a demand for a
-sampling regime no measured arm reaches.
+where p = 0.90 gives a 35-39 % chance. The revised mean bar avoids that
+particular trap (it does not demand p = 1) but replaces it with a stricter one
+elsewhere: it forbids zero-score runs entirely.
 
 ## What was not tried, and why
 
