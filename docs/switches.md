@@ -9,7 +9,7 @@ Tuning, off-switch, red-case and diagnostic switches are for measuring and
 may change or go without notice.
 
 A switch here is an environment variable read by arcint, by one of its tools,
-or by the llama.cpp patch series in `contrib/llama.cpp/patches` (0001-0062,
+or by the llama.cpp patch series in `contrib/llama.cpp/patches` (0001-0063,
 without the dropped 0031, 0055 and 0061). Switches the pinned llama.cpp tree reads by itself
 (`GGML_OPENCL_PLATFORM`, `GGML_OPENCL_FUSE_RMS_ADD`, `GGML_OPENCL_F16_MROW` and
 the others in upstream's `ggml-opencl.cpp`) are upstream's and not listed;
@@ -98,8 +98,8 @@ Four names are not in a table:
 | `GGML_OPENCL_PAIR_ORDER` | 1 | Order of a verify's expert pairs: 1 bank pairs first, 2 last, 0 token order. | 0022 | 30.7 t/s first, 29.8 token order, 29.3 last (Flash-Next MTP 2, B60, `measured-here`). |
 | `LLAMA_EXPERT_CACHE_ADAPT_EVERY` | 6 | Decode tokens between adapt rounds; 0 never adapts. | 0021 | Hit rate 89.9-90.7 % across the constants (`measured-here`). |
 | `LLAMA_EXPERT_CACHE_DECAY` | 0.7 | Decay of the routing counts at each adapt. | 0022 | Same. |
-| `LLAMA_EXPERT_CACHE_CPU_MISS_THREADS` | 8 | Threads of the CPU miss path (the coordinator and its workers). | 0056 | 6 lower, 10 and 12 as 8 (`measured-here`). |
-| `GGML_OPENCL_CPU_MISS_MAX` | 16 | Missed pairs a decode layer hands to the CPU; the card reads the rest over the link. | 0056 | 2 / 4 / 8 / 16 / 24 / 32: +4.2 / +8.5 / +11.3 / +13.4 / below 16 (`measured-here`). |
+| `LLAMA_EXPERT_CACHE_CPU_MISS_THREADS` | 8 | Threads of the CPU miss path (the coordinator and its workers). | 0056 | 6 lower, 10 and 12 as 8; with 0063 and the cap at 64 on UD-Q3_K_XL 12 as 8, 16 slower (13.4 against 16.7 t/s: the pool competes with the decode's 8 threads) (`measured-here`). |
+| `GGML_OPENCL_CPU_MISS_MAX` | 64 (16 before 0063) | Missed pairs a decode layer hands to the CPU; the card reads the rest over the link. From 40 on every miss of a verify window (10 experts x <= 4 tokens). | 0056, 0063 | Under 0056's rows 2 / 4 / 8 / 16 / 24 / 32: +4.2 / +8.5 / +11.3 / +13.4 / below 16; with 0063's rows 16 / 32 / 64 on IQ3_XXS 36.1 / 37.7 / 37.9 t/s, on UD-Q3_K_XL 12.5 / - / 16.7, 128 = 64 (`measured-here`). |
 | `LLAMA_EXPERT_CACHE_MAX_SWAPS` | 96 | Largest swaps a plan makes; 0 is the discriminator in the swap-queue measurement. | 0022 | Same. |
 | `LLAMA_EXPERT_CACHE_MIN_GAIN` | 1.5 | Least gain for a swap. | 0022 | Same. |
 | `LLAMA_EXPERT_CACHE_MIN_USAGE` | 2.0 | Least usage for a swap. | 0022 | Same. |

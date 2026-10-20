@@ -80,6 +80,10 @@ the RAM for its bank (DESIGN §7.2).
 
 ## Current numbers
 
+1.2.1 (2026-10-20, `measured-here`, the pre-tag package, the B60): Flash-Next
+IQ3_XXS decodes 38.1 t/s on six answers (1.2.0: 33.9), prefill 622 t/s at
+20k, KL 0.217 against Q8_0, the answers right; the other services as below.
+
 1.2.0's release check (2026-10-19, `measured-here`, the pre-tag packages,
 `docs/milestone-1.2.0.md` §9.11): the agent and the coder alternated with
 1.1.1's binary are equal to it (709.4 / 498.9 t/s at 55k / 138k on the B60;
