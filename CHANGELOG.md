@@ -18,6 +18,39 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.2.1 — 2026-10-20
+
+Flash-Next decodes faster: the expert cache's CPU miss path gets Strata's
+multi-token rows for the remaining expert types, and every miss of a verify
+window goes to the CPU.
+
+- **0063** (`contrib/llama.cpp/README.md`): Strata's multi-token AVX2 rows
+  (`src/kernels/cpu/iq_avx2.cpp`) for IQ2_XS, IQ3_XXS, IQ3_S and IQ4_NL, so
+  every layer of the served Flash-Next GGUFs takes the fast path (before,
+  only layers whose three projections were IQ2_S, IQ2_XXS or Q2_0 did; the
+  rest ran ggml-cpu's single-token dot products). `GGML_OPENCL_CPU_MISS_MAX`
+  defaults to 64 (was 16): with 10 experts a token and at most 4 tokens a
+  verify window that is every miss on the CPU, as Strata does.
+
+**Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (60
+patches, 0001-0063 without 0031, 0055 and 0061); dependencies as in 1.2.0.
+`arcint-stt` (1.2.0) and `arcint-imggen` (1.1.1) are unchanged.
+
+**Release check** (`measured-here`, 2026-10-20, the B60, the pre-tag
+package with the Flash-Next unit's flags): IQ3_XXS decodes **38.08 / 38.02
+t/s** on six answers (1.2.0: 33.85 / 33.87), prefill 622 t/s at 20k, KL as
+served 0.2173 against Q8_0 (1.2.0: 0.2191), Paris and the needle right.
+Measured the evening before on dev builds (Flash-Next campaign, stage 10):
+each kernel equal to ggml-cpu's dot product on test data and 1.8-2.9x
+faster at four tokens; the old path forced back on the patched build at the
+baseline (so the gain is the new rows); UD-Q3_K_XL 12.5 -> 16.7 t/s, below
+the operator's 20 t/s line for switching quants, so IQ3_XXS stays. The
+other services do not use the miss path (`code`); their 1.2.0 checks stand.
+A byte tripwire, reported: three of IQ3_XXS's eight answers change wording,
+and the forced-old-path control also differs from the base build, so the
+difference is not only the new rows; not explained; the answers and the KL
+are right.
+
 ## 1.2.0 — 2026-10-19
 
 Voice and vision (`docs/milestone-1.2.0.md`, the units' contract
