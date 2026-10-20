@@ -1,3 +1,14 @@
+arcint (1.2.1-1) trixie; urgency=medium
+
+  * 1.2.1: patch 0063, the expert cache's CPU miss path with Strata's
+    multi-token rows for IQ2_XS, IQ3_XXS, IQ3_S and IQ4_NL (before: IQ2_S,
+    IQ2_XXS and Q2_0 only), and GGML_OPENCL_CPU_MISS_MAX 16 -> 64 (every
+    miss of a verify window on the CPU). Flash-Next IQ3_XXS decodes 37.9
+    against 33.9 t/s on six answers, KL unchanged. 60 patches. The other
+    services' paths are unchanged. Dependencies unchanged.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Tue, 20 Oct 2026 01:00:00 +0200
+
 arcint (1.2.0-1) trixie; urgency=medium
 
   * 1.2.0: images in, speech in and out (docs/milestone-1.2.0.md): the

@@ -16,7 +16,7 @@
 > Qwen3.8-Flash-Next (512-expert MoE on one card plus host RAM), plus
 > Cydonia 24B (llama architecture) for writing. One engine: libllama
 > (llama.cpp at pinned commit 3e4dfa8) with ggml's OpenCL backend and
-> arcint's Intel kernel series (contrib/llama.cpp/patches, 0001-0062
+> arcint's Intel kernel series (contrib/llama.cpp/patches, 0001-0063
 > without 0031, 0055 and 0061).
 > arcint owns the HTTP surface, chat templates, tool calls, the sampler,
 > named lanes, MTP speculative decoding, context checkpoints and the expert
@@ -25,6 +25,10 @@
 
 ## Status
 
+- Version 1.2.1 (2026-10-20): patch 0063, the expert cache's CPU misses
+  with Strata's multi-token rows for IQ2_XS, IQ3_XXS, IQ3_S and IQ4_NL and
+  every miss of a verify window on the CPU (GGML_OPENCL_CPU_MISS_MAX 64):
+  Flash-Next IQ3_XXS 33.9 -> 37.9 t/s decode, KL unchanged.
 - Version 1.2.0 (2026-10-19): voice and vision (docs/milestone-1.2.0.md,
   docs/speech-service.md), three on-demand units on the B60: arcint-vlm
   :8083 (Qwen2.5-VL-7B, image_url data: URIs, --mmproj), arcint-tts :8084

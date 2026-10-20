@@ -3861,3 +3861,49 @@ Sub-real-time still: it is lever (a), not B3. `0062` applies cleanly on the
 Evidence class: `measured-here`. The campaign is
 `docs/campaigns/qwen3tts-card-real-time.md`; the milestone record is
 `docs/milestone-1.2.0.md` §9.5.
+
+## 0063-opencl-intel-cpu-miss-rows.patch
+
+0056's CPU half of the expert cache's miss path had Strata's multi-token
+AVX2 rows for IQ2_S, IQ2_XXS and Q2_0 only, and a layer takes that fast path
+only when all three of its projections do (`code`): every layer of the
+served Flash-Next GGUFs with an IQ2_XS, IQ3_XXS, IQ3_S or IQ4_NL projection
+(the IQ3_XXS file's IQ3_S, IQ3_XXS, IQ2_XS gate/up and IQ4_NL down layers;
+all of UD-Q3_K_XL's) ran ggml-cpu's single-token dot products instead. The
+patch ports Strata's rows for those four (`src/kernels/cpu/iq_avx2.cpp`,
+MIT): IQ2_XS (its own loop, two 4-bit sub-scales) and IQ3_S from the bank's
+planes, IQ3_XXS from GGUF blocks (the bank keeps it so), IQ4_NL from its split
+bank (scales and quants as two arrays over the whole tensor) through a new
+entry point with Q8_0 activations quantized as ggml-cpu's AVX2
+`quantize_row_q8_0` does; a per-type block constant (0.125 for the IQ2 types,
+0.25 IQ3_XXS, 1.0 IQ3_S); single-token loops shaped like ggml's AVX2 ones
+for IQ3_XXS and IQ3_S, where the multi-token form lost at one token. The
+caller sends an IQ4_NL split bank to the new entry and aborts on an unsplit
+one at the first miss (every USM IQ4_NL tensor is split when written, so it
+would be a bank not yet filled), and the generic entry aborts on a type it
+has no field table for. `GGML_OPENCL_CPU_MISS_MAX` defaults to 64 (16 before):
+with 10 experts a token and at most 4 tokens a verify window that is every
+miss on the CPU, Strata's design.
+
+Kernels (`measured-here`, Zen 3, -O3, one 2560 x 640 matrix, one thread):
+each equal to ggml-cpu's `vec_dot` on `ggml_quantize_chunk` weights for nt
+1..8, both layouts and an odd-block slice (max error 0 observed; the tests'
+gate is a 1e-4 tolerance), activations byte-identical to ggml's
+`from_float`; deliberate mutations (signs, a scale, the qh bit, nibble
+order) fail; at four tokens 2.48x (IQ2_XS), 2.86x (IQ3_XXS), 2.71x (IQ3_S),
+1.77x (IQ4_NL) ggml's time, at one token 1.00-1.04x. Reviewed by a second
+model (kernels, then the caller: one fix, the unsplit-bank guard now aborts
+instead of falling back to a path that would read the split arrays as blocks).
+
+Served (`measured-here`, the B60, Flash-Next with the unit's flags, arcint
+v1.2.0 built against the tree without and with the patch, the six answers'
+mean decode): IQ3_XXS 33.85 / 33.87 -> 36.13 / 36.08 t/s at the old cap 16,
+37.73 at 32, 37.93 at 64; the old path forced on the patch build
+(`GGML_OPENCL_CPU_MISS_MT=0`, the red case: the new rows off) 32.83; KL as
+served at ubatch 4 0.2178 / 89.66 % against 0.2191 / 89.56 %; prefill 621
+t/s in every arm; Paris and the needle in every run. UD-Q3_K_XL 12.48 ->
+12.55 at cap 16, 16.68 at 64 and at 128. A byte tripwire: three of
+IQ3_XXS's eight answers change wording with the patch, and the forced-old-
+path control differs from the base build in four, so the difference is not
+only the new rows; not explained, reported (the answers and KL are right).
+
