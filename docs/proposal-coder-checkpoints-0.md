@@ -308,6 +308,87 @@ it is harmful; `min_p` and `top_k` are neutral.
 exist is the one already applied, `--llama-checkpoints 0`, and it moves the
 greedy cell, not the mean.
 
+## The bar is inside the noise of one measurement of it (`measured-here`)
+
+Five independent 30-run batches at 0.7 of **one and the same configuration**
+(the shipped unit, `--llama-checkpoints 0`, no sampler knob):
+
+| batch | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| mean | 9.900 | 9.233 | 9.900 | 9.800 | 9.867 |
+| at 10/10 | 27 | 25 | 27 | 25 | 26 |
+| zeros | 0 | 2 | 0 | 0 | 0 |
+
+Batch-mean SD **0.286**. So a single 30-run measurement of the production unit
+carries a 90 % interval of **± 0.47** around its own mean, and the bar 9.8
+sits well inside it: two of these five batches pass, one (9.233) misses by
+half a point, and nothing about the unit changed between them. The spread is
+the zero mode arriving or not arriving in a given batch, which is what a
+30-run batch is a draw from.
+
+Runs per arm needed for 80 % power at alpha = 0.1, computed from these SDs
+(`measured-here`, arithmetic on the measured variance):
+
+| to detect | per arm |
+|---|---|
+| 0.30 points of mean | 383 |
+| 0.20 points | 862 |
+| zero-rate 0.95 % -> 0.30 % | 1817 |
+| zero-rate 0.95 % -> 0.00 % | 647 |
+
+At 30 runs per arm the 90 % interval is ± 0.47; at 300, ± 0.15. **A 30-run
+arm cannot rank two configurations of this unit at the resolution the bar is
+set at**, and a 60-run arm cannot either (± 0.33). Any A/B proposed against
+this bar must say how many runs it needs, or it measures nothing.
+
+This also settles the shape of the bar itself. As written ("mean >= 9.8 over
+30 sampled runs"), the production unit fails it about 1 time in 3 measured
+batches of the configuration that currently meets the greedy half. Either
+state the bar with its probability ("mean >= 9.8 with the 90 % interval off
+it", which needs ~300 runs), or set it where one batch can decide it.
+
+## What this does to the quant A/B that was proposed
+
+The proposed design — arm Q = `qwen36-coder-Q8_0.gguf` on the A770 with
+CPU-MoE offload, arm S = production shq8, 60 runs each at 0.7, decide the
+lever on a Fisher test at p < 0.1 — cannot answer the question it asks. Three
+independent reasons, each checked:
+
+1. **Power.** With production's measured zero-rate of 0.95 %, the proposed
+   rule has power 0.00 at 60 runs per arm and 0.02 at 150 (simulation, 6000
+   draws). Even a quant that removed the zero mode entirely needs ~650 runs
+   per arm to show it at p < 0.1. The test would come back "no difference"
+   whatever the truth, and that "no difference" would be read as a verdict.
+2. **The arm is not the same deployment.** `qwen36-coder-Q8_0.gguf` is
+   25.99 GiB; expert bodies are 91 % of its weight bytes (23.68 GiB), and the
+   A770 has 17.08 GB. Serving it means `--llama-cpu-moe` moving ~10 GiB of
+   experts to host memory — a 5700X, 8 cores, against production's all-on-card
+   path. The reference for that route is `measured-here`: 14.6 t/s on the same
+   CPU family at 26k (`docs/campaigns/research-hybrid-expert-execution.md:270`)
+   against the 70 t/s production decodes at. So arm Q would change the
+   quantization AND the execution route AND the decode speed by ~5x, in one
+   arm. A difference could not be attributed to the quant.
+3. **The prior art already covers the axis, and its own confound runs the
+   other way.** `docs/llama-engine.md:596-620` (`measured-here`, 2026-10-05)
+   searched `c5f495ac` *against the Q8_0 logits*: Q8_0 is the KL and top-1
+   reference there (c5f495ac KL 0.02305 / top-1 95.33 %, shq8 0.02367 /
+   95.43 %, Q4_K_M 0.02374 / 95.53 %). Its answer-level column reads c5f495ac
+   9/10 at T=0, shq8 10/10, Q4_K_M 10/10 — quant flipping a deterministic
+   answer without moving KL. But that table predates 83814b3 (2026-10-16, the
+   drafter's state through checkpoints) and was recorded in b642716, the same
+   commit that introduced `--llama-checkpoints` with default 32 — so that
+   table ran with checkpoints ON, the configuration this proposal shows scores
+   9/10 at T=0. Its per-GGUF differences are therefore partly the checkpoint
+   configuration, not the quant.
+
+What would settle the quant question, if it is to be run: the same execution
+route in both arms. The A770 cannot hold all-Q8_0 at 98,304 tokens, so the
+fair comparison is on the B60 (24 GiB, and `arcint-flashnext` currently holds
+it), or at a context short enough that both quants sit on one card. And the
+number of runs has to come from the table above, not from a budget: ~380 per
+arm to move the mean by 0.3, which at 7 s a run is 45 minutes of serving per
+arm on a card that is not the production card.
+
 ## Recommendation
 
 Under the mean bar the decision splits cleanly, because the two criteria are
