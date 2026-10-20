@@ -677,7 +677,8 @@ t/s on its own request and prefills 620 t/s at the 20k needle
 (`measured-here`, 2026-10-14); arcint 43.8-44.0 and 690 on the same
 request and needle with the CPU misses (charter B3).
 
-**Quality**: Flash-Next's default IQ3_XXS has KL 0.218 nats and top-1
+**Quality**: Flash-Next's default since 2026-10-20, IQ3_S, has KL 0.127 nats and top-1 92.1 %
+against unsloth's Q8_0 as served (§7.2). The previous default IQ3_XXS has KL 0.218 nats and top-1
 89.7 % against unsloth's Q8_0 (16 x 512), IQ2_XS 0.294 / 87.1 %; both are
 outside the answer-level bar, a shortfall the operator accepted (A2,
 2026-10-15), and IQ3_XXS became the default for its accuracy the same day.
