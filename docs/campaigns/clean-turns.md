@@ -142,3 +142,39 @@ one.
 - Step 0 done (this note).
 - Step 1 in progress.
 - Steps 2-3 not started.
+
+## Step 1 measured at the endpoint (before any code change)
+
+Probe: `tools/think_eog_probe.py` (arms in words only; every control token
+assembled from parts, none in the file). Run against the **already running**
+coder unit on the A770 — no card window, no build, one process already on the
+card. `measured-here`:
+
+- The mention mechanism does **not** reproduce on the coder artifact: asked to
+  produce a control token as text, it *spells it as text* (48 arms: the marker
+  appears in the output text, the turn does not end there). The substitution
+  was observed on the dense/Flash-Next family, which is the B60 and out of
+  scope for this branch.
+- The **empty stop itself reproduces reliably on the coder artifact**, and its
+  mechanism is simpler than the mention story: with `max_tokens` 4096 and the
+  prompt "Reply with an empty answer.", the turn ends at the model's
+  end-of-generation token **while the think block is still open** —
+  `finish=stop`, content 0 characters, ~600 characters of reasoning, no tool
+  call, 2/2 arms at T=0 and T=0.7. With `max_tokens` 64 the same shape comes
+  back as `length`, which is why the earlier arms hid it.
+- With tools declared (the shape of a real agent turn): 10/16 turns produced a
+  tool call, 3 answered, 3 ended empty at the token cap. No empty stop there.
+
+So the mask's target is not only "the model mentions the marker" but the
+general case: **the end-of-generation token wins a step in which the think
+block has not been closed**. That is the same six turns in the baseline and
+the same shape this session suffered three times while working on it.
+
+## Step 1 design (rewritten after the measurement)
+
+Mask, in the sampler, the ids that end generation, plus a second opening
+think-tag, while a think block is open. The block is open when the template
+opened it, or when the model wrote an opener of the family; it closes on that
+family's closer. `max_tokens` and the lane's context stay the only exits.
+
+Default off (current behaviour), on by request field and by operator flag.
