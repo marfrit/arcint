@@ -687,8 +687,9 @@ The other quants are options (§7.2). The dense agent's q8_0:q4_0 KV: KL 0.00565
 
 ### 7.2 Flash-Next quant options
 
-IQ3_XXS is the default (operator, 2026-10-15, for its accuracy; IQ2_XS was
-the shape until then); the others stay available as on-demand configurations
+IQ3_S is the default since 2026-10-20 (the operator's rule: the better quant if
+it reaches 20 t/s on 1.2.1); IQ3_XXS was, from 2026-10-15, for its accuracy, and
+IQ2_XS before; the others stay available as on-demand configurations
 on the same endpoint (`decision`, operator, 2026-10-15; `docs/llama-engine.md`,
 "Flash-Next quant options"):
 
