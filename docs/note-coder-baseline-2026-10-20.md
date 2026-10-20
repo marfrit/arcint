@@ -15,7 +15,7 @@ Everything here is `measured-here`.
 
 ## What was measured
 
-Arm: `arcint-coder-llama.service` on the coder card host (container `dirac`,
+Arm: `arcint-coder-llama.service` on the coder card host (a container,
 image `arcint-coder:latest`), model
 `/models/gguf/iwolucion-v3/qwen36-coder-iwo3-c5f495ac-shq8.gguf`
 (14,611,874,464 bytes, SHA-256 `27931997cfee…`), flags

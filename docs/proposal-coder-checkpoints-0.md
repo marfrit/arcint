@@ -459,14 +459,14 @@ decode speed in one arm. Reopening it means removing that confound first.
 
 1. **Same engine, both quants, no offload in either arm.** Not arcint on the
    A770 — it cannot hold the 25.99 GiB Q8_0 at any useful context. The place
-   is **`bosch`, the DGX Spark (ASUS Ascent GX10, GB10 Grace Blackwell,
+   is **a DGX Spark (ASUS Ascent GX10, GB10 Grace Blackwell,
    compute capability 12.1, 20-core aarch64, 121 GiB unified memory),
    llama.cpp built with CUDA** (`~/src/llama.cpp-latest` is there; a
    `-DGGML_CUDA=ON -DGGML_CUDA_F16=ON -DCMAKE_CUDA_ARCHITECTURES=121` recipe
    already exists on that host, fleet record 2026-09-09, `code`). Both files
    fit there outright — Q8_0 25.99 GiB, shq8 13.59 GiB — so both arms run
    all-on-card, same route, same link, differing only in the bytes. Neither
-   coder GGUF is on `bosch` yet; they would have to be copied (26 + 14 GiB).
+   coder GGUF is on the Spark yet; they would have to be copied (26 + 14 GiB).
 2. **Run count taken from the power simulation, targeting power ≥ 0.8 at
    α = 0.1.** The originally proposed 60/arm had power 0.000; **750/arm
    reaches only 0.26** — nowhere near enough. Simulated (Fisher exact on the
@@ -675,7 +675,7 @@ governed by two different defects:
    left with evidence behind it is a different model or a different quant at
    the same deployment — and the quant axis is closed above, on grounds of
    power and confound, with the cost of reopening it stated there (same engine
-   on `bosch`, ~2800 runs per arm for power ≥ 0.8). The bar is now a
+   on the Spark, ~2800 runs per arm for power ≥ 0.8). The bar is now a
    non-inferiority rule and production is **not failed** under it, so none of
    this is outstanding work. Not built, not claimed done.
 4. **`--llama-mtp 0` is now the weakest candidate, not the strongest.** It was
