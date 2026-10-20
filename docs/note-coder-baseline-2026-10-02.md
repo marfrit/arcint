@@ -159,3 +159,77 @@ Production traffic is not the acceptance cell: the journal shows the unit
 serving agentic conversations (prefill 24,069 / 26,871 / 32,480 tokens,
 decode up to 10,482 tokens, cache hits 88-94 %), i.e. multi-turn with long
 replies. The acceptance cell is a single 282-token turn with thinking off.
+
+## The `--llama-checkpoints 0` window (2026-10-20, `measured-here`)
+
+Card window on the coder host, 10:32-10:47 UTC, SOP followed: sampler started
+before the leg and anchored to `^/usr/bin/arcint ` plus a `--llama-checkpoints 0`
+substring (the flash-next unit on the other card holds fds on **both** render
+nodes, so a bare anchor charges its memory to this arm — that is what the
+substring is for); seat line with the card by PCI id (`card0` = `8086:56a0` =
+GPU.1); binary named with its sha256 (`arcint 1.2.1 (83d7609)`,
+`86b33f88fd4f609a`); unit stopped, arm run as one process, unit restored,
+release line with the process count.
+
+Arm: the unit's flags exactly, plus `--llama-checkpoints 0`, port 8095,
+`--n-ctx 98304 --llama-mtp 4 --llama-kv q8_0:q4_0`. Load log confirms the
+arm: no checkpoint line at all, where the unit logs
+`context checkpoints: up to 32 a lane, 8192 tokens apart`.
+
+| arm | T=0 (5 runs) | 30 runs at 0.7 | mean | decode | peak VRAM |
+|---|---|---|---|---|---|
+| the unit, checkpoints on | 0 of 5 at 10/10 (all 9/10) | 26 at 10/10, 3 at 9, 1 at 8 | 9.833 | 72.5 t/s | 15,877 MiB |
+| `--llama-checkpoints 0` | **5 of 5 at 10/10** | 27 at 10/10, 3 at 9 | 9.900 | 70.3 t/s | 15,879 MiB |
+
+Prefill 935 t/s at 282 tokens (the unit: 440 t/s cold, 4,400 warm). Peak VRAM
+15,879 MiB, GTT 32 MiB, host RSS 711 MiB, MemAvailable never under 90,967 MiB.
+Nothing paged; the arm costs 2 MiB more than the unit.
+
+**The greedy cell flips and it reproduces.** Thinking off, same GGUF, same
+flags: with checkpoints on the model emits the parser with the missing advance
+in the bare-LF branch, five times identically; with checkpoints off it emits
+the correct parser, five times identically (475 tokens every run). That is
+`docs/llama-engine.md`'s 0.5.12 observation — 9 against 10, "one case flipping
+with the batch layout" — reproduced two engine versions later on 1.2.1.
+
+**What it does not do.** The sampled bar is not met: 27 of 30, not 30 of 30.
+The three losses are the same bug class (two `einfach CRLF`, one `nur LF`), and
+the 8/10 outlier is gone. 27/30 equals the best the record has for this model
+at 0.7 (0.5.12: 27 at 10/10, 3 at 9).
+
+**And the bar itself deserves a number.** At a true per-run rate p, the chance
+that all 30 sampled runs score 10/10 is p^30. The best measured arms sit at
+p ≈ 0.90, where p^30 ≈ 4 %; 26/30 and 27/30 are what p ≈ 0.90 looks like, not
+what p = 1 looks like. Asking for 30/30 at 0.7 asks for p ≥ 0.90 once and
+p ≥ 0.99 to be dependable, and no arm in this repository's record — 606 scored
+runs in `~/pruefstand*/logs`, plus the tables in `docs/llama-engine.md` — has
+shown that at n = 30. The arms that read "all 10/10" did so at n = 9 or n = 10,
+where p = 0.90 gives a 35-39 % chance. So the bar is either a statement about
+greedy (which `--llama-checkpoints 0` now meets) or it is a demand for a
+sampling regime no measured arm reaches.
+
+## What was not tried, and why
+
+`--llama-kv q8_0:q8_0` was the other planned lever and was **not** run. The
+arm's own buffers put its price in range — KV 780 MiB at `q8_0:q4_0` against
+1,201 MiB of VRAM headroom, so raising V costs roughly +220 MiB and fits — but
+`docs/llama-engine.md` already ran the KV-precision A/B on this task at 30 runs
+per arm (q8_0 15 of 30, mean 7.4; f16 19 of 30, mean 8.13, at `--n-ctx 65536`)
+and recorded that the gap is under one standard error and reverses in a second
+batch. Spending a second window on a lever the record already showed cannot
+separate the task, when the measured failure is a dropped statement in a
+branch, is not the next thing to do. Recorded as not tried, not as verified
+against.
+
+## Where the effect actually is
+
+Three arms on one battery, one variable each, all `measured-here`:
+
+| change | greedy | sampled at 0.7 |
+|---|---|---|
+| baseline (unit as configured) | 9/10 | 26 of 30 |
+| checkpoints off (batch layout) | 10/10 | 27 of 30 |
+| thinking on (`enable_thinking: true`, cap 16,000) | 10/10 | see below |
+
+The two things that move this score are where the prefill batches break and
+whether the model reasons before writing. Neither is a precision knob.
