@@ -93,7 +93,7 @@ eight interleaved batches of the shipping configuration, n = 240, mean 9.771:
 | 240 | 0.976 (pooled per-run) | 0.063 | **9.874** | **not failed** |
 | 240 | 1.210 (batch-implied, overdispersed) | 0.078 | **9.899** | **not failed** |
 | 90 | 0.976 | 0.103 | 9.940 | not failed |
-| 30 (one batch) | 0.976 | 0.178 | 10.064 | not failed |
+| 30, the worst batch measured (9.233) | 0.976 | 0.178 | 9.526 | would fail on its own — which is why the rule sets a 90-run floor |
 
 Both SDs clear it, the conservative one by 0.10. The greedy half is met
 outright (5/5 at 10/10, three times running). **The coder unit passes the bar
@@ -110,9 +110,9 @@ drops under 9.8, for a given true mean:
 | 9.80 | never | never |
 
 And the protection it buys: the worst batch measured in this session, 9.233,
-would have failed the unit under a naive per-batch reading (its own upper 95 %
-bound is 9.53–9.60, under the bar). Under the rule as set it cannot, because
-the floor is 90 pooled runs.
+would fail the unit under a naive per-batch reading (its own upper 95 % bound
+is 9.53 pooled, 9.60 overdispersed — well under the bar). Under the rule as
+set it cannot, because the floor is 90 pooled runs.
 
 ## The bar is a MEAN, not a count (`decision`, operator, 2026-10-20)
 
