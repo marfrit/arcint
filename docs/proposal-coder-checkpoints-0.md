@@ -181,7 +181,12 @@ hypothesis for a future arm, not as a finding.
 ### Production measured against the mean bar
 
 Seven 30-run batches of the shipping configuration (`--llama-checkpoints 0`,
-no sampler knob, thinking off, cap 4,000), same day, same unit:
+no sampler knob, thinking off, cap 4,000), same day, same unit. (An eighth
+batch of the same configuration ran later, interleaved with the
+system-message arms; the eight pooled are tabulated in "The shipped
+configuration, pooled over eight interleaved batches" below, and supersede
+the pooled figure here. The zero-rate quoted here, 1 in 105, becomes 1 in 120
+over the eight.)
 
 | batch | mean | ±SE | hist |
 |---|---|---|---|
@@ -216,9 +221,9 @@ a tenth of a point; the honest report is the interval above.
 
 ### Consequence for the flag under debate
 
-`--llama-checkpoints 0` is **not supported by the mean bar**. Its seven
-batches pool to 9.762; the one pre-change batch measured on this unit
-(checkpoints on) scored 9.833. The difference, 0.071 ± 0.128, is not
+`--llama-checkpoints 0` is **not supported by the mean bar**. Its eight
+batches pool to 9.771 (CI [9.64, 9.87]); the one pre-change batch measured on
+this unit (checkpoints on) scored 9.833. The difference, 0.062 ± 0.128, is not
 significant — but the flag's justification was greedy 10/10, and the mean bar
 does not contradict that either. The flag is carried for the greedy cell; the
 sampled mean is orthogonal to it and is governed by the zero-rate, which the
@@ -311,7 +316,9 @@ greedy cell, not the mean.
 ## The bar is inside the noise of one measurement of it (`measured-here`)
 
 Five independent 30-run batches at 0.7 of **one and the same configuration**
-(the shipped unit, `--llama-checkpoints 0`, no sampler knob):
+(the shipped unit, `--llama-checkpoints 0`, no sampler knob) — the first five
+of the eight tabulated later; the eight give SD 0.221, the five 0.286, and the
+conclusion is the same either way:
 
 | batch | 1 | 2 | 3 | 4 | 5 |
 |---|---|---|---|---|---|
@@ -319,27 +326,33 @@ Five independent 30-run batches at 0.7 of **one and the same configuration**
 | at 10/10 | 27 | 25 | 27 | 25 | 26 |
 | zeros | 0 | 2 | 0 | 0 | 0 |
 
-Batch-mean SD **0.286**. So a single 30-run measurement of the production unit
-carries a 90 % interval of **± 0.47** around its own mean, and the bar 9.8
-sits well inside it: two of these five batches pass, one (9.233) misses by
-half a point, and nothing about the unit changed between them. The spread is
-the zero mode arriving or not arriving in a given batch, which is what a
-30-run batch is a draw from.
+Batch-mean SD **0.286** over these five, **0.221** over all eight. So a single
+30-run measurement of the production unit carries a 90 % interval of
+**± 0.36–0.47** around its own mean, and the bar 9.8 sits well inside it: two
+of these five batches pass, one (9.233) misses by half a point, and nothing
+about the unit changed between them. The spread is the zero mode arriving or
+not arriving in a given batch, which is what a 30-run batch is a draw from.
 
-Runs per arm needed for 80 % power at alpha = 0.1, computed from these SDs
-(`measured-here`, arithmetic on the measured variance):
+Runs per arm needed for 80 % power at alpha = 0.1, computed from the measured
+variance (`measured-here`, arithmetic). Two SDs are given: the pooled per-run
+SD of the 240-run histogram (**0.976**), and the larger SD implied by the
+between-batch scatter (**1.21**, i.e. treating the batch-to-batch excess as
+real overdispersion). The honest column is the second:
 
-| to detect | per arm |
-|---|---|
-| 0.30 points of mean | 383 |
-| 0.20 points | 862 |
-| zero-rate 0.95 % -> 0.30 % | 1817 |
-| zero-rate 0.95 % -> 0.00 % | 647 |
+| to detect | per arm (pooled SD) | per arm (batch-implied SD) |
+|---|---|---|
+| 0.30 points of mean | 131 | 201 |
+| 0.20 points | 295 | 453 |
+| 0.15 points | 524 | 806 |
+| 0.10 points | 1178 | 1813 |
+| zero-rate 0.83 % → 0.30 % | 2473 | — |
+| zero-rate 0.83 % → 0.00 % | 741 | — |
 
-At 30 runs per arm the 90 % interval is ± 0.47; at 300, ± 0.15. **A 30-run
-arm cannot rank two configurations of this unit at the resolution the bar is
-set at**, and a 60-run arm cannot either (± 0.33). Any A/B proposed against
-this bar must say how many runs it needs, or it measures nothing.
+At 30 runs per arm the 90 % interval is ± 0.36–0.47; at 300, ± 0.11–0.15.
+**A 30-run arm cannot rank two configurations of this unit at the resolution
+the bar is set at**, and a 60-run arm cannot either (± 0.26–0.33). Any A/B
+proposed against this bar must say how many runs it needs, or it measures
+nothing.
 
 This also settles the shape of the bar itself. As written ("mean >= 9.8 over
 30 sampled runs"), the production unit fails it about 1 time in 3 measured
@@ -354,10 +367,13 @@ CPU-MoE offload, arm S = production shq8, 60 runs each at 0.7, decide the
 lever on a Fisher test at p < 0.1 — cannot answer the question it asks. Three
 independent reasons, each checked:
 
-1. **Power.** With production's measured zero-rate of 0.95 %, the proposed
-   rule has power 0.00 at 60 runs per arm and 0.02 at 150 (simulation, 6000
-   draws). Even a quant that removed the zero mode entirely needs ~650 runs
-   per arm to show it at p < 0.1. The test would come back "no difference"
+1. **Power.** With production's measured zero-rate of 0.83 %, the proposed
+   rule has power 0.000 at 60 runs per arm, 0.005 at 150, 0.05 at 300 and
+   0.26 at 750 (simulation, 8000 draws, α = 0.1). Even a quant that removed
+   the zero mode **entirely** needs ~740 runs per arm to show it at p < 0.1.
+   The mean is no better a detector of it: a zero costs 9.77 points of a
+   30-run batch's total, so 0.83 % → 0.30 % lifts the mean by 0.05 points,
+   which needs ~4,400 runs per arm. The test would come back "no difference"
    whatever the truth, and that "no difference" would be read as a verdict.
 2. **The arm is not the same deployment.** `qwen36-coder-Q8_0.gguf` is
    25.99 GiB; expert bodies are 91 % of its weight bytes (23.68 GiB), and the
@@ -385,9 +401,94 @@ What would settle the quant question, if it is to be run: the same execution
 route in both arms. The A770 cannot hold all-Q8_0 at 98,304 tokens, so the
 fair comparison is on the B60 (24 GiB, and `arcint-flashnext` currently holds
 it), or at a context short enough that both quants sit on one card. And the
-number of runs has to come from the table above, not from a budget: ~380 per
-arm to move the mean by 0.3, which at 7 s a run is 45 minutes of serving per
-arm on a card that is not the production card.
+number of runs has to come from the table above, not from a budget: ~200–450
+per arm to move the mean by 0.2–0.3, which at 7 s a run is 25–55 minutes of
+serving per arm on a card that is not the production card. **The operator
+closed this axis on 2026-10-20: not run.**
+
+## The prompt lever, measured — no gain (`measured-here`)
+
+Four arms, 30 runs each, **round-robin interleaved** so any drift across the
+hour hits every arm equally, temp 0.7, thinking off, cap 4,000, live
+production unit, no card window (a `system` message is honoured by the engine:
+`src/core/chat.cpp:14` admits `system`/`developer`, `chat.cpp:483` renders it;
+a live probe returned the instructed token). Driver
+`~/wp/coder-quality/accept-sys.py`, logs `sys-screen.log`, files `out-sys/`.
+
+| arm | system message | mean | at 10/10 | zeros | syntax-bad | Python-ism | comment-run ≥ 5 |
+|---|---|---|---|---|---|---|---|
+| anchor | none | 9.833 | 26 | 0 | 0 | 0 | 1 |
+| neutral | "Du bist ein hilfreicher Assistent…" | 9.933 | 28 | 0 | 0 | 0 | 2 |
+| short | finished runnable Lua, no planning comments, no placeholders, no `pass`/`elif`/`None` | 9.867 | 27 | 0 | 0 | 0 | 1 |
+| strict | answer **only** with a complete Lua program in one code block, no planning text, no comment blocks, no placeholders, no Python syntax, write out every branch | 9.500 | 25 | **1** | **1** | 0 | **0** |
+
+Read it honestly: **nothing here is a lever.** The spread across four arms
+(9.500–9.933) is smaller than the spread of repeated batches of one
+configuration (9.233–9.900), the ordering is not monotone in instruction
+strength, and `neutral` — an instruction with no content relevant to the
+defect — beats the two arms that name it. The one zero sits in the strictest
+arm, and Fisher on 1/30 against 0/30 is p = 1.0: it licenses no claim either
+way. The paired proxy that the cause analysis predicted would move — the
+comment-run signature — does move in the intended direction (`strict` 0 runs
+with ≥ 5 consecutive comment lines, the only arm with none), but the zero it
+produced is **not** the Python-ism mode:
+
+```
+luac5.4: out-sys/strict-15.lua:73: '::' expected near 'end'
+```
+
+The answer used `goto continue_loop` and wrote the label as `::continue_loop`
+without the closing `::`. That is a Lua slip in a construct the passing
+answers also use, with no comment block and no Python-ism in sight. So
+suppressing the digression signature did not remove a zero; it coincided with
+a different one. The zero mode is not one defect with one cause reachable
+from the prompt.
+
+**Decision (operator, 2026-10-20): client-side only.** arcint stays as it is;
+whatever a caller wants in a `system` message is the caller's business. The
+engine's behaviour is unchanged, nothing is injected into the served path, and
+no client of the coder service gets a new sentence it did not ask for.
+
+## Decisions on the record (operator, 2026-10-20)
+
+| question | decision | what it means |
+|---|---|---|
+| the mean bar | **state it probabilistically** | a single 30-run batch is a draw, not a verdict; report the batch scatter with the number |
+| the system message | **client-side only** | arcint unchanged, nothing injected in the served path |
+| syntax guard + regenerate | **rejected** | no retry loop in the served path; the determinism promise stands as written |
+| the proposed quant A/B | **dropped, axis closed** | not run; see the power and confound arguments above |
+| the 2026-10-05 quant table | **annotate the confound** | done in `docs/llama-engine.md`, no re-measurement |
+
+The rejection of the syntax guard matters for how the remaining gap is read:
+the one intervention that cleared the bar with its interval off it
+(9.856 ± 0.026) is off the table **by choice, not by measurement**. The bar is
+then met or missed by the model and its configuration alone, and on the
+numbers below that is a coin that lands roughly two times in three.
+
+## The shipped configuration, pooled over eight interleaved batches (`measured-here`)
+
+Eight 30-run batches at 0.7 of the shipping configuration (`--llama-checkpoints
+0`, no sampler knob, thinking off, cap 4,000), all measured interleaved with
+other arms so no batch sits at a special time of day:
+
+| batch | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| mean | 9.900 | 9.900 | 9.233 | 9.867 | 9.800 | 9.833 | 9.800 | 9.833 |
+| at 10/10 | 27 | 27 | 25 | 26 | 25 | 25 | 25 | 26 |
+| zeros | 0 | 0 | 2 | 0 | 0 | 0 | 0 | 0 |
+
+- pooled **n = 240**, mean **9.771**, histogram 206×10, 29×9, 3×8, 2×0
+- perfect-rate 85.8 %, **zero-rate 0.83 %** (1 in 120)
+- pooled binomial SE 0.063 → 90 % CI **[9.667, 9.874]**
+- between-batch SE 0.078 → 90 % CI **[9.642, 9.899]**
+- 7 of 8 batches reach 9.8; the eighth is the one where two zeros landed
+- simulation of the pooled per-run distribution: **P(a 30-run batch clears
+  9.8) = 0.65**
+
+So the bar is unresolved in the only sense the word has here: the interval
+contains 9.8, the point estimate is below it by half an SE, and a single
+batch of it passes about two thirds of the time. Anyone reporting this unit as
+"meets 9.8" or "misses 9.8" from one 30-run measurement is reporting noise.
 
 ## Recommendation
 
@@ -399,36 +500,35 @@ governed by two different defects:
    masking it, and costs about 34 s of re-prefill per long follow-up — a small
    bill on this unit's measured traffic (5 such follow-ups in seven days). The
    mean bar neither supports nor contradicts it.
-2. **Sampled mean >= 9.8: not shown to be met, and no knob found here meets
-   it.** Production pools to 9.762 ± 0.071 over 210 runs — within one SE of
-   the bar, so the bar is unresolved rather than missed. Ranked by the cause
-   the mean bar actually sees, `top_p` raises the syntax-zero rate twelve-fold
-   (p = 0.0003) and `min_p`/`top_k` are indistinguishable from no knob. The
-   bar's binding constraint is the **zero-rate** — 1 run in 105 emits Lua that
-   does not parse — and its ceiling: P(>= 24 perfect) = 0.90 even at a
-   zero-rate of nil. State the bar with its measured probability (about 0.68
-   of a batch) or move the model; do not treat 9.8 as a settled property of
-   this configuration.
-3. **The lever the cause analysis points at.** The zero mode is now known
-   mechanically: with thinking off the model renders its reasoning as comment
-   blocks inside the CR/LF branch and then emits the Python statement `pass`
+2. **Sampled mean >= 9.8: not shown to be met, and no lever found here meets
+   it.** Eight interleaved batches pool to **9.771** over 240 runs, 90 % CI
+   [9.64, 9.87] — the bar sits inside the interval, so the bar is unresolved
+   rather than missed. Ranked by the cause the mean bar actually sees,
+   `top_p` raises the syntax-zero rate twelve-fold (p = 0.0003),
+   `min_p`/`top_k` are indistinguishable from no knob, and a `system` message
+   aimed straight at the defect shows no gain (above). The bar's binding
+   constraint is the **zero-rate** — 1 run in 120 emits Lua that does not
+   parse — and its ceiling: P(>= 24 perfect) = 0.90 even at a zero-rate of
+   nil. Stated probabilistically as the operator chose: this configuration
+   clears 9.8 in about **0.65 of 30-run batches**.
+3. **The levers that remain are the model and the task, not the serving
+   path.** The zero mode is known mechanically in one of its forms: with
+   thinking off the model renders its reasoning as comment blocks inside the
+   CR/LF branch and then emits the Python statement `pass`
    (`mb-2-08.lua:59`: `pass -- placeholder, will rewrite below`). Nothing in
-   the sampler touches that — and the measurement agrees: no knob lowers the
-   syntax-zero rate, `top_p` raises it. Two routes, both the operator's call:
-   - **Reject and regenerate.** A syntax guard in front of the coder
-     (`luac5.4 -p` is on the host; `pruefstand.lua` proves the same thing by
-     loading the file). Removing the two zeros from the same batches lifts the
-     mean from 9.762 to **9.856 ± 0.026**, clearing the bar with the interval
-     off it, at one extra generation in ~1 in 105 requests (~7 s). **A retry
-     loop in the served path conflicts with what the service promises about
-     determinism**, so per AGENTS.md rule 8 this is not mine to take.
-   - **Say it in the prompt.** The task text is the yardstick and must not
-     change, but a system message is honoured by the engine
-     (`src/core/chat.cpp:14` admits `system`/`developer`). "Lua only, no
-     Python statements" targets the exact defect. Untested, and it changes
-     what every client of the service gets, so it is a service-level decision,
-     not a measurement to slip in.
-   Not built, not claimed done.
+   the sampler touches that, and the measurement agrees: no knob lowers the
+   syntax-zero rate, `top_p` raises it, and a `system` message that names
+   `pass`, `elif` and `None` by name does not lower it either — the one zero
+   it produced was a Lua label written without its closing `::`, a second
+   defect with a different signature. Of the two routes that looked live:
+   **reject-and-regenerate is refused** (operator: the determinism promise
+   stands, no retry loop in the served path) and **the system message is
+   client-side only** (operator: arcint injects nothing). What is left with
+   evidence behind it is a different model or a different quant at the same
+   deployment — and the quant axis is closed above, on grounds of power and
+confound. State the bar probabilistically and re-measure it at the run count
+   the resolution demands, or accept the unit at 0.65 of batches. Not built,
+   not claimed done.
 4. **`--llama-mtp 0` is now the weakest candidate, not the strongest.** It was
    listed as the untouched lever while the count bar was in force. Under the
    mean bar the zeros dominate, and `docs/llama-engine.md:440-444` records a
@@ -445,4 +545,10 @@ arm's own flag substring — the flash-next unit on the other card holds fds on
 both render nodes, so a bare anchor misattributes its memory). Logs in
 `out-ckpt0b/`; the thinking arms are `think-t0.log`, `think-t07.log` and
 `accept-think.py` in the same directory. `base-t0.log` and `base-t07.log` are
-the baseline.
+the baseline. The sampler-knob arms are `sweep-sampler.log`, `repl-minp.log`
+and `zerorate.log` (driver `accept-extra.py`, knobs passed per request through
+`frage-extra.py`'s `EXTRA`). The system-message arms are `sys-screen.log` with
+`out-sys/` (driver `accept-sys.py`, request builder `frage-sys.py`, arms in
+the `ARMS` variable of `sys-screen.sh`); it scores every run in-process and
+carries the `syntax` / `pyism` / `comment_run` proxies per run. `aufgabe.txt`
+is a symlink to the untouched yardstick in `~/pruefstand`.
