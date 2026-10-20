@@ -1846,3 +1846,31 @@ GiB, the coder serving throughout. **UD-Q3_K_XL tops out at ~16.7 t/s with
 changed.** IQ3_XXS's own gain (33.9 -> 36.1 t/s, 37.9 with the cap at 64,
 KL unchanged) is a candidate for a 1.2.1 package (0063 + the cap), the
 operator's to decide.
+
+### Stage 11 — IQ3_S on 1.2.1: the production quant (2026-10-20)
+
+The next candidate after UD-Q3_K_XL (operator, relayed): ISTA-DASLab's
+GSQ-RCO IQ3_S, IQ3_XXS's sibling (`paper`: an independent measurement
+against BF16 on three texts put its KL 35-45 % below IQ3_XXS's). Fetched
+through the fleet's model fetcher with the token, both shards sha256 = the
+HF LFS oids; shard 2 (the 26.82 GiB n-gram table) has the same oid as
+IQ3_XXS's, so it was copied from that mirror and is linked on the NVMe, and
+the MTP head too (`code`, the manifest). Its experts are 46.84 GiB (IQ3_XXS
+39.97), the card-side weights 0.37 GiB larger, so the slots go to 11,600 MiB
+to keep IQ3_XXS's VRAM peak (`code`, the GGUF header; gate/up IQ2_S / IQ3_S /
+IQ3_XXS with one IQ4_XS layer, down IQ4_NL / Q2_0: all on 0063's rows but
+the IQ4_XS layer).
+
+Measured (`measured-here`, the B60, the 1.2.1 package with the unit's flags,
+two fresh processes, the page cache cold): decode on the six answers 33.33 /
+33.30 t/s (IQ3_XXS 38.08 / 38.02 on the same package), prefill 535.5 t/s at
+the 20k needle (622), VRAM peak 23,478 MiB without eviction (GTT at the
+bank's size), bank 36.06 GiB; KL as served against Q8_0 0.1269 (ubatch 4) /
+0.1267 (512), top-1 92.11 / 92.01 % (IQ3_XXS 0.2173 / 0.2188, 89.6 %); Paris
+and the needle, the two runs byte-identical. Above the operator's 20 t/s
+line, so IQ3_S is the production quant: the unit points at it with 11,600
+MiB of slots, started once through systemd (40 s, Paris). IQ3_XXS stays on
+the NVMe as the rollback. The served KL (0.127) is still above the
+answer-level bar against Q8_0, as every quant that fits this host is; the
+operator accepted that shortfall for the default in 0.7.x (A2).
+

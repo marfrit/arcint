@@ -695,8 +695,9 @@ on the same endpoint (`decision`, operator, 2026-10-15; `docs/llama-engine.md`,
 | GGUF | KL / top-1 against unsloth's Q8_0 on the CPU (16 x 512) | host bank | state |
 |---|---|---|---|
 | ISTA-DASLab IQ2_XS | 0.294 / 87.1 % | 20.32 GiB at 13,400 MiB of slots | the faster option, from the Flash-Next unit with its own `--gguf` and slot budget: 665.6 t/s at the 20k needle, 42.3 t/s |
-| ISTA-DASLab IQ3_XXS | 0.218 / 89.7 % (served) | 28.72 GiB at 12,000 MiB of slots | the default (`arcint-flashnext`): 595.1 t/s at the 20k needle, 34.5-35.6 t/s on the hash-table answer (0.8.0), 30.6-37.5 t/s on six answers with the CPU misses; their KL cost +0.0044 nats against the misses off on the served reference capture (8 x 512, ubatch 4: 0.2910 / 0.2866), a different window from this column's (`measured-here`, 2026-10-15) |
-| unsloth UD-Q3_K_XL | 0.100 / 93.3 % | ~39 GiB | inside the bar; needs the planned 96 GB host |
+| ISTA-DASLab IQ3_XXS | 0.218 / 89.7 % (served) | 28.72 GiB at 12,000 MiB of slots | the default until 2026-10-20, the rollback (38.0 t/s on 1.2.1; `arcint-flashnext`): 595.1 t/s at the 20k needle, 34.5-35.6 t/s on the hash-table answer (0.8.0), 30.6-37.5 t/s on six answers with the CPU misses; their KL cost +0.0044 nats against the misses off on the served reference capture (8 x 512, ubatch 4: 0.2910 / 0.2866), a different window from this column's (`measured-here`, 2026-10-15) |
+| ISTA-DASLab IQ3_S | 0.127 / 92.1 % (served, 1.2.1) | 36.06 GiB at 11,600 MiB of slots | **the default since 2026-10-20** (`arcint-flashnext`; operator's rule: the better quant if >= 20 t/s on 1.2.1): 33.3 t/s on six answers, 535 t/s at the 20k needle, VRAM peak 23,478 MiB; shard 2 (the n-gram table) is IQ3_XXS's, byte-identical (`measured-here`) |
+| unsloth UD-Q3_K_XL | 0.100 / 93.3 % (served 0.107 / 92.7 %) | 40.29 GiB at 9,000 MiB of slots | 16.7 t/s at best on 1.2.1, below the operator's 20 t/s line (`measured-here`, 2026-10-19) |
 
 ### 7.3 Retractions
 

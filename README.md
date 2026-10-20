@@ -62,7 +62,7 @@ tag [`openvino-history`](https://github.com/marfrit/arcint/tree/openvino-history
 |---|---|---|---|---|
 | agent | Qwen3.8-27B (`qwen35`, dense, 64 layers, MTP layer) | Q4_K_M GGUF | Arc Pro B60 | 245,760 tokens, q8_0:q4_0 KV, MTP 5 |
 | coder | Qwen3.6-27B-A3B-Coder (`qwen35moe`, 184 experts, MTP layer) | a searched per-layer quant mix (14.6 GB) | Arc A770 | 98,304 tokens, q8_0:q4_0 KV, MTP 4 |
-| Flash-Next | Qwen3.8-Flash-Next (`qwen4exp`, 125B-A6B, 512 experts, n-gram table) | ISTA-DASLab's IQ3_XXS GGUF (IQ2_XS as the faster option) through an expert cache: the hot experts in VRAM, the rest in host RAM, read over the link or computed on the CPU; its MTP layer from the checkpoint | Arc Pro B60 + host RAM, on demand | 131,072 tokens, q8_0 KV, MTP 3 |
+| Flash-Next | Qwen3.8-Flash-Next (`qwen4exp`, 125B-A6B, 512 experts, n-gram table) | ISTA-DASLab's IQ3_S GGUF since 2026-10-20 (IQ3_XXS and IQ2_XS as the faster options) through an expert cache: the hot experts in VRAM, the rest in host RAM, read over the link or computed on the CPU; its MTP layer from the checkpoint | Arc Pro B60 + host RAM, on demand | 131,072 tokens, q8_0 KV, MTP 3 |
 | writer | Cydonia 24B v4.3 (Mistral Small 3.2, `llama`) | imatrix Q4_K_M | Arc Pro B60, on demand | 98,304 tokens, q8_0 KV |
 | images | Z-Image Turbo (6B DiT) with the Qwen3-4B-Instruct-2507 encoder and the FLUX autoencoder | Q8_0 GGUFs, `ae.safetensors` | Arc Pro B60, on demand | 1024x1024, 8 steps |
 | images, lettering | Qwen-Image (20B MMDiT) with the Qwen2.5-VL-7B encoder and the Wan VAE | Q4_K_M GGUFs | Arc Pro B60, on demand | 1024x1024, 20 steps |
