@@ -102,6 +102,57 @@ Two arms were measured against that demand and both lose:
   about +220 MiB), but it is recorded as **not tried**, not as verified
   against.
 
+## Sampler knobs at the card temperature — measured, no lever found
+
+The next lever the operator named: `min_p`, `top_p`, `top_k`, one variable per
+arm, 30 sampled runs at 0.7 each. No card window: arcint reads all three
+**per request** (`src/core/chat.cpp:142-147`), so the knob rides in the request
+body and the unit is never touched.
+
+**A check that can fail first: are the knobs honoured at all?** Two probes,
+`wp/coder-quality/honour.py` (`measured-here`):
+
+- **Parse probe.** A mistyped value must be refused. `top_k: "not-a-number"`
+  → `HTTP 400 top_k must be an integer`; likewise `top_p` and `min_p`. A key
+  that was being ignored would have answered 200, and every arm built on it
+  would have been the baseline wearing a hat.
+- **Degenerate-limit probe.** `top_k=1`, `min_p=0.99` and `top_p=1e-6` each
+  collapse the distribution to the argmax, so a sampled request must reproduce
+  the greedy answer byte for byte. All three did, **3/3 each**.
+
+One structural fact from the code: `sampler.cpp:100` returns the argmax
+**before** any knob runs when temperature is 0. These knobs cannot move the
+greedy arm at all — they are levers for the sampled bar only.
+
+| arm, 30 runs at 0.7 | at 10/10 | mean | what broke |
+|---|---|---|---|
+| anchor, no knob | 26 | 9.867 | 3× `nur LF`, 1× `einfach CRLF` |
+| `min_p 0.05` | 27 | 9.600 | one 0/10 (Lua syntax error) |
+| `min_p 0.1` | **29** | 9.967 | looked best |
+| `top_p 0.9` | 21 | 8.467 | 4× 0/10 |
+| `top_p 0.95` | 22 | 7.933 | 6× 0/10 |
+| `top_k 20` | 26 | 9.867 | same as anchor |
+| `top_k 40` | 25 | 9.800 | same as anchor |
+| **`min_p 0.1`, second batch** | **22** | 9.733 | **did not replicate** |
+| **anchor, second batch** | **25** | 9.800 | **beat it** |
+
+`min_p 0.1` winning by three runs and then losing by three is the same shape
+the KV-precision A/B has in `docs/llama-engine.md:214-219`: pooling the six
+neutral arms (both anchors, both `min_p`, both `top_k`) gives 180 perfect runs
+of 210, p̂ = 0.857, and the spread of a 30-run arm at that rate is ±1.9 runs —
+so a three-run gap is noise. At p̂ = 0.857 the odds of any arm reaching 27/30
+are 36 %, of 30/30 1.0 %.
+
+**Why top_p collapses is worth recording — it is not the loop bug.** The 0/10
+runs under `top_p 0.9/0.95` are syntactically invalid Lua:
+`LADEFEHLER: :19: syntax error near 'else'` in six of seven cases, at the same
+line of different programs. Tightening top_p pushes the model into malformed
+control flow, which scores zero instead of nine. So top_p is not neutral here,
+it is harmful; `min_p` and `top_k` are neutral.
+
+**Disposition:** no sampler knob moves the sampled bar. The lever that does
+exist is the one already applied, `--llama-checkpoints 0`.
+
 ## Recommendation
 
 Take the flag for the greedy cell, and treat the sampled criterion as a
@@ -110,12 +161,13 @@ separate decision:
 1. **Apply `--llama-checkpoints 0`** if the greedy 10/10 is what the gate
    checks and 34 s per follow-up is acceptable on this unit. It is free in
    VRAM and it removes a reproducible defect rather than masking it.
-2. **Do not expect 30/30.** If the bar is really "30 sampled runs at 0.7, all
-   10/10", the measured options are: accept 27/30 as this model's ceiling on
-   this task, raise the sampling temperature's floor by a sampler change
-   (`--min-p`, `--top-p`, `--top-k` are all available and untested on this
-   battery), or move to a different model. A new quant is the expensive route
-   and the KV evidence says precision is not what moves this score.
+2. **Do not expect 30/30.** Measured odds at the observed per-run rate
+   (p̂ = 0.857, 180 of 210 sampled runs perfect across the six neutral arms):
+   27/30 in about 36 % of batches, 30/30 in 1 %. To reach 30/30 with even 50 %
+   confidence the per-run rate would have to be 0.977 — no arm in the 606-run
+   record has ever held that. Sampler knobs are now measured and do not get
+   there (§ above); a new quant is the expensive route and the KV evidence
+   says precision is not what moves this score.
 3. **Untouched lever worth one more window** if the sampled number matters
    more than the 34 s: `--llama-mtp 0` (plain decoding). The record notes the
    target's greedy text depends on how many rows each verify carries, and the
