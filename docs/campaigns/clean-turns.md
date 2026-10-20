@@ -178,3 +178,51 @@ opened it, or when the model wrote an opener of the family; it closes on that
 family's closer. `max_tokens` and the lane's context stay the only exits.
 
 Default off (current behaviour), on by request field and by operator flag.
+
+## Step 1 landed (unit level) — `code` + `measured-here` (device-free suite)
+
+What the switch does, in one sentence: while a think block is open, the ids
+that end generation are not offered, and neither is a second opener.
+
+Where each part lives:
+
+| part | file |
+|---|---|
+| the tag family, as one accessor (`think_tag_pairs`) | `src/core/reasoning.{h,cpp}` |
+| the mask itself (`mask_illegal_while_thinking`, applied before the penalties and before greedy) | `src/core/sampler.{h,cpp}` |
+| the params, the request field `think_eog_mask`, the operator flag `--think-eog-mask`, `/props` | `src/core/sampling.{h,cpp}`, `src/core/chat.cpp`, `src/config.{h,cpp}`, `src/api/handlers.cpp` |
+| which ids to mask, read from the vocabulary at load | `src/exec/backend_llama.cpp` (`eog_ids_`, `prepare_think_mask`) |
+| the block's state fed to the sampler in all three llama decode loops (plain, multimodal, spec/verify) | same file, at each `on_piece` |
+
+Three decisions worth keeping:
+
+- **The mask is in the sampler, not `is_stop`.** Masking the logits keeps the
+  invariant that the token the loop sees is a token that was legal; a filter in
+  the stop check would let the turn-ender be sampled, spend a step and its
+  probability mass, then be ignored.
+- **Nothing outside `reasoning.cpp` writes a tag out.** The ids come from
+  `llama_tokenize` over the table's own strings (`Tokenizer::special_ids`),
+  the end-of-generation set from `llama_vocab_is_eog` over the whole
+  vocabulary — the same predicate `is_stop` asks, so the two cannot drift.
+  During this work a version that composed tag strings from characters in a
+  test and in the probe looped on itself; that is the defect this campaign
+  tracks, reproduced in the tooling, and the accessor is the fix for it.
+- **The lead rule is one-sided.** Before the block's opening is settled the
+  mask engages as soon as the generation's lead matches an opener *or could
+  still grow into one*, and lets go only when the lead has provably become
+  something else. Masking the turn-ender for the two or three tokens of a
+  partial opener costs nothing; releasing a turn the client still reads as
+  reasoning is the defect.
+
+Evidence at unit level (`measured-here`, device-free build, 194 cases green):
+the red case fails without the switch and passes with it — with the mask off a
+row whose argmax is the turn-ending id ends the turn inside an open block; with
+it on the same row samples the next token. Nine further cases cover the closer
+clearing the mask, a closer split across two emitted pieces, a closer inside
+one long piece, an opener at the lead engaging it, a quoted opener later *not*
+engaging it, and the mask-off row being untouched. `tests/roundtrip.sh` checks
+the flag reaches `/props`.
+
+Not yet shown, and it is the gate: the same red case **at the endpoint on the
+served coder unit**, which needs the llama build of this branch (a card window,
+`docs/sop-card-window.md`). Until that pair exists the step is not closed.

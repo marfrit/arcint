@@ -202,6 +202,11 @@ std::string usage_text() {
         "                            temperature, as llama.cpp (0 disables)\n"
         "  --repetition-penalty X    default repetition penalty\n"
         "  --presence-penalty X      default presence penalty\n"
+        "  --think-eog-mask          while a think block is open, do not offer the\n"
+        "                            turn-ending token: a turn cannot then end with no\n"
+        "                            answer inside an unfinished block. Off keeps the\n"
+        "                            behaviour of every build up to this one; a request\n"
+        "                            may set the same thing as think_eog_mask\n"
         "  --chat-template-kwarg enable_thinking=BOOL\n"
         "                            template default when the request sends neither\n"
         "                            chat_template_kwargs.enable_thinking nor\n"
@@ -449,6 +454,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             double d = 0.0;
             if (!value(v) || !parse_double(v, d)) return fail("--presence-penalty needs a number");
             cfg.presence_penalty = static_cast<float>(d);
+        } else if (arg == "--think-eog-mask") {
+            cfg.think_eog_mask = true;
         } else if (arg == "--chat-template-kwarg") {
             if (!value(v)) return fail("--chat-template-kwarg needs key=value");
             const std::string_view kv = v;
@@ -680,6 +687,7 @@ std::optional<std::string> apply_operator_defaults(const Config& cfg, SamplerDef
     o.min_p              = cfg.min_p;
     o.repetition_penalty = cfg.repetition_penalty;
     o.presence_penalty   = cfg.presence_penalty;
+    if (cfg.think_eog_mask) o.think_eog_mask = true;
     return sampler_defaults_apply(d, o);
 }
 

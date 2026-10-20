@@ -499,6 +499,10 @@ json props(const Context& ctx) {
           {"min_p", sd.min_p},
           {"repetition_penalty", sd.repetition_penalty},
           {"presence_penalty", sd.presence_penalty},
+          // clean-turns: whether the think-block mask is on for requests that
+          // send nothing. /props says what the server is running with, so a
+          // turn that ends differently than yesterday's is explained here.
+          {"think_eog_mask", sd.think_eog_mask},
           {"provenance", sd.provenance}}},
         {"slots",
          {{"total", slots_total(ctx)},
@@ -673,6 +677,10 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
     // split of reasoning from content below follows that, not a guess.
     prep.think_open = prompt.ends_with("<think>\n");
     prep.think_tags_extended = ctx.backend->status().think_tags_extended;
+    // The backend has to know the same thing: its mask engages before the first
+    // sample, where the API's reasoning split has not seen a token yet.
+    prep.input.think_open          = prep.think_open;
+    prep.input.think_tags_extended = prep.think_tags_extended;
     // The rendered prompt is the one thing that decides what the model saw.
     // When an answer differs from a reference run this is the first question,
     // and reconstructing it after the fact is guesswork (§3.7).

@@ -3,6 +3,7 @@
 #include "util/text.h"
 
 #include <iterator>
+#include <vector>
 
 namespace lgc {
 namespace {
@@ -33,6 +34,15 @@ bool could_open(std::string_view lead, bool extended) {
     return false;
 }
 
+// The pairs as owning strings, for callers outside this file. Same table, so
+// the mask and the split cannot disagree about what a block looks like.
+std::vector<std::pair<std::string, std::string>> build_pairs(bool extended) {
+    std::vector<std::pair<std::string, std::string>> out;
+    for (size_t i = 0; i < n_tags(extended); ++i)
+        out.emplace_back(std::string(kTags[i].open), std::string(kTags[i].close));
+    return out;
+}
+
 std::string_view strip_edge_newlines(std::string_view s) {
     while (!s.empty() && s.front() == '\n') s.remove_prefix(1);
     while (!s.empty() && s.back() == '\n') s.remove_suffix(1);
@@ -43,6 +53,14 @@ std::string_view strip_leading_newlines(std::string_view s) {
     return s;
 }
 }  // namespace
+
+const std::vector<std::pair<std::string, std::string>>& think_tag_pairs(bool extended) {
+    // Built once per shape and handed out by reference: a caller that needs a
+    // tag asks for it here rather than writing one.
+    static const std::vector<std::pair<std::string, std::string>> all  = build_pairs(true);
+    static const std::vector<std::pair<std::string, std::string>> qwen = build_pairs(false);
+    return extended ? all : qwen;
+}
 
 ReasoningSplit split_reasoning(std::string_view raw, bool think_open, bool extended_tags) {
     ReasoningSplit out;

@@ -32,6 +32,22 @@ public:
     // Records a token the model actually generated.
     void observe(int token);
 
+    // clean-turns: the think-block mask. `start_in_think_block` says whether
+    // the template opened the block before the first token (the ChatML form
+    // writes the opener as the lead of the assistant turn, so the block is open
+    // before the model has produced anything). `observe_think_text` feeds the
+    // decoded pieces in generation order so the mask clears when the block
+    // closes, and engages when the model opens the block itself. Both are
+    // inert unless params.think_eog_mask is set.
+    void start_in_think_block(bool open);
+    void observe_think_text(std::string_view piece);
+    bool think_block_open() const { return think_open_; }
+
+    // Replace which tokens and tags spell the block. The params carry the
+    // switch; only the backend knows the vocabulary, so it hands the ids in
+    // here once per request.
+    void set_think_mask_ids(ThinkBlockIds ids);
+
     // Picks the next token from one row of logits. The row is scratch space and
     // is modified in place.
     int sample(float* logits, size_t vocab);
@@ -43,6 +59,8 @@ public:
 
 private:
     void   apply_penalties(float* logits, size_t vocab) const;
+    void   mask_illegal_while_thinking(float* logits, size_t vocab) const;
+    void   measure_think_tags();
     size_t collect_candidates(const float* logits, size_t vocab, bool full);
 
     SamplerParams   params_;
@@ -53,6 +71,15 @@ private:
     std::unordered_map<int, int> generated_;  // generated only
 
     std::vector<std::pair<float, int>> scratch_;
+
+    // The mask's state: whether the block is open, and the tail of generated
+    // text kept only to notice a closer that straddles two pieces. Bounded by
+    // the longest tag, so it costs nothing per step.
+    bool        think_open_ = false;
+    std::string think_tail_;   // the newest characters, to see a closer land
+    std::string think_lead_;   // the generation's first characters, until the
+                               // block's opening is settled
+    size_t      think_max_tag_ = 0;
 };
 
 }  // namespace lgc

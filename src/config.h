@@ -202,6 +202,12 @@ struct Config {
     // would be a lie.
     std::optional<bool> think_default;
 
+    // clean-turns: turn on the think-block mask for every request. While a
+    // think block is open the turn-ending token is not offered, so a turn
+    // cannot end with no answer inside an unfinished block. Off by default:
+    // it changes what the sampler may pick, so it is the operator's call.
+    bool think_eog_mask = false;
+
     // Stub-only: milliseconds of artificial latency per emitted token. Exists
     // so the cancellation path (§3.7) can be demonstrated against a backend
     // that would otherwise finish before a client could disconnect.

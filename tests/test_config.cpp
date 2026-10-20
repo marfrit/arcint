@@ -949,3 +949,22 @@ TEST(config_tts_gen_device_gpu_or_cpu) {
     const std::string help = usage_text();
     CHECK(help.find("--tts-gen-device") != std::string::npos);
 }
+
+TEST(config_think_eog_mask_defaults_off_and_turns_on) {
+    // Off is today's behaviour; the operator turns it on by name.
+    Config cfg;
+    CHECK(run({"--stub"}, cfg).ok);
+    CHECK(!cfg.think_eog_mask);
+    Config on;
+    CHECK(run({"--stub", "--think-eog-mask"}, on).ok);
+    CHECK(on.think_eog_mask);
+}
+
+TEST(config_think_eog_mask_marks_the_defaults_operator) {
+    Config cfg;
+    CHECK(run({"--stub", "--think-eog-mask"}, cfg).ok);
+    SamplerDefaults d;
+    CHECK(!apply_operator_defaults(cfg, d).has_value());
+    CHECK(d.think_eog_mask);
+    CHECK(d.provenance == "operator");
+}

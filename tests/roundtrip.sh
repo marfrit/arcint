@@ -539,7 +539,7 @@ kill -TERM "$LANES_PID" 2>/dev/null; wait "$LANES_PID" 2>/dev/null; LANES_PID=""
 OP_PORT=$(free_port); need_port "$OP_PORT"
 OP_LOG="${WORK}/op.log"
 "$BIN" --stub --host 127.0.0.1 --port "$OP_PORT" --n-ctx 4096 \
-       --temp 0 --chat-template-kwarg enable_thinking=false >"$OP_LOG" 2>&1 &
+       --temp 0 --think-eog-mask --chat-template-kwarg enable_thinking=false >"$OP_LOG" 2>&1 &
 OP_PID=$!
 OP_BASE="http://127.0.0.1:${OP_PORT}"
 for _ in $(seq 1 100); do
@@ -553,6 +553,8 @@ jassert "${WORK}/op-props.json" 'd["sampler_defaults"]["temperature"]==0 and d["
 check "--temp 0 flips the served default and its provenance to operator" $?
 jassert "${WORK}/op-props.json" 'd["sampler_defaults"]["top_k"]==20'
 check "flags override only what they set" $?
+jassert "${WORK}/op-props.json" 'd["sampler_defaults"]["think_eog_mask"]==True'
+check "--think-eog-mask is on /props, so a different turn shape is explained there" $?
 
 curl -sS "${OP_BASE}/v1/chat/completions" -H 'Content-Type: application/json' \
      -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":8}' -o "${WORK}/op-chat.json"

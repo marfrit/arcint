@@ -43,6 +43,7 @@ extern "C" int stbi_info_from_memory(unsigned char const* buffer, int len, int* 
 #include <vector>
 
 #include "config.h"
+#include "core/reasoning.h"
 #include "core/sampler.h"
 #include "exec/chat_json.h"
 #include "exec/llama_layer_split.h"
@@ -274,6 +275,16 @@ public:
         return s;
     }
 
+    // A tag string the vocabulary holds as ONE added token, as the ChatML
+    // vocabularies do for their think markers. encode() with parse_special is
+    // the test: it returns one token only when the whole string is that token.
+    // A vocabulary that spells the same tag as ordinary text returns several,
+    // and the caller treats it as text.
+    std::vector<int> special_ids(std::string_view tag) override {
+        const std::vector<int> t = encode(tag);
+        return t.size() == 1 ? t : std::vector<int>{};
+    }
+
     std::string decode(const std::vector<int>& ids) override {
         std::string out;
         for (int id : ids) out += decode_one(id);
@@ -488,6 +499,14 @@ public:
                                                  cfg.gguf_path.c_str(), arch));
         tokenizer_ = std::make_unique<LlamaTokenizer>(vocab_);
         n_vocab_   = static_cast<size_t>(llama_vocab_n_tokens(vocab_));
+        // clean-turns: which ids end a turn for this vocabulary. The mask needs
+        // the set, not just eos: a ChatML vocabulary ends a turn with its
+        // end-of-turn id, and is_stop() asks llama_vocab_is_eog(), which answers
+        // for both. Reading them from the vocabulary is why this file never
+        // writes a control token out.
+        eog_ids_.clear();
+        for (llama_token t = 0; t < llama_vocab_n_tokens(vocab_); ++t)
+            if (llama_vocab_is_eog(vocab_, t)) eog_ids_.push_back(t);
 
         // Named lanes (--served-model-name A,B --lane-ctx CA,CB; DESIGN 4.2,
         // docs/campaigns/lanes-agent-subagent.md): a cap per lane, one KV
@@ -907,6 +926,7 @@ public:
         }
         Sampler sampler(in.sampler, seed);
         sampler.set_prompt(prompt);
+        prepare_think_mask(in, sampler);
 
         std::vector<int>&  have = slot_tokens_[static_cast<size_t>(seq)];
         std::vector<float> logits(n_vocab_);
@@ -967,8 +987,10 @@ public:
             }
             ++stats.completion_tokens;
             const auto    t_emit = clock_type::now();
-            const Control ctl    = on_piece(tokenizer_->decode_one(next), next);
+            const std::string piece = tokenizer_->decode_one(next);
+            const Control ctl    = on_piece(piece, next);
             stats.decode_emit_seconds += seconds_since(t_emit);
+            sampler.observe_think_text(piece);
             sampler.observe(next);
             if (ctl != Control::Continue) {
                 reason = ctl == Control::Cancel ? FinishReason::Abort : FinishReason::Stop;
@@ -1058,6 +1080,7 @@ public:
         }
         Sampler sampler(in.sampler, seed);
         sampler.set_prompt(tokenizer_->encode(in.prompt));
+        prepare_think_mask(in, sampler);
 
         std::vector<int>&  have   = slot_tokens_[static_cast<size_t>(seq)];
         std::vector<float> logits(n_vocab_);
@@ -1103,8 +1126,10 @@ public:
             }
             ++stats.completion_tokens;
             const auto    t_emit = clock_type::now();
-            const Control ctl    = on_piece(tokenizer_->decode_one(next), next);
+            const std::string piece = tokenizer_->decode_one(next);
+            const Control ctl    = on_piece(piece, next);
             stats.decode_emit_seconds += seconds_since(t_emit);
+            sampler.observe_think_text(piece);
             sampler.observe(next);
             if (ctl != Control::Continue) {
                 reason = ctl == Control::Cancel ? FinishReason::Abort : FinishReason::Stop;
@@ -1428,6 +1453,7 @@ private:
         }
         Sampler sampler(in.sampler, seed);
         sampler.set_prompt(prompt);
+        prepare_think_mask(in, sampler);
         std::vector<int>&  have = slot_tokens_[static_cast<size_t>(seq)];
         std::vector<float> rows;   // the verified rows' logits
 
@@ -1512,9 +1538,11 @@ private:
                 rows.data(), batch.size(), n_vocab_, draft, sampler, budget,
                 [&](int tok) { return is_stop(in.sampler, tok); },
                 [&](int tok) {
-                    const auto t_emit = clock_type::now();
-                    const Control ctl = on_piece(tokenizer_->decode_one(tok), tok);
+                    const auto    t_emit = clock_type::now();
+                    const std::string piece = tokenizer_->decode_one(tok);
+                    const Control ctl = on_piece(piece, tok);
                     emit_s += seconds_since(t_emit);
+                    sampler.observe_think_text(piece);
                     return ctl;
                 });
             stats.decode_emit_seconds += emit_s;
@@ -1711,6 +1739,31 @@ private:
     bool is_stop(const SamplerParams& sp, int tok) const {
         if (!sp.ignore_eos && llama_vocab_is_eog(vocab_, tok)) return true;
         return std::find(sp.stop_token_ids.begin(), sp.stop_token_ids.end(), tok) != sp.stop_token_ids.end();
+    }
+
+    // Fill the mask's ids for one request: the turn-ending ids from the
+    // vocabulary, and the think tags from think_tag_pairs() — the same table
+    // split_reasoning() uses. A tag that is one added token is blocked in the
+    // logits; a tag this vocabulary spells as text is matched as text, because
+    // there is no single logit to block (measured on the coder artifact).
+    void prepare_think_mask(const GenerationInput& in, Sampler& sampler) const {
+        if (!in.sampler.think_eog_mask) return;
+        ThinkBlockIds ids;
+        ids.eog = eog_ids_;
+        for (const auto& [open, close] : think_tag_pairs(in.think_tags_extended)) {
+            // The opener is blocked by id wherever the vocabulary holds it as
+            // one added token; its text is kept in every case, because
+            // decode_one() renders a special as its tag text and the lead check
+            // needs the text either way.
+            const std::vector<int> one = tokenizer_->special_ids(open);
+            if (one.size() == 1) ids.open_ids.push_back(one.front());
+            ids.open_tags.emplace_back(open);
+            // The closer is never blocked: emitting it is what lets the turn
+            // end again.
+            ids.close_tags.emplace_back(close);
+        }
+        sampler.set_think_mask_ids(std::move(ids));
+        sampler.start_in_think_block(in.think_open);
     }
 
     // One llama_decode of n tokens of `seq` at positions [pos, pos + n), with
@@ -1928,6 +1981,9 @@ private:
 #endif
     const llama_vocab*                    vocab_ = nullptr;
     std::unique_ptr<LlamaTokenizer>       tokenizer_;
+    // Every id llama_vocab_is_eog() answers for: exactly the set is_stop() ends
+    // on, so the mask and the stop check cannot drift apart.
+    std::vector<int>                      eog_ids_;
     bool mistral_small_24b_ = false;   // the admitted llama geometry (think tags, BOS)
     std::unique_ptr<minja::chat_template> template_;
     std::string                           template_src_;

@@ -157,3 +157,30 @@ TEST(sampling_min_p_range_and_apply) {
     CHECK(sampler_from_defaults(d).min_p == 0.1f);
     CHECK_EQ(d.provenance, std::string("operator"));
 }
+
+TEST(sampling_think_eog_mask_travels_defaults_to_params_to_request) {
+    SamplerDefaults d;
+    d.think_eog_mask = true;
+    CHECK(sampler_from_defaults(d).think_eog_mask);
+
+    // Symmetric like every other field: a request that names it gets what it
+    // names, and the operator's setting is what a silent request gets.
+    SamplerParams p = sampler_from_defaults(d);
+    SamplerOverrides off;
+    off.think_eog_mask = false;
+    CHECK(!sampler_apply(p, off).has_value());
+    CHECK(!p.think_eog_mask);
+
+    SamplerParams q = sampler_from_defaults(SamplerDefaults{});
+    SamplerOverrides on;
+    on.think_eog_mask = true;
+    CHECK(!sampler_apply(q, on).has_value());
+    CHECK(q.think_eog_mask);
+}
+
+TEST(sampling_think_eog_mask_counts_as_an_override) {
+    SamplerOverrides o;
+    CHECK(!o.any());
+    o.think_eog_mask = true;
+    CHECK(o.any());
+}

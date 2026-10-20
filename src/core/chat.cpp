@@ -159,6 +159,13 @@ std::optional<std::string> read_sampler(const json& b, SamplerOverrides& s) {
         if (!b["ignore_eos"].is_boolean()) return "ignore_eos must be a boolean";
         s.ignore_eos = b["ignore_eos"].get<bool>();
     }
+    // clean-turns: while a think block is open, the turn-ending token is not a
+    // legal next token. Non-standard, so it is named; a request that sends
+    // neither keeps the operator's setting.
+    if (b.contains("think_eog_mask") && !b["think_eog_mask"].is_null()) {
+        if (!b["think_eog_mask"].is_boolean()) return "think_eog_mask must be a boolean";
+        s.think_eog_mask = b["think_eog_mask"].get<bool>();
+    }
     if (b.contains("stop")) {
         if (auto e = read_stop(b["stop"], s)) return e;
     }

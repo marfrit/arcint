@@ -19,11 +19,34 @@ struct SamplerDefaults {
     float repetition_penalty = 1.05f;
     float presence_penalty   = 0.0f;
 
+    // clean-turns: the operator's switch for the think-block mask. Off keeps
+    // today's behaviour; the artifact cannot decide it, so it is not read from
+    // the GGUF.
+    bool think_eog_mask = false;
+
     // "provisional" -- the Qwen3-family card values, carried because no
     //                  GGUF key is read yet; /props reports this so nobody
     //                  mistakes an inherited default for a measured one.
     // "operator"    -- at least one --temp/--top-p/... flag set it.
     std::string provenance = "provisional";
+};
+
+// What spells the think block, for the mask below. The ids come from the
+// vocabulary; the tag strings come from think_tag_pairs() in reasoning.h,
+// which is the only place they are written out anywhere in this tree.
+struct ThinkBlockIds {
+    std::vector<int> eog;        // end-of-turn / end-of-sequence ids: the block
+                                 // is not a place to end a turn
+    std::vector<int> open_ids;   // the block's opening marker id: a second one
+                                 // while the block is open is the same defect
+                                 // one step later
+    std::vector<std::string> close_tags;  // the closers, matched as TEXT: a
+                                          // model can spell them as ordinary
+                                          // text (measured on the coder
+                                          // artifact), so they cannot be
+                                          // assumed to be single ids
+    std::vector<std::string> open_tags;   // likewise the openers, for a model
+                                          // that opens the block itself
 };
 
 struct SamplerParams {
@@ -44,6 +67,11 @@ struct SamplerParams {
     std::vector<std::string> stop;
     std::vector<int>         stop_token_ids;
 
+    // clean-turns: while a think block is open, the end-of-turn token is not a
+    // legal next token. Off keeps today's behaviour exactly. See ThinkBlockIds.
+    bool think_eog_mask = false;
+    ThinkBlockIds think_ids;
+
     // top_k == 1 collapses the distribution just as temperature 0 does; both
     // must take the argmax path, or "greedy" means two different things.
     bool greedy() const { return temperature <= 0.0f || top_k == 1; }
@@ -62,6 +90,7 @@ struct SamplerOverrides {
     std::optional<bool>                     ignore_eos;
     std::optional<std::vector<std::string>> stop;
     std::optional<std::vector<int>>         stop_token_ids;
+    std::optional<bool>                     think_eog_mask;
 
     bool any() const;
 };

@@ -1,3 +1,4 @@
+#include "core/reasoning.h"
 #include "core/sampler.h"
 #include "harness.h"
 
@@ -284,4 +285,170 @@ TEST(sampler_min_p_with_top_p) {
     }
     CHECK(seen.count(0) && seen.count(1));
     CHECK(!seen.count(2) && !seen.count(3));
+}
+
+// ---------------------------------------------------------------------------
+// clean-turns: the think-block mask. Tag strings are assembled from parts here
+// The mask's own cases are appended below; they take the tag strings from
+// think_tag_pairs(), the same table split_reasoning() reads. Nothing in this
+// file writes a tag out.
+
+namespace {
+
+// The mask's ids for a test: stand-in ids for the two specials, and the tags
+// exactly as the reasoning table spells them.
+ThinkBlockIds table_ids() {
+    const auto& pairs = think_tag_pairs(false);
+    ThinkBlockIds t;
+    t.eog        = {0};      // stands in for the turn-ending id
+    t.open_ids   = {1};      // stands in for the block's opener id
+    t.close_tags = {pairs[0].second};
+    t.open_tags  = {pairs[0].first};
+    return t;
+}
+
+SamplerParams masked_params(bool on) {
+    SamplerParams p  = greedy_params();
+    p.think_eog_mask = on;
+    p.think_ids      = table_ids();
+    return p;
+}
+
+// The end-of-generation token is the argmax; the next best is id 3.
+std::vector<float> eog_first() { return logits({5.0f, 4.0f, 1.0f, 3.0f}); }
+
+}  // namespace
+
+TEST(sampler_mask_off_keeps_the_end_of_generation_token) {
+    // The red case: without the mask the turn ends inside the think block.
+    auto    l = eog_first();
+    Sampler s(masked_params(false), 1);
+    s.start_in_think_block(true);
+    CHECK_EQ(s.sample(l.data(), l.size()), 0);
+}
+
+TEST(sampler_mask_on_blocks_the_end_of_generation_token_while_open) {
+    auto    l = eog_first();
+    Sampler s(masked_params(true), 1);
+    s.start_in_think_block(true);
+    CHECK_EQ(s.sample(l.data(), l.size()), 3);
+}
+
+TEST(sampler_mask_on_blocks_a_second_opener_while_open) {
+    // A reopened block is the same defect one step later: while the block is
+    // open the opener id is not a legal next token either.
+    auto    l = logits({1.0f, 5.0f, 0.5f, 3.0f});
+    Sampler s(masked_params(true), 1);
+    s.start_in_think_block(true);
+    CHECK_EQ(s.sample(l.data(), l.size()), 3);
+}
+
+TEST(sampler_mask_clears_once_the_closer_has_been_emitted) {
+    const auto& pairs = think_tag_pairs(false);
+    Sampler     s(masked_params(true), 1);
+    s.start_in_think_block(true);
+    s.observe_think_text("some reasoning");
+    CHECK_EQ(s.sample(eog_first().data(), 4), 3);            // still blocked
+    s.observe_think_text(pairs[0].second);
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);            // the turn may end
+}
+
+TEST(sampler_mask_engages_when_the_model_opens_the_block_itself) {
+    // The template did not open it; the model's own opener, at the lead of the
+    // generation, engages the mask.
+    const auto& pairs = think_tag_pairs(false);
+    Sampler     s(masked_params(true), 1);
+    s.start_in_think_block(false);
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);            // not open: allowed
+    s.observe_think_text(pairs[0].first + "why");
+    CHECK_EQ(s.sample(eog_first().data(), 4), 3);            // open from here
+}
+
+TEST(sampler_mask_ignores_an_opener_that_is_not_at_the_lead) {
+    // Mirrors split_reasoning: only an opener at the very start opens a block.
+    // An answer that quotes a tag later must still be able to end normally.
+    const auto& pairs = think_tag_pairs(false);
+    Sampler     s(masked_params(true), 1);
+    s.start_in_think_block(false);
+    s.observe_think_text("the template writes " + pairs[0].first + " first");
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);
+}
+
+TEST(sampler_mask_off_is_the_old_behaviour_even_with_the_ids_set) {
+    auto    l = eog_first();
+    Sampler s(masked_params(false), 1);
+    s.start_in_think_block(true);
+    s.observe_think_text(think_tag_pairs(false)[0].first);
+    CHECK_EQ(s.sample(l.data(), l.size()), 0);
+}
+
+TEST(sampler_mask_leaves_every_other_token_alone) {
+    // The mask names two ids. Nothing else in the row moves, so a normal
+    // answer is sampled exactly as it was before. (sample() rewrites its row:
+    // each call gets a copy, as every decode loop does.)
+    const std::vector<float> row = logits({5.0f, 4.0f, 2.5f, 3.0f});
+
+    auto    a = row;
+    Sampler s(masked_params(true), 1);
+    s.start_in_think_block(true);
+    CHECK_EQ(s.sample(a.data(), a.size()), 3);
+    size_t changed = 0;
+    for (size_t i = 0; i < row.size(); ++i)
+        if (a[i] != row[i]) ++changed;
+    CHECK_EQ(static_cast<int>(changed), 2);   // the turn-ender and the opener
+
+    auto    b = row;
+    Sampler s2(masked_params(false), 1);
+    s2.start_in_think_block(true);
+    CHECK_EQ(s2.sample(b.data(), b.size()), 0);
+    CHECK(b == row);                          // off: the row is not touched
+}
+
+TEST(sampler_mask_notices_a_closer_split_across_pieces) {
+    // Cut from the table's own string, never written out here: a closer that
+    // straddles two emitted pieces still clears the mask.
+    const std::string closer = think_tag_pairs(false)[0].second;
+    const size_t      cut    = closer.size() / 2;
+    Sampler           s(masked_params(true), 1);
+    s.start_in_think_block(true);
+    s.observe_think_text(closer.substr(0, cut));
+    CHECK_EQ(s.sample(eog_first().data(), 4), 3);            // not closed yet
+    s.observe_think_text(closer.substr(cut));
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);
+}
+
+TEST(sampler_mask_notices_a_closer_inside_one_long_piece) {
+    // The tail kept for the straddle is never shorter than the piece just
+    // appended: a closer that lands wholly inside a long piece is still seen.
+    const std::string closer = think_tag_pairs(false)[0].second;
+    Sampler           s(masked_params(true), 1);
+    s.start_in_think_block(true);
+    s.observe_think_text(std::string(closer.size() * 3, 'x') + closer + std::string(closer.size() * 3, 'y'));
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);
+}
+
+TEST(sampler_mask_engages_on_an_opener_split_across_pieces) {
+    // Cut from the table's own string. The rule is one-sided on purpose: a lead
+    // that could still grow into an opener is masked from the first character,
+    // because masking the turn-ender for the two or three tokens of a partial
+    // opener costs nothing, while releasing a turn the client still reads as
+    // reasoning is the defect this is about.
+    const std::string opener = think_tag_pairs(false)[0].first;
+    const size_t      cut    = opener.size() / 2;
+    Sampler           s(masked_params(true), 1);
+    s.start_in_think_block(false);
+    s.observe_think_text(opener.substr(0, cut));
+    CHECK_EQ(s.sample(eog_first().data(), 4), 3);            // already masked
+    s.observe_think_text(opener.substr(cut) + "because");
+    CHECK_EQ(s.sample(eog_first().data(), 4), 3);            // and stays so
+}
+
+TEST(sampler_mask_lets_go_when_the_lead_is_plainly_not_an_opener) {
+    // The other side of the same rule: an answer that starts as content is not
+    // held back for the length of a tag.
+    const std::string opener = think_tag_pairs(false)[0].first;
+    Sampler           s(masked_params(true), 1);
+    s.start_in_think_block(false);
+    s.observe_think_text(opener.substr(0, 1) + "n ordinary sentence");
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);
 }

@@ -1,6 +1,8 @@
 #pragma once
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace lgc {
 
@@ -45,5 +47,13 @@ private:
     std::string_view close_ = "</think>";   // the closer of the block that is open
     bool             extended_;
 };
+
+// The tag family the split honours, in the order it tries them: the Qwen pair,
+// and with `extended` also the Mistral-family pairs. This is the only place
+// they are spelled; anything else that needs them (the sampler's think-block
+// mask, clean-turns) asks for them here rather than writing them out. A
+// reference to a table built once: no caller copies them, and no caller needs
+// to compose one.
+const std::vector<std::pair<std::string, std::string>>& think_tag_pairs(bool extended);
 
 }  // namespace lgc

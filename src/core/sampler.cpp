@@ -33,6 +33,89 @@ void Sampler::observe(int token) {
     ++generated_[token];
 }
 
+void Sampler::set_think_mask_ids(ThinkBlockIds ids) {
+    params_.think_ids = std::move(ids);
+    measure_think_tags();
+}
+
+// The tail kept to notice a closer that straddles two pieces is bounded by the
+// longest tag, so the check costs nothing per step. Both entry points measure:
+// the ids may arrive in the params (a test, or a backend that already knows
+// them) or through set_think_mask_ids.
+void Sampler::measure_think_tags() {
+    think_max_tag_ = 0;
+    for (const std::string& t : params_.think_ids.close_tags) think_max_tag_ = std::max(think_max_tag_, t.size());
+    for (const std::string& t : params_.think_ids.open_tags) think_max_tag_ = std::max(think_max_tag_, t.size());
+}
+
+void Sampler::start_in_think_block(bool open) {
+    measure_think_tags();
+    think_open_ = params_.think_eog_mask && open;
+    think_tail_.clear();
+    think_lead_.clear();
+}
+
+// Feed the generated text, in generation order. The block closes on a closer
+// wherever it appears; it opens on an opener only at the very lead, which is
+// what split_reasoning does with the same text — the mask and the reasoning
+// split must agree about where the block is, or the mask lifts on text the
+// client still sees as reasoning.
+void Sampler::observe_think_text(std::string_view piece) {
+    if (!params_.think_eog_mask) return;
+    if (!think_open_) {
+        // Before the block's opening is settled, only the generation's first
+        // characters matter. The rule is deliberately one-sided, and errs
+        // towards masking: the mask engages as soon as the lead matches an
+        // opener or could still grow into one, and only lets go when the lead
+        // has provably become something else. Masking the turn-ender for the
+        // two or three tokens of a partial opener costs nothing; releasing a
+        // turn that the client still sees as reasoning is the defect.
+        if (think_lead_.size() < think_max_tag_) think_lead_.append(piece);
+        if (think_lead_.size() > think_max_tag_) think_lead_.resize(think_max_tag_);
+        bool settled = false;
+        for (const std::string& t : params_.think_ids.open_tags) {
+            if (think_lead_.size() >= t.size()) {
+                if (think_lead_.compare(0, t.size(), t) == 0) { think_open_ = true; settled = true; break; }
+                continue;
+            }
+            if (t.compare(0, think_lead_.size(), think_lead_) == 0) { think_open_ = true; settled = true; break; }
+        }
+        if (!settled && !params_.think_ids.open_tags.empty()) {
+            // No opener matched or loomed: the answer begins as content.
+            think_open_ = false;
+        }
+        if (!think_open_) return;
+    }
+    think_tail_.append(piece);
+    // Keep enough of the tail to see a closer that straddles two pieces, and
+    // never less than the piece just appended: a closer wholly inside one long
+    // piece must still be seen.
+    const size_t keep = std::max(think_max_tag_ * 2 + 8, piece.size());
+    if (think_tail_.size() > keep) think_tail_.erase(0, think_tail_.size() - keep);
+    for (const std::string& t : params_.think_ids.close_tags) {
+        if (think_tail_.find(t) != std::string::npos) {
+            think_open_  = false;
+            think_tail_.clear();
+            return;
+        }
+    }
+}
+
+// While the block is open the end-of-turn token and a second opener are not
+// legal next tokens. Applied to the logits, not to the stop check: a filter in
+// the stop check would let the token be sampled, take its probability mass, and
+// then be ignored, so the sampled token would not be the one the distribution
+// describes.
+void Sampler::mask_illegal_while_thinking(float* logits, size_t vocab) const {
+    if (!params_.think_eog_mask || !think_open_) return;
+    auto kill = [&](const std::vector<int>& ids) {
+        for (int id : ids)
+            if (id >= 0 && static_cast<size_t>(id) < vocab) logits[static_cast<size_t>(id)] = -INFINITY;
+    };
+    kill(params_.think_ids.eog);
+    kill(params_.think_ids.open_ids);
+}
+
 int Sampler::argmax(const float* logits, size_t vocab) {
     size_t best = 0;
     float  top  = logits[0];
@@ -96,6 +179,7 @@ size_t Sampler::collect_candidates(const float* logits, size_t vocab, bool full)
 int Sampler::sample(float* logits, size_t vocab) {
     if (vocab == 0) return 0;
 
+    mask_illegal_while_thinking(logits, vocab);
     apply_penalties(logits, vocab);
 
     // Penalties can reorder the distribution, so greedy is decided after them.
