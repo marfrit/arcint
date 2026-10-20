@@ -116,3 +116,46 @@ inside a card window.
   reported, not from a controlled ablation of the parser.
 - Logs and quants referenced here live on the card host under
   `~/wp/coder-quality/`; they are not in this repository.
+
+## The thinking confound (settled 2026-10-20, `measured-here`)
+
+The unit's own comment and `docs/llama-engine.md` record the acceptance task
+at **10/10 at T=0** for this exact GGUF and these exact flags (2026-10-05).
+This baseline gets 9/10. Before treating that as a regression, the harness
+setting had to be pinned: `frage.py` takes `OHNE_DENKEN=1`, which sends
+`enable_thinking: false`.
+
+What the record actually used:
+
+- The cell's wrapper `~/pruefstand-coder/run.sh` and the N-run driver
+  `~/wp/llama/pruef-n.sh` both set `DECKEL=4000 OHNE_DENKEN=1`.
+- The surviving raw answers from that day confirm it: every
+  `~/pruefstand*/antwort-20261004-*.roh` and `antwort-20261005-*.roh` has
+  zero think-block hits (byte counts 2.0-3.9 kB, all code).
+
+So the recorded 10/10 arms and this baseline used the **same** thinking
+setting. There is no confound between them; the difference is the engine
+(0.5.11/0.5.12 then, 1.2.1 now) and its prefill batch layout — which is
+exactly the axis `docs/llama-engine.md` already identified: at 0.5.12 the
+same prompt scored 9 at T=0 with checkpoints on and 10 with
+`--llama-checkpoints 0`, "one case flipping with the batch layout".
+
+**Thinking on is a different arm, and it passes** (`measured-here`, live
+unit, T=0, 5 runs, `DECKEL=16000`):
+
+| arm | T=0 | tokens an answer | wall an answer | decode |
+|---|---|---|---|---|
+| thinking off (the cell's setting) | 0 of 5 at 10/10 | 467 | 6.3 s | 73.9 t/s |
+| thinking on | **5 of 5 at 10/10** | 6,601 | 99 s | 66.4 t/s |
+
+All five thinking-on runs are byte-identical in length and all score 10/10:
+the model finds the missing advance once it reasons first. VRAM is unchanged
+(15,881 MiB against 15,877). That is a serving-policy lever, not an engine
+lever, and it costs ~14× the tokens and ~16× the wall of the thinking-off
+answer. It is recorded here because it is the largest effect measured on this
+battery, and because it says the defect is reachable by the model at all.
+
+Production traffic is not the acceptance cell: the journal shows the unit
+serving agentic conversations (prefill 24,069 / 26,871 / 32,480 tokens,
+decode up to 10,482 tokens, cache hits 88-94 %), i.e. multi-turn with long
+replies. The acceptance cell is a single 282-token turn with thinking off.
