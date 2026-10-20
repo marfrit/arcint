@@ -25,6 +25,9 @@
 
 ## Status
 
+- Flash-Next's production quant is ISTA-DASLab's GSQ-RCO IQ3_S since
+  2026-10-20 (operator): 33.3 t/s decode on six answers, KL 0.127 against
+  Q8_0 (IQ3_XXS 38.0 t/s, 0.217, the rollback).
 - Version 1.2.1 (2026-10-20): patch 0063, the expert cache's CPU misses
   with Strata's multi-token rows for IQ2_XS, IQ3_XXS, IQ3_S and IQ4_NL and
   every miss of a verify window on the CPU (GGML_OPENCL_CPU_MISS_MAX 64):

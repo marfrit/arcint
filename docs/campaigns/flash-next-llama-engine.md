@@ -1868,7 +1868,8 @@ the 20k needle (622), VRAM peak 23,478 MiB without eviction (GTT at the
 bank's size), bank 36.06 GiB; KL as served against Q8_0 0.1269 (ubatch 4) /
 0.1267 (512), top-1 92.11 / 92.01 % (IQ3_XXS 0.2173 / 0.2188, 89.6 %); Paris
 and the needle, the two runs byte-identical. Above the operator's 20 t/s
-line, so IQ3_S is the production quant: the unit points at it with 11,600
+line, so IQ3_S is the production quant (confirmed by the operator the same
+morning, `decision`: "IQ3_S is the new Qwen Flash-Next model"): the unit points at it with 11,600
 MiB of slots, started once through systemd (40 s, Paris). IQ3_XXS stays on
 the NVMe as the rollback. The served KL (0.127) is still above the
 answer-level bar against Q8_0, as every quant that fits this host is; the
