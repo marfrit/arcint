@@ -233,3 +233,32 @@ Three arms on one battery, one variable each, all `measured-here`:
 
 The two things that move this score are where the prefill batches break and
 whether the model reasons before writing. Neither is a precision knob.
+
+## Thinking on, sampled (2026-10-20, `measured-here`) — it loses
+
+The greedy win of thinking-on did not survive sampling. 30 runs at 0.7 on the
+live unit, `DECKEL=16000`, `enable_thinking: true`:
+
+| arm | 30 runs at 0.7 | mean | tokens an answer | decode |
+|---|---|---|---|---|
+| thinking off, checkpoints off | 27 at 10/10, 3 at 9 | 9.900 | 531 | 70.3 t/s |
+| thinking on, checkpoints on | 15 at 10/10, then 2×9, 3×8, 2×7, 1×3, 1×5, **6×0** | 7.133 | 8,073 | 64.2 t/s |
+
+Six zeros, and they are two different things:
+
+- **2 of 6**: the answer never arrived. The run spent the whole 16,000-token
+  budget reasoning and emitted no answer text (`tok=16000`, empty response).
+  `docs/llama-engine.md` already saw this on the coder: "the cold arm's t2
+  spent its 700-token budget thinking and gave no answer".
+- **4 of 6**: the answer was there but wrapped in an answer-tag with **no code
+  fence**, so `frage.py`'s fence extractor wrote the tag into the `.lua` file
+  and Lua refused to load it (`LADEFEHLER: unexpected symbol near '<'`).
+
+The second class is partly a harness artefact, so it was checked rather than
+assumed: with the wrapper tags stripped line-wise, those four files score
+**10/10, 8/10, 8/10 and 5/10**. So one perfect answer was lost to the
+extractor and three were genuinely mediocre. Corrected, the arm is 16 of 30
+at 10/10 — still far below thinking-off's 27 of 30, and at 15× the tokens.
+
+Thinking-on is therefore not the lever for the sampled bar. It is the lever
+for greedy only, and it costs 15× the tokens and 16× the wall.
