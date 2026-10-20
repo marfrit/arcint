@@ -4,7 +4,8 @@ Status: **applied by the operator, 2026-10-20** (the flag is in
 `arcint-coder-llama.service`'s `ExecStart`; the unit has run with it since
 12:48 UTC and every sampled batch below was taken with it in place). This
 document is the evidence for that change, and it now also records the pass bar
-the operator set on the same day — see "The bar is a MEAN, not a count".
+the operator set on the same day and revised the same evening to a
+non-inferiority rule — see "The bar, as the operator finally set it".
 Every number is `measured-here`, 2026-10-20, on the coder host's A770
 (`card0`, PCI `8086:56a0`, GPU.1), `arcint 1.2.1 (83d7609)`, sha256
 `86b33f88fd4f609a`, model `qwen36-coder-iwo3-c5f495ac-shq8.gguf`
@@ -68,6 +69,50 @@ this unit's actual traffic — but it is traffic-dependent, and an agent harness
 pointed at the coder in earnest would raise it by an order of magnitude. The
 flag also frees the host memory the checkpoints held: 62.8 MiB each, up to 32
 a lane.
+
+## The bar, as the operator finally set it: NON-INFERIORITY (`decision`, 2026-10-20)
+
+The probabilistic form the operator chose is not "the batch mean must reach
+9.8". It is:
+
+- **greedy: 5 of 5 runs at 10/10**, and
+- **over at least 90 pooled runs at 0.7, the bar counts as FAILED only if the
+  upper 95 % bound of the mean lies below 9.8.**
+
+That is a non-inferiority test: the unit is presumed to meet 9.8 unless the
+measurement demonstrates it cannot. It is the right shape given the scatter
+measured below — a single unlucky batch can no longer fail the unit, and a
+configuration can only fail it when enough runs place its whole interval
+under the bar.
+
+**Production's verdict under that rule: not failed.** `measured-here`, the
+eight interleaved batches of the shipping configuration, n = 240, mean 9.771:
+
+| n | SD used | SE | upper 95 % bound | verdict |
+|---|---|---|---|---|
+| 240 | 0.976 (pooled per-run) | 0.063 | **9.874** | **not failed** |
+| 240 | 1.210 (batch-implied, overdispersed) | 0.078 | **9.899** | **not failed** |
+| 90 | 0.976 | 0.103 | 9.940 | not failed |
+| 30 (one batch) | 0.976 | 0.178 | 10.064 | not failed |
+
+Both SDs clear it, the conservative one by 0.10. The greedy half is met
+outright (5/5 at 10/10, three times running). **The coder unit passes the bar
+as the operator has now set it.**
+
+What it would take to fail this unit — the run count at which the upper bound
+drops under 9.8, for a given true mean:
+
+| true mean | pooled SD | overdispersed SD |
+|---|---|---|
+| 9.70 | 258 runs | 396 |
+| 9.75 | 1031 | 1585 |
+| 9.77 (the measured point estimate) | 2864 | 4402 |
+| 9.80 | never | never |
+
+And the protection it buys: the worst batch measured in this session, 9.233,
+would have failed the unit under a naive per-batch reading (its own upper 95 %
+bound is 9.53–9.60, under the bar). Under the rule as set it cannot, because
+the floor is 90 pooled runs.
 
 ## The bar is a MEAN, not a count (`decision`, operator, 2026-10-20)
 
@@ -199,7 +244,9 @@ over the eight.)
 | zero-rate anchor 2 | 9.800 | 0.088 | 25×10, 4×9, 1×8 |
 | **pooled, n = 210** | **9.762** | **0.071** | 180×10, 26×9, 2×8, **2×0** |
 
-**Production is not shown to meet the bar.** Pooled 9.762 ± 0.071, 95 % CI
+**Production is not shown to meet the bar** *(under the pre-non-inferiority
+reading; see "The bar, as the operator finally set it" above for the verdict
+under the rule that now governs — not failed)*. Pooled 9.762 ± 0.071, 95 % CI
 [9.62, 9.90]: the bar at 9.8 sits inside that interval, and the pooled point
 estimate is within one SE of it. That is *not shown to meet*, not *fails* —
 the measurement cannot resolve a tenth of a point at n = 210. What the
@@ -328,8 +375,8 @@ conclusion is the same either way:
 
 Batch-mean SD **0.286** over these five, **0.221** over all eight. So a single
 30-run measurement of the production unit carries a 90 % interval of
-**± 0.36–0.47** around its own mean, and the bar 9.8 sits well inside it: two
-of these five batches pass, one (9.233) misses by half a point, and nothing
+**± 0.36–0.47** around its own mean, and the bar 9.8 sits well inside it: four
+of these five batches reach 9.8, one (9.233) misses it by 0.57, and nothing
 about the unit changed between them. The spread is the zero mode arriving or
 not arriving in a given batch, which is what a 30-run batch is a draw from.
 
@@ -400,11 +447,54 @@ independent reasons, each checked:
 What would settle the quant question, if it is to be run: the same execution
 route in both arms. The A770 cannot hold all-Q8_0 at 98,304 tokens, so the
 fair comparison is on the B60 (24 GiB, and `arcint-flashnext` currently holds
-it), or at a context short enough that both quants sit on one card. And the
-number of runs has to come from the table above, not from a budget: ~200–450
-per arm to move the mean by 0.2–0.3, which at 7 s a run is 25–55 minutes of
-serving per arm on a card that is not the production card. **The operator
-closed this axis on 2026-10-20: not run.**
+it), or at a context short enough that both quants sit on one card.
+**The operator closed this axis on 2026-10-20: not run.** It is closed as
+*answered by these numbers*, not as forbidden — and reopening it has a stated
+cost, so it cannot be reopened casually.
+
+### How the quant axis would be reopened
+
+The defect of the proposed A/B was that it changed quant, execution route and
+decode speed in one arm. Reopening it means removing that confound first.
+
+1. **Same engine, both quants, no offload in either arm.** Not arcint on the
+   A770 — it cannot hold the 25.99 GiB Q8_0 at any useful context. The place
+   is **`bosch`, the DGX Spark (ASUS Ascent GX10, GB10 Grace Blackwell,
+   compute capability 12.1, 20-core aarch64, 121 GiB unified memory),
+   llama.cpp built with CUDA** (`~/src/llama.cpp-latest` is there; a
+   `-DGGML_CUDA=ON -DGGML_CUDA_F16=ON -DCMAKE_CUDA_ARCHITECTURES=121` recipe
+   already exists on that host, fleet record 2026-09-09, `code`). Both files
+   fit there outright — Q8_0 25.99 GiB, shq8 13.59 GiB — so both arms run
+   all-on-card, same route, same link, differing only in the bytes. Neither
+   coder GGUF is on `bosch` yet; they would have to be copied (26 + 14 GiB).
+2. **Run count taken from the power simulation, targeting power ≥ 0.8 at
+   α = 0.1.** The originally proposed 60/arm had power 0.000; **750/arm
+   reaches only 0.26** — nowhere near enough. Simulated (Fisher exact on the
+   zero-rate, 1200–1500 draws, production rate 0.83 %):
+
+   | alternative | runs per arm for power ≥ 0.8 |
+   |---|---|
+   | quant removes the zero mode **entirely** (0.83 % → 0 %) | **~850** |
+   | quant cuts it to a third (0.83 % → 0.30 %) | **~2800** |
+
+   The honest number for a realistic gain is therefore **2800 runs per arm**:
+   5600 runs, about **11 hours of serving** at the ~7 s a run costs here, on a
+   card that is not the production card. The cheaper variant, 850 per arm
+   (~3.3 h total), detects only a quant that makes the defect disappear.
+3. **Judge the zero-rate, not the mean.** The same alternative is far cheaper
+   to see in the zero-rate than in the mean: 0.83 % → 0.30 % shifts the mean
+   by only 0.052 points (a zero costs 9.77 points of a 30-run batch's total),
+   which needs ~6800 runs per arm on a mean test (overdispersed SD) against
+   ~2800 on the Fisher. If the axis is reopened, the zero-rate is the
+   statistic to run it on.
+4. **What a result would carry.** A CUDA/llama.cpp result is a statement about
+   the **weights**, not about arcint: it transfers to production only as a
+   model-level fact, and the answer-level bar would still have to be
+   re-measured on arcint on the A770 before anything moved. The KL and top-1
+   columns of `docs/llama-engine.md:611-615` stay the cheap first filter —
+   unaffected by the checkpoint confound noted there — with this caveat:
+   Q8_0 is already their reference, so an A/B that starts from Q8_0 starts
+   from the reference itself and cannot improve on it in those columns.
 
 ## The prompt lever, measured — no gain (`measured-here`)
 
@@ -453,7 +543,7 @@ no client of the coder service gets a new sentence it did not ask for.
 
 | question | decision | what it means |
 |---|---|---|
-| the mean bar | **state it probabilistically** | a single 30-run batch is a draw, not a verdict; report the batch scatter with the number |
+| the mean bar | **non-inferiority** | greedy 5/5 at 10/10, and over ≥ 90 pooled runs at 0.7 the bar counts as failed only if the **upper 95 % bound of the mean** lies below 9.8. Production's verdict under it: **not failed** (upper bound 9.874 / 9.899 conservative, n = 240) |
 | the system message | **client-side only** | arcint unchanged, nothing injected in the served path |
 | syntax guard + regenerate | **rejected** | no retry loop in the served path — and see below: at greedy a retry returns the same bytes, so it would not terminate |
 | the proposed quant A/B | **dropped, axis closed** | not run; see the power and confound arguments above |
@@ -531,12 +621,21 @@ other arms so no batch sits at a special time of day:
 - simulation of the pooled per-run distribution: **P(a 30-run batch clears
   9.8) = 0.65**
 
-So the bar is unresolved in the only sense the word has here: the interval
-contains 9.8, the point estimate is below it by half an SE, and a single
-batch of it passes about two thirds of the time. Anyone reporting this unit as
-"meets 9.8" or "misses 9.8" from one 30-run measurement is reporting noise.
+Under a per-batch reading the bar would be unresolved: the interval contains
+9.8, the point estimate is below it by half an SE, and a single batch of it
+passes about two thirds of the time. Anyone reporting this unit as "meets 9.8"
+or "misses 9.8" from one 30-run measurement is reporting noise. Under the
+non-inferiority rule the operator set the same evening, the same data gives a
+verdict: **not failed** — upper 95 % bound 9.874 (9.899 on the conservative
+overdispersed SD), both above 9.8, on n = 240.
 
 ## Recommendation
+
+**As the bar now stands (non-inferiority, operator 2026-10-20), the shipped
+configuration passes it**: greedy 5/5 at 10/10, and 240 pooled sampled runs
+whose upper 95 % bound (9.874, or 9.899 on the conservative overdispersed SD)
+sits above 9.8. Nothing further is owed to the bar. What follows is what the
+session learned about the margin, not a list of outstanding work.
 
 Under the mean bar the decision splits cleanly, because the two criteria are
 governed by two different defects:
@@ -546,17 +645,19 @@ governed by two different defects:
    masking it, and costs about 34 s of re-prefill per long follow-up — a small
    bill on this unit's measured traffic (5 such follow-ups in seven days). The
    mean bar neither supports nor contradicts it.
-2. **Sampled mean >= 9.8: not shown to be met, and no lever found here meets
-   it.** Eight interleaved batches pool to **9.771** over 240 runs, 90 % CI
-   [9.64, 9.87] — the bar sits inside the interval, so the bar is unresolved
-   rather than missed. Ranked by the cause the mean bar actually sees,
-   `top_p` raises the syntax-zero rate twelve-fold (p = 0.0003),
-   `min_p`/`top_k` are indistinguishable from no knob, and a `system` message
-   aimed straight at the defect shows no gain (above). The bar's binding
-   constraint is the **zero-rate** — 1 run in 120 emits Lua that does not
-   parse — and its ceiling: P(>= 24 perfect) = 0.90 even at a zero-rate of
-   nil. Stated probabilistically as the operator chose: this configuration
-   clears 9.8 in about **0.65 of 30-run batches**.
+2. **Sampled mean >= 9.8: under the non-inferiority rule, NOT FAILED.** Eight
+   interleaved batches pool to **9.771** over 240 runs; the upper 95 % bound
+   is 9.874 (9.899 conservative), above the bar. Under the earlier reading the
+   same data said "unresolved" — 90 % CI [9.64, 9.87] contains 9.8 — and that
+   is exactly the ambiguity the rule removes. No lever found here moves the
+   underlying number: `top_p` raises the syntax-zero rate twelve-fold
+   (p = 0.0003), `min_p`/`top_k` are indistinguishable from no knob, and a
+   `system` message aimed straight at the defect shows no gain (above). The
+   margin's binding constraint is the **zero-rate** — 1 run in 120 emits Lua
+   that does not parse — and its ceiling: P(>= 24 perfect) = 0.90 even at a
+   zero-rate of nil. As a per-batch event, this configuration clears 9.8 in
+   about **0.65 of 30-run batches**; the rule deliberately stops treating that
+   number as a pass or a fail.
 3. **The levers that remain are the model and the task, not the serving
    path.** The zero mode is known mechanically in one of its forms: with
    thinking off the model renders its reasoning as comment blocks inside the
@@ -573,9 +674,10 @@ governed by two different defects:
    message is client-side only** (operator: arcint injects nothing). What is
    left with evidence behind it is a different model or a different quant at
    the same deployment — and the quant axis is closed above, on grounds of
-   power and confound. State the bar probabilistically and re-measure it at
-   the run count the resolution demands, or accept the unit at 0.65 of
-   batches. Not built, not claimed done.
+   power and confound, with the cost of reopening it stated there (same engine
+   on `bosch`, ~2800 runs per arm for power ≥ 0.8). The bar is now a
+   non-inferiority rule and production is **not failed** under it, so none of
+   this is outstanding work. Not built, not claimed done.
 4. **`--llama-mtp 0` is now the weakest candidate, not the strongest.** It was
    listed as the untouched lever while the count bar was in force. Under the
    mean bar the zeros dominate, and `docs/llama-engine.md:440-444` records a
