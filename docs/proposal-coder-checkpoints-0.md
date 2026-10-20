@@ -455,15 +455,61 @@ no client of the coder service gets a new sentence it did not ask for.
 |---|---|---|
 | the mean bar | **state it probabilistically** | a single 30-run batch is a draw, not a verdict; report the batch scatter with the number |
 | the system message | **client-side only** | arcint unchanged, nothing injected in the served path |
-| syntax guard + regenerate | **rejected** | no retry loop in the served path; the determinism promise stands as written |
+| syntax guard + regenerate | **rejected** | no retry loop in the served path — and see below: at greedy a retry returns the same bytes, so it would not terminate |
 | the proposed quant A/B | **dropped, axis closed** | not run; see the power and confound arguments above |
 | the 2026-10-05 quant table | **annotate the confound** | done in `docs/llama-engine.md`, no re-measurement |
 
 The rejection of the syntax guard matters for how the remaining gap is read:
 the one intervention that cleared the bar with its interval off it
-(9.856 ± 0.026) is off the table **by choice, not by measurement**. The bar is
-then met or missed by the model and its configuration alone, and on the
-numbers below that is a coin that lands roughly two times in three.
+(9.856 ± 0.026) is off the table **by choice**.
+
+### Why the guard-and-regenerate route is closed
+
+The reason first recorded for refusing it (a determinism promise) does not
+survive checking; the corrected reason is stronger, so the decision stands and
+the argument changes. Evidence: `code` plus `measured-here`, 2026-10-20.
+
+- DESIGN §3.4 point 3: *"Deterministic replay is a cheap default, not a law"
+  … may be dropped by a mechanism that buys measured speed.* It is not an
+  invariant.
+- DESIGN §3.6 says an unseeded request gets a logged seed. **It does not get
+  a logged seed**: `src/exec/backend_llama.cpp:903-907` draws one from
+  `std::random_device` when `seeded` is false, and no code path in `src/`
+  logs it (searched for every `seed` site with a logging call; the only hit
+  is a comment in `src/core/sampler.h`). The seed is accepted per request
+  (`src/core/chat.cpp:154-156`, `src/core/sampling.cpp:73-75`) and never
+  surfaces in the API or `/props`.
+- Measured on the live unit at temp 0.7, three requests with
+  `"seed": 424242`: **byte-identical output, 3/3** (sha256
+  `690d5110…` on all three). Two unseeded requests at the same temperature:
+  two different outputs. So a seeded request IS reproducible today and an
+  unseeded one already is not — the sampled path has no reproducibility for
+  a retry to break.
+
+**Therefore the guard-and-regenerate proposal fails for a mechanical reason,
+not a promise-breaking one.** At T=0 the decode is argmax: regenerating the
+same request returns the same bytes, so a retry loop that triggers on
+`luac5.4 -p` would spin forever on the deterministic defect — the exact
+defect `--llama-checkpoints 0` already removed. To make the retry terminate
+at greedy it must perturb something (bump the seed, nudge the temperature),
+and *that* is the change that alters what a greedy request returns. At T=0.7
+unseeded it changes nothing at all, because nothing is reproducible there to
+begin with.
+
+Two consequences worth keeping:
+
+1. **If reproducibility at sampled temperature is wanted, it is a one-line
+   client change, not a service change**: send a `seed`. It already works,
+   byte for byte. The missing piece on the engine side is that §3.6 promises
+   the seed of an unseeded request is logged and it is not — a documentation
+   claim without a code path behind it.
+2. **The project's own release gate is not this bar.** DESIGN §5 gates
+   `pruefstand` at **at least 9/10** on the coder through the deployed
+   package, 10/10 the target, and the equivalence cells run greedy. The
+   shipped configuration is 5/5 at 10/10 greedy, so that gate is green
+   deterministically. The mean-over-30-at-0.7 bar is stricter than anything
+   the release procedure measures; the number that would actually turn a
+   release red is the zero-rate, ~1 in 120 sampled runs.
 
 ## The shipped configuration, pooled over eight interleaved batches (`measured-here`)
 
@@ -521,14 +567,15 @@ governed by two different defects:
    `pass`, `elif` and `None` by name does not lower it either — the one zero
    it produced was a Lua label written without its closing `::`, a second
    defect with a different signature. Of the two routes that looked live:
-   **reject-and-regenerate is refused** (operator: the determinism promise
-   stands, no retry loop in the served path) and **the system message is
-   client-side only** (operator: arcint injects nothing). What is left with
-   evidence behind it is a different model or a different quant at the same
-   deployment — and the quant axis is closed above, on grounds of power and
-confound. State the bar probabilistically and re-measure it at the run count
-   the resolution demands, or accept the unit at 0.65 of batches. Not built,
-   not claimed done.
+   **reject-and-regenerate is refused** (operator: no retry loop in the
+   served path; and `code` says it would not terminate at greedy anyway — see
+   "Why the guard-and-regenerate route is closed" above) and **the system
+   message is client-side only** (operator: arcint injects nothing). What is
+   left with evidence behind it is a different model or a different quant at
+   the same deployment — and the quant axis is closed above, on grounds of
+   power and confound. State the bar probabilistically and re-measure it at
+   the run count the resolution demands, or accept the unit at 0.65 of
+   batches. Not built, not claimed done.
 4. **`--llama-mtp 0` is now the weakest candidate, not the strongest.** It was
    listed as the untouched lever while the count bar was in force. Under the
    mean bar the zeros dominate, and `docs/llama-engine.md:440-444` records a
