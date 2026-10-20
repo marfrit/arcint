@@ -29,7 +29,7 @@ numbers are comparable with that history. Driver:
 `~/wp/coder-quality/accept.py`. Raw logs: `~/wp/coder-quality/logs/`
 (card host, not in this repo).
 
-## Result — baseline does not meet the bar
+## Result — baseline mean 9.833, one batch of 30
 
 | Arm | Score distribution | Perfect |
 |-----|--------------------|---------|

@@ -109,8 +109,74 @@ different cost, and under the mean bar it is the one that decides the gate.
 
 Zero-runs at 0.7 are not new to this repository: `docs/llama-engine.md:99-101`
 records the dense 27B sampling `9, 0, 10, 10, 0, 10`, and `:109` records
-builds whose KL agreed to four places scoring `10/10` and `0/10`. The defect
-is the task's, at temperature, not this unit's.
+builds whose KL agreed to four places scoring `10/10` and `0/10`. But the
+historical record does **not** carry this failure mode: scoring all 653
+`antwort-*` answers under `~/pruefstand` (`measured-here`), 43 score 0, of
+which **14 are syntax errors and 29 are other** (mostly the 2026-10-03
+population, which is a different task mix: 33 runs score 2/10), and **not one
+of the 653 contains a Python-ism**. The `pass`-in-Lua mode is specific to this
+model and this configuration, not to the task.
+
+### Every zero in the sweep, classified by cause (`measured-here`)
+
+The operator's check of `mb-2-08.lua` and `mb-2-13.lua` found the mechanism:
+with thinking off the model keeps reasoning aloud inside the CR/LF branch —
+27 and 19 comment lines against 7 in a passing answer — and then writes the
+Python statement `pass`, once preceded by `-- placeholder, will rewrite
+below`. Confirmed by reading the files: `mb-2-08.lua:59` is
+`pass -- placeholder, will rewrite below`, `mb-2-13.lua:49` is a bare `pass`,
+comment lines 25 and 19 against 10 in a passing answer. So the zero mode is
+**thinking leaking into the code, then a Python-ism**.
+
+Classifying all 510 sweep runs (`classify.py`), so an arm is never credited
+with fixing a defect it never touched:
+
+| arm | n | mean | zeros | syntax | cap | extraction |
+|---|---|---|---|---|---|---|
+| anchor (no knob, pooled) | 60 | 9.833 | 0 | 0 | 0 | 0 |
+| anchor 1 / anchor 2 | 30 / 30 | 9.833 / 9.800 | 0 | 0 | 0 | 0 |
+| mean-bar 1 / mean-bar 2 | 30 / 30 | 9.900 / **9.233** | 0 / **2** | 0 / **2** | 0 | 0 |
+| `min_p 0.1` (4 batches) | 120 | 9.767 | 1 | **0** | 1 | 0 |
+| `min_p 0.05` | 30 | 9.600 | 1 | 1 | 0 | 0 |
+| `top_k 20` / `top_k 40` | 30 / 30 | 9.867 / 9.800 | 0 | 0 | 0 | 0 |
+| `top_p 0.9` | 30 | 8.467 | 4 | 2 | 2 | 0 |
+| `top_p 0.95` | 30 | 7.933 | 6 | 6 | 0 | 0 |
+| thinking on | 60 | 8.483 | 6 | 4 | 0 | 2 |
+| **total** | **510** | | **20** | **15** | **3** | **2** |
+
+**The discriminator is the Python-ism, not the digression alone.** Across the
+sweep: 15 syntax zeros, of which **26.7 % contain a Python statement** —
+against **0.0 % of all 477 non-zero runs** (`pass`, `elif`, `None`/`True`,
+`def`, `.append(`, `#`). Comment density by itself barely separates (median 8
+lines in the syntax zeros against 7 in the perfects); the digression that
+matters is a *run* of consecutive comment lines, and it tracks the score:
+
+| longest comment run in the emitted code | n | mean | syntax zeros | perfect |
+|---|---|---|---|---|
+| < 5 lines | 419 | 9.671 | 7 | 85.0 % |
+| 5–7 lines | 22 | 8.455 | 3 | 72.7 % |
+| ≥ 8 lines | 9 | **6.333** | 1 | 44.4 % |
+
+### Ranking the knobs by the zero cause, which is the only thing the mean bar sees
+
+The zero-rate cannot rank arms: at ~1 % a run, showing a halving needs ~4,100
+runs an arm (~11 h each). The syntax-zero counts, pooled over every batch of
+this sweep, do separate one arm:
+
+| arm | syntax zeros | rate | Fisher p vs no-knob |
+|---|---|---|---|
+| no-knob (production) | 2 / 180 | 0.0111 | — |
+| `min_p 0.1` | 0 / 120 | 0.0000 | 0.52 |
+| `top_k 20/40` | 0 / 60 | 0.0000 | 1.00 |
+| `top_p 0.9/0.95` | **8 / 60** | **0.133** | **0.0003** |
+
+So the ranking is: **`top_p` is the only knob that measurably changes the
+zero-rate, and it raises it twelve-fold** (8 syntax zeros in 60 runs against 2
+in 180, Fisher p = 0.0003). `min_p` and `top_k` are indistinguishable from the
+no-knob arm and must not be credited with anything. The earlier
+`min_p 0.1` digression signal (4 digressions in 120 runs against 15 in 180,
+Fisher p = 0.094) is suggestive and **not** significant; it is recorded as a
+hypothesis for a future arm, not as a finding.
 
 ### Production measured against the mean bar
 
@@ -128,11 +194,13 @@ no sampler knob, thinking off, cap 4,000), same day, same unit:
 | zero-rate anchor 2 | 9.800 | 0.088 | 25×10, 4×9, 1×8 |
 | **pooled, n = 210** | **9.762** | **0.071** | 180×10, 26×9, 2×8, **2×0** |
 
-**The bar is not established for production as it runs today.** Pooled
-9.762 ± 0.071, 95 % CI [9.62, 9.90] — the bar at 9.8 sits inside that
-interval, so the honest verdict is *not established*, not *failed*. Batch
-means scatter 9.233–9.900 (sd 0.29 between batches, four times the
-within-batch SE), and all of that scatter is the zero-rate.
+**Production is not shown to meet the bar.** Pooled 9.762 ± 0.071, 95 % CI
+[9.62, 9.90]: the bar at 9.8 sits inside that interval, and the pooled point
+estimate is within one SE of it. That is *not shown to meet*, not *fails* —
+the measurement cannot resolve a tenth of a point at n = 210. What the
+measurement does resolve is the scatter: batch means run 9.233–9.900 (sd 0.29
+between batches, four times the within-batch SE), and all of that scatter is
+the zero-rate.
 
 At the measured rates — zero-rate **0.0095 a run** (2 of 210), perfect-rate
 0.865 among non-zero runs — a batch clears the bar with probability ≈ **0.68**:
@@ -250,25 +318,36 @@ governed by two different defects:
    masking it, and costs about 34 s of re-prefill per long follow-up — a small
    bill on this unit's measured traffic (5 such follow-ups in seven days). The
    mean bar neither supports nor contradicts it.
-2. **Sampled mean >= 9.8: not established, and no knob found here establishes
-   it.** Production pools to 9.762 +/- 0.071 over 210 runs. Sampler knobs are
-   measured and neutral (`min_p`, `top_k`) or harmful (`top_p`). The bar's
-   binding constraint is the **zero-rate** — 1 run in 105 emits Lua that does
-   not parse — and its ceiling: P(>= 24 perfect) = 0.90 even at a zero-rate of
-   nil. State the bar with its measured probability (about 0.68 of a batch) or
-   move the model; do not treat 9.8 as a property of this configuration.
-3. **The lever the mean bar points at, and it is not a card lever.** Removing
-   the two zeros from those same batches lifts the mean from 9.762 to **9.856
-   +/- 0.026**, clearing the bar with the interval off it. That is reachable
-   only by rejecting an unparseable answer and regenerating it: a syntax guard
-   (`luac5.4 -p` is on the host, and `pruefstand.lua` proves the same thing by
-   loading the file) in front of the coder, not inside the engine. Price: one
-   extra generation in about 1 in 105 requests, roughly 7 s. **This is a
-   conflict between a measured gain and a DESIGN invariant, so it is the
-   operator's call, not mine**: a retry loop in the served path changes what
-   the service promises about determinism, and the answer-level bar judges
-   correctness at the answer, which such a guard would be intervening in. Not
-   built, not claimed done — recorded as the only measured route to 9.8.
+2. **Sampled mean >= 9.8: not shown to be met, and no knob found here meets
+   it.** Production pools to 9.762 ± 0.071 over 210 runs — within one SE of
+   the bar, so the bar is unresolved rather than missed. Ranked by the cause
+   the mean bar actually sees, `top_p` raises the syntax-zero rate twelve-fold
+   (p = 0.0003) and `min_p`/`top_k` are indistinguishable from no knob. The
+   bar's binding constraint is the **zero-rate** — 1 run in 105 emits Lua that
+   does not parse — and its ceiling: P(>= 24 perfect) = 0.90 even at a
+   zero-rate of nil. State the bar with its measured probability (about 0.68
+   of a batch) or move the model; do not treat 9.8 as a settled property of
+   this configuration.
+3. **The lever the cause analysis points at.** The zero mode is now known
+   mechanically: with thinking off the model renders its reasoning as comment
+   blocks inside the CR/LF branch and then emits the Python statement `pass`
+   (`mb-2-08.lua:59`: `pass -- placeholder, will rewrite below`). Nothing in
+   the sampler touches that — and the measurement agrees: no knob lowers the
+   syntax-zero rate, `top_p` raises it. Two routes, both the operator's call:
+   - **Reject and regenerate.** A syntax guard in front of the coder
+     (`luac5.4 -p` is on the host; `pruefstand.lua` proves the same thing by
+     loading the file). Removing the two zeros from the same batches lifts the
+     mean from 9.762 to **9.856 ± 0.026**, clearing the bar with the interval
+     off it, at one extra generation in ~1 in 105 requests (~7 s). **A retry
+     loop in the served path conflicts with what the service promises about
+     determinism**, so per AGENTS.md rule 8 this is not mine to take.
+   - **Say it in the prompt.** The task text is the yardstick and must not
+     change, but a system message is honoured by the engine
+     (`src/core/chat.cpp:14` admits `system`/`developer`). "Lua only, no
+     Python statements" targets the exact defect. Untested, and it changes
+     what every client of the service gets, so it is a service-level decision,
+     not a measurement to slip in.
+   Not built, not claimed done.
 4. **`--llama-mtp 0` is now the weakest candidate, not the strongest.** It was
    listed as the untouched lever while the count bar was in force. Under the
    mean bar the zeros dominate, and `docs/llama-engine.md:440-444` records a
