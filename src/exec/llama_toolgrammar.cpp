@@ -4,6 +4,7 @@
 #include <stdexcept>
 
 #include "core/toolgrammar.h"
+#include "exec/backend.h"
 #include "util/log.h"
 
 namespace lgc {
@@ -24,7 +25,12 @@ std::string regex_escape(const std::string& s) {
 }  // namespace
 
 LlamaToolGrammar::LlamaToolGrammar(const llama_vocab* vocab, const std::vector<ToolSpec>& tools, bool parallel) {
-    gbnf_ = generate_tool_grammar(tools, parallel);
+    try {
+        gbnf_ = generate_tool_grammar(tools, parallel);
+    } catch (const std::invalid_argument& e) {
+        // the client's schema: a 400, before any token (handlers.cpp guarded())
+        throw InputError(std::string("tool_grammar: ") + e.what());
+    }
     if (gbnf_.empty()) throw std::runtime_error("tool grammar: no tools declared");
 
     const std::string opener = tool_grammar_trigger();

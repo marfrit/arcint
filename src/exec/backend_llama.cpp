@@ -1012,7 +1012,7 @@ public:
             stats.decode_sample_seconds += seconds_since(t_s);
         }
         stats.decode_seconds = seconds_since(t_decode);
-        report_tool_grammar(seq, tool_grammar.get());
+        report_tool_grammar(seq, tool_grammar.get(), sampler);
         log_expert_cache(seq);
         return reason;
     }
@@ -1153,7 +1153,7 @@ public:
             stats.decode_sample_seconds += seconds_since(t_s);
         }
         stats.decode_seconds = seconds_since(t_decode);
-        report_tool_grammar(seq, tool_grammar.get());
+        report_tool_grammar(seq, tool_grammar.get(), sampler);
         return reason;
     }
 
@@ -1585,7 +1585,7 @@ private:
                               "different lengths (process-wide)", seq,
                       static_cast<unsigned long long>(n_combined_), static_cast<unsigned long long>(n_uneven_));
         }
-        report_tool_grammar(seq, tool_grammar.get());
+        report_tool_grammar(seq, tool_grammar.get(), sampler);
         log_expert_cache(seq);
         return reason;
     }
@@ -1794,7 +1794,10 @@ private:
     }
 
     // One line a constrained request: how often the grammar overruled a draw.
-    static void report_tool_grammar(int seq, const LlamaToolGrammar* g) {
+    // Detaches it from the sampler too: the grammar is declared after the
+    // sampler, so it dies first, and the sampler must not keep its address.
+    static void report_tool_grammar(int seq, const LlamaToolGrammar* g, Sampler& sampler) {
+        sampler.set_constraint(nullptr);
         if (g == nullptr) return;
         log::info("grammar", "lane %d: tool-call grammar: %d draws masked%s", seq, g->rejections(),
                   g->broken() ? "; it gave up on a token outside it (warned above)" : "");

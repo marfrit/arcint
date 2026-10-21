@@ -23,7 +23,8 @@ public:
     // else a regex-escaped pattern -- llama.cpp's
     // common_sampling_add_grammar_triggers. Throws std::runtime_error when
     // the generator or llama.cpp's grammar parser refuses (the reference
-    // fails the request the same way: "failed to parse grammar").
+    // fails the request the same way: "failed to parse grammar"), and
+    // InputError (a 400) when a declared schema cannot be constrained.
     LlamaToolGrammar(const llama_vocab* vocab, const std::vector<ToolSpec>& tools, bool parallel);
     ~LlamaToolGrammar() override;
     LlamaToolGrammar(const LlamaToolGrammar&)            = delete;

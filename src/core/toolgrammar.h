@@ -24,7 +24,9 @@ namespace lgc {
 // the OpenAI default true), as the reference builds `calls`.
 //
 // Returns an empty string when no tools are declared: the caller then applies
-// no grammar, and a tool-less request is never constrained.
+// no grammar, and a tool-less request is never constrained. Throws
+// std::invalid_argument when a declared schema cannot be constrained (not an
+// object, or one the vendored closure refuses): the client's error.
 std::string generate_tool_grammar(const std::vector<ToolSpec>& tools, bool parallel = true);
 
 // The call opener: the lazy grammar's trigger word (the reference's

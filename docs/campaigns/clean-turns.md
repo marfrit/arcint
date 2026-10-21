@@ -620,6 +620,30 @@ the grammar. Decode t/s on against off: 79.5 against 79.5 — no movement beyond
 the ±0.1 run-to-run spread. The standard glance (no tools, so no grammar is
 built) with the switch on: 8/8 at 10/10, 72.7–77.2 t/s.
 
+### Review, and the second seat
+
+A review before the branch goes anywhere (a second model, read-only) found,
+and this branch fixed:
+
+- **A non-object `parameters` schema reached an unchecked cast** of the
+  schema root to an object (the reference casts the same way). Now checked:
+  such a schema, or one the vendored closure refuses, is the client's
+  `invalid_request` (400) before any token, not undefined behaviour or a 500
+  (`toolgrammar_refuses_a_non_object_schema`; at the endpoint: HTTP 400).
+- **The endpoint gate could not go red** for a grammar that never triggers:
+  an on arm with no call counted as valid, and a shape that was never red off
+  was not required to be. `tool_grammar_gate.py` now fails an on arm without
+  a call where its off twin made one, and fails a shape never red with the
+  switch off.
+- The sampler kept the grammar's address past its lifetime at the end of
+  each loop (unused, but a trap); it is detached when the request reports.
+
+Second seat, 7 min (17:09–17:16 UTC), the fixed build (sha256 `0c29dc14…`),
+the stricter gate: every number above reproduced — 11 of 12 off arms
+malformed, 0 on-arm failures, every shape red at least once off, CSV call
+10/10 ×10 with the T=0 answers byte-identical off and on, decode 79.5 / 79.5
+off against 79.4 ×3 on.
+
 ### Open
 
 - The **default stays off** — turning it on for a unit is the operator's

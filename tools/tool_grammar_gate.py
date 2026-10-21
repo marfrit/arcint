@@ -22,7 +22,9 @@ prompts, nothing from any session:
 Usage: tool_grammar_gate.py URL MODEL --task FILE --scorer DIR --out DIR
        [--server-log FILE] [--plain] [--parts malformed,csv-call]
 Prints one line per request and a summary; exit 1 when an on-arm call is
-schema-invalid (the gate), 0 otherwise. Counts and scores only.
+schema-invalid, when an on arm makes no call where its off twin made one, or
+when a malformed shape was never red with the switch off (the gate), 0
+otherwise. Counts and scores only.
 """
 import argparse
 import json
@@ -30,6 +32,7 @@ import os
 import re
 import subprocess
 import time
+import urllib.error
 import urllib.request
 
 READ_FILE = {"type": "function", "function": {
@@ -172,10 +175,22 @@ def main():
     red_seen = {}
 
     if "malformed" in parts:
+        # a schema the call form cannot constrain is the client's 400, not a 500
+        bad_tool = {"type": "function", "function": {"name": "f", "parameters": {"type": "string"}}}
+        try:
+            post(a.url, {"model": a.model, "messages": [{"role": "user", "content": "hi"}], "tools": [bad_tool],
+                         "max_tokens": 8, "tool_grammar": True})
+            code = 200
+        except urllib.error.HTTPError as e:
+            code = e.code
+        print("== non-object parameters schema with the switch on: HTTP %d (want 400)" % code)
+        if code != 400:
+            gate_fail += 1
         print("== malformed: off is the red control, on must be schema-valid")
         arms = [(0.0, 0, False), (0.7, 1, False), (0.0, 0, True)]
         for name, tools, prompt in MALFORMED:
             for temp, seed, think in arms:
+                off_had_call = False
                 for on in (False, True):
                     body = {"model": a.model, "messages": [{"role": "user", "content": prompt}], "tools": tools,
                             "max_tokens": 2048 if think else 512, "temperature": temp, "seed": seed,
@@ -190,7 +205,13 @@ def main():
                     content = ch["message"].get("content") or ""
                     if on and bad:
                         gate_fail += 1
+                    # an on arm with no call passes only where its off twin
+                    # made none either (the cap, say): a grammar that never
+                    # triggers must not read as green
+                    if on and not calls and off_had_call:
+                        gate_fail += 1
                     if not on:
+                        off_had_call = bool(calls)
                         red_seen.setdefault(name, 0)
                         red_seen[name] += 1 if bad else 0
                     verdict = "INVALID" if bad else ("valid" if calls else "no-call")
@@ -252,9 +273,12 @@ def main():
             print("csv-plain #%d T=%.1f PUNKTE %s/10 | decode %s t/s | %.1f s"
                   % (i, temp, score(a.scorer, path), d["tps"], dt))
 
-    print("== summary: on-arm schema-invalid calls: %d; off-arm malformed calls per shape: %s"
-          % (gate_fail, red_seen))
-    return 1 if gate_fail else 0
+    # every shape must have been red at least once with the switch off, or
+    # the on arm's validity measures nothing
+    not_red = sorted(k for k, v in red_seen.items() if v == 0)
+    print("== summary: on-arm failures (invalid, or no call where off made one): %d; off-arm malformed calls "
+          "per shape: %s%s" % (gate_fail, red_seen, "; NEVER RED: %s" % not_red if not_red else ""))
+    return 1 if gate_fail or not_red else 0
 
 
 if __name__ == "__main__":

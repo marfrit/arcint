@@ -2,6 +2,7 @@
 
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -88,7 +89,18 @@ common_peg_parser build_function(toolcall_peg_builder & p, size_t tool_index,
     auto arg_string = p.rule("xml-arg-string",
                              p.ac(p.tool_arg_string_value(p.until("\n" + kParamEnd + "\n")) + arg_close, "\n" + kParamEnd + "\n"));
 
-    auto doc = std::make_shared<const common_chat_schema_document>(common_chat_schema_from_json(params));
+    // The client's schema: one the closure cannot read, or whose root is not
+    // an object (the call form names parameters, so nothing else can be
+    // constrained), is the request's fault. The reference casts the root to
+    // an object unchecked; here it is checked, since a request reaches it.
+    std::shared_ptr<const common_chat_schema_document> doc;
+    try {
+        doc = std::make_shared<const common_chat_schema_document>(common_chat_schema_from_json(params));
+    } catch (const std::exception& e) {
+        throw std::invalid_argument("tool '" + name + "': its parameters schema cannot be constrained: " + e.what());
+    }
+    if (!doc->root || doc->root->kind() != common_chat_schema::KIND_OBJECT)
+        throw std::invalid_argument("tool '" + name + "': its parameters schema must be an object");
 
     std::vector<common_peg_parser> required_args;
     std::vector<common_peg_parser> optional_args;

@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -75,6 +76,24 @@ TEST(toolgrammar_names_the_declared_set) {
         CHECK(g.find(want) != std::string::npos);
     // an undeclared name is nowhere in it
     CHECK(g.find("delete_everything") == std::string::npos);
+}
+
+// A schema the call form cannot constrain is the client's error, never a cast
+// of the wrong node (the reference casts the root unchecked).
+TEST(toolgrammar_refuses_a_non_object_schema) {
+    ToolSpec bad;
+    bad.name       = "f";
+    bad.parameters = nlohmann::json::parse(R"({"type":"string"})");
+    bool threw     = false;
+    try {
+        (void)generate_tool_grammar({ bad });
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+    ToolSpec none;   // no parameters at all: an object with none, not an error
+    none.name = "g";
+    CHECK(!generate_tool_grammar({ none }).empty());
 }
 
 // ------------------------------------------------------- the sampler's hook
