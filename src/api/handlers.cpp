@@ -846,7 +846,14 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     }
 
     json message = {{"role", "assistant"}};
-    if (!split.reasoning.empty()) message["reasoning_content"] = split.reasoning;
+    if (!split.reasoning.empty()) {
+        message["reasoning_content"] = split.reasoning;
+        // Whether the think block's closer was seen before the turn ended.
+        // The split computes it but the client could not see it, which made an
+        // empty answer that closed the block indistinguishable from the defect
+        // (a turn-ending token winning a step while the block was still open).
+        message["reasoning_closed"] = split.closed;
+    }
     if (calls.empty()) {
         message["content"] = content;
     } else {

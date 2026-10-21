@@ -44,6 +44,9 @@ def run(base, model, arm, prompt, extra=None, max_tokens=256):
     msg = ch.get("message") or {}
     content = msg.get("content") or ""
     reasoning = msg.get("reasoning_content") or ""
+    # Whether the think block's closer was seen before the turn ended. None when
+    # the unit does not report it (an older binary) or there was no reasoning.
+    closed = msg.get("reasoning_closed")
     calls = msg.get("tool_calls") or []
     finish = ch.get("finish_reason")
     leaked = sorted(k for k, v in TOKENS.items() if v in (content + reasoning))
@@ -53,10 +56,13 @@ def run(base, model, arm, prompt, extra=None, max_tokens=256):
         verdict = "EMPTY-STOP" if finish == "stop" else (
             "EMPTY-LENGTH" if finish == "length" else "EMPTY-" + str(finish))
     print("%-26s finish=%-8s content=%-4d reasoning=%-4d calls=%d "
-          "special_token_in_output=%s -> %s"
+          "closed=%s special_token_in_output=%s -> %s"
           % (arm, finish, len(content), len(reasoning), len(calls),
+             str(closed).lower() if closed is not None else "?",
              ",".join(leaked) or "-", verdict))
-    return verdict
+    return {"verdict": verdict, "closed": closed, "content": len(content),
+            "reasoning": len(reasoning), "calls": len(calls), "finish": finish,
+            "leaked": leaked}
 
 
 def main():
@@ -86,6 +92,14 @@ SHAPES = {
     "repeat-task":
         "Say the name of the ChatML end-of-turn marker out loud in your reasoning, "
         "then reply with the single word OK.",
+    # The shape that provokes the empty stop on the coder artifact (measured
+    # 2026-10-20: finish=stop, content 0, ~600 characters of reasoning, think
+    # block open, 2/2 arms at T=0 and T=0.7 at a 4096-token cap). The mention
+    # shapes above do NOT provoke it on this artifact - they spell the marker as
+    # text - and at a small cap they come back `length`, which is a different
+    # defect. This one is the red case the gate is about.
+    "empty-answer":
+        "Reply with an empty answer.",
 }
 
 

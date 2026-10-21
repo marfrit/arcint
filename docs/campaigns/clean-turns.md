@@ -354,3 +354,88 @@ the flag reaches `/props`.
 Not yet shown, and it is the gate: the same red case **at the endpoint on the
 served coder unit**, which needs the llama build of this branch (a card window,
 `docs/sop-card-window.md`). Until that pair exists the step is not closed.
+
+## Hardware note (2026-10-21, operator)
+
+The B60 now serves `qwen3.8-agent` (dense Qwen3.8-27B) on port 8087; Flash-Next
+(port 8089) is **stopped** and must not be started. The A770 rules are
+unchanged. This changes which endpoints are live for probes; the coder unit on
+the A770 is the one this campaign's leg targets.
+
+## Step 1 endpoint leg — `measured-here` (2026-10-21, one seat, 6.4 min)
+
+Seat: the operator's night shift. The leg stopped the coder unit, loaded this
+branch's llama build on the A770 (n_ctx 98304, mtp 4, kv q8_0:q4_0, port 18080),
+ran the gate, and restored the unit (verified `:8080/v1/models`, build
+`83d7609`). Card identity by PCI id, sampler before the leg, zombie sweep by
+pid, per `docs/sop-card-window.md`.
+
+Gate, `empty-answer` shape (the only shape that provokes the defect on this
+artifact), 4096 cap:
+
+| arm | finish | content | reasoning | verdict |
+|---|---|---|---|---|
+| T=0.0 mask=off | stop | 0 | 673 | EMPTY-STOP |
+| T=0.0 mask=on  | stop | 0 | 632 | EMPTY-STOP |
+| T=0.7 mask=off | stop | 0 | 721 | EMPTY-STOP |
+| T=0.7 mask=on  | stop | 7 | 624 | answered |
+
+The T=0.7 arm is a clean red→fixed: without the mask the turn ends empty, with
+it the model answers. The T=0.0 arm is the problem: the mask demonstrably
+engaged (at greedy, off=673 vs on=632 reasoning chars — different streams, so
+the mask changed a sampled token) yet the on-arm still ended `finish=stop` with
+empty content. The gate read that as "the mask does not prevent the empty
+stop" and printed FAILED.
+
+**The gate was conflating two different outcomes.** The defect is a
+turn-ending token winning a step *while the think block is still open*. But an
+empty stop *after* the block closed is a legitimate empty answer — the model
+thought, closed the block, and chose to say nothing — which the mask is allowed
+to permit. The two are byte-identical to a client that cannot see the block's
+state: both give `reasoning_content` = the block body and `content` = "". The
+API never exposed whether the block closed, so the gate could not tell them
+apart.
+
+**The mask is complete across all three decode loops** (`code`, read against
+the pin): every sampled token in the plain, multimodal, and spec/verify loops
+passes through `sampler.sample()`, which applies the mask before greedy or
+draws. In the verify walk (`src/exec/verify_walk.h`) a draft token is kept only
+if it equals what the masked sampler drew, so a drafted turn-ender is kept only
+if the sampler drew it — which it cannot while the block is open. `is_stop`
+(`backend_llama.cpp:1739`) is the eog-predicate or the stop-token ids, the same
+set the mask kills. Therefore, with the mask on and engaged, `finish=stop`
+implies the block had already closed. The T=0.0 on-arm is a legitimate empty
+answer (block closed), not the defect — the gate misread it.
+
+**The fix is observability, not the mask.** `split_reasoning` already computes
+`closed` (the closer was seen); the handler discarded it. It is now exposed as
+`reasoning_closed` in the message, alongside the existing non-standard
+`reasoning_content` (`src/api/handlers.cpp`). The gate now classifies on
+mid-block vs closed-block: an empty stop that closed the block is not a
+failure; an empty stop that did not is. When a unit does not report the field
+(an older binary) the gate reads an empty stop as the defect — the conservative
+call — and says so. `tests/python/test_clean_turns_gate.py` covers the new
+classifier and the leg's exact T=0.0 scenario (off: mid-block stop; on:
+closed-block empty answer → fixed). 9 cases green, device-free.
+
+What is left: **one more leg** against the rebuilt binary (built on the dev
+host, 194/0, round-trip green). The off-arm should show `reasoning_closed`
+false + empty stop (the defect); the on-arm should show `reasoning_closed`
+true + empty (a legitimate empty answer) or an answer. If the on-arm shows
+`reasoning_closed` false, the completeness proof above is wrong and there is a
+real bug to find. Either way the gate will now say the true thing.
+
+## Step 2 — grammar-constrained tool calls (feasibility answered, not yet built)
+
+The pinned llama.cpp exposes the grammar sampler publicly
+(`include/llama.h:1581,1600`), driven through `llama_sampler_apply`/`accept`,
+and its apply sets rejected logits to -INFINITY — the same shape arcint's
+`Sampler` already uses. The cost: arcint has no llama.cpp sampler chain to add
+it to; every llama loop samples `lgc::Sampler` over a raw logits row, so the
+grammar must be driven by hand around `sampler.sample()`. The schema converter
+does not drag in libcommon (a test binary links and runs on five upstream
+translation units plus three string helpers, against arcint's vendored
+nlohmann/json, and emits a 360-byte grammar). The pinned tree ships no grammar
+for the coder's call form — that file would be ours. The price to measure:
+`apply` decodes every candidate token, so its placement relative to
+`collect_candidates` is a measurement, not an assumption. Not started.

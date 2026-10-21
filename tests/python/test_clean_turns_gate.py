@@ -23,23 +23,39 @@ sys.path.insert(0, str(TOOLS))
 import clean_turns_gate as gate  # noqa: E402
 
 
-def test_only_an_empty_stop_counts_as_the_defect():
-    assert gate.classify("EMPTY-STOP", "answered") == "fixed"
-    assert gate.classify("EMPTY-STOP", "EMPTY-STOP") == "red"
+def res(verdict, closed=None):
+    """A probe.run() result, shaped the way the gate consumes it."""
+    return {"verdict": verdict, "closed": closed}
+
+
+def test_only_a_mid_block_stop_counts_as_the_defect():
+    # An empty stop that closed the block is a legitimate empty answer, not the
+    # defect. Only a stop while the block is still open is.
+    assert gate.classify(res("EMPTY-STOP", False), res("answered")) == "fixed"
+    assert gate.classify(res("EMPTY-STOP", False), res("EMPTY-STOP", False)) == "red"
+    # The mask cleared it into a closed-block empty answer: fixed, not red.
+    assert gate.classify(res("EMPTY-STOP", False), res("EMPTY-STOP", True)) == "fixed"
 
 
 def test_a_cap_ended_empty_is_not_the_defect():
     # The mask is about the turn-ending token winning a step, not max_tokens.
-    assert gate.classify("EMPTY-LENGTH", "answered") == "neither"
-    assert gate.classify("EMPTY-LENGTH", "EMPTY-LENGTH") == "neither"
+    assert gate.classify(res("EMPTY-LENGTH"), res("answered")) == "neither"
+    assert gate.classify(res("EMPTY-LENGTH"), res("EMPTY-LENGTH")) == "neither"
 
 
 def test_a_quiet_arm_proves_nothing():
-    assert gate.classify("answered", "answered") == "neither"
+    assert gate.classify(res("answered"), res("answered")) == "neither"
 
 
 def test_empty_only_with_the_mask_is_the_opposite_defect():
-    assert gate.classify("answered", "EMPTY-STOP") == "flipped"
+    assert gate.classify(res("answered"), res("EMPTY-STOP", False)) == "flipped"
+
+
+def test_an_unreported_closed_state_is_read_as_the_defect():
+    # An older unit that does not report the block's state: an empty stop is
+    # the conservative call, and the gate says so rather than guessing.
+    assert gate.classify(res("EMPTY-STOP", None), res("answered")) == "fixed"
+    assert gate.classify(res("EMPTY-STOP", None), res("EMPTY-STOP", None)) == "red"
 
 
 class _Server(http.server.BaseHTTPRequestHandler):
@@ -48,10 +64,14 @@ class _Server(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(n) or b"{}")
-        content, finish = self.shape(body)
+        content, finish, closed = self.shape(body)
+        message = {"role": "assistant", "content": content}
+        if content == "":
+            # an empty answer comes out of a think block, like the real unit's
+            message["reasoning_content"] = "a block of reasoning"
+            message["reasoning_closed"] = closed
         raw = json.dumps({"choices": [{"finish_reason": finish, "index": 0,
-                                       "message": {"role": "assistant",
-                                                   "content": content}}]}).encode()
+                                       "message": message}]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
@@ -59,7 +79,7 @@ class _Server(http.server.BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def shape(self, body):
-        return "always an answer", "stop"
+        return "always an answer", "stop", False
 
     def log_message(self, *a):
         pass
@@ -107,7 +127,9 @@ def test_the_gate_refuses_to_pass_when_nothing_was_provoked():
 def test_the_gate_fails_when_the_mask_does_not_clear_the_stop():
     class AlwaysEmpty(_Server):
         def shape(self, body):
-            return "", "stop"
+            # empty, and the block never closed: the defect, with and without
+            # the mask
+            return "", "stop", False
 
     srv, port = _serve(AlwaysEmpty)
     try:
@@ -124,10 +146,30 @@ def test_the_gate_passes_when_the_pair_actually_pairs():
             # empty without the field, an answer with it: the red case and its
             # fix, served by one stand-in
             if body.get("think_eog_mask"):
-                return "an answer", "stop"
-            return "", "stop"
+                return "an answer", "stop", False
+            return "", "stop", False
 
     srv, port = _serve(FixedByMask)
+    try:
+        r = _run_gate(port)
+    finally:
+        srv.shutdown()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "GATE PASSED" in r.stdout, r.stdout
+
+
+def test_a_closed_block_empty_answer_is_not_a_failure():
+    # The leg's T=0 arm: without the mask the turn ends mid-block (the defect);
+    # with it the model closes the block and gives the empty answer the prompt
+    # asked for. Both arms look empty to a client that cannot see the block's
+    # state; the closed flag is what separates them.
+    class ClosesThenEmpty(_Server):
+        def shape(self, body):
+            if body.get("think_eog_mask"):
+                return "", "stop", True    # closed the block, then an empty answer
+            return "", "stop", False       # ended mid-block: the defect
+
+    srv, port = _serve(ClosesThenEmpty)
     try:
         r = _run_gate(port)
     finally:

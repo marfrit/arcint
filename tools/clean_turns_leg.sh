@@ -23,7 +23,7 @@
 set -uo pipefail
 
 SEAT="" BIN="" GGUF="" DEVICE="GPU.1" PORT="18080" NCTX="98304" MTP="4"
-KV="q8_0:q4_0" EXTRA="" MODEL="qwen3.6-coder"
+KV="q8_0:q4_0" EXTRA="" MODEL="qwen3.6-coder" SHAPES="" POST=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --seat)    SEAT="$2"; shift 2 ;;
@@ -36,6 +36,8 @@ while [[ $# -gt 0 ]]; do
     --kv)      KV="$2"; shift 2 ;;
     --model)   MODEL="$2"; shift 2 ;;
     --extra)   EXTRA="$2"; shift 2 ;;
+    --shapes)  SHAPES="$2"; shift 2 ;;
+    --post)    POST="$2"; shift 2 ;;
     *) echo "clean_turns_leg: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -153,10 +155,27 @@ print("  build:", (d.get("build") or {}).get("git"), (d.get("build") or {}).get(
 
 # The pair. 4096-token cap: at 64 the same shape comes back as `length`, which
 # is why the earlier arms hid it (campaign note, step 1 at the endpoint).
-timeout 1800 python3 "$here/clean_turns_gate.py" "http://127.0.0.1:$PORT" "$MODEL" \
-  > "$gate" 2>&1
+gate_args=("$here/clean_turns_gate.py" "http://127.0.0.1:$PORT" "$MODEL")
+[[ -n "$SHAPES" ]] && gate_args+=(--shapes="$SHAPES")
+timeout 1500 python3 "${gate_args[@]}" > "$gate" 2>&1
 grc=$?
 cat "$gate"
+
+# Step 3 rides the same load: the CSV sanity glance and the decode t/s line.
+# A post script is the operator's harness (it lives outside the repository);
+# it sees the endpoint and the model name, and its output is kept, not gated.
+post_rc=0
+if [[ -n "$POST" ]]; then
+  if [[ -x "$POST" ]]; then
+    ARCINT_URL="http://127.0.0.1:$PORT" ARCINT_MODEL="$MODEL" LEG_LOGDIR="$logdir" \
+      timeout 1500 "$POST" > "$logdir/post.out" 2>&1
+    post_rc=$?
+    sed -n '1,60p' "$logdir/post.out"
+  else
+    echo "clean_turns_leg: --post script not executable: $POST (skipped)" | tee "$logdir/post.out"
+    post_rc=127
+  fi
+fi
 
 # SOP §5: sweep by pid, never pkill -f with a pattern that lives in this line.
 kill -9 "$srvpid" 2>/dev/null
@@ -172,4 +191,7 @@ left=$(pgrep -cf "^${BIN}\b" || true)
 echo
 echo "log: $logdir (header.txt, sampler.log, server.log, gate.out)"
 echo "gate exit: $grc  (0 = the pair paired; 1 = FAILED or NOT SHOWN, see gate.out)"
+[[ -n "$POST" ]] && echo "post exit: $post_rc (see post.out)"
+# The decode line the server printed, whatever the gate said: step 3's number.
+grep -E "decode" "$srv" | tail -4 | sed 's/^/  /' || true
 exit $grc
