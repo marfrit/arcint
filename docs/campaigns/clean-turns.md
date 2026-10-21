@@ -264,6 +264,10 @@ call, not repair of observed breakage.
 
 ## Status
 
+- **Step 2 handover (2026-10-21):** the unfinished step-2 work lives on
+  branch `clean-turns-wip`; see [clean-turns-handover.md](clean-turns-handover.md)
+  for what is wired, what is not, and the exact next steps.
+
 - Step 0 done (this note).
 - Step 1 in progress: landed at unit level, gate written and proven able to
   fail; the endpoint pair needs the branch's llama build (running on the GPU
