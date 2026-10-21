@@ -137,11 +137,139 @@ one.
 
 (recon below, `code`)
 
+## Step 1 vocabulary facts on the served artifact (`measured-here`, 2026-10-21, no card)
+
+The mask's design has an assumption under it: that a think-tag is ONE token in
+the served vocabulary, so there is one logit to block. That is a fact about the
+artifact's file, and it was never checked. It is now, two ways, neither needing
+a GPU:
+
+| how | what it reads |
+|---|---|
+| `tools/think_vocab_probe.py` | the GGUF's metadata only (added-token list, token-type table, eos/eot ids) — pure Python, no llama, no device |
+| `tools/vocab_eog_probe.cpp` | the vocabulary as **the pinned llama.cpp loads it**: `vocab_only=true`, so no tensors, no device, no card seat; asks `llama_vocab_is_eog` over the whole vocabulary and `llama_tokenize(parse_special=true)` per tag |
+
+On the served coder artifact (`qwen36-coder-iwo3-c5f495ac-shq8.gguf`, 248320
+tokens, 753 tensors, Q4_K - Medium), by the second probe, run against the
+branch's own `libllama.a` on the GPU dev host:
+
+| fact | value | consequence for the mask |
+|---|---|---|
+| ids `llama_vocab_is_eog` answers true for | **5**: 248044, 248046, 248063, 248064, 248065 | the mask blocks five logits per step while the block is open, not one — and it is the same predicate `is_stop` asks, so the two cannot disagree about which ids those are |
+| the think opener | **one id**, 248068, attr `user_defined` | blockable by id, as designed |
+| the think closer | **one id**, 248069, attr `user_defined` | never blocked (emitting it is what re-opens the turn), matched as text |
+| the longer reasoning-tag variants (`thinking`, `reason`) | 3-4 ids each | no id to block; the text-match path is what covers them |
+
+The code already takes exactly that set: `prepare_think_mask` copies
+`eog_ids_`, and `eog_ids_` is built by asking `llama_vocab_is_eog` over the
+whole vocabulary (`src/exec/backend_llama.cpp:507-509`) — the same predicate
+`is_stop` asks. Nothing hard-codes one end-of-turn id, so the four ids nobody
+named did not get missed. The measurement confirmed the code rather than
+changing it, which is the order it should happen in.
+
+The `user_defined` type is the part worth keeping: llama.cpp's special-token
+cache is built over `CONTROL | USER_DEFINED | UNKNOWN`
+(`src/llama-vocab.cpp:3177`), and `tokenize(..., parse_special=true)` partitions
+on that cache (`src/llama-vocab.cpp:3399-3410`), so a tag typed `user_defined`
+still tokenizes to one id. A probe that only looked for the `CONTROL` type
+would have called these tags "text" and been wrong. The Python probe reports
+the type rather than deciding on it, for that reason.
+
+Two bugs found while writing the probes, both worth naming: GGUF array elements
+carry no type byte of their own (reading one per element desyncs the stream at
+the token-type array, which is the array the probe needs); and in
+`meta[string()] = value()` CPython evaluates the **right-hand side first**, so
+the value was decoded before its key. Both produced confident nonsense, not
+errors.
+
+## Step 1 endpoint pair — what the leg needs, and what it costs
+
+The gate is a pair on one served unit: the same arm empty without
+`think_eog_mask`, continuing with it. Running it needs a serving process built
+from this branch, and that is where the cost sits:
+
+- The **served coder unit is the installed package** (`arcint 1.2.1`, build
+  `83d7609`) on the 16 GiB card. It cannot serve the `on` arm: the field does
+  not exist in it. So the pair cannot be run against the unit as it stands.
+- The branch **does build** on the GPU dev host against the pin with all 60
+  patches (`~/wp/clean-turns/build/arcint`, configured
+  `-DARCINT_LLAMA=ON -DARCINT_LLAMA_DIR=~/lcpp-clean -DGGML_OPENCL=ON`, the
+  recipe `~/wp/wt-0019/build-0020` used). Device-free suite in that build:
+  **194 cases, 0 failed**. `--think-eog-mask` is in its `--help`.
+- Running it means loading a 13.58 GiB artifact, and **both cards are held by
+  the two serving units**. Stopping a serving unit is the operator's call, not
+  a step an agent takes: the fleet rule is one seat per card, announced, and
+  mneme records a past accident where an engineer's own rollout at the unit he
+  was building on killed his own agent loop.
+- The leg is otherwise prepared: the gate script and the probe are on the host
+  (`~/ct-tools/`), and the gate's verdict logic is already proven fail-capable
+  against a stand-in server. Against the current package the gate prints
+  **NOT SHOWN** (exit 1), which is the correct reading of that run: the arms
+  came back `EMPTY-LENGTH` at a 256-token cap, a different defect.
+
+So step 1 is one seat away, and the seat is the operator's decision.
+
+## Step 2 feasibility — grammar machinery: it can be wired in (`code` + `measured-here`)
+
+The gate asked for a `file:line` reason if it cannot be done. It can, and the
+reasons it is not free are these:
+
+
+**What the pinned tree offers** (`code`, llama.cpp `3e4dfa8` + the 60
+`contrib/llama.cpp/patches`, all 60 applying clean to the pin):
+| driven through the chain entry points | `include/llama.h:1493` (`llama_sampler_accept`), `:1494` (`llama_sampler_apply`) |
+| the mask itself sets rejected logits to `-INFINITY` on a `llama_token_data_array` | `src/llama-grammar.cpp:1359` (`llama_grammar_apply_impl`), rejects applied at `:1386`, `:1389`, `:1398` |
+| it also blocks the turn-ending token while no stack is complete | `src/llama-grammar.cpp:1384-1387` |
+| lazy mode: grammar engages only after a trigger pattern or trigger token | `src/llama-grammar.cpp:1313`, `:1362`, `:1407-1409` |
+| JSON-Schema to GBNF converter | `common/json-schema-to-grammar.cpp:993` |
+
+**The integration cost, which is the part a paper would not tell us** (`code`):
+arcint has **no llama.cpp sampler chain to add it to**. Every llama decode loop
+samples arcint's own `lgc::Sampler` over a raw logits row —
+`src/exec/backend_llama.cpp:975`, `:1009` (plain), `:1114`, `:1148`
+(multimodal), `:1252`, `:1289` (spec/verify). So "wire in the grammar sampler"
+means driving `llama_sampler_apply` / `llama_sampler_accept` by hand around
+arcint's `sample()` on the same row, and feeding it every token the loop
+accepts, including speculative ones. The mechanism itself is compatible —
+`apply` mutates logits in place, which is exactly what `Sampler::sample` does.
+
+**The converter does not drag libcommon in** (`measured-here`, 2026-10-21, on
+this machine, no GPU): a test binary that turns a two-property schema into
+GBNF links and runs against exactly five upstream translation units —
+`json-schema-to-grammar.cpp`, `common/json.cpp`, `common/json-schema.cpp`,
+`common/trie.cpp`, `common/unicode.cpp` — plus three string helpers
+(`string_repeat`, `string_join`, `string_split`; declared in `common/common.h`,
+defined in `common/common.cpp`, so a handful of functions, not the library) and
+`ggml_abort`, which arcint already links. Compiled with arcint's own vendored
+`nlohmann/json` 3.11.3 on the include path (`THIRD_PARTY.md`), not upstream's,
+and it produced a 360-byte grammar. So the schema→grammar half is a small,
+contained dependency, not a fork of upstream's `common`.
+
+**What is ours to write**: the pinned tree ships no grammar for the Qwen
+coder's call form (`grammars/` holds `json.gbnf`, `json_arr.gbnf`, arithmetic,
+chess — nothing with the function/parameter block form). The call grammar
+would be arcint's file, generated per request from the declared schemas.
+
+**The price to measure, not yet measured**: `apply` decodes every candidate
+token to a piece (`src/llama-grammar.cpp:1382`) before testing it. arcint
+hands `sample()` the full vocabulary row, so a naive placement costs a
+per-candidate decode over ~152k ids per step. Placing it after
+`collect_candidates` (top-k/top-p first) bounds that to the candidate set but
+changes which tokens the grammar ever sees — that trade is a measurement, not
+a guess, and it belongs with the decode t/s number step 3 asks for.
+
+**Priority stays where the baseline put it**: 2 unterminated call blocks in
+2395 served completions. Step 2's benefit is unreachability of the malformed
+call, not repair of observed breakage.
+
 ## Status
 
 - Step 0 done (this note).
-- Step 1 in progress.
-- Steps 2-3 not started.
+- Step 1 in progress: landed at unit level, gate written and proven able to
+  fail; the endpoint pair needs the branch's llama build (running on the GPU
+  dev host as of this writing).
+- Step 2 feasibility answered above: wireable, at a named cost.
+- Step 3 not started.
 
 ## Step 1 measured at the endpoint (before any code change)
 
