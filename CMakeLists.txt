@@ -128,7 +128,8 @@ if(ARCINT_LLAMA)
   set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
   add_subdirectory("${ARCINT_LLAMA_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/llama.cpp" EXCLUDE_FROM_ALL)
   find_package(OpenCL REQUIRED)
-  target_sources(arcint_core PRIVATE src/exec/backend_llama.cpp src/exec/llama_spec.cpp src/exec/llama_dflash.cpp)
+  target_sources(arcint_core PRIVATE src/exec/backend_llama.cpp src/exec/llama_spec.cpp src/exec/llama_dflash.cpp
+                                     src/exec/llama_toolgrammar.cpp)
   # The DFlash2 drafter's red cases (tests/dflash/legs.sh): a build with a
   # mutant compiled in, which says so at load. 0 is the served build; the
   # cases are listed in src/exec/llama_dflash.cpp and tests/dflash/legs.sh
@@ -232,9 +233,16 @@ if(ARCINT_TESTS)
     tests/test_lanes.cpp
     tests/test_reasoning.cpp
     tests/test_decode_stats.cpp
+    tests/test_toolgrammar.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+  if(ARCINT_LLAMA)
+    # test_toolgrammar.cpp runs the generated GBNF through libllama's grammar
+    # engine on text (llama-grammar.h, the entry points upstream's own grammar
+    # tests use), so it needs the pinned tree's src/ on its include path
+    target_include_directories(arcint-test PRIVATE "${ARCINT_LLAMA_DIR}/src")
+  endif()
   # test_props.cpp reads src/exec/backend_llama.cpp (the KV-precision tripwire:
   # the llama backend cannot be constructed without a card).
   target_compile_definitions(arcint-test PRIVATE

@@ -3,8 +3,10 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
+#include "core/toolcall.h"
 #include "json-schema-to-grammar.h"
 #include "json.h"
 #include "peg-parser.h"
@@ -14,16 +16,10 @@ namespace {
 
 using common_json = ::common_json;
 
-// The coder's call tags, spelled from parts (a "<" or "</" prefix plus the
-// rest) so no complete tag stands contiguously in this source. The open/close
-// are single special tokens on the coder vocabulary (measured); the inner tags
-// are spelled as text.
-const std::string kOpen      = std::string("<")  + "tool_call>";
-const std::string kClose     = std::string("</") + "tool_call>";
-const std::string kFnOpen    = std::string("<")  + "function=";
-const std::string kFnClose   = std::string("</") + "function>";
-const std::string kParamOpen = std::string("<")  + "parameter=";
-const std::string kParamEnd  = std::string("</") + "parameter>";
+// The coder's call tags, from the one table the parser reads too
+// (core/toolcall.h, tool_call_tags()), so the grammar and the parser cannot
+// disagree about what a call looks like and no tag is written out here.
+std::string tag_text(std::string_view t) { return std::string(t); }
 
 // The one derived-class method the tool-call block needs that the base builder
 // does not provide: permute (required args in any order). Copied verbatim from
@@ -83,6 +79,11 @@ class toolcall_peg_builder : public common_peg_parser_builder {
 // client declared). Returns the `tool-N` rule.
 common_peg_parser build_function(toolcall_peg_builder & p, size_t tool_index,
                                  const std::string & name, const common_json & params) {
+    const ToolCallTags& t      = tool_call_tags();
+    const std::string kFnOpen    = tag_text(t.fn_open);
+    const std::string kFnClose   = tag_text(t.fn_close);
+    const std::string kParamOpen = tag_text(t.param_open);
+    const std::string kParamEnd  = tag_text(t.param_end);
     auto arg_close  = p.tool_arg_close(p.literal("\n" + kParamEnd + "\n"));
     auto arg_string = p.rule("xml-arg-string",
                              p.ac(p.tool_arg_string_value(p.until("\n" + kParamEnd + "\n")) + arg_close, "\n" + kParamEnd + "\n"));
@@ -101,7 +102,7 @@ common_peg_parser build_function(toolcall_peg_builder & p, size_t tool_index,
 
         auto arg_value = p.eps();
         if (!types.has(common_chat_schema::TYPE_STRING)) {
-            arg_value = p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", doc, *prop.schema) + arg_close);
+            arg_value = p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", doc, *prop.schema)) + arg_close;
         } else if (types.is_only(common_chat_schema::TYPE_STRING)) {
             arg_value = arg_string;
         } else {
@@ -132,8 +133,12 @@ common_peg_parser build_function(toolcall_peg_builder & p, size_t tool_index,
 
 }  // namespace
 
-std::string generate_tool_grammar(const std::vector<ToolSpec>& tools) {
+std::string generate_tool_grammar(const std::vector<ToolSpec>& tools, bool parallel) {
     if (tools.empty()) return {};
+
+    const ToolCallTags& t      = tool_call_tags();
+    const std::string   kOpen  = tag_text(t.open);
+    const std::string   kClose = tag_text(t.close);
 
     toolcall_peg_builder p;
 
@@ -142,15 +147,25 @@ std::string generate_tool_grammar(const std::vector<ToolSpec>& tools) {
         // arcint's ToolSpec carries the client's schema as nlohmann/json; the
         // vendored closure speaks common_json (a pimpl over nlohmann/ordered_json), so
         // the conversion is a dump/parse (cheap: one schema per declared function).
-        auto params = common_json::parse(tools[i].parameters.dump());
+        // A function declared without parameters is an object with none.
+        const nlohmann::json& decl = tools[i].parameters;
+        auto params = common_json::parse(decl.is_object() && !decl.empty() ? decl.dump()
+                                                                          : std::string("{\"type\":\"object\"}"));
         tool_choice |= build_function(p, i, tools[i].name, params);
     }
 
-    // The call block: opener, the chosen function, closer. A lazy trigger rule
-    // on the opener, so prose before the call is unconstrained.
+    // The call block: opener, the chosen function, closer, as the reference's
+    // tool_call rule. The reference's Qwen3-Coder variant that may omit the
+    // opener (tool-call-first) applies only to a template without a think block
+    // (is_qwen3_coder = !supports_reasoning); arcint's trigger is the opener,
+    // so the opener is always there. Parallel calls as the reference: the first
+    // call, then any number more (parallel_tool_calls, the OpenAI default), or
+    // exactly one. min 0, as the reference for tool_choice auto: the grammar is
+    // lazy, so it is only ever entered through the opener.
     auto tool_call_body = tool_choice + kClose + p.space();
     auto tool_call      = p.rule("tool-call", kOpen + "\n" + tool_call_body);
-    p.trigger_rule("tool-call-root", p.repeat(tool_call, 1, 1));
+    auto calls          = parallel ? tool_call + p.zero_or_more(tool_call) : tool_call;
+    p.trigger_rule("tool-call-root", p.repeat(calls, 0, 1));
 
     auto arena = p.build();
     return build_grammar([&](const common_grammar_builder& builder) {
@@ -158,13 +173,6 @@ std::string generate_tool_grammar(const std::vector<ToolSpec>& tools) {
     });
 }
 
-std::string tool_grammar_trigger() {
-    // The call opener, as the lazy grammar's trigger pattern. It is a single
-    // special token on the coder vocabulary (measured) and carries no regex
-    // metacharacter, so the pattern is the opener itself (llama.cpp's
-    // common_sampling_add_grammar_triggers regex-escapes a WORD trigger; here
-    // there is nothing to escape).
-    return kOpen;
-}
+std::string tool_grammar_trigger() { return tag_text(tool_call_tags().open); }
 
 }  // namespace lgc

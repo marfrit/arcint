@@ -20,13 +20,17 @@ namespace lgc {
 // is the tool-calling protocol). The caller drives it as a lazy grammar
 // sampler, triggered on the call opener.
 //
+// `parallel`: more than one call per turn (the request's parallel_tool_calls,
+// the OpenAI default true), as the reference builds `calls`.
+//
 // Returns an empty string when no tools are declared: the caller then applies
 // no grammar, and a tool-less request is never constrained.
-std::string generate_tool_grammar(const std::vector<ToolSpec>& tools);
+std::string generate_tool_grammar(const std::vector<ToolSpec>& tools, bool parallel = true);
 
-// The call opener, as the lazy grammar's trigger pattern (regex-escaped, as
-// llama.cpp's common_sampling_add_grammar_triggers does for a WORD trigger).
-// Empty when generate_tool_grammar would return empty (no tools).
+// The call opener: the lazy grammar's trigger word (the reference's
+// tool_call_starts for a template with a think block). The caller makes it a
+// trigger TOKEN when the vocabulary holds it as one token, else a regex-escaped
+// pattern, as llama.cpp's common_sampling_add_grammar_triggers does.
 std::string tool_grammar_trigger();
 
 }  // namespace lgc

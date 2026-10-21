@@ -31,6 +31,13 @@ void Sampler::observe(int token) {
     if (token < 0) return;
     ++seen_[token];
     ++generated_[token];
+    // A token inside an open think block is reasoning, not a call: arcint
+    // parses calls from the content only (split_reasoning), so the grammar is
+    // not fed it -- a call opener the model mentions while thinking does not
+    // trigger it. observe_think_text has already seen this token's text, so a
+    // closer is fed (harmless: the lazy grammar is still waiting) and the
+    // first token after it is the first the grammar can trigger on.
+    if (constraint_ != nullptr && !think_open_) constraint_->accept(token);
 }
 
 void Sampler::set_think_mask_ids(ThinkBlockIds ids) {
@@ -50,7 +57,7 @@ void Sampler::measure_think_tags() {
 
 void Sampler::start_in_think_block(bool open) {
     measure_think_tags();
-    think_open_ = params_.think_eog_mask && open;
+    think_open_ = tracks_think() && open;
     think_tail_.clear();
     think_lead_.clear();
 }
@@ -61,7 +68,7 @@ void Sampler::start_in_think_block(bool open) {
 // split must agree about where the block is, or the mask lifts on text the
 // client still sees as reasoning.
 void Sampler::observe_think_text(std::string_view piece) {
-    if (!params_.think_eog_mask) return;
+    if (!tracks_think()) return;
     if (!think_open_) {
         // Before the block's opening is settled, only the generation's first
         // characters matter. The rule is deliberately one-sided, and errs
@@ -182,6 +189,18 @@ int Sampler::sample(float* logits, size_t vocab) {
     mask_illegal_while_thinking(logits, vocab);
     apply_penalties(logits, vocab);
 
+    const int tok = draw(logits, vocab);
+    if (constraint_ == nullptr || think_open_ || constraint_->allows(tok)) return tok;
+    // Grammar-based rejection sampling, as the reference's
+    // common_sampler_sample: the drawn token does not fit, so mask the row
+    // (after the think mask and the penalties, as the reference re-runs its
+    // chain over the masked candidates) and draw again. A rejection costs one
+    // full-vocabulary grammar pass; a token that fits costs one token's test.
+    constraint_->mask(logits, vocab);
+    return draw(logits, vocab);
+}
+
+int Sampler::draw(float* logits, size_t vocab) {
     // Penalties can reorder the distribution, so greedy is decided after them.
     if (params_.greedy()) return argmax(logits, vocab);
 

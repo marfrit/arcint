@@ -19,6 +19,24 @@
 // advertised context is 262144.
 namespace lgc {
 
+// clean-turns step 2: a constraint on which token may come next (the
+// tool-call grammar, src/exec/llama_toolgrammar.h). An interface so the
+// sampler stays device-free and testable on synthetic rows; the llama backend
+// supplies the grammar. The sampler drives it as llama.cpp's
+// common_sampler_sample does (common/sampling.cpp at the pin): draw first,
+// test the drawn token alone, and only when it is rejected mask the row and
+// draw again; every generated token is accepted into it.
+class TokenConstraint {
+public:
+    virtual ~TokenConstraint() = default;
+    // May `token` come next? Cheap: one token.
+    virtual bool allows(int token) = 0;
+    // Set every logit the constraint rejects to -inf (the whole row).
+    virtual void mask(float* logits, size_t vocab) = 0;
+    // `token` was generated; advance.
+    virtual void accept(int token) = 0;
+};
+
 class Sampler {
 public:
     Sampler(const SamplerParams& params, uint64_t seed);
@@ -38,7 +56,8 @@ public:
     // before the model has produced anything). `observe_think_text` feeds the
     // decoded pieces in generation order so the mask clears when the block
     // closes, and engages when the model opens the block itself. Both are
-    // inert unless params.think_eog_mask is set.
+    // inert unless params.think_eog_mask or params.tool_grammar is set (the
+    // grammar needs the block's state; only think_eog_mask masks anything).
     void start_in_think_block(bool open);
     void observe_think_text(std::string_view piece);
     bool think_block_open() const { return think_open_; }
@@ -47,6 +66,13 @@ public:
     // switch; only the backend knows the vocabulary, so it hands the ids in
     // here once per request.
     void set_think_mask_ids(ThinkBlockIds ids);
+
+    // clean-turns step 2: the tool-call grammar, or nullptr. Not owned. It is
+    // dormant while a think block is open (the reference's lazy grammar is not
+    // applied while the reasoning budget sampler counts, common/sampling.cpp
+    // grammar_should_apply), so it needs the block's state: the backend feeds
+    // observe_think_text whenever params.tool_grammar is set, mask or not.
+    void set_constraint(TokenConstraint* c) { constraint_ = c; }
 
     // Picks the next token from one row of logits. The row is scratch space and
     // is modified in place.
@@ -58,6 +84,8 @@ public:
     static int argmax(const float* logits, size_t vocab);
 
 private:
+    int    draw(float* logits, size_t vocab);
+    bool   tracks_think() const { return params_.think_eog_mask || params_.tool_grammar; }
     void   apply_penalties(float* logits, size_t vocab) const;
     void   mask_illegal_while_thinking(float* logits, size_t vocab) const;
     void   measure_think_tags();
@@ -80,6 +108,8 @@ private:
     std::string think_lead_;   // the generation's first characters, until the
                                // block's opening is settled
     size_t      think_max_tag_ = 0;
+
+    TokenConstraint* constraint_ = nullptr;
 };
 
 }  // namespace lgc
