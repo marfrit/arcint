@@ -4,6 +4,11 @@ This note is the handover for step 2 of the [clean-turns](clean-turns.md)
 campaign. It is written from the state of this branch, which carries the
 unfinished work; `clean-turns` itself stays at `ae2bc93`.
 
+> **Superseded (2026-10-21):** the next steps below were carried out on branch
+> `clean-turns-step2`; the result, its measurements and the deviations from the
+> reference are in [clean-turns.md](clean-turns.md#step-2-built--grammar-constrained-tool-calls-measured-here-2026-10-21).
+> This note is kept as the record of the state it describes.
+
 ## What step 2 is
 
 Grammar-constrained tool calls for the Qwen3-coder artifact. The pinned

@@ -264,15 +264,20 @@ call, not repair of observed breakage.
 
 ## Status
 
-- **Step 2 handover (2026-10-21):** the unfinished step-2 work lives on
-  branch `clean-turns-wip`; see [clean-turns-handover.md](clean-turns-handover.md)
-  for what is wired, what is not, and the exact next steps.
+- **Step 2 built and its gate shown (2026-10-21, branch `clean-turns-step2`):**
+  the switch drives the grammar in every llama decode loop; forced-malformed
+  calls are unreachable with it on (vocab-level probe and endpoint pair), the
+  CSV glance stays 10/10, decode t/s does not move. A **proposal**: the default
+  stays off, no unit or package changed. See
+  [Step 2 built](#step-2-built--grammar-constrained-tool-calls-measured-here-2026-10-21)
+  at the end of this note. The [handover](clean-turns-handover.md) that preceded
+  it is history now.
 
 - Step 0 done (this note).
 - Step 1 in progress: landed at unit level, gate written and proven able to
   fail; the endpoint pair needs the branch's llama build (running on the GPU
   dev host as of this writing).
-- Step 2 feasibility answered above: wireable, at a named cost.
+- Step 2 done as a proposal (see above).
 - Step 3 not started.
 
 ## Step 1 measured at the endpoint (before any code change)
@@ -483,7 +488,7 @@ which the mask — by design — does not and should not fix. Whether to keep th
 mask as a safety net, and whether to pursue the empty-answer defect as a
 separate (model-quality) lever, is the operator's call.
 
-## Step 2 — grammar-constrained tool calls (feasibility answered, not yet built)
+## Step 2 — grammar-constrained tool calls (feasibility answered; built below)
 
 The pinned llama.cpp exposes the grammar sampler publicly
 (`include/llama.h:1581,1600`), driven through `llama_sampler_apply`/`accept`,
@@ -497,3 +502,133 @@ nlohmann/json, and emits a 360-byte grammar). The pinned tree ships no grammar
 for the coder's call form — that file would be ours. The price to measure:
 `apply` decodes every candidate token, so its placement relative to
 `collect_candidates` is a measurement, not an assumption. Not started.
+
+## Step 2 built — grammar-constrained tool calls (`measured-here`, 2026-10-21)
+
+Branch `clean-turns-step2` (from `clean-turns-wip`). Off by default; on by
+`--tool-grammar` or the request field `tool_grammar`; `/props` reports it.
+
+### What it does, and where (`code`)
+
+| part | file | follows |
+|---|---|---|
+| the GBNF for the declared tools: opener, a declared function, required parameters in any order, optional ones, each non-string value typed by its schema, closer; parallel calls when the request allows them (OpenAI default), min 0 under the lazy trigger | `src/core/toolgrammar.cpp` (tags from `tool_call_tags()`, the parser's table) | `common/parsers/qwen3-coder.cpp` at the pin, the think-block template branch |
+| the constraint hook: draw, test the drawn token alone, only on a refusal mask the row and draw again; `observe()` accepts every generated token | `src/core/sampler.{h,cpp}` (`TokenConstraint`) | `common_sampler_sample` (grammar-based rejection sampling) |
+| the constraint on libllama's lazy grammar sampler; the opener is a trigger TOKEN (one token in this vocabulary), else a regex-escaped pattern | `src/exec/llama_toolgrammar.{h,cpp}` | `common_sampling_add_grammar_triggers` |
+| the schemas reach the backend only when the calls are parsed (tools declared, `tool_choice` not `none`), with `parallel_tool_calls` | `src/exec/backend.h`, `src/api/handlers.cpp`, `src/core/chat.cpp` | |
+| built per request next to the think mask in the plain, multimodal and speculative loops (MTP, DFlash2, combined lanes) | `src/exec/backend_llama.cpp` (`prepare_tool_grammar`) | |
+
+**Spec/verify is correct by construction, and tested to be.** The verify walk
+draws row *i* from the history the sampler itself accepted and `observe()`s only
+the tokens it keeps, so the grammar's state is the emitted stream and a
+rejected draft never reaches it — the reference's
+`common_sampler_sample_and_accept_n` does the same. No force-disable of
+speculation was needed. Device-free case `verify_walk_constraint_sees_only_kept_tokens`
+covers it on synthetic rows; the vocab probe below covers it on the real
+grammar, with a red mutant.
+
+**The placement price** (the handover's step 6), answered by following the
+reference: the grammar never sees the full row unless the drawn token is
+refused. A token that fits costs one single-token `apply`; a refusal costs one
+full-row mask. Measured at the endpoint below: sample time over the CSV call's
+681 tokens 0.06 s off, 0.07 s on (no refusal); a request with one refusal
+adds ~0.02 s of sample time (one full 248k-row mask).
+
+### Deviations from the reference, named
+
+- **Dormant while a think block is open.** The reference ends reasoning at the
+  call opener (`thinking_end_tags` includes it) and triggers the grammar there.
+  arcint parses calls from the content only (`split_reasoning`), so a call
+  opener inside an open block is reasoning text to the API, and constraining
+  it would build a call nobody parses. The grammar therefore waits for the
+  closer (the sampler's think-block tracker, which now runs when either
+  `think_eog_mask` or `tool_grammar` is set; the mask itself still engages
+  only under `think_eog_mask`). Rests on the API contract of
+  `split_reasoning`, not on an invariant; the operator may prefer the
+  reference's behaviour.
+- **`tool_choice: required` and a named function stay lazy.** The reference
+  builds a non-lazy grammar with min one call for `required`; that grammar
+  covers the generation prefix and the reasoning, which arcint renders itself.
+  A named function is not narrowed to that one function. Not built: no agent
+  in the baseline sends either.
+- **Kept from the reference, so worth knowing:** a string-typed value is raw
+  text up to the parameter closer, so a string `enum` is not enforced
+  (recorded in `toolgrammar_llama_refuses_the_malformed_calls`); a call opener
+  the model spells out of several text tokens instead of the special token
+  does not trigger the grammar (the reference uses the token trigger alone for
+  a one-token word); once a call is complete only another call or the
+  turn-ender may follow.
+- When the grammar would make the model call something, it makes it call a
+  **declared** function — not necessarily the one the user meant (endpoint:
+  asked for an undeclared `delete_everything`, the on arm called `read_file`).
+  Malformed becomes unreachable; "what the user wanted" is not the grammar's
+  to know.
+
+### The gate
+
+**1. Device-free suite** — `tests/test_toolgrammar.cpp` in `arcint-test`
+(replacing the unregistered standalone file): libllama build 204 cases, stub
+build with `-Werror` 201, 0 failed; `ctest -L unit` green in both. Red controls
+inside: without the constraint the refused token wins; libllama's own grammar
+engine (text, no vocabulary) refuses an undeclared function, a missing
+required parameter, an undeclared parameter, a word for an integer, and
+reports an unterminated block as incomplete.
+
+**2. Vocabulary probe, no card** — `tools/tool_grammar_probe.cpp` on the served
+artifact's vocabulary (248320 tokens; the opener is one token, so the trigger
+is a token): an adversary writes logits that prefer a malformed call over a
+well-formed one, five shapes, plain and speculative, T=0 and two seeds at 0.7.
+
+| arms | grammar off | grammar on |
+|---|---|---|
+| 30 + 30 | 30/30 the adversary's malformed text, byte for byte | 30/30 schema-valid |
+| red mutant `ARCINT_PROBE_RED_DESYNC=1` (feeds the first rejected draft) | — | 12 of the 15 speculative arms fail (the other 3 reject only at the turn-ender, which is never fed); the 15 plain arms stay valid |
+
+**3. Endpoint pair, A770** — one seat of 8 min (16:49–16:57 UTC): the coder unit
+stopped, renderD128 confirmed the A770 by PCI id (`8086:56a0`) and held by
+nothing but the GPU.0 unit's process, this branch's build (sha256 `0ff818f0…`,
+tree chain hash `9ed3e8df…` both ends) loaded with the unit's own flags
+(n_ctx 98304, `--llama-mtp 4`, KV q8_0:q4_0, checkpoints 0) on port 18080,
+`tools/tool_grammar_gate.py` run, the unit restarted and `/v1/models`
+answering. The installed package cannot serve the field, so the branch build
+with the unit's flags is the served configuration's stand-in.
+
+Forced-malformed prompts (synthetic; T=0, T=0.7 seed 1, and T=0 with thinking on):
+
+| shape | off | on |
+|---|---|---|
+| call an undeclared `delete_everything` | 3/3 undeclared function | 3/3 valid (`read_file`), 1 masked draw each |
+| `read_file` with `filename` instead of `path` | 3/3 required `path` missing | 3/3 valid, 1–2 masked draws |
+| `run_query` with `limit` as the word "ten" | 3/3 `limit` not an integer | 3/3 valid, 1 masked draw |
+| `run_query` without `limit` | 2/2 required `limit` missing, + 1 no call (thinking on, 2048 cap) | 2/2 valid, + the same no-call at the cap |
+
+11 of 12 off arms malformed, 0 of 12 on arms invalid. The thinking-on arms go
+through the dormant-then-engaged path (the block closes, then the call is
+constrained).
+
+CSV task through a `write_file` call (the grammar spans the whole answer,
+thinking off, 4000 cap, scored by executing the answer):
+
+| arm | PUNKTE | decode | sample time |
+|---|---|---|---|
+| off, T=0 ×2 | 10, 10 | 681 tok, 79.4 / 79.5 t/s | 0.06 s |
+| on, T=0 ×3 | 10, 10, 10 — byte-identical to the off answer | 681 tok, 79.5 / 79.5 / 79.4 t/s | 0.07 s |
+| on, T=0.7 ×5 | 10, 10, 10, 10, 10 | 75.8–80.7 t/s | 0.11–0.15 s |
+
+No draw was masked in any CSV run: the model's own calls were always inside
+the grammar. Decode t/s on against off: 79.5 against 79.5 — no movement beyond
+the ±0.1 run-to-run spread. The standard glance (no tools, so no grammar is
+built) with the switch on: 8/8 at 10/10, 72.7–77.2 t/s.
+
+### Open
+
+- The **default stays off** — turning it on for a unit is the operator's
+  decision; nothing here changes a unit or a package.
+- The grammar is built per request (`generate_tool_grammar` + libllama's
+  parse); not measured on its own. Upper bound from the probe: 31 builds, 60
+  arms, the vocabulary load and its piece table in 7.6 s wall. A cache keyed on the declared tools is the obvious
+  next step if a measurement says it is worth it.
+- The deviations above (dormant in the think block, `required` lazy) are the
+  operator's to accept or send back.
+- Only the A770 coder artifact is measured. The B60's models were not touched.
+
