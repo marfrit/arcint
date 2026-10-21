@@ -242,6 +242,11 @@ if(ARCINT_TESTS)
     # engine on text (llama-grammar.h, the entry points upstream's own grammar
     # tests use), so it needs the pinned tree's src/ on its include path
     target_include_directories(arcint-test PRIVATE "${ARCINT_LLAMA_DIR}/src")
+    # clean-turns step 2's forced-malformed gate on a real vocabulary (vocab-only
+    # load, no device). Not a ctest case: it needs the GGUF; run by hand.
+    add_executable(arcint-tool-grammar-probe tools/tool_grammar_probe.cpp)
+    target_link_libraries(arcint-tool-grammar-probe PRIVATE arcint_core)
+    target_compile_options(arcint-tool-grammar-probe PRIVATE -Wall -Wextra -Wpedantic)
   endif()
   # test_props.cpp reads src/exec/backend_llama.cpp (the KV-precision tripwire:
   # the llama backend cannot be constructed without a card).
