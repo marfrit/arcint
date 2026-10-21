@@ -56,6 +56,22 @@ endif()
 add_library(arcint_vendor INTERFACE)
 target_include_directories(arcint_vendor SYSTEM INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
 
+# The pinned llama.cpp's PEG grammar closure (clean-turns step 2): builds the
+# Qwen-coder tool-call GBNF from the declared schemas. Copied verbatim from the
+# pin's common/ (MIT, THIRD_PARTY.md), made self-contained by
+# third_party/llama-peg/llama-peg-shim.h. Vendored code: no -Werror, no
+# arcint warnings.
+add_library(arcint_peg STATIC
+  third_party/llama-peg/peg-parser.cpp
+  third_party/llama-peg/json.cpp
+  third_party/llama-peg/json-schema.cpp
+  third_party/llama-peg/json-schema-to-grammar.cpp
+  third_party/llama-peg/trie.cpp
+  third_party/llama-peg/unicode.cpp
+)
+target_include_directories(arcint_peg PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama-peg")
+target_link_libraries(arcint_peg PUBLIC arcint_vendor)
+
 # ----------------------------------------------------------------------- core
 add_library(arcint_core STATIC
   src/config.cpp
@@ -67,6 +83,7 @@ add_library(arcint_core STATIC
   src/core/sampling.cpp
   src/core/stop.cpp
   src/core/toolcall.cpp
+  src/core/toolgrammar.cpp
   src/core/chat.cpp
   src/exec/backend_stub.cpp
   src/api/error.cpp
@@ -76,7 +93,7 @@ add_library(arcint_core STATIC
 target_include_directories(arcint_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${CMAKE_CURRENT_BINARY_DIR}/generated")
-target_link_libraries(arcint_core PUBLIC arcint_vendor Threads::Threads)
+target_link_libraries(arcint_core PUBLIC arcint_vendor Threads::Threads arcint_peg)
 target_compile_options(arcint_core PRIVATE -Wall -Wextra -Wpedantic)
 if(ARCINT_WERROR)
   target_compile_options(arcint_core PRIVATE -Werror)

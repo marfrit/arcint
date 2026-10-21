@@ -166,6 +166,13 @@ std::optional<std::string> read_sampler(const json& b, SamplerOverrides& s) {
         if (!b["think_eog_mask"].is_boolean()) return "think_eog_mask must be a boolean";
         s.think_eog_mask = b["think_eog_mask"].get<bool>();
     }
+    // clean-turns step 2: constrain the tool-call form to the declared schemas.
+    // Non-standard, so it is named; a request that sends neither keeps the
+    // operator's setting. A no-op when the request declared no tools.
+    if (b.contains("tool_grammar") && !b["tool_grammar"].is_null()) {
+        if (!b["tool_grammar"].is_boolean()) return "tool_grammar must be a boolean";
+        s.tool_grammar = b["tool_grammar"].get<bool>();
+    }
     if (b.contains("stop")) {
         if (auto e = read_stop(b["stop"], s)) return e;
     }

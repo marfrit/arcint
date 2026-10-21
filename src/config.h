@@ -208,6 +208,11 @@ struct Config {
     // it changes what the sampler may pick, so it is the operator's call.
     bool think_eog_mask = false;
 
+    // clean-turns step 2: constrain a tool call to the declared schemas with a
+    // GBNF grammar, so an unterminated call block is unreachable. Off by
+    // default; a no-op when the request declared no tools.
+    bool tool_grammar = false;
+
     // Stub-only: milliseconds of artificial latency per emitted token. Exists
     // so the cancellation path (§3.7) can be demonstrated against a backend
     // that would otherwise finish before a client could disconnect.

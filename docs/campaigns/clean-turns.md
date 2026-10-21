@@ -420,6 +420,19 @@ closed-block empty answer → fixed). 9 cases green, device-free.
 
 ## Step 1 full battery — `measured-here` (2026-10-21, second seat, ~21 min)
 
+**Scope: this result holds for the A770 coder artifact, and only for it.** On
+2026-10-20 the operator session measured the mid-block stop *directly* on
+Flash-Next (B60, IQ3_S): a raw /v1/completions probe with `ignore_eos=true`
+showed the generation continuing past an end-of-turn token the model emitted
+*inside* its open reasoning (the text after it was more reasoning), and the
+chat probe ended `finish=stop`, empty content, reasoning cut mid-sentence. So
+the mid-block EOG is **demonstrated on Flash-Next, not on the coder; it is
+model-specific.** The mask is the fix for the Flash-Next artifact, and its
+benefit test belongs there — a B60 window, the operator's call (the B60
+currently serves the operator's own model; nothing is run on it). The coder
+battery below shows the mask is a no-op safety net on *this* artifact, which
+is the correct outcome for an artifact that does not exhibit the defect.
+
 The first leg's `reasoning_closed` field made the block's state visible. The
 full battery — all five probe shapes, both temperatures, both masks, 20 arms,
 4096 cap, on the A770 (n_ctx 98304, mtp 4, kv q8_0:q4_0, port 18080) — then

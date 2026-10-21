@@ -24,6 +24,11 @@ struct SamplerDefaults {
     // the GGUF.
     bool think_eog_mask = false;
 
+    // clean-turns step 2: the operator's switch for the tool-call grammar.
+    // Off keeps today's behaviour; on, a request that declared tools is
+    // constrained to a well-formed call. A no-op when no tools are declared.
+    bool tool_grammar = false;
+
     // "provisional" -- the Qwen3-family card values, carried because no
     //                  GGUF key is read yet; /props reports this so nobody
     //                  mistakes an inherited default for a measured one.
@@ -72,6 +77,13 @@ struct SamplerParams {
     bool think_eog_mask = false;
     ThinkBlockIds think_ids;
 
+    // clean-turns step 2: constrain the tool-call form to the declared schemas
+    // with a GBNF grammar, so a call the model starts is one it finishes. Off
+    // keeps today's behaviour exactly; on, the backend builds the grammar from
+    // the request's ToolSchemas and drives it around the sampler. The grammar
+    // is a no-op when the request declared no tools.
+    bool tool_grammar = false;
+
     // top_k == 1 collapses the distribution just as temperature 0 does; both
     // must take the argmax path, or "greedy" means two different things.
     bool greedy() const { return temperature <= 0.0f || top_k == 1; }
@@ -91,6 +103,7 @@ struct SamplerOverrides {
     std::optional<std::vector<std::string>> stop;
     std::optional<std::vector<int>>         stop_token_ids;
     std::optional<bool>                     think_eog_mask;
+    std::optional<bool>                     tool_grammar;
 
     bool any() const;
 };

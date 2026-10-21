@@ -207,6 +207,12 @@ std::string usage_text() {
         "                            answer inside an unfinished block. Off keeps the\n"
         "                            behaviour of every build up to this one; a request\n"
         "                            may set the same thing as think_eog_mask\n"
+        "  --tool-grammar            constrain a tool call to the declared schemas\n"
+        "                            with a GBNF grammar: a call the model starts is\n"
+        "                            one it finishes, so an unterminated call block is\n"
+        "                            unreachable. A no-op when the request declared no\n"
+        "                            tools; a request may set the same thing as\n"
+        "                            tool_grammar\n"
         "  --chat-template-kwarg enable_thinking=BOOL\n"
         "                            template default when the request sends neither\n"
         "                            chat_template_kwargs.enable_thinking nor\n"
@@ -456,6 +462,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             cfg.presence_penalty = static_cast<float>(d);
         } else if (arg == "--think-eog-mask") {
             cfg.think_eog_mask = true;
+        } else if (arg == "--tool-grammar") {
+            cfg.tool_grammar = true;
         } else if (arg == "--chat-template-kwarg") {
             if (!value(v)) return fail("--chat-template-kwarg needs key=value");
             const std::string_view kv = v;
@@ -688,6 +696,7 @@ std::optional<std::string> apply_operator_defaults(const Config& cfg, SamplerDef
     o.repetition_penalty = cfg.repetition_penalty;
     o.presence_penalty   = cfg.presence_penalty;
     if (cfg.think_eog_mask) o.think_eog_mask = true;
+    if (cfg.tool_grammar)   o.tool_grammar   = true;
     return sampler_defaults_apply(d, o);
 }
 

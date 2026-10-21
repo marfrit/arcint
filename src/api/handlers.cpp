@@ -503,6 +503,7 @@ json props(const Context& ctx) {
           // send nothing. /props says what the server is running with, so a
           // turn that ends differently than yesterday's is explained here.
           {"think_eog_mask", sd.think_eog_mask},
+          {"tool_grammar", sd.tool_grammar},
           {"provenance", sd.provenance}}},
         {"slots",
          {{"total", slots_total(ctx)},
