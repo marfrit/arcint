@@ -672,6 +672,12 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
     if (prep.parse_tool_calls) prep.schemas = tool_schemas(prep.req.tools);
 
     for (const ToolSpec& t : prep.req.tools) prep.input.tool_names.push_back(t.name);
+    // clean-turns step 2: the schemas reach the backend only when the calls
+    // are parsed, so the grammar never constrains a call nobody would read.
+    if (prep.parse_tool_calls) {
+        prep.input.tools               = prep.req.tools;
+        prep.input.parallel_tool_calls = prep.req.parallel_tool_calls;
+    }
 
     const std::string prompt = ctx.backend->render_chat(prep.req);
     // The template decides whether the answer starts inside a think block; the

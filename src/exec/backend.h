@@ -156,6 +156,15 @@ struct GenerationInput {
     // be exercised without a GPU.
     std::vector<std::string> tool_names;
 
+    // clean-turns step 2: the declared tools with their schemas, for the
+    // tool-call grammar (SamplerParams::tool_grammar). Filled only when the
+    // request's calls are parsed at all (tools declared, tool_choice not
+    // "none"), so a request whose calls would not be parsed is never
+    // constrained either. `parallel_tool_calls` as the request said (OpenAI
+    // default true): the grammar then admits more than one call.
+    std::vector<ToolSpec> tools;
+    bool                  parallel_tool_calls = true;
+
     // clean-turns: the rendered prompt ended inside a think block, and whether
     // this artifact answers to the wider tag family. The API knows both from the
     // template (Prepared::think_open / think_tags_extended); the backend needs

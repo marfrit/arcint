@@ -184,3 +184,22 @@ TEST(sampling_think_eog_mask_counts_as_an_override) {
     o.think_eog_mask = true;
     CHECK(o.any());
 }
+
+TEST(sampling_tool_grammar_travels_defaults_to_params_to_request) {
+    SamplerDefaults d;
+    d.tool_grammar = true;
+    SamplerParams p = sampler_from_defaults(d);
+    CHECK(p.tool_grammar);
+    SamplerOverrides off;
+    off.tool_grammar = false;
+    CHECK(off.any());
+    CHECK(!sampler_apply(p, off).has_value());
+    CHECK(!p.tool_grammar);
+
+    SamplerParams q = sampler_from_defaults(SamplerDefaults{});
+    CHECK(!q.tool_grammar);   // off unless someone turns it on
+    SamplerOverrides on;
+    on.tool_grammar = true;
+    CHECK(!sampler_apply(q, on).has_value());
+    CHECK(q.tool_grammar);
+}

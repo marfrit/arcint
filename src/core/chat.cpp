@@ -325,6 +325,11 @@ std::optional<std::string> parse_chat_request(const json& body, ChatRequest& out
         }
     }
 
+    if (body.contains("parallel_tool_calls") && !body["parallel_tool_calls"].is_null()) {
+        if (!body["parallel_tool_calls"].is_boolean()) return "parallel_tool_calls must be a boolean";
+        req.parallel_tool_calls = body["parallel_tool_calls"].get<bool>();
+    }
+
     if (auto e = read_stream(body, req.stream, req.stream_include_usage)) return e;
     if (auto e = read_sampler(body, req.sampler)) return e;
 

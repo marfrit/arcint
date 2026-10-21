@@ -48,6 +48,7 @@ extern "C" int stbi_info_from_memory(unsigned char const* buffer, int len, int* 
 #include "exec/chat_json.h"
 #include "exec/llama_layer_split.h"
 #include "exec/llama_spec.h"
+#include "exec/llama_toolgrammar.h"
 #include "exec/verify_walk.h"
 #include "util/log.h"
 
@@ -927,6 +928,7 @@ public:
         Sampler sampler(in.sampler, seed);
         sampler.set_prompt(prompt);
         prepare_think_mask(in, sampler);
+        const auto tool_grammar = prepare_tool_grammar(in, sampler);
 
         std::vector<int>&  have = slot_tokens_[static_cast<size_t>(seq)];
         std::vector<float> logits(n_vocab_);
@@ -1010,6 +1012,7 @@ public:
             stats.decode_sample_seconds += seconds_since(t_s);
         }
         stats.decode_seconds = seconds_since(t_decode);
+        report_tool_grammar(seq, tool_grammar.get());
         log_expert_cache(seq);
         return reason;
     }
@@ -1081,6 +1084,7 @@ public:
         Sampler sampler(in.sampler, seed);
         sampler.set_prompt(tokenizer_->encode(in.prompt));
         prepare_think_mask(in, sampler);
+        const auto tool_grammar = prepare_tool_grammar(in, sampler);
 
         std::vector<int>&  have   = slot_tokens_[static_cast<size_t>(seq)];
         std::vector<float> logits(n_vocab_);
@@ -1149,6 +1153,7 @@ public:
             stats.decode_sample_seconds += seconds_since(t_s);
         }
         stats.decode_seconds = seconds_since(t_decode);
+        report_tool_grammar(seq, tool_grammar.get());
         return reason;
     }
 
@@ -1454,6 +1459,7 @@ private:
         Sampler sampler(in.sampler, seed);
         sampler.set_prompt(prompt);
         prepare_think_mask(in, sampler);
+        const auto tool_grammar = prepare_tool_grammar(in, sampler);
         std::vector<int>&  have = slot_tokens_[static_cast<size_t>(seq)];
         std::vector<float> rows;   // the verified rows' logits
 
@@ -1579,6 +1585,7 @@ private:
                               "different lengths (process-wide)", seq,
                       static_cast<unsigned long long>(n_combined_), static_cast<unsigned long long>(n_uneven_));
         }
+        report_tool_grammar(seq, tool_grammar.get());
         log_expert_cache(seq);
         return reason;
     }
@@ -1746,8 +1753,12 @@ private:
     // split_reasoning() uses. A tag that is one added token is blocked in the
     // logits; a tag this vocabulary spells as text is matched as text, because
     // there is no single logit to block (measured on the coder artifact).
+    //
+    // The tool-call grammar needs the block's state too (it is dormant while
+    // the block is open), so the ids are filled for either switch; the mask
+    // itself still engages only under think_eog_mask (Sampler).
     void prepare_think_mask(const GenerationInput& in, Sampler& sampler) const {
-        if (!in.sampler.think_eog_mask) return;
+        if (!in.sampler.think_eog_mask && !in.sampler.tool_grammar) return;
         ThinkBlockIds ids;
         ids.eog = eog_ids_;
         for (const auto& [open, close] : think_tag_pairs(in.think_tags_extended)) {
@@ -1764,6 +1775,29 @@ private:
         }
         sampler.set_think_mask_ids(std::move(ids));
         sampler.start_in_think_block(in.think_open);
+    }
+
+    // clean-turns step 2: the request's tool-call grammar, handed to the
+    // sampler, which drives it in every decode loop alike (sample() tests and
+    // masks, observe() accepts -- in the verify walk only the tokens it keeps,
+    // so a rejected draft never reaches the grammar). Off (the default), or no
+    // tools whose calls are parsed: nothing, today's path exactly.
+    std::unique_ptr<LlamaToolGrammar> prepare_tool_grammar(const GenerationInput& in, Sampler& sampler) const {
+        if (!in.sampler.tool_grammar || in.tools.empty()) return nullptr;
+        const auto t0 = clock_type::now();
+        auto       g  = std::make_unique<LlamaToolGrammar>(vocab_, in.tools, in.parallel_tool_calls);
+        log::verbose("grammar", "tool-call grammar: %zu tools, %zu bytes of GBNF, triggered by %s, built in %.1f ms",
+                     in.tools.size(), g->gbnf().size(), g->trigger_is_token() ? "a token" : "a pattern",
+                     seconds_since(t0) * 1e3);
+        sampler.set_constraint(g.get());
+        return g;
+    }
+
+    // One line a constrained request: how often the grammar overruled a draw.
+    static void report_tool_grammar(int seq, const LlamaToolGrammar* g) {
+        if (g == nullptr) return;
+        log::info("grammar", "lane %d: tool-call grammar: %d draws masked%s", seq, g->rejections(),
+                  g->broken() ? "; it gave up on a token outside it (warned above)" : "");
     }
 
     // One llama_decode of n tokens of `seq` at positions [pos, pos + n), with

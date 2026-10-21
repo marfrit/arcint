@@ -365,3 +365,27 @@ TEST(chat_reasoning_effort_maps_onto_the_template_switch) {
     ChatRequest bad;
     CHECK(parse_chat_request(nlohmann::json::parse(R"({"messages":[{"role":"user","content":"x"}],"reasoning_effort":3})"), bad).has_value());
 }
+
+TEST(chat_tool_grammar_and_parallel_tool_calls_are_read) {
+    ChatRequest plain;
+    CHECK(!parse_chat_request(minimal_chat(), plain).has_value());
+    CHECK(!plain.sampler.tool_grammar.has_value());
+    CHECK(plain.parallel_tool_calls);   // the OpenAI default
+
+    json body                   = minimal_chat();
+    body["tool_grammar"]        = true;
+    body["parallel_tool_calls"] = false;
+    ChatRequest req;
+    CHECK(!parse_chat_request(body, req).has_value());
+    CHECK(req.sampler.tool_grammar.has_value() && *req.sampler.tool_grammar);
+    CHECK(!req.parallel_tool_calls);
+
+    json bad           = minimal_chat();
+    bad["tool_grammar"] = "yes";
+    ChatRequest r1;
+    CHECK(parse_chat_request(bad, r1).has_value());
+    json bad2                   = minimal_chat();
+    bad2["parallel_tool_calls"] = 1;
+    ChatRequest r2;
+    CHECK(parse_chat_request(bad2, r2).has_value());
+}
