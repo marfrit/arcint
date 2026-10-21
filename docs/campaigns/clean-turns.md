@@ -418,12 +418,53 @@ call — and says so. `tests/python/test_clean_turns_gate.py` covers the new
 classifier and the leg's exact T=0.0 scenario (off: mid-block stop; on:
 closed-block empty answer → fixed). 9 cases green, device-free.
 
-What is left: **one more leg** against the rebuilt binary (built on the dev
-host, 194/0, round-trip green). The off-arm should show `reasoning_closed`
-false + empty stop (the defect); the on-arm should show `reasoning_closed`
-true + empty (a legitimate empty answer) or an answer. If the on-arm shows
-`reasoning_closed` false, the completeness proof above is wrong and there is a
-real bug to find. Either way the gate will now say the true thing.
+## Step 1 full battery — `measured-here` (2026-10-21, second seat, ~21 min)
+
+The first leg's `reasoning_closed` field made the block's state visible. The
+full battery — all five probe shapes, both temperatures, both masks, 20 arms,
+4096 cap, on the A770 (n_ctx 98304, mtp 4, kv q8_0:q4_0, port 18080) — then
+answered the question the first leg could not:
+
+**Every one of the 20 arms reports `closed=true`.** Zero arms ended the turn
+while the think block was still open. The `empty-answer` shape's empty stops
+(`finish=stop`, content 0) are all *closed-block* empty answers: the model
+closes the block, then ends the turn with no content. The other four shapes
+all answered (content non-empty), also with `closed=true`.
+
+This overturns the campaign's premise. The defect step 1 targets — a
+turn-ending token winning a step *while the think block is still open* — does
+**not** reproduce on this artifact, across any of the five shapes. The
+"empty stop" that does reproduce is a legitimate empty answer (the model
+closed the block and chose to say nothing), which the mask is allowed to
+permit and cannot fix. Note the first leg's T=0.7 off-arm (EMPTY-STOP) did not
+reproduce here (answered, content 16): the empty stop is not deterministic at
+T=0.7, so the "reliably reproduces" claim was itself unstable.
+
+**The 2026-10-20 "think block open" was an inference, never a measurement.**
+It was read from client-visible fields — content 0 + reasoning non-empty +
+finish=stop — which cannot distinguish a mid-block stop from a closed-block
+empty answer. The `reasoning_closed` field is the first direct measurement of
+the block's state, and it says the block closed. Rule 5 holds: a label is not
+evidence, and the label "block open" had no basis.
+
+**The baseline audit's class (b) is the same blind heuristic.**
+`tools/turn_defect_audit.py` counts `b_open_think_block` as `not has_text and
+not has_call and has_think`, where `has_think` only checks that a thinking
+block *exists*, never that it *closed*. So the "4 empty-stop turns in 2653"
+(class b) were measured with the same client-visible proxy. They are, on this
+evidence, closed-block empty answers (class a), not mid-block stops. The
+count is real (the model does give empty answers) but the class label is
+wrong, and the mask does not address it.
+
+**What this means for step 1.** The mask is complete and correct across all
+three decode loops (the proof above stands), and it is a sound safety net: if
+any artifact or edge case did produce a mid-block stop, the mask would prevent
+it. But on *this* artifact it is not fixing a demonstrated defect, because the
+defect does not occur. The empty answers the baseline counted are a
+model-quality issue (the model chose to say nothing after closing the block),
+which the mask — by design — does not and should not fix. Whether to keep the
+mask as a safety net, and whether to pursue the empty-answer defect as a
+separate (model-quality) lever, is the operator's call.
 
 ## Step 2 — grammar-constrained tool calls (feasibility answered, not yet built)
 

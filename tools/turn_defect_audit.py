@@ -7,7 +7,15 @@ Campaign: docs/campaigns/clean-turns.md. Four classes, per model:
       empty answer with a normal finish;
   (b) a turn that ends INSIDE an open think block - the whole output stayed in
       reasoning_content, so the unit never saw the block's closer;
-  (c) aborted or errored turns;
+
+CAVEAT (2026-10-21, clean-turns full battery): class (b) is counted from
+`has_think` - that a thinking block EXISTS - not that it CLOSED. The block's
+closed state was not recorded in the sessions this script reads, so (b) cannot
+distinguish a mid-block stop from a closed-block empty answer. On the served
+coder artifact the full battery (20 arms) found zero mid-block stops: the
+"empty stops" are closed-block empty answers, i.e. class (a). A unit that
+reports `reasoning_closed` (the clean-turns build) can split the two; these
+logs cannot.  (c) aborted or errored turns;
   (d) tool calls that failed at the receiving end: the tool result reports an
       argument/JSON/validation error, or the call carries arguments that are
       not parseable JSON.
