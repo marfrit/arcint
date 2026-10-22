@@ -1,6 +1,7 @@
 #include "core/sampler.h"
 
 #include "core/reasoning.h"
+#include "util/log.h"
 
 #include <algorithm>
 #include <cmath>
@@ -27,6 +28,11 @@ void Sampler::set_prompt(const std::vector<int>& prompt) {
     for (int id : prompt) {
         if (id >= 0) ++seen_[id];
     }
+}
+
+void TokenConstraint::note_desync(int token, const std::string& why) {
+    ++desyncs_;
+    log::error("grammar", "desync: %s (token %d); the rest of this request is unconstrained", why.c_str(), token);
 }
 
 void Sampler::observe(int token) {

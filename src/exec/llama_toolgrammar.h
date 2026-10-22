@@ -35,7 +35,9 @@ public:
     void accept(int token) override;
 
     // For the log and the probe: the GBNF, whether the opener became a
-    // trigger token, how many full-row masks (rejections) this request took.
+    // trigger token, how many full-row masks (rejections) this request took,
+    // and whether the constraint lost sync with the text (review B4: counted
+    // on the base class, latched here for the probe and the log line).
     const std::string& gbnf() const { return gbnf_; }
     bool               trigger_is_token() const { return trigger_is_token_; }
     int                rejections() const { return rejections_; }

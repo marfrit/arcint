@@ -1012,7 +1012,7 @@ public:
             stats.decode_sample_seconds += seconds_since(t_s);
         }
         stats.decode_seconds = seconds_since(t_decode);
-        report_tool_grammar(seq, tool_grammar.get(), sampler);
+        report_tool_grammar(seq, tool_grammar.get(), sampler, stats);
         log_expert_cache(seq);
         return reason;
     }
@@ -1153,7 +1153,7 @@ public:
             stats.decode_sample_seconds += seconds_since(t_s);
         }
         stats.decode_seconds = seconds_since(t_decode);
-        report_tool_grammar(seq, tool_grammar.get(), sampler);
+        report_tool_grammar(seq, tool_grammar.get(), sampler, stats);
         return reason;
     }
 
@@ -1585,7 +1585,7 @@ private:
                               "different lengths (process-wide)", seq,
                       static_cast<unsigned long long>(n_combined_), static_cast<unsigned long long>(n_uneven_));
         }
-        report_tool_grammar(seq, tool_grammar.get(), sampler);
+        report_tool_grammar(seq, tool_grammar.get(), sampler, stats);
         log_expert_cache(seq);
         return reason;
     }
@@ -1793,14 +1793,19 @@ private:
         return g;
     }
 
-    // One line a constrained request: how often the grammar overruled a draw.
-    // Detaches it from the sampler too: the grammar is declared after the
-    // sampler, so it dies first, and the sampler must not keep its address.
-    static void report_tool_grammar(int seq, const LlamaToolGrammar* g, Sampler& sampler) {
+    // One line a constrained request: how often the grammar overruled a draw,
+    // and how often it desynced. The desync count lands on the per-request
+    // stats line (handlers.cpp's decode line), not only in the log: a broken
+    // constraint is an incident, and the request's numbers are where the
+    // operator looks first (review B4). Detaches it from the sampler too: the
+    // grammar is declared after the sampler, so it dies first, and the
+    // sampler must not keep its address.
+    static void report_tool_grammar(int seq, const LlamaToolGrammar* g, Sampler& sampler, GenerationStats& stats) {
         sampler.set_constraint(nullptr);
         if (g == nullptr) return;
+        stats.grammar_desyncs = g->desync();
         log::info("grammar", "lane %d: tool-call grammar: %d draws masked%s", seq, g->rejections(),
-                  g->broken() ? "; it gave up on a token outside it (warned above)" : "");
+                  g->broken() ? "; it gave up on a token outside it (error line above)" : "");
     }
 
     // One llama_decode of n tokens of `seq` at positions [pos, pos + n), with

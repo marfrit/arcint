@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <random>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -35,6 +36,23 @@ public:
     virtual void mask(float* logits, size_t vocab) = 0;
     // `token` was generated; advance.
     virtual void accept(int token) = 0;
+
+    // clean-turns review B4: how many times this request's constraint lost
+    // sync with the generated text -- the moment it refuses to trust its own
+    // engine and the rest of the request runs unconstrained (fail open, so a
+    // broken grammar cannot strand the turn at the length cap). The backend
+    // copies the count into the per-request stats line, so the operator sees
+    // it in the request's own numbers without hunting through the logs.
+    int desync() const { return desyncs_; }
+
+protected:
+    // One desync, once: counted, and said at error level (not warn: a broken
+    // constraint is an incident, and the error line is what the log grep
+    // keeps). Derived constraints that can lose sync record it here instead
+    // of re-implementing the latch and the log line.
+    void note_desync(int token, const std::string& why);
+
+    int desyncs_ = 0;
 };
 
 class Sampler {

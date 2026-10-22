@@ -137,6 +137,35 @@ SamplerParams greedy_grammar() {
     return p;
 }
 
+// Review B4, driven synthetically: a constraint that loses sync with the
+// generated text. Healthy it admits only the tokens in `ok` (a refusal is a
+// mask-and-redraw, as the real grammar does); the first token it never admits
+// through accept() breaks it, and it counts the desync on the base class the
+// way the real one does (note_desync). Broken it fails open -- allows
+// everything, no engine call -- so the turn can still end, and the state
+// latches, so the count does not run away per token.
+struct BrokenConstraint : TokenConstraint {
+    std::set<int> ok{ 7, 9 };
+    bool          broken = false;
+    int           masks  = 0;
+    bool allows(int tok) override {
+        if (broken) return true;
+        return ok.count(tok) != 0;
+    }
+    void mask(float* logits, size_t vocab) override {
+        ++masks;
+        for (size_t i = 0; i < vocab; ++i)
+            if (!allows(static_cast<int>(i))) logits[i] = -INFINITY;
+    }
+    void accept(int tok) override {
+        if (broken) return;
+        if (!allows(tok)) {
+            broken     = true;
+            note_desync(tok, "synthetic: the token left the constraint");
+        }
+    }
+};
+
 }  // namespace
 
 // The red case the gate asks for, at the sampler: the row prefers a token the
@@ -182,6 +211,45 @@ TEST(sampler_constraint_accepts_every_observed_token) {
     sampler.observe(4);
     sampler.observe(6);
     CHECK(c.accepted == std::vector<int>({ 4, 6 }));
+}
+
+// Review B4: a constraint that loses sync with the generated text fails open
+// -- the rest of the request runs unconstrained, so the turn can still end --
+// and the desync is counted on the constraint, so the backend can surface it
+// in the per-request stats line instead of leaving it to a log line nobody
+// reads. The synthetic constraint latches on the same path the real one
+// latches (a token the constraint never admits), and this case asserts the
+// three promises: the counter increments, allows() stays safe afterwards, and
+// generation is not masked.
+TEST(sampler_constraint_desync_counts_and_fails_open) {
+    Sampler        sampler(greedy_grammar(), 1);
+    BrokenConstraint c;
+    sampler.set_constraint(&c);
+    // Healthy first: a draw the constraint refuses is masked and redrawn,
+    // and the desync counter is still zero.
+    std::vector<float> r = row_with_argmax(5, 7);
+    CHECK_EQ(sampler.sample(r.data(), kVocab), 7);
+    CHECK_EQ(c.masks, 1);
+    CHECK_EQ(c.desync(), 0);
+    // A token the constraint never admits arrives through observe (the path
+    // that bypasses the draw's allows() test): it loses the sync.
+    sampler.observe(3);
+    CHECK(c.broken);
+    CHECK_EQ(c.desync(), 1);
+    // From here on allows() is safe and fail-open: every token allowed, no
+    // engine call, no throw.
+    CHECK(c.allows(0));
+    CHECK(c.allows(15));
+    // Generation is not masked any more: the row's own argmax wins, even
+    // though the constraint never admitted it.
+    std::vector<float> r2 = row_with_argmax(5);
+    CHECK_EQ(sampler.sample(r2.data(), kVocab), 5);
+    CHECK_EQ(c.masks, 1);                // no new mask after the desync
+    // ...and the rest of the request flows unconstrained, with the desync
+    // counted once, not once per token.
+    std::vector<float> r3 = row_with_argmax(12);
+    CHECK_EQ(sampler.sample(r3.data(), kVocab), 12);
+    CHECK_EQ(c.desync(), 1);
 }
 
 // Dormant while a think block is open: arcint parses calls from the content

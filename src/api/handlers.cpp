@@ -155,6 +155,14 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
         decode_suffix +=
             log::format(" | dflash lane failures %d (cumulative)", stats.dflash_lane_failures);
     }
+    // Tool-call grammar desyncs, review B4: the constraint lost sync with the
+    // text and the rest of the request ran unconstrained (fail open, so the
+    // turn can still end). Printed only when non-zero, as the drafting terms,
+    // so a request without a broken constraint keeps the line it always had.
+    if (stats.grammar_desyncs > 0) {
+        decode_suffix +=
+            log::format(" | grammar desync %d (turn unconstrained after desync)", stats.grammar_desyncs);
+    }
     // What the other lane cost this one. Printed only when it happened, so a
     // single-stream run's line is the line it always was, and a p95 rather than
     // a mean because one long stall inside many short steps is exactly what a

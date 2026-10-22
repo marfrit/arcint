@@ -61,7 +61,17 @@ bool LlamaToolGrammar::allows(int token) {
     if (broken_) return true;
     llama_token_data       d{ token, 1.0f, 0.0f };
     llama_token_data_array a{ &d, 1, -1, false };
-    llama_sampler_apply(smpl_, &a);
+    // Guarded exactly as accept() guards the same engine call: a refusal that
+    // surfaces as a thrown exception (an artifact/pin change making apply
+    // throw) breaks the constraint instead of escaping sample() as a 500
+    // mid-stream.
+    try {
+        llama_sampler_apply(smpl_, &a);
+    } catch (const std::exception& e) {
+        broken_ = true;
+        note_desync(token, e.what());
+        return true;
+    }
     return d.logit != -INFINITY;
 }
 
@@ -85,19 +95,20 @@ void LlamaToolGrammar::accept(int token) {
     // Never feed a token the grammar rejects: llama.cpp aborts the process on
     // an end-of-generation token outside a complete stack and throws on any
     // other. The sampler only hands over tokens that passed allows(), so this
-    // is the guard for a path that bypassed it; the request then goes on
-    // unconstrained and says so, rather than taking the server down.
+    // is the guard for a path that bypassed it. A desync breaks the
+    // constraint -- counted, and said once at error level, so the operator
+    // and the stats line both learn the turn is unconstrained -- and the
+    // request then goes on unconstrained, rather than taking the server down.
     if (!allows(token)) {
         broken_ = true;
-        log::warn("grammar", "token %d is outside the tool-call grammar; the rest of this turn is unconstrained", token);
+        note_desync(token, "token is outside the tool-call grammar");
         return;
     }
     try {
         llama_sampler_accept(smpl_, token);
     } catch (const std::exception& e) {
         broken_ = true;
-        log::warn("grammar", "tool-call grammar refused token %d (%s); the rest of this turn is unconstrained", token,
-                  e.what());
+        note_desync(token, e.what());
     }
 }
 

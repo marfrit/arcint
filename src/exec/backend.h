@@ -238,6 +238,13 @@ struct GenerationStats {
     // drafter, or a lane that has never failed.
     int dflash_lane_failures = 0;
 
+    // clean-turns review B4: tool-call grammar desyncs on this request -- the
+    // constraint lost sync with the generated text and the rest of the turn
+    // ran unconstrained (fail open, so the turn can still end). Zero is the
+    // normal value; anything else is printed on the decode line, where the
+    // operator looks for the request's own numbers.
+    int grammar_desyncs = 0;
+
     double prefill_rate() const {
         return prefill_seconds > 0.0 ? prompt_tokens / prefill_seconds : 0.0;
     }
