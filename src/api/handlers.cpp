@@ -962,11 +962,31 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     // logic below sees only that.
     ReasoningStreamer   reasoning(prep.think_open, prep.think_tags_extended);
     std::string         content;       // the answer part of the output so far
-    auto emit_reasoning = [&](std::string_view bytes) {
-        if (bytes.empty()) return true;
+    // Reasoning has its own hold-back stream: a multi-byte code point must not
+    // be split across two SSE chunks (DESIGN §3.7), and reasoning and content
+    // are separate streams, so each carries its own pending state. The content
+    // path above already does this with `utf8_stream`; the reasoning path did
+    // not, which is how a torn code point reached the client as replacement
+    // characters.
+    utf8::Streamer      reasoning_stream;
+    auto send_reasoning = [&](const std::string& safe) {
         return sse_send(write, chunk(json::array({{{"index", 0},
-                                                   {"delta", {{"reasoning_content", std::string(bytes)}}},
+                                                   {"delta", {{"reasoning_content", safe}}},
                                                    {"finish_reason", nullptr}}})));
+    };
+    auto emit_reasoning = [&](std::string_view bytes) {
+        const std::string safe = reasoning_stream.push(bytes);
+        if (safe.empty()) return true;
+        return send_reasoning(safe);
+    };
+    // Emits whatever the reasoning streamer is still holding. Called when the
+    // think block closes (before any content of that step) and at end of
+    // stream, so a held code point is flushed into the reasoning stream in
+    // order rather than leaking into content or being dropped.
+    auto flush_reasoning = [&]() -> bool {
+        const std::string held = reasoning_stream.flush();
+        if (held.empty()) return true;
+        return send_reasoning(held);
     };
 
     auto emit_content = [&](std::string_view bytes) {
@@ -986,6 +1006,15 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
             if (!emit_reasoning(step.reasoning)) {
                 gone = true;
                 return false;
+            }
+            if (!step.content.empty()) {
+                // The think block closed in this step: flush the reasoning
+                // streamer's held bytes before any content goes out, keeping
+                // reasoning-then-content order intact.
+                if (!flush_reasoning()) {
+                    gone = true;
+                    return false;
+                }
             }
             if (step.content.empty()) return true;
             content += step.content;
@@ -1036,6 +1065,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     {
         const ReasoningStreamer::Step last = reasoning.flush();
         if (!emit_reasoning(last.reasoning)) return;
+        if (!flush_reasoning()) return;
         if (!last.content.empty()) {
             content += last.content;
             if (!prep.parse_tool_calls && !emit_content(last.content)) return;
