@@ -158,9 +158,28 @@ void Sampler::observe_think_text(std::string_view piece) {
 // describes.
 void Sampler::mask_illegal_while_thinking(float* logits, size_t vocab) const {
     if (!params_.think_eog_mask || think_state_ != ThinkState::thinking) return;
+    // Review B3: the closer must never be in the masked set. If an artifact's
+    // end-of-thinking marker were one of the turn-ending ids -- or a client
+    // stop id -- the mask would make the block unclosable and the turn could
+    // end only at the length cap. The guard strips it from every source the
+    // mask kills, and says so once.
+    auto is_closer = [&](int id) {
+        return std::find(params_.think_ids.close_ids.begin(), params_.think_ids.close_ids.end(), id)
+               != params_.think_ids.close_ids.end();
+    };
     auto kill = [&](const std::vector<int>& ids) {
-        for (int id : ids)
+        for (int id : ids) {
+            if (is_closer(id)) {
+                if (!closer_stripped_) {
+                    closer_stripped_ = true;
+                    log::warn("mask", "the think block's closer id %d is in the turn-ending set; "
+                                      "the mask leaves it offered so the block can close",
+                              id);
+                }
+                continue;
+            }
             if (id >= 0 && static_cast<size_t>(id) < vocab) logits[static_cast<size_t>(id)] = -INFINITY;
+        }
     };
     if (!params_.ignore_eos) kill(params_.think_ids.eog);
     kill(params_.stop_token_ids);

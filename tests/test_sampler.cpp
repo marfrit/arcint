@@ -578,3 +578,68 @@ TEST(sampler_mask_still_holds_while_the_block_is_open) {
     CHECK(t.think_block_open());
     CHECK_EQ(t.sample(eog_first().data(), 4), 3);
 }
+
+// ---------------------------------------------------------------------------
+// Review B3: the EOG set is not checked against the closer ids. A vocabulary
+// in which the block's closer is one of the turn-ending ids must never end up
+// with the closer masked: with it killed the block could not close and the
+// turn could end only at the length cap. The guard strips the closer from the
+// masked set and says so once.
+
+namespace {
+
+// A vocabulary whose closer id is also a turn-ending id: 0 a plain EOG id,
+// 1 the closer (in the EOG list and, separately, as a client stop id), 2 the
+// opener. The tags come from the shared table; nothing is written out.
+ThinkBlockIds pathologic_ids() {
+    const auto& pairs = think_tag_pairs(false);
+    ThinkBlockIds t;
+    t.eog        = {0, 1};
+    t.open_ids   = {2};
+    t.close_ids  = {1};
+    t.close_tags = {pairs[0].second};
+    t.open_tags  = {pairs[0].first};
+    return t;
+}
+
+}  // namespace
+
+TEST(sampler_mask_never_masks_the_closer_id) {
+    // The closer id in the EOG set: the guard leaves it offered. The other
+    // EOG id and the opener are masked, and with the closer as the argmax it
+    // is drawn -- the block can close, and the turn can end.
+    SamplerParams p = greedy_params();
+    p.think_eog_mask = true;
+    p.think_ids      = pathologic_ids();
+
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    auto l = logits({5.0f, 4.0f, 3.0f, 1.0f});
+    s.sample(l.data(), l.size());
+    CHECK(l[0] == -INFINITY);   // the other EOG id is masked
+    CHECK(l[1] != -INFINITY);   // the closer is never masked
+    CHECK(l[2] == -INFINITY);   // the opener is masked
+    CHECK(l[3] == 1.0f);        // everything else untouched
+
+    auto l2 = logits({5.0f, 6.0f, 3.0f, 1.0f});
+    CHECK_EQ(s.sample(l2.data(), l2.size()), 1);  // the closer is offered: the block closes
+}
+
+TEST(sampler_mask_never_masks_the_closer_id_from_the_stop_ids_either) {
+    // The same guard reaches the client stop ids: a closer id a client put in
+    // stop_token_ids is still offered while the block is open.
+    SamplerParams p = greedy_params();
+    p.think_eog_mask = true;
+    p.think_ids      = pathologic_ids();
+    p.think_ids.eog  = {0};   // the closer is not in the EOG list here
+    p.stop_token_ids = {1};
+
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    auto l = logits({5.0f, 6.0f, 3.0f, 1.0f});
+    s.sample(l.data(), l.size());
+    CHECK(l[0] == -INFINITY);   // the EOG id is masked
+    CHECK(l[1] != -INFINITY);   // the closer is not, though it is a client stop id
+    CHECK(l[2] == -INFINITY);   // the opener is masked
+}

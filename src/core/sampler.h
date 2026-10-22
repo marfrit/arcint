@@ -137,6 +137,11 @@ private:
                                // block's opening is settled
     size_t      think_max_tag_ = 0;
 
+    // The closer guard's once-latch (review B3): the closer id was found in
+    // the masked set and left in the row so the block can close; the warn is
+    // printed once per request, not once per step.
+    mutable bool closer_stripped_ = false;
+
     TokenConstraint* constraint_ = nullptr;
 };
 

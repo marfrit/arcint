@@ -49,6 +49,11 @@ struct ThinkBlockIds {
     std::vector<int> open_ids;   // the block's opening marker id: a second one
                                  // while the block is open is the same defect
                                  // one step later
+    std::vector<int> close_ids;  // the block's closer id, when the vocabulary
+                                 // spells it as one added token: the mask must
+                                 // never kill it (emitting it is what lets the
+                                 // block close), so the mask's guard leaves it
+                                 // out of the masked set in every case
     std::vector<std::string> close_tags;  // the closers, matched as TEXT: a
                                           // model can spell them as ordinary
                                           // text (measured on the coder

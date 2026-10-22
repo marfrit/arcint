@@ -1770,7 +1770,12 @@ private:
             if (one.size() == 1) ids.open_ids.push_back(one.front());
             ids.open_tags.emplace_back(open);
             // The closer is never blocked: emitting it is what lets the turn
-            // end again.
+            // end again. Where the vocabulary spells it as one added token the
+            // id is handed to the mask as well: the closer guard in the sampler
+            // (review B3) leaves it out of the masked set, and logs once if it
+            // was in there.
+            const std::vector<int> closer = tokenizer_->special_ids(close);
+            if (closer.size() == 1) ids.close_ids.push_back(closer.front());
             ids.close_tags.emplace_back(close);
         }
         sampler.set_think_mask_ids(std::move(ids));
