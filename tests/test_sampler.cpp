@@ -404,6 +404,46 @@ TEST(sampler_mask_leaves_every_other_token_alone) {
     CHECK(b == row);                          // off: the row is not touched
 }
 
+TEST(sampler_mask_covers_the_client_stop_ids_too) {
+    // Review B2: the decode loop's stop check ends the turn on the
+    // vocabulary's EOG ids plus the client's stop ids; the mask must cover
+    // exactly that set while the block is open, not only the EOG list. A stop
+    // id the check honours that the mask left unmasked would end the turn
+    // with no answer, the same defect the mask exists to close.
+    SamplerParams p = masked_params(true);    // think_ids.eog = {0}, open_ids = {1}
+    p.stop_token_ids = {3};                   // a client stop id, the argmax below
+
+    auto    l = logits({3.5f, 3.4f, 1.0f, 4.5f});   // the stop id is the argmax
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    CHECK_EQ(s.sample(l.data(), l.size()), 2);  // 0, 1 and 3 are held back; id 2 wins
+
+    // and once the block has closed the stop id is offered again: the mask
+    // holds it back only while the block is open, exactly as the stop check
+    // ends the turn only when it comes.
+    s.observe_think_text(think_tag_pairs(false)[0].second);
+    auto l2 = logits({3.5f, 3.4f, 1.0f, 4.5f});
+    CHECK_EQ(s.sample(l2.data(), l2.size()), 3);
+}
+
+TEST(sampler_mask_honours_ignore_eos_like_the_stop_check) {
+    // Review B2, the other half: the stop check's EOG half is gated on
+    // ignore_eos, so the mask's must be too. With the flag set the EOG id is
+    // ordinary content for this request and the mask leaves it, while the
+    // client's stop ids are still held back.
+    SamplerParams p = masked_params(true);
+    p.stop_token_ids = {3};
+    p.ignore_eos     = true;
+
+    auto    l = logits({5.0f, 4.0f, 1.0f, 0.5f});
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    CHECK_EQ(s.sample(l.data(), l.size()), 0);  // the EOG id is offered: the check would not end on it
+
+    auto l2 = logits({0.5f, 4.0f, 1.0f, 5.0f});
+    CHECK_EQ(s.sample(l2.data(), l2.size()), 2);  // the stop id is still held back (opener 1 too)
+}
+
 TEST(sampler_mask_notices_a_closer_split_across_pieces) {
     // Cut from the table's own string, never written out here: a closer that
     // straddles two emitted pieces still clears the mask.

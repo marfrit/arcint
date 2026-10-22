@@ -143,10 +143,18 @@ void Sampler::observe_think_text(std::string_view piece) {
     }
 }
 
-// While the block is open the end-of-turn token and a second opener are not
-// legal next tokens. Applied to the logits, not to the stop check: a filter in
-// the stop check would let the token be sampled, take its probability mass, and
-// then be ignored, so the sampled token would not be the one the distribution
+// While the block is open the turn-ending ids and a second opener are not
+// legal next tokens. The turn-ending set is exactly the one the decode loop's
+// stop check ends on (is_stop): the vocabulary's EOG ids, unless the request
+// ignores them, plus the client's stop ids. Both mechanisms read the same
+// fields of the same SamplerParams -- the EOG list the backend fills from the
+// vocabulary's predicate, the client list straight from the request -- so the
+// two are one source, not two lists: a stop id the check honours is one the
+// mask holds back while the block is open, and an id the check would pass
+// (ignore_eos) is offered, not masked.
+// Applied to the logits, not to the stop check: a filter in the stop check
+// would let the token be sampled, take its probability mass, and then be
+// ignored, so the sampled token would not be the one the distribution
 // describes.
 void Sampler::mask_illegal_while_thinking(float* logits, size_t vocab) const {
     if (!params_.think_eog_mask || think_state_ != ThinkState::thinking) return;
@@ -154,7 +162,8 @@ void Sampler::mask_illegal_while_thinking(float* logits, size_t vocab) const {
         for (int id : ids)
             if (id >= 0 && static_cast<size_t>(id) < vocab) logits[static_cast<size_t>(id)] = -INFINITY;
     };
-    kill(params_.think_ids.eog);
+    if (!params_.ignore_eos) kill(params_.think_ids.eog);
+    kill(params_.stop_token_ids);
     kill(params_.think_ids.open_ids);
 }
 

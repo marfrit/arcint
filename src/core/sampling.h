@@ -40,8 +40,12 @@ struct SamplerDefaults {
 // vocabulary; the tag strings come from think_tag_pairs() in reasoning.h,
 // which is the only place they are written out anywhere in this tree.
 struct ThinkBlockIds {
-    std::vector<int> eog;        // end-of-turn / end-of-sequence ids: the block
-                                 // is not a place to end a turn
+    std::vector<int> eog;        // the vocabulary's end-of-generation ids: the
+                                 // block is not a place to end a turn. Together
+                                 // with the request's own stop ids (SamplerParams::
+                                 // stop_token_ids, same field the decode loop's
+                                 // stop check reads) this is the set the mask
+                                 // holds back while the block is open
     std::vector<int> open_ids;   // the block's opening marker id: a second one
                                  // while the block is open is the same defect
                                  // one step later
