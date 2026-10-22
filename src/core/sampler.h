@@ -60,7 +60,7 @@ public:
     // grammar needs the block's state; only think_eog_mask masks anything).
     void start_in_think_block(bool open);
     void observe_think_text(std::string_view piece);
-    bool think_block_open() const { return think_open_; }
+    bool think_block_open() const { return think_state_ == ThinkState::thinking; }
 
     // Replace which tokens and tags spell the block. The params carry the
     // switch; only the backend knows the vocabulary, so it hands the ids in
@@ -91,6 +91,14 @@ private:
     void   measure_think_tags();
     size_t collect_candidates(const float* logits, size_t vocab, bool full);
 
+    // Where the block is in the generation. undecided: the opening is not
+    // settled yet and the lead is still examined; thinking: the block is open
+    // and the tail is watched for the closer; content: settled (the block
+    // closed, or never opened) and the lead is never examined again for the
+    // rest of the turn. The mask and the grammar's dormancy both read
+    // "thinking"; nothing else can be undone.
+    enum class ThinkState { undecided, thinking, content };
+
     SamplerParams   params_;
     uint64_t        seed_;
     std::mt19937_64 rng_;
@@ -100,12 +108,14 @@ private:
 
     std::vector<std::pair<float, int>> scratch_;
 
-    // The mask's state: whether the block is open, and the tail of generated
-    // text kept only to notice a closer that straddles two pieces. Bounded by
-    // the longest tag, so it costs nothing per step.
-    bool        think_open_ = false;
+    // The mask's state (see ThinkState), plus the two text windows the states
+    // examine. Both are bounded by the longest tag, so they cost nothing per
+    // step: the lead holds the generation's first non-blank characters until
+    // the opening is settled, the tail the newest characters to see a closer
+    // that straddles two pieces.
+    ThinkState  think_state_ = ThinkState::undecided;
     std::string think_tail_;   // the newest characters, to see a closer land
-    std::string think_lead_;   // the generation's first characters, until the
+    std::string think_lead_;   // the first non-blank characters, until the
                                // block's opening is settled
     size_t      think_max_tag_ = 0;
 

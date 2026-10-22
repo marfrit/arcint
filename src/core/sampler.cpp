@@ -1,5 +1,7 @@
 #include "core/sampler.h"
 
+#include "core/reasoning.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -37,7 +39,7 @@ void Sampler::observe(int token) {
     // trigger it. observe_think_text has already seen this token's text, so a
     // closer is fed (harmless: the lazy grammar is still waiting) and the
     // first token after it is the first the grammar can trigger on.
-    if (constraint_ != nullptr && !think_open_) constraint_->accept(token);
+    if (constraint_ != nullptr && think_state_ != ThinkState::thinking) constraint_->accept(token);
 }
 
 void Sampler::set_think_mask_ids(ThinkBlockIds ids) {
@@ -57,42 +59,66 @@ void Sampler::measure_think_tags() {
 
 void Sampler::start_in_think_block(bool open) {
     measure_think_tags();
-    think_open_ = tracks_think() && open;
+    // The template wrote the opener as the lead of the turn: the block is
+    // already open before the first token. Otherwise the first tokens decide.
+    think_state_ = (tracks_think() && open) ? ThinkState::thinking : ThinkState::undecided;
     think_tail_.clear();
     think_lead_.clear();
 }
 
-// Feed the generated text, in generation order. The block closes on a closer
-// wherever it appears; it opens on an opener only at the very lead, which is
-// what split_reasoning does with the same text — the mask and the reasoning
-// split must agree about where the block is, or the mask lifts on text the
-// client still sees as reasoning.
+// Feed the generated text, in generation order. The state is undecided
+// (the opening is not settled yet), thinking (the block is open) or content
+// (settled: the block closed, or never opened). The lead is examined only
+// while undecided, and stripped of leading spaces and newlines with the same
+// lead_of split_reasoning uses, so the mask and the reasoning split agree
+// about where the block is. Once content the state is final for the turn: the
+// lead is never examined again and nothing re-opens the block.
 void Sampler::observe_think_text(std::string_view piece) {
     if (!tracks_think()) return;
-    if (!think_open_) {
+
+    if (think_state_ == ThinkState::undecided) {
         // Before the block's opening is settled, only the generation's first
-        // characters matter. The rule is deliberately one-sided, and errs
-        // towards masking: the mask engages as soon as the lead matches an
+        // non-blank characters matter. The rule is deliberately one-sided, and
+        // errs towards masking: the mask engages as soon as the lead matches an
         // opener or could still grow into one, and only lets go when the lead
         // has provably become something else. Masking the turn-ender for the
         // two or three tokens of a partial opener costs nothing; releasing a
         // turn that the client still sees as reasoning is the defect.
-        if (think_lead_.size() < think_max_tag_) think_lead_.append(piece);
+        think_lead_.append(piece);
+        // Strip the lead exactly as lead_of does, so a pad of spaces and
+        // newlines before a self-opened block is not part of the opener and
+        // the mask engages where the split would. Keep only as many lead
+        // characters as the longest tag: the decision needs no more, so a
+        // blank run costs nothing and the lead stays bounded.
+        const std::string_view lead = lead_of(think_lead_);
+        if (lead.size() != think_lead_.size()) think_lead_.erase(0, think_lead_.size() - lead.size());
         if (think_lead_.size() > think_max_tag_) think_lead_.resize(think_max_tag_);
-        bool settled = false;
+
+        bool matched = false;
+        bool loomed  = false;
         for (const std::string& t : params_.think_ids.open_tags) {
             if (think_lead_.size() >= t.size()) {
-                if (think_lead_.compare(0, t.size(), t) == 0) { think_open_ = true; settled = true; break; }
-                continue;
+                if (think_lead_.compare(0, t.size(), t) == 0) { matched = true; break; }
+            } else if (!think_lead_.empty() && t.compare(0, think_lead_.size(), think_lead_) == 0) {
+                loomed = true;
             }
-            if (t.compare(0, think_lead_.size(), think_lead_) == 0) { think_open_ = true; settled = true; break; }
         }
-        if (!settled && !params_.think_ids.open_tags.empty()) {
-            // No opener matched or loomed: the answer begins as content.
-            think_open_ = false;
+        if (matched || loomed) {
+            // Open from here, and the rest of this piece is inside the block:
+            // the closer scan below must run on it.
+            think_state_ = ThinkState::thinking;
+            think_lead_.clear();
+        } else if (!think_lead_.empty()) {
+            // No opener matched or loomed: the answer begins as content, and
+            // the lead is settled and never examined again.
+            think_state_ = ThinkState::content;
+            think_lead_.clear();
+            return;
         }
-        if (!think_open_) return;
+        // A blank-only lead could still grow into an opener: stay undecided.
     }
+
+    // thinking
     think_tail_.append(piece);
     // Keep enough of the tail to see a closer that straddles two pieces, and
     // never less than the piece just appended: a closer wholly inside one long
@@ -101,8 +127,11 @@ void Sampler::observe_think_text(std::string_view piece) {
     if (think_tail_.size() > keep) think_tail_.erase(0, think_tail_.size() - keep);
     for (const std::string& t : params_.think_ids.close_tags) {
         if (think_tail_.find(t) != std::string::npos) {
-            think_open_  = false;
+            // Settled: content. Both windows are cleared, so neither the
+            // stale lead nor a tail remnant can re-open the block later.
+            think_state_ = ThinkState::content;
             think_tail_.clear();
+            think_lead_.clear();
             return;
         }
     }
@@ -114,7 +143,7 @@ void Sampler::observe_think_text(std::string_view piece) {
 // then be ignored, so the sampled token would not be the one the distribution
 // describes.
 void Sampler::mask_illegal_while_thinking(float* logits, size_t vocab) const {
-    if (!params_.think_eog_mask || !think_open_) return;
+    if (!params_.think_eog_mask || think_state_ != ThinkState::thinking) return;
     auto kill = [&](const std::vector<int>& ids) {
         for (int id : ids)
             if (id >= 0 && static_cast<size_t>(id) < vocab) logits[static_cast<size_t>(id)] = -INFINITY;
@@ -190,7 +219,7 @@ int Sampler::sample(float* logits, size_t vocab) {
     apply_penalties(logits, vocab);
 
     const int tok = draw(logits, vocab);
-    if (constraint_ == nullptr || think_open_ || constraint_->allows(tok)) return tok;
+    if (constraint_ == nullptr || think_state_ == ThinkState::thinking || constraint_->allows(tok)) return tok;
     // Grammar-based rejection sampling, as the reference's
     // common_sampler_sample: the drawn token does not fit, so mask the row
     // (after the think mask and the penalties, as the reference re-runs its

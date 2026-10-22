@@ -26,6 +26,14 @@ struct ReasoningSplit {
 // (Magistral tunes), each closed only by its own closer.
 ReasoningSplit split_reasoning(std::string_view raw, bool think_open, bool extended_tags = false);
 
+// The lead of a generated text: everything from its first non-blank
+// character, where blank is a space or a newline. A model may pad before a
+// self-opened block; the pad is not part of the opener, so the opener rule
+// is applied to the stripped text. split_reasoning and the sampler's
+// think-block mask both use this one helper, so they cannot disagree about
+// where the lead starts.
+std::string_view lead_of(std::string_view s);
+
 // The streaming form: pieces in, (reasoning delta, content delta) out, with a
 // hold-back for a close tag that straddles two pieces. Once the block closes
 // every further byte is content and goes straight through.

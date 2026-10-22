@@ -15,10 +15,6 @@ struct ThinkTags {
 };
 constexpr ThinkTags kTags[] = {{"<think>", "</think>"}, {"<thinking>", "</thinking>"}, {"[THINK]", "[/THINK]"}};
 
-std::string_view lead_of(std::string_view s) {
-    while (!s.empty() && (s.front() == '\n' || s.front() == ' ')) s.remove_prefix(1);
-    return s;
-}
 // the pairs a model may open: <think> only, or all of them
 size_t n_tags(bool extended) { return extended ? std::size(kTags) : 1; }
 // the pair whose opener starts `lead`, or nullptr
@@ -53,6 +49,14 @@ std::string_view strip_leading_newlines(std::string_view s) {
     return s;
 }
 }  // namespace
+
+// One helper, two callers: split_reasoning below and the sampler's
+// think-block mask both strip the lead this way, so they cannot
+// disagree about where a self-opened block starts.
+std::string_view lead_of(std::string_view s) {
+    while (!s.empty() && (s.front() == '\n' || s.front() == ' ')) s.remove_prefix(1);
+    return s;
+}
 
 const std::vector<std::pair<std::string, std::string>>& think_tag_pairs(bool extended) {
     // Built once per shape and handed out by reference: a caller that needs a

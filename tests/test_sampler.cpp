@@ -452,3 +452,89 @@ TEST(sampler_mask_lets_go_when_the_lead_is_plainly_not_an_opener) {
     s.observe_think_text(opener.substr(0, 1) + "n ordinary sentence");
     CHECK_EQ(s.sample(eog_first().data(), 4), 0);
 }
+
+// ---------------------------------------------------------------------------
+// The state machine must settle. Before the fix the block was one bool plus a
+// lead string that was re-examined for the whole turn: a closed block's lead
+// could re-open it on the first content piece, and the raw lead disagreed
+// with split_reasoning's stripped lead. The cases below are red on that code.
+
+TEST(sampler_mask_stays_released_after_a_self_opened_block_closes) {
+    // The model opened the block itself, closed it, and the answer begins.
+    // The state is settled content: the first content piece must not
+    // re-open the block, and the turn-ender is legal again.
+    const auto& pairs = think_tag_pairs(false);
+    Sampler     s(masked_params(true), 1);
+    s.start_in_think_block(false);
+    s.observe_think_text(pairs[0].first + "why");
+    CHECK_EQ(s.sample(eog_first().data(), 4), 3);    // open: the mask holds
+    s.observe_think_text(pairs[0].second);
+    CHECK(!s.think_block_open());
+    s.observe_think_text("the answer begins");
+    CHECK(!s.think_block_open());
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);    // settled: the turn may end
+    s.observe_think_text(" and it goes on");
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);
+}
+
+TEST(sampler_mask_stays_released_after_a_template_opened_block_closes) {
+    // The template opened the block and the model closed it; the answer's
+    // first piece is a strict prefix of the opener. It is content, and it
+    // must not re-open the block: with the old bool plus lead, the empty
+    // lead absorbed the piece and matched the opener's prefix again.
+    const auto& pairs     = think_tag_pairs(false);
+    const std::string opener_prefix = pairs[0].first.substr(0, 3);
+    Sampler s(masked_params(true), 1);
+    s.start_in_think_block(true);
+    s.observe_think_text("some reasoning");
+    CHECK_EQ(s.sample(eog_first().data(), 4), 3);    // open: the mask holds
+    s.observe_think_text(pairs[0].second);
+    CHECK(!s.think_block_open());
+    s.observe_think_text(opener_prefix);
+    CHECK(!s.think_block_open());                    // still content
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);    // the turn may end
+    s.observe_think_text(" the rest");
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);
+}
+
+TEST(sampler_mask_engages_on_a_blank_lead_like_split_reasoning) {
+    // A run of newlines before a self-opened block is a pad, not the start of
+    // an answer: split_reasoning strips it before looking for the opener, and
+    // the mask must agree. With the old raw-lead comparison the lead settled
+    // as content on the blanks and the mask never engaged.
+    const auto& pairs = think_tag_pairs(false);
+    const std::string raw = "\n\n" + pairs[0].first + "why" + pairs[0].second;
+    const ReasoningSplit split = split_reasoning(raw, false, false);
+    CHECK(split.closed);
+    CHECK_EQ(split.reasoning, "why");
+    CHECK(split.content.empty());
+
+    Sampler s(masked_params(true), 1);
+    s.start_in_think_block(false);
+    s.observe_think_text("\n\n");
+    CHECK(!s.think_block_open());                    // the pad alone opens nothing
+    s.observe_think_text(pairs[0].first + "why");
+    CHECK(s.think_block_open());                     // the opener, past the pad
+    CHECK_EQ(s.sample(eog_first().data(), 4), 3);    // the mask holds
+    s.observe_think_text(pairs[0].second);
+    CHECK(!s.think_block_open());
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);    // and it releases
+}
+
+TEST(sampler_mask_still_holds_while_the_block_is_open) {
+    // Control for the settling cases above: a block that has not closed keeps
+    // masking the turn-ender, template-opened and self-opened alike. This one
+    // is green before and after.
+    const auto& pairs = think_tag_pairs(false);
+    Sampler     s(masked_params(true), 1);
+    s.start_in_think_block(true);
+    s.observe_think_text("still reasoning");
+    CHECK(s.think_block_open());
+    CHECK_EQ(s.sample(eog_first().data(), 4), 3);
+
+    Sampler t(masked_params(true), 1);
+    t.start_in_think_block(false);
+    t.observe_think_text(pairs[0].first + "still reasoning");
+    CHECK(t.think_block_open());
+    CHECK_EQ(t.sample(eog_first().data(), 4), 3);
+}
