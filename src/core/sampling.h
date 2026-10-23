@@ -40,6 +40,12 @@ struct SamplerDefaults {
 // vocabulary; the tag strings come from think_tag_pairs() in reasoning.h,
 // which is the only place they are written out anywhere in this tree.
 struct ThinkBlockIds {
+    // One entry per tag pair, aligned with open_tags/close_tags below:
+    // {open_id, close_id}, each -1 when that tag is not one single special
+    // token in the vocabulary. The state machine needs the PAIRING (a block
+    // opened by one pair's opener is closed by that pair's closer); the
+    // flattened open_ids/close_ids the mask reads carry the same ids as sets.
+    std::vector<std::pair<int, int>> open_close_ids;
     std::vector<int> eog;        // the vocabulary's end-of-generation ids: the
                                  // block is not a place to end a turn. Together
                                  // with the request's own stop ids (SamplerParams::

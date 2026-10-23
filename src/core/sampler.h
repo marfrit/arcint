@@ -69,18 +69,28 @@ public:
     // dock every common word before the model has said anything.
     void set_prompt(const std::vector<int>& prompt);
 
-    // Records a token the model actually generated.
-    void observe(int token);
+    // Records a token the model actually generated, with the text that token
+    // decoded to. The id and the text are one observation: the think-block
+    // tracker decides on the id when the vocabulary spells the tag as one
+    // special token (a spelled-out closer is ordinary tokens and does not
+    // close the block), and falls back to the text otherwise. `piece` may be
+    // empty (a caller that only tracks the id, e.g. the TTS codec loop, which
+    // never runs the think-block tracker).
+    void observe(int token, std::string_view piece = {});
 
     // clean-turns: the think-block mask. `start_in_think_block` says whether
     // the template opened the block before the first token (the ChatML form
     // writes the opener as the lead of the assistant turn, so the block is open
-    // before the model has produced anything). `observe_think_text` feeds the
-    // decoded pieces in generation order so the mask clears when the block
-    // closes, and engages when the model opens the block itself. Both are
+    // before the model has produced anything). `observe` feeds the (id, text)
+    // pairs in generation order so the mask clears when the block closes, and
+    // engages when the model opens the block itself. Both are
     // inert unless params.think_eog_mask or params.tool_grammar is set (the
     // grammar needs the block's state; only think_eog_mask masks anything).
     void start_in_think_block(bool open);
+    // Text-only feed, for a caller that has no token id (the tests; a
+    // backend always calls observe(id, piece)). It is the text fallback: a
+    // known id still governs its role, so ordinary text cannot close or open
+    // a block whose tag is one special token.
     void observe_think_text(std::string_view piece);
     bool think_block_open() const { return think_state_ == ThinkState::thinking; }
 
@@ -111,6 +121,8 @@ private:
     void   apply_penalties(float* logits, size_t vocab) const;
     void   mask_illegal_while_thinking(float* logits, size_t vocab) const;
     void   measure_think_tags();
+    void   build_think_id_table();
+    void   observe_think_(std::string_view piece, int token);
     size_t collect_candidates(const float* logits, size_t vocab, bool full);
 
     // Where the block is in the generation. undecided: the opening is not
@@ -142,6 +154,17 @@ private:
     size_t      think_max_tag_ = 0;   // the longest tag: the closer tail's bound
     size_t      think_max_open_ = 0;  // the longest opener: the lead's bound
                                       // (N1: the look-ahead is bounded by it)
+
+    // The id rule: when the vocabulary spells a tag as one special token the
+    // block opens and closes on that id, not on the decoded text (a model that
+    // QUOTES the closer spells it from ordinary tokens and produces the same
+    // text; the text path read that as the real closer). close_id_ is the id
+    // that closes the block that is open: the first close id when the template
+    // opened it, the close id paired with the opener that opened it otherwise.
+    // -1 means "no id; the text fallback is in force for that role".
+    int          think_close_id_ = -1;
+    bool         think_has_open_ids_ = false;   // at least one opener is one id
+    std::vector<std::pair<int, int>> think_open_to_close_;   // open id -> its close id
 
     // The closer guard's once-latch (review B3): the closer id was found in
     // the masked set and left in the row so the block can close; the warn is

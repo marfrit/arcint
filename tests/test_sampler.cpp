@@ -665,3 +665,83 @@ TEST(sampler_mask_never_masks_the_closer_id_from_the_stop_ids_either) {
     CHECK(l[1] != -INFINITY);   // the closer is not, though it is a client stop id
     CHECK(l[2] == -INFINITY);   // the opener is masked
 }
+
+// ---------------------------------------------------------------------------
+// clean-turns step 2: the block's state is decided by the token id, not by the
+// decoded text. A model that merely MENTIONS the closer -- spelling it from
+// ordinary sub-word tokens while quoting it in its reasoning or writing it
+// into code -- produces the same text. The text path read that as the real
+// closer: reasoning ended early, planning spilled into the answer. The id path
+// does not: a role whose tag is one special token is decided by its id alone.
+
+namespace {
+
+// A vocabulary whose closer is one special token, id 2. The opener has no id
+// (the template opened the block, as the Qwen templates do when thinking is
+// on), so these cases take the id path in the close role alone. The tag
+// strings come from the shared table; nothing is written out here.
+ThinkBlockIds id_close_ids() {
+    const auto& pairs = think_tag_pairs(false);
+    ThinkBlockIds t;
+    t.eog        = {0};
+    t.close_ids  = {2};
+    t.close_tags = {pairs[0].second};
+    t.open_tags  = {pairs[0].first};
+    return t;
+}
+
+SamplerParams id_close_params() {
+    SamplerParams p = greedy_params();
+    p.think_eog_mask = true;
+    p.think_ids      = id_close_ids();
+    return p;
+}
+
+// The closer spelled from ordinary tokens: same text, different ids. Assembled
+// from the table's own string, never written out here.
+std::string spelled_closer() { return std::string(think_tag_pairs(false)[0].second); }
+
+}  // namespace
+
+TEST(sampler_id_rule_a_spelled_closer_does_not_close_the_block) {
+    // The red case: the model quotes the closer in its reasoning. The decoded
+    // text equals the real closer, but no special token was emitted: the state
+    // must stay thinking and the turn-ender must stay masked.
+    Sampler s(id_close_params(), 1);
+    s.start_in_think_block(true);
+    s.observe_think_text("the marker is ");
+    const std::string c = spelled_closer();
+    s.observe_think_text(c.substr(0, 3)); s.observe(30);
+    s.observe_think_text(c.substr(3, 3)); s.observe(31);
+    s.observe_think_text(c.substr(6));     s.observe(32);
+    CHECK(s.think_block_open());                    // still thinking
+    CHECK_EQ(s.sample(eog_first().data(), 4), 1);   // the turn-ender (0) still masked
+}
+
+TEST(sampler_id_rule_the_special_closer_closes_the_block) {
+    // The closer as one special token, id 2: it closes the block whatever its
+    // text says; no text scan can do it. Red before the id rule: observe() did
+    // not look at the id, so the block stayed open.
+    Sampler s(id_close_params(), 1);
+    s.start_in_think_block(true);
+    s.observe_think_text("reasoning that ends");
+    CHECK(s.think_block_open());
+    CHECK_EQ(s.sample(eog_first().data(), 4), 1);   // the turn-ender (0) still masked
+    s.observe(2);                                   // the closer id, text not needed
+    CHECK(!s.think_block_open());
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);   // settled: the turn may end
+}
+
+TEST(sampler_id_rule_no_ids_keeps_the_text_behaviour) {
+    // The fallback: a template whose tags are not single special tokens (no ids
+    // known) behaves exactly as before -- the closer matched as text closes the
+    // block. This case is green before and after the id rule.
+    const auto& pairs = think_tag_pairs(false);
+    Sampler     s(masked_params(true), 1);   // table_ids(): no close_ids
+    s.start_in_think_block(true);
+    s.observe_think_text("reasoning");
+    CHECK(s.think_block_open());
+    s.observe_think_text(pairs[0].second);   // the closer as text
+    CHECK(!s.think_block_open());
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);
+}

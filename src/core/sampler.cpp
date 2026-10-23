@@ -41,18 +41,24 @@ void TokenConstraint::note_desync(int token, const std::string& why) {
     log::error("grammar", "desync: %s (token %d); the rest of this request is unconstrained", why.c_str(), token);
 }
 
-void Sampler::observe(int token) {
+void Sampler::observe(int token, std::string_view piece) {
     if (token < 0) return;
     ++seen_[token];
     ++generated_[token];
+    // The think-block tracker sees the (id, text) pair of every generated
+    // token, in generation order. The id decides when the vocabulary spells a
+    // tag as one special token; the text is the fallback otherwise.
+    observe_think_(piece, token);
     // A token inside an open think block is reasoning, not a call: arcint
     // parses calls from the content only (split_reasoning), so the grammar is
     // not fed it -- a call opener the model mentions while thinking does not
-    // trigger it. observe_think_text has already seen this token's text, so a
-    // closer is fed (harmless: the lazy grammar is still waiting) and the
-    // first token after it is the first the grammar can trigger on.
+    // trigger it. A closer is fed (harmless: the lazy grammar is still
+    // waiting) and the first token after it is the first the grammar can
+    // trigger on.
     if (constraint_ != nullptr && think_state_ != ThinkState::thinking) constraint_->accept(token);
 }
+
+void Sampler::observe_think_text(std::string_view piece) { observe_think_(piece, -1); }
 
 void Sampler::set_think_mask_ids(ThinkBlockIds ids) {
     params_.think_ids = std::move(ids);
@@ -73,37 +79,98 @@ void Sampler::measure_think_tags() {
     }
 }
 
+// The id rule's table: which open ids close which close ids, from the
+// per-pair field the backend fills (ThinkBlockIds::open_close_ids, aligned
+// with the tag pairs). A block opened by one pair's opener is closed by that
+// pair's closer, exactly as the split pairs them. For a caller that only fills
+// the flattened id lists, the ids are zipped positionally.
+void Sampler::build_think_id_table() {
+    think_open_to_close_.clear();
+    think_has_open_ids_ = false;
+    if (!params_.think_ids.open_close_ids.empty()) {
+        for (const auto& [oid, cid] : params_.think_ids.open_close_ids) {
+            if (oid < 0) continue;
+            think_has_open_ids_ = true;
+            think_open_to_close_.emplace_back(oid, cid);
+        }
+        return;
+    }
+    for (size_t i = 0; i < params_.think_ids.open_ids.size(); ++i) {
+        const int oid = params_.think_ids.open_ids[i];
+        if (oid < 0) continue;
+        think_has_open_ids_ = true;
+        const int cid = i < params_.think_ids.close_ids.size() ? params_.think_ids.close_ids[i] : -1;
+        think_open_to_close_.emplace_back(oid, cid);
+    }
+}
+
 void Sampler::start_in_think_block(bool open) {
     measure_think_tags();
+    build_think_id_table();
     // The template wrote the opener as the lead of the turn: the block is
     // already open before the first token. Otherwise the first tokens decide.
     think_state_ = (tracks_think() && open) ? ThinkState::thinking : ThinkState::undecided;
     think_tail_.clear();
     think_lead_.clear();
+    // The closer of a template-opened block: the first pair's close id, or the
+    // first flattened close id. -1 keeps the text fallback.
+    int cid = -1;
+    if (!params_.think_ids.open_close_ids.empty()) cid = params_.think_ids.open_close_ids.front().second;
+    else if (!params_.think_ids.close_ids.empty()) cid = params_.think_ids.close_ids.front();
+    think_close_id_ = think_state_ == ThinkState::thinking && cid >= 0 ? cid : -1;
 }
 
-// Feed the generated text, in generation order. The state is undecided
-// (the opening is not settled yet), thinking (the block is open) or content
-// (settled: the block closed, or never opened). The lead is examined only
-// while undecided, and stripped of leading spaces and newlines with the same
-// lead_of split_reasoning uses, so the mask and the reasoning split agree
-// about where the block is. Once content the state is final for the turn: the
-// lead is never examined again and nothing re-opens the block.
-void Sampler::observe_think_text(std::string_view piece) {
+// Feed one generated token -- its text and its id -- to the think-block
+// tracker, in generation order. The states: undecided (the opening is not
+// settled yet), thinking (the block is open) or content (settled: the block
+// closed, or never opened).
+//
+// The id rule: when the vocabulary spells a tag as one special token, that
+// role is decided by the id and the decoded text is not looked at for it. A
+// model that QUOTES the closer, spelling it from ordinary sub-word tokens,
+// produces identical text but a different id; the text path read that as the
+// real closer (reasoning ended early, planning spilled into the answer). A tag
+// with no id (the stub backend, a template whose vocabulary spells it as text)
+// keeps the text fallback below, exactly as before.
+//
+// The undecided state examines the stripped lead exactly as lead_of
+// split_reasoning does, so the mask and the reasoning split agree about where
+// the block is. Once content the state is final for the turn: nothing
+// re-opens the block.
+void Sampler::observe_think_(std::string_view piece, int token) {
     if (!tracks_think()) return;
 
+    // The closer id: the block that is open closes only on it. A spelled-out
+    // closer is ordinary tokens and cannot get here.
+    if (think_state_ == ThinkState::thinking && think_close_id_ >= 0 && token == think_close_id_) {
+        think_state_ = ThinkState::content;
+        think_tail_.clear();
+        think_lead_.clear();
+        return;
+    }
+
+    // The opener id: the model opened the block itself with one special token.
+    // It pairs with that tag's own closer.
+    if (think_state_ == ThinkState::undecided && token >= 0) {
+        for (const auto& [oid, cid] : think_open_to_close_) {
+            if (token != oid) continue;
+            think_state_    = ThinkState::thinking;
+            think_close_id_ = cid;
+            think_lead_.clear();
+            think_tail_.clear();
+            return;   // the opener token's whole piece is the marker
+        }
+    }
+
     if (think_state_ == ThinkState::undecided) {
-        // Before the block's opening is settled, only the generation's first
-        // non-blank characters matter. N1: the rule errs towards STAYING
-        // undecided. A lead that could still grow into an opener keeps the
-        // state undecided; a full opener match opens the block; a lead that
-        // can no longer grow into any opener settles it to content. Committing
-        // a merely looming lead to thinking (the old `matched || loomed`) is
-        // the defect this settles: if the text then diverges, no closer ever
-        // comes, every turn-ender stays masked, and the turn runs to the
-        // length cap. With token ids known (ThinkBlockIds::open_ids) this
-        // text path is not used at all: the opener is one id, seen in
-        // observe().
+        // N1: err towards STAYING undecided. A lead that could still grow into
+        // an opener keeps the state undecided; a full opener match opens it; a
+        // lead that can no longer grow into any opener settles to content.
+        // Committing a merely looming lead to thinking (the old `matched ||
+        // loomed`) is the defect this settles: if the text then diverges, no
+        // closer ever comes, every turn-ender stays masked, and the turn runs
+        // to the length cap. A pair whose opener is one special id keeps its
+        // id rule here: its text can neither open nor settle the block.
         think_lead_.append(piece);
         // Strip the lead exactly as lead_of does, so a pad of spaces and
         // newlines before a self-opened block is not part of the opener and
@@ -117,33 +184,51 @@ void Sampler::observe_think_text(std::string_view piece) {
 
         bool matched = false;
         bool loomed  = false;
-        for (const std::string& t : params_.think_ids.open_tags) {
+        size_t matched_pair = 0;
+        for (size_t i = 0; i < params_.think_ids.open_tags.size(); ++i) {
+            // A pair whose opener is a known id is decided by that id alone.
+            if (!params_.think_ids.open_close_ids.empty() && i < params_.think_ids.open_close_ids.size()
+                && params_.think_ids.open_close_ids[i].first >= 0)
+                continue;
+            const std::string& t = params_.think_ids.open_tags[i];
             if (think_lead_.size() >= t.size()) {
-                if (think_lead_.compare(0, t.size(), t) == 0) { matched = true; break; }
+                if (think_lead_.compare(0, t.size(), t) == 0) {
+                    matched      = true;
+                    matched_pair = i;
+                    break;
+                }
             } else if (!think_lead_.empty() && t.compare(0, think_lead_.size(), think_lead_) == 0) {
                 loomed = true;
             }
         }
         if (matched) {
-            // A full opener at the lead: open from here, and the rest of this
-            // piece is inside the block: the closer scan below must run on it.
+            // A full text opener at the lead, for a pair with no id: open from
+            // here, paired with its own closer id when that exists; otherwise
+            // the closer scan below runs on the rest of this piece.
             think_state_ = ThinkState::thinking;
+            think_close_id_ =
+                !params_.think_ids.open_close_ids.empty() && matched_pair < params_.think_ids.open_close_ids.size()
+                    ? params_.think_ids.open_close_ids[matched_pair].second
+                    : (!params_.think_ids.close_ids.empty() && matched_pair < params_.think_ids.close_ids.size()
+                           ? params_.think_ids.close_ids[matched_pair]
+                           : -1);
             think_lead_.clear();
         } else if (loomed || think_lead_.empty()) {
-            // Still undecided: the lead could grow into an opener (or is only
-            // blanks). Nothing is open, so no closer scan on this piece.
-            return;
+            return;   // nothing is open; no closer scan on this piece
         } else {
-            // The lead can no longer grow into any opener: the answer begins
-            // as content, and the lead is settled and never examined again
-            // for the rest of the turn.
             think_state_ = ThinkState::content;
             think_lead_.clear();
             return;
         }
     }
 
-    // thinking
+    if (think_state_ != ThinkState::thinking) return;
+
+    // thinking. A known closer id is the whole rule above: no text can close
+    // the block, so a spelled-out closer stays reasoning and there is nothing
+    // to scan. Only the text fallback watches the tail.
+    if (think_close_id_ >= 0) return;
+
     think_tail_.append(piece);
     // Keep enough of the tail to see a closer that straddles two pieces, and
     // never less than the piece just appended: a closer wholly inside one long
