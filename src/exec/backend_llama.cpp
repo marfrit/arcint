@@ -1577,7 +1577,10 @@ private:
             // of that token -- sample(), then emit (which feeds observe_think),
             // then walk_verify's own observe(token) before the next row. So a
             // closer inside the verified span switches the following draws to
-            // the answer row exactly as it would in the plain loop.
+            // the answer row exactly as it would in the plain loop; observe()
+            // counts the closer as the answer history's edge (not into it) and
+            // every token after it into the answer's own presence counts, so a
+            // verify that closes mid-span starts the history at the right token.
             const auto t_walk = clock_type::now();
             const VerifyWalk w = walk_verify(
                 rows.data(), batch.size(), n_vocab_, draft, sampler, budget,

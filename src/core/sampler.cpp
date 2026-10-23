@@ -24,6 +24,8 @@ Sampler::Sampler(const SamplerParams& params, uint64_t seed)
 void Sampler::set_prompt(const std::vector<int>& prompt) {
     seen_.clear();
     generated_.clear();
+    answer_generated_.clear();
+    answer_closer_now_ = false;
     seen_.reserve(prompt.size());
     for (int id : prompt) {
         if (id >= 0) ++seen_[id];
@@ -56,6 +58,17 @@ void Sampler::observe(int token, std::string_view piece) {
     // waiting) and the first token after it is the first the grammar can
     // trigger on.
     if (constraint_ != nullptr && think_state_ != ThinkState::thinking) constraint_->accept(token);
+    // llava: the answer row's history starts at the closer, not with it. The
+    // token that closed the block is reasoning's last token; it is not counted
+    // here, and the flag is consumed so the next token is. Inert before the
+    // switch and in a turn that never switches; filled only when the answer row
+    // owns a penalty, so an answer row without one keeps today's history.
+    const bool closer_here = answer_closer_now_;
+    answer_closer_now_ = false;
+    if (use_answer_row()
+        && (params_.answer_presence_penalty || params_.answer_frequency_penalty)
+        && !closer_here)
+        ++answer_generated_[token];
 }
 
 void Sampler::observe_think_text(std::string_view piece) { observe_think_(piece, -1); }
@@ -115,6 +128,8 @@ void Sampler::start_in_think_block(bool open) {
     // llava: the answer row needs a block that actually opened, not merely a
     // request that declared thinking.
     think_block_ever_open_ = think_state_ == ThinkState::thinking;
+    answer_generated_.clear();
+    answer_closer_now_ = false;
     think_tail_.clear();
     think_lead_.clear();
     // The closer of a template-opened block: the first pair's close id, or the
@@ -151,6 +166,7 @@ void Sampler::observe_think_(std::string_view piece, int token) {
         think_state_ = ThinkState::content;
         think_tail_.clear();
         think_lead_.clear();
+        answer_closer_now_ = true;   // llava: this token is the answer history's edge
         return;
     }
 
@@ -249,6 +265,7 @@ void Sampler::observe_think_(std::string_view piece, int token) {
             think_state_ = ThinkState::content;
             think_tail_.clear();
             think_lead_.clear();
+            answer_closer_now_ = true;   // llava: the text closer is the history's edge
             return;
         }
     }
@@ -310,9 +327,21 @@ int Sampler::argmax(const float* logits, size_t vocab) {
 }
 
 void Sampler::apply_penalties(float* logits, size_t vocab) const {
+    // llava: the effective row decides both the values and the history. When
+    // the answer row owns a penalty (either answer_* field is configured), its
+    // presence/frequency counts read only the tokens drawn after the closer --
+    // the identifiers the reasoning just worked out are not docked. With no
+    // answer penalty configured the fields fall back to the thinking row's
+    // values and read the whole generated history, byte-identically to before.
+    // repetition_penalty is unchanged: it counts the prompt too, by design
+    // (set_prompt), and is not part of the switch.
+    const EffectiveRow row = effective_row();
     const bool rep  = params_.repetition_penalty != 1.0f;
-    const bool pres = params_.presence_penalty != 0.0f;
-    const bool freq = params_.frequency_penalty != 0.0f;
+    const bool pres = row.presence_penalty != 0.0f;
+    const bool freq = row.frequency_penalty != 0.0f;
+    const bool answer_hist = row.answer_row
+                             && (params_.answer_presence_penalty || params_.answer_frequency_penalty);
+    const auto& hist = answer_hist ? answer_generated_ : generated_;
 
     if (rep) {
         for (const auto& [id, n] : seen_) {
@@ -325,11 +354,11 @@ void Sampler::apply_penalties(float* logits, size_t vocab) const {
         }
     }
     if (pres || freq) {
-        for (const auto& [id, n] : generated_) {
+        for (const auto& [id, n] : hist) {
             if (static_cast<size_t>(id) >= vocab) continue;
             float& l = logits[static_cast<size_t>(id)];
-            if (pres) l -= params_.presence_penalty;
-            if (freq) l -= params_.frequency_penalty * static_cast<float>(n);
+            if (pres) l -= row.presence_penalty;
+            if (freq) l -= row.frequency_penalty * static_cast<float>(n);
         }
     }
 }
@@ -395,6 +424,10 @@ Sampler::EffectiveRow Sampler::effective_row() const {
     r.top_p       = answer && params_.answer_top_p ? *params_.answer_top_p : params_.top_p;
     r.top_k       = answer && params_.answer_top_k ? *params_.answer_top_k : params_.top_k;
     r.min_p       = answer && params_.answer_min_p ? *params_.answer_min_p : params_.min_p;
+    r.presence_penalty  = answer && params_.answer_presence_penalty
+                              ? *params_.answer_presence_penalty : params_.presence_penalty;
+    r.frequency_penalty = answer && params_.answer_frequency_penalty
+                              ? *params_.answer_frequency_penalty : params_.frequency_penalty;
     return r;
 }
 

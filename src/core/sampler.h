@@ -123,6 +123,11 @@ public:
         float top_p;
         int   top_k;
         float min_p;
+        // llava: the row also decides which presence/frequency values apply
+        // and which history they read; a draw after the switch uses the
+        // answer row's values over the answer's own history.
+        float presence_penalty;
+        float frequency_penalty;
         bool  answer_row;
     };
     EffectiveRow effective_row() const;
@@ -164,6 +169,12 @@ private:
 
     std::unordered_map<int, int> seen_;       // prompt + generated
     std::unordered_map<int, int> generated_;  // generated only
+    // llava: the answer row's own history. Empty at the switch; the closer
+    // token itself is not counted, every token observed after it is. Read only
+    // while the answer row is in effect; before the switch and in a turn that
+    // never switches, the two penalty counts read `generated_` as before.
+    std::unordered_map<int, int> answer_generated_;
+    bool answer_closer_now_ = false;   // the token that closed the block, once
 
     std::vector<std::pair<float, int>> scratch_;
 
