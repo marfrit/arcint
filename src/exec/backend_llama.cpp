@@ -523,6 +523,22 @@ public:
         // text stays -1 and keeps the text behaviour.
         think_ids_qwen_ = build_think_ids(false);
         think_ids_ext_  = build_think_ids(true);
+        // One line, at load: what the id rule found, and where the text
+        // fallback is in force. A served artifact whose tags the vocabulary
+        // spells as text is then recognisable in the log, not only by its
+        // behaviour.
+        {
+            const int oid = think_ids_qwen_.open_close_ids.empty()
+                                ? -1
+                                : think_ids_qwen_.open_close_ids.front().first;
+            const int cid = think_ids_qwen_.open_close_ids.empty()
+                                ? -1
+                                : think_ids_qwen_.open_close_ids.front().second;
+            log::debug("think",
+                       "think-block ids: opener id %d (%s); closer id %d (%s)",
+                       oid, oid >= 0 ? "one special token, decided by id" : "none, the text fallback is in force",
+                       cid, cid >= 0 ? "one special token, decided by id" : "none, the text fallback is in force");
+        }
 
         // Named lanes (--served-model-name A,B --lane-ctx CA,CB; DESIGN 4.2,
         // docs/campaigns/lanes-agent-subagent.md): a cap per lane, one KV
