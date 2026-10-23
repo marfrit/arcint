@@ -301,3 +301,30 @@ TEST(props_reports_the_non_thinking_row) {
     CHECK(!n3.at("configured").get<bool>());
     CHECK(n3.at("temperature").is_null());
 }
+
+TEST(props_reports_the_answer_rows_penalties) {
+    // llava: /props must say which answer-row penalties are set, null for the
+    // ones the operator left on the thinking row's value. Red before the keys.
+    Config      cfg;
+    FakeBackend backend;
+    backend.st.id        = "stub";
+    backend.st.served_id = backend.st.id;
+    backend.st.loaded    = true;
+    backend.st.n_ctx     = 256;
+
+    SamplerDefaults& sd = backend.st.sampler_defaults;
+    sd.answer_presence_penalty  = 1.5f;
+    sd.answer_frequency_penalty = 0.3f;
+
+    SlotPool slots(1);
+    Context  ctx{&cfg, &backend, &slots};
+    const nlohmann::json a = lgc::api::props(ctx).at("sampler_defaults").at("answer");
+    CHECK(a.at("presence_penalty").get<float>() == 1.5f);
+    CHECK(a.at("frequency_penalty").get<float>() == 0.3f);
+
+    sd = SamplerDefaults{};
+    sd.answer_presence_penalty = 0.0f;   // explicitly set, still reported
+    const nlohmann::json a2 = lgc::api::props(ctx).at("sampler_defaults").at("answer");
+    CHECK(a2.at("presence_penalty").get<float>() == 0.0f);
+    CHECK(a2.at("frequency_penalty").is_null());
+}

@@ -8,7 +8,7 @@ bool SamplerOverrides::any() const {
     return temperature || top_p || top_k || min_p || repetition_penalty || presence_penalty ||
            frequency_penalty || seed || max_tokens || ignore_eos || stop || stop_token_ids ||
            think_eog_mask || tool_grammar || answer_temperature || answer_top_p || answer_top_k ||
-           answer_min_p ||
+           answer_min_p || answer_presence_penalty || answer_frequency_penalty ||
            nothink_temperature || nothink_top_p || nothink_top_k || nothink_min_p ||
            nothink_presence_penalty;
 }
@@ -34,6 +34,8 @@ SamplerParams sampler_from_defaults(const SamplerDefaults& d, bool nothink) {
     p.answer_top_p       = d.answer_top_p;
     p.answer_top_k       = d.answer_top_k;
     p.answer_min_p       = d.answer_min_p;
+    p.answer_presence_penalty  = d.answer_presence_penalty;
+    p.answer_frequency_penalty = d.answer_frequency_penalty;
     return p;
 }
 
@@ -99,6 +101,14 @@ std::optional<std::string> sampler_validate(const SamplerOverrides& o) {
     if (o.answer_min_p && (*o.answer_min_p < 0.0f || *o.answer_min_p > 1.0f)) {
         return log::format("answer_min_p must be in [0, 1] (0 disables), got %g", *o.answer_min_p);
     }
+    if (o.answer_presence_penalty &&
+        (*o.answer_presence_penalty < -2.0f || *o.answer_presence_penalty > 2.0f)) {
+        return log::format("answer_presence_penalty must be in [-2, 2], got %g", *o.answer_presence_penalty);
+    }
+    if (o.answer_frequency_penalty &&
+        (*o.answer_frequency_penalty < -2.0f || *o.answer_frequency_penalty > 2.0f)) {
+        return log::format("answer_frequency_penalty must be in [-2, 2], got %g", *o.answer_frequency_penalty);
+    }
     return std::nullopt;
 }
 
@@ -132,6 +142,8 @@ std::optional<std::string> sampler_apply(SamplerParams& p, const SamplerOverride
     if (o.answer_top_p)       p.answer_top_p       = *o.answer_top_p;
     if (o.answer_top_k)       p.answer_top_k       = *o.answer_top_k;
     if (o.answer_min_p)       p.answer_min_p       = *o.answer_min_p;
+    if (o.answer_presence_penalty)  p.answer_presence_penalty  = *o.answer_presence_penalty;
+    if (o.answer_frequency_penalty) p.answer_frequency_penalty = *o.answer_frequency_penalty;
     if (o.seed) {
         p.seed   = *o.seed;
         p.seeded = true;
@@ -163,9 +175,11 @@ std::optional<std::string> sampler_defaults_apply(SamplerDefaults& d, const Samp
     if (o.answer_top_p)       d.answer_top_p       = *o.answer_top_p;
     if (o.answer_top_k)       d.answer_top_k       = *o.answer_top_k;
     if (o.answer_min_p)       d.answer_min_p       = *o.answer_min_p;
+    if (o.answer_presence_penalty)  d.answer_presence_penalty  = *o.answer_presence_penalty;
+    if (o.answer_frequency_penalty) d.answer_frequency_penalty = *o.answer_frequency_penalty;
     if (o.temperature || o.top_p || o.top_k || o.min_p || o.repetition_penalty || o.presence_penalty ||
         o.think_eog_mask || o.tool_grammar || o.answer_temperature || o.answer_top_p || o.answer_top_k ||
-        o.answer_min_p || nothink_set) {
+        o.answer_min_p || o.answer_presence_penalty || o.answer_frequency_penalty || nothink_set) {
         d.provenance = "operator";
     }
     return std::nullopt;

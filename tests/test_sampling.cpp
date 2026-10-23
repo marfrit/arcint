@@ -238,3 +238,38 @@ TEST(sampling_answer_row_counts_as_an_override_and_validates) {
     CHECK(sampler_apply(p, bad).has_value());
     CHECK(!p.answer_configured());   // a rejected request leaves nothing applied
 }
+
+TEST(sampling_answer_penalties_travel_and_the_request_overrides_them) {
+    // llava: the answer row's presence/frequency travel like the other answer
+    // fields; a request field wins for that request only. Red before the
+    // transport: the operator flag and the request field were both dropped.
+    SamplerDefaults d;
+    d.answer_presence_penalty  = 1.5f;
+    d.answer_frequency_penalty = 0.5f;
+    SamplerParams p = sampler_from_defaults(d);
+    CHECK(p.answer_configured());   // a penalty alone arms the switch
+    CHECK(p.answer_presence_penalty && *p.answer_presence_penalty == 1.5f);
+    CHECK(p.answer_frequency_penalty && *p.answer_frequency_penalty == 0.5f);
+
+    SamplerOverrides o;
+    CHECK(!o.any());
+    o.answer_presence_penalty = 0.5f;
+    CHECK(o.any());
+    CHECK(!sampler_apply(p, o).has_value());
+    CHECK(p.answer_presence_penalty && *p.answer_presence_penalty == 0.5f);   // this request only
+    CHECK(p.answer_frequency_penalty && *p.answer_frequency_penalty == 0.5f); // untouched
+
+    SamplerParams q = sampler_from_defaults(d);   // a silent request keeps the operator's
+    CHECK(!sampler_apply(q, SamplerOverrides{}).has_value());
+    CHECK(q.answer_presence_penalty && *q.answer_presence_penalty == 1.5f);
+
+    // Same range as the normal row, same refusal wording.
+    SamplerParams r;
+    SamplerOverrides bad;
+    bad.answer_presence_penalty = 3.0f;
+    CHECK(sampler_apply(r, bad).has_value());
+    bad.answer_presence_penalty.reset();
+    bad.answer_frequency_penalty = 3.0f;
+    CHECK(sampler_apply(r, bad).has_value());
+    CHECK(!r.answer_configured());   // nothing applied on refusal
+}

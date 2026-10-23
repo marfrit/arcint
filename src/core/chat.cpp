@@ -178,6 +178,8 @@ std::optional<std::string> read_sampler(const json& b, SamplerOverrides& s) {
     if (auto e = num("answer_temperature", s.answer_temperature)) return e;
     if (auto e = num("answer_top_p", s.answer_top_p)) return e;
     if (auto e = num("answer_min_p", s.answer_min_p)) return e;
+    if (auto e = num("answer_presence_penalty", s.answer_presence_penalty)) return e;
+    if (auto e = num("answer_frequency_penalty", s.answer_frequency_penalty)) return e;
     if (auto e = integer("answer_top_k", s.answer_top_k)) return e;
     if (b.contains("stop")) {
         if (auto e = read_stop(b["stop"], s)) return e;

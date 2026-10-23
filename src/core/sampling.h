@@ -50,6 +50,8 @@ struct SamplerDefaults {
     std::optional<float> answer_top_p;
     std::optional<int>   answer_top_k;
     std::optional<float> answer_min_p;
+    std::optional<float> answer_presence_penalty;
+    std::optional<float> answer_frequency_penalty;
 
     // "provisional" -- the Qwen3-family card values, carried because no
     //                  GGUF key is read yet; /props reports this so nobody
@@ -134,10 +136,16 @@ struct SamplerParams {
     std::optional<float> answer_top_p;
     std::optional<int>   answer_top_k;
     std::optional<float> answer_min_p;
+    // llava: the card's non-thinking row also carries a presence penalty, so
+    // the answer row does too. Unset falls back to the thinking row's value;
+    // the penalty's history is the answer's own (see Sampler::observe).
+    std::optional<float> answer_presence_penalty;
+    std::optional<float> answer_frequency_penalty;
     bool                 thinking_turn = false;
 
     bool answer_configured() const {
-        return answer_temperature || answer_top_p || answer_top_k || answer_min_p;
+        return answer_temperature || answer_top_p || answer_top_k || answer_min_p ||
+               answer_presence_penalty || answer_frequency_penalty;
     }
 };
 
@@ -170,6 +178,8 @@ struct SamplerOverrides {
     std::optional<float>                    answer_top_p;
     std::optional<int>                      answer_top_k;
     std::optional<float>                    answer_min_p;
+    std::optional<float>                    answer_presence_penalty;
+    std::optional<float>                    answer_frequency_penalty;
 
     bool any() const;
 };

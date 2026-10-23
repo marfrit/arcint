@@ -210,6 +210,11 @@ std::string usage_text() {
         "  --answer-top-p X          the answer row: nucleus mass\n"
         "  --answer-top-k N          the answer row: top-k (0 disables)\n"
         "  --answer-min-p X          the answer row: min-p (0 disables)\n"
+        "  --answer-presence-penalty X\n"
+        "                            the answer row: presence penalty, counted over\n"
+        "                            the tokens drawn after the closer only\n"
+        "  --answer-frequency-penalty X\n"
+        "                            the answer row: frequency penalty, same history\n"
         "  --nothink-temp X          the row a request gets when it resolves to\n"
         "                            thinking off (same range as --temp)\n"
         "  --nothink-top-p X         non-thinking row: default nucleus mass\n"
@@ -494,6 +499,14 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             double d = 0.0;
             if (!value(v) || !parse_double(v, d)) return fail("--answer-min-p needs a number");
             cfg.answer_min_p = static_cast<float>(d);
+        } else if (arg == "--answer-presence-penalty") {
+            double d = 0.0;
+            if (!value(v) || !parse_double(v, d)) return fail("--answer-presence-penalty needs a number");
+            cfg.answer_presence_penalty = static_cast<float>(d);
+        } else if (arg == "--answer-frequency-penalty") {
+            double d = 0.0;
+            if (!value(v) || !parse_double(v, d)) return fail("--answer-frequency-penalty needs a number");
+            cfg.answer_frequency_penalty = static_cast<float>(d);
         } else if (arg == "--nothink-temp") {
             double d = 0.0;
             if (!value(v) || !parse_double(v, d)) return fail("--nothink-temp needs a number");
@@ -753,6 +766,8 @@ std::optional<std::string> apply_operator_defaults(const Config& cfg, SamplerDef
     o.answer_top_p       = cfg.answer_top_p;
     o.answer_top_k       = cfg.answer_top_k;
     o.answer_min_p       = cfg.answer_min_p;
+    o.answer_presence_penalty  = cfg.answer_presence_penalty;
+    o.answer_frequency_penalty = cfg.answer_frequency_penalty;
     if (cfg.think_eog_mask) o.think_eog_mask = true;
     if (cfg.tool_grammar)   o.tool_grammar   = true;
     o.nothink_temperature      = cfg.nothink_temp;

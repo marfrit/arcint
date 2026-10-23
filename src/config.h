@@ -204,6 +204,11 @@ struct Config {
     std::optional<float> answer_top_p;
     std::optional<int>   answer_top_k;
     std::optional<float> answer_min_p;
+    // llava: the answer row's presence/frequency penalties. Unset keeps the
+    // thinking row's value; set, the penalty counts only tokens drawn after
+    // the closer (Sampler::observe), not the reasoning.
+    std::optional<float> answer_presence_penalty;
+    std::optional<float> answer_frequency_penalty;
     // The non-thinking row: --nothink-temp/-top-p/-top-k/-min-p/
     // -presence-penalty. A request that resolves to thinking off starts from
     // these instead of the row above; unset fields fall back to the normal

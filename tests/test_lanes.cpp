@@ -441,3 +441,18 @@ TEST(handler_chat_marks_the_thinking_turn_for_the_answer_row) {
     CHECK(c.input.sampler.answer_top_p && *c.input.sampler.answer_top_p == 0.8f);
     CHECK(!c.input.sampler.thinking_turn);
 }
+
+TEST(handler_chat_reads_the_answer_rows_penalties) {
+    // llava: the request may set the answer row's presence/frequency for an
+    // A/B in one process. Red before the request fields were read.
+    Lanes l;
+    json  body = chat("", 10);
+    body["answer_presence_penalty"]  = 1.5;
+    body["answer_frequency_penalty"] = 0.3;
+
+    lgc::api::PreparedChat c;
+    CHECK(!lgc::api::prepare_chat(l.ctx, body, c));
+    CHECK(c.input.sampler.answer_presence_penalty && *c.input.sampler.answer_presence_penalty == 1.5f);
+    CHECK(c.input.sampler.answer_frequency_penalty && *c.input.sampler.answer_frequency_penalty == 0.3f);
+    CHECK(c.input.sampler.answer_configured());
+}
