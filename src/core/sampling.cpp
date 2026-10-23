@@ -4,10 +4,31 @@
 
 namespace lgc {
 
+const char* loop_guard_name(LoopGuardMode m) {
+    switch (m) {
+        case LoopGuardMode::Off:    return "off";
+        case LoopGuardMode::Detect: return "detect";
+        case LoopGuardMode::Nudge:  return "nudge";
+        case LoopGuardMode::Slap:   return "slap";
+        case LoopGuardMode::Ladder: return "ladder";
+    }
+    return "off";
+}
+
+std::optional<LoopGuardMode> loop_guard_parse(std::string_view name) {
+    if (name == "off")    return LoopGuardMode::Off;
+    if (name == "detect") return LoopGuardMode::Detect;
+    if (name == "nudge")  return LoopGuardMode::Nudge;
+    if (name == "slap")   return LoopGuardMode::Slap;
+    if (name == "ladder") return LoopGuardMode::Ladder;
+    return std::nullopt;
+}
+
 bool SamplerOverrides::any() const {
     return temperature || top_p || top_k || min_p || repetition_penalty || presence_penalty ||
            frequency_penalty || seed || max_tokens || ignore_eos || stop || stop_token_ids ||
-           think_eog_mask || tool_grammar || answer_temperature || answer_top_p || answer_top_k ||
+           think_eog_mask || tool_grammar || loop_guard || loop_guard_window ||
+           loop_guard_threshold || loop_guard_grace || answer_temperature || answer_top_p || answer_top_k ||
            answer_min_p || answer_presence_penalty || answer_frequency_penalty ||
            nothink_temperature || nothink_top_p || nothink_top_k || nothink_min_p ||
            nothink_presence_penalty;
@@ -30,6 +51,10 @@ SamplerParams sampler_from_defaults(const SamplerDefaults& d, bool nothink) {
     }
     p.think_eog_mask     = d.think_eog_mask;
     p.tool_grammar       = d.tool_grammar;
+    p.loop_guard         = d.loop_guard;
+    p.loop_guard_window    = d.loop_guard_window;
+    p.loop_guard_threshold = d.loop_guard_threshold;
+    p.loop_guard_grace     = d.loop_guard_grace;
     p.answer_temperature = d.answer_temperature;
     p.answer_top_p       = d.answer_top_p;
     p.answer_top_k       = d.answer_top_k;
@@ -109,6 +134,18 @@ std::optional<std::string> sampler_validate(const SamplerOverrides& o) {
         (*o.answer_frequency_penalty < -2.0f || *o.answer_frequency_penalty > 2.0f)) {
         return log::format("answer_frequency_penalty must be in [-2, 2], got %g", *o.answer_frequency_penalty);
     }
+    // loop-guard's thresholds: a window of 0 or a threshold outside [0, 1]
+    // cannot describe a share, so the refusal is the same for a flag and a
+    // request.
+    if (o.loop_guard_window && *o.loop_guard_window < 1) {
+        return log::format("loop_guard_window must be >= 1, got %d", *o.loop_guard_window);
+    }
+    if (o.loop_guard_threshold && (*o.loop_guard_threshold < 0.0f || *o.loop_guard_threshold > 1.0f)) {
+        return log::format("loop_guard_threshold must be in [0, 1], got %g", *o.loop_guard_threshold);
+    }
+    if (o.loop_guard_grace && *o.loop_guard_grace < 0) {
+        return log::format("loop_guard_grace must be >= 0, got %d", *o.loop_guard_grace);
+    }
     return std::nullopt;
 }
 
@@ -136,6 +173,7 @@ std::optional<std::string> sampler_apply(SamplerParams& p, const SamplerOverride
     // Making the operator's on un-vetoable would be a silent override (§3.6).
     if (o.think_eog_mask) p.think_eog_mask = *o.think_eog_mask;
     if (o.tool_grammar)   p.tool_grammar   = *o.tool_grammar;
+    if (o.loop_guard)     p.loop_guard     = *o.loop_guard;
     // llava: the request's answer row fields override the operator's, for that
     // request only (a client A/B without a restart). Absent keeps the default.
     if (o.answer_temperature) p.answer_temperature = *o.answer_temperature;
@@ -171,6 +209,10 @@ std::optional<std::string> sampler_defaults_apply(SamplerDefaults& d, const Samp
     if (nothink_set) d.nothink_row = true;
     if (o.think_eog_mask)     d.think_eog_mask     = *o.think_eog_mask;
     if (o.tool_grammar)       d.tool_grammar       = *o.tool_grammar;
+    if (o.loop_guard)         d.loop_guard         = *o.loop_guard;
+    if (o.loop_guard_window)    d.loop_guard_window    = *o.loop_guard_window;
+    if (o.loop_guard_threshold) d.loop_guard_threshold = *o.loop_guard_threshold;
+    if (o.loop_guard_grace)     d.loop_guard_grace     = *o.loop_guard_grace;
     if (o.answer_temperature) d.answer_temperature = *o.answer_temperature;
     if (o.answer_top_p)       d.answer_top_p       = *o.answer_top_p;
     if (o.answer_top_k)       d.answer_top_k       = *o.answer_top_k;
@@ -178,7 +220,8 @@ std::optional<std::string> sampler_defaults_apply(SamplerDefaults& d, const Samp
     if (o.answer_presence_penalty)  d.answer_presence_penalty  = *o.answer_presence_penalty;
     if (o.answer_frequency_penalty) d.answer_frequency_penalty = *o.answer_frequency_penalty;
     if (o.temperature || o.top_p || o.top_k || o.min_p || o.repetition_penalty || o.presence_penalty ||
-        o.think_eog_mask || o.tool_grammar || o.answer_temperature || o.answer_top_p || o.answer_top_k ||
+        o.think_eog_mask || o.tool_grammar || o.loop_guard || o.loop_guard_window || o.loop_guard_threshold ||
+        o.loop_guard_grace || o.answer_temperature || o.answer_top_p || o.answer_top_k ||
         o.answer_min_p || o.answer_presence_penalty || o.answer_frequency_penalty || nothink_set) {
         d.provenance = "operator";
     }

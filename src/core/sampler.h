@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -110,6 +111,28 @@ public:
     // observe_think_text whenever params.tool_grammar is set, mask or not.
     void set_constraint(TokenConstraint* c) { constraint_ = c; }
 
+    // loop-guard: the fixed sentence's ids, tokenised by the backend (which
+    // owns the vocabulary). The sampler forces them one a draw, at a token
+    // boundary, so the caller's emit/observe/decode path carries them exactly
+    // as a drawn token. Empty keeps the ladder's nudge rung inert.
+    void set_loop_guard_nudge(std::vector<int> ids) {
+        params_.loop_guard_nudge_ids = std::move(ids);
+    }
+    // The per-request counters, for the stats line and the response object.
+    struct LoopGuardCounts {
+        int detections = 0;
+        int nudges     = 0;
+        int slaps      = 0;
+        int aborts     = 0;
+    };
+    LoopGuardCounts loop_guard_counts() const {
+        return {loop_detections_, loop_nudges_, loop_slaps_, loop_aborts_};
+    }
+    // The answer phase kept looping after a slap: the caller ends the turn on
+    // FinishReason::Loop instead of emitting another token. Latching: once set
+    // the turn is over.
+    bool loop_abort() const { return loop_abort_; }
+
     // Picks the next token from one row of logits. The row is scratch space and
     // is modified in place.
     int sample(float* logits, size_t vocab);
@@ -140,7 +163,8 @@ public:
 private:
     int    draw(float* logits, size_t vocab);
     bool   tracks_think() const
-        { return params_.think_eog_mask || params_.tool_grammar || params_.answer_configured(); }
+        { return params_.think_eog_mask || params_.tool_grammar || params_.answer_configured()
+                 || params_.loop_guard != LoopGuardMode::Off; }
     // llava: the answer row applies only in a thinking turn, after a block
     // actually opened and closed. A non-thinking turn, or one whose block
     // never opened, keeps the thinking row.
@@ -148,6 +172,13 @@ private:
         return params_.answer_configured() && params_.thinking_turn && think_block_ever_open_
                && think_state_ == ThinkState::content;
     }
+    // loop-guard: the ladder's state and its per-request counters.
+    void   loop_observe_(std::string_view piece);
+    void   loop_line_ended_(const std::string& line);
+    void   loop_on_detect_(bool content_phase);
+    void   loop_do_nudge_();
+    void   loop_do_slap_();
+    void   loop_do_abort_();
     void   apply_penalties(float* logits, size_t vocab) const;
     void   mask_illegal_while_thinking(float* logits, size_t vocab) const;
     void   measure_think_tags();
@@ -212,6 +243,31 @@ private:
     mutable bool closer_stripped_ = false;
 
     TokenConstraint* constraint_ = nullptr;
+
+    // loop-guard: the incremental line share. Only lines longer than 20
+    // characters count; a line ends at a newline in the decoded text. The
+    // window holds the newest `loop_guard_window` such lines, each flagged
+    // whether it repeats an earlier line of this turn; the share is the flag's
+    // count over the window's size. No whole-text re-scan per token.
+    struct LoopLine {
+        std::string text;
+        bool        repeated = false;
+    };
+    std::string                       loop_line_;   // the open line's text
+    std::deque<LoopLine>              loop_window_;
+    std::unordered_map<std::string, int> loop_seen_;   // line -> prior count
+    bool loop_fired_     = false;   // the share is at/above the threshold now
+    bool loop_nudged_    = false;
+    bool loop_slapped_   = false;
+    bool loop_abort_     = false;
+    bool loop_slap_pending_ = false;
+    int  loop_nudge_cursor_ = -1;   // next nudge id, -1 when none pending
+    int  loop_since_nudge_  = 0;    // counted lines since the nudge
+    int  loop_detections_   = 0;
+    int  loop_nudges_       = 0;
+    int  loop_slaps_        = 0;
+    int  loop_aborts_       = 0;
+    mutable bool loop_closer_warned_ = false;
 };
 
 }  // namespace lgc

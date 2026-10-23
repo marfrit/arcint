@@ -160,6 +160,15 @@ void Sampler::start_in_think_block(bool open) {
 void Sampler::observe_think_(std::string_view piece, int token) {
     if (!tracks_think()) return;
 
+    // loop-guard: feed the detector from the same piece stream the tracker
+    // sees. Reasoning is watched while the block is open; the answer phase is
+    // watched only after a slap (the abort rung), never otherwise.
+    if (params_.loop_guard != LoopGuardMode::Off) {
+        if (think_state_ == ThinkState::thinking
+            || (think_state_ == ThinkState::content && loop_slapped_))
+            loop_observe_(piece);
+    }
+
     // The closer id: the block that is open closes only on it. A spelled-out
     // closer is ordinary tokens and cannot get here.
     if (think_state_ == ThinkState::thinking && think_close_id_ >= 0 && token == think_close_id_) {
@@ -269,6 +278,107 @@ void Sampler::observe_think_(std::string_view piece, int token) {
             return;
         }
     }
+}
+
+// loop-guard: the detector. A line ends at a newline in the decoded text and
+// counts only when it is longer than 20 characters (an empty or one-word line
+// says nothing about repetition). A line is a repeat when the same text
+// occurred earlier in this turn. The share is the repeat count over the newest
+// window lines; it trips at/above the threshold once at least 10 lines (or the
+// window, when smaller) are in hand, so two identical lines at the start of a
+// turn cannot pass for a loop. Everything is incremental: appending a piece
+// and testing the newline is the only per-token work.
+void Sampler::loop_observe_(std::string_view piece) {
+    loop_line_.append(piece);
+    size_t nl = 0;
+    while ((nl = loop_line_.find('\n')) != std::string::npos) {
+        const std::string line = loop_line_.substr(0, nl);
+        loop_line_.erase(0, nl + 1);
+        loop_line_ended_(line);
+    }
+}
+
+void Sampler::loop_line_ended_(const std::string& line) {
+    if (line.size() <= 20) return;
+
+    const bool thinking = think_state_ == ThinkState::thinking;
+    const bool content  = think_state_ == ThinkState::content && loop_slapped_;
+    if (!thinking && !content) return;
+
+    if (thinking && loop_nudged_ && !loop_slapped_) ++loop_since_nudge_;
+    const bool repeated = loop_seen_[line]++ > 0;
+    loop_window_.push_back(LoopLine{line, repeated});
+    const size_t window = static_cast<size_t>(std::max(1, params_.loop_guard_window));
+    while (loop_window_.size() > window) loop_window_.pop_front();
+
+    const size_t floor = std::min<size_t>(window, 10);
+    if (loop_window_.size() < floor) return;
+    size_t repeats = 0;
+    for (const LoopLine& l : loop_window_) repeats += l.repeated ? 1 : 0;
+    const float share = static_cast<float>(repeats) / static_cast<float>(loop_window_.size());
+    const bool over   = share >= params_.loop_guard_threshold;
+
+    if (thinking) {
+        if (!over) {
+            loop_fired_ = false;
+            return;
+        }
+        if (!loop_fired_) {
+            loop_fired_ = true;
+            ++loop_detections_;
+            log::info("loop-guard", "lane: reasoning loop detected: %zu of %zu recent lines repeat (%.2f), after %zu lines",
+                      repeats, loop_window_.size(), share, loop_seen_.size());
+            loop_on_detect_(false);
+        } else if (params_.loop_guard == LoopGuardMode::Ladder && loop_nudged_ && !loop_slapped_
+                   && loop_since_nudge_ >= params_.loop_guard_grace) {
+            loop_do_slap_();
+        }
+    } else if (content && over && !loop_abort_) {
+        loop_do_abort_();
+    }
+}
+
+void Sampler::loop_on_detect_(bool content_phase) {
+    if (content_phase) {
+        if (loop_slapped_) loop_do_abort_();
+        return;
+    }
+    switch (params_.loop_guard) {
+        case LoopGuardMode::Off:    return;
+        case LoopGuardMode::Detect: return;   // counted and logged above
+        case LoopGuardMode::Nudge:
+        case LoopGuardMode::Ladder: loop_do_nudge_(); return;
+        case LoopGuardMode::Slap:   loop_do_slap_(); return;
+    }
+}
+
+void Sampler::loop_do_nudge_() {
+    if (loop_nudged_) return;
+    if (params_.loop_guard_nudge_ids.empty()) {
+        log::warn("loop-guard", "the nudge rung has no tokenised sentence (the backend did not set it); no nudge");
+        return;
+    }
+    loop_nudged_     = true;
+    loop_nudge_cursor_ = 0;
+    loop_since_nudge_  = 0;
+    ++loop_nudges_;
+    log::info("loop-guard", "lane: nudge injected (%zu tokens), watching for %d more lines",
+              params_.loop_guard_nudge_ids.size(), params_.loop_guard_grace);
+}
+
+void Sampler::loop_do_slap_() {
+    if (loop_slapped_) return;
+    loop_slapped_   = true;
+    loop_slap_pending_ = true;
+    ++loop_slaps_;
+    log::info("loop-guard", "lane: slap: the think-block's closer is forced as the next token");
+}
+
+void Sampler::loop_do_abort_() {
+    if (loop_abort_) return;
+    loop_abort_ = true;
+    ++loop_aborts_;
+    log::warn("loop-guard", "lane: the answer phase is looping after a slap; ending the turn (finish loop)");
 }
 
 // While the block is open the turn-ending ids and a second opener are not
@@ -388,6 +498,32 @@ size_t Sampler::collect_candidates(const float* logits, size_t vocab, bool full,
 
 int Sampler::sample(float* logits, size_t vocab) {
     if (vocab == 0) return 0;
+
+    // loop-guard: a forced token is returned at the draw boundary, before the
+    // mask and the penalties -- it is not a draw from the model's row, and
+    // changing that row would not change what this step emits. The caller
+    // emits it, observes it (history and tracker) and decodes it into the KV
+    // exactly as a drawn token, which is how the nudge lands in
+    // reasoning_content, the stream and the history.
+    if (params_.loop_guard != LoopGuardMode::Off) {
+        if (loop_nudge_cursor_ >= 0) {
+            const int id = params_.loop_guard_nudge_ids[static_cast<size_t>(loop_nudge_cursor_)];
+            ++loop_nudge_cursor_;
+            if (loop_nudge_cursor_ >= static_cast<int>(params_.loop_guard_nudge_ids.size()))
+                loop_nudge_cursor_ = -1;   // the sentence is delivered once
+            return id;
+        }
+        if (loop_slap_pending_) {
+            loop_slap_pending_ = false;
+            int closer = think_close_id_ >= 0 ? think_close_id_
+                         : (!params_.think_ids.close_ids.empty() ? params_.think_ids.close_ids.front() : -1);
+            if (closer >= 0 && static_cast<size_t>(closer) < vocab) return closer;
+            if (!loop_closer_warned_) {
+                loop_closer_warned_ = true;
+                log::warn("loop-guard", "the slap has no closer id in this vocabulary; the block cannot be forced shut");
+            }
+        }
+    }
 
     mask_illegal_while_thinking(logits, vocab);
     apply_penalties(logits, vocab);
