@@ -732,6 +732,13 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
     if (auto err = finish_prepare(ctx, lane, prompt, prep.req.sampler, prep.input, prep.prompt_tokens)) {
         return err;
     }
+    // llava: the answer row switches only in a turn the request declared as
+    // thinking (enable_thinking after the operator default above). A request
+    // that says nothing keeps the default true, matching the template; one that
+    // says false keeps the thinking row, whatever tags the model writes. A
+    // thinking turn whose block never opened is the sampler's own guard. Set
+    // after finish_prepare, which owns input.sampler.
+    prep.input.sampler.thinking_turn = prep.req.enable_thinking;
     // the media, in marker order across the whole request (the renderer put one
     // marker per part into the prompt)
     for (const ChatMessage& m : prep.req.messages)
