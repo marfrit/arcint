@@ -209,14 +209,15 @@ FinishReason drive(Backend& backend, const GenerationInput& in, int slot, const 
         in, slot,
         [&](std::string_view piece, int token_id) -> Control {
             const StopMatcher::Step step = stop.push(piece);
-            // The reasoning split is decided by (piece, id), so record what was
-            // emitted with the id of the token that carried it; a piece the stop
-            // matcher held back in part gets no id (it is not wholly emitted).
-            if (pieces != nullptr)
-                pieces->emplace_back(step.emit, step.emit.size() == piece.size() ? token_id : -1);
+            // The reasoning split is decided by (piece, id), so the id travels
+            // with only a wholly emitted piece: a piece the stop matcher held
+            // back in part must not carry the id that would close the block
+            // early, and the held tail has no id when flushed.
+            const int emit_id = step.emit.size() == piece.size() ? token_id : -1;
+            if (pieces != nullptr) pieces->emplace_back(step.emit, emit_id);
             if (!step.emit.empty()) {
                 raw += step.emit;
-                if (!emit(step.emit, token_id, raw)) {
+                if (!emit(step.emit, emit_id, raw)) {
                     cancelled = true;
                     return Control::Cancel;
                 }
