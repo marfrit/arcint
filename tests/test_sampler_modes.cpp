@@ -126,3 +126,23 @@ TEST(sampler_modes_without_nothink_flags_both_modes_get_the_normal_row) {
     CHECK(cp.input.sampler.temperature == 0.6f);
     CHECK(cp.input.sampler.top_p == 0.95f);
 }
+
+// The common case: a client sends neither chat_template_kwargs.enable_thinking
+// nor reasoning_effort, and the server has no --chat-template-kwarg default.
+// The template thinks by default, so the request must get the normal row even
+// though a non-thinking row is configured.
+TEST(sampler_modes_unspecified_with_no_operator_default_gets_the_normal_row) {
+    Fixture f(with_nothink_row());
+    CHECK(!f.cfg.think_default);   // no operator default fills the field in
+
+    api::PreparedChat prep;
+    CHECK(!api::prepare_chat(f.ctx, chat(false, true), prep));
+    CHECK(!prep.req.has_enable_thinking);   // nothing was stated, nothing filled
+    CHECK(prep.req.enable_thinking);        // the template's thinking default
+
+    CHECK(prep.input.sampler.temperature == 0.6f);
+    CHECK(prep.input.sampler.top_p == 0.95f);
+    CHECK_EQ(prep.input.sampler.top_k, 20);
+    CHECK(prep.input.sampler.min_p == 0.0f);
+    CHECK(prep.input.sampler.presence_penalty == 0.0f);
+}
