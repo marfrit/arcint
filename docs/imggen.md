@@ -331,14 +331,20 @@ XMX does 4096 INT8 OPS/clock per Xe core (2048 FP16), so the XMX FP16 peak is
 
 **The step (`arithmetic`):** Z-Image Turbo's DiT is 6 B params; a step's MACs =
 params x tokens. 512² = 1,024 tokens -> **12.3 TFLOP a step**; 1024² = 4,096 ->
-**49.2 TFLOP**. Against the weights (1 byte a weight + a f16 scale per 32) the
+**49.2 TFLOP** (`paper`, rounded parameter count). Summed over the DiT's actual
+GEMM shapes (`arithmetic`, 2026-10-23: hidden 3,840, qkv 11,520, FFN 10,240, 30
+layers on the joint 4,128 tokens plus the 2 noise- and 2 context-refiner blocks;
+attention's own products excluded, as above) a step is **46.75 TFLOP** at 1024²
+and **11.96 TFLOP** at 512², i.e. the paper figure is 5.2 % / 2.8 % high. Against the weights (1 byte a weight + a f16 scale per 32) the
 intensity is ~1,900 FLOP/byte, far above the ridge 215 FLOP/byte (98.3 TFLOP /
 456 GB/s), so the step is **compute-bound**: the limiting factor is the XMX
 peak, not the bandwidth (456 GB/s binds only below ~256 tokens, and the whole
 6.58 GB of weights is 14 ms a read).
 
 **The bar:** >= 70 % of that peak -- <= ~**0.18 s a step at 512²**, ~**0.72 s at
-1024²** for the DiT. Measured today: OpenCL 3.69 s a step (**3.4 %** of the
+1024²** for the DiT (from the paper FLOPs). From the architecture FLOPs the same
+70 % is **0.17 s** at 512² and **0.68 s** at 1024² (68.8 TFLOP/s); a campaign
+gates against these, so a kernel cannot pass the bar below 70 %. Measured today: OpenCL 3.69 s a step (**3.4 %** of the
 98.3 TFLOP FP16 peak), Vulkan 1.78 s (**7 %**); the q8_0 GEMM that is 68 % of
 the step runs at ~4 TFLOP effective. The implementation target is a q8_0 XMX
 GEMM at 70 % of the XMX rate (int8 196 or fp16 98), 10-20x over the generic

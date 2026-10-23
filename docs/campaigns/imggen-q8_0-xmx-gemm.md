@@ -49,7 +49,10 @@ The comparative image gate (`tools/imggen_gate.py`, `docs/milestone-1.1.0.md`
 PSNR/SSIM against it; step time against the baseline's. **Red case first**: a
 deliberately broken tile turns the step curve red. **The operator's bar**:
 >= 70 % of the B60's XMX peak (~98.3 TFLOP FP16 / 196.6 INT8; ~0.18 s a step
-at 512², ~0.72 at 1024²).
+at 512², ~0.72 at 1024² from the paper FLOPs; **0.17 s / 0.68 s** from the
+architecture FLOPs, 11.96 / 46.75 TFLOP a step, which is the figure to gate
+against -- `docs/imggen.md`, "The step"). On those FLOPs the 1,470 ms kernel
+runs at ≈ 31.8 TFLOP/s, 32.3 % of the peak, not the 33.5 / 34 % above.
 
 ## What exists (`measured-here`, 2026-10-18, before the release review)
 
