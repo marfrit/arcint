@@ -528,6 +528,14 @@ json props(const Context& ctx) {
           // turn that ends differently than yesterday's is explained here.
           {"think_eog_mask", sd.think_eog_mask},
           {"tool_grammar", sd.tool_grammar},
+          // llava: the answer row after the think block; null is "not set", so
+          // an operator can tell the switch off from a value that happens to
+          // equal the thinking row's.
+          {"answer",
+           {{"temperature", sd.answer_temperature ? json(*sd.answer_temperature) : json(nullptr)},
+            {"top_p", sd.answer_top_p ? json(*sd.answer_top_p) : json(nullptr)},
+            {"top_k", sd.answer_top_k ? json(*sd.answer_top_k) : json(nullptr)},
+            {"min_p", sd.answer_min_p ? json(*sd.answer_min_p) : json(nullptr)}}},
           {"provenance", sd.provenance}}},
         {"slots",
          {{"total", slots_total(ctx)},

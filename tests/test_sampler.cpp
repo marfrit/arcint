@@ -745,3 +745,94 @@ TEST(sampler_id_rule_no_ids_keeps_the_text_behaviour) {
     CHECK(!s.think_block_open());
     CHECK_EQ(s.sample(eog_first().data(), 4), 0);
 }
+
+// ---------------------------------------------------------------------------
+// llava: the answer row after the think block, within one turn. The switch is
+// off unless an answer field is set and the turn declared thinking; the block
+// must actually have opened. The rows are asserted through effective_row(),
+// the same values draw() reads for the next sample.
+
+namespace {
+
+// The id-close table (the closer is one special token, id 2) plus a thinking
+// row and an answer row that differ in every field, so a switch is unmistakable.
+SamplerParams answer_params(bool thinking_turn) {
+    SamplerParams p = id_close_params();
+    p.temperature        = 0.9f;
+    p.top_p              = 0.95f;
+    p.top_k              = 40;
+    p.min_p              = 0.05f;
+    p.answer_temperature = 0.3f;
+    p.answer_top_p       = 0.8f;
+    p.answer_top_k       = 10;
+    p.answer_min_p       = 0.0f;
+    p.thinking_turn      = thinking_turn;
+    return p;
+}
+
+}  // namespace
+
+TEST(sampler_answer_row_switches_after_the_closer) {
+    // Inside the block the thinking row draws; after the closer id the answer
+    // row. Red before the switch: the answer fields were ignored, so both draws
+    // reported the thinking row.
+    Sampler s(answer_params(true), 1);
+    s.start_in_think_block(true);
+    auto r = s.effective_row();
+    CHECK(!r.answer_row);
+    CHECK(r.temperature == 0.9f && r.top_p == 0.95f && r.top_k == 40 && r.min_p == 0.05f);
+    CHECK(s.think_block_open());
+    s.observe(2);   // the closer id
+    CHECK(!s.think_block_open());
+    r = s.effective_row();
+    CHECK(r.answer_row);
+    CHECK(r.temperature == 0.3f && r.top_p == 0.8f && r.top_k == 10 && r.min_p == 0.0f);
+}
+
+TEST(sampler_answer_row_unset_changes_nothing_after_the_closer) {
+    // No answer row configured: today's behaviour, byte-identical. Green before
+    // and after the switch.
+    SamplerParams p = id_close_params();
+    p.thinking_turn = true;
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    s.observe(2);
+    const auto r = s.effective_row();
+    CHECK(!r.answer_row);
+    CHECK(r.temperature == p.temperature && r.top_p == p.top_p && r.top_k == p.top_k && r.min_p == p.min_p);
+}
+
+TEST(sampler_answer_row_never_switches_in_a_non_thinking_turn) {
+    // The request said enable_thinking false: whatever tags the model writes,
+    // the answer row stays off. Red before the thinking_turn guard.
+    Sampler s(answer_params(false), 1);
+    s.start_in_think_block(true);
+    s.observe(2);
+    const auto r = s.effective_row();
+    CHECK(!r.answer_row);
+    CHECK(r.temperature == 0.9f && r.top_p == 0.95f && r.top_k == 40 && r.min_p == 0.05f);
+}
+
+TEST(sampler_answer_row_never_switches_when_the_block_never_opened) {
+    // A thinking turn that produced plain content: no block ever opened, so the
+    // answer row is not for this turn. Red before the block-was-open guard.
+    Sampler s(answer_params(true), 1);
+    s.start_in_think_block(false);
+    s.observe_think_text("a plain answer, no block");
+    const auto r = s.effective_row();
+    CHECK(!r.answer_row);
+    CHECK(r.temperature == 0.9f && r.top_p == 0.95f && r.top_k == 40 && r.min_p == 0.05f);
+}
+
+TEST(sampler_answer_row_a_spelled_closer_inside_the_block_does_not_switch) {
+    // Ordinary tokens spelling the closer are still reasoning: the id rule does
+    // not close the block on text, so the answer row must not take over. Red
+    // before the id rule (the text path would have switched here).
+    Sampler s(answer_params(true), 1);
+    s.start_in_think_block(true);
+    s.observe(30, spelled_closer());   // ordinary token, the closer's text
+    CHECK(s.think_block_open());
+    const auto r = s.effective_row();
+    CHECK(!r.answer_row);
+    CHECK(r.temperature == 0.9f && r.top_p == 0.95f && r.top_k == 40 && r.min_p == 0.05f);
+}

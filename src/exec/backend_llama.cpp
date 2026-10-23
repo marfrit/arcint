@@ -1573,6 +1573,11 @@ private:
             for (size_t i = 0; i < draft.size(); ++i) rows[i * n_vocab_ + static_cast<size_t>(draft[i])] = 1e30f;
 #endif
             double     emit_s = 0.0;
+            // llava: the verify walk samples each row with the sampler state as
+            // of that token -- sample(), then emit (which feeds observe_think),
+            // then walk_verify's own observe(token) before the next row. So a
+            // closer inside the verified span switches the following draws to
+            // the answer row exactly as it would in the plain loop.
             const auto t_walk = clock_type::now();
             const VerifyWalk w = walk_verify(
                 rows.data(), batch.size(), n_vocab_, draft, sampler, budget,
@@ -1812,7 +1817,9 @@ private:
     }
 
     void prepare_think_mask(const GenerationInput& in, Sampler& sampler) const {
-        if (!in.sampler.think_eog_mask && !in.sampler.tool_grammar) return;
+        // llava: the answer row needs the same tracker, so the ids are set for
+        // it too; the mask itself still engages only under think_eog_mask.
+        if (!in.sampler.think_eog_mask && !in.sampler.tool_grammar && !in.sampler.answer_configured()) return;
         ThinkBlockIds ids = in.think_tags_extended ? think_ids_ext_ : think_ids_qwen_;
         ids.eog = eog_ids_;
         sampler.set_think_mask_ids(std::move(ids));

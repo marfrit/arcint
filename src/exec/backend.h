@@ -169,7 +169,9 @@ struct GenerationInput {
     // this artifact answers to the wider tag family. The API knows both from the
     // template (Prepared::think_open / think_tags_extended); the backend needs
     // them because the mask must engage before the FIRST sample, not after the
-    // first emitted piece.
+    // first emitted piece. SamplerParams::thinking_turn is the request's
+    // enable_thinking after the operator default, so llava's answer row never
+    // switches in a non-thinking turn.
     bool think_open          = false;
     bool think_tags_extended = false;
 };

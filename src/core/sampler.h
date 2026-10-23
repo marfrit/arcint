@@ -114,6 +114,19 @@ public:
     // is modified in place.
     int sample(float* logits, size_t vocab);
 
+    // llava: the sampler values this draw would use right now -- the thinking
+    // row, or the answer row when the block closed in a thinking turn. The
+    // test hook for the switch's cases; it reads no state that sample() does
+    // not read, so it is the row the next draw gets.
+    struct EffectiveRow {
+        float temperature;
+        float top_p;
+        int   top_k;
+        float min_p;
+        bool  answer_row;
+    };
+    EffectiveRow effective_row() const;
+
     uint64_t seed() const { return seed_; }
 
     // Exposed for tests: the pure argmax the greedy path must agree with.
@@ -121,13 +134,21 @@ public:
 
 private:
     int    draw(float* logits, size_t vocab);
-    bool   tracks_think() const { return params_.think_eog_mask || params_.tool_grammar; }
+    bool   tracks_think() const
+        { return params_.think_eog_mask || params_.tool_grammar || params_.answer_configured(); }
+    // llava: the answer row applies only in a thinking turn, after a block
+    // actually opened and closed. A non-thinking turn, or one whose block
+    // never opened, keeps the thinking row.
+    bool   use_answer_row() const {
+        return params_.answer_configured() && params_.thinking_turn && think_block_ever_open_
+               && think_state_ == ThinkState::content;
+    }
     void   apply_penalties(float* logits, size_t vocab) const;
     void   mask_illegal_while_thinking(float* logits, size_t vocab) const;
     void   measure_think_tags();
     void   build_think_id_table();
     void   observe_think_(std::string_view piece, int token);
-    size_t collect_candidates(const float* logits, size_t vocab, bool full);
+    size_t collect_candidates(const float* logits, size_t vocab, bool full, int top_k);
 
     // Where the block is in the generation. undecided: the opening is not
     // settled yet and the lead is still examined; thinking: the block is open
@@ -152,6 +173,10 @@ private:
     // the opening is settled, the tail the newest characters to see a closer
     // that straddles two pieces.
     ThinkState  think_state_ = ThinkState::undecided;
+    // llava: whether the block ever opened in this turn. The answer row
+    // switches only after a block that actually opened; a turn that settled
+    // undecided -> content without one keeps the thinking row.
+    bool        think_block_ever_open_ = false;
     std::string think_tail_;   // the newest characters, to see a closer land
     std::string think_lead_;   // the first non-blank characters, until the
                                // block's opening is settled

@@ -7,7 +7,8 @@ namespace lgc {
 bool SamplerOverrides::any() const {
     return temperature || top_p || top_k || min_p || repetition_penalty || presence_penalty ||
            frequency_penalty || seed || max_tokens || ignore_eos || stop || stop_token_ids ||
-           think_eog_mask || tool_grammar;
+           think_eog_mask || tool_grammar || answer_temperature || answer_top_p || answer_top_k ||
+           answer_min_p;
 }
 
 SamplerParams sampler_from_defaults(const SamplerDefaults& d) {
@@ -20,6 +21,10 @@ SamplerParams sampler_from_defaults(const SamplerDefaults& d) {
     p.presence_penalty   = d.presence_penalty;
     p.think_eog_mask     = d.think_eog_mask;
     p.tool_grammar       = d.tool_grammar;
+    p.answer_temperature = d.answer_temperature;
+    p.answer_top_p       = d.answer_top_p;
+    p.answer_top_k       = d.answer_top_k;
+    p.answer_min_p       = d.answer_min_p;
     return p;
 }
 
@@ -52,6 +57,20 @@ std::optional<std::string> sampler_validate(const SamplerOverrides& o) {
     if (o.max_tokens && *o.max_tokens < 1) {
         return log::format("max_tokens must be >= 1, got %d", *o.max_tokens);
     }
+    // llava: the answer row is validated like the thinking row, so a flag or a
+    // request field out of range is the same refusal.
+    if (o.answer_temperature && (*o.answer_temperature < 0.0f || *o.answer_temperature > 2.0f)) {
+        return log::format("answer_temperature must be in [0, 2], got %g", *o.answer_temperature);
+    }
+    if (o.answer_top_p && (*o.answer_top_p <= 0.0f || *o.answer_top_p > 1.0f)) {
+        return log::format("answer_top_p must be in (0, 1], got %g", *o.answer_top_p);
+    }
+    if (o.answer_top_k && *o.answer_top_k < 0) {
+        return log::format("answer_top_k must be >= 0 (0 disables), got %d", *o.answer_top_k);
+    }
+    if (o.answer_min_p && (*o.answer_min_p < 0.0f || *o.answer_min_p > 1.0f)) {
+        return log::format("answer_min_p must be in [0, 1] (0 disables), got %g", *o.answer_min_p);
+    }
     return std::nullopt;
 }
 
@@ -79,6 +98,12 @@ std::optional<std::string> sampler_apply(SamplerParams& p, const SamplerOverride
     // Making the operator's on un-vetoable would be a silent override (§3.6).
     if (o.think_eog_mask) p.think_eog_mask = *o.think_eog_mask;
     if (o.tool_grammar)   p.tool_grammar   = *o.tool_grammar;
+    // llava: the request's answer row fields override the operator's, for that
+    // request only (a client A/B without a restart). Absent keeps the default.
+    if (o.answer_temperature) p.answer_temperature = *o.answer_temperature;
+    if (o.answer_top_p)       p.answer_top_p       = *o.answer_top_p;
+    if (o.answer_top_k)       p.answer_top_k       = *o.answer_top_k;
+    if (o.answer_min_p)       p.answer_min_p       = *o.answer_min_p;
     if (o.seed) {
         p.seed   = *o.seed;
         p.seeded = true;
@@ -98,8 +123,13 @@ std::optional<std::string> sampler_defaults_apply(SamplerDefaults& d, const Samp
     if (o.presence_penalty)   d.presence_penalty   = *o.presence_penalty;
     if (o.think_eog_mask)     d.think_eog_mask     = *o.think_eog_mask;
     if (o.tool_grammar)       d.tool_grammar       = *o.tool_grammar;
+    if (o.answer_temperature) d.answer_temperature = *o.answer_temperature;
+    if (o.answer_top_p)       d.answer_top_p       = *o.answer_top_p;
+    if (o.answer_top_k)       d.answer_top_k       = *o.answer_top_k;
+    if (o.answer_min_p)       d.answer_min_p       = *o.answer_min_p;
     if (o.temperature || o.top_p || o.top_k || o.min_p || o.repetition_penalty || o.presence_penalty ||
-        o.think_eog_mask || o.tool_grammar) {
+        o.think_eog_mask || o.tool_grammar || o.answer_temperature || o.answer_top_p || o.answer_top_k ||
+        o.answer_min_p) {
         d.provenance = "operator";
     }
     return std::nullopt;

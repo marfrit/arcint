@@ -173,6 +173,12 @@ std::optional<std::string> read_sampler(const json& b, SamplerOverrides& s) {
         if (!b["tool_grammar"].is_boolean()) return "tool_grammar must be a boolean";
         s.tool_grammar = b["tool_grammar"].get<bool>();
     }
+    // llava: the answer row after the think block, for an A/B in one process.
+    // Absent keeps the operator's setting; a named field wins for this request.
+    if (auto e = num("answer_temperature", s.answer_temperature)) return e;
+    if (auto e = num("answer_top_p", s.answer_top_p)) return e;
+    if (auto e = num("answer_min_p", s.answer_min_p)) return e;
+    if (auto e = integer("answer_top_k", s.answer_top_k)) return e;
     if (b.contains("stop")) {
         if (auto e = read_stop(b["stop"], s)) return e;
     }

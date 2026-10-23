@@ -112,6 +112,9 @@ void Sampler::start_in_think_block(bool open) {
     // The template wrote the opener as the lead of the turn: the block is
     // already open before the first token. Otherwise the first tokens decide.
     think_state_ = (tracks_think() && open) ? ThinkState::thinking : ThinkState::undecided;
+    // llava: the answer row needs a block that actually opened, not merely a
+    // request that declared thinking.
+    think_block_ever_open_ = think_state_ == ThinkState::thinking;
     think_tail_.clear();
     think_lead_.clear();
     // The closer of a template-opened block: the first pair's close id, or the
@@ -157,6 +160,7 @@ void Sampler::observe_think_(std::string_view piece, int token) {
         for (const auto& [oid, cid] : think_open_to_close_) {
             if (token != oid) continue;
             think_state_    = ThinkState::thinking;
+            think_block_ever_open_ = true;
             think_close_id_ = cid;
             think_lead_.clear();
             think_tail_.clear();
@@ -208,6 +212,7 @@ void Sampler::observe_think_(std::string_view piece, int token) {
             // here, paired with its own closer id when that exists; otherwise
             // the closer scan below runs on the rest of this piece.
             think_state_ = ThinkState::thinking;
+            think_block_ever_open_ = true;
             think_close_id_ =
                 !params_.think_ids.open_close_ids.empty() && matched_pair < params_.think_ids.open_close_ids.size()
                     ? params_.think_ids.open_close_ids[matched_pair].second
@@ -331,10 +336,10 @@ void Sampler::apply_penalties(float* logits, size_t vocab) const {
 
 // Fills scratch_ with the candidates worth considering, largest logit first.
 // Returns how many are usable.
-size_t Sampler::collect_candidates(const float* logits, size_t vocab, bool full) {
+size_t Sampler::collect_candidates(const float* logits, size_t vocab, bool full, int top_k) {
     const size_t want = full ? vocab
-                        : params_.top_k > 0
-                            ? std::min(static_cast<size_t>(params_.top_k), vocab)
+                        : top_k > 0
+                            ? std::min(static_cast<size_t>(top_k), vocab)
                             : std::min(kCandidateProbe, vocab);
 
     scratch_.clear();
@@ -382,16 +387,31 @@ int Sampler::sample(float* logits, size_t vocab) {
     return draw(logits, vocab);
 }
 
+Sampler::EffectiveRow Sampler::effective_row() const {
+    const bool answer = use_answer_row();
+    EffectiveRow r;
+    r.answer_row  = answer;
+    r.temperature = answer && params_.answer_temperature ? *params_.answer_temperature : params_.temperature;
+    r.top_p       = answer && params_.answer_top_p ? *params_.answer_top_p : params_.top_p;
+    r.top_k       = answer && params_.answer_top_k ? *params_.answer_top_k : params_.top_k;
+    r.min_p       = answer && params_.answer_min_p ? *params_.answer_min_p : params_.min_p;
+    return r;
+}
+
 int Sampler::draw(float* logits, size_t vocab) {
+    // llava: one row per draw. The state cannot move inside sample(), so the
+    // row decided here is the row this token is drawn with -- also in a verify
+    // walk, where observe() advances the state before the next row's sample().
+    const EffectiveRow row = effective_row();
     // Penalties can reorder the distribution, so greedy is decided after them.
-    if (params_.greedy()) return argmax(logits, vocab);
+    if (row.temperature <= 0.0f || row.top_k == 1) return argmax(logits, vocab);
 
     for (int attempt = 0; attempt < 2; ++attempt) {
-        const bool   probing = attempt == 0 && params_.top_k <= 0 && kCandidateProbe < vocab;
-        const size_t n       = collect_candidates(logits, vocab, attempt > 0);
+        const bool   probing = attempt == 0 && row.top_k <= 0 && kCandidateProbe < vocab;
+        const size_t n       = collect_candidates(logits, vocab, attempt > 0, row.top_k);
         if (n == 0) return argmax(logits, vocab);
 
-        const float temp = params_.temperature > 0.0f ? params_.temperature : 1.0f;
+        const float temp = row.temperature > 0.0f ? row.temperature : 1.0f;
         const float max  = scratch_.front().first;
 
         double              sum = 0.0;
@@ -416,8 +436,8 @@ int Sampler::draw(float* logits, size_t vocab) {
         // needs no full sort.
         size_t min_p_cut    = probs.size();
         bool   min_p_closed = false;
-        if (params_.min_p > 0.0f) {
-            const float floor = max + std::log(params_.min_p);
+        if (row.min_p > 0.0f) {
+            const float floor = max + std::log(row.min_p);
             min_p_cut         = 1;
             while (min_p_cut < scratch_.size() && scratch_[min_p_cut].first >= floor) ++min_p_cut;
             min_p_closed = min_p_cut < scratch_.size();
@@ -427,19 +447,19 @@ int Sampler::draw(float* logits, size_t vocab) {
         // survives, so a tiny top_p degenerates to greedy rather than nothing.
         size_t cutoff = probs.size();
         bool   short_of_mass = false;
-        if (params_.top_p < 1.0f) {
+        if (row.top_p < 1.0f) {
             double acc = 0.0;
             cutoff     = probs.size();
             for (size_t i = 0; i < probs.size(); ++i) {
                 acc += probs[i];
-                if (acc >= static_cast<double>(params_.top_p)) {
+                if (acc >= static_cast<double>(row.top_p)) {
                     cutoff = i + 1;
                     break;
                 }
             }
             // The probe held less mass than top_p asked for; only then is the
             // full sort actually needed.
-            if (acc < static_cast<double>(params_.top_p) && probing && !min_p_closed) short_of_mass = true;
+            if (acc < static_cast<double>(row.top_p) && probing && !min_p_closed) short_of_mass = true;
         } else if (probing && scratch_.size() < vocab && !min_p_closed) {
             short_of_mass = true;
         }

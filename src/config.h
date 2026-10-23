@@ -195,6 +195,16 @@ struct Config {
     std::optional<float> repetition_penalty;
     std::optional<float> presence_penalty;
 
+    // llava: the answer row, used for tokens drawn after the think block has
+    // closed in a thinking turn (--answer-temp/--answer-top-p/--answer-top-k/
+    // --answer-min-p). Unset fields keep the thinking row's value; no field set
+    // keeps today's behaviour exactly. A request may set the same fields
+    // (answer_temperature, answer_top_p, ...) for an A/B in one process.
+    std::optional<float> answer_temperature;
+    std::optional<float> answer_top_p;
+    std::optional<int>   answer_top_k;
+    std::optional<float> answer_min_p;
+
     // --chat-template-kwarg enable_thinking=BOOL: the default a request gets
     // when it sends neither chat_template_kwargs.enable_thinking nor
     // reasoning_effort. Only enable_thinking is accepted, because it is the

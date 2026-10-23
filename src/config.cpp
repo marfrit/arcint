@@ -202,6 +202,14 @@ std::string usage_text() {
         "                            temperature, as llama.cpp (0 disables)\n"
         "  --repetition-penalty X    default repetition penalty\n"
         "  --presence-penalty X      default presence penalty\n"
+        "  --answer-temp X           the answer row: temperature for tokens drawn\n"
+        "                            after the think block closes in a thinking turn\n"
+        "                            (--answer-top-p/--answer-top-k/--answer-min-p\n"
+        "                            likewise; an unset field keeps the thinking row's\n"
+        "                            value, none set keeps today's behaviour)\n"
+        "  --answer-top-p X          the answer row: nucleus mass\n"
+        "  --answer-top-k N          the answer row: top-k (0 disables)\n"
+        "  --answer-min-p X          the answer row: min-p (0 disables)\n"
         "  --think-eog-mask          while a think block is open, do not offer the\n"
         "                            turn-ending token: a turn cannot then end with no\n"
         "                            answer inside an unfinished block. Off keeps the\n"
@@ -460,6 +468,22 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             double d = 0.0;
             if (!value(v) || !parse_double(v, d)) return fail("--presence-penalty needs a number");
             cfg.presence_penalty = static_cast<float>(d);
+        } else if (arg == "--answer-temp") {
+            double d = 0.0;
+            if (!value(v) || !parse_double(v, d)) return fail("--answer-temp needs a number");
+            cfg.answer_temperature = static_cast<float>(d);
+        } else if (arg == "--answer-top-p") {
+            double d = 0.0;
+            if (!value(v) || !parse_double(v, d)) return fail("--answer-top-p needs a number");
+            cfg.answer_top_p = static_cast<float>(d);
+        } else if (arg == "--answer-top-k") {
+            int k = 0;
+            if (!value(v) || !parse_int(v, k)) return fail("--answer-top-k needs an integer");
+            cfg.answer_top_k = k;
+        } else if (arg == "--answer-min-p") {
+            double d = 0.0;
+            if (!value(v) || !parse_double(v, d)) return fail("--answer-min-p needs a number");
+            cfg.answer_min_p = static_cast<float>(d);
         } else if (arg == "--think-eog-mask") {
             cfg.think_eog_mask = true;
         } else if (arg == "--tool-grammar") {
@@ -695,6 +719,10 @@ std::optional<std::string> apply_operator_defaults(const Config& cfg, SamplerDef
     o.min_p              = cfg.min_p;
     o.repetition_penalty = cfg.repetition_penalty;
     o.presence_penalty   = cfg.presence_penalty;
+    o.answer_temperature = cfg.answer_temperature;
+    o.answer_top_p       = cfg.answer_top_p;
+    o.answer_top_k       = cfg.answer_top_k;
+    o.answer_min_p       = cfg.answer_min_p;
     if (cfg.think_eog_mask) o.think_eog_mask = true;
     if (cfg.tool_grammar)   o.tool_grammar   = true;
     return sampler_defaults_apply(d, o);

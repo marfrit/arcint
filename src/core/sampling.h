@@ -29,6 +29,15 @@ struct SamplerDefaults {
     // constrained to a well-formed call. A no-op when no tools are declared.
     bool tool_grammar = false;
 
+    // llava: the answer row -- the sampler values used for tokens drawn after
+    // the think block has closed in a thinking turn. Each field is only the
+    // ones the operator set; an unset field keeps the thinking row's value.
+    // No field set at all means the switch is off, byte-identical to before.
+    std::optional<float> answer_temperature;
+    std::optional<float> answer_top_p;
+    std::optional<int>   answer_top_k;
+    std::optional<float> answer_min_p;
+
     // "provisional" -- the Qwen3-family card values, carried because no
     //                  GGUF key is read yet; /props reports this so nobody
     //                  mistakes an inherited default for a measured one.
@@ -102,6 +111,21 @@ struct SamplerParams {
     // top_k == 1 collapses the distribution just as temperature 0 does; both
     // must take the argmax path, or "greedy" means two different things.
     bool greedy() const { return temperature <= 0.0f || top_k == 1; }
+
+    // llava: the answer row after the think block, per field. Unset fields
+    // keep the thinking row's value; `answer_configured()` is what arms the
+    // switch. `thinking_turn` is the request's enable_thinking after the
+    // operator default (the API sets it); a turn that did not declare thinking
+    // never switches, whatever the model does with tags.
+    std::optional<float> answer_temperature;
+    std::optional<float> answer_top_p;
+    std::optional<int>   answer_top_k;
+    std::optional<float> answer_min_p;
+    bool                 thinking_turn = false;
+
+    bool answer_configured() const {
+        return answer_temperature || answer_top_p || answer_top_k || answer_min_p;
+    }
 };
 
 struct SamplerOverrides {
@@ -119,6 +143,12 @@ struct SamplerOverrides {
     std::optional<std::vector<int>>         stop_token_ids;
     std::optional<bool>                     think_eog_mask;
     std::optional<bool>                     tool_grammar;
+    // llava: the request's answer row fields, for an A/B in one process.
+    // Absent keeps the operator's setting; a named field wins for that request.
+    std::optional<float>                    answer_temperature;
+    std::optional<float>                    answer_top_p;
+    std::optional<int>                      answer_top_k;
+    std::optional<float>                    answer_min_p;
 
     bool any() const;
 };

@@ -203,3 +203,38 @@ TEST(sampling_tool_grammar_travels_defaults_to_params_to_request) {
     CHECK(!sampler_apply(q, on).has_value());
     CHECK(q.tool_grammar);
 }
+
+TEST(sampling_answer_row_travels_and_the_request_overrides_it) {
+    // llava: the operator flags land in the defaults; a request field wins for
+    // that request only, and an untouched answer field keeps the default.
+    SamplerDefaults d;
+    d.answer_top_p       = 0.8f;
+    d.answer_top_k       = 40;
+    SamplerParams p = sampler_from_defaults(d);
+    CHECK(p.answer_configured());
+    CHECK(p.answer_top_p && *p.answer_top_p == 0.8f);
+    CHECK(p.answer_top_k && *p.answer_top_k == 40);
+
+    SamplerOverrides o;
+    o.answer_top_p = 0.6f;
+    CHECK(!sampler_apply(p, o).has_value());
+    CHECK(p.answer_top_p && *p.answer_top_p == 0.6f);   // this request only
+    CHECK(p.answer_top_k && *p.answer_top_k == 40);     // the other field stays the operator's
+
+    SamplerParams q = sampler_from_defaults(d);         // a silent request
+    CHECK(!sampler_apply(q, SamplerOverrides{}).has_value());
+    CHECK(q.answer_top_p && *q.answer_top_p == 0.8f);
+}
+
+TEST(sampling_answer_row_counts_as_an_override_and_validates) {
+    SamplerOverrides o;
+    CHECK(!o.any());
+    o.answer_min_p = 0.03f;
+    CHECK(o.any());
+
+    SamplerParams p;
+    SamplerOverrides bad;
+    bad.answer_top_p = 1.5f;
+    CHECK(sampler_apply(p, bad).has_value());
+    CHECK(!p.answer_configured());   // a rejected request leaves nothing applied
+}
