@@ -116,6 +116,10 @@ int lane_n_ctx(const Context& ctx, int lane);
 // of `other`. Exposed here, not left static in handlers.cpp, so the
 // accounting itself is unit-testable without a GPU.
 double decode_other_seconds(const GenerationStats& stats);
+// The decode line's conditional terms (review B4 follow-up): the suffix that
+// lands on the line, extracted from log_stats so the wiring is unit-testable
+// at the struct level.
+std::string decode_suffix_for(const GenerationStats& stats);
 
 // Takes a lane for one request, or returns the 503 that says why not — with
 // the lane counts in it (slots.total, slots.free), so "busy" is a number and not a mood.

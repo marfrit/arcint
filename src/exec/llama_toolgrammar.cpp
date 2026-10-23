@@ -85,7 +85,17 @@ void LlamaToolGrammar::mask(float* logits, size_t vocab) {
     for (size_t i = 0; i < vocab; ++i)
         if (logits[i] != -INFINITY) cand_.push_back({ static_cast<llama_token>(i), logits[i], 0.0f });
     llama_token_data_array a{ cand_.data(), cand_.size(), -1, false };
-    llama_sampler_apply(smpl_, &a);
+    // Guarded like allows(): sample() reaches mask() right after a refused
+    // draw, and the engine call can throw there as well (a pin or artifact
+    // change), which must break the constraint (fail open, counted) rather
+    // than escape the decode loop as a 500 mid-stream.
+    try {
+        llama_sampler_apply(smpl_, &a);
+    } catch (const std::exception& e) {
+        broken_ = true;
+        note_desync(-1, e.what());
+        return;   // fail open: the redraw draws from the unmasked row
+    }
     for (const llama_token_data& d : cand_)
         if (d.logit == -INFINITY) logits[static_cast<size_t>(d.id)] = -INFINITY;
 }

@@ -123,10 +123,11 @@ class Log:
 DECODE_RE = re.compile(r"decode\s+(\d+) tok in\s+([\d.]+) s \(\s*([\d.]+) t/s\)(.*)")
 SAMPLE_RE = re.compile(r"sample ([\d.]+) s")
 MASKED_RE = re.compile(r"tool-call grammar: (\d+) draws masked")
+DESYNC_RE = re.compile(r"grammar desync (\d+)")
 
 
 def decode_of(lines):
-    d = {"tok": None, "s": None, "tps": None, "sample_s": None, "masked": None}
+    d = {"tok": None, "s": None, "tps": None, "sample_s": None, "masked": None, "desync": 0}
     for ln in lines:
         m = DECODE_RE.search(ln)
         if m:
@@ -134,10 +135,25 @@ def decode_of(lines):
             s = SAMPLE_RE.search(m.group(4))
             if s:
                 d["sample_s"] = float(s.group(1))
+            g = DESYNC_RE.search(m.group(4))
+            if g:
+                d["desync"] = int(g.group(1))
         m = MASKED_RE.search(ln)
         if m:
             d["masked"] = int(m.group(1))
     return d
+
+
+def desync_warning(who, d):
+    """The decode line's desync term, on a grammar-on arm: the constraint lost
+    sync and that turn ran unconstrained after it. A warning, not a gate
+    failure -- the gate's exit rules stay the validity rules; a desync is a
+    request-level incident the operator sees in the summary either way."""
+    if d["desync"] > 0:
+        print("WARNING: %s grammar=on: decode line reports %d grammar desync(s); "
+              "that turn ran unconstrained after the desync" % (who, d["desync"]))
+        return d["desync"]
+    return 0
 
 
 def score(scorer_dir, path):
@@ -172,6 +188,7 @@ def main():
         parts.add("csv-plain")
     log = Log(a.server_log)
     gate_fail = 0
+    desync_seen = 0
     red_seen = {}
 
     if "malformed" in parts:
@@ -198,6 +215,8 @@ def main():
                     log.since()
                     r, dt = post(a.url, body)
                     d = decode_of(log.since(0.5))
+                    if on:
+                        desync_seen += desync_warning("%s T=%.1f think=%s" % (name, temp, think), d)
                     ch = r["choices"][0]
                     calls = ch["message"].get("tool_calls") or []
                     reasons = [check_call(c, tools) for c in calls]
@@ -235,6 +254,8 @@ def main():
             log.since()
             r, dt = post(a.url, body)
             d = decode_of(log.since(0.5))
+            if on:
+                desync_seen += desync_warning("csv-call #%d T=%.1f seed=%d" % (i, temp, seed), d)
             ch = r["choices"][0]
             calls = ch["message"].get("tool_calls") or []
             reasons = [check_call(c, [WRITE_FILE]) for c in calls]
@@ -277,7 +298,8 @@ def main():
     # the on arm's validity measures nothing
     not_red = sorted(k for k, v in red_seen.items() if v == 0)
     print("== summary: on-arm failures (invalid, or no call where off made one): %d; off-arm malformed calls "
-          "per shape: %s%s" % (gate_fail, red_seen, "; NEVER RED: %s" % not_red if not_red else ""))
+          "per shape: %s%s%s" % (gate_fail, red_seen, "; NEVER RED: %s" % not_red if not_red else "",
+                                 "; grammar desyncs on on-arms: %d" % desync_seen))
     return 1 if gate_fail or not_red else 0
 
 

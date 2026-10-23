@@ -45,14 +45,18 @@ public:
     // it in the request's own numbers without hunting through the logs.
     int desync() const { return desyncs_; }
 
-protected:
-    // One desync, once: counted, and said at error level (not warn: a broken
-    // constraint is an incident, and the error line is what the log grep
-    // keeps). Derived constraints that can lose sync record it here instead
-    // of re-implementing the latch and the log line.
+    // One desync per request, counted once: the helper latches, not the
+    // callers. A second loss of sync in the same request still re-logs (the
+    // error line is the incident record) but does not re-count, so the stats
+    // line stays honest no matter how many paths record through it. Public,
+    // not protected: the sampler's mask guard records a thrown mask through
+    // it too -- the constraint's own guard (like allows') handles its engine,
+    // and the sampler's backstop handles whatever constraint throws anyway.
     void note_desync(int token, const std::string& why);
 
+protected:
     int desyncs_ = 0;
+    bool note_desynced_ = false;
 };
 
 class Sampler {

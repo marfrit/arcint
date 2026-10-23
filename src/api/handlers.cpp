@@ -26,6 +26,66 @@ double decode_other_seconds(const GenerationStats& stats) {
            stats.draft_verify_seconds - stats.draft_propose_seconds;
 }
 
+// The decode line's conditional terms, extracted from log_stats (review B4
+// follow-up) so the stats wiring is unit-testable at the struct level: the
+// value decode_suffix_for returns is the one that lands on the line.
+std::string decode_suffix_for(const GenerationStats& stats) {
+    std::string decode_suffix;
+    if (stats.decode_seconds > 0.0) {
+        const double other = decode_other_seconds(stats);
+        decode_suffix = log::format(
+            " | graph %.2f s, embed %.2f s, sample %.2f s, emit %.2f s, wait %.2f s, "
+            "other %.2f s",
+            stats.decode_forward_seconds, stats.decode_embed_seconds,
+            stats.decode_sample_seconds, stats.decode_emit_seconds,
+            stats.decode_wait_seconds, other);
+    }
+    // Printed whenever a subtracted term is non-zero, not only when a draft was
+    // proposed: propose time accrues on every paged drafting cycle, so a request
+    // that proposed nothing would otherwise subtract a term it never shows.
+    if (stats.draft_proposed > 0 || stats.draft_propose_seconds > 0.0) {
+        decode_suffix += log::format(
+            " | draft accept %.1f%% (%d/%d), propose %.2f s, verify %.2f s, re-forward %.2f s, "
+            "rollback %.2f s",
+            stats.draft_proposed > 0 ? 100.0 * stats.draft_accepted / stats.draft_proposed : 0.0,
+            stats.draft_accepted,
+            stats.draft_proposed, stats.draft_propose_seconds, stats.draft_verify_seconds,
+            stats.draft_reforward_seconds, stats.draft_rollback_seconds);
+        // the acceptance length: the tokens a verify emits on average
+        if (stats.draft_steps > 0)
+            decode_suffix += log::format(", %d verifies (%.2f tokens a verify)", stats.draft_steps,
+                                         static_cast<double>(stats.draft_accepted + stats.draft_steps) / stats.draft_steps);
+    }
+    // Visible even on a request that drafted nothing at all: a lane whose
+    // drafter is currently off (disabled by an earlier failure, re-armed only
+    // at the next request) proposes zero drafts and would otherwise vanish
+    // from this line entirely.
+    if (stats.dflash_lane_failures > 0) {
+        decode_suffix +=
+            log::format(" | dflash lane failures %d (cumulative)", stats.dflash_lane_failures);
+    }
+    // Tool-call grammar desyncs, review B4: the constraint lost sync with the
+    // text and the rest of the request ran unconstrained (fail open, so the
+    // turn can still end). Printed only when non-zero, as the drafting terms,
+    // so a request without a broken constraint keeps the line it always had.
+    if (stats.grammar_desyncs > 0) {
+        decode_suffix +=
+            log::format(" | grammar desync %d (turn unconstrained after desync)", stats.grammar_desyncs);
+    }
+    // What the other lane cost this one. Printed only when it happened, so a
+    // single-stream run's line is the line it always was, and a p95 rather than
+    // a mean because one long stall inside many short steps is exactly what a
+    // mean hides (DESIGN.md §4.1).
+    if (stats.stalled_steps > 0) {
+        decode_suffix += log::format(" | stall p95 %.0f ms max %.0f ms (%d step%s, %.2f s total)",
+                                     1000.0 * stats.stall_p95_seconds,
+                                     1000.0 * stats.stall_max_seconds, stats.stalled_steps,
+                                     stats.stalled_steps == 1 ? "" : "s",
+                                     stats.stall_total_seconds);
+    }
+    return decode_suffix;
+}
+
 namespace {
 
 using json = nlohmann::json;
@@ -121,59 +181,7 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
     log_slot_line(slot, "prefill", stats.prompt_tokens, stats.prefill_seconds,
                   stats.prefill_rate(), prefill_suffix);
 
-    std::string decode_suffix;
-    if (stats.decode_seconds > 0.0) {
-        const double other = decode_other_seconds(stats);
-        decode_suffix = log::format(
-            " | graph %.2f s, embed %.2f s, sample %.2f s, emit %.2f s, wait %.2f s, "
-            "other %.2f s",
-            stats.decode_forward_seconds, stats.decode_embed_seconds,
-            stats.decode_sample_seconds, stats.decode_emit_seconds,
-            stats.decode_wait_seconds, other);
-    }
-    // Printed whenever a subtracted term is non-zero, not only when a draft was
-    // proposed: propose time accrues on every paged drafting cycle, so a request
-    // that proposed nothing would otherwise subtract a term it never shows.
-    if (stats.draft_proposed > 0 || stats.draft_propose_seconds > 0.0) {
-        decode_suffix += log::format(
-            " | draft accept %.1f%% (%d/%d), propose %.2f s, verify %.2f s, re-forward %.2f s, "
-            "rollback %.2f s",
-            stats.draft_proposed > 0 ? 100.0 * stats.draft_accepted / stats.draft_proposed : 0.0,
-            stats.draft_accepted,
-            stats.draft_proposed, stats.draft_propose_seconds, stats.draft_verify_seconds,
-            stats.draft_reforward_seconds, stats.draft_rollback_seconds);
-        // the acceptance length: the tokens a verify emits on average
-        if (stats.draft_steps > 0)
-            decode_suffix += log::format(", %d verifies (%.2f tokens a verify)", stats.draft_steps,
-                                         static_cast<double>(stats.draft_accepted + stats.draft_steps) / stats.draft_steps);
-    }
-    // Visible even on a request that drafted nothing at all: a lane whose
-    // drafter is currently off (disabled by an earlier failure, re-armed only
-    // at the next request) proposes zero drafts and would otherwise vanish
-    // from this line entirely.
-    if (stats.dflash_lane_failures > 0) {
-        decode_suffix +=
-            log::format(" | dflash lane failures %d (cumulative)", stats.dflash_lane_failures);
-    }
-    // Tool-call grammar desyncs, review B4: the constraint lost sync with the
-    // text and the rest of the request ran unconstrained (fail open, so the
-    // turn can still end). Printed only when non-zero, as the drafting terms,
-    // so a request without a broken constraint keeps the line it always had.
-    if (stats.grammar_desyncs > 0) {
-        decode_suffix +=
-            log::format(" | grammar desync %d (turn unconstrained after desync)", stats.grammar_desyncs);
-    }
-    // What the other lane cost this one. Printed only when it happened, so a
-    // single-stream run's line is the line it always was, and a p95 rather than
-    // a mean because one long stall inside many short steps is exactly what a
-    // mean hides (DESIGN.md §4.1).
-    if (stats.stalled_steps > 0) {
-        decode_suffix += log::format(" | stall p95 %.0f ms max %.0f ms (%d step%s, %.2f s total)",
-                                     1000.0 * stats.stall_p95_seconds,
-                                     1000.0 * stats.stall_max_seconds, stats.stalled_steps,
-                                     stats.stalled_steps == 1 ? "" : "s",
-                                     stats.stall_total_seconds);
-    }
+    const std::string decode_suffix = decode_suffix_for(stats);
     log_slot_line(slot, "decode", stats.completion_tokens, stats.decode_seconds,
                   stats.decode_rate(), decode_suffix);
     if (reason == FinishReason::Abort) {

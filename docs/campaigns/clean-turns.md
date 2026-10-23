@@ -638,6 +638,42 @@ and this branch fixed:
 - The sampler kept the grammar's address past its lifetime at the end of
   each loop (unused, but a trap); it is detached when the request reports.
 
+### Review B4 follow-up (this branch)
+
+The B4 fix (desync counted on the constraint, `allows()` guarded, the count
+on the stats line) survived review with four changes, all device-free:
+
+- **`mask()` was unguarded.** `Sampler::sample()` reaches it right after a
+  refused draw, and the engine call there could throw and escape `sample()`
+  as a 500 mid-stream. Now guarded like `allows()`: the real constraint
+  breaks itself (fail open, counted), and the sampler's own backstop
+  catches a mask that throws anyway -- counted once, the constraint
+  detached, the redraw from the unmasked row (`measured-here`:
+  `sampler_constraint_mask_throw_is_guarded`, red before, green after).
+- **`note_desync` latched where the comment said the callers did.** The
+  helper now carries a latch flag: a second loss of sync in the same request
+  still re-logs (the error line is the incident record) but does not
+  re-count (`token_constraint_note_desync_latches_the_count`, red before,
+  green after).
+- **The stats wiring is testable at the struct level:** the decode line's
+  conditional terms are extracted from `log_stats` into
+  `lgc::api::decode_suffix_for` (the value that lands on the line), and
+  `decode_suffix_carries_the_grammar_desync_count` asserts a desynced
+  request prints the count and an undescynced one keeps the line it always
+  had (red before: the function did not exist, so the suite linked red).
+- **The endpoint gate sees a desync.** `tools/tool_grammar_gate.py` reads
+  the decode line's desync term, prints a WARNING naming the request for an
+  on arm that reports one, and counts them in the summary. The exit code
+  rules are unchanged (a desync is a warning, not a gate failure); the
+  stand-in-server test in `tests/python/test_tool_grammar_gate.py` proves
+  both the warning and the quiet line, device-free.
+
+The llama-side guard (`mask()`'s try/catch in `llama_toolgrammar.cpp`) is
+`code` on this host: the llama build of this branch is not configured here,
+and the change mirrors the file's own `allows()` guard; the device-free
+test drives the same guard through the sampler with a synthetic
+constraint.
+
 Second seat, 7 min (17:09–17:16 UTC), the fixed build (sha256 `0c29dc14…`),
 the stricter gate: every number above reproduced — 11 of 12 off arms
 malformed, 0 on-arm failures, every shape red at least once off, CSV call

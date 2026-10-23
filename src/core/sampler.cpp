@@ -31,7 +31,13 @@ void Sampler::set_prompt(const std::vector<int>& prompt) {
 }
 
 void TokenConstraint::note_desync(int token, const std::string& why) {
-    ++desyncs_;
+    if (!note_desynced_) {
+        note_desynced_ = true;
+        ++desyncs_;
+    }
+    // Not warn: a broken constraint is an incident, and the error line is what
+    // the log grep keeps. Latched, not once: a second loss of sync in the same
+    // request is re-logged, and only the count refuses to run away per token.
     log::error("grammar", "desync: %s (token %d); the rest of this request is unconstrained", why.c_str(), token);
 }
 
@@ -259,7 +265,20 @@ int Sampler::sample(float* logits, size_t vocab) {
     // (after the think mask and the penalties, as the reference re-runs its
     // chain over the masked candidates) and draw again. A rejection costs one
     // full-vocabulary grammar pass; a token that fits costs one token's test.
-    constraint_->mask(logits, vocab);
+    // Guarded like allows(): the constraint's own guard handles its engine
+    // (broken_, counted, fail open), and this backstop handles a constraint
+    // whose mask() throws anyway -- counted once, the constraint detached so
+    // the rest of the request runs unconstrained, and the redraw draws from
+    // the unmasked row, instead of the throw escaping sample() as a 500
+    // mid-stream. The backend reads the count through its own pointer, so the
+    // stats line still carries it.
+    try {
+        constraint_->mask(logits, vocab);
+    } catch (const std::exception& e) {
+        constraint_->note_desync(tok, e.what());
+        constraint_ = nullptr;
+        return draw(logits, vocab);
+    }
     return draw(logits, vocab);
 }
 

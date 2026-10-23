@@ -13,14 +13,17 @@
 //
 // No call tag is written out here: every one comes from tool_call_tags(), the
 // table the parser reads.
+#include "api/handlers.h"
 #include "core/sampler.h"
 #include "core/toolcall.h"
 #include "core/toolgrammar.h"
+#include "exec/backend.h"
 #include "exec/verify_walk.h"
 #include "harness.h"
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -142,18 +145,22 @@ SamplerParams greedy_grammar() {
 // mask-and-redraw, as the real grammar does); the first token it never admits
 // through accept() breaks it, and it counts the desync on the base class the
 // way the real one does (note_desync). Broken it fails open -- allows
-// everything, no engine call -- so the turn can still end, and the state
-// latches, so the count does not run away per token.
+// everything, no engine call -- so the turn can still end, and the count
+// latches, so it does not run away per token. `mask_throws` simulates the
+// engine itself throwing inside a full-row mask (the guard's other entry).
 struct BrokenConstraint : TokenConstraint {
     std::set<int> ok{ 7, 9 };
-    bool          broken = false;
-    int           masks  = 0;
+    bool          broken      = false;
+    int           masks       = 0;
+    bool          mask_throws = false;
     bool allows(int tok) override {
         if (broken) return true;
         return ok.count(tok) != 0;
     }
     void mask(float* logits, size_t vocab) override {
         ++masks;
+        if (mask_throws) throw std::runtime_error("synthetic: the engine threw in the mask");
+        if (broken) return;   // broken: fail open, nothing to mask
         for (size_t i = 0; i < vocab; ++i)
             if (!allows(static_cast<int>(i))) logits[i] = -INFINITY;
     }
@@ -250,6 +257,73 @@ TEST(sampler_constraint_desync_counts_and_fails_open) {
     std::vector<float> r3 = row_with_argmax(12);
     CHECK_EQ(sampler.sample(r3.data(), kVocab), 12);
     CHECK_EQ(c.desync(), 1);
+}
+
+// Review B4 follow-up: the refusal can also surface as a THROW inside the
+// full-row mask, on the path sample() takes right after a refused draw.
+// Without a guard there it escapes sample() as a 500 mid-stream. With the
+// guard the desync is counted once, and generation continues UNCONSTRAINED
+// (fail open): the row was not masked (the throw came first), so the redraw
+// draws the row's own argmax. The sampler detaches the broken constraint, so
+// the rest of the request never asks it again.
+TEST(sampler_constraint_mask_throw_is_guarded) {
+    Sampler            sampler(greedy_grammar(), 1);
+    BrokenConstraint   c;
+    c.mask_throws = true;
+    sampler.set_constraint(&c);
+    std::vector<float> r = row_with_argmax(5, 7);   // 5 refused by the constraint
+    bool              threw = false;
+    int               got   = -1;
+    try {
+        got = sampler.sample(r.data(), kVocab);
+    } catch (const std::exception&) {
+        threw = true;   // before the guard: this throw escapes sample()
+    }
+    CHECK(!threw);
+    CHECK_EQ(c.desync(), 1);    // counted exactly once, like every other desync
+    CHECK_EQ(c.masks, 1);
+    CHECK_EQ(got, 5);           // fail open: the unmasked row's own argmax wins
+    // and it stays that way: a further step runs unconstrained, no new throw,
+    // no new count, no second mask call (the constraint is detached).
+    std::vector<float> r2 = row_with_argmax(12);
+    CHECK_EQ(sampler.sample(r2.data(), kVocab), 12);
+    CHECK_EQ(c.desync(), 1);
+    CHECK_EQ(c.masks, 1);
+}
+
+// Review B4 follow-up: the count is the latch's, not the caller's. Before
+// the fix every path that lost sync incremented the counter, and the once
+// came from the callers remembering to check their own broken flag -- a
+// second recording in the same request double-counted the stats line. The
+// constraint below refuses every token it is handed and records every
+// refusal WITHOUT checking anything itself: it simulates a second path that
+// bypasses the caller-side latch, so the second note must be the base
+// class's to swallow.
+struct RefusingConstraint : TokenConstraint {
+    bool allows(int) override { return false; }
+    void mask(float*, size_t) override {}
+    void accept(int tok) override { note_desync(tok, "synthetic: the engine refuses everything"); }
+};
+
+TEST(token_constraint_note_desync_latches_the_count) {
+    RefusingConstraint c;
+    c.accept(3);
+    CHECK_EQ(c.desync(), 1);
+    c.accept(4);   // a second loss of sync in the same request
+    CHECK_EQ(c.desync(), 1);   // without the latch in the helper this is 2
+}
+
+// Review B4 follow-up: the stats wiring at the struct level. The count that
+// reaches the server's decode line is decode_suffix_for's -- this is the
+// value that lands on the line, not a grep of logs: a desynced request prints
+// the count, and an undescynced one keeps the line it always had.
+TEST(decode_suffix_carries_the_grammar_desync_count) {
+    GenerationStats s;
+    s.grammar_desyncs = 3;
+    const std::string suffix = lgc::api::decode_suffix_for(s);
+    CHECK(suffix.find("grammar desync 3") != std::string::npos);
+    GenerationStats plain;   // zero: the term stays off the line
+    CHECK(lgc::api::decode_suffix_for(plain).find("grammar desync") == std::string::npos);
 }
 
 // Dormant while a think block is open: arcint parses calls from the content
