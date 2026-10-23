@@ -236,6 +236,20 @@ std::string usage_text() {
         "                            unreachable. A no-op when the request declared no\n"
         "                            tools; a request may set the same thing as\n"
         "                            tool_grammar\n"
+        "  --loop-guard MODE         off|detect|nudge|slap|ladder: a reasoning loop\n"
+        "                            detector inside the think block. detect counts\n"
+        "                            only; nudge injects a fixed sentence once; slap\n"
+        "                            forces the think-block's closer at the detection\n"
+        "                            moment; ladder runs nudge, then slap after the\n"
+        "                            grace, then ends the turn if the answer loops.\n"
+        "                            off (default) is today's behaviour exactly; a\n"
+        "                            request may set loop_guard for itself\n"
+        "  --loop-guard-window N     recent reasoning lines whose repeat share is\n"
+        "                            tested (default 200; only lines > 20 chars)\n"
+        "  --loop-guard-threshold T  share of the window that trips the detector\n"
+        "                            (default 0.8)\n"
+        "  --loop-guard-grace K      more reasoning lines after a nudge before the\n"
+        "                            ladder's slap (default 40)\n"
         "  --chat-template-kwarg enable_thinking=BOOL\n"
         "                            template default when the request sends neither\n"
         "                            chat_template_kwargs.enable_thinking nor\n"
@@ -531,6 +545,23 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             cfg.think_eog_mask = true;
         } else if (arg == "--tool-grammar") {
             cfg.tool_grammar = true;
+        } else if (arg == "--loop-guard") {
+            if (!value(v)) return fail("--loop-guard needs off|detect|nudge|slap|ladder");
+            if (!loop_guard_parse(v)) return fail("--loop-guard needs off|detect|nudge|slap|ladder");
+            cfg.loop_guard = std::string(v);
+        } else if (arg == "--loop-guard-window") {
+            int n = 0;
+            if (!value(v) || !parse_int(v, n) || n < 1) return fail("--loop-guard-window needs an integer >= 1");
+            cfg.loop_guard_window = n;
+        } else if (arg == "--loop-guard-threshold") {
+            double d = 0.0;
+            if (!value(v) || !parse_double(v, d) || d < 0.0 || d > 1.0)
+                return fail("--loop-guard-threshold needs a number in [0, 1]");
+            cfg.loop_guard_threshold = static_cast<float>(d);
+        } else if (arg == "--loop-guard-grace") {
+            int k = 0;
+            if (!value(v) || !parse_int(v, k) || k < 0) return fail("--loop-guard-grace needs an integer >= 0");
+            cfg.loop_guard_grace = k;
         } else if (arg == "--chat-template-kwarg") {
             if (!value(v)) return fail("--chat-template-kwarg needs key=value");
             const std::string_view kv = v;
@@ -770,6 +801,14 @@ std::optional<std::string> apply_operator_defaults(const Config& cfg, SamplerDef
     o.answer_frequency_penalty = cfg.answer_frequency_penalty;
     if (cfg.think_eog_mask) o.think_eog_mask = true;
     if (cfg.tool_grammar)   o.tool_grammar   = true;
+    // loop-guard: off changes nothing and does not mark the defaults operator;
+    // any other rung carries its window/threshold/grace with it.
+    if (const auto mode = loop_guard_parse(cfg.loop_guard); mode && *mode != LoopGuardMode::Off) {
+        o.loop_guard           = *mode;
+        o.loop_guard_window    = cfg.loop_guard_window;
+        o.loop_guard_threshold = cfg.loop_guard_threshold;
+        o.loop_guard_grace     = cfg.loop_guard_grace;
+    }
     o.nothink_temperature      = cfg.nothink_temp;
     o.nothink_top_p            = cfg.nothink_top_p;
     o.nothink_top_k            = cfg.nothink_top_k;
