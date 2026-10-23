@@ -1582,7 +1582,7 @@ private:
                     const std::string piece = tokenizer_->decode_one(tok);
                     const Control ctl = on_piece(piece, tok);
                     emit_s += seconds_since(t_emit);
-                    sampler.observe(tok, piece);
+                    sampler.observe_think(tok, piece);
                     return ctl;
                 });
             stats.decode_emit_seconds += emit_s;

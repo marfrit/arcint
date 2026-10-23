@@ -92,6 +92,10 @@ public:
     // known id still governs its role, so ordinary text cannot close or open
     // a block whose tag is one special token.
     void observe_think_text(std::string_view piece);
+    // The tracker alone, without the history counts: a decode loop whose
+    // history is maintained elsewhere (the speculative lane's verify walk)
+    // still needs the emitted token's id and text here.
+    void observe_think(int token, std::string_view piece);
     bool think_block_open() const { return think_state_ == ThinkState::thinking; }
 
     // Replace which tokens and tags spell the block. The params carry the

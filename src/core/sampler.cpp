@@ -60,6 +60,8 @@ void Sampler::observe(int token, std::string_view piece) {
 
 void Sampler::observe_think_text(std::string_view piece) { observe_think_(piece, -1); }
 
+void Sampler::observe_think(int token, std::string_view piece) { observe_think_(piece, token); }
+
 void Sampler::set_think_mask_ids(ThinkBlockIds ids) {
     params_.think_ids = std::move(ids);
     measure_think_tags();
