@@ -159,6 +159,75 @@ TEST(loop_guard_ladder_nudges_once_then_forces_the_closer) {
     CHECK_EQ(s.sample(l2.data(), l2.size()), 3);
 }
 
+// Grace: the ladder waits exactly K counted lines after the nudge. K-1 lines
+// keep watching (no slap); the Kth trips the slap and the next draw is closer.
+TEST(loop_guard_ladder_waits_the_full_grace_before_the_slap) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 40);
+    for (size_t i = 0; i < kPiece.size(); ++i) p.loop_guard_nudge_ids.push_back(kPieceFirst + static_cast<int>(i));
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // the nudge rung fires
+    CHECK_EQ(s.loop_guard_counts().nudges, 1);
+
+    // Deliver the nudge sentence, one id a draw, observing each piece.
+    for (size_t i = 0; i < kPiece.size(); ++i) {
+        std::vector<float> l = row_with_argmax(2);
+        const int id = s.sample(l.data(), l.size());
+        CHECK_EQ(id, kPieceFirst + static_cast<int>(i));
+        s.observe_think(id, piece_of(id));
+    }
+
+    // K-1 = 39 counted lines after the nudge: still no slap.
+    feed_lines(s, 18, 57, true);
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+
+    // The Kth line (40): the slap is armed and the next drawn token is closer.
+    feed_text(s, loop_line(57));
+    CHECK_EQ(s.loop_guard_counts().slaps, 1);
+    std::vector<float> l = row_with_argmax(2);
+    CHECK_EQ(s.sample(l.data(), l.size()), 5);
+}
+
+// The answer phase is watched only after a slap. In detect and nudge modes the
+// block closes naturally, and a looping content phase must not abort: no
+// counters move, and the turn does not finish "loop".
+TEST(loop_guard_answer_phase_unwatched_without_a_slap) {
+    for (LoopGuardMode mode : {LoopGuardMode::Detect, LoopGuardMode::Nudge}) {
+        SamplerParams p = base_params(mode, 10, 5);
+        for (size_t i = 0; i < kPiece.size(); ++i)
+            p.loop_guard_nudge_ids.push_back(kPieceFirst + static_cast<int>(i));
+        Sampler s(p, 1);
+        s.start_in_think_block(true);
+
+        feed_lines(s, 0, 9, false);
+        feed_lines(s, 9, 18, true);   // a reasoning loop, detected in either mode
+        if (mode == LoopGuardMode::Nudge) {
+            for (size_t i = 0; i < kPiece.size(); ++i) {
+                std::vector<float> l = row_with_argmax(2);
+                const int id = s.sample(l.data(), l.size());
+                s.observe_think(id, piece_of(id));
+            }
+        }
+        CHECK_EQ(s.loop_guard_counts().slaps, 0);
+        s.observe(5, "closed");   // the block closes on its own, no slap
+
+        // A looping answer after a natural close is not watched: no abort.
+        feed_lines(s, 0, 9, false);
+        feed_lines(s, 9, 18, true);
+        CHECK(!s.loop_abort());
+        CHECK_EQ(s.loop_guard_counts().aborts, 0);
+
+        std::vector<float> rows = row_with_argmax(3);
+        const VerifyWalk   w = walk_verify(
+            rows.data(), 1, rows.size(), {}, s, 100, [](int) { return false; },
+            [&](int) { return Control::Continue; });
+        CHECK(w.reason != FinishReason::Loop);
+        CHECK_EQ(std::string(finish_reason_name(w.reason)), std::string("stop"));
+    }
+}
+
 // 4. Abort: a looping answer phase after a slap ends the turn with a distinct
 // finish reason.
 TEST(loop_guard_looping_content_after_a_slap_ends_the_turn) {

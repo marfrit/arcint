@@ -262,6 +262,10 @@ private:
     bool loop_abort_     = false;
     bool loop_slap_pending_ = false;
     int  loop_nudge_cursor_ = -1;   // next nudge id, -1 when none pending
+    // Set when sample() returns the last nudge id: observe_think_ clears the
+    // partial reasoning line before that piece is fed, so the sentence's tail
+    // does not prefix the model's next reasoning line.
+    bool loop_nudge_flush_ = false;
     int  loop_since_nudge_  = 0;    // counted lines since the nudge
     int  loop_detections_   = 0;
     int  loop_nudges_       = 0;

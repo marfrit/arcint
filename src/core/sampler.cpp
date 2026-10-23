@@ -164,6 +164,13 @@ void Sampler::observe_think_(std::string_view piece, int token) {
     // sees. Reasoning is watched while the block is open; the answer phase is
     // watched only after a slap (the abort rung), never otherwise.
     if (params_.loop_guard != LoopGuardMode::Off) {
+        // The last nudge id's piece is observed after sample() returned it; the
+        // sentence is not reasoning the detector should hold, so the buffer is
+        // dropped before that piece lands (the sample() side only marks it).
+        if (loop_nudge_flush_) {
+            loop_nudge_flush_ = false;
+            loop_line_.clear();
+        }
         if (think_state_ == ThinkState::thinking
             || (think_state_ == ThinkState::content && loop_slapped_))
             loop_observe_(piece);
@@ -301,8 +308,12 @@ void Sampler::loop_observe_(std::string_view piece) {
 void Sampler::loop_line_ended_(const std::string& line) {
     if (line.size() <= 20) return;
 
+    // loop_observe_ is only fed from the gates in observe_think_: reasoning
+    // while the block is open, content only after a slap. The phase test here
+    // must not carry a second copy of the slap condition, or the gate and the
+    // phase latch can disagree about what the answer phase is.
     const bool thinking = think_state_ == ThinkState::thinking;
-    const bool content  = think_state_ == ThinkState::content && loop_slapped_;
+    const bool content  = think_state_ == ThinkState::content;
     if (!thinking && !content) return;
 
     if (thinking && loop_nudged_ && !loop_slapped_) ++loop_since_nudge_;
@@ -517,10 +528,8 @@ int Sampler::sample(float* logits, size_t vocab) {
             const int id = params_.loop_guard_nudge_ids[static_cast<size_t>(loop_nudge_cursor_)];
             ++loop_nudge_cursor_;
             if (loop_nudge_cursor_ >= static_cast<int>(params_.loop_guard_nudge_ids.size())) {
-                loop_nudge_cursor_ = -1;   // the sentence is delivered once
-                // The nudge is not reasoning the detector should hold on to: the
-                // next model line starts from a clean partial-line buffer.
-                loop_line_.clear();
+                loop_nudge_cursor_ = -1;      // the sentence is delivered once
+                loop_nudge_flush_  = true;    // observe_think_ clears before its piece
             }
             return id;
         }
