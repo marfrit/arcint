@@ -195,6 +195,17 @@ struct Config {
     std::optional<float> repetition_penalty;
     std::optional<float> presence_penalty;
 
+    // The non-thinking row: --nothink-temp/-top-p/-top-k/-min-p/
+    // -presence-penalty. A request that resolves to thinking off starts from
+    // these instead of the row above; unset fields fall back to the normal
+    // row. No flag at all keeps every request on the normal row, exactly as
+    // before.
+    std::optional<float> nothink_temp;
+    std::optional<float> nothink_top_p;
+    std::optional<int>   nothink_top_k;
+    std::optional<float> nothink_min_p;
+    std::optional<float> nothink_presence_penalty;
+
     // --chat-template-kwarg enable_thinking=BOOL: the default a request gets
     // when it sends neither chat_template_kwargs.enable_thinking nor
     // reasoning_effort. Only enable_thinking is accepted, because it is the

@@ -523,6 +523,18 @@ json props(const Context& ctx) {
           {"min_p", sd.min_p},
           {"repetition_penalty", sd.repetition_penalty},
           {"presence_penalty", sd.presence_penalty},
+          // The row a thinking-off request starts from, null for each field
+          // the operator did not set (it then falls back to the normal row
+          // above). "configured" is false when no --nothink-* flag was given:
+          // then every request gets the normal row, byte-identically to before.
+          {"nothink",
+           {{"configured", sd.nothink_row},
+            {"temperature", sd.nothink_temperature ? json(*sd.nothink_temperature) : json(nullptr)},
+            {"top_p", sd.nothink_top_p ? json(*sd.nothink_top_p) : json(nullptr)},
+            {"top_k", sd.nothink_top_k ? json(*sd.nothink_top_k) : json(nullptr)},
+            {"min_p", sd.nothink_min_p ? json(*sd.nothink_min_p) : json(nullptr)},
+            {"presence_penalty",
+             sd.nothink_presence_penalty ? json(*sd.nothink_presence_penalty) : json(nullptr)}}},
           // clean-turns: whether the think-block mask is on for requests that
           // send nothing. /props says what the server is running with, so a
           // turn that ends differently than yesterday's is explained here.
@@ -616,8 +628,12 @@ namespace {
 std::optional<HttpResult> finish_prepare(const Context& ctx, int lane, const std::string& prompt,
                                          const SamplerOverrides& overrides,
                                          GenerationInput& input, int& prompt_tokens,
+                                         bool nothink = false,
                                          const std::vector<int>& prompt_ids = {}) {
-    SamplerParams sampler = sampler_from_defaults(ctx.backend->status().sampler_defaults);
+    // The row first: a request that resolves to thinking off starts from the
+    // operator's non-thinking row when one is configured. The request's own
+    // fields apply after this and still win.
+    SamplerParams sampler = sampler_from_defaults(ctx.backend->status().sampler_defaults, nothink);
     if (auto err = sampler_apply(sampler, overrides)) {
         return HttpResult{400, invalid_request(*err)};
     }
@@ -721,7 +737,11 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
     if (log::enabled(log::Level::Debug)) {
         log::debug("prompt", "%zu bytes:\n%s", prompt.size(), prompt.c_str());
     }
-    if (auto err = finish_prepare(ctx, lane, prompt, prep.req.sampler, prep.input, prep.prompt_tokens)) {
+    // Resolved after the operator's template default above: only a request
+    // that ends up with thinking off gets the non-thinking row.
+    const bool nothink = prep.req.has_enable_thinking && !prep.req.enable_thinking;
+    if (auto err = finish_prepare(ctx, lane, prompt, prep.req.sampler, prep.input, prep.prompt_tokens,
+                                  nothink)) {
         return err;
     }
     // the media, in marker order across the whole request (the renderer put one
@@ -755,7 +775,7 @@ std::optional<HttpResult> prepare_completion(const Context& ctx, const json& bod
     prep.model = lane >= 0 ? ctx.lanes[static_cast<size_t>(lane)].name : ctx.backend->status().served_id;
     if (auto err =
             finish_prepare(ctx, lane, prep.req.prompt, prep.req.sampler, prep.input, prep.prompt_tokens,
-                           prep.req.prompt_ids)) {
+                           /*nothink=*/false, prep.req.prompt_ids)) {
         return err;
     }
 
