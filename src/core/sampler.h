@@ -139,7 +139,9 @@ private:
     std::string think_tail_;   // the newest characters, to see a closer land
     std::string think_lead_;   // the first non-blank characters, until the
                                // block's opening is settled
-    size_t      think_max_tag_ = 0;
+    size_t      think_max_tag_ = 0;   // the longest tag: the closer tail's bound
+    size_t      think_max_open_ = 0;  // the longest opener: the lead's bound
+                                      // (N1: the look-ahead is bounded by it)
 
     // The closer guard's once-latch (review B3): the closer id was found in
     // the masked set and left in the row so the block can close; the warn is

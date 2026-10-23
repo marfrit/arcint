@@ -468,19 +468,41 @@ TEST(sampler_mask_notices_a_closer_inside_one_long_piece) {
 }
 
 TEST(sampler_mask_engages_on_an_opener_split_across_pieces) {
-    // Cut from the table's own string. The rule is one-sided on purpose: a lead
-    // that could still grow into an opener is masked from the first character,
-    // because masking the turn-ender for the two or three tokens of a partial
-    // opener costs nothing, while releasing a turn the client still reads as
-    // reasoning is the defect this is about.
+    // Cut from the table's own string. The N1 rule: the first half only looms
+    // -- it could still grow into an opener, so the state stays undecided and
+    // the mask does not engage yet (engaging on a partial match is what
+    // stranded a diverging lead at the length cap). The full match engages.
     const std::string opener = think_tag_pairs(false)[0].first;
     const size_t      cut    = opener.size() / 2;
     Sampler           s(masked_params(true), 1);
     s.start_in_think_block(false);
     s.observe_think_text(opener.substr(0, cut));
-    CHECK_EQ(s.sample(eog_first().data(), 4), 3);            // already masked
+    CHECK(!s.think_block_open());                    // looms: still undecided
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);    // not masked yet
     s.observe_think_text(opener.substr(cut) + "because");
-    CHECK_EQ(s.sample(eog_first().data(), 4), 3);            // and stays so
+    CHECK(s.think_block_open());                     // the full match opens it
+    CHECK_EQ(s.sample(eog_first().data(), 4), 3);    // and holds from here
+}
+
+TEST(sampler_mask_a_looming_lead_that_diverges_stays_undecided) {
+    // N1 (reviewer item, the text fallback): a lead that could still grow
+    // into an opener used to commit the state to thinking at once. If the
+    // text then diverges no closer ever comes, every turn-ender stays masked,
+    // and the turn runs to the length cap. While the lead only looms the
+    // state must stay undecided; on divergence it settles to content and the
+    // turn may end.
+    const auto&      pairs  = think_tag_pairs(false);
+    const std::string opener = pairs[0].first;
+    Sampler          s(masked_params(true), 1);
+    s.start_in_think_block(false);
+    // The opener's first bytes: could still grow into it
+    s.observe_think_text(opener.substr(0, 2));
+    CHECK(!s.think_block_open());                    // looms: undecided, not thinking
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);    // the turn-ender is still legal
+    // The text diverges: no opener completes, no closer will come
+    s.observe_think_text("x is not a block");
+    CHECK(!s.think_block_open());                    // settled content
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);    // the turn may end
 }
 
 TEST(sampler_mask_lets_go_when_the_lead_is_plainly_not_an_opener) {

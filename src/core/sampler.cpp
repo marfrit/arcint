@@ -64,9 +64,13 @@ void Sampler::set_think_mask_ids(ThinkBlockIds ids) {
 // the ids may arrive in the params (a test, or a backend that already knows
 // them) or through set_think_mask_ids.
 void Sampler::measure_think_tags() {
-    think_max_tag_ = 0;
+    think_max_tag_  = 0;
+    think_max_open_ = 0;
     for (const std::string& t : params_.think_ids.close_tags) think_max_tag_ = std::max(think_max_tag_, t.size());
-    for (const std::string& t : params_.think_ids.open_tags) think_max_tag_ = std::max(think_max_tag_, t.size());
+    for (const std::string& t : params_.think_ids.open_tags) {
+        think_max_tag_  = std::max(think_max_tag_, t.size());
+        think_max_open_ = std::max(think_max_open_, t.size());
+    }
 }
 
 void Sampler::start_in_think_block(bool open) {
@@ -90,21 +94,26 @@ void Sampler::observe_think_text(std::string_view piece) {
 
     if (think_state_ == ThinkState::undecided) {
         // Before the block's opening is settled, only the generation's first
-        // non-blank characters matter. The rule is deliberately one-sided, and
-        // errs towards masking: the mask engages as soon as the lead matches an
-        // opener or could still grow into one, and only lets go when the lead
-        // has provably become something else. Masking the turn-ender for the
-        // two or three tokens of a partial opener costs nothing; releasing a
-        // turn that the client still sees as reasoning is the defect.
+        // non-blank characters matter. N1: the rule errs towards STAYING
+        // undecided. A lead that could still grow into an opener keeps the
+        // state undecided; a full opener match opens the block; a lead that
+        // can no longer grow into any opener settles it to content. Committing
+        // a merely looming lead to thinking (the old `matched || loomed`) is
+        // the defect this settles: if the text then diverges, no closer ever
+        // comes, every turn-ender stays masked, and the turn runs to the
+        // length cap. With token ids known (ThinkBlockIds::open_ids) this
+        // text path is not used at all: the opener is one id, seen in
+        // observe().
         think_lead_.append(piece);
         // Strip the lead exactly as lead_of does, so a pad of spaces and
         // newlines before a self-opened block is not part of the opener and
-        // the mask engages where the split would. Keep only as many lead
-        // characters as the longest tag: the decision needs no more, so a
-        // blank run costs nothing and the lead stays bounded.
+        // the mask engages where the split would. The lead is bounded by the
+        // longest OPENER (a closer can never be the lead, so its length is
+        // irrelevant here): the decision needs no more, so a long plain
+        // answer costs nothing.
         const std::string_view lead = lead_of(think_lead_);
         if (lead.size() != think_lead_.size()) think_lead_.erase(0, think_lead_.size() - lead.size());
-        if (think_lead_.size() > think_max_tag_) think_lead_.resize(think_max_tag_);
+        if (think_lead_.size() > think_max_open_) think_lead_.resize(think_max_open_);
 
         bool matched = false;
         bool loomed  = false;
@@ -115,19 +124,23 @@ void Sampler::observe_think_text(std::string_view piece) {
                 loomed = true;
             }
         }
-        if (matched || loomed) {
-            // Open from here, and the rest of this piece is inside the block:
-            // the closer scan below must run on it.
+        if (matched) {
+            // A full opener at the lead: open from here, and the rest of this
+            // piece is inside the block: the closer scan below must run on it.
             think_state_ = ThinkState::thinking;
             think_lead_.clear();
-        } else if (!think_lead_.empty()) {
-            // No opener matched or loomed: the answer begins as content, and
-            // the lead is settled and never examined again.
+        } else if (loomed || think_lead_.empty()) {
+            // Still undecided: the lead could grow into an opener (or is only
+            // blanks). Nothing is open, so no closer scan on this piece.
+            return;
+        } else {
+            // The lead can no longer grow into any opener: the answer begins
+            // as content, and the lead is settled and never examined again
+            // for the rest of the turn.
             think_state_ = ThinkState::content;
             think_lead_.clear();
             return;
         }
-        // A blank-only lead could still grow into an opener: stay undecided.
     }
 
     // thinking
