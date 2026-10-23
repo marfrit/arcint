@@ -227,6 +227,7 @@ const char* finish_reason_name(FinishReason r) {
         case FinishReason::Stop:   return "stop";
         case FinishReason::Length: return "length";
         case FinishReason::Abort:  return "abort";
+        case FinishReason::Loop:   return "loop";
     }
     return "stop";
 }

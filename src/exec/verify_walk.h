@@ -47,6 +47,18 @@ inline VerifyWalk walk_verify(float* rows, size_t n_rows, size_t vocab, const st
         const Control ctl = emit(tok);
         ++w.emitted;
         sampler.observe(tok);
+        // loop-guard: a forced token (nudge or slap) returns from sample() and
+        // is emitted/observed like any drawn token. When it differs from the
+        // draft at this position the `tok == draft[i]` check below fails and
+        // the walk breaks, which is the rule that drops the remaining drafts at
+        // the boundary -- the KV is rolled back to what was emitted and the
+        // in-flight drafts past it are never accepted. A forced token that
+        // happens to equal the draft is simply accepted as that draft.
+        if (sampler.loop_abort()) {
+            w.done   = true;
+            w.reason = FinishReason::Loop;
+            break;
+        }
         if (ctl != Control::Continue) {
             w.done   = true;
             w.reason = ctl == Control::Cancel ? FinishReason::Abort : FinishReason::Stop;

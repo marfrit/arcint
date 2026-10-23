@@ -83,7 +83,25 @@ std::string decode_suffix_for(const GenerationStats& stats) {
                                      stats.stalled_steps == 1 ? "" : "s",
                                      stats.stall_total_seconds);
     }
+    // loop-guard: the ladder's counters, printed only when one moved, so a
+    // request without the switch keeps exactly the line it always had.
+    if (stats.loop_detections || stats.loop_nudges || stats.loop_slaps || stats.loop_aborts) {
+        decode_suffix += log::format(" | loop guard: detected %d, nudged %d, slapped %d, aborted %d",
+                                     stats.loop_detections, stats.loop_nudges, stats.loop_slaps,
+                                     stats.loop_aborts);
+    }
     return decode_suffix;
+}
+
+nlohmann::json loop_guard_json(const GenerationStats& stats) {
+    return nlohmann::json{{"detections", stats.loop_detections},
+                {"nudges", stats.loop_nudges},
+                {"slaps", stats.loop_slaps},
+                {"aborts", stats.loop_aborts}};
+}
+
+bool loop_guard_moved(const GenerationStats& stats) {
+    return stats.loop_detections || stats.loop_nudges || stats.loop_slaps || stats.loop_aborts;
 }
 
 namespace {
@@ -540,6 +558,13 @@ json props(const Context& ctx) {
           // turn that ends differently than yesterday's is explained here.
           {"think_eog_mask", sd.think_eog_mask},
           {"tool_grammar", sd.tool_grammar},
+          // loop-guard: the served switch and its thresholds, so a turn that
+          // ends differently than yesterday's is explained here.
+          {"loop_guard",
+           {{"mode", loop_guard_name(sd.loop_guard)},
+            {"window", sd.loop_guard_window},
+            {"threshold", sd.loop_guard_threshold},
+            {"grace", sd.loop_guard_grace}}},
           // llava: the answer row after the think block; null is "not set", so
           // an operator can tell the switch off from a value that happens to
           // equal the thinking row's.
@@ -956,6 +981,9 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
                                            {"message", std::move(message)},
                                            {"finish_reason", finish}}})},
                  {"usage", usage_json(stats)}};
+    // loop-guard: present only when the ladder moved, so a request without the
+    // switch has the response body it always had.
+    if (loop_guard_moved(stats)) body["loop_guard"] = loop_guard_json(stats);
     return HttpResult{200, std::move(body)};
 }
 
@@ -981,6 +1009,7 @@ HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, in
                                            {"logprobs", nullptr},
                                            {"finish_reason", finish_reason_name(reason)}}})},
                  {"usage", usage_json(stats)}};
+    if (loop_guard_moved(stats)) body["loop_guard"] = loop_guard_json(stats);
     return HttpResult{200, std::move(body)};
 }
 
@@ -1190,9 +1219,11 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     json final_delta = json::object();
     if (had_reasoning)
         final_delta["reasoning_closed"] = !reasoning.in_reasoning();
+    json final_extra = json::object();
+    if (loop_guard_moved(stats)) final_extra["loop_guard"] = loop_guard_json(stats);
     if (!sse_send(write, chunk(json::array({{{"index", 0},
                                              {"delta", final_delta},
-                                             {"finish_reason", finish}}})))) {
+                                             {"finish_reason", finish}}}), final_extra))) {
         return;
     }
 
@@ -1264,10 +1295,12 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep, int s
         }
     }
 
+    json final_extra = json::object();
+    if (loop_guard_moved(stats)) final_extra["loop_guard"] = loop_guard_json(stats);
     if (!sse_send(write, chunk(json::array({{{"index", 0},
                                              {"text", ""},
                                              {"logprobs", nullptr},
-                                             {"finish_reason", finish_reason_name(reason)}}})))) {
+                                             {"finish_reason", finish_reason_name(reason)}}}), final_extra))) {
         return;
     }
 

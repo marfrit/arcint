@@ -328,3 +328,27 @@ TEST(props_reports_the_answer_rows_penalties) {
     CHECK(a2.at("presence_penalty").get<float>() == 0.0f);
     CHECK(a2.at("frequency_penalty").is_null());
 }
+
+TEST(props_reports_the_loop_guard_switch_and_thresholds) {
+    // loop-guard: /props says which rung the server serves and its window,
+    // threshold and grace, so a turn that ends "loop" is explained there.
+    Config      cfg;
+    FakeBackend backend;
+    backend.st.id        = "stub";
+    backend.st.served_id = backend.st.id;
+    backend.st.loaded    = true;
+    backend.st.n_ctx     = 256;
+
+    backend.st.sampler_defaults.loop_guard          = LoopGuardMode::Ladder;
+    backend.st.sampler_defaults.loop_guard_window    = 120;
+    backend.st.sampler_defaults.loop_guard_threshold = 0.75f;
+    backend.st.sampler_defaults.loop_guard_grace     = 30;
+
+    SlotPool slots(1);
+    Context  ctx{&cfg, &backend, &slots};
+    const nlohmann::json lg = lgc::api::props(ctx).at("sampler_defaults").at("loop_guard");
+    CHECK_EQ(lg.at("mode").get<std::string>(), std::string("ladder"));
+    CHECK_EQ(lg.at("window").get<int>(), 120);
+    CHECK_EQ(lg.at("threshold").get<float>(), 0.75f);
+    CHECK_EQ(lg.at("grace").get<int>(), 30);
+}
