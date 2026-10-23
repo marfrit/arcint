@@ -371,6 +371,13 @@ void Sampler::loop_do_slap_() {
     loop_slapped_   = true;
     loop_slap_pending_ = true;
     ++loop_slaps_;
+    // The answer phase gets its own window: the reasoning loop that caused the
+    // slap must not count as the first answer lines (that would abort before
+    // the model has said anything). Content lines are counted from here.
+    loop_window_.clear();
+    loop_seen_.clear();
+    loop_line_.clear();
+    loop_fired_ = false;
     log::info("loop-guard", "lane: slap: the think-block's closer is forced as the next token");
 }
 
@@ -509,8 +516,12 @@ int Sampler::sample(float* logits, size_t vocab) {
         if (loop_nudge_cursor_ >= 0) {
             const int id = params_.loop_guard_nudge_ids[static_cast<size_t>(loop_nudge_cursor_)];
             ++loop_nudge_cursor_;
-            if (loop_nudge_cursor_ >= static_cast<int>(params_.loop_guard_nudge_ids.size()))
+            if (loop_nudge_cursor_ >= static_cast<int>(params_.loop_guard_nudge_ids.size())) {
                 loop_nudge_cursor_ = -1;   // the sentence is delivered once
+                // The nudge is not reasoning the detector should hold on to: the
+                // next model line starts from a clean partial-line buffer.
+                loop_line_.clear();
+            }
             return id;
         }
         if (loop_slap_pending_) {

@@ -178,6 +178,12 @@ TEST(loop_guard_looping_content_after_a_slap_ends_the_turn) {
     CHECK_EQ(s.sample(l.data(), l.size()), 5);
     s.observe(5, "closed");   // the block is closed: content phase, after a slap
 
+    // The reasoning window must not abort the answer's first lines: the slap
+    // starts a fresh content window, so one varied line is not a loop.
+    feed_text(s, distinct_line(0));
+    CHECK(!s.loop_abort());
+    CHECK_EQ(s.loop_guard_counts().aborts, 0);
+
     feed_lines(s, 0, 9, false);
     feed_lines(s, 9, 18, true);   // the answer repeats itself too
     CHECK(s.loop_abort());
