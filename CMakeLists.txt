@@ -230,6 +230,7 @@ if(ARCINT_TESTS)
     tests/test_spec_state.cpp
     tests/test_token_ids.cpp
     tests/test_props.cpp
+    tests/test_sampler_modes.cpp
     tests/test_lanes.cpp
     tests/test_reasoning.cpp
     tests/test_stream_utf8.cpp

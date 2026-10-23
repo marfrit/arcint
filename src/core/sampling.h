@@ -19,6 +19,19 @@ struct SamplerDefaults {
     float repetition_penalty = 1.05f;
     float presence_penalty   = 0.0f;
 
+    // The non-thinking row, set by the operator's --nothink-* flags. It
+    // applies only to a request that resolves to thinking off, and only when
+    // at least one such flag is set (nothink_row). An unset field falls back
+    // to the normal row above; a request's own fields still win over both.
+    // No --nothink-* flag means the normal row for every request, exactly as
+    // before.
+    std::optional<float> nothink_temperature;
+    std::optional<float> nothink_top_p;
+    std::optional<int>   nothink_top_k;
+    std::optional<float> nothink_min_p;
+    std::optional<float> nothink_presence_penalty;
+    bool nothink_row = false;   // at least one --nothink-* flag set it
+
     // clean-turns: the operator's switch for the think-block mask. Off keeps
     // today's behaviour; the artifact cannot decide it, so it is not read from
     // the GGUF.
@@ -129,6 +142,14 @@ struct SamplerParams {
 };
 
 struct SamplerOverrides {
+    // The operator layer's transport for the non-thinking row (--nothink-*);
+    // a request never sets these, and sampler_apply ignores them.
+    std::optional<float>                    nothink_temperature;
+    std::optional<float>                    nothink_top_p;
+    std::optional<int>                      nothink_top_k;
+    std::optional<float>                    nothink_min_p;
+    std::optional<float>                    nothink_presence_penalty;
+
     std::optional<float>                    temperature;
     std::optional<float>                    top_p;
     std::optional<int>                      top_k;
@@ -153,7 +174,10 @@ struct SamplerOverrides {
     bool any() const;
 };
 
-SamplerParams sampler_from_defaults(const SamplerDefaults& d);
+// The row a request starts from: the non-thinking row when `nothink` is true
+// and the operator configured one (SamplerDefaults::nothink_row), else the
+// normal row. Unset nothink fields fall back to the normal row.
+SamplerParams sampler_from_defaults(const SamplerDefaults& d, bool nothink = false);
 
 // The operator layer (config flags): overrides only the fields it sets and
 // marks the defaults' provenance "operator". Same validation as a request,
