@@ -985,7 +985,9 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     // not, which is how a torn code point reached the client as replacement
     // characters.
     utf8::Streamer      reasoning_stream;
+    bool                had_reasoning = false;
     auto send_reasoning = [&](const std::string& safe) {
+        had_reasoning = true;
         return sse_send(write, chunk(json::array({{{"index", 0},
                                                    {"delta", {{"reasoning_content", safe}}},
                                                    {"finish_reason", nullptr}}})));
@@ -1120,8 +1122,15 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     }
 
     const char* finish = calls.empty() ? finish_reason_name(reason) : "tool_calls";
+    // Review B6: the non-streaming message carries reasoning_closed, and the
+    // production clients stream; the final chunk carries it too, on the same
+    // condition (reasoning was non-empty). A stream client can then tell a
+    // closed-block empty answer from a mid-block stop.
+    json final_delta = json::object();
+    if (had_reasoning)
+        final_delta["reasoning_closed"] = !reasoning.in_reasoning();
     if (!sse_send(write, chunk(json::array({{{"index", 0},
-                                             {"delta", json::object()},
+                                             {"delta", final_delta},
                                              {"finish_reason", finish}}})))) {
         return;
     }

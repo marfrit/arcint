@@ -388,3 +388,21 @@ TEST(chat_run_reports_reasoning_closed) {
     CHECK(!msg.contains("reasoning_content"));
     CHECK(!msg.contains("reasoning_closed"));
 }
+
+// Review B6: the stream carries the block's state the non-streaming message
+// does -- reasoning_closed on the final chunk -- so a stream client can tell
+// a closed-block empty answer from a mid-block stop. On the same condition
+// the non-streaming path uses (reasoning was non-empty); absent otherwise.
+TEST(stream_final_chunk_carries_reasoning_closed) {
+    const auto& closer = think_tag_pairs(false)[0].second;
+    const std::vector<json> objs = run_stream("why" + closer + "answer");
+    const json& closed = objs.back()["choices"][0]["delta"];
+    CHECK(closed.value("reasoning_closed", false));
+
+    const std::vector<json> still = run_stream("never left the block");
+    CHECK(!still.back()["choices"][0]["delta"].value("reasoning_closed", true));
+
+    SplittingBackend plain("just an answer");
+    const std::vector<json> none = run_stream_with(plain, false);
+    CHECK(!none.back()["choices"][0]["delta"].contains("reasoning_closed"));
+}
