@@ -241,7 +241,12 @@ if(ARCINT_TESTS)
   if(ARCINT_LLAMA)
     # test_toolgrammar.cpp runs the generated GBNF through libllama's grammar
     # engine on text (llama-grammar.h, the entry points upstream's own grammar
-    # tests use), so it needs the pinned tree's src/ on its include path
+    # tests use), so it needs the pinned tree's src/ on its include path.
+    # Review B5: the toolgrammar_llama_* refusal cases exist in an ARCINT_LLAMA
+    # build only. The device-free unit gate above (LABELS unit) runs the
+    # generator's shape and the sampler's constraint hook without them; the
+    # record is in tests/test_toolgrammar.cpp's header and in the campaign
+    # (docs/campaigns/clean-turns.md, step 2 "the gate").
     target_include_directories(arcint-test PRIVATE "${ARCINT_LLAMA_DIR}/src")
     # clean-turns step 2's forced-malformed gate on a real vocabulary (vocab-only
     # load, no device). Not a ctest case: it needs the GGUF; run by hand.

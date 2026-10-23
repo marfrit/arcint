@@ -9,7 +9,17 @@
 //   - the GBNF accepts the well-formed call and refuses the malformed ones,
 //     run through libllama's own grammar engine on text (llama-grammar.h's
 //     test entry points, with no vocabulary -- the way upstream's
-//     tests/test-grammar-integration.cpp drives it). Only in a libllama build.
+//     tests/test-grammar-integration.cpp drives it).
+//
+//     Review B5, on the record: the toolgrammar_llama_* cases are compiled
+//     into an ARCINT_LLAMA build only -- they need the pinned tree's grammar
+//     engine (llama-grammar.h), and the device-free configuration has no
+//     source for it. The device-free `ctest -L unit` gate therefore does NOT
+//     include the refusal assertions; it covers the generator's shape and the
+//     sampler's constraint hook only. The refusal leg of the gate runs where
+//     the libllama build is, and the campaign records it there
+//     (docs/campaigns/clean-turns.md, step 2 "the gate" -- 204 cases in the
+//     libllama build, the 201-case device-free number excluding them).
 //
 // No call tag is written out here: every one comes from tool_call_tags(), the
 // table the parser reads.
