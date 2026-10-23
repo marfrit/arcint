@@ -37,16 +37,25 @@ std::string_view lead_of(std::string_view s);
 // The streaming form: pieces in, (reasoning delta, content delta) out, with a
 // hold-back for a close tag that straddles two pieces. Once the block closes
 // every further byte is content and goes straight through.
+//
+// `open_close_ids` is the per-pair id table from ThinkBlockIds, aligned with
+// think_tag_pairs(): a pair whose opener/closer is one special token is
+// decided by that id, and its text is not looked at. A -1 entry keeps the text
+// logic for that role. Empty: the text logic throughout, as before.
 class ReasoningStreamer {
 public:
-    explicit ReasoningStreamer(bool think_open, bool extended_tags = false);
+    explicit ReasoningStreamer(bool think_open, bool extended_tags = false,
+                               const std::vector<std::pair<int, int>>& open_close_ids = {});
     struct Step {
         std::string reasoning;
         std::string content;
     };
-    Step push(std::string_view piece);
+    // `token_id` is the id of the token that decoded to `piece`; -1 for a
+    // caller that only has text.
+    Step push(std::string_view piece, int token_id = -1);
     Step flush();
     bool in_reasoning() const { return in_reasoning_; }
+    bool closed() const { return closed_; }
 
 private:
     bool             in_reasoning_;
@@ -54,7 +63,17 @@ private:
     std::string      buffer_;
     std::string_view close_ = "</think>";   // the closer of the block that is open
     bool             extended_;
+    std::vector<std::pair<int, int>> ids_;
+    int              close_id_ = -1;   // the closer id of the open block; -1 = text
+    bool             closed_   = false;
 };
+
+// The non-streaming split driven by the same (piece, id) sequence the streamer
+// takes, so the two paths cannot disagree: a closer spelled from ordinary
+// tokens stays reasoning, the special-token closer ends the block.
+ReasoningSplit split_reasoning_tokens(const std::vector<std::pair<std::string, int>>& pieces,
+                                      bool think_open, bool extended_tags,
+                                      const std::vector<std::pair<int, int>>& open_close_ids);
 
 // The tag family the split honours, in the order it tries them: the Qwen pair,
 // and with `extended` also the Mistral-family pairs. This is the only place

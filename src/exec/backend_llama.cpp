@@ -276,14 +276,23 @@ public:
         return s;
     }
 
-    // A tag string the vocabulary holds as ONE added token, as the ChatML
+    // A tag string the vocabulary holds as ONE special token, as the ChatML
     // vocabularies do for their think markers. encode() with parse_special is
-    // the test: it returns one token only when the whole string is that token.
-    // A vocabulary that spells the same tag as ordinary text returns several,
-    // and the caller treats it as text.
+    // the shape test: it returns one token only when the whole string is that
+    // token. The id rule adds the attribute test: tokenizing to one token is
+    // not enough, because a vocabulary can fold a tag's text into a single
+    // ORDINARY sub-word token, and deciding on that id would treat a
+    // spelled-out mention as the real tag. So the token must also be a special
+    // or control token (llama_vocab_get_attr; the Qwen think markers are
+    // USER_DEFINED, so CONTROL alone would miss them). A vocabulary that
+    // spells the tag as ordinary text returns several tokens or one non-special
+    // one, and the caller keeps the text behaviour.
     std::vector<int> special_ids(std::string_view tag) override {
         const std::vector<int> t = encode(tag);
-        return t.size() == 1 ? t : std::vector<int>{};
+        if (t.size() != 1) return {};
+        const enum llama_token_attr attr = llama_vocab_get_attr(v_, static_cast<llama_token>(t.front()));
+        if ((attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) == 0) return {};
+        return t;
     }
 
     std::string decode(const std::vector<int>& ids) override {
@@ -508,6 +517,12 @@ public:
         eog_ids_.clear();
         for (llama_token t = 0; t < llama_vocab_n_tokens(vocab_); ++t)
             if (llama_vocab_is_eog(vocab_, t)) eog_ids_.push_back(t);
+
+        // clean-turns: the think tags' ids, once at load. A tag the vocabulary
+        // holds as one special token is decided by that id; a tag it spells as
+        // text stays -1 and keeps the text behaviour.
+        think_ids_qwen_ = build_think_ids(false);
+        think_ids_ext_  = build_think_ids(true);
 
         // Named lanes (--served-model-name A,B --lane-ctx CA,CB; DESIGN 4.2,
         // docs/campaigns/lanes-agent-subagent.md): a cap per lane, one KV
@@ -881,6 +896,11 @@ public:
 
     const ModelStatus& status() const override { return status_; }
     Tokenizer&         tokenizer() override { return *tokenizer_; }
+    // The ids read once at load; the reasoning split and the sampler's tracker
+    // decide the block's roles by them.
+    ThinkBlockIds think_block_ids(bool extended_tags) const override {
+        return extended_tags ? think_ids_ext_ : think_ids_qwen_;
+    }
 
     json template_caps() const override {
         const minja::chat_template_caps& c = template_->original_caps();
@@ -992,8 +1012,7 @@ public:
             const std::string piece = tokenizer_->decode_one(next);
             const Control ctl    = on_piece(piece, next);
             stats.decode_emit_seconds += seconds_since(t_emit);
-            sampler.observe_think_text(piece);
-            sampler.observe(next);
+            sampler.observe(next, piece);
             if (ctl != Control::Continue) {
                 reason = ctl == Control::Cancel ? FinishReason::Abort : FinishReason::Stop;
                 break;
@@ -1133,8 +1152,7 @@ public:
             const std::string piece = tokenizer_->decode_one(next);
             const Control ctl    = on_piece(piece, next);
             stats.decode_emit_seconds += seconds_since(t_emit);
-            sampler.observe_think_text(piece);
-            sampler.observe(next);
+            sampler.observe(next, piece);
             if (ctl != Control::Continue) {
                 reason = ctl == Control::Cancel ? FinishReason::Abort : FinishReason::Stop;
                 break;
@@ -1548,7 +1566,7 @@ private:
                     const std::string piece = tokenizer_->decode_one(tok);
                     const Control ctl = on_piece(piece, tok);
                     emit_s += seconds_since(t_emit);
-                    sampler.observe_think_text(piece);
+                    sampler.observe(tok, piece);
                     return ctl;
                 });
             stats.decode_emit_seconds += emit_s;
@@ -1757,27 +1775,30 @@ private:
     // The tool-call grammar needs the block's state too (it is dormant while
     // the block is open), so the ids are filled for either switch; the mask
     // itself still engages only under think_eog_mask (Sampler).
-    void prepare_think_mask(const GenerationInput& in, Sampler& sampler) const {
-        if (!in.sampler.think_eog_mask && !in.sampler.tool_grammar) return;
+    // Read once at load: the per-pair ids, and the flattened sets the mask reads.
+    // A tag that fails the one-special-token rule stays -1 and keeps the text
+    // behaviour for its role.
+    ThinkBlockIds build_think_ids(bool extended) const {
         ThinkBlockIds ids;
         ids.eog = eog_ids_;
-        for (const auto& [open, close] : think_tag_pairs(in.think_tags_extended)) {
-            // The opener is blocked by id wherever the vocabulary holds it as
-            // one added token; its text is kept in every case, because
-            // decode_one() renders a special as its tag text and the lead check
-            // needs the text either way.
-            const std::vector<int> one = tokenizer_->special_ids(open);
-            if (one.size() == 1) ids.open_ids.push_back(one.front());
+        for (const auto& [open, close] : think_tag_pairs(extended)) {
+            const std::vector<int> o = tokenizer_->special_ids(open);
+            const std::vector<int> c = tokenizer_->special_ids(close);
+            const int oid = o.size() == 1 ? o.front() : -1;
+            const int cid = c.size() == 1 ? c.front() : -1;
+            ids.open_close_ids.emplace_back(oid, cid);
+            if (oid >= 0) ids.open_ids.push_back(oid);
+            if (cid >= 0) ids.close_ids.push_back(cid);
             ids.open_tags.emplace_back(open);
-            // The closer is never blocked: emitting it is what lets the turn
-            // end again. Where the vocabulary spells it as one added token the
-            // id is handed to the mask as well: the closer guard in the sampler
-            // (review B3) leaves it out of the masked set, and logs once if it
-            // was in there.
-            const std::vector<int> closer = tokenizer_->special_ids(close);
-            if (closer.size() == 1) ids.close_ids.push_back(closer.front());
             ids.close_tags.emplace_back(close);
         }
+        return ids;
+    }
+
+    void prepare_think_mask(const GenerationInput& in, Sampler& sampler) const {
+        if (!in.sampler.think_eog_mask && !in.sampler.tool_grammar) return;
+        ThinkBlockIds ids = in.think_tags_extended ? think_ids_ext_ : think_ids_qwen_;
+        ids.eog = eog_ids_;
         sampler.set_think_mask_ids(std::move(ids));
         sampler.start_in_think_block(in.think_open);
     }
@@ -2031,6 +2052,12 @@ private:
     // Every id llama_vocab_is_eog() answers for: exactly the set is_stop() ends
     // on, so the mask and the stop check cannot drift apart.
     std::vector<int>                      eog_ids_;
+    // The think tags' ids, read from the vocabulary ONCE at load. The per-shape
+    // ids prepare_think_mask() hands to each request and the reasoning split
+    // reads are these; a tag that is not one special token stays -1 and keeps
+    // the text fallback for its role.
+    ThinkBlockIds                         think_ids_qwen_;   // the Qwen pair alone
+    ThinkBlockIds                         think_ids_ext_;    // the full tag family
     bool mistral_small_24b_ = false;   // the admitted llama geometry (think tags, BOS)
     std::unique_ptr<minja::chat_template> template_;
     std::string                           template_src_;

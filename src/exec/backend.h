@@ -260,6 +260,16 @@ public:
     virtual const ModelStatus& status() const = 0;
     virtual Tokenizer&         tokenizer()    = 0;
 
+    // The think tags' token ids the artifact's vocabulary holds as one special
+    // token, per pair (ThinkBlockIds::open_close_ids), or empty when none. The
+    // reasoning split and the sampler's tracker decide those roles by id; a
+    // pair with -1 keeps the text behaviour. Filled once at load, not per
+    // request.
+    virtual ThinkBlockIds think_block_ids(bool extended_tags) const {
+        (void)extended_tags;
+        return {};
+    }
+
     // Renders a chat request into the model's own prompt format. DESIGN.md §3.7
     // makes the artifact the single source of truth for the template, so this
     // is the backend's job: only it knows which template shipped with the

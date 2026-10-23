@@ -194,12 +194,13 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
 // Everything generic to both endpoints lives here: stop sequences, stop token
 // ids, cancellation, and the accumulation of the raw text the caller needs for
 // tool-call parsing.
-// `emit` receives the new piece and the full text accumulated so far
-// (the piece is already appended). Returning false means the client is gone.
-using EmitFn = std::function<bool(std::string_view piece, const std::string& accumulated)>;
+// `emit` receives the new piece, its token id and the full text accumulated so
+// far (the piece is already appended). Returning false means the client is gone.
+using EmitFn = std::function<bool(std::string_view piece, int token_id, const std::string& accumulated)>;
 
 FinishReason drive(Backend& backend, const GenerationInput& in, int slot, const EmitFn& emit,
-                   GenerationStats& stats, std::string& raw) {
+                   GenerationStats& stats, std::string& raw,
+                   std::vector<std::pair<std::string, int>>* pieces = nullptr) {
     StopMatcher   stop(in.sampler.stop);
     std::set<int> stop_ids(in.sampler.stop_token_ids.begin(), in.sampler.stop_token_ids.end());
     bool          cancelled = false;
@@ -208,9 +209,14 @@ FinishReason drive(Backend& backend, const GenerationInput& in, int slot, const 
         in, slot,
         [&](std::string_view piece, int token_id) -> Control {
             const StopMatcher::Step step = stop.push(piece);
+            // The reasoning split is decided by (piece, id), so record what was
+            // emitted with the id of the token that carried it; a piece the stop
+            // matcher held back in part gets no id (it is not wholly emitted).
+            if (pieces != nullptr)
+                pieces->emplace_back(step.emit, step.emit.size() == piece.size() ? token_id : -1);
             if (!step.emit.empty()) {
                 raw += step.emit;
-                if (!emit(step.emit, raw)) {
+                if (!emit(step.emit, token_id, raw)) {
                     cancelled = true;
                     return Control::Cancel;
                 }
@@ -227,7 +233,8 @@ FinishReason drive(Backend& backend, const GenerationInput& in, int slot, const 
         const std::string tail = stop.flush();
         if (!tail.empty()) {
             raw += tail;
-            if (!emit(tail, raw)) return FinishReason::Abort;
+            if (pieces != nullptr) pieces->emplace_back(tail, -1);
+            if (!emit(tail, -1, raw)) return FinishReason::Abort;
         }
     }
     return reason;
@@ -700,6 +707,9 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
     // split of reasoning from content below follows that, not a guess.
     prep.think_open = prompt.ends_with("<think>\n");
     prep.think_tags_extended = ctx.backend->status().think_tags_extended;
+    // The split, like the backend's mask, decides the block by token id where
+    // the artifact's vocabulary spells a tag as one special token.
+    prep.think_ids = ctx.backend->think_block_ids(prep.think_tags_extended);
     // The backend has to know the same thing: its mask engages before the first
     // sample, where the API's reasoning split has not seen a token yet.
     prep.input.think_open          = prep.think_open;
@@ -848,15 +858,26 @@ static std::optional<HttpResult> guarded(const std::function<void()>& run) {
 HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     GenerationStats stats;
     std::string     raw;
+    std::vector<std::pair<std::string, int>> pieces;
     FinishReason reason = FinishReason::Stop;
     if (auto err = guarded([&] {
             reason = drive(*ctx.backend, prep.input, slot,
-                           [](std::string_view, const std::string&) { return true; }, stats, raw);
+                           [](std::string_view, int, const std::string&) { return true; }, stats, raw, &pieces);
         }))
         return *err;
     log_stats(slot, stats, reason);
 
-    const ReasoningSplit  split   = split_reasoning(raw, prep.think_open, prep.think_tags_extended);
+    // When the artifact's tags are single special tokens the split is decided
+    // by those ids; the same (piece, id) sequence the streaming path feeds to
+    // its streamer goes here too, so the two cannot disagree. Without any id,
+    // the text split is exactly today's behaviour.
+    bool has_tag_ids = false;
+    for (const auto& [oid, cid] : prep.think_ids.open_close_ids)
+        if (oid >= 0 || cid >= 0) has_tag_ids = true;
+    const ReasoningSplit split = has_tag_ids
+        ? split_reasoning_tokens(pieces, prep.think_open, prep.think_tags_extended,
+                                 prep.think_ids.open_close_ids)
+        : split_reasoning(raw, prep.think_open, prep.think_tags_extended);
     std::string           content = split.content;
     std::vector<ToolCall> calls;
     if (prep.parse_tool_calls) {
@@ -904,7 +925,7 @@ HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, in
     FinishReason reason = FinishReason::Stop;
     if (auto err = guarded([&] {
             reason = drive(*ctx.backend, prep.input, slot,
-                           [](std::string_view, const std::string&) { return true; }, stats, raw);
+                           [](std::string_view, int, const std::string&) { return true; }, stats, raw);
         }))
         return *err;
     log_stats(slot, stats, reason);
@@ -976,7 +997,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     // Reasoning goes out as reasoning_content deltas until the think block
     // closes; from there `content` accumulates the answer and the tool-call
     // logic below sees only that.
-    ReasoningStreamer   reasoning(prep.think_open, prep.think_tags_extended);
+    ReasoningStreamer   reasoning(prep.think_open, prep.think_tags_extended, prep.think_ids.open_close_ids);
     std::string         content;       // the answer part of the output so far
     // Reasoning has its own hold-back stream: a multi-byte code point must not
     // be split across two SSE chunks (DESIGN §3.7), and reasoning and content
@@ -1019,8 +1040,8 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     FinishReason reason = FinishReason::Stop;
     if (auto err = guarded([&] { reason = drive(
         *ctx.backend, prep.input, slot,
-        [&](std::string_view piece, const std::string&) -> bool {
-            const ReasoningStreamer::Step step = reasoning.push(piece);
+        [&](std::string_view piece, int token_id, const std::string&) -> bool {
+            const ReasoningStreamer::Step step = reasoning.push(piece, token_id);
             if (!emit_reasoning(step.reasoning)) {
                 gone = true;
                 return false;
@@ -1171,7 +1192,7 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep, int s
     FinishReason reason = FinishReason::Stop;
     if (auto err = guarded([&] { reason = drive(
         *ctx.backend, prep.input, slot,
-        [&](std::string_view piece, const std::string&) -> bool {
+        [&](std::string_view piece, int, const std::string&) -> bool {
             const std::string safe = utf8_stream.push(piece);
             if (safe.empty()) return true;
             if (!sse_send(write, chunk(json::array({{{"index", 0},
