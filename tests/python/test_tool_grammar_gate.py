@@ -32,10 +32,12 @@ class _Server(http.server.BaseHTTPRequestHandler):
     asked for (the red control), an on arm gets a valid call -- and every
     answered arm appends its own decode line to the log the gate is pointed
     at, the way the real server does. `desync`, when set, puts the desync
-    term on the decode line of every grammar-on arm."""
+    term on the decode line of every grammar-on arm; `desync_off`, when set,
+    puts it on the grammar-off arms too."""
 
-    log_path = None
-    desync   = False
+    log_path   = None
+    desync     = False
+    desync_off = False
 
     def do_POST(self):
         n    = int(self.headers.get("Content-Length", 0))
@@ -53,6 +55,24 @@ class _Server(http.server.BaseHTTPRequestHandler):
             return
         on  = bool(body.get("tool_grammar"))
         prompt = (body.get("messages") or [{}])[0].get("content") or ""
+        if "write_file" in {(t.get("function") or {}).get("name") for t in body.get("tools") or []}:
+            # the csv-call part: no call and no text, so the gate never scores
+            message = {"role": "assistant", "content": ""}
+            raw = json.dumps({"choices": [{"finish_reason": "stop", "index": 0,
+                                           "message": message}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            if self.log_path:
+                suffix = (" | grammar desync 1 (turn unconstrained after desync)"
+                          if (on and self.desync) or (not on and self.desync_off) else "")
+                with open(self.log_path, "a") as f:
+                    f.write("lgc  slot 0: decode    120 tok in   1.50 s ( 80.0 t/s)"
+                            " | graph 1.40 s, embed 0.01 s, sample 0.02 s, emit 0.01 s, "
+                            "wait 0.00 s, other 0.06 s%s\n" % suffix)
+            return
         fn = ("read_file" if "delete_everything" in prompt or "filename" in prompt
               else "run_query")
         if fn == "read_file":
@@ -81,7 +101,7 @@ class _Server(http.server.BaseHTTPRequestHandler):
         self.wfile.write(raw)
         if self.log_path:
             suffix = (" | grammar desync 1 (turn unconstrained after desync)"
-                      if on and self.desync else "")
+                      if (on and self.desync) or (not on and self.desync_off) else "")
             with open(self.log_path, "a") as f:
                 f.write("lgc  slot 0: decode    120 tok in   1.50 s ( 80.0 t/s)"
                         " | graph 1.40 s, embed 0.01 s, sample 0.02 s, emit 0.01 s, "
@@ -111,9 +131,10 @@ def _serve(handler, timeout=5.0):
     return srv, port
 
 
-def _run_gate(port, log_path):
+def _run_gate(port, log_path, parts="malformed"):
     # --task and --scorer are required, but with --parts malformed neither is
-    # read; the stand-in never scores anything.
+    # read; the stand-in never scores anything. The csv-call part reads the
+    # task, but the stand-in answers no call and no text, so nothing is scored.
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
         tf.write("a task the stand-in never runs")
         task = tf.name
@@ -121,7 +142,7 @@ def _run_gate(port, log_path):
         [sys.executable, str(TOOLS / "tool_grammar_gate.py"),
          "http://127.0.0.1:%d" % port, "fake",
          "--task", task, "--scorer", str(ROOT), "--out", str(ROOT / "build-utf8"),
-         "--server-log", str(log_path), "--parts", "malformed"],
+         "--server-log", str(log_path), "--parts", parts],
         capture_output=True, text=True, timeout=300)
 
 
@@ -149,8 +170,54 @@ def test_a_desync_on_a_grammar_on_arm_warns_and_counts():
     assert r.returncode == 0, r.stdout + r.stderr
 
 
+def test_a_desync_in_the_csv_loop_warns_and_counts():
+    # the csv-call loop has its own desync wiring (not the malformed loop's)
+    _Server.log_path, _Server.desync, _Server.desync_off = None, True, False
+    with tempfile.TemporaryDirectory() as out:
+        log_path = str(Path(out) / "server.log")
+        open(log_path, "w").close()
+        _Server.log_path = log_path
+        srv, port = _serve(_Server)
+        try:
+            r = _run_gate(port, log_path, parts="csv-call")
+        finally:
+            srv.shutdown()
+    warnings = [ln for ln in r.stdout.splitlines() if ln.startswith("WARNING:")]
+    # the runs are 2 off + 8 on; only the on arms' decode lines carry the term
+    assert len(warnings) == 8, r.stdout
+    # the warning names the csv call, not just the count
+    assert any("csv-call #" in w for w in warnings), r.stdout
+    assert "grammar desyncs on on-arms: 8" in r.stdout, r.stdout
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_a_desync_on_an_off_arm_is_silent_and_uncounted():
+    # the stand-in reports the term on both arms; only the on arm may warn
+    _Server.log_path, _Server.desync, _Server.desync_off = None, True, True
+    with tempfile.TemporaryDirectory() as out:
+        log_path = str(Path(out) / "server.log")
+        open(log_path, "w").close()
+        _Server.log_path = log_path
+        srv, port = _serve(_Server)
+        try:
+            r = _run_gate(port, log_path)
+        finally:
+            srv.shutdown()
+    lines = r.stdout.splitlines()
+    # a WARNING is printed immediately before the result line of its arm; an
+    # off arm's result line must never be preceded by one
+    off_warned = [lines[i - 1] for i, ln in enumerate(lines)
+                  if "grammar=off" in ln and i and lines[i - 1].startswith("WARNING:")]
+    assert not off_warned, r.stdout
+    warnings = [ln for ln in lines if ln.startswith("WARNING:")]
+    # one per on arm (three configs per shape), none for the off twins
+    assert len(warnings) == 12, r.stdout
+    assert "grammar desyncs on on-arms: 12" in r.stdout, r.stdout
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
 def test_without_a_desync_the_line_is_quiet():
-    _Server.log_path, _Server.desync = None, False
+    _Server.log_path, _Server.desync, _Server.desync_off = None, False, False
     with tempfile.TemporaryDirectory() as out:
         log_path = str(Path(out) / "server.log")
         open(log_path, "w").close()
