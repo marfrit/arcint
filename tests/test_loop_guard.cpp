@@ -11,7 +11,9 @@
 #include "exec/verify_walk.h"
 #include "harness.h"
 
+#include <atomic>
 #include <string>
+#include <thread>
 
 using namespace lgc;
 
@@ -929,3 +931,62 @@ TEST(loop_guard_ladder_nodoor_never_opens_the_door) {
     CHECK(row[7] == -1.0f);
     CHECK_EQ(s.loop_guard_counts().door_masked, 0);
 }
+
+// ── door polish: the scan and the counter ─────────────────────────────────────
+
+// A stub-shaped tokenizer: pieces interned by id, like the stub's table, but
+// with a multi-newline piece the stub's byte splitter never makes. It counts
+// decode_one calls, so the test can see how many scans ran.
+class DoorPieceTokenizer final : public Tokenizer {
+public:
+    explicit DoorPieceTokenizer(std::vector<std::string> pieces)
+        : pieces_(std::move(pieces)) {}
+    std::vector<int> encode(std::string_view text) override {
+        std::vector<int> out;
+        for (char c : text) out.push_back(intern(std::string(1, c)));
+        return out;
+    }
+    std::string decode(const std::vector<int>& ids) override {
+        std::string out;
+        for (int id : ids) out += decode_one(id);
+        return out;
+    }
+    std::string decode_one(int id) override {
+        ++decode_calls;
+        if (id < 0 || static_cast<size_t>(id) >= pieces_.size()) return {};
+        return pieces_[static_cast<size_t>(id)];
+    }
+    int eos_id() const override { return 0; }
+    int vocab_size() const override { return static_cast<int>(pieces_.size()); }
+
+    mutable std::atomic<int> decode_calls{0};
+
+private:
+    int intern(const std::string& piece) {
+        for (size_t i = 0; i < pieces_.size(); ++i)
+            if (pieces_[i] == piece) return static_cast<int>(i);
+        pieces_.push_back(piece);
+        return static_cast<int>(pieces_.size() - 1);
+    }
+    std::vector<std::string> pieces_;
+};
+
+// 1. The door-id scan is pure and thread-safe: the ids are the multi-newline
+// set before any request, and two threads scanning at once see the same ids.
+TEST(loop_guard_door_ids_scan_is_pure_and_seen_before_a_request) {
+    DoorPieceTokenizer tok({"", "\n", "\n\n", "x", "\n\n\n"});
+    const std::vector<int> once = scan_loop_guard_door_ids(tok);
+    CHECK(once == std::vector<int>({2, 4}));   // the single newline (1) is not
+    CHECK_EQ(tok.decode_calls.load(), 5);      // the scan happens, before any request
+
+    tok.decode_calls = 0;
+    std::vector<int> a, b;
+    std::thread t1([&] { a = scan_loop_guard_door_ids(tok); });
+    std::thread t2([&] { b = scan_loop_guard_door_ids(tok); });
+    t1.join();
+    t2.join();
+    CHECK(a == once);
+    CHECK(b == once);
+    CHECK_EQ(tok.decode_calls.load(), 2 * tok.vocab_size());   // two independent passes
+}
+

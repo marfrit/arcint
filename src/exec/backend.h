@@ -38,6 +38,27 @@ public:
     virtual std::vector<int> special_ids(std::string_view tag) { (void)tag; return {}; }
 };
 
+// loop-guard door: the ids whose decoded piece is newline characters only,
+// two or more of them (the double, triple ... newline tokens). Pure: one pass
+// over the vocabulary the tokenizer owns, no cache and no shared state, so the
+// backend can run it once at model load and several threads can call it at
+// once. The single-newline id is not in the result.
+inline std::vector<int> scan_loop_guard_door_ids(Tokenizer& tok) {
+    std::vector<int> out;
+    const int n = tok.vocab_size();
+    for (int id = 0; id < n; ++id) {
+        const std::string piece = tok.decode_one(id);
+        size_t newlines = 0;
+        bool   only     = true;
+        for (char c : piece) {
+            if (c == '\n') ++newlines;
+            else { only = false; break; }
+        }
+        if (only && newlines >= 2) out.push_back(id);
+    }
+    return out;
+}
+
 struct ModelStatus {
     // Two names. `id` is the served file's own name (the GGUF's file name; the
     // stub's "stub") and never moves. `served_id` is what the outside world is

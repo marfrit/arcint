@@ -511,6 +511,13 @@ public:
                                                  cfg.gguf_path.c_str(), arch));
         tokenizer_ = std::make_unique<LlamaTokenizer>(vocab_);
         n_vocab_   = static_cast<size_t>(llama_vocab_n_tokens(vocab_));
+        // loop-guard door: the multi-newline ids, scanned ONCE here where the
+        // vocabulary becomes known, so no request-time lazy scan exists and no
+        // two lanes can race on a cache. A pure helper; the per-request path
+        // only reads the result.
+        loop_door_ids_ = scan_loop_guard_door_ids(*tokenizer_);
+        log::info("loop-guard", "door: %zu multi-newline token(s) in a vocabulary of %d",
+                  loop_door_ids_.size(), static_cast<int>(n_vocab_));
         // clean-turns: which ids end a turn for this vocabulary. The mask needs
         // the set, not just eos: a ChatML vocabulary ends a turn with its
         // end-of-turn id, and is_stop() asks llama_vocab_is_eog(), which answers
@@ -1878,30 +1885,7 @@ private:
     void prepare_loop_guard(const GenerationInput& in, Sampler& sampler) const {
         if (in.sampler.loop_guard == LoopGuardMode::Off) return;
         sampler.set_loop_guard_nudge(tokenizer_->encode(kLoopGuardNudge));
-        if (loop_guard_uses_door(in.sampler.loop_guard)) sampler.set_loop_guard_door(loop_door_ids());
-    }
-
-    // loop-guard door: the ids whose decoded piece is two or more newline
-    // characters and nothing else. Computed once per vocabulary, from the
-    // pieces the backend owns (the sampler never looks at the vocabulary), and
-    // handed to the sampler the way the nudge ids are. Scanned lazily, so a
-    // build that never turns the door on pays nothing.
-    const std::vector<int>& loop_door_ids() const {
-        if (loop_door_scanned_) return loop_door_ids_;
-        loop_door_scanned_ = true;
-        const int n = tokenizer_->vocab_size();
-        for (int id = 0; id < n; ++id) {
-            const std::string piece = tokenizer_->decode_one(id);
-            size_t newlines = 0;
-            bool   only    = true;
-            for (char c : piece) {
-                if (c == '\n') ++newlines;
-                else { only = false; break; }
-            }
-            if (only && newlines >= 2) loop_door_ids_.push_back(id);
-        }
-        log::info("loop-guard", "door: %zu multi-newline token(s) in a vocabulary of %d", loop_door_ids_.size(), n);
-        return loop_door_ids_;
+        if (loop_guard_uses_door(in.sampler.loop_guard)) sampler.set_loop_guard_door(loop_door_ids_);
     }
 
     // clean-turns step 2: the request's tool-call grammar, handed to the
@@ -2180,9 +2164,8 @@ private:
     std::string                           template_src_;
     ModelStatus                           status_;
     size_t                                n_vocab_ = 0;
-    // loop-guard door ids, scanned once from the vocabulary pieces
-    mutable std::vector<int>              loop_door_ids_;
-    mutable bool                          loop_door_scanned_ = false;
+    // loop-guard door ids, scanned once at load from the vocabulary pieces
+    std::vector<int>                      loop_door_ids_;
     int                                   lanes_   = 1;
     int                                   n_ctx_   = 0;   // the first lane's cap (status, the load line)
     bool                                  named_   = false;   // --lane-ctx: kv_unified, a cap per lane
