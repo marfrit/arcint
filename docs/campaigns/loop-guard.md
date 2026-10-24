@@ -90,8 +90,14 @@ loop. False-positive run on the other 21 tasks: 17 run before the window
 closed, 16 fully correct, 1 wrong with no guard event (run-to-run variance);
 on the near build without stripping, two triggers on code drafts written out
 several times (indented short lines passed the 20-character bar), silent with
-stripped lines; one real loop there caught and fixed by the nudge. Four tasks
-of the false-positive run are owed before the release.
+stripped lines; one real loop there caught and fixed by the nudge. The last
+four tasks on the 1.2.3 pre-tag build (2026-10-24): three fully correct with
+no guard event; one looped this time and climbed the whole ladder, its answer
+looping after the slap (code comments re-checking one contradiction, each
+line six times), and the abort ended it without a program (the screening,
+guard off, had answered it partly wrong). In all, 21 of 21: 19 fully correct,
+1 wrong with no guard event, 1 aborted on a real loop. The operator keeps the
+full ladder on the coder.
 
 ## Where it lives
 

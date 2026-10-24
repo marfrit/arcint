@@ -109,12 +109,15 @@ instead put a clean enumeration over the threshold, so near matching it is.
 - **The guard on the 9 cap runs:** all 9 end fully correct. 4 loops closed
   after the nudge alone, 4 needed the slap, and 1 task did not loop on that
   run.
-- **The false-positive run:** 17 of the 21 other tasks were run, 16 fully
-  correct. The one wrong answer had no guard event (the coder varies from run
-  to run; it was correct in the screening). The guard caught one real loop
-  there and the nudge fixed it. An earlier build triggered twice on code
-  drafts written out several times (short indented lines passed the length
-  bar unstripped); stripping the lines first fixed both.
+- **The false-positive run:** all 21 other tasks, 19 fully correct. One wrong
+  answer had no guard event (the coder varies from run to run; it was correct
+  in the screening). Two of these tasks looped this time, and the guard caught
+  both: the nudge fixed one; on the other the answer after the slap looped as
+  well (its code comments re-checked one contradiction again and again), and
+  the abort ended the turn without a program, where the screening, without
+  the guard, had answered partly wrong. An earlier build triggered twice on
+  code drafts written out several times (short indented lines passed the
+  length bar unstripped); stripping the lines first fixed both.
 
 **What it does not heal.** The guard ends loops; it does not make a wrong
 algorithm right. An answer given after a full reasoning is set by that

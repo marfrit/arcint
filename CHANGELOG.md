@@ -62,6 +62,17 @@ in 1.2.2. The coder unit turns on the loop guard and the non-thinking row
 patches), unchanged from 1.2.2; dependencies unchanged. `arcint-stt` (1.2.0)
 and `arcint-imggen` (1.1.1) are unchanged.
 
+**Release check** (`measured-here`, 2026-10-24, the pre-tag package): the
+device-free suite 286 cases and `ctest -L unit` 6/6, the package build green.
+Same-window speed A/B against 1.2.2 with every switch off: the coder (A770)
+and the agent (B60) pass with byte-identical texts. On the coder with its
+1.2.3 flags (the ladder, the non-thinking row): the acceptance task 5/5 at
+10/10 greedy and 30/30 at 10/10 at temperature 0.7; the agent 3/3 at 10/10.
+The loop guard's false-positive run completed: 21 of 21 tasks, 19 fully
+correct, 1 wrong with no guard event, 1 ended on `loop` after a real loop in
+the reasoning and again in the answer. Not run: Flash-Next's A/B (its sampler
+path is the agent's, every switch off; `code`).
+
 ## 1.2.2 — 2026-10-24
 
 Agent turns gain two opt-in guards: an open think block no longer offers the
