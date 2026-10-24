@@ -204,6 +204,37 @@ TEST(loop_guard_hysteresis_dip_does_not_add_a_detection) {
     CHECK_EQ(s.loop_guard_counts().detections, 2);
 }
 
+// Lines are judged after leading/trailing ASCII whitespace is stripped, the
+// same text the offline measurement used. Indentation alone is not a repeat;
+// an indented line whose stripped text is <= 20 characters is not counted.
+TEST(loop_guard_strips_whitespace_before_the_bar_and_the_comparison) {
+    // (a) the same long line with and without leading indentation is an exact
+    // repeat: after nine varied lines, eight alternations reach 0.8.
+    {
+        SamplerParams p = base_params(LoopGuardMode::Detect);
+        p.loop_guard_match = LoopGuardMatch::Exact;
+        Sampler s(p, 1);
+        s.start_in_think_block(true);
+        feed_lines(s, 0, 9, false);
+        const std::string body = "the index remainder is still the same value now";
+        for (int i = 9; i < 18; ++i)
+            feed_text(s, (i % 2 == 0 ? std::string(8, ' ') : std::string{}) + body + "\n");
+        CHECK_EQ(s.loop_guard_counts().detections, 1);
+    }
+    // (b) fifteen spaces + a ten-character comment is under the bar once
+    // stripped, so ten repetitions are not counted and nothing fires.
+    {
+        SamplerParams p = base_params(LoopGuardMode::Detect);
+        p.loop_guard_match = LoopGuardMatch::Exact;
+        Sampler s(p, 1);
+        s.start_in_think_block(true);
+        feed_lines(s, 0, 9, false);
+        for (int i = 0; i < 10; ++i)
+            feed_text(s, std::string(15, ' ') + "# Correct." + "\n");
+        CHECK_EQ(s.loop_guard_counts().detections, 0);
+    }
+}
+
 // 3. Ladder: the nudge text appears once in the reasoning, and after K more
 // looping lines the next drawn token is the closer id. Afterwards content flows.
 TEST(loop_guard_ladder_nudges_once_then_forces_the_closer) {

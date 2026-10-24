@@ -339,7 +339,17 @@ bool Sampler::loop_near_match_(const LoopGrams& grams) const {
     return false;
 }
 
-void Sampler::loop_line_ended_(const std::string& line) {
+void Sampler::loop_line_ended_(const std::string& raw_line) {
+    // The offline measurement that set the thresholds stripped each line before
+    // the length bar and the comparison. The engine must judge the same text:
+    // indentation is not content, and a short indented comment (eight spaces +
+    // "# Correct.") is below the bar in both places. ASCII whitespace only:
+    // the decoded text is bytes, and a Unicode space would be line content.
+    const auto      ws = " \t\r\n\f\v";
+    const size_t    first = raw_line.find_first_not_of(ws);
+    if (first == std::string::npos) return;
+    const size_t    last  = raw_line.find_last_not_of(ws);
+    const std::string line = raw_line.substr(first, last - first + 1);
     if (line.size() <= 20) return;
 
     // loop_observe_ is only fed from the gates in observe_think_: reasoning

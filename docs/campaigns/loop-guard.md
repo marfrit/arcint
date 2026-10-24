@@ -8,8 +8,9 @@ default.
 ## Charter
 
 - **Detection inside the think block only.** A rolling window of reasoning
-  lines (a line ends at a newline; only lines longer than 20 characters
-  count) whose repeat share reaches a threshold. Incremental, no whole-text
+  lines (a line ends at a newline; leading and trailing ASCII whitespace is
+  stripped, then only lines longer than 20 characters count) whose repeat
+  share reaches a threshold. Incremental, no whole-text
   re-scan per token. The default match rule is **near** (`--loop-guard-match
   exact|near`): a line also counts as a repeat when its character-3-gram set
   has Jaccard >= 0.8 with one of the last 400 distinct counted lines; exact
