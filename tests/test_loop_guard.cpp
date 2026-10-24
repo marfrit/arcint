@@ -112,7 +112,9 @@ std::string piece_of(int id) {
 // share at 0; after that the share rises 1/10, 2/10 ... and first reaches 0.8
 // when the eighth repeating line arrives (line 17, counting from 1).
 TEST(loop_guard_detector_fires_at_the_expected_line) {
-    SamplerParams p = base_params(LoopGuardMode::Ladder);
+    // ladder-nodoor: the ladder's old order, so the nudge is the first rung at
+    // detection (the door ladder defers it).
+    SamplerParams p = base_params(LoopGuardMode::LadderNoDoor);
     p.loop_guard_nudge_ids = {kPieceFirst};   // the ladder's first rung needs them
     Sampler s(p, 1);
     s.start_in_think_block(true);
@@ -178,7 +180,7 @@ TEST(loop_guard_near_varied_stream_never_fires) {
 // 0.8 without counting; seven varied lines fall to 0.65 (below the low mark),
 // and 16 repeats cross back and count.
 TEST(loop_guard_hysteresis_dip_does_not_add_a_detection) {
-    SamplerParams p = base_params(LoopGuardMode::Ladder, 20, 1000);
+    SamplerParams p = base_params(LoopGuardMode::LadderNoDoor, 20, 1000);
     p.loop_guard_match = LoopGuardMatch::Exact;
     for (size_t i = 0; i < kPiece.size(); ++i) p.loop_guard_nudge_ids.push_back(kPieceFirst + static_cast<int>(i));
     Sampler s(p, 1);
@@ -238,7 +240,8 @@ TEST(loop_guard_strips_whitespace_before_the_bar_and_the_comparison) {
 // 3. Ladder: the nudge text appears once in the reasoning, and after K more
 // looping lines the next drawn token is the closer id. Afterwards content flows.
 TEST(loop_guard_ladder_nudges_once_then_forces_the_closer) {
-    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 5);
+    // ladder-nodoor: today's ladder order, unchanged by the door rung.
+    SamplerParams p = base_params(LoopGuardMode::LadderNoDoor, 10, 5);
     for (size_t i = 0; i < kPiece.size(); ++i) p.loop_guard_nudge_ids.push_back(kPieceFirst + static_cast<int>(i));
     Sampler s(p, 1);
     s.start_in_think_block(true);
@@ -286,7 +289,7 @@ TEST(loop_guard_ladder_nudges_once_then_forces_the_closer) {
 // Grace: the ladder waits exactly K counted lines after the nudge. K-1 lines
 // keep watching (no slap); the Kth trips the slap and the next draw is closer.
 TEST(loop_guard_ladder_waits_the_full_grace_before_the_slap) {
-    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 40);
+    SamplerParams p = base_params(LoopGuardMode::LadderNoDoor, 10, 40);
     for (size_t i = 0; i < kPiece.size(); ++i) p.loop_guard_nudge_ids.push_back(kPieceFirst + static_cast<int>(i));
     Sampler s(p, 1);
     s.start_in_think_block(true);
@@ -355,7 +358,7 @@ TEST(loop_guard_answer_phase_unwatched_without_a_slap) {
 // 4. Abort: a looping answer phase after a slap ends the turn with a distinct
 // finish reason.
 TEST(loop_guard_looping_content_after_a_slap_ends_the_turn) {
-    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 2);
+    SamplerParams p = base_params(LoopGuardMode::LadderNoDoor, 10, 2);
     for (size_t i = 0; i < kPiece.size(); ++i) p.loop_guard_nudge_ids.push_back(kPieceFirst + static_cast<int>(i));
     Sampler s(p, 1);
     s.start_in_think_block(true);

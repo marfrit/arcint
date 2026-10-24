@@ -118,15 +118,27 @@ public:
     void set_loop_guard_nudge(std::vector<int> ids) {
         params_.loop_guard_nudge_ids = std::move(ids);
     }
+    // loop-guard door: the multi-newline token ids, computed by the backend
+    // from its vocabulary's pieces (two or more newline characters and nothing
+    // else). Masked while the door rung is open and the block is open.
+    void set_loop_guard_door(std::vector<int> ids) {
+        params_.loop_guard_door_ids = std::move(ids);
+    }
     // The per-request counters, for the stats line and the response object.
     struct LoopGuardCounts {
         int detections = 0;
         int nudges     = 0;
         int slaps      = 0;
         int aborts     = 0;
+        // door: the block closed by the model's own draw while the door was
+        // open (not by a slap), and the draws at which the door mask was active
+        // and a masked token sat in the row's top-k candidates.
+        int self_closes = 0;
+        int door_masked = 0;
     };
     LoopGuardCounts loop_guard_counts() const {
-        return {loop_detections_, loop_nudges_, loop_slaps_, loop_aborts_};
+        return {loop_detections_, loop_nudges_, loop_slaps_, loop_aborts_,
+                loop_self_closes_, loop_door_masked_};
     }
     // The answer phase kept looping after a slap: the caller ends the turn on
     // FinishReason::Loop instead of emitting another token. Latching: once set
@@ -186,6 +198,10 @@ private:
     void   loop_do_abort_();
     void   apply_penalties(float* logits, size_t vocab) const;
     void   mask_illegal_while_thinking(float* logits, size_t vocab) const;
+    // loop-guard door: mask the multi-newline ids while the door is open and
+    // the block is open, and count a draw whose top-k held one of them (before
+    // this mask removed it).
+    void   mask_door_while_thinking(float* logits, size_t vocab);
     void   measure_think_tags();
     void   build_think_id_table();
     void   observe_think_(std::string_view piece, int token);
@@ -272,6 +288,15 @@ private:
     bool loop_slapped_   = false;
     bool loop_abort_     = false;
     bool loop_slap_pending_ = false;
+    // door: open from the detection moment through nudge and slap until the
+    // block closes; the mask reads this and the block's state. `forced_closer`
+    // marks the token sample() returned for a slap, so observe_think_ does not
+    // count that close as the model's own.
+    bool loop_door_open_     = false;
+    bool loop_forced_closer_ = false;
+    int  loop_since_detect_  = 0;   // counted lines since detection (door grace)
+    int  loop_self_closes_   = 0;
+    int  loop_door_masked_   = 0;
     int  loop_nudge_cursor_ = -1;   // next nudge id, -1 when none pending
     // Set when sample() returns the last nudge id: observe_think_ clears the
     // partial reasoning line after that piece is fed, so the sentence's tail

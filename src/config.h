@@ -238,7 +238,8 @@ struct Config {
     // default; a no-op when the request declared no tools.
     bool tool_grammar = false;
 
-    // loop-guard: off|detect|nudge|slap|ladder (--loop-guard), and the ladder's
+    // loop-guard: off|detect|nudge|slap|door|ladder|ladder-nodoor (--loop-guard),
+    // and the ladder's
     // thresholds. Off by default: no detector, no forced token, no new finish
     // reason. A request may set its own rung with loop_guard, for that request.
     std::string loop_guard = "off";
@@ -250,6 +251,7 @@ struct Config {
     int         loop_guard_window    = 200;
     float       loop_guard_threshold = 0.8f;
     int         loop_guard_grace     = 40;
+    int         loop_guard_door_grace = 20;
 
     // Stub-only: milliseconds of artificial latency per emitted token. Exists
     // so the cancellation path (§3.7) can be demonstrated against a backend

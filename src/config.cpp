@@ -236,12 +236,16 @@ std::string usage_text() {
         "                            unreachable. A no-op when the request declared no\n"
         "                            tools; a request may set the same thing as\n"
         "                            tool_grammar\n"
-        "  --loop-guard MODE         off|detect|nudge|slap|ladder: a reasoning loop\n"
-        "                            detector inside the think block. detect counts\n"
-        "                            only; nudge injects a fixed sentence once; slap\n"
-        "                            forces the think-block's closer at the detection\n"
-        "                            moment; ladder runs nudge, then slap after the\n"
-        "                            grace, then ends the turn if the answer loops.\n"
+        "  --loop-guard MODE         off|detect|nudge|slap|door|ladder|ladder-nodoor:\n"
+        "                            a reasoning loop detector inside the think block.\n"
+        "                            detect counts only; door masks the multi-newline\n"
+        "                            tokens so the model can close by its own draw;\n"
+        "                            nudge injects a fixed sentence once; slap forces\n"
+        "                            the think-block's closer at the detection moment;\n"
+        "                            ladder opens the door, nudges after the door grace\n"
+        "                            if the loop persists, then slaps after the grace,\n"
+        "                            then ends the turn if the answer loops;\n"
+        "                            ladder-nodoor is the ladder before the door.\n"
         "                            off (default) is today's behaviour exactly; a\n"
         "                            request may set loop_guard for itself\n"
         "  --loop-guard-match RULE   exact|near (default near): near also counts a\n"
@@ -254,6 +258,9 @@ std::string usage_text() {
         "                            (default 0.8)\n"
         "  --loop-guard-grace K      more reasoning lines after a nudge before the\n"
         "                            ladder's slap (default 40)\n"
+        "  --loop-guard-door-grace K more counted lines after detection before the\n"
+        "                            ladder's nudge, while the door is open (default\n"
+        "                            20)\n"
         "  --chat-template-kwarg enable_thinking=BOOL\n"
         "                            template default when the request sends neither\n"
         "                            chat_template_kwargs.enable_thinking nor\n"
@@ -550,8 +557,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--tool-grammar") {
             cfg.tool_grammar = true;
         } else if (arg == "--loop-guard") {
-            if (!value(v)) return fail("--loop-guard needs off|detect|nudge|slap|ladder");
-            if (!loop_guard_parse(v)) return fail("--loop-guard needs off|detect|nudge|slap|ladder");
+            if (!value(v)) return fail("--loop-guard needs off|detect|nudge|slap|door|ladder|ladder-nodoor");
+            if (!loop_guard_parse(v)) return fail("--loop-guard needs off|detect|nudge|slap|door|ladder|ladder-nodoor");
             cfg.loop_guard = std::string(v);
         } else if (arg == "--loop-guard-match") {
             if (!value(v)) return fail("--loop-guard-match needs exact|near");
@@ -567,6 +574,11 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_double(v, d) || d < 0.0 || d > 1.0)
                 return fail("--loop-guard-threshold needs a number in [0, 1]");
             cfg.loop_guard_threshold = static_cast<float>(d);
+        } else if (arg == "--loop-guard-door-grace") {
+            int k = 0;
+            if (!value(v) || !parse_int(v, k) || k < 0)
+                return fail("--loop-guard-door-grace needs an integer >= 0");
+            cfg.loop_guard_door_grace = k;
         } else if (arg == "--loop-guard-grace") {
             int k = 0;
             if (!value(v) || !parse_int(v, k) || k < 0) return fail("--loop-guard-grace needs an integer >= 0");
@@ -817,6 +829,7 @@ std::optional<std::string> apply_operator_defaults(const Config& cfg, SamplerDef
         o.loop_guard_window    = cfg.loop_guard_window;
         o.loop_guard_threshold = cfg.loop_guard_threshold;
         o.loop_guard_grace     = cfg.loop_guard_grace;
+        o.loop_guard_door_grace = cfg.loop_guard_door_grace;
     }
     if (cfg.loop_guard_match_set) {
         if (const auto match = loop_guard_match_parse(cfg.loop_guard_match)) o.loop_guard_match = *match;

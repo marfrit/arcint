@@ -132,6 +132,14 @@ void Sampler::start_in_think_block(bool open) {
     answer_closer_now_ = false;
     think_tail_.clear();
     think_lead_.clear();
+    // loop-guard door: a fresh request starts with the door shut and no forced
+    // closer in flight; the counters are per request too (a new Sampler per
+    // request anyway, but this keeps a reused sampler honest).
+    loop_door_open_     = false;
+    loop_forced_closer_ = false;
+    loop_since_detect_  = 0;
+    loop_self_closes_   = 0;
+    loop_door_masked_   = 0;
     // The closer of a template-opened block: the first pair's close id, or the
     // first flattened close id. -1 keeps the text fallback.
     int cid = -1;
@@ -160,6 +168,12 @@ void Sampler::start_in_think_block(bool open) {
 void Sampler::observe_think_(std::string_view piece, int token) {
     if (!tracks_think()) return;
 
+    // loop-guard door: a closer that sample() forced for a slap is not the
+    // model's own draw, so it must not count as a self-close even though the
+    // door is open. Consumed with the token it belongs to.
+    const bool forced_closer = loop_forced_closer_;
+    loop_forced_closer_      = false;
+
     // loop-guard: feed the detector from the same piece stream the tracker
     // sees. Reasoning is watched while the block is open; the answer phase is
     // watched only after a slap (the abort rung), never otherwise.
@@ -180,6 +194,7 @@ void Sampler::observe_think_(std::string_view piece, int token) {
     // The closer id: the block that is open closes only on it. A spelled-out
     // closer is ordinary tokens and cannot get here.
     if (think_state_ == ThinkState::thinking && think_close_id_ >= 0 && token == think_close_id_) {
+        if (loop_door_open_ && !forced_closer) ++loop_self_closes_;
         think_state_ = ThinkState::content;
         think_tail_.clear();
         think_lead_.clear();
@@ -279,6 +294,7 @@ void Sampler::observe_think_(std::string_view piece, int token) {
         if (think_tail_.find(t) != std::string::npos) {
             // Settled: content. Both windows are cleared, so neither the
             // stale lead nor a tail remnant can re-open the block later.
+            if (loop_door_open_ && !forced_closer) ++loop_self_closes_;
             think_state_ = ThinkState::content;
             think_tail_.clear();
             think_lead_.clear();
@@ -373,6 +389,10 @@ void Sampler::loop_line_ended_(const std::string& raw_line) {
     if (!thinking && !content) return;
 
     if (thinking && loop_nudged_ && !loop_slapped_) ++loop_since_nudge_;
+    // door: counted lines since the detection moment. Incremented while the
+    // door is already open, so the detection line itself is zero and K = 0
+    // nudges on that line.
+    if (thinking && loop_door_open_) ++loop_since_detect_;
     const bool exact_repeat = loop_seen_[line]++ > 0;
     bool       repeated     = exact_repeat;
     if (!exact_repeat && params_.loop_guard_match == LoopGuardMatch::Near) {
@@ -411,9 +431,16 @@ void Sampler::loop_line_ended_(const std::string& raw_line) {
                       repeats, loop_window_.size(), share, loop_seen_.size());
             loop_on_detect_(false);
         }
+        // The door rung: the model may close by its own draw, so the ladder
+        // nudges only when the loop persists past the door grace. The nudge is
+        // never repeated; the slap keeps its own grace after the nudge.
+        if (over && loop_guard_is_ladder(params_.loop_guard) && loop_door_open_ && !loop_nudged_
+            && loop_since_detect_ >= params_.loop_guard_door_grace) {
+            loop_do_nudge_();
+        }
         // The slap's grace keeps watching every over line, dips included: a
         // share at/above the threshold after K counted lines still slaps.
-        if (over && params_.loop_guard == LoopGuardMode::Ladder && loop_nudged_ && !loop_slapped_
+        if (over && loop_guard_is_ladder(params_.loop_guard) && loop_nudged_ && !loop_slapped_
             && loop_since_nudge_ >= params_.loop_guard_grace) {
             loop_do_slap_();
         }
@@ -430,9 +457,18 @@ void Sampler::loop_on_detect_(bool content_phase) {
     switch (params_.loop_guard) {
         case LoopGuardMode::Off:    return;
         case LoopGuardMode::Detect: return;   // counted and logged above
-        case LoopGuardMode::Nudge:
-        case LoopGuardMode::Ladder: loop_do_nudge_(); return;
+        case LoopGuardMode::Nudge:  loop_do_nudge_(); return;
         case LoopGuardMode::Slap:   loop_do_slap_(); return;
+        case LoopGuardMode::Door:
+            // the mask alone; no injection, no forced token
+            loop_door_open_ = true;
+            return;
+        case LoopGuardMode::Ladder:
+            // the door opens first; the nudge and slap follow by grace in
+            // loop_line_ended_ if the loop persists
+            loop_door_open_ = true;
+            return;
+        case LoopGuardMode::LadderNoDoor: loop_do_nudge_(); return;   // today's order
     }
 }
 
@@ -514,6 +550,57 @@ void Sampler::mask_illegal_while_thinking(float* logits, size_t vocab) const {
     if (!params_.ignore_eos) kill(params_.think_ids.eog);
     kill(params_.stop_token_ids);
     kill(params_.think_ids.open_ids);
+}
+
+// loop-guard door: while the door is open and the block is open, the tokens
+// whose piece is two or more newline characters and nothing else are not legal
+// next tokens. The single-newline token stays legal, so after a sentence the
+// model can take the one newline that the closer follows. The mask is applied
+// to the logits before the penalties and the draw, so it is exactly the row the
+// model draws from -- and the reply's forced-token/grammar paths see the same
+// row. `door_masked` counts a draw at which the mask was active and a masked id
+// sat in the row's top-k candidates before the mask removed it: whether the
+// model would otherwise have taken that token is not knowable.
+void Sampler::mask_door_while_thinking(float* logits, size_t vocab) {
+    if (!loop_door_open_ || think_state_ != ThinkState::thinking) return;
+    if (params_.loop_guard_door_ids.empty() || vocab == 0) return;
+
+    const EffectiveRow row = effective_row();
+    // The top-k the draw will consider. Greedy takes one, so "would likely have
+    // taken" means the argmax there.
+    const size_t k = (row.temperature <= 0.0f || row.top_k == 1)
+                         ? 1
+                         : row.top_k > 0
+                               ? std::min(static_cast<size_t>(row.top_k), vocab)
+                               : std::min(kCandidateProbe, vocab);
+    // The kth-largest finite logit, as a min-heap of the k best: one pass over
+    // the vocabulary, no sort. Fewer than k finite logits means every finite
+    // one is inside the top-k.
+    std::vector<float> best;
+    best.reserve(k);
+    const auto by_logit = [](float a, float b) { return a > b; };
+    for (size_t i = 0; i < vocab; ++i) {
+        const float l = logits[i];
+        if (!std::isfinite(l)) continue;
+        if (best.size() < k) {
+            best.push_back(l);
+            if (best.size() == k) std::make_heap(best.begin(), best.end(), by_logit);
+        } else if (l > best.front()) {
+            std::pop_heap(best.begin(), best.end(), by_logit);
+            best.back() = l;
+            std::push_heap(best.begin(), best.end(), by_logit);
+        }
+    }
+    const float floor = best.size() < k ? -INFINITY : best.front();
+
+    bool masked_in_topk = false;
+    for (int id : params_.loop_guard_door_ids) {
+        if (id < 0 || static_cast<size_t>(id) >= vocab) continue;
+        const float l = logits[static_cast<size_t>(id)];
+        if (std::isfinite(l) && l >= floor) masked_in_topk = true;
+        logits[static_cast<size_t>(id)] = -INFINITY;
+    }
+    if (masked_in_topk) ++loop_door_masked_;
 }
 
 int Sampler::argmax(const float* logits, size_t vocab) {
@@ -611,7 +698,10 @@ int Sampler::sample(float* logits, size_t vocab) {
             loop_slap_pending_ = false;
             int closer = think_close_id_ >= 0 ? think_close_id_
                          : (!params_.think_ids.close_ids.empty() ? params_.think_ids.close_ids.front() : -1);
-            if (closer >= 0 && static_cast<size_t>(closer) < vocab) return closer;
+            if (closer >= 0 && static_cast<size_t>(closer) < vocab) {
+                loop_forced_closer_ = true;   // not the model's own draw
+                return closer;
+            }
             if (!loop_closer_warned_) {
                 loop_closer_warned_ = true;
                 log::warn("loop-guard", "the slap has no closer id in this vocabulary; the block cannot be forced shut");
@@ -620,6 +710,10 @@ int Sampler::sample(float* logits, size_t vocab) {
     }
 
     mask_illegal_while_thinking(logits, vocab);
+    // loop-guard door: before the penalties and the draw, as the think mask
+    // works. Inside sample(), so the verify walk sees it like any other mask: a
+    // draft the door forbids is a mismatch and drops the rest of the drafts.
+    mask_door_while_thinking(logits, vocab);
     apply_penalties(logits, vocab);
 
     const int tok = draw(logits, vocab);
