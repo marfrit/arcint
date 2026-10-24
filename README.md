@@ -80,6 +80,10 @@ the RAM for its bank (DESIGN §7.2).
 
 ## Current numbers
 
+1.2.2 (2026-10-23, `measured-here`, the build of this release): coder, agent and
+Flash-Next equal to 1.2.1 in the same-window A/B; the acceptance task 5/5 at
+10/10 greedy on the coder and the agent; the two new guards are off by default.
+
 1.2.1 (2026-10-20, `measured-here`, the pre-tag package, the B60): Flash-Next
 IQ3_XXS decodes 38.1 t/s on six answers (1.2.0: 33.9), prefill 622 t/s at
 20k, KL 0.217 against Q8_0, the answers right; the other services as below.
