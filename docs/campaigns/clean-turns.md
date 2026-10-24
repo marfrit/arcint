@@ -1,6 +1,6 @@
 # clean-turns — fewer unwanted stops and clean tool calls in agent sessions
 
-**Open.** Mission (operator Markus, 2026-10-20): the CSV acceptance task is
+**Open.** Mission (operator, 2026-10-20): the CSV acceptance task is
 only a concentration indicator here; the goal is agent sessions that do not
 stop empty and whose tool calls arrive parseable. Per change: the CSV sanity
 glance (T=0 ×3 plus 5 sampled at 0.7 on the served unit) and one decode t/s
