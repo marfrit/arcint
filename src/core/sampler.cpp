@@ -296,14 +296,25 @@ void Sampler::observe_think_(std::string_view piece, int token) {
 // window, when smaller) are in hand, so two identical lines at the start of a
 // turn cannot pass for a loop. Everything is incremental: appending a piece
 // and testing the newline is the only per-token work.
+// The longest open reasoning line the detector keeps (bytes).
+constexpr size_t kLoopLineCap = 4096;
+
 void Sampler::loop_observe_(std::string_view piece) {
+    // Only the appended bytes can hold a new line end: the open line before
+    // them has none, so the search starts where they do.
+    size_t from = loop_line_.size();
     loop_line_.append(piece);
     size_t nl = 0;
-    while ((nl = loop_line_.find('\n')) != std::string::npos) {
+    while ((nl = loop_line_.find('\n', from)) != std::string::npos) {
         const std::string line = loop_line_.substr(0, nl);
         loop_line_.erase(0, nl + 1);
         loop_line_ended_(line);
+        from = 0;
     }
+    // An open line is judged by its head: past the cap (a line of code or data
+    // that long is not a reasoning loop's line) its bytes are dropped, so a
+    // newline-free stretch costs the piece's length, not the line's.
+    if (loop_line_.size() > kLoopLineCap) loop_line_.resize(kLoopLineCap);
 }
 
 // The near rule's 3-grams, hashed with FNV-1a and kept sorted/deduped so the

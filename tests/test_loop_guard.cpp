@@ -534,3 +534,113 @@ TEST(loop_guard_nudge_tail_does_not_prefix_the_next_line) {
     feed_text(s, loop_line(57));              // the 40th
     CHECK_EQ(s.loop_guard_counts().slaps, 1);
 }
+
+// A forced token in the middle of a speculative span. The walk draws row by
+// row; the slap's closer differs from the draft at that row, so the walk
+// emits it and stops there: the drafts behind it are never accepted.
+TEST(loop_guard_slap_breaks_the_verify_walk_at_its_row) {
+    SamplerParams p = base_params(LoopGuardMode::Slap, 10, 2);
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detected; slap mode waits the grace
+    feed_lines(s, 18, 20, true);  // grace 2: the slap is pending
+
+    const size_t       vocab = 8;
+    std::vector<float> rows;
+    for (int r = 0; r < 3; ++r) {
+        const std::vector<float> row = row_with_argmax(2, vocab);
+        rows.insert(rows.end(), row.begin(), row.end());
+    }
+    std::vector<int> out;
+    const VerifyWalk w = walk_verify(
+        rows.data(), 3, vocab, {2, 2}, s, 100, [](int) { return false; },
+        [&](int t) {
+            out.push_back(t);
+            return Control::Continue;
+        });
+    CHECK_EQ(w.emitted, 1);
+    CHECK_EQ(w.accepted, 0);
+    CHECK_EQ(w.last, 5);
+    CHECK_EQ(out, std::vector<int>({5}));
+    CHECK_EQ(s.loop_guard_counts().slaps, 1);
+}
+
+// The nudge over a span: a forced id that equals the draft at its row is
+// accepted as that draft, the next forced id that does not ends the walk.
+TEST(loop_guard_nudge_inside_the_verify_walk_keeps_only_the_matching_prefix) {
+    SamplerParams p = base_params(LoopGuardMode::Nudge, 10, 5);
+    for (size_t i = 0; i < kPiece.size(); ++i) p.loop_guard_nudge_ids.push_back(kPieceFirst + static_cast<int>(i));
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);
+    CHECK_EQ(s.loop_guard_counts().nudges, 1);
+
+    const size_t       vocab = 200;
+    std::vector<float> rows;
+    for (int r = 0; r < 3; ++r) {
+        const std::vector<float> row = row_with_argmax(2, vocab);
+        rows.insert(rows.end(), row.begin(), row.end());
+    }
+    std::vector<int> out;
+    const VerifyWalk w = walk_verify(
+        rows.data(), 3, vocab, {kPieceFirst, 7}, s, 100, [](int) { return false; },
+        [&](int t) {
+            out.push_back(t);
+            return Control::Continue;
+        });
+    CHECK_EQ(w.accepted, 1);
+    CHECK_EQ(w.emitted, 2);
+    CHECK_EQ(out, std::vector<int>({kPieceFirst, kPieceFirst + 1}));
+}
+
+// A newline-free stretch longer than the open-line cap: the detector keeps
+// judging the lines that follow, and still trips on a loop at the expected
+// line.
+TEST(loop_guard_long_open_line_does_not_disturb_the_detector) {
+    SamplerParams p = base_params(LoopGuardMode::Detect);
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    const std::string chunk(1000, 'x');
+    for (int i = 0; i < 50; ++i) feed_text(s, chunk);   // 50,000 bytes, one open line
+    feed_text(s, "\n");                                  // ends it: one distinct line
+    feed_lines(s, 1, 9, false);
+    for (int i = 9; i < 17; ++i) feed_text(s, loop_line(i));
+    CHECK_EQ(s.loop_guard_counts().detections, 0);
+    feed_text(s, loop_line(17));
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+}
+
+// Lines that arrive one byte a piece, as a byte-level tokenizer hands out a
+// torn code point: the open line grows over many pieces and is judged whole
+// once its newline comes, so the detector trips where it does for whole lines.
+TEST(loop_guard_lines_fed_a_byte_at_a_time_are_judged_whole) {
+    SamplerParams p = base_params(LoopGuardMode::Detect);
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    feed_lines(s, 0, 9, false);
+    auto bytewise = [&](const std::string& line) {
+        for (char c : line) feed_text(s, std::string(1, c));
+    };
+    for (int i = 9; i < 17; ++i) bytewise(loop_line(i));
+    CHECK_EQ(s.loop_guard_counts().detections, 0);
+    bytewise(loop_line(17));
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+}
+
+// One piece that ends an open line and carries a whole short line after it:
+// both line ends are seen, so the second line counts on its own.
+TEST(loop_guard_a_piece_with_two_line_ends_counts_both_lines) {
+    SamplerParams p = base_params(LoopGuardMode::Detect);
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    const std::string r = "same check again, once more\n";   // 27 characters: counted
+    feed_lines(s, 0, 8, false);
+    feed_text(s, "an open distinct line of forty characters");   // no newline yet
+    feed_text(s, "\n" + r);                                       // ends it, then r whole
+    for (int i = 0; i < 7; ++i) feed_text(s, r);
+    CHECK_EQ(s.loop_guard_counts().detections, 0);
+    feed_text(s, r);   // the 8th repeat of r: 8 of 10
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+}

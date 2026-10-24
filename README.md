@@ -82,8 +82,12 @@ detected, once per crossing, with hysteresis at 0.7. Then, rung by rung:
 - **abort**: if the answer itself loops after a slap, the turn ends with
   `finish_reason` `loop`.
 
-With speculative decoding a forced token ends the verify walk at its position
-and the drafts behind it are dropped. The response carries a `loop_guard`
+The request field switches the guard for that request even where the
+operator left the flag off, as `think_eog_mask` and `tool_grammar` do, so a
+client can opt in. The nudge's tokens count as generated ones, so a presence
+or repetition penalty treats them as the model's own words for the rest of
+the turn. With speculative decoding a forced token ends the verify walk at
+its position and the drafts behind it are dropped. The response carries a `loop_guard`
 object (detections, nudges, slaps, aborts) when the ladder moved, and the
 decode line in the log counts the same.
 
