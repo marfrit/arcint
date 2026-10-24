@@ -162,6 +162,11 @@ the RAM for its bank (DESIGN §7.2).
 
 ## Current numbers
 
+1.2.3 (2026-10-24, `measured-here`, the pre-tag package): coder and agent
+equal to 1.2.2 in the same-window A/B with the switches off; the coder with
+its 1.2.3 flags (loop guard, non-thinking row) 5/5 at 10/10 greedy and 30/30
+at 10/10 at temperature 0.7.
+
 1.2.2 (2026-10-23, `measured-here`, the build of this release): coder, agent and
 Flash-Next equal to 1.2.1 in the same-window A/B; the acceptance task 5/5 at
 10/10 greedy on the coder and the agent; the two new guards are off by default.
