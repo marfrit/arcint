@@ -507,3 +507,30 @@ TEST(loop_guard_flags_parse_and_travel) {
         CHECK(!parse_args(static_cast<int>(bav.size()), bav.data(), c).ok);
     }
 }
+
+// The nudge sentence is not reasoning the detector holds: its last piece
+// must not prefix the model's next line. A 20-character line after the nudge
+// stays below the counting bar (lines longer than 20 count); with the
+// sentence's tail glued on it would count, and the 40th counted line would
+// arrive one line early.
+TEST(loop_guard_nudge_tail_does_not_prefix_the_next_line) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 40);
+    for (size_t i = 0; i < kPiece.size(); ++i) p.loop_guard_nudge_ids.push_back(kPieceFirst + static_cast<int>(i));
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);
+    CHECK_EQ(s.loop_guard_counts().nudges, 1);
+    for (size_t i = 0; i < kPiece.size(); ++i) {
+        std::vector<float> l = row_with_argmax(2);
+        const int id = s.sample(l.data(), l.size());
+        s.observe_think(id, piece_of(id));
+    }
+
+    feed_text(s, "abcdefghij klmnopqrs\n");   // 20 characters: not counted
+    feed_lines(s, 18, 57, true);              // 39 counted lines
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+    feed_text(s, loop_line(57));              // the 40th
+    CHECK_EQ(s.loop_guard_counts().slaps, 1);
+}

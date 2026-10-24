@@ -166,14 +166,15 @@ void Sampler::observe_think_(std::string_view piece, int token) {
     if (params_.loop_guard != LoopGuardMode::Off) {
         // The last nudge id's piece is observed after sample() returned it; the
         // sentence is not reasoning the detector should hold, so the buffer is
-        // dropped before that piece lands (the sample() side only marks it).
-        if (loop_nudge_flush_) {
-            loop_nudge_flush_ = false;
-            loop_line_.clear();
-        }
+        // dropped once that piece has landed (the sample() side only marks it):
+        // cleared before it, the sentence's tail would prefix the model's next
+        // line.
+        const bool nudge_done = loop_nudge_flush_;
+        loop_nudge_flush_ = false;
         if (think_state_ == ThinkState::thinking
             || (think_state_ == ThinkState::content && loop_slapped_))
             loop_observe_(piece);
+        if (nudge_done) loop_line_.clear();
     }
 
     // The closer id: the block that is open closes only on it. A spelled-out
