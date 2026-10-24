@@ -185,3 +185,17 @@ TEST(stop_with_a_leading_newline_keeps_the_opener_id) {
     CHECK_EQ(trimmed(s.reasoning), std::string("Hmm"));
     CHECK_EQ(trimmed(s.content), std::string("Hi"));
 }
+
+// No block at all (the template did not open one, the model did not either):
+// the content is the reply as generated, line breaks included, on both paths
+// and as the text split gives it.
+TEST(no_block_keeps_the_content_as_generated) {
+    IdScriptBackend backend({{"\n", 14}, {"\n", 14}, {"Hello", 16}, {"\n", 14}, {"User", 17}, {":", 18}});
+    const Answer n = non_streamed(backend, prepared(false, {"\nUser:"}));
+    CHECK(!n.closed);
+    CHECK_EQ(n.reasoning, std::string(""));
+    CHECK_EQ(n.content, std::string("\n\nHello"));
+    const Answer s = streamed(backend, prepared(false, {"\nUser:"}));
+    CHECK_EQ(s.content, std::string("\n\nHello"));
+    CHECK_EQ(lgc::split_reasoning("\n\nHello", false, false).content, n.content);
+}

@@ -52,7 +52,9 @@ artifact whose tags are single special tokens.
   the dev build that ran this content in production, not a package. A line
   break ahead of a self-opened block keeps the split undecided, as the mask
   is, and the non-streaming split drops the line breaks around the tags as the
-  text split does.
+  text split does. Residual (`code`, untested): a stop string that begins with
+  the tail of a tag's text splits that tag's piece, and a split piece carries
+  no id, so such a block stays open.
 - **The reasoning stream holds back a torn UTF-8 code point**, as the content
   path already did, so no reasoning delta is invalid UTF-8 (DESIGN §3.7).
 - **`reasoning_closed` on the stream:** the chunk that carries `finish_reason`

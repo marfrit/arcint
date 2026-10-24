@@ -132,3 +132,18 @@ TEST(stop_segments_before_a_hit_keep_their_ids) {
     CHECK_EQ(c.segments.size(), size_t{1});
     CHECK_EQ(c.segments[0].id, -1);
 }
+
+// A hit that cuts inside a piece held from an earlier step: the part before
+// the cut goes out without an id, and nothing stays held.
+TEST(stop_segments_hit_inside_a_held_piece) {
+    StopMatcher m({"abSTOP"});
+    auto a = m.push("xab", 4);   // "ab" held, "x" released without the id
+    CHECK_EQ(a.segments.size(), size_t{1});
+    CHECK_EQ(a.segments[0].text, std::string("x"));
+    CHECK_EQ(a.segments[0].id, -1);
+    auto b = m.push("STOP", 5);
+    CHECK(b.hit);
+    CHECK_EQ(b.emit, std::string(""));
+    CHECK_EQ(b.segments.size(), size_t{0});
+    CHECK_EQ(m.flush_segments().size(), size_t{0});
+}

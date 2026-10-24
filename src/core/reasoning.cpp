@@ -113,8 +113,10 @@ ReasoningSplit split_reasoning_tokens(const std::vector<std::pair<std::string, i
     // The text split's edges: the line breaks around the tags are layout, not
     // reasoning or answer. The streamer cannot drop them (they arrive as their
     // own pieces after the step that closed the block); the whole text can.
+    // A reply with no block keeps its content as generated, as the text split
+    // does.
     out.reasoning = std::string(strip_edge_newlines(out.reasoning));
-    out.content   = std::string(strip_leading_newlines(out.content));
+    if (out.closed) out.content = std::string(strip_leading_newlines(out.content));
     return out;
 }
 
