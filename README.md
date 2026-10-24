@@ -56,6 +56,81 @@ OpenVINO runtime. It was retired in 0.8.0; its design and record are at the
 tag [`openvino-history`](https://github.com/marfrit/arcint/tree/openvino-history)
 ([docs/history.md](docs/history.md)).
 
+## New: loop guard for small models
+
+Small and mixture-of-experts coder models sometimes think themselves into a
+loop: the same line, or the same check with one number changed, comes back
+inside the think block until the token cap, and the turn ends without an
+answer. 1.2.3 adds a loop guard, **off by default** (`--loop-guard
+off|detect|nudge|slap|ladder`, the request field `loop_guard`; `/props`
+reports it under `sampler_defaults.loop_guard`).
+
+**The ladder.** The detector reads only the reasoning, one line at a time (a
+line ends at a newline; it is stripped, and only lines longer than 20
+characters count). Over the newest 200 such lines (`--loop-guard-window`) it
+keeps the share of lines that repeat an earlier one, either word for word or
+nearly: a character-3-gram Jaccard of at least 0.8 against one of the last 400
+distinct lines (`--loop-guard-match near`, the default; `exact` counts
+identical lines only). At a share of 0.8 (`--loop-guard-threshold`) the loop is
+detected, once per crossing, with hysteresis at 0.7. Then, rung by rung:
+- **nudge**: one fixed sentence ("I am repeating myself. I will decide now
+  and write the final answer.") goes into the reasoning as if the model had
+  written it, once;
+- **slap**: if 40 more counted lines (`--loop-guard-grace`) still loop, the
+  think block's closer is forced as the next token, by its token id, and the
+  model answers;
+- **abort**: if the answer itself loops after a slap, the turn ends with
+  `finish_reason` `loop`.
+
+With speculative decoding a forced token ends the verify walk at its position
+and the drafts behind it are dropped. The response carries a `loop_guard`
+object (detections, nudges, slaps, aborts) when the ladder moved, and the
+decode line in the log counts the same.
+
+**How it was tested** (`measured-here`, October 2026). The coder (Qwen3.6-27B-A3B,
+the A770) was given 30 competitive-programming tasks published after its
+training cutoff, AtCoder Beginner Contest 475 to 480, problems A to E. Each
+answer was compiled and judged in a sandbox without network against an
+independent reference solution plus brute-force and generated tests. The
+coder ran at its model card's thinking settings with a 64k-token cap. First a
+screening without the guard, then the guard on the tasks that hit the cap,
+then the guard on the tasks that did not (the false-positive run). The line
+rule was chosen offline beforehand, over 42 recorded reasoning texts: exact
+matching missed a loop that counts upward in words, and masking the numbers
+instead put a clean enumeration over the threshold, so near matching it is.
+
+- **Screening:** 19 tasks fully correct, 2 answered partly wrong, 9 ended at
+  the cap without an answer: 8 of them in a loop, 1 in long but genuine
+  thinking. Loops hit easy tasks as well as hard ones.
+- **The guard on the 9 cap runs:** all 9 end fully correct. 4 loops closed
+  after the nudge alone, 4 needed the slap, and 1 task did not loop on that
+  run.
+- **The false-positive run:** 17 of the 21 other tasks were run, 16 fully
+  correct. The one wrong answer had no guard event (the coder varies from run
+  to run; it was correct in the screening). The guard caught one real loop
+  there and the nudge fixed it. An earlier build triggered twice on code
+  drafts written out several times (short indented lines passed the length
+  bar unstripped); stripping the lines first fixed both.
+
+**What it does not heal.** The guard ends loops; it does not make a wrong
+algorithm right. An answer given after a full reasoning is set by that
+reasoning: re-sampling only the answers of the two partly wrong tasks (ten
+seeds in each of three sampling rows) gave one of them right 30 of 30 times,
+its reasoning was right and the screening's miss was bad luck in the answer,
+and the other wrong 30 of 30 times in the same way, because the algorithm in
+its reasoning was wrong. Of the two kinds of loop, "done but cannot stop" (the model has decided
+and keeps confirming it) and "stuck" (one sub-question asked again and
+again), the stuck kind gets an answer only because the close is forced. And
+it is a small-model tool: the dense Qwen3.8-27B agent did not loop on any of
+the 11 tasks the coder failed, and answered all 11 correctly.
+
+One observation from the probes: in a done-but-cannot-stop loop the model
+would close the think block with near certainty after a single newline, but
+keeps choosing a double newline instead, and the loop goes on; in a stuck loop
+it never comes close to closing. Prior art: vLLM's ThinkingLoopBreaker
+(token-cycle detection, then the reasoning end forced) is an open pull
+request; llama.cpp's issue for a line-based detector went stale.
+
 ## Models
 
 | service | model | served file | card | context |

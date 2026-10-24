@@ -1,6 +1,6 @@
 # loop-guard — detect a reasoning loop, escalate, end the turn cleanly
 
-**Open (2026-10-24).** A coder model can circle inside its think block until
+**Shipping in 1.2.3 (2026-10-24).** A coder model can circle inside its think block until
 the token cap: no answer, a wasted round. The operator approved an escalation
 ladder **detect → nudge → slap → abort**, behind a switch that is off by
 default.
@@ -76,7 +76,22 @@ and near catches, the near false-positive guard, and the detection hysteresis. T
 speculative lane is handled at the token boundary the verify walk samples:
 a forced token that differs from the draft breaks the walk on the mismatch, so
 the remaining drafts in flight are dropped and only the emitted prefix is
-accepted. No card measurement yet.
+accepted.
+
+Card battery (`measured-here`, 2026-10-23/24, the coder on the A770, its
+card's thinking row, seed 1, 64k cap, `ladder`; 30 post-cutoff
+competitive-programming tasks, judged in a network-less sandbox against a
+reference and generated tests). Screening without the guard: 19 fully
+correct, 2 partly wrong, 9 at the cap (8 loops, 1 long thinking). Round 1,
+exact match: 6 of 7 live loops fixed, all fully correct; the counting loop
+stayed at an exact share of 0.50. Round 2, near match: 9 of 9 cap runs fully
+correct (4 by the nudge, 4 by the slap, 1 did not loop), one detection per
+loop. False-positive run on the other 21 tasks: 17 run before the window
+closed, 16 fully correct, 1 wrong with no guard event (run-to-run variance);
+on the near build without stripping, two triggers on code drafts written out
+several times (indented short lines passed the 20-character bar), silent with
+stripped lines; one real loop there caught and fixed by the nudge. Four tasks
+of the false-positive run are owed before the release.
 
 ## Where it lives
 

@@ -18,6 +18,50 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.2.3 — 2026-10-24
+
+A loop guard for small models and two sampling rows by phase, all behind
+switches that are **off by default**; with none set, a request is served as
+in 1.2.2. The coder unit turns on the loop guard and the non-thinking row
+(operator, 2026-10-24).
+
+- **Loop guard** — `--loop-guard off|detect|nudge|slap|ladder` (request
+  field `loop_guard`; `/props` `sampler_defaults.loop_guard`). A detector on
+  the reasoning's lines (stripped, longer than 20 characters) keeps the share
+  of repeated lines over the newest `--loop-guard-window` 200; a line repeats
+  when it equals an earlier one or, under `--loop-guard-match near` (the
+  default; `exact` the alternative), has a character-3-gram Jaccard of at
+  least 0.8 with one of the last 400 distinct lines. At
+  `--loop-guard-threshold` 0.8 (hysteresis 0.7) the ladder climbs: a fixed
+  sentence is injected into the reasoning once (nudge); after
+  `--loop-guard-grace` 40 more looping lines the think block's closer is
+  forced by token id (slap); a looping answer after the slap ends the turn
+  with `finish_reason` `loop` (abort). A forced token ends a speculative
+  verify walk at its position. The response's `loop_guard` object and the
+  decode line count detections, nudges, slaps and aborts. The test and what
+  it does not heal: README, "New: loop guard for small models".
+- **Non-thinking row** — `--nothink-temp`, `--nothink-top-p`,
+  `--nothink-top-k`, `--nothink-min-p`, `--nothink-presence-penalty`: a
+  request that resolves to thinking off starts from this row instead of the
+  thinking row; the request's own fields still win; `/props` reports it.
+  On the coder the card's non-thinking row (0.7 / 0.8 / 20, presence 0 as
+  measured) lifted the sampled acceptance task from a mean of 9.056 (7 of 90
+  runs at 0/10) to 9.922 (none of 90 at 0), the shortfall 1.2.2's release
+  check named.
+- **Answer row** — `--answer-temp`, `--answer-top-p`, `--answer-top-k`,
+  `--answer-min-p`, `--answer-presence-penalty`,
+  `--answer-frequency-penalty`: in a thinking turn, the sampler switches to
+  this row once the think block closes (the presence and frequency penalties
+  count the answer only). Measured without effect on the coder after a full
+  reasoning (the answer follows the reasoning); shipped as a switch, not set
+  on any unit.
+- The loop guard's nudge no longer leaves its last piece at the start of the
+  next reasoning line the detector judges.
+
+**Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (60
+patches), unchanged from 1.2.2; dependencies unchanged. `arcint-stt` (1.2.0)
+and `arcint-imggen` (1.1.1) are unchanged.
+
 ## 1.2.2 — 2026-10-24
 
 Agent turns gain two opt-in guards: an open think block no longer offers the
