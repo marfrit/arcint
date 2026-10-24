@@ -84,6 +84,12 @@ pass with byte-identical texts, Flash-Next passes in four rounds (33.38 ->
 sampled bar at 0.7 (mean 9.056 over 90 runs, upper bound 9.62) fails on the
 unit's thinking-row sampling for thinking-off requests, not on 1.2.2's code
 (the instruct row: 9.900 over 30); the fix is a later release's.
+The stop-string fix (`measured-here`, 2026-10-24): the device-free suite 239
+cases and `ctest -L unit` 6/6, eight one-line mutations of it each red, the
+pre-tag package build green; on the coder (A770, T=0) a request with a stop
+string beginning with a line break gave an empty answer with the block open
+on the dev build that ran this content, and closes the block and answers on
+the fixed build, streaming and non-streaming, as without the stop.
 
 ## 1.2.1 — 2026-10-20
 
@@ -117,6 +123,13 @@ A byte tripwire, reported: three of IQ3_XXS's eight answers change wording,
 and the forced-old-path control also differs from the base build, so the
 difference is not only the new rows; not explained; the answers and the KL
 are right.
+
+**Published** (2026-10-20, recorded with 1.2.2): `arcint` 1.2.1-1 built by
+its recipe from the v1.2.1 tag tarball (sha256 `a3779bd9…`) and published to
+the trixie repository (index verified); installed from the pool on the card
+host, the agent and the coder restarted on it. Not run: a fresh-container
+install (the Depends and the recipe were unchanged from 1.2.0). `arcint-stt`
+stayed at 1.2.0-1, `arcint-imggen` at 1.1.1-1.
 
 ## 1.2.0 — 2026-10-19
 
