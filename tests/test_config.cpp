@@ -949,3 +949,35 @@ TEST(config_tts_gen_device_gpu_or_cpu) {
     const std::string help = usage_text();
     CHECK(help.find("--tts-gen-device") != std::string::npos);
 }
+
+TEST(config_think_eog_mask_defaults_off_and_turns_on) {
+    // Off is today's behaviour; the operator turns it on by name.
+    Config cfg;
+    CHECK(run({"--stub"}, cfg).ok);
+    CHECK(!cfg.think_eog_mask);
+    Config on;
+    CHECK(run({"--stub", "--think-eog-mask"}, on).ok);
+    CHECK(on.think_eog_mask);
+}
+
+TEST(config_think_eog_mask_marks_the_defaults_operator) {
+    Config cfg;
+    CHECK(run({"--stub", "--think-eog-mask"}, cfg).ok);
+    SamplerDefaults d;
+    CHECK(!apply_operator_defaults(cfg, d).has_value());
+    CHECK(d.think_eog_mask);
+    CHECK(d.provenance == "operator");
+}
+
+TEST(config_tool_grammar_defaults_off_and_marks_the_defaults_operator) {
+    Config cfg;
+    CHECK(run({"--stub"}, cfg).ok);
+    CHECK(!cfg.tool_grammar);
+    Config on;
+    CHECK(run({"--stub", "--tool-grammar"}, on).ok);
+    CHECK(on.tool_grammar);
+    SamplerDefaults d;
+    CHECK(!apply_operator_defaults(on, d).has_value());
+    CHECK(d.tool_grammar);
+    CHECK(d.provenance == "operator");
+}

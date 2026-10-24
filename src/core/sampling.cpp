@@ -6,7 +6,8 @@ namespace lgc {
 
 bool SamplerOverrides::any() const {
     return temperature || top_p || top_k || min_p || repetition_penalty || presence_penalty ||
-           frequency_penalty || seed || max_tokens || ignore_eos || stop || stop_token_ids;
+           frequency_penalty || seed || max_tokens || ignore_eos || stop || stop_token_ids ||
+           think_eog_mask || tool_grammar;
 }
 
 SamplerParams sampler_from_defaults(const SamplerDefaults& d) {
@@ -17,6 +18,8 @@ SamplerParams sampler_from_defaults(const SamplerDefaults& d) {
     p.min_p              = d.min_p;
     p.repetition_penalty = d.repetition_penalty;
     p.presence_penalty   = d.presence_penalty;
+    p.think_eog_mask     = d.think_eog_mask;
+    p.tool_grammar       = d.tool_grammar;
     return p;
 }
 
@@ -70,6 +73,12 @@ std::optional<std::string> sampler_apply(SamplerParams& p, const SamplerOverride
     if (o.ignore_eos)         p.ignore_eos         = *o.ignore_eos;
     if (o.stop)               p.stop               = *o.stop;
     if (o.stop_token_ids)     p.stop_token_ids     = *o.stop_token_ids;
+    // Symmetric, like every other field: a request that names it gets what it
+    // names. A client that sends nothing gets the operator's setting, and that
+    // is where the fix reaches the real agent sessions — they send nothing.
+    // Making the operator's on un-vetoable would be a silent override (§3.6).
+    if (o.think_eog_mask) p.think_eog_mask = *o.think_eog_mask;
+    if (o.tool_grammar)   p.tool_grammar   = *o.tool_grammar;
     if (o.seed) {
         p.seed   = *o.seed;
         p.seeded = true;
@@ -87,7 +96,10 @@ std::optional<std::string> sampler_defaults_apply(SamplerDefaults& d, const Samp
     if (o.min_p)              d.min_p              = *o.min_p;
     if (o.repetition_penalty) d.repetition_penalty = *o.repetition_penalty;
     if (o.presence_penalty)   d.presence_penalty   = *o.presence_penalty;
-    if (o.temperature || o.top_p || o.top_k || o.min_p || o.repetition_penalty || o.presence_penalty) {
+    if (o.think_eog_mask)     d.think_eog_mask     = *o.think_eog_mask;
+    if (o.tool_grammar)       d.tool_grammar       = *o.tool_grammar;
+    if (o.temperature || o.top_p || o.top_k || o.min_p || o.repetition_penalty || o.presence_penalty ||
+        o.think_eog_mask || o.tool_grammar) {
         d.provenance = "operator";
     }
     return std::nullopt;

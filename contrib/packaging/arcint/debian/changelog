@@ -1,3 +1,15 @@
+arcint (1.2.2-1) trixie; urgency=medium
+
+  * 1.2.2: two opt-in guards for agent turns, both off by default:
+    --think-eog-mask (an open think block no longer offers the tokens that
+    end the turn) and --tool-grammar (a tool call constrained to the
+    declared schemas by a GBNF); the think block decided by the closer's
+    token id; the reasoning stream holds back a torn UTF-8 code point;
+    reasoning_closed on the stream's final chunk. Runtime and dependencies
+    unchanged (llama.cpp 3e4dfa8, 60 patches).
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 24 Oct 2026 12:00:00 +0200
+
 arcint (1.2.1-1) trixie; urgency=medium
 
   * 1.2.1: patch 0063, the expert cache's CPU miss path with Strata's

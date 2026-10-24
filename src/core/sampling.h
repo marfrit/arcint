@@ -19,11 +19,54 @@ struct SamplerDefaults {
     float repetition_penalty = 1.05f;
     float presence_penalty   = 0.0f;
 
+    // clean-turns: the operator's switch for the think-block mask. Off keeps
+    // today's behaviour; the artifact cannot decide it, so it is not read from
+    // the GGUF.
+    bool think_eog_mask = false;
+
+    // clean-turns step 2: the operator's switch for the tool-call grammar.
+    // Off keeps today's behaviour; on, a request that declared tools is
+    // constrained to a well-formed call. A no-op when no tools are declared.
+    bool tool_grammar = false;
+
     // "provisional" -- the Qwen3-family card values, carried because no
     //                  GGUF key is read yet; /props reports this so nobody
     //                  mistakes an inherited default for a measured one.
     // "operator"    -- at least one --temp/--top-p/... flag set it.
     std::string provenance = "provisional";
+};
+
+// What spells the think block, for the mask below. The ids come from the
+// vocabulary; the tag strings come from think_tag_pairs() in reasoning.h,
+// which is the only place they are written out anywhere in this tree.
+struct ThinkBlockIds {
+    // One entry per tag pair, aligned with open_tags/close_tags below:
+    // {open_id, close_id}, each -1 when that tag is not one single special
+    // token in the vocabulary. The state machine needs the PAIRING (a block
+    // opened by one pair's opener is closed by that pair's closer); the
+    // flattened open_ids/close_ids the mask reads carry the same ids as sets.
+    std::vector<std::pair<int, int>> open_close_ids;
+    std::vector<int> eog;        // the vocabulary's end-of-generation ids: the
+                                 // block is not a place to end a turn. Together
+                                 // with the request's own stop ids (SamplerParams::
+                                 // stop_token_ids, same field the decode loop's
+                                 // stop check reads) this is the set the mask
+                                 // holds back while the block is open
+    std::vector<int> open_ids;   // the block's opening marker id: a second one
+                                 // while the block is open is the same defect
+                                 // one step later
+    std::vector<int> close_ids;  // the block's closer id, when the vocabulary
+                                 // spells it as one added token: the mask must
+                                 // never kill it (emitting it is what lets the
+                                 // block close), so the mask's guard leaves it
+                                 // out of the masked set in every case
+    std::vector<std::string> close_tags;  // the closers, matched as TEXT: a
+                                          // model can spell them as ordinary
+                                          // text (measured on the coder
+                                          // artifact), so they cannot be
+                                          // assumed to be single ids
+    std::vector<std::string> open_tags;   // likewise the openers, for a model
+                                          // that opens the block itself
 };
 
 struct SamplerParams {
@@ -44,6 +87,18 @@ struct SamplerParams {
     std::vector<std::string> stop;
     std::vector<int>         stop_token_ids;
 
+    // clean-turns: while a think block is open, the end-of-turn token is not a
+    // legal next token. Off keeps today's behaviour exactly. See ThinkBlockIds.
+    bool think_eog_mask = false;
+    ThinkBlockIds think_ids;
+
+    // clean-turns step 2: constrain the tool-call form to the declared schemas
+    // with a GBNF grammar, so a call the model starts is one it finishes. Off
+    // keeps today's behaviour exactly; on, the backend builds the grammar from
+    // the request's ToolSchemas and drives it around the sampler. The grammar
+    // is a no-op when the request declared no tools.
+    bool tool_grammar = false;
+
     // top_k == 1 collapses the distribution just as temperature 0 does; both
     // must take the argmax path, or "greedy" means two different things.
     bool greedy() const { return temperature <= 0.0f || top_k == 1; }
@@ -62,6 +117,8 @@ struct SamplerOverrides {
     std::optional<bool>                     ignore_eos;
     std::optional<std::vector<std::string>> stop;
     std::optional<std::vector<int>>         stop_token_ids;
+    std::optional<bool>                     think_eog_mask;
+    std::optional<bool>                     tool_grammar;
 
     bool any() const;
 };

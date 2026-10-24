@@ -1,6 +1,6 @@
 # arcint — Design
 
-State as of 2026-10-20: arcint **1.2.1** on llama.cpp **`3e4dfa8`** with the
+State as of 2026-10-24: arcint **1.2.2** on llama.cpp **`3e4dfa8`** with the
 patch series `contrib/llama.cpp/patches` 0001-0063 (60 patches). One engine: libllama with
 ggml's OpenCL backend and arcint's Intel kernels. Three language services run
 in production on two Intel Arc cards: the dense Qwen3.8-27B agent and
@@ -678,7 +678,8 @@ t/s on its own request and prefills 620 t/s at the 20k needle
 (`measured-here`, 2026-10-14); arcint 43.8-44.0 and 690 on the same
 request and needle with the CPU misses (charter B3).
 
-**Quality**: Flash-Next's default IQ3_XXS has KL 0.218 nats and top-1
+**Quality**: Flash-Next's default since 2026-10-20, IQ3_S, has KL 0.127 nats and top-1 92.1 %
+against unsloth's Q8_0 as served (§7.2). The previous default IQ3_XXS has KL 0.218 nats and top-1
 89.7 % against unsloth's Q8_0 (16 x 512), IQ2_XS 0.294 / 87.1 %; both are
 outside the answer-level bar, a shortfall the operator accepted (A2,
 2026-10-15), and IQ3_XXS became the default for its accuracy the same day.
@@ -688,16 +689,19 @@ The other quants are options (§7.2). The dense agent's q8_0:q4_0 KV: KL 0.00565
 
 ### 7.2 Flash-Next quant options
 
-IQ3_XXS is the default (operator, 2026-10-15, for its accuracy; IQ2_XS was
-the shape until then); the others stay available as on-demand configurations
+IQ3_S is the default since 2026-10-20 (`decision`, operator, 2026-10-20: "IQ3_S
+is the new Qwen Flash-Next model", after his rule: the better quant if it
+reaches 20 t/s on 1.2.1); IQ3_XXS was, from 2026-10-15, for its accuracy, and
+IQ2_XS before; the others stay available as on-demand configurations
 on the same endpoint (`decision`, operator, 2026-10-15; `docs/llama-engine.md`,
 "Flash-Next quant options"):
 
 | GGUF | KL / top-1 against unsloth's Q8_0 on the CPU (16 x 512) | host bank | state |
 |---|---|---|---|
 | ISTA-DASLab IQ2_XS | 0.294 / 87.1 % | 20.32 GiB at 13,400 MiB of slots | the faster option, from the Flash-Next unit with its own `--gguf` and slot budget: 665.6 t/s at the 20k needle, 42.3 t/s |
-| ISTA-DASLab IQ3_XXS | 0.218 / 89.7 % (served) | 28.72 GiB at 12,000 MiB of slots | the default (`arcint-flashnext`): 595.1 t/s at the 20k needle, 34.5-35.6 t/s on the hash-table answer (0.8.0), 30.6-37.5 t/s on six answers with the CPU misses; their KL cost +0.0044 nats against the misses off on the served reference capture (8 x 512, ubatch 4: 0.2910 / 0.2866), a different window from this column's (`measured-here`, 2026-10-15) |
-| unsloth UD-Q3_K_XL | 0.100 / 93.3 % | ~39 GiB | inside the bar; needs the planned 96 GB host |
+| ISTA-DASLab IQ3_XXS | 0.218 / 89.7 % (served) | 28.72 GiB at 12,000 MiB of slots | the default until 2026-10-20, the rollback (38.0 t/s on 1.2.1; `arcint-flashnext`): 595.1 t/s at the 20k needle, 34.5-35.6 t/s on the hash-table answer (0.8.0), 30.6-37.5 t/s on six answers with the CPU misses; their KL cost +0.0044 nats against the misses off on the served reference capture (8 x 512, ubatch 4: 0.2910 / 0.2866), a different window from this column's (`measured-here`, 2026-10-15) |
+| ISTA-DASLab IQ3_S | 0.127 / 92.1 % (served, 1.2.1) | 36.06 GiB at 11,600 MiB of slots | **the default since 2026-10-20** (`arcint-flashnext`; operator's rule: the better quant if >= 20 t/s on 1.2.1): 33.3 t/s on six answers, 535 t/s at the 20k needle, VRAM peak 23,478 MiB; shard 2 (the n-gram table) is IQ3_XXS's, byte-identical (`measured-here`) |
+| unsloth UD-Q3_K_XL | 0.100 / 93.3 % (served 0.107 / 92.7 %) | 40.29 GiB at 9,000 MiB of slots | 16.7 t/s at best on 1.2.1, below the operator's 20 t/s line (`measured-here`, 2026-10-19) |
 
 ### 7.3 Retractions
 

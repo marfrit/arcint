@@ -139,3 +139,44 @@ TEST(reasoning_extended_edges) {
     CHECK_EQ(split_reasoning("[THINKING] no", false, true).content, std::string("[THINKING] no"));
     CHECK_EQ(split_reasoning("[think]x[/think]y", false, true).content, std::string("[think]x[/think]y"));
 }
+
+// ---------------------------------------------------------------------------
+// clean-turns step 2: the split decides the block by token id too. A closer
+// spelled from ordinary tokens is the same text as the real one, so text alone
+// cannot tell them apart. Streaming and non-streaming must agree on a sequence
+// carrying both: the spelled one stays reasoning, the special-token one ends
+// the block, and both paths put the answer in content.
+
+TEST(reasoning_streaming_and_nonstreaming_agree_on_a_spelled_and_a_real_closer) {
+    // The Qwen pair, template-opened: its closer is one special token, id 7.
+    // The opener has no id here; the template already opened the block.
+    const std::string closer = think_tag_pairs(false)[0].second;
+    const std::vector<std::pair<int, int>> ids = {{-1, 7}};
+    std::vector<std::pair<std::string, int>> pieces;
+    pieces.emplace_back("the marker is ", 30);
+    pieces.emplace_back(closer.substr(0, 3), 31);
+    pieces.emplace_back(closer.substr(3), 32);
+    pieces.emplace_back(" quoted, not emitted; ", 33);
+    pieces.emplace_back(closer, 7);   // the real closer, one special token
+    pieces.emplace_back("answer", 34);
+
+    ReasoningStreamer streamed(true, false, ids);
+    std::string       reasoning, content;
+    for (const auto& [piece, id] : pieces) {
+        const auto step = streamed.push(piece, id);
+        reasoning += step.reasoning;
+        content += step.content;
+    }
+    const auto tail = streamed.flush();
+    reasoning += tail.reasoning;
+    content += tail.content;
+
+    const ReasoningSplit split = split_reasoning_tokens(pieces, true, false, ids);
+    CHECK(split.closed);
+    CHECK_EQ(split.reasoning, reasoning);   // the two paths are one implementation
+    CHECK_EQ(split.content, content);
+    CHECK_EQ(content, std::string("answer"));
+    // The spelled closer and the text after it stay in reasoning.
+    CHECK(split.reasoning.find(closer) != std::string::npos);
+    CHECK(split.reasoning.find(" quoted, not emitted; ") != std::string::npos);
+}

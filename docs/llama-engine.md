@@ -619,6 +619,19 @@ points, KL lower). The operator moved the coder service to this engine with
 `c5f495ac` on 2026-10-05, and to `shq8` the same evening. The OpenVINO
 service was its way back until that engine was retired (0.8.0).
 
+**Confound in that table's answer-level column (`code`, 2026-10-20).** It was
+recorded in b642716, the same commit that introduced `--llama-checkpoints`
+with default 32, and it predates 83814b3 (2026-10-16, the drafter's state
+through the checkpoints). So every row ran with context checkpoints ON, and
+with the checkpoint code as it stood before that change. On 2026-10-20 the
+same unit with `--llama-checkpoints 0` scores 10/10 at T=0 where the
+checkpoints-ON configuration scores 9/10 (`measured-here`,
+`docs/proposal-coder-checkpoints-0.md`) — the same 9-versus-10 flip that row
+attributes to the quant. Read the column as *quant and checkpoint
+configuration together*; it does not isolate the quant, and it is not
+re-measurable from these rows. The KL and top-1 columns are unaffected: they
+come from logits, not from served answers.
+
 llama.cpp's own loop (`llama-speculative-simple`, raw prompt) for
 reference: coder 68.1 t/s with 2 drafts, dense 31.9 with 3; four drafts
 fall to 46.0 and 10.7 (a 5-row verify leaves the 4-column K-quant matvec).

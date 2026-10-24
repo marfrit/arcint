@@ -15,15 +15,17 @@ StopMatcher::StopMatcher(std::vector<std::string> stops) : stops_(std::move(stop
                  stops_.end());
 }
 
-StopMatcher::Step StopMatcher::push(std::string_view piece) {
+StopMatcher::Step StopMatcher::push(std::string_view piece, int token_id) {
     Step step;
 
     if (stops_.empty()) {
         step.emit.assign(piece);
+        step.segments.push_back({step.emit, token_id});
         return step;
     }
 
     buffer_.append(piece);
+    held_.emplace_back(piece.size(), token_id);
 
     // Earliest completed stop sequence wins, so that two overlapping stops
     // truncate at the same place regardless of declaration order.
@@ -33,9 +35,11 @@ StopMatcher::Step StopMatcher::push(std::string_view piece) {
         if (pos != std::string::npos && pos < cut) cut = pos;
     }
     if (cut != std::string::npos) {
-        step.emit = buffer_.substr(0, cut);
-        step.hit  = true;
+        step.emit     = buffer_.substr(0, cut);
+        step.hit      = true;
+        step.segments = take(cut);
         buffer_.clear();
+        held_.clear();
         return step;
     }
 
@@ -46,14 +50,44 @@ StopMatcher::Step StopMatcher::push(std::string_view piece) {
         hold = std::max(hold, text::partial_stop_suffix(buffer_, s));
     }
 
-    step.emit = buffer_.substr(0, buffer_.size() - hold);
+    step.emit     = buffer_.substr(0, buffer_.size() - hold);
+    step.segments = take(buffer_.size() - hold);
     buffer_.erase(0, buffer_.size() - hold);
     return step;
+}
+
+std::vector<StopMatcher::Segment> StopMatcher::take(size_t n) {
+    std::vector<Segment> out;
+    size_t               at = 0;
+    while (n > 0 && !held_.empty()) {
+        auto& [len, id] = held_.front();
+        if (len <= n) {
+            out.push_back({buffer_.substr(at, len), id});
+            at += len;
+            n -= len;
+            held_.erase(held_.begin());
+        } else {
+            // Part of a piece: no id travels with it, nor with what stays held.
+            out.push_back({buffer_.substr(at, n), -1});
+            len -= n;
+            id = -1;
+            n  = 0;
+        }
+    }
+    return out;
 }
 
 std::string StopMatcher::flush() {
     std::string out;
     out.swap(buffer_);
+    held_.clear();
+    return out;
+}
+
+std::vector<StopMatcher::Segment> StopMatcher::flush_segments() {
+    std::vector<Segment> out = take(buffer_.size());
+    buffer_.clear();
+    held_.clear();
     return out;
 }
 

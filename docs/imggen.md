@@ -21,6 +21,8 @@ with its `arm.json` (`measured-here`; the setup is the charter's §2 header).
 | DiT f16 (`^model\.=f16`, the dev unit's form), VAE im2col | 2.21 s | 15.12 s | 22,685 MiB | cos 0.999911, 41.67 dB; FAILs the baseline's per-step MSE (+15 %) |
 | 0057 off (sd.cpp's generic RoPE build), VAE im2col | 4.77 s | 15.40 s | 17,211 MiB | PASS, 0.999921, 42.85 dB |
 
+Re-measured on the **1.1.1-1 package** (`measured-here`, 2026-10-23, B60, seed 42, two requests, byte-identical images): the 1024²/8 service form is unchanged -- steady request **23.4 s**, step **2.14 s**, VAE **6.12 s**, against the release's 23.5 s steady, 2.13 s step and 6.33 s VAE on 2026-10-18.
+
 sd.cpp's own Vulkan backend on the same card, files, prompt, seed and steps
 (B3): 7.64 s a step at 1024², the VAE 10.48 s, gate PASS (cos worst
 0.999905, 41.39 dB); 1.78 s at 512². The development record's Vulkan arm
@@ -29,10 +31,11 @@ has no `arm.json`; this one does.
 At 512² the service form takes **0.476 s a step** (2.10 it/s) against the
 generic q8_0 GEMM's 3.03 s (6.4x), PASS at 46.54 dB (baseline 45.84). The
 service serves the same image as `sd-cli` pixel for pixel; a 1024² request
-takes ~23.5 s steady with the direct-conv VAE (32.5 s with im2col), and the
-first request after a start ~30 s more: the weight load from the disk the
-models live on (64.4 s with a warm and 64.9 s with an empty OpenCL program
-cache, 35.2 s from the NVMe; the program cache is worth ~0.5 s).
+takes **23.4 s steady** with the direct-conv VAE (32.5 s with im2col; the
+2026-10-23 re-measurement, `measured-here`; was ~23.5 s on 2026-10-18), and
+the first request after a start is **35.7 s**, the weight load (was 61.06 s
+on 2026-10-18; the NVMe path measures 35.2 s, the program cache is worth
+~0.5 s).
 
 Corrections to the record below (the release review, `measured-here` unless
 `code`):
@@ -328,14 +331,20 @@ XMX does 4096 INT8 OPS/clock per Xe core (2048 FP16), so the XMX FP16 peak is
 
 **The step (`arithmetic`):** Z-Image Turbo's DiT is 6 B params; a step's MACs =
 params x tokens. 512² = 1,024 tokens -> **12.3 TFLOP a step**; 1024² = 4,096 ->
-**49.2 TFLOP**. Against the weights (1 byte a weight + a f16 scale per 32) the
+**49.2 TFLOP** (`paper`, rounded parameter count). Summed over the DiT's actual
+GEMM shapes (`arithmetic`, 2026-10-23: hidden 3,840, qkv 11,520, FFN 10,240, 30
+layers on the joint 4,128 tokens plus the 2 noise- and 2 context-refiner blocks;
+attention's own products excluded, as above) a step is **46.75 TFLOP** at 1024²
+and **11.96 TFLOP** at 512², i.e. the paper figure is 5.2 % / 2.8 % high. Against the weights (1 byte a weight + a f16 scale per 32) the
 intensity is ~1,900 FLOP/byte, far above the ridge 215 FLOP/byte (98.3 TFLOP /
 456 GB/s), so the step is **compute-bound**: the limiting factor is the XMX
 peak, not the bandwidth (456 GB/s binds only below ~256 tokens, and the whole
 6.58 GB of weights is 14 ms a read).
 
 **The bar:** >= 70 % of that peak -- <= ~**0.18 s a step at 512²**, ~**0.72 s at
-1024²** for the DiT. Measured today: OpenCL 3.69 s a step (**3.4 %** of the
+1024²** for the DiT (from the paper FLOPs). From the architecture FLOPs the same
+70 % is **0.17 s** at 512² and **0.68 s** at 1024² (68.8 TFLOP/s); a campaign
+gates against these, so a kernel cannot pass the bar below 70 %. Measured today: OpenCL 3.69 s a step (**3.4 %** of the
 98.3 TFLOP FP16 peak), Vulkan 1.78 s (**7 %**); the q8_0 GEMM that is 68 % of
 the step runs at ~4 TFLOP effective. The implementation target is a q8_0 XMX
 GEMM at 70 % of the XMX rate (int8 196 or fp16 98), 10-20x over the generic
@@ -541,8 +550,10 @@ form is **DiT f16 + te Q8_0**, same step time as full f16 and 3.5 GiB less VRAM.
 **The service** (Phase 3, D2(a), D3 B60 on demand): `arcint-imggen` unit,
 `sd-server`, port 8085, `/v1/images/generations`, start stops `arcint-agent`
 (`Conflicts=`), flags as above. Over HTTP, 1024²/8/seed 42, prompt
-"a red cube on a white table, centered": **first request 61.06 s** (lazy
-kernel build + weights load), **steady request 24.08 s**; 512² steady 5.94 s
+"a red cube on a white table, centered": **first request 35.7 s** (lazy
+kernel build + weights load; was 61.06 s on 2026-10-18), **steady request
+23.4 s** with step **2.14 s** and VAE **6.12 s** (the 1.1.1-1 package,
+2026-10-23, `measured-here`; was 24.08 s on 2026-10-18); 512² steady 5.94 s
 and correct against `refcpu512`. The unit's `/v1/models` returns
 `sd-cpp-local`; sd-server has **no** `/health` or `/props` route (charter A4),
 `/sdcpp/v1/capabilities` is the closest defaults dump.

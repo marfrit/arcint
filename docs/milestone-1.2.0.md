@@ -736,6 +736,11 @@ mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0-codeheadf16.gguf`), `gate-fleurs`, seed
 | the cross-check f32-all | no output; dominated (121.1 ms predictor call, slowest of the family); not re-run |
 | the card window (after the upgrade) | peak resident vram0 **2,586 MiB**, min physical MemAvailable **116,787 MiB**, max container **4,066 MiB**; one non-service process per card; `arcint-agent` stopped by its unit and restored after 80 s, `:8087` health ok |
 
+Later spot check (`measured-here`, 2026-10-23, the packaged TTS unit, 4
+synthetic German sentences, seed 42): RTF **1.17** on sentences 2-4 and
+**1.095** over all four including the first request's warm-up -- a spot check,
+not the D8 gate; the gate figure stays **1.1597**.
+
 **Disposition (`measured-here`, `code`):** the recipe is the production TTS
 model set (`contrib/systemd/arcint-tts.service` points at the requantized file;
 the official bf16 stays as fallback); **B3 PASS** closes the campaign

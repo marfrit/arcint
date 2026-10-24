@@ -25,6 +25,13 @@
 
 ## Status
 
+- Flash-Next's production quant is ISTA-DASLab's GSQ-RCO IQ3_S since
+  2026-10-20 (operator): 33.3 t/s decode on six answers, KL 0.127 against
+  Q8_0 (IQ3_XXS 38.0 t/s, 0.217, the rollback).
+- Version 1.2.2 (2026-10-24): two opt-in guards for agent turns, off by
+  default: --think-eog-mask and --tool-grammar; the think block decided by
+  the closer's token id; the reasoning stream's UTF-8 hold-back;
+  reasoning_closed on the stream. Speed equal to 1.2.1 on all three services.
 - Version 1.2.1 (2026-10-20): patch 0063, the expert cache's CPU misses
   with Strata's multi-token rows for IQ2_XS, IQ3_XXS, IQ3_S and IQ4_NL and
   every miss of a verify window on the CPU (GGML_OPENCL_CPU_MISS_MAX 64):
@@ -202,6 +209,10 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
 - --llama-dflash-gguf FILE, --llama-dflash N (7), --llama-dflash-min-p P,
   --llama-dflash-ubatch N (64).
 - --llama-checkpoints N (32), --llama-checkpoint-step T (8192).
+- --think-eog-mask (off; request field think_eog_mask): while a think block
+  is open, the tokens that end the turn are not offered.
+- --tool-grammar (off; request field tool_grammar): a tool call is
+  constrained to the declared schemas by a GBNF.
 - --llama-cpu-moe N, --llama-expert-cache MIB[,MIB],
   --llama-expert-profile FILE, --llama-layer-split K.
 - --stub, --stub-delay-ms N (the device-free test backend); -v, -vv;

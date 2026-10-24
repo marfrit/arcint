@@ -18,6 +18,79 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.2.2 — 2026-10-24
+
+Agent turns gain two opt-in guards: an open think block no longer offers the
+tokens that end the turn, and a tool call can be constrained to the declared
+schemas. Both are switches, **off by default**; a unit or a request turns them
+on. The reasoning split by token id below is not a switch: it is on for every
+artifact whose tags are single special tokens.
+
+- **Think-block mask** — `--think-eog-mask` (also the request field
+  `think_eog_mask`; `/props` reports it). While a think block is open, the
+  end-of-generation ids (unless the request sets `ignore_eos`), the request's
+  `stop_token_ids` (the same set the stop check ends on) and a second opener
+  are masked in the sampler, so an empty or mid-block stop cannot happen; the
+  block's closer is never masked. Fed in all three llama decode loops (plain,
+  multimodal, speculative verify).
+- **Tool-call grammar** — `--tool-grammar` (request field `tool_grammar`). A
+  GBNF built from the declared tools makes an unterminated or malformed call
+  unreachable: the opener, a declared function, its required parameters in any
+  order, the optional ones, values typed by their schema, the closer. Dormant
+  while a think block is open; a non-object or unconfinable schema is the
+  client's 400. A lost sync is counted on the decode line and fails open (the
+  rest of the turn runs unconstrained) instead of escaping as a 500.
+- **The think block decided by the closer's token id.** The reasoning split
+  and the stream now see the generated token ids: a closer spelled from
+  ordinary tokens stays reasoning, the special-token closer ends the block,
+  and the streaming and non-streaming paths run the same splitter. Text a
+  request's stop strings hold back is released cut at the generated pieces,
+  each whole piece with its own id, so the closer and the opener keep theirs:
+  before this, a stop string beginning with a line break (a role prefix after
+  a newline, as agent frameworks send) cost the closer its id, the block never
+  closed and the answer came back as reasoning with empty content; it reached
+  the dev build that ran this content in production, not a package. A line
+  break ahead of a self-opened block keeps the split undecided, as the mask
+  is, and the non-streaming split drops the line breaks around the tags as the
+  text split does. Residual (`code`, untested): a stop string that begins with
+  the tail of a tag's text splits that tag's piece, and a split piece carries
+  no id, so such a block stays open.
+- **The reasoning stream holds back a torn UTF-8 code point**, as the content
+  path already did, so no reasoning delta is invalid UTF-8 (DESIGN §3.7).
+- **`reasoning_closed` on the stream:** the chunk that carries `finish_reason`
+  says whether the think block was closed when the turn ended, as the
+  non-streaming message does.
+- Review fixes riding with them: the mask's block tracker settles instead of
+  re-opening (B1), the mask covers exactly the stop check's set (B2), the
+  closer guard (B3), a guarded grammar mask (B4), tests that can go red for
+  the stream order and `reasoning_closed` (B5, B6).
+
+**Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (60
+patches, 0001-0063 without 0031, 0055 and 0061), unchanged from 1.2.1;
+dependencies unchanged. `arcint-stt` (1.2.0) and `arcint-imggen` (1.1.1) are
+unchanged.
+
+**Release check** (`measured-here`, 2026-10-23, the build of this content):
+the device-free suite 228 cases and `ctest -L unit` 6/6, the libllama build
+green, the operator's mutations of B2/B3, B4b and the token-id change red as
+predicted (4/4 each). Tool-call grammar gate on the coder (A770): off 11 of 12
+malformed, on 0 invalid, a non-object schema 400, the CSV task through a tool
+call 10/10 ten times, the T=0 answers byte-identical off and on, decode 79.2-79.3
+against 79.3-79.4 t/s. Think-block mask on the agent (B60): the empty stop with
+the mask off, answered with it on. Acceptance task 5/5 at 10/10 greedy on the
+coder and on the agent. Same-window speed A/B against 1.2.1: coder and agent
+pass with byte-identical texts, Flash-Next passes in four rounds (33.38 ->
+34.23 t/s; two rounds under-sample the old binary's spread). The coder's
+sampled bar at 0.7 (mean 9.056 over 90 runs, upper bound 9.62) fails on the
+unit's thinking-row sampling for thinking-off requests, not on 1.2.2's code
+(the instruct row: 9.900 over 30); the fix is a later release's.
+The stop-string fix (`measured-here`, 2026-10-24): the device-free suite 239
+cases and `ctest -L unit` 6/6, eight one-line mutations of it each red, the
+pre-tag package build green; on the coder (A770, T=0) a request with a stop
+string beginning with a line break gave an empty answer with the block open
+on the dev build that ran this content, and closes the block and answers on
+the fixed build, streaming and non-streaming, as without the stop.
+
 ## 1.2.1 — 2026-10-20
 
 Flash-Next decodes faster: the expert cache's CPU miss path gets Strata's
@@ -50,6 +123,13 @@ A byte tripwire, reported: three of IQ3_XXS's eight answers change wording,
 and the forced-old-path control also differs from the base build, so the
 difference is not only the new rows; not explained; the answers and the KL
 are right.
+
+**Published** (2026-10-20, recorded with 1.2.2): `arcint` 1.2.1-1 built by
+its recipe from the v1.2.1 tag tarball (sha256 `a3779bd9…`) and published to
+the trixie repository (index verified); installed from the pool on the card
+host, the agent and the coder restarted on it. Not run: a fresh-container
+install (the Depends and the recipe were unchanged from 1.2.0). `arcint-stt`
+stayed at 1.2.0-1, `arcint-imggen` at 1.1.1-1.
 
 ## 1.2.0 — 2026-10-19
 

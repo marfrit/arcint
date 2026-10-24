@@ -26,6 +26,66 @@ double decode_other_seconds(const GenerationStats& stats) {
            stats.draft_verify_seconds - stats.draft_propose_seconds;
 }
 
+// The decode line's conditional terms, extracted from log_stats (review B4
+// follow-up) so the stats wiring is unit-testable at the struct level: the
+// value decode_suffix_for returns is the one that lands on the line.
+std::string decode_suffix_for(const GenerationStats& stats) {
+    std::string decode_suffix;
+    if (stats.decode_seconds > 0.0) {
+        const double other = decode_other_seconds(stats);
+        decode_suffix = log::format(
+            " | graph %.2f s, embed %.2f s, sample %.2f s, emit %.2f s, wait %.2f s, "
+            "other %.2f s",
+            stats.decode_forward_seconds, stats.decode_embed_seconds,
+            stats.decode_sample_seconds, stats.decode_emit_seconds,
+            stats.decode_wait_seconds, other);
+    }
+    // Printed whenever a subtracted term is non-zero, not only when a draft was
+    // proposed: propose time accrues on every paged drafting cycle, so a request
+    // that proposed nothing would otherwise subtract a term it never shows.
+    if (stats.draft_proposed > 0 || stats.draft_propose_seconds > 0.0) {
+        decode_suffix += log::format(
+            " | draft accept %.1f%% (%d/%d), propose %.2f s, verify %.2f s, re-forward %.2f s, "
+            "rollback %.2f s",
+            stats.draft_proposed > 0 ? 100.0 * stats.draft_accepted / stats.draft_proposed : 0.0,
+            stats.draft_accepted,
+            stats.draft_proposed, stats.draft_propose_seconds, stats.draft_verify_seconds,
+            stats.draft_reforward_seconds, stats.draft_rollback_seconds);
+        // the acceptance length: the tokens a verify emits on average
+        if (stats.draft_steps > 0)
+            decode_suffix += log::format(", %d verifies (%.2f tokens a verify)", stats.draft_steps,
+                                         static_cast<double>(stats.draft_accepted + stats.draft_steps) / stats.draft_steps);
+    }
+    // Visible even on a request that drafted nothing at all: a lane whose
+    // drafter is currently off (disabled by an earlier failure, re-armed only
+    // at the next request) proposes zero drafts and would otherwise vanish
+    // from this line entirely.
+    if (stats.dflash_lane_failures > 0) {
+        decode_suffix +=
+            log::format(" | dflash lane failures %d (cumulative)", stats.dflash_lane_failures);
+    }
+    // Tool-call grammar desyncs, review B4: the constraint lost sync with the
+    // text and the rest of the request ran unconstrained (fail open, so the
+    // turn can still end). Printed only when non-zero, as the drafting terms,
+    // so a request without a broken constraint keeps the line it always had.
+    if (stats.grammar_desyncs > 0) {
+        decode_suffix +=
+            log::format(" | grammar desync %d (turn unconstrained after desync)", stats.grammar_desyncs);
+    }
+    // What the other lane cost this one. Printed only when it happened, so a
+    // single-stream run's line is the line it always was, and a p95 rather than
+    // a mean because one long stall inside many short steps is exactly what a
+    // mean hides (DESIGN.md §4.1).
+    if (stats.stalled_steps > 0) {
+        decode_suffix += log::format(" | stall p95 %.0f ms max %.0f ms (%d step%s, %.2f s total)",
+                                     1000.0 * stats.stall_p95_seconds,
+                                     1000.0 * stats.stall_max_seconds, stats.stalled_steps,
+                                     stats.stalled_steps == 1 ? "" : "s",
+                                     stats.stall_total_seconds);
+    }
+    return decode_suffix;
+}
+
 namespace {
 
 using json = nlohmann::json;
@@ -121,51 +181,7 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
     log_slot_line(slot, "prefill", stats.prompt_tokens, stats.prefill_seconds,
                   stats.prefill_rate(), prefill_suffix);
 
-    std::string decode_suffix;
-    if (stats.decode_seconds > 0.0) {
-        const double other = decode_other_seconds(stats);
-        decode_suffix = log::format(
-            " | graph %.2f s, embed %.2f s, sample %.2f s, emit %.2f s, wait %.2f s, "
-            "other %.2f s",
-            stats.decode_forward_seconds, stats.decode_embed_seconds,
-            stats.decode_sample_seconds, stats.decode_emit_seconds,
-            stats.decode_wait_seconds, other);
-    }
-    // Printed whenever a subtracted term is non-zero, not only when a draft was
-    // proposed: propose time accrues on every paged drafting cycle, so a request
-    // that proposed nothing would otherwise subtract a term it never shows.
-    if (stats.draft_proposed > 0 || stats.draft_propose_seconds > 0.0) {
-        decode_suffix += log::format(
-            " | draft accept %.1f%% (%d/%d), propose %.2f s, verify %.2f s, re-forward %.2f s, "
-            "rollback %.2f s",
-            stats.draft_proposed > 0 ? 100.0 * stats.draft_accepted / stats.draft_proposed : 0.0,
-            stats.draft_accepted,
-            stats.draft_proposed, stats.draft_propose_seconds, stats.draft_verify_seconds,
-            stats.draft_reforward_seconds, stats.draft_rollback_seconds);
-        // the acceptance length: the tokens a verify emits on average
-        if (stats.draft_steps > 0)
-            decode_suffix += log::format(", %d verifies (%.2f tokens a verify)", stats.draft_steps,
-                                         static_cast<double>(stats.draft_accepted + stats.draft_steps) / stats.draft_steps);
-    }
-    // Visible even on a request that drafted nothing at all: a lane whose
-    // drafter is currently off (disabled by an earlier failure, re-armed only
-    // at the next request) proposes zero drafts and would otherwise vanish
-    // from this line entirely.
-    if (stats.dflash_lane_failures > 0) {
-        decode_suffix +=
-            log::format(" | dflash lane failures %d (cumulative)", stats.dflash_lane_failures);
-    }
-    // What the other lane cost this one. Printed only when it happened, so a
-    // single-stream run's line is the line it always was, and a p95 rather than
-    // a mean because one long stall inside many short steps is exactly what a
-    // mean hides (DESIGN.md §4.1).
-    if (stats.stalled_steps > 0) {
-        decode_suffix += log::format(" | stall p95 %.0f ms max %.0f ms (%d step%s, %.2f s total)",
-                                     1000.0 * stats.stall_p95_seconds,
-                                     1000.0 * stats.stall_max_seconds, stats.stalled_steps,
-                                     stats.stalled_steps == 1 ? "" : "s",
-                                     stats.stall_total_seconds);
-    }
+    const std::string decode_suffix = decode_suffix_for(stats);
     log_slot_line(slot, "decode", stats.completion_tokens, stats.decode_seconds,
                   stats.decode_rate(), decode_suffix);
     if (reason == FinishReason::Abort) {
@@ -178,12 +194,13 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
 // Everything generic to both endpoints lives here: stop sequences, stop token
 // ids, cancellation, and the accumulation of the raw text the caller needs for
 // tool-call parsing.
-// `emit` receives the new piece and the full text accumulated so far
-// (the piece is already appended). Returning false means the client is gone.
-using EmitFn = std::function<bool(std::string_view piece, const std::string& accumulated)>;
+// `emit` receives the new piece, its token id and the full text accumulated so
+// far (the piece is already appended). Returning false means the client is gone.
+using EmitFn = std::function<bool(std::string_view piece, int token_id, const std::string& accumulated)>;
 
 FinishReason drive(Backend& backend, const GenerationInput& in, int slot, const EmitFn& emit,
-                   GenerationStats& stats, std::string& raw) {
+                   GenerationStats& stats, std::string& raw,
+                   std::vector<std::pair<std::string, int>>* pieces = nullptr) {
     StopMatcher   stop(in.sampler.stop);
     std::set<int> stop_ids(in.sampler.stop_token_ids.begin(), in.sampler.stop_token_ids.end());
     bool          cancelled = false;
@@ -191,10 +208,16 @@ FinishReason drive(Backend& backend, const GenerationInput& in, int slot, const 
     const FinishReason reason = backend.generate(
         in, slot,
         [&](std::string_view piece, int token_id) -> Control {
-            const StopMatcher::Step step = stop.push(piece);
-            if (!step.emit.empty()) {
-                raw += step.emit;
-                if (!emit(step.emit, raw)) {
+            const StopMatcher::Step step = stop.push(piece, token_id);
+            // The reasoning split is decided by (piece, id), so the emitted
+            // text goes out cut at the pieces it came from: a whole piece with
+            // its id, a part of one with -1. A held tail released together
+            // with the closer's piece no longer costs the closer its id.
+            for (const StopMatcher::Segment& seg : step.segments) {
+                if (pieces != nullptr) pieces->emplace_back(seg.text, seg.id);
+                if (seg.text.empty()) continue;
+                raw += seg.text;
+                if (!emit(seg.text, seg.id, raw)) {
                     cancelled = true;
                     return Control::Cancel;
                 }
@@ -208,10 +231,11 @@ FinishReason drive(Backend& backend, const GenerationInput& in, int slot, const 
     if (!cancelled) {
         // Text held back as a possible stop-sequence prefix that never
         // completed is ordinary output and must not be swallowed.
-        const std::string tail = stop.flush();
-        if (!tail.empty()) {
-            raw += tail;
-            if (!emit(tail, raw)) return FinishReason::Abort;
+        for (const StopMatcher::Segment& seg : stop.flush_segments()) {
+            if (pieces != nullptr) pieces->emplace_back(seg.text, seg.id);
+            if (seg.text.empty()) continue;
+            raw += seg.text;
+            if (!emit(seg.text, seg.id, raw)) return FinishReason::Abort;
         }
     }
     return reason;
@@ -499,6 +523,11 @@ json props(const Context& ctx) {
           {"min_p", sd.min_p},
           {"repetition_penalty", sd.repetition_penalty},
           {"presence_penalty", sd.presence_penalty},
+          // clean-turns: whether the think-block mask is on for requests that
+          // send nothing. /props says what the server is running with, so a
+          // turn that ends differently than yesterday's is explained here.
+          {"think_eog_mask", sd.think_eog_mask},
+          {"tool_grammar", sd.tool_grammar},
           {"provenance", sd.provenance}}},
         {"slots",
          {{"total", slots_total(ctx)},
@@ -667,12 +696,25 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
     if (prep.parse_tool_calls) prep.schemas = tool_schemas(prep.req.tools);
 
     for (const ToolSpec& t : prep.req.tools) prep.input.tool_names.push_back(t.name);
+    // clean-turns step 2: the schemas reach the backend only when the calls
+    // are parsed, so the grammar never constrains a call nobody would read.
+    if (prep.parse_tool_calls) {
+        prep.input.tools               = prep.req.tools;
+        prep.input.parallel_tool_calls = prep.req.parallel_tool_calls;
+    }
 
     const std::string prompt = ctx.backend->render_chat(prep.req);
     // The template decides whether the answer starts inside a think block; the
     // split of reasoning from content below follows that, not a guess.
     prep.think_open = prompt.ends_with("<think>\n");
     prep.think_tags_extended = ctx.backend->status().think_tags_extended;
+    // The split, like the backend's mask, decides the block by token id where
+    // the artifact's vocabulary spells a tag as one special token.
+    prep.think_ids = ctx.backend->think_block_ids(prep.think_tags_extended);
+    // The backend has to know the same thing: its mask engages before the first
+    // sample, where the API's reasoning split has not seen a token yet.
+    prep.input.think_open          = prep.think_open;
+    prep.input.think_tags_extended = prep.think_tags_extended;
     // The rendered prompt is the one thing that decides what the model saw.
     // When an answer differs from a reference run this is the first question,
     // and reconstructing it after the fact is guesswork (§3.7).
@@ -817,15 +859,26 @@ static std::optional<HttpResult> guarded(const std::function<void()>& run) {
 HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     GenerationStats stats;
     std::string     raw;
+    std::vector<std::pair<std::string, int>> pieces;
     FinishReason reason = FinishReason::Stop;
     if (auto err = guarded([&] {
             reason = drive(*ctx.backend, prep.input, slot,
-                           [](std::string_view, const std::string&) { return true; }, stats, raw);
+                           [](std::string_view, int, const std::string&) { return true; }, stats, raw, &pieces);
         }))
         return *err;
     log_stats(slot, stats, reason);
 
-    const ReasoningSplit  split   = split_reasoning(raw, prep.think_open, prep.think_tags_extended);
+    // When the artifact's tags are single special tokens the split is decided
+    // by those ids; the same (piece, id) sequence the streaming path feeds to
+    // its streamer goes here too, so the two cannot disagree. Without any id,
+    // the text split is exactly today's behaviour.
+    bool has_tag_ids = false;
+    for (const auto& [oid, cid] : prep.think_ids.open_close_ids)
+        if (oid >= 0 || cid >= 0) has_tag_ids = true;
+    const ReasoningSplit split = has_tag_ids
+        ? split_reasoning_tokens(pieces, prep.think_open, prep.think_tags_extended,
+                                 prep.think_ids.open_close_ids)
+        : split_reasoning(raw, prep.think_open, prep.think_tags_extended);
     std::string           content = split.content;
     std::vector<ToolCall> calls;
     if (prep.parse_tool_calls) {
@@ -838,7 +891,14 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     }
 
     json message = {{"role", "assistant"}};
-    if (!split.reasoning.empty()) message["reasoning_content"] = split.reasoning;
+    if (!split.reasoning.empty()) {
+        message["reasoning_content"] = split.reasoning;
+        // Whether the think block's closer was seen before the turn ended.
+        // The split computes it but the client could not see it, which made an
+        // empty answer that closed the block indistinguishable from the defect
+        // (a turn-ending token winning a step while the block was still open).
+        message["reasoning_closed"] = split.closed;
+    }
     if (calls.empty()) {
         message["content"] = content;
     } else {
@@ -866,7 +926,7 @@ HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, in
     FinishReason reason = FinishReason::Stop;
     if (auto err = guarded([&] {
             reason = drive(*ctx.backend, prep.input, slot,
-                           [](std::string_view, const std::string&) { return true; }, stats, raw);
+                           [](std::string_view, int, const std::string&) { return true; }, stats, raw);
         }))
         return *err;
     log_stats(slot, stats, reason);
@@ -938,13 +998,35 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     // Reasoning goes out as reasoning_content deltas until the think block
     // closes; from there `content` accumulates the answer and the tool-call
     // logic below sees only that.
-    ReasoningStreamer   reasoning(prep.think_open, prep.think_tags_extended);
+    ReasoningStreamer   reasoning(prep.think_open, prep.think_tags_extended, prep.think_ids.open_close_ids);
     std::string         content;       // the answer part of the output so far
-    auto emit_reasoning = [&](std::string_view bytes) {
-        if (bytes.empty()) return true;
+    // Reasoning has its own hold-back stream: a multi-byte code point must not
+    // be split across two SSE chunks (DESIGN §3.7), and reasoning and content
+    // are separate streams, so each carries its own pending state. The content
+    // path above already does this with `utf8_stream`; the reasoning path did
+    // not, which is how a torn code point reached the client as replacement
+    // characters.
+    utf8::Streamer      reasoning_stream;
+    bool                had_reasoning = false;
+    auto send_reasoning = [&](const std::string& safe) {
+        had_reasoning = true;
         return sse_send(write, chunk(json::array({{{"index", 0},
-                                                   {"delta", {{"reasoning_content", std::string(bytes)}}},
+                                                   {"delta", {{"reasoning_content", safe}}},
                                                    {"finish_reason", nullptr}}})));
+    };
+    auto emit_reasoning = [&](std::string_view bytes) {
+        const std::string safe = reasoning_stream.push(bytes);
+        if (safe.empty()) return true;
+        return send_reasoning(safe);
+    };
+    // Emits whatever the reasoning streamer is still holding. Called when the
+    // think block closes (before any content of that step) and at end of
+    // stream, so a held code point is flushed into the reasoning stream in
+    // order rather than leaking into content or being dropped.
+    auto flush_reasoning = [&]() -> bool {
+        const std::string held = reasoning_stream.flush();
+        if (held.empty()) return true;
+        return send_reasoning(held);
     };
 
     auto emit_content = [&](std::string_view bytes) {
@@ -959,11 +1041,20 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     FinishReason reason = FinishReason::Stop;
     if (auto err = guarded([&] { reason = drive(
         *ctx.backend, prep.input, slot,
-        [&](std::string_view piece, const std::string&) -> bool {
-            const ReasoningStreamer::Step step = reasoning.push(piece);
+        [&](std::string_view piece, int token_id, const std::string&) -> bool {
+            const ReasoningStreamer::Step step = reasoning.push(piece, token_id);
             if (!emit_reasoning(step.reasoning)) {
                 gone = true;
                 return false;
+            }
+            if (!step.content.empty()) {
+                // The think block closed in this step: flush the reasoning
+                // streamer's held bytes before any content goes out, keeping
+                // reasoning-then-content order intact.
+                if (!flush_reasoning()) {
+                    gone = true;
+                    return false;
+                }
             }
             if (step.content.empty()) return true;
             content += step.content;
@@ -1014,6 +1105,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     {
         const ReasoningStreamer::Step last = reasoning.flush();
         if (!emit_reasoning(last.reasoning)) return;
+        if (!flush_reasoning()) return;
         if (!last.content.empty()) {
             content += last.content;
             if (!prep.parse_tool_calls && !emit_content(last.content)) return;
@@ -1052,8 +1144,15 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     }
 
     const char* finish = calls.empty() ? finish_reason_name(reason) : "tool_calls";
+    // Review B6: the non-streaming message carries reasoning_closed, and the
+    // production clients stream; the final chunk carries it too, on the same
+    // condition (reasoning was non-empty). A stream client can then tell a
+    // closed-block empty answer from a mid-block stop.
+    json final_delta = json::object();
+    if (had_reasoning)
+        final_delta["reasoning_closed"] = !reasoning.in_reasoning();
     if (!sse_send(write, chunk(json::array({{{"index", 0},
-                                             {"delta", json::object()},
+                                             {"delta", final_delta},
                                              {"finish_reason", finish}}})))) {
         return;
     }
@@ -1094,7 +1193,7 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep, int s
     FinishReason reason = FinishReason::Stop;
     if (auto err = guarded([&] { reason = drive(
         *ctx.backend, prep.input, slot,
-        [&](std::string_view piece, const std::string&) -> bool {
+        [&](std::string_view piece, int, const std::string&) -> bool {
             const std::string safe = utf8_stream.push(piece);
             if (safe.empty()) return true;
             if (!sse_send(write, chunk(json::array({{{"index", 0},

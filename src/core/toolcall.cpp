@@ -6,16 +6,15 @@
 #include "util/text.h"
 
 namespace lgc {
-namespace {
-
-using json = nlohmann::json;
-
 constexpr std::string_view kOpen      = "<tool_call>";
 constexpr std::string_view kClose     = "</tool_call>";
 constexpr std::string_view kFnOpen    = "<function=";
 constexpr std::string_view kFnClose   = "</function>";
 constexpr std::string_view kParamOpen = "<parameter=";
 constexpr std::string_view kParamEnd  = "</parameter>";
+namespace {
+
+using json = nlohmann::json;
 
 // The coder template wraps every value in newlines. Strip exactly one on each
 // side — a value that legitimately starts with a blank line keeps it.
@@ -139,6 +138,12 @@ bool parse_json_body(std::string_view body, ToolCall& out) {
 }
 
 }  // namespace
+
+const ToolCallTags& tool_call_tags() {
+    static const ToolCallTags t{kOpen, kClose, kFnOpen, kFnClose, kParamOpen, kParamEnd};
+    return t;
+}
+
 
 ToolCallParse parse_qwen_tool_calls(std::string_view text, const ToolSchemas* schemas) {
     ToolCallParse result;

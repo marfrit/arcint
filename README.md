@@ -62,7 +62,7 @@ tag [`openvino-history`](https://github.com/marfrit/arcint/tree/openvino-history
 |---|---|---|---|---|
 | agent | Qwen3.8-27B (`qwen35`, dense, 64 layers, MTP layer) | Q4_K_M GGUF | Arc Pro B60 | 245,760 tokens, q8_0:q4_0 KV, MTP 5 |
 | coder | Qwen3.6-27B-A3B-Coder (`qwen35moe`, 184 experts, MTP layer) | a searched per-layer quant mix (14.6 GB) | Arc A770 | 98,304 tokens, q8_0:q4_0 KV, MTP 4 |
-| Flash-Next | Qwen3.8-Flash-Next (`qwen4exp`, 125B-A6B, 512 experts, n-gram table) | ISTA-DASLab's IQ3_XXS GGUF (IQ2_XS as the faster option) through an expert cache: the hot experts in VRAM, the rest in host RAM, read over the link or computed on the CPU; its MTP layer from the checkpoint | Arc Pro B60 + host RAM, on demand | 131,072 tokens, q8_0 KV, MTP 3 |
+| Flash-Next | Qwen3.8-Flash-Next (`qwen4exp`, 125B-A6B, 512 experts, n-gram table) | ISTA-DASLab's IQ3_S GGUF since 2026-10-20 (IQ3_XXS and IQ2_XS as the faster options) through an expert cache: the hot experts in VRAM, the rest in host RAM, read over the link or computed on the CPU; its MTP layer from the checkpoint | Arc Pro B60 + host RAM, on demand | 131,072 tokens, q8_0 KV, MTP 3 |
 | writer | Cydonia 24B v4.3 (Mistral Small 3.2, `llama`) | imatrix Q4_K_M | Arc Pro B60, on demand | 98,304 tokens, q8_0 KV |
 | images | Z-Image Turbo (6B DiT) with the Qwen3-4B-Instruct-2507 encoder and the FLUX autoencoder | Q8_0 GGUFs, `ae.safetensors` | Arc Pro B60, on demand | 1024x1024, 8 steps |
 | images, lettering | Qwen-Image (20B MMDiT) with the Qwen2.5-VL-7B encoder and the Wan VAE | Q4_K_M GGUFs | Arc Pro B60, on demand | 1024x1024, 20 steps |
@@ -79,6 +79,10 @@ faster and less exact, and UD-Q3_K_XL, inside the KL bar once the host has
 the RAM for its bank (DESIGN §7.2).
 
 ## Current numbers
+
+1.2.2 (2026-10-23, `measured-here`, the build of this release): coder, agent and
+Flash-Next equal to 1.2.1 in the same-window A/B; the acceptance task 5/5 at
+10/10 greedy on the coder and the agent; the two new guards are off by default.
 
 1.2.1 (2026-10-20, `measured-here`, the pre-tag package, the B60): Flash-Next
 IQ3_XXS decodes 38.1 t/s on six answers (1.2.0: 33.9), prefill 622 t/s at
@@ -106,7 +110,7 @@ point per case, at temperature 0.
 | agent | B60 | 708.7 t/s at 54,895 tokens, 498.5 at 138,028 | not in this check (38.9 / 25.6 / 16.6 / 13.5 t/s at 4k / 55k / 130k / 200k, 2026-10-16, the DFlash2 campaign's MTP 5 arm at 212,992 ctx) | the needle at 138k; task 10/10 |
 | coder | A770 | 724.3 t/s at 40,841 tokens | 51.1 / 47.5 / 44.0 t/s on three 300-token answers | the needle; task 9/10 |
 | Flash-Next, IQ3_XXS | B60 + 28.7 GiB host bank | 617.2 t/s at 20,045 tokens (asked right after the capital) | 35.2-35.4 t/s | the needle |
-| images, Z-Image Turbo | B60 | | 1024x1024, 8 steps: 2.14 s a step, the VAE 6.3 s, ~23.5 s a request; 512x512: 0.48 s a step | the image gate against a CPU reference: 42.6 dB |
+| images, Z-Image Turbo | B60 | | 1024x1024, 8 steps: 2.14 s a step, the VAE 6.12 s, ~23.4 s a request (1.1.1-1 package, 2026-10-23); was 6.3 s / ~23.5 s on 2026-10-18; 512x512: 0.48 s a step | the image gate against a CPU reference: 42.6 dB |
 | Flash-Next, IQ2_XS option | B60 + 20.3 GiB host bank | 665.6 t/s, the same protocol | 42.3 t/s | the needle |
 
 Every speed is equal to 1.0.0's in the same window or faster (the release
