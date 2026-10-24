@@ -83,7 +83,25 @@ std::string decode_suffix_for(const GenerationStats& stats) {
                                      stats.stalled_steps == 1 ? "" : "s",
                                      stats.stall_total_seconds);
     }
+    // loop-guard: the ladder's counters, printed only when one moved, so a
+    // request without the switch keeps exactly the line it always had.
+    if (stats.loop_detections || stats.loop_nudges || stats.loop_slaps || stats.loop_aborts) {
+        decode_suffix += log::format(" | loop guard: detected %d, nudged %d, slapped %d, aborted %d",
+                                     stats.loop_detections, stats.loop_nudges, stats.loop_slaps,
+                                     stats.loop_aborts);
+    }
     return decode_suffix;
+}
+
+nlohmann::json loop_guard_json(const GenerationStats& stats) {
+    return nlohmann::json{{"detections", stats.loop_detections},
+                {"nudges", stats.loop_nudges},
+                {"slaps", stats.loop_slaps},
+                {"aborts", stats.loop_aborts}};
+}
+
+bool loop_guard_moved(const GenerationStats& stats) {
+    return stats.loop_detections || stats.loop_nudges || stats.loop_slaps || stats.loop_aborts;
 }
 
 namespace {
@@ -523,11 +541,43 @@ json props(const Context& ctx) {
           {"min_p", sd.min_p},
           {"repetition_penalty", sd.repetition_penalty},
           {"presence_penalty", sd.presence_penalty},
+          // The row a thinking-off request starts from, null for each field
+          // the operator did not set (it then falls back to the normal row
+          // above). "configured" is false when no --nothink-* flag was given:
+          // then every request gets the normal row, byte-identically to before.
+          {"nothink",
+           {{"configured", sd.nothink_row},
+            {"temperature", sd.nothink_temperature ? json(*sd.nothink_temperature) : json(nullptr)},
+            {"top_p", sd.nothink_top_p ? json(*sd.nothink_top_p) : json(nullptr)},
+            {"top_k", sd.nothink_top_k ? json(*sd.nothink_top_k) : json(nullptr)},
+            {"min_p", sd.nothink_min_p ? json(*sd.nothink_min_p) : json(nullptr)},
+            {"presence_penalty",
+             sd.nothink_presence_penalty ? json(*sd.nothink_presence_penalty) : json(nullptr)}}},
           // clean-turns: whether the think-block mask is on for requests that
           // send nothing. /props says what the server is running with, so a
           // turn that ends differently than yesterday's is explained here.
           {"think_eog_mask", sd.think_eog_mask},
           {"tool_grammar", sd.tool_grammar},
+          // loop-guard: the served switch and its thresholds, so a turn that
+          // ends differently than yesterday's is explained here.
+          {"loop_guard",
+           {{"mode", loop_guard_name(sd.loop_guard)},
+            {"match", loop_guard_match_name(sd.loop_guard_match)},
+            {"window", sd.loop_guard_window},
+            {"threshold", sd.loop_guard_threshold},
+            {"grace", sd.loop_guard_grace}}},
+          // llava: the answer row after the think block; null is "not set", so
+          // an operator can tell the switch off from a value that happens to
+          // equal the thinking row's.
+          {"answer",
+           {{"temperature", sd.answer_temperature ? json(*sd.answer_temperature) : json(nullptr)},
+            {"top_p", sd.answer_top_p ? json(*sd.answer_top_p) : json(nullptr)},
+            {"top_k", sd.answer_top_k ? json(*sd.answer_top_k) : json(nullptr)},
+            {"min_p", sd.answer_min_p ? json(*sd.answer_min_p) : json(nullptr)},
+            {"presence_penalty",
+             sd.answer_presence_penalty ? json(*sd.answer_presence_penalty) : json(nullptr)},
+            {"frequency_penalty",
+             sd.answer_frequency_penalty ? json(*sd.answer_frequency_penalty) : json(nullptr)}}},
           {"provenance", sd.provenance}}},
         {"slots",
          {{"total", slots_total(ctx)},
@@ -616,8 +666,12 @@ namespace {
 std::optional<HttpResult> finish_prepare(const Context& ctx, int lane, const std::string& prompt,
                                          const SamplerOverrides& overrides,
                                          GenerationInput& input, int& prompt_tokens,
+                                         bool nothink = false,
                                          const std::vector<int>& prompt_ids = {}) {
-    SamplerParams sampler = sampler_from_defaults(ctx.backend->status().sampler_defaults);
+    // The row first: a request that resolves to thinking off starts from the
+    // operator's non-thinking row when one is configured. The request's own
+    // fields apply after this and still win.
+    SamplerParams sampler = sampler_from_defaults(ctx.backend->status().sampler_defaults, nothink);
     if (auto err = sampler_apply(sampler, overrides)) {
         return HttpResult{400, invalid_request(*err)};
     }
@@ -721,9 +775,20 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
     if (log::enabled(log::Level::Debug)) {
         log::debug("prompt", "%zu bytes:\n%s", prompt.size(), prompt.c_str());
     }
-    if (auto err = finish_prepare(ctx, lane, prompt, prep.req.sampler, prep.input, prep.prompt_tokens)) {
+    // Resolved after the operator's template default above: only a request
+    // that ends up with thinking off gets the non-thinking row.
+    const bool nothink = prep.req.has_enable_thinking && !prep.req.enable_thinking;
+    if (auto err = finish_prepare(ctx, lane, prompt, prep.req.sampler, prep.input, prep.prompt_tokens,
+                                  nothink)) {
         return err;
     }
+    // llava: the answer row switches only in a turn the request declared as
+    // thinking (enable_thinking after the operator default above). A request
+    // that says nothing keeps the default true, matching the template; one that
+    // says false keeps the thinking row, whatever tags the model writes. A
+    // thinking turn whose block never opened is the sampler's own guard. Set
+    // after finish_prepare, which owns input.sampler.
+    prep.input.sampler.thinking_turn = prep.req.enable_thinking;
     // the media, in marker order across the whole request (the renderer put one
     // marker per part into the prompt)
     for (const ChatMessage& m : prep.req.messages)
@@ -755,7 +820,7 @@ std::optional<HttpResult> prepare_completion(const Context& ctx, const json& bod
     prep.model = lane >= 0 ? ctx.lanes[static_cast<size_t>(lane)].name : ctx.backend->status().served_id;
     if (auto err =
             finish_prepare(ctx, lane, prep.req.prompt, prep.req.sampler, prep.input, prep.prompt_tokens,
-                           prep.req.prompt_ids)) {
+                           /*nothink=*/false, prep.req.prompt_ids)) {
         return err;
     }
 
@@ -917,6 +982,9 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
                                            {"message", std::move(message)},
                                            {"finish_reason", finish}}})},
                  {"usage", usage_json(stats)}};
+    // loop-guard: present only when the ladder moved, so a request without the
+    // switch has the response body it always had.
+    if (loop_guard_moved(stats)) body["loop_guard"] = loop_guard_json(stats);
     return HttpResult{200, std::move(body)};
 }
 
@@ -942,6 +1010,7 @@ HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, in
                                            {"logprobs", nullptr},
                                            {"finish_reason", finish_reason_name(reason)}}})},
                  {"usage", usage_json(stats)}};
+    if (loop_guard_moved(stats)) body["loop_guard"] = loop_guard_json(stats);
     return HttpResult{200, std::move(body)};
 }
 
@@ -1151,9 +1220,11 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     json final_delta = json::object();
     if (had_reasoning)
         final_delta["reasoning_closed"] = !reasoning.in_reasoning();
+    json final_extra = json::object();
+    if (loop_guard_moved(stats)) final_extra["loop_guard"] = loop_guard_json(stats);
     if (!sse_send(write, chunk(json::array({{{"index", 0},
                                              {"delta", final_delta},
-                                             {"finish_reason", finish}}})))) {
+                                             {"finish_reason", finish}}}), final_extra))) {
         return;
     }
 
@@ -1225,10 +1296,12 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep, int s
         }
     }
 
+    json final_extra = json::object();
+    if (loop_guard_moved(stats)) final_extra["loop_guard"] = loop_guard_json(stats);
     if (!sse_send(write, chunk(json::array({{{"index", 0},
                                              {"text", ""},
                                              {"logprobs", nullptr},
-                                             {"finish_reason", finish_reason_name(reason)}}})))) {
+                                             {"finish_reason", finish_reason_name(reason)}}}), final_extra))) {
         return;
     }
 

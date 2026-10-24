@@ -208,6 +208,60 @@ TEST(config_operator_sampler_flags) {
     CHECK(cfg.min_p && *cfg.min_p == 0.05f);
 }
 
+TEST(config_nothink_sampler_flags_parse_and_mark_the_row) {
+    Config cfg;
+    CHECK(run({"--stub", "--nothink-temp", "0.7", "--nothink-top-p", "0.8",
+               "--nothink-top-k", "35", "--nothink-min-p", "0.05",
+               "--nothink-presence-penalty", "0.3"}, cfg).ok);
+    CHECK(cfg.nothink_temp && *cfg.nothink_temp == 0.7f);
+    CHECK(cfg.nothink_top_p && *cfg.nothink_top_p == 0.8f);
+    CHECK(cfg.nothink_top_k && *cfg.nothink_top_k == 35);
+    CHECK(cfg.nothink_min_p && *cfg.nothink_min_p == 0.05f);
+    CHECK(cfg.nothink_presence_penalty && *cfg.nothink_presence_penalty == 0.3f);
+
+    SamplerDefaults d;
+    CHECK(!apply_operator_defaults(cfg, d).has_value());
+    CHECK(d.nothink_row);
+    CHECK_EQ(d.provenance, std::string("operator"));
+    CHECK(d.nothink_temperature == 0.7f);
+
+    Config unset;
+    CHECK(run({"--stub"}, unset).ok);
+    CHECK(!unset.nothink_temp);
+    CHECK(!unset.nothink_top_p);
+    CHECK(!unset.nothink_top_k);
+    CHECK(!unset.nothink_min_p);
+    CHECK(!unset.nothink_presence_penalty);
+    SamplerDefaults plain;
+    CHECK(!apply_operator_defaults(unset, plain).has_value());
+    CHECK(!plain.nothink_row);   // no flag: every request on the normal row
+}
+
+TEST(config_nothink_flags_reject_out_of_range_like_their_twins) {
+    auto bad = [](std::vector<const char*> args) {
+        Config cfg;
+        if (!run(std::move(args), cfg).ok) return true;
+        SamplerDefaults d;
+        return apply_operator_defaults(cfg, d).has_value();
+    };
+    CHECK(bad({"--stub", "--nothink-temp", "2.5"}));      // [0, 2]
+    CHECK(bad({"--stub", "--nothink-top-p", "0"}));       // (0, 1]
+    CHECK(bad({"--stub", "--nothink-top-k", "-1"}));      // >= 0
+    CHECK(bad({"--stub", "--nothink-min-p", "1.5"}));     // [0, 1]
+    CHECK(bad({"--stub", "--nothink-presence-penalty", "3"}));   // [-2, 2]
+    // garbage is refused at parse time, like the twins
+    CHECK(rejected({"--stub", "--nothink-temp", "warm"}));
+    CHECK(rejected({"--stub", "--nothink-top-k", "many"}));
+    CHECK(rejected({"--stub", "--nothink-top-p"}));
+}
+
+TEST(config_nothink_flags_in_help) {
+    const std::string help = usage_text();
+    for (const char* flag : {"--nothink-temp", "--nothink-top-p", "--nothink-top-k",
+                             "--nothink-min-p", "--nothink-presence-penalty"})
+        CHECK(help.find(flag) != std::string::npos);
+}
+
 TEST(config_operator_flags_default_unset) {
     Config cfg;
     CHECK(run({"--stub"}, cfg).ok);
@@ -980,4 +1034,43 @@ TEST(config_tool_grammar_defaults_off_and_marks_the_defaults_operator) {
     CHECK(!apply_operator_defaults(on, d).has_value());
     CHECK(d.tool_grammar);
     CHECK(d.provenance == "operator");
+}
+
+TEST(config_answer_penalty_flags_parse_and_travel) {
+    // llava: the answer row's presence/frequency, the card's non-thinking
+    // penalty after the switch. Red before the flags existed.
+    Config cfg;
+    CHECK(run({"--stub", "--answer-presence-penalty", "1.5",
+               "--answer-frequency-penalty", "0.3"}, cfg).ok);
+    CHECK(cfg.answer_presence_penalty && *cfg.answer_presence_penalty == 1.5f);
+    CHECK(cfg.answer_frequency_penalty && *cfg.answer_frequency_penalty == 0.3f);
+
+    SamplerDefaults d;
+    CHECK(!apply_operator_defaults(cfg, d).has_value());
+    CHECK(d.answer_presence_penalty && *d.answer_presence_penalty == 1.5f);
+    CHECK(d.answer_frequency_penalty && *d.answer_frequency_penalty == 0.3f);
+    CHECK(d.provenance == "operator");
+
+    Config unset;
+    CHECK(run({"--stub"}, unset).ok);
+    CHECK(!unset.answer_presence_penalty);
+    CHECK(!unset.answer_frequency_penalty);
+}
+
+TEST(config_answer_penalty_flags_reject_out_of_range_and_are_in_help) {
+    // Same [-2, 2] as the normal row, through the same one source of truth.
+    auto bad = [](std::vector<const char*> args) {
+        Config cfg;
+        if (!run(std::move(args), cfg).ok) return true;
+        SamplerDefaults d;
+        return apply_operator_defaults(cfg, d).has_value();
+    };
+    CHECK(bad({"--stub", "--answer-presence-penalty", "3"}));
+    CHECK(bad({"--stub", "--answer-frequency-penalty", "-2.5"}));
+    CHECK(rejected({"--stub", "--answer-presence-penalty", "often"}));
+    CHECK(rejected({"--stub", "--answer-frequency-penalty"}));
+
+    const std::string help = usage_text();
+    for (const char* flag : {"--answer-presence-penalty", "--answer-frequency-penalty"})
+        CHECK(help.find(flag) != std::string::npos);
 }

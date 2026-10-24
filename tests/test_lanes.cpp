@@ -418,3 +418,41 @@ TEST(lanes_the_response_names_the_lane_and_runs_on_its_sequence) {
     CHECK_EQ(r2.body.at("model").get<std::string>(), std::string("agent"));
     CHECK_EQ(l.backend.last_slot.load(), 0);
 }
+
+TEST(handler_chat_marks_the_thinking_turn_for_the_answer_row) {
+    // llava: the answer row switches only in a turn the request declared as
+    // thinking. The handler is the one place that knows enable_thinking after
+    // the operator default, so it marks GenerationInput's sampler. Red on
+    // a4865a53: nothing set the field, so every server request stayed false and
+    // the answer row could never switch. A request that says nothing keeps the
+    // default true, which is what the template does too.
+    Lanes l;
+    json  body = chat("", 10);
+    body["answer_top_p"] = 0.8;
+
+    lgc::api::PreparedChat c;
+    CHECK(!lgc::api::prepare_chat(l.ctx, body, c));
+    CHECK(c.input.sampler.answer_top_p && *c.input.sampler.answer_top_p == 0.8f);
+    CHECK(c.input.sampler.thinking_turn);
+
+    // explicit enable_thinking false: the same answer field, no switch
+    body["chat_template_kwargs"] = json{{"enable_thinking", false}};
+    CHECK(!lgc::api::prepare_chat(l.ctx, body, c));
+    CHECK(c.input.sampler.answer_top_p && *c.input.sampler.answer_top_p == 0.8f);
+    CHECK(!c.input.sampler.thinking_turn);
+}
+
+TEST(handler_chat_reads_the_answer_rows_penalties) {
+    // llava: the request may set the answer row's presence/frequency for an
+    // A/B in one process. Red before the request fields were read.
+    Lanes l;
+    json  body = chat("", 10);
+    body["answer_presence_penalty"]  = 1.5;
+    body["answer_frequency_penalty"] = 0.3;
+
+    lgc::api::PreparedChat c;
+    CHECK(!lgc::api::prepare_chat(l.ctx, body, c));
+    CHECK(c.input.sampler.answer_presence_penalty && *c.input.sampler.answer_presence_penalty == 1.5f);
+    CHECK(c.input.sampler.answer_frequency_penalty && *c.input.sampler.answer_frequency_penalty == 0.3f);
+    CHECK(c.input.sampler.answer_configured());
+}

@@ -253,3 +253,104 @@ TEST(props_stub_reports_null_rather_than_a_default) {
     CHECK(j.at("model").at("architecture").is_null());
     CHECK(j.at("model").at("n_ctx_train").is_null());
 }
+
+// The non-thinking row: /props reports which row a thinking-off request gets,
+// so the operator can see it. "configured" false means no --nothink-* flag and
+// every request on the normal row, exactly as before.
+TEST(props_reports_the_non_thinking_row) {
+    Config      cfg;
+    FakeBackend backend;
+    backend.st.id         = "stub";
+    backend.st.served_id  = backend.st.id;
+    backend.st.loaded     = true;
+    backend.st.n_ctx      = 256;
+
+    SamplerDefaults& sd = backend.st.sampler_defaults;
+    sd.nothink_row              = true;
+    sd.nothink_temperature      = 0.7f;
+    sd.nothink_top_p            = 0.8f;
+    sd.nothink_top_k            = 35;
+    sd.nothink_min_p            = 0.05f;
+    sd.nothink_presence_penalty = 0.3f;
+
+    SlotPool slots(1);
+    Context  ctx{&cfg, &backend, &slots};
+
+    const nlohmann::json n = lgc::api::props(ctx).at("sampler_defaults").at("nothink");
+    CHECK(n.at("configured").get<bool>());
+    CHECK(n.at("temperature").get<float>() == 0.7f);
+    CHECK(n.at("top_p").get<float>() == 0.8f);
+    CHECK(n.at("top_k").get<int>() == 35);
+    CHECK(n.at("min_p").get<float>() == 0.05f);
+    CHECK(n.at("presence_penalty").get<float>() == 0.3f);
+
+    // Unset fields are null, not a guessed value: they fall back to the
+    // normal row, which is reported above them.
+    sd = SamplerDefaults{};
+    sd.nothink_row = true;
+    sd.nothink_top_p = 0.8f;
+    const nlohmann::json n2 = lgc::api::props(ctx).at("sampler_defaults").at("nothink");
+    CHECK(n2.at("configured").get<bool>());
+    CHECK(n2.at("temperature").is_null());
+    CHECK(n2.at("top_p").get<float>() == 0.8f);
+    CHECK(n2.at("top_k").is_null());
+
+    // No --nothink-* flag: nothing configured
+    sd = SamplerDefaults{};
+    const nlohmann::json n3 = lgc::api::props(ctx).at("sampler_defaults").at("nothink");
+    CHECK(!n3.at("configured").get<bool>());
+    CHECK(n3.at("temperature").is_null());
+}
+
+TEST(props_reports_the_answer_rows_penalties) {
+    // llava: /props must say which answer-row penalties are set, null for the
+    // ones the operator left on the thinking row's value. Red before the keys.
+    Config      cfg;
+    FakeBackend backend;
+    backend.st.id        = "stub";
+    backend.st.served_id = backend.st.id;
+    backend.st.loaded    = true;
+    backend.st.n_ctx     = 256;
+
+    SamplerDefaults& sd = backend.st.sampler_defaults;
+    sd.answer_presence_penalty  = 1.5f;
+    sd.answer_frequency_penalty = 0.3f;
+
+    SlotPool slots(1);
+    Context  ctx{&cfg, &backend, &slots};
+    const nlohmann::json a = lgc::api::props(ctx).at("sampler_defaults").at("answer");
+    CHECK(a.at("presence_penalty").get<float>() == 1.5f);
+    CHECK(a.at("frequency_penalty").get<float>() == 0.3f);
+
+    sd = SamplerDefaults{};
+    sd.answer_presence_penalty = 0.0f;   // explicitly set, still reported
+    const nlohmann::json a2 = lgc::api::props(ctx).at("sampler_defaults").at("answer");
+    CHECK(a2.at("presence_penalty").get<float>() == 0.0f);
+    CHECK(a2.at("frequency_penalty").is_null());
+}
+
+TEST(props_reports_the_loop_guard_switch_and_thresholds) {
+    // loop-guard: /props says which rung the server serves and its window,
+    // threshold and grace, so a turn that ends "loop" is explained there.
+    Config      cfg;
+    FakeBackend backend;
+    backend.st.id        = "stub";
+    backend.st.served_id = backend.st.id;
+    backend.st.loaded    = true;
+    backend.st.n_ctx     = 256;
+
+    backend.st.sampler_defaults.loop_guard          = LoopGuardMode::Ladder;
+    backend.st.sampler_defaults.loop_guard_match     = LoopGuardMatch::Exact;
+    backend.st.sampler_defaults.loop_guard_window    = 120;
+    backend.st.sampler_defaults.loop_guard_threshold = 0.75f;
+    backend.st.sampler_defaults.loop_guard_grace     = 30;
+
+    SlotPool slots(1);
+    Context  ctx{&cfg, &backend, &slots};
+    const nlohmann::json lg = lgc::api::props(ctx).at("sampler_defaults").at("loop_guard");
+    CHECK_EQ(lg.at("mode").get<std::string>(), std::string("ladder"));
+    CHECK_EQ(lg.at("match").get<std::string>(), std::string("exact"));
+    CHECK_EQ(lg.at("window").get<int>(), 120);
+    CHECK_EQ(lg.at("threshold").get<float>(), 0.75f);
+    CHECK_EQ(lg.at("grace").get<int>(), 30);
+}

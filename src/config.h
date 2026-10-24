@@ -195,6 +195,31 @@ struct Config {
     std::optional<float> repetition_penalty;
     std::optional<float> presence_penalty;
 
+    // llava: the answer row, used for tokens drawn after the think block has
+    // closed in a thinking turn (--answer-temp/--answer-top-p/--answer-top-k/
+    // --answer-min-p). Unset fields keep the thinking row's value; no field set
+    // keeps today's behaviour exactly. A request may set the same fields
+    // (answer_temperature, answer_top_p, ...) for an A/B in one process.
+    std::optional<float> answer_temperature;
+    std::optional<float> answer_top_p;
+    std::optional<int>   answer_top_k;
+    std::optional<float> answer_min_p;
+    // llava: the answer row's presence/frequency penalties. Unset keeps the
+    // thinking row's value; set, the penalty counts only tokens drawn after
+    // the closer (Sampler::observe), not the reasoning.
+    std::optional<float> answer_presence_penalty;
+    std::optional<float> answer_frequency_penalty;
+    // The non-thinking row: --nothink-temp/-top-p/-top-k/-min-p/
+    // -presence-penalty. A request that resolves to thinking off starts from
+    // these instead of the row above; unset fields fall back to the normal
+    // row. No flag at all keeps every request on the normal row, exactly as
+    // before.
+    std::optional<float> nothink_temp;
+    std::optional<float> nothink_top_p;
+    std::optional<int>   nothink_top_k;
+    std::optional<float> nothink_min_p;
+    std::optional<float> nothink_presence_penalty;
+
     // --chat-template-kwarg enable_thinking=BOOL: the default a request gets
     // when it sends neither chat_template_kwargs.enable_thinking nor
     // reasoning_effort. Only enable_thinking is accepted, because it is the
@@ -212,6 +237,19 @@ struct Config {
     // GBNF grammar, so an unterminated call block is unreachable. Off by
     // default; a no-op when the request declared no tools.
     bool tool_grammar = false;
+
+    // loop-guard: off|detect|nudge|slap|ladder (--loop-guard), and the ladder's
+    // thresholds. Off by default: no detector, no forced token, no new finish
+    // reason. A request may set its own rung with loop_guard, for that request.
+    std::string loop_guard = "off";
+    // --loop-guard-match exact|near: how a line counts as a repeat. Near is
+    // the default (a counting loop whose lines differ only in a number word);
+    // set_match says the flag was given, so off's defaults stay untouched.
+    std::string loop_guard_match     = "near";
+    bool        loop_guard_match_set = false;
+    int         loop_guard_window    = 200;
+    float       loop_guard_threshold = 0.8f;
+    int         loop_guard_grace     = 40;
 
     // Stub-only: milliseconds of artificial latency per emitted token. Exists
     // so the cancellation path (§3.7) can be demonstrated against a backend

@@ -120,6 +120,9 @@ double decode_other_seconds(const GenerationStats& stats);
 // lands on the line, extracted from log_stats so the wiring is unit-testable
 // at the struct level.
 std::string decode_suffix_for(const GenerationStats& stats);
+// loop-guard: the per-request counters as the response's `loop_guard` object.
+// Exposed so the stats-to-JSON wiring is unit-testable without a card.
+nlohmann::json loop_guard_json(const GenerationStats& stats);
 
 // Takes a lane for one request, or returns the 503 that says why not — with
 // the lane counts in it (slots.total, slots.free), so "busy" is a number and not a mood.

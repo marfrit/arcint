@@ -173,6 +173,24 @@ std::optional<std::string> read_sampler(const json& b, SamplerOverrides& s) {
         if (!b["tool_grammar"].is_boolean()) return "tool_grammar must be a boolean";
         s.tool_grammar = b["tool_grammar"].get<bool>();
     }
+    // loop-guard: the request's own rung, overriding the operator's flag for
+    // this request only. Non-standard, so it is named; absent keeps the flag.
+    if (b.contains("loop_guard") && !b["loop_guard"].is_null()) {
+        if (!b["loop_guard"].is_string())
+            return "loop_guard must be one of off, detect, nudge, slap, ladder";
+        const std::string name = b["loop_guard"].get<std::string>();
+        const auto mode = loop_guard_parse(name);
+        if (!mode) return log::format("loop_guard must be off|detect|nudge|slap|ladder, got '%s'", name.c_str());
+        s.loop_guard = *mode;
+    }
+    // llava: the answer row after the think block, for an A/B in one process.
+    // Absent keeps the operator's setting; a named field wins for this request.
+    if (auto e = num("answer_temperature", s.answer_temperature)) return e;
+    if (auto e = num("answer_top_p", s.answer_top_p)) return e;
+    if (auto e = num("answer_min_p", s.answer_min_p)) return e;
+    if (auto e = num("answer_presence_penalty", s.answer_presence_penalty)) return e;
+    if (auto e = num("answer_frequency_penalty", s.answer_frequency_penalty)) return e;
+    if (auto e = integer("answer_top_k", s.answer_top_k)) return e;
     if (b.contains("stop")) {
         if (auto e = read_stop(b["stop"], s)) return e;
     }

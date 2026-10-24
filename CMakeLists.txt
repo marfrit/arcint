@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 1.2.2 LANGUAGES CXX)
+project(arcint VERSION 1.2.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -230,6 +230,8 @@ if(ARCINT_TESTS)
     tests/test_spec_state.cpp
     tests/test_token_ids.cpp
     tests/test_props.cpp
+    tests/test_sampler_modes.cpp
+    tests/test_loop_guard.cpp
     tests/test_lanes.cpp
     tests/test_reasoning.cpp
     tests/test_stream_utf8.cpp

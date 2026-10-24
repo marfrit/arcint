@@ -745,3 +745,201 @@ TEST(sampler_id_rule_no_ids_keeps_the_text_behaviour) {
     CHECK(!s.think_block_open());
     CHECK_EQ(s.sample(eog_first().data(), 4), 0);
 }
+
+// ---------------------------------------------------------------------------
+// llava: the answer row after the think block, within one turn. The switch is
+// off unless an answer field is set and the turn declared thinking; the block
+// must actually have opened. The rows are asserted through effective_row(),
+// the same values draw() reads for the next sample.
+
+namespace {
+
+// The id-close table (the closer is one special token, id 2) plus a thinking
+// row and an answer row that differ in every field, so a switch is unmistakable.
+SamplerParams answer_params(bool thinking_turn) {
+    SamplerParams p = id_close_params();
+    p.temperature        = 0.9f;
+    p.top_p              = 0.95f;
+    p.top_k              = 40;
+    p.min_p              = 0.05f;
+    p.answer_temperature = 0.3f;
+    p.answer_top_p       = 0.8f;
+    p.answer_top_k       = 10;
+    p.answer_min_p       = 0.0f;
+    p.thinking_turn      = thinking_turn;
+    return p;
+}
+
+}  // namespace
+
+TEST(sampler_answer_row_switches_after_the_closer) {
+    // Inside the block the thinking row draws; after the closer id the answer
+    // row. Red before the switch: the answer fields were ignored, so both draws
+    // reported the thinking row.
+    Sampler s(answer_params(true), 1);
+    s.start_in_think_block(true);
+    auto r = s.effective_row();
+    CHECK(!r.answer_row);
+    CHECK(r.temperature == 0.9f && r.top_p == 0.95f && r.top_k == 40 && r.min_p == 0.05f);
+    CHECK(s.think_block_open());
+    s.observe(2);   // the closer id
+    CHECK(!s.think_block_open());
+    r = s.effective_row();
+    CHECK(r.answer_row);
+    CHECK(r.temperature == 0.3f && r.top_p == 0.8f && r.top_k == 10 && r.min_p == 0.0f);
+}
+
+TEST(sampler_answer_row_unset_changes_nothing_after_the_closer) {
+    // No answer row configured: today's behaviour, byte-identical. Green before
+    // and after the switch.
+    SamplerParams p = id_close_params();
+    p.thinking_turn = true;
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    s.observe(2);
+    const auto r = s.effective_row();
+    CHECK(!r.answer_row);
+    CHECK(r.temperature == p.temperature && r.top_p == p.top_p && r.top_k == p.top_k && r.min_p == p.min_p);
+}
+
+TEST(sampler_answer_row_never_switches_in_a_non_thinking_turn) {
+    // The request said enable_thinking false: whatever tags the model writes,
+    // the answer row stays off. Red before the thinking_turn guard.
+    Sampler s(answer_params(false), 1);
+    s.start_in_think_block(true);
+    s.observe(2);
+    const auto r = s.effective_row();
+    CHECK(!r.answer_row);
+    CHECK(r.temperature == 0.9f && r.top_p == 0.95f && r.top_k == 40 && r.min_p == 0.05f);
+}
+
+TEST(sampler_answer_row_never_switches_when_the_block_never_opened) {
+    // A thinking turn that produced plain content: no block ever opened, so the
+    // answer row is not for this turn. Red before the block-was-open guard.
+    Sampler s(answer_params(true), 1);
+    s.start_in_think_block(false);
+    s.observe_think_text("a plain answer, no block");
+    const auto r = s.effective_row();
+    CHECK(!r.answer_row);
+    CHECK(r.temperature == 0.9f && r.top_p == 0.95f && r.top_k == 40 && r.min_p == 0.05f);
+}
+
+TEST(sampler_answer_row_a_spelled_closer_inside_the_block_does_not_switch) {
+    // Ordinary tokens spelling the closer are still reasoning: the id rule does
+    // not close the block on text, so the answer row must not take over. Red
+    // before the id rule (the text path would have switched here).
+    Sampler s(answer_params(true), 1);
+    s.start_in_think_block(true);
+    s.observe(30, spelled_closer());   // ordinary token, the closer's text
+    CHECK(s.think_block_open());
+    const auto r = s.effective_row();
+    CHECK(!r.answer_row);
+    CHECK(r.temperature == 0.9f && r.top_p == 0.95f && r.top_k == 40 && r.min_p == 0.05f);
+}
+
+// ---------------------------------------------------------------------------
+// llava: the answer row's presence (and frequency) penalty counts the answer,
+// not the reasoning. In a real non-thinking turn there is no think block, so
+// the penalty sees only the answer; after a switch it must see the same thing,
+// or it docks exactly the identifiers the reasoning just worked out.
+
+namespace {
+
+// The id-close table (closer id 2), greedy in both phases, and only the answer
+// presence configured: that field alone arms the switch, and the thinking row's
+// values stay in force for every other field.
+SamplerParams answer_penalty_params(bool thinking_turn, float answer_presence,
+                                    float answer_frequency = 0.0f) {
+    SamplerParams p = id_close_params();
+    p.thinking_turn            = thinking_turn;
+    p.answer_presence_penalty  = answer_presence;
+    p.answer_frequency_penalty = answer_frequency;
+    return p;
+}
+
+}  // namespace
+
+TEST(sampler_answer_presence_reads_the_answer_history_only) {
+    // A token seen in the reasoning only and no longer penalised after the
+    // switch; a token drawn after the switch is. Red before the second count
+    // map: presence read generated_, so the reasoning's token dropped by the
+    // answer penalty and lost the draw.
+    Sampler s(answer_penalty_params(true, 1.5f), 1);
+    s.start_in_think_block(true);
+    s.observe(5);   // reasoning only
+    s.observe(2);   // the closer id
+    CHECK(s.effective_row().answer_row);
+
+    // id5 (reasoning) 1.2, id7 1.0. With the wrong history id5 drops by 1.5
+    // to -0.3 and 7 wins; correct, 5 is untouched and wins.
+    auto l = logits({0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.2f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f});
+    CHECK_EQ(s.sample(l.data(), l.size()), 5);
+
+    // Now an answer token: id7 drawn after the switch. It is in the answer
+    // history, so it drops by 1.5 and id8 (1.0) wins.
+    s.observe(7);
+    auto l2 = logits({0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.2f, 1.0f, 0.0f, 0.0f, 0.0f});
+    CHECK_EQ(s.sample(l2.data(), l2.size()), 8);
+}
+
+TEST(sampler_answer_history_excludes_the_closer_token) {
+    // The closer that ended the reasoning is the history's edge, not its first
+    // entry. Red before the fix: the closer was in generated_ and got docked,
+    // so it lost a draw it should win.
+    Sampler s(answer_penalty_params(true, 1.5f), 1);
+    s.start_in_think_block(true);
+    s.observe(2);   // the closer id, the only token generated so far
+    CHECK(s.effective_row().answer_row);
+
+    // id2 (the closer) 1.2, id9 1.0: if the closer were counted it would drop
+    // by 1.5 to -0.3 and 9 would win.
+    auto l = logits({0.0f, 0.0f, 1.2f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f});
+    CHECK_EQ(s.sample(l.data(), l.size()), 2);
+}
+
+TEST(sampler_no_answer_penalty_keeps_the_whole_history_in_both_phases) {
+    // No answer presence/frequency configured: the answer row may switch on
+    // another field, but these penalties stay the thinking row's values over
+    // the whole generated history, exactly as today. Green before and after.
+    SamplerParams p     = answer_params(true);
+    p.temperature       = 0.0f;
+    p.answer_temperature = 0.0f;
+    p.answer_top_k      = 0;
+    p.answer_top_p      = 1.0f;
+    p.answer_min_p      = 0.0f;
+    p.presence_penalty  = 1.5f;
+    p.frequency_penalty = 0.5f;
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    s.observe(5);
+    s.observe(5);   // twice: -0.5*2 frequency
+
+    // Before the switch: 1.2 - 1.5 - 1.0 = -1.3, so id7 (1.0) wins.
+    auto l = logits({0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.2f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f});
+    CHECK_EQ(s.sample(l.data(), l.size()), 7);
+
+    s.observe(2);
+    CHECK(s.effective_row().answer_row);
+    // After the switch the same, whole-history counts still apply: id5 stays
+    // penalised and 7 wins again.
+    auto l2 = logits({0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.2f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f});
+    CHECK_EQ(s.sample(l2.data(), l2.size()), 7);
+}
+
+TEST(sampler_non_thinking_turn_keeps_the_normal_rows_presence_over_all_history) {
+    // A turn that never switches: the answer presence is configured but inert,
+    // and the normal row's presence applies over the whole history, as today.
+    // The answer value differs from the normal one so a wrong-field read shows.
+    SamplerParams p = answer_penalty_params(false, 3.0f);
+    p.presence_penalty = 1.5f;
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    s.observe(5);
+    s.observe(2);   // whatever the model writes, this turn never switches
+    CHECK(!s.effective_row().answer_row);
+
+    // id5 2.8 - 1.5 = 1.3, so 5 wins. Under the answer value (3.0) it would be
+    // -0.2 and id7 (1.0) would win.
+    auto l = logits({0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 2.8f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f});
+    CHECK_EQ(s.sample(l.data(), l.size()), 5);
+}

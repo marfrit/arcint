@@ -964,6 +964,7 @@ public:
         Sampler sampler(in.sampler, seed);
         sampler.set_prompt(prompt);
         prepare_think_mask(in, sampler);
+        prepare_loop_guard(in, sampler);
         const auto tool_grammar = prepare_tool_grammar(in, sampler);
 
         std::vector<int>&  have = slot_tokens_[static_cast<size_t>(seq)];
@@ -1014,6 +1015,12 @@ public:
         stats.decode_sample_seconds += seconds_since(t_s0);
         auto is_stop_token = [&](int tok) { return is_stop(in.sampler, tok); };
         while (true) {
+            // loop-guard: the answer phase looped after a slap; the token was
+            // sampled but must not be emitted, so the turn ends here.
+            if (sampler.loop_abort()) {
+                reason = FinishReason::Loop;
+                break;
+            }
             if (is_stop_token(next)) break;
             if (in.sampler.max_tokens >= 0 && stats.completion_tokens >= in.sampler.max_tokens) {
                 reason = FinishReason::Length;
@@ -1048,6 +1055,7 @@ public:
         }
         stats.decode_seconds = seconds_since(t_decode);
         report_tool_grammar(seq, tool_grammar.get(), sampler, stats);
+        report_loop_guard(seq, sampler, stats);
         log_expert_cache(seq);
         return reason;
     }
@@ -1119,6 +1127,7 @@ public:
         Sampler sampler(in.sampler, seed);
         sampler.set_prompt(tokenizer_->encode(in.prompt));
         prepare_think_mask(in, sampler);
+        prepare_loop_guard(in, sampler);
         const auto tool_grammar = prepare_tool_grammar(in, sampler);
 
         std::vector<int>&  have   = slot_tokens_[static_cast<size_t>(seq)];
@@ -1154,6 +1163,12 @@ public:
         stats.decode_sample_seconds += seconds_since(t_s0);
         auto is_stop_token = [&](int tok) { return is_stop(in.sampler, tok); };
         while (true) {
+            // loop-guard: as the plain loop, the answer phase looped after a
+            // slap and no further token is emitted.
+            if (sampler.loop_abort()) {
+                reason = FinishReason::Loop;
+                break;
+            }
             if (is_stop_token(next)) break;
             if (in.sampler.max_tokens >= 0 && stats.completion_tokens >= in.sampler.max_tokens) {
                 reason = FinishReason::Length;
@@ -1188,6 +1203,7 @@ public:
         }
         stats.decode_seconds = seconds_since(t_decode);
         report_tool_grammar(seq, tool_grammar.get(), sampler, stats);
+        report_loop_guard(seq, sampler, stats);
         return reason;
     }
 
@@ -1493,6 +1509,7 @@ private:
         Sampler sampler(in.sampler, seed);
         sampler.set_prompt(prompt);
         prepare_think_mask(in, sampler);
+        prepare_loop_guard(in, sampler);
         const auto tool_grammar = prepare_tool_grammar(in, sampler);
         std::vector<int>&  have = slot_tokens_[static_cast<size_t>(seq)];
         std::vector<float> rows;   // the verified rows' logits
@@ -1573,6 +1590,26 @@ private:
             for (size_t i = 0; i < draft.size(); ++i) rows[i * n_vocab_ + static_cast<size_t>(draft[i])] = 1e30f;
 #endif
             double     emit_s = 0.0;
+            // llava: the verify walk samples each row with the sampler state as
+            // of that token -- sample(), then emit (which feeds observe_think),
+            // then walk_verify's own observe(token) before the next row. So a
+            // closer inside the verified span switches the following draws to
+            // the answer row exactly as it would in the plain loop; observe()
+            // counts the closer as the answer history's edge (not into it) and
+            // every token after it into the answer's own presence counts, so a
+            // verify that closes mid-span starts the history at the right token.
+            //
+            // loop-guard under speculation: sample() returns a forced token
+            // (the nudge's next id, or the closer id for a slap) at the row
+            // boundary it is drawn for. The walk emits and observes it; when it
+            // differs from the draft at that position the walk breaks on the
+            // draft mismatch, so the remaining drafts in flight are dropped and
+            // the accept below keeps only the emitted prefix. A nudge therefore
+            // costs one decode step per sentence token under draft-rich decode
+            // (the drafts are re-proposed next step), which is the simple,
+            // correct rule; a slap costs one step and closes the block. No
+            // drafter state is advanced past the boundary because spec_->accept
+            // is called with the walked acceptance only.
             const auto t_walk = clock_type::now();
             const VerifyWalk w = walk_verify(
                 rows.data(), batch.size(), n_vocab_, draft, sampler, budget,
@@ -1620,6 +1657,7 @@ private:
                       static_cast<unsigned long long>(n_combined_), static_cast<unsigned long long>(n_uneven_));
         }
         report_tool_grammar(seq, tool_grammar.get(), sampler, stats);
+        report_loop_guard(seq, sampler, stats);
         log_expert_cache(seq);
         return reason;
     }
@@ -1812,11 +1850,25 @@ private:
     }
 
     void prepare_think_mask(const GenerationInput& in, Sampler& sampler) const {
-        if (!in.sampler.think_eog_mask && !in.sampler.tool_grammar) return;
+        // llava: the answer row needs the same tracker, so the ids are set for
+        // it too; the mask itself still engages only under think_eog_mask.
+        // loop-guard: the detector needs the block's state and the closer id for
+        // the slap, so it arms the tracker too.
+        if (!in.sampler.think_eog_mask && !in.sampler.tool_grammar && !in.sampler.answer_configured()
+            && in.sampler.loop_guard == LoopGuardMode::Off)
+            return;
         ThinkBlockIds ids = in.think_tags_extended ? think_ids_ext_ : think_ids_qwen_;
         ids.eog = eog_ids_;
         sampler.set_think_mask_ids(std::move(ids));
         sampler.start_in_think_block(in.think_open);
+    }
+
+    // loop-guard: the nudge sentence's ids. The sampler forces one id a draw,
+    // at a token boundary, so the decode loop emits/observes/decodes them like
+    // any drawn token; it never tokenises inside sample(). Off is inert.
+    void prepare_loop_guard(const GenerationInput& in, Sampler& sampler) const {
+        if (in.sampler.loop_guard == LoopGuardMode::Off) return;
+        sampler.set_loop_guard_nudge(tokenizer_->encode(kLoopGuardNudge));
     }
 
     // clean-turns step 2: the request's tool-call grammar, handed to the
@@ -1848,6 +1900,19 @@ private:
         stats.grammar_desyncs = g->desync();
         log::info("grammar", "lane %d: tool-call grammar: %d draws masked%s", seq, g->rejections(),
                   g->broken() ? "; it gave up on a token outside it (error line above)" : "");
+    }
+
+    // loop-guard: the per-request counters into the stats struct, so the
+    // decode line and the response object read the same numbers.
+    static void report_loop_guard(int seq, Sampler& sampler, GenerationStats& stats) {
+        const Sampler::LoopGuardCounts c = sampler.loop_guard_counts();
+        stats.loop_detections = c.detections;
+        stats.loop_nudges     = c.nudges;
+        stats.loop_slaps      = c.slaps;
+        stats.loop_aborts     = c.aborts;
+        if (c.detections || c.nudges || c.slaps || c.aborts)
+            log::info("loop-guard", "lane %d: detected %d, nudged %d, slapped %d, aborted %d", seq,
+                      c.detections, c.nudges, c.slaps, c.aborts);
     }
 
     // One llama_decode of n tokens of `seq` at positions [pos, pos + n), with

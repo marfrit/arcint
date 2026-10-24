@@ -104,7 +104,7 @@ enum class Control {
 
 using TokenCallback = std::function<Control(std::string_view piece, int token_id)>;
 
-enum class FinishReason { Stop, Length, Abort };
+enum class FinishReason { Stop, Length, Abort, Loop };
 
 const char* finish_reason_name(FinishReason r);
 
@@ -169,7 +169,9 @@ struct GenerationInput {
     // this artifact answers to the wider tag family. The API knows both from the
     // template (Prepared::think_open / think_tags_extended); the backend needs
     // them because the mask must engage before the FIRST sample, not after the
-    // first emitted piece.
+    // first emitted piece. SamplerParams::thinking_turn is the request's
+    // enable_thinking after the operator default, so llava's answer row never
+    // switches in a non-thinking turn.
     bool think_open          = false;
     bool think_tags_extended = false;
 };
@@ -183,6 +185,13 @@ struct GenerationStats {
     // verify steps (one target decode of [last, drafts...] each): the
     // accepted drafts + steps over steps is the tokens a verify
     int    draft_steps       = 0;
+    // loop-guard: what the ladder did in this request. Zero on every request
+    // without the switch -- the decode line and the response only print them
+    // when they moved.
+    int    loop_detections   = 0;
+    int    loop_nudges       = 0;
+    int    loop_slaps        = 0;
+    int    loop_aborts       = 0;
     // Wall time spent copying the whole model state so a rejected draft can be
     // rolled back. On the stateful path this is the price of speculation.
     // What the prefix cache costs on the way in. It is the same host round-trip
