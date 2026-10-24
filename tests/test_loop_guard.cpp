@@ -647,3 +647,218 @@ TEST(loop_guard_a_piece_with_two_line_ends_counts_both_lines) {
     feed_text(s, r);   // the 8th repeat of r: 8 of 10
     CHECK_EQ(s.loop_guard_counts().detections, 1);
 }
+
+// single newline instead. The masked draw is counted.
+TEST(loop_guard_door_masks_multi_newlines_inside_an_open_block) {
+    SamplerParams p = base_params(LoopGuardMode::Door, 10, 5);
+    p.loop_guard_door_ids = {6, 7};   // the double/triple newline ids; 4 is single
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // the detector fires; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    std::vector<float> row(8, -1.0f);
+    row[4] = 1.0f;   // the single newline
+    row[6] = 5.0f;   // a multi-newline token at the top
+    const int tok = s.sample(row.data(), row.size());
+    CHECK_EQ(tok, 4);
+    CHECK(row[6] == -INFINITY);
+    CHECK(row[7] == -INFINITY);
+    CHECK(row[4] == 1.0f);   // the single newline was never masked
+    CHECK_EQ(s.loop_guard_counts().door_masked, 1);
+}
+
+// The door never applies outside the block, never before detection, and never
+// with the switch off. Those rows are the plain draws, byte-identical.
+TEST(loop_guard_door_never_applies_outside_its_window) {
+    // (a) off is today's behaviour: the switch ignores the door ids entirely.
+    {
+        SamplerParams p = base_params(LoopGuardMode::Off, 10, 5);
+        p.loop_guard_door_ids = {6, 7};
+        Sampler s(p, 1);
+        s.start_in_think_block(true);
+        feed_lines(s, 0, 40, true);
+        std::vector<float> row(8, -1.0f);
+        row[6] = 5.0f;
+        const std::vector<float> before = row;
+        CHECK_EQ(s.sample(row.data(), row.size()), 6);
+        CHECK(row == before);
+        CHECK_EQ(s.loop_guard_counts().door_masked, 0);
+    }
+    // (b) before detection: six varied lines, under the 10-line floor.
+    {
+        SamplerParams p = base_params(LoopGuardMode::Door, 10, 5);
+        p.loop_guard_door_ids = {6, 7};
+        Sampler s(p, 1);
+        s.start_in_think_block(true);
+        feed_lines(s, 0, 6, false);
+        CHECK_EQ(s.loop_guard_counts().detections, 0);
+        std::vector<float> row(8, -1.0f);
+        row[6] = 5.0f;
+        CHECK_EQ(s.sample(row.data(), row.size()), 6);
+        CHECK_EQ(s.loop_guard_counts().door_masked, 0);
+    }
+    // (c) outside the block: the door opened, the model closed with the closer
+    // id, and the content phase draws the multi-newline token again.
+    {
+        SamplerParams p = base_params(LoopGuardMode::Door, 10, 5);
+        p.loop_guard_door_ids = {6, 7};
+        Sampler s(p, 1);
+        s.start_in_think_block(true);
+        feed_lines(s, 0, 9, false);
+        feed_lines(s, 9, 18, true);
+        CHECK_EQ(s.loop_guard_counts().detections, 1);
+        s.observe(5, "closed");
+        CHECK(!s.think_block_open());
+        std::vector<float> row(8, -1.0f);
+        row[6] = 5.0f;
+        CHECK_EQ(s.sample(row.data(), row.size()), 6);
+        CHECK_EQ(s.loop_guard_counts().door_masked, 0);
+    }
+}
+
+// The door lets the model close by its own draw: a stream whose top token is
+// the double newline draws the closer once that is masked, counts one
+// self-close, and no nudge or slap follows.
+TEST(loop_guard_door_self_close_needs_no_nudge_or_slap) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 5);
+    p.loop_guard_door_grace = 20;
+    p.loop_guard_door_ids   = {6, 7};
+    p.loop_guard_nudge_ids  = {kPieceFirst};   // armed, but it must not fire
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+
+    std::vector<float> row(8, -1.0f);
+    row[6] = 10.0f;   // the model's likely pick: the double newline
+    row[5] = 9.0f;    // the block's closer, legal, right behind it
+    row[4] = 8.0f;    // the single newline
+    const int tok = s.sample(row.data(), row.size());
+    CHECK_EQ(tok, 5);
+    s.observe(tok, "closed");
+    CHECK_EQ(s.loop_guard_counts().self_closes, 1);
+    CHECK_EQ(s.loop_guard_counts().door_masked, 1);
+
+    // The block is closed: no later line nudges or slaps.
+    feed_lines(s, 18, 40, true);
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+    CHECK_EQ(s.loop_guard_counts().self_closes, 1);
+}
+
+// Ladder order with the door grace: the door opens at detection, no nudge
+// before K more counted lines, the nudge at the Kth, the slap after the nudge
+// grace. ladder-nodoor keeps the old order: nudge at detection.
+TEST(loop_guard_ladder_door_then_nudge_then_slap_or_nodoor_old_order) {
+    auto detections_at = [&](LoopGuardMode mode, int door_grace, int slap_grace) {
+        SamplerParams p = base_params(mode, 10, slap_grace);
+        p.loop_guard_door_grace = door_grace;
+        p.loop_guard_door_ids   = {6, 7};
+        for (size_t i = 0; i < kPiece.size(); ++i)
+            p.loop_guard_nudge_ids.push_back(kPieceFirst + static_cast<int>(i));
+        Sampler s(p, 1);
+        s.start_in_think_block(true);
+        feed_lines(s, 0, 9, false);
+        feed_lines(s, 9, 18, true);   // detection at the 9th repeating line
+        return s;
+    };
+
+    // ladder: door grace 4, slap grace 3.
+    {
+        Sampler s = detections_at(LoopGuardMode::Ladder, 4, 3);
+        CHECK_EQ(s.loop_guard_counts().detections, 1);
+        CHECK_EQ(s.loop_guard_counts().nudges, 0);   // no nudge at detection
+        for (int i = 18; i < 21; ++i) {   // 3 more counted lines: still short of 4
+            feed_text(s, loop_line(i));
+            CHECK_EQ(s.loop_guard_counts().nudges, 0);
+        }
+        feed_text(s, loop_line(21));   // the 4th line after detection: the nudge
+        CHECK_EQ(s.loop_guard_counts().nudges, 1);
+        CHECK_EQ(s.loop_guard_counts().slaps, 0);
+
+        // Deliver the nudge sentence, then wait out the slap grace.
+        for (size_t i = 0; i < kPiece.size(); ++i) {
+            std::vector<float> l = row_with_argmax(2);
+            const int id = s.sample(l.data(), l.size());
+            s.observe_think(id, piece_of(id));
+        }
+        feed_text(s, loop_line(22));
+        feed_text(s, loop_line(23));   // 2 lines after the nudge: no slap yet
+        CHECK_EQ(s.loop_guard_counts().slaps, 0);
+        feed_text(s, loop_line(24));   // the 3rd: the slap
+        CHECK_EQ(s.loop_guard_counts().slaps, 1);
+        std::vector<float> l = row_with_argmax(2);
+        CHECK_EQ(s.sample(l.data(), l.size()), 5);
+    }
+
+    // ladder-nodoor: the nudge is the first rung at detection, exactly as the
+    // ladder before the door.
+    {
+        Sampler s = detections_at(LoopGuardMode::LadderNoDoor, 4, 3);
+        CHECK_EQ(s.loop_guard_counts().detections, 1);
+        CHECK_EQ(s.loop_guard_counts().nudges, 1);   // immediately at detection
+        CHECK_EQ(s.loop_guard_counts().slaps, 0);
+        for (size_t i = 0; i < kPiece.size(); ++i) {
+            std::vector<float> l = row_with_argmax(2);
+            const int id = s.sample(l.data(), l.size());
+            s.observe_think(id, piece_of(id));
+        }
+        feed_text(s, loop_line(18));
+        feed_text(s, loop_line(19));   // 2 lines after the nudge: no slap yet
+        CHECK_EQ(s.loop_guard_counts().slaps, 0);
+        feed_text(s, loop_line(20));   // the 3rd: the slap, as before
+        CHECK_EQ(s.loop_guard_counts().slaps, 1);
+    }
+}
+
+// The door counters reach the stats consumers: the decode suffix, the response
+// object, and the /props defaults carry the door grace and the mode names.
+TEST(loop_guard_door_counters_and_modes_parse) {
+    GenerationStats st;
+    st.loop_self_closes = 2;
+    st.loop_door_masked = 3;
+    const nlohmann::json j = api::loop_guard_json(st);
+    CHECK_EQ(j.at("self_closes").get<int>(), 2);
+    CHECK_EQ(j.at("door_masked").get<int>(), 3);
+    const std::string line = api::decode_suffix_for(st);
+    CHECK(line.find("self-closed 2") != std::string::npos);
+    CHECK(line.find("door masked 3") != std::string::npos);
+
+    // Mode names travel through the request field and the flag.
+    CHECK(loop_guard_parse("door") == LoopGuardMode::Door);
+    CHECK(loop_guard_parse("ladder-nodoor") == LoopGuardMode::LadderNoDoor);
+    CHECK(loop_guard_uses_door(LoopGuardMode::Door));
+    CHECK(loop_guard_uses_door(LoopGuardMode::Ladder));
+    CHECK(!loop_guard_uses_door(LoopGuardMode::LadderNoDoor));
+
+    nlohmann::json body = {{"model", "m"},
+                           {"messages", nlohmann::json::array({{{"role", "user"}, {"content", "hi"}}})},
+                           {"loop_guard", "ladder-nodoor"}};
+    ChatRequest req;
+    CHECK(!parse_chat_request(body, req).has_value());
+    CHECK(req.sampler.loop_guard.has_value());
+    CHECK(*req.sampler.loop_guard == LoopGuardMode::LadderNoDoor);
+
+    SamplerParams p = base_params(LoopGuardMode::Ladder);
+    CHECK(!sampler_apply(p, req.sampler).has_value());
+    CHECK(p.loop_guard == LoopGuardMode::LadderNoDoor);   // the field wins
+
+    Config cfg;
+    std::vector<const char*> args = {"--stub", "--loop-guard", "door",
+                                     "--loop-guard-door-grace", "7"};
+    std::vector<char*> argv;
+    argv.push_back(const_cast<char*>("arcint"));
+    for (const char* a : args) argv.push_back(const_cast<char*>(a));
+    CHECK(parse_args(static_cast<int>(argv.size()), argv.data(), cfg).ok);
+    CHECK_EQ(cfg.loop_guard_door_grace, 7);
+    SamplerDefaults d;
+    CHECK(!apply_operator_defaults(cfg, d).has_value());
+    CHECK(d.loop_guard == LoopGuardMode::Door);
+    CHECK_EQ(d.loop_guard_door_grace, 7);
+}
