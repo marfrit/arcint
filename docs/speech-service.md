@@ -50,7 +50,11 @@ CPU backend. **Accepted by the operator 2026-10-19:** `arcint-tts.service`
 carries `--tts-gen-device cpu`. (The 0.751/0.828 pair is the placement
 comparison of the earlier windows, on the bf16 mmproj and the 8-sentence gate;
 the production set below measures the hybrid at RTF 1.1291 / 1.1597 on the
-enlarged D8 set, B3 PASS, milestone §9.7.) The production model set is then the
+enlarged D8 set, B3 PASS, milestone §9.7.) **Spot check, not a gate
+(2026-10-23):** the packaged TTS unit, four synthetic German sentences, seed
+42, measured RTF **1.17** on sentences 2-4 and **1.095** over all four
+including the first request's warm-up; the D8 set's **1.1597** stays the gate
+figure. The production model set is then the
 requantized Q8_0 mmproj with `gen.code.head`/`gen.code.embd` kept at f16
 (lever (b), C4 + B3 PASS, campaign `qwen3tts-card-real-time`); the official
 bf16 mmproj stays as fallback. An `mmproj` context takes one backend for all its

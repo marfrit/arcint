@@ -25,6 +25,13 @@ public:
     virtual std::string      decode(const std::vector<int>& ids)  = 0;
     virtual std::string      decode_one(int id)                   = 0;
     virtual int              eos_id() const                       = 0;
+
+    // The ids a tag string occupies when it is a SINGLE special token, empty
+    // when the vocabulary spells it as ordinary text. The think-block mask
+    // needs the difference: a tag that is one control token can be blocked in
+    // the logits; a tag the model spells as text cannot, and is matched as text
+    // instead. Default empty keeps every other Tokenizer working.
+    virtual std::vector<int> special_ids(std::string_view tag) { (void)tag; return {}; }
 };
 
 struct ModelStatus {
@@ -148,6 +155,23 @@ struct GenerationInput {
     // stub backend needs them to synthesise a tool call so the parsing path can
     // be exercised without a GPU.
     std::vector<std::string> tool_names;
+
+    // clean-turns step 2: the declared tools with their schemas, for the
+    // tool-call grammar (SamplerParams::tool_grammar). Filled only when the
+    // request's calls are parsed at all (tools declared, tool_choice not
+    // "none"), so a request whose calls would not be parsed is never
+    // constrained either. `parallel_tool_calls` as the request said (OpenAI
+    // default true): the grammar then admits more than one call.
+    std::vector<ToolSpec> tools;
+    bool                  parallel_tool_calls = true;
+
+    // clean-turns: the rendered prompt ended inside a think block, and whether
+    // this artifact answers to the wider tag family. The API knows both from the
+    // template (Prepared::think_open / think_tags_extended); the backend needs
+    // them because the mask must engage before the FIRST sample, not after the
+    // first emitted piece.
+    bool think_open          = false;
+    bool think_tags_extended = false;
 };
 
 struct GenerationStats {
@@ -214,6 +238,13 @@ struct GenerationStats {
     // drafter, or a lane that has never failed.
     int dflash_lane_failures = 0;
 
+    // clean-turns review B4: tool-call grammar desyncs on this request -- the
+    // constraint lost sync with the generated text and the rest of the turn
+    // ran unconstrained (fail open, so the turn can still end). Zero is the
+    // normal value; anything else is printed on the decode line, where the
+    // operator looks for the request's own numbers.
+    int grammar_desyncs = 0;
+
     double prefill_rate() const {
         return prefill_seconds > 0.0 ? prompt_tokens / prefill_seconds : 0.0;
     }
@@ -228,6 +259,16 @@ public:
 
     virtual const ModelStatus& status() const = 0;
     virtual Tokenizer&         tokenizer()    = 0;
+
+    // The think tags' token ids the artifact's vocabulary holds as one special
+    // token, per pair (ThinkBlockIds::open_close_ids), or empty when none. The
+    // reasoning split and the sampler's tracker decide those roles by id; a
+    // pair with -1 keeps the text behaviour. Filled once at load, not per
+    // request.
+    virtual ThinkBlockIds think_block_ids(bool extended_tags) const {
+        (void)extended_tags;
+        return {};
+    }
 
     // Renders a chat request into the model's own prompt format. DESIGN.md §3.7
     // makes the artifact the single source of truth for the template, so this

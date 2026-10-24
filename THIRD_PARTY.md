@@ -37,6 +37,15 @@ Compiled in from a pinned source tree (not vendored): llama.cpp and ggml
 AVX2 kernels (MIT, github.com/Niko1221/Strata); the expert profile the
 Flash-Next unit loads is Strata's `data/expert-profile.bin` (MIT).
 
+Vendored from that same llama.cpp pin (MIT, the ggml authors):
+`third_party/llama-peg/` — `common/`'s PEG parser and JSON-Schema-to-GBNF
+closure (`peg-parser`, `json`, `json-schema`, `json-schema-to-grammar`,
+`trie`, `unicode`), verbatim except that each file includes
+`llama-peg-shim.h` instead of `common.h`/`log.h`/`ggml.h`/`llama.h`; the shim carries the three
+string helpers copied from `common/common.cpp`. `src/core/toolgrammar.cpp`
+copies `permute` from `common/chat-peg-parser.cpp` and mirrors the tool-call
+block of `common/parsers/qwen3-coder.cpp`.
+
 Runtime dependencies (not shipped): the OpenCL ICD loader and Intel's
 compute runtime. Model files are not shipped; GGUFs of Qwen checkpoints
 inherit the Qwen license, and each quantization its publisher's terms.

@@ -43,10 +43,12 @@ extern "C" int stbi_info_from_memory(unsigned char const* buffer, int len, int* 
 #include <vector>
 
 #include "config.h"
+#include "core/reasoning.h"
 #include "core/sampler.h"
 #include "exec/chat_json.h"
 #include "exec/llama_layer_split.h"
 #include "exec/llama_spec.h"
+#include "exec/llama_toolgrammar.h"
 #include "exec/verify_walk.h"
 #include "util/log.h"
 
@@ -274,6 +276,25 @@ public:
         return s;
     }
 
+    // A tag string the vocabulary holds as ONE special token, as the ChatML
+    // vocabularies do for their think markers. encode() with parse_special is
+    // the shape test: it returns one token only when the whole string is that
+    // token. The id rule adds the attribute test: tokenizing to one token is
+    // not enough, because a vocabulary can fold a tag's text into a single
+    // ORDINARY sub-word token, and deciding on that id would treat a
+    // spelled-out mention as the real tag. So the token must also be a special
+    // or control token (llama_vocab_get_attr; the Qwen think markers are
+    // USER_DEFINED, so CONTROL alone would miss them). A vocabulary that
+    // spells the tag as ordinary text returns several tokens or one non-special
+    // one, and the caller keeps the text behaviour.
+    std::vector<int> special_ids(std::string_view tag) override {
+        const std::vector<int> t = encode(tag);
+        if (t.size() != 1) return {};
+        const enum llama_token_attr attr = llama_vocab_get_attr(v_, static_cast<llama_token>(t.front()));
+        if ((attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) == 0) return {};
+        return t;
+    }
+
     std::string decode(const std::vector<int>& ids) override {
         std::string out;
         for (int id : ids) out += decode_one(id);
@@ -488,6 +509,36 @@ public:
                                                  cfg.gguf_path.c_str(), arch));
         tokenizer_ = std::make_unique<LlamaTokenizer>(vocab_);
         n_vocab_   = static_cast<size_t>(llama_vocab_n_tokens(vocab_));
+        // clean-turns: which ids end a turn for this vocabulary. The mask needs
+        // the set, not just eos: a ChatML vocabulary ends a turn with its
+        // end-of-turn id, and is_stop() asks llama_vocab_is_eog(), which answers
+        // for both. Reading them from the vocabulary is why this file never
+        // writes a control token out.
+        eog_ids_.clear();
+        for (llama_token t = 0; t < llama_vocab_n_tokens(vocab_); ++t)
+            if (llama_vocab_is_eog(vocab_, t)) eog_ids_.push_back(t);
+
+        // clean-turns: the think tags' ids, once at load. A tag the vocabulary
+        // holds as one special token is decided by that id; a tag it spells as
+        // text stays -1 and keeps the text behaviour.
+        think_ids_qwen_ = build_think_ids(false);
+        think_ids_ext_  = build_think_ids(true);
+        // One line, at load: what the id rule found, and where the text
+        // fallback is in force. A served artifact whose tags the vocabulary
+        // spells as text is then recognisable in the log, not only by its
+        // behaviour.
+        {
+            const int oid = think_ids_qwen_.open_close_ids.empty()
+                                ? -1
+                                : think_ids_qwen_.open_close_ids.front().first;
+            const int cid = think_ids_qwen_.open_close_ids.empty()
+                                ? -1
+                                : think_ids_qwen_.open_close_ids.front().second;
+            log::debug("think",
+                       "think-block ids: opener id %d (%s); closer id %d (%s)",
+                       oid, oid >= 0 ? "one special token, decided by id" : "none, the text fallback is in force",
+                       cid, cid >= 0 ? "one special token, decided by id" : "none, the text fallback is in force");
+        }
 
         // Named lanes (--served-model-name A,B --lane-ctx CA,CB; DESIGN 4.2,
         // docs/campaigns/lanes-agent-subagent.md): a cap per lane, one KV
@@ -861,6 +912,11 @@ public:
 
     const ModelStatus& status() const override { return status_; }
     Tokenizer&         tokenizer() override { return *tokenizer_; }
+    // The ids read once at load; the reasoning split and the sampler's tracker
+    // decide the block's roles by them.
+    ThinkBlockIds think_block_ids(bool extended_tags) const override {
+        return extended_tags ? think_ids_ext_ : think_ids_qwen_;
+    }
 
     json template_caps() const override {
         const minja::chat_template_caps& c = template_->original_caps();
@@ -907,6 +963,8 @@ public:
         }
         Sampler sampler(in.sampler, seed);
         sampler.set_prompt(prompt);
+        prepare_think_mask(in, sampler);
+        const auto tool_grammar = prepare_tool_grammar(in, sampler);
 
         std::vector<int>&  have = slot_tokens_[static_cast<size_t>(seq)];
         std::vector<float> logits(n_vocab_);
@@ -967,9 +1025,10 @@ public:
             }
             ++stats.completion_tokens;
             const auto    t_emit = clock_type::now();
-            const Control ctl    = on_piece(tokenizer_->decode_one(next), next);
+            const std::string piece = tokenizer_->decode_one(next);
+            const Control ctl    = on_piece(piece, next);
             stats.decode_emit_seconds += seconds_since(t_emit);
-            sampler.observe(next);
+            sampler.observe(next, piece);
             if (ctl != Control::Continue) {
                 reason = ctl == Control::Cancel ? FinishReason::Abort : FinishReason::Stop;
                 break;
@@ -988,6 +1047,7 @@ public:
             stats.decode_sample_seconds += seconds_since(t_s);
         }
         stats.decode_seconds = seconds_since(t_decode);
+        report_tool_grammar(seq, tool_grammar.get(), sampler, stats);
         log_expert_cache(seq);
         return reason;
     }
@@ -1058,6 +1118,8 @@ public:
         }
         Sampler sampler(in.sampler, seed);
         sampler.set_prompt(tokenizer_->encode(in.prompt));
+        prepare_think_mask(in, sampler);
+        const auto tool_grammar = prepare_tool_grammar(in, sampler);
 
         std::vector<int>&  have   = slot_tokens_[static_cast<size_t>(seq)];
         std::vector<float> logits(n_vocab_);
@@ -1103,9 +1165,10 @@ public:
             }
             ++stats.completion_tokens;
             const auto    t_emit = clock_type::now();
-            const Control ctl    = on_piece(tokenizer_->decode_one(next), next);
+            const std::string piece = tokenizer_->decode_one(next);
+            const Control ctl    = on_piece(piece, next);
             stats.decode_emit_seconds += seconds_since(t_emit);
-            sampler.observe(next);
+            sampler.observe(next, piece);
             if (ctl != Control::Continue) {
                 reason = ctl == Control::Cancel ? FinishReason::Abort : FinishReason::Stop;
                 break;
@@ -1124,6 +1187,7 @@ public:
             stats.decode_sample_seconds += seconds_since(t_s);
         }
         stats.decode_seconds = seconds_since(t_decode);
+        report_tool_grammar(seq, tool_grammar.get(), sampler, stats);
         return reason;
     }
 
@@ -1428,6 +1492,8 @@ private:
         }
         Sampler sampler(in.sampler, seed);
         sampler.set_prompt(prompt);
+        prepare_think_mask(in, sampler);
+        const auto tool_grammar = prepare_tool_grammar(in, sampler);
         std::vector<int>&  have = slot_tokens_[static_cast<size_t>(seq)];
         std::vector<float> rows;   // the verified rows' logits
 
@@ -1512,9 +1578,11 @@ private:
                 rows.data(), batch.size(), n_vocab_, draft, sampler, budget,
                 [&](int tok) { return is_stop(in.sampler, tok); },
                 [&](int tok) {
-                    const auto t_emit = clock_type::now();
-                    const Control ctl = on_piece(tokenizer_->decode_one(tok), tok);
+                    const auto    t_emit = clock_type::now();
+                    const std::string piece = tokenizer_->decode_one(tok);
+                    const Control ctl = on_piece(piece, tok);
                     emit_s += seconds_since(t_emit);
+                    sampler.observe_think(tok, piece);
                     return ctl;
                 });
             stats.decode_emit_seconds += emit_s;
@@ -1551,6 +1619,7 @@ private:
                               "different lengths (process-wide)", seq,
                       static_cast<unsigned long long>(n_combined_), static_cast<unsigned long long>(n_uneven_));
         }
+        report_tool_grammar(seq, tool_grammar.get(), sampler, stats);
         log_expert_cache(seq);
         return reason;
     }
@@ -1711,6 +1780,74 @@ private:
     bool is_stop(const SamplerParams& sp, int tok) const {
         if (!sp.ignore_eos && llama_vocab_is_eog(vocab_, tok)) return true;
         return std::find(sp.stop_token_ids.begin(), sp.stop_token_ids.end(), tok) != sp.stop_token_ids.end();
+    }
+
+    // Fill the mask's ids for one request: the turn-ending ids from the
+    // vocabulary, and the think tags from think_tag_pairs() — the same table
+    // split_reasoning() uses. A tag that is one added token is blocked in the
+    // logits; a tag this vocabulary spells as text is matched as text, because
+    // there is no single logit to block (measured on the coder artifact).
+    //
+    // The tool-call grammar needs the block's state too (it is dormant while
+    // the block is open), so the ids are filled for either switch; the mask
+    // itself still engages only under think_eog_mask (Sampler).
+    // Read once at load: the per-pair ids, and the flattened sets the mask reads.
+    // A tag that fails the one-special-token rule stays -1 and keeps the text
+    // behaviour for its role.
+    ThinkBlockIds build_think_ids(bool extended) const {
+        ThinkBlockIds ids;
+        ids.eog = eog_ids_;
+        for (const auto& [open, close] : think_tag_pairs(extended)) {
+            const std::vector<int> o = tokenizer_->special_ids(open);
+            const std::vector<int> c = tokenizer_->special_ids(close);
+            const int oid = o.size() == 1 ? o.front() : -1;
+            const int cid = c.size() == 1 ? c.front() : -1;
+            ids.open_close_ids.emplace_back(oid, cid);
+            if (oid >= 0) ids.open_ids.push_back(oid);
+            if (cid >= 0) ids.close_ids.push_back(cid);
+            ids.open_tags.emplace_back(open);
+            ids.close_tags.emplace_back(close);
+        }
+        return ids;
+    }
+
+    void prepare_think_mask(const GenerationInput& in, Sampler& sampler) const {
+        if (!in.sampler.think_eog_mask && !in.sampler.tool_grammar) return;
+        ThinkBlockIds ids = in.think_tags_extended ? think_ids_ext_ : think_ids_qwen_;
+        ids.eog = eog_ids_;
+        sampler.set_think_mask_ids(std::move(ids));
+        sampler.start_in_think_block(in.think_open);
+    }
+
+    // clean-turns step 2: the request's tool-call grammar, handed to the
+    // sampler, which drives it in every decode loop alike (sample() tests and
+    // masks, observe() accepts -- in the verify walk only the tokens it keeps,
+    // so a rejected draft never reaches the grammar). Off (the default), or no
+    // tools whose calls are parsed: nothing, today's path exactly.
+    std::unique_ptr<LlamaToolGrammar> prepare_tool_grammar(const GenerationInput& in, Sampler& sampler) const {
+        if (!in.sampler.tool_grammar || in.tools.empty()) return nullptr;
+        const auto t0 = clock_type::now();
+        auto       g  = std::make_unique<LlamaToolGrammar>(vocab_, in.tools, in.parallel_tool_calls);
+        log::verbose("grammar", "tool-call grammar: %zu tools, %zu bytes of GBNF, triggered by %s, built in %.1f ms",
+                     in.tools.size(), g->gbnf().size(), g->trigger_is_token() ? "a token" : "a pattern",
+                     seconds_since(t0) * 1e3);
+        sampler.set_constraint(g.get());
+        return g;
+    }
+
+    // One line a constrained request: how often the grammar overruled a draw,
+    // and how often it desynced. The desync count lands on the per-request
+    // stats line (handlers.cpp's decode line), not only in the log: a broken
+    // constraint is an incident, and the request's numbers are where the
+    // operator looks first (review B4). Detaches it from the sampler too: the
+    // grammar is declared after the sampler, so it dies first, and the
+    // sampler must not keep its address.
+    static void report_tool_grammar(int seq, const LlamaToolGrammar* g, Sampler& sampler, GenerationStats& stats) {
+        sampler.set_constraint(nullptr);
+        if (g == nullptr) return;
+        stats.grammar_desyncs = g->desync();
+        log::info("grammar", "lane %d: tool-call grammar: %d draws masked%s", seq, g->rejections(),
+                  g->broken() ? "; it gave up on a token outside it (error line above)" : "");
     }
 
     // One llama_decode of n tokens of `seq` at positions [pos, pos + n), with
@@ -1928,6 +2065,15 @@ private:
 #endif
     const llama_vocab*                    vocab_ = nullptr;
     std::unique_ptr<LlamaTokenizer>       tokenizer_;
+    // Every id llama_vocab_is_eog() answers for: exactly the set is_stop() ends
+    // on, so the mask and the stop check cannot drift apart.
+    std::vector<int>                      eog_ids_;
+    // The think tags' ids, read from the vocabulary ONCE at load. The per-shape
+    // ids prepare_think_mask() hands to each request and the reasoning split
+    // reads are these; a tag that is not one special token stays -1 and keeps
+    // the text fallback for its role.
+    ThinkBlockIds                         think_ids_qwen_;   // the Qwen pair alone
+    ThinkBlockIds                         think_ids_ext_;    // the full tag family
     bool mistral_small_24b_ = false;   // the admitted llama geometry (think tags, BOS)
     std::unique_ptr<minja::chat_template> template_;
     std::string                           template_src_;

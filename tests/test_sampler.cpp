@@ -1,3 +1,4 @@
+#include "core/reasoning.h"
 #include "core/sampler.h"
 #include "harness.h"
 
@@ -284,4 +285,463 @@ TEST(sampler_min_p_with_top_p) {
     }
     CHECK(seen.count(0) && seen.count(1));
     CHECK(!seen.count(2) && !seen.count(3));
+}
+
+// ---------------------------------------------------------------------------
+// clean-turns: the think-block mask. Tag strings are assembled from parts here
+// The mask's own cases are appended below; they take the tag strings from
+// think_tag_pairs(), the same table split_reasoning() reads. Nothing in this
+// file writes a tag out.
+
+namespace {
+
+// The mask's ids for a test: stand-in ids for the two specials, and the tags
+// exactly as the reasoning table spells them.
+ThinkBlockIds table_ids() {
+    const auto& pairs = think_tag_pairs(false);
+    ThinkBlockIds t;
+    t.eog        = {0};      // stands in for the turn-ending id
+    t.open_ids   = {1};      // stands in for the block's opener id
+    t.close_tags = {pairs[0].second};
+    t.open_tags  = {pairs[0].first};
+    return t;
+}
+
+SamplerParams masked_params(bool on) {
+    SamplerParams p  = greedy_params();
+    p.think_eog_mask = on;
+    p.think_ids      = table_ids();
+    return p;
+}
+
+// The end-of-generation token is the argmax; the next best is id 3.
+std::vector<float> eog_first() { return logits({5.0f, 4.0f, 1.0f, 3.0f}); }
+
+}  // namespace
+
+TEST(sampler_mask_off_keeps_the_end_of_generation_token) {
+    // The red case: without the mask the turn ends inside the think block.
+    auto    l = eog_first();
+    Sampler s(masked_params(false), 1);
+    s.start_in_think_block(true);
+    CHECK_EQ(s.sample(l.data(), l.size()), 0);
+}
+
+TEST(sampler_mask_on_blocks_the_end_of_generation_token_while_open) {
+    auto    l = eog_first();
+    Sampler s(masked_params(true), 1);
+    s.start_in_think_block(true);
+    CHECK_EQ(s.sample(l.data(), l.size()), 3);
+}
+
+TEST(sampler_mask_on_blocks_a_second_opener_while_open) {
+    // A reopened block is the same defect one step later: while the block is
+    // open the opener id is not a legal next token either.
+    auto    l = logits({1.0f, 5.0f, 0.5f, 3.0f});
+    Sampler s(masked_params(true), 1);
+    s.start_in_think_block(true);
+    CHECK_EQ(s.sample(l.data(), l.size()), 3);
+}
+
+TEST(sampler_mask_clears_once_the_closer_has_been_emitted) {
+    const auto& pairs = think_tag_pairs(false);
+    Sampler     s(masked_params(true), 1);
+    s.start_in_think_block(true);
+    s.observe_think_text("some reasoning");
+    CHECK_EQ(s.sample(eog_first().data(), 4), 3);            // still blocked
+    s.observe_think_text(pairs[0].second);
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);            // the turn may end
+}
+
+TEST(sampler_mask_engages_when_the_model_opens_the_block_itself) {
+    // The template did not open it; the model's own opener, at the lead of the
+    // generation, engages the mask.
+    const auto& pairs = think_tag_pairs(false);
+    Sampler     s(masked_params(true), 1);
+    s.start_in_think_block(false);
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);            // not open: allowed
+    s.observe_think_text(pairs[0].first + "why");
+    CHECK_EQ(s.sample(eog_first().data(), 4), 3);            // open from here
+}
+
+TEST(sampler_mask_ignores_an_opener_that_is_not_at_the_lead) {
+    // Mirrors split_reasoning: only an opener at the very start opens a block.
+    // An answer that quotes a tag later must still be able to end normally.
+    const auto& pairs = think_tag_pairs(false);
+    Sampler     s(masked_params(true), 1);
+    s.start_in_think_block(false);
+    s.observe_think_text("the template writes " + pairs[0].first + " first");
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);
+}
+
+TEST(sampler_mask_off_is_the_old_behaviour_even_with_the_ids_set) {
+    auto    l = eog_first();
+    Sampler s(masked_params(false), 1);
+    s.start_in_think_block(true);
+    s.observe_think_text(think_tag_pairs(false)[0].first);
+    CHECK_EQ(s.sample(l.data(), l.size()), 0);
+}
+
+TEST(sampler_mask_leaves_every_other_token_alone) {
+    // The mask names two ids. Nothing else in the row moves, so a normal
+    // answer is sampled exactly as it was before. (sample() rewrites its row:
+    // each call gets a copy, as every decode loop does.)
+    const std::vector<float> row = logits({5.0f, 4.0f, 2.5f, 3.0f});
+
+    auto    a = row;
+    Sampler s(masked_params(true), 1);
+    s.start_in_think_block(true);
+    CHECK_EQ(s.sample(a.data(), a.size()), 3);
+    size_t changed = 0;
+    for (size_t i = 0; i < row.size(); ++i)
+        if (a[i] != row[i]) ++changed;
+    CHECK_EQ(static_cast<int>(changed), 2);   // the turn-ender and the opener
+
+    auto    b = row;
+    Sampler s2(masked_params(false), 1);
+    s2.start_in_think_block(true);
+    CHECK_EQ(s2.sample(b.data(), b.size()), 0);
+    CHECK(b == row);                          // off: the row is not touched
+}
+
+TEST(sampler_mask_covers_the_client_stop_ids_too) {
+    // Review B2: the decode loop's stop check ends the turn on the
+    // vocabulary's EOG ids plus the client's stop ids; the mask must cover
+    // exactly that set while the block is open, not only the EOG list. A stop
+    // id the check honours that the mask left unmasked would end the turn
+    // with no answer, the same defect the mask exists to close.
+    SamplerParams p = masked_params(true);    // think_ids.eog = {0}, open_ids = {1}
+    p.stop_token_ids = {3};                   // a client stop id, the argmax below
+
+    auto    l = logits({3.5f, 3.4f, 1.0f, 4.5f});   // the stop id is the argmax
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    CHECK_EQ(s.sample(l.data(), l.size()), 2);  // 0, 1 and 3 are held back; id 2 wins
+
+    // and once the block has closed the stop id is offered again: the mask
+    // holds it back only while the block is open, exactly as the stop check
+    // ends the turn only when it comes.
+    s.observe_think_text(think_tag_pairs(false)[0].second);
+    auto l2 = logits({3.5f, 3.4f, 1.0f, 4.5f});
+    CHECK_EQ(s.sample(l2.data(), l2.size()), 3);
+}
+
+TEST(sampler_mask_honours_ignore_eos_like_the_stop_check) {
+    // Review B2, the other half: the stop check's EOG half is gated on
+    // ignore_eos, so the mask's must be too. With the flag set the EOG id is
+    // ordinary content for this request and the mask leaves it, while the
+    // client's stop ids are still held back.
+    SamplerParams p = masked_params(true);
+    p.stop_token_ids = {3};
+    p.ignore_eos     = true;
+
+    auto    l = logits({5.0f, 4.0f, 1.0f, 0.5f});
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    CHECK_EQ(s.sample(l.data(), l.size()), 0);  // the EOG id is offered: the check would not end on it
+
+    auto l2 = logits({0.5f, 4.0f, 1.0f, 5.0f});
+    CHECK_EQ(s.sample(l2.data(), l2.size()), 2);  // the stop id is still held back (opener 1 too)
+}
+
+TEST(sampler_mask_notices_a_closer_split_across_pieces) {
+    // Cut from the table's own string, never written out here: a closer that
+    // straddles two emitted pieces still clears the mask.
+    const std::string closer = think_tag_pairs(false)[0].second;
+    const size_t      cut    = closer.size() / 2;
+    Sampler           s(masked_params(true), 1);
+    s.start_in_think_block(true);
+    s.observe_think_text(closer.substr(0, cut));
+    CHECK_EQ(s.sample(eog_first().data(), 4), 3);            // not closed yet
+    s.observe_think_text(closer.substr(cut));
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);
+}
+
+TEST(sampler_mask_notices_a_closer_inside_one_long_piece) {
+    // The tail kept for the straddle is never shorter than the piece just
+    // appended: a closer that lands wholly inside a long piece is still seen.
+    const std::string closer = think_tag_pairs(false)[0].second;
+    Sampler           s(masked_params(true), 1);
+    s.start_in_think_block(true);
+    s.observe_think_text(std::string(closer.size() * 3, 'x') + closer + std::string(closer.size() * 3, 'y'));
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);
+}
+
+TEST(sampler_mask_engages_on_an_opener_split_across_pieces) {
+    // Cut from the table's own string. The N1 rule: the first half only looms
+    // -- it could still grow into an opener, so the state stays undecided and
+    // the mask does not engage yet (engaging on a partial match is what
+    // stranded a diverging lead at the length cap). The full match engages.
+    const std::string opener = think_tag_pairs(false)[0].first;
+    const size_t      cut    = opener.size() / 2;
+    Sampler           s(masked_params(true), 1);
+    s.start_in_think_block(false);
+    s.observe_think_text(opener.substr(0, cut));
+    CHECK(!s.think_block_open());                    // looms: still undecided
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);    // not masked yet
+    s.observe_think_text(opener.substr(cut) + "because");
+    CHECK(s.think_block_open());                     // the full match opens it
+    CHECK_EQ(s.sample(eog_first().data(), 4), 3);    // and holds from here
+}
+
+TEST(sampler_mask_a_looming_lead_that_diverges_stays_undecided) {
+    // N1 (reviewer item, the text fallback): a lead that could still grow
+    // into an opener used to commit the state to thinking at once. If the
+    // text then diverges no closer ever comes, every turn-ender stays masked,
+    // and the turn runs to the length cap. While the lead only looms the
+    // state must stay undecided; on divergence it settles to content and the
+    // turn may end.
+    const auto&      pairs  = think_tag_pairs(false);
+    const std::string opener = pairs[0].first;
+    Sampler          s(masked_params(true), 1);
+    s.start_in_think_block(false);
+    // The opener's first bytes: could still grow into it
+    s.observe_think_text(opener.substr(0, 2));
+    CHECK(!s.think_block_open());                    // looms: undecided, not thinking
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);    // the turn-ender is still legal
+    // The text diverges: no opener completes, no closer will come
+    s.observe_think_text("x is not a block");
+    CHECK(!s.think_block_open());                    // settled content
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);    // the turn may end
+}
+
+TEST(sampler_mask_lets_go_when_the_lead_is_plainly_not_an_opener) {
+    // The other side of the same rule: an answer that starts as content is not
+    // held back for the length of a tag.
+    const std::string opener = think_tag_pairs(false)[0].first;
+    Sampler           s(masked_params(true), 1);
+    s.start_in_think_block(false);
+    s.observe_think_text(opener.substr(0, 1) + "n ordinary sentence");
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The state machine must settle. Before the fix the block was one bool plus a
+// lead string that was re-examined for the whole turn: a closed block's lead
+// could re-open it on the first content piece, and the raw lead disagreed
+// with split_reasoning's stripped lead. The cases below are red on that code.
+
+TEST(sampler_mask_stays_released_after_a_self_opened_block_closes) {
+    // The model opened the block itself, closed it, and the answer begins.
+    // The state is settled content: the first content piece must not
+    // re-open the block, and the turn-ender is legal again.
+    const auto& pairs = think_tag_pairs(false);
+    Sampler     s(masked_params(true), 1);
+    s.start_in_think_block(false);
+    s.observe_think_text(pairs[0].first + "why");
+    CHECK_EQ(s.sample(eog_first().data(), 4), 3);    // open: the mask holds
+    s.observe_think_text(pairs[0].second);
+    CHECK(!s.think_block_open());
+    s.observe_think_text("the answer begins");
+    CHECK(!s.think_block_open());
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);    // settled: the turn may end
+    s.observe_think_text(" and it goes on");
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);
+}
+
+TEST(sampler_mask_stays_released_after_a_template_opened_block_closes) {
+    // The template opened the block and the model closed it; the answer's
+    // first piece is a strict prefix of the opener. It is content, and it
+    // must not re-open the block: with the old bool plus lead, the empty
+    // lead absorbed the piece and matched the opener's prefix again.
+    const auto& pairs     = think_tag_pairs(false);
+    const std::string opener_prefix = pairs[0].first.substr(0, 3);
+    Sampler s(masked_params(true), 1);
+    s.start_in_think_block(true);
+    s.observe_think_text("some reasoning");
+    CHECK_EQ(s.sample(eog_first().data(), 4), 3);    // open: the mask holds
+    s.observe_think_text(pairs[0].second);
+    CHECK(!s.think_block_open());
+    s.observe_think_text(opener_prefix);
+    CHECK(!s.think_block_open());                    // still content
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);    // the turn may end
+    s.observe_think_text(" the rest");
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);
+}
+
+TEST(sampler_mask_engages_on_a_blank_lead_like_split_reasoning) {
+    // A run of newlines before a self-opened block is a pad, not the start of
+    // an answer: split_reasoning strips it before looking for the opener, and
+    // the mask must agree. With the old raw-lead comparison the lead settled
+    // as content on the blanks and the mask never engaged.
+    const auto& pairs = think_tag_pairs(false);
+    const std::string raw = "\n\n" + pairs[0].first + "why" + pairs[0].second;
+    const ReasoningSplit split = split_reasoning(raw, false, false);
+    CHECK(split.closed);
+    CHECK_EQ(split.reasoning, "why");
+    CHECK(split.content.empty());
+
+    Sampler s(masked_params(true), 1);
+    s.start_in_think_block(false);
+    s.observe_think_text("\n\n");
+    CHECK(!s.think_block_open());                    // the pad alone opens nothing
+    s.observe_think_text(pairs[0].first + "why");
+    CHECK(s.think_block_open());                     // the opener, past the pad
+    CHECK_EQ(s.sample(eog_first().data(), 4), 3);    // the mask holds
+    s.observe_think_text(pairs[0].second);
+    CHECK(!s.think_block_open());
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);    // and it releases
+}
+
+TEST(sampler_mask_still_holds_while_the_block_is_open) {
+    // Control for the settling cases above: a block that has not closed keeps
+    // masking the turn-ender, template-opened and self-opened alike. This one
+    // is green before and after.
+    const auto& pairs = think_tag_pairs(false);
+    Sampler     s(masked_params(true), 1);
+    s.start_in_think_block(true);
+    s.observe_think_text("still reasoning");
+    CHECK(s.think_block_open());
+    CHECK_EQ(s.sample(eog_first().data(), 4), 3);
+
+    Sampler t(masked_params(true), 1);
+    t.start_in_think_block(false);
+    t.observe_think_text(pairs[0].first + "still reasoning");
+    CHECK(t.think_block_open());
+    CHECK_EQ(t.sample(eog_first().data(), 4), 3);
+}
+
+// ---------------------------------------------------------------------------
+// Review B3: the EOG set is not checked against the closer ids. A vocabulary
+// in which the block's closer is one of the turn-ending ids must never end up
+// with the closer masked: with it killed the block could not close and the
+// turn could end only at the length cap. The guard strips the closer from the
+// masked set and says so once.
+
+namespace {
+
+// A vocabulary whose closer id is also a turn-ending id: 0 a plain EOG id,
+// 1 the closer (in the EOG list and, separately, as a client stop id), 2 the
+// opener. The tags come from the shared table; nothing is written out.
+ThinkBlockIds pathologic_ids() {
+    const auto& pairs = think_tag_pairs(false);
+    ThinkBlockIds t;
+    t.eog        = {0, 1};
+    t.open_ids   = {2};
+    t.close_ids  = {1};
+    t.close_tags = {pairs[0].second};
+    t.open_tags  = {pairs[0].first};
+    return t;
+}
+
+}  // namespace
+
+TEST(sampler_mask_never_masks_the_closer_id) {
+    // The closer id in the EOG set: the guard leaves it offered. The other
+    // EOG id and the opener are masked, and with the closer as the argmax it
+    // is drawn -- the block can close, and the turn can end.
+    SamplerParams p = greedy_params();
+    p.think_eog_mask = true;
+    p.think_ids      = pathologic_ids();
+
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    auto l = logits({5.0f, 4.0f, 3.0f, 1.0f});
+    s.sample(l.data(), l.size());
+    CHECK(l[0] == -INFINITY);   // the other EOG id is masked
+    CHECK(l[1] != -INFINITY);   // the closer is never masked
+    CHECK(l[2] == -INFINITY);   // the opener is masked
+    CHECK(l[3] == 1.0f);        // everything else untouched
+
+    auto l2 = logits({5.0f, 6.0f, 3.0f, 1.0f});
+    CHECK_EQ(s.sample(l2.data(), l2.size()), 1);  // the closer is offered: the block closes
+}
+
+TEST(sampler_mask_never_masks_the_closer_id_from_the_stop_ids_either) {
+    // The same guard reaches the client stop ids: a closer id a client put in
+    // stop_token_ids is still offered while the block is open.
+    SamplerParams p = greedy_params();
+    p.think_eog_mask = true;
+    p.think_ids      = pathologic_ids();
+    p.think_ids.eog  = {0};   // the closer is not in the EOG list here
+    p.stop_token_ids = {1};
+
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    auto l = logits({5.0f, 6.0f, 3.0f, 1.0f});
+    s.sample(l.data(), l.size());
+    CHECK(l[0] == -INFINITY);   // the EOG id is masked
+    CHECK(l[1] != -INFINITY);   // the closer is not, though it is a client stop id
+    CHECK(l[2] == -INFINITY);   // the opener is masked
+}
+
+// ---------------------------------------------------------------------------
+// clean-turns step 2: the block's state is decided by the token id, not by the
+// decoded text. A model that merely MENTIONS the closer -- spelling it from
+// ordinary sub-word tokens while quoting it in its reasoning or writing it
+// into code -- produces the same text. The text path read that as the real
+// closer: reasoning ended early, planning spilled into the answer. The id path
+// does not: a role whose tag is one special token is decided by its id alone.
+
+namespace {
+
+// A vocabulary whose closer is one special token, id 2. The opener has no id
+// (the template opened the block, as the Qwen templates do when thinking is
+// on), so these cases take the id path in the close role alone. The tag
+// strings come from the shared table; nothing is written out here.
+ThinkBlockIds id_close_ids() {
+    const auto& pairs = think_tag_pairs(false);
+    ThinkBlockIds t;
+    t.eog        = {0};
+    t.close_ids  = {2};
+    t.close_tags = {pairs[0].second};
+    t.open_tags  = {pairs[0].first};
+    return t;
+}
+
+SamplerParams id_close_params() {
+    SamplerParams p = greedy_params();
+    p.think_eog_mask = true;
+    p.think_ids      = id_close_ids();
+    return p;
+}
+
+// The closer spelled from ordinary tokens: same text, different ids. Assembled
+// from the table's own string, never written out here.
+std::string spelled_closer() { return std::string(think_tag_pairs(false)[0].second); }
+
+}  // namespace
+
+TEST(sampler_id_rule_a_spelled_closer_does_not_close_the_block) {
+    // The red case: the model quotes the closer in its reasoning. The decoded
+    // text equals the real closer, but no special token was emitted: the state
+    // must stay thinking and the turn-ender must stay masked.
+    Sampler s(id_close_params(), 1);
+    s.start_in_think_block(true);
+    s.observe_think_text("the marker is ");
+    const std::string c = spelled_closer();
+    s.observe_think_text(c.substr(0, 3)); s.observe(30);
+    s.observe_think_text(c.substr(3, 3)); s.observe(31);
+    s.observe_think_text(c.substr(6));     s.observe(32);
+    CHECK(s.think_block_open());                    // still thinking
+    CHECK_EQ(s.sample(eog_first().data(), 4), 1);   // the turn-ender (0) still masked
+}
+
+TEST(sampler_id_rule_the_special_closer_closes_the_block) {
+    // The closer as one special token, id 2: it closes the block whatever its
+    // text says; no text scan can do it. Red before the id rule: observe() did
+    // not look at the id, so the block stayed open.
+    Sampler s(id_close_params(), 1);
+    s.start_in_think_block(true);
+    s.observe_think_text("reasoning that ends");
+    CHECK(s.think_block_open());
+    CHECK_EQ(s.sample(eog_first().data(), 4), 1);   // the turn-ender (0) still masked
+    s.observe(2);                                   // the closer id, text not needed
+    CHECK(!s.think_block_open());
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);   // settled: the turn may end
+}
+
+TEST(sampler_id_rule_no_ids_keeps_the_text_behaviour) {
+    // The fallback: a template whose tags are not single special tokens (no ids
+    // known) behaves exactly as before -- the closer matched as text closes the
+    // block. This case is green before and after the id rule.
+    const auto& pairs = think_tag_pairs(false);
+    Sampler     s(masked_params(true), 1);   // table_ids(): no close_ids
+    s.start_in_think_block(true);
+    s.observe_think_text("reasoning");
+    CHECK(s.think_block_open());
+    s.observe_think_text(pairs[0].second);   // the closer as text
+    CHECK(!s.think_block_open());
+    CHECK_EQ(s.sample(eog_first().data(), 4), 0);
 }

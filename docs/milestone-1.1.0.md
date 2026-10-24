@@ -84,7 +84,8 @@ gate. Checked against the source:
 - 1024 x 1024 pixels, VAE factor 8, 2 x 2 patches: 64 x 64 = **4,096 image
   tokens** a step, plus the text tokens.
 - Z-Image (6B, `paper`): ~2 x 6e9 x 4,096 ≈ 49 TFLOP a step without
-  attention. The dense 27B on the B60 prefills 787-837 t/s at 4k
+  attention. (Later, `arithmetic` from the GEMM shapes: 46.75 TFLOP;
+  `docs/imggen.md`, "The step".) The dense 27B on the B60 prefills 787-837 t/s at 4k
   (`measured-here`), ≈ 43-45 TFLOP/s effective. At the same utilisation
   ≈ 1.1 s a step, 8 steps (Turbo) ≈ 9 s, without the encoder and the VAE.
 - Memory (weights, rough): Z-Image BF16 ≈ 12 GB + Qwen3-4B Q8_0 ≈ 4.3 GB;

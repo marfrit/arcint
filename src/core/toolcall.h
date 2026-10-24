@@ -56,4 +56,17 @@ struct ToolCallParse {
 // string, which is the honest reading of the wire format.
 ToolCallParse parse_qwen_tool_calls(std::string_view text, const ToolSchemas* schemas = nullptr);
 
+// The coder's call tags, written once here so the parser and the grammar
+// (clean-turns step 2) cannot drift. The open/close are single special tokens
+// on the coder vocabulary (measured); the inner tags are spelled as text.
+struct ToolCallTags {
+    std::string_view open;      // the tool-call opener
+    std::string_view close;     // the tool-call closer
+    std::string_view fn_open;   // the function opener prefix
+    std::string_view fn_close;  // the function closer
+    std::string_view param_open; // the parameter opener prefix
+    std::string_view param_end;  // the parameter closer
+};
+const ToolCallTags& tool_call_tags();
+
 }  // namespace lgc

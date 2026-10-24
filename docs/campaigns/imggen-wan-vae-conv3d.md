@@ -83,6 +83,13 @@ step-path divergence is the DiT/TE, not 0059. The vision model reads the
 image's German lettering: "WILLKOMMEN" legible at 512²/8 and at the
 production 1024²/20 (160.7 s, VAE 8.25 s).
 
+Later measurement (`measured-here`, 2026-10-23, the 1.1.1-1 package, B60,
+seed 42, two requests): the production 1024²/20 form is **96.5 s steady**
+(88.3 s sampling + 8.04 s VAE) against the 160.7 s sampling / 8.25 s VAE
+measured 2026-10-18. The step time is unchanged (4.4 s against the 4.44 s
+in `docs/milestone-1.1.1.md`'s served row), so the difference lies outside the
+DiT steps; which first-request costs the 160.7 s carried is not established.
+
 The 1.1.1 gate tolerance and the rope-off attribution are open with the
 operator; the kernel is delivered.
 

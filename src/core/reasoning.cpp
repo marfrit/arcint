@@ -3,6 +3,7 @@
 #include "util/text.h"
 
 #include <iterator>
+#include <vector>
 
 namespace lgc {
 namespace {
@@ -14,10 +15,6 @@ struct ThinkTags {
 };
 constexpr ThinkTags kTags[] = {{"<think>", "</think>"}, {"<thinking>", "</thinking>"}, {"[THINK]", "[/THINK]"}};
 
-std::string_view lead_of(std::string_view s) {
-    while (!s.empty() && (s.front() == '\n' || s.front() == ' ')) s.remove_prefix(1);
-    return s;
-}
 // the pairs a model may open: <think> only, or all of them
 size_t n_tags(bool extended) { return extended ? std::size(kTags) : 1; }
 // the pair whose opener starts `lead`, or nullptr
@@ -33,6 +30,15 @@ bool could_open(std::string_view lead, bool extended) {
     return false;
 }
 
+// The pairs as owning strings, for callers outside this file. Same table, so
+// the mask and the split cannot disagree about what a block looks like.
+std::vector<std::pair<std::string, std::string>> build_pairs(bool extended) {
+    std::vector<std::pair<std::string, std::string>> out;
+    for (size_t i = 0; i < n_tags(extended); ++i)
+        out.emplace_back(std::string(kTags[i].open), std::string(kTags[i].close));
+    return out;
+}
+
 std::string_view strip_edge_newlines(std::string_view s) {
     while (!s.empty() && s.front() == '\n') s.remove_prefix(1);
     while (!s.empty() && s.back() == '\n') s.remove_suffix(1);
@@ -43,6 +49,22 @@ std::string_view strip_leading_newlines(std::string_view s) {
     return s;
 }
 }  // namespace
+
+// One helper, two callers: split_reasoning below and the sampler's
+// think-block mask both strip the lead this way, so they cannot
+// disagree about where a self-opened block starts.
+std::string_view lead_of(std::string_view s) {
+    while (!s.empty() && (s.front() == '\n' || s.front() == ' ')) s.remove_prefix(1);
+    return s;
+}
+
+const std::vector<std::pair<std::string, std::string>>& think_tag_pairs(bool extended) {
+    // Built once per shape and handed out by reference: a caller that needs a
+    // tag asks for it here rather than writing one.
+    static const std::vector<std::pair<std::string, std::string>> all  = build_pairs(true);
+    static const std::vector<std::pair<std::string, std::string>> qwen = build_pairs(false);
+    return extended ? all : qwen;
+}
 
 ReasoningSplit split_reasoning(std::string_view raw, bool think_open, bool extended_tags) {
     ReasoningSplit out;
@@ -71,19 +93,73 @@ ReasoningSplit split_reasoning(std::string_view raw, bool think_open, bool exten
     return out;
 }
 
-ReasoningStreamer::ReasoningStreamer(bool think_open, bool extended_tags)
-    : in_reasoning_(think_open), undecided_(!think_open), extended_(extended_tags) {}
+ReasoningSplit split_reasoning_tokens(const std::vector<std::pair<std::string, int>>& pieces,
+                                      bool think_open, bool extended_tags,
+                                      const std::vector<std::pair<int, int>>& open_close_ids) {
+    // One implementation with the streaming path: run the streamer over the
+    // same sequence and concatenate its steps. A spelled closer stays reasoning
+    // and the special-token closer closes the block in both, by construction.
+    ReasoningStreamer streamer(think_open, extended_tags, open_close_ids);
+    ReasoningSplit    out;
+    for (const auto& [piece, id] : pieces) {
+        const ReasoningStreamer::Step step = streamer.push(piece, id);
+        out.reasoning += step.reasoning;
+        out.content   += step.content;
+    }
+    const ReasoningStreamer::Step tail = streamer.flush();
+    out.reasoning += tail.reasoning;
+    out.content   += tail.content;
+    out.closed = streamer.closed();
+    return out;
+}
 
-ReasoningStreamer::Step ReasoningStreamer::push(std::string_view piece) {
+ReasoningStreamer::ReasoningStreamer(bool think_open, bool extended_tags,
+                                     const std::vector<std::pair<int, int>>& open_close_ids)
+    : in_reasoning_(think_open), undecided_(!think_open), extended_(extended_tags), ids_(open_close_ids) {
+    // A template-opened block: its closer is the first pair's close id when the
+    // vocabulary spells it as one token; -1 keeps the text fallback.
+    if (in_reasoning_ && !ids_.empty() && ids_.front().second >= 0) close_id_ = ids_.front().second;
+}
+
+ReasoningStreamer::Step ReasoningStreamer::push(std::string_view piece, int token_id) {
     Step step;
     if (undecided_) {
+        // The model opened the block itself, as one special token: that id
+        // opens it and pairs with its own closer. The whole piece is the
+        // marker, so none of its text is output.
+        for (size_t i = 0; token_id >= 0 && i < ids_.size(); ++i) {
+            if (ids_[i].first != token_id) continue;
+            undecided_    = false;
+            in_reasoning_ = true;
+            close_id_     = ids_[i].second;
+            buffer_.clear();
+            return step;
+        }
         // Not opened by the template. Hold the first bytes until they either
-        // spell an opener or cannot: anything else is plain content.
+        // spell an opener or cannot: anything else is plain content. Only a
+        // pair whose opener has no id takes part in the text rule; a pair with
+        // an id is decided by that id alone.
         buffer_ += piece;
         const std::string_view lead = lead_of(buffer_);
-        const ThinkTags*       tags = opened_by(lead, extended_);
+        const ThinkTags*       tags = nullptr;
+        size_t                 tag_i = 0;
+        for (size_t i = 0; i < n_tags(extended_); ++i) {
+            if (i < ids_.size() && ids_[i].first >= 0) continue;
+            if (lead.substr(0, kTags[i].open.size()) == kTags[i].open) {
+                tags  = &kTags[i];
+                tag_i = i;
+                break;
+            }
+        }
         if (tags == nullptr) {
-            if (could_open(lead, extended_)) return step;   // could still be a tag
+            bool loomed = false;
+            for (size_t i = 0; i < n_tags(extended_); ++i) {
+                if (i < ids_.size() && ids_[i].first >= 0) continue;
+                if (could_open(lead, extended_) && lead.size() < kTags[i].open.size()
+                    && kTags[i].open.substr(0, lead.size()) == lead)
+                    loomed = true;
+            }
+            if (loomed) return step;   // could still be a tag
             undecided_ = false;
             step.content = buffer_;
             buffer_.clear();
@@ -92,12 +168,26 @@ ReasoningStreamer::Step ReasoningStreamer::push(std::string_view piece) {
         undecided_    = false;
         in_reasoning_ = true;
         close_        = tags->close;
+        close_id_     = tag_i < ids_.size() ? ids_[tag_i].second : -1;
         std::string rest(lead.substr(tags->open.size()));
         buffer_.clear();
-        return push(rest);
+        return push(rest, -1);
     }
     if (!in_reasoning_) {
         step.content = std::string(piece);
+        return step;
+    }
+    // The block is open. With a closer id known, only that id closes it: no
+    // text is scanned, so a closer spelled from ordinary tokens stays
+    // reasoning.
+    if (close_id_ >= 0) {
+        if (token_id == close_id_) {
+            in_reasoning_ = false;
+            closed_       = true;
+            buffer_.clear();
+            return step;   // the closer's piece is the marker, not content
+        }
+        step.reasoning = std::string(piece);
         return step;
     }
     buffer_ += piece;

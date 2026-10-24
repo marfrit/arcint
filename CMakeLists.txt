@@ -56,6 +56,22 @@ endif()
 add_library(arcint_vendor INTERFACE)
 target_include_directories(arcint_vendor SYSTEM INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
 
+# The pinned llama.cpp's PEG grammar closure (clean-turns step 2): builds the
+# Qwen-coder tool-call GBNF from the declared schemas. Copied verbatim from the
+# pin's common/ (MIT, THIRD_PARTY.md), made self-contained by
+# third_party/llama-peg/llama-peg-shim.h. Vendored code: no -Werror, no
+# arcint warnings.
+add_library(arcint_peg STATIC
+  third_party/llama-peg/peg-parser.cpp
+  third_party/llama-peg/json.cpp
+  third_party/llama-peg/json-schema.cpp
+  third_party/llama-peg/json-schema-to-grammar.cpp
+  third_party/llama-peg/trie.cpp
+  third_party/llama-peg/unicode.cpp
+)
+target_include_directories(arcint_peg PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama-peg")
+target_link_libraries(arcint_peg PUBLIC arcint_vendor)
+
 # ----------------------------------------------------------------------- core
 add_library(arcint_core STATIC
   src/config.cpp
@@ -67,6 +83,7 @@ add_library(arcint_core STATIC
   src/core/sampling.cpp
   src/core/stop.cpp
   src/core/toolcall.cpp
+  src/core/toolgrammar.cpp
   src/core/chat.cpp
   src/exec/backend_stub.cpp
   src/api/error.cpp
@@ -76,7 +93,7 @@ add_library(arcint_core STATIC
 target_include_directories(arcint_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${CMAKE_CURRENT_BINARY_DIR}/generated")
-target_link_libraries(arcint_core PUBLIC arcint_vendor Threads::Threads)
+target_link_libraries(arcint_core PUBLIC arcint_vendor Threads::Threads arcint_peg)
 target_compile_options(arcint_core PRIVATE -Wall -Wextra -Wpedantic)
 if(ARCINT_WERROR)
   target_compile_options(arcint_core PRIVATE -Werror)
@@ -111,7 +128,8 @@ if(ARCINT_LLAMA)
   set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
   add_subdirectory("${ARCINT_LLAMA_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/llama.cpp" EXCLUDE_FROM_ALL)
   find_package(OpenCL REQUIRED)
-  target_sources(arcint_core PRIVATE src/exec/backend_llama.cpp src/exec/llama_spec.cpp src/exec/llama_dflash.cpp)
+  target_sources(arcint_core PRIVATE src/exec/backend_llama.cpp src/exec/llama_spec.cpp src/exec/llama_dflash.cpp
+                                     src/exec/llama_toolgrammar.cpp)
   # The DFlash2 drafter's red cases (tests/dflash/legs.sh): a build with a
   # mutant compiled in, which says so at load. 0 is the served build; the
   # cases are listed in src/exec/llama_dflash.cpp and tests/dflash/legs.sh
@@ -214,10 +232,28 @@ if(ARCINT_TESTS)
     tests/test_props.cpp
     tests/test_lanes.cpp
     tests/test_reasoning.cpp
+    tests/test_stream_utf8.cpp
     tests/test_decode_stats.cpp
+    tests/test_toolgrammar.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+  if(ARCINT_LLAMA)
+    # test_toolgrammar.cpp runs the generated GBNF through libllama's grammar
+    # engine on text (llama-grammar.h, the entry points upstream's own grammar
+    # tests use), so it needs the pinned tree's src/ on its include path.
+    # Review B5: the toolgrammar_llama_* refusal cases exist in an ARCINT_LLAMA
+    # build only. The device-free unit gate above (LABELS unit) runs the
+    # generator's shape and the sampler's constraint hook without them; the
+    # record is in tests/test_toolgrammar.cpp's header and in the campaign
+    # (docs/campaigns/clean-turns.md, step 2 "the gate").
+    target_include_directories(arcint-test PRIVATE "${ARCINT_LLAMA_DIR}/src")
+    # clean-turns step 2's forced-malformed gate on a real vocabulary (vocab-only
+    # load, no device). Not a ctest case: it needs the GGUF; run by hand.
+    add_executable(arcint-tool-grammar-probe tools/tool_grammar_probe.cpp)
+    target_link_libraries(arcint-tool-grammar-probe PRIVATE arcint_core)
+    target_compile_options(arcint-tool-grammar-probe PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
   # test_props.cpp reads src/exec/backend_llama.cpp (the KV-precision tripwire:
   # the llama backend cannot be constructed without a card).
   target_compile_definitions(arcint-test PRIVATE

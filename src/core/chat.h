@@ -44,6 +44,10 @@ struct ChatRequest {
     // Set when tool_choice named one function explicitly; empty otherwise.
     std::string tool_choice_function;
 
+    // OpenAI's parallel_tool_calls (default true). Read for the tool-call
+    // grammar only (clean-turns step 2): false admits exactly one call.
+    bool parallel_tool_calls = true;
+
     bool stream = false;
 
     // stream_options.include_usage. Defaults on: DESIGN.md §3.7 requires usage

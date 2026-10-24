@@ -159,6 +159,20 @@ std::optional<std::string> read_sampler(const json& b, SamplerOverrides& s) {
         if (!b["ignore_eos"].is_boolean()) return "ignore_eos must be a boolean";
         s.ignore_eos = b["ignore_eos"].get<bool>();
     }
+    // clean-turns: while a think block is open, the turn-ending token is not a
+    // legal next token. Non-standard, so it is named; a request that sends
+    // neither keeps the operator's setting.
+    if (b.contains("think_eog_mask") && !b["think_eog_mask"].is_null()) {
+        if (!b["think_eog_mask"].is_boolean()) return "think_eog_mask must be a boolean";
+        s.think_eog_mask = b["think_eog_mask"].get<bool>();
+    }
+    // clean-turns step 2: constrain the tool-call form to the declared schemas.
+    // Non-standard, so it is named; a request that sends neither keeps the
+    // operator's setting. A no-op when the request declared no tools.
+    if (b.contains("tool_grammar") && !b["tool_grammar"].is_null()) {
+        if (!b["tool_grammar"].is_boolean()) return "tool_grammar must be a boolean";
+        s.tool_grammar = b["tool_grammar"].get<bool>();
+    }
     if (b.contains("stop")) {
         if (auto e = read_stop(b["stop"], s)) return e;
     }
@@ -309,6 +323,11 @@ std::optional<std::string> parse_chat_request(const json& body, ChatRequest& out
         } else {
             return "tool_choice must be a string or an object";
         }
+    }
+
+    if (body.contains("parallel_tool_calls") && !body["parallel_tool_calls"].is_null()) {
+        if (!body["parallel_tool_calls"].is_boolean()) return "parallel_tool_calls must be a boolean";
+        req.parallel_tool_calls = body["parallel_tool_calls"].get<bool>();
     }
 
     if (auto e = read_stream(body, req.stream, req.stream_include_usage)) return e;

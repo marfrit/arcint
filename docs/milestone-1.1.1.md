@@ -199,8 +199,13 @@ arm's are bit-identical to the green arm's: cos 1.000000). 0059's own red shows 
 
 **FLUX.2 klein 4B** (512², 4 steps, seed 42, cfg 1.0, euler): DiT Q8_0 +
 Qwen3-4B Q8_0 TE + the FLUX2 VAE (32 latent channels), ~8.5 GiB, fits
-comfortably. 4 steps **18.8 s**, VAE 2.53 s; the vision model confirms the
-prompt (a cat on a windowsill). Against the CPU reference (143.7 s): cosine
+comfortably. 4 steps were **18.8 s**, VAE 2.53 s, on 2026-10-18; the vision
+model confirms the prompt (a cat on a windowsill). Re-measured on the
+**1.1.1-1 package** through sd-server (`measured-here`, 2026-10-23, B60, seed
+42, a different synthetic prompt, two requests, byte-identical images): **3.2 s
+steady** -- 1.67 s sampling + 1.52 s VAE; the first request 10.0 s (5.24 s
+sampling). The cause of the difference is not established (the 2026-10-18
+figure may include first-run kernel builds). Against the CPU reference (143.7 s): cosine
 worst **0.998115**, PSNR 25.31 dB -- outside the placeholder like Qwen-Image.
 
 **FLUX.2 klein edit** (`/v1/images/edits` shape, `--ref-image`, background
@@ -242,6 +247,15 @@ references reused, the gate with the per-model tolerances above:
 | klein edit, 0058 red (the last 16 of K zeroed) | | | | passes at TOL_COS 0.003 (cos worst 0.999177, 26.41 dB) |
 | FLUX.2 klein **served** edit (`/v1/images/edits`: init image + reference, strength 0.75), B60 sd-server against a CPU sd-server given the same request | | | | **below the proposed floor**: final 17.21 dB, SSIM 0.905 (no previews: sd-server writes none, so no per-step figure) |
 | Qwen-Image 1024², 20 steps (the unit's default) through sd-server | 4.44 s | 8.24 s | **18,827 MiB** | 158.9 s a request; no CPU reference at 1024² |
+
+Later measurement (**`measured-here`**, 2026-10-23, the 1.1.1-1 package, B60,
+seed 42, two requests, byte-identical images): Qwen-Image 1024²/20 through
+sd-server is **96.5 s steady** -- 88.3 s sampling (4.4 s/step) + 8.04 s VAE --
+against the 158.9 s request, 4.44 s step and 8.24 s VAE in the row above
+(2026-10-18). **Step and VAE are unchanged** (4.4 against 4.44 s, 8.04 against
+8.24 s); the ~62 s gap in the request time lies outside sampling and VAE. Today's
+first request took 111.2 s, so the 158.9 s figure most likely carries first-request
+costs; which ones is not established.
 
 The release build reproduces the 1.1.1 session's B60 images pixel for
 pixel (Qwen-Image, the klein edit). §9's "8 steps 55.7 s (7.0 s a step)"
