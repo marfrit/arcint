@@ -558,49 +558,40 @@ void Sampler::mask_illegal_while_thinking(float* logits, size_t vocab) const {
 // model can take the one newline that the closer follows. The mask is applied
 // to the logits before the penalties and the draw, so it is exactly the row the
 // model draws from -- and the reply's forced-token/grammar paths see the same
-// row. `door_masked` counts a draw at which the mask was active and a masked id
-// sat in the row's top-k candidates before the mask removed it: whether the
-// model would otherwise have taken that token is not knowable.
+// row. The -inf writes stay here; only the counter moved. This keeps just the
+// masked ids' logits at mask time, not a copy of the row, and the draw reads
+// them once its candidate set exists (count_door_masked_).
 void Sampler::mask_door_while_thinking(float* logits, size_t vocab) {
+    // Cleared every draw, so a forced-token return or a sparse candidate set
+    // cannot read a stale pair from an earlier sample.
+    door_masked_logits_.clear();
     if (!loop_door_open_ || think_state_ != ThinkState::thinking) return;
     if (params_.loop_guard_door_ids.empty() || vocab == 0) return;
-
-    const EffectiveRow row = effective_row();
-    // The top-k the draw will consider. Greedy takes one, so "would likely have
-    // taken" means the argmax there.
-    const size_t k = (row.temperature <= 0.0f || row.top_k == 1)
-                         ? 1
-                         : row.top_k > 0
-                               ? std::min(static_cast<size_t>(row.top_k), vocab)
-                               : std::min(kCandidateProbe, vocab);
-    // The kth-largest finite logit, as a min-heap of the k best: one pass over
-    // the vocabulary, no sort. Fewer than k finite logits means every finite
-    // one is inside the top-k.
-    std::vector<float> best;
-    best.reserve(k);
-    const auto by_logit = [](float a, float b) { return a > b; };
-    for (size_t i = 0; i < vocab; ++i) {
-        const float l = logits[i];
-        if (!std::isfinite(l)) continue;
-        if (best.size() < k) {
-            best.push_back(l);
-            if (best.size() == k) std::make_heap(best.begin(), best.end(), by_logit);
-        } else if (l > best.front()) {
-            std::pop_heap(best.begin(), best.end(), by_logit);
-            best.back() = l;
-            std::push_heap(best.begin(), best.end(), by_logit);
-        }
-    }
-    const float floor = best.size() < k ? -INFINITY : best.front();
-
-    bool masked_in_topk = false;
     for (int id : params_.loop_guard_door_ids) {
         if (id < 0 || static_cast<size_t>(id) >= vocab) continue;
         const float l = logits[static_cast<size_t>(id)];
-        if (std::isfinite(l) && l >= floor) masked_in_topk = true;
+        if (std::isfinite(l)) door_masked_logits_.emplace_back(id, l);
         logits[static_cast<size_t>(id)] = -INFINITY;
     }
-    if (masked_in_topk) ++loop_door_masked_;
+}
+
+// loop-guard door counter: a masked id is "among the candidates" when its logit
+// at mask time is at or above the floor of the candidate set the draw uses --
+// the lowest logit collect_candidates kept for the effective row's top-k (or
+// the argmax on a greedy row). Whether the model would otherwise have taken it
+// is not knowable. The stored logits are the row before the penalties, the
+// floor is after them; a masked id whose penalty would have lowered it can
+// over-report, and that is the counter's documented slack. Consumed once per
+// sample(), so a grammar redraw does not count the same draw twice.
+void Sampler::count_door_masked_(float floor, bool inclusive) {
+    if (door_masked_logits_.empty()) return;
+    bool in_topk = false;
+    for (const auto& [id, l] : door_masked_logits_) {
+        (void)id;
+        if (inclusive ? l >= floor : l > floor) in_topk = true;
+    }
+    door_masked_logits_.clear();
+    if (in_topk) ++loop_door_masked_;
 }
 
 int Sampler::argmax(const float* logits, size_t vocab) {
@@ -761,7 +752,11 @@ int Sampler::draw(float* logits, size_t vocab) {
     // walk, where observe() advances the state before the next row's sample().
     const EffectiveRow row = effective_row();
     // Penalties can reorder the distribution, so greedy is decided after them.
-    if (row.temperature <= 0.0f || row.top_k == 1) return argmax(logits, vocab);
+    if (row.temperature <= 0.0f || row.top_k == 1) {
+        const int best = argmax(logits, vocab);
+        count_door_masked_(logits[static_cast<size_t>(best)], /*inclusive=*/true);
+        return best;
+    }
 
     for (int attempt = 0; attempt < 2; ++attempt) {
         const bool   probing = attempt == 0 && row.top_k <= 0 && kCandidateProbe < vocab;
@@ -823,6 +818,12 @@ int Sampler::draw(float* logits, size_t vocab) {
         cutoff = std::min(cutoff, min_p_cut);
 
         if (short_of_mass) continue;   // the full set next pass (this token only)
+
+        // loop-guard door counter: the candidate set this draw actually samples
+        // from, now that the probe (if any) has settled to the full pass.
+        if (!door_masked_logits_.empty())
+            count_door_masked_(scratch_.empty() ? -INFINITY : scratch_.back().first,
+                               /*inclusive=*/true);
 
         double renorm = 0.0;
         for (size_t i = 0; i < cutoff; ++i) renorm += probs[i];

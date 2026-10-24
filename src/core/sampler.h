@@ -199,9 +199,14 @@ private:
     void   apply_penalties(float* logits, size_t vocab) const;
     void   mask_illegal_while_thinking(float* logits, size_t vocab) const;
     // loop-guard door: mask the multi-newline ids while the door is open and
-    // the block is open, and count a draw whose top-k held one of them (before
-    // this mask removed it).
+    // the block is open. It keeps only the masked ids' logits, for the counter
+    // the draw reads once its candidate set exists.
     void   mask_door_while_thinking(float* logits, size_t vocab);
+    // loop-guard door counter: was a masked id among the candidates this draw
+    // considers? Runs on the candidate set the draw collects, measured against
+    // the logits the ids had at mask time. Consumes the stored pair list, so a
+    // grammar redraw in the same sample() does not count twice.
+    void   count_door_masked_(float floor, bool inclusive);
     void   measure_think_tags();
     void   build_think_id_table();
     void   observe_think_(std::string_view piece, int token);
@@ -297,6 +302,9 @@ private:
     int  loop_since_detect_  = 0;   // counted lines since detection (door grace)
     int  loop_self_closes_   = 0;
     int  loop_door_masked_   = 0;
+    // The masked ids' logits at mask time (id, logit), not the whole row: the
+    // count reads them against the candidate floor the draw's collection gives.
+    std::vector<std::pair<int, float>> door_masked_logits_;
     int  loop_nudge_cursor_ = -1;   // next nudge id, -1 when none pending
     // Set when sample() returns the last nudge id: observe_think_ clears the
     // partial reasoning line after that piece is fed, so the sentence's tail

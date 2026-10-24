@@ -102,7 +102,9 @@ unit-tested on synthetic streams, including a counting loop that exact misses
 and near catches, the near false-positive guard, the detection hysteresis, the
 door's mask and self-close, a slap's forced closer not counted as a
 self-close, the door grace in the ladder order beside
-`ladder-nodoor`, and `ladder-nodoor` never opening the door. Evidence class:
+`ladder-nodoor`, and `ladder-nodoor` never opening the door. The door ids
+are scanned at model load; the `door_masked` counter reads the draw's own
+candidate set. Evidence class:
 the mechanism is `code` (this tree); the line-end probabilities and the closing
 estimate are `measured-here` (operator, offline, recorded above). The
 speculative lane: the door mask applies inside `sample()`, so the verify walk
@@ -137,19 +139,25 @@ newline remain).
 
 ## Open points
 
-Recorded by review of the door handover (2026-10-24); not fixed here.
+The two review notes on the door handover are closed (2026-10-24); neither
+changes the draw.
 
-- **The door-id scan races across lanes.** `loop_door_ids()` scans lazily and
-  caches through `mutable` state in a const method. Two lanes that start their
-  first door request at the same moment can both scan and interleave their
-  writes into the cached vector. `std::call_once` around the scan, or a scan at
-  model load, is the fix. Evidence: `code`, read in this tree; not measured.
-- **`door_masked` costs a second pass over the vocabulary.** While the door is
-  open, `mask_door_while_thinking` walks the full vocabulary on every draw to
-  find the top-k floor for the counter. The candidates the draw collects anyway
-  would answer the same question; folding the count into `collect_candidates`
-  removes the extra pass. Whether the counter is worth the pass at all is the
-  operator's call. Evidence: `code`, read in this tree; no measured cost yet.
+- **Door-id scan, thread safety: closed.** The ids are now scanned once at model
+  load, where the vocabulary becomes known, by a pure
+  `scan_loop_guard_door_ids(Tokenizer&)`; the per-request path only reads the
+  result, so no request-time lazy cache exists and lanes cannot race on it. The
+  load-time log line stays. A device-free test scans a stub-shaped tokenizer
+  from one call and from two concurrent calls and compares the ids; evidence
+  `code`, unit suite.
+- **`door_masked` without a full vocabulary pass: closed.** The mask keeps its
+  `-inf` writes where they were and stores only the masked ids' logits at mask
+  time. The draw then reads that small list against the floor of the candidate
+  set it collects anyway (the effective row's top-k, or the argmax on a greedy
+  row), so the counter no longer walks the vocabulary per draw. The stored
+  logits are pre-penalty and the floor is post-penalty; a masked id whose
+  penalty would have lowered it can over-report, which is the counter's
+  documented slack. A fixed-row test proves the drawn ids are unchanged from
+  the pre-change sampler; evidence `code`, unit suite.
 
 ## Where it lives
 

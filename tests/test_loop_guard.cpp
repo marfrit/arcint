@@ -990,3 +990,60 @@ TEST(loop_guard_door_ids_scan_is_pure_and_seen_before_a_request) {
     CHECK_EQ(tok.decode_calls.load(), 2 * tok.vocab_size());   // two independent passes
 }
 
+// 2. The counting change moves no draw: a fixed stream of rows under the open
+// door draws exactly the same ids it drew before the change.
+TEST(loop_guard_door_counting_change_leaves_the_draw_byte_identical) {
+    SamplerParams p = base_params(LoopGuardMode::Door, 10, 5);
+    p.loop_guard_door_ids = {6, 7};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection: the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    auto row = [](std::vector<float> v) { return v; };
+    std::vector<std::vector<float>> rows = {
+        row({-1, -1, -1, 1, 2, -1, 5, -1}),   // double newline on top -> single (4)
+        row({-1, -1, -1, -1, -1, 6, 7, -1}),  // closer 5 (double 6 is under it)
+        row({-1, -1, -1, 5, 3, -1, -1, 4}),   // triple newline 7 on top -> 3
+        row({-1, -1, 1, -1, 5, -1, -1, -1}),  // single newline on top -> 4
+        row({-1, -1, -1, -1, 4, 2, 3, -1}),   // double 6 masked -> 4
+    };
+    std::vector<int> drawn;
+    for (auto& r : rows) drawn.push_back(s.sample(r.data(), r.size()));
+    CHECK(drawn == std::vector<int>({4, 5, 3, 4, 4}));
+}
+
+// 3. door_masked counts the candidate membership and only that: a masked id
+// inside the row's top-k counts, one below the floor does not.
+TEST(loop_guard_door_masked_counts_topk_membership_not_any_mask) {
+    SamplerParams p = base_params(LoopGuardMode::Door, 10, 5);
+    p.loop_guard_door_ids = {6, 7};
+    p.temperature         = 0.7f;   // a candidate set, not the greedy argmax
+    p.top_k               = 2;
+    p.top_p               = 1.0f;
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    // The double newline is below the kept pair: 5 and 4.5 are in, 4.0 is out.
+    std::vector<float> below(8, -1.0f);
+    below[4] = 5.0f;
+    below[3] = 4.5f;
+    below[6] = 4.0f;
+    const int t1 = s.sample(below.data(), below.size());
+    CHECK(t1 == 4 || t1 == 3);
+    CHECK_EQ(s.loop_guard_counts().door_masked, 0);
+
+    // The double newline is above the kept pair's floor (4.0): it would have
+    // been among the candidates the mask removed it from.
+    std::vector<float> inside(8, -1.0f);
+    inside[4] = 5.0f;
+    inside[6] = 4.8f;
+    inside[3] = 4.0f;
+    const int t2 = s.sample(inside.data(), inside.size());
+    CHECK(t2 == 4 || t2 == 3);
+    CHECK_EQ(s.loop_guard_counts().door_masked, 1);
+}
