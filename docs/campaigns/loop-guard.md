@@ -132,10 +132,15 @@ guard off, had answered it partly wrong). In all, 21 of 21: 19 fully correct,
 1 wrong with no guard event, 1 aborted on a real loop. The operator keeps the
 full ladder on the coder.
 
-No card measurement of the door yet: the card window still owes the coder
-battery with the door, including missed lines (the door masks the
-multi-newline tokens only, and line breaks the vocabulary spells as one
-newline remain).
+Door card run (`measured-here`, 2026-10-24, the same coder and window,
+seed 1, 64k cap, `ladder` with the door; the 9 tasks that had hit the cap):
+all 7 looping runs ended fully correct, all 7 closed by the model's own draw
+-- 5 by the door alone within seconds of opening, 2 after the nudge -- and no
+forced token in the whole round. The same set on the no-door ladder needed
+the slap 4 times. The door battery's remaining gap: lines the vocabulary
+spells as one newline stay unmasked, and a loop that does not produce a
+line-with-newline pattern can still reach the nudge and the slap (that path
+is measured, not owed).
 
 ## Open points
 

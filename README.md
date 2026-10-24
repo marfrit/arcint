@@ -63,7 +63,8 @@ loop: the same line, or the same check with one number changed, comes back
 inside the think block until the token cap, and the turn ends without an
 answer. 1.2.3 adds a loop guard, **off by default** (`--loop-guard
 off|detect|nudge|slap|ladder`, the request field `loop_guard`; `/props`
-reports it under `sampler_defaults.loop_guard`).
+reports it under `sampler_defaults.loop_guard`). 1.2.4 adds the door rung,
+`door` and `ladder-nodoor` with it.
 
 **The ladder.** The detector reads only the reasoning, one line at a time (a
 line ends at a newline; it is stripped, and only lines longer than 20
@@ -90,6 +91,31 @@ the turn. With speculative decoding a forced token ends the verify walk at
 its position and the drafts behind it are dropped. The response carries a `loop_guard`
 object (detections, nudges, slaps, aborts) when the ladder moved, and the
 decode line in the log counts the same.
+
+**New in 1.2.4: the door rung.** Before the nudge, a model that has decided
+but cannot stop can close the block itself. At detection the sampler masks the
+vocabulary's multi-newline tokens: every id whose decoded piece consists only
+of newline characters and has two or more of them, while the think block is
+open; the single-newline token stays legal. Nothing is injected and no token
+is forced: the model draws normally and closes by its own draw, or the ladder
+goes on. The order is detect → door → nudge → slap → abort: the door opens
+at detection, stays open through the nudge and the slap, and is gone when the
+block closes. `--loop-guard door` is the mask alone (never nudge or slap),
+`ladder` includes the door, `ladder-nodoor` is 1.2.3's ladder exactly (the
+nudge at detection, no mask), so one binary can compare both;
+`--loop-guard-door-grace` (default 20) is the counted lines after detection
+before the nudge, and `/props` reports it. The response's `loop_guard` object
+counts `self_closes` (the block closed by the model's own draw while the mask
+was open, not by a slap) and `door_masked` (draws at which the mask was active
+and a masked token sat in the row's candidate set).
+
+**The door on the card** (`measured-here`, October 2026, the coder at its
+model card's thinking settings, seed 1, 64k-token cap). On the 9 tasks that
+had hit the cap in the screening, with the door in the ladder all 7 looping
+runs ended fully correct; all 7 closed by the model's own draw, 5 by the door
+alone within seconds of opening and 2 after the nudge, and no forced token was
+needed in the whole round. The same set without the door needed the slap 4
+times.
 
 **How it was tested** (`measured-here`, October 2026). The coder (Qwen3.6-27B-A3B,
 the A770) was given 30 competitive-programming tasks published after its
