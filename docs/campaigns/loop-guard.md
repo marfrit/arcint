@@ -2,8 +2,9 @@
 
 **Shipping in 1.2.3 (2026-10-24).** A coder model can circle inside its think block until
 the token cap: no answer, a wasted round. The operator approved an escalation
-ladder **detect → nudge → slap → abort**, behind a switch that is off by
-default.
+ladder **detect → door → nudge → slap → abort**, behind a switch that is off
+by default. The door rung (2026-10-24) lets the model close by its own draw
+before anything is injected.
 
 ## Charter
 
@@ -17,22 +18,48 @@ default.
   counts identical text only. Near catches a counting loop whose lines differ
   only in a number word. Detection counts once per crossing, with hysteresis
   at threshold - 0.1, so a nudge's own dip does not count a second loop.
+- **door:** while the rung is active and the think block is open, mask every
+  token whose decoded piece consists only of newline characters and has two or
+  more of them (the double, triple ... newline tokens). The single-newline
+  token stays legal. The masked id set is computed once per vocabulary from the
+  pieces the backend owns and handed to the sampler as the nudge ids are. This
+  is the newline trap (`measured-here`, operator, offline): BPE fuses line
+  breaks, so after a sentence a done-but-cannot-stop looper takes the double
+  newline with ~0.95 while the closer after a single newline has ~0.998; the
+  joint chance of closing per round is 0.03-0.05. In clean reasoning the
+  closer after a single newline is ~0 (mean 0.0002) until the real end. The
+  offline estimate with single line breaks: the looper would close by itself
+  within ~25 lines at 50 %. Nothing else changes -- no injected text, no
+  forced token; the model draws normally and closes, or not, by itself.
 - **nudge:** inject one fixed, short reasoning sentence as if the model had
   generated it; it lands in the KV, the history, `reasoning_content` and the
   stream. Keep watching.
 - **slap:** after the grace, force the think-block's closer **by token id** as
   the next token, ahead of any draft token in flight. The model then answers.
+- **order:** the door opens at detection and stays open through nudge and slap
+  (it helps both). Under `ladder` the nudge comes after
+  `--loop-guard-door-grace` more counted lines (default 20) if the loop
+  persists; the slap keeps its own grace after the nudge (40). When the block
+  closes the door is gone; content is never touched.
 - **abort:** if the answer phase itself loops after a slap, end the turn on a
   distinct finish reason, `loop`.
-- **Switches:** `--loop-guard off|detect|nudge|slap|ladder` (default off),
-  `--loop-guard-match exact|near` (near), `--loop-guard-window N` (200),
-  `--loop-guard-threshold T` (0.8), `--loop-guard-grace K` (40); request field
-  `loop_guard` overrides the flag
-  for that request. Off is today's behaviour exactly: no detector, no forced
-  token, no new finish reason.
-- **Observability:** detections, nudges, slaps, aborts in the per-request stats
-  (the decode line), a `loop_guard` object in the response, and the mode and
-  thresholds in `/props`.
+- **Switches:** `--loop-guard off|detect|nudge|slap|door|ladder|ladder-nodoor`
+  (default off), `--loop-guard-match exact|near` (near),
+  `--loop-guard-window N` (200), `--loop-guard-threshold T` (0.8),
+  `--loop-guard-grace K` (40), `--loop-guard-door-grace K` (20); request field
+  `loop_guard` accepts the same mode names and overrides the flag for that
+  request. `door` is detect + the mask only (never nudge/slap); `ladder`
+  includes the door; `ladder-nodoor` is today's ladder exactly (nudge at
+  detection, no mask), so a card test can compare both on one binary. `nudge`
+  and `slap` stay as they were (no door). Off is today's behaviour exactly: no
+  detector, no mask, no forced token, no new finish reason.
+- **Observability:** detections, nudges, slaps, aborts, `self_closes` (the
+  block closed by the model's own draw while the door was open, not by a slap)
+  and `door_masked` (draws at which the mask was active and a masked token sat
+  in the row's top-k candidates; whether the model would otherwise have taken
+  it is not knowable) in the per-request stats (the decode line), a
+  `loop_guard` object in the response, and the mode, thresholds and
+  `door_grace` in `/props`.
 
 ## Reference to follow
 
@@ -69,14 +96,17 @@ already came right are unchanged (the answer-level bar in `CLAUDE.md`).
 
 ## Current state
 
-Built, default off; the line match defaults to near. Detection, nudge (forced
-token ids), slap (forced closer id), and the content-phase abort are
+Built, default off; the line match defaults to near. Detection, door, nudge
+(forced token ids), slap (forced closer id), and the content-phase abort are
 unit-tested on synthetic streams, including a counting loop that exact misses
-and near catches, the near false-positive guard, and the detection hysteresis. The
-speculative lane is handled at the token boundary the verify walk samples:
-a forced token that differs from the draft breaks the walk on the mismatch, so
-the remaining drafts in flight are dropped and only the emitted prefix is
-accepted.
+and near catches, the near false-positive guard, the detection hysteresis, the
+door's mask and self-close, the door grace in the ladder order beside
+`ladder-nodoor`, and `ladder-nodoor` never opening the door. Evidence class:
+the mechanism is `code` (this tree); the line-end probabilities and the closing
+estimate are `measured-here` (operator, offline, recorded above). The
+speculative lane: the door mask applies inside `sample()`, so the verify walk
+sees it like any other mask -- a draft token the mask forbids is a mismatch and
+drops the rest; the forced-token boundary of the nudge/slap is unchanged.
 
 Card battery (`measured-here`, 2026-10-23/24, the coder on the A770, its
 card's thinking row, seed 1, 64k cap, `ladder`; 30 post-cutoff
@@ -99,15 +129,20 @@ guard off, had answered it partly wrong). In all, 21 of 21: 19 fully correct,
 1 wrong with no guard event, 1 aborted on a real loop. The operator keeps the
 full ladder on the coder.
 
+No card measurement of the door yet: the card window still owes the coder
+battery with the door, including missed lines (the door masks the
+multi-newline tokens only, and line breaks the vocabulary spells as one
+newline remain).
+
 ## Where it lives
 
-`src/core/sampler.{h,cpp}` — the detector, the ladder state and the forced
-draw; `src/core/sampling.{h,cpp}` — the mode, the match rule, the thresholds and
-the request override;
+`src/core/sampler.{h,cpp}` — the detector, the door mask, the ladder state and
+the forced draw; `src/core/sampling.{h,cpp}` — the mode, the match rule, the
+thresholds and the request override;
 `src/core/chat.cpp` — the `loop_guard` request field; `src/config.{h,cpp}` —
-the flags and `/props` defaults; `src/exec/backend_llama.cpp` — nudge
-tokenisation, per-request counters, `FinishReason::Loop` checks and the
-spec-lane comment; `src/exec/verify_walk.h` — the forced-token boundary and the
+the flags and `/props` defaults; `src/exec/backend_llama.cpp` — the
+vocabulary scan for the door ids, nudge tokenisation, per-request counters,
+`FinishReason::Loop` checks and the spec-lane comment; `src/exec/verify_walk.h` — the forced-token boundary and the
 abort latch; `src/api/handlers.cpp` — the decode suffix, the response object
 and `/props`; `tests/test_loop_guard.cpp` (red-first cases),
 `tests/test_props.cpp`.
