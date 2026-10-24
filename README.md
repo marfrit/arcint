@@ -127,7 +127,9 @@ its reasoning was right and the screening's miss was bad luck in the answer,
 and the other wrong 30 of 30 times in the same way, because the algorithm in
 its reasoning was wrong. Of the two kinds of loop, "done but cannot stop" (the model has decided
 and keeps confirming it) and "stuck" (one sub-question asked again and
-again), the stuck kind gets an answer only because the close is forced. And
+again), the stuck kind gets an answer only because the close is forced, and
+not always: when the answer loops too, the abort ends it cleanly with
+`finish_reason` `loop`, but it does not produce a program. And
 it is a small-model tool: the dense Qwen3.8-27B agent did not loop on any of
 the 11 tasks the coder failed, and answered all 11 correctly.
 
