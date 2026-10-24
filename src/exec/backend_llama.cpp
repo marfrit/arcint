@@ -303,6 +303,8 @@ public:
 
     int eos_id() const override { return llama_vocab_eos(v_); }
 
+    int vocab_size() const override { return llama_vocab_n_tokens(v_); }
+
 private:
     const llama_vocab* v_;
 };
@@ -1599,6 +1601,13 @@ private:
             // every token after it into the answer's own presence counts, so a
             // verify that closes mid-span starts the history at the right token.
             //
+            // loop-guard door under speculation: its mask is applied inside
+            // sample(), so each verified row is drawn from the masked row just
+            // as the plain loop's would be. A draft token the door forbids is
+            // not the drawn token, so the walk breaks on that mismatch and the
+            // remaining drafts are dropped; no drafter state is advanced past
+            // the boundary (spec_->accept gets the walked acceptance only).
+            //
             // loop-guard under speculation: sample() returns a forced token
             // (the nudge's next id, or the closer id for a slap) at the row
             // boundary it is drawn for. The walk emits and observes it; when it
@@ -1869,6 +1878,30 @@ private:
     void prepare_loop_guard(const GenerationInput& in, Sampler& sampler) const {
         if (in.sampler.loop_guard == LoopGuardMode::Off) return;
         sampler.set_loop_guard_nudge(tokenizer_->encode(kLoopGuardNudge));
+        if (loop_guard_uses_door(in.sampler.loop_guard)) sampler.set_loop_guard_door(loop_door_ids());
+    }
+
+    // loop-guard door: the ids whose decoded piece is two or more newline
+    // characters and nothing else. Computed once per vocabulary, from the
+    // pieces the backend owns (the sampler never looks at the vocabulary), and
+    // handed to the sampler the way the nudge ids are. Scanned lazily, so a
+    // build that never turns the door on pays nothing.
+    const std::vector<int>& loop_door_ids() const {
+        if (loop_door_scanned_) return loop_door_ids_;
+        loop_door_scanned_ = true;
+        const int n = tokenizer_->vocab_size();
+        for (int id = 0; id < n; ++id) {
+            const std::string piece = tokenizer_->decode_one(id);
+            size_t newlines = 0;
+            bool   only    = true;
+            for (char c : piece) {
+                if (c == '\n') ++newlines;
+                else { only = false; break; }
+            }
+            if (only && newlines >= 2) loop_door_ids_.push_back(id);
+        }
+        log::info("loop-guard", "door: %zu multi-newline token(s) in a vocabulary of %d", loop_door_ids_.size(), n);
+        return loop_door_ids_;
     }
 
     // clean-turns step 2: the request's tool-call grammar, handed to the
@@ -1906,13 +1939,16 @@ private:
     // decode line and the response object read the same numbers.
     static void report_loop_guard(int seq, Sampler& sampler, GenerationStats& stats) {
         const Sampler::LoopGuardCounts c = sampler.loop_guard_counts();
-        stats.loop_detections = c.detections;
-        stats.loop_nudges     = c.nudges;
-        stats.loop_slaps      = c.slaps;
-        stats.loop_aborts     = c.aborts;
-        if (c.detections || c.nudges || c.slaps || c.aborts)
-            log::info("loop-guard", "lane %d: detected %d, nudged %d, slapped %d, aborted %d", seq,
-                      c.detections, c.nudges, c.slaps, c.aborts);
+        stats.loop_detections  = c.detections;
+        stats.loop_nudges      = c.nudges;
+        stats.loop_slaps       = c.slaps;
+        stats.loop_aborts      = c.aborts;
+        stats.loop_self_closes = c.self_closes;
+        stats.loop_door_masked = c.door_masked;
+        if (c.detections || c.nudges || c.slaps || c.aborts || c.self_closes || c.door_masked)
+            log::info("loop-guard", "lane %d: detected %d, nudged %d, slapped %d, aborted %d, "
+                      "self-closed %d, door masked %d", seq,
+                      c.detections, c.nudges, c.slaps, c.aborts, c.self_closes, c.door_masked);
     }
 
     // One llama_decode of n tokens of `seq` at positions [pos, pos + n), with
@@ -2144,6 +2180,9 @@ private:
     std::string                           template_src_;
     ModelStatus                           status_;
     size_t                                n_vocab_ = 0;
+    // loop-guard door ids, scanned once from the vocabulary pieces
+    mutable std::vector<int>              loop_door_ids_;
+    mutable bool                          loop_door_scanned_ = false;
     int                                   lanes_   = 1;
     int                                   n_ctx_   = 0;   // the first lane's cap (status, the load line)
     bool                                  named_   = false;   // --lane-ctx: kv_unified, a cap per lane

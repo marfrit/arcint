@@ -54,6 +54,11 @@ inline VerifyWalk walk_verify(float* rows, size_t n_rows, size_t vocab, const st
         // the boundary -- the KV is rolled back to what was emitted and the
         // in-flight drafts past it are never accepted. A forced token that
         // happens to equal the draft is simply accepted as that draft.
+        // The door rung needs no boundary of its own: its mask is applied in
+        // sample() to the row before the draw, so a draft token the mask forbids
+        // is simply not the drawn token, and the same `tok == draft[i]` mismatch
+        // drops the rest of the drafts. A legal single newline drafted ahead of
+        // the block's closer is unaffected.
         if (sampler.loop_abort()) {
             w.done   = true;
             w.reason = FinishReason::Loop;

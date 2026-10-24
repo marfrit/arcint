@@ -85,10 +85,12 @@ std::string decode_suffix_for(const GenerationStats& stats) {
     }
     // loop-guard: the ladder's counters, printed only when one moved, so a
     // request without the switch keeps exactly the line it always had.
-    if (stats.loop_detections || stats.loop_nudges || stats.loop_slaps || stats.loop_aborts) {
-        decode_suffix += log::format(" | loop guard: detected %d, nudged %d, slapped %d, aborted %d",
+    if (stats.loop_detections || stats.loop_nudges || stats.loop_slaps || stats.loop_aborts
+        || stats.loop_self_closes || stats.loop_door_masked) {
+        decode_suffix += log::format(" | loop guard: detected %d, nudged %d, slapped %d, aborted %d, "
+                                     "self-closed %d, door masked %d",
                                      stats.loop_detections, stats.loop_nudges, stats.loop_slaps,
-                                     stats.loop_aborts);
+                                     stats.loop_aborts, stats.loop_self_closes, stats.loop_door_masked);
     }
     return decode_suffix;
 }
@@ -97,11 +99,14 @@ nlohmann::json loop_guard_json(const GenerationStats& stats) {
     return nlohmann::json{{"detections", stats.loop_detections},
                 {"nudges", stats.loop_nudges},
                 {"slaps", stats.loop_slaps},
-                {"aborts", stats.loop_aborts}};
+                {"aborts", stats.loop_aborts},
+                {"self_closes", stats.loop_self_closes},
+                {"door_masked", stats.loop_door_masked}};
 }
 
 bool loop_guard_moved(const GenerationStats& stats) {
-    return stats.loop_detections || stats.loop_nudges || stats.loop_slaps || stats.loop_aborts;
+    return stats.loop_detections || stats.loop_nudges || stats.loop_slaps || stats.loop_aborts
+           || stats.loop_self_closes || stats.loop_door_masked;
 }
 
 namespace {
@@ -565,7 +570,8 @@ json props(const Context& ctx) {
             {"match", loop_guard_match_name(sd.loop_guard_match)},
             {"window", sd.loop_guard_window},
             {"threshold", sd.loop_guard_threshold},
-            {"grace", sd.loop_guard_grace}}},
+            {"grace", sd.loop_guard_grace},
+            {"door_grace", sd.loop_guard_door_grace}}},
           // llava: the answer row after the think block; null is "not set", so
           // an operator can tell the switch off from a value that happens to
           // equal the thinking row's.
