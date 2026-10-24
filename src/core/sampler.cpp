@@ -305,6 +305,40 @@ void Sampler::loop_observe_(std::string_view piece) {
     }
 }
 
+// The near rule's 3-grams, hashed with FNV-1a and kept sorted/deduped so the
+// Jaccard of two lines is a merge over two small sorted vectors. One pass per
+// ended line; the text is never rescanned.
+Sampler::LoopGrams Sampler::loop_grams_(const std::string& line) const {
+    LoopGrams grams;
+    if (line.size() < 3) return grams;
+    grams.reserve(line.size() - 2);
+    for (size_t i = 0; i + 2 < line.size(); ++i) {
+        uint32_t h = 2166136261u;
+        for (size_t k = 0; k < 3; ++k)
+            h = (h ^ static_cast<unsigned char>(line[i + k])) * 16777619u;
+        grams.push_back(h);
+    }
+    std::sort(grams.begin(), grams.end());
+    grams.erase(std::unique(grams.begin(), grams.end()), grams.end());
+    return grams;
+}
+
+bool Sampler::loop_near_match_(const LoopGrams& grams) const {
+    for (const LoopGrams& prev : loop_gram_memory_) {
+        size_t inter = 0;
+        size_t i = 0, j = 0;
+        while (i < grams.size() && j < prev.size()) {
+            if (grams[i] < prev[j]) ++i;
+            else if (grams[i] > prev[j]) ++j;
+            else { ++inter; ++i; ++j; }
+        }
+        const size_t uni = grams.size() + prev.size() - inter;
+        if (uni > 0 && static_cast<float>(inter) >= kLoopGuardNearJaccard * static_cast<float>(uni))
+            return true;
+    }
+    return false;
+}
+
 void Sampler::loop_line_ended_(const std::string& line) {
     if (line.size() <= 20) return;
 
@@ -317,7 +351,18 @@ void Sampler::loop_line_ended_(const std::string& line) {
     if (!thinking && !content) return;
 
     if (thinking && loop_nudged_ && !loop_slapped_) ++loop_since_nudge_;
-    const bool repeated = loop_seen_[line]++ > 0;
+    const bool exact_repeat = loop_seen_[line]++ > 0;
+    bool       repeated     = exact_repeat;
+    if (!exact_repeat && params_.loop_guard_match == LoopGuardMatch::Near) {
+        LoopGrams grams = loop_grams_(line);
+        repeated        = loop_near_match_(grams);
+        // Every distinct counted line joins the near memory, the near matches
+        // too: a counting loop's number lines are distinct text and must be
+        // comparable with the next number line. Exact repeats already sit in
+        // the memory once.
+        loop_gram_memory_.push_back(std::move(grams));
+        while (loop_gram_memory_.size() > kLoopGuardNearMemory) loop_gram_memory_.pop_front();
+    }
     loop_window_.push_back(LoopLine{line, repeated});
     const size_t window = static_cast<size_t>(std::max(1, params_.loop_guard_window));
     while (loop_window_.size() > window) loop_window_.pop_front();
@@ -327,21 +372,27 @@ void Sampler::loop_line_ended_(const std::string& line) {
     size_t repeats = 0;
     for (const LoopLine& l : loop_window_) repeats += l.repeated ? 1 : 0;
     const float share = static_cast<float>(repeats) / static_cast<float>(loop_window_.size());
-    const bool over   = share >= params_.loop_guard_threshold;
+    const bool  over     = share >= params_.loop_guard_threshold;
+    // Hysteresis: low is re-armed only below (threshold - 0.1). A nudge's own
+    // new line pushes the share just under the threshold; that dip must not
+    // make the next repeat count as a second detection. A real fall below the
+    // low mark is a new loop onset when the share rises again.
+    const float low_mark = params_.loop_guard_threshold - 0.1f;
+    if (share < low_mark) loop_low_ = true;
+    const bool crossing = over && loop_low_;
 
     if (thinking) {
-        if (!over) {
-            loop_fired_ = false;
-            return;
-        }
-        if (!loop_fired_) {
-            loop_fired_ = true;
+        if (crossing) {
+            loop_low_ = false;
             ++loop_detections_;
             log::info("loop-guard", "lane: reasoning loop detected: %zu of %zu recent lines repeat (%.2f), after %zu lines",
                       repeats, loop_window_.size(), share, loop_seen_.size());
             loop_on_detect_(false);
-        } else if (params_.loop_guard == LoopGuardMode::Ladder && loop_nudged_ && !loop_slapped_
-                   && loop_since_nudge_ >= params_.loop_guard_grace) {
+        }
+        // The slap's grace keeps watching every over line, dips included: a
+        // share at/above the threshold after K counted lines still slaps.
+        if (over && params_.loop_guard == LoopGuardMode::Ladder && loop_nudged_ && !loop_slapped_
+            && loop_since_nudge_ >= params_.loop_guard_grace) {
             loop_do_slap_();
         }
     } else if (content && over && !loop_abort_) {
@@ -387,8 +438,9 @@ void Sampler::loop_do_slap_() {
     // the model has said anything). Content lines are counted from here.
     loop_window_.clear();
     loop_seen_.clear();
+    loop_gram_memory_.clear();
     loop_line_.clear();
-    loop_fired_ = false;
+    loop_low_ = true;
     log::info("loop-guard", "lane: slap: the think-block's closer is forced as the next token");
 }
 

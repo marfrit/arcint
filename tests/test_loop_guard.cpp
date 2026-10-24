@@ -37,10 +37,43 @@ SamplerParams base_params(LoopGuardMode mode, int window = 10, int grace = 5) {
     return p;
 }
 
-// A line that is long enough to count, with a distinct tail so a non-looping
-// stream stays varied.
+// A line that is long enough to count, with enough varied (and unique) tokens
+// that the near rule's 3-gram Jaccard stays well below its bar for a
+// non-looping stream.
+std::string distinct_token(int i, int salt) {
+    uint32_t x = static_cast<uint32_t>((i + 1) * 2654435761u + salt * 40503u);
+    std::string out;
+    for (int k = 0; k < 4; ++k) {
+        out += static_cast<char>('a' + x % 26);
+        x /= 26;
+    }
+    return out;
+}
+
 std::string distinct_line(int i) {
-    return "reasoning line " + std::to_string(i) + ": checking a different branch of the problem now\n";
+    const std::string a = distinct_token(i, 1), b = distinct_token(i, 2),
+                      c = distinct_token(i, 3), d = distinct_token(i, 4),
+                      e = distinct_token(i, 5);
+    switch (i % 4) {
+        case 0: return "step " + std::to_string(i) + ": " + a + " " + b + " " + c + " " + d + " " + e + "\n";
+        case 1: return "under " + std::to_string(i) + ", " + b + " asks " + c + " or " + d + " fits " + e + " beside " + a + "\n";
+        case 2: return "mark " + std::to_string(i) + ": choose " + c + ", drop " + d + ", keep " + a + " next to " + e + "\n";
+        default: return "branch " + std::to_string(i) + " reads " + d + " against " + e + " while " + a + " waits for " + b + "\n";
+    }
+}
+
+// A counting loop as seen live: one fixed line, one line whose only change is
+// a number word. Exact repeats stay at about half; near catches both.
+std::string counting_fixed() {
+    return "Wait, the index remainder is still the same value and the same step.\n";
+}
+std::string counting_varying(int i) {
+    static const char* nums[] = {"four", "five", "six", "seven", "eight", "nine", "ten",
+                                 "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+                                 "sixteen", "seventeen", "eighteen", "nineteen", "twenty",
+                                 "twenty-one", "twenty-two", "twenty-three", "twenty-four"};
+    return "If the index remainder is one thousand and " + std::string(nums[i % 20]) +
+           " after " + std::to_string(i) + " steps, still the same question?\n";
 }
 
 std::string loop_line(int) {
@@ -109,6 +142,66 @@ TEST(loop_guard_varied_stream_never_fires) {
         CHECK_EQ(s.loop_guard_counts().slaps, 0);
         CHECK_EQ(s.loop_guard_counts().aborts, 0);
     }
+}
+
+// The near rule catches the counting loop that exact misses.
+TEST(loop_guard_near_catches_a_counting_loop_that_exact_misses) {
+    auto detections = [&](LoopGuardMatch match) {
+        SamplerParams p = base_params(LoopGuardMode::Detect);
+        p.loop_guard_match = match;
+        Sampler s(p, 1);
+        s.start_in_think_block(true);
+        for (int i = 0; i < 40; ++i) {
+            feed_text(s, i % 2 == 0 ? counting_fixed() : counting_varying(i));
+        }
+        return s.loop_guard_counts().detections;
+    };
+    CHECK_EQ(detections(LoopGuardMatch::Exact), 0);
+    CHECK_EQ(detections(LoopGuardMatch::Near), 1);
+}
+
+// The false-positive guard under near: a genuinely varied stream of the same
+// length never fires.
+TEST(loop_guard_near_varied_stream_never_fires) {
+    SamplerParams p = base_params(LoopGuardMode::Detect);
+    p.loop_guard_match = LoopGuardMatch::Near;
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    feed_lines(s, 0, 60, false);
+    CHECK_EQ(s.loop_guard_counts().detections, 0);
+}
+
+// Hysteresis: a dip just under the threshold after a nudge does not count a
+// second detection; a real fall below threshold - 0.1 and a rise again does.
+// Window 20, threshold 0.8: a repeated line stream detects at 0.8, five varied
+// lines dip it to 0.75 (above the 0.7 low mark), and 16 repeats cross back to
+// 0.8 without counting; seven varied lines fall to 0.65 (below the low mark),
+// and 16 repeats cross back and count.
+TEST(loop_guard_hysteresis_dip_does_not_add_a_detection) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 20, 1000);
+    p.loop_guard_match = LoopGuardMatch::Exact;
+    for (size_t i = 0; i < kPiece.size(); ++i) p.loop_guard_nudge_ids.push_back(kPieceFirst + static_cast<int>(i));
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 26, true);   // 17 repeating lines: the share first reaches 0.8
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    // Deliver the nudge, then dip just under the threshold.
+    for (size_t i = 0; i < kPiece.size(); ++i) {
+        std::vector<float> l = row_with_argmax(2);
+        const int id = s.sample(l.data(), l.size());
+        s.observe_think(id, piece_of(id));
+    }
+    feed_lines(s, 9, 14, false);   // 5 varied lines: share 0.75
+    feed_lines(s, 26, 42, true);   // 16 repeats: crosses back to 0.8
+    CHECK_EQ(s.loop_guard_counts().detections, 1);   // the dip did not count
+
+    // A real fall below threshold - 0.1, then a rise again: a new detection.
+    feed_lines(s, 14, 21, false);  // 7 varied lines: share 0.65
+    feed_lines(s, 42, 58, true);   // 16 repeats: crosses 0.8 again
+    CHECK_EQ(s.loop_guard_counts().detections, 2);
 }
 
 // 3. Ladder: the nudge text appears once in the reasoning, and after K more
@@ -336,6 +429,7 @@ TEST(loop_guard_counters_reach_the_line_and_the_response_object) {
 TEST(loop_guard_flags_parse_and_travel) {
     Config cfg;
     std::vector<const char*> args = {"--stub", "--loop-guard", "slap",
+                                     "--loop-guard-match", "exact",
                                      "--loop-guard-window", "64",
                                      "--loop-guard-threshold", "0.6",
                                      "--loop-guard-grace", "12"};
@@ -348,6 +442,7 @@ TEST(loop_guard_flags_parse_and_travel) {
     SamplerDefaults d;
     CHECK(!apply_operator_defaults(cfg, d).has_value());
     CHECK(d.loop_guard == LoopGuardMode::Slap);
+    CHECK(d.loop_guard_match == LoopGuardMatch::Exact);
     CHECK_EQ(d.loop_guard_window, 64);
     CHECK_EQ(d.loop_guard_grace, 12);
     CHECK(d.provenance == "operator");
@@ -362,11 +457,13 @@ TEST(loop_guard_flags_parse_and_travel) {
     SamplerDefaults d2;
     CHECK(!apply_operator_defaults(stub, d2).has_value());
     CHECK(d2.loop_guard == LoopGuardMode::Off);
+    CHECK(d2.loop_guard_match == LoopGuardMatch::Near);   // the default rule
     CHECK_EQ(d2.loop_guard_window, 200);
     CHECK(d2.provenance == "provisional");
 
     // Bad values are refused at boot.
     for (std::vector<std::string> bad : {std::vector<std::string>{"--stub", "--loop-guard", "sometimes"},
+                                         std::vector<std::string>{"--stub", "--loop-guard-match", "loose"},
                                          std::vector<std::string>{"--stub", "--loop-guard-window", "0"},
                                          std::vector<std::string>{"--stub", "--loop-guard-threshold", "1.5"},
                                          std::vector<std::string>{"--stub", "--loop-guard-grace", "-1"}}) {

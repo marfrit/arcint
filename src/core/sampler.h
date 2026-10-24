@@ -175,6 +175,11 @@ private:
     // loop-guard: the ladder's state and its per-request counters.
     void   loop_observe_(std::string_view piece);
     void   loop_line_ended_(const std::string& line);
+    // near match: the line's hashed character-3-grams, sorted and deduped;
+    // compared by Jaccard against the remembered distinct counted lines.
+    using LoopGrams = std::vector<uint32_t>;
+    LoopGrams loop_grams_(const std::string& line) const;
+    bool      loop_near_match_(const LoopGrams& grams) const;
     void   loop_on_detect_(bool content_phase);
     void   loop_do_nudge_();
     void   loop_do_slap_();
@@ -256,7 +261,13 @@ private:
     std::string                       loop_line_;   // the open line's text
     std::deque<LoopLine>              loop_window_;
     std::unordered_map<std::string, int> loop_seen_;   // line -> prior count
-    bool loop_fired_     = false;   // the share is at/above the threshold now
+    // The near rule's memory: the last kLoopGuardNearMemory distinct counted
+    // lines' gram sets, per request. Exact repeats are not stored twice.
+    std::deque<LoopGrams>             loop_gram_memory_;
+    // Hysteresis: true while the share is below (threshold - 0.1). A
+    // detection counts only on a low -> over crossing, so a dip just under the
+    // threshold (a nudge's own line) does not count a second loop.
+    bool loop_low_       = true;
     bool loop_nudged_    = false;
     bool loop_slapped_   = false;
     bool loop_abort_     = false;

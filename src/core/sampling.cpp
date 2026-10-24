@@ -24,10 +24,24 @@ std::optional<LoopGuardMode> loop_guard_parse(std::string_view name) {
     return std::nullopt;
 }
 
+const char* loop_guard_match_name(LoopGuardMatch m) {
+    switch (m) {
+        case LoopGuardMatch::Exact: return "exact";
+        case LoopGuardMatch::Near:  return "near";
+    }
+    return "near";
+}
+
+std::optional<LoopGuardMatch> loop_guard_match_parse(std::string_view name) {
+    if (name == "exact") return LoopGuardMatch::Exact;
+    if (name == "near")  return LoopGuardMatch::Near;
+    return std::nullopt;
+}
+
 bool SamplerOverrides::any() const {
     return temperature || top_p || top_k || min_p || repetition_penalty || presence_penalty ||
            frequency_penalty || seed || max_tokens || ignore_eos || stop || stop_token_ids ||
-           think_eog_mask || tool_grammar || loop_guard || loop_guard_window ||
+           think_eog_mask || tool_grammar || loop_guard || loop_guard_match || loop_guard_window ||
            loop_guard_threshold || loop_guard_grace || answer_temperature || answer_top_p || answer_top_k ||
            answer_min_p || answer_presence_penalty || answer_frequency_penalty ||
            nothink_temperature || nothink_top_p || nothink_top_k || nothink_min_p ||
@@ -52,6 +66,7 @@ SamplerParams sampler_from_defaults(const SamplerDefaults& d, bool nothink) {
     p.think_eog_mask     = d.think_eog_mask;
     p.tool_grammar       = d.tool_grammar;
     p.loop_guard         = d.loop_guard;
+    p.loop_guard_match   = d.loop_guard_match;
     p.loop_guard_window    = d.loop_guard_window;
     p.loop_guard_threshold = d.loop_guard_threshold;
     p.loop_guard_grace     = d.loop_guard_grace;
@@ -174,6 +189,7 @@ std::optional<std::string> sampler_apply(SamplerParams& p, const SamplerOverride
     if (o.think_eog_mask) p.think_eog_mask = *o.think_eog_mask;
     if (o.tool_grammar)   p.tool_grammar   = *o.tool_grammar;
     if (o.loop_guard)     p.loop_guard     = *o.loop_guard;
+    if (o.loop_guard_match) p.loop_guard_match = *o.loop_guard_match;
     // llava: the request's answer row fields override the operator's, for that
     // request only (a client A/B without a restart). Absent keeps the default.
     if (o.answer_temperature) p.answer_temperature = *o.answer_temperature;
@@ -210,6 +226,7 @@ std::optional<std::string> sampler_defaults_apply(SamplerDefaults& d, const Samp
     if (o.think_eog_mask)     d.think_eog_mask     = *o.think_eog_mask;
     if (o.tool_grammar)       d.tool_grammar       = *o.tool_grammar;
     if (o.loop_guard)         d.loop_guard         = *o.loop_guard;
+    if (o.loop_guard_match)   d.loop_guard_match   = *o.loop_guard_match;
     if (o.loop_guard_window)    d.loop_guard_window    = *o.loop_guard_window;
     if (o.loop_guard_threshold) d.loop_guard_threshold = *o.loop_guard_threshold;
     if (o.loop_guard_grace)     d.loop_guard_grace     = *o.loop_guard_grace;
@@ -220,7 +237,7 @@ std::optional<std::string> sampler_defaults_apply(SamplerDefaults& d, const Samp
     if (o.answer_presence_penalty)  d.answer_presence_penalty  = *o.answer_presence_penalty;
     if (o.answer_frequency_penalty) d.answer_frequency_penalty = *o.answer_frequency_penalty;
     if (o.temperature || o.top_p || o.top_k || o.min_p || o.repetition_penalty || o.presence_penalty ||
-        o.think_eog_mask || o.tool_grammar || o.loop_guard || o.loop_guard_window || o.loop_guard_threshold ||
+        o.think_eog_mask || o.tool_grammar || o.loop_guard || o.loop_guard_match || o.loop_guard_window || o.loop_guard_threshold ||
         o.loop_guard_grace || o.answer_temperature || o.answer_top_p || o.answer_top_k ||
         o.answer_min_p || o.answer_presence_penalty || o.answer_frequency_penalty || nothink_set) {
         d.provenance = "operator";

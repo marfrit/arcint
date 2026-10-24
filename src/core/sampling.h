@@ -22,6 +22,22 @@ enum class LoopGuardMode { Off, Detect, Nudge, Slap, Ladder };
 const char* loop_guard_name(LoopGuardMode m);
 std::optional<LoopGuardMode> loop_guard_parse(std::string_view name);
 
+// loop-guard's line match rule. Exact: identical text earlier in the turn.
+// Near (default): also a repeat when the character-3-gram set of the line has
+// Jaccard >= kLoopGuardNearJaccard with one of the last
+// kLoopGuardNearMemory distinct counted lines. Near catches a counting loop
+// whose lines differ only in a number word; the exact rule does not.
+enum class LoopGuardMatch { Exact, Near };
+
+const char* loop_guard_match_name(LoopGuardMatch m);
+std::optional<LoopGuardMatch> loop_guard_match_parse(std::string_view name);
+
+// The near rule's fixed constants: J = 0.8, a 400-line memory. Named, not
+// configured: the offline measurement over 42 reasoning texts is what bounds
+// both (clean runs 0.67, loopers 1.0, the counting loop 0.97).
+inline constexpr float  kLoopGuardNearJaccard = 0.8f;
+inline constexpr size_t kLoopGuardNearMemory  = 400;
+
 // The fixed sentence the nudge rung injects, as if the model had generated it.
 // The backend tokenises it once per request; the sampler only forces the ids.
 inline constexpr const char* kLoopGuardNudge =
@@ -65,6 +81,7 @@ struct SamplerDefaults {
     // threshold is the repeat share that trips the detector, grace is how
     // many more lines after a nudge the ladder waits before the slap.
     LoopGuardMode loop_guard = LoopGuardMode::Off;
+    LoopGuardMatch loop_guard_match = LoopGuardMatch::Near;
     int   loop_guard_window    = 200;
     float loop_guard_threshold = 0.8f;
     int   loop_guard_grace     = 40;
@@ -157,6 +174,7 @@ struct SamplerParams {
     // caller's emit/observe/decode path like any drawn token, so it lands in
     // the history, the KV, reasoning_content and the stream.
     LoopGuardMode loop_guard = LoopGuardMode::Off;
+    LoopGuardMatch loop_guard_match = LoopGuardMatch::Near;
     int   loop_guard_window    = 200;
     float loop_guard_threshold = 0.8f;
     int   loop_guard_grace     = 40;
@@ -214,6 +232,7 @@ struct SamplerOverrides {
     // loop-guard: the request's own rung for this request only. Absent keeps
     // the operator's switch; the window/threshold/grace stay operator-side.
     std::optional<LoopGuardMode>            loop_guard;
+    std::optional<LoopGuardMatch>           loop_guard_match;
     // The operator layer carries these; a request parser never fills them.
     std::optional<int>                      loop_guard_window;
     std::optional<float>                    loop_guard_threshold;

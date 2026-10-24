@@ -242,6 +242,11 @@ struct Config {
     // thresholds. Off by default: no detector, no forced token, no new finish
     // reason. A request may set its own rung with loop_guard, for that request.
     std::string loop_guard = "off";
+    // --loop-guard-match exact|near: how a line counts as a repeat. Near is
+    // the default (a counting loop whose lines differ only in a number word);
+    // set_match says the flag was given, so off's defaults stay untouched.
+    std::string loop_guard_match     = "near";
+    bool        loop_guard_match_set = false;
     int         loop_guard_window    = 200;
     float       loop_guard_threshold = 0.8f;
     int         loop_guard_grace     = 40;

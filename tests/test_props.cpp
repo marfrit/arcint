@@ -340,6 +340,7 @@ TEST(props_reports_the_loop_guard_switch_and_thresholds) {
     backend.st.n_ctx     = 256;
 
     backend.st.sampler_defaults.loop_guard          = LoopGuardMode::Ladder;
+    backend.st.sampler_defaults.loop_guard_match     = LoopGuardMatch::Exact;
     backend.st.sampler_defaults.loop_guard_window    = 120;
     backend.st.sampler_defaults.loop_guard_threshold = 0.75f;
     backend.st.sampler_defaults.loop_guard_grace     = 30;
@@ -348,6 +349,7 @@ TEST(props_reports_the_loop_guard_switch_and_thresholds) {
     Context  ctx{&cfg, &backend, &slots};
     const nlohmann::json lg = lgc::api::props(ctx).at("sampler_defaults").at("loop_guard");
     CHECK_EQ(lg.at("mode").get<std::string>(), std::string("ladder"));
+    CHECK_EQ(lg.at("match").get<std::string>(), std::string("exact"));
     CHECK_EQ(lg.at("window").get<int>(), 120);
     CHECK_EQ(lg.at("threshold").get<float>(), 0.75f);
     CHECK_EQ(lg.at("grace").get<int>(), 30);

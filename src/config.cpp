@@ -244,6 +244,10 @@ std::string usage_text() {
         "                            grace, then ends the turn if the answer loops.\n"
         "                            off (default) is today's behaviour exactly; a\n"
         "                            request may set loop_guard for itself\n"
+        "  --loop-guard-match RULE   exact|near (default near): near also counts a\n"
+        "                            line whose character-3-gram set is Jaccard >=\n"
+        "                            0.8 with one of the last 400 distinct counted\n"
+        "                            lines; exact counts identical text only\n"
         "  --loop-guard-window N     recent reasoning lines whose repeat share is\n"
         "                            tested (default 200; only lines > 20 chars)\n"
         "  --loop-guard-threshold T  share of the window that trips the detector\n"
@@ -549,6 +553,11 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v)) return fail("--loop-guard needs off|detect|nudge|slap|ladder");
             if (!loop_guard_parse(v)) return fail("--loop-guard needs off|detect|nudge|slap|ladder");
             cfg.loop_guard = std::string(v);
+        } else if (arg == "--loop-guard-match") {
+            if (!value(v)) return fail("--loop-guard-match needs exact|near");
+            if (!loop_guard_match_parse(v)) return fail("--loop-guard-match needs exact|near");
+            cfg.loop_guard_match     = std::string(v);
+            cfg.loop_guard_match_set = true;
         } else if (arg == "--loop-guard-window") {
             int n = 0;
             if (!value(v) || !parse_int(v, n) || n < 1) return fail("--loop-guard-window needs an integer >= 1");
@@ -808,6 +817,9 @@ std::optional<std::string> apply_operator_defaults(const Config& cfg, SamplerDef
         o.loop_guard_window    = cfg.loop_guard_window;
         o.loop_guard_threshold = cfg.loop_guard_threshold;
         o.loop_guard_grace     = cfg.loop_guard_grace;
+    }
+    if (cfg.loop_guard_match_set) {
+        if (const auto match = loop_guard_match_parse(cfg.loop_guard_match)) o.loop_guard_match = *match;
     }
     o.nothink_temperature      = cfg.nothink_temp;
     o.nothink_top_p            = cfg.nothink_top_p;

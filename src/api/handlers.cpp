@@ -562,6 +562,7 @@ json props(const Context& ctx) {
           // ends differently than yesterday's is explained here.
           {"loop_guard",
            {{"mode", loop_guard_name(sd.loop_guard)},
+            {"match", loop_guard_match_name(sd.loop_guard_match)},
             {"window", sd.loop_guard_window},
             {"threshold", sd.loop_guard_threshold},
             {"grace", sd.loop_guard_grace}}},
