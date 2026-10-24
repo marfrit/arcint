@@ -73,6 +73,14 @@ correct, 1 wrong with no guard event, 1 ended on `loop` after a real loop in
 the reasoning and again in the answer. Not run: Flash-Next's A/B (its sampler
 path is the agent's, every switch off; `code`).
 
+**Published** (2026-10-24): `arcint` 1.2.3-1 built by its recipe from the
+v1.2.3 tag tarball (sha256 `bf0f02f4…`) and published to the trixie
+repository (index verified); installed from the pool on the card host. The
+agent runs it with the switches off (the stop-string check, the acceptance
+task 10/10); the coder's unit carries `--loop-guard ladder` and the
+non-thinking row and takes them at its next start. `arcint-stt` stays at
+1.2.0-1, `arcint-imggen` at 1.1.1-1.
+
 ## 1.2.2 — 2026-10-24
 
 Agent turns gain two opt-in guards: an open think block no longer offers the
@@ -145,6 +153,13 @@ pre-tag package build green; on the coder (A770, T=0) a request with a stop
 string beginning with a line break gave an empty answer with the block open
 on the dev build that ran this content, and closes the block and answers on
 the fixed build, streaming and non-streaming, as without the stop.
+
+**Published** (2026-10-24): `arcint` 1.2.2-1 built by its recipe from the
+v1.2.2 tag tarball (sha256 `95392892…`) and published to the trixie
+repository (index verified); installed from the pool on the card host, where
+the agent and the coder ran it (the stop-string check answered on both, the
+acceptance task 10/10 on the agent) until 1.2.3. `arcint-stt` stayed at
+1.2.0-1, `arcint-imggen` at 1.1.1-1.
 
 ## 1.2.1 — 2026-10-20
 
