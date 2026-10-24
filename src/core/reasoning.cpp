@@ -110,6 +110,11 @@ ReasoningSplit split_reasoning_tokens(const std::vector<std::pair<std::string, i
     out.reasoning += tail.reasoning;
     out.content   += tail.content;
     out.closed = streamer.closed();
+    // The text split's edges: the line breaks around the tags are layout, not
+    // reasoning or answer. The streamer cannot drop them (they arrive as their
+    // own pieces after the step that closed the block); the whole text can.
+    out.reasoning = std::string(strip_edge_newlines(out.reasoning));
+    out.content   = std::string(strip_leading_newlines(out.content));
     return out;
 }
 
@@ -159,7 +164,9 @@ ReasoningStreamer::Step ReasoningStreamer::push(std::string_view piece, int toke
                     && kTags[i].open.substr(0, lead.size()) == lead)
                     loomed = true;
             }
-            if (loomed) return step;   // could still be a tag
+            // Only layout so far (an empty lead): an opener token may still
+            // come, exactly as the sampler's mask stays undecided on it.
+            if (loomed || lead.empty()) return step;   // could still be a tag
             undecided_ = false;
             step.content = buffer_;
             buffer_.clear();

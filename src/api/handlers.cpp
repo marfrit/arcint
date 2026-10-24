@@ -208,16 +208,16 @@ FinishReason drive(Backend& backend, const GenerationInput& in, int slot, const 
     const FinishReason reason = backend.generate(
         in, slot,
         [&](std::string_view piece, int token_id) -> Control {
-            const StopMatcher::Step step = stop.push(piece);
-            // The reasoning split is decided by (piece, id), so the id travels
-            // with only a wholly emitted piece: a piece the stop matcher held
-            // back in part must not carry the id that would close the block
-            // early, and the held tail has no id when flushed.
-            const int emit_id = step.emit.size() == piece.size() ? token_id : -1;
-            if (pieces != nullptr) pieces->emplace_back(step.emit, emit_id);
-            if (!step.emit.empty()) {
-                raw += step.emit;
-                if (!emit(step.emit, emit_id, raw)) {
+            const StopMatcher::Step step = stop.push(piece, token_id);
+            // The reasoning split is decided by (piece, id), so the emitted
+            // text goes out cut at the pieces it came from: a whole piece with
+            // its id, a part of one with -1. A held tail released together
+            // with the closer's piece no longer costs the closer its id.
+            for (const StopMatcher::Segment& seg : step.segments) {
+                if (pieces != nullptr) pieces->emplace_back(seg.text, seg.id);
+                if (seg.text.empty()) continue;
+                raw += seg.text;
+                if (!emit(seg.text, seg.id, raw)) {
                     cancelled = true;
                     return Control::Cancel;
                 }
@@ -231,11 +231,11 @@ FinishReason drive(Backend& backend, const GenerationInput& in, int slot, const 
     if (!cancelled) {
         // Text held back as a possible stop-sequence prefix that never
         // completed is ordinary output and must not be swallowed.
-        const std::string tail = stop.flush();
-        if (!tail.empty()) {
-            raw += tail;
-            if (pieces != nullptr) pieces->emplace_back(tail, -1);
-            if (!emit(tail, -1, raw)) return FinishReason::Abort;
+        for (const StopMatcher::Segment& seg : stop.flush_segments()) {
+            if (pieces != nullptr) pieces->emplace_back(seg.text, seg.id);
+            if (seg.text.empty()) continue;
+            raw += seg.text;
+            if (!emit(seg.text, seg.id, raw)) return FinishReason::Abort;
         }
     }
     return reason;

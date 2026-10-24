@@ -23,7 +23,8 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 Agent turns gain two opt-in guards: an open think block no longer offers the
 tokens that end the turn, and a tool call can be constrained to the declared
 schemas. Both are switches, **off by default**; a unit or a request turns them
-on. With both off, 1.2.2 serves 1.2.1's behaviour.
+on. The reasoning split by token id below is not a switch: it is on for every
+artifact whose tags are single special tokens.
 
 - **Think-block mask** — `--think-eog-mask` (also the request field
   `think_eog_mask`; `/props` reports it). While a think block is open, the
@@ -42,7 +43,16 @@ on. With both off, 1.2.2 serves 1.2.1's behaviour.
 - **The think block decided by the closer's token id.** The reasoning split
   and the stream now see the generated token ids: a closer spelled from
   ordinary tokens stays reasoning, the special-token closer ends the block,
-  and the streaming and non-streaming paths run the same splitter.
+  and the streaming and non-streaming paths run the same splitter. Text a
+  request's stop strings hold back is released cut at the generated pieces,
+  each whole piece with its own id, so the closer and the opener keep theirs:
+  before this, a stop string beginning with a line break (a role prefix after
+  a newline, as agent frameworks send) cost the closer its id, the block never
+  closed and the answer came back as reasoning with empty content; it reached
+  the dev build that ran this content in production, not a package. A line
+  break ahead of a self-opened block keeps the split undecided, as the mask
+  is, and the non-streaming split drops the line breaks around the tags as the
+  text split does.
 - **The reasoning stream holds back a torn UTF-8 code point**, as the content
   path already did, so no reasoning delta is invalid UTF-8 (DESIGN §3.7).
 - **`reasoning_closed` on the stream:** the chunk that carries `finish_reason`

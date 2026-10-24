@@ -233,6 +233,7 @@ if(ARCINT_TESTS)
     tests/test_lanes.cpp
     tests/test_reasoning.cpp
     tests/test_stream_utf8.cpp
+    tests/test_stop_think_ids.cpp
     tests/test_decode_stats.cpp
     tests/test_toolgrammar.cpp
   )
