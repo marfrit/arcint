@@ -519,7 +519,10 @@ TEST(loop_guard_flags_parse_and_travel) {
 // sentence's tail glued on it would count, and the 40th counted line would
 // arrive one line early.
 TEST(loop_guard_nudge_tail_does_not_prefix_the_next_line) {
-    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 40);
+    // Today's ladder, without the door: the nudge lands at detection, so the
+    // tail check does not also depend on the door grace. The door's own
+    // ladder order is pinned in its tests.
+    SamplerParams p = base_params(LoopGuardMode::LadderNoDoor, 10, 40);
     for (size_t i = 0; i < kPiece.size(); ++i) p.loop_guard_nudge_ids.push_back(kPieceFirst + static_cast<int>(i));
     Sampler s(p, 1);
     s.start_in_think_block(true);
