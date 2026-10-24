@@ -100,7 +100,8 @@ Built, default off; the line match defaults to near. Detection, door, nudge
 (forced token ids), slap (forced closer id), and the content-phase abort are
 unit-tested on synthetic streams, including a counting loop that exact misses
 and near catches, the near false-positive guard, the detection hysteresis, the
-door's mask and self-close, the door grace in the ladder order beside
+door's mask and self-close, a slap's forced closer not counted as a
+self-close, the door grace in the ladder order beside
 `ladder-nodoor`, and `ladder-nodoor` never opening the door. Evidence class:
 the mechanism is `code` (this tree); the line-end probabilities and the closing
 estimate are `measured-here` (operator, offline, recorded above). The
@@ -133,6 +134,22 @@ No card measurement of the door yet: the card window still owes the coder
 battery with the door, including missed lines (the door masks the
 multi-newline tokens only, and line breaks the vocabulary spells as one
 newline remain).
+
+## Open points
+
+Recorded by review of the door handover (2026-10-24); not fixed here.
+
+- **The door-id scan races across lanes.** `loop_door_ids()` scans lazily and
+  caches through `mutable` state in a const method. Two lanes that start their
+  first door request at the same moment can both scan and interleave their
+  writes into the cached vector. `std::call_once` around the scan, or a scan at
+  model load, is the fix. Evidence: `code`, read in this tree; not measured.
+- **`door_masked` costs a second pass over the vocabulary.** While the door is
+  open, `mask_door_while_thinking` walks the full vocabulary on every draw to
+  find the top-k floor for the counter. The candidates the draw collects anyway
+  would answer the same question; folding the count into `collect_candidates`
+  removes the extra pass. Whether the counter is worth the pass at all is the
+  operator's call. Evidence: `code`, read in this tree; no measured cost yet.
 
 ## Where it lives
 

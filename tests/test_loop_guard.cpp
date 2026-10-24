@@ -862,3 +862,70 @@ TEST(loop_guard_door_counters_and_modes_parse) {
     CHECK(d.loop_guard == LoopGuardMode::Door);
     CHECK_EQ(d.loop_guard_door_grace, 7);
 }
+
+// A slap's forced closer is not the model's own draw: with the door open, the
+// ladder's slap must leave self_closes at 0 and count the slap. The card test
+// reads exactly these two counters to tell a self-close from a slap.
+TEST(loop_guard_door_slap_is_not_a_self_close) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 3);
+    p.loop_guard_door_grace = 4;
+    p.loop_guard_door_ids   = {6, 7};
+    for (size_t i = 0; i < kPiece.size(); ++i)
+        p.loop_guard_nudge_ids.push_back(kPieceFirst + static_cast<int>(i));
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection: the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+    for (int i = 18; i < 22; ++i) feed_text(s, loop_line(i));   // door grace 4
+    CHECK_EQ(s.loop_guard_counts().nudges, 1);
+
+    // Deliver the nudge sentence, then wait out the slap grace.
+    for (size_t i = 0; i < kPiece.size(); ++i) {
+        std::vector<float> l = row_with_argmax(2);
+        const int id = s.sample(l.data(), l.size());
+        s.observe_think(id, piece_of(id));
+    }
+    for (int i = 22; i < 25; ++i) feed_text(s, loop_line(i));   // 3 lines: slap
+    CHECK_EQ(s.loop_guard_counts().slaps, 1);
+
+    // The next draw is the forced closer, observed exactly as a decode loop
+    // does. It closes the block, but it is not the model's own draw.
+    std::vector<float> l(8, -1.0f);
+    l[6] = 10.0f;   // the model's likely pick, forbidden by the door
+    l[5] = 9.0f;    // the closer, legal
+    CHECK_EQ(s.sample(l.data(), l.size()), 5);
+    s.observe(5, "closed");
+    CHECK_EQ(s.loop_guard_counts().self_closes, 0);
+    CHECK_EQ(s.loop_guard_counts().slaps, 1);
+}
+
+// ladder-nodoor is the ladder before the door: it never opens the mask, so a
+// row whose top token is a multi-newline token still draws it.
+TEST(loop_guard_ladder_nodoor_never_opens_the_door) {
+    SamplerParams p = base_params(LoopGuardMode::LadderNoDoor, 10, 5);
+    p.loop_guard_door_grace = 4;
+    p.loop_guard_door_ids   = {6, 7};   // set, but this rung must not read them
+    p.loop_guard_nudge_ids  = {kPieceFirst};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; today's order nudges at once
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+    CHECK_EQ(s.loop_guard_counts().nudges, 1);
+
+    // The nudge is in flight at the detection moment: deliver its one id first,
+    // exactly as a decode loop does.
+    std::vector<float> nudge_row = row_with_argmax(2);
+    CHECK_EQ(s.sample(nudge_row.data(), nudge_row.size()), kPieceFirst);
+    s.observe_think(kPieceFirst, piece_of(kPieceFirst));
+
+    std::vector<float> row(8, -1.0f);
+    row[4] = 1.0f;   // the single newline
+    row[6] = 5.0f;   // a multi-newline token at the top
+    CHECK_EQ(s.sample(row.data(), row.size()), 6);
+    CHECK(row[6] == 5.0f);   // the multi-newline ids stay finite
+    CHECK(row[7] == -1.0f);
+    CHECK_EQ(s.loop_guard_counts().door_masked, 0);
+}
