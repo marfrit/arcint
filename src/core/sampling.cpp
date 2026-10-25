@@ -10,7 +10,9 @@ const char* loop_guard_name(LoopGuardMode m) {
         case LoopGuardMode::Detect: return "detect";
         case LoopGuardMode::Nudge:  return "nudge";
         case LoopGuardMode::Slap:   return "slap";
+        case LoopGuardMode::Door:   return "door";
         case LoopGuardMode::Ladder: return "ladder";
+        case LoopGuardMode::LadderNoDoor: return "ladder-nodoor";
     }
     return "off";
 }
@@ -20,7 +22,9 @@ std::optional<LoopGuardMode> loop_guard_parse(std::string_view name) {
     if (name == "detect") return LoopGuardMode::Detect;
     if (name == "nudge")  return LoopGuardMode::Nudge;
     if (name == "slap")   return LoopGuardMode::Slap;
+    if (name == "door")   return LoopGuardMode::Door;
     if (name == "ladder") return LoopGuardMode::Ladder;
+    if (name == "ladder-nodoor") return LoopGuardMode::LadderNoDoor;
     return std::nullopt;
 }
 
@@ -42,7 +46,7 @@ bool SamplerOverrides::any() const {
     return temperature || top_p || top_k || min_p || repetition_penalty || presence_penalty ||
            frequency_penalty || seed || max_tokens || ignore_eos || stop || stop_token_ids ||
            think_eog_mask || tool_grammar || loop_guard || loop_guard_match || loop_guard_window ||
-           loop_guard_threshold || loop_guard_grace || answer_temperature || answer_top_p || answer_top_k ||
+           loop_guard_threshold || loop_guard_grace || loop_guard_door_grace || answer_temperature || answer_top_p || answer_top_k ||
            answer_min_p || answer_presence_penalty || answer_frequency_penalty ||
            nothink_temperature || nothink_top_p || nothink_top_k || nothink_min_p ||
            nothink_presence_penalty;
@@ -69,7 +73,8 @@ SamplerParams sampler_from_defaults(const SamplerDefaults& d, bool nothink) {
     p.loop_guard_match   = d.loop_guard_match;
     p.loop_guard_window    = d.loop_guard_window;
     p.loop_guard_threshold = d.loop_guard_threshold;
-    p.loop_guard_grace     = d.loop_guard_grace;
+    p.loop_guard_grace      = d.loop_guard_grace;
+    p.loop_guard_door_grace = d.loop_guard_door_grace;
     p.answer_temperature = d.answer_temperature;
     p.answer_top_p       = d.answer_top_p;
     p.answer_top_k       = d.answer_top_k;
@@ -161,6 +166,9 @@ std::optional<std::string> sampler_validate(const SamplerOverrides& o) {
     if (o.loop_guard_grace && *o.loop_guard_grace < 0) {
         return log::format("loop_guard_grace must be >= 0, got %d", *o.loop_guard_grace);
     }
+    if (o.loop_guard_door_grace && *o.loop_guard_door_grace < 0) {
+        return log::format("loop_guard_door_grace must be >= 0, got %d", *o.loop_guard_door_grace);
+    }
     return std::nullopt;
 }
 
@@ -230,6 +238,7 @@ std::optional<std::string> sampler_defaults_apply(SamplerDefaults& d, const Samp
     if (o.loop_guard_window)    d.loop_guard_window    = *o.loop_guard_window;
     if (o.loop_guard_threshold) d.loop_guard_threshold = *o.loop_guard_threshold;
     if (o.loop_guard_grace)     d.loop_guard_grace     = *o.loop_guard_grace;
+    if (o.loop_guard_door_grace) d.loop_guard_door_grace = *o.loop_guard_door_grace;
     if (o.answer_temperature) d.answer_temperature = *o.answer_temperature;
     if (o.answer_top_p)       d.answer_top_p       = *o.answer_top_p;
     if (o.answer_top_k)       d.answer_top_k       = *o.answer_top_k;
@@ -238,7 +247,7 @@ std::optional<std::string> sampler_defaults_apply(SamplerDefaults& d, const Samp
     if (o.answer_frequency_penalty) d.answer_frequency_penalty = *o.answer_frequency_penalty;
     if (o.temperature || o.top_p || o.top_k || o.min_p || o.repetition_penalty || o.presence_penalty ||
         o.think_eog_mask || o.tool_grammar || o.loop_guard || o.loop_guard_match || o.loop_guard_window || o.loop_guard_threshold ||
-        o.loop_guard_grace || o.answer_temperature || o.answer_top_p || o.answer_top_k ||
+        o.loop_guard_grace || o.loop_guard_door_grace || o.answer_temperature || o.answer_top_p || o.answer_top_k ||
         o.answer_min_p || o.answer_presence_penalty || o.answer_frequency_penalty || nothink_set) {
         d.provenance = "operator";
     }

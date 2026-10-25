@@ -28,6 +28,9 @@
 - Flash-Next's production quant is ISTA-DASLab's GSQ-RCO IQ3_S since
   2026-10-20 (operator): 33.3 t/s decode on six answers, KL 0.127 against
   Q8_0 (IQ3_XXS 38.0 t/s, 0.217, the rollback).
+- Version 1.2.4 (2026-10-25): the loop guard's door rung (multi-newline
+  tokens masked in the open think block after a detection; ladder includes
+  it; ladder-nodoor is 1.2.3's ladder); the coder unit runs the ladder.
 - Version 1.2.3 (2026-10-24): a loop guard for small models
   (--loop-guard, README "New: loop guard for small models"), a non-thinking
   sampling row (--nothink-*) and an answer row (--answer-*), all off by
@@ -217,7 +220,8 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
   is open, the tokens that end the turn are not offered.
 - --tool-grammar (off; request field tool_grammar): a tool call is
   constrained to the declared schemas by a GBNF.
-- --loop-guard off|detect|nudge|slap|ladder (off; request field loop_guard),
+- --loop-guard off|detect|nudge|slap|door|ladder|ladder-nodoor (off; request
+  field loop_guard), --loop-guard-door-grace N (20),
   --loop-guard-window N (200), --loop-guard-threshold T (0.8),
   --loop-guard-grace K (40), --loop-guard-match exact|near (near).
 - --nothink-temp, --nothink-top-p, --nothink-top-k, --nothink-min-p,

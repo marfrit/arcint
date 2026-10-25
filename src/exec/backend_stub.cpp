@@ -57,6 +57,8 @@ public:
 
     int eos_id() const override { return 0; }
 
+    int vocab_size() const override { return static_cast<int>(pieces_.size()); }
+
 private:
     // Letters, digits, underscore and every non-ASCII byte glue together; each
     // remaining ASCII byte stands alone. Concatenating the pieces reproduces the

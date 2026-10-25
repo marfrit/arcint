@@ -344,6 +344,7 @@ TEST(props_reports_the_loop_guard_switch_and_thresholds) {
     backend.st.sampler_defaults.loop_guard_window    = 120;
     backend.st.sampler_defaults.loop_guard_threshold = 0.75f;
     backend.st.sampler_defaults.loop_guard_grace     = 30;
+    backend.st.sampler_defaults.loop_guard_door_grace = 15;
 
     SlotPool slots(1);
     Context  ctx{&cfg, &backend, &slots};
@@ -353,4 +354,5 @@ TEST(props_reports_the_loop_guard_switch_and_thresholds) {
     CHECK_EQ(lg.at("window").get<int>(), 120);
     CHECK_EQ(lg.at("threshold").get<float>(), 0.75f);
     CHECK_EQ(lg.at("grace").get<int>(), 30);
+    CHECK_EQ(lg.at("door_grace").get<int>(), 15);
 }

@@ -25,6 +25,10 @@ public:
     virtual std::string      decode(const std::vector<int>& ids)  = 0;
     virtual std::string      decode_one(int id)                   = 0;
     virtual int              eos_id() const                       = 0;
+    // The vocabulary's size, for a scan over every id's piece (the loop-guard
+    // door needs it to find the multi-newline tokens). Default 0: a tokenizer
+    // that cannot enumerate offers no door mask and keeps today's behaviour.
+    virtual int              vocab_size() const { return 0; }
 
     // The ids a tag string occupies when it is a SINGLE special token, empty
     // when the vocabulary spells it as ordinary text. The think-block mask
@@ -33,6 +37,27 @@ public:
     // instead. Default empty keeps every other Tokenizer working.
     virtual std::vector<int> special_ids(std::string_view tag) { (void)tag; return {}; }
 };
+
+// loop-guard door: the ids whose decoded piece is newline characters only,
+// two or more of them (the double, triple ... newline tokens). Pure: one pass
+// over the vocabulary the tokenizer owns, no cache and no shared state, so the
+// backend can run it once at model load and several threads can call it at
+// once. The single-newline id is not in the result.
+inline std::vector<int> scan_loop_guard_door_ids(Tokenizer& tok) {
+    std::vector<int> out;
+    const int n = tok.vocab_size();
+    for (int id = 0; id < n; ++id) {
+        const std::string piece = tok.decode_one(id);
+        size_t newlines = 0;
+        bool   only     = true;
+        for (char c : piece) {
+            if (c == '\n') ++newlines;
+            else { only = false; break; }
+        }
+        if (only && newlines >= 2) out.push_back(id);
+    }
+    return out;
+}
 
 struct ModelStatus {
     // Two names. `id` is the served file's own name (the GGUF's file name; the
@@ -192,6 +217,13 @@ struct GenerationStats {
     int    loop_nudges       = 0;
     int    loop_slaps        = 0;
     int    loop_aborts       = 0;
+    // loop-guard door: closes by the model's own draw while the door was open,
+    // and draws whose top-k candidates held a masked multi-newline token.
+    int    loop_self_closes  = 0;
+    int    loop_door_masked  = 0;
+    // gap 2: draws whose candidates held an end-of-generation id the door
+    // removed inside the open block.
+    int    loop_door_eog_masked = 0;
     // Wall time spent copying the whole model state so a rejected draft can be
     // rolled back. On the stateful path this is the price of speculation.
     // What the prefix cache costs on the way in. It is the same host round-trip

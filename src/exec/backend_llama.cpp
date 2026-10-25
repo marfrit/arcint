@@ -303,6 +303,8 @@ public:
 
     int eos_id() const override { return llama_vocab_eos(v_); }
 
+    int vocab_size() const override { return llama_vocab_n_tokens(v_); }
+
 private:
     const llama_vocab* v_;
 };
@@ -509,6 +511,13 @@ public:
                                                  cfg.gguf_path.c_str(), arch));
         tokenizer_ = std::make_unique<LlamaTokenizer>(vocab_);
         n_vocab_   = static_cast<size_t>(llama_vocab_n_tokens(vocab_));
+        // loop-guard door: the multi-newline ids, scanned ONCE here where the
+        // vocabulary becomes known, so no request-time lazy scan exists and no
+        // two lanes can race on a cache. A pure helper; the per-request path
+        // only reads the result.
+        loop_door_ids_ = scan_loop_guard_door_ids(*tokenizer_);
+        log::info("loop-guard", "door: %zu multi-newline token(s) in a vocabulary of %d",
+                  loop_door_ids_.size(), static_cast<int>(n_vocab_));
         // clean-turns: which ids end a turn for this vocabulary. The mask needs
         // the set, not just eos: a ChatML vocabulary ends a turn with its
         // end-of-turn id, and is_stop() asks llama_vocab_is_eog(), which answers
@@ -1599,6 +1608,13 @@ private:
             // every token after it into the answer's own presence counts, so a
             // verify that closes mid-span starts the history at the right token.
             //
+            // loop-guard door under speculation: its mask is applied inside
+            // sample(), so each verified row is drawn from the masked row just
+            // as the plain loop's would be. A draft token the door forbids is
+            // not the drawn token, so the walk breaks on that mismatch and the
+            // remaining drafts are dropped; no drafter state is advanced past
+            // the boundary (spec_->accept gets the walked acceptance only).
+            //
             // loop-guard under speculation: sample() returns a forced token
             // (the nudge's next id, or the closer id for a slap) at the row
             // boundary it is drawn for. The walk emits and observes it; when it
@@ -1869,6 +1885,7 @@ private:
     void prepare_loop_guard(const GenerationInput& in, Sampler& sampler) const {
         if (in.sampler.loop_guard == LoopGuardMode::Off) return;
         sampler.set_loop_guard_nudge(tokenizer_->encode(kLoopGuardNudge));
+        if (loop_guard_uses_door(in.sampler.loop_guard)) sampler.set_loop_guard_door(loop_door_ids_);
     }
 
     // clean-turns step 2: the request's tool-call grammar, handed to the
@@ -1906,13 +1923,19 @@ private:
     // decode line and the response object read the same numbers.
     static void report_loop_guard(int seq, Sampler& sampler, GenerationStats& stats) {
         const Sampler::LoopGuardCounts c = sampler.loop_guard_counts();
-        stats.loop_detections = c.detections;
-        stats.loop_nudges     = c.nudges;
-        stats.loop_slaps      = c.slaps;
-        stats.loop_aborts     = c.aborts;
-        if (c.detections || c.nudges || c.slaps || c.aborts)
-            log::info("loop-guard", "lane %d: detected %d, nudged %d, slapped %d, aborted %d", seq,
-                      c.detections, c.nudges, c.slaps, c.aborts);
+        stats.loop_detections  = c.detections;
+        stats.loop_nudges      = c.nudges;
+        stats.loop_slaps       = c.slaps;
+        stats.loop_aborts      = c.aborts;
+        stats.loop_self_closes = c.self_closes;
+        stats.loop_door_masked = c.door_masked;
+        stats.loop_door_eog_masked = c.door_eog_masked;
+        if (c.detections || c.nudges || c.slaps || c.aborts || c.self_closes || c.door_masked
+            || c.door_eog_masked)
+            log::info("loop-guard", "lane %d: detected %d, nudged %d, slapped %d, aborted %d, "
+                      "self-closed %d, door masked %d, door EOG masked %d", seq,
+                      c.detections, c.nudges, c.slaps, c.aborts, c.self_closes, c.door_masked,
+                      c.door_eog_masked);
     }
 
     // One llama_decode of n tokens of `seq` at positions [pos, pos + n), with
@@ -2144,6 +2167,8 @@ private:
     std::string                           template_src_;
     ModelStatus                           status_;
     size_t                                n_vocab_ = 0;
+    // loop-guard door ids, scanned once at load from the vocabulary pieces
+    std::vector<int>                      loop_door_ids_;
     int                                   lanes_   = 1;
     int                                   n_ctx_   = 0;   // the first lane's cap (status, the load line)
     bool                                  named_   = false;   // --lane-ctx: kv_unified, a cap per lane

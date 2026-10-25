@@ -11,13 +11,28 @@
 // explicit request fields always win.
 namespace lgc {
 
-// loop-guard: detect a reasoning loop and escalate (nudge, slap, abort). The
-// rungs are named so a request can pick one; Off is today's behaviour exactly.
-// Detect counts and logs only. Nudge injects the fixed sentence once. Slap
-// forces the think-block's closer at the detection moment (the rung the
-// operator's evidence points at). Ladder runs nudge, then a slap after the
-// grace, then an abort if the answer phase itself loops.
-enum class LoopGuardMode { Off, Detect, Nudge, Slap, Ladder };
+// loop-guard: detect a reasoning loop and escalate (door, nudge, slap, abort).
+// The rungs are named so a request can pick one; Off is today's behaviour
+// exactly. Detect counts and logs only. Door masks the multi-newline tokens
+// while the block is open, so the model can close by its own draw. Nudge
+// injects the fixed sentence once. Slap forces the think-block's closer at the
+// detection moment (the rung the operator's evidence points at). Ladder opens
+// the door at detection, nudges after the door grace if the loop persists,
+// then slaps after the nudge grace, then aborts if the answer phase itself
+// loops. LadderNoDoor is today's ladder exactly (nudge at detection, no mask).
+enum class LoopGuardMode { Off, Detect, Nudge, Slap, Door, Ladder, LadderNoDoor };
+
+// Whether a mode masks the multi-newline tokens at the detection moment and
+// keeps them masked while the block is open (Door, Ladder).
+inline bool loop_guard_uses_door(LoopGuardMode m) {
+    return m == LoopGuardMode::Door || m == LoopGuardMode::Ladder;
+}
+
+// Whether a mode escalates by nudge/slap/abort at all (Ladder is deferred by
+// the door grace; LadderNoDoor nudges at detection as before).
+inline bool loop_guard_is_ladder(LoopGuardMode m) {
+    return m == LoopGuardMode::Ladder || m == LoopGuardMode::LadderNoDoor;
+}
 
 const char* loop_guard_name(LoopGuardMode m);
 std::optional<LoopGuardMode> loop_guard_parse(std::string_view name);
@@ -79,12 +94,15 @@ struct SamplerDefaults {
     // behaviour, byte-identical: no detector, no forced tokens, no new
     // finish reason. window counts the recent reasoning lines (> 20 chars),
     // threshold is the repeat share that trips the detector, grace is how
-    // many more lines after a nudge the ladder waits before the slap.
+    // many more lines after a nudge the ladder waits before the slap, and
+    // door_grace is how many more counted lines the door rung opens before
+    // the ladder nudges.
     LoopGuardMode loop_guard = LoopGuardMode::Off;
     LoopGuardMatch loop_guard_match = LoopGuardMatch::Near;
     int   loop_guard_window    = 200;
     float loop_guard_threshold = 0.8f;
     int   loop_guard_grace     = 40;
+    int   loop_guard_door_grace = 20;   // counted lines before the ladder's nudge
 
     // llava: the answer row -- the sampler values used for tokens drawn after
     // the think block has closed in a thinking turn. Each field is only the
@@ -178,7 +196,14 @@ struct SamplerParams {
     int   loop_guard_window    = 200;
     float loop_guard_threshold = 0.8f;
     int   loop_guard_grace     = 40;
+    int   loop_guard_door_grace = 20;
     std::vector<int> loop_guard_nudge_ids;   // kLoopGuardNudge, tokenised
+    // loop-guard door: the ids whose decoded piece consists only of newline
+    // characters, two or more of them (the double, triple ... newline tokens).
+    // The backend scans its vocabulary once and hands them here; while the
+    // door rung is active and the block is open they are masked. The
+    // single-newline id is not in this set and stays legal.
+    std::vector<int> loop_guard_door_ids;
 
     // top_k == 1 collapses the distribution just as temperature 0 does; both
     // must take the argmax path, or "greedy" means two different things.
@@ -237,6 +262,7 @@ struct SamplerOverrides {
     std::optional<int>                      loop_guard_window;
     std::optional<float>                    loop_guard_threshold;
     std::optional<int>                      loop_guard_grace;
+    std::optional<int>                      loop_guard_door_grace;
     // llava: the request's answer row fields, for an A/B in one process.
     // Absent keeps the operator's setting; a named field wins for that request.
     std::optional<float>                    answer_temperature;

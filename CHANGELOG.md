@@ -18,6 +18,81 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.2.4 — 2026-10-25
+
+The loop guard gains a door rung; every switch stays **off by default**, and
+with none set a request is served as in 1.2.3. The coder unit's ladder now
+includes the door (operator, 2026-10-24).
+
+- **Door rung** — `--loop-guard door|ladder|ladder-nodoor`, with
+  `--loop-guard-door-grace` (20) and the same three names in the request
+  field. At detection, while the think block is open, the sampler masks every
+  vocabulary id whose decoded piece consists only of newline characters and
+  has two or more of them; the single-newline token stays legal. Nothing is
+  injected and no token is forced: the model draws normally and may close by
+  its own draw. The order is detect → door → nudge → slap → abort; the
+  door opens at detection and stays open through the nudge (after the door
+  grace) and the slap, and is gone once the block closes. `door` is the mask
+  alone (never nudge or slap); `ladder` includes the door; `ladder-nodoor` is
+  1.2.3's ladder exactly (nudge at detection, no mask), so one binary can
+  compare both. The door ids are scanned once at model load from the
+  vocabulary the backend owns. In a speculative lane the mask applies inside
+  `sample()`, so a draft the mask forbids is a mismatch and drops the rest.
+  The response's `loop_guard` object and the decode line count `self_closes`
+  (the model's own close while the mask was open, not a slap) and
+  `door_masked` (draws at which a masked token sat in the row's candidate
+  set). `/props` reports the mode and `door_grace`.
+- **Answer watched after a door self-close** — after a turn in which the door
+  opened, the content phase feeds the detector too, and a looping answer ends
+  on `finish_reason` `loop` exactly as after a slap. The answer starts from a
+  clean window at the block's close, so reasoning lines (including the loop
+  that opened the door) do not count against it; an answer that restates a
+  line or two of its reasoning once stays normal. A turn whose door never
+  opened keeps 1.2.3's unwatched answer, and `detect`/`nudge`/`slap` never
+  open the door.
+- **No end of turn inside the open block** — while the door is open and the
+  think block is open, the turn-ending ids are illegal next tokens, applied to
+  the logits in the same place as the newline mask (before penalties and the
+  draw); the closer is never masked, and `ignore_eos` turns it off. With
+  `think_eog_mask` set the mask is the same one and applied once. The
+  `loop_guard` object and the decode line add `door_eog_masked`, last after
+  `door_masked`: draws at which an end-of-generation id was a finite candidate
+  the door removed.
+- **The door on the card** (`measured-here`, the coder on the A770, its
+  model card's thinking row, seed 1, 64k cap). On the 9 tasks that had hit
+  the cap in the screening, with the door in the ladder all 7 looping runs
+  ended fully correct; all 7 closed by the model's own draw, 5 by the door
+  alone within seconds of opening and 2 after the nudge, and no forced token
+  was needed in the whole round. The same set without the door needed the
+  slap 4 times. README, "New: loop guard for small models".
+- `ladder` now includes the door. On a unit that set `ladder` in 1.2.3 a
+  detection now (a) waits the door grace (20 counted lines) before the nudge
+  instead of nudging at once, (b) masks the multi-newline tokens until the
+  block closes, (c) with `think_eog_mask` off also masks the turn-ending ids
+  in the open block, and (d) watches the answer after the model's own close,
+  so a turn that 1.2.3 recovered with the nudge and an unwatched answer can
+  now end on `loop`. `ladder-nodoor` restores 1.2.3's ladder.
+- Known residual (`code`, from the release review, not observed): the nudge
+  and the slap fire only on a line where the repeat share is at or above the
+  threshold. If the door is open with `think_eog_mask` off and the share then
+  falls below it without the model closing the block, nothing escalates and
+  the turn-ending ids stay masked, so the turn runs to the token cap where
+  1.2.3 could have ended it. The counters `door_masked` and `door_eog_masked`
+  count against the whole row when `top_k` is 0 (observability only).
+
+**Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (60
+patches), unchanged from 1.2.3; dependencies unchanged. `arcint-stt` (1.2.0)
+and `arcint-imggen` (1.1.1) are unchanged.
+
+**Release check** (2026-10-25): the device-free suite 305 cases and `ctest
+-L unit` 6/6 on the tagged tree, the package build's own tests; the
+mutations of the gap fixes red (`measured-here`, on the branch). The card
+numbers above and the answer watch's offline replay (0 of 391 recorded
+non-loop answers would abort) are from dev builds of the same mechanism. Not
+run on the release candidate, by the operator's decision: the same-window
+speed A/B against 1.2.3 and the acceptance task; every switch off is 1.2.3's
+path (`code`).
+
 ## 1.2.3 — 2026-10-24
 
 A loop guard for small models and two sampling rows by phase, all behind
