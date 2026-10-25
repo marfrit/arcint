@@ -121,8 +121,11 @@ double decode_other_seconds(const GenerationStats& stats);
 // at the struct level.
 std::string decode_suffix_for(const GenerationStats& stats);
 // loop-guard: the per-request counters as the response's `loop_guard` object.
-// Exposed so the stats-to-JSON wiring is unit-testable without a card.
-nlohmann::ordered_json loop_guard_json(const GenerationStats& stats);
+// Exposed so the stats-to-JSON wiring is unit-testable without a card. A plain
+// json: the body it lands in is one, so key order on the wire is alphabetical
+// whatever type this returns; the seven keys and their values are the
+// contract, and the handler tests read them off the serialized response.
+nlohmann::json loop_guard_json(const GenerationStats& stats);
 
 // Takes a lane for one request, or returns the 503 that says why not — with
 // the lane counts in it (slots.total, slots.free), so "busy" is a number and not a mood.

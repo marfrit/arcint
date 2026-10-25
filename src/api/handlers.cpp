@@ -96,8 +96,12 @@ std::string decode_suffix_for(const GenerationStats& stats) {
     return decode_suffix;
 }
 
-nlohmann::ordered_json loop_guard_json(const GenerationStats& stats) {
-    return nlohmann::ordered_json{{"detections", stats.loop_detections},
+// A plain json: the response body is one, so an ordered_json here cannot make
+// the key order on the wire anything but alphabetical. Order is therefore not
+// a contract -- the object's seven keys and their values are (see the handler
+// tests, which read the serialized response and the stream's finish frame).
+nlohmann::json loop_guard_json(const GenerationStats& stats) {
+    return nlohmann::json{{"detections", stats.loop_detections},
                 {"nudges", stats.loop_nudges},
                 {"slaps", stats.loop_slaps},
                 {"aborts", stats.loop_aborts},

@@ -826,14 +826,16 @@ TEST(loop_guard_ladder_door_then_nudge_then_slap_or_nodoor_old_order) {
 // object, and the /props defaults carry the door grace and the mode names.
 TEST(loop_guard_door_counters_and_modes_parse) {
     GenerationStats st;
-    st.loop_self_closes = 2;
-    st.loop_door_masked = 3;
+    st.loop_self_closes    = 2;
+    st.loop_door_masked    = 3;
+    st.loop_door_eog_masked = 4;
     const nlohmann::json j = api::loop_guard_json(st);
     CHECK_EQ(j.at("self_closes").get<int>(), 2);
     CHECK_EQ(j.at("door_masked").get<int>(), 3);
     const std::string line = api::decode_suffix_for(st);
     CHECK(line.find("self-closed 2") != std::string::npos);
     CHECK(line.find("door masked 3") != std::string::npos);
+    CHECK(line.find("door EOG masked 4") != std::string::npos);
 
     // Mode names travel through the request field and the flag.
     CHECK(loop_guard_parse("door") == LoopGuardMode::Door);
@@ -1229,23 +1231,6 @@ TEST(loop_guard_door_respects_ignore_eos_for_eog) {
     CHECK_EQ(s.loop_guard_counts().door_eog_masked, 0);
 }
 
-// The loop_guard object carries door_eog_masked last, after the keys 1.2.3 and
-// the door rung already had.
-TEST(loop_guard_json_carries_door_eog_masked_last) {
-    GenerationStats st;
-    st.loop_door_masked    = 3;
-    st.loop_door_eog_masked = 4;
-    const nlohmann::ordered_json j = api::loop_guard_json(st);
-    CHECK_EQ(j.at("door_masked").get<int>(), 3);
-    CHECK_EQ(j.at("door_eog_masked").get<int>(), 4);
-    CHECK_EQ(j.size(), 7u);
-    auto last = j.end();
-    --last;
-    CHECK_EQ(last.key(), std::string("door_eog_masked"));
-    const std::string line = api::decode_suffix_for(st);
-    CHECK(line.find("door EOG masked 4") != std::string::npos);
-}
-
 // Gap 1 on the text-closer path: models whose closer has no single token id
 // close the block by spelling it. The answer still starts from a clean window
 // there. The answer restates twelve distinct reasoning lines once each: from a
@@ -1309,3 +1294,4 @@ TEST(loop_guard_door_eog_masked_counts_on_the_sampling_path) {
     CHECK(row[0] == -INFINITY);
     CHECK_EQ(s.loop_guard_counts().door_eog_masked, 1);
 }
+
