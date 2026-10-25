@@ -203,6 +203,8 @@ private:
     void   loop_do_nudge_();
     void   loop_do_slap_();
     void   loop_do_abort_();
+    // door (no ladder): the budget spent -- lift the masks and go on unguarded
+    void   loop_door_lift_();
     void   apply_penalties(float* logits, size_t vocab) const;
     void   mask_illegal_while_thinking(float* logits, size_t vocab) const;
     // loop-guard door: mask the multi-newline ids while the door is open and
@@ -304,10 +306,14 @@ private:
     bool loop_abort_     = false;
     bool loop_slap_pending_ = false;
     // door: open from the detection moment through nudge and slap until the
-    // block closes; the mask reads this and the block's state. `forced_closer`
+    // block closes (or, in `door` mode, until the budget lifts it); the mask
+    // reads this and the block's state. `forced_closer`
     // marks the token sample() returned for a slap, so observe_think_ does not
     // count that close as the model's own.
     bool loop_door_open_     = false;
+    // A door the budget lifted stays shut for the rest of the turn (door mode);
+    // a later detection cannot reopen a mask the guard already gave up.
+    bool loop_door_lifted_   = false;
     bool loop_forced_closer_ = false;
     int  loop_since_detect_  = 0;   // counted lines since detection (door grace)
     int  loop_self_closes_   = 0;

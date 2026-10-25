@@ -136,6 +136,7 @@ void Sampler::start_in_think_block(bool open) {
     // closer in flight; the counters are per request too (a new Sampler per
     // request anyway, but this keeps a reused sampler honest).
     loop_door_open_     = false;
+    loop_door_lifted_   = false;
     loop_forced_closer_ = false;
     loop_since_detect_  = 0;
     loop_self_closes_   = 0;
@@ -445,15 +446,32 @@ void Sampler::loop_line_ended_(const std::string& raw_line) {
         // The door rung: the model may close by its own draw, so the ladder
         // nudges only when the loop persists past the door grace. The nudge is
         // never repeated; the slap keeps its own grace after the nudge.
-        if (over && loop_guard_is_ladder(params_.loop_guard) && loop_door_open_ && !loop_nudged_
+        //
+        // While the door is open the escalation goes by budget alone, not by
+        // the share: the door has already changed the row the model draws
+        // from, so the guard owns the turn's ending. A share that dips below
+        // the threshold without the model closing the block must not leave the
+        // turn running to the token cap -- the defect 1.2.4's review recorded.
+        if (loop_guard_is_ladder(params_.loop_guard) && loop_door_open_ && !loop_nudged_
             && loop_since_detect_ >= params_.loop_guard_door_grace) {
             loop_do_nudge_();
         }
-        // The slap's grace keeps watching every over line, dips included: a
-        // share at/above the threshold after K counted lines still slaps.
-        if (over && loop_guard_is_ladder(params_.loop_guard) && loop_nudged_ && !loop_slapped_
-            && loop_since_nudge_ >= params_.loop_guard_grace) {
+        // The slap fires on the nudge's grace whatever the share once the door
+        // is open; ladder-nodoor never opens it, so there it still waits for an
+        // over line (1.2.3's semantics).
+        if (loop_guard_is_ladder(params_.loop_guard) && loop_nudged_ && !loop_slapped_
+            && loop_since_nudge_ >= params_.loop_guard_grace
+            && (over || loop_door_open_)) {
             loop_do_slap_();
+        }
+        // `door` (no ladder): a mask alone must not hold the turn to the cap
+        // either. After the door grace plus the ladder's grace counted lines
+        // without a close, the door gives up its masks -- the multi-newline
+        // ones and the turn-ending ones it added -- and says so once; the turn
+        // goes on unguarded, as with the switch off.
+        if (params_.loop_guard == LoopGuardMode::Door && loop_door_open_
+            && loop_since_detect_ >= params_.loop_guard_door_grace + params_.loop_guard_grace) {
+            loop_door_lift_();
         }
     } else if (content && over && !loop_abort_) {
         loop_do_abort_();
@@ -471,7 +489,10 @@ void Sampler::loop_on_detect_(bool content_phase) {
         case LoopGuardMode::Nudge:  loop_do_nudge_(); return;
         case LoopGuardMode::Slap:   loop_do_slap_(); return;
         case LoopGuardMode::Door:
-            // the mask alone; no injection, no forced token
+            // the mask alone; no injection, no forced token. A door the
+            // budget already lifted is not reopened: from the lift on the
+            // turn is the switch-off path (loop_door_lift_).
+            if (loop_door_lifted_) return;
             loop_door_open_ = true;
             return;
         case LoopGuardMode::Ladder:
@@ -522,6 +543,18 @@ void Sampler::loop_do_slap_() {
     // the model has said anything). Content lines are counted from here.
     loop_start_answer_();
     log::info("loop-guard", "lane: slap: the think-block's closer is forced as the next token");
+}
+
+// `door` mode's budget: after door_grace + grace counted lines with the block
+// still open, the door lifts its masks so the turn cannot be held to the cap
+// by a mask alone. One log line, no counter, no response key: from here the
+// turn is the switch-off path.
+void Sampler::loop_door_lift_() {
+    loop_door_open_   = false;
+    loop_door_lifted_ = true;
+    log::info("loop-guard", "lane: the door lifts its masks after %d counted lines without a close; "
+                            "the turn continues unguarded",
+              loop_since_detect_);
 }
 
 void Sampler::loop_do_abort_() {
