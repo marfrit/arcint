@@ -1495,8 +1495,10 @@ TEST(loop_guard_ladder_after_a_lift_renewed_loop_escalates_on_over_lines) {
 }
 
 // (1v) the token stretches feed the same recovery decision: no line ends, and
-// the share the detector stood at is below the low mark when the budget
-// expires -- the door lifts, no nudge.
+// the token evidence is varied (each id distinct) when the budget expires --
+// the door lifts, no nudge. A stream whose ids repeat would be a token loop
+// and is judged over (1.2.6); the text stays newline-free, which is the case
+// only the tokens can read.
 TEST(loop_guard_ladder_recovered_on_token_stretches_lifts_no_nudge) {
     constexpr int kStretch = 64;
     SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 3);
@@ -1513,9 +1515,10 @@ TEST(loop_guard_ladder_recovered_on_token_stretches_lifts_no_nudge) {
     feed_lines(s, 18, 22, false); // the share falls to 0.6, below the low mark
 
     // Six stretches: the budget is 10 counted lines, 4 lines and 6 stretches.
-    for (int i = 0; i < 6 * kStretch - 1; ++i) s.observe_think(30, "word ");
+    auto varied = [](int i) { return 1000 + i; };
+    for (int i = 0; i < 6 * kStretch - 1; ++i) s.observe_think(varied(i), "word ");
     CHECK_EQ(s.loop_guard_counts().nudges, 0);
-    s.observe_think(30, "word ");   // the sixth stretch: the budget, recovered
+    s.observe_think(varied(6 * kStretch - 1), "word ");   // the sixth stretch: the budget, recovered
 
     std::vector<float> row(8, -1.0f);
     row[0] = 5.0f;

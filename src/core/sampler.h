@@ -172,6 +172,11 @@ public:
 
     uint64_t seed() const { return seed_; }
 
+    // loop-guard: test hook for the zero-cost path -- how many ids the token
+    // stretch's tracker has taken (1.2.5's speed gate measures the door-closed
+    // and guard-off paths, where this must never rise). No response key.
+    int loop_guard_tokens_seen() const { return loop_token_seen_; }
+
     // Exposed for tests: the pure argmax the greedy path must agree with.
     static int argmax(const float* logits, size_t vocab);
 
@@ -206,8 +211,19 @@ private:
     // door (no ladder): the budget spent -- lift the masks and go on unguarded
     void   loop_door_lift_();
     // the ladder's escalation, by counted lines once the door is open (shared
-    // with the token stretch in observe_think_)
-    void   loop_escalate_(bool over);
+    // with the token stretch in observe_think_); `share` is the recovery
+    // evidence the call's budget point provides -- the detector's line share
+    // from a counted line, or the token stretch's own k-gram share from a
+    // stretch boundary.
+    void   loop_escalate_(float share);
+    // loop-guard: the token stretch's own evidence. While the door is open the
+    // newest generated ids sit in a ring and their k-grams in a hash multiset,
+    // so a stretch the line detector cannot see (short lines, or text without
+    // newlines) is still judged by the tokens themselves. Nothing is recorded
+    // while the door is closed or the guard is off: that path costs zero.
+    void   loop_token_record_(int token);
+    void   loop_token_reset_();
+    float  loop_token_share_() const;
     void   apply_penalties(float* logits, size_t vocab) const;
     void   mask_illegal_while_thinking(float* logits, size_t vocab) const;
     // loop-guard door: mask the multi-newline ids while the door is open and
@@ -339,9 +355,25 @@ private:
     // piece: counted, but the ladder does not act, or a nudge lands in the
     // answer after the block closed.
     bool loop_suppress_escalation_ = false;
-    // The detector's last share. The token stretch judges recovery by it: no
-    // line ends in a stretch, so the share stands where the detector left it.
+    // The detector's last share. A counted line's budget point judges by it
+    // (unchanged); a stretch's budget point reads the token k-gram share below
+    // instead, since the line share is stale there.
     float loop_share_ = 0.0f;
+
+    // The token stretch's evidence (kLoopTokenGram / kLoopTokenWindow in
+    // sampler.cpp): `loop_token_ids_` is the newest ids' bounded queue, one
+    // entry per position; `loop_token_gram_ring_` holds that position's k-gram
+    // hash (0 until the first k ids are in); and the multiset counts how many
+    // of those grams are in the window. A position whose gram was already in
+    // the multiset is a repeat; the share is the repeats over the positions
+    // with a full k-gram since the last decision.
+    std::deque<int>           loop_token_ids_;
+    std::deque<uint64_t>      loop_token_gram_ring_;
+    std::unordered_map<uint64_t, int> loop_token_grams_;
+    size_t loop_token_pos_       = 0;   // ids recorded since the door opened
+    int    loop_token_positions_ = 0;   // full-k-gram positions in this span
+    int    loop_token_repeats_   = 0;   // of those, the positions seen earlier
+    int  loop_token_seen_      = 0;   // test hook only: ids taken by the tracker
     int  loop_self_closes_   = 0;
     int  loop_door_masked_   = 0;
     int  loop_door_eog_masked_ = 0;

@@ -25,6 +25,31 @@ constexpr size_t kCandidateProbe = 2048;
 // so a turn with lines keeps the line budget exactly.
 constexpr int kDoorStretchTokens = 64;
 
+// The token stretch's evidence, for a stretch the line detector cannot see (a
+// loop of lines of 20 characters or fewer, or text without newlines). k = 8
+// is one short phrase: a cycle of up to 8 token ids keeps its whole k-gram
+// inside the cycle, so the second pass of the cycle repeats every position at
+// once and the share rises without waiting for a longer history. k = 4 catches
+// finer cycles but fires on ordinary word-order recurrence ("the", "of", a
+// repeated bigram); k = 12 delays a 10-token phrase cycle by two passes and
+// needs a longer stretch to show. Eight is the smallest that holds a phrase.
+// The window is 2048 ids (~8 KiB of ring plus a multiset of the same order):
+// it covers the 64-token stretch and the cycles before it, so a loop that
+// pauses and resumes still counts, while memory stays bounded per request.
+constexpr int    kLoopTokenGram   = 8;
+constexpr size_t kLoopTokenWindow = 2048;
+
+// FNV-1a over the k ids of a gram, as 32-bit words: stable across processes
+// (no std::hash, whose seed and implementation differ), and cheap (k ≤ 8).
+uint64_t token_gram_hash(const int* ids, int k) {
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < k; ++i) {
+        h ^= static_cast<uint32_t>(ids[i]);
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
 }  // namespace
 
 Sampler::Sampler(const SamplerParams& params, uint64_t seed)
@@ -239,13 +264,26 @@ void Sampler::observe_think_(std::string_view piece, int token) {
     // stretch it absorbed (the line, not the line plus one token).
     if (params_.loop_guard != LoopGuardMode::Off && !closer_now && !forced_closer
         && think_state_ == ThinkState::thinking && loop_door_open_) {
+        // The stretch's evidence: the id's k-gram, into the bounded window.
+        loop_token_record_(token);
         if (++loop_door_tokens_ >= kDoorStretchTokens) {
             loop_door_tokens_ = 0;
             ++loop_since_detect_;
             if (loop_nudged_ && !loop_slapped_) ++loop_since_nudge_;
             log::debug("loop-guard", "the door's budget advances by a %d-token stretch without a counted line",
                        kDoorStretchTokens);
-            loop_escalate_(false);
+            // A budget point reached by stretches: the line share stands where
+            // the last counted line left it and is stale here by definition --
+            // the trigger takes 64 tokens since the last counted line. The
+            // tokens judge instead, so a short-line loop or a newline-free
+            // cycle after a varied stretch is not read as recovered. A budget
+            // point reached by a counted line keeps the line share
+            // (loop_line_ended_), unchanged. The token span is this stretch; a
+            // span with no full k-gram yet (the door just opened, or a text-only
+            // feed) falls back to the detector's share, as 1.2.5's stretch did.
+            loop_escalate_(loop_token_share_());
+            // A decision: the next span starts at this budget point.
+            loop_token_reset_();
         }
     }
 
@@ -540,7 +578,7 @@ void Sampler::loop_line_ended_(const std::string& raw_line) {
         // Escalation, shared with the token stretch (A). A line ending in this
         // piece while the closer is in it does not escalate: the model is
         // closing the block, so a nudge would land in the answer.
-        if (!loop_suppress_escalation_) loop_escalate_(over);
+        if (!loop_suppress_escalation_) loop_escalate_(share);
     } else if (content && over && !loop_abort_) {
         loop_do_abort_();
     }
@@ -567,8 +605,12 @@ void Sampler::loop_line_ended_(const std::string& raw_line) {
 // A text-closer family has no id to force, so a slap that cannot force the
 // closer lifts the masks at the slap point instead of holding the turn to the
 // cap.
-void Sampler::loop_escalate_(bool over) {
-    const bool recovered = loop_share_ < params_.loop_guard_threshold - 0.1f;
+// The recovery evidence the budget point provides: the detector's line share
+// from a counted line, or the token stretch's own k-gram share (a stretch
+// boundary, loop_token_share_).
+void Sampler::loop_escalate_(float share) {
+    const bool recovered = share < params_.loop_guard_threshold - 0.1f;
+    const bool over      = share >= params_.loop_guard_threshold;
     if (loop_guard_door_ladder(params_.loop_guard) && loop_door_open_ && !loop_nudged_
         && loop_since_detect_ >= params_.loop_guard_door_grace) {
         if (recovered) loop_door_lift_();   // no nudge into healthy reasoning
@@ -589,6 +631,64 @@ void Sampler::loop_escalate_(bool over) {
     }
 }
 
+void Sampler::loop_token_record_(int token) {
+    // Text-only feeds carry no id: no evidence, nothing recorded. The gate in
+    // observe_think_ already keeps this off while the door is closed or the
+    // guard is off, so that path allocates nothing and takes no hash.
+    if (token < 0) return;
+    ++loop_token_seen_;
+    const int    k = kLoopTokenGram;
+    const size_t W = kLoopTokenWindow;
+    const size_t i = loop_token_pos_;
+    if (i >= W) {
+        // The id at position i-W leaves the window, and so does the k-gram that
+        // ends at it (the front of both queues, at one position each); the
+        // multiset drops it before this position's gram is added.
+        if (i - W + 1 >= static_cast<size_t>(k)) {
+            auto it = loop_token_grams_.find(loop_token_gram_ring_.front());
+            if (it != loop_token_grams_.end() && --it->second <= 0) loop_token_grams_.erase(it);
+        }
+        loop_token_ids_.pop_front();
+        loop_token_gram_ring_.pop_front();
+    }
+    loop_token_ids_.push_back(token);
+    loop_token_pos_ = i + 1;
+    if (loop_token_ids_.size() < static_cast<size_t>(k)) {
+        loop_token_gram_ring_.push_back(0);   // not a full gram: a placeholder
+        return;
+    }
+    int ids[kLoopTokenGram];
+    const size_t from = loop_token_ids_.size() - static_cast<size_t>(k);
+    for (int j = 0; j < k; ++j) ids[j] = loop_token_ids_[from + static_cast<size_t>(j)];
+    const uint64_t gram = token_gram_hash(ids, k);
+    loop_token_gram_ring_.push_back(gram);
+    // "Occurred earlier in the window": the multiset count before this position
+    // is the number of earlier positions holding the same gram.
+    int& count = loop_token_grams_[gram];
+    const bool earlier = count > 0;
+    ++count;
+    ++loop_token_positions_;
+    if (earlier) ++loop_token_repeats_;
+}
+
+// The span since the last decision: cleared at the door's opening, its lift,
+// the block's close, and every stretch budget point.
+void Sampler::loop_token_reset_() {
+    loop_token_ids_.clear();
+    loop_token_gram_ring_.clear();
+    loop_token_grams_.clear();
+    loop_token_pos_       = 0;
+    loop_token_positions_ = 0;
+    loop_token_repeats_   = 0;
+}
+
+float Sampler::loop_token_share_() const {
+    // No full k-gram in the span (the door just opened, or a text-only feed):
+    // the detector's share stands, exactly as 1.2.5's stretch judged it.
+    if (loop_token_positions_ == 0) return loop_share_;
+    return static_cast<float>(loop_token_repeats_) / static_cast<float>(loop_token_positions_);
+}
+
 void Sampler::loop_on_detect_() {
     switch (params_.loop_guard) {
         case LoopGuardMode::Off:    return;
@@ -604,6 +704,7 @@ void Sampler::loop_on_detect_() {
             loop_door_opened_  = true;   // survives a lift (the answer watch)
             loop_door_tokens_  = 0;
             loop_since_detect_ = 0;   // the door's grace starts at its opening
+            loop_token_reset_();
             return;
         case LoopGuardMode::Ladder:
             // the door opens first; the nudge and slap follow by counted lines
@@ -615,6 +716,7 @@ void Sampler::loop_on_detect_() {
             loop_door_opened_  = true;   // survives a lift (the answer watch)
             loop_door_tokens_  = 0;
             loop_since_detect_ = 0;   // the door's grace starts at its opening
+            loop_token_reset_();
             return;
         case LoopGuardMode::LadderNoDoor: loop_do_nudge_(); return;   // today's order
     }
@@ -633,6 +735,9 @@ void Sampler::loop_start_answer_() {
     loop_seen_.clear();
     loop_gram_memory_.clear();
     loop_line_.clear();
+    // The token stretch is reasoning's evidence; the answer is judged by its
+    // own lines (and the door is not open there for the stretch to advance).
+    loop_token_reset_();
 }
 
 void Sampler::loop_do_nudge_() {
@@ -669,6 +774,7 @@ void Sampler::loop_door_lift_() {
     loop_door_open_   = false;
     loop_door_lifted_ = true;
     loop_door_tokens_ = 0;
+    loop_token_reset_();
     log::info("loop-guard", "the door lifts its masks after %d counted lines without a close; "
                             "the turn continues unguarded",
               loop_since_detect_);
