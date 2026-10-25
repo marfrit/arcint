@@ -11,15 +11,24 @@ Vendored, single-header, licenses unchanged:
 Adapted (not verbatim) in `tools/tts_voice_sim.py`, a measuring tool no
 package ships: the speaker-similarity recipe from
 `huggingface/open-tts-leaderboard`'s `transformers/score_similarity.py`
-(Apache-2.0), and the ECAPA-TDNN head transcribed from `microsoft/UniSpeech`
-`downstreams/speaker_verification/models/ecapa_tdnn.py` (Copyright (c)
-Microsoft Corporation, **CC-BY-SA-3.0** by that repository's root LICENSE,
-unchanged since 2021; upstream credits `lawlict/ECAPA-TDNN` for part of it).
-The leaderboard script labels the head "MIT"; the UniSpeech LICENSE file
-does not. `tools/tts_voice_sim.py` is therefore licensed CC-BY-SA-3.0
-(https://creativecommons.org/licenses/by-sa/3.0/), with its changes named in
-its header; the rest of the repository stays Apache-2.0. The SIM model
-itself is not shipped (CC-BY-SA-3.0, operator-local).
+(Apache-2.0), and the ECAPA-TDNN head, **modified**, from:
+
+- work: UniSpeech, `downstreams/speaker_verification/models/ecapa_tdnn.py`
+- author / licensor: Microsoft (`microsoft/UniSpeech`); the file credits
+  https://github.com/lawlict/ECAPA-TDNN for part of its code (kept verbatim
+  in the header)
+- source: https://github.com/microsoft/UniSpeech/blob/40ac183e772abdcbf3a318eccffaa70c0cfd3a74/downstreams/speaker_verification/models/ecapa_tdnn.py
+  (the file's last commit, 2021-12-20)
+- licence: CC BY-SA 3.0, https://creativecommons.org/licenses/by-sa/3.0/ (the
+  repository's root LICENSE; no further copyright line, no NOTICE file)
+- modified: transcribed without the torchaudio front end and the
+  training-time loss, wired to an HF `WavLMModel`
+
+The leaderboard script labels the head "MIT"; the UniSpeech LICENSE file does
+not. `tools/tts_voice_sim.py` is therefore under CC BY-SA 3.0, share-alike,
+and NOT under the repository's Apache-2.0; the rest of the repository stays
+Apache-2.0. No weights are committed: the SIM model is staged operator-locally
+(CC BY-SA 3.0), not redistributed.
 
 Committed data: `tools/tts_sentences_de.json` holds 46 German sentences from
 **Tatoeba** (tatoeba.org), CC-BY 2.0 FR, attribution to Tatoeba and its

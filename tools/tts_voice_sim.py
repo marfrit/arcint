@@ -20,15 +20,25 @@ upstream's module names so the checkpoint head loads strictly. Only the 256-d em
 attentive pooling take time-axis statistics, so batching would shift shorter
 clips). Cosine, as upstream. See `THIRD_PARTY.md`.
 
-Licence of this file: CC-BY-SA-3.0, not the repository's Apache-2.0. The
-ECAPA-TDNN head below is an adaptation of `microsoft/UniSpeech` (Copyright
-(c) Microsoft Corporation; licensed CC-BY-SA-3.0 by the LICENSE at that
-repository's root, https://creativecommons.org/licenses/by-sa/3.0/; upstream
-notes that part of its code is borrowed from `lawlict/ECAPA-TDNN`). Changes:
-the classes are transcribed without the torchaudio front end and the
-training-time loss, and wired to an HF `WavLMModel`. The leaderboard script
-this recipe follows labels the same head "MIT"; the UniSpeech LICENSE file
-says otherwise.
+Licence of this file: CC BY-SA 3.0. This file is NOT under the repository's
+own licence (Apache-2.0): it and any work derived from it stay under CC BY-SA
+3.0 (share-alike).
+
+Original work: UniSpeech, by Microsoft, the file
+`downstreams/speaker_verification/models/ecapa_tdnn.py` at its last commit,
+https://github.com/microsoft/UniSpeech/blob/40ac183e772abdcbf3a318eccffaa70c0cfd3a74/downstreams/speaker_verification/models/ecapa_tdnn.py
+Licensed under CC BY-SA 3.0, https://creativecommons.org/licenses/by-sa/3.0/
+(the LICENSE at that repository's root; neither that file nor the LICENSE
+carries a further copyright line, and the repository has no NOTICE file).
+Upstream's own notice in the file, kept verbatim:
+
+    # part of the code is borrowed from https://github.com/lawlict/ECAPA-TDNN
+
+Modified: the ECAPA-TDNN classes are transcribed without the torchaudio front
+end and the training-time loss, and wired to an HF `WavLMModel`. The
+leaderboard script this recipe follows labels the same head "MIT"; the
+UniSpeech LICENSE file says otherwise. No weights are part of this
+repository: the speaker model is staged operator-locally, not redistributed.
 
     tts_voice_sim.py pair --a A.wav --b B.wav [--model X.safetensors]
     tts_voice_sim.py mean-vs-ref --ref R.wav --wav W1.wav [W2.wav ...]
