@@ -2198,8 +2198,10 @@ void feed_cycle_ids(Sampler& s, int n) {
 }
 
 // A newline-free stretch of distinct ids: the token evidence says no repeat.
-void feed_varied_ids(Sampler& s, int n) {
-    for (int i = 0; i < n; ++i) s.observe_think(1000 + i, "tok ");
+// `base` keeps two calls in one test distinct -- the window now spans the
+// stretches, so a repeated id range across calls would be a cycle.
+void feed_varied_ids(Sampler& s, int n, int base = 1000) {
+    for (int i = 0; i < n; ++i) s.observe_think(base + i, "tok ");
 }
 
 // (i) door open, a varied stretch, then a short-line loop that reaches the
@@ -2320,7 +2322,7 @@ TEST(loop_guard_varied_newline_free_stretch_lifts_at_the_budget_point) {
 
     feed_varied_ids(s, 64);       // budget 1 of 2: no rung
     CHECK_EQ(s.loop_guard_counts().nudges, 0);
-    feed_varied_ids(s, 64);       // budget 2: the tokens say recovered
+    feed_varied_ids(s, 64, 1100); // budget 2: the tokens say recovered
     CHECK_EQ(s.loop_guard_counts().nudges, 0);
     CHECK_EQ(s.loop_guard_counts().slaps, 0);
 
@@ -2458,4 +2460,128 @@ TEST(loop_guard_token_tracker_records_nothing_while_the_door_is_shut) {
         for (int i = 0; i < 64; ++i) s.observe_think(i % 5, "word ");
         CHECK(s.loop_guard_tokens_seen() > 0);
     }
+}
+
+// A newline-free cycle of a given period: ids new per position of the cycle,
+// text without a newline. A period above 64 tokens is the case the window has
+// to span, not the stretch.
+void feed_cycle_period(Sampler& s, int period, int n, int base = 2000) {
+    for (int i = 0; i < n; ++i) s.observe_think(base + i % period, "ab ");
+}
+
+// (1.2.6 round 2, a) A newline-free cycle of period 40 reaches the budget point
+// by stretches: within one 64-token stretch only 17 of 56 positions repeat, but
+// across the window the cycle's grams repeat everywhere, so the turn is not
+// recovered -- the nudge. Mutation (red first): the decision calls
+// `loop_token_reset_()` (the full reset, 1.2.6's first round) -- the window is
+// one stretch wide, the share 0.30, the ladder lifts instead.
+TEST(loop_guard_cycle_of_period_40_nudges_at_the_budget_point) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 2);
+    p.loop_guard_door_grace = 6;
+    p.loop_guard_door_ids   = {6, 7};
+    p.think_eog_mask        = false;
+    p.ignore_eos            = false;
+    p.loop_guard_nudge_ids  = {kPieceFirst};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+    feed_lines(s, 18, 22, false); // four varied lines: the line share falls to 0.6
+
+    feed_cycle_period(s, 40, 128);   // two stretches; the grace (6) at the second
+    CHECK_EQ(s.loop_guard_counts().nudges, 1);
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+}
+
+// (b) A cycle of period 200: the first repeat needs 207 ids of history, so it
+// exists only across stretches -- at the fifth stretch the whole span repeats
+// against the window. Mutation (red first): the decision's full reset makes the
+// one-stretch window blind to it (share 0, the lift).
+TEST(loop_guard_cycle_of_period_200_nudges_at_the_budget_point) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 2);
+    p.loop_guard_door_grace = 9;
+    p.loop_guard_door_ids   = {6, 7};
+    p.think_eog_mask        = false;
+    p.ignore_eos            = false;
+    p.loop_guard_nudge_ids  = {kPieceFirst};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+    feed_lines(s, 18, 22, false); // four varied lines: the line share 0.6
+
+    feed_cycle_period(s, 200, 320);   // five stretches; the grace (9) at the fifth
+    CHECK_EQ(s.loop_guard_counts().nudges, 1);
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+}
+
+// (c) The control for the same length: a varied newline-free stream, 320 ids,
+// no repeat anywhere in the window -- recovered, the door lifts. Mutation (red
+// first): every position counts as a repeat (`earlier = true`) -- the nudge.
+TEST(loop_guard_varied_stream_of_the_same_length_lifts) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 2);
+    p.loop_guard_door_grace = 9;
+    p.loop_guard_door_ids   = {6, 7};
+    p.think_eog_mask        = false;
+    p.ignore_eos            = false;
+    p.loop_guard_nudge_ids  = {kPieceFirst};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+    feed_lines(s, 18, 22, false); // four varied lines: the line share 0.6
+
+    feed_varied_ids(s, 320);      // five stretches; the grace (9) at the fifth
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+
+    std::vector<float> row(8, -1.0f);
+    row[0] = 5.0f;
+    row[6] = 6.0f;
+    row[4] = 1.0f;
+    CHECK_EQ(s.sample(row.data(), row.size()), 6);   // lifted, drawable
+    CHECK(row[0] == 5.0f);
+    CHECK(row[6] == 6.0f);
+}
+
+// (d) The window's limit, pinned on purpose: a cycle whose period (3000)
+// exceeds the 2048-id window never has its gram in the window, so it reads as
+// recovered and the door lifts. This is the documented boundary of the
+// mechanism, not a defect: 2048 ids cover the realistic newline-free sentence
+// (period 30-80) with room to spare. Mutation (red first): the window evicts
+// nothing (`i >= W` never holds) -- a 3000-back gram stays, the span repeats,
+// and the ladder nudges.
+TEST(loop_guard_cycle_longer_than_the_window_is_recovered) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 2);
+    p.loop_guard_door_grace = 50;
+    p.loop_guard_door_ids   = {6, 7};
+    p.think_eog_mask        = false;
+    p.ignore_eos            = false;
+    p.loop_guard_nudge_ids  = {kPieceFirst};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    feed_cycle_period(s, 3000, 3200);   // 50 stretches; the grace (50) at the 50th
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+    CHECK(s.loop_guard_tokens_seen() > 2048);   // the ring evicted on the way
+
+    std::vector<float> row(8, -1.0f);
+    row[0] = 5.0f;
+    row[6] = 6.0f;
+    row[4] = 1.0f;
+    CHECK_EQ(s.sample(row.data(), row.size()), 6);   // lifted: the limit
+    CHECK(row[0] == 5.0f);
+    CHECK(row[6] == 6.0f);
 }

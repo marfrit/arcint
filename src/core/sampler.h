@@ -222,6 +222,9 @@ private:
     // newlines) is still judged by the tokens themselves. Nothing is recorded
     // while the door is closed or the guard is off: that path costs zero.
     void   loop_token_record_(int token);
+    // A decision keeps the window and resets the share's counters; a new
+    // context (the door opens, lifts, the block closes) clears both.
+    void   loop_token_span_reset_();
     void   loop_token_reset_();
     float  loop_token_share_() const;
     void   apply_penalties(float* logits, size_t vocab) const;
@@ -361,18 +364,19 @@ private:
     float loop_share_ = 0.0f;
 
     // The token stretch's evidence (kLoopTokenGram / kLoopTokenWindow in
-    // sampler.cpp): `loop_token_ids_` is the newest ids' bounded queue, one
-    // entry per position; `loop_token_gram_ring_` holds that position's k-gram
-    // hash (0 until the first k ids are in); and the multiset counts how many
-    // of those grams are in the window. A position whose gram was already in
-    // the multiset is a repeat; the share is the repeats over the positions
-    // with a full k-gram since the last decision.
+    // sampler.cpp): `loop_token_ids_` is the turn's newest ids' bounded queue,
+    // one entry per position; `loop_token_gram_ring_` holds that position's
+    // k-gram hash (0 until the first k ids are in); and the multiset counts how
+    // many of those grams are in the window. A position whose gram was already
+    // in the multiset is a repeat -- anywhere in the window, not only in this
+    // span; the share is the repeats over the positions with a full k-gram
+    // since the last decision.
     std::deque<int>           loop_token_ids_;
     std::deque<uint64_t>      loop_token_gram_ring_;
     std::unordered_map<uint64_t, int> loop_token_grams_;
     size_t loop_token_pos_       = 0;   // ids recorded since the door opened
-    int    loop_token_positions_ = 0;   // full-k-gram positions in this span
-    int    loop_token_repeats_   = 0;   // of those, the positions seen earlier
+    int    loop_token_positions_ = 0;   // full-k-gram positions since the decision
+    int    loop_token_repeats_   = 0;   // of those, the ones seen earlier in the window
     int  loop_token_seen_      = 0;   // test hook only: ids taken by the tracker
     int  loop_self_closes_   = 0;
     int  loop_door_masked_   = 0;

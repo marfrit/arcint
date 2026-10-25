@@ -34,8 +34,10 @@ constexpr int kDoorStretchTokens = 64;
 // repeated bigram); k = 12 delays a 10-token phrase cycle by two passes and
 // needs a longer stretch to show. Eight is the smallest that holds a phrase.
 // The window is 2048 ids (~8 KiB of ring plus a multiset of the same order):
-// it covers the 64-token stretch and the cycles before it, so a loop that
-// pauses and resumes still counts, while memory stays bounded per request.
+// a repeat is judged against the turn's last 2048 ids, across stretch
+// boundaries, so a repeated sentence of period 30-80 ids (the realistic
+// newline-free loop) repeats inside it; a period longer than the window is not
+// seen, the documented limit. Memory stays bounded per request.
 constexpr int    kLoopTokenGram   = 8;
 constexpr size_t kLoopTokenWindow = 2048;
 
@@ -278,12 +280,18 @@ void Sampler::observe_think_(std::string_view piece, int token) {
             // tokens judge instead, so a short-line loop or a newline-free
             // cycle after a varied stretch is not read as recovered. A budget
             // point reached by a counted line keeps the line share
-            // (loop_line_ended_), unchanged. The token span is this stretch; a
-            // span with no full k-gram yet (the door just opened, or a text-only
-            // feed) falls back to the detector's share, as 1.2.5's stretch did.
+            // (loop_line_ended_), unchanged. The span is the tokens since the
+            // last decision; a span with no full k-gram yet (the door just
+            // opened, or a text-only feed) falls back to the detector's share,
+            // as 1.2.5's stretch did.
             loop_escalate_(loop_token_share_());
-            // A decision: the next span starts at this budget point.
-            loop_token_reset_();
+            // A decision: the next span's counters start here. The WINDOW stays
+            // -- ids, gram ring and multiset are the last kLoopTokenWindow ids
+            // of the turn, not one stretch, because clearing them at every
+            // boundary would make a repeat visible only inside one 64-token
+            // stretch: a newline-free sentence of period 30-80 tokens could
+            // then never repeat and would read as recovered.
+            loop_token_span_reset_();
         }
     }
 
@@ -671,8 +679,19 @@ void Sampler::loop_token_record_(int token) {
     if (earlier) ++loop_token_repeats_;
 }
 
-// The span since the last decision: cleared at the door's opening, its lift,
-// the block's close, and every stretch budget point.
+// A decision's span reset: only the share's counters. A repeat is judged
+// against the window, which is the turn's last kLoopTokenWindow ids and stays
+// across stretch boundaries; resetting the window here (as 1.2.6's first
+// round did) left it one 64-token stretch wide, so a cycle of period 40 or a
+// repeated sentence of 30-80 ids could never repeat inside it.
+void Sampler::loop_token_span_reset_() {
+    loop_token_positions_ = 0;
+    loop_token_repeats_   = 0;
+}
+
+// The full reset: a new context -- the door opens, the door lifts, the block
+// closes, the turn starts. The window belongs to no earlier context, so it
+// goes too.
 void Sampler::loop_token_reset_() {
     loop_token_ids_.clear();
     loop_token_gram_ring_.clear();
