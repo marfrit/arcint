@@ -90,9 +90,12 @@ def main():
         for temp in (0.0, 0.7):
             verdicts = {}
             for label, extra in ARMS:
+                # The arm's temperature is sent, not only printed: without it
+                # both labels ran at the unit's default sampling row.
+                fields = dict(extra or {}, temperature=temp)
                 verdicts[label] = probe.run(
                     base, model, "%s T=%.1f mask=%s" % (name, temp, label),
-                    prompt, extra, max_tokens=4096)
+                    prompt, fields, max_tokens=4096)
             if verdicts["off"]["closed"] is None or verdicts["on"]["closed"] is None:
                 no_closed += 1
             tally[classify(verdicts["off"], verdicts["on"])] += 1

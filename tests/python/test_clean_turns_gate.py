@@ -176,3 +176,26 @@ def test_a_closed_block_empty_answer_is_not_a_failure():
         srv.shutdown()
     assert r.returncode == 0, r.stdout + r.stderr
     assert "GATE PASSED" in r.stdout, r.stdout
+
+
+def test_each_arm_sends_the_temperature_it_is_labelled_with():
+    # The gate labels its arms T=0.0 and T=0.7; a request that does not send
+    # the temperature runs at the unit's default, so both labels would name
+    # one sampling regime. Every request must carry the arm's temperature.
+    seen = []
+
+    class Recording(_Server):
+        def shape(self, body):
+            seen.append((body.get("temperature"), bool(body.get("think_eog_mask"))))
+            return "an answer", "stop", True
+
+    srv, port = _serve(Recording)
+    try:
+        _run_gate(port)
+    finally:
+        srv.shutdown()
+    assert seen, "the gate sent no request"
+    temps = sorted({t for t, _ in seen}, key=lambda t: (t is None, t))
+    assert temps == [0.0, 0.7], seen
+    # both mask states at both temperatures
+    assert {(t, m) for t, m in seen} == {(0.0, False), (0.0, True), (0.7, False), (0.7, True)}, seen
