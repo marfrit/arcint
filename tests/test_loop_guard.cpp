@@ -1490,3 +1490,49 @@ TEST(loop_guard_door_ladder_self_close_before_the_budget_nudges_not) {
     CHECK_EQ(s.loop_guard_counts().slaps, 0);
 }
 
+// (b) at top_k 0 the door counters read the candidate set the draw samples
+// from -- the prefix that survives top-p -- not the whole row. A masked id
+// below the cutoff is not a candidate; one inside the cutoff is.
+TEST(loop_guard_door_masked_counts_the_truncated_set_at_top_k_zero) {
+    SamplerParams p = base_params(LoopGuardMode::Door, 10, 5);
+    p.loop_guard_door_ids = {6, 7};
+    p.temperature         = 0.7f;
+    p.top_k               = 0;       // no top-k: the top-p cutoff is the set
+    p.top_p               = 0.9f;
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    // The masked double newline sits below the surviving prefix's floor: 5.0
+    // and 4.9 hold >= 0.9 of the unmasked mass, so the set is those two.
+    std::vector<float> below(8, -1.0f);
+    below[4] = 5.0f;
+    below[3] = 4.9f;
+    below[6] = 4.8f;   // masked, and below the floor the draw keeps
+    const int t1 = s.sample(below.data(), below.size());
+    CHECK_EQ(t1, 4);
+    CHECK_EQ(s.loop_guard_counts().door_masked, 0);
+
+    // The same row with the masked id above the floor: it would have been a
+    // candidate of the same truncated set.
+    std::vector<float> inside(8, -1.0f);
+    inside[4] = 5.0f;
+    inside[3] = 4.9f;
+    inside[6] = 4.95f;   // masked, above the floor
+    const int t2 = s.sample(inside.data(), inside.size());
+    CHECK_EQ(t2, 4);
+    CHECK_EQ(s.loop_guard_counts().door_masked, 1);
+
+    // Observability only: the draw itself is unchanged. A fixed seed and these
+    // rows give a fixed token sequence, so a change that moved the draw would
+    // have to move this list too (the top-k 0, top-p 1 case is pinned by
+    // loop_guard_door_counting_change_leaves_the_draw_byte_identical).
+    std::vector<float> third(8, -1.0f);
+    third[4] = 4.0f;
+    third[3] = 4.9f;
+    third[6] = 4.95f;
+    const int t3 = s.sample(third.data(), third.size());
+    CHECK_EQ(std::vector<int>({t1, t2, t3}), std::vector<int>({4, 4, 3}));
+}

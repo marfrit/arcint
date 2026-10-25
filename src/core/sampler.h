@@ -132,7 +132,7 @@ public:
         int aborts     = 0;
         // door: the block closed by the model's own draw while the door was
         // open (not by a slap), and the draws at which the door mask was active
-        // and a masked token sat in the row's top-k candidates.
+        // and a masked token sat in the candidate set the draw sampled from.
         int self_closes = 0;
         int door_masked = 0;
         // gap 2: draws at which an end-of-generation id was a finite candidate
@@ -211,10 +211,11 @@ private:
     // the block is open. It keeps only the masked ids' logits, for the counter
     // the draw reads once its candidate set exists.
     void   mask_door_while_thinking(float* logits, size_t vocab);
-    // loop-guard door counter: was a masked id among the candidates this draw
-    // considers? Runs on the candidate set the draw collects, measured against
-    // the logits the ids had at mask time. Consumes the stored pair list, so a
-    // grammar redraw in the same sample() does not count twice.
+    // loop-guard door counter: was a masked id among the candidates the draw
+    // samples from -- the set after the row's top-k/top-p/min-p truncation, not
+    // every finite logit in the row. Measured against the logits the ids had at
+    // mask time. Consumes the stored pair list, so a grammar redraw in the same
+    // sample() does not count twice.
     void   count_door_masked_(float floor, bool inclusive);
     // gap 2's counter: the same test for the end-of-generation ids the door
     // removed inside the open block, over the draw's own candidate set.

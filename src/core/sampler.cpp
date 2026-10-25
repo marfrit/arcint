@@ -665,14 +665,18 @@ void Sampler::mask_door_while_thinking(float* logits, size_t vocab) {
     }
 }
 
-// loop-guard door counter: a masked id is "among the candidates" when its logit
-// at mask time is at or above the floor of the candidate set the draw uses --
-// the lowest logit collect_candidates kept for the effective row's top-k (or
-// the argmax on a greedy row). Whether the model would otherwise have taken it
-// is not knowable. The stored logits are the row before the penalties, the
-// floor is after them; a masked id whose penalty would have lowered it can
-// over-report, and that is the counter's documented slack. Consumed once per
-// sample(), so a grammar redraw does not count the same draw twice.
+// loop-guard door counter: "candidate" means a member of the candidate set the
+// draw samples from -- the tokens that survived the effective row's truncation
+// (top-k, top-p, min-p as that row has them; the single argmax on a greedy
+// row). A masked id is among them when its logit at mask time is at or above
+// that set's floor, the lowest surviving candidate. Not "any finite logit in
+// the row": at top_k 0 without a top-p cutoff the whole row is the set, but a
+// top-p cutoff makes it a prefix and an id below the prefix was never a
+// candidate. Whether the model would otherwise have taken it is not knowable.
+// The stored logits are the row before the penalties, the floor after them; a
+// masked id whose penalty would have lowered it can over-report, and that is
+// the counter's documented slack. Consumed once per sample(), so a grammar
+// redraw does not count the same draw twice.
 void Sampler::count_door_masked_(float floor, bool inclusive) {
     if (door_masked_logits_.empty()) return;
     bool in_topk = false;
@@ -685,8 +689,9 @@ void Sampler::count_door_masked_(float floor, bool inclusive) {
 }
 
 // gap 2 counter: the end-of-generation ids the door removed while the block is
-// open, measured against the candidate floor of the draw's own collection. The
-// stored logits are the row at mask time; a token counts once per sample().
+// open, measured against the floor of the candidate set the draw actually
+// samples from (after top-k/top-p/min-p truncation, as count_door_masked_ is).
+// The stored logits are the row at mask time; a token counts once per sample().
 void Sampler::count_door_eog_masked_(float floor, bool inclusive) {
     if (door_eog_masked_logits_.empty()) return;
     bool in_topk = false;
@@ -925,8 +930,13 @@ int Sampler::draw(float* logits, size_t vocab) {
         if (short_of_mass) continue;   // the full set next pass (this token only)
 
         // loop-guard door counter: the candidate set this draw actually samples
-        // from, now that the probe (if any) has settled to the full pass.
-        const float door_floor = scratch_.empty() ? -INFINITY : scratch_.back().first;
+        // from, now that the probe (if any) has settled to the full pass. That
+        // is the kept prefix after BOTH truncations: top-k (collect_candidates
+        // sized the set) and top-p/min-p (cutoff trims it). The floor is the
+        // last surviving candidate, so an id below it was never a candidate --
+        // at top_k 0 a top-p cutoff can exclude a finite masked logit, and
+        // counting the whole row there is what 1.2.4 did in error.
+        const float door_floor = scratch_[cutoff - 1].first;
         if (!door_masked_logits_.empty())
             count_door_masked_(door_floor, /*inclusive=*/true);
         if (!door_eog_masked_logits_.empty())
