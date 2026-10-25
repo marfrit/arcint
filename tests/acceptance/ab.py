@@ -28,6 +28,15 @@ Per metric (`ACCEPTANCE-METRIC <name> <value> <unit>` lines of the runs):
 the two arms' spreads was the allowance, so a noisy candidate passed on its
 own noise.)
 
+Decode metrics (operator, 2026-10-25, 1.2.6): every decode answer runs to its
+token cap, so a run whose answer differs is another workload (another draft
+acceptance under speculation), not a speed sample of the same one. When
+served_check.py prints the `ACCEPTANCE-DECODE` line for a metric in every run,
+the gate reads only the runs whose answer has the majority md5 across both
+arms; the others are listed with their md5, tokens, acceptance and rate. If
+an arm keeps fewer than two such runs (one with --rounds 1), or two answers
+tie, every run is gated and the table says so.
+
 An answer gate (a `  FAIL` line of served_check.py) or a run that dies, in
 any run of either arm, fails the A/B. The `texts md5` line (the answers'
 bytes) is compared and reported, never gated: the byte tripwire.
@@ -38,6 +47,7 @@ the spread is 0, the allowance is FLOOR, and the table says so; use
 --rounds 2 or more for a gate.
 """
 import argparse
+import collections
 import hashlib
 import shutil
 import os
@@ -63,6 +73,8 @@ LESS_IS_BETTER_UNITS = ("s", "ms")
 METRIC_RE = re.compile(r"^ACCEPTANCE-METRIC (\S+) (\S+) (\S+)\s*$")
 GATE_RE = re.compile(r"^\s+(ok|FAIL)\s+(.*?)\s*$")
 TEXTS_RE = re.compile(r"^\s+texts md5\s*(.*?)\s*$")
+DECODE_RE = re.compile(r"^ACCEPTANCE-DECODE (\S+) md5 (\S+) tokens (\d+) accept (\S+) "
+                       r"verifies (\d+) verify_s (\S+)\s*$")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SERVED_CHECK = os.path.join(HERE, "cells", "served_check.py")
@@ -73,8 +85,14 @@ def parse_run(text, returncode=0):
     "failures": [str], "texts": [str]}. A run that exited non-zero without
     printing a FAIL gate (the server died at start, a traceback) still
     carries a failure: a run that did not complete is not a pass."""
-    metrics, failures, texts = {}, [], []
+    metrics, failures, texts, decode = {}, [], [], {}
     for line in text.splitlines():
+        d = DECODE_RE.match(line)
+        if d:
+            num = lambda x: None if x == "-" else float(x)  # noqa: E731
+            decode[d.group(1)] = {"md5": d.group(2), "tokens": int(d.group(3)), "accept": num(d.group(4)),
+                                  "verifies": int(d.group(5)), "verify_s": num(d.group(6))}
+            continue
         m = METRIC_RE.match(line)
         if m:
             try:
@@ -98,7 +116,7 @@ def parse_run(text, returncode=0):
             texts = t.group(1).split()
     if returncode != 0 and not failures:
         failures.append(f"the run exited {returncode} without a FAIL gate line")
-    return {"metrics": metrics, "failures": failures, "texts": texts}
+    return {"metrics": metrics, "failures": failures, "texts": texts, "decode": decode}
 
 
 def arm_stats(values):
@@ -107,6 +125,36 @@ def arm_stats(values):
     mean = sum(values) / len(values)
     spread = (max(values) - min(values)) / mean if mean else 0.0
     return mean, spread
+
+
+def majority_runs(name, old_runs, new_runs):
+    """The runs a decode metric is gated on: (used_old, used_new, divergent,
+    note). used_* are index lists into each arm; divergent lists (arm, run
+    number, md5, value) of the runs left out. Without a decode line in every
+    run of both arms, or without a strict majority answer, every run is used."""
+    every = (list(range(len(old_runs))), list(range(len(new_runs))), [], "")
+    md5 = {arm: [r.get("decode", {}).get(name, {}).get("md5") for r in runs]
+           for arm, runs in (("old", old_runs), ("new", new_runs))}
+    if any(m is None for m in md5["old"] + md5["new"]):
+        return every
+    counts = collections.Counter(md5["old"] + md5["new"]).most_common()
+    if len(counts) == 1:
+        return every
+    if counts[0][1] == counts[1][1]:
+        return every[:3] + ("two answers tie: every run gated",)
+    major = counts[0][0]
+    used = {arm: [i for i, m in enumerate(md5[arm]) if m == major] for arm in md5}
+    need = 2 if min(len(old_runs), len(new_runs)) >= 2 else 1
+    if len(used["old"]) < need or len(used["new"]) < need:
+        return every[:3] + (f"answers diverge too often for a majority reading: every run gated",)
+    divergent = []
+    for arm, runs in (("old", old_runs), ("new", new_runs)):
+        for i, m in enumerate(md5[arm]):
+            if m != major:
+                divergent.append((arm, i + 1, m, runs[i]["metrics"][name][0]))
+    note = f"gated on the runs with the majority answer {major}; divergent: " + ", ".join(
+        f"{a} run {i} {m} {v:.1f}" for a, i, m, v in divergent)
+    return used["old"], used["new"], divergent, note
 
 
 def decide(old_runs, new_runs, tolerance=None, floor=None):
@@ -148,8 +196,11 @@ def decide(old_runs, new_runs, tolerance=None, floor=None):
             row["note"] = "not printed by every run"
             rows.append(row)
             continue
-        mo, so = arm_stats(arms["old"][0])
-        mn, sn = arm_stats(arms["new"][0])
+        uo, un, divergent, note = majority_runs(name, old_runs, new_runs)
+        row.update(used_old=[arms["old"][0][i] for i in uo], used_new=[arms["new"][0][i] for i in un],
+                   divergent=divergent, note=note)
+        mo, so = arm_stats(row["used_old"])
+        mn, sn = arm_stats(row["used_new"])
         spread = max(so, flo)
         if row["unit"] in LESS_IS_BETTER_UNITS:
             limit = mo * (1 + spread + tol)
@@ -185,6 +236,21 @@ def fmt(vals):
     return " ".join(f"{v:.1f}" for v in vals)
 
 
+def render_decodes(old_runs, new_runs):
+    """Each run's decode answers: md5, tokens, draft acceptance, verifies,
+    verify seconds and the rate (reported; the gate reads the table)."""
+    out = []
+    for arm, runs in (("old", old_runs), ("new", new_runs)):
+        for i, r in enumerate(runs, 1):
+            for name, d in r.get("decode", {}).items():
+                acc = "-" if d["accept"] is None else f"{d['accept']:.1f}%"
+                vs = "-" if d["verify_s"] is None else f"{d['verify_s']:.2f} s"
+                rate = r["metrics"].get(name, (float("nan"), ""))[0]
+                out.append(f"  {name:<10} {arm} run {i}: md5 {d['md5']} tokens {d['tokens']} accept {acc} "
+                           f"verifies {d['verifies']} verify {vs} -> {rate:.1f} t/s")
+    return ["decode answers per run:"] + out if out else []
+
+
 def render(rows, failures, texts_line):
     out = [f"{'metric':<16} {'unit':<5} {'old runs':<22} {'new runs':<22} "
            f"{'mean old':>9} {'mean new':>9} {'sp old':>7} {'sp new':>7} {'allow':>7} {'limit':>9}  verdict"]
@@ -199,7 +265,7 @@ def render(rows, failures, texts_line):
         if r["unsteady"]:
             why.append("the new arm varies more than the old beyond the floor")
         verdict = "ok" if r["ok"] else "FAIL (" + "; ".join(why) + ")"
-        if r["note"] and r["ok"]:
+        if r["note"]:
             verdict += f" ({r['note']})"
         out.append(f"{r['metric']:<16} {r['unit']:<5} {fmt(r['old']):<22} {fmt(r['new']):<22} "
                    f"{r['mean_old']:>9.2f} {r['mean_new']:>9.2f} {r['spread_old'] * 100:>6.2f}% "
@@ -266,6 +332,8 @@ def main(argv=None):
     for arm in ("old", "new"):
         print(f"{arm}: {binaries[arm]}")
     print(render(rows, failures, compare_texts(old_runs, new_runs)))
+    for line in render_decodes(old_runs, new_runs):
+        print(line)
     bad = bool(failures) or not all(r["ok"] for r in rows)
     print("\nA/B " + ("FAIL" if bad else "PASS") + f": {args.service}, {args.rounds} round(s), "
           f"floor {FLOOR * 100:.1f} %, tolerance {TOLERANCE * 100:.1f} %")

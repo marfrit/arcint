@@ -519,7 +519,16 @@ reported, not a veto.
   below a floor of 0.5 %, and the candidate fails when its own spread
   exceeds the old arm's by more than that floor (operator, 2026-10-16: a
   noisy candidate does not widen its own allowance); an answer failure in
-  any run fails it; the answer bytes are compared and reported).
+  any run fails it; the answer bytes are compared and reported). Decode
+  rates are read on the majority answer (operator, 2026-10-25, 1.2.6): every
+  decode answer of the served check runs to its token cap, so a run whose
+  answer differs is another workload (its draft acceptance differs under
+  speculation), not a speed sample of the same one; 1.2.5's first Flash-Next
+  window failed on the spread of one such run (`measured-here`). The gate
+  reads the runs whose answer has the majority md5 across both arms and lists
+  the others with their tokens, acceptance and rate; with fewer than two such
+  runs in an arm, or a tie, every run is gated. Prefill prompts are fixed and
+  read as before.
 - **Equivalence suite** (`tests/equivalence/run.sh`, on a card, `--engine
   llama --gguf`): two greedy runs, a lane's reused prefix against a fresh
   process (warm against cold), a checkpoint resume against a full

@@ -18,6 +18,22 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## Unreleased (1.2.6)
+
+- **The release A/B reads decode on the majority answer** —
+  `tests/acceptance/ab.py` gates a decode rate on the runs whose answer has
+  the majority md5 across both arms, and lists the other runs with their md5,
+  tokens, draft acceptance, verifies and rate; with fewer than two such runs
+  in an arm, or a tie, every run is gated, as before (operator, 2026-10-25).
+  Every decode answer of the served check runs to its 300-token cap, so a run
+  with another answer is another workload: its draft acceptance differs under
+  speculation (`measured-here`, the coder's and Flash-Next's served logs).
+  `cells/served_check.py` prints an `ACCEPTANCE-DECODE` line per answer for
+  it. A fixed-length decode arm was considered and dropped: the answers are
+  already fixed in length. Read this way, 1.2.5's first Flash-Next window
+  passes (its one slow run was the one with another answer) and its second
+  still fails (slower on the same answer).
+
 ## 1.2.5 — 2026-10-25
 
 A fixes and clean-up release: the 1.2.4 release review's three loop-guard
