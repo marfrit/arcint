@@ -97,10 +97,13 @@ TEST(stop_segments_keep_each_whole_piece_id) {
     CHECK_EQ(b.segments[1].id, 7);
 }
 
-TEST(stop_segments_mark_a_split_piece_with_no_id) {
+// A piece split by a hold loses the id on its released part, but the id rides
+// on the held remainder: a tag whose text a stop string splits still reaches
+// the consumer (the think block's closer decides by id) with its id.
+TEST(stop_segments_move_the_id_to_a_split_pieces_last_part) {
     StopMatcher m({"\nUser:"});
 
-    auto a = m.push("ab\n", 3);  // "ab" released, "\n" held: both parts lose the id
+    auto a = m.push("ab\n", 3);  // "ab" released without the id, "\n" held with it
     CHECK_EQ(a.segments.size(), size_t{1});
     CHECK_EQ(a.segments[0].text, std::string("ab"));
     CHECK_EQ(a.segments[0].id, -1);
@@ -108,7 +111,7 @@ TEST(stop_segments_mark_a_split_piece_with_no_id) {
     const auto tail = m.flush_segments();
     CHECK_EQ(tail.size(), size_t{1});
     CHECK_EQ(tail[0].text, std::string("\n"));
-    CHECK_EQ(tail[0].id, -1);
+    CHECK_EQ(tail[0].id, 3);   // the last part carries the piece's id
 }
 
 TEST(stop_segments_flush_whole_held_pieces_with_their_ids) {

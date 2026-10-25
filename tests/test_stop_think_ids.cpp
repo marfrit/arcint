@@ -199,3 +199,23 @@ TEST(no_block_keeps_the_content_as_generated) {
     CHECK_EQ(s.content, std::string("\n\nHello"));
     CHECK_EQ(lgc::split_reasoning("\n\nHello", false, false).content, n.content);
 }
+
+// A stop string that begins with the LAST bytes of the closer's text splits the
+// closer's piece: the first part goes out without an id and the held tail
+// carries it. Before the id rode on the last part, the tail reached the tracker
+// with id -1, so the block stayed open and the answer came back as reasoning.
+TEST(stop_beginning_with_the_closer_tail_keeps_the_closer_id) {
+    // The stop never completes: it shares the closer's tail and then adds a
+    // byte the reply does not contain.
+    const std::vector<std::string> stop = {closer().substr(closer().size() - 3) + "\\x01"};
+    IdScriptBackend backend(template_opened_turn());
+    const Answer    n = non_streamed(backend, prepared(true, stop));
+    CHECK(n.closed);
+    // The answer is content, not reasoning: the block closes on the tail part's
+    // id even though the stop string split the closer's piece.
+    CHECK_EQ(n.content, std::string("Hello\nUser: more"));
+    CHECK(n.reasoning.rfind("Let me think.", 0) == 0);
+    CHECK(n.reasoning.find("Hello") == std::string::npos);
+    const Answer s = streamed(backend, prepared(true, stop));
+    CHECK_EQ(trimmed(s.content), std::string("Hello\nUser: more"));
+}

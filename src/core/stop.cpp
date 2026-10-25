@@ -67,10 +67,13 @@ std::vector<StopMatcher::Segment> StopMatcher::take(size_t n) {
             n -= len;
             held_.erase(held_.begin());
         } else {
-            // Part of a piece: no id travels with it, nor with what stays held.
+            // Part of a piece: the first part has no id, but the id rides on the
+            // part that stays held -- the LAST part -- so a tag whose text a
+            // stop string splits still reaches its consumer with its id. The
+            // id-less first part is ordinary text; the tracker decides tags by
+            // the id, never by the text, so nothing leaks.
             out.push_back({buffer_.substr(at, n), -1});
             len -= n;
-            id = -1;
             n  = 0;
         }
     }
