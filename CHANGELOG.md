@@ -147,6 +147,26 @@ inside an open think block starts the turn in the block, as chat does.
   clips, the cross pair 0.262419 (`measured-here`). `THIRD_PARTY.md` records
   both the recipe and the checkpoint's licence.
 
+**Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (60
+patches), unchanged from 1.2.4; dependencies unchanged. `arcint-stt` (1.2.0)
+and `arcint-imggen` (1.1.1) are unchanged.
+
+**Release check** (`measured-here`, 2026-10-25, the pre-tag package): the
+device-free suite 329 cases and `ctest -L unit` 6/6, the package build's tests;
+the branch's mutations red (each new test against its named mutation). The
+Flash-Next speed A/B against 1.2.4 (the B60, IQ3_XXS with the served check's
+flags, 4 rounds, twice) failed the gate as written, both times on decode:
+first on spread (the one slow run, 37.3 t/s, was the one run with a
+different answer), then on speed, 38.52 against 38.05 t/s (38.50 against
+38.10 on the runs with the same answer); prefill equal in both (618.4 /
+618.8 and 618.3 / 618.6 t/s). The decode split of four more runs, old / new /
+old / new: the sampler 0.03 s an answer on both binaries, draft acceptance
+65.2-65.8 % and 116-117 verifies on both, the difference in the GPU verify
+time, and the old binary's own runs spanning 37.7-38.3 t/s against the new
+binary's 37.9-38.0. Read as run-to-run variation of the forward, not a cost of
+the release's code; the operator accepted the 1 % (2026-10-25). The guard's
+budget and lift are unit-tested only, not run on the card.
+
 ## 1.2.4 — 2026-10-25
 
 The loop guard gains a door rung; every switch stays **off by default**, and
