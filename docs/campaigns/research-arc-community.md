@@ -15,7 +15,8 @@ here), `snippet` (only a search result could be read).
 | `sanmai.github.io/slop/2026/05/08/llama-cpp-batch-size-arc-b60.html` | llama.cpp SYCL on a B60: `-b 4096 -ub 2048` against the defaults (2048 / 512) +25-30 % prompt throughput on a 35B-A3B MoE, +8 % dense | `paper` |
 | `forum.level1techs.com/t/arc-pro-b60-for-local-llms/246971` | stock llama.cpp SYCL on a B60, a qwen35moe Q8_0: tg128 8.3 t/s, pp16384 111.6 t/s | `paper` |
 | LINUX DO `linux.do/t/1834964` (2026-03-27, part 1), code `github.com/funkpopo/Anna` (`anna-serve`) | a PyTorch XPU serving engine (Windows): weights quantized to int4 at load, the context sized automatically below the VRAM limit, a text-only fast path that skips the multimodal wrapper; Qwen3.5-9B on an A770 11 -> 19 t/s with the fast path | `paper` (the operator's copy of the page; the repository not read) |
-| LINUX DO `linux.do/t/topic/1849761` (2026-03-30, part 2 of a series) | a PyTorch XPU custom operator for Qwen3.5 on the A770/A750: one SYCL kernel for the gated delta-net's state update, its output, the per-head RMSNorm with `norm_weight` and the `silu(z)` gate; f16/bf16/f32 inputs, `beta`, `g`, the norm weight and the state in f32 (lower precision gave garbled text); Qwen3.5-9B BF16 12 t/s, first token 2 s (16 s the week before), 9.7 GB; part 3 (2026-04-17, MoE: experts in host RAM called on demand, per an 80aj.com repost) not read; its code is in the same repository | `paper` (a copy of the page from the operator: the forum's Cloudflare challenge stops headless fetchers) |
+| LINUX DO `linux.do/t/topic/1849761` (2026-03-30, part 2 of a series) | a PyTorch XPU custom operator for Qwen3.5 on the A770/A750: one SYCL kernel for the gated delta-net's state update, its output, the per-head RMSNorm with `norm_weight` and the `silu(z)` gate; f16/bf16/f32 inputs, `beta`, `g`, the norm weight and the state in f32 (lower precision gave garbled text); Qwen3.5-9B BF16 12 t/s, first token 2 s (16 s the week before), 9.7 GB; part 3 below |
+| LINUX DO, part 3 (2026-04-17), same repository | CPU-XPU hybrid MoE in the same engine: experts in host RAM, copied to the GPU when routed, decode bound by the copies; Qwen3.5-35B-A3B (Intel's int4 AutoRound) at 1 t/s on DDR4-3200; custom router, dispatch and scatter operators beside the GEMM ("routing, dispatch, scatter, the expert cache and the expert copies often matter more than the matrix multiply"); intermediates in f32 against garbled or looping text; operators registered with `TORCH_LIBRARY` (Meta + XPU), built with dpcpp | `paper` (the operator's copy of the page) | `paper` (a copy of the page from the operator: the forum's Cloudflare challenge stops headless fetchers) |
 | CSDN (a 4 x B60 server with llama.cpp SYCL, Qwen3-32B), Tencent News (a 96 GB 4 x B60 review), CodeArts / AtomGit guides, EE Times China | multi-card setups and tuning guides; no kernel work | `paper` |
 | Bilibili, Gitee | nothing found in two passes | — |
 
@@ -59,6 +60,12 @@ dp4a; an XMX flash-attention kernel correct but slower (SLM/barrier stalls).
    inside, `code`, `research-strata-qwen36.md`): the coder's re-count runs the
    delta-net (0.35 ms a token) and then separate norm and gate kernels; a
    fusion-campaign item, with the state kept in f32 as both do.
+
+The LINUX DO series confirms from outside what the coder's re-count shows: on
+Arc the MoE's routing and small ops cost as much as its matmuls. Its copy-on-
+miss hybrid (1 t/s) is the mechanism Flash-Next's expert cache replaced (the
+hot experts resident, the misses computed on the CPU: 33-38 t/s on the B60,
+`measured-here`).
 
 The stock path is far behind ours on the B-series: 8.3 t/s for a qwen35moe
 Q8_0 on llama.cpp SYCL (`paper`) against arcint's coder at 44-79 t/s on the
