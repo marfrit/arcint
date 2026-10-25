@@ -826,14 +826,16 @@ TEST(loop_guard_ladder_door_then_nudge_then_slap_or_nodoor_old_order) {
 // object, and the /props defaults carry the door grace and the mode names.
 TEST(loop_guard_door_counters_and_modes_parse) {
     GenerationStats st;
-    st.loop_self_closes = 2;
-    st.loop_door_masked = 3;
+    st.loop_self_closes    = 2;
+    st.loop_door_masked    = 3;
+    st.loop_door_eog_masked = 4;
     const nlohmann::json j = api::loop_guard_json(st);
     CHECK_EQ(j.at("self_closes").get<int>(), 2);
     CHECK_EQ(j.at("door_masked").get<int>(), 3);
     const std::string line = api::decode_suffix_for(st);
     CHECK(line.find("self-closed 2") != std::string::npos);
     CHECK(line.find("door masked 3") != std::string::npos);
+    CHECK(line.find("door EOG masked 4") != std::string::npos);
 
     // Mode names travel through the request field and the flag.
     CHECK(loop_guard_parse("door") == LoopGuardMode::Door);
@@ -1229,23 +1231,6 @@ TEST(loop_guard_door_respects_ignore_eos_for_eog) {
     CHECK_EQ(s.loop_guard_counts().door_eog_masked, 0);
 }
 
-// The loop_guard object carries door_eog_masked last, after the keys 1.2.3 and
-// the door rung already had.
-TEST(loop_guard_json_carries_door_eog_masked_last) {
-    GenerationStats st;
-    st.loop_door_masked    = 3;
-    st.loop_door_eog_masked = 4;
-    const nlohmann::ordered_json j = api::loop_guard_json(st);
-    CHECK_EQ(j.at("door_masked").get<int>(), 3);
-    CHECK_EQ(j.at("door_eog_masked").get<int>(), 4);
-    CHECK_EQ(j.size(), 7u);
-    auto last = j.end();
-    --last;
-    CHECK_EQ(last.key(), std::string("door_eog_masked"));
-    const std::string line = api::decode_suffix_for(st);
-    CHECK(line.find("door EOG masked 4") != std::string::npos);
-}
-
 // Gap 1 on the text-closer path: models whose closer has no single token id
 // close the block by spelling it. The answer still starts from a clean window
 // there. The answer restates twelve distinct reasoning lines once each: from a
@@ -1308,4 +1293,882 @@ TEST(loop_guard_door_eog_masked_counts_on_the_sampling_path) {
     CHECK(tok == 3 || tok == 4);
     CHECK(row[0] == -INFINITY);
     CHECK_EQ(s.loop_guard_counts().door_eog_masked, 1);
+}
+
+// ── 1.2.5: the door owns the turn's ending ────────────────────────────────
+
+// (a) ladder, still looping at the budget: escalation goes by counted lines,
+// not by the share, and the turn ends by the forced closer instead of running
+// to the token cap. The share stays over throughout.
+TEST(loop_guard_door_ladder_escalates_by_budget_while_still_looping) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 3);
+    p.loop_guard_door_grace = 4;
+    p.loop_guard_door_ids   = {6, 7};
+    for (size_t i = 0; i < kPiece.size(); ++i)
+        p.loop_guard_nudge_ids.push_back(kPieceFirst + static_cast<int>(i));
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+
+    feed_lines(s, 18, 21, true);   // 3 counted lines after detection
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+    feed_text(s, loop_line(21));   // the 4th: the door grace, the nudge
+    CHECK_EQ(s.loop_guard_counts().nudges, 1);
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    // Deliver the nudge sentence, then three more loop lines: the nudge's
+    // grace, whatever the share.
+    for (size_t i = 0; i < kPiece.size(); ++i) {
+        std::vector<float> l = row_with_argmax(2);
+        const int id = s.sample(l.data(), l.size());
+        s.observe_think(id, piece_of(id));
+    }
+    feed_text(s, loop_line(22));
+    feed_text(s, loop_line(23));
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+    feed_text(s, loop_line(24));   // the third: the slap
+    CHECK_EQ(s.loop_guard_counts().slaps, 1);
+
+    // The turn ends on the forced closer, not at the token cap.
+    std::vector<float> l = row_with_argmax(2);
+    CHECK_EQ(s.sample(l.data(), l.size()), 5);
+    s.observe(5, "closed");
+    CHECK(!s.think_block_open());
+}
+
+// (a) the same with think_eog_mask on: the door's ladder is unchanged by the
+// turn-ending mask, and the budget still ends the turn inside the open block.
+TEST(loop_guard_door_ladder_escalates_by_budget_with_think_eog_mask) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 3);
+    p.loop_guard_door_grace = 4;
+    p.loop_guard_door_ids   = {6, 7};
+    p.think_eog_mask        = true;
+    for (size_t i = 0; i < kPiece.size(); ++i)
+        p.loop_guard_nudge_ids.push_back(kPieceFirst + static_cast<int>(i));
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    feed_lines(s, 18, 21, true);
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+    feed_text(s, loop_line(21));   // the door grace: nudge, share still over
+    CHECK_EQ(s.loop_guard_counts().nudges, 1);
+
+    for (size_t i = 0; i < kPiece.size(); ++i) {
+        std::vector<float> l = row_with_argmax(2);
+        const int id = s.sample(l.data(), l.size());
+        s.observe_think(id, piece_of(id));
+    }
+    feed_text(s, loop_line(22));
+    feed_text(s, loop_line(23));
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+    feed_text(s, loop_line(24));   // the nudge grace: slap
+    CHECK_EQ(s.loop_guard_counts().slaps, 1);
+    std::vector<float> l = row_with_argmax(2);
+    CHECK_EQ(s.sample(l.data(), l.size()), 5);
+}
+
+// (1i) recovered at the nudge point: the share is back below the low mark when
+// the door grace expires. The ladder lifts the door's masks instead of nudging
+// into healthy reasoning -- and the reply continues unguarded, the
+// multi-newline and turn-ending ids drawable again.
+TEST(loop_guard_ladder_recovered_at_the_nudge_point_lifts_no_nudge) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 3);
+    p.loop_guard_door_grace = 4;
+    p.loop_guard_door_ids   = {6, 7};
+    p.think_eog_mask        = false;
+    p.ignore_eos            = false;
+    p.loop_guard_nudge_ids  = {kPieceFirst};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    // Four varied lines: the share falls 0.9, 0.8, 0.7, 0.6 -- the last is
+    // below the low mark, and it is the door grace's counted line.
+    feed_lines(s, 18, 22, false);
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+
+    std::vector<float> row(8, -1.0f);
+    row[0] = 5.0f;   // the EOG id: masked until the lift
+    row[6] = 6.0f;   // a multi-newline token, likewise
+    row[4] = 1.0f;
+    CHECK_EQ(s.sample(row.data(), row.size()), 6);
+    CHECK(row[0] == 5.0f);
+    CHECK(row[6] == 6.0f);
+    CHECK_EQ(s.loop_guard_counts().door_masked, 0);
+    CHECK_EQ(s.loop_guard_counts().door_eog_masked, 0);
+}
+
+// (1iii) recovered between the nudge and the slap: the nudge fired while the
+// loop was over, then the share fell below the low mark before the slap grace
+// expired. The slap point lifts, no closer is forced, and nothing is slapped.
+TEST(loop_guard_ladder_recovered_at_the_slap_point_lifts_no_slap) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 5);
+    p.loop_guard_door_grace = 4;
+    p.loop_guard_door_ids   = {6, 7};
+    for (size_t i = 0; i < kPiece.size(); ++i)
+        p.loop_guard_nudge_ids.push_back(kPieceFirst + static_cast<int>(i));
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    feed_lines(s, 18, 21, true);
+    feed_text(s, loop_line(21));   // the door grace: the nudge, still over
+    CHECK_EQ(s.loop_guard_counts().nudges, 1);
+
+    for (size_t i = 0; i < kPiece.size(); ++i) {
+        std::vector<float> l = row_with_argmax(2);
+        const int id = s.sample(l.data(), l.size());
+        s.observe_think(id, piece_of(id));
+    }
+    // Five varied lines: the share 0.9 ... 0.5, below the low mark at the
+    // fifth, which is the nudge grace's counted line.
+    feed_lines(s, 22, 27, false);
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+
+    std::vector<float> row(8, -1.0f);
+    row[0] = 5.0f;   // the EOG id
+    row[6] = 6.0f;   // a multi-newline token
+    row[4] = 1.0f;
+    CHECK_EQ(s.sample(row.data(), row.size()), 6);
+    CHECK(row[0] == 5.0f);
+    CHECK(row[6] == 6.0f);
+}
+
+// (1iv) after a lift the rest of the turn follows ladder-nodoor's rule: a
+// renewed loop nudges at its detection, the door stays shut (nothing masked),
+// and the slap fires on over lines after its grace.
+TEST(loop_guard_ladder_after_a_lift_renewed_loop_escalates_on_over_lines) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 3);
+    p.loop_guard_door_grace = 4;
+    p.loop_guard_door_ids   = {6, 7};
+    p.think_eog_mask        = false;
+    p.ignore_eos            = false;
+    p.loop_guard_nudge_ids  = {kPieceFirst};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    feed_lines(s, 18, 22, false); // the share 0.6 at the door grace: the lift
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+
+    // The loop renews (low was re-armed when the share fell to 0.6). The share
+    // rises through 0.7 to 0.8+.
+    for (int i = 0; i < 40 && s.loop_guard_counts().detections < 2; ++i) feed_text(s, loop_line(i));
+    CHECK_EQ(s.loop_guard_counts().detections, 2);
+    CHECK_EQ(s.loop_guard_counts().nudges, 1);   // the detection nudges, as ladder-nodoor
+
+    // Deliver the nudge sentence's one id, then look at a row.
+    std::vector<float> nudge_row = row_with_argmax(2);
+    const int nudge_id = s.sample(nudge_row.data(), nudge_row.size());
+    CHECK_EQ(nudge_id, kPieceFirst);
+    s.observe_think(nudge_id, piece_of(nudge_id));
+
+    // The door stays shut: the masks are not back.
+    std::vector<float> row(8, -1.0f);
+    row[0] = 5.0f;
+    row[6] = 6.0f;
+    row[4] = 1.0f;
+    CHECK_EQ(s.sample(row.data(), row.size()), 6);
+    CHECK(row[0] == 5.0f);
+    CHECK(row[6] == 6.0f);
+
+    // The slap fires on over lines after its grace: three more loop lines.
+    feed_text(s, loop_line(22));
+    feed_text(s, loop_line(23));
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+    feed_text(s, loop_line(24));
+    CHECK_EQ(s.loop_guard_counts().slaps, 1);
+}
+
+// (1v) the token stretches feed the same recovery decision: no line ends, and
+// the share the detector stood at is below the low mark when the budget
+// expires -- the door lifts, no nudge.
+TEST(loop_guard_ladder_recovered_on_token_stretches_lifts_no_nudge) {
+    constexpr int kStretch = 64;
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 3);
+    p.loop_guard_door_grace = 10;
+    p.loop_guard_door_ids   = {6, 7};
+    p.think_eog_mask        = false;
+    p.ignore_eos            = false;
+    p.loop_guard_nudge_ids  = {kPieceFirst};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    feed_lines(s, 18, 22, false); // the share falls to 0.6, below the low mark
+
+    // Six stretches: the budget is 10 counted lines, 4 lines and 6 stretches.
+    for (int i = 0; i < 6 * kStretch - 1; ++i) s.observe_think(30, "word ");
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+    s.observe_think(30, "word ");   // the sixth stretch: the budget, recovered
+
+    std::vector<float> row(8, -1.0f);
+    row[0] = 5.0f;
+    row[6] = 6.0f;
+    row[4] = 1.0f;
+    CHECK_EQ(s.sample(row.data(), row.size()), 6);
+    CHECK(row[0] == 5.0f);
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+}
+
+// (2) A text-closer family has no closer id to force. At the slap point the
+// ladder lifts its masks instead of holding the turn to the cap -- no forced
+// token, no slap, and the end-of-turn and multi-newline ids are drawable.
+TEST(loop_guard_ladder_text_closer_lifts_at_the_slap_point) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 1);
+    p.loop_guard_door_grace = 1;
+    p.loop_guard_door_ids   = {6, 7};
+    p.think_eog_mask        = false;
+    p.ignore_eos            = false;
+    p.think_ids.close_ids.clear();            // text closer only
+    p.think_ids.open_close_ids.clear();
+    p.loop_guard_nudge_ids = {kPieceFirst};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    feed_text(s, loop_line(18));   // the door grace: the nudge
+    CHECK_EQ(s.loop_guard_counts().nudges, 1);
+    std::vector<float> nudge_row = row_with_argmax(2);
+    const int nudge_id = s.sample(nudge_row.data(), nudge_row.size());
+    s.observe_think(nudge_id, piece_of(nudge_id));
+
+    feed_text(s, loop_line(19));   // the nudge grace: the slap point, still over
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);   // no closer id: lift instead
+    std::vector<float> row(8, -1.0f);
+    row[0] = 5.0f;   // the EOG id, drawable again
+    row[6] = 6.0f;   // a multi-newline token, likewise
+    row[4] = 1.0f;
+    CHECK_EQ(s.sample(row.data(), row.size()), 6);   // no forced token
+    CHECK(row[0] == 5.0f);
+    CHECK(row[6] == 6.0f);
+    CHECK(s.think_block_open());   // the block is not shut by a lift; it runs on
+}
+
+// (1vi) the answer after a LIFTED door is still watched: gap 1 keys on the door
+// having opened in this turn, not on it still being open. The mode recovers,
+// the door lifts, the model closes the block itself, and a looping answer still
+// ends the turn.
+TEST(loop_guard_answer_watched_after_a_lifted_door) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 3);
+    p.loop_guard_door_grace = 4;
+    p.loop_guard_door_ids   = {6, 7};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    feed_lines(s, 18, 22, false); // recovered at the door grace: the lift
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+
+    std::vector<float> row(8, -1.0f);
+    row[5] = 9.0f;   // the block's closer, by the model's own draw
+    row[4] = 1.0f;
+    CHECK_EQ(s.sample(row.data(), row.size()), 5);
+    s.observe(5, "closed");
+    CHECK_EQ(s.loop_guard_counts().self_closes, 0);   // the mask was lifted
+    CHECK(!s.think_block_open());
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // a looping answer
+    CHECK(s.loop_abort());
+    CHECK_EQ(s.loop_guard_counts().aborts, 1);
+}
+
+// (a) `door` (no ladder): a mask alone must not hold a turn to the cap. After
+// door_grace + grace counted lines without a close, the door gives up its
+// masks: the multi-newline ids and the turn-ending ids are drawable again, the
+// door counters stop, and a later detection does not reopen the mask.
+TEST(loop_guard_door_mode_lifts_its_masks_after_the_budget) {
+    SamplerParams p = base_params(LoopGuardMode::Door, 10, 2);
+    p.loop_guard_door_grace = 2;
+    p.loop_guard_door_ids   = {6, 7};
+    p.think_eog_mask        = false;
+    p.ignore_eos            = false;
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    // The block stays open and the share falls; 4 = door_grace + grace lines.
+    feed_text(s, distinct_line(18));
+    feed_text(s, distinct_line(19));
+    feed_text(s, distinct_line(20));
+    std::vector<float> still(8, -1.0f);
+    still[0] = 5.0f;    // the EOG id, still masked before the budget
+    still[6] = 6.0f;    // a multi-newline token, still masked
+    still[4] = 1.0f;    // the single newline
+    CHECK_EQ(s.sample(still.data(), still.size()), 4);
+    CHECK(still[0] == -INFINITY);
+    CHECK(still[6] == -INFINITY);
+    CHECK_EQ(s.loop_guard_counts().door_masked, 1);
+    CHECK_EQ(s.loop_guard_counts().door_eog_masked, 1);
+
+    feed_text(s, distinct_line(21));   // the 4th: the door lifts
+    std::vector<float> lifted(8, -1.0f);
+    lifted[0] = 5.0f;
+    lifted[6] = 6.0f;
+    lifted[4] = 1.0f;
+    CHECK_EQ(s.sample(lifted.data(), lifted.size()), 6);   // the door is gone
+    CHECK(lifted[0] == 5.0f);   // the EOG id is drawable again
+    CHECK(lifted[6] == 6.0f);
+    // The counters stop at the lift: this draw removed nothing.
+    CHECK_EQ(s.loop_guard_counts().door_masked, 1);
+    CHECK_EQ(s.loop_guard_counts().door_eog_masked, 1);
+
+    // A later crossing does not reopen a mask the guard gave up: the turn is
+    // the switch-off path from here.
+    feed_lines(s, 0, 12, true);
+    CHECK_EQ(s.loop_guard_counts().detections, 2);
+    std::vector<float> after(8, -1.0f);
+    after[0] = 5.0f;
+    CHECK_EQ(s.sample(after.data(), after.size()), 0);
+    CHECK(after[0] == 5.0f);
+}
+
+// (a) ladder-nodoor keeps 1.2.3's semantics: escalation only on an over line,
+// however long the turn goes on below the threshold (it never opens the door).
+TEST(loop_guard_ladder_nodoor_does_not_escalate_without_an_over_line) {
+    SamplerParams p = base_params(LoopGuardMode::LadderNoDoor, 10, 3);
+    p.loop_guard_door_grace = 4;
+    p.loop_guard_door_ids   = {6, 7};
+    for (size_t i = 0; i < kPiece.size(); ++i)
+        p.loop_guard_nudge_ids.push_back(kPieceFirst + static_cast<int>(i));
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the nudge is the first rung here
+    CHECK_EQ(s.loop_guard_counts().nudges, 1);
+
+    for (size_t i = 0; i < kPiece.size(); ++i) {
+        std::vector<float> l = row_with_argmax(2);
+        const int id = s.sample(l.data(), l.size());
+        s.observe_think(id, piece_of(id));
+    }
+    feed_lines(s, 18, 60, false);   // 42 varied lines: the share never rises
+    CHECK_EQ(s.loop_guard_counts().nudges, 1);
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+}
+
+// (a) a model that closes the block itself before the budget: no escalation
+// follows, and the close is still counted as the model's own.
+TEST(loop_guard_door_ladder_self_close_before_the_budget_nudges_not) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 3);
+    p.loop_guard_door_grace = 4;
+    p.loop_guard_door_ids   = {6, 7};
+    p.loop_guard_nudge_ids  = {kPieceFirst};   // armed, must not fire
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    feed_text(s, distinct_line(18));
+    feed_text(s, distinct_line(19));
+    feed_text(s, distinct_line(20));   // 3 counted lines: one short of the grace
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+
+    std::vector<float> row(8, -1.0f);
+    row[6] = 10.0f;   // the double newline, masked by the door
+    row[5] = 9.0f;    // the block's closer, legal
+    CHECK_EQ(s.sample(row.data(), row.size()), 5);
+    s.observe(5, "closed");
+    CHECK_EQ(s.loop_guard_counts().self_closes, 1);
+
+    feed_lines(s, 21, 60, false);   // a long varied answer after the close
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+}
+
+// (b) at top_k 0 the door counters read the candidate set the draw samples
+// from -- the prefix that survives top-p -- not the whole row. A masked id
+// below the cutoff is not a candidate; one inside the cutoff is.
+TEST(loop_guard_door_masked_counts_the_truncated_set_at_top_k_zero) {
+    SamplerParams p = base_params(LoopGuardMode::Door, 10, 5);
+    p.loop_guard_door_ids = {6, 7};
+    p.temperature         = 0.7f;
+    p.top_k               = 0;       // no top-k: the top-p cutoff is the set
+    p.top_p               = 0.9f;
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    // The masked double newline sits below the surviving prefix's floor: 5.0
+    // and 4.9 hold >= 0.9 of the unmasked mass, so the set is those two.
+    std::vector<float> below(8, -1.0f);
+    below[4] = 5.0f;
+    below[3] = 4.9f;
+    below[6] = 4.8f;   // masked, and below the floor the draw keeps
+    const int t1 = s.sample(below.data(), below.size());
+    CHECK_EQ(t1, 4);
+    CHECK_EQ(s.loop_guard_counts().door_masked, 0);
+
+    // The same row with the masked id above the floor: it would have been a
+    // candidate of the same truncated set.
+    std::vector<float> inside(8, -1.0f);
+    inside[4] = 5.0f;
+    inside[3] = 4.9f;
+    inside[6] = 4.95f;   // masked, above the floor
+    const int t2 = s.sample(inside.data(), inside.size());
+    CHECK_EQ(t2, 4);
+    CHECK_EQ(s.loop_guard_counts().door_masked, 1);
+
+    // Observability only: the draw itself is unchanged. A fixed seed and these
+    // rows give a fixed token sequence, so a change that moved the draw would
+    // have to move this list too (the top-k 0, top-p 1 case is pinned by
+    // loop_guard_door_counting_change_leaves_the_draw_byte_identical).
+    std::vector<float> third(8, -1.0f);
+    third[4] = 4.0f;
+    third[3] = 4.9f;
+    third[6] = 4.95f;
+    const int t3 = s.sample(third.data(), third.size());
+    CHECK_EQ(std::vector<int>({t1, t2, t3}), std::vector<int>({4, 4, 3}));
+}
+
+// ── 1.2.5 round 2: the door's budget in tokens, and the lifted-door latch ──
+
+// (A) The door's budget counted ended lines only, so a turn that switched to
+// newline-free text never advanced it and the masks could hold the turn to the
+// token cap. Each stretch of tokens without a counted line now counts as one
+// line-equivalent for the budget (never for the detector's window): the ladder
+// nudges and slaps by budget on newline-free text exactly as on lines.
+TEST(loop_guard_door_budget_advances_by_tokens_without_line_ends) {
+    constexpr int kStretch = 64;   // the sampler's stretch length
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 1);
+    p.loop_guard_door_grace = 3;
+    p.loop_guard_door_ids   = {6, 7};
+    for (size_t i = 0; i < kPiece.size(); ++i)
+        p.loop_guard_nudge_ids.push_back(kPieceFirst + static_cast<int>(i));
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+
+    // A counted line is the anchor: it spends one grace line and restarts the
+    // token stretch, so the numbers below are exact whatever the detection did.
+    feed_text(s, distinct_line(18));
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+
+    // The model writes only newline-free text: no line ever ends again.
+    int tokens = 0;
+    auto tok = [&] {
+        s.observe_think(30, "word ");   // no newline in the piece
+        ++tokens;
+    };
+    while (tokens < kStretch - 1) tok();   // one stretch short: grace 2 of 3
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+    tok();                                 // the first stretch: grace 2
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+    while (tokens < 2 * kStretch - 1) tok();
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+    tok();                                 // the second stretch: grace 3, the nudge
+    CHECK_EQ(s.loop_guard_counts().nudges, 1);
+    CHECK_EQ(s.loop_guard_counts().detections, 1);   // no detection from tokens
+
+    while (tokens < 3 * kStretch - 1) tok();   // the nudge's grace not yet
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+    tok();                                     // the next stretch: the slap
+    CHECK_EQ(s.loop_guard_counts().slaps, 1);
+
+    // Deliver the nudge, then the forced closer: the turn ends, not the cap.
+    for (size_t i = 0; i < kPiece.size(); ++i) {
+        std::vector<float> l = row_with_argmax(2);
+        const int id = s.sample(l.data(), l.size());
+        s.observe_think(id, piece_of(id));
+    }
+    std::vector<float> l = row_with_argmax(2);
+    CHECK_EQ(s.sample(l.data(), l.size()), 5);
+    s.observe(5, "closed");
+    CHECK(!s.think_block_open());
+}
+
+// (A) `door` mode on the same newline-free stream: after door_grace + grace
+// line-equivalents the door lifts, and the multi-newline and turn-ending ids
+// are drawable again. Before the lift the masks still hold.
+TEST(loop_guard_door_mode_lifts_after_token_stretches_without_lines) {
+    constexpr int kStretch = 64;
+    SamplerParams p = base_params(LoopGuardMode::Door, 10, 1);
+    p.loop_guard_door_grace = 1;
+    p.loop_guard_door_ids   = {6, 7};
+    p.think_eog_mask        = false;
+    p.ignore_eos            = false;
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    feed_text(s, distinct_line(18));   // the counted-line anchor: grace 1
+    int tokens = 0;
+    auto tok = [&] {
+        s.observe_think(30, "word ");
+        ++tokens;
+    };
+    while (tokens < kStretch - 1) tok();   // 1 short of door_grace + grace
+    std::vector<float> still(8, -1.0f);
+    still[0] = 5.0f;    // the EOG id
+    still[6] = 6.0f;    // a multi-newline token
+    still[4] = 1.0f;    // the single newline
+    CHECK_EQ(s.sample(still.data(), still.size()), 4);
+    CHECK(still[0] == -INFINITY);
+    CHECK(still[6] == -INFINITY);
+
+    tok();   // the stretch: door_grace + grace, the lift
+    std::vector<float> lifted(8, -1.0f);
+    lifted[0] = 5.0f;
+    lifted[6] = 6.0f;
+    lifted[4] = 1.0f;
+    CHECK_EQ(s.sample(lifted.data(), lifted.size()), 6);
+    CHECK(lifted[0] == 5.0f);
+    CHECK(lifted[6] == 6.0f);
+}
+
+// (A2) The lifted-door latch, pinned: after `door` mode's budget lifted the
+// masks, the share falls and rises again to a second detection -- the masks
+// stay off and the counters do not grow. A lifted door is not reopened.
+TEST(loop_guard_door_lifted_is_not_reopened_by_a_later_detection) {
+    constexpr int kStretch = 64;
+    SamplerParams p = base_params(LoopGuardMode::Door, 10, 2);
+    p.loop_guard_door_grace = 1;
+    p.loop_guard_door_ids   = {6, 7};
+    p.think_eog_mask        = false;
+    p.ignore_eos            = false;
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    feed_text(s, distinct_line(18));   // the anchor: grace 1
+    // door_grace 1 + the ladder grace 2 = three line-equivalents: the anchor
+    // plus two token stretches.
+    for (int i = 0; i < 2 * kStretch; ++i) s.observe_think(30, "word ");
+    std::vector<float> open_row(8, -1.0f);
+    open_row[0] = 5.0f;
+    open_row[6] = 6.0f;
+    open_row[4] = 1.0f;
+    CHECK_EQ(s.sample(open_row.data(), open_row.size()), 6);   // lifted
+    CHECK_EQ(s.loop_guard_counts().door_masked, 0);
+    CHECK_EQ(s.loop_guard_counts().door_eog_masked, 0);
+
+    // The share falls (varied lines), then rises again to a second detection.
+    // Feed line by line and stop at the detection, so the sample below is the
+    // first draw after it: a reopened door is still masked here.
+    feed_lines(s, 18, 30, false);
+    for (int i = 0; i < 40 && s.loop_guard_counts().detections < 2; ++i) feed_text(s, loop_line(i));
+    CHECK_EQ(s.loop_guard_counts().detections, 2);
+
+    std::vector<float> after(8, -1.0f);
+    after[0] = 5.0f;   // the EOG id: masked again only if the door reopened
+    after[6] = 6.0f;   // a multi-newline token, likewise
+    after[4] = 1.0f;
+    CHECK_EQ(s.sample(after.data(), after.size()), 6);
+    CHECK(after[0] == 5.0f);
+    CHECK(after[6] == 6.0f);
+    CHECK_EQ(s.loop_guard_counts().door_masked, 0);
+    CHECK_EQ(s.loop_guard_counts().door_eog_masked, 0);
+}
+
+// ── 1.2.5 round 2: the detector and the closer in one piece ─────────────────
+
+// (B4) Text-fallback vocabulary: a piece that carries a counted line and the
+// closer closes the block in the same call. The line is a real repeat, but the
+// ladder must not act on it -- a nudge injected then lands in the answer. The
+// detector counts the line and the detection; nothing is nudged.
+TEST(loop_guard_closer_in_the_same_piece_does_not_nudge_into_the_answer) {
+    SamplerParams p = base_params(LoopGuardMode::Nudge, 10, 1);
+    p.think_ids.close_ids.clear();            // text fallback only
+    p.think_ids.open_close_ids.clear();
+    p.loop_guard_nudge_ids = {kPieceFirst};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    for (int i = 9; i < 17; ++i) feed_text(s, loop_line(i));   // 7 repeats = 0.7
+    CHECK_EQ(s.loop_guard_counts().detections, 0);
+
+    // The 8th repeat line ends inside a piece that also spells the closer.
+    feed_text(s, loop_line(17) + think_tag_pairs(false)[0].second);
+    CHECK_EQ(s.loop_guard_counts().detections, 1);   // the reasoning line counts
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);       // but no nudge into the answer
+    CHECK(!s.think_block_open());
+}
+
+// ── 1.2.5 round 2: the slap's closer family, and the completions start ─────
+
+// (B5) Two tag families, a block opened by TEXT for the family whose closer is
+// text: the slap must not force the other family's closer id into the output.
+TEST(loop_guard_slap_forces_no_closer_from_another_family) {
+    SamplerParams p = base_params(LoopGuardMode::Slap, 10, 5);
+    const auto& pairs = think_tag_pairs(true);   // Qwen and the wider family
+    p.think_ids.open_tags  = {pairs[0].first, pairs[1].first, pairs[2].first};
+    p.think_ids.close_tags = {pairs[0].second, pairs[1].second, pairs[2].second};
+    // The flattened set: only family 0's closer is one special token.
+    p.think_ids.open_close_ids.clear();
+    p.think_ids.open_ids.clear();
+    p.think_ids.close_ids  = {5};
+    p.think_ids.close_tags = {pairs[0].second, pairs[1].second};
+    p.think_ids.open_tags  = {pairs[0].first, pairs[1].first};
+    p.think_ids.open_close_ids = {{-1, 5}, {-1, -1}};
+    Sampler s(p, 1);
+    s.start_in_think_block(false);
+    feed_text(s, pairs[1].first);   // the block opens by text, family 1
+    CHECK(s.think_block_open());
+
+    // The reasoning rounds into a loop: the slap fires.
+    for (int i = 0; i < 10; ++i) feed_text(s, loop_line(i));
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+    CHECK_EQ(s.loop_guard_counts().slaps, 1);
+
+    // No closer id belongs to the open family, so the slap forces none: the
+    // draw is the model's own, and family 0's closer (5) is not injected.
+    std::vector<float> row(8, -1.0f);
+    row[1] = 4.0f;   // not any closer
+    CHECK_EQ(s.sample(row.data(), row.size()), 1);
+    CHECK_EQ(row[5], -1.0f);
+}
+
+// (B6) The completions path gets the chat path's start state: a raw prompt that
+// ends inside an open block starts the turn in the block, so the masks and the
+// loop guard watch it from the first sample.
+TEST(completions_start_inside_an_open_block_like_chat) {
+    class StubBackend final : public Backend {
+    public:
+        StubBackend() {
+            st.id          = "stub";
+            st.served_id   = "stub";
+            st.n_ctx_train = kStubNCtxTrain;
+            st.loaded      = true;
+            st.stub        = true;
+            st.n_ctx       = 4096;
+        }
+        const ModelStatus& status() const override { return st; }
+        Tokenizer&         tokenizer() override { return tok_; }
+        std::string        render_chat(const ChatRequest&) const override { return {}; }
+        FinishReason generate(const GenerationInput&, int, const TokenCallback&,
+                              GenerationStats&) override {
+            return FinishReason::Stop;
+        }
+
+    private:
+        struct Tok final : public Tokenizer {
+            std::vector<int> encode(std::string_view) override { return {}; }
+            std::string      decode(const std::vector<int>&) override { return {}; }
+            std::string      decode_one(int) override { return {}; }
+            int              eos_id() const override { return 0; }
+        } tok_;
+        ModelStatus st;
+    };
+
+    Config cfg;
+    StubBackend backend;
+    api::Context ctx{&cfg, &backend, nullptr};
+
+    auto prepared = [&](const std::string& prompt) {
+        nlohmann::json body = {{"model", "stub"}, {"prompt", prompt}};
+        api::PreparedCompletion prep;
+        const auto err = api::prepare_completion(ctx, body, prep);
+        CHECK(!err.has_value());
+        return prep;
+    };
+
+    const std::string opener = think_tag_pairs(false)[0].first;
+    CHECK(prepared("a raw prompt").input.think_open == false);
+    CHECK(prepared("reasoning so far\n" + opener + "\n").input.think_open);
+    CHECK(prepared("reasoning so far\n" + opener).input.think_open == false);   // no newline
+}
+
+// (3) One opener check for both paths, built on the shared tag table. The chat
+// path and /v1/completions agree on the start state: a prompt ending in the
+// default family's opener, in an extended family's opener (when the artifact
+// answers to the wider family), and a plain prompt that ends in no block. With
+// the default family only the Qwen pair is checked, so the served templates'
+// behaviour is unchanged.
+TEST(opener_start_state_is_one_helper_for_chat_and_completions) {
+    class StubBackend final : public Backend {
+    public:
+        StubBackend(std::string prompt, bool extended) : prompt_(std::move(prompt)) {
+            st.id          = "stub";
+            st.served_id   = "stub";
+            st.n_ctx_train = kStubNCtxTrain;
+            st.loaded      = true;
+            st.stub        = true;
+            st.n_ctx       = 4096;
+            st.think_tags_extended = extended;
+        }
+        const ModelStatus& status() const override { return st; }
+        Tokenizer&         tokenizer() override { return tok_; }
+        std::string        render_chat(const ChatRequest&) const override { return prompt_; }
+        FinishReason generate(const GenerationInput&, int, const TokenCallback&,
+                              GenerationStats&) override {
+            return FinishReason::Stop;
+        }
+
+    private:
+        struct Tok final : public Tokenizer {
+            std::vector<int> encode(std::string_view) override { return {}; }
+            std::string      decode(const std::vector<int>&) override { return {}; }
+            std::string      decode_one(int) override { return {}; }
+            int              eos_id() const override { return 0; }
+        } tok_;
+        std::string prompt_;
+        ModelStatus st;
+    };
+
+    Config cfg;
+    auto start_state = [&](const std::string& prompt, bool extended) {
+        StubBackend backend(prompt, extended);
+        api::Context ctx{&cfg, &backend, nullptr};
+
+        nlohmann::json chat = {{"model", "stub"},
+                               {"messages", nlohmann::json::array({{{"role", "user"}, {"content", "hi"}}})}};
+        api::PreparedChat cp;
+        const auto chat_err = api::prepare_chat(ctx, chat, cp);
+        CHECK(!chat_err.has_value());
+
+        nlohmann::json comp = {{"model", "stub"}, {"prompt", prompt}};
+        api::PreparedCompletion pp;
+        const auto comp_err = api::prepare_completion(ctx, comp, pp);
+        CHECK(!comp_err.has_value());
+
+        CHECK_EQ(cp.input.think_open, pp.input.think_open);   // one helper, no disagreement
+        return cp.input.think_open;
+    };
+
+    const auto& pairs = think_tag_pairs(true);
+    const std::string default_open = pairs[0].first + "\n";
+    const std::string extended_open = pairs[1].first + "\n";
+
+    // The default template: unchanged (only the Qwen pair is checked).
+    CHECK(start_state("reasoning so far\n" + default_open, false));
+    CHECK(!start_state("just an answer", false));
+    CHECK(!start_state("an answer ending in words", false));
+
+    // Setting the default family: the wider family's opener is NOT the start
+    // state, exactly today's behaviour for a non-extended artifact.
+    CHECK(!start_state("reasoning so far\n" + extended_open, false));
+
+    // An artifact that answers to the wider family: that opener starts open.
+    CHECK(start_state("reasoning so far\n" + extended_open, true));
+    CHECK(start_state("reasoning so far\n" + default_open, true));
+    CHECK(!start_state("just an answer", true));
+}
+
+// (T1) The recovery test is the LOW MARK, not the threshold: a share inside the
+// band between them (0.80 with threshold 0.85, low mark 0.75) is still looping
+// by the hysteresis' own definition, so a budget point must not lift -- the
+// ladder nudges at the nudge point and slaps at the slap point.
+TEST(loop_guard_ladder_band_share_still_escalates_at_a_budget_point) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 20, 1);
+    p.loop_guard_threshold = 0.85f;   // low mark 0.75
+    p.loop_guard_door_grace = 10;
+    p.loop_guard_door_ids   = {6, 7};
+    p.loop_guard_nudge_ids  = {kPieceFirst};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    // Ten loop lines: the share 9/10 = 0.90 crosses the threshold; detection.
+    feed_lines(s, 0, 10, true);
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+
+    // Nine more counted lines -- seven loops and two varied -- keep the window
+    // at 0.89, 0.84: still well above the low mark, so the door stays open.
+    feed_lines(s, 10, 17, true);
+    feed_text(s, distinct_line(0));
+    feed_text(s, distinct_line(1));
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+
+    // The tenth counted line since detection is the door grace's budget point.
+    // The window is 16 of 20 repeats = 0.80: inside the band, not recovered.
+    feed_text(s, distinct_line(2));
+    CHECK_EQ(s.loop_guard_counts().nudges, 1);   // the ladder nudges, no lift
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    // Deliver the nudge sentence's one id, so the draw below is the model's.
+    std::vector<float> nudge_row = row_with_argmax(2);
+    const int nudge_id = s.sample(nudge_row.data(), nudge_row.size());
+    CHECK_EQ(nudge_id, kPieceFirst);
+    s.observe_think(nudge_id, piece_of(nudge_id));
+
+    // The nudge grace's line leaves the share at 0.80 again: inside the band.
+    feed_text(s, distinct_line(3));
+    CHECK_EQ(s.loop_guard_counts().slaps, 1);    // the slap, no lift at the band
+    std::vector<float> row(8, -1.0f);
+    CHECK_EQ(s.sample(row.data(), row.size()), 5);   // the forced closer
+}
+
+// (T2) Door mode's answer watch: the door was opened (and lifted before the
+// close), the model closes the block by its own draw, and the answer repeats
+// lines. The turn ends on finish_reason loop -- the watch keys on the door
+// having OPENED, in door mode as in the ladder.
+TEST(loop_guard_door_mode_answer_watched_after_a_lift) {
+    SamplerParams p = base_params(LoopGuardMode::Door, 10, 1);
+    p.loop_guard_door_grace = 1;
+    p.loop_guard_door_ids   = {6, 7};
+    p.think_eog_mask        = false;
+    p.ignore_eos            = false;
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    // door_grace 1 + grace 1: two counted lines later the door lifts.
+    feed_text(s, loop_line(18));
+    feed_text(s, loop_line(19));
+    CHECK_EQ(s.loop_guard_counts().detections, 1);   // the lift, not a detection
+
+    // The model closes the block by its own draw (no mask now: no self-close).
+    std::vector<float> row(8, -1.0f);
+    row[5] = 9.0f;
+    row[4] = 1.0f;
+    CHECK_EQ(s.sample(row.data(), row.size()), 5);
+    s.observe(5, "closed");
+    CHECK_EQ(s.loop_guard_counts().self_closes, 0);
+    CHECK(!s.think_block_open());
+
+    // A looping answer: watched because the door opened in this turn.
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);
+    CHECK(s.loop_abort());
+    CHECK_EQ(s.loop_guard_counts().aborts, 1);
+
+    std::vector<float> rows = row_with_argmax(3);
+    const VerifyWalk   w = walk_verify(
+        rows.data(), 1, rows.size(), {}, s, 100, [](int) { return false; },
+        [&](int) { return Control::Continue; });
+    CHECK(w.reason == FinishReason::Loop);
+    CHECK_EQ(std::string(finish_reason_name(w.reason)), std::string("loop"));
 }

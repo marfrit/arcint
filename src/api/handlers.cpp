@@ -26,6 +26,23 @@ double decode_other_seconds(const GenerationStats& stats) {
            stats.draft_verify_seconds - stats.draft_propose_seconds;
 }
 
+bool prompt_ends_inside_think_block(std::string_view prompt, bool extended_tags) {
+    // Built on think_tag_pairs(), the one table the split and the sampler's mask
+    // read, so no marker is written out here.
+    for (const auto& [open, close] : think_tag_pairs(extended_tags)) {
+        if (prompt.ends_with(open + "\n")) return true;
+    }
+    return false;
+}
+
+// One list for the two consumers: the decode line prints the counters when one
+// moved, and the response carries the object on the same condition. An eighth
+// counter is added here, once.
+bool loop_guard_moved(const GenerationStats& stats) {
+    return stats.loop_detections || stats.loop_nudges || stats.loop_slaps || stats.loop_aborts
+           || stats.loop_self_closes || stats.loop_door_masked || stats.loop_door_eog_masked;
+}
+
 // The decode line's conditional terms, extracted from log_stats (review B4
 // follow-up) so the stats wiring is unit-testable at the struct level: the
 // value decode_suffix_for returns is the one that lands on the line.
@@ -85,8 +102,7 @@ std::string decode_suffix_for(const GenerationStats& stats) {
     }
     // loop-guard: the ladder's counters, printed only when one moved, so a
     // request without the switch keeps exactly the line it always had.
-    if (stats.loop_detections || stats.loop_nudges || stats.loop_slaps || stats.loop_aborts
-        || stats.loop_self_closes || stats.loop_door_masked || stats.loop_door_eog_masked) {
+    if (loop_guard_moved(stats)) {
         decode_suffix += log::format(" | loop guard: detected %d, nudged %d, slapped %d, aborted %d, "
                                      "self-closed %d, door masked %d, door EOG masked %d",
                                      stats.loop_detections, stats.loop_nudges, stats.loop_slaps,
@@ -96,19 +112,18 @@ std::string decode_suffix_for(const GenerationStats& stats) {
     return decode_suffix;
 }
 
-nlohmann::ordered_json loop_guard_json(const GenerationStats& stats) {
-    return nlohmann::ordered_json{{"detections", stats.loop_detections},
+// A plain json: the response body is one, so an ordered_json here cannot make
+// the key order on the wire anything but alphabetical. Order is therefore not
+// a contract -- the object's seven keys and their values are (see the handler
+// tests, which read the serialized response and the stream's finish frame).
+nlohmann::json loop_guard_json(const GenerationStats& stats) {
+    return nlohmann::json{{"detections", stats.loop_detections},
                 {"nudges", stats.loop_nudges},
                 {"slaps", stats.loop_slaps},
                 {"aborts", stats.loop_aborts},
                 {"self_closes", stats.loop_self_closes},
                 {"door_masked", stats.loop_door_masked},
                 {"door_eog_masked", stats.loop_door_eog_masked}};
-}
-
-bool loop_guard_moved(const GenerationStats& stats) {
-    return stats.loop_detections || stats.loop_nudges || stats.loop_slaps || stats.loop_aborts
-           || stats.loop_self_closes || stats.loop_door_masked || stats.loop_door_eog_masked;
 }
 
 namespace {
@@ -768,8 +783,8 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
     const std::string prompt = ctx.backend->render_chat(prep.req);
     // The template decides whether the answer starts inside a think block; the
     // split of reasoning from content below follows that, not a guess.
-    prep.think_open = prompt.ends_with("<think>\n");
     prep.think_tags_extended = ctx.backend->status().think_tags_extended;
+    prep.think_open = prompt_ends_inside_think_block(prompt, prep.think_tags_extended);
     // The split, like the backend's mask, decides the block by token id where
     // the artifact's vocabulary spells a tag as one special token.
     prep.think_ids = ctx.backend->think_block_ids(prep.think_tags_extended);
@@ -831,6 +846,15 @@ std::optional<HttpResult> prepare_completion(const Context& ctx, const json& bod
                            /*nothink=*/false, prep.req.prompt_ids)) {
         return err;
     }
+
+    // The same start state the chat path gives the mask and the loop guard: a
+    // raw prompt that ends inside an open block starts the turn there, so the
+    // masks engage before the first sample and a loop in the reasoning is
+    // watched. Before this the completions path always started undecided, so a
+    // prompt the template had left open was never watched.
+    prep.input.think_tags_extended = ctx.backend->status().think_tags_extended;
+    prep.input.think_open          = prompt_ends_inside_think_block(
+        prep.req.prompt, ctx.backend->status().think_tags_extended);
 
     prep.id      = next_id("cmpl");
     prep.created = now_seconds();

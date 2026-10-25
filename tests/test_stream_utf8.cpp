@@ -406,3 +406,90 @@ TEST(stream_final_chunk_carries_reasoning_closed) {
     const std::vector<json> none = run_stream_with(plain, false);
     CHECK(!none.back()["choices"][0]["delta"].contains("reasoning_closed"));
 }
+
+// ---------------------------------------------------------------------------
+// The loop_guard object on the wire (1.2.5). The response body and the stream's
+// finish frame are both plain json, so key order as a contract was never what
+// the client saw; the seven keys and their values are. Read them off the
+// serialized response rather than the in-memory object.
+namespace {
+
+// Emits a fixed reply and reports a moved loop guard in the stats, so both wire
+// surfaces carry the object.
+class LoopStatsBackend final : public lgc::Backend {
+public:
+    LoopStatsBackend() {
+        status_.id          = "stub";
+        status_.served_id   = "stub";
+        status_.n_ctx_train = lgc::kStubNCtxTrain;
+        status_.loaded      = true;
+        status_.stub        = true;
+        status_.n_ctx       = 4096;
+    }
+
+    const lgc::ModelStatus& status() const override { return status_; }
+    lgc::Tokenizer&         tokenizer() override { return tok_; }
+    std::string             render_chat(const lgc::ChatRequest&) const override { return "prompt"; }
+
+    lgc::FinishReason generate(const lgc::GenerationInput&, int, const lgc::TokenCallback& on_piece,
+                               lgc::GenerationStats& stats) override {
+        stats.completion_tokens     = 1;
+        stats.loop_detections       = 1;
+        stats.loop_nudges           = 2;
+        stats.loop_slaps            = 3;
+        stats.loop_aborts           = 4;
+        stats.loop_self_closes      = 5;
+        stats.loop_door_masked      = 6;
+        stats.loop_door_eog_masked  = 7;
+        if (on_piece("answer", 0) != lgc::Control::Continue) return lgc::FinishReason::Stop;
+        return lgc::FinishReason::Stop;
+    }
+
+private:
+    struct Tok final : public lgc::Tokenizer {
+        std::vector<int> encode(std::string_view) override { return {}; }
+        std::string      decode(const std::vector<int>&) override { return {}; }
+        std::string      decode_one(int) override { return {}; }
+        int              eos_id() const override { return 0; }
+    } tok_;
+
+    lgc::ModelStatus status_;
+};
+
+json run_chat_loop_stats() {
+    LoopStatsBackend  backend;
+    lgc::api::Context ctx;
+    ctx.backend = &backend;
+    lgc::api::PreparedChat prep;
+    prep.think_open          = false;
+    prep.think_tags_extended = false;
+    prep.parse_tool_calls    = false;
+    prep.id                  = "test";
+    prep.model               = "stub";
+    prep.req.stream_include_usage = false;
+    return lgc::api::run_chat(ctx, prep, 0).body;
+}
+
+}  // namespace
+
+TEST(chat_loop_guard_object_carries_all_seven_keys_on_the_wire) {
+    const json expected = {{"detections", 1}, {"nudges", 2}, {"slaps", 3}, {"aborts", 4},
+                           {"self_closes", 5}, {"door_masked", 6}, {"door_eog_masked", 7}};
+
+    // The non-streaming response, read as serialized and parsed back: what a
+    // client actually receives.
+    const json body = run_chat_loop_stats();
+    const json wire = json::parse(body.dump());
+    CHECK(wire.contains("loop_guard"));
+    CHECK_EQ(wire["loop_guard"].size(), 7u);
+    CHECK(wire["loop_guard"] == expected);
+
+    // The stream's finish frame, the same object out of the same path.
+    LoopStatsBackend  backend;
+    const std::vector<json> objs = run_stream_with(backend, true);
+    const json& finish = objs.back();
+    CHECK(finish.contains("loop_guard"));
+    CHECK_EQ(finish["loop_guard"].size(), 7u);
+    CHECK(finish["loop_guard"] == expected);
+    CHECK_EQ(finish["loop_guard"].dump(), wire["loop_guard"].dump());
+}

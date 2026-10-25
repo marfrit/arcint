@@ -943,3 +943,30 @@ TEST(sampler_non_thinking_turn_keeps_the_normal_rows_presence_over_all_history) 
     auto l = logits({0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 2.8f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f});
     CHECK_EQ(s.sample(l.data(), l.size()), 5);
 }
+
+// ---------------------------------------------------------------------------
+// Round-2 fix B3: the positional id fallback. When the backend fills the
+// flattened id lists a role whose tag is text contributes no entry, so an id's
+// index is no longer its tag pair's index. Zipping two filtered lists would
+// pair an opener with another family's closer; a later slap would force a
+// closer that family never emits. Only a set of lists that kept one id per pair
+// can be zipped; otherwise no pairing is built at all.
+TEST(sampler_positional_ids_refuse_a_lossy_pairing) {
+    const auto& pairs = think_tag_pairs(true);
+    SamplerParams p = greedy_params();
+    p.think_eog_mask = true;
+    p.think_ids.open_tags  = {pairs[0].first, pairs[1].first};
+    p.think_ids.close_tags = {pairs[0].second, pairs[1].second};
+    // The backend's flattened sets for the pairs (-1 open / one-token close for
+    // family 0; one-token open / one-token close for family 1): open_ids has one
+    // entry, close_ids two, and no index carries the pair it came from.
+    p.think_ids.open_ids  = {6};
+    p.think_ids.close_ids = {5, 7};
+
+    Sampler s(p, 1);
+    s.start_in_think_block(false);
+    s.observe_think(6, "");   // family 1's opener id
+    // A zip by position would open the block paired with family 0's closer 5.
+    // The guard refuses: the id does not open an unpaired block.
+    CHECK(!s.think_block_open());
+}

@@ -180,3 +180,32 @@ TEST(reasoning_streaming_and_nonstreaming_agree_on_a_spelled_and_a_real_closer) 
     CHECK(split.reasoning.find(closer) != std::string::npos);
     CHECK(split.reasoning.find(" quoted, not emitted; ") != std::string::npos);
 }
+
+// The line breaks between the closer and the answer are layout: the
+// non-streaming split drops them (the reference), and the stream drops them
+// too, so both paths give the same content for the same token stream.
+TEST(reasoning_streaming_and_nonstreaming_drop_the_closer_line_breaks) {
+    const std::string closer = think_tag_pairs(false)[0].second;
+    const std::vector<std::pair<int, int>> ids = {{-1, 7}};
+    const std::vector<std::pair<std::string, int>> pieces = {{"the reasoning", 30},
+                                                             {closer, 7},
+                                                             {"\n\n", 15},
+                                                             {"Hello", 16}};
+
+    ReasoningStreamer streamed(true, false, ids);
+    std::string       reasoning, content;
+    for (const auto& [piece, id] : pieces) {
+        const auto step = streamed.push(piece, id);
+        reasoning += step.reasoning;
+        content += step.content;
+    }
+    const auto tail = streamed.flush();
+    reasoning += tail.reasoning;
+    content += tail.content;
+
+    const ReasoningSplit split = split_reasoning_tokens(pieces, true, false, ids);
+    CHECK(split.closed);
+    CHECK_EQ(content, std::string("Hello"));   // no leading line breaks
+    CHECK_EQ(split.content, content);
+    CHECK_EQ(split.reasoning, reasoning);
+}

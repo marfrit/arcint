@@ -104,7 +104,12 @@ block closes. `--loop-guard door` is the mask alone (never nudge or slap),
 `ladder` includes the door, `ladder-nodoor` is 1.2.3's ladder exactly (the
 nudge at detection, no mask), so one binary can compare both;
 `--loop-guard-door-grace` (default 20) is the counted lines after detection
-before the nudge, and `/props` reports it.
+before the nudge, and `/props` reports it. Once the door is open the ladder
+counts lines, not the share — the nudge at the door grace and the slap at its
+own grace whatever the repeat share — so a share that dips below the threshold
+without a close cannot run the turn to the token cap, and a `door`-mode mask
+that never gets a close lifts itself after the door and slap graces so the
+turn goes on as with the switch off.
 After a turn in which the door opened, the answer is watched too, so a looping
 answer ends the turn on `loop` from a clean detector window at the block's
 close, and restating a line or two of the reasoning once stays normal. While

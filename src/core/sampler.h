@@ -132,7 +132,7 @@ public:
         int aborts     = 0;
         // door: the block closed by the model's own draw while the door was
         // open (not by a slap), and the draws at which the door mask was active
-        // and a masked token sat in the row's top-k candidates.
+        // and a masked token sat in the candidate set the draw sampled from.
         int self_closes = 0;
         int door_masked = 0;
         // gap 2: draws at which an end-of-generation id was a finite candidate
@@ -195,7 +195,7 @@ private:
     using LoopGrams = std::vector<uint32_t>;
     LoopGrams loop_grams_(const std::string& line) const;
     bool      loop_near_match_(const LoopGrams& grams) const;
-    void   loop_on_detect_(bool content_phase);
+    void   loop_on_detect_();
     // gap 1: the answer gets a clean detector window at the block's close (by
     // the model's own draw after the door opened, or by the slap's forced
     // closer), so no reasoning line counts against the answer.
@@ -203,20 +203,30 @@ private:
     void   loop_do_nudge_();
     void   loop_do_slap_();
     void   loop_do_abort_();
+    // door (no ladder): the budget spent -- lift the masks and go on unguarded
+    void   loop_door_lift_();
+    // the ladder's escalation, by counted lines once the door is open (shared
+    // with the token stretch in observe_think_)
+    void   loop_escalate_(bool over);
     void   apply_penalties(float* logits, size_t vocab) const;
     void   mask_illegal_while_thinking(float* logits, size_t vocab) const;
     // loop-guard door: mask the multi-newline ids while the door is open and
     // the block is open. It keeps only the masked ids' logits, for the counter
     // the draw reads once its candidate set exists.
     void   mask_door_while_thinking(float* logits, size_t vocab);
-    // loop-guard door counter: was a masked id among the candidates this draw
-    // considers? Runs on the candidate set the draw collects, measured against
-    // the logits the ids had at mask time. Consumes the stored pair list, so a
-    // grammar redraw in the same sample() does not count twice.
-    void   count_door_masked_(float floor, bool inclusive);
+    // Review B3, one place for both masks: is the id the closer of a family
+    // the mask could kill, and the once-per-request warn when it is.
+    bool   closer_in_masked_set_(int id) const;
+    void   note_closer_stripped_(int id) const;
+    // loop-guard door counter: was a masked id among the candidates the draw
+    // samples from -- the set after the row's top-k/top-p/min-p truncation, not
+    // every finite logit in the row. Measured against the logits the ids had at
+    // mask time. Consumes the stored list, so a grammar redraw in the same
+    // sample() does not count twice; the n == 0 draw spends it too.
+    void   count_door_masked_(float floor);
     // gap 2's counter: the same test for the end-of-generation ids the door
     // removed inside the open block, over the draw's own candidate set.
-    void   count_door_eog_masked_(float floor, bool inclusive);
+    void   count_door_eog_masked_(float floor);
     void   measure_think_tags();
     void   build_think_id_table();
     void   observe_think_(std::string_view piece, int token);
@@ -304,19 +314,41 @@ private:
     bool loop_abort_     = false;
     bool loop_slap_pending_ = false;
     // door: open from the detection moment through nudge and slap until the
-    // block closes; the mask reads this and the block's state. `forced_closer`
+    // block closes (or, in `door` mode, until the budget lifts it); the mask
+    // reads this and the block's state. `forced_closer`
     // marks the token sample() returned for a slap, so observe_think_ does not
     // count that close as the model's own.
     bool loop_door_open_     = false;
+    // A door the budget lifted stays shut for the rest of the turn (door mode,
+    // and a ladder that recovered or has no closer to force); a later
+    // detection cannot reopen a mask the guard already gave up.
+    bool loop_door_lifted_   = false;
+    // Whether the door OPENED in this turn, surviving a lift. The answer watch
+    // (gap 1) keys on this: a turn whose door opened and was lifted before the
+    // close is still watched in its answer.
+    bool loop_door_opened_   = false;
     bool loop_forced_closer_ = false;
-    int  loop_since_detect_  = 0;   // counted lines since detection (door grace)
+    // counted line-equivalents since the detection: ended lines, and stretches
+    // of tokens without one while the door is open. Drives the door grace and
+    // `door` mode's lift budget.
+    int  loop_since_detect_  = 0;
+    // Generated tokens since the last counted line while the door is open; a
+    // full stretch counts as one line-equivalent for the budget (A).
+    int  loop_door_tokens_   = 0;
+    // Set for the lines a piece ends when the closer completes in the same
+    // piece: counted, but the ladder does not act, or a nudge lands in the
+    // answer after the block closed.
+    bool loop_suppress_escalation_ = false;
+    // The detector's last share. The token stretch judges recovery by it: no
+    // line ends in a stretch, so the share stands where the detector left it.
+    float loop_share_ = 0.0f;
     int  loop_self_closes_   = 0;
     int  loop_door_masked_   = 0;
     int  loop_door_eog_masked_ = 0;
-    // The masked ids' logits at mask time (id, logit), not the whole row: the
-    // count reads them against the candidate floor the draw's collection gives.
-    std::vector<std::pair<int, float>> door_masked_logits_;
-    std::vector<std::pair<int, float>> door_eog_masked_logits_;
+    // The masked ids' logits at mask time, not the whole row: the count reads
+    // them against the candidate floor the draw's collection gives.
+    std::vector<float> door_masked_logits_;
+    std::vector<float> door_eog_masked_logits_;
     int  loop_nudge_cursor_ = -1;   // next nudge id, -1 when none pending
     // Set when sample() returns the last nudge id: observe_think_ clears the
     // partial reasoning line after that piece is fed, so the sentence's tail

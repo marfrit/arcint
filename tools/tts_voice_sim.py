@@ -13,22 +13,20 @@ to safetensors there. This script loads that safetensors copy.
 Recipe (Apache-2.0, adapted from `huggingface/open-tts-leaderboard`
 `transformers/score_similarity.py`): the WavLM-Large backbone is an HF
 `WavLMModel` with the checkpoint's original-WavLM parameter names remapped
-onto it (no s3prl / torch.hub); the ECAPA-TDNN head is transcribed from
-UniSpeech `downstreams/speaker_verification/models/ecapa_tdnn.py` with
-upstream's module names so the checkpoint head loads strictly. Only the 256-d embedding is used; the training-time AM-softmax
-`loss_calculator.*` is dropped. One clip per forward pass (instance norm and
-attentive pooling take time-axis statistics, so batching would shift shorter
-clips). Cosine, as upstream. See `THIRD_PARTY.md`.
+onto it (no s3prl / torch.hub). The ECAPA-TDNN head is `tools/speaker_head.py`
+(Apache-2.0), written clean-room from a behavioural specification and the
+paper (Desplanques, Thienpondt, Demuynck, Interspeech 2020), whose state_dict
+carries the checkpoint's head keys, so the head loads strictly (a copy of this
+tool needs `speaker_head.py` beside it). Only the 256-d
+embedding is used; the training-time AM-softmax `loss_calculator.*` is
+dropped. One clip per forward pass (instance norm and attentive pooling take
+time-axis statistics, so batching would shift shorter clips). Cosine, as
+upstream. See `THIRD_PARTY.md`.
 
-Licence of this file: CC-BY-SA-3.0, not the repository's Apache-2.0. The
-ECAPA-TDNN head below is an adaptation of `microsoft/UniSpeech` (Copyright
-(c) Microsoft Corporation; licensed CC-BY-SA-3.0 by the LICENSE at that
-repository's root, https://creativecommons.org/licenses/by-sa/3.0/; upstream
-notes that part of its code is borrowed from `lawlict/ECAPA-TDNN`). Changes:
-the classes are transcribed without the torchaudio front end and the
-training-time loss, and wired to an HF `WavLMModel`. The leaderboard script
-this recipe follows labels the same head "MIT"; the UniSpeech LICENSE file
-says otherwise.
+Licence of this file: Apache-2.0, as the repository. The speaker model's
+weights are CC BY-SA 3.0 (the `bezzam/wavlm_large_finetune_seed_tts_eval`
+mirror of the UniSpeech checkpoint); they are staged operator-locally and not
+part of this repository.
 
     tts_voice_sim.py pair --a A.wav --b B.wav [--model X.safetensors]
     tts_voice_sim.py mean-vs-ref --ref R.wav --wav W1.wav [W2.wav ...]
@@ -52,6 +50,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_file
 from transformers import WavLMConfig, WavLMModel
+
+from speaker_head import SpeakerHead
 
 DEFAULT_MODEL = os.environ.get("ARCINT_SIM_MODEL", "")
 DEFAULT_CONFIG = "microsoft/wavlm-large"
@@ -95,123 +95,19 @@ def load_wav_16k_mono(path):
     return a
 
 
-# ── ECAPA-TDNN head, adapted from UniSpeech (CC-BY-SA-3.0), upstream's names ──
-class Res2Conv1dReluBn(nn.Module):
-    def __init__(self, channels, kernel_size=1, stride=1, padding=0, dilation=1, bias=True, scale=4):
-        super().__init__()
-        assert channels % scale == 0
-        self.scale, self.width = scale, channels // scale
-        self.nums = scale if scale == 1 else scale - 1
-        self.convs = nn.ModuleList(
-            nn.Conv1d(self.width, self.width, kernel_size, stride, padding, dilation, bias=bias)
-            for _ in range(self.nums))
-        self.bns = nn.ModuleList(nn.BatchNorm1d(self.width) for _ in range(self.nums))
+class WavLMSpeaker(nn.Module):
+    """WavLM-Large's hidden states (the input embedding and every layer)
+    stacked and handed to the ECAPA-TDNN head."""
 
-    def forward(self, x):
-        out, spx = [], torch.split(x, self.width, 1)
-        for i in range(self.nums):
-            sp = spx[i] if i == 0 else sp + spx[i]
-            sp = self.bns[i](F.relu(self.convs[i](sp)))
-            out.append(sp)
-        if self.scale != 1:
-            out.append(spx[self.nums])
-        return torch.cat(out, dim=1)
-
-
-class Conv1dReluBn(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=1, stride=1, padding=0, dilation=1, bias=True):
-        super().__init__()
-        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding, dilation, bias=bias)
-        self.bn = nn.BatchNorm1d(out_channels)
-
-    def forward(self, x):
-        return self.bn(F.relu(self.conv(x)))
-
-
-class SE_Connect(nn.Module):
-    def __init__(self, channels, se_bottleneck_dim=128):
-        super().__init__()
-        self.linear1 = nn.Linear(channels, se_bottleneck_dim)
-        self.linear2 = nn.Linear(se_bottleneck_dim, channels)
-
-    def forward(self, x):
-        out = x.mean(dim=2)
-        return x * torch.sigmoid(self.linear2(F.relu(self.linear1(out)))).unsqueeze(2)
-
-
-class SE_Res2Block(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, dilation, scale, se_bottleneck_dim):
-        super().__init__()
-        self.Conv1dReluBn1 = Conv1dReluBn(in_channels, out_channels, kernel_size=1)
-        self.Res2Conv1dReluBn = Res2Conv1dReluBn(out_channels, kernel_size, stride, padding, dilation, scale=scale)
-        self.Conv1dReluBn2 = Conv1dReluBn(out_channels, out_channels, kernel_size=1)
-        self.SE_Connect = SE_Connect(out_channels, se_bottleneck_dim)
-        self.shortcut = (nn.Conv1d(in_channels, out_channels, kernel_size=1)
-                         if in_channels != out_channels else None)
-
-    def forward(self, x):
-        residual = self.shortcut(x) if self.shortcut else x
-        x = self.Conv1dReluBn1(x)
-        x = self.Res2Conv1dReluBn(x)
-        x = self.Conv1dReluBn2(x)
-        x = self.SE_Connect(x)
-        return x + residual
-
-
-class AttentiveStatsPool(nn.Module):
-    def __init__(self, in_dim, attention_channels=128, global_context_att=False):
-        super().__init__()
-        self.global_context_att = global_context_att
-        in_ch = in_dim * 3 if global_context_att else in_dim
-        self.linear1 = nn.Conv1d(in_ch, attention_channels, kernel_size=1)
-        self.linear2 = nn.Conv1d(attention_channels, in_dim, kernel_size=1)
-
-    def forward(self, x):
-        if self.global_context_att:
-            cm = torch.mean(x, dim=-1, keepdim=True).expand_as(x)
-            cs = torch.sqrt(torch.var(x, dim=-1, keepdim=True) + 1e-10).expand_as(x)
-            x_in = torch.cat((x, cm, cs), dim=1)
-        else:
-            x_in = x
-        alpha = torch.softmax(self.linear2(torch.tanh(self.linear1(x_in))), dim=2)
-        mean = torch.sum(alpha * x, dim=2)
-        std = torch.sqrt((torch.sum(alpha * (x ** 2), dim=2) - mean ** 2).clamp(min=1e-9))
-        return torch.cat([mean, std], dim=1)
-
-
-class WavLMEcapaTdnn(nn.Module):
-    """ECAPA-TDNN over a softmax-weighted sum of WavLM-Large's 25 hidden states."""
-
-    def __init__(self, wavlm, feat_dim=1024, channels=512, emb_dim=256):
+    def __init__(self, wavlm, head):
         super().__init__()
         self.wavlm = wavlm
-        self.feat_num = 1 + wavlm.config.num_hidden_layers
-        self.feature_weight = nn.Parameter(torch.zeros(self.feat_num))
-        self.instance_norm = nn.InstanceNorm1d(feat_dim)
-        self.channels = [channels] * 4 + [1536]
-        self.layer1 = Conv1dReluBn(feat_dim, channels, kernel_size=5, padding=2)
-        self.layer2 = SE_Res2Block(channels, channels, 3, 1, 2, 2, 8, 128)
-        self.layer3 = SE_Res2Block(channels, channels, 3, 1, 3, 3, 8, 128)
-        self.layer4 = SE_Res2Block(channels, channels, 3, 1, 4, 4, 8, 128)
-        self.conv = nn.Conv1d(channels * 3, self.channels[-1], kernel_size=1)
-        self.pooling = AttentiveStatsPool(self.channels[-1], attention_channels=128)
-        self.bn = nn.BatchNorm1d(self.channels[-1] * 2)
-        self.linear = nn.Linear(self.channels[-1] * 2, emb_dim)
-
-    def get_feat(self, wav):
-        with torch.no_grad():
-            hidden = self.wavlm(wav, output_hidden_states=True).hidden_states
-        x = torch.stack(hidden, dim=0)
-        x = (F.softmax(self.feature_weight, dim=-1).view(-1, 1, 1, 1) * x).sum(dim=0)
-        return self.instance_norm(torch.transpose(x, 1, 2) + 1e-6)
+        self.head = head
 
     def forward(self, wav):
-        x = self.get_feat(wav)
-        o2, o3, o4 = self.layer2(self.layer1(x)), None, None
-        o3 = self.layer3(o2)
-        o4 = self.layer4(o3)
-        out = F.relu(self.conv(torch.cat([o2, o3, o4], dim=1)))
-        return self.linear(self.bn(self.pooling(out)))
+        with torch.no_grad():
+            hidden = self.wavlm(wav, output_hidden_states=True).hidden_states
+        return self.head(torch.stack(hidden, dim=0))
 
 
 def convert_wavlm_backbone_state_dict(orig, target_keys):
@@ -289,13 +185,11 @@ class Embedder:
         backbone = WavLMModel(cfg)
         state = load_file(model_path)
         backbone.load_state_dict(convert_wavlm_backbone_state_dict(state, set(backbone.state_dict())), strict=True)
-        self.model = WavLMEcapaTdnn(backbone, feat_dim=cfg.hidden_size)
-        head = {k: v for k, v in state.items()
-                if not k.startswith("feature_extract.") and not k.startswith("loss_calculator.")}
-        missing, unexpected = self.model.load_state_dict(head, strict=False)
-        stray = [k for k in missing if not k.startswith("wavlm.")]
-        if stray or unexpected:
-            raise RuntimeError(f"head key mismatch: missing {stray[:10]}; unexpected {list(unexpected)[:10]}")
+        head = SpeakerHead(num_states=1 + cfg.num_hidden_layers, feat_dim=cfg.hidden_size)
+        head.load_state_dict({k: v for k, v in state.items()
+                              if not k.startswith("feature_extract.") and not k.startswith("loss_calculator.")},
+                             strict=True)
+        self.model = WavLMSpeaker(backbone, head)
         self.model.to(device).eval()
         self.device = device
 

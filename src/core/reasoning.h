@@ -66,6 +66,10 @@ private:
     std::vector<std::pair<int, int>> ids_;
     int              close_id_ = -1;   // the closer id of the open block; -1 = text
     bool             closed_   = false;
+    // The block just closed and the answer has not started: the line breaks
+    // between the closer and the answer are layout and are dropped, as the
+    // non-streaming split drops them.
+    bool             content_start_ = false;
 };
 
 // The non-streaming split driven by the same (piece, id) sequence the streamer

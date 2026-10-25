@@ -18,6 +18,155 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.2.5 — 2026-10-25
+
+A fixes and clean-up release: the 1.2.4 release review's three loop-guard
+items, the round-1 follow-ups on the door's budget, and seven review leftovers
+from 1.2.2/1.2.3 on the serving path. Every switch stays **off by default**.
+With none set two things still change for clients: a streamed answer no
+longer starts with the line breaks that follow the think block's closer (as
+the non-streaming answer never did), and a `/v1/completions` prompt that ends
+inside an open think block starts the turn in the block, as chat does.
+
+- **The door's budget ends every open door (ladder)** — 1.2.4's ladder
+  escalated only on a line at or above the threshold, so a door opened at
+  detection whose share then fell below it held its masks to the token cap.
+  The ladder now decides at two budget points, `door_grace` counted lines
+  after the detection (the nudge point) and `grace` more (the slap point): a
+  share still at or above the low mark (threshold - 0.1) nudges, then slaps,
+  as before; a share below it means the model recovered, and the door lifts
+  its masks (latched) instead, with no nudge or slap, so a recovered turn
+  keeps its reasoning (operator, 2026-10-25). After a lift the door stays
+  shut and a renewed loop follows `ladder-nodoor`'s rule: a turn lifted at the
+  nudge point is nudged at the new detection and slapped on over lines; a turn
+  lifted at the slap point was already past its nudge, so the new detection
+  slaps at once. The answer stays watched in a turn whose door opened (also
+  after a lift), and `self_closes` counts only a close while a mask was
+  active. A lift is logged, with no counter of its own. `ladder-nodoor`,
+  `detect`, `nudge` and `slap` keep 1.2.3's semantics. (`code`)
+- Known residual (`code`, from the release review): a budget point reached by
+  the 64-token stretches (no counted line) decides on the last counted
+  share. A loop the detector cannot count (lines of 20 characters or less, or
+  no newline) after a varied stretch can therefore be lifted rather than
+  escalated and run on to the token cap, with the masks off, so the model
+  can still end the turn. 1.2.4 held the masks in that case.
+- **A ladder whose closer has no id lifts at the slap point** — on a
+  vocabulary whose closer is text the slap has nothing to force; the ladder
+  now lifts the door there instead of holding the masks. No served model is
+  affected (their closers are single tokens). (`code`)
+- **One opener check for chat and completions** — whether a rendered or raw
+  prompt ends inside an open think block is decided by one helper on the
+  shared tag table (every family when the artifact sets the extended tags,
+  the default family otherwise); no literal tag is left in the handlers, and
+  the chat path sets the extended flag before the check. The served templates'
+  result is unchanged, which a test pins. (`code`)
+- **`door` mode's budget** — `door` is the mask alone and has no nudge or slap,
+  so a mask could hold a turn to the cap on its own. After `door_grace +
+  grace` counted lines without a close, the door lifts its masks (the
+  multi-newline ids and the turn-ending ids it added) and says so once in the
+  log; the turn continues unguarded, as with the switch off. No new response
+  key, and a later detection does not reopen the lifted mask. (`code`)
+- **Door counters measure the sampled candidate set** — `door_masked` and
+  `door_eog_masked` count a step when a masked id would have been a candidate
+  of the draw. `candidate` is now the set the draw actually samples from, after
+  the row's truncation (top-k, top-p, min-p), for every `top_k` value: at
+  `top_k` 0 a top-p cutoff could exclude a finite masked logit and the old
+  code still counted it against the whole row. Observability only: the draw is
+  byte-identical, which a fixed-seed test pins. (`code`)
+- **The door's budget advances by tokens** — the budget counted ended lines
+  only. `loop_observe_` never ends a line without a newline and past its line
+  cap it truncates and keeps the line open, so a model that switched to
+  newline-free text never advanced the budget and the masks could again hold
+  the turn to the cap. Each stretch of 64 generated tokens with no counted
+  line now counts as one line-equivalent for the door's budget only — never
+  for the detector's window. 64 is conservative against the 15–25 tokens a
+  counted line costs, so a turn with lines keeps the line budget exactly.
+  (`code`)
+- **A lifted door is not reopened** — in `door` mode the budget's lift is
+  latched: a later detection leaves the masks off and the door counters do not
+  grow (the round-1 mutant that deleted the latch survived; the test now reds
+  with it deleted). The door's grace also starts at its opening, so a reopened
+  door cannot inherit a spent budget. (`code`)
+- **A stop string splitting a tag keeps the tag's id** — a stop string that
+  begins with the last bytes of the closer's text splits the closer's piece;
+  the released first part carries no id (ordinary text), and the id rides on
+  the part that stays held. Before, the held tail reached the tracker with id
+  -1, so the block stayed open and the answer came back as reasoning (1.2.2's
+  residual). Residual: the closer's released first part is text, so it shows at
+  the end of `reasoning_content`; the block closes and the answer is clean.
+  Avoiding it needs a stop matcher that knows the tags. (`code`)
+- **Streaming drops the line breaks after the closer** — the non-streaming
+  split (the reference) dropped them; the streamer kept them, so the two paths
+  disagreed on the same token stream. The streamer now drops leading line
+  breaks at the content's start, and only there: a reply with no block keeps
+  its content as generated. (`code`)
+- **The positional id fallback refuses a lossy pairing** — the flattened
+  open/close id lists are id sets; the backend drops a role's -1 entry, so an
+  id's index stops being its tag pair's index and zipping the two lists paired
+  an opener with another family's closer. The zip now only builds when every
+  pair contributed both ids, otherwise no pairing is built; the per-pair field
+  is the lossless source. (`code`)
+- **The detector and a closer in one piece** — on text-fallback vocabularies
+  the detector ran before the closer check: a piece that carried a counted
+  line and then the closer tripped the ladder and closed in the same call, so
+  the nudge landed in the answer. Only the bytes before a completing closer go
+  to the detector, and a detection or escalation on that line is counted but
+  does not act. (`code`)
+- **The slap forces the open family's closer** — its fallback forced the
+  flattened first close id, i.e. another tag family's closer, when an extended
+  pair had been opened by text. The slap now forces the closer of the family
+  that is open, or none when that family's closer is text. (`code`)
+- **`/v1/completions` gets the chat path's start state** — a raw prompt that
+  ends inside an open block starts the turn in the block, so the masks and the
+  loop guard watch it from the first sample; before, completions always started
+  undecided and such a turn ran unwatched. (`code`)
+- **Dead branch and log wording** — `loop_on_detect_`'s content branch was
+  dead (its only caller passes false; the content phase aborts elsewhere) and
+  is gone with its parameter. The loop-guard log lines said "lane:" without a
+  lane number; the sampler does not know the lane, so the word is gone.
+  (`code`)
+- **Clean-up, no behaviour change** — the dead `inclusive` parameter of the
+  two door counters removed, the unread id dropped from the stored masked
+  logits, one helper for the closer-strip warn/latch, the counter list in
+  handlers.cpp in one place, the `n == 0` draw spends the counters like the
+  greedy path, and `loop_guard_door_ladder` reads the door branches instead of
+  `loop_guard_is_ladder` carrying a second invisible condition. (`code`)
+- **The `loop_guard` object on the wire** — `loop_guard_json` returns a plain
+  `json` instead of an `ordered_json`: the response body is a plain `json`, so
+  the keys already landed alphabetically and the "last key" test checked a
+  property no client saw. The order test is replaced by one on the object as
+  it goes out: the serialized non-streaming response and the stream's finish
+  frame each carry all seven keys with their values. No change for clients.
+  (`code`)
+- **Tools** — `tools/clean_turns_gate.py` sends each arm's temperature (it
+  only printed it, so both arms ran at the unit's default row). The speaker
+  similarity tool `tools/tts_voice_sim.py` has a clean-room ECAPA-TDNN head,
+  `tools/speaker_head.py`, written from a behavioural specification and the
+  paper; the tool is Apache-2.0 again (it carried a CC BY-SA 3.0
+  transcription), and its gate number is unchanged: 0.598038 over the 46
+  clips, the cross pair 0.262419 (`measured-here`). `THIRD_PARTY.md` records
+  both the recipe and the checkpoint's licence.
+
+**Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (60
+patches), unchanged from 1.2.4; dependencies unchanged. `arcint-stt` (1.2.0)
+and `arcint-imggen` (1.1.1) are unchanged.
+
+**Release check** (`measured-here`, 2026-10-25, the pre-tag package): the
+device-free suite 329 cases and `ctest -L unit` 6/6, the package build's tests;
+the branch's mutations red (each new test against its named mutation). The
+Flash-Next speed A/B against 1.2.4 (the B60, IQ3_XXS with the served check's
+flags, 4 rounds, twice) failed the gate as written, both times on decode:
+first on spread (the one slow run, 37.3 t/s, was the one run with a
+different answer), then on speed, 38.52 against 38.05 t/s (38.50 against
+38.10 on the runs with the same answer); prefill equal in both (618.4 /
+618.8 and 618.3 / 618.6 t/s). The decode split of four more runs, old / new /
+old / new: the sampler 0.03 s an answer on both binaries, draft acceptance
+65.2-65.8 % and 116-117 verifies on both, the difference in the GPU verify
+time, and the old binary's own runs spanning 37.7-38.3 t/s against the new
+binary's 37.9-38.0. Read as run-to-run variation of the forward, not a cost of
+the release's code; the operator accepted the 1 % (2026-10-25). The guard's
+budget and lift are unit-tested only, not run on the card.
+
 ## 1.2.4 — 2026-10-25
 
 The loop guard gains a door rung; every switch stays **off by default**, and
@@ -77,8 +226,10 @@ includes the door (operator, 2026-10-24).
   threshold. If the door is open with `think_eog_mask` off and the share then
   falls below it without the model closing the block, nothing escalates and
   the turn-ending ids stay masked, so the turn runs to the token cap where
-  1.2.3 could have ended it. The counters `door_masked` and `door_eog_masked`
-  count against the whole row when `top_k` is 0 (observability only).
+  1.2.3 could have ended it (fixed in 1.2.5). The counters `door_masked` and
+  `door_eog_masked`
+  count against the whole row when `top_k` is 0 (observability only; fixed in
+  1.2.5).
 
 **Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (60
 patches), unchanged from 1.2.3; dependencies unchanged. `arcint-stt` (1.2.0)

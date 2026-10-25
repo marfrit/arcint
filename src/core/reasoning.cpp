@@ -183,7 +183,16 @@ ReasoningStreamer::Step ReasoningStreamer::push(std::string_view piece, int toke
         return push(rest, -1);
     }
     if (!in_reasoning_) {
-        step.content = std::string(piece);
+        // The line breaks between the closer and the answer are layout, not
+        // answer: the non-streaming split (the reference) drops them, so the
+        // stream drops them too -- otherwise the two paths disagree on the same
+        // token stream.
+        std::string text(piece);
+        if (content_start_) {
+            text = std::string(strip_leading_newlines(text));
+            if (!text.empty()) content_start_ = false;
+        }
+        step.content = std::move(text);
         return step;
     }
     // The block is open. With a closer id known, only that id closes it: no
@@ -193,6 +202,7 @@ ReasoningStreamer::Step ReasoningStreamer::push(std::string_view piece, int toke
         if (token_id == close_id_) {
             in_reasoning_ = false;
             closed_       = true;
+            content_start_ = true;
             buffer_.clear();
             return step;   // the closer's piece is the marker, not content
         }
@@ -213,6 +223,7 @@ ReasoningStreamer::Step ReasoningStreamer::push(std::string_view piece, int toke
     std::string_view rest(buffer_);
     rest.remove_prefix(at + close_.size());
     step.content = std::string(strip_leading_newlines(rest));
+    content_start_ = step.content.empty();
     buffer_.clear();
     in_reasoning_ = false;
     return step;

@@ -18,10 +18,11 @@ public:
     explicit StopMatcher(std::vector<std::string> stops);
 
     // A part of the emitted text that is one generated piece, whole, with
-    // that piece's token id, or part of one piece with id -1. Held text
-    // released together with a later piece keeps its own id this way: a
-    // consumer that decides by id (the think block's closer) sees the same
-    // (piece, id) sequence the backend produced, with or without stops.
+    // that piece's token id, or part of one piece with id -1. When a stop
+    // string splits a piece, the released first part has no id and the id
+    // rides on the LAST part: a consumer that decides by id (the think block's
+    // closer) sees the same tag id the backend produced, with or without
+    // stops, even when the tag's text is cut by a held stop tail.
     struct Segment {
         std::string text;
         int         id = -1;
@@ -49,8 +50,9 @@ private:
 
     std::vector<std::string> stops_;
     std::string              buffer_;
-    // buffer_'s bytes by the piece they came from, oldest first: {bytes, id},
-    // the id -1 once part of that piece has been released.
+    // buffer_'s bytes by the piece they came from, oldest first: {bytes, id};
+    // a piece split by a hold loses its id on the released part and keeps it
+    // on what remains held.
     std::vector<std::pair<size_t, int>> held_;
 };
 

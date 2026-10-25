@@ -28,6 +28,10 @@
 - Flash-Next's production quant is ISTA-DASLab's GSQ-RCO IQ3_S since
   2026-10-20 (operator): 33.3 t/s decode on six answers, KL 0.127 against
   Q8_0 (IQ3_XXS 38.0 t/s, 0.217, the rollback).
+- Version 1.2.5 (2026-10-25): fixes and clean-up: the door's budget lifts a
+  recovered turn's masks and nudges/slaps a looping one; the stream drops the
+  line breaks after the closer; /v1/completions starts inside an open block
+  like chat; a clean-room speaker head for the voice-similarity tool.
 - Version 1.2.4 (2026-10-25): the loop guard's door rung (multi-newline
   tokens masked in the open think block after a detection; ladder includes
   it; ladder-nodoor is 1.2.3's ladder); the coder unit runs the ladder.

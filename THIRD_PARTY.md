@@ -11,15 +11,14 @@ Vendored, single-header, licenses unchanged:
 Adapted (not verbatim) in `tools/tts_voice_sim.py`, a measuring tool no
 package ships: the speaker-similarity recipe from
 `huggingface/open-tts-leaderboard`'s `transformers/score_similarity.py`
-(Apache-2.0), and the ECAPA-TDNN head transcribed from `microsoft/UniSpeech`
-`downstreams/speaker_verification/models/ecapa_tdnn.py` (Copyright (c)
-Microsoft Corporation, **CC-BY-SA-3.0** by that repository's root LICENSE,
-unchanged since 2021; upstream credits `lawlict/ECAPA-TDNN` for part of it).
-The leaderboard script labels the head "MIT"; the UniSpeech LICENSE file
-does not. `tools/tts_voice_sim.py` is therefore licensed CC-BY-SA-3.0
-(https://creativecommons.org/licenses/by-sa/3.0/), with its changes named in
-its header; the rest of the repository stays Apache-2.0. The SIM model
-itself is not shipped (CC-BY-SA-3.0, operator-local).
+(Apache-2.0). Its ECAPA-TDNN head, `tools/speaker_head.py` (Apache-2.0), is a
+clean-room implementation from a behavioural specification and the paper
+(Desplanques, Thienpondt, Demuynck, "ECAPA-TDNN", Interspeech 2020), written
+without access to an existing implementation; it reproduces the checkpoint's
+embeddings (max |diff| below 1e-6 against the earlier transcription,
+`measured-here`). The speaker model's weights are not shipped: the
+`bezzam/wavlm_large_finetune_seed_tts_eval` mirror of the UniSpeech
+fine-tuned checkpoint, CC BY-SA 3.0, is staged operator-locally.
 
 Committed data: `tools/tts_sentences_de.json` holds 46 German sentences from
 **Tatoeba** (tatoeba.org), CC-BY 2.0 FR, attribution to Tatoeba and its

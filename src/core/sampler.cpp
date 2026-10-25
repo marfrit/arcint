@@ -16,6 +16,15 @@ namespace {
 // vocabulary, so a probe short of the top_p mass is seen and falls back.
 constexpr size_t kCandidateProbe = 2048;
 
+// The door's budget in tokens: a counted reasoning line costs 15-25 tokens on
+// a small model (a line counts above 20 characters, a token is 2-4 bytes), so
+// a stretch of 64 generated tokens without a counted line is several lines'
+// worth. Past it the budget advances by one line-equivalent: a model that
+// switches to newline-free text can then not hold the masks to the token cap.
+// Conservative on purpose: 64 makes the stretch slower than ordinary lines,
+// so a turn with lines keeps the line budget exactly.
+constexpr int kDoorStretchTokens = 64;
+
 }  // namespace
 
 Sampler::Sampler(const SamplerParams& params, uint64_t seed)
@@ -110,12 +119,24 @@ void Sampler::build_think_id_table() {
         }
         return;
     }
+    // The flattened lists are id SETS as the backend fills them: a pair whose
+    // role is text contributes no entry, so an id's index stops being its tag
+    // pair's index as soon as any role is skipped. Zipping two filtered lists
+    // would then pair an opener with another family's closer -- a wrong closer
+    // forced by a later slap is worse than no pairing at all. The zip is only
+    // meaningful when every pair contributed both ids; otherwise this
+    // test-only convenience builds nothing, and a caller with skipped roles
+    // must fill open_close_ids (the backend does).
+    const size_t pairs = std::max(params_.think_ids.open_tags.size(),
+                                  params_.think_ids.close_tags.size());
+    if (pairs == 0 || params_.think_ids.open_ids.size() != pairs
+        || params_.think_ids.close_ids.size() != pairs)
+        return;
     for (size_t i = 0; i < params_.think_ids.open_ids.size(); ++i) {
         const int oid = params_.think_ids.open_ids[i];
         if (oid < 0) continue;
         think_has_open_ids_ = true;
-        const int cid = i < params_.think_ids.close_ids.size() ? params_.think_ids.close_ids[i] : -1;
-        think_open_to_close_.emplace_back(oid, cid);
+        think_open_to_close_.emplace_back(oid, params_.think_ids.close_ids[i]);
     }
 }
 
@@ -136,7 +157,10 @@ void Sampler::start_in_think_block(bool open) {
     // closer in flight; the counters are per request too (a new Sampler per
     // request anyway, but this keeps a reused sampler honest).
     loop_door_open_     = false;
+    loop_door_lifted_   = false;
+    loop_door_opened_   = false;
     loop_forced_closer_ = false;
+    loop_door_tokens_   = 0;
     loop_since_detect_  = 0;
     loop_self_closes_   = 0;
     loop_door_masked_   = 0;
@@ -175,6 +199,56 @@ void Sampler::observe_think_(std::string_view piece, int token) {
     const bool forced_closer = loop_forced_closer_;
     loop_forced_closer_      = false;
 
+    // loop-guard: which bytes of this piece are reasoning, and whether a
+    // closer completes in it. The detector must not see the closer or the
+    // answer -- a piece that carries a line end and then the closer would
+    // otherwise trip the ladder, and the nudge would land in the answer after
+    // the block closed in the same call. Text-fallback vocabularies are the
+    // only case with bytes after the tag; an id closer marks its whole piece.
+    bool             closer_now   = false;
+    std::string_view reason_piece = piece;
+    if (params_.loop_guard != LoopGuardMode::Off && think_state_ == ThinkState::thinking) {
+        if (think_close_id_ >= 0) {
+            closer_now = token == think_close_id_;
+            if (closer_now) reason_piece = {};
+        } else {
+            const size_t    prior = think_tail_.size();
+            std::string     probe = think_tail_;
+            probe.append(piece);
+            size_t at = std::string::npos;
+            for (const std::string& t : params_.think_ids.close_tags) {
+                const size_t p = probe.find(t);
+                if (p != std::string::npos && (at == std::string::npos || p < at)) at = p;
+            }
+            if (at != std::string::npos) {
+                closer_now = true;
+                // Bytes of THIS piece before the closer; a closer already
+                // complete in the earlier tail would have closed in that piece.
+                const size_t len = at > prior ? at - prior : 0;
+                reason_piece     = std::string_view(piece).substr(0, std::min(len, piece.size()));
+            }
+        }
+    }
+
+    // The door's budget also advances by generated tokens, so a newline-free
+    // stretch cannot evade it (A of the round-1 review): each stretch of
+    // kDoorStretchTokens tokens with no counted line is one line-equivalent for
+    // the budget, never for the detector's window. Skipped when the closer is
+    // in this piece -- the block is closing, nothing needs the budget. It runs
+    // BEFORE the detector feeds, so a counted line in the same call resets the
+    // stretch it absorbed (the line, not the line plus one token).
+    if (params_.loop_guard != LoopGuardMode::Off && !closer_now && !forced_closer
+        && think_state_ == ThinkState::thinking && loop_door_open_) {
+        if (++loop_door_tokens_ >= kDoorStretchTokens) {
+            loop_door_tokens_ = 0;
+            ++loop_since_detect_;
+            if (loop_nudged_ && !loop_slapped_) ++loop_since_nudge_;
+            log::debug("loop-guard", "the door's budget advances by a %d-token stretch without a counted line",
+                       kDoorStretchTokens);
+            loop_escalate_(false);
+        }
+    }
+
     // loop-guard: feed the detector from the same piece stream the tracker
     // sees. Reasoning is watched while the block is open; the answer phase is
     // watched after a slap, and after a turn whose door opened (gap 1: the
@@ -189,9 +263,15 @@ void Sampler::observe_think_(std::string_view piece, int token) {
         // line.
         const bool nudge_done = loop_nudge_flush_;
         loop_nudge_flush_ = false;
+        // A line ended in this piece is counted, but the ladder does not act on
+        // it: the model is closing the block in the same call, so a nudge now
+        // would land in the answer. The turn still counts the detection.
+        const bool saved_suppress = loop_suppress_escalation_;
+        loop_suppress_escalation_ = closer_now;
         if (think_state_ == ThinkState::thinking
-            || (think_state_ == ThinkState::content && (loop_slapped_ || loop_door_open_)))
-            loop_observe_(piece);
+            || (think_state_ == ThinkState::content && (loop_slapped_ || loop_door_opened_)))
+            loop_observe_(reason_piece);
+        loop_suppress_escalation_ = saved_suppress;
         if (nudge_done) loop_line_.clear();
     }
 
@@ -203,7 +283,10 @@ void Sampler::observe_think_(std::string_view piece, int token) {
         // reasoning lines (including the loop that opened the door) must not
         // count as answer repeats, and an answer that restates a line or two
         // of its reasoning once is normal.
-        if (loop_door_open_ || loop_slapped_) loop_start_answer_();
+        // gap 1 keys on the door having OPENED in this turn, not on it still
+        // being open: a turn whose door was lifted before the close (recovered)
+        // is still watched in its answer.
+        if (loop_door_opened_ || loop_slapped_) loop_start_answer_();
         think_state_ = ThinkState::content;
         think_tail_.clear();
         think_lead_.clear();
@@ -305,7 +388,7 @@ void Sampler::observe_think_(std::string_view piece, int token) {
             // stale lead nor a tail remnant can re-open the block later.
             if (loop_door_open_ && !forced_closer) ++loop_self_closes_;
             // gap 1: same clean window at the text-closer close.
-            if (loop_door_open_ || loop_slapped_) loop_start_answer_();
+            if (loop_door_opened_ || loop_slapped_) loop_start_answer_();
             think_state_ = ThinkState::content;
             think_tail_.clear();
             think_lead_.clear();
@@ -400,10 +483,15 @@ void Sampler::loop_line_ended_(const std::string& raw_line) {
     if (!thinking && !content) return;
 
     if (thinking && loop_nudged_ && !loop_slapped_) ++loop_since_nudge_;
-    // door: counted lines since the detection moment. Incremented while the
-    // door is already open, so the detection line itself is zero and K = 0
-    // nudges on that line.
-    if (thinking && loop_door_open_) ++loop_since_detect_;
+    // door: counted lines since the detection moment, and the door (or the
+    // lift budget). Incremented while the door is already open, so the
+    // detection line itself is zero and K = 0 nudges on the first line after
+    // it. A counted line resets the token stretch it absorbed (A): the budget
+    // advances once per counted line, not once per line and stretch.
+    if (thinking && loop_door_open_) {
+        ++loop_since_detect_;
+        loop_door_tokens_ = 0;
+    }
     const bool exact_repeat = loop_seen_[line]++ > 0;
     bool       repeated     = exact_repeat;
     if (!exact_repeat && params_.loop_guard_match == LoopGuardMatch::Near) {
@@ -425,6 +513,10 @@ void Sampler::loop_line_ended_(const std::string& raw_line) {
     size_t repeats = 0;
     for (const LoopLine& l : loop_window_) repeats += l.repeated ? 1 : 0;
     const float share = static_cast<float>(repeats) / static_cast<float>(loop_window_.size());
+    // The last share the detector computed. The token stretch has no line to
+    // judge, so the ladder's recovery decision at that budget point reads this
+    // -- the share the detector stood at when the stretch began.
+    loop_share_      = share;
     const bool  over     = share >= params_.loop_guard_threshold;
     // Hysteresis: low is re-armed only below (threshold - 0.1). A nudge's own
     // new line pushes the share just under the threshold; that dip must not
@@ -438,46 +530,91 @@ void Sampler::loop_line_ended_(const std::string& raw_line) {
         if (crossing) {
             loop_low_ = false;
             ++loop_detections_;
-            log::info("loop-guard", "lane: reasoning loop detected: %zu of %zu recent lines repeat (%.2f), after %zu lines",
+            log::info("loop-guard", "reasoning loop detected: %zu of %zu recent lines repeat (%.2f), after %zu lines",
                       repeats, loop_window_.size(), share, loop_seen_.size());
-            loop_on_detect_(false);
+            // The detection is counted, but a closer completing in this same
+            // piece means the model is ending the block: no rung acts, or a
+            // nudge (or door) would land in the answer. B4.
+            if (!loop_suppress_escalation_) loop_on_detect_();
         }
-        // The door rung: the model may close by its own draw, so the ladder
-        // nudges only when the loop persists past the door grace. The nudge is
-        // never repeated; the slap keeps its own grace after the nudge.
-        if (over && loop_guard_is_ladder(params_.loop_guard) && loop_door_open_ && !loop_nudged_
-            && loop_since_detect_ >= params_.loop_guard_door_grace) {
-            loop_do_nudge_();
-        }
-        // The slap's grace keeps watching every over line, dips included: a
-        // share at/above the threshold after K counted lines still slaps.
-        if (over && loop_guard_is_ladder(params_.loop_guard) && loop_nudged_ && !loop_slapped_
-            && loop_since_nudge_ >= params_.loop_guard_grace) {
-            loop_do_slap_();
-        }
+        // Escalation, shared with the token stretch (A). A line ending in this
+        // piece while the closer is in it does not escalate: the model is
+        // closing the block, so a nudge would land in the answer.
+        if (!loop_suppress_escalation_) loop_escalate_(over);
     } else if (content && over && !loop_abort_) {
         loop_do_abort_();
     }
 }
 
-void Sampler::loop_on_detect_(bool content_phase) {
-    if (content_phase) {
-        if (loop_slapped_) loop_do_abort_();
-        return;
+// The door rung's escalation: by counted lines, and once the door is open by
+// the budget alone, not by the share. The door has changed the row the model
+// draws from, so the guard owns the turn's ending: a share that dips below the
+// threshold without a close must not leave the turn running to the token cap.
+// The nudge fires door_grace counted lines after the detection and the slap
+// grace counted lines after the nudge. ladder-nodoor never opens the door, so
+// there escalation stays on over lines (1.2.3's semantics). `door` mode has
+// neither rung: after door_grace + grace counted lines without a close it
+// lifts the masks, so a mask alone cannot hold the turn to the cap either.
+//
+// A turn that recovers (the share back below the low mark) does not escalate
+// at a budget point: the ladder lifts the door's masks instead, latched. The
+// masks were put there to end a loop; healthy reasoning needs no closer
+// forced in its middle. Below the LOW MARK, not merely below the threshold:
+// the hysteresis already treats the band between the two as still looping (a
+// dip just under the threshold must not re-arm a detection), so half-recovered
+// text keeps the door. From the lift on the turn is ladder-nodoor's rule: a
+// renewed loop escalates on over lines, without reopening the door.
+// A text-closer family has no id to force, so a slap that cannot force the
+// closer lifts the masks at the slap point instead of holding the turn to the
+// cap.
+void Sampler::loop_escalate_(bool over) {
+    const bool recovered = loop_share_ < params_.loop_guard_threshold - 0.1f;
+    if (loop_guard_door_ladder(params_.loop_guard) && loop_door_open_ && !loop_nudged_
+        && loop_since_detect_ >= params_.loop_guard_door_grace) {
+        if (recovered) loop_door_lift_();   // no nudge into healthy reasoning
+        else loop_do_nudge_();
     }
+    if (loop_guard_is_ladder(params_.loop_guard) && loop_nudged_ && !loop_slapped_
+        && loop_since_nudge_ >= params_.loop_guard_grace
+        && (over || loop_door_open_)) {
+        // Recovered at the slap point, or no closer id to force (text-closer
+        // family): lift the masks instead of forcing a close. Ladder-nodoor
+        // holds no mask, so it keeps its own slap path unchanged.
+        if (loop_door_open_ && (recovered || think_close_id_ < 0)) loop_door_lift_();
+        else loop_do_slap_();
+    }
+    if (params_.loop_guard == LoopGuardMode::Door && loop_door_open_
+        && loop_since_detect_ >= params_.loop_guard_door_grace + params_.loop_guard_grace) {
+        loop_door_lift_();
+    }
+}
+
+void Sampler::loop_on_detect_() {
     switch (params_.loop_guard) {
         case LoopGuardMode::Off:    return;
         case LoopGuardMode::Detect: return;   // counted and logged above
         case LoopGuardMode::Nudge:  loop_do_nudge_(); return;
         case LoopGuardMode::Slap:   loop_do_slap_(); return;
         case LoopGuardMode::Door:
-            // the mask alone; no injection, no forced token
-            loop_door_open_ = true;
+            // the mask alone; no injection, no forced token. A door the
+            // budget already lifted is not reopened: from the lift on the
+            // turn is the switch-off path (loop_door_lift_).
+            if (loop_door_lifted_) return;
+            loop_door_open_    = true;
+            loop_door_opened_  = true;   // survives a lift (the answer watch)
+            loop_door_tokens_  = 0;
+            loop_since_detect_ = 0;   // the door's grace starts at its opening
             return;
         case LoopGuardMode::Ladder:
-            // the door opens first; the nudge and slap follow by grace in
-            // loop_line_ended_ if the loop persists
-            loop_door_open_ = true;
+            // the door opens first; the nudge and slap follow by counted lines
+            // (loop_escalate_), or the door is lifted when the share recovers.
+            // After a lift the ladder is ladder-nodoor's rule: a renewed loop
+            // nudges at its detection, without reopening the door.
+            if (loop_door_lifted_) { loop_do_nudge_(); return; }
+            loop_door_open_    = true;
+            loop_door_opened_  = true;   // survives a lift (the answer watch)
+            loop_door_tokens_  = 0;
+            loop_since_detect_ = 0;   // the door's grace starts at its opening
             return;
         case LoopGuardMode::LadderNoDoor: loop_do_nudge_(); return;   // today's order
     }
@@ -508,7 +645,7 @@ void Sampler::loop_do_nudge_() {
     loop_nudge_cursor_ = 0;
     loop_since_nudge_  = 0;
     ++loop_nudges_;
-    log::info("loop-guard", "lane: nudge injected (%zu tokens), watching for %d more lines",
+    log::info("loop-guard", "nudge injected (%zu tokens), watching for %d more lines",
               params_.loop_guard_nudge_ids.size(), params_.loop_guard_grace);
 }
 
@@ -521,14 +658,27 @@ void Sampler::loop_do_slap_() {
     // slap must not count as the first answer lines (that would abort before
     // the model has said anything). Content lines are counted from here.
     loop_start_answer_();
-    log::info("loop-guard", "lane: slap: the think-block's closer is forced as the next token");
+    log::info("loop-guard", "slap: the think-block's closer is forced as the next token");
+}
+
+// `door` mode's budget: after door_grace + grace counted lines with the block
+// still open, the door lifts its masks so the turn cannot be held to the cap
+// by a mask alone. One log line, no counter, no response key: from here the
+// turn is the switch-off path.
+void Sampler::loop_door_lift_() {
+    loop_door_open_   = false;
+    loop_door_lifted_ = true;
+    loop_door_tokens_ = 0;
+    log::info("loop-guard", "the door lifts its masks after %d counted lines without a close; "
+                            "the turn continues unguarded",
+              loop_since_detect_);
 }
 
 void Sampler::loop_do_abort_() {
     if (loop_abort_) return;
     loop_abort_ = true;
     ++loop_aborts_;
-    log::warn("loop-guard", "lane: the answer phase is looping (after a slap or a door self-close); "
+    log::warn("loop-guard", "the answer phase is looping (after a slap or a door self-close); "
                             "ending the turn (finish loop)");
 }
 
@@ -552,19 +702,10 @@ void Sampler::mask_illegal_while_thinking(float* logits, size_t vocab) const {
     // stop id -- the mask would make the block unclosable and the turn could
     // end only at the length cap. The guard strips it from every source the
     // mask kills, and says so once.
-    auto is_closer = [&](int id) {
-        return std::find(params_.think_ids.close_ids.begin(), params_.think_ids.close_ids.end(), id)
-               != params_.think_ids.close_ids.end();
-    };
     auto kill = [&](const std::vector<int>& ids) {
         for (int id : ids) {
-            if (is_closer(id)) {
-                if (!closer_stripped_) {
-                    closer_stripped_ = true;
-                    log::warn("mask", "the think block's closer id %d is in the turn-ending set; "
-                                      "the mask leaves it offered so the block can close",
-                              id);
-                }
+            if (closer_in_masked_set_(id)) {
+                note_closer_stripped_(id);
                 continue;
             }
             if (id >= 0 && static_cast<size_t>(id) < vocab) logits[static_cast<size_t>(id)] = -INFINITY;
@@ -573,6 +714,23 @@ void Sampler::mask_illegal_while_thinking(float* logits, size_t vocab) const {
     if (!params_.ignore_eos) kill(params_.think_ids.eog);
     kill(params_.stop_token_ids);
     kill(params_.think_ids.open_ids);
+}
+
+// Review B3, shared by the two masks: is this id the closer of a family the
+// mask could kill? If so the mask leaves it offered -- the block could not
+// close otherwise -- and the warn is printed once per request, not once per
+// step.
+bool Sampler::closer_in_masked_set_(int id) const {
+    return std::find(params_.think_ids.close_ids.begin(), params_.think_ids.close_ids.end(), id)
+           != params_.think_ids.close_ids.end();
+}
+
+void Sampler::note_closer_stripped_(int id) const {
+    if (closer_stripped_) return;
+    closer_stripped_ = true;
+    log::warn("mask", "the think block's closer id %d is in the turn-ending set; "
+                      "the mask leaves it offered so the block can close",
+              id);
 }
 
 // loop-guard door: while the door is open and the block is open, the tokens
@@ -603,7 +761,7 @@ void Sampler::mask_door_while_thinking(float* logits, size_t vocab) {
         for (int id : params_.loop_guard_door_ids) {
             if (id < 0 || static_cast<size_t>(id) >= vocab) continue;
             const float l = logits[static_cast<size_t>(id)];
-            if (std::isfinite(l)) door_masked_logits_.emplace_back(id, l);
+            if (std::isfinite(l)) door_masked_logits_.push_back(l);
             logits[static_cast<size_t>(id)] = -INFINITY;
         }
     }
@@ -611,58 +769,50 @@ void Sampler::mask_door_while_thinking(float* logits, size_t vocab) {
     // Review B3, the same guard the think mask uses: the closer must never be
     // in the masked set, or the block becomes unclosable and the turn can end
     // only at the length cap. Latched with the think mask's warn.
-    auto is_closer = [&](int id) {
-        return std::find(params_.think_ids.close_ids.begin(), params_.think_ids.close_ids.end(), id)
-               != params_.think_ids.close_ids.end();
-    };
     for (int id : params_.think_ids.eog) {
-        if (is_closer(id)) {
-            if (!closer_stripped_) {
-                closer_stripped_ = true;
-                log::warn("mask", "the think block's closer id %d is in the turn-ending set; "
-                                  "the mask leaves it offered so the block can close",
-                          id);
-            }
+        if (closer_in_masked_set_(id)) {
+            note_closer_stripped_(id);
             continue;
         }
         if (id < 0 || static_cast<size_t>(id) >= vocab) continue;
         const float l = logits[static_cast<size_t>(id)];
-        if (std::isfinite(l)) door_eog_masked_logits_.emplace_back(id, l);
+        if (std::isfinite(l)) door_eog_masked_logits_.push_back(l);
         logits[static_cast<size_t>(id)] = -INFINITY;
     }
 }
 
-// loop-guard door counter: a masked id is "among the candidates" when its logit
-// at mask time is at or above the floor of the candidate set the draw uses --
-// the lowest logit collect_candidates kept for the effective row's top-k (or
-// the argmax on a greedy row). Whether the model would otherwise have taken it
-// is not knowable. The stored logits are the row before the penalties, the
-// floor is after them; a masked id whose penalty would have lowered it can
-// over-report, and that is the counter's documented slack. Consumed once per
-// sample(), so a grammar redraw does not count the same draw twice.
-void Sampler::count_door_masked_(float floor, bool inclusive) {
+// loop-guard door counter: "candidate" means a member of the candidate set the
+// draw samples from -- the tokens that survived the effective row's truncation
+// (top-k, top-p, min-p as that row has them; the single argmax on a greedy
+// row). A masked id is among them when its logit at mask time is at or above
+// that set's floor, the lowest surviving candidate. Not "any finite logit in
+// the row": at top_k 0 without a top-p cutoff the whole row is the set, but a
+// top-p cutoff makes it a prefix and an id below the prefix was never a
+// candidate. Whether the model would otherwise have taken it is not knowable.
+// The stored logits are the row before the penalties, the floor after them; a
+// masked id whose penalty would have lowered it can over-report, and that is
+// the counter's documented slack. Consumed once per sample(), so a grammar
+// redraw does not count the same draw twice.
+void Sampler::count_door_masked_(float floor) {
     if (door_masked_logits_.empty()) return;
-    bool in_topk = false;
-    for (const auto& [id, l] : door_masked_logits_) {
-        (void)id;
-        if (inclusive ? l >= floor : l > floor) in_topk = true;
-    }
+    bool in_set = false;
+    for (float l : door_masked_logits_)
+        if (l >= floor) in_set = true;
     door_masked_logits_.clear();
-    if (in_topk) ++loop_door_masked_;
+    if (in_set) ++loop_door_masked_;
 }
 
 // gap 2 counter: the end-of-generation ids the door removed while the block is
-// open, measured against the candidate floor of the draw's own collection. The
-// stored logits are the row at mask time; a token counts once per sample().
-void Sampler::count_door_eog_masked_(float floor, bool inclusive) {
+// open, measured against the floor of the candidate set the draw actually
+// samples from (after top-k/top-p/min-p truncation, as count_door_masked_ is).
+// The stored logits are the row at mask time; a token counts once per sample().
+void Sampler::count_door_eog_masked_(float floor) {
     if (door_eog_masked_logits_.empty()) return;
-    bool in_topk = false;
-    for (const auto& [id, l] : door_eog_masked_logits_) {
-        (void)id;
-        if (inclusive ? l >= floor : l > floor) in_topk = true;
-    }
+    bool in_set = false;
+    for (float l : door_eog_masked_logits_)
+        if (l >= floor) in_set = true;
     door_eog_masked_logits_.clear();
-    if (in_topk) ++loop_door_eog_masked_;
+    if (in_set) ++loop_door_eog_masked_;
 }
 
 int Sampler::argmax(const float* logits, size_t vocab) {
@@ -758,8 +908,11 @@ int Sampler::sample(float* logits, size_t vocab) {
         }
         if (loop_slap_pending_) {
             loop_slap_pending_ = false;
-            int closer = think_close_id_ >= 0 ? think_close_id_
-                         : (!params_.think_ids.close_ids.empty() ? params_.think_ids.close_ids.front() : -1);
+            // The closer of the family that is open, and only that one: a
+            // fallback to the first flattened close id would force another
+            // family's closer into the output. A family whose closer is text
+            // has no id to force, so the slap cannot force it.
+            const int closer = think_close_id_;
             if (closer >= 0 && static_cast<size_t>(closer) < vocab) {
                 loop_forced_closer_ = true;   // not the model's own draw
                 return closer;
@@ -825,15 +978,23 @@ int Sampler::draw(float* logits, size_t vocab) {
     // Penalties can reorder the distribution, so greedy is decided after them.
     if (row.temperature <= 0.0f || row.top_k == 1) {
         const int best = argmax(logits, vocab);
-        count_door_masked_(logits[static_cast<size_t>(best)], /*inclusive=*/true);
-        count_door_eog_masked_(logits[static_cast<size_t>(best)], /*inclusive=*/true);
+        count_door_masked_(logits[static_cast<size_t>(best)]);
+        count_door_eog_masked_(logits[static_cast<size_t>(best)]);
         return best;
     }
 
     for (int attempt = 0; attempt < 2; ++attempt) {
         const bool   probing = attempt == 0 && row.top_k <= 0 && kCandidateProbe < vocab;
         const size_t n       = collect_candidates(logits, vocab, attempt > 0, row.top_k);
-        if (n == 0) return argmax(logits, vocab);
+        if (n == 0) {
+            // No candidate at all (every logit -inf, e.g. a whole row masked):
+            // the draw is the argmax, so the counters are spent against it like
+            // the greedy path, not left stored for a later sample().
+            const int best = argmax(logits, vocab);
+            count_door_masked_(logits[static_cast<size_t>(best)]);
+            count_door_eog_masked_(logits[static_cast<size_t>(best)]);
+            return best;
+        }
 
         const float temp = row.temperature > 0.0f ? row.temperature : 1.0f;
         const float max  = scratch_.front().first;
@@ -892,12 +1053,17 @@ int Sampler::draw(float* logits, size_t vocab) {
         if (short_of_mass) continue;   // the full set next pass (this token only)
 
         // loop-guard door counter: the candidate set this draw actually samples
-        // from, now that the probe (if any) has settled to the full pass.
-        const float door_floor = scratch_.empty() ? -INFINITY : scratch_.back().first;
+        // from, now that the probe (if any) has settled to the full pass. That
+        // is the kept prefix after BOTH truncations: top-k (collect_candidates
+        // sized the set) and top-p/min-p (cutoff trims it). The floor is the
+        // last surviving candidate, so an id below it was never a candidate --
+        // at top_k 0 a top-p cutoff can exclude a finite masked logit, and
+        // counting the whole row there is what 1.2.4 did in error.
+        const float door_floor = scratch_[cutoff - 1].first;
         if (!door_masked_logits_.empty())
-            count_door_masked_(door_floor, /*inclusive=*/true);
+            count_door_masked_(door_floor);
         if (!door_eog_masked_logits_.empty())
-            count_door_eog_masked_(door_floor, /*inclusive=*/true);
+            count_door_eog_masked_(door_floor);
 
         double renorm = 0.0;
         for (size_t i = 0; i < cutoff; ++i) renorm += probs[i];
