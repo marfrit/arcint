@@ -14,7 +14,7 @@ here), `snippet` (only a search result could be read).
 | vLLM's Chinese blog, `blog.vllm.com.cn/2025/11/11/intel-arc-pro-b.html`; Zhihu `zhuanlan.zhihu.com/p/1971721550853014687` | Intel's vLLM on the Arc Pro B60: a persistent "zero-gap" MoE grouped GEMM claimed above 80 % of hardware efficiency, two SYCL groups per Xe core; sequence-parallel flash attention for long contexts | `paper` |
 | `sanmai.github.io/slop/2026/05/08/llama-cpp-batch-size-arc-b60.html` | llama.cpp SYCL on a B60: `-b 4096 -ub 2048` against the defaults (2048 / 512) +25-30 % prompt throughput on a 35B-A3B MoE, +8 % dense | `paper` |
 | `forum.level1techs.com/t/arc-pro-b60-for-local-llms/246971` | stock llama.cpp SYCL on a B60, a qwen35moe Q8_0: tg128 8.3 t/s, pp16384 111.6 t/s | `paper` |
-| LINUX DO `linux.do/t/topic/1849761` | a fused SYCL kernel for Qwen3.5's gated delta-net on the A770/A750 (single-token decode, fewer intermediate tensors); not compared with Vulkan | `snippet` (the forum serves a JavaScript challenge to every fetcher) |
+| LINUX DO `linux.do/t/topic/1849761` (2026-03-30, part 2 of a series) | a PyTorch XPU custom operator for Qwen3.5 on the A770/A750: one SYCL kernel for the gated delta-net's state update, its output, the per-head RMSNorm with `norm_weight` and the `silu(z)` gate; f16/bf16/f32 inputs, `beta`, `g`, the norm weight and the state in f32 (lower precision gave garbled text); Qwen3.5-9B BF16 12 t/s, first token 2 s (16 s the week before), 9.7 GB; part 3 (2026-04-17, MoE, "write your own operators") not read | `paper` (a copy of the page from the operator: the forum's Cloudflare challenge stops headless fetchers) |
 | CSDN (a 4 x B60 server with llama.cpp SYCL, Qwen3-32B), Tencent News (a 96 GB 4 x B60 review), CodeArts / AtomGit guides, EE Times China | multi-card setups and tuning guides; no kernel work | `paper` |
 | Bilibili, Gitee | nothing found in two passes | — |
 
@@ -53,6 +53,11 @@ dp4a; an XMX flash-attention kernel correct but slower (SLM/barrier stalls).
    2026-10-25); the agent's VRAM margin limits it.
 4. **The A770 kernel ceilings above** as targets for the coder's kernels
    (DPAS with independent accumulators; gather counts in the IQ paths).
+5. **The gated delta-net with its output norm and z-gate in one kernel**
+   (the LINUX DO operator, `paper`; Strata's `k_gdn_seq` with the gated norm
+   inside, `code`, `research-strata-qwen36.md`): the coder's re-count runs the
+   delta-net (0.35 ms a token) and then separate norm and gate kernels; a
+   fusion-campaign item, with the state kept in f32 as both do.
 
 The stock path is far behind ours on the B-series: 8.3 t/s for a qwen35moe
 Q8_0 on llama.cpp SYCL (`paper`) against arcint's coder at 44-79 t/s on the
