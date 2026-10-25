@@ -836,6 +836,15 @@ std::optional<HttpResult> prepare_completion(const Context& ctx, const json& bod
         return err;
     }
 
+    // The same start state the chat path gives the mask and the loop guard: a
+    // raw prompt that ends inside an open block starts the turn there, so the
+    // masks engage before the first sample and a loop in the reasoning is
+    // watched. Before this the completions path always started undecided, so a
+    // prompt the template had left open was never watched.
+    prep.input.think_open          = prep.req.prompt.ends_with(
+        think_tag_pairs(ctx.backend->status().think_tags_extended).front().first + "\n");
+    prep.input.think_tags_extended = ctx.backend->status().think_tags_extended;
+
     prep.id      = next_id("cmpl");
     prep.created = now_seconds();
     out          = std::move(prep);

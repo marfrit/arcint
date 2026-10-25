@@ -1745,3 +1745,52 @@ TEST(loop_guard_slap_forces_no_closer_from_another_family) {
     CHECK_EQ(row[5], -1.0f);
 }
 
+// (B6) The completions path gets the chat path's start state: a raw prompt that
+// ends inside an open block starts the turn in the block, so the masks and the
+// loop guard watch it from the first sample.
+TEST(completions_start_inside_an_open_block_like_chat) {
+    class StubBackend final : public Backend {
+    public:
+        StubBackend() {
+            st.id          = "stub";
+            st.served_id   = "stub";
+            st.n_ctx_train = kStubNCtxTrain;
+            st.loaded      = true;
+            st.stub        = true;
+            st.n_ctx       = 4096;
+        }
+        const ModelStatus& status() const override { return st; }
+        Tokenizer&         tokenizer() override { return tok_; }
+        std::string        render_chat(const ChatRequest&) const override { return {}; }
+        FinishReason generate(const GenerationInput&, int, const TokenCallback&,
+                              GenerationStats&) override {
+            return FinishReason::Stop;
+        }
+
+    private:
+        struct Tok final : public Tokenizer {
+            std::vector<int> encode(std::string_view) override { return {}; }
+            std::string      decode(const std::vector<int>&) override { return {}; }
+            std::string      decode_one(int) override { return {}; }
+            int              eos_id() const override { return 0; }
+        } tok_;
+        ModelStatus st;
+    };
+
+    Config cfg;
+    StubBackend backend;
+    api::Context ctx{&cfg, &backend, nullptr};
+
+    auto prepared = [&](const std::string& prompt) {
+        nlohmann::json body = {{"model", "stub"}, {"prompt", prompt}};
+        api::PreparedCompletion prep;
+        const auto err = api::prepare_completion(ctx, body, prep);
+        CHECK(!err.has_value());
+        return prep;
+    };
+
+    const std::string opener = think_tag_pairs(false)[0].first;
+    CHECK(prepared("a raw prompt").input.think_open == false);
+    CHECK(prepared("reasoning so far\n" + opener + "\n").input.think_open);
+    CHECK(prepared("reasoning so far\n" + opener).input.think_open == false);   // no newline
+}
