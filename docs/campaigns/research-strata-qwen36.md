@@ -77,17 +77,26 @@ matmuls, not by the weights. That is where Strata's fused kernels go.
 
 ## Transferable, ranked for the coder
 
-1. **Fewer launches a verify** (portable kernel structure): the fusions above,
-   in ggml-opencl, one at a time with the bit-identity check of 0049
-   (`feedback`: fusions must keep the rounding, or MTP acceptance moves). First
-   step owed: re-count the coder's launches a verify on the current series
-   and the device time outside matmuls and attention (`GGML_OPENCL_PROFILING`).
+1. **Re-count first** (a measurement, one profile window on the A770): the
+   coder's launches a verify on the current series and the device time
+   outside matmuls and attention (`GGML_OPENCL_PROFILING`). The ~2,034 is the
+   0002-era count; 0049 and 0051 removed some since.
 2. **Speculative-sampling acceptance** for sampled requests (`code` reference
    `q36_sampling.hpp:180-307`): the coder unit samples at 0.6; the gain is the
    acceptance difference between sample-and-compare and min(1, p/q), measured
    on the coder at its thinking row.
 3. **A draft gate on the coder** (`--llama-mtp-min-p`, built, used by
    Flash-Next): an A/B on the coder's unit flags, cheap.
+4. **The fusion campaign** (portable kernel structure), sized by item 1:
+   Strata's fused kernels as the reference, mapped onto the kernel-gap
+   campaign's open levers (B activation quantize, C routing chain, D the
+   shared-expert tail into the combine, E SwiGLU in the matvec epilogue, F the
+   recurrent state in place, G-I residual + norm and the q/k fusions),
+   estimated at 9-10 ms of a 26.5 ms coder step on the 0002-era trace
+   (`llama-engine-kernel-gap.md`, `measured-here`). One fusion at a time in
+   ggml-opencl, each with 0049's bit-identity check (a regrouped rounding
+   kept KL inside the bar but moved MTP acceptance) and the answer-level
+   bar; the implementation goes to a non-Qwen implementer (the house rule).
 
 Not transferable: the tensor-core attention, `cp.async`, stream priorities
 (CUDA), and the hybrid expert machinery (the coder is resident).
