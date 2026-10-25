@@ -135,10 +135,13 @@ public:
         // and a masked token sat in the row's top-k candidates.
         int self_closes = 0;
         int door_masked = 0;
+        // gap 2: draws at which an end-of-generation id was a finite candidate
+        // the door removed inside the open block (think_eog_mask off).
+        int door_eog_masked = 0;
     };
     LoopGuardCounts loop_guard_counts() const {
         return {loop_detections_, loop_nudges_, loop_slaps_, loop_aborts_,
-                loop_self_closes_, loop_door_masked_};
+                loop_self_closes_, loop_door_masked_, loop_door_eog_masked_};
     }
     // The answer phase kept looping after a slap: the caller ends the turn on
     // FinishReason::Loop instead of emitting another token. Latching: once set
@@ -211,6 +214,9 @@ private:
     // the logits the ids had at mask time. Consumes the stored pair list, so a
     // grammar redraw in the same sample() does not count twice.
     void   count_door_masked_(float floor, bool inclusive);
+    // gap 2's counter: the same test for the end-of-generation ids the door
+    // removed inside the open block, over the draw's own candidate set.
+    void   count_door_eog_masked_(float floor, bool inclusive);
     void   measure_think_tags();
     void   build_think_id_table();
     void   observe_think_(std::string_view piece, int token);
@@ -306,9 +312,11 @@ private:
     int  loop_since_detect_  = 0;   // counted lines since detection (door grace)
     int  loop_self_closes_   = 0;
     int  loop_door_masked_   = 0;
+    int  loop_door_eog_masked_ = 0;
     // The masked ids' logits at mask time (id, logit), not the whole row: the
     // count reads them against the candidate floor the draw's collection gives.
     std::vector<std::pair<int, float>> door_masked_logits_;
+    std::vector<std::pair<int, float>> door_eog_masked_logits_;
     int  loop_nudge_cursor_ = -1;   // next nudge id, -1 when none pending
     // Set when sample() returns the last nudge id: observe_think_ clears the
     // partial reasoning line after that piece is fed, so the sentence's tail

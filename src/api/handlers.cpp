@@ -86,27 +86,29 @@ std::string decode_suffix_for(const GenerationStats& stats) {
     // loop-guard: the ladder's counters, printed only when one moved, so a
     // request without the switch keeps exactly the line it always had.
     if (stats.loop_detections || stats.loop_nudges || stats.loop_slaps || stats.loop_aborts
-        || stats.loop_self_closes || stats.loop_door_masked) {
+        || stats.loop_self_closes || stats.loop_door_masked || stats.loop_door_eog_masked) {
         decode_suffix += log::format(" | loop guard: detected %d, nudged %d, slapped %d, aborted %d, "
-                                     "self-closed %d, door masked %d",
+                                     "self-closed %d, door masked %d, door EOG masked %d",
                                      stats.loop_detections, stats.loop_nudges, stats.loop_slaps,
-                                     stats.loop_aborts, stats.loop_self_closes, stats.loop_door_masked);
+                                     stats.loop_aborts, stats.loop_self_closes, stats.loop_door_masked,
+                                     stats.loop_door_eog_masked);
     }
     return decode_suffix;
 }
 
-nlohmann::json loop_guard_json(const GenerationStats& stats) {
-    return nlohmann::json{{"detections", stats.loop_detections},
+nlohmann::ordered_json loop_guard_json(const GenerationStats& stats) {
+    return nlohmann::ordered_json{{"detections", stats.loop_detections},
                 {"nudges", stats.loop_nudges},
                 {"slaps", stats.loop_slaps},
                 {"aborts", stats.loop_aborts},
                 {"self_closes", stats.loop_self_closes},
-                {"door_masked", stats.loop_door_masked}};
+                {"door_masked", stats.loop_door_masked},
+                {"door_eog_masked", stats.loop_door_eog_masked}};
 }
 
 bool loop_guard_moved(const GenerationStats& stats) {
     return stats.loop_detections || stats.loop_nudges || stats.loop_slaps || stats.loop_aborts
-           || stats.loop_self_closes || stats.loop_door_masked;
+           || stats.loop_self_closes || stats.loop_door_masked || stats.loop_door_eog_masked;
 }
 
 namespace {

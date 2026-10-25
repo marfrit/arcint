@@ -1155,3 +1155,93 @@ TEST(loop_guard_answer_unwatched_when_the_door_never_opened) {
         [&](int) { return Control::Continue; });
     CHECK(w.reason == FinishReason::Stop);
 }
+
+// Gap 2: the back door. With the door open and think_eog_mask off (the
+// coder-style config), the model can draw an end-of-generation id inside the
+// open think block and end the turn there: finish stop, empty content, no
+// self-close. The turn-ending ids are illegal while the door is open and the
+// block is open, applied to the logits before penalties and the draw. The
+// closer stays drawable (review B3).
+TEST(loop_guard_door_masks_eog_inside_the_open_block) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 5);
+    p.loop_guard_door_grace = 20;
+    p.loop_guard_door_ids   = {6, 7};
+    p.think_eog_mask        = false;   // the coder-style config
+    p.ignore_eos            = false;
+    // The closer is also a turn-ending id in this stub row: B3 must leave it
+    // offered so the block can close.
+    p.think_ids.eog = {0, 5};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    std::vector<float> row(8, -1.0f);
+    row[0] = 10.0f;   // the end-of-generation id at the top
+    row[5] = 9.0f;    // the block's closer, legal
+    row[6] = 7.0f;    // a multi-newline token, masked by the door
+    row[4] = 2.0f;    // the single newline
+    const int tok = s.sample(row.data(), row.size());
+    CHECK_EQ(tok, 5);                 // not the EOG, and the closer was drawable
+    CHECK(row[0] == -INFINITY);       // the EOG id is masked
+    CHECK(row[5] == 9.0f);            // B3: the closer is never masked
+    CHECK(s.loop_guard_counts().door_eog_masked >= 1);
+}
+
+// Gap 2, negative: the door shut (no detection) keeps today's behaviour --
+// with think_eog_mask off, an EOG inside the open block stays legal.
+TEST(loop_guard_door_shut_keeps_eog_legal) {
+    SamplerParams p = base_params(LoopGuardMode::Door, 10, 5);
+    p.loop_guard_door_ids = {6, 7};
+    p.think_eog_mask      = false;
+    p.ignore_eos          = false;
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    feed_lines(s, 0, 6, false);   // under the floor: no detection, door shut
+    CHECK_EQ(s.loop_guard_counts().detections, 0);
+
+    std::vector<float> row(8, -1.0f);
+    row[0] = 5.0f;   // the EOG id at the top
+    CHECK_EQ(s.sample(row.data(), row.size()), 0);
+    CHECK(row[0] == 5.0f);
+    CHECK_EQ(s.loop_guard_counts().door_eog_masked, 0);
+}
+
+// Gap 2 with ignore_eos: the request asked for the turn to run past EOG, so
+// the door does not mask it, and the counter stays 0.
+TEST(loop_guard_door_respects_ignore_eos_for_eog) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 5);
+    p.loop_guard_door_grace = 20;
+    p.loop_guard_door_ids   = {6, 7};
+    p.think_eog_mask        = false;
+    p.ignore_eos            = true;
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    std::vector<float> row(8, -1.0f);
+    row[0] = 5.0f;   // the EOG id at the top
+    CHECK_EQ(s.sample(row.data(), row.size()), 0);
+    CHECK(row[0] == 5.0f);
+    CHECK_EQ(s.loop_guard_counts().door_eog_masked, 0);
+}
+
+// The loop_guard object carries door_eog_masked last, after the keys 1.2.3 and
+// the door rung already had.
+TEST(loop_guard_json_carries_door_eog_masked_last) {
+    GenerationStats st;
+    st.loop_door_masked    = 3;
+    st.loop_door_eog_masked = 4;
+    const nlohmann::ordered_json j = api::loop_guard_json(st);
+    CHECK_EQ(j.at("door_masked").get<int>(), 3);
+    CHECK_EQ(j.at("door_eog_masked").get<int>(), 4);
+    CHECK_EQ(j.size(), 7u);
+    auto last = j.end();
+    --last;
+    CHECK_EQ(last.key(), std::string("door_eog_masked"));
+    const std::string line = api::decode_suffix_for(st);
+    CHECK(line.find("door EOG masked 4") != std::string::npos);
+}

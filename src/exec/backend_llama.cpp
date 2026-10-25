@@ -1929,10 +1929,13 @@ private:
         stats.loop_aborts      = c.aborts;
         stats.loop_self_closes = c.self_closes;
         stats.loop_door_masked = c.door_masked;
-        if (c.detections || c.nudges || c.slaps || c.aborts || c.self_closes || c.door_masked)
+        stats.loop_door_eog_masked = c.door_eog_masked;
+        if (c.detections || c.nudges || c.slaps || c.aborts || c.self_closes || c.door_masked
+            || c.door_eog_masked)
             log::info("loop-guard", "lane %d: detected %d, nudged %d, slapped %d, aborted %d, "
-                      "self-closed %d, door masked %d", seq,
-                      c.detections, c.nudges, c.slaps, c.aborts, c.self_closes, c.door_masked);
+                      "self-closed %d, door masked %d, door EOG masked %d", seq,
+                      c.detections, c.nudges, c.slaps, c.aborts, c.self_closes, c.door_masked,
+                      c.door_eog_masked);
     }
 
     // One llama_decode of n tokens of `seq` at positions [pos, pos + n), with

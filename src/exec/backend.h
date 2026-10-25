@@ -221,6 +221,9 @@ struct GenerationStats {
     // and draws whose top-k candidates held a masked multi-newline token.
     int    loop_self_closes  = 0;
     int    loop_door_masked  = 0;
+    // gap 2: draws whose candidates held an end-of-generation id the door
+    // removed inside the open block.
+    int    loop_door_eog_masked = 0;
     // Wall time spent copying the whole model state so a rejected draft can be
     // rolled back. On the stateful path this is the price of speculation.
     // What the prefix cache costs on the way in. It is the same host round-trip

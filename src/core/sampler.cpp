@@ -140,6 +140,7 @@ void Sampler::start_in_think_block(bool open) {
     loop_since_detect_  = 0;
     loop_self_closes_   = 0;
     loop_door_masked_   = 0;
+    loop_door_eog_masked_ = 0;
     // The closer of a template-opened block: the first pair's close id, or the
     // first flattened close id. -1 keeps the text fallback.
     int cid = -1;
@@ -581,16 +582,50 @@ void Sampler::mask_illegal_while_thinking(float* logits, size_t vocab) const {
 // row. The -inf writes stay here; only the counter moved. This keeps just the
 // masked ids' logits at mask time, not a copy of the row, and the draw reads
 // them once its candidate set exists (count_door_masked_).
+//
+// gap 2: the same window also makes the turn-ending ids illegal when the door
+// is open and think_eog_mask is off (the coder-style config). The door masks
+// the multi-newline tokens, and without this the model can take an EOG inside
+// the open block: the turn ends with finish `stop`, no content and no
+// self-close -- the back door. Only think_ids.eog is added (no client stop ids,
+// no open ids), never the closer (review B3), and never when ignore_eos is set.
+// With think_eog_mask on, mask_illegal_while_thinking already killed the same
+// EOG ids once, so this adds nothing and the result is the same mask.
 void Sampler::mask_door_while_thinking(float* logits, size_t vocab) {
     // Cleared every draw, so a forced-token return or a sparse candidate set
     // cannot read a stale pair from an earlier sample.
     door_masked_logits_.clear();
-    if (!loop_door_open_ || think_state_ != ThinkState::thinking) return;
-    if (params_.loop_guard_door_ids.empty() || vocab == 0) return;
-    for (int id : params_.loop_guard_door_ids) {
+    door_eog_masked_logits_.clear();
+    if (!loop_door_open_ || think_state_ != ThinkState::thinking || vocab == 0) return;
+    if (!params_.loop_guard_door_ids.empty()) {
+        for (int id : params_.loop_guard_door_ids) {
+            if (id < 0 || static_cast<size_t>(id) >= vocab) continue;
+            const float l = logits[static_cast<size_t>(id)];
+            if (std::isfinite(l)) door_masked_logits_.emplace_back(id, l);
+            logits[static_cast<size_t>(id)] = -INFINITY;
+        }
+    }
+    if (params_.think_eog_mask || params_.ignore_eos) return;
+    // Review B3, the same guard the think mask uses: the closer must never be
+    // in the masked set, or the block becomes unclosable and the turn can end
+    // only at the length cap. Latched with the think mask's warn.
+    auto is_closer = [&](int id) {
+        return std::find(params_.think_ids.close_ids.begin(), params_.think_ids.close_ids.end(), id)
+               != params_.think_ids.close_ids.end();
+    };
+    for (int id : params_.think_ids.eog) {
+        if (is_closer(id)) {
+            if (!closer_stripped_) {
+                closer_stripped_ = true;
+                log::warn("mask", "the think block's closer id %d is in the turn-ending set; "
+                                  "the mask leaves it offered so the block can close",
+                          id);
+            }
+            continue;
+        }
         if (id < 0 || static_cast<size_t>(id) >= vocab) continue;
         const float l = logits[static_cast<size_t>(id)];
-        if (std::isfinite(l)) door_masked_logits_.emplace_back(id, l);
+        if (std::isfinite(l)) door_eog_masked_logits_.emplace_back(id, l);
         logits[static_cast<size_t>(id)] = -INFINITY;
     }
 }
@@ -612,6 +647,20 @@ void Sampler::count_door_masked_(float floor, bool inclusive) {
     }
     door_masked_logits_.clear();
     if (in_topk) ++loop_door_masked_;
+}
+
+// gap 2 counter: the end-of-generation ids the door removed while the block is
+// open, measured against the candidate floor of the draw's own collection. The
+// stored logits are the row at mask time; a token counts once per sample().
+void Sampler::count_door_eog_masked_(float floor, bool inclusive) {
+    if (door_eog_masked_logits_.empty()) return;
+    bool in_topk = false;
+    for (const auto& [id, l] : door_eog_masked_logits_) {
+        (void)id;
+        if (inclusive ? l >= floor : l > floor) in_topk = true;
+    }
+    door_eog_masked_logits_.clear();
+    if (in_topk) ++loop_door_eog_masked_;
 }
 
 int Sampler::argmax(const float* logits, size_t vocab) {
@@ -775,6 +824,7 @@ int Sampler::draw(float* logits, size_t vocab) {
     if (row.temperature <= 0.0f || row.top_k == 1) {
         const int best = argmax(logits, vocab);
         count_door_masked_(logits[static_cast<size_t>(best)], /*inclusive=*/true);
+        count_door_eog_masked_(logits[static_cast<size_t>(best)], /*inclusive=*/true);
         return best;
     }
 
@@ -841,9 +891,11 @@ int Sampler::draw(float* logits, size_t vocab) {
 
         // loop-guard door counter: the candidate set this draw actually samples
         // from, now that the probe (if any) has settled to the full pass.
+        const float door_floor = scratch_.empty() ? -INFINITY : scratch_.back().first;
         if (!door_masked_logits_.empty())
-            count_door_masked_(scratch_.empty() ? -INFINITY : scratch_.back().first,
-                               /*inclusive=*/true);
+            count_door_masked_(door_floor, /*inclusive=*/true);
+        if (!door_eog_masked_logits_.empty())
+            count_door_eog_masked_(door_floor, /*inclusive=*/true);
 
         double renorm = 0.0;
         for (size_t i = 0; i < cutoff; ++i) renorm += probs[i];
