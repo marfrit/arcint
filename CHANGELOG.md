@@ -22,8 +22,11 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
 A fixes and clean-up release: the 1.2.4 release review's three loop-guard
 items, the round-1 follow-ups on the door's budget, and seven review leftovers
-from 1.2.2/1.2.3 on the serving path. Every switch stays **off by default** and
-a request with none set is served as in 1.2.4.
+from 1.2.2/1.2.3 on the serving path. Every switch stays **off by default**.
+With none set two things still change for clients: a streamed answer no
+longer starts with the line breaks that follow the think block's closer (as
+the non-streaming answer never did), and a `/v1/completions` prompt that ends
+inside an open think block starts the turn in the block, as chat does.
 
 - **The door owns the turn's ending (ladder)** — once the door is open the
   escalation goes by budget, not by the repeat share: the nudge fires
@@ -67,7 +70,9 @@ a request with none set is served as in 1.2.4.
   the released first part carries no id (ordinary text), and the id rides on
   the part that stays held. Before, the held tail reached the tracker with id
   -1, so the block stayed open and the answer came back as reasoning (1.2.2's
-  residual). (`code`)
+  residual). Residual: the closer's released first part is text, so it shows at
+  the end of `reasoning_content`; the block closes and the answer is clean.
+  Avoiding it needs a stop matcher that knows the tags. (`code`)
 - **Streaming drops the line breaks after the closer** — the non-streaming
   split (the reference) dropped them; the streamer kept them, so the two paths
   disagreed on the same token stream. The streamer now drops leading line
@@ -111,6 +116,14 @@ a request with none set is served as in 1.2.4.
   it goes out: the serialized non-streaming response and the stream's finish
   frame each carry all seven keys with their values. No change for clients.
   (`code`)
+- **Tools** — `tools/clean_turns_gate.py` sends each arm's temperature (it
+  only printed it, so both arms ran at the unit's default row). The speaker
+  similarity tool `tools/tts_voice_sim.py` has a clean-room ECAPA-TDNN head,
+  `tools/speaker_head.py`, written from a behavioural specification and the
+  paper; the tool is Apache-2.0 again (it carried a CC BY-SA 3.0
+  transcription), and its gate number is unchanged: 0.598038 over the 46
+  clips, the cross pair 0.262419 (`measured-here`). `THIRD_PARTY.md` records
+  both the recipe and the checkpoint's licence.
 
 ## 1.2.4 — 2026-10-25
 
