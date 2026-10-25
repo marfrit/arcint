@@ -1,3 +1,15 @@
+arcint (1.2.4-1) trixie; urgency=medium
+
+  * 1.2.4: the loop guard's door rung (--loop-guard door|ladder|ladder-nodoor,
+    --loop-guard-door-grace): after a detection the multi-newline tokens are
+    masked in the open think block, so the model can close it by its own
+    draw; ladder now includes the door; the answer is watched after a door
+    self-close; no end of turn inside the open block while the door is open.
+    All off by default. Runtime and dependencies unchanged (llama.cpp
+    3e4dfa8, 60 patches).
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 25 Oct 2026 12:00:00 +0200
+
 arcint (1.2.3-1) trixie; urgency=medium
 
   * 1.2.3: a loop guard for small models (--loop-guard

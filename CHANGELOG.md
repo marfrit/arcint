@@ -18,7 +18,7 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
-## 1.2.4 (unreleased)
+## 1.2.4 — 2026-10-25
 
 The loop guard gains a door rung; every switch stays **off by default**, and
 with none set a request is served as in 1.2.3. The coder unit's ladder now
@@ -65,9 +65,33 @@ includes the door (operator, 2026-10-24).
   alone within seconds of opening and 2 after the nudge, and no forced token
   was needed in the whole round. The same set without the door needed the
   slap 4 times. README, "New: loop guard for small models".
-- `ladder` now includes the door, so on a unit that set `ladder` in 1.2.3
-  the nudge waits the door grace (20 counted lines) instead of landing at
-  detection; `ladder-nodoor` restores 1.2.3's order.
+- `ladder` now includes the door. On a unit that set `ladder` in 1.2.3 a
+  detection now (a) waits the door grace (20 counted lines) before the nudge
+  instead of nudging at once, (b) masks the multi-newline tokens until the
+  block closes, (c) with `think_eog_mask` off also masks the turn-ending ids
+  in the open block, and (d) watches the answer after the model's own close,
+  so a turn that 1.2.3 recovered with the nudge and an unwatched answer can
+  now end on `loop`. `ladder-nodoor` restores 1.2.3's ladder.
+- Known residual (`code`, from the release review, not observed): the nudge
+  and the slap fire only on a line where the repeat share is at or above the
+  threshold. If the door is open with `think_eog_mask` off and the share then
+  falls below it without the model closing the block, nothing escalates and
+  the turn-ending ids stay masked, so the turn runs to the token cap where
+  1.2.3 could have ended it. The counters `door_masked` and `door_eog_masked`
+  count against the whole row when `top_k` is 0 (observability only).
+
+**Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (60
+patches), unchanged from 1.2.3; dependencies unchanged. `arcint-stt` (1.2.0)
+and `arcint-imggen` (1.1.1) are unchanged.
+
+**Release check** (2026-10-25): the device-free suite 305 cases and `ctest
+-L unit` 6/6 on the tagged tree, the package build's own tests; the
+mutations of the gap fixes red (`measured-here`, on the branch). The card
+numbers above and the answer watch's offline replay (0 of 391 recorded
+non-loop answers would abort) are from dev builds of the same mechanism. Not
+run on the release candidate, by the operator's decision: the same-window
+speed A/B against 1.2.3 and the acceptance task; every switch off is 1.2.3's
+path (`code`).
 
 ## 1.2.3 — 2026-10-24
 
