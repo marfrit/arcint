@@ -41,8 +41,11 @@ before anything is injected.
   `--loop-guard-door-grace` more counted lines (default 20) if the loop
   persists; the slap keeps its own grace after the nudge (40). When the block
   closes the door is gone; content is never touched.
-- **abort:** if the answer phase itself loops after a slap, end the turn on a
-  distinct finish reason, `loop`.
+- **abort:** if the answer phase itself loops after a slap, or after a turn
+  in which the door opened (the model closed the block itself), end the turn on
+  a distinct finish reason, `loop`. The answer's detector starts from a clean
+  window and memories at the block's close, so reasoning lines do not count
+  against it.
 - **Switches:** `--loop-guard off|detect|nudge|slap|door|ladder|ladder-nodoor`
   (default off), `--loop-guard-match exact|near` (near),
   `--loop-guard-window N` (200), `--loop-guard-threshold T` (0.8),
@@ -57,7 +60,9 @@ before anything is injected.
   block closed by the model's own draw while the door was open, not by a slap)
   and `door_masked` (draws at which the mask was active and a masked token sat
   in the row's top-k candidates; whether the model would otherwise have taken
-  it is not knowable) in the per-request stats (the decode line), a
+  it is not knowable), and `door_eog_masked` (the same, for an
+  end-of-generation id the door removed inside the open block) last after
+  `door_masked`, in the per-request stats (the decode line), a
   `loop_guard` object in the response, and the mode, thresholds and
   `door_grace` in `/props`.
 
@@ -131,6 +136,13 @@ line six times), and the abort ended it without a program (the screening,
 guard off, had answered it partly wrong). In all, 21 of 21: 19 fully correct,
 1 wrong with no guard event, 1 aborted on a real loop. The operator keeps the
 full ladder on the coder.
+
+Two gaps the operator measured on the door rung are closed in 1.2.4, both
+unit-tested: the answer is watched after a door self-close (the content-phase
+abort, from a clean window at the block's close), and the turn cannot end
+inside the open block while the door is open (`door_eog_masked`, last after
+`door_masked`, counts the removed end-of-generation draws; the closer stays
+drawable and `ignore_eos` turns the mask off).
 
 Door card run (`measured-here`, 2026-10-24, the same coder and window,
 seed 1, 64k cap, `ladder` with the door; the 9 tasks that had hit the cap):

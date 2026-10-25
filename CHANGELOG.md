@@ -42,6 +42,22 @@ includes the door (operator, 2026-10-24).
   (the model's own close while the mask was open, not a slap) and
   `door_masked` (draws at which a masked token sat in the row's candidate
   set). `/props` reports the mode and `door_grace`.
+- **Answer watched after a door self-close** — after a turn in which the door
+  opened, the content phase feeds the detector too, and a looping answer ends
+  on `finish_reason` `loop` exactly as after a slap. The answer starts from a
+  clean window at the block's close, so reasoning lines (including the loop
+  that opened the door) do not count against it; an answer that restates a
+  line or two of its reasoning once stays normal. A turn whose door never
+  opened keeps 1.2.3's unwatched answer, and `detect`/`nudge`/`slap` never
+  open the door.
+- **No end of turn inside the open block** — while the door is open and the
+  think block is open, the turn-ending ids are illegal next tokens, applied to
+  the logits in the same place as the newline mask (before penalties and the
+  draw); the closer is never masked, and `ignore_eos` turns it off. With
+  `think_eog_mask` set the mask is the same one and applied once. The
+  `loop_guard` object and the decode line add `door_eog_masked`, last after
+  `door_masked`: draws at which an end-of-generation id was a finite candidate
+  the door removed.
 - **The door on the card** (`measured-here`, the coder on the A770, its
   model card's thinking row, seed 1, 64k cap). On the 9 tasks that had hit
   the cap in the screening, with the door in the ladder all 7 looping runs

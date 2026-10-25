@@ -104,7 +104,14 @@ block closes. `--loop-guard door` is the mask alone (never nudge or slap),
 `ladder` includes the door, `ladder-nodoor` is 1.2.3's ladder exactly (the
 nudge at detection, no mask), so one binary can compare both;
 `--loop-guard-door-grace` (default 20) is the counted lines after detection
-before the nudge, and `/props` reports it. The response's `loop_guard` object
+before the nudge, and `/props` reports it.
+After a turn in which the door opened, the answer is watched too, so a looping
+answer ends the turn on `loop` from a clean detector window at the block's
+close, and restating a line or two of the reasoning once stays normal. While
+the door is open and the block is open, the turn-ending ids are also masked
+(never the closer, and not under `ignore_eos`), so the model cannot end the
+turn inside the open block, and `door_eog_masked` counts the draws that
+removed one. The response's `loop_guard` object
 counts `self_closes` (the block closed by the model's own draw while the mask
 was open, not by a slap) and `door_masked` (draws at which the mask was active
 and a masked token sat in the row's candidate set).
