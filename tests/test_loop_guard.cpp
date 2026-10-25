@@ -2007,3 +2007,78 @@ TEST(completions_start_inside_an_open_block_like_chat) {
     CHECK(prepared("reasoning so far\n" + opener).input.think_open == false);   // no newline
 }
 
+// (3) One opener check for both paths, built on the shared tag table. The chat
+// path and /v1/completions agree on the start state: a prompt ending in the
+// default family's opener, in an extended family's opener (when the artifact
+// answers to the wider family), and a plain prompt that ends in no block. With
+// the default family only the Qwen pair is checked, so the served templates'
+// behaviour is unchanged.
+TEST(opener_start_state_is_one_helper_for_chat_and_completions) {
+    class StubBackend final : public Backend {
+    public:
+        StubBackend(std::string prompt, bool extended) : prompt_(std::move(prompt)) {
+            st.id          = "stub";
+            st.served_id   = "stub";
+            st.n_ctx_train = kStubNCtxTrain;
+            st.loaded      = true;
+            st.stub        = true;
+            st.n_ctx       = 4096;
+            st.think_tags_extended = extended;
+        }
+        const ModelStatus& status() const override { return st; }
+        Tokenizer&         tokenizer() override { return tok_; }
+        std::string        render_chat(const ChatRequest&) const override { return prompt_; }
+        FinishReason generate(const GenerationInput&, int, const TokenCallback&,
+                              GenerationStats&) override {
+            return FinishReason::Stop;
+        }
+
+    private:
+        struct Tok final : public Tokenizer {
+            std::vector<int> encode(std::string_view) override { return {}; }
+            std::string      decode(const std::vector<int>&) override { return {}; }
+            std::string      decode_one(int) override { return {}; }
+            int              eos_id() const override { return 0; }
+        } tok_;
+        std::string prompt_;
+        ModelStatus st;
+    };
+
+    Config cfg;
+    auto start_state = [&](const std::string& prompt, bool extended) {
+        StubBackend backend(prompt, extended);
+        api::Context ctx{&cfg, &backend, nullptr};
+
+        nlohmann::json chat = {{"model", "stub"},
+                               {"messages", nlohmann::json::array({{{"role", "user"}, {"content", "hi"}}})}};
+        api::PreparedChat cp;
+        const auto chat_err = api::prepare_chat(ctx, chat, cp);
+        CHECK(!chat_err.has_value());
+
+        nlohmann::json comp = {{"model", "stub"}, {"prompt", prompt}};
+        api::PreparedCompletion pp;
+        const auto comp_err = api::prepare_completion(ctx, comp, pp);
+        CHECK(!comp_err.has_value());
+
+        CHECK_EQ(cp.input.think_open, pp.input.think_open);   // one helper, no disagreement
+        return cp.input.think_open;
+    };
+
+    const auto& pairs = think_tag_pairs(true);
+    const std::string default_open = pairs[0].first + "\n";
+    const std::string extended_open = pairs[1].first + "\n";
+
+    // The default template: unchanged (only the Qwen pair is checked).
+    CHECK(start_state("reasoning so far\n" + default_open, false));
+    CHECK(!start_state("just an answer", false));
+    CHECK(!start_state("an answer ending in words", false));
+
+    // Setting the default family: the wider family's opener is NOT the start
+    // state, exactly today's behaviour for a non-extended artifact.
+    CHECK(!start_state("reasoning so far\n" + extended_open, false));
+
+    // An artifact that answers to the wider family: that opener starts open.
+    CHECK(start_state("reasoning so far\n" + extended_open, true));
+    CHECK(start_state("reasoning so far\n" + default_open, true));
+    CHECK(!start_state("just an answer", true));
+}

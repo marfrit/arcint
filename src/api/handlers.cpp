@@ -29,6 +29,15 @@ double decode_other_seconds(const GenerationStats& stats) {
 // The decode line's conditional terms, extracted from log_stats (review B4
 // follow-up) so the stats wiring is unit-testable at the struct level: the
 // value decode_suffix_for returns is the one that lands on the line.
+bool prompt_ends_inside_think_block(std::string_view prompt, bool extended_tags) {
+    // Built on think_tag_pairs(), the one table the split and the sampler's mask
+    // read, so no marker is written out here.
+    for (const auto& [open, close] : think_tag_pairs(extended_tags)) {
+        if (prompt.ends_with(open + "\n")) return true;
+    }
+    return false;
+}
+
 // One list for the two consumers: the decode line prints the counters when one
 // moved, and the response carries the object on the same condition. An eighth
 // counter is added here, once.
@@ -774,8 +783,8 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
     const std::string prompt = ctx.backend->render_chat(prep.req);
     // The template decides whether the answer starts inside a think block; the
     // split of reasoning from content below follows that, not a guess.
-    prep.think_open = prompt.ends_with("<think>\n");
     prep.think_tags_extended = ctx.backend->status().think_tags_extended;
+    prep.think_open = prompt_ends_inside_think_block(prompt, prep.think_tags_extended);
     // The split, like the backend's mask, decides the block by token id where
     // the artifact's vocabulary spells a tag as one special token.
     prep.think_ids = ctx.backend->think_block_ids(prep.think_tags_extended);
@@ -843,9 +852,9 @@ std::optional<HttpResult> prepare_completion(const Context& ctx, const json& bod
     // masks engage before the first sample and a loop in the reasoning is
     // watched. Before this the completions path always started undecided, so a
     // prompt the template had left open was never watched.
-    prep.input.think_open          = prep.req.prompt.ends_with(
-        think_tag_pairs(ctx.backend->status().think_tags_extended).front().first + "\n");
     prep.input.think_tags_extended = ctx.backend->status().think_tags_extended;
+    prep.input.think_open          = prompt_ends_inside_think_block(
+        prep.req.prompt, ctx.backend->status().think_tags_extended);
 
     prep.id      = next_id("cmpl");
     prep.created = now_seconds();

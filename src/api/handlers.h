@@ -6,6 +6,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -120,6 +121,15 @@ double decode_other_seconds(const GenerationStats& stats);
 // lands on the line, extracted from log_stats so the wiring is unit-testable
 // at the struct level.
 std::string decode_suffix_for(const GenerationStats& stats);
+// Whether a rendered prompt ends inside an think block: it ends with one tag
+// family's opener and the newline the templates put after it. The chat path
+// and /v1/completions ask this one function, built on the shared tag table, so
+// they cannot disagree about the start state. With `extended_tags` every
+// family's opener is checked -- a template that opens with a wider family's
+// tag ends inside the block the same way; with the default family only the
+// Qwen pair is checked, exactly as the chat path always did.
+bool prompt_ends_inside_think_block(std::string_view prompt, bool extended_tags);
+
 // loop-guard: the per-request counters as the response's `loop_guard` object.
 // Exposed so the stats-to-JSON wiring is unit-testable without a card. A plain
 // json: the body it lands in is one, so key order on the wire is alphabetical
