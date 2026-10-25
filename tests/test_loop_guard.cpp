@@ -1526,6 +1526,43 @@ TEST(loop_guard_ladder_recovered_on_token_stretches_lifts_no_nudge) {
     CHECK_EQ(s.loop_guard_counts().slaps, 0);
 }
 
+// (2) A text-closer family has no closer id to force. At the slap point the
+// ladder lifts its masks instead of holding the turn to the cap -- no forced
+// token, no slap, and the end-of-turn and multi-newline ids are drawable.
+TEST(loop_guard_ladder_text_closer_lifts_at_the_slap_point) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 1);
+    p.loop_guard_door_grace = 1;
+    p.loop_guard_door_ids   = {6, 7};
+    p.think_eog_mask        = false;
+    p.ignore_eos            = false;
+    p.think_ids.close_ids.clear();            // text closer only
+    p.think_ids.open_close_ids.clear();
+    p.loop_guard_nudge_ids = {kPieceFirst};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    feed_text(s, loop_line(18));   // the door grace: the nudge
+    CHECK_EQ(s.loop_guard_counts().nudges, 1);
+    std::vector<float> nudge_row = row_with_argmax(2);
+    const int nudge_id = s.sample(nudge_row.data(), nudge_row.size());
+    s.observe_think(nudge_id, piece_of(nudge_id));
+
+    feed_text(s, loop_line(19));   // the nudge grace: the slap point, still over
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);   // no closer id: lift instead
+    std::vector<float> row(8, -1.0f);
+    row[0] = 5.0f;   // the EOG id, drawable again
+    row[6] = 6.0f;   // a multi-newline token, likewise
+    row[4] = 1.0f;
+    CHECK_EQ(s.sample(row.data(), row.size()), 6);   // no forced token
+    CHECK(row[0] == 5.0f);
+    CHECK(row[6] == 6.0f);
+    CHECK(s.think_block_open());   // the block is not shut by a lift; it runs on
+}
+
 // (1vi) the answer after a LIFTED door is still watched: gap 1 keys on the door
 // having opened in this turn, not on it still being open. The mode recovers,
 // the door lifts, the model closes the block itself, and a looping answer still

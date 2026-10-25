@@ -564,7 +564,9 @@ void Sampler::loop_line_ended_(const std::string& raw_line) {
 // dip just under the threshold must not re-arm a detection), so half-recovered
 // text keeps the door. From the lift on the turn is ladder-nodoor's rule: a
 // renewed loop escalates on over lines, without reopening the door.
-
+// A text-closer family has no id to force, so a slap that cannot force the
+// closer lifts the masks at the slap point instead of holding the turn to the
+// cap.
 void Sampler::loop_escalate_(bool over) {
     const bool recovered = loop_share_ < params_.loop_guard_threshold - 0.1f;
     if (loop_guard_door_ladder(params_.loop_guard) && loop_door_open_ && !loop_nudged_
@@ -575,10 +577,10 @@ void Sampler::loop_escalate_(bool over) {
     if (loop_guard_is_ladder(params_.loop_guard) && loop_nudged_ && !loop_slapped_
         && loop_since_nudge_ >= params_.loop_guard_grace
         && (over || loop_door_open_)) {
-        // Recovered at the slap point: lift the masks instead of forcing a
-        // close. Ladder-nodoor holds no mask, so it keeps its own slap path
-        // unchanged.
-        if (loop_door_open_ && recovered) loop_door_lift_();
+        // Recovered at the slap point, or no closer id to force (text-closer
+        // family): lift the masks instead of forcing a close. Ladder-nodoor
+        // holds no mask, so it keeps its own slap path unchanged.
+        if (loop_door_open_ && (recovered || think_close_id_ < 0)) loop_door_lift_();
         else loop_do_slap_();
     }
     if (params_.loop_guard == LoopGuardMode::Door && loop_door_open_
