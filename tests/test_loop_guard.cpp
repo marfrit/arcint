@@ -1050,3 +1050,108 @@ TEST(loop_guard_door_masked_counts_topk_membership_not_any_mask) {
     CHECK(t2 == 4 || t2 == 3);
     CHECK_EQ(s.loop_guard_counts().door_masked, 1);
 }
+
+// ── 1.2.4 gaps: the answer after a door self-close, and the back door ────────
+
+// Gap 1: the door opened, the model closed the block itself, and the answer
+// then loops. The content phase is watched after a door-open turn exactly as
+// after a slap: the turn ends on `loop`, with one self-close counted.
+TEST(loop_guard_answer_after_a_door_self_close_aborts_on_a_loop) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 5);
+    p.loop_guard_door_grace = 20;
+    p.loop_guard_door_ids   = {6, 7};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    // The model closes by its own draw: the multi-newline top is masked, the
+    // closer is next.
+    std::vector<float> row(8, -1.0f);
+    row[6] = 10.0f;
+    row[5] = 9.0f;
+    CHECK_EQ(s.sample(row.data(), row.size()), 5);
+    s.observe(5, "closed");
+    CHECK_EQ(s.loop_guard_counts().self_closes, 1);
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+
+    // The answer loops. It is watched now, from a clean window at the close.
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);
+    CHECK(s.loop_abort());
+    CHECK_EQ(s.loop_guard_counts().aborts, 1);
+    CHECK_EQ(s.loop_guard_counts().self_closes, 1);
+
+    std::vector<float> rows = row_with_argmax(3);
+    const VerifyWalk   w = walk_verify(
+        rows.data(), 1, rows.size(), {}, s, 100, [](int) { return false; },
+        [&](int) { return Control::Continue; });
+    CHECK(w.done);
+    CHECK(w.reason == FinishReason::Loop);
+    CHECK_EQ(std::string(finish_reason_name(w.reason)), std::string("loop"));
+}
+
+// Gap 1, negative: an answer that restates a line or two of its reasoning once
+// is normal. The window is clean at the block's close, so those lines are not
+// repeats and no abort follows.
+TEST(loop_guard_answer_restating_two_reasoning_lines_once_does_not_abort) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 5);
+    p.loop_guard_door_grace = 20;
+    p.loop_guard_door_ids   = {6, 7};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+    std::vector<float> row(8, -1.0f);
+    row[6] = 10.0f;
+    row[5] = 9.0f;
+    CHECK_EQ(s.sample(row.data(), row.size()), 5);
+    s.observe(5, "closed");
+    CHECK_EQ(s.loop_guard_counts().self_closes, 1);
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+
+    feed_lines(s, 0, 4, false);         // the answer's own varied lines
+    feed_text(s, distinct_line(0));     // restates reasoning line 0, once
+    feed_text(s, distinct_line(1));     // restates reasoning line 1, once
+    feed_lines(s, 4, 12, false);        // and goes on, varied
+    CHECK(!s.loop_abort());
+    CHECK_EQ(s.loop_guard_counts().aborts, 0);
+    CHECK_EQ(s.loop_guard_counts().self_closes, 1);
+
+    std::vector<float> rows = row_with_argmax(3);
+    const VerifyWalk   w = walk_verify(
+        rows.data(), 1, rows.size(), {}, s, 100, [](int) { return false; },
+        [&](int) { return Control::Continue; });
+    CHECK(w.reason == FinishReason::Stop);
+}
+
+// Gap 1, negative: a turn whose door never opened keeps today's behaviour. Its
+// answer is unwatched, so a repeating answer does not abort; the scope stays
+// the door-open turns only.
+TEST(loop_guard_answer_unwatched_when_the_door_never_opened) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 5);
+    p.loop_guard_door_grace = 20;
+    p.loop_guard_door_ids   = {6, 7};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 40, false);   // varied reasoning: no detection, door shut
+    CHECK_EQ(s.loop_guard_counts().detections, 0);
+    s.observe(5, "closed");        // the block closes, the door was never open
+    CHECK_EQ(s.loop_guard_counts().self_closes, 0);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);    // a looping answer
+    CHECK(!s.loop_abort());
+    CHECK_EQ(s.loop_guard_counts().aborts, 0);
+
+    std::vector<float> rows = row_with_argmax(3);
+    const VerifyWalk   w = walk_verify(
+        rows.data(), 1, rows.size(), {}, s, 100, [](int) { return false; },
+        [&](int) { return Control::Continue; });
+    CHECK(w.reason == FinishReason::Stop);
+}

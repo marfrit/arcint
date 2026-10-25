@@ -193,6 +193,10 @@ private:
     LoopGrams loop_grams_(const std::string& line) const;
     bool      loop_near_match_(const LoopGrams& grams) const;
     void   loop_on_detect_(bool content_phase);
+    // gap 1: the answer gets a clean detector window at the block's close (by
+    // the model's own draw after the door opened, or by the slap's forced
+    // closer), so no reasoning line counts against the answer.
+    void   loop_start_answer_();
     void   loop_do_nudge_();
     void   loop_do_slap_();
     void   loop_do_abort_();

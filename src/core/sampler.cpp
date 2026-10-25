@@ -176,7 +176,10 @@ void Sampler::observe_think_(std::string_view piece, int token) {
 
     // loop-guard: feed the detector from the same piece stream the tracker
     // sees. Reasoning is watched while the block is open; the answer phase is
-    // watched only after a slap (the abort rung), never otherwise.
+    // watched after a slap, and after a turn whose door opened (gap 1: the
+    // model can close by its own draw and then loop in the answer). A turn
+    // whose door never opened keeps the answer unwatched, as in 1.2.3, and so
+    // do detect/nudge/slap, which never open the door.
     if (params_.loop_guard != LoopGuardMode::Off) {
         // The last nudge id's piece is observed after sample() returned it; the
         // sentence is not reasoning the detector should hold, so the buffer is
@@ -186,7 +189,7 @@ void Sampler::observe_think_(std::string_view piece, int token) {
         const bool nudge_done = loop_nudge_flush_;
         loop_nudge_flush_ = false;
         if (think_state_ == ThinkState::thinking
-            || (think_state_ == ThinkState::content && loop_slapped_))
+            || (think_state_ == ThinkState::content && (loop_slapped_ || loop_door_open_)))
             loop_observe_(piece);
         if (nudge_done) loop_line_.clear();
     }
@@ -195,6 +198,11 @@ void Sampler::observe_think_(std::string_view piece, int token) {
     // closer is ordinary tokens and cannot get here.
     if (think_state_ == ThinkState::thinking && think_close_id_ >= 0 && token == think_close_id_) {
         if (loop_door_open_ && !forced_closer) ++loop_self_closes_;
+        // gap 1: the answer is judged from a clean window at the close. The
+        // reasoning lines (including the loop that opened the door) must not
+        // count as answer repeats, and an answer that restates a line or two
+        // of its reasoning once is normal.
+        if (loop_door_open_ || loop_slapped_) loop_start_answer_();
         think_state_ = ThinkState::content;
         think_tail_.clear();
         think_lead_.clear();
@@ -295,6 +303,8 @@ void Sampler::observe_think_(std::string_view piece, int token) {
             // Settled: content. Both windows are cleared, so neither the
             // stale lead nor a tail remnant can re-open the block later.
             if (loop_door_open_ && !forced_closer) ++loop_self_closes_;
+            // gap 1: same clean window at the text-closer close.
+            if (loop_door_open_ || loop_slapped_) loop_start_answer_();
             think_state_ = ThinkState::content;
             think_tail_.clear();
             think_lead_.clear();
@@ -472,6 +482,19 @@ void Sampler::loop_on_detect_(bool content_phase) {
     }
 }
 
+// gap 1: what the answer's detector starts from, and why: the window, the
+// exact-repeat memory, the near memory and the open line all belonged to the
+// reasoning; the hysteresis low mark is re-armed so an answer's first crossing
+// counts. The counters and the ladder state stay: self_closes/aborts and
+// loop_slapped_ are what the caller reports.
+void Sampler::loop_start_answer_() {
+    loop_window_.clear();
+    loop_seen_.clear();
+    loop_gram_memory_.clear();
+    loop_line_.clear();
+    loop_low_ = true;
+}
+
 void Sampler::loop_do_nudge_() {
     if (loop_nudged_) return;
     if (params_.loop_guard_nudge_ids.empty()) {
@@ -494,11 +517,7 @@ void Sampler::loop_do_slap_() {
     // The answer phase gets its own window: the reasoning loop that caused the
     // slap must not count as the first answer lines (that would abort before
     // the model has said anything). Content lines are counted from here.
-    loop_window_.clear();
-    loop_seen_.clear();
-    loop_gram_memory_.clear();
-    loop_line_.clear();
-    loop_low_ = true;
+    loop_start_answer_();
     log::info("loop-guard", "lane: slap: the think-block's closer is forced as the next token");
 }
 
@@ -506,7 +525,8 @@ void Sampler::loop_do_abort_() {
     if (loop_abort_) return;
     loop_abort_ = true;
     ++loop_aborts_;
-    log::warn("loop-guard", "lane: the answer phase is looping after a slap; ending the turn (finish loop)");
+    log::warn("loop-guard", "lane: the answer phase is looping (after a slap or a door self-close); "
+                            "ending the turn (finish loop)");
 }
 
 // While the block is open the turn-ending ids and a second opener are not
