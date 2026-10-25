@@ -76,6 +76,12 @@ on the 1.2.7 list. Not run: the coder's and the agent's A/B (their paths
 change only with the loop guard's door open, which the agent never opens;
 `code`); the token-share rule is unit-tested only.
 
+**Published** (2026-10-25): `arcint` 1.2.6-1 built by its recipe from the
+v1.2.6 tag tarball (sha256 `efc0e4fa…`) and published to the trixie
+repository (index verified); installed from the pool on the card host, where
+the coder (`--loop-guard ladder`) and the agent run it and answer the
+stop-string check. `arcint-stt` stays at 1.2.0-1, `arcint-imggen` at 1.1.1-1.
+
 ## 1.2.5 — 2026-10-25
 
 A fixes and clean-up release: the 1.2.4 release review's three loop-guard
