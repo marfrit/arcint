@@ -18,6 +18,43 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## Unreleased (1.2.5)
+
+A fixes and clean-up release. Three loop-guard items from the 1.2.4 release
+review; every switch stays **off by default** and a request with none set is
+served as in 1.2.4.
+
+- **The door owns the turn's ending (ladder)** — once the door is open the
+  escalation goes by budget, not by the repeat share: the nudge fires
+  `door_grace` counted lines after the detection and the slap `grace` counted
+  lines after the nudge, whatever the share. With the door open the guard has
+  changed the row the model draws from, so it owns the turn's ending: a share
+  that now falls below the threshold without the model closing the block can
+  no longer leave the turn running to the token cap. A model that closes the
+  block itself before the budget is unchanged. `ladder-nodoor`, `detect`,
+  `nudge` and `slap` keep 1.2.3's semantics (escalation only on an over line).
+  (`code`)
+- **`door` mode's budget** — `door` is the mask alone and has no nudge or slap,
+  so a mask could hold a turn to the cap on its own. After `door_grace +
+  grace` counted lines without a close, the door lifts its masks (the
+  multi-newline ids and the turn-ending ids it added) and says so once in the
+  log; the turn continues unguarded, as with the switch off. No new response
+  key, and a later detection does not reopen the lifted mask. (`code`)
+- **Door counters measure the sampled candidate set** — `door_masked` and
+  `door_eog_masked` count a step when a masked id would have been a candidate
+  of the draw. `candidate` is now the set the draw actually samples from, after
+  the row's truncation (top-k, top-p, min-p), for every `top_k` value: at
+  `top_k` 0 a top-p cutoff could exclude a finite masked logit and the old
+  code still counted it against the whole row. Observability only: the draw is
+  byte-identical, which a fixed-seed test pins. (`code`)
+- **The `loop_guard` object on the wire** — `loop_guard_json` returns a plain
+  `json` instead of an `ordered_json`: the response body is a plain `json`, so
+  the keys already landed alphabetically and the "last key" test checked a
+  property no client saw. The order test is replaced by one on the object as
+  it goes out: the serialized non-streaming response and the stream's finish
+  frame each carry all seven keys with their values. No change for clients.
+  (`code`)
+
 ## 1.2.4 — 2026-10-25
 
 The loop guard gains a door rung; every switch stays **off by default**, and
@@ -77,8 +114,10 @@ includes the door (operator, 2026-10-24).
   threshold. If the door is open with `think_eog_mask` off and the share then
   falls below it without the model closing the block, nothing escalates and
   the turn-ending ids stay masked, so the turn runs to the token cap where
-  1.2.3 could have ended it. The counters `door_masked` and `door_eog_masked`
-  count against the whole row when `top_k` is 0 (observability only).
+  1.2.3 could have ended it (fixed in 1.2.5). The counters `door_masked` and
+  `door_eog_masked`
+  count against the whole row when `top_k` is 0 (observability only; fixed in
+  1.2.5).
 
 **Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (60
 patches), unchanged from 1.2.3; dependencies unchanged. `arcint-stt` (1.2.0)
