@@ -1,6 +1,6 @@
 # arcint — Design
 
-State as of 2026-10-25: arcint **1.2.5** on llama.cpp **`3e4dfa8`** with the
+State as of 2026-10-25: arcint **1.2.6** on llama.cpp **`3e4dfa8`** with the
 patch series `contrib/llama.cpp/patches` 0001-0063 (60 patches). One engine: libllama with
 ggml's OpenCL backend and arcint's Intel kernels. Three language services run
 in production on two Intel Arc cards: the dense Qwen3.8-27B agent and
@@ -519,7 +519,18 @@ reported, not a veto.
   below a floor of 0.5 %, and the candidate fails when its own spread
   exceeds the old arm's by more than that floor (operator, 2026-10-16: a
   noisy candidate does not widen its own allowance); an answer failure in
-  any run fails it; the answer bytes are compared and reported).
+  any run fails it; the answer bytes are compared and reported). Decode
+  rates are read on the majority answer (operator, 2026-10-25, 1.2.6): every
+  decode answer of the served check runs to its token cap, so a run whose
+  answer differs is another workload (its draft acceptance differs under
+  speculation), not a speed sample of the same one; 1.2.5's first Flash-Next
+  window failed on the spread of one such run (`measured-here`). The gate
+  reads the runs whose answer has the majority md5 across both arms and lists
+  the others with their tokens, acceptance and rate; with fewer than two such
+  runs in an arm, or a tie, every run is gated. Prefill prompts are fixed and
+  read as before. The bound: a candidate that gives another answer in up to
+  half its runs has those runs' rates listed but not gated; a majority of
+  other answers falls back to every run.
 - **Equivalence suite** (`tests/equivalence/run.sh`, on a card, `--engine
   llama --gguf`): two greedy runs, a lane's reused prefix against a fresh
   process (warm against cold), a checkpoint resume against a full

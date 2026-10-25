@@ -113,6 +113,45 @@ def main():
         x["texts"] = ["bbbbbbbb"]
     check("texts differing between the arms are reported", "DIFFER" in ab.compare_texts(runs(1, 1), other), True)
 
+    # The decode answers (1.2.6, operator): the gate reads the runs whose decode
+    # answer has the majority md5 across both arms. Every answer runs to its
+    # token cap, so a run with another answer is another workload (another
+    # draft acceptance), not a speed sample of the same one.
+    def druns(*pairs, metric="decode"):
+        out = []
+        for v, m in pairs:
+            out.append({"metrics": {metric: (v, "t/s")}, "failures": [], "texts": ["aaaaaaaa"],
+                        "decode": {metric: {"md5": m, "tokens": 300, "accept": 65.0, "verifies": 116,
+                                            "verify_s": 6.9}}})
+        return out
+
+    A, B = "d679e4cc", "4b3a6d8c"
+    # 1.2.5's first window: the one slow run is the one run with another answer
+    rows, _ = ab.decide(druns((37.9, A), (38.4, A), (38.2, A), (38.4, A)),
+                        druns((38.2, A), (38.6, A), (37.3, B), (38.2, A)))
+    r = rows[0]
+    check("decode: a divergent slow run is not a speed sample -> pass", r["ok"], True)
+    check("decode: the gate reads the majority runs", (len(r["used_old"]), len(r["used_new"])), (4, 3))
+    check("decode: the divergent run is named", [(d[0], d[1], d[2]) for d in r["divergent"]], [("new", 3, B)])
+    check("RED decode: the same rows read without the majority rule fail on spread",
+          verdict((37.9, 38.4, 38.2, 38.4), (38.2, 38.6, 37.3, 38.2)), False)
+    # 1.2.5's second window: slower on the same answer stays a FAIL
+    rows, _ = ab.decide(druns((38.4, A), (38.6, A), (38.5, A), (38.6, "9b617370")),
+                        druns((38.0, A), (38.2, A), (38.1, A), (37.9, B)))
+    check("RED decode: slower on the majority answer still fails", (rows[0]["ok"], rows[0]["slow"]), (False, True))
+    # too few majority runs in an arm: every run is gated, and the note says so
+    rows, _ = ab.decide(druns((38.0, A), (38.0, B)), druns((38.0, A), (38.0, "cccccccc")))
+    check("decode: an arm left with one majority run falls back to every run",
+          (len(rows[0]["used_old"]), len(rows[0]["used_new"]), "every run" in rows[0]["note"]), (2, 2, True))
+    # a tie between two answers has no majority: every run is gated
+    rows, _ = ab.decide(druns((38.0, A), (38.0, B)), druns((38.0, A), (38.0, B)))
+    check("decode: a tie has no majority answer, every run gated", len(rows[0]["used_new"]), 2)
+    # runs without the decode lines (an older served_check) are gated as before,
+    # also when the other arm has them: no majority is read, and no note says so
+    rows, _ = ab.decide(druns((38.0, A), (38.0, A), (38.0, A), (38.0, B)), runs(38.0, 38.0, 38.0, 38.0))
+    check("decode: an arm without decode lines -> every run, no majority reading",
+          (len(rows[0]["used_new"]), rows[0]["note"]), (4, ""))
+
     # the parser, on a captured served_check output
     with open(os.path.join(HERE, "fixtures", "served-check-output.txt")) as f:
         text = f.read()
@@ -124,6 +163,12 @@ def main():
     ok_text = "\n".join(line for line in text.splitlines() if "FAIL" not in line)
     check("parser: no FAIL line, exit 0 -> no failure", ab.parse_run(ok_text, 0)["failures"], [])
     check("parser: exit 1 without a FAIL line is a failure", len(ab.parse_run(ok_text, 1)["failures"]), 1)
+    line = "ACCEPTANCE-DECODE decode md5 d679e4cc tokens 300 accept 65.8 verifies 116 verify_s 6.94\n"
+    check("parser: a decode answer line", ab.parse_run(line)["decode"],
+          {"decode": {"md5": "d679e4cc", "tokens": 300, "accept": 65.8, "verifies": 116, "verify_s": 6.94}})
+    check("parser: a decode line without speculation",
+          ab.parse_run("ACCEPTANCE-DECODE decode-a md5 aaaaaaaa tokens 300 accept - verifies 0 verify_s -\n")
+          ["decode"]["decode-a"]["accept"], None)
     check("parser: a non-numeric metric is a failure",
           len(ab.parse_run("ACCEPTANCE-METRIC decode nan t/s\n")["failures"]), 1)
 
@@ -163,6 +208,14 @@ def main():
           (proc.returncode, "not found" in proc.stderr, "== old run" in proc.stdout), (2, True, False))
     rc, out = a_b("100,101", "100,101", rounds=1)
     check("end to end: one round runs old and new once each", out.count("== old run") + out.count("== new run"), 2)
+
+    # end to end, the decode answers: 1.2.5's first window passes once the
+    # divergent run is read as another workload, and the table names it
+    rc, out = a_b("37.9:aaaaaaaa,38.4,38.2,38.4", "38.2:aaaaaaaa,38.6,37.3:4b3a6d8c,38.2", rounds=4)
+    check("end to end: a divergent slow run -> exit 0, named in the table",
+          (rc, "divergent: new run 3 4b3a6d8c 37.3" in out, "decode answers per run:" in out), (0, True, True))
+    rc, out = a_b("38.4:aaaaaaaa,38.6,38.5,38.6:9b617370", "38.0:aaaaaaaa,38.2,38.1,37.9:4b3a6d8c", rounds=4)
+    check("RED end to end: slower on the majority answer -> exit 1", rc, 1)
 
     if FAILED:
         print(f"\n{len(FAILED)} of {TOTAL} assertion(s) failed: {', '.join(FAILED)}", file=sys.stderr)

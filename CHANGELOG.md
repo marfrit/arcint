@@ -18,6 +18,64 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.2.6 — 2026-10-25
+
+The loop guard's last 1.2.5 residual fixed, and the release A/B reads decode
+rates on the majority answer. Every switch stays **off by default**; with none
+set a request is served as in 1.2.5.
+
+
+- **A stretch's budget point judges recovery on the tokens** — 1.2.5's
+  residual: a budget point the door reaches by 64-token stretches (no counted
+  line) decided on the last counted line share, so a loop the line detector
+  cannot count (lines of 20 characters or less, or no newline) after a varied
+  stretch was lifted rather than escalated. Such a point now reads a token
+  repeat share: the share of 8-token grams in the stretch that occurred
+  earlier within the last 2,048 generated ids, recovered when it is below the
+  low mark. A point reached by a counted line keeps the line share; every
+  decision, the counted line's too, starts the next span, so a counted-line
+  loop's repeats are not carried into a later stretch's share. The
+  tracker records only while the door is open; with the door shut or the
+  guard off nothing is computed. Loops with a period up to the window
+  (2,048 ids) are caught. Residual (`code`): a short-line loop with one
+  varying token per cycle (a counter in lines of 20 characters or less) has
+  few exact 8-gram repeats and is still read as recovered; a long stretch of
+  legitimately repetitive text without counted lines (a table of short
+  lines, a long newline-free JSON) can read as looping once the door is
+  open. (`code`)
+- **The release A/B reads decode on the majority answer** —
+  `tests/acceptance/ab.py` gates a decode rate on the runs whose answer has
+  the majority md5 across both arms, and lists the other runs with their md5,
+  tokens, draft acceptance, verifies and rate; with fewer than two such runs
+  in an arm, or a tie, every run is gated, as before (operator, 2026-10-25).
+  Every decode answer of the served check runs to its 300-token cap, so a run
+  with another answer is another workload: its draft acceptance differs under
+  speculation (`measured-here`, the coder's and Flash-Next's served logs).
+  `cells/served_check.py` prints an `ACCEPTANCE-DECODE` line per answer for
+  it. A fixed-length decode arm was considered and dropped: the answers are
+  already fixed in length. Read this way, 1.2.5's first Flash-Next window
+  passes (its one slow run was the one with another answer) and its second
+  still fails (slower on the same answer).
+
+**Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (60
+patches), unchanged from 1.2.5; dependencies unchanged. `arcint-stt` (1.2.0)
+and `arcint-imggen` (1.1.1) are unchanged.
+
+**Release check** (`measured-here`, 2026-10-25, the pre-tag package): the
+device-free suite 340 cases and `ctest -L unit` 6/6; the branch's mutations
+red. The Flash-Next speed A/B against 1.2.5 (the B60, IQ3_XXS with the served
+check's flags, 4 rounds), the first under the majority reading, failed the
+gate as written on decode spread while faster: on the majority answer (2 old
+runs, 4 new) 38.20 against 38.33 t/s, the new arm's spread 1.83 % (its
+fastest run, 38.8 t/s) against the allowance of 0.52 % from the two old runs;
+prefill equal (618.5 / 618.7 t/s). On the same answer the draft acceptance
+still varies 65.5-67.6 % between runs, so two runs do not measure an arm's
+spread. The operator accepted the result (2026-10-25); a spread rule that
+fails only a slower candidate, and a minimum of majority runs per arm, are
+on the 1.2.7 list. Not run: the coder's and the agent's A/B (their paths
+change only with the loop guard's door open, which the agent never opens;
+`code`); the token-share rule is unit-tested only.
+
 ## 1.2.5 — 2026-10-25
 
 A fixes and clean-up release: the 1.2.4 release review's three loop-guard

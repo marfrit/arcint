@@ -1,3 +1,14 @@
+arcint (1.2.6-1) trixie; urgency=medium
+
+  * 1.2.6: the loop guard judges a budget point reached by token stretches
+    on a token repeat share (8-grams over the last 2,048 ids), so a loop the
+    line detector cannot count is escalated rather than lifted; every
+    decision starts a new span. The release A/B reads decode rates on the
+    majority answer. Runtime and dependencies unchanged (llama.cpp 3e4dfa8,
+    60 patches).
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 25 Oct 2026 20:00:00 +0200
+
 arcint (1.2.5-1) trixie; urgency=medium
 
   * 1.2.5: fixes and clean-up. The loop guard's door ends every open door:

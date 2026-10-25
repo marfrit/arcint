@@ -139,11 +139,25 @@ def prefill(name, line, lo, hi):
     metric(name, float(line[2]))
 
 
-def decodes(names, min_tok=100):
-    d = [x for x in slot_lines("decode") if int(x[0]) >= min_tok][-len(names):]
-    gate(len(d) == len(names), f"{len(names)} decodes of at least {min_tok} tokens (got {len(d)})")
-    for name, x in zip(names, d):
-        metric(name, float(x[2]))
+DECODE_LINE = re.compile(r"slot 0: decode +(\d+) tok in +[\d.]+ s \( *([\d.]+) t/s\)(.*)")
+
+
+def decodes(names, md5s, min_tok=100):
+    # One ACCEPTANCE-DECODE line per answer beside its rate: the answer's md5,
+    # its tokens and, under speculation, the draft acceptance, the verifies and
+    # their seconds. ab.py gates decode rates on the runs with the majority
+    # answer (every answer runs to its cap, so another answer is another
+    # workload); "-" where the line carries no speculation.
+    lines = [m for m in DECODE_LINE.finditer(open(log_path).read()) if int(m.group(1)) >= min_tok][-len(names):]
+    gate(len(lines) == len(names), f"{len(names)} decodes of at least {min_tok} tokens (got {len(lines)})")
+    for name, m, md5 in zip(names, lines, md5s):
+        metric(name, float(m.group(2)))
+        rest = m.group(3)
+        acc = re.search(r"draft accept ([\d.]+)%", rest)
+        ver = re.search(r"verify ([\d.]+) s", rest)
+        nv = re.search(r"(\d+) verifies", rest)
+        print(f"ACCEPTANCE-DECODE {name} md5 {md5} tokens {m.group(1)} accept {acc.group(1) if acc else '-'} "
+              f"verifies {nv.group(1) if nv else 0} verify_s {ver.group(1) if ver else '-'}", flush=True)
 
 
 try:
@@ -173,7 +187,7 @@ try:
                   "Describe in about 250 words how a compiler turns source code into machine code.",
                   "Explain in about 250 words how TCP congestion control works."):
             gate(len(text(post(q, 300))) > 200, f"an answer to {q[:40]!r}")
-        decodes(("decode-a", "decode-b", "decode-c"))
+        decodes(("decode-a", "decode-b", "decode-c"), TEXTS[-3:])
         a = text(post(needle_prompt(44000, 3.45), 24))
         gate("violet-harbor-42" in a.lower(), f"the needle at 41k ({a.strip()[:40]!r})")
         prefill("prefill-41k", slot_lines("prefill")[-1], 38000, 44000)
@@ -183,7 +197,7 @@ try:
         prefill("prefill-20k", slot_lines("prefill")[-1], 19500, 20500)
         gate(len(text(post("Explain in about 250 words how a hash table handles collisions.", 300))) > 200,
              "the long answer")
-        decodes(("decode",))
+        decodes(("decode",), TEXTS[-1:])
 finally:
     proc.terminate()
     try:
