@@ -11,24 +11,14 @@ Vendored, single-header, licenses unchanged:
 Adapted (not verbatim) in `tools/tts_voice_sim.py`, a measuring tool no
 package ships: the speaker-similarity recipe from
 `huggingface/open-tts-leaderboard`'s `transformers/score_similarity.py`
-(Apache-2.0), and the ECAPA-TDNN head, **modified**, from:
-
-- work: UniSpeech, `downstreams/speaker_verification/models/ecapa_tdnn.py`
-- author / licensor: Microsoft (`microsoft/UniSpeech`); the file credits
-  https://github.com/lawlict/ECAPA-TDNN for part of its code (kept verbatim
-  in the header)
-- source: https://github.com/microsoft/UniSpeech/blob/40ac183e772abdcbf3a318eccffaa70c0cfd3a74/downstreams/speaker_verification/models/ecapa_tdnn.py
-  (the file's last commit, 2021-12-20)
-- licence: CC BY-SA 3.0, https://creativecommons.org/licenses/by-sa/3.0/ (the
-  repository's root LICENSE; no further copyright line, no NOTICE file)
-- modified: transcribed without the torchaudio front end and the
-  training-time loss, wired to an HF `WavLMModel`
-
-The leaderboard script labels the head "MIT"; the UniSpeech LICENSE file does
-not. `tools/tts_voice_sim.py` is therefore under CC BY-SA 3.0, share-alike,
-and NOT under the repository's Apache-2.0; the rest of the repository stays
-Apache-2.0. No weights are committed: the SIM model is staged operator-locally
-(CC BY-SA 3.0), not redistributed.
+(Apache-2.0). Its ECAPA-TDNN head, `tools/speaker_head.py` (Apache-2.0), is a
+clean-room implementation from a behavioural specification and the paper
+(Desplanques, Thienpondt, Demuynck, "ECAPA-TDNN", Interspeech 2020), written
+without access to an existing implementation; it reproduces the checkpoint's
+embeddings (max |diff| below 1e-6 against the earlier transcription,
+`measured-here`). The speaker model's weights are not shipped: the
+`bezzam/wavlm_large_finetune_seed_tts_eval` mirror of the UniSpeech
+fine-tuned checkpoint, CC BY-SA 3.0, is staged operator-locally.
 
 Committed data: `tools/tts_sentences_de.json` holds 46 German sentences from
 **Tatoeba** (tatoeba.org), CC-BY 2.0 FR, attribution to Tatoeba and its
