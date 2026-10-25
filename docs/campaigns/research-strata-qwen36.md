@@ -75,12 +75,36 @@ device time (`llama-engine-kernel-gap.md`, `measured-here`, the 0002-era
 trace): the step is bound by the small ops and the launches around the
 matmuls, not by the weights. That is where Strata's fused kernels go.
 
+## Re-count (`measured-here`, 2026-10-25)
+
+The 1.2.6 tree built with `GGML_OPENCL_PROFILING` (one kernel launch a row of
+`cl_profiling.csv`), the coder's unit flags, the A770, one prose prompt at
+temperature 0, two runs of 100 and 300 decode tokens each, so the difference
+is 200 tokens of decode; the profiling build itself decodes slower (event
+profiling), so its device times count and its wall rates do not.
+
+| | launches | device time | matmuls | attention | other |
+|---|---|---|---|---|---|
+| plain, a token | 1,635 (0002 era: 2,034) | 19.25 ms | 9.86 ms (451) | 2.86 ms (20) | 6.54 ms (1,164) |
+| MTP 4, a verify step (2.63 tokens) | 1,962 | 39.14 ms (14.87 a token) | 26.23 ms (610) | 4.10 ms (28) | 8.81 ms (1,323) |
+
+Against the normal build's ~21 ms a plain token, the step is device-bound:
+the launches' host cost is not the wall, the small ops' device time is. The
+largest "other" kernels a plain token: the MoE router
+`kernel_topk_moe_softmax_norm` 1.37 ms (40 launches, ~34 us each, for a
+softmax and top-k over 184 experts); `kernel_gemv_f32_f32_mc` 0.74 (100);
+`kernel_rms_norm_mul` 0.65 (131); `kernel_get_rows_f32` 0.49 (62);
+`kernel_quantize_q8_1_sg` 0.48 (161); the gated delta-net 0.35 (30);
+`kernel_mul` 0.35 (70); `kernel_add_row` 0.33 (120); the f32 copies 0.39
+(60); `kernel_swiglu` 0.21 (80); `kernel_rms_norm` 0.19; `kernel_moe_combine_f32`
+0.18; `kernel_concat_b4_pack` 0.15. The matmuls' 9.9 ms a token is not
+amortized by MTP (9.97 a token at MTP 4: the window's rows route to
+different experts).
+
 ## Transferable, ranked for the coder
 
-1. **Re-count first** (a measurement, one profile window on the A770): the
-   coder's launches a verify on the current series and the device time
-   outside matmuls and attention (`GGML_OPENCL_PROFILING`). The ~2,034 is the
-   0002-era count; 0049 and 0051 removed some since.
+1. **Re-count** — done (above): 1,635 launches and 19.25 ms of device time
+   a plain token, of which 6.54 ms in 1,164 small-op launches; device-bound.
 2. **Speculative-sampling acceptance** for sampled requests (`code` reference
    `q36_sampling.hpp:180-307`): the coder unit samples at 0.6; the gain is the
    acceptance difference between sample-and-compare and min(1, p/q), measured
@@ -93,7 +117,14 @@ matmuls, not by the weights. That is where Strata's fused kernels go.
    shared-expert tail into the combine, E SwiGLU in the matvec epilogue, F the
    recurrent state in place, G-I residual + norm and the q/k fusions),
    estimated at 9-10 ms of a 26.5 ms coder step on the 0002-era trace
-   (`llama-engine-kernel-gap.md`, `measured-here`). One fusion at a time in
+   (`llama-engine-kernel-gap.md`, `measured-here`); the re-count puts the
+   small ops at 6.54 ms of 19.25 (34 %) and the first target at the MoE
+   router (1.37 ms a token, Strata's `k_route_group` the reference), then the
+   norm/quantize chain (rms_norm_mul + quantize + add_row + mul, ~1.8 ms
+   together, Strata's `k_add_rms_q` / `k_moe_out_s8`), the F32 matvec
+   (0.74 ms) and the copies/concat (0.54 ms). The matmuls' own efficiency
+   (9.9 ms a token for the active weights) is the other half and a separate
+   lever. One fusion at a time in
    ggml-opencl, each with 0049's bit-identity check (a regrouped rounding
    kept KL inside the bar but moved MTP acceptance) and the answer-level
    bar; the implementation goes to a non-Qwen implementer (the house rule).
