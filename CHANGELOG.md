@@ -93,6 +93,13 @@ run on the release candidate, by the operator's decision: the same-window
 speed A/B against 1.2.3 and the acceptance task; every switch off is 1.2.3's
 path (`code`).
 
+**Published** (2026-10-25): `arcint` 1.2.4-1 built by its recipe from the
+v1.2.4 tag tarball (sha256 `a12aabde…`) and published to the trixie
+repository (index verified); installed from the pool on the card host, where
+the coder runs it with `--loop-guard ladder` (now with the door) and the
+agent with the switches as before, each answering the stop-string check.
+`arcint-stt` stays at 1.2.0-1, `arcint-imggen` at 1.1.1-1.
+
 ## 1.2.3 — 2026-10-24
 
 A loop guard for small models and two sampling rows by phase, all behind
