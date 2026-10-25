@@ -114,6 +114,7 @@ paths under `~/src/Strata-ref/`.
 | [research-reference-audit](research-reference-audit.md) | Strata and FreeToken against arcint's record; the ranked levers |
 | [research-hybrid-expert-execution](research-hybrid-expert-execution.md) | CPU/GPU expert execution, Flash-Next comparables, Strata read at source |
 | [research-infernix](research-infernix.md) | Infernix (CUDA, Flash-Next on a 5090) at source: global LFRU cache, layer-walk prefill, shared prefix cache, CPU miss service; ranked for the B60 |
+| [research-arc-community](research-arc-community.md) | A field survey in Chinese and English (2026-10-25): an independent A770 SYCL/ESIMD project for Qwen3.8-27B (its prompt-tail MTP, its A770 kernel ceilings), Intel's persistent MoE grouped GEMM on the B60, a ubatch blog; leads ranked |
 | [research-strata-qwen36](research-strata-qwen36.md) | Strata's Qwen3.6-35B-A3B engine (a fork's `q36-r2`, 160-290 t/s on a 5080) at source against our coder: the verify and MTP pairing equivalent; the gaps are launches a forward (~750-800 fused against our ~2,000) and speculative-sampling acceptance (not built); ranked for the A770 |
 | [research-b70-field](research-b70-field.md) | The B70 projects at source (Flash-Next NVMe offload, exl3xpu, valarauca SYCL): Flash-Next prefill is our gap; per-layer staging, per-query sparse attention, register sign masks |
 | [research-hyperqwen](research-hyperqwen.md) | HyperQwen (vLLM, Qwen3.8-27B on one 3090) read at source: draft vocabulary, multi-row verify, lookup drafting |
