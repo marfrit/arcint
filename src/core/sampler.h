@@ -195,7 +195,7 @@ private:
     using LoopGrams = std::vector<uint32_t>;
     LoopGrams loop_grams_(const std::string& line) const;
     bool      loop_near_match_(const LoopGrams& grams) const;
-    void   loop_on_detect_(bool content_phase);
+    void   loop_on_detect_();
     // gap 1: the answer gets a clean detector window at the block's close (by
     // the model's own draw after the door opened, or by the slap's forced
     // closer), so no reasoning line counts against the answer.
@@ -319,12 +319,17 @@ private:
     // a later detection cannot reopen a mask the guard already gave up.
     bool loop_door_lifted_   = false;
     bool loop_forced_closer_ = false;
-    // counted lines since the detection (door grace, and `door` mode's lift
-    // budget).
+    // counted line-equivalents since the detection: ended lines, and stretches
+    // of tokens without one while the door is open. Drives the door grace and
+    // `door` mode's lift budget.
     int  loop_since_detect_  = 0;
     // Generated tokens since the last counted line while the door is open; a
-    // full stretch counts as one line-equivalent for the budget.
+    // full stretch counts as one line-equivalent for the budget (A).
     int  loop_door_tokens_   = 0;
+    // Set for the lines a piece ends when the closer completes in the same
+    // piece: counted, but the ladder does not act, or a nudge lands in the
+    // answer after the block closed.
+    bool loop_suppress_escalation_ = false;
     int  loop_self_closes_   = 0;
     int  loop_door_masked_   = 0;
     int  loop_door_eog_masked_ = 0;

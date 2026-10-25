@@ -1536,6 +1536,7 @@ TEST(loop_guard_door_masked_counts_the_truncated_set_at_top_k_zero) {
     const int t3 = s.sample(third.data(), third.size());
     CHECK_EQ(std::vector<int>({t1, t2, t3}), std::vector<int>({4, 4, 3}));
 }
+
 // ── 1.2.5 round 2: the door's budget in tokens, and the lifted-door latch ──
 
 // (A) The door's budget counted ended lines only, so a turn that switched to
@@ -1683,5 +1684,64 @@ TEST(loop_guard_door_lifted_is_not_reopened_by_a_later_detection) {
     CHECK(after[6] == 6.0f);
     CHECK_EQ(s.loop_guard_counts().door_masked, 0);
     CHECK_EQ(s.loop_guard_counts().door_eog_masked, 0);
+}
+
+// ── 1.2.5 round 2: the detector and the closer in one piece ─────────────────
+
+// (B4) Text-fallback vocabulary: a piece that carries a counted line and the
+// closer closes the block in the same call. The line is a real repeat, but the
+// ladder must not act on it -- a nudge injected then lands in the answer. The
+// detector counts the line and the detection; nothing is nudged.
+TEST(loop_guard_closer_in_the_same_piece_does_not_nudge_into_the_answer) {
+    SamplerParams p = base_params(LoopGuardMode::Nudge, 10, 1);
+    p.think_ids.close_ids.clear();            // text fallback only
+    p.think_ids.open_close_ids.clear();
+    p.loop_guard_nudge_ids = {kPieceFirst};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    for (int i = 9; i < 17; ++i) feed_text(s, loop_line(i));   // 7 repeats = 0.7
+    CHECK_EQ(s.loop_guard_counts().detections, 0);
+
+    // The 8th repeat line ends inside a piece that also spells the closer.
+    feed_text(s, loop_line(17) + think_tag_pairs(false)[0].second);
+    CHECK_EQ(s.loop_guard_counts().detections, 1);   // the reasoning line counts
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);       // but no nudge into the answer
+    CHECK(!s.think_block_open());
+}
+
+// ── 1.2.5 round 2: the slap's closer family, and the completions start ─────
+
+// (B5) Two tag families, a block opened by TEXT for the family whose closer is
+// text: the slap must not force the other family's closer id into the output.
+TEST(loop_guard_slap_forces_no_closer_from_another_family) {
+    SamplerParams p = base_params(LoopGuardMode::Slap, 10, 5);
+    const auto& pairs = think_tag_pairs(true);   // Qwen and the wider family
+    p.think_ids.open_tags  = {pairs[0].first, pairs[1].first, pairs[2].first};
+    p.think_ids.close_tags = {pairs[0].second, pairs[1].second, pairs[2].second};
+    // The flattened set: only family 0's closer is one special token.
+    p.think_ids.open_close_ids.clear();
+    p.think_ids.open_ids.clear();
+    p.think_ids.close_ids  = {5};
+    p.think_ids.close_tags = {pairs[0].second, pairs[1].second};
+    p.think_ids.open_tags  = {pairs[0].first, pairs[1].first};
+    p.think_ids.open_close_ids = {{-1, 5}, {-1, -1}};
+    Sampler s(p, 1);
+    s.start_in_think_block(false);
+    feed_text(s, pairs[1].first);   // the block opens by text, family 1
+    CHECK(s.think_block_open());
+
+    // The reasoning rounds into a loop: the slap fires.
+    for (int i = 0; i < 10; ++i) feed_text(s, loop_line(i));
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+    CHECK_EQ(s.loop_guard_counts().slaps, 1);
+
+    // No closer id belongs to the open family, so the slap forces none: the
+    // draw is the model's own, and family 0's closer (5) is not injected.
+    std::vector<float> row(8, -1.0f);
+    row[1] = 4.0f;   // not any closer
+    CHECK_EQ(s.sample(row.data(), row.size()), 1);
+    CHECK_EQ(row[5], -1.0f);
 }
 
