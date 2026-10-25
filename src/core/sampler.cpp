@@ -485,15 +485,17 @@ void Sampler::loop_on_detect_(bool content_phase) {
 
 // gap 1: what the answer's detector starts from, and why: the window, the
 // exact-repeat memory, the near memory and the open line all belonged to the
-// reasoning; the hysteresis low mark is re-armed so an answer's first crossing
-// counts. The counters and the ladder state stay: self_closes/aborts and
-// loop_slapped_ are what the caller reports.
+// reasoning. The hysteresis low mark is not re-armed here: the content-phase
+// row aborts on the share being over the threshold, not on a low -> over
+// crossing, so it reads no hysteresis. A cleared window on the reasoning side
+// (the slap, which can fire while the block is still open) re-arms itself on
+// its first line below the low mark. The counters and the ladder state stay:
+// self_closes/aborts and loop_slapped_ are what the caller reports.
 void Sampler::loop_start_answer_() {
     loop_window_.clear();
     loop_seen_.clear();
     loop_gram_memory_.clear();
     loop_line_.clear();
-    loop_low_ = true;
 }
 
 void Sampler::loop_do_nudge_() {

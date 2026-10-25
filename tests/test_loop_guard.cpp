@@ -1245,3 +1245,67 @@ TEST(loop_guard_json_carries_door_eog_masked_last) {
     const std::string line = api::decode_suffix_for(st);
     CHECK(line.find("door EOG masked 4") != std::string::npos);
 }
+
+// Gap 1 on the text-closer path: models whose closer has no single token id
+// close the block by spelling it. The answer still starts from a clean window
+// there. The answer restates twelve distinct reasoning lines once each: from a
+// clean window they are first occurrences and no abort follows, but a stale
+// window (the reasoning loop still at the threshold) would abort on the first.
+TEST(loop_guard_text_closer_answer_starts_from_a_clean_window) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 5);
+    p.loop_guard_door_grace = 20;
+    p.loop_guard_door_ids   = {6, 7};
+    // The text fallback: no closer id, so only the spelled tag closes.
+    p.think_ids.close_ids.clear();
+    p.think_ids.open_close_ids.clear();
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    CHECK(s.think_block_open());
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    feed_text(s, think_tag_pairs(false)[0].second);   // the model spells the closer
+    CHECK(!s.think_block_open());
+    CHECK_EQ(s.loop_guard_counts().self_closes, 1);
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+
+    for (int i = 0; i < 12; ++i) feed_text(s, distinct_line(i));   // restated once each
+    CHECK(!s.loop_abort());
+    CHECK_EQ(s.loop_guard_counts().aborts, 0);
+    CHECK_EQ(s.loop_guard_counts().self_closes, 1);
+
+    std::vector<float> rows = row_with_argmax(3);
+    const VerifyWalk   w = walk_verify(
+        rows.data(), 1, rows.size(), {}, s, 100, [](int) { return false; },
+        [&](int) { return Control::Continue; });
+    CHECK(w.reason == FinishReason::Stop);
+}
+
+// Gap 2's counter on the sampling path (temperature > 0, top-k > 1), not only
+// the greedy path: an end-of-generation id above the kept pair's floor is a
+// finite candidate the door removed, so door_eog_masked counts it.
+TEST(loop_guard_door_eog_masked_counts_on_the_sampling_path) {
+    SamplerParams p = base_params(LoopGuardMode::Door, 10, 5);
+    p.loop_guard_door_ids = {6, 7};
+    p.think_eog_mask      = false;
+    p.ignore_eos          = false;
+    p.temperature         = 0.7f;
+    p.top_k               = 2;
+    p.top_p               = 1.0f;
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    std::vector<float> row(8, -1.0f);
+    row[0] = 5.0f;   // the EOG id above the kept pair's floor
+    row[3] = 4.5f;
+    row[4] = 4.2f;
+    const int tok = s.sample(row.data(), row.size());
+    CHECK(tok == 3 || tok == 4);
+    CHECK(row[0] == -INFINITY);
+    CHECK_EQ(s.loop_guard_counts().door_eog_masked, 1);
+}
