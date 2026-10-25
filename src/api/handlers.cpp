@@ -26,9 +26,6 @@ double decode_other_seconds(const GenerationStats& stats) {
            stats.draft_verify_seconds - stats.draft_propose_seconds;
 }
 
-// The decode line's conditional terms, extracted from log_stats (review B4
-// follow-up) so the stats wiring is unit-testable at the struct level: the
-// value decode_suffix_for returns is the one that lands on the line.
 bool prompt_ends_inside_think_block(std::string_view prompt, bool extended_tags) {
     // Built on think_tag_pairs(), the one table the split and the sampler's mask
     // read, so no marker is written out here.
@@ -46,6 +43,9 @@ bool loop_guard_moved(const GenerationStats& stats) {
            || stats.loop_self_closes || stats.loop_door_masked || stats.loop_door_eog_masked;
 }
 
+// The decode line's conditional terms, extracted from log_stats (review B4
+// follow-up) so the stats wiring is unit-testable at the struct level: the
+// value decode_suffix_for returns is the one that lands on the line.
 std::string decode_suffix_for(const GenerationStats& stats) {
     std::string decode_suffix;
     if (stats.decode_seconds > 0.0) {

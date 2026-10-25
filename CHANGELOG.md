@@ -18,7 +18,7 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
-## Unreleased (1.2.5)
+## 1.2.5 — 2026-10-25
 
 A fixes and clean-up release: the 1.2.4 release review's three loop-guard
 items, the round-1 follow-ups on the door's budget, and seven review leftovers
@@ -28,16 +28,38 @@ longer starts with the line breaks that follow the think block's closer (as
 the non-streaming answer never did), and a `/v1/completions` prompt that ends
 inside an open think block starts the turn in the block, as chat does.
 
-- **The door owns the turn's ending (ladder)** — once the door is open the
-  escalation goes by budget, not by the repeat share: the nudge fires
-  `door_grace` counted lines after the detection and the slap `grace` counted
-  lines after the nudge, whatever the share. With the door open the guard has
-  changed the row the model draws from, so it owns the turn's ending: a share
-  that now falls below the threshold without the model closing the block can
-  no longer leave the turn running to the token cap. A model that closes the
-  block itself before the budget is unchanged. `ladder-nodoor`, `detect`,
-  `nudge` and `slap` keep 1.2.3's semantics (escalation only on an over line).
-  (`code`)
+- **The door's budget ends every open door (ladder)** — 1.2.4's ladder
+  escalated only on a line at or above the threshold, so a door opened at
+  detection whose share then fell below it held its masks to the token cap.
+  The ladder now decides at two budget points, `door_grace` counted lines
+  after the detection (the nudge point) and `grace` more (the slap point): a
+  share still at or above the low mark (threshold - 0.1) nudges, then slaps,
+  as before; a share below it means the model recovered, and the door lifts
+  its masks (latched) instead, with no nudge or slap, so a recovered turn
+  keeps its reasoning (operator, 2026-10-25). After a lift the door stays
+  shut and a renewed loop follows `ladder-nodoor`'s rule: a turn lifted at the
+  nudge point is nudged at the new detection and slapped on over lines; a turn
+  lifted at the slap point was already past its nudge, so the new detection
+  slaps at once. The answer stays watched in a turn whose door opened (also
+  after a lift), and `self_closes` counts only a close while a mask was
+  active. A lift is logged, with no counter of its own. `ladder-nodoor`,
+  `detect`, `nudge` and `slap` keep 1.2.3's semantics. (`code`)
+- Known residual (`code`, from the release review): a budget point reached by
+  the 64-token stretches (no counted line) decides on the last counted
+  share. A loop the detector cannot count (lines of 20 characters or less, or
+  no newline) after a varied stretch can therefore be lifted rather than
+  escalated and run on to the token cap, with the masks off, so the model
+  can still end the turn. 1.2.4 held the masks in that case.
+- **A ladder whose closer has no id lifts at the slap point** — on a
+  vocabulary whose closer is text the slap has nothing to force; the ladder
+  now lifts the door there instead of holding the masks. No served model is
+  affected (their closers are single tokens). (`code`)
+- **One opener check for chat and completions** — whether a rendered or raw
+  prompt ends inside an open think block is decided by one helper on the
+  shared tag table (every family when the artifact sets the extended tags,
+  the default family otherwise); no literal tag is left in the handlers, and
+  the chat path sets the extended flag before the check. The served templates'
+  result is unchanged, which a test pins. (`code`)
 - **`door` mode's budget** — `door` is the mask alone and has no nudge or slap,
   so a mask could hold a turn to the cap on its own. After `door_grace +
   grace` counted lines without a close, the door lifts its masks (the

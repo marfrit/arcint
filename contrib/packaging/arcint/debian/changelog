@@ -1,3 +1,17 @@
+arcint (1.2.5-1) trixie; urgency=medium
+
+  * 1.2.5: fixes and clean-up. The loop guard's door ends every open door:
+    at its budget points a still-looping turn is nudged and slapped, a
+    recovered one has its masks lifted; door mode lifts after its budget;
+    the door counters measure the sampled candidate set. A stop string that
+    splits a tag keeps the tag's id; the stream drops the line breaks after
+    the closer as the non-streaming answer does; /v1/completions starts
+    inside an open think block like chat. Tools: the clean-turns gate's
+    temperatures, a clean-room speaker head (Apache-2.0). Runtime and
+    dependencies unchanged (llama.cpp 3e4dfa8, 60 patches).
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 25 Oct 2026 18:00:00 +0200
+
 arcint (1.2.4-1) trixie; urgency=medium
 
   * 1.2.4: the loop guard's door rung (--loop-guard door|ladder|ladder-nodoor,

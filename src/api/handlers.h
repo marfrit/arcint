@@ -121,7 +121,7 @@ double decode_other_seconds(const GenerationStats& stats);
 // lands on the line, extracted from log_stats so the wiring is unit-testable
 // at the struct level.
 std::string decode_suffix_for(const GenerationStats& stats);
-// Whether a rendered prompt ends inside an think block: it ends with one tag
+// Whether a rendered prompt ends inside a think block: it ends with one tag
 // family's opener and the newline the templates put after it. The chat path
 // and /v1/completions ask this one function, built on the shared tag table, so
 // they cannot disagree about the start state. With `extended_tags` every

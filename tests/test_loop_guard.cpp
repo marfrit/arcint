@@ -1465,7 +1465,8 @@ TEST(loop_guard_ladder_after_a_lift_renewed_loop_escalates_on_over_lines) {
     feed_lines(s, 18, 22, false); // the share 0.6 at the door grace: the lift
     CHECK_EQ(s.loop_guard_counts().nudges, 0);
 
-    // The loop renews. The share rises through 0.7 (low re-armed) to 0.8+.
+    // The loop renews (low was re-armed when the share fell to 0.6). The share
+    // rises through 0.7 to 0.8+.
     for (int i = 0; i < 40 && s.loop_guard_counts().detections < 2; ++i) feed_text(s, loop_line(i));
     CHECK_EQ(s.loop_guard_counts().detections, 2);
     CHECK_EQ(s.loop_guard_counts().nudges, 1);   // the detection nudges, as ladder-nodoor
