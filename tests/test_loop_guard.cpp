@@ -2082,3 +2082,92 @@ TEST(opener_start_state_is_one_helper_for_chat_and_completions) {
     CHECK(start_state("reasoning so far\n" + default_open, true));
     CHECK(!start_state("just an answer", true));
 }
+
+// (T1) The recovery test is the LOW MARK, not the threshold: a share inside the
+// band between them (0.80 with threshold 0.85, low mark 0.75) is still looping
+// by the hysteresis' own definition, so a budget point must not lift -- the
+// ladder nudges at the nudge point and slaps at the slap point.
+TEST(loop_guard_ladder_band_share_still_escalates_at_a_budget_point) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 20, 1);
+    p.loop_guard_threshold = 0.85f;   // low mark 0.75
+    p.loop_guard_door_grace = 10;
+    p.loop_guard_door_ids   = {6, 7};
+    p.loop_guard_nudge_ids  = {kPieceFirst};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    // Ten loop lines: the share 9/10 = 0.90 crosses the threshold; detection.
+    feed_lines(s, 0, 10, true);
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+
+    // Nine more counted lines -- seven loops and two varied -- keep the window
+    // at 0.89, 0.84: still well above the low mark, so the door stays open.
+    feed_lines(s, 10, 17, true);
+    feed_text(s, distinct_line(0));
+    feed_text(s, distinct_line(1));
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+
+    // The tenth counted line since detection is the door grace's budget point.
+    // The window is 16 of 20 repeats = 0.80: inside the band, not recovered.
+    feed_text(s, distinct_line(2));
+    CHECK_EQ(s.loop_guard_counts().nudges, 1);   // the ladder nudges, no lift
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    // Deliver the nudge sentence's one id, so the draw below is the model's.
+    std::vector<float> nudge_row = row_with_argmax(2);
+    const int nudge_id = s.sample(nudge_row.data(), nudge_row.size());
+    CHECK_EQ(nudge_id, kPieceFirst);
+    s.observe_think(nudge_id, piece_of(nudge_id));
+
+    // The nudge grace's line leaves the share at 0.80 again: inside the band.
+    feed_text(s, distinct_line(3));
+    CHECK_EQ(s.loop_guard_counts().slaps, 1);    // the slap, no lift at the band
+    std::vector<float> row(8, -1.0f);
+    CHECK_EQ(s.sample(row.data(), row.size()), 5);   // the forced closer
+}
+
+// (T2) Door mode's answer watch: the door was opened (and lifted before the
+// close), the model closes the block by its own draw, and the answer repeats
+// lines. The turn ends on finish_reason loop -- the watch keys on the door
+// having OPENED, in door mode as in the ladder.
+TEST(loop_guard_door_mode_answer_watched_after_a_lift) {
+    SamplerParams p = base_params(LoopGuardMode::Door, 10, 1);
+    p.loop_guard_door_grace = 1;
+    p.loop_guard_door_ids   = {6, 7};
+    p.think_eog_mask        = false;
+    p.ignore_eos            = false;
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    // door_grace 1 + grace 1: two counted lines later the door lifts.
+    feed_text(s, loop_line(18));
+    feed_text(s, loop_line(19));
+    CHECK_EQ(s.loop_guard_counts().detections, 1);   // the lift, not a detection
+
+    // The model closes the block by its own draw (no mask now: no self-close).
+    std::vector<float> row(8, -1.0f);
+    row[5] = 9.0f;
+    row[4] = 1.0f;
+    CHECK_EQ(s.sample(row.data(), row.size()), 5);
+    s.observe(5, "closed");
+    CHECK_EQ(s.loop_guard_counts().self_closes, 0);
+    CHECK(!s.think_block_open());
+
+    // A looping answer: watched because the door opened in this turn.
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);
+    CHECK(s.loop_abort());
+    CHECK_EQ(s.loop_guard_counts().aborts, 1);
+
+    std::vector<float> rows = row_with_argmax(3);
+    const VerifyWalk   w = walk_verify(
+        rows.data(), 1, rows.size(), {}, s, 100, [](int) { return false; },
+        [&](int) { return Control::Continue; });
+    CHECK(w.reason == FinishReason::Loop);
+    CHECK_EQ(std::string(finish_reason_name(w.reason)), std::string("loop"));
+}
