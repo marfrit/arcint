@@ -28,6 +28,9 @@
 - Flash-Next's production quant is ISTA-DASLab's GSQ-RCO IQ3_S since
   2026-10-20 (operator): 33.3 t/s decode on six answers, KL 0.127 against
   Q8_0 (IQ3_XXS 38.0 t/s, 0.217, the rollback).
+- Version 1.2.6 (2026-10-25): the loop guard's stretch budget point judged
+  on a token repeat share; the release A/B reads decode on the majority
+  answer.
 - Version 1.2.5 (2026-10-25): fixes and clean-up: the door's budget lifts a
   recovered turn's masks and nudges/slaps a looping one; the stream drops the
   line breaks after the closer; /v1/completions starts inside an open block

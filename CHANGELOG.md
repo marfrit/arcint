@@ -18,7 +18,12 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
-## Unreleased (1.2.6)
+## 1.2.6 — 2026-10-25
+
+The loop guard's last 1.2.5 residual fixed, and the release A/B reads decode
+rates on the majority answer. Every switch stays **off by default**; with none
+set a request is served as in 1.2.5.
+
 
 - **A stretch's budget point judges recovery on the tokens** — 1.2.5's
   residual: a budget point the door reaches by 64-token stretches (no counted
@@ -27,7 +32,9 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   stretch was lifted rather than escalated. Such a point now reads a token
   repeat share: the share of 8-token grams in the stretch that occurred
   earlier within the last 2,048 generated ids, recovered when it is below the
-  low mark. A point reached by a counted line keeps the line share. The
+  low mark. A point reached by a counted line keeps the line share; every
+  decision, the counted line's too, starts the next span, so a counted-line
+  loop's repeats are not carried into a later stretch's share. The
   tracker records only while the door is open; with the door shut or the
   guard off nothing is computed. Loops with a period up to the window
   (2,048 ids) are caught. Residual (`code`): a short-line loop with one
@@ -49,6 +56,10 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   already fixed in length. Read this way, 1.2.5's first Flash-Next window
   passes (its one slow run was the one with another answer) and its second
   still fails (slower on the same answer).
+
+**Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (60
+patches), unchanged from 1.2.5; dependencies unchanged. `arcint-stt` (1.2.0)
+and `arcint-imggen` (1.1.1) are unchanged.
 
 ## 1.2.5 — 2026-10-25
 
