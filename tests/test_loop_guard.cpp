@@ -1536,3 +1536,152 @@ TEST(loop_guard_door_masked_counts_the_truncated_set_at_top_k_zero) {
     const int t3 = s.sample(third.data(), third.size());
     CHECK_EQ(std::vector<int>({t1, t2, t3}), std::vector<int>({4, 4, 3}));
 }
+// ── 1.2.5 round 2: the door's budget in tokens, and the lifted-door latch ──
+
+// (A) The door's budget counted ended lines only, so a turn that switched to
+// newline-free text never advanced it and the masks could hold the turn to the
+// token cap. Each stretch of tokens without a counted line now counts as one
+// line-equivalent for the budget (never for the detector's window): the ladder
+// nudges and slaps by budget on newline-free text exactly as on lines.
+TEST(loop_guard_door_budget_advances_by_tokens_without_line_ends) {
+    constexpr int kStretch = 64;   // the sampler's stretch length
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 1);
+    p.loop_guard_door_grace = 3;
+    p.loop_guard_door_ids   = {6, 7};
+    for (size_t i = 0; i < kPiece.size(); ++i)
+        p.loop_guard_nudge_ids.push_back(kPieceFirst + static_cast<int>(i));
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+
+    // A counted line is the anchor: it spends one grace line and restarts the
+    // token stretch, so the numbers below are exact whatever the detection did.
+    feed_text(s, distinct_line(18));
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+
+    // The model writes only newline-free text: no line ever ends again.
+    int tokens = 0;
+    auto tok = [&] {
+        s.observe_think(30, "word ");   // no newline in the piece
+        ++tokens;
+    };
+    while (tokens < kStretch - 1) tok();   // one stretch short: grace 2 of 3
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+    tok();                                 // the first stretch: grace 2
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+    while (tokens < 2 * kStretch - 1) tok();
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);
+    tok();                                 // the second stretch: grace 3, the nudge
+    CHECK_EQ(s.loop_guard_counts().nudges, 1);
+    CHECK_EQ(s.loop_guard_counts().detections, 1);   // no detection from tokens
+
+    while (tokens < 3 * kStretch - 1) tok();   // the nudge's grace not yet
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+    tok();                                     // the next stretch: the slap
+    CHECK_EQ(s.loop_guard_counts().slaps, 1);
+
+    // Deliver the nudge, then the forced closer: the turn ends, not the cap.
+    for (size_t i = 0; i < kPiece.size(); ++i) {
+        std::vector<float> l = row_with_argmax(2);
+        const int id = s.sample(l.data(), l.size());
+        s.observe_think(id, piece_of(id));
+    }
+    std::vector<float> l = row_with_argmax(2);
+    CHECK_EQ(s.sample(l.data(), l.size()), 5);
+    s.observe(5, "closed");
+    CHECK(!s.think_block_open());
+}
+
+// (A) `door` mode on the same newline-free stream: after door_grace + grace
+// line-equivalents the door lifts, and the multi-newline and turn-ending ids
+// are drawable again. Before the lift the masks still hold.
+TEST(loop_guard_door_mode_lifts_after_token_stretches_without_lines) {
+    constexpr int kStretch = 64;
+    SamplerParams p = base_params(LoopGuardMode::Door, 10, 1);
+    p.loop_guard_door_grace = 1;
+    p.loop_guard_door_ids   = {6, 7};
+    p.think_eog_mask        = false;
+    p.ignore_eos            = false;
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    feed_text(s, distinct_line(18));   // the counted-line anchor: grace 1
+    int tokens = 0;
+    auto tok = [&] {
+        s.observe_think(30, "word ");
+        ++tokens;
+    };
+    while (tokens < kStretch - 1) tok();   // 1 short of door_grace + grace
+    std::vector<float> still(8, -1.0f);
+    still[0] = 5.0f;    // the EOG id
+    still[6] = 6.0f;    // a multi-newline token
+    still[4] = 1.0f;    // the single newline
+    CHECK_EQ(s.sample(still.data(), still.size()), 4);
+    CHECK(still[0] == -INFINITY);
+    CHECK(still[6] == -INFINITY);
+
+    tok();   // the stretch: door_grace + grace, the lift
+    std::vector<float> lifted(8, -1.0f);
+    lifted[0] = 5.0f;
+    lifted[6] = 6.0f;
+    lifted[4] = 1.0f;
+    CHECK_EQ(s.sample(lifted.data(), lifted.size()), 6);
+    CHECK(lifted[0] == 5.0f);
+    CHECK(lifted[6] == 6.0f);
+}
+
+// (A2) The lifted-door latch, pinned: after `door` mode's budget lifted the
+// masks, the share falls and rises again to a second detection -- the masks
+// stay off and the counters do not grow. A lifted door is not reopened.
+TEST(loop_guard_door_lifted_is_not_reopened_by_a_later_detection) {
+    constexpr int kStretch = 64;
+    SamplerParams p = base_params(LoopGuardMode::Door, 10, 2);
+    p.loop_guard_door_grace = 1;
+    p.loop_guard_door_ids   = {6, 7};
+    p.think_eog_mask        = false;
+    p.ignore_eos            = false;
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    feed_text(s, distinct_line(18));   // the anchor: grace 1
+    // door_grace 1 + the ladder grace 2 = three line-equivalents: the anchor
+    // plus two token stretches.
+    for (int i = 0; i < 2 * kStretch; ++i) s.observe_think(30, "word ");
+    std::vector<float> open_row(8, -1.0f);
+    open_row[0] = 5.0f;
+    open_row[6] = 6.0f;
+    open_row[4] = 1.0f;
+    CHECK_EQ(s.sample(open_row.data(), open_row.size()), 6);   // lifted
+    CHECK_EQ(s.loop_guard_counts().door_masked, 0);
+    CHECK_EQ(s.loop_guard_counts().door_eog_masked, 0);
+
+    // The share falls (varied lines), then rises again to a second detection.
+    // Feed line by line and stop at the detection, so the sample below is the
+    // first draw after it: a reopened door is still masked here.
+    feed_lines(s, 18, 30, false);
+    for (int i = 0; i < 40 && s.loop_guard_counts().detections < 2; ++i) feed_text(s, loop_line(i));
+    CHECK_EQ(s.loop_guard_counts().detections, 2);
+
+    std::vector<float> after(8, -1.0f);
+    after[0] = 5.0f;   // the EOG id: masked again only if the door reopened
+    after[6] = 6.0f;   // a multi-newline token, likewise
+    after[4] = 1.0f;
+    CHECK_EQ(s.sample(after.data(), after.size()), 6);
+    CHECK(after[0] == 5.0f);
+    CHECK(after[6] == 6.0f);
+    CHECK_EQ(s.loop_guard_counts().door_masked, 0);
+    CHECK_EQ(s.loop_guard_counts().door_eog_masked, 0);
+}
+

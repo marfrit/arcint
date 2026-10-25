@@ -205,6 +205,9 @@ private:
     void   loop_do_abort_();
     // door (no ladder): the budget spent -- lift the masks and go on unguarded
     void   loop_door_lift_();
+    // the ladder's escalation, by counted lines once the door is open (shared
+    // with the token stretch in observe_think_)
+    void   loop_escalate_(bool over);
     void   apply_penalties(float* logits, size_t vocab) const;
     void   mask_illegal_while_thinking(float* logits, size_t vocab) const;
     // loop-guard door: mask the multi-newline ids while the door is open and
@@ -316,7 +319,12 @@ private:
     // a later detection cannot reopen a mask the guard already gave up.
     bool loop_door_lifted_   = false;
     bool loop_forced_closer_ = false;
-    int  loop_since_detect_  = 0;   // counted lines since detection (door grace)
+    // counted lines since the detection (door grace, and `door` mode's lift
+    // budget).
+    int  loop_since_detect_  = 0;
+    // Generated tokens since the last counted line while the door is open; a
+    // full stretch counts as one line-equivalent for the budget.
+    int  loop_door_tokens_   = 0;
     int  loop_self_closes_   = 0;
     int  loop_door_masked_   = 0;
     int  loop_door_eog_masked_ = 0;

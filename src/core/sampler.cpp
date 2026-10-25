@@ -16,6 +16,15 @@ namespace {
 // vocabulary, so a probe short of the top_p mass is seen and falls back.
 constexpr size_t kCandidateProbe = 2048;
 
+// The door's budget in tokens: a counted reasoning line costs 15-25 tokens on
+// a small model (a line counts above 20 characters, a token is 2-4 bytes), so
+// a stretch of 64 generated tokens without a counted line is several lines'
+// worth. Past it the budget advances by one line-equivalent: a model that
+// switches to newline-free text can then not hold the masks to the token cap.
+// Conservative on purpose: 64 makes the stretch slower than ordinary lines,
+// so a turn with lines keeps the line budget exactly.
+constexpr int kDoorStretchTokens = 64;
+
 }  // namespace
 
 Sampler::Sampler(const SamplerParams& params, uint64_t seed)
@@ -138,6 +147,7 @@ void Sampler::start_in_think_block(bool open) {
     loop_door_open_     = false;
     loop_door_lifted_   = false;
     loop_forced_closer_ = false;
+    loop_door_tokens_   = 0;
     loop_since_detect_  = 0;
     loop_self_closes_   = 0;
     loop_door_masked_   = 0;
@@ -175,6 +185,24 @@ void Sampler::observe_think_(std::string_view piece, int token) {
     // door is open. Consumed with the token it belongs to.
     const bool forced_closer = loop_forced_closer_;
     loop_forced_closer_      = false;
+
+    // The door's budget also advances by generated tokens, so a newline-free
+    // stretch cannot evade it: each stretch of kDoorStretchTokens tokens with
+    // no counted line is one line-equivalent for the budget, never for the
+    // detector's window. It runs BEFORE the detector feeds, so a counted line
+    // in the same call resets the stretch it absorbed (the line, not the line
+    // plus one token).
+    if (params_.loop_guard != LoopGuardMode::Off && !forced_closer
+        && think_state_ == ThinkState::thinking && loop_door_open_) {
+        if (++loop_door_tokens_ >= kDoorStretchTokens) {
+            loop_door_tokens_ = 0;
+            ++loop_since_detect_;
+            if (loop_nudged_ && !loop_slapped_) ++loop_since_nudge_;
+            log::debug("loop-guard", "the door's budget advances by a %d-token stretch without a counted line",
+                       kDoorStretchTokens);
+            loop_escalate_(false);
+        }
+    }
 
     // loop-guard: feed the detector from the same piece stream the tracker
     // sees. Reasoning is watched while the block is open; the answer phase is
@@ -401,10 +429,14 @@ void Sampler::loop_line_ended_(const std::string& raw_line) {
     if (!thinking && !content) return;
 
     if (thinking && loop_nudged_ && !loop_slapped_) ++loop_since_nudge_;
-    // door: counted lines since the detection moment. Incremented while the
-    // door is already open, so the detection line itself is zero and K = 0
-    // nudges on that line.
-    if (thinking && loop_door_open_) ++loop_since_detect_;
+    // door: counted lines since the detection moment (and `door` mode's lift
+    // budget). Incremented while the door is already open, so the detection
+    // line itself is zero and K = 0 nudges on the first line after it. A
+    // counted line resets the token stretch it absorbed.
+    if (thinking && loop_door_open_) {
+        ++loop_since_detect_;
+        loop_door_tokens_ = 0;
+    }
     const bool exact_repeat = loop_seen_[line]++ > 0;
     bool       repeated     = exact_repeat;
     if (!exact_repeat && params_.loop_guard_match == LoopGuardMatch::Near) {
@@ -443,38 +475,37 @@ void Sampler::loop_line_ended_(const std::string& raw_line) {
                       repeats, loop_window_.size(), share, loop_seen_.size());
             loop_on_detect_(false);
         }
-        // The door rung: the model may close by its own draw, so the ladder
-        // nudges only when the loop persists past the door grace. The nudge is
-        // never repeated; the slap keeps its own grace after the nudge.
-        //
-        // While the door is open the escalation goes by budget alone, not by
-        // the share: the door has already changed the row the model draws
-        // from, so the guard owns the turn's ending. A share that dips below
-        // the threshold without the model closing the block must not leave the
-        // turn running to the token cap -- the defect 1.2.4's review recorded.
-        if (loop_guard_is_ladder(params_.loop_guard) && loop_door_open_ && !loop_nudged_
-            && loop_since_detect_ >= params_.loop_guard_door_grace) {
-            loop_do_nudge_();
-        }
-        // The slap fires on the nudge's grace whatever the share once the door
-        // is open; ladder-nodoor never opens it, so there it still waits for an
-        // over line (1.2.3's semantics).
-        if (loop_guard_is_ladder(params_.loop_guard) && loop_nudged_ && !loop_slapped_
-            && loop_since_nudge_ >= params_.loop_guard_grace
-            && (over || loop_door_open_)) {
-            loop_do_slap_();
-        }
-        // `door` (no ladder): a mask alone must not hold the turn to the cap
-        // either. After the door grace plus the ladder's grace counted lines
-        // without a close, the door gives up its masks -- the multi-newline
-        // ones and the turn-ending ones it added -- and says so once; the turn
-        // goes on unguarded, as with the switch off.
-        if (params_.loop_guard == LoopGuardMode::Door && loop_door_open_
-            && loop_since_detect_ >= params_.loop_guard_door_grace + params_.loop_guard_grace) {
-            loop_door_lift_();
-        }
+        // Escalation, shared with the token stretch: by counted lines, and once
+        // the door is open by the budget alone, not by the share (the door has
+        // changed the row the model draws from, so the guard owns the turn's
+        // ending; a share that dips below the threshold without a close must
+        // not leave the turn running to the token cap).
+        loop_escalate_(over);
     } else if (content && over && !loop_abort_) {
         loop_do_abort_();
+    }
+}
+
+// The door rung's escalation: the nudge fires door_grace counted lines after
+// the detection and the slap grace counted lines after the nudge. Once the
+// door is open that is the budget alone, whatever the share; ladder-nodoor
+// never opens the door, so there escalation stays on over lines (1.2.3's
+// semantics). `door` mode has neither rung: after door_grace + grace counted
+// lines without a close it lifts the masks, so a mask alone cannot hold the
+// turn to the cap either.
+void Sampler::loop_escalate_(bool over) {
+    if (loop_guard_is_ladder(params_.loop_guard) && loop_door_open_ && !loop_nudged_
+        && loop_since_detect_ >= params_.loop_guard_door_grace) {
+        loop_do_nudge_();
+    }
+    if (loop_guard_is_ladder(params_.loop_guard) && loop_nudged_ && !loop_slapped_
+        && loop_since_nudge_ >= params_.loop_guard_grace
+        && (over || loop_door_open_)) {
+        loop_do_slap_();
+    }
+    if (params_.loop_guard == LoopGuardMode::Door && loop_door_open_
+        && loop_since_detect_ >= params_.loop_guard_door_grace + params_.loop_guard_grace) {
+        loop_door_lift_();
     }
 }
 
@@ -493,12 +524,16 @@ void Sampler::loop_on_detect_(bool content_phase) {
             // budget already lifted is not reopened: from the lift on the
             // turn is the switch-off path (loop_door_lift_).
             if (loop_door_lifted_) return;
-            loop_door_open_ = true;
+            loop_door_open_    = true;
+            loop_door_tokens_  = 0;
+            loop_since_detect_ = 0;   // the door's grace starts at its opening
             return;
         case LoopGuardMode::Ladder:
-            // the door opens first; the nudge and slap follow by grace in
-            // loop_line_ended_ if the loop persists
-            loop_door_open_ = true;
+            // the door opens first; the nudge and slap follow by counted lines
+            // (loop_escalate_), whatever the share
+            loop_door_open_    = true;
+            loop_door_tokens_  = 0;
+            loop_since_detect_ = 0;   // the door's grace starts at its opening
             return;
         case LoopGuardMode::LadderNoDoor: loop_do_nudge_(); return;   // today's order
     }
@@ -552,6 +587,7 @@ void Sampler::loop_do_slap_() {
 void Sampler::loop_door_lift_() {
     loop_door_open_   = false;
     loop_door_lifted_ = true;
+    loop_door_tokens_ = 0;
     log::info("loop-guard", "lane: the door lifts its masks after %d counted lines without a close; "
                             "the turn continues unguarded",
               loop_since_detect_);
