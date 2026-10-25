@@ -2197,6 +2197,13 @@ void feed_cycle_ids(Sampler& s, int n) {
     for (int i = 0; i < n; ++i) s.observe_think(ids[i % 5], "ab ");
 }
 
+// A newline-free cycle of a given period: ids new per position of the cycle,
+// text without a newline. A period above 64 tokens is the case the window has
+// to span, not the stretch.
+void feed_cycle_period(Sampler& s, int period, int n, int base = 2000) {
+    for (int i = 0; i < n; ++i) s.observe_think(base + i % period, "ab ");
+}
+
 // A newline-free stretch of distinct ids: the token evidence says no repeat.
 // `base` keeps two calls in one test distinct -- the window now spans the
 // stretches, so a repeated id range across calls would be a cycle.
@@ -2389,10 +2396,9 @@ TEST(loop_guard_counted_line_budget_point_keeps_the_line_share) {
     CHECK(masked[6] == -INFINITY);
 }
 
-// The window is bounded: a span of more than 2048 ids (here 500 counted lines
-// of five id-bearing tokens each) evicts its oldest grams, and the stretch that
-// follows still reads the loop as over. It pins the ring path, not the share's
-// size: the tracker never holds more than kLoopTokenWindow ids.
+// A counted line whose five ids cycle within the line: its text repeats (over
+// for the line detector) and its ids repeat too, so a long run of these lines
+// fills the token span with repeat positions.
 void feed_id_lines(Sampler& s, int lines) {
     static const int ids[5] = {401, 402, 403, 404, 405};
     static const char* pieces[5] = {"Wait, ", "the ", "index ", "still ", "same.\n"};
@@ -2400,9 +2406,16 @@ void feed_id_lines(Sampler& s, int lines) {
         for (int j = 0; j < 5; ++j) s.observe_think(ids[j], pieces[j]);
 }
 
-TEST(loop_guard_token_window_evicts_an_oversized_span) {
+// Every decision starts a span, the counted line's as well as the stretch's: a
+// long counted-line loop (399 lines, ~1995 repeat positions) up to the budget
+// point, then a genuinely recovered newline-free stretch to the next budget
+// point, lifts. Mutation (red first): the span reset's call site moves from
+// `loop_escalate_` to the stretch branch only (round 2's placement) -- the
+// loop's repeat positions stay in the span, the recovery reads as 0.96 over,
+// and the ladder nudges.
+TEST(loop_guard_recovered_stretch_after_a_long_counted_line_loop_lifts) {
     SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 2);
-    p.loop_guard_door_grace = 501;      // the last counted line is one short
+    p.loop_guard_door_grace = 400;   // the long loop stops one short of it
     p.loop_guard_door_ids   = {6, 7};
     p.think_eog_mask        = false;
     p.ignore_eos            = false;
@@ -2414,13 +2427,57 @@ TEST(loop_guard_token_window_evicts_an_oversized_span) {
     feed_lines(s, 9, 18, true);   // detection; the door opens
     CHECK_EQ(s.loop_guard_counts().detections, 1);
 
-    feed_id_lines(s, 500);        // 2500 ids: the window evicts from here on
-    CHECK(s.loop_guard_tokens_seen() > 2048);
+    feed_id_lines(s, 399);        // 1995 ids, all repeat positions, no rung
     CHECK_EQ(s.loop_guard_counts().nudges, 0);
+    CHECK(s.loop_guard_tokens_seen() >= 1995);
 
-    feed_varied_ids(s, 64);       // the stretch reaches the grace (501)
-    CHECK_EQ(s.loop_guard_counts().nudges, 1);   // the span still reads over: nudge
-    CHECK(s.think_block_open());   // no lift; the door is still there
+    feed_varied_ids(s, 64);       // the stretch reaches the grace (400)
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);   // recovered, no nudge
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+
+    std::vector<float> row(8, -1.0f);
+    row[0] = 5.0f;   // the EOG id
+    row[6] = 6.0f;   // a multi-newline token
+    row[4] = 1.0f;   // the single newline
+    CHECK_EQ(s.sample(row.data(), row.size()), 6);   // the lift, drawable
+    CHECK(row[0] == 5.0f);
+    CHECK(row[6] == 6.0f);
+}
+
+// The window is bounded and the eviction decides: a newline-free cycle of
+// period 2100, just past the 2048-id window, run to the 34th stretch (2176
+// tokens). The span at that budget point has its 2100-back counterparts
+// evicted, so no position repeats and the turn reads recovered -- the lift.
+// Mutation (red first): the window evicts nothing (`i >= W` never holds) --
+// the counterparts stay in the multiset, the whole span repeats, and the
+// ladder nudges.
+TEST(loop_guard_token_window_evicts_beyond_2048_ids) {
+    SamplerParams p = base_params(LoopGuardMode::Ladder, 10, 2);
+    p.loop_guard_door_grace = 34;    // the 34th stretch is the budget point
+    p.loop_guard_door_ids   = {6, 7};
+    p.think_eog_mask        = false;
+    p.ignore_eos            = false;
+    p.loop_guard_nudge_ids  = {kPieceFirst};
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+
+    feed_lines(s, 0, 9, false);
+    feed_lines(s, 9, 18, true);   // detection; the door opens
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    feed_cycle_period(s, 2100, 2176);   // no line counts: the stretches advance
+    CHECK(s.loop_guard_tokens_seen() > 2048);
+    CHECK_EQ(s.loop_guard_counts().nudges, 0);   // the counterparts are evicted
+    CHECK_EQ(s.loop_guard_counts().slaps, 0);
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+
+    std::vector<float> row(8, -1.0f);
+    row[0] = 5.0f;
+    row[6] = 6.0f;
+    row[4] = 1.0f;
+    CHECK_EQ(s.sample(row.data(), row.size()), 6);   // lifted
+    CHECK(row[0] == 5.0f);
+    CHECK(row[6] == 6.0f);
 }
 
 // (v) The zero-cost path: while the door is closed or the guard is off the
@@ -2460,13 +2517,6 @@ TEST(loop_guard_token_tracker_records_nothing_while_the_door_is_shut) {
         for (int i = 0; i < 64; ++i) s.observe_think(i % 5, "word ");
         CHECK(s.loop_guard_tokens_seen() > 0);
     }
-}
-
-// A newline-free cycle of a given period: ids new per position of the cycle,
-// text without a newline. A period above 64 tokens is the case the window has
-// to span, not the stretch.
-void feed_cycle_period(Sampler& s, int period, int n, int base = 2000) {
-    for (int i = 0; i < n; ++i) s.observe_think(base + i % period, "ab ");
 }
 
 // (1.2.6 round 2, a) A newline-free cycle of period 40 reaches the budget point

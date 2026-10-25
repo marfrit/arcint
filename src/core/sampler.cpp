@@ -192,6 +192,9 @@ void Sampler::start_in_think_block(bool open) {
     loop_self_closes_   = 0;
     loop_door_masked_   = 0;
     loop_door_eog_masked_ = 0;
+    // A reused sampler starts with a clean tracker; the door's opening clears
+    // it again, so this is the earlier of two and harmless.
+    loop_token_reset_();
     // The closer of a template-opened block: the first pair's close id, or the
     // first flattened close id. -1 keeps the text fallback.
     int cid = -1;
@@ -284,14 +287,13 @@ void Sampler::observe_think_(std::string_view piece, int token) {
             // last decision; a span with no full k-gram yet (the door just
             // opened, or a text-only feed) falls back to the detector's share,
             // as 1.2.5's stretch did.
+            // The decision resets the span's counters (loop_escalate_); the
+            // WINDOW stays -- ids, gram ring and multiset are the last
+            // kLoopTokenWindow ids of the turn, not one stretch, because
+            // clearing them at every boundary would make a repeat visible only
+            // inside one 64-token stretch: a newline-free sentence of period
+            // 30-80 tokens could then never repeat and would read as recovered.
             loop_escalate_(loop_token_share_());
-            // A decision: the next span's counters start here. The WINDOW stays
-            // -- ids, gram ring and multiset are the last kLoopTokenWindow ids
-            // of the turn, not one stretch, because clearing them at every
-            // boundary would make a repeat visible only inside one 64-token
-            // stretch: a newline-free sentence of period 30-80 tokens could
-            // then never repeat and would read as recovered.
-            loop_token_span_reset_();
         }
     }
 
@@ -637,6 +639,12 @@ void Sampler::loop_escalate_(float share) {
         && loop_since_detect_ >= params_.loop_guard_door_grace + params_.loop_guard_grace) {
         loop_door_lift_();
     }
+    // EVERY decision starts the next span here, the counted line's as well as
+    // the stretch's: a line's tokens must not be carried into a later stretch's
+    // share. A long counted-line loop whose repeat positions stayed in the span
+    // made a genuinely recovered newline-free stretch read as looping and
+    // nudge. The window is not cleared -- it is the turn's, not the span's.
+    loop_token_span_reset_();
 }
 
 void Sampler::loop_token_record_(int token) {

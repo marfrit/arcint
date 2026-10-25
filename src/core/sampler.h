@@ -222,8 +222,9 @@ private:
     // newlines) is still judged by the tokens themselves. Nothing is recorded
     // while the door is closed or the guard is off: that path costs zero.
     void   loop_token_record_(int token);
-    // A decision keeps the window and resets the share's counters; a new
-    // context (the door opens, lifts, the block closes) clears both.
+    // A decision -- the counted line's as well as the stretch's -- keeps the
+    // window and resets the share's counters; a new context (the door opens,
+    // lifts, the block closes, the turn starts) clears both.
     void   loop_token_span_reset_();
     void   loop_token_reset_();
     float  loop_token_share_() const;
