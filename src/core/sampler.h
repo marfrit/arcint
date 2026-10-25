@@ -319,9 +319,14 @@ private:
     // marks the token sample() returned for a slap, so observe_think_ does not
     // count that close as the model's own.
     bool loop_door_open_     = false;
-    // A door the budget lifted stays shut for the rest of the turn (door mode);
-    // a later detection cannot reopen a mask the guard already gave up.
+    // A door the budget lifted stays shut for the rest of the turn (door mode,
+    // and a ladder that recovered or has no closer to force); a later
+    // detection cannot reopen a mask the guard already gave up.
     bool loop_door_lifted_   = false;
+    // Whether the door OPENED in this turn, surviving a lift. The answer watch
+    // (gap 1) keys on this: a turn whose door opened and was lifted before the
+    // close is still watched in its answer.
+    bool loop_door_opened_   = false;
     bool loop_forced_closer_ = false;
     // counted line-equivalents since the detection: ended lines, and stretches
     // of tokens without one while the door is open. Drives the door grace and
@@ -334,6 +339,9 @@ private:
     // piece: counted, but the ladder does not act, or a nudge lands in the
     // answer after the block closed.
     bool loop_suppress_escalation_ = false;
+    // The detector's last share. The token stretch judges recovery by it: no
+    // line ends in a stretch, so the share stands where the detector left it.
+    float loop_share_ = 0.0f;
     int  loop_self_closes_   = 0;
     int  loop_door_masked_   = 0;
     int  loop_door_eog_masked_ = 0;

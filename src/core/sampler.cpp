@@ -158,6 +158,7 @@ void Sampler::start_in_think_block(bool open) {
     // request anyway, but this keeps a reused sampler honest).
     loop_door_open_     = false;
     loop_door_lifted_   = false;
+    loop_door_opened_   = false;
     loop_forced_closer_ = false;
     loop_door_tokens_   = 0;
     loop_since_detect_  = 0;
@@ -268,7 +269,7 @@ void Sampler::observe_think_(std::string_view piece, int token) {
         const bool saved_suppress = loop_suppress_escalation_;
         loop_suppress_escalation_ = closer_now;
         if (think_state_ == ThinkState::thinking
-            || (think_state_ == ThinkState::content && (loop_slapped_ || loop_door_open_)))
+            || (think_state_ == ThinkState::content && (loop_slapped_ || loop_door_opened_)))
             loop_observe_(reason_piece);
         loop_suppress_escalation_ = saved_suppress;
         if (nudge_done) loop_line_.clear();
@@ -282,7 +283,10 @@ void Sampler::observe_think_(std::string_view piece, int token) {
         // reasoning lines (including the loop that opened the door) must not
         // count as answer repeats, and an answer that restates a line or two
         // of its reasoning once is normal.
-        if (loop_door_open_ || loop_slapped_) loop_start_answer_();
+        // gap 1 keys on the door having OPENED in this turn, not on it still
+        // being open: a turn whose door was lifted before the close (recovered)
+        // is still watched in its answer.
+        if (loop_door_opened_ || loop_slapped_) loop_start_answer_();
         think_state_ = ThinkState::content;
         think_tail_.clear();
         think_lead_.clear();
@@ -384,7 +388,7 @@ void Sampler::observe_think_(std::string_view piece, int token) {
             // stale lead nor a tail remnant can re-open the block later.
             if (loop_door_open_ && !forced_closer) ++loop_self_closes_;
             // gap 1: same clean window at the text-closer close.
-            if (loop_door_open_ || loop_slapped_) loop_start_answer_();
+            if (loop_door_opened_ || loop_slapped_) loop_start_answer_();
             think_state_ = ThinkState::content;
             think_tail_.clear();
             think_lead_.clear();
@@ -509,6 +513,10 @@ void Sampler::loop_line_ended_(const std::string& raw_line) {
     size_t repeats = 0;
     for (const LoopLine& l : loop_window_) repeats += l.repeated ? 1 : 0;
     const float share = static_cast<float>(repeats) / static_cast<float>(loop_window_.size());
+    // The last share the detector computed. The token stretch has no line to
+    // judge, so the ladder's recovery decision at that budget point reads this
+    // -- the share the detector stood at when the stretch began.
+    loop_share_      = share;
     const bool  over     = share >= params_.loop_guard_threshold;
     // Hysteresis: low is re-armed only below (threshold - 0.1). A nudge's own
     // new line pushes the share just under the threshold; that dip must not
@@ -547,15 +555,31 @@ void Sampler::loop_line_ended_(const std::string& raw_line) {
 // there escalation stays on over lines (1.2.3's semantics). `door` mode has
 // neither rung: after door_grace + grace counted lines without a close it
 // lifts the masks, so a mask alone cannot hold the turn to the cap either.
+//
+// A turn that recovers (the share back below the low mark) does not escalate
+// at a budget point: the ladder lifts the door's masks instead, latched. The
+// masks were put there to end a loop; healthy reasoning needs no closer
+// forced in its middle. Below the LOW MARK, not merely below the threshold:
+// the hysteresis already treats the band between the two as still looping (a
+// dip just under the threshold must not re-arm a detection), so half-recovered
+// text keeps the door. From the lift on the turn is ladder-nodoor's rule: a
+// renewed loop escalates on over lines, without reopening the door.
+
 void Sampler::loop_escalate_(bool over) {
+    const bool recovered = loop_share_ < params_.loop_guard_threshold - 0.1f;
     if (loop_guard_door_ladder(params_.loop_guard) && loop_door_open_ && !loop_nudged_
         && loop_since_detect_ >= params_.loop_guard_door_grace) {
-        loop_do_nudge_();
+        if (recovered) loop_door_lift_();   // no nudge into healthy reasoning
+        else loop_do_nudge_();
     }
     if (loop_guard_is_ladder(params_.loop_guard) && loop_nudged_ && !loop_slapped_
         && loop_since_nudge_ >= params_.loop_guard_grace
         && (over || loop_door_open_)) {
-        loop_do_slap_();
+        // Recovered at the slap point: lift the masks instead of forcing a
+        // close. Ladder-nodoor holds no mask, so it keeps its own slap path
+        // unchanged.
+        if (loop_door_open_ && recovered) loop_door_lift_();
+        else loop_do_slap_();
     }
     if (params_.loop_guard == LoopGuardMode::Door && loop_door_open_
         && loop_since_detect_ >= params_.loop_guard_door_grace + params_.loop_guard_grace) {
@@ -574,15 +598,20 @@ void Sampler::loop_on_detect_() {
             // budget already lifted is not reopened: from the lift on the
             // turn is the switch-off path (loop_door_lift_).
             if (loop_door_lifted_) return;
-            loop_door_open_   = true;
-            loop_door_tokens_ = 0;
+            loop_door_open_    = true;
+            loop_door_opened_  = true;   // survives a lift (the answer watch)
+            loop_door_tokens_  = 0;
             loop_since_detect_ = 0;   // the door's grace starts at its opening
             return;
         case LoopGuardMode::Ladder:
             // the door opens first; the nudge and slap follow by counted lines
-            // (loop_escalate_), whatever the share
-            loop_door_open_   = true;
-            loop_door_tokens_ = 0;
+            // (loop_escalate_), or the door is lifted when the share recovers.
+            // After a lift the ladder is ladder-nodoor's rule: a renewed loop
+            // nudges at its detection, without reopening the door.
+            if (loop_door_lifted_) { loop_do_nudge_(); return; }
+            loop_door_open_    = true;
+            loop_door_opened_  = true;   // survives a lift (the answer watch)
+            loop_door_tokens_  = 0;
             loop_since_detect_ = 0;   // the door's grace starts at its opening
             return;
         case LoopGuardMode::LadderNoDoor: loop_do_nudge_(); return;   // today's order
