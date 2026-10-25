@@ -528,7 +528,9 @@ reported, not a veto.
   reads the runs whose answer has the majority md5 across both arms and lists
   the others with their tokens, acceptance and rate; with fewer than two such
   runs in an arm, or a tie, every run is gated. Prefill prompts are fixed and
-  read as before.
+  read as before. The bound: a candidate that gives another answer in up to
+  half its runs has those runs' rates listed but not gated; a majority of
+  other answers falls back to every run.
 - **Equivalence suite** (`tests/equivalence/run.sh`, on a card, `--engine
   llama --gguf`): two greedy runs, a lane's reused prefix against a fresh
   process (warm against cold), a checkpoint resume against a full

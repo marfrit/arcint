@@ -146,9 +146,11 @@ def main():
     # a tie between two answers has no majority: every run is gated
     rows, _ = ab.decide(druns((38.0, A), (38.0, B)), druns((38.0, A), (38.0, B)))
     check("decode: a tie has no majority answer, every run gated", len(rows[0]["used_new"]), 2)
-    # runs without the decode lines (an older served_check) are gated as before
-    rows, _ = ab.decide(runs(37.9, 38.4, 38.2, 38.4), runs(38.2, 38.6, 37.3, 38.2))
-    check("decode: runs without decode lines are gated on every run", len(rows[0]["used_new"]), 4)
+    # runs without the decode lines (an older served_check) are gated as before,
+    # also when the other arm has them: no majority is read, and no note says so
+    rows, _ = ab.decide(druns((38.0, A), (38.0, A), (38.0, A), (38.0, B)), runs(38.0, 38.0, 38.0, 38.0))
+    check("decode: an arm without decode lines -> every run, no majority reading",
+          (len(rows[0]["used_new"]), rows[0]["note"]), (4, ""))
 
     # the parser, on a captured served_check output
     with open(os.path.join(HERE, "fixtures", "served-check-output.txt")) as f:

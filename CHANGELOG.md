@@ -20,6 +20,22 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
 ## Unreleased (1.2.6)
 
+- **A stretch's budget point judges recovery on the tokens** — 1.2.5's
+  residual: a budget point the door reaches by 64-token stretches (no counted
+  line) decided on the last counted line share, so a loop the line detector
+  cannot count (lines of 20 characters or less, or no newline) after a varied
+  stretch was lifted rather than escalated. Such a point now reads a token
+  repeat share: the share of 8-token grams in the stretch that occurred
+  earlier within the last 2,048 generated ids, recovered when it is below the
+  low mark. A point reached by a counted line keeps the line share. The
+  tracker records only while the door is open; with the door shut or the
+  guard off nothing is computed. Loops with a period up to the window
+  (2,048 ids) are caught. Residual (`code`): a short-line loop with one
+  varying token per cycle (a counter in lines of 20 characters or less) has
+  few exact 8-gram repeats and is still read as recovered; a long stretch of
+  legitimately repetitive text without counted lines (a table of short
+  lines, a long newline-free JSON) can read as looping once the door is
+  open. (`code`)
 - **The release A/B reads decode on the majority answer** —
   `tests/acceptance/ab.py` gates a decode rate on the runs whose answer has
   the majority md5 across both arms, and lists the other runs with their md5,
