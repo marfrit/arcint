@@ -34,6 +34,14 @@ inline bool loop_guard_is_ladder(LoopGuardMode m) {
     return m == LoopGuardMode::Ladder || m == LoopGuardMode::LadderNoDoor;
 }
 
+// The ladder whose door rung opens: only Ladder. LadderNoDoor is a ladder mode
+// too but never opens the door, so the branches that escalate by budget while
+// the door is open read this, not loop_guard_is_ladder (which would carry a
+// second, invisible condition).
+inline bool loop_guard_door_ladder(LoopGuardMode m) {
+    return m == LoopGuardMode::Ladder;
+}
+
 const char* loop_guard_name(LoopGuardMode m);
 std::optional<LoopGuardMode> loop_guard_parse(std::string_view name);
 

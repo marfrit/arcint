@@ -214,15 +214,19 @@ private:
     // the block is open. It keeps only the masked ids' logits, for the counter
     // the draw reads once its candidate set exists.
     void   mask_door_while_thinking(float* logits, size_t vocab);
+    // Review B3, one place for both masks: is the id the closer of a family
+    // the mask could kill, and the once-per-request warn when it is.
+    bool   closer_in_masked_set_(int id) const;
+    void   note_closer_stripped_(int id) const;
     // loop-guard door counter: was a masked id among the candidates the draw
     // samples from -- the set after the row's top-k/top-p/min-p truncation, not
     // every finite logit in the row. Measured against the logits the ids had at
-    // mask time. Consumes the stored pair list, so a grammar redraw in the same
-    // sample() does not count twice.
-    void   count_door_masked_(float floor, bool inclusive);
+    // mask time. Consumes the stored list, so a grammar redraw in the same
+    // sample() does not count twice; the n == 0 draw spends it too.
+    void   count_door_masked_(float floor);
     // gap 2's counter: the same test for the end-of-generation ids the door
     // removed inside the open block, over the draw's own candidate set.
-    void   count_door_eog_masked_(float floor, bool inclusive);
+    void   count_door_eog_masked_(float floor);
     void   measure_think_tags();
     void   build_think_id_table();
     void   observe_think_(std::string_view piece, int token);
@@ -333,10 +337,10 @@ private:
     int  loop_self_closes_   = 0;
     int  loop_door_masked_   = 0;
     int  loop_door_eog_masked_ = 0;
-    // The masked ids' logits at mask time (id, logit), not the whole row: the
-    // count reads them against the candidate floor the draw's collection gives.
-    std::vector<std::pair<int, float>> door_masked_logits_;
-    std::vector<std::pair<int, float>> door_eog_masked_logits_;
+    // The masked ids' logits at mask time, not the whole row: the count reads
+    // them against the candidate floor the draw's collection gives.
+    std::vector<float> door_masked_logits_;
+    std::vector<float> door_eog_masked_logits_;
     int  loop_nudge_cursor_ = -1;   // next nudge id, -1 when none pending
     // Set when sample() returns the last nudge id: observe_think_ clears the
     // partial reasoning line after that piece is fed, so the sentence's tail

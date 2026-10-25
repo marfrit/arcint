@@ -29,6 +29,14 @@ double decode_other_seconds(const GenerationStats& stats) {
 // The decode line's conditional terms, extracted from log_stats (review B4
 // follow-up) so the stats wiring is unit-testable at the struct level: the
 // value decode_suffix_for returns is the one that lands on the line.
+// One list for the two consumers: the decode line prints the counters when one
+// moved, and the response carries the object on the same condition. An eighth
+// counter is added here, once.
+bool loop_guard_moved(const GenerationStats& stats) {
+    return stats.loop_detections || stats.loop_nudges || stats.loop_slaps || stats.loop_aborts
+           || stats.loop_self_closes || stats.loop_door_masked || stats.loop_door_eog_masked;
+}
+
 std::string decode_suffix_for(const GenerationStats& stats) {
     std::string decode_suffix;
     if (stats.decode_seconds > 0.0) {
@@ -85,8 +93,7 @@ std::string decode_suffix_for(const GenerationStats& stats) {
     }
     // loop-guard: the ladder's counters, printed only when one moved, so a
     // request without the switch keeps exactly the line it always had.
-    if (stats.loop_detections || stats.loop_nudges || stats.loop_slaps || stats.loop_aborts
-        || stats.loop_self_closes || stats.loop_door_masked || stats.loop_door_eog_masked) {
+    if (loop_guard_moved(stats)) {
         decode_suffix += log::format(" | loop guard: detected %d, nudged %d, slapped %d, aborted %d, "
                                      "self-closed %d, door masked %d, door EOG masked %d",
                                      stats.loop_detections, stats.loop_nudges, stats.loop_slaps,
@@ -108,11 +115,6 @@ nlohmann::json loop_guard_json(const GenerationStats& stats) {
                 {"self_closes", stats.loop_self_closes},
                 {"door_masked", stats.loop_door_masked},
                 {"door_eog_masked", stats.loop_door_eog_masked}};
-}
-
-bool loop_guard_moved(const GenerationStats& stats) {
-    return stats.loop_detections || stats.loop_nudges || stats.loop_slaps || stats.loop_aborts
-           || stats.loop_self_closes || stats.loop_door_masked || stats.loop_door_eog_masked;
 }
 
 namespace {
