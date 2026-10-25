@@ -20,9 +20,10 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
 ## Unreleased (1.2.5)
 
-A fixes and clean-up release. Three loop-guard items from the 1.2.4 release
-review; every switch stays **off by default** and a request with none set is
-served as in 1.2.4.
+A fixes and clean-up release: the 1.2.4 release review's three loop-guard
+items, the round-1 follow-ups on the door's budget, and seven review leftovers
+from 1.2.2/1.2.3 on the serving path. Every switch stays **off by default** and
+a request with none set is served as in 1.2.4.
 
 - **The door owns the turn's ending (ladder)** — once the door is open the
   escalation goes by budget, not by the repeat share: the nudge fires
@@ -47,6 +48,62 @@ served as in 1.2.4.
   `top_k` 0 a top-p cutoff could exclude a finite masked logit and the old
   code still counted it against the whole row. Observability only: the draw is
   byte-identical, which a fixed-seed test pins. (`code`)
+- **The door's budget advances by tokens** — the budget counted ended lines
+  only. `loop_observe_` never ends a line without a newline and past its line
+  cap it truncates and keeps the line open, so a model that switched to
+  newline-free text never advanced the budget and the masks could again hold
+  the turn to the cap. Each stretch of 64 generated tokens with no counted
+  line now counts as one line-equivalent for the door's budget only — never
+  for the detector's window. 64 is conservative against the 15–25 tokens a
+  counted line costs, so a turn with lines keeps the line budget exactly.
+  (`code`)
+- **A lifted door is not reopened** — in `door` mode the budget's lift is
+  latched: a later detection leaves the masks off and the door counters do not
+  grow (the round-1 mutant that deleted the latch survived; the test now reds
+  with it deleted). The door's grace also starts at its opening, so a reopened
+  door cannot inherit a spent budget. (`code`)
+- **A stop string splitting a tag keeps the tag's id** — a stop string that
+  begins with the last bytes of the closer's text splits the closer's piece;
+  the released first part carries no id (ordinary text), and the id rides on
+  the part that stays held. Before, the held tail reached the tracker with id
+  -1, so the block stayed open and the answer came back as reasoning (1.2.2's
+  residual). (`code`)
+- **Streaming drops the line breaks after the closer** — the non-streaming
+  split (the reference) dropped them; the streamer kept them, so the two paths
+  disagreed on the same token stream. The streamer now drops leading line
+  breaks at the content's start, and only there: a reply with no block keeps
+  its content as generated. (`code`)
+- **The positional id fallback refuses a lossy pairing** — the flattened
+  open/close id lists are id sets; the backend drops a role's -1 entry, so an
+  id's index stops being its tag pair's index and zipping the two lists paired
+  an opener with another family's closer. The zip now only builds when every
+  pair contributed both ids, otherwise no pairing is built; the per-pair field
+  is the lossless source. (`code`)
+- **The detector and a closer in one piece** — on text-fallback vocabularies
+  the detector ran before the closer check: a piece that carried a counted
+  line and then the closer tripped the ladder and closed in the same call, so
+  the nudge landed in the answer. Only the bytes before a completing closer go
+  to the detector, and a detection or escalation on that line is counted but
+  does not act. (`code`)
+- **The slap forces the open family's closer** — its fallback forced the
+  flattened first close id, i.e. another tag family's closer, when an extended
+  pair had been opened by text. The slap now forces the closer of the family
+  that is open, or none when that family's closer is text. (`code`)
+- **`/v1/completions` gets the chat path's start state** — a raw prompt that
+  ends inside an open block starts the turn in the block, so the masks and the
+  loop guard watch it from the first sample; before, completions always started
+  undecided and such a turn ran unwatched. (`code`)
+- **Dead branch and log wording** — `loop_on_detect_`'s content branch was
+  dead (its only caller passes false; the content phase aborts elsewhere) and
+  is gone with its parameter. The loop-guard log lines said "lane:" without a
+  lane number; the sampler does not know the lane, so the word is gone.
+  (`code`)
+- **Clean-up, no behaviour change** — the dead `inclusive` parameter of the
+  two door counters removed, the unread id dropped from the stored masked
+  logits, one helper for the closer-strip warn/latch, the counter list in
+  handlers.cpp in one place, the `n == 0` draw spends the counters like the
+  greedy path, and `loop_guard_door_ladder` reads the door branches instead of
+  `loop_guard_is_ladder` carrying a second invisible condition. (`code`)
 - **The `loop_guard` object on the wire** — `loop_guard_json` returns a plain
   `json` instead of an `ordered_json`: the response body is a plain `json`, so
   the keys already landed alphabetically and the "last key" test checked a
