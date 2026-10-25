@@ -61,6 +61,21 @@ set a request is served as in 1.2.5.
 patches), unchanged from 1.2.5; dependencies unchanged. `arcint-stt` (1.2.0)
 and `arcint-imggen` (1.1.1) are unchanged.
 
+**Release check** (`measured-here`, 2026-10-25, the pre-tag package): the
+device-free suite 340 cases and `ctest -L unit` 6/6; the branch's mutations
+red. The Flash-Next speed A/B against 1.2.5 (the B60, IQ3_XXS with the served
+check's flags, 4 rounds), the first under the majority reading, failed the
+gate as written on decode spread while faster: on the majority answer (2 old
+runs, 4 new) 38.20 against 38.33 t/s, the new arm's spread 1.83 % (its
+fastest run, 38.8 t/s) against the allowance of 0.52 % from the two old runs;
+prefill equal (618.5 / 618.7 t/s). On the same answer the draft acceptance
+still varies 65.5-67.6 % between runs, so two runs do not measure an arm's
+spread. The operator accepted the result (2026-10-25); a spread rule that
+fails only a slower candidate, and a minimum of majority runs per arm, are
+on the 1.2.7 list. Not run: the coder's and the agent's A/B (their paths
+change only with the loop guard's door open, which the agent never opens;
+`code`); the token-share rule is unit-tested only.
+
 ## 1.2.5 — 2026-10-25
 
 A fixes and clean-up release: the 1.2.4 release review's three loop-guard
