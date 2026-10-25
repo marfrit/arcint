@@ -167,6 +167,13 @@ binary's 37.9-38.0. Read as run-to-run variation of the forward, not a cost of
 the release's code; the operator accepted the 1 % (2026-10-25). The guard's
 budget and lift are unit-tested only, not run on the card.
 
+**Published** (2026-10-25): `arcint` 1.2.5-1 built by its recipe from the
+v1.2.5 tag tarball (sha256 `acfa0516…`) and published to the trixie
+repository (index verified); installed from the pool on the card host, where
+the coder (`--loop-guard ladder`) and the agent run it and answer the
+stop-string check, the streamed answer now without the line breaks after the
+closer. `arcint-stt` stays at 1.2.0-1, `arcint-imggen` at 1.1.1-1.
+
 ## 1.2.4 — 2026-10-25
 
 The loop guard gains a door rung; every switch stays **off by default**, and
