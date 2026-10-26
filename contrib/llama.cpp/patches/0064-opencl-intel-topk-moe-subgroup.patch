@@ -1,0 +1,219 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 77ebe4b..ea3e196 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1079,8 +1079,11 @@ struct ggml_backend_opencl_context {
+     int    stage_on   = -1;          // -1: not decided yet
+     char * stage_ring = nullptr;
+     size_t stage_size = 0, stage_head = 0;
+-    // the MoE router's softmax + top-k + normalized weights in one kernel, Intel
+-    cl_kernel kernel_topk_moe = nullptr;
++    // the MoE router's softmax + top-k + normalized weights in one kernel, Intel:
++    // NPER buckets 4, 8, 16, 32, 64 (n_expert <= 64, 128, 256, 512, 1024)
++    cl_kernel kernel_topk_moe[5] = {};
++    cl_kernel kernel_topk_moe_legacy = nullptr;      // GGML_OPENCL_TOPK_MOE_LEGACY=1: the old work-group-per-token kernel
++    bool topk_moe_legacy = false;
+     // SCALE -> SILU / SCALE -> SIGMOID -> SCALE fused, Intel
+     cl_kernel kernel_scale_act = nullptr;
+     // Intel: x f16 GEMM on the XMX units (mul_mm_kq_f16.cl), per type, plain
+@@ -2438,7 +2441,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         CL_CHECK((backend_ctx->kernel_dsv4_hc_pre  = clCreateKernel(prog, "kernel_dsv4_hc_pre",  &err), err));
+                         CL_CHECK((backend_ctx->kernel_moe_pair_perm = clCreateKernel(prog, "kernel_moe_pair_perm", &err), err));
+                         CL_CHECK((backend_ctx->kernel_dsv4_hc_post = clCreateKernel(prog, "kernel_dsv4_hc_post", &err), err));
+-                        CL_CHECK((backend_ctx->kernel_topk_moe = clCreateKernel(prog, "kernel_topk_moe_softmax_norm", &err), err));
++                        CL_CHECK((backend_ctx->kernel_topk_moe[0] = clCreateKernel(prog, "kernel_topk_moe_softmax_norm_n4",  &err), err));
++                        CL_CHECK((backend_ctx->kernel_topk_moe[1] = clCreateKernel(prog, "kernel_topk_moe_softmax_norm_n8",  &err), err));
++                        CL_CHECK((backend_ctx->kernel_topk_moe[2] = clCreateKernel(prog, "kernel_topk_moe_softmax_norm_n16", &err), err));
++                        CL_CHECK((backend_ctx->kernel_topk_moe[3] = clCreateKernel(prog, "kernel_topk_moe_softmax_norm_n32", &err), err));
++                        CL_CHECK((backend_ctx->kernel_topk_moe[4] = clCreateKernel(prog, "kernel_topk_moe_softmax_norm_n64", &err), err));
++                        CL_CHECK((backend_ctx->kernel_topk_moe_legacy = clCreateKernel(prog, "kernel_topk_moe_softmax_norm_legacy", &err), err));
+                         CL_CHECK((backend_ctx->kernel_scale_act = clCreateKernel(prog, "kernel_scale_act_f32", &err), err));
+                     }
+                     CL_CHECK(clReleaseProgram(prog));
+@@ -8334,6 +8342,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
+     if (const char * env = getenv("GGML_OPENCL_FUSE_0049")) {
+         backend_ctx->fuse_0049 = atoi(env);
+     }
++    if (const char * env = getenv("GGML_OPENCL_TOPK_MOE_LEGACY")) {
++        backend_ctx->topk_moe_legacy = atoi(env) != 0;
++    }
+     if (const char * env = getenv("GGML_OPENCL_F16_MROW")) {
+         backend_ctx->f16_mrow = atoi(env) != 0;
+     }
+@@ -9900,7 +9911,7 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
+ // CLAMP, DIV, RESHAPE (the weights) -> one kernel, as ggml-cuda's topk_moe
+ static bool ggml_opencl_can_fuse_topk_moe(const ggml_backend_opencl_context * backend_ctx, const ggml_cgraph * cgraph, int i) {
+     static const char * env = getenv("GGML_OPENCL_FUSE_TOPK_MOE");
+-    if (backend_ctx->kernel_topk_moe == nullptr || (env != nullptr && atoi(env) == 0) || i + 10 > cgraph->n_nodes) {
++    if (backend_ctx->kernel_topk_moe[4] == nullptr || (env != nullptr && atoi(env) == 0) || i + 10 > cgraph->n_nodes) {
+         return false;
+     }
+     ggml_tensor ** n = cgraph->nodes + i;
+@@ -9947,7 +9958,11 @@ static void ggml_cl_topk_moe_fused(ggml_backend_t backend, ggml_cgraph * cgraph,
+     float cmin = 0.0f, cmax = 0.0f;
+     memcpy(&cmin, (const float *) n[7]->op_params + 0, sizeof(float));
+     memcpy(&cmax, (const float *) n[7]->op_params + 1, sizeof(float));
+-    cl_kernel kk = backend_ctx->kernel_topk_moe;
++    int bucket = 0;
++    for (int b = 0; b < 5; ++b) {
++        if ((4 << b) * 16 >= n_expert) { bucket = b; break; }
++    }
++    cl_kernel kk = backend_ctx->topk_moe_legacy ? backend_ctx->kernel_topk_moe_legacy : backend_ctx->kernel_topk_moe[bucket];
+     int a = 0;
+     CL_CHECK(clSetKernelArg(kk, a++, sizeof(cl_mem),   &el->data_device));
+     CL_CHECK(clSetKernelArg(kk, a++, sizeof(cl_ulong), &offl));
+@@ -9960,9 +9975,18 @@ static void ggml_cl_topk_moe_fused(ggml_backend_t backend, ggml_cgraph * cgraph,
+     CL_CHECK(clSetKernelArg(kk, a++, sizeof(cl_ulong), &nbw1));
+     CL_CHECK(clSetKernelArg(kk, a++, sizeof(int),      &n_expert));
+     CL_CHECK(clSetKernelArg(kk, a++, sizeof(int),      &k));
++    size_t lws[1], gws[1];
++    if (backend_ctx->topk_moe_legacy) {
++        lws[0] = 256;
++        gws[0] = (size_t) n_tok * 256;
++    } else {
++        const int sg_size = 16, tokens_per_wg = 4;   // one sub-group a token (mul_mv_iq_q8_1.cl)
++        CL_CHECK(clSetKernelArg(kk, a++, sizeof(int),      &n_tok));
++        lws[0] = tokens_per_wg * sg_size;
++        gws[0] = (size_t) ((n_tok + tokens_per_wg - 1) / tokens_per_wg) * lws[0];
++    }
+     CL_CHECK(clSetKernelArg(kk, a++, sizeof(float),    &cmin));
+     CL_CHECK(clSetKernelArg(kk, a++, sizeof(float),    &cmax));
+-    size_t lws[1] = { 256 }, gws[1] = { (size_t) n_tok * 256 };
+     backend_ctx->enqueue_ndrange_kernel(kk, 1, gws, lws, n[8]);
+ }
+ 
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
+index 723d3d3..df67519 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
+@@ -1989,13 +1989,91 @@ kernel void kernel_dsv4_hc_post(global const char * x, ulong offx, global const
+ 
+ // ---- the MoE router's top-k in one kernel (llama.cpp's CUDA topk_moe fusion):
+ // softmax over a token's logits, the k largest in descending order (ties: the
+-// lower expert), and their probabilities normalized by their clamped sum. A
+-// work-group a token; the six kernels it replaces cost ~22 us and six launch
+-// gaps a layer (B60, profiled). ----
+-#define TOPK_MAX_EXPERT 1024
+-#define TOPK_MAX_K      32
++// lower expert), and their probabilities normalized by their clamped sum.
++//
++// One sub-group handles one token, TOPK_MOE_TOKENS_PER_WG tokens a work-group,
++// so decode (1..5 tokens) fills a whole work-group and prefill keeps the GPU
++// busy. The token's probabilities live in one register per expert per lane
++// (expert i = lane + TOPK_MOE_SG_SIZE * j), and the row max, the probability
++// sum and the k selections are sub-group reductions only: no local memory and
++// no barrier inside a token. GGML_OPENCL_TOPK_MOE_LEGACY=1 selects the old
++// work-group-per-token kernel below. ----
++#define TOPK_MAX_EXPERT          1024
++#define TOPK_MAX_K              32
++#define TOPK_MOE_SG_SIZE        16
++#ifndef TOPK_MOE_TOKENS_PER_WG
++#define TOPK_MOE_TOKENS_PER_WG  4
++#endif
++
++// One kernel per NPER bucket, so the private array is only as large as the
++// token's expert count needs: NPER = 4, 8, 16, 32, 64 for n_expert <= 64, 128,
++// 256, 512, 1024. A larger bucket is harmless but spills registers, so the
++// host picks the smallest bucket whose NPER * 16 covers n_expert.
++#define TOPK_MOE_BODY(NPER) \
++    const int sg = get_sub_group_id(), ln = get_sub_group_local_id(); \
++    const int t = get_group_id(0) * TOPK_MOE_TOKENS_PER_WG + sg; \
++    if (t >= n_tok) return; \
++    \
++    global const float * x = (global const float *)(lg + offl + (ulong)t * nbl1); \
++    global int * io = (global int *)(ids + offi + (ulong)t * nbi1); \
++    global float * wo = (global float *)(w + offw + (ulong)t * nbw1); \
++    \
++    /* p[j]: expert i = ln + TOPK_MOE_SG_SIZE * j; sel: bit j = p[j] taken */ \
++    float p[NPER]; \
++    ulong sel = 0; \
++    float m = -INFINITY; \
++    _Pragma("unroll") \
++    for (int j = 0; j < NPER; ++j) { \
++        const int i = ln + TOPK_MOE_SG_SIZE * j; \
++        p[j] = i < n_expert ? x[i] : -INFINITY; \
++        m = fmax(m, p[j]); \
++    } \
++    m = sub_group_reduce_max(m); \
++    float s = 0.0f; \
++    _Pragma("unroll") \
++    for (int j = 0; j < NPER; ++j) { \
++        const int i = ln + TOPK_MOE_SG_SIZE * j; \
++        if (i < n_expert) { p[j] = exp(p[j] - m); s += p[j]; } \
++    } \
++    s = sub_group_reduce_add(s); \
++    \
++    float wsum = 0.0f; \
++    for (int j = 0; j < k; ++j) { \
++        float bv = -1.0f; \
++        int   bi = INT_MAX; \
++        _Pragma("unroll") \
++        for (int q = 0; q < NPER; ++q) { \
++            if ((sel & (1UL << q)) == 0 && p[q] > bv) { bv = p[q]; bi = ln + TOPK_MOE_SG_SIZE * q; } \
++        } \
++        const float gv = sub_group_reduce_max(bv); \
++        const int   gi = sub_group_reduce_min(bv == gv ? bi : INT_MAX); \
++        if (ln == 0) { io[j] = gi; wo[j] = gv / s; wsum += gv / s; } \
++        if (gi < n_expert && (gi & (TOPK_MOE_SG_SIZE - 1)) == ln) sel |= 1UL << (gi / TOPK_MOE_SG_SIZE); \
++    } \
++    if (ln == 0) { \
++        const float sum = clamp(wsum, cmin, cmax); \
++        for (int j = 0; j < k; ++j) wo[j] = wo[j] / sum; \
++    }
++
++#define TOPK_MOE_KERNEL(N) \
++__attribute__((intel_reqd_sub_group_size(TOPK_MOE_SG_SIZE))) \
++kernel void kernel_topk_moe_softmax_norm_n##N(global const char * lg, ulong offl, ulong nbl1, \
++                                         global char * ids, ulong offi, ulong nbi1, \
++                                         global char * w, ulong offw, ulong nbw1, \
++                                         int n_expert, int k, int n_tok, float cmin, float cmax) { \
++    TOPK_MOE_BODY(N) \
++}
++
++TOPK_MOE_KERNEL(4)
++TOPK_MOE_KERNEL(8)
++TOPK_MOE_KERNEL(16)
++TOPK_MOE_KERNEL(32)
++TOPK_MOE_KERNEL(64)
++
++// the previous version: one work-group (256 work-items) per token, the
++// probabilities and the selection in local memory
+ __attribute__((intel_reqd_sub_group_size(16)))
+-kernel void kernel_topk_moe_softmax_norm(global const char * lg, ulong offl, ulong nbl1,
++kernel void kernel_topk_moe_softmax_norm_legacy(global const char * lg, ulong offl, ulong nbl1,
+                                          global char * ids, ulong offi, ulong nbi1,
+                                          global char * w, ulong offw, ulong nbw1,
+                                          int n_expert, int k, float cmin, float cmax) {
+@@ -2004,7 +2082,6 @@ kernel void kernel_topk_moe_softmax_norm(global const char * lg, ulong offl, ulo
+     local float sv[16];
+     local int   si[16];
+     local float wt[TOPK_MAX_K];
+-    local int   sel_l;
+     const int t = get_group_id(0), lid = get_local_id(0), sg = get_sub_group_id(), ln = get_sub_group_local_id();
+     const int nsg = get_num_sub_groups();
+     global const float * x = (global const float *)(lg + offl + (ulong)t * nbl1);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 43f4f4c..1aa6eb7 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12453,6 +12453,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // The router shapes the fused top-k runs on: 184 experts with k = 10 (one
++    // decode token, a 5-token speculative verify, a 512-token prefill chunk),
++    // 512 experts, and n_expert / n_tok not multiples of the kernel's sub-group
++    // lanes / tokens per work-group.
++    test_cases.emplace_back(new test_topk_moe({184, 1, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f));
++    test_cases.emplace_back(new test_topk_moe({184, 5, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f));
++    test_cases.emplace_back(new test_topk_moe({184, 512, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f));
++    test_cases.emplace_back(new test_topk_moe({512, 1, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f));
++    test_cases.emplace_back(new test_topk_moe({512, 5, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f));
++    test_cases.emplace_back(new test_topk_moe({183, 7, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f));
++    // the smallest and the largest private-array bucket
++    test_cases.emplace_back(new test_topk_moe({64, 1, 1, 1}, 8, true, false, GATING_FUNC_SOFTMAX, 0.0f));
++    test_cases.emplace_back(new test_topk_moe({1024, 1, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f));
++
+     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
+     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));
+     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128));

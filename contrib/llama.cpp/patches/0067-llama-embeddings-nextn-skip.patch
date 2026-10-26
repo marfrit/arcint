@@ -1,0 +1,58 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 64fd793..e44535e 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2229,7 +2229,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
+             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
+ 
+-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
++            if (!embd_nextn_skip && embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+                 GGML_ASSERT(backend_h != nullptr);
+ 
+@@ -4357,6 +4357,10 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
+     ctx->set_embeddings_nextn(value, masked);
+ }
+ 
++void llama_set_embeddings_nextn_skip(llama_context * ctx, bool skip) {
++    ctx->set_embeddings_nextn_skip(skip);
++}
++
+ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
+     ctx->set_embeddings_layer_inp(lid, value);
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 6938fb1..e7198c5 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -119,6 +119,7 @@ struct llama_context {
+ 
+     void set_embeddings (bool value);
+     void set_embeddings_nextn(bool value, bool masked);
++    void set_embeddings_nextn_skip(bool skip) { embd_nextn_skip = skip; }
+     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+     void set_nextn_layer_offset(int32_t offset);
+     void set_causal_attn(bool value);
+@@ -325,6 +326,7 @@ private:
+     // populated when cparams.output_layer_inp[il] is true
+     std::vector<buffer_view<float>> embd_layer_inp;
+     std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
++    bool embd_nextn_skip = false;         // llama_set_embeddings_nextn_skip
+ 
+     struct sampling_info {
+         // !samplers.empty() to check if any samplers are active
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index b8c5e80..94a36ba 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -102,6 +102,9 @@ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
+ // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
+ // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
+ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
++// skip copying the unmasked nextn rows to the host for the next decodes (the graph is unchanged): a
++// caller that knows it will not read them (a draft context's prompt catch-up) saves the transfer
++LLAMA_API void llama_set_embeddings_nextn_skip(struct llama_context * ctx, bool skip);
+ 
+ // Select which appended NextN block the DECODER_MTP graph runs (offset past
+ // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to

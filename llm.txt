@@ -213,7 +213,7 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
 - --host ADDR (127.0.0.1), --port N (8090), --http-threads N.
 - --served-model-name NAME[,NAME2] with --lane-ctx CA,CB; --parallel N;
   --n-ctx N (default the smaller of 32,768 and the trained context);
-  --queue-timeout S; --prefill-chunk N.
+  --queue-timeout S; --prefill-chunk N; --prefill-ubatch N (n_ubatch, default 512).
 - Sampler defaults: --temp, --top-p, --top-k, --min-p,
   --repetition-penalty, --presence-penalty,
   --chat-template-kwarg enable_thinking=BOOL.

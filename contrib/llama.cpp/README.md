@@ -3907,3 +3907,87 @@ IQ3_XXS's eight answers change wording with the patch, and the forced-old-
 path control differs from the base build in four, so the difference is not
 only the new rows; not explained, reported (the answers and KL are right).
 
+
+## 0064-opencl-intel-topk-moe-subgroup.patch
+
+The fused top-k MoE router (`kernel_topk_moe_softmax_norm`: softmax, the k
+largest, their sum clamped, the k weights divided by it) ran one work-group
+of 256 a token with k rounds of local-memory scans and barriers: 34.1 us a
+call, 40 calls = 1.364 ms of the coder's 19.25 ms token on the A770, its
+largest small op (`measured-here`, OpenCL profiling). The patch gives each
+token one 16-lane sub-group with its probabilities in registers, four tokens a
+work-group, and does the k rounds with sub-group reductions only (ties to the
+lower expert index, as before). The private array is sized by compile-time
+buckets of the expert count (n4 .. n64 floats a lane: 184 experts take n16,
+512 n32), because one 64-float array for every count spilled on both cards
+(ocloc: A770 ~239, B60 ~87 registers); n16 and the B60's n32 compile without
+spills. `GGML_OPENCL_TOPK_MOE_LEGACY=1` keeps the old kernel in the same
+binary.
+
+`measured-here` (A770 coder unless noted): the router 34.1 -> 13.5 us a call
+(1.364 -> 0.542 ms a token); test-backend-ops TOPK_MOE 424/424 on both cards
+with either kernel, three own one-line mutations of the new kernel failing
+8/8 of its new cases on both cards; KL against the coder reference
+0.023656 -> 0.023594 nats, same top 95.42 -> 95.37 % (one sequence a batch;
+four a batch 0.023594 / 95.368 % with 0065 on top); the acceptance task
+10/10 four times. The sum over the probabilities runs in another order, so
+the greedy texts change and the draft acceptance with them: the coder's
+ab.py A/B failed two of its three decode cells on that, while the device time
+per verify step fell 1.4-2.5 %. Flash-Next (B60, 512 experts): ab.py PASS,
+prefill +0.7 %, decode +0.4 %. Written by DeepSeek (two rounds), verified on
+the cards by Claude.
+
+## 0065-opencl-intel-cpy-run.patch
+
+A speculative verify writes the conv-state rollback snapshots as K = n_draft +
+1 separate copies a gated delta-net layer (`src/models/delta-net-base.cpp`
+`build_conv_state`): each moves three floats a row and is launch-bound, 150
+launches and 0.90 ms of a 39.1 ms verify step on the A770 coder
+(`measured-here`). The patch matches a run of up to 8 consecutive f32 CPY
+nodes (VIEW-type no-ops between them skipped) whose sources and destinations
+are views of one tensor each with equal shapes, narrow rows (ne0 < 32) and
+disjoint destinations, and runs it as one launch (`kernel_cpy_f32_f32_run`,
+a work-item a row writes all K windows). The copy is exact.
+`GGML_OPENCL_FUSE_CPY_RUN=0` turns it off.
+
+`measured-here`: the snapshots 150 launches / 0.900 ms -> 30 / 0.175 ms a
+step; CPY_RUN_FUSION 5/5 fused and off and all 146 CPY cases on both cards,
+three own mutations failing 4/5, 4/5 and 1/5 (the stride one only bites at
+two sequences); the coder's ab.py PASS, decode +1.8 to +1.9 %, the same
+answers. Written by DeepSeek, verified by Claude.
+
+## 0066-opencl-intel-gdn-tg-verify.patch
+
+The Intel gated delta-net dispatch took the prompt kernel
+(`kernel_gated_delta_net_pp`: work-groups that stage chunks of TC = 16 tokens
+in local memory) for every batch over one token, so a 5-token verify paid the
+staging for one partial chunk: 35 us a launch against 11.7 us for the
+one-token generation kernel (`measured-here`, the coder's re-count). The
+generation kernel already loops over the tokens with the state in registers
+and writes the K snapshots a token, with the same arguments; the patch sends
+batches up to 8 tokens to it. `GGML_OPENCL_GDN_TG_MAX=N` moves the limit (1 =
+before). Four test cases at the verify shapes.
+
+`measured-here`: GATED_DELTA_NET 53/53 on both cards at limits 1, 8 and
+1,000,000 (the generation kernel for every case, 2,048-token prompts
+included); a mutation of its snapshot slot passes at 1 and fails 5 cases at 8.
+The coder's GDN time a verify step 1.044 -> 0.674 ms, ab.py PASS, decode +1.1
+to +1.2 %, the same answers; with 0065 on the agent (dense 27B, B60, MTP 5)
+decode +2.3 to +2.4 %, the same answers, prefill equal; with 0064 and 0065 on
+Flash-Next ab.py PASS, prefill +0.7 %, decode +1.2 %.
+
+## 0067-llama-embeddings-nextn-skip.patch
+
+With a draft vocabulary (`--llama-mtp-vocab`) arcint's MTP context runs with
+unmasked nextn embeddings (a row for every token, no logits), so its prompt
+catch-up copied a row a prompt token to the host that nothing reads: 41k rows
+x 2,048 floats on the coder, over the A770's PCIe 3.0 x4 link, -0.8 % prefill
+(`measured-here`); Flash-Next's rows (4 hyper-connection streams) cost it
+-0.9 %. `llama_set_embeddings_nextn_skip(ctx, true)` leaves the rows on the
+device for the following decodes without changing the graph (no re-reserve,
+which toggling the mask would force). arcint sets it around the draft
+context's catch-up decodes (`src/exec/llama_spec.cpp`).
+
+`measured-here`: the coder with the vocabulary, ab.py with vs without the
+patch: prefill-41k 723.25 -> 729.20 t/s, decode equal; Flash-Next with the
+vocabulary: prefill equal to no vocabulary (622.65 / 622.88).

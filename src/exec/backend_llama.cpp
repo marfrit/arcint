@@ -584,6 +584,8 @@ public:
         // over the link once: the whole batch in one ubatch reads them once per
         // n_batch tokens instead of per 512
         cp.n_ubatch        = static_cast<uint32_t>(ec_on ? n_batch_ : std::min(n_batch_, 512));
+        // --prefill-ubatch: the operator's micro-batch, capped at the chunk
+        if (cfg.prefill_ubatch > 0) cp.n_ubatch = static_cast<uint32_t>(std::min(n_batch_, cfg.prefill_ubatch));
         cp.n_kv_reserve    = cfg.llama_reserve_cells;
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
         cp.type_k          = kv_type(cfg.llama_kv_k);

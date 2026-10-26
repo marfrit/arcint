@@ -1,0 +1,360 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index ea3e196..5747f7e 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -714,6 +714,7 @@ struct ggml_backend_opencl_context {
+     bool disable_fusion;
+     bool fuse_mm_glu = true;                     // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
+     bool fuse_rms_add = true;                    // opt-out GGML_OPENCL_FUSE_RMS_ADD=0 (fused rms_norm*w + residual)
++    bool fuse_cpy_run = true;                    // opt-out GGML_OPENCL_FUSE_CPY_RUN=0 (a run of narrow strided copies in one launch)
+     int  fuse_0050 = 3;                          // the GDN-stage fusions (GGML_OPENCL_FUSE_0050=<mask>): 1 the snapshots into the cache
+                                                  // (patch 0050), 2 the gating into the GDN kernel (patch 0051)
+     // patch 0051: per graph, the GDN nodes whose gating chains are folded in,
+@@ -961,6 +962,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_rope_apply_f32;   // the fused precomputed-RoPE op (GGML_OP_ROPE_APPLY)
+     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_i32_i32;
+     cl_kernel kernel_cpy_f32_f32_pack = nullptr;
++    cl_kernel kernel_cpy_f32_f32_run = nullptr;   // a run of narrow strided copies, one launch
+     cl_kernel kernel_cpy_f32_i32 = nullptr, kernel_cpy_i32_f32 = nullptr;   // the casts
+     cl_kernel kernel_cpy_f32_f32_flat = nullptr;
+     cl_kernel kernel_cpy_f32_f32_rows = nullptr;
+@@ -1941,6 +1943,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                 backend_ctx->kernel_cpy_f32_f32_rows = k;
+             }
+         }
++        {   // optional: without it the cpy runs keep the per-node path
++            cl_int err_run = CL_SUCCESS;
++            cl_kernel k = clCreateKernel(prog, "kernel_cpy_f32_f32_run", &err_run);
++            if (err_run == CL_SUCCESS) {
++                backend_ctx->kernel_cpy_f32_f32_run = k;
++            }
++        }
+         CL_CHECK((backend_ctx->kernel_cpy_i32_i32 = clCreateKernel(prog, "kernel_cpy_i32_i32", &err), err));
+         CL_CHECK((backend_ctx->kernel_cpy_f32_i32 = clCreateKernel(prog, "kernel_cpy_f32_i32", &err), err));
+         CL_CHECK((backend_ctx->kernel_cpy_i32_f32 = clCreateKernel(prog, "kernel_cpy_i32_f32", &err), err));
+@@ -8252,6 +8261,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
+     static const char * fuse_moe_combine_env = getenv("GGML_OPENCL_FUSE_MOE_COMBINE");
+     backend_ctx->fuse_moe_combine = fuse_moe_combine_env == NULL ? 1 : (atoi(fuse_moe_combine_env) != 0);
+ 
++    static const char * fuse_cpy_run_env = getenv("GGML_OPENCL_FUSE_CPY_RUN");
++    backend_ctx->fuse_cpy_run = fuse_cpy_run_env == NULL ? 1 : (atoi(fuse_cpy_run_env) != 0);
++
+     // ragged moe dp4 variant
+     static const char * ragged_dp4_env = getenv("GGML_OPENCL_MOE_RAGGED");
+     backend_ctx->adreno_use_moe_ragged_dp4 = ragged_dp4_env == NULL ? 1 : (atoi(ragged_dp4_env) != 0);
+@@ -10174,6 +10186,152 @@ static void ggml_cl_gdn_gate_prepass(ggml_backend_opencl_context * ctx, const gg
+     }
+ }
+ 
++// A run of K narrow strided f32 copies that share their source and destination
++// layouts and differ only in the byte offset (the recurrent-state rollback
++// snapshots from build_conv_state) is launch-bound one copy at a time. Match
++// such a run and execute it as one kernel launch. No-op nodes between the
++// copies (VIEW and friends) are skipped; any other op ends the run.
++#define GGML_OPENCL_CPY_RUN_MAX 8
++
++struct ggml_opencl_cpy_run {
++    int n    = 0;
++    int last = 0;   // index of the last copy in the run
++    const ggml_tensor * src[GGML_OPENCL_CPY_RUN_MAX] = {};
++    const ggml_tensor * dst[GGML_OPENCL_CPY_RUN_MAX] = {};
++};
++
++static bool ggml_opencl_same_view_layout(const ggml_tensor * a, const ggml_tensor * b) {
++    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
++        if (a->ne[d] != b->ne[d] || a->nb[d] != b->nb[d]) return false;
++    }
++    return true;
++}
++
++// byte extent of a view: last element's start plus its width
++static size_t ggml_opencl_view_span(const ggml_tensor * t) {
++    size_t span = sizeof(float);
++    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
++        span += (size_t) (t->ne[d] - 1) * (size_t) t->nb[d];
++    }
++    return span;
++}
++
++static int ggml_opencl_can_fuse_cpy_run(const struct ggml_cgraph * cgraph, int i, ggml_opencl_cpy_run * run) {
++    const int n_nodes = cgraph->n_nodes;
++    if (i >= n_nodes || cgraph->nodes[i]->op != GGML_OP_CPY) return 0;
++
++    const ggml_tensor * s0 = cgraph->nodes[i]->src[0];
++    const ggml_tensor * d0 = cgraph->nodes[i]->src[1];
++    if (s0 == nullptr || d0 == nullptr) return 0;
++    if (s0->view_src == nullptr || d0->view_src == nullptr) return 0;
++    if (s0->type != GGML_TYPE_F32 || d0->type != GGML_TYPE_F32) return 0;
++    if (s0->nb[0] != sizeof(float) || d0->nb[0] != sizeof(float)) return 0;
++    if (s0->extra == nullptr || d0->extra == nullptr) return 0;
++    // a source view must not alias the destination view: one launch has no order
++    if (s0->view_src == d0->view_src) return 0;
++    if (s0->ne[0] >= 32) return 0;
++    if (s0->ne[3] != 1 || d0->ne[3] != 1 || d0->ne[2] != 1) return 0;
++    // the kernel writes dst as rows of src ne0*ne1, one row per src seq
++    if (d0->ne[0] != s0->ne[0] * s0->ne[1] || d0->ne[1] != s0->ne[2]) return 0;
++
++    int cnt  = 0;
++    int last = -1;
++    for (int j = i; j < n_nodes && cnt < GGML_OPENCL_CPY_RUN_MAX; ++j) {
++        const ggml_tensor * node = cgraph->nodes[j];
++        if (node->op != GGML_OP_CPY) {
++            if (ggml_op_is_empty(node->op)) continue;
++            break;
++        }
++        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) break;
++        const ggml_tensor * s = node->src[0];
++        const ggml_tensor * d = node->src[1];
++        if (s == nullptr || d == nullptr) break;
++        if (s->view_src != s0->view_src || d->view_src != d0->view_src) break;
++        if (!ggml_opencl_same_view_layout(s, s0) || !ggml_opencl_same_view_layout(d, d0)) break;
++        if (s->extra == nullptr || d->extra == nullptr) break;
++        // nothing in the run may read a destination an earlier copy already wrote
++        bool reads_written = false;
++        for (int q = 0; q < cnt; ++q) {
++            if (s->view_src == run->dst[q]->view_src || s == run->dst[q]) {
++                reads_written = true;
++                break;
++            }
++        }
++        if (reads_written) break;
++        // the destinations must not overlap: their writes land in one launch
++        bool overlaps = false;
++        for (int q = 0; q < cnt; ++q) {
++            const size_t a0 = d->view_offs;
++            const size_t a1 = a0 + ggml_opencl_view_span(d);
++            const size_t b0 = run->dst[q]->view_offs;
++            const size_t b1 = b0 + ggml_opencl_view_span(run->dst[q]);
++            if (a0 < b1 && b0 < a1) {
++                overlaps = true;
++                break;
++            }
++        }
++        if (overlaps) break;
++        run->src[cnt] = s;
++        run->dst[cnt] = d;
++        ++cnt;
++        last = j;
++    }
++    if (cnt < 2) return 0;
++    run->n    = cnt;
++    run->last = last;
++    return cnt;
++}
++
++static void ggml_cl_cpy_run_fused(ggml_backend_t backend, const ggml_opencl_cpy_run & run) {
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
++    const ggml_tensor * s0 = run.src[0];
++    const ggml_tensor * d0 = run.dst[0];
++    ggml_tensor_extra_cl * es = (ggml_tensor_extra_cl *) s0->extra;
++    ggml_tensor_extra_cl * ed = (ggml_tensor_extra_cl *) d0->extra;
++
++    cl_ulong soff[GGML_OPENCL_CPY_RUN_MAX] = {};
++    cl_ulong doff[GGML_OPENCL_CPY_RUN_MAX] = {};
++    for (int t = 0; t < run.n; ++t) {
++        soff[t] = es->offset + run.src[t]->view_offs;
++        doff[t] = ed->offset + run.dst[t]->view_offs;
++    }
++
++    cl_kernel kernel = backend_ctx->kernel_cpy_f32_f32_run;
++    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &es->data_device));
++    for (int t = 0; t < GGML_OPENCL_CPY_RUN_MAX; ++t) {
++        CL_CHECK(clSetKernelArg(kernel, 1 + t, sizeof(cl_ulong), &soff[t]));
++    }
++    CL_CHECK(clSetKernelArg(kernel, 9, sizeof(cl_mem), &ed->data_device));
++    for (int t = 0; t < GGML_OPENCL_CPY_RUN_MAX; ++t) {
++        CL_CHECK(clSetKernelArg(kernel, 10 + t, sizeof(cl_ulong), &doff[t]));
++    }
++
++    const int ne00 = (int) s0->ne[0];
++    const int ne01 = (int) s0->ne[1];
++    const int ne02 = (int) s0->ne[2];
++    const cl_ulong nbs1 = s0->nb[1];
++    const cl_ulong nbs2 = s0->nb[2];
++    const cl_ulong nbd1 = d0->nb[1];
++    const int k = run.n;
++
++    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &ne00));
++    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &ne01));
++    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &ne02));
++    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(cl_ulong), &nbs1));
++    CL_CHECK(clSetKernelArg(kernel, 22, sizeof(cl_ulong), &nbs2));
++    CL_CHECK(clSetKernelArg(kernel, 23, sizeof(cl_ulong), &nbd1));
++    CL_CHECK(clSetKernelArg(kernel, 24, sizeof(int),      &k));
++
++    // one work item per (channel, seq) row, writing all K windows
++    const int rows = ne01 * ne02;
++    const int lsz  = MAX(1, MIN(rows, MIN(64, (int) backend_ctx->max_workgroup_size)));
++    const int nwg  = (rows + lsz - 1) / lsz;
++    size_t global_work_size[] = { (size_t) nwg * lsz, 1, 1 };
++    size_t local_work_size[]  = { (size_t) lsz, 1, 1 };
++
++    backend_ctx->enqueue_ndrange_kernel(kernel, 1, global_work_size, local_work_size, run.dst[run.n - 1]);
++}
++
+ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+     backend_ctx->graph_gen++;
+@@ -10208,6 +10366,15 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+                 continue;
+             }
+         }
++        if (!backend_ctx->disable_fusion && backend_ctx->fuse_cpy_run &&
++            backend_ctx->kernel_cpy_f32_f32_run != nullptr && node->op == GGML_OP_CPY) {
++            ggml_opencl_cpy_run run;
++            if (ggml_opencl_can_fuse_cpy_run(cgraph, i, &run) > 0) {
++                ggml_cl_cpy_run_fused(backend, run);
++                i = run.last;
++                continue;
++            }
++        }
+         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse_topk_moe(backend_ctx, cgraph, i)) {
+             ggml_cl_topk_moe_fused(backend, cgraph, i);
+             i += 9;
+diff --git a/ggml/src/ggml-opencl/kernels/cpy.cl b/ggml/src/ggml-opencl/kernels/cpy.cl
+index 2b42f52..e71994f 100644
+--- a/ggml/src/ggml-opencl/kernels/cpy.cl
++++ b/ggml/src/ggml-opencl/kernels/cpy.cl
+@@ -244,6 +244,44 @@ kernel void kernel_cpy_f32_f32_pack(
+ }
+ #endif // GGML_CL_NO_CPY_PACK
+ 
++// One launch for a run of K narrow strided copies that share their source and
++// destination layouts and differ only in the byte offset: the recurrent-state
++// rollback snapshots. One work item per (channel, seq) row writes all K windows.
++kernel void kernel_cpy_f32_f32_run(
++        global float * src0,
++        ulong s0, ulong s1, ulong s2, ulong s3, ulong s4, ulong s5, ulong s6, ulong s7,
++        global float * dst,
++        ulong d0, ulong d1, ulong d2, ulong d3, ulong d4, ulong d5, ulong d6, ulong d7,
++        int ne00,
++        int ne01,
++        int ne02,
++        ulong nbs1,
++        ulong nbs2,
++        ulong nbd1,
++        int k
++) {
++    ulong soff[8] = { s0, s1, s2, s3, s4, s5, s6, s7 };
++    ulong doff[8] = { d0, d1, d2, d3, d4, d5, d6, d7 };
++
++    int row = get_global_id(0);
++    if (row >= ne01*ne02) {
++        return;
++    }
++
++    int i01 = row % ne01;
++    int i02 = row / ne01;
++    ulong srow = (ulong) i02*nbs2 + (ulong) i01*nbs1;
++    ulong drow = (ulong) i02*nbd1 + (ulong) i01*ne00*sizeof(float);
++
++    for (int t = 0; t < k; ++t) {
++        global const float * src = (global const float *)((global char *) src0 + soff[t] + srow);
++        global float * d = (global float *)((global char *) dst + doff[t] + drow);
++        for (int i00 = 0; i00 < ne00; ++i00) {
++            d[i00] = src[i00];
++        }
++    }
++}
++
+ kernel void kernel_cpy_i32_i32(
+         global int * src0,
+         ulong offset0,
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 1aa6eb7..2162bf3 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3329,6 +3329,78 @@ struct test_cpy : public test_case {
+     }
+ };
+ 
++// GGML_OP_CPY - a run of narrow strided copies (the recurrent-state rollback
++// snapshots): K copies from K windows of one source into K slots of one cache.
++// The cache is the graph output, so the slots the run does not write are
++// compared too (they are initialised with distinct values).
++struct test_cpy_run_fusion : public test_case {
++    const int64_t n_tokens;
++    const int64_t channels;
++    const int64_t n_seqs;
++    const int64_t K;
++    const int64_t mem_size;
++
++    std::string vars() override {
++        return VARS_TO_STR5(n_tokens, channels, n_seqs, K, mem_size);
++    }
++
++    test_cpy_run_fusion(int64_t n_tokens = 5, int64_t channels = 8192, int64_t n_seqs = 1,
++            int64_t K = 5, int64_t mem_size = 2)
++        : n_tokens(n_tokens), channels(channels), n_seqs(n_seqs), K(K), mem_size(mem_size) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        const int64_t conv_kernel_size = 3;
++        const int64_t row_count = conv_kernel_size * channels;
++
++        ggml_tensor * in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
++                conv_kernel_size + n_tokens, channels, n_seqs);
++        ggml_set_name(in, "in");
++
++        // one cache row per mem_size, K snapshot slots; slots the run does not
++        // write stay at their initialised values and are checked as well
++        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
++                row_count, K * mem_size);
++        ggml_set_name(cache, "cache");
++        // the cache is the compared output, so it has to be a graph node
++        ggml_set_param(cache);
++
++        for (int64_t t = 1; t <= K; ++t) {
++            const int64_t s_idx  = std::max<int64_t>(0, in->ne[0] - conv_kernel_size - K + t);
++            const int64_t s_slot = K - t;
++
++            ggml_tensor * src = ggml_view_3d(ctx, in,
++                    conv_kernel_size, channels, n_seqs,
++                    in->nb[1], in->nb[2],
++                    ggml_row_size(in->type, s_idx));
++            ggml_tensor * dst = ggml_view_2d(ctx, cache,
++                    row_count, n_seqs, cache->nb[1],
++                    (s_slot * mem_size) * ggml_row_size(cache->type, row_count));
++            ggml_set_name(src, "src");
++            ggml_set_name(dst, "dst");
++
++            ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
++            ggml_set_name(cpy, "cpy");
++            ggml_build_forward_expand(gf, cpy);
++        }
++
++        return cache;
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "CPY_RUN_FUSION";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->view_src != nullptr) { continue; }   // views and the cpy results
++            init_tensor_uniform(t, -1.0f, 1.0f);
++        }
++    }
++};
++
+ // GGML_OP_CONT
+ // permute = {0, 0, 0, 0} means no permutation: the source is transposed (or
+ // view-sliced). A non-identity permute applies ggml_permute before ggml_cont.
+@@ -10683,6 +10755,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {4099, 1, 6, 1}, {4099, 1, 6, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {4099, 2, 6, 1}));
+     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {1024, 3, 2, 2}, {1024, 3, 2, 2}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {1024, 5, 3, 2}));
+ 
++    // a run of narrow strided copies, one destination slot each (the conv-state
++    // rollback snapshots); K == 1 must not fuse, n_tokens < K clamps s_idx at 0
++    test_cases.emplace_back(new test_cpy_run_fusion(5, 8192, 1, 5, 2));
++    test_cases.emplace_back(new test_cpy_run_fusion(6, 10240, 1, 6, 1));
++    test_cases.emplace_back(new test_cpy_run_fusion(5, 8192, 2, 5, 3));
++    test_cases.emplace_back(new test_cpy_run_fusion(1, 8192, 1, 1, 1));
++    test_cases.emplace_back(new test_cpy_run_fusion(3, 8192, 1, 5, 1));
++
+     // CPY - different src/dst shapes (reshaping via CPY)
+     // Use permutations of {3, 5, 7, 32}. Total elements: 3*5*7*32 = 3360.
+     // Each src permutation is tested against canonical sorted and reverse dst (skip self).
