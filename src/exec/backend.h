@@ -199,6 +199,15 @@ struct GenerationInput {
     // switches in a non-thinking turn.
     bool think_open          = false;
     bool think_tags_extended = false;
+
+    // The client-liveness probe for this request: false once the peer's
+    // connection is gone. Empty when nothing is watched (a non-streamed call
+    // from a tool, a unit test). The backend calls it at every ubatch boundary
+    // of a prefill and at least every 0.5 s of wall time in decode, without
+    // writing to the stream, and ends the request as Abort when it says gone
+    // (DESIGN §3.7: the phases that write nothing -- a long prompt's prefill,
+    // a tool call buffered to the turn's end -- would otherwise not see it).
+    std::function<bool()> peer_alive;
 };
 
 struct GenerationStats {
@@ -358,10 +367,14 @@ inline constexpr int kStubNCtxTrain = 262144;
 // streaming can be observed; zero for the fastest possible round-trip.
 // `lane_ctx`: named lanes' caps (--lane-ctx), by slot; generation on a lane
 // stops at its cap. Empty: every slot at n_ctx.
+// `prefill_ubatches`: how many ubatches the simulated prefill takes, so the
+// prefill's cancellation boundaries (a gone client, a stop signal) are on the
+// tested path. 1 keeps the immediate prefill it always had.
 std::unique_ptr<Backend> make_stub_backend(int n_ctx, int delay_ms = 0,
                                            const std::string& served_name = {},
                                            const std::vector<int>& lane_ctx = {},
-                                           const SamplerDefaults& sampler = {});
+                                           const SamplerDefaults& sampler = {},
+                                           int prefill_ubatches = 1);
 
 #ifdef ARCINT_LLAMA
 // The libllama executor (ggml OpenCL), the GGUF in --gguf.

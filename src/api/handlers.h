@@ -158,6 +158,11 @@ nlohmann::json models(const Context& ctx);
 // request's work at the next boundary (DESIGN.md §3.7).
 using SseWriter = std::function<bool(std::string_view)>;
 
+// Whether the stream's peer is still connected. Empty when the caller has no
+// socket to watch (a direct call to the handlers in a test). The generation
+// calls it at its own boundaries and never writes to the stream to find out.
+using PeerProbe = std::function<bool()>;
+
 struct PreparedChat {
     ChatRequest     req;
     GenerationInput input;
@@ -221,8 +226,8 @@ SpeechResult run_speech(const Context& ctx, const PreparedSpeech& prep, int slot
 nlohmann::json voices(const Context& ctx);
 
 void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
-                 const SseWriter& write);
+                 const SseWriter& write, const PeerProbe& peer_alive = {});
 void stream_completion(const Context& ctx, const PreparedCompletion& prep, int slot,
-                       const SseWriter& write);
+                       const SseWriter& write, const PeerProbe& peer_alive = {});
 
 }  // namespace lgc::api

@@ -240,13 +240,25 @@ using EmitFn = std::function<bool(std::string_view piece, int token_id, const st
 
 FinishReason drive(Backend& backend, const GenerationInput& in, int slot, const EmitFn& emit,
                    GenerationStats& stats, std::string& raw,
-                   std::vector<std::pair<std::string, int>>* pieces = nullptr) {
+                   std::vector<std::pair<std::string, int>>* pieces = nullptr,
+                   const PeerProbe& peer_alive = {}) {
     StopMatcher   stop(in.sampler.stop);
     std::set<int> stop_ids(in.sampler.stop_token_ids.begin(), in.sampler.stop_token_ids.end());
     bool          cancelled = false;
 
+    // The probe rides the request the backend runs; the input is the prepared
+    // request, which the streaming path holds const, so it is copied only when
+    // a connection is watched.
+    GenerationInput watched;
+    const GenerationInput* gen_in = &in;
+    if (peer_alive) {
+        watched   = in;
+        watched.peer_alive = peer_alive;
+        gen_in    = &watched;
+    }
+
     const FinishReason reason = backend.generate(
-        in, slot,
+        *gen_in, slot,
         [&](std::string_view piece, int token_id) -> Control {
             const StopMatcher::Step step = stop.push(piece, token_id);
             // The reasoning split is decided by (piece, id), so the emitted
@@ -1073,7 +1085,7 @@ SpeechResult run_speech(const Context& ctx, const PreparedSpeech& prep, int slot
 
 // ----------------------------------------------------------------- streaming
 void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
-                 const SseWriter& write) {
+                 const SseWriter& write, const PeerProbe& peer_alive) {
     const std::string& model = prep.model;
     auto               chunk = [&](json choices, json extra = json::object()) {
         json c = {{"id", prep.id},
@@ -1194,7 +1206,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
             }
             return true;
         },
-        stats, raw); })) {
+        stats, raw, nullptr, peer_alive); })) {
         // the 200 and the first chunk are out: the error goes in the stream
         sse_send(write, err->body);
         write("data: [DONE]\n\n");
@@ -1202,7 +1214,10 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     }
 
     log_stats(slot, stats, reason);
-    if (gone) return;
+    // An aborted request sends nothing more: a gone client's write would fail
+    // anyway, and a buffered tool call must not come back as raw content after
+    // the turn was cancelled (DESIGN §3.7; the stop signal too).
+    if (gone || reason == FinishReason::Abort) return;
     {
         const ReasoningStreamer::Step last = reasoning.flush();
         if (!emit_reasoning(last.reasoning)) return;
@@ -1267,7 +1282,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
 }
 
 void stream_completion(const Context& ctx, const PreparedCompletion& prep, int slot,
-                       const SseWriter& write) {
+                       const SseWriter& write, const PeerProbe& peer_alive) {
     const std::string& model = prep.model;
     auto               chunk = [&](json choices, json extra = json::object()) {
         json c = {{"id", prep.id},
@@ -1308,7 +1323,7 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep, int s
             }
             return true;
         },
-        stats, raw); })) {
+        stats, raw, nullptr, peer_alive); })) {
         // the 200 and the first chunk are out: the error goes in the stream
         sse_send(write, err->body);
         write("data: [DONE]\n\n");
@@ -1316,7 +1331,8 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep, int s
     }
 
     log_stats(slot, stats, reason);
-    if (gone) return;
+    // As the chat path: an aborted request sends nothing more.
+    if (gone || reason == FinishReason::Abort) return;
 
     const std::string tail = utf8_stream.flush();
     if (!tail.empty()) {

@@ -92,8 +92,9 @@ private:
 class StubBackend final : public Backend {
 public:
     StubBackend(int n_ctx, int delay_ms, const std::string& served_name,
-                const std::vector<int>& lane_ctx, const SamplerDefaults& sampler)
-        : delay_ms_(delay_ms), lane_ctx_(lane_ctx) {
+                const std::vector<int>& lane_ctx, const SamplerDefaults& sampler,
+                int prefill_ubatches)
+        : delay_ms_(delay_ms), prefill_ubatches_(std::max(1, prefill_ubatches)), lane_ctx_(lane_ctx) {
         status_.id               = kStubId;
         status_.served_id        = served_name.empty() ? std::string(kStubId) : served_name;
         status_.n_ctx_train      = kStubNCtxTrain;
@@ -127,6 +128,16 @@ public:
         const auto prefill_start = clock::now();
         const auto prompt_ids    = in.prompt_ids.empty() ? tokenizer_.encode(in.prompt) : in.prompt_ids;
         stats.prompt_tokens      = static_cast<int>(prompt_ids.size());
+        // The prefill in its ubatches, as the real backend's loop: one cancel
+        // check a boundary, so a gone client is seen there and not only when
+        // the first token fails to write (DESIGN §3.7).
+        for (int u = 0; u < prefill_ubatches_; ++u) {
+            if (abort_requested(in)) {
+                stats.prefill_seconds =
+                    std::chrono::duration<double>(clock::now() - prefill_start).count();
+                return FinishReason::Abort;
+            }
+        }
         stats.prefill_seconds =
             std::chrono::duration<double>(clock::now() - prefill_start).count();
 
@@ -137,6 +148,13 @@ public:
         FinishReason reason     = FinishReason::Stop;
 
         for (int id : ids) {
+            // A gone client ends the request at the token boundary, and the
+            // slot is free at once. Checked every token: the stub has no step
+            // cost worth throttling.
+            if (abort_requested(in)) {
+                reason = FinishReason::Abort;
+                break;
+            }
             if (in.sampler.max_tokens >= 0 &&
                 stats.completion_tokens >= in.sampler.max_tokens) {
                 reason = FinishReason::Length;
@@ -186,6 +204,11 @@ public:
     }
 
 private:
+    // The client's connection: the probe peeks the socket and writes nothing.
+    static bool abort_requested(const GenerationInput& in) {
+        return in.peer_alive && !in.peer_alive();
+    }
+
     static Control emit_split(const std::string& piece, int id, const TokenCallback& on_piece) {
         const size_t cut = piece.size() / 2;
         const Control first = on_piece(std::string_view(piece).substr(0, cut), id);
@@ -217,6 +240,7 @@ private:
     }
 
     int           delay_ms_ = 0;
+    int           prefill_ubatches_ = 1;
     std::vector<int> lane_ctx_;   // --lane-ctx, by slot
     ModelStatus   status_;
     StubTokenizer tokenizer_;
@@ -236,8 +260,10 @@ const char* finish_reason_name(FinishReason r) {
 
 std::unique_ptr<Backend> make_stub_backend(int n_ctx, int delay_ms, const std::string& served_name,
                                            const std::vector<int>& lane_ctx,
-                                           const SamplerDefaults& sampler) {
-    return std::make_unique<StubBackend>(n_ctx, delay_ms, served_name, lane_ctx, sampler);
+                                           const SamplerDefaults& sampler,
+                                           int prefill_ubatches) {
+    return std::make_unique<StubBackend>(n_ctx, delay_ms, served_name, lane_ctx, sampler,
+                                         prefill_ubatches);
 }
 
 }  // namespace lgc

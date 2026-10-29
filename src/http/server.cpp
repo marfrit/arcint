@@ -168,6 +168,13 @@ void HttpServer::Impl::route() {
                 try {
                     api::stream_chat(ctx, *prep, slot, [&sink](std::string_view data) {
                         return sink.write(data.data(), data.size());
+                    }, [&sink] {
+                        // cpp-httplib's is_writable is a write-select plus
+                        // is_socket_alive: a peek for EOF, so a closed peer
+                        // reads gone without a byte going out. Empty on a
+                        // sink that carries no probe, which means "alive".
+                        if (!sink.is_writable) return true;
+                        return sink.is_writable();
                     });
                 } catch (const std::exception& e) {
                     log::error("http", "stream ended by an exception: %s", e.what());
@@ -215,6 +222,10 @@ void HttpServer::Impl::route() {
                 try {
                     api::stream_completion(ctx, *prep, slot, [&sink](std::string_view data) {
                         return sink.write(data.data(), data.size());
+                    }, [&sink] {
+                        // as the chat path: the peek is the close check.
+                        if (!sink.is_writable) return true;
+                        return sink.is_writable();
                     });
                 } catch (const std::exception& e) {
                     log::error("http", "stream ended by an exception: %s", e.what());

@@ -238,6 +238,7 @@ if(ARCINT_TESTS)
     tests/test_stop_think_ids.cpp
     tests/test_decode_stats.cpp
     tests/test_toolgrammar.cpp
+    tests/test_disconnect.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
