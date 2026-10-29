@@ -46,6 +46,24 @@ is code) before stage 3.
 Alongside: re-measure the two-card layer split on today's stack (`layer-split-two-cards.md`; CPU-computed misses
 arrived after its 2026-10-08 numbers and keep the A770's misses off its x4 link).
 
+## Continuous trace (operator, 2026-10-29)
+
+The learned map and the token -> expert table were fitted on 5 requests (~400 steps, `measured-here`); a stable
+workload logged over weeks would give them orders of magnitude more data, and a per-workload expert profile (audit
+candidate 14) needs only routing counts. Operator decision:
+
+- **An option, off by default.** The served unit may run with a continuous routing trace (the 0069 recorder made a
+  production option: rotation, a size cap, no extra decode sync).
+- **Record the detail, aggregate later.** The raw records (token ids, routed ids per layer, the MTP window's drafts
+  and acceptances) are kept, not decayed counts: "I'd rather have a bit more detail than needed to aggregate later
+  than finding out after a month the statistics were optimized too early." Aggregation (decayed counts, profiles,
+  training sets) is an offline step over the raw log.
+- **The documentation warns:** a trace with token ids is the prompt and the answer in another form. Whoever enables
+  it stores every request's content on the serving host; the option's help text and the README section say so.
+
+Measurement before building on it: held-out hit rate (and the learned map's recall) against training-set size, from
+traces captured over several days; the oracle ceiling bounds the prize.
+
 ## Gate (operator's rule, 2026-10-29)
 
 Adopted if decode (or prefill) rises at all and no other target variable degrades: the other phase within its
