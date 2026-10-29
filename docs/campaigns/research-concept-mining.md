@@ -155,3 +155,24 @@ conversation does not use. A KV-tail loan would lend them to a larger prefill ub
 nothing to refill (an unused cell holds nothing). First its price, with static arms and no code: the coder at a
 smaller context with ubatch 2,048, the agent with ubatch 1,024 and 2,048 at a smaller context; then a campaign of its
 own if it pays.
+
+### Priced: no KV-tail loan for the agent or the coder (2026-10-29)
+
+`measured-here`, the units' dev binary (`c50e5e6`), an 18,646-token corpus prompt, one fresh process an arm
+(`tools/prefill_arm.py`), peak VRAM and GTT from the process's fdinfo:
+
+| unit, card | context | ubatch | prefill | peak VRAM / GTT |
+|---|---|---|---|---|
+| agent, B60 | 245,760 (the unit) | 512 | 870.4 t/s | 24,280 / 56 MiB |
+| agent, B60 | 245,760 | 1,024 | 669.0 t/s | 24,438 / 15,940 MiB (spill) |
+| agent, B60 | 245,760 | 2,048 | 22.0 t/s | 24,438 / 16,733 MiB (thrash) |
+| agent, B60 | 131,072 | 2,048 | 863.9 t/s | 21,927 / 58 MiB |
+| coder, A770 | 98,304 (the unit) | 1,024 | 1,134.5 t/s | 16,159 / 32 MiB |
+| coder, A770 | 98,304 | 2,048 | 896.3 t/s | 16,250 / 4,251 MiB (spill) |
+| coder, A770 | 49,152 | 2,048 | 1,162.1 t/s | 15,911 / 32 MiB |
+| coder, A770 | 49,152 | 4,096 | 1,123.4 t/s | 16,273 / 378 MiB |
+
+With the memory to hold it, a larger ubatch gains nothing on the dense agent (863.9 against 870.4) and +2.4 % on the
+coder (single legs). The lending lever pays where the work per weight is lumpy (Flash-Next's 512-expert MoE and its
+tile padding, +29 %), not here: no KV-tail loan campaign. For these two units the open levers are the MTP width
+policy and prefix reuse. Also noted: the agent unit peaks at 24,280 of the B60's 24,480 MiB on this prompt.
