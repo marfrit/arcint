@@ -55,6 +55,12 @@ path's lent cache slots with queued copies and one wait"; d5733321 the refill fr
   peak (23,519 MiB); the record shows what the edge costs.
 - **One lane** (Flash-Next serves one), so no second request can see a lent slot.
 
+## Operator decisions
+
+- 2026-10-29: a poisoned or broken loan state (a failed resident re-reserve, a refill that does not verify, an undo
+  whose tables still differ) ends the process with an ERROR line naming the problem and a non-zero exit, so the unit
+  manager restarts it clean; no serving in that state.
+
 ## Gate (on the record before the work)
 
 Against the unit's configuration (chunk 2,048, 11,600 MiB), same binary family, same window, alternated fresh
