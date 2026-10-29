@@ -129,8 +129,8 @@ public:
         const auto prompt_ids    = in.prompt_ids.empty() ? tokenizer_.encode(in.prompt) : in.prompt_ids;
         stats.prompt_tokens      = static_cast<int>(prompt_ids.size());
         // The prefill in its ubatches, as the real backend's loop: one cancel
-        // check a boundary, so a gone client is seen there and not only when
-        // the first token fails to write (DESIGN §3.7).
+        // check a boundary, so a gone client or a stop signal is seen there
+        // and not only when the first token fails to write (DESIGN §3.7).
         for (int u = 0; u < prefill_ubatches_; ++u) {
             if (abort_requested(in)) {
                 stats.prefill_seconds =
@@ -148,9 +148,9 @@ public:
         FinishReason reason     = FinishReason::Stop;
 
         for (int id : ids) {
-            // A gone client ends the request at the token boundary, and the
-            // slot is free at once. Checked every token: the stub has no step
-            // cost worth throttling.
+            // A stop signal or a gone client ends the request at the token
+            // boundary, and the slot is free at once. Checked every token: the
+            // stub has no step cost worth throttling.
             if (abort_requested(in)) {
                 reason = FinishReason::Abort;
                 break;
@@ -204,8 +204,10 @@ public:
     }
 
 private:
-    // The client's connection: the probe peeks the socket and writes nothing.
+    // The two cancellation sources, one check: the process's stop flag, then
+    // the client's connection (the probe peeks the socket and writes nothing).
     static bool abort_requested(const GenerationInput& in) {
+        if (in.stop != nullptr && in.stop->load(std::memory_order_relaxed)) return true;
         return in.peer_alive && !in.peer_alive();
     }
 

@@ -1,20 +1,23 @@
 #include "harness.h"
 
 #include <atomic>
+#include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "api/handlers.h"
 #include "exec/backend.h"
+#include "http/server.h"
 
 // DESIGN §3.7: a dropped connection aborts at the next boundary and frees the
 // lane. The boundary used to be "the next write that fails", and two phases
 // write nothing for a long time: a long prompt's prefill, and a tool call
 // buffered from its marker to the turn's end. These cases drive the handlers'
 // seam with a peer probe that closes (the server's probe is cpp-httplib's
-// is_writable, a peek for EOF).
+// is_writable, a peek for EOF) and a stop signal that arrives mid-generation.
 namespace {
 
 using namespace lgc;
@@ -127,6 +130,7 @@ public:
 
 private:
     static bool gone(const GenerationInput& in) {
+        if (in.stop != nullptr && in.stop->load(std::memory_order_relaxed)) return true;
         return in.peer_alive && !in.peer_alive();
     }
 
@@ -209,4 +213,44 @@ TEST(client_gone_while_a_tool_call_is_buffered_ends_the_request_early) {
         for (const json& c : f["choices"])
             CHECK(!(c.contains("delta") && c["delta"].contains("tool_calls")));
     }
+}
+
+// The stop signal: stop() from another thread while a generation runs. The
+// request ends Abort at its next token boundary and run_chat returns well
+// inside the bound, rather than waiting out the long decode.
+TEST(stop_signal_aborts_a_running_generation) {
+    Config cfg;
+    cfg.stub = true;
+    auto backend = make_stub_backend(4096, 10, {}, {}, {}, 4);   // 10 ms a token: a long generation
+    api::SlotPool slots(1);
+    api::Context  ctx;
+    ctx.cfg     = &cfg;
+    ctx.backend = backend.get();
+    ctx.slots   = &slots;
+
+    HttpServer server(cfg, ctx);   // owns the stop flag ctx now points at
+
+    json body{{"model", "stub"},
+              {"messages", json::array({{{"role", "user"}, {"content", "hello"}}})},
+              {"max_tokens", 100000}};
+    api::PreparedChat prep;
+    if (auto err = api::prepare_chat(ctx, body, prep)) {
+        CHECK(!err.has_value());
+        return;
+    }
+
+    const auto lease = slots.acquire_for(0);
+    std::thread stopper([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        server.stop();
+    });
+
+    const auto       t0 = std::chrono::steady_clock::now();
+    const api::HttpResult r = api::run_chat(ctx, prep, 0);
+    const double     dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    stopper.join();
+
+    CHECK_EQ(r.status, 200);
+    CHECK_EQ(r.body["choices"][0]["finish_reason"].get<std::string>(), std::string("abort"));
+    CHECK(dt < 2.0);   // the natural run is ~40 tokens at 10 ms; the stop must not wait it out
 }

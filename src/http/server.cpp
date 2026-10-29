@@ -1,5 +1,7 @@
 #include "http/server.h"
 
+#include <atomic>
+
 #include <httplib.h>
 
 #include "api/error.h"
@@ -35,8 +37,15 @@ struct HttpServer::Impl {
     const Config&   cfg;
     api::Context&   ctx;
     httplib::Server svr;
+    // The stop signal's flag: SIGTERM/SIGINT sets it through stop(), and every
+    // request prepared while it is set carries it into the backend, which ends
+    // at its next token or ubatch boundary (DESIGN §3.7). A stop is terminal:
+    // nothing clears it for this process's life.
+    std::atomic<bool> stopping{false};
 
-    Impl(const Config& c, api::Context& x) : cfg(c), ctx(x) {}
+    Impl(const Config& c, api::Context& x) : cfg(c), ctx(x) {
+        ctx.stop_flag = &stopping;
+    }
 
     void route();
 };
@@ -249,6 +258,12 @@ bool HttpServer::listen() {
     return impl_->svr.listen(impl_->cfg.host.c_str(), impl_->cfg.port);
 }
 
-void HttpServer::stop() { impl_->svr.stop(); }
+void HttpServer::stop() {
+    // The running requests first, then the listener: a generation that writes
+    // nothing (a long prefill, a buffered tool call) would otherwise outlive
+    // the stop signal, and a stop during one timed out and was killed.
+    impl_->stopping.store(true, std::memory_order_relaxed);
+    impl_->svr.stop();
+}
 
 }  // namespace lgc

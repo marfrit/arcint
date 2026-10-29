@@ -136,6 +136,13 @@ double seconds_since(clock_type::time_point t0) {
     return std::chrono::duration<double>(clock_type::now() - t0).count();
 }
 
+// The request's cancellation at a boundary. The stop flag first: a SIGTERM or
+// SIGINT ends every running request at its next token or ubatch boundary, so a
+// clean exit does not wait out a long prefill (DESIGN §3.7).
+bool stop_requested(const GenerationInput& in) {
+    return in.stop != nullptr && in.stop->load(std::memory_order_relaxed);
+}
+
 // Whether the client's connection is gone, checked at most every 0.5 s of wall
 // time: the probe peeks the socket (cpp-httplib's is_socket_alive), so nothing
 // is written to find out. A prefill checks it at every ubatch boundary instead
@@ -1029,7 +1036,7 @@ public:
                 stats.prefill_seconds = seconds_since(t_prefill);
                 return FinishReason::Abort;   // the slot is freed by the caller at once
             }
-            if (in.peer_alive && !in.peer_alive()) {
+            if (stop_requested(in) || (in.peer_alive && !in.peer_alive())) {
                 stats.prefill_seconds = seconds_since(t_prefill);
                 return FinishReason::Abort;
             }
@@ -1049,10 +1056,11 @@ public:
         stats.decode_sample_seconds += seconds_since(t_s0);
         auto is_stop_token = [&](int tok) { return is_stop(in.sampler, tok); };
         while (true) {
-            // The client's connection, at the token boundary: a close is seen
-            // even while the text is buffered for tool-call parsing
-            // (DESIGN §3.7).
-            if (peer_gone(in, last_peer)) {
+            // The stop signal and the client's connection, at the token
+            // boundary: a signal ends the request rather than waiting out a
+            // long decode, and a close is seen even while the text is buffered
+            // for tool-call parsing (DESIGN §3.7).
+            if (stop_requested(in) || peer_gone(in, last_peer)) {
                 reason = FinishReason::Abort;
                 break;
             }
@@ -1161,7 +1169,7 @@ public:
         }
         // The projector's eval below is one call, so the prefill's cancellation
         // boundary is before it and after it; the decode loop checks its own.
-        if (in.peer_alive && !in.peer_alive()) {
+        if (stop_requested(in) || (in.peer_alive && !in.peer_alive())) {
             mtmd_input_chunks_free(chunks);
             return FinishReason::Abort;
         }
@@ -1202,7 +1210,7 @@ public:
         }
         mtmd_input_chunks_free(chunks);
         stats.prefill_seconds = seconds_since(t_pre);
-        if (in.peer_alive && !in.peer_alive()) return FinishReason::Abort;
+        if (stop_requested(in) || (in.peer_alive && !in.peer_alive())) return FinishReason::Abort;
 
         const auto   t_decode = clock_type::now();
         FinishReason reason   = FinishReason::Stop;
@@ -1212,9 +1220,9 @@ public:
         stats.decode_sample_seconds += seconds_since(t_s0);
         auto is_stop_token = [&](int tok) { return is_stop(in.sampler, tok); };
         while (true) {
-            // A gone client at the token boundary, as the plain loop
-            // (DESIGN §3.7).
-            if (peer_gone(in, last_peer)) {
+            // A stop signal or a gone client at the token boundary, as the
+            // plain loop (DESIGN §3.7).
+            if (stop_requested(in) || peer_gone(in, last_peer)) {
                 reason = FinishReason::Abort;
                 break;
             }
@@ -1618,9 +1626,9 @@ private:
         std::optional<Decoding> decoding(std::in_place, *this, seq);
         clock_type::time_point last_peer = t_decode - std::chrono::seconds(1);   // first check at once
         while (true) {
-            // A gone client at the token boundary, as the plain loop
-            // (DESIGN §3.7).
-            if (peer_gone(in, last_peer)) {
+            // A stop signal or a gone client at the token boundary, as the
+            // plain loop (DESIGN §3.7).
+            if (stop_requested(in) || peer_gone(in, last_peer)) {
                 reason = FinishReason::Abort;
                 break;
             }
@@ -1812,10 +1820,10 @@ private:
             spec_->prefill_plan(seq, to, keep);
         }
         for (size_t at = from; at < to;) {
-            // A gone client at every ubatch boundary: without this a long
-            // prompt's prefill, which writes nothing, holds the lane for its
-            // whole remaining run after the client has left.
-            if (in.peer_alive && !in.peer_alive()) return false;
+            // A stop signal or a gone client at every ubatch boundary: without
+            // this a long prompt's prefill, which writes nothing, holds the
+            // lane for its whole remaining run after the client has left.
+            if (stop_requested(in) || (in.peer_alive && !in.peer_alive())) return false;
             size_t e = at;
             if (step(at, list.empty(), newest(), e)) save_ckpt_locked(seq, at);
             if (!decode(prompt.data() + at, e - at, at))

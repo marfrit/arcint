@@ -728,6 +728,10 @@ std::optional<HttpResult> finish_prepare(const Context& ctx, int lane, const std
     input.prompt     = prompt;
     input.prompt_ids = prompt_ids;
     input.sampler    = std::move(sampler);
+    // The stop flag belongs to the request's whole life: a SIGTERM/SIGINT
+    // while it runs ends it at the backend's next token or ubatch boundary,
+    // rather than waiting out a long prefill (DESIGN §3.7).
+    input.stop = ctx.stop_flag;
     return std::nullopt;
 }
 

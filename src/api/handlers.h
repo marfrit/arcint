@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -82,6 +83,11 @@ struct Context {
     // Named lanes, in --served-model-name order. Empty: one name, `slots`
     // admits and the model field is not binding (the behaviour before them).
     std::vector<Lane> lanes{};
+    // The process's stop flag, owned by the HTTP server. A request prepared
+    // while it is set carries it into the backend, which ends it at its next
+    // token or ubatch boundary (DESIGN §3.7). Null outside a server (a test
+    // calling the seam directly).
+    std::atomic<bool>* stop_flag = nullptr;
 };
 
 struct HttpResult {

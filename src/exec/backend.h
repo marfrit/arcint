@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <stdexcept>
@@ -208,6 +209,11 @@ struct GenerationInput {
     // (DESIGN §3.7: the phases that write nothing -- a long prompt's prefill,
     // a tool call buffered to the turn's end -- would otherwise not see it).
     std::function<bool()> peer_alive;
+
+    // The process's stop flag (SIGTERM/SIGINT): set while a request runs, the
+    // request ends at its next token or ubatch boundary as Abort. Null when no
+    // stop signal exists (a direct call to the seam).
+    const std::atomic<bool>* stop = nullptr;
 };
 
 struct GenerationStats {
