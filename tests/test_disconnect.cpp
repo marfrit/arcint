@@ -12,6 +12,7 @@
 
 #ifndef _WIN32
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -464,6 +465,18 @@ TEST(the_client_probe_peeks_without_blocking) {
 // is what the probe needs; without it this case fails, and the server itself
 // answers 500 to such a connection in process_request.
 TEST(the_client_probe_works_above_fd_setsize) {
+    // The case needs descriptors past FD_SETSIZE; a build user's soft limit is
+    // often exactly 1024. Raise the soft limit within the hard one for this
+    // process, and skip only when the hard limit forbids it.
+    struct rlimit rl {};
+    getrlimit(RLIMIT_NOFILE, &rl);
+    const rlim_t want = FD_SETSIZE + 128;
+    if (rl.rlim_cur < want && (rl.rlim_max == RLIM_INFINITY || rl.rlim_max >= want)) {
+        rl.rlim_cur = want;
+        setrlimit(RLIMIT_NOFILE, &rl);
+        getrlimit(RLIMIT_NOFILE, &rl);
+    }
+    SKIP_UNLESS(rl.rlim_cur >= want, "the hard RLIMIT_NOFILE is below FD_SETSIZE + 128");
     std::vector<int> filler;
     while (filler.size() < 1100) {
         const int fd = open("/dev/null", O_RDONLY);
