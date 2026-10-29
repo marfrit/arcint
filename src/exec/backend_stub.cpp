@@ -133,6 +133,11 @@ public:
         // and not only when the first token fails to write (DESIGN §3.7).
         for (int u = 0; u < prefill_ubatches_; ++u) {
             if (abort_requested(in)) {
+                // the prefill stopped after `u` of its ubatches: report what it
+                // prefilled, not the whole prompt, and which source ended it
+                stats.prompt_tokens_prefilled =
+                    static_cast<int>(stats.prompt_tokens) * u / prefill_ubatches_;
+                stats.abort_cause   = cause(in);
                 stats.prefill_seconds =
                     std::chrono::duration<double>(clock::now() - prefill_start).count();
                 return FinishReason::Abort;
@@ -152,6 +157,7 @@ public:
             // boundary, and the slot is free at once. Checked every token: the
             // stub has no step cost worth throttling.
             if (abort_requested(in)) {
+                stats.abort_cause = cause(in);
                 reason = FinishReason::Abort;
                 break;
             }
@@ -185,6 +191,7 @@ public:
                 break;
             }
             if (c == Control::Cancel) {
+                stats.abort_cause = AbortCause::ClientGone;   // the write failed
                 reason = FinishReason::Abort;
                 break;
             }
@@ -209,6 +216,13 @@ private:
     static bool abort_requested(const GenerationInput& in) {
         if (in.stop != nullptr && in.stop->load(std::memory_order_relaxed)) return true;
         return in.peer_alive && !in.peer_alive();
+    }
+
+    // Which of the two sources ended it: the stop flag is checked first.
+    static AbortCause cause(const GenerationInput& in) {
+        if (in.stop != nullptr && in.stop->load(std::memory_order_relaxed))
+            return AbortCause::StopSignal;
+        return AbortCause::ClientGone;
     }
 
     static Control emit_split(const std::string& piece, int id, const TokenCallback& on_piece) {

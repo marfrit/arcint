@@ -132,6 +132,11 @@ using TokenCallback = std::function<Control(std::string_view piece, int token_id
 
 enum class FinishReason { Stop, Length, Abort, Loop };
 
+// Why a request ended as Abort. Both sources leave FinishReason::Abort; the
+// slot line names the cause, because a SIGTERM was logged as "client gone"
+// on the card (DESIGN §3.7). None: the reason was not Abort.
+enum class AbortCause { None, ClientGone, StopSignal };
+
 const char* finish_reason_name(FinishReason r);
 
 // One text-to-speech request, in the OpenAI /v1/audio/speech shape minus the
@@ -202,12 +207,15 @@ struct GenerationInput {
     bool think_tags_extended = false;
 
     // The client-liveness probe for this request: false once the peer's
-    // connection is gone. Empty when nothing is watched (a non-streamed call
-    // from a tool, a unit test). The backend calls it at every ubatch boundary
-    // of a prefill and at least every 0.5 s of wall time in decode, without
-    // writing to the stream, and ends the request as Abort when it says gone
-    // (DESIGN §3.7: the phases that write nothing -- a long prompt's prefill,
-    // a tool call buffered to the turn's end -- would otherwise not see it).
+    // connection is gone. Empty when nothing is watched (a direct call to the
+    // seam in a test). The routes fill it in from the request's socket before
+    // the generation starts, so the backend runs the prepared input itself and
+    // nothing copies the prompt or the images to attach a probe. The backend
+    // calls it at every ubatch boundary of a prefill and at least every 0.5 s
+    // of wall time in decode, without writing to the stream, and ends the
+    // request as Abort when it says gone (DESIGN §3.7: the phases that write
+    // nothing -- a long prompt's prefill, a tool call buffered to the turn's
+    // end -- would otherwise not see it).
     std::function<bool()> peer_alive;
 
     // The process's stop flag (SIGTERM/SIGINT): set while a request runs, the
@@ -301,8 +309,17 @@ struct GenerationStats {
     // operator looks for the request's own numbers.
     int grammar_desyncs = 0;
 
+    // An aborted request never finished its prefill: the tokens actually
+    // prefilled (the `have` growth) in prompt_tokens_prefilled, so the slot
+    // line reports what happened instead of the whole prompt. Negative: the
+    // prefill ended (or never ran).
+    int prompt_tokens_prefilled = -1;
+    // Set by the backend when it returns Abort (None otherwise).
+    AbortCause abort_cause = AbortCause::None;
+
     double prefill_rate() const {
-        return prefill_seconds > 0.0 ? prompt_tokens / prefill_seconds : 0.0;
+        const int n = prompt_tokens_prefilled >= 0 ? prompt_tokens_prefilled : prompt_tokens;
+        return prefill_seconds > 0.0 ? n / prefill_seconds : 0.0;
     }
     double decode_rate() const {
         return decode_seconds > 0.0 ? completion_tokens / decode_seconds : 0.0;

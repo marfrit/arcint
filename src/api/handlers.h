@@ -93,6 +93,10 @@ struct Context {
 struct HttpResult {
     int            status = 200;
     nlohmann::json body;
+    // The request ended because its peer's connection is gone: the route
+    // writes nothing then (there is nobody to receive it). Distinct from a
+    // stop signal, which answers a 503 an alive client can still read.
+    bool gone = false;
 };
 
 // The lanes --served-model-name A,B --lane-ctx CA,CB configure, a pool of one
@@ -164,9 +168,10 @@ nlohmann::json models(const Context& ctx);
 // request's work at the next boundary (DESIGN.md §3.7).
 using SseWriter = std::function<bool(std::string_view)>;
 
-// Whether the stream's peer is still connected. Empty when the caller has no
-// socket to watch (a direct call to the handlers in a test). The generation
-// calls it at its own boundaries and never writes to the stream to find out.
+// Whether the peer is still connected. The routes put it into the prepared
+// request's GenerationInput (peer_alive): the generation calls it at its own
+// boundaries and never writes to the stream to find out, and the input the
+// backend runs is not copied to attach it.
 using PeerProbe = std::function<bool()>;
 
 struct PreparedChat {
@@ -232,8 +237,8 @@ SpeechResult run_speech(const Context& ctx, const PreparedSpeech& prep, int slot
 nlohmann::json voices(const Context& ctx);
 
 void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
-                 const SseWriter& write, const PeerProbe& peer_alive = {});
+                 const SseWriter& write);
 void stream_completion(const Context& ctx, const PreparedCompletion& prep, int slot,
-                       const SseWriter& write, const PeerProbe& peer_alive = {});
+                       const SseWriter& write);
 
 }  // namespace lgc::api

@@ -621,6 +621,13 @@ struct Request {
   std::string local_addr;
   int local_port = -1;
 
+  // arcint: the server-side connection's socket, so a handler can ask
+  // `detail::is_socket_alive(socket)` whether the peer is still there without
+  // writing a byte to it (a non-streamed request's prefill writes nothing).
+  // INVALID_SOCKET when the request came from a client, a buffer, or an
+  // internal stream.
+  socket_t socket = INVALID_SOCKET;
+
   // for server
   std::string version;
   std::string target;
@@ -7093,6 +7100,7 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
     connection_closed = true;
   }
 
+  req.socket = strm.socket();
   req.remote_addr = remote_addr;
   req.remote_port = remote_port;
   req.set_header("REMOTE_ADDR", req.remote_addr);
