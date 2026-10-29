@@ -280,9 +280,11 @@ FinishReason drive(Backend& backend, const GenerationInput& in, int slot, const 
         },
         stats);
 
-    if (!cancelled) {
+    if (!cancelled && reason != FinishReason::Abort) {
         // Text held back as a possible stop-sequence prefix that never
-        // completed is ordinary output and must not be swallowed.
+        // completed is ordinary output and must not be swallowed. An aborted
+        // request is not an ordinary end: its peer is gone or the process is
+        // stopping, so nothing more is written.
         for (const StopMatcher::Segment& seg : stop.flush_segments()) {
             if (pieces != nullptr) pieces->emplace_back(seg.text, seg.id);
             if (seg.text.empty()) continue;
