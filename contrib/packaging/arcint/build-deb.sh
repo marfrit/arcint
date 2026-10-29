@@ -71,7 +71,13 @@ SRC=$(find . -maxdepth 1 -mindepth 1 -type d | head -1)
 # The engine: llama.cpp at the pin, the patches from the arcint tarball itself,
 # so the package and its source agree on them by construction.
 mkdir llama && cd llama
-curl --connect-timeout 10 --max-time 600 --retry 3 --retry-delay 5 -sSLfo llama.tar.gz "$LLAMA_URL"
+# LLAMA_SRC_TARBALL: the same tarball from a local path, for a build host without
+# internet access; the checksum below is checked either way.
+if [ -n "${LLAMA_SRC_TARBALL:-}" ]; then
+    cp "$LLAMA_SRC_TARBALL" llama.tar.gz
+else
+    curl --connect-timeout 10 --max-time 600 --retry 3 --retry-delay 5 -sSLfo llama.tar.gz "$LLAMA_URL"
+fi
 echo "$LLAMA_TARBALL_SHA256  llama.tar.gz" | sha256sum -c
 tar xzf llama.tar.gz
 LLAMA_DIR="$work/llama/llama.cpp-${LLAMA_COMMIT}"
