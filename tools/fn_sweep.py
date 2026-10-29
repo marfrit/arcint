@@ -2,7 +2,7 @@
 """One arm of a served Flash-Next sweep: a fresh process with the unit's flags plus the arm's overrides.
 
     fn_sweep.py <arcint> <model.gguf> <assets-dir> <tag> [--env K=V]... [--set --flag VALUE]... [--port N]
-                [--prompt-tokens N] [--no-answers]
+                [--prompt-tokens N] [--no-answers] [--prompt-again]
 
 Starts arcint with the Flash-Next unit's flags (contrib/systemd/, the 11,600 MiB slot budget, the CPU misses,
 the bank stream), an `--env` or `--set` per override (a flag the unit has gets its value replaced, a new one
@@ -27,7 +27,7 @@ import urllib.request
 
 args = sys.argv[1:]
 binary, gguf, assets, tag = args[:4]
-env_over, set_over, port, prompt_tokens, no_answers = {}, [], 0, 0, False
+env_over, set_over, port, prompt_tokens, no_answers, prompt_again = {}, [], 0, 0, False, False
 i = 4
 while i < len(args):
     if args[i] == "--env":
@@ -40,6 +40,8 @@ while i < len(args):
         prompt_tokens = int(args[i + 1]); i += 2
     elif args[i] == "--no-answers":
         no_answers = True; i += 1
+    elif args[i] == "--prompt-again":
+        prompt_again = True; i += 1
     else:
         sys.exit(f"unknown argument {args[i]!r}")
 A = lambda n: os.path.join(assets, n)
@@ -142,6 +144,16 @@ try:
         print(f"  {name:9s} {d.group(1) if d else '?':>4} tok {d.group(3) if d else '?':>6} t/s accept "
               f"{d.group(4) if d else '?':>5} %  cache {e.group(1) if e else '?':>5} % swaps {e.group(4) if e else '?':>4}"
               f"  md5 {md5}", flush=True)
+    if prompt_tokens and prompt_again:
+        # a second long prompt after the answers (another stretch of the corpus, so nothing is cached): a loan
+        # after decode's adapt swaps have moved experts in the lent layers
+        before = len(log_lines())
+        post(open(A("corpus.txt")).read()[int(prompt_tokens * 3.6):int(2 * prompt_tokens * 3.6)] +
+             "\n\nSummarize the last paragraph above in one sentence.", 24)
+        time.sleep(0.5)
+        new = log_lines()[before:]
+        pf = next((l for l in reversed(new) if "prefill" in l and "tok in" in l), "")
+        print(f"  prompt2   {pf.split('prefill', 1)[-1].strip()[:120]}", flush=True)
     mean = lambda v: sum(v) / len(v) if v else float("nan")
     print(f"SWEEP {tag} decode-mean {mean(dec):.2f} accept-mean {mean(acc):.1f} hits-mean {mean(hit):.1f}", flush=True)
     rc = 0 if "paris" in paris.lower() and (no_answers or len(dec) == len(PROMPTS)) else 1

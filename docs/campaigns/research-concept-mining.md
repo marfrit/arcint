@@ -144,3 +144,14 @@ after the prompt with queued copies and one wait, 68072d30, d5733321; Battlemage
 recommends a 8,192 prefill, 219ae436, `paper`). Refilling ~3.6 GiB of slots over the B60's 14.3 GB/s link is
 ~0.25 s (inferred) against ~10 s saved on a 20k prompt. Candidate 11's loan moves to the front of Wave 2;
 candidate 1's span walk is the same prize without the loan and stays behind it.
+
+## Direction: the same lending for the dense agent and the small MoE (operator, 2026-10-29)
+
+The three served units are the target, and the lever is not specific to the expert cache: a phase's unused memory
+lent to the phase that is short of it. The agent (dense, 245,760 cells of KV reserved at load, a 512-token prefill
+ubatch) and the coder (a small MoE on the 16 GB A770, 98,304 cells; `--prefill-ubatch 1024` measured +15 %, 2,048
+spills 4.1-4.3 GiB to host memory, `measured-here`, `fusion-coder-night.md`) hold KV cells that a shallow
+conversation does not use. A KV-tail loan would lend them to a larger prefill ubatch while the depth allows, with
+nothing to refill (an unused cell holds nothing). First its price, with static arms and no code: the coder at a
+smaller context with ubatch 2,048, the agent with ubatch 1,024 and 2,048 at a smaller context; then a campaign of its
+own if it pays.
