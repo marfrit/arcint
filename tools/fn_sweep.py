@@ -2,6 +2,7 @@
 """One arm of a served Flash-Next sweep: a fresh process with the unit's flags plus the arm's overrides.
 
     fn_sweep.py <arcint> <model.gguf> <assets-dir> <tag> [--env K=V]... [--set --flag VALUE]... [--port N]
+                [--prompt-tokens N] [--no-answers]
 
 Starts arcint with the Flash-Next unit's flags (contrib/systemd/, the 11,600 MiB slot budget, the CPU misses,
 the bank stream), an `--env` or `--set` per override (a flag the unit has gets its value replaced, a new one
@@ -26,7 +27,7 @@ import urllib.request
 
 args = sys.argv[1:]
 binary, gguf, assets, tag = args[:4]
-env_over, set_over, port = {}, [], 0
+env_over, set_over, port, prompt_tokens, no_answers = {}, [], 0, 0, False
 i = 4
 while i < len(args):
     if args[i] == "--env":
@@ -35,6 +36,10 @@ while i < len(args):
         set_over.append((args[i + 1], args[i + 2])); i += 3
     elif args[i] == "--port":
         port = int(args[i + 1]); i += 2
+    elif args[i] == "--prompt-tokens":
+        prompt_tokens = int(args[i + 1]); i += 2
+    elif args[i] == "--no-answers":
+        no_answers = True; i += 1
     else:
         sys.exit(f"unknown argument {args[i]!r}")
 A = lambda n: os.path.join(assets, n)
@@ -98,8 +103,31 @@ try:
     print(f"  load {time.time() - t0:.0f} s", flush=True)
     paris = post("What is the capital of France? Answer in one word.", 8)
     print(f"  capital: {paris.strip()[:20]!r} {'ok' if 'paris' in paris.lower() else 'WRONG'}", flush=True)
+    if prompt_tokens:
+        # a long prompt first: its prefill line, and the grouped GEMM's tile padding if the probe is on
+        before = len(log_lines())
+        post(open(A("corpus.txt")).read()[:int(prompt_tokens * 3.6)] +
+             "\n\nSummarize the last paragraph above in one sentence.", 24)
+        time.sleep(0.5)
+        new = log_lines()[before:]
+        pf = next((l for l in reversed(new) if "prefill" in l and "tok in" in l), "")
+        print(f"  prompt    {pf.split('prefill', 1)[-1].strip()[:120]}", flush=True)
+        PAD = re.compile(r"\[KQ_MM_ID_PAD\] (\S+) experts=\d+ used=(\d+) routed=(\d+) tile=(\d+) slots=(\d+)")
+        agg = {}
+        for l in new:
+            m = PAD.search(l)
+            if m:
+                kind = re.sub(r"blk\.\d+\.", "", m.group(1))
+                a = agg.setdefault(kind, [0, 0, 0, m.group(4)])
+                a[0] += 1; a[1] += int(m.group(3)); a[2] += int(m.group(5))
+        for kind, (n, r, s, tile) in sorted(agg.items()):
+            print(f"  pad {kind:28s} calls {n:4d} tile {tile:>3} routed {r:9d} slots {s:9d} "
+                  f"pad {100.0 * (s - r) / max(r, 1):5.1f} %", flush=True)
+        if agg:
+            r = sum(a[1] for a in agg.values()); s = sum(a[2] for a in agg.values())
+            print(f"PAD {tag} routed {r} slots {s} pad {100.0 * (s - r) / max(r, 1):.1f} %", flush=True)
     dec, acc, hit = [], [], []
-    for name, n, q in PROMPTS:
+    for name, n, q in ([] if no_answers else PROMPTS):
         before = len(log_lines())
         t = post(q, n)
         time.sleep(0.5)
@@ -116,7 +144,7 @@ try:
               f"  md5 {md5}", flush=True)
     mean = lambda v: sum(v) / len(v) if v else float("nan")
     print(f"SWEEP {tag} decode-mean {mean(dec):.2f} accept-mean {mean(acc):.1f} hits-mean {mean(hit):.1f}", flush=True)
-    rc = 0 if "paris" in paris.lower() and len(dec) == len(PROMPTS) else 1
+    rc = 0 if "paris" in paris.lower() and (no_answers or len(dec) == len(PROMPTS)) else 1
 finally:
     proc.terminate()
     try:

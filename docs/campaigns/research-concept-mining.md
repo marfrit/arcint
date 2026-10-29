@@ -101,3 +101,46 @@ six-answer mean is the comparison.
   is 2 for three prose answers and 3 for the code and two others; an oracle choosing the best width per
   answer would reach 35.33 t/s, +2.5 % over width 3. A real policy collects part of that ceiling, so the
   prize is ~1-2 % (Strata's adaptive width measured +2.0-2.1 % geomean, `paper`).
+
+## Wave 1, window 2: tile padding and the prefill chunk (2026-10-29)
+
+`measured-here`: the B60, Flash-Next IQ3_S, the unit's flags, a 19,196-token corpus prompt, one fresh process
+an arm (`tools/fn_sweep.py --prompt-tokens 20000`), peak VRAM from the process's fdinfo. The padding arms ran
+a diagnostic build (`w1-probe`, not on qfndev: an env-gated count of the grouped GEMM's per-expert tiles in
+`ggml_cl_mul_mat_id_kq`, `GGML_OPENCL_KQ_MM_ID_PAD_DEBUG`); the same binary without the variable printed no
+probe line and timed the rate arms.
+
+**Tile padding** (rows the 32-token tiles hold against the rows routed, summed over the prompt's calls):
+
+| chunk | gate/up, bank experts | gate/up, slot experts | down, bank | down, slots |
+|---|---|---|---|---|
+| 2,048 | +396.5 % | +192.5 % | +154.2 % | +77.7 % |
+| 8,192 | +115.8 % | +48.6 % | +45.5 % | +20.1 % |
+
+At 2,048 tokens most experts get a few rows of a tile whose expert slice is dequantized whole; at 8,192 the
+same work fills the tiles four times better.
+
+**Prefill rate against the VRAM it needs** (t/s over the 19,196 tokens):
+
+| chunk | slots (MiB) | prefill | peak VRAM (of 24,480) |
+|---|---|---|---|
+| 2,048 | 11,600 (the unit) | 442.1 | 23,519 MiB |
+| 2,048 | 9,600 | 433.0 / 430.6 / 433.3 / 433.4 / 433.3 | 21,577 MiB |
+| 4,096 | 9,600 | 532.9 | 22,929 MiB |
+| 4,096 | 11,600 | 364.1 | 24,437 MiB |
+| 8,192 | 8,000 | 569.9 / 572.1 | 23,632 MiB |
+| 8,192 | 9,600 | 499.0 / 432.2 / 393.2 / 417.6 / 417.2 | 24,400 MiB |
+
+A larger chunk pays **+29 %** (8,192 at 8,000 MiB of slots) and +20.5 % (4,096 at 9,600) when the compute
+buffer fits; at the card's edge the same chunk scatters by 25 % and loses (the eviction thrash recorded for
+Flash-Next). Stage 5's +3.1 % at 8,192 ran at 24.3 GB of VRAM, at that edge, so it did not measure the
+mechanism: the audit's demotion of candidate 1 rested on it and is withdrawn.
+
+**What a static setting would cost:** decode on the six answers at 8,000 MiB of slots 31.08 t/s against 34.30
+at 11,600 (-9.4 %; the cache's share of routed experts 71.5 against 81.2 %). So the prize is collected only
+by giving the slots back for decode: **Strata's lend region** (candidate 11, `code`: the prompt path borrows
+the tail slots of the GPU expert cache, `src/core/expert_source.cpp:247`, `:3571`, `:3649`, and refills them
+after the prompt with queued copies and one wait, 68072d30, d5733321; Battlemage's borrowing configuration
+recommends a 8,192 prefill, 219ae436, `paper`). Refilling ~3.6 GiB of slots over the B60's 14.3 GB/s link is
+~0.25 s (inferred) against ~10 s saved on a 20k prompt. Candidate 11's loan moves to the front of Wave 2;
+candidate 1's span walk is the same prize without the loan and stays behind it.
