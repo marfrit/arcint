@@ -113,3 +113,19 @@ The B60, Flash-Next IQ3_S with the unit's flags, the round-6 build (`088df89`, r
 project's rule (a measured gain in one phase without a regression in the other beyond the spread, at the
 answer-level bar, is adopted). Before the unit takes it: the KL check, and the peak's margin at depth. Next: the
 refill at the link's speed (~0.5 s would bring the prompt near +18 %, inferred), the reserve-failure switch.
+
+## The refill at the link's speed (2026-10-29, `measured-here`, round 7's `a1a9a91`)
+
+The same configuration and prompt (18,802 tokens); the loan off in the same window: 436.6 t/s.
+
+| arm | refill | verify | prefill |
+|---|---|---|---|
+| loan, verify against the file | 0.541 s (write 0.525 from 78 tensors, wait 0.015) | 3.295 s, 0 of 9,360 rows differ | 498.4 t/s (+14.2 %) |
+| loan, verify off | 0.514 s | off | 546.4 / 546.6 t/s (+25.2 %) |
+
+The refill went from 2.7 s (~2.3 GB/s) to 0.51-0.54 s (~12 GB/s on the 14.3 GB/s link): one region copy a tensor
+from the lend bank's USM. The lend bank is checked against the file once at load (0 of 9,282 rows, 1.5 s). The
+verify's cost now decides the gain: verify off reaches +25.2 %, near the static arm's +29 %; round 8 makes the
+default verify (against the lend bank) correct for IQ4_NL and cheap. The capital was right and the six answers decoded
+at 34.40 t/s in the verified arm. The refill red switch (1) crashed inside the driver instead of corrupting a data
+row: fixed in round 8.
