@@ -39,6 +39,23 @@ the task 10/10) and Flash-Next (+2.9 %), and `--prefill-ubatch 1024` on the
 coder, are unit changes. The coder with all of it against 1.2.6: decode
 +13.6 / +21.9 / +14.7 %, prefill-41k +15.7 %.
 
+Request cancellation (DESIGN §3.7): a client that leaves and a stop signal end a
+request at its next token or prefill batch, also while nothing is written (a
+long prompt's prefill, a buffered tool call). A zero-timeout socket peek on the
+request's own connection (cpp-httplib built with poll; one `Request::socket`
+field in the vendored header); the slot line names the cause and the tokens
+actually prefilled; a non-streamed request answers a stop with 503
+`server_stopping` and gets no body when its client is gone. Measured on the
+A770 with the coder and a 37,723-token prompt, against the parent binary
+(`tools/cancel_check.py`, `measured-here`): the slot is free 1.8 s after a
+streamed client leaves (42.6 s before), 1.6 s non-streamed (42.3 s), SIGTERM
+exits after 1.8 s (42.7 s), and the same needle prompt sent right after the
+abort is answered correctly. Speech and transcription do not cancel yet.
+
+Quality instruments: `tools/capture_vs_capture.py` compares a candidate against
+a baseline's own run-to-run twin (`--baseline A B --candidate C`) and restricts
+the KL to given token ranges (`--mask`).
+
 ## 1.2.6 — 2026-10-25
 
 The loop guard's last 1.2.5 residual fixed, and the release A/B reads decode
