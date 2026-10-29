@@ -129,3 +129,12 @@ verify's cost now decides the gain: verify off reaches +25.2 %, near the static 
 default verify (against the lend bank) correct for IQ4_NL and cheap. The capital was right and the six answers decoded
 at 34.40 t/s in the verified arm. The refill red switch (1) crashed inside the driver instead of corrupting a data
 row: fixed in round 8.
+
+## With the default verify (2026-10-29, `measured-here`, round 8's `6709c19`)
+
+Same configuration and prompt; the loan off in the same window 436.7 t/s. Four loan runs: **517.3 / 516.7 / 518.0 /
+517.7 t/s (+18.5 %)** with every refill verified against the lend bank (refill 0.51 s, verify 1.9 s, 0 of 9,360 rows
+differ; the bank itself checked against the file at load). Red switch 1 (one corrupted byte) is caught and exits 70
+with the cause and leaves no GPU fault (the queue drain works there). Red switch 4 (a failed re-reserve at the return)
+exits with the cause but the B60 faulted at the exit (-ENOENT, compute and copy engines reset): queued work addresses
+the freed tail buffer on that path; open. Red switch 3 does not fire yet. Peak VRAM 24,229 MiB (the unit 23,492).
