@@ -68,3 +68,36 @@ the late-layer approximate prefill (12) and a lower-precision K cache (17).
    prefix-reuse share and input copies (13, 15, 10).
 3. **Wave 2, builds in the priced order**, each its own campaign document with its gate on the record:
    provisionally 2, 3, 13, 11, 14, 15, 5, 6, 10, 16, 1, 19.
+
+## Wave 1, window 1: the CPU-miss cap and the MTP width (2026-10-29)
+
+`measured-here`: the B60, Flash-Next IQ3_S with the unit's flags (11,600 MiB of slots, the CPU misses, the
+bank stream, MTP 3 with the min-p 0.5 stop, the draft vocabulary), the dev binary of `c50e5e6`; one fresh
+process an arm through `tools/fn_sweep.py` (the capital, Strata's RFC 4180 request at 500 tokens, five
+300-token answers, greedy, no thinking); two rounds, the second in reverse order. The capital was right in
+every arm. Decode in t/s, the mean of the two rounds, and the spread of the six-answer mean between them:
+
+| arm | strata | hash | compiler | tcp | btree | gc | mean | spread |
+|---|---|---|---|---|---|---|---|---|
+| miss cap 16 | 34.60 | 26.65 | 34.90 | 33.45 | 30.45 | 31.55 | 31.93 | 0.9 % |
+| miss cap 32 | 40.30 | 31.65 | 36.90 | 34.10 | 32.30 | 33.00 | 34.71 | 1.4 % |
+| miss cap 64 (the unit; MTP 3) | 40.70 | 32.50 | 36.10 | 31.95 | 32.85 | 32.80 | 34.48 | 1.2 % |
+| miss cap 128 | 40.75 | 32.95 | 36.20 | 32.05 | 33.05 | 33.00 | 34.67 | 0.0 % |
+| MTP 2 | 35.80 | 34.15 | 34.75 | 34.80 | 33.45 | 31.35 | 34.05 | 1.0 % |
+| MTP 4 | 38.65 | 29.80 | 33.45 | 30.65 | 31.70 | 31.25 | 32.58 | 1.5 % |
+| MTP 5 | 39.65 | 29.55 | 31.20 | 28.25 | 30.70 | 30.25 | 31.60 | 1.7 % |
+
+The answers' md5s are stable within an arm and differ between most arms (the verify batch and the CPU or
+card placement of a miss change the rounding), so the per-answer rates compare different texts; the
+six-answer mean is the comparison.
+
+- **Candidate 3 (the miss balance), decode: no prize at this shape.** Caps 32, 64 and 128 lie within the
+  window's spread, and 64 and 128 give byte-identical answers: the cap does not bind above 64 here (a verify
+  of 4 tokens routes 40 pairs a layer, ~19 % of them missed). Only cap 16 binds, at -7.4 %. Strata's gains
+  for this concept came from prefill and from a slow-CPU decode shape; the prefill side here goes through
+  the bank stream, not the CPU rows, and was not measured in this window.
+- **Candidate 13 (the MTP width): the fixed width 3 is the best fixed arm.** Width 2 is -1.2 %, 4 is
+  -5.5 %, 5 is -8.4 % (acceptance 73.5 / 66.6 / 60.3 / 54.8 % for 2 / 3 / 4 / 5). The best width per answer
+  is 2 for three prose answers and 3 for the code and two others; an oracle choosing the best width per
+  answer would reach 35.33 t/s, +2.5 % over width 3. A real policy collects part of that ceiling, so the
+  prize is ~1-2 % (Strata's adaptive width measured +2.0-2.1 % geomean, `paper`).
