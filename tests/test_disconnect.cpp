@@ -360,7 +360,11 @@ TEST(a_stop_abort_carries_the_stop_cause) {
     });
     const api::HttpResult r = api::run_chat(ctx, prep, 0);
     stopper.join();
+    // the cause, as the client sees it: a stop answers server_stopping, it is
+    // not taken for a gone client (which gets no body at all)
     CHECK_EQ(r.status, 503);
+    CHECK(!r.gone);
+    CHECK(r.body.dump().find("server_stopping") != std::string::npos);
 }
 
 // The stop flag names the cause in the stats, through the seam the slot line

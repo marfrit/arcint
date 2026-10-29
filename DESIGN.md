@@ -353,14 +353,14 @@ provenance (`code`).
   iterates arguments as a mapping is handed the parsed object; minja
   polyfills stay off (`code`).
 - **Cancellation.** A dropped connection and a stop signal (SIGTERM/SIGINT)
-  abort at the next token or ubatch boundary and free the lane (`code`; gated
+  abort at the next token or batch boundary (a prefill steps by `--prefill-chunk`) and free the lane (`code`; gated
   by the concurrency suite, §5). The boundary checks the process's stop flag
   and the request's socket with a zero-timeout peek — no byte is written and
   nothing blocks (`code`: the prefill writes nothing for long stretches and a
   tool call is buffered to the turn's end, so a write could learn the close
   too late by minutes). A streamed request then sends nothing more; a
-  non-streamed one answers a stop signal with a 503 error body and writes
-  nothing at all to a gone client, and a half-buffered tool call is never
+  non-streamed one answers a stop signal with a 503 error body and builds no
+  body for a gone client (the server's empty status line fails harmlessly), and a half-buffered tool call is never
   returned as raw content (`code`: unit-tested on the stub backend). The slot
   line names the cause (`aborted: stop signal` / `aborted: client gone`), and
   an aborted prefill reports the tokens it actually prefilled, not the whole

@@ -15,7 +15,10 @@ still connected without writing a byte (a non-streamed request's prefill
 writes nothing for a long stretch). The build also defines
 `CPPHTTPLIB_USE_POLL` (`CMakeLists.txt`): without poll, `process_request`
 answers 500 to every connection above `FD_SETSIZE`, and `select()` returns -1
-there, which that liveness probe would read as "gone".
+there, which that liveness probe would read as "gone". Two limits of the probe:
+when `poll` itself fails with an errno other than `EBADF` it falls through to a
+blocking `MSG_PEEK` (not reachable in practice), and TLS is not compiled in; if
+it ever is, a peek on the raw fd would read an unread close_notify as alive.
 
 Adapted (not verbatim) in `tools/tts_voice_sim.py`, a measuring tool no
 package ships: the speaker-similarity recipe from

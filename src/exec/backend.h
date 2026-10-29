@@ -211,7 +211,7 @@ struct GenerationInput {
     // seam in a test). The routes fill it in from the request's socket before
     // the generation starts, so the backend runs the prepared input itself and
     // nothing copies the prompt or the images to attach a probe. The backend
-    // calls it at every ubatch boundary of a prefill and at least every 0.5 s
+    // calls it at every batch boundary of a prefill (--prefill-chunk) and at least every 0.5 s
     // of wall time in decode, without writing to the stream, and ends the
     // request as Abort when it says gone (DESIGN §3.7: the phases that write
     // nothing -- a long prompt's prefill, a tool call buffered to the turn's
@@ -219,7 +219,7 @@ struct GenerationInput {
     std::function<bool()> peer_alive;
 
     // The process's stop flag (SIGTERM/SIGINT): set while a request runs, the
-    // request ends at its next token or ubatch boundary as Abort. Null when no
+    // request ends at its next token or batch boundary as Abort. Null when no
     // stop signal exists (a direct call to the seam).
     const std::atomic<bool>* stop = nullptr;
 };

@@ -1187,7 +1187,8 @@ public:
         // The projector's eval below is one call, so the prefill's cancellation
         // boundary is before it and after it; the decode loop checks its own.
         if (stop_requested(in) || (in.peer_alive && !in.peer_alive())) {
-            stats.abort_cause = abort_cause_of(in);
+            stats.abort_cause             = abort_cause_of(in);
+            stats.prompt_tokens_prefilled = 0;   // nothing reached the model yet
             mtmd_input_chunks_free(chunks);
             return FinishReason::Abort;
         }

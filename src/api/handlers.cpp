@@ -731,7 +731,7 @@ std::optional<HttpResult> finish_prepare(const Context& ctx, int lane, const std
     input.prompt_ids = prompt_ids;
     input.sampler    = std::move(sampler);
     // The stop flag belongs to the request's whole life: a SIGTERM/SIGINT
-    // while it runs ends it at the backend's next token or ubatch boundary,
+    // while it runs ends it at the backend's next token or batch boundary,
     // rather than waiting out a long prefill (DESIGN §3.7).
     input.stop = ctx.stop_flag;
     return std::nullopt;
@@ -992,7 +992,7 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
         if (stats.abort_cause == AbortCause::ClientGone)
             return HttpResult{200, json::object(), true};
         return HttpResult{503, error_body("the server is stopping; the request was cancelled "
-                                         "at its last token or ubatch boundary", "server_error",
+                                         "at its last token or batch boundary", "server_error",
                                          "server_stopping")};
     }
 
@@ -1067,7 +1067,7 @@ HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, in
         if (stats.abort_cause == AbortCause::ClientGone)
             return HttpResult{200, json::object(), true};
         return HttpResult{503, error_body("the server is stopping; the request was cancelled "
-                                         "at its last token or ubatch boundary", "server_error",
+                                         "at its last token or batch boundary", "server_error",
                                          "server_stopping")};
     }
 
