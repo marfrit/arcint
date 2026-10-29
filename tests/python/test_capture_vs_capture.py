@@ -13,6 +13,13 @@ Red first:
   substituted line) reads a difference of 0 for the moved candidate.
 - mask: `position_mask` returning all rows (the ranges ignored) reads the
   masked mean as the unmasked one, red for the large KL outside the ranges.
+- twin without a mask through the CLI: `print_twin` passing
+  `{"unmasked": ..., "masked": rep["twin"]["masked"]}` (the line that was
+  there) raises KeyError 'masked' on `main(argv)`, so the twin mode without
+  `--mask` never completed.
+- a vocabulary mismatch in the single mode: `print_legacy` reading the
+  captures itself and passing `n_vocab` to `kl_rows` (the shape before
+  load_rows) accepts an n_vocab mismatch instead of refusing it.
 """
 import struct
 import sys
@@ -97,6 +104,48 @@ def test_the_masked_mean_ignores_a_large_kl_outside_the_ranges(tmp_path):
     assert arm["unmasked"]["mean_kl"] > 0.01
     assert arm["masked"]["mean_kl"] < 1e-4
     assert arm["masked"]["rows"] == 2
+
+
+def test_twin_mode_runs_without_a_mask_through_the_cli(tmp_path, capsys):
+    """The twinning path with no --mask: the twin holds no 'masked' key, so the
+    printer must not read one. Red: the unconditional rep["twin"]["masked"]
+    line raises KeyError and main() never returns."""
+    ref, base, tokens, _ = fixture(tmp_path)
+    a = write_arm(tmp_path, "a.bin", base, tokens)
+    b = write_arm(tmp_path, "b.bin", base, tokens)
+    cand = write_arm(tmp_path, "cand.bin", base, tokens)
+
+    cvc.main([str(ref), "--baseline", str(a), str(b), "--candidate", str(cand), "--window", "0"])
+    out = capsys.readouterr().out
+    assert "baseline twin" in out and "difference candidate - twin" in out
+    assert "masked" not in out
+
+
+def test_single_mode_refuses_a_vocabulary_mismatch(tmp_path):
+    """A capture for a different vocabulary: kl_rows truncates to the shorter
+    row silently and reads garbage. The single mode must refuse it, as the
+    twin mode's load_arm does. Red: print_legacy passing the reference's
+    n_vocab to kl_rows without the equality check returns numbers instead."""
+    ref, base, tokens, _ = fixture(tmp_path)
+    other_n_vocab = 19
+    other = np.random.default_rng(3).normal(size=(32, other_n_vocab)).astype(np.float32)
+    p = tmp_path / "other.bin"
+    write_capture(p, [other], tokens)
+
+    with pytest.raises(ValueError, match="does not match the reference"):
+        cvc.main([str(ref), str(p), "0"])
+    with pytest.raises(ValueError, match="does not match the reference"):
+        cvc.load_arm(str(ref), str(p), 0)
+
+
+def test_single_mode_prints_the_boundary_split(tmp_path, capsys):
+    """The legacy print keeps the below/above QSA_BOUNDARY_TOKENS split its
+    docstring describes."""
+    ref, base, tokens, _ = fixture(tmp_path)
+    cand = write_arm(tmp_path, "cand.bin", base, tokens)
+    cvc.main([str(ref), str(cand), "0"])
+    out = capsys.readouterr().out
+    assert "(below " in out and "/ above " in out
 
 
 def test_a_mask_without_a_range_is_refused(tmp_path):

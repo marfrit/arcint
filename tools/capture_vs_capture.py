@@ -88,9 +88,12 @@ def summarise(kl, agree, select=None):
             "argmax": float(agree[sel].mean())}
 
 
-def load_arm(ref_path, other_path, window, mask_ranges=None):
-    """One capture's KL against the reference, over all rows and (when a mask
-    is given) over the masked rows."""
+def load_rows(ref_path, other_path, window):
+    """The two captures' per-row KL and argmax agreement, after refusing a
+    file that is not the same capture: the same context and vocabulary (a
+    vocabulary mismatch would be truncated silently by kl_rows and read as
+    garbage) and the same tokens in the reference's window 0 and `window`.
+    Returns (n_ctx, kl, agree)."""
     n_ctx, n_vocab, _, tok_ref, rows_ref = read_capture(ref_path)
     n_oth, v_oth, n_chunk, tok_oth, rows_oth = read_capture(other_path)
     if (n_ctx, n_vocab) != (n_oth, v_oth):
@@ -101,6 +104,13 @@ def load_arm(ref_path, other_path, window, mask_ranges=None):
     if not np.array_equal(tok_ref[0], tok_oth[window]):
         raise ValueError(f"{other_path}: window {window} holds different tokens than the reference")
     kl, agree = kl_rows(rows_ref[0], rows_oth[window], n_vocab)
+    return n_ctx, kl, agree
+
+
+def load_arm(ref_path, other_path, window, mask_ranges=None):
+    """One capture's KL against the reference, over all rows and (when a mask
+    is given) over the masked rows."""
+    n_ctx, kl, agree = load_rows(ref_path, other_path, window)
     positions = row_positions(n_ctx)
     out = {"unmasked": summarise(kl, agree)}
     if mask_ranges is not None:
@@ -147,19 +157,21 @@ def print_side(label, arm):
 
 
 def print_legacy(ref_path, other_path, window, mask_ranges):
-    n_ctx, n_vocab, _, tok_ref, rows_ref = read_capture(ref_path)
-    _, _, _, tok_oth, rows_oth = read_capture(other_path)
-    if not np.array_equal(tok_ref[0], tok_oth[window]):
-        raise ValueError(f"{other_path}: window {window} holds different tokens than the reference")
-    kl, agree = kl_rows(rows_ref[0], rows_oth[window], n_vocab)
+    # load_rows refuses a capture that is not the same one (n_ctx, n_vocab, the
+    # window's tokens), which kl_rows alone would silently truncate.
+    n_ctx, kl, agree = load_rows(ref_path, other_path, window)
+    positions      = row_positions(n_ctx)
+    below           = positions < QSA_BOUNDARY_TOKENS
     un = summarise(kl, agree)
-    ma = summarise(kl, agree, position_mask(row_positions(n_ctx), mask_ranges)) if mask_ranges else None
-    print(f"llama.cpp capture window {window} vs the f32 reference: mean KL {un['mean_kl']:.4f}, "
+    ma = summarise(kl, agree, position_mask(positions, mask_ranges)) if mask_ranges else None
+    below_kl = f"{kl[below].mean():.4f}" if below.any() else "no rows"
+    above_kl = f"{kl[~below].mean():.4f}" if (~below).any() else "no rows"
+    print(f"llama.cpp capture window {window} vs the f32 reference: mean KL {un['mean_kl']:.4f} "
+          f"(below {below_kl} / above {above_kl}), "
           f"median {un['median_kl']:.4f}, max {un['max_kl']:.3f}, argmax agreement {un['argmax']:.4f}")
     if ma is not None:
         print(f"   masked to {ma['rows']} rows: mean KL {ma['mean_kl']:.4f}, median {ma['median_kl']:.4f}, "
               f"max {ma['max_kl']:.3f}, argmax agreement {ma['argmax']:.4f}")
-    positions = row_positions(n_ctx)
     for lo in range(n_ctx // 2 - (n_ctx // 2) % 128, n_ctx, 128):
         m = (positions >= lo) & (positions < lo + 128)
         if m.any():
@@ -171,14 +183,18 @@ def print_twin(ref_path, baseline_a, baseline_b, candidate, window, mask_ranges)
     rep = twin_report(ref_path, baseline_a, baseline_b, candidate, window, mask_ranges)
     print_side(f"baseline a (window {window})", rep["a"])
     print_side(f"baseline b (window {window})", rep["b"])
-    print_side("baseline twin (mean of the two runs)", {"unmasked": rep["twin"]["unmasked"],
-                                                       "masked": rep["twin"]["masked"]})
+    # The twin holds only the keys every arm has: without a mask there is no
+    # "masked", and printing it unconditionally was a KeyError on the CLI.
+    print_side("baseline twin (mean of the two runs)", rep["twin"])
     print_side("candidate", rep["candidate"])
     d = rep["difference"]
-    print(f"difference candidate - twin: mean KL {d['unmasked']['mean_kl']:+.4f}, "
-          f"argmax {d['unmasked']['argmax']:+.4f} | masked {d['masked']['mean_kl']:+.4f}, "
-          f"argmax {d['masked']['argmax']:+.4f}"
-          + (" (positive: worse than the card's own floor)" if d["unmasked"]["mean_kl"] >= 0 else ""))
+    line = (f"difference candidate - twin: mean KL {d['unmasked']['mean_kl']:+.4f}, "
+            f"argmax {d['unmasked']['argmax']:+.4f}")
+    if "masked" in d:
+        line += (f" | masked {d['masked']['mean_kl']:+.4f}, "
+                 f"argmax {d['masked']['argmax']:+.4f}")
+    print(line + (" (positive: worse than the card's own floor)"
+                  if d["unmasked"]["mean_kl"] >= 0 else ""))
 
 
 def main(argv=None):
@@ -195,6 +211,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     mask_ranges = read_mask(args.mask) if args.mask else None
+    # a mask is optional in both modes; a twin without one has no masked keys
     if args.baseline or args.candidate:
         if args.other is not None or args.legacy_window is not None:
             ap.error("twin mode takes the window through --window, not positionally")
