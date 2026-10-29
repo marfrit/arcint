@@ -265,3 +265,7 @@ Our llama.cpp pin (bed0a85, patches 0001-0022), `code`:
 
 `src/exec/backend_llama.cpp` (device selection, model and MTP contexts),
 `contrib/llama.cpp/patches/` (0021 the expert cache, 0022 the Intel kernels).
+
+- **Re-measure on today's stack (queued 2026-10-29):** the numbers above predate the CPU-computed misses (0.7.11),
+  which keep the A770's layers' misses off its x4 link, and the IQ3_S / MTP 3 / 0064-0067 stack; K=36 and K=40 with
+  MTP on the B60 against the B60 alone, three rounds (`expert-foresight.md`).
