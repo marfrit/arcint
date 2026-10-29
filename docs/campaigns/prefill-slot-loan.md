@@ -138,3 +138,12 @@ differ; the bank itself checked against the file at load). Red switch 1 (one cor
 with the cause and leaves no GPU fault (the queue drain works there). Red switch 4 (a failed re-reserve at the return)
 exits with the cause but the B60 faulted at the exit (-ENOENT, compute and copy engines reset): queued work addresses
 the freed tail buffer on that path; open. Red switch 3 does not fire yet. Peak VRAM 24,229 MiB (the unit 23,492).
+
+## Round 10 on the card (2026-10-29, `measured-here`, `b4bca38`)
+
+Loan off 436.8 t/s; the loan with the default verify (row by row against the lend bank, 0 of 12,250 rows differ,
+1.65 s) **521.3 / 520.9 / 518.8 t/s (+19.3 %)**; with the six answers decode 33.78 t/s. Red switches: 1 (one byte)
+caught and named (layer 47, region quants) and exits 70 with no GPU fault; 3 now fires (the reserve allocated 4.55 GiB
+against a sized 1.14 GiB, the slots put back, the prompt ran resident at 429.7 t/s); 4 (a failed re-reserve at the
+return) exits 70 with the cause but still faulted the B60 at the exit (-ENOENT/-EINVAL, compute and copy engines
+reset): open. Before the unit: that fault, the KL check, and the two low findings of the ninth/tenth review.
