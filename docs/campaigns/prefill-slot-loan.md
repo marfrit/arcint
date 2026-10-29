@@ -90,3 +90,26 @@ processes, `tools/fn_sweep.py`:
 ## Implementation
 
 DeepSeek implements (patch 0068+ and `src/exec/backend_llama.cpp`), Claude runs the card windows and the A/B.
+
+## First served run (2026-10-29, `measured-here`)
+
+The B60, Flash-Next IQ3_S with the unit's flags, the round-6 build (`088df89`, recipe), `tools/fn_sweep.py`, an
+18,802-token prompt, one fresh process an arm, two rounds:
+
+| arm | prefill | decode, six answers | answers (md5) |
+|---|---|---|---|
+| the unit's binary | 436.7 / 436.7 t/s | 34.65 / 34.67 | identical |
+| new, loan off | 436.9 / 436.9 | 34.67 / 34.65 | identical |
+| new, loan on (`--llama-slot-loan 6400 --llama-loan-chunk 8192 --prefill-chunk 8192`) | 485.2 / 485.0 (+11.1 %) | 34.62 / 34.58 | identical |
+
+- The loan lends 26 layers (6.20 GiB), its table check and the refill's verify are exact (0 of 192, 0 of 9,360),
+  also after decode's adapt swaps (a second prompt 501.0 t/s); 4,608 MiB is refused (the buffers need 4.55 GiB).
+- Red switches: a corrupt refill and a failed return re-reserve exit with the cause (exit 70); a corrupt lend table
+  undoes the lend and the prompt runs resident; the reserve-failure switch (3) did not trigger (open).
+- The refill takes 2.66-2.86 s for 6.2 GiB (~2.3 GB/s against the link's 14.3 GB/s): ~7 % of the prompt's time.
+- Peak VRAM 24,242 MiB (the unit 23,519 MiB of 24,480): 238 MiB below the card's limit.
+
+**Disposition (operator, 2026-10-29): +11 % is adopted, not discarded.** The +20 % bar above was Claude's, not the
+project's rule (a measured gain in one phase without a regression in the other beyond the spread, at the
+answer-level bar, is adopted). Before the unit takes it: the KL check, and the peak's margin at depth. Next: the
+refill at the link's speed (~0.5 s would bring the prompt near +18 %, inferred), the reserve-failure switch.
