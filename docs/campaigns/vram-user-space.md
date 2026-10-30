@@ -57,6 +57,18 @@ not yet told apart.
    already owns, the kernel sees no new allocation and has nothing to evict. Needs the backend's own allocations
    (plain `clCreateBuffer` today) routed through the arena; prior art to survey first (llama.cpp's backend buffer
    types, Strata's and Infernix's VRAM pools, read at source).
+2a. **Route A - LEO (operator 2026-10-30: gate it).** Level Zero virtual memory reaches the OpenCL kernels only
+   through the runtime's LEO mode (OpenCL implemented on Level Zero; experimental, `EnableLEO=1`; research-vram-arena.md
+   section 8, `code`; `paper`: not all extensions, performance tuning ongoing in 26.27). Gate before any arena gain
+   counts: test-backend-ops on both cards, the answers at the answer-level bar, a same-window speed A/B against the
+   default driver - on the installed runtime and on the newest one (in the fresh-host container). Then the probe
+   (`tools/l0_vm_arena_probe.c`).
+2b. **Route B - a chunk pool on the default driver (if LEO falls short).** Allocate the usable VRAM once at load as a
+   fixed set of large `cl_mem` chunks; a ggml buffer type hands out ranges inside them (the backend already addresses
+   every tensor as buffer + offset, `data_device` set in one place, `code`); the backend's grow-only buffers and the
+   stream ring route through it; the slot loan becomes a reassignment of chunk ranges (no free, no create: a constant
+   driver footprint). Costs: no contiguity across chunks (a tensor or compute buffer fits one chunk, or the compute
+   reserve is split), fragmentation managed by size classes, a chunk can still be evicted whole under outside pressure.
 3. **Neighbours:** `dmem.min` for a unit's cgroup protects it from another cgroup's allocations (the image service,
    a TTS leg on the same card) - an operator decision, priced by a window with both on the card.
 
