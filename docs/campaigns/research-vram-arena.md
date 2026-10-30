@@ -290,3 +290,146 @@ question 4.
    including the MTP context and a second concurrent request.
 9. **Operator decision**: scope out the elastic VMM range (needs Level Zero, section 5 last paragraph) or open it as
    its own campaign with Infernix `vmm_arena.cu` as the reference.
+
+## 8. An elastic range on Intel (operator 2026-10-30: find a way)
+
+The operator rejects the scope-out at the end of section 5 and asks for a reserved GPU address range whose physical
+pages are mapped and unmapped without moving addresses. Recon only, no card window. Trees read: compute-runtime (NEO)
+at tag `26.27.39122.11` (the installed version, `paper`: `docs/docker.md:178`) unless marked HEAD (master of
+2026-10-30); Linux `v7.0` `drivers/gpu/drm/xe` + `ttm` and the `v7.3` uAPI header (the card host runs a drm-tip DKMS
+build of 7.0.14, not re-read: host down); the Level Zero loader's `ze_api.h` (spec 1.20); Strata `origin/HEAD`;
+llama.cpp `bed0a85`; vllm-xpu-kernels `daf6240`; PyTorch master `c10/xpu/XPUCachingAllocator.cpp`; intel/llvm `sycl`.
+This section supersedes "a `cl_mem` cannot be made from them" (section 5, last paragraph) and question 9.
+
+### 8.1 Result in six lines
+
+1. **Level Zero virtual memory works on xe for both cards** (`code`): NEO implements reserve/physical/map/unmap/access
+   generically over VM_BIND (no product gate); B60 users exist (`paper`: compute-runtime issue 1024, SGLang's MoE
+   expert prefetch remaps pool pages per layer on L0; PyTorch XPU and vLLM-XPU sleep mode, 8.3).
+2. **Granularity**: 64 KiB below 2 MiB, 2 MiB from 2 MiB up; one physical object = one xe BO; the range lives in the
+   CPU-identity (SVM) address range (8.3).
+3. **The bridge to OpenCL exists in the installed driver, behind an experimental switch.** LEO ("Level Zero Executing
+   OpenCL") reimplements OpenCL inside `libze_intel_gpu`; with it, a `cl_context` can be made over a `ze_context` and
+   a `cl_mem` over any L0 pointer (`CL_L0_CONTEXT_HANDLE` 0x42B0, `CL_L0_MEM_OBJ_HANDLE` 0x42B3), so the backend's
+   kernels keep their `cl_mem` + offset arguments over an elastic range. Off by default on BMG and DG2 (`EnableLEO=1`).
+4. **Native OpenCL (the default) cannot see an L0 range**: two drivers, two xe VMs; only dma-buf import (a new
+   address per chunk) or binding our own BOs into NEO's VM from outside NEO.
+5. **Eviction stays whole-BO and kernel-owned** (`code`): no user pin, no priority; `DRM_XE_MADVISE` carries location,
+   atomics, PAT (and from 7.3 a *purgeable* state, the opposite). A chunked range limits the blast radius to a chunk.
+6. **Most promising: route A** (LEO + L0 VM), proved by one ~250-line program on the B60 (8.5); fallback route C.
+
+### 8.2 Routes
+
+| Route | Mechanism | Evidence | On our stack |
+|---|---|---|---|
+| A | L0 `zeVirtualMem*` + LEO: `clGetContextInfo(CL_L0_CONTEXT_HANDLE)` (or `clCreateContext` with it), `clCreateBufferWithProperties({CL_L0_MEM_OBJ_HANDLE, va})` over the reservation | `code`: LEO `api_context.cpp:56`, `context.cpp:189`, `api_mem_obj.cpp:80` (no size check on the imported pointer), `cl_ext_private.h:139-144`; reference program `level_zero/core/test/black_box_tests/zello_opencl_interop.cpp:36,214-215` | Present in 26.27 (`EnableLEO`, `release_variables_base.inl:12`); `isLEOSupported()` false except NVL/CRI (`product_helper.inl:1140`), so `EnableLEO=1` forces it. Experimental (`documentation/LEO.md:70,92`, `paper`). HEAD renames the keys `CL_CONTEXT_L0_HANDLE_INTEL` / `CL_MEM_L0_HANDLE_INTEL`, same values. |
+| B | L0 range in its own driver, chunks exported as dma-buf (`zePhysicalMemCreate` export desc, `context.cpp` HEAD:2346) and imported via `cl_khr_external_memory` (`cl_memory_properties_helpers.cpp:57`) | `code` | Works, but each import gets its own OpenCL address: no common range; equal to plain `cl_mem` chunks plus a second driver. Not elastic in the sense asked. |
+| C | Own memory manager on the xe uAPI: `GEM_CREATE` + `VM_BIND` on NEO's fd into NEO's `vm_id`, at a VA reserved with `mmap(PROT_NONE)` in the CPU half NEO uses only CPU-identically (`gfx_partition.cpp` HEAD:418-421); kernels get raw pointers via `clSetKernelArgMemPointerINTEL` | `code`: VM ids are per file (`xe_vm.c:1881`); NEO accepts an unknown pointer (`api.cpp:5291`, detection off by default) and patches it stateless (`kernel.cpp:968`) | Needs NEO's fd and `vm_id` (ioctl interposition on `DRM_IOCTL_XE_VM_CREATE`), user-fence binds, our own copy path (NEO treats unknown pointers as host memory in `clEnqueue*`), ~800 kernel-argument sites rewritten. Feasible, fragile against NEO updates (`inferred`). |
+| D | Port the backend's host side to L0 (load the same OpenCL C as SPIR-V/zebin with `zeModuleCreate`) | `inferred` | Route A done by hand; only if LEO fails on correctness or speed. |
+| E | `sycl_ext_oneapi_virtual_mem` | `code`: UR's OpenCL adapter returns `UNSUPPORTED_FEATURE` (`unified-runtime/source/adapters/opencl/virtual_mem.cpp:20-34`); the L0 adapter calls `zeVirtualMemReserve` | SYCL-on-L0 only; for an OpenCL backend it is route D. |
+| F | No range: a pool of fixed-size `cl_mem` frames allocated once, lent by reassignment (Infernix's `FrameLease` without VMM) | `inferred` | Works today; loses contiguity (a compute buffer must fit one frame) and cannot defragment. The fallback if A and C fail. |
+
+### 8.3 Answers to the five questions
+
+- **(1) L0 VM on xe** (`code`, NEO 26.27). `reserveVirtualMem` (`context.cpp:1494`) reserves in the SVM
+  (CPU-identity) range by default on Linux (`isSvmHeapReservationSupported()` true, `product_helper.inl:965`;
+  `EnableReservingInSvmRange` true, `context.cpp:1522-1523`), base aligned to 2 MiB (`:1535`). Page size = `selectAlignment(size)`: candidates 64 KiB
+  (any size) and 2 MiB (sizes >= 2 MiB, `AlignLocalMemoryVaTo2MB` default on) (`drm_memory_manager.cpp:93-95`);
+  measured 2 MiB on a B60 by others (`paper`: issue 1024 output). `createPhysicalMem` (`context.cpp:1646`): device
+  memory unless `ALLOCATE_ON_HOST`, size must be a page multiple (`:1699`), one BO
+  (`allocatePhysicalLocalDeviceMemory`, `drm_memory_manager.cpp:2504`). `mapVirtualMem` (`:1782`) sets the BO's
+  address and calls `makeResident` (`:1890`): the VM_BIND happens at map; unmap unbinds (`drm_memory_manager.cpp:803`);
+  `zePhysicalMemDestroy` frees the BO. **Limits**: a device physical object may back one VA at a time (`:1823-1833`);
+  aliasing on a B60 returned SUCCESS then DEVICE_LOST on 26.18 (`paper`: issue 1024, open). Unmap of several adjacent
+  mappings in one call since June 2026 (`paper`: commit a726418ab4). HEAD adds a free-memory check at create
+  (`drm_memory_manager.cpp` HEAD:3019); 26.27 has none.
+- **(2) SYCL / Strata.** Strata's SYCL port stubs all VMM (`sycl/src/core/vmm.cpp:1-6`, `expert_cache.cpp:12`
+  `STRATA_EC_NO_VMM`; `--vram-elastic` refuses): the stated reason is that dpct has no mapping (`paper`, a comment),
+  not that L0 lacks it. Users of the SYCL extension on Intel: ggml-sycl's VMM pool for compute scratch, granularity
+  clamped to 2 MiB because L0 rejects smaller multiples above 2 MiB (`ggml-sycl.cpp:192-203`, pool `:1858-1940`, on by
+  default when the device has `aspect::ext_oneapi_virtual_mem`, `:2060`); PyTorch XPU `ExpandableSegment` (reserve
+  1.125x device memory, map per segment; "the actual OOM can occur during map()", `XPUCachingAllocator.cpp:144-245`);
+  vLLM-XPU sleep mode unmaps and keeps the VA (`csrc/utils/mem_alloc.cpp:103-170`). OpenVINO and oneDNN: no hit for
+  `zeVirtualMemReserve` in a GitHub code search (`inferred` absence).
+- **(3) OpenCL in the same process.** Native NEO: `libigdrcl` and `libze_intel_gpu` each own an execution
+  environment, drm fd and VM (`inferred` from the two libraries; consistent with LEO's design note that igdrcl
+  forwards to ze_intel_gpu instead, `opencl/source/api/leo_forwarding.h` HEAD:19-46), so an L0 address is not mapped in
+  OpenCL's VM. Under LEO a buffer *is* an L0 USM pointer (`LEO.md` object table) and both APIs share one
+  `DriverHandle`: L0 kernel arguments resolve reservation mappings (`driver_handle.cpp` HEAD:560-585), widen the
+  bindful surface to the full stateful region for them (`kernel_hw.h:109`) and accept unmapped pointers as system
+  pointers (`kernel_imp.cpp:913,930`). The only interop in the native path is `cl_khr_external_memory` dma-buf (route B).
+- **(4) xe as the memory manager** (`code`, v7.0). NEO creates every VM `LR_MODE`, `FAULT_MODE` only with page-fault
+  support (`ioctl_helper_xe.cpp:1291-1296`), which BMG and DG2 do not report (`product_helper.inl:401`; only PVC/CRI
+  override): our VMs are preempt-fence mode. TTM evicts whole BOs (`ttm_bo.c:359`), VRAM BOs go to TT
+  (`xe_bo.c:361-366`); the preempt-rebind worker re-validates every evicted BO of the VM before the queues resume
+  (`xe_vm.c:363-380,453`) - the mechanism behind 2026-10-11's thrash. No user pin; `xe_bo_eviction_valuable` only
+  spares BOs of a VM that is validating (`xe_bo.c:1091-1106`). `DRM_XE_MADVISE` (v7.0 `xe_drm.h:2099-2101`):
+  preferred location, atomics, PAT; v7.3 adds `DRM_XE_VMA_ATTR_PURGEABLE_STATE` (`xe_drm.h:2213`), a DONTNEED hint.
+  Protection from other clients stays `dmem.min` (stage 3). Route C is possible because a VM id is valid on the file
+  that created it, and NEO's own fd is that file.
+- **(5) Ecosystem**: ggml-sycl, PyTorch XPU, vLLM-XPU, SGLang (above). ggml-opencl has none; ggml-cuda's VMM pool is
+  the CUDA analogue (`ggml-cuda.cu:529-587`).
+
+### 8.4 Why route A first
+
+It is the only route where every link is a driver API Intel ships and tests (`zello_opencl_interop`), the kernels and
+their `cl_mem` + offset arguments stay as they are, and the cost of finding out is an environment variable plus one
+program. What it buys over section 4's fixed arena: physical chunks that can be moved (lend = unmap from the slot
+range, map into the compute range, no allocation, no eviction trigger), returned to the kernel (shrink for a
+neighbour) and re-taken, behind addresses that never move; and an eviction blast radius of one chunk instead of the
+arena (section 5, risk 1). Route C is the fallback on the native driver, route F the fallback without a range.
+
+### 8.5 The smallest proof: `vm_arena_probe` (one C file, `-lze_loader -lOpenCL`, keys 0x42B0/0x42B3/0x42B4 defined locally)
+
+Run on the B60 per `docs/sop-card-window.md` (card by PCI id, image service released), as
+`EnableLEO=1 ./vm_arena_probe <pci-bdf>`; the A770 run follows (no deferred backing there, 8.7). Every step reads the
+process's `drm-resident-vram0` (sum over its xe fds in `/proc/self/fdinfo`) and the card's `used` (xe query).
+
+1. Device by PCI id (`zeDevicePciGetPropertiesExt`); the CL device must report `LEO` in `CL_DEVICE_VERSION` and its
+   `CL_L0_DEVICE_HANDLE` must equal the ze device. `clCreateContext({CL_L0_CONTEXT_HANDLE, ze_ctx})`.
+2. `zeVirtualMemQueryPageSize(512 MiB)` (expect 2 MiB); reserve 16 GiB. Resident delta: 0.
+3. Eight `zePhysicalMemCreate` of 512 MiB. Delta recorded (expect ~0 on the B60 under deferred backing).
+4. Map chunks 0-3 at offsets 0-2 GiB: +2 GiB, time per map. One `cl_mem` over the whole 16 GiB with
+   `CL_L0_MEM_OBJ_HANDLE`, plus a `clCreateSubBuffer` at 1.5 GiB. Kernel `fill(global uint *p, ulong off, uint seed)`
+   over a window crossing the chunk 1/2 boundary and over chunk 3; `count_bad` writes mismatches to a small buffer.
+   Gate: 0 bad. Red case: `count_bad` with `seed+1` must report every word.
+5. Lend: `clFinish`; unmap chunk 3 at 1.5 GiB; map it at 8 GiB; `count_bad` there with chunk 3's seed = 0 proves the
+   same pages moved (a fresh allocation would fail it); resident and card `used` unchanged within 2 MiB. Never launch
+   on the unmapped hole: no recoverable faults on these cards, an access there is a GPU fault and an engine reset.
+6. Shrink and grow: unmap + destroy chunk 2: -512 MiB resident and card-wide; create + map a new chunk there: +512 MiB,
+   fill + check. 100 lend cycles timed (unmap + map + `clFinish`): the loan's cost per chunk.
+7. Control: `EnableLEO=0` must fail at step 1 (`CL_L0_CONTEXT_HANDLE` unknown to native NEO): proves the bridge is LEO.
+
+Next, if it passes: `test-backend-ops -b GPUOpenCL` and the deployed answers under `EnableLEO=1` with no arena (LEO's
+own gate), then section 7's question 4 with the range: an arena at `total - 1 GiB` in 512 MiB chunks, a second process
+taking 2 GiB, both clients' resident read - whole chunks expected to move and come back, not the range.
+
+### 8.6 Risks
+
+1. **LEO is experimental and replaces the whole OpenCL implementation** (`paper`: `LEO.md`); arcint's subgroup
+   kernels, program-binary cache, host-USM bank, LSC-uncached doorbell, events and queue ordering all run on a new
+   path. Its gate (answers at the answer-level bar, `test-backend-ops`, same-window speed A/B) comes before any arena
+   benefit; a speed loss under LEO prices route A against C.
+2. **API churn**: the interop keys are private (`cl_ext_private.h`) and were renamed after 26.27; pin by value.
+3. **Argument resolution on the A770**: BMG compiles every buffer stateless
+   (`compiler_product_helper_xe_hpc_and_later.inl:18` via `enable_compiler_product_helper_bmg.cpp:14`), DG2 does
+   not (`..._before_xe_hpc.inl`); a bindful surface is widened only when the base pointer resolves to a mapping
+   (`kernel_hw.h:109`). Keep the range's bottom chunk mapped for its lifetime (the stable end of 4.1 is there anyway)
+   or force stateless on the A770 (`inferred`).
+4. **No aliasing** (8.3 (1)): a chunk is unmapped before it is mapped elsewhere, and every queue that used it is idle.
+5. **Eviction is not abolished**: chunks are ordinary BOs and the runtime's own late allocations (section 3 C) or a
+   neighbour can still evict one; the rebind worker returns it at the 2026-10-11 price. The range removes our late
+   allocations, not the kernel's right to evict; `dmem.min` stays the guard.
+6. **Overcommit at map, not at create**: with deferred backing the BO gets VRAM at bind (`xe_drm.h:779-783`), and
+   26.27 has no free-memory check at create; PyTorch saw the same (`paper`). Create and map all chunks at load.
+7. **Route C** (if A fails): NEO is unaware of the range, so its copy paths treat those pointers as host memory, and
+   any NEO change to fd or VM handling breaks it silently.
+
+### 8.7 Side finding: deferred backing on the B60
+
+NEO 26.27 sets `DRM_XE_GEM_CREATE_FLAG_DEFER_BACKING` on every BO on BMG (`product_helper_bmg.cpp:39-44`, default
+true; DG2 false, `product_helper.inl:426-431`; HEAD defers only above 50 % of VRAM). The kernel then allocates VRAM
+"until the object is either bound ... via VM_BIND or accessed by the CPU" (`xe_drm.h:779-783`, `code`). Every B60
+`clCreateBuffer` is therefore populated at its first bind, not at creation (`inferred`; when NEO binds an OpenCL buffer
+was not traced): a candidate root cause for section 5 risk 8 (lazy population) and the loan's `first_touch` term,
+testable by `NEOReadDebugKeys=1 EnableDeferBacking=0` against the default in the same window (question 3).
