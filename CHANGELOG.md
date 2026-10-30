@@ -18,6 +18,51 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.2.7 — 2026-10-30
+
+Faster decode on every unit and faster prefill on the coder; answers checked
+at the answer-level bar (`docs/campaigns/fusion-coder-night.md`, on the `qfndev`
+branch; all `measured-here`):
+- 0064: the MoE router kernel on one sub-group a token, 2.5x faster;
+  KL 0.023656 -> 0.023594, the task 10/10; the greedy texts change (sum order).
+- 0065: a verify's conv-state snapshots in one launch (+1.8 % coder decode,
+  the same answers).
+- 0066: the delta-net generation kernel for verify batches up to 8 tokens, on by
+  default (+1.1 % coder, +2.3 % agent with 0065, the same answers).
+- 0067 + `llama_spec`: with `--llama-mtp-vocab` the draft context's unread
+  rows stay on the device (the vocabulary's -0.8 % prefill on the coder gone).
+- `--prefill-ubatch N`: llama.cpp's n_ubatch (default unchanged, 512). 1024 on
+  the A770 coder: prefill-41k +15 %, the same answers, +219 MiB VRAM.
+
+Unit changes, not defaults: `--llama-mtp-vocab` on the coder (+10 to +13 %
+decode, the task 10/10) and Flash-Next (+2.9 %), and `--prefill-ubatch 1024`
+on the coder (the production units run them since 2026-10-26, coder task 10/10
+twice). The coder with all of it against 1.2.6: decode +13.6 / +21.9 / +14.7 %,
+prefill-41k +15.7 %.
+
+Request cancellation (DESIGN §3.7): a client that leaves and a stop signal end a
+request at its next token or prefill batch, also while nothing is written (a
+long prompt's prefill, a buffered tool call). A zero-timeout socket peek on the
+request's own connection (cpp-httplib built with poll; one `Request::socket`
+field in the vendored header); the slot line names the cause and the tokens
+actually prefilled; a non-streamed request answers a stop with 503
+`server_stopping` and gets no body when its client is gone. Measured on the
+A770 with the coder and a 37,723-token prompt, against the parent binary
+(`tools/cancel_check.py`, `measured-here`): the slot is free 1.8 s after a
+streamed client leaves (42.6 s before), 1.6 s non-streamed (42.3 s), SIGTERM
+exits after 1.8 s (42.7 s), and the same needle prompt sent right after the
+abort is answered correctly. Speech and transcription do not cancel yet.
+
+Quality instruments: `tools/capture_vs_capture.py` compares a candidate against
+a baseline's own run-to-run twin (`--baseline A B --candidate C`) and restricts
+the KL to given token ranges (`--mask`).
+
+**Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (64
+patches: 0064-0067 new); dependencies unchanged. `arcint-stt` (1.2.0) and
+`arcint-imggen` (1.1.1) are unchanged. Release check: the install of the
+published package in a fresh container (the operator's call: the unit and
+card ladders had run on the tree).
+
 ## 1.2.6 — 2026-10-25
 
 The loop guard's last 1.2.5 residual fixed, and the release A/B reads decode

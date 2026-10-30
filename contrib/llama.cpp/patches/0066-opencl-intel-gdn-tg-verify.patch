@@ -1,0 +1,37 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 5747f7e..39c3d49 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -34998,7 +34998,14 @@ static bool ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
+     cl_kernel kernel = backend_ctx->kernel_gated_delta_net_f32[si][kda][tgpp];
+     const bool gdn_intel = S_v == 128 && kda == 0 && backend_ctx->kernel_gdn_intel_tg != nullptr;
+     if (gdn_intel) {
+-        kernel = tgpp == 0 ? backend_ctx->kernel_gdn_intel_tg : backend_ctx->kernel_gdn_intel_pp;
++        // the generation kernel (one sub-group per R rows, the tokens in a loop, the K snapshots
++        // written per token) also takes batches of up to 8 tokens, a speculative verify's size; the
++        // prompt kernel's work-groups stage chunks of TC tokens for long batches. A verify step on
++        // the A770 coder: GDN 1.044 -> 0.674 ms, same answers (measured). GGML_OPENCL_GDN_TG_MAX=N
++        // moves the limit, 1 = the prompt kernel for every batch over one token
++        static const char * tg_max_env = getenv("GGML_OPENCL_GDN_TG_MAX");
++        static const int    tg_max     = tg_max_env != nullptr ? atoi(tg_max_env) : 8;
++        kernel = (tgpp == 0 || n_tokens <= tg_max) ? backend_ctx->kernel_gdn_intel_tg : backend_ctx->kernel_gdn_intel_pp;
+     }
+     GGML_ASSERT(kernel != nullptr);
+     if (snap != nullptr && !gdn_intel) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 2162bf3..fd7f6bf 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12616,6 +12616,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   1, 2, 3));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   2, 1, 2, false, false, /*K=*/2));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128, 100, 2, 1, false, false, /*K=*/4));
++    // a speculative verify's shapes (n_draft + 1 tokens, K = n_draft + 1 snapshots): the MoE coder's
++    // 16 q/k and 32 v heads with 4 drafts, the dense 27B's 48 v heads with 5, and fewer tokens than slots
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   5, 1, 2, false, false, /*K=*/5));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   6, 1, 3, false, false, /*K=*/6));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   3, 1, 2, false, false, /*K=*/5));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   8, 2, 2, false, false, /*K=*/1));
+ 
+     // gdn + cache cpy fusion (K > 1)
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));

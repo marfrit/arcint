@@ -192,6 +192,10 @@ std::string usage_text() {
         "  --prefill-chunk N         prefill chunk in tokens (llama.cpp's n_batch;\n"
         "                            default: 2048, 0 the same). Bounds activation\n"
         "                            memory; chunk boundaries are not bit-exact\n"
+        "  --prefill-ubatch N        prefill micro-batch in tokens (llama.cpp's\n"
+        "                            n_ubatch, at most the chunk; default 0: 512, or\n"
+        "                            the chunk with --llama-expert-cache). Larger is\n"
+        "                            faster and takes more VRAM for the compute buffer\n"
         "\n"
         "serving defaults (the operator layer: request > these > the GGUF's own;\n"
         "any of them flips the served sampler provenance to 'operator')\n"
@@ -632,6 +636,10 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, cfg.prefill_chunk)) {
                 return fail("--prefill-chunk needs an integer");
             }
+        } else if (arg == "--prefill-ubatch") {
+            if (!value(v) || !parse_int(v, cfg.prefill_ubatch)) {
+                return fail("--prefill-ubatch needs an integer");
+            }
         } else if (is_retired_flag(std::string(arg))) {
             return fail(std::string(arg) + " was retired with the OpenVINO engine in 0.8.0 (see docs/history.md)");
         } else {
@@ -687,6 +695,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.stub_delay_ms > 0 && !cfg.stub) return fail("--stub-delay-ms only applies to --stub");
     if (cfg.n_ctx < 0) return fail("--n-ctx must be >= 0");
     if (cfg.prefill_chunk < 0) return fail("--prefill-chunk must be >= 0");
+    if (cfg.prefill_ubatch < 0) return fail("--prefill-ubatch must be >= 0");
     // The libllama engine is the only one; a bare --gguf selects it.
     if (cfg.engine.empty()) cfg.engine = "llama";
     // Named lanes (DESIGN §4.2, amended 2026-10-07): the libllama engine's

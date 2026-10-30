@@ -136,6 +136,40 @@ double seconds_since(clock_type::time_point t0) {
     return std::chrono::duration<double>(clock_type::now() - t0).count();
 }
 
+// The request's cancellation at a boundary. The stop flag first: a SIGTERM or
+// SIGINT ends every running request at its next token or ubatch boundary, so a
+// clean exit does not wait out a long prefill (DESIGN §3.7).
+bool stop_requested(const GenerationInput& in) {
+    return in.stop != nullptr && in.stop->load(std::memory_order_relaxed);
+}
+
+// Why an Abort: the stop flag is checked first, so a SIGTERM is not logged as
+// a gone client (the card showed "aborted: client gone" on SIGTERM).
+AbortCause abort_cause_of(const GenerationInput& in) {
+    return stop_requested(in) ? AbortCause::StopSignal : AbortCause::ClientGone;
+}
+
+// The tokens a cancelled prefill actually prefilled: the `have` growth over
+// the restored prefix, so the slot line does not report the whole prompt.
+int prefilled_so_far(const std::vector<int>& have, size_t from) {
+    return static_cast<int>(have.size() > from ? have.size() - from : 0);
+}
+
+// Whether the client's connection is gone, checked at most every 0.5 s of wall
+// time: the probe peeks the socket (cpp-httplib's is_socket_alive), so nothing
+// is written to find out. A prefill checks it at every ubatch boundary instead
+// of by time -- one decode call cannot be interrupted -- and a phase that
+// writes nothing for minutes (a long prompt, a buffered tool call) would
+// otherwise not see the close at all.
+constexpr double kPeerCheckSeconds = 0.5;
+bool peer_gone(const GenerationInput& in, clock_type::time_point& last_check) {
+    if (!in.peer_alive) return false;
+    const clock_type::time_point now = clock_type::now();
+    if (std::chrono::duration<double>(now - last_check).count() < kPeerCheckSeconds) return false;
+    last_check = now;
+    return !in.peer_alive();
+}
+
 // The OpenCL card --device names: its platform, its index among the
 // platform's devices as ggml-opencl numbers them (every device type, as
 // GGML_OPENCL_DEVICES takes it), and its name. "GPU.N" is the N-th platform
@@ -584,6 +618,8 @@ public:
         // over the link once: the whole batch in one ubatch reads them once per
         // n_batch tokens instead of per 512
         cp.n_ubatch        = static_cast<uint32_t>(ec_on ? n_batch_ : std::min(n_batch_, 512));
+        // --prefill-ubatch: the operator's micro-batch, capped at the chunk
+        if (cfg.prefill_ubatch > 0) cp.n_ubatch = static_cast<uint32_t>(std::min(n_batch_, cfg.prefill_ubatch));
         cp.n_kv_reserve    = cfg.llama_reserve_cells;
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
         cp.type_k          = kv_type(cfg.llama_kv_k);
@@ -1006,9 +1042,20 @@ public:
             // all but the last token, checkpointed along the way; the last
             // runs alone, for its logits
             const size_t n_pre = prompt.size() - 1;
-            prefill_locked(seq, prompt, common, n_pre, have, [&](const int* t, size_t n, size_t at) {
-                return decode_locked(seq, t, n, at, false);
-            });
+            if (!prefill_locked(seq, prompt, common, n_pre, have, [&](const int* t, size_t n, size_t at) {
+                    return decode_locked(seq, t, n, at, false);
+                }, in)) {
+                stats.prompt_tokens_prefilled = prefilled_so_far(have, common);
+                stats.abort_cause            = abort_cause_of(in);
+                stats.prefill_seconds        = seconds_since(t_prefill);
+                return FinishReason::Abort;   // the slot is freed by the caller at once
+            }
+            if (stop_requested(in) || (in.peer_alive && !in.peer_alive())) {
+                // the prefill finished; the slot line reports the full prompt
+                stats.abort_cause     = abort_cause_of(in);
+                stats.prefill_seconds = seconds_since(t_prefill);
+                return FinishReason::Abort;
+            }
             if (!decode_locked(seq, &prompt.back(), 1, n_pre, true))
                 throw std::runtime_error("llama_decode failed during prefill");
             have.push_back(prompt.back());
@@ -1020,10 +1067,20 @@ public:
         const auto t_decode = clock_type::now();
         FinishReason reason = FinishReason::Stop;
         const auto   t_s0   = clock_type::now();
+        clock_type::time_point last_peer = t_s0 - std::chrono::seconds(1);   // first check at once
         int          next   = sampler.sample(logits.data(), n_vocab_);
         stats.decode_sample_seconds += seconds_since(t_s0);
         auto is_stop_token = [&](int tok) { return is_stop(in.sampler, tok); };
         while (true) {
+            // The stop signal and the client's connection, at the token
+            // boundary: a signal ends the request rather than waiting out a
+            // long decode, and a close is seen even while the text is buffered
+            // for tool-call parsing (DESIGN §3.7).
+            if (stop_requested(in) || peer_gone(in, last_peer)) {
+                stats.abort_cause = abort_cause_of(in);
+                reason            = FinishReason::Abort;
+                break;
+            }
             // loop-guard: the answer phase looped after a slap; the token was
             // sampled but must not be emitted, so the turn ends here.
             if (sampler.loop_abort()) {
@@ -1127,6 +1184,14 @@ public:
             mtmd_input_chunks_free(chunks);
             throw ContextOverflowError(static_cast<int>(n_tok), cap);
         }
+        // The projector's eval below is one call, so the prefill's cancellation
+        // boundary is before it and after it; the decode loop checks its own.
+        if (stop_requested(in) || (in.peer_alive && !in.peer_alive())) {
+            stats.abort_cause             = abort_cause_of(in);
+            stats.prompt_tokens_prefilled = 0;   // nothing reached the model yet
+            mtmd_input_chunks_free(chunks);
+            return FinishReason::Abort;
+        }
 
         uint64_t seed = in.sampler.seed;
         if (!in.sampler.seeded) {
@@ -1164,14 +1229,27 @@ public:
         }
         mtmd_input_chunks_free(chunks);
         stats.prefill_seconds = seconds_since(t_pre);
+        if (stop_requested(in) || (in.peer_alive && !in.peer_alive())) {
+            // the projector's prefill finished: the full prompt was prefilled
+            stats.abort_cause = abort_cause_of(in);
+            return FinishReason::Abort;
+        }
 
         const auto   t_decode = clock_type::now();
         FinishReason reason   = FinishReason::Stop;
         const auto   t_s0     = clock_type::now();
+        clock_type::time_point last_peer = t_s0 - std::chrono::seconds(1);   // first check at once
         int          next     = sampler.sample(logits.data(), n_vocab_);
         stats.decode_sample_seconds += seconds_since(t_s0);
         auto is_stop_token = [&](int tok) { return is_stop(in.sampler, tok); };
         while (true) {
+            // A stop signal or a gone client at the token boundary, as the
+            // plain loop (DESIGN §3.7).
+            if (stop_requested(in) || peer_gone(in, last_peer)) {
+                stats.abort_cause = abort_cause_of(in);
+                reason            = FinishReason::Abort;
+                break;
+            }
             // loop-guard: as the plain loop, the answer phase looped after a
             // slap and no further token is emitted.
             if (sampler.loop_abort()) {
@@ -1548,9 +1626,14 @@ private:
             drop_ckpts_after_locked(seq, common);
             have.resize(common);
             stats.cache_hit_tokens = static_cast<int>(common);
-            prefill_locked(seq, prompt, common, n_pre, have, [&](const int* t, size_t n, size_t at) {
-                return spec_->decode(t, n, at, seq, false) == 0;
-            });
+            if (!prefill_locked(seq, prompt, common, n_pre, have, [&](const int* t, size_t n, size_t at) {
+                    return spec_->decode(t, n, at, seq, false) == 0;
+                }, in)) {
+                stats.prompt_tokens_prefilled = prefilled_so_far(have, common);
+                stats.abort_cause            = abort_cause_of(in);
+                stats.prefill_seconds        = seconds_since(t_prefill);
+                return FinishReason::Abort;
+            }
         }
         stats.prefill_seconds = seconds_since(t_prefill);
 
@@ -1567,7 +1650,15 @@ private:
             ~Decoding() { b.set_decoding(seq, false); }
         };
         std::optional<Decoding> decoding(std::in_place, *this, seq);
+        clock_type::time_point last_peer = t_decode - std::chrono::seconds(1);   // first check at once
         while (true) {
+            // A stop signal or a gone client at the token boundary, as the
+            // plain loop (DESIGN §3.7).
+            if (stop_requested(in) || peer_gone(in, last_peer)) {
+                stats.abort_cause = abort_cause_of(in);
+                reason            = FinishReason::Abort;
+                break;
+            }
             if (static_cast<int>(have.size()) + 1 >= cap) {
                 reason = FinishReason::Length;
                 break;
@@ -1689,8 +1780,8 @@ private:
     // before its end; an edited message, up to that message's start. Caller
     // holds mu_.
     template <class Decode>
-    void prefill_locked(int seq, const std::vector<int>& prompt, size_t from, size_t to, std::vector<int>& have,
-                        Decode&& decode) {
+    bool prefill_locked(int seq, const std::vector<int>& prompt, size_t from, size_t to, std::vector<int>& have,
+                        Decode&& decode, const GenerationInput& in) {
         const bool   ckpt = ckpt_on_;
         const size_t P    = prompt.size();
         const size_t nub  = static_cast<size_t>(n_ubatch_);
@@ -1756,6 +1847,10 @@ private:
             spec_->prefill_plan(seq, to, keep);
         }
         for (size_t at = from; at < to;) {
+            // A stop signal or a gone client at every ubatch boundary: without
+            // this a long prompt's prefill, which writes nothing, holds the
+            // lane for its whole remaining run after the client has left.
+            if (stop_requested(in) || (in.peer_alive && !in.peer_alive())) return false;
             size_t e = at;
             if (step(at, list.empty(), newest(), e)) save_ckpt_locked(seq, at);
             if (!decode(prompt.data() + at, e - at, at))
@@ -1763,6 +1858,7 @@ private:
             have.insert(have.end(), prompt.begin() + static_cast<long>(at), prompt.begin() + static_cast<long>(e));
             at = e;
         }
+        return true;
     }
 
     // A checkpoint of what `seq` holds after n_tokens tokens: only the part of

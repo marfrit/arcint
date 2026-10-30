@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -82,11 +83,20 @@ struct Context {
     // Named lanes, in --served-model-name order. Empty: one name, `slots`
     // admits and the model field is not binding (the behaviour before them).
     std::vector<Lane> lanes{};
+    // The process's stop flag, owned by the HTTP server. A request prepared
+    // while it is set carries it into the backend, which ends it at its next
+    // token or ubatch boundary (DESIGN §3.7). Null outside a server (a test
+    // calling the seam directly).
+    std::atomic<bool>* stop_flag = nullptr;
 };
 
 struct HttpResult {
     int            status = 200;
     nlohmann::json body;
+    // The request ended because its peer's connection is gone: the route
+    // writes nothing then (there is nobody to receive it). Distinct from a
+    // stop signal, which answers a 503 an alive client can still read.
+    bool gone = false;
 };
 
 // The lanes --served-model-name A,B --lane-ctx CA,CB configure, a pool of one
@@ -157,6 +167,12 @@ nlohmann::json models(const Context& ctx);
 // Writes one SSE frame. Returns false when the client is gone, which aborts the
 // request's work at the next boundary (DESIGN.md §3.7).
 using SseWriter = std::function<bool(std::string_view)>;
+
+// Whether the peer is still connected. The routes put it into the prepared
+// request's GenerationInput (peer_alive): the generation calls it at its own
+// boundaries and never writes to the stream to find out, and the input the
+// backend runs is not copied to attach it.
+using PeerProbe = std::function<bool()>;
 
 struct PreparedChat {
     ChatRequest     req;

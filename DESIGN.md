@@ -1,7 +1,7 @@
 # arcint — Design
 
-State as of 2026-10-25: arcint **1.2.6** on llama.cpp **`3e4dfa8`** with the
-patch series `contrib/llama.cpp/patches` 0001-0063 (60 patches). One engine: libllama with
+State as of 2026-10-30: arcint **1.2.7** on llama.cpp **`3e4dfa8`** with the
+patch series `contrib/llama.cpp/patches` 0001-0067 (64 patches). One engine: libllama with
 ggml's OpenCL backend and arcint's Intel kernels. Three language services run
 in production on two Intel Arc cards: the dense Qwen3.8-27B agent and
 Qwen3.8-Flash-Next (125B-A6B, on demand) on the 24 GB Arc Pro B60, the MoE
@@ -352,8 +352,25 @@ provenance (`code`).
   `tool_calls`; requests without `tools` get raw text. A template that
   iterates arguments as a mapping is handed the parsed object; minja
   polyfills stay off (`code`).
-- **Cancellation.** A dropped connection aborts at the next step boundary
-  and frees the lane (`code`; gated by the concurrency suite, §5).
+- **Cancellation.** A dropped connection and a stop signal (SIGTERM/SIGINT)
+  abort at the next token or batch boundary (a prefill steps by `--prefill-chunk`) and free the lane (`code`; gated
+  by the concurrency suite, §5). The boundary checks the process's stop flag
+  and the request's socket with a zero-timeout peek — no byte is written and
+  nothing blocks (`code`: the prefill writes nothing for long stretches and a
+  tool call is buffered to the turn's end, so a write could learn the close
+  too late by minutes). A streamed request then sends nothing more; a
+  non-streamed one answers a stop signal with a 503 error body and builds no
+  body for a gone client (the server's empty status line fails harmlessly), and a half-buffered tool call is never
+  returned as raw content (`code`: unit-tested on the stub backend). The slot
+  line names the cause (`aborted: stop signal` / `aborted: client gone`), and
+  an aborted prefill reports the tokens it actually prefilled, not the whole
+  prompt (`code`).
+- **What does not cancel.** Speech synthesis (TTS) and transcription hold the
+  backend mutex for the whole request and are not cancellable yet (`code`:
+  `generate_speech` takes the context mutex once and the seam carries no probe;
+  transcription is the separate `arcint-stt` unit). A dropped client or a stop
+  signal during either is waited out; the stop still ends every text request
+  at its next boundary.
 
 ### 3.8 Context-overflow policy
 

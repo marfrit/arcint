@@ -472,7 +472,12 @@ public:
             }
         }
         if (nd_ > 0) {
+            // with the draft head the MTP context returns a row for every entry; these
+            // entries (a prompt's catch-up, a verify's pending rows) are never read, so the
+            // rows stay on the device (patch 0067; a prompt of 41k rows copied 335 MB)
+            if (head_) llama_set_embeddings_nextn_skip(ctx_dft_, true);
             const int rd = llama_process(ctx_dft_, LLAMA_PROCESS_TYPE_DECODE, bd_);
+            if (head_) llama_set_embeddings_nextn_skip(ctx_dft_, false);
             if (rd != 0) return rd;
         }
         for (size_t k = 0; k < n_parts; ++k) {

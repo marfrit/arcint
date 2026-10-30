@@ -36,6 +36,7 @@ TEST(config_stub_defaults) {
     CHECK_EQ(cfg.engine, std::string("llama"));
     CHECK(cfg.gguf_path.empty());
     CHECK_EQ(cfg.prefill_chunk, 2048);
+    CHECK_EQ(cfg.prefill_ubatch, 0);
     CHECK_EQ(cfg.device, std::string("GPU.0"));
 }
 
@@ -81,6 +82,8 @@ TEST(config_validates_ranges) {
     CHECK(rejected({"--stub", "--parallel", "0"}));
     CHECK(rejected({"--stub", "--n-ctx", "-1"}));
     CHECK(rejected({"--stub", "--prefill-chunk", "-1"}));
+    CHECK(rejected({"--stub", "--prefill-ubatch", "-1"}));
+    CHECK(rejected({"--stub", "--prefill-ubatch", "many"}));
 }
 
 TEST(config_accepts_the_documented_choices) {
@@ -91,6 +94,9 @@ TEST(config_accepts_the_documented_choices) {
     }
     Config chunk;
     CHECK(run({"--stub", "--prefill-chunk", "0"}, chunk).ok);
+    Config ub;
+    CHECK(run({"--stub", "--prefill-ubatch", "1024"}, ub).ok);
+    CHECK_EQ(ub.prefill_ubatch, 1024);
     CHECK(rejected({"--stub", "--device", ""}));
 }
 

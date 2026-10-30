@@ -1,5 +1,7 @@
 #include "http/server.h"
 
+#include <atomic>
+
 #include <httplib.h>
 
 #include "api/error.h"
@@ -29,14 +31,35 @@ bool read_json(const httplib::Request& req, httplib::Response& res, json& out) {
     return true;
 }
 
+// The peer-liveness probe for a request: cpp-httplib's detail::is_socket_alive,
+// a zero-timeout poll plus a MSG_PEEK, so it neither blocks nor writes a byte.
+// It used to be the sink's is_writable, which is select_write under this
+// server's 3600 s write timeout -- it could block under the backend's mutex --
+// and without CPPHTTPLIB_USE_POLL it read EVERY fd >= 1024 as gone (this build
+// defines poll for exactly that, see CMakeLists.txt). No socket (a direct
+// call in a test): nothing is watched.
+api::PeerProbe peer_probe(socket_t sock) {
+    return [sock] {
+        if (sock < 0) return true;
+        return httplib::detail::is_socket_alive(sock);
+    };
+}
+
 }  // namespace
 
 struct HttpServer::Impl {
     const Config&   cfg;
     api::Context&   ctx;
     httplib::Server svr;
+    // The stop signal's flag: SIGTERM/SIGINT sets it through stop(), and every
+    // request prepared while it is set carries it into the backend, which ends
+    // at its next token or ubatch boundary (DESIGN §3.7). A stop is terminal:
+    // nothing clears it for this process's life.
+    std::atomic<bool> stopping{false};
 
-    Impl(const Config& c, api::Context& x) : cfg(c), ctx(x) {}
+    Impl(const Config& c, api::Context& x) : cfg(c), ctx(x) {
+        ctx.stop_flag = &stopping;
+    }
 
     void route();
 };
@@ -151,7 +174,13 @@ void HttpServer::Impl::route() {
         }
 
         if (!prep->req.stream) {
+            // The probe rides the prepared input, so the backend runs it as it
+            // is: a stream:false client that leaves during a long prefill is
+            // seen at the next boundary too. A stop signal answers a 503; a
+            // gone client's response is not built (r.gone).
+            prep->input.peer_alive = peer_probe(req.socket);
             const api::HttpResult r = api::run_chat(ctx, *prep, slot);
+            if (r.gone) return;
             send_json(res, r.status, r.body);
             return;
         }
@@ -159,13 +188,15 @@ void HttpServer::Impl::route() {
         res.set_header("Cache-Control", "no-cache");
         // The lease rides in the provider so the lane is held for exactly as
         // long as the stream lives, and freed when it ends however it ends.
+        const socket_t sock = req.socket;
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, prep, lease, slot](size_t, httplib::DataSink& sink) {
+            [this, prep, lease, slot, sock](size_t, httplib::DataSink& sink) {
                 // The handlers turn a generation's exceptions into an error
                 // event; this is the last guard: nothing thrown here may leave
                 // httplib's worker thread, which would end the process.
                 try {
+                    prep->input.peer_alive = peer_probe(sock);
                     api::stream_chat(ctx, *prep, slot, [&sink](std::string_view data) {
                         return sink.write(data.data(), data.size());
                     });
@@ -200,19 +231,23 @@ void HttpServer::Impl::route() {
         }
 
         if (!prep->req.stream) {
+            prep->input.peer_alive = peer_probe(req.socket);
             const api::HttpResult r = api::run_completion(ctx, *prep, slot);
+            if (r.gone) return;
             send_json(res, r.status, r.body);
             return;
         }
 
         res.set_header("Cache-Control", "no-cache");
+        const socket_t sock = req.socket;
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, prep, lease, slot](size_t, httplib::DataSink& sink) {
+            [this, prep, lease, slot, sock](size_t, httplib::DataSink& sink) {
                 // The handlers turn a generation's exceptions into an error
                 // event; this is the last guard: nothing thrown here may leave
                 // httplib's worker thread, which would end the process.
                 try {
+                    prep->input.peer_alive = peer_probe(sock);
                     api::stream_completion(ctx, *prep, slot, [&sink](std::string_view data) {
                         return sink.write(data.data(), data.size());
                     });
@@ -238,6 +273,12 @@ bool HttpServer::listen() {
     return impl_->svr.listen(impl_->cfg.host.c_str(), impl_->cfg.port);
 }
 
-void HttpServer::stop() { impl_->svr.stop(); }
+void HttpServer::stop() {
+    // The running requests first, then the listener: a generation that writes
+    // nothing (a long prefill, a buffered tool call) would otherwise outlive
+    // the stop signal, and a stop during one timed out and was killed.
+    impl_->stopping.store(true, std::memory_order_relaxed);
+    impl_->svr.stop();
+}
 
 }  // namespace lgc

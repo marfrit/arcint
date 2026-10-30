@@ -28,6 +28,9 @@
 - Flash-Next's production quant is ISTA-DASLab's GSQ-RCO IQ3_S since
   2026-10-20 (operator): 33.3 t/s decode on six answers, KL 0.127 against
   Q8_0 (IQ3_XXS 38.0 t/s, 0.217, the rollback).
+- Version 1.2.7 (2026-10-30): faster decode on every unit and faster coder
+  prefill (patches 0064-0067, `--prefill-ubatch`), request cancellation on a
+  client that leaves or a stop signal, twin-based KL instruments.
 - Version 1.2.6 (2026-10-25): the loop guard's stretch budget point judged
   on a token repeat share; the release A/B reads decode on the majority
   answer.
@@ -213,7 +216,7 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
 - --host ADDR (127.0.0.1), --port N (8090), --http-threads N.
 - --served-model-name NAME[,NAME2] with --lane-ctx CA,CB; --parallel N;
   --n-ctx N (default the smaller of 32,768 and the trained context);
-  --queue-timeout S; --prefill-chunk N.
+  --queue-timeout S; --prefill-chunk N; --prefill-ubatch N (n_ubatch, default 512).
 - Sampler defaults: --temp, --top-p, --top-k, --min-p,
   --repetition-penalty, --presence-penalty,
   --chat-template-kwarg enable_thinking=BOOL.

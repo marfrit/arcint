@@ -14,7 +14,7 @@
 # (docs/history.md), and older tags are built with the recipe at their tag.
 set -euo pipefail
 
-PKGVER=1.2.6
+PKGVER=1.2.7
 UPSTREAM_TAG=v${PKGVER}
 PKGREL=1
 # The public repository, not the fleet one. The fleet repo (still named
@@ -22,9 +22,9 @@ PKGREL=1
 # and carries operator-local notes; the published tree is the same code without
 # them, so the package is built from what anyone can check.
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
-# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v1.2.6.tar.gz,
+# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v1.2.7.tar.gz,
 # taken after the tag was pushed (recorded in the follow-up commit, as for every tag).
-ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-efc0e4fa87c2e7729add12601b57334713786149ae43e0778edf0cf66a899831}
+ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-}
 # The libllama engine (--engine llama) builds against llama.cpp at this pin
 # with contrib/llama.cpp/patches applied (contrib/llama.cpp/README.md): the
 # GitHub tarball of the commit, checked by sha256.
@@ -71,7 +71,13 @@ SRC=$(find . -maxdepth 1 -mindepth 1 -type d | head -1)
 # The engine: llama.cpp at the pin, the patches from the arcint tarball itself,
 # so the package and its source agree on them by construction.
 mkdir llama && cd llama
-curl --connect-timeout 10 --max-time 600 --retry 3 --retry-delay 5 -sSLfo llama.tar.gz "$LLAMA_URL"
+# LLAMA_SRC_TARBALL: the same tarball from a local path, for a build host without
+# internet access; the checksum below is checked either way.
+if [ -n "${LLAMA_SRC_TARBALL:-}" ]; then
+    cp "$LLAMA_SRC_TARBALL" llama.tar.gz
+else
+    curl --connect-timeout 10 --max-time 600 --retry 3 --retry-delay 5 -sSLfo llama.tar.gz "$LLAMA_URL"
+fi
 echo "$LLAMA_TARBALL_SHA256  llama.tar.gz" | sha256sum -c
 tar xzf llama.tar.gz
 LLAMA_DIR="$work/llama/llama.cpp-${LLAMA_COMMIT}"

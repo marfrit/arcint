@@ -89,3 +89,19 @@ def kl_ref_vs_served(ref_logp, served_logits):
     cand = log_softmax(np.asarray(served_logits, dtype=np.float64))
     p = np.exp(ref)
     return float((p * (ref - cand)).sum())
+
+
+def kl_rows(ref_rows, other_rows, n_vocab):
+    """Per-row KL and argmax agreement between two captures' row arrays (the
+    reference's window 0 and another capture's window W). Both arrays are
+    uint16 records, shape (n_rows, nv); the returned arrays are one entry per
+    row, so a position mask can select a subset without recomputing."""
+    n = min(len(ref_rows), len(other_rows))
+    kl = np.empty(n, dtype=np.float64)
+    agree = np.empty(n, dtype=bool)
+    for i in range(n):
+        r = log_softmax(reference_log_probs(ref_rows[i], n_vocab))
+        o = log_softmax(reference_log_probs(other_rows[i], n_vocab))
+        kl[i] = float((np.exp(r) * (r - o)).sum())
+        agree[i] = np.argmax(r) == np.argmax(o)
+    return kl, agree

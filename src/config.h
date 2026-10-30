@@ -182,6 +182,11 @@ struct Config {
     // keeps ordinary prompts in a single chunk.
     int prefill_chunk = 2048;
 
+    // Prefill micro-batch in tokens (llama.cpp's n_ubatch), at most the chunk;
+    // 0 = 512, or the whole chunk with the expert cache. 1024 on the A770 coder:
+    // prefill-41k +15 %, the same answers, +219 MiB VRAM (measured-here).
+    int prefill_ubatch = 0;
+
     // Operator serving defaults — the layer between the artifact and the
     // request (sampler-defaults order, 2026-09-01). Each flag overrides only
     // its own field of the artifact's sampler defaults; a request field still

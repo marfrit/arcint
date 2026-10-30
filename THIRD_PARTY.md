@@ -8,6 +8,18 @@ Vendored, single-header, licenses unchanged:
 | nlohmann/json | 3.11.3 | MIT | `third_party/nlohmann/json.hpp` |
 | minja (chat templating) | vendored | MIT | via `minja/chat-template.hpp` |
 
+`third_party/httplib.h` carries one small local change beyond verbatim:
+`Request` gets a `socket` field, filled in `process_request` from the server
+stream, so a handler can ask `detail::is_socket_alive` whether the peer is
+still connected without writing a byte (a non-streamed request's prefill
+writes nothing for a long stretch). The build also defines
+`CPPHTTPLIB_USE_POLL` (`CMakeLists.txt`): without poll, `process_request`
+answers 500 to every connection above `FD_SETSIZE`, and `select()` returns -1
+there, which that liveness probe would read as "gone". Two limits of the probe:
+when `poll` itself fails with an errno other than `EBADF` it falls through to a
+blocking `MSG_PEEK` (not reachable in practice), and TLS is not compiled in; if
+it ever is, a peek on the raw fd would read an unread close_notify as alive.
+
 Adapted (not verbatim) in `tools/tts_voice_sim.py`, a measuring tool no
 package ships: the speaker-similarity recipe from
 `huggingface/open-tts-leaderboard`'s `transformers/score_similarity.py`

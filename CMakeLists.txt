@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 1.2.6 LANGUAGES CXX)
+project(arcint VERSION 1.2.7 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -93,6 +93,11 @@ add_library(arcint_core STATIC
 target_include_directories(arcint_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${CMAKE_CURRENT_BINARY_DIR}/generated")
+# cpp-httplib's select()-based helpers: without poll, process_request refuses
+# every connection whose fd is >= FD_SETSIZE (1024) with a 500, and select()
+# returns -1 there, which the client-gone probe (detail::is_socket_alive) would
+# read as "gone". poll has neither the fd limit nor the errno ambiguity.
+target_compile_definitions(arcint_core PUBLIC CPPHTTPLIB_USE_POLL)
 target_link_libraries(arcint_core PUBLIC arcint_vendor Threads::Threads arcint_peg)
 target_compile_options(arcint_core PRIVATE -Wall -Wextra -Wpedantic)
 if(ARCINT_WERROR)
@@ -238,6 +243,7 @@ if(ARCINT_TESTS)
     tests/test_stop_think_ids.cpp
     tests/test_decode_stats.cpp
     tests/test_toolgrammar.cpp
+    tests/test_disconnect.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")

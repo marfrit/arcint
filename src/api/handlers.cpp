@@ -218,14 +218,23 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
             stats.prefill_blocks_seconds, stats.prefill_restore_seconds,
             stats.prefill_wait_seconds, other);
     }
-    log_slot_line(slot, "prefill", stats.prompt_tokens, stats.prefill_seconds,
+    // An aborted prefill reports the tokens it actually prefilled, not the
+    // whole prompt (the card showed a 37,723-token prompt as prefilled after
+    // the client left 8 s in). rate() reads the same number.
+    const int prefill_tokens = stats.prompt_tokens_prefilled >= 0 ? stats.prompt_tokens_prefilled
+                                                                 : stats.prompt_tokens;
+    log_slot_line(slot, "prefill", prefill_tokens, stats.prefill_seconds,
                   stats.prefill_rate(), prefill_suffix);
 
     const std::string decode_suffix = decode_suffix_for(stats);
     log_slot_line(slot, "decode", stats.completion_tokens, stats.decode_seconds,
                   stats.decode_rate(), decode_suffix);
     if (reason == FinishReason::Abort) {
-        log::info(log::format("slot %d", slot), "%s", "aborted: client gone");
+        // The cause, not a guess: a SIGTERM during a prefill was logged as a
+        // gone client until the backend carried which source ended it.
+        const char* why = stats.abort_cause == AbortCause::StopSignal ? "stop signal"
+                                                                     : "client gone";
+        log::info(log::format("slot %d", slot), "aborted: %s", why);
     }
 }
 
@@ -245,6 +254,9 @@ FinishReason drive(Backend& backend, const GenerationInput& in, int slot, const 
     std::set<int> stop_ids(in.sampler.stop_token_ids.begin(), in.sampler.stop_token_ids.end());
     bool          cancelled = false;
 
+    // The probe rides the prepared input (the routes set in.peer_alive before
+    // the generation starts), so the input is run as it is: no copy of the
+    // prompt ids or the images per streamed request (design review, wave 2a).
     const FinishReason reason = backend.generate(
         in, slot,
         [&](std::string_view piece, int token_id) -> Control {
@@ -268,9 +280,11 @@ FinishReason drive(Backend& backend, const GenerationInput& in, int slot, const 
         },
         stats);
 
-    if (!cancelled) {
+    if (!cancelled && reason != FinishReason::Abort) {
         // Text held back as a possible stop-sequence prefix that never
-        // completed is ordinary output and must not be swallowed.
+        // completed is ordinary output and must not be swallowed. An aborted
+        // request is not an ordinary end: its peer is gone or the process is
+        // stopping, so nothing more is written.
         for (const StopMatcher::Segment& seg : stop.flush_segments()) {
             if (pieces != nullptr) pieces->emplace_back(seg.text, seg.id);
             if (seg.text.empty()) continue;
@@ -716,6 +730,10 @@ std::optional<HttpResult> finish_prepare(const Context& ctx, int lane, const std
     input.prompt     = prompt;
     input.prompt_ids = prompt_ids;
     input.sampler    = std::move(sampler);
+    // The stop flag belongs to the request's whole life: a SIGTERM/SIGINT
+    // while it runs ends it at the backend's next token or batch boundary,
+    // rather than waiting out a long prefill (DESIGN §3.7).
+    input.stop = ctx.stop_flag;
     return std::nullopt;
 }
 
@@ -965,6 +983,19 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
         return *err;
     log_stats(slot, stats, reason);
 
+    // A non-streamed request commits its status before its body is built, so
+    // an abort is still answerable: a stop signal is a 503 an alive client
+    // reads, and a gone client gets no body at all (nothing to deliver). Never
+    // a 200 with finish_reason "abort": that is no OpenAI reason, and a
+    // half-buffered tool call would come back as raw content.
+    if (reason == FinishReason::Abort) {
+        if (stats.abort_cause == AbortCause::ClientGone)
+            return HttpResult{200, json::object(), true};
+        return HttpResult{503, error_body("the server is stopping; the request was cancelled "
+                                         "at its last token or batch boundary", "server_error",
+                                         "server_stopping")};
+    }
+
     // When the artifact's tags are single special tokens the split is decided
     // by those ids; the same (piece, id) sequence the streaming path feeds to
     // its streamer goes here too, so the two cannot disagree. Without any id,
@@ -1030,6 +1061,15 @@ HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, in
         }))
         return *err;
     log_stats(slot, stats, reason);
+
+    // As the chat path: a stop signal is a 503, a gone client gets no body.
+    if (reason == FinishReason::Abort) {
+        if (stats.abort_cause == AbortCause::ClientGone)
+            return HttpResult{200, json::object(), true};
+        return HttpResult{503, error_body("the server is stopping; the request was cancelled "
+                                         "at its last token or batch boundary", "server_error",
+                                         "server_stopping")};
+    }
 
     const std::string text = prep.req.echo ? prep.req.prompt + raw : raw;
 
@@ -1194,7 +1234,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
             }
             return true;
         },
-        stats, raw); })) {
+        stats, raw, nullptr); })) {
         // the 200 and the first chunk are out: the error goes in the stream
         sse_send(write, err->body);
         write("data: [DONE]\n\n");
@@ -1202,7 +1242,10 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     }
 
     log_stats(slot, stats, reason);
-    if (gone) return;
+    // An aborted request sends nothing more: a gone client's write would fail
+    // anyway, and a buffered tool call must not come back as raw content after
+    // the turn was cancelled (DESIGN §3.7; the stop signal too).
+    if (gone || reason == FinishReason::Abort) return;
     {
         const ReasoningStreamer::Step last = reasoning.flush();
         if (!emit_reasoning(last.reasoning)) return;
@@ -1308,7 +1351,7 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep, int s
             }
             return true;
         },
-        stats, raw); })) {
+        stats, raw, nullptr); })) {
         // the 200 and the first chunk are out: the error goes in the stream
         sse_send(write, err->body);
         write("data: [DONE]\n\n");
@@ -1316,7 +1359,8 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep, int s
     }
 
     log_stats(slot, stats, reason);
-    if (gone) return;
+    // As the chat path: an aborted request sends nothing more.
+    if (gone || reason == FinishReason::Abort) return;
 
     const std::string tail = utf8_stream.flush();
     if (!tail.empty()) {

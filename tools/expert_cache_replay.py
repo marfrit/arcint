@@ -22,7 +22,12 @@ some are in flight (the engine's two-phase non-blocking swaps). Hits count
 against the residency at the step, as the engine counts them. Frames are
 counted, not bytes: the layers' experts are not one size.
 
-Usage: expert_cache_replay.py <trace> [--budget N] [--delay N]   (needs numpy)
+--bounds adds what no online policy can beat on the trace: the best fixed set per
+layer in hindsight, a planner inside the same mechanism that knows the next H steps'
+routing, and Belady's MIN per layer (every miss admitted at once).
+
+Usage: expert_cache_replay.py <trace> [--budget N] [--delay N] [--cap N] [--every N]
+       [--bounds]   (needs numpy)
 The older replay tools for the retired engine's traces and policies are at the
 tag openvino-history (docs/history.md).
 """
@@ -131,11 +136,77 @@ def simulate(layers, steps, policy, adapt_every=6, max_swaps=96, budget=4, delay
     return hits / max(1, hits + misses), per_step, res.sum(1)
 
 
+def bounds(layers, steps, delay=2, every=6, cap=96):
+    nl = len(layers); ne = layers[0]["n_expert"]; S = len(steps)
+    use = np.zeros((S, nl, ne), np.int64)
+    for si, (_, ids) in enumerate(steps):
+        for l, x in enumerate(ids):
+            np.add.at(use[si, l], x[(x >= 0) & (x < ne)], 1)
+    tot = use.sum()
+    init = np.zeros((nl, ne), bool)
+    for i, L in enumerate(layers): init[i, L["slots"][L["slots"] >= 0]] = True
+    ns = init.sum(1)
+    out = {"fill-only (the load-time profile)": (use * init).sum() / tot}
+    best = np.zeros((nl, ne), bool); tu = use.sum(0)
+    for l in range(nl): best[l, np.argsort(-tu[l], kind="stable")[:ns[l]]] = True
+    out["best fixed set per layer, in hindsight"] = (use * best).sum() / tot
+    cum = np.concatenate([np.zeros((1, nl, ne), np.int64), np.cumsum(use, 0)])
+    for H in (6, 24, 96):                      # the mechanism's cadence, cap and landing; the next H steps known
+        res = init.copy(); pending = []; since = 0; h = 0
+        for si, (nt, _) in enumerate(steps):
+            keep = []
+            for land, flips in pending:
+                if land <= si:
+                    for l, e, r in flips: res[l, e] = r
+                else: keep.append((land, flips))
+            pending = keep
+            h += (use[si] * res).sum(); since += nt
+            if since < every: continue
+            since = 0
+            if pending: continue
+            fut = cum[min(S, si + delay + H)] - cum[min(S, si + delay)]
+            plan = []
+            for l in range(nl):
+                c = np.where(~res[l])[0]; v = np.where(res[l])[0]
+                c = c[np.argsort(-fut[l, c], kind="stable")]; v = v[np.argsort(fut[l, v], kind="stable")]
+                for j in range(min(len(c), len(v))):
+                    if fut[l, c[j]] <= fut[l, v[j]]: break
+                    plan.append((fut[l, c[j]] - fut[l, v[j]], l, c[j], v[j]))
+            plan.sort(key=lambda t: -t[0])
+            if plan[:cap]:
+                flips = []
+                for _, l, ei, eo in plan[:cap]: flips += [(l, eo, False), (l, ei, True)]
+                pending.append((si + delay, flips))
+        out["foresight planner in the mechanism, next %d steps" % H] = h / tot
+    h = 0                                       # Belady's MIN per layer
+    for l in range(nl):
+        res = set(np.where(init[l])[0].tolist()); seq = [np.where(use[si, l] > 0)[0].tolist() for si in range(S)]
+        nxt = {}; nexts = [None] * S
+        for si in range(S - 1, -1, -1):
+            nexts[si] = dict(nxt)
+            for e in seq[si]: nxt[e] = si
+        for si in range(S):
+            row = seq[si]
+            h += sum(int(use[si, l, e]) for e in row if e in res)
+            for e in row:
+                if e in res: continue
+                if len(res) >= ns[l]:
+                    v = max((r for r in res if r not in row), key=lambda r: nexts[si].get(r, S + 1), default=None)
+                    if v is None: continue
+                    res.discard(v)
+                res.add(e)
+    out["Belady MIN per layer"] = h / tot
+    return out
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("trace")
     ap.add_argument("--delay", type=int, default=2)
     ap.add_argument("--budget", type=int, default=4)
+    ap.add_argument("--cap", type=int, default=96, help="swaps a plan (the engine's LLAMA_EXPERT_CACHE_MAX_SWAPS)")
+    ap.add_argument("--every", type=int, default=6, help="decode tokens a plan (LLAMA_EXPERT_CACHE_ADAPT_EVERY)")
+    ap.add_argument("--bounds", action="store_true")
     a = ap.parse_args()
     layers, steps = load(a.trace)
     tot = sum(L["n_slots"] for L in layers)
@@ -144,5 +215,9 @@ if __name__ == "__main__":
         sorted(set(L["eb"] for L in layers)), len(steps), sum(1 for s in steps if s[0] <= 8),
         sum(sum(len(x) for x in s[1]) for s in steps)))
     for pol, ex in (("strata", False), ("lfru", False), ("lfru", True), ("glfru", False), ("glfru", True)):
-        h, per, occ = simulate(layers, steps, pol, delay=a.delay, budget=a.budget, exact=ex)
+        h, per, occ = simulate(layers, steps, pol, delay=a.delay, budget=a.budget, exact=ex,
+                               max_swaps=a.cap, adapt_every=a.every)
         print("%-6s%-6s %.2f %%  slots a layer at the end %d-%d" % (pol, " exact" if ex else "", 100 * h, occ.min(), occ.max()))
+    if a.bounds:
+        for k, v in bounds(layers, steps, delay=a.delay, every=a.every, cap=a.cap).items():
+            print("%-50s %.2f %%" % (k, 100 * v))
