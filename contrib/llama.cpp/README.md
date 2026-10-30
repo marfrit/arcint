@@ -4287,3 +4287,208 @@ Round 7 (`code`, `docs/campaigns/prefill-slot-loan-design.md` §15):
 patch is stage 1, whose pass bar is the trace lines and the red runs in
 `docs/campaigns/prefill-slot-loan-design.md` §7, §10, §11, §13, §19, §20, §21,
 §22 and §24.
+## 0069-expert-route-trace.patch
+
+A production option, off by default: it records the expert cache's routing
+into binary trace files so a replay can price predictors offline before any
+serving change (`docs/campaigns/expert-foresight.md`). Arcint's
+`--llama-expert-route-trace DIR` sets `LLAMA_EXPERT_ROUTE_TRACE` before the
+model's load; unset, the cost is one `getenv` at the cache's init, one cached
+bool the graph builder and the accept writer ask, and nothing else — no
+allocation, no read-back, no write (`code`, `llama-expert-route-trace.cpp`).
+A trace with token ids is the prompt and the answer in another form: whoever
+enables it stores every request's content on the serving host.
+
+A file a process, rotated at a size cap (`LLAMA_EXPERT_ROUTE_TRACE_MAX_MB`,
+default 256). `DIR` gives `expert-route-<pid>-<unix-time>.000.ert1`,
+`.001.ert1`, ...; a path that is an existing non-directory is a *base*: the
+file already sitting there is skipped (`O_EXCL`) and the sequence starts at
+`.001`, then `.002`. Every file is opened `O_EXCL` and a fresh name
+is chosen, never appended: a restarted unit with a reused pid gets a new base,
+and a file that already exists advances the sequence, so a second header never
+lands in an old file (`code`). A `DIR` that does not exist is created; if that
+fails the trace is refused with one `WARN`, not treated as a file path. A
+non-numeric or non-positive `LLAMA_EXPERT_ROUTE_TRACE_MAX_MB` falls back to
+256 MB with a `WARN` (it used to parse as 0, rotating every record). Every
+file repeats the header `ERT1`, version, the model's `n_layer`/`n_expert`/
+top-k, and after a rotation a `LAYERS` record of the cache's residents at that
+moment — so each file replays alone; concatenating the files gives the
+unrotated trace's records. Nothing is ever deleted by arcint. A pre-round-6
+file with a second header at its old tail still replays: the reader
+resynchronises on a later `ERT1` header with the same geometry (`code`).
+
+Records (`src/llama-expert-route-trace.h`): a cache's layers with their
+resident slots at load; each graph's kind (prompt, decode, verify, MTP
+draft), its first position, its token ids and every layer's routed ids in the
+router's rank order, token-major; and every residency change the cache
+applies, so a replay rebuilds the run's own resident set. Version 2 adds the
+graph's first position; the kind is the call's shape, not the token count — a
+prompt call does not output every row, a decode or verify call does — so a
+prompt's 4-token checkpoint tail is a `PROMPT` record, not a `VERIFY`; the
+decision is the pure function `llama_expert_route_graph_kind` the device-free
+selftest checks. A `DRAFT` record is an MTP draft context's own decode: the
+draft head is a separate model without an expert cache, so while the trace is
+on its one MoE block's `selected_experts` is a graph output. The record
+carries the MTP block's INPUT tokens (step 0 the accepted target token, then
+the previous draft) — not the drafted tokens — and that block's routed ids;
+the copy goes through the OpenCL backend's batch hook
+(`ggml_backend_opencl_get_tensors_async`, the entry point the cache already
+uses; `ggml_backend_tensor_get_async` is a blocking fallback on OpenCL because
+`iface.get_tensor_async` is NULL there), is issued behind the graph with no
+wait and written at that context's `synchronize`, with one wait at a decode
+that starts before a synchronize.
+The last graph of each request is written at the request's end
+(`llama_expert_route_trace_flush`, from arcint's generate and its destructor,
+under `mu_`), because the cache otherwise writes a graph only at the next
+graph's advance.
+
+A verify's accepted drafts are not in the trace — the cache cannot see the
+sampler — so arcint writes an accept sidecar beside the *current* trace file:
+one line a decode graph, `verify <ord> pos <p> rows <n> accepted <a>`,
+aligned by the graph's first position and checked against its token count.
+The sidecar follows the rotation, so each trace file has its own: the cache
+rotates at `after_graph`, BEFORE arcint writes the verify's accept line, so the
+line and the graph record land in the same file. A graph record's rotation is
+taken only there: while a record is pending (an MTP DRAFT record can push the
+cap over between `after_graph` and the writing `advance`) no rotation happens,
+so the line never parts from its record; the rotation waits for the next
+`after_graph` (`llama_expert_route_trace_rotate_now`, `code`). With
+`LLAMA_EXPERT_CACHE_ASYNC_IDS=0` the switch is respected: the ids are read
+with the wait it asks, even while the trace is on.
+
+The cost, `code`: on a decode step the ids are the ones the cache already
+reads back for its usage counts (`ids_pending`, the read issued behind the
+graph by `after_graph`), so no new device wait is added; the trace copies
+those host bytes into one record (a record is a few KB: top-k × tokens ×
+cached layers × 4 bytes) and writes it once. A prompt graph has no such
+read-back, so a traced prompt gets one host read and one wait at the next
+ubatch boundary. An MTP `DRAFT` record is a read behind the draft graph (the
+batch hook, no wait), written after that context's synchronize; a decode that
+starts before a synchronize waits once, never a graph. A failed write logs one `WARN` and
+clears `trace_on`, so no read-back continues.
+The flush at a request's end is one sync, only when a graph is pending and
+the trace is on. Off: none of these paths run.
+
+The MTP block sits **after** the FFN's `call early so that topk-moe can be
+used` weights expand, and never before it (`code`): a graph's node order is
+the expand order, and 0064's `ggml_opencl_can_fuse_topk_moe` wants the
+router's ten nodes (SOFT_MAX, RESHAPE, ARGSORT, VIEW, GET_ROWS, RESHAPE,
+SUM_ROWS, CLAMP, DIV, RESHAPE) consecutive from SOFT_MAX, which that expand
+is what appends them. Placed before it (round 9's build), the trace's own
+expand appended SOFT_MAX, ARGSORT, VIEW, CONT first, the weights expand
+followed with the rest, the scan met ARGSORT where it wants RESHAPE, and the
+MTP draft's router ran unfused -- a drafter whose softmax sum order differs
+from the served one (`docs/campaigns/fusion-coder-night.md`). After the ten
+nodes the CONT keeps the fusion: `ggml_can_fuse_subgraph` exempts the nodes
+in `outs`, and the VIEW it consumes is `outs[0]`, the same placement the
+cache's own `ids_out` below has.
+
+Evidence on the card (`code`, the line's print is unmeasured): the ids CONT
+is named `ffn_moe_ids_trace` -- set **after** the graph callback `cb(ids_out,
+"ffn_moe_ids_trace", il)`, because the callback renames a layer's tensor
+`"%s-%d"` (llama-context.cpp's `ggml_format_name`) and a name set first would
+be `ffn_moe_ids_trace-<il>` (`code`, round 11). `ggml_cl_topk_moe_fused`
+compares the 18-byte **prefix** (never the NUL-terminated form, which is 19
+bytes against an 18-byte name) and prints, once per process at WARN,
+`opencl: topk-moe fused in the MTP trace graph (n_expert N, n_tok T)`.
+WARN because arcint routes ggml INFO to verbose and drops it at the units'
+default level; once because a per-dispatch line floods a month-long trace.
+The line is the check that the trace-on drafter's router is the served one;
+a broken node order makes `can_fuse` fail and the line is absent (and its
+absence also covers the trace being off). Only an MTP trace graph is
+reported, and its scan is decided once per graph, not once per fused
+dispatch, so a traced target graph does not flood the log (`code`, round 11).
+
+Size: a prompt record is `n_tokens × top-k × n_layer × 4 B`, about 1.9 KB a
+prompt token (100k prompt ~190 MB), so DIR belongs on a dataset with room, not
+the root filesystem.
+
+Device-free: `tests/python/test_expert_route_trace.py` reads the committed
+fixture `tests/python/fixtures/expert-route-trace-v2.ert1`, which is
+`tools/expert_route_trace_selftest.cpp`'s output compiled against this patch,
+and rebuilds the same bytes with the replay's writer; with
+`EXPERT_ROUTE_TRACE_SRC=<llama tree>` set it also compiles the selftest,
+requires the writer's output to equal the fixture (so the fixture cannot
+drift), and runs the rotation red case: a small cap gives two files, each
+replays alone, and their concatenation equals the unrotated trace (`code`).
+Round 6's cells add: a second header resync, a `.000` argument finding its
+`.001` siblings, a later file's `LAYERS` updating `residents`, one missing
+last graph a killed process, a rotation putting the accept line and graph in
+one file (red: line before rotation), a repeated open not appending, a missing
+DIR created, and a non-numeric max falling back (`code`; the red mutations
+were seen failing). Round 7 adds: a pending graph record never rotates away
+from its accept line when MTP `DRAFT` records cross the cap between
+`after_graph` and the writing `advance` (red: rotate while pending), and a
+write failure stops tracing with one `WARN`, `opened` cleared and no sidecar
+(red: keep `opened` set after the failed write) -- both drive the selftest's
+`EXPERT_ROUTE_SELFTEST_PENDING_ORDER` / `_WRITE_FAIL` arms (`code`).
+Round 9 adds the MTP ids' expand cell: the block's expand sits between the
+output mark and `set_route_ids` (red: delete it, the buffer stays null and no
+DRAFT record is written), and round 10 extends that cell with the placement
+assertion -- the weights expand appears before the trace block (red on
+round 9's placement: seen failing, then green after the move). Round 11 adds
+two cells: the fused-router name is set after `cb` and the backend scan is the
+18-byte prefix (red: name before `cb`, `sizeof` without `- 1` -- both seen
+failing), and the line is a WARN held by a static once-per-process flag with
+its graph scan decided once per graph (red: `GGML_LOG_INFO`, or a truthy
+once-guard -- both seen failing). These source cells read `src/llama-graph.cpp`
+and `ggml/src/ggml-opencl/ggml-opencl.cpp` and need `EXPERT_ROUTE_TRACE_SRC`;
+the recipe's ctest does not run this python file at all.
+The reader is `tools/expert_cache_replay.py`, which still reads the
+2026-10-15 `ECT1` format of the dropped `LLAMA_EXPERT_CACHE_TRACE` knob.
+
+## 0070-expert-cache-save.patch
+
+A production option, off by default. Writes the expert cache's learned routing
+as Strata's STRP profile at teardown, so a warm start can load it with
+`--llama-expert-profile`. Arcint's `--llama-expert-cache-save FILE` sets
+`LLAMA_EXPERT_CACHE_SAVE` before the model's load; unset, one `getenv` at the
+cache's init and no allocation, no write. The file is Strata's whole STRP file: header, ranked pairs, then the
+trailing layer x expert rank table (`expert -> rank`, -1), which the reader
+stops before (`code`; the C++ writer's bytes equal the scope tool's Python
+writer byte for byte).
+
+Two ranking rules, both Strata's (`code`, commit 3d6f1718). The default `xe`
+is its SYCL/xe save (`save_profile`, `sycl/src/program/generate.cpp`): the
+raw routing counts mixed with the start's ranking as pseudo-counts,
+lambda 2, `STRATA_PROFILE_PRIOR_ENTRIES` 800,000 routed entries by default, a
+prior pair at rank r worth `prior_entries * 2 * exp(-2 * r / n) / (1 -
+exp(-2)) / n`; a short conversation does not wipe the prior. `--llama-expert-
+cache-save-rule cu` selects its `rank_learned_profile` (`src/core/
+expert_cache.cpp`): resident pairs by heat, counted non-residents by heat,
+then the rest, ties by the prior's rank then the index. The save ranks from a
+per-pair `heat` in Strata's xe unit, raw routing counts:
+`llama_expert_profile_add_heat` in the cache's `count()`, one a routed pair,
+beside `usage += 1`, in double (a month at ~33 t/s passes float's 2^24 on the
+hottest pairs). It is allocated only when the save is on. Counting in
+`count()`, not in `adapt()`, keeps it accumulating with
+`LLAMA_EXPERT_CACHE_ADAPT_EVERY=0`; a decayed sum would be 1/(1-decay) larger
+(3.33 at decay 0.7) and weigh like ~240k prior entries instead of the 800k the
+prior is measured with. The save's success and failure lines are `WARN` (the
+units' default level drops `INFO`), and the xe line prints the routed entries
+counted next to the prior, as Strata's stderr line does.
+
+The destructor saves after `adapt_finish` has landed the pending copies but
+without `progress()`, so the host tables stay at the last phase: every pending
+incoming expert is marked resident (the copy in flight counts as done) and the
+outgoing one stays resident only in phase 1, cleared in phase 2 when the host
+table has freed its slot. A layer split has a cache a card and one path cannot
+name both; nothing is written there with one `WARN`. arcint refuses at config
+a save path equal to `--llama-expert-profile` (the save would overwrite the
+file the run reads) and an unknown rule name.
+
+Device-free cells: `tools/expert_profile_save_selftest.cpp` (round trip and
+same placement, truncation, version before geometry, prior-rank tie-break,
+pending incoming/outgoing in both phases, xe prior mass, heat unit and heat
+width) and `tests/python/test_expert_profile_save.py` (the C++/Python byte
+equality, and that the heat call sits in `count()` not `adapt()`), wired into
+CTest as `expert-profile-save`. The Python cell is stdlib `unittest` and CTest
+runs it with `python3` alone: pytest is not a build dependency. Red mutations
+and the recipe line are in `docs/campaigns/research-concept-mining/audit.md`
+§14a.
+
+Patch order: this patch and 0069 both touch `llama-expert-cache.{h,cpp}` (the
+destructor, the layer struct) that the prefill slot loan (0068) already
+changes. Both are therefore regenerated on top of 0068 and exported in series
+order; the whole 0001-0068, 0069, 0070 series applies on the pin and the
+recipe passes (`measured-here`, the recipe line in audit 14a).

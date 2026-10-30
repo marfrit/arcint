@@ -2,7 +2,16 @@
 """One arm of a served Flash-Next sweep: a fresh process with the unit's flags plus the arm's overrides.
 
     fn_sweep.py <arcint> <model.gguf> <assets-dir> <tag> [--env K=V]... [--set --flag VALUE]... [--port N]
-                [--prompt-tokens N] [--no-answers] [--prompt-again]
+                [--prompt-tokens N] [--no-answers] [--prompt-again] [--prompts FILE] [--no-capital]
+
+--prompts FILE replaces the six standard prompts with a JSON list of
+{"name", "max_tokens", "prompt"}; the training capture uses
+tools/fn_sweep_prompts.json (36 prompts, English and German, prose, code and
+summaries), so the standard prompts stay unseen for the served A/B.
+
+--no-capital leaves the capital question out: a trace capture must not route
+the gate's own question, so the training capture runs it. The served arms keep
+it, which is why the gate's capital check is shared across every arm.
 
 Starts arcint with the Flash-Next unit's flags (contrib/systemd/, the 11,600 MiB slot budget, the CPU misses,
 the bank stream), an `--env` or `--set` per override (a flag the unit has gets its value replaced, a new one
@@ -10,7 +19,8 @@ is appended), asks the capital, then Strata's request (the RFC 4180 Lua parser, 
 300-token answers, greedy, without thinking. Per answer it prints the slot's decode line (tokens, t/s, draft
 acceptance), the expert cache's share of routed experts on the card and its swaps, and the answer's md5 (a
 byte tripwire between arms, not a gate). Last line: `SWEEP <tag> decode-mean <t/s> accept-mean <%> hits-mean
-<%>` over the six answers.
+<%> prefill-mean <t/s>` over the six answers and the long prompt (the trace's known cost is one scheduler
+synchronize a prompt ubatch, so both arms' prefill is recorded next to decode).
 
 The assets directory: expert-profile.bin (Strata's profile), mtp-flash-next.gguf (the MTP head),
 mtp-vocab.json (the draft vocabulary), as for tests/acceptance/cells/served_check.py.
@@ -27,7 +37,8 @@ import urllib.request
 
 args = sys.argv[1:]
 binary, gguf, assets, tag = args[:4]
-env_over, set_over, port, prompt_tokens, no_answers, prompt_again = {}, [], 0, 0, False, False
+env_over, set_over, port, prompt_tokens, no_answers, prompt_again, no_capital = {}, [], 0, 0, False, False, False
+prompts_file = ""
 i = 4
 while i < len(args):
     if args[i] == "--env":
@@ -42,6 +53,10 @@ while i < len(args):
         no_answers = True; i += 1
     elif args[i] == "--prompt-again":
         prompt_again = True; i += 1
+    elif args[i] == "--no-capital":
+        no_capital = True; i += 1
+    elif args[i] == "--prompts":
+        prompts_file = args[i + 1]; i += 2
     else:
         sys.exit(f"unknown argument {args[i]!r}")
 A = lambda n: os.path.join(assets, n)
@@ -68,6 +83,16 @@ PROMPTS = [
     ("btree", 300, "Explain in about 250 words how a B-tree index speeds up database lookups."),
     ("gc", 300, "Describe in about 250 words how a generational garbage collector works."),
 ]
+
+if prompts_file:
+    data = json.loads(open(prompts_file).read())
+    if not isinstance(data, list) or not data:
+        sys.exit(f"--prompts {prompts_file}: a non-empty JSON list of objects")
+    PROMPTS = []
+    for k, item in enumerate(data):
+        if not isinstance(item, dict) or not item.get("prompt") or not item.get("name"):
+            sys.exit(f"--prompts {prompts_file}: item {k} needs a name and a prompt")
+        PROMPTS.append((str(item["name"]), int(item.get("max_tokens", 300)), str(item["prompt"])))
 
 if not port:
     s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
@@ -103,8 +128,13 @@ try:
             break
         time.sleep(2)
     print(f"  load {time.time() - t0:.0f} s", flush=True)
-    paris = post("What is the capital of France? Answer in one word.", 8)
-    print(f"  capital: {paris.strip()[:20]!r} {'ok' if 'paris' in paris.lower() else 'WRONG'}", flush=True)
+    if no_capital:
+        paris = "paris"   # left out: a trace capture must not route the gate's question
+        print("  capital: skipped (--no-capital)", flush=True)
+    else:
+        paris = post("What is the capital of France? Answer in one word.", 8)
+        print(f"  capital: {paris.strip()[:20]!r} {'ok' if 'paris' in paris.lower() else 'WRONG'}", flush=True)
+    dec, acc, hit, pref = [], [], [], []
     if prompt_tokens:
         # a long prompt first: its prefill line, and the grouped GEMM's tile padding if the probe is on
         before = len(log_lines())
@@ -114,6 +144,9 @@ try:
         new = log_lines()[before:]
         pf = next((l for l in reversed(new) if "prefill" in l and "tok in" in l), "")
         print(f"  prompt    {pf.split('prefill', 1)[-1].strip()[:120]}", flush=True)
+        m = re.search(r"([0-9]+(?:\.[0-9]+)?) t/s", pf)
+        if m:
+            pref.append(float(m.group(1)))
         PAD = re.compile(r"\[KQ_MM_ID_PAD\] (\S+) experts=\d+ used=(\d+) routed=(\d+) tile=(\d+) slots=(\d+)")
         agg = {}
         for l in new:
@@ -128,7 +161,6 @@ try:
         if agg:
             r = sum(a[1] for a in agg.values()); s = sum(a[2] for a in agg.values())
             print(f"PAD {tag} routed {r} slots {s} pad {100.0 * (s - r) / max(r, 1):.1f} %", flush=True)
-    dec, acc, hit = [], [], []
     for name, n, q in ([] if no_answers else PROMPTS):
         before = len(log_lines())
         t = post(q, n)
@@ -155,7 +187,8 @@ try:
         pf = next((l for l in reversed(new) if "prefill" in l and "tok in" in l), "")
         print(f"  prompt2   {pf.split('prefill', 1)[-1].strip()[:120]}", flush=True)
     mean = lambda v: sum(v) / len(v) if v else float("nan")
-    print(f"SWEEP {tag} decode-mean {mean(dec):.2f} accept-mean {mean(acc):.1f} hits-mean {mean(hit):.1f}", flush=True)
+    print(f"SWEEP {tag} decode-mean {mean(dec):.2f} accept-mean {mean(acc):.1f} hits-mean {mean(hit):.1f} "
+          f"prefill-mean {mean(pref):.1f}", flush=True)
     rc = 0 if "paris" in paris.lower() and (no_answers or len(dec) == len(PROMPTS)) else 1
 finally:
     proc.terminate()

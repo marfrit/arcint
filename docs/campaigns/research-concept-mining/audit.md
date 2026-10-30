@@ -19,7 +19,7 @@ proposed build order after the audit — see "Order" at the end.
 | 10 PCIe copy discipline | **has most** — 0047 inputs, 0042 swaps, 0046 tables, 0032 copy queue (`code`) | exact | all three | coder inputs 1.93-2.02 ms→133-255 µs, +14-15 % (arcint `measured-here`) | low (one leftover) | 9 |
 | 11 prefill chunk/residency dial | **partly** — chunk and slot budget are flags, swept by hand; ring fixed at 4 (`code`) | rounding-only | Flash-Next, coder | +5.9 % (`paper`); B70 16K 1,222→1,347, 32K 1,187→1,361 (`paper`) | low | 4 |
 | 13 MTP width policy | **lacks** — fixed K with a min-p stop only (`code`) | rounding-only | all three | auto width +17 % code / +1.6 % geomean (`paper`); adaptive +2.0-2.1 % geomean (`paper`) | low-med | **3** |
-| 14 per-card expert profile | **partly** — reads Strata's STRP file, one file for all layers, read-only (`code`); no save, no trace in the series | exact | Flash-Next (B60) | B70 mean +21 % over 12 unseen prompts, same tokens (`paper`) | low | 5 |
+| 14 per-card expert profile | **built, opt-in, off by default** — reads and writes Strata's STRP file, one file for all layers (`code`); the save is 0070, the continuous trace 0069, and the replay/profile tools are device-free (`code`) | rounding-only | Flash-Next (B60) | B70 mean +21 % over 12 unseen prompts, same tokens (`paper`) | low | 5 |
 | 15 agent prefix reuse | **partly** — checkpoint restore + longest-prefix reuse exist (`code`); no tokenise-from-prefix, no branch taps, no tool-call hold | rounding-only | agent, coder, Flash-Next | 40K transcript TTFT 2.1-2.2→0.6-1.1 s (`paper`) | low-med | 6 |
 | 16 decode launch fusions | **partly** — 0004/0027/0049/0050/0051/0064/0065/0066 are built (`code`); qk-norm+rope and the commit form lack | exact | coder (A770), Flash-Next | 0064 router 34.1→13.5 µs; coder −1.4…−2.5 %/step (arcint `measured-here`) | low | 10 |
 | 18 decode-once expert matvecs | **measured negative** on the reference's mechanism (`paper`, arcint); the dense few-column part is built (`code`, 0009/0001/0022) | exact | Flash-Next (verify), denser units | St KqSplit 362→402 GB/s bitwise (`paper`); **arcint 30.5→29.5 t/s, verify 15.01→15.56 s** (arcint `measured-here`) | — | out |
@@ -717,3 +717,173 @@ Move out of the build queue (keep the audit rows):
 - **18**: the reference's mechanism was tested on the exact engine, model and card and lost; the
   dense half is built. Re-opening needs a new kernel shape → a new candidate.
 - **1** stays in scope but at order 11, with the first step a measurement rather than a build.
+
+### 14a. the build and its offline pricing (2026-10-30, `code` + `measured-here` offline replay)
+
+- **Built:** `tools/expert_profile_from_trace.py` writes the STRP file arcint's `read_profile`
+  reads and Strata's `make_profile.py` / `write_expert_profile` write: header version 1, the
+  ranked pairs, then the per-layer rank table (`code` in both writers; the table is written and
+  arcint ignores it). The ranking is Strata's `rank_profile` (`code`,
+  `tools/make_profile.py` at Strata's upstream, in the mirror at
+  `~/src/strata-profile-ref/src/tools/make_profile.py`): the traces' pairs by score, ties by
+  `(layer, expert)`, then a base's own order (never reordered), then the fill `expert` outer,
+  `layer` inner. **Deviation, named:** Strata's `make_profile_mix` normalizes per trace FILE,
+  because a Strata trace file is one prompt's run; an ERT1 file is one process's many requests,
+  so the tool's unit is a REQUEST (each request's counts / its total, then its file's weight;
+  `--raw` keeps `make_profile`'s additive counts, `--per-file` restores Strata's unit). Prompt
+  and decode positions count at the SAME weight: Strata's `read_trace` counts every record's k
+  ids alike and does not separate the two (`code`); a DRAFT record never counts, it is another
+  layer's ids.
+- **Replay seeding:** `--profile FILE` seeds the cache's slots from a ranking, `--profiles` the
+  three-arm comparison; the per-layer slot count stays the trace's (the run's budget, the trace
+  carries no sizes), so the arms share one budget and differ only in placement. `--every 0` is
+  now adapt-off (the engine's `LLAMA_EXPERT_CACHE_ADAPT_EVERY=0`); before it adapted every step
+  (`code`, the replay's own `since < 0`).
+- **The trace is the served unit's own run.** The replay of the trace's resident set reproduces
+  `expert-profile-unit.bin`'s placement to the slot: 5,915 of 5,915, the same 83.88 % hits with
+  adapt and 55.19 % placement-only (`measured-here`). So arm (a) is the file the unit loads.
+- **Held out, the odd requests, 399 decode steps, 5,915 slots, delay 2, 96 swaps every 6 tokens:**
+
+  | placement | adapt on | adapt off | swaps (on) |
+  |---|---|---|---|
+  | the shipped unit profile (`expert-profile-unit.bin`) | 83.88 % | 55.19 % | 12,819 |
+  | Strata's `data/expert-profile-sycl.bin` (`paper`: the B70's card profile) | 84.21 % | 64.02 % | 12,812 |
+  | built from the trace's EVEN requests (5 of 9, 24,161 pairs) | 84.21 % | 66.02 % | 12,772 |
+  | built from ALL 9 requests (in-sample, not a result) | 84.81 % | 78.92 % | 12,540 |
+
+  All four rows `measured-here`, offline replay on the served public-corpus trace. Reading: the
+  trace-built profile moves placement-only hits +10.8 points over the shipped file and +2.0 over
+  the xe profile; with the served adapt on it is +0.33 over the shipped (83.88 -> 84.21), the
+  same as the xe file. Adaptation recovers most of placement's gap, which is why the on column
+  moves so little; the placement column is the profile's own effect. This is one 9-request trace
+  of public corpus text, so it prices the mechanism, not the shipped file's workload; the B70's
+  +21 % mean over 12 unseen prompts is `paper` and this trace does not reproduce it.
+- **Save path (round 2, `code`; regenerated for 0068, `measured-here` recipe).**
+  `--llama-expert-cache-save FILE` (patch **0070**, after the trace's 0069; **off by default**,
+  one getenv and nothing else). The patch number moved because the prefill slot loan takes 0068
+  when it integrates; the trace keeps 0069. Both 0069 and 0070 touch
+  `llama-expert-cache.{h,cpp}`, the destructor and the layer struct the loan already changes,
+  so both are regenerated **on top of 0068** and exported in series order; the whole
+  0001-0070 series applies on the pin (recipe line below). The writer and reader
+  live in the dependency-free `llama-expert-profile.{h,cpp}`; the cache's static `read_profile`
+  delegates to it, and the destructor saves at teardown after `adapt_finish` has landed the
+  pending copies. The header and the writer now agree: the file is Strata's whole STRP file,
+  header, pairs, then the trailing layer x expert rank table (expert -> rank, -1), which the
+  writer emits and the reader stops before (`code`; a cell asserts the C++ bytes equal
+  `make_profile.py`'s byte for byte).
+- **The save's default rule is the xe one, not the cu one (round 2, `code`).** Strata has two
+  save paths. Its SYCL/xe `save_profile` (`sycl/src/program/generate.cpp`, commit 3d6f1718)
+  mixes the device's cumulative counts with the start's ranking as pseudo-counts: lambda 2,
+  `STRATA_PROFILE_PRIOR_ENTRIES` 800,000 routed entries by default, each prior pair worth
+  `prior_entries * lam * exp(-2 * rank / n) / (1 - exp(-2)) / n`; "a short conversation must not
+  wipe the prior". The default `xe` rule now builds that ranking (no resident head): the
+  counts plus the prior mass, then Strata's `rank_learned_profile` comparator. `--llama-expert-
+  cache-save-rule cu` keeps Strata's other path (`src/core/expert_cache.cpp`
+  `rank_learned_profile`, `code`): the resident pairs by heat, the counted non-residents by
+  heat, then the rest, ties by the prior's rank then the index. Which arm uses which: the save
+  default is **xe**; the `cu` arm is named only by that option, and the offline profile arms
+  below are built by `make_profile.rank_profile` (a third writer), not by either save rule.
+  The earlier round 1 build implemented only cu and labelled it as the cited mechanism; that was
+  wrong, and the xe path is what the B70 measurement (`paper`: code +13..19 %, prose -18 %)
+  measured.
+- **Heat, Strata's xe unit (round 3, `code`).** The save ranks from per-pair `heat` in raw
+  routing counts, one a routed pair, counted in the cache's `count()` beside `usage += 1`
+  (Strata's per-routing-event device counter, `sycl/src/program/generate.cpp:8145-8151`), in
+  `double` (a month at ~33 t/s passes float's 2^24 on the hottest pairs). Round 2's
+  `heat += usage` before every adapt decay was 1/(1-decay) larger (3.33 at decay 0.7), so the
+  800,000-entry prior weighed like ~240k raw entries instead of 800k; and with
+  `LLAMA_EXPERT_CACHE_ADAPT_EVERY=0` the heat never accumulated at all, because it was fed
+  inside `adapt()`. Both findings are `code` against Strata's source; the fix is `code`, the
+  red cells `measured-here` (mutations h/i/j in the round-3 list). The save's xe line prints
+  the routed entries counted next to the prior, as Strata's stderr line does (`code`, same
+  source).
+- **Pending swaps at save (round 2, `code`).** The teardown waits for the copies but does not run
+  `progress()`, so the host tables stay at the last phase. The save now marks every pending
+  incoming expert resident (a copy in flight counts as done, Strata does), and keeps the
+  outgoing expert resident only in phase 1: at phase 2 the host table has already freed its
+  slot and the save clears it.
+- **Config guard (round 2, `code`).** `--llama-expert-cache-save` equal to `--llama-expert-
+  profile` is refused at config, because the save would overwrite the file the run reads. An
+  unknown `--llama-expert-cache-save-rule` is refused rather than silently xe. A save without
+  `--llama-expert-cache` stays refused.
+- **Replay (round 2, `code`).** `profile_slots` now models the engine's global walk: one pass
+  over the whole ranking, a pair into its layer's next slot until the trace's total slot
+  budget is spent, then a zero expert for a layer with no slot. The budget is counted in
+  frames because the trace carries no expert bytes; a Q8_0 down and a gate/up pair differ in
+  bytes and the engine walks bytes, so the table's per-layer slot counts are the walk's
+  distribution, not the trace's 93-155. `read_profile` refuses a file shorter than the 24-byte
+  header and a pair count larger than the geometry, as well as a truncated pair.
+- **Device-free cells (round 2, `measured-here` via the recipe):**
+  `tools/expert_profile_save_selftest.cpp` and `tests/python/test_expert_profile_save.py` now
+  carry round trip and same placement, truncation refusal with no partial ranking, version 2
+  refused before the geometry, the prior-rank tie-break, the pending incoming/outgoing rule in
+  both phases, the xe prior-mass rule (a 9-count pair does not outrank 800,000 prior entries;
+  with 0 prior entries it does), the heat unit (one a routed pair, raw, out-of-range ids
+  skipped), the heat width (a count past float's 2^24 stays exact), and the C++ / Python byte
+  equality. The Python cell is stdlib `unittest` and CTest runs it with `python3` alone
+  (`expert-profile-save`, LABELS unit, `EXPERT_PROFILE_SRC` pointing at the tree the build
+  compiled against): pytest is not a build dependency (round 2's `-m pytest` broke the recipe
+  on a host with python3 only, `measured-here`), and the cell skips with a message when the
+  profile sources are absent. A source cell asserts the heat call sits in `count()` and not in
+  `adapt()`, so adapt-off still counts.
+- **Red-first, one-line mutations, each run and seen failing before restored (round 2,
+  `measured-here`):** (a) heat comparator `>` -> `<`: "the ranking is Strata's rule"; (b) drop
+  the version check: "a version 2 profile is refused"; (c) accept a short pair read (`!= 4` ->
+  `> 4`): "a truncated profile is refused"; (d) drop the prior-rank tie-break (`rank_of(a) <
+  rank_of(b)` -> `false`): "ties take the prior's rank before the index"; (e) drop the pending
+  incoming mark: "a pending incoming expert is resident"; (f) clear the outgoing in phase 1 too
+  (`>= 2` -> `>= 1`): "an outgoing expert stays resident in phase 1"; (g) drop the xe prior mass
+  (`prior_entries > 0 ...` -> `false`): "xe mixes the prior in as pseudo-counts". The replay's
+  length guard's mutation (drop `len(b) < 24`) was also seen failing: the cell expected the
+  short-header refusal, got the magic refusal.
+- **Red-first, round 3 (`measured-here`):** (h) heat counts a decayed weight (`+= 1.0` ->
+  `+= 1.0 / (1.0 - 0.7)`): "heat counts one a routed pair, raw"; (i) narrow the heat to float
+  (`+= 1.0` -> `= (double)(float)(...+1.0)`): "heat keeps a count past float's 2^24"; (j) move
+  the heat call from `count()` to `adapt()`: the source cell's count() assert fails; (k)
+  truncate `profile_slots` back to the trace's n_slots: "the walk's distribution, not the
+  trace's" fails (a 5-frame budget lands 4). Each was run and seen failing before restored,
+  with `PYTHONDONTWRITEBYTECODE=1`.
+- **Red-first, a caveat worth keeping:** run mutations with `PYTHONDONTWRITEBYTECODE=1` (or after
+  clearing `tools/__pycache__`). A stale `.pyc` from an edit earlier in the same second with the
+  same file size made one mutation read green until the bytecode cache was cleared; the
+  adapt-off cell was also strengthened (a six-step stream that does meet the engine's own
+  `min_usage` 2 / gain 1.5 thresholds, with adapt ON as the positive control) because the
+  two-step stream could never swap. `measured-here` is only a claim once the fresh interpreter
+  reproduces it.
+- **Recipe:** `RECIPE 64908b5: 100% tests passed, 0 tests failed out of 7 EXIT 0 deb
+  arcint_1.2.6-1_amd64.deb`, patch 0070 applied in sequence on the pinned tarball
+  (`measured-here`); the 7th test is `expert-profile-save`, `7/7 Test #7: expert-profile-save
+  ... Passed 1.23 sec`. Pytest is not a build dependency: the cell's own command under a
+  site-packages-free interpreter is green and pytest is absent there (`measured-here`):
+  `python3 -S -c 'import pytest'` -> `ModuleNotFoundError: No module named 'pytest'`, and
+  `PYTHONDONTWRITEBYTECODE=1 EXPERT_PROFILE_SRC=<tree> python3 -S tests/python/
+  test_expert_profile_save.py` -> `Ran 2 tests ... OK (skipped=1)`, the skip being the byte
+  equality's numpy import. The served warm-start arm and the out-of-sample gate stayed owed in
+  that round: no card run was made there. Claude's 2026-10-30 card runs carry them below.
+- **Out-of-sample gate (round 2, `code` for the tool, owed for the measurement).** Every trace
+  so far came from `fn_sweep.py`'s own six prompts, so a trace-built profile was in-sample for
+  them. `tools/fn_sweep.py --prompts FILE` now takes a JSON prompt list;
+  `tools/fn_sweep_prompts.json` is the training capture set (36 prompts, English and German:
+  public-domain prose summaries, code questions and explanatory prose), written for this
+  campaign and nothing private. The gate: capture a trace with the training prompts only,
+  build the profile from that trace only, then run the served A/B with the six standard
+  prompts as the unseen side — unit profile against trace-built, alternated twice, adapt on,
+  plus the adapt-off pair. The six standard prompts are never in the training capture, and
+  neither is the capital question: `fn_sweep.py --no-capital` leaves it out of the capture
+  (`code`), so no training prompt routes the gate's own question. The served arms carry it,
+  which is what makes the capital check shared across arms (`code`). The training set's topics
+  were checked against the gate's six and against each other in round 3: five overlapping
+  topics (hash tables, compilers, GC, CSV, WAL/B-trees) were replaced by bit counting, blocked
+  matrix multiply, a backtracking Sudoku solver, an hour-bucket time series and mRNA vaccine
+  prose, and the recursive-descent parser (compiler-adjacent) by Dijkstra — none is the gate's
+  topic nor another set member's (`code`, the JSON's own names). The exact card commands are
+  in the round-3 handover (`docs/campaigns/research-concept-mining/handover-round3.md`).
+- **The card results (2026-10-30, `measured-here`, B60, Flash-Next IQ3_S, Claude's runs; the
+  served arms, the trace and the save are off by default and were switched on for these arms):**
+  - served item 14: the trace-built profile against the unit profile gains **+0.35 %** decode
+    with adapt on and **+5.7 %** with adapt off;
+  - the warm start on a saved profile: **+2.5 %** in-sample, **-1.9 %** out-of-sample;
+  - profiles change answers: the CPU miss's rounding, a **rounding-only** class;
+  - the MTP draft routing is the best predictor: **76.2 %** replacing, **+0.26 blended**;
+  - the blend rule is the limit: the oracle with the rule off **+6.52**, blended **+1.28**.
+- **Recipe on the integrated branch (2026-10-30, `measured-here`):** `RECIPE 23a4295: 100% tests passed, 0 tests failed out of 7 EXIT 0 deb arcint_1.2.7-1_amd64.deb`, the whole 0001-0068, 0069, 0070 series applied on the pinned tarball in order; the 7th test is `expert-profile-save`. The commit after it records this line; the code is unchanged.

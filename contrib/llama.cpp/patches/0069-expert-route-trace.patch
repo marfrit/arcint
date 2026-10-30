@@ -1,0 +1,1253 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 5bd96e8..38c5b1d 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -9989,6 +9989,47 @@ static void ggml_cl_topk_moe_fused(ggml_backend_t backend, ggml_cgraph * cgraph,
+     const cl_ulong offl = el->offset + logits->view_offs, offi = ei->offset + ids->view_offs, offw = ew->offset + w->view_offs;
+     const cl_ulong nbl1 = logits->nb[1], nbi1 = ids->nb[1], nbw1 = w->nb[1];
+     const int n_expert = (int) logits->ne[0], k = (int) ids->ne[0], n_tok = (int) logits->ne[1];
++    // a card check's evidence that the trace-on drafter is the served drafter:
++    // the trace's MTP block names its routed ids "ffn_moe_ids_trace", a name
++    // set only in an MTP context while LLAMA_EXPERT_ROUTE_TRACE is on. The
++    // fusion is a backend decision nothing else logs, and a broken node order
++    // (the CONT before the router's ten nodes) makes can_fuse fail, so the
++    // line is absent -- which is the red state. Only the MTP trace graph, not
++    // the target graph's routers, so the log stays quiet under a trace.
++    //
++    // WARN, once per process: an INFO line is routed to verbose and dropped at
++    // the units' default level, and once per fused dispatch it floods a
++    // month-long trace (~100 lines a second of MTP decode).
++    //
++    // Trace off costs a static read-once guard and a compare; trace on scans
++    // each graph once, not each fused dispatch (a target graph's 48 routers
++    // would otherwise scan 48 nodes 48 times and price the scan as the trace).
++    static int trace_env_state = 0; // 0 unread, 1 on, -1 off
++    if (trace_env_state == 0) {
++        const char * e = getenv("LLAMA_EXPERT_ROUTE_TRACE");
++        trace_env_state = (e != nullptr && *e != '\0') ? 1 : -1;
++    }
++    if (trace_env_state == 1) {
++        static bool mtp_trace_logged = false;
++        static const ggml_cgraph * mtp_trace_scanned_graph = nullptr;
++        static bool mtp_trace_scanned = false;
++        if (!mtp_trace_logged) {
++            if (cgraph != mtp_trace_scanned_graph) {
++                mtp_trace_scanned = false;
++                // the graph callback's name is "%s-%d" (ggml_format_name), so
++                // compare the 18-byte prefix, never the NUL-terminated 18 bytes
++                for (int j = 0; j < cgraph->n_nodes && !mtp_trace_scanned; ++j) {
++                    mtp_trace_scanned = strncmp(cgraph->nodes[j]->name, "ffn_moe_ids_trace",
++                                                sizeof("ffn_moe_ids_trace") - 1) == 0;
++                }
++                mtp_trace_scanned_graph = cgraph;
++            }
++            if (mtp_trace_scanned) {
++                GGML_LOG_WARN("opencl: topk-moe fused in the MTP trace graph (n_expert %d, n_tok %d)\n", n_expert, n_tok);
++                mtp_trace_logged = true;
++            }
++        }
++    }
+     float cmin = 0.0f, cmax = 0.0f;
+     memcpy(&cmin, (const float *) n[7]->op_params + 0, sizeof(float));
+     memcpy(&cmax, (const float *) n[7]->op_params + 1, sizeof(float));
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index d17a91b..3853549 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -36,6 +36,7 @@ set(LLAMA_CORE_SOURCES
+     llama-mmap.cpp
+     llama-model-loader.cpp
+     llama-expert-cache.cpp
++    llama-expert-route-trace.cpp
+     llama-model-saver.cpp
+     llama-model.cpp
+     llama-quant.cpp
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 6921fef..f2bf37f 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,5 +1,6 @@
+ #include "llama-context.h"
+ #include "llama-expert-cache.h"
++#include "llama-expert-route-trace.h"
+ 
+ #include "ggml.h"
+ #include "llama-arch.h"
+@@ -1745,6 +1746,14 @@ const char * llama_context_slot_loan_state(llama_context * ctx) {
+     return ctx->slot_loan_state();
+ }
+ 
++void llama_context::flush_draft_trace() {
++    auto & t = llama_expert_route_trace::instance();
++    for (const auto & r : draft_trace_pending) {
++        t.event_graph(LLAMA_EXPERT_ROUTE_DRAFT, r.first_pos, r.n_tokens, r.tokens, r.il, r.ids);
++    }
++    draft_trace_pending.clear();
++}
++
+ void llama_context::synchronize() {
+     if (!sched) {
+         return;
+@@ -1752,6 +1761,12 @@ void llama_context::synchronize() {
+ 
+     ggml_backend_sched_synchronize(sched.get());
+ 
++    // the MTP trace record's ids are complete now: write it beside the logits
++    // copy, after the one synchronize, never a second wait
++    if (!draft_trace_pending.empty()) {
++        flush_draft_trace();
++    }
++
+     // FIXME: if multiple single tokens are evaluated without a synchronization,
+     // the stats will be added to the prompt evaluation stats
+     // this should only happen when using batch size 1 to evaluate a batch
+@@ -2728,6 +2743,12 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+ }
+ 
+ int llama_context::decode(const llama_batch_ext & batch_inp) {
++    // a previous draft graph's async ids are still in flight and this graph
++    // reuses its tensors: the caller did not synchronize (get_embeddings_nextn
++    // does), so wait once here. Normally empty, nothing extra.
++    if (!draft_trace_pending.empty() && llama_expert_route_trace_enabled()) {
++        synchronize();
++    }
+     if (!memory) {
+         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
+         return encode(batch_inp);
+@@ -2959,8 +2980,84 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+ 
+         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+         if (res) {
++            const bool all_outputs = n_outputs_all == n_tokens_all && !output_all;
++            const int32_t first_pos = ubatch.pos != nullptr ? ubatch.pos[0] : -1;
+             for (const auto & ec : model.expert_caches) {
+-                ec->after_graph(sched.get(), ubatch.n_tokens);
++                ec->after_graph(sched.get(), ubatch.n_tokens, ubatch.token, first_pos, all_outputs);
++            }
++            // an MTP draft context: no expert cache covers its one MoE layer,
++            // so its routed ids come from the graph's output instead. The read
++            // is issued behind the graph without a wait and the record is
++            // written at the context's synchronize (llama_get_embeddings_nextn
++            // and the logits path call it). A caller that decodes again without
++            // a synchronize gets one at decode's start, because the next graph
++            // reuses these tensors; that is the only extra wait, never one a
++            // graph.
++            //
++            // NOT ggml_backend_tensor_get_async: on this series' OpenCL backend
++            // that is not async. Its iface.get_tensor_async is the NULL slot
++            // beside an empty stub (ggml-opencl.cpp:11471 and :9043), so
++            // ggml-backend.cpp:426-428 falls back to synchronize + a blocking
++            // get, and the read would stall the draft graph. The backend's own
++            // batch entry point (patch 0032; llama-expert-cache.cpp uses it for
++            // its ids) enqueues CL_FALSE reads on the graph's queue; a backend
++            // without it keeps the blocking read, and the A/B prices it.
++            if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && llama_expert_route_trace_enabled()) {
++                auto & t = llama_expert_route_trace::instance();
++                if (t.opened && !res->get_route_ids().empty()) {
++                    draft_trace_record r;
++                    r.first_pos = first_pos;
++                    r.n_tokens  = ubatch.n_tokens;
++                    if (ubatch.token != nullptr) {
++                        r.tokens.assign(ubatch.token, ubatch.token + ubatch.n_tokens);
++                    }
++                    struct pending_read { ggml_backend_t backend; const ggml_tensor * tensor; size_t bytes; };
++                    std::vector<pending_read> reads;   // one a route id, r's order
++                    for (const auto & rt : res->get_route_ids()) {
++                        ggml_tensor * rids = rt.second;
++                        if (rids == nullptr || rids->buffer == nullptr) {
++                            continue;
++                        }
++                        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), rids);
++                        if (backend == nullptr) {
++                            continue;
++                        }
++                        r.il.push_back(rt.first);
++                        r.ids.emplace_back((size_t) ggml_nelements(rids));
++                        reads.push_back({backend, rids, r.ids.back().size() * sizeof(int32_t)});
++                    }
++                    if (!r.il.empty()) {
++                        // the dsts live in the pending record, so they stay
++                        // valid until the synchronize that writes it
++                        draft_trace_pending.push_back(std::move(r));
++                        auto & ids = draft_trace_pending.back().ids;
++                        for (size_t i = 0; i < reads.size(); ) {
++                            const ggml_backend_t backend = reads[i].backend;
++                            const ggml_backend_dev_t dev = ggml_backend_get_device(backend);
++                            const ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
++                            auto batch = reg != nullptr
++                                ? (void (*)(const ggml_tensor * const *, void * const *, int))
++                                      ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_get_tensors_async")
++                                : nullptr;
++                            if (batch == nullptr) {
++                                ggml_backend_tensor_get_async(backend, reads[i].tensor, ids[i].data(), 0, reads[i].bytes);
++                                ++i;
++                                continue;
++                            }
++                            // one batch a backend: the hook reads from one queue
++                            std::vector<const ggml_tensor *> ts;
++                            std::vector<void *> dsts;
++                            size_t j = i;
++                            while (j < reads.size() && reads[j].backend == backend) {
++                                ts.push_back(reads[j].tensor);
++                                dsts.push_back(ids[j].data());
++                                ++j;
++                            }
++                            batch(ts.data(), dsts.data(), (int) ts.size());
++                            i = j;
++                        }
++                    }
++                }
+             }
+         }
+         const int64_t dt_p0 = dt ? ggml_time_us() : 0;
+@@ -5711,6 +5808,15 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
+     return ctx->memory_breakdown();
+ }
+ 
++// the process's pending last graph (campaign expert-foresight): at the end of
++// a request, so a continuous trace loses nothing. Nothing when the trace is off
++void llama_expert_route_trace_flush(llama_context * ctx) {
++    if (ctx == nullptr) {
++        return;
++    }
++    llama_expert_cache::flush_traces(ctx->get_model().expert_caches, ctx->get_sched());
++}
++
+ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
+     return ctx->get_cparams().ctx_other;
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index b563fe2..efd64f8 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -446,6 +446,20 @@ private:
+ 
+     copy_experts_info copy_experts;
+ 
++    // an MTP draft context's trace record while the ids read is still in
++    // flight (enqueued from the backend's batch hook, no wait): written at the
++    // next synchronize, beside the logits copy, not on the graph's path. The
++    // unused-path writer steps below only run while the trace is on.
++    struct draft_trace_record {
++        int32_t first_pos = -1;
++        uint32_t n_tokens = 0;
++        std::vector<int32_t> tokens;
++        std::vector<int> il;
++        std::vector<std::vector<int32_t>> ids;
++    };
++    std::vector<draft_trace_record> draft_trace_pending;
++    void flush_draft_trace();
++
+     // graph reallocations during inference where the backend assignments did not change, split by whether the
+     // graph size is the same as the previously scheduled one (unexpected) or different
+     int32_t n_reallocs_same = 0;
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+index 4fba5f4..73d3e80 100644
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -1,7 +1,7 @@
+ #include "llama-expert-cache.h"
+ 
+ #include "llama-loan-book.h"
+-
++#include "llama-expert-route-trace.h"
+ #include "llama-impl.h"
+ #include "llama-model.h"
+ #include "llama-model-loader.h"
+@@ -884,6 +884,20 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+             g_registry[L.src[2]] = &L;
+         }
+     }
++    // the routing trace (campaign expert-foresight): unset, one
++    // getenv and no read-back; set, one host read a graph and one write a record
++    if (const char * tp = getenv("LLAMA_EXPERT_ROUTE_TRACE")) {
++        auto & t = llama_expert_route_trace::instance();
++        if (!t.opened) {
++            if (!t.open(tp, model.hparams.n_layer(), model.hparams.n_expert, model.hparams.n_expert_used_max())) {
++                LLAMA_LOG_WARN("%s: LLAMA_EXPERT_ROUTE_TRACE: cannot open %s: %s\n", __func__, tp, strerror(errno));
++            }
++        }
++        if (t.opened) {
++            trace_on = true;
++            trace_snapshot();
++        }
++    }
+     LLAMA_LOG_WARN("%s: %s: %zu layers (%d-%d), %lld expert slots (%lld-%lld a layer), %.2f GiB on the card (with the Q8_0 banks), "
+                    "bank %.2f GiB in host memory, budget %.2f GiB, from %s; filled in %.1f s; swaps %s\n",
+                    __func__, ggml_backend_dev_name(dev), layers.size(), layers.front().il, layers.back().il, (long long) n_slots_all,
+@@ -1777,6 +1791,10 @@ void llama_expert_cache::adapt(const std::vector<llama_expert_cache_swap> & all_
+         L.bank_of[victim]   = entry;    L.bexpert_of[entry] = victim;
+         L.slot_of[victim]   = -1;       L.bank_of[c.expert] = -1;
+         touched[c.layer] = 1;
++        if (trace_on) {
++            trace_tables.push_back({ L.il, c.expert, 1 });
++            trace_tables.push_back({ L.il, victim, 0 });
++        }
+         n_swaps++;
+     }
+     if (mutate == 1) {   // the red case: one swapped slot's bytes corrupted after the exchange
+@@ -1800,6 +1818,12 @@ void llama_expert_cache::adapt(const std::vector<llama_expert_cache_swap> & all_
+         mutate = 0;
+     }
+     flush_tables();
++    if (!trace_tables.empty()) {
++        trace_residents();   // the TABLES record's residency, for a later rotation
++        trace_prepare();
++        llama_expert_route_trace::instance().event_tables(trace_tables);
++        trace_tables.clear();
++    }
+     if (check) {
+         const auto & c   = all.front();
+         const auto & L   = layers[c.layer];
+@@ -1826,6 +1850,9 @@ void llama_expert_cache::pend_tables_out(const std::vector<pending_swap> & plan)
+         L.bexpert_of[p.x]   = p.e_out;
+         L.expert_of[p.slot] = -1;
+         touched[p.layer] = 1;
++        if (trace_on) {
++            trace_tables.push_back({ L.il, p.e_out, 0 });
++        }
+     }
+     for (size_t i = 0; i < layers.size(); ++i) {
+         if (touched[i]) {
+@@ -1833,6 +1860,12 @@ void llama_expert_cache::pend_tables_out(const std::vector<pending_swap> & plan)
+         }
+     }
+     flush_tables();
++    if (!trace_tables.empty()) {
++        trace_residents();   // the TABLES record's residency, for a later rotation
++        trace_prepare();
++        llama_expert_route_trace::instance().event_tables(trace_tables);
++        trace_tables.clear();
++    }
+ }
+ 
+ // the phase-2 tables: the newcomers are in their slots, served from them from
+@@ -1846,6 +1879,9 @@ void llama_expert_cache::pend_tables_in(const std::vector<pending_swap> & plan)
+         L.bank_of[p.e_in]   = -1;       L.bexpert_of[p.b_in] = -1;
+         L.spare.push_back(p.b_in);
+         touched[p.layer] = 1;
++        if (trace_on) {
++            trace_tables.push_back({ L.il, p.e_in, 1 });
++        }
+     }
+     if (mutate == 1) {   // the red case: one swapped slot's bytes corrupted after it landed
+         const auto & p = plan.front();
+@@ -1868,6 +1904,12 @@ void llama_expert_cache::pend_tables_in(const std::vector<pending_swap> & plan)
+         mutate = 0;
+     }
+     flush_tables();
++    if (!trace_tables.empty()) {
++        trace_residents();   // the TABLES record's residency, for a later rotation
++        trace_prepare();
++        llama_expert_route_trace::instance().event_tables(trace_tables);
++        trace_tables.clear();
++    }
+ }
+ 
+ // The swaps in flight, polled between ubatches without a wait (Strata's
+@@ -1903,6 +1945,122 @@ void llama_expert_cache::check_swap() {
+     book_.check = false;
+ }
+ 
++// Keep this cache's residents for the next LAYERS snapshot. Updated at init and
++// at every TABLES record (a residency change), so a rotation taken from ANOTHER
++// cache still writes this card's current set.
++void llama_expert_cache::trace_residents() {
++    auto & t = llama_expert_route_trace::instance();
++    if (!t.opened) {
++        return;
++    }
++    std::vector<int> il, ns;
++    std::vector<std::vector<int32_t>> res;
++    for (const auto & L : layers) {
++        il.push_back(L.il);
++        ns.push_back(L.n_slots);
++        std::vector<int32_t> r;
++        for (int s = 0; s < L.n_slots; ++s) {
++            r.push_back(s < (int) L.expert_of.size() ? L.expert_of[s] : -1);
++        }
++        res.push_back(std::move(r));
++    }
++    t.set_residents((intptr_t) this, il, ns, res);
++}
++
++// The trace's LAYERS record of every cache's residents at the moment (init, or
++// a rotation): under a layer split one record per cache would leave a rotated
++// file unable to replay alone, so the rotation writes all registered sets.
++void llama_expert_cache::trace_snapshot() {
++    auto & t = llama_expert_route_trace::instance();
++    if (!t.opened) {
++        return;
++    }
++    trace_residents();
++    t.event_layers_all();
++}
++
++// Called before every trace record: at the file's cap it opens the next file
++// (its own header) and writes the residents that file starts from. The cache
++// calls it from after_graph, BEFORE arcint writes the verify's accept line, so
++// the line and the graph record land in the same file at a rotation (round 6's
++// one-line-off defect). A graph record's rotation is taken HERE and nowhere
++// else: while a record is pending (trace_pending), its accept line already
++// sits in this file, so a rotation at advance/flush_trace or an MTP DRAFT
++// record would split the line from the record (round 7's defect) -- the
++// decision is llama_expert_route_trace_rotate_now, and the rotation then waits
++// for the next after_graph.
++void llama_expert_cache::trace_prepare() {
++    auto & t = llama_expert_route_trace::instance();
++    if (!trace_on) {
++        return;
++    }
++    if (!t.opened) {
++        trace_on = false;   // a write failed: the read-backs stop, the cost goes
++        return;
++    }
++    if (!llama_expert_route_trace_rotate_now(t)) {
++        return;
++    }
++    if (!t.rotate_next()) {
++        trace_on = false;   // a full disk: stop tracing, do not fail the run
++        return;
++    }
++    trace_snapshot();
++}
++
++// At a request's end: the pending last graph's ids are complete after one
++// sync, and the graph is written before the next request's advance would
++// count a different one. `count` keeps the usage the engine already counted
++// from this graph at the next decode, exactly once (last_n is cleared).
++void llama_expert_cache::flush_trace(ggml_backend_sched_t sched) {
++    if (!trace_on) {
++        return;
++    }
++    if (!llama_expert_route_trace::instance().opened) {
++        trace_on = false;   // a failed write: no more read-backs, the cost goes
++        if (trace_pending) {
++            llama_expert_route_trace::instance().pending_graph(false);
++        }
++        trace_pending = false;
++        trace_tokens.clear();
++        last_n = 0;
++        return;
++    }
++    if (!trace_pending || last_n == 0 || sched != owner_sched) {
++        return;
++    }
++    if (last_n <= decode_max) {
++        count(last_n);
++    } else {
++        ggml_backend_sched_synchronize(owner_sched);
++        ids_pending = 0;
++    }
++    if (ids_host.size() == layers.size() && trace_n == last_n) {
++        std::vector<int> il;
++        for (const auto & L : layers) {
++            il.push_back(L.il);
++        }
++        // no trace_prepare: this record's rotation was taken at after_graph,
++        // and rotating now (an MTP DRAFT record may have crossed the cap since,
++        // the line is already written) would split the accept line from its
++        // record
++        llama_expert_route_trace::instance().event_graph(trace_kind, trace_pos, trace_n, trace_tokens, il, ids_host);
++    }
++    if (trace_pending) {
++        llama_expert_route_trace::instance().pending_graph(false);
++    }
++    trace_pending = false;
++    trace_tokens.clear();
++    last_n = 0;
++}
++
++void llama_expert_cache::flush_traces(const std::vector<std::unique_ptr<llama_expert_cache>> & caches,
++                                      ggml_backend_sched_t sched) {
++    for (const auto & ec : caches) {
++        ec->flush_trace(sched);
++    }
++}
++
+ // The owner context's ubatch: counts the previous decode ubatch's routing;
+ // true when an adapt is due
+ bool llama_expert_cache::advance(ggml_backend_sched_t sched, uint32_t n_tokens) {
+@@ -1916,7 +2074,35 @@ bool llama_expert_cache::advance(ggml_backend_sched_t sched, uint32_t n_tokens)
+     } else if (sched != owner_sched) {
+         return false;
+     }
+-    if (last_n > 0 && last_n <= decode_max) {
++    if (trace_on && !llama_expert_route_trace::instance().opened) {
++        trace_on = false;   // a failed write: stop the read-backs at the next call
++    }
++    if (last_n > 0 && trace_pending) {
++        // the trace's graph: the ids read behind it are complete now. A decode
++        // graph's count() already waits; a prompt graph needs one wait here,
++        // only when the trace is on
++        if (last_n <= decode_max) {
++            count(last_n);   // waits for the queue; ids_host is the graph's
++        } else {
++            ggml_backend_sched_synchronize(owner_sched);
++            ids_pending = 0;
++        }
++        // as in flush_trace: no trace_prepare, the pending record's rotation
++        // was taken at after_graph and rotating here would split its accept
++        // line from it
++        if (ids_host.size() == layers.size() && trace_n == last_n) {
++            std::vector<int> il;
++            for (const auto & L : layers) {
++                il.push_back(L.il);
++            }
++            llama_expert_route_trace::instance().event_graph(trace_kind, trace_pos, trace_n, trace_tokens, il, ids_host);
++        }
++        if (trace_pending) {
++            llama_expert_route_trace::instance().pending_graph(false);
++        }
++        trace_pending = false;
++        trace_tokens.clear();
++    } else if (last_n > 0 && last_n <= decode_max) {
+         count(last_n);   // waits for the queue
+     }
+     progress();
+@@ -1950,7 +2136,8 @@ void llama_expert_cache::step(const std::vector<std::unique_ptr<llama_expert_cac
+     }
+ }
+ 
+-void llama_expert_cache::after_graph(ggml_backend_sched_t sched, uint32_t n_tokens) {
++void llama_expert_cache::after_graph(ggml_backend_sched_t sched, uint32_t n_tokens, const int32_t * tokens,
++                                     int32_t pos, bool all_outputs) {
+     if (loan_out_) {
+         return;   // no swap is issued, and a lent graph's ids are not read
+     }
+@@ -1958,6 +2145,28 @@ void llama_expert_cache::after_graph(ggml_backend_sched_t sched, uint32_t n_toke
+         ggml_backend_sched_synchronize(owner_sched);   // an unconsumed read still targets ids_host
+     }
+     ids_pending = 0;
++    if (trace_on && sched == owner_sched && n_tokens > 0) {
++        if (!llama_expert_route_trace::instance().opened) {
++            trace_on = false;   // a failed write: the read-backs below stop
++        } else {
++            // BEFORE arcint writes this verify's accept line (which follows the
++            // target decode): a rotation here puts the line and the graph record
++            // in the same file. trace_prepare also writes the new file's LAYERS.
++            trace_prepare();
++            // a prompt call outputs fewer rows than it has tokens (llama.cpp's
++            // prompt evaluation), a decode or verify call outputs every row; the
++            // count alone would call a prompt's 4-token checkpoint tail a verify.
++            // An embedding batch has no token ids at all.
++            trace_kind = llama_expert_route_graph_kind(n_tokens, decode_max, all_outputs, tokens != nullptr);
++            trace_n      = n_tokens;
++            trace_pos    = pos;
++            if (tokens != nullptr) {
++                trace_tokens.assign(tokens, tokens + n_tokens);
++            } else {
++                trace_tokens.clear();   // event_graph writes -1 a row
++            }
++        }
++    }
+     if (book_.phase != 0 && !book_.issued && sched == owner_sched) {
+         // the swaps' copies on the adapt queue, behind the fence placed before
+         // this graph (adapt for phase 1, progress for phase 2): they run while it
+@@ -1965,7 +2174,8 @@ void llama_expert_cache::after_graph(ggml_backend_sched_t sched, uint32_t n_toke
+         // (finding 3): 3x the bytes otherwise.
+         issue_phase(false);
+     }
+-    if (!async_ids || sched != owner_sched || n_tokens == 0 || n_tokens > decode_max) {
++    if ((!async_ids && !trace_on) || sched != owner_sched || n_tokens == 0 ||
++        (n_tokens > decode_max && !trace_on)) {
+         return;
+     }
+     // each id copy on this cache's card (its buffer type is the card's own
+@@ -1984,8 +2194,21 @@ void llama_expert_cache::after_graph(ggml_backend_sched_t sched, uint32_t n_toke
+         ts.push_back(layers[i].ids_out);
+         dsts.push_back(ids_host[i].data());
+     }
+-    get_tensors_async(ts.data(), dsts.data(), (int) ts.size());
+-    ids_pending = n_tokens;
++    // the switch is respected: ASYNC_IDS=0 means a read with a wait, even when
++    // the trace is on (the trace's ids are the cache's own). The wait is this
++    // graph's, as the switch asks, and the read-back then costs no extra copy.
++    if (async_ids) {
++        get_tensors_async(ts.data(), dsts.data(), (int) ts.size());
++    } else {
++        get_tensors(ts.data(), dsts.data(), (int) ts.size());
++    }
++    ids_pending = n_tokens;   // the ids are valid either way; count() takes them
++    trace_pending = trace_on;
++    if (trace_pending) {
++        // process-wide: another cache on another card must not rotate while
++        // this graph's record is still waiting for its write
++        llama_expert_route_trace::instance().pending_graph(true);
++    }
+ }
+ 
+ llama_expert_cache_stats llama_expert_cache::stats() const {
+diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
+index e4cf02d..6655bd9 100644
+--- a/src/llama-expert-cache.h
++++ b/src/llama-expert-cache.h
+@@ -34,6 +34,7 @@
+ #include "ggml.h"
+ #include "ggml-backend.h"
+ #include "llama-loan-book.h"
++#include "llama-expert-route-trace.h"
+ 
+ #include <cstdint>
+ #include <memory>
+@@ -136,6 +137,12 @@ struct llama_expert_cache {
+     // `dev` runs at least one layer init() would cache
+     static bool has_layers(const llama_model & model, const llama_model_loader & ml, ggml_backend_dev_t dev);
+ 
++    // The process's last graph, at the end of a request (or at shutdown): the
++    // cache writes a graph when the NEXT graph's advance runs, so without this
++    // a continuous log loses its last step. One sync, only when the trace is
++    // on and a graph is pending.
++    static void flush_traces(const std::vector<std::unique_ptr<llama_expert_cache>> & caches, ggml_backend_sched_t sched);
++
+     // Between ubatches of llama_context::decode, before the next graph, over
+     // the model's caches (one per card): each counts the previous decode
+     // ubatch's routing of its layers; every adapt_every decode tokens the
+@@ -146,7 +153,11 @@ struct llama_expert_cache {
+     // Right after a decode graph is enqueued: its routed ids are read behind
+     // it (no wait), for step() to count once the host has synchronized
+     // (LLAMA_EXPERT_CACHE_ASYNC_IDS=0: step() reads them with a wait)
+-    void after_graph(ggml_backend_sched_t sched, uint32_t n_tokens);
++    // `tokens` is the ubatch's token ids (null for an embedding batch), `pos`
++    // its first position (-1 when absent), `all_outputs` whether the call
++    // outputs every row (a decode/verify call) or a prompt call does not
++    void after_graph(ggml_backend_sched_t sched, uint32_t n_tokens, const int32_t * tokens, int32_t pos,
++                     bool all_outputs);
+ 
+     llama_expert_cache_stats stats() const;
+ 
+@@ -248,6 +259,10 @@ private:
+ 
+     bool advance(ggml_backend_sched_t sched, uint32_t n_tokens);
+     void count(uint32_t n_tokens);
++    void trace_residents();                   // keep this cache's residents for the next snapshot
++    void trace_snapshot();                    // LAYERS: every cache's residents now
++    void trace_prepare();                     // a rotation at the cap, then the snapshot
++    void flush_trace(ggml_backend_sched_t sched);
+     void candidates(std::vector<llama_expert_cache_swap> & out);
+     void adapt(const std::vector<llama_expert_cache_swap> & all);
+     static void plan(const std::vector<std::unique_ptr<llama_expert_cache>> & caches);
+@@ -322,6 +337,15 @@ private:
+     void (*get_tensors_async)(const ggml_tensor * const *, void * const *, int) = nullptr;
+     std::vector<std::vector<int32_t>> ids_host;   // after_graph's reads, per layer
+     uint32_t           ids_pending = 0;   // their graph's tokens; 0: none queued
++    // the diagnostic trace (LLAMA_EXPERT_ROUTE_TRACE): the last graph's kind,
++    // its token ids and whether their read is queued
++    bool               trace_on = false;
++    bool               trace_pending = false;
++    uint8_t            trace_kind = 0;
++    uint32_t           trace_n = 0;
++    int32_t            trace_pos = -1;
++    std::vector<int32_t> trace_tokens;
++    std::vector<llama_expert_route_trace::change> trace_tables;
+     bool               async_ids = true;
+     void (*get_slices)(const ggml_tensor *, void *, int64_t, int64_t) = nullptr;
+     void (*exchange)(ggml_tensor *, int64_t, ggml_tensor *, int64_t) = nullptr;
+diff --git a/src/llama-expert-route-trace.cpp b/src/llama-expert-route-trace.cpp
+new file mode 100644
+index 0000000..2f6a1b1
+--- /dev/null
++++ b/src/llama-expert-route-trace.cpp
+@@ -0,0 +1,331 @@
++#include "llama-expert-route-trace.h"
++
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++uint8_t llama_expert_route_graph_kind(uint32_t n_tokens, uint32_t decode_max, bool all_outputs, bool has_tokens) {
++    const bool prompt = !all_outputs || !has_tokens || n_tokens > decode_max;
++    return prompt ? LLAMA_EXPERT_ROUTE_PROMPT : (n_tokens == 1 ? LLAMA_EXPERT_ROUTE_DECODE : LLAMA_EXPERT_ROUTE_VERIFY);
++}
++
++bool llama_expert_route_trace_enabled() {
++    // once: the graph builder asks on every MTP MoE layer
++    static const bool on = [] {
++        const char * p = getenv("LLAMA_EXPERT_ROUTE_TRACE");
++        return p != nullptr && *p != '\0';
++    }();
++    return on;
++}
++
++// one WARN a process: the writer is dependency-free (a device-free test
++// compiles this file alone), so it cannot use llama's logger
++static void trace_warn(const char * what, const char * detail) {
++    std::fprintf(stderr, "WARN: expert route trace: %s%s%s\n", what,
++                 detail != nullptr ? ": " : "", detail != nullptr ? detail : "");
++}
++
++static uint64_t trace_max_bytes(bool & warned) {
++    const char * p = getenv("LLAMA_EXPERT_ROUTE_TRACE_MAX_MB");
++    // a record is a few KB; 256 MiB is a long span. Fractional values are for
++    // the device-free rotation test (a cap in bytes, not in a serving run).
++    // A non-numeric or non-positive value falls back to the default; 0 used to
++    // mean "rotate every record", the defect this check removes.
++    const double def = 256.0;
++    if (p == nullptr || *p == '\0') {
++        return (uint64_t) (def * 1048576.0);
++    }
++    char * end = nullptr;
++    errno = 0;
++    const double mb = std::strtod(p, &end);
++    if (end == p || *end != '\0' || errno != 0 || !(mb > 0)) {
++        if (!warned) {
++            warned = true;
++            char msg[96];
++            std::snprintf(msg, sizeof(msg), "LLAMA_EXPERT_ROUTE_TRACE_MAX_MB=%s is not a positive number", p);
++            trace_warn("falling back to 256 MB", msg);
++        }
++        return (uint64_t) (def * 1048576.0);
++    }
++    return (uint64_t) (mb * 1048576.0);
++}
++
++void llama_expert_route_trace::put_u32(uint32_t v) {
++    for (int i = 0; i < 4; ++i) {
++        buf.push_back((uint8_t) ((v >> (8 * i)) & 0xff));
++    }
++}
++
++void llama_expert_route_trace::put_i32(int32_t v) {
++    put_u32((uint32_t) v);
++}
++
++void llama_expert_route_trace::flush() {
++    std::lock_guard<std::recursive_mutex> lk(mu);
++    if (!opened || buf.empty()) {
++        buf.clear();
++        return;
++    }
++    // one write a record; the file was opened O_WRONLY|O_EXCL with one writer
++    // (the trace's mu), never O_APPEND, so a short write is resumed in the
++    // loop below instead of trusting a page-atomic write
++    size_t off = 0;
++    while (off < buf.size()) {
++        const ssize_t n = ::write(fd, buf.data() + off, buf.size() - off);
++        if (n <= 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            const int err = errno;
++            opened = false;   // a full disk or a closed fd: stop tracing, do not fail the run
++            buf.clear();
++            if (!warned) {
++                warned = true;
++                char msg[160];
++                std::snprintf(msg, sizeof(msg), "cannot write %s: %s; tracing stops",
++                              path.c_str(), std::strerror(err));
++                trace_warn("the file can no longer be written", msg);
++            }
++            return;
++        }
++        off += (size_t) n;
++        bytes_in_file += (uint64_t) n;
++    }
++    buf.clear();
++}
++
++static std::string trace_file_name(const std::string & base, bool dir_mode, uint32_t seq) {
++    if (dir_mode) {
++        char tail[32];
++        std::snprintf(tail, sizeof(tail), ".%03u.ert1", seq);
++        return base + tail;
++    }
++    if (seq == 0) {
++        return base;
++    }
++    char tail[32];
++    std::snprintf(tail, sizeof(tail), ".%03u", seq);
++    return base + tail;
++}
++
++std::string llama_expert_route_trace_sidecar() {
++    auto & t = llama_expert_route_trace::instance();
++    std::lock_guard<std::recursive_mutex> lk(t.mu);
++    if (!t.opened) {
++        return {};
++    }
++    return trace_file_name(t.path, t.dir_mode, t.seq) + ".accept";
++}
++
++void llama_expert_route_trace::close() {
++    std::lock_guard<std::recursive_mutex> lk(mu);
++    if (fd >= 0) {
++        ::close(fd);
++    }
++    fd = -1;
++    opened = false;
++    buf.clear();
++}
++
++// a fresh name only: O_EXCL, advance the sequence past anything already there.
++// Nothing is ever appended, so a restart cannot put a second header in an old
++// file and the replay never meets one mid-file.
++static int trace_open_fresh(const std::string & base, bool dir_mode, uint32_t & seq, uint64_t & bytes) {
++    for (uint32_t guard = 0; guard < 10000; ++guard) {
++        const std::string f = trace_file_name(base, dir_mode, seq);
++        const int fd = ::open(f.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
++        if (fd >= 0) {
++            bytes = 0;
++            return fd;
++        }
++        if (errno != EEXIST) {
++            return -1;
++        }
++        ++seq;
++    }
++    errno = EEXIST;
++    return -1;
++}
++
++bool llama_expert_route_trace::open(const char * p, uint32_t nl, uint32_t ne, uint32_t nu) {
++    std::lock_guard<std::recursive_mutex> lk(mu);
++    close();
++    path      = p;
++    seq       = 0;
++    bytes_in_file = 0;
++    n_layer   = nl;
++    n_expert  = ne;
++    n_used    = nu;
++    warned    = false;
++    max_bytes = trace_max_bytes(warned);
++    struct stat st;
++    const bool exists = ::stat(p, &st) == 0;
++    dir_mode = exists && S_ISDIR(st.st_mode);
++    if (!exists) {
++        // the flag is a DIR: a missing one is created, or refused loudly. It is
++        // never silently treated as a base file path (the round-6 defect).
++        if (::mkdir(p, 0755) != 0) {
++            trace_warn("cannot create the trace directory", p);
++            return false;
++        }
++        dir_mode = true;
++    }
++    if (dir_mode) {
++        char base[4096];
++        // the start time in the base: a reused pid after a restart opens a new
++        // family, not the previous run's sequence
++        std::snprintf(base, sizeof(base), "%s/expert-route-%d-%lld", p, (int) ::getpid(),
++                      (long long) std::time(nullptr));
++        path = base;
++    }
++    fd = trace_open_fresh(path, dir_mode, seq, bytes_in_file);
++    if (fd < 0) {
++        char msg[160];
++        std::snprintf(msg, sizeof(msg), "cannot open a fresh file for %s: %s", p, std::strerror(errno));
++        trace_warn("tracing is off", msg);
++        return false;
++    }
++    opened = true;
++    buf.clear();
++    buf.insert(buf.end(), {'E', 'R', 'T', '1'});
++    put_u32(2);   // version: a graph carries its first position
++    put_u32(n_layer);
++    put_u32(n_expert);
++    put_u32(n_used);
++    flush();
++    return opened;
++}
++
++bool llama_expert_route_trace_rotate_now(const llama_expert_route_trace & t) {
++    if (!t.opened || t.pending_graphs > 0) {
++        return false;
++    }
++    return t.at_cap();
++}
++
++bool llama_expert_route_trace::rotate_next() {
++    std::lock_guard<std::recursive_mutex> lk(mu);
++    if (!opened) {
++        return false;
++    }
++    close();
++    fd = trace_open_fresh(path, dir_mode, seq, bytes_in_file);
++    if (fd < 0) {
++        char msg[160];
++        std::snprintf(msg, sizeof(msg), "cannot open the next file for %s: %s", path.c_str(), std::strerror(errno));
++        trace_warn("tracing stops", msg);
++        return false;
++    }
++    opened = true;
++    buf.clear();
++    buf.insert(buf.end(), {'E', 'R', 'T', '1'});
++    put_u32(2);
++    put_u32(n_layer);
++    put_u32(n_expert);
++    put_u32(n_used);
++    flush();
++    return opened;
++}
++
++void llama_expert_route_trace::event_layers(const std::vector<int> & il, const std::vector<int> & n_slots,
++                                            const std::vector<std::vector<int32_t>> & residents) {
++    std::lock_guard<std::recursive_mutex> lk(mu);
++    if (!opened) {
++        return;
++    }
++    put_u8(0);
++    put_u32((uint32_t) il.size());
++    for (size_t i = 0; i < il.size(); ++i) {
++        put_i32(il[i]);
++        put_i32(n_slots[i]);
++        for (int s = 0; s < n_slots[i]; ++s) {
++            put_i32(s < (int) residents[i].size() ? residents[i][s] : -1);
++        }
++    }
++    flush();
++}
++
++void llama_expert_route_trace::set_residents(intptr_t key, const std::vector<int> & il, const std::vector<int> & n_slots,
++                                             const std::vector<std::vector<int32_t>> & residents) {
++    std::lock_guard<std::recursive_mutex> lk(mu);
++    for (auto & s : layer_sets) {
++        if (s.key == key) {
++            s.il = il;
++            s.n_slots = n_slots;
++            s.residents = residents;
++            return;
++        }
++    }
++    layer_sets.push_back({ key, il, n_slots, residents });
++}
++
++void llama_expert_route_trace::event_layers_all() {
++    std::lock_guard<std::recursive_mutex> lk(mu);
++    std::vector<int> il, ns;
++    std::vector<std::vector<int32_t>> res;
++    for (const auto & s : layer_sets) {
++        il.insert(il.end(), s.il.begin(), s.il.end());
++        ns.insert(ns.end(), s.n_slots.begin(), s.n_slots.end());
++        res.insert(res.end(), s.residents.begin(), s.residents.end());
++    }
++    event_layers(il, ns, res);   // the lock is recursive; one record either way
++}
++
++void llama_expert_route_trace::pending_graph(bool pending) {
++    std::lock_guard<std::recursive_mutex> lk(mu);
++    if (pending) {
++        ++pending_graphs;
++    } else if (pending_graphs > 0) {
++        --pending_graphs;
++    }
++}
++
++void llama_expert_route_trace::event_graph(uint8_t kind, int32_t first_pos, uint32_t n_tokens,
++                                           const std::vector<int32_t> & tokens,
++                                           const std::vector<int> & il, const std::vector<std::vector<int32_t>> & ids) {
++    std::lock_guard<std::recursive_mutex> lk(mu);
++    if (!opened) {
++        return;
++    }
++    put_u8(kind);
++    put_i32(first_pos);
++    put_u32(n_tokens);
++    for (uint32_t i = 0; i < n_tokens; ++i) {
++        put_i32(i < tokens.size() ? tokens[i] : -1);
++    }
++    put_u32((uint32_t) il.size());
++    for (size_t i = 0; i < il.size(); ++i) {
++        put_i32(il[i]);
++        put_u32((uint32_t) ids[i].size());
++        for (int32_t e : ids[i]) {
++            put_i32(e);
++        }
++    }
++    flush();
++}
++
++void llama_expert_route_trace::event_tables(const std::vector<llama_expert_route_trace::change> & changed) {
++    std::lock_guard<std::recursive_mutex> lk(mu);
++    if (!opened || changed.empty()) {
++        buf.clear();
++        return;
++    }
++    put_u8(5);
++    put_u32((uint32_t) changed.size());
++    for (const auto & c : changed) {
++        put_i32(c.il);
++        put_i32(c.expert);
++        put_u8(c.resident);
++    }
++    flush();
++}
++
++llama_expert_route_trace & llama_expert_route_trace::instance() {
++    static llama_expert_route_trace t;
++    return t;
++}
+diff --git a/src/llama-expert-route-trace.h b/src/llama-expert-route-trace.h
+new file mode 100644
+index 0000000..b8e2256
+--- /dev/null
++++ b/src/llama-expert-route-trace.h
+@@ -0,0 +1,163 @@
++#pragma once
++
++// An opt-in, binary routing trace for the expert cache (campaign
++// expert-foresight; stage 0 built it as a diagnostic, the operator made it a
++// production option on 2026-10-29). `LLAMA_EXPERT_ROUTE_TRACE=<dir or path>`
++// (arcint's `--llama-expert-route-trace DIR`) turns it on; unset it costs one
++// getenv at start-up and nothing else: no allocation, no read-back, no write.
++//
++// A file per process, rotated at a size cap: `f = dir` gives
++// `expert-route-<pid>-<unix-time>.000.ert1`, `.001.ert1`, ...; `f` an existing
++// non-directory is a file BASE, not the first file: a file that already sits
++// there is skipped (O_EXCL) and the sequence starts at `f.001`, then `.002`.
++// Every file is
++// opened with O_EXCL and a fresh name is chosen, never appended: a restarted
++// unit with a reused pid, or a path whose file already exists, gets a new base
++// or the next sequence, so no second header ever lands in an old file. A DIR
++// that does not exist is created; if that fails the trace is refused with a
++// WARN, never treated as a file path. Each file carries its own header and,
++// after a rotation, a LAYERS record of the cache's residents at that moment, so
++// every file replays alone; nothing is ever deleted by arcint. Header with the
++// model's geometry, then one record a event, little endian, no trailer. A run
++// that dies mid-write leaves a torn last record; a reader stops at it (never a
++// partial one), and resynchronises on a later "ERT1" magic so an old file with
++// an appended header still replays.
++//
++// Size: a prompt record is n_tokens x top-k x n_layer x 4 B, about 1.9 KB a
++// prompt token, so a 100k prompt is about 190 MB. DIR belongs on a dataset with
++// room, not the root filesystem.
++//
++// A trace with token ids is the prompt and the answer in another form: whoever
++// turns it on stores every request's content on the serving host.
++//
++//   header  "ERT1" u32 version u32 n_layer u32 n_expert u32 n_used
++//           version 2 adds a graph's first position; version 1 had none
++//   event   u8 kind, then
++//     0 LAYERS  u32 n, per: i32 il, i32 n_slots, n_slots i32 resident (slot ->
++//               expert, -1 for the trailing zeros slot) -- a cache's layers as
++//               loaded, so a replay starts from the run's own resident set
++//     1 PROMPT  a prompt batch of any size, including the 4-token tail a
++//               checkpoint break leaves (the cache classifies by the call:
++//               a prompt call does not output every row; a decode call does)
++//     2 DECODE  a one-token decode
++//     3 VERIFY  a decode verify (2..decode_max tokens): tokens[1..] are the
++//               drafts, tokens[0] the token before them; which of the drafts a
++//               sampler accepted is NOT in this file -- the engine's cache
++//               cannot see the sampler. arcint writes it beside the trace
++//               (`<path>.accept`: "verify <ordinal> pos <p> rows <n> accepted
++//               <a>", one a decode graph, a single lane; the replay aligns by
++//               p, a graph's first position, never by order)
++//     4 DRAFT   an MTP draft context's own decode: the MTP block's input
++//               tokens (step 0 the accepted target token, then the previous
++//               draft -- NOT the drafted tokens) and its own routed ids
++//               (Flash-Next's MTP block is a full MoE layer,
++//               llama-model.cpp/models/qwen4exp.cpp; it runs without an
++//               expert cache, so llama-context.cpp reads its
++//               selected_experts tensor when this trace is on)
++//     all four graph kinds: i32 first_pos (version 2; -1 when the ubatch has
++//      no positions), u32 n_tokens, i32 token[n_tokens] (-1 for an embedding
++//      row), u32 n_layers, per: i32 il, u32 count, i32 ids[count]
++//      (token-major, the router's top-k in rank order, exactly the ids_out the
++//      cache already reads)
++//     5 TABLES  u32 n_changes, per: i32 il, i32 expert, u8 resident (1: in a
++//               slot, 0: not) -- every residency change the cache applies, so a
++//               replay rebuilds the resident set instead of guessing it
++//
++// The writer is dependency-free on purpose: a device-free test compiles this
++// file alone and reads its bytes back with the replay's reader.
++
++#include <cstdint>
++#include <mutex>
++#include <string>
++#include <vector>
++
++// ERT1 graph kinds: the cache's decision from a call's shape, kept pure so a
++// device-free test can exercise it (a prompt call outputs fewer rows than it
++// has tokens; a decode or verify call outputs every one; a prompt's 4-token
++// checkpoint tail is a prompt).
++enum llama_expert_route_kind : uint8_t {
++    LLAMA_EXPERT_ROUTE_LAYERS = 0, LLAMA_EXPERT_ROUTE_PROMPT = 1,
++    LLAMA_EXPERT_ROUTE_DECODE = 2, LLAMA_EXPERT_ROUTE_VERIFY = 3,
++    LLAMA_EXPERT_ROUTE_DRAFT = 4, LLAMA_EXPERT_ROUTE_TABLES = 5,
++};
++
++uint8_t llama_expert_route_graph_kind(uint32_t n_tokens, uint32_t decode_max, bool all_outputs, bool has_tokens);
++
++// The variable is read once: the graph builder asks whether to mark the
++// MTP block's routed ids as an output (a no-op when the trace is off).
++bool llama_expert_route_trace_enabled();
++
++// The accept sidecar beside the CURRENT trace file (`<file>.accept`), so it
++// rotates with it; empty when the trace is off. A writer appends one line a
++// accepted graph and reopens the sidecar when this name changes.
++std::string llama_expert_route_trace_sidecar();
++
++struct llama_expert_route_trace {
++    struct change { int32_t il, expert; uint8_t resident; };
++    int  fd      = -1;
++    bool opened  = false;
++    bool warned  = false;       // one WARN a run when a write or an open fails
++    std::string path;           // `base` for the file names below
++    bool        dir_mode = false;
++    uint32_t    seq      = 0;   // the file in this process's sequence
++    uint64_t    bytes_in_file = 0;
++    uint64_t    max_bytes = 0;  // rotate past this; LLAMA_EXPERT_ROUTE_TRACE_MAX_MB (default 256)
++    uint32_t    n_layer = 0, n_expert = 0, n_used = 0;
++    std::vector<uint8_t> buf;   // the record being built
++    // the writer is shared by the cache's decode path and an MTP context's
++    // synchronize (lanes), so every public record call holds this one lock
++    std::recursive_mutex mu;
++    // process-wide, not one cache: with a cache a card (a layer split), cache A
++    // must not rotate while cache B's graph record for the same graph is still
++    // pending -- its accept line is already in A's file
++    int pending_graphs = 0;
++    // every cache's residents at its last TABLES record, so a rotation writes
++    // one LAYERS record that holds every card's layers and every file replays
++    // alone under a layer split
++    struct layer_set {
++        intptr_t key;   // the cache, stable for its life
++        std::vector<int> il, n_slots;
++        std::vector<std::vector<int32_t>> residents;
++    };
++    std::vector<layer_set> layer_sets;
++
++    // Opens the first file with O_EXCL (never appends), writes the header.
++    bool open(const char * p, uint32_t n_layer, uint32_t n_expert, uint32_t n_used);
++    // At the cap: close this file, open the next fresh one (O_EXCL) and write
++    // its header. The caller follows with event_layers_all.
++    bool at_cap() const { return opened && bytes_in_file >= max_bytes; }
++    bool rotate_next();
++    void close();
++
++    void put_u8(uint8_t v)  { buf.push_back(v); }
++    void put_u32(uint32_t v);
++    void put_i32(int32_t v);
++    void flush();   // one write() a record, resumed across short writes; the
++                    // file is opened O_WRONLY|O_EXCL (no O_APPEND)
++
++    void event_layers(const std::vector<int> & il, const std::vector<int> & n_slots,
++                      const std::vector<std::vector<int32_t>> & residents);
++    // A cache's current residents, kept for the next rotation's snapshot.
++    void set_residents(intptr_t key, const std::vector<int> & il, const std::vector<int> & n_slots,
++                       const std::vector<std::vector<int32_t>> & residents);
++    // One LAYERS record over every registered cache, in registration order.
++    void event_layers_all();
++    // Hold/release the process-wide pending count around a graph record.
++    void pending_graph(bool pending);
++    void event_graph(uint8_t kind, int32_t first_pos, uint32_t n_tokens, const std::vector<int32_t> & tokens,
++                     const std::vector<int> & il, const std::vector<std::vector<int32_t>> & ids);
++    void event_tables(const std::vector<change> & changed);
++
++    // The process's one trace: opened on the first cache's init, off when the
++    // variable is unset or the file cannot be opened (a warning a run).
++    static llama_expert_route_trace & instance();
++};
++
++// The cache's rotation decision, kept pure so a device-free test can drive the
++// cache's real call order: a rotation is taken at `after_graph`, before arcint
++// writes the verify's accept line. While ANY cache's graph record is pending
++// its accept line is already in this file, so a rotation at the next advance,
++// the request-end flush or an MTP DRAFT record would split the line from its
++// record; it waits for the next `after_graph` (round 7's defect, made
++// process-wide in round 8: a layer split has a cache a card).
++bool llama_expert_route_trace_rotate_now(const llama_expert_route_trace & t);
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 94a36ba..ab8be70 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -98,6 +98,10 @@ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llam
+ // Useful for testing purposes.
+ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
+ 
++// Write the expert cache's pending last graph to the routing trace, at a
++// request's end (campaign expert-foresight). A no-op when the trace is off.
++LLAMA_API void llama_expert_route_trace_flush(struct llama_context * ctx);
++
+ // Set whether the context outputs nextn embeddings or not
+ // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
+ // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 9c43e37..5a5d13b 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-graph.h"
++#include "llama-expert-route-trace.h"
+ #include "llama-expert-cache.h"
+ 
+ #include "llama-impl.h"
+@@ -1402,6 +1403,7 @@ void llm_graph_result::reset() {
+ 
+     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
+     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
++    t_route_ids.clear();
+ 
+     t_sampled.clear();
+     t_sampled_probs.clear();
+@@ -2298,6 +2300,44 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     //call early so that topk-moe can be used
+     ggml_build_forward_expand(gf, weights);
+ 
++    // the trace's MTP block: its routed ids as an output, read back by
++    // llama-context.cpp after the graph. Only an MTP context, only when the
++    // variable is set: off, no tensor is added, no node and no name.
++    //
++    // AFTER the weights expand, never before it: a graph's node order is the
++    // expand order, and 0064's ggml_opencl_can_fuse_topk_moe wants ten
++    // consecutive nodes from the router's SOFT_MAX (RESHAPE, ARGSORT, VIEW,
++    // GET_ROWS, RESHAPE, SUM_ROWS, CLAMP, DIV, RESHAPE -- the weights expand
++    // is what appends them). Before it, this block's expand appended SOFT_MAX,
++    // ARGSORT, VIEW, CONT first, the weights expand followed with the rest,
++    // and the scan saw ARGSORT where it wants RESHAPE: the MTP draft's router
++    // ran unfused and, per fusion-coder-night.md, a fused router's softmax sum
++    // order changes greedy texts and draft acceptance -- the trace-on drafter
++    // was not the served one. Here the CONT lands after the ten nodes and the
++    // fusion survives: ggml_can_fuse_subgraph exempts the nodes in `outs`,
++    // and the VIEW it consumes is outs[0] (the cache's own ids_out below is
++    // placed exactly that way).
++    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && llama_expert_route_trace_enabled()) {
++        ggml_tensor * ids_out = ggml_cont(ctx0, selected_experts);
++        ggml_set_output(ids_out);
++        // the cache's ids_out (below) is reachable from the graph through
++        // ids_flat, so the scheduler allocates it; this one is a dead end --
++        // marked output and nothing else. The forward walk does not reach it,
++        // so without this expand its buffer stays null, the decode's read-back
++        // skips it, and no DRAFT record is written even though the graph ran.
++        ggml_build_forward_expand(gf, ids_out);
++        // name AFTER cb, never before it: cb renames a layer's tensor
++        // "%s-%d" (llama-context.cpp's ggml_format_name), so a name set first is
++        // overwritten to "ffn_moe_ids_trace-<il>" and the backend's byte compare
++        // never matches. The backend reads the prefix, so either form would do;
++        // setting it here keeps the exact name on the node.
++        cb(ids_out, "ffn_moe_ids_trace", il);
++        // the backend's fused-router check reads this name: a card check can
++        // then say the MTP context's router ran fused while the trace was on
++        ggml_set_name(ids_out, "ffn_moe_ids_trace");
++        res->set_route_ids(il, ids_out);
++    }
++
+     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+ 
+     if (weight_before_ffn) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 2ddb5c9..338f73f 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -941,6 +941,11 @@ public:
+     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
+     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
+ 
++    // the routed ids of a traced MTP block's MoE layers (il, tensor); empty
++    // unless LLAMA_EXPERT_ROUTE_TRACE is set and this is an MTP context
++    const std::vector<std::pair<int, ggml_tensor *>> & get_route_ids() const { return t_route_ids; }
++    void set_route_ids(int il, ggml_tensor * t) { t_route_ids.emplace_back(il, t); }
++
+     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
+ 
+     ggml_cgraph  * get_gf()  const { return gf; }
+@@ -981,6 +986,7 @@ public:
+     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+ 
+     std::vector<ggml_tensor *> t_layer_inp;
++    std::vector<std::pair<int, ggml_tensor *>> t_route_ids;
+ 
+     std::vector<ggml_tensor *> t_sampled;
+     std::vector<ggml_tensor *> t_sampled_probs;

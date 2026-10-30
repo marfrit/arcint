@@ -119,6 +119,25 @@ struct Config {
     int         llama_expert_cache_mib = 0;
     std::vector<int> llama_expert_cache_mib_dev;
     std::string llama_expert_profile;
+    // --llama-expert-cache-save F: at teardown, write the cache's learned STRP
+    // ranking to F from its cumulative routing counts (raw heat, one a routed
+    // pair, counted in count()), with the loaded profile as the prior (Strata's
+    // --expert-profile-save). Needs --llama-expert-cache; F must differ from
+    // llama_expert_profile, which the save would overwrite. A layer split has a
+    // cache a card; one path cannot name both, so nothing is saved there. Empty:
+    // off, one getenv and nothing else.
+    std::string llama_expert_cache_save;
+    // --llama-expert-cache-save-rule: xe (default, Strata's SYCL/xe save with
+    // the prior mass by rank) or cu (Strata's rank_learned_profile, residents
+    // first). Empty means xe.
+    std::string llama_expert_cache_save_rule;
+    // --llama-expert-route-trace DIR: an opt-in, binary record of every
+    // expert the cache routed, a file per process, rotated at a size cap (each
+    // file replays alone), never deleted by arcint. Empty: off, one getenv and
+    // nothing else. A trace with token ids is the prompt and the answer in
+    // another form: whoever turns it on stores every request's content on the
+    // serving host.
+    std::string llama_expert_route_trace;
     // --device GPU.0,GPU.1 with --engine llama: the cards of a layer split,
     // in layer order (filled from --device by parse_args; one entry for one
     // card). --llama-layer-split K: layers [0, K) on the first card, [K,

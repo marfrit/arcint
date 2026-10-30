@@ -333,6 +333,32 @@ std::string usage_text() {
         "                            model (default 0, the first)\n"
         "  --llama-expert-profile F  the expert ranking that fills the cache (Strata's\n"
         "                            STRP profile; default round robin)\n"
+        "  --llama-expert-cache-save F\n"
+        "                            save the learned STRP ranking to F at teardown,\n"
+        "                            from this cache's cumulative routing counts\n"
+        "                            (Strata's --expert-profile-save); needs\n"
+        "                            --llama-expert-cache. A layer split has a cache a\n"
+        "                            card and one path cannot name both: nothing is\n"
+        "                            saved there (give a path a card). F must differ\n"
+        "                            from --llama-expert-profile (the save would\n"
+        "                            overwrite the file it points at). OFF by\n"
+        "                            default: only this flag turns it on\n"
+        "  --llama-expert-cache-save-rule R\n"
+        "                            the save's ranking rule: xe (default, Strata's\n"
+        "                            SYCL/xe save: prior mass by rank mixed with the\n"
+        "                            counts, STRATA_PROFILE_PRIOR_ENTRIES, 800,000 by\n"
+        "                            default) or cu (Strata's rank_learned_profile:\n"
+        "                            resident pairs first)\n"
+        "  --llama-expert-route-trace DIR\n"
+        "                            binary routing trace into DIR (created if\n"
+        "                            missing; one fresh file a process, rotated at\n"
+        "                            256 MB; each file replays alone; nothing is\n"
+        "                            deleted). OFF by default; when on it stores every\n"
+        "                            request's token ids and the experts it routed,\n"
+        "                            i.e. the prompt and the answer in another form,\n"
+        "                            on the serving host. A prompt record is about\n"
+        "                            1.9 KB a prompt token (100k: ~190 MB), so DIR\n"
+        "                            belongs on a dataset with room\n"
         "  --llama-kv K[:V]          the attention cache types, f16, q8_0 or q8_0:q4_0\n"
         "                            (default f16): q8_0 takes the cache to 53 %,\n"
         "                            q8_0:q4_0 to 41 %\n";
@@ -410,6 +436,16 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--llama-expert-profile") {
             if (!value(v)) return fail("--llama-expert-profile needs a profile file");
             cfg.llama_expert_profile = std::string(v);
+        } else if (arg == "--llama-expert-cache-save") {
+            if (!value(v)) return fail("--llama-expert-cache-save needs a profile file");
+            cfg.llama_expert_cache_save = std::string(v);
+        } else if (arg == "--llama-expert-cache-save-rule") {
+            if (!value(v) || (std::string(v) != "xe" && std::string(v) != "cu"))
+                return fail("--llama-expert-cache-save-rule takes xe or cu");
+            cfg.llama_expert_cache_save_rule = std::string(v);
+        } else if (arg == "--llama-expert-route-trace") {
+            if (!value(v)) return fail("--llama-expert-route-trace needs a directory");
+            cfg.llama_expert_route_trace = std::string(v);
         } else if (arg == "--llama-mtp-gguf") {
             if (!value(v)) return fail("--llama-mtp-gguf needs an MTP-only GGUF");
             cfg.llama_mtp_gguf = std::string(v);
@@ -803,6 +839,11 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         return fail("--llama-expert-cache caches experts --llama-cpu-moe keeps in host memory: give --llama-cpu-moe");
     if (!cfg.llama_expert_profile.empty() && !cfg.llama_expert_cache_on())
         return fail("--llama-expert-profile needs --llama-expert-cache");
+    if (!cfg.llama_expert_cache_save.empty() && !cfg.llama_expert_cache_on())
+        return fail("--llama-expert-cache-save needs --llama-expert-cache");
+    // the save would write over the profile the same run reads: refuse at config
+    if (!cfg.llama_expert_cache_save.empty() && cfg.llama_expert_cache_save == cfg.llama_expert_profile)
+        return fail("--llama-expert-cache-save must differ from --llama-expert-profile: the save would overwrite it");
     // --device: one card, or the two of a layer split (no automatic split:
     // the split point decides each card's VRAM, so it is the operator's)
     if (!split_list(cfg.device, cfg.llama_devices))

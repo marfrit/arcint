@@ -172,6 +172,41 @@ Strata's kernels read its pinned mirror; prefill gathers the routed bank
 experts into a card-side mirror first. Its constants take
 `LLAMA_EXPERT_CACHE_{ADAPT_EVERY,MAX_SWAPS,MIN_GAIN,MIN_USAGE,DECAY}`.
 
+`--llama-expert-route-trace DIR` writes the cache's own routing read-back to
+one file a process (`expert-route-<pid>-<unix-time>.000.ert1`, rotated at
+`LLAMA_EXPERT_ROUTE_TRACE_MAX_MB`, default 256 MiB; each file carries its
+header and a resident snapshot so it replays alone) and `<file>.accept` for
+the sampler's accepted drafts; the last graph of a request is written at its
+end, and a rotation happens before the accept line so both land in the new
+file. A missing DIR is created; an existing non-directory path is a file base
+and gets `.001`, `.002` (`code`). Files are opened with `O_EXCL` and never
+appended, so a restarted unit with a reused pid gets a new base, never a second
+header in an old file. **Off by default.** With it on, decode adds no device
+sync (the ids are the cache's existing read-back; `LLAMA_EXPERT_CACHE_ASYNC_IDS=0`
+is respected and costs the wait it asks), a prompt adds one read and one wait,
+an MTP draft graph one read issued behind the graph through the OpenCL
+backend's batch hook (`ggml_backend_reg_get_proc_address(...
+"ggml_backend_opencl_get_tensors_async")`, no wait; a backend without it keeps
+a blocking read), the record written at that context's synchronize (a decode
+that starts before a synchronize waits once),
+and a request-end flush one sync. Off, one `getenv` at load and one cached
+bool. If a write fails, one WARN is logged and tracing stops; no read-back
+continues. A trace with token ids is the prompt and the answer in another form:
+whoever enables it stores every request's content on the serving host. Size: a
+prompt record is `n_tokens × top-k × n_layer × 4 B`, about 1.9 KB a prompt
+token, so a 100k prompt is about 190 MB; put DIR on a dataset with room, not
+the root filesystem. Details and the record layout:
+`contrib/llama.cpp/README.md` 0069, campaign `expert-foresight.md`.
+
+`--llama-expert-cache-save FILE` writes the cache's learned STRP ranking at
+teardown, so a later run can load it with `--llama-expert-profile`
+(`--llama-expert-cache-save-rule xe|cu` picks Strata's xe or cu rule; xe is the
+default). **Off by default:** unset, one `getenv` at the cache's init and no
+allocation, no write. It needs `--llama-expert-cache`, refuses a path equal to
+`--llama-expert-profile`, and writes nothing under a layer split (one path
+cannot name both cards' caches). Details: `contrib/llama.cpp/README.md` 0070,
+audit 14a.
+
 What 0022 adds for it (`contrib/llama.cpp/README.md`): the low-bit IQ and
 Q2_0 kernels in planes, F16/BF16 products on XMX, and the QSA indexer's ops
 on the card (TOP_K, F32<->I32 casts, F16 FILL/REPEAT/SET_ROWS) -- without

@@ -37,13 +37,16 @@
 #include <ggml.h>
 #include <gguf.h>
 #include <llama-ext.h>   // staging API of the pinned llama.cpp: nextn embeddings
+#include <llama-expert-route-trace.h>   // the trace's sidecar name (contrib/llama.cpp 0069)
 #include <llama.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <fstream>
 #include <sstream>
 
@@ -53,6 +56,49 @@
 
 namespace lgc {
 namespace {
+
+// The accept sidecar of the routing trace (campaign expert-foresight, stage
+// 0). The expert cache in libllama records a graph's routing but cannot see
+// the sampler, so which of a verify's drafts the walk accepted is written
+// here, beside the trace: LLAMA_EXPERT_ROUTE_TRACE=<path> gives both files,
+// one line a decode graph (a single lane). A line's `pos` is the graph's first
+// position and `rows` its token count (1 + drafts, so a decode graph with no
+// drafts has its line too); the replay aligns lines to graphs BY POSITION --
+// a prompt's 4-token checkpoint tail is a PROMPT graph and would scramble an
+// order -- and fails loudly on a missing position or a count mismatch. Off and
+// free when the variable is unset.
+static void trace_accept(int pos, int rows, int n_accepted) {
+    static std::mutex mu;
+    static std::FILE * f = nullptr;
+    static std::string name;
+    static int ord = 0;
+    if (!llama_expert_route_trace_enabled()) {
+        return;   // one cached bool when the trace is off, no string built
+    }
+    std::lock_guard<std::mutex> lk(mu);
+    // beside the CURRENT trace file (libllama rotates it at its size cap):
+    // when the name moves, so does this sidecar, and each file keeps its own
+    const std::string want = llama_expert_route_trace_sidecar();
+    if (want.empty()) {
+        return;
+    }
+    if (name != want) {
+        if (f != nullptr && f != reinterpret_cast<std::FILE *>(-1)) std::fclose(f);
+        f = std::fopen(want.c_str(), "a");
+        name = want;
+        ord = 0;   // a new file's lines start at 1, aligned by pos anyway
+        if (f == nullptr) {
+            f = reinterpret_cast<std::FILE *>(-1);
+            return;
+        }
+    }
+    if (f == reinterpret_cast<std::FILE *>(-1)) {
+        return;
+    }
+    ++ord;
+    std::fprintf(f, "verify %d pos %d rows %d accepted %d\n", ord, pos, rows, n_accepted);
+    std::fflush(f);
+}
 
 // The output head's rows of a token subset, on the device the output head
 // runs on (the one card, or a layer split's last):
@@ -594,6 +640,7 @@ public:
     void accept(int seq, int n_accepted) override {
         Lane& ln = lanes_[static_cast<size_t>(seq)];
         if (ln.pending <= 0) return;
+        trace_accept(static_cast<int>(ln.base), ln.pending, n_accepted);
         ln.pending = std::min(std::max(n_accepted, 0) + 1, ln.pending);
     }
 

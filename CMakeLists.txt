@@ -328,6 +328,22 @@ if(ARCINT_TESTS)
   add_test(NAME acceptance-ab
            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/acceptance/ab_selftest.py")
   set_tests_properties(acceptance-ab PROPERTIES LABELS unit)
+
+  # patch 0070's device-free C++ cell, against the llama tree the build already
+  # compiled against (EXPERT_PROFILE_SRC): the selftest's round trip,
+  # truncation, version, tie-break, pending-swap, xe, heat-unit and heat-width
+  # cells, plus the C++/Python byte equality. Run by python3 alone (the cell is
+  # stdlib unittest), so the recipe is green on a build host without pytest;
+  # the recipe's `ctest -L unit` still runs it, so a patch that does not compile
+  # fails the package build instead of a skipped skip.
+  if(ARCINT_LLAMA)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(NAME expert-profile-save
+             COMMAND "${CMAKE_COMMAND}" -E env "EXPERT_PROFILE_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_expert_profile_save.py")
+    set_tests_properties(expert-profile-save PROPERTIES LABELS unit)
+  endif()
 endif()
 
 if(ARCINT_ACCEPTANCE)

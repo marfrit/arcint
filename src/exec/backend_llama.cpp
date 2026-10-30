@@ -12,6 +12,7 @@
 #include <CL/cl.h>
 #include <gguf.h>
 #include <llama.h>
+#include <llama-ext.h>   // llama_expert_route_trace_flush (contrib/llama.cpp 0069)
 
 #ifdef ARCINT_MTMD
 #include <mtmd.h>
@@ -385,6 +386,26 @@ public:
         }
         llama_log_set(route_llama_log, nullptr);
         llama_backend_init();
+        // --llama-expert-route-trace: set before the model's load, which reads
+        // it once at the expert cache's init. Empty unsets, so an inherited
+        // variable cannot turn the trace on behind the operator's back.
+        if (cfg.llama_expert_route_trace.empty()) {
+            unsetenv("LLAMA_EXPERT_ROUTE_TRACE");
+        } else {
+            setenv("LLAMA_EXPERT_ROUTE_TRACE", cfg.llama_expert_route_trace.c_str(), 1);
+        }
+        // --llama-expert-cache-save: the same rule, read at the cache's teardown
+        if (cfg.llama_expert_cache_save.empty()) {
+            unsetenv("LLAMA_EXPERT_CACHE_SAVE");
+        } else {
+            setenv("LLAMA_EXPERT_CACHE_SAVE", cfg.llama_expert_cache_save.c_str(), 1);
+        }
+        // the save's rule (the default xe is unset: the cache's own default)
+        if (cfg.llama_expert_cache_save_rule.empty() || cfg.llama_expert_cache_save_rule == "xe") {
+            unsetenv("LLAMA_EXPERT_CACHE_SAVE_RULE");
+        } else {
+            setenv("LLAMA_EXPERT_CACHE_SAVE_RULE", cfg.llama_expert_cache_save_rule.c_str(), 1);
+        }
 
         llama_model_params mp = llama_model_default_params();
         mp.n_gpu_layers       = 999;
@@ -976,6 +997,8 @@ public:
     }
 
     ~LlamaBackend() override {
+        // the trace's pending last graph, written before the context goes
+        if (ctx_ != nullptr) llama_expert_route_trace_flush(ctx_);
         spec_.reset();   // its draft context reads the target's
 #ifdef ARCINT_MTMD
         if (mctx_ != nullptr) mtmd_free(mctx_);
@@ -1030,8 +1053,21 @@ public:
         return template_->apply(inputs, opts);
     }
 
+    // Every return of generate() (and a throw), the trace's last graph
     FinishReason generate(const GenerationInput& in, int slot, const TokenCallback& on_piece,
                           GenerationStats& stats) override {
+        // the flush is a llama_context call: take mu_ like every other one.
+        // The catch in generate_spec releases mu_ before this destructor runs.
+        struct TraceFlush {
+            llama_context * ctx;
+            std::mutex     * mu;
+            ~TraceFlush() {
+                if (ctx != nullptr) {
+                    std::lock_guard<std::mutex> lk(*mu);
+                    llama_expert_route_trace_flush(ctx);
+                }
+            }
+        } trace_flush_{ctx_, &mu_};
         if (!in.images.empty()) return generate_mm(in, slot, on_piece, stats);
         if (spec_) return generate_spec(in, slot, on_piece, stats);
         const int seq = std::min(std::max(slot, 0), lanes_ - 1);

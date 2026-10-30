@@ -1,0 +1,687 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 3853549..b82ca4a 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -40,6 +40,7 @@ set(LLAMA_CORE_SOURCES
+     llama-model-saver.cpp
+     llama-model.cpp
+     llama-quant.cpp
++    llama-expert-profile.cpp
+     llama-sampler.cpp
+     llama-vocab.cpp
+     unicode-data.cpp
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+index 73d3e80..a24b6bb 100644
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -5,6 +5,7 @@
+ #include "llama-impl.h"
+ #include "llama-model.h"
+ #include "llama-model-loader.h"
++#include "llama-expert-profile.h"
+ #include "ggml-cpu.h"
+ 
+ #include <algorithm>
+@@ -63,33 +64,81 @@ static bool on_cpu(const ggml_tensor * t) {
+     return ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+ }
+ 
+-// Strata's STRP profile (tools/make_profile.py): "STRP", u32 version,
+-// n_layers, n_expert, slots, n_ranked, then n_ranked (u16 layer, u16 expert)
++// Strata's STRP profile: the reader patch 0070 adds (llama-expert-profile.cpp)
+ static bool read_profile(const char * path, int n_layers, int n_expert, std::vector<std::pair<int, int>> & ranked) {
+-    FILE * f = fopen(path, "rb");
+-    if (!f) {
+-        return false;
+-    }
+-    char     magic[4];
+-    uint32_t h[5];
+-    bool ok = fread(magic, 1, 4, f) == 4 && memcmp(magic, "STRP", 4) == 0 && fread(h, 4, 5, f) == 5 &&
+-              h[0] == 1 && (int) h[1] == n_layers && (int) h[2] == n_expert;
+-    if (ok) {
+-        ranked.resize(h[4]);
+-        for (uint32_t i = 0; ok && i < h[4]; ++i) {
+-            uint16_t p[2];
+-            ok = fread(p, 2, 2, f) == 2;
+-            ranked[i] = {p[0], p[1]};
+-        }
+-    }
+-    fclose(f);
+-    return ok;
++    std::string err;
++    return llama_expert_profile_read(path, n_layers, n_expert, ranked, err);
+ }
+ 
+ llama_expert_cache::~llama_expert_cache() {
+     if (book_.phase != 0 && adapt_finish && !layers.empty()) {
+         adapt_finish(layers[0].slot[0]);
+     }
++    // --llama-expert-cache-save F (LLAMA_EXPERT_CACHE_SAVE): the learned profile
++    // from this cache's cumulative routing. The default rule is Strata's SYCL/xe
++    // save (save_profile, generate.cpp, commit 3d6f1718): the counts mixed with
++    // the start's ranking as prior mass, so a short conversation does not wipe
++    // the prior; --llama-expert-cache-save-rule cu selects Strata's
++    // rank_learned_profile instead (the resident head). Written at teardown after
++    // adapt_finish has landed the pending copies; the host tables are still at
++    // the phase the last progress() left them in, so a pending incoming expert is
++    // marked resident here (Strata does) and a pending outgoing expert is kept
++    // only in phase 1. A layer split has one cache a card: the same variable
++    // would name one file for both cards, so it is not written then -- the WARN
++    // says what is needed.
++    if (const char * save = getenv("LLAMA_EXPERT_CACHE_SAVE"); save != nullptr && *save != '\0' && !layers.empty()) {
++        const int n_caches = model_ != nullptr ? (int) model_->expert_caches.size() : 1;
++        if (n_caches > 1) {
++            LLAMA_LOG_WARN("%s: %d expert caches (a cache a card): one save path for all of them is wrong; "
++                            "per-card files need distinct paths, nothing written\n", __func__, n_caches);
++        } else {
++            const int n_layers = model_ != nullptr ? (int) model_->layers.size() : layers.back().il + 1;
++            const int n_expert = layers[0].n_expert;
++            std::vector<uint8_t> resident((size_t) n_layers * (size_t) n_expert, 0);
++            std::vector<double>  heat    ((size_t) n_layers * (size_t) n_expert, 0.0);
++            double counted = 0.0;
++            for (const auto & L : layers) {
++                const size_t base = (size_t) L.il * (size_t) n_expert;
++                for (int e = 0; e < L.n_expert; ++e) {
++                    resident[base + (size_t) e] = L.slot_of[e] >= 0 ? 1 : 0;
++                    // the raw routing counts, one a routed pair (Strata's device counter)
++                    heat[base + (size_t) e] = L.heat.empty() ? 0.0 : L.heat[e];
++                    counted += heat[base + (size_t) e];
++                }
++            }
++            if (book_.phase != 0) {
++                std::vector<llama_expert_profile_swap> pending;
++                pending.reserve(book_.pend.size());
++                for (const auto & p : book_.pend) {
++                    pending.push_back({p.layer, p.e_in, p.e_out});
++                }
++                llama_expert_profile_mark_pending(n_expert, resident, pending, book_.phase);
++            }
++            const char * rule_env = getenv("LLAMA_EXPERT_CACHE_SAVE_RULE");
++            const bool cu = rule_env != nullptr && std::strcmp(rule_env, "cu") == 0;
++            if (rule_env != nullptr && *rule_env != '\0' && !cu && std::strcmp(rule_env, "xe") != 0) {
++                LLAMA_LOG_WARN("%s: LLAMA_EXPERT_CACHE_SAVE_RULE=%s: not xe or cu, the xe rule\n", __func__, rule_env);
++            }
++            // Strata's constant and its environment variable, mirrored
++            double prior_entries = 800000.0;
++            if (const char * pe = getenv("STRATA_PROFILE_PRIOR_ENTRIES")) {
++                prior_entries = std::max(0.0, std::atof(pe));
++            }
++            const auto ranked = cu ? llama_expert_profile_rank(n_layers, n_expert, resident, heat, profile_ranked)
++                                  : llama_expert_profile_rank_xe(n_layers, n_expert, heat, profile_ranked,
++                                                                 prior_entries, 2.0);
++            std::string err;
++            if (llama_expert_profile_write(save, n_layers, n_expert, ranked, err)) {
++                // WARN, not INFO: the units' default level drops INFO, and a save the
++                // operator asked for must say it happened (Strata writes stderr plainly)
++                LLAMA_LOG_WARN("%s: saved the expert profile to %s (%zu pairs, %s rule, %.0f routed entries counted on "
++                               "the device%s)\n", __func__, save, ranked.size(), cu ? "cu" : "xe", counted,
++                               cu ? "" : format(", prior %.0f routed entries", prior_entries).c_str());
++            } else {
++                LLAMA_LOG_WARN("%s: the expert profile was not saved: %s\n", __func__, err.c_str());
++            }
++        }
++    }
+     if (n_deferred > 0) {
+         LLAMA_LOG_INFO("%s: %s: %llu swaps put off for want of a spare bank entry in their layer\n", __func__,
+                        dev_ ? ggml_backend_dev_name(dev_) : "-", (unsigned long long) n_deferred);
+@@ -337,6 +386,7 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+         adapt_every = (uint32_t) atoi(a);   // 0: the profile's placement, never adapted
+     }
+     dev_ = dev;
++    model_ = &model;
+     layers.reserve(model.layers.size());   // the registry holds pointers into it
+     for (int il = 0; dev != nullptr && il < (int) model.layers.size(); ++il) {
+         llama_expert_cache_layer L;
+@@ -347,6 +397,11 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+         L.slot_of.assign(L.n_expert, -1);
+         L.bank_of.assign(L.n_expert, -1);
+         L.usage.assign(L.n_expert, 0.0f);
++        // the save's raw routing counts, Strata's --expert-profile-save allocates
++        // its counter only then; off, this vector stays empty and count() skips it
++        if (const char * save = getenv("LLAMA_EXPERT_CACHE_SAVE"); save != nullptr && *save != '\0') {
++            L.heat.assign(L.n_expert, 0.0);
++        }
+         layers.push_back(std::move(L));
+     }
+     if (layers.empty()) {
+@@ -442,6 +497,9 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+     if (profile && *profile && !from_profile) {
+         LLAMA_LOG_WARN("%s: profile %s unreadable or for another geometry; round robin\n", __func__, profile);
+     }
++    // the profile the run started from, for the save's prior step; empty for
++    // round robin (Strata's save test's no-prior order)
++    profile_ranked = from_profile ? ranked : std::vector<std::pair<int, int>>();
+     if (!from_profile) {
+         for (int e = 0; e < n_expert; ++e) {
+             for (auto & L : layers) {
+@@ -1661,6 +1719,14 @@ void llama_expert_cache::count(uint32_t n_tokens) {
+             L.usage[e] += 1.0f;
+             (L.slot_of[e] >= 0 ? n_hits : n_misses) += 1;
+         }
++        // the save's heat, Strata's per-routing-event device counter: raw counts,
++        // unnormalized, so it is in the same unit as the prior's
++        // STRATA_PROFILE_PRIOR_ENTRIES (a decayed sum would be 1/(1-decay) larger
++        // and weigh like ~240k entries at decay 0.7). Counted here, not in adapt():
++        // LLAMA_EXPERT_CACHE_ADAPT_EVERY=0 must still accumulate it.
++        if (!L.heat.empty()) {
++            llama_expert_profile_add_heat(L.heat, L.n_expert, ids[i]);
++        }
+         if (n_tokens > 1) {
+             std::vector<int32_t> u(ids[i]);
+             std::sort(u.begin(), u.end());
+@@ -1730,6 +1796,8 @@ void llama_expert_cache::adapt(const std::vector<llama_expert_cache_swap> & all_
+         }
+     }
+     for (auto & L : layers) {
++        // no heat here: it counts in count(), one a routed pair, so it does not
++        // depend on this cadence (LLAMA_EXPERT_CACHE_ADAPT_EVERY=0 still counts)
+         for (float & u : L.usage) {
+             u *= decay;
+         }
+diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
+index 6655bd9..37d9de2 100644
+--- a/src/llama-expert-cache.h
++++ b/src/llama-expert-cache.h
+@@ -39,6 +39,7 @@
+ #include <cstdint>
+ #include <memory>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ struct llama_model;
+@@ -94,6 +95,9 @@ struct llama_expert_cache_layer {
+     llama_loan_book::DirtyTrack dirty;
+     std::vector<int32_t> bexpert_of;    // bank entry -> expert, -1 (the zero entry, a spare)
+     std::vector<float>   usage;         // decode routing counts, decayed each adapt
++    std::vector<double>  heat;          // raw routing counts for the save (--llama-expert-cache-save), one
++                                        // a routed pair in count(); empty unless the save is on. Double: a
++                                        // month at ~33 t/s passes float's 2^24 on the hottest pairs
+     ggml_tensor * ids_out = nullptr;    // the last graph's routed ids (a copy, marked output)
+     int      tab_row  = 0;              // the first of its tables' rows in the cache's tab_all
+     int      n_tab    = 0;              // its tables: 3, or 5 with the _dn pair
+@@ -373,6 +377,11 @@ private:
+     void (*bank_stream_ring)(ggml_backend_dev_t, size_t *, size_t *) = nullptr;
+     int                mutate = 0;      // LLAMA_EXPERT_CACHE_MUTATE: corrupt one swapped slot (red case for the swap check)
+     int                mutate_loan = 0; // LLAMA_SLOT_LOAN_MUTATE: 1 a tensor of the last lent layer left uncopied, 2 drop the lend's last table row, 3 the lent sizing skipped, 4 the return's re-reserve skipped (llama-context.cpp), 5 a lent layer's bank row off by one (lend, the prefill's red case)
++    // --llama-expert-cache-save: the profile loaded in init (the prior of both
++    // rules: the xe mixing's pseudo-counts and cu's tie-break), empty for round
++    // robin; and the model, to get the geometry and the cache count at teardown
++    std::vector<std::pair<int, int>> profile_ranked;
++    const llama_model * model_ = nullptr;
+ };
+ 
+ // The layer whose down projection (as loaded) is `down_exps`, or null.
+diff --git a/src/llama-expert-profile.cpp b/src/llama-expert-profile.cpp
+new file mode 100644
+index 0000000..6a8d662
+--- /dev/null
++++ b/src/llama-expert-profile.cpp
+@@ -0,0 +1,368 @@
++#include "llama-expert-profile.h"
++
++#include <algorithm>
++#include <cerrno>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++
++// The heat is Strata's xe unit: raw routing counts, one a routed pair (its device
++// counter), not a decayed sum. Strata's rank_learned_profile (src/core/expert_cache.cpp, commit 3d6f1718):
++// resident first, then by heat descending, then by the prior's own rank, then
++// by the pair's index. Written as the staged order the save test shows, which
++// is the same sequence: resident by heat, the counted non-resident pairs by
++// heat, the prior in its own order, the fill layer-major. Ties in either heat
++// group take the prior's rank before the index (Strata's comparator), which is
++// what puts a prior pair ahead of a same-heat non-prior pair.
++std::vector<std::pair<int, int>> llama_expert_profile_rank(
++    int n_layers, int n_expert, const std::vector<uint8_t> & resident,
++    const std::vector<double> & heat, const std::vector<std::pair<int, int>> & prior) {
++    std::vector<std::pair<int, int>> out;
++    if (n_layers <= 0 || n_expert <= 0) {
++        return out;
++    }
++    const size_t n = (size_t) n_layers * (size_t) n_expert;
++    auto index = [n_expert](int l, int e) { return (size_t) l * (size_t) n_expert + (size_t) e; };
++    auto is_resident = [&](const std::pair<int, int> & p) {
++        const size_t i = index(p.first, p.second);
++        return i < resident.size() && resident[i] != 0;
++    };
++    auto heat_of = [&](const std::pair<int, int> & p) {
++        const size_t i = index(p.first, p.second);
++        return i < heat.size() ? heat[i] : 0.0;
++    };
++
++    // the pairs in the fill's own enumeration: layer outer, expert inner
++    std::vector<std::pair<int, int>> all;
++    all.reserve(n);
++    for (int l = 0; l < n_layers; ++l) {
++        for (int e = 0; e < n_expert; ++e) {
++            all.emplace_back(l, e);
++        }
++    }
++
++    // prior rank: the position of a pair in the profile the run started from,
++    // INT64_MAX when the prior does not name it (Strata's comparator)
++    std::vector<int64_t> prior_rank(n, INT64_MAX);
++    for (size_t r = 0; r < prior.size(); ++r) {
++        const auto [l, e] = prior[r];
++        if (l >= 0 && l < n_layers && e >= 0 && e < n_expert) {
++            int64_t & pr = prior_rank[index(l, e)];
++            if (pr == INT64_MAX) {
++                pr = (int64_t) r;
++            }
++        }
++    }
++    auto rank_of = [&](const std::pair<int, int> & p) { return prior_rank[index(p.first, p.second)]; };
++
++    std::vector<std::pair<int, int>> hot_resident, hot_others;
++    for (const auto & p : all) {
++        if (is_resident(p)) {
++            hot_resident.push_back(p);
++        } else if (heat_of(p) > 0.0) {
++            hot_others.push_back(p);
++        }
++    }
++    // Strata's tie-break: heat descending, then the prior's rank, then the
++    // index (layer-major). Red mutations: `>` -> `<` reverses both groups; a
++    // tie-break on the index alone moves a prior pair behind a same-heat one.
++    auto by_heat_desc = [&](const std::pair<int, int> & a, const std::pair<int, int> & b) {
++        if (heat_of(a) != heat_of(b)) {
++            return heat_of(a) > heat_of(b);
++        }
++        if (rank_of(a) != rank_of(b)) {
++            return rank_of(a) < rank_of(b);
++        }
++        return index(a.first, a.second) < index(b.first, b.second);
++    };
++    std::sort(hot_resident.begin(), hot_resident.end(), by_heat_desc);
++    std::sort(hot_others.begin(), hot_others.end(), by_heat_desc);
++
++    std::vector<uint8_t> seen(n, 0);
++    auto take = [&](const std::pair<int, int> & p) {
++        if (p.first < 0 || p.first >= n_layers || p.second < 0 || p.second >= n_expert) {
++            return;
++        }
++        const size_t i = index(p.first, p.second);
++        if (seen[i]) {
++            return;
++        }
++        seen[i] = 1;
++        out.push_back(p);
++    };
++    for (const auto & p : hot_resident) take(p);
++    for (const auto & p : hot_others)   take(p);
++    // the profile the run started from, in that profile's order
++    for (const auto & p : prior) take(p);
++    // the fill: layer outer, expert inner, every pair still missing
++    for (const auto & p : all) take(p);
++    return out;
++}
++
++void llama_expert_profile_add_heat(std::vector<double> & heat, int n_expert, const std::vector<int32_t> & ids) {
++    if (n_expert <= 0) {
++        return;
++    }
++    for (int32_t e : ids) {
++        if (e < 0 || e >= n_expert) {
++            continue;
++        }
++        if ((size_t) e < heat.size()) {
++            heat[(size_t) e] += 1.0;   // raw: no decay factor, one a routed pair
++        }
++    }
++}
++
++std::vector<std::pair<int, int>> llama_expert_profile_rank_xe(
++    int n_layers, int n_expert, const std::vector<double> & heat,
++    const std::vector<std::pair<int, int>> & prior, double prior_entries, double lam) {
++    if (n_layers <= 0 || n_expert <= 0) {
++        return std::vector<std::pair<int, int>>();
++    }
++    const size_t n = (size_t) n_layers * (size_t) n_expert;
++    // Strata's SYCL/xe save (generate.cpp save_profile): the device's cumulative
++    // counts, then the prior mass by rank, exp(-lam * rank / n) worth
++    // `prior_entries` routed entries over the whole ranking. `lam` 2, the shipped
++    // ranking holds ~70 % of the routing in its first 47 % of pairs.
++    std::vector<double> mixed(n, 0.0);
++    for (size_t i = 0; i < n; ++i) {
++        mixed[i] = i < heat.size() ? heat[i] : 0.0;
++    }
++    if (prior_entries > 0.0 && lam > 0.0 && n > 0) {
++        const double norm = lam / (1.0 - std::exp(-lam)) / (double) n;
++        for (size_t r = 0; r < prior.size(); ++r) {
++            const auto [l, e] = prior[r];
++            if (l < 0 || l >= n_layers || e < 0 || e >= n_expert) {
++                continue;
++            }
++            const double x = (double) r / (double) n;
++            mixed[(size_t) l * (size_t) n_expert + (size_t) e] +=
++                prior_entries * norm * std::exp(-lam * x);
++        }
++    }
++    // Strata passes no resident vector here: every pair ranks by the mixed heat
++    const std::vector<uint8_t> none(n, 0);
++    return llama_expert_profile_rank(n_layers, n_expert, none, mixed, prior);
++}
++
++void llama_expert_profile_mark_pending(int n_expert, std::vector<uint8_t> & resident,
++                                       const std::vector<llama_expert_profile_swap> & pending, int phase) {
++    if (n_expert <= 0) {
++        return;
++    }
++    for (const auto & s : pending) {
++        if (s.layer < 0) {
++            continue;
++        }
++        const size_t base = (size_t) s.layer * (size_t) n_expert;
++        auto put = [&](int e) {
++            if (e >= 0 && e < n_expert) {
++                const size_t i = base + (size_t) e;
++                if (i < resident.size()) {
++                    resident[i] = 1;
++                }
++            }
++        };
++        auto clear = [&](int e) {
++            if (e >= 0 && e < n_expert) {
++                const size_t i = base + (size_t) e;
++                if (i < resident.size()) {
++                    resident[i] = 0;
++                }
++            }
++        };
++        // the incoming expert has landed (a copy in flight counts as done)
++        put(s.e_in);
++        // the outgoing stays resident only in phase 1; at phase 2 the host
++        // table has already freed its slot
++        if (phase >= 2) {
++            clear(s.e_out);
++        }
++    }
++}
++
++static void put_u32(std::FILE * f, uint32_t v) {
++    uint8_t b[4];
++    for (int i = 0; i < 4; ++i) {
++        b[i] = (uint8_t) ((v >> (8 * i)) & 0xff);
++    }
++    std::fwrite(b, 1, 4, f);
++}
++
++static void put_u16(std::FILE * f, uint32_t v) {
++    uint8_t b[2] = { (uint8_t) (v & 0xff), (uint8_t) ((v >> 8) & 0xff) };
++    std::fwrite(b, 1, 2, f);
++}
++
++static uint32_t get_u32(const uint8_t * b) {
++    return (uint32_t) b[0] | ((uint32_t) b[1] << 8) | ((uint32_t) b[2] << 16) | ((uint32_t) b[3] << 24);
++}
++
++static uint16_t get_u16(const uint8_t * b) {
++    return (uint16_t) ((uint16_t) b[0] | ((uint16_t) b[1] << 8));
++}
++
++bool llama_expert_profile_read(const char * path, int n_layers, int n_expert,
++                               std::vector<std::pair<int, int>> & ranked, std::string & err) {
++    ranked.clear();
++    err.clear();
++    if (path == nullptr || *path == '\0') {
++        err = "llama_expert_profile_read: no profile path";
++        return false;
++    }
++    std::FILE * f = std::fopen(path, "rb");
++    if (f == nullptr) {
++        err = std::string("llama_expert_profile_read: ") + path + ": cannot open: " + std::strerror(errno);
++        return false;
++    }
++
++    uint8_t magic[4];
++    uint8_t hb[20];
++    if (std::fread(magic, 1, 4, f) != 4 || std::fread(hb, 1, 20, f) != 20) {
++        std::fclose(f);
++        err = std::string("llama_expert_profile_read: ") + path + ": shorter than a 24-byte STRP header";
++        return false;
++    }
++    if (std::memcmp(magic, "STRP", 4) != 0) {
++        std::fclose(f);
++        err = std::string("llama_expert_profile_read: ") + path + ": not a Strata profile (magic is not STRP)";
++        return false;
++    }
++    const uint32_t version  = get_u32(hb);
++    const uint32_t n_layer  = get_u32(hb + 4);
++    const uint32_t n_exp    = get_u32(hb + 8);
++    const uint32_t slots    = get_u32(hb + 12);   // ignored: arcint ignores the hint
++    const uint32_t n_ranked = get_u32(hb + 16);
++    (void) slots;
++
++    // the version BEFORE the geometry: the fields after it are a version 1
++    // layout's, so a version 2 file of another model is refused by its number
++    // (Strata's _version_test)
++    if (version != 1) {
++        std::fclose(f);
++        err = std::string("llama_expert_profile_read: ") + path + ": profile version " +
++              std::to_string(version) + ", this reader reads version 1";
++        return false;
++    }
++    if ((int) n_layer != n_layers || (int) n_exp != n_expert) {
++        std::fclose(f);
++        err = std::string("llama_expert_profile_read: ") + path + ": " + std::to_string(n_layer) + "x" +
++              std::to_string(n_exp) + ", not " + std::to_string(n_layers) + "x" + std::to_string(n_expert);
++        return false;
++    }
++    // more pairs than the geometry has: a header claim, refused before the loop
++    // (a truncated pair is caught by the loop's own short read)
++    if (n_ranked > (uint32_t) ((size_t) n_layers * (size_t) n_expert)) {
++        std::fclose(f);
++        err = std::string("llama_expert_profile_read: ") + path + ": " + std::to_string(n_ranked) +
++              " ranked pairs, more than the geometry's " + std::to_string(n_layers * n_expert);
++        return false;
++    }
++
++    std::vector<std::pair<int, int>> got;
++    got.reserve(n_ranked);
++    for (uint32_t i = 0; i < n_ranked; ++i) {
++        uint8_t pb[4];
++        if (std::fread(pb, 1, 4, f) != 4) {
++            std::fclose(f);
++            err = std::string("llama_expert_profile_read: ") + path + ": pair " + std::to_string(i) +
++                  " of " + std::to_string(n_ranked) + " (truncated record)";
++            return false;
++        }
++        const int l = get_u16(pb);
++        const int e = get_u16(pb + 2);
++        if (l < 0 || l >= n_layers || e < 0 || e >= n_expert) {
++            std::fclose(f);
++            err = std::string("llama_expert_profile_read: ") + path + ": pair " + std::to_string(i) + " (" +
++                  std::to_string(l) + "," + std::to_string(e) + ") is out of range";
++            return false;
++        }
++        got.emplace_back(l, e);
++    }
++    if (std::fclose(f) != 0) {
++        err = std::string("llama_expert_profile_read: ") + path + ": close failed: " + std::strerror(errno);
++        return false;
++    }
++    ranked = std::move(got);
++    return true;
++}
++
++bool llama_expert_profile_write(const char * path, int n_layers, int n_expert,
++                                const std::vector<std::pair<int, int>> & ranked, std::string & err) {
++    err.clear();
++    if (path == nullptr || *path == '\0') {
++        err = "llama_expert_profile_write: no profile path";
++        return false;
++    }
++    if (n_layers < 1 || n_layers > 65535 || n_expert < 1 || n_expert > 65535) {
++        err = std::string("llama_expert_profile_write: ") + path + ": " + std::to_string(n_layers) + "x" +
++              std::to_string(n_expert) + " does not fit the u16 pair fields";
++        return false;
++    }
++    if (ranked.size() > 0xffffffffUL) {
++        err = std::string("llama_expert_profile_write: ") + path + ": too many ranked pairs";
++        return false;
++    }
++    // the range check BEFORE the file is touched: a refused save keeps an
++    // existing file (Strata's save test)
++    for (size_t i = 0; i < ranked.size(); ++i) {
++        const int l = ranked[i].first, e = ranked[i].second;
++        if (l < 0 || l >= n_layers || e < 0 || e >= n_expert) {
++            err = std::string("llama_expert_profile_write: ") + path + ": pair " + std::to_string(i) + " (" +
++                  std::to_string(l) + "," + std::to_string(e) + ") is out of range";
++            return false;
++        }
++    }
++
++    const std::string tmp = std::string(path) + ".tmp";
++    std::FILE * f = std::fopen(tmp.c_str(), "wb");
++    if (f == nullptr) {
++        err = std::string("llama_expert_profile_write: ") + tmp + ": cannot open: " + std::strerror(errno);
++        return false;
++    }
++    auto fail = [&](const std::string & why) {
++        std::fclose(f);
++        std::remove(tmp.c_str());   // never leave a `.tmp`
++        err = std::string("llama_expert_profile_write: ") + tmp + ": " + why;
++        return false;
++    };
++    std::fwrite("STRP", 1, 4, f);
++    put_u32(f, 1u);                              // version
++    put_u32(f, (uint32_t) n_layers);
++    put_u32(f, (uint32_t) n_expert);
++    put_u32(f, (uint32_t) ranked.size());        // slots = n_ranked, Strata's writer
++    put_u32(f, (uint32_t) ranked.size());        // n_ranked
++    for (const auto & p : ranked) {
++        put_u16(f, (uint32_t) p.first);
++        put_u16(f, (uint32_t) p.second);
++    }
++    // the trailing table Strata's writer appends: a layer's experts -> their
++    // rank, -1 for a pair the ranking does not hold. Its save test compares the
++    // whole file byte for byte, so a saved profile is the same file the Python
++    // writers produce; readers stop after the pairs.
++    std::vector<int32_t> table((size_t) n_layers * (size_t) n_expert, -1);
++    for (size_t i = 0; i < ranked.size(); ++i) {
++        table[(size_t) ranked[i].first * (size_t) n_expert + (size_t) ranked[i].second] = (int32_t) i;
++    }
++    for (int32_t v : table) {
++        put_u32(f, (uint32_t) v);
++    }
++    if (std::fflush(f) != 0) {
++        return fail(std::string("write failed: ") + std::strerror(errno));
++    }
++    if (std::fclose(f) != 0) {
++        const int e = errno;
++        std::remove(tmp.c_str());
++        err = std::string("llama_expert_profile_write: ") + tmp + ": close failed: " + std::strerror(e);
++        return false;
++    }
++    if (std::rename(tmp.c_str(), path) != 0) {
++        const int e = errno;
++        std::remove(tmp.c_str());
++        err = std::string("llama_expert_profile_write: ") + path + ": rename from the .tmp failed: " +
++              std::strerror(e);
++        return false;
++    }
++    return true;
++}
+diff --git a/src/llama-expert-profile.h b/src/llama-expert-profile.h
+new file mode 100644
+index 0000000..cd413f4
+--- /dev/null
++++ b/src/llama-expert-profile.h
+@@ -0,0 +1,93 @@
++#pragma once
++
++// Strata's learned expert profile (STRP), its ranking rule and its file format,
++// kept dependency-free so a device-free test compiles the .cpp alone (the same
++// rule the route trace follows, src/llama-expert-route-trace.cpp of patch 0069).
++//
++// Two ranking rules, both from Strata (commit 3d6f1718):
++//   xe  its SYCL/xe save (`save_profile`, sycl/src/program/generate.cpp): the
++//       raw routing counts (one a routed pair, its device counter's unit, not a
++//       decayed sum) mixed with the start's ranking as pseudo-counts, no
++//       resident head. `STRATA_PROFILE_PRIOR_ENTRIES` (default 800,000 routed
++//       entries), lambda 2, the prior pair rank's share exp(-2 * rank / n).
++//       A short conversation must not wipe the prior.
++//   cu  its `rank_learned_profile` (src/core/expert_cache.cpp): the resident
++//       pairs by heat, the counted non-resident pairs by heat, then the rest;
++//       ties by the prior's own rank, then the pair's index.
++//
++// The cu rule, read from Strata's source and its save test:
++//   1. the resident pairs, ordered by heat (usage) descending;
++//   2. the non-resident pairs WITH heat > 0, ordered by heat descending;
++//   3. then the remaining pairs (the prior's pairs in the prior's order, then
++//      the fill layer 0..n_layers-1 outer, expert 0..n_expert-1 inner);
++//   every group ties by the prior's rank first, then the pair's index.
++// Strata's `rank_learned_profile` sorts every pair at once with exactly that
++// comparator; the staged form here gives the same order.
++//
++// STRP file: "STRP", u32 version 1, u32 n_layer, u32 n_expert, u32 slots,
++// u32 n_ranked, then n_ranked x (u16 layer, u16 expert), little endian, then
++// the trailing layer x expert rank table (i32 expert -> rank, -1 for a pair
++// the ranking does not hold), as Strata's writer appends it. The reader stops
++// after the pairs, as arcint's does; a writer produces the whole file so it is
++// byte for byte Strata's. The `slots` field is a hint; the reader ignores it.
++
++#include <cstdint>
++#include <string>
++#include <utility>
++#include <vector>
++
++enum class llama_expert_profile_rule {
++    xe,   // Strata's SYCL/xe save: prior mixing, no resident head (the default)
++    cu,   // Strata's rank_learned_profile: resident first, prior as a tie-break
++};
++
++// a swap a cache still has in flight, as its save sees it: the incoming expert
++// has landed (a copy in flight counts as done, Strata does), the outgoing one
++// is still resident only while the host table is in phase 1
++struct llama_expert_profile_swap {
++    int layer;
++    int e_in;
++    int e_out;
++};
++
++// The version and geometry checks; a refusal names the file, the version found
++// and the one read (version before geometry, Strata's _version_test), or the
++// geometry, or why the pairs stopped. On refusal `ranked` is left empty: no
++// partial ranking. `slots` may be any value.
++bool llama_expert_profile_read(const char * path, int n_layers, int n_expert,
++                               std::vector<std::pair<int, int>> & ranked, std::string & err);
++
++// Atomic: a `.tmp` beside `path`, then a rename over it; a refusal (a pair out
++// of range, a short write, a failed rename) leaves an existing file untouched
++// and removes the `.tmp`. `slots = n_ranked`, as Strata's writer uses
++// len(ranked) for both; the trailing rank table is written after the pairs.
++bool llama_expert_profile_write(const char * path, int n_layers, int n_expert,
++                                const std::vector<std::pair<int, int>> & ranked, std::string & err);
++
++// Count one graph's routing into the save's heat: exactly one a routed id, raw
++// (Strata's per-routing-event device counter, the unit the prior is in), ids out
++// of range skipped. Double: a month at ~33 t/s passes float's 2^24 on the
++// hottest pairs. Call it in the cache's count(), never in its adapt(): the heat
++// must accumulate with adaptation off (LLAMA_EXPERT_CACHE_ADAPT_EVERY=0).
++void llama_expert_profile_add_heat(std::vector<double> & heat, int n_expert, const std::vector<int32_t> & ids);
++
++// The cu ranking above. `resident` and `heat` are indexed `layer * n_expert +
++// expert`; a short or missing vector reads as 0 (Strata's empty heat case). A
++// prior pair out of range is skipped; a pair the prior does not name ties last.
++std::vector<std::pair<int, int>> llama_expert_profile_rank(
++    int n_layers, int n_expert, const std::vector<uint8_t> & resident,
++    const std::vector<double> & heat, const std::vector<std::pair<int, int>> & prior);
++
++// The xe ranking: `heat` (the raw routing counts) mixed with the start's
++// ranking as pseudo-counts worth `prior_entries` routed entries, lambda 2, by
++// the prior pair's rank, then Strata's rank_learned_profile with no residents.
++std::vector<std::pair<int, int>> llama_expert_profile_rank_xe(
++    int n_layers, int n_expert, const std::vector<double> & heat,
++    const std::vector<std::pair<int, int>> & prior, double prior_entries, double lam);
++
++// Mark a cache's swaps still in flight, as Strata's save does: every incoming
++// expert is resident (its copy has landed). The outgoing expert stays resident
++// only in phase 1 (the host table still names its slot); at phase 2 the
++// table has already freed it, so the save clears it.
++void llama_expert_profile_mark_pending(int n_expert, std::vector<uint8_t> & resident,
++                                       const std::vector<llama_expert_profile_swap> & pending, int phase);
