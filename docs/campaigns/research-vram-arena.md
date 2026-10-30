@@ -436,3 +436,16 @@ true; DG2 false, `product_helper.inl:426-431`; HEAD defers only above 50 % of VR
 `clCreateBuffer` is therefore populated at its first bind, not at creation (`inferred`; when NEO binds an OpenCL buffer
 was not traced): a candidate root cause for section 5 risk 8 (lazy population) and the loan's `first_touch` term,
 testable by `NEOReadDebugKeys=1 EnableDeferBacking=0` against the default in the same window (question 3).
+
+### 8.6 The probe on the B60 (2026-10-30, `measured-here`)
+
+`tools/l0_vm_arena_probe.c` on the B60, compute-runtime 26.27.39122.11, the Level Zero loader 1.34, the agent stopped,
+0 engine resets: the control run (`EnableLEO=0`) fails at step 1 as designed (no OpenCL device maps to the Level Zero
+device); with `NEOReadDebugKeys=1 EnableLEO=1` the OpenCL device reports "OpenCL 3.0 LEO" with the Level Zero device's
+handle, and every check passes. Page size 2 MiB for a 512 MiB chunk; a 16 GiB reservation and the physical chunks'
+creation leave residency at 0 (backing at map); mapping 4 chunks costs 7.64 ms a chunk and adds exactly 2,048 MiB to
+both this process's `drm-resident-vram0` and the card's `used`; an OpenCL kernel through one `cl_mem` over the range
+fills and verifies across a chunk boundary (0 bad; the wrong-seed red fails every word); moving a chunk to another
+address takes 0.17 ms unmap + 0.03 ms map, the data moves with it and residency stays; destroying a chunk frees
+exactly 512 MiB, creating and mapping one adds it back; 100 lend cycles cost 0.194 ms each with no leak; teardown
+returns everything. What this does not show: the served kernels under LEO (the gate in vram-user-space.md stage 2a).
