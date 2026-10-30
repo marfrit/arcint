@@ -162,3 +162,23 @@ cost is not modelled (`measured-here`, offline):
 4. **The route tail skip is an answer-changing lever.** It gets judged by the
    answer-level bar; Strata gates it off from 90 % cached, where our gate set
    sits.
+
+## Addendum 2026-10-30: a lossy default taken back
+
+Strata 0.2.7 (1d45da3a, 2026-10-26) turned residency-biased routing on by default
+(`STRATA_ROUTE_PRIOR=1.5` on a discrete NVIDIA card of 13 GiB or less): the router
+leans toward experts already in VRAM, so it changes which experts compute a token.
+Three days later 20a63cf0 (#4402, 2026-10-29) took the default back: user reports
+and the project's own agent check (4.5 of 10 tasks with it on, 5.6 with it off) tie
+it to repetition loops and weaker results in long agent sessions; with nothing set
+the engine routes as 0.2.6 again, and 1.5 stays an opt-in. Users of Flash-Next IQ3_S
+on small cards reported misspellings, characters from another script mid-sentence
+and loops on the updated builds (`paper`: the commit message and public reports,
+not measured here). The route tail skip (rank 7, default on CUDA since 0.1.42, item
+4 above) stays on by default.
+
+For arcint this is the quality filter's case in practice (operator, 2026-10-29: only
+levers that do not trade quality for speed): an answer-changing lever is opt-in and
+passes the answer-level bar and the task battery before it can become a default.
+Strata's reference checkout here is at 4b9e05a2 (2026-10-25); upstream was at
+870aedd9 (2026-10-29) when this was written.
