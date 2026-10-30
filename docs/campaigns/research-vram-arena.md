@@ -400,6 +400,9 @@ process's `drm-resident-vram0` (sum over its xe fds in `/proc/self/fdinfo`) and 
    fill + check. 100 lend cycles timed (unmap + map + `clFinish`): the loan's cost per chunk.
 7. Control: `EnableLEO=0` must fail at step 1 (`CL_L0_CONTEXT_HANDLE` unknown to native NEO): proves the bridge is LEO.
 
+Program: `tools/l0_vm_arena_probe.c` (build and run line in its header; written against `ze_api.h` 1.x, not yet compiled or run).
+It covers steps 1-7 with a 100-cycle lend timing; the control is `EnableLEO=0`, which must exit 1 at step 1.
+
 Next, if it passes: `test-backend-ops -b GPUOpenCL` and the deployed answers under `EnableLEO=1` with no arena (LEO's
 own gate), then section 7's question 4 with the range: an arena at `total - 1 GiB` in 512 MiB chunks, a second process
 taking 2 GiB, both clients' resident read - whole chunks expected to move and come back, not the range.

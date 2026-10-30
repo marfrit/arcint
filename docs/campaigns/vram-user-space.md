@@ -69,6 +69,12 @@ not yet told apart.
    stream ring route through it; the slot loan becomes a reassignment of chunk ranges (no free, no create: a constant
    driver footprint). Costs: no contiguity across chunks (a tensor or compute buffer fits one chunk, or the compute
    reserve is split), fragmentation managed by size classes, a chunk can still be evicted whole under outside pressure.
+   The layout removes most of that (operator's point, 2026-10-30): an expert has a deterministic size per layer
+   (its tensor types and shapes; Flash-Next's mixed layer ~2.0 MiB a slot, `code` via prefill-slot-loan-design.md),
+   so slots are slab frames that never fragment (Infernix's FrameLease, `code`); the one large variable consumer, the
+   prompt's compute buffer, takes the lend region - the tail layers' slots, already one contiguous buffer today -
+   whose range changes owner instead of being freed and re-created (Strata's lend region); KV, the stream ring and the
+   grow-only buffers (sized once at the largest ubatch) are fixed carve-outs.
 3. **Neighbours:** `dmem.min` for a unit's cgroup protects it from another cgroup's allocations (the image service,
    a TTS leg on the same card) - an operator decision, priced by a window with both on the card.
 
