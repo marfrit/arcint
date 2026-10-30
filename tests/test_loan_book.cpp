@@ -2484,7 +2484,7 @@ TEST(a_true_shortfall_grows_the_next_lend_and_the_need_rule_refuses_alone) {
     CHECK(!llama_loan_book::size_fits(need + shortfall, lend));
     CHECK(has_between("llama-context.cpp", "bool llama_context::slot_loan_begin", "bool llama_context::slot_loan_end",
                       {"growth_from_shortfall(", "extend_lend(demand, beside, card, need)", "card.need = demand",
-                       "not at a refusal"}));
+                       "the demand is not a refusal term"}));
     // the refusal checks still compare `need`, the shortfall's demand is not one
     CHECK(has_between("llama-context.cpp", "if (!llama_loan_book::size_fits(need, lend))",
                       "bool llama_context::slot_loan_end", {"size_fits(need, lend)", "the resident reserve comes back"}));
@@ -2519,6 +2519,44 @@ TEST(a_short_tail_still_runs_the_loan_at_what_need_alone_requires) {
     // one tail layer is not enough by the rule's arithmetic, two are
     CHECK(!llama_loan_book::size_fits(need, (size_t) (ask.bytes + 1 * layer)));
     CHECK(llama_loan_book::size_fits(need, (size_t) (ask.bytes + 2 * layer)));
+}
+
+TEST(a_card_rule_carries_need_not_the_demand) {
+    // Round 25 (R104): the same two-step growth under the card rule. need 5,120
+    // MiB and a carried 3,072 MiB shortfall -> demand 8,192 MiB; the ask (26
+    // layers, 6,188 MiB) does not meet even `need`, and the 31-layer tail is
+    // 7,378 MiB. The tail is under the demand but the loan's own need fits the
+    // card: used 24,000 of 24,480 MiB + need 5,120 - lend 7,378 = 21,742 MiB.
+    // Step 2's card copy must carry `need`, not the demand: with the demand as
+    // the card's need the same loan is 24,814 MiB and does not fit. Red case:
+    // `own.need = need;` dropped -> the step-2 card check refuses the tail and
+    // this case fails (`g.pick.why` is set, the pick is the ask).
+    const int64_t MiB = 1u << 20, layer = 238 * MiB;
+    std::vector<llama_loan_book::LendCandidate> c;
+    for (int i = 0; i < 31; ++i) c.push_back({true, layer});
+    const auto ask = llama_loan_book::choose_lend_layers(c, (size_t) (6400 * MiB));
+    CHECK_EQ(ask.chosen.size(), 26u);
+    CHECK_EQ(ask.bytes, 26 * layer);
+    const size_t need = 5120 * MiB, shortfall = 3072 * MiB;
+    const size_t demand = need + shortfall;
+    const size_t tail = 31 * layer;
+    CHECK_EQ(tail, (size_t) (7378 * MiB));
+    CHECK(!llama_loan_book::size_fits(demand, tail));       // the demand is beyond the tail
+    CHECK(llama_loan_book::size_fits(need, tail));           // the loan's own rule fits
+    llama_loan_book::CardFacts card;
+    card.query_ok = true;
+    card.total = 24480 * MiB;
+    card.used = 24000 * MiB;
+    card.need = demand;                                      // what the caller's copy carries
+    CHECK(!llama_loan_book::card_fits(card, tail));          // the demand does not fit the card
+    llama_loan_book::CardFacts own = card;
+    own.need = need;
+    CHECK(llama_loan_book::card_fits(own, tail));            // need alone does
+    const auto g = llama_loan_book::extend_lend_toward(c, ask, demand, need, 0, card);
+    CHECK(!g.reached_demand);
+    CHECK(g.pick.why == nullptr);
+    CHECK_EQ(g.pick.chosen.size(), 31u);
+    CHECK_EQ(g.pick.bytes, tail);
 }
 
 TEST(no_shortfall_state_survives_a_clean_loan_or_a_refused_begin) {

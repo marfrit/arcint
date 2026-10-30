@@ -1054,8 +1054,8 @@ index e44535e..6921fef 100644
 +            }
 +            if (grow_by > 0 && !llama_loan_book::size_fits(demand, lend)) {
 +                LLAMA_LOG_WARN("%s: the eviction guard's shortfall %.2f GiB could not be covered by the "
-+                               "lendable tail (the lend is %.2f GiB); the loan runs at the rules it holds, "
-+                               "not at a refusal\n", __func__, grow_by / 1073741824.0, lend / 1073741824.0);
++                               "lendable tail (the lend is %.2f GiB); the demand is not a refusal term, "
++                               "the loan's own rules still decide\n", __func__, grow_by / 1073741824.0, lend / 1073741824.0);
 +            }
 +        }
 +    } catch (const std::exception & e) {

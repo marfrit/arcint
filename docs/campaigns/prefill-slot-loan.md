@@ -1708,6 +1708,22 @@ keeps the measured bytes on a trip, zeroes them on a clean loan, and floor 0
 lets every byte count); R101 asserts the probe's summed figure and query fd in
 values beside its text-order checks.
 
+**R104, the card rule's copy (`code`, red first).** The same two-step growth
+under the kernel's card rule: `need` 5,120 MiB and a carried 3,072 MiB
+shortfall (demand 8,192 MiB); the ask is 26 layers (6,188 MiB), the 31-layer
+tail is 7,378 MiB, and the card reads used 24,000 of 24,480 MiB. The demand as
+the card's `need` does not fit (24,814 MiB); `need` alone does (21,742 MiB),
+and step 2's card copy carries `need`, not the demand. The case asserts the
+values and the 31-layer commit. **The mutation** -- `own.need = need;` dropped
+in `extend_lend_toward` -- was applied, `arcint-test` rebuilt, the case seen
+failing (the step-2 card check refuses the tail: `why` set, the pick is the
+ask), then the line restored and the case green.
+
+**The WARN's wording (`code`).** The round-23 WARN ended `the loan runs at the
+rules it holds, not at a refusal`, which can contradict the card rule's
+refusal right after it. It now reads `the demand is not a refusal term, the
+loan's own rules still decide`; the text case asserts the new phrase.
+
 **The unit's header (`code`).** `contrib/systemd/arcint-flashnext.service`'s loan
 paragraph described round 19/20's fixed 1 GiB margin. It now states the current
 rule: the kernel's device-wide `used`/`total` from the xe memory-regions query on
@@ -1717,7 +1733,19 @@ guard's true shortfall (64 MiB floor) feeds the NEXT lend's growth, never a shed
 or a refusal; the prefill growth allowance is the only addend and defaults to 0;
 the loan flags in the example unit are opt-in.
 
-**Commit and identity (`code`).** One commit on `loan-integration` above
-`qfndev`'s tip, the subject under 72 characters, the round history in the body,
-and the two attribution lines the last paragraph, so
-`git interpret-trailers --parse` reads the `Co-Authored-By`.
+**Commit and identity (`code`).** One commit on the integration branch above
+`qfndev`'s tip, the subject under 72 characters, and the round history in the
+body. The attribution is two parts with one deliberate blank line between
+them -- the implementer line, then the trailer block:
+
+```
+Implemented by meseeks (a private DeepSeek-V4.1-Flash quant, run locally); briefed, reviewed and measured on the cards by Claude.
+
+Co-Authored-By: meseeks (private DeepSeek-V4.1-Flash quant) <noreply@example.invalid>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+```
+
+so `git interpret-trailers --parse` reads both `Co-Authored-By` lines.
+
+The integration commit and the loan follow-ups are the two commits of the
+branch; nothing is pushed.
