@@ -1,3 +1,15 @@
+arcint (1.2.7-1) trixie; urgency=medium
+
+  * 1.2.7: faster decode on every unit and faster prefill on the coder
+    (patches 0064-0067: the MoE router on one sub-group a token, a verify's
+    conv-state snapshots in one launch, the delta-net generation kernel for
+    verify batches, the draft context's unread rows left on the device;
+    --prefill-ubatch). Request cancellation: a client that leaves or a stop
+    signal ends a request at its next token or prefill batch. Runtime:
+    llama.cpp 3e4dfa8, 64 patches; dependencies unchanged.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Fri, 30 Oct 2026 07:00:00 +0100
+
 arcint (1.2.6-1) trixie; urgency=medium
 
   * 1.2.6: the loop guard judges a budget point reached by token stretches

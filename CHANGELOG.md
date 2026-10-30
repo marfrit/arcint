@@ -18,7 +18,7 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
-## Unreleased (qfndev)
+## 1.2.7 — 2026-10-30
 
 Faster decode on every unit and faster prefill on the coder; answers checked
 at the answer-level bar (`docs/campaigns/fusion-coder-night.md`, all
@@ -34,10 +34,11 @@ at the answer-level bar (`docs/campaigns/fusion-coder-night.md`, all
 - `--prefill-ubatch N`: llama.cpp's n_ubatch (default unchanged, 512). 1024 on
   the A770 coder: prefill-41k +15 %, the same answers, +219 MiB VRAM.
 
-Not on any unit yet: `--llama-mtp-vocab` on the coder (+10 to +13 % decode,
-the task 10/10) and Flash-Next (+2.9 %), and `--prefill-ubatch 1024` on the
-coder, are unit changes. The coder with all of it against 1.2.6: decode
-+13.6 / +21.9 / +14.7 %, prefill-41k +15.7 %.
+Unit changes, not defaults: `--llama-mtp-vocab` on the coder (+10 to +13 %
+decode, the task 10/10) and Flash-Next (+2.9 %), and `--prefill-ubatch 1024`
+on the coder (the production units run them since 2026-10-26, coder task 10/10
+twice). The coder with all of it against 1.2.6: decode +13.6 / +21.9 / +14.7 %,
+prefill-41k +15.7 %.
 
 Request cancellation (DESIGN §3.7): a client that leaves and a stop signal end a
 request at its next token or prefill batch, also while nothing is written (a
@@ -55,6 +56,12 @@ abort is answered correctly. Speech and transcription do not cancel yet.
 Quality instruments: `tools/capture_vs_capture.py` compares a candidate against
 a baseline's own run-to-run twin (`--baseline A B --candidate C`) and restricts
 the KL to given token ranges (`--mask`).
+
+**Runtime:** llama.cpp `3e4dfa8` with `contrib/llama.cpp/patches` (64
+patches: 0064-0067 new); dependencies unchanged. `arcint-stt` (1.2.0) and
+`arcint-imggen` (1.1.1) are unchanged. Release check: the install of the
+published package in a fresh container (the operator's call: the unit and
+card ladders had run on the tree).
 
 ## 1.2.6 — 2026-10-25
 
