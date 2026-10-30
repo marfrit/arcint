@@ -564,6 +564,10 @@ json props(const Context& ctx) {
         // leaves it empty on purpose, which is what lets this print null
         // instead of guessing.
         {"cache", {{"kv_dtype", st.kv_precision.empty() ? json(nullptr) : json(st.kv_precision)}}},
+        // The prefill-slot-loan's live state, so a refused request ("state is
+        // out/poisoned/broken") is explained here. "off": no loan configured (the
+        // default), "armed": the cache set one up at load, "out": lent right now.
+        {"slot_loan", {{"state", ctx.backend->slot_loan_state()}}},
         {"mtp", {{"requested", std::string(cfg.llama_mtp > 0 ? "on" : "off")},
                  {"enabled", st.mtp_enabled}}},
         {"dflash", {{"requested", std::string(cfg.llama_dflash_on() ? "on" : "off")},

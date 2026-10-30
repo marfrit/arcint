@@ -302,6 +302,12 @@ std::string usage_text() {
         "                            0 off: always --llama-dflash drafts)\n"
         "  --llama-dflash-ubatch N   the DFlash2 drafter's ubatch, 8-512 (default 64):\n"
         "                            its compute buffer holds N rows of logits\n"
+        "  --llama-slot-loan MIB     lend the expert cache's tail layers' slots to a\n"
+        "                            prompt of more than the resident chunk (2048) and\n"
+        "                            reserve the compute buffers at the prompt's chunk\n"
+        "                            (default 0, off; contrib/llama.cpp 0068)\n"
+        "  --llama-loan-chunk N      the chunk a slot loan may ask for (0: the\n"
+        "                            prefill chunk)\n"
         "  --llama-reserve-cells N   reserve the compute buffers for a prompt ubatch at N\n"
         "                            cache cells, not the whole context; deeper prompt\n"
         "                            chunks take smaller ubatches (0: the whole context)\n"
@@ -424,6 +430,16 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, cfg.llama_dflash_ubatch) || cfg.llama_dflash_ubatch < 8 ||
                 cfg.llama_dflash_ubatch > 512)
                 return fail("--llama-dflash-ubatch needs a ubatch from 8 to 512");
+        } else if (arg == "--llama-slot-loan") {
+            int mib = 0;
+            if (!value(v) || !parse_int(v, mib) || mib < 0)
+                return fail("--llama-slot-loan needs a size in MiB >= 1 (0: off)");
+            cfg.llama_slot_loan_mib = mib;
+        } else if (arg == "--llama-loan-chunk") {
+            int n = 0;
+            if (!value(v) || !parse_int(v, n) || n < 0)
+                return fail("--llama-loan-chunk needs a token count >= 0 (0: the prefill chunk)");
+            cfg.llama_loan_chunk = n;
         } else if (arg == "--llama-reserve-cells") {
             int n = 0;
             if (!value(v) || !parse_int(v, n) || n < 0)

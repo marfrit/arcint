@@ -137,6 +137,16 @@ struct Config {
         return llama_expert_cache_mib > 0;
     }
     int llama_checkpoint_step = 8192;
+    // --llama-slot-loan MIB / --llama-loan-chunk N: the prefill-slot-loan
+    // (docs/campaigns/prefill-slot-loan.md): up to MIB of the expert cache's
+    // tail layers' slots are lent to a prompt, the tail slot buffer and its
+    // lend bank set up at load, and a prompt longer than the resident chunk
+    // borrows them while the compute buffers are reserved at the prompt's
+    // chunk (contrib/llama.cpp 0068). 0 off. --llama-loan-chunk is the chunk a
+    // loan may ask for (0: --prefill-chunk); the buffer without a loan stays
+    // reserved for the resident chunk (min of the two, 2048).
+    int  llama_slot_loan_mib = 0;
+    int  llama_loan_chunk    = 0;
     bool        stub = false;
 
     // The name this endpoint answers to on /v1/models and /props. Empty means

@@ -163,6 +163,12 @@ if(ARCINT_LLAMA)
     if(ARCINT_LLAMA_H MATCHES "llama_model_expert_cache_count")
       target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_EXPERT_CACHE_DEV=1)
     endif()
+    # 0068: the prefill-slot-loan (docs/campaigns/prefill-slot-loan.md)
+    if(ARCINT_LLAMA_H MATCHES "slot_loan_bytes")
+      target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_SLOT_LOAN=1)
+    else()
+      message(WARNING "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0068: --llama-slot-loan is refused")
+    endif()
   else()
     message(WARNING "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0021: --llama-expert-cache is refused")
   endif()
@@ -242,11 +248,16 @@ if(ARCINT_TESTS)
     tests/test_stream_utf8.cpp
     tests/test_stop_think_ids.cpp
     tests/test_decode_stats.cpp
+    tests/test_slot_loan.cpp
+    tests/test_loan_book.cpp
     tests/test_toolgrammar.cpp
     tests/test_disconnect.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+  # round 13: test_loan_book reads the loan-KL driver's rule header
+  # (contrib/llama-loan-kld/loan_kld_book.h), a device-free plain-data header
+  target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/contrib/llama-loan-kld")
   if(ARCINT_LLAMA)
     # test_toolgrammar.cpp runs the generated GBNF through libllama's grammar
     # engine on text (llama-grammar.h, the entry points upstream's own grammar
@@ -256,7 +267,10 @@ if(ARCINT_TESTS)
     # generator's shape and the sampler's constraint hook without them; the
     # record is in tests/test_toolgrammar.cpp's header and in the campaign
     # (docs/campaigns/clean-turns.md, step 2 "the gate").
-    target_include_directories(arcint-test PRIVATE "${ARCINT_LLAMA_DIR}/src")
+    # ... and its include/ for llama.h: test_loan_book's rule cases read
+    # LLAMA_SLOT_LOAN_BYTES_ENV and llama_model_default_params (finding 8's rule
+    # lives in the pinned tree's init and its default params, not in the tool)
+    target_include_directories(arcint-test PRIVATE "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/include")
     # clean-turns step 2's forced-malformed gate on a real vocabulary (vocab-only
     # load, no device). Not a ctest case: it needs the GGUF; run by hand.
     add_executable(arcint-tool-grammar-probe tools/tool_grammar_probe.cpp)
@@ -267,6 +281,12 @@ if(ARCINT_TESTS)
   # the llama backend cannot be constructed without a card).
   target_compile_definitions(arcint-test PRIVATE
     ARCINT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+  if(ARCINT_LLAMA)
+    # test_loan_book.cpp reads the cache's own init: the destructor's buffer list
+    # is built inside a function a unit build cannot call (finding 7, third review)
+    target_compile_definitions(arcint-test PRIVATE
+      ARCINT_LLAMA_SRC_DIR="${ARCINT_LLAMA_DIR}")
+  endif()
   target_compile_options(arcint-test PRIVATE -Wall -Wextra -Wpedantic)
 
   # --max-skips 0: a skip is a failure here unless the case is named with

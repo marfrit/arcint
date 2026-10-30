@@ -333,6 +333,11 @@ public:
     virtual const ModelStatus& status() const = 0;
     virtual Tokenizer&         tokenizer()    = 0;
 
+    // The prefill-slot-loan's current state, as llama_context_slot_loan_state
+    // reports it ("off", "armed", "out", "poisoned", "broken"), for /props and
+    // the request-start refusal. The stub and a backend without the loan: "off".
+    virtual std::string slot_loan_state() const { return "off"; }
+
     // The think tags' token ids the artifact's vocabulary holds as one special
     // token, per pair (ThinkBlockIds::open_close_ids), or empty when none. The
     // reasoning split and the sampler's tracker decide those roles by id; a

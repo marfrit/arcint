@@ -35,6 +35,8 @@ public:
 
     const ModelStatus& status() const override { return st; }
     Tokenizer&          tokenizer() override { return tok_; }
+    std::string         slot_loan_state() const override { return loan_state; }
+    std::string         loan_state = "off";
     std::string          render_chat(const ChatRequest&) const override { return {}; }
     // Never called: props() only reads status() and template_caps().
     FinishReason generate(const GenerationInput&, int, const TokenCallback&,
@@ -85,6 +87,21 @@ TEST(llama_backend_publishes_the_configured_kv_type) {
     const std::string src = ss.str();
     CHECK(src.find("status_.kv_precision  = llama_kv_dtype(cfg);") != std::string::npos);
     CHECK(src.find("kv_precision  = \"") == std::string::npos);
+}
+
+TEST(props_reports_the_slot_loan_state) {
+    // /props names the loan's state ("off" by default, "armed"/"out"/"poisoned"/
+    // "broken" from llama_context_slot_loan_state) so a request refused with
+    // "the slot loan's state is ..." is explained without a log tail.
+    FakeBackend backend;
+    Config     cfg;
+    SlotPool   slots(1);
+    Context    ctx{&cfg, &backend, &slots};
+    CHECK_EQ(lgc::api::props(ctx).at("slot_loan").at("state").get<std::string>(), std::string("off"));
+    backend.loan_state = "armed";
+    CHECK_EQ(lgc::api::props(ctx).at("slot_loan").at("state").get<std::string>(), std::string("armed"));
+    backend.loan_state = "out";
+    CHECK_EQ(lgc::api::props(ctx).at("slot_loan").at("state").get<std::string>(), std::string("out"));
 }
 
 TEST(props_reports_the_served_file_and_what_the_backend_knows) {

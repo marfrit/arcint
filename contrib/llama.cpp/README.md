@@ -3991,3 +3991,299 @@ context's catch-up decodes (`src/exec/llama_spec.cpp`).
 `measured-here`: the coder with the vocabulary, ab.py with vs without the
 patch: prefill-41k 723.25 -> 729.20 t/s, decode equal; Flash-Next with the
 vocabulary: prefill equal to no vocabulary (622.65 / 622.88).
+
+## 0068-llama-prefill-slot-loan.patch
+
+The prefill-slot-loan (`docs/campaigns/prefill-slot-loan.md`): a prompt borrows
+the expert cache's tail layers' slots, the compute buffers are reserved at the
+prompt's ubatch, and the return re-reserves at the resident ubatch, takes the
+tail slot buffer back, refills every lent slot from the lend bank and verifies
+it against the file. The design is `docs/campaigns/prefill-slot-loan-design.md`
+(evidence class on every disposition). The mechanism, `code`:
+
+- the tail slot tensors live in their own buffer at load
+  (`ggml_backend_buft_alloc_buffer_n`, the tensor list -- no byte range, so
+  `n_slots` varying per profile rank and a Q8_0 bank in the same context do not
+  matter); a loan frees it and `sched_reserve()` at the prompt's chunk allocates
+  the compute buffers where it was. The tensors' `buffer`/`data`/`extra` are
+  cleared before the free because the OpenCL `free_buffer` does not clear them,
+  and the re-allocation runs `init_tensor`, which rebuilds the device extras.
+- the lent layers' ex-slot experts stay reachable in a **lend bank** in host
+  memory beside the bank, and the graph builds a third MUL_MAT_ID branch over it
+  (`llama-graph.cpp`), so every tensor a loan graph sees stays under the grouped
+  kernel's `MAX_EXPERT 512` local table: no compile define is raised and the
+  GGUF fallback Strata measured at -26 % prompt with 18 % uncovered is not paid.
+- `n_ubatch_reserve` keeps the resident reserve at the unit's 2,048 while the
+  loan's reserve is the chunk; the effective ubatch is capped by it, so a graph
+  larger than the reserve cannot reallocate through the buffer type and escape
+  the loan.
+- `sched_reserve()` replaces the scheduler (`llama-context.cpp`), and the expert
+  cache binds to the first one it decodes (`llama-expert-cache.cpp`): a loan
+  rebinds (synchronize, zero `ids_pending`, adopt), so adapt runs after the
+  second request too. A swap in flight is finished before the lend, not polled.
+- the arcint side is an RAII scope around `prefill_locked` only, so the last
+  prompt token's decode runs after the refill's wait, and every exit (a throw,
+  wave2a's cancellation) gives the slots back; a request start refuses while a
+  loan is out.
+
+Second review round (`code`, `docs/campaigns/prefill-slot-loan-design.md` §10):
+
+- the lent branch is tested **before** the `n_tokens <= 8` decode branch: while
+  lent the slot tensors have no buffer and no data, and a 1-token tg graph (every
+  `sched_reserve`) or a prompt's 4-token last batch would otherwise allocate them
+  into the compute buffer and read uninitialised bytes.
+- the lend bank is the slots' mirror: both swap sites (the exchange, the adapt
+  queue's phase 2) write the incoming expert's rows into `lend[k]`, host to host;
+  a swap in flight is settled (copies issued and waited, both table halves
+  applied), not only polled.
+- the refill reads back through `get_slices` (which restores a planar type's
+  layout) instead of a raw USM pointer, one staging buffer and a wait a layer:
+  `set_tensor_slices` converts GGUF blocks again, so the planes would verify
+  wrong on every IQ3_S loan.
+- the return's re-reserves cannot throw (`slot_loan_reserve`): they run from a
+  destructor, where a throw is `std::terminate`; a failed return leaves the loan
+  out and the request-start check refuses.
+- `decode`'s cell budget is `ub_cap x n_kv_reserve`, not `n_ubatch x
+  n_kv_reserve`: under a loan the two differ, and a budget off `n_ubatch` takes a
+  graph several times the reserve and reallocates through the buffer type.
+- a lend that cannot be published puts its tables back (the patch's own
+  `src/llama-loan-book.h`, shared with the device-free test), and the tail buffer
+  has its own owner: it is taken out of, and never added to, the list the
+  destructor walks.
+- `slot_loan_bytes` has a "no parameter set" sentinel (`LLAMA_SLOT_LOAN_BYTES_ENV`),
+  so a tool's explicit 0 is off and `LLAMA_SLOT_LOAN_MIB` cannot turn the loan on;
+  `.lend.bank` tensors stay out of the bank stream's learned order.
+
+Third review round (`code`, `docs/campaigns/prefill-slot-loan-design.md` §11):
+
+- an adapt's pending phase is never cleared: a planned, unissued phase (an
+  aborted or failed ubatch returns before `after_graph`) is issued behind a
+  fence and settled, so the phase-1 spares come back and a phase-2 slot is not
+  orphaned (the refill would copy it back and verify it against -1, zeros).
+  The phase state and its transitions are this patch's `src/llama-loan-book.h`,
+  shared with arcint's device-free test.
+- the settle fences before the phase it issues and between the phase-1 tables
+  and the phase-2 copies, as `progress` does: the copies are on the adapt queue,
+  unordered against the compute queue.
+- the lend bank's mirror is once a swap (all three k in one call), outside the
+  k loop: 0.14 GiB a 96-swap adapt instead of 0.42, on the decode thread.
+- a failed resident re-reserve after `sched_new`, or at the loan's return,
+  poisons the context (`slot_loan_poison`): `llama_context_slot_loan_out` reports
+  it, so the request-start check refuses rather than prefilling on a scheduler
+  with no reserve for its shape. A lend whose undo leaves the tables differing
+  marks the cache unusable the same way (`loan_broken`).
+- the lend, the refill and the drop skip a cache with no lend set
+  (`lend_bytes() == 0`, the other card under a layer split) instead of turning a
+  good loan or a good return into a refusal.
+- the refill restores the zero slot (row `n_slots`), which init wrote and the
+  slot branch reads, and the verify covers `s <= n_slots`; `lend_undo` checks
+  the tables again after its undo (its read is the wait) and marks the cache
+  unusable if they still differ.
+- the flag rule lives in the book header and `init` (`resolve_lend_bytes`): only
+  `llama_model_default_params`' sentinel reads `LLAMA_SLOT_LOAN_MIB`; an explicit
+  0 is off. The lend's comment no longer calls the table writes blocking.
+
+Fourth round (the first card run, `code` and `measured-here`;
+`docs/campaigns/prefill-slot-loan-design.md` §13):
+
+- IQ4_NL is lendable. The served Flash-Next IQ3_S has every layer's
+  `ffn_down_exps` in IQ4_NL; the old `no_split()` excluded it, so no layer was
+  lendable and the selection left non-chosen eligible layers marked while no
+  tail context existed -- `ggml_new_tensor_3d` in a null context at load (the
+  segfault, `measured-here`). The swap mirror now reads the bank slice through
+  `get_tensor_slices` and writes the lend slice through `set_tensor_slices`, the
+  converting pair the refill already uses, so the split (scales, quants) layout
+  is never copied raw. A Q8_0 layer stays non-lendable (its bank lives in the
+  slot buffer).
+- the lend set is computed from scratch: every layer `lendable = false`, the
+  scan starts at the tail, skips a non-lendable layer or one that does not fit
+  the remaining budget and continues earlier (the tail buffer is a tensor list,
+  so no contiguity), and only the chosen entries are set. Every loop walks that
+  set. Nothing chosen means the loan is off -- no tail/lend context, every slot
+  in the ordinary buffer, one line `the slot loan lends nothing: <reason>`.
+- the poison policy is the operator's `poison-exit` (2026-10-29):
+  `llama_loan_book::poison_exit` writes one ERROR line naming the step and the
+  counts/layers and exits non-zero, so the unit restarts clean. The context's
+  failed resident re-reserves and the cache's unverified/unallocatable refill
+  and differing undo call it; staying up instead is that one function's body.
+- `slot_loan_begin` initializes the memory module before it replaces the
+  scheduler, so a refusal there leaves the live scheduler intact; the failed
+  loan-reserve path reserves the resident chunk again after the refill, as the
+  return does.
+- `llama_context_slot_loan_state()` ("off", "armed", "out", "poisoned",
+  "broken") is what the request-start refusal names and what `/props` publishes
+  under `slot_loan.state`.
+- `llama_loan_book::ubatch_cap()`/`cell_budget()` keep the loan-off decode path
+  identical: with `reserve_ubatch == n_ubatch` the cap is `n_ubatch` and the
+  budget is `n_ubatch x n_kv_reserve`.
+
+Fifth review round (`code`, `docs/campaigns/prefill-slot-loan-design.md` §14):
+
+- the refill writes a slot tensor whose card layout `set_tensor` builds (IQ4_NL
+  and Q1_0/Q4_0/Q4_1/Q5_0/Q5_1/MXFP4/Q4_K/Q5_K/Q6_K) **whole**, not by slices:
+  the tail buffer's re-allocation installs the plain `ggml_tensor_extra_cl`,
+  while the split layout (IQ4_NL's d/q sub-buffers) exists only after a
+  whole-tensor `set_tensor` write -- as init does. A slice write, the verify's
+  `get_slices`, an adapt copy's regions or a kq weight arg would cast the plain
+  extra to the split one (`q = data_device`, `d = actual_size`: a CL_CHECK
+  abort or silent corruption), on every lent layer of the served model, whose
+  down is IQ4_NL. The refill assembles the `(n_slots+1) x nb2` image (the lend
+  bank's rows plus the zero slot) and writes it with a blocking
+  `ggml_backend_tensor_set`; planar types (IQ3_S, IQ3_XXS, IQ4_XS, IQ2_*, Q2_0)
+  keep the plain extra and the slice path.
+- `poison_exit` is `std::_Exit(70)`, not `std::exit`: static destructors must
+  not run from the generation thread under arcint's mutex (the OpenCL device
+  contexts and the CPU-miss coordinator can hang there, and the unit only
+  restarts on an exit). The line goes through the llama log callback first
+  (`log_line`) and then on stderr with a flush.
+
+Round 7 (`code`, `docs/campaigns/prefill-slot-loan-design.md` §15):
+
+- the refill copies **regions from the lend bank**, not staged host bytes. The
+  bank holds the CARD'S layout (it is filled through `set_tensor`/`set_slices` at
+  load, and every adapt's mirror copies bank bytes already in that layout), so a
+  refill is one non-blocking region copy a tensor from USM host memory into the
+  new slots -- `ggml_backend_opencl_lend_write` (three new proc addresses:
+  `lend_write`, `lend_zero`, `lend_read`) -- with no `(n_slots+1) x nb2` host
+  image, no whole write, no temporary upload buffer and conversion kernel, no
+  plane/GGUF conversion, and one wait at the end instead of one a layer. The
+  measured 2.66-2.86 s for 6.20 GiB (~2.3 GB/s) against the link's 14.3 GB/s was
+  that staging and conversion; the trace line now prints its phases
+  (`stage, write, convert, tables, wait`) so a card run shows where the time goes.
+- the zero slot (row `n_slots`) is filled from a device zero page by
+  `lend_zero` (a copy a region), so no host bytes are held past an enqueue.
+- the split extra is rebuilt **without bytes**: the re-allocated tail buffer's
+  `init_tensor` installs the plain `ggml_tensor_extra_cl`, and `lend_write` calls
+  `ggml_cl_iq4_nl_extra` before it copies (the `iq4_nl_split_tensors` set records
+  which tensors have it). That was the fifth review's whole write; the write path
+  is gone, so no type needs to be named in a rule -- BF16's f16-on-card layout is
+  in the bank's bytes and the copy is exact without it being added anywhere.
+- the refill's check: by default every row of every lent tensor (the zero slot
+  included) is compared **with the lend bank, byte for byte, in the card's
+  layout** (`lend_read` on both, no conversion, no GGUF read) -- the bank's
+  provenance to the file is the load's new `lend bank check` over every lendable
+  row against a read of the file, once, plus every mirror. `LLAMA_SLOT_LOAN_VERIFY=file`
+  is the gate's direct form (GGUF bytes against the file, batched: one read-back
+  a tensor instead of a blocking read a row), `=0`/`off` is the timing arm; a word
+  that is neither is the default, never silently off.
+- Round 8 (`code`, §16): `lend_read` emits a tensor's regions one after the
+  other (`[d x n][q x n]`), so the per-row compare of the round-7 default read
+  the slot's q region against the bank's d region once it passed the scales --
+  ~8/9 rows "differed" on a correct copy and exited 70. Round 9, item 3: both
+  sides are read with the same `n` and compared **row by row inside each region**
+  with the region's own row stride (`lend_compare_rows`); `bad` is a row count
+  like `n` (round 8 added one per tensor while the line said rows) and the first
+  mismatch names its layer, region and row. The zero slot rides in the same pass
+  as the slot image's extra row.
+- `LLAMA_SLOT_LOAN_MUTATE=1` corrupts one DATA byte of a lent row after the
+  copies (`lend_perturb`), which either reference catches and the poison exit
+  fires; the round-7 form skipped a copy, left the slot's split extra unbuilt and
+  the file check's `get_slices` cast a plain extra (an Intel driver segfault, no
+  ERROR line). `=3` skips the lent graph's measurement; after the reserve the
+  actual buffer sum is compared with the sizing's expectation
+  (`reserve_matches`), so the mismatch is deterministic instead of depending on
+  the card's reserve failing. Round 9, item 2: the comparison is `actual <=
+  expect`, not equality -- a buffer shared between bufts counts differently in
+  `sched_reserve_size` and `ggml_backend_sched_get_buffer_size`, so a healthy
+  reserve can legitimately sum below; only actual above the expectation is the
+  defect. Round 10: round 8's `=3` skipped only the lent flag, premised on one
+  more MUL_MAT_ID dst; the code shows the lent branch REPLACES the slot branch
+  and drops both down tables (`llama-graph.cpp:2510-2521`), so the skip RAISES
+  `need` and the check passed on the card (the loan lent and returned normally,
+  `measured-here`). `=3` now measures the graph at the resident chunk while the
+  reserve allocates the prompt's chunk (`measure_tokens`), a real under-count
+  that `actual <= expect` rejects.
+- lendable is only what the region copy is exact for (`region_copyable`):
+  plain-no-extra types, the planar set and IQ4_NL. The bank stores the types
+  `set_tensor` gives a specialised extra (Q1_0, Q4_0, Q4_1, Q5_0, Q5_1, MXFP4,
+  Q8_0, Q4_K, Q5_K, Q6_K) raw, and BF16 raw while the card converts it to f16; a
+  copy there is the old crash or wrong weights with a passing bank check.
+- the plan needs `need + 384 MiB <= lend` (`size_fits`, round 9 item 1 back to
+  round 7's rule): the freed lend bytes are real and the reserve is what stays
+  free beside the plan. Round 8's `headroom_fits` read `ggml_backend_dev_memory`,
+  whose OpenCL form is `free = global_mem_size - 1 GiB` -- a constant, so the
+  check could never fail; it is gone from the loan path.
+- the poison exit drains the compute, adapt and bank-stream copy queues first
+  (`ggml_backend_opencl_drain`), bounded by a 5 s watchdog, so `_Exit` does not
+  tear the address space down under in-flight work (the `xe` page fault and GuC
+  engine reset on both exit-70 arms). Round 9 item 4: the watchdog's
+  `std::thread` construction is guarded (`watchdog_spawn`), because a throw there
+  under the policy would reach `std::terminate` and the exit would not be 70.
+  Round 10: the drain alone was not enough on `MUTATE=4` -- the tail buffer was
+  freed at the lend while the adapt/bank-stream queues could still hold copies
+  over it, and the exit's drain then executed them against released memory (the
+  B60's `xe -ENOENT` and GuC reset, `measured-here`). Every tail-buffer free now
+  drains first (`drain_now`, `drop_tail_buffer`) and the return's poison path
+  drains before it poisons, so no queued command outlives the memory it targets.
+- Round 11: `sched_reserve`'s own `synchronize()` leaves the adapt queue out
+  (`ggml-opencl.cpp:9062`), while `sched_new` replaces the live scheduler and the
+  galloc frees its buffers at once. Every scheduler replace on the loan path now
+  follows a full drain: `slot_loan_reserve` drains before `sched_reserve` and
+  again on a throw, `slot_loan_begin` drains before its own `sched_new`, and a
+  failed/skipped return synchronizes the scheduler and drains before the poison.
+  The cache destructor and `drop_tail_buffer` drain whenever the loan is armed
+  (`lend_bytes_ != 0`, before freeing anything; unchanged with the loan off). A
+  throw inside `slot_loan_begin`'s sizing takes the resident re-reserve and the
+  rebind instead of reaching `Scope::begin` on an unreserved scheduler with a
+  dangling `owner_sched`; a failed tail allocation clears its dangling tensors
+  before the poison. `ggml_opencl: drain: N device(s), compute, adapt and
+  bank-stream queues finished` is the card's proof line (design §19, R36-R39).
+- Round 12: the drains stay, but the surviving `MUTATE=4` fault was not queued
+  work (`code`: no adapt-queue command targets a galloc buffer, and OpenCL
+  retains a `cl_mem` until its commands finish). The card's discriminator was
+  idle time (`measured-here`: `MUTATE=1` is idle hundreds of ms while the refill
+  verifies, no fault; `MUTATE=4` exits microseconds after the last GPU work and
+  faults 3 of 3; direct submission off: no fault, 0 of 3). `std::_Exit` runs no
+  destructor, so the runtime's direct-submission rings are live when `xe` closes
+  the fd; `poison_exit` now waits `LLAMA_SLOT_LOAN_EXIT_IDLE_MS` (default 2,000
+  ms, clamped to 4,000 under the 5 s watchdog) after its drain. The drain line
+  is `GGML_LOG_WARN`: arcint shows WARN and above, and the round-11 card window
+  never saw the INFO line. Card: the default does not fault 3 of 3, idle 0
+  faults 1 of 1, idle 100 does not 1 of 1 (design §20).
+- Round 13: the wait line is written before the sleep, so the log stated an asked
+  value rather than what happened; `poison_exit` now writes a second WARN line
+  after the sleep with the measured elapsed, and the watchdog's thread writes
+  ONE constant line with `write(2)` before `_Exit` (async-signal-safe; the drain
+  may be hung and the log route sits on the lock it holds). `off`/`OFF`/`false`/
+  `no` all read as 0 (round 12's `strcmp("off")` silently took the default for
+  an `OFF` arm). Design §21, R44-R46.
+- Round 14: `LLAMA_SLOT_LOAN_MUTATE=5` is the red case for the branch the KL
+  gate tests -- `mutate_loan_bank_row` moves one lent layer's lend-bank row
+  index by one in the host table before its non-blocking write, so the card reads
+  the neighbour's rows during the prefill; no verify compares a table row (the
+  refill's check compares slot bytes with the bank's), so the run refills,
+  returns and scores, and the WARN line names layer, expert and both rows. Every
+  earlier red arm exited before scoring, and `MUTATE=1` + `VERIFY=off` was a
+  false red (its corruption lands after the prefill). Design §22, R49.
+- Round 17: the fixed-margin rule (operator's decision 2026-10-30):
+  `size_fits` keeps the 384 MiB peak reserve and adds a fixed 1 GiB under the
+  card's total (`kCardMargin`, `kLendMargin` = 1.375 GiB), and
+  `extend_lend_layers` grows the ask-bounded lend one candidate tail layer at a
+  time until `lend - need >= kLendMargin`, stopping at the layer the margin
+  needs (`code`, design §24b). In the cache (`extend_lend`), a grown layer's
+  lend bank is allocated in host memory and filled from the rows its slots hold
+  now, then its resident slot buffer is freed; a candidate outside the ask's
+  pick keeps its slot tensors in its own small buffer (the ask's pick stays in
+  the one tail buffer) until growth frees it, and the refill allocates it back.
+  The tail bounds the growth; when it runs out `slot_loan_begin` refuses into
+  the resident path with one WARN naming `need`, the lend and the fixed margin.
+  The `loan out` line now prints the margin (`lend - need`) beside the fixed
+  one. Device-free: `tests/test_loan_book.cpp` R58-R60.
+- Round 24: the card's fdinfo discovery. The OpenCL runtime opens TWO xe clients
+  per card in one process (a probe client and the real one, `measured-here`,
+  round 22's window), so round 20's unique-pdev match never engaged and the
+  kernel query, the fdinfo figure and the eviction guard were all absent. A
+  card's figure is now the SUM of `drm-resident-vram0` and `drm-resident-gtt`
+  over the distinct `drm-client-id`s whose `drm-pdev` is the device's (dedupe by
+  client id only; the scan's job), and `DRM_XE_DEVICE_QUERY_MEM_REGIONS` is
+  taken on any render fd of that pdev -- `used`/`total` are device-wide.
+  `match_fdinfo` is gone; `sum_fdinfo` returns `FdinfoAgg`, `read_resident`
+  keeps the ggml-sum fallback and tripwire. The load probe stays in
+  `llama_expert_cache::init` after the cache's own buffer allocations and the
+  weights, so the backend's fds exist; its line prints the summed
+  `fdinfo vram0 ... over N client(s)`. Device-free: R99-R102.
+
+`measured-here`: the card's numbers are the campaign's gate (stage 3); this
+patch is stage 1, whose pass bar is the trace lines and the red runs in
+`docs/campaigns/prefill-slot-loan-design.md` §7, §10, §11, §13, §19, §20, §21,
+§22 and §24.

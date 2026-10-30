@@ -5,6 +5,7 @@
 // llama.cpp keeps the weights, the tokenizer, the attention KV and the
 // recurrent (gated delta-net) state, one sequence per lane.
 #include "exec/backend.h"
+#include "exec/slot_loan.h"
 
 #ifdef ARCINT_LLAMA
 
@@ -436,6 +437,11 @@ public:
 #ifdef ARCINT_LLAMA_EXPERT_CACHE
         expert_profile_          = cfg.llama_expert_profile;
         mp.expert_cache_bytes    = static_cast<size_t>(cfg.llama_expert_cache_mib) << 20;
+#ifdef ARCINT_LLAMA_SLOT_LOAN
+        // 0 when the flag is off is an explicit off: LLAMA_SLOT_LOAN_MIB cannot
+        // turn the loan on behind it (slot_loan::lend_param, finding 8)
+        mp.slot_loan_bytes       = slot_loan::lend_param(cfg.llama_slot_loan_mib);
+#endif
         mp.expert_cache_profile  = expert_profile_.empty() ? nullptr : expert_profile_.c_str();
         if (split && ec_on) {
 #ifdef ARCINT_LLAMA_EXPERT_CACHE_DEV
@@ -514,6 +520,20 @@ public:
                       static_cast<double>(ec.bank_bytes) / (1u << 30));
 #endif
         }
+
+#ifdef ARCINT_LLAMA_SLOT_LOAN
+        // the prefill-slot-loan: what the cache set up at load, not what was
+        // asked for (a non-lendable tail or a smaller budget shortens it)
+        llama_slot_loan_info sl{};
+        if (cfg.llama_slot_loan_mib > 0 && llama_model_slot_loan_info(model_, &sl) && sl.bytes > 0) {
+            loan_rule_.enabled    = true;
+            loan_rule_.lend_bytes = sl.bytes;
+            log::info("load", "slot loan: %d tail layers, %lld expert slots, %.2f GiB lendable in host memory",
+                      sl.layers, static_cast<long long>(sl.slots), static_cast<double>(sl.bytes) / (1u << 30));
+        } else if (cfg.llama_slot_loan_mib > 0) {
+            log::warn("load", "--llama-slot-loan: the cache set up no lendable tail (its log says why); off");
+        }
+#endif
 #endif
 
         // The models this engine serves, by the GGUF's own architecture (there
@@ -656,6 +676,17 @@ public:
             cp.n_outputs_max         = 0;   // 0 = llama.cpp's n_batch
             cp.n_outputs_max_per_seq = 0;   // 0 = n_outputs_max
         }
+#ifdef ARCINT_LLAMA_SLOT_LOAN
+        // the loan asks the context for the loan chunk; without a loan the buffers
+        // stay reserved for the resident chunk (a 1,000-token follow-up pays
+        // neither a reserve nor a refill)
+        if (loan_rule_.enabled) {
+            if (lanes_ > 1)
+                throw std::runtime_error("--llama-slot-loan: one lane (a second lane must never see a lent slot)");
+            loan_chunk_          = static_cast<uint32_t>(cfg.llama_loan_chunk > 0 ? cfg.llama_loan_chunk : n_batch_);
+            cp.n_ubatch_reserve  = slot_loan::floor_chunk(loan_chunk_, loan_rule_);
+        }
+#endif
         ctx_               = llama_init_from_model(model_, cp);
         if (ctx_ == nullptr) throw std::runtime_error("llama.cpp could not create a context");
         // llama.cpp pads the context to 256 (llama-context.cpp:291); the caps
@@ -956,6 +987,18 @@ public:
     }
 
     const ModelStatus& status() const override { return status_; }
+#ifdef ARCINT_LLAMA_SLOT_LOAN
+    // /props reads this under the context's lock: "off"/"armed"/"out"/"poisoned"/
+    // "broken". A poisoned or broken state exits the process (patch 0068's
+    // llama_loan_book::poison_exit, operator 2026-10-29), so a live server
+    // reports at worst "out" for a moment or "armed".
+    std::string slot_loan_state() const override {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (ctx_ == nullptr) return "off";
+        const char * st = llama_context_slot_loan_state(ctx_);
+        return st != nullptr ? st : "off";
+    }
+#endif
     Tokenizer&         tokenizer() override { return *tokenizer_; }
     // The ids read once at load; the reasoning split and the sampler's tracker
     // decide the block's roles by them.
@@ -1019,6 +1062,15 @@ public:
         const auto t_prefill = clock_type::now();
         {
             std::lock_guard<std::mutex> lk(mu_);
+#ifdef ARCINT_LLAMA_SLOT_LOAN
+            // A previous request's scope failed and left a loan out: its slots
+            // are not the file's, so answer no request until the operator
+            // restarts. Read under mu_: the loan's state is the context's, and
+            // the scope that changes it runs under the same lock (finding 8).
+            if (!slot_loan::request_start_ok(llama_context_slot_loan_out(ctx_)))
+                throw std::runtime_error(log::format("the slot loan's state is %s; refusing this request (a lent slot must never be read as an expert)",
+                                                     llama_context_slot_loan_state(ctx_) ? llama_context_slot_loan_state(ctx_) : "unusable"));
+#endif
             // The longest prefix this lane still holds is reused; one token is
             // always run, for its logits. A recurrent state cannot step back:
             // where llama.cpp refuses the partial removal the lane resumes from
@@ -1042,9 +1094,11 @@ public:
             // all but the last token, checkpointed along the way; the last
             // runs alone, for its logits
             const size_t n_pre = prompt.size() - 1;
-            if (!prefill_locked(seq, prompt, common, n_pre, have, [&](const int* t, size_t n, size_t at) {
-                    return decode_locked(seq, t, n, at, false);
-                }, in)) {
+            if (!prefill_with_loan_locked(prompt, common, n_pre, have, [&](const std::vector<int>& p, size_t f, size_t e, std::vector<int>& h) {
+                    return prefill_locked(seq, p, f, e, h, [&](const int* t, size_t n, size_t at) {
+                        return decode_locked(seq, t, n, at, false);
+                    }, in);
+                })) {
                 stats.prompt_tokens_prefilled = prefilled_so_far(have, common);
                 stats.abort_cause            = abort_cause_of(in);
                 stats.prefill_seconds        = seconds_since(t_prefill);
@@ -1607,6 +1661,12 @@ private:
         const size_t n_pre     = prompt.size() - 1;
         {
             std::lock_guard<std::mutex> lk(mu_);
+#ifdef ARCINT_LLAMA_SLOT_LOAN
+            // as generate(): a loan left out refuses the request, read under mu_
+            if (!slot_loan::request_start_ok(llama_context_slot_loan_out(ctx_)))
+                throw std::runtime_error(log::format("the slot loan's state is %s; refusing this request (a lent slot must never be read as an expert)",
+                                                     llama_context_slot_loan_state(ctx_) ? llama_context_slot_loan_state(ctx_) : "unusable"));
+#endif
             size_t common = 0;
             while (common < have.size() && common < n_pre && have[common] == prompt[common]) ++common;
             if (common < have.size()) {
@@ -1626,9 +1686,11 @@ private:
             drop_ckpts_after_locked(seq, common);
             have.resize(common);
             stats.cache_hit_tokens = static_cast<int>(common);
-            if (!prefill_locked(seq, prompt, common, n_pre, have, [&](const int* t, size_t n, size_t at) {
-                    return spec_->decode(t, n, at, seq, false) == 0;
-                }, in)) {
+            if (!prefill_with_loan_locked(prompt, common, n_pre, have, [&](const std::vector<int>& p, size_t f, size_t e, std::vector<int>& h) {
+                    return prefill_locked(seq, p, f, e, h, [&](const int* t, size_t n, size_t at) {
+                        return spec_->decode(t, n, at, seq, false) == 0;
+                    }, in);
+                })) {
                 stats.prompt_tokens_prefilled = prefilled_so_far(have, common);
                 stats.abort_cause            = abort_cause_of(in);
                 stats.prefill_seconds        = seconds_since(t_prefill);
@@ -2213,6 +2275,32 @@ private:
 #ifdef ARCINT_LLAMA_EXPERT_CACHE_DEV
     std::vector<llama_expert_cache_info> ec_prev_dev_;   // per card's cache, the same
 #endif
+    slot_loan::Rule   loan_rule_;              // --llama-slot-loan (disabled unless the API is there)
+    uint32_t          loan_chunk_ = 0;         // --llama-loan-chunk (0: the prefill chunk)
+    // the prefill-slot-loan's request scope: begin before the prompt's first
+    // ubatch, end after its last (explicitly, before the last token's decode;
+    // the destructor is the path a throw or a cancellation takes)
+    // false: the prefill was cancelled (a gone client, a stop signal); the
+    // scope's destructor has returned the loan by the time the caller sees it,
+    // so the next request never starts with a loan out
+    template <class Prefill>
+    bool prefill_with_loan_locked(const std::vector<int>& prompt, size_t from, size_t to, std::vector<int>& have,
+                                  Prefill&& prefill) {
+#ifdef ARCINT_LLAMA_SLOT_LOAN
+        const size_t left = to > from ? to - from : 0;
+        slot_loan::Scope loan(loan_rule_, loan_chunk_,
+                              [this](uint32_t chunk) { return llama_context_slot_loan_begin(ctx_, chunk); },
+                              [this]() { return llama_context_slot_loan_end(ctx_); });
+        loan.begin(left);
+        if (!prefill(prompt, from, to, have)) return false;
+        loan.end();   // before the caller's last-token decode: the refill's wait precedes it
+        if (!loan.ok())
+            throw std::runtime_error("the slot loan's refill did not get the slots back exactly; the decode would read wrong rows");
+        return true;
+#else
+        return prefill(prompt, from, to, have);
+#endif
+    }
     // --device GPU.0,GPU.1 --llama-layer-split K: the cards (null-terminated),
     // the MTP model's card, the split; alive for the load
     std::vector<ggml_backend_dev_t> devs_;
@@ -2271,7 +2359,7 @@ private:
     bool                                  windows_ = false;   // named lanes: a KV cell window per lane (0026)
     std::vector<int>                      cap_;       // per lane (seq): its context
     int                                   n_batch_ = 2048;
-    std::mutex                            mu_;    // llama_context is not thread-safe: one call at a time
+    mutable std::mutex                    mu_;    // llama_context is not thread-safe: one call at a time
     // the step combiner (step_combined)
     std::mutex                            comb_mu_;
     std::condition_variable               comb_cv_;
