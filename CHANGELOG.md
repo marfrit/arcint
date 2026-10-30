@@ -63,6 +63,13 @@ patches: 0064-0067 new); dependencies unchanged. `arcint-stt` (1.2.0) and
 published package in a fresh container (the operator's call: the unit and
 card ladders had run on the tree).
 
+**Published** (2026-10-30): `arcint` 1.2.7-1 built by its recipe from the
+v1.2.7 tag tarball (sha256 `da561b3d…`, deb `2e9d44b5…`) and published to the
+trixie repository (index verified); installed from the public repository in a
+fresh trixie container, where the coder answers on the A770 and `/props` names
+1.2.7 (`1d93d5d`). Container image `ghcr.io/marfrit/arcint:20261030T052224`
+(`:edge`) from main. `arcint-stt` stays at 1.2.0-1, `arcint-imggen` at 1.1.1-1.
+
 ## 1.2.6 — 2026-10-25
 
 The loop guard's last 1.2.5 residual fixed, and the release A/B reads decode
