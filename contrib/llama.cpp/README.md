@@ -4492,3 +4492,275 @@ destructor, the layer struct) that the prefill slot loan (0068) already
 changes. Both are therefore regenerated on top of 0068 and exported in series
 order; the whole 0001-0068, 0069, 0070 series applies on the pin and the
 recipe passes (`measured-here`, the recipe line in audit 14a).
+
+## 0071-opencl-intel-moe-int8-dpas.patch
+
+`MUL_MAT_ID` on int8 DPAS for the prompt's routed experts on a sub-group 16
+device (the B60's shapes first): the IQ3_S grid and IQ4_NL values decoded
+in-kernel to s8 pieces, q8_1-style int8 activations per 32, one s8
+8x16x32 DPAS a 32-weight block per 8-pair group, scaled in float by
+(weight `d * (1 + 2 sc)`) x (activation scale). It is Strata's fused form
+(`code`: `sycl/src/prefill/esimd_moe.dp.cpp` `gate_up`/`down`, the ESIMD
+decode of 16 rows a lane and the q8_1 `quantize_rows`; `docs/INTEL.md`'s
++21 % at 1,024 tokens, +12 % at 4,095 on a B70, KL mean 2e-4 nats, top-1
+99.7 %, all `paper`) in OpenCL. The existing grouped-by-expert route is
+reused unchanged; the int8 path routes with `tile = 32` so one route cache
+entry serves a layer's gate/up/down as before.
+
+The OpenCL port differs from ESIMD in three places (`code`):
+- the DPAS operands are built with `intel_sub_group_block_read_us8` from a
+  local 256-weight super-block staged as [block][pair][32 bytes] (a 8-pair
+  group of a block is 256 contiguous bytes; `mul_mm_kq_i8.cl`), where Strata's
+  ESIMD passes raw register blocks;
+- the weight planes are the tile kernel's plane form (patch 0022: IQ3_S
+  `d | qs[64] | qh[8] | signs[32] | scales[4]`, IQ4_NL code and scale
+  planes), IQ3_S's qs and signs read as aligned global `uint` words (the
+  plane form keeps them 4-aligned), where Strata reads the GGUF blocks as
+  stored at 110 / 18 bytes;
+- an expert cache's bank mirrors and the bank stream pass through
+  `ggml_cl_kq_weight_args` as they did for the f16 tiles; the activation has
+  its own preallocated buffers (`prealloc_kq_id8_{q,d}`), so the q8_1 matvec's
+  `prealloc_kq_{xq,xd}` and its `kq_q8` dedup key are untouched. They hold
+  [column][K] codes and [column][K / 32] scales, the fp16 path's activation
+  size (`n_cols = ne11 * ne12`): 21 MB of codes and 2.6 MB of scales at an 8k
+  chunk and K 2560, against 210 MB + 26 MB for [pair][K] (`n_used` 10x, real
+  VRAM at Flash-Next's margin; `measured-here`, the test's byte arithmetic).
+  The quantizer reads columns, not pair indices, so the route buffer needs no
+  -1 fill and a recomputed route does not clear the activation (the columns are
+  unchanged; the dedup key is the tensor, its buffer, offset and size in this
+  graph); the route cache key still carries the path (`rc.i8`) with the tile.
+
+Blocks and scales: the activation block is 32 values, `scale = amax / 127`,
+codes round half away from zero (llama.cpp's q8_1, Strata's `quantize_rows`).
+The integer sum q8_1 also stores is not used here: each 32-block's int32 DPAS
+product is exact and converted to float, then scaled, so no integer `mad` on
+a super-block accumulator is needed (the Q4_K 2D kernel's form is not this
+one). IQ3_S: `d` per 256-block, `sc` per 32 -> `d * (1 + 2 sc)`; IQ4_NL: `d`
+per 32-block. K ascending, one DPAS chain a 32-block; the decode is done once
+per block and applied to every 8-pair group of the tile (as Strata applies a
+decode to every row tile). The quantizer runs one work-item a (column,
+32-block) in 64-wide groups, the column the fp16 kernel's `kq_i8_col`
+`(i % ne11) + t * ne11`, and its dedup entry lets a MoE layer's gate and up
+share one quantization of src1. The activation is staged a 256-weight
+super-block with one barrier pair (not a 32-block), each staged row the pair's
+activation column (as the fp16 kernel stages `xh`), the last group taking the
+remaining blocks when K is not a multiple of 256 (IQ4_NL down is 640). IQ3_S's
+qs and signs planes are read as aligned global `uint` words (the plane form's
+4-alignment: nblk is a multiple of 16 at `ne01 % 16 == 0`), as `lb_expand`
+reads them; qh and the scale byte stay single-byte fields.
+
+Handled formats (`code`): IQ3_S gate/up (K a multiple of 256, 16-row output
+multiples) and IQ4_NL down (K a multiple of 32); any other type, and any
+device at sub-group 8, keeps today's fp16 tile path (`GGML_OPENCL_KQ_MM_ID2`
+or the tile kernel). The int8 kernels are their own program
+(`mul_mm_kq_i8.cl`, built with `build_program_from_source_optional` after the
+XMX program) and only when `GGML_OPENCL_KQ_MM_ID_I8` is set non-empty and not
+0 and the device is not sub-group 8 (`kq_i8_program_wanted` and `sg8`
+directly: the gate runs before `kq_mm_sg` is assigned, so it does not read
+that field's default): the default path pays
+no second program compile a unit start and does not read the int8 sources; a
+build failure there costs the int8 arm only; the dispatch falls back when the
+kernels are null. Switches: `GGML_OPENCL_KQ_MM_ID_I8`
+unset = `0`, fp16 (this patch keeps int8 opt-in; a later commit flips the
+default to auto after recording the B60's KL/task/speed), `0` = fp16,
+`1` = int8 wherever the format is handled and the device is sub-group 16
+with its kernels present, `auto` = int8 while the group's
+mean routed pairs per expert are at or under
+`GGML_OPENCL_KQ_MM_ID_I8_CROSS` (default 128, Strata's measured 130-250 rows
+per expert on a B70, `paper`; the B60's value is owed by the card window),
+and `GGML_OPENCL_KQ_MM_ID_I8_FMT` (a comma or whitespace separated list,
+`\n`/`\r` too, of `iq3_s` and `iq4_nl`, case-insensitive; unset, empty,
+whitespace-only or a value with no token = both, parsed once at the dispatch;
+a format left out takes the fp16 tile; one INFO line at the first int8
+decision names the parsed formats). The mean uses `min(n_expert, pairs)` as the experts touched, never
+understating it.
+
+Card round 3 (`measured-here`, a B60, one announced window, the pin with the
+branch's patches, `GGML_OPENCL_DEVICES=0:0`, `test-backend-ops` from that
+tree): Intel's offline compiler (`ocloc 26.27 -device bmg`, the backend's
+options, `-DSG=16`) compiles the assembled int8 program with 0 errors (with a
+`half` variable restored: 11 errors). Forced int8 on the pre-fix commit
+passes 2 of 12 `MUL_MAT_ID` cases (the matvec ones, n=1 and n=5); every GEMM
+case fails (IQ3_S NaN, IQ4_NL NMSE 1.90), the fp16 arm passes 12/12. The
+defect, named (`code`, then `measured-here`): the kernel's block loop counts
+`kb` in elements of K (`k0 += 256`, `kb += 32`) while the IQ3_S and IQ4_NL
+kernels read it as a 32-block index (`sb = kb / 8`, `p = kb & 7`, `blk = ...
+* n32 + kb`), so the weight reads land beyond the block and, on the last
+experts, out of bounds (a read that can fault the card's engines). The fix is
+the fp16 tile kernel's own arithmetic (`j32 = kb / 32`, `LB_BI` / `LB_P`):
+`sb = kb / 256`, `p = (kb / 32) & 7`, `blk = row * n32 + kb / 32`, in
+`kq_i8_ops.inc` helpers the kernels call. After it forced int8 passes 12/12;
+the red (both 32-block weight scales `ws = 1.f` on top of the fix) fails
+2/12, IQ3_S NMSE 0.86, IQ4_NL NMSE 1.00, no engine reset. Perf (`us/run`,
+fp16 arm -> int8 arm): IQ3_S m=640 k=2560 n=16 2,259.39 -> 1,142.74; IQ4_NL
+m=2560 k=640 n=16 1,199.10 -> 929.77; IQ3_S n=512 8,482.40 -> 4,154.80;
+IQ4_NL n=512 5,035.29 -> 3,825.53. Also fixed here: the program gate now
+reads the device's sub-group before `kq_mm_sg` is assigned, and the dispatch
+conjunction includes the kernels and the sub-group 16 condition, so a
+sub-group 8 device never builds or dispatches the SG16 kernel with an 8x8
+local size.
+
+Card round 4 (`measured-here`, a B60, one announced window, the commit
+`60cf5a6`): `test-backend-ops` on the committed text, forced int8 12/12 at the
+served shapes, the red (both 32-block weight scales `ws = 1.f`) 2/12; int8
+perf (`us/run`): IQ3_S m=640 k=2560 n=16 1,125.75, IQ4_NL m=2560 k=640 n=16
+912.03, IQ3_S n=512 4,156.28, IQ4_NL n=512 3,826.86 (the fp16 floor is round
+3's column). Served Flash-Next IQ3_S (`tools/fn_sweep.py`, the unit's flags,
+switch 0 vs 1, two rounds with the second reversed), prompt t/s fp16 -> int8:
+with the slot loan 2k 229.6/250.6 -> 252.7/245.4 (inside the spread), 8k
+470.4/476.6 -> 474.0/484.5 (+1.2 %), 19k 509.4/514.5 -> 524.1/521.0 (+2.1 %);
+without the loan 8k 442.6/442.3 -> 456.7/456.2 (+3.2 %); decode 32.60/34.18
+vs 33.35/34.08 (equal); the capital right in every arm; 5 of 6 answer md5s
+differ between the arms (a byte tripwire, not the gate). KL (`measured-here`,
+one 8,192-token window, `-ub 2048`, `--n-cpu-moe 48` with the expert cache,
+the device pinned): the red arm PPL 435,809, mean KL +11.5; int8 twice, mean
+KL +0.0059 / +0.0054 nats over the fp16 twins' floor 0.0064 (the 0.03 bar
+passes); argmax 0.9585 both against the twins' 0.9692, -1.07 points, the
+1-point bar fails by 0.07. Strata's activation quantization is the same form
+(`code`, `sycl/src/prefill/moe_fused_iq.dp.cpp`: per 32 values, `amax/127`,
+SwiGLU output to int8 for the down); its own top-1 99.7 % is `paper`.
+Round 5 adds the per-format switch so the next window prices IQ3_S-only and
+IQ4_NL-only against the same reference and fp16 twins, plus a served
+IQ3_S-only arm; a layer whose gate/up are int8 and whose down is fp16 reroutes
+through the cache key's `rc.i8` (`code`), so the route is per call; the
+reroute costs one extra `moe_route_tiles` a layer although both tiles have the
+same geometry, not measured.
+
+Round 6 review (`measured-here`, two compilers): the format parser's string
+literals sat in the `.inc` prepended to the OpenCL program, where a literal is
+`__constant char *`; Intel's offline compiler for the B60 on the exact assembly
+(`.inc` + `mul_mm_kq_f16.cl` + `mul_mm_kq_i8.cl`, `-DSG=16 -cl-std=CL3.0`)
+reported an address-space change and failed with -11, and clang-18 failed the
+same at CL1.2/2.0/3.0, so the test with a clang printed the assembled-program
+FAIL at SG16 and SG8 (exit 1); the backend fell back silently and an int8 arm
+measured the fp16 tile. Fixed (`code`): the `.inc`'s host-only block (dispatch,
+format list, launch sizing) is behind `#ifdef __cplusplus`, which the device
+never sees and the test's `opencl_part` strips; the device-free text check
+rejects a string literal in the `.inc`'s OpenCL part (red: a literal added
+there -> `FAIL opencl: a string literal in the .inc's OpenCL part`). The fix
+is `code`; its clang and card compile are `measured-here` in round 8 (0
+errors).
+
+Round 7 review (`measured-here`, clang-18 `-target spir64 -x cl -cl-std=CL3.0
+-DSG=16` on the backend's assembly): 4 errors "use of undeclared identifier
+'kq_i8_col'". `kq_i8_col` is device code (called by `I8_STAGE`) but round 6
+left it in the host-only block; `-DSG=8` compiled only because the int8
+kernels are under `#if SG == 16`. Fixed (`code`; the compile is
+`measured-here` in round 8, clang-18 SG16/SG8 and the B60 ocloc 0 errors): the device
+helpers (`kq_i8_col`, decode, quantize, indices) sit above the guard, and the
+device-free text check requires every `kq_i8_*` the `.cl` kernels call to be
+defined in the `.inc`'s OpenCL part (red: `kq_i8_col` back in the host block
+-> `FAIL opencl: the kernel calls kq_i8_col, not defined in the .inc's
+OpenCL part`). Also (`code`): `opencl_part` counts nesting; the parser accepts
+`\n`/`\r`, compares case-insensitively, and a no-token value is both; the
+duplicate `const` on `qq` in the shared `mul_mm_kq_f16.cl` text is dropped.
+
+Card round 8 (`measured-here`, a B60, windows 27 and 28, `cecdea0`'s build; no
+kernel change): clang-18 on the assembled program at SG16 and SG8, 0 errors,
+the test with `CLANG` all OK; Intel's offline compiler for the B60 (`-device
+bmg`, the backend's options, `-DSG=16`) 0 errors. `test-backend-ops`
+`MUL_MAT_ID` at the served shapes: the INFO line names the formats (`int8
+DPAS formats: iq3_s,iq4_nl` / `iq3_s`); forced int8 12/12, the red (both
+32-block weight scales `1.f`) 2/12, int8 IQ3_S only 12/12; the eval list
+widened to n = 256, 512, 2048 (a diagnostic edit of the test tree, not in the
+patch), fp16 12/12 and int8 12/12, no multi-tile defect inside the NMSE bar
+5e-4. KL (`measured-here`, one 8,192-token window, `-ub 2048`, `--n-cpu-moe
+48` with the expert cache, the device pinned; the twins were bit-identical to
+the reference: KL 0, argmax 1.000): red PPL 429,684, KL +11.49; IQ3_S gate/up
+only +0.0059 / +0.0039 nats, argmax -2.95 / -2.47 points; IQ4_NL down only
++0.0117, -4.18 points; both +0.0098, -4.27 points. The KL bar (0.03) passes
+every arm, the argmax bar (1 point) fails every arm; window 24's -1.07 points
+came from twins at 0.9692, a noisy floor that day. Served Flash-Next
+(`measured-here`, fp16 vs int8 IQ3_S only, two rounds reversed): 8k with the
+loan 463.8/478.7 vs 475.6/469.7 t/s, 19k 513.0/483.6 vs 511.2/512.1, 8k
+without 444.1/444.8 vs 444.1/437.2, decode 34.13/34.43 vs 34.03/34.17 — no
+gain beyond the spread, the capital right in every arm. Status (`measured-here`):
+opt-in, off by default, not adopted on any unit; owed: the expert GEMM's share
+of the prefill (the profiling step, never run). Strata's own figure (`paper`,
+`docs/INTEL_INT8_EXPERTS.md:83-88`): KL 0.0002, top-1 99.7 % against its FP16
+path on 6,002 teacher-forced positions; ours is one 8K corpus window through
+the expert cache, a different method, the same-method comparison owed.
+
+Round 8's test fixes (`code`): `opencl_part`'s inverted `#else` ternary
+(`st.empty()` must read `skip`, not an empty stack) and a unit case for its
+nesting (red: the ternary inverted -> segfault; restored all OK).
+
+Pricing cases (`code`): the patch adds Flash-Next MUL_MAT_ID cases to
+`tests/test-backend-ops.cpp` in both lists. The eval (correctness) list gets
+IQ3_S 2560 -> 640 gate/up and IQ4_NL 640 -> 2560 down, 512 experts, 10 used,
+16 and 64 tokens, with src1 as a broadcast row (`b=true`, the served gate/up)
+and per-slot (`b=false`); the correctness mode runs that list, not the perf
+list. The perf list gets the same shapes at batch 16 and 512, so `perf`
+prices the fp16 and the int8 arm.
+
+Device-free (`measured-here`): `tests/test-opencl-kq-i8.cpp`, built by the
+llama tests, red-first with one-line mutations each seen failing:
+- the IQ3_S and IQ4_NL s8 decode against ggml's own `dequantize_row_iq3_s`
+  and `dequantize_row_iq4_nl`, value for value, 400 random blocks each
+  (red: the qh 9th index bit dropped -> `FAIL IQ3_S k 4 decode -15 want ...
+  got ...`; the IQ4_NL low nibbles read as the high ones -> `FAIL IQ4_NL k 0`);
+- the 32-value quantizer, its scale and the round-half-away cases at scale 1
+  (red: `rint` -> `FAIL quant: .5 away from zero at scale 1`);
+- the dispatch rule: env 0/1/auto, unset = off in this patch, the
+  sub-group-16 and kernels-present conjunction (`kq_i8_mode` reads both), the
+  crossover boundary (red: `<` for `<=` -> `FAIL at the crossover: int8`; the
+  sub-group/kernels guard removed -> `FAIL dispatch: switch on, SG 8 ->
+  fp16`; auto on SG 8 -> `FAIL dispatch: auto on SG 8 -> fp16`; the pre-patch
+  auto default -> `FAIL unset -> off (this patch)`);
+- the per-format list `kq_i8_fmt_allowed`: unset, empty, whitespace-only
+  (space, tab, `\n`, `\r`) and a no-token value (`,`, ` , , `) are both,
+  names are case-insensitive, `iq3_s` only makes IQ4_NL fp16 and `iq4_nl`
+  only makes IQ3_S fp16, both named, commas and whitespace as separators, an
+  unlisted format and a prefix that is not a token (reds: the final `return
+  1` -> `FAIL fmt: iq3_s only -> IQ4_NL fp16`; the name fixed to `iq3_s` ->
+  `FAIL fmt: iq4_nl only -> IQ3_S fp16`; the whitespace-only line dropped ->
+  `FAIL fmt: whitespace-only -> both`; whitespace dropped from the token
+  delimiter -> `FAIL fmt: whitespace is a separator too`; `\n`/`\r` dropped
+  -> `FAIL fmt: a newline-only value -> both`; the case fold dropped -> `FAIL
+  fmt: names are case-insensitive`; no-token no longer both -> `FAIL fmt: a
+  separators-only value -> both`);
+- the block indices of an element offset `kb` against the fp16 tile kernel's
+  own (`j32 = kb / 32`, `LB_BI` / `LB_P`): IQ3_S's super-block and sub-block
+  and IQ4_NL's 32-block for every `kb` of K 640 and 2560 (reds: `kb / 8` ->
+  `FAIL index: IQ3_S super-block of kb`; `(kb / 32) & 7` -> `FAIL index:
+  IQ3_S sub-block of kb`; `kb` -> `FAIL index: IQ4_NL 32-block of kb`);
+- the program gate: unset, empty, `0` and an unparsable word are not built,
+  `1` and `auto` are (red: `return 1` -> `FAIL program: unset -> not built`);
+- the activation's column: `kq_i8_col`, the fp16 kernel's
+  `(i % ne11) + t * ne11`, a broadcast b's `n_used` pairs sharing one column,
+  and the served 8k sizes (21 / 210 / 42 MB) (red: return the pair ->
+  `FAIL col: slot 9 of token 0 shares the column`);
+- the ASSEMBLED int8 program, as `load_cl_kernels` builds it (`kq_i8_ops.inc`,
+  then `mul_mm_kq_f16.cl`, then `mul_mm_kq_i8.cl`, at `-DSG=16`): the
+  C++-only branch of the `.inc` is behind `#ifdef __cplusplus`, the
+  OpenCL-visible text must carry no C++-only token, the `.inc`'s OpenCL part
+  no string literal (it is `__constant char *`; red: a literal added there ->
+  `FAIL opencl: a string literal in the .inc's OpenCL part`) and every
+  `kq_i8_*` the `.cl` kernels call defined there (red: `kq_i8_col` back in the
+  host block -> `FAIL opencl: the kernel calls kq_i8_col, not defined`), no reserved
+  OpenCL type name (half, float, int, ...) may be used as an identifier, and, when
+  `clang`, `clang-18`, `clang-19` or `$CLANG` is present, the assembled text
+  with a prelude for the Intel subgroup builtins the clang header lacks
+  compiles as OpenCL C at CL3.0, `-target spir64`, `-DSG=16` and `-DSG=8`;
+  each overloaded prelude declaration carries
+  `__attribute__((overloadable))` (without it clang-18 rejects the two
+  same-name f16 DPAS declarations as "conflicting types" and the test exits 1;
+  red: the attribute dropped from one overload -> `FAIL opencl: overloaded
+  prelude declaration ...`). When no clang is found the compile half is skipped
+  and the text checks are the pre-run; the card compile gate runs Intel ocloc
+  on the same text. (reds: `half` as a variable in `I8_STAGE` -> `FAIL opencl: reserved type
+  name half used as an identifier` (the round-3 blocker that failed the
+  program build); `nullptr` -> `FAIL opencl: C++-only token nullptr in the
+  OpenCL part`, the blocker that failed every device's XMX program when the
+  `.inc` was prepended there).
+The kernel helpers and the dispatch rule are one text,
+`ggml/src/ggml-opencl/kernels/kq_i8_ops.inc`; the int8 kernels
+(`kernels/mul_mm_kq_i8.cl`) get it prepended in their own program by a CMake
+embed step (so the embedded build has no runtime include), and a
+non-embedded build copies the `.inc` beside the kernel sources, so the
+runtime never reads it empty.
+
+Owed (no class until run): the expert GEMM's share of the prefill wall and
+the B60 crossover; the same-method quality comparison against Strata's
+teacher-forced form. Commands in
+`docs/campaigns/int8-dpas-prompt-experts.md` §"Card window".
