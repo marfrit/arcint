@@ -1,6 +1,8 @@
 # research-mtp-width-policy: the MTP window width (concept-mining Wave 2, item 13)
 
-Status: research + build plan, no code. Date 2026-10-30. Tree: qfndev at d725dd6.
+Status: research + build plan; section 6 step 1 (the trace and the replay tool) built on branch `mtpw`
+(2026-10-30/31, section 7; rounds 2 and 3 fixed the reviews' findings). The serving path is unchanged. Date 2026-10-30, tree qfndev at d725dd6; the round-1 line
+numbers are read at branch base qfndev `450eca9`.
 Evidence classes: `code` (path:line, read in this session), `paper` (a document or commit message says so),
 `inferred` (reasoned here, not measured), `measured-here` (arcint's own window). References are cited as
 `Strata-ref:`, `Infernix-ref:`, `llama-port:` (the checked-out trees, files read at origin/HEAD or the working tree).
@@ -80,7 +82,7 @@ This is arcint's rule, taken from there. "`--spec 4 --spec-min-p 0.5` adopted; d
   twice the known value (`clamp_sample`, `draft_policy.cpp:55-65`; the 0.1 is `kCostAlpha`, the EMA weight, not a
   sample weight); costs of unmeasured widths are scaled from measured ones by a fixed shape
   `{1, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6}` (`:13, :41-53`); an optional per-card seed table
-  (`STRATA_SPEC_COST_TABLE`, `generate.cpp:18176`) starts the costs known.
+  (`STRATA_SPEC_COST_TABLE`, `generate.cpp:16495-16511`) starts the costs known.
 - Separate from `keep_draft`: `stale()` (`draft_policy.cpp:116`; a width unmeasured for 300 rounds is re-tried) is used
   only in `choose()` (`:142`, `:147`) and `chain()` (`:287`, `:291`), the lookup/suffix paths, not in the MTP rule.
 - It reads only earlier rounds and the current chain's own probabilities, never the target's draws.
@@ -211,7 +213,7 @@ one lane. Do not extend to lanes without the lanes' own measurement (Strata and 
 ### 5.3 Per-unit defaults and why the cost model matters
 
 The cost table is the unit's own and starts seeded, not from the generic shape. Seed it from the first rounds' measured
-times by width (Strata's `STRATA_SPEC_COST_TABLE` form, `generate.cpp:18176`) and let the EMA take over.
+times by width (Strata's `STRATA_SPEC_COST_TABLE` form, `generate.cpp:16495-16511`) and let the EMA take over.
 
 - **Agent (dense 27B, B60, ceiling 5, min-p as the unit has).** Row cost near linear with a cliff between 4 and 5 rows
   (`paper`, stage 3c). Expect the policy to settle at 3-4 on prose and 5 on code and tool calls. Default: ceiling stays
@@ -277,3 +279,267 @@ rounds, tokens a round and accepted drafts. Honor the card SOP before each leg (
 Open before the build, to settle with step 1: whether `t_propose + t_verify` alone matches the start-to-start round time
 (the walk, emit and rollback add to it, and the `cost(t)` that Strata learns is the whole round); whether per-lane
 state in `Lane` survives preemption/checkpoint restore the way `pending` does (`backend_llama.cpp:1683-1684`).
+
+## 7. The trace and the replay (built; rounds 2 and 3 fixed the reviews' findings)
+
+Built on branch `mtpw` from qfndev `450eca9`, arcint only, no llama.cpp patch: the off-by-default trace
+(`src/exec/mtp_trace.h`, `src/exec/llama_spec.{h,cpp}`, `src/exec/backend_llama.cpp`), the stdlib-only replay
+(`tools/mtp_width_replay.py`) and the device-free tests (`tests/test_mtp_trace.cpp`,
+`tests/python/test_mtp_width_replay.py`, the fixture `tests/python/fixtures/mtp_trace_lines.txt`). It does not
+touch the serving path's policy hook (§5.2).
+
+### 7.1 Where the code disagrees with this document (`code`, the reference's source wins)
+
+Read this session: Strata-ref `4b9e05a2`, Infernix-ref `b741710c`, arcint `mtpw`. A label in §1-§6 is not
+evidence; these are the citations and mechanisms that differed when the code was read:
+
+1. **`keep_draft`'s call sites** are `generate.cpp:16513` (the MTP chain) and `:11221` (the suffix path), not
+   `:18126-18205` / `:12292-12299`; the chain loop's replacement of the min-p test is `:16512-16515`.
+2. **The rule's own lines**: `draft_policy.cpp:199-224` (`keep_draft`), `:154-170` (`observe`), `:190-196`
+   (`observe_probs`), `:182-188` (`draft_rate`), `:174-179` (`p_bucket`), `:98-113` (`cost_table_text`), `:40-53`
+   (`cost_ms`), `:55-65` (`clamp_sample`), `:66-74` (`seed_costs`), `:76-93` (`set_context`); the constants
+   `:11-24` and `draft_policy.hpp:25-27, :57-78`. §3.1's `:236-264` is the suffix's rule, not the MTP one's range.
+3. **The trace's shape**: `generate.cpp:16461-16469` (the comment and the `fopen`), `:16768-16770` (the write).
+   It is `"<T> <a> <sfx> <round_ms>"` then `o.spec - 1` probabilities at `%.4f`; it opens `w`, truncating, and the
+   list is zero-padded to the ceiling, so a replay cannot tell a never-drafted row from `p = 0`. arcint's trace
+   (7.2) omits instead, which is what §6 step 1 wanted.
+4. **Strata's round time is start-to-end** (`t0` at `:16752` to `:16765`), not start-to-start: §6's open question
+   is not answered by the reference (`code`). arcint's trace records the round's own duration - its start to the
+   next round's start, a request's last round to the decode loop's exit - *and* `t_propose` / `t_verify`, so
+   both ends are priced. The first format (`mtp1`, round 1) carried the previous round's duration on this
+   round's rows; `mtp2` carries each round's own.
+5. **The reference's cost arm has no floor**: `keep_draft` replaces the `pj >= min_p` test outright, so a draft
+   below the floor is kept when the cost rule wants it. §5.2's "the min-p value stays a floor" is therefore a
+   deviation from the reference (`code`), and the replay defaults to floor-off (`--respect-floor` models ours).
+   The card arm must include min-p 0 for a faithful price.
+6. **arcint's line numbers moved** from d725dd6 through both rounds: the min-p stop is
+   `llama_spec.cpp:628` (§1's `:562-575`), `top_prob` `:354` (`:304-313`), the probability computed only when
+   min-p or the trace asks (`want_p`) `:565-567, :622`, the ceiling `min(p.n_max, n_draft_)` `:568` (§5.2's
+   `:562-567`), the config flags `config.cpp:410-412, :453-454` (§5.2's `:383-385, :416-418`), `StepReq`'s
+   `probs` member and the combined step's `DraftPart` `backend_llama.cpp:2199, :2269`, `walk_verify` called at
+   `:1847` (§5.2's `:1734-1818`), the trace write `:1883-1896` and the buffered last write `:1902-1907`, the
+   request counter `:1745`, `n_uneven_` `:2317`. Cite these by symbol where
+   the numbers are read again: the line numbers have moved once already in this round.
+7. **The gate's answer set**: §5.4 says "four 300-token answers", the code posts five 300-token answers (hash,
+   compiler, tcp, btree, gc) plus the 500-token RFC 4180 request, and its `SWEEP` line means over those six while
+   the capital is checked separately (`code`: `tools/fn_sweep.py:109-118, :203-226`). The code wins; the gate uses
+   fn_sweep's set.
+8. **`fn_sweep.py` had only Flash-Next's flags** and `GPU.0`; to price the agent and the coder in the same window
+   it now takes `--unit flashnext|agent|coder`, `--device`, and `--reverse` for §5.4's reversed second round.
+   Defaults are unchanged (no flag: Flash-Next, GPU.0). The three flag tables disagree and the code says which
+   is which (`code`): `fn_sweep.py`'s flashnext is Wave 1's arm table (11,600 MiB slots, `--llama-mtp-vocab`,
+   min-p 0.5) and does **not** carry the unit's slot-loan flags; `served_check.py`'s flashnext is the release
+   floor (12,000 MiB slots, no draft vocabulary, no loan flags); the systemd unit file carries the loan flags.
+   `fn_sweep.py`'s agent and coder tables equal both `served_check.py`'s and the unit files'. The trace arms of
+   7.4 therefore run the arm's own flags, and `served_check.py` stays the answers' check.
+
+### 7.2 The trace (`code`: `src/exec/mtp_trace.h`)
+
+`ARCINT_MTP_TRACE=<file>` turns it on; unset is OFF. Off is the default and costs one `getenv` a draft step
+(and a round) and one pointer comparison; with it off no probability is computed beyond what min-p already
+needs (`llama_spec.cpp:565-567`: `record`/`want_p` in the chain's `St`, and `pick` gets the null it got
+before), so a run without the variable takes the same code path as before (`code`; that branch's own cost is
+not measured here, and 7.4 runs a trace-off arm per unit next to a trace-on one). On, the trace computes the
+head's top probability per draft, one host pass over the head's logits a draft (~0.8 ms a draft at the code's
+own comment for a 248,320-row head, `llama_spec.cpp:354-361`): a cost the serving path does not pay, which
+prices a trace-on arm's widths high - limitation 6 in 7.3. One line per verify round, appended, in a fixed
+field order (format `mtp2`):
+
+```
+mtp2 req=<request counter> seq=<lane index> pos=<context depth> rows=<verified rows> acc=<accepted>
+     nmax=<ceiling> minp=<floor> tp=<propose ms> tv=<verify ms> ms=<the round's own duration ms>
+     p=<kept probs>[,...]
+```
+
+- `p` holds the head's top probability of every draft the chain kept; when the min-p floor stopped the chain, the
+  stopping draft's probability is appended (it is the draft the floor rejected, the one event the replay needs
+  that the kept list cannot carry). With no drafts, `p=` is empty.
+- `rows` is the verify batch's length (the accepted drafts plus the target's row), `acc` how many were accepted.
+- `ms` is the round's own duration: its start to the next round's start, the request's last round to the decode
+  loop's exit, which answers §6's open question; `tp` and `tv` are the round's own propose and verify halves, so
+  a replay can price the sum against it. The record is buffered one round and written when the next round starts
+  (`backend_llama.cpp:1762, :1789-1795, :1883-1896, :1902-1907`); `ms` <= 0 is unknown and the replay learns no
+  cost from such a line.
+- `req` counts the requests the process served; `seq` is the lane's index, not a request id. A file opens once a
+  process: clearing the variable later stops the writes, changing it later does not redirect them.
+- Off-by-default proof: `tests/test_mtp_trace.cpp` renders records and matches `tests/python/fixtures/
+  mtp_trace_lines.txt` byte for byte, checks the field order, the ceiling-end and floor-stop shapes, and that
+  the variable unset writes nothing; a fifth case turns it on and checks the file opens, appends one line a
+  call and is flushed before the process ends.
+- Scope: MTP only, not DFlash2 (the record is built inside `if (mtp_trace_on() && !dflash_)`); lanes: one file
+  per process, `seq` distinguishes lanes, and a combined step's `tp` is the shared draft step's time for every
+  lane in it, so a multi-lane trace prices per-lane only if the lanes' steps are separate (`code`:
+  `backend_llama.cpp:2269`).
+
+### 7.3 The replay (`code`: `tools/mtp_width_replay.py`, standard library only)
+
+Ports Strata's MTP half of `DraftPolicy`: `cost_ms` with `kShape`, `kCostAlpha` 0.1, `clamp_sample` at 2x the
+known cost, `seed_costs`, `set_context`, `mtp_tokens` (prior `1 + 0.7*(t-1)`, `kPriorN` 4), `observe`'s
+committed-token EMA (`kTokAlpha` 0.05, alpha `max(kCostAlpha, 1/(n+1))`), `draft_rate`, `observe_probs` with
+`kCalDecay` 0.995, `keep_draft` (verbatim, `margin/3`, `kProbes` its own probe), `cost_table_text`; constants
+cited at their `draft_policy.cpp` lines. Per trace it reports the rounds and requests, the fixed width's tokens
+a round and tokens per ms, the policy's expected tokens a round, its rate as the mean of its own E/cost at the
+width it would verify (not E over the mode width's cost), the width histogram, the truncated round's inferred
+tokens and rate (its tokens over its chosen width's cost, summed), the `a(p)` calibration table by 8
+probability buckets (reached/held), and the `tp+tv` against the round's own duration.
+
+`observe_probs` receives only the probabilities the round recorded (`min(rows - 1, len(p))`, `code`:
+`draft_policy.cpp:190-196`): a draft an arm never made never enters the `a(p)` table, and the prior
+`1 + 0.7*(t-1)` (`draft_policy.cpp:118-121`) stands for its width until a round measures one. Not modelled:
+Strata's `observe_chain`/`observe` call *sequence*, which is Strata's own choice of one call a round; the
+replay feeds one per round (`code`: `generate.cpp:16776-16778`).
+
+Limits to name on every report (the tool prints them): (1) an arm at ceiling `ceiling+1` with **min-p 0** is
+needed to see the drafts the policy would have wanted past the ceiling or below the floor; (2) a trace has only
+the widths it ran, so a width's cost is estimated from rounds that ran at it, not measured;
+(3) a truncated round's `acc` is bounded by the chosen width, inferred as `min(acc, chosen-1)+1`, not
+observed; (4) the round time is that round's own, which the reference's policy never saw (Strata's is
+start-to-end); (5) the process-wide state means arms interleave only when one process a trace; (6) **the trace
+pays a host cost**: the head's top probability per draft (~0.8 ms a draft, `llama_spec.cpp:354-361`), absent
+from the trace-off serving path, so a trace-on arm's per-width costs are inflated and the replay leans
+narrower - cover with the trace-off arm per unit (7.4); (7) **T1 is never measured by a trace** (`code`): a
+round's `rows` is 1 + its drafts, and a chunk drafts at least one while the budget allows, so width 1 appears
+only at a budget end, and `--llama-mtp 0` writes no trace - cover with the MTP-off leg's decode t/s, T1's
+round ms = 1000/t_s (`inferred`), passed by `--seed-costs`; and the T1 seed lands beside measured costs that
+were paid with the trace on, so T1 is under-priced against them by limitation 6's host cost (`code`: trace
+writes only with `--llama-mtp N > 0`; the MTP-off leg has no trace); (8) the policy's state is process-wide
+and the trace's `req` restarts per process, so the replay keys a request by (file, req).
+
+Its `--seed-costs` takes Strata's `STRATA_SPEC_COST_TABLE` form (`generate.cpp:16495-16511`, weight 6 rounds,
+`draft_policy.cpp:66-74`); without a seeded or measured cost a width is Strata's `kShape` guess, which the
+report warns about by name. `--costs-from <leg traces>` measures the fixed-width legs' per-width mean round
+ms by context bucket (`measured_costs`, weight 6) and seeds those; an explicit `--seed-costs` value for a
+width wins, and both lose to a round of the arm's own that measured the width. The legs are replayed **alone**
+first to read their per-width ms, then the arm with `--costs-from`: an arm and its legs in one history would
+learn the arm's first rounds by `kShape` and pour the legs' rows into the arm's histogram, E and `a(p)`
+(`code`: the replay's own `seed_costs`, `draft_policy.cpp:66-74`). The `--json` report carries the
+per-width sums under `tp_tv_vs_round_duration` (renamed from an earlier `tp_tv`): the round's own ms against
+propose + verify, which the open question of §5.4 measures.
+
+### 7.4 Card commands (one window each card; honor `docs/sop-card-window.md` first)
+
+Order: Flash-Next on the B60 (GPU.0) first - its row cost is the least linear - then the agent (B60, GPU.0),
+then the coder on the A770 (GPU.1). Ceilings are the unit's +1 (§6 step 1: it needs the drafts the ceiling would
+truncate), min-p 0 and the unit's own. One fresh process an arm, no other lane. Four arm classes a unit: the
+ceiling+1 arm (the drafts the ceiling would truncate), the unit's own floor at the same ceiling, a
+**trace-off** decode next to a trace-on one (limitation 6: the trace pays ~0.8 ms a draft on the host), and an
+**MTP-off** decode (limitation 7: T1 has no trace round; its decode t/s is T1's ms a token). The
+**fixed-width legs** (widths N -> rows N+1, so N runs 1..ceiling+1, one process a width, trace on: the
+rows the floor-free ceiling+1 arm drafts and then truncates) measure the per-width round times
+Strata's cost table needs - without them a width the arms never ran keeps Strata's `kShape` guess, which the
+report warns about. `<arcint>` is the recipe build's binary. Assets as in 5.4's method. The replay procedure
+after the sweeps, per unit: replay the legs **alone** for their per-width ms, then replay the arms with
+`--costs-from` those legs and `--seed-costs` carrying T1 - an arm and its legs in one history would learn the
+arm's first rounds by `kShape` and pour the legs' rows into the arm's histogram, E and `a(p)` (7.3).
+
+Flash-Next (unit: ceiling 3, min-p 0.5; four arms, four legs, the MTP-off leg):
+
+```
+ARCINT_MTP_TRACE=/tmp/mtp-fn-4-p0.txt  tools/fn_sweep.py <arcint> <flash-next.gguf> <assets> fn-4-p0 --unit flashnext --set --llama-mtp 4 --set --llama-mtp-min-p 0
+ARCINT_MTP_TRACE=/tmp/mtp-fn-4-p05.txt tools/fn_sweep.py <arcint> <flash-next.gguf> <assets> fn-4-p05 --unit flashnext --set --llama-mtp 4
+ARCINT_MTP_TRACE=/tmp/mtp-fn-3-p0.txt  tools/fn_sweep.py <arcint> <flash-next.gguf> <assets> fn-3-p0 --unit flashnext --set --llama-mtp-min-p 0
+tools/fn_sweep.py <arcint> <flash-next.gguf> <assets> fn-3-traceoff --unit flashnext
+tools/fn_sweep.py <arcint> <flash-next.gguf> <assets> fn-mtp-off --unit flashnext --no-mtp
+for N in 1 2 3 4 5; do ARCINT_MTP_TRACE=/tmp/mtp-fn-w$N.txt tools/fn_sweep.py <arcint> <flash-next.gguf> <assets> fn-w$N --unit flashnext --set --llama-mtp $N --set --llama-mtp-min-p 0; done
+```
+
+Agent (unit: ceiling 5, no min-p on the unit - so its own floor is 0; the ceiling+1 arm, six legs):
+
+```
+ARCINT_MTP_TRACE=/tmp/mtp-agent-6-p0.txt tools/fn_sweep.py <arcint> <agent.gguf> <assets> agent-6-p0 --unit agent --set --llama-mtp 6
+tools/fn_sweep.py <arcint> <agent.gguf> <assets> agent-5-traceoff --unit agent
+tools/fn_sweep.py <arcint> <agent.gguf> <assets> agent-mtp-off --unit agent --no-mtp
+for N in 1 2 3 4 5 6; do ARCINT_MTP_TRACE=/tmp/mtp-agent-w$N.txt tools/fn_sweep.py <arcint> <agent.gguf> <assets> agent-w$N --unit agent --set --llama-mtp $N; done
+```
+
+Coder (unit: ceiling 4, no min-p; the A770, five legs):
+
+```
+ARCINT_MTP_TRACE=/tmp/mtp-coder-5-p0.txt tools/fn_sweep.py <arcint> <coder.gguf> <assets> coder-5-p0 --unit coder --device GPU.1 --set --llama-mtp 5
+tools/fn_sweep.py <arcint> <coder.gguf> <assets> coder-4-traceoff --unit coder --device GPU.1
+tools/fn_sweep.py <arcint> <coder.gguf> <assets> coder-mtp-off --unit coder --device GPU.1 --no-mtp
+for N in 1 2 3 4 5; do ARCINT_MTP_TRACE=/tmp/mtp-coder-w$N.txt tools/fn_sweep.py <arcint> <coder.gguf> <assets> coder-w$N --unit coder --device GPU.1 --set --llama-mtp $N; done
+```
+
+Then, per unit, the report. First the legs alone - the `fixed` lines give each width's mean round ms, and a
+WARNING says which width the replay would still guess:
+
+```
+python3 tools/mtp_width_replay.py /tmp/mtp-fn-w1.txt /tmp/mtp-fn-w2.txt /tmp/mtp-fn-w3.txt /tmp/mtp-fn-w4.txt
+python3 tools/mtp_width_replay.py /tmp/mtp-agent-w1.txt /tmp/mtp-agent-w2.txt /tmp/mtp-agent-w3.txt /tmp/mtp-agent-w4.txt /tmp/mtp-agent-w5.txt /tmp/mtp-agent-w6.txt
+python3 tools/mtp_width_replay.py /tmp/mtp-coder-w1.txt /tmp/mtp-coder-w2.txt /tmp/mtp-coder-w3.txt /tmp/mtp-coder-w4.txt /tmp/mtp-coder-w5.txt
+```
+
+Then the arms, with those measured legs as the seed and T1 from the MTP-off `SWEEP <tag> decode-mean <t/s>`
+line: T1's round ms = 1000 / t_s (`inferred`), the same for each context bucket until the legs measured a
+`T1` of their own:
+
+```
+python3 tools/mtp_width_replay.py /tmp/mtp-fn-4-p0.txt /tmp/mtp-fn-4-p05.txt --costs-from /tmp/mtp-fn-w1.txt /tmp/mtp-fn-w2.txt /tmp/mtp-fn-w3.txt /tmp/mtp-fn-w4.txt --seed-costs "<1000/t_s>;<1000/t_s>;<1000/t_s>"
+python3 tools/mtp_width_replay.py /tmp/mtp-agent-6-p0.txt --costs-from /tmp/mtp-agent-w1.txt /tmp/mtp-agent-w2.txt /tmp/mtp-agent-w3.txt /tmp/mtp-agent-w4.txt /tmp/mtp-agent-w5.txt /tmp/mtp-agent-w6.txt --seed-costs "<1000/t_s>;<1000/t_s>;<1000/t_s>"
+python3 tools/mtp_width_replay.py /tmp/mtp-coder-5-p0.txt --costs-from /tmp/mtp-coder-w1.txt /tmp/mtp-coder-w2.txt /tmp/mtp-coder-w3.txt /tmp/mtp-coder-w4.txt /tmp/mtp-coder-w5.txt --seed-costs "<1000/t_s>;<1000/t_s>;<1000/t_s>"
+```
+
+An arm's own rounds overwrite the seed where it ran that width, so the seed is a starting value, not a lock;
+the report's `learned cost table` shows which entry is which. §5.4's reversed second round is
+`fn_sweep.py --reverse` on the second sweep; replay those traces the same way (legs to `--costs-from`, arms in
+the report).
+
+and per unit the answers' check (`served_check.py` asks the capital, the needle, the answers; 5.4's items 4 and
+5), single-lane check from the log's `n_uneven_` line.
+
+Not run here: no card was touched this round; every command above waits for Claude's window.
+
+### 7.5 Rounds 2 and 3: the review's findings, all fixed in the one commit
+
+**Round 2**
+
+1. *(high)* `mtp1` priced a round with the **previous** round's duration. Fixed: the record is buffered one round
+   and written at the next round's start; a request's last round measures to the decode loop's exit; the format
+   tag is `mtp2`. Evidence: `code` (`backend_llama.cpp:1762, :1789-1795, :1902-1907`).
+2. *(high)* the first round wrote microseconds (the clock was set just before the first start) and the replay
+   learned it as a width cost. Fixed in 1; the replay treats `ms <= 0` as unknown and learns no cost from it,
+   reported as `unknown_ms`. Evidence: `code`, device-free red test `UnknownTimes`.
+3. *(medium)* at min-p 0 the trace computes `DraftHead::top_prob` per draft (~0.8 ms a draft on the host,
+   `llama_spec.cpp:354-361`), absent from the serving path: a trace-on arm's width costs are inflated toward
+   narrower widths. Fixed by naming it as limitation 6 in 7.3 and adding a trace-off arm per unit in 7.4.
+   Evidence: `code` for the host pass; the inflation's size is `inferred`, not measured this round.
+4. *(medium)* the replay had no way to take Strata's measured cost table. Fixed: `--seed-costs` parses
+   `STRATA_SPEC_COST_TABLE` (`Strata-ref:src/program/generate.cpp:16495-16511`) into the three buckets at weight
+   6 (`draft_policy.cpp:66-74`), and 7.4 runs fixed-width legs so the table is measured, not guessed. Evidence:
+   `code` both sides.
+5. *(medium)* `exp_v` divided the mean expected tokens by the **mode** width's cost, mixing two widths. Fixed:
+   the policy's rate is the mean of its own `best_v` (E over the cost of the width it would verify, `code`:
+   `draft_policy.cpp:199-224`); the truncated rate is its tokens over its chosen width's cost, summed. Red
+   test `FixedWidthNumbers.test_the_policy_rate_is_its_own_e_over_cost_per_round`.
+6. *(medium)* the doc and the tool's docstring said the `--unit` tables equal `contrib/systemd` **and**
+   `served_check.py` for Flash-Next - they do not (7.1 item 8). Fixed: 7.1 names what each table is.
+7. *(low)* `kProbes` is `keep_draft`'s own probe (`draft_policy.cpp:216, :223`), now named at each of the
+   replay's ported functions; the fixture's first line had a kept draft at `p = 0.42` below a min-p 0.5 floor,
+   which the writer cannot make - now `0.66`, and `parse_line` rejects a kept draft below the floor (red test);
+   `mtp_trace_off_by_default` cleared the variable it depends on; a fifth C++ case turns the writer on and
+   checks the file opens, appends and flushes. Evidence: `code`.
+
+**Round 3**
+
+1. *(medium)* §7.4's replay command put a policy arm and its fixed-width legs in ONE history: the costs are
+   learned online in file order, so the arm's first rounds priced by `kShape` and the legs' rows flowed into
+   the arm's histogram, E and `a(p)` (`code`: `replay`'s per-record `observe`). Fixed: the legs are replayed
+   alone for their per-width ms, then the arm with the new `--costs-from <leg traces>`, which builds the seed
+   table from the legs' measured per-width means by context bucket; requests are keyed by (file, `req`) as the
+   counter restarts per process. Red tests `CostsFrom` (the legs' means, the CLI wiring, the request keying).
+2. *(medium)* `exp_tok` took `st.e` after the whole chain; `keep_draft` explores one or two drafts past
+   `st.best_rows`, so E was overstated where the probe was rejected. Fixed: `ChainState` keeps `best_e` beside
+   `best_rows` and the report's E is the chosen width's (`exp_tok`, JSON `expected_e_rounds`). The reviewer's
+   chain: E 1.90, 2.62, 2.764, `best_rows` 3, so E = 2.62. Red test
+   `PolicyExpectedTokens.test_e_is_at_the_chosen_width_not_the_chain_end`.
+3. *(medium, window design)* T1 has no trace round (7.3 limitation 7) and `--llama-mtp 0` writes none. Fixed:
+   named as limitation 7 and the report prints it; `fn_sweep.py --no-mtp` drops the four MTP flags (default
+   unchanged, `--print-flags` for the device-free check) and 7.4 gives each unit an MTP-off leg whose decode
+   t/s is T1's ms a token, passed by `--seed-costs`. Red tests `T1Unmeasured`, `FlagTable`; the t/s-to-ms
+   conversion is `inferred`.
+4. *(low)* named `kProbes` (`KPROBES` at `draft_policy.cpp:22`, used in `keep_draft`); the unknown-`ms`
+   comments say `observe` is skipped entirely; the stale `generate.cpp:18176` citations now read
+   `:16495-16511`; `cost_table_text` names a bucket once per bucket as Strata does (`draft_policy.cpp:105-111`,
+   red test `CostTableText`); 7.1 item 6's refs are the current ones (`:2199, :2269, :1847, :2317`); this
+   section sits after 7.4; the reversed-round sentence names `fn_sweep.py`. Evidence: `code` both sides.

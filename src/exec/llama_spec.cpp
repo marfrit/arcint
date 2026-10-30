@@ -50,6 +50,7 @@
 #include <fstream>
 #include <sstream>
 
+#include "exec/mtp_trace.h"
 #include "exec/spec_state.h"
 #include "exec/token_ids.h"
 #include "util/log.h"
@@ -546,6 +547,8 @@ public:
         struct St {
             int                n = 0, idx = -1, pending = 0;
             bool               on = false;
+            bool               record = false;   // ARCINT_MTP_TRACE: keep the chain's probabilities
+            bool               want_p = false;   // min-p or the trace asks for them
             std::vector<float> row;
         };
         std::vector<St> st(n_parts);
@@ -556,6 +559,12 @@ public:
             DraftPart& p  = parts[k];
             Lane&      ln = lanes_[static_cast<size_t>(p.seq)];
             p.out->clear();
+            // ARCINT_MTP_TRACE (exec/mtp_trace.h): the chain's probabilities, kept
+            // drafts then the floor's stopping draft; `record` is what makes the
+            // head compute one at min-p 0. Null or off: nothing extra computed.
+            st[k].record = p.probs != nullptr && mtp_trace_on();
+            if (st[k].record) p.probs->clear();
+            st[k].want_p = min_p_ > 0.0f || st[k].record;
             st[k].n = std::min(p.n_max, n_draft_);
             if (st[k].n <= 0 || ln.pending <= 0 || ln.base + static_cast<size_t>(ln.pending) != p.pos0) continue;
             // the pending rows with what followed them; the last one's output is draft 0
@@ -605,20 +614,24 @@ public:
                 const float* h    = nullptr;
                 if (head_) {
                     h   = llama_get_embeddings_nextn_ith(ctx_dft_, st[k].idx);   // unmasked: the batch index
-                    tok = h != nullptr ? head_->pick(h, min_p_ > 0.0f ? &prob : nullptr) : -1;
+                    tok = h != nullptr ? head_->pick(h, st[k].want_p ? &prob : nullptr) : -1;
                 } else {
                     const float* l = llama_get_logits_ith(ctx_dft_, st[k].idx);
                     h   = llama_get_embeddings_nextn_ith(ctx_dft_, st[k].idx);
                     tok = l != nullptr ? static_cast<int>(std::max_element(l, l + n_vocab_) - l) : -1;
-                    if (tok >= 0 && min_p_ > 0.0f) prob = DraftHead::top_prob(l, static_cast<size_t>(n_vocab_), l[tok]);
+                    if (tok >= 0 && st[k].want_p) prob = DraftHead::top_prob(l, static_cast<size_t>(n_vocab_), l[tok]);
                 }
                 // Strata's spec-min-p (src/core/mtp.cpp:804): the chain goes on while
-                // the drafts are likely enough to be verified; one below stays out
+                // the drafts are likely enough to be verified; one below stays out.
+                // The trace records that stopping draft's probability too: the replay
+                // needs it to price the width the floor refused to verify.
                 if (h == nullptr || tok < 0 || prob < min_p_) {
+                    if (st[k].record && h != nullptr && tok >= 0) parts[k].probs->push_back(prob);
                     st[k].on = false;
                     continue;
                 }
                 parts[k].out->push_back(tok);
+                if (st[k].record) parts[k].probs->push_back(prob);
                 st[k].row.assign(h, h + n_embd_);
                 any = true;
             }

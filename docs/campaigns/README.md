@@ -130,3 +130,4 @@ paths under `~/src/Strata-ref/`.
 | [research-kv-quantisation](research-kv-quantisation.md) | KV quantisation and prefill cost |
 | [research-agent-lanes](research-agent-lanes.md) | serving an agent and its subagents from one model: per-slot caps, routing, batching lanes with speculative decoding, priority, prefix sharing on hybrid models; llama.cpp, vLLM, SGLang, ExLlamaV3, ollama, MLC-LLM read at source |
 | [research-cold-start](research-cold-start.md) | kernel caches and warm-up |
+| [research-mtp-width-policy](research-mtp-width-policy.md) | the MTP window width (concept-mining item 13): Strata's cost-aware `keep_draft`, ported for pricing; round 1 built the off-by-default round trace and the offline replay (2026-10-31), the card window is owed |

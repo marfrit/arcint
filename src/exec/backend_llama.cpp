@@ -5,6 +5,7 @@
 // llama.cpp keeps the weights, the tokenizer, the attention KV and the
 // recurrent (gated delta-net) state, one sequence per lane.
 #include "exec/backend.h"
+#include "exec/mtp_trace.h"   // the MTP window trace (off by default, ARCINT_MTP_TRACE)
 #include "exec/slot_loan.h"
 
 #ifdef ARCINT_LLAMA
@@ -762,6 +763,7 @@ public:
                                    cp.n_kv_reserve, err);
             if (!spec_) throw std::runtime_error(log::format("--llama-mtp %d: %s", cfg.llama_mtp, err.c_str()));
             n_draft_ = cfg.llama_mtp;
+            mtp_min_p_ = cfg.llama_mtp_min_p;   // the trace records it (exec/mtp_trace.h)
             if (windows_ && !spec_->set_kv_windows(windows.data(), lanes_))
                 log::warn("load", "named lanes: the MTP draft context takes no cell windows; its attention spans "
                                   "the pool's used cells");
@@ -1737,6 +1739,10 @@ private:
 
         // ------------------------------------------------------------- decode
         const auto   t_decode = clock_type::now();
+        // ARCINT_MTP_TRACE's request counter (exec/mtp_trace.h): a per-request
+        // id in the line, not the lane's index, so the replay can split one
+        // process's history per request
+        const unsigned long long req_id = ++mtp_req_;
         FinishReason reason   = FinishReason::Stop;
         int          id_last  = prompt.back();
         std::vector<int> batch;
@@ -1749,6 +1755,12 @@ private:
         };
         std::optional<Decoding> decoding(std::in_place, *this, seq);
         clock_type::time_point last_peer = t_decode - std::chrono::seconds(1);   // first check at once
+        // ARCINT_MTP_TRACE (exec/mtp_trace.h): one record buffered one round, so
+        // each line carries its OWN round's duration - its start to the next
+        // round's start, the last round's to the loop's exit. The previous
+        // format carried round k-1's duration on round k's rows.
+        std::optional<MtpTraceRound> pending_trace;
+        clock_type::time_point       prev_trace_start = t_decode;
         while (true) {
             // A stop signal or a gone client at the token boundary, as the
             // plain loop (DESIGN §3.7).
@@ -1769,16 +1781,32 @@ private:
             if (in.sampler.max_tokens >= 0) budget = std::min(budget, in.sampler.max_tokens - stats.completion_tokens);
             const int n_max = std::max(0, std::min(n_draft_, budget - 1));
             std::vector<int> draft;
+            std::vector<float> probs;   // exec/mtp_trace.h: filled by draft_multi when the trace is on
+            // the round's own bookkeeping: its start, the depth it starts at, and
+            // the start-to-start time the trace records (the doc's open question)
+            const size_t pos0 = have.size();
+            const auto   t_start = clock_type::now();
+            if (pending_trace) {
+                // the previous round ran from prev_trace_start to this start
+                pending_trace->round_ms =
+                    std::chrono::duration<double, std::milli>(t_start - prev_trace_start).count();
+                mtp_trace_write(*pending_trace);
+                pending_trace.reset();
+            }
+            prev_trace_start = t_start;
+            double t_propose_s = 0.0, t_verify_s = 0.0;   // the round's halves, out of the step's block
             {
                 // the step, with the other lanes' steps that are ready: one draft
                 // step for all, then one target decode for all the verifies
                 // (llama.cpp's server drafts and batches its slots the same way);
                 // the rows leave the context under the lock, before another
                 // decode overwrites them
-                StepReq req{ seq, id_last, have.size(), n_max, &draft, &batch, &rows };
+                StepReq req{ seq, id_last, have.size(), n_max, &draft, &batch, &rows, &probs };
                 if (step_combined(req) != 0) throw std::runtime_error("llama_decode failed during verify");
                 stats.draft_propose_seconds += req.t_propose;
                 stats.draft_verify_seconds += req.t_verify;
+                t_propose_s = req.t_propose;
+                t_verify_s  = req.t_verify;
             }
             stats.draft_proposed += static_cast<int>(draft.size());
             ++stats.draft_steps;
@@ -1848,10 +1876,34 @@ private:
                     throw std::runtime_error("llama.cpp refused the draft rollback");
             }
             stats.draft_rollback_seconds += seconds_since(t_r);
+            // one trace record a verify round, off by default (exec/mtp_trace.h):
+            // buffered, because its duration is known only at the next round's
+            // start; the replay needs the per-width round time and the chain's
+            // own probabilities, and a draft never made is absent from `p`.
+            if (mtp_trace_on() && !dflash_) {
+                MtpTraceRound tr;
+                tr.req             = req_id;
+                tr.seq             = seq;
+                tr.pos             = static_cast<long long>(pos0);
+                tr.rows            = static_cast<int>(batch.size());
+                tr.accepted        = w.accepted;
+                tr.nmax            = n_max;
+                tr.min_p           = mtp_min_p_;
+                tr.probs           = probs;
+                tr.t_propose_ms    = t_propose_s * 1000.0;
+                tr.t_verify_ms     = t_verify_s * 1000.0;
+                pending_trace      = std::move(tr);
+            }
             if (w.done) {
                 reason = w.reason;
                 break;
             }
+        }
+        if (pending_trace) {
+            // the request's last round: no next start, so start to the loop's exit
+            pending_trace->round_ms =
+                std::chrono::duration<double, std::milli>(clock_type::now() - prev_trace_start).count();
+            mtp_trace_write(*pending_trace);
         }
         decoding.reset();   // this lane posts no more steps
         stats.decode_seconds = seconds_since(t_decode);
@@ -2144,6 +2196,9 @@ private:
         std::vector<int>*   draft   = nullptr;
         std::vector<int>*   batch   = nullptr;
         std::vector<float>* rows    = nullptr;
+        // ARCINT_MTP_TRACE (exec/mtp_trace.h): the draft chain's probabilities,
+        // handed to the drafter with the draft itself; the lane writes its line
+        std::vector<float>* probs   = nullptr;
         bool                done    = false;
         int                 rc      = 0;
         double              t_propose = 0.0, t_verify = 0.0;
@@ -2211,7 +2266,7 @@ private:
                 std::vector<DraftPart> dparts;
                 dparts.reserve(reqs.size());
                 for (StepReq* q : reqs)
-                    if (q->n_max > 0) dparts.push_back(DraftPart{ q->seq, q->id_last, q->pos, q->n_max, q->draft });
+                    if (q->n_max > 0) dparts.push_back(DraftPart{ q->seq, q->id_last, q->pos, q->n_max, q->draft, q->probs });
                     else q->draft->clear();
                 if (!dparts.empty()) spec_->draft_multi(dparts.data(), dparts.size());
                 t_p = seconds_since(t0);
@@ -2409,6 +2464,9 @@ private:
     std::vector<std::vector<int>>         slot_tokens_;
     std::unique_ptr<LlamaSpec>            spec_;      // --llama-mtp, --llama-dflash-gguf
     int                                   n_draft_ = 0;
+    std::atomic<unsigned long long>       mtp_req_{0};   // requests served, the trace's `req`
+
+    double                                mtp_min_p_ = 0.0;   // --llama-mtp-min-p, for the trace's line
     // --llama-checkpoints: per lane, the recurrent state at token counts the
     // lane's tokens still match, oldest first
     std::vector<std::vector<Checkpoint>>  ckpts_;

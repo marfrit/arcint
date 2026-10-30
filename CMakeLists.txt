@@ -237,6 +237,7 @@ if(ARCINT_TESTS)
     tests/test_text.cpp
     tests/test_config.cpp
     tests/test_verify_walk.cpp
+    tests/test_mtp_trace.cpp
     tests/test_dflash_walk.cpp
     tests/test_spec_state.cpp
     tests/test_token_ids.cpp
@@ -323,6 +324,21 @@ if(ARCINT_TESTS)
   add_test(NAME acceptance-runner
            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/acceptance/selftest.py")
   set_tests_properties(acceptance-runner PROPERTIES LABELS unit)
+
+  # The MTP window trace's replay (campaign research-mtp-width-policy, section 6
+  # step 1): the trace format's round trip, the fixed-width arithmetic and the
+  # port of Strata's cost-aware keep_draft. Standard library only (unittest), so
+  # it runs on a build host with python3 and no packages; device-free.
+  add_test(NAME mtp-width-replay
+           COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_mtp_width_replay.py")
+  set_tests_properties(mtp-width-replay PROPERTIES LABELS unit)
+
+  # tools/fn_sweep.py's flag tables and --no-mtp (the T1 leg), device-free.
+  add_test(NAME fn-sweep-flags
+           COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_fn_sweep_flags.py")
+  set_tests_properties(fn-sweep-flags PROPERTIES LABELS unit)
 
   # The release speed gate's decision function and parser (tests/acceptance/ab.py).
   add_test(NAME acceptance-ab

@@ -36,6 +36,11 @@ struct DraftPart {
     size_t            pos0    = 0;
     int               n_max   = 0;
     std::vector<int>* out     = nullptr;
+    // ARCINT_MTP_TRACE (exec/mtp_trace.h): the head's top probability of every
+    // draft step the chain made, in order, then the stopping draft's when
+    // --llama-mtp-min-p cut the chain. Null: no probability computed beyond
+    // what min-p itself needs, the off switch's zero cost.
+    std::vector<float>* probs = nullptr;
 };
 
 class LlamaSpec {
