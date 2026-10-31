@@ -143,6 +143,11 @@ not yet told apart.
      DG2 command generation, owed the newest compute-runtime in the fresh-host container, and its LEO
      prefill loss (-5.3 % at 41k) is unexplained, owed a profile under both drivers.
 
+   **The newest runtime, 2026-10-31 (`measured-here`, the A770 in the fresh-host container, compute-runtime
+   26.35.39758.10 + IGC 2.41.5, test-backend-ops of 0001-0072):** the default driver 12,867 / 12,881 (the same as on
+   26.27); under LEO the same failures, then the same abort after 4,615 passing cases at MUL_MAT mxfp4 m=2880 n=32
+   k=2880, at the same assertion (`hw_cmds_generated_xe_hpg_core.inl:1898`). The DG2 abort is not fixed in the newest
+   release: route A stays B60-only; the A770 waits for an upstream fix (a report with the reproducer is owed).
 2b. **Route B - a chunk pool on the default driver (if LEO falls short).** Allocate the usable VRAM once at load as a
    fixed set of large `cl_mem` chunks; a ggml buffer type hands out ranges inside them (the backend already addresses
    every tensor as buffer + offset, `data_device` set in one place, `code`); the backend's grow-only buffers and the
