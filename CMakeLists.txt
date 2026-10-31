@@ -89,6 +89,7 @@ add_library(arcint_core STATIC
   src/api/error.cpp
   src/api/handlers.cpp
   src/api/generate.cpp
+  src/api/responses.cpp
   src/http/server.cpp
 )
 target_include_directories(arcint_core PUBLIC
@@ -253,6 +254,7 @@ if(ARCINT_TESTS)
     tests/test_loan_book.cpp
     tests/test_toolgrammar.cpp
     tests/test_disconnect.cpp
+    tests/test_responses.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
