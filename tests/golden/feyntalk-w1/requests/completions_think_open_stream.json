@@ -1,0 +1,7 @@
+{
+  "model": "stub",
+  "prompt": "assistant starts thinking\n<think>\n",
+  "stream": true,
+  "temperature": 0.0,
+  "max_tokens": 256
+}

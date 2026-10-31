@@ -38,4 +38,11 @@ nlohmann::json context_overflow(int prompt_tokens, int n_ctx) {
     return body;
 }
 
+nlohmann::json responses_error(std::string_view message, std::string_view type,
+                               std::string_view code, std::string_view param) {
+    // Same envelope as error_body, named separately so the chat path's bytes
+    // cannot move when the Responses spellings change.
+    return error_body(message, type, code, param);
+}
+
 }  // namespace lgc::api

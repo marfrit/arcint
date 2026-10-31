@@ -1,0 +1,102 @@
+data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"arcint"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"stub"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"backend"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"·"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"no"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"model"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"loaded"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"·"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"stub"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"("},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"stub"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":")"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"\n"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"prompt"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"108"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"tokens"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":","},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"sampler"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"greedy"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"."},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"Gr"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"üße"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"aus"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"der"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"Werkstatt"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"."},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"🧩"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"\n"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{}","name":"read_file"},"id":"call_0","index":0,"type":"function"}]},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk","usage":{"completion_tokens":73,"completion_tokens_details":{"accepted_prediction_tokens":0,"rejected_prediction_tokens":0},"prompt_tokens":108,"total_tokens":181}}
+
+data: [DONE]
+

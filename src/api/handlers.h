@@ -18,6 +18,8 @@
 
 namespace lgc::api {
 
+class ResponseStore;   // api/responses_state.h: the process's in-memory store
+
 // A fixed set of lanes (DESIGN.md §4: /health reports free/total and queue
 // depth). A lane is a memory reservation, not a queue position: N lanes means
 // the startup arithmetic (§7.0.2a) reserved activations, GDN checkpoint rows
@@ -51,6 +53,9 @@ public:
     // unbounded variant: an admission that can wait forever is the failure this
     // milestone replaced with a numbered refusal.
     Lease acquire_for(double timeout_seconds);
+    // Non-blocking, for a continuation's slot affinity: index < 0 = invalid, 0
+    // = taken, else the lease. Never waits and never picks another index.
+    Lease try_acquire(int index);
     void  release(int index);
 
     int total() const;
@@ -88,6 +93,10 @@ struct Context {
     // token or ubatch boundary (DESIGN §3.7). Null outside a server (a test
     // calling the seam directly).
     std::atomic<bool>* stop_flag = nullptr;
+    // The process's in-memory response store (docs/campaigns/feyntalk.md State,
+    // W3). Null outside a server (a test calling the seam directly): then a
+    // continuation cannot resolve and answers previous_response_not_found.
+    std::shared_ptr<ResponseStore> responses;
 };
 
 struct HttpResult {
@@ -156,7 +165,7 @@ std::optional<HttpResult> acquire_slot(const Context& ctx, SlotPool::Lease& out)
 // waited for (--queue-timeout) or refused on its own; another lane is never
 // taken instead.
 std::optional<HttpResult> acquire_slot(const Context& ctx, int lane, SlotPool::Lease& out,
-                                       int& slot);
+                                       int& slot, int affinity_slot = -1);
 
 nlohmann::json health(const Context& ctx);
 nlohmann::json props(const Context& ctx);
@@ -213,6 +222,12 @@ struct PreparedSpeech {
 // is committed — including the context-overflow 400 (§3.8).
 std::optional<HttpResult> prepare_chat(const Context& ctx, const nlohmann::json& body,
                                        PreparedChat& out);
+// The half of prepare_chat that runs after the body is parsed: lane resolution,
+// the template default, render_chat, the sampler and the think state. The
+// Responses route maps its request into a ChatRequest and calls this same
+// function (docs/campaigns/feyntalk.md W1), so there is one prompt builder.
+std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
+                                           PreparedChat& out);
 std::optional<HttpResult> prepare_completion(const Context& ctx, const nlohmann::json& body,
                                              PreparedCompletion& out);
 // /v1/audio/speech: the availability refusals ("this build has no TTS", no

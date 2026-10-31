@@ -135,7 +135,7 @@ enum class FinishReason { Stop, Length, Abort, Loop };
 // Why a request ended as Abort. Both sources leave FinishReason::Abort; the
 // slot line names the cause, because a SIGTERM was logged as "client gone"
 // on the card (DESIGN §3.7). None: the reason was not Abort.
-enum class AbortCause { None, ClientGone, StopSignal };
+enum class AbortCause { None, ClientGone, StopSignal, Cancelled };
 
 const char* finish_reason_name(FinishReason r);
 
@@ -222,6 +222,13 @@ struct GenerationInput {
     // request ends at its next token or batch boundary as Abort. Null when no
     // stop signal exists (a direct call to the seam).
     const std::atomic<bool>* stop = nullptr;
+
+    // Cancel by id (docs/campaigns/feyntalk.md Cancel, W4): the route ORs this
+    // flag into the peer_alive closure, so every boundary check the engine
+    // already makes sees a cancel exactly as it sees a close; `abort_cause_of`
+    // reads it after the stop flag to name the cause. Null when no cancel is
+    // possible (a direct call to the seam).
+    std::shared_ptr<std::atomic<bool>> cancel;
 };
 
 struct GenerationStats {

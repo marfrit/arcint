@@ -88,6 +88,10 @@ add_library(arcint_core STATIC
   src/exec/backend_stub.cpp
   src/api/error.cpp
   src/api/handlers.cpp
+  src/api/generate.cpp
+  src/api/responses.cpp
+  src/api/responses_stream.cpp
+  src/api/responses_state.cpp
   src/http/server.cpp
 )
 target_include_directories(arcint_core PUBLIC
@@ -254,6 +258,7 @@ if(ARCINT_TESTS)
     tests/test_loan_book.cpp
     tests/test_toolgrammar.cpp
     tests/test_disconnect.cpp
+    tests/test_responses.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
@@ -300,6 +305,17 @@ if(ARCINT_TESTS)
 
   add_test(NAME roundtrip
            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/roundtrip.sh" "$<TARGET_FILE:arcint>")
+
+  # Review R5 (docs/campaigns/feyntalk.md): W1 splits prepare_chat, and a green
+  # suite does not prove the served bytes stayed the same. The checked-in
+  # capture of the chat and completions routes on the stub backend is compared
+  # byte for byte, with only the ids and `created` normalised (normalise.py
+  # names them and why). A refactor that moves one byte of these bodies fails
+  # here.
+  add_test(NAME feyntalk-golden
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/feyntalk-w1/compare.sh"
+                   "$<TARGET_FILE:arcint>")
+  set_tests_properties(feyntalk-golden PROPERTIES TIMEOUT 120 LABELS unit)
   # roundtrip.sh exits 77 with a reason when curl or python3 is missing. That
   # is deliberately NOT a ctest skip here: the package recipe gates on
   # `-L unit`, and a builder without curl must fail that gate, not pass it with

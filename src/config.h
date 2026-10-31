@@ -215,6 +215,12 @@ struct Config {
     // queue from a hang. A non-zero value restores queueing for deployments
     // that prefer it, and /health reports the queue depth either way.
     double queue_timeout_s = 0.0;
+    // The Responses store (docs/campaigns/feyntalk.md State): per-lane entries,
+    // retained bytes and TTL, in seconds. entries == 0 disables retention
+    // entirely (review R4); 0 bytes disables the byte bound.
+    int responses_store_entries = 32;
+    int responses_store_bytes   = 16 * 1024 * 1024;
+    int responses_store_ttl_s   = 24 * 60 * 60;
 
     // Prefill chunk in tokens (llama.cpp's n_batch), 0 = the default 2048.
     // Bounding the chunk bounds activation memory, which is how deep context
