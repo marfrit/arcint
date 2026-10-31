@@ -237,7 +237,14 @@ void remember(const Context& ctx, const PreparedResponse& prep,
     e->prompt_tokens = prep.chat.prompt_tokens;
     e->prompt_ids    = prep.chat.input.prompt_ids;
     e->prompt        = prep.chat.input.prompt;
-    e->prefix_hash   = sha256_hex(e->prompt);
+    // feyntalk W3.5: a truncated turn served a prompt with replayed reasoning
+    // dropped, while e->chat keeps the full history. The continuation re-renders
+    // the FULL history and drops reasoning again under its own truncation
+    // field, so the prefix check compares render(e->chat); the hash is taken
+    // over that full render, not over the served (truncated) prompt.
+    e->prefix_hash   = prep.chat.truncation.blocks_dropped > 0
+                           ? sha256_hex(ctx.backend->render_chat(e->chat))
+                           : sha256_hex(e->prompt);
     e->usage         = resource.contains("usage") ? resource["usage"] : nlohmann::json(nullptr);
     e->error         = resource.contains("error") ? resource["error"] : nlohmann::json(nullptr);
     e->incomplete_details = resource.contains("incomplete_details") ? resource["incomplete_details"]

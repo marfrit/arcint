@@ -48,6 +48,14 @@ json usage_json(const GenerationStats& s) {
 // One list for the two consumers: the decode line prints the counters when one
 // moved, and the response carries the object on the same condition. An eighth
 // counter is added here, once.
+json truncation_json(const TruncationReport& t) {
+    return json{{"blocks_dropped", t.blocks_dropped},
+                {"tokens_freed", t.tokens_freed()},
+                {"prompt_tokens_before", t.tokens_before},
+                {"prompt_tokens_after", t.tokens_after},
+                {"reserve", t.reserve}};
+}
+
 bool loop_guard_moved(const GenerationStats& stats) {
     return stats.loop_detections || stats.loop_nudges || stats.loop_slaps || stats.loop_aborts
            || stats.loop_self_closes || stats.loop_door_masked || stats.loop_door_eog_masked

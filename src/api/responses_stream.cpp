@@ -326,6 +326,17 @@ private:
             if (!send(context)) return false;
         }
 
+        // feyntalk W3.5: the fit pass's numbers, when this turn dropped replayed
+        // reasoning to fit the context. Same fields as the non-streamed
+        // arcint.truncated object, plus the extension envelope.
+        if (prep_.truncation.blocks_dropped > 0) {
+            json truncated = truncation_json(prep_.truncation);
+            truncated["type"]        = "arcint:truncated";
+            truncated["v"]           = 1;
+            truncated["response_id"] = prep_.id;
+            if (!send(truncated)) return false;
+        }
+
         // A cancel is a named arcint event before the terminal incomplete (the
         // spec has no cancelled state; incomplete(cancelled) is the nearest).
         if (reason == FinishReason::Abort && stats.abort_cause == AbortCause::Cancelled) {

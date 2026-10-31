@@ -671,6 +671,17 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
     return prepare_from_chat(ctx, std::move(req), out);
 }
 
+// feyntalk W3.5: clear the oldest non-empty replayed reasoning block in the
+// render copy. Messages, tool calls and tool outputs stay exactly as they came.
+static bool drop_oldest_reasoning(std::vector<ChatMessage>& messages) {
+    for (ChatMessage& m : messages) {
+        if (m.reasoning.empty()) continue;
+        m.reasoning.clear();
+        return true;
+    }
+    return false;
+}
+
 // The half of the old prepare_chat that runs after the body is parsed: lane
 // resolution, the template default, the render, the sampler and the think
 // state. The Responses route maps its request into a ChatRequest and calls this
@@ -678,7 +689,6 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
 // (docs/campaigns/feyntalk.md W1).
 std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req, PreparedChat& out,
                                             const PromptFit* fit) {
-    (void)fit;   // W3.5 scaffolding (red-first): the fit pass is not built yet.
     // The lane first: its name may be a 404, and its cap is the 400's
     int lane = -1;
     if (auto err = resolve_lane(ctx, req.model, lane)) return err;
@@ -732,7 +742,42 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
         prep.input.parallel_tool_calls = prep.req.parallel_tool_calls;
     }
 
-    const std::string prompt = ctx.backend->render_chat(prep.req);
+    std::string prompt;
+    if (fit != nullptr && fit->drop_reasoning) {
+        // feyntalk W3.5: `truncation: "auto"`, reasoning first. The render copy
+        // is local: prep.req (the echo and the stored state) keeps the full
+        // history. Drop one replayed reasoning block at a time, oldest first,
+        // re-render and recount until the prompt fits n_ctx - reserve. Only
+        // ChatMessage::reasoning is cleared -- no message body, tool call or
+        // tool output is dropped or edited. The most recent assistant turn's
+        // reasoning is the last to go because the loop walks messages in order.
+        ChatRequest render_req = prep.req;
+        const int   n_ctx      = lane_n_ctx(ctx, lane);
+        const int   limit      = n_ctx > 0 ? n_ctx - fit->reserve : 0;
+        auto render = [&] { return ctx.backend->render_chat(render_req); };
+        auto count  = [&](const std::string& p) {
+            return static_cast<int>(ctx.backend->tokenizer().encode(p).size());
+        };
+        prompt = render();
+        const int before = count(prompt);
+        int       tokens = before;
+        int       blocks = 0;
+        while (n_ctx > 0 && tokens > limit && drop_oldest_reasoning(render_req.messages)) {
+            ++blocks;
+            prompt = render();
+            tokens = count(prompt);
+        }
+        prep.truncation.blocks_dropped = blocks;
+        prep.truncation.tokens_before  = before;
+        prep.truncation.tokens_after   = tokens;
+        prep.truncation.reserve        = fit->reserve;
+        if (n_ctx > 0 && tokens > limit) {
+            const int over = tokens - limit;
+            return HttpResult{400, context_overflow_truncated(tokens, n_ctx, fit->reserve, blocks, over)};
+        }
+    } else {
+        prompt = ctx.backend->render_chat(prep.req);
+    }
     // The template decides whether the answer starts inside a think block; the
     // split of reasoning from content below follows that, not a guess.
     prep.think_tags_extended = ctx.backend->status().think_tags_extended;

@@ -38,6 +38,21 @@ nlohmann::json context_overflow(int prompt_tokens, int n_ctx) {
     return body;
 }
 
+nlohmann::json context_overflow_truncated(int prompt_tokens, int n_ctx, int reserve,
+                                         int blocks_dropped, int still_over) {
+    nlohmann::json body = error_body(
+        log::format("reasoning dropped: %d blocks, still %d over. prompt is %d tokens, context is "
+                    "%d, generation reserve %d: compaction client-side is still needed and retry.",
+                    blocks_dropped, still_over, prompt_tokens, n_ctx, reserve),
+        "invalid_request_error", "context_length_exceeded", "messages");
+    body["error"]["prompt_tokens"] = prompt_tokens;
+    body["error"]["n_ctx"]         = n_ctx;
+    body["error"]["overflow"]      = still_over;
+    body["error"]["fit_reserve"]   = reserve;
+    body["error"]["reasoning_dropped_blocks"] = blocks_dropped;
+    return body;
+}
+
 nlohmann::json responses_error(std::string_view message, std::string_view type,
                                std::string_view code, std::string_view param) {
     // Same envelope as error_body, named separately so the chat path's bytes

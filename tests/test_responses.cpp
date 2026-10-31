@@ -1857,6 +1857,15 @@ namespace {
 // operator's --think-ctx-reserve overrides both.
 constexpr int kDefaultFitReserve = 256;
 
+// Long enough to matter under the stub's run-based tokenizer (a run of one
+// repeated character is ONE token; words are what count), so the fit pass has
+// real tokens to free.
+std::string reasoning_text(const char* tag) {
+    std::string out;
+    for (int i = 0; i < 30; ++i) out += std::string(tag) + " reason about the port line ";
+    return out;
+}
+
 // A replayed tool loop with two RENDERED reasoning blocks: the last user
 // message sits before both assistant turns, which is the stub template's
 // Qwen3 rule (reasoning only for assistant turns after the last user).
@@ -1870,7 +1879,7 @@ ResponseRequest replay_request(std::string truncation) {
     ChatMessage a1;
     a1.role      = "assistant";
     a1.content   = "checking the config";
-    a1.reasoning = std::string(320, 'o') + " OLD-REASON";
+    a1.reasoning = reasoning_text("OLD") + " OLD-REASON";
     ToolCall c1;
     c1.id        = "call_0";
     c1.name      = "read_file";
@@ -1883,7 +1892,7 @@ ResponseRequest replay_request(std::string truncation) {
     ChatMessage a2;
     a2.role      = "assistant";
     a2.content   = "reading it back";
-    a2.reasoning = std::string(320, 'n') + " NEW-REASON";
+    a2.reasoning = reasoning_text("NEW") + " NEW-REASON";
     ToolCall c2;
     c2.id        = "call_1";
     c2.name      = "read_file";
@@ -1995,8 +2004,8 @@ TEST(responses_truncation_auto_exhausted_is_the_same_400_with_counts) {
     CHECK_EQ(e["code"].get<std::string>(), std::string("context_length_exceeded"));
     const std::string msg = e["message"].get<std::string>();
     CHECK(msg.find("reasoning dropped: 2 blocks, still 1 over") != std::string::npos);
-    CHECK_EQ(e["prompt_tokens"].get<int>(), two);
-    CHECK_EQ(e["n_ctx"].get<int>(), two + kDefaultFitReserve - 1);
+    CHECK_EQ(err->body["prompt_tokens"].get<int>(), two);
+    CHECK_EQ(err->body["n_ctx"].get<int>(), two + kDefaultFitReserve - 1);
     CHECK(!err->body.contains("arcint"));   // a refusal is not a response
 }
 
@@ -2096,7 +2105,9 @@ TEST(responses_sse_truncated_event_reports_the_fit_pass) {
 TEST(responses_truncation_auto_continuation_keeps_the_full_store) {
     ResponseRequest r = replay_request("auto");
     const int       one = tokens_without_first(r);
-    Fixture fx(one + kDefaultFitReserve);
+    // 128 tokens of extra room: the continuation adds one assistant turn and a
+    // short user item, which the fit pass leaves untouched.
+    Fixture fx(one + kDefaultFitReserve + 128);
     fx.ctx.responses = std::make_shared<api::ResponseStore>(
         api::ResponseStore::Limits{32, 1ull << 20, 600});
 
