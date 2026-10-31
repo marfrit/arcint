@@ -276,6 +276,16 @@ answer by design.
   - A KL arm at 100k+ against the old select — mutation: the ReLU moved after the head sum, KL must
     move past the bar.
 
+- **Priced (`measured-here`, 2026-10-31, the B60, Flash-Next IQ3_S with the unit's flags and the slot loan, the OpenCL
+  intercept layer's chrome trace, device time of the prefill segment against its span):** at 19,196 tokens
+  `kernel_top_k_f32` 0.45 %, `kernel_relu` 0.17 %, `flash_attn_mask_cls` 0.20 %; at 103,638 tokens (346.4 t/s, the
+  loan arm's untraced rate) 0.98 % / 0.49 % / 0.59 %, plus `kernel_mul_mm_f32_f32_l4_lm` 1.6 % if all of it is the
+  indexer's f32 score product (`inferred`: the score is the only f32 x f32 mul_mat named in this section) - at most
+  ~3.7 % at 100K against the bar of 10 %: **not built**. The record's "select 18 % of a 128K prompt" (`paper`) does not
+  hold on this build. The same 100K trace: the bank stream's `clEnqueueWriteBuffer` 38.2 %, `kernel_moe_gather_experts`
+  25.7 %, `flash_attn_f32_f16_dpas2` 21.4 % - the prefill's levers at depth are the expert weights' movement and the
+  attention, not the select.
+
 ## 6. CPU miss compute on AVX2, the remaining pieces
 
 - **arcint status: has most of it.** 0063's rows are Strata's: multi-token (`NT` up to 8) decode-once
