@@ -775,10 +775,28 @@ float Sampler::loop_token_share_() const {
     return static_cast<float>(loop_token_repeats_) / static_cast<float>(loop_token_positions_);
 }
 
+// feyntalk W6b (docs/campaigns/feyntalk.md D3): the span sink. Cheap and
+// inert unless token mode handed a vector in; token_index is `emitted_`, the
+// index the decision applies to. Same thread as the API's drain.
+void Sampler::span_event_(std::string span, std::string rung, std::string match,
+                          bool forced, int budget) {
+    if (!params_.span_events) return;
+    SamplerSpanEvent e;
+    e.span        = std::move(span);
+    e.rung        = std::move(rung);
+    e.match       = std::move(match);
+    e.forced      = forced;
+    e.budget      = budget;
+    e.token_index = emitted_;
+    params_.span_events->push_back(std::move(e));
+}
+
 void Sampler::loop_on_detect_() {
     switch (params_.loop_guard) {
         case LoopGuardMode::Off:    return;
-        case LoopGuardMode::Detect: return;   // counted and logged above
+        case LoopGuardMode::Detect:
+            span_event_("loop_guard", "detect", loop_guard_match_name(params_.loop_guard_match));
+            return;   // counted and logged above
         case LoopGuardMode::Nudge:  loop_do_nudge_(); return;
         case LoopGuardMode::Slap:   loop_do_slap_(); return;
         case LoopGuardMode::Door:
@@ -791,6 +809,7 @@ void Sampler::loop_on_detect_() {
             loop_door_tokens_  = 0;
             loop_since_detect_ = 0;   // the door's grace starts at its opening
             loop_token_reset_();
+            span_event_("loop_guard", "door", loop_guard_match_name(params_.loop_guard_match));
             return;
         case LoopGuardMode::Ladder:
             // the door opens first; the nudge and slap follow by counted lines
@@ -803,6 +822,7 @@ void Sampler::loop_on_detect_() {
             loop_door_tokens_  = 0;
             loop_since_detect_ = 0;   // the door's grace starts at its opening
             loop_token_reset_();
+            span_event_("loop_guard", "door", loop_guard_match_name(params_.loop_guard_match));
             return;
         case LoopGuardMode::LadderNoDoor: loop_do_nudge_(); return;   // today's order
     }
@@ -833,6 +853,7 @@ void Sampler::loop_do_nudge_() {
         return;
     }
     loop_nudged_     = true;
+    span_event_("loop_guard", "nudge", loop_guard_match_name(params_.loop_guard_match));
     loop_nudge_cursor_ = 0;
     loop_since_nudge_  = 0;
     ++loop_nudges_;
@@ -843,6 +864,7 @@ void Sampler::loop_do_nudge_() {
 void Sampler::loop_do_slap_() {
     if (loop_slapped_) return;
     loop_slapped_   = true;
+    span_event_("loop_guard", "slap", loop_guard_match_name(params_.loop_guard_match));
     loop_slap_pending_ = true;
     ++loop_slaps_;
     // The answer phase gets its own window: the reasoning loop that caused the
@@ -857,6 +879,7 @@ void Sampler::loop_do_slap_() {
 // by a mask alone. One log line, no counter, no response key: from here the
 // turn is the switch-off path.
 void Sampler::loop_door_lift_() {
+    span_event_("loop_guard", "door_lift", loop_guard_match_name(params_.loop_guard_match));
     loop_door_open_   = false;
     loop_door_lifted_ = true;
     loop_door_tokens_ = 0;
@@ -868,6 +891,7 @@ void Sampler::loop_door_lift_() {
 
 void Sampler::loop_do_abort_() {
     if (loop_abort_) return;
+    span_event_("loop_guard", "abort", loop_guard_match_name(params_.loop_guard_match));
     loop_abort_ = true;
     ++loop_aborts_;
     log::warn("loop-guard", "the answer phase is looping (after a slap or a door self-close); "
@@ -1141,12 +1165,14 @@ int Sampler::sample(float* logits, size_t vocab) {
             if (closer >= 0 && static_cast<size_t>(closer) < vocab) {
                 ++ctx_closes_;
                 ctx_forced_index_ = emitted_;   // the index this token takes
+                span_event_("context_guard", "", "", true, ctx_budget_);
                 loop_forced_closer_ = true;     // not the model's own draw
                 log::info("context-guard", "the context guard reached its budget (%d left); "
                           "the think-block's closer is forced as the next token", ctx_budget_);
                 return closer;
             }
             ++ctx_no_closer_;
+            span_event_("context_guard", "", "", false, ctx_budget_);
             if (!ctx_warned_) {
                 ctx_warned_ = true;
                 log::warn("context-guard", "the context guard reached its budget, but this "

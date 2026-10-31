@@ -2789,3 +2789,50 @@ TEST(responses_token_events_contiguous_and_the_shadow_is_decode_of_tokens) {
     for (const json* t : toks) decoded += fx.backend->tokenizer().decode_one((*t)["token_id"].get<int>());
     CHECK_EQ(shadow, decoded);
 }
+
+// feyntalk W6b, the stream side of the sampler vector: the writer drains the
+// turn's events at the emit that follows, before that token's own event, and
+// carries the sampler's detail verbatim. The loop and context events are
+// informational; no item ids.
+TEST(responses_sampler_spans_are_drained_before_the_token_event) {
+    StreamFixture fx;
+    fx.req.token_mode = true;
+    fx.prep.req       = fx.req;
+    fx.prep.chat.input.sampler.span_events =
+        std::make_shared<std::vector<SamplerSpanEvent>>();
+    SamplerSpanEvent loop;
+    loop.span = "loop_guard"; loop.rung = "door"; loop.match = "near";
+    loop.token_index = 0;
+    SamplerSpanEvent ctx;
+    ctx.span = "context_guard"; ctx.forced = true; ctx.budget = 0; ctx.token_index = 1;
+    fx.prep.chat.input.sampler.span_events->push_back(loop);
+    fx.prep.chat.input.sampler.span_events->push_back(ctx);
+    fx.backend.pieces = {{"A", 1}, {"B", 2}};
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    int loop_at = -1, ctx_at = -1, tok0 = -1, tok1 = -1;
+    for (size_t i = 0; i < s.events.size(); ++i) {
+        const json& b = s.events[i].second;
+        if (s.events[i].first == "arcint:span") {
+            if (b["span"] == "loop_guard" && loop_at < 0) loop_at = static_cast<int>(i);
+            if (b["span"] == "context_guard" && ctx_at < 0) ctx_at = static_cast<int>(i);
+            CHECK(!b.contains("item_id"));
+        }
+        if (s.events[i].first == "arcint:token") {
+            if (b["token_index"] == 0 && tok0 < 0) tok0 = static_cast<int>(i);
+            if (b["token_index"] == 1 && tok1 < 0) tok1 = static_cast<int>(i);
+        }
+    }
+    CHECK(loop_at >= 0 && ctx_at >= 0 && tok0 >= 0 && tok1 >= 0);
+    if (loop_at < 0 || ctx_at < 0 || tok0 < 0 || tok1 < 0) return;
+    CHECK(loop_at < tok0);
+    CHECK(ctx_at < tok1);
+    CHECK(loop_at < ctx_at);
+    const json& l = s.events[static_cast<size_t>(loop_at)].second;
+    CHECK_EQ(l["detail"]["rung"].get<std::string>(), std::string("door"));
+    CHECK_EQ(l["detail"]["match"].get<std::string>(), std::string("near"));
+    const json& c = s.events[static_cast<size_t>(ctx_at)].second;
+    CHECK_EQ(c["detail"]["forced"].get<bool>(), true);
+    CHECK_EQ(c["detail"]["budget"].get<int>(), 0);
+    CHECK(fx.prep.chat.input.sampler.span_events->empty());   // drained
+}

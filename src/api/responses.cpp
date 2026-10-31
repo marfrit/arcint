@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -932,6 +933,11 @@ std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest r
         return translate_prepare_error(*err);
     }
     if (req.token_mode) {
+        // W6b: the sampler's span sink, one vector per token-mode turn. The
+        // sampler appends at its own counter increments; the SSE writer drains
+        // it right after the emit that follows. Null outside token mode, so the
+        // off path allocates nothing.
+        prep.chat.input.sampler.span_events = std::make_shared<std::vector<SamplerSpanEvent>>();
         // The engine renders the prompt it serves; the gateway's render hash is
         // over that same full history. A mismatch is a 409 before the slot, not
         // a cache miss later: the prompt is never echoed, only the hash.

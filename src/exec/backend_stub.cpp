@@ -240,7 +240,10 @@ private:
         const size_t cut = piece.size() / 2;
         const Control first = on_piece(std::string_view(piece).substr(0, cut), id);
         if (first != Control::Continue) return first;
-        return on_piece(std::string_view(piece).substr(cut), id);
+        // The tail of ONE token carries no id, as StopMatcher's held-tail
+        // convention does: a token event is one per token id (W6b), and the
+        // UTF-8 hold-back still gets its split piece.
+        return on_piece(std::string_view(piece).substr(cut), -1);
     }
 
     std::string synthesise(const GenerationInput& in, int prompt_tokens) const {
