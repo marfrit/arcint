@@ -1112,6 +1112,15 @@ and W7 (the extension's WebSocket half). W6f is not a 1.3.0 gate.
 8. **`feyntalk-render` licence.** Public from v1.0.0; recommend MIT, matching
    minja's (only minja's *behaviour* is mirrored, no code is copied). Record in
    `THIRD_PARTY.md` when used. `code` for minja's MIT row.
+9. **Token mode with `truncation: "auto"`.** The engine's fit pass drops
+   replayed reasoning before the hash is taken, while a gateway that renders the
+   full history hashes the un-dropped render — the turn gets a 409, which is the
+   honest outcome but not a usable one. Options: (a) token-mode clients send
+   `truncation: "disabled"` until the gateway applies the same fit from the
+   material (recommended; the 409 stays as the guard); (b) the gateway ports the
+   fit rule and hashes the dropped render — it needs the template's
+   reasoning-visibility capability, which the material does not carry yet.
+   `code` for the engine side; `inferred` for the consumer rule.
 
 ### Gate additions
 
@@ -1250,9 +1259,9 @@ prompt equals a full-history request's with the same items. `include` is accepte
 its code and numbers; the chat route has the same gap for prepare-time
 refusals and was left unchanged (its bytes are a gate).
 
-Gate numbers (`measured-here`): `ctest -L unit` 9/9, 459 cases 0 failed 0
+Gate numbers (`measured-here`): `ctest -L unit` 9/9, 476 cases 0 failed 0
 skipped on the stub build with `-Werror` (432 before W3.4's ten cases, W3.5's
-nine, W3.4b's four, W3.5b's two and W3.5c's two); the feyntalk-golden captures of the
+nine, W3.4b's four, W3.5b's two, W3.5c's two and W6a's 17); the feyntalk-golden captures of the
 chat/completions routes (12: the 10 original byte-identical plus two carrying
 `reasoning_content`) stay byte-identical; `tests/roundtrip.sh` green
 including the two-turn continuation and cancel-by-id checks; the 7 named
@@ -1318,9 +1327,33 @@ countdown per emitted token (accepted drafts once each), the two edges, the
 green (`measured-here`, 2026-10-31, stub build). Its live check on the card is
 owed and is not part of the package.
 
-W5 still owes the compliance vendor + runner and the live token-mode leg is
-W6. `GET /v1/responses/{id}` is not in the 2026-04-24 OpenAPI document and
-was not added. No WebSocket, no compact/background, no W6 option work.
+**W6a is built (2026-10-31, stub gate).** The `arcint` object serves
+`token_mode`, `renderer_hash` and `render.prompt_sha256`; both hashes are
+required in token mode and checked before the slot (a unit without material or a
+renderer_hash mismatch → 409 `renderer_mismatch` before the render; the
+engine's prompt hash against the gateway's `render.prompt_sha256` → 409 after
+prepare, before the slot). `input_ids` is accepted by the schema and refused by
+its own name until W6f; token mode requires `stream: true` and refuses an image
+part. `GET /v1/responses/renderer` serves the material (no auth; 404
+`renderer_not_served` on the stub), `/props` carries `token_mode` and
+`renderer_hash`, and the llama backend builds the material at load — the decode
+pieces are exactly `decode_one(id)`, the encoder tables are the GGUF's, the
+think/tool-call ids and parser hints are the load-time reads, and the canonical
+hash excludes the volatile model names. Token mode is off by default; the
+existing text surface is byte-identical. Red first 16 cases, then `ctest -L
+unit` 9/9, `arcint-test --max-skips 0` 476 cases 0 failed 0 skipped,
+`feyntalk-golden` 12/12 route captures byte-identical, `roundtrip` green,
+`ctest -L compliance` 7/7 (`measured-here`, stub, aarch64, 2026-10-31). The
+executor compile, the two-load hash and the material size line on a card are
+the engine maintainer's recipe gate: the checked-out llama trees here lack the
+pinned arcint patches, so nothing on the card was run in this package. Token
+mode with `truncation: "auto"` stays a 409 (the engine's fit pass hashes the
+dropped render; the gateway's full render differs) until W6c applies the fit —
+open question 9, (a).
+
+W5 still owes the live token-mode leg (W6e). `GET /v1/responses/{id}` is not in
+the 2026-04-24 OpenAPI document and was not added. No WebSocket, no
+compact/background, no W6b/W6c/W6d/W6f work.
 
 ## Where it lives
 
@@ -1342,6 +1375,12 @@ was not added. No WebSocket, no compact/background, no W6 option work.
   the split, and the sampler's event sink (580/779/788/813, params at
   `sampling.h:166`).
 - `src/api/error.h` — the spec-typed `responses_error` next to `error_body`.
+- `src/api/renderer.{h,cpp}` — the material surface (W6a): `/props` flags,
+  `GET /v1/responses/renderer`, the 404; the backend owns the material.
+- `src/core/renderer_material.{h,cpp}` — `assemble_renderer_material`: schema
+  `feyntalk-render/1` and the canonical hash over the five hashable parts.
+- `src/util/{canonical_json,sha256}.{h,cpp}` — the JCS subset and the hash it
+  uses; `sha256_hex` moved out of `responses_state.cpp` for the executor.
 - `tests/test_responses.cpp`, `tests/test_context_guard.cpp`, `tests/roundtrip.sh`,
   `tests/feyntalk/` (vendored compliance library + runner),
   `tools/feyntalk_live.py`, `tools/feyntalk_cancel.py`.
