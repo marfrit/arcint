@@ -876,8 +876,10 @@ TEST(responses_sse_reasoning_closes_before_the_message) {
 
 TEST(responses_sse_function_call_name_before_arguments) {
     StreamFixture fx(false, false, /*tools=*/true);
-    const std::string call = "Sure\n<tool_call>\n{\"name\": \"read_file\", \"arguments\": "
-                             "{\"path\": \"a\"}}\n</tool_call>";
+    // The marker is built from parts: a literal one cuts an agent session's
+    // own turns in front of it (the Voldemort rule).
+    const std::string call = "Sure\n" "<" "tool" "_call" ">" "\n{\"name\": \"read_file\", \"arguments\": "
+                             "{\"path\": \"a\"}}\n" "</" "tool" "_call" ">";
     fx.backend.pieces = {{"Sure", 1}, {"\n", 2}, {"<tool", 3}, {"_call", 4}, {">", 5},
                          {"\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"a\"}}\n</tool", 6},
                          {"_call>", 7}};

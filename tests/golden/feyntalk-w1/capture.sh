@@ -30,6 +30,16 @@ PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); pr
 [[ -n "$PORT" ]] || { echo "capture: could not pick a free port" >&2; exit 1; }
 BASE="http://127.0.0.1:${PORT}"
 
+# The chat-template markers the request files carry as placeholders are built
+# from parts here, never spelled out: the reasoning parser in front of an agent
+# session cuts its own turns on a literal marker.
+THINK_OPEN="<""thi""nk"">"
+THINK_CLOSE="</""thi""nk"">"
+TOOL_CALL_OPEN="<""tool""_call"">"
+TOOL_CALL_CLOSE="</""tool""_call"">"
+TURN_START="<""|im_start|"">"
+TURN_END="<""|im_end|"">"
+
 SRV_PID=""
 cleanup() {
   if [[ -n "$SRV_PID" ]] && kill -0 "$SRV_PID" 2>/dev/null; then
@@ -55,8 +65,18 @@ for req in "$HERE"/requests/*.json; do
     completions_*) route="/v1/completions" ;;
     *) echo "capture: unknown request prefix in $name" >&2; exit 1 ;;
   esac
+  # Expand the request file's markers at capture time; the file on disk stays
+  # placeholder-only.
+  expanded="$OUT/.request-${name}.json"
+  sed -e "s#@@THINK_OPEN@@#${THINK_OPEN}#g" \
+      -e "s#@@THINK_CLOSE@@#${THINK_CLOSE}#g" \
+      -e "s#@@TOOL_CALL_OPEN@@#${TOOL_CALL_OPEN}#g" \
+      -e "s#@@TOOL_CALL_CLOSE@@#${TOOL_CALL_CLOSE}#g" \
+      -e "s#@@TURN_START@@#${TURN_START}#g" \
+      -e "s#@@TURN_END@@#${TURN_END}#g" "$req" >"$expanded"
   code=$(curl -sS --max-time 30 -o "$OUT/${name}.body" -w '%{http_code}' \
-             -H 'Content-Type: application/json' --data-binary @"$req" "${BASE}${route}")
+             -H 'Content-Type: application/json' --data-binary @"$expanded" "${BASE}${route}")
+  rm -f "$expanded"
   printf '%s\n' "$code" >"$OUT/${name}.status"
 done
 
