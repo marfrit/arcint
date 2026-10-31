@@ -361,3 +361,150 @@ TEST(context_guard_flag_parses_and_reaches_props) {
     CHECK(sd.contains("think_ctx_reserve"));
     if (sd.contains("think_ctx_reserve")) CHECK_EQ(sd.at("think_ctx_reserve").get<int>(), 256);
 }
+
+// -------------------------------------------------- W3.4b review findings
+namespace {
+std::string repeated_reasoning_line() {
+    return "reasoning line: the same plan again and again and again, unchanged\n";
+}
+}  // namespace
+
+// F1 (blocking): a pending context-guard force must not survive a close by the
+// slap. The budget reaches 0 in the SAME observe() whose counted line trips
+// the lane; the slap's closer is drawn next, closes the block, and the guard
+// must not put a second closer into the answer (nor into the tool grammar).
+TEST(context_guard_pending_force_does_not_survive_a_slap_close) {
+    SamplerParams p = ctx_params();
+    p.think_ctx_reserve    = 8;
+    p.loop_guard           = LoopGuardMode::Slap;
+    p.loop_guard_window    = 2;
+    p.loop_guard_threshold = 0.5f;
+    p.loop_guard_match     = LoopGuardMatch::Exact;
+    Sampler s(p, 1);
+    s.set_prompt({1});
+    s.set_think_ctx_budget(2);
+    s.start_in_think_block(true);
+
+    const std::string line = repeated_reasoning_line();
+    s.observe(1, line);   // first counted line; budget 2 -> 1
+    s.observe(1, line);   // second line: share 1.0, the slap arms AND the budget hits 0
+    CHECK_EQ(s.loop_guard_counts().slaps, 1);
+    CHECK_EQ(s.think_ctx_remaining(), 0);
+
+    std::vector<float> l = row_with_argmax(3);
+    CHECK_EQ(s.sample(l.data(), l.size()), 5);   // the slap's closer
+    s.observe(5, "closed");
+    CHECK(!s.think_block_open());
+
+    std::vector<float> l2 = row_with_argmax(3);
+    CHECK_EQ(s.sample(l2.data(), l2.size()), 3);   // NOT the closer again
+    CHECK_EQ(s.loop_guard_counts().ctx_closes, 0);
+    CHECK_EQ(s.loop_guard_counts().ctx_no_closer, 0);
+}
+
+// F1, the nudge-in-flight variant: the detection nudges, the nudge sentence is
+// delivered, the grace lines then trip the slap; the pending context force from
+// the detection moment must not fire after that close.
+TEST(context_guard_pending_force_does_not_survive_a_nudge_then_slap) {
+    SamplerParams p = ctx_params();
+    p.think_ctx_reserve    = 8;
+    p.loop_guard           = LoopGuardMode::LadderNoDoor;
+    p.loop_guard_window    = 2;
+    p.loop_guard_threshold = 0.5f;
+    p.loop_guard_match     = LoopGuardMatch::Exact;
+    p.loop_guard_grace     = 2;
+    p.loop_guard_nudge_ids = {101, 102};
+    Sampler s(p, 1);
+    s.set_prompt({1});
+    s.set_think_ctx_budget(2);
+    s.start_in_think_block(true);
+
+    const std::string line = repeated_reasoning_line();
+    s.observe(1, line);
+    s.observe(1, line);   // detection -> nudge; budget hits 0
+    CHECK_EQ(s.loop_guard_counts().nudges, 1);
+    CHECK_EQ(s.think_ctx_remaining(), 0);
+
+    // Deliver the nudge sentence, one forced id a draw (the context force is
+    // pending but a nudge in flight comes first).
+    for (int id : {101, 102}) {
+        std::vector<float> l = row_with_argmax(2);
+        CHECK_EQ(s.sample(l.data(), l.size()), id);
+        s.observe(id, "nudge");
+    }
+    CHECK(s.think_block_open());
+
+    s.observe(1, line);   // grace 1
+    s.observe(1, line);   // grace 2: the slap arms
+    CHECK_EQ(s.loop_guard_counts().slaps, 1);
+
+    std::vector<float> l = row_with_argmax(3);
+    CHECK_EQ(s.sample(l.data(), l.size()), 5);   // the slap's closer
+    s.observe(5, "closed");
+    CHECK(!s.think_block_open());
+
+    std::vector<float> l2 = row_with_argmax(3);
+    CHECK_EQ(s.sample(l2.data(), l2.size()), 3);   // NOT the closer again
+    CHECK_EQ(s.loop_guard_counts().ctx_closes, 0);
+}
+
+// F2 (blocking): a prompt inside the reserve with the block NOT template-opened.
+// The arm must wait for the thinking state; when the model opens the block
+// itself the guard must still fire (the opener's observe() re-arms).
+TEST(context_guard_undecided_start_arms_when_the_model_opens_the_block) {
+    SamplerParams p = ctx_params();
+    p.think_ctx_reserve      = 64;
+    p.think_ids.open_close_ids = {{6, 5}};   // the model can open with id 6, close 5
+    Sampler s(p, 1);
+    s.set_prompt(std::vector<int>(200, 1));
+    s.set_think_ctx_budget(think_ctx_budget(256, 200, 64));   // -8: prompt inside the reserve
+    s.start_in_think_block(false);   // the template did NOT open the block
+    CHECK(!s.think_block_open());
+
+    // The model opens the block itself. Before the opener, no arm may be spent:
+    // no closer id exists yet, and a spent arm would latch the guard dead.
+    std::vector<float> l = row_with_argmax(6);
+    CHECK_EQ(s.sample(l.data(), l.size()), 6);
+    CHECK_EQ(s.loop_guard_counts().ctx_no_closer, 0);
+    s.observe(6, "opened");
+    CHECK(s.think_block_open());
+
+    std::vector<float> l2 = row_with_argmax(2);
+    CHECK_EQ(s.sample(l2.data(), l2.size()), 5);   // the guard fires at the opener
+    CHECK_EQ(s.loop_guard_counts().ctx_closes, 1);
+    s.observe(5, "closed");
+    CHECK(!s.think_block_open());
+}
+
+// The missing verify-walk case: a context-forced closer that mismatches a draft
+// token truncates the chain exactly as the slap's does -- the drafts behind it
+// are never accepted.
+TEST(context_guard_forced_closer_breaks_the_verify_walk_at_its_row) {
+    SamplerParams p = ctx_params();
+    p.think_ctx_reserve = 8;
+    Sampler s(p, 1);
+    s.set_prompt({1});
+    s.set_think_ctx_budget(2);
+    s.start_in_think_block(true);
+    s.observe(2);
+    s.observe(2);   // the budget reaches 0: the next draw is the closer
+
+    const size_t       vocab = 8;
+    std::vector<float> rows;
+    for (int r = 0; r < 3; ++r) {
+        const std::vector<float> row = row_with_argmax(2, vocab);
+        rows.insert(rows.end(), row.begin(), row.end());
+    }
+    std::vector<int> out;
+    const VerifyWalk w = walk_verify(
+        rows.data(), 3, vocab, {2, 2}, s, 100, [](int) { return false; },
+        [&](int t) {
+            out.push_back(t);
+            return Control::Continue;
+        });
+    CHECK_EQ(w.emitted, 1);
+    CHECK_EQ(w.accepted, 0);
+    CHECK_EQ(w.last, 5);
+    CHECK_EQ(out, std::vector<int>({5}));
+    CHECK_EQ(s.loop_guard_counts().ctx_closes, 1);
+}
