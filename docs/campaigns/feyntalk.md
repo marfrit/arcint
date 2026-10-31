@@ -404,7 +404,11 @@ cap, the served prompt count) and hands it over after `set_prompt()` and before
 `start_in_think_block()`. `n_ctx` is the lane's cap, not the process pool
 (`code`, `src/exec/backend_llama.cpp` `prepare_think_ctx`). `--think-ctx-reserve
 N` (default 0 = off) is the operator flag; a request never sets it; `/props`
-names the served value under `sampler_defaults`.
+names the served value under `sampler_defaults`. With a loop-guard nudge in
+flight the forced closer waits for the nudge sentence's remaining ids, so the
+reserve must absorb that sentence's token length (tokeniser-dependent, a
+handful of ids on the artifact) in addition to the answer room the operator
+wants to keep (review F5).
 
 **Countdown, relative to the verify walk** (`code`): the countdown happens in
 `Sampler::observe()`, one per emitted token that lands **inside** the block --
@@ -442,7 +446,11 @@ took, the same space as `arcint:token`) when it fired; the event is before the
 terminal event. The loop-guard stats object on both chat and Responses gains
 `context_closes` and `context_no_closer`; the decode line names them. The
 `token_index` is graded by the API (which owns prompt/completion counts and
-n_ctx), not the sampler, so no engine-loop hook was added.
+n_ctx), not the sampler, so no engine-loop hook was added. At reserve 0 the
+generated **tokens are byte-identical**, but the stats object is extended: the
+chat and Responses `loop_guard` object now carries the two context keys (nine
+instead of seven), so a client reading that object sees the extension even with
+the guard off (review F3).
 
 **Gate, measured-here (2026-10-31, stub build, aarch64):** red-first ten cases
 (sampler-level arithmetic incl. accepted-draft counting, forced close at budget
@@ -452,6 +460,36 @@ edge, reserve-0 off, the object/line, the flag//props, the event); `ctest -L
 unit` 9/9, `arcint-test --max-skips 0` 442 cases 0 failed 0 skipped, the
 feyntalk-golden captures byte-identical, `tests/roundtrip.sh` green. The live
 check on the card is owed: it is not part of this package.
+
+**Review round W3.4b (`code`, 2026-10-31).** The engine maintainer blocked the
+merge on two sampler defects, both reproduced with a sampler probe:
+
+- **F1, fixed:** a pending context force survived a close by the slap and
+  forced a second closer into the answer, since the force branch checked
+  neither the block's state nor a cleared arm. Fix chosen: **gate the branch on
+  `think_state_ == thinking`**, rather than clearing the arm at the two close
+  sites -- one condition covers every path to content, present and future, and
+  enumerating close sites can miss the next one. A gated arm is dropped
+  silently and the turn settles.
+- **F2, fixed:** a prompt inside the reserve with the block not
+  template-opened armed in the undecided state, where no closer id exists,
+  spent the arm as `ctx_no_closer_` and latched the guard dead. Fix: the arm
+  requires the block open (`think_ctx_arm_()` checks the state); the opener's
+  `observe()` re-arms through the countdown.
+- **F3:** reserve 0 keeps the tokens byte-identical but extends the stats
+  object, as stated above.
+- **F4, reported only:** a forced close that is consumed and then ends on a
+  Length break before the emit counts `ctx_closes` (and the slap's `slaps`)
+  for a token that never reached the stream. Pre-existing for the slap; not
+  fixed here.
+- **F5:** the nudge-in-flight delay, stated next to `--think-ctx-reserve`.
+
+Cases red first: the P1 shape (the budget reaching 0 in the same `observe()`
+whose counted line trips the slap), the nudge-then-slap variant, the
+undecided-start opener, and the missing verify-walk case where the forced
+closer mismatches a draft token and truncates the chain. Gate after the fixes
+(`measured-here`, 2026-10-31, stub, aarch64): `ctest -L unit` 9/9, 455 cases 0
+failed 0 skipped, golden byte-identical, roundtrip green.
 
 ## Truncation: `"auto"` (W3.5)
 
@@ -631,6 +669,7 @@ Two ids are named in the specification README (`basic-response`,
 | W3 | **state + continuation**: `ResponseStore`, limits/LRU/TTL, `store` semantics, `previous_response_id`, `prefix_hash`, `SlotPool::try_acquire`, eviction on error | `src/api/responses_state.{h,cpp}`, `src/api/handlers.{h,cpp}` (`SlotPool`), `src/api/responses.cpp`, `src/config.{h,cpp}`, `/props`, `tests/test_responses.cpp` | unit store/continuation/eviction green; stub continuation `cache_hit_tokens >= prompt_tokens - 1`; compliance `previous_response_id` tests |
 | W3.2 | **reasoning replay**: `ChatMessage::reasoning`, Responses reasoning-item pairing, chat `reasoning_content`, the stub template's Qwen3 rule, stored-continuation assistant turns per output item, think state keyed to the generation start | `src/core/chat.{h,cpp}`, `src/exec/chat_json.h`, `src/api/responses.cpp`, `tests/test_chat.cpp`, `tests/test_responses.cpp`, `tests/golden/feyntalk-w1/` | unit mapping/rendering/continuation red-first; think-state guard with replayed closed reasoning; 12 golden captures (10 old byte-identical); roundtrip |
 | W3.4 | **context guard**: the loop guard's forced-closer seam, a second trigger with its own reason and counter; the budget `n_ctx - prompt_tokens - reserve` handed at request start, counted down per emitted token, forced closer at 0; `--think-ctx-reserve N` (default 0 = off), `/props`; `arcint:context` event, the counters in the loop-guard object, the slot line | `src/core/sampler.{h,cpp}`, `src/core/sampling.{h,cpp}`, `src/exec/backend_llama.cpp` (`prepare_think_ctx`, the three sampler sites), `src/config.{h,cpp}`, `src/api/{handlers,generate,responses_stream}.cpp`, `tests/test_context_guard.cpp`, `tests/test_responses.cpp`, `tests/test_stream_utf8.cpp` | red-first 10 cases; `ctest -L unit` 0 failed; `arcint-test --max-skips 0` 0 failed; golden byte-identical; roundtrip green. The live card check is owed (no card in this package) |
+| W3.4b | **review round for W3.4**: F1 (the pending force survives a slap close) fixed by a `think_state_ == thinking` gate; F2 (an undecided start spends the arm) fixed by requiring the open block in `think_ctx_arm_()`; F3/F4/F5 recorded; the missing verify-walk case added; red first | `src/core/sampler.cpp` (`sample()`'s context branch, `think_ctx_arm_()`), `tests/test_context_guard.cpp`, `docs/campaigns/feyntalk.md` | red-first four cases; `ctest -L unit` 0 failed; `arcint-test --max-skips 0` 0 failed; golden byte-identical; roundtrip and compliance green |
 | W3.5 | **truncation auto**: the cheap compaction tier, reasoning first — `prepare_from_chat`'s optional fit policy (`PromptFit`) drops the oldest replayed reasoning block on a local render copy until the prompt fits `n_ctx - reserve`, re-rendering and recounting; exhausted → the same 400 with counts; `arcint:truncated` event / `arcint.truncated` object, one `req:` line; the store keeps the full history and a truncated turn's prefix hash is taken over the full render | `src/api/handlers.{h,cpp}` (`PromptFit`, `drop_oldest_reasoning`), `src/api/responses.cpp` (reserve, `PromptFit`, log, ext object), `src/api/responses_stream.cpp` (event), `src/api/responses_state.cpp` (hash), `src/api/error.{h,cpp}` (exhausted 400), `src/api/generate.{h,cpp}` (`truncation_json`), `tests/test_responses.cpp` | red-first nine cases; `ctest -L unit` 0 failed; `arcint-test --max-skips 0` 0 failed; golden byte-identical; roundtrip green |
 | W4 | **cancel by id**: extension route, in-flight registry, `GenerationInput::cancel`, `AbortCause::Cancelled`, `abort_cause_of` + stub `cause`, `arcint:response.cancelled` + incomplete(cancelled) | `src/http/server.cpp`, `src/api/responses_state.{h,cpp}`, `src/exec/backend.h` (~390), `src/exec/backend_llama.cpp:150-152`, `src/exec/backend_stub.cpp:216-220`, `tests/test_responses.cpp`, a cancel measurement script under `tools/` | unit cancel paths red-first; stub cancel at 4 ubatches; card window: cancel-to-abort within one ubatch at 100k, control arm the same |
 | W5 | **gate + live leg**: vendor the compliance library at the pinned release into `tests/feyntalk/`, wire a runner, add the pi multi-turn leg | `tests/feyntalk/`, `tests/CMakeLists.txt` or `CMakeLists.txt`, `tools/feyntalk_live.py` | compliance 0 failed, skipped = the named list; live leg passes Gate 4 |
@@ -728,8 +767,8 @@ its code and numbers; the chat route has the same gap for prepare-time
 refusals and was left unchanged (its bytes are a gate).
 
 Gate numbers (`measured-here`): `ctest -L unit` 9/9, 442 cases 0 failed 0
-skipped on the stub build with `-Werror` (432 before W3.4's ten cases and W3.5's
-nine); the feyntalk-golden captures of the
+skipped on the stub build with `-Werror` (432 before W3.4's ten cases, W3.5's
+nine and W3.4b's four); the feyntalk-golden captures of the
 chat/completions routes (12: the 10 original byte-identical plus two carrying
 `reasoning_content`) stay byte-identical; `tests/roundtrip.sh` green
 including the two-turn continuation and cancel-by-id checks; the 7 named
@@ -780,8 +819,8 @@ in `prepare_from_chat` (`PromptFit`), the 256-token/smaller-`max_output_tokens`
 reserve, the exhausted 400 with counts, `arcint:truncated` /
 `arcint.truncated`, the store keeping the full history and the full-render
 prefix hash for truncated turns. `ctest -L unit` 9/9, `arcint-test --max-skips
-0` 451 cases 0 failed 0 skipped, golden byte-identical, roundtrip green
-(`measured-here`, 2026-10-31, stub). No card check applies to this package.
+0` 455 cases 0 failed 0 skipped, golden byte-identical, roundtrip green
+(`measured-here`, 2026-10-31, stub, after the W3.4b review round). No card check applies to this package.
 
 W3.4 (context guard) is built, unit-tested and default off: the loop guard's
 forced-closer seam with its own counter, the budget at request start, the
