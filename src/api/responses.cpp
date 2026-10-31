@@ -1,5 +1,6 @@
 #include "api/responses.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -593,8 +594,9 @@ std::optional<HttpResult> parse_response_request(const json& body, ResponseReque
         if (tr != "auto" && tr != "disabled") {
             return invalid("truncation must be auto or disabled", "truncation");
         }
-        // Both mean no truncation here: `auto` MAY truncate, not MUST, and
-        // `disabled` MUST fail — the §3.8 400 is the same answer.
+        // W3.5: `auto` is the cheap compaction tier (prepare_response drops
+        // replayed reasoning blocks until the prompt fits); `disabled` MUST
+        // fail on overflow and keeps the §3.8 400.
         req.truncation = tr;
     }
 
@@ -660,6 +662,16 @@ HttpResult translate_prepare_error(const HttpResult& err) {
         if (overflow) {
             if (e.contains("prompt_tokens")) body["prompt_tokens"] = e["prompt_tokens"];
             if (e.contains("n_ctx")) body["n_ctx"] = e["n_ctx"];
+            // W3.5b N4 / W3.5c R3: the fit numbers reach the client, but only
+            // for the fit pass's own 400 (`auto`). `overflow` rides with them, so
+            // the disabled/absent 400 keeps today's bytes: it has no top-level
+            // `overflow` key, exactly as before W3.5.
+            if (e.contains("fit_reserve")) {
+                if (e.contains("overflow")) body["overflow"] = e["overflow"];
+                body["fit_reserve"] = e["fit_reserve"];
+                if (e.contains("reasoning_dropped_blocks"))
+                    body["reasoning_dropped_blocks"] = e["reasoning_dropped_blocks"];
+            }
         }
         return HttpResult{400, std::move(body)};
     }
@@ -778,11 +790,40 @@ std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest r
 
     PreparedResponse prep;
     prep.affinity_slot = stored ? stored->slot : -1;
-    if (auto err = prepare_from_chat(ctx, req.chat, prep.chat)) {
+    // feyntalk W3.5: `truncation: "auto"` is the cheap compaction tier,
+    // reasoning first. The fit reserve is the operator's --think-ctx-reserve
+    // when set; otherwise a small default of 256 tokens of answer room, or the
+    // request's own max_output_tokens when that is smaller. A larger
+    // max_output_tokens does not enlarge the reserve: the length stop still
+    // bounds the answer, and reserving a client's 16k ask would drop nearly
+    // every reasoning block instead of failing. `disabled` and an absent field
+    // never build a PromptFit and keep today's §3.8 400.
+    PromptFit   fit;
+    PromptFit*  fitp = nullptr;
+    if (req.truncation == "auto") {
+        const int operator_reserve = ctx.backend->status().sampler_defaults.think_ctx_reserve;
+        fit.drop_reasoning = true;
+        fit.reserve        = operator_reserve > 0
+                                 ? operator_reserve
+                                 : (req.max_output_tokens > 0
+                                        ? std::min(req.max_output_tokens, 256)
+                                        : 256);
+        fitp = &fit;
+    }
+    if (auto err = prepare_from_chat(ctx, req.chat, prep.chat, fitp)) {
         // A continuation the server answers 4xx is a broken chain: evict the
         // referenced entry so a retry cannot silently continue from it.
         evict_continuation(ctx, prev_id);
         return translate_prepare_error(*err);
+    }
+    // One line for the quiet path too: a truncated turn's numbers, so an
+    // operator reading the log knows what was served and what was dropped.
+    if (prep.chat.truncation.blocks_dropped > 0) {
+        log::warn("req", "truncation auto: dropped %d reasoning blocks, prompt %d -> %d tokens "
+                         "(reserve %d, n_ctx %d, lane %d)",
+                  prep.chat.truncation.blocks_dropped, prep.chat.truncation.tokens_before,
+                  prep.chat.truncation.tokens_after, prep.chat.truncation.reserve,
+                  lane_n_ctx(ctx, prep.chat.lane), prep.chat.lane);
     }
     prep.req = std::move(req);
     // The Responses ids are resp-N; prepare_from_chat numbered it as a chat
@@ -901,8 +942,12 @@ json response_resource(const ResponseRequest& req, const PreparedChat& prep,
                             : gen.reason == FinishReason::Abort ? "cancelled"
                                                               : "max_output_tokens"}};
     }
-    if (loop_guard_moved(gen.stats))
-        parts.arcint_ext = json{{"v", 1}, {"loop_guard", loop_guard_json(gen.stats)}};
+    json ext = json{{"v", 1}};
+    // feyntalk W3.5: the fit pass's numbers, on the same extension object the
+    // loop guard's counters use.
+    if (prep.truncation.blocks_dropped > 0) ext["truncated"] = truncation_json(prep.truncation);
+    if (loop_guard_moved(gen.stats)) ext["loop_guard"] = loop_guard_json(gen.stats);
+    if (ext.size() > 1) parts.arcint_ext = std::move(ext);
     parts.output = std::move(output);
     parts.usage  = json{{"input_tokens", gen.stats.prompt_tokens},
                         {"output_tokens", gen.stats.completion_tokens},

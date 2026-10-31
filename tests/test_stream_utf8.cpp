@@ -473,16 +473,19 @@ json run_chat_loop_stats() {
 
 }  // namespace
 
-TEST(chat_loop_guard_object_carries_all_seven_keys_on_the_wire) {
+TEST(chat_loop_guard_object_carries_all_nine_keys_on_the_wire) {
+    // Seven ladder counters and, since W3.4, the context guard's own two:
+    // its forced close and the arms that found no closer id to force.
     const json expected = {{"detections", 1}, {"nudges", 2}, {"slaps", 3}, {"aborts", 4},
-                           {"self_closes", 5}, {"door_masked", 6}, {"door_eog_masked", 7}};
+                           {"self_closes", 5}, {"door_masked", 6}, {"door_eog_masked", 7},
+                           {"context_closes", 0}, {"context_no_closer", 0}};
 
     // The non-streaming response, read as serialized and parsed back: what a
     // client actually receives.
     const json body = run_chat_loop_stats();
     const json wire = json::parse(body.dump());
     CHECK(wire.contains("loop_guard"));
-    CHECK_EQ(wire["loop_guard"].size(), 7u);
+    CHECK_EQ(wire["loop_guard"].size(), 9u);
     CHECK(wire["loop_guard"] == expected);
 
     // The stream's finish frame, the same object out of the same path.
@@ -490,7 +493,7 @@ TEST(chat_loop_guard_object_carries_all_seven_keys_on_the_wire) {
     const std::vector<json> objs = run_stream_with(backend, true);
     const json& finish = objs.back();
     CHECK(finish.contains("loop_guard"));
-    CHECK_EQ(finish["loop_guard"].size(), 7u);
+    CHECK_EQ(finish["loop_guard"].size(), 9u);
     CHECK(finish["loop_guard"] == expected);
     CHECK_EQ(finish["loop_guard"].dump(), wire["loop_guard"].dump());
 }

@@ -44,6 +44,24 @@ Unit:
     ctest --test-dir build --output-on-failure -L unit   # the unit gate
     ./build/arcint --stub --port 8090 -v                  # serving skeleton, no model
 
+Compliance (NOT in the unit label; it needs node >= 22):
+
+    ctest --test-dir build --output-on-failure -L compliance
+    tests/feyntalk/run-compliance.sh ./build/arcint       # same, with the CLI output
+
+The runner starts the binary as `--stub` with `--queue-timeout 30` on a free
+local port and runs the official Open Responses CLI vendored under
+`tests/feyntalk/openresponses/` (Apache-2.0, 2026-04-24 release; file list and
+hashes in `THIRD_PARTY.md` and its `MANIFEST.sha256`) for the seven 1.3.0 ids:
+`basic-response`, `streaming-response`, `system-prompt`, `tool-calling`,
+`multi-turn`, `assistant-phase`, `response-output-phase-schema`. The CLI's
+runtime dependencies are pinned (tsx 4.19.2, zod 3.25.76); `npm ci
+--ignore-scripts` installs them into `tests/feyntalk/.deps` (git-ignored) the
+first time, or into `$FEYNTALK_COMPLIANCE_DEPS`. Without node >= 22 the run
+prints `SKIP feyntalk-compliance: …` and exits 0, so the offline unit gate stays
+offline; set `FEYNTALK_COMPLIANCE_REQUIRED=1` to make a skip a failure where the
+compliance gate is claimed.
+
 Serving build:
 
     git -C <llama.cpp> apply <arcint>/contrib/llama.cpp/patches/*.patch

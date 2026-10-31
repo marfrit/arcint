@@ -183,6 +183,20 @@ using SseWriter = std::function<bool(std::string_view)>;
 // backend runs is not copied to attach it.
 using PeerProbe = std::function<bool()>;
 
+// feyntalk W3.5: what the `truncation: "auto"` fit pass did to this turn's
+// prompt. Zero everywhere on the chat, completions and disabled/absent paths;
+// the Responses route reports it as the arcint:truncated event and the
+// `arcint.truncated` object. The stored state keeps the full ChatRequest either
+// way: truncation is per request, not a rewrite of the store.
+struct TruncationReport {
+    int blocks_dropped      = 0;   // replayed reasoning blocks, oldest first
+    int tokens_before       = 0;   // prompt tokens before the first drop
+    int tokens_after        = 0;   // the prompt actually served
+    int reserve             = 0;   // tokens the fit rule left for generation
+
+    int tokens_freed() const { return tokens_before > tokens_after ? tokens_before - tokens_after : 0; }
+};
+
 struct PreparedChat {
     ChatRequest     req;
     GenerationInput input;
@@ -196,6 +210,7 @@ struct PreparedChat {
     int             prompt_tokens = 0;
     int             lane          = -1;  // resolve_lane's answer
     std::string     model;               // the name the response carries
+    TruncationReport truncation;         // W3.5: zero on every non-auto path
 };
 
 struct PreparedCompletion {
@@ -226,8 +241,19 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const nlohmann::json&
 // the template default, render_chat, the sampler and the think state. The
 // Responses route maps its request into a ChatRequest and calls this same
 // function (docs/campaigns/feyntalk.md W1), so there is one prompt builder.
+// feyntalk W3.5: the optional fit policy. The chat and completions routes pass
+// nullptr (today's §3.8 400 on overflow, byte-identical); the Responses route
+// with `truncation: "auto"` passes one, and prepare_from_chat drops replayed
+// reasoning blocks on the LOCAL render copy until the prompt fits
+// n_ctx - reserve. It never drops or edits a message, a tool call or a tool
+// output, and `out.req` (the stored/echoed history) is left full.
+struct PromptFit {
+    bool drop_reasoning = false;   // truncation: "auto" with an active fit pass
+    int  reserve        = 0;       // tokens to leave for generation
+};
 std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
-                                           PreparedChat& out);
+                                            PreparedChat& out,
+                                            const PromptFit* fit = nullptr);
 std::optional<HttpResult> prepare_completion(const Context& ctx, const nlohmann::json& body,
                                              PreparedCompletion& out);
 // /v1/audio/speech: the availability refusals ("this build has no TTS", no

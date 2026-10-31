@@ -57,6 +57,21 @@ string helpers copied from `common/common.cpp`. `src/core/toolgrammar.cpp`
 copies `permute` from `common/chat-peg-parser.cpp` and mirrors the tool-call
 block of `common/parsers/qwen3-coder.cpp`.
 
+Vendored for the compliance gate (Apache-2.0): the Open Responses specification
+repository's **2026-04-24 release** (`package.json` 0.1.0; the checkout carries
+no git metadata, so the release document is the pin), at
+`tests/feyntalk/openresponses/` with the upstream paths kept — `LICENSE`
+next to the files, sha256
+`43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1`.
+Brought in: `bin/compliance-test.ts`, `src/lib/compliance-tests.ts`,
+`src/lib/sse-parser.ts` and the reachable closure of
+`src/generated/kubb/zod/…` — 108 files, no local change. The per-file sha256
+list is `tests/feyntalk/openresponses/MANIFEST.sha256` (the manifest is part of
+this record; the CLI is run as the official code, not reimplemented). Its
+runtime dependencies are not vendored: tsx 4.19.2 and zod 3.25.76 are pinned in
+`tests/feyntalk/package.json`/`package-lock.json` and installed with
+`npm ci --ignore-scripts` into an ignored cache when node >= 22 is present.
+
 Runtime dependencies (not shipped): the OpenCL ICD loader and Intel's
 compute runtime. Model files are not shipped; GGUFs of Qwen checkpoints
 inherit the Qwen license, and each quantization its publisher's terms.

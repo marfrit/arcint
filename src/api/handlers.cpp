@@ -103,6 +103,12 @@ std::string decode_suffix_for(const GenerationStats& stats) {
                                      stats.loop_aborts, stats.loop_self_closes, stats.loop_door_masked,
                                      stats.loop_door_eog_masked);
     }
+    // feyntalk W3.4: the context guard's close is its own event, not a
+    // loop-guard rung; named on the same line, only when it moved.
+    if (stats.loop_context_closes || stats.loop_context_no_closer) {
+        decode_suffix += log::format(" | context guard: closed %d, no closer %d",
+                                     stats.loop_context_closes, stats.loop_context_no_closer);
+    }
     return decode_suffix;
 }
 
@@ -117,7 +123,11 @@ nlohmann::json loop_guard_json(const GenerationStats& stats) {
                 {"aborts", stats.loop_aborts},
                 {"self_closes", stats.loop_self_closes},
                 {"door_masked", stats.loop_door_masked},
-                {"door_eog_masked", stats.loop_door_eog_masked}};
+                {"door_eog_masked", stats.loop_door_eog_masked},
+                // feyntalk W3.4: not a ladder rung -- the context guard's own
+                // counter, and the arms that had no closer id to force.
+                {"context_closes", stats.loop_context_closes},
+                {"context_no_closer", stats.loop_context_no_closer}};
 }
 
 namespace {
@@ -492,6 +502,8 @@ json props(const Context& ctx) {
           // send nothing. /props says what the server is running with, so a
           // turn that ends differently than yesterday's is explained here.
           {"think_eog_mask", sd.think_eog_mask},
+          // feyntalk W3.4: the context guard's reserve in tokens; 0 is off.
+          {"think_ctx_reserve", sd.think_ctx_reserve},
           {"tool_grammar", sd.tool_grammar},
           // loop-guard: the served switch and its thresholds, so a turn that
           // ends differently than yesterday's is explained here.
@@ -616,7 +628,8 @@ std::optional<HttpResult> finish_prepare(const Context& ctx, int lane, const std
                                          const SamplerOverrides& overrides,
                                          GenerationInput& input, int& prompt_tokens,
                                          bool nothink = false,
-                                         const std::vector<int>& prompt_ids = {}) {
+                                         const std::vector<int>& prompt_ids = {},
+                                         int known_prompt_tokens = -1) {
     // The row first: a request that resolves to thinking off starts from the
     // operator's non-thinking row when one is configured. The request's own
     // fields apply after this and still win.
@@ -626,10 +639,13 @@ std::optional<HttpResult> finish_prepare(const Context& ctx, int lane, const std
     }
 
     // A token-id prompt is counted as given; a text prompt is tokenised once
-    // here for the count (the backend tokenises it again for the forward).
-    prompt_tokens = prompt_ids.empty()
-                        ? static_cast<int>(ctx.backend->tokenizer().encode(prompt).size())
-                        : static_cast<int>(prompt_ids.size());
+    // here for the count (the backend tokenises it again for the forward). The
+    // W3.5 fit pass already encoded the prompt it served, so it hands the count
+    // in (N3) and the encode is not repeated for every auto request.
+    prompt_tokens = !prompt_ids.empty()
+                        ? static_cast<int>(prompt_ids.size())
+                        : (known_prompt_tokens >= 0 ? known_prompt_tokens
+                                                    : static_cast<int>(ctx.backend->tokenizer().encode(prompt).size()));
 
     // DESIGN.md §3.8 — reject, with the numbers. No truncation, no shift.
     // Against the request's lane: a subagent lane's prompt over its cap is
@@ -659,12 +675,24 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
     return prepare_from_chat(ctx, std::move(req), out);
 }
 
+// feyntalk W3.5: clear the oldest non-empty replayed reasoning block in the
+// render copy. Messages, tool calls and tool outputs stay exactly as they came.
+static bool drop_oldest_reasoning(std::vector<ChatMessage>& messages) {
+    for (ChatMessage& m : messages) {
+        if (m.reasoning.empty()) continue;
+        m.reasoning.clear();
+        return true;
+    }
+    return false;
+}
+
 // The half of the old prepare_chat that runs after the body is parsed: lane
 // resolution, the template default, the render, the sampler and the think
 // state. The Responses route maps its request into a ChatRequest and calls this
 // same function, so there is one prompt builder and not two
 // (docs/campaigns/feyntalk.md W1).
-std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req, PreparedChat& out) {
+std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req, PreparedChat& out,
+                                            const PromptFit* fit) {
     // The lane first: its name may be a 404, and its cap is the 400's
     int lane = -1;
     if (auto err = resolve_lane(ctx, req.model, lane)) return err;
@@ -718,7 +746,75 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
         prep.input.parallel_tool_calls = prep.req.parallel_tool_calls;
     }
 
-    const std::string prompt = ctx.backend->render_chat(prep.req);
+    std::string prompt;
+    int         fit_tokens = -1;   // N3: the count the fit pass already made
+    if (fit != nullptr && fit->drop_reasoning) {
+        // feyntalk W3.5: `truncation: "auto"`, reasoning first. The render copy
+        // is local: prep.req (the echo and the stored state) keeps the full
+        // history. Drop one replayed reasoning block at a time, oldest first,
+        // re-render and recount until the prompt fits n_ctx - reserve. Only
+        // ChatMessage::reasoning is cleared -- no message body, tool call or
+        // tool output is dropped or edited. The most recent assistant turn's
+        // reasoning is the last to go because the loop walks messages in order.
+        //
+        // N2: a template that does not reference reasoning_content cannot
+        // render any of it, so the whole pass is skipped and nothing is
+        // counted. The llama backend reports that capability explicitly; a
+        // backend without the key (the stub) is treated as "may render", so
+        // the pass stays honest instead of guessing.
+        const json caps = ctx.backend->template_caps();
+        const bool template_renders_reasoning =
+            !caps.contains("supports_preserve_reasoning")
+            || (caps["supports_preserve_reasoning"].is_boolean()
+                && caps["supports_preserve_reasoning"].get<bool>());
+        ChatRequest render_req = prep.req;
+        const int   n_ctx      = lane_n_ctx(ctx, lane);
+        const int   limit      = n_ctx > 0 ? n_ctx - fit->reserve : 0;
+        auto render = [&] { return ctx.backend->render_chat(render_req); };
+        auto count  = [&](const std::string& p) {
+            return static_cast<int>(ctx.backend->tokenizer().encode(p).size());
+        };
+        prompt = render();
+        const int before = count(prompt);
+        int       tokens = before;
+        int       blocks = 0;
+        if (template_renders_reasoning) {
+            // N2: a drop is counted only when the re-rendered prompt actually
+            // changed. Reasonings the template hides (an assistant turn before
+            // the last user message) are cleared for the iteration but not
+            // counted, and their unchanged render does not advance the count.
+            while (n_ctx > 0 && tokens > limit && drop_oldest_reasoning(render_req.messages)) {
+                const std::string next = render();
+                // R2: compare the rendered bytes first. A hidden reasoning block
+                // (an assistant turn before the last user message) leaves the
+                // render unchanged, so the token count is not recomputed -- the
+                // encode was the near-245k-token cost per hidden block on the
+                // agent. A changed render is a real drop even when its token
+                // count happens to be equal.
+                if (next == prompt) continue;
+                prompt = next;
+                tokens = count(next);
+                ++blocks;
+            }
+        }
+        prep.truncation.blocks_dropped = blocks;
+        prep.truncation.tokens_before  = before;
+        prep.truncation.tokens_after   = tokens;
+        prep.truncation.reserve        = fit->reserve;
+        // N1: auto may truncate, it never refuses more than disabled. Being
+        // over the fit limit after the drops are exhausted is not a refusal:
+        // the fall-through is finish_prepare's own >= n_ctx check (the context
+        // guard forces the closer early when it is on). Only a prompt that
+        // reaches n_ctx is the 400, and it keeps the counts.
+        if (n_ctx > 0 && tokens >= n_ctx) {
+            return HttpResult{400,
+                              context_overflow_truncated(tokens, n_ctx, fit->reserve, blocks,
+                                                         tokens - n_ctx)};
+        }
+        fit_tokens = tokens;
+    } else {
+        prompt = ctx.backend->render_chat(prep.req);
+    }
     // The template decides whether the answer starts inside a think block; the
     // split of reasoning from content below follows that, not a guess.
     prep.think_tags_extended = ctx.backend->status().think_tags_extended;
@@ -740,7 +836,7 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
     // that ends up with thinking off gets the non-thinking row.
     const bool nothink = prep.req.has_enable_thinking && !prep.req.enable_thinking;
     if (auto err = finish_prepare(ctx, lane, prompt, prep.req.sampler, prep.input, prep.prompt_tokens,
-                                  nothink)) {
+                                  nothink, {}, fit_tokens)) {
         return err;
     }
     // llava: the answer row switches only in a turn the request declared as

@@ -34,6 +34,12 @@ nlohmann::json usage_json(const GenerationStats& stats);
 // once.
 bool loop_guard_moved(const GenerationStats& stats);
 
+// feyntalk W3.5: the `truncation: "auto"` fit pass's numbers, once, for the
+// non-streamed `arcint.truncated` object and the stream's arcint:truncated
+// event: blocks dropped, tokens freed, prompt tokens before/after and the
+// reserve the fit rule left for generation.
+nlohmann::json truncation_json(const TruncationReport& truncation);
+
 void log_slot_line(int slot, const char* phase, int tokens, double seconds, double rate,
                    const std::string& suffix = {});
 void log_stats(int slot, const GenerationStats& stats, FinishReason reason);

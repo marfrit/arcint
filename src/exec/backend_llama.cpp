@@ -1107,6 +1107,7 @@ public:
         }
         Sampler sampler(in.sampler, seed);
         sampler.set_prompt(prompt);
+        prepare_think_ctx(in.sampler, cap, stats.prompt_tokens, sampler);
         prepare_think_mask(in, sampler);
         prepare_loop_guard(in, sampler);
         const auto tool_grammar = prepare_tool_grammar(in, sampler);
@@ -1310,6 +1311,7 @@ public:
         }
         Sampler sampler(in.sampler, seed);
         sampler.set_prompt(tokenizer_->encode(in.prompt));
+        prepare_think_ctx(in.sampler, cap, stats.prompt_tokens, sampler);
         prepare_think_mask(in, sampler);
         prepare_loop_guard(in, sampler);
         const auto tool_grammar = prepare_tool_grammar(in, sampler);
@@ -1705,6 +1707,7 @@ private:
         }
         Sampler sampler(in.sampler, seed);
         sampler.set_prompt(prompt);
+        prepare_think_ctx(in.sampler, cap, stats.prompt_tokens, sampler);
         prepare_think_mask(in, sampler);
         prepare_loop_guard(in, sampler);
         const auto tool_grammar = prepare_tool_grammar(in, sampler);
@@ -2141,13 +2144,28 @@ private:
         return ids;
     }
 
+    // feyntalk W3.4: the context guard's budget at request start. The sampler
+    // knows neither n_ctx nor the prompt's position, so the lane's cap and the
+    // served prompt count arrive here; reserve 0 is the switch off and sets
+    // nothing. Called before prepare_think_mask, so start_in_think_block() can
+    // arm a prompt already inside the reserve at its first thinking token.
+    // The lane's cap, not the process pool: a named lane's request cannot spill
+    // into another lane's context.
+    static void prepare_think_ctx(const SamplerParams& sp, int cap, int prompt_tokens,
+                                  Sampler& sampler) {
+        if (sp.think_ctx_reserve <= 0) return;
+        sampler.set_think_ctx_budget(think_ctx_budget(cap, prompt_tokens, sp.think_ctx_reserve));
+    }
+
     void prepare_think_mask(const GenerationInput& in, Sampler& sampler) const {
         // llava: the answer row needs the same tracker, so the ids are set for
         // it too; the mask itself still engages only under think_eog_mask.
         // loop-guard: the detector needs the block's state and the closer id for
         // the slap, so it arms the tracker too.
+        // feyntalk W3.4: the context guard needs the block's state and its own
+        // closer id, the same pairing the slap uses.
         if (!in.sampler.think_eog_mask && !in.sampler.tool_grammar && !in.sampler.answer_configured()
-            && in.sampler.loop_guard == LoopGuardMode::Off)
+            && in.sampler.loop_guard == LoopGuardMode::Off && in.sampler.think_ctx_reserve <= 0)
             return;
         ThinkBlockIds ids = in.think_tags_extended ? think_ids_ext_ : think_ids_qwen_;
         ids.eog = eog_ids_;
@@ -2206,12 +2224,18 @@ private:
         stats.loop_self_closes = c.self_closes;
         stats.loop_door_masked = c.door_masked;
         stats.loop_door_eog_masked = c.door_eog_masked;
+        stats.loop_context_closes    = c.ctx_closes;
+        stats.loop_context_no_closer = c.ctx_no_closer;
+        stats.loop_context_token_index = c.ctx_forced_index;
         if (c.detections || c.nudges || c.slaps || c.aborts || c.self_closes || c.door_masked
             || c.door_eog_masked)
             log::info("loop-guard", "lane %d: detected %d, nudged %d, slapped %d, aborted %d, "
                       "self-closed %d, door masked %d, door EOG masked %d", seq,
                       c.detections, c.nudges, c.slaps, c.aborts, c.self_closes, c.door_masked,
                       c.door_eog_masked);
+        if (c.ctx_closes || c.ctx_no_closer)
+            log::info("context-guard", "lane %d: closed %d, no closer %d, forced at token %d", seq,
+                      c.ctx_closes, c.ctx_no_closer, c.ctx_forced_index);
     }
 
     // One llama_decode of n tokens of `seq` at positions [pos, pos + n), with

@@ -242,6 +242,16 @@ std::string usage_text() {
         "                            behaviour of every build up to this one; a request\n"
         "                            may set the same thing as think_eog_mask\n"
         "  --tool-grammar            constrain a tool call to the declared schemas\n"
+        "  --think-ctx-reserve N     tokens of the lane's context reserved for what\n"
+        "                            is left after the thought (default 0: off). The\n"
+        "                            sampler forces the think-block's closer once\n"
+        "                            n_ctx - prompt_tokens - N reasoning tokens have\n"
+        "                            been emitted, through the loop guard's forced-\n"
+        "                            closer seam; a prompt already inside the reserve\n"
+        "                            forces it at the first thinking token. With a\n"
+        "                            loop-guard nudge in flight the closer waits for\n"
+        "                            the sentence's remaining ids: add that length to\n"
+        "                            the reserve\n"
         "                            with a GBNF grammar: a call the model starts is\n"
         "                            one it finishes, so an unterminated call block is\n"
         "                            unreachable. A no-op when the request declared no\n"
@@ -632,6 +642,11 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             cfg.nothink_presence_penalty = static_cast<float>(d);
         } else if (arg == "--think-eog-mask") {
             cfg.think_eog_mask = true;
+        } else if (arg == "--think-ctx-reserve") {
+            int n = 0;
+            if (!value(v) || !parse_int(v, n) || n < 0)
+                return fail("--think-ctx-reserve needs a token count >= 0 (0: off)");
+            cfg.think_ctx_reserve = n;
         } else if (arg == "--tool-grammar") {
             cfg.tool_grammar = true;
         } else if (arg == "--loop-guard") {
@@ -929,6 +944,7 @@ std::optional<std::string> apply_operator_defaults(const Config& cfg, SamplerDef
     o.answer_presence_penalty  = cfg.answer_presence_penalty;
     o.answer_frequency_penalty = cfg.answer_frequency_penalty;
     if (cfg.think_eog_mask) o.think_eog_mask = true;
+    if (cfg.think_ctx_reserve > 0) o.think_ctx_reserve = cfg.think_ctx_reserve;
     if (cfg.tool_grammar)   o.tool_grammar   = true;
     // loop-guard: off changes nothing and does not mark the defaults operator;
     // any other rung carries its window/threshold/grace with it.

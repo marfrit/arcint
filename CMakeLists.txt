@@ -249,6 +249,7 @@ if(ARCINT_TESTS)
     tests/test_props.cpp
     tests/test_sampler_modes.cpp
     tests/test_loop_guard.cpp
+    tests/test_context_guard.cpp
     tests/test_lanes.cpp
     tests/test_reasoning.cpp
     tests/test_markers.cpp
@@ -359,6 +360,16 @@ if(ARCINT_TESTS)
   set_tests_properties(fn-sweep-flags PROPERTIES LABELS unit)
 
   # The release speed gate's decision function and parser (tests/acceptance/ab.py).
+  # The Open Responses compliance gate (docs/campaigns/feyntalk.md Gate 3):
+  # the official vendored CLI, the seven 1.3.0 ids against a --stub server. NOT
+  # the unit label: it needs node >= 22 and the pinned npm packages, while the
+  # offline unit gate does not. It skips loudly (exit 0, named) without node;
+  # FEYNTALK_COMPLIANCE_REQUIRED=1 turns a skip into a failure.
+  add_test(NAME feyntalk-compliance
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/feyntalk/run-compliance.sh"
+                   "$<TARGET_FILE:arcint>")
+  set_tests_properties(feyntalk-compliance PROPERTIES TIMEOUT 300 LABELS compliance)
+
   add_test(NAME acceptance-ab
            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/acceptance/ab_selftest.py")
   set_tests_properties(acceptance-ab PROPERTIES LABELS unit)

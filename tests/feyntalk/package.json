@@ -1,0 +1,11 @@
+{
+  "name": "arcint-feyntalk-compliance",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Pinned runner dependencies for the vendored Open Responses compliance CLI (tests/feyntalk)",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "tsx": "4.19.2",
+    "zod": "3.25.76"
+  }
+}

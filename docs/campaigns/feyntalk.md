@@ -63,7 +63,14 @@ namespace and an optional token mode.
 3. **Compliance CLI** against a stub (or CPU llama) build on a test port:
    `failed == 0` among the runnable tests, exit 0, and the skipped set equals
    the named list below. The CLI's per-request deadline is 30 s (`paper`, its
-   README); a stub build meets it.
+   README); a stub build meets it. In the repository: `ctest -L compliance`
+   (not the unit label) runs `tests/feyntalk/run-compliance.sh`, the official
+   CLI vendored under `tests/feyntalk/openresponses/` (2026-04-24 release,
+   Apache-2.0; manifest in `THIRD_PARTY.md`), the seven ids against a `--stub`
+   with `--queue-timeout 30`; node >= 22 + the pinned tsx/zod are installed
+   with `npm ci --ignore-scripts` into an ignored cache, and without node the
+   run is SKIPPED loudly (exit 0, named; `FEYNTALK_COMPLIANCE_REQUIRED=1` makes
+   it a failure).
 4. **Live leg**: a pi session with provider type `openai-responses` (SSE) runs
    a short multi-turn tool-using task against a test port on the card host in
    one card window (`docs/sop-card-window.md`). Gates: the task's expected
@@ -179,7 +186,8 @@ scan, reasoning split, UTF-8 hold-back and tool parsing.
 | `reasoning.effort` `"none"` | `enable_thinking=false` | the fleet's switch `code` |
 | `reasoning.effort` low/medium/high/xhigh/minimal | `enable_thinking=true` | Qwen templates know on/off only (`src/core/chat.cpp:354` comment) `code`; echoed unchanged |
 | `reasoning.summary` | accepted, echoed `null`; no summary is produced | 1.3.x |
-| `truncation` `"disabled"` or `"auto"` | both: no truncation, `§3.8` 400 on overflow with `prompt_tokens`/`n_ctx` | `paper`: `auto` MAY truncate, not MUST; `disabled` MUST fail — same behaviour `code` |
+| `truncation` `"disabled"` or absent | no truncation; `§3.8` 400 only at `prompt_tokens >= n_ctx`, with the numbers | `paper`: `disabled` MUST fail; `code`, byte-identical |
+| `truncation` `"auto"` | the fit pass drops rendered replayed reasoning blocks oldest first until the prompt fits `n_ctx - reserve` (W3.5); never refuses more than `disabled`; `arcint:truncated` / `arcint.truncated` reports it | `paper`: `auto` MAY truncate, not MUST; operator decision 2026-10-31, `code` |
 | `stream`, `stream_options.include_obfuscation` | `stream` honoured; obfuscation accepted and ignored (arcint emits no `obfuscation`) | `paper` optional field |
 | `store`, `background`, `metadata`, `service_tier`, `safety_identifier`, `prompt_cache_key` | echoed; `background:true` → 400 `unsupported_parameter`, `service_tier` other than `auto`/`default` → 400 | see Scope `code` |
 | `max_tool_calls` | 400 `unsupported_parameter`, param `max_tool_calls` | 1.3.x |
@@ -374,6 +382,186 @@ param)` so the chat and completions routes keep their bytes unchanged.
 `dump_json` keeps replacing invalid UTF-8 with U+FFFD (`src/api/error.h`,
 `code`); an error body still serialises.
 
+## Context guard (W3.4)
+
+Operator problem (2026-10-31): the model sometimes thinks itself out of its
+context inside ONE turn, before the agent's between-turn compaction can act.
+The answer is not to stop it thinking but to close the thought with the
+think-block's own closer while there is still room to answer.
+
+**Seam.** The loop guard's existing slap path: `sample()` returns the block's
+closer id as the next token, before the masks, the penalties and the draw, and
+the caller emits, observes and decodes it like any drawn token (`code`,
+`src/core/sampler.cpp`). The context guard is a **second trigger** of that
+forced closer, with its own reason (`context-guard`) and its own counter
+(`ctx_closes`/`ctx_no_closer`); it opens no door, injects no text, changes no
+finish reason. Its forced close is not counted as a door self-close, exactly as
+the slap's is (the `loop_forced_closer_` flag the tracker consumes).
+
+**Budget.** The sampler knows neither n_ctx nor the prompt's position, so the
+backend computes `n_ctx - prompt_tokens - reserve` at request start (the lane's
+cap, the served prompt count) and hands it over after `set_prompt()` and before
+`start_in_think_block()`. `n_ctx` is the lane's cap, not the process pool
+(`code`, `src/exec/backend_llama.cpp` `prepare_think_ctx`). `--think-ctx-reserve
+N` (default 0 = off) is the operator flag; a request never sets it; `/props`
+names the served value under `sampler_defaults`. With a loop-guard nudge in
+flight the forced closer waits for the nudge sentence's remaining ids, so the
+reserve must absorb that sentence's token length (tokeniser-dependent, a
+handful of ids on the artifact) in addition to the answer room the operator
+wants to keep (review F5).
+
+**Countdown, relative to the verify walk** (`code`): the countdown happens in
+`Sampler::observe()`, one per emitted token that lands **inside** the block --
+the opener included, a closer or an answer token excluded. This is not the
+propose count: `observe()` is the one call every decode loop makes per emitted
+token, and in the verify walk (`src/exec/verify_walk.h`) it is the walk's own
+`observe(tok)` after `emit` has handed the token on, so every accepted draft
+counts exactly once -- the rejected drafts and the unemitted rows count zero.
+At 0 the **next** `sample()` returns the forced closer: within a verify chain
+that is the next row's sample, at that position, before the row is looked at.
+The forced token cannot be overwritten by an accepted draft: the walk draws
+with `sample()` and then compares `tok == draft[i]`; the forced token is the
+returned token regardless of the row, so either the draft happens to be the
+same closer (the token emitted is still the forced one) or the mismatch breaks
+the walk and drops the rest of the chain. The accept line below then keeps only
+the emitted prefix and rolls the KV back to it, so no drafted token past the
+boundary reaches the KV or the accept count. The earlier review's two rules
+carry over unchanged: the think mask never masks the closer (review B3,
+`closer_in_masked_set_`), and the door's mask applies inside `sample()`, so a
+forbidden draft is a mismatch like any other. The forced return precedes both
+masks, so neither can take the closer from the guard.
+
+**Edges, decided.** (1) A text-closer family has no closer id to force: the
+guard copies the slap -- no token is forced, the draw stands, one
+`context_no_closer` counter and one warn, and the `arcint:context` event says
+`forced_close: false`. (2) A prompt already inside the reserve
+(`n_ctx - prompt_tokens <= reserve`, budget <= 0) arms the closer at the first
+thinking token: the template-opened block takes the closer as its first token,
+thinking is skipped, the model answers inside what is left, no refusal.
+
+**Reporting.** The Responses stream carries one `arcint:context` event per turn
+when the reserve is configured: `v: 1, used, n_ctx, remaining`, plus
+`forced_close: true` and `token_index` (the emitted index the forced closer
+took, the same space as `arcint:token`) when it fired; the event is before the
+terminal event. The loop-guard stats object on both chat and Responses gains
+`context_closes` and `context_no_closer`; the decode line names them. The
+`token_index` is graded by the API (which owns prompt/completion counts and
+n_ctx), not the sampler, so no engine-loop hook was added. At reserve 0 the
+generated **tokens are byte-identical**, but the stats object is extended: the
+chat and Responses `loop_guard` object now carries the two context keys (nine
+instead of seven), so a client reading that object sees the extension even with
+the guard off (review F3).
+
+**Gate, measured-here (2026-10-31, stub build, aarch64):** red-first ten cases
+(sampler-level arithmetic incl. accepted-draft counting, forced close at budget
+0 under `--think-eog-mask` on and under the door ladder with the mask off,
+grammar live after the forced close, text-closer edge, prompt-inside-reserve
+edge, reserve-0 off, the object/line, the flag//props, the event); `ctest -L
+unit` 9/9, `arcint-test --max-skips 0` 442 cases 0 failed 0 skipped, the
+feyntalk-golden captures byte-identical, `tests/roundtrip.sh` green. The live
+check on the card is owed: it is not part of this package.
+
+**Review round W3.4b (`code`, 2026-10-31).** The engine maintainer blocked the
+merge on two sampler defects, both reproduced with a sampler probe:
+
+- **F1, fixed:** a pending context force survived a close by the slap and
+  forced a second closer into the answer, since the force branch checked
+  neither the block's state nor a cleared arm. Fix chosen: **gate the branch on
+  `think_state_ == thinking`**, rather than clearing the arm at the two close
+  sites -- one condition covers every path to content, present and future, and
+  enumerating close sites can miss the next one. A gated arm is dropped
+  silently and the turn settles.
+- **F2, fixed:** a prompt inside the reserve with the block not
+  template-opened armed in the undecided state, where no closer id exists,
+  spent the arm as `ctx_no_closer_` and latched the guard dead. Fix: the arm
+  requires the block open (`think_ctx_arm_()` checks the state); the opener's
+  `observe()` re-arms through the countdown.
+- **F3:** reserve 0 keeps the tokens byte-identical but extends the stats
+  object, as stated above.
+- **F4, reported only:** a forced close that is consumed and then ends on a
+  Length break before the emit counts `ctx_closes` (and the slap's `slaps`)
+  for a token that never reached the stream. Pre-existing for the slap; not
+  fixed here.
+- **F5:** the nudge-in-flight delay, stated next to `--think-ctx-reserve`.
+
+Cases red first: the P1 shape (the budget reaching 0 in the same `observe()`
+whose counted line trips the slap), the nudge-then-slap variant, the
+undecided-start opener, and the missing verify-walk case where the forced
+closer mismatches a draft token and truncates the chain. Gate after the fixes
+(`measured-here`, 2026-10-31, stub, aarch64): `ctest -L unit` 9/9, 455 cases 0
+failed 0 skipped, golden byte-identical, roundtrip green.
+
+## Truncation: `"auto"` (W3.5)
+
+Operator decision (2026-10-31): the campaign's earlier "arcint never truncates"
+is changed for the opt-in Responses case only. `truncation: "disabled"` and an
+absent field keep today's `§3.8` 400 on overflow, byte-identical; the chat and
+completions routes have no such field and are unchanged.
+
+Trigger: the rendered prompt leaves no room for generation,
+`prompt_tokens > n_ctx - reserve`. The reserve is the operator's
+`--think-ctx-reserve` when set, otherwise a small default of **256 tokens** of
+answer room, or the request's own `max_output_tokens` when that is smaller (a
+larger `max_output_tokens` does not enlarge the reserve: the length stop still
+bounds the answer, and reserving a client's 16k ask would drop nearly every
+reasoning block instead of failing honestly). Evidence for the rule: operator
+decision (`paper`/operator), the arithmetic and the fit pass `code`.
+
+The fit pass lives in `prepare_from_chat`'s optional `PromptFit` (W3.5), so
+there is still one prompt builder (`code`). On a **local render copy** it clears
+the oldest replayed `ChatMessage::reasoning`, re-renders and recounts, and
+repeats until the prompt fits; it walks messages in order, so the most recent
+assistant turn's reasoning is the last to go. It never drops or edits a message
+body, a tool call or a tool output. `out.req` stays the full history — the echo
+and the store are not rewritten; truncation is per request. **N1:** auto may truncate, it never refuses more than `disabled`. After the
+drops are exhausted, being over the fit limit while still under `n_ctx` is
+**served** -- the context guard forces the closer early when it is on, and a
+guard-off unit ends at the ordinary length stop. The 400 fires only when the
+prompt reaches `n_ctx`, the same condition `disabled` refuses on; its message
+names the drops and the remaining overflow (`reasoning dropped: N blocks, still
+M over`) and the fit numbers (`prompt_tokens`, `n_ctx`, `overflow`,
+`fit_reserve`, `reasoning_dropped_blocks`) reach the client.
+
+**N2:** a drop is counted only when the re-rendered prompt actually changed.
+Reasoning the template hides (an assistant turn before the last user message)
+is not a drop and adds no reports; a template that does not reference
+`reasoning_content` skips the whole pass (the backend's
+`supports_preserve_reasoning` capability; a backend without the key is treated
+as "may render").
+
+**N3:** the fit pass's render and token count are reused, so an `auto` request
+that already fits pays no extra render or encode. **R2:** a hidden reasoning
+block is recognised by comparing the rendered bytes first; its token count is
+not recomputed, so k hidden blocks cost no full-prompt encode (the
+near-245k-token cost on the agent), and a changed render counts as a drop even
+when its token count happens to be equal. **R3:** the fit numbers
+(`overflow` with `fit_reserve` and `reasoning_dropped_blocks`) reach the client
+only for the fit pass's own 400; the `disabled`/absent 400 keeps today's
+bytes, with no top-level `overflow`. **N6:** with `auto` and a
+reserve R the fit stops at the first drop under `n_ctx - R`, so a truncated
+turn's context-guard budget can be 0 -- with the guard on, the closer is forced
+at the first thinking token; that is the intended cheap tier, not a defect.
+
+**Record correction (W3.5c R1).** W3.5b's red record said "13 matched, 3
+failed"; the run could not have completed that way -- two of the cases
+terminated on unguarded lookups (a missing `overflow` key and an empty message
+vector after a refused prepare, exit 134). The behaviour red cases were red by
+assertion/refusal; the guards now make such regressions FAIL instead of
+terminating.
+
+Reporting: `arcint:truncated` on the stream (before the terminal event) and
+`arcint.truncated` in the non-streamed resource's extension object — blocks
+dropped, tokens freed, prompt tokens before/after, the reserve — only when
+something was dropped. One `req:` log line carries the same numbers with the
+lane's `n_ctx`. The resource echoes `truncation: "auto"` (it did before; now
+it describes behaviour).
+
+Continuation: the stored `ChatRequest` keeps every reasoning block. For a
+truncated turn the stored prefix hash is taken over the full history's render,
+because the next continuation re-renders the full history and applies its own
+truncation setting (`code`, `responses_state.cpp`); otherwise the prefix check
+would refuse a chain that was legitimately shortened.
+
 ## Token mode (point 10)
 
 Decided as an **option in 1.3.0**, off by default; text stays the default until
@@ -510,6 +698,11 @@ Two ids are named in the specification README (`basic-response`,
 | W2 | **SSE event writer**: `sequence_number`, `event:` line, item/part lifecycle, reasoning/text/function-call deltas, terminal events, `[DONE]`, in-stream error + `failed` | `src/api/responses_stream.{h,cpp}`, `tests/test_responses.cpp`, `tests/roundtrip.sh` | unit event order/sequence/lifecycle green; stub curl SSE green; compliance HTTP+SSE runnable subset 0 failed |
 | W3 | **state + continuation**: `ResponseStore`, limits/LRU/TTL, `store` semantics, `previous_response_id`, `prefix_hash`, `SlotPool::try_acquire`, eviction on error | `src/api/responses_state.{h,cpp}`, `src/api/handlers.{h,cpp}` (`SlotPool`), `src/api/responses.cpp`, `src/config.{h,cpp}`, `/props`, `tests/test_responses.cpp` | unit store/continuation/eviction green; stub continuation `cache_hit_tokens >= prompt_tokens - 1`; compliance `previous_response_id` tests |
 | W3.2 | **reasoning replay**: `ChatMessage::reasoning`, Responses reasoning-item pairing, chat `reasoning_content`, the stub template's Qwen3 rule, stored-continuation assistant turns per output item, think state keyed to the generation start | `src/core/chat.{h,cpp}`, `src/exec/chat_json.h`, `src/api/responses.cpp`, `tests/test_chat.cpp`, `tests/test_responses.cpp`, `tests/golden/feyntalk-w1/` | unit mapping/rendering/continuation red-first; think-state guard with replayed closed reasoning; 12 golden captures (10 old byte-identical); roundtrip |
+| W3.4 | **context guard**: the loop guard's forced-closer seam, a second trigger with its own reason and counter; the budget `n_ctx - prompt_tokens - reserve` handed at request start, counted down per emitted token, forced closer at 0; `--think-ctx-reserve N` (default 0 = off), `/props`; `arcint:context` event, the counters in the loop-guard object, the slot line | `src/core/sampler.{h,cpp}`, `src/core/sampling.{h,cpp}`, `src/exec/backend_llama.cpp` (`prepare_think_ctx`, the three sampler sites), `src/config.{h,cpp}`, `src/api/{handlers,generate,responses_stream}.cpp`, `tests/test_context_guard.cpp`, `tests/test_responses.cpp`, `tests/test_stream_utf8.cpp` | red-first 10 cases; `ctest -L unit` 0 failed; `arcint-test --max-skips 0` 0 failed; golden byte-identical; roundtrip green. The live card check is owed (no card in this package) |
+| W3.5c | **release-path round for W3.5**: R1 (testable cases fail instead of terminating; the W3.5b red record corrected), R2 (render-byte comparison before the token count; hidden blocks cost no encode), R3 (`overflow` copied only with the fit fields, so the disabled/absent 400 stays byte-identical), R4 (current gate count), R5 (the exhausted-under-n_ctx-with-drops case and the capability-false skip) | `tests/test_responses.cpp`, `src/api/handlers.cpp` (the fit loop), `src/api/responses.cpp` (`translate_prepare_error`), `docs/campaigns/feyntalk.md` | red-first one case (R3); `ctest -L unit` 0 failed; `arcint-test --max-skips 0` 0 failed; golden byte-identical; roundtrip and compliance green |
+| W3.5b | **review round for W3.5**: N1 (auto never refuses more than disabled; fall-through to `>= n_ctx`, counts in that 400), N2 (un-rendered reasoning not counted; a template without `reasoning_content` skips the pass), N3 (the fit count reused), N4 (the fit numbers reach the client; message sentence fixed), N5 (table cells), N6 (documented); red first | `src/api/handlers.cpp` (fit pass, `finish_prepare`'s count hint), `src/api/responses.cpp` (`translate_prepare_error`), `src/api/error.cpp`, `tests/test_responses.cpp` | red-first three cases; `ctest -L unit` 0 failed; `arcint-test --max-skips 0` 0 failed; golden byte-identical; roundtrip and compliance green |
+| W3.4b | **review round for W3.4**: F1 (the pending force survives a slap close) fixed by a `think_state_ == thinking` gate; F2 (an undecided start spends the arm) fixed by requiring the open block in `think_ctx_arm_()`; F3/F4/F5 recorded; the missing verify-walk case added; red first | `src/core/sampler.cpp` (`sample()`'s context branch, `think_ctx_arm_()`), `tests/test_context_guard.cpp`, `docs/campaigns/feyntalk.md` | red-first four cases; `ctest -L unit` 0 failed; `arcint-test --max-skips 0` 0 failed; golden byte-identical; roundtrip and compliance green |
+| W3.5 | **truncation auto**: the cheap compaction tier, reasoning first — `prepare_from_chat`'s optional fit policy (`PromptFit`) drops the oldest replayed reasoning block on a local render copy until the prompt fits `n_ctx - reserve`, re-rendering and recounting; exhausted → the same 400 with counts; `arcint:truncated` event / `arcint.truncated` object, one `req:` line; the store keeps the full history and a truncated turn's prefix hash is taken over the full render | `src/api/handlers.{h,cpp}` (`PromptFit`, `drop_oldest_reasoning`), `src/api/responses.cpp` (reserve, `PromptFit`, log, ext object), `src/api/responses_stream.cpp` (event), `src/api/responses_state.cpp` (hash), `src/api/error.{h,cpp}` (exhausted 400), `src/api/generate.{h,cpp}` (`truncation_json`), `tests/test_responses.cpp` | red-first nine cases; `ctest -L unit` 0 failed; `arcint-test --max-skips 0` 0 failed; golden byte-identical; roundtrip green |
 | W4 | **cancel by id**: extension route, in-flight registry, `GenerationInput::cancel`, `AbortCause::Cancelled`, `abort_cause_of` + stub `cause`, `arcint:response.cancelled` + incomplete(cancelled) | `src/http/server.cpp`, `src/api/responses_state.{h,cpp}`, `src/exec/backend.h` (~390), `src/exec/backend_llama.cpp:150-152`, `src/exec/backend_stub.cpp:216-220`, `tests/test_responses.cpp`, a cancel measurement script under `tools/` | unit cancel paths red-first; stub cancel at 4 ubatches; card window: cancel-to-abort within one ubatch at 100k, control arm the same |
 | W5 | **gate + live leg**: vendor the compliance library at the pinned release into `tests/feyntalk/`, wire a runner, add the pi multi-turn leg | `tests/feyntalk/`, `tests/CMakeLists.txt` or `CMakeLists.txt`, `tools/feyntalk_live.py` | compliance 0 failed, skipped = the named list; live leg passes Gate 4 |
 | W6 | **token mode + spans + material**: `arcint.token_mode`/`input_ids`/`renderer_hash`, `arcint:token`, `arcint:span`, sampler event sink, `Backend::renderer_material()`, `GET /v1/responses/renderer`, hash | `src/api/responses*.{h,cpp}`, `src/core/sampler.{h,cpp}` (580/779/788/813), `src/core/sampling.h:166`, `src/exec/backend.h` + `backend_llama.cpp` (326/1032 area), `src/api/handlers.cpp` (`/props` 514), `tests/test_responses.cpp` | unit token/span/shadow equality green; hash stable across two loads; off by default; live token leg (Gate 5) |
@@ -591,7 +784,7 @@ marked); the note's decisions stand except where a row says otherwise.
 
 ## Current state
 
-W1–W4 and W3.2 are built and accepted (2026-10-31); W5's fix round landed: the request mapping and the
+W1–W4, W3.2, W3.4 and W3.5 are built and accepted (2026-10-31); W5's fix round landed: the request mapping and the
 non-stream/non-SSE `ResponseResource` (`src/api/responses.*`), the SSE event
 writer (`responses_stream.*`) with the item/part lifecycle and the terminal
 events, the in-memory state and continuation (`responses_state.*`) with
@@ -605,15 +798,18 @@ prompt equals a full-history request's with the same items. `include` is accepte
 its code and numbers; the chat route has the same gap for prepare-time
 refusals and was left unchanged (its bytes are a gate).
 
-Gate numbers (`measured-here`): `ctest -L unit` 7/7, 432 cases 0 failed 0
-skipped on the stub build with `-Werror`; the feyntalk-golden captures of the
+Gate numbers (`measured-here`): `ctest -L unit` 9/9, 459 cases 0 failed 0
+skipped on the stub build with `-Werror` (432 before W3.4's ten cases, W3.5's
+nine, W3.4b's four, W3.5b's two and W3.5c's two); the feyntalk-golden captures of the
 chat/completions routes (12: the 10 original byte-identical plus two carrying
 `reasoning_content`) stay byte-identical; `tests/roundtrip.sh` green
 including the two-turn continuation and cancel-by-id checks; the 7 named
 compliance ids (`basic-response`, `streaming-response`, `system-prompt`,
 `tool-calling`, `multi-turn`, `assistant-phase`,
 `response-output-phase-schema`) pass against the stub (second-reader run,
-node+tsx; the vendor + runner stays W5).
+node+tsx; W5 rest now vendors it in the repository and runs it as the
+`compliance` ctest label — 7/7 against the stub, five consecutive runs
+(`measured-here`), and a mutated build fails it).
 
 Live leg (`measured-here`, 2026-10-31, Arc A770, the coder model, serving build
 83d4e26, pi with provider type `openai-responses`): PASS — 4 tool calls
@@ -650,6 +846,26 @@ fresh prefill tokens vs 19 requests, hit 91.8 %, 3,738 fresh. Thinking was short
 on this task (50-300 characters a step), so the absolute saving is small here;
 with long reasoning steps the arm without W3.2 re-prefills all of them.
 
+W3.5 (`truncation: "auto"`) is built and tested: the reasoning-first fit pass
+in `prepare_from_chat` (`PromptFit`), the 256-token/smaller-`max_output_tokens`
+reserve, the exhausted 400 with counts, `arcint:truncated` /
+`arcint.truncated`, the store keeping the full history and the full-render
+prefix hash for truncated turns. W3.5c's release-path round then made the
+cases fail instead of terminating, compared render bytes before the token
+count, kept the disabled/absent 400 byte-identical and added the two remaining
+cases. `ctest -L unit` 9/9, `arcint-test --max-skips 0` 459 cases 0 failed 0
+skipped, golden byte-identical, roundtrip and compliance green (`measured-here`,
+2026-10-31, stub, after the W3.4b, W3.5b and W3.5c rounds). No card check
+applies to this package.
+
+W3.4 (context guard) is built, unit-tested and default off: the loop guard's
+forced-closer seam with its own counter, the budget at request start, the
+countdown per emitted token (accepted drafts once each), the two edges, the
+`arcint:context` event and the line. `ctest -L unit` 9/9, `arcint-test
+--max-skips 0` 442 cases 0 failed 0 skipped, golden byte-identical, roundtrip
+green (`measured-here`, 2026-10-31, stub build). Its live check on the card is
+owed and is not part of the package.
+
 W5 still owes the compliance vendor + runner and the live token-mode leg is
 W6. `GET /v1/responses/{id}` is not in the 2026-04-24 OpenAPI document and
 was not added. No WebSocket, no compact/background, no W6 option work.
@@ -665,13 +881,15 @@ was not added. No WebSocket, no compact/background, no W6 option work.
 - new `src/api/responses.{h,cpp}`, `responses_stream.{h,cpp}`,
   `responses_state.{h,cpp}`, `generate.{h,cpp}`.
 - `src/exec/backend.h` (`GenerationInput`, `AbortCause`, `Backend`) and
-  `backend_llama.cpp` only at `abort_cause_of` 150-152 and the load-time
-  material area 326/1032; `backend_stub.cpp` 216-220. The step loop, and the
-  `mtpw` trace writes near :1782 and :1871, are untouched.
+  `backend_llama.cpp` at `abort_cause_of` 150-152, the load-time
+  material area 326/1032, and W3.4's `prepare_think_ctx` at the three sampler
+  construction sites (request start, not the step loop); `backend_stub.cpp`
+  216-220. The step loop, and the `mtpw` trace writes near :1782 and :1871,
+  are untouched.
 - `src/core/{chat,toolcall,reasoning,sampler,sampling}.{h,cpp}` — the mapping,
   the split, and the sampler's event sink (580/779/788/813, params at
   `sampling.h:166`).
 - `src/api/error.h` — the spec-typed `responses_error` next to `error_body`.
-- `tests/test_responses.cpp`, `tests/roundtrip.sh`, `tests/feyntalk/` (vendored
-  compliance library + runner), `tools/feyntalk_live.py`,
-  `tools/feyntalk_cancel.py`.
+- `tests/test_responses.cpp`, `tests/test_context_guard.cpp`, `tests/roundtrip.sh`,
+  `tests/feyntalk/` (vendored compliance library + runner),
+  `tools/feyntalk_live.py`, `tools/feyntalk_cancel.py`.
