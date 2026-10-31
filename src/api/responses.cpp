@@ -673,12 +673,37 @@ std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest r
         // stored input messages + the stored assistant turn + the new items.
         // The new request's tools, tool_choice, sampler and thinking settings
         // are the turn's own; the template is the one process.
+        //
+        // Instructions (W3.1): an OpenAI-compatible client resends its full
+        // system prompt as `instructions` on every turn, and the Qwen-family
+        // templates reject a system message that is not first. The spec gives no
+        // replacement rule; we read `instructions` as this turn's guidance, so a
+        // request that carries them REPLACES the stored head system message in
+        // place, and a request that carries none KEEPS the stored head (absent
+        // means "no new guidance", not "drop the stored system prompt"). With the
+        // same text resent, the head and the stored half render to the same bytes
+        // as before, which is what slot affinity's prefix needs.
+        std::vector<ChatMessage> new_items = req.chat.messages;
+        ChatMessage              new_head;
+        bool                     has_new_head = false;
+        if (req.has_instructions && !new_items.empty() && new_items.front().role == "system" &&
+            new_items.front().content == req.instructions) {
+            new_head = std::move(new_items.front());
+            new_items.erase(new_items.begin());
+            has_new_head = true;
+        }
         ChatRequest merged = req.chat;
         merged.messages.clear();
         merged.messages = stored->chat.messages;
+        if (has_new_head) {
+            if (!merged.messages.empty() && merged.messages.front().role == "system")
+                merged.messages.front() = std::move(new_head);
+            else
+                merged.messages.insert(merged.messages.begin(), std::move(new_head));
+        }
         if (!stored->output_items.empty())
             merged.messages.push_back(assistant_turn_of(stored->output_items));
-        for (const ChatMessage& m : req.chat.messages) merged.messages.push_back(m);
+        for (ChatMessage& m : new_items) merged.messages.push_back(std::move(m));
         req.chat = std::move(merged);
     }
 
