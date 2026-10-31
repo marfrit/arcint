@@ -1204,15 +1204,18 @@ TEST(responses_a_two_turn_continuation_rebuilds_and_echoes) {
     const auto err = api::prepare_response(fx.ctx, std::move(r2), p2);
     CHECK(!err.has_value());
     if (err.has_value()) return;
-    // Stored input messages (1 user) + the rebuilt assistant turn + the new
-    // tool output.
-    CHECK_EQ(p2.chat.req.messages.size(), 3u);
-    if (p2.chat.req.messages.size() < 3) return;
+    // Stored input messages (1 user) + one assistant message per output item
+    // (the message and the function_call; W3.2 made the continuation mirror the
+    // full-history item shape so the prompt can match) + the new tool output.
+    CHECK_EQ(p2.chat.req.messages.size(), 4u);
+    if (p2.chat.req.messages.size() < 4) return;
     CHECK_EQ(p2.chat.req.messages[1].role, std::string("assistant"));
-    CHECK_EQ(p2.chat.req.messages[1].tool_calls.size(), size_t(1));
-    CHECK_EQ(p2.chat.req.messages[2].role, std::string("tool"));
-    CHECK_EQ(p2.chat.req.messages[2].tool_call_id, call_id);
-    CHECK_EQ(p2.chat.req.messages[2].content, std::string("alpha"));
+    CHECK_EQ(p2.chat.req.messages[2].role, std::string("assistant"));
+    CHECK_EQ(p2.chat.req.messages[2].tool_calls.size(), size_t(1));
+    CHECK_EQ(p2.chat.req.messages[2].tool_calls[0].id, call_id);
+    CHECK_EQ(p2.chat.req.messages[3].role, std::string("tool"));
+    CHECK_EQ(p2.chat.req.messages[3].tool_call_id, call_id);
+    CHECK_EQ(p2.chat.req.messages[3].content, std::string("alpha"));
     CHECK(p2.affinity_slot >= 0);
 
     const api::HttpResult res2 = api::run_response(fx.ctx, p2, 0);
@@ -1708,6 +1711,11 @@ TEST(responses_pairs_reasoning_items_with_the_next_assistant_item) {
 }
 
 TEST(responses_continuation_renders_the_stored_reasoning_like_full_history) {
+    // A tool loop has no new user turn between the assistant turn and the tool
+    // output, so the stored assistant turn sits AFTER the last user message and
+    // the Qwen3 template shows its reasoning block. A continuation must render
+    // that block exactly as a full-history client request does (pi replays the
+    // reasoning item of every past assistant turn), so the prefix can match.
     ReplayFixture fx;
     fx.backend.pieces = {{open_tag(), 1}, {"WHY", 2}, {close_tag(), 3}, {"ANSWER", 4}};
 
@@ -1723,24 +1731,26 @@ TEST(responses_continuation_renders_the_stored_reasoning_like_full_history) {
         if (item["type"].get<std::string>() == "reasoning") saw_reasoning_item = true;
     CHECK(saw_reasoning_item);
 
-    // Turn 2a: a continuation.
-    json b2 = {{"model", "stub"}, {"previous_response_id", id}, {"input", "second"},
+    // Turn 2a: a continuation whose new input is a tool output (no new user).
+    json b2 = {{"model", "stub"}, {"previous_response_id", id},
+               {"input", json::array({{{"type", "function_call_output"},
+                                       {"call_id", "call_x"}, {"output", "tool-result"}}})},
                {"max_output_tokens", 256}};
     ResponseRequest r2;
     parse_ok(b2, r2);
     PreparedResponse p2;
     CHECK(!api::prepare_response(fx.ctx, std::move(r2), p2).has_value());
     const std::string cont_prompt = p2.chat.input.prompt;
-    CHECK(cont_prompt.find("WHY") != std::string::npos);
+    CHECK(cont_prompt.find("WHY") != std::string::npos);   // after the last user message
 
-    // Turn 2b: the same history as a full-history client request (pi replays
-    // the reasoning item of every past assistant turn).
+    // Turn 2b: the same history as a full-history Responses request.
     json b3 = {{"model", "stub"},
-               {"input", json::array({reasoning_item("WHY"),
-                                      {{"type", "message"}, {"role", "assistant"},
-                                       {"content", "ANSWER"}},
-                                      {{"type", "message"}, {"role", "user"},
-                                       {"content", "second"}}})},
+               {"input", json::array({
+                    {{"type", "message"}, {"role", "user"}, {"content", "question"}},
+                    reasoning_item("WHY"),
+                    {{"type", "message"}, {"role", "assistant"}, {"content", "ANSWER"}},
+                    {{"type", "function_call_output"}, {"call_id", "call_x"},
+                     {"output", "tool-result"}}})},
                {"max_output_tokens", 256}};
     ResponseRequest r3;
     parse_ok(b3, r3);
@@ -1748,14 +1758,14 @@ TEST(responses_continuation_renders_the_stored_reasoning_like_full_history) {
     CHECK(!api::prepare_response(fx.ctx, std::move(r3), p3).has_value());
     CHECK_EQ(cont_prompt, p3.chat.input.prompt);
 
-    // The chat route's full-history form (reasoning_content on the assistant
-    // message) renders the same prompt.
+    // The chat route's full-history form renders the same prompt.
     json chat = {{"model", "stub"},
                  {"messages", json::array({
                       {{"role", "user"}, {"content", "question"}},
                       {{"role", "assistant"}, {"content", "ANSWER"},
                        {"reasoning_content", "WHY"}},
-                      {{"role", "user"}, {"content", "second"}}})},
+                      {{"role", "tool"}, {"tool_call_id", "call_x"},
+                       {"content", "tool-result"}}})},
                  {"max_tokens", 256}};
     ChatRequest creq;
     CHECK(!parse_chat_request(chat, creq).has_value());

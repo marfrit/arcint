@@ -92,8 +92,35 @@ std::optional<HttpResult> read_message_content(const json& content, ChatMessage&
     return std::nullopt;
 }
 
-// One input item. `index` names the position in the error's message.
-std::optional<HttpResult> read_item(const json& item, ResponseRequest& req, size_t index) {
+// The reasoning text a reasoning input item carries: its reasoning_text parts,
+// joined with a newline (the campaign's parts rule). A null content is the
+// spec's input shape and contributes nothing.
+std::optional<std::string> reasoning_text_of(const json& item, std::string& out) {
+    if (!item.contains("content") || item["content"].is_null()) return std::nullopt;
+    const json& content = item["content"];
+    if (!content.is_array()) return std::string("reasoning.content must be an array or null");
+    std::string joined;
+    for (const json& part : content) {
+        if (!part.is_object() || !part.contains("type") || !part["type"].is_string())
+            return std::string("reasoning.content parts must be typed objects");
+        const std::string type = part["type"].get<std::string>();
+        if (type != "reasoning_text" && type != "text")
+            return std::string("reasoning.content part '" + type + "' is not served: reasoning_text only");
+        if (!part.contains("text") || !part["text"].is_string())
+            return std::string("reasoning.content: part is missing 'text'");
+        if (!joined.empty()) joined += "\n";
+        joined += part["text"].get<std::string>();
+    }
+    out = std::move(joined);
+    return std::nullopt;
+}
+
+// One input item. `index` names the position in the error's message; `pending`
+// is the reasoning an item has carried that belongs to the next assistant item
+// (the pairing rule: a reasoning item pairs with the FOLLOWING assistant message
+// or function_call; any other item in between drops it).
+std::optional<HttpResult> read_item(const json& item, ResponseRequest& req, size_t index,
+                                    std::string& pending) {
     const std::string where = log::format("input[%zu]", index);
     if (!item.is_object()) return invalid(where + " must be an object", "input");
     // The OpenAPI document marks `type` required but defaults every message
@@ -128,6 +155,12 @@ std::optional<HttpResult> read_item(const json& item, ResponseRequest& req, size
         // `phase` (2026-04-24) is accepted on an assistant message and ignored:
         // the template knows no phase, and the output carries none (optional
         // field). Review R2 of the campaign moved it out of the skip list.
+        if (msg.role == "assistant") {
+            msg.reasoning = pending;   // the item that precedes this turn
+            pending.clear();
+        } else {
+            pending.clear();           // a user/system/developer turn ends the pairing
+        }
         req.chat.messages.push_back(std::move(msg));
         return std::nullopt;
     }
@@ -145,7 +178,9 @@ std::optional<HttpResult> read_item(const json& item, ResponseRequest& req, size
             return invalid(where + ".arguments must be a JSON string", "input");
         }
         ChatMessage msg;
-        msg.role = "assistant";
+        msg.role      = "assistant";
+        msg.reasoning = pending;
+        pending.clear();
         ToolCall call;
         call.id        = item["call_id"].get<std::string>();
         call.name      = item["name"].get<std::string>();
@@ -161,6 +196,7 @@ std::optional<HttpResult> read_item(const json& item, ResponseRequest& req, size
             return invalid(where + ".call_id is required", "input");
         }
         if (!item.contains("output")) return invalid(where + ".output is required", "input");
+        pending.clear();   // a tool output is not an assistant item
         ChatMessage  msg;
         msg.role         = "tool";
         msg.tool_call_id = item["call_id"].get<std::string>();
@@ -193,8 +229,15 @@ std::optional<HttpResult> read_item(const json& item, ResponseRequest& req, size
     }
 
     if (type == "reasoning") {
-        // Accepted and kept for the store; never rendered into the prompt
-        // (parity with /v1/chat/completions, which replays no reasoning).
+        // Kept for the record and paired with the following assistant item; the
+        // template decides whether the turn shows it (Qwen3 keeps the turns after
+        // the last user message, drops earlier ones).
+        std::string text;
+        if (auto e = reasoning_text_of(item, text)) return invalid(where + ".content: " + *e, "input");
+        if (!text.empty()) {
+            if (!pending.empty()) pending += "\n";
+            pending += text;
+        }
         req.reasoning_items.push_back(item);
         return std::nullopt;
     }
@@ -404,9 +447,10 @@ std::optional<HttpResult> parse_response_request(const json& body, ResponseReque
             msg.content = text;
             req.chat.messages.push_back(std::move(msg));
         } else if (input.is_array()) {
-            size_t i = 0;
+            std::string pending;   // reasoning that belongs to the next assistant item
+            size_t      i = 0;
             for (const json& item : input) {
-                if (auto err = read_item(item, req, i)) return err;
+                if (auto err = read_item(item, req, i, pending)) return err;
                 ++i;
             }
         } else {
@@ -628,29 +672,45 @@ HttpResult previous_not_found(const std::string& id, const std::string& why) {
         "invalid_request", "previous_response_not_found", "previous_response_id")};
 }
 
-// The stored assistant turn, rebuilt from the spec output items: the message
-// text and the function_call items. Reasoning items are not replayed (parity
-// with /v1/chat/completions).
-ChatMessage assistant_turn_of(const nlohmann::json& output_items) {
-    ChatMessage msg;
-    msg.role = "assistant";
+// One assistant ChatMessage per spec output item, in the item order and with
+// the same reasoning pairing as the input mapping, so a continuation renders
+// like a full-history request. Reasoning items pair with the following message
+// or function_call; reasoning parts join with a newline.
+std::vector<ChatMessage> assistant_turns_of(const nlohmann::json& output_items) {
+    std::vector<ChatMessage> out;
+    std::string              pending;
     for (const json& item : output_items) {
         const std::string type = item.value("type", "");
-        if (type == "message") {
-            if (!item.contains("content") || !item["content"].is_array()) continue;
-            for (const json& part : item["content"]) {
-                if (!part.is_object() || !part.contains("text") || !part["text"].is_string()) continue;
-                msg.content += part["text"].get<std::string>();
+        if (type == "reasoning") {
+            std::string text;
+            if (reasoning_text_of(item, text) || text.empty()) continue;
+            if (!pending.empty()) pending += "\n";
+            pending += text;
+        } else if (type == "message") {
+            ChatMessage msg;
+            msg.role      = "assistant";
+            msg.reasoning = pending;
+            pending.clear();
+            if (item.contains("content") && item["content"].is_array()) {
+                for (const json& part : item["content"])
+                    if (part.is_object() && part.contains("text") && part["text"].is_string())
+                        msg.content += part["text"].get<std::string>();
             }
+            out.push_back(std::move(msg));
         } else if (type == "function_call") {
+            ChatMessage msg;
+            msg.role      = "assistant";
+            msg.reasoning = pending;
+            pending.clear();
             ToolCall call;
             call.id        = item.value("call_id", "");
             call.name      = item.value("name", "");
             call.arguments = item.value("arguments", std::string("{}"));
             msg.tool_calls.push_back(std::move(call));
+            out.push_back(std::move(msg));
         }
     }
-    return msg;
+    return out;
 }
 
 }  // namespace
@@ -710,8 +770,8 @@ std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest r
             else
                 merged.messages.insert(merged.messages.begin(), std::move(new_head));
         }
-        if (!stored->output_items.empty())
-            merged.messages.push_back(assistant_turn_of(stored->output_items));
+        for (ChatMessage& m : assistant_turns_of(stored->output_items))
+            merged.messages.push_back(std::move(m));
         for (ChatMessage& m : new_items) merged.messages.push_back(std::move(m));
         req.chat = std::move(merged);
     }
