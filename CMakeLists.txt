@@ -387,6 +387,14 @@ if(ARCINT_TESTS)
   # fails the package build instead of a skipped skip.
   if(ARCINT_LLAMA)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    # patch 0074's device-free terms cell: the fused q/k norm + IMRoPE kernel's
+    # arithmetic and the dispatch's switch/order, read out of the patched tree
+    # (LLAMA_SRC). The numerics stay a card arm (test-backend-ops RMS_NORM_MUL_ROPE).
+    add_test(NAME fuse-qk-norm-rope
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_fuse_qk_norm_rope.py")
+    set_tests_properties(fuse-qk-norm-rope PROPERTIES LABELS unit)
     add_test(NAME expert-profile-save
              COMMAND "${CMAKE_COMMAND}" -E env "EXPERT_PROFILE_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
                      "${Python3_EXECUTABLE}"

@@ -1,0 +1,481 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 41de741..7519df1 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -724,6 +724,8 @@ struct ggml_backend_opencl_context {
+     bool disable_fusion;
+     bool fuse_mm_glu = true;                     // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
+     bool fuse_rms_add = true;                    // opt-out GGML_OPENCL_FUSE_RMS_ADD=0 (fused rms_norm*w + residual)
++    bool fuse_qk_norm_rope = false;               // opt-in GGML_OPENCL_FUSE_QK_NORM_ROPE=1 (patch 0074: the q/k norm + its IMRoPE
++                                                  // in one kernel; off until the card A/B prices it)
+     bool fuse_cpy_run = true;                    // opt-out GGML_OPENCL_FUSE_CPY_RUN=0 (a run of narrow strided copies in one launch)
+     int  fuse_0050 = 3;                          // the GDN-stage fusions (GGML_OPENCL_FUSE_0050=<mask>): 1 the snapshots into the cache
+                                                  // (patch 0050), 2 the gating into the GDN kernel (patch 0051)
+@@ -953,6 +955,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_norm, kernel_norm_mul_add;
+     cl_kernel kernel_rms_norm, kernel_rms_norm_mul;
+     cl_kernel kernel_rms_norm_mul_add = nullptr;   // fused rms_norm(x)*w + b (residual)
++    cl_kernel kernel_rms_norm_mul_rope_multi = nullptr;   // fused rms_norm(x)*w then the interleaved M-RoPE (patch 0074)
+     cl_kernel kernel_l2_norm_f32;
+     cl_kernel kernel_group_norm, kernel_group_norm_mul_add;
+     cl_kernel kernel_diag_mask_inf, kernel_diag_mask_inf_8;
+@@ -3627,6 +3630,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+         CL_CHECK((backend_ctx->kernel_rms_norm     = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm", &err), err));
+         CL_CHECK((backend_ctx->kernel_rms_norm_mul = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm_mul", &err), err));
+         CL_CHECK((backend_ctx->kernel_rms_norm_mul_add = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm_mul_add", &err), err));
++        CL_CHECK((backend_ctx->kernel_rms_norm_mul_rope_multi = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm_mul_rope_multi_f32", &err), err));
+         GGML_LOG_CONT(".");
+     }
+ 
+@@ -8429,6 +8433,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
+     if (const char * env = getenv("GGML_OPENCL_FUSE_RMS_ADD")) {
+         backend_ctx->fuse_rms_add = atoi(env) != 0;
+     }
++    if (const char * env = getenv("GGML_OPENCL_FUSE_QK_NORM_ROPE")) {
++        backend_ctx->fuse_qk_norm_rope = atoi(env) != 0;
++    }
+     if (const char * env = getenv("GGML_OPENCL_FUSE_0050")) {
+         backend_ctx->fuse_0050 = atoi(env);
+     }
+@@ -9693,7 +9700,54 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
+         return false;
+     }
+ 
+-    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
++    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL &&
++        ops.begin()[2] == GGML_OP_ROPE) {
++        // the q/k norm and its rotation in one kernel (patch 0074). The served
++        // models build rms_norm -> mul(1-D [head_dim] weight) -> rope_multi(IMROPE),
++        // so that is the shape this takes; any other mode keeps the per-op kernels.
++        const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
++        const ggml_tensor *mul      = cgraph->nodes[node_idx+1];
++        const ggml_tensor *rope     = cgraph->nodes[node_idx+2];
++        const ggml_tensor *w        = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
++
++        if (backend_ctx->kernel_rms_norm_mul_rope_multi == nullptr) {
++            return false;
++        }
++        if (rms_norm->src[0]->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 ||
++            w->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || rope->type != GGML_TYPE_F32) {
++            return false;
++        }
++        // the norm weight is the model's 1-D [ne00] tensor, broadcast over the rows
++        if (w->ne[0] != rms_norm->src[0]->ne[0] || w->ne[1] != 1 || w->ne[2] != 1 || w->ne[3] != 1 ||
++            w->nb[0] != ggml_element_size(w)) {
++            return false;
++        }
++        // the norm's row is contiguous f32 and 4-aligned (the kernel sums float4s)
++        if (!ggml_is_contiguous_rows(rms_norm->src[0]) || rms_norm->src[0]->ne[0] % 4 != 0) {
++            return false;
++        }
++        // the interleaved M-RoPE only: its position layout is what the kernel reads
++        if (ggml_get_op_params_i32(rope, 2) != GGML_ROPE_TYPE_IMROPE) {
++            return false;
++        }
++        const int n_dims = ggml_get_op_params_i32(rope, 1);
++        const int n_offs = ggml_get_op_params_i32(rope, 15);
++        if (n_dims <= 0 || n_dims % 2 != 0 || n_offs < 0 || n_offs + n_dims > (int) rope->ne[0]) {
++            return false;
++        }
++        // the normed row is the rotation's input, so the destination must be a
++        // contiguous f32 row too (the per-op rope can write a cache view instead)
++        if (!ggml_is_contiguous(rope) || rope->nb[0] != sizeof(float)) {
++            return false;
++        }
++        if (rope->src[1] == nullptr || rope->src[1]->type != GGML_TYPE_I32 || !ggml_is_contiguous(rope->src[1])) {
++            return false;
++        }
++        if (rope->src[2] != nullptr &&
++            (rope->src[2]->type != GGML_TYPE_F32 || !ggml_is_contiguous_rows(rope->src[2]))) {
++            return false;
++        }
++    } else if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
+         const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
+         const ggml_tensor *mul      = cgraph->nodes[node_idx+1];
+ 
+@@ -9788,6 +9842,8 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
+ }
+ 
+ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor);
++static void ggml_opencl_op_rms_norm_rope_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor,
++                                               ggml_tensor * mul_tensor, ggml_tensor * rope_tensor);
+ static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
+ static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
+ 
+@@ -10000,6 +10056,124 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
+     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+ }
+ 
++// patch 0074: the q/k norm and its interleaved M-RoPE in one kernel. The norm's
++// float4 sum, the epsilon and the weight factor are kernel_rms_norm_mul's; the
++// rotation is kernel_rope_multi_f32's (mode GGML_ROPE_TYPE_IMROPE); the normed
++// row's store and its reload by the next kernel are gone. The switch is off by
++// default (GGML_OPENCL_FUSE_QK_NORM_ROPE=1); it is priced at the wall on both
++// cards before a default.
++static void ggml_opencl_op_rms_norm_rope_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor,
++                                               ggml_tensor * mul_tensor, ggml_tensor * rope_tensor) {
++    GGML_ASSERT(rms_norm_tensor && mul_tensor && rope_tensor);
++
++    const ggml_tensor * src0 = rms_norm_tensor->src[0];
++    const ggml_tensor * w    = mul_tensor->src[0] == rms_norm_tensor ? mul_tensor->src[1] : mul_tensor->src[0];
++    const ggml_tensor * pos  = rope_tensor->src[1];
++    const ggml_tensor * ff   = rope_tensor->src[2];
++    const ggml_tensor * dst  = rope_tensor;
++
++    GGML_ASSERT(src0 && src0->extra);
++    GGML_ASSERT(w    && w->extra);
++    GGML_ASSERT(pos  && pos->extra);
++    GGML_ASSERT(dst  && dst->extra);
++
++    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
++    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
++    ggml_tensor_extra_cl * extraw = (ggml_tensor_extra_cl *)w->extra;
++    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)pos->extra;
++    ggml_tensor_extra_cl * extra2 = ff != nullptr ? (ggml_tensor_extra_cl *)ff->extra : extra0;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++
++    const cl_ulong offset0 = extra0->offset + src0->view_offs;
++    const cl_ulong offsetw = extraw->offset + w->view_offs;
++    const cl_ulong offset1 = extra1->offset + pos->view_offs;
++    const cl_ulong offset2 = ff != nullptr ? extra2->offset + ff->view_offs : offset0;
++    const cl_ulong offsetd = extrad->offset + dst->view_offs;
++
++    float eps;
++    memcpy(&eps, rms_norm_tensor->op_params, sizeof(float));
++
++    const int n_past     = ggml_get_op_params_i32(dst, 0);
++    const int n_dims     = ggml_get_op_params_i32(dst, 1);
++    const int n_ctx_orig = ggml_get_op_params_i32(dst, 4);
++    const int n_offs     = ggml_get_op_params_i32(dst, 15);
++    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
++    memcpy(&freq_base,   (int32_t *) dst->op_params + 5, sizeof(float));
++    memcpy(&freq_scale,  (int32_t *) dst->op_params + 6, sizeof(float));
++    memcpy(&ext_factor,  (int32_t *) dst->op_params + 7, sizeof(float));
++    memcpy(&attn_factor, (int32_t *) dst->op_params + 8, sizeof(float));
++    memcpy(&beta_fast,   (int32_t *) dst->op_params + 9, sizeof(float));
++    memcpy(&beta_slow,   (int32_t *) dst->op_params + 10, sizeof(float));
++    int32_t sections[4];
++    memcpy(&sections,    (int32_t *) dst->op_params + 11, sizeof(int32_t)*4);
++
++    const int ne00 = src0->ne[0], ne01 = src0->ne[1], ne02 = src0->ne[2], ne03 = src0->ne[3];
++    const cl_ulong nb00 = src0->nb[0], nb01 = src0->nb[1], nb02 = src0->nb[2], nb03 = src0->nb[3];
++    const int ne0 = dst->ne[0], ne1 = dst->ne[1], ne2 = dst->ne[2], ne3 = dst->ne[3];
++    const cl_ulong nb0 = dst->nb[0], nb1 = dst->nb[1], nb2 = dst->nb[2], nb3 = dst->nb[3];
++
++    size_t sgs;
++    if (backend_ctx->gpu_family == ADRENO) sgs = 64;
++    else if (backend_ctx->gpu_family == INTEL) sgs = 32;
++    else GGML_ASSERT(false && "Unsupported GPU");
++
++    cl_kernel kernel = backend_ctx->kernel_rms_norm_mul_rope_multi;
++
++    int nth = sgs;
++    int max_workgroup_size = backend_ctx->get_kernel_workgroup_size(kernel);
++    while (nth < ne00 && nth < max_workgroup_size) nth *= 2;
++    nth = MIN(nth, max_workgroup_size);
++    nth = MIN(nth, ne00);
++
++    size_t global_work_size[] = {(size_t)ne01*nth, (size_t)ne02, (size_t)ne03};
++    size_t local_work_size[]  = {(size_t)nth, 1, 1};
++
++    const uint32_t opaque = 0;   // the compiler cannot regroup (x * scale) * w through it
++
++    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
++    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
++    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extraw->data_device));
++    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offsetw));
++    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extra1->data_device));
++    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offset1));
++    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_mem),   &extra2->data_device));
++    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &offset2));
++    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne00));
++    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne01));
++    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne02));
++    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &ne03));
++    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_ulong), &nb00));
++    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_ulong), &nb01));
++    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb02));
++    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &nb03));
++    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &ne0));
++    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &ne1));
++    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &ne2));
++    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(int),      &ne3));
++    CL_CHECK(clSetKernelArg(kernel, 22, sizeof(cl_ulong), &nb0));
++    CL_CHECK(clSetKernelArg(kernel, 23, sizeof(cl_ulong), &nb1));
++    CL_CHECK(clSetKernelArg(kernel, 24, sizeof(cl_ulong), &nb2));
++    CL_CHECK(clSetKernelArg(kernel, 25, sizeof(cl_ulong), &nb3));
++    CL_CHECK(clSetKernelArg(kernel, 26, sizeof(int),      &n_past));
++    CL_CHECK(clSetKernelArg(kernel, 27, sizeof(int),      &n_dims));
++    CL_CHECK(clSetKernelArg(kernel, 28, sizeof(int),      &n_ctx_orig));
++    CL_CHECK(clSetKernelArg(kernel, 29, sizeof(float),    &freq_base));
++    CL_CHECK(clSetKernelArg(kernel, 30, sizeof(float),    &freq_scale));
++    CL_CHECK(clSetKernelArg(kernel, 31, sizeof(float),    &ext_factor));
++    CL_CHECK(clSetKernelArg(kernel, 32, sizeof(float),    &attn_factor));
++    CL_CHECK(clSetKernelArg(kernel, 33, sizeof(float),    &beta_fast));
++    CL_CHECK(clSetKernelArg(kernel, 34, sizeof(float),    &beta_slow));
++    CL_CHECK(clSetKernelArg(kernel, 35, sizeof(int32_t)*4, &sections));
++    CL_CHECK(clSetKernelArg(kernel, 36, sizeof(int),      &n_offs));
++    CL_CHECK(clSetKernelArg(kernel, 37, sizeof(float),    &eps));
++    CL_CHECK(clSetKernelArg(kernel, 38, sizeof(uint32_t), &opaque));
++    CL_CHECK(clSetKernelArg(kernel, 39, sizeof(float)*sgs, NULL));
++
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++}
++
+ // llama.cpp's MoE routing (build_moe_ffn, softmax gating, normalized weights):
+ // SOFT_MAX, RESHAPE, ARGSORT, VIEW (the ids), GET_ROWS, RESHAPE, SUM_ROWS,
+ // CLAMP, DIV, RESHAPE (the weights) -> one kernel, as ggml-cuda's topk_moe
+@@ -10558,6 +10732,14 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+             i += 2;
+             continue;
+         }
++        // the q/k norm and its interleaved M-RoPE in one kernel (patch 0074),
++        // before the norm+mul pair so the three-node pattern wins over its prefix
++        if (!backend_ctx->disable_fusion && backend_ctx->fuse_qk_norm_rope &&
++            ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE })) {
++            ggml_opencl_op_rms_norm_rope_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
++            i += 2;
++            continue;
++        }
+         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+             ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
+             i++;
+diff --git a/ggml/src/ggml-opencl/kernels/rms_norm.cl b/ggml/src/ggml-opencl/kernels/rms_norm.cl
+index 47124be..7e4198c 100644
+--- a/ggml/src/ggml-opencl/kernels/rms_norm.cl
++++ b/ggml/src/ggml-opencl/kernels/rms_norm.cl
+@@ -372,3 +372,178 @@ kernel void kernel_rms_norm_mul_add_scale(
+         y[i00] = ((x[i00] * scale) * f[i00%(ne10/4)] + g[i00%(ne20/4)]) * sc;
+     }
+ }
++
++//------------------------------------------------------------------------------
++// rms_norm · norm weight · interleaved M-RoPE, fused (patch 0074).
++// The q/k norm and its rotation sit adjacent on every attention layer of the
++// served models (qwen35/qwen4exp: a 1-D [head_dim] weight, mode 40). This
++// computes y = rope(rmsnorm(x) * w) in one dispatch and drops the normed row's
++// store/load between the two kernels. The epsilon, the weight factor and the
++// rotation's cos/sin are kernel_rms_norm_mul's and kernel_rope_multi_f32's
++// expressions, and the normed value is rounded as kernel_rms_norm_mul rounds it
++// ((x * scale) then * w, the `opaque` guard against IGC regouping); only the
++// interleaved M-RoPE form (mode GGML_ROPE_TYPE_IMROPE) is handled, which is
++// what both served models build.
++//------------------------------------------------------------------------------
++float rope_yarn_ramp_fused(float low, float high, int i0) {
++    const float y = (i0 / 2 - low) / max(0.001f, high - low);
++    return 1.0f - min(1.0f, max(0.0f, y));
++}
++
++// rope.cl's rope_yarn, rope_yarn_corr_factor and rope_yarn_corr_dims, verbatim
++// in a second program (this one needs its subgroup reduction, rope.cl's does
++// not), so the fused cos/sin is the rotation's own expression.
++float2 rope_yarn_fused(float theta_extrap, float freq_scale, float2 corr_dims, int i0, float ext_factor, float mscale) {
++    float theta_interp = freq_scale * theta_extrap;
++    float theta = theta_interp;
++    if (ext_factor != 0.0f) {
++        float ramp_mix = rope_yarn_ramp_fused(corr_dims.s0, corr_dims.s1, i0) * ext_factor;
++        theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix;
++        mscale *= 1.0f + 0.1f * log(1.0f / freq_scale);
++    }
++    return (float2)(cos(theta) * mscale, sin(theta) * mscale);
++}
++
++float rope_yarn_corr_factor_fused(int n_dims, int n_ctx_orig, float n_rot, float base) {
++    return n_dims * log(n_ctx_orig / (n_rot * 2 * M_PI_F)) / (2 * log(base));
++}
++
++float2 rope_yarn_corr_dims_fused(int n_dims, int n_ctx_orig, float freq_base, float beta_fast, float beta_slow) {
++    return (float2)(
++        max(0.0f,         floor(rope_yarn_corr_factor_fused(n_dims, n_ctx_orig, beta_fast, freq_base))),
++        min(n_dims - 1.0f, ceil(rope_yarn_corr_factor_fused(n_dims, n_ctx_orig, beta_slow, freq_base)))
++    );
++}
++
++#ifdef INTEL_GPU
++REQD_SUBGROUP_SIZE_32
++#elif defined (ADRENO_GPU)
++REQD_SUBGROUP_SIZE_64
++#endif
++kernel void kernel_rms_norm_mul_rope_multi_f32(
++        global char * src0,
++        ulong offset0,
++        global char * wsrc,
++        ulong offsetw,
++        global int  * src1,
++        ulong offset1,
++        global char * src2,
++        ulong offset2,
++        global char * dst,
++        ulong offsetd,
++        int ne00,
++        int ne01,
++        int ne02,
++        int ne03,
++        ulong nb00,
++        ulong nb01,
++        ulong nb02,
++        ulong nb03,
++        int ne0,
++        int ne1,
++        int ne2,
++        int ne3,
++        ulong nb0,
++        ulong nb1,
++        ulong nb2,
++        ulong nb3,
++        int n_past,
++        int n_dims,
++        int n_ctx_orig,
++        float freq_base,
++        float freq_scale,
++        float ext_factor,
++        float attn_factor,
++        float beta_fast,
++        float beta_slow,
++        int4 sections,
++        int n_offs,
++        float eps,
++        uint opaque,
++        local float * sum
++) {
++    src0 = src0 + offset0;
++    global float * w = (global float *) (wsrc + offsetw);
++    src1 = src1 + offset1;
++    src2 = src2 + offset2;
++    global float * ff = (global float *) src2;
++    dst  = dst  + offsetd;
++
++    if (get_sub_group_id() == 0) {
++        sum[get_sub_group_local_id()] = 0.0f;
++    }
++
++    int i03 = get_group_id(2);
++    int i02 = get_group_id(1);
++    int i01 = get_group_id(0);
++
++    global float4 * x = (global float4 *) (src0 + i03*nb03 + i02*nb02 + i01*nb01);
++
++    float sumf = 0;
++    for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
++        sumf += dot(x[i00], x[i00]);
++    }
++    sumf = sub_group_reduce_add(sumf);
++
++    barrier(CLK_LOCAL_MEM_FENCE);
++    if (get_sub_group_local_id() == 0) {
++        sum[get_sub_group_id()] = sumf;
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++
++    sumf = sum[get_sub_group_local_id()];
++    sumf = sub_group_reduce_add(sumf);
++
++    const float scale = 1.0f/sqrt(sumf / ne00 + eps);
++
++    float2 corr_dims = rope_yarn_corr_dims_fused(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow);
++
++    global int * pos = src1;
++
++    const int sect_dims = sections.s0 + sections.s1 + sections.s2 + sections.s3;
++    const float inv_ndims = -1.f/n_dims;
++
++    for (int i0 = 2*get_local_id(0); i0 < ne0; i0 += 2*get_local_size(0)) {
++        if (i0 >= n_offs && i0 < n_offs + n_dims) {
++            int iw = i0 - n_offs; // relative idx
++            int ic = iw/2;
++
++            const int sector = ic % sect_dims;
++            float theta_base = 0.0f;
++
++            // the interleaved M-RoPE's position layout, kernel_rope_multi_f32's
++            // is_imrope branch (the sections' t/h/w/e positions per token)
++            if (sector % 3 == 1 && sector < 3 * sections.s1) { // h
++                theta_base = (float) pos[i02 + ne02 * 1];
++            } else if (sector % 3 == 2 && sector < 3 * sections.s2) { // w
++                theta_base = (float) pos[i02 + ne02 * 2];
++            } else if (sector % 3 == 0 && sector < 3 * sections.s0) { // t
++                theta_base = (float) pos[i02 + ne02 * 0];
++            } else { // e
++                theta_base = (float) pos[i02 + ne02 * 3];
++            }
++
++            const float theta = theta_base * pow(freq_base, inv_ndims*iw);
++
++            const float freq_factor = src2 != src0 ? ff[ic] : 1.0f;
++
++            float2 cos_sin_theta = rope_yarn_fused(theta/freq_factor, freq_scale, corr_dims, iw, ext_factor, attn_factor);
++
++            global float * src      = (global float *)((global char *) src0 + i03*nb03 + i02*nb02 + i01*nb01 + (n_offs + ic)*nb00);
++            global float * dst_data = (global float *)((global char *)  dst + i03*nb3  + i02*nb2  + i01*nb1  + (n_offs + ic)*nb0);
++
++            // the norm's store then the weight, as kernel_rms_norm_mul rounds them
++            const float x0 = as_float(as_uint(src[0] * scale) ^ opaque) * w[n_offs + ic];
++            const float x1 = as_float(as_uint(src[n_dims/2] * scale) ^ opaque) * w[n_offs + ic + n_dims/2];
++
++            dst_data[0]        = x0*cos_sin_theta.s0 - x1*cos_sin_theta.s1;
++            dst_data[n_dims/2] = x0*cos_sin_theta.s1 + x1*cos_sin_theta.s0;
++        } else {
++            global float * const src = (global float *)((global char *) src0 + i03*nb03 + i02*nb02 + i01*nb01 + i0*nb00);
++            global float * dst_data  = (global float *)((global char *)  dst + i03*nb3  + i02*nb2  + i01*nb1  + i0*nb0);
++
++            dst_data[0] = as_float(as_uint(src[0] * scale) ^ opaque) * w[i0];
++            dst_data[1] = as_float(as_uint(src[1] * scale) ^ opaque) * w[i0 + 1];
++        }
++    }
++}
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index fcbd70e..3d71b3f 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -2819,6 +2819,8 @@ struct test_rms_norm_mul_rope : public test_case {
+     const bool rope;
+     const bool set_rows;
+     const bool broadcast; // multiply by a 1D [ne0] weight, as model norm weights are
++    const bool gap;       // a is a view with every second [ne0] row unused: the served models'
++                          // Q layout (query and gate interleaved per head), nb[1] = 2 * ne0 * 4
+     const ggml_type set_rows_type;
+     int mode;
+ 
+@@ -2830,17 +2832,24 @@ struct test_rms_norm_mul_rope : public test_case {
+     bool run_whole_graph() override { return true; }
+ 
+     std::string vars() override {
+-        return VARS_TO_STR9(ne, eps, multi_add, mul, rope, set_rows, broadcast, mode, set_rows_type);
++        return VARS_TO_STR10(ne, eps, multi_add, mul, rope, set_rows, broadcast, gap, mode, set_rows_type);
+     }
+ 
+     test_rms_norm_mul_rope(std::array<int64_t, 4> ne, float eps = 1e-6f, bool multi_add = false,
+                            bool set_rows = false, bool broadcast = false, int mode = GGML_ROPE_TYPE_NORMAL,
+-                           bool mul = true, bool rope = true, ggml_type set_rows_type = GGML_TYPE_F16)
++                           bool mul = true, bool rope = true, ggml_type set_rows_type = GGML_TYPE_F16,
++                           bool gap = false)
+         : ne(ne), eps(eps), multi_add(multi_add), mul(mul), rope(rope), set_rows(set_rows), broadcast(broadcast),
+-          set_rows_type(set_rows_type), mode(mode) {}
++          gap(gap), set_rows_type(set_rows_type), mode(mode) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
++        if (gap) {
++            // the query half of a joint Q|gate projection: [ne0, 2*ne1, ne2, ne3] with
++            // the query heads at every second [ne0] row (nb[1] = 2 * ne[0] * 4)
++            ggml_tensor * parent = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], 2 * ne[1], ne[2], ne[3]);
++            a = ggml_view_4d(ctx, parent, ne[0], ne[1], ne[2], ne[3], 2 * parent->nb[1], parent->nb[2], parent->nb[3], 0);
++        }
+ 
+         ggml_tensor * b = nullptr;
+         ggml_tensor * c = nullptr;
+@@ -10987,6 +10996,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ 
+     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
+     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
++    // the q/k norm + IMRoPE fusion (patch 0074): the served models' shapes, the
++    // 1-D norm weight, one token (decode) and five (a verify batch), the strided
++    // Q layout and the contiguous K layout
++    test_cases.emplace_back(new test_rms_norm_mul_rope({128, 16, 1, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_IMROPE, true, true, GGML_TYPE_F16, true));
++    test_cases.emplace_back(new test_rms_norm_mul_rope({128, 16, 5, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_IMROPE, true, true, GGML_TYPE_F16, true));
++    test_cases.emplace_back(new test_rms_norm_mul_rope({128,  8, 6, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_IMROPE));
+ 
+     for (auto multi_add : {false, true}) {
+         for (auto set_rows : {false, true}) {

@@ -5118,3 +5118,41 @@ For an A770 LEO run the log line `ggml_opencl: LEO on DG2: weight images above
 `ggml_opencl: mxfp4 weight image skipped (518400 texels, DG2 + LEO)`, are the
 patch's own evidence that the branch was taken; the absence of both means the
 detection did not match and the run is not a test of the patch.
+## 0074-opencl-intel-qk-norm-rope.patch
+
+The q/k RMS norm and its rotation sit adjacent on every attention layer of both
+served models (`code`: `src/models/qwen35.cpp:309-321`, `qwen4exp.cpp:994-1008`:
+`rms_norm -> mul(1-D [head_dim] weight) -> rope_multi`, mode 40), three kernels
+a side, six launches a layer. The patch takes the three nodes as one dispatch:
+`kernel_rms_norm_mul_rope_multi_f32` (`kernels/rms_norm.cl`) computes the norm's
+float4 sum and scale, applies the weight on the rounded normed value and rotates
+with `rope_yarn`'s cos/sin and the interleaved M-RoPE's position layout — the
+three expressions `kernel_rms_norm_mul` and `kernel_rope_multi_f32` use, with
+the normed row no longer stored and reloaded. The gate is the 3-node pattern in
+`ggml_opencl_can_fuse`, checked before the 2-node norm+mul prefix (which would
+otherwise swallow its first two nodes), and only for mode
+`GGML_ROPE_TYPE_IMROPE`, a 1-D weight, a 4-aligned contiguous input row and a
+contiguous f32 output.
+
+Switch: `GGML_OPENCL_FUSE_QK_NORM_ROPE=1`, **off by default** (`code`): the
+patch is a mechanism, the card A/B is owed before any default (see the audit's
+bar: >= +0.5 % decode for a bundle of two or three fusions, else no build).
+
+`code`: the patch adds the served shapes to `test-backend-ops`'s
+`RMS_NORM_MUL_ROPE` — `[128,16,1]` and `[128,16,5]` with the strided Q layout
+(`nb[1] = 2*ne0*4`, the joint Q|gate projection's query half) and the 1-D
+weight, `[128,8,6]` contiguous — which is where the red case is run: one term
+dropped from the kernel (the epsilon, the weight, the rotation) fails those
+cases on the card. Device-free, `tests/python/test_fuse_qk_norm_rope.py` reads
+the patched tree: the epsilon in the scale, the weight at both rotated
+positions, the norm-then-weight rounding order, the rotation's formula and the
+M-RoPE position layout, the switch's default and the 3-before-2 dispatch order.
+Mutations run red before restore (`measured-here` on the patched tree): the
+epsilon dropped, the weight read at `w[ic]`, the weight folded before the
+rounding, the default flipped on, the dispatch moved below the prefix — each
+made its cell fail; restored, the cell passes.
+
+`measured-here` /**owed** on the cards (Claude's window; the handover carries
+the commands): the pricing trace's per-step `kernel_rope_multi_f32` +
+`kernel_rms_norm_mul` device time and count, then the served A/B with the
+switch off and on at the same unit flags. No number is claimed here.
