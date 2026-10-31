@@ -26,7 +26,7 @@ FROM ${BASE} AS builder
 # of /usr/include/CL/cl.h. python3 is what embeds the OpenCL kernels; git is
 # what applies the patch series.
 RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
-      gcc gcc-c++ cmake git which binutils curl python3 libgomp \
+      gcc gcc-c++ cmake git which binutils curl python3 libgomp diffutils \
       opencl-headers ocl-icd-devel \
   && dnf clean all && rm -rf /var/cache/dnf/*
 RUN [ -f /usr/include/CL/cl.h ] || { echo "opencl-headers did not provide /usr/include/CL/cl.h" >&2; exit 1; }
