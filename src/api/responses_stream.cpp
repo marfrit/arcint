@@ -8,6 +8,7 @@
 
 #include "api/error.h"
 #include "api/generate.h"
+#include "api/responses_state.h"
 #include "core/reasoning.h"
 #include "core/toolcall.h"
 #include "util/log.h"
@@ -41,8 +42,8 @@ json snapshot(const ResponseRequest& req, const PreparedChat& prep, const char* 
 // the caller owns the generation.
 class Stream final {
 public:
-    Stream(const ResponseRequest& req, const PreparedChat& prep, const SseWriter& write)
-        : req_(req), prep_(prep), write_(write) {}
+    Stream(const PreparedResponse& prep, const SseWriter& write)
+        : resp_(prep), req_(prep.req), prep_(prep.chat), write_(write) {}
 
     // true when every write succeeded; false once the client is gone.
     bool run(const Context& ctx, int slot);
@@ -268,6 +269,10 @@ private:
 
     bool failed(const char* status, const std::string& message, const std::string& code,
                 bool error_event) {
+        // A continuation the server answers as failed is a broken chain: evict
+        // the referenced entry (docs/campaigns/feyntalk.md State).
+        if (resp_.req.has_previous_response_id)
+            evict_continuation(*ctx_, resp_.req.previous_response_id);
         mark_open_incomplete();
         if (error_event && !send(json{{"type", "error"},
                                       {"error", json{{"type", "server_error"},
@@ -291,9 +296,9 @@ private:
         if (!close_reasoning(reasoning_status)) return false;
         if (!close_message(item_status_now)) return false;
 
-        if (reason == FinishReason::Loop) {
-            // Observability at the end of the stream, before the terminal
-            // resource; the seven counters are loop_guard_json's own keys.
+        // Review F2: the counters go out whenever one moved, not only on a
+        // loop-guard abort — parity with the chat route's loop_guard object.
+        if (loop_guard_moved(stats)) {
             json counters = loop_guard_json(stats);
             counters["type"]        = "arcint:loop_guard";
             counters["v"]           = 1;
@@ -309,19 +314,24 @@ private:
         }
         const char* type  = completed ? "response.completed" : "response.incomplete";
         const char* status = completed ? "completed" : "incomplete";
-        if (!send(json{{"type", type},
-                       {"response", snapshot(req_, prep_, status, output_, usage_of(stats),
-                                             nullptr, incomplete, completed)}}))
-            return false;
+        json resource = snapshot(req_, prep_, status, output_, usage_of(stats), nullptr,
+                                 incomplete, completed);
+        if (!send(json{{"type", type}, {"response", resource}})) return false;
+        // store=true retains the turn; store=false and an entries=0 store keep
+        // nothing. A failed turn is not stored (the failed() path).
+        remember(*ctx_, resp_, resource, slot_);
         return done_frame();
     }
 
-    const ResponseRequest& req_;
-    const PreparedChat&   prep_;
+    const PreparedResponse& resp_;
+    const ResponseRequest&  req_;
+    const PreparedChat&     prep_;
     const SseWriter&      write_;
 
     int  sequence_ = 0;
     bool gone_     = false;
+    const Context* ctx_ = nullptr;
+    int            slot_ = -1;
 
     json output_     = json::array();
     int  next_index_ = 0;
@@ -346,6 +356,8 @@ private:
 };
 
 bool Stream::run(const Context& ctx, int slot) {
+    ctx_  = &ctx;
+    slot_ = slot;
     // The spec's opening: the full resource in progress, then the same snapshot
     // as response.in_progress, before any item exists.
     const json created = snapshot(req_, prep_, "in_progress", json::array(), nullptr,
@@ -472,7 +484,7 @@ bool Stream::run(const Context& ctx, int slot) {
 
 void stream_response(const Context& ctx, const PreparedResponse& prep, int slot,
                      const SseWriter& write) {
-    Stream stream(prep.req, prep.chat, write);
+    Stream stream(prep, write);
     stream.run(ctx, slot);
 }
 

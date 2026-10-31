@@ -89,6 +89,9 @@ struct ResponseParts {
     nlohmann::json usage             = nullptr;   // null while in_progress
     nlohmann::json error             = nullptr;
     bool           completed         = true;      // completed_at: set for completed only
+    // The arcint extension object (loop-guard counters), present only when the
+    // ladder moved (review F2); null keeps the resource's standard keys only.
+    nlohmann::json arcint_ext        = nullptr;
 };
 nlohmann::json response_resource(const ResponseRequest& req, const PreparedChat& prep,
                                  const ResponseParts& parts);
@@ -96,7 +99,7 @@ nlohmann::json response_resource(const ResponseRequest& req, const PreparedChat&
 // One non-streamed turn: drive the prepared input exactly as run_chat does,
 // then build the resource. A stop signal is a 503 envelope, a gone client no
 // body (HttpResult::gone). Generation exceptions are the spec's 500/400.
-HttpResult run_response(const Context& ctx, const PreparedResponse& prep, int slot);
+HttpResult run_response(const Context& ctx, PreparedResponse& prep, int slot);
 
 // The admission refusal (review F1): the spec maps a busy service to 429
 // too_many_requests/all_lanes_busy, while the chat route keeps its 503. The

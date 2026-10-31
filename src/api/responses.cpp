@@ -7,6 +7,7 @@
 
 #include "api/error.h"
 #include "api/generate.h"
+#include "api/responses_state.h"
 #include "core/chat.h"
 #include "util/log.h"
 #include "util/text.h"
@@ -95,10 +96,21 @@ std::optional<HttpResult> read_message_content(const json& content, ChatMessage&
 std::optional<HttpResult> read_item(const json& item, ResponseRequest& req, size_t index) {
     const std::string where = log::format("input[%zu]", index);
     if (!item.is_object()) return invalid(where + " must be an object", "input");
-    if (!item.contains("type") || !item["type"].is_string()) {
-        return invalid(where + ".type is required", "input");
+    // The OpenAPI document marks `type` required but defaults every message
+    // item param to "message"; real clients (the live pi client with
+    // provider type openai-responses) omit it and send only a role. A role
+    // makes it a message, an item with neither is still a 400.
+    std::string type;
+    if (!item.contains("type") || item["type"].is_null()) {
+        if (!item.contains("role") || !item["role"].is_string())
+            return invalid(where + ".type is required (a message item may omit it by its role)",
+                           "input");
+        type = "message";
+    } else if (!item["type"].is_string()) {
+        return invalid(where + ".type must be a string", "input");
+    } else {
+        type = item["type"].get<std::string>();
     }
-    const std::string type = item["type"].get<std::string>();
 
     if (type == "message") {
         if (!item.contains("role") || !item["role"].is_string()) {
@@ -571,47 +583,112 @@ std::optional<HttpResult> parse_response_request(const json& body, ResponseReque
     return std::nullopt;
 }
 
+namespace {
+
+// prepare_from_chat speaks the chat route's envelope (its lanes' 404 and the
+// §3.8 overflow are shared answers). The Responses surface gets the spec's type
+// spellings and field paths here, not a second prepare.
+HttpResult translate_prepare_error(const HttpResult& err) {
+    const json& e = err.body["error"];
+    const std::string message = e["message"].is_string() ? e["message"].get<std::string>() : "";
+    const std::string code = (e.contains("code") && e["code"].is_string())
+                                ? e["code"].get<std::string>()
+                                : "invalid_request";
+    if (err.status == 404) {
+        return HttpResult{404, responses_error(message, "not_found", code,
+                                               e["param"].is_string() ? e["param"].get<std::string>()
+                                                                      : "model")};
+    }
+    if (err.status == 400) {
+        // Overflow is a §3.8 400 with the numbers at the top level (the
+        // campaign's extension keys); a malformed field names `input`.
+        const bool overflow = code == "context_length_exceeded";
+        json body = responses_error(message, "invalid_request", code, overflow ? "input" : "");
+        if (overflow) {
+            if (e.contains("prompt_tokens")) body["prompt_tokens"] = e["prompt_tokens"];
+            if (e.contains("n_ctx")) body["n_ctx"] = e["n_ctx"];
+        }
+        return HttpResult{400, std::move(body)};
+    }
+    return err;
+}
+
+HttpResult previous_not_found(const std::string& id, const std::string& why) {
+    return HttpResult{400, responses_error(
+        "previous_response_id '" + id + "' is not usable here: " + why,
+        "invalid_request", "previous_response_not_found", "previous_response_id")};
+}
+
+// The stored assistant turn, rebuilt from the spec output items: the message
+// text and the function_call items. Reasoning items are not replayed (parity
+// with /v1/chat/completions).
+ChatMessage assistant_turn_of(const nlohmann::json& output_items) {
+    ChatMessage msg;
+    msg.role = "assistant";
+    for (const json& item : output_items) {
+        const std::string type = item.value("type", "");
+        if (type == "message") {
+            if (!item.contains("content") || !item["content"].is_array()) continue;
+            for (const json& part : item["content"]) {
+                if (!part.is_object() || !part.contains("text") || !part["text"].is_string()) continue;
+                msg.content += part["text"].get<std::string>();
+            }
+        } else if (type == "function_call") {
+            ToolCall call;
+            call.id        = item.value("call_id", "");
+            call.name      = item.value("name", "");
+            call.arguments = item.value("arguments", std::string("{}"));
+            msg.tool_calls.push_back(std::move(call));
+        }
+    }
+    return msg;
+}
+
+}  // namespace
+
 std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest req,
                                            PreparedResponse& out) {
-    // W1 has no store, so a continuation cannot be resolved. The spec's answer
-    // for an unknown id is this 400; accepting and dropping the id would serve
-    // a fresh turn while telling the client it continued (W3 adds the lookup).
+    const std::string prev_id =
+        req.has_previous_response_id ? req.previous_response_id : std::string();
+    std::shared_ptr<StoredResponse> stored;
     if (req.has_previous_response_id) {
-        return HttpResult{400, responses_error(
-            "previous_response_id '" + req.previous_response_id +
-                "' is not known to this server: no response store exists in this build "
-                "(docs/campaigns/feyntalk.md W3)",
-            "invalid_request", "previous_response_not_found", "previous_response_id")};
+        if (!ctx.responses)
+            return previous_not_found(prev_id, "this process keeps no response store");
+        // Lane-scoped: resolve the request's lane first, so a name that is a 404
+        // stays a 404 and an entry from another lane is not found.
+        int lane = -1;
+        if (auto err = resolve_lane(ctx, req.chat.model, lane))
+            return translate_prepare_error(*err);
+        stored = ctx.responses->get(prev_id, lane);
+        if (!stored) return previous_not_found(prev_id, "unknown id, another lane, or evicted");
+        // The prefix must still be reproducible by the current renderer. A
+        // mismatch means the continuation would not share the stored prompt.
+        const std::string rendered = ctx.backend->render_chat(stored->chat);
+        if (sha256_hex(rendered) != stored->prefix_hash) {
+            // A 4xx on a continuation evicts the entry it referenced.
+            evict_continuation(ctx, prev_id);
+            return previous_not_found(prev_id, "the rendered prefix no longer matches the stored one");
+        }
+
+        // stored input messages + the stored assistant turn + the new items.
+        // The new request's tools, tool_choice, sampler and thinking settings
+        // are the turn's own; the template is the one process.
+        ChatRequest merged = req.chat;
+        merged.messages.clear();
+        merged.messages = stored->chat.messages;
+        if (!stored->output_items.empty())
+            merged.messages.push_back(assistant_turn_of(stored->output_items));
+        for (const ChatMessage& m : req.chat.messages) merged.messages.push_back(m);
+        req.chat = std::move(merged);
     }
 
     PreparedResponse prep;
+    prep.affinity_slot = stored ? stored->slot : -1;
     if (auto err = prepare_from_chat(ctx, req.chat, prep.chat)) {
-        // prepare_from_chat speaks the chat route's envelope (its lanes' 404 and
-        // the §3.8 overflow are shared answers). The Responses surface gets the
-        // spec's type spellings and field paths here, not a second prepare.
-        const json& e = err->body["error"];
-        const std::string message = e["message"].is_string() ? e["message"].get<std::string>() : "";
-        const std::string code = (e.contains("code") && e["code"].is_string())
-                                    ? e["code"].get<std::string>()
-                                    : "invalid_request";
-        if (err->status == 404) {
-            return HttpResult{404, responses_error(message, "not_found", code,
-                                                   e["param"].is_string() ? e["param"].get<std::string>()
-                                                                          : "model")};
-        }
-        if (err->status == 400) {
-            // Overflow is a §3.8 400 with the numbers at the top level (the
-            // campaign's extension keys); a malformed field names `input`.
-            const bool overflow = code == "context_length_exceeded";
-            json body = responses_error(message, "invalid_request", code,
-                                        overflow ? "input" : "");
-            if (overflow) {
-                if (e.contains("prompt_tokens")) body["prompt_tokens"] = e["prompt_tokens"];
-                if (e.contains("n_ctx")) body["n_ctx"] = e["n_ctx"];
-            }
-            return HttpResult{400, std::move(body)};
-        }
-        return err;
+        // A continuation the server answers 4xx is a broken chain: evict the
+        // referenced entry so a retry cannot silently continue from it.
+        evict_continuation(ctx, prev_id);
+        return translate_prepare_error(*err);
     }
     prep.req = std::move(req);
     // The Responses ids are resp-N; prepare_from_chat numbered it as a chat
@@ -638,14 +715,16 @@ json response_resource(const ResponseRequest& req, const PreparedChat& prep,
     const SamplerParams& sampler = prep.input.sampler;
     // Every required key of the 2026-04-24 ResponseResource, in the order the
     // document lists them. Zero/null where the spec says so.
-    return json{{"id", prep.id},
+    json body = {{"id", prep.id},
                 {"object", "response"},
                 {"created_at", prep.created},
                 {"completed_at", parts.completed ? json(now_seconds()) : json(nullptr)},
                 {"status", parts.status},
                 {"incomplete_details", parts.incomplete_details},
                 {"model", prep.model},
-                {"previous_response_id", nullptr},   // W1: no chain is served
+                {"previous_response_id", req.has_previous_response_id
+                                            ? json(req.previous_response_id)
+                                            : json(nullptr)},
                 {"instructions", req.has_instructions ? json(req.instructions) : json(nullptr)},
                 {"output", parts.output},
                 {"error", parts.error},
@@ -672,6 +751,10 @@ json response_resource(const ResponseRequest& req, const PreparedChat& prep,
                                                                : json(nullptr)},
                 {"prompt_cache_key", req.has_prompt_cache_key ? json(req.prompt_cache_key)
                                                               : json(nullptr)}};
+    // Review F2: the loop-guard counters as an arcint key when one moved, on
+    // the same condition as the chat route's loop_guard object.
+    if (!parts.arcint_ext.is_null()) body["arcint"] = parts.arcint_ext;
+    return body;
 }
 
 json response_resource(const ResponseRequest& req, const PreparedChat& prep,
@@ -721,6 +804,8 @@ json response_resource(const ResponseRequest& req, const PreparedChat& prep,
                             : gen.reason == FinishReason::Loop ? "loop_guard_abort"
                                                               : "max_output_tokens"}};
     }
+    if (loop_guard_moved(gen.stats))
+        parts.arcint_ext = json{{"v", 1}, {"loop_guard", loop_guard_json(gen.stats)}};
     parts.output = std::move(output);
     parts.usage  = json{{"input_tokens", gen.stats.prompt_tokens},
                         {"output_tokens", gen.stats.completion_tokens},
@@ -743,7 +828,7 @@ HttpResult responses_busy(const HttpResult& chat_refusal) {
     return HttpResult{429, std::move(body)};
 }
 
-HttpResult run_response(const Context& ctx, const PreparedResponse& prep, int slot) {
+HttpResult run_response(const Context& ctx, PreparedResponse& prep, int slot) {
     GenerationStats stats;
     std::string     raw;
     std::vector<std::pair<std::string, int>> pieces;
@@ -753,6 +838,8 @@ HttpResult run_response(const Context& ctx, const PreparedResponse& prep, int sl
                        [](std::string_view, int, const std::string&) { return true; }, stats, raw,
                        &pieces);
     } catch (const ContextOverflowError& e) {
+        if (prep.req.has_previous_response_id)
+            evict_continuation(ctx, prep.req.previous_response_id);
         log::warn("req", "responses refused: prompt %d tokens with its images, lane %d",
                   e.prompt_tokens, e.n_ctx);
         json body = responses_error(
@@ -764,10 +851,14 @@ HttpResult run_response(const Context& ctx, const PreparedResponse& prep, int sl
         body["n_ctx"]         = e.n_ctx;
         return HttpResult{400, std::move(body)};
     } catch (const InputError& e) {
+        if (prep.req.has_previous_response_id)
+            evict_continuation(ctx, prep.req.previous_response_id);
         log::warn("req", "responses refused: %s", e.what());
         return HttpResult{400, responses_error(e.what(), "invalid_request", "invalid_request",
                                                "input")};
     } catch (const std::exception& e) {
+        if (prep.req.has_previous_response_id)
+            evict_continuation(ctx, prep.req.previous_response_id);
         log::error("req", "responses generation failed: %s", e.what());
         return HttpResult{500, responses_error(e.what(), "server_error", "internal_error")};
     }
@@ -777,6 +868,8 @@ HttpResult run_response(const Context& ctx, const PreparedResponse& prep, int sl
     if (reason == FinishReason::Abort) {
         if (stats.abort_cause == AbortCause::ClientGone)
             return HttpResult{200, json::object(), true};
+        if (prep.req.has_previous_response_id)
+            evict_continuation(ctx, prep.req.previous_response_id);
         return HttpResult{503, responses_error(
             "the server is stopping; the request was cancelled at its last token or batch boundary",
             "server_error", "server_stopping")};
@@ -786,7 +879,11 @@ HttpResult run_response(const Context& ctx, const PreparedResponse& prep, int sl
     gen.stats  = stats;
     gen.reason = reason;
     finish_chat_generation(prep.chat, pieces, raw, gen);
-    return HttpResult{200, response_resource(prep.req, prep.chat, gen)};
+    json body = response_resource(prep.req, prep.chat, gen);
+    // store=true retains the turn (default true; review R4's entries=0 makes
+    // this a no-op inside the store). store=false keeps nothing.
+    remember(ctx, prep, body, slot);
+    return HttpResult{200, std::move(body)};
 }
 
 }  // namespace lgc::api

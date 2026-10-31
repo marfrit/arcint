@@ -246,7 +246,7 @@ void HttpServer::Impl::route() {
 
         auto lease = std::make_shared<api::SlotPool::Lease>();
         int  slot  = -1;
-        if (auto err = api::acquire_slot(ctx, prep->chat.lane, *lease, slot)) {
+        if (auto err = api::acquire_slot(ctx, prep->chat.lane, *lease, slot, prep->affinity_slot)) {
             // The spec maps a busy service to 429 too_many_requests; the chat
             // route keeps its 503. The refusal's slots/lanes diagnostics ride
             // into the 429 body (review F1).

@@ -4,6 +4,7 @@
 #include "api/responses_stream.h"
 
 #include <atomic>
+#include <ctime>
 #include <memory>
 #include <string>
 #include <vector>
@@ -480,6 +481,9 @@ TEST(responses_resource_carries_every_required_key) {
     CHECK(body["prompt_cache_key"].is_null());
     CHECK_EQ(body["top_logprobs"].get<int>(), 0);
     CHECK_EQ(body["model"].get<std::string>(), std::string("stub"));
+    // F2: the arcint extension key is present only when a loop-guard counter
+    // moved; this stub turn moved none.
+    CHECK(!body.contains("arcint"));
 
     // The message item and the usage block.
     CHECK_EQ(body["output"].size(), size_t(1));
@@ -1069,12 +1073,12 @@ TEST(responses_store_lru_and_bytes_limits_per_lane) {
     CHECK(store.get("b", 0) != nullptr);
     CHECK(store.get("c", 0) != nullptr);
 
-    // The byte limit binds first when the entries fit: one 700-byte prompt with
-    // a 400-byte limit leaves one entry, and the older one is evicted.
-    api::ResponseStore small(limits(32, 400));
-    std::string        big(700, 'x');
-    small.put(stored_entry("a", 0, big));
-    small.put(stored_entry("b", 0, big));
+    // The byte limit binds first when the entries fit: two ~950-byte entries
+    // under a 1000-byte limit leave one, and the older one is evicted.
+    api::ResponseStore small(limits(32, 1000));
+    std::string        text(100, 'x');
+    small.put(stored_entry("a", 0, text));
+    small.put(stored_entry("b", 0, text));
     CHECK_EQ(small.entries(), 1);
     CHECK(small.get("a", 0) == nullptr);
     CHECK(small.get("b", 0) != nullptr);
@@ -1084,9 +1088,10 @@ TEST(responses_store_lru_and_bytes_limits_per_lane) {
 TEST(responses_store_ttl_sweeps_expired_entries) {
     api::ResponseStore store(limits(32, 1ull << 20, /*ttl=*/10));
     store.put(stored_entry("a", 0));
-    store.sweep(5);
+    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    store.sweep(now + 5);
     CHECK(store.get("a", 0) != nullptr);
-    store.sweep(11);
+    store.sweep(now + 11);
     CHECK_EQ(store.entries(), 0);
 }
 
@@ -1211,6 +1216,51 @@ TEST(responses_continuation_prefix_mismatch_is_not_found) {
     CHECK(err.has_value());
     if (!err.has_value()) return;
     CHECK_EQ(err->body["error"]["code"].get<std::string>(), std::string("previous_response_not_found"));
+    CHECK(fx.ctx.responses->get("resp-x", -1) == nullptr);   // a 400 evicts the chain
+}
+
+TEST(responses_r4_entries_zero_refuses_every_continuation) {
+    // Review R4: entries=0 disables retention, so a continuation always answers
+    // previous_response_not_found even though the store exists.
+    Fixture fx;
+    fx.ctx.responses = std::make_shared<api::ResponseStore>(
+        api::ResponseStore::Limits{0, 1ull << 20, 600});
+    json b = base();
+    b["previous_response_id"] = "resp-anything";
+    ResponseRequest r;
+    parse_ok(b, r);
+    PreparedResponse p;
+    auto err = api::prepare_response(fx.ctx, std::move(r), p);
+    CHECK(err.has_value());
+    if (!err.has_value()) return;
+    CHECK_EQ(err->body["error"]["code"].get<std::string>(), std::string("previous_response_not_found"));
+}
+
+TEST(responses_store_limits_are_per_lane) {
+    api::ResponseStore store(limits(1));
+    store.put(stored_entry("a", 0));
+    store.put(stored_entry("b", 1));   // another lane: its own one-entry budget
+    CHECK_EQ(store.entries(), 2);
+    CHECK(store.get("a", 0) != nullptr);
+    CHECK(store.get("b", 1) != nullptr);
+}
+
+TEST(responses_slot_affinity_tries_the_stored_slot_then_falls_back) {
+    Fixture fx;
+    auto other = fx.slots.try_acquire(0);
+    CHECK_EQ(other.index(), 0);   // the affinity slot is taken
+    api::SlotPool::Lease lease;
+    int slot = -1;
+    auto err = api::acquire_slot(fx.ctx, -1, lease, slot, /*affinity=*/0);
+    CHECK(err.has_value());   // falls back to the ordinary acquire, which is busy
+    if (err.has_value()) CHECK_EQ(err->status, 503);
+    other = api::SlotPool::Lease();   // release
+
+    // Free again: the affinity look now wins without the fallback.
+    api::SlotPool::Lease lease2;
+    int slot2 = -1;
+    CHECK(!api::acquire_slot(fx.ctx, -1, lease2, slot2, /*affinity=*/0).has_value());
+    CHECK_EQ(slot2, 0);
 }
 
 TEST(responses_bogus_previous_id_is_not_found) {

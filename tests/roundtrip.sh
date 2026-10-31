@@ -633,6 +633,39 @@ ssecheck "${WORK}/resp-sse-tools.txt" \
   'done and types[-1]=="response.completed" and any(t=="response.function_call_arguments.delta" for t in types)'
 check "/v1/responses SSE emits the function_call argument delta and terminal event" $?
 
+# The state chain (W3): turn 1 stores; turn 2 continues with previous_response_id
+# and a function_call_output. The stub backend reports no prefix reuse
+# (cache_hit_tokens stays 0), so the affinity number is the live leg's (W5);
+# here the continuation, the echo and the /props count are the contract.
+curl -sS "${OP_BASE}/v1/responses" -H 'Content-Type: application/json' \
+     -d '{"model":"stub","input":"read it","max_output_tokens":256,"tools":[{"type":"function","name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}]}' \
+     -o "${WORK}/resp-t1.json"
+RESP_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "${WORK}/resp-t1.json")
+CALL_ID=$(python3 -c 'import json,sys; print(next(i["call_id"] for i in json.load(open(sys.argv[1]))["output"] if i["type"]=="function_call"))' "${WORK}/resp-t1.json")
+[[ -n "$RESP_ID" && -n "$CALL_ID" ]] && pass "responses turn 1 returns an id and a function_call" || fail "responses turn 1 returns an id and a function_call"
+python3 - "$WORK/resp-t2-request.json" "$RESP_ID" "$CALL_ID" <<'PY'
+import json, sys
+body = {"model": "stub", "previous_response_id": sys.argv[2], "max_output_tokens": 256,
+        "tools": [{"type": "function", "name": "read_file",
+                   "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}],
+        "input": [{"type": "function_call_output", "call_id": sys.argv[3], "output": "alpha"}]}
+open(sys.argv[1], "w").write(json.dumps(body))
+PY
+code=$(curl -sS -o "${WORK}/resp-t2.json" -w '%{http_code}' \
+       -H 'Content-Type: application/json' --data-binary @"${WORK}/resp-t2-request.json" \
+       "${OP_BASE}/v1/responses")
+check "/v1/responses continues a stored response on previous_response_id" "$([[ $code == 200 ]] && echo 0 || echo 1)"
+python3 - "$WORK/resp-t2.json" "$RESP_ID" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+sys.exit(0 if (d["previous_response_id"] == sys.argv[2] and d["status"] == "completed"
+               and d["store"] is True) else 1)
+PY
+check "responses turn 2 echoes previous_response_id and keeps the chain" $?
+curl -sS "${OP_BASE}/props" -o "${WORK}/resp-props.json"
+jassert "${WORK}/resp-props.json" 'd["responses"]["entries"] >= 1 and d["responses"]["limit_entries"] >= 32 and d["responses"]["bytes"] > 0'
+check "/props reports the Responses store's live entries and bytes" $?
+
 kill -TERM "$OP_PID" 2>/dev/null; wait "$OP_PID" 2>/dev/null; OP_PID=""
 
 # The retired engine's options are refused by name, and its engine value by a
