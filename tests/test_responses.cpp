@@ -34,8 +34,8 @@ struct Fixture {
     SlotPool                slots{1};
     Context                 ctx;
 
-    Fixture() {
-        backend = make_stub_backend(4096, 0, {}, {}, {}, 1);
+    explicit Fixture(int n_ctx = 4096) {
+        backend = make_stub_backend(n_ctx, 0, {}, {}, {}, 1);
         cfg.stub = true;
         ctx.cfg  = &cfg;
         ctx.backend = backend.get();
@@ -373,6 +373,28 @@ TEST(responses_refuses_a_previous_response_id_until_the_store_exists) {
     CHECK_EQ(err->body["error"]["param"].get<std::string>(), std::string("previous_response_id"));
 }
 
+TEST(responses_overflow_uses_the_spec_envelope_with_the_numbers) {
+    // §3.8 stays a hard 400; the Responses surface spells it with the spec's
+    // type and carries prompt_tokens/n_ctx at the top level (campaign Errors).
+    Fixture fx(16);
+    ResponseRequest r;
+    parse_ok({{"model", "stub"},
+              {"input", "one two three four five six seven eight nine ten eleven twelve "
+                        "thirteen fourteen fifteen sixteen seventeen eighteen nineteen"}},
+             r);
+    PreparedResponse prep;
+    auto err = api::prepare_response(fx.ctx, std::move(r), prep);
+    CHECK(err.has_value());
+    if (!err.has_value()) return;
+    CHECK_EQ(err->status, 400);
+    const json& b = err->body;
+    CHECK_EQ(b["error"]["type"].get<std::string>(), std::string("invalid_request"));
+    CHECK_EQ(b["error"]["code"].get<std::string>(), std::string("context_length_exceeded"));
+    CHECK_EQ(b["error"]["param"].get<std::string>(), std::string("input"));
+    CHECK(b["prompt_tokens"].is_number_integer());
+    CHECK_EQ(b["n_ctx"].get<int>(), 16);
+}
+
 // --------------------------------------------------------------- resource
 TEST(responses_resource_carries_every_required_key) {
     // The 2026-04-24 OpenAPI ResponseResource.required array, frozen here: a
@@ -472,7 +494,22 @@ TEST(responses_resource_emits_reasoning_and_function_call_items) {
     CHECK(incomplete["completed_at"].is_null());
     CHECK_EQ(incomplete["output"].size(), size_t(2));
     if (incomplete["output"].size() < 2) return;
+    // The reasoning block closed before the budget ran out, so that item stays
+    // completed; only the open item (the message) is the last and incomplete.
+    CHECK_EQ(incomplete["output"][0]["status"].get<std::string>(), std::string("completed"));
     CHECK_EQ(incomplete["output"].back()["status"].get<std::string>(), std::string("incomplete"));
+
+    // A budget cut inside the reasoning block: the reasoning item is the only
+    // output item, is last, and is incomplete (spec §Items).
+    api::ChatGeneration open = gen;
+    open.reasoning_closed   = false;
+    open.content            = "";
+    open.reason             = FinishReason::Length;
+    const json open_body = api::response_resource(req, prep, open);
+    CHECK_EQ(open_body["output"].size(), size_t(1));
+    if (open_body["output"].empty()) return;
+    CHECK_EQ(open_body["output"][0]["type"].get<std::string>(), std::string("reasoning"));
+    CHECK_EQ(open_body["output"][0]["status"].get<std::string>(), std::string("incomplete"));
 
     api::ChatGeneration loop = gen;
     loop.reason              = FinishReason::Loop;

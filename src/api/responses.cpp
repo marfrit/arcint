@@ -9,6 +9,7 @@
 #include "api/generate.h"
 #include "core/chat.h"
 #include "util/log.h"
+#include "util/text.h"
 
 // Open Responses 2026-04-24 request mapping (docs/campaigns/feyntalk.md W1).
 // The mapping rows and their refusals are the campaign's table; every row that
@@ -21,7 +22,7 @@ using json = nlohmann::json;
 
 constexpr size_t kMaxInputChars = 10485760;
 
-HttpResult invalid( std::string message, std::string param = {}) {
+HttpResult invalid(std::string message, std::string param = {}) {
     return HttpResult{400, responses_error(std::move(message), "invalid_request",
                                            "invalid_request", param)};
 }
@@ -587,7 +588,34 @@ std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest r
     }
 
     PreparedResponse prep;
-    if (auto err = prepare_from_chat(ctx, req.chat, prep.chat)) return err;
+    if (auto err = prepare_from_chat(ctx, req.chat, prep.chat)) {
+        // prepare_from_chat speaks the chat route's envelope (its lanes' 404 and
+        // the §3.8 overflow are shared answers). The Responses surface gets the
+        // spec's type spellings and field paths here, not a second prepare.
+        const json& e = err->body["error"];
+        const std::string message = e["message"].is_string() ? e["message"].get<std::string>() : "";
+        const std::string code = (e.contains("code") && e["code"].is_string())
+                                    ? e["code"].get<std::string>()
+                                    : "invalid_request";
+        if (err->status == 404) {
+            return HttpResult{404, responses_error(message, "not_found", code,
+                                                   e["param"].is_string() ? e["param"].get<std::string>()
+                                                                          : "model")};
+        }
+        if (err->status == 400) {
+            // Overflow is a §3.8 400 with the numbers at the top level (the
+            // campaign's extension keys); a malformed field names `input`.
+            const bool overflow = code == "context_length_exceeded";
+            json body = responses_error(message, "invalid_request", code,
+                                        overflow ? "input" : "");
+            if (overflow) {
+                if (e.contains("prompt_tokens")) body["prompt_tokens"] = e["prompt_tokens"];
+                if (e.contains("n_ctx")) body["n_ctx"] = e["n_ctx"];
+            }
+            return HttpResult{400, std::move(body)};
+        }
+        return err;
+    }
     prep.req = std::move(req);
     // The Responses ids are resp-N; prepare_from_chat numbered it as a chat
     // response, so it is renumbered here rather than letting one turn carry two
@@ -616,16 +644,17 @@ json response_resource(const ResponseRequest& req, const PreparedChat& prep,
     if (!gen.reasoning.empty()) {
         output.push_back(json{{"type", "reasoning"},
                               {"id", next_id("rs")},
-                              {"status", item_status(gen.reason)},
+                              {"status", gen.reasoning_closed ? "completed" : item_status(gen.reason)},
                               {"summary", json::array()},
                               {"content",
                                json::array({{{"type", "reasoning_text"},
                                              {"text", gen.reasoning}}})}});
     }
-    // A message item for an answer. A turn that produced only tool calls has
-    // no message: the markup around the call is not an answer (the chat route
-    // reports content null on that turn, not "").
-    if (!gen.content.empty() || gen.calls.empty()) {
+    // A message item for a real answer. A turn that produced only tool calls
+    // or only reasoning has no message: the markup around the call is not an
+    // answer (the chat route reports content null on that turn, not "").
+    const bool has_answer = !text::trim(gen.content).empty();
+    if (has_answer || (gen.calls.empty() && gen.reasoning.empty())) {
         output.push_back(json{{"type", "message"},
                               {"id", next_id("msg")},
                               {"role", "assistant"},
