@@ -186,8 +186,8 @@ scan, reasoning split, UTF-8 hold-back and tool parsing.
 | `reasoning.effort` `"none"` | `enable_thinking=false` | the fleet's switch `code` |
 | `reasoning.effort` low/medium/high/xhigh/minimal | `enable_thinking=true` | Qwen templates know on/off only (`src/core/chat.cpp:354` comment) `code`; echoed unchanged |
 | `reasoning.summary` | accepted, echoed `null`; no summary is produced | 1.3.x |
-| `truncation` `"disabled"` or absent | today's behaviour: no truncation, `§3.8` 400 on overflow with `prompt_tokens`/`n_ctx` | — | `paper`: `disabled` MUST fail (`code`; unchanged, byte-identical) |
-| `truncation` `"auto"` | **yes**, W3.5: the cheap compaction tier, reasoning first | — | operator decision 2026-10-31, recorded below: drop replayed reasoning blocks oldest first until the prompt fits `n_ctx - reserve`; messages, tool calls and tool outputs are never dropped or edited; exhausted → the same 400 with `reasoning dropped: N blocks, still M over`; the store keeps the full history (`code`) |
+| `truncation` `"disabled"` or absent | no truncation; `§3.8` 400 only at `prompt_tokens >= n_ctx`, with the numbers | `paper`: `disabled` MUST fail; `code`, byte-identical |
+| `truncation` `"auto"` | the fit pass drops rendered replayed reasoning blocks oldest first until the prompt fits `n_ctx - reserve` (W3.5); never refuses more than `disabled`; `arcint:truncated` / `arcint.truncated` reports it | `paper`: `auto` MAY truncate, not MUST; operator decision 2026-10-31, `code` |
 | `stream`, `stream_options.include_obfuscation` | `stream` honoured; obfuscation accepted and ignored (arcint emits no `obfuscation`) | `paper` optional field |
 | `store`, `background`, `metadata`, `service_tier`, `safety_identifier`, `prompt_cache_key` | echoed; `background:true` → 400 `unsupported_parameter`, `service_tier` other than `auto`/`default` → 400 | see Scope `code` |
 | `max_tool_calls` | 400 `unsupported_parameter`, param `max_tool_calls` | 1.3.x |
@@ -513,11 +513,27 @@ the oldest replayed `ChatMessage::reasoning`, re-renders and recounts, and
 repeats until the prompt fits; it walks messages in order, so the most recent
 assistant turn's reasoning is the last to go. It never drops or edits a message
 body, a tool call or a tool output. `out.req` stays the full history — the echo
-and the store are not rewritten; truncation is per request. If every block is
-gone and the prompt is still over, the answer is the same 400 code with a
-message naming the drops and the remaining overflow:
-`reasoning dropped: N blocks, still M over`, plus `prompt_tokens`, `n_ctx`,
-`fit_reserve` and `reasoning_dropped_blocks`.
+and the store are not rewritten; truncation is per request. **N1:** auto may truncate, it never refuses more than `disabled`. After the
+drops are exhausted, being over the fit limit while still under `n_ctx` is
+**served** -- the context guard forces the closer early when it is on, and a
+guard-off unit ends at the ordinary length stop. The 400 fires only when the
+prompt reaches `n_ctx`, the same condition `disabled` refuses on; its message
+names the drops and the remaining overflow (`reasoning dropped: N blocks, still
+M over`) and the fit numbers (`prompt_tokens`, `n_ctx`, `overflow`,
+`fit_reserve`, `reasoning_dropped_blocks`) reach the client.
+
+**N2:** a drop is counted only when the re-rendered prompt actually changed.
+Reasoning the template hides (an assistant turn before the last user message)
+is not a drop and adds no reports; a template that does not reference
+`reasoning_content` skips the whole pass (the backend's
+`supports_preserve_reasoning` capability; a backend without the key is treated
+as "may render").
+
+**N3:** the fit pass's render and token count are reused, so an `auto` request
+that already fits pays no extra render or encode. **N6:** with `auto` and a
+reserve R the fit stops at the first drop under `n_ctx - R`, so a truncated
+turn's context-guard budget can be 0 -- with the guard on, the closer is forced
+at the first thinking token; that is the intended cheap tier, not a defect.
 
 Reporting: `arcint:truncated` on the stream (before the terminal event) and
 `arcint.truncated` in the non-streamed resource's extension object — blocks
@@ -669,6 +685,7 @@ Two ids are named in the specification README (`basic-response`,
 | W3 | **state + continuation**: `ResponseStore`, limits/LRU/TTL, `store` semantics, `previous_response_id`, `prefix_hash`, `SlotPool::try_acquire`, eviction on error | `src/api/responses_state.{h,cpp}`, `src/api/handlers.{h,cpp}` (`SlotPool`), `src/api/responses.cpp`, `src/config.{h,cpp}`, `/props`, `tests/test_responses.cpp` | unit store/continuation/eviction green; stub continuation `cache_hit_tokens >= prompt_tokens - 1`; compliance `previous_response_id` tests |
 | W3.2 | **reasoning replay**: `ChatMessage::reasoning`, Responses reasoning-item pairing, chat `reasoning_content`, the stub template's Qwen3 rule, stored-continuation assistant turns per output item, think state keyed to the generation start | `src/core/chat.{h,cpp}`, `src/exec/chat_json.h`, `src/api/responses.cpp`, `tests/test_chat.cpp`, `tests/test_responses.cpp`, `tests/golden/feyntalk-w1/` | unit mapping/rendering/continuation red-first; think-state guard with replayed closed reasoning; 12 golden captures (10 old byte-identical); roundtrip |
 | W3.4 | **context guard**: the loop guard's forced-closer seam, a second trigger with its own reason and counter; the budget `n_ctx - prompt_tokens - reserve` handed at request start, counted down per emitted token, forced closer at 0; `--think-ctx-reserve N` (default 0 = off), `/props`; `arcint:context` event, the counters in the loop-guard object, the slot line | `src/core/sampler.{h,cpp}`, `src/core/sampling.{h,cpp}`, `src/exec/backend_llama.cpp` (`prepare_think_ctx`, the three sampler sites), `src/config.{h,cpp}`, `src/api/{handlers,generate,responses_stream}.cpp`, `tests/test_context_guard.cpp`, `tests/test_responses.cpp`, `tests/test_stream_utf8.cpp` | red-first 10 cases; `ctest -L unit` 0 failed; `arcint-test --max-skips 0` 0 failed; golden byte-identical; roundtrip green. The live card check is owed (no card in this package) |
+| W3.5b | **review round for W3.5**: N1 (auto never refuses more than disabled; fall-through to `>= n_ctx`, counts in that 400), N2 (un-rendered reasoning not counted; a template without `reasoning_content` skips the pass), N3 (the fit count reused), N4 (the fit numbers reach the client; message sentence fixed), N5 (table cells), N6 (documented); red first | `src/api/handlers.cpp` (fit pass, `finish_prepare`'s count hint), `src/api/responses.cpp` (`translate_prepare_error`), `src/api/error.cpp`, `tests/test_responses.cpp` | red-first three cases; `ctest -L unit` 0 failed; `arcint-test --max-skips 0` 0 failed; golden byte-identical; roundtrip and compliance green |
 | W3.4b | **review round for W3.4**: F1 (the pending force survives a slap close) fixed by a `think_state_ == thinking` gate; F2 (an undecided start spends the arm) fixed by requiring the open block in `think_ctx_arm_()`; F3/F4/F5 recorded; the missing verify-walk case added; red first | `src/core/sampler.cpp` (`sample()`'s context branch, `think_ctx_arm_()`), `tests/test_context_guard.cpp`, `docs/campaigns/feyntalk.md` | red-first four cases; `ctest -L unit` 0 failed; `arcint-test --max-skips 0` 0 failed; golden byte-identical; roundtrip and compliance green |
 | W3.5 | **truncation auto**: the cheap compaction tier, reasoning first — `prepare_from_chat`'s optional fit policy (`PromptFit`) drops the oldest replayed reasoning block on a local render copy until the prompt fits `n_ctx - reserve`, re-rendering and recounting; exhausted → the same 400 with counts; `arcint:truncated` event / `arcint.truncated` object, one `req:` line; the store keeps the full history and a truncated turn's prefix hash is taken over the full render | `src/api/handlers.{h,cpp}` (`PromptFit`, `drop_oldest_reasoning`), `src/api/responses.cpp` (reserve, `PromptFit`, log, ext object), `src/api/responses_stream.cpp` (event), `src/api/responses_state.cpp` (hash), `src/api/error.{h,cpp}` (exhausted 400), `src/api/generate.{h,cpp}` (`truncation_json`), `tests/test_responses.cpp` | red-first nine cases; `ctest -L unit` 0 failed; `arcint-test --max-skips 0` 0 failed; golden byte-identical; roundtrip green |
 | W4 | **cancel by id**: extension route, in-flight registry, `GenerationInput::cancel`, `AbortCause::Cancelled`, `abort_cause_of` + stub `cause`, `arcint:response.cancelled` + incomplete(cancelled) | `src/http/server.cpp`, `src/api/responses_state.{h,cpp}`, `src/exec/backend.h` (~390), `src/exec/backend_llama.cpp:150-152`, `src/exec/backend_stub.cpp:216-220`, `tests/test_responses.cpp`, a cancel measurement script under `tools/` | unit cancel paths red-first; stub cancel at 4 ubatches; card window: cancel-to-abort within one ubatch at 100k, control arm the same |
@@ -768,7 +785,7 @@ refusals and was left unchanged (its bytes are a gate).
 
 Gate numbers (`measured-here`): `ctest -L unit` 9/9, 442 cases 0 failed 0
 skipped on the stub build with `-Werror` (432 before W3.4's ten cases, W3.5's
-nine and W3.4b's four); the feyntalk-golden captures of the
+nine, W3.4b's four and W3.5b's two); the feyntalk-golden captures of the
 chat/completions routes (12: the 10 original byte-identical plus two carrying
 `reasoning_content`) stay byte-identical; `tests/roundtrip.sh` green
 including the two-turn continuation and cancel-by-id checks; the 7 named
@@ -819,8 +836,9 @@ in `prepare_from_chat` (`PromptFit`), the 256-token/smaller-`max_output_tokens`
 reserve, the exhausted 400 with counts, `arcint:truncated` /
 `arcint.truncated`, the store keeping the full history and the full-render
 prefix hash for truncated turns. `ctest -L unit` 9/9, `arcint-test --max-skips
-0` 455 cases 0 failed 0 skipped, golden byte-identical, roundtrip green
-(`measured-here`, 2026-10-31, stub, after the W3.4b review round). No card check applies to this package.
+0` 457 cases 0 failed 0 skipped, golden byte-identical, roundtrip and compliance
+green (`measured-here`, 2026-10-31, stub, after the W3.4b and W3.5b review
+rounds). No card check applies to this package.
 
 W3.4 (context guard) is built, unit-tested and default off: the loop guard's
 forced-closer seam with its own counter, the budget at request start, the
