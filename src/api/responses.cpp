@@ -562,11 +562,20 @@ std::optional<HttpResult> parse_response_request(const json& body, ResponseReque
         req.has_previous_response_id = true;
     }
 
-    // The unbuilt fields, refused by their own names.
+    // include (2026-04-24): accepted and ignored. arcint serves no encrypted
+    // reasoning and no output logprobs, and OpenAI-compatible clients (the live
+    // pi client) send it on every reasoning request; a 400 would lock them out.
+    // Nothing is added to the output. A non-string entry is still a 400.
     if (body.contains("include")) {
-        return unsupported("include is not served in 1.3.0: no encrypted reasoning and no "
-                           "logprobs exist here (docs/campaigns/feyntalk.md Scope)", "include");
+        const json& inc = body["include"];
+        if (!inc.is_array()) return invalid("include must be an array", "include");
+        for (const json& entry : inc) {
+            if (!entry.is_string())
+                return invalid("include entries must be strings (the spec's enum values)",
+                               "include");
+        }
     }
+    // The unbuilt fields, refused by their own names.
     if (body.contains("max_tool_calls")) {
         return unsupported("max_tool_calls is not served in 1.3.0: no cross-call counting exists "
                            "(docs/campaigns/feyntalk.md Scope)", "max_tool_calls");
