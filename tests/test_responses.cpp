@@ -1343,3 +1343,102 @@ TEST(responses_non_stream_resource_carries_arcint_loop_guard_when_moved) {
     if (!r.body.contains("arcint")) return;
     CHECK_EQ(r.body["arcint"]["loop_guard"]["nudges"].get<int>(), 2);
 }
+
+// ------------------------------------------------ instructions (W3.1)
+namespace {
+
+// Turn 1 with `instructions`, stored on the stub; returns the response id.
+std::string stored_with_instructions(Fixture& fx, const std::string& instructions) {
+    fx.ctx.responses = std::make_shared<api::ResponseStore>(
+        api::ResponseStore::Limits{32, 1ull << 20, 600});
+    json b = {{"model", "stub"}, {"input", "first"}, {"instructions", instructions},
+              {"max_output_tokens", 256}};
+    ResponseRequest r;
+    parse_ok(b, r);
+    PreparedResponse p;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r), p).has_value());
+    const api::HttpResult res = api::run_response(fx.ctx, p, 0);
+    CHECK_EQ(res.status, 200);
+    return res.status == 200 ? res.body["id"].get<std::string>() : std::string();
+}
+
+}  // namespace
+
+TEST(responses_continuation_resending_the_same_instructions_keeps_one_head) {
+    // OpenAI-compatible clients send their full system prompt as `instructions`
+    // on every turn. Resending the same text must not duplicate it: the stored
+    // head is replaced by the identical message, so the shared prefix bytes (and
+    // the slot-affinity prefix hash) stay the same.
+    Fixture fx;
+    const std::string id = stored_with_instructions(fx, "be terse");
+    CHECK(!id.empty());
+    if (id.empty()) return;
+
+    json b = {{"model", "stub"}, {"previous_response_id", id}, {"instructions", "be terse"},
+              {"input", "second"}, {"max_output_tokens", 256}};
+    ResponseRequest r;
+    parse_ok(b, r);
+    PreparedResponse p;
+    const auto err = api::prepare_response(fx.ctx, std::move(r), p);
+    CHECK(!err.has_value());
+    if (err.has_value()) return;
+    int systems = 0;
+    for (const ChatMessage& m : p.chat.req.messages) if (m.role == "system") ++systems;
+    CHECK_EQ(systems, 1);   // the head, once
+    CHECK_EQ(p.chat.req.messages[0].role, std::string("system"));
+    CHECK_EQ(p.chat.req.messages[0].content, std::string("be terse"));
+    // The rendered head+stored half is still the stored prompt's bytes: the
+    // current renderer reproduces the stored prefix (checked in prepare) and the
+    // head is the same message in the same position.
+    CHECK_EQ(fx.ctx.responses->get(id, -1)->prefix_hash,
+             api::sha256_hex(fx.backend->render_chat(fx.ctx.responses->get(id, -1)->chat)));
+}
+
+TEST(responses_continuation_changed_instructions_replace_the_head) {
+    // A new system prompt replaces the stored head in place (first), never
+    // appended after the assistant turn: Qwen-family templates reject a system
+    // message that is not first.
+    Fixture fx;
+    const std::string id = stored_with_instructions(fx, "be terse");
+    CHECK(!id.empty());
+    if (id.empty()) return;
+
+    json b = {{"model", "stub"}, {"previous_response_id", id}, {"instructions", "be verbose"},
+              {"input", "second"}, {"max_output_tokens", 256}};
+    ResponseRequest r;
+    parse_ok(b, r);
+    PreparedResponse p;
+    const auto err = api::prepare_response(fx.ctx, std::move(r), p);
+    CHECK(!err.has_value());
+    if (err.has_value()) return;
+    CHECK_EQ(p.chat.req.messages[0].role, std::string("system"));
+    CHECK_EQ(p.chat.req.messages[0].content, std::string("be verbose"));
+    int systems = 0;
+    for (const ChatMessage& m : p.chat.req.messages) if (m.role == "system") ++systems;
+    CHECK_EQ(systems, 1);
+    CHECK(p.chat.req.messages[1].content != std::string("be terse"));
+}
+
+TEST(responses_continuation_without_instructions_keeps_the_stored_head) {
+    // No instructions on the new request means "no new guidance", not "drop the
+    // stored system prompt": the stored head stays first, and no system message
+    // is added.
+    Fixture fx;
+    const std::string id = stored_with_instructions(fx, "be terse");
+    CHECK(!id.empty());
+    if (id.empty()) return;
+
+    json b = {{"model", "stub"}, {"previous_response_id", id}, {"input", "second"},
+              {"max_output_tokens", 256}};
+    ResponseRequest r;
+    parse_ok(b, r);
+    PreparedResponse p;
+    const auto err = api::prepare_response(fx.ctx, std::move(r), p);
+    CHECK(!err.has_value());
+    if (err.has_value()) return;
+    CHECK_EQ(p.chat.req.messages[0].role, std::string("system"));
+    CHECK_EQ(p.chat.req.messages[0].content, std::string("be terse"));
+    int systems = 0;
+    for (const ChatMessage& m : p.chat.req.messages) if (m.role == "system") ++systems;
+    CHECK_EQ(systems, 1);
+}
