@@ -174,7 +174,7 @@ These names are not in a table:
 | `LLAMA_EXPERT_CACHE_NB` | on (needs the adapt entry points) | `0`: swaps go back to the exchange on the compute queue. | 0042 | Verify input wait 2.6-6.0 -> 0.94-0.95 ms; decode 32.3 -> 33.1 t/s (`measured-here`). |
 | `GGML_OPENCL_CPU_MISS_MT` | on (AVX2, FMA, F16C) | `0`: the CPU miss path on ggml-cpu's single-token dot products, as its prototype. | 0056 | ggml-cpu's Q2_0 dot product 661 against 72 us a matrix (`measured-here`). |
 | `LLAMA_SLOT_LOAN_EVICTION_GUARD` | on (absent) | 0, off, false or no (any case) turn the loan's eviction guard off; a typo keeps it on. | 0068 | `code`: 0068:3944-3946. |
-| `GGML_OPENCL_CPU_MISS_PREFETCH` | 0 | `1`: a block-ahead prefetch in the miss rows; `2`: also a page-touch pass over the missed experts' slices at publish. | 0075 | — pricing owed (the cold/warm served pair and `perf stat -e major-faults`; the audit's bar: faults > ~5 % of the CPU lane). |
+| `GGML_OPENCL_CPU_MISS_PREFETCH` | 0 | `1`: a next-block prefetch (field 1, two blocks ahead) in the miss rows; `2`: also a synchronous page-touch pass over the missed experts' slices at publish. | 0075 | — pricing owed; the bank is USM host memory written at load, so the prediction is major faults ~0 and level 2 buying nothing (the window's `/proc` fault count decides; the audit's bar: faults > ~5 % of the CPU lane). |
 
 ### Red case
 

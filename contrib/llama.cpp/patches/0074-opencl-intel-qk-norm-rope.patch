@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 41de741..7519df1 100644
+index 41de741..545ab96 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -724,6 +724,8 @@ struct ggml_backend_opencl_context {
@@ -37,7 +37,7 @@ index 41de741..7519df1 100644
      if (const char * env = getenv("GGML_OPENCL_FUSE_0050")) {
          backend_ctx->fuse_0050 = atoi(env);
      }
-@@ -9693,7 +9700,54 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
+@@ -9693,7 +9700,68 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
          return false;
      }
  
@@ -59,6 +59,12 @@ index 41de741..7519df1 100644
 +            w->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || rope->type != GGML_TYPE_F32) {
 +            return false;
 +        }
++        // the pattern's operand order: the rotation's input must be the mul.
++        // ggml_can_fuse also accepts the mul as rope's src[1]; the fused kernel
++        // reads the normed value from the mul, so that placement is not its shape
++        if (rope->src[0] != mul) {
++            return false;
++        }
 +        // the norm weight is the model's 1-D [ne00] tensor, broadcast over the rows
 +        if (w->ne[0] != rms_norm->src[0]->ne[0] || w->ne[1] != 1 || w->ne[2] != 1 || w->ne[3] != 1 ||
 +            w->nb[0] != ggml_element_size(w)) {
@@ -77,6 +83,14 @@ index 41de741..7519df1 100644
 +        if (n_dims <= 0 || n_dims % 2 != 0 || n_offs < 0 || n_offs + n_dims > (int) rope->ne[0]) {
 +            return false;
 +        }
++        // the sections must carry a dimension: the per-op path asserts their sum
++        // (`ggml_cl_rope`), and the fused kernel's `ic % sect_dims` would divide
++        // by zero on the GPU without a word
++        int32_t sections[4];
++        memcpy(&sections, (int32_t *) rope->op_params + 11, sizeof(sections));
++        if (sections[0] + sections[1] + sections[2] + sections[3] <= 0) {
++            return false;
++        }
 +        // the normed row is the rotation's input, so the destination must be a
 +        // contiguous f32 row too (the per-op rope can write a cache view instead)
 +        if (!ggml_is_contiguous(rope) || rope->nb[0] != sizeof(float)) {
@@ -93,7 +107,7 @@ index 41de741..7519df1 100644
          const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
          const ggml_tensor *mul      = cgraph->nodes[node_idx+1];
  
-@@ -9788,6 +9842,8 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
+@@ -9788,6 +9856,8 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
  }
  
  static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor);
@@ -102,7 +116,7 @@ index 41de741..7519df1 100644
  static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
  static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
  
-@@ -10000,6 +10056,124 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
+@@ -10000,6 +10070,124 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
      backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
  }
  
@@ -227,7 +241,7 @@ index 41de741..7519df1 100644
  // llama.cpp's MoE routing (build_moe_ffn, softmax gating, normalized weights):
  // SOFT_MAX, RESHAPE, ARGSORT, VIEW (the ids), GET_ROWS, RESHAPE, SUM_ROWS,
  // CLAMP, DIV, RESHAPE (the weights) -> one kernel, as ggml-cuda's topk_moe
-@@ -10558,6 +10732,14 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+@@ -10558,6 +10746,14 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
              i += 2;
              continue;
          }
@@ -243,10 +257,10 @@ index 41de741..7519df1 100644
              ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
              i++;
 diff --git a/ggml/src/ggml-opencl/kernels/rms_norm.cl b/ggml/src/ggml-opencl/kernels/rms_norm.cl
-index 47124be..7e4198c 100644
+index 47124be..b03922c 100644
 --- a/ggml/src/ggml-opencl/kernels/rms_norm.cl
 +++ b/ggml/src/ggml-opencl/kernels/rms_norm.cl
-@@ -372,3 +372,178 @@ kernel void kernel_rms_norm_mul_add_scale(
+@@ -372,3 +372,180 @@ kernel void kernel_rms_norm_mul_add_scale(
          y[i00] = ((x[i00] * scale) * f[i00%(ne10/4)] + g[i00%(ne20/4)]) * sc;
      }
  }
@@ -258,10 +272,12 @@ index 47124be..7e4198c 100644
 +// computes y = rope(rmsnorm(x) * w) in one dispatch and drops the normed row's
 +// store/load between the two kernels. The epsilon, the weight factor and the
 +// rotation's cos/sin are kernel_rms_norm_mul's and kernel_rope_multi_f32's
-+// expressions, and the normed value is rounded as kernel_rms_norm_mul rounds it
-+// ((x * scale) then * w, the `opaque` guard against IGC regouping); only the
-+// interleaved M-RoPE form (mode GGML_ROPE_TYPE_IMROPE) is handled, which is
-+// what both served models build.
++// expressions. The normed value rounds in two steps here, (x * scale) then * w,
++// through the `opaque` guard against IGC regrouping — kernel_rms_norm_mul has no
++// such guard (`code`), so it may fold x * (scale * w) itself and the two paths'
++// bits are not promised to agree either way; the answer-level bar and the
++// md5/argmax tripwire are the gate. Only the interleaved M-RoPE form (mode
++// GGML_ROPE_TYPE_IMROPE) is handled, which is what both served models build.
 +//------------------------------------------------------------------------------
 +float rope_yarn_ramp_fused(float low, float high, int i0) {
 +    const float y = (i0 / 2 - low) / max(0.001f, high - low);

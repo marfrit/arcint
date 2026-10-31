@@ -21,7 +21,13 @@ patch README section):
   (d) the switch's default flipped (`fuse_qk_norm_rope = false` -> `= true`):
       the default-off cell fails;
   (e) the fused dispatch moved below the 2-node norm+mul check: the
-      pattern-order cell fails.
+      pattern-order cell fails;
+  (f) the sections guard dropped (`sections[0] + ... <= 0` removed), and the
+      operand-order guard dropped (`rope->src[0] != mul` removed): the guards
+      cell fails.
+These are source-text assertions (the cells read the patched tree), not
+numerics; `test-backend-ops`' NMSE cannot see the fused rounding order either,
+so the rounding gate is the answer-level bar with the md5/argmax tripwire.
 Standard library only (unittest), so the recipe's `ctest -L unit` runs it on a
 build host with python3 and nothing else.
 """
@@ -114,6 +120,13 @@ class FuseQkNormRopeGate(unittest.TestCase):
 
     def test_kernel_is_created(self):
         self.assertIn('clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm_mul_rope_multi_f32"', self.cpp)
+
+    def test_gate_guards(self):
+        # the rotation's input is the mul (can_fuse also accepts it as rope's src[1])
+        self.assertIn("rope->src[0] != mul", self.cpp)
+        # the sections must carry a dimension: the per-op path asserts the sum, the
+        # fused kernel's ic % sect_dims would divide by zero on the GPU silently
+        self.assertRegex(self.cpp, r"sections\[0\] \+ sections\[1\] \+ sections\[2\] \+ sections\[3\] <= 0")
 
 
 class FuseQkNormRopeCardCases(unittest.TestCase):

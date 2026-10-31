@@ -5132,7 +5132,11 @@ the normed row no longer stored and reloaded. The gate is the 3-node pattern in
 `ggml_opencl_can_fuse`, checked before the 2-node norm+mul prefix (which would
 otherwise swallow its first two nodes), and only for mode
 `GGML_ROPE_TYPE_IMROPE`, a 1-D weight, a 4-aligned contiguous input row and a
-contiguous f32 output.
+contiguous f32 output; `rope->src[0] == mul` is required explicitly
+(`ggml_can_fuse` also accepts the mul as rope's `src[1]`, which is not this
+kernel's shape), and the sections' sum must be positive — the per-op path
+asserts it and the fused kernel's `ic % sect_dims` would divide by zero on the
+GPU without a word (`code`).
 
 Switch: `GGML_OPENCL_FUSE_QK_NORM_ROPE=1`, **off by default** (`code`): the
 patch is a mechanism, the card A/B is owed before any default (see the audit's
@@ -5149,8 +5153,18 @@ positions, the norm-then-weight rounding order, the rotation's formula and the
 M-RoPE position layout, the switch's default and the 3-before-2 dispatch order.
 Mutations run red before restore (`measured-here` on the patched tree): the
 epsilon dropped, the weight read at `w[ic]`, the weight folded before the
-rounding, the default flipped on, the dispatch moved below the prefix — each
-made its cell fail; restored, the cell passes.
+rounding, the default flipped on, the dispatch moved below the prefix, the
+sections guard dropped, the operand-order guard dropped — each made its cell
+fail; restored, the cell passes. The cells are **source-text assertions** (they
+read the patched tree), not numerics.
+
+**Rounding, stated plainly** (`code`): the fused kernel rounds the normed value
+in two steps — `(x * scale)` then `* w`, kept apart by the 0049 `opaque` guard.
+`kernel_rms_norm_mul` has no such guard (`rms_norm.cl`, the plain `(x * scale) *
+f[i00]`), so it may fold `x * (scale * w)` itself and the two paths' bits are
+not promised to agree either way. The gate is the answer-level bar
+(`CLAUDE.md`) with an md5/argmax tripwire per fusion; `test-backend-ops`' NMSE
+cannot see the rounding-order mutation, which is why the tripwire exists.
 
 `measured-here` /**owed** on the cards (Claude's window; the handover carries
 the commands): the pricing trace's per-step `kernel_rope_multi_f32` +
@@ -5159,38 +5173,52 @@ switch off and on at the same unit flags. No number is claimed here.
 
 ## 0075-opencl-intel-cpu-miss-prefetch.patch
 
-The CPU miss rows (0056/0063) read a bank slice for the first time after an
-expert has missed, so the pages may be absent: Strata measured cold reads at
-78 % of its CPU lane (`paper`, St 9e3fe046). The patch carries both pieces the
-audit names: one block-ahead `__builtin_prefetch` of the next block's first
-payload field in each of the six row functions (`code`:
-`ggml-opencl-miss-cpu.cpp`), and a page-touch pass over a missed expert's three
-slices at publish time (`ggml_cl_miss_cpu_touch`, one byte a 4 KiB page through
-a volatile pointer), run as the pool's own tasks so the faults flow in parallel
-before the rows read the same pages. It is the audit's cold-page half; its
-prefetch half deviates from the sketch's "next expert's first field" and reads
-the block two ahead within the same expert (`code`) — the rows' task sees one
-expert only, so the next expert's field is not in scope, and the page touch
-covers the slice boundary instead.
+Two pieces from the audit's item 6, behind `GGML_OPENCL_CPU_MISS_PREFETCH`
+(**0 off by default**; `1` the rows' hints, `2` also the page-touch pass,
+`code`): one block-ahead `__builtin_prefetch` in each of the six row functions,
+and a page touch over a missed expert's three bank slices at publish.
 
-Switch: `GGML_OPENCL_CPU_MISS_PREFETCH`, **0 (off) by default**; `1` the rows'
-hints, `2` also the page touch (`code`). The audit's bar before any default:
-major page faults above ~5 % of the CPU lane's time (`paper`, the audit's
-pricing) — no number is claimed here.
+**The premise is not Strata's — a build difference, named** (`code`). Strata's
+cold reads are file-backed rows (78 % of its CPU lane, `paper`, St 9e3fe046).
+Here a bank is USM host memory (`clHostMemAllocINTEL`, the `usm_host_alloc`
+entry points in `ggml-opencl.cpp`, the buffer context's comment) and **every
+byte is written at load** by `ggml_cl_usm_set_tensor` — the planar loop and the
+IQ4_NL split copy — so its pages are resident before the first miss, and
+`drop_caches` evicts page cache, not this memory. Prediction: major faults near
+0 and the level-2 pass buying nothing, by construction. The window's fault count
+decides; no number is claimed here (`measured-here` owed).
 
-`measured-here`, device-free: `tests/test-opencl-miss-cpu.cpp` gains the
-level-1 parity arm (the rows' bits identical at level 0 and level 1, which is
-what a hint must be), the ahead-distance arm and the residency arm (a 16-page
-mapping dropped to absent, one byte a page touches it all resident; a touch
-striding 8192 leaves 8 of 16 absent and fails). Mutations run red before
-restore: the touch stride 8192 (residency 16 -> 8 and the cell fails), the ahead
-distance 0 (the cell fails). `tests/python/test_cpu_miss_prefetch.py` reads the
-patched tree for the default-off switch, one hint in every row function, the
-volatile touch and the `>= 2` guard in both compute paths; its five red
-mutations (a hint dropped, distance 0, stride, non-volatile pointer, default
-on, guard removed) were each seen failing.
+**The hints are narrow, and said so** (`code`): each names only the next block's
+field 1 (the payload plane), two blocks ahead — 64-128 bytes, inside the
+hardware prefetcher's reach; fields 0 (the scale) and 2 (the signs/qh plane) are
+unhinted. A hint's gain, if any, is expected in the run's spread, not a step.
+
+**The touch is a synchronous barrier on the lane's critical path** (`code`):
+`ggml_cl_miss_pool::run` claims tasks and spins until `done == n`, so the
+calling (coordinator) thread waits; "in parallel" is across experts and the
+pool's workers only, not overlapped with the card's round. The slow path calls
+it once a pair, so a multiply-routed expert's slice is touched once a pair —
+redundant, kept for the one pass's simplicity.
+
+**Deviation, named** (`code`): the sketch's hint is "ahead of the next expert's
+first field"; the build hints the next block within the same expert — a rows'
+task sees one expert only. The cold-page half is built as sketched.
+
+`measured-here`, device-free: `tests/test-opencl-miss-cpu.cpp` gains the level-1
+parity arm (the rows' bits identical at level 0 and level 1 — what a hint must
+be), the ahead-distance arm and the residency arm (a 16-page mapping dropped to
+absent, one byte a page touches it all resident; a touch striding 8192 leaves 8
+of 16 absent and fails — the pass's mechanism, not its premise).
+`tests/python/test_cpu_miss_prefetch.py` reads the patched tree for the
+default-off switch, one hint in every row function, the volatile touch and the
+`>= 2` guard in both compute paths; its six red mutations (a hint dropped from
+`row_iq3s_1`, the distance 0, the stride, the non-volatile pointer, the default
+on, the guard removed) were each seen failing, and the C cells' two (stride,
+distance) likewise. Both cells are **source-text assertions**, not numerics.
 
 Owed on the cards (Claude's window; the handover carries the commands): the
-cold/warm served pair at `GGML_OPENCL_CPU_MISS_MAX=64` and `perf stat -e
-cache-misses,minor-faults,major-faults` on one decode, then the A/B at level 0
-and 2. The audit's bar decides whether a default follows.
+lane's ceiling at `GGML_OPENCL_CPU_MISS_MAX=0` against 64, the cold/warm pair,
+and the major-fault count from `/proc/<pid>/stat` on one served decode (the leg
+host has no `perf`), then the A/B at level 0 and 2. The audit's bar — faults
+above ~5 % of the CPU lane — decides. If the faults are ~0, as predicted, the
+switch stays off and the patch stays a mechanism.
