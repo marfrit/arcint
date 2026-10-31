@@ -148,6 +148,13 @@ not yet told apart.
    26.27); under LEO the same failures, then the same abort after 4,615 passing cases at MUL_MAT mxfp4 m=2880 n=32
    k=2880, at the same assertion (`hw_cmds_generated_xe_hpg_core.inl:1898`). The DG2 abort is not fixed in the newest
    release: route A stays B60-only; the A770 waits for an upstream fix (a report with the reproducer is owed).
+   **The coder's prefill loss under LEO, located (`measured-here`, 2026-10-31, the A770, the 1.3.0 package, a 39,689-token
+   prefill under the OpenCL intercept layer, the same binary under both drivers):** 723.7 t/s default, 676.4 t/s LEO
+   (-6.5 %), span +3,838 ms; `flash_attn_f32_f16_dpas` alone +3,201 ms (21,643 -> 24,844 ms, the same 858 calls, +14.8 %),
+   every other kernel within +-0.5 %; `clEnqueueReadBuffer` 314 -> 101 ms (the decode gain's likely source). The same
+   kernel source and launches run slower: a code-generation difference on LEO's compile path (`inferred`: e.g. the
+   large-GRF build option not reaching it -> spills; the check is the program binaries under both drivers, the intercept
+   layer's CLI_DumpProgramBinaries, register and spill counts).
 2b. **Route B - a chunk pool on the default driver (if LEO falls short).** Allocate the usable VRAM once at load as a
    fixed set of large `cl_mem` chunks; a ggml buffer type hands out ranges inside them (the backend already addresses
    every tensor as buffer + offset, `data_device` set in one place, `code`); the backend's grow-only buffers and the
