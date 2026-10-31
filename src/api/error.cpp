@@ -42,7 +42,7 @@ nlohmann::json context_overflow_truncated(int prompt_tokens, int n_ctx, int rese
                                          int blocks_dropped, int still_over) {
     nlohmann::json body = error_body(
         log::format("reasoning dropped: %d blocks, still %d over. prompt is %d tokens, context is "
-                    "%d, generation reserve %d: compaction client-side is still needed and retry.",
+                    "%d, generation reserve %d. Compact the history client-side and retry.",
                     blocks_dropped, still_over, prompt_tokens, n_ctx, reserve),
         "invalid_request_error", "context_length_exceeded", "messages");
     body["error"]["prompt_tokens"] = prompt_tokens;
