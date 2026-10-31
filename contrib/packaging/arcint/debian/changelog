@@ -1,3 +1,15 @@
+arcint (1.3.0-1) trixie; urgency=medium
+
+  * 1.3.0: the Open Responses API (POST /v1/responses: non-stream and SSE, an
+    in-memory store with previous_response_id, cancel, prior reasoning replayed
+    by the template's rule, --think-ctx-reserve, truncation auto); the MTP
+    width policy (--llama-mtp-policy cost, off by default; the coder +15.8 %
+    decode); the prefill slot loan (--llama-slot-loan, off by default;
+    Flash-Next prefill +59.8 % at 103k); patches 0068-0072 (0069/0070 the expert
+    trace and profile save, 0071 int8 DPAS opt-in, 0072 uniform work groups).
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 31 Oct 2026 19:00:00 +0100
+
 arcint (1.2.7-1) trixie; urgency=medium
 
   * 1.2.7: faster decode on every unit and faster prefill on the coder

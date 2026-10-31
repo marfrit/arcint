@@ -28,6 +28,9 @@
 - Flash-Next's production quant is ISTA-DASLab's GSQ-RCO IQ3_S since
   2026-10-20 (operator): 33.3 t/s decode on six answers, KL 0.127 against
   Q8_0 (IQ3_XXS 38.0 t/s, 0.217, the rollback).
+- Version 1.3.0 (2026-10-31): the Open Responses API (`POST /v1/responses`, streaming, store,
+  cancel, reasoning replay, `--think-ctx-reserve`, `truncation: "auto"`), the MTP width policy
+  (`--llama-mtp-policy cost`), the prefill slot loan (`--llama-slot-loan`), patches 0068-0072.
 - Version 1.2.7 (2026-10-30): faster decode on every unit and faster coder
   prefill (patches 0064-0067, `--prefill-ubatch`), request cancellation on a
   client that leaves or a stop signal, twin-based KL instruments.
