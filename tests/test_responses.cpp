@@ -1,6 +1,8 @@
 #include "api/error.h"
 #include "api/responses.h"
+#include "api/responses_stream.h"
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -217,7 +219,6 @@ TEST(responses_refuses_the_unbuilt_request_fields) {
         body[key] = value;
         check_refusal(body, "unsupported_parameter", param, key);
     };
-    refuse("stream", true, "stream");
     refuse("include", json::array({"message.output_text.logprobs"}), "include");
     refuse("max_tool_calls", 4, "max_tool_calls");
     refuse("background", true, "background");
@@ -254,6 +255,19 @@ TEST(responses_refuses_the_unbuilt_request_fields) {
         body["whatever"] = 1;
         check_refusal(body, "invalid_request", "whatever", "unknown top-level field");
     }
+}
+
+TEST(responses_accepts_stream_and_obfuscation_options) {
+    json body = base();
+    body["stream"] = true;
+    body["stream_options"] = {{"include_obfuscation", false}};
+    ResponseRequest r;
+    parse_ok(body, r);
+    CHECK(r.chat.stream);
+    // The non-stream form and an absent stream are the JSON body.
+    ResponseRequest r2;
+    parse_ok(base(), r2);
+    CHECK(!r2.chat.stream);
 }
 
 // ---------------------------------------------------------- field mapping
@@ -561,4 +575,432 @@ TEST(responses_error_uses_the_spec_spellings) {
     // The chat envelope keeps its own type spelling.
     const json chat = api::error_body("nope", "internal_error");
     CHECK_EQ(chat["error"]["type"].get<std::string>(), std::string("internal_error"));
+}
+
+// ------------------------------------------------------------ SSE writer (W2)
+namespace {
+
+// Frames as (event name, body, [DONE] seen). The `event:` line is checked to be
+// the body's type by the callers; a frame without one is an error.
+struct Sse {
+    std::vector<std::pair<std::string, json>> events;
+    bool done = false;
+};
+
+Sse parse_sse(const std::vector<std::string>& raw) {
+    Sse out;
+    for (const std::string& frame : raw) {
+        if (frame == "data: [DONE]\n\n") {
+            out.done = true;
+            continue;
+        }
+        if (frame.rfind("event: ", 0) != 0) {
+            t::fail(__FILE__, __LINE__, "SSE frame without an event: line: " + frame);
+            continue;
+        }
+        const size_t nl = frame.find('\n');
+        const std::string name = frame.substr(7, nl - 7);
+        const size_t data = frame.find("data: ", nl);
+        if (data == std::string::npos) {
+            t::fail(__FILE__, __LINE__, "SSE frame without data: " + frame);
+            continue;
+        }
+        std::string payload = frame.substr(data + 6);
+        while (!payload.empty() && payload.back() == '\n') payload.pop_back();
+        out.events.emplace_back(name, json::parse(payload));
+    }
+    return out;
+}
+
+// The sequence numbers are 1..N with no gap, and every event's `event:` line is
+// its body's `type`.
+void check_framing(const Sse& s) {
+    for (size_t i = 0; i < s.events.size(); ++i) {
+        const auto& [name, body] = s.events[i];
+        CHECK_EQ(name, body["type"].get<std::string>());
+        CHECK_EQ(body["sequence_number"].get<int>(), static_cast<int>(i + 1));
+    }
+}
+
+std::string think_close_tag() { return std::string("</") + "thi" + "nk" + ">"; }
+
+// A programmable backend: exact pieces (and ids) in, one FinishReason out. It
+// checks the stop flag as the stub and the llama backend do, and turns a failed
+// write into Abort/ClientGone.
+class PiecesBackend final : public Backend {
+public:
+    PiecesBackend() {
+        st_.id          = "stub";
+        st_.served_id   = "stub";
+        st_.loaded      = true;
+        st_.stub        = true;
+        st_.n_ctx       = 4096;
+        st_.n_ctx_train = 262144;
+    }
+
+    std::vector<std::pair<std::string, int>> pieces;
+    FinishReason    reason         = FinishReason::Stop;
+    bool            throw_after    = false;
+    size_t          throw_at       = 0;
+    GenerationStats counters{};
+
+    const ModelStatus& status() const override { return st_; }
+    Tokenizer&         tokenizer() override { return tok_; }
+    std::string        render_chat(const ChatRequest&) const override { return "p"; }
+
+    FinishReason generate(const GenerationInput& in, int, const TokenCallback& on_piece,
+                          GenerationStats& stats) override {
+        stats.prompt_tokens = 4;
+        if (in.stop != nullptr && in.stop->load(std::memory_order_relaxed)) {
+            stats.abort_cause = AbortCause::StopSignal;
+            return FinishReason::Abort;
+        }
+        for (size_t i = 0; i < pieces.size(); ++i) {
+            if (throw_after && i == throw_at) throw std::runtime_error("backend exploded");
+            const Control c = on_piece(pieces[i].first, pieces[i].second);
+            ++stats.completion_tokens;
+            if (c == Control::Cancel) {
+                stats.abort_cause = AbortCause::ClientGone;
+                return FinishReason::Abort;
+            }
+            if (c == Control::Stop) return FinishReason::Stop;
+        }
+        stats.loop_detections = counters.loop_detections;
+        stats.loop_nudges     = counters.loop_nudges;
+        stats.loop_slaps      = counters.loop_slaps;
+        stats.loop_aborts     = counters.loop_aborts;
+        stats.loop_self_closes = counters.loop_self_closes;
+        stats.loop_door_masked = counters.loop_door_masked;
+        stats.loop_door_eog_masked = counters.loop_door_eog_masked;
+        return reason;
+    }
+
+private:
+    struct Tok final : public Tokenizer {
+        std::vector<int> encode(std::string_view text) override {
+            return std::vector<int>(text.begin(), text.end());
+        }
+        std::string decode(const std::vector<int>& ids) override {
+            return std::string(ids.begin(), ids.end());
+        }
+        std::string decode_one(int id) override { return std::string(1, static_cast<char>(id)); }
+        int         eos_id() const override { return 0; }
+    } tok_;
+    ModelStatus st_;
+};
+
+// A prepared turn built by hand: the stream tests control exactly what the
+// backend emits, so they do not depend on the stub's fixed reply.
+struct StreamFixture {
+    Config       cfg;
+    PiecesBackend backend;
+    SlotPool     slots{1};
+    Context      ctx;
+    ResponseRequest req;
+    PreparedResponse prep;
+
+    explicit StreamFixture(bool think_open = false, bool by_ids = false, bool tools = false) {
+        cfg.stub   = true;
+        ctx.cfg    = &cfg;
+        ctx.backend = &backend;
+        ctx.slots   = &slots;
+        prep.req         = req;
+        prep.chat.id      = "resp-test";
+        prep.chat.created = 1;
+        prep.chat.model   = "stub";
+        prep.chat.input.sampler.temperature = 0.0f;
+        prep.chat.think_open = think_open;
+        if (by_ids) prep.chat.think_ids.open_close_ids = {{248068, 248069}};
+        if (tools) {
+            prep.chat.parse_tool_calls = true;
+            prep.chat.schemas = tool_schemas({{"read_file", "", json::object()}});
+        }
+    }
+
+    std::vector<std::string> run(int fail_at = -1) {
+        std::vector<std::string> raw;
+        const int slot = 0;
+        api::stream_response(ctx, prep, slot, [&](std::string_view frame) {
+            if (fail_at >= 0 && static_cast<int>(raw.size()) == fail_at) return false;
+            raw.emplace_back(frame);
+            return true;
+        });
+        return raw;
+    }
+};
+
+}  // namespace
+
+TEST(responses_sse_plain_turn_has_the_lifecycle_and_framing) {
+    StreamFixture fx;
+    fx.backend.pieces = {{"Hello", 1}, {" world", 2}};
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    CHECK(!s.events.empty());
+    if (s.events.empty()) return;
+    CHECK(s.done);
+    // created, in_progress, item added, part added, two deltas, text done,
+    // part done, item done, completed.
+    CHECK_EQ(s.events.size(), size_t(10));
+    if (s.events.size() < 10) return;
+    const std::vector<std::string> types = {"response.created", "response.in_progress",
+        "response.output_item.added", "response.content_part.added",
+        "response.output_text.delta", "response.output_text.delta",
+        "response.output_text.done", "response.content_part.done",
+        "response.output_item.done", "response.completed"};
+    for (size_t i = 0; i < types.size() && i < s.events.size(); ++i) {
+        CHECK_EQ(s.events[i].first, types[i]);
+    }
+    // The opening snapshots are in_progress with no output and no usage.
+    CHECK_EQ(s.events[0].second["response"]["status"].get<std::string>(), std::string("in_progress"));
+    CHECK(s.events[0].second["response"]["output"].is_array());
+    CHECK(s.events[0].second["response"]["output"].empty());
+    CHECK(s.events[0].second["response"]["usage"].is_null());
+    // The terminal resource carries the full answer and the usage block.
+    const json& term = s.events.back().second["response"];
+    CHECK_EQ(term["status"].get<std::string>(), std::string("completed"));
+    if (term["output"].empty()) return;
+    CHECK_EQ(term["output"][0]["content"][0]["text"].get<std::string>(), std::string("Hello world"));
+    CHECK_EQ(term["usage"]["output_tokens"].get<int>(), 2);
+    CHECK_EQ(term["usage"]["output_tokens_details"]["reasoning_tokens"].get<int>(), 0);
+}
+
+TEST(responses_sse_reasoning_closes_before_the_message) {
+    StreamFixture fx(/*think_open=*/true);
+    fx.backend.pieces = {{"So", 1}, {" far", 2}, {think_close_tag(), 3}, {"OK", 4}};
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    CHECK(!s.events.empty());
+    if (s.events.empty()) return;
+    // The first reasoning event opens its item; the reasoning deltas precede
+    // any output_text delta.
+    size_t first_reasoning_delta = s.events.size(), first_text_delta = s.events.size();
+    bool saw_reasoning_done = false, message_after_reasoning = false;
+    for (size_t i = 0; i < s.events.size(); ++i) {
+        const std::string& t = s.events[i].first;
+        if (t == "response.reasoning.delta" && first_reasoning_delta == s.events.size())
+            first_reasoning_delta = i;
+        if (t == "response.output_text.delta" && first_text_delta == s.events.size())
+            first_text_delta = i;
+        if (t == "response.reasoning.done") saw_reasoning_done = true;
+        if (t == "response.output_item.added" && saw_reasoning_done &&
+            s.events[i].second["item"]["type"].get<std::string>() == "message")
+            message_after_reasoning = true;
+    }
+    CHECK(first_reasoning_delta < first_text_delta);
+    CHECK(saw_reasoning_done);
+    CHECK(message_after_reasoning);
+    const json& term = s.events.back().second["response"];
+    CHECK_EQ(term["output"].size(), size_t(2));
+    if (term["output"].size() < 2) return;
+    CHECK_EQ(term["output"][0]["type"].get<std::string>(), std::string("reasoning"));
+    CHECK_EQ(term["output"][0]["content"][0]["text"].get<std::string>(), std::string("So far"));
+    CHECK_EQ(term["output"][1]["content"][0]["text"].get<std::string>(), std::string("OK"));
+}
+
+TEST(responses_sse_function_call_name_before_arguments) {
+    StreamFixture fx(false, false, /*tools=*/true);
+    const std::string call = "Sure\n<tool_call>\n{\"name\": \"read_file\", \"arguments\": "
+                             "{\"path\": \"a\"}}\n</tool_call>";
+    fx.backend.pieces = {{"Sure", 1}, {"\n", 2}, {"<tool", 3}, {"_call", 4}, {">", 5},
+                         {"\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"a\"}}\n</tool", 6},
+                         {"_call>", 7}};
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    CHECK(!s.events.empty());
+    if (s.events.empty()) return;
+    // The call item is added with name and call_id before the argument delta.
+    int added = -1, delta = -1, done_args = -1, item_done = -1;
+    for (size_t i = 0; i < s.events.size(); ++i) {
+        const std::string& t = s.events[i].first;
+        if (t == "response.output_item.added" &&
+            s.events[i].second["item"]["type"].get<std::string>() == "function_call" &&
+            added < 0) {
+            added = static_cast<int>(i);
+            CHECK_EQ(s.events[i].second["item"]["name"].get<std::string>(), std::string("read_file"));
+            CHECK(!s.events[i].second["item"]["call_id"].get<std::string>().empty());
+            CHECK_EQ(s.events[i].second["item"]["arguments"].get<std::string>(), std::string(""));
+        }
+        if (t == "response.function_call_arguments.delta" && delta < 0)
+            delta = static_cast<int>(i);
+        if (t == "response.function_call_arguments.done") done_args = static_cast<int>(i);
+        if (t == "response.output_item.done" &&
+            s.events[i].second["item"]["type"].get<std::string>() == "function_call")
+            item_done = static_cast<int>(i);
+    }
+    CHECK(added >= 0);
+    CHECK(added < delta);
+    CHECK(delta < done_args);
+    CHECK(done_args < item_done);
+    if (s.events.back().second["response"]["output"].size() < 2) return;
+    CHECK(s.events.back().second["response"]["output"][1]["type"] == json("function_call"));
+    CHECK_EQ(s.events.back().second["response"]["status"].get<std::string>(), std::string("completed"));
+}
+
+TEST(responses_sse_length_is_incomplete_and_the_open_item_is_last) {
+    StreamFixture fx;
+    fx.backend.pieces = {{"cut", 1}};
+    fx.backend.reason = FinishReason::Length;
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    CHECK(!s.events.empty());
+    if (s.events.empty()) return;
+    CHECK(s.done);
+    CHECK_EQ(s.events.back().first, std::string("response.incomplete"));
+    const json& term = s.events.back().second["response"];
+    CHECK_EQ(term["status"].get<std::string>(), std::string("incomplete"));
+    CHECK_EQ(term["incomplete_details"]["reason"].get<std::string>(), std::string("max_output_tokens"));
+    if (term["output"].empty()) return;
+    CHECK_EQ(term["output"].back()["status"].get<std::string>(), std::string("incomplete"));
+}
+
+TEST(responses_sse_loop_emits_the_counters_then_incomplete) {
+    StreamFixture fx;
+    fx.backend.pieces = {{"x", 1}};
+    fx.backend.reason = FinishReason::Loop;
+    fx.backend.counters.loop_detections = 3;
+    fx.backend.counters.loop_nudges     = 2;
+    fx.backend.counters.loop_slaps      = 1;
+    fx.backend.counters.loop_aborts     = 1;
+    fx.backend.counters.loop_self_closes = 1;
+    fx.backend.counters.loop_door_masked = 4;
+    fx.backend.counters.loop_door_eog_masked = 5;
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    CHECK(!s.events.empty());
+    if (s.events.empty()) return;
+    // The loop-guard event is before the terminal incomplete, and carries v and
+    // the seven counters.
+    int guard = -1, terminal = -1;
+    for (size_t i = 0; i < s.events.size(); ++i) {
+        if (s.events[i].first == "arcint:loop_guard") guard = static_cast<int>(i);
+        if (s.events[i].first == "response.incomplete") terminal = static_cast<int>(i);
+    }
+    CHECK(guard >= 0);
+    if (guard < 0) return;
+    CHECK(guard < terminal);
+    const json& g = s.events[guard].second;
+    CHECK_EQ(g["v"].get<int>(), 1);
+    for (const char* k : {"detections", "nudges", "slaps", "aborts", "self_closes",
+                          "door_masked", "door_eog_masked"})
+        CHECK(g.contains(k));
+    if (guard < 0) return;
+    CHECK_EQ(s.events.back().second["response"]["incomplete_details"]["reason"].get<std::string>(),
+             std::string("loop_guard_abort"));
+}
+
+TEST(responses_sse_exception_is_error_then_failed) {
+    StreamFixture fx;
+    fx.backend.pieces     = {{"partial", 1}, {"more", 2}};
+    fx.backend.throw_after = true;
+    fx.backend.throw_at    = 1;
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    CHECK(!s.events.empty());
+    if (s.events.empty()) return;
+    CHECK(s.done);
+    // An open item closes incomplete first, then the error event, then failed.
+    int error = -1, failed_i = -1, item_done = -1;
+    for (size_t i = 0; i < s.events.size(); ++i) {
+        const std::string& t = s.events[i].first;
+        if (t == "error" && error < 0) error = static_cast<int>(i);
+        if (t == "response.output_item.done" && item_done < 0) item_done = static_cast<int>(i);
+        if (t == "response.failed") failed_i = static_cast<int>(i);
+    }
+    CHECK(item_done >= 0);
+    CHECK(item_done < error);
+    CHECK(error < failed_i);
+    const json& err = s.events[error].second["error"];
+    CHECK_EQ(err["type"].get<std::string>(), std::string("server_error"));
+    CHECK_EQ(err["code"].get<std::string>(), std::string("internal_error"));
+    const json& term = s.events.back().second["response"];
+    CHECK_EQ(term["status"].get<std::string>(), std::string("failed"));
+    CHECK_EQ(term["error"]["code"].get<std::string>(), std::string("internal_error"));
+    if (term["output"].empty()) return;
+    CHECK_EQ(term["output"].back()["status"].get<std::string>(), std::string("incomplete"));
+}
+
+TEST(responses_sse_stop_signal_fails_with_server_stopping) {
+    StreamFixture fx;
+    std::atomic<bool> stop{true};
+    fx.ctx.stop_flag      = &stop;
+    fx.prep.chat.input.stop = &stop;   // the route's finish_prepare sets this
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    CHECK(!s.events.empty());
+    if (s.events.empty()) return;
+    CHECK(s.done);
+    CHECK_EQ(s.events.back().first, std::string("response.failed"));
+    CHECK_EQ(s.events.back().second["response"]["status"].get<std::string>(), std::string("failed"));
+    CHECK_EQ(s.events.back().second["response"]["error"]["code"].get<std::string>(),
+             std::string("server_stopping"));
+}
+
+TEST(responses_sse_client_gone_ends_the_stream_silently) {
+    StreamFixture fx;
+    fx.backend.pieces = {{"Hello", 1}, {" world", 2}, {" again", 3}};
+    // The sink fails at the fourth frame (the content-part added), as a closed
+    // socket's write does.
+    const std::vector<std::string> raw = fx.run(/*fail_at=*/3);
+    const Sse s = parse_sse(raw);
+    check_framing(s);
+    CHECK(!s.done);
+    CHECK_EQ(s.events.size(), size_t(3));   // created, in_progress, item added
+    for (const auto& [name, body] : s.events) {
+        CHECK(name != "response.completed" && name != "response.failed" &&
+              name != "response.incomplete");
+    }
+}
+
+TEST(responses_sse_counts_reasoning_tokens_where_the_split_is_by_ids) {
+    StreamFixture fx(/*think_open=*/true, /*by_ids=*/true);
+    // Two reasoning tokens, the closer's id, then one answer token.
+    fx.backend.pieces = {{"a", 10}, {"b", 11}, {think_close_tag(), 248069}, {"c", 12}};
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    CHECK(!s.events.empty());
+    if (s.events.empty()) return;
+    const json& term = s.events.back().second["response"];
+    if (term["output"].size() < 2) return;
+    CHECK_EQ(term["output"][0]["type"].get<std::string>(), std::string("reasoning"));
+    CHECK_EQ(term["output"][0]["content"][0]["text"].get<std::string>(), std::string("ab"));
+    CHECK_EQ(term["output"][1]["content"][0]["text"].get<std::string>(), std::string("c"));
+    // R7: the id split counts the two reasoning pieces; 0 only for text splits.
+    CHECK_EQ(term["usage"]["output_tokens_details"]["reasoning_tokens"].get<int>(), 2);
+}
+
+TEST(responses_non_stream_counts_reasoning_tokens_from_the_split) {
+    // The same id-split pieces through the non-streamed builder: R7 applies to
+    // both paths, not only the stream.
+    StreamFixture fx(/*think_open=*/true, /*by_ids=*/true);
+    fx.backend.pieces = {{"a", 10}, {"b", 11}, {think_close_tag(), 248069}, {"c", 12}};
+    const auto lease = fx.slots.acquire_for(0);
+    const api::HttpResult r = api::run_response(fx.ctx, fx.prep, lease.index());
+    CHECK_EQ(r.status, 200);
+    if (r.status != 200) return;
+    CHECK_EQ(r.body["usage"]["output_tokens_details"]["reasoning_tokens"].get<int>(), 2);
+    if (r.body["output"].empty()) return;
+    CHECK_EQ(r.body["output"][0]["content"][0]["text"].get<std::string>(), std::string("ab"));
+}
+
+TEST(responses_busy_refusal_keeps_the_slots_diagnostics) {
+    // Review F1: the 429 carries the chat 503's slots (and lanes) numbers.
+    Fixture fx;
+    const auto held = fx.slots.acquire_for(0);
+    CHECK_EQ(held.index(), 0);
+    api::SlotPool::Lease lease;
+    int slot = -1;
+    auto err = api::acquire_slot(fx.ctx, -1, lease, slot);
+    CHECK(err.has_value());
+    if (!err.has_value()) return;
+    CHECK_EQ(err->status, 503);
+    CHECK(err->body.contains("slots"));
+    const api::HttpResult busy = api::responses_busy(*err);
+    CHECK_EQ(busy.status, 429);
+    CHECK_EQ(busy.body["error"]["type"].get<std::string>(), std::string("too_many_requests"));
+    CHECK_EQ(busy.body["error"]["code"].get<std::string>(), std::string("all_lanes_busy"));
+    CHECK(busy.body.contains("slots"));
+    if (!busy.body.contains("slots")) return;
+    CHECK_EQ(busy.body["slots"]["total"].get<int>(), 1);
+    CHECK_EQ(busy.body["slots"]["free"].get<int>(), 0);
 }

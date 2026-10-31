@@ -579,11 +579,44 @@ jassert "${WORK}/resp.json" \
   'd["usage"]["input_tokens"]>0 and d["usage"]["total_tokens"]==d["usage"]["input_tokens"]+d["usage"]["output_tokens"] and d["usage"]["input_tokens_details"]["cached_tokens"]==0'
 check "/v1/responses usage is filled" $?
 
-code=$(curl -sS -o "${WORK}/resp-stream.json" -w '%{http_code}' "${OP_BASE}/v1/responses" \
-       -H 'Content-Type: application/json' -d '{"model":"stub","input":"hello","stream":true}')
-check "/v1/responses refuses stream until the SSE writer exists" "$([[ $code == 400 ]] && echo 0 || echo 1)"
-jassert "${WORK}/resp-stream.json" 'd["error"]["type"]=="invalid_request" and d["error"]["code"]=="unsupported_parameter" and d["error"]["param"]=="stream"'
-check "/v1/responses stream refusal is the spec error envelope" $?
+# SSE (W2): every frame has an `event:` line equal to the body's type, the
+# sequence numbers run 1..N without a gap, the terminal event is last and
+# `[DONE]` follows it.
+curl -sN "${OP_BASE}/v1/responses" -H 'Content-Type: application/json' \
+     -d '{"model":"stub","input":"hello","stream":true,"max_output_tokens":256}' \
+     -o "${WORK}/resp-sse.txt"
+check "/v1/responses streams an SSE body on request" $?
+ssecheck() {  # ssecheck <file> <python assertions over events/types/done>
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+raw = open(sys.argv[1], encoding="utf-8").read()
+events, done = [], False
+for frame in [f for f in raw.split("\n\n") if f.strip()]:
+    lines = frame.split("\n")
+    ev = [l[6:] for l in lines if l.startswith("data: ")]
+    names = [l[7:] for l in lines if l.startswith("event: ")]
+    if ev and ev[0] == "[DONE]":
+        done = True
+        continue
+    if len(names) != 1 or len(ev) != 1:
+        print("frame without one event:/data: pair:", frame, file=sys.stderr)
+        sys.exit(1)
+    body = json.loads(ev[0])
+    if names[0] != body["type"]:
+        print("event: line", names[0], "!= type", body["type"], file=sys.stderr)
+        sys.exit(1)
+    events.append(body)
+seq = [e["sequence_number"] for e in events]
+if seq != list(range(1, len(events) + 1)):
+    print("sequence is not 1..N:", seq, file=sys.stderr)
+    sys.exit(1)
+types = [e["type"] for e in events]
+sys.exit(0 if eval(sys.argv[2], {"events": events, "types": types, "done": done}) else 1)
+PY
+}
+ssecheck "${WORK}/resp-sse.txt" \
+  'types[:2]==["response.created","response.in_progress"] and types[-1]=="response.completed" and done and any(t=="response.output_text.delta" for t in types) and events[-1]["response"]["status"]=="completed"'
+check "/v1/responses SSE framing, order, sequence and terminal event" $?
 
 code=$(curl -sS -o "${WORK}/resp-tools.json" -w '%{http_code}' \
        -H 'Content-Type: application/json' --data-binary '{"model":"stub","instructions":"be terse","input":[{"type":"message","role":"user","content":"read a.txt"},{"type":"function_call","call_id":"call_7","name":"read_file","arguments":"{\"path\":\"a.txt\"}"},{"type":"function_call_output","call_id":"call_7","output":"alpha"}],"tools":[{"type":"function","name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}],"max_output_tokens":256}' \
@@ -591,6 +624,14 @@ code=$(curl -sS -o "${WORK}/resp-tools.json" -w '%{http_code}' \
 check "/v1/responses serves an instructions + tool + tool-output turn" "$([[ $code == 200 ]] && echo 0 || echo 1)"
 jassert "${WORK}/resp-tools.json" 'd["instructions"]=="be terse" and d["tools"][0]["name"]=="read_file" and any(i["type"]=="function_call" and i["name"]=="read_file" for i in d["output"])'
 check "/v1/responses echoes instructions and tools and emits the function_call item" $?
+
+curl -sN "${OP_BASE}/v1/responses" -H 'Content-Type: application/json' \
+     -d '{"model":"stub","input":"call it","stream":true,"max_output_tokens":256,"tools":[{"type":"function","name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}]}' \
+     -o "${WORK}/resp-sse-tools.txt"
+check "/v1/responses streams a tool turn" $?
+ssecheck "${WORK}/resp-sse-tools.txt" \
+  'done and types[-1]=="response.completed" and any(t=="response.function_call_arguments.delta" for t in types)'
+check "/v1/responses SSE emits the function_call argument delta and terminal event" $?
 
 kill -TERM "$OP_PID" 2>/dev/null; wait "$OP_PID" 2>/dev/null; OP_PID=""
 

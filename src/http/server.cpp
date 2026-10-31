@@ -6,6 +6,7 @@
 
 #include "api/error.h"
 #include "api/responses.h"
+#include "api/responses_stream.h"
 #include "util/log.h"
 
 namespace lgc {
@@ -247,17 +248,43 @@ void HttpServer::Impl::route() {
         int  slot  = -1;
         if (auto err = api::acquire_slot(ctx, prep->chat.lane, *lease, slot)) {
             // The spec maps a busy service to 429 too_many_requests; the chat
-            // route keeps its 503 (docs/campaigns/feyntalk.md Errors).
-            json busy = api::responses_error(err->body["error"]["message"].get<std::string>(),
-                                             "too_many_requests", "all_lanes_busy");
-            send_json(res, 429, busy);
+            // route keeps its 503. The refusal's slots/lanes diagnostics ride
+            // into the 429 body (review F1).
+            const api::HttpResult busy = api::responses_busy(*err);
+            send_json(res, busy.status, busy.body);
             return;
         }
 
-        prep->chat.input.peer_alive = peer_probe(req.socket);
-        const api::HttpResult r = api::run_response(ctx, *prep, slot);
-        if (r.gone) return;
-        send_json(res, r.status, r.body);
+        if (!prep->req.chat.stream) {
+            prep->chat.input.peer_alive = peer_probe(req.socket);
+            const api::HttpResult r = api::run_response(ctx, *prep, slot);
+            if (r.gone) return;
+            send_json(res, r.status, r.body);
+            return;
+        }
+
+        // SSE (docs/campaigns/feyntalk.md W2): the writer emits one event per
+        // frame, `event:` equal to the body's type, and a terminal event before
+        // [DONE]. The lease rides in the provider so the lane is held for exactly
+        // as long as the stream lives.
+        res.set_header("Cache-Control", "no-cache");
+        const socket_t sock = req.socket;
+        res.set_chunked_content_provider(
+            "text/event-stream",
+            [this, prep, lease, slot, sock](size_t, httplib::DataSink& sink) {
+                try {
+                    prep->chat.input.peer_alive = peer_probe(sock);
+                    api::stream_response(ctx, *prep, slot, [&sink](std::string_view data) {
+                        return sink.write(data.data(), data.size());
+                    });
+                } catch (const std::exception& e) {
+                    log::error("http", "responses stream ended by an exception: %s", e.what());
+                } catch (...) {
+                    log::error("http", "%s", "responses stream ended by an unknown exception");
+                }
+                sink.done();
+                return true;
+            });
     });
 
     svr.Post("/v1/completions", [this](const httplib::Request& req, httplib::Response& res) {
