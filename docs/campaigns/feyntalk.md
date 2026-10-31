@@ -468,14 +468,19 @@ to `template_caps` 1032 and `special_ids` 326 — load-time, not the step loop.
 feyntalk-render lives outside this repository; this repository owns the
 material contract and the hash only.
 
-**Renderer, one shared component.** feyntalk-render is versioned independently
-(schema 1) and used by both the pi provider extension and the gateway/proxy in
-front of other backends. Two modes: **tokens** (arcint now; vLLM and llama.cpp
-later, both take ids) and **text** (cloud providers only deliver text; the
-renderer still renders the prompt and parses the answer). It refuses on a hash
-mismatch before consuming a token. Incremental byte-BPE detokenisation (split
-UTF-8 sequences, leading spaces, byte fallbacks) is the one piece that needs a
-clean test set once; the server's shadow stream is the oracle for it.
+**Renderer, the translator lives in the gateway (operator, 2026-10-31).**
+feyntalk-render is versioned independently (schema 1) and one implementation
+lives in the gateway/proxy in front of the engine, not in the agents. The proxy
+renders the prompt, parses the answer and owns the token→text seam; agents
+receive text plus the `arcint:` span events through the proxy. The agent-side
+extension is only for WebSocket and `previous_response_id`, so no second
+renderer has to agree with the first. Two modes: **tokens** (arcint now; vLLM
+and llama.cpp later, both take ids) and **text** (cloud providers only deliver
+text; the renderer still renders the prompt and parses the answer). The proxy
+refuses on a hash mismatch before consuming a token. Incremental byte-BPE
+detokenisation (split UTF-8 sequences, leading spaces, byte fallbacks) is the
+one piece that needs a clean test set once; the server's shadow stream is the
+oracle for it.
 Why this exists: the recurring defect class sits at the token→text seam — stop
 strings swallowing a closer id, opener literals in the chat path, UTF-8 splits
 in think deltas, `reasoning` vs `reasoning_content`, tool-call salvage in the
@@ -504,17 +509,20 @@ Two ids are named in the specification README (`basic-response`,
 | W1 | **responses seam**: split `prepare_chat`; extract `drive`/`log_stats`; parse + map the request; non-stream `ResponseResource`; `responses_error` helper | `src/api/handlers.{h,cpp}`, new `src/api/responses.{h,cpp}`, new `src/api/generate.{h,cpp}`, `src/http/server.cpp`, `tests/test_responses.cpp`, `CMakeLists.txt` | unit mapping + resource keys green on the stub, red before; roundtrip |
 | W2 | **SSE event writer**: `sequence_number`, `event:` line, item/part lifecycle, reasoning/text/function-call deltas, terminal events, `[DONE]`, in-stream error + `failed` | `src/api/responses_stream.{h,cpp}`, `tests/test_responses.cpp`, `tests/roundtrip.sh` | unit event order/sequence/lifecycle green; stub curl SSE green; compliance HTTP+SSE runnable subset 0 failed |
 | W3 | **state + continuation**: `ResponseStore`, limits/LRU/TTL, `store` semantics, `previous_response_id`, `prefix_hash`, `SlotPool::try_acquire`, eviction on error | `src/api/responses_state.{h,cpp}`, `src/api/handlers.{h,cpp}` (`SlotPool`), `src/api/responses.cpp`, `src/config.{h,cpp}`, `/props`, `tests/test_responses.cpp` | unit store/continuation/eviction green; stub continuation `cache_hit_tokens >= prompt_tokens - 1`; compliance `previous_response_id` tests |
+| W3.2 | **reasoning replay**: `ChatMessage::reasoning`, Responses reasoning-item pairing, chat `reasoning_content`, the stub template's Qwen3 rule, stored-continuation assistant turns per output item, think state keyed to the generation start | `src/core/chat.{h,cpp}`, `src/exec/chat_json.h`, `src/api/responses.cpp`, `tests/test_chat.cpp`, `tests/test_responses.cpp`, `tests/golden/feyntalk-w1/` | unit mapping/rendering/continuation red-first; think-state guard with replayed closed reasoning; 12 golden captures (10 old byte-identical); roundtrip |
 | W4 | **cancel by id**: extension route, in-flight registry, `GenerationInput::cancel`, `AbortCause::Cancelled`, `abort_cause_of` + stub `cause`, `arcint:response.cancelled` + incomplete(cancelled) | `src/http/server.cpp`, `src/api/responses_state.{h,cpp}`, `src/exec/backend.h` (~390), `src/exec/backend_llama.cpp:150-152`, `src/exec/backend_stub.cpp:216-220`, `tests/test_responses.cpp`, a cancel measurement script under `tools/` | unit cancel paths red-first; stub cancel at 4 ubatches; card window: cancel-to-abort within one ubatch at 100k, control arm the same |
 | W5 | **gate + live leg**: vendor the compliance library at the pinned release into `tests/feyntalk/`, wire a runner, add the pi multi-turn leg | `tests/feyntalk/`, `tests/CMakeLists.txt` or `CMakeLists.txt`, `tools/feyntalk_live.py` | compliance 0 failed, skipped = the named list; live leg passes Gate 4 |
 | W6 | **token mode + spans + material**: `arcint.token_mode`/`input_ids`/`renderer_hash`, `arcint:token`, `arcint:span`, sampler event sink, `Backend::renderer_material()`, `GET /v1/responses/renderer`, hash | `src/api/responses*.{h,cpp}`, `src/core/sampler.{h,cpp}` (580/779/788/813), `src/core/sampling.h:166`, `src/exec/backend.h` + `backend_llama.cpp` (326/1032 area), `src/api/handlers.cpp` (`/props` 514), `tests/test_responses.cpp` | unit token/span/shadow equality green; hash stable across two loads; off by default; live token leg (Gate 5) |
 | W7 | **WebSocket (1.3.x)**: `response.create`, one in-flight response per connection, sequential turns, connection-local `store=false`, 60-min limit, WS error envelope | `src/http/server.cpp` + a new WS framing unit, `src/api/responses_state.{h,cpp}`, `tests/test_responses.cpp` | WS compliance tests pass; connection-limit and `previous_response_not_found` after eviction |
+| W9 | **bundle** (after W6/W7, operator decision 2026-10-31): ship the chain an interested user can install end to end — engine >= 1.3, the gateway with the token→text translator, the agent extension (WebSocket + `previous_response_id`), and a wiring guide | packaging + `contrib/` bundle, the wiring guide, the gateway and agent-extension repos outside this tree | a clean host installs the bundle and runs the live task (Gate 4's class, text and token) |
 | W8 | **compact + background (1.3.x)**: `/v1/responses/compact`, `background:true`, background cancel, `allowed_tools`, `text.format` json, reasoning summary/logprobs | new compaction + job modules, `src/api/responses*.{h,cpp}` | each part's compliance test; `background` cancel; no card gate before design |
 
 Order: W1 before W2 (the resource and the event writer share the snapshot
 builder); W2 before W3 (a continuation is observable in the stream); W3 before
 W4 (cancel must resolve an id a store knows); W4 before W5 (the live leg
 includes a cancel); W5 closes 1.3.0; W6 is the option, after the text surface is
-green; W7 and W8 are 1.3.x. Each package fits one coding session; W1's refactor
+green; W7 and W8 are 1.3.x; W9 is the bundle after W6/W7. Each package fits
+one coding session; W1's refactor
 is the riskiest (it touches the chat path's prepare), and its gate is that the
 existing unit suite and roundtrip stay green unchanged.
 
@@ -529,15 +537,25 @@ existing unit suite and roundtrip stay green unchanged.
    happens the gate is capability-defined, which is weaker. Vendoring needs the
    specification repository's licence checked and recorded in `THIRD_PARTY.md`
    first (not read here).
-2. **Prior reasoning replay.** The spec's `previous_response_id` concatenation
-   includes prior reasoning items (`paper`). arcint's `ChatMessage` has no
-   reasoning field and `/v1/chat/completions` never replays it (`code`), so a
-   continuation drops prior reasoning and a client resending full history with
-   reasoning items sees the same drop. Options: (a) keep the drop, parity with
-   the chat route (recommended; the answer-level bar does not require
-   reasoning fidelity); (b) add `ChatMessage::reasoning` and let the template
-   render it — an operator call, because it changes what the model sees and
-   the prompt bytes of every replay.
+2. **Prior reasoning replay.** *Decided (operator, 2026-10-31: "do as the
+   models expect").* `ChatMessage::reasoning` exists; the Responses mapping
+   pairs a reasoning item with the FOLLOWING assistant message or
+   `function_call` (several reasoning items join with a newline; any other item
+   between drops the pending reasoning), and the chat route maps
+   `reasoning_content` on assistant messages onto the same field. It is passed
+   to the template as `reasoning_content` and the TEMPLATE decides what to
+   show: the Qwen3.5-4B family template (read at source in the llama.cpp
+   template directory, `code`: assistant branch lines 90-104) renders the block
+   only for an assistant turn after `last_query_index` (the last user message)
+   and drops it for earlier turns; Qwen3-Coder does not reference the field at
+   all. The stub template mirrors the Qwen3 rule so the path is unit-tested.
+   The stored continuation rebuilds one assistant `ChatMessage` per output item
+   (reasoning paired the same way), so its prompt equals a full-history request's
+   on the same items; what can remain is the template's own formatting and the
+   client's item shape (a client that sends a message and a function_call as one
+   combined chat turn, or sends a different content form, renders differently —
+   that is the template's difference, not arcint's policy). No "keep the last N"
+   and no truncation on the server side.
 3. **`allowed_tools`.** A spec MUST when present (`paper`). Options: (a) 400
    `unsupported_parameter` in 1.3.0 and enforce in 1.3.x (recommended: loud,
    no silent weakening); (b) enforce now by narrowing the tool grammar when it
@@ -573,20 +591,24 @@ marked); the note's decisions stand except where a row says otherwise.
 
 ## Current state
 
-W1–W4 are built and accepted (2026-10-31): the request mapping and the
+W1–W4 and W3.2 are built and accepted (2026-10-31); W5's fix round landed: the request mapping and the
 non-stream/non-SSE `ResponseResource` (`src/api/responses.*`), the SSE event
 writer (`responses_stream.*`) with the item/part lifecycle and the terminal
 events, the in-memory state and continuation (`responses_state.*`) with
 limits, LRU/TTL, `previous_response_id`, prefix hash and slot affinity, and
 cancel by id (`POST /v1/responses/{id}/cancel`, an arcint extension) with
-`AbortCause::Cancelled` in the engine seam. `include` is accepted and ignored
+`AbortCause::Cancelled` in the engine seam. W3.2 replays prior reasoning through
+the template's own `reasoning_content` rule (open question 2, `code`) and the
+stored continuation rebuilds one assistant `ChatMessage` per output item so its
+prompt equals a full-history request's with the same items. `include` is accepted and ignored
 (the live-client fix); a Responses refusal writes one `req:` warning line with
 its code and numbers; the chat route has the same gap for prepare-time
 refusals and was left unchanged (its bytes are a gate).
 
-Gate numbers (`measured-here`): `ctest -L unit` 7/7, 419 cases 0 failed 0
-skipped on the stub build with `-Werror`; the feyntalk-golden capture of the
-chat/completions routes stays byte-identical; `tests/roundtrip.sh` green
+Gate numbers (`measured-here`): `ctest -L unit` 7/7, 432 cases 0 failed 0
+skipped on the stub build with `-Werror`; the feyntalk-golden captures of the
+chat/completions routes (12: the 10 original byte-identical plus two carrying
+`reasoning_content`) stay byte-identical; `tests/roundtrip.sh` green
 including the two-turn continuation and cancel-by-id checks; the 7 named
 compliance ids (`basic-response`, `streaming-response`, `system-prompt`,
 `tool-calling`, `multi-turn`, `assistant-phase`,
@@ -603,6 +625,17 @@ turn's generation prefix is re-rendered differently in history). Cancel at a
 prefilled after 1.28 s, socket-close control at 14,336 after 1.25 s, and
 `response.created` reached the client after 0.01 s — ~1.6 ubatches for both
 arms, the existing boundary check's property, not one.
+
+W3.2's replay was measured on the same live leg's history shape: pi sent the
+reasoning item of every past assistant turn to a unit that dropped it, and the
+prior generation prefix rendered differently (the 4 tokens below
+`prior prompt_tokens - 1`, and with thinking on the whole reasoning block would
+re-prefill). The template's rule now keeps the reasoning only for assistant
+turns after the last user message (the running tool loop), so inside that loop
+the replayed block renders as it was generated; earlier turns stay dropped by
+the template's own rule. What remains is the template's formatting and a
+client's item shape — a clean re-run of Gate 4 is owed with W3.2 merged, and
+the number is not claimed here.
 
 W5 still owes the compliance vendor + runner and the live token-mode leg is
 W6. `GET /v1/responses/{id}` is not in the 2026-04-24 OpenAPI document and
