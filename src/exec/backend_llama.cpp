@@ -148,7 +148,12 @@ bool stop_requested(const GenerationInput& in) {
 // Why an Abort: the stop flag is checked first, so a SIGTERM is not logged as
 // a gone client (the card showed "aborted: client gone" on SIGTERM).
 AbortCause abort_cause_of(const GenerationInput& in) {
-    return stop_requested(in) ? AbortCause::StopSignal : AbortCause::ClientGone;
+    // The stop flag first (a SIGTERM is not logged as a gone client), then a
+    // cancel-by-id flag (the campaign's W4 seam; the route also ORs it into the
+    // peer closure, so the boundary checks see it), then the closed peer.
+    if (stop_requested(in)) return AbortCause::StopSignal;
+    if (in.cancel && in.cancel->load(std::memory_order_relaxed)) return AbortCause::Cancelled;
+    return AbortCause::ClientGone;
 }
 
 // The tokens a cancelled prefill actually prefilled: the `have` growth over

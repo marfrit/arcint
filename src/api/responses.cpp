@@ -824,9 +824,12 @@ json response_resource(const ResponseRequest& req, const PreparedChat& prep,
     parts.completed = completed;
     parts.status    = completed ? "completed" : "incomplete";
     if (!completed) {
+        // Length is the token budget, Loop the guard, an Abort is a cancel
+        // (StopSignal never reaches the resource builder: it answers 503).
         parts.incomplete_details =
             json{{"reason", gen.reason == FinishReason::Length ? "max_output_tokens"
                             : gen.reason == FinishReason::Loop ? "loop_guard_abort"
+                            : gen.reason == FinishReason::Abort ? "cancelled"
                                                               : "max_output_tokens"}};
     }
     if (loop_guard_moved(gen.stats))
@@ -889,8 +892,10 @@ HttpResult run_response(const Context& ctx, PreparedResponse& prep, int slot) {
     }
     log_stats(slot, stats, reason);
 
-    // A stop signal is a 503 an alive client reads; a gone client gets no body.
-    if (reason == FinishReason::Abort) {
+    // A cancel-by-id is a 200 with the incomplete resource (the campaign's
+    // Cancel section); a stop signal is a 503 an alive client reads; a gone
+    // client gets no body.
+    if (reason == FinishReason::Abort && stats.abort_cause != AbortCause::Cancelled) {
         if (stats.abort_cause == AbortCause::ClientGone)
             return HttpResult{200, json::object(), true};
         if (prep.req.has_previous_response_id)

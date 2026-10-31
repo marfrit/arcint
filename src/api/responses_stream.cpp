@@ -306,10 +306,18 @@ private:
             if (!send(counters)) return false;
         }
 
+        // A cancel is a named arcint event before the terminal incomplete (the
+        // spec has no cancelled state; incomplete(cancelled) is the nearest).
+        if (reason == FinishReason::Abort && stats.abort_cause == AbortCause::Cancelled) {
+            json cancelled = {{"type", "arcint:response.cancelled"}, {"v", 1},
+                              {"response_id", prep_.id}};
+            if (!send(cancelled)) return false;
+        }
         json incomplete = nullptr;
         if (!completed) {
             incomplete = json{{"reason", reason == FinishReason::Length ? "max_output_tokens"
                                         : reason == FinishReason::Loop ? "loop_guard_abort"
+                                        : reason == FinishReason::Abort ? "cancelled"
                                                                       : "incomplete"}};
         }
         const char* type  = completed ? "response.completed" : "response.incomplete";
@@ -442,6 +450,7 @@ bool Stream::run(const Context& ctx, int slot) {
         // failed, or the probe saw the close). StopSignal: the process is
         // stopping; delivery is best-effort.
         if (stats.abort_cause == AbortCause::ClientGone) return false;
+        if (stats.abort_cause == AbortCause::Cancelled) return terminal(stats, reason);
         return failed("failed", "the server is stopping; the request was cancelled at its last "
                                 "token or batch boundary", "server_stopping",
                      /*error_event=*/false);

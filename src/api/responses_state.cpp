@@ -187,11 +187,22 @@ std::shared_ptr<StoredResponse> ResponseStore::find_stored_any(const std::string
     return it == entries_.end() ? nullptr : it->second;
 }
 
-void ResponseStore::begin_in_flight(std::shared_ptr<InFlightResponse>) {}
-std::shared_ptr<InFlightResponse> ResponseStore::find_in_flight(const std::string&) {
-    return nullptr;
+void ResponseStore::begin_in_flight(std::shared_ptr<InFlightResponse> entry) {
+    if (!entry) return;
+    std::lock_guard<std::mutex> guard(mutex_);
+    in_flight_[entry->id] = std::move(entry);
 }
-void ResponseStore::end_in_flight(const std::string&) {}
+
+std::shared_ptr<InFlightResponse> ResponseStore::find_in_flight(const std::string& id) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto it = in_flight_.find(id);
+    return it == in_flight_.end() ? nullptr : it->second;
+}
+
+void ResponseStore::end_in_flight(const std::string& id) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    in_flight_.erase(id);
+}
 
 int ResponseStore::entries() const {
     std::lock_guard<std::mutex> guard(mutex_);

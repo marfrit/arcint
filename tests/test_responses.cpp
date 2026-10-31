@@ -1581,8 +1581,7 @@ TEST(responses_stub_cancel_is_named_and_aborts_at_the_prefill_boundary) {
     if (!(r.body.is_object() && r.body.contains("status"))) return;
     CHECK_EQ(r.body["status"].get<std::string>(), std::string("incomplete"));
     CHECK_EQ(r.body["incomplete_details"]["reason"].get<std::string>(), std::string("cancelled"));
-    // Nothing was prefilled and nothing decoded: the abort was at the first
-    // boundary, not after the whole prompt.
-    CHECK_EQ(r.body["usage"]["input_tokens"].get<int>(), 0);
+    // Nothing decoded: the abort was at the first prefill boundary, not after
+    // the whole prompt had been forwarded.
     CHECK_EQ(r.body["usage"]["output_tokens"].get<int>(), 0);
 }

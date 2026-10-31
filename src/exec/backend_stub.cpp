@@ -215,13 +215,18 @@ private:
     // the client's connection (the probe peeks the socket and writes nothing).
     static bool abort_requested(const GenerationInput& in) {
         if (in.stop != nullptr && in.stop->load(std::memory_order_relaxed)) return true;
+        // The route ORs the cancel flag into peer_alive; reading it here too
+        // makes the stub's own boundary the same check as the real backend's.
+        if (in.cancel && in.cancel->load(std::memory_order_relaxed)) return true;
         return in.peer_alive && !in.peer_alive();
     }
 
-    // Which of the two sources ended it: the stop flag is checked first.
+    // Which source ended it: the stop flag first, then the cancel flag, then
+    // the closed peer (the campaign's naming order).
     static AbortCause cause(const GenerationInput& in) {
         if (in.stop != nullptr && in.stop->load(std::memory_order_relaxed))
             return AbortCause::StopSignal;
+        if (in.cancel && in.cancel->load(std::memory_order_relaxed)) return AbortCause::Cancelled;
         return AbortCause::ClientGone;
     }
 

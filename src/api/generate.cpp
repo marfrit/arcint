@@ -99,8 +99,9 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
     if (reason == FinishReason::Abort) {
         // The cause, not a guess: a SIGTERM during a prefill was logged as a
         // gone client until the backend carried which source ended it.
-        const char* why = stats.abort_cause == AbortCause::StopSignal ? "stop signal"
-                                                                     : "client gone";
+        const char* why = stats.abort_cause == AbortCause::StopSignal  ? "stop signal"
+                          : stats.abort_cause == AbortCause::Cancelled ? "cancel requested"
+                                                                       : "client gone";
         log::info(log::format("slot %d", slot), "aborted: %s", why);
     }
 }
