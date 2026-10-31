@@ -155,6 +155,14 @@ not yet told apart.
    kernel source and launches run slower: a code-generation difference on LEO's compile path (`inferred`: e.g. the
    large-GRF build option not reaching it -> spills; the check is the program binaries under both drivers, the intercept
    layer's CLI_DumpProgramBinaries, register and spill counts).
+   **The A770's LEO abort, root cause (`measured-here`, 2026-10-31, runtime 26.27, `tools/leo_image1d_buffer_repro.c`):**
+   an `IMAGE1D_BUFFER` (CL_R, UINT32) of 16,384 texels is created, sampled and read back correctly under LEO; at 16,385
+   texels (and at 1,036,800, a 2880x2880 weight's) the runtime aborts at `hw_cmds_generated_xe_hpg_core.inl:1898` =
+   `RENDER_SURFACE_STATE::setWidth`, `UNRECOVERABLE_IF((value - 1) > 0x3fff)` (`code`, compute-runtime 26.35 source):
+   LEO's DG2 path writes the texel count into the 14-bit width of the surface state instead of the buffer-surface
+   encoding. The default driver passes all three sizes. ggml-opencl wraps quantized weights in such images (`q_img`,
+   nelements/8 texels), which is why the op suite aborts at the first large one. An Intel runtime defect: the program is
+   the upstream reproducer; the workaround is to skip the weight images on DG2 under LEO (the buffer kernels exist).
 2b. **Route B - a chunk pool on the default driver (if LEO falls short).** Allocate the usable VRAM once at load as a
    fixed set of large `cl_mem` chunks; a ggml buffer type hands out ranges inside them (the backend already addresses
    every tensor as buffer + offset, `data_device` set in one place, `code`); the backend's grow-only buffers and the
