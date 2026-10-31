@@ -502,7 +502,7 @@ existing unit suite and roundtrip stay green unchanged.
 
 ## Open questions
 
-1. **Compliance test ids.** The specification checkout here has
+1. **Compliance test ids.** *Resolved by review R1 (ids enumerated, option (a)).* The specification checkout here has
    `bin/compliance-test.ts` but not `src/lib/compliance-tests`, so the ids and
    the per-test assertions cannot be enumerated in this note (`code`). Options:
    (a) vendor the library at the 2026-04-24 release into `tests/feyntalk/` and
@@ -536,6 +536,22 @@ existing unit suite and roundtrip stay green unchanged.
    response MUST be incomplete" conflict when an error truncates an open item
    (`paper`). We choose `failed` and close the item `incomplete`; a proposal to
    the TSC is out of scope. Unchanged if the next release resolves it.
+
+## Review (second reader, 2026-10-31)
+
+Checked at source against the full specification repository (`code`/`paper` as
+marked); the note's decisions stand except where a row says otherwise.
+
+| # | finding | disposition |
+|---|---|---|
+| R1 | Open question 1 is an artifact of an incomplete checkout: the full repository has `src/lib/compliance-tests.ts` (1,784 lines, Apache-2.0, `code`). It defines **17 ids**: `basic-response`, `assistant-phase`, `response-output-phase-schema`, `streaming-response`, `system-prompt`, `tool-calling`, `image-input`, `multi-turn`, seven `websocket-*`, `compact-response`, `compact-missing-model`. | **Resolved, option (a).** 1.3.0 gate = `basic-response`, `streaming-response`, `system-prompt`, `tool-calling`, `multi-turn`, `assistant-phase`, `response-output-phase-schema` (7). `image-input` runs only where the unit has a projector (skipped on the stub, named). `websocket-*` (7) → W7, `compact-*` (2) → W8. Licence row in `THIRD_PARTY.md` in W5. |
+| R2 | `assistant-phase` only sends assistant history with `phase:"commentary"` and checks acceptance; `response-output-phase-schema` checks the output schema (`code`). | Move `phase` out of the skip list: accept it on input items (ignored by the template), emit no `phase` on output (optional field). W1. |
+| R3 | `incomplete_details.reason` is a free string in the OpenAPI document (no enum, `paper`); the spec text does not mention cancel anywhere (0 occurrences, `paper`). | Confirms `"cancelled"` and `"loop_guard_abort"` are spec-legal values and cancel-by-id must be an extension. No change. |
+| R4 | `store` carries no default in the OpenAPI document (`paper`). With default `true`, every prompt of every Responses turn is retained in RAM for up to 24 h. | Keep `true` (client convention), but `--responses-store-entries 0` must disable retention entirely (in-flight registry only), and `/props` reports entries and bytes. W3 unit case for the 0 setting. |
+| R5 | W1 splits `prepare_chat`, which is the chat route every production unit serves. A green suite does not prove identical bytes. | W1 gate adds a **golden capture**: the existing chat and completions routes on `--stub`, non-stream and SSE, byte-identical before/after the refactor. W1 merges only in agreement with the engine maintainer's release plan. |
+| R6 | 429 on busy lanes (Responses) vs 503 (chat) is right per the spec's type table; clients retry 429 with backoff. | Keep. Record the test client's retry behaviour in the W5 live leg. |
+| R7 | `output_tokens_details.reasoning_tokens = 0` although the reasoning split is token-exact where the tag is one special token. | Count it in W2 from the streamer's side per emitted piece; 0 only where the split is textual. |
+| R8 | feyntalk-render "lives outside this repository" — its home is not named. | Operator decision before W6 (own repository; public or private). Not a 1.3.0 text-mode blocker. |
 
 ## Current state
 
