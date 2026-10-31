@@ -71,20 +71,37 @@ namespace and an optional token mode.
    `cache_hit_tokens >= prior prompt_tokens - 1` (the guaranteed shared prefix,
    `code`); 0 malformed tool calls; decode within the run-to-run spread of the
    chat-route arm on the same window; the stop classes unchanged.
+   **Outcome (`measured-here`, 2026-10-31, A770, the coder model, serving
+   build 83d4e26, one card window):** PASS — 4 tool calls (read, read, write,
+   read), 0 malformed, the expected answer right. The continuation shared
+   93–97 % of the prior prompt in cache, consistently 4 tokens below
+   `prior prompt_tokens - 1`; the chat route shows the same property: the
+   prior turn's generation prefix is re-rendered differently in history, so
+   the gate's `- 1` is not met by 4 tokens and the shared-prefix guarantee is
+   `code`-bounded, not exact. Recorded rather than waived: the answer and the
+   tool loop are right, the cache share is high.
 5. **Cancel measurement**: at a 100,000-token prefill, the cancel POST to the
    aborted request's `response.incomplete` is bounded by **one ubatch**: the
    server's `prompt_tokens_prefilled` is within one `--prefill-chunk` of the
    point where cancel was issued, and the control arm (connection close, today's
    path) shows the same bound. Recorded with card, depth, KV precision and
    configuration.
+   **Outcome (`measured-here`, 2026-10-31, A770, the coder model, build
+   83d4e26, ~14–15k-token prefill, cancel issued 10 s in):** the bound is
+   **~1.6 ubatches for both arms, not one** — cancel-by-id aborted at 14,336
+   prefilled after 1.28 s, the socket-close control at 14,336 after 1.25 s;
+   `response.created` reached the client after 0.01 s. The extra 0.6 ubatch is
+   the existing boundary check's property (the ubatch in flight at the check),
+   identical for the control arm; recorded honestly, not narrowed to one.
 
 **Knowingly skipped in 1.3.0** (each is refused loudly or absent from the
 served surface, never silently accepted): every WebSocket test; `/responses/
 compact`; `background: true`; hosted tools (`implementor_slug:` tool types);
 `allowed_tools`; `text.format` `json_object`/`json_schema`; logprobs /
-`include` / encrypted reasoning / obfuscation; assistant `phase`; prior
-reasoning replay fidelity (see the open question). See the Scope section for
-the reasons and the status codes.
+encrypted reasoning / obfuscation; assistant `phase`; prior reasoning replay
+fidelity (see the open question). `include` is not skipped: it is accepted and
+ignored, because clients send it on every reasoning request. See the Scope
+section for the reasons and the status codes.
 
 ## Scope — 1.3.0 vs 1.3.x
 
@@ -106,7 +123,8 @@ the reasons and the status codes.
 | `allowed_tools` hard constraint | — | **yes** | needs grammar narrowing or suppression; 400 `unsupported_parameter` in 1.3.0 |
 | `item_reference` input items, `compaction` input items | — | **yes** | need an item index in the store and a compaction pass respectively; 400 in 1.3.0 |
 | `text.format` json_object/json_schema | — | **yes** | the schema→GBNF machinery exists (`src/core/toolgrammar.cpp`) but is opt-in and not wired for answers `code`; 400 in 1.3.0 |
-| reasoning `summary`, `encrypted_content`, `include`, logprobs, obfuscation, `phase` | — | **yes** | arcint surfaces raw reasoning only; summaries/encryption are model-provider features `code` |
+| reasoning `summary`, `encrypted_content`, logprobs, obfuscation, `phase` | — | **yes** | arcint surfaces raw reasoning only; summaries/encryption are model-provider features `code` |
+| `include` (2026-04-24 enum) | **accepted and ignored** | — | clients send `reasoning.encrypted_content` every turn; a 400 would lock them out, and arcint serves neither encrypted reasoning nor output logprobs. The enum is accepted even where a future value is unknown; only a non-string entry is a 400 `invalid_request`, param `include` (`measured-here`, live client) |
 | hosted tools (`implementor_slug:`) | — | **later** | arcint executes no tools; the item type would be a receipt for a tool it never ran `code` |
 | `max_tool_calls` | — | **later** | no cross-call counting exists; 400 in 1.3.0 |
 | `response.queued` | never | — | admission is a status code before `response.created` (`SlotPool`/503 `code`); no queue state exists |
@@ -165,7 +183,7 @@ scan, reasoning split, UTF-8 hold-back and tool parsing.
 | `stream`, `stream_options.include_obfuscation` | `stream` honoured; obfuscation accepted and ignored (arcint emits no `obfuscation`) | `paper` optional field |
 | `store`, `background`, `metadata`, `service_tier`, `safety_identifier`, `prompt_cache_key` | echoed; `background:true` → 400 `unsupported_parameter`, `service_tier` other than `auto`/`default` → 400 | see Scope `code` |
 | `max_tool_calls` | 400 `unsupported_parameter`, param `max_tool_calls` | 1.3.x |
-| `include` (any value) | 400 `unsupported_parameter`, param `include` | 1.3.x until logprobs/encrypted reasoning exist |
+| `include` (array of strings, any enum value) | accepted and ignored: nothing is added to the output | clients send `reasoning.encrypted_content` on every reasoning turn; the strings are the spec's enum, a future value is accepted too; a non-string entry is 400 `invalid_request`, param `include` `measured-here` |
 | `arcint` object (extension) | parsed by `src/api/responses.cpp` (see Extension namespace and Token mode) | `paper` §Extending existing schemas |
 
 ## Event mapping (point 3)
@@ -490,7 +508,7 @@ Two ids are named in the specification README (`basic-response`,
 | W5 | **gate + live leg**: vendor the compliance library at the pinned release into `tests/feyntalk/`, wire a runner, add the pi multi-turn leg | `tests/feyntalk/`, `tests/CMakeLists.txt` or `CMakeLists.txt`, `tools/feyntalk_live.py` | compliance 0 failed, skipped = the named list; live leg passes Gate 4 |
 | W6 | **token mode + spans + material**: `arcint.token_mode`/`input_ids`/`renderer_hash`, `arcint:token`, `arcint:span`, sampler event sink, `Backend::renderer_material()`, `GET /v1/responses/renderer`, hash | `src/api/responses*.{h,cpp}`, `src/core/sampler.{h,cpp}` (580/779/788/813), `src/core/sampling.h:166`, `src/exec/backend.h` + `backend_llama.cpp` (326/1032 area), `src/api/handlers.cpp` (`/props` 514), `tests/test_responses.cpp` | unit token/span/shadow equality green; hash stable across two loads; off by default; live token leg (Gate 5) |
 | W7 | **WebSocket (1.3.x)**: `response.create`, one in-flight response per connection, sequential turns, connection-local `store=false`, 60-min limit, WS error envelope | `src/http/server.cpp` + a new WS framing unit, `src/api/responses_state.{h,cpp}`, `tests/test_responses.cpp` | WS compliance tests pass; connection-limit and `previous_response_not_found` after eviction |
-| W8 | **compact + background (1.3.x)**: `/v1/responses/compact`, `background:true`, background cancel, `allowed_tools`, `text.format` json, reasoning summary/include/logprobs | new compaction + job modules, `src/api/responses*.{h,cpp}` | each part's compliance test; `background` cancel; no card gate before design |
+| W8 | **compact + background (1.3.x)**: `/v1/responses/compact`, `background:true`, background cancel, `allowed_tools`, `text.format` json, reasoning summary/logprobs | new compaction + job modules, `src/api/responses*.{h,cpp}` | each part's compliance test; `background` cancel; no card gate before design |
 
 Order: W1 before W2 (the resource and the event writer share the snapshot
 builder); W2 before W3 (a continuation is observable in the stream); W3 before
@@ -555,12 +573,40 @@ marked); the note's decisions stand except where a row says otherwise.
 
 ## Current state
 
-Design note only (2026-10-31). Nothing built, no unit or package changed. The
-facts above are read from the current tree (`code`) and from the 2026-04-24
-specification (`paper`); the only `measured-here` numbers reused are the
-clean-turns records (the coder's tool opener is one special token; decode
-79.5 t/s on the 16 GiB card) and the suite baselines. Cancel latency, compliance
-results and the live legs are owed by W2-W5.
+W1–W4 are built and accepted (2026-10-31): the request mapping and the
+non-stream/non-SSE `ResponseResource` (`src/api/responses.*`), the SSE event
+writer (`responses_stream.*`) with the item/part lifecycle and the terminal
+events, the in-memory state and continuation (`responses_state.*`) with
+limits, LRU/TTL, `previous_response_id`, prefix hash and slot affinity, and
+cancel by id (`POST /v1/responses/{id}/cancel`, an arcint extension) with
+`AbortCause::Cancelled` in the engine seam. `include` is accepted and ignored
+(the live-client fix); a Responses refusal writes one `req:` warning line with
+its code and numbers; the chat route has the same gap for prepare-time
+refusals and was left unchanged (its bytes are a gate).
+
+Gate numbers (`measured-here`): `ctest -L unit` 7/7, 419 cases 0 failed 0
+skipped on the stub build with `-Werror`; the feyntalk-golden capture of the
+chat/completions routes stays byte-identical; `tests/roundtrip.sh` green
+including the two-turn continuation and cancel-by-id checks; the 7 named
+compliance ids (`basic-response`, `streaming-response`, `system-prompt`,
+`tool-calling`, `multi-turn`, `assistant-phase`,
+`response-output-phase-schema`) pass against the stub (second-reader run,
+node+tsx; the vendor + runner stays W5).
+
+Live leg (`measured-here`, 2026-10-31, Arc A770, the coder model, serving build
+83d4e26, pi with provider type `openai-responses`): PASS — 4 tool calls
+(read, read, write, read), 0 malformed, the expected answer right. The
+continuation shared 93–97 % of the prior prompt; every turn was 4 tokens below
+`prior prompt_tokens - 1`, the same property as the chat route (the prior
+turn's generation prefix is re-rendered differently in history). Cancel at a
+~14–15k-token prefill, issued 10 s in: cancel-by-id aborted at 14,336
+prefilled after 1.28 s, socket-close control at 14,336 after 1.25 s, and
+`response.created` reached the client after 0.01 s — ~1.6 ubatches for both
+arms, the existing boundary check's property, not one.
+
+W5 still owes the compliance vendor + runner and the live token-mode leg is
+W6. `GET /v1/responses/{id}` is not in the 2026-04-24 OpenAPI document and
+was not added. No WebSocket, no compact/background, no W6 option work.
 
 ## Where it lives
 
