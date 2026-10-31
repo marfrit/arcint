@@ -395,6 +395,15 @@ if(ARCINT_TESTS)
                      "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_fuse_qk_norm_rope.py")
     set_tests_properties(fuse-qk-norm-rope PROPERTIES LABELS unit)
+    # patch 0075's device-free terms cell: the CPU-miss prefetch switch (default
+    # off), a block-ahead hint in every row function, the volatile page touch and
+    # its level-2 guard in both compute paths. The residency and parity arms are
+    # in tests/test-opencl-miss-cpu.cpp (the patch's own C cell).
+    add_test(NAME cpu-miss-prefetch
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_cpu_miss_prefetch.py")
+    set_tests_properties(cpu-miss-prefetch PROPERTIES LABELS unit)
     add_test(NAME expert-profile-save
              COMMAND "${CMAKE_COMMAND}" -E env "EXPERT_PROFILE_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
                      "${Python3_EXECUTABLE}"

@@ -1,0 +1,249 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.cpp b/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.cpp
+index a146afb..0a0258d 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.cpp
+@@ -77,6 +77,14 @@ bool ggml_cl_miss_cpu_type(ggml_type t) {
+ #endif
+ #endif
+ 
++// patch 0075: the prefetch level, set once when the cache registers a layer
++// (GGML_OPENCL_CPU_MISS_PREFETCH: 0 off, 1 the rows' block-ahead hints, 2 also
++// the cold-page touch at publish). Read from the rows' block loop; a hint can
++// never change a row's bits, it only names the next block's first payload field.
++static int g_cl_miss_pf = 0;
++#define GGML_CL_MISS_PF(p) do { if (g_cl_miss_pf >= 1) __builtin_prefetch((const void *) (p), 0, 3); } while (0)
++static const int GGML_CL_MISS_PF_AHEAD = 2;   // blocks
++
+ #if GGML_CL_MISS_CPU
+ #include <immintrin.h>
+ 
+@@ -203,6 +211,7 @@ inline void row_iq(const Fields & F, int64_t i0, int nblocks, const block_q8_K *
+     for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
+     for (int b = 0; b < nblocks; ++b) {
+         const int64_t i = i0 + b;
++        GGML_CL_MISS_PF(F.at(1, i + GGML_CL_MISS_PF_AHEAD));
+         __m256i acci[NT];
+         for (int t = 0; t < NT; ++t) acci[t] = _mm256_setzero_si256();
+         for (int j = 0; j < 4; ++j) {
+@@ -263,6 +272,7 @@ inline void row_iq2xs(const Fields & F, int64_t i0, int nblocks, const block_q8_
+     for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
+     for (int b = 0; b < nblocks; ++b) {
+         const int64_t i = i0 + b;
++        GGML_CL_MISS_PF(F.at(1, i + GGML_CL_MISS_PF_AHEAD));
+         const uint8_t * qs = F.at(1, i);
+         __m128i st = _mm_set1_epi64x((long long) u64(F.at(2, i)));
+         st = _mm_unpacklo_epi8(_mm_and_si128(st, m4), _mm_and_si128(_mm_srli_epi16(st, 4), m4));
+@@ -310,6 +320,7 @@ inline void row_iq3xxs(const Fields & F, int64_t i0, int nblocks, const block_q8
+     for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
+     for (int b = 0; b < nblocks; ++b) {
+         const int64_t i = i0 + b;
++        GGML_CL_MISS_PF(F.at(1, i + GGML_CL_MISS_PF_AHEAD));
+         const uint8_t * q3  = F.at(1, i);
+         const uint8_t * gas = F.at(2, i);
+         __m256i s1[NT], s2[NT];
+@@ -362,6 +373,7 @@ inline void row_iq3s_1(const Fields & F, int64_t i0, int nblocks, const block_q8
+     __m256 accumf = _mm256_setzero_ps();
+     for (int b = 0; b < nblocks; ++b) {
+         const int64_t i = i0 + b;
++        GGML_CL_MISS_PF(F.at(1, i + GGML_CL_MISS_PF_AHEAD));
+         const float d = h2f(u16(F.at(0, i))) * iq_k<GGML_TYPE_IQ3_S>() * y[b].d;
+         const uint8_t * qs = F.at(1, i);
+         const uint8_t * qh = F.at(2, i);
+@@ -432,6 +444,7 @@ inline void row_q2(const Fields & F, int64_t i0, int nblocks, const ActQ2 * a, f
+     const __m256i ones = _mm256_set1_epi16(1);
+     for (int b = 0; b < nblocks; ++b) {
+         const int64_t i = i0 + b;
++        GGML_CL_MISS_PF(F.at(1, i + GGML_CL_MISS_PF_AHEAD));
+         const float d = h2f(u16(F.at(0, i)));
+         __m256i lo, hi;
+         unpack64(F.at(1, i), lo, hi);
+@@ -473,6 +486,7 @@ inline void row_iq4nl(const uint8_t * d, const uint8_t * q, int nb, const block_
+     for (int t = 0; t < NT; ++t) { acc0[t] = _mm256_setzero_ps(); acc1[t] = _mm256_setzero_ps(); }
+     int ib = 0;
+     for (; ib + 1 < nb; ib += 2) {
++        GGML_CL_MISS_PF(q + 16 * (ib + GGML_CL_MISS_PF_AHEAD));
+         __m256i q4, aq;
+         dec_iq4nl(q, ib, values, q4, aq);
+         __m256 dx = _mm256_set1_ps(h2f(u16(d + 2 * ib)));
+@@ -655,6 +669,24 @@ void ggml_cl_miss_cpu_rows(ggml_type t, const void * slice, bool planar, int64_t
+     }
+ }
+ 
++void ggml_cl_miss_cpu_set_prefetch(int level) {
++    g_cl_miss_pf = level < 0 ? 0 : level;
++}
++
++int ggml_cl_miss_cpu_prefetch_ahead(void) {
++    return GGML_CL_MISS_PF_AHEAD;
++}
++
++// patch 0075's cold-page half: one byte a 4 KiB page of a slice, so the pages a
++// first-use bank read would fault in serially are flowed in by the pool's tasks.
++// The reads are volatile: the point is the fault, not the value.
++void ggml_cl_miss_cpu_touch(const void * p, size_t bytes) {
++    const volatile unsigned char * q = (const volatile unsigned char *) p;
++    unsigned char acc = 0;
++    for (size_t o = 0; o < bytes; o += 4096) acc ^= q[o];
++    (void) acc;
++}
++
+ void ggml_cl_miss_cpu_rows_iq4nl(const void * d, const void * q, int64_t blk0, int64_t ne0, int64_t ne1,
+                                  const void * const * act, int nt, float * const * out, int r0, int r1) {
+     (void) ne1;
+@@ -682,5 +714,8 @@ bool   ggml_cl_miss_cpu_type(ggml_type) { return false; }
+ size_t ggml_cl_miss_cpu_act_size(ggml_type, int64_t) { return 0; }
+ void   ggml_cl_miss_cpu_quant(ggml_type, const float *, int64_t, void *) {}
+ void   ggml_cl_miss_cpu_rows(ggml_type, const void *, bool, int64_t, int64_t, const void * const *, int, float * const *, int, int) {}
++void   ggml_cl_miss_cpu_set_prefetch(int) {}
++int    ggml_cl_miss_cpu_prefetch_ahead(void) { return 0; }
++void   ggml_cl_miss_cpu_touch(const void *, size_t) {}
+ void   ggml_cl_miss_cpu_rows_iq4nl(const void *, const void *, int64_t, int64_t, int64_t, const void * const *, int, float * const *, int, int) {}
+ #endif
+diff --git a/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.h b/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.h
+index 2bfbf05..151f17d 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.h
++++ b/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.h
+@@ -15,6 +15,12 @@ void   ggml_cl_miss_cpu_rows(ggml_type t, const void * slice, bool planar, int64
+ // the same for an IQ4_NL matrix in the bank's split form (scales d, quants q over the whole tensor); its first block blk0
+ void   ggml_cl_miss_cpu_rows_iq4nl(const void * d, const void * q, int64_t blk0, int64_t ne0, int64_t ne1,
+                                    const void * const * act, int nt, float * const * out, int r0, int r1);
++// patch 0075: 0 off (the rows' block-ahead hints and the page touch off), 1 the
++// rows' hints every 2 blocks ahead, 2 also the cold-page touch at publish
++void   ggml_cl_miss_cpu_set_prefetch(int level);
++int    ggml_cl_miss_cpu_prefetch_ahead(void);   // blocks the row hint names ahead
++// one byte a 4 KiB page of [p, p+bytes): the first-use page faults, flowed ahead
++void   ggml_cl_miss_cpu_touch(const void * p, size_t bytes);
+ // n IQ4_NL blocks from i0 on, as GGUF blocks, out of a USM bank that holds the tensor's scales and its
+ // quants as two arrays (ggml_cl_usm_set_tensor): the rows ggml-cpu's dot products read
+ void   ggml_cl_miss_cpu_join_iq4nl(const void * d, const void * q, int64_t i0, int64_t n, void * dst);
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 7519df1..8a4d074 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -15909,6 +15909,7 @@ struct ggml_cl_miss_layer {
+     ggml_type             vd_type[3] = {};
+     ggml_cl_from_float_fn from_float[3] = {};
+     int   n_slots = 0, n_expert = 0;
++    int   prefetch = 0;          // patch 0075: GGML_OPENCL_CPU_MISS_PREFETCH (0 off)
+     float clamp = 0.0f;
+     bool  fast  = false;         // patch 0056: all three types on the multi-token kernels (ggml-opencl-miss-cpu.cpp)
+     uint32_t * pub  = nullptr;   // [0] seq, [1] CPU pairs; [16..) their pair index, [16+PMAX..) bank row; floats from 512: x
+@@ -16014,6 +16015,16 @@ static void ggml_cl_miss_fast_rows(const ggml_cl_miss_layer & L, int k, int64_t
+     ggml_cl_miss_cpu_rows(L.bank[k]->type, slice, L.planar[k], ne0, ne1, act, nt, out, r0, r1);
+ }
+ 
++// patch 0075's cold-page pass: a missed expert's three bank slices, one byte a
++// page, run as the pool's own tasks so the faults flow in parallel before the
++// rows read the same pages
++static void ggml_cl_miss_touch(const ggml_cl_miss_layer & L, int64_t b) {
++    for (int k = 0; k < 3; ++k) {
++        if (L.bptr[k] == nullptr) continue;
++        ggml_cl_miss_cpu_touch(L.bptr[k] + (size_t) b * L.bank[k]->nb[2], (size_t) L.bank[k]->nb[2]);
++    }
++}
++
+ static void ggml_cl_miss_compute(const ggml_cl_miss_job & job) {
+     ggml_cl_miss_layer & L = *job.L;
+     const float * x = (const float *) (L.pub + 512);
+@@ -16043,6 +16054,9 @@ static void ggml_cl_miss_compute(const ggml_cl_miss_job & job) {
+             if (gi == grp_b.size()) { grp_b.push_back(ms[m].b); grp.emplace_back(); }
+             grp[gi].push_back(m);
+         }
++        if (L.prefetch >= 2) {
++            g_miss_pool->run((int) grp_b.size(), [&](int task) { ggml_cl_miss_touch(L, grp_b[task]); });
++        }
+         const ggml_type t0 = L.bank[0]->type, t1 = L.bank[1]->type, t2 = L.bank[2]->type;
+         const size_t a0 = ggml_cl_miss_cpu_act_size(t0, ne_in), a1 = ggml_cl_miss_cpu_act_size(t1, ne_in);
+         const size_t a2 = ggml_cl_miss_cpu_act_size(t2, ne_ff);
+@@ -16106,6 +16120,9 @@ static void ggml_cl_miss_compute(const ggml_cl_miss_job & job) {
+         const int RB = 32;   // rows a task
+         const int tg = (int) ((ne_ff + RB - 1) / RB);
+         const char * xq0p = xq0.data(); const char * xq1p = xq1.data();
++        if (L.prefetch >= 2) {
++            g_miss_pool->run(nm, [&](int task) { ggml_cl_miss_touch(L, ms[task].b); });
++        }
+         float * gp = g.data(); float * up = u.data();
+         g_miss_pool->run(nm * tg * 2, [&](int task) {
+             alignas(64) char scratch[4096];
+@@ -16254,6 +16271,11 @@ static void ggml_backend_opencl_miss_layer(const ggml_tensor * const * slot, con
+         L->from_float[k] = (ggml_cl_from_float_fn) from_float[k];
+     }
+     L->n_slots = n_slots; L->n_expert = n_expert; L->clamp = clamp;
++    // patch 0075: the prefetch arm, off unless named. 1 = the rows' block-ahead
++    // hints, 2 = also the cold-page touch before the rows read the bank
++    static const int pf = [] { const char * e = getenv("GGML_OPENCL_CPU_MISS_PREFETCH"); return e != nullptr ? atoi(e) : 0; }();
++    L->prefetch = pf;
++    ggml_cl_miss_cpu_set_prefetch(pf);
+     static const bool mt = getenv("GGML_OPENCL_CPU_MISS_MT") == nullptr || atoi(getenv("GGML_OPENCL_CPU_MISS_MT")) != 0;
+     L->fast = mt && ggml_cl_miss_cpu_ok();
+     for (int k = 0; k < 3; ++k) L->fast = L->fast && ggml_cl_miss_cpu_type(bank[k]->type);
+diff --git a/tests/test-opencl-miss-cpu.cpp b/tests/test-opencl-miss-cpu.cpp
+index 531a03d..3fa0529 100644
+--- a/tests/test-opencl-miss-cpu.cpp
++++ b/tests/test-opencl-miss-cpu.cpp
+@@ -9,6 +9,10 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <cmath>
++#if defined(__linux__)
++#include <sys/mman.h>
++#include <unistd.h>
++#endif
+ #include <random>
+ #include <vector>
+ #include <chrono>
+@@ -72,6 +76,20 @@ int main(int argc, char ** argv) {
+             for (int k = 0; k < nt; ++k) { ggml_cl_miss_cpu_quant(c.t, x[k].data(), c.ne0, aq[k].data()); act[k] = aq[k].data(); op[k] = out[k].data(); tv->from_float(x[k].data(), rq[k].data(), c.ne0); }
+             const auto t0 = std::chrono::steady_clock::now();
+             ggml_cl_miss_cpu_rows(c.t, planes.data(), !red, c.ne0, c.ne1, act, nt, op, 0, (int) c.ne1);
++            // patch 0075: level 1's block-ahead hint cannot change a row's bits: the
++            // same rows at level 0 and level 1 must be identical. (The red is the
++            // ahead distance: ggml_cl_miss_cpu_prefetch_ahead() < 1 fails below.)
++            if (!red && c.t == GGML_TYPE_IQ2_S && nt == 2) {
++                std::vector<std::vector<float>> out_pf = out;
++                ggml_cl_miss_cpu_set_prefetch(1);
++                for (int k = 0; k < nt; ++k) op[k] = out_pf[k].data();
++                ggml_cl_miss_cpu_rows(c.t, planes.data(), true, c.ne0, c.ne1, act, nt, op, 0, (int) c.ne1);
++                ggml_cl_miss_cpu_set_prefetch(0);
++                int differ = 0;
++                for (int k = 0; k < nt; ++k) differ += memcmp(out[k].data(), out_pf[k].data(), (size_t) c.ne1 * sizeof(float)) != 0;
++                printf("prefetch level 1 bits: %d of %d rows differ %s\n", differ, nt, differ ? "FAIL" : "ok");
++                fails += differ != 0;
++            }
+             const double us = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() * 1e6;
+             double emax = 0, rmax = 0;
+             for (int k = 0; k < nt; ++k) for (int64_t r = 0; r < c.ne1; ++r) {
+@@ -83,6 +101,33 @@ int main(int argc, char ** argv) {
+             printf("%-8s nt=%d rel err %.2e (tol %.0e) %s  %.0f us\n", ggml_type_name(c.t), nt, rel, tol, ok ? "ok" : "FAIL", us);
+         }
+     }
++    // patch 0075: the cold-page touch flows a slice's pages in. A 16-page
++    // anonymous mapping, dropped, must be all absent before and all present
++    // after one byte a page; a touch that strides 8192 leaves half absent (red).
++    if (ggml_cl_miss_cpu_prefetch_ahead() < 1) {
++        printf("prefetch ahead %d blocks FAIL\n", ggml_cl_miss_cpu_prefetch_ahead()); fails++;
++    }
++#if defined(__linux__)
++    {
++        const long pg = sysconf(_SC_PAGESIZE);
++        const int np = 16;
++        void * p = mmap(nullptr, (size_t) pg * np, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++        if (p == MAP_FAILED) { printf("cold-page touch: mmap failed FAIL\n"); fails++; }
++        else {
++            unsigned char vec[16];
++            madvise(p, (size_t) pg * np, MADV_DONTNEED);
++            const int rb = mincore(p, (size_t) pg * np, vec);
++            int before = 0; for (int i = 0; i < np; ++i) before += vec[i] & 1;
++            ggml_cl_miss_cpu_touch(p, (size_t) pg * np);
++            const int ra = mincore(p, (size_t) pg * np, vec);
++            int after = 0; for (int i = 0; i < np; ++i) after += vec[i] & 1;
++            const bool ok = rb == 0 && ra == 0 && before == 0 && after == np;
++            printf("cold-page touch: %d of %d pages resident before, %d after %s\n", before, np, after, ok ? "ok" : "FAIL");
++            fails += !ok;
++            munmap(p, (size_t) pg * np);
++        }
++    }
++#endif
+     printf("%s: %d failing\n", red ? "red" : "test", fails);
+     return fails ? 1 : 0;
+ }

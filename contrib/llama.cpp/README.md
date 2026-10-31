@@ -5156,3 +5156,41 @@ made its cell fail; restored, the cell passes.
 the commands): the pricing trace's per-step `kernel_rope_multi_f32` +
 `kernel_rms_norm_mul` device time and count, then the served A/B with the
 switch off and on at the same unit flags. No number is claimed here.
+
+## 0075-opencl-intel-cpu-miss-prefetch.patch
+
+The CPU miss rows (0056/0063) read a bank slice for the first time after an
+expert has missed, so the pages may be absent: Strata measured cold reads at
+78 % of its CPU lane (`paper`, St 9e3fe046). The patch carries both pieces the
+audit names: one block-ahead `__builtin_prefetch` of the next block's first
+payload field in each of the six row functions (`code`:
+`ggml-opencl-miss-cpu.cpp`), and a page-touch pass over a missed expert's three
+slices at publish time (`ggml_cl_miss_cpu_touch`, one byte a 4 KiB page through
+a volatile pointer), run as the pool's own tasks so the faults flow in parallel
+before the rows read the same pages. It is the audit's cold-page half; its
+prefetch half deviates from the sketch's "next expert's first field" and reads
+the block two ahead within the same expert (`code`) — the rows' task sees one
+expert only, so the next expert's field is not in scope, and the page touch
+covers the slice boundary instead.
+
+Switch: `GGML_OPENCL_CPU_MISS_PREFETCH`, **0 (off) by default**; `1` the rows'
+hints, `2` also the page touch (`code`). The audit's bar before any default:
+major page faults above ~5 % of the CPU lane's time (`paper`, the audit's
+pricing) — no number is claimed here.
+
+`measured-here`, device-free: `tests/test-opencl-miss-cpu.cpp` gains the
+level-1 parity arm (the rows' bits identical at level 0 and level 1, which is
+what a hint must be), the ahead-distance arm and the residency arm (a 16-page
+mapping dropped to absent, one byte a page touches it all resident; a touch
+striding 8192 leaves 8 of 16 absent and fails). Mutations run red before
+restore: the touch stride 8192 (residency 16 -> 8 and the cell fails), the ahead
+distance 0 (the cell fails). `tests/python/test_cpu_miss_prefetch.py` reads the
+patched tree for the default-off switch, one hint in every row function, the
+volatile touch and the `>= 2` guard in both compute paths; its five red
+mutations (a hint dropped, distance 0, stride, non-volatile pointer, default
+on, guard removed) were each seen failing.
+
+Owed on the cards (Claude's window; the handover carries the commands): the
+cold/warm served pair at `GGML_OPENCL_CPU_MISS_MAX=64` and `perf stat -e
+cache-misses,minor-faults,major-faults` on one decode, then the A/B at level 0
+and 2. The audit's bar decides whether a default follows.
