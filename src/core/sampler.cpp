@@ -111,6 +111,13 @@ void Sampler::observe_think_text(std::string_view piece) { observe_think_(piece,
 
 void Sampler::observe_think(int token, std::string_view piece) { observe_think_(piece, token); }
 
+// feyntalk W3.4 scaffolding (red-first): the budget is stored, nothing counts
+// it down and nothing forces a closer yet.
+void Sampler::set_think_ctx_budget(int budget) {
+    if (params_.think_ctx_reserve <= 0) return;
+    ctx_budget_ = budget;
+}
+
 void Sampler::set_think_mask_ids(ThinkBlockIds ids) {
     params_.think_ids = std::move(ids);
     measure_think_tags();

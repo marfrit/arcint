@@ -304,6 +304,13 @@ struct Config {
     int         loop_guard_grace     = 40;
     int         loop_guard_door_grace = 20;
 
+    // feyntalk W3.4: the context guard's reserve in tokens (--think-ctx-reserve).
+    // 0 (default) is off: no budget at request start, no forced closer,
+    // byte-identical to before. N > 0 reserves N tokens of the lane's n_ctx
+    // for what is left after the thought: the sampler forces the think block's
+    // closer once n_ctx - prompt_tokens - N emitted reasoning tokens have gone.
+    int         think_ctx_reserve = 0;
+
     // Stub-only: milliseconds of artificial latency per emitted token. Exists
     // so the cancellation path (§3.7) can be demonstrated against a backend
     // that would otherwise finish before a client could disconnect.

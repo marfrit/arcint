@@ -1384,6 +1384,34 @@ TEST(responses_stream_sends_loop_guard_when_any_counter_moved) {
     CHECK(guard);   // parity with the chat route's loop_guard object
 }
 
+// feyntalk W3.4: the context guard's event. The stream names the arithmetic
+// and, when the guard fired, the forced close with the emitted-token index, in
+// the same index space as arcint:token.
+TEST(responses_sse_context_event_reports_the_guard) {
+    StreamFixture fx;
+    fx.backend.pieces = {{"a", 1}, {"b", 2}};
+    fx.backend.counters.loop_context_closes    = 1;
+    fx.backend.counters.loop_context_token_index = 7;
+    fx.prep.chat.input.sampler.think_ctx_reserve = 64;
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    int context = -1, terminal = -1;
+    for (size_t i = 0; i < s.events.size(); ++i) {
+        if (s.events[i].first == "arcint:context") context = static_cast<int>(i);
+        if (s.events[i].first == "response.completed") terminal = static_cast<int>(i);
+    }
+    CHECK(context >= 0);
+    if (context < 0) return;
+    CHECK(context < terminal);
+    const json& c = s.events[context].second;
+    CHECK_EQ(c["v"].get<int>(), 1);
+    CHECK_EQ(c["used"].get<int>(), 6);       // 4 prompt + 2 pieces
+    CHECK_EQ(c["n_ctx"].get<int>(), 4096);
+    CHECK_EQ(c["remaining"].get<int>(), 4090);
+    CHECK(c["forced_close"].get<bool>());
+    CHECK_EQ(c["token_index"].get<int>(), 7);
+}
+
 TEST(responses_non_stream_resource_carries_arcint_loop_guard_when_moved) {
     StreamFixture fx;
     fx.backend.pieces = {{"x", 1}};

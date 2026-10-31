@@ -254,6 +254,12 @@ struct GenerationStats {
     // gap 2: draws whose candidates held an end-of-generation id the door
     // removed inside the open block.
     int    loop_door_eog_masked = 0;
+    // feyntalk W3.4 context guard: closes forced by the reserve (not by the
+    // loop guard), arms that could not force a closer (text-closer family),
+    // and the emitted-token index the forced closer took (-1: none).
+    int    loop_context_closes    = 0;
+    int    loop_context_no_closer = 0;
+    int    loop_context_token_index = -1;
     // Wall time spent copying the whole model state so a rejected draft can be
     // rolled back. On the stateful path this is the price of speculation.
     // What the prefix cache costs on the way in. It is the same host round-trip
