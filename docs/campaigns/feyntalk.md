@@ -821,9 +821,9 @@ Sources, all outside the step loop:
 
 A `SpanTracker` in `responses_stream.cpp` consumes each `(piece, token_id)`
 before the text deltas, so span order is chronological; loop/context spans come
-from a **per-request event vector** in `SamplerParams` (a
-`std::vector<SamplerEvent>`, filled by `Sampler::sample()` and drained by the
-API after each emit), not from a cross-thread callback. The sampler already
+from a **per-request event vector** in `SamplerParams`
+(`std::vector<SamplerSpanEvent>`, filled by the sampler's own counter sites and
+drained by the API after each emit), not from a cross-thread callback. The sampler already
 knows `emitted_`, so the index is exact where it is produced. No backend loop
 call site and no step-loop change. `code`.
 
@@ -836,12 +836,13 @@ what the gateway decodes and what it later encodes:
 {"schema":"feyntalk-render/1","hash":"sha256:…",
  "model":{"served_id":"…","canonical_id":"…","quant":"…","arch":"…"},
  "decode":{"pieces_b64":["…"],"eos":248044,"eog_ids":[248044,248046]},
- "encode":{"tokens":["…"],"merges":["…"],"token_types":[1],
+ "encode":{"model":"bpe","tokens":["…"],"merges":["…"],"token_types":[1],
            "pre":"qwen2","add_bos":false,"special_text":{"248068":"…"}},
  "chat_template":{"text":"…","source":"gguf"},
  "special_tokens":{"think":[{"open_ids":[248068],"close_ids":[248069]}],
-                    "tool_call":{"open_ids":[…],"close_ids":[…]}},
- "parser":{"reasoning":"ids/1","tool_calls":"qwen3-coder/1"}}
+                    "think_extended":[{"open_ids":[…],"close_ids":[…]}],
+                    "tool_call":{"open_ids":[…],"close_ids":[…],"open_text":"…"}},
+ "parser":{"reasoning":"ids/1","tag_set":"qwen","tool_calls":"qwen3-coder/1"}}
 ```
 
 Two changes from the earlier draft, both `code`-driven:
@@ -864,18 +865,43 @@ hashed fields, non-ASCII unescaped) of `decode`, `encode`, `chat_template`,
 `special_tokens` and `parser`; `model` is excluded as volatile. A canonical
 form is fixed here so both sides recompute the same digest (JCS subset; no
 floats in the hashed part). `/props` gains `token_mode: "off"|"ready"` and
-`renderer_hash`, so discovery does not depend on the large body. The hash must
-be stable across two loads of the same artifact (`code`: material is read at
-load time, `backend_llama.cpp:326/1032 area`). The stub has no material: `/props`
-says `off`, the endpoint answers **404 `renderer_not_served`**, loudly.
+`renderer_hash`: `ready` is the backend's capability, and the hash is the cached
+one from the build (the first GET or the first token-mode request), never
+computed by `/props` (`code`, W6a review finding 3). The hash must be stable
+across two loads of the same artifact (`code`: the build reads the GGUF metadata
+and the vocabulary, `backend_llama.cpp` build area). The stub has no material:
+`/props` says `off`, the endpoint answers **404 `renderer_not_served`** with the
+Responses envelope's type `not_found`.
 
-The body is several MB (pieces + raw tokens + merges); the gateway fetches it
-once per backend and caches by hash. Two loads with the same artifact give the
-same hash; a changed hash is a different backend capability, not a restart.
+The body is several MB (pieces + raw tokens + merges). The build is **lazy and
+once**: the first GET or the first token-mode request builds it under a mutex,
+keeps the JSON, the hash and a pre-serialized string, and the endpoint serves
+that string by reference — `/props` never pays it, a second GET copies nothing.
+A build the canonical hash cannot encode (a raw-byte vocabulary's token text is
+not valid UTF-8) is caught: one warn line, empty material, `token_mode: "off"`,
+and the unit still serves text (`code`, review finding 2). `model` is volatile
+in the hash but the material still carries the served/canonical names; the think
+geometry carries the served tag family and the extended family, the parser its
+`tag_set`, and `chat_template.source` is the real source (`gguf` or
+`chatml-fallback`) (`code`, review finding 4).
 
-`Backend::renderer_material()` default returns `nullopt` (the stub), the llama
-backend fills it at load. This is the only new backend virtual, and it is not
-in the step loop. `code`.
+`Backend::renderer_capable()` / `renderer_material()` / `renderer_hash()` /
+`renderer_material_json()` are the four virtuals (default: not capable); the
+llama backend builds lazily, the stub answers 404. None is in the step loop.
+`code`.
+
+#### W6a review round (engine maintainer, 2026-10-31)
+
+| # | finding | disposition | evidence |
+|---|---|---|---|
+| 1 HIGH | `/props` said `ready` from material presence alone, not from the events | `ready` is the backend's capability (`renderer_capable`); with W6b in, every accepted token-mode turn is the SSE writer, which emits `arcint:token`/`arcint:span`; a non-stream token request is refused in parse (400 `stream`). A test pins `ready` ⇔ a token-mode request yields token events; no path serves `token_mode` without events | `code` |
+| 2 MEDIUM | the constructor build threw on non-UTF-8 token text, aborting the load | the build is lazy (finding 3); the assembler catches the canonical-hash refusal and returns a null material with a reason, the loader writes one warn line and leaves the unit servable with `token_mode: "off"`; a fake material test pins it | `code`, `measured-here` (unit) |
+| 3 MEDIUM | built unconditionally at every load (~35–55 MB resident, a second GGUF parse), copied and dumped per GET | `renderer_capable()` is separate (no build); the lazy build runs once under a mutex on the first GET or the first token-mode request, keeps the JSON, the hash and a pre-serialized string; the endpoint serves the cached string by reference; `/props` reads the capability and the cached hash only. Tests: props builds nothing, two GETs build/serialize once and hand out the same string | `code` |
+| 4 LOW | no extended-think geometry; `source` hard-coded | material carries `special_tokens.think_extended` (the extended family's ids), `parser.tag_set` (`qwen`/`extended`), `encode.model` and the real `chat_template.source` (`gguf` or `chatml-fallback`); the hash moves with them | `code`; llama-only path, card recipe by the maintainer |
+| 5 LOW | error types mixed (`invalid_request_error` on the 404) | the 404 speaks the Responses envelope (`not_found`, `renderer_not_served`), the 409s stay `invalid_request` (`renderer_mismatch`). A continuation's prompt-hash 409 keeps the stored entry: nothing of it was served and a render-fixed retry may reuse the id; only a prepare 4xx evicts — comment in the code and this note | `code` |
+
+The review's lifecycle note is adopted: W6a's red commit carried skeleton source
+files; this round's red commit is test-only.
 
 ### D5 — feyntalk-render (new public repository, Python)
 
@@ -1016,8 +1042,9 @@ path.
 
 **Failure modes**, all loud and one-turn-bounded:
 
-- material hash mismatch / unrecomputeable canonical form → text mode for that
-  backend, one log line with both hashes;
+- material hash mismatch, a unit that is not renderer capable, or a material
+  the engine could not build → text mode for that backend, one log line with
+  both hashes (the endpoint is 404 `renderer_not_served`, type `not_found`);
 - `409 renderer_mismatch` → the gateway marks the backend text-only, logs the
   param, and re-sends the turn in text mode once (a user-visible retry is the
   client's; the proxy's own retry is the same request, not a second model);
@@ -1346,8 +1373,19 @@ unit` 9/9, `arcint-test --max-skips 0` 476 cases 0 failed 0 skipped,
 `feyntalk-golden` 12/12 route captures byte-identical, `roundtrip` green,
 `ctest -L compliance` 7/7 (`measured-here`, stub, aarch64, 2026-10-31). The
 executor compile, the two-load hash and the material size line on a card are
-the engine maintainer's recipe gate: the checked-out llama trees here lack the
-pinned arcint patches, so nothing on the card was run in this package. Token
+the engine maintainer's recipe gate: the first real build is green (recipe
+10/10; stub 477/0/0). **W6a review round (2026-10-31):** all five findings
+closed — capability-based `ready` with the equivalence pinned, a safe lazy build
+(caught canonical-hash refusal, one warn, material empty, token mode off), the
+build once under a mutex with the pre-serialized body served by reference and
+`/props` building nothing, the extended-think geometry and the real template
+source in the material, and consistent error types (`not_found` on the 404;
+the continuation 409 keeps the stored entry). Red first three cases (the
+`ready` equivalence is a guard), then `ctest -L unit` 9/9, `arcint-test
+--max-skips 0` 492 cases 0 failed 0 skipped, golden 12/12 byte-identical,
+roundtrip green, `ctest -L compliance` 7/7 (`measured-here`, stub, aarch64,
+2026-10-31). The llama-side lazy build, tag geometry and two-load hash are the
+maintainer's recipe build. Token
 mode with `truncation: "auto"` stays a 409 (the engine's fit pass hashes the
 dropped render; the gateway's full render differs) until W6c applies the fit —
 open question 9, (a).
