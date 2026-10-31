@@ -1,6 +1,8 @@
 build*/
 *.o
 __pycache__/
+tests/feyntalk/.deps/
+tests/feyntalk/node_modules/
 .cache/
 tools/flash-next-watch.log
 CLAUDE.local.md
