@@ -234,6 +234,9 @@ private:
     void   loop_do_nudge_();
     void   loop_do_slap_();
     void   loop_do_abort_();
+    // W6b: one span event into the request's vector, stamped with emitted_.
+    void span_event_(std::string span, std::string rung, std::string match = {},
+                     bool forced = false, int budget = -1);
     // feyntalk W3.4: the context guard's once-per-turn arm, at (or already past)
     // the budget with the block open.
     void   think_ctx_arm_();

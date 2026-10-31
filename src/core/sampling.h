@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -130,7 +131,7 @@ struct SamplerDefaults {
     int   loop_guard_window    = 200;
     float loop_guard_threshold = 0.8f;
     int   loop_guard_grace     = 40;
-    int   loop_guard_door_grace = 20;   // counted lines before the ladder's nudge
+    int   loop_guard_door_grace = 20;
 
     // llava: the answer row -- the sampler values used for tokens drawn after
     // the think block has closed in a thinking turn. Each field is only the
@@ -183,6 +184,20 @@ struct ThinkBlockIds {
                                           // that opens the block itself
 };
 
+// feyntalk W6b (docs/campaigns/feyntalk.md D3): a span event the sampler
+// produces at its own counter increment. The API drains the per-request vector
+// after an emit and puts it on the SSE writer; `token_index` is `emitted_` at
+// the decision — the index the next accepted token takes. The vector is null
+// outside token mode, so nothing is allocated or pushed there.
+struct SamplerSpanEvent {
+    std::string span;          // "loop_guard" or "context_guard"
+    std::string rung;          // loop_guard: detect/nudge/slap/door/door_lift/abort
+    std::string match;         // loop_guard: the request's match rule
+    bool        forced = false;  // context_guard: a closer token was forced
+    int         budget = -1;     // context_guard: tokens left (0 at the force)
+    int         token_index = -1;
+};
+
 struct SamplerParams {
     float    temperature        = 0.7f;
     float    top_p              = 0.8f;
@@ -231,6 +246,9 @@ struct SamplerParams {
     float loop_guard_threshold = 0.8f;
     int   loop_guard_grace     = 40;
     int   loop_guard_door_grace = 20;
+    // W6b: token mode's span sink. Null (the default) means no event is built;
+    // the same thread fills and drains it, no lock.
+    std::shared_ptr<std::vector<SamplerSpanEvent>> span_events;
     std::vector<int> loop_guard_nudge_ids;   // kLoopGuardNudge, tokenised
     // loop-guard door: the ids whose decoded piece consists only of newline
     // characters, two or more of them (the double, triple ... newline tokens).

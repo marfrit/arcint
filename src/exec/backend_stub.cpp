@@ -93,8 +93,9 @@ class StubBackend final : public Backend {
 public:
     StubBackend(int n_ctx, int delay_ms, const std::string& served_name,
                 const std::vector<int>& lane_ctx, const SamplerDefaults& sampler,
-                int prefill_ubatches)
-        : delay_ms_(delay_ms), prefill_ubatches_(std::max(1, prefill_ubatches)), lane_ctx_(lane_ctx) {
+                int prefill_ubatches, const nlohmann::json& renderer_material)
+        : delay_ms_(delay_ms), prefill_ubatches_(std::max(1, prefill_ubatches)), lane_ctx_(lane_ctx),
+          renderer_material_(renderer_material) {
         status_.id               = kStubId;
         status_.served_id        = served_name.empty() ? std::string(kStubId) : served_name;
         status_.n_ctx_train      = kStubNCtxTrain;
@@ -111,6 +112,31 @@ public:
 
     std::string render_chat(const ChatRequest& req) const override {
         return render_chatml_stub(req);
+    }
+    // W6a's test seam: the stub loads no artifact, so its material is empty by
+    // default (the endpoint answers 404). A fixture that needs to exercise the
+    // token-mode hash checks injects a synthetic bundle here; it is never built
+    // from a vocabulary, and the production stub never has one. The synthetic
+    // bundle is already built, so the capability/hash accessors read it; the
+    // serialized body is cached on the first GET (W6a review finding 3).
+    bool renderer_capable() const override {
+        return renderer_material_.is_object() && renderer_material_.contains("hash") &&
+               renderer_material_["hash"].is_string();
+    }
+    const nlohmann::json& renderer_material() const override { return renderer_material_; }
+    std::string renderer_hash() const override {
+        return renderer_capable() ? renderer_material_["hash"].get<std::string>() : std::string();
+    }
+    const std::string& renderer_material_json() const override {
+        if (!renderer_capable()) {
+            static const std::string kEmpty;
+            return kEmpty;
+        }
+        if (!renderer_json_built_) {
+            renderer_material_json_ = renderer_material_.dump();
+            renderer_json_built_   = true;
+        }
+        return renderer_material_json_;
     }
 
     // The lane index is real here too: the stub has no per-lane state to index
@@ -234,7 +260,10 @@ private:
         const size_t cut = piece.size() / 2;
         const Control first = on_piece(std::string_view(piece).substr(0, cut), id);
         if (first != Control::Continue) return first;
-        return on_piece(std::string_view(piece).substr(cut), id);
+        // The tail of ONE token carries no id, as StopMatcher's held-tail
+        // convention does: a token event is one per token id (W6b), and the
+        // UTF-8 hold-back still gets its split piece.
+        return on_piece(std::string_view(piece).substr(cut), -1);
     }
 
     std::string synthesise(const GenerationInput& in, int prompt_tokens) const {
@@ -263,6 +292,9 @@ private:
     int           delay_ms_ = 0;
     int           prefill_ubatches_ = 1;
     std::vector<int> lane_ctx_;   // --lane-ctx, by slot
+    nlohmann::json renderer_material_;   // W6a test seam; empty in production
+    mutable bool   renderer_json_built_ = false;
+    mutable std::string renderer_material_json_;
     ModelStatus   status_;
     StubTokenizer tokenizer_;
 };
@@ -282,9 +314,10 @@ const char* finish_reason_name(FinishReason r) {
 std::unique_ptr<Backend> make_stub_backend(int n_ctx, int delay_ms, const std::string& served_name,
                                            const std::vector<int>& lane_ctx,
                                            const SamplerDefaults& sampler,
-                                           int prefill_ubatches) {
+                                           int prefill_ubatches,
+                                           const nlohmann::json& renderer_material) {
     return std::make_unique<StubBackend>(n_ctx, delay_ms, served_name, lane_ctx, sampler,
-                                         prefill_ubatches);
+                                         prefill_ubatches, renderer_material);
 }
 
 }  // namespace lgc

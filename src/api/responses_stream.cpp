@@ -288,6 +288,123 @@ private:
         return done_frame();
     }
 
+    // ---------------------------------------------------------- W6b events
+    bool send_span(const char* span, const char* phase, int token_index, json detail) {
+        return send(json{{"type", "arcint:span"}, {"v", 1}, {"span", span},
+                         {"phase", phase}, {"token_index", token_index},
+                         {"detail", std::move(detail)}});
+    }
+
+    // The sampler appends to the turn's vector at its own counter increments
+    // and on this same thread; the writer drains it at the emit that follows,
+    // so the event carries the index the token takes. Nothing is copied or
+    // polled; null outside token mode.
+    bool drain_sampler_spans() {
+        const auto& events = prep_.input.sampler.span_events;
+        if (!events) return true;
+        for (const SamplerSpanEvent& e : *events) {
+            json detail = json::object();
+            if (e.span == "loop_guard") {
+                detail["rung"]  = e.rung;
+                detail["match"] = e.match;
+            } else {
+                detail["forced"] = e.forced;
+                detail["budget"] = e.budget;
+            }
+            if (!send_span(e.span.c_str(), "event", e.token_index, std::move(detail))) return false;
+        }
+        events->clear();
+        return true;
+    }
+
+    bool send_token(int index, int token_id, bool reasoning, const ReasoningStreamer::Step& step) {
+        json b = {{"type", "arcint:token"}, {"v", 1}, {"response_id", prep_.id},
+                  {"token_index", index}, {"token_id", token_id},
+                  {"field", reasoning ? "reasoning" : "text"}};
+        // Item ids only when an item is already open (D2: nullable). The
+        // first reasoning token opens its item in the shadow path below, so its
+        // event carries none.
+        if (reasoning) {
+            if (reasoning_open_) {
+                b["item_id"]       = reasoning_id_;
+                b["output_index"]  = reasoning_index_;
+                b["content_index"] = 0;
+            }
+        } else if (!tool_span_open_ && message_open_) {
+            b["item_id"]       = message_id_;
+            b["output_index"]  = message_index_;
+            b["content_index"] = 0;
+        }
+        (void)step;
+        return send(std::move(b));
+    }
+
+    bool update_spans(std::string_view piece, int token_id, int index, bool was_reasoning,
+                      bool is_reasoning) {
+        // thinking: the template's opener is a start at index 0; a model's own
+        // opener starts at its token; the closer's token ends it.
+        if (prep_.think_open && index == 0 && !thinking_started_) {
+            if (!send_span("thinking", "start", 0, json{{"preopened", true}})) return false;
+            thinking_started_ = true;
+            thinking_span_open_ = true;
+        } else if (!thinking_started_ && is_reasoning) {
+            if (!send_span("thinking", "start", index, json{{"preopened", false}})) return false;
+            thinking_started_ = true;
+            thinking_span_open_ = true;
+        }
+        if (thinking_span_open_ && was_reasoning && !reasoning_.in_reasoning()) {
+            if (!send_span("thinking", "end", index, json{{"closed", true}})) return false;
+            thinking_span_open_ = false;
+        }
+        if (!prep_.parse_tool_calls || is_reasoning) return true;
+        // tool calls: the opener's id, or the token whose piece completed the
+        // opener text (the text-form fallback); the closer likewise. The
+        // gateway parses inside the span, never hunting markers.
+        auto in_ids = [&](const std::vector<int>& ids) {
+            return token_id >= 0 && std::find(ids.begin(), ids.end(), token_id) != ids.end();
+        };
+        auto scan = [&](const std::string& marker) {
+            tool_scan_ += std::string(piece);
+            const size_t keep = marker.size() + 8;
+            if (tool_scan_.size() > keep) tool_scan_.erase(0, tool_scan_.size() - keep);
+            return tool_scan_.find(marker) != std::string::npos;
+        };
+        if (!tool_span_open_) {
+            if (in_ids(tool_open_ids_) || scan(tool_open_text_)) {
+                if (!send_span("tool_call", "start", index,
+                               json{{"call_index", tool_call_index_}}))
+                    return false;
+                tool_span_open_ = true;
+                tool_scan_.clear();
+            }
+        } else if (in_ids(tool_close_ids_) || scan(tool_close_text_)) {
+            if (!send_span("tool_call", "end", index, json{{"call_index", tool_call_index_}}))
+                return false;
+            tool_span_open_ = false;
+            ++tool_call_index_;
+            tool_scan_.clear();
+        }
+        return true;
+    }
+
+    // Turn end: a block that never closed ends `closed:false`; an unterminated
+    // call ends `truncated:true`. Any sampler event that fired at the last
+    // boundary is drained first, so nothing is left in the vector.
+    bool close_spans() {
+        if (!token_mode_) return true;
+        if (!drain_sampler_spans()) return false;
+        const int at = last_token_index_ < 0 ? 0 : last_token_index_;
+        if (thinking_span_open_) {
+            if (!send_span("thinking", "end", at, json{{"closed", false}})) return false;
+            thinking_span_open_ = false;
+        }
+        if (tool_span_open_) {
+            if (!send_span("tool_call", "end", at, json{{"truncated", true}})) return false;
+            tool_span_open_ = false;
+        }
+        return true;
+    }
+
     bool terminal(const GenerationStats& stats, FinishReason reason) {
         const bool completed = reason == FinishReason::Stop;
         const char* item_status_now = completed ? "completed" : "incomplete";
@@ -392,6 +509,22 @@ private:
     std::string    content_;       // the answer part so far (tool-call scan)
     std::string    message_text_;  // bytes emitted as output_text
     size_t         streamed_ = 0;  // bytes of the answer already sent
+
+    // feyntalk W6b (docs/campaigns/feyntalk.md D2/D3): token mode's event
+    // state. Inert when token_mode_ is false: no event is built, no span is
+    // tracked, and the shadow path below is byte-identical.
+    bool token_mode_ = false;
+    int  token_index_ = 0;        // 0-based accepted output stream
+    int  last_token_index_ = -1;
+    bool thinking_span_open_ = false;
+    bool thinking_started_ = false;
+    bool tool_span_open_ = false;
+    int  tool_call_index_ = 0;
+    std::string tool_scan_;       // content tail, text-form markers only
+    std::vector<int> tool_open_ids_;
+    std::vector<int> tool_close_ids_;
+    std::string tool_open_text_;
+    std::string tool_close_text_;
 };
 
 bool Stream::run(const Context& ctx, int slot) {
@@ -407,6 +540,16 @@ bool Stream::run(const Context& ctx, int slot) {
     // The chat route's streamer, over the same (piece, id) sequence.
     reasoning_ = ReasoningStreamer(prep_.think_open, prep_.think_tags_extended,
                                    prep_.think_ids.open_close_ids);
+    // W6b: token mode's spans read the same ids the streamer and the parser
+    // use; the off path leaves every field false/empty.
+    token_mode_ = req_.token_mode;
+    if (token_mode_ && prep_.parse_tool_calls) {
+        const ToolCallTags& tags = tool_call_tags();
+        tool_open_text_ = std::string(tags.open);
+        tool_close_text_ = std::string(tags.close);
+        tool_open_ids_ = ctx.backend->tokenizer().special_ids(tags.open);
+        tool_close_ids_ = ctx.backend->tokenizer().special_ids(tags.close);
+    }
     const bool by_ids = std::any_of(prep_.think_ids.open_close_ids.begin(),
                                     prep_.think_ids.open_close_ids.end(),
                                     [](const std::pair<int, int>& p) {
@@ -421,7 +564,33 @@ bool Stream::run(const Context& ctx, int slot) {
     try {
         reason = drive(*ctx.backend, prep_.input, slot,
                        [&](std::string_view piece, int token_id, const std::string&) -> bool {
+                           const bool was_reasoning   = reasoning_.in_reasoning();
+                           const bool opener_field    = reasoning_.field_for(token_id) ==
+                                                        TokenField::Reasoning;
                            const ReasoningStreamer::Step step = reasoning_.push(piece, token_id);
+                           // D2: the token's side. The id/state says it, the
+                           // streamer's own step catches a text-spelled opener;
+                           // the closer is reasoning by `was_reasoning`.
+                           const bool is_reasoning = opener_field || !step.reasoning.empty() ||
+                                                     (!was_reasoning && reasoning_.in_reasoning());
+                           if (token_mode_) {
+                               // Sampler events belong to the token this emit
+                               // produced: the decision preceded it.
+                               if (!drain_sampler_spans()) return false;
+                               // One event per token: the callback that carries
+                               // the token id. A held or split tail carries -1
+                               // (the stop matcher and the stub's UTF-8 split),
+                               // and is part of the token already announced.
+                               if (token_id >= 0) {
+                                   const int index = token_index_;
+                                   if (!update_spans(piece, token_id, index, was_reasoning,
+                                                     is_reasoning))
+                                       return false;
+                                   if (!send_token(index, token_id, is_reasoning, step)) return false;
+                                   last_token_index_ = index;
+                                   ++token_index_;
+                               }
+                           }
                            // R7: one reasoning token per accepted output token
                            // whose piece produced reasoning text; only the
                            // id-based split can say that exactly.
@@ -481,7 +650,10 @@ bool Stream::run(const Context& ctx, int slot) {
         // failed, or the probe saw the close). StopSignal: the process is
         // stopping; delivery is best-effort.
         if (stats.abort_cause == AbortCause::ClientGone) return false;
-        if (stats.abort_cause == AbortCause::Cancelled) return terminal(stats, reason);
+        if (stats.abort_cause == AbortCause::Cancelled) {
+            if (!close_spans()) return false;
+            return terminal(stats, reason);
+        }
         return failed("failed", "the server is stopping; the request was cancelled at its last "
                                 "token or batch boundary", "server_stopping",
                      /*error_event=*/false);
@@ -516,6 +688,7 @@ bool Stream::run(const Context& ctx, int slot) {
         reason == FinishReason::Stop ? "completed" : "incomplete";
     if (!close_message(item_status_now)) return false;
     if (!emit_calls(calls, item_status_now)) return false;
+    if (!close_spans()) return false;
 
     return terminal(stats, reason);
 }

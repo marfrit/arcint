@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -391,6 +392,16 @@ std::optional<HttpResult> read_reasoning(const json& v, ResponseRequest& req) {
     return std::nullopt;
 }
 
+// A hash is "sha256:" and 64 lowercase hex digits — the form the material
+// endpoint publishes and the request must echo. Nothing else is accepted; a
+// short or upper-case hash would compare unequal for the wrong reason.
+bool is_sha256_hash(std::string_view s) {
+    if (s.size() != 71 || s.substr(0, 7) != "sha256:") return false;
+    for (char c : s.substr(7))
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    return true;
+}
+
 std::optional<HttpResult> read_arcint(const json& v, ResponseRequest& req) {
     if (!v.is_object()) return invalid("arcint must be an object", "arcint");
     if (!v.contains("v")) return invalid("arcint.v is required when the arcint object is sent",
@@ -403,12 +414,81 @@ std::optional<HttpResult> read_arcint(const json& v, ResponseRequest& req) {
                            "arcint.v");
     }
     req.arcint_v = 1;
+    bool has_renderer_hash = false;
+    bool has_render        = false;
     for (auto it = v.begin(); it != v.end(); ++it) {
         if (it.key() == "v") continue;
-        // Everything beyond the version belongs to a later package (token mode,
-        // spans, ...); accepting and dropping it would be a silent lie.
+        if (it.key() == "token_mode") {
+            if (!it.value().is_boolean())
+                return invalid("arcint.token_mode must be a boolean", "arcint.token_mode");
+            req.token_mode = it.value().get<bool>();
+            continue;
+        }
+        if (it.key() == "renderer_hash") {
+            if (!it.value().is_string())
+                return invalid("arcint.renderer_hash must be a string", "arcint.renderer_hash");
+            const std::string h = it.value().get<std::string>();
+            if (!is_sha256_hash(h))
+                return invalid("arcint.renderer_hash must be 'sha256:' and 64 lowercase hex digits",
+                               "arcint.renderer_hash");
+            req.renderer_hash = h;
+            has_renderer_hash = true;
+            continue;
+        }
+        if (it.key() == "render") {
+            if (!it.value().is_object()) return invalid("arcint.render must be an object",
+                                                        "arcint.render");
+            const json& r = it.value();
+            for (auto rt = r.begin(); rt != r.end(); ++rt) {
+                if (rt.key() != "prompt_sha256")
+                    return unsupported("arcint.render." + rt.key() + " is not served in this build",
+                                       "arcint.render." + rt.key());
+                if (!rt.value().is_string())
+                    return invalid("arcint.render.prompt_sha256 must be a string",
+                                   "arcint.render.prompt_sha256");
+                const std::string h = rt.value().get<std::string>();
+                if (!is_sha256_hash(h))
+                    return invalid("arcint.render.prompt_sha256 must be 'sha256:' and 64 lowercase "
+                                   "hex digits", "arcint.render.prompt_sha256");
+                req.render_prompt_sha256 = h;
+            }
+            has_render = req.render_prompt_sha256.empty() ? false : true;
+            if (!has_render)
+                return invalid("arcint.render.prompt_sha256 is required when arcint.render is sent",
+                               "arcint.render.prompt_sha256");
+            continue;
+        }
+        if (it.key() == "input_ids") {
+            // D1: the renderer-owned prompt path. The field is part of the
+            // schema, so it is not "not a field"; it is refused by its own name
+            // until W6f, when the renderer's encoder has passed its corpus.
+            if (!it.value().is_array())
+                return invalid("arcint.input_ids must be an array of token ids", "arcint.input_ids");
+            for (const json& id : it.value())
+                if (!id.is_number_integer() || id.get<int64_t>() < 0)
+                    return invalid("arcint.input_ids must hold non-negative integer token ids",
+                                   "arcint.input_ids");
+            return unsupported("arcint.input_ids is accepted by the schema but not served in this "
+                               "build: the engine renders the prompt and checks its hash (W6f adds "
+                               "the renderer-owned ids)", "arcint.input_ids");
+        }
+        // Everything beyond the version and the W6a fields belongs to a later
+        // package (spans, ...); accepting and dropping it would be a silent lie.
         return unsupported("arcint." + it.key() + " is not served in this build",
                            "arcint." + it.key());
+    }
+    if (req.token_mode) {
+        if (!has_renderer_hash)
+            return invalid("arcint.renderer_hash is required with arcint.token_mode: true",
+                           "arcint.renderer_hash");
+        if (!has_render)
+            return invalid("arcint.render.prompt_sha256 is required with arcint.token_mode: true",
+                           "arcint.render.prompt_sha256");
+    } else if (has_renderer_hash || has_render) {
+        // A hash without the mode names no turn to check: refuse rather than
+        // store a value nothing reads.
+        return invalid("arcint.renderer_hash and arcint.render need arcint.token_mode: true",
+                       "arcint.token_mode");
     }
     return std::nullopt;
 }
@@ -633,6 +713,18 @@ std::optional<HttpResult> parse_response_request(const json& body, ResponseReque
     if (body.contains("arcint")) {
         if (auto err = read_arcint(body["arcint"], req)) return err;
     }
+    if (req.token_mode) {
+        // Token mode is stream-only: its events ride the SSE writer.
+        if (!req.chat.stream)
+            return unsupported("token mode requires stream: true (arcint:token rides the SSE "
+                               "writer)", "stream");
+        // Text-only: the gateway renders a text prompt, and an image would
+        // leave the prompt the engine verifies.
+        for (const ChatMessage& m : req.chat.messages)
+            if (!m.images.empty())
+                return unsupported("token mode is text-only: an image part is not served with "
+                                   "token mode", "arcint.token_mode");
+    }
 
     out = std::move(req);
     return std::nullopt;
@@ -676,6 +768,14 @@ HttpResult translate_prepare_error(const HttpResult& err) {
         return HttpResult{400, std::move(body)};
     }
     return err;
+}
+
+// W6a D1: a token-mode turn's hashes are checked before the slot is taken, so a
+// stale gateway cannot drive a prompt the engine would render differently. Both
+// refusals are 409 `renderer_mismatch`; the param names which side differed.
+HttpResult renderer_conflict(std::string message, std::string param) {
+    return HttpResult{409, responses_error(std::move(message), "invalid_request",
+                                           "renderer_mismatch", std::move(param))};
 }
 
 HttpResult previous_not_found(const std::string& id, const std::string& why) {
@@ -729,6 +829,30 @@ std::vector<ChatMessage> assistant_turns_of(const nlohmann::json& output_items) 
 
 std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest req,
                                            PreparedResponse& out) {
+    // Token mode: the material first, before any render and before any
+    // continuation lookup. A unit without material cannot serve token mode.
+    if (req.token_mode) {
+        // W6a review findings 1/3: the capability first (no build), then the
+        // material, which builds once on first use. A build that failed leaves
+        // the unit servable with token mode off, and is a 409 here.
+        if (!ctx.backend->renderer_capable()) {
+            return renderer_conflict("token mode is not served here: this unit is not renderer "
+                                     "capable (GET /props says token_mode: \"off\")",
+                                     "arcint.token_mode");
+        }
+        const nlohmann::json& material = ctx.backend->renderer_material();
+        if (!material.is_object() || !material.contains("hash") ||
+            !material["hash"].is_string()) {
+            return renderer_conflict("token mode is not served here: this unit's renderer "
+                                     "material could not be built (the load log has the reason)",
+                                     "arcint.token_mode");
+        }
+        if (material["hash"].get<std::string>() != req.renderer_hash) {
+            return renderer_conflict("arcint.renderer_hash does not name the material this unit "
+                                     "serves; the gateway must refresh its renderer material",
+                                     "arcint.renderer_hash");
+        }
+    }
     const std::string prev_id =
         req.has_previous_response_id ? req.previous_response_id : std::string();
     std::shared_ptr<StoredResponse> stored;
@@ -815,6 +939,26 @@ std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest r
         // referenced entry so a retry cannot silently continue from it.
         evict_continuation(ctx, prev_id);
         return translate_prepare_error(*err);
+    }
+    if (req.token_mode) {
+        // W6b: the sampler's span sink, one vector per token-mode turn. The
+        // sampler appends at its own counter increments; the SSE writer drains
+        // it right after the emit that follows. Null outside token mode, so the
+        // off path allocates nothing.
+        prep.chat.input.sampler.span_events = std::make_shared<std::vector<SamplerSpanEvent>>();
+        // The engine renders the prompt it serves; the gateway's render hash is
+        // over that same full history. A mismatch is a 409 before the slot, not
+        // a cache miss later: the prompt is never echoed, only the hash.
+        const std::string served = "sha256:" + sha256_hex(prep.chat.input.prompt);
+        if (served != req.render_prompt_sha256) {
+            // A continuation's stored entry is NOT evicted here: nothing of it
+            // was served, no token left the engine, and the client can retry the
+            // same previous_response_id once its render is fixed. Only a
+            // prepare 4xx (the stored prefix itself is broken) evicts.
+            return renderer_conflict("arcint.render.prompt_sha256 does not match the prompt this "
+                                     "unit renders for the turn; the gateway's render and the "
+                                     "engine's differ", "arcint.render.prompt_sha256");
+        }
     }
     // One line for the quiet path too: a truncated turn's numbers, so an
     // operator reading the log knows what was served and what was dropped.

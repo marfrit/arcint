@@ -76,9 +76,12 @@ target_link_libraries(arcint_peg PUBLIC arcint_vendor)
 add_library(arcint_core STATIC
   src/config.cpp
   src/util/log.cpp
+  src/util/canonical_json.cpp
+  src/util/sha256.cpp
   src/util/utf8.cpp
   src/util/text.cpp
   src/core/reasoning.cpp
+  src/core/renderer_material.cpp
   src/core/sampler.cpp
   src/core/sampling.cpp
   src/core/stop.cpp
@@ -89,6 +92,7 @@ add_library(arcint_core STATIC
   src/api/error.cpp
   src/api/handlers.cpp
   src/api/generate.cpp
+  src/api/renderer.cpp
   src/api/responses.cpp
   src/api/responses_stream.cpp
   src/api/responses_state.cpp

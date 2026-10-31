@@ -5,6 +5,7 @@
 // llama.cpp keeps the weights, the tokenizer, the attention KV and the
 // recurrent (gated delta-net) state, one sequence per lane.
 #include "exec/backend.h"
+#include "core/renderer_material.h"
 #include "exec/mtp_trace.h"   // the MTP window trace (off by default, ARCINT_MTP_TRACE)
 #include "exec/slot_loan.h"
 #include "core/markers.h"
@@ -60,6 +61,96 @@ namespace lgc {
 namespace {
 
 using json = nlohmann::json;
+
+// feyntalk W6a: the material carries every token's piece as base64, so the
+// gateway detokenises without SPM/BPE marker logic. A standard-alphabet
+// encoder, no dependency.
+std::string base64_encode(std::string_view bytes) {
+    static const char* alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((bytes.size() + 2) / 3 * 4);
+    size_t i = 0;
+    for (; i + 3 <= bytes.size(); i += 3) {
+        const unsigned b0 = static_cast<unsigned char>(bytes[i]);
+        const unsigned b1 = static_cast<unsigned char>(bytes[i + 1]);
+        const unsigned b2 = static_cast<unsigned char>(bytes[i + 2]);
+        out.push_back(alpha[b0 >> 2]);
+        out.push_back(alpha[((b0 & 0x3) << 4) | (b1 >> 4)]);
+        out.push_back(alpha[((b1 & 0xf) << 2) | (b2 >> 6)]);
+        out.push_back(alpha[b2 & 0x3f]);
+    }
+    const size_t rest = bytes.size() - i;
+    if (rest == 1) {
+        const unsigned b0 = static_cast<unsigned char>(bytes[i]);
+        out.push_back(alpha[b0 >> 2]);
+        out.push_back(alpha[(b0 & 0x3) << 4]);
+        out += "==";
+    } else if (rest == 2) {
+        const unsigned b0 = static_cast<unsigned char>(bytes[i]);
+        const unsigned b1 = static_cast<unsigned char>(bytes[i + 1]);
+        out.push_back(alpha[b0 >> 2]);
+        out.push_back(alpha[((b0 & 0x3) << 4) | (b1 >> 4)]);
+        out.push_back(alpha[(b1 & 0xf) << 2]);
+        out.push_back('=');
+    }
+    return out;
+}
+
+// The encoder half of the material (D4): the GGUF's raw token strings, the
+// merges, the token types and the pre-tokeniser rule. W6f's Python encoder
+// needs all four; nothing in W6a reads them. A key the artifact lacks stays an
+// empty array — SPM vocabularies carry no merges — and the load does not fail
+// on it.
+json read_encode_material(const std::string& gguf_path, const llama_vocab* vocab) {
+    json enc = {{"tokens", json::array()}, {"merges", json::array()},
+                {"token_types", json::array()}, {"pre", ""},
+                {"add_bos", llama_vocab_get_add_bos(vocab)}, {"special_text", json::object()}};
+    switch (llama_vocab_type(vocab)) {
+        case LLAMA_VOCAB_TYPE_BPE:    enc["model"] = "bpe";    break;
+        case LLAMA_VOCAB_TYPE_SPM:    enc["model"] = "spm";    break;
+        case LLAMA_VOCAB_TYPE_WPM:    enc["model"] = "wpm";    break;
+        case LLAMA_VOCAB_TYPE_UGM:    enc["model"] = "ugm";    break;
+        case LLAMA_VOCAB_TYPE_RWKV:   enc["model"] = "rwkv";   break;
+        case LLAMA_VOCAB_TYPE_PLAMO2: enc["model"] = "plamo2"; break;
+        case LLAMA_VOCAB_TYPE_PLAMO3: enc["model"] = "plamo3"; break;
+        default:                      enc["model"] = "none";   break;
+    }
+    gguf_context* g = gguf_init_from_file(gguf_path.c_str(), gguf_init_params{/*no_alloc=*/true, nullptr});
+    if (g == nullptr) return enc;   // the model loaded, so this is a read-only miss
+    auto read_strs = [&](const char* key, json& out) {
+        const int64_t k = gguf_find_key(g, key);
+        if (k < 0 || gguf_get_kv_type(g, k) != GGUF_TYPE_ARRAY ||
+            gguf_get_arr_type(g, k) != GGUF_TYPE_STRING) return;
+        const size_t n = gguf_get_arr_n(g, k);
+        for (size_t i = 0; i < n; ++i) out.push_back(gguf_get_arr_str(g, k, i));
+    };
+    read_strs("tokenizer.ggml.tokens", enc["tokens"]);
+    read_strs("tokenizer.ggml.merges", enc["merges"]);
+    {
+        const int64_t k = gguf_find_key(g, "tokenizer.ggml.token_type");
+        if (k >= 0 && gguf_get_kv_type(g, k) == GGUF_TYPE_ARRAY &&
+            gguf_get_arr_type(g, k) == GGUF_TYPE_INT32) {
+            const size_t n = gguf_get_arr_n(g, k);
+            const int32_t* d = static_cast<const int32_t*>(gguf_get_arr_data(g, k));
+            for (size_t i = 0; i < n; ++i) enc["token_types"].push_back(d[i]);
+        }
+    }
+    {
+        const int64_t k = gguf_find_key(g, "tokenizer.ggml.pre");
+        if (k >= 0 && gguf_get_kv_type(g, k) == GGUF_TYPE_STRING)
+            enc["pre"] = gguf_get_val_str(g, k);
+    }
+    gguf_free(g);
+    // The special tokens' literal text, for a tokenizer that has to turn the
+    // template's plain-text markers back into ids on the encode side.
+    for (llama_token id = 0; id < llama_vocab_n_tokens(vocab); ++id) {
+        const enum llama_token_attr attr = llama_vocab_get_attr(vocab, id);
+        if ((attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) == 0) continue;
+        const char* text = llama_vocab_get_text(vocab, id);
+        if (text != nullptr && *text != '\0') enc["special_text"][text] = id;
+    }
+    return enc;
+}
 
 #ifdef ARCINT_MTMD
 // A standard-alphabet base64 decoder for the data: URIs the image parts carry.
@@ -816,6 +907,7 @@ public:
         ckpts_.resize(static_cast<size_t>(lanes_));
 
         const char* tmpl = llama_model_chat_template(model_, nullptr);
+        template_source_ = "gguf";
         if (tmpl == nullptr) {
             // --tts: the audio-generation backbone (Qwen3-TTS) ships no chat
             // template; its prompt is built by libmtmd's gen pipeline (text +
@@ -833,6 +925,7 @@ public:
                 "\n{% endfor %}{% if add_generation_prompt %}" + std::string(markers::kTurnStart) +
                 "assistant\n{% endif %}";
             tmpl = chatml_fallback.c_str();
+            template_source_ = "chatml-fallback";
         }
         template_src_ = tmpl;
         const char* bos = llama_vocab_get_text(vocab_, llama_vocab_bos(vocab_));
@@ -983,6 +1076,11 @@ public:
                 log::warn("load", "tts: no enabled voice in %s: /v1/audio/speech refuses every voice until one "
                                   "is enrolled (tools/tts_enrol.py)", cfg.tts_profiles.c_str());
         }
+        // feyntalk W6a review finding 3: the material is NOT built here. The
+        // load keeps the artifact path; the first GET or the first token-mode
+        // request builds it once (thread-safe) and caches the serialized body.
+        // /props reports the capability alone, so it never pays the build.
+        gguf_path_ = cfg.gguf_path;
         std::string lane_desc = log::format("%d lane%s x %d ctx", lanes_, lanes_ == 1 ? "" : "s", n_ctx_);
         if (named_) {
             lane_desc = log::format("%d named lanes,", lanes_);
@@ -1010,6 +1108,93 @@ public:
                       cfg.llama_layer_split - 1, cards[0].name.c_str(), cfg.llama_layer_split, n_layer_gguf - 1,
                       cards[1].name.c_str(), static_cast<double>(tensor_split_[0]), static_cast<double>(tensor_split_[1]),
                       mtp_model_ != nullptr ? log::format("; the MTP model on %s", cards[static_cast<size_t>(std::max(0, cfg.llama_mtp_card))].name.c_str()).c_str() : "");
+    }
+
+    // W6a review findings 2/3: everything the gateway needs to render,
+    // detokenise and parse, built LAZILY on the first GET or token-mode request
+    // (once, under material_mu_; /props never pays it). The pieces are exactly
+    // decode_one(id), so the gateway's text is the shadow's by construction;
+    // the encoder tables wait for W6f. A material the canonical hash cannot
+    // encode (a raw-byte vocabulary's token text is not valid UTF-8) leaves the
+    // unit servable: one warn line, empty material, token mode off.
+    void build_if_needed_locked() const {
+        if (material_built_) return;
+        material_built_ = true;
+        try {
+            RendererMaterialParts parts;
+            parts.model = {{"served_id", status_.served_id}, {"canonical_id", status_.id},
+                           {"quant", status_.quant}, {"arch", status_.arch}};
+            json pieces = json::array();
+            const int n = static_cast<int>(llama_vocab_n_tokens(vocab_));
+            for (int id = 0; id < n; ++id)
+                pieces.push_back(base64_encode(tokenizer_->decode_one(id)));
+            json eog = json::array();
+            for (int id : eog_ids_) eog.push_back(id);
+            parts.decode = {{"pieces_b64", std::move(pieces)},
+                            {"eos", static_cast<int>(llama_vocab_eos(vocab_))},
+                            {"eog_ids", std::move(eog)}};
+            parts.encode        = read_encode_material(gguf_path_, vocab_);
+            parts.chat_template = {{"text", template_src_}, {"source", template_source_}};
+            // The think geometry: the served tag family's ids, and the extended
+            // family's ids when this artifact answers to it (review finding 4).
+            auto think_json = [&](const ThinkBlockIds& ids) {
+                json out = json::array();
+                for (const auto& pair : ids.open_close_ids) {
+                    json open_ids = json::array(), close_ids = json::array();
+                    if (pair.first >= 0) open_ids.push_back(pair.first);
+                    if (pair.second >= 0) close_ids.push_back(pair.second);
+                    out.push_back({{"open_ids", std::move(open_ids)},
+                                   {"close_ids", std::move(close_ids)}});
+                }
+                return out;
+            };
+            const json think          = think_json(think_ids_qwen_);
+            const json think_extended = think_json(think_ids_ext_);
+            const bool think_ids = std::any_of(think_ids_qwen_.open_close_ids.begin(),
+                                               think_ids_qwen_.open_close_ids.end(),
+                                               [](const std::pair<int, int>& p) {
+                                                   return p.first >= 0 || p.second >= 0;
+                                               });
+            const ToolCallTags& tags = tool_call_tags();
+            auto ids_of = [&](std::string_view tag) {
+                json ids = json::array();
+                for (int id : tokenizer_->special_ids(tag)) ids.push_back(id);
+                return ids;
+            };
+            parts.special_tokens = {{"think", think},
+                                    {"think_extended", think_extended},
+                                    {"tool_call", {{"open_ids", ids_of(tags.open)},
+                                                   {"close_ids", ids_of(tags.close)},
+                                                   {"open_text", std::string(tags.open)},
+                                                   {"close_text", std::string(tags.close)},
+                                                   {"fn_open", std::string(tags.fn_open)},
+                                                   {"fn_close", std::string(tags.fn_close)},
+                                                   {"param_open", std::string(tags.param_open)},
+                                                   {"param_end", std::string(tags.param_end)}}}};
+            parts.parser = {{"reasoning", think_ids ? "ids/1" : "tags/1"},
+                            {"tag_set", status_.think_tags_extended ? "extended" : "qwen"},
+                            {"tool_calls", "qwen3-coder/1"}};
+            std::string why;
+            json material = assemble_renderer_material(parts, &why);
+            if (material.is_null()) {
+                material_failed_.store(true, std::memory_order_relaxed);
+                log::warn("load", "renderer material: not built (%s); token mode is off on this unit",
+                          why.c_str());
+                return;
+            }
+            renderer_material_ = std::move(material);
+            log::info("load", "renderer material: %s (%d pieces, %zu raw tokens, %zu merges, %zu template bytes)",
+                      renderer_material_["hash"].get<std::string>().c_str(), n,
+                      parts.encode["tokens"].size(), parts.encode["merges"].size(),
+                      template_src_.size());
+        } catch (const std::exception& e) {
+            material_failed_.store(true, std::memory_order_relaxed);
+            log::warn("load", "renderer material: not built (%s); token mode is off on this unit",
+                      e.what());
+        } catch (...) {
+            material_failed_.store(true, std::memory_order_relaxed);
+            log::warn("load", "renderer material: not built (unknown error); token mode is off on this unit");
+        }
     }
 
     ~LlamaBackend() override {
@@ -1047,6 +1232,34 @@ public:
     // decide the block's roles by them.
     ThinkBlockIds think_block_ids(bool extended_tags) const override {
         return extended_tags ? think_ids_ext_ : think_ids_qwen_;
+    }
+
+    // feyntalk W6a review findings 2/3: capability without a build (read by
+    // /props), the lazy material (the request's hash check), the cached hash
+    // (no build) and the cached serialized body (the endpoint).
+    bool renderer_capable() const override {
+        return !status_.tts && !material_failed_.load(std::memory_order_relaxed);
+    }
+    const nlohmann::json& renderer_material() const override {
+        std::lock_guard<std::mutex> lk(material_mu_);
+        build_if_needed_locked();
+        return renderer_material_;
+    }
+    std::string renderer_hash() const override {
+        std::lock_guard<std::mutex> lk(material_mu_);
+        if (!material_built_ || material_failed_.load(std::memory_order_relaxed) ||
+            !renderer_material_.is_object())
+            return {};
+        return renderer_material_.value("hash", std::string());
+    }
+    const std::string& renderer_material_json() const override {
+        static const std::string kEmpty;
+        std::lock_guard<std::mutex> lk(material_mu_);
+        build_if_needed_locked();
+        if (material_failed_.load(std::memory_order_relaxed) || !renderer_material_.is_object())
+            return kEmpty;
+        if (renderer_material_json_.empty()) renderer_material_json_ = renderer_material_.dump();
+        return renderer_material_json_;
     }
 
     json template_caps() const override {
@@ -2494,6 +2707,15 @@ private:
     bool mistral_small_24b_ = false;   // the admitted llama geometry (think tags, BOS)
     std::unique_ptr<minja::chat_template> template_;
     std::string                           template_src_;
+    // W6a review finding 3: the material's lazy build and caches. Never on the
+    // generation path; the mutex covers the one build.
+    mutable std::mutex                    material_mu_;
+    mutable bool                          material_built_ = false;
+    mutable std::atomic<bool>             material_failed_{false};
+    mutable nlohmann::json                renderer_material_;
+    mutable std::string                   renderer_material_json_;
+    std::string                           gguf_path_;          // for the lazy GGUF metadata parse
+    std::string                           template_source_;    // "gguf" or "chatml-fallback"
     ModelStatus                           status_;
     size_t                                n_vocab_ = 0;
     // loop-guard door ids, scanned once at load from the vocabulary pieces

@@ -1,7 +1,11 @@
 #include "api/error.h"
+#include "api/renderer.h"
 #include "api/responses.h"
 #include "api/responses_state.h"
 #include "api/responses_stream.h"
+
+#include "core/renderer_material.h"
+#include "util/canonical_json.h"
 
 #include <atomic>
 #include <chrono>
@@ -40,8 +44,10 @@ struct Fixture {
     SlotPool                slots{1};
     Context                 ctx;
 
-    explicit Fixture(int n_ctx = 4096) {
-        backend = make_stub_backend(n_ctx, 0, {}, {}, {}, 1);
+    json                 renderer_material_owned;   // W6a: a synthetic bundle for the hash cases
+    explicit Fixture(int n_ctx = 4096, const json& renderer_material = {})
+        : renderer_material_owned(renderer_material) {
+        backend = make_stub_backend(n_ctx, 0, {}, {}, {}, 1, renderer_material_owned);
         cfg.stub = true;
         ctx.cfg  = &cfg;
         ctx.backend = backend.get();
@@ -268,8 +274,8 @@ TEST(responses_refuses_the_unbuilt_request_fields) {
     }
     {
         json body = base();
-        body["arcint"] = {{"v", 1}, {"token_mode", true}};
-        check_refusal(body, "unsupported_parameter", "arcint.token_mode", "arcint beyond v");
+        body["arcint"] = {{"v", 1}, {"spans", true}};
+        check_refusal(body, "unsupported_parameter", "arcint.spans", "arcint beyond v");
     }
     {
         json body = base();
@@ -2303,4 +2309,696 @@ TEST(responses_truncation_auto_continuation_keeps_the_full_store) {
     PreparedResponse prep2;
     const auto       err = api::prepare_response(fx.ctx, std::move(next), prep2);
     CHECK(!err.has_value());
+}
+
+// ------------------------------------------------- feyntalk W6a (token mode)
+//
+// The request protocol and the renderer material (docs/campaigns/feyntalk.md,
+// "Token mode, revised", D1/D4): token mode's three fields, the hashes checked
+// before the slot, `input_ids` accepted by the schema but refused until W6f,
+// the material bundle and its canonical hash, and the stub's 404. The red run
+// was against a skeleton that refused token mode and returned a placeholder
+// material; the cases below failed, then the protocol made them pass.
+namespace {
+
+const std::string kHashA = "sha256:" + std::string(64, 'a');
+const std::string kHashB = "sha256:" + std::string(64, 'b');
+
+// A complete token-mode request: the two hashes and a stream.
+json token_body(const std::string& renderer_hash, const std::string& prompt_hash,
+                bool stream = true) {
+    json b = base();
+    b["stream"] = stream;
+    b["arcint"] = {{"v", 1},
+                   {"token_mode", true},
+                   {"renderer_hash", renderer_hash},
+                   {"render", {{"prompt_sha256", prompt_hash}}}};
+    return b;
+}
+
+// What a unit with a material serves: the model names are volatile; the five
+// hashable parts are the backend's, and the stub's fixture only needs a hash.
+json synthetic_material(const std::string& hash = kHashA) {
+    return json{{"schema", "feyntalk-render/1"},
+                {"hash", hash},
+                {"model", {{"served_id", "stub"}, {"canonical_id", "stub"},
+                           {"quant", "none"}, {"arch", "stub"}}},
+                {"decode", {{"pieces_b64", json::array()}, {"eos", 0},
+                            {"eog_ids", json::array({0})}}},
+                {"encode", {{"tokens", json::array()}, {"merges", json::array()},
+                            {"token_types", json::array()}, {"model", "stub"},
+                            {"pre", ""}, {"add_bos", false},
+                            {"special_text", json::object()}}},
+                {"chat_template", {{"text", ""}, {"source", "gguf"}}},
+                {"special_tokens", {{"think", json::array()},
+                                    {"tool_call", {{"open_ids", json::array()},
+                                                   {"close_ids", json::array()}}}}},
+                {"parser", {{"reasoning", "tags/1"}, {"tool_calls", "qwen3-coder/1"}}}};
+}
+
+}  // namespace
+
+TEST(responses_token_mode_request_maps_its_three_fields) {
+    // The arcint object no longer refuses token_mode; the parsed request carries
+    // the flag and both hashes for the pre-slot check.
+    ResponseRequest out;
+    const json     b = token_body(kHashA, kHashB);
+    auto           err = api::parse_response_request(b, out);
+    CHECK(!err.has_value());
+    if (err.has_value()) return;
+    CHECK(out.token_mode);
+    CHECK_EQ(out.renderer_hash, kHashA);
+    CHECK_EQ(out.render_prompt_sha256, kHashB);
+    CHECK(out.chat.stream);
+}
+
+TEST(responses_token_mode_input_ids_is_accepted_then_refused) {
+    // D1: the field is part of the schema (no "not a field" refusal), but the
+    // served path refuses it until W6f — a clear sentence, not a dropped field.
+    json b = token_body(kHashA, kHashB);
+    b["arcint"]["input_ids"] = json::array({1, 2, 3});
+    check_refusal(b, "unsupported_parameter", "arcint.input_ids", "input_ids before W6f");
+}
+
+TEST(responses_token_mode_requires_a_stream) {
+    ResponseRequest out;
+    const json     b = token_body(kHashA, kHashB, /*stream=*/false);
+    auto           err = api::parse_response_request(b, out);
+    CHECK(err.has_value());
+    if (!err.has_value()) return;
+    CHECK_EQ(err->status, 400);
+    const json& e = err->body["error"];
+    CHECK_EQ(e["code"].get<std::string>(), std::string("unsupported_parameter"));
+    CHECK_EQ(e["param"].get<std::string>(), std::string("stream"));
+}
+
+TEST(responses_token_mode_refuses_an_image_part) {
+    // Text-only: the renderer's prompt is text, and an image would leave it.
+    json b = token_body(kHashA, kHashB);
+    b["input"] = json::array({
+        {{"type", "message"},
+         {"role", "user"},
+         {"content", json::array({{{"type", "input_text"}, {"text", "look"}},
+                                  {{"type", "input_image"},
+                                   {"image_url", "data:image/png;base64,AAAA"}}})}},
+    });
+    check_refusal(b, "unsupported_parameter", "arcint.token_mode", "token mode image");
+}
+
+TEST(responses_arcint_renderer_hash_without_token_mode_is_refused) {
+    // No silent acceptance: a hash without the mode names no turn to check.
+    json b = base();
+    b["arcint"] = {{"v", 1}, {"renderer_hash", kHashA}};
+    check_refusal(b, "invalid_request", "arcint.token_mode", "renderer_hash alone");
+}
+
+TEST(responses_arcint_render_hash_must_be_a_sha256_string) {
+    for (const auto& bad : {std::string("sha256:xyz"), std::string(64, 'a'),
+                                  "sha256:" + std::string(63, 'a')}) {
+        json b = token_body(bad, kHashB);
+        check_refusal(b, "invalid_request", "arcint.renderer_hash", "malformed renderer_hash");
+    }
+}
+
+TEST(responses_arcint_render_has_no_unknown_keys) {
+    json b = token_body(kHashA, kHashB);
+    b["arcint"]["render"]["foo"] = true;
+    check_refusal(b, "unsupported_parameter", "arcint.render.foo", "unknown render key");
+}
+
+TEST(responses_token_mode_409_without_material) {
+    // The stub serves no material: token mode cannot be served, loudly, and no
+    // slot is taken.
+    Fixture fx;
+    ResponseRequest r;
+    parse_ok(token_body(kHashA, kHashB), r);
+    PreparedResponse p;
+    const auto       err = api::prepare_response(fx.ctx, std::move(r), p);
+    CHECK(err.has_value());
+    if (!err.has_value()) return;
+    CHECK_EQ(err->status, 409);
+    const json& e = err->body["error"];
+    CHECK_EQ(e["code"].get<std::string>(), std::string("renderer_mismatch"));
+    CHECK_EQ(e["param"].get<std::string>(), std::string("arcint.token_mode"));
+    CHECK_EQ(fx.slots.free(), fx.slots.total());
+}
+
+TEST(responses_token_mode_renderer_hash_mismatch_is_a_409_before_the_slot) {
+    Fixture fx(4096, synthetic_material(kHashA));
+    ResponseRequest r;
+    parse_ok(token_body(kHashB, kHashB), r);
+    PreparedResponse p;
+    const auto       err = api::prepare_response(fx.ctx, std::move(r), p);
+    CHECK(err.has_value());
+    if (!err.has_value()) return;
+    CHECK_EQ(err->status, 409);
+    const json& e = err->body["error"];
+    CHECK_EQ(e["code"].get<std::string>(), std::string("renderer_mismatch"));
+    CHECK_EQ(e["param"].get<std::string>(), std::string("arcint.renderer_hash"));
+    CHECK_EQ(fx.slots.free(), fx.slots.total());
+}
+
+TEST(responses_token_mode_prompt_hash_mismatch_is_a_409_before_the_slot) {
+    Fixture fx(4096, synthetic_material(kHashA));
+    ResponseRequest r;
+    parse_ok(token_body(kHashA, kHashB), r);   // matching material, wrong render
+    PreparedResponse p;
+    const auto       err = api::prepare_response(fx.ctx, std::move(r), p);
+    CHECK(err.has_value());
+    if (!err.has_value()) return;
+    CHECK_EQ(err->status, 409);
+    const json& e = err->body["error"];
+    CHECK_EQ(e["code"].get<std::string>(), std::string("renderer_mismatch"));
+    CHECK_EQ(e["param"].get<std::string>(), std::string("arcint.render.prompt_sha256"));
+    CHECK_EQ(fx.slots.free(), fx.slots.total());
+}
+
+TEST(responses_token_mode_matching_hashes_prepare) {
+    // The gateway's render is the served render: a text-mode prepare on the same
+    // request gives the prompt the gateway would have hashed.
+    Fixture fx(4096, synthetic_material(kHashA));
+    ResponseRequest off;
+    parse_ok(base(), off);
+    PreparedResponse po;
+    CHECK(!api::prepare_response(fx.ctx, std::move(off), po).has_value());
+    const std::string prompt_hash = api::sha256_hex(po.chat.input.prompt);
+
+    ResponseRequest r;
+    parse_ok(token_body(kHashA, "sha256:" + prompt_hash), r);
+    PreparedResponse p;
+    const auto       err = api::prepare_response(fx.ctx, std::move(r), p);
+    CHECK(!err.has_value());
+    if (err.has_value()) return;
+    CHECK(p.req.token_mode);
+    CHECK_EQ(p.chat.input.prompt, po.chat.input.prompt);
+}
+
+TEST(responses_renderer_endpoint_is_404_without_material) {
+    Fixture fx;
+    const api::RendererBundle r = api::renderer_bundle(fx.ctx);
+    CHECK_EQ(r.status, 404);
+    if (r.status != 404 || r.error.empty()) return;
+    const json e = json::parse(r.error)["error"];
+    CHECK_EQ(e["code"].get<std::string>(), std::string("renderer_not_served"));
+}
+
+TEST(responses_renderer_endpoint_serves_the_material) {
+    Fixture fx(4096, synthetic_material(kHashB));
+    const api::RendererBundle r = api::renderer_bundle(fx.ctx);
+    CHECK_EQ(r.status, 200);
+    if (r.status != 200 || r.body == nullptr) return;
+    const json body = json::parse(*r.body);
+    CHECK(body.contains("schema"));
+    CHECK(body.contains("hash"));
+    if (!body.contains("schema") || !body.contains("hash")) return;
+    CHECK_EQ(body["schema"].get<std::string>(), std::string("feyntalk-render/1"));
+    CHECK_EQ(body["hash"].get<std::string>(), kHashB);
+    CHECK(body.contains("decode"));
+    CHECK(body.contains("chat_template"));
+    CHECK(body.contains("special_tokens"));
+    CHECK(body.contains("parser"));
+}
+
+TEST(props_reports_token_mode_and_the_renderer_hash) {
+    Fixture off;
+    const json p0 = api::props(off.ctx);
+    CHECK(p0.contains("token_mode"));
+    CHECK(p0.contains("renderer_hash"));
+    if (!p0.contains("token_mode") || !p0.contains("renderer_hash")) return;
+    CHECK_EQ(p0["token_mode"].get<std::string>(), std::string("off"));
+    CHECK(p0["renderer_hash"].is_null());
+
+    Fixture ready(4096, synthetic_material(kHashB));
+    const json p1 = api::props(ready.ctx);
+    CHECK(p1.contains("token_mode"));
+    CHECK(p1.contains("renderer_hash"));
+    if (!p1.contains("token_mode") || !p1.contains("renderer_hash")) return;
+    CHECK_EQ(p1["token_mode"].get<std::string>(), std::string("ready"));
+    CHECK_EQ(p1["renderer_hash"].get<std::string>(), kHashB);
+}
+
+// ------------------------------------------------------- the canonical hash
+
+TEST(renderer_canonical_dump_sorts_keys_and_has_no_whitespace) {
+    const json v = {{"b", 1}, {"a", json::array({2, 3})}, {"z", {{"y", 2}, {"x", 1}}}};
+    CHECK_EQ(lgc::canonical_dump(v), std::string("{\"a\":[2,3],\"b\":1,\"z\":{\"x\":1,\"y\":2}}"));
+    // Non-ASCII stays raw (UTF-8), not \u-escaped.
+    const json u = {{"t", "Grüße"}};
+    CHECK_EQ(lgc::canonical_dump(u), std::string("{\"t\":\"Grüße\"}"));
+    // Floats are not in the hashable material and are refused, not rounded.
+    bool threw = false;
+    try { (void)lgc::canonical_dump(json{{"f", 0.5}}); } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+}
+
+TEST(renderer_canonical_hash_is_the_sha256_of_the_canonical_dump) {
+    // The digest is fixed here so the engine and the gateway cannot drift apart
+    // on separators or key order.
+    const json v = {{"a", 2}, {"b", json::array({2, 3})}};
+    CHECK_EQ(lgc::canonical_sha256(v),
+             std::string("sha256:135a674abfbcdc7913758dc48a2bb88a2376d0bf85a7000ba0b0ef69cd449079"));
+    CHECK_EQ(lgc::canonical_sha256(v), "sha256:" + api::sha256_hex(lgc::canonical_dump(v)));
+}
+
+TEST(renderer_material_hash_is_stable_and_excludes_the_model_names) {
+    RendererMaterialParts parts;
+    parts.model         = {{"served_id", "one"}, {"canonical_id", "one.gguf"},
+                           {"quant", "Q4_K - Medium"}, {"arch", "qwen35"}};
+    parts.decode        = {{"pieces_b64", json::array({"QQ=="})}, {"eos", 0},
+                           {"eog_ids", json::array({0})}};
+    parts.encode        = {{"tokens", json::array()}, {"merges", json::array()},
+                           {"token_types", json::array()}, {"model", "bpe"},
+                           {"pre", "qwen2"}, {"add_bos", false},
+                           {"special_text", json::object()}};
+    parts.chat_template = {{"text", "tmpl"}, {"source", "gguf"}};
+    parts.special_tokens = {{"think", json::array()}, {"tool_call", json::object()}};
+    parts.parser        = {{"reasoning", "tags/1"}, {"tool_calls", "qwen3-coder/1"}};
+
+    const json a = assemble_renderer_material(parts);
+    CHECK(a.contains("schema"));
+    CHECK(a.contains("hash"));
+    if (!a.contains("schema") || !a.contains("hash")) return;
+    CHECK_EQ(a["schema"].get<std::string>(), std::string("feyntalk-render/1"));
+    CHECK_EQ(a["hash"].get<std::string>().rfind("sha256:", 0), size_t(0));
+    // The same parts built with a different key order give the same digest:
+    // this is what two loads of the same artifact must see.
+    RendererMaterialParts reordered;
+    reordered.parser        = {{"tool_calls", "qwen3-coder/1"}, {"reasoning", "tags/1"}};
+    reordered.special_tokens = {{"tool_call", json::object()}, {"think", json::array()}};
+    reordered.chat_template = {{"source", "gguf"}, {"text", "tmpl"}};
+    reordered.encode        = parts.encode;
+    reordered.decode        = parts.decode;
+    reordered.model         = {{"arch", "qwen35"}, {"quant", "Q4_K - Medium"},
+                               {"canonical_id", "one.gguf"}, {"served_id", "one"}};
+    const json b = assemble_renderer_material(reordered);
+    CHECK_EQ(a["hash"].get<std::string>(), b["hash"].get<std::string>());
+
+    // The model names are volatile: a rename must not change the material hash.
+    parts.model = {{"served_id", "two"}, {"canonical_id", "one.gguf"},
+                   {"quant", "Q4_K - Medium"}, {"arch", "qwen35"}};
+    const json renamed = assemble_renderer_material(parts);
+    CHECK_EQ(a["hash"].get<std::string>(), renamed["hash"].get<std::string>());
+
+    // A changed piece is a different material, not a cached one.
+    parts.decode = {{"pieces_b64", json::array({"Qg=="})}, {"eos", 0},
+                    {"eog_ids", json::array({0})}};
+    const json changed = assemble_renderer_material(parts);
+    CHECK(a["hash"].get<std::string>() != changed["hash"].get<std::string>());
+}
+
+// ------------------------------------- feyntalk W6b (token and span events)
+//
+// docs/campaigns/feyntalk.md "Token mode, revised": D2 (one `arcint:token` per
+// accepted token, before its text shadow, field decided by the token) and D3
+// (span events without item ids). The red run was against W6a: token mode
+// served the turn and emitted no token or span event, so every case below
+// failed; the implementation adds the events, the streamer's `field_for` and
+// the spans.
+
+namespace {
+
+// The token-mode turn on the real stub backend: the stub's tokenizer makes
+// decode_one(id) the piece the shadow carries, so the shadow can be compared
+// with the tokens themselves. Two prepares give the prompt hash the gateway
+// would have.
+std::vector<std::string> stub_token_stream(Fixture& fx) {
+    ResponseRequest off;
+    parse_ok(base(), off);
+    PreparedResponse po;
+    if (api::prepare_response(fx.ctx, std::move(off), po).has_value()) return {};
+    const std::string prompt_hash = "sha256:" + api::sha256_hex(po.chat.input.prompt);
+    ResponseRequest r;
+    parse_ok(token_body(kHashA, prompt_hash), r);
+    PreparedResponse p;
+    if (api::prepare_response(fx.ctx, std::move(r), p).has_value()) return {};
+    std::vector<std::string> raw;
+    api::stream_response(fx.ctx, p, 0, [&](std::string_view frame) {
+        raw.emplace_back(frame);
+        return true;
+    });
+    return raw;
+}
+
+const json* find_event(const Sse& s, const std::string& type, size_t from = 0) {
+    for (size_t i = from; i < s.events.size(); ++i)
+        if (s.events[i].first == type) return &s.events[i].second;
+    return nullptr;
+}
+
+std::vector<const json*> all_events(const Sse& s, const std::string& type) {
+    std::vector<const json*> out;
+    for (const auto& [name, body] : s.events)
+        if (name == type) out.push_back(&body);
+    return out;
+}
+
+}  // namespace
+
+TEST(responses_token_events_one_per_token_before_the_shadow) {
+    StreamFixture fx;
+    fx.req.token_mode = true;   // stream_response is called directly: no prepare
+    fx.prep.req       = fx.req;
+    fx.backend.pieces = {{"Hello", 1}, {" world", 2}};
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    const auto toks = all_events(s, "arcint:token");
+    CHECK_EQ(toks.size(), size_t(2));
+    if (toks.size() != 2) return;
+    CHECK_EQ((*toks[0])["token_index"].get<int>(), 0);
+    CHECK_EQ((*toks[1])["token_index"].get<int>(), 1);
+    CHECK_EQ((*toks[0])["token_id"].get<int>(), 1);
+    CHECK_EQ((*toks[1])["token_id"].get<int>(), 2);
+    CHECK_EQ((*toks[0])["field"].get<std::string>(), std::string("text"));
+    CHECK_EQ((*toks[0])["v"].get<int>(), 1);
+    CHECK_EQ((*toks[0])["response_id"].get<std::string>(), std::string("resp-test"));
+    // Before its text shadow: the token event precedes the first delta.
+    int first_tok = -1, first_delta = -1;
+    for (size_t i = 0; i < s.events.size(); ++i) {
+        if (s.events[i].first == "arcint:token" && first_tok < 0) first_tok = static_cast<int>(i);
+        if (s.events[i].first == "response.output_text.delta" && first_delta < 0)
+            first_delta = static_cast<int>(i);
+    }
+    CHECK(first_tok >= 0 && first_delta >= 0 && first_tok < first_delta);
+}
+
+TEST(responses_token_event_field_is_reasoning_for_the_closer) {
+    StreamFixture fx(/*think_open=*/true);
+    fx.req.token_mode = true;
+    fx.prep.req       = fx.req;
+    fx.backend.pieces = {{"So", 1}, {" far", 2}, {think_close_tag(), 3}, {"OK", 4}};
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    const auto toks = all_events(s, "arcint:token");
+    CHECK_EQ(toks.size(), size_t(4));
+    if (toks.size() != 4) return;
+    const std::vector<std::string> want = {"reasoning", "reasoning", "reasoning", "text"};
+    for (size_t i = 0; i < want.size(); ++i)
+        CHECK_EQ((*toks[i])["field"].get<std::string>(), want[i]);
+    // The closer token is the one that closes the block, at index 2.
+    CHECK_EQ((*toks[2])["token_index"].get<int>(), 2);
+}
+
+TEST(responses_thinking_span_start_at_zero_and_end_on_the_closer) {
+    StreamFixture fx(/*think_open=*/true);
+    fx.req.token_mode = true;
+    fx.prep.req       = fx.req;
+    fx.backend.pieces = {{"So", 1}, {" far", 2}, {think_close_tag(), 3}, {"OK", 4}};
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    const auto spans = all_events(s, "arcint:span");
+    int start = -1, end = -1;
+    for (size_t i = 0; i < spans.size(); ++i) {
+        const json& b = *spans[i];
+        CHECK_EQ(b["span"].get<std::string>(), std::string("thinking"));
+        CHECK(!b.contains("item_id"));       // D3: no item ids on spans
+        CHECK(!b.contains("output_index"));
+        if (b["phase"].get<std::string>() == "start" && start < 0) start = static_cast<int>(i);
+        if (b["phase"].get<std::string>() == "end" && end < 0) end = static_cast<int>(i);
+    }
+    CHECK(start >= 0 && end >= 0 && start < end);
+    if (start < 0 || end < 0) return;
+    CHECK_EQ((*spans[static_cast<size_t>(start)])["token_index"].get<int>(), 0);
+    CHECK_EQ((*spans[static_cast<size_t>(end)])["token_index"].get<int>(), 2);
+    CHECK_EQ((*spans[static_cast<size_t>(start)])["detail"]["preopened"].get<bool>(), true);
+    CHECK_EQ((*spans[static_cast<size_t>(end)])["detail"]["closed"].get<bool>(), true);
+}
+
+TEST(responses_tool_call_span_brackets_the_text_form_call) {
+    StreamFixture fx(false, false, /*tools=*/true);
+    fx.req.token_mode = true;
+    fx.prep.req       = fx.req;
+    const std::string call = "<" "tool" "_call" ">\n{\"name\": \"read_file\", \"arguments\": {}}\n"
+                             "</" "tool" "_call>";
+    // The opener is split across pieces; the span starts at the piece that
+    // completes it.
+    fx.backend.pieces = {{"Sure", 1}, {"\n", 2}, {"<tool", 3}, {"_call", 4}, {">", 5},
+                         {"\n{\"name\": \"read_file\", \"arguments\": {}}\n</tool", 6},
+                         {"_call>", 7}};
+    (void)call;
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    const auto spans = all_events(s, "arcint:span");
+    int start = -1, end = -1;
+    for (size_t i = 0; i < spans.size(); ++i) {
+        const json& b = *spans[i];
+        CHECK_EQ(b["span"].get<std::string>(), std::string("tool_call"));
+        CHECK(!b.contains("item_id"));
+        if (b["phase"].get<std::string>() == "start" && start < 0) start = static_cast<int>(i);
+        if (b["phase"].get<std::string>() == "end" && end < 0) end = static_cast<int>(i);
+    }
+    CHECK(start >= 0 && end >= 0 && start < end);
+    if (start < 0 || end < 0) return;
+    CHECK_EQ((*spans[static_cast<size_t>(start)])["token_index"].get<int>(), 4);
+    CHECK_EQ((*spans[static_cast<size_t>(end)])["token_index"].get<int>(), 6);
+    CHECK_EQ((*spans[static_cast<size_t>(start)])["detail"]["call_index"].get<int>(), 0);
+}
+
+TEST(responses_token_mode_off_emits_no_token_or_span_events) {
+    StreamFixture fx;
+    fx.backend.pieces = {{"Hello", 1}, {" world", 2}};
+    const Sse s = parse_sse(fx.run());
+    CHECK(all_events(s, "arcint:token").empty());
+    CHECK(all_events(s, "arcint:span").empty());
+}
+
+TEST(responses_token_events_contiguous_and_the_shadow_is_decode_of_tokens) {
+    // The real stub: its pieces (the four-byte code point split in half by
+    // emit_split) and ids are one token each, so the shadow is exactly the
+    // concatenation of decode_one(id for every token event).
+    Fixture fx(4096, synthetic_material(kHashA));
+    const Sse s = parse_sse(stub_token_stream(fx));
+    check_framing(s);
+    const auto toks = all_events(s, "arcint:token");
+    CHECK(!toks.empty());
+    if (toks.empty()) return;
+    for (size_t i = 0; i < toks.size(); ++i) {
+        CHECK_EQ((*toks[i])["token_index"].get<int>(), static_cast<int>(i));
+        CHECK((*toks[i])["token_id"].get<int>() >= 0);
+    }
+    // One event per accepted token: the usage block counts the same number.
+    const json* terminal = find_event(s, "response.completed");
+    CHECK(terminal != nullptr);
+    if (terminal != nullptr) {
+        const int out = (*terminal)["response"]["usage"]["output_tokens"].get<int>();
+        CHECK_EQ(static_cast<int>(toks.size()), out);
+    }
+    std::string shadow;
+    for (const auto& [name, body] : s.events)
+        if (name == "response.output_text.delta")
+            shadow += body["delta"].get<std::string>();
+    std::string decoded;
+    for (const json* t : toks) decoded += fx.backend->tokenizer().decode_one((*t)["token_id"].get<int>());
+    CHECK_EQ(shadow, decoded);
+}
+
+// feyntalk W6b, the stream side of the sampler vector: the writer drains the
+// turn's events at the emit that follows, before that token's own event, and
+// carries the sampler's detail verbatim. The loop and context events are
+// informational; no item ids.
+TEST(responses_sampler_spans_are_drained_before_the_token_event) {
+    StreamFixture fx;
+    fx.req.token_mode = true;
+    fx.prep.req       = fx.req;
+    fx.prep.chat.input.sampler.span_events =
+        std::make_shared<std::vector<SamplerSpanEvent>>();
+    SamplerSpanEvent loop;
+    loop.span = "loop_guard"; loop.rung = "door"; loop.match = "near";
+    loop.token_index = 0;
+    SamplerSpanEvent ctx;
+    ctx.span = "context_guard"; ctx.forced = true; ctx.budget = 0; ctx.token_index = 1;
+    fx.prep.chat.input.sampler.span_events->push_back(loop);
+    fx.prep.chat.input.sampler.span_events->push_back(ctx);
+    fx.backend.pieces = {{"A", 1}, {"B", 2}};
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    int loop_at = -1, ctx_at = -1, tok0 = -1, tok1 = -1;
+    for (size_t i = 0; i < s.events.size(); ++i) {
+        const json& b = s.events[i].second;
+        if (s.events[i].first == "arcint:span") {
+            if (b["span"] == "loop_guard" && loop_at < 0) loop_at = static_cast<int>(i);
+            if (b["span"] == "context_guard" && ctx_at < 0) ctx_at = static_cast<int>(i);
+            CHECK(!b.contains("item_id"));
+        }
+        if (s.events[i].first == "arcint:token") {
+            if (b["token_index"] == 0 && tok0 < 0) tok0 = static_cast<int>(i);
+            if (b["token_index"] == 1 && tok1 < 0) tok1 = static_cast<int>(i);
+        }
+    }
+    CHECK(loop_at >= 0 && ctx_at >= 0 && tok0 >= 0 && tok1 >= 0);
+    if (loop_at < 0 || ctx_at < 0 || tok0 < 0 || tok1 < 0) return;
+    CHECK(loop_at < tok0);
+    CHECK(ctx_at < tok1);
+    CHECK(loop_at < ctx_at);
+    const json& l = s.events[static_cast<size_t>(loop_at)].second;
+    CHECK_EQ(l["detail"]["rung"].get<std::string>(), std::string("door"));
+    CHECK_EQ(l["detail"]["match"].get<std::string>(), std::string("near"));
+    const json& c = s.events[static_cast<size_t>(ctx_at)].second;
+    CHECK_EQ(c["detail"]["forced"].get<bool>(), true);
+    CHECK_EQ(c["detail"]["budget"].get<int>(), 0);
+    CHECK(fx.prep.chat.input.sampler.span_events->empty());   // drained
+}
+
+// ---------------------------------- W6a review round (2026-10-31, findings)
+//
+// 1 HIGH: `/props` must say "ready" only where a token-mode request really
+// emits `arcint:token`/`arcint:span`. The equivalence is pinned, not assumed.
+// 2 MEDIUM: a material the canonical hash cannot encode (raw-byte vocabularies
+// give non-UTF-8 token text) must leave the unit servable: no throw, empty
+// material, token mode off.
+// 3 MEDIUM: `/props` must not build the material.
+// 5 LOW: the 404 speaks the Responses envelope's `not_found`.
+
+namespace {
+
+RendererMaterialParts minimal_parts() {
+    RendererMaterialParts parts;
+    parts.model          = {{"served_id", "one"}, {"canonical_id", "one.gguf"},
+                            {"quant", "Q4_K - Medium"}, {"arch", "qwen35"}};
+    parts.decode         = {{"pieces_b64", json::array({"QQ=="})}, {"eos", 0},
+                            {"eog_ids", json::array({0})}};
+    parts.encode         = {{"tokens", json::array()}, {"merges", json::array()},
+                            {"token_types", json::array()}, {"model", "bpe"},
+                            {"pre", "qwen2"}, {"add_bos", false},
+                            {"special_text", json::object()}};
+    parts.chat_template  = {{"text", "tmpl"}, {"source", "gguf"}};
+    parts.special_tokens = {{"think", json::array()}, {"tool_call", json::object()}};
+    parts.parser         = {{"reasoning", "tags/1"}, {"tool_calls", "qwen3-coder/1"}};
+    return parts;
+}
+
+// W6a review finding 3's seam: a backend that counts material builds. `props`
+// must not touch the counter; the material endpoint builds once and serves the
+// cached body.
+class CountingMaterialBackend final : public Backend {
+public:
+    ModelStatus       st;
+    nlohmann::json    material = synthetic_material(kHashA);
+    mutable int       builds   = 0;
+    mutable int       serializations = 0;
+    mutable bool      serialized = false;
+    mutable std::string serialized_body;
+
+    const ModelStatus& status() const override { return st; }
+    Tokenizer&         tokenizer() override { return tok_; }
+    std::string        render_chat(const ChatRequest&) const override { return {}; }
+    bool renderer_capable() const override { return true; }
+    const nlohmann::json& renderer_material() const override {
+        ++builds;
+        return material;
+    }
+    std::string renderer_hash() const override { return material["hash"].get<std::string>(); }
+    const std::string& renderer_material_json() const override {
+        if (!serialized) {
+            (void)renderer_material();
+            serialized_body = material.dump();
+            serialized      = true;
+            ++serializations;
+        }
+        return serialized_body;
+    }
+    FinishReason generate(const GenerationInput&, int, const TokenCallback&,
+                          GenerationStats&) override {
+        return FinishReason::Stop;
+    }
+
+private:
+    struct Tok final : public Tokenizer {
+        std::vector<int> encode(std::string_view) override { return {}; }
+        std::string      decode(const std::vector<int>&) override { return {}; }
+        std::string      decode_one(int) override { return {}; }
+        int              eos_id() const override { return 0; }
+    } tok_;
+};
+
+}  // namespace
+
+TEST(props_ready_iff_a_token_request_emits_token_events) {
+    Fixture fx(4096, synthetic_material(kHashA));
+    const json p = api::props(fx.ctx);
+    CHECK_EQ(p["token_mode"].get<std::string>(), std::string("ready"));
+    if (p["token_mode"] != "ready") return;
+    const Sse s = parse_sse(stub_token_stream(fx));
+    const auto toks = all_events(s, "arcint:token");
+    CHECK(!toks.empty());   // "ready" without these is a lie
+}
+
+TEST(renderer_material_assembly_returns_empty_on_non_utf8_text) {
+    // A raw-byte vocabulary's token text is not valid UTF-8; the canonical hash
+    // cannot round-trip it. The build must refuse the material, not abort the
+    // unit load or throw in the endpoint.
+    RendererMaterialParts parts = minimal_parts();
+    parts.encode["tokens"] = json::array({std::string("\xff\xfe")});
+    json m;
+    bool threw = false;
+    try {
+        m = assemble_renderer_material(parts);
+    } catch (...) {
+        threw = true;
+    }
+    CHECK(!threw);
+    CHECK(m.is_null());
+}
+
+TEST(props_does_not_build_the_material) {
+    Config cfg;
+    CountingMaterialBackend backend;
+    SlotPool slots{1};
+    api::Context ctx;
+    ctx.cfg = &cfg;
+    ctx.backend = &backend;
+    ctx.slots = &slots;
+    const json p = api::props(ctx);
+    CHECK_EQ(backend.builds, 0);
+    CHECK_EQ(p["token_mode"].get<std::string>(), std::string("ready"));
+}
+
+TEST(renderer_endpoint_builds_once_and_serves_the_cached_body) {
+    Config cfg;
+    CountingMaterialBackend backend;
+    SlotPool slots{1};
+    api::Context ctx;
+    ctx.cfg = &cfg;
+    ctx.backend = &backend;
+    ctx.slots = &slots;
+    const api::RendererBundle first  = api::renderer_bundle(ctx);
+    const api::RendererBundle second = api::renderer_bundle(ctx);
+    CHECK_EQ(first.status, 200);
+    CHECK_EQ(second.status, 200);
+    CHECK(first.body != nullptr && second.body != nullptr);
+    CHECK(first.body == second.body);   // the same cached string, not a copy
+    CHECK_EQ(backend.builds, 1);
+    CHECK_EQ(backend.serializations, 1);
+    if (first.body != nullptr) {
+        const json body = json::parse(*first.body);
+        CHECK_EQ(body["hash"].get<std::string>(), kHashA);
+    }
+}
+
+TEST(renderer_404_uses_the_responses_not_found_type) {
+    Fixture fx;
+    const api::RendererBundle r = api::renderer_bundle(fx.ctx);
+    CHECK_EQ(r.status, 404);
+    if (r.status != 404 || r.error.empty()) return;
+    CHECK_EQ(json::parse(r.error)["error"]["type"].get<std::string>(), std::string("not_found"));
+}
+
+// W6a review finding 4: the material carries the served tag geometry and the
+// template's real source. The assembler must preserve both (the llama backend
+// fills them at load; the stub can only pin the contract).
+TEST(renderer_material_carries_the_tag_geometry_and_template_source) {
+    RendererMaterialParts parts = minimal_parts();
+    parts.chat_template["source"] = "chatml-fallback";
+    parts.special_tokens["think_extended"] =
+        json::array({json{{"open_ids", json::array({11})}, {"close_ids", json::array({12})}}});
+    parts.parser["tag_set"] = "extended";
+    const json m = assemble_renderer_material(parts);
+    CHECK(m.is_object());
+    if (!m.is_object()) return;
+    CHECK_EQ(m["chat_template"]["source"].get<std::string>(), std::string("chatml-fallback"));
+    CHECK(m["special_tokens"].contains("think_extended"));
+    CHECK_EQ(m["parser"]["tag_set"].get<std::string>(), std::string("extended"));
+    // The geometry is part of the hash: changing it changes the material.
+    parts.parser["tag_set"] = "qwen";
+    const json other = assemble_renderer_material(parts);
+    CHECK(m["hash"].get<std::string>() != other["hash"].get<std::string>());
 }

@@ -45,6 +45,13 @@ struct ResponseRequest {
     std::string    previous_response_id;
     bool           has_previous_response_id = false;
     int            arcint_v = 1;
+    // feyntalk W6a (docs/campaigns/feyntalk.md, D1/D4): token mode in the
+    // arcint object. The gateway renders the prompt; the two hashes are
+    // required and are checked before the slot. `input_ids` is accepted by the
+    // schema but refused until W6f (the encode side of the renderer).
+    bool           token_mode = false;
+    std::string    renderer_hash;         // "sha256:…" of the served material
+    std::string    render_prompt_sha256;  // "sha256:…" of the gateway's render
     // Reasoning items of the input: accepted, kept for the store (W3), never
     // rendered into the prompt — parity with /v1/chat/completions, which has no
     // reasoning replay.

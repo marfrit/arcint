@@ -379,6 +379,28 @@ public:
     // models came up "non-reasoning" in every client.
     virtual nlohmann::json template_caps() const { return nlohmann::json::object(); }
 
+    // feyntalk W6a (docs/campaigns/feyntalk.md, D4; W6a review findings 2/3):
+    // the renderer material. The capability is separate from the material so
+    // `/props` never builds the body; the build is lazy (the first GET or the
+    // first token-mode request), once and thread-safe, and a material the
+    // canonical hash cannot encode leaves the unit servable with token mode off.
+    virtual bool renderer_capable() const { return false; }
+    // The built material; builds it once on first use. Empty when the unit is
+    // not capable or the build failed. Used by the request's hash check.
+    virtual const nlohmann::json& renderer_material() const {
+        static const nlohmann::json kEmpty;
+        return kEmpty;
+    }
+    // The hash of the built material, from the cache; empty before the first
+    // build and when not capable. Does NOT build: `/props` reads it.
+    virtual std::string renderer_hash() const { return {}; }
+    // The pre-serialized body the endpoint serves, built once with the material
+    // and cached; empty when not capable or the build failed.
+    virtual const std::string& renderer_material_json() const {
+        static const std::string kEmpty;
+        return kEmpty;
+    }
+
     // `slot` is the lane this request owns for its whole life (DESIGN.md §4.1).
     // Every piece of mutable execution state — InferRequests, GDN checkpoint
     // rows, the KV block table, the MTP head's own KV — is indexed by it, which
@@ -421,7 +443,8 @@ std::unique_ptr<Backend> make_stub_backend(int n_ctx, int delay_ms = 0,
                                            const std::string& served_name = {},
                                            const std::vector<int>& lane_ctx = {},
                                            const SamplerDefaults& sampler = {},
-                                           int prefill_ubatches = 1);
+                                           int prefill_ubatches = 1,
+                                           const nlohmann::json& renderer_material = {});
 
 #ifdef ARCINT_LLAMA
 // The libllama executor (ggml OpenCL), the GGUF in --gguf.

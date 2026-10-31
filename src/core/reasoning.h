@@ -46,6 +46,11 @@ std::string_view lead_of(std::string_view s);
 // think_tag_pairs(): a pair whose opener/closer is one special token is
 // decided by that id, and its text is not looked at. A -1 entry keeps the text
 // logic for that role. Empty: the text logic throughout, as before.
+// feyntalk W6b (docs/campaigns/feyntalk.md D2): which side of the think split
+// a token belongs to, decided by the token id and the streamer's state, not by
+// scanning text. The closer belongs to reasoning; an opener id opens reasoning.
+enum class TokenField { Reasoning, Text };
+
 class ReasoningStreamer {
 public:
     explicit ReasoningStreamer(bool think_open, bool extended_tags = false,
@@ -57,6 +62,10 @@ public:
     // `token_id` is the id of the token that decoded to `piece`; -1 for a
     // caller that only has text.
     Step push(std::string_view piece, int token_id = -1);
+    // The token's side BEFORE this push: reasoning while the block is open (the
+    // closer included), an opener id while undecided. A piece whose text opens
+    // the block is caught by the caller through the step's reasoning bytes.
+    TokenField field_for(int token_id) const;
     Step flush();
     bool in_reasoning() const { return in_reasoning_; }
     bool closed() const { return closed_; }
