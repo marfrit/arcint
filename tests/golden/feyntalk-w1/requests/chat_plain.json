@@ -1,0 +1,11 @@
+{
+  "model": "stub",
+  "messages": [
+    {
+      "role": "user",
+      "content": "hello stub"
+    }
+  ],
+  "temperature": 0.0,
+  "max_tokens": 256
+}

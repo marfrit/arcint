@@ -1,0 +1,14 @@
+{
+  "model": "stub",
+  "messages": [
+    {
+      "role": "user",
+      "content": "answer without thinking"
+    }
+  ],
+  "temperature": 0.0,
+  "max_tokens": 256,
+  "chat_template_kwargs": {
+    "enable_thinking": false
+  }
+}

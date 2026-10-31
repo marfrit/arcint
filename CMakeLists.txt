@@ -298,6 +298,17 @@ if(ARCINT_TESTS)
 
   add_test(NAME roundtrip
            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/roundtrip.sh" "$<TARGET_FILE:arcint>")
+
+  # Review R5 (docs/campaigns/feyntalk.md): W1 splits prepare_chat, and a green
+  # suite does not prove the served bytes stayed the same. The checked-in
+  # capture of the chat and completions routes on the stub backend is compared
+  # byte for byte, with only the ids and `created` normalised (normalise.py
+  # names them and why). A refactor that moves one byte of these bodies fails
+  # here.
+  add_test(NAME feyntalk-golden
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/feyntalk-w1/compare.sh"
+                   "$<TARGET_FILE:arcint>")
+  set_tests_properties(feyntalk-golden PROPERTIES TIMEOUT 120 LABELS unit)
   # roundtrip.sh exits 77 with a reason when curl or python3 is missing. That
   # is deliberately NOT a ctest skip here: the package recipe gates on
   # `-L unit`, and a builder without curl must fail that gate, not pass it with

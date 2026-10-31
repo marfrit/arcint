@@ -1,0 +1,36 @@
+{
+  "model": "stub",
+  "messages": [
+    {
+      "role": "system",
+      "content": "you can call tools"
+    },
+    {
+      "role": "user",
+      "content": "read the file"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "read a file",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "temperature": 0.0,
+  "max_tokens": 256
+}

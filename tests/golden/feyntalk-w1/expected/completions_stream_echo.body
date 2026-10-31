@@ -1,0 +1,98 @@
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"once upon a time"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"arcint"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":" "}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"stub"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":" "}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"backend"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":" "}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"·"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":" "}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"no"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":" "}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"model"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":" "}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"loaded"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":" "}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"·"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":" "}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"stub"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":" "}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"("}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"stub"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":")"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"\n"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"prompt"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":" "}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"7"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":" "}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"tokens"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":","}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":" "}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"sampler"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":" "}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"greedy"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"."}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":" "}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"Gr"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"üße"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":" "}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"aus"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":" "}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"der"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":" "}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"Werkstatt"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"."}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":" "}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"logprobs":null,"text":"🧩"}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[{"finish_reason":"stop","index":0,"logprobs":null,"text":""}],"created":<created>,"id":"<id>","model":"stub","object":"text_completion"}
+
+data: {"choices":[],"created":<created>,"id":"<id>","model":"stub","object":"text_completion","usage":{"completion_tokens":44,"completion_tokens_details":{"accepted_prediction_tokens":0,"rejected_prediction_tokens":0},"prompt_tokens":7,"total_tokens":51}}
+
+data: [DONE]
+
