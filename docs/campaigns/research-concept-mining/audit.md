@@ -111,6 +111,19 @@ answer by design.
   `src/models/qwen4exp.cpp`, a new patch 0068. Size: ~400-600 lines, plus the memory module's
   span batch handling. Cost: high.
 
+- **Re-priced by the 2026-10-31 profiles (`measured-here`, the B60, Flash-Next IQ3_S, the intercept layer's chrome
+  trace; 2,048 / 8,192 tokens without the loan, 19,196 / 103,638 with it at chunk 8,192):** the main queue is the
+  critical path (busy 96.3 % of the 100K span); the bank stream's `clEnqueueWriteBuffer` runs on its own queue (36.8 %
+  of the span, overlapped, as 0032 says). The largest main-queue cost is `kernel_moe_gather_experts` (0021's copy of
+  the routed experts' bytes from the host bank into a card-side mirror): 38.5 % of the span at 2K, 31.8 % at 8K,
+  20.3 % at 20K, 25.7 % at 100K; 1,998 calls at 4.08 ms at 20K and 8,892 at 8.69 ms at 100K - the calls scale with the
+  ubatch count (4.5x for 4.3x the ubatches) and the per-call cost doubles under the loan (fewer slots, more bank
+  experts). It is paid per ubatch and per layer on the critical path, which the chunk sweep above (where the bank's
+  4x fewer copies 'did not show' because the copy engine overlaps them) did not separate. Prize if each layer's
+  gather were paid once per prefill: up to ~24 % of the 100K prefill (`inferred`: 25.7 % x 12/13). The open question is
+  why the bank stream and the gather both move expert bytes, and whether the gather can move to the copy queue,
+  dedupe across ubatches or shrink to the misses (FreeToken's `_prefetch_split`, `paper`) - research first.
+
 ## 2. int8-DPAS grouped expert GEMM for the prompt
 
 - **arcint status: partly.** The *grouped-by-expert* half is built: the prefill expert GEMM sorts
