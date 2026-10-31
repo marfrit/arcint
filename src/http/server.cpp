@@ -5,6 +5,7 @@
 #include <httplib.h>
 
 #include "api/error.h"
+#include "api/renderer.h"
 #include "api/responses.h"
 #include "api/responses_state.h"
 #include "api/responses_stream.h"
@@ -150,6 +151,14 @@ void HttpServer::Impl::route() {
 
     svr.Get("/v1/models", [this](const httplib::Request&, httplib::Response& res) {
         send_json(res, 200, api::models(ctx));
+    });
+
+    // feyntalk W6a (docs/campaigns/feyntalk.md, D4): the renderer material the
+    // gateway consumes. No auth, like /props; a unit without material answers
+    // 404 `renderer_not_served` (the stub, --tts), never an empty bundle.
+    svr.Get("/v1/responses/renderer", [this](const httplib::Request&, httplib::Response& res) {
+        const api::HttpResult r = api::renderer_bundle(ctx);
+        send_json(res, r.status, r.body);
     });
 
     // The TTS surface (docs/milestone-1.2.0.md D4/D5). Both routes refuse from

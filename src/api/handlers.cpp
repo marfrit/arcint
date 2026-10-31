@@ -11,6 +11,7 @@
 
 #include "api/error.h"
 #include "api/generate.h"
+#include "api/renderer.h"
 #include "api/responses_state.h"
 #include "build_info.h"
 #include "core/stop.h"
@@ -455,6 +456,11 @@ json props(const Context& ctx) {
     json p = json{
         {"model", std::move(model)},
         {"chat_template_caps", ctx.backend->template_caps()},
+        // feyntalk W6a (docs/campaigns/feyntalk.md, D4): whether this unit can
+        // serve token mode and the material hash a gateway pins. "ready" means
+        // GET /v1/responses/renderer answers 200; "off" means it answers 404.
+        {"token_mode", api::renderer_ready(ctx) ? "ready" : "off"},
+        {"renderer_hash", api::renderer_ready(ctx) ? json(api::renderer_hash(ctx)) : json(nullptr)},
         // What is actually served, not a Config default the load path may
         // never have read. `kv_dtype` comes off ModelStatus, which the llama
         // backend fills from --llama-kv (config.h's llama_kv_dtype); the stub
