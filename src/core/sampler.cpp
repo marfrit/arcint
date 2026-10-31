@@ -140,11 +140,16 @@ void Sampler::set_think_ctx_budget(int budget) {
     think_ctx_arm_();
 }
 
-// The once-per-turn arm: at (or already past) the budget with the block open.
+// The once-per-turn arm: at (or already past) the budget with the block OPEN.
+// The state check is the fix for review F2: a prompt inside the reserve arms
+// nothing while the block is undecided, because there is no closer id yet --
+// spending the arm there latched the guard dead before the model could open the
+// block itself. The opener's observe() re-arms (the countdown sees thinking).
 // settle latches the decision so a text-closer family is not re-armed every
 // token after the budget went negative.
 void Sampler::think_ctx_arm_() {
-    if (ctx_armed_ && ctx_budget_ <= 0 && !ctx_settled_ && !ctx_pending_)
+    if (ctx_armed_ && think_state_ == ThinkState::thinking && ctx_budget_ <= 0
+        && !ctx_settled_ && !ctx_pending_)
         ctx_pending_ = true;
 }
 
@@ -1121,22 +1126,32 @@ int Sampler::sample(float* logits, size_t vocab) {
     // forced return is ahead of every mask, so neither think_eog_mask nor the
     // door can ever take the closer from the guard (review B3).
     if (ctx_pending_) {
-        ctx_pending_  = false;
-        ctx_settled_  = true;
-        const int closer = think_close_id_;
-        if (closer >= 0 && static_cast<size_t>(closer) < vocab) {
-            ++ctx_closes_;
-            ctx_forced_index_ = emitted_;   // the index this token takes
-            loop_forced_closer_   = true;       // not the model's own draw
-            log::info("context-guard", "the context guard reached its budget (%d left); "
-                      "the think-block's closer is forced as the next token", ctx_budget_);
-            return closer;
-        }
-        ++ctx_no_closer_;
-        if (!ctx_warned_) {
-            ctx_warned_ = true;
-            log::warn("context-guard", "the context guard reached its budget, but this vocabulary "
-                      "spells the closer as text; no token is forced");
+        // Review F1: the force is meaningful only while the block is OPEN. A
+        // close can land first -- the slap's forced closer (its branch runs
+        // above and does not clear this arm), the model's own draw, or a text
+        // closer -- and then this branch must not put a second closer into the
+        // answer or the tool grammar. One state gate covers every close site,
+        // present and future, rather than enumerating them; a void arm is
+        // dropped silently (it is not a text-closer family: the closer existed
+        // and someone else used it) and the turn is settled, content is final.
+        ctx_pending_ = false;
+        ctx_settled_ = true;
+        if (think_state_ == ThinkState::thinking) {
+            const int closer = think_close_id_;
+            if (closer >= 0 && static_cast<size_t>(closer) < vocab) {
+                ++ctx_closes_;
+                ctx_forced_index_ = emitted_;   // the index this token takes
+                loop_forced_closer_ = true;     // not the model's own draw
+                log::info("context-guard", "the context guard reached its budget (%d left); "
+                          "the think-block's closer is forced as the next token", ctx_budget_);
+                return closer;
+            }
+            ++ctx_no_closer_;
+            if (!ctx_warned_) {
+                ctx_warned_ = true;
+                log::warn("context-guard", "the context guard reached its budget, but this "
+                          "vocabulary spells the closer as text; no token is forced");
+            }
         }
     }
 
