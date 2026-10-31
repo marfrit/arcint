@@ -768,8 +768,9 @@ shadow bytes:
   text: `reasoning` while the think block is open **and for the closer token
   itself**; `text` otherwise. The opener token that a model writes itself is
   `reasoning`. A tool-call token is `text`; the span delimits it. The stream
-  writer asks a new `ReasoningStreamer::field_for(token_id, was_reasoning)`
-  (a few lines in `reasoning.h`), no step-loop change. `code`.
+  writer asks `ReasoningStreamer::field_for(token_id)` (state + opener ids, a
+  few lines in `reasoning.h`) and combines it with the step's own reasoning
+  bytes, so a text-spelled opener is caught too; no step-loop change. `code`.
 - `item_id` / `output_index` / `content_index` are nullable: a reasoning or
   message item is opened before its token event is written, so its ids are
   present; a tool-call token has no item until the turn's end, so the fields
@@ -1351,9 +1352,31 @@ mode with `truncation: "auto"` stays a 409 (the engine's fit pass hashes the
 dropped render; the gateway's full render differs) until W6c applies the fit —
 open question 9, (a).
 
+**W6b is built (2026-10-31, stub gate).** In token mode the SSE writer emits one
+`arcint:token` per accepted output token before its text shadow (token_index
+from 0, token_id, response_id, `field` decided by the token, item ids only when
+an item is open); the shadow path is unchanged. `arcint:span` carries
+start/end/`event` for thinking, tool_call, loop_guard and context_guard with
+`token_index` and `detail`, no item ids. The thinking span starts at 0 for a
+template-opened block or at the model's opener, ends on the closer
+(`closed:false` at turn end); the tool span brackets the opener-to-closer token
+range by id or text-form fallback (`truncated:true` at turn end). Loop and
+context events are filled by the sampler into a per-request
+`SamplerParams::span_events` vector with `emitted_` as the index and drained by
+the writer at the emit that follows; no backend call site and no step-loop
+change. A token whose piece arrives in halves is one event (the stub's UTF-8
+split tail now carries -1, matching the stop matcher's held-tail convention).
+Red first five event cases; the three vector/drain cases carried their
+declarations and ran red once with the sink disabled. Gate: `ctest -L unit`
+9/9, `arcint-test --max-skips 0` 486 cases 0 failed 0 skipped,
+`feyntalk-golden` 12/12 byte-identical, roundtrip green, `ctest -L compliance`
+7/7 (`measured-here`, stub, aarch64, 2026-10-31). Token mode stays off by
+default; the off path is byte-identical. The card-side shadow/hash checks and
+the two-load material hash remain W6e / the maintainer's W6a recipe.
+
 W5 still owes the live token-mode leg (W6e). `GET /v1/responses/{id}` is not in
 the 2026-04-24 OpenAPI document and was not added. No WebSocket, no
-compact/background, no W6b/W6c/W6d/W6f work.
+compact/background, no W6c/W6d/W6f work.
 
 ## Where it lives
 
@@ -1377,6 +1400,14 @@ compact/background, no W6b/W6c/W6d/W6f work.
 - `src/api/error.h` — the spec-typed `responses_error` next to `error_body`.
 - `src/api/renderer.{h,cpp}` — the material surface (W6a): `/props` flags,
   `GET /v1/responses/renderer`, the 404; the backend owns the material.
+- `src/api/responses_stream.cpp` — W6b's `arcint:token`, the span tracker
+  (thinking, tool_call) and the drain of the sampler's span vector; the text
+  shadow path is untouched.
+- `src/core/reasoning.{h,cpp}` — `ReasoningStreamer::field_for` and
+  `TokenField`: the token's side of the think split by id/state.
+- `src/core/sampling.h` (`SamplerSpanEvent`, `SamplerParams::span_events`) and
+  `src/core/sampler.cpp` (`span_event_`, the five loop sites and the two
+  context sites) — the per-request event vector.
 - `src/core/renderer_material.{h,cpp}` — `assemble_renderer_material`: schema
   `feyntalk-render/1` and the canonical hash over the five hashable parts.
 - `src/util/{canonical_json,sha256}.{h,cpp}` — the JCS subset and the hash it
