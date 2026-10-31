@@ -48,6 +48,26 @@ api::PeerProbe peer_probe(socket_t sock) {
     };
 }
 
+// One req: line per refusal at parse/prepare time (nothing answers it in the
+// log today otherwise, and the live run had to reproduce a 400 by hand). The
+// response bytes are unchanged; the numbers the envelope carries
+// (prompt_tokens/n_ctx on an overflow) go on the line.
+void log_refusal(const char* surface, const api::HttpResult& err) {
+    const json& e = err.body["error"];
+    const std::string code = (e.contains("code") && e["code"].is_string())
+                                ? e["code"].get<std::string>() : "invalid_request";
+    const std::string param = (e.contains("param") && e["param"].is_string())
+                                ? e["param"].get<std::string>() : "";
+    std::string numbers;
+    if (err.body.contains("prompt_tokens") && err.body["prompt_tokens"].is_number_integer())
+        numbers += log::format(" prompt_tokens=%d", err.body["prompt_tokens"].get<int>());
+    if (err.body.contains("n_ctx") && err.body["n_ctx"].is_number_integer())
+        numbers += log::format(" n_ctx=%d", err.body["n_ctx"].get<int>());
+    log::warn("req", "%s refused: %d code=%s%s%s", surface, err.status, code.c_str(),
+              param.empty() ? "" : log::format(" param=%s", param.c_str()).c_str(),
+              numbers.c_str());
+}
+
 // The in-flight registry entry's life: removed on every exit, including an
 // exception out of the route (a leaked registry entry would answer a cancel
 // with 200 for a response that is gone).
@@ -275,20 +295,24 @@ void HttpServer::Impl::route() {
         try {
             body = json::parse(req.body);
         } catch (const json::exception& e) {
-            send_json(res, 400,
-                      api::responses_error(log::format("request body is not valid JSON: %s",
-                                                       e.what()), "invalid_request", "invalid_request"));
+            const api::HttpResult err{400, api::responses_error(
+                log::format("request body is not valid JSON: %s", e.what()),
+                "invalid_request", "invalid_request")};
+            log_refusal("responses", err);
+            send_json(res, err.status, err.body);
             return;
         }
 
         api::ResponseRequest parsed;
         if (auto err = api::parse_response_request(body, parsed)) {
+            log_refusal("responses", *err);
             send_json(res, err->status, err->body);
             return;
         }
 
         auto prep = std::make_shared<api::PreparedResponse>();
         if (auto err = api::prepare_response(ctx, std::move(parsed), *prep)) {
+            log_refusal("responses", *err);
             send_json(res, err->status, err->body);
             return;
         }

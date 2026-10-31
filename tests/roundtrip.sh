@@ -476,6 +476,19 @@ curl -sS "http://127.0.0.1:${CANCEL_PORT}/health" -o "${WORK}/after-cancel.json"
 jassert "${WORK}/after-cancel.json" 'd["slots_free"]==d["slots_total"] and d["queue_depth"]==0'
 check "the aborted request released its slot" $?
 
+# The W5 measurement tool runs against the stub: cancel arm, line-by-line SSE,
+# unique nonce at the prompt head, and a prefill-rate estimate when no explicit
+# tokens-at-issue is given.
+python3 "$(cd "$(dirname "$0")/../tools" && pwd)/feyntalk_cancel.py" --base-url "http://127.0.0.1:${CANCEL_PORT}" \
+       --log "$CANCEL_LOG" --model stub --prompt-words 80 --arm cancel >"${WORK}/cancel-tool.json"
+python3 - "${WORK}/cancel-tool.json" <<'PY3'
+import json, sys
+d = json.loads(open(sys.argv[1], encoding="utf-8").read().strip().splitlines()[-1])
+sys.exit(0 if (d["cancel_status"] == 200 and d["cancelled_event"] is True
+               and d["prefilled"] is not None and d["tokens_at_issue_source"] == "prefill-rate estimate") else 1)
+PY3
+check "tools/feyntalk_cancel.py cancel arm measures against the stub" $?
+
 kill -TERM "$CANCEL_PID" 2>/dev/null
 wait "$CANCEL_PID" 2>/dev/null
 
@@ -650,6 +663,17 @@ check "/v1/responses carries every required ResponseResource key" $?
 jassert "${WORK}/resp.json" \
   'd["usage"]["input_tokens"]>0 and d["usage"]["total_tokens"]==d["usage"]["input_tokens"]+d["usage"]["output_tokens"] and d["usage"]["input_tokens_details"]["cached_tokens"]==0'
 check "/v1/responses usage is filled" $?
+
+# A refusal answers 400 and leaves one req: warning line with the code and the
+# field (W5 live-leg finding: the server log said nothing about a prepare-time
+# refusal, and reproducing it by hand was the only way).
+code=$(curl -sS -o "${WORK}/resp-refused.json" -w '%{http_code}' "${OP_BASE}/v1/responses" \
+       -H 'Content-Type: application/json' -d '{"model":"stub","input":"x","include":[7]}')
+check "/v1/responses refuses a non-string include entry" "$([[ $code == 400 ]] && echo 0 || echo 1)"
+jassert "${WORK}/resp-refused.json" 'd["error"]["code"]=="invalid_request" and d["error"]["param"]=="include"'
+check "the include refusal names the field" $?
+grep -q 'responses refused: 400 code=invalid_request param=include' "$OP_LOG"
+check "a Responses refusal writes one req: warning line" $?
 
 # SSE (W2): every frame has an `event:` line equal to the body's type, the
 # sequence numbers run 1..N without a gap, the terminal event is last and
