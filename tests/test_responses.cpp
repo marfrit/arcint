@@ -1988,12 +1988,43 @@ TEST(responses_truncation_auto_drops_several_newest_last) {
     CHECK_EQ(prep.chat.req.messages.size(), 5u);
 }
 
-// Nothing left to drop and the prompt is still over: the same 400 code, and
-// the message names the drops and how many tokens are still over.
-TEST(responses_truncation_auto_exhausted_is_the_same_400_with_counts) {
+// N1: auto may truncate, it never refuses more than disabled. Nothing left to
+// drop and n_ctx - reserve < tokens < n_ctx: disabled serves (the context
+// guard forces the closer early), so auto serves too -- with the first
+// render's count, nothing counted as dropped.
+TEST(responses_truncation_auto_never_refuses_more_than_disabled) {
+    ResponseRequest r;
+    r.chat.model = "stub";
+    r.truncation = "auto";
+    ChatMessage u;
+    u.role    = "user";
+    u.content = "a prompt with no replayed reasoning at all";
+    r.chat.messages = {u};
+    const int tokens = prompt_tokens_of(r.chat);
+    Fixture fx(tokens + 100);   // limit = tokens - 156: over the fit limit, under n_ctx
+
+    PreparedResponse prep;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r), prep).has_value());
+    CHECK_EQ(prep.chat.truncation.blocks_dropped, 0);
+    CHECK_EQ(prep.chat.truncation.tokens_before, tokens);
+    CHECK_EQ(prep.chat.truncation.tokens_after, tokens);
+
+    ResponseRequest disabled;
+    disabled.chat.model = "stub";
+    disabled.truncation = "disabled";
+    disabled.chat.messages = {u};
+    PreparedResponse prep2;
+    CHECK(!api::prepare_response(fx.ctx, std::move(disabled), prep2).has_value());
+    CHECK_EQ(prep.chat.input.prompt, prep2.chat.input.prompt);
+}
+
+// Nothing left to drop and the prompt reaches n_ctx: the same 400 code, the
+// message names the drops and how many tokens are still over, and the counts
+// reach the client (N4).
+TEST(responses_truncation_auto_exhausted_past_n_ctx_is_the_same_400_with_counts) {
     ResponseRequest r = replay_request("auto");
     const int       two = tokens_without_both(r);
-    Fixture fx(two + kDefaultFitReserve - 1);
+    Fixture fx(two - 5);
 
     PreparedResponse prep;
     const auto       err = api::prepare_response(fx.ctx, std::move(r), prep);
@@ -2003,10 +2034,45 @@ TEST(responses_truncation_auto_exhausted_is_the_same_400_with_counts) {
     const json& e = err->body["error"];
     CHECK_EQ(e["code"].get<std::string>(), std::string("context_length_exceeded"));
     const std::string msg = e["message"].get<std::string>();
-    CHECK(msg.find("reasoning dropped: 2 blocks, still 1 over") != std::string::npos);
+    CHECK(msg.find("reasoning dropped: 2 blocks, still 5 over") != std::string::npos);
     CHECK_EQ(err->body["prompt_tokens"].get<int>(), two);
-    CHECK_EQ(err->body["n_ctx"].get<int>(), two + kDefaultFitReserve - 1);
+    CHECK_EQ(err->body["n_ctx"].get<int>(), two - 5);
+    CHECK_EQ(err->body["overflow"].get<int>(), 5);
+    CHECK_EQ(err->body["fit_reserve"].get<int>(), kDefaultFitReserve);
+    CHECK_EQ(err->body["reasoning_dropped_blocks"].get<int>(), 2);
     CHECK(!err->body.contains("arcint"));   // a refusal is not a response
+}
+
+// N2: reasoning the template never renders is not a drop. The last user
+// message is the request's end here, so the earlier assistant's reasoning is
+// not in the prompt; clearing it changes nothing, and the fit pass must not
+// count it (nor spend a counted re-render on it). The prompt is over the fit
+// limit but under n_ctx, so it is served.
+TEST(responses_truncation_auto_ignores_reasoning_the_template_never_renders) {
+    ResponseRequest r;
+    r.chat.model = "stub";
+    r.truncation = "auto";
+    ChatMessage u1;
+    u1.role    = "user";
+    u1.content = "first question";
+    ChatMessage a;
+    a.role      = "assistant";
+    a.content   = "earlier answer";
+    a.reasoning = reasoning_text("OLD") + " OLD-REASON";
+    ChatMessage u2;
+    u2.role    = "user";
+    u2.content = "second question";
+    r.chat.messages = {u1, a, u2};
+    const int tokens = prompt_tokens_of(r.chat);
+    Fixture fx(tokens + 100);   // over the fit limit, under n_ctx
+
+    PreparedResponse prep;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r), prep).has_value());
+    CHECK_EQ(prep.chat.truncation.blocks_dropped, 0);
+    CHECK_EQ(prep.chat.truncation.tokens_before, tokens);
+    CHECK_EQ(prep.chat.truncation.tokens_after, tokens);
+    CHECK(prep.chat.input.prompt.find("OLD-REASON") == std::string::npos);
+    CHECK_EQ(prep.chat.req.messages[1].reasoning.find("OLD-REASON") != std::string::npos, true);
 }
 
 // disabled and an absent field keep today's 400 exactly: no fit pass, no
