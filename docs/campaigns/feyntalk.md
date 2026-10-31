@@ -634,8 +634,21 @@ re-prefill). The template's rule now keeps the reasoning only for assistant
 turns after the last user message (the running tool loop), so inside that loop
 the replayed block renders as it was generated; earlier turns stay dropped by
 the template's own rule. What remains is the template's formatting and a
-client's item shape — a clean re-run of Gate 4 is owed with W3.2 merged, and
-the number is not claimed here.
+client's item shape.
+
+**W3.2 A/B, measured-here (2026-10-31):** Arc Pro B60, the dense 27B agent
+model with the agent unit's own flags, the same base build with and without
+W3.2+W3.3, a pi client (`openai-responses`, thinking on) running a multi-step
+tool task (find the file that sets a port, change it, read it back, answer),
+4 runs per arm. Task PASS 4/4 in both arms, answers and tool calls right, no
+think-state anomaly. Per in-run step, cache hit minus the prior request's
+prompt tokens: without W3.2 **-4 in all 13 steps** (the cache never reaches the
+prior turn's output; the whole prior generation re-prefills every step); with
+W3.2 **median +53, max +121, min -4 over 15 steps**, i.e. a median **100 %** of
+the prior turn's generated tokens reused. Totals: 17 requests, hit 89.4 %, 4,182
+fresh prefill tokens vs 19 requests, hit 91.8 %, 3,738 fresh. Thinking was short
+on this task (50-300 characters a step), so the absolute saving is small here;
+with long reasoning steps the arm without W3.2 re-prefills all of them.
 
 W5 still owes the compliance vendor + runner and the live token-mode leg is
 W6. `GET /v1/responses/{id}` is not in the 2026-04-24 OpenAPI document and
