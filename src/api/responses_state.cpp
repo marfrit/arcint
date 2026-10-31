@@ -181,6 +181,18 @@ void ResponseStore::erase(const std::string& id) {
     entries_.erase(id);
 }
 
+std::shared_ptr<StoredResponse> ResponseStore::find_stored_any(const std::string& id) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto it = entries_.find(id);
+    return it == entries_.end() ? nullptr : it->second;
+}
+
+void ResponseStore::begin_in_flight(std::shared_ptr<InFlightResponse>) {}
+std::shared_ptr<InFlightResponse> ResponseStore::find_in_flight(const std::string&) {
+    return nullptr;
+}
+void ResponseStore::end_in_flight(const std::string&) {}
+
 int ResponseStore::entries() const {
     std::lock_guard<std::mutex> guard(mutex_);
     return static_cast<int>(entries_.size());

@@ -45,6 +45,17 @@ struct StoredResponse {
 
 // Per-lane limits, LRU eviction by `last_used`, TTL sweep. Operator flags fill
 // Limits; entries == 0 disables retention entirely (review R4).
+// A response that is running right now (docs/campaigns/feyntalk.md Cancel, W4):
+// the id registered before the first event, its cancel flag and the prepared
+// request, so a cancel POST can answer the in-progress snapshot. `store=false`
+// is registered too and removed when the request ends.
+struct InFlightResponse {
+    std::string                       id;
+    int                               lane = -1;
+    std::shared_ptr<std::atomic<bool>> cancel;
+    std::shared_ptr<PreparedResponse> prep;   // alive for the snapshot, not copied
+};
+
 class ResponseStore {
 public:
     struct Limits {
@@ -61,6 +72,14 @@ public:
     // touches `last_used`.
     std::shared_ptr<StoredResponse> get(const std::string& id, int lane);
     void erase(const std::string& id);
+    // Any stored entry, regardless of lane: the cancel POST has no lane.
+    std::shared_ptr<StoredResponse> find_stored_any(const std::string& id);
+
+    // The in-flight registry (W4): begin before the first event, end on every
+    // exit. A cancel POST finds it here first, then a terminal stored entry.
+    void begin_in_flight(std::shared_ptr<InFlightResponse> entry);
+    std::shared_ptr<InFlightResponse> find_in_flight(const std::string& id);
+    void end_in_flight(const std::string& id);
     // The TTL sweep, driven by `now`; put/get call it with the wall clock.
     void sweep(int64_t now);
 
@@ -75,6 +94,7 @@ private:
     Limits             limits_;
     uint64_t           use_counter_ = 0;
     std::unordered_map<std::string, std::shared_ptr<StoredResponse>> entries_;
+    std::unordered_map<std::string, std::shared_ptr<InFlightResponse>> in_flight_;
 };
 
 // sha256 of a byte string as lowercase hex: the prefix hash the campaign names.

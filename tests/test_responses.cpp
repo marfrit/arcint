@@ -4,9 +4,11 @@
 #include "api/responses_stream.h"
 
 #include <atomic>
+#include <chrono>
 #include <ctime>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -667,6 +669,7 @@ public:
     }
 
     std::vector<std::pair<std::string, int>> pieces;
+    int             delay_ms       = 0;   // lets a cancel arrive mid-decode
     FinishReason    reason         = FinishReason::Stop;
     bool            throw_after    = false;
     size_t          throw_at       = 0;
@@ -685,6 +688,12 @@ public:
         }
         for (size_t i = 0; i < pieces.size(); ++i) {
             if (throw_after && i == throw_at) throw std::runtime_error("backend exploded");
+            if (in.cancel && in.cancel->load(std::memory_order_relaxed)) {
+                stats.abort_cause = AbortCause::Cancelled;
+                return FinishReason::Abort;
+            }
+            if (delay_ms > 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
             const Control c = on_piece(pieces[i].first, pieces[i].second);
             ++stats.completion_tokens;
             if (c == Control::Cancel) {
@@ -1441,4 +1450,139 @@ TEST(responses_continuation_without_instructions_keeps_the_stored_head) {
     int systems = 0;
     for (const ChatMessage& m : p.chat.req.messages) if (m.role == "system") ++systems;
     CHECK_EQ(systems, 1);
+}
+
+// ---------------------------------------------------- cancel by id (W4)
+TEST(responses_in_flight_registry_registers_and_removes) {
+    api::ResponseStore store(api::ResponseStore::Limits{32, 1ull << 20, 600});
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    auto entry = std::make_shared<api::InFlightResponse>();
+    entry->id     = "resp-flight";
+    entry->lane   = 0;
+    entry->cancel = cancel;
+    entry->prep   = std::make_shared<api::PreparedResponse>();
+    store.begin_in_flight(entry);
+
+    const auto found = store.find_in_flight("resp-flight");
+    CHECK(found != nullptr);
+    if (!found) return;
+    CHECK_EQ(found->lane, 0);
+    found->cancel->store(true, std::memory_order_relaxed);
+    CHECK(cancel->load(std::memory_order_relaxed));
+    CHECK(store.find_in_flight("resp-other") == nullptr);
+
+    // store=false registers while in flight and removes at the end: the
+    // registry is not the store.
+    CHECK_EQ(store.entries(), 0);
+    store.end_in_flight("resp-flight");
+    CHECK(store.find_in_flight("resp-flight") == nullptr);
+}
+
+TEST(responses_stream_cancel_emits_cancelled_then_incomplete) {
+    StreamFixture fx;
+    fx.backend.pieces   = {{"one", 1}, {" two", 2}, {" three", 3}, {" four", 4},
+                           {" five", 5}, {" six", 6}};
+    fx.backend.delay_ms = 15;
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    fx.prep.chat.input.cancel = cancel;
+    fx.prep.chat.input.peer_alive = [cancel] {
+        return !cancel->load(std::memory_order_relaxed);
+    };
+
+    std::vector<std::string> raw;
+    api::stream_response(fx.ctx, fx.prep, 0, [&](std::string_view frame) {
+        raw.emplace_back(frame);
+        // The client asks to cancel after the first answer delta.
+        if (std::string_view(frame).find("\"response.output_text.delta\"") != std::string_view::npos)
+            cancel->store(true, std::memory_order_relaxed);
+        return true;
+    });
+    const Sse s = parse_sse(raw);
+    check_framing(s);
+    CHECK(!s.events.empty());
+    if (s.events.empty()) return;
+    CHECK(s.done);
+    int cancelled = -1, terminal = -1, item_done = -1;
+    for (size_t i = 0; i < s.events.size(); ++i) {
+        const std::string& t = s.events[i].first;
+        if (t == "arcint:response.cancelled" && cancelled < 0) cancelled = static_cast<int>(i);
+        if (t == "response.incomplete") terminal = static_cast<int>(i);
+        if (t == "response.output_item.done") item_done = static_cast<int>(i);
+    }
+    CHECK(cancelled >= 0);
+    if (cancelled < 0) return;
+    CHECK_EQ(s.events[cancelled].second["v"].get<int>(), 1);
+    CHECK(item_done < cancelled);   // the open item closes before the terminal
+    CHECK(cancelled < terminal);
+    CHECK_EQ(s.events[terminal].second["response"]["status"].get<std::string>(),
+             std::string("incomplete"));
+    CHECK_EQ(s.events[terminal].second["response"]["incomplete_details"]["reason"].get<std::string>(),
+             std::string("cancelled"));
+    CHECK_EQ(s.events[terminal].second["response"]["output"].back()["status"].get<std::string>(),
+             std::string("incomplete"));
+}
+
+TEST(responses_non_stream_cancel_returns_the_incomplete_resource) {
+    StreamFixture fx;
+    fx.backend.pieces   = {{"one", 1}, {" two", 2}, {" three", 3}, {" four", 4}};
+    fx.backend.delay_ms = 30;
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    fx.prep.chat.input.cancel = cancel;
+    fx.prep.chat.input.peer_alive = [cancel] {
+        return !cancel->load(std::memory_order_relaxed);
+    };
+
+    api::HttpResult result;
+    std::thread run([&] { result = api::run_response(fx.ctx, fx.prep, 0); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(70));
+    cancel->store(true, std::memory_order_relaxed);
+    run.join();
+
+    CHECK_EQ(result.status, 200);
+    if (result.status != 200) return;
+    CHECK_EQ(result.body["status"].get<std::string>(), std::string("incomplete"));
+    CHECK_EQ(result.body["incomplete_details"]["reason"].get<std::string>(), std::string("cancelled"));
+    CHECK_EQ(result.body["output"].back()["status"].get<std::string>(), std::string("incomplete"));
+}
+
+TEST(responses_stub_cancel_is_named_and_aborts_at_the_prefill_boundary) {
+    // The stub proof: make_stub_backend(..., prefill_ubatches=4), the cancel
+    // flag set before the run. The backend sees it at its first ubatch boundary
+    // (the same check the real backend makes), names the cause Cancelled, and
+    // the turn returns the incomplete resource.
+    auto backend = make_stub_backend(4096, 0, {}, {}, {}, /*prefill_ubatches=*/4);
+    SlotPool slots(1);
+    Config   cfg;
+    cfg.stub = true;
+    Context ctx;
+    ctx.cfg = &cfg;
+    ctx.backend = backend.get();
+    ctx.slots   = &slots;
+    ctx.responses = std::make_shared<api::ResponseStore>(
+        api::ResponseStore::Limits{32, 1ull << 20, 600});
+
+    PreparedResponse prep;
+    prep.req         = ResponseRequest{};
+    prep.chat.id     = "resp-cancel";
+    prep.chat.model  = "stub";
+    prep.chat.input.prompt = "a prompt a prefill holds";
+    auto cancel = std::make_shared<std::atomic<bool>>(true);
+    prep.chat.input.cancel = cancel;
+    prep.chat.input.peer_alive = [cancel] {
+        return !cancel->load(std::memory_order_relaxed);
+    };
+    prep.affinity_slot = -1;
+
+    const auto lease = slots.acquire_for(0);
+    const api::HttpResult r = api::run_response(ctx, prep, lease.index());
+    CHECK_EQ(r.status, 200);
+    if (r.status != 200) return;
+    CHECK(r.body.is_object() && r.body.contains("status"));
+    if (!(r.body.is_object() && r.body.contains("status"))) return;
+    CHECK_EQ(r.body["status"].get<std::string>(), std::string("incomplete"));
+    CHECK_EQ(r.body["incomplete_details"]["reason"].get<std::string>(), std::string("cancelled"));
+    // Nothing was prefilled and nothing decoded: the abort was at the first
+    // boundary, not after the whole prompt.
+    CHECK_EQ(r.body["usage"]["input_tokens"].get<int>(), 0);
+    CHECK_EQ(r.body["usage"]["output_tokens"].get<int>(), 0);
 }
