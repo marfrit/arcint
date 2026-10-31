@@ -63,6 +63,34 @@ not yet told apart.
    counts: test-backend-ops on both cards, the answers at the answer-level bar, a same-window speed A/B against the
    default driver - on the installed runtime and on the newest one (in the fresh-host container). Then the probe
    (`tools/l0_vm_arena_probe.c`).
+
+   **Gate, first window (installed runtime 26.27.39122.11, 2026-10-31, `measured-here`).** The same binaries under
+   `EnableLEO=1 NEOReadDebugKeys=1` against the default driver; test-backend-ops from the pin + 0001-0068 + 0071 (the
+   int8 arm off); the release A/B (`tests/acceptance/ab.py`, two rounds, the package 1.2.7 binary against itself
+   under LEO through a wrapper).
+   - The device ids do not move: each card is its own OpenCL platform under both drivers (`GGML_OPENCL_DEVICES`
+     B60 `0:0`, A770 `1:0`); the device string reads `OpenCL 3.0 LEO`.
+   - **Op suite: LEO fails it on both cards.** Every op whose test cases load quantized tensors aborts at the first
+     such tensor: `clEnqueueNDRangeKernel ... error -54` (`CL_INVALID_WORK_GROUP_SIZE`) in the backend's set_tensor
+     convert kernels (the q8_0 convert, ggml-opencl.cpp:13198, a global size of n_blocks against a local 64; and
+     :12413), launches the default driver accepts as non-uniform work groups. Aborted per op on both cards: MUL_MAT,
+     FLASH_ATTN_EXT, GET_ROWS, SET_ROWS; MUL_MAT_ID aborts on the A770 and runs on the B60 (476/550, the default
+     driver's count: the 74 failures are the pin's MXFP4 cases, README 0012). Passed under LEO on both cards: CPY 146,
+     ROPE 470, RMS_NORM 33, SOFT_MAX 214, ADD 105, MUL 94, SCALE 4, CONT 72, ARGSORT 46, TOP_K 533, SSM_CONV 45,
+     GATED_DELTA_NET 53. Default driver, same binary: A770 7522/7525 (three FLASH_ATTN_EXT hsk=64 f16 cases, also
+     red in an earlier window's log), B60 7451/7525 (the 74 MXFP4 cases).
+   - **Served, the units' models load and answer** (their tensors happen to fill whole work groups), texts
+     byte-identical to the default driver in every run of both arms:
+     - coder (A770): decode +5.6 to +5.8 % (51.60 -> 54.60, 52.80 -> 55.75, 45.35 -> 47.90 t/s; the verify time per
+       answer 4.20 -> 4.02 s), prefill at 41k -5.4 % (730.45 -> 691.35 t/s): FAIL on prefill.
+     - agent (B60): prefill at 55k 715.50 -> 714.30 (-0.17 %), 138k 503.20 -> 502.65 (-0.11 %), inside the floor:
+       PASS (the agent cell has no decode metric).
+   - Disposition: route A is not usable on 26.27 as is. Before LEO can carry an arena, the backend's launches need
+     uniform work groups (round the global size up with a bound check in the kernel, or query
+     `CL_DEVICE_NON_UNIFORM_WORK_GROUP_SUPPORT` / compile per device), and the coder's prefill loss needs a cause.
+     The coder's decode gain under LEO is a lead of its own (the A770's per-launch host cost behind the chipset,
+     contrib/llama.cpp/README.md 0047; not yet explained, not yet measured on Flash-Next's decode). Owed: the
+     newest runtime in the fresh-host container, Flash-Next served under LEO.
 2b. **Route B - a chunk pool on the default driver (if LEO falls short).** Allocate the usable VRAM once at load as a
    fixed set of large `cl_mem` chunks; a ggml buffer type hands out ranges inside them (the backend already addresses
    every tensor as buffer + offset, `data_device` set in one place, `code`); the backend's grow-only buffers and the
