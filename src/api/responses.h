@@ -75,9 +75,29 @@ std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest r
 nlohmann::json response_resource(const ResponseRequest& req, const PreparedChat& prep,
                                  const ChatGeneration& gen);
 
+// The resource's variable half, shared by the non-streamed builder above and the
+// SSE writer's snapshots: every other key is the request/preparation echo and is
+// filled once, here.
+struct ResponseParts {
+    std::string    status            = "completed";
+    nlohmann::json incomplete_details = nullptr;
+    nlohmann::json output            = nlohmann::json::array();
+    nlohmann::json usage             = nullptr;   // null while in_progress
+    nlohmann::json error             = nullptr;
+    bool           completed         = true;      // completed_at: set for completed only
+};
+nlohmann::json response_resource(const ResponseRequest& req, const PreparedChat& prep,
+                                 const ResponseParts& parts);
+
 // One non-streamed turn: drive the prepared input exactly as run_chat does,
 // then build the resource. A stop signal is a 503 envelope, a gone client no
 // body (HttpResult::gone). Generation exceptions are the spec's 500/400.
 HttpResult run_response(const Context& ctx, const PreparedResponse& prep, int slot);
+
+// The admission refusal (review F1): the spec maps a busy service to 429
+// too_many_requests/all_lanes_busy, while the chat route keeps its 503. The
+// chat body's diagnostics — `slots` and, under named lanes, `lanes` — are
+// copied into the 429 body, so a client can still tell why and retry.
+HttpResult responses_busy(const HttpResult& chat_refusal);
 
 }  // namespace lgc::api

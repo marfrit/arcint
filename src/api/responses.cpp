@@ -461,14 +461,11 @@ std::optional<HttpResult> parse_response_request(const json& body, ResponseReque
         req.chat.parallel_tool_calls = body["parallel_tool_calls"].get<bool>();
     }
 
-    // stream is honoured in the mapping but the SSE writer is W2: a streaming
-    // request is refused loudly until it exists, never answered as a JSON body.
+    // stream is honoured: true selects the SSE writer, false the complete
+    // ResponseResource as one JSON body.
     if (body.contains("stream") && !body["stream"].is_null()) {
         if (!body["stream"].is_boolean()) return invalid("stream must be a boolean", "stream");
-        if (body["stream"].get<bool>()) {
-            return unsupported("stream is not served yet: POST with stream=false for the complete "
-                               "ResponseResource (the SSE writer is the next package)", "stream");
-        }
+        req.chat.stream = body["stream"].get<bool>();
     }
     if (body.contains("stream_options") && !body["stream_options"].is_null()) {
         const json& so = body["stream_options"];
@@ -637,6 +634,47 @@ const char* item_status(FinishReason reason) {
 }  // namespace
 
 json response_resource(const ResponseRequest& req, const PreparedChat& prep,
+                       const ResponseParts& parts) {
+    const SamplerParams& sampler = prep.input.sampler;
+    // Every required key of the 2026-04-24 ResponseResource, in the order the
+    // document lists them. Zero/null where the spec says so.
+    return json{{"id", prep.id},
+                {"object", "response"},
+                {"created_at", prep.created},
+                {"completed_at", parts.completed ? json(now_seconds()) : json(nullptr)},
+                {"status", parts.status},
+                {"incomplete_details", parts.incomplete_details},
+                {"model", prep.model},
+                {"previous_response_id", nullptr},   // W1: no chain is served
+                {"instructions", req.has_instructions ? json(req.instructions) : json(nullptr)},
+                {"output", parts.output},
+                {"error", parts.error},
+                {"tools", req.tools},
+                {"tool_choice", req.tool_choice},
+                {"truncation", req.truncation},
+                {"parallel_tool_calls", req.chat.parallel_tool_calls},
+                {"text", req.text},
+                {"top_p", sampler.top_p},
+                {"presence_penalty", sampler.presence_penalty},
+                {"frequency_penalty", sampler.frequency_penalty},
+                {"top_logprobs", 0},
+                {"temperature", sampler.temperature},
+                {"reasoning", req.reasoning},
+                {"usage", parts.usage},
+                {"max_output_tokens", req.max_output_tokens > 0 ? json(req.max_output_tokens)
+                                                                : json(nullptr)},
+                {"max_tool_calls", nullptr},
+                {"store", req.store},
+                {"background", req.background},
+                {"service_tier", req.service_tier},
+                {"metadata", req.metadata},
+                {"safety_identifier", req.has_safety_identifier ? json(req.safety_identifier)
+                                                               : json(nullptr)},
+                {"prompt_cache_key", req.has_prompt_cache_key ? json(req.prompt_cache_key)
+                                                              : json(nullptr)}};
+}
+
+json response_resource(const ResponseRequest& req, const PreparedChat& prep,
                        const ChatGeneration& gen) {
     const bool completed = gen.reason == FinishReason::Stop;
 
@@ -674,60 +712,35 @@ json response_resource(const ResponseRequest& req, const PreparedChat& prep,
                               {"status", item_status(gen.reason)}});
     }
 
-    json incomplete = nullptr;
+    ResponseParts parts;
+    parts.completed = completed;
+    parts.status    = completed ? "completed" : "incomplete";
     if (!completed) {
-        incomplete = json{{"reason", gen.reason == FinishReason::Length ? "max_output_tokens"
-                                      : gen.reason == FinishReason::Loop ? "loop_guard_abort"
-                                                                        : "max_output_tokens"}};
+        parts.incomplete_details =
+            json{{"reason", gen.reason == FinishReason::Length ? "max_output_tokens"
+                            : gen.reason == FinishReason::Loop ? "loop_guard_abort"
+                                                              : "max_output_tokens"}};
     }
+    parts.output = std::move(output);
+    parts.usage  = json{{"input_tokens", gen.stats.prompt_tokens},
+                        {"output_tokens", gen.stats.completion_tokens},
+                        {"total_tokens", gen.stats.prompt_tokens + gen.stats.completion_tokens},
+                        {"input_tokens_details", {{"cached_tokens", gen.stats.cache_hit_tokens}}},
+                        // R7: from the split where it is id-exact, 0 where it is
+                        // textual (see ChatGeneration::reasoning_tokens).
+                        {"output_tokens_details", {{"reasoning_tokens", gen.reasoning_tokens}}}};
+    return response_resource(req, prep, parts);
+}
 
-    const SamplerParams& sampler = prep.input.sampler;
-    json usage = {
-        {"input_tokens", gen.stats.prompt_tokens},
-        {"output_tokens", gen.stats.completion_tokens},
-        {"total_tokens", gen.stats.prompt_tokens + gen.stats.completion_tokens},
-        {"input_tokens_details", {{"cached_tokens", gen.stats.cache_hit_tokens}}},
-        // 0 in W1: no separate reasoning-token count exists yet (W2 counts it
-        // from the split, review R7).
-        {"output_tokens_details", {{"reasoning_tokens", 0}}},
-    };
-
-    // Every required key of the 2026-04-24 ResponseResource, in the order the
-    // document lists them. Zero/null where the spec says so.
-    return json{{"id", prep.id},
-                {"object", "response"},
-                {"created_at", prep.created},
-                {"completed_at", completed ? json(now_seconds()) : json(nullptr)},
-                {"status", completed ? "completed" : "incomplete"},
-                {"incomplete_details", incomplete},
-                {"model", prep.model},
-                {"previous_response_id", nullptr},   // W1: no chain is served
-                {"instructions", req.has_instructions ? json(req.instructions) : json(nullptr)},
-                {"output", output},
-                {"error", nullptr},
-                {"tools", req.tools},
-                {"tool_choice", req.tool_choice},
-                {"truncation", req.truncation},
-                {"parallel_tool_calls", req.chat.parallel_tool_calls},
-                {"text", req.text},
-                {"top_p", sampler.top_p},
-                {"presence_penalty", sampler.presence_penalty},
-                {"frequency_penalty", sampler.frequency_penalty},
-                {"top_logprobs", 0},
-                {"temperature", sampler.temperature},
-                {"reasoning", req.reasoning},
-                {"usage", usage},
-                {"max_output_tokens", req.max_output_tokens > 0 ? json(req.max_output_tokens)
-                                                                : json(nullptr)},
-                {"max_tool_calls", nullptr},
-                {"store", req.store},
-                {"background", req.background},
-                {"service_tier", req.service_tier},
-                {"metadata", req.metadata},
-                {"safety_identifier", req.has_safety_identifier ? json(req.safety_identifier)
-                                                               : json(nullptr)},
-                {"prompt_cache_key", req.has_prompt_cache_key ? json(req.prompt_cache_key)
-                                                              : json(nullptr)}};
+HttpResult responses_busy(const HttpResult& chat_refusal) {
+    const json& e = chat_refusal.body["error"];
+    const std::string message = e["message"].is_string() ? e["message"].get<std::string>() : "";
+    json body = responses_error(message, "too_many_requests", "all_lanes_busy");
+    // The diagnostics are numbers, not a mood: a client told "busy" without
+    // slots/free cannot decide whether to retry now or later (F1, W1 review).
+    if (chat_refusal.body.contains("slots")) body["slots"] = chat_refusal.body["slots"];
+    if (chat_refusal.body.contains("lanes")) body["lanes"] = chat_refusal.body["lanes"];
+    return HttpResult{429, std::move(body)};
 }
 
 HttpResult run_response(const Context& ctx, const PreparedResponse& prep, int slot) {

@@ -58,6 +58,11 @@ struct ChatGeneration {
     bool                        reasoning_closed = false;  // the think block's closer was seen
     std::string                 content;
     std::vector<ToolCall>       calls;
+    // Tokens that produced reasoning text (review R7). Exact where the split is
+    // by tag ids (a token id is one accepted output token); 0 where the split is
+    // textual, because a piece may carry an opener, reasoning and a closer at
+    // once and the piece count is then not a token count.
+    int                         reasoning_tokens = 0;
 };
 
 // The split the non-streaming chat path has always used: token ids when the

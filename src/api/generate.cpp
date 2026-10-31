@@ -158,6 +158,30 @@ FinishReason drive(Backend& backend, const GenerationInput& in, int slot, const 
     return reason;
 }
 
+namespace {
+
+// R7: one reasoning token per accepted output token whose piece produced
+// reasoning text. Only the id-based split can say that exactly; the textual
+// split reports 0 (a piece may carry opener, reasoning and closer together).
+int reasoning_token_count(const PreparedChat& prep,
+                          const std::vector<std::pair<std::string, int>>& pieces,
+                          bool has_tag_ids) {
+    if (!has_tag_ids) return 0;
+    ReasoningStreamer streamer(prep.think_open, prep.think_tags_extended,
+                               prep.think_ids.open_close_ids);
+    int n = 0;
+    for (const auto& [piece, id] : pieces) {
+        const ReasoningStreamer::Step step = streamer.push(piece, id);
+        if (id >= 0 && !step.reasoning.empty()) ++n;
+    }
+    // Text held back for a straddling closer is the tail of a token already
+    // pushed; it is not counted a second time.
+    (void)streamer.flush();
+    return n;
+}
+
+}  // namespace
+
 void finish_chat_generation(const PreparedChat& prep,
                             const std::vector<std::pair<std::string, int>>& pieces,
                             const std::string& raw, ChatGeneration& out) {
@@ -175,6 +199,7 @@ void finish_chat_generation(const PreparedChat& prep,
     out.reasoning        = split.reasoning;
     out.reasoning_closed = split.closed;
     out.content          = split.content;
+    out.reasoning_tokens = reasoning_token_count(prep, pieces, has_tag_ids);
     if (prep.parse_tool_calls) {
         ToolCallParse parsed = parse_qwen_tool_calls(out.content, &prep.schemas);
         if (parsed.truncated) {
