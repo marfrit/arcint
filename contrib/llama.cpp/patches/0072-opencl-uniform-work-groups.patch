@@ -2717,9 +2717,9 @@ index 0000000..f5dfa10
 +//   - the kernel sources: a parameter-list line whose comment ends with a
 +//     comma swallowed a declaration separator (the ssm_conv round-2 blocker: a
 +//     comment sat before the comma, so two parameters merged), and, when a
-+//     clang exists, a syntax-only compile of every kernels/*.cl as OpenCL C
-+//     (spir64, CL3.0, the default header); files that need the backend's -D
-+//     defines or an #include are listed and skipped with a note.
++//     clang exists, a syntax-only compile as OpenCL C (spir64, CL3.0, the
++//     default header) of the sources in tests/opencl_clang_clean.txt, the list
++//     measured clean under a generic clang; the others are counted, not compiled.
 +// No GPU, no OpenCL runtime. The helper is ggml/src/ggml-opencl/
 +// ggml-opencl-uniform.h, the same header ggml-opencl.cpp includes, so a
 +// mutation here is a mutation of the backend's launch rule.

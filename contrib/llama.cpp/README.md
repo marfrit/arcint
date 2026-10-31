@@ -4866,7 +4866,8 @@ are `measured-here` where the reviewer ran them):
   unrounded, `transpose.cl` is back at the pin unchanged: the first commit's
   edits there are reverted, and the README's claim that the transpose kernels
   bound their launch was wrong.
-- the test's compile half: when a clang exists (`$CLANG`, `clang`, `clang-18`,
+- the test's compile half (round 2's form, superseded in round 4 by the explicit
+  list below): when a clang exists (`$CLANG`, `clang`, `clang-18`,
   `clang-19`), every `kernels/*.cl` is syntax-checked as OpenCL C at
   `-target spir64 -x cl -cl-std=CL3.0 -Xclang -finclude-default-header`. A
   file the backend assembles with an `#include`, or builds with its own `-D`
@@ -4924,15 +4925,15 @@ failures, exit 1 (a stub clang standing in for that compiler failure here;
 Claude runs the half with clang-18). Refresh: compile `kernels/*.cl` with the
 command above and keep the names that report no error in both texts.
 
-Card window 33 (`measured-here`: Claude, 2026-10-31, `2ba3656`'s build,
+Card window 33 (`measured-here`: Claude, 2026-10-31, `2ba3656`'s build (that round's backend text is byte-identical to this commit's; only the test half changed since),
 compute-runtime 26.27.39122.11, the same binaries under both drivers):
 - `clang-18 -target spir64 -x cl -cl-std=CL3.0 -Xclang -finclude-default-header
   -fsyntax-only` on every kernel file the patch touches, the pre-0072 text
   against the patched: no file gains an error (round 2's ssm_conv and transpose
   defects are closed).
 - `test-backend-ops`, the full eval (12,881 cases): **B60** default 12,724
-  passed, LEO 12,724 passed, the failure sets identical by name (74 MXFP4
-  `MUL_MAT_ID`, the pin's - README 0012; 70 `MUL_MAT_VEC_FUSION`, 8
+  passed, LEO 12,724 passed, the failure sets identical by name (76 MXFP4
+  cases - 74 `MUL_MAT_ID`, the pin's (README 0012), and 2 `MUL_MAT_ID_W4A8`/`_W4A4`; 70 `MUL_MAT_VEC_FUSION`, 8
   `SWIGLU_OAI`, 3 `ADD_{SILU,SIGMOID,SOFTPLUS}_MUL`, all failing under the
   default driver too), so on the B60 LEO passes exactly what the default driver
   passes. **A770** default 12,867 passed (3 `ADD_*_MUL`, 3 `FLASH_ATTN_EXT`

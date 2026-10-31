@@ -117,13 +117,13 @@ not yet told apart.
    build fails; a stub clang failing ssm_conv, the compile FAIL. The cards were measured in window 33 (below);
    commands in `contrib/llama.cpp/README.md` 0072.
 
-   **Card window 33, `measured-here` (Claude, 2026-10-31, `2ba3656`'s build, compute-runtime
+   **Card window 33, `measured-here` (Claude, 2026-10-31, `2ba3656`'s build (that round's backend text is byte-identical to this commit's; only the test half changed since), compute-runtime
    26.27.39122.11, the same binaries under both drivers).** The launch defect is closed on both cards:
    - `clang-18 -target spir64 -x cl -cl-std=CL3.0 -Xclang -finclude-default-header -fsyntax-only` on every
      kernel file 0072 touches, the pre-0072 text against the patch's: no file gains an error (ssm_conv's
      comma-merged declarations and transpose's misplaced bound are gone).
    - `test-backend-ops`, the full eval (12,881 cases), per card: **B60** default 12,724 passed, LEO 12,724
-     passed, the failure sets identical by name (74 MXFP4 `MUL_MAT_ID`, the pin's; 70 `MUL_MAT_VEC_FUSION`,
+     passed, the failure sets identical by name (76 MXFP4 cases - 74 `MUL_MAT_ID`, the pin's, and 2 `MUL_MAT_ID_W4A8`/`_W4A4`; 70 `MUL_MAT_VEC_FUSION`,
      8 `SWIGLU_OAI`, 3 `ADD_{SILU,SIGMOID,SOFTPLUS}_MUL`, all failing under the default driver too) - on the
      B60 LEO passes exactly what the default driver passes. **A770** default 12,867 passed (3 `ADD_*_MUL`, 3
      `FLASH_ATTN_EXT` hsk=64 f16, 8 `SWIGLU_OAI`); LEO matches those failures then the runtime aborts after
