@@ -33,8 +33,9 @@ arcint prize is not 4.8-5.7×** — the mechanism is already inside a ubatch, an
 across-ubatch arm is +3.1 % (`paper`, arcint stage 5). See item 1 below for why.
 
 Evidence classes on every claim: `code` = read in `arcint-src/` (arcint at `qfndev`, 3f449ff) or
-`llama-src/` (llama.cpp at the pin `3e4dfa8` with the served series, `0001-0067`, without 0031,
-0055, 0061); `paper` = what a commit message, a document or arcint's own campaign record states
+`llama-src/` (llama.cpp at the pin `3e4dfa8` with the served series, `0001-0072`, without 0031,
+0055, 0061); line numbers below are that patched tree's, which is not the pin's -- the series
+shifts them (the router's f32 accumulator: `:2171` here, `:2155` at the pin); `paper` = what a commit message, a document or arcint's own campaign record states
 (arcint's campaign numbers are its own `measured-here` class, quoted here as `paper`); "(inferred)" =
 my reasoning from the code and the record. Out of scope and not audited: 4 route-resident bias, 8
 screened vocab head, 12 late-layer approximate prefill, 17 lower-precision KV — all four change the
@@ -721,6 +722,84 @@ answer by design.
   Files: `tools/*.py`, the backend's logits read (`src/exec/backend_llama.cpp`). ~150-250 lines.
   Red-first: the mask's unit test (a planted high-KL position in a non-assistant span must not move
   the mean) — mutation: the mask off by one token, the test fails.
+
+### Built (2026-10-31, `code`, device-free tests only)
+
+The mask and the noise floor are in the tools, before the first quality-moving arm:
+
+- **the assistant mask** (`code`). `tools/kld_served.py`'s `assistant_spans` reads a chat request's
+  turns and the assistant turns' token ids — the ids the capture's window holds (the pin's
+  `llama-tokenize` at the capture's own parse-special setting, since perplexity does not parse
+  specials) — and locates each turn's span in the window forward from the previous turn's end, so a
+  multi-turn transcript masks the earlier assistant turns and the reply. Because the located
+  sequence is the turn's text WITH its closing marker, a user turn quoting the reply's text cannot
+  be taken for the reply. A turn whose ids are not in the window is refused by name, never masked
+  silently. `tools/capture_vs_capture.py --spans FILE` prints the masked mean and argmax beside the
+  unmasked ones.
+- **a row scores the next token** (`code`). A `--kl-divergence-base` capture is written by
+  `kl_divergence()` (`llama-src/tools/perplexity/perplexity.cpp:1675`): its worker scores row `i`
+  with `log_softmax(..., tokens[i+1], local_kld)` (`:287`; the plain-text writer does the same at
+  `:157-160`), `first = n_ctx/2` at `:1772`, and the row's token base is `tokens.data() + start +
+  seq*n_ctx + first` (`:1887`), so row position `p` holds the
+  prediction of token `p + 1` and a token range `[start, end)` is masked as the row range
+  `[start - 1, end - 1)` (`token_rows`). The reply's first token's prediction — the one after the
+  assistant header, usually the reply's highest-entropy token — is inside the mask, the token after
+  the reply is outside. The convention is stated in the tools' docstrings and in the single mode's
+  output line.
+- **a reply's ids are tokenised with its closing marker** (`code`). Standalone, a reply ending in
+  punctuation gets a different last id: the Qwen2 pretokenizer folds the trailing punctuation and
+  the marker's leading characters into one token (its regex alternative
+  `?[^\s\p{L}\p{N}]+[\r\n]*`). The transcript therefore carries the turn's ids as text PLUS
+  marker tokenised together, and the marker's own ids; `reply_end` drops the marker's ids from the
+  tail and keeps a merged last token, and refuses a tail that matches neither.
+- **a corpus arm has no roles** (`code`). `llama-perplexity --kl-divergence-base` over plain text
+  carries no roles; the tool states that every recorded position is scored there and invents no
+  mask. The claim is in the tool's output and in its docstring.
+- **the noise floor, two numbers** (`code`). The twin mode reports mean KL and argmax agreement as
+  separate floor values, each with the two baseline runs' own spread, and flags a candidate "inside
+  the floor" when its difference lies within that spread, "outside" otherwise. `CLAUDE.md`'s
+  answer-level bar (0.03 nats worse than the baseline arm, argmax at most 1 point below) is printed
+  beside it, unchanged, as its own verdict — a card's floor is no bar.
+- **the FP32 logit diagnostic is not built** (`code`). The graph DECLARES f32: the head's
+  `ggml_mul_mat` result is `GGML_TYPE_F32` (`llama-src/ggml/src/ggml.c:3370`), qwen4exp takes that
+  tensor as `res->t_logits` (`llama-src/src/models/qwen4exp.cpp:519-521`, MTP head `:613-615`), and
+  the MoE router asks for f32 accumulation CONDITIONALLY — `ggml_prec_set_acc(logits,
+  GGML_PREC_F32)` inside `if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS)`
+  (`llama-src/src/llama-graph.cpp:2170-2171`; `:2155` at the pin), so not for other gating
+  functions. A declaration does not settle the KERNEL's arithmetic — which is what the reference's
+  BF16-logit finding is about — so the accumulator forms of kernels whose result this series
+  deposits as f32 were read: `float sumf[N_R0_MXFP4]`
+  (`llama-src/ggml/src/ggml-opencl/kernels/mul_mv_mxfp4_f32_flat.cl:127`), `float8 sumf`
+  (`kernels/mul_mv_iq4_nl_f32_flat.cl:114`), `float4 sumf` in the expert-routed GEMV
+  (`kernels/mul_mv_id_q8_0_f32_flat.cl:136`) and the router kernel this tree adds (`float wsum`,
+  `contrib/llama.cpp/patches/0064-opencl-intel-topk-moe-subgroup.patch`). That is not a claim about
+  the LM head: it is a dense matmul, neither expert-routed nor one of those three weight types on
+  the served GGUFs. NOT examined: the dispatch of a given shape to a given kernel for every model,
+  which Adreno/Intel path wins, and the f16 GEMM accumulators.
+
+The reference's mask case remains `paper` (99 % of an arm's KL in positions the model never writes);
+the arcint counterpart is owed: one served KL arm with `--spans`, masked against unmasked, on the
+agent and on Flash-Next, with a twin. No card run has been made here.
+
+The transcript the arm needs is written by `tools/tokenize_turn.py`, which pins the capture's
+tokenisation: perplexity's `common_tokenize(ctx, prompt, true)` omits `parse_special`, so it takes the
+default `false` (`llama-src/common/common.h:1159-1163`; the calls at
+`llama-src/tools/perplexity/perplexity.cpp:310`, KL mode `:473`), while the pin's `llama-tokenize` defaults `parse_special = true` for its own example
+(`llama-src/common/arg.cpp:1408`) and its affirmative `--parse-special` is imatrix-only (`:3227-3233`);
+`--no-parse-special` is the tokenize example's switch (`:3255-3261`, passed to common_tokenize at
+`llama-src/tools/tokenize/tokenize.cpp:185`). The helper always passes it, so the closing marker is
+TEXT and matches the window. Per assistant turn it tokenises the turn's text followed by the
+template's closing marker — built from parts, never typed literally — as ONE stream, and the marker
+alone; the two id lists are the turn's `tokens` and `marker_tokens`. The merged-last-token rule is a
+heuristic over the pretokenizer's regex, not a measured case. Then one `llama-perplexity
+-f <chat>.txt -c <C> -b <C> -ub 2048 --chunks 1 --save-all-logits` per arm (the reference, the twin's
+two runs, the candidate) and
+
+    python3 tools/capture_vs_capture.py REF.kld --baseline A.kld B.kld \
+      --candidate C.kld --window 0 --spans request.json
+
+`<C>` must put the reply in the recorded half: rows are `n_ctx/2 .. n_ctx-2`, so the reply's last
+token has to sit below `n_ctx - 1`, and a mask selecting no row is refused by name.
 
 ---
 

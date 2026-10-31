@@ -1,20 +1,53 @@
 #!/usr/bin/env python3
 """KL between captures of the same window in llama's format: the f32 reference
-(window 0) against a served capture (window W). A comparison is judged against
-the card's own run-to-run floor, so the twin mode takes two baseline captures
-(same binary and configuration, two runs) beside one candidate and reports the
-baseline twin's mean KL, the candidate's and the difference. An optional mask
-restricts both to [start, end) token ranges, the assistant spans of a rendered
-chat, and the masked and unmasked numbers are printed side by side.
+(window 0) against a served capture (window W).
 
-  capture_vs_capture.py REF_CAPTURE OTHER_CAPTURE OTHER_WINDOW [--mask FILE]
+The floor is the card's own run-to-run noise, and it is TWO numbers, not one:
+mean KL and argmax agreement, each with the two baseline runs' own spread. The
+twin mode takes two baseline captures (same binary and configuration, two
+runs) beside one candidate and prints, per metric, the twin's mean, its two
+runs' spread, the candidate's number and the difference; a candidate whose
+difference is within the twins' own spread is flagged "inside the floor" and
+one beyond it "outside the floor". The answer-level bar is then read beside
+that and is unchanged (`CLAUDE.md`): the candidate's mean KL at most 0.03 nats
+worse than the baseline arm's, and argmax agreement at most 1 point (0.01 of
+the fraction) below it. A card's floor is no bar -- the twin can be narrow or
+wide, per window -- so the two verdicts are printed apart and never merged.
+
+The mask scores only the positions the model writes. A capture row holds the
+distribution over the NEXT token (row position p scores token p+1; see
+`tools/kld_served.py`), so a token range [start, end) is scored by the row
+positions [start - 1, end - 1) -- `token_rows` makes that conversion, and the
+first token of a reply (predicted by the row right after the assistant header)
+is in the mask rather than one row outside it. `--spans` derives the token
+ranges from a chat request's roles: a JSON of the turns, each assistant turn
+carrying the ids of its text TOGETHER WITH its closing marker (the sequence the
+window holds), and the marker's own ids so the reply's end is exact even when
+trailing punctuation merges with the marker (`read_transcript`, `reply_end`).
+The spans are located by id, in turn order, so a multi-turn transcript's
+earlier assistant turns and the reply are all in the mask. `--mask` takes
+hand-written [start, end) TOKEN ranges instead and is converted the same way.
+Either way the masked and unmasked numbers are printed side by side, and the
+output names the convention. A plain-text corpus arm
+(`llama-perplexity --kl-divergence-base` over a corpus file) has NO roles:
+there is nothing to mask, nothing is invented, and the output says so.
+
+  capture_vs_capture.py REF_CAPTURE OTHER_CAPTURE OTHER_WINDOW [--mask FILE | --spans FILE]
   capture_vs_capture.py REF_CAPTURE --baseline BASE_A BASE_B \\
-      --candidate CANDIDATE --window W [--mask FILE]
+      --candidate CANDIDATE --window W [--mask FILE | --spans FILE]
 
 The reference is window 0 (llama.cpp's `--kl-divergence-base` file); the
 baseline and candidate files may carry several windows, `--window` picks the
 one to read. 2026-09-19: llama.cpp reads mean 0.34 / median 0.065 nats against
 the model's own f32 arithmetic on window 0; the native artifact 0.37 / 0.18.
+
+The transcript's ids are the ones the capture's window holds, not text
+re-tokenised here: `tools/tokenize_turn.py` writes them with the pin's
+`llama-tokenize --no-parse-special`, the setting the capture tokenises at
+(perplexity's common_tokenize omits `parse_special`, so it is false; the pin's
+llama-tokenize defaults it true for its own example), so the end marker is text rather than one special id. A turn
+whose ids are not in the window is refused rather than masked silently. The LM-head f32 diagnostic the audit sketched is
+not needed on this tree; the reasons with file:line are in `tools/kld_served.py`.
 """
 import argparse
 import pathlib
@@ -23,7 +56,14 @@ import sys
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from kld_served import read_capture, kl_rows, QSA_BOUNDARY_TOKENS  # noqa: E402
+from kld_served import (read_capture, kl_rows, read_transcript, assistant_spans,
+                        token_rows, QSA_BOUNDARY_TOKENS)  # noqa: E402
+
+# CLAUDE.md's answer-level bar, unchanged and stated here once: the candidate's
+# mean KL is at most 0.03 nats worse than the baseline arm's and argmax
+# agreement at most 1 point (0.01 of the fraction) below it.
+BAR_KL_NATS = 0.03
+BAR_ARGMAX_POINTS = 0.01
 
 
 # ------------------------------------------------------------ position mask
@@ -93,7 +133,8 @@ def load_rows(ref_path, other_path, window):
     file that is not the same capture: the same context and vocabulary (a
     vocabulary mismatch would be truncated silently by kl_rows and read as
     garbage) and the same tokens in the reference's window 0 and `window`.
-    Returns (n_ctx, kl, agree)."""
+    Also returns the reference's window tokens, which locate the assistant
+    spans by id. Returns (n_ctx, kl, agree, tokens)."""
     n_ctx, n_vocab, _, tok_ref, rows_ref = read_capture(ref_path)
     n_oth, v_oth, n_chunk, tok_oth, rows_oth = read_capture(other_path)
     if (n_ctx, n_vocab) != (n_oth, v_oth):
@@ -104,33 +145,61 @@ def load_rows(ref_path, other_path, window):
     if not np.array_equal(tok_ref[0], tok_oth[window]):
         raise ValueError(f"{other_path}: window {window} holds different tokens than the reference")
     kl, agree = kl_rows(rows_ref[0], rows_oth[window], n_vocab)
-    return n_ctx, kl, agree
+    return n_ctx, kl, agree, tok_ref[0]
 
 
-def load_arm(ref_path, other_path, window, mask_ranges=None):
+def token_mask(positions, token_ranges):
+    """A selection over the recorded rows from TOKEN ranges: each [start, end)
+    becomes the row positions [start - 1, end - 1) (`token_rows`), then
+    `position_mask`. The off-by-one lives in `token_rows` alone."""
+    return position_mask(positions, [token_rows(start, end) for start, end in token_ranges])
+
+
+def load_arm(ref_path, other_path, window, mask_ranges=None, transcript=None):
     """One capture's KL against the reference, over all rows and (when a mask
-    is given) over the masked rows."""
-    n_ctx, kl, agree = load_rows(ref_path, other_path, window)
+    is given) over the masked rows. The mask is either [start, end) TOKEN
+    ranges or -- for a chat arm -- the assistant spans derived from the
+    request's turn ids (also token ranges); both map to rows through
+    `token_rows`. A corpus capture has no roles and gets no mask."""
+    n_ctx, kl, agree, tokens = load_rows(ref_path, other_path, window)
     positions = row_positions(n_ctx)
+    if transcript is not None and mask_ranges is not None:
+        raise ValueError("pass a mask or a transcript, not both: they select the same rows")
+    if transcript is not None:
+        mask_ranges = assistant_spans(tokens, transcript)
     out = {"unmasked": summarise(kl, agree)}
     if mask_ranges is not None:
-        out["masked"] = summarise(kl, agree, position_mask(positions, mask_ranges))
+        out["masked"] = summarise(kl, agree, token_mask(positions, mask_ranges))
     return out
 
 
-def twin_report(ref_path, baseline_a, baseline_b, candidate, window, mask_ranges=None):
+def twin_report(ref_path, baseline_a, baseline_b, candidate, window, mask_ranges=None,
+                transcript=None):
     """The noise twin: two baseline runs against the reference give the card's
     own run-to-run floor, the candidate's mean KL is read beside it, and the
     difference is candidate - twin (positive: the candidate is worse than the
-    floor)."""
-    a = load_arm(ref_path, baseline_a, window, mask_ranges)
-    b = load_arm(ref_path, baseline_b, window, mask_ranges)
-    c = load_arm(ref_path, candidate, window, mask_ranges)
+    floor). The floor is TWO numbers with the two runs' own spread beside
+    each: mean KL and argmax agreement. A candidate whose difference is
+    within that spread is 'inside the floor'; the answer-level bar is read
+    and reported separately, unchanged."""
+    a = load_arm(ref_path, baseline_a, window, mask_ranges, transcript)
+    b = load_arm(ref_path, baseline_b, window, mask_ranges, transcript)
+    c = load_arm(ref_path, candidate, window, mask_ranges, transcript)
 
     keys = [k for k in ("unmasked", "masked") if k in a and k in b and k in c]
-    twin = {k: {field: (a[k][field] + b[k][field]) / 2 for field in ("mean_kl", "argmax")} for k in keys}
-    diff = {k: {field: c[k][field] - twin[k][field] for field in ("mean_kl", "argmax")} for k in keys}
-    return {"a": a, "b": b, "twin": twin, "candidate": c, "difference": diff}
+    metrics = ("mean_kl", "argmax")
+    twin = {k: {f: (a[k][f] + b[k][f]) / 2 for f in metrics} for k in keys}
+    spread = {k: {f: abs(a[k][f] - b[k][f]) for f in metrics} for k in keys}
+    diff = {k: {f: c[k][f] - twin[k][f] for f in metrics} for k in keys}
+    inside = {k: {f: abs(diff[k][f]) <= spread[k][f] for f in metrics} for k in keys}
+    for k in keys:
+        inside[k]["inside"] = inside[k]["mean_kl"] and inside[k]["argmax"]
+    bar = {k: {"mean_kl": diff[k]["mean_kl"] <= BAR_KL_NATS,
+               "argmax": -diff[k]["argmax"] <= BAR_ARGMAX_POINTS} for k in keys}
+    for k in keys:
+        bar[k]["pass"] = bar[k]["mean_kl"] and bar[k]["argmax"]
+    return {"a": a, "b": b, "twin": twin, "spread": spread, "candidate": c,
+            "difference": diff, "inside_floor": inside, "bar": bar}
 
 
 # ------------------------------------------------------------------- output
@@ -148,30 +217,36 @@ def _side_fields(s):
     return ", ".join(parts)
 
 
-def print_side(label, arm):
-    un, ma = arm["unmasked"], arm.get("masked")
-    line = f"{label}: {_side_fields(un)}"
-    if ma is not None:
-        line += f" | masked {_side_fields(ma)}"
-    print(line)
+def print_no_mask_note():
+    """A capture with no mask scores every recorded position, and the output
+    must say why that is right for a corpus arm and not for a chat arm."""
+    print("mask: no assistant mask -- every recorded position is scored. A plain-text corpus arm "
+          "(llama-perplexity --kl-divergence-base over a corpus) has no roles and cannot take one "
+          "(nothing is invented there); a chat arm passes --spans with the request's turn token ids.")
 
 
-def print_legacy(ref_path, other_path, window, mask_ranges):
+def print_legacy(ref_path, other_path, window, mask_ranges, transcript=None):
     # load_rows refuses a capture that is not the same one (n_ctx, n_vocab, the
     # window's tokens), which kl_rows alone would silently truncate.
-    n_ctx, kl, agree = load_rows(ref_path, other_path, window)
+    n_ctx, kl, agree, tokens = load_rows(ref_path, other_path, window)
     positions      = row_positions(n_ctx)
+    if transcript is not None:
+        mask_ranges = assistant_spans(tokens, transcript)
     below           = positions < QSA_BOUNDARY_TOKENS
     un = summarise(kl, agree)
-    ma = summarise(kl, agree, position_mask(positions, mask_ranges)) if mask_ranges else None
+    ma = summarise(kl, agree, token_mask(positions, mask_ranges)) if mask_ranges else None
     below_kl = f"{kl[below].mean():.4f}" if below.any() else "no rows"
     above_kl = f"{kl[~below].mean():.4f}" if (~below).any() else "no rows"
-    print(f"llama.cpp capture window {window} vs the f32 reference: mean KL {un['mean_kl']:.4f} "
+    print(f"unmasked: llama.cpp capture window {window} vs the f32 reference: mean KL {un['mean_kl']:.4f} "
           f"(below {below_kl} / above {above_kl}), "
           f"median {un['median_kl']:.4f}, max {un['max_kl']:.3f}, argmax agreement {un['argmax']:.4f}")
     if ma is not None:
-        print(f"   masked to {ma['rows']} rows: mean KL {ma['mean_kl']:.4f}, median {ma['median_kl']:.4f}, "
-              f"max {ma['max_kl']:.3f}, argmax agreement {ma['argmax']:.4f}")
+        print(f"masked: {ma['rows']} rows (row p scores token p+1, the assistant tokens' "
+              f"predictions): mean KL {ma['mean_kl']:.4f}, "
+              f"median {ma['median_kl']:.4f}, max {ma['max_kl']:.3f}, "
+              f"argmax agreement {ma['argmax']:.4f}")
+    else:
+        print_no_mask_note()
     for lo in range(n_ctx // 2 - (n_ctx // 2) % 128, n_ctx, 128):
         m = (positions >= lo) & (positions < lo + 128)
         if m.any():
@@ -179,22 +254,32 @@ def print_legacy(ref_path, other_path, window, mask_ranges):
                   f"mean {kl[m].mean():.4f} argmax {agree[m].mean():.3f}")
 
 
-def print_twin(ref_path, baseline_a, baseline_b, candidate, window, mask_ranges):
-    rep = twin_report(ref_path, baseline_a, baseline_b, candidate, window, mask_ranges)
-    print_side(f"baseline a (window {window})", rep["a"])
-    print_side(f"baseline b (window {window})", rep["b"])
-    # The twin holds only the keys every arm has: without a mask there is no
-    # "masked", and printing it unconditionally was a KeyError on the CLI.
-    print_side("baseline twin (mean of the two runs)", rep["twin"])
-    print_side("candidate", rep["candidate"])
-    d = rep["difference"]
-    line = (f"difference candidate - twin: mean KL {d['unmasked']['mean_kl']:+.4f}, "
-            f"argmax {d['unmasked']['argmax']:+.4f}")
-    if "masked" in d:
-        line += (f" | masked {d['masked']['mean_kl']:+.4f}, "
-                 f"argmax {d['masked']['argmax']:+.4f}")
-    print(line + (" (positive: worse than the card's own floor)"
-                  if d["unmasked"]["mean_kl"] >= 0 else ""))
+def print_twin(ref_path, baseline_a, baseline_b, candidate, window, mask_ranges, transcript=None):
+    rep = twin_report(ref_path, baseline_a, baseline_b, candidate, window, mask_ranges, transcript)
+    if "masked" not in rep["a"]:
+        print_no_mask_note()
+    for k in [k for k in ("unmasked", "masked") if k in rep["a"]]:
+        label = "" if k == "unmasked" else " [masked]"
+        a, b = rep["a"][k], rep["b"][k]
+        tw, sp = rep["twin"][k], rep["spread"][k]
+        print(f"floor{label} (baseline twin, two runs of the same binary and configuration): "
+              f"mean KL {tw['mean_kl']:.4f} (the two runs read {a['mean_kl']:.4f} / {b['mean_kl']:.4f} "
+              f"against the reference; their own spread {sp['mean_kl']:.4f}), "
+              f"argmax agreement {tw['argmax']:.4f} (spread {sp['argmax']:.4f}), {a['rows']} rows")
+        c = rep["candidate"][k]
+        print(f"candidate{label}: {_side_fields(c)}")
+        d = rep["difference"][k]
+        ins = rep["inside_floor"][k]
+        bar = rep["bar"][k]
+        print(f"difference candidate - twin{label}: mean KL {d['mean_kl']:+.4f} "
+              f"({'within' if ins['mean_kl'] else 'beyond'} the twin's spread), "
+              f"argmax {d['argmax']:+.4f} ({'within' if ins['argmax'] else 'beyond'} its spread): "
+              + ("inside the floor" if ins["inside"] else "outside the floor"))
+        print(f"   bar{label} (answer-level, unchanged): mean KL at most +{BAR_KL_NATS:.2f} nats worse "
+              f"than the baseline arm ({d['mean_kl']:+.4f}): {'pass' if bar['mean_kl'] else 'FAIL'}; "
+              f"argmax agreement at most {BAR_ARGMAX_POINTS * 100:g} point below "
+              f"({-d['argmax']:+.4f}): {'pass' if bar['argmax'] else 'FAIL'} "
+              f"-> {'pass' if bar['pass'] else 'FAIL'}")
 
 
 def main(argv=None):
@@ -208,9 +293,14 @@ def main(argv=None):
     ap.add_argument("--candidate", help="twin mode: the candidate arm's capture")
     ap.add_argument("--window", type=int, help="twin mode: the window the baseline and candidate captures hold")
     ap.add_argument("--mask", help="a file of [start, end) token ranges (the assistant spans)")
+    ap.add_argument("--spans", help="a chat request's turns with their token ids; the assistant "
+                                     "spans are derived from them (no tokenizer is assumed)")
     args = ap.parse_args(argv)
 
+    if args.mask and args.spans:
+        ap.error("--mask and --spans both select rows; pass one")
     mask_ranges = read_mask(args.mask) if args.mask else None
+    transcript = read_transcript(args.spans) if args.spans else None
     # a mask is optional in both modes; a twin without one has no masked keys
     if args.baseline or args.candidate:
         if args.other is not None or args.legacy_window is not None:
@@ -218,11 +308,11 @@ def main(argv=None):
         if not args.baseline or not args.candidate or args.window is None:
             ap.error("twin mode needs --baseline A B, --candidate and --window")
         print_twin(args.ref, args.baseline[0], args.baseline[1], args.candidate,
-                   args.window, mask_ranges)
+                   args.window, mask_ranges, transcript)
     else:
         if args.other is None or args.legacy_window is None:
             ap.error("single mode needs REF OTHER WINDOW (or use --baseline/--candidate)")
-        print_legacy(args.ref, args.other, args.legacy_window, mask_ranges)
+        print_legacy(args.ref, args.other, args.legacy_window, mask_ranges, transcript)
 
 
 if __name__ == "__main__":

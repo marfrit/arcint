@@ -18,6 +18,31 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## Unreleased
+
+The quality instruments that shipped in 1.2.7 — `tools/capture_vs_capture.py`'s
+twin baseline (`--baseline A B --candidate C`) and its `--mask` token ranges —
+gain three things:
+
+- `--spans`: the assistant mask from a chat request's role ids
+  (`tools/kld_served.py`'s `assistant_spans`), so a served arm is scored on the
+  positions the model writes, masked beside unmasked. A plain-text corpus arm
+  has no roles, and the tool says so instead of inventing one.
+- the twin's floor as TWO numbers per metric — mean KL and argmax agreement,
+  each with the two runs' own spread — with the candidate flagged inside or
+  outside that spread per metric. `CLAUDE.md`'s answer-level bar (0.03 nats, 1
+  point) prints beside it, unchanged: a card's floor is no bar.
+- the row convention: a capture row scores the NEXT token (row position p holds
+  the prediction of token p+1), so a token range is masked as the row range
+  [start - 1, end - 1) — the reply's first token's prediction is inside, the
+  token after the reply outside.
+
+A turn's ids are tokenised with its closing marker (a merge rule, no measured
+case here), and `tools/tokenize_turn.py` writes the transcript with
+`parse_special=false`, the setting the capture tokenises at. The single mode's
+output labels its two lines `unmasked:` and `masked:` and states the row
+convention; a run without a mask prints the no-roles note.
+
 ## 1.2.7 — 2026-10-30
 
 Faster decode on every unit and faster prefill on the coder; answers checked
