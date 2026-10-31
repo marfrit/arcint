@@ -2604,3 +2604,188 @@ TEST(renderer_material_hash_is_stable_and_excludes_the_model_names) {
     const json changed = assemble_renderer_material(parts);
     CHECK(a["hash"].get<std::string>() != changed["hash"].get<std::string>());
 }
+
+// ------------------------------------- feyntalk W6b (token and span events)
+//
+// docs/campaigns/feyntalk.md "Token mode, revised": D2 (one `arcint:token` per
+// accepted token, before its text shadow, field decided by the token) and D3
+// (span events without item ids). The red run was against W6a: token mode
+// served the turn and emitted no token or span event, so every case below
+// failed; the implementation adds the events, the streamer's `field_for` and
+// the spans.
+
+namespace {
+
+// The token-mode turn on the real stub backend: the stub's tokenizer makes
+// decode_one(id) the piece the shadow carries, so the shadow can be compared
+// with the tokens themselves. Two prepares give the prompt hash the gateway
+// would have.
+std::vector<std::string> stub_token_stream(Fixture& fx) {
+    ResponseRequest off;
+    parse_ok(base(), off);
+    PreparedResponse po;
+    if (api::prepare_response(fx.ctx, std::move(off), po).has_value()) return {};
+    const std::string prompt_hash = "sha256:" + api::sha256_hex(po.chat.input.prompt);
+    ResponseRequest r;
+    parse_ok(token_body(kHashA, prompt_hash), r);
+    PreparedResponse p;
+    if (api::prepare_response(fx.ctx, std::move(r), p).has_value()) return {};
+    std::vector<std::string> raw;
+    api::stream_response(fx.ctx, p, 0, [&](std::string_view frame) {
+        raw.emplace_back(frame);
+        return true;
+    });
+    return raw;
+}
+
+const json* find_event(const Sse& s, const std::string& type, size_t from = 0) {
+    for (size_t i = from; i < s.events.size(); ++i)
+        if (s.events[i].first == type) return &s.events[i].second;
+    return nullptr;
+}
+
+std::vector<const json*> all_events(const Sse& s, const std::string& type) {
+    std::vector<const json*> out;
+    for (const auto& [name, body] : s.events)
+        if (name == type) out.push_back(&body);
+    return out;
+}
+
+}  // namespace
+
+TEST(responses_token_events_one_per_token_before_the_shadow) {
+    StreamFixture fx;
+    fx.req.token_mode = true;   // stream_response is called directly: no prepare
+    fx.prep.req       = fx.req;
+    fx.backend.pieces = {{"Hello", 1}, {" world", 2}};
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    const auto toks = all_events(s, "arcint:token");
+    CHECK_EQ(toks.size(), size_t(2));
+    if (toks.size() != 2) return;
+    CHECK_EQ((*toks[0])["token_index"].get<int>(), 0);
+    CHECK_EQ((*toks[1])["token_index"].get<int>(), 1);
+    CHECK_EQ((*toks[0])["token_id"].get<int>(), 1);
+    CHECK_EQ((*toks[1])["token_id"].get<int>(), 2);
+    CHECK_EQ((*toks[0])["field"].get<std::string>(), std::string("text"));
+    CHECK_EQ((*toks[0])["v"].get<int>(), 1);
+    CHECK_EQ((*toks[0])["response_id"].get<std::string>(), std::string("resp-test"));
+    // Before its text shadow: the token event precedes the first delta.
+    int first_tok = -1, first_delta = -1;
+    for (size_t i = 0; i < s.events.size(); ++i) {
+        if (s.events[i].first == "arcint:token" && first_tok < 0) first_tok = static_cast<int>(i);
+        if (s.events[i].first == "response.output_text.delta" && first_delta < 0)
+            first_delta = static_cast<int>(i);
+    }
+    CHECK(first_tok >= 0 && first_delta >= 0 && first_tok < first_delta);
+}
+
+TEST(responses_token_event_field_is_reasoning_for_the_closer) {
+    StreamFixture fx(/*think_open=*/true);
+    fx.req.token_mode = true;
+    fx.prep.req       = fx.req;
+    fx.backend.pieces = {{"So", 1}, {" far", 2}, {think_close_tag(), 3}, {"OK", 4}};
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    const auto toks = all_events(s, "arcint:token");
+    CHECK_EQ(toks.size(), size_t(4));
+    if (toks.size() != 4) return;
+    const std::vector<std::string> want = {"reasoning", "reasoning", "reasoning", "text"};
+    for (size_t i = 0; i < want.size(); ++i)
+        CHECK_EQ((*toks[i])["field"].get<std::string>(), want[i]);
+    // The closer token is the one that closes the block, at index 2.
+    CHECK_EQ((*toks[2])["token_index"].get<int>(), 2);
+}
+
+TEST(responses_thinking_span_start_at_zero_and_end_on_the_closer) {
+    StreamFixture fx(/*think_open=*/true);
+    fx.req.token_mode = true;
+    fx.prep.req       = fx.req;
+    fx.backend.pieces = {{"So", 1}, {" far", 2}, {think_close_tag(), 3}, {"OK", 4}};
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    const auto spans = all_events(s, "arcint:span");
+    int start = -1, end = -1;
+    for (size_t i = 0; i < spans.size(); ++i) {
+        const json& b = *spans[i];
+        CHECK_EQ(b["span"].get<std::string>(), std::string("thinking"));
+        CHECK(!b.contains("item_id"));       // D3: no item ids on spans
+        CHECK(!b.contains("output_index"));
+        if (b["phase"].get<std::string>() == "start" && start < 0) start = static_cast<int>(i);
+        if (b["phase"].get<std::string>() == "end" && end < 0) end = static_cast<int>(i);
+    }
+    CHECK(start >= 0 && end >= 0 && start < end);
+    if (start < 0 || end < 0) return;
+    CHECK_EQ((*spans[static_cast<size_t>(start)])["token_index"].get<int>(), 0);
+    CHECK_EQ((*spans[static_cast<size_t>(end)])["token_index"].get<int>(), 2);
+    CHECK_EQ((*spans[static_cast<size_t>(start)])["detail"]["preopened"].get<bool>(), true);
+    CHECK_EQ((*spans[static_cast<size_t>(end)])["detail"]["closed"].get<bool>(), true);
+}
+
+TEST(responses_tool_call_span_brackets_the_text_form_call) {
+    StreamFixture fx(false, false, /*tools=*/true);
+    fx.req.token_mode = true;
+    fx.prep.req       = fx.req;
+    const std::string call = "<" "tool" "_call" ">\n{\"name\": \"read_file\", \"arguments\": {}}\n"
+                             "</" "tool" "_call>";
+    // The opener is split across pieces; the span starts at the piece that
+    // completes it.
+    fx.backend.pieces = {{"Sure", 1}, {"\n", 2}, {"<tool", 3}, {"_call", 4}, {">", 5},
+                         {"\n{\"name\": \"read_file\", \"arguments\": {}}\n</tool", 6},
+                         {"_call>", 7}};
+    (void)call;
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    const auto spans = all_events(s, "arcint:span");
+    int start = -1, end = -1;
+    for (size_t i = 0; i < spans.size(); ++i) {
+        const json& b = *spans[i];
+        CHECK_EQ(b["span"].get<std::string>(), std::string("tool_call"));
+        CHECK(!b.contains("item_id"));
+        if (b["phase"].get<std::string>() == "start" && start < 0) start = static_cast<int>(i);
+        if (b["phase"].get<std::string>() == "end" && end < 0) end = static_cast<int>(i);
+    }
+    CHECK(start >= 0 && end >= 0 && start < end);
+    if (start < 0 || end < 0) return;
+    CHECK_EQ((*spans[static_cast<size_t>(start)])["token_index"].get<int>(), 4);
+    CHECK_EQ((*spans[static_cast<size_t>(end)])["token_index"].get<int>(), 6);
+    CHECK_EQ((*spans[static_cast<size_t>(start)])["detail"]["call_index"].get<int>(), 0);
+}
+
+TEST(responses_token_mode_off_emits_no_token_or_span_events) {
+    StreamFixture fx;
+    fx.backend.pieces = {{"Hello", 1}, {" world", 2}};
+    const Sse s = parse_sse(fx.run());
+    CHECK(all_events(s, "arcint:token").empty());
+    CHECK(all_events(s, "arcint:span").empty());
+}
+
+TEST(responses_token_events_contiguous_and_the_shadow_is_decode_of_tokens) {
+    // The real stub: its pieces (the four-byte code point split in half by
+    // emit_split) and ids are one token each, so the shadow is exactly the
+    // concatenation of decode_one(id for every token event).
+    Fixture fx(4096, synthetic_material(kHashA));
+    const Sse s = parse_sse(stub_token_stream(fx));
+    check_framing(s);
+    const auto toks = all_events(s, "arcint:token");
+    CHECK(!toks.empty());
+    if (toks.empty()) return;
+    for (size_t i = 0; i < toks.size(); ++i) {
+        CHECK_EQ((*toks[i])["token_index"].get<int>(), static_cast<int>(i));
+        CHECK((*toks[i])["token_id"].get<int>() >= 0);
+    }
+    // One event per accepted token: the usage block counts the same number.
+    const json* terminal = find_event(s, "response.completed");
+    CHECK(terminal != nullptr);
+    if (terminal != nullptr) {
+        const int out = (*terminal)["response"]["usage"]["output_tokens"].get<int>();
+        CHECK_EQ(static_cast<int>(toks.size()), out);
+    }
+    std::string shadow;
+    for (const auto& [name, body] : s.events)
+        if (name == "response.output_text.delta")
+            shadow += body["delta"].get<std::string>();
+    std::string decoded;
+    for (const json* t : toks) decoded += fx.backend->tokenizer().decode_one((*t)["token_id"].get<int>());
+    CHECK_EQ(shadow, decoded);
+}
