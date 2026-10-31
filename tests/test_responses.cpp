@@ -702,6 +702,8 @@ public:
     }
 
     std::vector<std::pair<std::string, int>> pieces;
+    ThinkBlockIds   ids;                  // for the think-state/split cases
+    bool            seen_think_open = false;
     int             delay_ms       = 0;   // lets a cancel arrive mid-decode
     FinishReason    reason         = FinishReason::Stop;
     bool            throw_after    = false;
@@ -710,11 +712,15 @@ public:
 
     const ModelStatus& status() const override { return st_; }
     Tokenizer&         tokenizer() override { return tok_; }
-    std::string        render_chat(const ChatRequest&) const override { return "p"; }
+    std::string        render_chat(const ChatRequest& req) const override {
+        return render_chatml_stub(req);   // the stub's own template path
+    }
+    ThinkBlockIds think_block_ids(bool) const override { return ids; }
 
     FinishReason generate(const GenerationInput& in, int, const TokenCallback& on_piece,
                           GenerationStats& stats) override {
         stats.prompt_tokens = 4;
+        seen_think_open = in.think_open;
         if (in.stop != nullptr && in.stop->load(std::memory_order_relaxed)) {
             stats.abort_cause = AbortCause::StopSignal;
             return FinishReason::Abort;
@@ -1617,4 +1623,185 @@ TEST(responses_stub_cancel_is_named_and_aborts_at_the_prefill_boundary) {
     // Nothing decoded: the abort was at the first prefill boundary, not after
     // the whole prompt had been forwarded.
     CHECK_EQ(r.body["usage"]["output_tokens"].get<int>(), 0);
+}
+
+// ------------------------- reasoning replay (docs/campaigns/feyntalk.md W3.2)
+namespace {
+
+// A device-free context whose backend renders the stub template but emits a
+// chosen piece sequence, so the replay path and the generation split are the
+// real ones.
+struct ReplayFixture {
+    Config        cfg;
+    PiecesBackend backend;
+    SlotPool      slots{1};
+    Context       ctx;
+
+    explicit ReplayFixture(bool with_store = true) {
+        cfg.stub    = true;
+        ctx.cfg     = &cfg;
+        ctx.backend = &backend;
+        ctx.slots   = &slots;
+        if (with_store)
+            ctx.responses = std::make_shared<api::ResponseStore>(
+                api::ResponseStore::Limits{32, 1ull << 20, 600});
+    }
+
+    std::string prepare_run(const json& body) {
+        ResponseRequest r;
+        parse_ok(body, r);
+        PreparedResponse p;
+        CHECK(!api::prepare_response(ctx, std::move(r), p).has_value());
+        const api::HttpResult res = api::run_response(ctx, p, 0);
+        CHECK_EQ(res.status, 200);
+        return res.status == 200 ? res.body["id"].get<std::string>() : std::string();
+    }
+};
+
+std::string open_tag() {
+    const auto& pairs = think_tag_pairs(false);
+    return pairs.empty() ? std::string() : pairs[0].first;
+}
+std::string close_tag() {
+    const auto& pairs = think_tag_pairs(false);
+    return pairs.empty() ? std::string() : pairs[0].second;
+}
+
+json reasoning_item(const std::string& text) {
+    return {{"type", "reasoning"},
+            {"summary", json::array()},
+            {"content", json::array({{{"type", "reasoning_text"}, {"text", text}}})}};
+}
+
+}  // namespace
+
+TEST(responses_pairs_reasoning_items_with_the_next_assistant_item) {
+    // The pairing rule: a reasoning item (or several in a row, their
+    // reasoning_text parts joined with a newline) belongs to the NEXT assistant
+    // item — an assistant message or a function_call. Any other item in between
+    // drops the pending reasoning; about the last user message the template then
+    // decides what to show.
+    json body = base();
+    body["input"] = json::array({
+        reasoning_item("r-one"),
+        {{"type", "message"}, {"role", "assistant"}, {"content", "one"}},
+        {{"type", "function_call"}, {"call_id", "c1"}, {"name", "f"}, {"arguments", "{}"}},
+        reasoning_item("r-two-a"),
+        reasoning_item("r-two-b"),
+        {{"type", "function_call"}, {"call_id", "c2"}, {"name", "f"}, {"arguments", "{}"}},
+        reasoning_item("r-orphan"),
+        {{"type", "message"}, {"role", "user"}, {"content", "u"}},
+        {{"type", "message"}, {"role", "assistant"}, {"content", "last"}},
+    });
+    ResponseRequest r;
+    parse_ok(body, r);
+    CHECK_EQ(r.chat.messages.size(), 5u);
+    if (r.chat.messages.size() < 5) return;
+    CHECK_EQ(r.chat.messages[0].role, std::string("assistant"));
+    CHECK_EQ(r.chat.messages[0].reasoning, std::string("r-one"));
+    CHECK_EQ(r.chat.messages[1].role, std::string("assistant"));
+    CHECK_EQ(r.chat.messages[1].tool_calls.size(), size_t(1));
+    CHECK_EQ(r.chat.messages[1].reasoning, std::string(""));   // r-one went to the message
+    CHECK_EQ(r.chat.messages[2].reasoning, std::string("r-two-a\nr-two-b"));
+    CHECK_EQ(r.chat.messages[3].role, std::string("user"));
+    CHECK_EQ(r.chat.messages[4].reasoning, std::string(""));   // orphan dropped at the user
+}
+
+TEST(responses_continuation_renders_the_stored_reasoning_like_full_history) {
+    ReplayFixture fx;
+    fx.backend.pieces = {{open_tag(), 1}, {"WHY", 2}, {close_tag(), 3}, {"ANSWER", 4}};
+
+    json b1 = {{"model", "stub"}, {"input", "question"}, {"max_output_tokens", 256}};
+    const std::string id = fx.prepare_run(b1);
+    CHECK(!id.empty());
+    if (id.empty()) return;
+    const auto stored = fx.ctx.responses->get(id, -1);
+    CHECK(stored != nullptr);
+    if (!stored) return;
+    bool saw_reasoning_item = false;
+    for (const json& item : stored->output_items)
+        if (item["type"].get<std::string>() == "reasoning") saw_reasoning_item = true;
+    CHECK(saw_reasoning_item);
+
+    // Turn 2a: a continuation.
+    json b2 = {{"model", "stub"}, {"previous_response_id", id}, {"input", "second"},
+               {"max_output_tokens", 256}};
+    ResponseRequest r2;
+    parse_ok(b2, r2);
+    PreparedResponse p2;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r2), p2).has_value());
+    const std::string cont_prompt = p2.chat.input.prompt;
+    CHECK(cont_prompt.find("WHY") != std::string::npos);
+
+    // Turn 2b: the same history as a full-history client request (pi replays
+    // the reasoning item of every past assistant turn).
+    json b3 = {{"model", "stub"},
+               {"input", json::array({reasoning_item("WHY"),
+                                      {{"type", "message"}, {"role", "assistant"},
+                                       {"content", "ANSWER"}},
+                                      {{"type", "message"}, {"role", "user"},
+                                       {"content", "second"}}})},
+               {"max_output_tokens", 256}};
+    ResponseRequest r3;
+    parse_ok(b3, r3);
+    PreparedResponse p3;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r3), p3).has_value());
+    CHECK_EQ(cont_prompt, p3.chat.input.prompt);
+
+    // The chat route's full-history form (reasoning_content on the assistant
+    // message) renders the same prompt.
+    json chat = {{"model", "stub"},
+                 {"messages", json::array({
+                      {{"role", "user"}, {"content", "question"}},
+                      {{"role", "assistant"}, {"content", "ANSWER"},
+                       {"reasoning_content", "WHY"}},
+                      {{"role", "user"}, {"content", "second"}}})},
+                 {"max_tokens", 256}};
+    ChatRequest creq;
+    CHECK(!parse_chat_request(chat, creq).has_value());
+    PreparedChat cp;
+    CHECK(!api::prepare_from_chat(fx.ctx, std::move(creq), cp).has_value());
+    CHECK_EQ(cp.input.prompt, cont_prompt);
+}
+
+TEST(responses_think_state_stays_keyed_to_the_generation_start) {
+    // Engine-maintainer point: a replayed, closed reasoning block inside the
+    // PROMPT must not make the new generation look "inside a think block". The
+    // open state is the generation prompt's own opener; the split of the new
+    // answer (opener id, reasoning, closer id, answer) must be right, with and
+    // without thinking enabled.
+    for (const bool thinking : {true, false}) {
+        ReplayFixture fx(/*with_store=*/false);
+        fx.backend.ids = ThinkBlockIds{};
+        fx.backend.ids.open_close_ids = {{248068, 248069}};
+        fx.backend.ids.open_ids       = {248068};
+        fx.backend.ids.close_ids      = {248069};
+        fx.backend.pieces = {{"x", 248068}, {"NEW-REASON", 7}, {"y", 248069},
+                             {"NEW-ANSWER", 8}};
+
+        json body = {{"model", "stub"},
+                     {"messages", json::array({
+                          {{"role", "user"}, {"content", "earlier"}},
+                          {{"role", "assistant"}, {"content", "OLD-ANSWER"},
+                           {"reasoning_content", "OLD-REASONING"}},
+                          {{"role", "user"}, {"content", "now"}}})},
+                     {"chat_template_kwargs", {{"enable_thinking", thinking}}},
+                     {"max_tokens", 256}};
+        ChatRequest req;
+        CHECK(!parse_chat_request(body, req).has_value());
+        PreparedChat prep;
+        CHECK(!api::prepare_from_chat(fx.ctx, std::move(req), prep).has_value());
+        // The rendered prompt ends outside a block: the history's closed block
+        // is not the generation's start state.
+        CHECK(!prep.think_open);
+        CHECK_EQ(prep.input.think_open, false);
+        const api::HttpResult r = api::run_chat(fx.ctx, prep, 0);
+        CHECK_EQ(r.status, 200);
+        if (r.status != 200) continue;
+        CHECK_EQ(fx.backend.seen_think_open, false);   // the mask runs outside a block
+        const json& msg = r.body["choices"][0]["message"];
+        CHECK_EQ(msg["reasoning_content"].get<std::string>(), std::string("NEW-REASON"));
+        CHECK(msg["reasoning_closed"].get<bool>());
+        CHECK_EQ(msg["content"].get<std::string>(), std::string("NEW-ANSWER"));
+    }
 }
