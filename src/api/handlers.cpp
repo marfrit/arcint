@@ -103,6 +103,12 @@ std::string decode_suffix_for(const GenerationStats& stats) {
                                      stats.loop_aborts, stats.loop_self_closes, stats.loop_door_masked,
                                      stats.loop_door_eog_masked);
     }
+    // feyntalk W3.4: the context guard's close is its own event, not a
+    // loop-guard rung; named on the same line, only when it moved.
+    if (stats.loop_context_closes || stats.loop_context_no_closer) {
+        decode_suffix += log::format(" | context guard: closed %d, no closer %d",
+                                     stats.loop_context_closes, stats.loop_context_no_closer);
+    }
     return decode_suffix;
 }
 
@@ -117,7 +123,11 @@ nlohmann::json loop_guard_json(const GenerationStats& stats) {
                 {"aborts", stats.loop_aborts},
                 {"self_closes", stats.loop_self_closes},
                 {"door_masked", stats.loop_door_masked},
-                {"door_eog_masked", stats.loop_door_eog_masked}};
+                {"door_eog_masked", stats.loop_door_eog_masked},
+                // feyntalk W3.4: not a ladder rung -- the context guard's own
+                // counter, and the arms that had no closer id to force.
+                {"context_closes", stats.loop_context_closes},
+                {"context_no_closer", stats.loop_context_no_closer}};
 }
 
 namespace {
@@ -492,6 +502,8 @@ json props(const Context& ctx) {
           // send nothing. /props says what the server is running with, so a
           // turn that ends differently than yesterday's is explained here.
           {"think_eog_mask", sd.think_eog_mask},
+          // feyntalk W3.4: the context guard's reserve in tokens; 0 is off.
+          {"think_ctx_reserve", sd.think_ctx_reserve},
           {"tool_grammar", sd.tool_grammar},
           // loop-guard: the served switch and its thresholds, so a turn that
           // ends differently than yesterday's is explained here.

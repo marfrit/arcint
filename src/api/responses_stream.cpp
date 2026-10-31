@@ -306,6 +306,26 @@ private:
             if (!send(counters)) return false;
         }
 
+        // feyntalk W3.4: the context guard's own event, after the loop-guard one
+        // and before the terminal event. Emitted whenever the guard is
+        // configured for the request (reserve > 0), so a client sees the
+        // arithmetic even on a turn where it did not fire; graded by the API,
+        // not the sampler, because n_ctx and the prompt/completion counts live
+        // here.
+        if (prep_.input.sampler.think_ctx_reserve > 0) {
+            const int n_ctx = lane_n_ctx(*ctx_, prep_.lane);
+            const int used  = stats.prompt_tokens + stats.completion_tokens;
+            json context = {{"type", "arcint:context"}, {"v", 1},
+                            {"response_id", prep_.id},
+                            {"used", used},
+                            {"n_ctx", n_ctx},
+                            {"remaining", std::max(0, n_ctx - used)},
+                            {"forced_close", stats.loop_context_closes > 0}};
+            if (stats.loop_context_closes > 0)
+                context["token_index"] = stats.loop_context_token_index;
+            if (!send(context)) return false;
+        }
+
         // A cancel is a named arcint event before the terminal incomplete (the
         // spec has no cancelled state; incomplete(cancelled) is the nearest).
         if (reason == FinishReason::Abort && stats.abort_cause == AbortCause::Cancelled) {

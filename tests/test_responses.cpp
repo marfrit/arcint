@@ -748,6 +748,9 @@ public:
         stats.loop_self_closes = counters.loop_self_closes;
         stats.loop_door_masked = counters.loop_door_masked;
         stats.loop_door_eog_masked = counters.loop_door_eog_masked;
+        stats.loop_context_closes    = counters.loop_context_closes;
+        stats.loop_context_no_closer = counters.loop_context_no_closer;
+        stats.loop_context_token_index = counters.loop_context_token_index;
         return reason;
     }
 

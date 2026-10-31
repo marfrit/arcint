@@ -113,10 +113,10 @@ TEST(context_guard_budget_arithmetic_counts_accepted_drafts_once) {
     CHECK_EQ(think_ctx_budget(4096, 4, 0), 4092);        // arithmetic only: reserve 0 is off
 
     SamplerParams p = ctx_params();
-    p.think_ctx_reserve = 256;
+    p.think_ctx_reserve = 8;
     Sampler s(p, 1);
     s.set_prompt({1, 2, 3, 4});
-    s.set_think_ctx_budget(think_ctx_budget(64, 4, 256));   // 52
+    s.set_think_ctx_budget(think_ctx_budget(64, 4, 8));   // 52
     s.start_in_think_block(true);
     CHECK_EQ(s.think_ctx_remaining(), 52);
 
@@ -161,8 +161,8 @@ TEST(context_guard_forced_close_fires_at_budget_zero_with_the_think_mask) {
         l[2] = 1.0f;
         const int id = s.sample(l.data(), l.size());
         CHECK_EQ(id, 2);
-        CHECK_EQ(s.think_ctx_remaining(), 5 - (i + 1));
         s.observe(id);
+        CHECK_EQ(s.think_ctx_remaining(), 5 - (i + 1));
     }
     CHECK_EQ(s.loop_guard_counts().ctx_closes, 0);
 
@@ -223,7 +223,7 @@ TEST(context_guard_grammar_constrains_the_answer_after_the_forced_close) {
     p.tool_grammar      = true;
     Sampler s(p, 1);
     s.set_prompt({1});
-    s.set_think_ctx_budget(2);
+    s.set_think_ctx_budget(3);
     s.start_in_think_block(true);
 
     AllowOnly grammar(7);
@@ -232,7 +232,9 @@ TEST(context_guard_grammar_constrains_the_answer_after_the_forced_close) {
     s.observe(2);
     // While thinking the grammar is dormant, so the row's own argmax comes.
     std::vector<float> l = row_with_argmax(6);
-    CHECK_EQ(s.sample(l.data(), l.size()), 6);
+    const int dormant = s.sample(l.data(), l.size());
+    CHECK_EQ(dormant, 6);
+    s.observe(dormant);   // the budget reaches 0: the next draw is forced
 
     std::vector<float> l2 = row_with_argmax(2);
     const int closer = s.sample(l2.data(), l2.size());
@@ -351,6 +353,7 @@ TEST(context_guard_flag_parses_and_reaches_props) {
     backend.st.served_id = backend.st.id;
     backend.st.loaded    = true;
     backend.st.n_ctx     = 4096;
+    backend.st.sampler_defaults = d;   // what the load path serves
     api::SlotPool slots(1);
     api::Context  ctx{&cfg, &backend, &slots};
     const nlohmann::json p = api::props(ctx);

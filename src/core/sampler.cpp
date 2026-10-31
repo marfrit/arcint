@@ -81,12 +81,25 @@ void TokenConstraint::note_desync(int token, const std::string& why) {
 
 void Sampler::observe(int token, std::string_view piece) {
     if (token < 0) return;
+    ++emitted_;
     ++seen_[token];
     ++generated_[token];
     // The think-block tracker sees the (id, text) pair of every generated
     // token, in generation order. The id decides when the vocabulary spells a
     // tag as one special token; the text is the fallback otherwise.
     observe_think_(piece, token);
+    // feyntalk W3.4: the context guard counts down one per emitted token that
+    // lands INSIDE the block: the opener included (undecided -> thinking), a
+    // closer or an answer token excluded (-> content). This is the one call a
+    // decode loop makes per emitted token, and in the verify walk it is the
+    // walk's own observe() after `emit`, so an accepted draft counts once each
+    // -- not once per proposed row. The forced closer itself returns from
+    // sample() before the masks and is observed like any drawn token: it closes
+    // the block, so it does not count down. At 0 the next draw is the closer.
+    if (ctx_armed_ && think_state_ == ThinkState::thinking) {
+        --ctx_budget_;
+        think_ctx_arm_();
+    }
     // A token inside an open think block is reasoning, not a call: arcint
     // parses calls from the content only (split_reasoning), so the grammar is
     // not fed it -- a call opener the model mentions while thinking does not
@@ -111,11 +124,28 @@ void Sampler::observe_think_text(std::string_view piece) { observe_think_(piece,
 
 void Sampler::observe_think(int token, std::string_view piece) { observe_think_(piece, token); }
 
-// feyntalk W3.4 scaffolding (red-first): the budget is stored, nothing counts
-// it down and nothing forces a closer yet.
+// feyntalk W3.4: the context guard's budget, at request start. The backend
+// computes n_ctx - prompt_tokens - reserve and hands it over after set_prompt;
+// the sampler knows neither. reserve 0 is the switch off and no budget is
+// stored, so nothing below runs. A budget <= 0 means the prompt already sits
+// inside the reserve: the closer is forced at the first thinking token. The
+// arm is also checked here, so a caller that hands the budget after
+// start_in_think_block() still gets the prompt-inside-reserve rule.
 void Sampler::set_think_ctx_budget(int budget) {
     if (params_.think_ctx_reserve <= 0) return;
-    ctx_budget_ = budget;
+    ctx_budget_  = budget;
+    ctx_armed_   = true;
+    ctx_pending_ = false;
+    ctx_settled_ = false;
+    think_ctx_arm_();
+}
+
+// The once-per-turn arm: at (or already past) the budget with the block open.
+// settle latches the decision so a text-closer family is not re-armed every
+// token after the budget went negative.
+void Sampler::think_ctx_arm_() {
+    if (ctx_armed_ && ctx_budget_ <= 0 && !ctx_settled_ && !ctx_pending_)
+        ctx_pending_ = true;
 }
 
 void Sampler::set_think_mask_ids(ThinkBlockIds ids) {
@@ -202,12 +232,29 @@ void Sampler::start_in_think_block(bool open) {
     // A reused sampler starts with a clean tracker; the door's opening clears
     // it again, so this is the earlier of two and harmless.
     loop_token_reset_();
+    // feyntalk W3.4: the context guard's per-request state. The budget belongs
+    // to set_think_ctx_budget() (called before this, after set_prompt); reserve
+    // 0 clears it so a reused sampler cannot carry a stale one. emitted_ is the
+    // accepted-stream index the event names, reset per turn.
+    if (params_.think_ctx_reserve <= 0) {
+        ctx_budget_ = -1;
+        ctx_armed_  = false;
+    }
+    ctx_pending_        = false;
+    ctx_settled_        = false;
+    ctx_closes_         = 0;
+    ctx_no_closer_      = 0;
+    ctx_forced_index_   = -1;
+    emitted_            = 0;
     // The closer of a template-opened block: the first pair's close id, or the
     // first flattened close id. -1 keeps the text fallback.
     int cid = -1;
     if (!params_.think_ids.open_close_ids.empty()) cid = params_.think_ids.open_close_ids.front().second;
     else if (!params_.think_ids.close_ids.empty()) cid = params_.think_ids.close_ids.front();
     think_close_id_ = think_state_ == ThinkState::thinking && cid >= 0 ? cid : -1;
+    // A prompt already inside the reserve: the block is open before the first
+    // token, so the closer is armed now and the first sample() forces it.
+    think_ctx_arm_();
 }
 
 // Feed one generated token -- its text and its id -- to the think-block
@@ -1061,6 +1108,35 @@ int Sampler::sample(float* logits, size_t vocab) {
                 loop_closer_warned_ = true;
                 log::warn("loop-guard", "the slap has no closer id in this vocabulary; the block cannot be forced shut");
             }
+        }
+    }
+
+    // feyntalk W3.4: the context guard's forced closer, a second trigger of the
+    // loop guard's forced-closer seam, with its own reason and counter. It runs
+    // after the loop guard's nudge/slap (a slap is the same closer and wins) and
+    // before the masks and the draw, exactly as the slap does. The caller emits,
+    // observes and decodes it like any drawn token, so it lands in the KV, the
+    // history, reasoning_content and the stream. A text-closer family has no id
+    // to force: no token, one counter and one warn, as the slap does there. The
+    // forced return is ahead of every mask, so neither think_eog_mask nor the
+    // door can ever take the closer from the guard (review B3).
+    if (ctx_pending_) {
+        ctx_pending_  = false;
+        ctx_settled_  = true;
+        const int closer = think_close_id_;
+        if (closer >= 0 && static_cast<size_t>(closer) < vocab) {
+            ++ctx_closes_;
+            ctx_forced_index_ = emitted_;   // the index this token takes
+            loop_forced_closer_   = true;       // not the model's own draw
+            log::info("context-guard", "the context guard reached its budget (%d left); "
+                      "the think-block's closer is forced as the next token", ctx_budget_);
+            return closer;
+        }
+        ++ctx_no_closer_;
+        if (!ctx_warned_) {
+            ctx_warned_ = true;
+            log::warn("context-guard", "the context guard reached its budget, but this vocabulary "
+                      "spells the closer as text; no token is forced");
         }
     }
 

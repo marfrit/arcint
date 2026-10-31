@@ -253,7 +253,8 @@ std::optional<std::string> sampler_defaults_apply(SamplerDefaults& d, const Samp
     if (o.answer_presence_penalty)  d.answer_presence_penalty  = *o.answer_presence_penalty;
     if (o.answer_frequency_penalty) d.answer_frequency_penalty = *o.answer_frequency_penalty;
     if (o.temperature || o.top_p || o.top_k || o.min_p || o.repetition_penalty || o.presence_penalty ||
-        o.think_eog_mask || o.tool_grammar || o.loop_guard || o.loop_guard_match || o.loop_guard_window || o.loop_guard_threshold ||
+        o.think_eog_mask || o.tool_grammar || o.think_ctx_reserve || o.loop_guard || o.loop_guard_match ||
+        o.loop_guard_window || o.loop_guard_threshold ||
         o.loop_guard_grace || o.loop_guard_door_grace || o.answer_temperature || o.answer_top_p || o.answer_top_k ||
         o.answer_min_p || o.answer_presence_penalty || o.answer_frequency_penalty || nothink_set) {
         d.provenance = "operator";

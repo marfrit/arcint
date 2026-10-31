@@ -50,7 +50,8 @@ json usage_json(const GenerationStats& s) {
 // counter is added here, once.
 bool loop_guard_moved(const GenerationStats& stats) {
     return stats.loop_detections || stats.loop_nudges || stats.loop_slaps || stats.loop_aborts
-           || stats.loop_self_closes || stats.loop_door_masked || stats.loop_door_eog_masked;
+           || stats.loop_self_closes || stats.loop_door_masked || stats.loop_door_eog_masked
+           || stats.loop_context_closes || stats.loop_context_no_closer;
 }
 
 void log_slot_line(int slot, const char* phase, int tokens, double seconds, double rate,

@@ -234,6 +234,9 @@ private:
     void   loop_do_nudge_();
     void   loop_do_slap_();
     void   loop_do_abort_();
+    // feyntalk W3.4: the context guard's once-per-turn arm, at (or already past)
+    // the budget with the block open.
+    void   think_ctx_arm_();
     // door (no ladder): the budget spent -- lift the masks and go on unguarded
     void   loop_door_lift_();
     // the ladder's escalation, by counted lines once the door is open (shared
@@ -415,7 +418,8 @@ private:
     // boundary; ctx_settled_ is the once-latch (a forced close, or a text
     // family that cannot be forced, is decided once per turn). emitted_ counts
     // observed tokens, the same index space the event names.
-    int  ctx_budget_         = -1;
+    int  ctx_budget_         = -1;   // tokens left inside the block; -1 when off
+    bool ctx_armed_          = false; // a budget was handed over (reserve > 0)
     bool ctx_pending_        = false;
     bool ctx_settled_        = false;
     int  ctx_closes_         = 0;
