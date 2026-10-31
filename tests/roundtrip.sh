@@ -563,6 +563,35 @@ curl -sS "${OP_BASE}/v1/chat/completions" -H 'Content-Type: application/json' \
 jassert "${WORK}/op-chat.json" '"accepted_prediction_tokens" in d["usage"]["completion_tokens_details"] and "rejected_prediction_tokens" in d["usage"]["completion_tokens_details"]'
 check "usage says which regime the request got (draft counters present)" $?
 
+# ------------------------------------------------------------- /v1/responses
+# Open Responses, non-stream (docs/campaigns/feyntalk.md W1); the SSE writer is
+# W2. The required-key set is the 2026-04-24 ResponseResource: a client parses a
+# resource only when all of it is present.
+code=$(curl -sS -o "${WORK}/resp.json" -w '%{http_code}' "${OP_BASE}/v1/responses" \
+       -H 'Content-Type: application/json' -d '{"model":"stub","input":"hello"}')
+check "/v1/responses answers a plain string input" "$([[ $code == 200 ]] && echo 0 || echo 1)"
+jassert "${WORK}/resp.json" 'd["object"]=="response" and d["status"]=="completed" and d["output"][0]["type"]=="message"'
+check "/v1/responses returns a completed response with a message item" $?
+jassert "${WORK}/resp.json" \
+  'all(k in d for k in ["id","object","created_at","completed_at","status","incomplete_details","model","previous_response_id","instructions","output","error","tools","tool_choice","truncation","parallel_tool_calls","text","top_p","presence_penalty","frequency_penalty","top_logprobs","temperature","reasoning","usage","max_output_tokens","max_tool_calls","store","background","service_tier","metadata","safety_identifier","prompt_cache_key"])'
+check "/v1/responses carries every required ResponseResource key" $?
+jassert "${WORK}/resp.json" \
+  'd["usage"]["input_tokens"]>0 and d["usage"]["total_tokens"]==d["usage"]["input_tokens"]+d["usage"]["output_tokens"] and d["usage"]["input_tokens_details"]["cached_tokens"]==0'
+check "/v1/responses usage is filled" $?
+
+code=$(curl -sS -o "${WORK}/resp-stream.json" -w '%{http_code}' "${OP_BASE}/v1/responses" \
+       -H 'Content-Type: application/json' -d '{"model":"stub","input":"hello","stream":true}')
+check "/v1/responses refuses stream until the SSE writer exists" "$([[ $code == 400 ]] && echo 0 || echo 1)"
+jassert "${WORK}/resp-stream.json" 'd["error"]["type"]=="invalid_request" and d["error"]["code"]=="unsupported_parameter" and d["error"]["param"]=="stream"'
+check "/v1/responses stream refusal is the spec error envelope" $?
+
+code=$(curl -sS -o "${WORK}/resp-tools.json" -w '%{http_code}' \
+       -H 'Content-Type: application/json' --data-binary '{"model":"stub","instructions":"be terse","input":[{"type":"message","role":"user","content":"read a.txt"},{"type":"function_call","call_id":"call_7","name":"read_file","arguments":"{\"path\":\"a.txt\"}"},{"type":"function_call_output","call_id":"call_7","output":"alpha"}],"tools":[{"type":"function","name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}],"max_output_tokens":256}' \
+       "${OP_BASE}/v1/responses")
+check "/v1/responses serves an instructions + tool + tool-output turn" "$([[ $code == 200 ]] && echo 0 || echo 1)"
+jassert "${WORK}/resp-tools.json" 'd["instructions"]=="be terse" and d["tools"][0]["name"]=="read_file" and any(i["type"]=="function_call" and i["name"]=="read_file" for i in d["output"])'
+check "/v1/responses echoes instructions and tools and emits the function_call item" $?
+
 kill -TERM "$OP_PID" 2>/dev/null; wait "$OP_PID" 2>/dev/null; OP_PID=""
 
 # The retired engine's options are refused by name, and its engine value by a

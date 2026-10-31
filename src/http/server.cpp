@@ -5,6 +5,7 @@
 #include <httplib.h>
 
 #include "api/error.h"
+#include "api/responses.h"
 #include "util/log.h"
 
 namespace lgc {
@@ -211,6 +212,52 @@ void HttpServer::Impl::route() {
                 // keep-alive survive.
                 return true;
             });
+    });
+
+
+    // Open Responses (docs/campaigns/feyntalk.md W1): one request path, one
+    // generation path. parse_response_request maps the body onto a ChatRequest,
+    // prepare_response hands it to the chat route's own prepare_from_chat, and
+    // run_response drives it exactly as run_chat does. Non-stream only in W1:
+    // stream:true is refused by the parser with the spec's envelope.
+    svr.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const json::exception& e) {
+            send_json(res, 400,
+                      api::responses_error(log::format("request body is not valid JSON: %s",
+                                                       e.what()), "invalid_request", "invalid_request"));
+            return;
+        }
+
+        api::ResponseRequest parsed;
+        if (auto err = api::parse_response_request(body, parsed)) {
+            send_json(res, err->status, err->body);
+            return;
+        }
+
+        auto prep = std::make_shared<api::PreparedResponse>();
+        if (auto err = api::prepare_response(ctx, std::move(parsed), *prep)) {
+            send_json(res, err->status, err->body);
+            return;
+        }
+
+        auto lease = std::make_shared<api::SlotPool::Lease>();
+        int  slot  = -1;
+        if (auto err = api::acquire_slot(ctx, prep->chat.lane, *lease, slot)) {
+            // The spec maps a busy service to 429 too_many_requests; the chat
+            // route keeps its 503 (docs/campaigns/feyntalk.md Errors).
+            json busy = api::responses_error(err->body["error"]["message"].get<std::string>(),
+                                             "too_many_requests", "all_lanes_busy");
+            send_json(res, 429, busy);
+            return;
+        }
+
+        prep->chat.input.peer_alive = peer_probe(req.socket);
+        const api::HttpResult r = api::run_response(ctx, *prep, slot);
+        if (r.gone) return;
+        send_json(res, r.status, r.body);
     });
 
     svr.Post("/v1/completions", [this](const httplib::Request& req, httplib::Response& res) {
