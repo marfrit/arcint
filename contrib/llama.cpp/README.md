@@ -4764,3 +4764,213 @@ Owed (no class until run): the expert GEMM's share of the prefill wall and
 the B60 crossover; the same-method quality comparison against Strata's
 teacher-forced form. Commands in
 `docs/campaigns/int8-dpas-prompt-experts.md` §"Card window".
+
+## 0072-opencl-uniform-work-groups.patch
+
+The backend's launches without non-uniform work groups (`code`: the patch's
+own text, `ggml-opencl.cpp` and the kernel sources). OpenCL 2.0+ accepts a
+global size that is not a multiple of the local size as a non-uniform work
+group; the individual driver does, LEO (OpenCL over Level Zero,
+`EnableLEO=1`, `docs/campaigns/research-vram-arena.md` §8) does not and returns
+`CL_INVALID_WORK_GROUP_SIZE` (-54) at the first ragged launch, which failed
+the stage 2a gate at the set_tensor converts (`measured-here`, the gate's
+first window, `docs/campaigns/vram-user-space.md`).
+
+One rule, one place: `ggml-opencl-uniform.h` rounds every dimension of the
+global size up to a whole local size, and `enqueue_ndrange_kernel` applies it
+to every launch through the wrapper; a direct `clEnqueueNDRangeKernel` call in
+the backend rounds before enqueueing (67 launch sites with a local size,
+`code`: the device-free test counts them from the source). Rounding is
+idempotent, so a grid that is already a whole multiple is unchanged. The
+work-items of the rounded tail exit in the kernel. This replaces the pin's
+two-way fallback (`local_work_size_ptr = NULL` when `n % 64 != 0` and the
+device has no non-uniform support, at 19 sites): that path changed the local
+size, this one keeps it and rounds the count. The pin's
+`CL_DEVICE_NON_UNIFORM_WORK_GROUP_SUPPORT` query and its field are gone with
+that fallback (0072 reads neither: the individual driver's answer does not
+match what LEO accepts, so every launch is made uniform instead of trusting
+the capability).
+
+Two classes, told apart by the build, not by a runtime test (`code`): 170 of
+the 368 launch sites live only in `GGML_OPENCL_USE_ADRENO_KERNELS` regions, and
+in that build both helpers return their input unchanged — the Adreno launches
+keep the pin's ragged sizes and the Adreno kernels need no bound of their own
+(several decompose their axes by modulo, `kernel_transpose_32` on
+`get_global_id(2)`, `mul_mm_f16_f32_kq_kqv.cl:204`). LEO is not an Adreno
+driver: `GGML_OPENCL_USE_ADRENO_KERNELS` builds do not define the Intel
+launches and an Adreno device never runs through Level Zero. The Intel class
+(198 sites) rounds; the test's Adreno build asserts the no-op.
+
+The inventory of the Intel class (`code`: every launch read in the patch's
+tree), by class:
+
+- **Whole multiple by construction, unchanged by the rule.** Tile and
+  block-derived grids: `ne01*nth` / `ne10*nth` / `ne11*nth` with local `nth`,
+  every `CEIL_DIV(..., L)*L` (the matmul, im2col, conv, flash-attention,
+  MoE-sort and -reorder, GEMM, GEMV-split, repack and set/get-rows grids), the
+  one-group reductions (softmax, argsort, sum_rows, norm, cpy, diag) whose
+  local size is the tile, and every local size 1 (the converts' restore legs,
+  the dequant copies, the reconstruct kernels).
+- **Ragged, the kernel already bounds the work-item.** The elementwise grids
+  over `ggml_nelements` and the convert grids over n_blocks/ne01. The bound
+  was already there (`neg`, `pad`, `upscale`, `tri`, `fill`, `q5_0`, `q5_1`,
+  `q6_K`, `iq4_nl`, the q4_K/q5_K/q6_K trans4 converts, the add_id/glu-style
+  n-argument kernels); the test below keeps them.
+- **Ragged, the kernel got its bound in this patch.** Read each to find the
+  index it must bound and what it did not have (`code`):
+  - the convert kernels a separate arrays form: `kernel_convert_block_q1_0`,
+    `_q4_0`, `_q4_0_noshuffle`, `_q4_1`, `_q4_1_noshuffle`,
+    `_q5_0_noshuffle`, `_q5_1_noshuffle`, `_mxfp4`, `_q8_0`, `_q4_K`,
+    `_q4_K_noshuffle`, `_q5_K`, `_q5_K_noshuffle`, `_q6_K`,
+    `_q6_K_noshuffle`, `_iq4_nl`, `_iq4_nl_noshuffle`, the q6_K and IQ4_NL
+    restore legs — an appended `ulong n_blk` and
+    `if (get_global_id(0) >= n_blk) return;` (the q8_0 convert at `n_blocks`
+    against local 64 is the gate's abort site);
+  - the elementwise kernels over the flat count: `gelu`, `gelu_erf`,
+    `gelu_quick`, `silu`, `relu`, `sigmoid_f32`/`_f16`, `clamp`,
+    `tanh_f32`/`_f32_4`/`_f16`/`_f16_4`, `expm1_*`, `abs_*`, the
+    `unary_ext` and `leaky_relu` macros, `softplus_*`, `scale_f32`,
+    `sqr_cont_*`, `sqrt_cont_*` — an appended `int n` and the same exit (the
+    `_4` variants' n is the element count after the /4 the host already does);
+  - the row broadcasts `add_row`, `add_row_f16`, `mul_row`, `mul_row_f16`,
+    `div_row`/`_f16`, `sub_row`/`_f16` — the row length `ne` is the modulo,
+    not the count, so an appended `int n_total` carries the launch's true
+    count and the exit is on it (red: a guard on `ne` drops a whole broadcast);
+  - `ssm_conv` (an appended `ne01`, the dim-0 count), `solve_tri` (the
+    existing `k` bounds dim 0; appended `ne2`/`ne3` bound dims 1/2),
+    `diag_mask_inf` (the existing `ne00` bounds dim 0) and `_8` (an appended
+    `int n_f4`, float4 units — the item writes two).
+- **Sub-group or barrier collectives** (`code`): the gemv 32b-trans kernels
+  (`gemv_noshuffle_q4_k/q5_k/q6_k_f32_32b_trans`, launched `ne01 x 8` against
+  local `64 x 8`) must not lose a lane before their `sub_group_broadcast` and
+  `barrier`. They clamp the row index for the loads and gate only the final
+  `dst[i01] = sum` on `i01 < ne01`, after the collectives. The conv, flash
+  attention, argsort and MoE-sort kernels are whole-multiple grids (class 1),
+  so their groups stay full.
+
+Round 2 (`code`, the review of the first commit; the round's own measurements
+are `measured-here` where the reviewer ran them):
+- `ssm_conv.cl` did not compile: the appended `int ne01` followed a comma that
+  sat inside the preceding parameter comment, so both kernels read
+  `int act /* ... */ int ne01` (`expected ')'`, then an undeclared `ne01` at
+  the bound; 4 errors with `clang-18 -target spir64 -x cl -cl-std=CL3.0
+  -Xclang -finclude-default-header -fsyntax-only`). ssm_conv is built at init
+  through the fatal `build_program_from_source`, so every start died before
+  the first op. The separator is now outside the comment (`int act, // ...`,
+  then `int ne01`), and the test carries a structural check for the class: a
+  parameter list whose comment line ends with a comma (red: the bug restored ->
+  `FAIL: ssm_conv.cl:16 a comma inside a parameter comment ends the line`).
+- `transpose.cl`: the `padded_rows` exit had gone into `kernel_transpose_16`,
+  which has no such parameter; the kernel that has it is
+  `kernel_transpose_32_16` (Adreno-only, image buffers). With the Adreno class
+  unrounded, `transpose.cl` is back at the pin unchanged: the first commit's
+  edits there are reverted, and the README's claim that the transpose kernels
+  bound their launch was wrong.
+- the test's compile half: when a clang exists (`$CLANG`, `clang`, `clang-18`,
+  `clang-19`), every `kernels/*.cl` is syntax-checked as OpenCL C at
+  `-target spir64 -x cl -cl-std=CL3.0 -Xclang -finclude-default-header`. A
+  file the backend assembles with an `#include`, or builds with its own `-D`
+  defines (the names read from `ggml-opencl.cpp`; e.g. `-DSG`, `-DWG`,
+  `-DBLOCK_STRIDE_A`), is listed and skipped with that reason. Round 3: the
+  full sweep also hit `kernels/sdpa_xmem_f32_f16_os8.cl`, which calls Qualcomm
+  builtins (`qcom_get_physical_sub_group_id`,
+  `qcom_sub_group_constant_load8`, `qcom_sub_group_sync`) that the generic
+  front end cannot know, and which fails identically on the pre-0072 text; any
+  source whose code calls a `qcom_*` builtin (or uses such an attribute) is
+  now listed and skipped with that reason (`qcom_reqd_sub_group_size`, an
+  attribute behind the driver's own pragma guard, still compiles and is not
+  skipped). 153 compiled, 43 skipped (16 with a `-D`, 27 vendor). No clang is
+  installed on this host, so the half prints its note and Claude runs it on a
+  host that has one (red: a stub clang returning 1 for `ssm_conv.cl` ->
+  `FAIL: ssm_conv.cl does not compile as OpenCL C`, exit 1; the ssm_conv comma
+  restored still fails that half as well as the comment check).
+- hygiene: the dead capability field and its query are gone (above); the two
+  lines the review flagged as mis-indented are corrected.
+
+Device-free tests (`tests/test-opencl-workgroups.cpp`, the CTest
+`test-opencl-workgroups` and, for the Adreno build, the same source built with
+`-DGGML_OPENCL_USE_ADRENO_KERNELS` as `test-opencl-workgroups-adreno`; no GPU):
+the rounding helper (per dimension, idempotence, local 0/1/NULL, a tail; in
+the Adreno build that it returns its input), a text check over
+`ggml-opencl.cpp` that every `clEnqueueNDRangeKernel` call with a local size
+has the rounding call between it and the previous launch and that no
+`local_work_size_ptr` fallback remains, the parameter-comment check, and the
+compile half above. Reds, each seen failing: one helper line removed ->
+`FAIL: launch at byte ... passes a local size without rounding`, exit 1; the
+helper returning its input -> `FAIL: round 10/64`, `FAIL: round 65/64`,
+`FAIL: round three dimensions`; the Adreno no-op removed from the
+one-dimension helper -> `FAIL: adreno: round leaves the count` in the Adreno
+build; the ssm_conv comma restored -> the parameter-comment FAIL above; a stub
+clang failing `ssm_conv.cl` -> the compile FAIL above.
+
+Round 4 test fix (`code`, from the review of `00b7532`, `measured-here` for the
+measurement that motivated it): round 3's auto-discovery still failed on any
+host that has a clang - with `clang-18` it reported errors on 39 sources
+(`flash_attn_*.cl`, `gated_delta_net_intel.cl`, `mul_mm_kq_{2d,f16,few,i8}.cl`,
+`mul_mv_*.cl`, ...), every one of them failing identically on the pre-0072
+text (Intel sub-group builtins and `-D` macros a generic front end does not
+know), so the half caught nothing and the suite could not pass. It is now an
+explicit list: `tests/opencl_clang_clean.txt` names the 135 kernel sources
+that compile with 0 errors under a generic clang, measured with
+`clang-18 -target spir64 -x cl -cl-std=CL3.0 -Xclang
+-finclude-default-header -fsyntax-only`, both before the series' 0072 change
+and after. The half compiles exactly those and fails on any error; a source
+not in the list is counted and reported but not compiled (61 of the 196
+sources, the vendor-builtin and `-D` ones); a listed name that is missing
+fails. The structural no-clang checks stay (the parameter-comment comma). Red
+(the one-line mutation): the comma after `int act` in `ssm_conv.cl` restored ->
+`FAIL: ssm_conv.cl does not compile as OpenCL C` plus the comment check, 2
+failures, exit 1 (a stub clang standing in for that compiler failure here;
+Claude runs the half with clang-18). Refresh: compile `kernels/*.cl` with the
+command above and keep the names that report no error in both texts.
+
+Card window 33 (`measured-here`: Claude, 2026-10-31, `2ba3656`'s build,
+compute-runtime 26.27.39122.11, the same binaries under both drivers):
+- `clang-18 -target spir64 -x cl -cl-std=CL3.0 -Xclang -finclude-default-header
+  -fsyntax-only` on every kernel file the patch touches, the pre-0072 text
+  against the patched: no file gains an error (round 2's ssm_conv and transpose
+  defects are closed).
+- `test-backend-ops`, the full eval (12,881 cases): **B60** default 12,724
+  passed, LEO 12,724 passed, the failure sets identical by name (74 MXFP4
+  `MUL_MAT_ID`, the pin's - README 0012; 70 `MUL_MAT_VEC_FUSION`, 8
+  `SWIGLU_OAI`, 3 `ADD_{SILU,SIGMOID,SOFTPLUS}_MUL`, all failing under the
+  default driver too), so on the B60 LEO passes exactly what the default driver
+  passes. **A770** default 12,867 passed (3 `ADD_*_MUL`, 3 `FLASH_ATTN_EXT`
+  hsk=64 f16, 8 `SWIGLU_OAI`); LEO meets the same failures, then the runtime
+  aborts after 4,615 passing cases in the next test (`MUL_MAT` type_a=mxfp4
+  m=2880 n=32 k=2880, which the default driver passes): `Abort was called at
+  1898 line in file: .../xe_hpg_core/hw_cmds_generated_xe_hpg_core.inl` - an
+  assertion in the runtime's DG2 command generation, not a launch error (in
+  this release LEO is supported only on the later products, `code`:
+  `isLEOSupported()`, `docs/campaigns/research-vram-arena.md` §8).
+- release A/B (`tests/acceptance/ab.py`, two rounds, default against LEO
+  through a wrapper exporting `EnableLEO=1 NEOReadDebugKeys=1`): **agent**
+  (B60) PASS, prefill 55k 716.45 -> 714.45 (-0.28 %), 138k 503.65 -> 503.25
+  (-0.08 %); **coder** (A770) decode +5.9 % (51.55 -> 54.60, 52.80 -> 55.85,
+  45.30 -> 48.00 t/s), prefill 41k -5.3 % (730.15 -> 691.15), FAIL on prefill;
+  texts byte-identical in every run of both arms on both units.
+
+Disposition (`measured-here`): 0072 closes LEO's -54 on both cards - it is no
+longer a launch defect but a runtime limit. Route A is usable on the B60 at the
+default driver's numbers (same pass set, same answers, prefill inside the
+floor). On the A770 route A is blocked by the runtime's abort in its DG2
+command generation, owed the newest compute-runtime in the fresh-host
+container, and its LEO prefill loss (-5.3 % at 41k) is unexplained, owed a
+profile under both drivers.
+
+Trajectory: at stage 2a's first window the eval stopped at the first ragged
+launch under LEO (the set_tensor converts, -54) before any op; window 33 above
+is the full eval, and the earlier 75xx-case run that produced
+A770 7522/7525 and B60 7451/7525 is superseded by the 12,881-case suite.
+
+To re-run, build the series from the pin, then
+
+    GGML_OPENCL_DEVICES=0:0 ./bin/test-backend-ops -b GPUOpenCL          # B60, default driver
+    GGML_OPENCL_DEVICES=0:0 EnableLEO=1 NEOReadDebugKeys=1 ./bin/test-backend-ops -b GPUOpenCL
+    GGML_OPENCL_DEVICES=1:0 ./bin/test-backend-ops -b GPUOpenCL          # A770, default driver
+    GGML_OPENCL_DEVICES=1:0 EnableLEO=1 NEOReadDebugKeys=1 ./bin/test-backend-ops -b GPUOpenCL
+
+and `tests/acceptance/ab.py` for the A/B, the LEO arm's binary through the
+wrapper. The coder's prefill loss is owed a cause: rebuild with
+`-DGGML_OPENCL_PROFILING=ON` and compare `cl_trace.json` under both drivers for
+the same prefill chunk (kernel names, device durations, copies).

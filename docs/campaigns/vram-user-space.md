@@ -91,6 +91,58 @@ not yet told apart.
      The coder's decode gain under LEO is a lead of its own (the A770's per-launch host cost behind the chipset,
      contrib/llama.cpp/README.md 0047; not yet explained, not yet measured on Flash-Next's decode). Owed: the
      newest runtime in the fresh-host container, Flash-Next served under LEO.
+   **Patch 0072, the launch defect closed (`code`: the patch's text, `measured-here` for the device-free tests,
+   2026-10-31).** The operator chose the backend patch ("backend patch it is", 2026-10-31). One rounding rule in
+   `ggml-opencl-uniform.h` makes every launch's global size a whole multiple of its local size; the wrapper applies
+   it to every launch and each direct enqueue rounds before it (67 launch sites with a local size, counted by the
+   text check). The kernels' rounded tail exits on the index each kernel must bound; the convert kernels (the gate's
+   abort site: the q8_0 convert at n_blocks against local 64) and the elementwise kernels without an n got one, and
+   the gemv 32b-trans kernels mask only the final store after their sub-group collectives. This replaces the pin's
+   `local_work_size_ptr = NULL` fallback at 19 sites, so the local size is never traded for non-uniform support.
+   Adreno-only builds round nothing (`GGML_OPENCL_USE_ADRENO_KERNELS`: both helpers return their input; 170 of the
+   368 launch sites and the Adreno kernels' modulo-decomposed axes stay as the pin had them), and the pin's
+   `CL_DEVICE_NON_UNIFORM_WORK_GROUP_SUPPORT` query and field are gone with its fallback.
+   Round 2 (`code`; the reviewer's clang-18 run is `measured-here`): the first commit's `ssm_conv.cl` did not
+   compile (the appended `ne01` followed a comma inside the parameter comment, so both kernels merged two
+   declarations; ssm_conv is built at init fatally, so every start died), and its `transpose.cl` exit sat in a
+   kernel without that parameter - both fixed, the Adreno file restored to the pin. The tests now also carry the
+   parameter-comment check and, where a clang exists, a syntax-only compile of the sources listed in
+   `tests/opencl_clang_clean.txt` - the 135 kernel sources measured clean under clang-18 before and after the
+   patch; the 61 others call a vendor builtin or need the backend's own `-D` defines and fail identically on the
+   pre-0072 text, so they are counted and reported and not compiled (round 4 replaced round 3's auto-discovery,
+   which failed on 39 such sources on any host with a clang).
+   Device-free reds, each seen failing:
+   one helper line removed, exit 1; a helper returning its input, `FAIL: round 10/64`; the ssm_conv comma
+   restored, `FAIL: ssm_conv.cl:16 a comma inside a parameter comment`; the Adreno no-op removed, the Adreno
+   build fails; a stub clang failing ssm_conv, the compile FAIL. The cards were measured in window 33 (below);
+   commands in `contrib/llama.cpp/README.md` 0072.
+
+   **Card window 33, `measured-here` (Claude, 2026-10-31, `2ba3656`'s build, compute-runtime
+   26.27.39122.11, the same binaries under both drivers).** The launch defect is closed on both cards:
+   - `clang-18 -target spir64 -x cl -cl-std=CL3.0 -Xclang -finclude-default-header -fsyntax-only` on every
+     kernel file 0072 touches, the pre-0072 text against the patch's: no file gains an error (ssm_conv's
+     comma-merged declarations and transpose's misplaced bound are gone).
+   - `test-backend-ops`, the full eval (12,881 cases), per card: **B60** default 12,724 passed, LEO 12,724
+     passed, the failure sets identical by name (74 MXFP4 `MUL_MAT_ID`, the pin's; 70 `MUL_MAT_VEC_FUSION`,
+     8 `SWIGLU_OAI`, 3 `ADD_{SILU,SIGMOID,SOFTPLUS}_MUL`, all failing under the default driver too) - on the
+     B60 LEO passes exactly what the default driver passes. **A770** default 12,867 passed (3 `ADD_*_MUL`, 3
+     `FLASH_ATTN_EXT` hsk=64 f16, 8 `SWIGLU_OAI`); LEO matches those failures then the runtime aborts after
+     4,615 passing cases, in the next test (`MUL_MAT` type_a=mxfp4 m=2880 n=32 k=2880, which the default
+     driver passes): "Abort was called at 1898 line in file:
+     ../../neo/shared/source/generated/xe_hpg_core/hw_cmds_generated_xe_hpg_core.inl" - an assertion inside
+     the runtime's DG2 command generation, not a launch error (`code`: `isLEOSupported()` false except the
+     newer products in this release, `docs/campaigns/research-vram-arena.md` §8).
+   - Release A/B (`tests/acceptance/ab.py`, two rounds, default against LEO through a wrapper exporting
+     `EnableLEO=1 NEOReadDebugKeys=1`): **agent** (B60) PASS, prefill 55k 716.45 -> 714.45 (-0.28 %), 138k
+     503.65 -> 503.25 (-0.08 %); **coder** (A770) decode +5.9 % (51.55 -> 54.60, 52.80 -> 55.85, 45.30 ->
+     48.00 t/s), prefill 41k -5.3 % (730.15 -> 691.15), FAIL on prefill; texts byte-identical in every run of
+     both arms on both units.
+   - **Disposition (measured-here):** 0072 closes LEO's -54 on both cards, so it is no longer a launch
+     defect but a runtime limit. Route A is usable on the B60 at the default driver's numbers (same pass set,
+     same answers, prefill inside the floor). On the A770 route A is blocked by the runtime's abort in its
+     DG2 command generation, owed the newest compute-runtime in the fresh-host container, and its LEO
+     prefill loss (-5.3 % at 41k) is unexplained, owed a profile under both drivers.
+
 2b. **Route B - a chunk pool on the default driver (if LEO falls short).** Allocate the usable VRAM once at load as a
    fixed set of large `cl_mem` chunks; a ggml buffer type hands out ranges inside them (the backend already addresses
    every tensor as buffer + offset, `data_device` set in one place, `code`); the backend's grow-only buffers and the
