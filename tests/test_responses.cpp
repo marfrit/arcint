@@ -246,7 +246,6 @@ TEST(responses_refuses_the_unbuilt_request_fields) {
         body[key] = value;
         check_refusal(body, "unsupported_parameter", param, key);
     };
-    refuse("include", json::array({"message.output_text.logprobs"}), "include");
     refuse("max_tool_calls", 4, "max_tool_calls");
     refuse("background", true, "background");
     refuse("service_tier", "flex", "service_tier");
@@ -282,6 +281,40 @@ TEST(responses_refuses_the_unbuilt_request_fields) {
         body["whatever"] = 1;
         check_refusal(body, "invalid_request", "whatever", "unknown top-level field");
     }
+}
+
+TEST(responses_accepts_include_and_ignores_it) {
+    // Found by the live leg: pi and other OpenAI-compatible clients send
+    // include: ["reasoning.encrypted_content"] on every reasoning request. A
+    // 400 would lock the client out; the entries are accepted and ignored —
+    // arcint serves neither encrypted reasoning nor output logprobs, and
+    // nothing extra appears in the output.
+    json body = base();
+    body["include"] = json::array({"reasoning.encrypted_content", "message.output_text.logprobs"});
+    ResponseRequest r;
+    parse_ok(body, r);
+    CHECK_EQ(r.chat.messages.size(), 1u);
+
+    // Any string entry is accepted (the enum may grow); only a non-string entry
+    // is a 400.
+    json other = base();
+    other["include"] = json::array({"some.future.value"});
+    ResponseRequest r2;
+    parse_ok(other, r2);
+    json bad = base();
+    bad["include"] = json::array({7});
+    check_refusal(bad, "invalid_request", "include", "a non-string include entry");
+
+    // Nothing extra in the output: the resource has no include key and the
+    // required-key set is unchanged.
+    Fixture fx;
+    PreparedResponse prep;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r2), prep).has_value());
+    const auto lease = fx.slots.acquire_for(0);
+    const api::HttpResult res = api::run_response(fx.ctx, prep, lease.index());
+    CHECK_EQ(res.status, 200);
+    if (res.status != 200) return;
+    CHECK(!res.body.contains("include"));
 }
 
 TEST(responses_accepts_stream_and_obfuscation_options) {
