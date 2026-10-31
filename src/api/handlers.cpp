@@ -456,11 +456,15 @@ json props(const Context& ctx) {
     json p = json{
         {"model", std::move(model)},
         {"chat_template_caps", ctx.backend->template_caps()},
-        // feyntalk W6a (docs/campaigns/feyntalk.md, D4): whether this unit can
-        // serve token mode and the material hash a gateway pins. "ready" means
-        // GET /v1/responses/renderer answers 200; "off" means it answers 404.
+        // feyntalk W6a (docs/campaigns/feyntalk.md, D4; review findings 1/3):
+        // the capability, not the material. "ready" means token mode serves and
+        // the endpoint can build the body; the hash is the cached one from the
+        // first build (the first GET or token request), never computed here.
         {"token_mode", api::renderer_ready(ctx) ? "ready" : "off"},
-        {"renderer_hash", api::renderer_ready(ctx) ? json(api::renderer_hash(ctx)) : json(nullptr)},
+        {"renderer_hash", [&]() {
+             const std::string h = api::renderer_hash(ctx);
+             return h.empty() ? json(nullptr) : json(h);
+         }()},
         // What is actually served, not a Config default the load path may
         // never have read. `kv_dtype` comes off ModelStatus, which the llama
         // backend fills from --llama-kv (config.h's llama_kv_dtype); the stub

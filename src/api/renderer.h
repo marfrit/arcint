@@ -6,23 +6,33 @@
 
 #include "api/handlers.h"
 
-// feyntalk W6a (docs/campaigns/feyntalk.md, D4/D1): the renderer material
-// surface. The backend owns the material; this module reads it for `/props`,
-// for the request's hash check and for `GET /v1/responses/renderer`. No auth,
-// like `/props`.
+// feyntalk W6a (docs/campaigns/feyntalk.md, D4/D1) and its review round: the
+// renderer material surface. The backend owns the lazy build and the cached
+// body; this module reads the capability for `/props`, the cached hash for
+// `/props`, and hands the endpoint the pre-serialized body by reference. No
+// auth, like `/props`.
 namespace lgc::api {
 
-// The material the unit serves, or an empty json when it serves none (the stub).
-const nlohmann::json& renderer_material(const Context& ctx);
-
-// Whether this unit can serve token mode: material present with a hash.
+// Whether this unit can serve token mode: the capability the backend reports,
+// without building the material (W6a review finding 3). `/props` reads this.
 bool renderer_ready(const Context& ctx);
 
-// The served material's hash, empty when no material is served.
+// The hash of the already-built material, empty before the first build. Never
+// builds (W6a review finding 3: `/props` must not pay the ~13 MB body).
 std::string renderer_hash(const Context& ctx);
 
-// `GET /v1/responses/renderer`: 200 with the material, or 404
-// `renderer_not_served` for a unit without one.
-HttpResult renderer_bundle(const Context& ctx);
+// The material JSON, built once on first use; empty when not capable or the
+// build failed. The request's hash check reads the hash from it.
+const nlohmann::json& renderer_material(const Context& ctx);
+
+// `GET /v1/responses/renderer`: the status, the cached serialized body by
+// reference (200; owned by the backend) or a serialized error envelope (404
+// `renderer_not_served`, type `not_found`). Never copies the 13 MB body.
+struct RendererBundle {
+    int                status = 200;
+    const std::string* body   = nullptr;   // 200: the backend's cached body
+    std::string        error;              // 4xx: the serialized error body
+};
+RendererBundle renderer_bundle(const Context& ctx);
 
 }  // namespace lgc::api

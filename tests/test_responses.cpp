@@ -2495,27 +2495,28 @@ TEST(responses_token_mode_matching_hashes_prepare) {
 
 TEST(responses_renderer_endpoint_is_404_without_material) {
     Fixture fx;
-    const api::HttpResult r = api::renderer_bundle(fx.ctx);
+    const api::RendererBundle r = api::renderer_bundle(fx.ctx);
     CHECK_EQ(r.status, 404);
-    if (r.status != 404 || !r.body.is_object() || !r.body.contains("error")) return;
-    const json& e = r.body["error"];
+    if (r.status != 404 || r.error.empty()) return;
+    const json e = json::parse(r.error)["error"];
     CHECK_EQ(e["code"].get<std::string>(), std::string("renderer_not_served"));
 }
 
 TEST(responses_renderer_endpoint_serves_the_material) {
     Fixture fx(4096, synthetic_material(kHashB));
-    const api::HttpResult r = api::renderer_bundle(fx.ctx);
+    const api::RendererBundle r = api::renderer_bundle(fx.ctx);
     CHECK_EQ(r.status, 200);
-    if (r.status != 200) return;
-    CHECK(r.body.contains("schema"));
-    CHECK(r.body.contains("hash"));
-    if (!r.body.contains("schema") || !r.body.contains("hash")) return;
-    CHECK_EQ(r.body["schema"].get<std::string>(), std::string("feyntalk-render/1"));
-    CHECK_EQ(r.body["hash"].get<std::string>(), kHashB);
-    CHECK(r.body.contains("decode"));
-    CHECK(r.body.contains("chat_template"));
-    CHECK(r.body.contains("special_tokens"));
-    CHECK(r.body.contains("parser"));
+    if (r.status != 200 || r.body == nullptr) return;
+    const json body = json::parse(*r.body);
+    CHECK(body.contains("schema"));
+    CHECK(body.contains("hash"));
+    if (!body.contains("schema") || !body.contains("hash")) return;
+    CHECK_EQ(body["schema"].get<std::string>(), std::string("feyntalk-render/1"));
+    CHECK_EQ(body["hash"].get<std::string>(), kHashB);
+    CHECK(body.contains("decode"));
+    CHECK(body.contains("chat_template"));
+    CHECK(body.contains("special_tokens"));
+    CHECK(body.contains("parser"));
 }
 
 TEST(props_reports_token_mode_and_the_renderer_hash) {
@@ -2874,13 +2875,26 @@ public:
     nlohmann::json    material = synthetic_material(kHashA);
     mutable int       builds   = 0;
     mutable int       serializations = 0;
+    mutable bool      serialized = false;
+    mutable std::string serialized_body;
 
     const ModelStatus& status() const override { return st; }
     Tokenizer&         tokenizer() override { return tok_; }
     std::string        render_chat(const ChatRequest&) const override { return {}; }
+    bool renderer_capable() const override { return true; }
     const nlohmann::json& renderer_material() const override {
         ++builds;
         return material;
+    }
+    std::string renderer_hash() const override { return material["hash"].get<std::string>(); }
+    const std::string& renderer_material_json() const override {
+        if (!serialized) {
+            (void)renderer_material();
+            serialized_body = material.dump();
+            serialized      = true;
+            ++serializations;
+        }
+        return serialized_body;
     }
     FinishReason generate(const GenerationInput&, int, const TokenCallback&,
                           GenerationStats&) override {
@@ -2938,10 +2952,53 @@ TEST(props_does_not_build_the_material) {
     CHECK_EQ(p["token_mode"].get<std::string>(), std::string("ready"));
 }
 
+TEST(renderer_endpoint_builds_once_and_serves_the_cached_body) {
+    Config cfg;
+    CountingMaterialBackend backend;
+    SlotPool slots{1};
+    api::Context ctx;
+    ctx.cfg = &cfg;
+    ctx.backend = &backend;
+    ctx.slots = &slots;
+    const api::RendererBundle first  = api::renderer_bundle(ctx);
+    const api::RendererBundle second = api::renderer_bundle(ctx);
+    CHECK_EQ(first.status, 200);
+    CHECK_EQ(second.status, 200);
+    CHECK(first.body != nullptr && second.body != nullptr);
+    CHECK(first.body == second.body);   // the same cached string, not a copy
+    CHECK_EQ(backend.builds, 1);
+    CHECK_EQ(backend.serializations, 1);
+    if (first.body != nullptr) {
+        const json body = json::parse(*first.body);
+        CHECK_EQ(body["hash"].get<std::string>(), kHashA);
+    }
+}
+
 TEST(renderer_404_uses_the_responses_not_found_type) {
     Fixture fx;
-    const api::HttpResult r = api::renderer_bundle(fx.ctx);
+    const api::RendererBundle r = api::renderer_bundle(fx.ctx);
     CHECK_EQ(r.status, 404);
-    if (r.status != 404 || !r.body.contains("error")) return;
-    CHECK_EQ(r.body["error"]["type"].get<std::string>(), std::string("not_found"));
+    if (r.status != 404 || r.error.empty()) return;
+    CHECK_EQ(json::parse(r.error)["error"]["type"].get<std::string>(), std::string("not_found"));
+}
+
+// W6a review finding 4: the material carries the served tag geometry and the
+// template's real source. The assembler must preserve both (the llama backend
+// fills them at load; the stub can only pin the contract).
+TEST(renderer_material_carries_the_tag_geometry_and_template_source) {
+    RendererMaterialParts parts = minimal_parts();
+    parts.chat_template["source"] = "chatml-fallback";
+    parts.special_tokens["think_extended"] =
+        json::array({json{{"open_ids", json::array({11})}, {"close_ids", json::array({12})}}});
+    parts.parser["tag_set"] = "extended";
+    const json m = assemble_renderer_material(parts);
+    CHECK(m.is_object());
+    if (!m.is_object()) return;
+    CHECK_EQ(m["chat_template"]["source"].get<std::string>(), std::string("chatml-fallback"));
+    CHECK(m["special_tokens"].contains("think_extended"));
+    CHECK_EQ(m["parser"]["tag_set"].get<std::string>(), std::string("extended"));
+    // The geometry is part of the hash: changing it changes the material.
+    parts.parser["tag_set"] = "qwen";
+    const json other = assemble_renderer_material(parts);
+    CHECK(m["hash"].get<std::string>() != other["hash"].get<std::string>());
 }

@@ -116,8 +116,28 @@ public:
     // W6a's test seam: the stub loads no artifact, so its material is empty by
     // default (the endpoint answers 404). A fixture that needs to exercise the
     // token-mode hash checks injects a synthetic bundle here; it is never built
-    // from a vocabulary, and the production stub never has one.
+    // from a vocabulary, and the production stub never has one. The synthetic
+    // bundle is already built, so the capability/hash accessors read it; the
+    // serialized body is cached on the first GET (W6a review finding 3).
+    bool renderer_capable() const override {
+        return renderer_material_.is_object() && renderer_material_.contains("hash") &&
+               renderer_material_["hash"].is_string();
+    }
     const nlohmann::json& renderer_material() const override { return renderer_material_; }
+    std::string renderer_hash() const override {
+        return renderer_capable() ? renderer_material_["hash"].get<std::string>() : std::string();
+    }
+    const std::string& renderer_material_json() const override {
+        if (!renderer_capable()) {
+            static const std::string kEmpty;
+            return kEmpty;
+        }
+        if (!renderer_json_built_) {
+            renderer_material_json_ = renderer_material_.dump();
+            renderer_json_built_   = true;
+        }
+        return renderer_material_json_;
+    }
 
     // The lane index is real here too: the stub has no per-lane state to index
     // with it, but it does have to prove the plumbing — the concurrency gates
@@ -273,6 +293,8 @@ private:
     int           prefill_ubatches_ = 1;
     std::vector<int> lane_ctx_;   // --lane-ctx, by slot
     nlohmann::json renderer_material_;   // W6a test seam; empty in production
+    mutable bool   renderer_json_built_ = false;
+    mutable std::string renderer_material_json_;
     ModelStatus   status_;
     StubTokenizer tokenizer_;
 };

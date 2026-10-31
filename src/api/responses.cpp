@@ -832,11 +832,19 @@ std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest r
     // Token mode: the material first, before any render and before any
     // continuation lookup. A unit without material cannot serve token mode.
     if (req.token_mode) {
+        // W6a review findings 1/3: the capability first (no build), then the
+        // material, which builds once on first use. A build that failed leaves
+        // the unit servable with token mode off, and is a 409 here.
+        if (!ctx.backend->renderer_capable()) {
+            return renderer_conflict("token mode is not served here: this unit is not renderer "
+                                     "capable (GET /props says token_mode: \"off\")",
+                                     "arcint.token_mode");
+        }
         const nlohmann::json& material = ctx.backend->renderer_material();
         if (!material.is_object() || !material.contains("hash") ||
             !material["hash"].is_string()) {
-            return renderer_conflict("token mode is not served here: this unit publishes no "
-                                     "renderer material (GET /v1/responses/renderer answers 404)",
+            return renderer_conflict("token mode is not served here: this unit's renderer "
+                                     "material could not be built (the load log has the reason)",
                                      "arcint.token_mode");
         }
         if (material["hash"].get<std::string>() != req.renderer_hash) {
@@ -943,6 +951,10 @@ std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest r
         // a cache miss later: the prompt is never echoed, only the hash.
         const std::string served = "sha256:" + sha256_hex(prep.chat.input.prompt);
         if (served != req.render_prompt_sha256) {
+            // A continuation's stored entry is NOT evicted here: nothing of it
+            // was served, no token left the engine, and the client can retry the
+            // same previous_response_id once its render is fixed. Only a
+            // prepare 4xx (the stored prefix itself is broken) evicts.
             return renderer_conflict("arcint.render.prompt_sha256 does not match the prompt this "
                                      "unit renders for the turn; the gateway's render and the "
                                      "engine's differ", "arcint.render.prompt_sha256");

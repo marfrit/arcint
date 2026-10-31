@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 #include <nlohmann/json.hpp>
 
 // feyntalk W6a (docs/campaigns/feyntalk.md, D4): the renderer material the
@@ -19,6 +21,11 @@ struct RendererMaterialParts {
 };
 
 // {schema, hash, model, decode, encode, chat_template, special_tokens, parser}
-nlohmann::json assemble_renderer_material(const RendererMaterialParts& parts);
+// Never throws (W6a review, finding 2): the canonical hash admits valid UTF-8
+// only, and a raw-byte vocabulary's token text is not valid UTF-8. An optional
+// feature must not abort a unit's load or throw in the endpoint, so a part the
+// hash cannot encode returns a null json and sets `why`.
+nlohmann::json assemble_renderer_material(const RendererMaterialParts& parts,
+                                           std::string* why = nullptr);
 
 }  // namespace lgc
