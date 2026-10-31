@@ -785,10 +785,15 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
             // counted, and their unchanged render does not advance the count.
             while (n_ctx > 0 && tokens > limit && drop_oldest_reasoning(render_req.messages)) {
                 const std::string next = render();
-                const int         next_tokens = count(next);
-                if (next_tokens == tokens) continue;   // not rendered: not a drop
+                // R2: compare the rendered bytes first. A hidden reasoning block
+                // (an assistant turn before the last user message) leaves the
+                // render unchanged, so the token count is not recomputed -- the
+                // encode was the near-245k-token cost per hidden block on the
+                // agent. A changed render is a real drop even when its token
+                // count happens to be equal.
+                if (next == prompt) continue;
                 prompt = next;
-                tokens = next_tokens;
+                tokens = count(next);
                 ++blocks;
             }
         }

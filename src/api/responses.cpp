@@ -662,12 +662,16 @@ HttpResult translate_prepare_error(const HttpResult& err) {
         if (overflow) {
             if (e.contains("prompt_tokens")) body["prompt_tokens"] = e["prompt_tokens"];
             if (e.contains("n_ctx")) body["n_ctx"] = e["n_ctx"];
-            // W3.5b N4: the fit numbers the message names also reach the
-            // client, as the campaign says.
-            if (e.contains("overflow")) body["overflow"] = e["overflow"];
-            if (e.contains("fit_reserve")) body["fit_reserve"] = e["fit_reserve"];
-            if (e.contains("reasoning_dropped_blocks"))
-                body["reasoning_dropped_blocks"] = e["reasoning_dropped_blocks"];
+            // W3.5b N4 / W3.5c R3: the fit numbers reach the client, but only
+            // for the fit pass's own 400 (`auto`). `overflow` rides with them, so
+            // the disabled/absent 400 keeps today's bytes: it has no top-level
+            // `overflow` key, exactly as before W3.5.
+            if (e.contains("fit_reserve")) {
+                if (e.contains("overflow")) body["overflow"] = e["overflow"];
+                body["fit_reserve"] = e["fit_reserve"];
+                if (e.contains("reasoning_dropped_blocks"))
+                    body["reasoning_dropped_blocks"] = e["reasoning_dropped_blocks"];
+            }
         }
         return HttpResult{400, std::move(body)};
     }
