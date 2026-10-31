@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "core/reasoning.h"
+#include "core/markers.h"
 #include "util/log.h"
 #include "util/text.h"
 
@@ -522,9 +523,11 @@ std::string render_chatml_stub(const ChatRequest& req) {
                                   {"description", t.description},
                                   {"parameters", t.parameters}}}});
         }
-        out += "<|im_start|>system\n# Tools\n";
+        out += markers::kTurnStart;
+        out += "system\n# Tools\n";
         out += declared.dump();
-        out += "<|im_end|>\n";
+        out += markers::kTurnEnd;
+        out += "\n";
     }
 
     // The Qwen3-family rule the stub mirrors so the replay path is tested: an
@@ -537,7 +540,7 @@ std::string render_chatml_stub(const ChatRequest& req) {
 
     for (size_t i = 0; i < req.messages.size(); ++i) {
         const ChatMessage& m = req.messages[i];
-        out += "<|im_start|>";
+        out += markers::kTurnStart;
         out += m.role == "developer" ? "system" : m.role;
         out += "\n";
         if (m.role == "assistant" && i > last_user && !m.reasoning.empty()) {
@@ -557,11 +560,18 @@ std::string render_chatml_stub(const ChatRequest& req) {
             out += json{{"name", c.name}, {"arguments", c.arguments}}.dump();
             out += "\n</tool_call>";
         }
-        out += "<|im_end|>\n";
+        out += markers::kTurnEnd;
+        out += "\n";
     }
 
-    out += "<|im_start|>assistant\n";
-    if (!req.enable_thinking) out += "<think>\n\n</think>\n\n";
+    out += markers::kTurnStart;
+    out += "assistant\n";
+    if (!req.enable_thinking) {
+        out += markers::kThinkOpen;
+        out += "\n\n";
+        out += markers::kThinkClose;
+        out += "\n\n";
+    }
     return out;
 }
 

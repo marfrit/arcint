@@ -7,6 +7,7 @@
 #include "exec/backend.h"
 #include "exec/mtp_trace.h"   // the MTP window trace (off by default, ARCINT_MTP_TRACE)
 #include "exec/slot_loan.h"
+#include "core/markers.h"
 
 #ifdef ARCINT_LLAMA
 
@@ -569,8 +570,9 @@ public:
         // family's: served for creative writing with Mistral Small 3.2's
         // finetune Cydonia 24B (operator, 2026-10-04). Others of the family
         // load too; their tool calls are not parsed (Qwen formats only,
-        // src/core/toolcall.h). Their think blocks are split: <thinking>
-        // (Cydonia) and [THINK] (Magistral), see ModelStatus::think_tags_extended
+        // src/core/toolcall.h). Their think blocks are split: the angle-bracket
+        // tags (Cydonia) and the square-bracket tags (Magistral), see
+        // ModelStatus::think_tags_extended
         char arch[64] = {};
         llama_model_meta_val_str(model_, "general.architecture", arch, sizeof(arch));
         const std::string a(arch);
@@ -824,7 +826,13 @@ public:
                 throw std::runtime_error(log::format("%s carries no chat template", cfg.gguf_path.c_str()));
             log::warn("load", "%s carries no chat template: --tts, using the ChatML fallback for a stray chat request",
                       cfg.gguf_path.c_str());
-            tmpl = "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+            // static: tmpl points into it and is copied after this block ends
+            static const std::string chatml_fallback =
+                "{% for message in messages %}" + std::string(markers::kTurnStart) +
+                "{{ message['role'] }}\n{{ message['content'] }}" + std::string(markers::kTurnEnd) +
+                "\n{% endfor %}{% if add_generation_prompt %}" + std::string(markers::kTurnStart) +
+                "assistant\n{% endif %}";
+            tmpl = chatml_fallback.c_str();
         }
         template_src_ = tmpl;
         const char* bos = llama_vocab_get_text(vocab_, llama_vocab_bos(vocab_));
@@ -1586,10 +1594,10 @@ private:
     }
 
     // The text that opens a user message after an assistant reply (ChatML:
-    // "<|im_start|>user"), from the template by difference, as llama.cpp's
-    // autoparser finds its user_start: what stands between a reply and the
-    // next user message, less what ends a reply. Empty when the template
-    // renders neither.
+    // the turn-start marker followed by the user role), from the template
+    // by difference, as llama.cpp's autoparser finds its user_start: what
+    // stands between a reply and the next user message, less what ends a
+    // reply. Empty when the template renders neither.
     std::string user_start_text() const {
         static const char* u1 = "ARCINTPROBEUSERONE";
         static const char* a1 = "ARCINTPROBEREPLYONE";

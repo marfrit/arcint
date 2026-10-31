@@ -737,9 +737,9 @@ mechanism (`tools/server/server-context.cpp` at the pin, `code`):
   taken, its follow-up reused 5,346 of 5,353 tokens by trimming).
 
 User messages are found by the text that opens one, derived from the GGUF's
-template by rendering it twice (ChatML: `<|im_start|>user`, trimmed as llama.cpp trims it). llama.cpp's
-autoparser finds the same delimiter; arcint renders with minja, so it derives
-the delimiter itself.
+template by rendering it twice (ChatML: the start-of-turn marker followed by
+`user`, trimmed as llama.cpp trims it). llama.cpp's autoparser finds the same
+delimiter; arcint renders with minja, so it derives the delimiter itself.
 
 Two deviations from the reference:
 - llama.cpp supersedes a checkpoint at the same token count, while arcint

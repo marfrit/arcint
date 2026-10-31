@@ -4,26 +4,30 @@
 #include <utility>
 #include <vector>
 
+#include "core/markers.h"
+
 namespace lgc {
 
 // Qwen3-family templates open the think block in the prompt: the generation
-// prompt ends with "<think>\n", the model answers from inside it, and the
-// first thing it emits is reasoning followed by a bare "</think>". The server
-// is the only party that knows the block was pre-opened, so the split is its
-// job: everything before the first close is `reasoning_content`, the rest is
-// `content` -- the convention vLLM and llama.cpp follow. Until 2026-08-30 the
-// whole thing went back as content, "</think>" included.
+// prompt ends with the Qwen think opener and a newline, the model answers
+// from inside it, and the first thing it emits is reasoning followed by the
+// bare think closer. The server is the only party that knows the block was
+// pre-opened, so the split is its job: everything before the first close is
+// `reasoning_content`, the rest is `content` -- the convention vLLM and
+// llama.cpp follow. Until 2026-08-30 the whole thing went back as content,
+// the closer included.
 struct ReasoningSplit {
     std::string reasoning;
     std::string content;
     bool        closed = false;   // the block's closer was seen; false = the model never left the block
 };
 
-// `think_open`: the rendered prompt ended inside a think block ("<think>").
+// `think_open`: the rendered prompt ended inside the Qwen think block.
 // When it did not, a block the model opens itself at the very start is
-// honoured too: "<think>", and with `extended_tags` (ModelStatus::
-// think_tags_extended) also "<thinking>" (Cydonia 24B) or "[THINK]"
-// (Magistral tunes), each closed only by its own closer.
+// honoured too: the same opener, and with `extended_tags` (ModelStatus::
+// think_tags_extended) also the angle-bracket opener (Cydonia 24B) or
+// the square-bracket opener (Magistral tunes), each closed only by its
+// own closer.
 ReasoningSplit split_reasoning(std::string_view raw, bool think_open, bool extended_tags = false);
 
 // The lead of a generated text: everything from its first non-blank
@@ -61,7 +65,7 @@ private:
     bool             in_reasoning_;
     bool             undecided_;      // not opened by the template: wait for the first bytes
     std::string      buffer_;
-    std::string_view close_ = "</think>";   // the closer of the block that is open
+    std::string_view close_ = markers::kThinkClose;   // the closer of the block that is open
     bool             extended_;
     std::vector<std::pair<int, int>> ids_;
     int              close_id_ = -1;   // the closer id of the open block; -1 = text

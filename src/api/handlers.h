@@ -189,7 +189,7 @@ struct PreparedChat {
     ToolSchemas     schemas;
     bool            parse_tool_calls = false;
     bool            think_open       = false;  // the prompt ended inside a think block
-    bool            think_tags_extended = false;  // also <thinking> / [THINK] (ModelStatus)
+    bool            think_tags_extended = false;  // also the angle- and square-bracket think tags (ModelStatus)
     ThinkBlockIds   think_ids;                   // the artifact's per-pair tag ids
     std::string     id;
     int64_t         created       = 0;

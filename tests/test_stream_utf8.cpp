@@ -7,6 +7,7 @@
 
 #include "api/handlers.h"
 #include "core/reasoning.h"
+#include "core/markers.h"
 #include "exec/backend.h"
 #include "util/utf8.h"
 
@@ -250,7 +251,7 @@ using namespace lgc;
 TEST(stream_reasoning_and_content_never_split_a_code_point) {
     const std::string reasoning = "x \xe2\x87\xa9 y \xc3\xa9 z \xf0\x9f\xa7\xa9 w";  // ⇒ é 🧩
     const std::string content   = "p \xe2\x87\xa9 q \xc3\xa9 r \xf0\x9f\xa7\xa9 s";
-    const std::string reply     = reasoning + "</think>" + content;
+    const std::string reply     = reasoning + std::string(markers::kThinkClose) + content;
 
     const std::vector<json> objs = run_stream(reply);
 
@@ -265,7 +266,7 @@ TEST(stream_reasoning_and_content_never_split_a_code_point) {
 TEST(stream_code_point_at_the_think_closer_boundary) {
     const std::string reasoning = "w \xe2\x87\xa9";  // ⇒ right before the close tag
     const std::string content   = "s";
-    const std::string reply     = reasoning + "</think>" + content;
+    const std::string reply     = reasoning + std::string(markers::kThinkClose) + content;
 
     const std::vector<json> objs = run_stream(reply);
 

@@ -1,5 +1,6 @@
 #include "core/chat.h"
 #include "core/reasoning.h"
+#include "core/markers.h"
 #include "harness.h"
 
 using namespace lgc;
@@ -227,7 +228,7 @@ TEST(chat_honours_enable_thinking) {
     CHECK(!req.enable_thinking);
 
     const std::string prompt = render_chatml_stub(req);
-    CHECK(prompt.find("<think>") != std::string::npos);
+    CHECK(prompt.find(std::string(markers::kThinkOpen)) != std::string::npos);
 }
 
 TEST(chat_stream_options_include_usage) {
@@ -301,7 +302,7 @@ TEST(chat_render_stub_is_deterministic) {
     ChatRequest req;
     CHECK(!parse_chat_request(minimal_chat(), req).has_value());
     CHECK_EQ(render_chatml_stub(req), render_chatml_stub(req));
-    CHECK(render_chatml_stub(req).find("<|im_start|>assistant") != std::string::npos);
+    CHECK(render_chatml_stub(req).find(std::string(markers::kTurnStart) + "assistant") != std::string::npos);
 }
 
 TEST(completion_parses_prompt_forms) {

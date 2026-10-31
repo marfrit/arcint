@@ -141,7 +141,7 @@
 - Tool calls parsed server-side into OpenAI tool_calls (JSON body and the
   coder's <function=>/<parameter=> XML with schema-driven coercion);
   deterministic call ids; never executed; no tools declared = raw text.
-- Reasoning: text before </think> goes to reasoning_content;
+- Reasoning: text before the bare think closer goes to reasoning_content;
   enable_thinking and reasoning_effort honoured.
 - Sampling defaults: request > operator flags > the GGUF's defaults; /props
   names the provenance.

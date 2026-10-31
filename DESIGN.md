@@ -345,9 +345,9 @@ provenance (`code`).
 - Incremental detokenisation never splits a UTF-8 code point across SSE
   chunks; stop strings and token ids; `usage` in every response (`code`,
   unit-tested).
-- **Reasoning.** When the rendered prompt ends inside `<think>`, everything
-  before the first `</think>` goes to `reasoning_content`; `enable_thinking`
-  and `reasoning_effort` are honoured (`code`).
+- **Reasoning.** When the rendered prompt ends inside the Qwen think block,
+  everything before the first bare think closer goes to `reasoning_content`;
+  `enable_thinking` and `reasoning_effort` are honoured (`code`).
 - **Tool calls.** The models' native format is parsed into OpenAI
   `tool_calls`; requests without `tools` get raw text. A template that
   iterates arguments as a mapping is handed the parsed object; minja

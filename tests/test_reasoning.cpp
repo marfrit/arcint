@@ -1,4 +1,5 @@
 #include "core/reasoning.h"
+#include "core/markers.h"
 
 #include "harness.h"
 
@@ -8,15 +9,25 @@
 
 using namespace lgc;
 
+namespace {
+// Markers come from the shared header; no test spells one out.
+std::string qwen_open() { return std::string(markers::kThinkOpen); }
+std::string qwen_close() { return std::string(markers::kThinkClose); }
+std::string angle_open() { return std::string(markers::kThinkOpenAngle); }
+std::string angle_close() { return std::string(markers::kThinkCloseAngle); }
+std::string square_open() { return std::string(markers::kThinkOpenSquare); }
+std::string square_close() { return std::string(markers::kThinkCloseSquare); }
+}  // namespace
+
 TEST(reasoning_split_when_the_template_opened_the_block) {
-    const auto s = split_reasoning("The user wants a review.\n</think>\n\nI'll start by exploring.", true);
+    const auto s = split_reasoning("The user wants a review.\n" + qwen_close() + "\n\nI'll start by exploring.", true);
     CHECK(s.closed);
     CHECK_EQ(s.reasoning, std::string("The user wants a review."));
     CHECK_EQ(s.content, std::string("I'll start by exploring."));
 }
 
 TEST(reasoning_split_empty_thinking_is_just_content) {
-    const auto s = split_reasoning("</think>\n\nThe total on the invoice is 42.", true);
+    const auto s = split_reasoning(qwen_close() + "\n\nThe total on the invoice is 42.", true);
     CHECK(s.closed);
     CHECK(s.reasoning.empty());
     CHECK_EQ(s.content, std::string("The total on the invoice is 42."));
@@ -35,7 +46,7 @@ TEST(reasoning_split_not_opened_leaves_content_alone) {
     CHECK(s.reasoning.empty());
     CHECK_EQ(s.content, std::string("Plain answer with no tags."));
     // ...unless the model opened one itself.
-    const auto t = split_reasoning("<think>\nhmm\n</think>\n\nanswer", false);
+    const auto t = split_reasoning(qwen_open() + "\nhmm\n" + qwen_close() + "\n\nanswer", false);
     CHECK_EQ(t.reasoning, std::string("hmm"));
     CHECK_EQ(t.content, std::string("answer"));
 }
@@ -62,23 +73,25 @@ TEST(reasoning_streamer_undecided_start_resolves_both_ways) {
     CHECK(a.content == "Hel" && a.reasoning.empty());
     ReasoningStreamer self_opened(false);
     std::string r, c;
-    for (std::string_view p : {"<thi", "nk>\nplan</think>\n", "go"}) { auto s = self_opened.push(p); r += s.reasoning; c += s.content; }
+    for (const std::string& p : {qwen_open().substr(0, 4), qwen_open().substr(4) + "\nplan" + qwen_close() + "\n",
+                           std::string("go")}) { auto s = self_opened.push(p); r += s.reasoning; c += s.content; }
     CHECK_EQ(r, std::string("\nplan"));
     CHECK_EQ(c, std::string("go"));
 }
 
 TEST(reasoning_split_other_think_tags) {
-    // Cydonia 24B (Mistral Small 3.2) thinks in <thinking>, Magistral tunes in [THINK]
-    const auto a = split_reasoning("<thinking>\nplot first\n</thinking>\n\nThe storm broke.", false, true);
+    // Cydonia 24B (Mistral Small 3.2) thinks in the angle-bracket tags, Magistral
+    // tunes in the square-bracket ones
+    const auto a = split_reasoning(angle_open() + "\nplot first\n" + angle_close() + "\n\nThe storm broke.", false, true);
     CHECK(a.closed);
     CHECK_EQ(a.reasoning, std::string("plot first"));
     CHECK_EQ(a.content, std::string("The storm broke."));
-    const auto b = split_reasoning("[THINK]weigh it[/THINK]Answer.", false, true);
+    const auto b = split_reasoning(square_open() + "weigh it" + square_close() + "Answer.", false, true);
     CHECK_EQ(b.reasoning, std::string("weigh it"));
     CHECK_EQ(b.content, std::string("Answer."));
     // a closer of another pair does not close the block
-    const auto c = split_reasoning("<thinking>a </think> b</thinking>c", false, true);
-    CHECK_EQ(c.reasoning, std::string("a </think> b"));
+    const auto c = split_reasoning(angle_open() + "a " + qwen_close() + " b" + angle_close() + "c", false, true);
+    CHECK_EQ(c.reasoning, "a " + qwen_close() + " b");
     CHECK_EQ(c.content, std::string("c"));
 }
 
@@ -99,42 +112,47 @@ TEST(reasoning_streamer_other_think_tags) {
 }
 
 TEST(reasoning_other_tags_only_when_extended) {
-    // the Qwens keep <think> alone: an answer that merely starts with the
-    // other tags stays content (a swallowed answer would lose tool calls)
-    const auto a = split_reasoning("<thinking>x</thinking>y", false);
+    // the Qwens keep the bare think tag alone: an answer that merely starts with
+    // the other tags stays content (a swallowed answer would lose tool calls)
+    const auto a = split_reasoning(angle_open() + "x" + angle_close() + "y", false);
     CHECK(!a.closed);
-    CHECK_EQ(a.content, std::string("<thinking>x</thinking>y"));
+    CHECK_EQ(a.content, angle_open() + "x" + angle_close() + "y");
     ReasoningStreamer q(false);
     std::string r, c;
-    for (std::string_view p : {"[THI", "NK]x[/THINK]y"}) { auto s = q.push(p); r += s.reasoning; c += s.content; }
+    for (const std::string& p : {square_open().substr(0, 4), square_open().substr(4) + "x" + square_close() + "y"}) {
+        auto s = q.push(p);
+        r += s.reasoning;
+        c += s.content;
+    }
     const auto t = q.flush(); r += t.reasoning; c += t.content;
     CHECK(r.empty());
-    CHECK_EQ(c, std::string("[THINK]x[/THINK]y"));
+    CHECK_EQ(c, square_open() + "x" + square_close() + "y");
 }
 
 TEST(reasoning_extended_edges) {
-    // the <think> / <thinking> boundary across pieces
-    auto run = [](std::vector<std::string_view> pieces) {
+    // the bare / angle-bracket think boundary across pieces
+    auto run = [](std::vector<std::string> pieces) {
         ReasoningStreamer st(false, true);
         std::pair<std::string, std::string> rc;
         for (auto p : pieces) { auto s = st.push(p); rc.first += s.reasoning; rc.second += s.content; }
         auto t = st.flush(); rc.first += t.reasoning; rc.second += t.content;
         return rc;
     };
-    CHECK(run({"<think", ">x</think>y"}) == std::make_pair(std::string("x"), std::string("y")));
-    CHECK(run({"<think", "ing>x</thinking>y"}) == std::make_pair(std::string("x"), std::string("y")));
-    CHECK(run({"<think>", "ing>a</think>b"}) == std::make_pair(std::string("ing>a"), std::string("b")));
+    CHECK(run({angle_open().substr(0, 6), ">x" + qwen_close() + "y"}) == std::make_pair(std::string("x"), std::string("y")));
+    CHECK(run({angle_open().substr(0, 6), angle_open().substr(6) + "x" + angle_close() + "y"}) ==
+          std::make_pair(std::string("x"), std::string("y")));
+    CHECK(run({qwen_open(), "ing>a" + qwen_close() + "b"}) == std::make_pair(std::string("ing>a"), std::string("b")));
     // unclosed: all reasoning
-    const auto u = split_reasoning("[THINK]still going", false, true);
+    const auto u = split_reasoning(square_open() + "still going", false, true);
     CHECK(!u.closed);
     CHECK_EQ(u.reasoning, std::string("still going"));
     CHECK(u.content.empty());
-    // a pre-opened <think> is closed only by </think>
-    const auto o = split_reasoning("a</thinking>b[/THINK]c</think>d", true, true);
-    CHECK_EQ(o.reasoning, std::string("a</thinking>b[/THINK]c"));
+    // a pre-opened bare think block is closed only by its own closer
+    const auto o = split_reasoning("a" + angle_close() + "b" + square_close() + "c" + qwen_close() + "d", true, true);
+    CHECK_EQ(o.reasoning, "a" + angle_close() + "b" + square_close() + "c");
     CHECK_EQ(o.content, std::string("d"));
     // leading whitespace, near misses, case
-    CHECK_EQ(split_reasoning("\n [THINK]p[/THINK]q", false, true).content, std::string("q"));
+    CHECK_EQ(split_reasoning("\n " + square_open() + "p" + square_close() + "q", false, true).content, std::string("q"));
     CHECK_EQ(split_reasoning("<thinkpad> is a laptop", false, true).content, std::string("<thinkpad> is a laptop"));
     CHECK_EQ(split_reasoning("[THINKING] no", false, true).content, std::string("[THINKING] no"));
     CHECK_EQ(split_reasoning("[think]x[/think]y", false, true).content, std::string("[think]x[/think]y"));

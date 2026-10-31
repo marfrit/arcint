@@ -251,6 +251,7 @@ if(ARCINT_TESTS)
     tests/test_loop_guard.cpp
     tests/test_lanes.cpp
     tests/test_reasoning.cpp
+    tests/test_markers.cpp
     tests/test_stream_utf8.cpp
     tests/test_stop_think_ids.cpp
     tests/test_decode_stats.cpp

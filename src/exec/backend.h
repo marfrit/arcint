@@ -112,10 +112,11 @@ struct ModelStatus {
     // which is what lets /props print null rather than a default that was
     // never served.
     std::string kv_precision;
-    // The model may open a think block with "<thinking>" or "[THINK]" as well
-    // as "<think>": set by the llama engine for the Mistral Small 24B family
-    // (Cydonia 24B, Magistral tunes). The Qwens keep "<think>" alone, so an
-    // answer of theirs that merely starts with such text stays content.
+    // The model may open a think block with the angle-bracket or the
+    // square-bracket tag as well as the Qwen tag: set by the llama engine
+    // for the Mistral Small 24B family (Cydonia 24B, Magistral tunes). The
+    // Qwens keep the Qwen tag alone, so an answer of theirs that merely
+    // starts with such text stays content.
     bool think_tags_extended = false;
 
     SamplerDefaults sampler_defaults;
