@@ -213,6 +213,12 @@ struct PreparedSpeech {
 // is committed — including the context-overflow 400 (§3.8).
 std::optional<HttpResult> prepare_chat(const Context& ctx, const nlohmann::json& body,
                                        PreparedChat& out);
+// The half of prepare_chat that runs after the body is parsed: lane resolution,
+// the template default, render_chat, the sampler and the think state. The
+// Responses route maps its request into a ChatRequest and calls this same
+// function (docs/campaigns/feyntalk.md W1), so there is one prompt builder.
+std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
+                                           PreparedChat& out);
 std::optional<HttpResult> prepare_completion(const Context& ctx, const nlohmann::json& body,
                                              PreparedCompletion& out);
 // /v1/audio/speech: the availability refusals ("this build has no TTS", no
