@@ -220,6 +220,12 @@ answer by design.
   (the pricing above), so a per-layer balance has no prize on this workload: **not built**. What this does not test:
   depth (the reference's +9.9 % / +25.6 % are at 8K / 32K on a slower-CPU shape, `paper`) - a decode-at-depth arm
   (fn_sweep with --prompt-tokens 8192 / 32768 then the answers) is the remaining check before the item is closed.
+- **At depth (`measured-here`, 2026-10-31, the same card and build, fn_sweep --prompt-tokens N --prompt-max 300, the
+  long prompt's own answer, two rounds reversed):** 8K - cap 16: 23.0 / 23.9 t/s, 64: 27.1 / 27.5, 256: 25.7 / 26.1;
+  32K - 16: 18.2 / 15.4, 64: 21.7 / 14.2, 256: 21.3 / 14.8 (the two rounds differ by ~30 %, more than any cap effect;
+  the answers stopped at 35-72 tokens, so each figure is a short sample). No cap above 64 is faster at either depth:
+  the balance's prize is not visible here either. **Closed: not built** (`measured-here` on the cap, the reference's
+  per-layer rate split itself untested; reopen only with a long-answer depth method that resolves a few per cent).
 
 ## 5. QSA select (wide block scores, register/one-read top-k)
 
