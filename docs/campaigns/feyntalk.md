@@ -674,6 +674,458 @@ strings swallowing a closer id, opener literals in the chat path, UTF-8 splits
 in think deltas, `reasoning` vs `reasoning_content`, tool-call salvage in the
 proxy (`docs/campaigns/clean-turns.md`, `loop-guard.md`, `code`).
 
+## Token mode, revised (W6 + gateway translator)
+
+**Status: design note, 2026-10-31, nothing built.** This section supersedes the
+W6 and W9 work-package rows and the "Token mode (point 10)" text wherever
+they differ. Two operator decisions of 2026-10-31 are folded in: **(1)** the
+token→text translator lives in the gateway in front of the engine, not in the
+agents; **(2)** a bundle (W9) ships with token mode. The engine owns the
+material contract and the event schemas; the gateway owns the render, the
+detokenisation and the parsing.
+
+### What this note read
+
+- arcint at source: `src/api/responses.{h,cpp}` (request mapping 330-676,
+  `read_arcint` 394-414, continuation 725-800, resource 893-960),
+  `src/api/responses_stream.cpp` (`send`/sequence 52-63, reasoning item 73-124,
+  content item 195, token callback 423-430, tool-call scan 444-462, turn end
+  490-520, `arcint:` events 291-346), `src/api/responses_state.{h,cpp}`
+  (`prompt_ids` 32, `renderer_hash` 35, prefix hash 246-249),
+  `src/api/handlers.cpp` (`finish_prepare` 629-667, `prepare_from_chat` 694-847,
+  `/props` 457+), `src/exec/backend.h` (`TokenCallback` 131,
+  `GenerationInput` 171, `Backend` 379-387), `src/exec/backend_llama.cpp`
+  (`special_ids` 332-345, `decode_one` 312-320, `render_chat` 1058-1064,
+  `template_caps` 1044-1055, `build_think_ids` 2120-2137),
+  `src/core/{reasoning,sampler,sampling,toolcall}.{h,cpp}` (streamer
+  `push(piece, id)`, sampler `observe` 82-84, loop sites 645/650/652/680/778/
+  829/843/869, context guard 1143, `emitted_` 428), `third_party/minja/`
+  (`chat-template.hpp` 96-102 parser options, 312-362 polyfills, 495-530
+  context; `minja.hpp` 2735-2738 `tojson`). `code`.
+- the gateway at source: `llm-proxy.py` 3,525 lines and its `tests/` — one
+  stdlib file, no dependencies; the salvage filters listed in D7 below, with
+  line numbers. `code`.
+- the vendored minja: `third_party/minja/PATCHES.md` (the `undefined` test).
+  `code`.
+
+### D1 — Prompt ownership and the render handshake (engine)
+
+Token mode stays off by default and requires `stream: true`. In the `arcint`
+object:
+
+```json
+{"v":1,"token_mode":true,"renderer_hash":"sha256:…",
+ "render":{"prompt_sha256":"sha256:…"}}
+```
+
+Both hashes are **required** in W6; `input_ids` is accepted by the schema but
+not served in the first step (D2). The engine renders the prompt with minja as
+it does today, takes its sha256 before the slot is acquired, and compares it
+with `arcint.render.prompt_sha256`: a mismatch → **409 `renderer_mismatch`**,
+param `arcint.render.prompt_sha256`, before any token and before the slot.
+That is one render per turn that the engine would already do, and it makes the
+byte-identical prefix the gateway's claim **checked per turn**, not a hope.
+A `renderer_hash` mismatch with the served material is the same 409, param
+`arcint.renderer_hash`.
+
+Why this shape: the operator decision puts the render in the gateway. Without
+a per-turn check, a mapping divergence (system head, reasoning pairing, tool
+shape) would silently move the prefix and the slot binding, and the symptom
+would appear as a cache miss, not an error. The check is cheap (sha256 over a
+string the engine already has) and turns every divergence into a pre-token
+refusal, which the gateway can fall back from. The engine's served prompt is
+its own render, so it is the same string the gateway hashed; a match means
+byte equality by construction. `code`.
+
+`arcint.input_ids` (W6f, after the encode corpus) is the alternative: the
+gateway renders and encodes, the engine serves the ids and checks
+`sha256(concat(decode_one(id))) == render.prompt_sha256`. The ids are the
+prompt; the continuation concatenates `stored.prompt_ids ∪ stored
+output_ids ∪ input_ids` (the campaign's original rule). Until the renderer's
+encoder passes its corpus, the served path is the engine's render — the
+first step the brief asks about, and the one that needs no BPE in the gateway.
+
+Keep the standard `input` items required; the engine records them but does not
+verify them against the prompt hash (the gateway's conformance does). Images
+refused in token mode: 400 `unsupported_parameter`, param `arcint.token_mode`.
+
+### D2 — Token events and the shadow
+
+One `arcint:token` per accepted output token, emitted **before** its text
+shadow bytes:
+
+```json
+{"type":"arcint:token","v":1,"sequence_number":41,
+ "response_id":"resp_…","token_index":7,"token_id":248069,
+ "field":"reasoning","item_id":"rs_…","output_index":0,"content_index":0}
+```
+
+- `token_index` is the accepted-stream index, the sampler's `emitted_`
+  (`src/core/sampler.cpp:82-84`; reset per turn at 253, the same index W3.4
+  already names). Under speculation the verify walk calls `observe()` once per
+  accepted draft, so only kept tokens count (`code`).
+- `field` is `reasoning` or `text`, decided by the token, not by scanning
+  text: `reasoning` while the think block is open **and for the closer token
+  itself**; `text` otherwise. The opener token that a model writes itself is
+  `reasoning`. A tool-call token is `text`; the span delimits it. The stream
+  writer asks a new `ReasoningStreamer::field_for(token_id, was_reasoning)`
+  (a few lines in `reasoning.h`), no step-loop change. `code`.
+- `item_id` / `output_index` / `content_index` are nullable: a reasoning or
+  message item is opened before its token event is written, so its ids are
+  present; a tool-call token has no item until the turn's end, so the fields
+  are `null`. A strict client ignores them; the gateway never needs them.
+
+Text deltas stay exactly as today (the compatibility shadow). The test asserts
+`shadow == concat(decode_one(token_id))` on the stub's fixed reply, with a
+UTF-8 split case and a straddling closer case; on a real unit the same
+assertion is the live leg's per-turn check (D6). `code`.
+
+### D3 — Span events
+
+One event type, a `span` discriminator, `phase` `start`/`end` or `event` for a
+point signal, and a `token_index` in the same space as `arcint:token`:
+
+```json
+{"type":"arcint:span","v":1,"sequence_number":52,"span":"thinking",
+ "phase":"start","token_index":0,"detail":{"preopened":true}}
+{"type":"arcint:span","v":1,"sequence_number":78,"span":"thinking",
+ "phase":"end","token_index":19,"detail":{"closed":true}}
+{"type":"arcint:span","v":1,"sequence_number":80,"span":"tool_call",
+ "phase":"start","token_index":31,"detail":{"call_index":0}}
+{"type":"arcint:span","v":1,"sequence_number":90,"span":"tool_call",
+ "phase":"end","token_index":44,"detail":{"call_index":0}}
+{"type":"arcint:span","v":1,"sequence_number":91,"span":"loop_guard",
+ "phase":"event","token_index":45,"detail":{"rung":"door","match":"near"}}
+{"type":"arcint:span","v":1,"sequence_number":92,"span":"context_guard",
+ "phase":"event","token_index":63,"detail":{"forced":true,"budget":0}}
+```
+
+Item ids are **dropped from spans**: the reasoning and function-call items are
+allocated lazily or at the turn's end, and a span carrying a null id that later
+becomes real is a two-step contract no consumer asked for. `call_index` is the
+call's order in the turn; the gateway pairs it with the standard
+`function_call` event, which still carries the real `call_id`. `output_index`
+is likewise omitted. This is a change from the earlier draft; it removes the
+only fields that could not be correct at emission time. `code`, `inferred`
+for the consumer side.
+
+Sources, all outside the step loop:
+
+| span | start | end | evidence |
+|---|---|---|---|
+| `thinking` | `prep.think_open` at index 0, else the token whose id is the opener (streamer's `undecided_` settles) | the closer token's index, and at turn end with `closed:false` when the block never closed | `code`: `ReasoningStreamer::push`, `closed()` |
+| `tool_call` | the token whose id is the call opener (`special_ids(tool_call_tags().open)`, load time) or the token that completed the opener text | the closer token's index | `code`: `ToolCallTags`, `build_think_ids` pattern |
+| `loop_guard` | sampler's own counters at detection/nudge/slap/door-lift/abort | same point | `code`: `sampler.cpp` 645/650/652/680/778/829/843/869 |
+| `context_guard` | the forced closer (`ctx_forced_index_`) and the no-closer case | point event | `code`: `sampler.cpp:1143`, W3.4 |
+
+A `SpanTracker` in `responses_stream.cpp` consumes each `(piece, token_id)`
+before the text deltas, so span order is chronological; loop/context spans come
+from a **per-request event vector** in `SamplerParams` (a
+`std::vector<SamplerEvent>`, filled by `Sampler::sample()` and drained by the
+API after each emit), not from a cross-thread callback. The sampler already
+knows `emitted_`, so the index is exact where it is produced. No backend loop
+call site and no step-loop change. `code`.
+
+### D4 — Renderer material (`GET /v1/responses/renderer`)
+
+The material is `feyntalk-render/1`, no auth (like `/props`), and serves both
+what the gateway decodes and what it later encodes:
+
+```json
+{"schema":"feyntalk-render/1","hash":"sha256:…",
+ "model":{"served_id":"…","canonical_id":"…","quant":"…","arch":"…"},
+ "decode":{"pieces_b64":["…"],"eos":248044,"eog_ids":[248044,248046]},
+ "encode":{"tokens":["…"],"merges":["…"],"token_types":[1],
+           "pre":"qwen2","add_bos":false,"special_text":{"248068":"…"}},
+ "chat_template":{"text":"…","source":"gguf"},
+ "special_tokens":{"think":[{"open_ids":[248068],"close_ids":[248069]}],
+                    "tool_call":{"open_ids":[…],"close_ids":[…]}},
+ "parser":{"reasoning":"ids/1","tool_calls":"qwen3-coder/1"}}
+```
+
+Two changes from the earlier draft, both `code`-driven:
+
+- **`decode.pieces_b64[id]` is exactly what `decode_one(id)` returns**, bytes,
+  base64. The gateway then detokenises by concatenation and an incremental
+  UTF-8 decoder — no SPM `▁`, no byte-level BPE, no leading-space marker logic
+  in Python. The vocabulary's quirks stay in one C++ function. The raw GGUF
+  `tokens` array stays under `encode` only, for W6f.
+- **`encode` needs `pre` and `special_text` for a faithful encoder.** The
+  earlier schema had `tokens`/`merges` but no pre-tokeniser rule and no
+  special-token text→id table; llama.cpp tokenises with the GGUF's
+  `tokenizer.ggml.pre` regex and `parse_special=true`. Without both, a Python
+  encoder cannot produce the same ids. They are served in v1 and unused until
+  W6f, so the schema does not break twice.
+
+`hash` = sha256 over the canonical UTF-8 JSON (keys sorted recursively at every
+level, no insignificant whitespace, separators `,`/`:`, integers only in the
+hashed fields, non-ASCII unescaped) of `decode`, `encode`, `chat_template`,
+`special_tokens` and `parser`; `model` is excluded as volatile. A canonical
+form is fixed here so both sides recompute the same digest (JCS subset; no
+floats in the hashed part). `/props` gains `token_mode: "off"|"ready"` and
+`renderer_hash`, so discovery does not depend on the large body. The hash must
+be stable across two loads of the same artifact (`code`: material is read at
+load time, `backend_llama.cpp:326/1032 area`). The stub has no material: `/props`
+says `off`, the endpoint answers **404 `renderer_not_served`**, loudly.
+
+The body is several MB (pieces + raw tokens + merges); the gateway fetches it
+once per backend and caches by hash. Two loads with the same artifact give the
+same hash; a changed hash is a different backend capability, not a restart.
+
+`Backend::renderer_material()` default returns `nullopt` (the stub), the llama
+backend fills it at load. This is the only new backend virtual, and it is not
+in the step loop. `code`.
+
+### D5 — feyntalk-render (new public repository, Python)
+
+Module layout (schema/version `1`):
+
+```
+feyntalk_render/
+  __init__.py        # version, schema constant
+  material.py        # load, validate, canonical hash, refuse on mismatch
+  render.py          # prompt rendering (jinja2 + compatibility layer)
+  detok.py           # decode_one pieces -> incremental UTF-8 text
+  spans.py           # span-driven reasoning/tool-call state machine
+  parser/            # qwen3-coder text form, tool-argument typing
+  modes.py           # tokens mode, text mode
+  conformance.py     # per-turn checks against the engine's shadow/hash
+  cli.py             # feyntalk-render render|detok|check|material
+```
+
+**Prompt rendering.** arcint renders with vendored minja (`apply_polyfills =
+false`), parser options `trim_blocks=true, lstrip_blocks=true,
+keep_trailing_newline=false`, context `messages`, `tools`,
+`add_generation_prompt`, `bos_token`/`eos_token`, `strftime_now`, and
+`extra_context` (`enable_thinking`). Python jinja2 matches that lexical layer
+with the same three options, **after** a compatibility layer:
+
+1. a `undefined` test (Jinja2 has `defined` only; the Qwen3.8-27B template
+   uses `is undefined`, and minja was patched for the same reason,
+   `third_party/minja/PATCHES.md`); `code`;
+2. a `tojson` filter with `sort_keys=false, ensure_ascii=false, separators
+   (', ', ': ')` and no HTML escaping — Jinja2's stock filter sorts and
+   escapes, minja's `Value::dump(-1, to_json)` does neither
+   (`minja.hpp:2735-2738`, `98-145`); `code`;
+3. `strftime_now` bound to the same fixed clock (minja's `apply` from the
+   request; the renderer uses a fixed epoch in tests); `code`;
+4. `raise_exception`, `items`, `last`, `trim` as Jinja2 provides or as thin
+   wrappers.
+
+The **message/tools mapping** is the other half of byte equality: the renderer
+must build the same `messages` array as `chat_messages_json`
+(`src/exec/chat_json.h`, called at `backend_llama.cpp:1058`). The gateway builds
+it from the Responses items with the same rules (system head, reasoning
+pairing, tool messages, tool-call argument form), and **that mapping is checked
+by the per-turn prompt hash**, not trusted. The conformance corpus freezes the
+matrix: system head with/without instructions, replayed reasoning paired and
+unpaired, string vs typed content per template capability, tool calls in both
+wired forms, a continuation's rebuilt assistant turns. `inferred` for the
+mapping duplication; `code` for the engine side.
+
+A template the renderer cannot render (an unsupported construct, a filter it
+does not ship) is a **refusal**, never a guess: `RenderError` names the
+construct, the gateway marks the backend text-only for the session and logs one
+line. That is the honest boundary of a jinja2-based renderer; the byte corpus
+decides which templates are in.
+
+**Detokenisation.** `bytes(pieces_b64[id])` concatenated, through
+`codecs.getincrementaldecoder("utf-8")("strict")`: incomplete tails are held,
+complete codepoints are emitted, a malformed sequence at turn end is an error
+and fails the turn (never a silent replacement character). Special tokens'
+pieces are what `decode_one` returns; they are recognised by id, not by text.
+Test corpus: leading-space pieces, a piece that is half a 4-byte codepoint, a
+zero-byte special piece, an invalid-sequence tail, and the stub's straddling
+closer case. The engine's shadow is the oracle. `code`.
+
+**Span-driven parsing.** No marker scanning anywhere in the gateway:
+
+- reasoning vs text: the `thinking` span's start/end and each token's `field`;
+- tool calls: the `tool_call` span's token range; the renderer's parser for
+  the material's `parser.tool_calls` form consumes exactly those tokens' text
+  (the inner tags are material data, not searched in the whole answer); the
+  standard `function_call` item supplies `call_id`, the span supplies the
+  boundary and `call_index`;
+- a span gap/overlap is an error, not a heuristic re-parse. `inferred`
+  (consumer contract); `code` for the token and span fields.
+
+**Two modes.** `tokens` (arcint now; vLLM/llama.cpp later) constructs the
+request with token mode, the render hashes, and consumes `arcint:token` +
+`arcint:span`; text deltas are ignored. `text` (cloud providers, older local
+engines) consumes the provider's text and parses with the same span-free state
+machine; it renders only when the backend also serves material (a local HF
+engine), and then uses the render for the continuation prefix bookkeeping — a
+cloud provider renders its own template, so the gateway must not render there.
+`inferred` for the cloud case, `code` for the local one.
+
+**Conformance** (`conformance.py`, also a CLI): per turn, (a) recompute the
+material hash and refuse on mismatch, (b) compare the gateway render's hash
+with the engine's `render.prompt_sha256` (the engine already refused if it differs),
+(c) compare `concat(decoded tokens)` with the engine's shadow text, (d) parse
+the answer and compare with the standard events. A failure is one line with
+the hash, the token index and the first differing byte; it disables token mode
+for that backend and does not retry silently.
+
+### D6 — Gateway integration (llm-proxy)
+
+Capability, not model name: at discovery, `GET /props` says `token_mode` and
+`renderer_hash`; if `ready`, fetch `/v1/responses/renderer`, validate and cache
+by hash. `local-backends.json` may pin `feyntalk: "tokens"|"text"|"off"` as
+an override, but the served capability wins (the gateway's own rule: a name or
+a config never decides a capability the backend advertises, `code`:
+`llm-proxy.py` 87-160). A changed hash replaces the cached material; a
+mismatch on load marks the backend text-only and logs.
+
+Where it plugs in: a `feyntalk_gateway` module beside the existing proxy; the
+route table gains `/v1/responses` (pass-through of the spec SSE, with the
+`arcint:` events relayed unchanged) and `/v1/chat/completions` is served from
+the same normalised event stream for token-capable backends (translation:
+`reasoning_content` deltas from reasoning tokens, `content` from text tokens
+outside a call span, real `tool_calls` from the call span, `finish_reason` from
+the terminal event). Existing pi sessions on `openai-completions` then get the
+correct field name, the real call, and no salvage — without changing their
+provider. Cloud and text-only local backends keep today's path unchanged.
+`inferred` for the client benefit; `code` for the proxy paths.
+
+The command path is: proxy receives Chat Completions → renders the prompt from
+the wire messages with the material's template (or passes the messages to a
+text backend) → calls the engine's `/v1/responses` with token mode and the two
+hashes → consumes tokens+spans → emits either spec SSE or Chat Completions
+frames. A strict client sees the same answer either way.
+
+**Salvage paths that become dead for token-mode backends** (`code`, line
+numbers in the reference copy; the same classes are in the working tree):
+
+| path | line | why it is dead |
+|---|---|---|
+| `ReasoningSeam` (`TAG`, `MAX_CHARS`, `MAX_DELTAS`, class) | 1813-1815, 1818 | reasoning is classified by token and span; no text seam to repair |
+| `ChatMLGuard` (`_CHATML`, class) | 1997, 2000 | the engine ends by stop ids; ChatML markers never reach the client text |
+| `ToolTextSalvage` (`_TT_MARKERS`, `parse_text_tool_calls`) | 2157, 2252, 2316 | calls come from the span and the standard item; no text block to salvage |
+| stop-string injection for local non-stream requests | 3392-3404 | token mode is stream-only and has no stop strings |
+| `_req_seam` selection | 3258, 3284 | the seam is not built for a token backend |
+| `_chatml_guard` selection | 3391-3393 | same |
+| `reasoning` vs `reasoning_content` sniffing | 1875, 1964, 2076, 2095, 2498 | the gateway emits one canonical field (`reasoning_content` on the Chat Completions surface, reasoning deltas on Responses) |
+| frame rebuilding (`_FRAME_HUELLE`, `_frame_zusatz`, `StromSignale`) | 1733-1737, 1740 | no filter rebuilds a frame on a token backend; the normalised stream is built from events, not relayed frames |
+
+What stays: all of the above for **cloud and text-only local backends**, and
+the existing relay for a backend that advertises `off`. The tests assert that
+a token-mode backend's bytes never enter any of these classes; the old
+`test_tooltext*.py`, `test_chatml_guard.py`, seam tests stay green for the text
+path.
+
+**Failure modes**, all loud and one-turn-bounded:
+
+- material hash mismatch / unrecomputeable canonical form → text mode for that
+  backend, one log line with both hashes;
+- `409 renderer_mismatch` → the gateway marks the backend text-only, logs the
+  param, and re-sends the turn in text mode once (a user-visible retry is the
+  client's; the proxy's own retry is the same request, not a second model);
+- token index gap, span overlap, UTF-8 tail error, unknown span → the turn
+  fails (no silent text); the next turn starts text mode;
+- the engine's stream ends without a terminal event → today's
+  `StromAbgeschnitten` path, unchanged;
+- a hash-valid backend whose render hashes diverge on one turn → the same
+  409 path; the gateway does not re-render with a different template.
+
+### D7 — Bundle (W9) shape
+
+Four artifacts, one manifest:
+
+| artifact | form | pin |
+|---|---|---|
+| arcint | deb (`arcint >= 1.3.0 < 2`) | engine serves material schema 1 |
+| llm-proxy | apk, **depends on `feyntalk-render`** | proxy version, renderer `>=1.0,<2` |
+| feyntalk-render | apk/wheel, public repo from v1.0.0 | `feyntalk-render == 1.0.x` |
+| pi extension | pi package (WebSocket, `previous_response_id`) | extension version |
+
+The manifest (shipped in the bundle, printed by `feyntalk-doctor`) records
+`{arcint version, feyntalk-render version, material hash, gateway version,
+extension version}` per served unit. The material hash is the join key: a
+renderer version that does not know a hash refuses to talk to that unit, and a
+unit whose hash changed is a new pin, not a silent upgrade. The agent-side
+extension carries only the WebSocket transport and the `previous_response_id`
+bookkeeping the provider cannot express; it contains no renderer and no parser.
+`code` for the engine/proxy artifacts, `inferred` for the pi package split.
+
+Wiring guide outline (public, no host names): install order and versions; the
+unit's `/props` and `/v1/responses/renderer` check; the gateway config
+(backend block, `feyntalk` capability); a text-mode smoke turn; a token-mode
+turn with `feyntalk-doctor --check` printing both hashes; what to do on a
+409/hash mismatch (stay text, report); the extension's three settings; the
+rollback (capability `off`, no state on disk). Gate: a clean host (no prior
+unit state) installs the bundle and runs the live task in **both** modes, then
+`feyntalk-doctor` shows the manifest hashes; no card window for the install,
+one window for the live leg (Gate 4's class). `inferred` until built.
+
+### Work packages
+
+Ordered, each one session. `R` = engine maintainer review; `C` = card window.
+
+| # | package | scope | gate | R | C |
+|---|---|---|---|---|---|
+| W6a | **engine protocol + material** | `arcint.token_mode`/`renderer_hash`/`render.prompt_sha256` (+`input_ids` accepted, unserved), `read_arcint` 394-414, `finish_prepare`'s prompt hash, `GET /v1/responses/renderer`, `/props`, `Backend::renderer_material()` + `backend_llama.cpp` load area, canonical hash, stub 404 | unit: request mapping, both 409s before the slot, hash stable across two loads, stub no material; off by default; red first | yes | no |
+| W6b | **token events + spans** | `responses_stream.cpp` token event before the shadow, `SpanTracker`, `ReasoningStreamer::field_for`, sampler event vector (loop/context; no call-site change), `reasoning.h` | unit: contiguous `token_index`, exact span indices on the stub, `shadow == decode(tokens)` with the UTF-8 and closer cases, loop/context event order; red first | yes | no |
+| W6c | **feyntalk-render v0.1** (new repo) | material/canonical hash, render + jinja2 compat, detok, parser, both modes, CLI, conformance | corpus: render vs engine prompt hash, detok vs shadow, mapping matrix; refusal on unknown constructs; the public repo from v1.0.0 | no | sample needed |
+| W6d | **gateway integration** | capability discovery + material cache, `/v1/responses` pass-through, Chat Completions translation, salvage bypass, fallbacks, `feyntalk-doctor` | proxy tests: token-mode frames never enter the salvage classes; token-path Chat Completions has `reasoning_content`, real calls, no text markers; text and cloud paths unchanged; a 409→text fallback; fixtures, no card | no | no |
+| W6e | **conformance + live token leg** | `tools/feyntalk_live.py` token arm, one card window; the proxy as the client (not the engine's shadow only) | Gate 4's class in token mode: task right, ≥2 round-trips, 0 malformed calls, 0 hash mismatches, shadow==render(tokens) per turn, decode within the chat arm's spread | no | yes |
+| W6f | **encode + `input_ids`** (later) | `encode` material fields, Python BPE encoder + `pre` + `special_text`, engine decode-hash check, continuation id concatenation | id equality corpus against the unit (≥200 prompts), prefix cache equals `prompt_tokens`; live token leg green with ids; this is the W6 row's original end state | yes | yes |
+| W9 | **bundle** | packages, manifest, wiring guide, `feyntalk-doctor`, clean-host install | clean host installs and runs the live task in text and token; doctor's hashes match the manifest | no | yes (live leg only) |
+
+W6a and W6b merge only in agreement with the engine maintainer's release plan
+(the protocol and the event schema are the public contract; the text surface
+is already green). W6c can start when W6a's material endpoint exists on a test
+build; W6d needs W6b and W6c; W6e needs W6d and a card window; W9 needs W6e
+and W7 (the extension's WebSocket half). W6f is not a 1.3.0 gate.
+
+### Open questions (options + recommendation)
+
+1. **The renderer's template engine.** Jinja2 plus a compatibility layer (a),
+   a Python port of minja (b), or an engine dry-run render (c). Recommend
+   **(a)**: the lexical options are identical, the two known gaps (`undefined`,
+   `tojson`) are small, minja is a Jinja subset, and the per-turn prompt hash
+   (D1) makes any remaining divergence a pre-token refusal rather than a
+   silent prefix change. Fall back to (c) for a template the corpus cannot
+   match; (b) only if several served templates need it. `inferred`.
+2. **When `input_ids` serves.** Recommend the engine's render for W6 (the
+   first step), `input_ids` in W6f after the encoder corpus. The encode side
+   needs the pre-tokeniser and special-token table, which the earlier material
+   schema lacked; shipping it unserved in v1 avoids a schema break. `code` for
+   the missing fields.
+3. **Sampler events: vector or callback.** Recommend the vector in
+   `SamplerParams` drained by the API (`code`: same thread, `emitted_` exact).
+   A callback would cross the sampler/stream boundary for no gain.
+4. **Spans without item ids.** Recommend as written; the consumer needs the
+   token range and `call_index` only. If a future WebSocket client wants item
+   ids, add them then, not as nullable fields now. `inferred`.
+5. **A sanitized artifact sample.** Needed for W6c's corpus: one template, a
+   tokenised prompt, a short token stream with ids, and the shadow text
+   (the operator provides a sanitized capture; nothing from the affected
+   hosts).
+   Recommend asking before W6c starts; without it the corpus is stub-only and
+   W6e proves the real one. `inferred`.
+6. **The extension's repository.** Operator decision before W9; the bundle
+   names it. Not a W6 blocker.
+7. **Chat Completions from token mode.** Recommend yes (D6): existing
+   `openai-completions` clients benefit from the correct field and real calls
+   without a provider change, and it is the same normalised stream. The
+   alternative (Responses only) keeps the salvage on the chat path. `inferred`.
+8. **`feyntalk-render` licence.** Public from v1.0.0; recommend MIT, matching
+   minja's (only minja's *behaviour* is mirrored, no code is copied). Record in
+   `THIRD_PARTY.md` when used. `code` for minja's MIT row.
+
+### Gate additions
+
+- The existing text gate (unit, roundtrip, compliance, live text) is unchanged
+  and must stay green; token mode is off until its own gate passes.
+- Unit (stub): the W6a/W6b cases above, red first; `ctest -L unit` 0 failed.
+- Hash: two loads of the same artifact, same digest; one mutated material,
+  different digest and a 409 on the next continuing turn.
+- Proxy: the token-mode bypass test and the text/cloud regression; the
+  existing proxy tests stay green.
+- Live (one card window): Gate 4's class in token mode, plus 0 render-hash
+  mismatches and shadow==render(tokens) per turn. Record card, depth, KV
+  precision and configuration.
+
 ## Test plan (point 8)
 
 | level | what | gate | evidence |
