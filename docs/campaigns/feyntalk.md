@@ -63,7 +63,14 @@ namespace and an optional token mode.
 3. **Compliance CLI** against a stub (or CPU llama) build on a test port:
    `failed == 0` among the runnable tests, exit 0, and the skipped set equals
    the named list below. The CLI's per-request deadline is 30 s (`paper`, its
-   README); a stub build meets it.
+   README); a stub build meets it. In the repository: `ctest -L compliance`
+   (not the unit label) runs `tests/feyntalk/run-compliance.sh`, the official
+   CLI vendored under `tests/feyntalk/openresponses/` (2026-04-24 release,
+   Apache-2.0; manifest in `THIRD_PARTY.md`), the seven ids against a `--stub`
+   with `--queue-timeout 30`; node >= 22 + the pinned tsx/zod are installed
+   with `npm ci --ignore-scripts` into an ignored cache, and without node the
+   run is SKIPPED loudly (exit 0, named; `FEYNTALK_COMPLIANCE_REQUIRED=1` makes
+   it a failure).
 4. **Live leg**: a pi session with provider type `openai-responses` (SSE) runs
    a short multi-turn tool-using task against a test port on the card host in
    one card window (`docs/sop-card-window.md`). Gates: the task's expected
@@ -613,7 +620,9 @@ including the two-turn continuation and cancel-by-id checks; the 7 named
 compliance ids (`basic-response`, `streaming-response`, `system-prompt`,
 `tool-calling`, `multi-turn`, `assistant-phase`,
 `response-output-phase-schema`) pass against the stub (second-reader run,
-node+tsx; the vendor + runner stays W5).
+node+tsx; W5 rest now vendors it in the repository and runs it as the
+`compliance` ctest label — 7/7 against the stub, five consecutive runs
+(`measured-here`), and a mutated build fails it).
 
 Live leg (`measured-here`, 2026-10-31, Arc A770, the coder model, serving build
 83d4e26, pi with provider type `openai-responses`): PASS — 4 tool calls
