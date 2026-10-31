@@ -754,9 +754,11 @@ was not added. No WebSocket, no compact/background, no W6 option work.
 - new `src/api/responses.{h,cpp}`, `responses_stream.{h,cpp}`,
   `responses_state.{h,cpp}`, `generate.{h,cpp}`.
 - `src/exec/backend.h` (`GenerationInput`, `AbortCause`, `Backend`) and
-  `backend_llama.cpp` only at `abort_cause_of` 150-152 and the load-time
-  material area 326/1032; `backend_stub.cpp` 216-220. The step loop, and the
-  `mtpw` trace writes near :1782 and :1871, are untouched.
+  `backend_llama.cpp` at `abort_cause_of` 150-152, the load-time
+  material area 326/1032, and W3.4's `prepare_think_ctx` at the three sampler
+  construction sites (request start, not the step loop); `backend_stub.cpp`
+  216-220. The step loop, and the `mtpw` trace writes near :1782 and :1871,
+  are untouched.
 - `src/core/{chat,toolcall,reasoning,sampler,sampling}.{h,cpp}` — the mapping,
   the split, and the sampler's event sink (580/779/788/813, params at
   `sampling.h:166`).
