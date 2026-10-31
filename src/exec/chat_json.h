@@ -15,6 +15,10 @@ inline nlohmann::json chat_messages_json(const ChatRequest& req, bool object_arg
         nlohmann::json msg{{"role", m.role}, {"content", m.content}};
         if (!m.name.empty()) msg["name"] = m.name;
         if (!m.tool_call_id.empty()) msg["tool_call_id"] = m.tool_call_id;
+        // The template's own field: it decides what to show (Qwen3 keeps it for
+        // turns after the last user message, drops it earlier; a template that
+        // does not reference reasoning_content ignores it).
+        if (!m.reasoning.empty()) msg["reasoning_content"] = m.reasoning;
         if (!m.tool_calls.empty()) {
             nlohmann::json calls = nlohmann::json::array();
             for (const ToolCall& c : m.tool_calls) {

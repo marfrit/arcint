@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+#include "core/reasoning.h"
 #include "util/log.h"
 #include "util/text.h"
 
@@ -276,6 +277,15 @@ std::optional<std::string> parse_chat_request(const json& body, ChatRequest& out
         if (m.contains("tool_calls") && !m["tool_calls"].is_null()) {
             if (auto e = read_tool_calls(m["tool_calls"], msg.tool_calls, index)) return e;
         }
+        // OpenAI-compatible clients replay a past assistant turn's reasoning as
+        // reasoning_content; it reaches the template as the same field and the
+        // template decides what to show (docs/campaigns/feyntalk.md open
+        // question 2, operator decision 2026-10-31).
+        if (m.contains("reasoning_content") && !m["reasoning_content"].is_null()) {
+            if (!m["reasoning_content"].is_string())
+                return log::format("messages[%zu].reasoning_content must be a string", index);
+            msg.reasoning = m["reasoning_content"].get<std::string>();
+        }
 
         if (msg.role == "tool" && msg.tool_call_id.empty()) {
             return log::format("messages[%zu]: a tool message needs tool_call_id", index);
@@ -517,10 +527,30 @@ std::string render_chatml_stub(const ChatRequest& req) {
         out += "<|im_end|>\n";
     }
 
-    for (const ChatMessage& m : req.messages) {
+    // The Qwen3-family rule the stub mirrors so the replay path is tested: an
+    // assistant turn AFTER the last user message keeps its reasoning block; an
+    // earlier turn does not. The tags come from the shared table, never spelled
+    // here.
+    size_t last_user = req.messages.size();
+    for (size_t i = 0; i < req.messages.size(); ++i)
+        if (req.messages[i].role == "user") last_user = i;
+
+    for (size_t i = 0; i < req.messages.size(); ++i) {
+        const ChatMessage& m = req.messages[i];
         out += "<|im_start|>";
         out += m.role == "developer" ? "system" : m.role;
         out += "\n";
+        if (m.role == "assistant" && i > last_user && !m.reasoning.empty()) {
+            const auto& pairs = think_tag_pairs(false);
+            if (!pairs.empty()) {
+                out += pairs[0].first;
+                out += "\n";
+                out += text::trim(m.reasoning);
+                out += "\n";
+                out += pairs[0].second;
+                out += "\n\n";
+            }
+        }
         out += m.content;
         for (const ToolCall& c : m.tool_calls) {
             out += "\n<tool_call>\n";
