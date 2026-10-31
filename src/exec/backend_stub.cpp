@@ -93,8 +93,9 @@ class StubBackend final : public Backend {
 public:
     StubBackend(int n_ctx, int delay_ms, const std::string& served_name,
                 const std::vector<int>& lane_ctx, const SamplerDefaults& sampler,
-                int prefill_ubatches)
-        : delay_ms_(delay_ms), prefill_ubatches_(std::max(1, prefill_ubatches)), lane_ctx_(lane_ctx) {
+                int prefill_ubatches, const nlohmann::json& renderer_material)
+        : delay_ms_(delay_ms), prefill_ubatches_(std::max(1, prefill_ubatches)), lane_ctx_(lane_ctx),
+          renderer_material_(renderer_material) {
         status_.id               = kStubId;
         status_.served_id        = served_name.empty() ? std::string(kStubId) : served_name;
         status_.n_ctx_train      = kStubNCtxTrain;
@@ -112,6 +113,11 @@ public:
     std::string render_chat(const ChatRequest& req) const override {
         return render_chatml_stub(req);
     }
+    // W6a's test seam: the stub loads no artifact, so its material is empty by
+    // default (the endpoint answers 404). A fixture that needs to exercise the
+    // token-mode hash checks injects a synthetic bundle here; it is never built
+    // from a vocabulary, and the production stub never has one.
+    const nlohmann::json& renderer_material() const override { return renderer_material_; }
 
     // The lane index is real here too: the stub has no per-lane state to index
     // with it, but it does have to prove the plumbing — the concurrency gates
@@ -263,6 +269,7 @@ private:
     int           delay_ms_ = 0;
     int           prefill_ubatches_ = 1;
     std::vector<int> lane_ctx_;   // --lane-ctx, by slot
+    nlohmann::json renderer_material_;   // W6a test seam; empty in production
     ModelStatus   status_;
     StubTokenizer tokenizer_;
 };
@@ -282,9 +289,10 @@ const char* finish_reason_name(FinishReason r) {
 std::unique_ptr<Backend> make_stub_backend(int n_ctx, int delay_ms, const std::string& served_name,
                                            const std::vector<int>& lane_ctx,
                                            const SamplerDefaults& sampler,
-                                           int prefill_ubatches) {
+                                           int prefill_ubatches,
+                                           const nlohmann::json& renderer_material) {
     return std::make_unique<StubBackend>(n_ctx, delay_ms, served_name, lane_ctx, sampler,
-                                         prefill_ubatches);
+                                         prefill_ubatches, renderer_material);
 }
 
 }  // namespace lgc

@@ -378,6 +378,16 @@ public:
     // models came up "non-reasoning" in every client.
     virtual nlohmann::json template_caps() const { return nlohmann::json::object(); }
 
+    // feyntalk W6a (docs/campaigns/feyntalk.md, D4): the renderer material the
+    // gateway consumes, read once at load and served by
+    // `GET /v1/responses/renderer`. Empty for a unit that cannot serve token
+    // mode (the stub), so every request path sees "not served" loudly. The
+    // reference keeps it off the generation path: it is built at load.
+    virtual const nlohmann::json& renderer_material() const {
+        static const nlohmann::json kEmpty;
+        return kEmpty;
+    }
+
     // `slot` is the lane this request owns for its whole life (DESIGN.md §4.1).
     // Every piece of mutable execution state — InferRequests, GDN checkpoint
     // rows, the KV block table, the MTP head's own KV — is indexed by it, which
@@ -420,7 +430,8 @@ std::unique_ptr<Backend> make_stub_backend(int n_ctx, int delay_ms = 0,
                                            const std::string& served_name = {},
                                            const std::vector<int>& lane_ctx = {},
                                            const SamplerDefaults& sampler = {},
-                                           int prefill_ubatches = 1);
+                                           int prefill_ubatches = 1,
+                                           const nlohmann::json& renderer_material = {});
 
 #ifdef ARCINT_LLAMA
 // The libllama executor (ggml OpenCL), the GGUF in --gguf.
