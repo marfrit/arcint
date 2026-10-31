@@ -191,6 +191,11 @@ SlotPool::Lease SlotPool::acquire_for(double timeout_seconds) {
     return Lease(this, index);
 }
 
+SlotPool::Lease SlotPool::try_acquire(int index) {
+    (void)index;
+    return Lease();   // skeleton: affinity is not implemented yet
+}
+
 void SlotPool::release(int index) {
     {
         std::lock_guard<std::mutex> guard(mutex_);

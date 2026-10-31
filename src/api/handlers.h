@@ -18,6 +18,8 @@
 
 namespace lgc::api {
 
+class ResponseStore;   // api/responses_state.h: the process's in-memory store
+
 // A fixed set of lanes (DESIGN.md §4: /health reports free/total and queue
 // depth). A lane is a memory reservation, not a queue position: N lanes means
 // the startup arithmetic (§7.0.2a) reserved activations, GDN checkpoint rows
@@ -51,6 +53,9 @@ public:
     // unbounded variant: an admission that can wait forever is the failure this
     // milestone replaced with a numbered refusal.
     Lease acquire_for(double timeout_seconds);
+    // Non-blocking, for a continuation's slot affinity: index < 0 = invalid, 0
+    // = taken, else the lease. Never waits and never picks another index.
+    Lease try_acquire(int index);
     void  release(int index);
 
     int total() const;
@@ -88,6 +93,10 @@ struct Context {
     // token or ubatch boundary (DESIGN §3.7). Null outside a server (a test
     // calling the seam directly).
     std::atomic<bool>* stop_flag = nullptr;
+    // The process's in-memory response store (docs/campaigns/feyntalk.md State,
+    // W3). Null outside a server (a test calling the seam directly): then a
+    // continuation cannot resolve and answers previous_response_not_found.
+    std::shared_ptr<ResponseStore> responses;
 };
 
 struct HttpResult {

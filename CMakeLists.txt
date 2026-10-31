@@ -91,6 +91,7 @@ add_library(arcint_core STATIC
   src/api/generate.cpp
   src/api/responses.cpp
   src/api/responses_stream.cpp
+  src/api/responses_state.cpp
   src/http/server.cpp
 )
 target_include_directories(arcint_core PUBLIC

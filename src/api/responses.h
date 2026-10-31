@@ -60,6 +60,10 @@ std::optional<HttpResult> parse_response_request(const nlohmann::json& body, Res
 struct PreparedResponse {
     ResponseRequest req;
     PreparedChat    chat;   // the one prepare_from_chat result; id = resp-N
+    // A continuation's slot affinity (docs/campaigns/feyntalk.md State): the
+    // slot the referenced response ran on, tried non-blockingly before the
+    // lane's ordinary acquire. -1: no affinity.
+    int affinity_slot = -1;
 };
 
 // Maps a parsed request onto prepare_from_chat, then numbers the response.

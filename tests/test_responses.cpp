@@ -1,5 +1,6 @@
 #include "api/error.h"
 #include "api/responses.h"
+#include "api/responses_state.h"
 #include "api/responses_stream.h"
 
 #include <atomic>
@@ -88,6 +89,29 @@ TEST(responses_maps_a_plain_string_input) {
     CHECK_EQ(r.truncation, std::string("disabled"));
     CHECK_EQ(r.service_tier, std::string("default"));
     CHECK(r.tools.empty());
+}
+
+TEST(responses_maps_a_message_item_without_type) {
+    // Found by the live-client test: a real pi client (openai-responses) sends
+    // {"role":"user","content":"..."} without `type`. The OpenAPI document
+    // requires type but defaults every message item to "message", and clients
+    // rely on that default. A role makes it a message; neither stays a 400.
+    json body = base();
+    body["input"] = json::array({
+        {{"role", "user"}, {"content", "hello"}},
+        {{"role", "assistant"}, {"content", "earlier answer"}},
+    });
+    ResponseRequest r;
+    parse_ok(body, r);
+    CHECK_EQ(r.chat.messages.size(), 2u);
+    if (r.chat.messages.size() < 2) return;
+    CHECK_EQ(r.chat.messages[0].role, std::string("user"));
+    CHECK_EQ(r.chat.messages[0].content, std::string("hello"));
+    CHECK_EQ(r.chat.messages[1].role, std::string("assistant"));
+
+    json none = base();
+    none["input"] = json::array({json{{"content", "no role, no type"}}});
+    check_refusal(none, "invalid_request", "input", "an item with no type and no role");
 }
 
 TEST(responses_maps_every_message_part_type) {
@@ -1003,4 +1027,269 @@ TEST(responses_busy_refusal_keeps_the_slots_diagnostics) {
     if (!busy.body.contains("slots")) return;
     CHECK_EQ(busy.body["slots"]["total"].get<int>(), 1);
     CHECK_EQ(busy.body["slots"]["free"].get<int>(), 0);
+}
+
+// ------------------------------------------------------- state (W3)
+namespace {
+
+std::shared_ptr<api::StoredResponse> stored_entry(const std::string& id, int lane,
+                                                  const std::string& prompt = "p") {
+    auto e       = std::make_shared<api::StoredResponse>();
+    e->id        = id;
+    e->lane      = lane;
+    e->status    = "completed";
+    e->prompt    = prompt;
+    e->prompt_ids.assign(prompt.begin(), prompt.end());
+    e->prefix_hash = api::sha256_hex(prompt);
+    e->output_items = json::array({json{{"type", "message"}, {"id", "msg-1"}, {"role", "assistant"},
+                                        {"status", "completed"},
+                                        {"content", json::array({{{"type", "output_text"},
+                                                                  {"text", "ok"}}})}}});
+    return e;
+}
+
+// A hand-built store for the W3 cases that do not need a server.
+api::ResponseStore::Limits limits(int entries, uint64_t bytes = 1ull << 20, int64_t ttl = 600) {
+    api::ResponseStore::Limits l;
+    l.entries = entries;
+    l.bytes   = bytes;
+    l.ttl_s   = ttl;
+    return l;
+}
+
+}  // namespace
+
+TEST(responses_store_lru_and_bytes_limits_per_lane) {
+    api::ResponseStore store(limits(2));
+    store.put(stored_entry("a", 0));
+    store.put(stored_entry("b", 0));
+    store.put(stored_entry("c", 0));   // 3 entries, limit 2: `a` (LRU) goes
+    CHECK_EQ(store.entries(), 2);
+    CHECK(store.get("a", 0) == nullptr);
+    CHECK(store.get("b", 0) != nullptr);
+    CHECK(store.get("c", 0) != nullptr);
+
+    // The byte limit binds first when the entries fit: one 700-byte prompt with
+    // a 400-byte limit leaves one entry, and the older one is evicted.
+    api::ResponseStore small(limits(32, 400));
+    std::string        big(700, 'x');
+    small.put(stored_entry("a", 0, big));
+    small.put(stored_entry("b", 0, big));
+    CHECK_EQ(small.entries(), 1);
+    CHECK(small.get("a", 0) == nullptr);
+    CHECK(small.get("b", 0) != nullptr);
+    CHECK(small.bytes() > 0);
+}
+
+TEST(responses_store_ttl_sweeps_expired_entries) {
+    api::ResponseStore store(limits(32, 1ull << 20, /*ttl=*/10));
+    store.put(stored_entry("a", 0));
+    store.sweep(5);
+    CHECK(store.get("a", 0) != nullptr);
+    store.sweep(11);
+    CHECK_EQ(store.entries(), 0);
+}
+
+TEST(responses_store_lane_scoped_and_entries_zero) {
+    api::ResponseStore store(limits(32));
+    store.put(stored_entry("a", 0));
+    CHECK(store.get("a", 1) == nullptr);   // wrong lane: not found
+    CHECK(store.get("a", 0) != nullptr);
+
+    // Review R4: --responses-store-entries 0 retains nothing.
+    api::ResponseStore off(limits(0));
+    off.put(stored_entry("a", 0));
+    CHECK_EQ(off.entries(), 0);
+    CHECK(off.get("a", 0) == nullptr);
+}
+
+TEST(responses_slot_try_acquire_is_non_blocking) {
+    SlotPool pool(2);
+    const auto first = pool.try_acquire(0);
+    CHECK_EQ(first.index(), 0);
+    const auto busy = pool.try_acquire(0);
+    CHECK_EQ(busy.index(), -1);   // taken: refused, not waited for
+    const auto other = pool.try_acquire(1);
+    CHECK_EQ(other.index(), 1);
+}
+
+TEST(responses_a_two_turn_continuation_rebuilds_and_echoes) {
+    Fixture fx;
+    fx.ctx.responses = std::make_shared<api::ResponseStore>(
+        api::ResponseStore::Limits{32, 1ull << 20, 600});
+
+    // Turn 1: a tool turn, so the stored assistant turn carries a function_call.
+    json b1 = {{"model", "stub"}, {"input", "read it"}, {"max_output_tokens", 256},
+               {"tools", json::array({{{"type", "function"}, {"name", "read_file"},
+                                       {"parameters", {{"type", "object"},
+                                                       {"properties", {{"path", {{"type", "string"}}}}}}}}})}};
+    ResponseRequest r1;
+    parse_ok(b1, r1);
+    PreparedResponse p1;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r1), p1).has_value());
+    const api::HttpResult res1 = api::run_response(fx.ctx, p1, 0);
+    CHECK_EQ(res1.status, 200);
+    if (res1.status != 200) return;
+    const std::string id = res1.body["id"].get<std::string>();
+    std::string call_id;
+    for (const json& item : res1.body["output"])
+        if (item["type"].get<std::string>() == "function_call")
+            call_id = item["call_id"].get<std::string>();
+    CHECK(!call_id.empty());
+    CHECK(fx.ctx.responses->get(id, -1) != nullptr);
+
+    // Turn 2: previous_response_id plus the function_call_output.
+    json b2 = {{"model", "stub"}, {"previous_response_id", id}, {"max_output_tokens", 256},
+               {"tools", json::array({{{"type", "function"}, {"name", "read_file"},
+                                       {"parameters", {{"type", "object"},
+                                                       {"properties", {{"path", {{"type", "string"}}}}}}}}})},
+               {"input", json::array({{{"type", "function_call_output"},
+                                       {"call_id", call_id}, {"output", "alpha"}}})}};
+    ResponseRequest r2;
+    parse_ok(b2, r2);
+    PreparedResponse p2;
+    const auto err = api::prepare_response(fx.ctx, std::move(r2), p2);
+    CHECK(!err.has_value());
+    if (err.has_value()) return;
+    // Stored input messages (1 user) + the rebuilt assistant turn + the new
+    // tool output.
+    CHECK_EQ(p2.chat.req.messages.size(), 3u);
+    if (p2.chat.req.messages.size() < 3) return;
+    CHECK_EQ(p2.chat.req.messages[1].role, std::string("assistant"));
+    CHECK_EQ(p2.chat.req.messages[1].tool_calls.size(), size_t(1));
+    CHECK_EQ(p2.chat.req.messages[2].role, std::string("tool"));
+    CHECK_EQ(p2.chat.req.messages[2].tool_call_id, call_id);
+    CHECK_EQ(p2.chat.req.messages[2].content, std::string("alpha"));
+    CHECK(p2.affinity_slot >= 0);
+
+    const api::HttpResult res2 = api::run_response(fx.ctx, p2, 0);
+    CHECK_EQ(res2.status, 200);
+    if (res2.status != 200) return;
+    CHECK_EQ(res2.body["previous_response_id"].get<std::string>(), id);
+}
+
+TEST(responses_store_false_keeps_nothing) {
+    Fixture fx;
+    fx.ctx.responses = std::make_shared<api::ResponseStore>(
+        api::ResponseStore::Limits{32, 1ull << 20, 600});
+    json b1 = base();
+    b1["store"] = false;
+    ResponseRequest r1;
+    parse_ok(b1, r1);
+    PreparedResponse p1;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r1), p1).has_value());
+    const api::HttpResult res1 = api::run_response(fx.ctx, p1, 0);
+    CHECK_EQ(res1.status, 200);
+    const std::string id = res1.body["id"].get<std::string>();
+    CHECK(fx.ctx.responses->get(id, -1) == nullptr);
+
+    json b2 = base();
+    b2["previous_response_id"] = id;
+    ResponseRequest r2;
+    parse_ok(b2, r2);
+    PreparedResponse p2;
+    auto err = api::prepare_response(fx.ctx, std::move(r2), p2);
+    CHECK(err.has_value());
+    if (!err.has_value()) return;
+    CHECK_EQ(err->body["error"]["code"].get<std::string>(), std::string("previous_response_not_found"));
+}
+
+TEST(responses_continuation_prefix_mismatch_is_not_found) {
+    Fixture fx;
+    fx.ctx.responses = std::make_shared<api::ResponseStore>(
+        api::ResponseStore::Limits{32, 1ull << 20, 600});
+    auto e = stored_entry("resp-x", -1, "a prompt this server no longer renders");
+    e->prefix_hash = std::string(64, '0');   // a hash the current render never yields
+    fx.ctx.responses->put(e);
+
+    json b = base();
+    b["previous_response_id"] = "resp-x";
+    ResponseRequest r;
+    parse_ok(b, r);
+    PreparedResponse p;
+    auto err = api::prepare_response(fx.ctx, std::move(r), p);
+    CHECK(err.has_value());
+    if (!err.has_value()) return;
+    CHECK_EQ(err->body["error"]["code"].get<std::string>(), std::string("previous_response_not_found"));
+}
+
+TEST(responses_bogus_previous_id_is_not_found) {
+    Fixture fx;
+    fx.ctx.responses = std::make_shared<api::ResponseStore>(
+        api::ResponseStore::Limits{32, 1ull << 20, 600});
+    json b = base();
+    b["previous_response_id"] = "resp-never";
+    ResponseRequest r;
+    parse_ok(b, r);
+    PreparedResponse p;
+    auto err = api::prepare_response(fx.ctx, std::move(r), p);
+    CHECK(err.has_value());
+    if (!err.has_value()) return;
+    CHECK_EQ(err->body["error"]["code"].get<std::string>(), std::string("previous_response_not_found"));
+}
+
+TEST(responses_a_failed_continuation_evicts_the_entry) {
+    StreamFixture fx;   // PiecesBackend: it can throw on demand
+    fx.ctx.responses = std::make_shared<api::ResponseStore>(
+        api::ResponseStore::Limits{32, 1ull << 20, 600});
+    fx.backend.pieces = {{"ok", 1}, {" done", 2}};
+    json b1 = base();
+    ResponseRequest r1;
+    parse_ok(b1, r1);
+    PreparedResponse p1;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r1), p1).has_value());
+    const api::HttpResult res1 = api::run_response(fx.ctx, p1, 0);
+    CHECK_EQ(res1.status, 200);
+    if (res1.status != 200) return;
+    const std::string id = res1.body["id"].get<std::string>();
+    CHECK(fx.ctx.responses->get(id, -1) != nullptr);
+
+    // Turn 2 continues and the engine throws: the server answered 500, so the
+    // state it continued from is broken and must not be reused.
+    fx.backend.throw_after = true;
+    fx.backend.throw_at    = 0;
+    json b2 = base();
+    b2["previous_response_id"] = id;
+    ResponseRequest r2;
+    parse_ok(b2, r2);
+    PreparedResponse p2;
+    auto err = api::prepare_response(fx.ctx, std::move(r2), p2);
+    CHECK(!err.has_value());
+    if (err.has_value()) return;
+    const api::HttpResult res2 = api::run_response(fx.ctx, p2, 0);
+    CHECK_EQ(res2.status, 500);
+    CHECK(fx.ctx.responses->get(id, -1) == nullptr);
+}
+
+// ------------------------------------------------------- F2 (W2 review)
+TEST(responses_stream_sends_loop_guard_when_any_counter_moved) {
+    StreamFixture fx;
+    fx.backend.pieces = {{"x", 1}};
+    fx.backend.counters.loop_detections = 1;   // moved, but the turn ended Stop
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    CHECK(!s.events.empty());
+    if (s.events.empty()) return;
+    bool guard = false;
+    CHECK_EQ(s.events.back().first, std::string("response.completed"));
+    for (size_t i = 0; i < s.events.size(); ++i) {
+        if (s.events[i].first == "arcint:loop_guard") {
+            guard = true;
+            CHECK_EQ(s.events[i].second["detections"].get<int>(), 1);
+        }
+    }
+    CHECK(guard);   // parity with the chat route's loop_guard object
+}
+
+TEST(responses_non_stream_resource_carries_arcint_loop_guard_when_moved) {
+    StreamFixture fx;
+    fx.backend.pieces = {{"x", 1}};
+    fx.backend.counters.loop_nudges = 2;
+    const auto lease = fx.slots.acquire_for(0);
+    const api::HttpResult r = api::run_response(fx.ctx, fx.prep, lease.index());
+    CHECK_EQ(r.status, 200);
+    if (r.status != 200) return;
+    CHECK(r.body.contains("arcint"));
+    if (!r.body.contains("arcint")) return;
+    CHECK_EQ(r.body["arcint"]["loop_guard"]["nudges"].get<int>(), 2);
 }
