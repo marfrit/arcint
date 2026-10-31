@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -37,7 +38,8 @@ struct StoredResponse {
     nlohmann::json incomplete_details  = nullptr;
     // Held by the in-flight registry too (W4); unused in W3.
     std::shared_ptr<std::atomic<bool>> cancel;
-    int64_t  last_used = 0;
+    int64_t  last_used = 0;                  // wall seconds, for the TTL
+    uint64_t use_seq   = 0;                  // store-assigned LRU order
     uint64_t bytes     = 0;                  // what this entry retains
 };
 
@@ -71,6 +73,7 @@ private:
 
     mutable std::mutex mutex_;
     Limits             limits_;
+    uint64_t           use_counter_ = 0;
     std::unordered_map<std::string, std::shared_ptr<StoredResponse>> entries_;
 };
 

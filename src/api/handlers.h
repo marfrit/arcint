@@ -165,7 +165,7 @@ std::optional<HttpResult> acquire_slot(const Context& ctx, SlotPool::Lease& out)
 // waited for (--queue-timeout) or refused on its own; another lane is never
 // taken instead.
 std::optional<HttpResult> acquire_slot(const Context& ctx, int lane, SlotPool::Lease& out,
-                                       int& slot);
+                                       int& slot, int affinity_slot = -1);
 
 nlohmann::json health(const Context& ctx);
 nlohmann::json props(const Context& ctx);

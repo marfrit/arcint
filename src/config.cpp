@@ -183,6 +183,13 @@ std::string usage_text() {
         "                            once)\n"
         "  --http-threads N          HTTP worker threads (default: library default)\n"
         "\n"
+        "responses store\n"
+        "  --responses-store-entries N  retained responses per lane (default: 32;\n"
+        "                            0 disables retention entirely)\n"
+        "  --responses-store-bytes B    retained bytes per lane (default: 16777216);\n"
+        "                            0 disables the byte bound\n"
+        "  --responses-store-ttl S      entry TTL in seconds (default: 86400)\n"
+        "\n"
         "memory\n"
         "  --n-ctx N                 context length (default: the model's trained\n"
         "                            context, at most 32768). There is no auto-fit: the\n"
@@ -670,6 +677,18 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_double(v, cfg.queue_timeout_s)) {
                 return fail("--queue-timeout needs a number of seconds");
             }
+        } else if (arg == "--responses-store-entries") {
+            if (!value(v) || !parse_int(v, cfg.responses_store_entries)) {
+                return fail("--responses-store-entries needs an integer");
+            }
+        } else if (arg == "--responses-store-bytes") {
+            if (!value(v) || !parse_int(v, cfg.responses_store_bytes)) {
+                return fail("--responses-store-bytes needs an integer");
+            }
+        } else if (arg == "--responses-store-ttl") {
+            if (!value(v) || !parse_int(v, cfg.responses_store_ttl_s)) {
+                return fail("--responses-store-ttl needs an integer (seconds)");
+            }
         } else if (arg == "--stub-delay-ms") {
             if (!value(v) || !parse_int(v, cfg.stub_delay_ms)) {
                 return fail("--stub-delay-ms needs an integer");
@@ -742,6 +761,10 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         return fail("--queue-timeout must be between 0 and 3600 seconds");
     }
     if (cfg.http_threads < 0) return fail("--http-threads must be >= 0");
+    if (cfg.responses_store_entries < 0)
+        return fail("--responses-store-entries must be >= 0");
+    if (cfg.responses_store_bytes < 0) return fail("--responses-store-bytes must be >= 0");
+    if (cfg.responses_store_ttl_s < 0) return fail("--responses-store-ttl must be >= 0");
     if (cfg.stub_delay_ms < 0) return fail("--stub-delay-ms must be >= 0");
     if (cfg.device.empty()) return fail("--device must not be empty");
     if (cfg.stub_delay_ms > 0 && !cfg.stub) return fail("--stub-delay-ms only applies to --stub");

@@ -11,6 +11,7 @@
 
 #include "api/error.h"
 #include "api/generate.h"
+#include "api/responses_state.h"
 #include "build_info.h"
 #include "core/stop.h"
 #include "core/reasoning.h"
@@ -192,8 +193,13 @@ SlotPool::Lease SlotPool::acquire_for(double timeout_seconds) {
 }
 
 SlotPool::Lease SlotPool::try_acquire(int index) {
-    (void)index;
-    return Lease();   // skeleton: affinity is not implemented yet
+    // Continuation affinity: one look, never a wait and never another index.
+    // Falling back is the caller's job (acquire_slot).
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (index < 0 || static_cast<size_t>(index) >= busy_.size() || busy_[static_cast<size_t>(index)])
+        return Lease();
+    busy_[static_cast<size_t>(index)] = true;
+    return Lease(this, index);
 }
 
 void SlotPool::release(int index) {
@@ -326,8 +332,19 @@ int queue_depth(const Context& ctx) {
 
 }  // namespace
 
-std::optional<HttpResult> acquire_slot(const Context& ctx, int lane, SlotPool::Lease& out, int& slot) {
+std::optional<HttpResult> acquire_slot(const Context& ctx, int lane, SlotPool::Lease& out, int& slot,
+                                       int affinity_slot) {
     if (lane < 0 || static_cast<size_t>(lane) >= ctx.lanes.size()) {
+        // A continuation first tries the slot the referenced response ran on,
+        // without waiting; a refusal there falls back to the ordinary acquire
+        // (docs/campaigns/feyntalk.md State: "then falls back").
+        if (affinity_slot >= 0) {
+            out = ctx.slots->try_acquire(affinity_slot);
+            if (out.index() >= 0) {
+                slot = out.index();
+                return std::nullopt;
+            }
+        }
         auto err = acquire_slot(ctx, out);
         slot     = out.index();
         return err;
@@ -337,6 +354,15 @@ std::optional<HttpResult> acquire_slot(const Context& ctx, int lane, SlotPool::L
     // reservation of its own size, DESIGN §4.3)
     const Lane&  l       = ctx.lanes[static_cast<size_t>(lane)];
     const double timeout = ctx.cfg != nullptr ? ctx.cfg->queue_timeout_s : 0.0;
+    // The named lane's pool has one lease; its sequence is what the entry
+    // records, so the affinity look is index 0 of that pool.
+    if (affinity_slot >= 0) {
+        out = l.pool->try_acquire(0);
+        if (out.index() >= 0) {
+            slot = l.seq;
+            return std::nullopt;
+        }
+    }
     out                  = l.pool->acquire_for(timeout);
     slot                 = out.index() >= 0 ? l.seq : -1;
     if (out.index() >= 0) return std::nullopt;
@@ -503,6 +529,19 @@ json props(const Context& ctx) {
         {"endpoints",
          json::array({"/health", "/props", "/v1/chat/completions", "/v1/completions",
                       "/v1/responses", "/v1/models", "/v1/audio/speech", "/v1/audio/voices"})}};
+    // The Responses store's live state (docs/campaigns/feyntalk.md State):
+    // what it retains now, and the limits that bound it. A process without a
+    // store (a test seam) says null rather than a zero that would read as empty.
+    if (ctx.responses) {
+        const auto limits = ctx.responses->limits();
+        p["responses"] = {{"entries", ctx.responses->entries()},
+                          {"bytes", ctx.responses->bytes()},
+                          {"limit_entries", limits.entries},
+                          {"limit_bytes", limits.bytes},
+                          {"limit_ttl_s", limits.ttl_s}};
+    } else {
+        p["responses"] = nullptr;
+    }
     if (!ctx.lanes.empty()) {
         json lanes = json::array();
         for (const Lane& l : ctx.lanes) lanes.push_back(json{{"name", l.name}, {"n_ctx", l.n_ctx}, {"seq", l.seq}});
