@@ -398,11 +398,96 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 grep -q 'aborted: client gone' "$CANCEL_LOG"
+
+# ---------------------------------------------------- cancel by id (W4, arcint)
+# The same slow stub: a streamed response is cancelled from a second connection
+# as soon as response.created gives its id. Issue-to-terminal latency is not
+# asserted here; the event order and the cause are.
+CANCEL_ID=$(python3 - "$CANCEL_PORT" <<'PY3'
+import http.client, json, sys, threading, queue, urllib.request, urllib.error, time
+port = int(sys.argv[1])
+q = queue.Queue()
+result = {}
+def canceller():
+    rid = q.get()
+    t0 = time.time()
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/responses/{rid}/cancel", method="POST")
+        r = urllib.request.urlopen(req)
+        result["cancel"] = (r.status, json.loads(r.read()).get("arcint"))
+        result["cancel_seconds"] = time.time() - t0
+    except urllib.error.HTTPError as e:
+        result["cancel"] = (e.code, e.read().decode())
+th = threading.Thread(target=canceller)
+th.start()
+c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+c.request("POST", "/v1/responses", json.dumps({"model": "stub", "input": "x", "stream": True,
+                                              "max_output_tokens": 500}),
+          {"Content-Type": "application/json"})
+r = c.getresponse()
+types = []
+done = False
+rid = ""
+while True:
+    line = r.fp.readline()
+    if not line: break
+    s = line.decode("utf-8", errors="replace").strip()
+    if s.startswith("event: "): types.append(s[7:])
+    if s.startswith("data: {"):
+        d = json.loads(s[6:])
+        if d["type"] == "response.created":
+            rid = d["response"]["id"]; q.put(rid)
+        if d["type"] == "response.incomplete":
+            assert d["response"]["incomplete_details"]["reason"] == "cancelled", d["response"]
+            assert d["response"]["output"][-1]["status"] == "incomplete", d["response"]["output"]
+    if s == "data: [DONE]": done = True; break
+th.join()
+assert result.get("cancel", (0, None))[0] == 200, result
+assert result["cancel"][1] == {"cancelling": True, "v": 1}, result["cancel"]
+assert done and types[-1] == "response.incomplete", types[-3:]
+assert "arcint:response.cancelled" in types and types[-2] == "arcint:response.cancelled", types[-4:]
+print(rid)
+PY3
+)
+check "a cancel by id answers 200 with arcint.cancelling and the stream ends incomplete(cancelled)" \
+  "$([[ -n "$CANCEL_ID" ]] && echo 0 || echo 1)"
+
+code=$(curl -sS -o "${WORK}/cancel-late.json" -w '%{http_code}' -X POST -d '' \
+       "http://127.0.0.1:${CANCEL_PORT}/v1/responses/${CANCEL_ID}/cancel")
+check "a terminal response cannot be cancelled again (409)" "$([[ $code == 409 ]] && echo 0 || echo 1)"
+jassert "${WORK}/cancel-late.json" 'd["error"]["type"]=="invalid_request" and d["error"]["code"]=="response_not_cancellable"'
+check "the 409 carries response_not_cancellable" $?
+
+code=$(curl -sS -o "${WORK}/cancel-unknown.json" -w '%{http_code}' -X POST -d '' \
+       "http://127.0.0.1:${CANCEL_PORT}/v1/responses/resp-nope/cancel")
+check "an unknown cancel id is 404" "$([[ $code == 404 ]] && echo 0 || echo 1)"
+jassert "${WORK}/cancel-unknown.json" 'd["error"]["type"]=="not_found" and d["error"]["code"]=="response_not_found"'
+check "the 404 carries response_not_found" $?
+
+for _ in $(seq 1 50); do
+  grep -q 'aborted: cancel requested' "$CANCEL_LOG" && break
+  sleep 0.1
+done
+grep -q 'aborted: cancel requested' "$CANCEL_LOG"
+check "the slot line names the cancel, not a gone client" $?
 check "the server logs the abort at a scheduler boundary" $?
 
 curl -sS "http://127.0.0.1:${CANCEL_PORT}/health" -o "${WORK}/after-cancel.json"
 jassert "${WORK}/after-cancel.json" 'd["slots_free"]==d["slots_total"] and d["queue_depth"]==0'
 check "the aborted request released its slot" $?
+
+# The W5 measurement tool runs against the stub: cancel arm, line-by-line SSE,
+# unique nonce at the prompt head, and a prefill-rate estimate when no explicit
+# tokens-at-issue is given.
+python3 "$(cd "$(dirname "$0")/../tools" && pwd)/feyntalk_cancel.py" --base-url "http://127.0.0.1:${CANCEL_PORT}" \
+       --log "$CANCEL_LOG" --model stub --prompt-words 80 --arm cancel >"${WORK}/cancel-tool.json"
+python3 - "${WORK}/cancel-tool.json" <<'PY3'
+import json, sys
+d = json.loads(open(sys.argv[1], encoding="utf-8").read().strip().splitlines()[-1])
+sys.exit(0 if (d["cancel_status"] == 200 and d["cancelled_event"] is True
+               and d["prefilled"] is not None and d["tokens_at_issue_source"] == "prefill-rate estimate") else 1)
+PY3
+check "tools/feyntalk_cancel.py cancel arm measures against the stub" $?
 
 kill -TERM "$CANCEL_PID" 2>/dev/null
 wait "$CANCEL_PID" 2>/dev/null
@@ -562,6 +647,120 @@ curl -sS "${OP_BASE}/v1/chat/completions" -H 'Content-Type: application/json' \
      -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":8}' -o "${WORK}/op-chat.json"
 jassert "${WORK}/op-chat.json" '"accepted_prediction_tokens" in d["usage"]["completion_tokens_details"] and "rejected_prediction_tokens" in d["usage"]["completion_tokens_details"]'
 check "usage says which regime the request got (draft counters present)" $?
+
+# ------------------------------------------------------------- /v1/responses
+# Open Responses, non-stream (docs/campaigns/feyntalk.md W1); the SSE writer is
+# W2. The required-key set is the 2026-04-24 ResponseResource: a client parses a
+# resource only when all of it is present.
+code=$(curl -sS -o "${WORK}/resp.json" -w '%{http_code}' "${OP_BASE}/v1/responses" \
+       -H 'Content-Type: application/json' -d '{"model":"stub","input":"hello"}')
+check "/v1/responses answers a plain string input" "$([[ $code == 200 ]] && echo 0 || echo 1)"
+jassert "${WORK}/resp.json" 'd["object"]=="response" and d["status"]=="completed" and d["output"][0]["type"]=="message"'
+check "/v1/responses returns a completed response with a message item" $?
+jassert "${WORK}/resp.json" \
+  'all(k in d for k in ["id","object","created_at","completed_at","status","incomplete_details","model","previous_response_id","instructions","output","error","tools","tool_choice","truncation","parallel_tool_calls","text","top_p","presence_penalty","frequency_penalty","top_logprobs","temperature","reasoning","usage","max_output_tokens","max_tool_calls","store","background","service_tier","metadata","safety_identifier","prompt_cache_key"])'
+check "/v1/responses carries every required ResponseResource key" $?
+jassert "${WORK}/resp.json" \
+  'd["usage"]["input_tokens"]>0 and d["usage"]["total_tokens"]==d["usage"]["input_tokens"]+d["usage"]["output_tokens"] and d["usage"]["input_tokens_details"]["cached_tokens"]==0'
+check "/v1/responses usage is filled" $?
+
+# A refusal answers 400 and leaves one req: warning line with the code and the
+# field (W5 live-leg finding: the server log said nothing about a prepare-time
+# refusal, and reproducing it by hand was the only way).
+code=$(curl -sS -o "${WORK}/resp-refused.json" -w '%{http_code}' "${OP_BASE}/v1/responses" \
+       -H 'Content-Type: application/json' -d '{"model":"stub","input":"x","include":[7]}')
+check "/v1/responses refuses a non-string include entry" "$([[ $code == 400 ]] && echo 0 || echo 1)"
+jassert "${WORK}/resp-refused.json" 'd["error"]["code"]=="invalid_request" and d["error"]["param"]=="include"'
+check "the include refusal names the field" $?
+grep -q 'responses refused: 400 code=invalid_request param=include' "$OP_LOG"
+check "a Responses refusal writes one req: warning line" $?
+
+# SSE (W2): every frame has an `event:` line equal to the body's type, the
+# sequence numbers run 1..N without a gap, the terminal event is last and
+# `[DONE]` follows it.
+curl -sN "${OP_BASE}/v1/responses" -H 'Content-Type: application/json' \
+     -d '{"model":"stub","input":"hello","stream":true,"max_output_tokens":256}' \
+     -o "${WORK}/resp-sse.txt"
+check "/v1/responses streams an SSE body on request" $?
+ssecheck() {  # ssecheck <file> <python assertions over events/types/done>
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+raw = open(sys.argv[1], encoding="utf-8").read()
+events, done = [], False
+for frame in [f for f in raw.split("\n\n") if f.strip()]:
+    lines = frame.split("\n")
+    ev = [l[6:] for l in lines if l.startswith("data: ")]
+    names = [l[7:] for l in lines if l.startswith("event: ")]
+    if ev and ev[0] == "[DONE]":
+        done = True
+        continue
+    if len(names) != 1 or len(ev) != 1:
+        print("frame without one event:/data: pair:", frame, file=sys.stderr)
+        sys.exit(1)
+    body = json.loads(ev[0])
+    if names[0] != body["type"]:
+        print("event: line", names[0], "!= type", body["type"], file=sys.stderr)
+        sys.exit(1)
+    events.append(body)
+seq = [e["sequence_number"] for e in events]
+if seq != list(range(1, len(events) + 1)):
+    print("sequence is not 1..N:", seq, file=sys.stderr)
+    sys.exit(1)
+types = [e["type"] for e in events]
+sys.exit(0 if eval(sys.argv[2], {"events": events, "types": types, "done": done}) else 1)
+PY
+}
+ssecheck "${WORK}/resp-sse.txt" \
+  'types[:2]==["response.created","response.in_progress"] and types[-1]=="response.completed" and done and any(t=="response.output_text.delta" for t in types) and events[-1]["response"]["status"]=="completed"'
+check "/v1/responses SSE framing, order, sequence and terminal event" $?
+
+code=$(curl -sS -o "${WORK}/resp-tools.json" -w '%{http_code}' \
+       -H 'Content-Type: application/json' --data-binary '{"model":"stub","instructions":"be terse","input":[{"type":"message","role":"user","content":"read a.txt"},{"type":"function_call","call_id":"call_7","name":"read_file","arguments":"{\"path\":\"a.txt\"}"},{"type":"function_call_output","call_id":"call_7","output":"alpha"}],"tools":[{"type":"function","name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}],"max_output_tokens":256}' \
+       "${OP_BASE}/v1/responses")
+check "/v1/responses serves an instructions + tool + tool-output turn" "$([[ $code == 200 ]] && echo 0 || echo 1)"
+jassert "${WORK}/resp-tools.json" 'd["instructions"]=="be terse" and d["tools"][0]["name"]=="read_file" and any(i["type"]=="function_call" and i["name"]=="read_file" for i in d["output"])'
+check "/v1/responses echoes instructions and tools and emits the function_call item" $?
+
+curl -sN "${OP_BASE}/v1/responses" -H 'Content-Type: application/json' \
+     -d '{"model":"stub","input":"call it","stream":true,"max_output_tokens":256,"tools":[{"type":"function","name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}]}' \
+     -o "${WORK}/resp-sse-tools.txt"
+check "/v1/responses streams a tool turn" $?
+ssecheck "${WORK}/resp-sse-tools.txt" \
+  'done and types[-1]=="response.completed" and any(t=="response.function_call_arguments.delta" for t in types)'
+check "/v1/responses SSE emits the function_call argument delta and terminal event" $?
+
+# The state chain (W3): turn 1 stores; turn 2 continues with previous_response_id
+# and a function_call_output. The stub backend reports no prefix reuse
+# (cache_hit_tokens stays 0), so the affinity number is the live leg's (W5);
+# here the continuation, the echo and the /props count are the contract.
+curl -sS "${OP_BASE}/v1/responses" -H 'Content-Type: application/json' \
+     -d '{"model":"stub","input":"read it","max_output_tokens":256,"tools":[{"type":"function","name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}]}' \
+     -o "${WORK}/resp-t1.json"
+RESP_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "${WORK}/resp-t1.json")
+CALL_ID=$(python3 -c 'import json,sys; print(next(i["call_id"] for i in json.load(open(sys.argv[1]))["output"] if i["type"]=="function_call"))' "${WORK}/resp-t1.json")
+[[ -n "$RESP_ID" && -n "$CALL_ID" ]] && pass "responses turn 1 returns an id and a function_call" || fail "responses turn 1 returns an id and a function_call"
+python3 - "$WORK/resp-t2-request.json" "$RESP_ID" "$CALL_ID" <<'PY'
+import json, sys
+body = {"model": "stub", "previous_response_id": sys.argv[2], "max_output_tokens": 256,
+        "tools": [{"type": "function", "name": "read_file",
+                   "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}],
+        "input": [{"type": "function_call_output", "call_id": sys.argv[3], "output": "alpha"}]}
+open(sys.argv[1], "w").write(json.dumps(body))
+PY
+code=$(curl -sS -o "${WORK}/resp-t2.json" -w '%{http_code}' \
+       -H 'Content-Type: application/json' --data-binary @"${WORK}/resp-t2-request.json" \
+       "${OP_BASE}/v1/responses")
+check "/v1/responses continues a stored response on previous_response_id" "$([[ $code == 200 ]] && echo 0 || echo 1)"
+python3 - "$WORK/resp-t2.json" "$RESP_ID" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+sys.exit(0 if (d["previous_response_id"] == sys.argv[2] and d["status"] == "completed"
+               and d["store"] is True) else 1)
+PY
+check "responses turn 2 echoes previous_response_id and keeps the chain" $?
+curl -sS "${OP_BASE}/props" -o "${WORK}/resp-props.json"
+jassert "${WORK}/resp-props.json" 'd["responses"]["entries"] >= 1 and d["responses"]["limit_entries"] >= 32 and d["responses"]["bytes"] > 0'
+check "/props reports the Responses store's live entries and bytes" $?
 
 kill -TERM "$OP_PID" 2>/dev/null; wait "$OP_PID" 2>/dev/null; OP_PID=""
 

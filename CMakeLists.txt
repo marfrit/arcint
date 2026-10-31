@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 1.2.7 LANGUAGES CXX)
+project(arcint VERSION 1.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -88,6 +88,10 @@ add_library(arcint_core STATIC
   src/exec/backend_stub.cpp
   src/api/error.cpp
   src/api/handlers.cpp
+  src/api/generate.cpp
+  src/api/responses.cpp
+  src/api/responses_stream.cpp
+  src/api/responses_state.cpp
   src/http/server.cpp
 )
 target_include_directories(arcint_core PUBLIC
@@ -163,6 +167,12 @@ if(ARCINT_LLAMA)
     if(ARCINT_LLAMA_H MATCHES "llama_model_expert_cache_count")
       target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_EXPERT_CACHE_DEV=1)
     endif()
+    # 0068: the prefill-slot-loan (docs/campaigns/prefill-slot-loan.md)
+    if(ARCINT_LLAMA_H MATCHES "slot_loan_bytes")
+      target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_SLOT_LOAN=1)
+    else()
+      message(WARNING "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0068: --llama-slot-loan is refused")
+    endif()
   else()
     message(WARNING "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0021: --llama-expert-cache is refused")
   endif()
@@ -231,22 +241,32 @@ if(ARCINT_TESTS)
     tests/test_text.cpp
     tests/test_config.cpp
     tests/test_verify_walk.cpp
+    tests/test_mtp_trace.cpp
+    tests/test_draft_policy.cpp
     tests/test_dflash_walk.cpp
     tests/test_spec_state.cpp
     tests/test_token_ids.cpp
     tests/test_props.cpp
     tests/test_sampler_modes.cpp
     tests/test_loop_guard.cpp
+    tests/test_context_guard.cpp
     tests/test_lanes.cpp
     tests/test_reasoning.cpp
+    tests/test_markers.cpp
     tests/test_stream_utf8.cpp
     tests/test_stop_think_ids.cpp
     tests/test_decode_stats.cpp
+    tests/test_slot_loan.cpp
+    tests/test_loan_book.cpp
     tests/test_toolgrammar.cpp
     tests/test_disconnect.cpp
+    tests/test_responses.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+  # round 13: test_loan_book reads the loan-KL driver's rule header
+  # (contrib/llama-loan-kld/loan_kld_book.h), a device-free plain-data header
+  target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/contrib/llama-loan-kld")
   if(ARCINT_LLAMA)
     # test_toolgrammar.cpp runs the generated GBNF through libllama's grammar
     # engine on text (llama-grammar.h, the entry points upstream's own grammar
@@ -256,7 +276,10 @@ if(ARCINT_TESTS)
     # generator's shape and the sampler's constraint hook without them; the
     # record is in tests/test_toolgrammar.cpp's header and in the campaign
     # (docs/campaigns/clean-turns.md, step 2 "the gate").
-    target_include_directories(arcint-test PRIVATE "${ARCINT_LLAMA_DIR}/src")
+    # ... and its include/ for llama.h: test_loan_book's rule cases read
+    # LLAMA_SLOT_LOAN_BYTES_ENV and llama_model_default_params (finding 8's rule
+    # lives in the pinned tree's init and its default params, not in the tool)
+    target_include_directories(arcint-test PRIVATE "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/include")
     # clean-turns step 2's forced-malformed gate on a real vocabulary (vocab-only
     # load, no device). Not a ctest case: it needs the GGUF; run by hand.
     add_executable(arcint-tool-grammar-probe tools/tool_grammar_probe.cpp)
@@ -267,6 +290,12 @@ if(ARCINT_TESTS)
   # the llama backend cannot be constructed without a card).
   target_compile_definitions(arcint-test PRIVATE
     ARCINT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+  if(ARCINT_LLAMA)
+    # test_loan_book.cpp reads the cache's own init: the destructor's buffer list
+    # is built inside a function a unit build cannot call (finding 7, third review)
+    target_compile_definitions(arcint-test PRIVATE
+      ARCINT_LLAMA_SRC_DIR="${ARCINT_LLAMA_DIR}")
+  endif()
   target_compile_options(arcint-test PRIVATE -Wall -Wextra -Wpedantic)
 
   # --max-skips 0: a skip is a failure here unless the case is named with
@@ -278,6 +307,17 @@ if(ARCINT_TESTS)
 
   add_test(NAME roundtrip
            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/roundtrip.sh" "$<TARGET_FILE:arcint>")
+
+  # Review R5 (docs/campaigns/feyntalk.md): W1 splits prepare_chat, and a green
+  # suite does not prove the served bytes stayed the same. The checked-in
+  # capture of the chat and completions routes on the stub backend is compared
+  # byte for byte, with only the ids and `created` normalised (normalise.py
+  # names them and why). A refactor that moves one byte of these bodies fails
+  # here.
+  add_test(NAME feyntalk-golden
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/feyntalk-w1/compare.sh"
+                   "$<TARGET_FILE:arcint>")
+  set_tests_properties(feyntalk-golden PROPERTIES TIMEOUT 120 LABELS unit)
   # roundtrip.sh exits 77 with a reason when curl or python3 is missing. That
   # is deliberately NOT a ctest skip here: the package recipe gates on
   # `-L unit`, and a builder without curl must fail that gate, not pass it with
@@ -304,10 +344,51 @@ if(ARCINT_TESTS)
            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/acceptance/selftest.py")
   set_tests_properties(acceptance-runner PROPERTIES LABELS unit)
 
+  # The MTP window trace's replay (campaign research-mtp-width-policy, section 6
+  # step 1): the trace format's round trip, the fixed-width arithmetic and the
+  # port of Strata's cost-aware keep_draft. Standard library only (unittest), so
+  # it runs on a build host with python3 and no packages; device-free.
+  add_test(NAME mtp-width-replay
+           COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_mtp_width_replay.py")
+  set_tests_properties(mtp-width-replay PROPERTIES LABELS unit)
+
+  # tools/fn_sweep.py's flag tables and --no-mtp (the T1 leg), device-free.
+  add_test(NAME fn-sweep-flags
+           COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_fn_sweep_flags.py")
+  set_tests_properties(fn-sweep-flags PROPERTIES LABELS unit)
+
   # The release speed gate's decision function and parser (tests/acceptance/ab.py).
+  # The Open Responses compliance gate (docs/campaigns/feyntalk.md Gate 3):
+  # the official vendored CLI, the seven 1.3.0 ids against a --stub server. NOT
+  # the unit label: it needs node >= 22 and the pinned npm packages, while the
+  # offline unit gate does not. It skips loudly (exit 0, named) without node;
+  # FEYNTALK_COMPLIANCE_REQUIRED=1 turns a skip into a failure.
+  add_test(NAME feyntalk-compliance
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/feyntalk/run-compliance.sh"
+                   "$<TARGET_FILE:arcint>")
+  set_tests_properties(feyntalk-compliance PROPERTIES TIMEOUT 300 LABELS compliance)
+
   add_test(NAME acceptance-ab
            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/acceptance/ab_selftest.py")
   set_tests_properties(acceptance-ab PROPERTIES LABELS unit)
+
+  # patch 0070's device-free C++ cell, against the llama tree the build already
+  # compiled against (EXPERT_PROFILE_SRC): the selftest's round trip,
+  # truncation, version, tie-break, pending-swap, xe, heat-unit and heat-width
+  # cells, plus the C++/Python byte equality. Run by python3 alone (the cell is
+  # stdlib unittest), so the recipe is green on a build host without pytest;
+  # the recipe's `ctest -L unit` still runs it, so a patch that does not compile
+  # fails the package build instead of a skipped skip.
+  if(ARCINT_LLAMA)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(NAME expert-profile-save
+             COMMAND "${CMAKE_COMMAND}" -E env "EXPERT_PROFILE_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_expert_profile_save.py")
+    set_tests_properties(expert-profile-save PROPERTIES LABELS unit)
+  endif()
 endif()
 
 if(ARCINT_ACCEPTANCE)

@@ -45,8 +45,9 @@ std::optional<LoopGuardMatch> loop_guard_match_parse(std::string_view name) {
 bool SamplerOverrides::any() const {
     return temperature || top_p || top_k || min_p || repetition_penalty || presence_penalty ||
            frequency_penalty || seed || max_tokens || ignore_eos || stop || stop_token_ids ||
-           think_eog_mask || tool_grammar || loop_guard || loop_guard_match || loop_guard_window ||
-           loop_guard_threshold || loop_guard_grace || loop_guard_door_grace || answer_temperature || answer_top_p || answer_top_k ||
+           think_eog_mask || tool_grammar || think_ctx_reserve || loop_guard || loop_guard_match ||
+           loop_guard_window || loop_guard_threshold || loop_guard_grace || loop_guard_door_grace ||
+           answer_temperature || answer_top_p || answer_top_k ||
            answer_min_p || answer_presence_penalty || answer_frequency_penalty ||
            nothink_temperature || nothink_top_p || nothink_top_k || nothink_min_p ||
            nothink_presence_penalty;
@@ -69,6 +70,7 @@ SamplerParams sampler_from_defaults(const SamplerDefaults& d, bool nothink) {
     }
     p.think_eog_mask     = d.think_eog_mask;
     p.tool_grammar       = d.tool_grammar;
+    p.think_ctx_reserve  = d.think_ctx_reserve;
     p.loop_guard         = d.loop_guard;
     p.loop_guard_match   = d.loop_guard_match;
     p.loop_guard_window    = d.loop_guard_window;
@@ -131,6 +133,9 @@ std::optional<std::string> sampler_validate(const SamplerOverrides& o) {
     }
     if (o.max_tokens && *o.max_tokens < 1) {
         return log::format("max_tokens must be >= 1, got %d", *o.max_tokens);
+    }
+    if (o.think_ctx_reserve && *o.think_ctx_reserve < 0) {
+        return log::format("think_ctx_reserve must be >= 0 (0 disables), got %d", *o.think_ctx_reserve);
     }
     // llava: the answer row is validated like the thinking row, so a flag or a
     // request field out of range is the same refusal.
@@ -196,6 +201,7 @@ std::optional<std::string> sampler_apply(SamplerParams& p, const SamplerOverride
     // Making the operator's on un-vetoable would be a silent override (§3.6).
     if (o.think_eog_mask) p.think_eog_mask = *o.think_eog_mask;
     if (o.tool_grammar)   p.tool_grammar   = *o.tool_grammar;
+    if (o.think_ctx_reserve) p.think_ctx_reserve = *o.think_ctx_reserve;
     if (o.loop_guard)     p.loop_guard     = *o.loop_guard;
     if (o.loop_guard_match) p.loop_guard_match = *o.loop_guard_match;
     // llava: the request's answer row fields override the operator's, for that
@@ -233,6 +239,7 @@ std::optional<std::string> sampler_defaults_apply(SamplerDefaults& d, const Samp
     if (nothink_set) d.nothink_row = true;
     if (o.think_eog_mask)     d.think_eog_mask     = *o.think_eog_mask;
     if (o.tool_grammar)       d.tool_grammar       = *o.tool_grammar;
+    if (o.think_ctx_reserve)  d.think_ctx_reserve  = *o.think_ctx_reserve;
     if (o.loop_guard)         d.loop_guard         = *o.loop_guard;
     if (o.loop_guard_match)   d.loop_guard_match   = *o.loop_guard_match;
     if (o.loop_guard_window)    d.loop_guard_window    = *o.loop_guard_window;
@@ -246,7 +253,8 @@ std::optional<std::string> sampler_defaults_apply(SamplerDefaults& d, const Samp
     if (o.answer_presence_penalty)  d.answer_presence_penalty  = *o.answer_presence_penalty;
     if (o.answer_frequency_penalty) d.answer_frequency_penalty = *o.answer_frequency_penalty;
     if (o.temperature || o.top_p || o.top_k || o.min_p || o.repetition_penalty || o.presence_penalty ||
-        o.think_eog_mask || o.tool_grammar || o.loop_guard || o.loop_guard_match || o.loop_guard_window || o.loop_guard_threshold ||
+        o.think_eog_mask || o.tool_grammar || o.think_ctx_reserve || o.loop_guard || o.loop_guard_match ||
+        o.loop_guard_window || o.loop_guard_threshold ||
         o.loop_guard_grace || o.loop_guard_door_grace || o.answer_temperature || o.answer_top_p || o.answer_top_k ||
         o.answer_min_p || o.answer_presence_penalty || o.answer_frequency_penalty || nothink_set) {
         d.provenance = "operator";

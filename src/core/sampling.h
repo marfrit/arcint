@@ -28,6 +28,17 @@ inline bool loop_guard_uses_door(LoopGuardMode m) {
     return m == LoopGuardMode::Door || m == LoopGuardMode::Ladder;
 }
 
+// feyntalk W3.4: the context guard's budget arithmetic, in one place. Tokens
+// that may still be emitted inside the think block before its closer is
+// forced: n_ctx - prompt_tokens - reserve. The sampler knows neither n_ctx nor
+// the position, so the backend computes this at request start and hands it
+// over (Sampler::set_think_ctx_budget). A result <= 0 means the prompt already
+// sits inside the reserve: the closer is forced at the first thinking token.
+// reserve 0 is the switch off and never produces a budget.
+inline int think_ctx_budget(int n_ctx, int prompt_tokens, int reserve) {
+    return n_ctx - prompt_tokens - reserve;
+}
+
 // Whether a mode escalates by nudge/slap/abort at all (Ladder is deferred by
 // the door grace; LadderNoDoor nudges at detection as before).
 inline bool loop_guard_is_ladder(LoopGuardMode m) {
@@ -92,6 +103,15 @@ struct SamplerDefaults {
     // today's behaviour; the artifact cannot decide it, so it is not read from
     // the GGUF.
     bool think_eog_mask = false;
+
+    // feyntalk W3.4: the context guard's reserve in tokens. 0 (default) is
+    // off, byte-identical: no budget is set at request start. N > 0 lets the
+    // sampler force the think-block's closer once
+    // n_ctx - prompt_tokens - N tokens have been emitted inside the block,
+    // so a turn cannot think itself out of the context before the between-turn
+    // compaction can act. The operator's --think-ctx-reserve flag sets it; a
+    // request never does.
+    int think_ctx_reserve = 0;
 
     // clean-turns step 2: the operator's switch for the tool-call grammar.
     // Off keeps today's behaviour; on, a request that declared tools is
@@ -184,6 +204,12 @@ struct SamplerParams {
     // clean-turns: while a think block is open, the end-of-turn token is not a
     // legal next token. Off keeps today's behaviour exactly. See ThinkBlockIds.
     bool think_eog_mask = false;
+
+    // feyntalk W3.4: the context guard's reserve (--think-ctx-reserve), 0 =
+    // off. It is the operator layer's field, carried into the request's
+    // params; the sampler gets the budget itself at request start (it knows
+    // neither n_ctx nor the position).
+    int think_ctx_reserve = 0;
     ThinkBlockIds think_ids;
 
     // clean-turns step 2: constrain the tool-call form to the declared schemas
@@ -262,6 +288,8 @@ struct SamplerOverrides {
     std::optional<std::vector<int>>         stop_token_ids;
     std::optional<bool>                     think_eog_mask;
     std::optional<bool>                     tool_grammar;
+    // feyntalk W3.4: the operator layer carries the context guard's reserve.
+    std::optional<int>                      think_ctx_reserve;
     // loop-guard: the request's own rung for this request only. Absent keeps
     // the operator's switch; the window/threshold/grace stay operator-side.
     std::optional<LoopGuardMode>            loop_guard;

@@ -112,10 +112,11 @@ struct ModelStatus {
     // which is what lets /props print null rather than a default that was
     // never served.
     std::string kv_precision;
-    // The model may open a think block with "<thinking>" or "[THINK]" as well
-    // as "<think>": set by the llama engine for the Mistral Small 24B family
-    // (Cydonia 24B, Magistral tunes). The Qwens keep "<think>" alone, so an
-    // answer of theirs that merely starts with such text stays content.
+    // The model may open a think block with the angle-bracket or the
+    // square-bracket tag as well as the Qwen tag: set by the llama engine
+    // for the Mistral Small 24B family (Cydonia 24B, Magistral tunes). The
+    // Qwens keep the Qwen tag alone, so an answer of theirs that merely
+    // starts with such text stays content.
     bool think_tags_extended = false;
 
     SamplerDefaults sampler_defaults;
@@ -135,7 +136,7 @@ enum class FinishReason { Stop, Length, Abort, Loop };
 // Why a request ended as Abort. Both sources leave FinishReason::Abort; the
 // slot line names the cause, because a SIGTERM was logged as "client gone"
 // on the card (DESIGN §3.7). None: the reason was not Abort.
-enum class AbortCause { None, ClientGone, StopSignal };
+enum class AbortCause { None, ClientGone, StopSignal, Cancelled };
 
 const char* finish_reason_name(FinishReason r);
 
@@ -222,6 +223,13 @@ struct GenerationInput {
     // request ends at its next token or batch boundary as Abort. Null when no
     // stop signal exists (a direct call to the seam).
     const std::atomic<bool>* stop = nullptr;
+
+    // Cancel by id (docs/campaigns/feyntalk.md Cancel, W4): the route ORs this
+    // flag into the peer_alive closure, so every boundary check the engine
+    // already makes sees a cancel exactly as it sees a close; `abort_cause_of`
+    // reads it after the stop flag to name the cause. Null when no cancel is
+    // possible (a direct call to the seam).
+    std::shared_ptr<std::atomic<bool>> cancel;
 };
 
 struct GenerationStats {
@@ -247,6 +255,12 @@ struct GenerationStats {
     // gap 2: draws whose candidates held an end-of-generation id the door
     // removed inside the open block.
     int    loop_door_eog_masked = 0;
+    // feyntalk W3.4 context guard: closes forced by the reserve (not by the
+    // loop guard), arms that could not force a closer (text-closer family),
+    // and the emitted-token index the forced closer took (-1: none).
+    int    loop_context_closes    = 0;
+    int    loop_context_no_closer = 0;
+    int    loop_context_token_index = -1;
     // Wall time spent copying the whole model state so a rejected draft can be
     // rolled back. On the stateful path this is the price of speculation.
     // What the prefix cache costs on the way in. It is the same host round-trip
@@ -332,6 +346,16 @@ public:
 
     virtual const ModelStatus& status() const = 0;
     virtual Tokenizer&         tokenizer()    = 0;
+
+    // The prefill-slot-loan's current state, as llama_context_slot_loan_state
+    // reports it ("off", "armed", "out", "poisoned", "broken"), for /props and
+    // the request-start refusal. The stub and a backend without the loan: "off".
+    virtual std::string slot_loan_state() const { return "off"; }
+
+    // --llama-mtp-policy cost's learned per-width round cost table (Strata's
+    // log line), for /props; empty when the policy is off. Reads under the
+    // context's lock, as slot_loan_state does.
+    virtual std::string mtp_cost_table() const { return {}; }
 
     // The think tags' token ids the artifact's vocabulary holds as one special
     // token, per pair (ThinkBlockIds::open_close_ids), or empty when none. The

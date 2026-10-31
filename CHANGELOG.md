@@ -18,6 +18,68 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.3.0 — 2026-10-31
+
+The Open Responses API, an adaptive MTP window on the coder, and the prefill slot
+loan for Flash-Next; answers checked at the answer-level bar (all `measured-here`
+unless marked):
+
+- **`POST /v1/responses`** (`docs/campaigns/feyntalk.md` on the `qfndev` branch): the Open Responses
+  request and resource, non-stream and SSE streaming, an in-memory store with
+  `previous_response_id` continuations and slot affinity,
+  `POST /v1/responses/{id}/cancel` (cancel-by-id stops a 14k-token prefill in
+  1.28 s, the same bound as closing the socket), the official compliance suite
+  7/7. The chat route's bytes are unchanged (golden captures).
+  - Prior reasoning is replayed by the chat template's own rule (Qwen3 keeps
+    the reasoning of assistant turns after the last user message): in a tool
+    loop the prefix cache now reuses the previous turn's output (median 100 %
+    of it per step, before: re-prefilled every step), the task 4/4 in both arms.
+  - `--think-ctx-reserve N` (default 0, off): when a turn's reasoning would run
+    past the context minus N tokens, the think block's closer is forced so the
+    answer or tool call fits; on the agent it fired exactly at the budget,
+    the answer and a tool call after it parsed.
+  - `truncation: "auto"` drops replayed reasoning oldest-first (never a
+    message) and never refuses a prompt that `disabled` serves.
+- **MTP width policy** (`--llama-mtp-policy cost`, `--llama-mtp-cost-seed`,
+  default off; `docs/campaigns/research-mtp-width-policy.md` on the `qfndev` branch): Strata's
+  cost-aware window in the serving path, seeded with the card's measured round
+  times. Coder on the A770: decode on the six-answer set 56.27 -> 64.92 / 65.42
+  t/s (+15.8 %), the acceptance task 10/10 x3 at 90.1/90.0/90.1 -> 92.8/90.9/93.5
+  t/s; a sampled battery 10/10 x9 and 9/10 x1. Not adopted on Flash-Next
+  (-2.6 %) or the agent (the greedy task flipped). The round trace
+  (`ARCINT_MTP_TRACE`) and `tools/mtp_width_replay.py` price a width rule
+  offline.
+- **Prefill slot loan** (`--llama-slot-loan MIB`, `--llama-loan-chunk N`,
+  default off; `docs/campaigns/prefill-slot-loan.md` on the `qfndev` branch): the expert cache lends its
+  tail layers' slots to a long prompt's compute buffers and gets them back
+  before decode. Flash-Next on the B60: prefill at 103,638 tokens 217.7 ->
+  347.9 t/s (+59.8 %), +18 to +19.5 % at 18.8k; KL inside the twin floor; no
+  margin to the card's total beyond an eviction guard.
+- Expert route trace (0069) and the per-card expert profile save (0070), opt-in
+  (`docs/campaigns/expert-foresight.md` on the `qfndev` branch).
+- 0071: int8 DPAS for the prompt's grouped expert GEMM on sub-group-16 devices,
+  opt-in (`GGML_OPENCL_KQ_MM_ID_I8`, off): 2.0x on IQ3_S and 1.3x on IQ4_NL in
+  test-backend-ops, +1.2 to +3.2 % served prefill on Flash-Next; not adopted
+  (argmax agreement -2.5 to -4.3 points against bit-identical fp16 twins); the
+  GEMMs it covers are 7-11 % of Flash-Next's prefill.
+- 0072: the OpenCL backend's launches use uniform work groups (each ragged
+  launch rounded up, the kernels bounded): the full test-backend-ops is identical
+  with and without it under the default driver on both cards (B60 12,724 /
+  12,881, A770 12,867 / 12,881, the same failure sets), and the runtime's LEO
+  mode (OpenCL on Level Zero, `EnableLEO=1`) no longer rejects them
+  (`docs/campaigns/vram-user-space.md` on the `qfndev` branch).
+- Tools: `tools/fn_sweep.py` --unit agent|coder|flashnext, --device, --reverse,
+  --no-mtp, --prompt-max; the KL tools mask the assistant's tokens
+  (`tools/capture_vs_capture.py --spans`, `tools/tokenize_turn.py`) and report the
+  twin floor's verdict.
+
+Unit changes, not defaults: the coder runs `--llama-mtp-policy cost` with the
+A770's seed; Flash-Next runs the slot loan (`--prefill-chunk 8192
+--llama-slot-loan 6400 --llama-loan-chunk 8192`).
+
+Runtime dependency unchanged: llama.cpp 3e4dfa8 with `contrib/llama.cpp/patches`
+0001-0072 (0031, 0055, 0061 dropped).
+
 ## 1.2.7 — 2026-10-30
 
 Faster decode on every unit and faster prefill on the coder; answers checked

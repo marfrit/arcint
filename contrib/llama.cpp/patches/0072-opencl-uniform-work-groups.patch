@@ -1,0 +1,3059 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl-uniform.h b/ggml/src/ggml-opencl/ggml-opencl-uniform.h
+new file mode 100644
+index 0000000..893a86c
+--- /dev/null
++++ b/ggml/src/ggml-opencl/ggml-opencl-uniform.h
+@@ -0,0 +1,69 @@
++// 0072: uniform work groups for the OpenCL backend.
++//
++// OpenCL 2.0+ lets a launch's global size be ragged (not a multiple of its
++// local size) as a non-uniform work group. The individual driver accepts that,
++// LEO (OpenCL over Level Zero, EnableLEO=1) does not: clEnqueueNDRangeKernel
++// returns CL_INVALID_WORK_GROUP_SIZE (-54) at the first ragged global size, and
++// every following launch of the op fails with it (the gate in
++// docs/campaigns/vram-user-space.md, stage 2a).
++//
++// The fix is one rounding rule for the whole backend: every dimension of the
++// global size is rounded up to the next multiple of its local size, so each
++// work-group is full, and the work-items of the rounded tail exit in the
++// kernel. Most kernels already carry the bound (an n/ne/n_blk argument they
++// check); the ones that did not got one in this patch. The rounding lives in
++// this one header, so the host launches and the device-free test share it.
++//
++// A launch whose global size is already a multiple (tile-derived grids, local
++// size 1) is unchanged by the rule: rounding is idempotent.
++//
++// Adreno builds round nothing: `GGML_OPENCL_USE_ADRENO_KERNELS` makes both
++// helpers return their input unchanged, so the 170 Adreno-only launches keep
++// the pin's ragged global sizes and the Adreno kernels need no bound of their
++// own (several decompose their axes by modulo, e.g. kernel_transpose_32). LEO
++// is not an Adreno driver: it exists in Intel's Level Zero OpenCL
++// implementation, which an Adreno device never runs through.
++#ifndef GGML_OPENCL_UNIFORM_H
++#define GGML_OPENCL_UNIFORM_H
++
++#include <stddef.h>
++
++// round one global dimension up to a whole number of local work-items
++#ifdef __cplusplus
++static inline
++#endif
++size_t ggml_cl_round_up_global(size_t global, size_t local) {
++#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
++    // 0072: the Adreno class stays ragged (see above)
++    (void) local;
++    return global;
++#else
++    if (local == 0) {
++        return global;
++    }
++    return ((global + local - 1) / local) * local;
++#endif
++}
++
++// round every dimension of a launch; local_work_size == NULL (the driver picks
++// it) is left alone, and so is a zero local dimension
++#ifdef __cplusplus
++static inline
++#endif
++void ggml_cl_round_up_global_work_size(size_t * global_work_size, const size_t * local_work_size, unsigned int work_dim) {
++#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
++    // 0072: the Adreno class stays ragged (see above)
++    (void) global_work_size;
++    (void) local_work_size;
++    (void) work_dim;
++#else
++    if (local_work_size == NULL) {
++        return;
++    }
++    for (unsigned int i = 0; i < work_dim; ++i) {
++        global_work_size[i] = ggml_cl_round_up_global(global_work_size[i], local_work_size[i]);
++    }
++#endif
++}
++
++#endif // GGML_OPENCL_UNIFORM_H
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 55467ec..e28e421 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -17,6 +17,8 @@
+ #include "ggml-opencl-miss-cpu.h"
+ // 0071: the int8 DPAS expert GEMM's dispatch rule, the same text the kernel gets
+ #include "kernels/kq_i8_ops.inc"
++// 0072: the uniform-work-group rounding rule, shared with the device-free test
++#include "ggml-opencl-uniform.h"
+ 
+ #ifdef GGML_OPENCL_USE_ADRENO_BIN_KERNELS
+ #include "libdl.h"
+@@ -755,7 +757,6 @@ struct ggml_backend_opencl_context {
+ 
+     int adreno_wave_size;
+ 
+-    cl_bool non_uniform_workgroups;
+     size_t  image_max_buffer_size;
+     size_t  image2d_max_width;
+     size_t  image2d_max_height;
+@@ -1426,6 +1427,10 @@ struct ggml_backend_opencl_context {
+                 return;
+             }
+         }
++        // 0072: a ragged global size is a non-uniform work group, which LEO
++        // rejects; round every dimension to a whole local size. The kernels'
++        // bounds make the rounded tail's work-items exit.
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, work_dim);
+ #ifdef GGML_OPENCL_PROFILING
+         cl_event evt;
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+@@ -8275,19 +8280,11 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
+     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(size_t), &backend_ctx->max_workgroup_size, NULL));
+     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_SVM_CAPABILITIES, sizeof(cl_device_svm_capabilities), &backend_ctx->svm_caps, 0));
+ 
+-    if (opencl_c_version.major >= 3) {
+-        // Assume it is not available for 3.0, since it is optional in 3.0.
+-        // If compiling against 3.0, then we can query.
+-        backend_ctx->non_uniform_workgroups = false;
+-#if CL_TARGET_OPENCL_VERSION >= 300
+-        CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_NON_UNIFORM_WORK_GROUP_SUPPORT, sizeof(cl_bool),
+-                                 &backend_ctx->non_uniform_workgroups, 0));
+-#endif
+-    } else {
+-        GGML_ASSERT(opencl_c_version.major == 2);
+-        // Non-uniform workgroup sizes is mandatory feature in v2.x.
+-        backend_ctx->non_uniform_workgroups = true;
+-    }
++    // 0072: CL_DEVICE_NON_UNIFORM_WORK_GROUP_SUPPORT is not queried and the
++    // field is gone with it: the individual driver reports it (whatever its
++    // value) and accepts ragged launches, LEO reports it and rejects them with
++    // -54 at the first ragged launch (the gate's first window), so every launch
++    // is made uniform instead of trusting the capability.
+ 
+ #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+     // Adreno xmem F16xF32 GEMM, default on adreno, opt out with GGML_OPENCL_ADRENO_XMEM_GEMM=0.
+@@ -8471,6 +8468,7 @@ static void transpose_2d(
+ 
+     size_t local_size[3] = {64, 1, 1};
+     size_t global_size[3] = {(size_t)stride, (size_t)rows, 1};;
++    ggml_cl_round_up_global_work_size(global_size, auto_local ? NULL : local_size, 3);
+     CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL,
+         global_size, auto_local ? NULL : local_size, 0, NULL, NULL));
+ 
+@@ -12383,14 +12381,17 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+ 
+         cl_kernel kernel = backend_ctx->kernel_convert_block_q1_0;
+ 
++        const cl_ulong n_blk = (cl_ulong)(ggml_nelements(tensor)/ggml_blck_size(tensor->type));
+         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &data_device));
+         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->q));
+         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->d));
++        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &n_blk));
+ 
+         size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
+         size_t local_work_size[] = {64, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+         CL_CHECK(clReleaseMemObject(data_device));
+@@ -12496,6 +12497,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+             size_t local_work_size[3] = {64, 2, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+             CL_CHECK(clReleaseMemObject(data_device));
+@@ -12527,14 +12529,17 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+ #else
+         cl_kernel kernel = backend_ctx->kernel_convert_block_q4_0;
+ #endif // GGML_OPENCL_USE_ADRENO_KERNELS
++        const cl_ulong n_blk = (cl_ulong)(ggml_nelements(tensor)/ggml_blck_size(tensor->type));
+         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &data_device));
+         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->q));
+         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->d));
++        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &n_blk));
+ 
+         size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
+         size_t local_work_size[] = {64, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+         CL_CHECK(clReleaseMemObject(data_device));
+@@ -12650,6 +12655,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+             size_t local_work_size[3] = {64, 2, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+             CL_CHECK(clReleaseMemObject(data_device));
+@@ -12679,15 +12685,18 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+ #else
+         cl_kernel kernel = backend_ctx->kernel_convert_block_q4_1;
+ #endif // GGML_OPENCL_USE_ADRENO_KERNELS
++        const cl_ulong n_blk = (cl_ulong)(ggml_nelements(tensor)/ggml_blck_size(tensor->type));
+         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &data_device));
+         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->q));
+         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->d));
+         CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &extra->m));
++        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_ulong), &n_blk));
+ 
+         size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
+         size_t local_work_size[] = {64, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+         CL_CHECK(clReleaseMemObject(data_device));
+@@ -12776,6 +12785,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+             size_t local_work_size[3] = {64, 2, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+             CL_CHECK(clReleaseMemObject(data_device));
+@@ -12811,6 +12821,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+                     size_t eg[3] = { (size_t)(((ne01 + 63) / 64) * 64), nb32, (size_t)ne02 };
+                     size_t el[3] = { 64, 1, 1 };
+                     cl_event evt;
++                    ggml_cl_round_up_global_work_size(eg, el, 3);
+                     CL_CHECK(clEnqueueNDRangeKernel(queue, ek, 3, NULL, eg, el, 0, NULL, &evt));
+                     CL_CHECK(clWaitForEvents(1, &evt));
+                 }
+@@ -12823,15 +12834,18 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+ #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+         if (use_adreno_kernels(backend_ctx, tensor)) {
+             cl_kernel kernel = backend_ctx->kernel_convert_block_q5_0_noshuffle;
++            const cl_ulong n_blk = (cl_ulong)(ggml_nelements(tensor)/ggml_blck_size(tensor->type));
+             CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &data_device));
+             CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->qs));
+             CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->qh));
+             CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &extra->d));
++            CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_ulong), &n_blk));
+ 
+             size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
+             size_t local_work_size[] = {64, 1, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+             CL_CHECK(clReleaseMemObject(data_device));
+@@ -12864,6 +12878,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+         size_t local_work_size[] = {64, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+         CL_CHECK(clReleaseMemObject(data_device));
+@@ -12948,6 +12963,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+             size_t local_work_size[3] = {64, 2, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+             CL_CHECK(clReleaseMemObject(data_device));
+@@ -12970,16 +12986,19 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+ #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+         if (use_adreno_kernels(backend_ctx, tensor)) {
+             cl_kernel kernel = backend_ctx->kernel_convert_block_q5_1_noshuffle;
++            const cl_ulong n_blk = (cl_ulong)(ggml_nelements(tensor)/ggml_blck_size(tensor->type));
+             CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &data_device));
+             CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->qs));
+             CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->qh));
+             CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &extra->d));
+             CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &extra->m));
++            CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_ulong), &n_blk));
+ 
+             size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
+             size_t local_work_size[] = {64, 1, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+             CL_CHECK(clReleaseMemObject(data_device));
+@@ -13015,6 +13034,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+         size_t local_work_size[] = {64, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+         CL_CHECK(clReleaseMemObject(data_device));
+@@ -13077,6 +13097,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+             size_t local_work_size[3] = {64, 2, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+             CL_CHECK(clReleaseMemObject(data_device));
+@@ -13099,14 +13120,17 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+ #endif // GGML_OPENCL_USE_ADRENO_KERNELS
+         cl_kernel kernel = backend_ctx->kernel_convert_block_mxfp4;
+ 
++        const cl_ulong n_blk = (cl_ulong)(ggml_nelements(tensor)/ggml_blck_size(tensor->type));
+         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &data_device));
+         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->q));
+         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->e));
++        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &n_blk));
+ 
+         size_t global_work_size[3] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
+         size_t local_work_size[3] = {64, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+         CL_CHECK(clReleaseMemObject(data_device));
+@@ -13168,14 +13192,17 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+ 
+         cl_kernel kernel = backend_ctx->kernel_convert_block_q8_0;
+ 
++        const cl_ulong n_blk = (cl_ulong)(ggml_nelements(tensor)/ggml_blck_size(tensor->type));
+         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &data_device));
+         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->q));
+         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->d));
++        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &n_blk));
+ 
+         size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
+         size_t local_work_size[] = {64, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+         CL_CHECK(clReleaseMemObject(data_device));
+@@ -13205,6 +13232,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+                 size_t eg[3] = { (size_t)(((ne01 + 63) / 64) * 64), nb32, (size_t)ne02 };
+                 size_t el[3] = { 64, 1, 1 };
+                 cl_event evt;
++                ggml_cl_round_up_global_work_size(eg, el, 3);
+                 CL_CHECK(clEnqueueNDRangeKernel(queue, ek, 3, NULL, eg, el, 0, NULL, &evt));
+                 CL_CHECK(clWaitForEvents(1, &evt));
+             }
+@@ -13265,6 +13293,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+         size_t local_work_size[] = {64, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+         CL_CHECK(clReleaseMemObject(data_device));
+@@ -13362,6 +13391,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+             size_t local_work_size[] = {64, 1, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+             CL_CHECK(clReleaseMemObject(data_device));
+@@ -13406,6 +13436,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+             size_t lws[] = {64, 1, 1};
+ 
+             cl_event tevt;
++            ggml_cl_round_up_global_work_size(gws, lws, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, tk, 3, NULL, gws, lws, 0, NULL, &tevt));
+             CL_CHECK(clWaitForEvents(1, &tevt));
+             CL_CHECK(clReleaseMemObject(data_device));
+@@ -13426,6 +13457,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+         cl_uchar mask_0F = 0x0F;
+         cl_uchar mask_F0 = 0xF0;
+ 
++        const cl_ulong n_blk = (cl_ulong)(ggml_nelements(tensor)/ggml_blck_size(tensor->type));
+         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &data_device));
+         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->q));
+         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->s));
+@@ -13433,11 +13465,13 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+         CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &extra->dm));
+         CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_uchar), &mask_0F));
+         CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_uchar), &mask_F0));
++        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_ulong), &n_blk));
+ 
+         size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
+         size_t local_work_size[] = {64, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+         CL_CHECK(clReleaseMemObject(data_device));
+@@ -13568,6 +13602,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+             size_t local_work_size[] = {64, 1, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+             CL_CHECK(clReleaseMemObject(data_device));
+@@ -13605,6 +13640,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+                     size_t eg[3] = { (size_t)(((ne01 + 63) / 64) * 64), (size_t)(ne00 / 256), (size_t)ne02 };
+                     size_t el[3] = { 64, 1, 1 };
+                     cl_event evt;
++                    ggml_cl_round_up_global_work_size(eg, el, 3);
+                     CL_CHECK(clEnqueueNDRangeKernel(queue, ek, 3, NULL, eg, el, 0, NULL, &evt));
+                     CL_CHECK(clWaitForEvents(1, &evt));
+                 }
+@@ -13626,6 +13662,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+         cl_uchar mask_0F = 0x0F;
+         cl_uchar mask_F0 = 0xF0;
+ 
++        const cl_ulong n_blk = (cl_ulong)(ggml_nelements(tensor)/ggml_blck_size(tensor->type));
+         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &data_device));
+         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &extra->q));
+         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra->qh));
+@@ -13634,11 +13671,13 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+         CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_mem),   &extra->dm));
+         CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_uchar), &mask_0F));
+         CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_uchar), &mask_F0));
++        CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_ulong), &n_blk));
+ 
+         size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
+         size_t local_work_size[] = {64, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+         CL_CHECK(clReleaseMemObject(data_device));
+@@ -13763,6 +13802,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+             size_t local_work_size[] = {64, 1, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+             CL_CHECK(clReleaseMemObject(data_device));
+@@ -13832,6 +13872,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+             size_t local_work_size[] = {64, 1, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+             CL_CHECK(clReleaseMemObject(data_device));
+@@ -13870,6 +13911,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+         size_t local_work_size[] = {64, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+         CL_CHECK(clReleaseMemObject(data_device));
+@@ -13954,6 +13996,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+         size_t local_work_size[] = { 64, 1, 1 };
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+         CL_CHECK(clReleaseMemObject(data_device));
+@@ -14034,6 +14077,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             size_t local_work_size[] = {1, 1, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+             CL_CHECK(clEnqueueReadBuffer(queue, buf_unpacked.buffer, CL_TRUE, offset, size, data, 0, NULL, NULL));
+@@ -14054,6 +14098,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+         size_t local_work_size[] = {1, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+         CL_CHECK(clEnqueueReadBuffer(queue, data_device, CL_TRUE, offset, size, data, 0, NULL, NULL));
+@@ -14100,6 +14145,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             size_t local_work_size[3] = {64, 2, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+                 global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+@@ -14148,6 +14194,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_uchar), &mask_0F));
+             CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_uchar), &mask_F0));
+ 
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, NULL));
+             CL_CHECK(clEnqueueReadBuffer(queue, buf_unpacked.buffer, CL_TRUE, offset, size, data, 0, NULL, NULL));
+             return;
+@@ -14166,6 +14213,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+         size_t local_work_size[] = {1, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+             global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+@@ -14198,6 +14246,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             size_t local_work_size[3] = {64, 2, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+                 global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+@@ -14247,6 +14296,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_uchar), &mask_0F));
+             CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_uchar), &mask_F0));
+ 
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, NULL));
+             CL_CHECK(clEnqueueReadBuffer(queue, buf_unpacked.buffer, CL_TRUE, offset, size, data, 0, NULL, NULL));
+             return;
+@@ -14266,6 +14316,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+         size_t local_work_size[] = {1, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+             global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+@@ -14300,6 +14351,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             size_t local_work_size[3] = {64, 2, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+                 global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+@@ -14347,6 +14399,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_uchar), &mask_0F));
+             CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_uchar), &mask_F0));
+ 
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, NULL));
+             CL_CHECK(clEnqueueReadBuffer(queue, buf_unpacked.buffer, CL_TRUE, offset, size, data, 0, NULL, NULL));
+             return;
+@@ -14368,6 +14421,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+         size_t local_work_size[] = {1, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+             global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+@@ -14403,6 +14457,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             size_t local_work_size[3] = {64, 2, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+                 global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+@@ -14456,6 +14511,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_uchar), &mask_0F));
+             CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_uchar), &mask_F0));
+ 
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, NULL));
+             CL_CHECK(clEnqueueReadBuffer(queue, buf_unpacked.buffer, CL_TRUE, offset, size, data, 0, NULL, NULL));
+             return;
+@@ -14477,6 +14533,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+         size_t local_work_size[] = {1, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+             global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+@@ -14509,6 +14566,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             size_t local_work_size[3] = {64, 2, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+                 global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+@@ -14529,6 +14587,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+         size_t local_work_size[] = {1, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+             global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+@@ -14574,6 +14633,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             size_t local_work_size[3] = {64, 1, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+                 global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+@@ -14594,6 +14654,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+         size_t local_work_size[] = {1, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+             global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+@@ -14647,6 +14708,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             size_t global_work_size[] = {(size_t)n_blk, 1, 1};
+             size_t local_work_size[] = {1, 1, 1};
+ 
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, NULL));
+             CL_CHECK(clEnqueueReadBuffer(queue, buf_unpacked.buffer, CL_TRUE, offset, size, data, 0, NULL, NULL));
+             return;
+@@ -14664,6 +14726,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+         size_t local_work_size[] = {1, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+             global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+@@ -14754,6 +14817,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             size_t local_work_size[] = {64, 1, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+                 global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+@@ -14804,6 +14868,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
+             size_t local_work_size[] = {1, 1, 1};
+ 
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+                 global_work_size, local_work_size, 0, NULL, NULL));
+             CL_CHECK(clEnqueueReadBuffer(queue, data_device, CL_TRUE, offset,
+@@ -14826,6 +14891,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+         size_t local_work_size[] = {1, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+             global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+@@ -14868,6 +14934,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             size_t local_work_size[] = {64, 1, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+                 global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+@@ -14926,6 +14993,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
+             size_t local_work_size[] = {1, 1, 1};
+ 
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+                 global_work_size, local_work_size, 0, NULL, NULL));
+             CL_CHECK(clEnqueueReadBuffer(queue, data_device, CL_TRUE, offset,
+@@ -14949,6 +15017,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+         size_t local_work_size[] = {1, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+             global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+@@ -15043,6 +15112,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             size_t local_work_size[] = {64, 1, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+                 global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+@@ -15107,6 +15177,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             size_t local_work_size[] = {1, 1, 1};
+ 
+             cl_event evt;
++            ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+             CL_CHECK(clWaitForEvents(1, &evt));
+             CL_CHECK(clEnqueueReadBuffer(queue, buf_unpacked.buffer, CL_TRUE, offset, size, data, 0, NULL, NULL));
+@@ -15133,6 +15204,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+         size_t local_work_size[] = {1, 1, 1};
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+             global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+@@ -15168,6 +15240,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+         size_t local_work_size[] = { 64, 1, 1 };
+ 
+         cl_event evt;
++        ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+         CL_CHECK(clWaitForEvents(1, &evt));
+         CL_CHECK(clReleaseEvent(evt));
+@@ -16041,6 +16114,7 @@ static void ggml_cl_miss_publish(ggml_backend_opencl_context * ctx, const ggml_t
+     CL_CHECK(clSetKernelArg(k, 8, sizeof(int),      &L.n_slots));
+     CL_CHECK(clSetKernelArg(k, 9, sizeof(int),      &n_cpu_max));
+     size_t gws[1] = { 256 }, lws[1] = { 256 };
++    ggml_cl_round_up_global_work_size(gws, lws, 1);
+     CL_CHECK(clEnqueueNDRangeKernel(ctx->queue, k, 1, nullptr, gws, lws, 0, nullptr, nullptr));
+     CL_CHECK(clFlush(ctx->queue));   // the publish must reach the card: the CPU spins on it
+     // the coordinator's job
+@@ -16073,6 +16147,7 @@ static void ggml_cl_miss_merge(ggml_backend_opencl_context * ctx, const ggml_ten
+     CL_CHECK(clSetKernelArg(k, 5, sizeof(int),      &n_embd));
+     CL_CHECK(clSetKernelArg(k, 6, sizeof(int),      &y_rows));
+     size_t gws[1] = { 256 }, lws[1] = { 256 };
++    ggml_cl_round_up_global_work_size(gws, lws, 1);
+     CL_CHECK(clEnqueueNDRangeKernel(ctx->queue, k, 1, nullptr, gws, lws, 0, nullptr, nullptr));
+ }
+ 
+@@ -17474,12 +17549,9 @@ static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const
+         size_t global_work_size[] = {(size_t)n, 1, 1};
+         size_t local_work_size[] = {64, 1, 1};
+ 
+-        size_t * local_work_size_ptr = local_work_size;
+-        if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
+-            local_work_size_ptr = nullptr;
+-        }
+-
+-        backend_ctx->enqueue_ndrange_kernel(kernel, 1, global_work_size, local_work_size_ptr, dst);
++        const int n_total = n;   // 0072: the launch's true count, the rounded tail exits at it
++        CL_CHECK(clSetKernelArg(kernel, (kernel == backend_ctx->kernel_add_row_f16) ? 9 : 7, sizeof(int), &n_total));
++        backend_ctx->enqueue_ndrange_kernel(kernel, 1, global_work_size, local_work_size, dst);
+     } else {
+         unsigned int nth = MIN(64, ne0);
+         size_t global_work_size[] = {(size_t)ne01*nth, (size_t)ne02, (size_t)ne03};
+@@ -17679,12 +17751,9 @@ static void ggml_cl_mul(ggml_backend_t backend, const ggml_tensor * src0, const
+         size_t global_work_size[] = {(size_t)n, 1, 1};
+         size_t local_work_size[] = {64, 1, 1};
+ 
+-        size_t * local_work_size_ptr = local_work_size;
+-        if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
+-            local_work_size_ptr = nullptr;  // Let driver choose the work-group sizes.
+-        }
+-
+-        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++        const int n_total = n;   // 0072: the launch's true count, the rounded tail exits at it
++        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int), &n_total));
++        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+     } else {
+         // Intel: 256 work-items a row (a 2048-wide single row, the coder's
+         // gated shared expert at decode, took 14.5 us at 64, measured-here)
+@@ -17808,6 +17877,8 @@ static void ggml_cl_div(ggml_backend_t backend, const ggml_tensor * src0, const
+         size_t global_work_size[] = {(size_t)n, 1, 1};
+         size_t local_work_size[] = {64, 1, 1};
+ 
++        const int n_total = n;   // 0072: the launch's true count, the rounded tail exits at it
++        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int), &n_total));
+         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+     } else {
+         unsigned int nth = MIN(64, ne0);
+@@ -17929,6 +18000,8 @@ static void ggml_cl_sub(ggml_backend_t backend, const ggml_tensor * src0, const
+         size_t global_work_size[] = {(size_t)n, 1, 1};
+         size_t local_work_size[] = {64, 1, 1};
+ 
++        const int n_total = n;   // 0072: the launch's true count, the rounded tail exits at it
++        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int), &n_total));
+         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+     } else {
+         unsigned int nth = MIN(64, ne0);
+@@ -17978,15 +18051,11 @@ static void ggml_cl_sqr(ggml_backend_t backend, const ggml_tensor * src0, const
+     CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
+     CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
+ 
++    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &n));
+     size_t global_work_size[] = {(size_t)n, 1, 1};
+     size_t local_work_size[] = {64, 1, 1};
+ 
+-    size_t * local_work_size_ptr = local_work_size;
+-    if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
+-        local_work_size_ptr = nullptr;
+-    }
+-
+-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+ }
+ 
+ static void ggml_cl_sqrt(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+@@ -18028,15 +18097,11 @@ static void ggml_cl_sqrt(ggml_backend_t backend, const ggml_tensor * src0, const
+     CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
+     CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
+ 
++    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &n));
+     size_t global_work_size[] = {(size_t)n, 1, 1};
+     size_t local_work_size[] = {64, 1, 1};
+ 
+-    size_t * local_work_size_ptr = local_work_size;
+-    if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
+-        local_work_size_ptr = nullptr;
+-    }
+-
+-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+ }
+ 
+ static void ggml_cl_mean(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+@@ -18301,16 +18366,12 @@ static void ggml_cl_ssm_conv_impl(ggml_backend_t backend, const ggml_tensor * sr
+     CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb1));
+     CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &nb2));
+     CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &act));
++    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &ne01));
+ 
+     size_t global_work_size[] = {(size_t)ne01, (size_t)ne1, (size_t)ne2};
+     size_t local_work_size[]  = {64, 1, 1};
+ 
+-    size_t * local_work_size_ptr = local_work_size;
+-    if (ne01 % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
+-        local_work_size_ptr = nullptr;
+-    }
+-
+-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, out);
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, out);
+ }
+ 
+ static void ggml_cl_gelu(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+@@ -18345,6 +18406,7 @@ static void ggml_cl_gelu(ggml_backend_t backend, const ggml_tensor * src0, const
+     CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
+     CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
+ 
++    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &n));
+     size_t global_work_size[] = {(size_t)n, 1, 1};
+     size_t local_work_size[] = {64, 1, 1};
+ 
+@@ -18383,6 +18445,7 @@ static void ggml_cl_gelu_erf(ggml_backend_t backend, const ggml_tensor * src0, c
+     CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
+     CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
+ 
++    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &n));
+     size_t global_work_size[] = {(size_t)n, 1, 1};
+     size_t local_work_size[] = {64, 1, 1};
+ 
+@@ -18421,6 +18484,7 @@ static void ggml_cl_gelu_quick(ggml_backend_t backend, const ggml_tensor * src0,
+     CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
+     CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
+ 
++    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &n));
+     size_t global_work_size[] = {(size_t)n, 1, 1};
+     size_t local_work_size[] = {64, 1, 1};
+ 
+@@ -18459,15 +18523,11 @@ static void ggml_cl_silu(ggml_backend_t backend, const ggml_tensor * src0, const
+     CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
+     CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
+ 
++    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &n));
+     size_t global_work_size[] = {(size_t)n, 1, 1};
+     size_t local_work_size[] = {64, 1, 1};
+ 
+-    size_t * local_work_size_ptr = local_work_size;
+-    if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
+-        local_work_size_ptr = nullptr;  // Let driver choose the work-group sizes.
+-    }
+-
+-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+ }
+ 
+ static void ggml_cl_relu(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+@@ -18495,15 +18555,12 @@ static void ggml_cl_relu(ggml_backend_t backend, const ggml_tensor * src0, const
+ 
+     const int64_t n = ggml_nelements(dst);
+ 
++    const int n_arg = (int) n;   // 0072: the launch's true count, the rounded tail exits at it
++    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &n_arg));
+     size_t global_work_size[] = {(size_t)n, 1, 1};
+     size_t local_work_size[] = {64, 1, 1};
+ 
+-    size_t * local_work_size_ptr = local_work_size;
+-    if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
+-        local_work_size_ptr = nullptr;  // Let driver choose the work-group sizes.
+-    }
+-
+-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+ }
+ 
+ static void ggml_cl_sigmoid(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+@@ -18541,15 +18598,12 @@ static void ggml_cl_sigmoid(ggml_backend_t backend, const ggml_tensor * src0, co
+ 
+     const int64_t n = ggml_nelements(dst);
+ 
++    const int n_arg = (int) n;   // 0072: the launch's true count, the rounded tail exits at it
++    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &n_arg));
+     size_t global_work_size[] = {(size_t)n, 1, 1};
+     size_t local_work_size[] = {64, 1, 1};
+ 
+-    size_t * local_work_size_ptr = local_work_size;
+-    if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
+-        local_work_size_ptr = nullptr;  // Let driver choose the work-group sizes.
+-    }
+-
+-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+ }
+ 
+ static void ggml_cl_tri(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+@@ -18700,15 +18754,13 @@ static void ggml_cl_clamp(ggml_backend_t backend, const ggml_tensor * src0, cons
+ 
+     const int64_t n = ggml_nelements(dst);
+ 
++    const int n_arg = (int) n;   // 0072: the launch's true count, the rounded tail exits at it
++    CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int), &n_arg));
++
+     size_t global_work_size[] = {(size_t)n, 1, 1};
+     size_t local_work_size[] = {64, 1, 1};
+ 
+-    size_t * local_work_size_ptr = local_work_size;
+-    if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
+-        local_work_size_ptr = nullptr;  // Let driver choose the work-group sizes.
+-    }
+-
+-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+ }
+ 
+ static void ggml_cl_norm(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+@@ -19254,15 +19306,11 @@ static void ggml_cl_tanh(ggml_backend_t backend, const ggml_tensor * src0, const
+         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
+         CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
+ 
++        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &n));
+         size_t global_work_size[] = {(size_t)n, 1, 1};
+         size_t local_work_size[] = {64, 1, 1};
+ 
+-        size_t * local_work_size_ptr = local_work_size;
+-        if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
+-            local_work_size_ptr = nullptr;
+-        }
+-
+-        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+     } else {
+         // Handle non-contiguous input
+         if (src0->type == GGML_TYPE_F32) {
+@@ -19514,15 +19562,11 @@ static void ggml_cl_expm1(ggml_backend_t backend, const ggml_tensor * src0, cons
+         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
+         CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
+ 
++        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &n));
+         size_t global_work_size[] = {(size_t)n, 1, 1};
+         size_t local_work_size[] = {64, 1, 1};
+ 
+-        size_t * local_work_size_ptr = local_work_size;
+-        if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
+-            local_work_size_ptr = nullptr;
+-        }
+-
+-        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+     } else {
+         // Handle non-contiguous input
+         if (src0->type == GGML_TYPE_F32) {
+@@ -19610,15 +19654,11 @@ static void ggml_cl_abs(ggml_backend_t backend, const ggml_tensor * src0, const
+         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
+         CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
+ 
++        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &n));
+         size_t global_work_size[] = {(size_t)n, 1, 1};
+         size_t local_work_size[] = {64, 1, 1};
+ 
+-        size_t * local_work_size_ptr = local_work_size;
+-        if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
+-            local_work_size_ptr = nullptr;
+-        }
+-
+-        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+     } else {
+         // Handle non-contiguous input
+         if (src0->type == GGML_TYPE_F32) {
+@@ -19690,13 +19730,10 @@ static void ggml_cl_unary_ext(ggml_backend_t backend, const ggml_tensor * src0,
+         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
+         CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
+ 
++        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &n));
+         size_t global_work_size[] = {(size_t)n, 1, 1};
+         size_t local_work_size[]  = {64, 1, 1};
+-        size_t * local_work_size_ptr = local_work_size;
+-        if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
+-            local_work_size_ptr = nullptr;
+-        }
+-        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+     } else {
+         kernel = is_f16 ? k_f16_nc : k_f32_nc;
+ 
+@@ -19785,13 +19822,10 @@ static void ggml_cl_leaky_relu(ggml_backend_t backend, const ggml_tensor * src0,
+         CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
+         CL_CHECK(clSetKernelArg(kernel, 4, sizeof(float),    &slope));
+ 
++        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int), &n));
+         size_t global_work_size[] = {(size_t)n, 1, 1};
+         size_t local_work_size[]  = {64, 1, 1};
+-        size_t * local_work_size_ptr = local_work_size;
+-        if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
+-            local_work_size_ptr = nullptr;
+-        }
+-        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+     } else {
+         kernel = is_f16 ? backend_ctx->kernel_leaky_relu_f16_nc : backend_ctx->kernel_leaky_relu_f32_nc;
+ 
+@@ -19877,15 +19911,11 @@ static void ggml_cl_softplus(ggml_backend_t backend, const ggml_tensor * src0, c
+         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
+         CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
+ 
++        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &n));
+         size_t global_work_size[] = {(size_t)n, 1, 1};
+         size_t local_work_size[] = {64, 1, 1};
+ 
+-        size_t * local_work_size_ptr = local_work_size;
+-        if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
+-            local_work_size_ptr = nullptr;
+-        }
+-
+-        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+     } else {
+         // Handle non-contiguous input
+         if (src0->type == GGML_TYPE_F32) {
+@@ -20069,12 +20099,7 @@ static void ggml_cl_pad(ggml_backend_t backend, const ggml_tensor * src0, ggml_t
+     size_t global_work_size[] = { gws0, (size_t)d_ne1, (size_t)d_ne2*d_ne3 };
+     size_t local_work_size[]  = { lws0, 1, 1 };
+ 
+-    size_t * local_work_size_ptr = local_work_size;
+-    if (d_ne0 % lws0 != 0 && !backend_ctx->non_uniform_workgroups) {
+-        local_work_size_ptr = nullptr;
+-    }
+-
+-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+ }
+ 
+ static void ggml_cl_upscale(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst) {
+@@ -20183,12 +20208,7 @@ static void ggml_cl_upscale(ggml_backend_t backend, const ggml_tensor * src0, gg
+     size_t local_work_size_pref = 256;
+     size_t local_work_size[] = { MIN(local_work_size_pref, dst_total_elements), 1, 1};
+ 
+-    size_t * local_work_size_ptr = local_work_size;
+-    if (dst_total_elements % local_work_size[0] != 0 && !backend_ctx->non_uniform_workgroups) {
+-        local_work_size_ptr = nullptr;
+-    }
+-
+-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+ }
+ 
+ static void ggml_cl_concat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+@@ -20549,6 +20569,7 @@ static bool ggml_cl_flash_attn_reconstruct_aos(
+     const size_t n_blocks = (size_t) ggml_nelements(soa_src) / ggml_blck_size(soa_src->type);
+     size_t global_work_size[] = { n_blocks, 1, 1 };
+     size_t local_work_size[]  = { 1, 1, 1 };
++    ggml_cl_round_up_global_work_size(global_work_size, local_work_size, 3);
+     CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL,
+                                     global_work_size, local_work_size, 0, NULL, NULL));
+ 
+@@ -27739,6 +27760,7 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
+             CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_int), &p_ne01));
+             size_t gws[] = { (size_t)(((p_ne01 + 63) / 64) * 64), 1, 1 };
+             size_t lws[] = { 64, 1, 1 };
++            ggml_cl_round_up_global_work_size(gws, lws, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL, gws, lws, 0, NULL, NULL));
+             restored = true;
+         } else if (tensor->type == GGML_TYPE_Q4_0 &&
+@@ -27763,6 +27785,7 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
+             const size_t n_blk = parent_nbytes / block_bytes;
+             size_t gws[] = { n_blk, 1, 1 };
+             size_t lws[] = { 1, 1, 1 };
++            ggml_cl_round_up_global_work_size(gws, lws, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL, gws, lws, 0, NULL, NULL));
+ 
+             CL_CHECK(clReleaseMemObject(buf_tq));
+@@ -27792,6 +27815,7 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
+             const size_t n_blocks = parent_nbytes / block_bytes;
+             size_t gws_rec[] = { n_blocks, 1, 1 };
+             size_t lws_rec[] = { 1, 1, 1 };
++            ggml_cl_round_up_global_work_size(gws_rec, lws_rec, 3);
+             CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL, gws_rec, lws_rec, 0, NULL, NULL));
+         }
+ 
+@@ -27866,6 +27890,7 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
+ 
+     size_t gws[3] = { (size_t) nblk0, (size_t) ne1_, (size_t) (ne2_ * ne3_) };
+     size_t lws[3] = { 1, 1, 1 };
++    ggml_cl_round_up_global_work_size(gws, lws, 3);
+     CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, dq_kernel, 3, NULL, gws, lws, 0, NULL, NULL));
+ 
+     // release the reconstructed aos if
+@@ -34058,15 +34083,11 @@ static void ggml_cl_scale(ggml_backend_t backend, const ggml_tensor * src0, cons
+     CL_CHECK(clSetKernelArg(kernel, 4, sizeof(float),    &scale));
+     CL_CHECK(clSetKernelArg(kernel, 5, sizeof(float),    &bias));
+ 
++    CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int), &n));
+     size_t global_work_size[] = {(size_t)n, 1, 1};
+     size_t local_work_size[] = {64, 1, 1};
+ 
+-    size_t * local_work_size_ptr = local_work_size;
+-    if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
+-        local_work_size_ptr = nullptr;  // Let driver choose the work-group sizes.
+-    }
+-
+-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+ }
+ 
+ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+@@ -34377,6 +34398,8 @@ static void ggml_cl_diag_mask_inf(ggml_backend_t backend, const ggml_tensor * sr
+         CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int),      &ne00));
+         CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int),      &ne01));
+         CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int),      &n_past));
++        const int n_f4 = ne00 * ne01 * ne02 / 4;   // 0072: float4 units, the _8 kernel writes two per item
++        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int),      &n_f4));
+ 
+         size_t global_work_size[] = {(size_t)ne00*ne01*ne02/8, 1, 1};
+         size_t local_work_size[] = {64, 1, 1};
+@@ -34396,12 +34419,7 @@ static void ggml_cl_diag_mask_inf(ggml_backend_t backend, const ggml_tensor * sr
+         size_t global_work_size[] = {(size_t)ne00, (size_t)ne01, (size_t)ne02};
+         size_t local_work_size[] = {64, 1, 1};
+ 
+-        size_t * local_work_size_ptr = local_work_size;
+-        if (ne00 % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
+-            local_work_size_ptr = nullptr;  // Let driver choose the work-group sizes.
+-        }
+-
+-        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+     }
+ }
+ 
+@@ -34895,6 +34913,10 @@ static void ggml_cl_solve_tri(ggml_backend_t backend, const ggml_tensor * src0,
+     CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong),&nb1));
+     CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_ulong),&nb2));
+     CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_ulong),&nb3));
++    const int ne2_h = (int) dst->ne[2];
++    const int ne3_h = (int) dst->ne[3];
++    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &ne2_h));
++    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(int),      &ne3_h));
+ 
+     size_t global_work_size[3]= { (size_t)k, (size_t)dst->ne[2], (size_t)dst->ne[3]};
+     size_t local_work_size[] = {16, 4, 1};
+diff --git a/ggml/src/ggml-opencl/kernels/abs.cl b/ggml/src/ggml-opencl/kernels/abs.cl
+index 96e952c..daae835 100644
+--- a/ggml/src/ggml-opencl/kernels/abs.cl
++++ b/ggml/src/ggml-opencl/kernels/abs.cl
+@@ -8,8 +8,14 @@ kernel void kernel_abs_f32(
+         global const float * src0,
+         ulong                offset0,
+         global       float * dst,
+-        ulong                offsetd
++        ulong                offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float*)((global char*)src0 + offset0);
+     dst  = (global float*)((global char*)dst + offsetd);
+ 
+@@ -20,8 +26,14 @@ kernel void kernel_abs_f32_4(
+         global const float4 * src0,
+         ulong                 offset0,
+         global       float4 * dst,
+-        ulong                 offsetd
++        ulong                 offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float4*)((global char*)src0 + offset0);
+     dst  = (global float4*)((global char*)dst + offsetd);
+ 
+@@ -32,8 +44,14 @@ kernel void kernel_abs_f16(
+         global const half * src0,
+         ulong               offset0,
+         global       half * dst,
+-        ulong               offsetd
++        ulong               offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global half*)((global char*)src0 + offset0);
+     dst  = (global half*)((global char*)dst + offsetd);
+ 
+@@ -44,8 +62,14 @@ kernel void kernel_abs_f16_4(
+         global const half4 * src0,
+         ulong                offset0,
+         global       half4 * dst,
+-        ulong                offsetd
++        ulong                offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global half4*)((global char*)src0 + offset0);
+     dst  = (global half4*)((global char*)dst + offsetd);
+ 
+diff --git a/ggml/src/ggml-opencl/kernels/add.cl b/ggml/src/ggml-opencl/kernels/add.cl
+index 509bf17..4d6af3c 100644
+--- a/ggml/src/ggml-opencl/kernels/add.cl
++++ b/ggml/src/ggml-opencl/kernels/add.cl
+@@ -70,7 +70,8 @@ kernel void kernel_add_row(
+         ulong  offset1,
+         global float4 * dst,
+         ulong  offsetd,
+-        int ne
++        int ne,
++        int n_total
+ ) {
+     src0 = (global float4*)((global char*)src0 + offset0);
+     src1 = (global float4*)((global char*)src1 + offset1);
+@@ -78,6 +79,9 @@ kernel void kernel_add_row(
+ 
+     // This performs better than using %.
+     uint gid = get_global_id(0);
++    if (gid >= (uint) n_total) {   // 0072: exit the rounded uniform launch's tail
++        return;
++    }
+     uint idx1 = gid - (gid/ne)*ne; // get_global_id(0) % ne
+     dst[gid] = src0[gid] + src1[idx1];
+ }
+@@ -161,12 +165,16 @@ kernel void kernel_add_row_f16(
+         ulong  offsetd,
+         int ne,
+         int type_src0,
+-        int type_src1
++        int type_src1,
++        int n_total
+ ) {
+     dst = (global half4*)((global char*)dst + offsetd);
+ 
+     // This performs better than using %.
+     uint gid = get_global_id(0);
++    if (gid >= (uint) n_total) {   // 0072: exit the rounded uniform launch's tail
++        return;
++    }
+     uint idx1 = gid - (gid/ne)*ne; // get_global_id(0) % ne
+ 
+     half4 v0, v1;
+diff --git a/ggml/src/ggml-opencl/kernels/clamp.cl b/ggml/src/ggml-opencl/kernels/clamp.cl
+index 366a068..7374838 100644
+--- a/ggml/src/ggml-opencl/kernels/clamp.cl
++++ b/ggml/src/ggml-opencl/kernels/clamp.cl
+@@ -9,8 +9,14 @@ kernel void kernel_clamp(
+         global float * dst,
+         ulong offsetd,
+         float min,
+-        float max
++        float max,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float*)((global char*)src0 + offset0);
+     dst = (global float*)((global char*)dst + offsetd);
+ 
+diff --git a/ggml/src/ggml-opencl/kernels/cvt.cl b/ggml/src/ggml-opencl/kernels/cvt.cl
+index acc8f98..8d97c68 100644
+--- a/ggml/src/ggml-opencl/kernels/cvt.cl
++++ b/ggml/src/ggml-opencl/kernels/cvt.cl
+@@ -177,8 +177,13 @@ kernel void kernel_convert_f16_to_bf16(
+ kernel void kernel_convert_block_q1_0(
+     global block_q1_0 * src0,
+     global uchar * dst_q,
+-    global half  * dst_d
++    global half  * dst_d,
++    ulong n_blk
+ ) {
++    // 0072: bound for the uniform launch's rounded tail
++    if (get_global_id(0) >= n_blk) {
++        return;
++    }
+     global block_q1_0 * b = (global block_q1_0 *) src0 + get_global_id(0);
+     global uchar      * q = (global uchar *) dst_q + (QK1_0/8)*get_global_id(0);
+     global half       * d = (global half *) dst_d + get_global_id(0);
+@@ -213,8 +218,12 @@ kernel void kernel_restore_block_q1_0(
+ kernel void kernel_convert_block_q4_0(
+     global struct block_q4_0 * src0,
+     global uchar * dst_q,
+-    global half  * dst_d
++    global half  * dst_d,
++    ulong n_blk
+ ) {
++    if (get_global_id(0) >= n_blk) {
++        return;
++    }
+     global struct block_q4_0 * b = (global struct block_q4_0 *) src0 + get_global_id(0);
+     global uchar * q = (global uchar *) dst_q + QK4_0/2*get_global_id(0);
+     global half  * d = (global half *) dst_d + get_global_id(0);
+@@ -249,8 +258,12 @@ kernel void kernel_restore_block_q4_0(
+ kernel void kernel_convert_block_q4_0_noshuffle(
+     global struct block_q4_0 * src0,
+     global uchar * dst_q,
+-    global half  * dst_d
++    global half  * dst_d,
++    ulong n_blk
+ ) {
++    if (get_global_id(0) >= n_blk) {
++        return;
++    }
+     global struct block_q4_0 * b = (global struct block_q4_0 *) src0 + get_global_id(0);
+     global uchar * q = (global uchar *) dst_q + QK4_0/2*get_global_id(0);
+     global half  * d = (global half *) dst_d + get_global_id(0);
+@@ -400,8 +413,12 @@ kernel void kernel_convert_block_q4_1(
+     global struct block_q4_1 * src0,
+     global uchar * dst_q,
+     global half  * dst_d,
+-    global half  * dst_m
++    global half  * dst_m,
++    ulong n_blk
+ ) {
++    if (get_global_id(0) >= n_blk) {
++        return;
++    }
+     global struct block_q4_1 * b = (global struct block_q4_1 *) src0 + get_global_id(0);
+     global uchar * q = (global uchar *) dst_q + QK4_1/2*get_global_id(0);
+     global half  * d = (global half *) dst_d + get_global_id(0);
+@@ -437,8 +454,12 @@ kernel void kernel_convert_block_q4_1_noshuffle(
+     global struct block_q4_1 * src0,
+     global uchar * dst_q,
+     global half  * dst_d,
+-    global half  * dst_m
++    global half  * dst_m,
++    ulong n_blk
+ ) {
++    if (get_global_id(0) >= n_blk) {
++        return;
++    }
+     global struct block_q4_1 * b = (global struct block_q4_1 *) src0 + get_global_id(0);
+     global uchar * q = (global uchar *) dst_q + QK4_1/2*get_global_id(0);
+     global half  * d = (global half *) dst_d + get_global_id(0);
+@@ -634,8 +655,12 @@ kernel void kernel_convert_block_q5_0_noshuffle(
+     global struct block_q5_0 * src0,
+     global uchar * dst_q,
+     global uint  * dst_qh,
+-    global half  * dst_d
++    global half  * dst_d,
++    ulong n_blk
+ ) {
++    if (get_global_id(0) >= n_blk) {
++        return;
++    }
+     global struct block_q5_0 * b = (global struct block_q5_0 *) src0 + get_global_id(0);
+     global uchar * q  = (global uchar *) dst_q + QK5_0/2*get_global_id(0);
+     global uint  * qh = (global uint  *) dst_qh + get_global_id(0);
+@@ -841,8 +866,12 @@ kernel void kernel_convert_block_q5_1_noshuffle(
+     global uchar * dst_q,
+     global uint  * dst_qh,
+     global half  * dst_d,
+-    global half  * dst_m
++    global half  * dst_m,
++    ulong n_blk
+ ) {
++    if (get_global_id(0) >= n_blk) {
++        return;
++    }
+     global struct block_q5_1 * b = (global struct block_q5_1 *) src0 + get_global_id(0);
+     global uchar * q  = (global uchar *) dst_q + QK5_1/2*get_global_id(0);
+     global uint  * qh = (global uint  *) dst_qh + get_global_id(0);
+@@ -1496,8 +1525,12 @@ struct block_mxfp4 {
+ kernel void kernel_convert_block_mxfp4(
+     global struct block_mxfp4 * src0,
+     global uchar * dst_q,
+-    global uchar * dst_e
++    global uchar * dst_e,
++    ulong n_blk
+ ) {
++    if (get_global_id(0) >= n_blk) {
++        return;
++    }
+     global struct block_mxfp4 * b = (global struct block_mxfp4 *) src0 + get_global_id(0);
+     global uchar * q = (global uchar *) dst_q + QK_MXFP4 / 2 * get_global_id(0);
+     global uchar * e = (global uchar *) dst_e + get_global_id(0);
+@@ -1771,8 +1804,13 @@ typedef struct {
+ kernel void kernel_convert_block_q8_0(
+     global block_q8_0 * src0,
+     global uchar * dst_q,
+-    global half  * dst_d
++    global half  * dst_d,
++    ulong n_blk
+ ) {
++    // 0072: the q8_0 convert the LEO gate aborted at (n_blocks against local 64)
++    if (get_global_id(0) >= n_blk) {
++        return;
++    }
+     global block_q8_0 * b = (global block_q8_0 *) src0 + get_global_id(0);
+     global uchar      * q = (global uchar *) dst_q + QK8_0*get_global_id(0);
+     global half       * d = (global half *) dst_d + get_global_id(0);
+@@ -1997,8 +2035,12 @@ kernel void kernel_convert_block_q4_K(
+     global half  * dst_d,
+     global half  * dst_dm,
+     uchar mask_0F,
+-    uchar mask_F0
++    uchar mask_F0,
++    ulong n_blk
+ ) {
++    if (get_global_id(0) >= n_blk) {
++        return;
++    }
+     global struct block_q4_K * b = (global struct block_q4_K *) src0 + get_global_id(0);
+     global uchar * q  = (global uchar *) dst_q  + QK_K/2*get_global_id(0);
+     global uchar * s  = (global uchar *) dst_s  + K_SCALE_SIZE*get_global_id(0);
+@@ -2052,8 +2094,12 @@ kernel void kernel_convert_block_q4_K_noshuffle(
+     global half  * dst_d,
+     global half  * dst_dm,
+     uchar mask_0F,
+-    uchar mask_F0
++    uchar mask_F0,
++    ulong n_blk
+ ) {
++    if (get_global_id(0) >= n_blk) {
++        return;
++    }
+     global struct block_q4_K * b = (global struct block_q4_K *) src0 + get_global_id(0);
+     global uchar * q  = (global uchar *) dst_q  + QK_K/2 * get_global_id(0);
+     global uchar * s  = (global uchar *) dst_s  + K_SCALE_SIZE * get_global_id(0);
+@@ -2122,8 +2168,12 @@ kernel void kernel_convert_block_q5_K(
+     global half  * dst_d,
+     global half  * dst_dm,
+     uchar mask_0F,
+-    uchar mask_F0
++    uchar mask_F0,
++    ulong n_blk
+ ) {
++    if (get_global_id(0) >= n_blk) {
++        return;
++    }
+     global struct block_q5_K * b  = (global struct block_q5_K *) src0 + get_global_id(0);
+     global uchar * q  = (global uchar *) dst_q  + QK_K/2*get_global_id(0);
+     global uchar * qh = (global uchar *) dst_qh + QK_K/8*get_global_id(0);
+@@ -2186,8 +2236,12 @@ kernel void kernel_convert_block_q5_K_noshuffle(
+     global half  * dst_d,
+     global half  * dst_dm,
+     uchar mask_0F,
+-    uchar mask_F0
++    uchar mask_F0,
++    ulong n_blk
+ ) {
++    if (get_global_id(0) >= n_blk) {
++        return;
++    }
+     global struct block_q5_K * b  = (global struct block_q5_K *) src0 + get_global_id(0);
+     global uchar * q  = (global uchar *) dst_q  + QK_K/2       * get_global_id(0);
+     global uchar * qh = (global uchar *) dst_qh + QK_K/8       * get_global_id(0);
+diff --git a/ggml/src/ggml-opencl/kernels/diag_mask_inf.cl b/ggml/src/ggml-opencl/kernels/diag_mask_inf.cl
+index 36eff04..fe26c27 100644
+--- a/ggml/src/ggml-opencl/kernels/diag_mask_inf.cl
++++ b/ggml/src/ggml-opencl/kernels/diag_mask_inf.cl
+@@ -19,6 +19,10 @@ kernel void kernel_diag_mask_inf(
+     int i01 = get_global_id(1);
+     int i00 = get_global_id(0);
+ 
++    if (i00 >= ne00) {   // 0072: exit the rounded uniform launch's tail
++        return;
++    }
++
+     if (i00 > n_past + i01) {
+         dst[i02*ne01*ne00 + i01*ne00 + i00] = -INFINITY;
+     } else {
+@@ -33,12 +37,16 @@ kernel void kernel_diag_mask_inf_8(
+         ulong offsetd,
+         int ne00,
+         int ne01,
+-        int n_past
++        int n_past,
++        int n_f4     // 0072: float4 units in the tensor (the launch's true count)
+ ) {
+     src0 = (global float4*)((global char*)src0 + offset0);
+     dst = (global float4*)((global char*)dst + offsetd);
+ 
+     int i = 2*get_global_id(0);
++    if (i + 1 >= n_f4) {   // 0072: this item writes two float4; exit the tail
++        return;
++    }
+ 
+     dst[i+0] = src0[i+0];
+     dst[i+1] = src0[i+1];
+diff --git a/ggml/src/ggml-opencl/kernels/div.cl b/ggml/src/ggml-opencl/kernels/div.cl
+index 6d9b4ad..0e64dcb 100644
+--- a/ggml/src/ggml-opencl/kernels/div.cl
++++ b/ggml/src/ggml-opencl/kernels/div.cl
+@@ -59,7 +59,8 @@ kernel void kernel_div_row(
+         ulong offset1,
+         global float4 * dst,
+         ulong offsetd,
+-        int ne
++        int ne,
++        int n_total
+ ) {
+     src0 = (global float4*)((global char*)src0 + offset0);
+     src1 = (global float4*)((global char*)src1 + offset1);
+@@ -67,6 +68,9 @@ kernel void kernel_div_row(
+ 
+     // This performs better than using %.
+     uint gid = get_global_id(0);
++    if (gid >= (uint) n_total) {   // 0072: exit the rounded uniform launch's tail
++        return;
++    }
+     uint idx1 = gid - (gid/ne)*ne; // get_global_id(0) % ne
+     dst[gid] = src0[gid] / src1[idx1];
+ }
+@@ -125,7 +129,8 @@ kernel void kernel_div_row_f16(
+         ulong offset1,
+         global half4 * dst,
+         ulong offsetd,
+-        int ne
++        int ne,
++        int n_total
+ ) {
+     src0 = (global half4*)((global char*)src0 + offset0);
+     src1 = (global half4*)((global char*)src1 + offset1);
+@@ -133,6 +138,9 @@ kernel void kernel_div_row_f16(
+ 
+     // This performs better than using %.
+     uint gid = get_global_id(0);
++    if (gid >= (uint) n_total) {   // 0072: exit the rounded uniform launch's tail
++        return;
++    }
+     uint idx1 = gid - (gid/ne)*ne; // get_global_id(0) % ne
+     dst[gid] = src0[gid] / src1[idx1];
+ }
+diff --git a/ggml/src/ggml-opencl/kernels/expm1.cl b/ggml/src/ggml-opencl/kernels/expm1.cl
+index 05442ac..6b19714 100644
+--- a/ggml/src/ggml-opencl/kernels/expm1.cl
++++ b/ggml/src/ggml-opencl/kernels/expm1.cl
+@@ -8,8 +8,14 @@ kernel void kernel_expm1_f32(
+         global const float * src0,
+         ulong                offset0,
+         global       float * dst,
+-        ulong                offsetd
++        ulong                offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float*)((global char*)src0 + offset0);
+     dst  = (global float*)((global char*)dst + offsetd);
+ 
+@@ -20,8 +26,14 @@ kernel void kernel_expm1_f32_4(
+         global const float4 * src0,
+         ulong                 offset0,
+         global       float4 * dst,
+-        ulong                 offsetd
++        ulong                 offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float4*)((global char*)src0 + offset0);
+     dst  = (global float4*)((global char*)dst + offsetd);
+ 
+@@ -32,8 +44,14 @@ kernel void kernel_expm1_f16(
+         global const half * src0,
+         ulong               offset0,
+         global       half * dst,
+-        ulong               offsetd
++        ulong               offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global half*)((global char*)src0 + offset0);
+     dst  = (global half*)((global char*)dst + offsetd);
+ 
+@@ -44,8 +62,14 @@ kernel void kernel_expm1_f16_4(
+         global const half4 * src0,
+         ulong                offset0,
+         global       half4 * dst,
+-        ulong                offsetd
++        ulong                offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global half4*)((global char*)src0 + offset0);
+     dst  = (global half4*)((global char*)dst + offsetd);
+ 
+diff --git a/ggml/src/ggml-opencl/kernels/gelu.cl b/ggml/src/ggml-opencl/kernels/gelu.cl
+index 1ab426c..1b9e69d 100644
+--- a/ggml/src/ggml-opencl/kernels/gelu.cl
++++ b/ggml/src/ggml-opencl/kernels/gelu.cl
+@@ -12,8 +12,14 @@ kernel void kernel_gelu(
+     global float * src0,
+     ulong offset0,
+     global float * dst,
+-    ulong offsetd
++    ulong offsetd,
++    int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float*)((global char*)src0 + offset0);
+     dst = (global float*)((global char*)dst + offsetd);
+ 
+@@ -26,8 +32,14 @@ kernel void kernel_gelu_4(
+     global float4 * src0,
+     ulong offset0,
+     global float4 * dst,
+-    ulong offsetd
++    ulong offsetd,
++    int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float4*)((global char*)src0 + offset0);
+     dst = (global float4*)((global char*)dst + offsetd);
+ 
+@@ -40,8 +52,14 @@ kernel void kernel_gelu_erf(
+     global float * src0,
+     ulong offset0,
+     global float * dst,
+-    ulong offsetd
++    ulong offsetd,
++    int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float*)((global char*)src0 + offset0);
+     dst = (global float*)((global char*)dst + offsetd);
+ 
+@@ -53,8 +71,14 @@ kernel void kernel_gelu_erf_4(
+     global float4 * src0,
+     ulong offset0,
+     global float4 * dst,
+-    ulong offsetd
++    ulong offsetd,
++    int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float4*)((global char*)src0 + offset0);
+     dst = (global float4*)((global char*)dst + offsetd);
+ 
+@@ -66,8 +90,14 @@ kernel void kernel_gelu_quick(
+     global float * src0,
+     ulong offset0,
+     global float * dst,
+-    ulong offsetd
++    ulong offsetd,
++    int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float*)((global char*)src0 + offset0);
+     dst = (global float*)((global char*)dst + offsetd);
+ 
+@@ -79,8 +109,14 @@ kernel void kernel_gelu_quick_4(
+     global float4 * src0,
+     ulong offset0,
+     global float4 * dst,
+-    ulong offsetd
++    ulong offsetd,
++    int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float4*)((global char*)src0 + offset0);
+     dst = (global float4*)((global char*)dst + offsetd);
+ 
+diff --git a/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q4_k_f32_32b_trans.cl b/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q4_k_f32_32b_trans.cl
+index 2dbd943..0478e20 100644
+--- a/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q4_k_f32_32b_trans.cl
++++ b/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q4_k_f32_32b_trans.cl
+@@ -49,6 +49,9 @@ __kernel void gemv_noshuffle_q4_k_f32_32b_trans(
+     int                     ne01
+ ) {
+     uint i01  = get_global_id(0);
++    // 0072: the launch rounds ne01 up to a multiple of 64; clamp the
++    // tail's index for the loads and keep every lane in the collectives
++    uint i01c = min(i01, (uint) ne01 - 1);
+     uint sgid = get_local_id(1);
+     uint slid = get_sub_group_local_id();
+ 
+@@ -62,11 +65,11 @@ __kernel void gemv_noshuffle_q4_k_f32_32b_trans(
+         uint j  = ib % 8;
+ 
+         // Load d and dmin for this super-block
+-        half d_val  = src0_d[sb * ne01 + i01];
+-        half dm_val = src0_dm[sb * ne01 + i01];
++        half d_val  = src0_d[sb * ne01 + i01c];
++        half dm_val = src0_dm[sb * ne01 + i01c];
+ 
+         // Load sub-block scale and min. s is transposed [nb][12][M]; stride ne01 per code.
+-        global const uchar * sc = src0_s + sb * K_SCALE_SIZE * ne01 + i01;
++        global const uchar * sc = src0_s + sb * K_SCALE_SIZE * ne01 + i01c;
+         uchar sv, mn;
+         get_scale_min_k4(j, sc, ne01, &sv, &mn);
+ 
+@@ -74,7 +77,7 @@ __kernel void gemv_noshuffle_q4_k_f32_32b_trans(
+         float minv  = (float)dm_val * (float)mn;
+ 
+         // Load 4 uints of quants (32 nibbles = 32 elements), column-major stride ne01
+-        uint q_base = ib * ne01 * 4 + i01;
++        uint q_base = ib * ne01 * 4 + i01c;
+ 
+         uint4 regQ;
+         regQ.s0 = read_imageui(src0_q, q_base).x;
+@@ -129,6 +132,8 @@ __kernel void gemv_noshuffle_q4_k_f32_32b_trans(
+     // 1 output per thread in subgroup 0
+     if (sgid == 0) {
+         dst = dst + (offsetd >> 2);
+-        dst[i01] = sum;
++        if (i01 < (uint) ne01) {   // 0072: only a real row stores
++            dst[i01] = sum;
++        }
+     }
+ }
+diff --git a/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q5_k_f32_32b_trans.cl b/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q5_k_f32_32b_trans.cl
+index ecf1513..388adf5 100644
+--- a/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q5_k_f32_32b_trans.cl
++++ b/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q5_k_f32_32b_trans.cl
+@@ -50,6 +50,9 @@ __kernel void gemv_noshuffle_q5_k_f32_32b_trans(
+     int                     ne01
+ ) {
+     uint i01  = get_global_id(0);
++    // 0072: the launch rounds ne01 up to a multiple of 64; clamp the
++    // tail's index for the loads and keep every lane in the collectives
++    uint i01c = min(i01, (uint) ne01 - 1);
+     uint sgid = get_local_id(1);
+     uint slid = get_sub_group_local_id();
+ 
+@@ -63,11 +66,11 @@ __kernel void gemv_noshuffle_q5_k_f32_32b_trans(
+         uint j  = ib % 8;
+ 
+         // Load d and dmin for this super-block.
+-        half d_val  = src0_d[sb * ne01 + i01];
+-        half dm_val = src0_dm[sb * ne01 + i01];
++        half d_val  = src0_d[sb * ne01 + i01c];
++        half dm_val = src0_dm[sb * ne01 + i01c];
+ 
+         // Load sub-block scale and min. s is transposed [nb][12][M]; stride ne01 per code.
+-        global const uchar * sc = src0_s + sb * K_SCALE_SIZE * ne01 + i01;
++        global const uchar * sc = src0_s + sb * K_SCALE_SIZE * ne01 + i01c;
+         uchar sv, mn;
+         get_scale_min_k4(j, sc, ne01, &sv, &mn);
+ 
+@@ -75,7 +78,7 @@ __kernel void gemv_noshuffle_q5_k_f32_32b_trans(
+         float minv  = (float)dm_val * (float)mn;
+ 
+         // Load 4 uints of quants (32 nibbles = 32 elements), column-major stride ne01.
+-        uint q_base = ib * ne01 * 4 + i01;
++        uint q_base = ib * ne01 * 4 + i01c;
+ 
+         uint4 regQ;
+         regQ.s0 = read_imageui(src0_q, q_base).x;
+@@ -84,10 +87,10 @@ __kernel void gemv_noshuffle_q5_k_f32_32b_trans(
+         regQ.s3 = read_imageui(src0_q, q_base + ne01 * 3).x;
+ 
+         uint qh_grp = ib * 4;
+-        uint qh_word = (uint)src0_qh[(qh_grp + 0) * ne01 + i01]
+-                      | ((uint)src0_qh[(qh_grp + 1) * ne01 + i01] << 8)
+-                      | ((uint)src0_qh[(qh_grp + 2) * ne01 + i01] << 16)
+-                      | ((uint)src0_qh[(qh_grp + 3) * ne01 + i01] << 24);
++        uint qh_word = (uint)src0_qh[(qh_grp + 0) * ne01 + i01c]
++                      | ((uint)src0_qh[(qh_grp + 1) * ne01 + i01c] << 8)
++                      | ((uint)src0_qh[(qh_grp + 2) * ne01 + i01c] << 16)
++                      | ((uint)src0_qh[(qh_grp + 3) * ne01 + i01c] << 24);
+ 
+         // Load activations: 32 floats = 8 float4s.
+         uint y_offset = ib * 8;
+@@ -136,6 +139,8 @@ __kernel void gemv_noshuffle_q5_k_f32_32b_trans(
+     // 1 output per thread in subgroup 0
+     if (sgid == 0) {
+         dst = dst + (offsetd >> 2);
+-        dst[i01] = sum;
++        if (i01 < (uint) ne01) {   // 0072: only a real row stores
++            dst[i01] = sum;
++        }
+     }
+ }
+diff --git a/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q6_k_f32_32b_trans.cl b/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q6_k_f32_32b_trans.cl
+index 2e1e2d7..05965a2 100644
+--- a/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q6_k_f32_32b_trans.cl
++++ b/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q6_k_f32_32b_trans.cl
+@@ -32,6 +32,9 @@ __kernel void kernel_gemv_noshuffle_q6_k_f32_32b_trans(
+     int                     ne01
+ ) {
+     uint i01  = get_global_id(0);
++    // 0072: the launch rounds ne01 up to a multiple of 64; clamp the
++    // tail's index for the loads and keep every lane in the collectives
++    uint i01c = min(i01, (uint) ne01 - 1);
+     uint sgid = get_local_id(1);
+     uint slid = get_sub_group_local_id();
+ 
+@@ -47,15 +50,15 @@ __kernel void kernel_gemv_noshuffle_q6_k_f32_32b_trans(
+         uint j  = ib % 8;   // 32-element group within super-block (0..7)
+ 
+         // Load d for this super-block.
+-        half d_val = src0_d[sb * ne01 + i01];
++        half d_val = src0_d[sb * ne01 + i01c];
+ 
+         // Load 2 sub-block scales (int8), one per 16 elements.
+-        global const char * sc = src0_s + i01 * scales_per_row + sb * 16;
++        global const char * sc = src0_s + i01c * scales_per_row + sb * 16;
+         float scale0 = (float)d_val * (float)sc[j * 2];
+         float scale1 = (float)d_val * (float)sc[j * 2 + 1];
+ 
+         // Load 4 uints of ql (32 elements, 4-bit each = 128 bits), column-major stride ne01.
+-        uint ql_base = (ib * 4) * ne01 + i01;
++        uint ql_base = (ib * 4) * ne01 + i01c;
+         uint4 regQL;
+         regQL.s0 = read_imageui(src0_ql, ql_base).x;
+         regQL.s1 = read_imageui(src0_ql, ql_base + ne01).x;
+@@ -63,7 +66,7 @@ __kernel void kernel_gemv_noshuffle_q6_k_f32_32b_trans(
+         regQL.s3 = read_imageui(src0_ql, ql_base + ne01 * 3).x;
+ 
+         // Load 2 uints of qh (32 elements, 2-bit each = 64 bits), column-major stride ne01.
+-        uint qh_base = (ib * 2) * ne01 + i01;
++        uint qh_base = (ib * 2) * ne01 + i01c;
+         uint2 regQH;
+         regQH.s0 = read_imageui(src0_qh, qh_base).x;
+         regQH.s1 = read_imageui(src0_qh, qh_base + ne01).x;
+@@ -123,6 +126,8 @@ __kernel void kernel_gemv_noshuffle_q6_k_f32_32b_trans(
+     // 1 output per thread in subgroup 0
+     if (sgid == 0) {
+         dst = dst + (offsetd >> 2);
+-        dst[i01] = sum;
++        if (i01 < (uint) ne01) {   // 0072: only a real row stores
++            dst[i01] = sum;
++        }
+     }
+ }
+diff --git a/ggml/src/ggml-opencl/kernels/leaky_relu.cl b/ggml/src/ggml-opencl/kernels/leaky_relu.cl
+index bc521b7..b1a4614 100644
+--- a/ggml/src/ggml-opencl/kernels/leaky_relu.cl
++++ b/ggml/src/ggml-opencl/kernels/leaky_relu.cl
+@@ -13,7 +13,8 @@
+ #define LEAKY_RELU(NAME, SEXPR, VEXPR)                                          \
+ kernel void kernel_##NAME##_f32(                                               \
+         global const float * src0, ulong offset0,                             \
+-        global       float * dst,  ulong offsetd, float slope) {              \
++        global       float * dst,  ulong offsetd, float slope, int n) {       \
++    if ((int) get_global_id(0) >= n) { return; } /* 0072: rounded tail */ \
+     src0 = (global float*)((global char*)src0 + offset0);                     \
+     dst  = (global float*)((global char*)dst  + offsetd);                     \
+     float x = src0[get_global_id(0)];                                         \
+@@ -21,7 +22,8 @@ kernel void kernel_##NAME##_f32(                                               \
+ }                                                                             \
+ kernel void kernel_##NAME##_f32_4(                                            \
+         global const float4 * src0, ulong offset0,                           \
+-        global       float4 * dst,  ulong offsetd, float slope) {             \
++        global       float4 * dst,  ulong offsetd, float slope, int n) {      \
++    if ((int) get_global_id(0) >= n) { return; } /* 0072: rounded tail */ \
+     src0 = (global float4*)((global char*)src0 + offset0);                   \
+     dst  = (global float4*)((global char*)dst  + offsetd);                   \
+     float4 x = src0[get_global_id(0)];                                       \
+@@ -29,7 +31,8 @@ kernel void kernel_##NAME##_f32_4(                                            \
+ }                                                                             \
+ kernel void kernel_##NAME##_f16(                                             \
+         global const half * src0, ulong offset0,                            \
+-        global       half * dst,  ulong offsetd, float slope) {              \
++        global       half * dst,  ulong offsetd, float slope, int n) {        \
++    if ((int) get_global_id(0) >= n) { return; } /* 0072: rounded tail */ \
+     src0 = (global half*)((global char*)src0 + offset0);                    \
+     dst  = (global half*)((global char*)dst  + offsetd);                    \
+     float x = src0[get_global_id(0)];                                       \
+@@ -37,7 +40,8 @@ kernel void kernel_##NAME##_f16(                                             \
+ }                                                                            \
+ kernel void kernel_##NAME##_f16_4(                                          \
+         global const half4 * src0, ulong offset0,                          \
+-        global       half4 * dst,  ulong offsetd, float slope) {            \
++        global       half4 * dst,  ulong offsetd, float slope, int n) {       \
++    if ((int) get_global_id(0) >= n) { return; } /* 0072: rounded tail */ \
+     src0 = (global half4*)((global char*)src0 + offset0);                  \
+     dst  = (global half4*)((global char*)dst  + offsetd);                  \
+     float4 x = convert_float4(src0[get_global_id(0)]);                     \
+diff --git a/ggml/src/ggml-opencl/kernels/mul.cl b/ggml/src/ggml-opencl/kernels/mul.cl
+index b12a592..871baee 100644
+--- a/ggml/src/ggml-opencl/kernels/mul.cl
++++ b/ggml/src/ggml-opencl/kernels/mul.cl
+@@ -66,7 +66,8 @@ kernel void kernel_mul_row(
+         ulong offset1,
+         global float4 * dst,
+         ulong offsetd,
+-        int ne
++        int ne,
++        int n_total
+ ) {
+     src0 = (global float4*)((global char*)src0 + offset0);
+     src1 = (global float4*)((global char*)src1 + offset1);
+@@ -74,6 +75,9 @@ kernel void kernel_mul_row(
+ 
+     // This performs better than using %.
+     uint gid = get_global_id(0);
++    if (gid >= (uint) n_total) {   // 0072: exit the rounded uniform launch's tail
++        return;
++    }
+     uint idx1 = gid - (gid/ne)*ne; // get_global_id(0) % ne
+     dst[gid] = src0[gid] * src1[idx1];
+ }
+@@ -139,7 +143,8 @@ kernel void kernel_mul_row_f16(
+         ulong offset1,
+         global half4 * dst,
+         ulong offsetd,
+-        int ne
++        int ne,
++        int n_total
+ ) {
+     src0 = (global half4*)((global char*)src0 + offset0);
+     src1 = (global half4*)((global char*)src1 + offset1);
+@@ -147,6 +152,9 @@ kernel void kernel_mul_row_f16(
+ 
+     // This performs better than using %.
+     uint gid = get_global_id(0);
++    if (gid >= (uint) n_total) {   // 0072: exit the rounded uniform launch's tail
++        return;
++    }
+     uint idx1 = gid - (gid/ne)*ne; // get_global_id(0) % ne
+     dst[gid] = src0[gid] * src1[idx1];
+ }
+diff --git a/ggml/src/ggml-opencl/kernels/relu.cl b/ggml/src/ggml-opencl/kernels/relu.cl
+index 60ff28a..ffd0743 100644
+--- a/ggml/src/ggml-opencl/kernels/relu.cl
++++ b/ggml/src/ggml-opencl/kernels/relu.cl
+@@ -7,8 +7,14 @@ kernel void kernel_relu(
+         global float * src0,
+         ulong offset0,
+         global float * dst,
+-        ulong offsetd
++        ulong offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float*)((global char*)src0 + offset0);
+     dst = (global float*)((global char*)dst + offsetd);
+ 
+diff --git a/ggml/src/ggml-opencl/kernels/scale.cl b/ggml/src/ggml-opencl/kernels/scale.cl
+index 17ed97f..539a8d7 100644
+--- a/ggml/src/ggml-opencl/kernels/scale.cl
++++ b/ggml/src/ggml-opencl/kernels/scale.cl
+@@ -6,8 +6,14 @@ kernel void kernel_scale_f32(
+         global float * dst,
+         ulong offsetd,
+         float scale,
+-        float bias
++        float bias,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float*)((global char*)src0 + offset0);
+     dst = (global float*)((global char*)dst + offsetd);
+     dst[get_global_id(0)] = src0[get_global_id(0)] * scale + bias;
+@@ -19,8 +25,14 @@ kernel void kernel_scale_f32_4(
+         global float4 * dst,
+         ulong offsetd,
+         float scale,
+-        float bias
++        float bias,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float4*)((global char*)src0 + offset0);
+     dst = (global float4*)((global char*)dst + offsetd);
+     dst[get_global_id(0)] = src0[get_global_id(0)] * scale + bias;
+diff --git a/ggml/src/ggml-opencl/kernels/sigmoid.cl b/ggml/src/ggml-opencl/kernels/sigmoid.cl
+index fe2ccfa..4be4ce7 100644
+--- a/ggml/src/ggml-opencl/kernels/sigmoid.cl
++++ b/ggml/src/ggml-opencl/kernels/sigmoid.cl
+@@ -8,8 +8,14 @@ kernel void kernel_sigmoid_f32(
+         global float * src0,
+         ulong offset0,
+         global float * dst,
+-        ulong offsetd
++        ulong offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float*)((global char*)src0 + offset0);
+     dst = (global float*)((global char*)dst + offsetd);
+ 
+@@ -20,8 +26,14 @@ kernel void kernel_sigmoid_f16(
+         global half * src0,
+         ulong offset0,
+         global half * dst,
+-        ulong offsetd
++        ulong offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global half*)((global char*)src0 + offset0);
+     dst = (global half*)((global char*)dst + offsetd);
+ 
+diff --git a/ggml/src/ggml-opencl/kernels/silu.cl b/ggml/src/ggml-opencl/kernels/silu.cl
+index 1d95e1b..f610714 100644
+--- a/ggml/src/ggml-opencl/kernels/silu.cl
++++ b/ggml/src/ggml-opencl/kernels/silu.cl
+@@ -7,8 +7,14 @@ kernel void kernel_silu(
+         global float * src0,
+         ulong offset0,
+         global float * dst,
+-        ulong offsetd
++        ulong offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float*)((global char*)src0 + offset0);
+     dst = (global float*)((global char*)dst + offsetd);
+ 
+@@ -20,8 +26,14 @@ kernel void kernel_silu_4(
+         global float4 * src0,
+         ulong offset0,
+         global float4 * dst,
+-        ulong offsetd
++        ulong offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float4*)((global char*)src0 + offset0);
+     dst = (global float4*)((global char*)dst + offsetd);
+ 
+diff --git a/ggml/src/ggml-opencl/kernels/softplus.cl b/ggml/src/ggml-opencl/kernels/softplus.cl
+index 6f8b747..fb079b3 100644
+--- a/ggml/src/ggml-opencl/kernels/softplus.cl
++++ b/ggml/src/ggml-opencl/kernels/softplus.cl
+@@ -8,8 +8,14 @@ kernel void kernel_softplus_f32(
+         global const float * src0,
+         ulong                offset0,
+         global       float * dst,
+-        ulong                offsetd
++        ulong                offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float*)((global char*)src0 + offset0);
+     dst  = (global float*)((global char*)dst + offsetd);
+ 
+@@ -20,8 +26,14 @@ kernel void kernel_softplus_f32_4(
+         global const float4 * src0,
+         ulong                 offset0,
+         global       float4 * dst,
+-        ulong                 offsetd
++        ulong                 offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float4*)((global char*)src0 + offset0);
+     dst  = (global float4*)((global char*)dst + offsetd);
+ 
+@@ -32,8 +44,14 @@ kernel void kernel_softplus_f16(
+         global const half * src0,
+         ulong               offset0,
+         global       half * dst,
+-        ulong               offsetd
++        ulong               offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global half*)((global char*)src0 + offset0);
+     dst  = (global half*)((global char*)dst + offsetd);
+ 
+@@ -45,8 +63,14 @@ kernel void kernel_softplus_f16_4(
+         global const half4 * src0,
+         ulong                offset0,
+         global       half4 * dst,
+-        ulong                offsetd
++        ulong                offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global half4*)((global char*)src0 + offset0);
+     dst  = (global half4*)((global char*)dst + offsetd);
+ 
+diff --git a/ggml/src/ggml-opencl/kernels/solve_tri.cl b/ggml/src/ggml-opencl/kernels/solve_tri.cl
+index 80745fc..7dc244d 100644
+--- a/ggml/src/ggml-opencl/kernels/solve_tri.cl
++++ b/ggml/src/ggml-opencl/kernels/solve_tri.cl
+@@ -23,12 +23,21 @@ kernel void kernel_solve_tri_f32(
+         ulong nb0,
+         ulong nb1,
+         ulong nb2,
+-        ulong nb3
++        ulong nb3,
++        int ne2,
++        int ne3  // 0072: the launch covers dst->ne[2]/ne[3]; bound both
+ ) {
+     int col = get_global_id(0);
+     int i2 = get_global_id(1);
+     int i3 = get_global_id(2);
+ 
++    if (col >= k) {   // 0072: k is the launch's dim-0 count
++        return;
++    }
++    if (i2 >= ne2 || i3 >= ne3) {   // 0072: exit the rounded tail of dims 1/2
++        return;
++    }
++
+     global const uchar * Lb = src0 + offset0 + i2 * nb02 + i3 * nb03;
+     global const uchar * Bb = src1 + offset1 + i2 * nb12 + i3 * nb13;
+     global       uchar * Xb = dst + offsetd + i2 * nb2 + i3 * nb3;
+diff --git a/ggml/src/ggml-opencl/kernels/sqr.cl b/ggml/src/ggml-opencl/kernels/sqr.cl
+index 4310906..8886037 100644
+--- a/ggml/src/ggml-opencl/kernels/sqr.cl
++++ b/ggml/src/ggml-opencl/kernels/sqr.cl
+@@ -4,8 +4,14 @@ kernel void kernel_sqr_cont_f32(
+     global float * src0,
+     ulong          offset0,
+     global float * dst,
+-    ulong          offsetd
++    ulong          offsetd,
++    int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float*)((global char*)src0 + offset0);
+     dst  = (global float*)((global char*)dst + offsetd);
+ 
+@@ -17,8 +23,14 @@ kernel void kernel_sqr_cont_f32_4(
+     global float4 * src0,
+     ulong           offset0,
+     global float4 * dst,
+-    ulong           offsetd
++    ulong           offsetd,
++    int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float4*)((global char*)src0 + offset0);
+     dst  = (global float4*)((global char*)dst + offsetd);
+ 
+@@ -30,8 +42,14 @@ kernel void kernel_sqr_cont_f16(
+     global half * src0,
+     ulong         offset0,
+     global half * dst,
+-    ulong         offsetd
++    ulong         offsetd,
++    int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global half*)((global char*)src0 + offset0);
+     dst  = (global half*)((global char*)dst + offsetd);
+ 
+@@ -43,8 +61,14 @@ kernel void kernel_sqr_cont_f16_4(
+     global half4 * src0,
+     ulong          offset0,
+     global half4 * dst,
+-    ulong          offsetd
++    ulong          offsetd,
++    int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global half4*)((global char*)src0 + offset0);
+     dst  = (global half4*)((global char*)dst + offsetd);
+ 
+diff --git a/ggml/src/ggml-opencl/kernels/sqrt.cl b/ggml/src/ggml-opencl/kernels/sqrt.cl
+index c59fbe0..7860991 100644
+--- a/ggml/src/ggml-opencl/kernels/sqrt.cl
++++ b/ggml/src/ggml-opencl/kernels/sqrt.cl
+@@ -4,8 +4,14 @@ kernel void kernel_sqrt_cont_f32(
+     global float * src0,
+     ulong          offset0,
+     global float * dst,
+-    ulong          offsetd
++    ulong          offsetd,
++    int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float*)((global char*)src0 + offset0);
+     dst  = (global float*)((global char*)dst + offsetd);
+ 
+@@ -17,8 +23,14 @@ kernel void kernel_sqrt_cont_f32_4(
+     global float4 * src0,
+     ulong           offset0,
+     global float4 * dst,
+-    ulong           offsetd
++    ulong           offsetd,
++    int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float4*)((global char*)src0 + offset0);
+     dst  = (global float4*)((global char*)dst + offsetd);
+ 
+@@ -30,8 +42,14 @@ kernel void kernel_sqrt_cont_f16(
+     global half * src0,
+     ulong         offset0,
+     global half * dst,
+-    ulong         offsetd
++    ulong         offsetd,
++    int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global half*)((global char*)src0 + offset0);
+     dst  = (global half*)((global char*)dst + offsetd);
+ 
+@@ -43,8 +61,14 @@ kernel void kernel_sqrt_cont_f16_4(
+     global half4 * src0,
+     ulong          offset0,
+     global half4 * dst,
+-    ulong          offsetd
++    ulong          offsetd,
++    int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global half4*)((global char*)src0 + offset0);
+     dst  = (global half4*)((global char*)dst + offsetd);
+ 
+diff --git a/ggml/src/ggml-opencl/kernels/ssm_conv.cl b/ggml/src/ggml-opencl/kernels/ssm_conv.cl
+index ee8b0a8..29c2ca4 100644
+--- a/ggml/src/ggml-opencl/kernels/ssm_conv.cl
++++ b/ggml/src/ggml-opencl/kernels/ssm_conv.cl
+@@ -13,7 +13,8 @@ kernel void kernel_ssm_conv_f32_f32(
+     ulong         nb0,
+     ulong         nb1,
+     ulong         nb2,
+-    int           act     // 1: a following SILU folded in (kernel_silu's formula; patch 0049)
++    int           act,    // 1: a following SILU folded in (kernel_silu's formula; patch 0049)
++    int           ne01    // 0072: the dim-0 count, the rounded tail exits at it
+ ){
+     src0 = src0 + offset0;
+     src1 = src1 + offset1;
+@@ -23,6 +24,10 @@ kernel void kernel_ssm_conv_f32_f32(
+     int i2 = get_global_id(1);
+     int i3 = get_global_id(2);
+ 
++    if (ir >= ne01) {   // 0072: exit the rounded uniform launch's tail
++        return;
++    }
++
+     int nc  = ne10;
+ 
+     global float * s = (global float *) (src0 + ir*nb01 + i2*nb00 + i3*nb02);
+@@ -53,7 +58,8 @@ kernel void kernel_ssm_conv_f32_f32_4(
+     ulong         nb0,
+     ulong         nb1,
+     ulong         nb2,
+-    int           act     // 1: a following SILU folded in (kernel_silu's formula; patch 0049)
++    int           act,    // 1: a following SILU folded in (kernel_silu's formula; patch 0049)
++    int           ne01    // 0072: the dim-0 count, the rounded tail exits at it
+ ) {
+     src0 = src0 + offset0;
+     src1 = src1 + offset1;
+@@ -63,6 +69,10 @@ kernel void kernel_ssm_conv_f32_f32_4(
+     int i2 = get_global_id(1);
+     int i3 = get_global_id(2);
+ 
++    if (ir >= ne01) {   // 0072: exit the rounded uniform launch's tail
++        return;
++    }
++
+     int nc = ne10;
+ 
+     global float4 * s = (global float4 *) (src0 + ir*nb01 + i2*nb00 + i3*nb02);
+diff --git a/ggml/src/ggml-opencl/kernels/sub.cl b/ggml/src/ggml-opencl/kernels/sub.cl
+index 423ed59..603a0d1 100644
+--- a/ggml/src/ggml-opencl/kernels/sub.cl
++++ b/ggml/src/ggml-opencl/kernels/sub.cl
+@@ -59,7 +59,8 @@ kernel void kernel_sub_row(
+         ulong offset1,
+         global float4 * dst,
+         ulong offsetd,
+-        int ne
++        int ne,
++        int n_total
+ ) {
+     src0 = (global float4*)((global char*)src0 + offset0);
+     src1 = (global float4*)((global char*)src1 + offset1);
+@@ -67,6 +68,9 @@ kernel void kernel_sub_row(
+ 
+     // This performs better than using %.
+     uint gid = get_global_id(0);
++    if (gid >= (uint) n_total) {   // 0072: exit the rounded uniform launch's tail
++        return;
++    }
+     uint idx1 = gid - (gid/ne)*ne; // get_global_id(0) % ne
+     dst[gid] = src0[gid] - src1[idx1];
+ }
+@@ -125,7 +129,8 @@ kernel void kernel_sub_row_f16(
+         ulong offset1,
+         global half4 * dst,
+         ulong offsetd,
+-        int ne
++        int ne,
++        int n_total
+ ) {
+     src0 = (global half4*)((global char*)src0 + offset0);
+     src1 = (global half4*)((global char*)src1 + offset1);
+@@ -133,6 +138,9 @@ kernel void kernel_sub_row_f16(
+ 
+     // This performs better than using %.
+     uint gid = get_global_id(0);
++    if (gid >= (uint) n_total) {   // 0072: exit the rounded uniform launch's tail
++        return;
++    }
+     uint idx1 = gid - (gid/ne)*ne; // get_global_id(0) % ne
+     dst[gid] = src0[gid] - src1[idx1];
+ }
+diff --git a/ggml/src/ggml-opencl/kernels/tanh.cl b/ggml/src/ggml-opencl/kernels/tanh.cl
+index 2c4887a..5b4db2a 100644
+--- a/ggml/src/ggml-opencl/kernels/tanh.cl
++++ b/ggml/src/ggml-opencl/kernels/tanh.cl
+@@ -4,8 +4,14 @@ kernel void kernel_tanh_f32(
+         global const float * src0,
+         ulong                offset0,
+         global       float * dst,
+-        ulong                offsetd
++        ulong                offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float*)((global char*)src0 + offset0);
+     dst  = (global float*)((global char*)dst + offsetd);
+ 
+@@ -16,8 +22,14 @@ kernel void kernel_tanh_f32_4(
+         global const float4 * src0,
+         ulong                 offset0,
+         global       float4 * dst,
+-        ulong                 offsetd
++        ulong                 offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global float4*)((global char*)src0 + offset0);
+     dst  = (global float4*)((global char*)dst + offsetd);
+ 
+@@ -28,8 +40,14 @@ kernel void kernel_tanh_f16(
+         global const half * src0,
+         ulong               offset0,
+         global       half * dst,
+-        ulong               offsetd
++        ulong               offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global half*)((global char*)src0 + offset0);
+     dst  = (global half*)((global char*)dst + offsetd);
+ 
+@@ -40,8 +58,14 @@ kernel void kernel_tanh_f16_4(
+         global const half4 * src0,
+         ulong                offset0,
+         global       half4 * dst,
+-        ulong                offsetd
++        ulong                offsetd,
++        int n
+ ) {
++    // 0072: exit the rounded uniform launch's tail
++    if ((int) get_global_id(0) >= n) {
++        return;
++    }
++
+     src0 = (global half4*)((global char*)src0 + offset0);
+     dst  = (global half4*)((global char*)dst + offsetd);
+ 
+diff --git a/ggml/src/ggml-opencl/kernels/unary_ext.cl b/ggml/src/ggml-opencl/kernels/unary_ext.cl
+index e86eadf..fff3027 100644
+--- a/ggml/src/ggml-opencl/kernels/unary_ext.cl
++++ b/ggml/src/ggml-opencl/kernels/unary_ext.cl
+@@ -15,7 +15,8 @@
+ #define UNARY_EXT(NAME, SEXPR, VEXPR)                                           \
+ kernel void kernel_##NAME##_f32(                                               \
+         global const float * src0, ulong offset0,                             \
+-        global       float * dst,  ulong offsetd) {                           \
++        global       float * dst,  ulong offsetd, int n) {                    \
++    if ((int) get_global_id(0) >= n) { return; } /* 0072: rounded tail */ \
+     src0 = (global float*)((global char*)src0 + offset0);                     \
+     dst  = (global float*)((global char*)dst  + offsetd);                     \
+     float x = src0[get_global_id(0)];                                         \
+@@ -23,7 +24,8 @@ kernel void kernel_##NAME##_f32(                                               \
+ }                                                                             \
+ kernel void kernel_##NAME##_f32_4(                                            \
+         global const float4 * src0, ulong offset0,                           \
+-        global       float4 * dst,  ulong offsetd) {                         \
++        global       float4 * dst,  ulong offsetd, int n) {                   \
++    if ((int) get_global_id(0) >= n) { return; } /* 0072: rounded tail */ \
+     src0 = (global float4*)((global char*)src0 + offset0);                   \
+     dst  = (global float4*)((global char*)dst  + offsetd);                   \
+     float4 x = src0[get_global_id(0)];                                       \
+@@ -31,7 +33,8 @@ kernel void kernel_##NAME##_f32_4(                                            \
+ }                                                                             \
+ kernel void kernel_##NAME##_f16(                                             \
+         global const half * src0, ulong offset0,                            \
+-        global       half * dst,  ulong offsetd) {                          \
++        global       half * dst,  ulong offsetd, int n) {                     \
++    if ((int) get_global_id(0) >= n) { return; } /* 0072: rounded tail */ \
+     src0 = (global half*)((global char*)src0 + offset0);                    \
+     dst  = (global half*)((global char*)dst  + offsetd);                    \
+     float x = src0[get_global_id(0)];                                       \
+@@ -39,7 +42,8 @@ kernel void kernel_##NAME##_f16(                                             \
+ }                                                                            \
+ kernel void kernel_##NAME##_f16_4(                                          \
+         global const half4 * src0, ulong offset0,                          \
+-        global       half4 * dst,  ulong offsetd) {                        \
++        global       half4 * dst,  ulong offsetd, int n) {                    \
++    if ((int) get_global_id(0) >= n) { return; } /* 0072: rounded tail */ \
+     src0 = (global half4*)((global char*)src0 + offset0);                  \
+     dst  = (global half4*)((global char*)dst  + offsetd);                  \
+     float4 x = convert_float4(src0[get_global_id(0)]);                     \
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index f8a917b..8749cdb 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -205,6 +205,32 @@ if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
+     add_test(NAME test-opencl-kq-i8 COMMAND $<TARGET_FILE:test-opencl-kq-i8>)
+ endif()
+ 
++# patch 0072: the uniform-work-group rounding rule (ggml-opencl-uniform.h,
++# the header the backend includes) and a text check that every launch site with
++# a local size rounds its global size before enqueueing.
++if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
++    add_executable(test-opencl-workgroups test-opencl-workgroups.cpp)
++    target_include_directories(test-opencl-workgroups PRIVATE
++        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl)
++    target_compile_definitions(test-opencl-workgroups PRIVATE
++        GGML_OPENCL_SRC_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/ggml-opencl.cpp"
++        GGML_OPENCL_KERNELS_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/kernels"
++        GGML_OPENCL_CLANG_CLEAN_PATH="${PROJECT_SOURCE_DIR}/tests/opencl_clang_clean.txt")
++    add_test(NAME test-opencl-workgroups COMMAND $<TARGET_FILE:test-opencl-workgroups>)
++    # the Adreno build of the same test: GGML_OPENCL_USE_ADRENO_KERNELS makes the
++    # rounding helper a no-op (the Adreno class keeps the pin's ragged launches),
++    # and the test asserts that in its own build
++    add_executable(test-opencl-workgroups-adreno test-opencl-workgroups.cpp)
++    target_include_directories(test-opencl-workgroups-adreno PRIVATE
++        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl)
++    target_compile_definitions(test-opencl-workgroups-adreno PRIVATE
++        GGML_OPENCL_USE_ADRENO_KERNELS
++        GGML_OPENCL_SRC_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/ggml-opencl.cpp"
++        GGML_OPENCL_KERNELS_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/kernels"
++        GGML_OPENCL_CLANG_CLEAN_PATH="${PROJECT_SOURCE_DIR}/tests/opencl_clang_clean.txt")
++    add_test(NAME test-opencl-workgroups-adreno COMMAND $<TARGET_FILE:test-opencl-workgroups-adreno>)
++endif()
++
+ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
+     llama_build_and_test(test-unicode.cpp LINK llama)
+diff --git a/tests/opencl_clang_clean.txt b/tests/opencl_clang_clean.txt
+new file mode 100644
+index 0000000..23a8157
+--- /dev/null
++++ b/tests/opencl_clang_clean.txt
+@@ -0,0 +1,141 @@
++# Kernel sources that compile with 0 errors under a generic clang, measured with
++# clang-18: `clang-18 -target spir64 -x cl -cl-std=CL3.0 -Xclang
++# -finclude-default-header -fsyntax-only <file>`, on this tree both before the
++# series' 0072 change and after. `test-opencl-workgroups` compiles exactly these
++# and fails on any error. Refresh: compile ggml/src/ggml-opencl/kernels/*.cl with
++# that command and keep the names that report no error in both texts.
++abs.cl
++add.cl
++add_id.cl
++argsort.cl
++clamp.cl
++concat.cl
++conv2d.cl
++conv2d_f16_f32.cl
++conv3d.cl
++conv3d_f16_f32.cl
++cpy.cl
++cumsum.cl
++cvt.cl
++diag.cl
++diag_mask_inf.cl
++div.cl
++exp.cl
++expm1.cl
++fill.cl
++flash_attn_repack.cl
++gated_delta_net.cl
++gelu.cl
++gemm_moe_mxfp4_f32.cl
++gemm_moe_mxfp4_q8_1_dp4a.cl
++gemm_moe_q4_0_q8_1_dp4a.cl
++gemm_moe_q4_k_q8_1_dp4a.cl
++gemm_moe_q6_k_q8_1_dp4a.cl
++gemm_moe_q8_1_dp4a.cl
++gemm_noshuffle_iq4_nl_f32.cl
++gemm_noshuffle_iq4_nl_q8_1_dp4a.cl
++gemm_noshuffle_q1_0_f32.cl
++gemm_noshuffle_q4_0_f32.cl
++gemm_noshuffle_q4_0_q8_1_dp4a.cl
++gemm_noshuffle_q4_1_f32.cl
++gemm_noshuffle_q4_k_f32.cl
++gemm_noshuffle_q4_k_q8_1_dp4a.cl
++gemm_noshuffle_q5_0_f32.cl
++gemm_noshuffle_q5_0_q8_1_dp4a.cl
++gemm_noshuffle_q5_1_f32.cl
++gemm_noshuffle_q5_k_f32.cl
++gemm_noshuffle_q5_k_q8_1_dp4a.cl
++gemm_noshuffle_q6_k_f32.cl
++gemm_noshuffle_q6_k_f32_tiled.cl
++gemm_noshuffle_q6_k_q8_1_dp4a.cl
++gemm_noshuffle_q8_0_f32.cl
++gemm_noshuffle_q8_0_q8_1_dp4a.cl
++gemv_moe_mxfp4_f32.cl
++gemv_moe_mxfp4_f32_ns.cl
++gemv_moe_q4_0_f32_ns.cl
++gemv_moe_q4_1_f32_ns.cl
++gemv_moe_q4_k_f32_ns.cl
++gemv_moe_q5_0_f32_ns.cl
++gemv_moe_q5_1_f32_ns.cl
++gemv_moe_q5_k_f32_ns.cl
++gemv_moe_q6_k_f32_ns.cl
++gemv_noshuffle_iq4_nl_f32.cl
++gemv_noshuffle_q4_1_f32.cl
++gemv_noshuffle_q4_k_f32_32b_trans.cl
++gemv_noshuffle_q4_k_f32.cl
++gemv_noshuffle_q4_k_f32_o4.cl
++gemv_noshuffle_q4_k_f32_tiled.cl
++gemv_noshuffle_q5_0_f32.cl
++gemv_noshuffle_q5_1_f32.cl
++gemv_noshuffle_q5_k_f32_32b_trans.cl
++gemv_noshuffle_q5_k_f32.cl
++gemv_noshuffle_q6_k_f32_32b_trans.cl
++gemv_noshuffle_q6_k_f32.cl
++gemv_noshuffle_q6_k_f32_o4.cl
++gemv_noshuffle_q6_k_f32_tiled.cl
++get_rows.cl
++glu.cl
++group_norm.cl
++im2col_f16.cl
++im2col_f32.cl
++l2_norm.cl
++leaky_relu.cl
++mean.cl
++moe_add_id_glu.cl
++moe_combine.cl
++moe_reorder_b.cl
++moe_reorder_quant_a_q8_1.cl
++moe_sort_by_expert.cl
++mul.cl
++mul_mat_f16_f32.cl
++mul_mm_f16_f32_kq_kqv.cl
++mul_mm_f16_f32_l4_lm.cl
++mul_mm_f32_f32_l4_lm.cl
++mul_mm_iq4_nl_f32_l4_lm.cl
++mul_mm_q1_0_f32_l4_lm.cl
++mul_mm_q4_0_f32_l4_lm.cl
++mul_mm_q4_1_f32_l4_lm.cl
++mul_mm_q4_k_f32_l4_lm.cl
++mul_mm_q5_0_f32_l4_lm.cl
++mul_mm_q5_1_f32_l4_lm.cl
++mul_mm_q5_k_f32_l4_lm.cl
++mul_mm_q6_k_f32_l4_lm.cl
++mul_mm_q8_0_f32_l4_lm.cl
++mul_mv_f16_f16.cl
++mul_mv_f16_f32_1row.cl
++mul_mv_f16_f32.cl
++mul_mv_f16_f32_l4.cl
++mul_mv_f16_f32_mrow.cl
++mul_mv_f32_f32.cl
++mul_mv_kq_q8_1.cl
++neg.cl
++norm.cl
++pad.cl
++quant_a_q8_1.cl
++relu.cl
++repeat.cl
++rms_norm.cl
++rope_apply_f32.cl
++rope.cl
++scale.cl
++set_rows.cl
++sigmoid.cl
++silu.cl
++softmax_4_f16.cl
++softmax_4_f32.cl
++softmax_f16.cl
++softmax_f32.cl
++softplus.cl
++solve_tri.cl
++sqr.cl
++sqrt.cl
++ssm_conv.cl
++ssm_scan.cl
++sub.cl
++sum_rows.cl
++tanh.cl
++transpose.cl
++tri.cl
++tsembd.cl
++unary_ext.cl
++upscale.cl
+diff --git a/tests/test-opencl-workgroups.cpp b/tests/test-opencl-workgroups.cpp
+new file mode 100644
+index 0000000..f5dfa10
+--- /dev/null
++++ b/tests/test-opencl-workgroups.cpp
+@@ -0,0 +1,351 @@
++// 0072: device-free tests for the uniform-work-group rounding rule.
++//   - the rounding helper itself (every dimension, idempotence, local 0/NULL,
++//     a local size 1, the tail), and, in the Adreno build of this test
++//     (-DGGML_OPENCL_USE_ADRENO_KERNELS), that it returns the input unchanged;
++//   - the text check over ggml-opencl.cpp: every clEnqueueNDRangeKernel call
++//     that passes a local size is preceded by ggml_cl_round_up_global_work_size,
++//     so no launch site hands the driver a raw (ragged) count. The two calls
++//     inside enqueue_ndrange_kernel are covered by that wrapper's own call.
++//   - the kernel sources: a parameter-list line whose comment ends with a
++//     comma swallowed a declaration separator (the ssm_conv round-2 blocker: a
++//     comment sat before the comma, so two parameters merged), and, when a
++//     clang exists, a syntax-only compile as OpenCL C (spir64, CL3.0, the
++//     default header) of the sources in tests/opencl_clang_clean.txt, the list
++//     measured clean under a generic clang; the others are counted, not compiled.
++// No GPU, no OpenCL runtime. The helper is ggml/src/ggml-opencl/
++// ggml-opencl-uniform.h, the same header ggml-opencl.cpp includes, so a
++// mutation here is a mutation of the backend's launch rule.
++#include <cstdio>
++#include <cstring>
++#include <cstdlib>
++#include <string>
++#include <vector>
++#include <set>
++#include <algorithm>
++#include <dirent.h>
++
++#include "ggml-opencl-uniform.h"
++
++static int g_bad = 0;
++#define CHECK(cond, what) do { if (!(cond)) { std::printf("FAIL: %s\n", what); ++g_bad; } } while (0)
++
++static void check_rounding(void) {
++#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
++    // the Adreno build: the helper is a no-op, the Adreno launches stay ragged
++    CHECK(ggml_cl_round_up_global(10, 64) == 10, "adreno: round leaves the count");
++    size_t g[3] = {10, 20, 30};
++    const size_t l[3] = {64, 8, 1};
++    ggml_cl_round_up_global_work_size(g, l, 3);
++    CHECK(g[0] == 10 && g[1] == 20 && g[2] == 30, "adreno: no dimension rounds");
++    std::printf("workgroups: Adreno build, the rounding helper is a no-op\n");
++#else
++    // one dimension: a ragged count rounds to a whole local size
++    CHECK(ggml_cl_round_up_global(10, 64) == 64, "round 10/64");
++    CHECK(ggml_cl_round_up_global(64, 64) == 64, "round 64/64 stays");
++    CHECK(ggml_cl_round_up_global(65, 64) == 128, "round 65/64");
++    CHECK(ggml_cl_round_up_global(0, 64) == 0, "round 0 stays");
++    CHECK(ggml_cl_round_up_global(7, 1) == 7, "local 1 leaves the count");
++    CHECK(ggml_cl_round_up_global(7, 0) == 7, "local 0 leaves the count");
++    // a multi-dimension launch: each dimension rounds independently, and a
++    // NULL local size (the driver picks) is left alone
++    size_t g[3] = {10, 20, 30};
++    const size_t l[3] = {64, 8, 1};
++    ggml_cl_round_up_global_work_size(g, l, 3);
++    CHECK(g[0] == 64 && g[1] == 24 && g[2] == 30, "round three dimensions");
++    // idempotence: a launch that is already uniform is unchanged
++    size_t g2[3] = {64, 24, 30};
++    ggml_cl_round_up_global_work_size(g2, l, 3);
++    CHECK(g2[0] == 64 && g2[1] == 24 && g2[2] == 30, "rounding is idempotent");
++    size_t g3[2] = {10, 11};
++    ggml_cl_round_up_global_work_size(g3, NULL, 2);
++    CHECK(g3[0] == 10 && g3[1] == 11, "NULL local size is left alone");
++#endif
++}
++
++// split the top-level comma arguments of a call, from the '(' after its name
++static std::vector<std::string> split_args(const std::string & text, size_t open_paren) {
++    std::vector<std::string> args;
++    int depth = 0;
++    std::string cur;
++    for (size_t i = open_paren; i < text.size(); ++i) {
++        const char c = text[i];
++        if (c == '(' || c == '[') depth++;
++        if (c == ')' || c == ']') {
++            if (depth == 0) { args.push_back(cur); return args; }
++            depth--;
++        }
++        if (c == ',' && depth == 0) { args.push_back(cur); cur.clear(); }
++        else cur += c;
++    }
++    args.push_back(cur);
++    return args;
++}
++
++static void check_launch_sites(const std::string & src) {
++    // the wrapper's own two calls: it rounds before both, at the top of the
++    // function; test that separately, then check every other call site for a
++    // rounding call between it and the previous launch site
++    const size_t wstart = src.find("void enqueue_ndrange_kernel(");
++    const size_t wend = src.find("const void * get_adreno_bin_kernel", wstart);
++    const size_t wround = src.find("ggml_cl_round_up_global_work_size(global_work_size, local_work_size, work_dim);", wstart);
++    CHECK(wstart != std::string::npos, "the launch wrapper exists");
++    CHECK(wround != std::string::npos, "the launch wrapper rounds every dimension");
++
++    size_t pos = 0;
++    size_t prev = 0;
++    int checked = 0;
++    int raw = 0;
++    int in_wrapper = 0;
++    for (;;) {
++        const size_t start = src.find("clEnqueueNDRangeKernel(", pos);
++        if (start == std::string::npos) break;
++        const size_t args_begin = start + std::strlen("clEnqueueNDRangeKernel(");
++        const std::string call = src.substr(start, 1200);
++        const std::vector<std::string> a = split_args(call, std::strlen("clEnqueueNDRangeKernel("));
++        pos = args_begin;
++        if (a.size() < 6) continue;
++        std::string local = a[5];
++        const size_t b = local.find_first_not_of(" \t\r\n");
++        const size_t e = local.find_last_not_of(" \t\r\n");
++        local = b == std::string::npos ? "" : local.substr(b, e - b + 1);
++        if (local.empty() || local == "NULL" || local == "nullptr") continue;
++        // the two calls inside the wrapper sit 1.5 KB after its top; the
++        // wrapper's own rounding is before them, not between the previous site
++        const bool wrapper_call = start > wstart && start < wend;
++        if (!wrapper_call) {
++            const std::string between = src.substr(prev, start - prev);
++            if (between.find("ggml_cl_round_up_global_work_size(") == std::string::npos) {
++                std::printf("FAIL: launch at byte %zu passes a local size without rounding: %s\n",
++                            start, call.substr(0, 120).c_str());
++                ++raw;
++                ++g_bad;
++            }
++        } else {
++            ++in_wrapper;
++        }
++        ++checked;
++        prev = start;
++    }
++    CHECK(raw == 0, "no launch site passes a raw count with a local size");
++    CHECK(checked > 20, "the text check saw the backend's launch sites");
++    CHECK(in_wrapper == 2, "both wrapper calls are covered");
++    std::printf("workgroups: %d launch sites with a local size checked (%d in the wrapper)\n", checked, in_wrapper);
++
++    // the non-uniform fallback must be gone: no launch picks NULL local size
++    // because the shape is ragged, and no local_work_size_ptr remains
++    CHECK(src.find("local_work_size_ptr") == std::string::npos, "the local-size fallback is gone");
++}
++
++static std::string read_text(const std::string & path) {
++    std::FILE * f = std::fopen(path.c_str(), "rb");
++    if (!f) return std::string();
++    std::string s;
++    char buf[65536];
++    size_t n;
++    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) s.append(buf, n);
++    std::fclose(f);
++    return s;
++}
++
++
++// a comment inside a kernel's parameter list whose text ends with a comma: the
++// comma belongs to the comment, so the declarations around it merge (the
++// ssm_conv round-2 blocker, `int act /* ... */ int ne01`). Only parameter lists
++// count: prose comments elsewhere may end with a comma.
++static void check_kernel_comments(const char * dir, const std::vector<std::string> & files) {
++    int bad = 0, lists = 0;
++    for (const std::string & f : files) {
++        const std::string text = read_text(std::string(dir) + "/" + f);
++        size_t pos = 0;
++        while ((pos = text.find("kernel void ", pos)) != std::string::npos) {
++            const size_t c = text.find('(', pos);
++            if (c == std::string::npos) break;
++            // the parameter list, comment-aware: parens inside a comment or a
++            // string do not count
++            int depth = 1;
++            size_t i = c + 1;
++            for (; i < text.size(); ++i) {
++                if (text.compare(i, 2, "//") == 0) {
++                    const size_t nl = text.find('\n', i);
++                    i = nl == std::string::npos ? text.size() : nl;
++                    continue;
++                }
++                if (text.compare(i, 2, "/*") == 0) {
++                    const size_t e = text.find("*/", i + 2);
++                    i = e == std::string::npos ? text.size() : e + 1;
++                    continue;
++                }
++                if (text[i] == '(') ++depth;
++                if (text[i] == ')') {
++                    if (--depth == 0) break;
++                }
++            }
++            const std::string region = text.substr(c + 1, i - c - 1);
++            ++lists;
++            // per line inside the list: a comment whose text ends with ','
++            size_t ls = 0, line = 1;
++            for (size_t k = 0; k < c; ++k) if (text[k] == '\n') ++line;
++            while (ls < region.size()) {
++                const size_t le = region.find('\n', ls);
++                const std::string ln = region.substr(ls, (le == std::string::npos ? region.size() : le) - ls);
++                const size_t cc = ln.find("//");
++                if (cc != std::string::npos) {
++                    const std::string body = ln.substr(cc + 2);
++                    const size_t lb = body.find_last_not_of(" \t\r");
++                    if (lb != std::string::npos && body[lb] == ',') {
++                        std::printf("FAIL: %s:%d a comma inside a parameter comment ends the line: %s\n",
++                                    f.c_str(), (int)line, ln.c_str());
++                        ++bad;
++                    }
++                }
++                ++line;
++                if (le == std::string::npos) break;
++                ls = le + 1;
++            }
++            pos = i;
++        }
++    }
++    CHECK(bad == 0, "no kernel parameter list hides a comma in a comment");
++    CHECK(lists > 50, "the parameter lists were read");
++}
++
++// clang, clang-18, clang-19, or $CLANG (first that runs); empty when none
++static std::string find_clang(void) {
++    const char * env = std::getenv("CLANG");
++    if (env != nullptr && env[0] != 0 &&
++        std::system((std::string(env) + " --version >/dev/null 2>&1").c_str()) == 0) {
++        return env;
++    }
++    for (const char * c : { "clang", "clang-18", "clang-19" }) {
++        if (std::system((std::string(c) + " --version >/dev/null 2>&1").c_str()) == 0) return c;
++    }
++    return std::string();
++}
++
++// compile exactly the sources listed in tests/opencl_clang_clean.txt, when a
++// clang exists. The list was measured with clang-18 (`-target spir64 -x cl
++// -cl-std=CL3.0 -Xclang -finclude-default-header -fsyntax-only`) on this tree,
++// both before the series' 0072 change and after: every name in it compiles
++// with 0 errors under a generic front end. The rest of kernels/*.cl calls a
++// vendor builtin or needs the backend's own -D defines, and fails identically
++// on the pre-0072 text, so it is counted and reported and not compiled:
++// auto-discovery would fail on any host that has a clang and catch nothing.
++// To refresh the list, compile kernels/*.cl with that command and keep the
++// names that report no error before and after the patch.
++static void check_kernel_compile(const char * dir, const std::vector<std::string> & files,
++                                 const std::string & list_path) {
++    const std::string list = read_text(list_path);
++    if (list.empty()) {
++        std::printf("FAIL: the clang-clean list %s is not readable\n", list_path.c_str());
++        CHECK(false, "tests/opencl_clang_clean.txt is readable");
++        return;
++    }
++    std::vector<std::string> listed;
++    for (size_t i = 0; i < list.size(); ) {
++        size_t nl = list.find('\n', i);
++        if (nl == std::string::npos) nl = list.size();
++        std::string name = list.substr(i, nl - i);
++        i = nl + 1;
++        while (!name.empty() && std::isspace((unsigned char)name.back())) name.pop_back();
++        size_t lead = 0;
++        while (lead < name.size() && std::isspace((unsigned char)name[lead])) ++lead;
++        name = name.substr(lead);
++        if (name.empty() || name[0] == '#') continue;
++        listed.push_back(name);
++    }
++
++    int missing = 0;
++    std::set<std::string> names(files.begin(), files.end());
++    for (const std::string & f : listed) {
++        if (names.count(f) == 0 || read_text(std::string(dir) + "/" + f).empty()) {
++            std::printf("FAIL: the listed kernel source %s is missing from %s\n", f.c_str(), dir);
++            ++missing;
++        }
++    }
++    int unlisted = static_cast<int>(files.size()) - static_cast<int>(listed.size());
++    int listed_present = static_cast<int>(listed.size()) - missing;
++
++    const std::string cc = find_clang();
++    if (cc.empty()) {
++        std::printf("note: no clang (clang, clang-18, clang-19, $CLANG); %d listed kernel sources are not "
++                    "compiled, %d sources are not in the list\n", listed_present, unlisted);
++        CHECK(missing == 0, "every kernel source listed in tests/opencl_clang_clean.txt exists");
++        return;
++    }
++    int compiled = 0, failed = missing;
++    for (const std::string & f : listed) {
++        const std::string path = std::string(dir) + "/" + f;
++        if (read_text(path).empty()) continue;   // reported above
++        const std::string cmd = cc + " -target spir64 -x cl -cl-std=CL3.0"
++                               " -Xclang -finclude-default-header -fsyntax-only \"" + path + "\" >/dev/null 2>&1";
++        if (std::system(cmd.c_str()) != 0) {
++            std::printf("FAIL: %s does not compile as OpenCL C (spir64, CL3.0, %s)\n", f.c_str(), cc.c_str());
++            ++failed;
++        }
++        ++compiled;
++    }
++    std::printf("workgroups: %d of the %d listed kernel sources compiled as OpenCL C, %d kernel sources not "
++                "in the list are not compiled\n", compiled, listed_present, unlisted);
++    CHECK(failed == 0, "every kernel source in tests/opencl_clang_clean.txt compiles as OpenCL C");
++    CHECK(compiled > 20, "the list names enough sources to be a real check");
++}
++
++int main(int argc, char ** argv) {
++    (void)argc;
++    (void)argv;
++    check_rounding();
++#ifdef GGML_OPENCL_SRC_PATH
++    const char * path = GGML_OPENCL_SRC_PATH;
++#else
++    const char * path = argc > 1 ? argv[1] : nullptr;
++#endif
++#ifdef GGML_OPENCL_KERNELS_PATH
++    const char * kdir = GGML_OPENCL_KERNELS_PATH;
++#else
++    const char * kdir = argc > 2 ? argv[2] : nullptr;
++#endif
++#ifdef GGML_OPENCL_CLANG_CLEAN_PATH
++    const std::string clist = GGML_OPENCL_CLANG_CLEAN_PATH;
++#else
++    const std::string clist = argc > 3 ? argv[3] : std::string();
++#endif
++    if (path == nullptr) {
++        std::printf("FAIL: no ggml-opencl.cpp path (pass it as argv[1])\n");
++        return 1;
++    }
++    const std::string src = read_text(path);
++    if (src.empty()) {
++        std::printf("FAIL: cannot open %s\n", path);
++        return 1;
++    }
++    check_launch_sites(src);
++    if (kdir != nullptr && !clist.empty()) {
++        std::vector<std::string> files;
++        DIR * d = opendir(kdir);
++        if (d != nullptr) {
++            for (;;) {
++                struct dirent * de = readdir(d);
++                if (de == nullptr) break;
++                const std::string n = de->d_name;
++                if (n.size() > 3 && n.compare(n.size() - 3, 3, ".cl") == 0) files.push_back(n);
++            }
++            closedir(d);
++        }
++        std::sort(files.begin(), files.end());
++        CHECK(!files.empty(), "the kernel sources are listed");
++        check_kernel_comments(kdir, files);
++        check_kernel_compile(kdir, files, clist);
++    } else if (kdir == nullptr) {
++        std::printf("FAIL: no kernels directory (pass it as argv[2])\n");
++        ++g_bad;
++    } else {
++        std::printf("FAIL: no clang-clean list (pass it as argv[3])\n");
++        ++g_bad;
++    }
++    if (g_bad) {
++        std::printf("test-opencl-workgroups: %d failure(s)\n", g_bad);
++        return 1;
++    }
++    std::printf("test-opencl-workgroups: ok\n");
++    return 0;
++}

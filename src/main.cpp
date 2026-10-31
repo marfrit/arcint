@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "api/handlers.h"
+#include "api/responses_state.h"
 #include "build_info.h"
 #include "config.h"
 #include "exec/backend.h"
@@ -126,7 +127,10 @@ int main(int argc, char** argv) {
     }
 
     lgc::api::SlotPool slots(cfg.parallel);
-    lgc::api::Context  ctx{&cfg, backend.get(), &slots};
+    lgc::api::Context  ctx{.cfg = &cfg, .backend = backend.get(), .slots = &slots};
+    ctx.responses = std::make_shared<lgc::api::ResponseStore>(lgc::api::ResponseStore::Limits{
+        cfg.responses_store_entries, static_cast<uint64_t>(cfg.responses_store_bytes),
+        cfg.responses_store_ttl_s});
     // named lanes: a pool each, admitting by name
     std::vector<std::unique_ptr<lgc::api::SlotPool>> lane_pools;
     ctx.lanes = lgc::api::make_lanes(cfg, lane_pools);

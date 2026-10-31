@@ -15,7 +15,7 @@
 # instead of 1,141 t/s at 4k.
 #
 # Since 2026-10-11: 196,608 tokens with q8_0:q4_0 KV (K in q8_0, V in q4_0;
-# docs/campaigns/agent-context.md on the qfndev branch). Measured on the B60 with arcint 0.7.3 and
+# docs/campaigns/agent-context.md). Measured on the B60 with arcint 0.7.3 and
 # exactly these flags: the needle at 40 % of a 195,451-token prompt right
 # (prefill 1,059 s, 184.6 t/s; decode there 12.0 t/s); acceptance task 10/10
 # (temperature 0, one run); KL 0.005950 / top-1 97.30 % against q8_0 KV's
@@ -32,8 +32,7 @@
 # start: --n-ctx 131072 --llama-kv q8_0.
 #
 # --llama-mtp-vocab: the draft head scores a 40,960-token vocabulary
-# (HyperQwen's; docs/campaigns/research-hyperqwen.md on the qfndev branch)
-# instead of the full one.
+# (HyperQwen's, docs/campaigns/research-hyperqwen.md) instead of the full one.
 
 [Unit]
 Description=arcint-agent — Qwen3.8-27B dense + MTP on libllama (q8_0:q4_0 KV, 245760 tokens), GPU.0, :8087

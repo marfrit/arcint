@@ -183,6 +183,13 @@ std::string usage_text() {
         "                            once)\n"
         "  --http-threads N          HTTP worker threads (default: library default)\n"
         "\n"
+        "responses store\n"
+        "  --responses-store-entries N  retained responses per lane (default: 32;\n"
+        "                            0 disables retention entirely)\n"
+        "  --responses-store-bytes B    retained bytes per lane (default: 16777216);\n"
+        "                            0 disables the byte bound\n"
+        "  --responses-store-ttl S      entry TTL in seconds (default: 86400)\n"
+        "\n"
         "memory\n"
         "  --n-ctx N                 context length (default: the model's trained\n"
         "                            context, at most 32768). There is no auto-fit: the\n"
@@ -235,6 +242,16 @@ std::string usage_text() {
         "                            behaviour of every build up to this one; a request\n"
         "                            may set the same thing as think_eog_mask\n"
         "  --tool-grammar            constrain a tool call to the declared schemas\n"
+        "  --think-ctx-reserve N     tokens of the lane's context reserved for what\n"
+        "                            is left after the thought (default 0: off). The\n"
+        "                            sampler forces the think-block's closer once\n"
+        "                            n_ctx - prompt_tokens - N reasoning tokens have\n"
+        "                            been emitted, through the loop guard's forced-\n"
+        "                            closer seam; a prompt already inside the reserve\n"
+        "                            forces it at the first thinking token. With a\n"
+        "                            loop-guard nudge in flight the closer waits for\n"
+        "                            the sentence's remaining ids: add that length to\n"
+        "                            the reserve\n"
         "                            with a GBNF grammar: a call the model starts is\n"
         "                            one it finishes, so an unterminated call block is\n"
         "                            unreachable. A no-op when the request declared no\n"
@@ -290,6 +307,14 @@ std::string usage_text() {
         "  --llama-mtp-min-p P       stop drafting at a token the MTP head gives less\n"
         "                            than P, and leave it out of the verify (0-1; 0 off:\n"
         "                            always --llama-mtp drafts)\n"
+        "  --llama-mtp-policy off|cost\n"
+        "                            cost: Strata's cost-aware window rule picks the\n"
+        "                            kept drafts and the verify's rows from the measured\n"
+        "                            per-width round time (default off: the fixed\n"
+        "                            --llama-mtp width; one lane only)\n"
+        "  --llama-mtp-cost-seed LIST the round ms per width, one list a context\n"
+        "                            bucket: \"T1,T2,..;T1,..;T1,..\" (needs\n"
+        "                            --llama-mtp-policy cost)\n"
         "  --llama-dflash-gguf FILE  draft with this DFlash2 drafter (llama.cpp's\n"
         "                            'dflash' GGUF for the served model) instead of\n"
         "                            an MTP head: one drafter pass proposes a block,\n"
@@ -302,6 +327,12 @@ std::string usage_text() {
         "                            0 off: always --llama-dflash drafts)\n"
         "  --llama-dflash-ubatch N   the DFlash2 drafter's ubatch, 8-512 (default 64):\n"
         "                            its compute buffer holds N rows of logits\n"
+        "  --llama-slot-loan MIB     lend the expert cache's tail layers' slots to a\n"
+        "                            prompt of more than the resident chunk (2048) and\n"
+        "                            reserve the compute buffers at the prompt's chunk\n"
+        "                            (default 0, off; contrib/llama.cpp 0068)\n"
+        "  --llama-loan-chunk N      the chunk a slot loan may ask for (0: the\n"
+        "                            prefill chunk)\n"
         "  --llama-reserve-cells N   reserve the compute buffers for a prompt ubatch at N\n"
         "                            cache cells, not the whole context; deeper prompt\n"
         "                            chunks take smaller ubatches (0: the whole context)\n"
@@ -327,6 +358,32 @@ std::string usage_text() {
         "                            model (default 0, the first)\n"
         "  --llama-expert-profile F  the expert ranking that fills the cache (Strata's\n"
         "                            STRP profile; default round robin)\n"
+        "  --llama-expert-cache-save F\n"
+        "                            save the learned STRP ranking to F at teardown,\n"
+        "                            from this cache's cumulative routing counts\n"
+        "                            (Strata's --expert-profile-save); needs\n"
+        "                            --llama-expert-cache. A layer split has a cache a\n"
+        "                            card and one path cannot name both: nothing is\n"
+        "                            saved there (give a path a card). F must differ\n"
+        "                            from --llama-expert-profile (the save would\n"
+        "                            overwrite the file it points at). OFF by\n"
+        "                            default: only this flag turns it on\n"
+        "  --llama-expert-cache-save-rule R\n"
+        "                            the save's ranking rule: xe (default, Strata's\n"
+        "                            SYCL/xe save: prior mass by rank mixed with the\n"
+        "                            counts, STRATA_PROFILE_PRIOR_ENTRIES, 800,000 by\n"
+        "                            default) or cu (Strata's rank_learned_profile:\n"
+        "                            resident pairs first)\n"
+        "  --llama-expert-route-trace DIR\n"
+        "                            binary routing trace into DIR (created if\n"
+        "                            missing; one fresh file a process, rotated at\n"
+        "                            256 MB; each file replays alone; nothing is\n"
+        "                            deleted). OFF by default; when on it stores every\n"
+        "                            request's token ids and the experts it routed,\n"
+        "                            i.e. the prompt and the answer in another form,\n"
+        "                            on the serving host. A prompt record is about\n"
+        "                            1.9 KB a prompt token (100k: ~190 MB), so DIR\n"
+        "                            belongs on a dataset with room\n"
         "  --llama-kv K[:V]          the attention cache types, f16, q8_0 or q8_0:q4_0\n"
         "                            (default f16): q8_0 takes the cache to 53 %,\n"
         "                            q8_0:q4_0 to 41 %\n";
@@ -404,12 +461,29 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--llama-expert-profile") {
             if (!value(v)) return fail("--llama-expert-profile needs a profile file");
             cfg.llama_expert_profile = std::string(v);
+        } else if (arg == "--llama-expert-cache-save") {
+            if (!value(v)) return fail("--llama-expert-cache-save needs a profile file");
+            cfg.llama_expert_cache_save = std::string(v);
+        } else if (arg == "--llama-expert-cache-save-rule") {
+            if (!value(v) || (std::string(v) != "xe" && std::string(v) != "cu"))
+                return fail("--llama-expert-cache-save-rule takes xe or cu");
+            cfg.llama_expert_cache_save_rule = std::string(v);
+        } else if (arg == "--llama-expert-route-trace") {
+            if (!value(v)) return fail("--llama-expert-route-trace needs a directory");
+            cfg.llama_expert_route_trace = std::string(v);
         } else if (arg == "--llama-mtp-gguf") {
             if (!value(v)) return fail("--llama-mtp-gguf needs an MTP-only GGUF");
             cfg.llama_mtp_gguf = std::string(v);
         } else if (arg == "--llama-mtp-min-p") {
             if (!value(v) || !parse_double(v, cfg.llama_mtp_min_p) || cfg.llama_mtp_min_p < 0.0 || cfg.llama_mtp_min_p > 1.0)
                 return fail("--llama-mtp-min-p needs a probability from 0 to 1");
+        } else if (arg == "--llama-mtp-policy") {
+            if (!value(v) || (std::string(v) != "off" && std::string(v) != "cost"))
+                return fail("--llama-mtp-policy takes off or cost");
+            cfg.llama_mtp_policy = std::string(v) == "cost";
+        } else if (arg == "--llama-mtp-cost-seed") {
+            if (!value(v)) return fail("--llama-mtp-cost-seed needs a cost table: \"T1,T2,..;T1,..;T1,..\"");
+            cfg.llama_mtp_cost_seed = std::string(v);
         } else if (arg == "--llama-dflash-gguf") {
             if (!value(v)) return fail("--llama-dflash-gguf needs a DFlash2 drafter GGUF");
             cfg.llama_dflash_gguf = std::string(v);
@@ -424,6 +498,16 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, cfg.llama_dflash_ubatch) || cfg.llama_dflash_ubatch < 8 ||
                 cfg.llama_dflash_ubatch > 512)
                 return fail("--llama-dflash-ubatch needs a ubatch from 8 to 512");
+        } else if (arg == "--llama-slot-loan") {
+            int mib = 0;
+            if (!value(v) || !parse_int(v, mib) || mib < 0)
+                return fail("--llama-slot-loan needs a size in MiB >= 1 (0: off)");
+            cfg.llama_slot_loan_mib = mib;
+        } else if (arg == "--llama-loan-chunk") {
+            int n = 0;
+            if (!value(v) || !parse_int(v, n) || n < 0)
+                return fail("--llama-loan-chunk needs a token count >= 0 (0: the prefill chunk)");
+            cfg.llama_loan_chunk = n;
         } else if (arg == "--llama-reserve-cells") {
             int n = 0;
             if (!value(v) || !parse_int(v, n) || n < 0)
@@ -558,6 +642,11 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             cfg.nothink_presence_penalty = static_cast<float>(d);
         } else if (arg == "--think-eog-mask") {
             cfg.think_eog_mask = true;
+        } else if (arg == "--think-ctx-reserve") {
+            int n = 0;
+            if (!value(v) || !parse_int(v, n) || n < 0)
+                return fail("--think-ctx-reserve needs a token count >= 0 (0: off)");
+            cfg.think_ctx_reserve = n;
         } else if (arg == "--tool-grammar") {
             cfg.tool_grammar = true;
         } else if (arg == "--loop-guard") {
@@ -617,6 +706,18 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--queue-timeout") {
             if (!value(v) || !parse_double(v, cfg.queue_timeout_s)) {
                 return fail("--queue-timeout needs a number of seconds");
+            }
+        } else if (arg == "--responses-store-entries") {
+            if (!value(v) || !parse_int(v, cfg.responses_store_entries)) {
+                return fail("--responses-store-entries needs an integer");
+            }
+        } else if (arg == "--responses-store-bytes") {
+            if (!value(v) || !parse_int(v, cfg.responses_store_bytes)) {
+                return fail("--responses-store-bytes needs an integer");
+            }
+        } else if (arg == "--responses-store-ttl") {
+            if (!value(v) || !parse_int(v, cfg.responses_store_ttl_s)) {
+                return fail("--responses-store-ttl needs an integer (seconds)");
             }
         } else if (arg == "--stub-delay-ms") {
             if (!value(v) || !parse_int(v, cfg.stub_delay_ms)) {
@@ -690,6 +791,10 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         return fail("--queue-timeout must be between 0 and 3600 seconds");
     }
     if (cfg.http_threads < 0) return fail("--http-threads must be >= 0");
+    if (cfg.responses_store_entries < 0)
+        return fail("--responses-store-entries must be >= 0");
+    if (cfg.responses_store_bytes < 0) return fail("--responses-store-bytes must be >= 0");
+    if (cfg.responses_store_ttl_s < 0) return fail("--responses-store-ttl must be >= 0");
     if (cfg.stub_delay_ms < 0) return fail("--stub-delay-ms must be >= 0");
     if (cfg.device.empty()) return fail("--device must not be empty");
     if (cfg.stub_delay_ms > 0 && !cfg.stub) return fail("--stub-delay-ms only applies to --stub");
@@ -732,7 +837,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     }
     if (cfg.stub) {
         if (cfg.llama_cpu_moe > 0 || cfg.llama_threads > 0 || cfg.llama_mtp > 0 || !cfg.llama_mtp_vocab.empty() ||
-            !cfg.llama_mtp_gguf.empty() || cfg.llama_mtp_min_p > 0.0 || cfg.llama_dflash_on() || cfg.llama_dflash > 0 ||
+            !cfg.llama_mtp_gguf.empty() || cfg.llama_mtp_min_p > 0.0 || cfg.llama_mtp_policy ||
+            !cfg.llama_mtp_cost_seed.empty() || cfg.llama_dflash_on() || cfg.llama_dflash > 0 ||
             cfg.llama_dflash_min_p > 0.0 || cfg.llama_dflash_ubatch > 0 ||
             cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192 ||
             cfg.llama_expert_cache_on() || !cfg.llama_expert_profile.empty() || cfg.llama_layer_split > 0 || cfg.llama_mtp_card >= 0 ||
@@ -775,7 +881,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.llama_dflash_ubatch > 0 && !cfg.llama_dflash_on())
         return fail("--llama-dflash-ubatch needs --llama-dflash-gguf (the drafter)");
     if (cfg.llama_dflash_on() && (cfg.llama_mtp > 0 || !cfg.llama_mtp_vocab.empty() || !cfg.llama_mtp_gguf.empty() ||
-                                  cfg.llama_mtp_min_p > 0.0))
+                                  cfg.llama_mtp_min_p > 0.0 || cfg.llama_mtp_policy || !cfg.llama_mtp_cost_seed.empty()))
         return fail("--llama-dflash-gguf and --llama-mtp (-vocab, -gguf, -min-p) are exclusive: one drafter a context, "
                     "the DFlash2 drafter or the MTP head");
     if (cfg.llama_dflash_on() && cfg.llama_dflash == 0) cfg.llama_dflash = 7;   // the drafter's block of 8
@@ -783,10 +889,18 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (!cfg.llama_mtp_vocab.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-vocab needs --llama-mtp");
     if (!cfg.llama_mtp_gguf.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-gguf needs --llama-mtp");
     if (cfg.llama_mtp_min_p > 0.0 && cfg.llama_mtp <= 0) return fail("--llama-mtp-min-p needs --llama-mtp");
+    if (cfg.llama_mtp_policy && cfg.llama_mtp <= 0) return fail("--llama-mtp-policy needs --llama-mtp");
+    if (!cfg.llama_mtp_cost_seed.empty() && !cfg.llama_mtp_policy)
+        return fail("--llama-mtp-cost-seed needs --llama-mtp-policy cost");
     if (cfg.llama_expert_cache_on() && cfg.llama_cpu_moe <= 0)
         return fail("--llama-expert-cache caches experts --llama-cpu-moe keeps in host memory: give --llama-cpu-moe");
     if (!cfg.llama_expert_profile.empty() && !cfg.llama_expert_cache_on())
         return fail("--llama-expert-profile needs --llama-expert-cache");
+    if (!cfg.llama_expert_cache_save.empty() && !cfg.llama_expert_cache_on())
+        return fail("--llama-expert-cache-save needs --llama-expert-cache");
+    // the save would write over the profile the same run reads: refuse at config
+    if (!cfg.llama_expert_cache_save.empty() && cfg.llama_expert_cache_save == cfg.llama_expert_profile)
+        return fail("--llama-expert-cache-save must differ from --llama-expert-profile: the save would overwrite it");
     // --device: one card, or the two of a layer split (no automatic split:
     // the split point decides each card's VRAM, so it is the operator's)
     if (!split_list(cfg.device, cfg.llama_devices))
@@ -830,6 +944,7 @@ std::optional<std::string> apply_operator_defaults(const Config& cfg, SamplerDef
     o.answer_presence_penalty  = cfg.answer_presence_penalty;
     o.answer_frequency_penalty = cfg.answer_frequency_penalty;
     if (cfg.think_eog_mask) o.think_eog_mask = true;
+    if (cfg.think_ctx_reserve > 0) o.think_ctx_reserve = cfg.think_ctx_reserve;
     if (cfg.tool_grammar)   o.tool_grammar   = true;
     // loop-guard: off changes nothing and does not mark the defaults operator;
     // any other rung carries its window/threshold/grace with it.

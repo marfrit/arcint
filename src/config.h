@@ -67,6 +67,17 @@ struct Config {
     // probability under the MTP head is at least P, and a draft below P is
     // not verified (Strata's --spec-min-p); 0 drafts --llama-mtp tokens always
     double llama_mtp_min_p = 0.0;
+    // --llama-mtp-policy off|cost: cost hands the chain to Strata's cost-aware
+    // window rule (src/exec/draft_policy.h, campaign research-mtp-width-policy
+    // 5.2) instead of the fixed --llama-mtp ceiling; off (default) is the fixed
+    // width. One lane only: named lanes run it off. The min-p floor above stays
+    // a floor over the policy's choice.
+    bool llama_mtp_policy = false;
+    // --llama-mtp-cost-seed "T1,T2,..;T1,..;T1,..": the round ms per width, one
+    // list a context bucket (<6K, <24K, longer), as Strata's
+    // STRATA_SPEC_COST_TABLE (generate.cpp:16495-16511), counted as weight 6
+    // rounds (draft_policy.cpp:66-74). Needs --llama-mtp-policy cost.
+    std::string llama_mtp_cost_seed;
     // --llama-dflash-gguf FILE: a DFlash2 drafter (llama.cpp's `dflash`
     // architecture, converted with --target-model-dir) drafts a block a
     // verify instead of the MTP head, conditioned on the target's hidden
@@ -119,6 +130,25 @@ struct Config {
     int         llama_expert_cache_mib = 0;
     std::vector<int> llama_expert_cache_mib_dev;
     std::string llama_expert_profile;
+    // --llama-expert-cache-save F: at teardown, write the cache's learned STRP
+    // ranking to F from its cumulative routing counts (raw heat, one a routed
+    // pair, counted in count()), with the loaded profile as the prior (Strata's
+    // --expert-profile-save). Needs --llama-expert-cache; F must differ from
+    // llama_expert_profile, which the save would overwrite. A layer split has a
+    // cache a card; one path cannot name both, so nothing is saved there. Empty:
+    // off, one getenv and nothing else.
+    std::string llama_expert_cache_save;
+    // --llama-expert-cache-save-rule: xe (default, Strata's SYCL/xe save with
+    // the prior mass by rank) or cu (Strata's rank_learned_profile, residents
+    // first). Empty means xe.
+    std::string llama_expert_cache_save_rule;
+    // --llama-expert-route-trace DIR: an opt-in, binary record of every
+    // expert the cache routed, a file per process, rotated at a size cap (each
+    // file replays alone), never deleted by arcint. Empty: off, one getenv and
+    // nothing else. A trace with token ids is the prompt and the answer in
+    // another form: whoever turns it on stores every request's content on the
+    // serving host.
+    std::string llama_expert_route_trace;
     // --device GPU.0,GPU.1 with --engine llama: the cards of a layer split,
     // in layer order (filled from --device by parse_args; one entry for one
     // card). --llama-layer-split K: layers [0, K) on the first card, [K,
@@ -137,6 +167,16 @@ struct Config {
         return llama_expert_cache_mib > 0;
     }
     int llama_checkpoint_step = 8192;
+    // --llama-slot-loan MIB / --llama-loan-chunk N: the prefill-slot-loan
+    // (docs/campaigns/prefill-slot-loan.md): up to MIB of the expert cache's
+    // tail layers' slots are lent to a prompt, the tail slot buffer and its
+    // lend bank set up at load, and a prompt longer than the resident chunk
+    // borrows them while the compute buffers are reserved at the prompt's
+    // chunk (contrib/llama.cpp 0068). 0 off. --llama-loan-chunk is the chunk a
+    // loan may ask for (0: --prefill-chunk); the buffer without a loan stays
+    // reserved for the resident chunk (min of the two, 2048).
+    int  llama_slot_loan_mib = 0;
+    int  llama_loan_chunk    = 0;
     bool        stub = false;
 
     // The name this endpoint answers to on /v1/models and /props. Empty means
@@ -175,6 +215,12 @@ struct Config {
     // queue from a hang. A non-zero value restores queueing for deployments
     // that prefer it, and /health reports the queue depth either way.
     double queue_timeout_s = 0.0;
+    // The Responses store (docs/campaigns/feyntalk.md State): per-lane entries,
+    // retained bytes and TTL, in seconds. entries == 0 disables retention
+    // entirely (review R4); 0 bytes disables the byte bound.
+    int responses_store_entries = 32;
+    int responses_store_bytes   = 16 * 1024 * 1024;
+    int responses_store_ttl_s   = 24 * 60 * 60;
 
     // Prefill chunk in tokens (llama.cpp's n_batch), 0 = the default 2048.
     // Bounding the chunk bounds activation memory, which is how deep context
@@ -257,6 +303,13 @@ struct Config {
     float       loop_guard_threshold = 0.8f;
     int         loop_guard_grace     = 40;
     int         loop_guard_door_grace = 20;
+
+    // feyntalk W3.4: the context guard's reserve in tokens (--think-ctx-reserve).
+    // 0 (default) is off: no budget at request start, no forced closer,
+    // byte-identical to before. N > 0 reserves N tokens of the lane's n_ctx
+    // for what is left after the thought: the sampler forces the think block's
+    // closer once n_ctx - prompt_tokens - N emitted reasoning tokens have gone.
+    int         think_ctx_reserve = 0;
 
     // Stub-only: milliseconds of artificial latency per emitted token. Exists
     // so the cancellation path (§3.7) can be demonstrated against a backend

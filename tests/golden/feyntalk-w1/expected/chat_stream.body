@@ -1,0 +1,98 @@
+data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"arcint"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"stub"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"backend"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"·"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"no"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"model"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"loaded"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"·"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"stub"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"("},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"stub"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":")"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"\n"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"prompt"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"23"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"tokens"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":","},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"sampler"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"greedy"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"."},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"Gr"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"üße"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"aus"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"der"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"Werkstatt"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"."},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" "},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"🧩"},"finish_reason":null,"index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk"}
+
+data: {"choices":[],"created":<created>,"id":"<id>","model":"stub","object":"chat.completion.chunk","usage":{"completion_tokens":44,"completion_tokens_details":{"accepted_prediction_tokens":0,"rejected_prediction_tokens":0},"prompt_tokens":23,"total_tokens":67}}
+
+data: [DONE]
+

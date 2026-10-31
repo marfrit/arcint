@@ -5,12 +5,16 @@
 // llama.cpp keeps the weights, the tokenizer, the attention KV and the
 // recurrent (gated delta-net) state, one sequence per lane.
 #include "exec/backend.h"
+#include "exec/mtp_trace.h"   // the MTP window trace (off by default, ARCINT_MTP_TRACE)
+#include "exec/slot_loan.h"
+#include "core/markers.h"
 
 #ifdef ARCINT_LLAMA
 
 #include <CL/cl.h>
 #include <gguf.h>
 #include <llama.h>
+#include <llama-ext.h>   // llama_expert_route_trace_flush (contrib/llama.cpp 0069)
 
 #ifdef ARCINT_MTMD
 #include <mtmd.h>
@@ -146,7 +150,12 @@ bool stop_requested(const GenerationInput& in) {
 // Why an Abort: the stop flag is checked first, so a SIGTERM is not logged as
 // a gone client (the card showed "aborted: client gone" on SIGTERM).
 AbortCause abort_cause_of(const GenerationInput& in) {
-    return stop_requested(in) ? AbortCause::StopSignal : AbortCause::ClientGone;
+    // The stop flag first (a SIGTERM is not logged as a gone client), then a
+    // cancel-by-id flag (the campaign's W4 seam; the route also ORs it into the
+    // peer closure, so the boundary checks see it), then the closed peer.
+    if (stop_requested(in)) return AbortCause::StopSignal;
+    if (in.cancel && in.cancel->load(std::memory_order_relaxed)) return AbortCause::Cancelled;
+    return AbortCause::ClientGone;
 }
 
 // The tokens a cancelled prefill actually prefilled: the `have` growth over
@@ -384,6 +393,26 @@ public:
         }
         llama_log_set(route_llama_log, nullptr);
         llama_backend_init();
+        // --llama-expert-route-trace: set before the model's load, which reads
+        // it once at the expert cache's init. Empty unsets, so an inherited
+        // variable cannot turn the trace on behind the operator's back.
+        if (cfg.llama_expert_route_trace.empty()) {
+            unsetenv("LLAMA_EXPERT_ROUTE_TRACE");
+        } else {
+            setenv("LLAMA_EXPERT_ROUTE_TRACE", cfg.llama_expert_route_trace.c_str(), 1);
+        }
+        // --llama-expert-cache-save: the same rule, read at the cache's teardown
+        if (cfg.llama_expert_cache_save.empty()) {
+            unsetenv("LLAMA_EXPERT_CACHE_SAVE");
+        } else {
+            setenv("LLAMA_EXPERT_CACHE_SAVE", cfg.llama_expert_cache_save.c_str(), 1);
+        }
+        // the save's rule (the default xe is unset: the cache's own default)
+        if (cfg.llama_expert_cache_save_rule.empty() || cfg.llama_expert_cache_save_rule == "xe") {
+            unsetenv("LLAMA_EXPERT_CACHE_SAVE_RULE");
+        } else {
+            setenv("LLAMA_EXPERT_CACHE_SAVE_RULE", cfg.llama_expert_cache_save_rule.c_str(), 1);
+        }
 
         llama_model_params mp = llama_model_default_params();
         mp.n_gpu_layers       = 999;
@@ -436,6 +465,11 @@ public:
 #ifdef ARCINT_LLAMA_EXPERT_CACHE
         expert_profile_          = cfg.llama_expert_profile;
         mp.expert_cache_bytes    = static_cast<size_t>(cfg.llama_expert_cache_mib) << 20;
+#ifdef ARCINT_LLAMA_SLOT_LOAN
+        // 0 when the flag is off is an explicit off: LLAMA_SLOT_LOAN_MIB cannot
+        // turn the loan on behind it (slot_loan::lend_param, finding 8)
+        mp.slot_loan_bytes       = slot_loan::lend_param(cfg.llama_slot_loan_mib);
+#endif
         mp.expert_cache_profile  = expert_profile_.empty() ? nullptr : expert_profile_.c_str();
         if (split && ec_on) {
 #ifdef ARCINT_LLAMA_EXPERT_CACHE_DEV
@@ -514,6 +548,20 @@ public:
                       static_cast<double>(ec.bank_bytes) / (1u << 30));
 #endif
         }
+
+#ifdef ARCINT_LLAMA_SLOT_LOAN
+        // the prefill-slot-loan: what the cache set up at load, not what was
+        // asked for (a non-lendable tail or a smaller budget shortens it)
+        llama_slot_loan_info sl{};
+        if (cfg.llama_slot_loan_mib > 0 && llama_model_slot_loan_info(model_, &sl) && sl.bytes > 0) {
+            loan_rule_.enabled    = true;
+            loan_rule_.lend_bytes = sl.bytes;
+            log::info("load", "slot loan: %d tail layers, %lld expert slots, %.2f GiB lendable in host memory",
+                      sl.layers, static_cast<long long>(sl.slots), static_cast<double>(sl.bytes) / (1u << 30));
+        } else if (cfg.llama_slot_loan_mib > 0) {
+            log::warn("load", "--llama-slot-loan: the cache set up no lendable tail (its log says why); off");
+        }
+#endif
 #endif
 
         // The models this engine serves, by the GGUF's own architecture (there
@@ -522,8 +570,9 @@ public:
         // family's: served for creative writing with Mistral Small 3.2's
         // finetune Cydonia 24B (operator, 2026-10-04). Others of the family
         // load too; their tool calls are not parsed (Qwen formats only,
-        // src/core/toolcall.h). Their think blocks are split: <thinking>
-        // (Cydonia) and [THINK] (Magistral), see ModelStatus::think_tags_extended
+        // src/core/toolcall.h). Their think blocks are split: the angle-bracket
+        // tags (Cydonia) and the square-bracket tags (Magistral), see
+        // ModelStatus::think_tags_extended
         char arch[64] = {};
         llama_model_meta_val_str(model_, "general.architecture", arch, sizeof(arch));
         const std::string a(arch);
@@ -656,6 +705,17 @@ public:
             cp.n_outputs_max         = 0;   // 0 = llama.cpp's n_batch
             cp.n_outputs_max_per_seq = 0;   // 0 = n_outputs_max
         }
+#ifdef ARCINT_LLAMA_SLOT_LOAN
+        // the loan asks the context for the loan chunk; without a loan the buffers
+        // stay reserved for the resident chunk (a 1,000-token follow-up pays
+        // neither a reserve nor a refill)
+        if (loan_rule_.enabled) {
+            if (lanes_ > 1)
+                throw std::runtime_error("--llama-slot-loan: one lane (a second lane must never see a lent slot)");
+            loan_chunk_          = static_cast<uint32_t>(cfg.llama_loan_chunk > 0 ? cfg.llama_loan_chunk : n_batch_);
+            cp.n_ubatch_reserve  = slot_loan::floor_chunk(loan_chunk_, loan_rule_);
+        }
+#endif
         ctx_               = llama_init_from_model(model_, cp);
         if (ctx_ == nullptr) throw std::runtime_error("llama.cpp could not create a context");
         // llama.cpp pads the context to 256 (llama-context.cpp:291); the caps
@@ -706,10 +766,12 @@ public:
             std::string err;
             spec_ = make_llama_mtp(mtp_model, ctx_, cfg.llama_mtp, lanes_, n_batch_, static_cast<int>(cp.n_ubatch),
                                    threads, cfg.llama_mtp_gguf.empty() ? cfg.gguf_path : cfg.llama_mtp_gguf,
-                                   cfg.llama_mtp_vocab, cfg.llama_mtp_min_p, cp.type_k, cp.type_v, cp.kv_unified,
-                                   cp.n_kv_reserve, err);
+                                   cfg.llama_mtp_vocab, cfg.llama_mtp_min_p, cfg.llama_mtp_policy,
+                                   cfg.llama_mtp_cost_seed, cp.type_k, cp.type_v, cp.kv_unified, cp.n_kv_reserve,
+                                   err);
             if (!spec_) throw std::runtime_error(log::format("--llama-mtp %d: %s", cfg.llama_mtp, err.c_str()));
             n_draft_ = cfg.llama_mtp;
+            mtp_min_p_ = cfg.llama_mtp_min_p;   // the trace records it (exec/mtp_trace.h)
             if (windows_ && !spec_->set_kv_windows(windows.data(), lanes_))
                 log::warn("load", "named lanes: the MTP draft context takes no cell windows; its attention spans "
                                   "the pool's used cells");
@@ -764,7 +826,13 @@ public:
                 throw std::runtime_error(log::format("%s carries no chat template", cfg.gguf_path.c_str()));
             log::warn("load", "%s carries no chat template: --tts, using the ChatML fallback for a stray chat request",
                       cfg.gguf_path.c_str());
-            tmpl = "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+            // static: tmpl points into it and is copied after this block ends
+            static const std::string chatml_fallback =
+                "{% for message in messages %}" + std::string(markers::kTurnStart) +
+                "{{ message['role'] }}\n{{ message['content'] }}" + std::string(markers::kTurnEnd) +
+                "\n{% endfor %}{% if add_generation_prompt %}" + std::string(markers::kTurnStart) +
+                "assistant\n{% endif %}";
+            tmpl = chatml_fallback.c_str();
         }
         template_src_ = tmpl;
         const char* bos = llama_vocab_get_text(vocab_, llama_vocab_bos(vocab_));
@@ -945,6 +1013,8 @@ public:
     }
 
     ~LlamaBackend() override {
+        // the trace's pending last graph, written before the context goes
+        if (ctx_ != nullptr) llama_expert_route_trace_flush(ctx_);
         spec_.reset();   // its draft context reads the target's
 #ifdef ARCINT_MTMD
         if (mctx_ != nullptr) mtmd_free(mctx_);
@@ -956,6 +1026,22 @@ public:
     }
 
     const ModelStatus& status() const override { return status_; }
+#ifdef ARCINT_LLAMA_SLOT_LOAN
+    // /props reads this under the context's lock: "off"/"armed"/"out"/"poisoned"/
+    // "broken". A poisoned or broken state exits the process (patch 0068's
+    // llama_loan_book::poison_exit, operator 2026-10-29), so a live server
+    // reports at worst "out" for a moment or "armed".
+    std::string slot_loan_state() const override {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (ctx_ == nullptr) return "off";
+        const char * st = llama_context_slot_loan_state(ctx_);
+        return st != nullptr ? st : "off";
+    }
+    std::string mtp_cost_table() const override {
+        std::lock_guard<std::mutex> lk(mu_);
+        return spec_ ? spec_->mtp_cost_table() : std::string();
+    }
+#endif
     Tokenizer&         tokenizer() override { return *tokenizer_; }
     // The ids read once at load; the reasoning split and the sampler's tracker
     // decide the block's roles by them.
@@ -987,8 +1073,21 @@ public:
         return template_->apply(inputs, opts);
     }
 
+    // Every return of generate() (and a throw), the trace's last graph
     FinishReason generate(const GenerationInput& in, int slot, const TokenCallback& on_piece,
                           GenerationStats& stats) override {
+        // the flush is a llama_context call: take mu_ like every other one.
+        // The catch in generate_spec releases mu_ before this destructor runs.
+        struct TraceFlush {
+            llama_context * ctx;
+            std::mutex     * mu;
+            ~TraceFlush() {
+                if (ctx != nullptr) {
+                    std::lock_guard<std::mutex> lk(*mu);
+                    llama_expert_route_trace_flush(ctx);
+                }
+            }
+        } trace_flush_{ctx_, &mu_};
         if (!in.images.empty()) return generate_mm(in, slot, on_piece, stats);
         if (spec_) return generate_spec(in, slot, on_piece, stats);
         const int seq = std::min(std::max(slot, 0), lanes_ - 1);
@@ -1008,6 +1107,7 @@ public:
         }
         Sampler sampler(in.sampler, seed);
         sampler.set_prompt(prompt);
+        prepare_think_ctx(in.sampler, cap, stats.prompt_tokens, sampler);
         prepare_think_mask(in, sampler);
         prepare_loop_guard(in, sampler);
         const auto tool_grammar = prepare_tool_grammar(in, sampler);
@@ -1019,6 +1119,15 @@ public:
         const auto t_prefill = clock_type::now();
         {
             std::lock_guard<std::mutex> lk(mu_);
+#ifdef ARCINT_LLAMA_SLOT_LOAN
+            // A previous request's scope failed and left a loan out: its slots
+            // are not the file's, so answer no request until the operator
+            // restarts. Read under mu_: the loan's state is the context's, and
+            // the scope that changes it runs under the same lock (finding 8).
+            if (!slot_loan::request_start_ok(llama_context_slot_loan_out(ctx_)))
+                throw std::runtime_error(log::format("the slot loan's state is %s; refusing this request (a lent slot must never be read as an expert)",
+                                                     llama_context_slot_loan_state(ctx_) ? llama_context_slot_loan_state(ctx_) : "unusable"));
+#endif
             // The longest prefix this lane still holds is reused; one token is
             // always run, for its logits. A recurrent state cannot step back:
             // where llama.cpp refuses the partial removal the lane resumes from
@@ -1042,9 +1151,11 @@ public:
             // all but the last token, checkpointed along the way; the last
             // runs alone, for its logits
             const size_t n_pre = prompt.size() - 1;
-            if (!prefill_locked(seq, prompt, common, n_pre, have, [&](const int* t, size_t n, size_t at) {
-                    return decode_locked(seq, t, n, at, false);
-                }, in)) {
+            if (!prefill_with_loan_locked(prompt, common, n_pre, have, [&](const std::vector<int>& p, size_t f, size_t e, std::vector<int>& h) {
+                    return prefill_locked(seq, p, f, e, h, [&](const int* t, size_t n, size_t at) {
+                        return decode_locked(seq, t, n, at, false);
+                    }, in);
+                })) {
                 stats.prompt_tokens_prefilled = prefilled_so_far(have, common);
                 stats.abort_cause            = abort_cause_of(in);
                 stats.prefill_seconds        = seconds_since(t_prefill);
@@ -1200,6 +1311,7 @@ public:
         }
         Sampler sampler(in.sampler, seed);
         sampler.set_prompt(tokenizer_->encode(in.prompt));
+        prepare_think_ctx(in.sampler, cap, stats.prompt_tokens, sampler);
         prepare_think_mask(in, sampler);
         prepare_loop_guard(in, sampler);
         const auto tool_grammar = prepare_tool_grammar(in, sampler);
@@ -1484,10 +1596,10 @@ private:
     }
 
     // The text that opens a user message after an assistant reply (ChatML:
-    // "<|im_start|>user"), from the template by difference, as llama.cpp's
-    // autoparser finds its user_start: what stands between a reply and the
-    // next user message, less what ends a reply. Empty when the template
-    // renders neither.
+    // the turn-start marker followed by the user role), from the template
+    // by difference, as llama.cpp's autoparser finds its user_start: what
+    // stands between a reply and the next user message, less what ends a
+    // reply. Empty when the template renders neither.
     std::string user_start_text() const {
         static const char* u1 = "ARCINTPROBEUSERONE";
         static const char* a1 = "ARCINTPROBEREPLYONE";
@@ -1595,6 +1707,7 @@ private:
         }
         Sampler sampler(in.sampler, seed);
         sampler.set_prompt(prompt);
+        prepare_think_ctx(in.sampler, cap, stats.prompt_tokens, sampler);
         prepare_think_mask(in, sampler);
         prepare_loop_guard(in, sampler);
         const auto tool_grammar = prepare_tool_grammar(in, sampler);
@@ -1607,6 +1720,12 @@ private:
         const size_t n_pre     = prompt.size() - 1;
         {
             std::lock_guard<std::mutex> lk(mu_);
+#ifdef ARCINT_LLAMA_SLOT_LOAN
+            // as generate(): a loan left out refuses the request, read under mu_
+            if (!slot_loan::request_start_ok(llama_context_slot_loan_out(ctx_)))
+                throw std::runtime_error(log::format("the slot loan's state is %s; refusing this request (a lent slot must never be read as an expert)",
+                                                     llama_context_slot_loan_state(ctx_) ? llama_context_slot_loan_state(ctx_) : "unusable"));
+#endif
             size_t common = 0;
             while (common < have.size() && common < n_pre && have[common] == prompt[common]) ++common;
             if (common < have.size()) {
@@ -1626,9 +1745,11 @@ private:
             drop_ckpts_after_locked(seq, common);
             have.resize(common);
             stats.cache_hit_tokens = static_cast<int>(common);
-            if (!prefill_locked(seq, prompt, common, n_pre, have, [&](const int* t, size_t n, size_t at) {
-                    return spec_->decode(t, n, at, seq, false) == 0;
-                }, in)) {
+            if (!prefill_with_loan_locked(prompt, common, n_pre, have, [&](const std::vector<int>& p, size_t f, size_t e, std::vector<int>& h) {
+                    return prefill_locked(seq, p, f, e, h, [&](const int* t, size_t n, size_t at) {
+                        return spec_->decode(t, n, at, seq, false) == 0;
+                    }, in);
+                })) {
                 stats.prompt_tokens_prefilled = prefilled_so_far(have, common);
                 stats.abort_cause            = abort_cause_of(in);
                 stats.prefill_seconds        = seconds_since(t_prefill);
@@ -1639,6 +1760,10 @@ private:
 
         // ------------------------------------------------------------- decode
         const auto   t_decode = clock_type::now();
+        // ARCINT_MTP_TRACE's request counter (exec/mtp_trace.h): a per-request
+        // id in the line, not the lane's index, so the replay can split one
+        // process's history per request
+        const unsigned long long req_id = ++mtp_req_;
         FinishReason reason   = FinishReason::Stop;
         int          id_last  = prompt.back();
         std::vector<int> batch;
@@ -1651,6 +1776,12 @@ private:
         };
         std::optional<Decoding> decoding(std::in_place, *this, seq);
         clock_type::time_point last_peer = t_decode - std::chrono::seconds(1);   // first check at once
+        // ARCINT_MTP_TRACE (exec/mtp_trace.h): one record buffered one round, so
+        // each line carries its OWN round's duration - its start to the next
+        // round's start, the last round's to the loop's exit. The previous
+        // format carried round k-1's duration on round k's rows.
+        std::optional<MtpTraceRound> pending_trace;
+        clock_type::time_point       prev_trace_start = t_decode;
         while (true) {
             // A stop signal or a gone client at the token boundary, as the
             // plain loop (DESIGN §3.7).
@@ -1671,16 +1802,32 @@ private:
             if (in.sampler.max_tokens >= 0) budget = std::min(budget, in.sampler.max_tokens - stats.completion_tokens);
             const int n_max = std::max(0, std::min(n_draft_, budget - 1));
             std::vector<int> draft;
+            std::vector<float> probs;   // exec/mtp_trace.h: filled by draft_multi when the trace is on
+            // the round's own bookkeeping: its start, the depth it starts at, and
+            // the start-to-start time the trace records (the doc's open question)
+            const size_t pos0 = have.size();
+            const auto   t_start = clock_type::now();
+            if (pending_trace) {
+                // the previous round ran from prev_trace_start to this start
+                pending_trace->round_ms =
+                    std::chrono::duration<double, std::milli>(t_start - prev_trace_start).count();
+                mtp_trace_write(*pending_trace);
+                pending_trace.reset();
+            }
+            prev_trace_start = t_start;
+            double t_propose_s = 0.0, t_verify_s = 0.0;   // the round's halves, out of the step's block
             {
                 // the step, with the other lanes' steps that are ready: one draft
                 // step for all, then one target decode for all the verifies
                 // (llama.cpp's server drafts and batches its slots the same way);
                 // the rows leave the context under the lock, before another
                 // decode overwrites them
-                StepReq req{ seq, id_last, have.size(), n_max, &draft, &batch, &rows };
+                StepReq req{ seq, id_last, have.size(), n_max, &draft, &batch, &rows, &probs };
                 if (step_combined(req) != 0) throw std::runtime_error("llama_decode failed during verify");
                 stats.draft_propose_seconds += req.t_propose;
                 stats.draft_verify_seconds += req.t_verify;
+                t_propose_s = req.t_propose;
+                t_verify_s  = req.t_verify;
             }
             stats.draft_proposed += static_cast<int>(draft.size());
             ++stats.draft_steps;
@@ -1750,10 +1897,46 @@ private:
                     throw std::runtime_error("llama.cpp refused the draft rollback");
             }
             stats.draft_rollback_seconds += seconds_since(t_r);
+            // --llama-mtp-policy cost: the round's outcome to the rule (section
+            // 5.2): the verified window's drafts and probabilities, the walk's
+            // accepted count, and the round's own time - its start to here,
+            // which is propose + verify + walk + rollback. The trace's
+            // start-to-start measured that gap at 0.6 % (7.6); the last round
+            // has no next start, so this is the only measure it can have.
+            if (spec_->mtp_policy_on()) {
+                const double round_ms = std::chrono::duration<double, std::milli>(clock_type::now() - t_start).count();
+                std::lock_guard<std::mutex> lk(mu_);
+                spec_->mtp_observe(seq, probs, static_cast<int>(draft.size()), w.accepted,
+                                   static_cast<int>(batch.size()), round_ms, pos0);
+            }
+            // one trace record a verify round, off by default (exec/mtp_trace.h):
+            // buffered, because its duration is known only at the next round's
+            // start; the replay needs the per-width round time and the chain's
+            // own probabilities, and a draft never made is absent from `p`.
+            if (mtp_trace_on() && !dflash_) {
+                MtpTraceRound tr;
+                tr.req             = req_id;
+                tr.seq             = seq;
+                tr.pos             = static_cast<long long>(pos0);
+                tr.rows            = static_cast<int>(batch.size());
+                tr.accepted        = w.accepted;
+                tr.nmax            = n_max;
+                tr.min_p           = mtp_min_p_;
+                tr.probs           = probs;
+                tr.t_propose_ms    = t_propose_s * 1000.0;
+                tr.t_verify_ms     = t_verify_s * 1000.0;
+                pending_trace      = std::move(tr);
+            }
             if (w.done) {
                 reason = w.reason;
                 break;
             }
+        }
+        if (pending_trace) {
+            // the request's last round: no next start, so start to the loop's exit
+            pending_trace->round_ms =
+                std::chrono::duration<double, std::milli>(clock_type::now() - prev_trace_start).count();
+            mtp_trace_write(*pending_trace);
         }
         decoding.reset();   // this lane posts no more steps
         stats.decode_seconds = seconds_since(t_decode);
@@ -1961,13 +2144,28 @@ private:
         return ids;
     }
 
+    // feyntalk W3.4: the context guard's budget at request start. The sampler
+    // knows neither n_ctx nor the prompt's position, so the lane's cap and the
+    // served prompt count arrive here; reserve 0 is the switch off and sets
+    // nothing. Called before prepare_think_mask, so start_in_think_block() can
+    // arm a prompt already inside the reserve at its first thinking token.
+    // The lane's cap, not the process pool: a named lane's request cannot spill
+    // into another lane's context.
+    static void prepare_think_ctx(const SamplerParams& sp, int cap, int prompt_tokens,
+                                  Sampler& sampler) {
+        if (sp.think_ctx_reserve <= 0) return;
+        sampler.set_think_ctx_budget(think_ctx_budget(cap, prompt_tokens, sp.think_ctx_reserve));
+    }
+
     void prepare_think_mask(const GenerationInput& in, Sampler& sampler) const {
         // llava: the answer row needs the same tracker, so the ids are set for
         // it too; the mask itself still engages only under think_eog_mask.
         // loop-guard: the detector needs the block's state and the closer id for
         // the slap, so it arms the tracker too.
+        // feyntalk W3.4: the context guard needs the block's state and its own
+        // closer id, the same pairing the slap uses.
         if (!in.sampler.think_eog_mask && !in.sampler.tool_grammar && !in.sampler.answer_configured()
-            && in.sampler.loop_guard == LoopGuardMode::Off)
+            && in.sampler.loop_guard == LoopGuardMode::Off && in.sampler.think_ctx_reserve <= 0)
             return;
         ThinkBlockIds ids = in.think_tags_extended ? think_ids_ext_ : think_ids_qwen_;
         ids.eog = eog_ids_;
@@ -2026,12 +2224,18 @@ private:
         stats.loop_self_closes = c.self_closes;
         stats.loop_door_masked = c.door_masked;
         stats.loop_door_eog_masked = c.door_eog_masked;
+        stats.loop_context_closes    = c.ctx_closes;
+        stats.loop_context_no_closer = c.ctx_no_closer;
+        stats.loop_context_token_index = c.ctx_forced_index;
         if (c.detections || c.nudges || c.slaps || c.aborts || c.self_closes || c.door_masked
             || c.door_eog_masked)
             log::info("loop-guard", "lane %d: detected %d, nudged %d, slapped %d, aborted %d, "
                       "self-closed %d, door masked %d, door EOG masked %d", seq,
                       c.detections, c.nudges, c.slaps, c.aborts, c.self_closes, c.door_masked,
                       c.door_eog_masked);
+        if (c.ctx_closes || c.ctx_no_closer)
+            log::info("context-guard", "lane %d: closed %d, no closer %d, forced at token %d", seq,
+                      c.ctx_closes, c.ctx_no_closer, c.ctx_forced_index);
     }
 
     // One llama_decode of n tokens of `seq` at positions [pos, pos + n), with
@@ -2046,6 +2250,9 @@ private:
         std::vector<int>*   draft   = nullptr;
         std::vector<int>*   batch   = nullptr;
         std::vector<float>* rows    = nullptr;
+        // ARCINT_MTP_TRACE (exec/mtp_trace.h): the draft chain's probabilities,
+        // handed to the drafter with the draft itself; the lane writes its line
+        std::vector<float>* probs   = nullptr;
         bool                done    = false;
         int                 rc      = 0;
         double              t_propose = 0.0, t_verify = 0.0;
@@ -2113,7 +2320,7 @@ private:
                 std::vector<DraftPart> dparts;
                 dparts.reserve(reqs.size());
                 for (StepReq* q : reqs)
-                    if (q->n_max > 0) dparts.push_back(DraftPart{ q->seq, q->id_last, q->pos, q->n_max, q->draft });
+                    if (q->n_max > 0) dparts.push_back(DraftPart{ q->seq, q->id_last, q->pos, q->n_max, q->draft, q->probs });
                     else q->draft->clear();
                 if (!dparts.empty()) spec_->draft_multi(dparts.data(), dparts.size());
                 t_p = seconds_since(t0);
@@ -2213,6 +2420,32 @@ private:
 #ifdef ARCINT_LLAMA_EXPERT_CACHE_DEV
     std::vector<llama_expert_cache_info> ec_prev_dev_;   // per card's cache, the same
 #endif
+    slot_loan::Rule   loan_rule_;              // --llama-slot-loan (disabled unless the API is there)
+    uint32_t          loan_chunk_ = 0;         // --llama-loan-chunk (0: the prefill chunk)
+    // the prefill-slot-loan's request scope: begin before the prompt's first
+    // ubatch, end after its last (explicitly, before the last token's decode;
+    // the destructor is the path a throw or a cancellation takes)
+    // false: the prefill was cancelled (a gone client, a stop signal); the
+    // scope's destructor has returned the loan by the time the caller sees it,
+    // so the next request never starts with a loan out
+    template <class Prefill>
+    bool prefill_with_loan_locked(const std::vector<int>& prompt, size_t from, size_t to, std::vector<int>& have,
+                                  Prefill&& prefill) {
+#ifdef ARCINT_LLAMA_SLOT_LOAN
+        const size_t left = to > from ? to - from : 0;
+        slot_loan::Scope loan(loan_rule_, loan_chunk_,
+                              [this](uint32_t chunk) { return llama_context_slot_loan_begin(ctx_, chunk); },
+                              [this]() { return llama_context_slot_loan_end(ctx_); });
+        loan.begin(left);
+        if (!prefill(prompt, from, to, have)) return false;
+        loan.end();   // before the caller's last-token decode: the refill's wait precedes it
+        if (!loan.ok())
+            throw std::runtime_error("the slot loan's refill did not get the slots back exactly; the decode would read wrong rows");
+        return true;
+#else
+        return prefill(prompt, from, to, have);
+#endif
+    }
     // --device GPU.0,GPU.1 --llama-layer-split K: the cards (null-terminated),
     // the MTP model's card, the split; alive for the load
     std::vector<ggml_backend_dev_t> devs_;
@@ -2271,7 +2504,7 @@ private:
     bool                                  windows_ = false;   // named lanes: a KV cell window per lane (0026)
     std::vector<int>                      cap_;       // per lane (seq): its context
     int                                   n_batch_ = 2048;
-    std::mutex                            mu_;    // llama_context is not thread-safe: one call at a time
+    mutable std::mutex                    mu_;    // llama_context is not thread-safe: one call at a time
     // the step combiner (step_combined)
     std::mutex                            comb_mu_;
     std::condition_variable               comb_cv_;
@@ -2285,6 +2518,9 @@ private:
     std::vector<std::vector<int>>         slot_tokens_;
     std::unique_ptr<LlamaSpec>            spec_;      // --llama-mtp, --llama-dflash-gguf
     int                                   n_draft_ = 0;
+    std::atomic<unsigned long long>       mtp_req_{0};   // requests served, the trace's `req`
+
+    double                                mtp_min_p_ = 0.0;   // --llama-mtp-min-p, for the trace's line
     // --llama-checkpoints: per lane, the recurrent state at token counts the
     // lane's tokens still match, oldest first
     std::vector<std::vector<Checkpoint>>  ckpts_;

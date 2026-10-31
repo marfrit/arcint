@@ -652,6 +652,29 @@ TEST(config_llama_expert_cache) {
         const char* argv[] = {"arcint", "--stub", "--llama-expert-cache", "64"};
         CHECK(!parse_args(4, const_cast<char**>(argv), cfg).ok);   // an option of the libllama engine only
     }
+    {
+        // the save and its rule: xe is the default, cu is the named option
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-cpu-moe", "48", "--llama-expert-cache", "16384",
+                              "--llama-expert-profile", "/p/unit.bin", "--llama-expert-cache-save", "/p/saved.bin"};
+        CHECK(parse_args(11, const_cast<char**>(argv), cfg).ok);
+        CHECK_EQ(cfg.llama_expert_cache_save, std::string("/p/saved.bin"));
+        CHECK(cfg.llama_expert_cache_save_rule.empty());   // xe
+        Config cfgcu;
+        const char* argvcu[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-cpu-moe", "48", "--llama-expert-cache", "16384",
+                                "--llama-expert-profile", "/p/unit.bin", "--llama-expert-cache-save", "/p/saved.bin",
+                                "--llama-expert-cache-save-rule", "cu"};
+        CHECK(parse_args(13, const_cast<char**>(argvcu), cfgcu).ok);
+        CHECK_EQ(cfgcu.llama_expert_cache_save_rule, std::string("cu"));
+    }
+    // the save would overwrite the profile the run reads: refused at config
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-cpu-moe", "48", "--llama-expert-cache", "16384",
+                    "--llama-expert-profile", "/p/x.bin", "--llama-expert-cache-save", "/p/x.bin"}));
+    // an unknown rule name is refused, not silently xe
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-cpu-moe", "48", "--llama-expert-cache", "16384",
+                    "--llama-expert-cache-save", "/p/saved.bin", "--llama-expert-cache-save-rule", "cuda"}));
+    // a save without a cache
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-cpu-moe", "48", "--llama-expert-cache-save", "/p/saved.bin"}));
 }
 
 // --llama-mtp-card N: the card of a layer split that runs the MTP model

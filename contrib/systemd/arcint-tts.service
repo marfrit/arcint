@@ -6,7 +6,7 @@
 # code predictor + code2wav acoustic decoder) makes the waveform. Its code
 # predictor must keep `gen.code.head` (sampling) and `gen.code.embd` at f16:
 # the whole code body at Q8_0 never samples `codec_eos` and makes German
-# unintelligible (docs/campaigns/qwen3tts-german-genpath.md (on the `qfndev` branch), measured-here);
+# unintelligible (docs/campaigns/qwen3tts-german-genpath.md, measured-here);
 # the backbone may stay Q8_0. The production set is the **Q8_0 mmproj with
 # those two tensors at f16** (requantized from the official bf16; C4 + B3 PASS
 # on the enlarged D8 set, campaign qwen3tts-card-real-time lever (b),

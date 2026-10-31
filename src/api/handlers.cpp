@@ -10,6 +10,8 @@
 #include <set>
 
 #include "api/error.h"
+#include "api/generate.h"
+#include "api/responses_state.h"
 #include "build_info.h"
 #include "core/stop.h"
 #include "core/reasoning.h"
@@ -33,14 +35,6 @@ bool prompt_ends_inside_think_block(std::string_view prompt, bool extended_tags)
         if (prompt.ends_with(open + "\n")) return true;
     }
     return false;
-}
-
-// One list for the two consumers: the decode line prints the counters when one
-// moved, and the response carries the object on the same condition. An eighth
-// counter is added here, once.
-bool loop_guard_moved(const GenerationStats& stats) {
-    return stats.loop_detections || stats.loop_nudges || stats.loop_slaps || stats.loop_aborts
-           || stats.loop_self_closes || stats.loop_door_masked || stats.loop_door_eog_masked;
 }
 
 // The decode line's conditional terms, extracted from log_stats (review B4
@@ -109,6 +103,12 @@ std::string decode_suffix_for(const GenerationStats& stats) {
                                      stats.loop_aborts, stats.loop_self_closes, stats.loop_door_masked,
                                      stats.loop_door_eog_masked);
     }
+    // feyntalk W3.4: the context guard's close is its own event, not a
+    // loop-guard rung; named on the same line, only when it moved.
+    if (stats.loop_context_closes || stats.loop_context_no_closer) {
+        decode_suffix += log::format(" | context guard: closed %d, no closer %d",
+                                     stats.loop_context_closes, stats.loop_context_no_closer);
+    }
     return decode_suffix;
 }
 
@@ -123,40 +123,16 @@ nlohmann::json loop_guard_json(const GenerationStats& stats) {
                 {"aborts", stats.loop_aborts},
                 {"self_closes", stats.loop_self_closes},
                 {"door_masked", stats.loop_door_masked},
-                {"door_eog_masked", stats.loop_door_eog_masked}};
+                {"door_eog_masked", stats.loop_door_eog_masked},
+                // feyntalk W3.4: not a ladder rung -- the context guard's own
+                // counter, and the arms that had no closer id to force.
+                {"context_closes", stats.loop_context_closes},
+                {"context_no_closer", stats.loop_context_no_closer}};
 }
 
 namespace {
 
 using json = nlohmann::json;
-
-std::atomic<uint64_t> g_request_counter{0};
-
-// Deterministic rather than random: greedy output must be reproducible byte for
-// byte (§3.4), and a random id would break that in the response envelope even
-// when every generated token matched. The equivalence suite compares generated
-// content, not `created`.
-std::string next_id(const char* prefix) {
-    return log::format("%s-%llu", prefix,
-                       static_cast<unsigned long long>(
-                           g_request_counter.fetch_add(1, std::memory_order_relaxed) + 1));
-}
-
-int64_t now_seconds() { return static_cast<int64_t>(std::time(nullptr)); }
-
-json usage_json(const GenerationStats& s) {
-    // The draft counters say which performance regime this request actually
-    // got: speculation engages only under greedy, and without these numbers
-    // the only signal is a line in the server log the caller cannot see
-    // (sampler-defaults order, 2026-09-01). OpenAI's own field names, so SDKs
-    // that model completion_tokens_details keep parsing.
-    return json{{"prompt_tokens", s.prompt_tokens},
-                {"completion_tokens", s.completion_tokens},
-                {"total_tokens", s.prompt_tokens + s.completion_tokens},
-                {"completion_tokens_details",
-                 {{"accepted_prediction_tokens", s.draft_accepted},
-                  {"rejected_prediction_tokens", s.draft_proposed - s.draft_accepted}}}};
-}
 
 // `with_index` adds the per-call index. A streaming delta requires it (the
 // official OpenAI SDKs model ChoiceDeltaToolCall.index as a required int, and
@@ -184,115 +160,6 @@ bool sse_send(const SseWriter& write, const json& payload) {
     frame += dump_json(payload);
     frame += "\n\n";
     return write(frame);
-}
-
-void log_slot_line(int slot, const char* phase, int tokens, double seconds, double rate,
-                   const std::string& suffix = {}) {
-    log::info(log::format("slot %d", slot), "%-7s %5d tok in %5.2f s (%5.1f t/s)%s", phase, tokens,
-              seconds, rate, suffix.c_str());
-}
-
-void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
-    std::string prefill_suffix;
-    if (stats.cache_hit_tokens > 0 && stats.prompt_tokens > 0) {
-        prefill_suffix = log::format(" | cache hit %d tok (%.1f%%)", stats.cache_hit_tokens,
-                                     100.0 * stats.cache_hit_tokens / stats.prompt_tokens);
-        if (stats.cache_promote_seconds > 0.0) {
-            prefill_suffix += log::format(" from host tier in %.2f s", stats.cache_promote_seconds);
-        }
-    }
-    if (stats.snapshot_seconds > 0.0) {
-        prefill_suffix += log::format(" | cache snapshot %.2f s", stats.snapshot_seconds);
-    }
-    // Where prefill went, on the same footing as the decode line. Printed only
-    // when the backend fills it in, so the stub's line is the line it was.
-    if (stats.prefill_forward_seconds > 0.0 || stats.prefill_embed_seconds > 0.0) {
-        const double other = stats.prefill_seconds - stats.prefill_forward_seconds -
-                             stats.prefill_embed_seconds - stats.prefill_blocks_seconds -
-                             stats.prefill_restore_seconds - stats.prefill_wait_seconds -
-                             stats.snapshot_seconds;
-        prefill_suffix += log::format(
-            " | graph %.2f s, embed %.2f s, pages %.2f s, restore %.2f s, wait %.2f s, "
-            "other %.2f s",
-            stats.prefill_forward_seconds, stats.prefill_embed_seconds,
-            stats.prefill_blocks_seconds, stats.prefill_restore_seconds,
-            stats.prefill_wait_seconds, other);
-    }
-    // An aborted prefill reports the tokens it actually prefilled, not the
-    // whole prompt (the card showed a 37,723-token prompt as prefilled after
-    // the client left 8 s in). rate() reads the same number.
-    const int prefill_tokens = stats.prompt_tokens_prefilled >= 0 ? stats.prompt_tokens_prefilled
-                                                                 : stats.prompt_tokens;
-    log_slot_line(slot, "prefill", prefill_tokens, stats.prefill_seconds,
-                  stats.prefill_rate(), prefill_suffix);
-
-    const std::string decode_suffix = decode_suffix_for(stats);
-    log_slot_line(slot, "decode", stats.completion_tokens, stats.decode_seconds,
-                  stats.decode_rate(), decode_suffix);
-    if (reason == FinishReason::Abort) {
-        // The cause, not a guess: a SIGTERM during a prefill was logged as a
-        // gone client until the backend carried which source ended it.
-        const char* why = stats.abort_cause == AbortCause::StopSignal ? "stop signal"
-                                                                     : "client gone";
-        log::info(log::format("slot %d", slot), "aborted: %s", why);
-    }
-}
-
-// ---------------------------------------------------------------- generation
-//
-// Everything generic to both endpoints lives here: stop sequences, stop token
-// ids, cancellation, and the accumulation of the raw text the caller needs for
-// tool-call parsing.
-// `emit` receives the new piece, its token id and the full text accumulated so
-// far (the piece is already appended). Returning false means the client is gone.
-using EmitFn = std::function<bool(std::string_view piece, int token_id, const std::string& accumulated)>;
-
-FinishReason drive(Backend& backend, const GenerationInput& in, int slot, const EmitFn& emit,
-                   GenerationStats& stats, std::string& raw,
-                   std::vector<std::pair<std::string, int>>* pieces = nullptr) {
-    StopMatcher   stop(in.sampler.stop);
-    std::set<int> stop_ids(in.sampler.stop_token_ids.begin(), in.sampler.stop_token_ids.end());
-    bool          cancelled = false;
-
-    // The probe rides the prepared input (the routes set in.peer_alive before
-    // the generation starts), so the input is run as it is: no copy of the
-    // prompt ids or the images per streamed request (design review, wave 2a).
-    const FinishReason reason = backend.generate(
-        in, slot,
-        [&](std::string_view piece, int token_id) -> Control {
-            const StopMatcher::Step step = stop.push(piece, token_id);
-            // The reasoning split is decided by (piece, id), so the emitted
-            // text goes out cut at the pieces it came from: a whole piece with
-            // its id, a part of one with -1. A held tail released together
-            // with the closer's piece no longer costs the closer its id.
-            for (const StopMatcher::Segment& seg : step.segments) {
-                if (pieces != nullptr) pieces->emplace_back(seg.text, seg.id);
-                if (seg.text.empty()) continue;
-                raw += seg.text;
-                if (!emit(seg.text, seg.id, raw)) {
-                    cancelled = true;
-                    return Control::Cancel;
-                }
-            }
-            if (step.hit) return Control::Stop;
-            if (!stop_ids.empty() && stop_ids.count(token_id) != 0) return Control::Stop;
-            return Control::Continue;
-        },
-        stats);
-
-    if (!cancelled && reason != FinishReason::Abort) {
-        // Text held back as a possible stop-sequence prefix that never
-        // completed is ordinary output and must not be swallowed. An aborted
-        // request is not an ordinary end: its peer is gone or the process is
-        // stopping, so nothing more is written.
-        for (const StopMatcher::Segment& seg : stop.flush_segments()) {
-            if (pieces != nullptr) pieces->emplace_back(seg.text, seg.id);
-            if (seg.text.empty()) continue;
-            raw += seg.text;
-            if (!emit(seg.text, seg.id, raw)) return FinishReason::Abort;
-        }
-    }
-    return reason;
 }
 
 }  // namespace
@@ -332,6 +199,16 @@ SlotPool::Lease SlotPool::acquire_for(double timeout_seconds) {
     const auto it    = std::find(busy_.begin(), busy_.end(), false);
     const int  index = static_cast<int>(it - busy_.begin());
     *it              = true;
+    return Lease(this, index);
+}
+
+SlotPool::Lease SlotPool::try_acquire(int index) {
+    // Continuation affinity: one look, never a wait and never another index.
+    // Falling back is the caller's job (acquire_slot).
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (index < 0 || static_cast<size_t>(index) >= busy_.size() || busy_[static_cast<size_t>(index)])
+        return Lease();
+    busy_[static_cast<size_t>(index)] = true;
     return Lease(this, index);
 }
 
@@ -465,8 +342,19 @@ int queue_depth(const Context& ctx) {
 
 }  // namespace
 
-std::optional<HttpResult> acquire_slot(const Context& ctx, int lane, SlotPool::Lease& out, int& slot) {
+std::optional<HttpResult> acquire_slot(const Context& ctx, int lane, SlotPool::Lease& out, int& slot,
+                                       int affinity_slot) {
     if (lane < 0 || static_cast<size_t>(lane) >= ctx.lanes.size()) {
+        // A continuation first tries the slot the referenced response ran on,
+        // without waiting; a refusal there falls back to the ordinary acquire
+        // (docs/campaigns/feyntalk.md State: "then falls back").
+        if (affinity_slot >= 0) {
+            out = ctx.slots->try_acquire(affinity_slot);
+            if (out.index() >= 0) {
+                slot = out.index();
+                return std::nullopt;
+            }
+        }
         auto err = acquire_slot(ctx, out);
         slot     = out.index();
         return err;
@@ -476,6 +364,15 @@ std::optional<HttpResult> acquire_slot(const Context& ctx, int lane, SlotPool::L
     // reservation of its own size, DESIGN §4.3)
     const Lane&  l       = ctx.lanes[static_cast<size_t>(lane)];
     const double timeout = ctx.cfg != nullptr ? ctx.cfg->queue_timeout_s : 0.0;
+    // The named lane's pool has one lease; its sequence is what the entry
+    // records, so the affinity look is index 0 of that pool.
+    if (affinity_slot >= 0) {
+        out = l.pool->try_acquire(0);
+        if (out.index() >= 0) {
+            slot = l.seq;
+            return std::nullopt;
+        }
+    }
     out                  = l.pool->acquire_for(timeout);
     slot                 = out.index() >= 0 ? l.seq : -1;
     if (out.index() >= 0) return std::nullopt;
@@ -564,8 +461,20 @@ json props(const Context& ctx) {
         // leaves it empty on purpose, which is what lets this print null
         // instead of guessing.
         {"cache", {{"kv_dtype", st.kv_precision.empty() ? json(nullptr) : json(st.kv_precision)}}},
+        // The prefill-slot-loan's live state, so a refused request ("state is
+        // out/poisoned/broken") is explained here. "off": no loan configured (the
+        // default), "armed": the cache set one up at load, "out": lent right now.
+        {"slot_loan", {{"state", ctx.backend->slot_loan_state()}}},
         {"mtp", {{"requested", std::string(cfg.llama_mtp > 0 ? "on" : "off")},
-                 {"enabled", st.mtp_enabled}}},
+                 {"enabled", st.mtp_enabled},
+                 // --llama-mtp-policy: the width rule the serving path runs, and
+                 // the table it has learned so far (null when the policy is off).
+                 // Section 5.2's "/props reports the policy and the learned table".
+                 {"policy", std::string(cfg.llama_mtp_policy ? "cost" : "off")},
+                 {"cost_table", [&]() {
+                      const std::string t = ctx.backend->mtp_cost_table();
+                      return t.empty() ? json(nullptr) : json(t);
+                  }()}}},
         {"dflash", {{"requested", std::string(cfg.llama_dflash_on() ? "on" : "off")},
                     {"enabled", st.dflash_enabled},
                     // the drafter's own count: --llama-dflash capped by its trained block
@@ -593,6 +502,8 @@ json props(const Context& ctx) {
           // send nothing. /props says what the server is running with, so a
           // turn that ends differently than yesterday's is explained here.
           {"think_eog_mask", sd.think_eog_mask},
+          // feyntalk W3.4: the context guard's reserve in tokens; 0 is off.
+          {"think_ctx_reserve", sd.think_ctx_reserve},
           {"tool_grammar", sd.tool_grammar},
           // loop-guard: the served switch and its thresholds, so a turn that
           // ends differently than yesterday's is explained here.
@@ -637,7 +548,20 @@ json props(const Context& ctx) {
         {"voices", static_cast<int>(st.voices.size())},
         {"endpoints",
          json::array({"/health", "/props", "/v1/chat/completions", "/v1/completions",
-                      "/v1/models", "/v1/audio/speech", "/v1/audio/voices"})}};
+                      "/v1/responses", "/v1/responses/{id}/cancel", "/v1/models", "/v1/audio/speech", "/v1/audio/voices"})}};
+    // The Responses store's live state (docs/campaigns/feyntalk.md State):
+    // what it retains now, and the limits that bound it. A process without a
+    // store (a test seam) says null rather than a zero that would read as empty.
+    if (ctx.responses) {
+        const auto limits = ctx.responses->limits();
+        p["responses"] = {{"entries", ctx.responses->entries()},
+                          {"bytes", ctx.responses->bytes()},
+                          {"limit_entries", limits.entries},
+                          {"limit_bytes", limits.bytes},
+                          {"limit_ttl_s", limits.ttl_s}};
+    } else {
+        p["responses"] = nullptr;
+    }
     if (!ctx.lanes.empty()) {
         json lanes = json::array();
         for (const Lane& l : ctx.lanes) lanes.push_back(json{{"name", l.name}, {"n_ctx", l.n_ctx}, {"seq", l.seq}});
@@ -704,7 +628,8 @@ std::optional<HttpResult> finish_prepare(const Context& ctx, int lane, const std
                                          const SamplerOverrides& overrides,
                                          GenerationInput& input, int& prompt_tokens,
                                          bool nothink = false,
-                                         const std::vector<int>& prompt_ids = {}) {
+                                         const std::vector<int>& prompt_ids = {},
+                                         int known_prompt_tokens = -1) {
     // The row first: a request that resolves to thinking off starts from the
     // operator's non-thinking row when one is configured. The request's own
     // fields apply after this and still win.
@@ -714,10 +639,13 @@ std::optional<HttpResult> finish_prepare(const Context& ctx, int lane, const std
     }
 
     // A token-id prompt is counted as given; a text prompt is tokenised once
-    // here for the count (the backend tokenises it again for the forward).
-    prompt_tokens = prompt_ids.empty()
-                        ? static_cast<int>(ctx.backend->tokenizer().encode(prompt).size())
-                        : static_cast<int>(prompt_ids.size());
+    // here for the count (the backend tokenises it again for the forward). The
+    // W3.5 fit pass already encoded the prompt it served, so it hands the count
+    // in (N3) and the encode is not repeated for every auto request.
+    prompt_tokens = !prompt_ids.empty()
+                        ? static_cast<int>(prompt_ids.size())
+                        : (known_prompt_tokens >= 0 ? known_prompt_tokens
+                                                    : static_cast<int>(ctx.backend->tokenizer().encode(prompt).size()));
 
     // DESIGN.md §3.8 — reject, with the numbers. No truncation, no shift.
     // Against the request's lane: a subagent lane's prompt over its cap is
@@ -744,7 +672,27 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
     if (auto err = parse_chat_request(body, req)) {
         return HttpResult{400, invalid_request(*err)};
     }
+    return prepare_from_chat(ctx, std::move(req), out);
+}
 
+// feyntalk W3.5: clear the oldest non-empty replayed reasoning block in the
+// render copy. Messages, tool calls and tool outputs stay exactly as they came.
+static bool drop_oldest_reasoning(std::vector<ChatMessage>& messages) {
+    for (ChatMessage& m : messages) {
+        if (m.reasoning.empty()) continue;
+        m.reasoning.clear();
+        return true;
+    }
+    return false;
+}
+
+// The half of the old prepare_chat that runs after the body is parsed: lane
+// resolution, the template default, the render, the sampler and the think
+// state. The Responses route maps its request into a ChatRequest and calls this
+// same function, so there is one prompt builder and not two
+// (docs/campaigns/feyntalk.md W1).
+std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req, PreparedChat& out,
+                                            const PromptFit* fit) {
     // The lane first: its name may be a 404, and its cap is the 400's
     int lane = -1;
     if (auto err = resolve_lane(ctx, req.model, lane)) return err;
@@ -798,7 +746,75 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
         prep.input.parallel_tool_calls = prep.req.parallel_tool_calls;
     }
 
-    const std::string prompt = ctx.backend->render_chat(prep.req);
+    std::string prompt;
+    int         fit_tokens = -1;   // N3: the count the fit pass already made
+    if (fit != nullptr && fit->drop_reasoning) {
+        // feyntalk W3.5: `truncation: "auto"`, reasoning first. The render copy
+        // is local: prep.req (the echo and the stored state) keeps the full
+        // history. Drop one replayed reasoning block at a time, oldest first,
+        // re-render and recount until the prompt fits n_ctx - reserve. Only
+        // ChatMessage::reasoning is cleared -- no message body, tool call or
+        // tool output is dropped or edited. The most recent assistant turn's
+        // reasoning is the last to go because the loop walks messages in order.
+        //
+        // N2: a template that does not reference reasoning_content cannot
+        // render any of it, so the whole pass is skipped and nothing is
+        // counted. The llama backend reports that capability explicitly; a
+        // backend without the key (the stub) is treated as "may render", so
+        // the pass stays honest instead of guessing.
+        const json caps = ctx.backend->template_caps();
+        const bool template_renders_reasoning =
+            !caps.contains("supports_preserve_reasoning")
+            || (caps["supports_preserve_reasoning"].is_boolean()
+                && caps["supports_preserve_reasoning"].get<bool>());
+        ChatRequest render_req = prep.req;
+        const int   n_ctx      = lane_n_ctx(ctx, lane);
+        const int   limit      = n_ctx > 0 ? n_ctx - fit->reserve : 0;
+        auto render = [&] { return ctx.backend->render_chat(render_req); };
+        auto count  = [&](const std::string& p) {
+            return static_cast<int>(ctx.backend->tokenizer().encode(p).size());
+        };
+        prompt = render();
+        const int before = count(prompt);
+        int       tokens = before;
+        int       blocks = 0;
+        if (template_renders_reasoning) {
+            // N2: a drop is counted only when the re-rendered prompt actually
+            // changed. Reasonings the template hides (an assistant turn before
+            // the last user message) are cleared for the iteration but not
+            // counted, and their unchanged render does not advance the count.
+            while (n_ctx > 0 && tokens > limit && drop_oldest_reasoning(render_req.messages)) {
+                const std::string next = render();
+                // R2: compare the rendered bytes first. A hidden reasoning block
+                // (an assistant turn before the last user message) leaves the
+                // render unchanged, so the token count is not recomputed -- the
+                // encode was the near-245k-token cost per hidden block on the
+                // agent. A changed render is a real drop even when its token
+                // count happens to be equal.
+                if (next == prompt) continue;
+                prompt = next;
+                tokens = count(next);
+                ++blocks;
+            }
+        }
+        prep.truncation.blocks_dropped = blocks;
+        prep.truncation.tokens_before  = before;
+        prep.truncation.tokens_after   = tokens;
+        prep.truncation.reserve        = fit->reserve;
+        // N1: auto may truncate, it never refuses more than disabled. Being
+        // over the fit limit after the drops are exhausted is not a refusal:
+        // the fall-through is finish_prepare's own >= n_ctx check (the context
+        // guard forces the closer early when it is on). Only a prompt that
+        // reaches n_ctx is the 400, and it keeps the counts.
+        if (n_ctx > 0 && tokens >= n_ctx) {
+            return HttpResult{400,
+                              context_overflow_truncated(tokens, n_ctx, fit->reserve, blocks,
+                                                         tokens - n_ctx)};
+        }
+        fit_tokens = tokens;
+    } else {
+        prompt = ctx.backend->render_chat(prep.req);
+    }
     // The template decides whether the answer starts inside a think block; the
     // split of reasoning from content below follows that, not a guess.
     prep.think_tags_extended = ctx.backend->status().think_tags_extended;
@@ -820,7 +836,7 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
     // that ends up with thinking off gets the non-thinking row.
     const bool nothink = prep.req.has_enable_thinking && !prep.req.enable_thinking;
     if (auto err = finish_prepare(ctx, lane, prompt, prep.req.sampler, prep.input, prep.prompt_tokens,
-                                  nothink)) {
+                                  nothink, {}, fit_tokens)) {
         return err;
     }
     // llava: the answer row switches only in a turn the request declared as
@@ -999,33 +1015,21 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     // When the artifact's tags are single special tokens the split is decided
     // by those ids; the same (piece, id) sequence the streaming path feeds to
     // its streamer goes here too, so the two cannot disagree. Without any id,
-    // the text split is exactly today's behaviour.
-    bool has_tag_ids = false;
-    for (const auto& [oid, cid] : prep.think_ids.open_close_ids)
-        if (oid >= 0 || cid >= 0) has_tag_ids = true;
-    const ReasoningSplit split = has_tag_ids
-        ? split_reasoning_tokens(pieces, prep.think_open, prep.think_tags_extended,
-                                 prep.think_ids.open_close_ids)
-        : split_reasoning(raw, prep.think_open, prep.think_tags_extended);
-    std::string           content = split.content;
-    std::vector<ToolCall> calls;
-    if (prep.parse_tool_calls) {
-        ToolCallParse parsed = parse_qwen_tool_calls(split.content, &prep.schemas);
-        if (parsed.truncated) {
-            log::warn("tools", "%s", "unterminated <tool_call> block; returned as raw content");
-        }
-        content = std::move(parsed.content);
-        calls   = std::move(parsed.calls);
-    }
+    // the text split is exactly today's behaviour. The shared extraction keeps
+    // the Responses resource on the same bytes.
+    ChatGeneration gen;
+    finish_chat_generation(prep, pieces, raw, gen);
+    const std::string& content = gen.content;
+    const std::vector<ToolCall>& calls = gen.calls;
 
     json message = {{"role", "assistant"}};
-    if (!split.reasoning.empty()) {
-        message["reasoning_content"] = split.reasoning;
+    if (!gen.reasoning.empty()) {
+        message["reasoning_content"] = gen.reasoning;
         // Whether the think block's closer was seen before the turn ended.
         // The split computes it but the client could not see it, which made an
         // empty answer that closed the block indistinguishable from the defect
         // (a turn-ending token winning a step while the block was still open).
-        message["reasoning_closed"] = split.closed;
+        message["reasoning_closed"] = gen.reasoning_closed;
     }
     if (calls.empty()) {
         message["content"] = content;

@@ -18,6 +18,8 @@
 
 namespace lgc::api {
 
+class ResponseStore;   // api/responses_state.h: the process's in-memory store
+
 // A fixed set of lanes (DESIGN.md §4: /health reports free/total and queue
 // depth). A lane is a memory reservation, not a queue position: N lanes means
 // the startup arithmetic (§7.0.2a) reserved activations, GDN checkpoint rows
@@ -51,6 +53,9 @@ public:
     // unbounded variant: an admission that can wait forever is the failure this
     // milestone replaced with a numbered refusal.
     Lease acquire_for(double timeout_seconds);
+    // Non-blocking, for a continuation's slot affinity: index < 0 = invalid, 0
+    // = taken, else the lease. Never waits and never picks another index.
+    Lease try_acquire(int index);
     void  release(int index);
 
     int total() const;
@@ -88,6 +93,10 @@ struct Context {
     // token or ubatch boundary (DESIGN §3.7). Null outside a server (a test
     // calling the seam directly).
     std::atomic<bool>* stop_flag = nullptr;
+    // The process's in-memory response store (docs/campaigns/feyntalk.md State,
+    // W3). Null outside a server (a test calling the seam directly): then a
+    // continuation cannot resolve and answers previous_response_not_found.
+    std::shared_ptr<ResponseStore> responses;
 };
 
 struct HttpResult {
@@ -156,7 +165,7 @@ std::optional<HttpResult> acquire_slot(const Context& ctx, SlotPool::Lease& out)
 // waited for (--queue-timeout) or refused on its own; another lane is never
 // taken instead.
 std::optional<HttpResult> acquire_slot(const Context& ctx, int lane, SlotPool::Lease& out,
-                                       int& slot);
+                                       int& slot, int affinity_slot = -1);
 
 nlohmann::json health(const Context& ctx);
 nlohmann::json props(const Context& ctx);
@@ -174,19 +183,34 @@ using SseWriter = std::function<bool(std::string_view)>;
 // backend runs is not copied to attach it.
 using PeerProbe = std::function<bool()>;
 
+// feyntalk W3.5: what the `truncation: "auto"` fit pass did to this turn's
+// prompt. Zero everywhere on the chat, completions and disabled/absent paths;
+// the Responses route reports it as the arcint:truncated event and the
+// `arcint.truncated` object. The stored state keeps the full ChatRequest either
+// way: truncation is per request, not a rewrite of the store.
+struct TruncationReport {
+    int blocks_dropped      = 0;   // replayed reasoning blocks, oldest first
+    int tokens_before       = 0;   // prompt tokens before the first drop
+    int tokens_after        = 0;   // the prompt actually served
+    int reserve             = 0;   // tokens the fit rule left for generation
+
+    int tokens_freed() const { return tokens_before > tokens_after ? tokens_before - tokens_after : 0; }
+};
+
 struct PreparedChat {
     ChatRequest     req;
     GenerationInput input;
     ToolSchemas     schemas;
     bool            parse_tool_calls = false;
     bool            think_open       = false;  // the prompt ended inside a think block
-    bool            think_tags_extended = false;  // also <thinking> / [THINK] (ModelStatus)
+    bool            think_tags_extended = false;  // also the angle- and square-bracket think tags (ModelStatus)
     ThinkBlockIds   think_ids;                   // the artifact's per-pair tag ids
     std::string     id;
     int64_t         created       = 0;
     int             prompt_tokens = 0;
     int             lane          = -1;  // resolve_lane's answer
     std::string     model;               // the name the response carries
+    TruncationReport truncation;         // W3.5: zero on every non-auto path
 };
 
 struct PreparedCompletion {
@@ -213,6 +237,23 @@ struct PreparedSpeech {
 // is committed — including the context-overflow 400 (§3.8).
 std::optional<HttpResult> prepare_chat(const Context& ctx, const nlohmann::json& body,
                                        PreparedChat& out);
+// The half of prepare_chat that runs after the body is parsed: lane resolution,
+// the template default, render_chat, the sampler and the think state. The
+// Responses route maps its request into a ChatRequest and calls this same
+// function (docs/campaigns/feyntalk.md W1), so there is one prompt builder.
+// feyntalk W3.5: the optional fit policy. The chat and completions routes pass
+// nullptr (today's §3.8 400 on overflow, byte-identical); the Responses route
+// with `truncation: "auto"` passes one, and prepare_from_chat drops replayed
+// reasoning blocks on the LOCAL render copy until the prompt fits
+// n_ctx - reserve. It never drops or edits a message, a tool call or a tool
+// output, and `out.req` (the stored/echoed history) is left full.
+struct PromptFit {
+    bool drop_reasoning = false;   // truncation: "auto" with an active fit pass
+    int  reserve        = 0;       // tokens to leave for generation
+};
+std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
+                                            PreparedChat& out,
+                                            const PromptFit* fit = nullptr);
 std::optional<HttpResult> prepare_completion(const Context& ctx, const nlohmann::json& body,
                                              PreparedCompletion& out);
 // /v1/audio/speech: the availability refusals ("this build has no TTS", no

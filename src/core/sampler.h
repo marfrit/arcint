@@ -104,6 +104,22 @@ public:
     // here once per request.
     void set_think_mask_ids(ThinkBlockIds ids);
 
+    // feyntalk W3.4: the context guard's budget, at request start. The
+    // backend computes n_ctx - prompt_tokens - reserve (the sampler knows
+    // neither) and hands it here after set_prompt(), BEFORE
+    // start_in_think_block(), which is what arms a prompt already inside the
+    // reserve. It is a no-op unless params.think_ctx_reserve > 0: reserve 0 is
+    // the switch off, byte-identical to before. Counted down per emitted token
+    // while the block is open, in observe() (the verify walk's accepted drafts
+    // are the emitted tokens it observes, so each counts once); at 0 the
+    // think-block's closer id is forced as the next sampled token, through the
+    // loop guard's own forced-closer seam.
+    void set_think_ctx_budget(int budget);
+    // Test hook: tokens still allowed inside the block, -1 when off. No
+    // response key (the Responses event's numbers come from the API's own
+    // prompt/completion counts and n_ctx).
+    int think_ctx_remaining() const { return ctx_budget_; }
+
     // clean-turns step 2: the tool-call grammar, or nullptr. Not owned. It is
     // dormant while a think block is open (the reference's lazy grammar is not
     // applied while the reasoning budget sampler counts, common/sampling.cpp
@@ -138,10 +154,20 @@ public:
         // gap 2: draws at which an end-of-generation id was a finite candidate
         // the door removed inside the open block (think_eog_mask off).
         int door_eog_masked = 0;
+        // feyntalk W3.4: the context guard's counter -- how many times it
+        // forced the think-block's closer -- and how many times it was armed
+        // and could not force one (the text-closer family has no closer id;
+        // the event says so). ctx_forced_index is the emitted-token position
+        // the forced closer took in the accepted stream (-1: none), the same
+        // index space as arcint:token, so the event can name it.
+        int ctx_closes      = 0;
+        int ctx_no_closer    = 0;
+        int ctx_forced_index = -1;
     };
     LoopGuardCounts loop_guard_counts() const {
         return {loop_detections_, loop_nudges_, loop_slaps_, loop_aborts_,
-                loop_self_closes_, loop_door_masked_, loop_door_eog_masked_};
+                loop_self_closes_, loop_door_masked_, loop_door_eog_masked_,
+                ctx_closes_, ctx_no_closer_, ctx_forced_index_};
     }
     // The answer phase kept looping after a slap: the caller ends the turn on
     // FinishReason::Loop instead of emitting another token. Latching: once set
@@ -184,7 +210,7 @@ private:
     int    draw(float* logits, size_t vocab);
     bool   tracks_think() const
         { return params_.think_eog_mask || params_.tool_grammar || params_.answer_configured()
-                 || params_.loop_guard != LoopGuardMode::Off; }
+                 || params_.loop_guard != LoopGuardMode::Off || params_.think_ctx_reserve > 0; }
     // llava: the answer row applies only in a thinking turn, after a block
     // actually opened and closed. A non-thinking turn, or one whose block
     // never opened, keeps the thinking row.
@@ -208,6 +234,9 @@ private:
     void   loop_do_nudge_();
     void   loop_do_slap_();
     void   loop_do_abort_();
+    // feyntalk W3.4: the context guard's once-per-turn arm, at (or already past)
+    // the budget with the block open.
+    void   think_ctx_arm_();
     // door (no ladder): the budget spent -- lift the masks and go on unguarded
     void   loop_door_lift_();
     // the ladder's escalation, by counted lines once the door is open (shared
@@ -382,6 +411,22 @@ private:
     int  loop_self_closes_   = 0;
     int  loop_door_masked_   = 0;
     int  loop_door_eog_masked_ = 0;
+
+    // feyntalk W3.4: the context guard. ctx_budget_ is the tokens still allowed
+    // inside the block (-1: off, no budget was handed over). ctx_pending_ is
+    // the armed forced closer, consumed by the next sample() at the draw
+    // boundary; ctx_settled_ is the once-latch (a forced close, or a text
+    // family that cannot be forced, is decided once per turn). emitted_ counts
+    // observed tokens, the same index space the event names.
+    int  ctx_budget_         = -1;   // tokens left inside the block; -1 when off
+    bool ctx_armed_          = false; // a budget was handed over (reserve > 0)
+    bool ctx_pending_        = false;
+    bool ctx_settled_        = false;
+    int  ctx_closes_         = 0;
+    int  ctx_no_closer_      = 0;
+    int  ctx_forced_index_   = -1;
+    int  emitted_            = 0;
+    mutable bool ctx_warned_ = false;
     // The masked ids' logits at mask time, not the whole row: the count reads
     // them against the candidate floor the draw's collection gives.
     std::vector<float> door_masked_logits_;

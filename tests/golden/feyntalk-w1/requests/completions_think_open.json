@@ -1,0 +1,6 @@
+{
+  "model": "stub",
+  "prompt": "system says be careful\n@@THINK_OPEN@@\n",
+  "temperature": 0.0,
+  "max_tokens": 256
+}

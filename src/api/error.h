@@ -29,4 +29,18 @@ nlohmann::json invalid_request(std::string_view message, std::string_view param 
 // a GDN recurrent state cannot un-see tokens.
 nlohmann::json context_overflow(int prompt_tokens, int n_ctx);
 
+// feyntalk W3.5: `truncation: "auto"` exhausted its reasoning drops and the
+// prompt is still over the fit limit. Same code and numbers as context_overflow,
+// one line naming the drops and the overflow that remains.
+nlohmann::json context_overflow_truncated(int prompt_tokens, int n_ctx, int reserve,
+                                         int blocks_dropped, int still_over);
+
+// The Open Responses error envelope (docs/campaigns/feyntalk.md W1): the same
+// {"error": {message, type, param, code}} shape, with the spec's own type
+// spellings (`invalid_request`, `not_found`, `server_error`, ...) instead of the
+// chat route's `invalid_request_error` / `internal_error`. The chat and
+// completions routes keep error_body and their exact bytes.
+nlohmann::json responses_error(std::string_view message, std::string_view type,
+                               std::string_view code = {}, std::string_view param = {});
+
 }  // namespace lgc::api

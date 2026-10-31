@@ -1,4 +1,6 @@
 #include "core/chat.h"
+#include "core/reasoning.h"
+#include "core/markers.h"
 #include "harness.h"
 
 using namespace lgc;
@@ -226,7 +228,7 @@ TEST(chat_honours_enable_thinking) {
     CHECK(!req.enable_thinking);
 
     const std::string prompt = render_chatml_stub(req);
-    CHECK(prompt.find("<think>") != std::string::npos);
+    CHECK(prompt.find(std::string(markers::kThinkOpen)) != std::string::npos);
 }
 
 TEST(chat_stream_options_include_usage) {
@@ -300,7 +302,7 @@ TEST(chat_render_stub_is_deterministic) {
     ChatRequest req;
     CHECK(!parse_chat_request(minimal_chat(), req).has_value());
     CHECK_EQ(render_chatml_stub(req), render_chatml_stub(req));
-    CHECK(render_chatml_stub(req).find("<|im_start|>assistant") != std::string::npos);
+    CHECK(render_chatml_stub(req).find(std::string(markers::kTurnStart) + "assistant") != std::string::npos);
 }
 
 TEST(completion_parses_prompt_forms) {
@@ -388,4 +390,61 @@ TEST(chat_tool_grammar_and_parallel_tool_calls_are_read) {
     bad2["parallel_tool_calls"] = 1;
     ChatRequest r2;
     CHECK(parse_chat_request(bad2, r2).has_value());
+}
+
+// ------------------------- reasoning replay (docs/campaigns/feyntalk.md W3.2)
+TEST(chat_parses_reasoning_content_on_assistant_messages) {
+    // OpenAI-compatible clients send a past assistant turn's reasoning as
+    // reasoning_content; it must reach ChatMessage::reasoning, not be dropped.
+    json body = minimal_chat();
+    body["messages"] = json::array({
+        {{"role", "user"}, {"content", "q"}},
+        {{"role", "assistant"}, {"content", "a"}, {"reasoning_content", "why"}},
+        {{"role", "user"}, {"content", "next"}},
+    });
+    ChatRequest req;
+    CHECK(!parse_chat_request(body, req).has_value());
+    CHECK_EQ(req.messages[1].reasoning, std::string("why"));
+    CHECK_EQ(req.messages[0].reasoning, std::string(""));
+
+    // A non-string reasoning_content is a 400, not a silent drop.
+    json bad = body;
+    bad["messages"][1]["reasoning_content"] = 7;
+    ChatRequest r2;
+    CHECK(parse_chat_request(bad, r2).has_value());
+}
+
+TEST(stub_render_keeps_reasoning_only_after_the_last_user_message) {
+    // The Qwen3-family rule, mirrored by the stub so the path is tested: an
+    // assistant turn after the last user message carries its reasoning block;
+    // an earlier turn does not. Tags are built from the shared table, never
+    // written out here.
+    ChatRequest req;
+    ChatMessage first;
+    first.role      = "user";
+    first.content   = "first question";
+    ChatMessage one;
+    one.role      = "assistant";
+    one.content   = "EARLY-ANSWER";
+    one.reasoning = "EARLY-REASONING";
+    ChatMessage second;
+    second.role     = "user";
+    second.content  = "second question";
+    ChatMessage two;
+    two.role      = "assistant";
+    two.content   = "LATE-ANSWER";
+    two.reasoning = "LATE-REASONING";
+    req.messages = {first, one, second, two};
+
+    const std::string prompt = render_chatml_stub(req);
+    CHECK(prompt.find("EARLY-ANSWER") != std::string::npos);
+    CHECK(prompt.find("LATE-ANSWER") != std::string::npos);
+    CHECK_EQ(prompt.find("EARLY-REASONING"), std::string::npos);   // before the last user
+    CHECK(prompt.find("LATE-REASONING") != std::string::npos);      // after the last user
+    // The late block is the template's own shape: opener, reasoning, closer.
+    const auto& pairs = think_tag_pairs(false);
+    CHECK(!pairs.empty());
+    if (pairs.empty()) return;
+    const std::string block = pairs[0].first + "\n" + "LATE-REASONING" + "\n" + pairs[0].second;
+    CHECK(prompt.find(block) != std::string::npos);
 }

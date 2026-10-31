@@ -33,6 +33,11 @@ struct ChatMessage {
     std::string           name;          // function name, for role == "tool"
     std::string           tool_call_id;  // for role == "tool"
     std::vector<ToolCall> tool_calls;    // assistant turns replayed back to us
+    // The assistant turn's reasoning (Open Responses reasoning items, or the
+    // chat route's reasoning_content). Rendered only through the template's own
+    // logic as `reasoning_content`; arcint applies no policy of its own
+    // (docs/campaigns/feyntalk.md open question 2, operator decision 2026-10-31).
+    std::string           reasoning;
 };
 
 struct ChatRequest {

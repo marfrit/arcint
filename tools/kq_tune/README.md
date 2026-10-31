@@ -1,6 +1,6 @@
 # kq_tune — parameter search for the llama engine's Intel kernels
 
-Drivers for `docs/campaigns/kernel-autotune-ga.md` (on the `qfndev` branch). They run against a
+Drivers for `docs/campaigns/kernel-autotune-ga.md`. They run against a
 llama.cpp tree carrying `contrib/llama.cpp/patches` through 0014, on the
 card the kernels serve. Each driver writes one JSON file, rewritten after
 every evaluation. A rerun with the same file resumes and skips genomes

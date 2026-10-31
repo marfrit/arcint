@@ -1,0 +1,28 @@
+{
+  "model": "stub",
+  "messages": [
+    {
+      "role": "user",
+      "content": "call the tool"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "stream": true,
+  "temperature": 0.0,
+  "max_tokens": 256
+}

@@ -1,5 +1,6 @@
 #include "core/reasoning.h"
 
+#include "core/markers.h"
 #include "util/text.h"
 
 #include <iterator>
@@ -7,15 +8,17 @@
 
 namespace lgc {
 namespace {
-constexpr std::string_view kClose = "</think>";
+constexpr std::string_view kClose = markers::kThinkClose;
 // the think blocks a model may open itself: Qwen's, Cydonia 24B's (Mistral
 // Small 3.2) and the Magistral tunes'
 struct ThinkTags {
     std::string_view open, close;
 };
-constexpr ThinkTags kTags[] = {{"<think>", "</think>"}, {"<thinking>", "</thinking>"}, {"[THINK]", "[/THINK]"}};
+constexpr ThinkTags kTags[] = {{markers::kThinkOpen, markers::kThinkClose},
+                               {markers::kThinkOpenAngle, markers::kThinkCloseAngle},
+                               {markers::kThinkOpenSquare, markers::kThinkCloseSquare}};
 
-// the pairs a model may open: <think> only, or all of them
+// the pairs a model may open: the Qwen pair only, or all of them
 size_t n_tags(bool extended) { return extended ? std::size(kTags) : 1; }
 // the pair whose opener starts `lead`, or nullptr
 const ThinkTags* opened_by(std::string_view lead, bool extended) {
