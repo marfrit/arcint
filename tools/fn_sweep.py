@@ -3,7 +3,7 @@
 
     fn_sweep.py <arcint> <model.gguf> <assets-dir> <tag> [--unit flashnext|agent|coder]
                 [--device GPU.N] [--env K=V]... [--set --flag VALUE]... [--port N]
-                [--prompt-tokens N] [--no-answers] [--prompt-again] [--reverse]
+                [--prompt-tokens N] [--prompt-max N] [--no-answers] [--prompt-again] [--reverse]
                 [--prompts FILE] [--no-capital]
 
 --unit picks the unit's flags. The three tables are NOT the same and this
@@ -63,6 +63,7 @@ import urllib.request
 args = sys.argv[1:]
 binary, gguf, assets, tag = args[:4]
 env_over, set_over, port, prompt_tokens, no_answers, prompt_again, no_capital = {}, [], 0, 0, False, False, False
+prompt_max = 24   # the long prompt's answer length; larger measures decode at that depth
 no_mtp, print_flags = False, False
 unit, device, reverse = "flashnext", "GPU.0", False
 prompts_file = ""
@@ -78,6 +79,8 @@ while i < len(args):
         prompt_tokens = int(args[i + 1]); i += 2
     elif args[i] == "--no-answers":
         no_answers = True; i += 1
+    elif args[i] == "--prompt-max":
+        prompt_max = int(args[i + 1]); i += 2
     elif args[i] == "--prompt-again":
         prompt_again = True; i += 1
     elif args[i] == "--no-capital":
@@ -202,11 +205,16 @@ try:
         # a long prompt first: its prefill line, and the grouped GEMM's tile padding if the probe is on
         before = len(log_lines())
         post(open(A("corpus.txt")).read()[:int(prompt_tokens * 3.6)] +
-             "\n\nSummarize the last paragraph above in one sentence.", 24)
+             "\n\nSummarize the last paragraph above in one sentence.", prompt_max)
         time.sleep(0.5)
         new = log_lines()[before:]
         pf = next((l for l in reversed(new) if "prefill" in l and "tok in" in l), "")
         print(f"  prompt    {pf.split('prefill', 1)[-1].strip()[:120]}", flush=True)
+        if prompt_max != 24:
+            # --prompt-max: the long prompt's own answer, i.e. decode at that depth
+            dd = next((DEC.search(l) for l in reversed(new) if DEC.search(l)), None)
+            print(f"DEPTH {tag} decode {dd.group(1) if dd else '?'} tok {dd.group(3) if dd else '?'} t/s "
+                  f"accept {dd.group(4) if dd else '?'} %", flush=True)
         m = re.search(r"([0-9]+(?:\.[0-9]+)?) t/s", pf)
         if m:
             pref.append(float(m.group(1)))
