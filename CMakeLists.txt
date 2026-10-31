@@ -77,6 +77,7 @@ add_library(arcint_core STATIC
   src/config.cpp
   src/util/log.cpp
   src/util/canonical_json.cpp
+  src/util/sha256.cpp
   src/util/utf8.cpp
   src/util/text.cpp
   src/core/reasoning.cpp
