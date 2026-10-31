@@ -381,6 +381,77 @@ param)` so the chat and completions routes keep their bytes unchanged.
 `dump_json` keeps replacing invalid UTF-8 with U+FFFD (`src/api/error.h`,
 `code`); an error body still serialises.
 
+## Context guard (W3.4)
+
+Operator problem (2026-10-31): the model sometimes thinks itself out of its
+context inside ONE turn, before the agent's between-turn compaction can act.
+The answer is not to stop it thinking but to close the thought with the
+think-block's own closer while there is still room to answer.
+
+**Seam.** The loop guard's existing slap path: `sample()` returns the block's
+closer id as the next token, before the masks, the penalties and the draw, and
+the caller emits, observes and decodes it like any drawn token (`code`,
+`src/core/sampler.cpp`). The context guard is a **second trigger** of that
+forced closer, with its own reason (`context-guard`) and its own counter
+(`ctx_closes`/`ctx_no_closer`); it opens no door, injects no text, changes no
+finish reason. Its forced close is not counted as a door self-close, exactly as
+the slap's is (the `loop_forced_closer_` flag the tracker consumes).
+
+**Budget.** The sampler knows neither n_ctx nor the prompt's position, so the
+backend computes `n_ctx - prompt_tokens - reserve` at request start (the lane's
+cap, the served prompt count) and hands it over after `set_prompt()` and before
+`start_in_think_block()`. `n_ctx` is the lane's cap, not the process pool
+(`code`, `src/exec/backend_llama.cpp` `prepare_think_ctx`). `--think-ctx-reserve
+N` (default 0 = off) is the operator flag; a request never sets it; `/props`
+names the served value under `sampler_defaults`.
+
+**Countdown, relative to the verify walk** (`code`): the countdown happens in
+`Sampler::observe()`, one per emitted token that lands **inside** the block --
+the opener included, a closer or an answer token excluded. This is not the
+propose count: `observe()` is the one call every decode loop makes per emitted
+token, and in the verify walk (`src/exec/verify_walk.h`) it is the walk's own
+`observe(tok)` after `emit` has handed the token on, so every accepted draft
+counts exactly once -- the rejected drafts and the unemitted rows count zero.
+At 0 the **next** `sample()` returns the forced closer: within a verify chain
+that is the next row's sample, at that position, before the row is looked at.
+The forced token cannot be overwritten by an accepted draft: the walk draws
+with `sample()` and then compares `tok == draft[i]`; the forced token is the
+returned token regardless of the row, so either the draft happens to be the
+same closer (the token emitted is still the forced one) or the mismatch breaks
+the walk and drops the rest of the chain. The accept line below then keeps only
+the emitted prefix and rolls the KV back to it, so no drafted token past the
+boundary reaches the KV or the accept count. The earlier review's two rules
+carry over unchanged: the think mask never masks the closer (review B3,
+`closer_in_masked_set_`), and the door's mask applies inside `sample()`, so a
+forbidden draft is a mismatch like any other. The forced return precedes both
+masks, so neither can take the closer from the guard.
+
+**Edges, decided.** (1) A text-closer family has no closer id to force: the
+guard copies the slap -- no token is forced, the draw stands, one
+`context_no_closer` counter and one warn, and the `arcint:context` event says
+`forced_close: false`. (2) A prompt already inside the reserve
+(`n_ctx - prompt_tokens <= reserve`, budget <= 0) arms the closer at the first
+thinking token: the template-opened block takes the closer as its first token,
+thinking is skipped, the model answers inside what is left, no refusal.
+
+**Reporting.** The Responses stream carries one `arcint:context` event per turn
+when the reserve is configured: `v: 1, used, n_ctx, remaining`, plus
+`forced_close: true` and `token_index` (the emitted index the forced closer
+took, the same space as `arcint:token`) when it fired; the event is before the
+terminal event. The loop-guard stats object on both chat and Responses gains
+`context_closes` and `context_no_closer`; the decode line names them. The
+`token_index` is graded by the API (which owns prompt/completion counts and
+n_ctx), not the sampler, so no engine-loop hook was added.
+
+**Gate, measured-here (2026-10-31, stub build, aarch64):** red-first ten cases
+(sampler-level arithmetic incl. accepted-draft counting, forced close at budget
+0 under `--think-eog-mask` on and under the door ladder with the mask off,
+grammar live after the forced close, text-closer edge, prompt-inside-reserve
+edge, reserve-0 off, the object/line, the flag//props, the event); `ctest -L
+unit` 9/9, `arcint-test --max-skips 0` 442 cases 0 failed 0 skipped, the
+feyntalk-golden captures byte-identical, `tests/roundtrip.sh` green. The live
+check on the card is owed: it is not part of this package.
+
 ## Token mode (point 10)
 
 Decided as an **option in 1.3.0**, off by default; text stays the default until
@@ -517,6 +588,7 @@ Two ids are named in the specification README (`basic-response`,
 | W2 | **SSE event writer**: `sequence_number`, `event:` line, item/part lifecycle, reasoning/text/function-call deltas, terminal events, `[DONE]`, in-stream error + `failed` | `src/api/responses_stream.{h,cpp}`, `tests/test_responses.cpp`, `tests/roundtrip.sh` | unit event order/sequence/lifecycle green; stub curl SSE green; compliance HTTP+SSE runnable subset 0 failed |
 | W3 | **state + continuation**: `ResponseStore`, limits/LRU/TTL, `store` semantics, `previous_response_id`, `prefix_hash`, `SlotPool::try_acquire`, eviction on error | `src/api/responses_state.{h,cpp}`, `src/api/handlers.{h,cpp}` (`SlotPool`), `src/api/responses.cpp`, `src/config.{h,cpp}`, `/props`, `tests/test_responses.cpp` | unit store/continuation/eviction green; stub continuation `cache_hit_tokens >= prompt_tokens - 1`; compliance `previous_response_id` tests |
 | W3.2 | **reasoning replay**: `ChatMessage::reasoning`, Responses reasoning-item pairing, chat `reasoning_content`, the stub template's Qwen3 rule, stored-continuation assistant turns per output item, think state keyed to the generation start | `src/core/chat.{h,cpp}`, `src/exec/chat_json.h`, `src/api/responses.cpp`, `tests/test_chat.cpp`, `tests/test_responses.cpp`, `tests/golden/feyntalk-w1/` | unit mapping/rendering/continuation red-first; think-state guard with replayed closed reasoning; 12 golden captures (10 old byte-identical); roundtrip |
+| W3.4 | **context guard**: the loop guard's forced-closer seam, a second trigger with its own reason and counter; the budget `n_ctx - prompt_tokens - reserve` handed at request start, counted down per emitted token, forced closer at 0; `--think-ctx-reserve N` (default 0 = off), `/props`; `arcint:context` event, the counters in the loop-guard object, the slot line | `src/core/sampler.{h,cpp}`, `src/core/sampling.{h,cpp}`, `src/exec/backend_llama.cpp` (`prepare_think_ctx`, the three sampler sites), `src/config.{h,cpp}`, `src/api/{handlers,generate,responses_stream}.cpp`, `tests/test_context_guard.cpp`, `tests/test_responses.cpp`, `tests/test_stream_utf8.cpp` | red-first 10 cases; `ctest -L unit` 0 failed; `arcint-test --max-skips 0` 0 failed; golden byte-identical; roundtrip green. The live card check is owed (no card in this package) |
 | W4 | **cancel by id**: extension route, in-flight registry, `GenerationInput::cancel`, `AbortCause::Cancelled`, `abort_cause_of` + stub `cause`, `arcint:response.cancelled` + incomplete(cancelled) | `src/http/server.cpp`, `src/api/responses_state.{h,cpp}`, `src/exec/backend.h` (~390), `src/exec/backend_llama.cpp:150-152`, `src/exec/backend_stub.cpp:216-220`, `tests/test_responses.cpp`, a cancel measurement script under `tools/` | unit cancel paths red-first; stub cancel at 4 ubatches; card window: cancel-to-abort within one ubatch at 100k, control arm the same |
 | W5 | **gate + live leg**: vendor the compliance library at the pinned release into `tests/feyntalk/`, wire a runner, add the pi multi-turn leg | `tests/feyntalk/`, `tests/CMakeLists.txt` or `CMakeLists.txt`, `tools/feyntalk_live.py` | compliance 0 failed, skipped = the named list; live leg passes Gate 4 |
 | W6 | **token mode + spans + material**: `arcint.token_mode`/`input_ids`/`renderer_hash`, `arcint:token`, `arcint:span`, sampler event sink, `Backend::renderer_material()`, `GET /v1/responses/renderer`, hash | `src/api/responses*.{h,cpp}`, `src/core/sampler.{h,cpp}` (580/779/788/813), `src/core/sampling.h:166`, `src/exec/backend.h` + `backend_llama.cpp` (326/1032 area), `src/api/handlers.cpp` (`/props` 514), `tests/test_responses.cpp` | unit token/span/shadow equality green; hash stable across two loads; off by default; live token leg (Gate 5) |
@@ -598,7 +670,7 @@ marked); the note's decisions stand except where a row says otherwise.
 
 ## Current state
 
-W1–W4 and W3.2 are built and accepted (2026-10-31); W5's fix round landed: the request mapping and the
+W1–W4, W3.2 and W3.4 are built and accepted (2026-10-31); W5's fix round landed: the request mapping and the
 non-stream/non-SSE `ResponseResource` (`src/api/responses.*`), the SSE event
 writer (`responses_stream.*`) with the item/part lifecycle and the terminal
 events, the in-memory state and continuation (`responses_state.*`) with
@@ -612,8 +684,8 @@ prompt equals a full-history request's with the same items. `include` is accepte
 its code and numbers; the chat route has the same gap for prepare-time
 refusals and was left unchanged (its bytes are a gate).
 
-Gate numbers (`measured-here`): `ctest -L unit` 7/7, 432 cases 0 failed 0
-skipped on the stub build with `-Werror`; the feyntalk-golden captures of the
+Gate numbers (`measured-here`): `ctest -L unit` 9/9, 442 cases 0 failed 0
+skipped on the stub build with `-Werror` (432 before W3.4's ten cases); the feyntalk-golden captures of the
 chat/completions routes (12: the 10 original byte-identical plus two carrying
 `reasoning_content`) stay byte-identical; `tests/roundtrip.sh` green
 including the two-turn continuation and cancel-by-id checks; the 7 named
@@ -659,6 +731,14 @@ fresh prefill tokens vs 19 requests, hit 91.8 %, 3,738 fresh. Thinking was short
 on this task (50-300 characters a step), so the absolute saving is small here;
 with long reasoning steps the arm without W3.2 re-prefills all of them.
 
+W3.4 (context guard) is built, unit-tested and default off: the loop guard's
+forced-closer seam with its own counter, the budget at request start, the
+countdown per emitted token (accepted drafts once each), the two edges, the
+`arcint:context` event and the line. `ctest -L unit` 9/9, `arcint-test
+--max-skips 0` 442 cases 0 failed 0 skipped, golden byte-identical, roundtrip
+green (`measured-here`, 2026-10-31, stub build). Its live check on the card is
+owed and is not part of the package.
+
 W5 still owes the compliance vendor + runner and the live token-mode leg is
 W6. `GET /v1/responses/{id}` is not in the 2026-04-24 OpenAPI document and
 was not added. No WebSocket, no compact/background, no W6 option work.
@@ -681,6 +761,6 @@ was not added. No WebSocket, no compact/background, no W6 option work.
   the split, and the sampler's event sink (580/779/788/813, params at
   `sampling.h:166`).
 - `src/api/error.h` — the spec-typed `responses_error` next to `error_body`.
-- `tests/test_responses.cpp`, `tests/roundtrip.sh`, `tests/feyntalk/` (vendored
-  compliance library + runner), `tools/feyntalk_live.py`,
-  `tools/feyntalk_cancel.py`.
+- `tests/test_responses.cpp`, `tests/test_context_guard.cpp`, `tests/roundtrip.sh`,
+  `tests/feyntalk/` (vendored compliance library + runner),
+  `tools/feyntalk_live.py`, `tools/feyntalk_cancel.py`.
