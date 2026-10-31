@@ -2836,3 +2836,112 @@ TEST(responses_sampler_spans_are_drained_before_the_token_event) {
     CHECK_EQ(c["detail"]["budget"].get<int>(), 0);
     CHECK(fx.prep.chat.input.sampler.span_events->empty());   // drained
 }
+
+// ---------------------------------- W6a review round (2026-10-31, findings)
+//
+// 1 HIGH: `/props` must say "ready" only where a token-mode request really
+// emits `arcint:token`/`arcint:span`. The equivalence is pinned, not assumed.
+// 2 MEDIUM: a material the canonical hash cannot encode (raw-byte vocabularies
+// give non-UTF-8 token text) must leave the unit servable: no throw, empty
+// material, token mode off.
+// 3 MEDIUM: `/props` must not build the material.
+// 5 LOW: the 404 speaks the Responses envelope's `not_found`.
+
+namespace {
+
+RendererMaterialParts minimal_parts() {
+    RendererMaterialParts parts;
+    parts.model          = {{"served_id", "one"}, {"canonical_id", "one.gguf"},
+                            {"quant", "Q4_K - Medium"}, {"arch", "qwen35"}};
+    parts.decode         = {{"pieces_b64", json::array({"QQ=="})}, {"eos", 0},
+                            {"eog_ids", json::array({0})}};
+    parts.encode         = {{"tokens", json::array()}, {"merges", json::array()},
+                            {"token_types", json::array()}, {"model", "bpe"},
+                            {"pre", "qwen2"}, {"add_bos", false},
+                            {"special_text", json::object()}};
+    parts.chat_template  = {{"text", "tmpl"}, {"source", "gguf"}};
+    parts.special_tokens = {{"think", json::array()}, {"tool_call", json::object()}};
+    parts.parser         = {{"reasoning", "tags/1"}, {"tool_calls", "qwen3-coder/1"}};
+    return parts;
+}
+
+// W6a review finding 3's seam: a backend that counts material builds. `props`
+// must not touch the counter; the material endpoint builds once and serves the
+// cached body.
+class CountingMaterialBackend final : public Backend {
+public:
+    ModelStatus       st;
+    nlohmann::json    material = synthetic_material(kHashA);
+    mutable int       builds   = 0;
+    mutable int       serializations = 0;
+
+    const ModelStatus& status() const override { return st; }
+    Tokenizer&         tokenizer() override { return tok_; }
+    std::string        render_chat(const ChatRequest&) const override { return {}; }
+    const nlohmann::json& renderer_material() const override {
+        ++builds;
+        return material;
+    }
+    FinishReason generate(const GenerationInput&, int, const TokenCallback&,
+                          GenerationStats&) override {
+        return FinishReason::Stop;
+    }
+
+private:
+    struct Tok final : public Tokenizer {
+        std::vector<int> encode(std::string_view) override { return {}; }
+        std::string      decode(const std::vector<int>&) override { return {}; }
+        std::string      decode_one(int) override { return {}; }
+        int              eos_id() const override { return 0; }
+    } tok_;
+};
+
+}  // namespace
+
+TEST(props_ready_iff_a_token_request_emits_token_events) {
+    Fixture fx(4096, synthetic_material(kHashA));
+    const json p = api::props(fx.ctx);
+    CHECK_EQ(p["token_mode"].get<std::string>(), std::string("ready"));
+    if (p["token_mode"] != "ready") return;
+    const Sse s = parse_sse(stub_token_stream(fx));
+    const auto toks = all_events(s, "arcint:token");
+    CHECK(!toks.empty());   // "ready" without these is a lie
+}
+
+TEST(renderer_material_assembly_returns_empty_on_non_utf8_text) {
+    // A raw-byte vocabulary's token text is not valid UTF-8; the canonical hash
+    // cannot round-trip it. The build must refuse the material, not abort the
+    // unit load or throw in the endpoint.
+    RendererMaterialParts parts = minimal_parts();
+    parts.encode["tokens"] = json::array({std::string("\xff\xfe")});
+    json m;
+    bool threw = false;
+    try {
+        m = assemble_renderer_material(parts);
+    } catch (...) {
+        threw = true;
+    }
+    CHECK(!threw);
+    CHECK(m.is_null());
+}
+
+TEST(props_does_not_build_the_material) {
+    Config cfg;
+    CountingMaterialBackend backend;
+    SlotPool slots{1};
+    api::Context ctx;
+    ctx.cfg = &cfg;
+    ctx.backend = &backend;
+    ctx.slots = &slots;
+    const json p = api::props(ctx);
+    CHECK_EQ(backend.builds, 0);
+    CHECK_EQ(p["token_mode"].get<std::string>(), std::string("ready"));
+}
+
+TEST(renderer_404_uses_the_responses_not_found_type) {
+    Fixture fx;
+    const api::HttpResult r = api::renderer_bundle(fx.ctx);
+    CHECK_EQ(r.status, 404);
+    if (r.status != 404 || !r.body.contains("error")) return;
+    CHECK_EQ(r.body["error"]["type"].get<std::string>(), std::string("not_found"));
+}
