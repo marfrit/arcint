@@ -83,9 +83,20 @@ primitive is also already used, on the dense Q4_K path (`code`, README 0013,
   beyond the spread; the capital right in every arm.
 - Status (`measured-here`): the arm is opt-in and off by default, not adopted
   on any unit; the argmax bar fails every arm, and the served gain is +1.2 to
-  +3.2 % with both formats and none with gate/up only. Owed: the expert GEMM's
-  share of the prefill (the profiling step, never run), which bounds what any
-  kernel here can give.
+  +3.2 % with both formats and none with gate/up only.
+- The expert GEMM's share of the prefill (`measured-here`, 2026-10-31, the B60,
+  Flash-Next IQ3_S with the unit's flags (no loan), the int8 arm off, the OpenCL
+  intercept layer's chrome trace; device time of the prefill segment against its
+  span, the trace's host overhead inside the span): at 2,048 tokens the GEMMs this
+  patch covers (`kernel_mul_mm_id_iq3_s_f16` + `kernel_mul_mm_id2_iq4_nl_f16`) are
+  7.1 % of the span, at 8,192 tokens 10.8 %; the GGUF's other expert formats
+  (IQ2_S, IQ3_XXS, Q2_0 GEMMs) 9.1 % / 13.0 %, which this patch does not cover;
+  `kernel_moe_gather_experts` is 38.5 % / 31.8 % and at 8k the bank stream's
+  `clEnqueueWriteBuffer` on its second queue 38.8 %. So the ceiling of this
+  patch on this model is ~+3.3 % at 8k (2x on 3.1 %, 1.3x on 7.7 %), which is
+  what the served A/B measured (+1.2 to +3.2 %): the kernel delivers its share;
+  the prefill's lever on this model is moving the expert weights (the gather and
+  the bank copies), not the GEMM.
 - Round 8 test fixes (`code`): `opencl_part`'s inverted `#else` ternary
   (`st.empty()` must read `skip`, not an empty stack) and a unit case for its
   nesting plus a top-level `#else` (red: the ternary inverted -> segfault;
