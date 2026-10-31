@@ -213,6 +213,14 @@ answer by design.
   - A KL arm against the fixed split — mutation: the balance's pairs taken in reverse order, KL must
     move past the bar only if the rows are wrong (a bitwise tripwire, not a veto).
 
+- **Priced (`measured-here`, 2026-10-31, the B60, Flash-Next IQ3_S with the unit's flags, the six answers, two rounds,
+  the second reversed; the capital right in all 12 legs):** decode against `GGML_OPENCL_CPU_MISS_MAX` - 16: 31.57 /
+  32.15 t/s, 32: 34.48 / 34.77, 64: 34.40 / 34.58, 96: 34.57 / 34.67, 128: 34.57 / 34.62, 256: 30.05 (a one-off; its
+  reversed twin 34.55) / 34.55. Flat from 32 to 256; only 16 costs (~-7 %). The cap slope is this item's upper bound
+  (the pricing above), so a per-layer balance has no prize on this workload: **not built**. What this does not test:
+  depth (the reference's +9.9 % / +25.6 % are at 8K / 32K on a slower-CPU shape, `paper`) - a decode-at-depth arm
+  (fn_sweep with --prompt-tokens 8192 / 32768 then the answers) is the remaining check before the item is closed.
+
 ## 5. QSA select (wide block scores, register/one-read top-k)
 
 - **arcint status: partly, and on the wrong unit in `candidates.md`.** The graph is there:
