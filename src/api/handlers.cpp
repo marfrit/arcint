@@ -528,7 +528,7 @@ json props(const Context& ctx) {
         {"voices", static_cast<int>(st.voices.size())},
         {"endpoints",
          json::array({"/health", "/props", "/v1/chat/completions", "/v1/completions",
-                      "/v1/responses", "/v1/models", "/v1/audio/speech", "/v1/audio/voices"})}};
+                      "/v1/responses", "/v1/responses/{id}/cancel", "/v1/models", "/v1/audio/speech", "/v1/audio/voices"})}};
     // The Responses store's live state (docs/campaigns/feyntalk.md State):
     // what it retains now, and the limits that bound it. A process without a
     // store (a test seam) says null rather than a zero that would read as empty.

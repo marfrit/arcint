@@ -398,6 +398,78 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 grep -q 'aborted: client gone' "$CANCEL_LOG"
+
+# ---------------------------------------------------- cancel by id (W4, arcint)
+# The same slow stub: a streamed response is cancelled from a second connection
+# as soon as response.created gives its id. Issue-to-terminal latency is not
+# asserted here; the event order and the cause are.
+CANCEL_ID=$(python3 - "$CANCEL_PORT" <<'PY3'
+import http.client, json, sys, threading, queue, urllib.request, urllib.error, time
+port = int(sys.argv[1])
+q = queue.Queue()
+result = {}
+def canceller():
+    rid = q.get()
+    t0 = time.time()
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/responses/{rid}/cancel", method="POST")
+        r = urllib.request.urlopen(req)
+        result["cancel"] = (r.status, json.loads(r.read()).get("arcint"))
+        result["cancel_seconds"] = time.time() - t0
+    except urllib.error.HTTPError as e:
+        result["cancel"] = (e.code, e.read().decode())
+th = threading.Thread(target=canceller)
+th.start()
+c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+c.request("POST", "/v1/responses", json.dumps({"model": "stub", "input": "x", "stream": True,
+                                              "max_output_tokens": 500}),
+          {"Content-Type": "application/json"})
+r = c.getresponse()
+types = []
+done = False
+rid = ""
+while True:
+    line = r.fp.readline()
+    if not line: break
+    s = line.decode("utf-8", errors="replace").strip()
+    if s.startswith("event: "): types.append(s[7:])
+    if s.startswith("data: {"):
+        d = json.loads(s[6:])
+        if d["type"] == "response.created":
+            rid = d["response"]["id"]; q.put(rid)
+        if d["type"] == "response.incomplete":
+            assert d["response"]["incomplete_details"]["reason"] == "cancelled", d["response"]
+            assert d["response"]["output"][-1]["status"] == "incomplete", d["response"]["output"]
+    if s == "data: [DONE]": done = True; break
+th.join()
+assert result.get("cancel", (0, None))[0] == 200, result
+assert result["cancel"][1] == {"cancelling": True, "v": 1}, result["cancel"]
+assert done and types[-1] == "response.incomplete", types[-3:]
+assert "arcint:response.cancelled" in types and types[-2] == "arcint:response.cancelled", types[-4:]
+print(rid)
+PY3
+)
+check "a cancel by id answers 200 with arcint.cancelling and the stream ends incomplete(cancelled)" \
+  "$([[ -n "$CANCEL_ID" ]] && echo 0 || echo 1)"
+
+code=$(curl -sS -o "${WORK}/cancel-late.json" -w '%{http_code}' -X POST -d '' \
+       "http://127.0.0.1:${CANCEL_PORT}/v1/responses/${CANCEL_ID}/cancel")
+check "a terminal response cannot be cancelled again (409)" "$([[ $code == 409 ]] && echo 0 || echo 1)"
+jassert "${WORK}/cancel-late.json" 'd["error"]["type"]=="invalid_request" and d["error"]["code"]=="response_not_cancellable"'
+check "the 409 carries response_not_cancellable" $?
+
+code=$(curl -sS -o "${WORK}/cancel-unknown.json" -w '%{http_code}' -X POST -d '' \
+       "http://127.0.0.1:${CANCEL_PORT}/v1/responses/resp-nope/cancel")
+check "an unknown cancel id is 404" "$([[ $code == 404 ]] && echo 0 || echo 1)"
+jassert "${WORK}/cancel-unknown.json" 'd["error"]["type"]=="not_found" and d["error"]["code"]=="response_not_found"'
+check "the 404 carries response_not_found" $?
+
+for _ in $(seq 1 50); do
+  grep -q 'aborted: cancel requested' "$CANCEL_LOG" && break
+  sleep 0.1
+done
+grep -q 'aborted: cancel requested' "$CANCEL_LOG"
+check "the slot line names the cancel, not a gone client" $?
 check "the server logs the abort at a scheduler boundary" $?
 
 curl -sS "http://127.0.0.1:${CANCEL_PORT}/health" -o "${WORK}/after-cancel.json"

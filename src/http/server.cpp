@@ -6,6 +6,7 @@
 
 #include "api/error.h"
 #include "api/responses.h"
+#include "api/responses_state.h"
 #include "api/responses_stream.h"
 #include "util/log.h"
 
@@ -46,6 +47,18 @@ api::PeerProbe peer_probe(socket_t sock) {
         return httplib::detail::is_socket_alive(sock);
     };
 }
+
+// The in-flight registry entry's life: removed on every exit, including an
+// exception out of the route (a leaked registry entry would answer a cancel
+// with 200 for a response that is gone).
+struct FlightGuard {
+    FlightGuard(api::ResponseStore* s, std::string i) : store(s), id(std::move(i)) {}
+    api::ResponseStore* store = nullptr;
+    std::string         id;
+    ~FlightGuard() {
+        if (store != nullptr) store->end_in_flight(id);
+    }
+};
 
 }  // namespace
 
@@ -216,6 +229,42 @@ void HttpServer::Impl::route() {
     });
 
 
+
+    // POST /v1/responses/{id}/cancel (docs/campaigns/feyntalk.md Cancel, W4; an
+    // arcint extension — the spec defines no cancel endpoint or state). An
+    // in-flight response: set the flag and answer the in-progress snapshot with
+    // arcint.cancelling. A stored terminal response is 409; an unknown id 404.
+    svr.Post(R"(/v1/responses/([^/]+)/cancel)", [this](const httplib::Request& req,
+                                                      httplib::Response& res) {
+        const std::string id = req.matches[1];
+        if (!ctx.responses) {
+            send_json(res, 404, api::responses_error(
+                "no cancel route without a response store: this process keeps none",
+                "not_found", "response_not_found"));
+            return;
+        }
+        if (auto inflight = ctx.responses->find_in_flight(id)) {
+            inflight->cancel->store(true, std::memory_order_relaxed);
+            api::ResponseParts parts;
+            parts.status    = "in_progress";
+            parts.output    = json::array();
+            parts.usage     = nullptr;
+            parts.completed = false;
+            json body = api::response_resource(inflight->prep->req, inflight->prep->chat, parts);
+            body["arcint"] = {{"v", 1}, {"cancelling", true}};
+            send_json(res, 200, body);
+            return;
+        }
+        if (ctx.responses->find_stored_any(id)) {
+            send_json(res, 409, api::responses_error(
+                "this response has already ended; a terminal response cannot be cancelled",
+                "invalid_request", "response_not_cancellable"));
+            return;
+        }
+        send_json(res, 404, api::responses_error(
+            "no in-flight or stored response with this id", "not_found", "response_not_found"));
+    });
+
     // Open Responses (docs/campaigns/feyntalk.md W1): one request path, one
     // generation path. parse_response_request maps the body onto a ChatRequest,
     // prepare_response hands it to the chat route's own prepare_from_chat, and
@@ -255,8 +304,31 @@ void HttpServer::Impl::route() {
             return;
         }
 
+        // The cancel flag and the registry entry exist BEFORE the first event:
+        // `response.created` is what gives the client the id it cancels by. The
+        // flag is ORed into the peer closure, so every boundary check the engine
+        // already makes sees a cancel exactly as it sees a close.
+        std::shared_ptr<std::atomic<bool>> cancel;
+        std::shared_ptr<FlightGuard>       flight;
+        if (ctx.responses) {
+            cancel = std::make_shared<std::atomic<bool>>(false);
+            auto entry = std::make_shared<api::InFlightResponse>();
+            entry->id     = prep->chat.id;
+            entry->lane   = prep->chat.lane;
+            entry->cancel = cancel;
+            entry->prep   = prep;
+            ctx.responses->begin_in_flight(std::move(entry));
+            flight = std::make_shared<FlightGuard>(ctx.responses.get(), prep->chat.id);
+        }
+        const socket_t sock = req.socket;
+        auto peer = [sock, cancel] {
+            if (cancel && cancel->load(std::memory_order_relaxed)) return false;
+            return peer_probe(sock)();
+        };
+
         if (!prep->req.chat.stream) {
-            prep->chat.input.peer_alive = peer_probe(req.socket);
+            prep->chat.input.cancel     = cancel;
+            prep->chat.input.peer_alive = peer;
             const api::HttpResult r = api::run_response(ctx, *prep, slot);
             if (r.gone) return;
             send_json(res, r.status, r.body);
@@ -268,12 +340,12 @@ void HttpServer::Impl::route() {
         // [DONE]. The lease rides in the provider so the lane is held for exactly
         // as long as the stream lives.
         res.set_header("Cache-Control", "no-cache");
-        const socket_t sock = req.socket;
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, prep, lease, slot, sock](size_t, httplib::DataSink& sink) {
+            [this, prep, lease, slot, sock, cancel, flight, peer](size_t, httplib::DataSink& sink) {
                 try {
-                    prep->chat.input.peer_alive = peer_probe(sock);
+                    prep->chat.input.cancel     = cancel;
+                    prep->chat.input.peer_alive = peer;
                     api::stream_response(ctx, *prep, slot, [&sink](std::string_view data) {
                         return sink.write(data.data(), data.size());
                     });
