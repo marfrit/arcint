@@ -2035,12 +2035,33 @@ TEST(responses_truncation_auto_exhausted_past_n_ctx_is_the_same_400_with_counts)
     CHECK_EQ(e["code"].get<std::string>(), std::string("context_length_exceeded"));
     const std::string msg = e["message"].get<std::string>();
     CHECK(msg.find("reasoning dropped: 2 blocks, still 5 over") != std::string::npos);
-    CHECK_EQ(err->body["prompt_tokens"].get<int>(), two);
-    CHECK_EQ(err->body["n_ctx"].get<int>(), two - 5);
-    CHECK_EQ(err->body["overflow"].get<int>(), 5);
-    CHECK_EQ(err->body["fit_reserve"].get<int>(), kDefaultFitReserve);
-    CHECK_EQ(err->body["reasoning_dropped_blocks"].get<int>(), 2);
+    CHECK_EQ(err->body.value("prompt_tokens", -1), two);
+    CHECK_EQ(err->body.value("n_ctx", -1), two - 5);
+    CHECK(err->body.contains("overflow"));   // a regression fails, it does not throw
+    if (err->body.contains("overflow")) CHECK_EQ(err->body["overflow"].get<int>(), 5);
+    CHECK(err->body.contains("fit_reserve"));
+    if (err->body.contains("fit_reserve"))
+        CHECK_EQ(err->body["fit_reserve"].get<int>(), kDefaultFitReserve);
+    CHECK(err->body.contains("reasoning_dropped_blocks"));
+    if (err->body.contains("reasoning_dropped_blocks"))
+        CHECK_EQ(err->body["reasoning_dropped_blocks"].get<int>(), 2);
     CHECK(!err->body.contains("arcint"));   // a refusal is not a response
+}
+
+// R5: exhausted under n_ctx with REAL drops. Both reasoning blocks are gone
+// and the prompt is still over the fit limit, but it stays under n_ctx: served
+// with blocks 2 and the fit numbers, no refusal (the N1 rule with drops).
+TEST(responses_truncation_auto_exhausted_under_n_ctx_serves) {
+    ResponseRequest r = replay_request("auto");
+    const int       two = tokens_without_both(r);
+    Fixture fx(two + 100);   // limit = two - 156: over it, under n_ctx
+
+    PreparedResponse prep;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r), prep).has_value());
+    CHECK_EQ(prep.chat.truncation.blocks_dropped, 2);
+    CHECK_EQ(prep.chat.truncation.tokens_after, two);
+    CHECK(prep.chat.input.prompt.find("OLD-REASON") == std::string::npos);
+    CHECK_EQ(prep.chat.req.messages.size(), 5u);   // the store/echo stays full
 }
 
 // N2: reasoning the template never renders is not a drop. The last user
@@ -2072,7 +2093,74 @@ TEST(responses_truncation_auto_ignores_reasoning_the_template_never_renders) {
     CHECK_EQ(prep.chat.truncation.tokens_before, tokens);
     CHECK_EQ(prep.chat.truncation.tokens_after, tokens);
     CHECK(prep.chat.input.prompt.find("OLD-REASON") == std::string::npos);
-    CHECK_EQ(prep.chat.req.messages[1].reasoning.find("OLD-REASON") != std::string::npos, true);
+    CHECK_EQ(prep.chat.req.messages.size(), 3u);
+    if (prep.chat.req.messages.size() > 1)
+        CHECK(prep.chat.req.messages[1].reasoning.find("OLD-REASON") != std::string::npos);
+}
+
+namespace {
+// A template that does not reference reasoning_content: it renders without the
+// blocks and says so through the capability the fit pass reads.
+class NoReasoningBackend final : public Backend {
+public:
+    ModelStatus st;
+    const ModelStatus& status() const override { return st; }
+    Tokenizer&          tokenizer() override { return tok_; }
+    std::string         render_chat(const ChatRequest& req) const override {
+        ChatRequest copy = req;
+        for (ChatMessage& m : copy.messages) m.reasoning.clear();
+        return render_chatml_stub(copy);
+    }
+    nlohmann::json template_caps() const override {
+        return nlohmann::json{{"supports_preserve_reasoning", false}};
+    }
+    FinishReason generate(const GenerationInput&, int, const TokenCallback&,
+                          GenerationStats&) override {
+        return FinishReason::Stop;
+    }
+
+private:
+    struct Tok final : public Tokenizer {
+        std::vector<int> encode(std::string_view text) override {
+            return std::vector<int>(text.begin(), text.end());
+        }
+        std::string decode(const std::vector<int>& ids) override {
+            return std::string(ids.begin(), ids.end());
+        }
+        std::string decode_one(int id) override { return std::string(1, static_cast<char>(id)); }
+        int         eos_id() const override { return 0; }
+    } tok_;
+};
+
+int no_reasoning_tokens(const ChatRequest& req) {
+    NoReasoningBackend backend;
+    return static_cast<int>(backend.tokenizer().encode(backend.render_chat(req)).size());
+}
+}  // namespace
+
+// R5: a template without reasoning_content skips the whole fit pass -- the
+// call is served and nothing is reported, even where the renderer would be over
+// the fit limit. The capability is what the pass reads, not a guess.
+TEST(responses_truncation_auto_skips_a_template_without_reasoning_content) {
+    Config           cfg;
+    cfg.stub = true;
+    NoReasoningBackend backend;
+    backend.st.id        = "stub";
+    backend.st.served_id = "stub";
+    backend.st.loaded    = true;
+    api::SlotPool slots(1);
+    api::Context  ctx{&cfg, &backend, &slots};
+
+    ResponseRequest r = replay_request("auto");
+    const int tokens = no_reasoning_tokens(r.chat);
+    backend.st.n_ctx = tokens + 100;   // over the fit limit, under n_ctx
+
+    PreparedResponse prep;
+    CHECK(!api::prepare_response(ctx, std::move(r), prep).has_value());
+    CHECK_EQ(prep.chat.truncation.blocks_dropped, 0);
+    CHECK_EQ(prep.chat.truncation.tokens_before, tokens);
+    CHECK_EQ(prep.chat.truncation.tokens_after, tokens);
+    CHECK(prep.chat.input.prompt.find("OLD-REASON") == std::string::npos);
 }
 
 // disabled and an absent field keep today's 400 exactly: no fit pass, no
@@ -2097,6 +2185,12 @@ TEST(responses_truncation_disabled_and_absent_keep_todays_400) {
     CHECK_EQ(err2->body.dump(), disabled.dump());
     const std::string msg = disabled["error"]["message"].get<std::string>();
     CHECK(msg.find("does not truncate") != std::string::npos);
+    // R3: the disabled/absent 400 keeps today's top-level keys -- no
+    // `overflow` copied from the error's own record (that key is the fit
+    // pass's, auto only).
+    CHECK(!disabled.contains("overflow"));
+    CHECK(!disabled.contains("fit_reserve"));
+    CHECK(!disabled.contains("reasoning_dropped_blocks"));
 }
 
 // The fit pass leaves the request's max_output_tokens worth of room when it is
