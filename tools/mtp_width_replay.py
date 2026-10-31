@@ -413,6 +413,7 @@ def replay(records, max_t=KMAXT, margin=MARGIN, constant_cost=None, respects_flo
     unknown_ms = 0
     guessed_width = 0
     requests = set()
+    chosen_rounds = []   # (req, seq, pos, rows, acc, cap, chosen, E, v, drafts) a round
 
     for r in records:
         requests.add((r.get("src"), r["req"]))   # the counter restarts per process
@@ -453,6 +454,8 @@ def replay(records, max_t=KMAXT, margin=MARGIN, constant_cost=None, respects_flo
             if not go:
                 break
         chosen = max(1, st.best_rows)
+        chosen_rounds.append((r["req"], r["seq"], r["pos"], rows, acc, cap, chosen, st.best_e, st.best_v,
+                              len(r["probs"])))
         hist[chosen] = hist.get(chosen, 0) + 1
         exp_tok.append(st.best_e)   # E at the width it would verify, not the chain's end
         if r["probs"]:
@@ -495,6 +498,7 @@ def replay(records, max_t=KMAXT, margin=MARGIN, constant_cost=None, respects_flo
         # widths' numbers)
         "exp_v": _mean(exp_v),
         "exp_v_rounds": exp_v,
+        "chosen_rounds": chosen_rounds,
         "mode_cost": mode_cost,
         "trunc_tok": _mean(trunc_tok),
         "trunc_ms": _mean(trunc_ms),
@@ -510,6 +514,19 @@ def replay(records, max_t=KMAXT, margin=MARGIN, constant_cost=None, respects_flo
         "policy": policy,
         "minp_seen": sorted({r["minp"] for r in records}),
     }
+
+
+def decision_text(rep):
+    """The `--decisions` output: one line a round (the policy's cap, chosen width,
+    E at that width, its rate, the draft count the trace holds), then the cost
+    table. tests/python/fixtures/mtp_policy_decisions.txt is this over the shared
+    trace fixture; src/exec/draft_policy.h's test compares its own bytes to it."""
+    out = []
+    for (req, seq, pos, rows, acc, cap, chosen, e, v, n) in rep["chosen_rounds"]:
+        out.append("mtpdec req=%d seq=%d pos=%d rows=%d acc=%d cap=%d chosen=%d e=%.9f v=%.9f n=%d"
+                   % (req, seq, pos, rows, acc, cap, chosen, e, v, n))
+    out.append("table %s" % (rep["policy"].cost_table_text() or "(nothing measured)"))
+    return "\n".join(out) + "\n"
 
 
 def parse_cost_table(text):
@@ -658,6 +675,9 @@ def main(argv):
                          " --seed-costs value wins")
     ap.add_argument("--respect-floor", action="store_true",
                     help="keep --llama-mtp-min-p's veto (default: the min-p 0 arm)")
+    ap.add_argument("--decisions", action="store_true",
+                    help="one line a round with the policy's choice and its E, then the learned cost table:"
+                         " the cross-language pin, compared byte for byte with src/exec/draft_policy.h")
     ap.add_argument("--json", action="store_true", help="the report as JSON")
     a = ap.parse_args(argv)
 
@@ -668,6 +688,9 @@ def main(argv):
     from_legs = measured_costs([r for t in a.costs_from for r in read_trace(t)]) if a.costs_from else None
     rep = replay(recs, max_t=a.max_t, margin=a.margin, constant_cost=a.constant_cost,
                  respects_floor=a.respect_floor, seed_costs=seeds, costs_from=from_legs)
+    if a.decisions:
+        print(decision_text(rep), end="")
+        return 0
     if a.json:
         out = {
             "rounds": rep["rounds"], "requests": rep["requests"],

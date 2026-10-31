@@ -95,12 +95,30 @@ public:
     // (llama_memory_seq_windows, contrib/llama.cpp 0026); false when its
     // memory cannot take them.
     virtual bool set_kv_windows(const uint32_t* n_cells, int n) = 0;
+    // --llama-mtp-policy cost (section 5.2): the draft chain is the cost-aware
+    // rule's, and the step loop reports each round's outcome. False: the fixed
+    // ceiling and the min-p floor alone, nothing extra computed.
+    virtual bool mtp_policy_on() const { return false; }
+    // One round's outcome to the policy, after the verify and the rollback:
+    // `probs` the verified drafts' head probabilities in order, `accepted` the
+    // walk's kept drafts (bounded by the verified window), `rows` the verify's
+    // own rows, `ms` the round's start to now, `pos` the round's first row.
+    virtual void mtp_observe(int seq, const std::vector<float>& probs, int drafted, int accepted, int rows,
+                             double ms, size_t pos) {
+        (void) seq; (void) probs; (void) drafted; (void) accepted; (void) rows; (void) ms; (void) pos;
+    }
+    // The learned per-width cost table, as Strata's log line (/props reports it).
+    virtual std::string mtp_cost_table() const { return {}; }
 };
 
 // model: loaded with load_mtp from `gguf`; ctx_tgt: n_rs_seq >= n_draft.
 // vocab: the file of token ids the drafts are drawn from (empty: all).
 // min_p: drafting stops at a token the head gives less than min_p, which is
-// left out (0: always n_draft).
+// left out (0: always n_draft; with cost_policy it stays a floor over the
+// policy's choice, the reference's cost arm has none).
+// cost_policy: --llama-mtp-policy cost, with cost_seed as Strata's
+// STRATA_SPEC_COST_TABLE form (empty: no seed; the learned table starts a
+// width from kShape). One lane only: the policy is off with n_seq > 1.
 // kv_unified: the target's (named lanes, --lane-ctx): the draft context then
 // holds one pool of the target's n_ctx that every sequence can reach, as the
 // target does; else n_ctx / n_seq per sequence, the target's stream.
@@ -108,7 +126,8 @@ public:
 // made or the draft vocabulary cannot be built.
 std::unique_ptr<LlamaSpec> make_llama_mtp(llama_model* model, llama_context* ctx_tgt, int n_draft, int n_seq,
                                           int n_batch, int n_ubatch, int threads, const std::string& gguf,
-                                          const std::string& vocab, double min_p, ggml_type type_k, ggml_type type_v,
+                                          const std::string& vocab, double min_p, bool cost_policy,
+                                          const std::string& cost_seed, ggml_type type_k, ggml_type type_v,
                                           bool kv_unified, uint32_t n_kv_reserve, std::string& err);
 
 // model_dft: a DFlash2 drafter (general.architecture "dflash" with a

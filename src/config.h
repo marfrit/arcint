@@ -67,6 +67,17 @@ struct Config {
     // probability under the MTP head is at least P, and a draft below P is
     // not verified (Strata's --spec-min-p); 0 drafts --llama-mtp tokens always
     double llama_mtp_min_p = 0.0;
+    // --llama-mtp-policy off|cost: cost hands the chain to Strata's cost-aware
+    // window rule (src/exec/draft_policy.h, campaign research-mtp-width-policy
+    // 5.2) instead of the fixed --llama-mtp ceiling; off (default) is the fixed
+    // width. One lane only: named lanes run it off. The min-p floor above stays
+    // a floor over the policy's choice.
+    bool llama_mtp_policy = false;
+    // --llama-mtp-cost-seed "T1,T2,..;T1,..;T1,..": the round ms per width, one
+    // list a context bucket (<6K, <24K, longer), as Strata's
+    // STRATA_SPEC_COST_TABLE (generate.cpp:16495-16511), counted as weight 6
+    // rounds (draft_policy.cpp:66-74). Needs --llama-mtp-policy cost.
+    std::string llama_mtp_cost_seed;
     // --llama-dflash-gguf FILE: a DFlash2 drafter (llama.cpp's `dflash`
     // architecture, converted with --target-model-dir) drafts a block a
     // verify instead of the MTP head, conditioned on the target's hidden

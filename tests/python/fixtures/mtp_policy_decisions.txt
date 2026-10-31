@@ -1,0 +1,6 @@
+mtpdec req=1 seq=7 pos=4096 rows=4 acc=3 cap=4 chosen=4 e=2.756290670 v=1.400580772 n=3
+mtpdec req=1 seq=7 pos=16384 rows=4 acc=2 cap=6 chosen=5 e=3.843376244 v=0.079971170 n=4
+mtpdec req=2 seq=3 pos=0 rows=1 acc=0 cap=1 chosen=1 e=1.000000000 v=0.000000000 n=0
+mtpdec req=2 seq=12 pos=231422 rows=8 acc=7 cap=8 chosen=8 e=7.933223839 v=0.110351884 n=7
+mtpdec req=3 seq=9 pos=8192 rows=4 acc=1 cap=8 chosen=2 e=1.966277143 v=0.072936263 n=3
+table ctx<6K: T1:20.43(n=1) T4:41.88(n=1) | ctx<24K: T4:38.62(n=3) | ctx>=24K: T4:40.94(n=1) T8:71.89(n=1)

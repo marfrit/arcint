@@ -338,6 +338,11 @@ public:
     // the request-start refusal. The stub and a backend without the loan: "off".
     virtual std::string slot_loan_state() const { return "off"; }
 
+    // --llama-mtp-policy cost's learned per-width round cost table (Strata's
+    // log line), for /props; empty when the policy is off. Reads under the
+    // context's lock, as slot_loan_state does.
+    virtual std::string mtp_cost_table() const { return {}; }
+
     // The think tags' token ids the artifact's vocabulary holds as one special
     // token, per pair (ThinkBlockIds::open_close_ids), or empty when none. The
     // reasoning split and the sampler's tracker decide those roles by id; a

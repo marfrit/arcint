@@ -27,6 +27,7 @@
 // A hyper-connection model (Qwen3.8-Flash-Next: four streams of 2,560) returns
 // the streams; the head takes their mix (qwen4exp.cpp's build_hc_mix with the
 // nextn.hc_head_* weights), which DraftHead computes before the rows.
+#include "exec/draft_policy.h"   // --llama-mtp-policy cost (campaign research-mtp-width-policy 5.2)
 #include "exec/llama_spec.h"
 
 #ifdef ARCINT_LLAMA
@@ -375,8 +376,9 @@ private:
 class LlamaMtp final : public LlamaSpec {
 public:
     LlamaMtp(llama_model* model, llama_context* ctx_tgt, int n_draft, int n_seq, int n_batch, int n_ubatch,
-             int threads, const std::string& gguf, const std::string& vocab, double min_p, ggml_type type_k,
-             ggml_type type_v, bool kv_unified, uint32_t n_kv_reserve, std::string& err)
+             int threads, const std::string& gguf, const std::string& vocab, double min_p, bool cost_policy,
+             const std::string& cost_seed, ggml_type type_k, ggml_type type_v, bool kv_unified,
+             uint32_t n_kv_reserve, std::string& err)
         : ctx_tgt_(ctx_tgt), n_draft_(n_draft), min_p_(static_cast<float>(min_p)) {
         const int n_heads = llama_model_n_layer_nextn(model);
         if (n_heads <= 0) {
@@ -453,6 +455,15 @@ public:
         bt_ = llama_batch_ext_init(ctx_tgt);
         bd_ = llama_batch_ext_init(ctx_dft_);
         lanes_.resize(static_cast<size_t>(n_seq));
+        // --llama-mtp-policy cost: one lane only (a shared step's lanes would
+        // draft for each other and the rule's per-round outcome is one lane's
+        // round); off otherwise, as the decision recorded in section 5.2.
+        if (cost_policy && n_seq == 1) {
+            policy_ = std::make_unique<DraftPolicy>();
+            if (!cost_seed.empty() && !policy_->seed_from_text(cost_seed, err)) return;
+        } else if (cost_policy) {
+            log::warn("mtp", "named lanes: --llama-mtp-policy cost is off (one policy a lane, one lane a verify)");
+        }
         zero_.assign(static_cast<size_t>(n_embd_), 0.0f);
         h_step_.resize(static_cast<size_t>(n_embd_));
     }
@@ -547,12 +558,17 @@ public:
         struct St {
             int                n = 0, idx = -1, pending = 0;
             bool               on = false;
-            bool               record = false;   // ARCINT_MTP_TRACE: keep the chain's probabilities
-            bool               want_p = false;   // min-p or the trace asks for them
+            bool               record = false;   // ARCINT_MTP_TRACE or the policy: keep the chain's probabilities
+            bool               want_p = false;   // min-p, the trace or the policy asks for them
+            bool               floor_stopped = false;   // min-p cut the chain (the trace records that draft)
+            PolicyChain        chain;                   // --llama-mtp-policy cost: this round's E/cost state
             std::vector<float> row;
         };
         std::vector<St> st(n_parts);
         const bool      out_logits = head_ == nullptr;
+        // the policy's context bucket of this round's first row (one part when
+        // it is on: n_seq == 1)
+        if (policy_) policy_->set_context(static_cast<long long>(parts[0].pos0));
         clear_d();
         bool any = false;
         for (size_t k = 0; k < n_parts; ++k) {
@@ -562,7 +578,7 @@ public:
             // ARCINT_MTP_TRACE (exec/mtp_trace.h): the chain's probabilities, kept
             // drafts then the floor's stopping draft; `record` is what makes the
             // head compute one at min-p 0. Null or off: nothing extra computed.
-            st[k].record = p.probs != nullptr && mtp_trace_on();
+            st[k].record = p.probs != nullptr && (mtp_trace_on() || policy_ != nullptr);
             if (st[k].record) p.probs->clear();
             st[k].want_p = min_p_ > 0.0f || st[k].record;
             st[k].n = std::min(p.n_max, n_draft_);
@@ -625,15 +641,52 @@ public:
                 // the drafts are likely enough to be verified; one below stays out.
                 // The trace records that stopping draft's probability too: the replay
                 // needs it to price the width the floor refused to verify.
-                if (h == nullptr || tok < 0 || prob < min_p_) {
-                    if (st[k].record && h != nullptr && tok >= 0) parts[k].probs->push_back(prob);
+                if (h == nullptr || tok < 0) {
                     st[k].on = false;
+                    continue;
+                }
+                // the min-p floor stays a floor over the policy (the reference's
+                // cost arm has none; section 7.1): a draft below it is never
+                // verified, the policy sees the chain stop there.
+                if (prob < min_p_) {
+                    if (st[k].record) parts[k].probs->push_back(prob);
+                    st[k].floor_stopped = true;
+                    st[k].on            = false;
                     continue;
                 }
                 parts[k].out->push_back(tok);
                 if (st[k].record) parts[k].probs->push_back(prob);
                 st[k].row.assign(h, h + n_embd_);
-                any = true;
+                // the fixed ceiling continues every draft; the policy decides
+                // whether another draft could beat its best width, and the
+                // verify is then truncated to that width below.
+                bool go = true;
+                if (policy_) {
+                    const int cap = std::max(1, std::min(parts[k].n_max + 1, DraftPolicy::kMaxT));
+                    go            = policy_->keep_draft(st[k].chain, i, prob, cap);
+                }
+                any = go;
+                if (!go) st[k].on = false;
+            }
+        }
+        // --llama-mtp-policy cost: the verify is the policy's width, not the
+        // drafted chain (section 5.2). Truncate each part's drafts to
+        // best_rows - 1 and the probability list to the verified drafts (the
+        // floor's stopping draft stays the list's last, as the trace's shape
+        // says). The drafts past the width were made for the look-ahead; the
+        // MTP rows they used are cut by the caller's rollback.
+        if (policy_) {
+            for (size_t k = 0; k < n_parts; ++k) {
+                if (!st[k].record || parts[k].probs == nullptr) continue;
+                const int kept =
+                    std::max(0, std::min(st[k].chain.best_rows - 1, static_cast<int>(parts[k].out->size())));
+                parts[k].out->resize(static_cast<size_t>(kept));
+                std::vector<float> keep(parts[k].probs->begin(),
+                                        parts[k].probs->begin() + std::min(static_cast<size_t>(kept),
+                                                                          parts[k].probs->size()));
+                if (st[k].floor_stopped && static_cast<int>(parts[k].probs->size()) > kept)
+                    keep.push_back(parts[k].probs->back());
+                *parts[k].probs = std::move(keep);
             }
         }
         // the drafts leave; the entry of pos0 (id_last, a target row) stays
@@ -690,6 +743,23 @@ public:
     bool set_kv_windows(const uint32_t* n_cells, int n) override {
         return llama_memory_seq_windows(llama_get_memory(ctx_dft_), n_cells, n);
     }
+
+    // --llama-mtp-policy cost: the step loop reports a round's outcome here
+    // after the verify and the rollback (section 5.2). The cost's time is the
+    // round's start to the report, which excludes the next round's setup; the
+    // trace's start-to-start measured that gap at 0.6 % (7.6).
+    bool mtp_policy_on() const override { return policy_ != nullptr; }
+    void mtp_observe(int seq, const std::vector<float>& probs, int drafted, int accepted, int rows, double ms,
+                     size_t pos) override {
+        (void) seq;
+        (void) drafted;
+        if (!policy_) return;
+        policy_->set_context(static_cast<long long>(pos));
+        policy_->observe_round(rows, accepted, ms);
+        const int n = std::max(0, std::min(rows - 1, static_cast<int>(probs.size())));
+        policy_->observe_probs(probs.data(), n, accepted);
+    }
+    std::string mtp_cost_table() const override { return policy_ ? policy_->cost_table_text() : std::string(); }
 
     void set_carried_state(int seq, size_t n, const std::vector<uint8_t>& state) override {
         SpecStateView v;
@@ -760,6 +830,7 @@ private:
     llama_batch_ext*   bd_      = nullptr;
     int                n_draft_ = 0;
     float              min_p_   = 0.0f;
+    std::unique_ptr<DraftPolicy> policy_;   // --llama-mtp-policy cost, one lane
     int                n_embd_  = 0;
     int                n_vocab_ = 0;
     int                nd_      = 0;   // entries in bd_
@@ -773,10 +844,11 @@ private:
 
 std::unique_ptr<LlamaSpec> make_llama_mtp(llama_model* model, llama_context* ctx_tgt, int n_draft, int n_seq,
                                           int n_batch, int n_ubatch, int threads, const std::string& gguf,
-                                          const std::string& vocab, double min_p, ggml_type type_k, ggml_type type_v,
+                                          const std::string& vocab, double min_p, bool cost_policy,
+                                          const std::string& cost_seed, ggml_type type_k, ggml_type type_v,
                                           bool kv_unified, uint32_t n_kv_reserve, std::string& err) {
     auto s = std::make_unique<LlamaMtp>(model, ctx_tgt, n_draft, n_seq, n_batch, n_ubatch, threads, gguf, vocab,
-                                        min_p, type_k, type_v, kv_unified, n_kv_reserve, err);
+                                        min_p, cost_policy, cost_seed, type_k, type_v, kv_unified, n_kv_reserve, err);
     if (!s->ok() || !err.empty()) return nullptr;
     if (s->head_rows() > 0) log::info("mtp", "draft head: %zu token rows", s->head_rows());
     return s;

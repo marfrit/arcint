@@ -210,6 +210,24 @@ one lane. Do not extend to lanes without the lanes' own measurement (Strata and 
 6. No llama.cpp patch. If the `probs` of a draft are needed before the draft vocabulary head, they come from
    the same `top_prob` already computed.
 
+**Built (this branch, `code` unless marked; the plan above and what the build did):** `src/exec/draft_policy.h`
+is the pure class (`keep_draft`, `observe_round`, `observe_probs`, `draft_rate`, `set_context`, `seed_costs`,
+`seed_from_text`, `cost_table_text`, `kShape`/alphas/probes/margin as `paper` constants), one behaviour with
+`tools/mtp_width_replay.py` pinned round by round by `tests/python/fixtures/mtp_policy_decisions.txt`
+(`tests/test_draft_policy.cpp` and the replay's `--decisions` both compare bytes to it). `draft_multi` hooks it
+at `llama_spec.cpp:571` (the round's context bucket), `:666` (the keep decision; the min-p floor at `:651` still
+stops a draft below it first), `:676-693` (the truncation to `best_rows - 1`, the probability list cut to the
+verified drafts with a floor-stopping draft kept last); the backend reports at `backend_llama.cpp:1890-1895`
+after the walk and rollback with the round's start-to-now time (propose + verify + walk + rollback; the trace's
+start-to-start measured that gap at 0.6 %, `measured-here`, 7.6), then `observe_round` and `observe_probs`. The
+flags are `--llama-mtp-policy off|cost` (default `off`) and `--llama-mtp-cost-seed` (`config.cpp:461-469`; the
+policy needs `--llama-mtp`, the seed needs the policy, `:854-856`; DFlash and stub refuse both); `/props`'s `mtp`
+object carries `policy` and the learned `cost_table` (`api/handlers.cpp`). Deviations from the plan, all
+deliberate: the chain state lives in `draft_multi`'s local `St` (one part when the policy is on, `n_seq == 1`),
+not in `Lane`; `n_seq > 1` runs the policy off with a warning, so no per-lane instance exists; a round's cost time
+is its start to the report, not the trace's start-to-start (last round included); the probability is computed
+whenever the trace or the policy wants it, else not (`code`: the same `top_prob` call, `:638`).
+
 ### 5.3 Per-unit defaults and why the cost model matters
 
 The cost table is the unit's own and starts seeded, not from the generic shape. Seed it from the first rounds' measured
@@ -254,7 +272,13 @@ times by width (Strata's `STRATA_SPEC_COST_TABLE` form, `generate.cpp:16495-1651
   truncates after the draft and verifies the full chain anyway: the unit test on the chain fails; (3) `keep_draft`
   fed a constant cost: it must reproduce the fixed K path and the unit test equate them; (4) the walk test
   (`tests/test_verify_walk.cpp`) with a width change, a mutation that accepts past the target's disagreement.
-  Each asserted in the built artifact (CLAUDE.md red-case rule), not assumed.
+  Each asserted in the built artifact (CLAUDE.md red-case rule), not assumed. Built here: (2) is
+  `draft_policy_truncation_verifies_the_chosen_width` (the 0.9/0.01 chain makes 2 drafts, the verify holds 1;
+  the mutation `drafts = drafted` fails it); (3) is `draft_policy_constant_cost_reproduces_fixed_k` (every width
+  10 ms reproduces the cap, and a 0.2 chain stops at 3 rows; the unseeded mutation fails the fixture); (4) is
+  the existing `verify_walk_mismatch_keeps_the_prefix` plus the policy's own truncation - the walk code itself is
+  untouched by the policy, so it runs on whatever rows the verify holds; (1) needs a card and is the policy's
+  width-1 arm below.
 
 ## 6. Card measurements to run (not run here)
 
@@ -285,8 +309,9 @@ state in `Lane` survives preemption/checkpoint restore the way `pending` does (`
 Built on branch `mtpw` from qfndev `450eca9`, arcint only, no llama.cpp patch: the off-by-default trace
 (`src/exec/mtp_trace.h`, `src/exec/llama_spec.{h,cpp}`, `src/exec/backend_llama.cpp`), the stdlib-only replay
 (`tools/mtp_width_replay.py`) and the device-free tests (`tests/test_mtp_trace.cpp`,
-`tests/python/test_mtp_width_replay.py`, the fixture `tests/python/fixtures/mtp_trace_lines.txt`). It does not
-touch the serving path's policy hook (§5.2).
+`tests/python/test_mtp_width_replay.py`, the fixture `tests/python/fixtures/mtp_trace_lines.txt`). The first
+commit (trace + replay, rounds 1-4) leaves the serving path unchanged; the second commit builds the cost-aware
+policy into it (§5.2's "Built" note, §7.6's card traces).
 
 ### 7.1 Where the code disagrees with this document (`code`, the reference's source wins)
 
@@ -488,6 +513,18 @@ the report).
 and per unit the answers' check (`served_check.py` asks the capital, the needle, the answers; 5.4's items 4 and
 5), single-lane check from the log's `n_uneven_` line.
 
+**The policy arm** (`--llama-mtp-policy cost`, built in the second commit, §5.2): one more arm a unit, on top of
+the unit's flags at the same ceiling and floor, and one with the measured table as seed (7.6's per-width ms;
+the seeds below exercise `--llama-mtp-cost-seed`, not a code constant):
+
+```
+ARCINT_MTP_TRACE=/tmp/mtp-<unit>-policy.txt tools/fn_sweep.py <arcint> <unit.gguf> <assets> <unit>-policy --unit <unit> [--device GPU.N] --set --llama-mtp-policy cost --set --llama-mtp-cost-seed "<T1,T2,..;T1,..;T1,..>"
+```
+
+Read `/props`'s `mtp.cost_table` at the run's end against the replay's learned table (both sides start from the
+same seed); that is limitation 6's answer for the policy arm, and the replay's `--costs-from` from the same
+window is the offline cross-check.
+
 Not run here: no card was touched this round; every command above waits for Claude's window.
 
 ### 7.5 Rounds 2 and 3: the review's findings, all fixed in the one commit
@@ -543,3 +580,46 @@ Not run here: no card was touched this round; every command above waits for Clau
    `:16495-16511`; `cost_table_text` names a bucket once per bucket as Strata does (`draft_policy.cpp:105-111`,
    red test `CostTableText`); 7.1 item 6's refs are the current ones (`:2199, :2269, :1847, :2317`); this
    section sits after 7.4; the reversed-round sentence names `fn_sweep.py`. Evidence: `code` both sides.
+
+### 7.6 First card traces (windows 28-29, the trace build `fbea77a`; `measured-here` unless marked)
+
+Claude's first windows ran the trace before the serving-path policy existed: fixed-width legs and arm sweeps on
+the three units, so this section is the measurement the build's defaults and seeds rest on. Every number is
+`measured-here`; the replay figures are `inferred` from those traces with the measured table seeded.
+
+**Round cost by verified rows** (mean ms of a round, fixed-width legs, context under 6K; rows 1-4/5/6 per
+unit): Flash-Next B60 43.8 / 62.9 / 68.7 / 80.0 / 97.7 (rows 1-5; the 1 -> 2 jump is the expert misses), agent
+B60 55.0 / 57.0 / 60.5 / 64.0 / 66.1 / 68.9 / 71.8 (rows 1-7, ~2.8 ms a row), coder A770 with the deployed
+draft vocabulary 22.8 / 26.9 / 31.7 / 38.5 / 43.5 / 48.1 (rows 1-6). A round's own duration against
+propose + verify: a 0.5 ms gap (0.6 %), which is what §5.2's hook uses as its cost time (its start-to-report).
+
+**Served decode t/s**, `fn_sweep.py` six answers, greedy, the capital right on every leg (width = rows-1):
+Flash-Next 1 28.95, 2 33.10, 3 33.48, ceiling 4 with min-p 0 29.77, ceiling 4 with the unit's 0.5 floor 32.47,
+the unit (3, floor 0.5) 33.10 trace-off and 32.60 trace-on; agent 1 31.33, 2 38.92, 3 41.48, 4 42.65,
+5 42.43 (trace-off 42.55), 6 41.62; coder with the vocabulary 1 63.08, 2 65.13 (trace-off 65.55/65.43),
+3 60.83, 4 55.68 (trace-off 56.18/56.18), 5 51.88; coder **without** the vocabulary (fn_sweep's table before
+the fix below, not what the unit serves) 1 60.18, 2 60.42, 3 55.33, 4 50.15 (trace-off 50.95). The coder's
+best fixed width is 2, the agent's 4, Flash-Next's 3-4 (`measured-here`: these are the replay's mode widths
+too, within one width).
+
+**Acceptance task** (one sampled answer, temp 0.7, scored /10, the deployed coder flags): width 2 10/10 three
+times at 86.0/86.0/85.9 t/s; width 4 10/10 three times at 90.0/89.8/90.1 -> on code a wide window pays
++4.6 %, while on prose (the fn_sweep answers) the narrow width is +16.5 %. Best fixed width is
+workload-dependent (`measured-here`), which is the policy's reason to exist.
+
+**Replay over these traces with the measured costs seeded** (`inferred`; tokens a ms): Flash-Next unit 0.0339,
+best fixed 0.0342, policy 0.0344-0.0352 (+1.5 to +3.8 % over the unit); agent best fixed 0.0431 at width 4,
+unit 0.0429, policy 0.0420-0.0424 (-1.6 to -2.1 %: the rule's kShape prior and probe settle narrower on prose
+than the best fixed width); coder unit 0.0563, best fixed 0.0660, policy 0.0675-0.0676 (+20 % over the unit,
++2.3 % over best fixed). The replay's fixed-width numbers match the served ones (Flash-Next 33.9 against
+33.48, agent 42.9 against 42.43), so the trace's time is the round's own. The agent's negative is not the
+policy's arithmetic: cost(t) near-linear makes E/cost flat across widths, and the kProbes rule keeps an
+unmeasured width for one round; the seeded table (`--llama-mtp-cost-seed`, the policy arm in 7.4) is the arm
+that answers it.
+
+**Fixed bug in `tools/fn_sweep.py`** (`code`, seen on the cards): the `coder` table lacked
+`--llama-mtp-vocab`, so a coder arm drafted from all 248,320 output rows, not the deployed 4k draft
+vocabulary - the coder's sweeps above that say "with the vocabulary" were run with an explicit `--set`, and
+the ones without it (50-60 t/s instead of 63-65) are that slower head. Fixed in the first commit's addendum:
+the coder table now carries the vocabulary. `contrib/systemd/arcint-coder.service` still lacks the flag -
+recorded, not edited here (the operator owns the unit files).

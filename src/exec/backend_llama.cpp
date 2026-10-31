@@ -759,8 +759,9 @@ public:
             std::string err;
             spec_ = make_llama_mtp(mtp_model, ctx_, cfg.llama_mtp, lanes_, n_batch_, static_cast<int>(cp.n_ubatch),
                                    threads, cfg.llama_mtp_gguf.empty() ? cfg.gguf_path : cfg.llama_mtp_gguf,
-                                   cfg.llama_mtp_vocab, cfg.llama_mtp_min_p, cp.type_k, cp.type_v, cp.kv_unified,
-                                   cp.n_kv_reserve, err);
+                                   cfg.llama_mtp_vocab, cfg.llama_mtp_min_p, cfg.llama_mtp_policy,
+                                   cfg.llama_mtp_cost_seed, cp.type_k, cp.type_v, cp.kv_unified, cp.n_kv_reserve,
+                                   err);
             if (!spec_) throw std::runtime_error(log::format("--llama-mtp %d: %s", cfg.llama_mtp, err.c_str()));
             n_draft_ = cfg.llama_mtp;
             mtp_min_p_ = cfg.llama_mtp_min_p;   // the trace records it (exec/mtp_trace.h)
@@ -1022,6 +1023,10 @@ public:
         if (ctx_ == nullptr) return "off";
         const char * st = llama_context_slot_loan_state(ctx_);
         return st != nullptr ? st : "off";
+    }
+    std::string mtp_cost_table() const override {
+        std::lock_guard<std::mutex> lk(mu_);
+        return spec_ ? spec_->mtp_cost_table() : std::string();
     }
 #endif
     Tokenizer&         tokenizer() override { return *tokenizer_; }
@@ -1876,6 +1881,18 @@ private:
                     throw std::runtime_error("llama.cpp refused the draft rollback");
             }
             stats.draft_rollback_seconds += seconds_since(t_r);
+            // --llama-mtp-policy cost: the round's outcome to the rule (section
+            // 5.2): the verified window's drafts and probabilities, the walk's
+            // accepted count, and the round's own time - its start to here,
+            // which is propose + verify + walk + rollback. The trace's
+            // start-to-start measured that gap at 0.6 % (7.6); the last round
+            // has no next start, so this is the only measure it can have.
+            if (spec_->mtp_policy_on()) {
+                const double round_ms = std::chrono::duration<double, std::milli>(clock_type::now() - t_start).count();
+                std::lock_guard<std::mutex> lk(mu_);
+                spec_->mtp_observe(seq, probs, static_cast<int>(draft.size()), w.accepted,
+                                   static_cast<int>(batch.size()), round_ms, pos0);
+            }
             // one trace record a verify round, off by default (exec/mtp_trace.h):
             // buffered, because its duration is known only at the next round's
             // start; the replay needs the per-width round time and the chain's

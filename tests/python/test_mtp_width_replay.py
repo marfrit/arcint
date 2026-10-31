@@ -79,6 +79,7 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 import mtp_width_replay as mw  # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "mtp_trace_lines.txt"
+POLICY_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "mtp_policy_trace.txt"
 
 
 def write_trace(path, records):
@@ -449,6 +450,30 @@ class Limits(unittest.TestCase):
         out = []
         mw.report(str(path), rep, out)
         self.assertNotIn("min-p > 0", "\n".join(out))
+
+
+class DecisionPin(unittest.TestCase):
+    # the cross-language pin: this file and src/exec/draft_policy.h's test both
+    # compare their bytes to the checked-in decisions fixture, so the C++ class
+    # and this replay have ONE behaviour round by round.
+    FIXTURE_DEC = Path(__file__).resolve().parent / "fixtures" / "mtp_policy_decisions.txt"
+
+    def test_the_replay_emits_the_checked_in_decisions(self):
+        # red: `st.best_e = st.e` unconditionally at the end of keep_draft (E at
+        # the chain's end, not at the width it would verify) moves the
+        # truncating round's e= off 1.966277143 and the comparison fails.
+        rep = mw.replay(mw.read_trace(FIXTURE) + mw.read_trace(POLICY_FIXTURE))
+        want = self.FIXTURE_DEC.read_text(encoding="utf-8")
+        self.assertEqual(mw.decision_text(rep), want)
+
+    def test_the_decisions_fixture_names_its_own_table(self):
+        # red: a table line dropped or the bucket name changed once a bucket -
+        # the fifth line disappears (the C++ side fails the same way)
+        text = self.FIXTURE_DEC.read_text(encoding="utf-8")
+        lines = [l for l in text.splitlines() if l.strip()]
+        self.assertEqual(len(lines), 6)
+        self.assertTrue(lines[-1].startswith("table ctx<6K:"))
+        self.assertIn(" | ctx<24K:", lines[-1])
 
 
 class T1Unmeasured(unittest.TestCase):

@@ -238,6 +238,7 @@ if(ARCINT_TESTS)
     tests/test_config.cpp
     tests/test_verify_walk.cpp
     tests/test_mtp_trace.cpp
+    tests/test_draft_policy.cpp
     tests/test_dflash_walk.cpp
     tests/test_spec_state.cpp
     tests/test_token_ids.cpp

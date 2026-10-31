@@ -290,6 +290,14 @@ std::string usage_text() {
         "  --llama-mtp-min-p P       stop drafting at a token the MTP head gives less\n"
         "                            than P, and leave it out of the verify (0-1; 0 off:\n"
         "                            always --llama-mtp drafts)\n"
+        "  --llama-mtp-policy off|cost\n"
+        "                            cost: Strata's cost-aware window rule picks the\n"
+        "                            kept drafts and the verify's rows from the measured\n"
+        "                            per-width round time (default off: the fixed\n"
+        "                            --llama-mtp width; one lane only)\n"
+        "  --llama-mtp-cost-seed LIST the round ms per width, one list a context\n"
+        "                            bucket: \"T1,T2,..;T1,..;T1,..\" (needs\n"
+        "                            --llama-mtp-policy cost)\n"
         "  --llama-dflash-gguf FILE  draft with this DFlash2 drafter (llama.cpp's\n"
         "                            'dflash' GGUF for the served model) instead of\n"
         "                            an MTP head: one drafter pass proposes a block,\n"
@@ -452,6 +460,13 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--llama-mtp-min-p") {
             if (!value(v) || !parse_double(v, cfg.llama_mtp_min_p) || cfg.llama_mtp_min_p < 0.0 || cfg.llama_mtp_min_p > 1.0)
                 return fail("--llama-mtp-min-p needs a probability from 0 to 1");
+        } else if (arg == "--llama-mtp-policy") {
+            if (!value(v) || (std::string(v) != "off" && std::string(v) != "cost"))
+                return fail("--llama-mtp-policy takes off or cost");
+            cfg.llama_mtp_policy = std::string(v) == "cost";
+        } else if (arg == "--llama-mtp-cost-seed") {
+            if (!value(v)) return fail("--llama-mtp-cost-seed needs a cost table: \"T1,T2,..;T1,..;T1,..\"");
+            cfg.llama_mtp_cost_seed = std::string(v);
         } else if (arg == "--llama-dflash-gguf") {
             if (!value(v)) return fail("--llama-dflash-gguf needs a DFlash2 drafter GGUF");
             cfg.llama_dflash_gguf = std::string(v);
@@ -784,7 +799,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     }
     if (cfg.stub) {
         if (cfg.llama_cpu_moe > 0 || cfg.llama_threads > 0 || cfg.llama_mtp > 0 || !cfg.llama_mtp_vocab.empty() ||
-            !cfg.llama_mtp_gguf.empty() || cfg.llama_mtp_min_p > 0.0 || cfg.llama_dflash_on() || cfg.llama_dflash > 0 ||
+            !cfg.llama_mtp_gguf.empty() || cfg.llama_mtp_min_p > 0.0 || cfg.llama_mtp_policy ||
+            !cfg.llama_mtp_cost_seed.empty() || cfg.llama_dflash_on() || cfg.llama_dflash > 0 ||
             cfg.llama_dflash_min_p > 0.0 || cfg.llama_dflash_ubatch > 0 ||
             cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192 ||
             cfg.llama_expert_cache_on() || !cfg.llama_expert_profile.empty() || cfg.llama_layer_split > 0 || cfg.llama_mtp_card >= 0 ||
@@ -827,7 +843,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.llama_dflash_ubatch > 0 && !cfg.llama_dflash_on())
         return fail("--llama-dflash-ubatch needs --llama-dflash-gguf (the drafter)");
     if (cfg.llama_dflash_on() && (cfg.llama_mtp > 0 || !cfg.llama_mtp_vocab.empty() || !cfg.llama_mtp_gguf.empty() ||
-                                  cfg.llama_mtp_min_p > 0.0))
+                                  cfg.llama_mtp_min_p > 0.0 || cfg.llama_mtp_policy || !cfg.llama_mtp_cost_seed.empty()))
         return fail("--llama-dflash-gguf and --llama-mtp (-vocab, -gguf, -min-p) are exclusive: one drafter a context, "
                     "the DFlash2 drafter or the MTP head");
     if (cfg.llama_dflash_on() && cfg.llama_dflash == 0) cfg.llama_dflash = 7;   // the drafter's block of 8
@@ -835,6 +851,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (!cfg.llama_mtp_vocab.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-vocab needs --llama-mtp");
     if (!cfg.llama_mtp_gguf.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-gguf needs --llama-mtp");
     if (cfg.llama_mtp_min_p > 0.0 && cfg.llama_mtp <= 0) return fail("--llama-mtp-min-p needs --llama-mtp");
+    if (cfg.llama_mtp_policy && cfg.llama_mtp <= 0) return fail("--llama-mtp-policy needs --llama-mtp");
+    if (!cfg.llama_mtp_cost_seed.empty() && !cfg.llama_mtp_policy)
+        return fail("--llama-mtp-cost-seed needs --llama-mtp-policy cost");
     if (cfg.llama_expert_cache_on() && cfg.llama_cpu_moe <= 0)
         return fail("--llama-expert-cache caches experts --llama-cpu-moe keeps in host memory: give --llama-cpu-moe");
     if (!cfg.llama_expert_profile.empty() && !cfg.llama_expert_cache_on())

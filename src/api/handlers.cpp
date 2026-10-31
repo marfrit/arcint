@@ -569,7 +569,15 @@ json props(const Context& ctx) {
         // default), "armed": the cache set one up at load, "out": lent right now.
         {"slot_loan", {{"state", ctx.backend->slot_loan_state()}}},
         {"mtp", {{"requested", std::string(cfg.llama_mtp > 0 ? "on" : "off")},
-                 {"enabled", st.mtp_enabled}}},
+                 {"enabled", st.mtp_enabled},
+                 // --llama-mtp-policy: the width rule the serving path runs, and
+                 // the table it has learned so far (null when the policy is off).
+                 // Section 5.2's "/props reports the policy and the learned table".
+                 {"policy", std::string(cfg.llama_mtp_policy ? "cost" : "off")},
+                 {"cost_table", [&]() {
+                      const std::string t = ctx.backend->mtp_cost_table();
+                      return t.empty() ? json(nullptr) : json(t);
+                  }()}}},
         {"dflash", {{"requested", std::string(cfg.llama_dflash_on() ? "on" : "off")},
                     {"enabled", st.dflash_enabled},
                     // the drafter's own count: --llama-dflash capped by its trained block
