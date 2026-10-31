@@ -676,7 +676,9 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
 // state. The Responses route maps its request into a ChatRequest and calls this
 // same function, so there is one prompt builder and not two
 // (docs/campaigns/feyntalk.md W1).
-std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req, PreparedChat& out) {
+std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req, PreparedChat& out,
+                                            const PromptFit* fit) {
+    (void)fit;   // W3.5 scaffolding (red-first): the fit pass is not built yet.
     // The lane first: its name may be a 404, and its cap is the 400's
     int lane = -1;
     if (auto err = resolve_lane(ctx, req.model, lane)) return err;

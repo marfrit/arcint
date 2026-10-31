@@ -1848,3 +1848,288 @@ TEST(responses_think_state_stays_keyed_to_the_generation_start) {
         CHECK_EQ(msg["content"].get<std::string>(), std::string("NEW-ANSWER"));
     }
 }
+
+// ------------------------------------------------- W3.5 truncation: "auto"
+namespace {
+
+// The cheap compaction tier's small default: 256 tokens of room for the
+// answer. A request's own max_output_tokens is used when smaller; the
+// operator's --think-ctx-reserve overrides both.
+constexpr int kDefaultFitReserve = 256;
+
+// A replayed tool loop with two RENDERED reasoning blocks: the last user
+// message sits before both assistant turns, which is the stub template's
+// Qwen3 rule (reasoning only for assistant turns after the last user).
+ResponseRequest replay_request(std::string truncation) {
+    ResponseRequest r;
+    r.chat.model = "stub";
+    r.truncation = std::move(truncation);
+    ChatMessage u;
+    u.role    = "user";
+    u.content = "find the port";
+    ChatMessage a1;
+    a1.role      = "assistant";
+    a1.content   = "checking the config";
+    a1.reasoning = std::string(320, 'o') + " OLD-REASON";
+    ToolCall c1;
+    c1.id        = "call_0";
+    c1.name      = "read_file";
+    c1.arguments = "{}";
+    a1.tool_calls.push_back(c1);
+    ChatMessage t1;
+    t1.role         = "tool";
+    t1.tool_call_id = "call_0";
+    t1.content      = "8080";
+    ChatMessage a2;
+    a2.role      = "assistant";
+    a2.content   = "reading it back";
+    a2.reasoning = std::string(320, 'n') + " NEW-REASON";
+    ToolCall c2;
+    c2.id        = "call_1";
+    c2.name      = "read_file";
+    c2.arguments = "{}";
+    a2.tool_calls.push_back(c2);
+    ChatMessage t2;
+    t2.role         = "tool";
+    t2.tool_call_id = "call_1";
+    t2.content      = "8080";
+    r.chat.messages = {u, a1, t1, a2, t2};
+    return r;
+}
+
+// The stub renderer and tokenizer do not depend on n_ctx, so a probe fixture
+// gives the expected counts before the case's own fixture picks its n_ctx.
+int prompt_tokens_of(const ChatRequest& req) {
+    Fixture probe;
+    return static_cast<int>(probe.backend->tokenizer().encode(probe.backend->render_chat(req)).size());
+}
+
+// The prompt with the oldest reasoning block removed, and with both removed:
+// the oracle the expected numbers come from. Dropping reasoning never touches
+// a message body, a tool call or a tool output.
+int tokens_without_first(const ResponseRequest& r) {
+    ChatRequest c = r.chat;
+    c.messages[1].reasoning.clear();
+    return prompt_tokens_of(c);
+}
+
+int tokens_without_both(const ResponseRequest& r) {
+    ChatRequest c = r.chat;
+    c.messages[1].reasoning.clear();
+    c.messages[3].reasoning.clear();
+    return prompt_tokens_of(c);
+}
+
+}  // namespace
+
+// Fits: nothing is dropped and the prompt is the renderer's own bytes, exactly
+// today's prompt.
+TEST(responses_truncation_auto_fits_and_drops_nothing) {
+    ResponseRequest r = replay_request("auto");
+    const int       full = prompt_tokens_of(r.chat);
+    Fixture         fx(full + kDefaultFitReserve);
+
+    PreparedResponse prep;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r), prep).has_value());
+    CHECK_EQ(prep.chat.truncation.blocks_dropped, 0);
+    CHECK_EQ(prep.chat.truncation.tokens_before, full);
+    CHECK_EQ(prep.chat.truncation.tokens_after, full);
+    CHECK_EQ(prep.chat.truncation.reserve, kDefaultFitReserve);
+    CHECK_EQ(prep.chat.input.prompt, fx.backend->render_chat(prep.chat.req));
+}
+
+// Over by a little: the OLDEST reasoning block is dropped, the newest stays in
+// the prompt. The restore keeps the whole history in prep.chat.req.
+TEST(responses_truncation_auto_drops_the_oldest_block_only) {
+    ResponseRequest r = replay_request("auto");
+    const int       full = prompt_tokens_of(r.chat);
+    const int       one  = tokens_without_first(r);
+    CHECK(one < full);
+    Fixture fx(one + kDefaultFitReserve);
+
+    PreparedResponse prep;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r), prep).has_value());
+    CHECK_EQ(prep.chat.truncation.blocks_dropped, 1);
+    CHECK_EQ(prep.chat.truncation.tokens_before, full);
+    CHECK_EQ(prep.chat.truncation.tokens_after, one);
+    CHECK_EQ(prep.chat.truncation.tokens_freed(), full - one);
+    CHECK_EQ(prep.chat.truncation.reserve, kDefaultFitReserve);
+    CHECK(prep.chat.input.prompt.find("NEW-REASON") != std::string::npos);
+    CHECK(prep.chat.input.prompt.find("OLD-REASON") == std::string::npos);
+    // The store and the echo keep the full history: the drop is per request.
+    CHECK_EQ(prep.chat.req.messages.size(), 5u);
+    if (prep.chat.req.messages.size() < 5) return;
+    CHECK(prep.chat.req.messages[1].reasoning.find("OLD-REASON") != std::string::npos);
+    CHECK(prep.chat.req.messages[3].reasoning.find("NEW-REASON") != std::string::npos);
+    CHECK_EQ(prep.chat.req.messages[1].tool_calls.size(), 1u);   // untouched
+}
+
+// Over by more: several blocks go, oldest first, the newest last.
+TEST(responses_truncation_auto_drops_several_newest_last) {
+    ResponseRequest r = replay_request("auto");
+    const int       two = tokens_without_both(r);
+    Fixture fx(two + kDefaultFitReserve);
+
+    PreparedResponse prep;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r), prep).has_value());
+    CHECK_EQ(prep.chat.truncation.blocks_dropped, 2);
+    CHECK_EQ(prep.chat.truncation.tokens_after, two);
+    CHECK(prep.chat.input.prompt.find("NEW-REASON") == std::string::npos);
+    CHECK(prep.chat.input.prompt.find("OLD-REASON") == std::string::npos);
+    CHECK_EQ(prep.chat.req.messages.size(), 5u);
+}
+
+// Nothing left to drop and the prompt is still over: the same 400 code, and
+// the message names the drops and how many tokens are still over.
+TEST(responses_truncation_auto_exhausted_is_the_same_400_with_counts) {
+    ResponseRequest r = replay_request("auto");
+    const int       two = tokens_without_both(r);
+    Fixture fx(two + kDefaultFitReserve - 1);
+
+    PreparedResponse prep;
+    const auto       err = api::prepare_response(fx.ctx, std::move(r), prep);
+    CHECK(err.has_value());
+    if (!err.has_value()) return;
+    CHECK_EQ(err->status, 400);
+    const json& e = err->body["error"];
+    CHECK_EQ(e["code"].get<std::string>(), std::string("context_length_exceeded"));
+    const std::string msg = e["message"].get<std::string>();
+    CHECK(msg.find("reasoning dropped: 2 blocks, still 1 over") != std::string::npos);
+    CHECK_EQ(e["prompt_tokens"].get<int>(), two);
+    CHECK_EQ(e["n_ctx"].get<int>(), two + kDefaultFitReserve - 1);
+    CHECK(!err->body.contains("arcint"));   // a refusal is not a response
+}
+
+// disabled and an absent field keep today's 400 exactly: no fit pass, no
+// reasoning dropped, the same message and bytes.
+TEST(responses_truncation_disabled_and_absent_keep_todays_400) {
+    ResponseRequest r = replay_request("disabled");
+    const int       full = prompt_tokens_of(r.chat);
+    Fixture fx(full);
+
+    PreparedResponse prep;
+    const auto       err = api::prepare_response(fx.ctx, std::move(r), prep);
+    CHECK(err.has_value());
+    if (!err.has_value()) return;
+    CHECK_EQ(err->status, 400);
+    const json disabled = err->body;
+
+    ResponseRequest absent = replay_request("disabled");   // the parse default
+    PreparedResponse prep2;
+    const auto       err2 = api::prepare_response(fx.ctx, std::move(absent), prep2);
+    CHECK(err2.has_value());
+    if (!err2.has_value()) return;
+    CHECK_EQ(err2->body.dump(), disabled.dump());
+    const std::string msg = disabled["error"]["message"].get<std::string>();
+    CHECK(msg.find("does not truncate") != std::string::npos);
+}
+
+// The fit pass leaves the request's max_output_tokens worth of room when it is
+// smaller than the default, and still fits a prompt that already has room.
+TEST(responses_truncation_auto_reserve_uses_max_output_tokens_when_smaller) {
+    ResponseRequest r = replay_request("auto");
+    r.max_output_tokens       = 64;
+    r.chat.sampler.max_tokens = 64;
+    const int full = prompt_tokens_of(r.chat);
+    Fixture fx(full + kDefaultFitReserve);
+
+    PreparedResponse prep;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r), prep).has_value());
+    CHECK_EQ(prep.chat.truncation.blocks_dropped, 0);
+    CHECK_EQ(prep.chat.truncation.reserve, 64);
+}
+
+// The non-streamed resource: truncation is echoed, and the arcint extension
+// carries blocks dropped, tokens freed and prompt before/after.
+TEST(responses_truncation_auto_reports_in_the_non_streamed_resource) {
+    ResponseRequest r = replay_request("auto");
+    const int       full = prompt_tokens_of(r.chat);
+    const int       one  = tokens_without_first(r);
+    Fixture fx(one + kDefaultFitReserve);
+
+    PreparedResponse prep;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r), prep).has_value());
+    const auto lease = fx.slots.acquire_for(0);
+    const api::HttpResult res = api::run_response(fx.ctx, prep, lease.index());
+    CHECK_EQ(res.status, 200);
+    if (res.status != 200) return;
+    CHECK_EQ(res.body["truncation"].get<std::string>(), std::string("auto"));
+    CHECK(res.body.contains("arcint"));
+    if (!res.body.contains("arcint")) return;
+    const json& t = res.body["arcint"]["truncated"];
+    CHECK_EQ(t["blocks_dropped"].get<int>(), 1);
+    CHECK_EQ(t["tokens_freed"].get<int>(), full - one);
+    CHECK_EQ(t["prompt_tokens_before"].get<int>(), full);
+    CHECK_EQ(t["prompt_tokens_after"].get<int>(), one);
+    CHECK_EQ(res.body["usage"]["input_tokens"].get<int>(), one);
+}
+
+// The stream's arcint:truncated event: same fields, v, and before the terminal
+// event.
+TEST(responses_sse_truncated_event_reports_the_fit_pass) {
+    StreamFixture fx;
+    fx.backend.pieces = {{"a", 1}};
+    fx.prep.chat.truncation.blocks_dropped   = 2;
+    fx.prep.chat.truncation.tokens_before    = 500;
+    fx.prep.chat.truncation.tokens_after     = 380;
+    fx.prep.chat.truncation.reserve          = kDefaultFitReserve;
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    int truncated = -1, terminal = -1;
+    for (size_t i = 0; i < s.events.size(); ++i) {
+        if (s.events[i].first == "arcint:truncated") truncated = static_cast<int>(i);
+        if (s.events[i].first == "response.completed") terminal = static_cast<int>(i);
+    }
+    CHECK(truncated >= 0);
+    if (truncated < 0) return;
+    CHECK(truncated < terminal);
+    const json& t = s.events[truncated].second;
+    CHECK_EQ(t["v"].get<int>(), 1);
+    CHECK_EQ(t["blocks_dropped"].get<int>(), 2);
+    CHECK_EQ(t["tokens_freed"].get<int>(), 120);
+    CHECK_EQ(t["prompt_tokens_before"].get<int>(), 500);
+    CHECK_EQ(t["prompt_tokens_after"].get<int>(), 380);
+}
+
+// A continuation after a truncated turn still works, and the store kept the
+// full history: the drop was this turn's prompt, not a rewrite of the state.
+TEST(responses_truncation_auto_continuation_keeps_the_full_store) {
+    ResponseRequest r = replay_request("auto");
+    const int       one = tokens_without_first(r);
+    Fixture fx(one + kDefaultFitReserve);
+    fx.ctx.responses = std::make_shared<api::ResponseStore>(
+        api::ResponseStore::Limits{32, 1ull << 20, 600});
+
+    PreparedResponse prep;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r), prep).has_value());
+    CHECK_EQ(prep.chat.truncation.blocks_dropped, 1);
+    const auto             lease = fx.slots.acquire_for(0);
+    const api::HttpResult  turn1 = api::run_response(fx.ctx, prep, lease.index());
+    CHECK_EQ(turn1.status, 200);
+    const std::string id = prep.chat.id;
+
+    const auto stored = fx.ctx.responses->get(id, prep.chat.lane);
+    CHECK(stored != nullptr);
+    if (stored == nullptr) return;
+    CHECK_EQ(stored->chat.messages.size(), 5u);
+    if (stored->chat.messages.size() < 5) return;
+    CHECK(stored->chat.messages[1].reasoning.find("OLD-REASON") != std::string::npos);
+    CHECK(stored->chat.messages[3].reasoning.find("NEW-REASON") != std::string::npos);
+
+    // The next turn: same truncation setting, the full stored history plus the
+    // new user item. Its prompt renders no past reasoning (the template's rule
+    // for assistant turns before the last user), so the fit pass has nothing to
+    // drop; the prefix check must still match the stored full render.
+    ResponseRequest next;
+    next.chat.model = "stub";
+    ChatMessage u;
+    u.role    = "user";
+    u.content = "go on";
+    next.chat.messages = {u};
+    next.truncation    = "auto";
+    next.previous_response_id     = id;
+    next.has_previous_response_id = true;
+    PreparedResponse prep2;
+    const auto       err = api::prepare_response(fx.ctx, std::move(next), prep2);
+    CHECK(!err.has_value());
+}
