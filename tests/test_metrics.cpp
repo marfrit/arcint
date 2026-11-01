@@ -7,6 +7,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -176,4 +177,78 @@ TEST(metrics_render_labels_each_named_lane) {
     CHECK(has(text, "arcint_queue_depth{lane=\"sub\\\"agent\"} 0"));
     CHECK(has(text, "arcint_slots_total{lane=\"sub\\\"agent\"} 1"));
     CHECK(has(text, "arcint_model_loaded 1"));
+}
+
+// --------------------------------------------------- streaming timings
+namespace {
+
+// The SSE payloads of a stream_chat run (the [DONE] sentinel dropped).
+std::vector<json> stream_chunks(Fixture& f, const json& body) {
+    PreparedChat prep;
+    CHECK(!api::prepare_chat(f.ctx, body, prep));
+    std::vector<json> out;
+    api::stream_chat(f.ctx, prep, 0, [&](std::string_view frame) {
+        if (frame.rfind("data: ", 0) != 0) return true;
+        std::string payload(frame.substr(6));
+        while (!payload.empty() && payload.back() == '\n') payload.pop_back();
+        if (payload == "[DONE]") return true;
+        out.push_back(json::parse(payload));
+        return true;
+    });
+    return out;
+}
+
+json base_stream() {
+    return json{{"model", "stub"},
+                {"messages", json::array({{{"role", "user"}, {"content", "hi"}}})},
+                {"stream", true}};
+}
+
+bool any_chunk_has(const std::vector<json>& chunks, const char* key) {
+    for (const json& c : chunks)
+        if (c.contains(key)) return true;
+    return false;
+}
+
+}  // namespace
+
+TEST(chat_stream_timings_ride_the_usage_chunk_when_usage_is_on) {
+    // llama-server puts usage and timings in the same final chunk; a client
+    // that reads the last data frame gets both.
+    Fixture f;
+    json body = base_stream();
+    body["stream_options"] = {{"include_usage", true}};
+    body["arcint"]         = {{"timings", true}};
+    const std::vector<json> chunks = stream_chunks(f, body);
+
+    bool found = false;
+    for (const json& c : chunks) {
+        if (!c.contains("usage")) continue;
+        CHECK(c.contains("timings"));
+        found = true;
+    }
+    CHECK(found);
+}
+
+TEST(chat_stream_timings_stay_on_the_finish_chunk_without_usage) {
+    Fixture f;
+    json body = base_stream();
+    body["stream_options"] = {{"include_usage", false}};
+    body["arcint"]         = {{"timings", true}};
+    const std::vector<json> chunks = stream_chunks(f, body);
+
+    bool found = false;
+    for (const json& c : chunks) {
+        if (!c.contains("choices") || c["choices"].empty()) continue;
+        const json& choice = c["choices"][0];
+        if (!choice.contains("finish_reason") || choice["finish_reason"].is_null()) continue;
+        if (c.contains("timings")) found = true;
+    }
+    CHECK(found);
+}
+
+TEST(chat_stream_absent_timings_adds_none) {
+    Fixture f;
+    const std::vector<json> chunks = stream_chunks(f, base_stream());
+    CHECK(!any_chunk_has(chunks, "timings"));
 }

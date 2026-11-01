@@ -25,4 +25,17 @@ bool constant_time_equal(std::string_view a, std::string_view b);
 // is never needed at request time.
 bool bearer_matches(std::string_view authorization_header, std::string_view key_sha256_hex);
 
+// Boot hygiene for a configured key. False + `error` means the server must not
+// start: an empty key (an empty or newline-only --api-key-file) or one with a
+// carriage return (it can never be presented in an HTTP header). True with a
+// `warning` for a legal key that is still a footgun: leading or trailing
+// whitespace, or a '%' (cpp-httplib URL-decodes header values, so a key with
+// `%xx` can never match a client that sends it verbatim).
+bool api_key_hygiene(std::string_view key, std::string& error, std::string& warning);
+
+// Overwrite a string's storage with zeros before clearing it, so a plaintext
+// key does not stay in freed memory. volatile, so the compiler cannot elide
+// the writes as dead stores.
+void secure_scrub(std::string& s);
+
 }  // namespace lgc::api

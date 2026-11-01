@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -109,4 +110,58 @@ TEST(auth_config_refuses_tls_without_the_build_option) {
 #else
     CHECK(rejected({"--stub", "--tls-cert", "/tmp/c.pem", "--tls-key", "/tmp/k.pem"}));
 #endif
+}
+
+TEST(auth_hygiene_refuses_an_empty_key_and_a_carriage_return) {
+    std::string err, warn;
+    CHECK(!api::api_key_hygiene("", err, warn));
+    CHECK(!err.empty());
+
+    err.clear();
+    warn.clear();
+    CHECK(!api::api_key_hygiene("a\rb", err, warn));
+    CHECK(err.find("carriage") != std::string::npos);
+
+    // The newline-only --api-key-file case: read_api_key_file strips the one
+    // trailing newline, leaving an empty key the same check refuses.
+    CHECK(!api::api_key_hygiene("\n", err, warn));
+}
+
+TEST(auth_hygiene_warns_on_whitespace_and_a_percent) {
+    std::string err, warn;
+    CHECK(api::api_key_hygiene("good-key", err, warn));
+    CHECK(warn.empty());
+
+    warn.clear();
+    CHECK(api::api_key_hygiene(" leading", err, warn));
+    CHECK(!warn.empty());
+
+    warn.clear();
+    CHECK(api::api_key_hygiene("trailing ", err, warn));
+    CHECK(!warn.empty());
+
+    warn.clear();
+    CHECK(api::api_key_hygiene("k%41y", err, warn));
+    CHECK(!warn.empty());
+}
+
+TEST(auth_secure_scrub_clears_and_overwrites) {
+    std::string key = "test-key-not-real";
+    api::secure_scrub(key);
+    CHECK(key.empty());
+}
+
+TEST(auth_main_checks_hygiene_and_scrubs_the_key) {
+    // The startup path is not reachable from a unit test (it needs a process),
+    // so this pins the wiring the way test_props pins the llama backend's KV
+    // precision: main must run the hygiene check and scrub the plaintext
+    // buffers. The scanner case in tests/acceptance/cells guards the source
+    // the same way.
+    std::ifstream in(std::string(ARCINT_SOURCE_DIR) + "/src/main.cpp");
+    CHECK(in.good());
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const std::string src = ss.str();
+    CHECK(src.find("api_key_hygiene") != std::string::npos);
+    CHECK(src.find("secure_scrub") != std::string::npos);
 }

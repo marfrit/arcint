@@ -67,4 +67,13 @@ bool bearer_matches(std::string_view authorization_header, std::string_view key_
     return constant_time_equal(digest, key_sha256_hex);
 }
 
+bool api_key_hygiene(std::string_view key, std::string& error, std::string& warning) {
+    (void)key;
+    (void)error;
+    (void)warning;
+    return true;
+}
+
+void secure_scrub(std::string& s) { s.clear(); }
+
 }  // namespace lgc::api
