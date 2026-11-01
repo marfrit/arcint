@@ -8,11 +8,38 @@ Vendored, single-header, licenses unchanged:
 | nlohmann/json | 3.11.3 | MIT | `third_party/nlohmann/json.hpp` |
 | minja (chat templating) | vendored | MIT | via `minja/chat-template.hpp` |
 
-`third_party/httplib.h` carries one small local change beyond verbatim:
-`Request` gets a `socket` field, filled in `process_request` from the server
-stream, so a handler can ask `detail::is_socket_alive` whether the peer is
-still connected without writing a byte (a non-streamed request's prefill
-writes nothing for a long stretch). The build also defines
+`third_party/httplib.h` is cpp-httplib **0.18.3** with two small local
+changes. The exact diff against a fresh upstream v0.18.3 `httplib.h` is
+`third_party/httplib-arcint.patch` (4 hunks; `--- a/httplib.h`).
+
+First change (patch hunks 1 and 3): `Request` gets a `socket` field, filled
+in `process_request` from the server stream, so a handler can ask
+`detail::is_socket_alive` whether the peer is still connected without writing
+a byte (a non-streamed request's prefill writes nothing for a long stretch).
+
+Second change (patch hunks 2 and 4): a handler that answers
+`Connection: close` is honoured. `write_response_core`
+
+    -  } else {
+    +  } else if (!res.has_header("Connection")) {
+
+so the handler's `Connection: close` is not accompanied by a `Keep-Alive`
+beside it; and `process_request`, just before `if (routed)`,
+
+    +  if (res.get_header_value("Connection") == "close") {
+    +    connection_closed = true;
+    +  }
+
+so the socket is closed after that response and the unread request body (the
+pre-routing 401 does not read it) is never parsed as a next request.
+
+Upstream 0.18.3 cannot do this today: the server derives close only from the
+request's `Connection` header and the keep-alive max count (`close_connection`)
+and overwrites every response's `Connection`/`Keep-Alive` itself, so no
+handler -- `set_pre_routing_handler` included -- can ask for the connection to
+close. The vendored patch is the smallest fix short of an upstream change; the
+behaviour is a candidate for upstream (`Server`: honour a handler's
+`Connection: close`). The build also defines
 `CPPHTTPLIB_USE_POLL` (`CMakeLists.txt`): without poll, `process_request`
 answers 500 to every connection above `FD_SETSIZE`, and `select()` returns -1
 there, which that liveness probe would read as "gone". Two limits of the probe:

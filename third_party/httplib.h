@@ -6435,7 +6435,10 @@ inline bool Server::write_response_core(Stream &strm, bool close_connection,
   // Prepare additional headers
   if (close_connection || req.get_header_value("Connection") == "close") {
     res.set_header("Connection", "close");
-  } else {
+  } else if (!res.has_header("Connection")) {
+    // arcint local change: a handler that already decided to close (the
+    // pre-routing 401) keeps its Connection: close alone, no Keep-Alive beside
+    // it.
     std::string s = "timeout=";
     s += std::to_string(keep_alive_timeout_sec_);
     s += ", max=";
@@ -7174,6 +7177,13 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
     }
   }
 #endif
+  // arcint local change: a handler that answered `Connection: close` (the
+  // pre-routing 401, which does not read the request body) closes the
+  // connection here, so the unread request bytes are never parsed as a next
+  // request.
+  if (res.get_header_value("Connection") == "close") {
+    connection_closed = true;
+  }
   if (routed) {
     if (res.status == -1) {
       res.status = req.ranges.empty() ? StatusCode::OK_200
