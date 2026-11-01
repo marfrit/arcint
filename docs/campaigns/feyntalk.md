@@ -1145,6 +1145,90 @@ unit state) installs the bundle and runs the live task in **both** modes, then
 `feyntalk-doctor` shows the manifest hashes; no card window for the install,
 one window for the live leg (Gate 4's class). `inferred` until built.
 
+### D8 — Parallel calls in one assistant turn (W6g)
+
+**Status: built (2026-11-01, stub gate).** Measured live 2026-11-01 (W6e):
+the engine mapped every `function_call` input item to its own assistant
+ChatMessage, so a turn in which the model emitted two parallel calls came back
+as two consecutive assistant messages with one call each. The rendered prompt
+differed from what the model generated (prefix cache misses from that turn on,
+and the history the model saw was not its own), and a gateway could not carry
+a Chat history with several calls per assistant message through Responses input.
+`measured-here`.
+
+**The rule.** A run of `[reasoning item]? [assistant message item]?
+[function_call item]+` with no user/developer/system message item and no
+`function_call_output` in between becomes **ONE** assistant ChatMessage:
+
+- `content` = the message item's text (empty when there is no message item);
+- `tool_calls` = the calls in item order, each with its own `call_id`;
+- `reasoning` = the preceding reasoning item(s), applied to the merged turn.
+
+`function_call_output` items stay one tool message each, in order. Turn
+boundaries are user/developer/system message items and `function_call_output`
+items; a reasoning item also restarts a run (the grammar puts it before the
+message item, never between calls). An empty reasoning item contributes
+nothing but still restarts the run, and it does not erase the reasoning that
+preceded it: both paths read that one way, so a call after
+`[reasoning "r1", reasoning <empty>]` still carries "r1" (`code`). No invented
+separator items. The merged
+ChatMessage is exactly what the Chat route builds for the same turn (`code`:
+`chat_json.h`'s `tool_calls` array, one entry per call).
+
+The rule applies on **both** paths — `read_item`'s input mapping and
+`assistant_turns_of` (store reconstruction) — so a `previous_response_id`
+continuation renders byte-identically to the same history sent inline: the
+prefix hash and the token-mode `arcint.render.prompt_sha256` stay meaningful
+(`code`). Reasoning is attached once to the merged turn, so W3.2's
+after-the-last-user rule and W3.5's reasoning-first fit pass keep or drop it as
+a unit, never per call (`code`).
+
+The two paths share one state machine (`AssistantRun`): the merge, the
+reasoning pairing, the message-content shapes (a string, or typed parts joined
+with a newline) and the reset rules live in one place, and an item the grammar
+does not handle closes the run on the stored path exactly as the input path's
+boundary items do — a corrupt stored `[call, <unknown>, call]` cannot merge
+across the unknown item. A table-driven test feeds the same assistant-item
+sequences through both paths and asserts identical ChatMessages (`code`).
+
+The rule is not only about several calls. A stored `[message, function_call]`
+turn — the ordinary single-call tool turn with a text preamble, which the
+engine's `response_resource` emits as a message item followed by a
+`function_call` item — now rebuilds as **one** assistant message where it used
+to be two. That is a render change for existing `previous_response_id`
+continuations, and it is correct because a template cannot have generated two
+back-to-back assistant turns: the engine's own output is one assistant turn
+with its content and its calls, and replaying it any other way shows the model
+a history it never wrote. The store is in-memory only (charter §3), so no
+persisted prefix is invalidated (`code`).
+
+On the Responses input path a duplicate `call_id` inside **one** merged run is
+refused with 400 `invalid_request` (param `input`), because the
+`function_call_output` pairing would be ambiguous. The stored-output path
+carries engine-minted ids and cannot see a duplicate. The Chat Completions
+route is a separate surface and keeps its current behaviour (`code`).
+
+A continuation whose new input replays the stored output's own
+`function_call` items is the client double-replaying: the stored turn and the
+replayed turn become **two** assistant turns, where the inline form of the same
+items is one run (and is refused, the call_ids repeat). This is named, not
+special-cased: the engine does not guess which of the two turns the client
+meant (`code`).
+
+**Fixture and tests.**
+`tests/feyntalk/fixtures/parallel-tool-calls.json` is the shared contract: a
+`schema: feyntalk-w6g/1` object of named histories, each holding the Responses
+`items` and the equivalent Chat `messages` they must render to (two calls in
+one turn; text then two calls; two separate turns split by a tool output; a
+reasoning item before the turn; the inline full history after the two-call
+turn). The engine test (`tests/test_responses.cpp`, the W6g section) reads it,
+pins `schema: feyntalk-w6g/1` so a drifted copy fails loudly, checks the mapped
+messages structurally against the Chat form, compares the rendered prompts
+byte for byte on both paths (including the continuation), and feeds the same
+assistant-item sequences through both paths; the gateway's renderer test reads
+a copy of the same file later (no other repository is touched here). Red first,
+then the merge made them pass.
+
 ### Work packages
 
 Ordered, each one session. `R` = engine maintainer review; `C` = card window.

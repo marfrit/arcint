@@ -556,9 +556,16 @@ std::string render_chatml_stub(const ChatRequest& req) {
         }
         out += m.content;
         for (const ToolCall& c : m.tool_calls) {
-            out += "\n<tool_call>\n";
+            // The parser's own tags: this renderer emits exactly the
+            // bytes core/toolcall.cpp finds, so there is one spelling
+            // (W6g review 3).
+            const ToolCallTags& tags = tool_call_tags();
+            out += "\n";
+            out += tags.open;
+            out += "\n";
             out += json{{"name", c.name}, {"arguments", c.arguments}}.dump();
-            out += "\n</tool_call>";
+            out += "\n";
+            out += tags.close;
         }
         out += markers::kTurnEnd;
         out += "\n";

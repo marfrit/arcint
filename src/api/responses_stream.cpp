@@ -556,7 +556,7 @@ bool Stream::run(const Context& ctx, int slot) {
                                         return p.first >= 0 || p.second >= 0;
                                     });
 
-    static const std::string kToolOpen = "<tool_call>";
+    static const std::string kToolOpen(tool_call_tags().open);
 
     GenerationStats stats;
     std::string     raw;

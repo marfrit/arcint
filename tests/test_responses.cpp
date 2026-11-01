@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <ctime>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -1215,18 +1216,22 @@ TEST(responses_a_two_turn_continuation_rebuilds_and_echoes) {
     const auto err = api::prepare_response(fx.ctx, std::move(r2), p2);
     CHECK(!err.has_value());
     if (err.has_value()) return;
-    // Stored input messages (1 user) + one assistant message per output item
-    // (the message and the function_call; W3.2 made the continuation mirror the
-    // full-history item shape so the prompt can match) + the new tool output.
-    CHECK_EQ(p2.chat.req.messages.size(), 4u);
-    if (p2.chat.req.messages.size() < 4) return;
+    // Stored input messages (1 user) + the stored assistant turn + the new
+    // tool output. W6g: the output's message item and its function_call item
+    // are ONE assistant run, so the continuation rebuilds ONE assistant
+    // ChatMessage carrying the text and the call (its own turn), exactly the
+    // shape a full-history request maps to.
+    CHECK_EQ(p2.chat.req.messages.size(), 3u);
+    if (p2.chat.req.messages.size() < 3) return;
     CHECK_EQ(p2.chat.req.messages[1].role, std::string("assistant"));
-    CHECK_EQ(p2.chat.req.messages[2].role, std::string("assistant"));
-    CHECK_EQ(p2.chat.req.messages[2].tool_calls.size(), size_t(1));
-    CHECK_EQ(p2.chat.req.messages[2].tool_calls[0].id, call_id);
-    CHECK_EQ(p2.chat.req.messages[3].role, std::string("tool"));
-    CHECK_EQ(p2.chat.req.messages[3].tool_call_id, call_id);
-    CHECK_EQ(p2.chat.req.messages[3].content, std::string("alpha"));
+    CHECK_EQ(p2.chat.req.messages[1].tool_calls.size(), size_t(1));
+    // Guard the index: a regression that splits the run must fail the CHECKs
+    // above, not read past the vector.
+    if (p2.chat.req.messages[1].tool_calls.empty()) return;
+    CHECK_EQ(p2.chat.req.messages[1].tool_calls[0].id, call_id);
+    CHECK_EQ(p2.chat.req.messages[2].role, std::string("tool"));
+    CHECK_EQ(p2.chat.req.messages[2].tool_call_id, call_id);
+    CHECK_EQ(p2.chat.req.messages[2].content, std::string("alpha"));
     CHECK(p2.affinity_slot >= 0);
 
     const api::HttpResult res2 = api::run_response(fx.ctx, p2, 0);
@@ -1722,7 +1727,10 @@ TEST(responses_pairs_reasoning_items_with_the_next_assistant_item) {
     // reasoning_text parts joined with a newline) belongs to the NEXT assistant
     // item — an assistant message or a function_call. Any other item in between
     // drops the pending reasoning; about the last user message the template then
-    // decides what to show.
+    // decides what to show. W6g: a message item and the function_calls that
+    // follow it are ONE assistant run, so the first call joins the message (it
+    // does not open a second turn), while a reasoning item restarts the run and
+    // the next call opens a new turn carrying it.
     json body = base();
     body["input"] = json::array({
         reasoning_item("r-one"),
@@ -1737,16 +1745,23 @@ TEST(responses_pairs_reasoning_items_with_the_next_assistant_item) {
     });
     ResponseRequest r;
     parse_ok(body, r);
-    CHECK_EQ(r.chat.messages.size(), 5u);
-    if (r.chat.messages.size() < 5) return;
+    CHECK_EQ(r.chat.messages.size(), 4u);
+    if (r.chat.messages.size() < 4) return;
     CHECK_EQ(r.chat.messages[0].role, std::string("assistant"));
+    CHECK_EQ(r.chat.messages[0].content, std::string("one"));
     CHECK_EQ(r.chat.messages[0].reasoning, std::string("r-one"));
+    CHECK_EQ(r.chat.messages[0].tool_calls.size(), size_t(1));   // c1 joined the message
+    // Guard the index: a regression that splits the run must fail the CHECK
+    // above, not read past the vector.
+    if (r.chat.messages[0].tool_calls.empty()) return;
+    CHECK_EQ(r.chat.messages[0].tool_calls[0].id, std::string("c1"));
     CHECK_EQ(r.chat.messages[1].role, std::string("assistant"));
+    CHECK_EQ(r.chat.messages[1].reasoning, std::string("r-two-a\nr-two-b"));
     CHECK_EQ(r.chat.messages[1].tool_calls.size(), size_t(1));
-    CHECK_EQ(r.chat.messages[1].reasoning, std::string(""));   // r-one went to the message
-    CHECK_EQ(r.chat.messages[2].reasoning, std::string("r-two-a\nr-two-b"));
-    CHECK_EQ(r.chat.messages[3].role, std::string("user"));
-    CHECK_EQ(r.chat.messages[4].reasoning, std::string(""));   // orphan dropped at the user
+    if (r.chat.messages[1].tool_calls.empty()) return;   // guard the index
+    CHECK_EQ(r.chat.messages[1].tool_calls[0].id, std::string("c2"));
+    CHECK_EQ(r.chat.messages[2].role, std::string("user"));
+    CHECK_EQ(r.chat.messages[3].reasoning, std::string(""));   // orphan dropped at the user
 }
 
 TEST(responses_continuation_renders_the_stored_reasoning_like_full_history) {
@@ -3034,4 +3049,471 @@ TEST(renderer_material_carries_the_tag_geometry_and_template_source) {
     parts.parser["tag_set"] = "qwen";
     const json other = assemble_renderer_material(parts);
     CHECK(m["hash"].get<std::string>() != other["hash"].get<std::string>());
+}
+
+// ------------------------- W6g: parallel calls in one assistant turn
+//
+// docs/campaigns/feyntalk.md D8. A run of [reasoning item]? [assistant message
+// item]? [function_call item]+ with no user/developer/system message item and
+// no function_call_output in between is ONE assistant ChatMessage: content =
+// the message item's text, tool_calls = the calls in item order with their
+// call_ids, reasoning = the preceding reasoning. function_call_output items
+// stay one tool message each, in order. The rule applies to the input mapping
+// and to the stored-continuation reconstruction, so a continuation renders
+// byte-identically to the same history sent inline. The histories live in the
+// shared fixture tests/feyntalk/fixtures/parallel-tool-calls.json; the
+// gateway's renderer test reads a copy of it.
+namespace {
+
+// The fixture, located by the build's own source directory (the way the
+// neighbouring tests read repository files), never by the working directory:
+// ctest runs this binary with the build directory as cwd.
+const std::string kSourceDir = ARCINT_SOURCE_DIR;
+
+json load_w6g_fixture() {
+    const std::string path = kSourceDir + "/tests/feyntalk/fixtures/parallel-tool-calls.json";
+    std::ifstream     in(path);
+    CHECK(in.good());
+    json j = json::object();
+    if (in.good()) {
+        try {
+            in >> j;
+        } catch (...) {
+            j = json::object();
+        }
+    }
+    if (!j.is_object() || !j.contains("histories") || !j["histories"].is_object()) {
+        t::fail(__FILE__, __LINE__, "fixture missing or malformed: " + path);
+        return json{{"schema", "feyntalk-w6g/1"}, {"histories", json::object()}};
+    }
+    // The schema pin: a drifted copy (the gateway's later) fails loudly here
+    // instead of being read as if it were this contract.
+    if (j.value("schema", std::string()) != "feyntalk-w6g/1") {
+        t::fail(__FILE__, __LINE__, "fixture schema is not feyntalk-w6g/1: " + path);
+    }
+    return j;
+}
+
+// One named history, or an empty placeholder so a fixture problem fails on the
+// size checks instead of throwing out of the binary.
+json w6g_history(const json& fixture, const std::string& name) {
+    if (fixture.contains("histories") && fixture["histories"].is_object() &&
+        fixture["histories"].contains(name) && fixture["histories"][name].is_object()) {
+        return fixture["histories"][name];
+    }
+    t::fail(__FILE__, __LINE__, "w6g fixture history missing: " + name);
+    return json{{"items", json::array()}, {"messages", json::array()}};
+}
+
+// Structural equality of the mapped messages and the fixture's Chat form.
+void check_messages_equal(const std::vector<ChatMessage>& got,
+                          const std::vector<ChatMessage>& want) {
+    CHECK_EQ(got.size(), want.size());
+    if (got.size() != want.size()) return;
+    for (size_t i = 0; i < got.size(); ++i) {
+        CHECK_EQ(got[i].role, want[i].role);
+        CHECK_EQ(got[i].content, want[i].content);
+        CHECK_EQ(got[i].tool_call_id, want[i].tool_call_id);
+        CHECK_EQ(got[i].reasoning, want[i].reasoning);
+        CHECK_EQ(got[i].tool_calls.size(), want[i].tool_calls.size());
+        for (size_t j = 0; j < got[i].tool_calls.size() && j < want[i].tool_calls.size(); ++j) {
+            CHECK_EQ(got[i].tool_calls[j].id, want[i].tool_calls[j].id);
+            CHECK_EQ(got[i].tool_calls[j].name, want[i].tool_calls[j].name);
+            CHECK_EQ(got[i].tool_calls[j].arguments, want[i].tool_calls[j].arguments);
+        }
+    }
+}
+
+// One fixture history: the Responses items map to the fixture's Chat messages,
+// and both render the same prompt bytes (the property the prefix cache and the
+// token-mode prompt hash depend on).
+void check_history_renders_like_chat(Fixture& fx, const json& h) {
+    ResponseRequest r;
+    parse_ok(json{{"model", "stub"}, {"input", h.value("items", json::array())}}, r);
+    ChatRequest want;
+    CHECK(!parse_chat_request(
+               json{{"model", "stub"}, {"messages", h.value("messages", json::array())}}, want)
+               .has_value());
+    check_messages_equal(r.chat.messages, want.messages);
+
+    ResponseRequest  r2 = r;
+    PreparedResponse p;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r2), p).has_value());
+    PreparedChat pc;
+    CHECK(!api::prepare_from_chat(fx.ctx, std::move(want), pc).has_value());
+    CHECK_EQ(p.chat.input.prompt, pc.input.prompt);
+}
+
+// A long reasoning block the fit pass has something to drop.
+std::string w6g_long_reasoning() {
+    std::string out;
+    for (int i = 0; i < 30; ++i) out += "W6G reason about the two calls ";
+    return out;
+}
+
+// Minimal assistant items the stored-output path can carry.
+json w6g_call(const std::string& call_id) {
+    return json{{"type", "function_call"}, {"call_id", call_id}, {"name", "read_file"},
+                {"arguments", "{}"}};
+}
+// The assistant items of a history: reasoning, assistant message and
+// function_call items only (the items assistant_turns_of handles). Filtering
+// them out is what lets both paths be fed the same sequence.
+json assistant_subset(const json& items) {
+    json out = json::array();
+    for (const json& item : items) {
+        const std::string type = item.value("type", "");
+        if (type == "reasoning" || type == "function_call") {
+            out.push_back(item);
+        } else if (type == "message" && item.value("role", "") == "assistant") {
+            out.push_back(item);
+        }
+    }
+    return out;
+}
+
+// The store reconstruction of `output_items` as a continuation sees it: a
+// hand-built entry with an empty input half, continued with `new_input`. With
+// an empty `new_input` the returned messages are exactly assistant_turns_of().
+std::vector<ChatMessage> stored_path_messages(const json& output_items,
+                                              const json& new_input = json::array()) {
+    Fixture fx;
+    fx.ctx.responses = std::make_shared<api::ResponseStore>(
+        api::ResponseStore::Limits{32, 1ull << 20, 600});
+    auto e          = std::make_shared<api::StoredResponse>();
+    e->id           = "resp-w6g-stored";
+    e->lane         = -1;
+    e->status       = "completed";
+    e->output_items = output_items;
+    e->prompt       = fx.backend->render_chat(e->chat);
+    e->prefix_hash  = api::sha256_hex(e->prompt);
+    fx.ctx.responses->put(e);
+
+    ResponseRequest r;
+    parse_ok(json{{"model", "stub"}, {"previous_response_id", "resp-w6g-stored"},
+                  {"input", new_input}},
+             r);
+    PreparedResponse p;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r), p).has_value());
+    return p.chat.req.messages;
+}
+
+}  // namespace
+
+// (a)/(b): two calls in one turn -- with and without a message item before
+// them -- are ONE assistant message with two tool_calls, rendering byte-equal
+// to the Chat form of the same turn.
+TEST(responses_parallel_calls_merge_into_one_assistant_turn) {
+    Fixture    fx;
+    const json fixture = load_w6g_fixture();
+    for (const char* name : {"two_calls_one_turn", "text_then_two_calls"}) {
+        const json h = w6g_history(fixture, name);
+        check_history_renders_like_chat(fx, h);
+        ResponseRequest r;
+        parse_ok(json{{"model", "stub"}, {"input", h.value("items", json::array())}}, r);
+        CHECK_EQ(r.chat.messages.size(), 2u);   // user + the one merged turn
+        if (r.chat.messages.size() != 2) continue;
+        CHECK_EQ(r.chat.messages[1].role, std::string("assistant"));
+        CHECK_EQ(r.chat.messages[1].tool_calls.size(), 2u);
+        CHECK_EQ(r.chat.messages[1].tool_calls[0].id, std::string("call_a"));
+        CHECK_EQ(r.chat.messages[1].tool_calls[1].id, std::string("call_b"));
+    }
+    // The text before the calls is the merged turn's content, not a turn of
+    // its own.
+    const json text_h = w6g_history(fixture, "text_then_two_calls");
+    ResponseRequest rt;
+    parse_ok(json{{"model", "stub"}, {"input", text_h.value("items", json::array())}}, rt);
+    CHECK_EQ(rt.chat.messages.size(), 2u);
+    if (rt.chat.messages.size() == 2)
+        CHECK_EQ(rt.chat.messages[1].content, std::string("let me look at both"));
+}
+
+// (c): a function_call_output between two calls is a turn boundary: the two
+// turns stay two assistant messages with one call each.
+TEST(responses_separate_turns_do_not_merge) {
+    Fixture    fx;
+    const json fixture = load_w6g_fixture();
+    const json h      = w6g_history(fixture, "two_separate_turns");
+    check_history_renders_like_chat(fx, h);
+    ResponseRequest r;
+    parse_ok(json{{"model", "stub"}, {"input", h.value("items", json::array())}}, r);
+    CHECK_EQ(r.chat.messages.size(), 5u);
+    if (r.chat.messages.size() != 5) return;
+    CHECK_EQ(r.chat.messages[1].tool_calls.size(), 1u);
+    CHECK_EQ(r.chat.messages[1].tool_calls[0].id, std::string("call_a"));
+    CHECK_EQ(r.chat.messages[3].tool_calls.size(), 1u);
+    CHECK_EQ(r.chat.messages[3].tool_calls[0].id, std::string("call_b"));
+}
+
+// (d): a previous_response_id continuation of a two-call turn renders like the
+// same history sent inline, because assistant_turns_of applies the same merge
+// as the input mapping.
+TEST(responses_continuation_of_a_two_call_turn_renders_like_inline) {
+    const json fixture = load_w6g_fixture();
+    const json turn    = w6g_history(fixture, "two_calls_one_turn");
+    const json turn_items = turn.value("items", json::array());
+    CHECK(turn_items.size() >= 3);
+    if (turn_items.size() < 3) return;
+
+    Fixture fx;
+    fx.ctx.responses = std::make_shared<api::ResponseStore>(
+        api::ResponseStore::Limits{32, 1ull << 20, 600});
+    auto e      = std::make_shared<api::StoredResponse>();
+    e->id       = "resp-w6g-1";
+    e->lane     = -1;
+    e->status   = "completed";
+    ChatMessage u;
+    u.role    = "user";
+    u.content = turn_items[0].value("content", std::string());
+    e->chat.messages = {u};
+    // The stored output half as response_resource emits it: one function_call
+    // item per call, in item order.
+    e->output_items = json::array({turn_items[1], turn_items[2]});
+    e->prompt       = fx.backend->render_chat(e->chat);
+    e->prefix_hash  = api::sha256_hex(e->prompt);
+    fx.ctx.responses->put(e);
+
+    json cont = {{"model", "stub"}, {"previous_response_id", "resp-w6g-1"},
+                 {"input", json::array({
+                     {{"type", "function_call_output"}, {"call_id", "call_a"}, {"output", "alpha"}},
+                     {{"type", "function_call_output"}, {"call_id", "call_b"}, {"output", "beta"}}})}};
+    ResponseRequest r;
+    parse_ok(cont, r);
+    PreparedResponse p;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r), p).has_value());
+    const std::string cont_prompt = p.chat.input.prompt;
+    CHECK(cont_prompt.find("a.txt") != std::string::npos);
+    CHECK(cont_prompt.find("b.txt") != std::string::npos);
+    CHECK(cont_prompt.find("alpha") != std::string::npos);
+    CHECK(cont_prompt.find("beta") != std::string::npos);
+    // The stored turn is rebuilt as ONE merged assistant message: user, the
+    // merged turn, tool, tool.
+    CHECK_EQ(p.chat.req.messages.size(), 4u);
+    if (p.chat.req.messages.size() == 4u) CHECK_EQ(p.chat.req.messages[1].tool_calls.size(), 2u);
+
+    // ... and it renders byte-identically to the Chat form of the full history,
+    // which is the property the prefix cache and the prompt hash rest on.
+    const json inline_h = w6g_history(fixture, "continuation_inline");
+    ChatRequest chat_req;
+    CHECK(!parse_chat_request(
+               json{{"model", "stub"},
+                    {"messages", inline_h.value("messages", json::array())}},
+               chat_req)
+               .has_value());
+    PreparedChat chat_prep;
+    CHECK(!api::prepare_from_chat(fx.ctx, std::move(chat_req), chat_prep).has_value());
+    CHECK_EQ(cont_prompt, chat_prep.input.prompt);
+
+    json inline_body = {{"model", "stub"},
+                        {"input", inline_h.value("items", json::array())}};
+    ResponseRequest r2;
+    parse_ok(inline_body, r2);
+    PreparedResponse p2;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r2), p2).has_value());
+    CHECK_EQ(cont_prompt, p2.chat.input.prompt);
+}
+
+// W3.2 (unchanged): a merged turn's reasoning is kept or dropped as a unit.
+// The reasoning item before the turn attaches to the single merged message and
+// renders once, with both calls; the template's after-last-user rule sees one
+// turn, not one turn per call.
+TEST(responses_merged_turn_keeps_its_reasoning_as_a_unit) {
+    Fixture    fx;
+    const json fixture = load_w6g_fixture();
+    const json h       = w6g_history(fixture, "reasoning_then_calls");
+    check_history_renders_like_chat(fx, h);
+
+    ResponseRequest r;
+    parse_ok(json{{"model", "stub"}, {"input", h.value("items", json::array())}}, r);
+    CHECK_EQ(r.chat.messages.size(), 2u);
+    if (r.chat.messages.size() != 2) return;
+    CHECK_EQ(r.chat.messages[1].reasoning, std::string("W6G-WHY"));
+    CHECK_EQ(r.chat.messages[1].content, std::string("here we go"));
+    CHECK_EQ(r.chat.messages[1].tool_calls.size(), 2u);
+
+    ResponseRequest  r2 = r;
+    PreparedResponse p;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r2), p).has_value());
+    const std::string& prompt = p.chat.input.prompt;
+    const size_t       first  = prompt.find("W6G-WHY");
+    CHECK(first != std::string::npos);
+    CHECK(prompt.find("W6G-WHY", first + 1) == std::string::npos);   // once, not per call
+}
+
+// W3.5 (unchanged): truncation auto drops a merged turn's reasoning as one
+// block -- the whole turn's reasoning goes, no call is touched.
+TEST(responses_truncation_auto_drops_a_merged_turns_reasoning_as_one_block) {
+    json body = {{"model", "stub"}, {"truncation", "auto"},
+                 {"input", json::array({
+                     {{"type", "message"}, {"role", "user"}, {"content", "run both"}},
+                     reasoning_item(w6g_long_reasoning() + "W6G-REASON"),
+                     {{"type", "message"}, {"role", "assistant"}, {"content", "calling both"}},
+                     {{"type", "function_call"}, {"call_id", "call_a"}, {"name", "read_file"}, {"arguments", "{\"path\":\"a\"}"}},
+                     {{"type", "function_call"}, {"call_id", "call_b"}, {"name", "read_file"}, {"arguments", "{\"path\":\"b\"}"}}})}};
+    ResponseRequest r;
+    parse_ok(body, r);
+    CHECK_EQ(r.chat.messages.size(), 2u);   // the merge, before the fit pass
+    if (r.chat.messages.size() != 2) return;
+    CHECK_EQ(r.chat.messages[1].tool_calls.size(), 2u);
+
+    const int  full    = prompt_tokens_of(r.chat);
+    ChatRequest without = r.chat;
+    without.messages[1].reasoning.clear();
+    const int one = prompt_tokens_of(without);
+    CHECK(one < full);
+
+    Fixture fx(one + kDefaultFitReserve);
+    PreparedResponse p;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r), p).has_value());
+    CHECK_EQ(p.chat.truncation.blocks_dropped, 1);   // one turn, one block
+    CHECK(p.chat.input.prompt.find("W6G-REASON") == std::string::npos);
+    CHECK_EQ(p.chat.req.messages[1].tool_calls.size(), 2u);   // both calls survive
+}
+
+// W6g review 1: one grammar. The input mapping and the store reconstruction
+// share one merge rule, so the same assistant-item sequence is the same
+// ChatMessages through both. Table-driven over the fixture histories, whose
+// assistant items are extracted so both paths can be fed the same sequence.
+TEST(responses_two_paths_merge_identically) {
+    const json fixture = load_w6g_fixture();
+    for (const char* name : {"two_calls_one_turn", "text_then_two_calls",
+                             "two_separate_turns", "reasoning_then_calls",
+                             "empty_reasoning_then_call", "continuation_inline"}) {
+        const json h   = w6g_history(fixture, name);
+        const json sub = assistant_subset(h.value("items", json::array()));
+        ResponseRequest r;
+        parse_ok(json{{"model", "stub"}, {"input", sub}}, r);
+        check_messages_equal(r.chat.messages, stored_path_messages(sub));
+    }
+}
+
+// W6g review 1: an item the input path refuses must also reset the run on the
+// stored path. [call, <unknown>, call] is a 400 inline; the stored path skips
+// the unknown item but must not merge the two calls across it.
+TEST(responses_stored_unknown_item_resets_the_run) {
+    const json items = json::array({w6g_call("c1"), json{{"type", "item_reference"}},
+                                    w6g_call("c2")});
+    ResponseRequest refused;
+    CHECK(api::parse_response_request(json{{"model", "stub"}, {"input", items}}, refused)
+              .has_value());
+
+    const std::vector<ChatMessage> msgs = stored_path_messages(items);
+    CHECK_EQ(msgs.size(), 2u);
+    if (msgs.size() != 2) return;
+    CHECK_EQ(msgs[0].tool_calls.size(), 1u);
+    CHECK_EQ(msgs[0].tool_calls[0].id, std::string("c1"));
+    CHECK_EQ(msgs[1].tool_calls.size(), 1u);
+    CHECK_EQ(msgs[1].tool_calls[0].id, std::string("c2"));
+}
+
+// W6g review 4: [reasoning, call, call] with no message item is ONE assistant
+// turn carrying the reasoning; the prompt holds the reasoning sentinel exactly
+// once, however many calls the turn made.
+TEST(responses_merged_reasoning_without_a_message_is_one_turn) {
+    Fixture fx;
+    json body = {{"model", "stub"},
+                 {"input", json::array({json{{"type", "message"}, {"role", "user"},
+                                              {"content", "go"}},
+                                         reasoning_item("W6G-RSN"), w6g_call("call_a"),
+                                         w6g_call("call_b")})}};
+    ResponseRequest r;
+    parse_ok(body, r);
+    CHECK_EQ(r.chat.messages.size(), 2u);
+    if (r.chat.messages.size() != 2) return;
+    CHECK_EQ(r.chat.messages[1].reasoning, std::string("W6G-RSN"));
+    CHECK_EQ(r.chat.messages[1].content, std::string(""));
+    CHECK_EQ(r.chat.messages[1].tool_calls.size(), 2u);
+
+    ResponseRequest  r2 = r;
+    PreparedResponse p;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r2), p).has_value());
+    const std::string& prompt = p.chat.input.prompt;
+    const size_t       first  = prompt.find("W6G-RSN");
+    CHECK(first != std::string::npos);
+    CHECK(prompt.find("W6G-RSN", first + 1) == std::string::npos);
+}
+
+// W6g review 5: a continuation whose new input replays the stored output's own
+// function_call items gets a SECOND assistant turn -- the client is
+// double-replaying. The inline form of the same four calls is one run and is
+// refused, because the call_ids repeat within it. Neither is special-cased.
+TEST(responses_double_replayed_calls_make_a_second_assistant_turn) {
+    const json stored = json::array({w6g_call("call_a"), w6g_call("call_b")});
+    const std::vector<ChatMessage> msgs =
+        stored_path_messages(stored, json::array({w6g_call("call_a"), w6g_call("call_b")}));
+    CHECK_EQ(msgs.size(), 2u);
+    if (msgs.size() != 2) return;
+    CHECK_EQ(msgs[0].tool_calls.size(), 2u);
+    CHECK_EQ(msgs[1].tool_calls.size(), 2u);
+
+    json inline_items = json::array({json{{"type", "message"}, {"role", "user"}, {"content", "go"}}});
+    for (const char* id : {"call_a", "call_b", "call_a", "call_b"})
+        inline_items.push_back(w6g_call(id));
+    ResponseRequest refused;
+    CHECK(api::parse_response_request(json{{"model", "stub"}, {"input", inline_items}}, refused)
+              .has_value());
+}
+
+// W6g review 6: a duplicate call_id inside ONE merged run is refused on the
+// Responses input path -- the function_call_output pairing would be ambiguous.
+// The Chat Completions route is a separate surface and stays as it is.
+TEST(responses_refuses_a_duplicate_call_id_in_one_run) {
+    json body = {{"model", "stub"},
+                 {"input", json::array({json{{"type", "message"}, {"role", "user"}, {"content", "go"}},
+                                         w6g_call("dup"), w6g_call("dup")})}};
+    ResponseRequest r;
+    const auto      err = api::parse_response_request(body, r);
+    CHECK(err.has_value());
+    if (!err.has_value()) return;
+    CHECK_EQ(err->status, 400);
+    const json& e = err->body["error"];
+    CHECK_EQ(e["code"].get<std::string>(), std::string("invalid_request"));
+    CHECK_EQ(e["type"].get<std::string>(), std::string("invalid_request"));
+    CHECK_EQ(e["param"].get<std::string>(), std::string("input"));
+    CHECK(e["message"].get<std::string>().find("dup") != std::string::npos);
+}
+
+// W6g review 6 (the other half): the engine mints function_call ids
+// (call_0, call_1, ...), so a stored output cannot carry a duplicate -- that is
+// why the store reconstruction does not police them. A real two-call turn
+// proves the minted ids differ and that the stored path merges them into one
+// assistant turn without a refusal.
+TEST(responses_stored_output_call_ids_are_engine_minted_and_unique) {
+    ReplayFixture fx;
+    // The single source of the call tags (core/toolcall.cpp's table), never
+    // spelled here.
+    const std::string open_marker(tool_call_tags().open);
+    const std::string close_marker(tool_call_tags().close);
+    const std::string block = open_marker + "\n{\"name\": \"read_file\", \"arguments\": {}}\n" +
+                              close_marker;
+    fx.backend.pieces = {{"Sure\n" + block, 1}, {"\n" + block, 2}};
+    json body = {{"model", "stub"},
+                 {"input", "read both"},
+                 {"tools", json::array({{{"type", "function"},
+                                         {"name", "read_file"},
+                                         {"parameters", {{"type", "object"},
+                                                          {"properties", json::object()}}}}})},
+                 {"max_output_tokens", 256}};
+    const std::string id = fx.prepare_run(body);
+    CHECK(!id.empty());
+    if (id.empty()) return;
+    const auto stored = fx.ctx.responses->get(id, -1);
+    CHECK(stored != nullptr);
+    if (!stored) return;
+
+    std::vector<std::string> ids;
+    json                     calls = json::array();
+    for (const json& item : stored->output_items)
+        if (item.value("type", "") == "function_call") {
+            ids.push_back(item.value("call_id", std::string()));
+            calls.push_back(item);
+        }
+    CHECK_EQ(ids.size(), 2u);
+    if (ids.size() != 2) return;
+    CHECK(ids[0] != ids[1]);   // the engine minted distinct ids
+
+    const std::vector<ChatMessage> msgs = stored_path_messages(calls);
+    CHECK_EQ(msgs.size(), 1u);
+    if (msgs.size() != 1) return;
+    CHECK_EQ(msgs[0].tool_calls.size(), 2u);
 }

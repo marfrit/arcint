@@ -1160,7 +1160,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     std::string         raw;
     size_t              streamed = 0;  // bytes of tool-free content already sent
     bool                gone     = false;
-    static const std::string kToolOpen = "<tool_call>";
+    static const std::string kToolOpen(tool_call_tags().open);
     // Reasoning goes out as reasoning_content deltas until the think block
     // closes; from there `content` accumulates the answer and the tool-call
     // logic below sees only that.
