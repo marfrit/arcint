@@ -22,7 +22,9 @@ namespace lgc::api {
 //     `GenerationInput::prompt_ids_text`, so the count is what a real request
 //     would decode, by construction;
 //   - a Responses body (`input`, `instructions`, `tools`, …): the same through
-//     prepare_response, with the store left untouched (a count is not a turn).
+//     prepare_response, but the referenced stored entry is not evicted (a count
+//     is not a turn). It is still a lookup: ResponseStore::get refreshes the
+//     entry's last_used and bumps its LRU rank like any other read.
 //
 // A prompt the lane would refuse is refused here too, in the same error body
 // (the §3.8 overflow carries `prompt_tokens`), because the count goes through

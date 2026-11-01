@@ -138,7 +138,8 @@
   request would decode, counted through the request's own prepare path (one
   tokenisation, never a second). A prompt the lane would refuse is refused by
   /tokenize too, the count in the error body's prompt_tokens; a count over a
-  continuation does not evict the referenced stored response. POST /detokenize
+  continuation does not evict the referenced stored response (it is a lookup,
+  so it refreshes that entry's LRU rank like any other read). POST /detokenize
   takes {tokens} and returns {content}, special tokens rendered as text
   (unparse_special=true); an id outside the vocabulary is a 400 naming tokens.
   parse_special is accepted and ignored (specials are always parsed). The

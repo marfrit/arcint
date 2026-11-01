@@ -495,6 +495,7 @@ TEST(tokenize_continuation_overflow_keeps_the_stored_entry) {
                                           {"previous_response_id", "resp-1"},
                                           {"input", input}});
     CHECK_EQ(r.status, 400);   // the lane's cap, from the same prepare path
+    CHECK_EQ(err_field(r.body, "code"), std::string("context_length_exceeded"));
     CHECK(f.store->get("resp-1", -1) != nullptr);
 }
 
@@ -508,6 +509,7 @@ TEST(tokenize_continuation_prefix_mismatch_keeps_the_stored_entry) {
                                           {"previous_response_id", "resp-1"},
                                           {"input", "hi"}});
     CHECK_EQ(r.status, 400);
+    CHECK_EQ(err_field(r.body, "code"), std::string("previous_response_not_found"));
     CHECK(f.store->get("resp-1", -1) != nullptr);
 }
 
