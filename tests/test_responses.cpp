@@ -3472,3 +3472,46 @@ TEST(responses_refuses_a_duplicate_call_id_in_one_run) {
     CHECK_EQ(e["param"].get<std::string>(), std::string("input"));
     CHECK(e["message"].get<std::string>().find("dup") != std::string::npos);
 }
+
+// W6g review 6 (the other half): the engine mints function_call ids
+// (call_0, call_1, ...), so a stored output cannot carry a duplicate -- that is
+// why the store reconstruction does not police them. A real two-call turn
+// proves the minted ids differ and that the stored path merges them into one
+// assistant turn without a refusal.
+TEST(responses_stored_output_call_ids_are_engine_minted_and_unique) {
+    ReplayFixture fx;
+    const std::string open_marker  = "<" "tool" "_call" ">";
+    const std::string close_marker = "</" "tool" "_call" ">";
+    const std::string block = open_marker + "\n{\"name\": \"read_file\", \"arguments\": {}}\n" +
+                              close_marker;
+    fx.backend.pieces = {{"Sure\n" + block, 1}, {"\n" + block, 2}};
+    json body = {{"model", "stub"},
+                 {"input", "read both"},
+                 {"tools", json::array({{{"type", "function"},
+                                         {"name", "read_file"},
+                                         {"parameters", {{"type", "object"},
+                                                          {"properties", json::object()}}}}})},
+                 {"max_output_tokens", 256}};
+    const std::string id = fx.prepare_run(body);
+    CHECK(!id.empty());
+    if (id.empty()) return;
+    const auto stored = fx.ctx.responses->get(id, -1);
+    CHECK(stored != nullptr);
+    if (!stored) return;
+
+    std::vector<std::string> ids;
+    json                     calls = json::array();
+    for (const json& item : stored->output_items)
+        if (item.value("type", "") == "function_call") {
+            ids.push_back(item.value("call_id", std::string()));
+            calls.push_back(item);
+        }
+    CHECK_EQ(ids.size(), 2u);
+    if (ids.size() != 2) return;
+    CHECK(ids[0] != ids[1]);   // the engine minted distinct ids
+
+    const std::vector<ChatMessage> msgs = stored_path_messages(calls);
+    CHECK_EQ(msgs.size(), 1u);
+    if (msgs.size() != 1) return;
+    CHECK_EQ(msgs[0].tool_calls.size(), 2u);
+}
