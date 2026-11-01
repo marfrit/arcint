@@ -131,6 +131,21 @@ ToolSchemas tool_schemas(const std::vector<ToolSpec>& tools);
 // mtmd_tokenize() finds it (`docs/milestone-1.2.0.md §3`).
 inline constexpr const char* kMediaMarker = "<__media__>";
 
+// The keys the vendored minja's chat-template context sets itself before it
+// merges `extra_context` (third_party/minja/chat-template.hpp, apply()):
+// messages, add_generation_prompt, bos_token, eos_token, strftime_now, tools.
+// A chat_template_kwargs key that names one would let a client override the
+// engine's own value, so it is refused by name.
+bool reserved_template_context_key(std::string_view key);
+
+// The `extra_context` a request produces: the typed switches
+// (enable_thinking, preserve_thinking) plus every non-reserved
+// chat_template_kwargs key, unchanged. Empty when the request set neither, so
+// a render stays byte-identical to before the passthrough existed. `error`
+// names the first reserved key found; the caller refuses with a 400.
+// Pure: the one construction the llama render_chat and the unit test share.
+nlohmann::json template_context(const ChatRequest& req, std::string& error);
+
 // M0 stub prompt rendering.
 //
 // This is NOT the model's chat template. DESIGN.md §3.7 makes the artifact the

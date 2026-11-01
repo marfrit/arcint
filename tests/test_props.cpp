@@ -90,10 +90,10 @@ TEST(llama_backend_publishes_the_configured_kv_type) {
     CHECK(src.find("kv_precision  = \"") == std::string::npos);
 }
 
-// The coder template reads `preserve_thinking`; the capability field tells a
-// proxy so, and the render puts the switch into extra_context. Both are the
-// llama backend's (the GGUF template is the contract), so a source scan is the
-// device-free half.
+// The coder template reads `preserve_thinking`: the capability field is the
+// llama backend's (only the GGUF template knows), so this one fact stays a
+// source scan. The construction itself (typed switches + passthrough, reserved
+// keys refused) is test_chat.cpp's pure template_context case.
 TEST(llama_backend_publishes_supports_preserve_thinking) {
     std::ifstream in(std::string(ARCINT_SOURCE_DIR) + "/src/exec/backend_llama.cpp");
     CHECK(in.good());
@@ -102,16 +102,17 @@ TEST(llama_backend_publishes_supports_preserve_thinking) {
     const std::string src = ss.str();
     CHECK(src.find("supports_preserve_thinking") != std::string::npos);
     CHECK(src.find("supports_preserve_reasoning") != std::string::npos);   // kept
-    CHECK(src.find("extra_context") != std::string::npos);
 }
 
-TEST(llama_backend_passes_chat_template_kwargs_through) {
+// The wire from render_chat to the shared construction: only a scan can see it
+// device-free, and the scanned string is code, not a comment.
+TEST(llama_backend_render_chat_uses_the_template_context) {
     std::ifstream in(std::string(ARCINT_SOURCE_DIR) + "/src/exec/backend_llama.cpp");
     CHECK(in.good());
     std::stringstream ss;
     ss << in.rdbuf();
     const std::string src = ss.str();
-    CHECK(src.find("chat_template_kwargs") != std::string::npos);
+    CHECK(src.find("inputs.extra_context = template_context(") != std::string::npos);
 }
 
 TEST(props_reports_the_slot_loan_state) {

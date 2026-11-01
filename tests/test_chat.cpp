@@ -268,6 +268,62 @@ TEST(chat_unknown_template_kwargs_are_passed_through) {
     CHECK_EQ(render_chatml_stub(req), render_chatml_stub(without));
 }
 
+TEST(template_context_is_empty_without_a_request) {
+    ChatRequest req;
+    std::string err;
+    const json  ctx = template_context(req, err);
+    CHECK(err.empty());
+    CHECK(ctx.empty());   // the render can then leave extra_context unset
+}
+
+TEST(template_context_carries_the_typed_switches_and_the_passthrough) {
+    ChatRequest req;
+    req.has_enable_thinking      = true;
+    req.enable_thinking          = false;
+    req.has_preserve_thinking    = true;
+    req.preserve_thinking        = true;
+    req.chat_template_kwargs     = json{{"some_template_key", 42}, {"another", "x"}};
+    std::string err;
+    const json  ctx = template_context(req, err);
+    CHECK(err.empty());
+    CHECK_EQ(ctx.value("enable_thinking", json()), json(false));
+    CHECK_EQ(ctx.value("preserve_thinking", json()), json(true));
+    CHECK_EQ(ctx.value("some_template_key", json()), json(42));   // unchanged
+    CHECK_EQ(ctx.value("another", json()), json("x"));
+    CHECK(!ctx.contains("messages"));
+}
+
+TEST(template_context_refuses_reserved_keys) {
+    // The context keys minja sets itself: a client may not override them.
+    static constexpr const char* kReserved[] = {"messages", "add_generation_prompt", "bos_token",
+                                                "eos_token", "strftime_now", "tools"};
+    for (const char* key : kReserved) {
+        ChatRequest req;
+        req.chat_template_kwargs = json{{key, "x"}};
+        std::string err;
+        const json  ctx = template_context(req, err);
+        CHECK(!err.empty());
+        if (!err.empty()) CHECK(err.find(key) != std::string::npos);
+        CHECK(!ctx.contains(key));   // the engine's own value wins
+    }
+}
+
+TEST(chat_refuses_reserved_template_context_kwargs) {
+    static constexpr const char* kReserved[] = {"messages", "add_generation_prompt", "bos_token",
+                                                "eos_token", "strftime_now", "tools"};
+    for (const char* key : kReserved) {
+        json body = minimal_chat();
+        body["chat_template_kwargs"] = json{{key, "x"}};
+        ChatRequest req;
+        const auto  err = parse_chat_request(body, req);
+        CHECK(err.has_value());
+        if (err.has_value()) {
+            CHECK(err->find("chat_template_kwargs.") != std::string::npos);
+            CHECK(err->find(key) != std::string::npos);
+        }
+    }
+}
+
 TEST(chat_render_stub_preserve_thinking_keeps_earlier_reasoning) {
     ChatRequest req;
     CHECK(!parse_chat_request(minimal_chat(), req).has_value());

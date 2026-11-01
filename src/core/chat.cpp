@@ -553,6 +553,22 @@ json tool_call_arguments_for_template(const std::string& arguments, bool templat
     return json(arguments);
 }
 
+// Red scaffolding: the predicate and the builder exist so the cases compile,
+// but no key is reserved yet and the render still builds its own context.
+bool reserved_template_context_key(std::string_view) { return false; }
+
+nlohmann::json template_context(const ChatRequest& req, std::string& error) {
+    error.clear();
+    nlohmann::json extra = nlohmann::json::object();
+    if (req.chat_template_kwargs.is_object()) {
+        for (auto it = req.chat_template_kwargs.begin(); it != req.chat_template_kwargs.end(); ++it)
+            extra[it.key()] = it.value();
+    }
+    if (req.has_enable_thinking) extra["enable_thinking"] = req.enable_thinking;
+    if (req.has_preserve_thinking) extra["preserve_thinking"] = req.preserve_thinking;
+    return extra;
+}
+
 std::string render_chatml_stub(const ChatRequest& req) {
     std::string out;
 
