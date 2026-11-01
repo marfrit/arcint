@@ -752,7 +752,8 @@ refused in token mode: 400 `unsupported_parameter`, param `arcint.token_mode`.
 ### D2 — Token events and the shadow
 
 One `arcint:token` per accepted output token, emitted **before** its text
-shadow bytes:
+shadow bytes — except the stop-string edge D3 names, where the engine can emit
+a token's first bytes before its event (`code`):
 
 ```json
 {"type":"arcint:token","v":1,"sequence_number":41,
@@ -837,7 +838,14 @@ the index is the decision's, not an emitted token's; **(b)** a token absorbed by
 a stop string is already counted in `usage.output_tokens` by the backend, while
 it reaches no `on_piece` emit and therefore gets no `arcint:token` — the token
 index space is the emitted stream, not the usage count, on turns with stop
-strings.
+strings; **(c)** on the engine path a stop-string hold emits a token's first
+part with `-1` and its id with the last part (`generate.cpp`'s `drive` over
+`StopMatcher`, `stop.cpp take()`), so the token event can follow some of that
+token's bytes — D2's "before its shadow" does not hold on that edge. Token mode
+itself has no `stop` field (the Responses surface), so the edge needs a request
+that carries one; the token is still announced exactly once, and the turn-end
+shadow == `decode(tokens)` equality is unaffected: at turn end the shadow and
+the token sequence are both complete, whatever order the bytes arrived in.
 
 ### D4 — Renderer material (`GET /v1/responses/renderer`)
 
@@ -892,9 +900,15 @@ string, drops the JSON tree (W6 follow-ups 4/5), and the endpoint serves the
 string by reference — `/props` never pays it, a second GET copies nothing, and
 only one body-sized allocation stays resident. `/props` reads the capability and
 the cached hash through a **try_lock**: while a build is in flight it reports
-`ready` with a null hash instead of waiting it out (follow-up 3). A load-time
-pre-flight over the vocabulary's text and the template marks the capability off
-from the first second when the material could never be built (follow-up 2).
+`ready` with a null hash instead of waiting it out (follow-up 3). `try_lock`
+can fail spuriously, and a short hold after the build can also give one
+`ready`+null `/props`: a null `renderer_hash` with `token_mode: "ready"` means
+*GET the renderer*, never *token mode is off*. A load-time pre-flight over the
+vocabulary's text and the template marks the capability off from the first
+second **when that text is not valid UTF-8** (follow-up 2). It is a narrow
+pre-flight, not a guarantee: a GGUF parse failure in `read_encode_material`, or
+a non-UTF-8 model string, still flips `ready` to `off` at the first build — the
+first GET then answers 404 and `/props` says `off`.
 A build the canonical hash cannot encode (a raw-byte vocabulary's token text is
 not valid UTF-8) is caught: one warn line, empty material, `token_mode: "off"`,
 and the unit still serves text (`code`, review finding 2). `model` is volatile
@@ -938,6 +952,16 @@ commit.
 | 6 | two edge conditions unrecorded | D3 now names both: a span from a sampled-but-not-emitted token drains at an index no token carries; a stop-string token gets no `arcint:token` while usage counts it | `code` |
 | 7 | the record named a `SpanTracker` class the code does not have | the record names the `Stream` methods (`update_spans`/`drain_sampler_spans`/`close_spans`) | `code` |
 | 8 | red `360611e` read as failing assertions | noted: test-only still true; applied alone to `8d77311` it is a compile failure (no W6b helpers there), on the W6b branch the three cases failed as assertions | `code` |
+
+#### W6 follow-up round 2 (engine maintainer, 2026-11-01, record/comments only)
+
+| # | item | disposition | evidence |
+|---|---|---|---|
+| 1 | D2's "before its shadow" does not hold when a stop-string hold splits a token (first part `-1`, id on the last part) | D2 qualified; D3 gains edge **(c)**; the qualifier is in `backend_stub.cpp`'s split comment and `responses_stream.cpp`'s token-event comment. The token is announced once and the turn-end `shadow == decode(tokens)` equality is unaffected — say so at both places | `code` |
+| 2 | the round-1 insertion split the W6a paragraph; the truncation-auto 409 sentence ended the follow-up paragraph | the sentence is back in the W6a paragraph, after its "maintainer's recipe build" close | `code` |
+| 3 | D4's "could never be built" overstated the pre-flight | narrowed: the pre-flight covers non-UTF-8 vocabulary/template text only; a GGUF parse failure or a non-UTF-8 model string still flips `ready` to `off` at the first build | `code` |
+| 4 | try_lock can fail spuriously; a short post-build hold gives one `ready`+null `/props` | D4 states it: a null `renderer_hash` with `token_mode: "ready"` means *GET the renderer*, never *token mode is off* | `code` |
+| 5 | label drift "W6a follow-up 2/3" vs "W6 follow-up" | one label throughout: `src/core/renderer_material.h` says "W6 follow-up 2"; no "W6a follow-up" remains | `code` |
 
 ### D5 — feyntalk-render (new public repository, Python)
 
@@ -1421,7 +1445,9 @@ the continuation 409 keeps the stored entry). Red first three cases (the
 --max-skips 0` 492 cases 0 failed 0 skipped, golden 12/12 byte-identical,
 roundtrip green, `ctest -L compliance` 7/7 (`measured-here`, stub, aarch64,
 2026-10-31). The llama-side lazy build, tag geometry and two-load hash are the
-maintainer's recipe build.
+maintainer's recipe build. Token mode with `truncation: "auto"` stays a 409
+(the engine's fit pass hashes the dropped render; the gateway's full render
+differs) until W6c applies the fit — open question 9, (a).
 
 **W6 follow-up round (2026-11-01, `feyntalk-w6fu` from the merged qfndev tip).**
 All eight non-blocking follow-ups closed: the stub's split comment corrected
@@ -1436,10 +1462,20 @@ a build-capable accessor counter), then `ctest -L unit` 9/9, `arcint-test
 --max-skips 0` 495 cases 0 failed 0 skipped, golden 12/12 byte-identical,
 roundtrip green, `ctest -L compliance` 7/7 (`measured-here`, stub, aarch64,
 2026-11-01). The llama pre-flight and the try_lock/one-cache paths are the
-maintainer's recipe build. Token
-mode with `truncation: "auto"` stays a 409 (the engine's fit pass hashes the
-dropped render; the gateway's full render differs) until W6c applies the fit —
-open question 9, (a).
+maintainer's recipe build.
+
+**W6 follow-up round 2 (2026-11-01, `feyntalk-w6fu2` from qfndev's tip
+53ab2d1).** Five record/comment items, no behaviour change: D2 qualified and
+D3's third edge (c) named (a stop-string hold can put the id on the last part,
+so the token event can follow some of the token's bytes; turn-end
+`shadow == decode(tokens)` unaffected), and the qualifier sits in both code
+comments; the truncation-auto 409 sentence returned to the W6a paragraph;
+D4's pre-flight narrowed to non-UTF-8 text (a GGUF parse failure or a non-UTF-8
+model string still flips ready→off at the first build); D4 states that a null
+hash with `ready` means "GET the renderer"; the label is "W6 follow-up"
+throughout. Gate: build-verify, `ctest -L unit` 9/9, `arcint-test --max-skips
+0` 495 cases 0 failed 0 skipped, golden 12/12 byte-identical (`measured-here`,
+stub, aarch64, 2026-11-01).
 
 **W6b is built (2026-10-31, stub gate).** In token mode the SSE writer emits one
 `arcint:token` per accepted output token before its text shadow (token_index

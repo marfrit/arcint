@@ -266,9 +266,14 @@ private:
         // The tail of ONE token carries no id. This is deliberately the OTHER
         // side from StopMatcher: the stop matcher keeps the id with the LAST
         // part of a held stop string (stop.cpp take()), while the stub announces
-        // the token on the FIRST part here — the token event must precede the
-        // token's bytes (W6b D2), and the shadow's split bytes still reach the
-        // UTF-8 hold-back. One callback with the id is one token event either way.
+        // the token on the FIRST part here — the token event precedes the
+        // token's bytes on the stub's own split, and the shadow's split bytes
+        // still reach the UTF-8 hold-back. One callback with the id is one token
+        // event either way. Qualifier (W6 D3 edge c): on the engine path a
+        // stop-string hold can emit a token's first part with -1 and its id with
+        // the last part, so there the token event follows some of that token's
+        // bytes; the token is still announced once, and the turn-end
+        // shadow == decode(tokens) equality is unaffected.
         return on_piece(std::string_view(piece).substr(cut), -1);
     }
 
