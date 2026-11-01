@@ -19,6 +19,7 @@
 namespace lgc::api {
 
 class ResponseStore;   // api/responses_state.h: the process's in-memory store
+class Metrics;         // api/metrics.h: the counters and gauges behind GET /metrics
 
 // A fixed set of lanes (DESIGN.md §4: /health reports free/total and queue
 // depth). A lane is a memory reservation, not a queue position: N lanes means
@@ -96,7 +97,10 @@ struct Context {
     // The process's in-memory response store (docs/campaigns/feyntalk.md State,
     // W3). Null outside a server (a test calling the seam directly): then a
     // continuation cannot resolve and answers previous_response_not_found.
-    std::shared_ptr<ResponseStore> responses;
+    std::shared_ptr<ResponseStore> responses = nullptr;
+    // The counters behind GET /metrics (--metrics). Null when the flag is off:
+    // nothing is recorded then and the default surface is untouched.
+    Metrics* metrics = nullptr;
 };
 
 struct HttpResult {

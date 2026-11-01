@@ -89,9 +89,11 @@ add_library(arcint_core STATIC
   src/core/toolgrammar.cpp
   src/core/chat.cpp
   src/exec/backend_stub.cpp
+  src/api/auth.cpp
   src/api/error.cpp
   src/api/handlers.cpp
   src/api/generate.cpp
+  src/api/metrics.cpp
   src/api/renderer.cpp
   src/api/responses.cpp
   src/api/responses_stream.cpp
@@ -107,6 +109,18 @@ target_include_directories(arcint_core PUBLIC
 # read as "gone". poll has neither the fd limit nor the errno ambiguity.
 target_compile_definitions(arcint_core PUBLIC CPPHTTPLIB_USE_POLL)
 target_link_libraries(arcint_core PUBLIC arcint_vendor Threads::Threads arcint_peg)
+
+# TLS (--tls-cert/--tls-key) needs httplib's OpenSSL server. Off by default: the
+# default build neither finds nor links OpenSSL, so the package's Depends stay
+# unchanged (no libssl). ON is an extra arm, not the recipe: it exists so a
+# deployment that wants TLS in-process can build one.
+option(ARCINT_TLS "Serve HTTPS through httplib's OpenSSL server (needs OpenSSL)" OFF)
+if(ARCINT_TLS)
+  find_package(OpenSSL REQUIRED)
+  target_compile_definitions(arcint_core PUBLIC CPPHTTPLIB_OPENSSL_SUPPORT ARCINT_TLS=1)
+  target_link_libraries(arcint_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+endif()
+
 target_compile_options(arcint_core PRIVATE -Wall -Wextra -Wpedantic)
 if(ARCINT_WERROR)
   target_compile_options(arcint_core PRIVATE -Werror)
@@ -266,6 +280,8 @@ if(ARCINT_TESTS)
     tests/test_tokenize_once.cpp
     tests/test_disconnect.cpp
     tests/test_responses.cpp
+    tests/test_metrics.cpp
+    tests/test_auth.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
@@ -343,6 +359,20 @@ if(ARCINT_TESTS)
            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/stress.sh"
                    "$<TARGET_FILE:arcint>" 60 12 4)
   set_tests_properties(stress PROPERTIES TIMEOUT 300 LABELS unit)
+
+  # ops item 1: GET /metrics is opt-in and arcint.timings is opt-in. The HTTP
+  # half (route presence, Content-Type, the response object) on the stub.
+  add_test(NAME metrics
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/metrics.sh"
+                   "$<TARGET_FILE:arcint>")
+  set_tests_properties(metrics PROPERTIES TIMEOUT 120 LABELS unit)
+
+  # ops item 2: the bearer key and the TLS flag pairing. The HTTP half (401s,
+  # the /health exemption, preflight, the key file) on the stub.
+  add_test(NAME auth
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/auth.sh"
+                   "$<TARGET_FILE:arcint>")
+  set_tests_properties(auth PROPERTIES TIMEOUT 120 LABELS unit)
 
   # Both device-free: the generator's own consistency check, and the
   # acceptance runner's self-test against a fixture manifest. Neither needs a

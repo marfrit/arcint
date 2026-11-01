@@ -182,6 +182,25 @@ std::string usage_text() {
         "                            with the lane's free count (default: 0, refuse at\n"
         "                            once)\n"
         "  --http-threads N          HTTP worker threads (default: library default)\n"
+        "  --api-key KEY             require `Authorization: Bearer KEY` on every\n"
+        "                            route but /health. VISIBLE to every local user\n"
+        "                            in ps and /proc/<pid>/cmdline, so test use\n"
+        "                            only -- deployments use --api-key-file. Never\n"
+        "                            logged, never on /props\n"
+        "  --api-key-file PATH       read the bearer key from PATH once at boot\n"
+        "                            (exactly one trailing newline stripped; a key\n"
+        "                            that ends up empty is refused). Give this or\n"
+        "                            --api-key\n"
+
+        "  --tls-cert FILE           serve HTTPS with this PEM certificate; needs\n"
+        "                            --tls-key FILE and a build configured with\n"
+        "                            -DARCINT_TLS=ON (the default build has no TLS\n"
+        "                            and does not link OpenSSL)\n"
+        "  --tls-key FILE            the certificate's private key\n"
+        "  --metrics                 serve GET /metrics (Prometheus text format)\n"
+        "                            with the request/token/prefill/decode/spec\n"
+        "                            counters and the lane gauges. Off by default:\n"
+        "                            without it the route does not exist\n"
         "\n"
         "responses store\n"
         "  --responses-store-entries N  retained responses per lane (default: 32;\n"
@@ -418,6 +437,20 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             cfg.verbosity = 2;
         } else if (arg == "--stub") {
             cfg.stub = true;
+        } else if (arg == "--metrics") {
+            cfg.metrics = true;
+        } else if (arg == "--api-key") {
+            if (!value(v) || v.empty()) return fail("--api-key needs a non-empty key");
+            cfg.api_key = std::string(v);
+        } else if (arg == "--api-key-file") {
+            if (!value(v) || v.empty()) return fail("--api-key-file needs a path");
+            cfg.api_key_file = std::string(v);
+        } else if (arg == "--tls-cert") {
+            if (!value(v) || v.empty()) return fail("--tls-cert needs a certificate path");
+            cfg.tls_cert = std::string(v);
+        } else if (arg == "--tls-key") {
+            if (!value(v) || v.empty()) return fail("--tls-key needs a key path");
+            cfg.tls_key = std::string(v);
         } else if (arg == "--engine") {
             if (!value(v)) return fail("--engine needs llama");
             if (v == "ov")
@@ -770,6 +803,15 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         return fail("--served-model-name cannot be blank");
     }
     if (cfg.parallel < 1) return fail("--parallel must be >= 1");
+    if (!cfg.api_key.empty() && !cfg.api_key_file.empty())
+        return fail("--api-key and --api-key-file are mutually exclusive: give one");
+    if (cfg.tls_cert.empty() != cfg.tls_key.empty())
+        return fail("--tls-cert and --tls-key must be given together");
+    if (!cfg.tls_cert.empty()) {
+#ifndef ARCINT_TLS
+        return fail("--tls-cert/--tls-key need a build configured with -DARCINT_TLS=ON: this build has no TLS");
+#endif
+    }
     // --served-model-name A,B: named lanes (a single name, as before, may not
     // contain a comma). The first name is the served one.
     if (cfg.served_model_name.find(',') != std::string::npos) {

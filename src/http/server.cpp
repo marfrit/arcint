@@ -1,10 +1,18 @@
 #include "http/server.h"
 
 #include <atomic>
+#include <memory>
+#include <stdexcept>
+#include <utility>
 
 #include <httplib.h>
+#ifdef ARCINT_TLS
+#include <openssl/err.h>
+#endif
 
+#include "api/auth.h"
 #include "api/error.h"
+#include "api/metrics.h"
 #include "api/renderer.h"
 #include "api/responses.h"
 #include "api/responses_state.h"
@@ -86,37 +94,86 @@ struct FlightGuard {
 struct HttpServer::Impl {
     const Config&   cfg;
     api::Context&   ctx;
-    httplib::Server svr;
+    // A plain Server, or httplib's SSLServer in an ARCINT_TLS build with
+    // --tls-cert/--tls-key. The base pointer is enough: routing and listen()
+    // go through it, and process_and_close_socket() is virtual.
+    std::unique_ptr<httplib::Server> svr;
     // The stop signal's flag: SIGTERM/SIGINT sets it through stop(), and every
     // request prepared while it is set carries it into the backend, which ends
     // at its next token or ubatch boundary (DESIGN §3.7). A stop is terminal:
     // nothing clears it for this process's life.
     std::atomic<bool> stopping{false};
 
-    Impl(const Config& c, api::Context& x) : cfg(c), ctx(x) {
-        ctx.stop_flag = &stopping;
-    }
+    Impl(const Config& c, api::Context& x);
 
     void route();
+
+    // --api-key/--api-key-file: the pre-routing handler calls this for every
+    // request; no key configured is the identity. A refused request answers
+    // the OpenAI-shaped 401 and never reaches the route or reads the body.
+    bool authorized(const httplib::Request& req, httplib::Response& res) const;
 };
 
+HttpServer::Impl::Impl(const Config& c, api::Context& x) : cfg(c), ctx(x) {
+#ifdef ARCINT_TLS
+    if (!cfg.tls_cert.empty()) {
+        svr = std::make_unique<httplib::SSLServer>(cfg.tls_cert.c_str(), cfg.tls_key.c_str());
+        if (!svr->is_valid()) {
+            // httplib frees its SSL_CTX when the certificate or key cannot be
+            // loaded; is_valid() then says so, and the OpenSSL error queue
+            // holds the reason. Without this the failure surfaced later as a
+            // misleading "could not bind".
+            char                reason[256] = {0};
+            const unsigned long err        = ERR_get_error();
+            if (err != 0) ERR_error_string_n(err, reason, sizeof reason);
+            throw std::runtime_error(log::format(
+                "could not enable TLS: --tls-cert/--tls-key could not be loaded%s%s",
+                reason[0] != '\0' ? ": " : "", reason));
+        }
+    } else
+#endif
+        svr = std::make_unique<httplib::Server>();
+    // Only after the point that can throw: a failed construction must not
+    // leave the context pointing at this object's already-dead stop flag.
+    ctx.stop_flag = &stopping;
+}
+
+bool HttpServer::Impl::authorized(const httplib::Request& req, httplib::Response& res) const {
+    // No key: the surface is the one every build up to this one had.
+    if (cfg.api_key_sha256.empty()) return true;
+    if (api::bearer_matches(req.get_header_value("Authorization"), cfg.api_key_sha256)) return true;
+    // RFC 6750 §3: a bearer-protected resource names its scheme.
+    res.set_header("WWW-Authenticate", "Bearer");
+    // The pre-routing refusal does not read the request body; ask the client to
+    // close rather than leave those bytes in a connection it reuses.
+    res.set_header("Connection", "close");
+    send_json(res, 401, api::error_body(
+        "invalid API key: this server requires an `Authorization: Bearer <key>` header",
+        "invalid_request_error", "invalid_api_key"));
+    return false;
+}
+
 void HttpServer::Impl::route() {
-    svr.set_payload_max_length(kMaxPayloadBytes);
-    svr.set_read_timeout(60, 0);
+    svr->set_payload_max_length(kMaxPayloadBytes);
+    svr->set_read_timeout(60, 0);
     // Decode can run for minutes at long contexts; a short write timeout would
     // cut a healthy stream off mid-generation.
-    svr.set_write_timeout(3600, 0);
+    svr->set_write_timeout(3600, 0);
 
     if (cfg.http_threads > 0) {
         const size_t n     = static_cast<size_t>(cfg.http_threads);
-        svr.new_task_queue = [n] { return new httplib::ThreadPool(n); };
+        svr->new_task_queue = [n] { return new httplib::ThreadPool(n); };
     }
 
-    svr.set_logger([](const httplib::Request& req, const httplib::Response& res) {
+    svr->set_logger([this](const httplib::Request& req, const httplib::Response& res) {
         log::verbose("http", "%s %s -> %d", req.method.c_str(), req.path.c_str(), res.status);
+        // The request counter reads the status the route actually committed,
+        // refusals included (--metrics only).
+        if (ctx.metrics != nullptr)
+            ctx.metrics->observe_request(api::metrics_route_label(req.path), res.status);
     });
 
-    svr.set_exception_handler(
+    svr->set_exception_handler(
         [](const httplib::Request&, httplib::Response& res, std::exception_ptr ep) {
             std::string what = "unknown error";
             try {
@@ -129,7 +186,7 @@ void HttpServer::Impl::route() {
             send_json(res, 500, api::error_body(what, "internal_error"));
         });
 
-    svr.set_error_handler([](const httplib::Request& req, httplib::Response& res) {
+    svr->set_error_handler([](const httplib::Request& req, httplib::Response& res) {
         // httplib calls this for every status >= 400, a handler's own 404 (a
         // named lane's unknown model, §4.2) included: only a 404 without a
         // body is a missing route
@@ -141,24 +198,72 @@ void HttpServer::Impl::route() {
         }
     });
 
-    svr.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
+    // --api-key: the check runs in httplib's pre-routing handler, before the
+    // request body is read (third_party/httplib.h's Server::routing(): the
+    // pre_routing_handler_ call sits above the expect_content() block), so an
+    // unauthenticated POST up to the 64 MiB payload cap is refused unread and
+    // an unknown path is a 401 rather than a route probe. /health stays open
+    // for probes -- it reveals the served model id, an intended trade-off --
+    // and a CORS preflight cannot carry the key.
+    if (!cfg.api_key_sha256.empty()) {
+        // The permissive CORS a secured browser client needs to read the
+        // responses it was allowed to send (401s included).
+        svr->set_default_headers({{"Access-Control-Allow-Origin", "*"}});
+        svr->Options(R"(.*)", [](const httplib::Request&, httplib::Response& res) {
+            res.status = 204;
+            res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            res.set_header("Access-Control-Allow-Headers", "Authorization, Content-Type");
+            res.set_header("Access-Control-Max-Age", "86400");
+        });
+        svr->set_pre_routing_handler(
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (req.path == "/health" || req.method == "OPTIONS")
+                    return httplib::Server::HandlerResponse::Unhandled;
+                if (!authorized(req, res)) return httplib::Server::HandlerResponse::Handled;
+                return httplib::Server::HandlerResponse::Unhandled;
+            });
+        // httplib writes 100 Continue above routing, so an unauthenticated
+        // request with Expect: 100-continue would be answered 100 before the
+        // pre-routing 401. Answer the 401 here instead; httplib then closes
+        // the connection (the default arm) without reading the body.
+        svr->set_expect_100_continue_handler(
+            [this](const httplib::Request& req, httplib::Response& res) -> int {
+                if (req.path == "/health" || req.method == "OPTIONS") return 100;
+                if (!authorized(req, res)) return 401;
+                return 100;
+            });
+    }
+
+    svr->Get("/health", [this](const httplib::Request&, httplib::Response& res) {
         send_json(res, 200, api::health(ctx));
     });
 
-    svr.Get("/props", [this](const httplib::Request&, httplib::Response& res) {
+    svr->Get("/props", [this](const httplib::Request&, httplib::Response& res) {
         send_json(res, 200, api::props(ctx));
     });
 
-    svr.Get("/v1/models", [this](const httplib::Request&, httplib::Response& res) {
+    // GET /metrics (--metrics): the Prometheus text format over what arcint
+    // already computes. Off by default: without the flag the route does not
+    // exist and the default surface is unchanged.
+    if (ctx.cfg != nullptr && ctx.cfg->metrics) {
+        svr->Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
+            res.status = 200;
+            res.set_content(ctx.metrics != nullptr ? ctx.metrics->render(ctx) : std::string(),
+                            "text/plain; version=0.0.4; charset=utf-8");
+        });
+    }
+
+    svr->Get("/v1/models", [this](const httplib::Request&, httplib::Response& res) {
         send_json(res, 200, api::models(ctx));
     });
 
     // feyntalk W6a (docs/campaigns/feyntalk.md, D4): the renderer material the
-    // gateway consumes. No auth, like /props; a unit without material answers
+    // gateway consumes. Behind the same key as /props when --api-key is set; a
+    // unit without material answers
     // 404 `renderer_not_served` (the stub, --tts), never an empty bundle.
     // The body is the backend's cached serialization, served by reference; a
     // 4xx is the serialized error envelope (W6a review finding 3).
-    svr.Get("/v1/responses/renderer", [this](const httplib::Request&, httplib::Response& res) {
+    svr->Get("/v1/responses/renderer", [this](const httplib::Request&, httplib::Response& res) {
         const api::RendererBundle r = api::renderer_bundle(ctx);
         res.status = r.status;
         res.set_content(r.status == 200 && r.body != nullptr ? *r.body : r.error,
@@ -168,11 +273,11 @@ void HttpServer::Impl::route() {
     // The TTS surface (docs/milestone-1.2.0.md D4/D5). Both routes refuse from
     // prepare_speech with a clear message when the build has no --tts or no
     // audio-generation mmproj; the voice list is a names-only probe.
-    svr.Get("/v1/audio/voices", [this](const httplib::Request&, httplib::Response& res) {
+    svr->Get("/v1/audio/voices", [this](const httplib::Request&, httplib::Response& res) {
         send_json(res, 200, api::voices(ctx));
     });
 
-    svr.Post("/v1/audio/speech", [this](const httplib::Request& req, httplib::Response& res) {
+    svr->Post("/v1/audio/speech", [this](const httplib::Request& req, httplib::Response& res) {
         json body;
         if (!read_json(req, res, body)) return;
 
@@ -200,7 +305,7 @@ void HttpServer::Impl::route() {
         res.set_content(r.wav, "audio/wav");
     });
 
-    svr.Post("/v1/chat/completions", [this](const httplib::Request& req, httplib::Response& res) {
+    svr->Post("/v1/chat/completions", [this](const httplib::Request& req, httplib::Response& res) {
         json body;
         if (!read_json(req, res, body)) return;
 
@@ -267,7 +372,7 @@ void HttpServer::Impl::route() {
     // arcint extension — the spec defines no cancel endpoint or state). An
     // in-flight response: set the flag and answer the in-progress snapshot with
     // arcint.cancelling. A stored terminal response is 409; an unknown id 404.
-    svr.Post(R"(/v1/responses/([^/]+)/cancel)", [this](const httplib::Request& req,
+    svr->Post(R"(/v1/responses/([^/]+)/cancel)", [this](const httplib::Request& req,
                                                       httplib::Response& res) {
         const std::string id = req.matches[1];
         if (!ctx.responses) {
@@ -303,7 +408,7 @@ void HttpServer::Impl::route() {
     // prepare_response hands it to the chat route's own prepare_from_chat, and
     // run_response drives it exactly as run_chat does. Non-stream only in W1:
     // stream:true is refused by the parser with the spec's envelope.
-    svr.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
+    svr->Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
         json body;
         try {
             body = json::parse(req.body);
@@ -396,7 +501,7 @@ void HttpServer::Impl::route() {
             });
     });
 
-    svr.Post("/v1/completions", [this](const httplib::Request& req, httplib::Response& res) {
+    svr->Post("/v1/completions", [this](const httplib::Request& req, httplib::Response& res) {
         json body;
         if (!read_json(req, res, body)) return;
 
@@ -453,7 +558,7 @@ HttpServer::HttpServer(const Config& cfg, api::Context& ctx)
 HttpServer::~HttpServer() = default;
 
 bool HttpServer::listen() {
-    return impl_->svr.listen(impl_->cfg.host.c_str(), impl_->cfg.port);
+    return impl_->svr->listen(impl_->cfg.host.c_str(), impl_->cfg.port);
 }
 
 void HttpServer::stop() {
@@ -461,7 +566,7 @@ void HttpServer::stop() {
     // nothing (a long prefill, a buffered tool call) would otherwise outlive
     // the stop signal, and a stop during one timed out and was killed.
     impl_->stopping.store(true, std::memory_order_relaxed);
-    impl_->svr.stop();
+    impl_->svr->stop();
 }
 
 }  // namespace lgc

@@ -52,6 +52,9 @@ struct ResponseRequest {
     bool           token_mode = false;
     std::string    renderer_hash;         // "sha256:…" of the served material
     std::string    render_prompt_sha256;  // "sha256:…" of the gateway's render
+    // arcint.timings: the per-response timing object on the resource. Absent
+    // keeps the resource byte-identical.
+    bool           timings = false;
     // Reasoning items of the input: accepted, kept for the store (W3), never
     // rendered into the prompt — parity with /v1/chat/completions, which has no
     // reasoning replay.

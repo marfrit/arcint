@@ -29,6 +29,12 @@ int64_t     now_seconds();
 // completion_tokens_details keep parsing).
 nlohmann::json usage_json(const GenerationStats& stats);
 
+// The per-response timing object, llama-server's names and meaning
+// (prompt_n/prompt_ms, predicted_n/predicted_ms, cache_n, draft_n,
+// draft_accepted). Sent only when the request sets arcint.timings, so an
+// absent flag keeps every response body byte-identical.
+nlohmann::json timings_json(const GenerationStats& stats);
+
 // Whether the loop-guard ladder moved; the decode line and the response body
 // carry the counters on this one condition. An eighth counter is added here,
 // once.

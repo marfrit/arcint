@@ -178,6 +178,11 @@ struct Config {
     int  llama_slot_loan_mib = 0;
     int  llama_loan_chunk    = 0;
     bool        stub = false;
+    // --metrics: serve GET /metrics in the Prometheus text format and record
+    // the per-route request counters and the generation stats behind it. Off
+    // by default: without the flag the route does not exist and the default
+    // surface is unchanged.
+    bool metrics = false;
 
     // The name this endpoint answers to on /v1/models and /props. Empty means
     // the GGUF's file name (the stub: "stub"). DESIGN.md §4.2.
@@ -199,6 +204,19 @@ struct Config {
 
     std::string host = "127.0.0.1";
     int         port = 8090;
+
+    // --api-key (tests) / --api-key-file PATH: a bearer key read once at boot.
+    // When set, every route but /health needs `Authorization: Bearer <key>`,
+    // compared as sha256 digests. The key (and its file) is never logged and
+    // never appears on /props; api_key is cleared once api_key_sha256 is set.
+    std::string api_key;
+    std::string api_key_file;
+    std::string api_key_sha256;   // derived at boot, the only form the server keeps
+    // --tls-cert/--tls-key: HTTPS through httplib's OpenSSL server. Only a
+    // build with -DARCINT_TLS=ON accepts the flags; the default build refuses
+    // them and does not link OpenSSL.
+    std::string tls_cert;
+    std::string tls_key;
 
     int  n_ctx          = 0;      // 0: min(the model's trained context, 32768)
     // True only when --n-ctx was actually passed (any value, including 0);

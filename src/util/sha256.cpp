@@ -28,7 +28,7 @@ uint32_t rotr(uint32_t x, uint32_t n) { return (x >> n) | (x << (32 - n)); }
 
 }  // namespace
 
-std::string sha256_impl(std::string_view bytes) {
+std::string sha256_impl(std::string_view bytes, bool wipe) {
     // Message schedule and the compression function over 64-byte blocks.
     uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
                      0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
@@ -74,9 +74,17 @@ std::string sha256_impl(std::string_view bytes) {
     for (uint32_t v : h) {
         for (int i = 7; i >= 0; --i) out.push_back(kHex[(v >> (i * 4)) & 0xf]);
     }
+    if (wipe) {
+        // The working copy holds the input (a key) plus its padding; zero it
+        // before it is freed. volatile: the stores may not be elided.
+        volatile char* p = m.data();
+        for (size_t i = 0; i < m.size(); ++i) p[i] = '\0';
+    }
     return out;
 }
 
-std::string sha256_hex(std::string_view bytes) { return sha256_impl(bytes); }
+std::string sha256_hex(std::string_view bytes) { return sha256_impl(bytes, false); }
+
+std::string sha256_hex_secure(std::string_view bytes) { return sha256_impl(bytes, true); }
 
 }  // namespace lgc
