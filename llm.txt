@@ -174,7 +174,9 @@
   drop a running tool loop's reasoning; absent renders exactly as before.
   chat_template_kwargs is a passthrough to the template (llama-server's
   dialect): enable_thinking and preserve_thinking are read and type-checked by
-  arcint, every other key reaches the template unchanged and is not refused.
+  arcint; a key naming what the template context sets itself (messages, tools,
+  add_generation_prompt, bos_token, eos_token, strftime_now) or one of minja's
+  31 builtins is a 400; every other key reaches the template unchanged.
   /props' chat_template_caps carries supports_preserve_reasoning and
   supports_preserve_thinking.
 - Sampling defaults: request > operator flags > the GGUF's defaults; /props
