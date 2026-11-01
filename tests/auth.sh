@@ -112,6 +112,72 @@ expect_warning() {
   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
 }
 
+# The pre-body refusal: a request whose headers declare a large body but send
+# almost none must get its 401 promptly, the socket must close, only
+# `Connection: close` is advertised, and no second response appears on the
+# connection (the unread body is never parsed).
+body_not_read_check() {
+  PORT="$PORT" python3 - <<'PY'
+import os, socket, sys, time
+port = int(os.environ["PORT"])
+try:
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+except OSError as e:
+    print("  FAIL could not connect:", e)
+    sys.exit(1)
+head = ("POST /v1/chat/completions HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Length: 1000000\r\n"
+        "Content-Type: application/json\r\n"
+        "\r\n")
+s.sendall(head.encode() + b"{")   # two body bytes, 999998 missing, no auth
+s.settimeout(3.0)
+start = time.time()
+data = b""
+try:
+    while b"\r\n\r\n" not in data:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+except socket.timeout:
+    pass
+elapsed = time.time() - start
+header_blob = data.split(b"\r\n\r\n", 1)[0].decode("latin1", "replace")
+lower = header_blob.lower()
+ok_401 = header_blob.startswith("HTTP/1.1 401") or header_blob.startswith("HTTP/1.0 401")
+ok_close = "\r\nconnection: close" in ("\r\n" + lower)
+no_keep = "keep-alive" not in lower
+# Drain to EOF: it must end, and hold no second response.
+rest = b""
+eof = False
+try:
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            eof = True
+            break
+        rest += chunk
+except socket.timeout:
+    eof = False
+s.close()
+second = rest.count(b"HTTP/1.1 ") + rest.count(b"HTTP/1.0 ")
+checks = [
+    ("the 401 arrives without the missing body (under 2 s)", elapsed < 2.0 and ok_401),
+    ("the server closes the connection after the 401", eof),
+    ("the response says Connection: close", ok_close),
+    ("the response does not also say Keep-Alive", no_keep),
+    ("no second response on the connection", second == 0),
+]
+rc = 0
+for name, ok in checks:
+    print(("  ok   " if ok else "  FAIL ") + name)
+    if not ok:
+        rc = 1
+sys.exit(rc)
+PY
+}
+
 KEY="test-key-not-real"
 AUTH="Authorization: Bearer ${KEY}"
 
@@ -183,6 +249,8 @@ JSON
 code=$(curl -sS -o /dev/null -w '%{http_code}' -H "$AUTH" -H 'Content-Type: application/json' \
        --data-binary @"$WORK/chat.json" "$BASE/v1/chat/completions")
 check "POST /v1/chat/completions with the key is 200" "$([[ "$code" == "200" ]] && echo 0 || echo 1)"
+
+body_not_read_check || FAILED=$((FAILED + 1))
 
 kill "$SRV_PID"; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
 check "the key never appears in the server log" "$(grep -q "$KEY" "$WORK/key.log" && echo 1 || echo 0)"

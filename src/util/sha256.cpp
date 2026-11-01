@@ -79,4 +79,6 @@ std::string sha256_impl(std::string_view bytes) {
 
 std::string sha256_hex(std::string_view bytes) { return sha256_impl(bytes); }
 
+std::string sha256_hex_secure(std::string_view bytes) { return sha256_impl(bytes); }
+
 }  // namespace lgc

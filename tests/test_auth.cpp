@@ -151,6 +151,26 @@ TEST(auth_secure_scrub_clears_and_overwrites) {
     CHECK(key.empty());
 }
 
+TEST(auth_hashes_the_key_without_leaving_a_working_copy) {
+    CHECK(sha256_hex_secure("test-key-not-real") == sha256_hex("test-key-not-real"));
+
+    // The hash's own working copy of the key must be wiped; the plain
+    // sha256_hex stays on the large renderer-material path.
+    std::ifstream sha(std::string(ARCINT_SOURCE_DIR) + "/src/util/sha256.cpp");
+    CHECK(sha.good());
+    std::stringstream shass;
+    shass << sha.rdbuf();
+    const std::string shasrc = shass.str();
+    CHECK(shasrc.find("sha256_hex_secure") != std::string::npos);
+    CHECK(shasrc.find("volatile char*") != std::string::npos);   // the wipe
+
+    std::ifstream mainin(std::string(ARCINT_SOURCE_DIR) + "/src/main.cpp");
+    CHECK(mainin.good());
+    std::stringstream mainss;
+    mainss << mainin.rdbuf();
+    CHECK(mainss.str().find("sha256_hex_secure") != std::string::npos);
+}
+
 TEST(auth_main_checks_hygiene_and_scrubs_the_key) {
     // The startup path is not reachable from a unit test (it needs a process),
     // so this pins the wiring the way test_props pins the llama backend's KV
