@@ -30,7 +30,7 @@ struct RendererMaterialParts {
 nlohmann::json assemble_renderer_material(const RendererMaterialParts& parts,
                                            std::string* why = nullptr);
 
-// W6a follow-up 2: the cheap pre-flight at load. The canonical hash and the
+// W6 follow-up 2: the cheap pre-flight at load. The canonical hash and the
 // served body's dump admit valid UTF-8 only; a vocabulary or template whose
 // text is not valid UTF-8 cannot serve the material. Checking it here keeps
 // `/props` honest from the first second instead of until the first GET. The

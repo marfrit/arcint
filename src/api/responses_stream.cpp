@@ -581,6 +581,12 @@ bool Stream::run(const Context& ctx, int slot) {
                                // the token id. A held or split tail carries -1
                                // (the stop matcher and the stub's UTF-8 split),
                                // and is part of the token already announced.
+                               // Qualifier (W6 D3 edge c): a stop-string hold puts
+                               // the id on the token's LAST part, so on the engine
+                               // path the event can follow some of that token's
+                               // bytes; the token is announced once, and the
+                               // turn-end shadow == decode(tokens) equality is
+                               // unaffected.
                                if (token_id >= 0) {
                                    const int index = token_index_;
                                    if (!update_spans(piece, token_id, index, was_reasoning,
