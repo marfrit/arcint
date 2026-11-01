@@ -922,7 +922,7 @@ std::vector<ChatMessage> assistant_turns_of(const nlohmann::json& output_items) 
 }  // namespace
 
 std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest req,
-                                           PreparedResponse& out) {
+                                           PreparedResponse& out, bool evict_on_error) {
     // Token mode: the material first, before any render and before any
     // continuation lookup. A unit without material cannot serve token mode.
     if (req.token_mode) {
@@ -965,8 +965,9 @@ std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest r
         // mismatch means the continuation would not share the stored prompt.
         const std::string rendered = ctx.backend->render_chat(stored->chat);
         if (sha256_hex(rendered) != stored->prefix_hash) {
-            // A 4xx on a continuation evicts the entry it referenced.
-            evict_continuation(ctx, prev_id);
+            // A 4xx on a continuation evicts the entry it referenced -- unless
+            // the caller is only counting (/tokenize), where nothing was served.
+            if (evict_on_error) evict_continuation(ctx, prev_id);
             return previous_not_found(prev_id, "the rendered prefix no longer matches the stored one");
         }
 
@@ -1031,8 +1032,9 @@ std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest r
     }
     if (auto err = prepare_from_chat(ctx, req.chat, prep.chat, fitp)) {
         // A continuation the server answers 4xx is a broken chain: evict the
-        // referenced entry so a retry cannot silently continue from it.
-        evict_continuation(ctx, prev_id);
+        // referenced entry so a retry cannot silently continue from it. The
+        // count path does not evict (see the header).
+        if (evict_on_error) evict_continuation(ctx, prev_id);
         return translate_prepare_error(*err);
     }
     if (req.token_mode) {

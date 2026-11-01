@@ -100,12 +100,15 @@ HttpResult tokenize_request(const Context& ctx, const json& body) {
         return count_result(ctx, prep.input, prep.prompt_tokens, with_pieces);
     }
 
-    // 3. a Responses body: the same prepare the Responses route calls.
+    // 3. a Responses body: the same prepare the Responses route calls, but a
+    //    count is not a turn -- a 4xx here must not evict the referenced
+    //    stored entry (the count path is how a client asks whether the next
+    //    turn fits).
     if (body.contains("input")) {
         ResponseRequest req;
         if (auto err = parse_response_request(body, req)) return *err;
         PreparedResponse prep;
-        if (auto err = prepare_response(ctx, std::move(req), prep)) return *err;
+        if (auto err = prepare_response(ctx, std::move(req), prep, /*evict_on_error=*/false)) return *err;
         return count_result(ctx, prep.chat.input, prep.chat.prompt_tokens, with_pieces);
     }
 
@@ -122,6 +125,17 @@ HttpResult detokenize_request(const Context& ctx, const json& body) {
         ids = body["tokens"].get<std::vector<int>>();
     } catch (const json::exception&) {
         return bad_field("tokens must be an array of integers", "tokens");
+    }
+    // An id past the vocabulary would read out of range in decode_one (the
+    // llama backend throws, which the exception handler would turn into a 500
+    // with an "unhandled exception" line). A tokenizer that cannot enumerate
+    // (vocab_size 0) offers nothing to validate against and keeps the old path.
+    const int vocab = ctx.backend->tokenizer().vocab_size();
+    if (vocab > 0) {
+        for (int id : ids) {
+            if (id < 0 || id >= vocab)
+                return bad_field("tokens must be ids this vocabulary serves", "tokens");
+        }
     }
     // Tokenizer::decode concatenates decode_one, which renders a special token
     // as its text (llama-server's default unparse_special=true).

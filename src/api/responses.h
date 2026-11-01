@@ -80,8 +80,15 @@ struct PreparedResponse {
 // previous_response_id is refused here in W1: no store exists yet, and the
 // spec's answer for an unknown id is 400 previous_response_not_found (W3
 // replaces the refusal with the lookup).
+//
+// `evict_on_error` gates the chain-eviction rule: a continuation the server
+// answers 4xx evicts the entry it referenced, so a retry cannot silently
+// continue from a state it treated as broken. The Responses generation route
+// keeps that (true, the default). The /tokenize count path passes false: it is
+// not a turn, and learning whether the next turn fits must not destroy the
+// chain when it does not.
 std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest req,
-                                           PreparedResponse& out);
+                                           PreparedResponse& out, bool evict_on_error = true);
 
 // The complete ResponseResource for a finished turn: every required key of the
 // 2026-04-24 OpenAPI document, output items (message, reasoning,

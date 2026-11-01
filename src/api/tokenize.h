@@ -14,18 +14,25 @@ namespace lgc::api {
 
 // POST /tokenize. Three body shapes:
 //   - `{content, add_special?, with_pieces?, model?}` (llama-server's shape):
-//     `{tokens: [ids]}` or, with `with_pieces`, `{tokens: [{id, piece}]}`;
+//     `{tokens: [ids]}` or, with `with_pieces`, `{tokens: [{id, piece}]}`.
+//     llama-server's `parse_special` is accepted and ignored: this tokenizer
+//     always parses specials;
 //   - a chat body (`messages`, `tools`, …): `{tokens, count}` through
 //     prepare_chat and the tokens finish_prepare stored in
 //     `GenerationInput::prompt_ids_text`, so the count is what a real request
 //     would decode, by construction;
 //   - a Responses body (`input`, `instructions`, `tools`, …): the same through
-//     prepare_response.
+//     prepare_response, with the store left untouched (a count is not a turn).
+//
+// A prompt the lane would refuse is refused here too, in the same error body
+// (the §3.8 overflow carries `prompt_tokens`), because the count goes through
+// the request's own prepare.
 HttpResult tokenize_request(const Context& ctx, const nlohmann::json& body);
 
 // POST /detokenize `{tokens, model?}` -> `{content}`: the concatenation of the
 // tokens' pieces, with special tokens rendered as their text (llama-server's
-// default `unparse_special=true`), which is `Tokenizer::decode`.
+// default `unparse_special=true`), which is `Tokenizer::decode`. An id outside
+// `[0, vocab_size)` is a 400 naming `tokens`.
 HttpResult detokenize_request(const Context& ctx, const nlohmann::json& body);
 
 }  // namespace lgc::api
