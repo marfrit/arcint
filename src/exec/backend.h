@@ -23,6 +23,14 @@ public:
     virtual ~Tokenizer() = default;
 
     virtual std::vector<int> encode(std::string_view text)        = 0;
+    // llama-server's /tokenize `add_special`: the same encode with the
+    // vocabulary's BOS/EOS rule (llama_tokenize's add_special flag). The
+    // default ignores the flag and delegates to the plain encode, which is
+    // the right answer for a vocabulary without the rule and for the stub.
+    virtual std::vector<int> encode(std::string_view text, bool add_special) {
+        (void)add_special;
+        return encode(text);
+    }
     virtual std::string      decode(const std::vector<int>& ids)  = 0;
     virtual std::string      decode_one(int id)                   = 0;
     virtual int              eos_id() const                       = 0;

@@ -98,6 +98,7 @@ add_library(arcint_core STATIC
   src/api/responses.cpp
   src/api/responses_stream.cpp
   src/api/responses_state.cpp
+  src/api/tokenize.cpp
   src/http/server.cpp
 )
 target_include_directories(arcint_core PUBLIC
@@ -282,6 +283,7 @@ if(ARCINT_TESTS)
     tests/test_responses.cpp
     tests/test_metrics.cpp
     tests/test_auth.cpp
+    tests/test_tokenize.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
@@ -382,6 +384,15 @@ if(ARCINT_TESTS)
            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/tls.sh"
                    "$<TARGET_FILE:arcint>")
   set_tests_properties(tls PROPERTIES TIMEOUT 60 LABELS unit SKIP_RETURN_CODE 77)
+
+  # ops item 3: POST /tokenize and POST /detokenize on the stub. The HTTP half
+  # of the device-free gate: the llama-server shapes, the chat/Responses count
+  # against a real generation's usage, the model-field lane routing and the
+  # auth coverage.
+  add_test(NAME tokenize
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/tokenize.sh"
+                   "$<TARGET_FILE:arcint>")
+  set_tests_properties(tokenize PROPERTIES TIMEOUT 120 LABELS unit)
 
   # Both device-free: the generator's own consistency check, and the
   # acceptance runner's self-test against a fixture manifest. Neither needs a

@@ -17,6 +17,7 @@
 #include "api/responses.h"
 #include "api/responses_state.h"
 #include "api/responses_stream.h"
+#include "api/tokenize.h"
 #include "util/log.h"
 
 namespace lgc {
@@ -298,6 +299,23 @@ void HttpServer::Impl::route() {
 
     svr->Get("/v1/models", [this](const httplib::Request&, httplib::Response& res) {
         send_json(res, 200, api::models(ctx));
+    });
+
+    // ops item 3: the llama-server-compatible token surface. Behind the same
+    // key as every other route; `/tokenize` also takes a chat or Responses
+    // body and counts it through the request's own prepare path. POST only,
+    // like llama-server.
+    svr->Post("/tokenize", [this](const httplib::Request& req, httplib::Response& res) {
+        json body;
+        if (!read_json(req, res, body)) return;
+        const api::HttpResult r = api::tokenize_request(ctx, body);
+        send_json(res, r.status, r.body);
+    });
+    svr->Post("/detokenize", [this](const httplib::Request& req, httplib::Response& res) {
+        json body;
+        if (!read_json(req, res, body)) return;
+        const api::HttpResult r = api::detokenize_request(ctx, body);
+        send_json(res, r.status, r.body);
     });
 
     // feyntalk W6a (docs/campaigns/feyntalk.md, D4): the renderer material the

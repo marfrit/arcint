@@ -344,6 +344,19 @@ service's production flags, Flash-Next's expert cache included
   token, prefill/decode, cache-hit, draft counters and per-lane
   queue/slot gauges); a request with `arcint: {timings: true}` gets the
   per-response timings back on Chat Completions and Responses.
+- `POST /tokenize` and `POST /detokenize` are llama-server-compatible:
+  `/tokenize` takes `{content, add_special?, with_pieces?, model?}` and
+  returns `{tokens}` (or `{id, piece}` objects with `with_pieces`; a piece
+  that is not valid UTF-8 on its own is its array of byte values). With a
+  chat or Responses body it returns `{tokens, count}`, the prompt tokens the
+  same request would decode, counted through the request's own prepare path.
+  `/detokenize` takes `{tokens}` and returns `{content}`, special tokens as
+  text. Both are behind the same key as every other route. A prompt the lane
+  would refuse is refused by `/tokenize` too, with the count in the error
+  body's `prompt_tokens`; llama-server's `parse_special` is accepted and
+  ignored (specials are always parsed), and a count over a continuation does
+  not evict the referenced stored response — it is a lookup, so it refreshes
+  that entry's LRU rank like any other read.
 
 ## Scope
 
