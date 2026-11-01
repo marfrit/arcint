@@ -193,7 +193,17 @@ not yet told apart.
    1,632 / 1,664 / 1,824 bytes under the default driver and 1,696 / 1,728 / 1,856 under LEO; the arguments are four
    stateful (binding table) and one stateless under the default driver, four bindless and five stateless under LEO.
    The runtime's heap address model (`SelectCmdListHeapAddressModel`, `EnableStatelessToStatefulBufferOffsetOpt`, `code`:
-   `debug_variables_base.inl` at 26.35.39758.10) is the next arm (window 44).
+   `debug_variables_base.inl` at 26.35.39758.10) was the next arm.
+   **Window 44 (`measured-here`, Claude, 2026-11-01, the A770, runtime 26.27, the 0079 binary, a 39,689-token prefill, one
+   fresh process a leg, two rounds reversed):** default driver 737.0 t/s; LEO 696.5 / 698.2; LEO with
+   `SelectCmdListHeapAddressModel=0` (private heaps) 698.0 / 698.1; LEO with `EnableStatelessToStatefulBufferOffsetOpt=1`
+   698.1 / 698.2. The dumped FA kernel stays four bindless and five stateless arguments with 1,696 bytes of spill under every
+   LEO arm, so neither key reaches the kernel's address model and the prefill loss stands; the capital was right in every
+   leg. `SelectCmdListHeapAddressModel=3` (bindful) aborts the process during load, in userspace, before any submission:
+   "Abort was called at 306 line in file: ../../neo/shared/source/command_container/cmdcontainer.cpp", three times in
+   three runs (a separate runtime defect, not pursued). Open: the loss is in the code the LEO compile path generates for
+   one kernel (bindless and stateless arguments, more spill, `inferred` as the cause of the +14.8 %); no runtime key moves
+   it. The coder stays on the default driver.
    **Gate for 0079 (owed):** the A770 on 26.27 and on 26.35 in the fresh-host container, the reproducer still aborting
    at 16,385 and passing 16,384; the full op suite under LEO reaching 12,867 / 12,881 with the default driver's failure
    names and no MXFP4 abort; the coder A/B under LEO against the default driver; and the `flash_attn_f32_f16_dpas`
