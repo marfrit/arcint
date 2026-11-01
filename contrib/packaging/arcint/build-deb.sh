@@ -44,7 +44,7 @@ export SOURCE_DATE_EPOCH=1787990400
 for t in curl git python3 cmake objdump; do
     command -v "$t" >/dev/null || { echo "$t is missing (build dependency)" >&2; exit 1; }
 done
-[ -f /usr/include/CL/cl.h ] || { echo "opencl-headers fehlen (/usr/include/CL/cl.h)" >&2; exit 1; }
+[ -f /usr/include/CL/cl.h ] || { echo "opencl-headers are missing (/usr/include/CL/cl.h)" >&2; exit 1; }
 [ -n "${ARCINT_GIT_SHA:-}" ] || { echo "ARCINT_GIT_SHA is not set — /props would report 'unknown'" >&2; exit 1; }
 
 work=$(mktemp -d)
