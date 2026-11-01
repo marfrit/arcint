@@ -89,6 +89,19 @@ struct FlightGuard {
     }
 };
 
+// The pre-auth exemptions, shared by the pre-routing handler and the
+// Expect: 100-continue handler. /health is open for GET/HEAD probes only (a
+// POST /health is not a probe and must not read its body unauthenticated),
+// and an OPTIONS is a CORS preflight only when it carries
+// Access-Control-Request-Method -- the header a browser adds; a bare OPTIONS
+// is not exempt. Both are documented in the campaign/docs as intended.
+bool auth_exempt(const httplib::Request& req) {
+    if ((req.method == "GET" || req.method == "HEAD") && req.path == "/health") return true;
+    if (req.method == "OPTIONS" && !req.get_header_value("Access-Control-Request-Method").empty())
+        return true;
+    return false;
+}
+
 }  // namespace
 
 struct HttpServer::Impl {
@@ -151,6 +164,37 @@ bool HttpServer::Impl::authorized(const httplib::Request& req, httplib::Response
         "invalid API key: this server requires an `Authorization: Bearer <key>` header",
         "invalid_request_error", "invalid_api_key"));
     return false;
+}
+
+bool tls_material_loads(const Config& cfg, std::string& error) {
+    error.clear();
+#ifdef ARCINT_TLS
+    if (cfg.tls_cert.empty()) return true;
+    // The same calls httplib's SSLServer constructor makes, without a server
+    // and without binding; main runs this before the model load so a bad
+    // certificate is a boot error, not a failure after minutes of loading.
+    SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
+    bool     ok  = ctx != nullptr;
+    if (ok) {
+        ok = SSL_CTX_use_certificate_chain_file(ctx, cfg.tls_cert.c_str()) == 1 &&
+             SSL_CTX_use_PrivateKey_file(ctx, cfg.tls_key.c_str(), SSL_FILETYPE_PEM) == 1 &&
+             SSL_CTX_check_private_key(ctx) == 1;
+    }
+    if (!ok) {
+        char                reason[256] = {0};
+        const unsigned long err        = ERR_get_error();
+        if (err != 0) ERR_error_string_n(err, reason, sizeof reason);
+        error = log::format("could not enable TLS: --tls-cert/--tls-key could not be loaded%s%s",
+                            reason[0] != '\0' ? ": " : "", reason);
+        if (ctx != nullptr) SSL_CTX_free(ctx);
+        return false;
+    }
+    SSL_CTX_free(ctx);
+    return true;
+#else
+    (void)cfg;
+    return true;
+#endif
 }
 
 void HttpServer::Impl::route() {
@@ -217,8 +261,7 @@ void HttpServer::Impl::route() {
         });
         svr->set_pre_routing_handler(
             [this](const httplib::Request& req, httplib::Response& res) {
-                if (req.path == "/health" || req.method == "OPTIONS")
-                    return httplib::Server::HandlerResponse::Unhandled;
+                if (auth_exempt(req)) return httplib::Server::HandlerResponse::Unhandled;
                 if (!authorized(req, res)) return httplib::Server::HandlerResponse::Handled;
                 return httplib::Server::HandlerResponse::Unhandled;
             });
@@ -228,7 +271,7 @@ void HttpServer::Impl::route() {
         // the connection (the default arm) without reading the body.
         svr->set_expect_100_continue_handler(
             [this](const httplib::Request& req, httplib::Response& res) -> int {
-                if (req.path == "/health" || req.method == "OPTIONS") return 100;
+                if (auth_exempt(req)) return 100;
                 if (!authorized(req, res)) return 401;
                 return 100;
             });

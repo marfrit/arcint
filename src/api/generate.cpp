@@ -227,7 +227,8 @@ void finish_chat_generation(const PreparedChat& prep,
     if (prep.parse_tool_calls) {
         ToolCallParse parsed = parse_qwen_tool_calls(out.content, &prep.schemas);
         if (parsed.truncated) {
-            log::warn("tools", "%s", "unterminated <tool_call> block; returned as raw content");
+            log::warn("tools", "unterminated %s block; returned as raw content",
+                      std::string(tool_call_tags().open).c_str());
         }
         out.content = std::move(parsed.content);
         out.calls   = std::move(parsed.calls);

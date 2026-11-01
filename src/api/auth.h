@@ -26,22 +26,26 @@ bool constant_time_equal(std::string_view a, std::string_view b);
 bool bearer_matches(std::string_view authorization_header, std::string_view key_sha256_hex);
 
 // Boot hygiene for a configured key. False + `error` means the server must not
-// start: an empty key (an empty or newline-only --api-key-file) or one with a
-// carriage return (it can never be presented in an HTTP header). True with a
-// `warning` for a legal key that is still a footgun: leading or trailing
-// whitespace, or a '%' (cpp-httplib URL-decodes header values, so a key with
-// `%xx` can never match a client that sends it verbatim).
+// start: an empty key (an empty or newline-only --api-key-file), one with a
+// control character (below 0x20, or DEL), or one that starts or ends with a
+// SPACE (cpp-httplib trims header values, so a client can never present it).
+// True with a `warning` for a legal key that is still a footgun: a '%'
+// (cpp-httplib URL-decodes header values, so a key with `%xx` can never match
+// a client that sends it verbatim).
 bool api_key_hygiene(std::string_view key, std::string& error, std::string& warning);
 
 // A boot warning when the key file is group- or world-accessible (mode & 077),
 // naming the mode; empty when the file is private or cannot be stat'd (the
-// read already reported a missing file). In a public repository no operator
-// host detail is in it, only the file's own mode.
+// read already reported a missing file). Only the file's own mode is in it.
 std::string api_key_file_warning(const std::string& path);
 
 // Overwrite a string's storage with zeros before clearing it, so a plaintext
-// key does not stay in freed memory. volatile, so the compiler cannot elide
-// the writes as dead stores.
+// key does not stay in this buffer's freed memory. volatile, so the compiler
+// cannot elide the writes as dead stores. The server keeps only the sha256
+// digest in its long-lived state; this scrubs the buffers it owns (the file
+// read's buffer, the parsed key, the hash's working copy), not every copy C++
+// made on the way (the ifstream's, the string's reallocations, a client's
+// presented key).
 void secure_scrub(std::string& s);
 
 }  // namespace lgc::api

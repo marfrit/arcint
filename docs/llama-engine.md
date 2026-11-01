@@ -871,18 +871,21 @@ pre-routing handler, before the request body is read, so an unknown path is a
 401 too (no route probing) and an unauthenticated POST is refused unread. A
 refused request is a 401 with the OpenAI error envelope, code
 `invalid_api_key`, and a `WWW-Authenticate: Bearer` header; the CORS preflight
-is answered without the key, and the key is never logged and never appears on
-`/props`. `/props` and `/metrics` are behind the key too, so a proxy or unit
-manager that reads `/props` has to send the key once one is configured.
+(a bare OPTIONS with `Access-Control-Request-Method`) is answered without the
+key, and the key is never logged and never appears on `/props`. `/props` and
+`/metrics` are behind the key too, so a proxy or unit manager that reads
+`/props` has to send the key once one is configured.
 
-A key file that yields an empty key (empty, or a single newline) or a key with
-a carriage return is a boot error, not a silently unauthenticated server; a key
-with leading or trailing whitespace, or with a percent sign, starts with a
-warning (cpp-httplib URL-decodes header values, so a `%xx` escape can never be
-presented verbatim). `--api-key` is visible to local users in `ps`/
+A key file that yields an empty key (empty, or a single newline), a key with a
+control character (below 0x20, or DEL), or one that starts or ends with a space
+is a boot error, not a silently unauthenticated server; a key with a percent
+sign starts with a warning (cpp-httplib URL-decodes header values, so a `%xx`
+escape can never be presented verbatim), and a group- or world-readable key
+file warns and names its mode. The server keeps only the key's sha256 digest
+in its long-lived state. `--api-key` is visible to local users in `ps`/
 `/proc/<pid>/cmdline` and is meant for tests; deployments use
-`--api-key-file`. `/health` stays open for probes and reveals the served model
-id, an intended trade-off.
+`--api-key-file`. `/health` stays open for GET and HEAD probes only and reveals
+the served model id, an intended trade-off.
 
 Because the 401 is written without draining an unread request body, a client
 that has already pushed more bytes than the socket buffer holds may see the

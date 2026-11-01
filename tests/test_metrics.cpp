@@ -168,6 +168,16 @@ TEST(metrics_render_carries_counters_and_gauges) {
     CHECK(has(text, "arcint_model_loaded 1"));
 }
 
+TEST(metrics_render_tolerates_a_null_backend_test_seam) {
+    // Metrics::render is also called from a test seam with no backend; the
+    // scrape must not dereference it (it renders the model gauge as 0).
+    Metrics      m;
+    api::Context ctx;   // no backend, no slots, no lanes
+    const std::string text = m.render(ctx);
+    CHECK(has(text, "arcint_model_loaded 0"));
+    CHECK(has(text, "arcint_prompt_tokens_total 0"));
+}
+
 TEST(metrics_render_labels_each_named_lane) {
     Fixture f;
     SlotPool lane_pool(1);

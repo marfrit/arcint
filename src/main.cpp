@@ -61,8 +61,9 @@ int main(int argc, char** argv) {
                    ARCINT_BUILD_TYPE, ARCINT_COMPILER);
 
     // --api-key/--api-key-file: the key is read once here, never logged and
-    // never published. The server keeps only its sha256 digest; the plaintext
-    // is scrubbed before any request is served.
+    // never published. The server keeps only its sha256 digest in its
+    // long-lived state; the buffers it owns and hashes are zeroed after use
+    // (a client's presented key and the C++ copies made on the way are not).
     const bool key_configured = !cfg.api_key_file.empty() || !cfg.api_key.empty();
     if (!cfg.api_key_file.empty()) {
         std::string err;
@@ -81,11 +82,28 @@ int main(int argc, char** argv) {
             return 2;
         }
         if (!key_warning.empty()) lgc::log::warn("boot", "%s", key_warning.c_str());
+        // A group/world-readable key file is a footgun, not a refusal: warn,
+        // naming the mode, and keep serving.
+        if (!cfg.api_key_file.empty()) {
+            const std::string mode_warning = lgc::api::api_key_file_warning(cfg.api_key_file);
+            if (!mode_warning.empty()) lgc::log::warn("boot", "%s", mode_warning.c_str());
+        }
         // sha256_hex_secure wipes its own working copy of the key too.
         cfg.api_key_sha256 = lgc::sha256_hex_secure(cfg.api_key);
         lgc::api::secure_scrub(cfg.api_key);   // the parsed key
         lgc::log::info("boot", "%s", "an API key is configured: every route but /health needs "
                                  "`Authorization: Bearer <key>`");
+    }
+
+    // The TLS material is loaded here, with the key hygiene, BEFORE the
+    // backend: a bad --tls-cert/--tls-key is a boot error, not a failure after
+    // a long model load. The server still constructs its SSLServer later.
+    {
+        std::string tls_error;
+        if (!lgc::tls_material_loads(cfg, tls_error)) {
+            lgc::log::error("boot", "%s", tls_error.c_str());
+            return 2;
+        }
     }
 
     std::unique_ptr<lgc::Backend> backend;

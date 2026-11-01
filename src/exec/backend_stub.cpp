@@ -4,6 +4,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include "core/toolcall.h"
 #include "exec/backend.h"
 #include "util/log.h"
 #include "util/utf8.h"
@@ -293,9 +294,14 @@ private:
         out += " \xf0\x9f\xa7\xa9";
 
         if (!in.tool_names.empty()) {
-            out += "\n<tool_call>\n{\"name\": \"";
+            // The one spelling of the call tags (core/toolcall.h); the emitted
+            // bytes are unchanged.
+            out += '\n';
+            out.append(tool_call_tags().open);
+            out += "\n{\"name\": \"";
             out += in.tool_names.front();
-            out += "\", \"arguments\": {}}\n</tool_call>";
+            out += "\", \"arguments\": {}}\n";
+            out.append(tool_call_tags().close);
         }
         return out;
     }
