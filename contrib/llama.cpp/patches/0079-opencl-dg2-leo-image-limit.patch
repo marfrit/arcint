@@ -82,7 +82,7 @@ index 0000000..839bdf2
 +
 +#endif // GGML_OPENCL_IMAGE_LIMIT_H
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 41de741..05094ef 100644
+index 41de741..9f4ab87 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -19,6 +19,8 @@
@@ -203,17 +203,29 @@ index 41de741..05094ef 100644
          tensor->extra = extra;
  
          return;
-@@ -28021,6 +28086,13 @@ static cl_mem ggml_cl_img_pool_get_or_create(
+@@ -28010,6 +28075,16 @@ static cl_mem ggml_cl_img_pool_get_or_create(
+         pool.erase(it);
      }
  
-     const size_t pixel_size = (channel_data_type == CL_HALF_FLOAT) ? 8 : 16;
++    const size_t pixel_size = (channel_data_type == CL_HALF_FLOAT) ? 8 : 16;
 +    // 0079: the DG2 + LEO bound applies to every image1d_buffer, not only the
 +    // quantized weight images: the flash-attention K view is one too.  Returning
 +    // nullptr is the pool's existing "no image" answer; the caller then takes
-+    // its buffer kernel.
++    // its buffer kernel.  Asked before the sub-buffer exists, so a refusal
++    // leaves nothing to release.
 +    if (!ggml_cl_image_texels_ok(backend_ctx, required_bytes / pixel_size)) {
 +        return nullptr;
 +    }
++
+     cl_int status = CL_SUCCESS;
+     cl_buffer_region region = {};
+     region.origin = (size_t)offset0;
+@@ -28019,8 +28094,6 @@ static cl_mem ggml_cl_img_pool_get_or_create(
+     if (status != CL_SUCCESS) {
+         return nullptr;
+     }
+-
+-    const size_t pixel_size = (channel_data_type == CL_HALF_FLOAT) ? 8 : 16;
      cl_image_format fmt = {CL_RGBA, channel_data_type};
      cl_image_desc   desc = {};
      desc.image_type   = CL_MEM_OBJECT_IMAGE1D_BUFFER;
@@ -242,10 +254,10 @@ index 8749cdb..6d32e41 100644
      llama_build_and_test(test-unicode.cpp LINK llama)
 diff --git a/tests/test-opencl-image-limit.cpp b/tests/test-opencl-image-limit.cpp
 new file mode 100644
-index 0000000..301a2e2
+index 0000000..03d59a1
 --- /dev/null
 +++ b/tests/test-opencl-image-limit.cpp
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,150 @@
 +// 0079: device-free tests for the DG2 + LEO image1d_buffer bound.
 +//   - the rule itself (ggml-opencl-image-limit.h, the header the backend
 +//     includes): every combination of LEO, DG2 and driver max, including the
@@ -357,8 +369,14 @@ index 0000000..301a2e2
 +
 +    // the image pool: FA's K view is an image1d_buffer too, and the pool's
 +    // nullptr answer makes the caller take its buffer kernel
-+    CHECK(has(src, "ggml_cl_image_texels_ok(backend_ctx, required_bytes / pixel_size)"),
-+          "the image pool asks the bound before creating the sub-buffer");
++    // the pool asks the bound before it creates the sub-buffer: a refusal after
++    // clCreateSubBuffer would return without releasing it (a handle per call)
++    const size_t pq = src.find("ggml_cl_image_texels_ok(backend_ctx, required_bytes / pixel_size)");
++    CHECK(pq != std::string::npos, "the image pool asks the bound");
++    if (pq != std::string::npos) {
++        const size_t sb = src.find("clCreateSubBuffer(data_device, 0,", pq > 2000 ? pq - 2000 : 0);
++        CHECK(sb != std::string::npos && sb > pq, "the image pool asks the bound before creating the sub-buffer");
++    }
 +
 +    // a selection site that assumes q_img must still see it: both weight-image
 +    // MoE selections read a live image, and the FA site falls back

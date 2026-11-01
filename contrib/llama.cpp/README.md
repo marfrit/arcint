@@ -5004,7 +5004,9 @@ the gate). The rule is one device-free header function and one predicate pair:
 - `ggml-opencl.cpp`: at init, `leo_mode` from the device version and `dg2` from
   `CL_DEVICE_NAME` / `CL_DEVICE_ID_INTEL` when
   `cl_intel_device_attribute_query` is exposed (the A770 is `0x56a0`,
-  `measured-here`; the fallback names cover the family). One call site
+  `measured-here`; the id window covers the desktop A-series ids only, the name
+  predicate runs first and covers the Arc A and Pro A names; a Flex part would be
+  missed, `code`). One call site
   `ggml_cl_image_texels_ok()` builds the mode from the context.
 
 Every `IMAGE1D_BUFFER` creation in the patched `ggml-opencl.cpp` (`code`,
@@ -5017,15 +5019,24 @@ inventory over the 0001-0072 text; counts before this patch):
   refused branch leaves `extra->q_img = nullptr`, and every Intel MXFP4 kernel
   this backend selects reads the `q` buffer, so no kernel choice changes. (The
   MoE weight-image variants are `GGML_OPENCL_USE_ADRENO_KERNELS`-only.)
-- **one** image pool creation used by flash attention's K view
-  (`ggml_cl_img_pool_get_or_create`, FA prefill DK=512 opt-in and the f16 K
-  image path). **Guarded here**; `nullptr` is the pool's existing "no image"
-  answer, so both callers take their buffer kernel.
+- **one** image pool creation (`ggml_cl_img_pool_get_or_create`) with six
+  callers in the source, two of them compiled in the Intel build: flash
+  attention's prefill K view (DK=512, `GGML_OPENCL_FA_PREFILL_K_IMG`) and its
+  decode K view (`GGML_OPENCL_FA_K_IMG`), both opt-in; the four f16 KQ/KQV image
+  mul_mat callers sit inside the Adreno `#ifdef` (`code`). **Guarded here**,
+  before the sub-buffer is created (a refusal after it would leak one sub-buffer
+  handle per call, reachable on the A770 only with one of the two switches set;
+  the cell checks the order);
+  `nullptr` is the pool's existing "no image" answer, and every caller null-checks
+  it and takes its buffer kernel. The coder's prefill flash attention
+  (`flash_attn_f32_f16_dpas`) is buffer-only and never a pool client.
 - **all others** are under `#ifdef GGML_OPENCL_USE_ADRENO_KERNELS` (not
   compiled in the Intel build: `-DGGML_OPENCL_USE_ADRENO_KERNELS=OFF`), or live
-  in `ggml_cl_mul_mat_q1_0_f32_adreno`, whose only call site is behind
-  `use_adreno_kernels()` (false on Intel). They are not reachable on the A770
-  and are untouched.
+  in functions whose body compiles on Intel but whose only call sites sit inside
+  that `#ifdef` (`ggml_cl_mul_mat_q1_0_f32_adreno`, the `A_image1d`/`D_image1d`
+  images of `ggml_cl_mul_mat_kq_kqv_adreno`): the `#ifdef` is the guard, not the
+  `use_adreno_kernels()` predicate. They are not reachable on the A770 and are
+  untouched.
 - The two extra fields `q_img`/`d_img` set in the SoA conversion are
   `GGML_OPENCL_USE_ADRENO_KERNELS`-only as well.
 
@@ -5034,6 +5045,9 @@ missing image, so no site needed a new branch):
 
 - q4_K MoE decode weight-image: `&& extra0_q4_K->q_img != nullptr` (Adreno);
 - MXFP4 MoE decode weight-image: `&& extra0_mxfp4->q_img != nullptr` (Adreno);
+  both strings sit inside Adreno `#ifdef`s, dead text in the Intel build; on the
+  A770 the proof is that the `gpu_family == INTEL` branches of the MXFP4 mul_mv and
+  mul_mv_id read `extra0_mxfp4->q`, never `q_img` (`code`);
 - flash attention: `if (prefill_k_img == nullptr)` resets the kernel to
   `fa.f32_f16_split.at(dk_dv)`; the other FA K-image path tests
   `if (k_img == nullptr)` and sets `use_fa_k_img = false`;
