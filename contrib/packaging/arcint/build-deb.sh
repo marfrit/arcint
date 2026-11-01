@@ -163,6 +163,14 @@ case "$LDD_OUT" in
         printf '%s\n' "$LDD_OUT" >&2
         exit 1 ;;
 esac
+# TLS (-DARCINT_TLS=ON, --tls-cert/--tls-key) is an extra arm, not this recipe:
+# the package must not have picked OpenSSL up, or its Depends would be wrong.
+case "$LDD_OUT" in
+    *libssl*|*libcrypto*)
+        echo "das Binary linkt OpenSSL: dieser Paketbau muss ARCINT_TLS=OFF bauen (--tls-* ist ein Extra-Arm)" >&2
+        printf '%s\n' "$LDD_OUT" >&2
+        exit 1 ;;
+esac
 
 # The unit TEMPLATE comes from `cmake --install` since 0.2.2, not from a copy
 # here: two places installing the same file is how the packaged unit and the

@@ -150,8 +150,11 @@
   names the provenance.
 - Console: one-line state/timing prints on stderr (load, expert cache,
   per-slot prefill/decode rates, draft acceptance).
-- Security: no authentication, permissive CORS, no TLS. LAN or a reverse
-  proxy only.
+- Security: no authentication by default; --api-key/--api-key-file add a
+  bearer token on every route but /health (that includes /props and /metrics;
+  the CORS preflight is answered without the key). TLS only in a build
+  configured with -DARCINT_TLS=ON (--tls-cert/--tls-key); the default build
+  links no OpenSSL. LAN or a reverse proxy only.
 
 ## Model input
 
@@ -217,6 +220,17 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
 - --device GPU.N | NAME-SUBSTRING | GPU.0,GPU.1: the card(s), in OpenCL
   enumeration order (GPU.0 = B60, GPU.1 = A770 on the dev host).
 - --host ADDR (127.0.0.1), --port N (8090), --http-threads N.
+- --metrics (off): serve GET /metrics in the Prometheus text format with the
+  request/status, token, prefill/decode, cache-hit, draft and lane gauges. A
+  request field `arcint.timings: true` adds the per-response timing object
+  (llama-server's prompt_n/prompt_ms, predicted_n/predicted_ms, cache_n,
+  draft_n, draft_accepted) on Chat Completions and Responses.
+- --api-key KEY | --api-key-file PATH: require `Authorization: Bearer KEY` on
+  every route but /health. The file is read once (exactly one trailing newline
+  stripped); the key is never logged and never on /props.
+- --tls-cert FILE --tls-key FILE: HTTPS through httplib's OpenSSL server;
+  needs a build configured with -DARCINT_TLS=ON (the default build refuses the
+  flags and does not link OpenSSL).
 - --served-model-name NAME[,NAME2] with --lane-ctx CA,CB; --parallel N;
   --n-ctx N (default the smaller of 32,768 and the trained context);
   --queue-timeout S; --prefill-chunk N; --prefill-ubatch N (n_ubatch, default 512).
@@ -283,3 +297,7 @@ Serving build: -DARCINT_LLAMA=ON -DARCINT_LLAMA_DIR=<llama.cpp at 3e4dfa8
 with contrib/llama.cpp/patches applied> -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF;
 needs OpenCL headers and the ICD loader, and Intel's compute runtime to run.
 -DARCINT_WERROR=ON is warning-clean; ASan+UBSan clean on x86_64.
+
+TLS is an extra arm: -DARCINT_TLS=ON (finds and links OpenSSL) accepts
+--tls-cert/--tls-key. The default build refuses the flags and stays free of
+libssl, so the package's Depends do not change.

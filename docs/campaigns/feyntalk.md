@@ -1063,6 +1063,13 @@ a config never decides a capability the backend advertises, `code`:
 `llm-proxy.py` 87-160). A changed hash replaces the cached material; a
 mismatch on load marks the backend text-only and logs.
 
+**With an API key configured** (`--api-key`/`--api-key-file` on the unit), the
+gateway must send `Authorization: Bearer <key>` on every call — discovery
+(`GET /props`, `GET /v1/responses/renderer`) included, because the key covers
+every route but `/health`. No unit sets one today, so nothing breaks; the
+gateway's backend block gains an optional key field when a deployment turns it
+on.
+
 Where it plugs in: a `feyntalk_gateway` module beside the existing proxy; the
 route table gains `/v1/responses` (pass-through of the spec SSE, with the
 `arcint:` events relayed unchanged) and `/v1/chat/completions` is served from

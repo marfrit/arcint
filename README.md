@@ -284,6 +284,11 @@ Pass `-DARCINT_GIT_SHA` whenever the tree has no `.git`; without it
 warning-clean build CI uses. [DEVELOPMENT.md](DEVELOPMENT.md) has the test
 ladder.
 
+A build that should serve TLS adds `-DARCINT_TLS=ON` (it finds and links
+OpenSSL) and takes `--tls-cert`/`--tls-key`. The default build refuses those
+flags and links no OpenSSL, so the Debian package's dependencies do not
+change.
+
 **The GPU runtime on a fresh host.** Debian trixie ships no Intel compute
 runtime in any component; install Intel's release `.deb`s from
 [intel/compute-runtime](https://github.com/intel/compute-runtime/releases)
@@ -323,8 +328,15 @@ service's production flags, Flash-Next's expert cache included
   unit keeps MTP.
 - One process holds its card's VRAM for its whole lifetime: whatever else
   was serving that card has to stop first.
-- **No authentication, permissive CORS, no TLS.** arcint is built for a LAN
-  or a reverse proxy that provides all three.
+- **No authentication by default, permissive CORS, no TLS.** `--api-key`
+  (or `--api-key-file PATH`) adds a bearer token on every route but `/health`
+  — `/props` and `/metrics` included — and answers a 401 otherwise; the CORS
+  preflight is answered without the key. A `-DARCINT_TLS=ON` build adds
+  `--tls-cert`/`--tls-key`. Built for a LAN or a reverse proxy.
+- `--metrics` serves `GET /metrics` in the Prometheus text format (request,
+  token, prefill/decode, cache-hit, draft counters and per-lane
+  queue/slot gauges); a request with `arcint: {timings: true}` gets the
+  per-response timings back on Chat Completions and Responses.
 
 ## Scope
 

@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "api/auth.h"
 #include "api/handlers.h"
 #include "api/metrics.h"
 #include "api/responses_state.h"
@@ -14,6 +15,7 @@
 #include "exec/backend.h"
 #include "http/server.h"
 #include "util/log.h"
+#include "util/sha256.h"
 
 namespace {
 
@@ -57,6 +59,25 @@ int main(int argc, char** argv) {
     lgc::log::set_level(level_for(cfg.verbosity));
     lgc::log::info("boot", "arcint %s (%s) %s, %s", ARCINT_VERSION, ARCINT_GIT_SHA,
                    ARCINT_BUILD_TYPE, ARCINT_COMPILER);
+
+    // --api-key/--api-key-file: the key is read once here, never logged and
+    // never published. The server keeps only its sha256 digest; the key itself
+    // is dropped before any request is served.
+    if (!cfg.api_key_file.empty()) {
+        std::string err;
+        auto        key = lgc::api::read_api_key_file(cfg.api_key_file, err);
+        if (!key) {
+            lgc::log::error("boot", "could not read --api-key-file: %s", err.c_str());
+            return 2;
+        }
+        cfg.api_key = *key;
+    }
+    if (!cfg.api_key.empty()) {
+        cfg.api_key_sha256 = lgc::sha256_hex(cfg.api_key);
+        cfg.api_key.clear();
+        lgc::log::info("boot", "%s", "an API key is configured: every route but /health needs "
+                                 "`Authorization: Bearer <key>`");
+    }
 
     std::unique_ptr<lgc::Backend> backend;
     if (cfg.stub) {

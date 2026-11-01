@@ -848,6 +848,35 @@ A context is a multiple of 256, at most the model's trained context, at most
   (`docs/campaigns/lanes-agent-subagent.md`). Without MTP the lanes still
   take turns, one lane per `llama_decode`.
 
+## Access control and metrics (`--api-key`, `--metrics`, TLS)
+
+Three additive serving options, all off by default.
+
+`--metrics` registers `GET /metrics` (Prometheus text format) and records the
+counters behind it: requests by route and status, prompt/completion/cache-hit
+tokens, prefill and decode seconds, speculated and accepted drafts, queue
+depth and slots busy/total per lane, and the model-loaded gauge. The values
+are the ones arcint already logs; nothing new is measured in the step loop.
+Without the flag the route does not exist. A request may set
+`arcint: {timings: true}` (Chat Completions and Responses) for the
+per-response timing object in llama-server's names — `prompt_n`/`prompt_ms`,
+`predicted_n`/`predicted_ms`, `cache_n`, `draft_n`, `draft_accepted`; an
+absent flag keeps the response byte-identical.
+
+`--api-key KEY` (or `--api-key-file PATH`, read once at boot with exactly one
+trailing newline stripped) makes every route but `/health` require
+`Authorization: Bearer <key>`; the presented key is hashed and the sha256
+digests are compared in constant time. A refused request is a 401 with the
+OpenAI error envelope, code `invalid_api_key`; the CORS preflight is answered
+without the key, and the key is never logged and never appears on `/props`.
+`/props` and `/metrics` are behind the key too, so a proxy or unit manager
+that reads `/props` has to send the key once one is configured.
+
+`--tls-cert`/`--tls-key` serve HTTPS through httplib's OpenSSL server, but
+only in a build configured with `-DARCINT_TLS=ON`; the default build refuses
+the flags and does not find or link OpenSSL, so the package's Depends stay
+free of libssl. TLS is an extra arm, not the recipe's default.
+
 ## Open on this engine
 
 Conversation state kept across a restart (P6; in process it is the context
