@@ -819,13 +819,25 @@ Sources, all outside the step loop:
 | `loop_guard` | sampler's own counters at detection/nudge/slap/door-lift/abort | same point | `code`: `sampler.cpp` 645/650/652/680/778/829/843/869 |
 | `context_guard` | the forced closer (`ctx_forced_index_`) and the no-closer case | point event | `code`: `sampler.cpp:1143`, W3.4 |
 
-A `SpanTracker` in `responses_stream.cpp` consumes each `(piece, token_id)`
-before the text deltas, so span order is chronological; loop/context spans come
-from a **per-request event vector** in `SamplerParams`
-(`std::vector<SamplerSpanEvent>`, filled by the sampler's own counter sites and
-drained by the API after each emit), not from a cross-thread callback. The sampler already
-knows `emitted_`, so the index is exact where it is produced. No backend loop
-call site and no step-loop change. `code`.
+The span state machine lives in `responses_stream.cpp` as `Stream` methods
+(`update_spans` for thinking/tool_call, `drain_sampler_spans` for the vector,
+`close_spans` at turn end) — there is no `SpanTracker` class; the record names
+the methods (W6 follow-up 7). They consume each `(piece, token_id)` before the
+text deltas, so span order is chronological; loop/context spans come from a
+**per-request event vector** in `SamplerParams` (`std::vector<SamplerSpanEvent>`,
+filled by the sampler's own counter sites and drained by the API after each
+emit), not from a cross-thread callback. The sampler already knows `emitted_`,
+so the index is exact where it is produced. No backend loop call site and no
+step-loop change. `code`.
+
+Two edges worth naming (W6 follow-up 6, `code`): **(a)** a sampler span can fire
+on a decision whose token is never emitted (a stop id ends the turn at the next
+boundary), and the drained span then carries an index no `arcint:token` takes —
+the index is the decision's, not an emitted token's; **(b)** a token absorbed by
+a stop string is already counted in `usage.output_tokens` by the backend, while
+it reaches no `on_piece` emit and therefore gets no `arcint:token` — the token
+index space is the emitted stream, not the usage count, on turns with stop
+strings.
 
 ### D4 — Renderer material (`GET /v1/responses/renderer`)
 
@@ -875,8 +887,14 @@ Responses envelope's type `not_found`.
 
 The body is several MB (pieces + raw tokens + merges). The build is **lazy and
 once**: the first GET or the first token-mode request builds it under a mutex,
-keeps the JSON, the hash and a pre-serialized string, and the endpoint serves
-that string by reference — `/props` never pays it, a second GET copies nothing.
+serializes it **inside the build's try**, keeps the hash and the pre-serialized
+string, drops the JSON tree (W6 follow-ups 4/5), and the endpoint serves the
+string by reference — `/props` never pays it, a second GET copies nothing, and
+only one body-sized allocation stays resident. `/props` reads the capability and
+the cached hash through a **try_lock**: while a build is in flight it reports
+`ready` with a null hash instead of waiting it out (follow-up 3). A load-time
+pre-flight over the vocabulary's text and the template marks the capability off
+from the first second when the material could never be built (follow-up 2).
 A build the canonical hash cannot encode (a raw-byte vocabulary's token text is
 not valid UTF-8) is caught: one warn line, empty material, `token_mode: "off"`,
 and the unit still serves text (`code`, review finding 2). `model` is volatile
@@ -901,7 +919,25 @@ llama backend builds lazily, the stub answers 404. None is in the step loop.
 | 5 LOW | error types mixed (`invalid_request_error` on the 404) | the 404 speaks the Responses envelope (`not_found`, `renderer_not_served`), the 409s stay `invalid_request` (`renderer_mismatch`). A continuation's prompt-hash 409 keeps the stored entry: nothing of it was served and a render-fixed retry may reuse the id; only a prepare 4xx evicts — comment in the code and this note | `code` |
 
 The review's lifecycle note is adopted: W6a's red commit carried skeleton source
-files; this round's red commit is test-only.
+files; this round's red commit is test-only. **W6 follow-up 8:** the review
+commit `360611e` is test-only, but applied alone to `8d77311` it does not
+compile (that tree has no W6b test helpers), so its red run there is a compile
+failure, not failing assertions; on the branch where W6b was present the three
+cases failed as assertions. Both records are true; the commit is not a source
+commit.
+
+#### W6 follow-up round (engine maintainer, 2026-11-01)
+
+| # | follow-up | disposition | evidence |
+|---|---|---|---|
+| 1 | stub split said it matches StopMatcher's tail convention, it does not | comment corrected: the stub announces the token on the FIRST part (the token event must precede the token's bytes), StopMatcher keeps the id with the LAST part of a held stop string; both are deliberate | `code` |
+| 2 | `/props` said `ready` before the first build, so a failing vocabulary looked ready until the GET | a cheap load-time pre-flight (`renderer_text_utf8_ok`) over the vocabulary text and the template marks the capability off at load; the lazy build then returns without attempting. Qwen vocabularies pass it; the llama path is the maintainer's recipe build | `code`; helper unit-tested |
+| 3 | `renderer_hash()` took the build mutex, so `/props` waited out a build | split into the build-capable hash (the token request) and `renderer_hash_cached()`, which uses `try_lock`: `/props` reports `ready` and a null hash, never waits | `code`, `measured-here` (unit) |
+| 4 | the body's `.dump()` was outside the try | serialization moved inside the build's try; a dump that refuses a string is a failed build, one warn, token mode off | `code` |
+| 5 | the JSON tree and the string both stay resident after the GET | the tree is dropped after serialization; the cached hash and string are all that stay | `code` |
+| 6 | two edge conditions unrecorded | D3 now names both: a span from a sampled-but-not-emitted token drains at an index no token carries; a stop-string token gets no `arcint:token` while usage counts it | `code` |
+| 7 | the record named a `SpanTracker` class the code does not have | the record names the `Stream` methods (`update_spans`/`drain_sampler_spans`/`close_spans`) | `code` |
+| 8 | red `360611e` read as failing assertions | noted: test-only still true; applied alone to `8d77311` it is a compile failure (no W6b helpers there), on the W6b branch the three cases failed as assertions | `code` |
 
 ### D5 — feyntalk-render (new public repository, Python)
 
@@ -1092,7 +1128,7 @@ Ordered, each one session. `R` = engine maintainer review; `C` = card window.
 | # | package | scope | gate | R | C |
 |---|---|---|---|---|---|
 | W6a | **engine protocol + material** | `arcint.token_mode`/`renderer_hash`/`render.prompt_sha256` (+`input_ids` accepted, unserved), `read_arcint` 394-414, `finish_prepare`'s prompt hash, `GET /v1/responses/renderer`, `/props`, `Backend::renderer_material()` + `backend_llama.cpp` load area, canonical hash, stub 404 | unit: request mapping, both 409s before the slot, hash stable across two loads, stub no material; off by default; red first | yes | no |
-| W6b | **token events + spans** | `responses_stream.cpp` token event before the shadow, `SpanTracker`, `ReasoningStreamer::field_for`, sampler event vector (loop/context; no call-site change), `reasoning.h` | unit: contiguous `token_index`, exact span indices on the stub, `shadow == decode(tokens)` with the UTF-8 and closer cases, loop/context event order; red first | yes | no |
+| W6b | **token events + spans** | `responses_stream.cpp` token event before the shadow, the span methods (`update_spans`/`drain_sampler_spans`/`close_spans`), `ReasoningStreamer::field_for`, sampler event vector (loop/context; no call-site change), `reasoning.h` | unit: contiguous `token_index`, exact span indices on the stub, `shadow == decode(tokens)` with the UTF-8 and closer cases, loop/context event order; red first | yes | no |
 | W6c | **feyntalk-render v0.1** (new repo) | material/canonical hash, render + jinja2 compat, detok, parser, both modes, CLI, conformance | corpus: render vs engine prompt hash, detok vs shadow, mapping matrix; refusal on unknown constructs; the public repo from v1.0.0 | no | sample needed |
 | W6d | **gateway integration** | capability discovery + material cache, `/v1/responses` pass-through, Chat Completions translation, salvage bypass, fallbacks, `feyntalk-doctor` | proxy tests: token-mode frames never enter the salvage classes; token-path Chat Completions has `reasoning_content`, real calls, no text markers; text and cloud paths unchanged; a 409→text fallback; fixtures, no card | no | no |
 | W6e | **conformance + live token leg** | `tools/feyntalk_live.py` token arm, one card window; the proxy as the client (not the engine's shadow only) | Gate 4's class in token mode: task right, ≥2 round-trips, 0 malformed calls, 0 hash mismatches, shadow==render(tokens) per turn, decode within the chat arm's spread | no | yes |
@@ -1385,6 +1421,21 @@ the continuation 409 keeps the stored entry). Red first three cases (the
 --max-skips 0` 492 cases 0 failed 0 skipped, golden 12/12 byte-identical,
 roundtrip green, `ctest -L compliance` 7/7 (`measured-here`, stub, aarch64,
 2026-10-31). The llama-side lazy build, tag geometry and two-load hash are the
+maintainer's recipe build.
+
+**W6 follow-up round (2026-11-01, `feyntalk-w6fu` from the merged qfndev tip).**
+All eight non-blocking follow-ups closed: the stub's split comment corrected
+(first part carries the id, unlike StopMatcher's last part); a load-time UTF-8
+pre-flight so `/props` is honest before the first build; `/props` reads the
+cached hash through a try_lock and never waits a build; the body serialization
+moved inside the build's try; the JSON tree dropped after serialization (one
+body-sized cache stays); the two span/token edge sentences in D3; the record's
+`SpanTracker` name replaced by the `Stream` methods; and the red-commit
+compile-failure note. Red first one case (`props_never_takes_the_building_hash`,
+a build-capable accessor counter), then `ctest -L unit` 9/9, `arcint-test
+--max-skips 0` 495 cases 0 failed 0 skipped, golden 12/12 byte-identical,
+roundtrip green, `ctest -L compliance` 7/7 (`measured-here`, stub, aarch64,
+2026-11-01). The llama pre-flight and the try_lock/one-cache paths are the
 maintainer's recipe build. Token
 mode with `truncation: "auto"` stays a 409 (the engine's fit pass hashes the
 dropped render; the gateway's full render differs) until W6c applies the fit —
