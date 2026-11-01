@@ -34,6 +34,10 @@ public:
     virtual std::string      decode(const std::vector<int>& ids)  = 0;
     virtual std::string      decode_one(int id)                   = 0;
     virtual int              eos_id() const                       = 0;
+    // The vocabulary's BOS id, or -1 when it has none. The count path applies
+    // the llama backend's BOS rule with it: a vocabulary that wants BOS gets it
+    // prepended when the rendered prompt did not already write it.
+    virtual int              bos_id() const { return -1; }
     // The vocabulary's size, for a scan over every id's piece (the loop-guard
     // door needs it to find the multi-newline tokens). Default 0: a tokenizer
     // that cannot enumerate offers no door mask and keeps today's behaviour.

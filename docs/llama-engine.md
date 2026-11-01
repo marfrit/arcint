@@ -871,7 +871,7 @@ pre-routing handler, before the request body is read, so an unknown path is a
 401 too (no route probing) and an unauthenticated POST is refused unread. A
 refused request is a 401 with the OpenAI error envelope, code
 `invalid_api_key`, and a `WWW-Authenticate: Bearer` header; the CORS preflight
-(a bare OPTIONS with `Access-Control-Request-Method`) is answered without the
+(an OPTIONS with `Access-Control-Request-Method`) is answered without the
 key, and the key is never logged and never appears on `/props`. `/props` and
 `/metrics` are behind the key too, so a proxy or unit manager that reads
 `/props` has to send the key once one is configured.

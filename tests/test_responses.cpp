@@ -2508,6 +2508,74 @@ TEST(responses_token_mode_matching_hashes_prepare) {
     CHECK_EQ(p.chat.input.prompt, po.chat.input.prompt);
 }
 
+TEST(responses_arcint_preserve_thinking_is_read) {
+    json b = base();
+    b["arcint"] = {{"v", 1}, {"preserve_thinking", true}};
+    ResponseRequest out;
+    CHECK(!api::parse_response_request(b, out).has_value());
+    CHECK(out.chat.has_preserve_thinking);
+    CHECK(out.chat.preserve_thinking);
+}
+
+TEST(responses_arcint_preserve_thinking_must_be_a_boolean) {
+    json b = base();
+    b["arcint"] = {{"v", 1}, {"preserve_thinking", 3}};
+    ResponseRequest out;
+    auto err = api::parse_response_request(b, out);
+    CHECK(err.has_value());
+    if (!err.has_value()) return;
+    CHECK_EQ(err->status, 400);
+    const json& e = err->body["error"];
+    CHECK_EQ(e["code"].get<std::string>(), std::string("invalid_request"));
+    CHECK_EQ(e["param"].get<std::string>(), std::string("arcint.preserve_thinking"));
+}
+
+TEST(responses_token_mode_hash_covers_preserve_thinking) {
+    // A gateway that rendered with preserve_thinking must not match an engine
+    // that rendered without it: the hash is over the rendered prompt, so the
+    // two renders must differ and a stale hash is a 409.
+    Fixture fx(4096, synthetic_material(kHashA));
+
+    ChatMessage u0;
+    u0.role = "user"; u0.content = "first";
+    ChatMessage a;
+    a.role = "assistant"; a.content = "answer"; a.reasoning = "REASON-OLD";
+    ChatMessage u1;
+    u1.role = "user"; u1.content = "steer";
+
+    ResponseRequest plain;
+    plain.chat.model    = "stub";
+    plain.chat.messages = {u0, a, u1};
+    const std::string without = fx.backend->render_chat(plain.chat);
+
+    ResponseRequest flagged = plain;
+    flagged.chat.preserve_thinking     = true;
+    flagged.chat.has_preserve_thinking = true;
+    const std::string with = fx.backend->render_chat(flagged.chat);
+    CHECK(without != with);   // the flag changes the bytes the hash covers
+
+    auto request_with_hash = [&](const std::string& hash) {
+        ResponseRequest rr;
+        rr.chat            = flagged.chat;
+        rr.token_mode      = true;
+        rr.renderer_hash   = kHashA;
+        rr.render_prompt_sha256 = hash;
+        return rr;
+    };
+
+    PreparedResponse p1;
+    const auto e1 = api::prepare_response(fx.ctx, request_with_hash("sha256:" + api::sha256_hex(without)), p1);
+    CHECK(e1.has_value());
+    if (e1.has_value()) {
+        CHECK_EQ(e1->status, 409);
+        CHECK_EQ(e1->body["error"]["param"].get<std::string>(),
+                 std::string("arcint.render.prompt_sha256"));
+    }
+    PreparedResponse p2;
+    const auto e2 = api::prepare_response(fx.ctx, request_with_hash("sha256:" + api::sha256_hex(with)), p2);
+    CHECK(!e2.has_value());
+}
+
 TEST(responses_renderer_endpoint_is_404_without_material) {
     Fixture fx;
     const api::RendererBundle r = api::renderer_bundle(fx.ctx);

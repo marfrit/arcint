@@ -2,6 +2,7 @@
 
 #include "harness.h"
 
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 
@@ -89,6 +90,35 @@ TEST(llama_backend_publishes_the_configured_kv_type) {
     CHECK(src.find("kv_precision  = \"") == std::string::npos);
 }
 
+// The coder template reads `preserve_thinking`: the capability field is the
+// llama backend's (only the GGUF template knows), so this one fact stays a
+// source scan. The construction itself (typed switches + passthrough, reserved
+// keys refused) is test_chat.cpp's pure template_context case.
+TEST(llama_backend_publishes_supports_preserve_thinking) {
+    std::ifstream in(std::string(ARCINT_SOURCE_DIR) + "/src/exec/backend_llama.cpp");
+    CHECK(in.good());
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const std::string src = ss.str();
+    CHECK(src.find("supports_preserve_thinking") != std::string::npos);
+    CHECK(src.find("supports_preserve_reasoning") != std::string::npos);   // kept
+}
+
+// The wire from render_chat to the shared construction: only a scan can see it
+// device-free, and the scanned text is code, not a comment. Whitespace is
+// stripped from both sides, so a formatting pass cannot break it.
+TEST(llama_backend_render_chat_uses_the_template_context) {
+    std::ifstream in(std::string(ARCINT_SOURCE_DIR) + "/src/exec/backend_llama.cpp");
+    CHECK(in.good());
+    std::stringstream ss;
+    ss << in.rdbuf();
+    std::string nows;
+    for (char c : ss.str())
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') nows += c;
+    CHECK(nows.find("extra=template_context(req,ctx_error)") != std::string::npos);
+    CHECK(nows.find("inputs.extra_context=extra") != std::string::npos);
+}
+
 TEST(props_reports_the_slot_loan_state) {
     // /props names the loan's state ("off" by default, "armed"/"out"/"poisoned"/
     // "broken" from llama_context_slot_loan_state) so a request refused with
@@ -136,6 +166,29 @@ TEST(props_reports_the_served_file_and_what_the_backend_knows) {
     CHECK_EQ(j.at("mtp").at("requested").get<std::string>(), std::string("on"));
     CHECK(j.at("mtp").at("enabled").get<bool>());
     CHECK_EQ(j.at("cache").at("kv_dtype").get<std::string>(), std::string("q8_0:q4_0"));
+}
+
+// The endpoint list must name the token routes too: a discovering client reads
+// it to know what this process serves.
+TEST(props_endpoints_lists_the_token_routes) {
+    Config      cfg;
+    FakeBackend backend;
+    backend.st.id        = "stub";
+    backend.st.served_id = "stub";
+    backend.st.loaded    = true;
+    backend.st.stub      = true;
+    backend.st.n_ctx     = 4096;
+    SlotPool slots(1);
+    Context  ctx{&cfg, &backend, &slots};
+
+    const nlohmann::json j         = lgc::api::props(ctx);
+    const nlohmann::json& endpoints = j.at("endpoints");
+    auto has = [&](const char* path) {
+        return std::find(endpoints.begin(), endpoints.end(), path) != endpoints.end();
+    };
+    CHECK(has("/tokenize"));
+    CHECK(has("/detokenize"));
+    CHECK(!has("/metrics"));   // --metrics off
 }
 
 // The projector's own halves: /props must report libmtmd's vision/audio caps,

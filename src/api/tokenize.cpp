@@ -1,5 +1,6 @@
 #include "api/tokenize.h"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -60,14 +61,34 @@ HttpResult bad_field(std::string_view message, std::string_view param = {}) {
     return HttpResult{400, invalid_request(message, param)};
 }
 
-// The count result: the prompt tokens finish_prepare stored, or -- never on the
-// chat and Responses paths -- the one tokenisation of the input. The count is
-// the stored vector's size, so it equals what the backend would decode.
-HttpResult count_result(const Context& ctx, const GenerationInput& in, int count, bool with_pieces) {
+// An mmproj unit counts the image tokens with the projector's own tokenizer,
+// which /tokenize does not run: the text tokenisation would be short by every
+// image token, so an image part is refused instead of reported wrong.
+std::optional<HttpResult> refuse_images(const ChatRequest& req) {
+    for (const ChatMessage& m : req.messages) {
+        if (m.images.empty()) continue;
+        return HttpResult{400, invalid_request(
+            "image parts cannot be counted by /tokenize: an mmproj unit's image tokens are known "
+            "only when the projector runs, so use the generation's usage.prompt_tokens",
+            "messages")};
+    }
+    return std::nullopt;
+}
+
+// The count result: the id vector finish_prepare stored, with the llama
+// backend's BOS rule applied. That backend prepends BOS for a vocabulary that
+// wants it when the rendered prompt did not already write it (prompt_tokens),
+// so the count has to as well; otherwise /tokenize reports one token fewer than
+// the generation's usage. The count is the final vector's size.
+HttpResult count_result(const Context& ctx, const GenerationInput& in, bool with_pieces) {
     std::vector<int> ids = in.prompt_ids_text;
-    if (ids.empty()) ids = prompt_ids_raw(in, ctx.backend->tokenizer());
-    Tokenizer& tok = ctx.backend->tokenizer();
-    return HttpResult{200, json{{"tokens", tokens_json(tok, ids, with_pieces)}, {"count", count}}};
+    Tokenizer&       tok = ctx.backend->tokenizer();
+    const int        bos = tok.bos_id();
+    const bool       add_bos = ctx.backend->template_caps().value("add_bos", false);
+    if (add_bos && bos >= 0 && in.prompt_ids.empty() && (ids.empty() || ids.front() != bos))
+        ids.insert(ids.begin(), bos);
+    return HttpResult{200, json{{"tokens", tokens_json(tok, ids, with_pieces)},
+                                {"count", static_cast<int>(ids.size())}}};
 }
 
 }  // namespace
@@ -95,9 +116,16 @@ HttpResult tokenize_request(const Context& ctx, const json& body) {
     // 2. a chat body: the chat route's own prepare, so the count is the prompt
     //    that would be decoded.
     if (body.contains("messages")) {
+        // Parse and refuse an image before the prepare renders the prompt: an
+        // image's tokens cannot be counted here, and the render is the work, so
+        // the cheaper refusal comes first. The 400 keeps prepare_chat's shape.
+        ChatRequest req;
+        if (auto err = parse_chat_request(body, req))
+            return HttpResult{400, invalid_request(*err)};
+        if (auto err = refuse_images(req)) return *err;
         PreparedChat prep;
-        if (auto err = prepare_chat(ctx, body, prep)) return *err;
-        return count_result(ctx, prep.input, prep.prompt_tokens, with_pieces);
+        if (auto err = prepare_from_chat(ctx, std::move(req), prep)) return *err;
+        return count_result(ctx, prep.input, with_pieces);
     }
 
     // 3. a Responses body: the same prepare the Responses route calls, but a
@@ -107,9 +135,15 @@ HttpResult tokenize_request(const Context& ctx, const json& body) {
     if (body.contains("input")) {
         ResponseRequest req;
         if (auto err = parse_response_request(body, req)) return *err;
+        if (auto err = refuse_images(req.chat)) return *err;   // the new input
         PreparedResponse prep;
         if (auto err = prepare_response(ctx, std::move(req), prep, /*evict_on_error=*/false)) return *err;
-        return count_result(ctx, prep.chat.input, prep.chat.prompt_tokens, with_pieces);
+        // A previous_response_id continuation merges the stored prefix inside
+        // prepare, and a stored message keeps its image parts: refuse again on
+        // the request that was actually prepared, or the count would be short
+        // by every image token the projector would have added.
+        if (auto err = refuse_images(prep.chat.req)) return *err;
+        return count_result(ctx, prep.chat.input, with_pieces);
     }
 
     return bad_field("the body needs `content`, `messages` or `input`");
@@ -119,23 +153,35 @@ HttpResult detokenize_request(const Context& ctx, const json& body) {
     if (!body.is_object()) return bad_field("the body must be a JSON object");
     int lane = -1;
     if (auto err = resolve_lane(ctx, model_of(body), lane)) return *err;
-    if (!body.contains("tokens")) return bad_field("the body needs `tokens`", "tokens");
-    std::vector<int> ids;
-    try {
-        ids = body["tokens"].get<std::vector<int>>();
-    } catch (const json::exception&) {
+    if (!body.contains("tokens") || !body["tokens"].is_array())
         return bad_field("tokens must be an array of integers", "tokens");
-    }
-    // An id past the vocabulary would read out of range in decode_one (the
-    // llama backend throws, which the exception handler would turn into a 500
-    // with an "unhandled exception" line). A tokenizer that cannot enumerate
-    // (vocab_size 0) offers nothing to validate against and keeps the old path.
-    const int vocab = ctx.backend->tokenizer().vocab_size();
-    if (vocab > 0) {
-        for (int id : ids) {
-            if (id < 0 || id >= vocab)
+    // Per element, never get<std::vector<int>>(): that converts a float (1.5 ->
+    // 1) and wraps an integer past int32 (2^32 + 5 -> 5), which then passes the
+    // vocabulary check. is_number_integer() rejects a bool; the int64/uint64
+    // range is checked before the vocabulary range. An id past the vocabulary
+    // would read out of range in decode_one (the llama backend throws, which
+    // the exception handler would turn into a 500 with an "unhandled exception"
+    // line). A tokenizer that cannot enumerate (vocab_size 0) offers nothing to
+    // validate against and keeps the old path.
+    const int        vocab = ctx.backend->tokenizer().vocab_size();
+    std::vector<int> ids;
+    ids.reserve(body["tokens"].size());
+    for (const json& t : body["tokens"]) {
+        if (!t.is_number_integer())
+            return bad_field("tokens must be an array of integers", "tokens");
+        int64_t v = 0;
+        if (t.is_number_unsigned()) {
+            const uint64_t u = t.get<uint64_t>();
+            if (u > static_cast<uint64_t>(INT32_MAX))
                 return bad_field("tokens must be ids this vocabulary serves", "tokens");
+            v = static_cast<int64_t>(u);
+        } else {
+            v = t.get<int64_t>();
         }
+        if (v < 0 || v > static_cast<int64_t>(INT32_MAX) ||
+            (vocab > 0 && v >= static_cast<int64_t>(vocab)))
+            return bad_field("tokens must be ids this vocabulary serves", "tokens");
+        ids.push_back(static_cast<int>(v));
     }
     // Tokenizer::decode concatenates decode_one, which renders a special token
     // as its text (llama-server's default unparse_special=true).

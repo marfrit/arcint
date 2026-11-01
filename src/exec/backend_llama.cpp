@@ -443,6 +443,9 @@ public:
     }
 
     int eos_id() const override { return llama_vocab_eos(v_); }
+    // LLAMA_TOKEN_NULL (-1) when the vocabulary has no BOS, which is the
+    // "nothing to prepend" value the count path expects.
+    int bos_id() const override { return llama_vocab_bos(v_); }
 
     int vocab_size() const override { return llama_vocab_n_tokens(v_); }
 
@@ -1309,7 +1312,15 @@ public:
                     {"supports_object_arguments", c.requires_object_arguments},
                     {"supports_string_content", !c.requires_typed_content},
                     {"supports_typed_content", c.requires_typed_content},
-                    {"supports_preserve_reasoning", template_src_.find("reasoning_content") != std::string::npos}};
+                    {"supports_preserve_reasoning", template_src_.find("reasoning_content") != std::string::npos},
+                    // Not the same fact: the template reads the preserve_thinking
+                    // variable (the coder template's own switch), whether or not
+                    // it renders reasoning_content at all.
+                    {"supports_preserve_thinking", template_src_.find("preserve_thinking") != std::string::npos},
+                    // The vocab's BOS rule: the generation prepends BOS when the
+                    // rendered template did not write it, and /tokenize's count
+                    // applies the same rule. A proxy reads it here.
+                    {"add_bos", llama_vocab_get_add_bos(vocab_)}};
     }
 
     std::string render_chat(const ChatRequest& req) const override {
@@ -1317,7 +1328,15 @@ public:
         inputs.messages = chat_messages_json(req, template_->original_caps().requires_object_arguments);
         inputs.tools    = chat_tools_json(req);
         inputs.add_generation_prompt = true;
-        if (req.has_enable_thinking) inputs.extra_context = json{{"enable_thinking", req.enable_thinking}};
+        // The one construction of the template context (core/chat.cpp): the
+        // typed switches plus the chat_template_kwargs passthrough, with the
+        // keys minja's own context sets already refused by parse. A request
+        // that sent neither leaves extra_context unset, byte-identical to the
+        // render before the passthrough existed.
+        std::string ctx_error;
+        const json  extra = template_context(req, ctx_error);
+        if (!ctx_error.empty()) log::warn("req", "%s", ctx_error.c_str());
+        if (!extra.empty()) inputs.extra_context = extra;
         minja::chat_template_options opts;
         opts.apply_polyfills = false;   // the GGUF's template is the contract (§3.7)
         return template_->apply(inputs, opts);

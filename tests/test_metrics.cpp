@@ -133,6 +133,9 @@ TEST(metrics_route_label_folds_to_bounded_values) {
              std::string("/v1/responses/:id/cancel"));
     CHECK_EQ(api::metrics_route_label("/v1/responses/resp-7"), std::string("other"));
     CHECK_EQ(api::metrics_route_label("/scanned/../../../etc/passwd"), std::string("other"));
+    // The token routes are served, so they must not fold into "other".
+    CHECK_EQ(api::metrics_route_label("/tokenize"), std::string("/tokenize"));
+    CHECK_EQ(api::metrics_route_label("/detokenize"), std::string("/detokenize"));
 }
 
 TEST(metrics_render_carries_counters_and_gauges) {

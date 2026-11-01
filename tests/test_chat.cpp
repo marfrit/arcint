@@ -1,7 +1,10 @@
+#include "api/handlers.h"
 #include "core/chat.h"
 #include "core/reasoning.h"
 #include "core/markers.h"
 #include "harness.h"
+
+#include <stdexcept>
 
 using namespace lgc;
 using nlohmann::json;
@@ -11,6 +14,46 @@ json minimal_chat() {
     return json{{"model", "qwen3.8-27b"},
                 {"messages", json::array({{{"role", "user"}, {"content", "hi"}}})}};
 }
+
+// A backend whose template render throws, as minja does on a value it cannot
+// use: prepare_chat must answer a 400 (the request made the template fail), not
+// propagate the exception and not a 500 (that is an engine fault).
+class ThrowTokenizer final : public Tokenizer {
+public:
+    std::vector<int> encode(std::string_view) override { return {}; }
+    std::string      decode(const std::vector<int>&) override { return {}; }
+    std::string      decode_one(int) override { return {}; }
+    int              eos_id() const override { return 0; }
+};
+
+class ThrowingTemplateBackend final : public Backend {
+public:
+    // true: an engine fault (logic_error) that must not be read as the client's
+    // 400; false: a minja runtime_error, the template's own failure.
+    bool logic_error = false;
+    ThrowingTemplateBackend() {
+        st.id          = "stub";
+        st.served_id   = "stub";
+        st.loaded      = true;
+        st.stub        = true;
+        st.n_ctx       = 4096;
+        st.n_ctx_train = kStubNCtxTrain;
+    }
+    const ModelStatus& status() const override { return st; }
+    Tokenizer&         tokenizer() override { return tok_; }
+    std::string        render_chat(const ChatRequest&) const override {
+        if (logic_error) throw std::logic_error("an engine bug inside the render");
+        throw std::runtime_error("the template rejected the request");
+    }
+    FinishReason generate(const GenerationInput&, int, const TokenCallback&,
+                          GenerationStats&) override {
+        return FinishReason::Stop;
+    }
+
+private:
+    ThrowTokenizer tok_;
+    ModelStatus    st;
+};
 }  // namespace
 
 TEST(chat_parses_a_minimal_request) {
@@ -229,6 +272,200 @@ TEST(chat_honours_enable_thinking) {
 
     const std::string prompt = render_chatml_stub(req);
     CHECK(prompt.find(std::string(markers::kThinkOpen)) != std::string::npos);
+}
+
+TEST(chat_preserve_thinking_is_read) {
+    json body = minimal_chat();
+    body["chat_template_kwargs"] = json{{"preserve_thinking", true}};
+    ChatRequest req;
+    CHECK(!parse_chat_request(body, req).has_value());
+    CHECK(req.has_preserve_thinking);
+    CHECK(req.preserve_thinking);
+}
+
+TEST(chat_preserve_thinking_must_be_a_boolean) {
+    json body = minimal_chat();
+    body["chat_template_kwargs"] = json{{"preserve_thinking", 3}};
+    ChatRequest req;
+    const auto err = parse_chat_request(body, req);
+    CHECK(err.has_value());
+    if (err.has_value())
+        CHECK(err->find("chat_template_kwargs.preserve_thinking") != std::string::npos);
+}
+
+TEST(chat_unknown_template_kwargs_are_passed_through) {
+    // llama-server's dialect: chat_template_kwargs is a passthrough, so an
+    // unknown key is not refused. It reaches the template unchanged (the stub
+    // ignores it, like a template without that key), and the typed switches
+    // are still read.
+    json body = minimal_chat();
+    body["chat_template_kwargs"] = json{{"enable_thinking", false}, {"some_template_key", true}};
+    ChatRequest req;
+    CHECK(!parse_chat_request(body, req).has_value());
+    CHECK(req.has_enable_thinking && !req.enable_thinking);
+    CHECK(req.chat_template_kwargs.contains("some_template_key"));
+    if (req.chat_template_kwargs.contains("some_template_key"))
+        CHECK(req.chat_template_kwargs["some_template_key"].get<bool>());
+    ChatRequest without = req;
+    without.chat_template_kwargs.erase("some_template_key");
+    CHECK_EQ(render_chatml_stub(req), render_chatml_stub(without));
+}
+
+TEST(template_context_is_empty_without_a_request) {
+    ChatRequest req;
+    std::string err;
+    const json  ctx = template_context(req, err);
+    CHECK(err.empty());
+    CHECK(ctx.empty());   // the render can then leave extra_context unset
+}
+
+TEST(template_context_carries_the_typed_switches_and_the_passthrough) {
+    ChatRequest req;
+    req.has_enable_thinking      = true;
+    req.enable_thinking          = false;
+    req.has_preserve_thinking    = true;
+    req.preserve_thinking        = true;
+    req.chat_template_kwargs     = json{{"some_template_key", 42}, {"another", "x"}};
+    std::string err;
+    const json  ctx = template_context(req, err);
+    CHECK(err.empty());
+    CHECK_EQ(ctx.value("enable_thinking", json()), json(false));
+    CHECK_EQ(ctx.value("preserve_thinking", json()), json(true));
+    CHECK_EQ(ctx.value("some_template_key", json()), json(42));   // unchanged
+    CHECK_EQ(ctx.value("another", json()), json("x"));
+    CHECK(!ctx.contains("messages"));
+}
+
+TEST(template_context_refuses_reserved_keys) {
+    // The context keys minja sets itself: a client may not override them.
+    static constexpr const char* kReserved[] = {"messages", "add_generation_prompt", "bos_token",
+                                                "eos_token", "strftime_now", "tools"};
+    for (const char* key : kReserved) {
+        ChatRequest req;
+        req.chat_template_kwargs = json{{key, "x"}};
+        std::string err;
+        const json  ctx = template_context(req, err);
+        CHECK(!err.empty());
+        if (!err.empty()) CHECK(err.find(key) != std::string::npos);
+        CHECK(!ctx.contains(key));   // the engine's own value wins
+    }
+}
+
+TEST(chat_refuses_reserved_template_context_kwargs) {
+    static constexpr const char* kReserved[] = {"messages", "add_generation_prompt", "bos_token",
+                                                "eos_token", "strftime_now", "tools"};
+    for (const char* key : kReserved) {
+        json body = minimal_chat();
+        body["chat_template_kwargs"] = json{{key, "x"}};
+        ChatRequest req;
+        const auto  err = parse_chat_request(body, req);
+        CHECK(err.has_value());
+        if (err.has_value()) {
+            CHECK(err->find("chat_template_kwargs.") != std::string::npos);
+            CHECK(err->find(key) != std::string::npos);
+        }
+    }
+}
+
+// minja's Context::builtins() (third_party/minja/minja.hpp): the template's
+// own functions. A chat_template_kwargs key that names one shadows it on the
+// child context and makes a template that calls it throw, so the names are
+// reserved too. The table is read from that function.
+static constexpr const char* kMinjaBuiltins[] = {
+    "==",       "count",  "default",   "dictsort", "e",        "equalto",
+    "escape",   "in",     "indent",    "int",      "items",    "join",
+    "joiner",   "last",   "length",    "list",     "lower",    "map",
+    "namespace", "raise_exception", "range", "reject", "rejectattr", "safe",
+    "select",   "selectattr", "string", "tojson",  "trim",     "unique",
+    "upper",
+};
+
+TEST(template_context_refuses_builtin_keys) {
+    for (const char* key : kMinjaBuiltins) {
+        ChatRequest req;
+        req.chat_template_kwargs = json{{key, 1}};
+        std::string err;
+        const json  ctx = template_context(req, err);
+        CHECK(!err.empty());
+        if (!err.empty()) CHECK(err.find(key) != std::string::npos);
+        CHECK(!ctx.contains(key));
+    }
+}
+
+TEST(chat_refuses_builtin_template_context_kwargs) {
+    for (const char* key : kMinjaBuiltins) {
+        json body = minimal_chat();
+        body["chat_template_kwargs"] = json{{key, 1}};
+        ChatRequest req;
+        const auto  err = parse_chat_request(body, req);
+        CHECK(err.has_value());
+        if (err.has_value()) CHECK(err->find(key) != std::string::npos);
+    }
+}
+
+TEST(chat_template_render_error_is_a_400) {
+    Config                 cfg;
+    ThrowingTemplateBackend backend;
+    api::SlotPool          slots(1);
+    api::Context           ctx{&cfg, &backend, &slots};
+
+    json body = json{{"messages", json::array({{{"role", "user"}, {"content", "hi"}}})}};
+    // The current tree lets the render exception escape prepare_chat; the case
+    // pins the 400. A propagated throw leaves `err` unset, which is the red.
+    std::optional<api::HttpResult> err;
+    try {
+        api::PreparedChat prep;
+        err = api::prepare_chat(ctx, body, prep);
+    } catch (const std::exception&) {
+    }
+    CHECK(err.has_value());
+    if (err.has_value()) CHECK_EQ(err->status, 400);
+}
+
+TEST(chat_template_render_engine_fault_is_not_a_400) {
+    // Only a minja runtime_error is the template's own failure. A logic_error
+    // (or bad_alloc) is an engine fault: it must not be blamed on the request,
+    // it propagates to the route's 500 handler.
+    Config                 cfg;
+    ThrowingTemplateBackend backend;
+    backend.logic_error = true;
+    api::SlotPool slots(1);
+    api::Context  ctx{&cfg, &backend, &slots};
+
+    json body = json{{"messages", json::array({{{"role", "user"}, {"content", "hi"}}})}};
+    bool propagated = false;
+    try {
+        api::PreparedChat prep;
+        const auto        err = api::prepare_chat(ctx, body, prep);
+        CHECK(!err.has_value() || err->status != 400);
+    } catch (const std::logic_error&) {
+        propagated = true;
+    }
+    CHECK(propagated);
+}
+
+TEST(chat_render_stub_preserve_thinking_keeps_earlier_reasoning) {
+    ChatRequest req;
+    CHECK(!parse_chat_request(minimal_chat(), req).has_value());
+    // An assistant turn with reasoning BEFORE a later user message: the rule
+    // hides it unless preserve_thinking is set.
+    ChatMessage a;
+    a.role      = "assistant";
+    a.content   = "first answer";
+    a.reasoning = "REASON-OLD";
+    ChatMessage u;
+    u.role    = "user";
+    u.content = "steer";
+    req.messages.push_back(a);
+    req.messages.push_back(u);
+
+    const std::string off = render_chatml_stub(req);
+    CHECK(off.find("REASON-OLD") == std::string::npos);
+    req.preserve_thinking     = true;
+    req.has_preserve_thinking = true;
+    const std::string on = render_chatml_stub(req);
+    CHECK(on.find("REASON-OLD") != std::string::npos);
+    CHECK(off != on);
 }
 
 TEST(chat_stream_options_include_usage) {

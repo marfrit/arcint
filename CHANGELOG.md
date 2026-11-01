@@ -34,6 +34,17 @@ The serving-ops package.
   `/detokenize` takes `{tokens}` and returns `{content}`, special tokens
   rendered as text (llama-server's default `unparse_special=true`). The `model`
   field picks the lane exactly as the generation routes do.
+- **Thinking replay (`preserve_thinking`)**: `chat_template_kwargs.preserve_thinking`
+  on Chat Completions and `arcint.preserve_thinking` on Responses keep every
+  assistant turn's thinking, not only the turns after the last user query, so a
+  steering message does not drop a running tool loop's reasoning (a UAT
+  measured a 10.6 % cache hit without it). Absent renders exactly as before;
+  the token-mode prompt hash covers the flag. The coder template reads
+  `preserve_thinking`; `/props`' `chat_template_caps` reports
+  `supports_preserve_thinking` beside `supports_preserve_reasoning`.
+  `chat_template_kwargs` stays a passthrough (llama-server's dialect):
+  `enable_thinking` and `preserve_thinking` are type-checked, every other key
+  reaches the template unchanged and is not refused.
 
 ## Unreleased
 

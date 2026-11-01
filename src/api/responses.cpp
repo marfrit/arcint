@@ -501,6 +501,14 @@ std::optional<HttpResult> read_arcint(const json& v, ResponseRequest& req) {
             req.timings = it.value().get<bool>();
             continue;
         }
+        if (it.key() == "preserve_thinking") {
+            if (!it.value().is_boolean())
+                return invalid("arcint.preserve_thinking must be a boolean",
+                               "arcint.preserve_thinking");
+            req.chat.preserve_thinking     = it.value().get<bool>();
+            req.chat.has_preserve_thinking = true;
+            continue;
+        }
         if (it.key() == "renderer_hash") {
             if (!it.value().is_string())
                 return invalid("arcint.renderer_hash must be a string", "arcint.renderer_hash");

@@ -398,13 +398,36 @@ std::optional<std::string> parse_chat_request(const json& body, ChatRequest& out
     if (body.contains("chat_template_kwargs") && !body["chat_template_kwargs"].is_null()) {
         const json& kw = body["chat_template_kwargs"];
         if (!kw.is_object()) return "chat_template_kwargs must be an object";
-        if (kw.contains("enable_thinking") && !kw["enable_thinking"].is_null()) {
-            if (!kw["enable_thinking"].is_boolean()) {
-                return "chat_template_kwargs.enable_thinking must be a boolean";
+        // llama-server's dialect: chat_template_kwargs is a passthrough to the
+        // template, so its keys are template-specific and an unknown key is not
+        // refused. Every key reaches extra_context unchanged; the two switches
+        // arcint reads itself are type-checked here. A null value reads as
+        // absent, as it always did.
+        for (auto it = kw.begin(); it != kw.end(); ++it) {
+            if (it.key() == "enable_thinking") {
+                if (it.value().is_null()) continue;
+                if (!it.value().is_boolean())
+                    return "chat_template_kwargs.enable_thinking must be a boolean";
+                req.enable_thinking     = it.value().get<bool>();
+                req.has_enable_thinking = true;
+            } else if (it.key() == "preserve_thinking") {
+                if (it.value().is_null()) continue;
+                if (!it.value().is_boolean())
+                    return "chat_template_kwargs.preserve_thinking must be a boolean";
+                req.preserve_thinking     = it.value().get<bool>();
+                req.has_preserve_thinking = true;
             }
-            req.enable_thinking     = kw["enable_thinking"].get<bool>();
-            req.has_enable_thinking = true;
         }
+        json passthrough = json::object();
+        for (auto it = kw.begin(); it != kw.end(); ++it)
+            if (!it.value().is_null()) passthrough[it.key()] = it.value();
+        req.chat_template_kwargs = std::move(passthrough);
+        // One construction, one reserved-key list: the keys minja's context
+        // sets itself are refused by name (a client must not override the
+        // engine's messages, tools or generation prompt).
+        std::string ctx_error;
+        (void)template_context(req, ctx_error);
+        if (!ctx_error.empty()) return ctx_error;
     }
 
     out = std::move(req);
@@ -533,6 +556,51 @@ json tool_call_arguments_for_template(const std::string& arguments, bool templat
     return json(arguments);
 }
 
+bool reserved_template_context_key(std::string_view key) {
+    // The names minja's chat-template context sets before it merges
+    // extra_context (third_party/minja/chat-template.hpp, ChatTemplate::apply):
+    // messages and add_generation_prompt from Context::make, bos_token and
+    // eos_token, strftime_now when the clock is wired, tools when the request
+    // declared any. A passthrough key that names one would override the
+    // engine's own value.
+    static constexpr std::string_view kReserved[] = {
+        // The keys minja sets on the render context itself (chat-template.hpp,
+        // apply()): the engine's own values, never the client's.
+        "messages", "add_generation_prompt", "bos_token", "eos_token", "strftime_now", "tools",
+        // The builtins (minja.hpp, Context::builtins()). extra_context is set on
+        // a child of that context, so a key naming one shadows the builtin and
+        // a template that calls it throws.
+        "==", "count", "default", "dictsort", "e", "equalto", "escape", "in", "indent",
+        "int", "items", "join", "joiner", "last", "length", "list", "lower", "map",
+        "namespace", "raise_exception", "range", "reject", "rejectattr", "safe", "select",
+        "selectattr", "string", "tojson", "trim", "unique", "upper",
+    };
+    for (std::string_view r : kReserved)
+        if (key == r) return true;
+    return false;
+}
+
+nlohmann::json template_context(const ChatRequest& req, std::string& error) {
+    error.clear();
+    nlohmann::json extra = nlohmann::json::object();
+    if (req.chat_template_kwargs.is_object()) {
+        for (auto it = req.chat_template_kwargs.begin(); it != req.chat_template_kwargs.end(); ++it) {
+            if (reserved_template_context_key(it.key())) {
+                if (error.empty())
+                    error = "chat_template_kwargs." + it.key() +
+                            " is reserved by the template context (the engine sets it); remove it";
+                continue;
+            }
+            log::debug("req", "chat_template_kwargs.%s reaches the template context",
+                       it.key().c_str());
+            extra[it.key()] = it.value();
+        }
+    }
+    if (req.has_enable_thinking) extra["enable_thinking"] = req.enable_thinking;
+    if (req.has_preserve_thinking) extra["preserve_thinking"] = req.preserve_thinking;
+    return extra;
+}
+
 std::string render_chatml_stub(const ChatRequest& req) {
     std::string out;
 
@@ -554,8 +622,10 @@ std::string render_chatml_stub(const ChatRequest& req) {
 
     // The Qwen3-family rule the stub mirrors so the replay path is tested: an
     // assistant turn AFTER the last user message keeps its reasoning block; an
-    // earlier turn does not. The tags come from the shared table, never spelled
-    // here.
+    // earlier turn does not -- unless preserve_thinking is set, when every
+    // assistant turn keeps it (the coder template's own rule, so a steering
+    // message does not drop the running tool loop's thinking). The tags come
+    // from the shared table, never spelled here.
     size_t last_user = req.messages.size();
     for (size_t i = 0; i < req.messages.size(); ++i)
         if (req.messages[i].role == "user") last_user = i;
@@ -565,7 +635,9 @@ std::string render_chatml_stub(const ChatRequest& req) {
         out += markers::kTurnStart;
         out += m.role == "developer" ? "system" : m.role;
         out += "\n";
-        if (m.role == "assistant" && i > last_user && !m.reasoning.empty()) {
+        const bool replay_reasoning = m.role == "assistant" && !m.reasoning.empty() &&
+                                      (req.preserve_thinking || i > last_user);
+        if (replay_reasoning) {
             const auto& pairs = think_tag_pairs(false);
             if (!pairs.empty()) {
                 out += pairs[0].first;
