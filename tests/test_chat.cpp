@@ -28,6 +28,9 @@ public:
 
 class ThrowingTemplateBackend final : public Backend {
 public:
+    // true: an engine fault (logic_error) that must not be read as the client's
+    // 400; false: a minja runtime_error, the template's own failure.
+    bool logic_error = false;
     ThrowingTemplateBackend() {
         st.id          = "stub";
         st.served_id   = "stub";
@@ -39,6 +42,7 @@ public:
     const ModelStatus& status() const override { return st; }
     Tokenizer&         tokenizer() override { return tok_; }
     std::string        render_chat(const ChatRequest&) const override {
+        if (logic_error) throw std::logic_error("an engine bug inside the render");
         throw std::runtime_error("the template rejected the request");
     }
     FinishReason generate(const GenerationInput&, int, const TokenCallback&,
@@ -416,6 +420,28 @@ TEST(chat_template_render_error_is_a_400) {
     }
     CHECK(err.has_value());
     if (err.has_value()) CHECK_EQ(err->status, 400);
+}
+
+TEST(chat_template_render_engine_fault_is_not_a_400) {
+    // Only a minja runtime_error is the template's own failure. A logic_error
+    // (or bad_alloc) is an engine fault: it must not be blamed on the request,
+    // it propagates to the route's 500 handler.
+    Config                 cfg;
+    ThrowingTemplateBackend backend;
+    backend.logic_error = true;
+    api::SlotPool slots(1);
+    api::Context  ctx{&cfg, &backend, &slots};
+
+    json body = json{{"messages", json::array({{{"role", "user"}, {"content", "hi"}}})}};
+    bool propagated = false;
+    try {
+        api::PreparedChat prep;
+        const auto        err = api::prepare_chat(ctx, body, prep);
+        CHECK(!err.has_value() || err->status != 400);
+    } catch (const std::logic_error&) {
+        propagated = true;
+    }
+    CHECK(propagated);
 }
 
 TEST(chat_render_stub_preserve_thinking_keeps_earlier_reasoning) {
