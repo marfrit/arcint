@@ -866,16 +866,34 @@ absent flag keeps the response byte-identical.
 `--api-key KEY` (or `--api-key-file PATH`, read once at boot with exactly one
 trailing newline stripped) makes every route but `/health` require
 `Authorization: Bearer <key>`; the presented key is hashed and the sha256
-digests are compared in constant time. A refused request is a 401 with the
-OpenAI error envelope, code `invalid_api_key`; the CORS preflight is answered
-without the key, and the key is never logged and never appears on `/props`.
-`/props` and `/metrics` are behind the key too, so a proxy or unit manager
-that reads `/props` has to send the key once one is configured.
+digests are compared in constant time. The check runs in cpp-httplib's
+pre-routing handler, before the request body is read, so an unknown path is a
+401 too (no route probing) and an unauthenticated POST is refused unread. A
+refused request is a 401 with the OpenAI error envelope, code
+`invalid_api_key`, and a `WWW-Authenticate: Bearer` header; the CORS preflight
+is answered without the key, and the key is never logged and never appears on
+`/props`. `/props` and `/metrics` are behind the key too, so a proxy or unit
+manager that reads `/props` has to send the key once one is configured.
+
+A key file that yields an empty key (empty, or a single newline) or a key with
+a carriage return is a boot error, not a silently unauthenticated server; a key
+with leading or trailing whitespace, or with a percent sign, starts with a
+warning (cpp-httplib URL-decodes header values, so a `%xx` escape can never be
+presented verbatim). `--api-key` is visible to local users in `ps`/
+`/proc/<pid>/cmdline` and is meant for tests; deployments use
+`--api-key-file`. `/health` stays open for probes and reveals the served model
+id, an intended trade-off.
 
 `--tls-cert`/`--tls-key` serve HTTPS through httplib's OpenSSL server, but
 only in a build configured with `-DARCINT_TLS=ON`; the default build refuses
 the flags and does not find or link OpenSSL, so the package's Depends stay
-free of libssl. TLS is an extra arm, not the recipe's default.
+free of libssl. TLS is an extra arm, not the recipe's default. In an ON build
+a certificate or key OpenSSL cannot load is a boot error naming the flags
+(httplib frees its SSL_CTX, and the reason comes from OpenSSL's error queue),
+not a late "could not bind". The device-free gate builds with the option OFF,
+so the bad-certificate refusal and the HTTPS handshake are checked on the ON
+arm (an OpenSSL-enabled configure; the recipe's extra arm), not by the stub
+gate.
 
 ## Open on this engine
 

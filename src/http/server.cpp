@@ -5,6 +5,9 @@
 #include <utility>
 
 #include <httplib.h>
+#ifdef ARCINT_TLS
+#include <openssl/err.h>
+#endif
 
 #include "api/auth.h"
 #include "api/error.h"
@@ -104,19 +107,30 @@ struct HttpServer::Impl {
 
     void route();
 
-    // --api-key/--api-key-file: every route but /health (and the preflight)
-    // passes through here. No key configured is the identity. A refused request
-    // answers the OpenAI-shaped 401 and never reaches the route.
+    // --api-key/--api-key-file: the pre-routing handler calls this for every
+    // request; no key configured is the identity. A refused request answers
+    // the OpenAI-shaped 401 and never reaches the route or reads the body.
     bool authorized(const httplib::Request& req, httplib::Response& res) const;
-    httplib::Server::Handler guarding(httplib::Server::Handler handler);
 };
 
 HttpServer::Impl::Impl(const Config& c, api::Context& x) : cfg(c), ctx(x) {
     ctx.stop_flag = &stopping;
 #ifdef ARCINT_TLS
-    if (!cfg.tls_cert.empty())
+    if (!cfg.tls_cert.empty()) {
         svr = std::make_unique<httplib::SSLServer>(cfg.tls_cert.c_str(), cfg.tls_key.c_str());
-    else
+        if (!svr->is_valid()) {
+            // httplib frees its SSL_CTX when the certificate or key cannot be
+            // loaded; is_valid() then says so, and the OpenSSL error queue
+            // holds the reason. Without this the failure surfaced later as a
+            // misleading "could not bind".
+            char                reason[256] = {0};
+            const unsigned long err        = ERR_get_error();
+            if (err != 0) ERR_error_string_n(err, reason, sizeof reason);
+            throw std::runtime_error(log::format(
+                "could not enable TLS: --tls-cert/--tls-key could not be loaded%s%s",
+                reason[0] != '\0' ? ": " : "", reason));
+        }
+    } else
 #endif
         svr = std::make_unique<httplib::Server>();
 }
@@ -125,22 +139,15 @@ bool HttpServer::Impl::authorized(const httplib::Request& req, httplib::Response
     // No key: the surface is the one every build up to this one had.
     if (cfg.api_key_sha256.empty()) return true;
     if (api::bearer_matches(req.get_header_value("Authorization"), cfg.api_key_sha256)) return true;
+    // RFC 6750 §3: a bearer-protected resource names its scheme.
+    res.set_header("WWW-Authenticate", "Bearer");
+    // The pre-routing refusal does not read the request body; ask the client to
+    // close rather than leave those bytes in a connection it reuses.
+    res.set_header("Connection", "close");
     send_json(res, 401, api::error_body(
         "invalid API key: this server requires an `Authorization: Bearer <key>` header",
         "invalid_request_error", "invalid_api_key"));
     return false;
-}
-
-httplib::Server::Handler HttpServer::Impl::guarding(httplib::Server::Handler handler) {
-    return [this, handler = std::move(handler)](const httplib::Request& req,
-                                                httplib::Response&       res) {
-        // The same permissive CORS a secured browser client needs to read the
-        // response it was allowed to send; on the 401 too, so the error is
-        // readable rather than opaque.
-        if (!cfg.api_key_sha256.empty()) res.set_header("Access-Control-Allow-Origin", "*");
-        if (!authorized(req, res)) return;
-        handler(req, res);
-    };
 }
 
 void HttpServer::Impl::route() {
@@ -188,32 +195,37 @@ void HttpServer::Impl::route() {
         }
     });
 
-    // --api-key: the preflight is answered before the key check (a browser
-    // cannot attach Authorization to it), and only when a key is configured.
+    // --api-key: the check runs in httplib's pre-routing handler, before the
+    // request body is read (third_party/httplib.h's Server::routing(): the
+    // pre_routing_handler_ call sits above the expect_content() block), so an
+    // unauthenticated POST up to the 64 MiB payload cap is refused unread and
+    // an unknown path is a 401 rather than a route probe. /health stays open
+    // for probes -- it reveals the served model id, an intended trade-off --
+    // and a CORS preflight cannot carry the key.
     if (!cfg.api_key_sha256.empty()) {
+        // The permissive CORS a secured browser client needs to read the
+        // responses it was allowed to send (401s included).
+        svr->set_default_headers({{"Access-Control-Allow-Origin", "*"}});
         svr->Options(R"(.*)", [](const httplib::Request&, httplib::Response& res) {
             res.status = 204;
-            res.set_header("Access-Control-Allow-Origin", "*");
             res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
             res.set_header("Access-Control-Allow-Headers", "Authorization, Content-Type");
             res.set_header("Access-Control-Max-Age", "86400");
         });
+        svr->set_pre_routing_handler(
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (req.path == "/health" || req.method == "OPTIONS")
+                    return httplib::Server::HandlerResponse::Unhandled;
+                if (!authorized(req, res)) return httplib::Server::HandlerResponse::Handled;
+                return httplib::Server::HandlerResponse::Unhandled;
+            });
     }
-
-    // Every route but /health and the preflight passes through guarding(...):
-    // with no key it is the handler itself, with one it 401s first.
-    auto get = [this](const char* path, httplib::Server::Handler handler) {
-        svr->Get(path, guarding(std::move(handler)));
-    };
-    auto post = [this](const char* path, httplib::Server::Handler handler) {
-        svr->Post(path, guarding(std::move(handler)));
-    };
 
     svr->Get("/health", [this](const httplib::Request&, httplib::Response& res) {
         send_json(res, 200, api::health(ctx));
     });
 
-    get("/props", [this](const httplib::Request&, httplib::Response& res) {
+    svr->Get("/props", [this](const httplib::Request&, httplib::Response& res) {
         send_json(res, 200, api::props(ctx));
     });
 
@@ -221,14 +233,14 @@ void HttpServer::Impl::route() {
     // already computes. Off by default: without the flag the route does not
     // exist and the default surface is unchanged.
     if (ctx.cfg != nullptr && ctx.cfg->metrics) {
-        get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
+        svr->Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
             res.status = 200;
             res.set_content(ctx.metrics != nullptr ? ctx.metrics->render(ctx) : std::string(),
                             "text/plain; version=0.0.4; charset=utf-8");
         });
     }
 
-    get("/v1/models", [this](const httplib::Request&, httplib::Response& res) {
+    svr->Get("/v1/models", [this](const httplib::Request&, httplib::Response& res) {
         send_json(res, 200, api::models(ctx));
     });
 
@@ -238,7 +250,7 @@ void HttpServer::Impl::route() {
     // 404 `renderer_not_served` (the stub, --tts), never an empty bundle.
     // The body is the backend's cached serialization, served by reference; a
     // 4xx is the serialized error envelope (W6a review finding 3).
-    get("/v1/responses/renderer", [this](const httplib::Request&, httplib::Response& res) {
+    svr->Get("/v1/responses/renderer", [this](const httplib::Request&, httplib::Response& res) {
         const api::RendererBundle r = api::renderer_bundle(ctx);
         res.status = r.status;
         res.set_content(r.status == 200 && r.body != nullptr ? *r.body : r.error,
@@ -248,11 +260,11 @@ void HttpServer::Impl::route() {
     // The TTS surface (docs/milestone-1.2.0.md D4/D5). Both routes refuse from
     // prepare_speech with a clear message when the build has no --tts or no
     // audio-generation mmproj; the voice list is a names-only probe.
-    get("/v1/audio/voices", [this](const httplib::Request&, httplib::Response& res) {
+    svr->Get("/v1/audio/voices", [this](const httplib::Request&, httplib::Response& res) {
         send_json(res, 200, api::voices(ctx));
     });
 
-    post("/v1/audio/speech", [this](const httplib::Request& req, httplib::Response& res) {
+    svr->Post("/v1/audio/speech", [this](const httplib::Request& req, httplib::Response& res) {
         json body;
         if (!read_json(req, res, body)) return;
 
@@ -280,7 +292,7 @@ void HttpServer::Impl::route() {
         res.set_content(r.wav, "audio/wav");
     });
 
-    post("/v1/chat/completions", [this](const httplib::Request& req, httplib::Response& res) {
+    svr->Post("/v1/chat/completions", [this](const httplib::Request& req, httplib::Response& res) {
         json body;
         if (!read_json(req, res, body)) return;
 
@@ -347,7 +359,7 @@ void HttpServer::Impl::route() {
     // arcint extension — the spec defines no cancel endpoint or state). An
     // in-flight response: set the flag and answer the in-progress snapshot with
     // arcint.cancelling. A stored terminal response is 409; an unknown id 404.
-    post(R"(/v1/responses/([^/]+)/cancel)", [this](const httplib::Request& req,
+    svr->Post(R"(/v1/responses/([^/]+)/cancel)", [this](const httplib::Request& req,
                                                       httplib::Response& res) {
         const std::string id = req.matches[1];
         if (!ctx.responses) {
@@ -383,7 +395,7 @@ void HttpServer::Impl::route() {
     // prepare_response hands it to the chat route's own prepare_from_chat, and
     // run_response drives it exactly as run_chat does. Non-stream only in W1:
     // stream:true is refused by the parser with the spec's envelope.
-    post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
+    svr->Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
         json body;
         try {
             body = json::parse(req.body);
@@ -476,7 +488,7 @@ void HttpServer::Impl::route() {
             });
     });
 
-    post("/v1/completions", [this](const httplib::Request& req, httplib::Response& res) {
+    svr->Post("/v1/completions", [this](const httplib::Request& req, httplib::Response& res) {
         json body;
         if (!read_json(req, res, body)) return;
 

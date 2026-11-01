@@ -68,12 +68,47 @@ bool bearer_matches(std::string_view authorization_header, std::string_view key_
 }
 
 bool api_key_hygiene(std::string_view key, std::string& error, std::string& warning) {
-    (void)key;
-    (void)error;
-    (void)warning;
+    error.clear();
+    warning.clear();
+    if (key.empty()) {
+        // An empty --api-key-file (or one holding only a newline, whose one
+        // trailing newline read_api_key_file strips) would leave the server
+        // unauthenticated although the operator asked for auth.
+        error = "the API key is empty: an empty --api-key-file (or one holding only a newline) "
+                "would serve every request unauthenticated; fix the file or drop the key flags";
+        return false;
+    }
+    if (key.find('\r') != std::string_view::npos) {
+        error = "the API key contains a carriage return: it can never be presented in an HTTP "
+                "header (a CRLF key file?); write the file with a single LF or none";
+        return false;
+    }
+    auto is_space = [](char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
+    };
+    const bool edge_space = is_space(key.front()) || is_space(key.back());
+    const bool percent    = key.find('%') != std::string_view::npos;
+    if (edge_space && percent) {
+        warning = "the API key has leading or trailing whitespace and contains a percent sign "
+                  "('%'): clients must send it verbatim, and cpp-httplib URL-decodes header "
+                  "values, so neither form can be relied on";
+    } else if (edge_space) {
+        warning = "the API key has leading or trailing whitespace: clients must send it "
+                  "verbatim, and whitespace in a bearer token is easy to corrupt";
+    } else if (percent) {
+        warning = "the API key contains a percent sign ('%'): cpp-httplib URL-decodes header "
+                  "values, so a %xx escape can never match a client that sends it verbatim";
+    }
     return true;
 }
 
-void secure_scrub(std::string& s) { s.clear(); }
+void secure_scrub(std::string& s) {
+    if (!s.empty()) {
+        // volatile: the compiler may not drop the stores as dead.
+        volatile char* p = s.data();
+        for (size_t i = 0; i < s.size(); ++i) p[i] = '\0';
+    }
+    s.clear();
+}
 
 }  // namespace lgc::api

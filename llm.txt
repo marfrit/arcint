@@ -226,8 +226,15 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
   (llama-server's prompt_n/prompt_ms, predicted_n/predicted_ms, cache_n,
   draft_n, draft_accepted) on Chat Completions and Responses.
 - --api-key KEY | --api-key-file PATH: require `Authorization: Bearer KEY` on
-  every route but /health. The file is read once (exactly one trailing newline
-  stripped); the key is never logged and never on /props.
+  every route but /health (and the CORS preflight). The check runs before the
+  request body is read, so an unknown path is a 401 too (no route probing),
+  and a 401 names the scheme (WWW-Authenticate: Bearer). The file is read once
+  (exactly one trailing newline stripped); an empty or newline-only file, or a
+  key with a carriage return, is a boot error; edge whitespace or a percent
+  sign warns (cpp-httplib URL-decodes header values). The key is never logged
+  and never on /props; --api-key is visible in ps and /proc/<pid>/cmdline (test
+  use; deployments use the file). /health stays open for probes and reveals
+  the served model id.
 - --tls-cert FILE --tls-key FILE: HTTPS through httplib's OpenSSL server;
   needs a build configured with -DARCINT_TLS=ON (the default build refuses the
   flags and does not link OpenSSL).

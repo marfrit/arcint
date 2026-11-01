@@ -1333,9 +1333,11 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
         final_delta["reasoning_closed"] = !reasoning.in_reasoning();
     json final_extra = json::object();
     if (loop_guard_moved(stats)) final_extra["loop_guard"] = loop_guard_json(stats);
-    // arcint.timings: the final chunk carries the same object the non-streamed
-    // body does, on the same opt-in condition.
-    if (prep.req.timings) final_extra["timings"] = timings_json(stats);
+    // arcint.timings: with usage opted in, the object rides the usage chunk, so
+    // the last data frame carries both (llama-server's shape); without usage
+    // there is no such chunk, so it rides the finish chunk.
+    if (prep.req.timings && !prep.req.stream_include_usage)
+        final_extra["timings"] = timings_json(stats);
     if (!sse_send(write, chunk(json::array({{{"index", 0},
                                              {"delta", final_delta},
                                              {"finish_reason", finish}}}), final_extra))) {
@@ -1343,7 +1345,9 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     }
 
     if (prep.req.stream_include_usage) {
-        if (!sse_send(write, chunk(json::array(), json{{"usage", usage_json(stats)}}))) return;
+        json usage_extra = {{"usage", usage_json(stats)}};
+        if (prep.req.timings) usage_extra["timings"] = timings_json(stats);
+        if (!sse_send(write, chunk(json::array(), usage_extra))) return;
     }
     write("data: [DONE]\n\n");
 }

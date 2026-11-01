@@ -61,8 +61,9 @@ int main(int argc, char** argv) {
                    ARCINT_BUILD_TYPE, ARCINT_COMPILER);
 
     // --api-key/--api-key-file: the key is read once here, never logged and
-    // never published. The server keeps only its sha256 digest; the key itself
-    // is dropped before any request is served.
+    // never published. The server keeps only its sha256 digest; the plaintext
+    // is scrubbed before any request is served.
+    const bool key_configured = !cfg.api_key_file.empty() || !cfg.api_key.empty();
     if (!cfg.api_key_file.empty()) {
         std::string err;
         auto        key = lgc::api::read_api_key_file(cfg.api_key_file, err);
@@ -71,10 +72,17 @@ int main(int argc, char** argv) {
             return 2;
         }
         cfg.api_key = *key;
+        lgc::api::secure_scrub(*key);   // the file-read buffer
     }
-    if (!cfg.api_key.empty()) {
+    if (key_configured) {
+        std::string key_error, key_warning;
+        if (!lgc::api::api_key_hygiene(cfg.api_key, key_error, key_warning)) {
+            lgc::log::error("boot", "%s", key_error.c_str());
+            return 2;
+        }
+        if (!key_warning.empty()) lgc::log::warn("boot", "%s", key_warning.c_str());
         cfg.api_key_sha256 = lgc::sha256_hex(cfg.api_key);
-        cfg.api_key.clear();
+        lgc::api::secure_scrub(cfg.api_key);   // the parsed key
         lgc::log::info("boot", "%s", "an API key is configured: every route but /health needs "
                                  "`Authorization: Bearer <key>`");
     }
@@ -162,8 +170,16 @@ int main(int argc, char** argv) {
     std::vector<std::unique_ptr<lgc::api::SlotPool>> lane_pools;
     ctx.lanes = lgc::api::make_lanes(cfg, lane_pools);
 
-    lgc::HttpServer server(cfg, ctx);
-    g_server.store(&server);
+    // The TLS server construction can refuse a bad --tls-cert/--tls-key; that
+    // is a boot error, not a bind error later.
+    std::unique_ptr<lgc::HttpServer> server;
+    try {
+        server = std::make_unique<lgc::HttpServer>(cfg, ctx);
+    } catch (const std::exception& e) {
+        lgc::log::error("boot", "%s", e.what());
+        return 2;
+    }
+    g_server.store(server.get());
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
     std::signal(SIGPIPE, SIG_IGN);
@@ -181,7 +197,7 @@ int main(int argc, char** argv) {
     lgc::log::info("http", "listening on %s:%d | %d slot%s | serving %s", cfg.host.c_str(),
                    cfg.port, slots.total(), slots.total() == 1 ? "" : "s", serving.c_str());
 
-    if (!server.listen()) {
+    if (!server->listen()) {
         lgc::log::error("http", "could not bind %s:%d", cfg.host.c_str(), cfg.port);
         g_server.store(nullptr);
         return 1;

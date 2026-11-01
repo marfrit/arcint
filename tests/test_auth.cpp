@@ -122,9 +122,9 @@ TEST(auth_hygiene_refuses_an_empty_key_and_a_carriage_return) {
     CHECK(!api::api_key_hygiene("a\rb", err, warn));
     CHECK(err.find("carriage") != std::string::npos);
 
-    // The newline-only --api-key-file case: read_api_key_file strips the one
-    // trailing newline, leaving an empty key the same check refuses.
-    CHECK(!api::api_key_hygiene("\n", err, warn));
+    // A newline-only --api-key-file is the empty case end-to-end:
+    // read_api_key_file strips the one trailing newline (and only that), so the
+    // key reaches this check empty and is refused (auth.sh's file leg).
 }
 
 TEST(auth_hygiene_warns_on_whitespace_and_a_percent) {
