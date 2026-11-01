@@ -98,13 +98,17 @@ bool api_key_hygiene(std::string_view key, std::string& error, std::string& warn
             return false;
         }
     }
-    // A leading or trailing SPACE can never authenticate: cpp-httplib trims
-    // the header value, so the client's "Bearer <key>" reaches bearer_matches
-    // without it and the digest cannot match. Only a plain space can still be
-    // at an edge here (every other whitespace byte is a control character and
-    // already refused above).
+    // A leading or trailing SPACE can never authenticate, for two different
+    // reasons. A LEADING space is eaten by bearer_matches' own 1*SP loop: the
+    // client sends "Bearer  <key>", the extra space is consumed as part of the
+    // scheme separator, and the digest is taken over the key without it. A
+    // TRAILING space is trimmed by cpp-httplib's header parser before the value
+    // reaches arcint at all. Only a plain space can still be at an edge here
+    // (every other whitespace byte is a control character and already refused
+    // above).
     if (key.front() == ' ' || key.back() == ' ') {
-        error = "the API key starts or ends with a space: cpp-httplib trims header values, so a "
+        error = "the API key starts or ends with a space: a leading space is consumed by the "
+                "Bearer scheme's 1*SP separator, and cpp-httplib trims a trailing one, so a "
                 "client can never present it; remove the space from the file";
         return false;
     }

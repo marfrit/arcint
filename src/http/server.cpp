@@ -98,8 +98,17 @@ struct FlightGuard {
 // is not exempt. Both are documented in the campaign/docs as intended.
 bool auth_exempt(const httplib::Request& req) {
     if ((req.method == "GET" || req.method == "HEAD") && req.path == "/health") return true;
-    if (req.method == "OPTIONS" && !req.get_header_value("Access-Control-Request-Method").empty())
-        return true;
+    if (req.method == "OPTIONS") {
+        // A whitespace-only value is not a method and must not exempt: the
+        // header is trimmed here rather than left to cpp-httplib's parser, so
+        // the rule is arcint's own. A non-empty method may itself have
+        // surrounding spaces (a client that padded the value).
+        const std::string method = req.get_header_value("Access-Control-Request-Method");
+        size_t            b = 0, e = method.size();
+        while (b < e && (method[b] == ' ' || method[b] == '\t')) ++b;
+        while (e > b && (method[e - 1] == ' ' || method[e - 1] == '\t')) --e;
+        if (b < e) return true;
+    }
     return false;
 }
 

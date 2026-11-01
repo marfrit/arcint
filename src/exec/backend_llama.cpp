@@ -443,6 +443,9 @@ public:
     }
 
     int eos_id() const override { return llama_vocab_eos(v_); }
+    // LLAMA_TOKEN_NULL (-1) when the vocabulary has no BOS, which is the
+    // "nothing to prepend" value the count path expects.
+    int bos_id() const override { return llama_vocab_bos(v_); }
 
     int vocab_size() const override { return llama_vocab_n_tokens(v_); }
 
@@ -1309,7 +1312,11 @@ public:
                     {"supports_object_arguments", c.requires_object_arguments},
                     {"supports_string_content", !c.requires_typed_content},
                     {"supports_typed_content", c.requires_typed_content},
-                    {"supports_preserve_reasoning", template_src_.find("reasoning_content") != std::string::npos}};
+                    {"supports_preserve_reasoning", template_src_.find("reasoning_content") != std::string::npos},
+                    // The vocab's BOS rule: the generation prepends BOS when the
+                    // rendered template did not write it, and /tokenize's count
+                    // applies the same rule. A proxy reads it here.
+                    {"add_bos", llama_vocab_get_add_bos(vocab_)}};
     }
 
     std::string render_chat(const ChatRequest& req) const override {

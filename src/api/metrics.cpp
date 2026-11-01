@@ -17,7 +17,7 @@ const char* const kKnownRoutes[] = {
     "/health",         "/props",          "/metrics",
     "/v1/models",      "/v1/chat/completions", "/v1/completions",
     "/v1/responses",   "/v1/responses/renderer", "/v1/responses/:id/cancel",
-    "/v1/audio/speech", "/v1/audio/voices",
+    "/v1/audio/speech", "/v1/audio/voices", "/tokenize", "/detokenize",
 };
 
 // Prometheus label-value escaping: backslash, double quote, newline.

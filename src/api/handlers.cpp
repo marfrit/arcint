@@ -559,7 +559,8 @@ json props(const Context& ctx) {
         {"voices", static_cast<int>(st.voices.size())},
         {"endpoints",
          json::array({"/health", "/props", "/v1/chat/completions", "/v1/completions",
-                      "/v1/responses", "/v1/responses/{id}/cancel", "/v1/models", "/v1/audio/speech", "/v1/audio/voices"})}};
+                      "/v1/responses", "/v1/responses/{id}/cancel", "/v1/models", "/v1/audio/speech", "/v1/audio/voices",
+                      "/tokenize", "/detokenize"})}};
     // --metrics adds GET /metrics, so it is named here only when it is served.
     if (cfg.metrics) p["endpoints"].push_back("/metrics");
     // The Responses store's live state (docs/campaigns/feyntalk.md State):
