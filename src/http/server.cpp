@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 
 #include <httplib.h>
@@ -114,7 +115,6 @@ struct HttpServer::Impl {
 };
 
 HttpServer::Impl::Impl(const Config& c, api::Context& x) : cfg(c), ctx(x) {
-    ctx.stop_flag = &stopping;
 #ifdef ARCINT_TLS
     if (!cfg.tls_cert.empty()) {
         svr = std::make_unique<httplib::SSLServer>(cfg.tls_cert.c_str(), cfg.tls_key.c_str());
@@ -133,6 +133,9 @@ HttpServer::Impl::Impl(const Config& c, api::Context& x) : cfg(c), ctx(x) {
     } else
 #endif
         svr = std::make_unique<httplib::Server>();
+    // Only after the point that can throw: a failed construction must not
+    // leave the context pointing at this object's already-dead stop flag.
+    ctx.stop_flag = &stopping;
 }
 
 bool HttpServer::Impl::authorized(const httplib::Request& req, httplib::Response& res) const {
@@ -218,6 +221,16 @@ void HttpServer::Impl::route() {
                     return httplib::Server::HandlerResponse::Unhandled;
                 if (!authorized(req, res)) return httplib::Server::HandlerResponse::Handled;
                 return httplib::Server::HandlerResponse::Unhandled;
+            });
+        // httplib writes 100 Continue above routing, so an unauthenticated
+        // request with Expect: 100-continue would be answered 100 before the
+        // pre-routing 401. Answer the 401 here instead; httplib then closes
+        // the connection (the default arm) without reading the body.
+        svr->set_expect_100_continue_handler(
+            [this](const httplib::Request& req, httplib::Response& res) -> int {
+                if (req.path == "/health" || req.method == "OPTIONS") return 100;
+                if (!authorized(req, res)) return 401;
+                return 100;
             });
     }
 

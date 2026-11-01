@@ -884,6 +884,13 @@ presented verbatim). `--api-key` is visible to local users in `ps`/
 `--api-key-file`. `/health` stays open for probes and reveals the served model
 id, an intended trade-off.
 
+Because the 401 is written without draining an unread request body, a client
+that has already pushed more bytes than the socket buffer holds may see the
+connection reset instead of the 401. That is standard behaviour for a server
+that refuses before reading (nginx's `lingering_close` addresses the same
+class); a client that sent only headers, or awaited `Expect: 100-continue`,
+reads the 401 normally.
+
 `--tls-cert`/`--tls-key` serve HTTPS through httplib's OpenSSL server, but
 only in a build configured with `-DARCINT_TLS=ON`; the default build refuses
 the flags and does not find or link OpenSSL, so the package's Depends stay

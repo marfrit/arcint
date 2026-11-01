@@ -78,10 +78,17 @@ bool api_key_hygiene(std::string_view key, std::string& error, std::string& warn
                 "would serve every request unauthenticated; fix the file or drop the key flags";
         return false;
     }
-    if (key.find('\r') != std::string_view::npos) {
-        error = "the API key contains a carriage return: it can never be presented in an HTTP "
-                "header (a CRLF key file?); write the file with a single LF or none";
-        return false;
+    for (unsigned char c : key) {
+        // Anything below 0x20 and DEL can never be presented in an HTTP header
+        // (an embedded LF after read_api_key_file stripped the one trailing
+        // newline, a CR, a TAB). A CRLF key file and a hand-edited multi-line
+        // file are the usual causes.
+        if (c < 0x20 || c == 0x7f) {
+            error = "the API key contains a control character (below 0x20, or DEL): it can never "
+                    "be presented in an HTTP header; a CRLF key file or an embedded newline is "
+                    "the usual cause";
+            return false;
+        }
     }
     auto is_space = [](char c) {
         return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
