@@ -5142,6 +5142,15 @@ thread-local guard, no `size > (4u << 20)`, no chunk loop). Reds
 return moved after the wrap (`FAIL: a copy larger than the ring does not finish
 the ring`).
 
+
+**Window 47 (`measured-here`, Claude, 2026-11-01, the A770, the coder with its unit's flags, the 1.3.0 package
+against this branch's binary f3ec32b, two rounds alternated):** a 40,365-token prompt sent twice with different
+final questions; the second request hits 97.5 % of the prefix (39,337 tokens) and so takes the checkpoint
+restore. Time to the first streamed byte: request 1 (cold) package 48.04 / 48.22 s, branch 47.92 / 47.96 s;
+request 2 (restore) package 2.17 / 2.37 s, branch 2.07 / 2.07 s. The restore path does not regress under the
+bound. The coder's 0077 check is a no-op (Q4_K slots are not sampled); 0077's load cost is measured on
+Flash-Next in the release window.
+
 Card arms owed (each on the unit's own `--model`, `--mmproj`, `--device` and
 `--port` flags, collected as `UNIT_FLAGS`; the baseline is the `9f1ea8e` deb,
 the branch is this patch series' deb):
