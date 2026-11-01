@@ -135,9 +135,14 @@ HttpResult tokenize_request(const Context& ctx, const json& body) {
     if (body.contains("input")) {
         ResponseRequest req;
         if (auto err = parse_response_request(body, req)) return *err;
-        if (auto err = refuse_images(req.chat)) return *err;
+        if (auto err = refuse_images(req.chat)) return *err;   // the new input
         PreparedResponse prep;
         if (auto err = prepare_response(ctx, std::move(req), prep, /*evict_on_error=*/false)) return *err;
+        // A previous_response_id continuation merges the stored prefix inside
+        // prepare, and a stored message keeps its image parts: refuse again on
+        // the request that was actually prepared, or the count would be short
+        // by every image token the projector would have added.
+        if (auto err = refuse_images(prep.chat.req)) return *err;
         return count_result(ctx, prep.chat.input, with_pieces);
     }
 

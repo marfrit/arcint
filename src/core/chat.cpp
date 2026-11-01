@@ -564,7 +564,16 @@ bool reserved_template_context_key(std::string_view key) {
     // declared any. A passthrough key that names one would override the
     // engine's own value.
     static constexpr std::string_view kReserved[] = {
+        // The keys minja sets on the render context itself (chat-template.hpp,
+        // apply()): the engine's own values, never the client's.
         "messages", "add_generation_prompt", "bos_token", "eos_token", "strftime_now", "tools",
+        // The builtins (minja.hpp, Context::builtins()). extra_context is set on
+        // a child of that context, so a key naming one shadows the builtin and
+        // a template that calls it throws.
+        "==", "count", "default", "dictsort", "e", "equalto", "escape", "in", "indent",
+        "int", "items", "join", "joiner", "last", "length", "list", "lower", "map",
+        "namespace", "raise_exception", "range", "reject", "rejectattr", "safe", "select",
+        "selectattr", "string", "tojson", "trim", "unique", "upper",
     };
     for (std::string_view r : kReserved)
         if (key == r) return true;

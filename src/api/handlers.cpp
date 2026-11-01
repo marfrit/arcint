@@ -638,6 +638,22 @@ json voices(const Context& ctx) {
 // ---------------------------------------------------------------- prepare
 namespace {
 
+// The template render as an answer: a render that throws is the request's fault
+// (a passthrough value minja cannot use, a message shape the template rejects),
+// so it is a 400. An engine fault stays guarded()'s 500; only this call is
+// wrapped, so generation and the rest of the prepare keep their own handling.
+std::optional<HttpResult> render_template(const Context& ctx, const ChatRequest& req,
+                                          std::string& out) {
+    try {
+        out = ctx.backend->render_chat(req);
+    } catch (const std::exception& e) {
+        log::warn("req", "template render refused: %s", e.what());
+        return HttpResult{400, invalid_request(log::format(
+            "the chat template could not render this request: %s", e.what()))};
+    }
+    return std::nullopt;
+}
+
 std::optional<HttpResult> finish_prepare(const Context& ctx, int lane, const std::string& prompt,
                                          const SamplerOverrides& overrides,
                                          GenerationInput& input, int& prompt_tokens,
@@ -793,11 +809,11 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
         ChatRequest render_req = prep.req;
         const int   n_ctx      = lane_n_ctx(ctx, lane);
         const int   limit      = n_ctx > 0 ? n_ctx - fit->reserve : 0;
-        auto render = [&] { return ctx.backend->render_chat(render_req); };
+        auto render = [&](std::string& out) { return render_template(ctx, render_req, out); };
         auto tokenize = [&](const std::string& p) {
             return ctx.backend->tokenizer().encode(p);
         };
-        prompt = render();
+        if (auto err = render(prompt)) return *err;
         fit_ids = tokenize(prompt);
         const int before = static_cast<int>(fit_ids.size());
         int       tokens = before;
@@ -808,7 +824,8 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
             // the last user message) are cleared for the iteration but not
             // counted, and their unchanged render does not advance the count.
             while (n_ctx > 0 && tokens > limit && drop_oldest_reasoning(render_req.messages)) {
-                const std::string next = render();
+                std::string next;
+                if (auto err = render(next)) return *err;
                 // R2: compare the rendered bytes first. A hidden reasoning block
                 // (an assistant turn before the last user message) leaves the
                 // render unchanged, so the token count is not recomputed -- the
@@ -838,7 +855,7 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
         }
         fit_tokens = tokens;
     } else {
-        prompt = ctx.backend->render_chat(prep.req);
+        if (auto err = render_template(ctx, prep.req, prompt)) return *err;
     }
     // The template decides whether the answer starts inside a think block; the
     // split of reasoning from content below follows that, not a guess.
