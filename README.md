@@ -351,7 +351,11 @@ service's production flags, Flash-Next's expert cache included
   chat or Responses body it returns `{tokens, count}`, the prompt tokens the
   same request would decode, counted through the request's own prepare path.
   `/detokenize` takes `{tokens}` and returns `{content}`, special tokens as
-  text. Both are behind the same key as every other route.
+  text. Both are behind the same key as every other route. A prompt the lane
+  would refuse is refused by `/tokenize` too, with the count in the error
+  body's `prompt_tokens`; llama-server's `parse_special` is accepted and
+  ignored (specials are always parsed), and a count over a continuation leaves
+  the referenced stored response untouched.
 
 ## Scope
 

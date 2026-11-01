@@ -136,8 +136,12 @@
   /tokenize also takes a chat body (messages, tools) or a Responses body
   (input, instructions, tools) and returns {tokens, count}: the prompt the
   request would decode, counted through the request's own prepare path (one
-  tokenisation, never a second). POST /detokenize takes {tokens} and returns
-  {content}, special tokens rendered as text (unparse_special=true). The
+  tokenisation, never a second). A prompt the lane would refuse is refused by
+  /tokenize too, the count in the error body's prompt_tokens; a count over a
+  continuation does not evict the referenced stored response. POST /detokenize
+  takes {tokens} and returns {content}, special tokens rendered as text
+  (unparse_special=true); an id outside the vocabulary is a 400 naming tokens.
+  parse_special is accepted and ignored (specials are always parsed). The
   model field picks the lane as the generation routes do.
 - --served-model-name NAME sets the id /v1/models and /props report. The
   model object carries id, n_ctx (running), n_ctx_train, quant, lanes.
