@@ -2,9 +2,8 @@
 # ops-2 item 6: in an ARCINT_TLS build a bad --tls-cert/--tls-key must be
 # refused, and the refusal must come BEFORE the model load (the stub logs a
 # "stub | n_ctx" line when it loads). A build without ARCINT_TLS refuses the
-# flags at parse, so this script then passes with a note: the default unit
-# gate stays green and the TLS gate (`dirac-gate tls`, ctest -L unit in the
-# ARCINT_TLS build) runs the real assertion.
+# flags at parse; this script then exits 77 (SKIP), so the default unit gate
+# reads it as skipped and the ARCINT_TLS=ON gate arm runs the real assertion.
 set -uo pipefail
 
 BIN="${1:-}"
@@ -18,7 +17,7 @@ rc=$?
 
 if grep -q "ARCINT_TLS" <<<"$out"; then
   echo "tls: this build has no ARCINT_TLS (parse refuses the flags); the ON-arm check is skipped"
-  exit 0
+  exit 77
 fi
 
 fail=0
