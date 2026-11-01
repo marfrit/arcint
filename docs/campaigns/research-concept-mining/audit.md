@@ -399,22 +399,32 @@ answer by design.
 
 ## 10. PCIe copy discipline
 
-- **arcint status: has most, one leftover that matters at depth.** Built: 0047 stages small graph
-  inputs into a 32 MiB USM ring and enqueues without a wait, the scheduler waits once a split
-  (`code`: `ggml-opencl.cpp:12168-12200`, the cap `size > (4u << 20)`); 0042 keeps the swaps off the
-  compute queue; 0046 uploads every layer's tables in one write (`code`:
-  `llama-expert-cache.cpp:167-176`); 0032 copies bank tensors on a copy-only queue (`code`:
-  `ggml-opencl.cpp:27700-27706`) — a copy-only queue doing only copies, which is the reference's
+- **arcint status: the leftover is bounded.** Built: 0047 stages small graph inputs into a 32 MiB
+  USM ring and enqueues without a wait, the scheduler waits once a split (`code`: the staging write
+  in `ggml-opencl.cpp`); 0042 keeps the swaps off the compute queue; 0046 uploads every layer's
+  tables in one write (`code`: `llama-expert-cache.cpp`); 0032 copies bank tensors on a copy-only
+  queue (`code`: `ggml-opencl.cpp`) — a copy-only queue doing only copies, which is the reference's
   lesson. Measured: a verify's inputs 926-949 → 582-593 µs, a draft's 395-404 → 134-141, decode +1.1
   to +1.4 %; the coder (A770 behind the chipset) 1.93-2.02 ms → 133-255 µs an input, decode +14-15 %
   (`paper`, README 0047).
-  - **The leftover:** the staging cap is 4 MiB and the ring is 32 MiB, so any graph input above 4 MiB
-    is still a blocking write, and a ring wrap forces a `clFinish` (`code`: `:12166-12199`). At
-    Flash-Next's depth the QSA inputs are large: the indexer's `pool_mask` is f32 `[n_pool, n_tokens]`
-    (`code`: `qwen4exp.cpp:707`) and the `mask_all` path was sized at ~1 GiB for the scores at 131K
-    (`paper`, 0052's finding) — the masks and rotations are the ones the artifact's own note says
-    "take longer than a 1 KiB input" (`paper`). So per prompt chunk at depth there are still a few
-    big blocking writes. That is the audit's remaining piece.
+  - **The leftover, and its bound (0078, `code` + `measured-here`).** The old 4 MiB refusal made
+    every graph input above it a blocking write, and a ring wrap forced a `clFinish`. 0078 stages an
+    copy only when (a) the scheduler's graph-input marker is active (a thread-local marker around
+    `ggml_backend_sched_copy_input`) and (b) the whole copy fits the ring's free space without a
+    wrap. A checkpoint restore and `llama_state_seq_set_data` are not marked: they **get the old
+    blocking write** (1.3.0's 0047 staged their KV/recurrent chunks at or below 4 MiB), and the
+    restore timing before/after is a card arm owed before 0078 is equivalent. A CPU island's
+    host->device copy goes through the same scheduler function, so a non-INPUT copy up to the
+    ring's free space is staged too (`code`). A copy larger than the ring takes the old blocking
+    write: no split, no `clFinish` inside one write, no host memcpy where one DMA was. The f16 mask
+    at 200K depth, ubatch 512 (~200 MiB), is that case; six finishes and a 200 MiB memcpy were the
+    review's finding against the old chunk plan (`measured-here`). Device-free cells check both
+    bounds and their reds; the bytes are the blocking write's.
+  - **The ceiling at depth.** Flash-Next's QSA inputs are large: the indexer's `pool_mask` is f32
+    `[n_pool, n_tokens]` (`code`: `qwen4exp.cpp`) and the `mask_all` path was sized at ~1 GiB for the
+    scores at 131K (`paper`, 0052's finding) — the masks and rotations are the ones the artifact's
+    own note says "take longer than a 1 KiB input" (`paper`). With 0078 those stay blocking; the card
+    leg's count decides whether raising `GGML_OPENCL_STAGE_MB` above the depth's mask pays.
   - The counters: the card's copy engine was 81 % busy during decode and 2 % during prefill
     (`paper`, stage 5's fdinfo read), so the copy engine is not the prefill bound and the leftover's
     ceiling is decode-side at depth.
@@ -423,20 +433,24 @@ answer by design.
   queue, and its graph inputs go on the compute queue as non-blocking writes from a USM ring. Both
   OpenCL/SYCL; arcint has no async-copy/event primitive in the backend's device objects (`paper`:
   the backend has no events, stage 8), so a big write cannot be split and awaited at the split's
-  first kernel — that is what the leftover needs.
+  first kernel; 0078 keeps such a write whole and blocking rather than splitting it without a wait.
 - **Quality class: exact.** Copy discipline only; the staged bytes are the same bytes (the red case's
   stale ring answers garbage, which is the proof the path is exercised, `paper`).
 - **Units.** coder (A770, its link is slow: the biggest measured gain), agent, Flash-Next.
 - **Pricing measurement.** Count what still blocks: `GGML_SCHED_TIMING=1` plus the backend's own
   input-copy time on a 100k+ agent prefill and Flash-Next's 20k needle; the diff between "inputs a
   graph" with `GGML_OPENCL_STAGE_INPUTS=1` and `=0` per graph is the ceiling (the campaign's method,
-  `paper`). Then the default 4 MiB arm against `GGML_OPENCL_STAGE_INPUTS=1` with a bigger ring only
+  `paper`). Then a bigger-ring arm (`GGML_OPENCL_STAGE_MB`) with `GGML_OPENCL_STAGE_INPUTS=1` only
   if the count is nonzero. Bar: ≥+0.5 % decode or ≥+1 % prefill at depth.
-- **Implementation sketch.** Raise the ring to what a split's inputs need (a flag, 32 → 64/128 MiB)
-  and let a large write go non-blocking in chunks with one wait at the split's first kernel; the
-  write is already in `ggml_cl_stage_write` (`ggml-opencl.cpp:12166`), patch 0068+, ~60-100 lines.
-  Red-first: the served staging red (`GGML_OPENCL_STAGE_RED=1`) — mutation: the wait moved after the
-  first kernel, garbage answers (the existing red case must fire).
+- **Implementation, built (0078, `code`).** `ggml_cl_stage_write` stages one whole input when the
+  scheduler's graph-input marker is on and `ggml_cl_stage_fits(head, span, ring)` holds; a wrap
+  before the write is the 0047 reuse (a `clFinish`, then the ring starts over), and an input larger
+  than the ring returns false (the blocking write). `GGML_OPENCL_STAGE_MB` sets the ring (8-1024
+  MiB, default 32). Red-first cells: the marker removed (the restore case stages), the larger-than-
+  the-ring return moved after the wrap (a needless `clFinish`), the 4 MiB cap restored, each seen
+  failing. The card arm still owes the
+  count (`GGML_SCHED_TIMING=1`, `GGML_OPENCL_STAGE_INPUTS` 0/1 at depth, >= +0.5 % decode or
+  >= +1 % prefill) and the checkpoint-restore timing (the slot save/restore route before/after).
 
 ## 11. prefill chunk / residency dial + ring byte budget
 
@@ -600,20 +614,23 @@ answer by design.
   **40.36 ms** for one `llama_tokenize` pass and **80.27 ms** for the old two-call encode, best of
   seven. Before the fix, a chat text request in this tree encoded twice — the handler's count
   (`code`: `src/api/handlers.cpp`, `finish_prepare`) and the backend's `prompt_tokens`
-  (`code`: `backend_llama.cpp`) — so **four passes, ~161 ms** of a prefix-hit request; the image
-  path's own `set_prompt` encode adds a third encode on that path (six passes there). The review's
-  six-pass text count (~190 ms at the earlier 31.65 ms a pass) is the same class with a faster
-  measurement; both put the tokenizer at **14.7-26.8 %** of a 0.6-1.1 s prefix-hit TTFT (161 ms)
-  and **27-47 %** (190 ms), over the 20 % bar on the fast side, so the build reopens.
+  (`code`: `backend_llama.cpp`) — so **four passes, ~161 ms** of a prefix-hit text request. The
+  image path has two encodes too: `generate_mm` returns before `prompt_tokens`, so handler +
+  `set_prompt` are both of it, not a third (`code`: `handlers.cpp`). The review's six-pass text
+  count (~190 ms at the earlier 31.65 ms a pass) is the same class with a faster measurement;
+  both put the tokenizer at **14.7-26.8 %** of a 0.6-1.1 s prefix-hit TTFT (161 ms) and
+  **27-47 %** (190 ms), over the 20 % bar on the fast side, so the build reopens.
   **Built:** one tokenisation per request, byte-identical by construction. `finish_prepare` stores
   the tokens it counted in `GenerationInput::prompt_ids_text`; `prompt_ids_raw` (a shared helper)
   returns the explicit ids, the API's tokens, or one encode; `prompt_tokens` and the multimodal
   `set_prompt` read them. `encode` is one `llama_tokenize` pass with an upper-bound buffer
   (`src/exec/tokenize-once.h`), retried only when the vocabulary reports more; the ids are the old
   two-pass path's. Device-free cells (`tests/test_tokenize_once.cpp`): the one-pass ids equal the
-  old path's on a mixed corpus, a retry only on a short bound, and the request path counts one
-  encode (`code`; each red — the retry removed, the handler's tokens not stored, the helper ignoring
-  them, the old sizing call restored — seen failing). A text request now pays **one** pass, ~40.4 ms
+  old path's on a mixed corpus, a retry only on a short bound, a pin `INT32_MIN` result (a >2^31
+  token answer, where `-n` would overflow) returns no ids, and the request path counts one encode
+  (`code`; each red — the retry removed, the `INT32_MIN` guard removed (a `length_error` abort),
+  the handler's tokens not stored, the helper ignoring them, the old sizing call restored — seen
+  failing). A text request now pays **one** pass, ~40.4 ms
   against ~161 ms here; tokenise-from-prefix stays unbought, W3.2 already reuses the generated
   tokens (`paper`/`measured-here`, `docs/campaigns/feyntalk.md`).
 
@@ -680,42 +697,72 @@ answer by design.
 
 ## 19. xe device hygiene
 
-- **arcint status: partly.** The audits:
-  - **JIT >4 GiB pointers:** no `-ze-opt-greater-than-4GB-buffer-required` in the compile options
-    (`code`: no hit in `ggml-opencl.cpp`'s opts, only `-cl-intel-256-GRF-per-thread` and defines).
-    The slots are a >4 GiB buffer at Flash-Next's budgets (11,600 MiB) and 0035's codebook tables,
-    0013's inline vISA and 0022's grids are all in that program — the Infernix/Strata finding (experts
-    in the last 0.46 GiB of a 4.46 GiB cache dequantized to NaN, `paper`, St defadd6e) is the class
-    that would hit here.
-  - **Aliased pages:** no allocation check or spacer (`code`: no allocator check). The cache's
-    load-time `verify()` compares every slot's and bank entry's bytes against the file
-    (`code`: `llama-expert-cache.cpp:570-589`), which is a tripwire that catches the corruption after
-    the fact (Strata's 22 GiB B70 arena aliased two 2 MiB pages → NaN at layer 4, expert 249,
-    `paper`, 78f61744), not a pre-check.
+- **arcint status: the JIT gap is closed as a measured non-issue; the alias check is a sampled
+  tripwire, a deviation from the reference's full scan.** The audits:
+  - **JIT >4 GiB pointers — no patch; retired (0076), `measured-here`.** On the card host, offline
+    (compute-runtime/ocloc 26.27.39122.11), a one-store kernel was compiled per option and
+    disassembled: on dg2 the default build is stateful (`send.ugm` with ExBSO and a surface-state
+    descriptor `0x220E8504`); both `-cl-intel-greater-than-4GB-buffer-required` and
+    `-ze-opt-greater-than-4GB-buffer-required` are accepted and turn it stateless (`0x020E8584`, no
+    surface state). On bmg all three builds are identical and already stateless. `clinfo`: the
+    A770's `CL_DEVICE_MAX_MEM_ALLOC_SIZE` is **4,294,959,104 B**, the B60's **24,385,683,456 B**.
+    So on the A770 no `cl_mem` can exceed 4 GiB and the option only moves every kernel to stateless
+    addressing (other OOB semantics, other codegen) for nothing; on the B60 it changes nothing
+    because the default is already stateless. This contradicts the old line "the slots are a >4 GiB
+    buffer": the OpenCL type splits a tensor list at `CL_DEVICE_MAX_MEM_ALLOC_SIZE`
+    (`code`: `research-vram-arena.md` §2.4), so on the A770 the slot buffer is under 4 GiB by
+    construction; on the B60 a slot buffer may exceed 4 GiB, but the program is stateless without
+    the flag. The two programs that build their own option strings (argsort and div) are not on the
+    JIT builder's path and are unchanged (`code`).
+  - **Aliased pages — a sampled tripwire built (0077), a named deviation (`code`).** Strata's
+    `sycl_queue.hpp:168-206, 259-295` tags every 64 KiB block of an allocation of 32 MiB or more
+    with GPU kernels and retries behind a growing spacer up to 8 times (`code`,
+    `research-reference-audit.md`); two virtual blocks sharing one physical page make the later
+    write visible in the earlier block. 0077 samples: one whole slice a slot tensor (53.8 MiB over
+    the IQ3_S artifact's 94 sampled expert tensors) at the cache's init, and at most 16 blocks a
+    bank-ring allocation (4 MiB at K=4) at the ring's first allocate, i.e. the first bank-stream
+    prefill, not model load; both through blocking host<->device copies. The sampled switch covers
+    the planar types (IQ2_XXS, IQ2_XS, IQ2_S, Q2_0, IQ3_S) and IQ3_XXS, whose set path is a plain
+    write and accepts a whole slice; the whole-tensor readers (Q4_0, Q1_0, Q8_0, IQ4_NL, Q4_K) are
+    not sampled because their set path reads the whole tensor. The region's offset is a multiple of
+    `nb[2]` and its size is exactly `nb[2]` (the OpenCL planar set path asserts them; the old
+    arbitrary 64 KiB offset died on IQ3_S, the use configuration, and the SOA path read past a
+    short buffer, `code`). The USM host staging ring is **not** scanned: it is host RAM, not a GPU
+    page table. The old round-1 build intersected host virtual ranges of distinct USM allocations,
+    which cannot overlap, so it could never fire; it is gone (`code`, no `ggml_cl_ranges_overlap`
+    remains). A finding warns and the load proceeds, ring included; Strata's spacer retry is not
+    built. The sample's hit chance for Strata's one-aliased-page class is below a full scan's; the
+    review's order-2 % estimate was for a one-64 KiB-block sample, and one whole slice is ~0.6 MiB
+    on this artifact, so the chance is higher and not quantified here. Load cost: ~54 MiB written
+    plus ~54 MiB read (~108 MiB traffic), one-time (`code`, the GGUF dims); the slot summary line
+    reports the sampled bytes, the bank-ring summary its block count. The plan holds spans and ids,
+    not expected bytes; the pattern is regenerated at each read-back, so the peak host transient is
+    one region (~0.6 MiB here) and the load's RAM forecast can include it, not the sampled total.
+    The card leg owes the seconds and the summary lines (`measured-here` owed). The full-scan
+    alternative is a write kernel plus a read-back kernel over every block, 2 × allocation bytes of
+    traffic in one pass (at the unit's 12,000 MiB slot budget, ~24 GiB; formula, `code`; seconds
+    owed); the operator can choose it against the sample.
   - **Pageable host:** none — the bank and the staging ring are USM host allocations (`code`:
-    `usm_host_alloc`), and no pageable staging exists, so the pageable-fault/deadlock class
-    (`paper`, 73e01fa5, fca3c595) is avoided by construction.
+    `usm_host_alloc`), so the pageable-fault/deadlock class is avoided by construction.
   - **Blitter/timeout:** no large memsets in the engine's path (`code`); the 25 GiB memset timeout
-    (`paper`, 6d1cb3a6) has no analogue.
-  - **The bmg staging that was not needed** (`paper`, 7a07f281: identical logits, ~10 % of a prompt)
-    — arcint has no such staging.
-- **How arcint's build differs.** Strata's is SYCL with its own arena and a tag-check; arcint's is
-  OpenCL over the driver's allocator with a byte check at load and the debug-only `GGML_OPENCL_
-  CPU_MISS_RED`/`MUTATE` reds. The JIT option is the one concrete gap.
-- **Quality class: exact/tripwire.** A hygiene change must not alter numbers; the tests are
+    has no analogue.
+- **How arcint's build differs.** Strata is SYCL with its own arena and a tag check; arcint is
+  OpenCL over the driver's allocator. The reference's alias class lives in VRAM page tables, so the
+  check is device-side write/read-back, not a host-range comparison; it is sampled, not a full
+  scan, and warns and proceeds rather than retrying behind a spacer. The load-time copy verify
+  (`code`: `llama-expert-cache.cpp`, the `copy check`) stays the post-hoc tripwire.
+- **Quality class: exact/tripwire.** The alias check writes no number the model computes (the expert
+  load overwrites the patterns) and a finding warns without refusing the load; the tests are
   corruption detectors.
-- **Units.** all three (the JIT hazard is any >4 GiB buffer: Flash-Next's slots, the image service's
-  16.7 GB VRAM, the agent's KV+weights); the arena tripwire is Flash-Next's.
-- **Pricing measurement.** None on a card: one build with the JIT option added and the suites
-  (`test-backend-ops`, the three services' checks) green is the whole cost. The alias check costs a
-  `clGetMemAllocInfoINTEL` round trip at load. If a window is spent, the cheapest is: a fresh load of
-  Flash-Next at the unit's slot budget with the copy check's "0 of N" line and a served check.
-- **Implementation sketch.** Add the JIT option to the OpenCL program's compile options (a one-line
-  change in `ggml_opencl_make_compile_opts`, `ggml-opencl.cpp:1779-1795`) — patch 0068+, ~1 line plus
-  its README section; and, optional, an alias check on the slots/ring allocations behind a warning.
-  Red-first: a probe kernel that writes a pointer offset past 4 GiB — mutation: the option removed,
-  the probe must return the NaN pattern; the served copy check — mutation: one slot byte flipped,
-  `1 of N` (the existing `LLAMA_EXPERT_CACHE_MUTATE=1` red must fire).
+- **Units.** all three for the alias check (any VRAM allocation); the JIT option has none (retired).
+- **Pricing measurement.** No card arm for the JIT option (retired). For the alias check: a fresh
+  Flash-Next load at the unit's slot budget, its `alias check` summary lines, the load seconds
+  before/after `LLAMA_EXPERT_CACHE_ALIAS=0`, and a served check; the full-scan alternative's
+  seconds if the operator chooses it.
+- **Implementation.** JIT: not built; the option moves dg2 to stateless addressing for an allocation
+  class that cannot occur there and changes nothing on bmg. Alias: built as above, `code`; the card
+  leg is owed (`measured-here`).
+
 
 ## 20. quality instruments
 

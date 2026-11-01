@@ -4976,6 +4976,190 @@ wrapper. The coder's prefill loss is owed a cause: rebuild with
 `-DGGML_OPENCL_PROFILING=ON` and compare `cl_trace.json` under both drivers for
 the same prefill chunk (kernel names, device durations, copies).
 
+## 0076 — retired, not carried
+
+The Intel >4 GiB JIT option (`-cl-intel-greater-than-4GB-buffer-required` /
+`-ze-opt-greater-than-4GB-buffer-required`) is not a patch. **Evidence class:
+`measured-here` (the card host, offline; compute-runtime/ocloc 26.27.39122.11).**
+On dg2 the default program is stateful (`send.ugm` with ExBSO and surface state
+`0x220E8504`); either option makes it stateless (`0x020E8584`, no surface state).
+On bmg all three builds are identical and already stateless. `clinfo`: the
+A770's `CL_DEVICE_MAX_MEM_ALLOC_SIZE` is 4,294,959,104 B and the B60's is
+24,385,683,456 B. So on the A770 no `cl_mem` exceeds 4 GiB and the option moves
+every kernel to stateless addressing for nothing; on the B60 it changes nothing.
+The old "the slots are a >4 GiB buffer" premise is contradicted by the OpenCL
+type's split at `CL_DEVICE_MAX_MEM_ALLOC_SIZE` (`code`,
+`docs/campaigns/research-vram-arena.md` §2.4). Two programs build their own
+option strings (argsort, div) and are not on the JIT builder's path (`code`).
+
+## 0077-opencl-alias-pages.patch
+
+A **sampled tripwire** for VRAM page-table aliasing at the expert cache's init
+and the bank stream ring's first bank-stream prefill, a named deviation from
+Strata's full scan. **Evidence class: `code` (Strata's
+`sycl_queue.hpp:168-206, 259-295`, `research-reference-audit.md`) and
+`measured-here` for the device-free cells; the card arm is owed.**
+
+The round-1 build intersected host virtual ranges of distinct USM host
+allocations. Two distinct allocations cannot overlap, so it could not fire on
+any real class; it is removed (`code`: no `ggml_cl_ranges_overlap` remains).
+The reference's class lives in VRAM page tables: two virtual 64 KiB blocks
+inside one allocation sharing one physical page, where the later write is
+visible when the earlier block reads back.
+
+**The deviation, said.** Strata tags every 64 KiB block of an allocation of
+32 MiB or more with GPU kernels, frees and re-allocates behind a growing spacer
+up to 8 times when a tag is lost, then warns and proceeds (`code`, the lines
+above). This patch samples at most 16 blocks an allocation and one region a
+slot tensor, through blocking host<->device copies; for Strata's
+one-aliased-page class that is a sample, not a full scan. The review put the
+one-64 KiB-block sample's hit chance at order 2 % (estimate, not measured
+here); one whole slice is ~0.6 MiB on this artifact, a larger sample, so its
+hit chance is higher and is not quantified. The full-scan
+alternative is a write kernel plus a read-back kernel over every block: one
+64 KiB write and one read a block, i.e. **2 × allocation bytes of traffic** in
+one load-time pass; at the unit's 12,000 MiB slot budget that is ~24 GiB of
+traffic (formula, `code`; the seconds are the card arm's), with the same
+warn-and-proceed verdict. It is not built here; the operator can choose it
+against this sampled cost.
+
+The patch is that sampled write/read-back, at the cache's init and the bank
+stream ring's first allocation (the first bank-stream prefill, not model load):
+
+- `ggml/src/ggml-opencl/ggml-opencl-alias.h` (new): the bounded plan (at most
+  16 blocks an allocation, evenly spread, 64 KiB aligned) and the pattern, so
+  the device-free cell tests exactly what the backend runs;
+- `ggml-opencl.cpp`: after the bank stream ring's first `allocate` (K=4) the
+  blocks are written, then all read back. The USM **host** staging ring is not
+  scanned (host RAM, not a GPU page table, `code`). A finding names the block
+  and a scan ends with one summary line:
+  `alias check, bank stream ring: d of N sampled blocks differ`. A finding
+  **warns and proceeds**, the ring included; Strata's spacer retry is not built.
+  Cost: ~4 MiB written plus ~4 MiB read for the K=4 ring (`code`; the seconds
+  owed);
+- `src/llama-expert-cache-alias.h` (new) and `llama-expert-cache.cpp`: the same
+  tripwire over every slot tensor in its slot buffer (`bslots`, the ask's
+  `b_lend`, the candidates' per-layer spares) at the init, after the usage marks
+  and before the fill. The region is **one whole slice**: offset a multiple of
+  the tensor's `nb[2]`, size exactly `nb[2]`. The OpenCL set path's planar
+  conversion asserts `offset % nb[2] == 0 && size % nb[2] == 0`, so the old
+  arbitrary 64 KiB offset died at load on IQ3_S (the use configuration) and the
+  SOA path read past a short caller buffer (`code`). The sampled switch covers
+  the planar types (IQ2_XXS, IQ2_XS, IQ2_S, Q2_0, IQ3_S) and IQ3_XXS, whose
+  OpenCL set path is a plain write and accepts a whole slice; the whole-tensor
+  readers (Q4_0, Q1_0, Q8_0, IQ4_NL, Q4_K) are not sampled because their set
+  path reads the whole tensor. On the IQ3_S Flash-Next artifact 94 sampled
+  expert tensors total ~53.8 MiB of whole slices, so ~54 MiB written plus
+  ~54 MiB read (~108 MiB traffic), one-time (`code`, the GGUF dims; the seconds
+  are the card arm's); the summary line reports the sampled bytes. The plan
+  holds spans and ids, not expected bytes: the pattern is regenerated at each
+  read-back, so the peak host transient is one region (~0.6 MiB here), not the
+  sampled total, and the load's RAM forecast has room for it. The sampled total
+  is not held on the host. `LLAMA_EXPERT_CACHE_ALIAS=0` turns it off for the
+  load-cost arm. A finding **warns and the load proceeds**, not a refused cache
+  (`code`). The patterns are overwritten by the expert load; nothing the model
+  computes changes.
+
+Cells (`code`, device-free): `tests/test-opencl-alias.cpp` (plan, pattern, a
+two-page model that aliases on purpose reports the earlier block, the bank-ring
+call, no host-ring scan, findings and the summary); `tests/test-expert-cache-alias.cpp`
+(the region arithmetic over every sampled type's `nb[2]`, pattern, one differing
+region is one finding, writes before reads, warn-and-proceed, no held expected
+bytes and the summary's sampled bytes). Reds (`measured-here`, each seen
+failing): the arbitrary 64 KiB offset restored (`FAIL: the region starts on a
+whole slice` and `FAIL: the region lies inside the tensor`); the doubled
+region restored (`FAIL: the region is one whole slice`); IQ3_XXS removed from
+the sampled switch (`FAIL: the planar types are the ones sampled`); a
+whole-tensor reader added to the sampled switch (`FAIL: the whole-tensor SOA
+readers are not sampled`); a held expected region restored (`FAIL: the plan
+holds no expected bytes and the summary reports them`); the summary's byte
+count removed (`FAIL: the finding is logged with its count and the sampled
+bytes`); the host staging-ring scan restored (`FAIL: the USM host staging ring
+is not scanned`); the slot call refusing the load (`FAIL: a finding warns and
+the load proceeds`).
+
+Card arms owed: a fresh Flash-Next load at the unit's slot budget, the
+`alias check` summary lines, the load seconds with `LLAMA_EXPERT_CACHE_ALIAS=0`
+and `=1`, and a served check. A device-side alias cannot be constructed on
+purpose (the runtime chooses the pages), so the red is the check's own mutation
+and a healthy load's zero findings.
+
+Implemented by meseeks (a private DeepSeek-V4.1-Flash quant, run locally) over 1
+review round; briefed, reviewed and measured on the cards by Claude.
+
+The three cells are labelled `unit` for a llama tree configured with
+`LLAMA_BUILD_TESTS=ON` (`ctest -L unit`); the package recipe builds the engine
+with tests off, so they do not run there.
+
+## 0078-opencl-staging-bound.patch
+
+The graph-input staging bound. **Evidence class: `code` and `measured-here` for
+the device-free cells; the card arms are owed.**
+
+0047 staged a graph input into a USM ring and removed the blocking write for
+inputs at or below 4 MiB; above it the write blocked. The round-1 0078 removed
+that cap by splitting a large input into 4 MiB chunks, which the review found
+wrong twice (`measured-here`): an input larger than the ring wraps inside its
+own loop (the f16 mask at 200K depth, ubatch 512 is ~200 MiB: six `clFinish`es
+and a 200 MiB host memcpy where one blocking DMA was), and removing the refusal
+rerouted every non-weight `set_tensor`, including the checkpoint restore and
+`llama_state_seq_set_data` (DESIGN §3.4's 38.75 → 0.61 s resume).
+
+The bound, both terms:
+
+- `ggml/src/ggml-opencl/ggml-opencl-staging.h` (new): `ggml_cl_stage_fits` (an
+  exact fit at the head is allowed; a zero-size ring fits nothing);
+- `ggml-backend.h` / `ggml-backend.cpp`: a thread-local marker,
+  `ggml_backend_sched_input_copy_begin/end/active`, held by a guard at
+  `ggml_backend_sched_copy_input`; another thread's restore is never staged
+  (`code`). It **gets the old blocking write**: 1.3.0's 0047 staged every
+  non-WEIGHTS `set_tensor` at or below 4 MiB, including
+  `llama_state_seq_set_data`'s KV and recurrent chunks, so the restore timing
+  before/after is a card arm owed before 0078 is called equivalent (DESIGN
+  §3.4's 38.75 → 0.61 s resume). A CPU island's host->device copy goes through
+  the same scheduler copy function, so a non-INPUT copy up to the ring's free
+  space is staged too (`code`).
+- `ggml_cl_stage_write`: stages only when the marker is active and the whole
+  copy fits the ring's free space. A copy larger than the ring is tested before
+  the wrap and returns false without a `clFinish`, taking the blocking write; a
+  wrap before a smaller write is the 0047 reuse (a `clFinish`, then the head
+  resets). One `clEnqueueWriteBuffer` of the whole copy; no chunk loop. `GGML_OPENCL_STAGE_MB` sets the ring (8-1024 MiB, default 32);
+  `GGML_OPENCL_STAGE_INPUTS=0` turns staging off; `STAGE_RED=1` is the
+  stale-ring red.
+
+Cells (`code`, device-free): `tests/test-opencl-staging.cpp` (the fit table, one
+ring-bound ask after the explicit larger-than-the-ring return, the marker's
+thread-local guard, no `size > (4u << 20)`, no chunk loop). Reds
+(`measured-here`, each seen failing): the marker check removed
+(`FAIL: staging asks the scheduler's graph-input marker`); the larger-than-ring
+return moved after the wrap (`FAIL: a copy larger than the ring does not finish
+the ring`).
+
+Card arms owed (each on the unit's own `--model`, `--mmproj`, `--device` and
+`--port` flags, collected as `UNIT_FLAGS`; the baseline is the `9f1ea8e` deb,
+the branch is this patch series' deb):
+
+```
+GGML_SCHED_TIMING=1 GGML_OPENCL_STAGE_INPUTS=1 arcint $UNIT_FLAGS --port 8090
+GGML_SCHED_TIMING=1 GGML_OPENCL_STAGE_INPUTS=0 arcint $UNIT_FLAGS --port 8090
+for MB in 32 64 128 256; do GGML_SCHED_TIMING=1 GGML_OPENCL_STAGE_MB=$MB arcint $UNIT_FLAGS --port 8090; done
+GGML_SCHED_TIMING=1 GGML_OPENCL_STAGE_RED=1 arcint $UNIT_FLAGS --port 8090
+```
+
+- a 100K agent prefill and decode, `STAGE_INPUTS=1` against `=0`, alternated
+  twice: `GGML_SCHED_TIMING=1` inputs us/graph and decode;
+- the `GGML_OPENCL_STAGE_MB` sweep above, at least one value covering the depth's
+  f16 mask (Flash-Next's 200K mask is ~200 MiB; the unit's slot budget decides
+  the ring);
+- checkpoint restore: 24.3k-token follow-up TTFT on the branch and the baseline
+  deb, same flags, before/after 0078 is called equivalent;
+- `GGML_OPENCL_STAGE_RED=1`: stale ring bytes, the path's own red.
+
+Bars: ≥ +0.5 % decode or ≥ +1 % prefill at depth.
+
+Implemented by meseeks (a private DeepSeek-V4.1-Flash quant, run locally) over 1
+review round; briefed, reviewed and measured on the cards by Claude.
+
 ## 0079-opencl-dg2-leo-image-limit.patch
 
 The A770's LEO abort, worked around at the creation site. **Evidence class of

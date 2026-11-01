@@ -1,7 +1,8 @@
 # arcint — Design
 
 State as of 2026-10-31: arcint **1.3.0** on llama.cpp **`3e4dfa8`** with the
-patch series `contrib/llama.cpp/patches` 0001-0072 (69 patches). One engine: libllama with
+patch series `contrib/llama.cpp/patches` 0001-0079 (74 patches; 0031, 0055,
+0061 and 0076 retired, 0073 on its own prefill-gather branch). One engine: libllama with
 ggml's OpenCL backend and arcint's Intel kernels. Three language services run
 in production on two Intel Arc cards: the dense Qwen3.8-27B agent and
 Qwen3.8-Flash-Next (125B-A6B, on demand) on the 24 GB Arc Pro B60, the MoE
@@ -164,7 +165,7 @@ The cards (`measured-here` unless marked):
    └──────────────────────────────┬─────────────────────────────────┘
                                   │ libllama C API
    ┌──────────────────────────────▼─────────────────────────────────┐
-   │ llama.cpp 3e4dfa8 + contrib/llama.cpp/patches 0001-0063        │
+   │ llama.cpp 3e4dfa8 + contrib/llama.cpp/patches 0001-0079        │
    │  model, tokenizer, unified KV with a window per lane,          │
    │  recurrent state with per-token snapshots,                     │
    │  expert cache: VRAM slots + USM host bank + CPU misses         │
@@ -194,8 +195,9 @@ The cards (`measured-here` unless marked):
 
 ### 3.2 Kernels: the patch series
 
-`contrib/llama.cpp/patches` holds 60 patches against the pin (0001-0063; 0031
-and 0055 dropped in 0.8.1, 0061 reviewed and dropped in 1.2.0), each with its
+`contrib/llama.cpp/patches` holds 74 patches against the pin (0001-0079; 0031,
+0055 and 0061 dropped earlier, 0076 retired by measurement, 0073 on its own
+prefill-gather branch), each with its
 measurement, KL, red case and review in `contrib/llama.cpp/README.md`
 (`measured-here` throughout). By what they change:
 
@@ -204,15 +206,17 @@ measurement, KL, red case and review in `contrib/llama.cpp/README.md`
 | K-quant products | 0001, 0009, 0011-0014 | integer-dot matvec for 1-4 columns, few-column XMX for verify rows, the fp16/int8 DPAS GEMMs with 2D block loads, tiles from a genetic search |
 | low-bit and IQ types | 0002, 0022, 0030, 0034, 0035, 0053, 0054 | IQ2_XS/IQ2_S/IQ2_XXS/IQ3/IQ4/Q2_0 in planes, cheaper sign and codebook decode |
 | gated delta-net | 0003, 0050, 0051 | the GDN kernel, rollback snapshots written into the recurrent cache, gating in the kernel |
-| attention | 0007, 0008, 0015-0020, 0028, 0037-0041, 0045, 0048 | split decode attention, XMX prompt attention, quantized KV (q8_0, q8_0:q4_0), GQA verify attention, head size 128, the key split by wave |
+| attention | 0007, 0008, 0015-0020, 0028, 0037-0041, 0045, 0048, 0074 | split decode attention, XMX prompt attention, quantized KV (q8_0, q8_0:q4_0), GQA verify attention, head size 128, the key split by wave, the q/k norm + weight + interleaved M-RoPE in one kernel (off) |
 | MoE | 0006, 0033, 0043 | tokens as the DPAS A operand, the B60 tile, the cache's GEMM threshold |
-| expert cache | 0021, 0024, 0042, 0046, 0056, 0063 | VRAM slots and a USM bank, per device, non-blocking admission on its own queue, the misses on the CPU (Strata's multi-token rows for every expert type of the served GGUFs since 0063) |
+| expert cache | 0021, 0024, 0042, 0046, 0056, 0063, 0075 | VRAM slots and a USM bank, per device, non-blocking admission on its own queue, the misses on the CPU (Strata's multi-token rows for every expert type of the served GGUFs since 0063), the miss rows' prefetch and page touch (off; the premise is not Strata's) |
 | prefill bank stream | 0032, 0044 | each bank tensor copied whole into a VRAM ring ahead of its GEMM, from 256 tokens |
-| decode launches and inputs | 0004, 0005, 0027, 0047, 0049 | small ops, few-row F32, fewer launches, inputs staged in a USM ring with one wait a split |
+| decode launches and inputs | 0004, 0005, 0027, 0047, 0049, 0078 | small ops, few-row F32, fewer launches, inputs staged in a USM ring with one wait a split, only graph inputs that fit the ring without a wrap, everything else blocking |
 | lanes and devices | 0023, 0025, 0026, 0029 | one OpenCL context per platform, a KV cell window per lane, per-sequence attention windows |
 | graph and buffers | 0010, 0036, 0052 | MTP masked rows, Q8_0 GET_ROWS, compute buffers reserved for N cells |
 | image generation | 0057-0060 | the fused `ROPE_APPLY` op (CPU and OpenCL) for sd.cpp's DiTs; `CONV_3D` (Qwen-Image's Wan VAE) and `LEAKY_RELU` (the ESRGAN upscaler) on OpenCL, neither in a language graph; the Q8_0 GEMM on the XMX units, on the B60 (it also takes the language models' Q8_0 weights in batches of 16 or more, which in the served GGUFs are only MTP draft heads) |
 | speech | 0062 | `libmtmd`'s Qwen3-TTS acoustic decoder decodes the frames it is given instead of a padded 72-frame window (`tools/mtmd` only; no language graph builds it) |
+| device hygiene | 0077 | a sampled VRAM page-table alias tripwire (a whole slice a slot tensor at the cache init, 16 blocks a bank-ring allocation at the first bank-stream prefill), warn-and-proceed; a named deviation from Strata's full 64 KiB scan, its price and full-scan alternative in the README; exact/tripwire |
+| driver workarounds | 0079 | DG2 under LEO refuses an `IMAGE1D_BUFFER` above 16,384 texels at creation; the default driver and the B60 are permissive |
 
 Every switch the series reads is classified in `docs/switches.md`
 (operational, tuning, opt-in alternative, off switch, red case, diagnostic).
