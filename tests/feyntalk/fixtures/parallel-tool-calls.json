@@ -1,0 +1,122 @@
+{
+  "schema": "feyntalk-w6g/1",
+  "note": "Shared W6g renderer fixtures (docs/campaigns/feyntalk.md D8). Each history holds the Responses input `items` and the Chat `messages` they must render to. A run of [reasoning item]? [assistant message item]? [function_call item]+ with no user/developer/system message item and no function_call_output in between is ONE assistant Chat message: content = the message item's text, tool_calls = the calls in item order. function_call_output items stay one tool message each, in order. The gateway's renderer test reads a copy of this file; the engine's test reads it here.",
+  "histories": {
+    "two_calls_one_turn": {
+      "items": [
+        {"type": "message", "role": "user", "content": "read both files"},
+        {"type": "function_call", "call_id": "call_a", "name": "read_file", "arguments": "{\"path\":\"a.txt\"}"},
+        {"type": "function_call", "call_id": "call_b", "name": "read_file", "arguments": "{\"path\":\"b.txt\"}"}
+      ],
+      "messages": [
+        {"role": "user", "content": "read both files"},
+        {"role": "assistant", "content": null, "tool_calls": [
+          {"id": "call_a", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}},
+          {"id": "call_b", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"b.txt\"}"}}
+        ]}
+      ]
+    },
+    "text_then_two_calls": {
+      "items": [
+        {"type": "message", "role": "user", "content": "read both files"},
+        {"type": "message", "role": "assistant", "content": "let me look at both"},
+        {"type": "function_call", "call_id": "call_a", "name": "read_file", "arguments": "{\"path\":\"a.txt\"}"},
+        {"type": "function_call", "call_id": "call_b", "name": "read_file", "arguments": "{\"path\":\"b.txt\"}"}
+      ],
+      "messages": [
+        {"role": "user", "content": "read both files"},
+        {"role": "assistant", "content": "let me look at both", "tool_calls": [
+          {"id": "call_a", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}},
+          {"id": "call_b", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"b.txt\"}"}}
+        ]}
+      ]
+    },
+    "two_separate_turns": {
+      "items": [
+        {"type": "message", "role": "user", "content": "read both files"},
+        {"type": "function_call", "call_id": "call_a", "name": "read_file", "arguments": "{\"path\":\"a.txt\"}"},
+        {"type": "function_call_output", "call_id": "call_a", "output": "alpha"},
+        {"type": "function_call", "call_id": "call_b", "name": "read_file", "arguments": "{\"path\":\"b.txt\"}"},
+        {"type": "function_call_output", "call_id": "call_b", "output": "beta"}
+      ],
+      "messages": [
+        {"role": "user", "content": "read both files"},
+        {"role": "assistant", "content": null, "tool_calls": [
+          {"id": "call_a", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}}
+        ]},
+        {"role": "tool", "tool_call_id": "call_a", "content": "alpha"},
+        {"role": "assistant", "content": null, "tool_calls": [
+          {"id": "call_b", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"b.txt\"}"}}
+        ]},
+        {"role": "tool", "tool_call_id": "call_b", "content": "beta"}
+      ]
+    },
+    "reasoning_then_calls": {
+      "items": [
+        {"type": "message", "role": "user", "content": "read both files"},
+        {"type": "reasoning", "summary": [], "content": [
+          {"type": "reasoning_text", "text": "W6G-WHY"}
+        ]},
+        {"type": "message", "role": "assistant", "content": "here we go"},
+        {"type": "function_call", "call_id": "call_a", "name": "read_file", "arguments": "{\"path\":\"a.txt\"}"},
+        {"type": "function_call", "call_id": "call_b", "name": "read_file", "arguments": "{\"path\":\"b.txt\"}"}
+      ],
+      "messages": [
+        {"role": "user", "content": "read both files"},
+        {"role": "assistant", "content": "here we go", "reasoning_content": "W6G-WHY", "tool_calls": [
+          {"id": "call_a", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}},
+          {"id": "call_b", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"b.txt\"}"}}
+        ]}
+      ]
+    },
+    "empty_reasoning_then_call": {
+      "items": [
+        {"type": "message", "role": "user", "content": "read a file"},
+        {"type": "reasoning", "summary": [], "content": [
+          {"type": "reasoning_text", "text": "r1"}
+        ]},
+        {"type": "reasoning", "summary": [], "content": null},
+        {"type": "function_call", "call_id": "call_a", "name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}
+      ],
+      "messages": [
+        {"role": "user", "content": "read a file"},
+        {"role": "assistant", "content": null, "reasoning_content": "r1", "tool_calls": [
+          {"id": "call_a", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}}
+        ]}
+      ]
+    },
+    "empty_message_then_calls": {
+      "items": [
+        {"type": "message", "role": "user", "content": "read both files"},
+        {"type": "message", "role": "assistant", "content": ""},
+        {"type": "function_call", "call_id": "call_a", "name": "read_file", "arguments": "{\"path\":\"a.txt\"}"},
+        {"type": "function_call", "call_id": "call_b", "name": "read_file", "arguments": "{\"path\":\"b.txt\"}"}
+      ],
+      "messages": [
+        {"role": "user", "content": "read both files"},
+        {"role": "assistant", "content": null, "tool_calls": [
+          {"id": "call_a", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}},
+          {"id": "call_b", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"b.txt\"}"}}
+        ]}
+      ]
+    },
+    "continuation_inline": {
+      "items": [
+        {"type": "message", "role": "user", "content": "read both files"},
+        {"type": "function_call", "call_id": "call_a", "name": "read_file", "arguments": "{\"path\":\"a.txt\"}"},
+        {"type": "function_call", "call_id": "call_b", "name": "read_file", "arguments": "{\"path\":\"b.txt\"}"},
+        {"type": "function_call_output", "call_id": "call_a", "output": "alpha"},
+        {"type": "function_call_output", "call_id": "call_b", "output": "beta"}
+      ],
+      "messages": [
+        {"role": "user", "content": "read both files"},
+        {"role": "assistant", "content": null, "tool_calls": [
+          {"id": "call_a", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}},
+          {"id": "call_b", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"b.txt\"}"}}
+        ]},
+        {"role": "tool", "tool_call_id": "call_a", "content": "alpha"},
+        {"role": "tool", "tool_call_id": "call_b", "content": "beta"}
+      ]
+    }
+  }
+}

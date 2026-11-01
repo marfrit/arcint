@@ -1,0 +1,50 @@
+--- a/httplib.h
++++ b/httplib.h
+@@ -621,6 +621,13 @@
+   std::string local_addr;
+   int local_port = -1;
+ 
++  // arcint: the server-side connection's socket, so a handler can ask
++  // `detail::is_socket_alive(socket)` whether the peer is still there without
++  // writing a byte to it (a non-streamed request's prefill writes nothing).
++  // INVALID_SOCKET when the request came from a client, a buffer, or an
++  // internal stream.
++  socket_t socket = INVALID_SOCKET;
++
+   // for server
+   std::string version;
+   std::string target;
+@@ -6428,7 +6435,10 @@
+   // Prepare additional headers
+   if (close_connection || req.get_header_value("Connection") == "close") {
+     res.set_header("Connection", "close");
+-  } else {
++  } else if (!res.has_header("Connection")) {
++    // arcint local change: a handler that already decided to close (the
++    // pre-routing 401) keeps its Connection: close alone, no Keep-Alive beside
++    // it.
+     std::string s = "timeout=";
+     s += std::to_string(keep_alive_timeout_sec_);
+     s += ", max=";
+@@ -7093,6 +7103,7 @@
+     connection_closed = true;
+   }
+ 
++  req.socket = strm.socket();
+   req.remote_addr = remote_addr;
+   req.remote_port = remote_port;
+   req.set_header("REMOTE_ADDR", req.remote_addr);
+@@ -7166,6 +7177,13 @@
+     }
+   }
+ #endif
++  // arcint local change: a handler that answered `Connection: close` (the
++  // pre-routing 401, which does not read the request body) closes the
++  // connection here, so the unread request bytes are never parsed as a next
++  // request.
++  if (res.get_header_value("Connection") == "close") {
++    connection_closed = true;
++  }
+   if (routed) {
+     if (res.status == -1) {
+       res.status = req.ranges.empty() ? StatusCode::OK_200

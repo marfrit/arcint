@@ -28,6 +28,11 @@
 - Flash-Next's production quant is ISTA-DASLab's GSQ-RCO IQ3_S since
   2026-10-20 (operator): 33.3 t/s decode on six answers, KL 0.127 against
   Q8_0 (IQ3_XXS 38.0 t/s, 0.217, the rollback).
+- Version 1.4.0 (2026-11-01): token mode for gateways (`GET /v1/responses/renderer`,
+  `arcint:token`/`arcint:span` events, `/props` `token_mode`), `preserve_thinking`, `POST /tokenize` and
+  `/detokenize`, `--metrics`, `--api-key`, TLS (`ARCINT_TLS`), the strict `arcint` object on Chat
+  Completions, patches 0074-0079; the feyntalk chain with llm-proxy 1.3.0 and feyntalk-render 1.0.0
+  (`docs/feyntalk.md`).
 - Version 1.3.0 (2026-10-31): the Open Responses API (`POST /v1/responses`, streaming, store,
   cancel, reasoning replay, `--think-ctx-reserve`, `truncation: "auto"`), the MTP width policy
   (`--llama-mtp-policy cost`), the prefill slot loan (`--llama-slot-loan`), patches 0068-0072.
@@ -129,6 +134,23 @@
 - HTTP: POST /v1/chat/completions, POST /v1/completions (OpenAI-compatible,
   SSE streaming; /v1/completions also takes token-id prompts), GET /health,
   GET /props, GET /v1/models. No UI.
+- Token surface (llama-server-compatible, behind the same key as every route):
+  POST /tokenize takes {content, add_special?, with_pieces?, model?} and
+  returns {tokens}; with_pieces returns {id, piece} objects, a piece that is
+  not valid UTF-8 on its own being the array of its byte values. content must
+  be a string (llama-server's mixed array of strings and ids is a 400 here).
+  POST /tokenize also takes a chat body (messages, tools) or a Responses body
+  (input, instructions, tools) and returns {tokens, count}: the prompt the
+  request would decode, counted through the request's own prepare path (one
+  tokenisation, never a second). A prompt the lane would refuse is refused by
+  /tokenize too, the count in the error body's prompt_tokens; a count over a
+  continuation does not evict the referenced stored response (it is a lookup,
+  so it refreshes that entry's LRU rank like any other read); an image part is
+  refused (the projector counts tokens /tokenize does not run). POST /detokenize
+  takes {tokens} and returns {content}, special tokens rendered as text
+  (unparse_special=true); an id outside the vocabulary is a 400 naming tokens.
+  parse_special is accepted and ignored (specials are always parsed). The
+  model field picks the lane as the generation routes do.
 - --served-model-name NAME sets the id /v1/models and /props report. The
   model object carries id, n_ctx (running), n_ctx_train, quant, lanes.
 - Named lanes: --served-model-name A,B --lane-ctx CA,CB serves lanes of
@@ -146,12 +168,24 @@
   deterministic call ids; never executed; no tools declared = raw text.
 - Reasoning: text before the bare think closer goes to reasoning_content;
   enable_thinking and reasoning_effort honoured.
+- preserve_thinking: chat_template_kwargs.preserve_thinking (Chat) or
+  arcint.preserve_thinking (Responses) keeps every assistant turn's thinking,
+  not only the turns after the last user query, so a steering message does not
+  drop a running tool loop's reasoning; absent renders exactly as before.
+  chat_template_kwargs is a passthrough to the template (llama-server's
+  dialect): enable_thinking and preserve_thinking are read and type-checked by
+  arcint, every other key reaches the template unchanged and is not refused.
+  /props' chat_template_caps carries supports_preserve_reasoning and
+  supports_preserve_thinking.
 - Sampling defaults: request > operator flags > the GGUF's defaults; /props
   names the provenance.
 - Console: one-line state/timing prints on stderr (load, expert cache,
   per-slot prefill/decode rates, draft acceptance).
-- Security: no authentication, permissive CORS, no TLS. LAN or a reverse
-  proxy only.
+- Security: no authentication by default; --api-key/--api-key-file add a
+  bearer token on every route but /health (that includes /props and /metrics;
+  the CORS preflight is answered without the key). TLS only in a build
+  configured with -DARCINT_TLS=ON (--tls-cert/--tls-key); the default build
+  links no OpenSSL. LAN or a reverse proxy only.
 
 ## Model input
 
@@ -217,6 +251,28 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
 - --device GPU.N | NAME-SUBSTRING | GPU.0,GPU.1: the card(s), in OpenCL
   enumeration order (GPU.0 = B60, GPU.1 = A770 on the dev host).
 - --host ADDR (127.0.0.1), --port N (8090), --http-threads N.
+- --metrics (off): serve GET /metrics in the Prometheus text format with the
+  request/status, token, prefill/decode, cache-hit, draft and lane gauges. A
+  request field `arcint.timings: true` adds the per-response timing object
+  (llama-server's prompt_n/prompt_ms, predicted_n/predicted_ms, cache_n,
+  draft_n, draft_accepted) on Chat Completions and Responses.
+- --api-key KEY | --api-key-file PATH: require `Authorization: Bearer KEY` on
+  every route but /health (GET/HEAD only; a CORS preflight -- an OPTIONS with
+  Access-Control-Request-Method -- is exempt). The check runs before the
+  request body is read, so an unknown path is a 401 too (no route probing),
+  and a 401 names the scheme (WWW-Authenticate: Bearer). The file is read once
+  (exactly one trailing newline stripped); an empty or newline-only file, a
+  key with a control character or DEL, or one that starts or ends with a space
+  is a boot error; a percent sign warns (cpp-httplib URL-decodes header
+  values) and a group/world-readable file warns with its mode. The server
+  keeps only the key's sha256 digest in its long-lived state; the key is never
+  logged and never on
+  /props; --api-key is visible in ps and /proc/<pid>/cmdline (test use;
+  deployments use the file). /health stays open for probes and reveals the
+  served model id.
+- --tls-cert FILE --tls-key FILE: HTTPS through httplib's OpenSSL server;
+  needs a build configured with -DARCINT_TLS=ON (the default build refuses the
+  flags and does not link OpenSSL).
 - --served-model-name NAME[,NAME2] with --lane-ctx CA,CB; --parallel N;
   --n-ctx N (default the smaller of 32,768 and the trained context);
   --queue-timeout S; --prefill-chunk N; --prefill-ubatch N (n_ubatch, default 512).
@@ -283,3 +339,7 @@ Serving build: -DARCINT_LLAMA=ON -DARCINT_LLAMA_DIR=<llama.cpp at 3e4dfa8
 with contrib/llama.cpp/patches applied> -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF;
 needs OpenCL headers and the ICD loader, and Intel's compute runtime to run.
 -DARCINT_WERROR=ON is warning-clean; ASan+UBSan clean on x86_64.
+
+TLS is an extra arm: -DARCINT_TLS=ON (finds and links OpenSSL) accepts
+--tls-cert/--tls-key. The default build refuses the flags and stays free of
+libssl, so the package's Depends do not change.

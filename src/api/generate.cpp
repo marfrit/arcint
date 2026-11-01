@@ -45,6 +45,20 @@ json usage_json(const GenerationStats& s) {
                   {"rejected_prediction_tokens", s.draft_proposed - s.draft_accepted}}}};
 }
 
+nlohmann::json timings_json(const GenerationStats& stats) {
+    // llama-server's names, on this engine's own counters: prompt_n/predicted_n
+    // are the tokens, cache_n the reused prefix, draft_n/draft_accepted the
+    // speculation. The milliseconds are the wall phases the server already
+    // times and logs; nothing new is measured for this object.
+    return nlohmann::json{{"prompt_n", stats.prompt_tokens},
+                          {"prompt_ms", stats.prefill_seconds * 1000.0},
+                          {"predicted_n", stats.completion_tokens},
+                          {"predicted_ms", stats.decode_seconds * 1000.0},
+                          {"cache_n", stats.cache_hit_tokens},
+                          {"draft_n", stats.draft_proposed},
+                          {"draft_accepted", stats.draft_accepted}};
+}
+
 // One list for the two consumers: the decode line prints the counters when one
 // moved, and the response carries the object on the same condition. An eighth
 // counter is added here, once.
@@ -213,7 +227,8 @@ void finish_chat_generation(const PreparedChat& prep,
     if (prep.parse_tool_calls) {
         ToolCallParse parsed = parse_qwen_tool_calls(out.content, &prep.schemas);
         if (parsed.truncated) {
-            log::warn("tools", "%s", "unterminated <tool_call> block; returned as raw content");
+            log::warn("tools", "unterminated %s block; returned as raw content",
+                      std::string(tool_call_tags().open).c_str());
         }
         out.content = std::move(parsed.content);
         out.calls   = std::move(parsed.calls);

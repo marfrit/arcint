@@ -59,9 +59,27 @@ struct ChatRequest {
     // in the final chunk, so opting out is the client's explicit choice.
     bool stream_include_usage = true;
 
+    // arcint.timings: the request asks for the per-response timing object
+    // (prompt_n/prompt_ms, predicted_n/predicted_ms, cache_n, draft_n,
+    // draft_accepted) on the response. Absent keeps the body byte-identical.
+    bool timings = false;
+
     // chat_template_kwargs.enable_thinking — the fleet standard switch (§4).
     bool enable_thinking     = true;
     bool has_enable_thinking = false;
+    // chat_template_kwargs.preserve_thinking — the coder template replays an
+    // assistant turn's thinking only after the last user query unless this is
+    // true; a steering message moves that boundary and would otherwise drop
+    // the running tool loop's thinking (measured in UAT: a 10.6 % cache hit).
+    bool preserve_thinking     = false;
+    bool has_preserve_thinking = false;
+    // The raw chat_template_kwargs object, passed through to the template (the
+    // llama-server dialect: the keys are template-specific and a client may
+    // send ones a given template ignores). `enable_thinking` and
+    // `preserve_thinking` are type-checked above; every other key reaches
+    // extra_context unchanged. Empty for a request that sent none, which keeps
+    // the render byte-identical to before this field existed.
+    nlohmann::json chat_template_kwargs = nlohmann::json::object();
 
     SamplerOverrides sampler;
 };
@@ -112,6 +130,29 @@ ToolSchemas tool_schemas(const std::vector<ToolSpec>& tools);
 // content at each image part, so the model's own chat template carries it and
 // mtmd_tokenize() finds it (`docs/milestone-1.2.0.md §3`).
 inline constexpr const char* kMediaMarker = "<__media__>";
+
+// The names a chat_template_kwargs key must not take, because the vendored
+// minja already owns them in the template context:
+//   - the six keys apply() sets before it merges extra_context
+//     (third_party/minja/chat-template.hpp): messages, add_generation_prompt,
+//     bos_token, eos_token, strftime_now, tools;
+//   - the 31 builtins Context::builtins() installs (third_party/minja/
+//     minja.hpp), on a parent context, so a same-named key on the child
+//     shadows them: ==, count, default, dictsort, e, equalto, escape, in,
+//     indent, int, items, join, joiner, last, length, list, lower, map,
+//     namespace, raise_exception, range, reject, rejectattr, safe, select,
+//     selectattr, string, tojson, trim, unique, upper.
+// A key that names one would let a client override the engine's value or break
+// a template that calls the builtin, so it is refused by name.
+bool reserved_template_context_key(std::string_view key);
+
+// The `extra_context` a request produces: the typed switches
+// (enable_thinking, preserve_thinking) plus every non-reserved
+// chat_template_kwargs key, unchanged. Empty when the request set neither, so
+// a render stays byte-identical to before the passthrough existed. `error`
+// names the first reserved key found; the caller refuses with a 400.
+// Pure: the one construction the llama render_chat and the unit test share.
+nlohmann::json template_context(const ChatRequest& req, std::string& error);
 
 // M0 stub prompt rendering.
 //

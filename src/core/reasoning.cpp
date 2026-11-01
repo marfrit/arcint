@@ -131,6 +131,15 @@ ReasoningStreamer::ReasoningStreamer(bool think_open, bool extended_tags,
     if (in_reasoning_ && !ids_.empty() && ids_.front().second >= 0) close_id_ = ids_.front().second;
 }
 
+TokenField ReasoningStreamer::field_for(int token_id) const {
+    if (in_reasoning_) return TokenField::Reasoning;
+    if (undecided_ && token_id >= 0) {
+        for (const auto& pair : ids_)
+            if (pair.first == token_id) return TokenField::Reasoning;
+    }
+    return TokenField::Text;
+}
+
 ReasoningStreamer::Step ReasoningStreamer::push(std::string_view piece, int token_id) {
     Step step;
     if (undecided_) {

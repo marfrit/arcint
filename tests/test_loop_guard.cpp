@@ -2635,3 +2635,30 @@ TEST(loop_guard_cycle_longer_than_the_window_is_recovered) {
     CHECK(row[0] == 5.0f);
     CHECK(row[6] == 6.0f);
 }
+
+// feyntalk W6b: a loop-guard span lands in the turn's event vector the sampler
+// was handed, with the detection's own index and the request's match rule. No
+// SSE here: the stream drains this vector (test_responses.cpp).
+TEST(loop_guard_span_event_lands_in_the_request_vector) {
+    SamplerParams p = base_params(LoopGuardMode::Detect);
+    p.span_events = std::make_shared<std::vector<SamplerSpanEvent>>();
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    feed_lines(s, 0, 17, true);
+    CHECK_EQ(s.loop_guard_counts().detections, 1);
+    CHECK(!p.span_events->empty());
+    if (p.span_events->empty()) return;
+    const SamplerSpanEvent& e = p.span_events->front();
+    CHECK_EQ(e.span, std::string("loop_guard"));
+    CHECK_EQ(e.rung, std::string("detect"));
+    CHECK_EQ(e.match, std::string("near"));
+    CHECK_EQ(e.token_index, 0);   // no accepted token yet: the first index
+}
+
+TEST(loop_guard_span_event_is_off_when_no_vector_was_handed) {
+    SamplerParams p = base_params(LoopGuardMode::Detect);   // no span_events
+    Sampler s(p, 1);
+    s.start_in_think_block(true);
+    feed_lines(s, 0, 17, true);
+    CHECK_EQ(s.loop_guard_counts().detections, 1);   // the guard still fires
+}

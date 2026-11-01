@@ -8,11 +8,38 @@ Vendored, single-header, licenses unchanged:
 | nlohmann/json | 3.11.3 | MIT | `third_party/nlohmann/json.hpp` |
 | minja (chat templating) | vendored | MIT | via `minja/chat-template.hpp` |
 
-`third_party/httplib.h` carries one small local change beyond verbatim:
-`Request` gets a `socket` field, filled in `process_request` from the server
-stream, so a handler can ask `detail::is_socket_alive` whether the peer is
-still connected without writing a byte (a non-streamed request's prefill
-writes nothing for a long stretch). The build also defines
+`third_party/httplib.h` is cpp-httplib **0.18.3** with two small local
+changes. The exact diff against a fresh upstream v0.18.3 `httplib.h` is
+`third_party/httplib-arcint.patch` (4 hunks; `--- a/httplib.h`).
+
+First change (patch hunks 1 and 3): `Request` gets a `socket` field, filled
+in `process_request` from the server stream, so a handler can ask
+`detail::is_socket_alive` whether the peer is still connected without writing
+a byte (a non-streamed request's prefill writes nothing for a long stretch).
+
+Second change (patch hunks 2 and 4): a handler that answers
+`Connection: close` is honoured. `write_response_core`
+
+    -  } else {
+    +  } else if (!res.has_header("Connection")) {
+
+so the handler's `Connection: close` is not accompanied by a `Keep-Alive`
+beside it; and `process_request`, just before `if (routed)`,
+
+    +  if (res.get_header_value("Connection") == "close") {
+    +    connection_closed = true;
+    +  }
+
+so the socket is closed after that response and the unread request body (the
+pre-routing 401 does not read it) is never parsed as a next request.
+
+Upstream 0.18.3 cannot do this today: the server derives close only from the
+request's `Connection` header and the keep-alive max count (`close_connection`)
+and overwrites every response's `Connection`/`Keep-Alive` itself, so no
+handler -- `set_pre_routing_handler` included -- can ask for the connection to
+close. The vendored patch is the smallest fix short of an upstream change; the
+behaviour is a candidate for upstream (`Server`: honour a handler's
+`Connection: close`). The build also defines
 `CPPHTTPLIB_USE_POLL` (`CMakeLists.txt`): without poll, `process_request`
 answers 500 to every connection above `FD_SETSIZE`, and `select()` returns -1
 there, which that liveness probe would read as "gone". Two limits of the probe:
@@ -56,6 +83,21 @@ closure (`peg-parser`, `json`, `json-schema`, `json-schema-to-grammar`,
 string helpers copied from `common/common.cpp`. `src/core/toolgrammar.cpp`
 copies `permute` from `common/chat-peg-parser.cpp` and mirrors the tool-call
 block of `common/parsers/qwen3-coder.cpp`.
+
+Vendored for the compliance gate (Apache-2.0): the Open Responses specification
+repository's **2026-04-24 release** (`package.json` 0.1.0; the checkout carries
+no git metadata, so the release document is the pin), at
+`tests/feyntalk/openresponses/` with the upstream paths kept — `LICENSE`
+next to the files, sha256
+`43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1`.
+Brought in: `bin/compliance-test.ts`, `src/lib/compliance-tests.ts`,
+`src/lib/sse-parser.ts` and the reachable closure of
+`src/generated/kubb/zod/…` — 108 files, no local change. The per-file sha256
+list is `tests/feyntalk/openresponses/MANIFEST.sha256` (the manifest is part of
+this record; the CLI is run as the official code, not reimplemented). Its
+runtime dependencies are not vendored: tsx 4.19.2 and zod 3.25.76 are pinned in
+`tests/feyntalk/package.json`/`package-lock.json` and installed with
+`npm ci --ignore-scripts` into an ignored cache when node >= 22 is present.
 
 Runtime dependencies (not shipped): the OpenCL ICD loader and Intel's
 compute runtime. Model files are not shipped; GGUFs of Qwen checkpoints

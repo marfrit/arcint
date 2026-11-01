@@ -18,13 +18,159 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.4.0 — 2026-11-01
+
+Token mode for gateways, the serving-ops package and thinking replay across a
+steering message. Every new surface is off or inert until a request or a flag
+asks for it; without them the chat route's bytes are unchanged (golden
+captures 12/12 byte-identical, `measured-here` on the stub).
+
+Part of the feyntalk chain, released together: llm-proxy 1.3.0 (the gateway
+that renders and translates token mode), feyntalk-render 1.0.0 (the client-side
+renderer), and `docs/feyntalk.md` (how the three fit and how to run them).
+
+**Contract change (operator decision): Chat Completions validates `arcint`
+strictly.** A non-object, an unknown key, a non-boolean `timings`, or a `v`
+other than 1 is now a 400. Before 1.4.0 the field was ignored on this route,
+so a client that sent an unrelated `arcint` object must remove it or send only
+`timings` (and optionally `v: 1`); `/v1/responses` already validated its own
+`arcint` object. The operator chose the strict behaviour over silently
+dropping unknown keys. `chat_template_kwargs` is not part of this contract (see
+thinking replay below).
+
+- **Token mode, the engine side** (`docs/campaigns/feyntalk.md`, "Token mode,
+  revised"), per request on `/v1/responses`:
+  - `GET /v1/responses/renderer` serves the unit's renderer material (decode
+    pieces, special tokens, the chat template and its source, the think-tag
+    geometry) and its canonical hash. The material is built once, on the first
+    GET; a build that fails leaves the unit serving with token mode off and
+    says why in the log.
+  - `arcint.token_mode: true` with `arcint.renderer_hash` and
+    `arcint.render.prompt_sha256`: a stale hash or a prompt the unit would
+    render differently is a 409 before a slot is taken. Token mode needs
+    `stream: true` and is text-only (an image part is refused). The stream carries
+    an `arcint:token` event per accepted output token before the unchanged text
+    event, and `arcint:span` events for thinking, tool calls, the loop guard and
+    the context guard.
+  - `/props` reports `token_mode: "ready"` on every llama unit whose material
+    pre-flight passed (no flag; the GGUF's template), `"off"` on TTS units and
+    where the build failed.
+  - `arcint.input_ids` is schema-checked and refused as not served yet.
+- **A run of function calls is one assistant turn** (W6g): Responses input and
+  the stored output behind `previous_response_id` map
+  `[reasoning]? [message]? [function_call]+` to ONE assistant message, so
+  parallel calls round-trip as the turn the model produced (no prefix-cache miss
+  from that turn on), and a continuation renders byte-identically to the same
+  history sent inline. A duplicate `call_id` inside one run is a 400.
+- **Thinking replay (`preserve_thinking`)**: `chat_template_kwargs.preserve_thinking`
+  on Chat Completions and `arcint.preserve_thinking` on Responses keep every
+  assistant turn's thinking, not only the turns after the last user query, so a
+  steering message does not drop a running tool loop's reasoning (a UAT
+  measured a 10.6 % prefix-cache hit without it, `measured-here`). Absent
+  renders exactly as before; the token-mode prompt hash covers the flag.
+  Templates differ in the default: the Qwen3.6 coder template drops replayed
+  thinking unless the flag is true, the Qwen3.8 templates keep it unless the
+  flag is false (`code`, the GGUFs' templates). `/props`' `chat_template_caps`
+  reports `supports_preserve_thinking` beside `supports_preserve_reasoning`.
+  `chat_template_kwargs` stays a passthrough (llama-server's dialect):
+  `enable_thinking` and `preserve_thinking` must be booleans, the names the
+  template context sets itself (`messages`, `tools`, `add_generation_prompt`,
+  `bos_token`, `eos_token`, `strftime_now`) are a 400, and every other key
+  reaches the template unchanged (`code`, `src/core/chat.cpp`). A token-mode
+  gateway must render with the same keys, or the prompt hash is a 409.
+- **`POST /tokenize` and `POST /detokenize`** (llama-server-compatible, behind
+  the same key as every other route): `/tokenize` takes
+  `{content, add_special?, with_pieces?, model?}` and returns `{tokens}`; with
+  `with_pieces` it returns `{id, piece}` objects, and a piece that is not valid
+  UTF-8 on its own is the array of its byte values. `content` must be a
+  string: llama-server's mixed array of strings and ids is a 400. A chat body
+  (`messages`, `tools`, …) or a Responses body (`input`, `instructions`,
+  `tools`, …) is counted through the request's own prepare path, BOS included
+  where the generation adds it, and returns `{tokens, count}`, so the count is
+  the prompt the same request would decode; an image part is a 400 (the
+  generation counts image tokens through the projector, which this route does
+  not run). `/detokenize` takes `{tokens}` (integers in the vocabulary, each
+  checked) and returns `{content}`, special tokens rendered as text
+  (llama-server's default `unparse_special=true`). The `model` field picks the
+  lane exactly as the generation routes do.
+- **`--metrics`**: `GET /metrics` in the Prometheus text format (requests by
+  route and status, tokens, prefill and decode seconds, cache hits, drafts,
+  per-lane queue and slots, model loaded). `arcint: {timings: true}` returns the
+  per-response timings on Chat Completions and Responses.
+- **`--api-key` / `--api-key-file`**: a bearer key on every route except
+  `GET`/`HEAD /health` and a real CORS preflight, checked before any body is
+  read (an unknown path is 401 too, `Expect: 100-continue` is answered 401),
+  compared as SHA-256 digests in constant time; the server keeps only the
+  digest. A key that is empty, has a control character, DEL or a leading or
+  trailing space refuses to start; a group- or world-readable key file warns.
+- **`--tls-cert` / `--tls-key`** behind the CMake option `ARCINT_TLS` (default
+  OFF; the OFF build links no OpenSSL, and the Debian package is the OFF
+  build). The certificate and key are loaded before the model, so a bad pair
+  is refused before the model load. One local patch to the vendored cpp-httplib honours a
+  handler's `Connection: close` (`third_party/httplib-arcint.patch`,
+  `THIRD_PARTY.md`).
+- One tokenisation per request: the prompt count and the backend's prompt ids
+  share one encode, one pass with a bounded buffer and an exact retry; a
+  188,900-byte text costs 40.36 ms instead of about 161 ms (`measured-here`,
+  off the cards, `tools/tokenize_cost.cpp`).
+- llama.cpp series:
+  - 0077 (on, `LLAMA_EXPERT_CACHE_ALIAS=0` turns it off): Strata's
+    VRAM page-alias tripwire (`code`, Strata's source), sampled — a write/read-back over up to 16 blocks
+    of each bank-ring allocation and one whole slice of each expert-slot
+    tensor; a finding warns and the load proceeds. About 53.8 MiB written and
+    read back once on the IQ3_S Flash-Next artifact (`code`), instead of
+    Strata's full scan (about 24 GiB at a 12,000 MiB slot budget).
+  - 0078 (on): a graph input is staged only when the whole copy fits the
+    staging ring without a wrap, otherwise one blocking write; the ring size is
+    `GGML_OPENCL_STAGE_MB` (8-1024, default 32). The coder's checkpoint restore
+    does not regress: time to first token 2.07 / 2.07 s against 1.3.0's
+    2.17 / 2.37 s (A770, window 47, `measured-here`).
+  - 0079: under the compute runtime's LEO mode on a DG2 card (the A770) an
+    image1d_buffer above 16,384 texels aborts in the runtime; arcint now skips
+    such an image and takes the buffer kernel. With it the A770 runs under LEO
+    (test-backend-ops 12,867 of 12,881, the default driver's pass set); the
+    coder under LEO decodes +6 % and prefills -5.6 % against the default
+    driver, so the units stay on the default driver (`measured-here`, window 43;
+    `docs/campaigns/vram-user-space.md`). The default driver and the B60 take
+    the same images as before.
+  - 0074 (the q/k norm + IMRoPE in one kernel) and 0075 (the CPU miss rows'
+    prefetch) are in the series, off: 0074 is correct on both cards and buys no
+    decode, 0075's levels buy nothing or cost (`measured-here`, windows 42 and
+    45). 0076 is retired, 0073 (the prefill expert gather) is not in 1.4.0.
+- `docs/switches.md`: every environment switch of 0059-0079 and of the tools,
+  with its default and the code line it is read at.
+- The container image's builder stage carries diffutils (the 1.3.0 image build
+  failed on the golden compare).
+
+Release gate (window 48, `measured-here`, the release candidate against 1.3.0 in the same
+window):
+- Coder (A770): decode 51.55 / 52.75 / 45.25 t/s on both builds, prefill at 41k 729.3 against
+  730.5 (inside the spread), the answers byte-identical; the acceptance task 10/10 greedy x3,
+  10/10/9 at 0.7. `/tokenize` ids equal `llama-tokenize` on three texts; the count equals the
+  generation's `usage.prompt_tokens` with thinking on, off and with tools. A steering turn's
+  prefix-cache hit: 13.4 % without `preserve_thinking`, 99.6 % with it (prefill 1,476 -> 229 ms).
+- Agent (B60): prefill at 55k / 138k 712.8 / 501.85 against 715.4 / 503.0 t/s (inside the
+  floor), the answers byte-identical.
+- Flash-Next (B60): prefill equal (533.75 against 535.73 t/s in four rounds); **decode 2.2 %
+  slower**, 32.97 against 33.70 t/s pooled over nine runs of each build in three passes, with the
+  same draft acceptance (each verify step slower). The cause is not isolated yet (suspects: 0078's
+  staging of CPU-island copies, 0077's bank-ring rescan on a relearn); the operator accepted it
+  for 1.4.0, the fix is owed for 1.4.1. 0077's load cost is inside load-to-load noise (alias
+  check on 61.6 / 56.6 s, off 52.1 / 64.2 s to `/health`; 60.5 MB written and read back).
+- Token mode `ready` with the renderer material served on all three (`/props`, the material's
+  hash, the load log).
+
+Runtime dependency unchanged in kind: llama.cpp 3e4dfa8 with
+`contrib/llama.cpp/patches` 0001-0079 (0031, 0055, 0061, 0073, 0076 not
+carried).
+
 ## 1.3.0 — 2026-10-31
 
 The Open Responses API, an adaptive MTP window on the coder, and the prefill slot
 loan for Flash-Next; answers checked at the answer-level bar (all `measured-here`
 unless marked):
 
-- **`POST /v1/responses`** (`docs/campaigns/feyntalk.md` on the `qfndev` branch): the Open Responses
+- **`POST /v1/responses`** (`docs/campaigns/feyntalk.md`): the Open Responses
   request and resource, non-stream and SSE streaming, an in-memory store with
   `previous_response_id` continuations and slot affinity,
   `POST /v1/responses/{id}/cancel` (cancel-by-id stops a 14k-token prefill in
@@ -41,7 +187,7 @@ unless marked):
   - `truncation: "auto"` drops replayed reasoning oldest-first (never a
     message) and never refuses a prompt that `disabled` serves.
 - **MTP width policy** (`--llama-mtp-policy cost`, `--llama-mtp-cost-seed`,
-  default off; `docs/campaigns/research-mtp-width-policy.md` on the `qfndev` branch): Strata's
+  default off; `docs/campaigns/research-mtp-width-policy.md`): Strata's
   cost-aware window in the serving path, seeded with the card's measured round
   times. Coder on the A770: decode on the six-answer set 56.27 -> 64.92 / 65.42
   t/s (+15.8 %), the acceptance task 10/10 x3 at 90.1/90.0/90.1 -> 92.8/90.9/93.5
@@ -50,13 +196,13 @@ unless marked):
   (`ARCINT_MTP_TRACE`) and `tools/mtp_width_replay.py` price a width rule
   offline.
 - **Prefill slot loan** (`--llama-slot-loan MIB`, `--llama-loan-chunk N`,
-  default off; `docs/campaigns/prefill-slot-loan.md` on the `qfndev` branch): the expert cache lends its
+  default off; `docs/campaigns/prefill-slot-loan.md`): the expert cache lends its
   tail layers' slots to a long prompt's compute buffers and gets them back
   before decode. Flash-Next on the B60: prefill at 103,638 tokens 217.7 ->
   347.9 t/s (+59.8 %), +18 to +19.5 % at 18.8k; KL inside the twin floor; no
   margin to the card's total beyond an eviction guard.
 - Expert route trace (0069) and the per-card expert profile save (0070), opt-in
-  (`docs/campaigns/expert-foresight.md` on the `qfndev` branch).
+  (`docs/campaigns/expert-foresight.md`).
 - 0071: int8 DPAS for the prompt's grouped expert GEMM on sub-group-16 devices,
   opt-in (`GGML_OPENCL_KQ_MM_ID_I8`, off): 2.0x on IQ3_S and 1.3x on IQ4_NL in
   test-backend-ops, +1.2 to +3.2 % served prefill on Flash-Next; not adopted
@@ -67,11 +213,34 @@ unless marked):
   with and without it under the default driver on both cards (B60 12,724 /
   12,881, A770 12,867 / 12,881, the same failure sets), and the runtime's LEO
   mode (OpenCL on Level Zero, `EnableLEO=1`) no longer rejects them
-  (`docs/campaigns/vram-user-space.md` on the `qfndev` branch).
+  (`docs/campaigns/vram-user-space.md`).
 - Tools: `tools/fn_sweep.py` --unit agent|coder|flashnext, --device, --reverse,
   --no-mtp, --prompt-max; the KL tools mask the assistant's tokens
   (`tools/capture_vs_capture.py --spans`, `tools/tokenize_turn.py`) and report the
   twin floor's verdict.
+
+The KL tools in detail: the quality instruments that shipped in 1.2.7 — `tools/capture_vs_capture.py`'s
+twin baseline (`--baseline A B --candidate C`) and its `--mask` token ranges —
+gain three things:
+
+- `--spans`: the assistant mask from a chat request's role ids
+  (`tools/kld_served.py`'s `assistant_spans`), so a served arm is scored on the
+  positions the model writes, masked beside unmasked. A plain-text corpus arm
+  has no roles, and the tool says so instead of inventing one.
+- the twin's floor as TWO numbers per metric — mean KL and argmax agreement,
+  each with the two runs' own spread — with the candidate flagged inside or
+  outside that spread per metric. `CLAUDE.md`'s answer-level bar (0.03 nats, 1
+  point) prints beside it, unchanged: a card's floor is no bar.
+- the row convention: a capture row scores the NEXT token (row position p holds
+  the prediction of token p+1), so a token range is masked as the row range
+  [start - 1, end - 1) — the reply's first token's prediction is inside, the
+  token after the reply outside.
+
+A turn's ids are tokenised with its closing marker (a merge rule, no measured
+case here), and `tools/tokenize_turn.py` writes the transcript with
+`parse_special=false`, the setting the capture tokenises at. The single mode's
+output labels its two lines `unmasked:` and `masked:` and states the row
+convention; a run without a mask prints the no-roles note.
 
 Unit changes, not defaults: the coder runs `--llama-mtp-policy cost` with the
 A770's seed; Flash-Next runs the slot loan (`--prefill-chunk 8192
@@ -83,8 +252,8 @@ Runtime dependency unchanged: llama.cpp 3e4dfa8 with `contrib/llama.cpp/patches`
 ## 1.2.7 — 2026-10-30
 
 Faster decode on every unit and faster prefill on the coder; answers checked
-at the answer-level bar (`docs/campaigns/fusion-coder-night.md`, on the `qfndev`
-branch; all `measured-here`):
+at the answer-level bar (`docs/campaigns/fusion-coder-night.md`, all
+`measured-here`):
 - 0064: the MoE router kernel on one sub-group a token, 2.5x faster;
   KL 0.023656 -> 0.023594, the task 10/10; the greedy texts change (sum order).
 - 0065: a verify's conv-state snapshots in one launch (+1.8 % coder decode,
@@ -706,7 +875,7 @@ in 158.9 s at a peak of 18,827 MiB; the klein edit PASS (0.999539,
 32.43 dB); the served edit (`/v1/images/edits`, init image +
 reference) 17.2 dB from a CPU sd-server running the same request, below the
 proposed 20 dB floor (a local divergence, not the VAE; released with that gate open by the operator's decision,
-`docs/campaigns/imggen-served-edit-divergence.md` (on the `qfndev` branch)); the upscale route 512² -> 2048² in 27.9 s; the
+`docs/campaigns/imggen-served-edit-divergence.md`); the upscale route 512² -> 2048² in 27.9 s; the
 red cases of 0059 (by the new final floor) and of the op suites FAIL.
 Unchanged paths: Z-Image Turbo 512² seed 42 pixel-identical to 1.1.0's;
 the 1.1.1 language binary answers the capital question on
@@ -788,7 +957,7 @@ tolerance, both red cases FAIL; 512² 0.476 s a step. sd.cpp's own Vulkan backen
   arm; it refuses arms whose prompt, size, steps, seed, sampler or models
   differ. **`tools/imggen_profile.py`**: kernels ranked by device time.
 - The development record's two "defects" were arms that differed in prompt
-  or steps (`docs/campaigns/imggen-attention-path.md` (on the `qfndev` branch), closed).
+  or steps (`docs/campaigns/imggen-attention-path.md`, closed).
 
 ## 1.0.0 — 2026-10-16
 
@@ -813,8 +982,7 @@ acceptance task 10/10 (agent) and 9/10 (coder); DFlash2 opt-in answers and
 drafts from the package.
 
 - **DFlash2 drafting on the libllama engine, opt-in** (charter B2,
-  `docs/campaigns/dflash2-agent.md`, on the `qfndev` branch):
-  `--llama-dflash-gguf FILE` drafts with
+  `docs/campaigns/dflash2-agent.md`): `--llama-dflash-gguf FILE` drafts with
   a DFlash2 drafter in place of the MTP head, `--llama-dflash N` (1-7,
   default 7) drafts a verify, `--llama-dflash-min-p P` is the selector's
   stop, `--llama-dflash-ubatch N` (default 64) the drafter's batch (a

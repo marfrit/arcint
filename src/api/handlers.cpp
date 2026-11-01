@@ -11,6 +11,8 @@
 
 #include "api/error.h"
 #include "api/generate.h"
+#include "api/metrics.h"
+#include "api/renderer.h"
 #include "api/responses_state.h"
 #include "build_info.h"
 #include "core/stop.h"
@@ -455,6 +457,15 @@ json props(const Context& ctx) {
     json p = json{
         {"model", std::move(model)},
         {"chat_template_caps", ctx.backend->template_caps()},
+        // feyntalk W6a (docs/campaigns/feyntalk.md, D4; review findings 1/3):
+        // the capability, not the material. "ready" means token mode serves and
+        // the endpoint can build the body; the hash is the cached one from the
+        // first build (the first GET or token request), never computed here.
+        {"token_mode", api::renderer_ready(ctx) ? "ready" : "off"},
+        {"renderer_hash", [&]() {
+             const std::string h = api::renderer_hash(ctx);
+             return h.empty() ? json(nullptr) : json(h);
+         }()},
         // What is actually served, not a Config default the load path may
         // never have read. `kv_dtype` comes off ModelStatus, which the llama
         // backend fills from --llama-kv (config.h's llama_kv_dtype); the stub
@@ -548,7 +559,10 @@ json props(const Context& ctx) {
         {"voices", static_cast<int>(st.voices.size())},
         {"endpoints",
          json::array({"/health", "/props", "/v1/chat/completions", "/v1/completions",
-                      "/v1/responses", "/v1/responses/{id}/cancel", "/v1/models", "/v1/audio/speech", "/v1/audio/voices"})}};
+                      "/v1/responses", "/v1/responses/{id}/cancel", "/v1/models", "/v1/audio/speech", "/v1/audio/voices",
+                      "/tokenize", "/detokenize"})}};
+    // --metrics adds GET /metrics, so it is named here only when it is served.
+    if (cfg.metrics) p["endpoints"].push_back("/metrics");
     // The Responses store's live state (docs/campaigns/feyntalk.md State):
     // what it retains now, and the limits that bound it. A process without a
     // store (a test seam) says null rather than a zero that would read as empty.
@@ -624,12 +638,35 @@ json voices(const Context& ctx) {
 // ---------------------------------------------------------------- prepare
 namespace {
 
+// The template render as an answer. Only the exception a template raises for
+// its own failure is the request's 400: the vendored minja rethrows every
+// std::exception raised while rendering as a located std::runtime_error at two
+// sites - Expression::evaluate and TemplateNode::render in
+// third_party/minja/minja.hpp (re-check both on a minja bump) - so a value the
+// template cannot use (a nlohmann type_error, an out_of_range) or a message it
+// rejects (raise_exception) arrives here as a runtime_error; that includes an
+// allocation failure inside the render itself. An engine fault outside the
+// render (std::bad_alloc, a std::logic_error from the engine's own helpers) is
+// not the client's and is left to propagate to the route's 500.
+std::optional<HttpResult> render_template(const Context& ctx, const ChatRequest& req,
+                                          std::string& out) {
+    try {
+        out = ctx.backend->render_chat(req);
+    } catch (const std::runtime_error& e) {
+        log::warn("req", "template render refused: %s", e.what());
+        return HttpResult{400, invalid_request(log::format(
+            "the chat template could not render this request: %s", e.what()))};
+    }
+    return std::nullopt;
+}
+
 std::optional<HttpResult> finish_prepare(const Context& ctx, int lane, const std::string& prompt,
                                          const SamplerOverrides& overrides,
                                          GenerationInput& input, int& prompt_tokens,
                                          bool nothink = false,
                                          const std::vector<int>& prompt_ids = {},
-                                         int known_prompt_tokens = -1) {
+                                         int known_prompt_tokens = -1,
+                                         const std::vector<int>& prompt_ids_text = {}) {
     // The row first: a request that resolves to thinking off starts from the
     // operator's non-thinking row when one is configured. The request's own
     // fields apply after this and still win.
@@ -638,14 +675,20 @@ std::optional<HttpResult> finish_prepare(const Context& ctx, int lane, const std
         return HttpResult{400, invalid_request(*err)};
     }
 
-    // A token-id prompt is counted as given; a text prompt is tokenised once
-    // here for the count (the backend tokenises it again for the forward). The
-    // W3.5 fit pass already encoded the prompt it served, so it hands the count
-    // in (N3) and the encode is not repeated for every auto request.
-    prompt_tokens = !prompt_ids.empty()
-                        ? static_cast<int>(prompt_ids.size())
-                        : (known_prompt_tokens >= 0 ? known_prompt_tokens
-                                                    : static_cast<int>(ctx.backend->tokenizer().encode(prompt).size()));
+    // A token-id prompt is counted as given. A text prompt is tokenised once,
+    // here, and the tokens go to the backend (`input.prompt_ids_text`), so its
+    // sampler and its count do not tokenise the same text again (audit 15: the
+    // request's one tokenisation, one llama_tokenize pass). The W3.5 fit pass
+    // already encoded the prompt it served and hands the tokens and the count
+    // in (N3), so a drop loop's last encode is not repeated either.
+    std::vector<int> text_ids = prompt_ids_text;
+    if (!prompt_ids.empty()) {
+        prompt_tokens = static_cast<int>(prompt_ids.size());
+    } else {
+        if (text_ids.empty()) text_ids = ctx.backend->tokenizer().encode(prompt);
+        prompt_tokens = known_prompt_tokens >= 0 ? known_prompt_tokens
+                                                 : static_cast<int>(text_ids.size());
+    }
 
     // DESIGN.md §3.8 — reject, with the numbers. No truncation, no shift.
     // Against the request's lane: a subagent lane's prompt over its cap is
@@ -655,9 +698,10 @@ std::optional<HttpResult> finish_prepare(const Context& ctx, int lane, const std
         return HttpResult{400, context_overflow(prompt_tokens, n_ctx)};
     }
 
-    input.prompt     = prompt;
-    input.prompt_ids = prompt_ids;
-    input.sampler    = std::move(sampler);
+    input.prompt          = prompt;
+    input.prompt_ids      = prompt_ids;
+    input.prompt_ids_text = prompt_ids.empty() ? std::move(text_ids) : std::vector<int>{};
+    input.sampler         = std::move(sampler);
     // The stop flag belongs to the request's whole life: a SIGTERM/SIGINT
     // while it runs ends it at the backend's next token or batch boundary,
     // rather than waiting out a long prefill (DESIGN §3.7).
@@ -748,6 +792,7 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
 
     std::string prompt;
     int         fit_tokens = -1;   // N3: the count the fit pass already made
+    std::vector<int> fit_ids;      // and the tokens of the prompt it served
     if (fit != nullptr && fit->drop_reasoning) {
         // feyntalk W3.5: `truncation: "auto"`, reasoning first. The render copy
         // is local: prep.req (the echo and the stored state) keeps the full
@@ -770,12 +815,13 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
         ChatRequest render_req = prep.req;
         const int   n_ctx      = lane_n_ctx(ctx, lane);
         const int   limit      = n_ctx > 0 ? n_ctx - fit->reserve : 0;
-        auto render = [&] { return ctx.backend->render_chat(render_req); };
-        auto count  = [&](const std::string& p) {
-            return static_cast<int>(ctx.backend->tokenizer().encode(p).size());
+        auto render = [&](std::string& out) { return render_template(ctx, render_req, out); };
+        auto tokenize = [&](const std::string& p) {
+            return ctx.backend->tokenizer().encode(p);
         };
-        prompt = render();
-        const int before = count(prompt);
+        if (auto err = render(prompt)) return *err;
+        fit_ids = tokenize(prompt);
+        const int before = static_cast<int>(fit_ids.size());
         int       tokens = before;
         int       blocks = 0;
         if (template_renders_reasoning) {
@@ -784,7 +830,8 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
             // the last user message) are cleared for the iteration but not
             // counted, and their unchanged render does not advance the count.
             while (n_ctx > 0 && tokens > limit && drop_oldest_reasoning(render_req.messages)) {
-                const std::string next = render();
+                std::string next;
+                if (auto err = render(next)) return *err;
                 // R2: compare the rendered bytes first. A hidden reasoning block
                 // (an assistant turn before the last user message) leaves the
                 // render unchanged, so the token count is not recomputed -- the
@@ -792,8 +839,9 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
                 // agent. A changed render is a real drop even when its token
                 // count happens to be equal.
                 if (next == prompt) continue;
-                prompt = next;
-                tokens = count(next);
+                prompt  = next;
+                fit_ids = tokenize(next);
+                tokens  = static_cast<int>(fit_ids.size());
                 ++blocks;
             }
         }
@@ -813,7 +861,7 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
         }
         fit_tokens = tokens;
     } else {
-        prompt = ctx.backend->render_chat(prep.req);
+        if (auto err = render_template(ctx, prep.req, prompt)) return *err;
     }
     // The template decides whether the answer starts inside a think block; the
     // split of reasoning from content below follows that, not a guess.
@@ -836,7 +884,7 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
     // that ends up with thinking off gets the non-thinking row.
     const bool nothink = prep.req.has_enable_thinking && !prep.req.enable_thinking;
     if (auto err = finish_prepare(ctx, lane, prompt, prep.req.sampler, prep.input, prep.prompt_tokens,
-                                  nothink, {}, fit_tokens)) {
+                                  nothink, {}, fit_tokens, fit_ids)) {
         return err;
     }
     // llava: the answer row switches only in a turn the request declared as
@@ -998,6 +1046,7 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
         }))
         return *err;
     log_stats(slot, stats, reason);
+    if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
 
     // A non-streamed request commits its status before its body is built, so
     // an abort is still answerable: a stop signal is a 503 an alive client
@@ -1052,6 +1101,10 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     // loop-guard: present only when the ladder moved, so a request without the
     // switch has the response body it always had.
     if (loop_guard_moved(stats)) body["loop_guard"] = loop_guard_json(stats);
+    // arcint.timings: the per-response timing object, only when the request
+    // asked. llama-server's field name at the top level; absent keeps the body
+    // byte-identical.
+    if (prep.req.timings) body["timings"] = timings_json(stats);
     return HttpResult{200, std::move(body)};
 }
 
@@ -1065,6 +1118,7 @@ HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, in
         }))
         return *err;
     log_stats(slot, stats, reason);
+    if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
 
     // As the chat path: a stop signal is a 503, a gone client gets no body.
     if (reason == FinishReason::Abort) {
@@ -1112,6 +1166,7 @@ SpeechResult run_speech(const Context& ctx, const PreparedSpeech& prep, int slot
     }
     log::info(log::format("slot %d", slot), "speech '%s': %d frames, %zu bytes WAV in %.2f s",
               prep.input.voice.c_str(), stats.completion_tokens, wav.size(), stats.decode_seconds);
+    if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
     return SpeechResult{200, std::move(wav), json::object()};
 }
 
@@ -1139,7 +1194,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     std::string         raw;
     size_t              streamed = 0;  // bytes of tool-free content already sent
     bool                gone     = false;
-    static const std::string kToolOpen = "<tool_call>";
+    static const std::string kToolOpen(tool_call_tags().open);
     // Reasoning goes out as reasoning_content deltas until the think block
     // closes; from there `content` accumulates the answer and the tool-call
     // logic below sees only that.
@@ -1246,6 +1301,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     }
 
     log_stats(slot, stats, reason);
+    if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
     // An aborted request sends nothing more: a gone client's write would fail
     // anyway, and a buffered tool call must not come back as raw content after
     // the turn was cancelled (DESIGN §3.7; the stop signal too).
@@ -1264,7 +1320,8 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     if (prep.parse_tool_calls) {
         ToolCallParse parsed = parse_qwen_tool_calls(content, &prep.schemas);
         if (parsed.truncated) {
-            log::warn("tools", "%s", "unterminated <tool_call> block; returned as raw content");
+            log::warn("tools", "unterminated %s block; returned as raw content",
+                      std::string(tool_call_tags().open).c_str());
         }
         calls = std::move(parsed.calls);
         if (parsed.content.size() > streamed) {
@@ -1301,6 +1358,11 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
         final_delta["reasoning_closed"] = !reasoning.in_reasoning();
     json final_extra = json::object();
     if (loop_guard_moved(stats)) final_extra["loop_guard"] = loop_guard_json(stats);
+    // arcint.timings: with usage opted in, the object rides the usage chunk, so
+    // the last data frame carries both (llama-server's shape); without usage
+    // there is no such chunk, so it rides the finish chunk.
+    if (prep.req.timings && !prep.req.stream_include_usage)
+        final_extra["timings"] = timings_json(stats);
     if (!sse_send(write, chunk(json::array({{{"index", 0},
                                              {"delta", final_delta},
                                              {"finish_reason", finish}}}), final_extra))) {
@@ -1308,7 +1370,9 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     }
 
     if (prep.req.stream_include_usage) {
-        if (!sse_send(write, chunk(json::array(), json{{"usage", usage_json(stats)}}))) return;
+        json usage_extra = {{"usage", usage_json(stats)}};
+        if (prep.req.timings) usage_extra["timings"] = timings_json(stats);
+        if (!sse_send(write, chunk(json::array(), usage_extra))) return;
     }
     write("data: [DONE]\n\n");
 }
@@ -1363,6 +1427,7 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep, int s
     }
 
     log_stats(slot, stats, reason);
+    if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
     // As the chat path: an aborted request sends nothing more.
     if (gone || reason == FinishReason::Abort) return;
 

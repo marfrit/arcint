@@ -508,3 +508,25 @@ TEST(context_guard_forced_closer_breaks_the_verify_walk_at_its_row) {
     CHECK_EQ(out, std::vector<int>({5}));
     CHECK_EQ(s.loop_guard_counts().ctx_closes, 1);
 }
+
+// feyntalk W6b: the context guard's forced closer lands in the span vector with
+// the index the forced token takes and the budget it was forced at. With no
+// vector handed, nothing is built.
+TEST(context_guard_span_event_lands_in_the_request_vector) {
+    SamplerParams p = ctx_params();
+    p.think_ctx_reserve = 8;
+    p.span_events = std::make_shared<std::vector<SamplerSpanEvent>>();
+    Sampler s(p, 1);
+    s.set_prompt({1});
+    s.set_think_ctx_budget(0);   // prompt inside the reserve: force at the first draw
+    s.start_in_think_block(true);
+    std::vector<float> l = row_with_argmax(2);
+    CHECK_EQ(s.sample(l.data(), l.size()), 5);
+    CHECK_EQ(p.span_events->size(), size_t(1));
+    if (p.span_events->empty()) return;
+    const SamplerSpanEvent& e = p.span_events->front();
+    CHECK_EQ(e.span, std::string("context_guard"));
+    CHECK_EQ(e.forced, true);
+    CHECK_EQ(e.budget, 0);
+    CHECK_EQ(e.token_index, 0);
+}

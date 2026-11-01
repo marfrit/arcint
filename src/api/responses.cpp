@@ -2,12 +2,14 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "api/error.h"
 #include "api/generate.h"
+#include "api/metrics.h"
 #include "api/responses_state.h"
 #include "core/chat.h"
 #include "util/log.h"
@@ -116,12 +118,71 @@ std::optional<std::string> reasoning_text_of(const json& item, std::string& out)
     return std::nullopt;
 }
 
-// One input item. `index` names the position in the error's message; `pending`
-// is the reasoning an item has carried that belongs to the next assistant item
-// (the pairing rule: a reasoning item pairs with the FOLLOWING assistant message
-// or function_call; any other item in between drops it).
+// W6g (docs/campaigns/feyntalk.md D8): the one merge rule for an assistant run.
+// A run of [reasoning]? [assistant message]? [function_call]+ is ONE assistant
+// ChatMessage. The input mapping and the stored-output reconstruction both use
+// this state machine, so the two paths cannot drift.
+struct AssistantRun {
+    std::vector<ChatMessage>& messages;
+    std::string               pending;   // reasoning for the next assistant item
+    bool                      open = false;   // the tail message accepts calls
+
+    explicit AssistantRun(std::vector<ChatMessage>& m) : messages(m) {}
+
+    // A reasoning item contributes to the NEXT assistant item and restarts the
+    // run: the grammar puts it before the message item, never between calls.
+    void add_reasoning(const std::string& text) {
+        if (!text.empty()) {
+            if (!pending.empty()) pending += "\n";
+            pending += text;
+        }
+        open = false;
+    }
+    // An assistant message item opens the run the following calls join; it takes
+    // the pending reasoning.
+    void add_message(ChatMessage msg) {
+        msg.reasoning = std::move(pending);
+        pending.clear();
+        messages.push_back(std::move(msg));
+        open = true;
+    }
+    // A call joins the open run, or opens a new assistant turn carrying the
+    // pending reasoning.
+    void add_call(ToolCall call) {
+        if (open && !messages.empty() && messages.back().role == "assistant") {
+            messages.back().tool_calls.push_back(std::move(call));
+        } else {
+            ChatMessage msg;
+            msg.role      = "assistant";
+            msg.reasoning = std::move(pending);
+            pending.clear();
+            msg.tool_calls.push_back(std::move(call));
+            messages.push_back(std::move(msg));
+            open = true;
+        }
+    }
+    // A boundary item (a user/system/developer message, a function_call_output)
+    // or an item this grammar does not handle closes the run.
+    void close() {
+        open = false;
+        pending.clear();
+    }
+    // Whether the open run already carries `call_id`: the input path's duplicate
+    // refusal (the stored path cannot see duplicates; the engine mints the ids).
+    bool open_run_has_call(const std::string& call_id) const {
+        if (!open || messages.empty() || messages.back().role != "assistant") return false;
+        for (const ToolCall& c : messages.back().tool_calls)
+            if (c.id == call_id) return true;
+        return false;
+    }
+};
+
+// One input item. `index` names the position in the error's message; `run`
+// carries the reasoning pending for the next assistant item and the W6g merge
+// state (the pairing rule: a reasoning item pairs with the FOLLOWING assistant
+// message or function_call; any other item in between drops it).
 std::optional<HttpResult> read_item(const json& item, ResponseRequest& req, size_t index,
-                                    std::string& pending) {
+                                    AssistantRun& run) {
     const std::string where = log::format("input[%zu]", index);
     if (!item.is_object()) return invalid(where + " must be an object", "input");
     // The OpenAPI document marks `type` required but defaults every message
@@ -157,12 +218,15 @@ std::optional<HttpResult> read_item(const json& item, ResponseRequest& req, size
         // the template knows no phase, and the output carries none (optional
         // field). Review R2 of the campaign moved it out of the skip list.
         if (msg.role == "assistant") {
-            msg.reasoning = pending;   // the item that precedes this turn
-            pending.clear();
+            // Opens a run the following function_calls join and takes the
+            // reasoning that precedes it.
+            run.add_message(std::move(msg));
         } else {
-            pending.clear();           // a user/system/developer turn ends the pairing
+            // A user/system/developer turn is a boundary: it ends the pairing
+            // and the merge run.
+            run.close();
+            req.chat.messages.push_back(std::move(msg));
         }
-        req.chat.messages.push_back(std::move(msg));
         return std::nullopt;
     }
 
@@ -178,16 +242,23 @@ std::optional<HttpResult> read_item(const json& item, ResponseRequest& req, size
         if (!item.contains("arguments") || !item["arguments"].is_string()) {
             return invalid(where + ".arguments must be a JSON string", "input");
         }
-        ChatMessage msg;
-        msg.role      = "assistant";
-        msg.reasoning = pending;
-        pending.clear();
         ToolCall call;
         call.id        = item["call_id"].get<std::string>();
         call.name      = item["name"].get<std::string>();
         call.arguments = item["arguments"].get<std::string>();
-        msg.tool_calls.push_back(std::move(call));
-        req.chat.messages.push_back(std::move(msg));
+        // A duplicate call_id inside one merged turn makes the
+        // function_call_output pairing ambiguous, so it is refused here. The
+        // stored-output path carries engine-minted ids and cannot see one.
+        if (run.open_run_has_call(call.id)) {
+            return invalid(where + ".call_id '" + call.id +
+                               "' is duplicated in one assistant turn; the function_call_output "
+                               "pairing would be ambiguous",
+                           "input");
+        }
+        // W6g: a call that follows an assistant message (or a previous call in
+        // the same run) joins that one message; only the run's first call opens
+        // it, and only it takes the pending reasoning.
+        run.add_call(std::move(call));
         return std::nullopt;
     }
 
@@ -197,7 +268,8 @@ std::optional<HttpResult> read_item(const json& item, ResponseRequest& req, size
             return invalid(where + ".call_id is required", "input");
         }
         if (!item.contains("output")) return invalid(where + ".output is required", "input");
-        pending.clear();   // a tool output is not an assistant item
+        // A tool output is not an assistant item and is a turn boundary (W6g).
+        run.close();
         ChatMessage  msg;
         msg.role         = "tool";
         msg.tool_call_id = item["call_id"].get<std::string>();
@@ -235,10 +307,10 @@ std::optional<HttpResult> read_item(const json& item, ResponseRequest& req, size
         // the last user message, drops earlier ones).
         std::string text;
         if (auto e = reasoning_text_of(item, text)) return invalid(where + ".content: " + *e, "input");
-        if (!text.empty()) {
-            if (!pending.empty()) pending += "\n";
-            pending += text;
-        }
+        // W6g: a reasoning item restarts the run (the grammar puts it before
+        // the message item, never between calls): the next function_call opens a
+        // new turn carrying this reasoning.
+        run.add_reasoning(text);
         req.reasoning_items.push_back(item);
         return std::nullopt;
     }
@@ -391,6 +463,16 @@ std::optional<HttpResult> read_reasoning(const json& v, ResponseRequest& req) {
     return std::nullopt;
 }
 
+// A hash is "sha256:" and 64 lowercase hex digits — the form the material
+// endpoint publishes and the request must echo. Nothing else is accepted; a
+// short or upper-case hash would compare unequal for the wrong reason.
+bool is_sha256_hash(std::string_view s) {
+    if (s.size() != 71 || s.substr(0, 7) != "sha256:") return false;
+    for (char c : s.substr(7))
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    return true;
+}
+
 std::optional<HttpResult> read_arcint(const json& v, ResponseRequest& req) {
     if (!v.is_object()) return invalid("arcint must be an object", "arcint");
     if (!v.contains("v")) return invalid("arcint.v is required when the arcint object is sent",
@@ -403,12 +485,95 @@ std::optional<HttpResult> read_arcint(const json& v, ResponseRequest& req) {
                            "arcint.v");
     }
     req.arcint_v = 1;
+    bool has_renderer_hash = false;
+    bool has_render        = false;
     for (auto it = v.begin(); it != v.end(); ++it) {
         if (it.key() == "v") continue;
-        // Everything beyond the version belongs to a later package (token mode,
-        // spans, ...); accepting and dropping it would be a silent lie.
+        if (it.key() == "token_mode") {
+            if (!it.value().is_boolean())
+                return invalid("arcint.token_mode must be a boolean", "arcint.token_mode");
+            req.token_mode = it.value().get<bool>();
+            continue;
+        }
+        if (it.key() == "timings") {
+            if (!it.value().is_boolean())
+                return invalid("arcint.timings must be a boolean", "arcint.timings");
+            req.timings = it.value().get<bool>();
+            continue;
+        }
+        if (it.key() == "preserve_thinking") {
+            if (!it.value().is_boolean())
+                return invalid("arcint.preserve_thinking must be a boolean",
+                               "arcint.preserve_thinking");
+            req.chat.preserve_thinking     = it.value().get<bool>();
+            req.chat.has_preserve_thinking = true;
+            continue;
+        }
+        if (it.key() == "renderer_hash") {
+            if (!it.value().is_string())
+                return invalid("arcint.renderer_hash must be a string", "arcint.renderer_hash");
+            const std::string h = it.value().get<std::string>();
+            if (!is_sha256_hash(h))
+                return invalid("arcint.renderer_hash must be 'sha256:' and 64 lowercase hex digits",
+                               "arcint.renderer_hash");
+            req.renderer_hash = h;
+            has_renderer_hash = true;
+            continue;
+        }
+        if (it.key() == "render") {
+            if (!it.value().is_object()) return invalid("arcint.render must be an object",
+                                                        "arcint.render");
+            const json& r = it.value();
+            for (auto rt = r.begin(); rt != r.end(); ++rt) {
+                if (rt.key() != "prompt_sha256")
+                    return unsupported("arcint.render." + rt.key() + " is not served in this build",
+                                       "arcint.render." + rt.key());
+                if (!rt.value().is_string())
+                    return invalid("arcint.render.prompt_sha256 must be a string",
+                                   "arcint.render.prompt_sha256");
+                const std::string h = rt.value().get<std::string>();
+                if (!is_sha256_hash(h))
+                    return invalid("arcint.render.prompt_sha256 must be 'sha256:' and 64 lowercase "
+                                   "hex digits", "arcint.render.prompt_sha256");
+                req.render_prompt_sha256 = h;
+            }
+            has_render = req.render_prompt_sha256.empty() ? false : true;
+            if (!has_render)
+                return invalid("arcint.render.prompt_sha256 is required when arcint.render is sent",
+                               "arcint.render.prompt_sha256");
+            continue;
+        }
+        if (it.key() == "input_ids") {
+            // D1: the renderer-owned prompt path. The field is part of the
+            // schema, so it is not "not a field"; it is refused by its own name
+            // until W6f, when the renderer's encoder has passed its corpus.
+            if (!it.value().is_array())
+                return invalid("arcint.input_ids must be an array of token ids", "arcint.input_ids");
+            for (const json& id : it.value())
+                if (!id.is_number_integer() || id.get<int64_t>() < 0)
+                    return invalid("arcint.input_ids must hold non-negative integer token ids",
+                                   "arcint.input_ids");
+            return unsupported("arcint.input_ids is accepted by the schema but not served in this "
+                               "build: the engine renders the prompt and checks its hash (W6f adds "
+                               "the renderer-owned ids)", "arcint.input_ids");
+        }
+        // Everything beyond the version and the W6a fields belongs to a later
+        // package (spans, ...); accepting and dropping it would be a silent lie.
         return unsupported("arcint." + it.key() + " is not served in this build",
                            "arcint." + it.key());
+    }
+    if (req.token_mode) {
+        if (!has_renderer_hash)
+            return invalid("arcint.renderer_hash is required with arcint.token_mode: true",
+                           "arcint.renderer_hash");
+        if (!has_render)
+            return invalid("arcint.render.prompt_sha256 is required with arcint.token_mode: true",
+                           "arcint.render.prompt_sha256");
+    } else if (has_renderer_hash || has_render) {
+        // A hash without the mode names no turn to check: refuse rather than
+        // store a value nothing reads.
+        return invalid("arcint.renderer_hash and arcint.render need arcint.token_mode: true",
+                       "arcint.token_mode");
     }
     return std::nullopt;
 }
@@ -448,10 +613,10 @@ std::optional<HttpResult> parse_response_request(const json& body, ResponseReque
             msg.content = text;
             req.chat.messages.push_back(std::move(msg));
         } else if (input.is_array()) {
-            std::string pending;   // reasoning that belongs to the next assistant item
-            size_t      i = 0;
+            AssistantRun run(req.chat.messages);   // W6g's merge state for the whole input
+            size_t       i = 0;
             for (const json& item : input) {
-                if (auto err = read_item(item, req, i, pending)) return err;
+                if (auto err = read_item(item, req, i, run)) return err;
                 ++i;
             }
         } else {
@@ -633,6 +798,18 @@ std::optional<HttpResult> parse_response_request(const json& body, ResponseReque
     if (body.contains("arcint")) {
         if (auto err = read_arcint(body["arcint"], req)) return err;
     }
+    if (req.token_mode) {
+        // Token mode is stream-only: its events ride the SSE writer.
+        if (!req.chat.stream)
+            return unsupported("token mode requires stream: true (arcint:token rides the SSE "
+                               "writer)", "stream");
+        // Text-only: the gateway renders a text prompt, and an image would
+        // leave the prompt the engine verifies.
+        for (const ChatMessage& m : req.chat.messages)
+            if (!m.images.empty())
+                return unsupported("token mode is text-only: an image part is not served with "
+                                   "token mode", "arcint.token_mode");
+    }
 
     out = std::move(req);
     return std::nullopt;
@@ -678,48 +855,73 @@ HttpResult translate_prepare_error(const HttpResult& err) {
     return err;
 }
 
+// W6a D1: a token-mode turn's hashes are checked before the slot is taken, so a
+// stale gateway cannot drive a prompt the engine would render differently. Both
+// refusals are 409 `renderer_mismatch`; the param names which side differed.
+HttpResult renderer_conflict(std::string message, std::string param) {
+    return HttpResult{409, responses_error(std::move(message), "invalid_request",
+                                           "renderer_mismatch", std::move(param))};
+}
+
 HttpResult previous_not_found(const std::string& id, const std::string& why) {
     return HttpResult{400, responses_error(
         "previous_response_id '" + id + "' is not usable here: " + why,
         "invalid_request", "previous_response_not_found", "previous_response_id")};
 }
 
-// One assistant ChatMessage per spec output item, in the item order and with
-// the same reasoning pairing as the input mapping, so a continuation renders
-// like a full-history request. Reasoning items pair with the following message
-// or function_call; reasoning parts join with a newline.
+// One assistant ChatMessage per spec output item run, in the item order and
+// with the same reasoning pairing and the same W6g merge as the input mapping
+// (both use AssistantRun), so a continuation renders like a full-history
+// request. Reasoning items pair with the following message or function_call;
+// reasoning parts join with a newline. A run of [reasoning]? [message]?
+// [call]+ is ONE message (content from the message item, all calls in item
+// order), exactly as read_item maps the same items. An item this grammar does
+// not handle closes the run, the same way a boundary item does on the input
+// path, so a corrupt stored item cannot let two calls merge across it.
 std::vector<ChatMessage> assistant_turns_of(const nlohmann::json& output_items) {
     std::vector<ChatMessage> out;
-    std::string              pending;
+    AssistantRun             run(out);
     for (const json& item : output_items) {
         const std::string type = item.value("type", "");
         if (type == "reasoning") {
             std::string text;
-            if (reasoning_text_of(item, text) || text.empty()) continue;
-            if (!pending.empty()) pending += "\n";
-            pending += text;
+            // One rule with the input path: a reasoning item restarts the run
+            // and contributes only its text. An empty item -- or a malformed
+            // content the stored path cannot refuse -- therefore carries
+            // nothing and does NOT erase the reasoning that preceded it, so the
+            // call that follows keeps it. (read_item refuses a malformed content
+            // outright and calls add_reasoning("") for an empty one.)
+            if (reasoning_text_of(item, text)) text.clear();
+            run.add_reasoning(text);
         } else if (type == "message") {
             ChatMessage msg;
-            msg.role      = "assistant";
-            msg.reasoning = pending;
-            pending.clear();
-            if (item.contains("content") && item["content"].is_array()) {
-                for (const json& part : item["content"])
-                    if (part.is_object() && part.contains("text") && part["text"].is_string())
+            msg.role = "assistant";
+            // The same content shapes the input mapping accepts: a string, or
+            // typed parts joined with a newline. A stored output message
+            // carries one output_text part, so this does not move a real
+            // continuation's bytes; it keeps the two paths one grammar.
+            if (item.contains("content")) {
+                const json& content = item["content"];
+                if (content.is_string()) {
+                    msg.content = content.get<std::string>();
+                } else if (content.is_array()) {
+                    for (const json& part : content) {
+                        if (!part.is_object() || !part.contains("text") || !part["text"].is_string())
+                            continue;
+                        if (!msg.content.empty()) msg.content += "\n";
                         msg.content += part["text"].get<std::string>();
+                    }
+                }
             }
-            out.push_back(std::move(msg));
+            run.add_message(std::move(msg));
         } else if (type == "function_call") {
-            ChatMessage msg;
-            msg.role      = "assistant";
-            msg.reasoning = pending;
-            pending.clear();
             ToolCall call;
             call.id        = item.value("call_id", "");
             call.name      = item.value("name", "");
             call.arguments = item.value("arguments", std::string("{}"));
-            msg.tool_calls.push_back(std::move(call));
-            out.push_back(std::move(msg));
+            run.add_call(std::move(call));
+        } else {
+            run.close();
         }
     }
     return out;
@@ -728,7 +930,32 @@ std::vector<ChatMessage> assistant_turns_of(const nlohmann::json& output_items) 
 }  // namespace
 
 std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest req,
-                                           PreparedResponse& out) {
+                                           PreparedResponse& out, bool evict_on_error) {
+    // Token mode: the material first, before any render and before any
+    // continuation lookup. A unit without material cannot serve token mode.
+    if (req.token_mode) {
+        // W6a review findings 1/3: the capability first (no build), then the
+        // material, which builds once on first use. A build that failed leaves
+        // the unit servable with token mode off, and is a 409 here.
+        if (!ctx.backend->renderer_capable()) {
+            return renderer_conflict("token mode is not served here: this unit is not renderer "
+                                     "capable (GET /props says token_mode: \"off\")",
+                                     "arcint.token_mode");
+        }
+        // W6 follow-up 3/5: the hash accessor builds if needed and returns the
+        // cached string; the JSON tree is not kept after serialization.
+        const std::string served_hash = ctx.backend->renderer_hash();
+        if (served_hash.empty()) {
+            return renderer_conflict("token mode is not served here: this unit's renderer "
+                                     "material could not be built (the load log has the reason)",
+                                     "arcint.token_mode");
+        }
+        if (served_hash != req.renderer_hash) {
+            return renderer_conflict("arcint.renderer_hash does not name the material this unit "
+                                     "serves; the gateway must refresh its renderer material",
+                                     "arcint.renderer_hash");
+        }
+    }
     const std::string prev_id =
         req.has_previous_response_id ? req.previous_response_id : std::string();
     std::shared_ptr<StoredResponse> stored;
@@ -746,8 +973,9 @@ std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest r
         // mismatch means the continuation would not share the stored prompt.
         const std::string rendered = ctx.backend->render_chat(stored->chat);
         if (sha256_hex(rendered) != stored->prefix_hash) {
-            // A 4xx on a continuation evicts the entry it referenced.
-            evict_continuation(ctx, prev_id);
+            // A 4xx on a continuation evicts the entry it referenced -- unless
+            // the caller is only counting (/tokenize), where nothing was served.
+            if (evict_on_error) evict_continuation(ctx, prev_id);
             return previous_not_found(prev_id, "the rendered prefix no longer matches the stored one");
         }
 
@@ -812,9 +1040,30 @@ std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest r
     }
     if (auto err = prepare_from_chat(ctx, req.chat, prep.chat, fitp)) {
         // A continuation the server answers 4xx is a broken chain: evict the
-        // referenced entry so a retry cannot silently continue from it.
-        evict_continuation(ctx, prev_id);
+        // referenced entry so a retry cannot silently continue from it. The
+        // count path does not evict (see the header).
+        if (evict_on_error) evict_continuation(ctx, prev_id);
         return translate_prepare_error(*err);
+    }
+    if (req.token_mode) {
+        // W6b: the sampler's span sink, one vector per token-mode turn. The
+        // sampler appends at its own counter increments; the SSE writer drains
+        // it right after the emit that follows. Null outside token mode, so the
+        // off path allocates nothing.
+        prep.chat.input.sampler.span_events = std::make_shared<std::vector<SamplerSpanEvent>>();
+        // The engine renders the prompt it serves; the gateway's render hash is
+        // over that same full history. A mismatch is a 409 before the slot, not
+        // a cache miss later: the prompt is never echoed, only the hash.
+        const std::string served = "sha256:" + sha256_hex(prep.chat.input.prompt);
+        if (served != req.render_prompt_sha256) {
+            // A continuation's stored entry is NOT evicted here: nothing of it
+            // was served, no token left the engine, and the client can retry the
+            // same previous_response_id once its render is fixed. Only a
+            // prepare 4xx (the stored prefix itself is broken) evicts.
+            return renderer_conflict("arcint.render.prompt_sha256 does not match the prompt this "
+                                     "unit renders for the turn; the gateway's render and the "
+                                     "engine's differ", "arcint.render.prompt_sha256");
+        }
     }
     // One line for the quiet path too: a truncated turn's numbers, so an
     // operator reading the log knows what was served and what was dropped.
@@ -947,6 +1196,9 @@ json response_resource(const ResponseRequest& req, const PreparedChat& prep,
     // loop guard's counters use.
     if (prep.truncation.blocks_dropped > 0) ext["truncated"] = truncation_json(prep.truncation);
     if (loop_guard_moved(gen.stats)) ext["loop_guard"] = loop_guard_json(gen.stats);
+    // arcint.timings: the per-response timing object, only when the request
+    // asked; the extension namespace is the spec-typed surface's own.
+    if (req.timings) ext["timings"] = timings_json(gen.stats);
     if (ext.size() > 1) parts.arcint_ext = std::move(ext);
     parts.output = std::move(output);
     parts.usage  = json{{"input_tokens", gen.stats.prompt_tokens},
@@ -1005,6 +1257,7 @@ HttpResult run_response(const Context& ctx, PreparedResponse& prep, int slot) {
         return HttpResult{500, responses_error(e.what(), "server_error", "internal_error")};
     }
     log_stats(slot, stats, reason);
+    if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
 
     // A cancel-by-id is a 200 with the incomplete resource (the campaign's
     // Cancel section); a stop signal is a 503 an alive client reads; a gone

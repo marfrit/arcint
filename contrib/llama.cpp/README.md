@@ -4975,3 +4975,516 @@ and `tests/acceptance/ab.py` for the A/B, the LEO arm's binary through the
 wrapper. The coder's prefill loss is owed a cause: rebuild with
 `-DGGML_OPENCL_PROFILING=ON` and compare `cl_trace.json` under both drivers for
 the same prefill chunk (kernel names, device durations, copies).
+
+## 0076 — retired, not carried
+
+The Intel >4 GiB JIT option (`-cl-intel-greater-than-4GB-buffer-required` /
+`-ze-opt-greater-than-4GB-buffer-required`) is not a patch. **Evidence class:
+`measured-here` (the card host, offline; compute-runtime/ocloc 26.27.39122.11).**
+On dg2 the default program is stateful (`send.ugm` with ExBSO and surface state
+`0x220E8504`); either option makes it stateless (`0x020E8584`, no surface state).
+On bmg all three builds are identical and already stateless. `clinfo`: the
+A770's `CL_DEVICE_MAX_MEM_ALLOC_SIZE` is 4,294,959,104 B and the B60's is
+24,385,683,456 B. So on the A770 no `cl_mem` exceeds 4 GiB and the option moves
+every kernel to stateless addressing for nothing; on the B60 it changes nothing.
+The old "the slots are a >4 GiB buffer" premise is contradicted by the OpenCL
+type's split at `CL_DEVICE_MAX_MEM_ALLOC_SIZE` (`code`,
+`docs/campaigns/research-vram-arena.md` §2.4). Two programs build their own
+option strings (argsort, div) and are not on the JIT builder's path (`code`).
+
+## 0077-opencl-alias-pages.patch
+
+A **sampled tripwire** for VRAM page-table aliasing at the expert cache's init
+and each learned bank-stream order's ring (re)allocation (a relearn after a
+reset scans again), a named deviation from Strata's full scan. **Evidence class: `code` (Strata's
+`sycl_queue.hpp:168-206, 259-295`, `research-reference-audit.md`) and
+`measured-here` for the device-free cells; the card arm is owed.**
+
+The round-1 build intersected host virtual ranges of distinct USM host
+allocations. Two distinct allocations cannot overlap, so it could not fire on
+any real class; it is removed (`code`: no `ggml_cl_ranges_overlap` remains).
+The reference's class lives in VRAM page tables: two virtual 64 KiB blocks
+inside one allocation sharing one physical page, where the later write is
+visible when the earlier block reads back.
+
+**The deviation, said.** Strata tags every 64 KiB block of an allocation of
+32 MiB or more with GPU kernels, frees and re-allocates behind a growing spacer
+up to 8 times when a tag is lost, then warns and proceeds (`code`, the lines
+above). This patch samples at most 16 blocks an allocation and one region a
+slot tensor, through blocking host<->device copies; for Strata's
+one-aliased-page class that is a sample, not a full scan. The review put the
+one-64 KiB-block sample's hit chance at order 2 % (estimate, not measured
+here); one whole slice is ~0.6 MiB on this artifact, a larger sample, so its
+hit chance is higher and is not quantified. The full-scan
+alternative is a write kernel plus a read-back kernel over every block: one
+64 KiB write and one read a block, i.e. **2 × allocation bytes of traffic** in
+one scan pass at a learned order; at the unit's 12,000 MiB slot budget that is ~24 GiB of
+traffic (formula, `code`; the seconds are the card arm's), with the same
+warn-and-proceed verdict. It is not built here; the operator can choose it
+against this sampled cost.
+
+The patch is that sampled write/read-back, at the cache's init and each learned
+bank-stream order's ring allocation (not model load; a relearn after a reset
+scans again):
+
+- `ggml/src/ggml-opencl/ggml-opencl-alias.h` (new): the bounded plan (at most
+  16 blocks an allocation, evenly spread, 64 KiB aligned) and the pattern, so
+  the device-free cell tests exactly what the backend runs;
+- `ggml-opencl.cpp`: when a learned order completes and the ring is (re)allocated
+  (K=4), the blocks are written, then all read back; `ggml_cl_bank_stream_reset`
+  clears the learned state, so the next learned order scans again. The USM **host** staging ring is not
+  scanned (host RAM, not a GPU page table, `code`). A finding names the block
+  and a scan ends with one summary line:
+  `alias check, bank stream ring: d of N sampled blocks differ`. A finding
+  **warns and proceeds**, the ring included; Strata's spacer retry is not built.
+  Cost: ~4 MiB written plus ~4 MiB read for the K=4 ring (`code`; the seconds
+  owed);
+- `src/llama-expert-cache-alias.h` (new) and `llama-expert-cache.cpp`: the same
+  tripwire over every slot tensor in its slot buffer (`bslots`, the ask's
+  `b_lend`, the candidates' per-layer spares) at the init, after the usage marks
+  and before the fill. The region is **one whole slice**: offset a multiple of
+  the tensor's `nb[2]`, size exactly `nb[2]`. The OpenCL set path's planar
+  conversion asserts `offset % nb[2] == 0 && size % nb[2] == 0`, so the old
+  arbitrary 64 KiB offset died at load on IQ3_S (the use configuration) and the
+  SOA path read past a short caller buffer (`code`). The sampled switch covers
+  the planar types (IQ2_XXS, IQ2_XS, IQ2_S, Q2_0, IQ3_S) and IQ3_XXS, whose
+  OpenCL set path is a plain write and accepts a whole slice; the whole-tensor
+  readers (Q4_0, Q1_0, Q8_0, IQ4_NL, Q4_K) are not sampled because their set
+  path reads the whole tensor. On the IQ3_S Flash-Next artifact the measured
+  count is 94 sampled expert tensors, ~53.8 MiB of whole slices (`code`, the
+  GGUF dims and the cache's slot tensors). The per-type slice sizes are in
+  `docs/campaigns/prefill-slot-loan-design.md:498-503` (IQ3_S 704,000 B,
+  IQ3_XXS 422,400 B, IQ4_XS 870,400 B, IQ4_NL 921,600 B, Q8_0 1,740,800 B);
+  the upper bound if all 144 slot tensors (48 layers x 3) were IQ3_S is
+  144 x 704,000 B = 101,376,000 B, ~97 MiB. The artifact's measured ~54 MiB
+  written plus ~54 MiB read (~108 MiB traffic), one-time (`code`; the seconds
+  are the card arm's); the summary line reports the sampled bytes. The plan
+  holds spans and ids, not expected bytes: the pattern is regenerated at each
+  read-back, so the peak host transient is one region (~0.6 MiB here), not the
+  sampled total, and the load's RAM forecast has room for it. The sampled total
+  is not held on the host. `LLAMA_EXPERT_CACHE_ALIAS=0` turns it off for the
+  load-cost arm. A finding **warns and the load proceeds**, not a refused cache
+  (`code`). The patterns are overwritten by the expert load; nothing the model
+  computes changes.
+
+Cells (`code`, device-free): `tests/test-opencl-alias.cpp` (plan, pattern, a
+two-page model that aliases on purpose reports the earlier block, the bank-ring
+call, no host-ring scan, findings and the summary); `tests/test-expert-cache-alias.cpp`
+(the region arithmetic over every sampled type's `nb[2]`, pattern, one differing
+region is one finding, writes before reads, warn-and-proceed, no held expected
+bytes and the summary's sampled bytes). Reds (`measured-here`, each seen
+failing): the arbitrary 64 KiB offset restored (`FAIL: the region starts on a
+whole slice` and `FAIL: the region lies inside the tensor`); the doubled
+region restored (`FAIL: the region is one whole slice`); IQ3_XXS removed from
+the sampled switch (`FAIL: the planar types are the ones sampled`); a
+whole-tensor reader added to the sampled switch (`FAIL: the whole-tensor SOA
+readers are not sampled`); a held expected region restored (`FAIL: the plan
+holds no expected bytes and the summary reports them`); the summary's byte
+count removed (`FAIL: the finding is logged with its count and the sampled
+bytes`); the host staging-ring scan restored (`FAIL: the USM host staging ring
+is not scanned`); the slot call refusing the load (`FAIL: a finding warns and
+the load proceeds`).
+
+Card arms owed: a fresh Flash-Next load at the unit's slot budget, the
+`alias check` summary lines, the load seconds with `LLAMA_EXPERT_CACHE_ALIAS=0`
+and `=1`, and a served check. A device-side alias cannot be constructed on
+purpose (the runtime chooses the pages), so the red is the check's own mutation
+and a healthy load's zero findings.
+
+Implemented by meseeks (a private DeepSeek-V4.1-Flash quant, run locally) over 1
+review round; briefed and reviewed by Claude.
+
+The three cells are labelled `unit` for a llama tree configured with
+`LLAMA_BUILD_TESTS=ON` (`ctest -L unit`); the package recipe builds the engine
+with tests off, so they do not run there.
+
+## 0078-opencl-staging-bound.patch
+
+The graph-input staging bound. **Evidence class: `code` and `measured-here` for
+the device-free cells; the card arms are owed.**
+
+0047 staged a graph input into a USM ring and removed the blocking write for
+inputs at or below 4 MiB; above it the write blocked. The round-1 0078 removed
+that cap by splitting a large input into 4 MiB chunks, which the review found
+wrong twice (`measured-here`): an input larger than the ring wraps inside its
+own loop (the f16 mask at 200K depth, ubatch 512 is ~200 MiB: six `clFinish`es
+and a 200 MiB host memcpy where one blocking DMA was), and removing the refusal
+rerouted every non-weight `set_tensor`, including the checkpoint restore and
+`llama_state_seq_set_data` (DESIGN §3.4's 38.75 → 0.61 s resume).
+
+The bound, both terms:
+
+- `ggml/src/ggml-opencl/ggml-opencl-staging.h` (new): `ggml_cl_stage_fits` (an
+  exact fit at the head is allowed; a zero-size ring fits nothing);
+- `ggml-backend.h` / `ggml-backend.cpp`: a thread-local marker,
+  `ggml_backend_sched_input_copy_begin/end/active`, held by a guard at
+  `ggml_backend_sched_copy_input`; another thread's restore is never staged
+  (`code`). It **gets the old blocking write**: 1.3.0's 0047 staged every
+  non-WEIGHTS `set_tensor` at or below 4 MiB, including
+  `llama_state_seq_set_data`'s KV and recurrent chunks, so the restore timing
+  before/after is a card arm owed before 0078 is called equivalent (DESIGN
+  §3.4's 38.75 → 0.61 s resume). A CPU island's host->device copy goes through
+  the same scheduler copy function, so a non-INPUT copy up to the ring's free
+  space is staged too (`code`).
+- `ggml_cl_stage_write`: stages only when the marker is active and the whole
+  copy fits the ring's free space. A copy larger than the ring is tested before
+  the wrap and returns false without a `clFinish`, taking the blocking write; a
+  wrap before a smaller write is the 0047 reuse (a `clFinish`, then the head
+  resets). One `clEnqueueWriteBuffer` of the whole copy; no chunk loop. `GGML_OPENCL_STAGE_MB` sets the ring (8-1024 MiB, default 32);
+  `GGML_OPENCL_STAGE_INPUTS=0` turns staging off; `STAGE_RED=1` is the
+  stale-ring red.
+
+Cells (`code`, device-free): `tests/test-opencl-staging.cpp` (the fit table, one
+ring-bound ask after the explicit larger-than-the-ring return, the marker's
+thread-local guard, no `size > (4u << 20)`, no chunk loop). Reds
+(`measured-here`, each seen failing): the marker check removed
+(`FAIL: staging asks the scheduler's graph-input marker`); the larger-than-ring
+return moved after the wrap (`FAIL: a copy larger than the ring does not finish
+the ring`).
+
+
+**Window 47 (`measured-here`, Claude, 2026-11-01, the A770, the coder with its unit's flags, the 1.3.0 package
+against this branch's binary f3ec32b, two rounds alternated):** a 40,365-token prompt sent twice with different
+final questions; the second request hits 97.5 % of the prefix (39,337 tokens) and so takes the checkpoint
+restore. Time to the first streamed byte: request 1 (cold) package 48.04 / 48.22 s, branch 47.92 / 47.96 s;
+request 2 (restore) package 2.17 / 2.37 s, branch 2.07 / 2.07 s. The restore path does not regress under the
+bound. The coder's 0077 check is a no-op (Q4_K slots are not sampled); 0077's load cost is measured on
+Flash-Next in the release window.
+
+Card arms owed (each on the unit's own `--model`, `--mmproj`, `--device` and
+`--port` flags, collected as `UNIT_FLAGS`; the baseline is the `9f1ea8e` deb,
+the branch is this patch series' deb):
+
+```
+GGML_SCHED_TIMING=1 GGML_OPENCL_STAGE_INPUTS=1 arcint $UNIT_FLAGS --port 8090
+GGML_SCHED_TIMING=1 GGML_OPENCL_STAGE_INPUTS=0 arcint $UNIT_FLAGS --port 8090
+for MB in 32 64 128 256; do GGML_SCHED_TIMING=1 GGML_OPENCL_STAGE_MB=$MB arcint $UNIT_FLAGS --port 8090; done
+GGML_SCHED_TIMING=1 GGML_OPENCL_STAGE_RED=1 arcint $UNIT_FLAGS --port 8090
+```
+
+- a 100K agent prefill and decode, `STAGE_INPUTS=1` against `=0`, alternated
+  twice: `GGML_SCHED_TIMING=1` inputs us/graph and decode;
+- the `GGML_OPENCL_STAGE_MB` sweep above, at least one value covering the depth's
+  f16 mask (Flash-Next's 200K mask is ~200 MiB; the unit's slot budget decides
+  the ring);
+- checkpoint restore: 24.3k-token follow-up TTFT on the branch and the baseline
+  deb, same flags, before/after 0078 is called equivalent;
+- `GGML_OPENCL_STAGE_RED=1`: stale ring bytes, the path's own red.
+
+Adoption follows the repository's rule: any measured gain with no other target
+degrading is adoptable. The comparison is the per-graph input time with
+`STAGE_INPUTS=1` against `=0`, and the restore's TTFT on the branch against the
+baseline deb.
+
+Implemented by meseeks (a private DeepSeek-V4.1-Flash quant, run locally) over 1
+review round; briefed and reviewed by Claude.
+
+## 0079-opencl-dg2-leo-image-limit.patch
+
+The A770's LEO abort, worked around at the creation site. **Evidence class of
+the defect: `measured-here` + `code`.** On a DG2 device under the runtime's LEO
+mode (`OpenCL on Level Zero`, `EnableLEO=1 NEOReadDebugKeys=1`), an
+`IMAGE1D_BUFFER` (`CL_R`, `UINT32`) above **16,384 texels** aborts inside
+`RENDER_SURFACE_STATE::setWidth` at the 14-bit field check
+(`UNRECOVERABLE_IF((value - 1) > 0x3fff)`, compute-runtime 26.35 source); 16,384
+fits, 16,385 does not. The default driver passes every size; the B60 under LEO
+passes every size. The abort is in the runtime's DG2 command generation, so the
+allocation succeeds and there is no `clCreateImage` error to catch. The
+reproducer is `tools/leo_image1d_buffer_repro.c` (`measured-here`, runtime 26.27
+and 26.35).
+
+The patch is narrow by design: on **DG2 under LEO only** an image above 16,384
+texels is refused; every image that fits is still created, and the driver's own
+`CL_DEVICE_IMAGE_MAX_BUFFER_SIZE` is still honoured. On the default driver and
+on the B60 the rule's DG2 or LEO term is false, so the images, kernels and
+outputs are the same as before (the default-driver arm's pass set and texts are
+the gate). The rule is one device-free header function and one predicate pair:
+
+- `ggml/src/ggml-opencl/ggml-opencl-image-limit.h` (new): the rule, the
+  `16,384` bound, the LEO version predicate (`CL_DEVICE_VERSION` contains
+  `LEO`, the device string reads `OpenCL 3.0 LEO`; `measured-here`) and the DG2
+  name predicate (Intel Arc A-series / Pro A-series; `code`);
+- `ggml-opencl.cpp`: at init, `leo_mode` from the device version and `dg2` from
+  `CL_DEVICE_NAME` / `CL_DEVICE_ID_INTEL` when
+  `cl_intel_device_attribute_query` is exposed (the A770 is `0x56a0`,
+  `measured-here`; the id window covers the desktop A-series ids only, the name
+  predicate runs first and covers the Arc A and Pro A names; a Flex part would be
+  missed, `code`). One call site
+  `ggml_cl_image_texels_ok()` builds the mode from the context.
+
+Every `IMAGE1D_BUFFER` creation in the patched `ggml-opencl.cpp` (`code`,
+inventory over the 0001-0072 text; counts before this patch):
+
+- **one** is reachable in the Intel build outside an Adreno guard: the MXFP4
+  weight image in `ggml_backend_opencl_buffer_set_tensor`
+  (`CL_MEM_OBJECT_IMAGE1D_BUFFER`, `CL_RG`/`CL_UNSIGNED_INT32`,
+  `nelements/32*2` texels; the 2880x2880 case is 518,400). **Guarded here**; the
+  refused branch leaves `extra->q_img = nullptr`, and every Intel MXFP4 kernel
+  this backend selects reads the `q` buffer, so no kernel choice changes. (The
+  MoE weight-image variants are `GGML_OPENCL_USE_ADRENO_KERNELS`-only.)
+- **one** image pool creation (`ggml_cl_img_pool_get_or_create`) with six
+  callers in the source, two of them compiled in the Intel build: flash
+  attention's prefill K view (DK=512, `GGML_OPENCL_FA_PREFILL_K_IMG`) and its
+  decode K view (`GGML_OPENCL_FA_K_IMG`), both opt-in; the four f16 KQ/KQV image
+  mul_mat callers sit inside the Adreno `#ifdef` (`code`). **Guarded here**,
+  before the sub-buffer is created (a refusal after it would leak one sub-buffer
+  handle per call, reachable on the A770 only with one of the two switches set;
+  the cell checks the order);
+  `nullptr` is the pool's existing "no image" answer, and every caller null-checks
+  it and takes its buffer kernel. The coder's prefill flash attention
+  (`flash_attn_f32_f16_dpas`) is buffer-only and never a pool client.
+- **all others** are under `#ifdef GGML_OPENCL_USE_ADRENO_KERNELS` (not
+  compiled in the Intel build: `-DGGML_OPENCL_USE_ADRENO_KERNELS=OFF`), or live
+  in functions whose body compiles on Intel but whose only call sites sit inside
+  that `#ifdef` (`ggml_cl_mul_mat_q1_0_f32_adreno`, the `A_image1d`/`D_image1d`
+  images of `ggml_cl_mul_mat_kq_kqv_adreno`): the `#ifdef` is the guard, not the
+  `use_adreno_kernels()` predicate. They are not reachable on the A770 and are
+  untouched.
+- The two extra fields `q_img`/`d_img` set in the SoA conversion are
+  `GGML_OPENCL_USE_ADRENO_KERNELS`-only as well.
+
+Kernel selection sites that assume an image (`code`; each already refuses a
+missing image, so no site needed a new branch):
+
+- q4_K MoE decode weight-image: `&& extra0_q4_K->q_img != nullptr` (Adreno);
+- MXFP4 MoE decode weight-image: `&& extra0_mxfp4->q_img != nullptr` (Adreno);
+  both strings sit inside Adreno `#ifdef`s, dead text in the Intel build; on the
+  A770 the proof is that the `gpu_family == INTEL` branches of the MXFP4 mul_mv and
+  mul_mv_id read `extra0_mxfp4->q`, never `q_img` (`code`);
+- flash attention: `if (prefill_k_img == nullptr)` resets the kernel to
+  `fa.f32_f16_split.at(dk_dv)`; the other FA K-image path tests
+  `if (k_img == nullptr)` and sets `use_fa_k_img = false`;
+- q8_0 and q4_K dense dp4a wimg variants: their `q_img` locals are
+  null-checked where created and released.
+
+Tests (`tests/test-opencl-image-limit.cpp`, device-free; `code`): the rule
+table including **16,384 allowed / 16,385 refused** under DG2+LEO, default
+driver and B60 permissive at the same sizes, a driver max below the bound; the
+LEO version and DG2 name predicates; and text checks that the MXFP4 site and
+the image pool ask the bound, the MXFP4/q4_K selection sites require a live
+image, and FA falls back. CMake adds `test-opencl-image-limit` under
+`GGML_OPENCL`.
+
+Red-first (local, `measured-here`): four mutations each fail the test and exit
+1, then the restored text passes:
+- DG2 term dropped -> `FAIL: B60 LEO: 16385 allowed` (and 1036800);
+- LEO term dropped -> `FAIL: A770 default driver: 16385 allowed` (and 1036800);
+- bound `>` -> `>=` -> `FAIL: A770 LEO: 16384 fits`;
+- MXFP4 selection loses `&& extra0_mxfp4->q_img != nullptr` ->
+  `FAIL: mxfp4 wimg selection needs a live image`.
+The series build (`-DGGML_OPENCL=ON -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF`) and
+`ctest -R test-opencl-image-limit` pass.
+
+Card gate (owed; Claude runs it in a card window, **not yet measured**):
+1. **A770, fresh-host container, runtime 26.35** and **the card host, runtime
+   26.27**; the reproducer still aborts under LEO:
+   `cc -O2 -o /tmp/leo_repro tools/leo_image1d_buffer_repro.c -lOpenCL`
+   `EnableLEO=1 NEOReadDebugKeys=1 /tmp/leo_repro 16385 1` -> abort at
+   `setWidth`; `EnableLEO=1 NEOReadDebugKeys=1 /tmp/leo_repro 16384 1` -> read
+   back, 0 mismatches; `/tmp/leo_repro 16385 1` (default driver) -> 0
+   mismatches. This proves the bound and that the patch did not hide it.
+2. **A770 full op suite** from the series build:
+   `GGML_OPENCL_DEVICES=1:0 ./bin/test-backend-ops -b GPUOpenCL` (default;
+   record the pass count and the failure names), then
+   `GGML_OPENCL_DEVICES=1:0 EnableLEO=1 NEOReadDebugKeys=1 ./bin/test-backend-ops -b GPUOpenCL`.
+   Expected (`measured-here` on 26.27/26.35 before the patch): the default set
+   is 12,867 / 12,881 with 3 `ADD_*_MUL`, 3 `FLASH_ATTN_EXT` hsk=64 f16 and 8
+   `SWIGLU_OAI` failing; under LEO the same failures and the same 12,867, with
+   no abort at MXFP4 m=2880 n=32 k=2880. A different pass count or failure name
+   is a finding, not a pass.
+3. **Coder served under LEO against the default driver**, two rounds,
+   `--device GPU.1` (A770). The LEO arm is the same binary through a wrapper:
+   `printf '#!/bin/sh\nexport EnableLEO=1 NEOReadDebugKeys=1\nexec %s "$@"\n'
+   <arcint-binary> > /tmp/arcint-leo && chmod +x /tmp/arcint-leo`
+   `python3 tests/acceptance/ab.py coder --old <arcint-binary> --new
+   /tmp/arcint-leo --gguf <coder.gguf> --device GPU.1 --assets <assets>
+   --rounds 2 --out /tmp/ab-79`. Record decode/prefill per arm, the answers'
+   md5 majority, the acceptance line and the `FAIL` lines. The prior LEO arm
+   (`measured-here`, 26.27): decode +5.6-5.8 % (51.60->54.60, 52.80->55.75,
+   45.35->47.90 t/s), prefill 41k -5.3 % (730.15->691.15), FAIL on prefill;
+   the patch does not claim that loss fixed.
+4. **The owed codegen check** on `flash_attn_f32_f16_dpas` under both drivers:
+   in two empty directories,
+   `CLI_DumpProgramBinaries=1 GGML_OPENCL_DEVICES=1:0 ./bin/test-backend-ops -o
+   'FLASH_ATTN_EXT' -b GPUOpenCL` (default) and the same with
+   `EnableLEO=1 NEOReadDebugKeys=1`. Disassemble every dumped `.bin` with
+   `ocloc disasm -d igc -device dg2 -file <bin>` (drop `-device dg2` if the
+   local `ocloc` rejects it), find the kernel named
+   `flash_attn_f32_f16_dpas`, and record **register count and spill bytes per
+   mode** (`Number of registers used`, `Spill Memory Size`). The LEO prefill
+   loss sits in that kernel (+14.8 %, 21,643 -> 24,844 ms, 858 calls); a
+   register/spill difference between the modes is the cause to confirm or
+   refute, not a claim yet.
+
+For an A770 LEO run the log line `ggml_opencl: LEO on DG2: weight images above
+16384 texels are skipped` (once at init) and, at the first large MXFP4 tensor,
+`ggml_opencl: mxfp4 weight image skipped (518400 texels, DG2 + LEO)`, are the
+patch's own evidence that the branch was taken; the absence of both means the
+detection did not match and the run is not a test of the patch.
+## 0074-opencl-intel-qk-norm-rope.patch
+
+The q/k RMS norm and its rotation sit adjacent on every attention layer of both
+served models (`code`: `src/models/qwen35.cpp:309-321`, `qwen4exp.cpp:994-1008`:
+`rms_norm -> mul(1-D [head_dim] weight) -> rope_multi`, mode 40), three kernels
+a side, six launches a layer. The patch takes the three nodes as one dispatch:
+`kernel_rms_norm_mul_rope_multi_f32` (`kernels/rms_norm.cl`) computes the norm's
+float4 sum and scale, applies the weight on the rounded normed value and rotates
+with `rope_yarn`'s cos/sin and the interleaved M-RoPE's position layout — the
+three expressions `kernel_rms_norm_mul` and `kernel_rope_multi_f32` use, with
+the normed row no longer stored and reloaded. The gate is the 3-node pattern in
+`ggml_opencl_can_fuse`, checked before the 2-node norm+mul prefix (which would
+otherwise swallow its first two nodes), and only for mode
+`GGML_ROPE_TYPE_IMROPE`, a 1-D weight, a 4-aligned contiguous input row and a
+contiguous f32 output; `rope->src[0] == mul` is required explicitly
+(`ggml_can_fuse` also accepts the mul as rope's `src[1]`, which is not this
+kernel's shape), and the sections' sum must be positive — the per-op path
+asserts it and the fused kernel's `ic % sect_dims` would divide by zero on the
+GPU without a word (`code`).
+
+Switch: `GGML_OPENCL_FUSE_QK_NORM_ROPE=1`, **off by default** (`code`). It
+**failed on the cards (window 42, `measured-here`)**: with the switch on,
+`test-backend-ops -o RMS_NORM_MUL_ROPE` was 45 of 227 failing on the A770 and a
+device fault on the B60, because the kernel stepped the positions' offset in
+elements instead of bytes (round 4, `code`). **Fixed and re-run (window 45,
+`measured-here`):** fused-on 227/227 on both cards; served, off vs on, coder
+55.10/55.75 vs 53.92/55.08 t/s, agent 41.97/42.47 vs 42.05/42.40, Flash-Next
+inconclusive; no decode gain, so it stays **off**.
+
+`code`: the patch adds the served shapes to `test-backend-ops`'s
+`RMS_NORM_MUL_ROPE` — `[128,16,1]` and `[128,16,5]` with the strided Q layout
+(`nb[1] = 2*ne0*4`, the joint Q|gate projection's query half) and the 1-D
+weight, `[128,8,6]` contiguous — which is where the red case is run: one term
+dropped from the kernel (the epsilon, the weight, the rotation) fails those
+cases on the card. Device-free, `tests/python/test_fuse_qk_norm_rope.py` reads
+the patched tree: the epsilon in the scale, the weight at both rotated
+positions, the norm-then-weight rounding order, the rotation's formula and the
+M-RoPE position layout, the switch's default and the 3-before-2 dispatch order.
+Mutations run red before restore (`measured-here` on the patched tree): the
+epsilon dropped, the weight read at `w[ic]`, the weight folded before the
+rounding, the default flipped on, the dispatch moved below the prefix, the
+sections guard dropped, the operand-order guard dropped — each made its cell
+fail; restored, the cell passes. The cells are **source-text assertions** (they
+read the patched tree), not numerics.
+
+**Rounding, stated plainly** (`code`): the fused kernel rounds the normed value
+in two steps — `(x * scale)` then `* w`, kept apart by the 0049 `opaque` guard.
+`kernel_rms_norm_mul` has no such guard (`rms_norm.cl`, the plain `(x * scale) *
+f[i00]`), so it may fold `x * (scale * w)` itself and the two paths' bits are
+not promised to agree either way. The gate is the answer-level bar
+(`CLAUDE.md`) with an md5/argmax tripwire per fusion; `test-backend-ops`' NMSE
+cannot see the rounding-order mutation, which is why the tripwire exists.
+
+**Window 42, `measured-here` (the first card run).** Switch off 227/227 on both
+cards; on, the A770 fails 45 of 227 and the B60 exits 134 after 6 failures
+(`clWaitForEvents` error -14, `CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST`).
+Every failure is `mode=40` (IMROPE) with `[ROPE] ERR 1.1-2.4`; the A770's values
+are the unrotated normed row (a host mirror of the reference against an
+unrotated row gives the same NMSE band). Served, two rounds each, the capital
+right everywhere, the default path equal to the package binary: coder (A770)
+53.27/52.90 vs 56.03/55.70 t/s (-5 %), MTP acceptance 35.8 -> 32.6 %; agent
+(B60) 39.37/39.35 vs 42.40/42.32 (-7 %), acceptance 39.0 -> 34.9 %; Flash-Next
+33.35/34.58 vs 33.95/33.93, expert hits 81.2 -> 83.5/82.9 %.
+
+**Window 43, `measured-here`: the defect, found and fixed (`code`).** The
+diagnostic print of round 3 read **pos=0/0/0/0 for all four position streams of
+every dispatch, 67 of 67** (`~/w42/diag74-a770.log`: `theta=0, cos=1, sin=0`,
+e.g. `n_dims=8192 ... sect=8190 secs=2730/2730/2730/0 pos=0/0/0/0`), while the
+test fills the positions with `rand() % 512` (`code`: the case's
+`initialize_tensors`). That is theta 0 for every row — the unrotated output the
+NMSE band predicted. The cause is the kernel's own first line: `src1` is a
+`global int *` and `src1 = src1 + offset1` stepped the operand offset in
+**elements** (x4 bytes) instead of bytes, reading a wrong, zeroed region; the B60
+then read past the buffer and faulted. `kernel_rope_multi_f32` casts every
+offset through `global char *`; so does this kernel now, for src1
+(`src1 = (global int *)((global char *) src1 + offset1)`). The fused-on suite and
+the served A/B are owed to the next window; no speed is claimed.
+
+**Why it was slower — from the code (`inferred`; the A/B has not been re-run).**
+The fused dispatch ran one work-group a row with lws = `ne00` (128), while the
+rope phase gives one lane a rotated pair: half the lanes idle in the rotation,
+and the group waits behind the norm's two barriers before the rotation starts.
+The two kernels it replaces have the same norm geometry (one group a row) and an
+all-active 64-lane rope group with no barrier. The fusion's only saving is 2
+launches a side, ~0.4 % at the wall by the audit's pricing, below its +0.5 %
+bar. The patch now sets lws to one lane a pair (rounded to a subgroup, capped so
+the subgroup count fits the local `sum`), which removes the idle lanes but not
+the barrier serialization. Whether that clears the bar is the next A/B's answer,
+not this text's.
+
+To prove the fix in the next window (print the offset the host passed and the
+four ints the kernel reads, then restore):
+
+    sed -i '/float2 cos_sin_theta = rope_yarn_fused/a\            if (i01 == 0 && i02 == 0 && get_local_id(0) == 0) { printf("FUSED offset1=%lu n_dims=%d n_offs=%d sect=%d secs=%d/%d/%d/%d pos=%d/%d/%d/%d theta=%f cos=%f sin=%f\\n", offset1, n_dims, n_offs, sect_dims, sections.s0, sections.s1, sections.s2, sections.s3, pos[0], pos[ne02], pos[2*ne02], pos[3*ne02], theta_base * pow(freq_base, inv_ndims*iw), cos_sin_theta.s0, cos_sin_theta.s1); }' ggml/src/ggml-opencl/kernels/rms_norm.cl
+    GGML_OPENCL_DEVICES=1:0 GGML_OPENCL_FUSE_QK_NORM_ROPE=1 ./bin/test-backend-ops -b GPUOpenCL -o RMS_NORM_MUL_ROPE
+    git checkout ggml/src/ggml-opencl/kernels/rms_norm.cl
+
+`pos=` must read the case's position values (not four zeros) with `offset1` the
+tensor's byte offset; the same print on the B60 (`GGML_OPENCL_DEVICES=0:0`) must
+not abort.
+
+## 0075-opencl-intel-cpu-miss-prefetch.patch
+
+Two pieces from the audit's item 6, behind `GGML_OPENCL_CPU_MISS_PREFETCH`
+(**0 off by default**; `1` the rows' hints, `2` also the page-touch pass,
+`code`): one block-ahead `__builtin_prefetch` in each of the six row functions,
+and a page touch over a missed expert's three bank slices at publish.
+
+**The premise is not Strata's — a build difference, named** (`code`). Strata's
+cold reads are file-backed rows (78 % of its CPU lane, `paper`, St 9e3fe046).
+Here a bank is USM host memory (`clHostMemAllocINTEL`, the `usm_host_alloc`
+entry points in `ggml-opencl.cpp`, the buffer context's comment) and **every
+byte is written at load** by `ggml_cl_usm_set_tensor` — the planar loop and the
+IQ4_NL split copy — so its pages are resident before the first miss, and
+`drop_caches` evicts page cache, not this memory. Prediction: major faults near
+0 and the level-2 pass buying nothing, by construction. The window's fault count
+decides; no number is claimed here (`measured-here` owed).
+
+**The hints are narrow, and said so** (`code`): each names only the next block's
+field 1 (the payload plane), two blocks ahead — 64-128 bytes, inside the
+hardware prefetcher's reach; fields 0 (the scale) and 2 (the signs/qh plane) are
+unhinted. A hint's gain, if any, is expected in the run's spread, not a step.
+
+**The touch is a synchronous barrier on the lane's critical path** (`code`):
+`ggml_cl_miss_pool::run` claims tasks and spins until `done == n`, so the
+calling (coordinator) thread waits; "in parallel" is across experts and the
+pool's workers only, not overlapped with the card's round. The slow path calls
+it once a pair, so a multiply-routed expert's slice is touched once a pair —
+redundant, kept for the one pass's simplicity.
+
+**Deviation, named** (`code`): the sketch's hint is "ahead of the next expert's
+first field"; the build hints the next block within the same expert — a rows'
+task sees one expert only. The cold-page half is built as sketched.
+
+`measured-here`, device-free: `tests/test-opencl-miss-cpu.cpp` gains the level-1
+parity arm (the rows' bits identical at level 0 and level 1 — what a hint must
+be), the ahead-distance arm and the residency arm (a 16-page mapping dropped to
+absent, one byte a page touches it all resident; a touch striding 8192 leaves 8
+of 16 absent and fails — the pass's mechanism, not its premise).
+`tests/python/test_cpu_miss_prefetch.py` reads the patched tree for the
+default-off switch, one hint in every row function, the volatile touch and the
+`>= 2` guard in both compute paths; its six red mutations (a hint dropped from
+`row_iq3s_1`, the distance 0, the stride, the non-volatile pointer, the default
+on, the guard removed) were each seen failing, and the C cells' two (stride,
+distance) likewise. Both cells are **source-text assertions**, not numerics.
+
+**Window 42, `measured-here` (the card run; the record).** Flash-Next,
+`GGML_OPENCL_CPU_MISS_MAX=64`: level 0 34.12/34.40 t/s with **0 and 10 major
+faults** over the leg, level 1 34.28 t/s (in the run's spread), level 2
+30.12 and 33.73 with one leg at **+479,730 major faults**. The premise holds
+(faults ~0 at level 0), level 1 buys nothing, level 2 costs, so **the switch
+stays off**.
+
+**The level-2 fault spike, from the code** (`code`): the touch addressed a
+missed expert's slices at `bptr[k] + b * bank->nb[2]`. For an IQ4_NL bank that is
+the SPLIT form — `ggml_cl_usm_set_tensor` lays the scales and the quants as two
+arrays over every expert — so the tensor's own `nb[2]` stride is not expert `b`'s
+offset and the walk can run past the split's region, into whatever mapping
+follows it (the GF mmap is file-backed: a major fault a page). The patch now
+addresses the split arrays by the block index `row_dot_iq4nl` reads
+(`split_d + b*nblk*2`, `split_q + b*nblk*qb`) and keeps `nb[2]` only for the
+block/planar banks. It is a fix for the spike, not for a default: level 2 still
+buys nothing by the premise.
+
+Owed on the cards, unchanged: the cold/warm pair at level 0 and the same A/B on
+the other units; the audit's bar — major faults above ~5 % of the CPU lane —
+decides a default. With faults ~0 already measured, it is ~0.

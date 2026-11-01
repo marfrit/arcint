@@ -14,7 +14,7 @@
 # (docs/history.md), and older tags are built with the recipe at their tag.
 set -euo pipefail
 
-PKGVER=1.3.0
+PKGVER=1.4.0
 UPSTREAM_TAG=v${PKGVER}
 PKGREL=1
 # The public repository, not the fleet one. The fleet repo (still named
@@ -22,9 +22,9 @@ PKGREL=1
 # and carries operator-local notes; the published tree is the same code without
 # them, so the package is built from what anyone can check.
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
-# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v1.3.0.tar.gz,
+# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v1.4.0.tar.gz,
 # taken after the tag was pushed (recorded in the follow-up commit, as for every tag).
-ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-1b1df08c55e6319573bd17f61a24ce93d544434dc612884e323f33885f3e880e}
+ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-}
 # The libllama engine (--engine llama) builds against llama.cpp at this pin
 # with contrib/llama.cpp/patches applied (contrib/llama.cpp/README.md): the
 # GitHub tarball of the commit, checked by sha256.
@@ -42,10 +42,10 @@ export SOURCE_DATE_EPOCH=1787990400
 # Fail in a second, not after the downloads: the tools and the engine's
 # build dependencies.
 for t in curl git python3 cmake objdump; do
-    command -v "$t" >/dev/null || { echo "$t fehlt (Build-Abhaengigkeit)" >&2; exit 1; }
+    command -v "$t" >/dev/null || { echo "$t is missing (build dependency)" >&2; exit 1; }
 done
-[ -f /usr/include/CL/cl.h ] || { echo "opencl-headers fehlen (/usr/include/CL/cl.h)" >&2; exit 1; }
-[ -n "${ARCINT_GIT_SHA:-}" ] || { echo "ARCINT_GIT_SHA fehlt — /props wuerde 'unknown' melden" >&2; exit 1; }
+[ -f /usr/include/CL/cl.h ] || { echo "opencl-headers are missing (/usr/include/CL/cl.h)" >&2; exit 1; }
+[ -n "${ARCINT_GIT_SHA:-}" ] || { echo "ARCINT_GIT_SHA is not set — /props would report 'unknown'" >&2; exit 1; }
 
 work=$(mktemp -d)
 trap "rm -rf $work" EXIT
@@ -62,11 +62,11 @@ fi
 if [ -n "$ARCINT_TARBALL_SHA256" ]; then
     echo "$ARCINT_TARBALL_SHA256  arcint.tar.gz" | sha256sum -c
 else
-    echo "WARNUNG: keine Pruefsumme gesetzt (ARCINT_TARBALL_SHA256) — $(sha256sum arcint.tar.gz | cut -d' ' -f1)"
+    echo "WARNING: no checksum set (ARCINT_TARBALL_SHA256) — $(sha256sum arcint.tar.gz | cut -d' ' -f1)"
 fi
 tar xzf arcint.tar.gz
 SRC=$(find . -maxdepth 1 -mindepth 1 -type d | head -1)
-[ -f "$SRC/CMakeLists.txt" ] || { echo "Tarball-Layout unerwartet: kein CMakeLists.txt" >&2; exit 1; }
+[ -f "$SRC/CMakeLists.txt" ] || { echo "unexpected tarball layout: no CMakeLists.txt" >&2; exit 1; }
 
 # The engine: llama.cpp at the pin, the patches from the arcint tarball itself,
 # so the package and its source agree on them by construction.
@@ -92,7 +92,7 @@ cd "$work"
 # the sha is handed in; without it the binary would report "unknown" and every
 # /props answer would be unattributable.
 GIT_SHA=${ARCINT_GIT_SHA:-}
-[ -n "$GIT_SHA" ] || { echo "ARCINT_GIT_SHA fehlt — /props wuerde 'unknown' melden" >&2; exit 1; }
+[ -n "$GIT_SHA" ] || { echo "ARCINT_GIT_SHA is not set — /props would report 'unknown'" >&2; exit 1; }
 
 cmake -S "$SRC" -B build \
     -DCMAKE_BUILD_TYPE=Release \
@@ -108,7 +108,7 @@ cmake -S "$SRC" -B build \
 # build), which left every package's ggml-cpu at the SSE2 baseline although docs/docker.md says the .deb is
 # built native on its host: Flash-Next with the CPU misses decoded 45.6 against 49.4 t/s (measured-here,
 # 2026-10-15). Asked for explicitly, and checked.
-grep -q '^GGML_NATIVE:BOOL=ON$' build/CMakeCache.txt || { echo "GGML_NATIVE ist nicht ON (ggml-cpu ohne -march=native)" >&2; exit 1; }
+grep -q '^GGML_NATIVE:BOOL=ON$' build/CMakeCache.txt || { echo "GGML_NATIVE is not ON (ggml-cpu without -march=native)" >&2; exit 1; }
 cmake --build build -j"$(nproc)"
 
 # The gates are the product. A package built from a tree whose unit tests fail
@@ -123,7 +123,7 @@ ROOT="$work/pkgroot"
 mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/share/doc/arcint" "$ROOT/usr/share/arcint"
 DESTDIR="$ROOT" cmake --install build >/dev/null
 
-[ -x "$ROOT/usr/bin/arcint" ] || { echo "FEHLT: /usr/bin/arcint" >&2; exit 1; }
+[ -x "$ROOT/usr/bin/arcint" ] || { echo "MISSING: /usr/bin/arcint" >&2; exit 1; }
 # llama.cpp is a static subproject: none of its install rules may land in the
 # package (headers, static libraries, CMake and pkg-config files).
 STRAY=$(cd "$ROOT" && find . -path ./usr/include -prune -print -o \( -name '*.a' -o -name '*.pc' -o -path '*/cmake/*' -o -name 'libggml*' -o -name 'libllama*' \) -print)
@@ -132,7 +132,7 @@ STRAY=$(cd "$ROOT" && find . -path ./usr/include -prune -print -o \( -name '*.a'
 # No pipe: `strings | grep -q` takes SIGPIPE under pipefail (see the ldd
 # probe below).
 grep -qa kernel_mul_mm_kq2d_q4_K_i8 "$ROOT/usr/bin/arcint" || {
-    echo "die libllama-Engine fehlt im Binary (ARCINT_LLAMA?)" >&2; exit 1; }
+    echo "the libllama engine is missing from the binary (ARCINT_LLAMA?)" >&2; exit 1; }
 # The result of GGML_NATIVE=ON, not only the ask: this host is the target host, so a ggml-cpu dot product
 # without AVX2 here is the SSE-only ggml-cpu of the packages before 0.7.12 (0 ymm registers in 0.7.11's,
 # 58 in a native build). A ggml-cpu function, because the CPU miss rows carry AVX2 in any build. Captured
@@ -140,7 +140,7 @@ grep -qa kernel_mul_mm_kq2d_q4_K_i8 "$ROOT/usr/bin/arcint" || {
 DIS=$(objdump -d --no-show-raw-insn --disassemble=ggml_vec_dot_q4_K_q8_K "$ROOT/usr/bin/arcint")
 case "$DIS" in
     *"%ymm"*) ;;
-    *) echo "ggml_vec_dot_q4_K_q8_K ohne AVX2 (ggml-cpu ohne -march=native)" >&2; exit 1 ;;
+    *) echo "ggml_vec_dot_q4_K_q8_K without AVX2 (ggml-cpu without -march=native)" >&2; exit 1 ;;
 esac
 unset DIS
 
@@ -159,7 +159,15 @@ esac
 # The retired engine's runtime must not come back through a stale build cache.
 case "$LDD_OUT" in
     *openvino*|*libtbb*)
-        echo "das Binary linkt OpenVINO (seit 0.8.0 entfernt)" >&2
+        echo "the binary links OpenVINO (removed in 0.8.0)" >&2
+        printf '%s\n' "$LDD_OUT" >&2
+        exit 1 ;;
+esac
+# TLS (-DARCINT_TLS=ON, --tls-cert/--tls-key) is an extra arm, not this recipe:
+# the package must not have picked OpenSSL up, or its Depends would be wrong.
+case "$LDD_OUT" in
+    *libssl*|*libcrypto*)
+        echo "the binary links OpenSSL: this package build must use ARCINT_TLS=OFF (--tls-* is an extra arm)" >&2
         printf '%s\n' "$LDD_OUT" >&2
         exit 1 ;;
 esac
@@ -172,14 +180,14 @@ esac
 # puzzled operator on the target host.
 for f in arcint.service arcint-vlm.service arcint-tts.service tts_enrol.py; do
     [ -f "$ROOT/usr/share/arcint/$f" ] || {
-        echo "FEHLT: /usr/share/arcint/$f — installiert CMake die Vorlage nicht mehr?" >&2
+        echo "MISSING: /usr/share/arcint/$f — does CMake no longer install the template?" >&2
         exit 1; }
 done
 # The separate env file is gone as of 0.2.2 (flags are literal in ExecStart, so
 # a unit manager and a journal can both see the port). If it comes back, it has
 # to be installed by CMake too, not by this recipe.
 if [ -e "$SRC/packaging/arcint.env" ]; then
-    echo "packaging/arcint.env ist zurueck — CMake-Installationsregel pruefen" >&2
+    echo "packaging/arcint.env is back — check the CMake install rule" >&2
     exit 1
 fi
 for f in README.md llm.txt LICENSE; do

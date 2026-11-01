@@ -1,3 +1,17 @@
+arcint (1.4.0-1) trixie; urgency=medium
+
+  * 1.4.0: token mode for gateways (GET /v1/responses/renderer, arcint:token
+    and arcint:span events, the prompt hash; /props token_mode), thinking
+    replay across a steering message (preserve_thinking; a steering turn's
+    prefix-cache hit 13.4 -> 99.6 % on the coder), POST /tokenize and
+    /detokenize, --metrics, --api-key, TLS behind ARCINT_TLS (not in this
+    package); the strict arcint object on Chat Completions; patches
+    0074/0075 (off), 0077/0078 (on), 0079. Part of the feyntalk chain with
+    llm-proxy 1.3.0 and feyntalk-render 1.0.0. Flash-Next decode 2.2 % slower
+    than 1.3.0 (accepted for this release; the fix is owed for 1.4.1).
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 01 Nov 2026 22:00:00 +0100
+
 arcint (1.3.0-1) trixie; urgency=medium
 
   * 1.3.0: the Open Responses API (POST /v1/responses: non-stream and SSE, an

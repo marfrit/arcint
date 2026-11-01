@@ -45,6 +45,16 @@ struct ResponseRequest {
     std::string    previous_response_id;
     bool           has_previous_response_id = false;
     int            arcint_v = 1;
+    // feyntalk W6a (docs/campaigns/feyntalk.md, D1/D4): token mode in the
+    // arcint object. The gateway renders the prompt; the two hashes are
+    // required and are checked before the slot. `input_ids` is accepted by the
+    // schema but refused until W6f (the encode side of the renderer).
+    bool           token_mode = false;
+    std::string    renderer_hash;         // "sha256:…" of the served material
+    std::string    render_prompt_sha256;  // "sha256:…" of the gateway's render
+    // arcint.timings: the per-response timing object on the resource. Absent
+    // keeps the resource byte-identical.
+    bool           timings = false;
     // Reasoning items of the input: accepted, kept for the store (W3), never
     // rendered into the prompt — parity with /v1/chat/completions, which has no
     // reasoning replay.
@@ -70,8 +80,15 @@ struct PreparedResponse {
 // previous_response_id is refused here in W1: no store exists yet, and the
 // spec's answer for an unknown id is 400 previous_response_not_found (W3
 // replaces the refusal with the lookup).
+//
+// `evict_on_error` gates the chain-eviction rule: a continuation the server
+// answers 4xx evicts the entry it referenced, so a retry cannot silently
+// continue from a state it treated as broken. The Responses generation route
+// keeps that (true, the default). The /tokenize count path passes false: it is
+// not a turn, and learning whether the next turn fits must not destroy the
+// chain when it does not.
 std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest req,
-                                           PreparedResponse& out);
+                                           PreparedResponse& out, bool evict_on_error = true);
 
 // The complete ResponseResource for a finished turn: every required key of the
 // 2026-04-24 OpenAPI document, output items (message, reasoning,

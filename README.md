@@ -284,6 +284,11 @@ Pass `-DARCINT_GIT_SHA` whenever the tree has no `.git`; without it
 warning-clean build CI uses. [DEVELOPMENT.md](DEVELOPMENT.md) has the test
 ladder.
 
+A build that should serve TLS adds `-DARCINT_TLS=ON` (it finds and links
+OpenSSL) and takes `--tls-cert`/`--tls-key`. The default build refuses those
+flags and links no OpenSSL, so the Debian package's dependencies do not
+change.
+
 **The GPU runtime on a fresh host.** Debian trixie ships no Intel compute
 runtime in any component; install Intel's release `.deb`s from
 [intel/compute-runtime](https://github.com/intel/compute-runtime/releases)
@@ -323,8 +328,49 @@ service's production flags, Flash-Next's expert cache included
   unit keeps MTP.
 - One process holds its card's VRAM for its whole lifetime: whatever else
   was serving that card has to stop first.
-- **No authentication, permissive CORS, no TLS.** arcint is built for a LAN
-  or a reverse proxy that provides all three.
+- **No authentication by default, permissive CORS, no TLS.** `--api-key`
+  (or `--api-key-file PATH`) adds a bearer token on every route but `/health`
+  (GET/HEAD only) — `/props` and `/metrics` included, an unknown path too, and
+  the check runs before the request body is read. A 401 names the scheme
+  (`WWW-Authenticate: Bearer`); a CORS preflight (an OPTIONS with
+  `Access-Control-Request-Method`) is answered without the key. An empty or
+  newline-only key file, a key with a control character or DEL, or one that
+  starts or ends with a space is a boot error; a group- or world-readable key
+  file warns. The server keeps only the key's sha256 digest in its long-lived
+  state. `--api-key` is
+  visible to local users in `ps`, so deployments use `--api-key-file`.
+  `/health` stays open and reveals the served model id. A `-DARCINT_TLS=ON`
+  build adds `--tls-cert`/`--tls-key`. Built for a LAN or a reverse proxy.
+- `--metrics` serves `GET /metrics` in the Prometheus text format (request,
+  token, prefill/decode, cache-hit, draft counters and per-lane
+  queue/slot gauges); a request with `arcint: {timings: true}` gets the
+  per-response timings back on Chat Completions and Responses.
+- `chat_template_kwargs.preserve_thinking` (Chat Completions) and
+  `arcint.preserve_thinking` (Responses) keep every assistant turn's thinking,
+  not only the turns after the last user query, so a steering message does not
+  drop a running tool loop's reasoning; absent renders exactly as before.
+  `chat_template_kwargs` is a passthrough to the template (llama-server's
+  dialect): `enable_thinking` and `preserve_thinking` are type-checked, every
+  other key reaches the template unchanged and is not refused. `/props`'
+  `chat_template_caps` reports `supports_preserve_reasoning` (the template
+  renders reasoning_content at all) and `supports_preserve_thinking` (it reads
+  the switch).
+- `POST /tokenize` and `POST /detokenize` are llama-server-compatible:
+  `/tokenize` takes `{content, add_special?, with_pieces?, model?}` and
+  returns `{tokens}` (or `{id, piece}` objects with `with_pieces`; a piece
+  that is not valid UTF-8 on its own is its array of byte values). `content`
+  must be a string: llama-server's mixed array of strings and token ids is a
+  400 here. With a chat or Responses body it returns `{tokens, count}`, the
+  prompt tokens the same request would decode, counted through the request's
+  own prepare path; an image part is refused (the projector counts tokens this
+  route does not run). `/detokenize` takes `{tokens}` and returns `{content}`,
+  special tokens as text. Both are behind the same key as every other route. A
+  prompt the lane
+  would refuse is refused by `/tokenize` too, with the count in the error
+  body's `prompt_tokens`; llama-server's `parse_special` is accepted and
+  ignored (specials are always parsed), and a count over a continuation does
+  not evict the referenced stored response — it is a lookup, so it refreshes
+  that entry's LRU rank like any other read.
 
 ## Scope
 

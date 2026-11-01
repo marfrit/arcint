@@ -813,6 +813,63 @@ A context is a multiple of 256, at most the model's trained context, at most
   (`docs/campaigns/lanes-agent-subagent.md` (on the `qfndev` branch)). Without MTP the lanes still
   take turns, one lane per `llama_decode`.
 
+## Access control and metrics (`--api-key`, `--metrics`, TLS)
+
+Three additive serving options, all off by default.
+
+`--metrics` registers `GET /metrics` (Prometheus text format) and records the
+counters behind it: requests by route and status, prompt/completion/cache-hit
+tokens, prefill and decode seconds, speculated and accepted drafts, queue
+depth and slots busy/total per lane, and the model-loaded gauge. The values
+are the ones arcint already logs; nothing new is measured in the step loop.
+Without the flag the route does not exist. A request may set
+`arcint: {timings: true}` (Chat Completions and Responses) for the
+per-response timing object in llama-server's names — `prompt_n`/`prompt_ms`,
+`predicted_n`/`predicted_ms`, `cache_n`, `draft_n`, `draft_accepted`; an
+absent flag keeps the response byte-identical.
+
+`--api-key KEY` (or `--api-key-file PATH`, read once at boot with exactly one
+trailing newline stripped) makes every route but `/health` require
+`Authorization: Bearer <key>`; the presented key is hashed and the sha256
+digests are compared in constant time. The check runs in cpp-httplib's
+pre-routing handler, before the request body is read, so an unknown path is a
+401 too (no route probing) and an unauthenticated POST is refused unread. A
+refused request is a 401 with the OpenAI error envelope, code
+`invalid_api_key`, and a `WWW-Authenticate: Bearer` header; the CORS preflight
+(an OPTIONS with `Access-Control-Request-Method`) is answered without the
+key, and the key is never logged and never appears on `/props`. `/props` and
+`/metrics` are behind the key too, so a proxy or unit manager that reads
+`/props` has to send the key once one is configured.
+
+A key file that yields an empty key (empty, or a single newline), a key with a
+control character (below 0x20, or DEL), or one that starts or ends with a space
+is a boot error, not a silently unauthenticated server; a key with a percent
+sign starts with a warning (cpp-httplib URL-decodes header values, so a `%xx`
+escape can never be presented verbatim), and a group- or world-readable key
+file warns and names its mode. The server keeps only the key's sha256 digest
+in its long-lived state. `--api-key` is visible to local users in `ps`/
+`/proc/<pid>/cmdline` and is meant for tests; deployments use
+`--api-key-file`. `/health` stays open for GET and HEAD probes only and reveals
+the served model id, an intended trade-off.
+
+Because the 401 is written without draining an unread request body, a client
+that has already pushed more bytes than the socket buffer holds may see the
+connection reset instead of the 401. That is standard behaviour for a server
+that refuses before reading (nginx's `lingering_close` addresses the same
+class); a client that sent only headers, or awaited `Expect: 100-continue`,
+reads the 401 normally.
+
+`--tls-cert`/`--tls-key` serve HTTPS through httplib's OpenSSL server, but
+only in a build configured with `-DARCINT_TLS=ON`; the default build refuses
+the flags and does not find or link OpenSSL, so the package's Depends stay
+free of libssl. TLS is an extra arm, not the recipe's default. In an ON build
+a certificate or key OpenSSL cannot load is a boot error naming the flags
+(httplib frees its SSL_CTX, and the reason comes from OpenSSL's error queue),
+not a late "could not bind". The device-free gate builds with the option OFF,
+so the bad-certificate refusal and the HTTPS handshake are checked on the ON
+arm (an OpenSSL-enabled configure; the recipe's extra arm), not by the stub
+gate.
+
 ## Open on this engine
 
 Conversation state kept across a restart (P6; in process it is the context

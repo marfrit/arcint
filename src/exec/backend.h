@@ -23,9 +23,21 @@ public:
     virtual ~Tokenizer() = default;
 
     virtual std::vector<int> encode(std::string_view text)        = 0;
+    // llama-server's /tokenize `add_special`: the same encode with the
+    // vocabulary's BOS/EOS rule (llama_tokenize's add_special flag). The
+    // default ignores the flag and delegates to the plain encode, which is
+    // the right answer for a vocabulary without the rule and for the stub.
+    virtual std::vector<int> encode(std::string_view text, bool add_special) {
+        (void)add_special;
+        return encode(text);
+    }
     virtual std::string      decode(const std::vector<int>& ids)  = 0;
     virtual std::string      decode_one(int id)                   = 0;
     virtual int              eos_id() const                       = 0;
+    // The vocabulary's BOS id, or -1 when it has none. The count path applies
+    // the llama backend's BOS rule with it: a vocabulary that wants BOS gets it
+    // prepended when the rendered prompt did not already write it.
+    virtual int              bos_id() const { return -1; }
     // The vocabulary's size, for a scan over every id's piece (the loop-guard
     // door needs it to find the multi-newline tokens). Default 0: a tokenizer
     // that cannot enumerate offers no door mask and keeps today's behaviour.
@@ -180,6 +192,11 @@ struct GenerationInput {
     // (CompletionRequest::prompt_ids; the KLD gate's replay of the reference
     // capture's token windows).
     std::vector<int> prompt_ids;
+    // The tokens the API already made of `prompt` (the one tokenisation of the
+    // request), so the backend does not tokenise the same text again for its
+    // sampler and its count. Empty when nothing counted the text yet; the
+    // backend then tokenises it once. `prompt_ids` wins over this.
+    std::vector<int> prompt_ids_text;
     SamplerParams sampler;
 
     // Names of the tools this request declared. A real backend ignores this —
@@ -379,6 +396,27 @@ public:
     // models came up "non-reasoning" in every client.
     virtual nlohmann::json template_caps() const { return nlohmann::json::object(); }
 
+    // feyntalk W6a (docs/campaigns/feyntalk.md, D4; W6a review findings 2/3):
+    // the renderer material. The capability is separate from the material so
+    // `/props` never builds the body; the build is lazy (the first GET or the
+    // first token-mode request), once and thread-safe, and a material the
+    // canonical hash cannot encode leaves the unit servable with token mode off.
+    virtual bool renderer_capable() const { return false; }
+    // The hash of the material; builds it once on first use (W6 follow-up 3
+    // keeps `/props` off this accessor). Empty when the unit is not capable or
+    // the build failed. The request's hash check reads it.
+    virtual std::string renderer_hash() const { return {}; }
+    // The hash of the already-built material, from the cache; empty before the
+    // first build, when not capable, or while a build holds the lock (try_lock:
+    // `/props` never waits it out). Does NOT build.
+    virtual std::string renderer_hash_cached() const { return {}; }
+    // The pre-serialized body the endpoint serves, built once with the material
+    // and cached; empty when not capable or the build failed.
+    virtual const std::string& renderer_material_json() const {
+        static const std::string kEmpty;
+        return kEmpty;
+    }
+
     // `slot` is the lane this request owns for its whole life (DESIGN.md §4.1).
     // Every piece of mutable execution state — InferRequests, GDN checkpoint
     // rows, the KV block table, the MTP head's own KV — is indexed by it, which
@@ -407,6 +445,16 @@ public:
 // so n_ctx_train and the context default have something to differ from.
 inline constexpr int kStubNCtxTrain = 262144;
 
+// The prompt's ids without the backend's BOS rule: the explicit id prompt, the
+// API's already-made tokens, or one tokenisation of the text. One call per
+// request: the API stores `prompt_ids_text` when it counted the text, and the
+// backend reuses it for the sampler and the count instead of tokenising again.
+inline std::vector<int> prompt_ids_raw(const GenerationInput& in, Tokenizer& tok) {
+    if (!in.prompt_ids.empty()) return in.prompt_ids;
+    if (!in.prompt_ids_text.empty()) return in.prompt_ids_text;
+    return tok.encode(in.prompt);
+}
+
 // The stub: no weights, no card, deterministic synthetic output, with a fixed
 // identity (id "stub", `served_name` when given) and a plausible trained
 // context, so the whole HTTP surface runs in the device-free suites.
@@ -421,7 +469,8 @@ std::unique_ptr<Backend> make_stub_backend(int n_ctx, int delay_ms = 0,
                                            const std::string& served_name = {},
                                            const std::vector<int>& lane_ctx = {},
                                            const SamplerDefaults& sampler = {},
-                                           int prefill_ubatches = 1);
+                                           int prefill_ubatches = 1,
+                                           const nlohmann::json& renderer_material = {});
 
 #ifdef ARCINT_LLAMA
 // The libllama executor (ggml OpenCL), the GGUF in --gguf.

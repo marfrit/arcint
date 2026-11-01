@@ -6,13 +6,16 @@
 #include <string>
 #include <vector>
 
+#include "api/auth.h"
 #include "api/handlers.h"
+#include "api/metrics.h"
 #include "api/responses_state.h"
 #include "build_info.h"
 #include "config.h"
 #include "exec/backend.h"
 #include "http/server.h"
 #include "util/log.h"
+#include "util/sha256.h"
 
 namespace {
 
@@ -56,6 +59,52 @@ int main(int argc, char** argv) {
     lgc::log::set_level(level_for(cfg.verbosity));
     lgc::log::info("boot", "arcint %s (%s) %s, %s", ARCINT_VERSION, ARCINT_GIT_SHA,
                    ARCINT_BUILD_TYPE, ARCINT_COMPILER);
+
+    // --api-key/--api-key-file: the key is read once here, never logged and
+    // never published. The server keeps only its sha256 digest in its
+    // long-lived state; the buffers it owns and hashes are zeroed after use
+    // (a client's presented key and the C++ copies made on the way are not).
+    const bool key_configured = !cfg.api_key_file.empty() || !cfg.api_key.empty();
+    if (!cfg.api_key_file.empty()) {
+        std::string err;
+        auto        key = lgc::api::read_api_key_file(cfg.api_key_file, err);
+        if (!key) {
+            lgc::log::error("boot", "could not read --api-key-file: %s", err.c_str());
+            return 2;
+        }
+        cfg.api_key = *key;
+        lgc::api::secure_scrub(*key);   // the file-read buffer
+    }
+    if (key_configured) {
+        std::string key_error, key_warning;
+        if (!lgc::api::api_key_hygiene(cfg.api_key, key_error, key_warning)) {
+            lgc::log::error("boot", "%s", key_error.c_str());
+            return 2;
+        }
+        if (!key_warning.empty()) lgc::log::warn("boot", "%s", key_warning.c_str());
+        // A group/world-readable key file is a footgun, not a refusal: warn,
+        // naming the mode, and keep serving.
+        if (!cfg.api_key_file.empty()) {
+            const std::string mode_warning = lgc::api::api_key_file_warning(cfg.api_key_file);
+            if (!mode_warning.empty()) lgc::log::warn("boot", "%s", mode_warning.c_str());
+        }
+        // sha256_hex_secure wipes its own working copy of the key too.
+        cfg.api_key_sha256 = lgc::sha256_hex_secure(cfg.api_key);
+        lgc::api::secure_scrub(cfg.api_key);   // the parsed key
+        lgc::log::info("boot", "%s", "an API key is configured: every route but /health needs "
+                                 "`Authorization: Bearer <key>`");
+    }
+
+    // The TLS material is loaded here, with the key hygiene, BEFORE the
+    // backend: a bad --tls-cert/--tls-key is a boot error, not a failure after
+    // a long model load. The server still constructs its SSLServer later.
+    {
+        std::string tls_error;
+        if (!lgc::tls_material_loads(cfg, tls_error)) {
+            lgc::log::error("boot", "%s", tls_error.c_str());
+            return 2;
+        }
+    }
 
     std::unique_ptr<lgc::Backend> backend;
     if (cfg.stub) {
@@ -127,7 +176,12 @@ int main(int argc, char** argv) {
     }
 
     lgc::api::SlotPool slots(cfg.parallel);
-    lgc::api::Context  ctx{.cfg = &cfg, .backend = backend.get(), .slots = &slots};
+    // --metrics owns the counters; without the flag nothing is recorded.
+    lgc::api::Metrics metrics;
+    lgc::api::Context  ctx{.cfg     = &cfg,
+                           .backend = backend.get(),
+                           .slots   = &slots,
+                           .metrics = cfg.metrics ? &metrics : nullptr};
     ctx.responses = std::make_shared<lgc::api::ResponseStore>(lgc::api::ResponseStore::Limits{
         cfg.responses_store_entries, static_cast<uint64_t>(cfg.responses_store_bytes),
         cfg.responses_store_ttl_s});
@@ -135,8 +189,16 @@ int main(int argc, char** argv) {
     std::vector<std::unique_ptr<lgc::api::SlotPool>> lane_pools;
     ctx.lanes = lgc::api::make_lanes(cfg, lane_pools);
 
-    lgc::HttpServer server(cfg, ctx);
-    g_server.store(&server);
+    // The TLS server construction can refuse a bad --tls-cert/--tls-key; that
+    // is a boot error, not a bind error later.
+    std::unique_ptr<lgc::HttpServer> server;
+    try {
+        server = std::make_unique<lgc::HttpServer>(cfg, ctx);
+    } catch (const std::exception& e) {
+        lgc::log::error("boot", "%s", e.what());
+        return 2;
+    }
+    g_server.store(server.get());
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
     std::signal(SIGPIPE, SIG_IGN);
@@ -154,7 +216,7 @@ int main(int argc, char** argv) {
     lgc::log::info("http", "listening on %s:%d | %d slot%s | serving %s", cfg.host.c_str(),
                    cfg.port, slots.total(), slots.total() == 1 ? "" : "s", serving.c_str());
 
-    if (!server.listen()) {
+    if (!server->listen()) {
         lgc::log::error("http", "could not bind %s:%d", cfg.host.c_str(), cfg.port);
         g_server.store(nullptr);
         return 1;

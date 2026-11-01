@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 1.3.0 LANGUAGES CXX)
+project(arcint VERSION 1.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -76,9 +76,12 @@ target_link_libraries(arcint_peg PUBLIC arcint_vendor)
 add_library(arcint_core STATIC
   src/config.cpp
   src/util/log.cpp
+  src/util/canonical_json.cpp
+  src/util/sha256.cpp
   src/util/utf8.cpp
   src/util/text.cpp
   src/core/reasoning.cpp
+  src/core/renderer_material.cpp
   src/core/sampler.cpp
   src/core/sampling.cpp
   src/core/stop.cpp
@@ -86,12 +89,16 @@ add_library(arcint_core STATIC
   src/core/toolgrammar.cpp
   src/core/chat.cpp
   src/exec/backend_stub.cpp
+  src/api/auth.cpp
   src/api/error.cpp
   src/api/handlers.cpp
   src/api/generate.cpp
+  src/api/metrics.cpp
+  src/api/renderer.cpp
   src/api/responses.cpp
   src/api/responses_stream.cpp
   src/api/responses_state.cpp
+  src/api/tokenize.cpp
   src/http/server.cpp
 )
 target_include_directories(arcint_core PUBLIC
@@ -103,6 +110,18 @@ target_include_directories(arcint_core PUBLIC
 # read as "gone". poll has neither the fd limit nor the errno ambiguity.
 target_compile_definitions(arcint_core PUBLIC CPPHTTPLIB_USE_POLL)
 target_link_libraries(arcint_core PUBLIC arcint_vendor Threads::Threads arcint_peg)
+
+# TLS (--tls-cert/--tls-key) needs httplib's OpenSSL server. Off by default: the
+# default build neither finds nor links OpenSSL, so the package's Depends stay
+# unchanged (no libssl). ON is an extra arm, not the recipe: it exists so a
+# deployment that wants TLS in-process can build one.
+option(ARCINT_TLS "Serve HTTPS through httplib's OpenSSL server (needs OpenSSL)" OFF)
+if(ARCINT_TLS)
+  find_package(OpenSSL REQUIRED)
+  target_compile_definitions(arcint_core PUBLIC CPPHTTPLIB_OPENSSL_SUPPORT ARCINT_TLS=1)
+  target_link_libraries(arcint_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+endif()
+
 target_compile_options(arcint_core PRIVATE -Wall -Wextra -Wpedantic)
 if(ARCINT_WERROR)
   target_compile_options(arcint_core PRIVATE -Werror)
@@ -259,8 +278,12 @@ if(ARCINT_TESTS)
     tests/test_slot_loan.cpp
     tests/test_loan_book.cpp
     tests/test_toolgrammar.cpp
+    tests/test_tokenize_once.cpp
     tests/test_disconnect.cpp
     tests/test_responses.cpp
+    tests/test_metrics.cpp
+    tests/test_auth.cpp
+    tests/test_tokenize.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
@@ -285,6 +308,12 @@ if(ARCINT_TESTS)
     add_executable(arcint-tool-grammar-probe tools/tool_grammar_probe.cpp)
     target_link_libraries(arcint-tool-grammar-probe PRIVATE arcint_core)
     target_compile_options(arcint-tool-grammar-probe PRIVATE -Wall -Wextra -Wpedantic)
+    # audit 15's number: a vocab-only GGUF, the old two-call encode against the
+    # one-pass encode, on the host or the card host (tools/tokenize_cost.cpp,
+    # the campaign's command). Not a ctest case: it needs the GGUF.
+    add_executable(arcint-tokenize-cost tools/tokenize_cost.cpp)
+    target_link_libraries(arcint-tokenize-cost PRIVATE arcint_core)
+    target_compile_options(arcint-tokenize-cost PRIVATE -Wall -Wextra -Wpedantic)
   endif()
   # test_props.cpp reads src/exec/backend_llama.cpp (the KV-precision tripwire:
   # the llama backend cannot be constructed without a card).
@@ -332,6 +361,38 @@ if(ARCINT_TESTS)
            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/stress.sh"
                    "$<TARGET_FILE:arcint>" 60 12 4)
   set_tests_properties(stress PROPERTIES TIMEOUT 300 LABELS unit)
+
+  # ops item 1: GET /metrics is opt-in and arcint.timings is opt-in. The HTTP
+  # half (route presence, Content-Type, the response object) on the stub.
+  add_test(NAME metrics
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/metrics.sh"
+                   "$<TARGET_FILE:arcint>")
+  set_tests_properties(metrics PROPERTIES TIMEOUT 120 LABELS unit)
+
+  # ops item 2: the bearer key and the TLS flag pairing. The HTTP half (401s,
+  # the /health exemption, preflight, the key file) on the stub.
+  add_test(NAME auth
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/auth.sh"
+                   "$<TARGET_FILE:arcint>")
+  set_tests_properties(auth PROPERTIES TIMEOUT 120 LABELS unit)
+
+  # ops-2 item 6: a bad --tls-cert/--tls-key is refused before the model load.
+  # In a build without ARCINT_TLS the script reports SKIP (77), so it reads as
+  # skipped rather than as a pass that asserted nothing; the ARCINT_TLS=ON gate
+  # arm runs the assertion for real.
+  add_test(NAME tls
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/tls.sh"
+                   "$<TARGET_FILE:arcint>")
+  set_tests_properties(tls PROPERTIES TIMEOUT 60 LABELS unit SKIP_RETURN_CODE 77)
+
+  # ops item 3: POST /tokenize and POST /detokenize on the stub. The HTTP half
+  # of the device-free gate: the llama-server shapes, the chat/Responses count
+  # against a real generation's usage, the model-field lane routing and the
+  # auth coverage.
+  add_test(NAME tokenize
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/tokenize.sh"
+                   "$<TARGET_FILE:arcint>")
+  set_tests_properties(tokenize PROPERTIES TIMEOUT 120 LABELS unit)
 
   # Both device-free: the generator's own consistency check, and the
   # acceptance runner's self-test against a fixture manifest. Neither needs a
@@ -383,6 +444,23 @@ if(ARCINT_TESTS)
   # fails the package build instead of a skipped skip.
   if(ARCINT_LLAMA)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    # patch 0074's device-free terms cell: the fused q/k norm + IMRoPE kernel's
+    # arithmetic and the dispatch's switch/order, read out of the patched tree
+    # (LLAMA_SRC). The numerics stay a card arm (test-backend-ops RMS_NORM_MUL_ROPE).
+    add_test(NAME fuse-qk-norm-rope
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_fuse_qk_norm_rope.py")
+    set_tests_properties(fuse-qk-norm-rope PROPERTIES LABELS unit)
+    # patch 0075's device-free terms cell: the CPU-miss prefetch switch (default
+    # off), a block-ahead hint in every row function, the volatile page touch and
+    # its level-2 guard in both compute paths. The residency and parity arms are
+    # in tests/test-opencl-miss-cpu.cpp (the patch's own C cell).
+    add_test(NAME cpu-miss-prefetch
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_cpu_miss_prefetch.py")
+    set_tests_properties(cpu-miss-prefetch PROPERTIES LABELS unit)
     add_test(NAME expert-profile-save
              COMMAND "${CMAKE_COMMAND}" -E env "EXPERT_PROFILE_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
                      "${Python3_EXECUTABLE}"
