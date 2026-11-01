@@ -120,9 +120,14 @@ std::optional<std::string> reasoning_text_of(const json& item, std::string& out)
 // One input item. `index` names the position in the error's message; `pending`
 // is the reasoning an item has carried that belongs to the next assistant item
 // (the pairing rule: a reasoning item pairs with the FOLLOWING assistant message
-// or function_call; any other item in between drops it).
+// or function_call; any other item in between drops it). `assistant_run` says
+// whether the message last pushed is an assistant run that still accepts
+// function_calls: W6g merges a run of [reasoning]? [assistant message]?
+// [function_call]+ into ONE assistant ChatMessage (docs/campaigns/feyntalk.md
+// D8). A user/developer/system message, a function_call_output or a reasoning
+// item closes the run; the next call opens a new turn.
 std::optional<HttpResult> read_item(const json& item, ResponseRequest& req, size_t index,
-                                    std::string& pending) {
+                                    std::string& pending, bool& assistant_run) {
     const std::string where = log::format("input[%zu]", index);
     if (!item.is_object()) return invalid(where + " must be an object", "input");
     // The OpenAPI document marks `type` required but defaults every message
@@ -157,13 +162,17 @@ std::optional<HttpResult> read_item(const json& item, ResponseRequest& req, size
         // `phase` (2026-04-24) is accepted on an assistant message and ignored:
         // the template knows no phase, and the output carries none (optional
         // field). Review R2 of the campaign moved it out of the skip list.
-        if (msg.role == "assistant") {
+        const bool is_assistant = msg.role == "assistant";
+        if (is_assistant) {
             msg.reasoning = pending;   // the item that precedes this turn
             pending.clear();
         } else {
             pending.clear();           // a user/system/developer turn ends the pairing
         }
         req.chat.messages.push_back(std::move(msg));
+        // An assistant message opens a run the following function_calls join;
+        // any other role is a turn boundary.
+        assistant_run = is_assistant;
         return std::nullopt;
     }
 
@@ -179,16 +188,25 @@ std::optional<HttpResult> read_item(const json& item, ResponseRequest& req, size
         if (!item.contains("arguments") || !item["arguments"].is_string()) {
             return invalid(where + ".arguments must be a JSON string", "input");
         }
-        ChatMessage msg;
-        msg.role      = "assistant";
-        msg.reasoning = pending;
-        pending.clear();
         ToolCall call;
         call.id        = item["call_id"].get<std::string>();
         call.name      = item["name"].get<std::string>();
         call.arguments = item["arguments"].get<std::string>();
-        msg.tool_calls.push_back(std::move(call));
-        req.chat.messages.push_back(std::move(msg));
+        // W6g: a call that follows an assistant message (or a previous call in
+        // the same run) joins that one message; only the run's first call opens
+        // it, and only it takes the pending reasoning.
+        if (assistant_run && !req.chat.messages.empty() &&
+            req.chat.messages.back().role == "assistant") {
+            req.chat.messages.back().tool_calls.push_back(std::move(call));
+        } else {
+            ChatMessage msg;
+            msg.role      = "assistant";
+            msg.reasoning = pending;
+            pending.clear();
+            msg.tool_calls.push_back(std::move(call));
+            req.chat.messages.push_back(std::move(msg));
+            assistant_run = true;
+        }
         return std::nullopt;
     }
 
@@ -198,7 +216,8 @@ std::optional<HttpResult> read_item(const json& item, ResponseRequest& req, size
             return invalid(where + ".call_id is required", "input");
         }
         if (!item.contains("output")) return invalid(where + ".output is required", "input");
-        pending.clear();   // a tool output is not an assistant item
+        pending.clear();        // a tool output is not an assistant item
+        assistant_run = false;  // ... and it is a turn boundary (W6g)
         ChatMessage  msg;
         msg.role         = "tool";
         msg.tool_call_id = item["call_id"].get<std::string>();
@@ -240,6 +259,10 @@ std::optional<HttpResult> read_item(const json& item, ResponseRequest& req, size
             if (!pending.empty()) pending += "\n";
             pending += text;
         }
+        // W6g: the run grammar puts a reasoning item before the message item,
+        // never between calls, so a reasoning item restarts the run: the next
+        // function_call opens a new turn carrying this reasoning.
+        assistant_run = false;
         req.reasoning_items.push_back(item);
         return std::nullopt;
     }
@@ -528,10 +551,11 @@ std::optional<HttpResult> parse_response_request(const json& body, ResponseReque
             msg.content = text;
             req.chat.messages.push_back(std::move(msg));
         } else if (input.is_array()) {
-            std::string pending;   // reasoning that belongs to the next assistant item
+            std::string pending;         // reasoning that belongs to the next assistant item
+            bool        assistant_run = false;   // W6g: the tail assistant run accepts calls
             size_t      i = 0;
             for (const json& item : input) {
-                if (auto err = read_item(item, req, i, pending)) return err;
+                if (auto err = read_item(item, req, i, pending, assistant_run)) return err;
                 ++i;
             }
         } else {
@@ -784,13 +808,17 @@ HttpResult previous_not_found(const std::string& id, const std::string& why) {
         "invalid_request", "previous_response_not_found", "previous_response_id")};
 }
 
-// One assistant ChatMessage per spec output item, in the item order and with
-// the same reasoning pairing as the input mapping, so a continuation renders
-// like a full-history request. Reasoning items pair with the following message
-// or function_call; reasoning parts join with a newline.
+// One assistant ChatMessage per spec output item run, in the item order and
+// with the same reasoning pairing and the same W6g merge as the input mapping,
+// so a continuation renders like a full-history request. Reasoning items pair
+// with the following message or function_call; reasoning parts join with a
+// newline. A run of [reasoning]? [message]? [call]+ is ONE message (content
+// from the message item, all calls in item order), exactly as read_item maps
+// the same items.
 std::vector<ChatMessage> assistant_turns_of(const nlohmann::json& output_items) {
     std::vector<ChatMessage> out;
     std::string              pending;
+    bool                     assistant_run = false;
     for (const json& item : output_items) {
         const std::string type = item.value("type", "");
         if (type == "reasoning") {
@@ -798,6 +826,7 @@ std::vector<ChatMessage> assistant_turns_of(const nlohmann::json& output_items) 
             if (reasoning_text_of(item, text) || text.empty()) continue;
             if (!pending.empty()) pending += "\n";
             pending += text;
+            assistant_run = false;   // a reasoning item restarts the run (W6g)
         } else if (type == "message") {
             ChatMessage msg;
             msg.role      = "assistant";
@@ -809,17 +838,23 @@ std::vector<ChatMessage> assistant_turns_of(const nlohmann::json& output_items) 
                         msg.content += part["text"].get<std::string>();
             }
             out.push_back(std::move(msg));
+            assistant_run = true;
         } else if (type == "function_call") {
-            ChatMessage msg;
-            msg.role      = "assistant";
-            msg.reasoning = pending;
-            pending.clear();
             ToolCall call;
             call.id        = item.value("call_id", "");
             call.name      = item.value("name", "");
             call.arguments = item.value("arguments", std::string("{}"));
-            msg.tool_calls.push_back(std::move(call));
-            out.push_back(std::move(msg));
+            if (assistant_run && !out.empty() && out.back().role == "assistant") {
+                out.back().tool_calls.push_back(std::move(call));
+            } else {
+                ChatMessage msg;
+                msg.role      = "assistant";
+                msg.reasoning = pending;
+                pending.clear();
+                msg.tool_calls.push_back(std::move(call));
+                out.push_back(std::move(msg));
+                assistant_run = true;
+            }
         }
     }
     return out;

@@ -1145,6 +1145,52 @@ unit state) installs the bundle and runs the live task in **both** modes, then
 `feyntalk-doctor` shows the manifest hashes; no card window for the install,
 one window for the live leg (Gate 4's class). `inferred` until built.
 
+### D8 — Parallel calls in one assistant turn (W6g)
+
+**Status: built (2026-11-01, stub gate).** Measured live 2026-11-01 (W6e):
+the engine mapped every `function_call` input item to its own assistant
+ChatMessage, so a turn in which the model emitted two parallel calls came back
+as two consecutive assistant messages with one call each. The rendered prompt
+differed from what the model generated (prefix cache misses from that turn on,
+and the history the model saw was not its own), and a gateway could not carry
+a Chat history with several calls per assistant message through Responses input.
+`measured-here`.
+
+**The rule.** A run of `[reasoning item]? [assistant message item]?
+[function_call item]+` with no user/developer/system message item and no
+`function_call_output` in between becomes **ONE** assistant ChatMessage:
+
+- `content` = the message item's text (empty when there is no message item);
+- `tool_calls` = the calls in item order, each with its own `call_id`;
+- `reasoning` = the preceding reasoning item(s), applied to the merged turn.
+
+`function_call_output` items stay one tool message each, in order. Turn
+boundaries are user/developer/system message items and `function_call_output`
+items; a reasoning item also restarts a run (the grammar puts it before the
+message item, never between calls). No invented separator items. The merged
+ChatMessage is exactly what the Chat route builds for the same turn (`code`:
+`chat_json.h`'s `tool_calls` array, one entry per call).
+
+The rule applies on **both** paths — `read_item`'s input mapping and
+`assistant_turns_of` (store reconstruction) — so a `previous_response_id`
+continuation renders byte-identically to the same history sent inline: the
+prefix hash and the token-mode `arcint.render.prompt_sha256` stay meaningful
+(`code`). Reasoning is attached once to the merged turn, so W3.2's
+after-the-last-user rule and W3.5's reasoning-first fit pass keep or drop it as
+a unit, never per call (`code`).
+
+**Fixture and tests.**
+`tests/feyntalk/fixtures/parallel-tool-calls.json` is the shared contract: a
+`schema: feyntalk-w6g/1` object of named histories, each holding the Responses
+`items` and the equivalent Chat `messages` they must render to (two calls in
+one turn; text then two calls; two separate turns split by a tool output; a
+reasoning item before the turn; the inline full history after the two-call
+turn). The engine test (`tests/test_responses.cpp`, the W6g section) reads it,
+checks the mapped messages structurally against the Chat form, and compares the
+rendered prompts byte for byte on both paths, including the continuation; the
+gateway's renderer test reads a copy of the same file later (no other
+repository is touched here). Red first, then the merge made them pass.
+
 ### Work packages
 
 Ordered, each one session. `R` = engine maintainer review; `C` = card window.
