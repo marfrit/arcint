@@ -870,10 +870,14 @@ std::vector<ChatMessage> assistant_turns_of(const nlohmann::json& output_items) 
         const std::string type = item.value("type", "");
         if (type == "reasoning") {
             std::string text;
-            // A malformed or empty reasoning item is still a reasoning item and
-            // still restarts the run, exactly as the input path's does.
-            if (reasoning_text_of(item, text) || text.empty()) run.close();
-            else run.add_reasoning(text);
+            // One rule with the input path: a reasoning item restarts the run
+            // and contributes only its text. An empty item -- or a malformed
+            // content the stored path cannot refuse -- therefore carries
+            // nothing and does NOT erase the reasoning that preceded it, so the
+            // call that follows keeps it. (read_item refuses a malformed content
+            // outright and calls add_reasoning("") for an empty one.)
+            if (reasoning_text_of(item, text)) text.clear();
+            run.add_reasoning(text);
         } else if (type == "message") {
             ChatMessage msg;
             msg.role = "assistant";

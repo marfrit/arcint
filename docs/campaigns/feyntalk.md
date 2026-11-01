@@ -1167,7 +1167,11 @@ a Chat history with several calls per assistant message through Responses input.
 `function_call_output` items stay one tool message each, in order. Turn
 boundaries are user/developer/system message items and `function_call_output`
 items; a reasoning item also restarts a run (the grammar puts it before the
-message item, never between calls). No invented separator items. The merged
+message item, never between calls). An empty reasoning item contributes
+nothing but still restarts the run, and it does not erase the reasoning that
+preceded it: both paths read that one way, so a call after
+`[reasoning "r1", reasoning <empty>]` still carries "r1" (`code`). No invented
+separator items. The merged
 ChatMessage is exactly what the Chat route builds for the same turn (`code`:
 `chat_json.h`'s `tool_calls` array, one entry per call).
 
