@@ -90,6 +90,30 @@ TEST(llama_backend_publishes_the_configured_kv_type) {
     CHECK(src.find("kv_precision  = \"") == std::string::npos);
 }
 
+// The coder template reads `preserve_thinking`; the capability field tells a
+// proxy so, and the render puts the switch into extra_context. Both are the
+// llama backend's (the GGUF template is the contract), so a source scan is the
+// device-free half.
+TEST(llama_backend_publishes_supports_preserve_thinking) {
+    std::ifstream in(std::string(ARCINT_SOURCE_DIR) + "/src/exec/backend_llama.cpp");
+    CHECK(in.good());
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const std::string src = ss.str();
+    CHECK(src.find("supports_preserve_thinking") != std::string::npos);
+    CHECK(src.find("supports_preserve_reasoning") != std::string::npos);   // kept
+    CHECK(src.find("extra_context") != std::string::npos);
+}
+
+TEST(llama_backend_passes_chat_template_kwargs_through) {
+    std::ifstream in(std::string(ARCINT_SOURCE_DIR) + "/src/exec/backend_llama.cpp");
+    CHECK(in.good());
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const std::string src = ss.str();
+    CHECK(src.find("chat_template_kwargs") != std::string::npos);
+}
+
 TEST(props_reports_the_slot_loan_state) {
     // /props names the loan's state ("off" by default, "armed"/"out"/"poisoned"/
     // "broken" from llama_context_slot_loan_state) so a request refused with

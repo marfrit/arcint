@@ -231,6 +231,67 @@ TEST(chat_honours_enable_thinking) {
     CHECK(prompt.find(std::string(markers::kThinkOpen)) != std::string::npos);
 }
 
+TEST(chat_preserve_thinking_is_read) {
+    json body = minimal_chat();
+    body["chat_template_kwargs"] = json{{"preserve_thinking", true}};
+    ChatRequest req;
+    CHECK(!parse_chat_request(body, req).has_value());
+    CHECK(req.has_preserve_thinking);
+    CHECK(req.preserve_thinking);
+}
+
+TEST(chat_preserve_thinking_must_be_a_boolean) {
+    json body = minimal_chat();
+    body["chat_template_kwargs"] = json{{"preserve_thinking", 3}};
+    ChatRequest req;
+    const auto err = parse_chat_request(body, req);
+    CHECK(err.has_value());
+    if (err.has_value())
+        CHECK(err->find("chat_template_kwargs.preserve_thinking") != std::string::npos);
+}
+
+TEST(chat_unknown_template_kwargs_are_passed_through) {
+    // llama-server's dialect: chat_template_kwargs is a passthrough, so an
+    // unknown key is not refused. It reaches the template unchanged (the stub
+    // ignores it, like a template without that key), and the typed switches
+    // are still read.
+    json body = minimal_chat();
+    body["chat_template_kwargs"] = json{{"enable_thinking", false}, {"some_template_key", true}};
+    ChatRequest req;
+    CHECK(!parse_chat_request(body, req).has_value());
+    CHECK(req.has_enable_thinking && !req.enable_thinking);
+    CHECK(req.chat_template_kwargs.contains("some_template_key"));
+    if (req.chat_template_kwargs.contains("some_template_key"))
+        CHECK(req.chat_template_kwargs["some_template_key"].get<bool>());
+    ChatRequest without = req;
+    without.chat_template_kwargs.erase("some_template_key");
+    CHECK_EQ(render_chatml_stub(req), render_chatml_stub(without));
+}
+
+TEST(chat_render_stub_preserve_thinking_keeps_earlier_reasoning) {
+    ChatRequest req;
+    CHECK(!parse_chat_request(minimal_chat(), req).has_value());
+    // An assistant turn with reasoning BEFORE a later user message: the rule
+    // hides it unless preserve_thinking is set.
+    ChatMessage a;
+    a.role      = "assistant";
+    a.content   = "first answer";
+    a.reasoning = "REASON-OLD";
+    ChatMessage u;
+    u.role    = "user";
+    u.content = "steer";
+    req.messages.push_back(a);
+    req.messages.push_back(u);
+
+    const std::string off = render_chatml_stub(req);
+    CHECK(off.find("REASON-OLD") == std::string::npos);
+    req.preserve_thinking     = true;
+    req.has_preserve_thinking = true;
+    const std::string on = render_chatml_stub(req);
+    CHECK(on.find("REASON-OLD") != std::string::npos);
+    CHECK(off != on);
+}
+
 TEST(chat_stream_options_include_usage) {
     json body             = minimal_chat();
     body["stream"]        = true;

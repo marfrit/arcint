@@ -67,6 +67,19 @@ struct ChatRequest {
     // chat_template_kwargs.enable_thinking — the fleet standard switch (§4).
     bool enable_thinking     = true;
     bool has_enable_thinking = false;
+    // chat_template_kwargs.preserve_thinking — the coder template replays an
+    // assistant turn's thinking only after the last user query unless this is
+    // true; a steering message moves that boundary and would otherwise drop
+    // the running tool loop's thinking (measured in UAT: a 10.6 % cache hit).
+    bool preserve_thinking     = false;
+    bool has_preserve_thinking = false;
+    // The raw chat_template_kwargs object, passed through to the template (the
+    // llama-server dialect: the keys are template-specific and a client may
+    // send ones a given template ignores). `enable_thinking` and
+    // `preserve_thinking` are type-checked above; every other key reaches
+    // extra_context unchanged. Empty for a request that sent none, which keeps
+    // the render byte-identical to before this field existed.
+    nlohmann::json chat_template_kwargs = nlohmann::json::object();
 
     SamplerOverrides sampler;
 };
