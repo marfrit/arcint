@@ -2874,6 +2874,7 @@ public:
     ModelStatus       st;
     nlohmann::json    material = synthetic_material(kHashA);
     mutable int       builds   = 0;
+    mutable int       hash_calls = 0;   // the build-capable hash accessor
     mutable int       serializations = 0;
     mutable bool      serialized = false;
     mutable std::string serialized_body;
@@ -2886,7 +2887,10 @@ public:
         ++builds;
         return material;
     }
-    std::string renderer_hash() const override { return material["hash"].get<std::string>(); }
+    std::string renderer_hash() const override {
+        ++hash_calls;
+        return material["hash"].get<std::string>();
+    }
     const std::string& renderer_material_json() const override {
         if (!serialized) {
             (void)renderer_material();
@@ -2950,6 +2954,22 @@ TEST(props_does_not_build_the_material) {
     const json p = api::props(ctx);
     CHECK_EQ(backend.builds, 0);
     CHECK_EQ(p["token_mode"].get<std::string>(), std::string("ready"));
+}
+
+TEST(props_never_takes_the_building_hash) {
+    // W6a follow-up 3: /props must not wait out a build in flight. The cached
+    // accessor is the one it may read; the build-capable hash is not.
+    Config cfg;
+    CountingMaterialBackend backend;
+    SlotPool slots{1};
+    api::Context ctx;
+    ctx.cfg = &cfg;
+    ctx.backend = &backend;
+    ctx.slots = &slots;
+    const json p = api::props(ctx);
+    CHECK_EQ(backend.hash_calls, 0);
+    CHECK_EQ(p["token_mode"].get<std::string>(), std::string("ready"));
+    CHECK(p["renderer_hash"].is_null());   // not built yet; no wait, no build
 }
 
 TEST(renderer_endpoint_builds_once_and_serves_the_cached_body) {
