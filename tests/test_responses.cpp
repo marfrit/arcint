@@ -3378,7 +3378,7 @@ TEST(responses_two_paths_merge_identically) {
     const json fixture = load_w6g_fixture();
     for (const char* name : {"two_calls_one_turn", "text_then_two_calls",
                              "two_separate_turns", "reasoning_then_calls",
-                             "continuation_inline"}) {
+                             "empty_reasoning_then_call", "continuation_inline"}) {
         const json h   = w6g_history(fixture, name);
         const json sub = assistant_subset(h.value("items", json::array()));
         ResponseRequest r;
@@ -3480,8 +3480,10 @@ TEST(responses_refuses_a_duplicate_call_id_in_one_run) {
 // assistant turn without a refusal.
 TEST(responses_stored_output_call_ids_are_engine_minted_and_unique) {
     ReplayFixture fx;
-    const std::string open_marker  = "<" "tool" "_call" ">";
-    const std::string close_marker = "</" "tool" "_call" ">";
+    // The single source of the call tags (core/toolcall.cpp's table), never
+    // spelled here.
+    const std::string open_marker(tool_call_tags().open);
+    const std::string close_marker(tool_call_tags().close);
     const std::string block = open_marker + "\n{\"name\": \"read_file\", \"arguments\": {}}\n" +
                               close_marker;
     fx.backend.pieces = {{"Sure\n" + block, 1}, {"\n" + block, 2}};
