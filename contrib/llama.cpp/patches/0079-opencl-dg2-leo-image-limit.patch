@@ -1,0 +1,392 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl-image-limit.h b/ggml/src/ggml-opencl/ggml-opencl-image-limit.h
+new file mode 100644
+index 0000000..839bdf2
+--- /dev/null
++++ b/ggml/src/ggml-opencl/ggml-opencl-image-limit.h
+@@ -0,0 +1,77 @@
++// 0079: the DG2 + LEO limit for image1d_buffer weights.
++//
++// Under the runtime's LEO mode (OpenCL over Level Zero, EnableLEO=1) on a DG2
++// device, an IMAGE1D_BUFFER (CL_R, UINT32) larger than 16,384 texels aborts the
++// process in RENDER_SURFACE_STATE::setWidth: LEO's DG2 path writes the texel
++// count into the 14-bit width field of the surface state instead of the
++// buffer-surface encoding (docs/campaigns/vram-user-space.md, stage 2a; the
++// reproducer is tools/leo_image1d_buffer_repro.c). 16,384 texels fit the field,
++// 16,385 do not. The default driver is fine at every size and the B60 under
++// LEO is fine at every size.
++//
++// The backend therefore asks this header before it creates a weight image: the
++// image is allowed unless the device is DG2 in LEO mode and the texel count is
++// above the field's 16,384. The driver's own CL_DEVICE_IMAGE_MAX_BUFFER_SIZE is
++// still honoured; it does not report the DG2+LEO limit (the runtime accepts the
++// allocation and aborts at the surface-state write).
++//
++// LEO is detected from CL_DEVICE_VERSION containing "LEO" (the device string
++// reads "OpenCL 3.0 LEO"; measured-here, the gate in vram-user-space.md). DG2
++// is detected from the Intel device id (CL_DEVICE_ID_INTEL, the A770 is 0x56a0;
++// measured-here, the card host's PCI id 8086:56a0) or, without that extension,
++// from the device name's Arc A-series / Arc Pro A-series models.
++//
++// One function, device-free: the rule, the LEO predicate and the DG2 name
++// predicate are testable without a GPU; tests/test-opencl-image-limit.cpp does
++// that, including the 16,384 / 16,385 boundary.
++#ifndef GGML_OPENCL_IMAGE_LIMIT_H
++#define GGML_OPENCL_IMAGE_LIMIT_H
++
++#include <stddef.h>
++#include <string.h>
++
++// the largest texel count the 14-bit RENDER_SURFACE_STATE width can encode
++#define GGML_CL_DG2_LEO_MAX_IMAGE_TEXELS ((size_t) 16384)
++
++struct ggml_cl_image_mode {
++    int    leo;          // CL_DEVICE_VERSION carried "LEO"
++    int    dg2;          // the device is a DG2 (Intel Arc A-series)
++    size_t driver_max;   // CL_DEVICE_IMAGE_MAX_BUFFER_SIZE, 0 = not queried
++};
++
++// 1 when a weight image of `texels` may be created in this mode, 0 when not.
++// The narrow form: on DG2 under LEO only images above the field bound are
++// refused, so a per-tensor choice keeps every image that fits.  A zero texel
++// count is never an image.
++static inline int ggml_cl_image_allowed(const struct ggml_cl_image_mode mode, size_t texels) {
++    if (texels == 0) {
++        return 0;
++    }
++    if (mode.driver_max != 0 && texels > mode.driver_max) {
++        return 0;
++    }
++    if (mode.leo && mode.dg2 && texels > GGML_CL_DG2_LEO_MAX_IMAGE_TEXELS) {
++        return 0;
++    }
++    return 1;
++}
++
++// LEO's device string is "OpenCL 3.0 LEO" (measured-here); the default driver
++// has no such suffix.
++static inline int ggml_cl_version_is_leo(const char * version) {
++    return version != NULL && strstr(version, "LEO") != NULL;
++}
++
++// DG2 models are Intel's Arc A-series and Arc Pro A-series.  The B60 (BMG) is
++// "Arc(TM) Pro B60" and an Adreno device is not Intel.
++static inline int ggml_cl_name_is_dg2(const char * name) {
++    if (name == NULL || strstr(name, "Intel") == NULL) {
++        return 0;
++    }
++    return strstr(name, "Arc(TM) A") != NULL ||
++           strstr(name, "Arc A")    != NULL ||
++           strstr(name, "Arc(TM) Pro A") != NULL ||
++           strstr(name, "Arc Pro A")    != NULL;
++}
++
++#endif // GGML_OPENCL_IMAGE_LIMIT_H
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 41de741..05094ef 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -19,6 +19,8 @@
+ #include "kernels/kq_i8_ops.inc"
+ // 0072: the uniform-work-group rounding rule, shared with the device-free test
+ #include "ggml-opencl-uniform.h"
++// 0079: the DG2 + LEO image1d_buffer bound, shared with the device-free test
++#include "ggml-opencl-image-limit.h"
+ 
+ #ifdef GGML_OPENCL_USE_ADRENO_BIN_KERNELS
+ #include "libdl.h"
+@@ -765,6 +767,10 @@ struct ggml_backend_opencl_context {
+ 
+     size_t  image_max_buffer_size;
+     size_t  image2d_max_width;
++
++    // 0079: LEO mode and the DG2 family, for the image1d_buffer weight bound
++    bool    leo_mode = false;
++    bool    dg2 = false;
+     size_t  image2d_max_height;
+ 
+     cl_device_svm_capabilities svm_caps;
+@@ -8170,6 +8176,46 @@ static bool ggml_opencl_is_device_supported(ggml_backend_dev_t dev) {
+     return true;
+ }
+ 
++// 0079: the device is a DG2 (Intel Arc A-series / Pro A-series).  The model
++// names carry it; when the runtime exposes cl_intel_device_attribute_query the
++// device id is the authoritative form (the A770 is 0x56a0, measured-here; the
++// DG2 family spans 0x56a0..0x56af).
++static bool ggml_opencl_device_is_dg2(cl_device_id device) {
++    char name[256] = {};
++    if (clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(name), name, nullptr) == CL_SUCCESS &&
++        ggml_cl_name_is_dg2(name)) {
++        return true;
++    }
++
++    size_t ext_size = 0;
++    if (clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, 0, nullptr, &ext_size) != CL_SUCCESS || ext_size == 0) {
++        return false;
++    }
++    std::unique_ptr<char[]> ext(new char[ext_size]);
++    if (clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, ext_size, ext.get(), nullptr) != CL_SUCCESS) {
++        return false;
++    }
++    if (strstr(ext.get(), "cl_intel_device_attribute_query") == nullptr) {
++        return false;
++    }
++    cl_uint id = 0;
++    if (clGetDeviceInfo(device, CL_DEVICE_ID_INTEL, sizeof(id), &id, nullptr) != CL_SUCCESS) {
++        return false;
++    }
++    return id >= 0x56a0u && id <= 0x56afu;
++}
++
++// 0079: one call site for the rule, so the backend and the device-free test
++// share the same text.
++static bool ggml_cl_image_texels_ok(const ggml_backend_opencl_context * backend_ctx, size_t texels) {
++    const ggml_cl_image_mode mode = {
++        backend_ctx->leo_mode ? 1 : 0,
++        backend_ctx->dg2 ? 1 : 0,
++        backend_ctx->image_max_buffer_size,
++    };
++    return ggml_cl_image_allowed(mode, texels) != 0;
++}
++
+ // Initialize device if it is supported (returns nullptr if it is not).
+ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
+     GGML_ASSERT(dev);
+@@ -8294,6 +8340,16 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
+ 
+     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(size_t), &backend_ctx->max_alloc_size, NULL));
+     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_IMAGE_MAX_BUFFER_SIZE, sizeof(size_t), &backend_ctx->image_max_buffer_size, NULL));
++
++    // 0079: LEO from the device version string, DG2 from the Intel device id /
++    // model name. Both read once at init; the default driver and the B60 take
++    // the false branch and create the same images as before.
++    backend_ctx->leo_mode = ggml_cl_version_is_leo(dev_ctx->device_version.c_str()) != 0;
++    backend_ctx->dg2      = ggml_opencl_device_is_dg2(device);
++    if (backend_ctx->leo_mode && backend_ctx->dg2) {
++        GGML_LOG_INFO("ggml_opencl: LEO on DG2: weight images above %zu texels are skipped\n",
++                      GGML_CL_DG2_LEO_MAX_IMAGE_TEXELS);
++    }
+     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_IMAGE2D_MAX_WIDTH, sizeof(size_t), &backend_ctx->image2d_max_width, NULL));
+     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_IMAGE2D_MAX_HEIGHT, sizeof(size_t), &backend_ctx->image2d_max_height, NULL));
+     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(size_t), &backend_ctx->max_workgroup_size, NULL));
+@@ -13195,15 +13251,24 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+         CL_CHECK(clWaitForEvents(1, &evt));
+         CL_CHECK(clReleaseMemObject(data_device));
+ 
+-        // Create image for Q
+-        cl_image_format img_format_q = {CL_RG, CL_UNSIGNED_INT32};
+-        cl_image_desc img_desc_q = {
+-            CL_MEM_OBJECT_IMAGE1D_BUFFER,
+-            static_cast<size_t>(ggml_nelements(tensor)/32*2),
+-            0, 0, 0, 0, 0, 0, 0,
+-            { extra->q }
+-        };
+-        extra->q_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_format_q, &img_desc_q, NULL, &err);
++        // Create image for Q, unless the DG2 + LEO bound refuses it.  The
++        // mxfp4 kernels this backend selects on Intel read the q buffer (the
++        // MoE wimg variants are Adreno-only), so a skipped image changes no
++        // kernel selected here.
++        const size_t q_img_texels = static_cast<size_t>(ggml_nelements(tensor)/32*2);
++        if (ggml_cl_image_texels_ok(backend_ctx, q_img_texels)) {
++            cl_image_format img_format_q = {CL_RG, CL_UNSIGNED_INT32};
++            cl_image_desc img_desc_q = {
++                CL_MEM_OBJECT_IMAGE1D_BUFFER,
++                q_img_texels,
++                0, 0, 0, 0, 0, 0, 0,
++                { extra->q }
++            };
++            extra->q_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_format_q, &img_desc_q, NULL, &err);
++        } else {
++            extra->q_img = nullptr;
++            GGML_LOG_INFO("ggml_opencl: mxfp4 weight image skipped (%zu texels, DG2 + LEO)\n", q_img_texels);
++        }
+         tensor->extra = extra;
+ 
+         return;
+@@ -28021,6 +28086,13 @@ static cl_mem ggml_cl_img_pool_get_or_create(
+     }
+ 
+     const size_t pixel_size = (channel_data_type == CL_HALF_FLOAT) ? 8 : 16;
++    // 0079: the DG2 + LEO bound applies to every image1d_buffer, not only the
++    // quantized weight images: the flash-attention K view is one too.  Returning
++    // nullptr is the pool's existing "no image" answer; the caller then takes
++    // its buffer kernel.
++    if (!ggml_cl_image_texels_ok(backend_ctx, required_bytes / pixel_size)) {
++        return nullptr;
++    }
+     cl_image_format fmt = {CL_RGBA, channel_data_type};
+     cl_image_desc   desc = {};
+     desc.image_type   = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 8749cdb..6d32e41 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -231,6 +231,18 @@ if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
+     add_test(NAME test-opencl-workgroups-adreno COMMAND $<TARGET_FILE:test-opencl-workgroups-adreno>)
+ endif()
+ 
++# patch 0079: the DG2 + LEO image1d_buffer bound (ggml-opencl-image-limit.h,
++# the header the backend includes), the two detection predicates, and a text
++# check that the weight-image site and the image pool ask it before creating.
++if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
++    add_executable(test-opencl-image-limit test-opencl-image-limit.cpp)
++    target_include_directories(test-opencl-image-limit PRIVATE
++        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl)
++    target_compile_definitions(test-opencl-image-limit PRIVATE
++        GGML_OPENCL_SRC_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/ggml-opencl.cpp")
++    add_test(NAME test-opencl-image-limit COMMAND $<TARGET_FILE:test-opencl-image-limit> ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/ggml-opencl.cpp)
++endif()
++
+ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
+     llama_build_and_test(test-unicode.cpp LINK llama)
+diff --git a/tests/test-opencl-image-limit.cpp b/tests/test-opencl-image-limit.cpp
+new file mode 100644
+index 0000000..301a2e2
+--- /dev/null
++++ b/tests/test-opencl-image-limit.cpp
+@@ -0,0 +1,144 @@
++// 0079: device-free tests for the DG2 + LEO image1d_buffer bound.
++//   - the rule itself (ggml-opencl-image-limit.h, the header the backend
++//     includes): every combination of LEO, DG2 and driver max, including the
++//     16,384 / 16,385 boundary the abbreviation sits at;  the default driver
++//     and the B60 stay permissive at the same sizes, so no default image is
++//     refused;
++//   - the two predicates: the LEO device-version suffix and the DG2 model name;
++//   - text checks over ggml-opencl.cpp: the mxfp4 weight image and the image
++//     pool (flash-attention's K view) are both asked before creation, and the
++//     selection site that would take an image kernel only does so when the
++//     image is still non-null; the FA site falls back to the buffer kernel on a
++//     skipped image.
++// No GPU, no OpenCL runtime.  A mutation of the header is a mutation of the
++// backend's creation rule, and a mutation of either guard is caught here.
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <sstream>
++#include <string>
++
++#include "ggml-opencl-image-limit.h"
++
++static int g_bad = 0;
++#define CHECK(cond, what) do { if (!(cond)) { std::printf("FAIL: %s\n", what); ++g_bad; } } while (0)
++
++static ggml_cl_image_mode mode(int leo, int dg2, size_t driver_max) {
++    ggml_cl_image_mode m = { leo, dg2, driver_max };
++    return m;
++}
++
++static void check_rule(void) {
++    // the driver's own bound is honoured on every device
++    CHECK(!ggml_cl_image_allowed(mode(0, 0, 16384), 16385), "driver max: 16385 above 16384");
++    CHECK(ggml_cl_image_allowed(mode(0, 0, 16384), 16384), "driver max: 16384 fits");
++    CHECK(ggml_cl_image_allowed(mode(0, 0, 0), (size_t) 1 << 20), "driver max 0: no driver bound");
++
++    // the default driver on the A770 (no LEO): images of every size as before
++    CHECK(ggml_cl_image_allowed(mode(0, 1, 0), 16385), "A770 default driver: 16385 allowed");
++    CHECK(ggml_cl_image_allowed(mode(0, 1, 0), 1036800), "A770 default driver: 1036800 allowed");
++
++    // the B60 in LEO (DG2 false): images of every size as before
++    CHECK(ggml_cl_image_allowed(mode(1, 0, 0), 16385), "B60 LEO: 16385 allowed");
++    CHECK(ggml_cl_image_allowed(mode(1, 0, 0), 1036800), "B60 LEO: 1036800 allowed");
++
++    // the A770 in LEO: the 14-bit width field's exact boundary
++    CHECK(ggml_cl_image_allowed(mode(1, 1, 0), 1), "A770 LEO: one texel");
++    CHECK(ggml_cl_image_allowed(mode(1, 1, 0), 16384), "A770 LEO: 16384 fits");
++    CHECK(!ggml_cl_image_allowed(mode(1, 1, 0), 16385), "A770 LEO: 16385 refused");
++    CHECK(!ggml_cl_image_allowed(mode(1, 1, 0), 1036800), "A770 LEO: a real weight image refused");
++    CHECK(!ggml_cl_image_allowed(mode(1, 1, 0), 0), "zero texels is never an image");
++
++    // a wider driver bound does not lift the DG2 + LEO bound, and a driver
++    // bound below it still wins
++    CHECK(!ggml_cl_image_allowed(mode(1, 1, 65536), 16385), "A770 LEO: driver max 65536 does not lift the bound");
++    CHECK(!ggml_cl_image_allowed(mode(1, 1, 8192), 8193), "A770 LEO: driver max 8192 wins");
++    CHECK(!ggml_cl_image_allowed(mode(1, 1, 8192), 16384), "A770 LEO: driver max below the DG2 bound refuses 16384");
++    CHECK(ggml_cl_image_allowed(mode(1, 1, 8192), 8192), "A770 LEO: 8192 fits the driver max");
++}
++
++static void check_predicates(void) {
++    CHECK(ggml_cl_version_is_leo("OpenCL 3.0 LEO") == 1, "LEO version suffix");
++    CHECK(ggml_cl_version_is_leo("OpenCL 3.0 NEO") == 0, "default driver version is not LEO");
++    CHECK(ggml_cl_version_is_leo("OpenCL 3.0") == 0, "bare version is not LEO");
++    CHECK(ggml_cl_version_is_leo(NULL) == 0, "null version");
++
++    CHECK(ggml_cl_name_is_dg2("Intel(R) Arc(TM) A770 Graphics") == 1, "A770 name");
++    CHECK(ggml_cl_name_is_dg2("Intel(R) Arc(TM) A750 Graphics") == 1, "A750 name");
++    CHECK(ggml_cl_name_is_dg2("Intel(R) Arc(TM) Pro A60 Graphics") == 1, "Pro A60 name");
++    CHECK(ggml_cl_name_is_dg2("Intel(R) Arc(TM) Pro B60 Graphics") == 0, "B60 is not DG2");
++    CHECK(ggml_cl_name_is_dg2("Adreno (TM) 740") == 0, "Adreno is not DG2");
++    CHECK(ggml_cl_name_is_dg2(NULL) == 0, "null name");
++}
++
++static std::string read_file(const char * path) {
++    std::ifstream f(path, std::ios::binary);
++    std::ostringstream b;
++    b << f.rdbuf();
++    return b.str();
++}
++
++static bool has(const std::string & text, const char * needle) {
++    return text.find(needle) != std::string::npos;
++}
++
++static void check_source(const char * path) {
++    const std::string src = read_file(path);
++    CHECK(!src.empty(), "ggml-opencl.cpp reads");
++    if (src.empty()) {
++        return;
++    }
++
++    // the header and the one call site are part of the backend
++    CHECK(has(src, "#include \"ggml-opencl-image-limit.h\""), "the backend includes the header");
++    CHECK(has(src, "ggml_cl_image_texels_ok(backend_ctx, q_img_texels)"),
++          "mxfp4 image creation asks the bound");
++
++    // mxfp4: the image is created only inside the allowed branch, and the
++    // refused branch leaves q_img null (the Intel kernels read the q buffer)
++    const std::string mxfp4_anchor = "// Create image for Q, unless the DG2 + LEO bound refuses it.";
++    const size_t mx = src.find(mxfp4_anchor);
++    CHECK(mx != std::string::npos, "mxfp4 image site has the guard comment");
++    if (mx != std::string::npos) {
++        const std::string block = src.substr(mx, 1400);
++        CHECK(has(block, "if (ggml_cl_image_texels_ok(backend_ctx, q_img_texels))"), "mxfp4 creates only when allowed");
++        CHECK(has(block, "extra->q_img = nullptr;"), "mxfp4 refused path leaves q_img null");
++        CHECK(has(block, "extra->q_img = clCreateImage"), "mxfp4 allowed path still creates the image");
++    }
++
++    // the image pool: FA's K view is an image1d_buffer too, and the pool's
++    // nullptr answer makes the caller take its buffer kernel
++    CHECK(has(src, "ggml_cl_image_texels_ok(backend_ctx, required_bytes / pixel_size)"),
++          "the image pool asks the bound before creating the sub-buffer");
++
++    // a selection site that assumes q_img must still see it: both weight-image
++    // MoE selections read a live image, and the FA site falls back
++    CHECK(has(src, "&& extra0_q4_K->q_img != nullptr"), "q4_K wimg selection needs a live image");
++    CHECK(has(src, "&& extra0_mxfp4->q_img != nullptr"), "mxfp4 wimg selection needs a live image");
++    const size_t fa = src.find("if (prefill_k_img == nullptr)");
++    CHECK(fa != std::string::npos, "FA has a skipped-image branch");
++    if (fa != std::string::npos) {
++        const std::string block = src.substr(fa, 300);
++        CHECK(has(block, "kernel = backend_ctx->fa.f32_f16_split.at(dk_dv)"),
++              "FA takes the buffer kernel when the image is skipped");
++        CHECK(has(block, "use_prefill_k_img = false"), "FA stops claiming an image argument");
++    }
++}
++
++int main(int argc, char ** argv) {
++    if (argc < 2) {
++        std::printf("usage: %s <ggml-opencl.cpp>\n", argv[0]);
++        return 2;
++    }
++    check_rule();
++    check_predicates();
++    check_source(argv[1]);
++
++    if (g_bad != 0) {
++        std::printf("image-limit: %d check(s) failed\n", g_bad);
++        return 1;
++    }
++    std::printf("image-limit: rule, predicates and backend text OK\n");
++    return 0;
++}

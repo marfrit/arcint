@@ -4975,3 +4975,132 @@ and `tests/acceptance/ab.py` for the A/B, the LEO arm's binary through the
 wrapper. The coder's prefill loss is owed a cause: rebuild with
 `-DGGML_OPENCL_PROFILING=ON` and compare `cl_trace.json` under both drivers for
 the same prefill chunk (kernel names, device durations, copies).
+
+## 0079-opencl-dg2-leo-image-limit.patch
+
+The A770's LEO abort, worked around at the creation site. **Evidence class of
+the defect: `measured-here` + `code`.** On a DG2 device under the runtime's LEO
+mode (`OpenCL on Level Zero`, `EnableLEO=1 NEOReadDebugKeys=1`), an
+`IMAGE1D_BUFFER` (`CL_R`, `UINT32`) above **16,384 texels** aborts inside
+`RENDER_SURFACE_STATE::setWidth` at the 14-bit field check
+(`UNRECOVERABLE_IF((value - 1) > 0x3fff)`, compute-runtime 26.35 source); 16,384
+fits, 16,385 does not. The default driver passes every size; the B60 under LEO
+passes every size. The abort is in the runtime's DG2 command generation, so the
+allocation succeeds and there is no `clCreateImage` error to catch. The
+reproducer is `tools/leo_image1d_buffer_repro.c` (`measured-here`, runtime 26.27
+and 26.35).
+
+The patch is narrow by design: on **DG2 under LEO only** an image above 16,384
+texels is refused; every image that fits is still created, and the driver's own
+`CL_DEVICE_IMAGE_MAX_BUFFER_SIZE` is still honoured. On the default driver and
+on the B60 the rule's DG2 or LEO term is false, so the images, kernels and
+outputs are the same as before (the default-driver arm's pass set and texts are
+the gate). The rule is one device-free header function and one predicate pair:
+
+- `ggml/src/ggml-opencl/ggml-opencl-image-limit.h` (new): the rule, the
+  `16,384` bound, the LEO version predicate (`CL_DEVICE_VERSION` contains
+  `LEO`, the device string reads `OpenCL 3.0 LEO`; `measured-here`) and the DG2
+  name predicate (Intel Arc A-series / Pro A-series; `code`);
+- `ggml-opencl.cpp`: at init, `leo_mode` from the device version and `dg2` from
+  `CL_DEVICE_NAME` / `CL_DEVICE_ID_INTEL` when
+  `cl_intel_device_attribute_query` is exposed (the A770 is `0x56a0`,
+  `measured-here`; the fallback names cover the family). One call site
+  `ggml_cl_image_texels_ok()` builds the mode from the context.
+
+Every `IMAGE1D_BUFFER` creation in the patched `ggml-opencl.cpp` (`code`,
+inventory over the 0001-0072 text; counts before this patch):
+
+- **one** is reachable in the Intel build outside an Adreno guard: the MXFP4
+  weight image in `ggml_backend_opencl_buffer_set_tensor`
+  (`CL_MEM_OBJECT_IMAGE1D_BUFFER`, `CL_RG`/`CL_UNSIGNED_INT32`,
+  `nelements/32*2` texels; the 2880x2880 case is 518,400). **Guarded here**; the
+  refused branch leaves `extra->q_img = nullptr`, and every Intel MXFP4 kernel
+  this backend selects reads the `q` buffer, so no kernel choice changes. (The
+  MoE weight-image variants are `GGML_OPENCL_USE_ADRENO_KERNELS`-only.)
+- **one** image pool creation used by flash attention's K view
+  (`ggml_cl_img_pool_get_or_create`, FA prefill DK=512 opt-in and the f16 K
+  image path). **Guarded here**; `nullptr` is the pool's existing "no image"
+  answer, so both callers take their buffer kernel.
+- **all others** are under `#ifdef GGML_OPENCL_USE_ADRENO_KERNELS` (not
+  compiled in the Intel build: `-DGGML_OPENCL_USE_ADRENO_KERNELS=OFF`), or live
+  in `ggml_cl_mul_mat_q1_0_f32_adreno`, whose only call site is behind
+  `use_adreno_kernels()` (false on Intel). They are not reachable on the A770
+  and are untouched.
+- The two extra fields `q_img`/`d_img` set in the SoA conversion are
+  `GGML_OPENCL_USE_ADRENO_KERNELS`-only as well.
+
+Kernel selection sites that assume an image (`code`; each already refuses a
+missing image, so no site needed a new branch):
+
+- q4_K MoE decode weight-image: `&& extra0_q4_K->q_img != nullptr` (Adreno);
+- MXFP4 MoE decode weight-image: `&& extra0_mxfp4->q_img != nullptr` (Adreno);
+- flash attention: `if (prefill_k_img == nullptr)` resets the kernel to
+  `fa.f32_f16_split.at(dk_dv)`; the other FA K-image path tests
+  `if (k_img == nullptr)` and sets `use_fa_k_img = false`;
+- q8_0 and q4_K dense dp4a wimg variants: their `q_img` locals are
+  null-checked where created and released.
+
+Tests (`tests/test-opencl-image-limit.cpp`, device-free; `code`): the rule
+table including **16,384 allowed / 16,385 refused** under DG2+LEO, default
+driver and B60 permissive at the same sizes, a driver max below the bound; the
+LEO version and DG2 name predicates; and text checks that the MXFP4 site and
+the image pool ask the bound, the MXFP4/q4_K selection sites require a live
+image, and FA falls back. CMake adds `test-opencl-image-limit` under
+`GGML_OPENCL`.
+
+Red-first (local, `measured-here`): four mutations each fail the test and exit
+1, then the restored text passes:
+- DG2 term dropped -> `FAIL: B60 LEO: 16385 allowed` (and 1036800);
+- LEO term dropped -> `FAIL: A770 default driver: 16385 allowed` (and 1036800);
+- bound `>` -> `>=` -> `FAIL: A770 LEO: 16384 fits`;
+- MXFP4 selection loses `&& extra0_mxfp4->q_img != nullptr` ->
+  `FAIL: mxfp4 wimg selection needs a live image`.
+The series build (`-DGGML_OPENCL=ON -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF`) and
+`ctest -R test-opencl-image-limit` pass.
+
+Card gate (owed; Claude runs it in a card window, **not yet measured**):
+1. **A770, fresh-host container, runtime 26.35** and **the card host, runtime
+   26.27**; the reproducer still aborts under LEO:
+   `cc -O2 -o /tmp/leo_repro tools/leo_image1d_buffer_repro.c -lOpenCL`
+   `EnableLEO=1 NEOReadDebugKeys=1 /tmp/leo_repro 16385 1` -> abort at
+   `setWidth`; `EnableLEO=1 NEOReadDebugKeys=1 /tmp/leo_repro 16384 1` -> read
+   back, 0 mismatches; `/tmp/leo_repro 16385 1` (default driver) -> 0
+   mismatches. This proves the bound and that the patch did not hide it.
+2. **A770 full op suite** from the series build:
+   `GGML_OPENCL_DEVICES=1:0 ./bin/test-backend-ops -b GPUOpenCL` (default;
+   record the pass count and the failure names), then
+   `GGML_OPENCL_DEVICES=1:0 EnableLEO=1 NEOReadDebugKeys=1 ./bin/test-backend-ops -b GPUOpenCL`.
+   Expected (`measured-here` on 26.27/26.35 before the patch): the default set
+   is 12,867 / 12,881 with 3 `ADD_*_MUL`, 3 `FLASH_ATTN_EXT` hsk=64 f16 and 8
+   `SWIGLU_OAI` failing; under LEO the same failures and the same 12,867, with
+   no abort at MXFP4 m=2880 n=32 k=2880. A different pass count or failure name
+   is a finding, not a pass.
+3. **Coder served under LEO against the default driver**, two rounds,
+   `--device GPU.1` (A770). The LEO arm is the same binary through a wrapper:
+   `printf '#!/bin/sh\nexport EnableLEO=1 NEOReadDebugKeys=1\nexec %s "$@"\n'
+   <arcint-binary> > /tmp/arcint-leo && chmod +x /tmp/arcint-leo`
+   `python3 tests/acceptance/ab.py coder --old <arcint-binary> --new
+   /tmp/arcint-leo --gguf <coder.gguf> --device GPU.1 --assets <assets>
+   --rounds 2 --out /tmp/ab-79`. Record decode/prefill per arm, the answers'
+   md5 majority, the acceptance line and the `FAIL` lines. The prior LEO arm
+   (`measured-here`, 26.27): decode +5.6-5.8 % (51.60->54.60, 52.80->55.75,
+   45.35->47.90 t/s), prefill 41k -5.3 % (730.15->691.15), FAIL on prefill;
+   the patch does not claim that loss fixed.
+4. **The owed codegen check** on `flash_attn_f32_f16_dpas` under both drivers:
+   in two empty directories,
+   `CLI_DumpProgramBinaries=1 GGML_OPENCL_DEVICES=1:0 ./bin/test-backend-ops -o
+   'FLASH_ATTN_EXT' -b GPUOpenCL` (default) and the same with
+   `EnableLEO=1 NEOReadDebugKeys=1`. Disassemble every dumped `.bin` with
+   `ocloc disasm -d igc -device dg2 -file <bin>` (drop `-device dg2` if the
+   local `ocloc` rejects it), find the kernel named
+   `flash_attn_f32_f16_dpas`, and record **register count and spill bytes per
+   mode** (`Number of registers used`, `Spill Memory Size`). The LEO prefill
+   loss sits in that kernel (+14.8 %, 21,643 -> 24,844 ms, 858 calls); a
+   register/spill difference between the modes is the cause to confirm or
+   refute, not a claim yet.
+
+For an A770 LEO run the log line `ggml_opencl: LEO on DG2: weight images above
+16384 texels are skipped` (once at init) and, at the first large MXFP4 tensor,
+`ggml_opencl: mxfp4 weight image skipped (518400 texels, DG2 + LEO)`, are the
+patch's own evidence that the branch was taken; the absence of both means the
+detection did not match and the run is not a test of the patch.

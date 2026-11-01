@@ -163,6 +163,22 @@ not yet told apart.
    encoding. The default driver passes all three sizes. ggml-opencl wraps quantized weights in such images (`q_img`,
    nelements/8 texels), which is why the op suite aborts at the first large one. An Intel runtime defect: the program is
    the upstream reproducer; the workaround is to skip the weight images on DG2 under LEO (the buffer kernels exist).
+   **The workaround, patch 0079 (`code`, this tree; the abort itself `measured-here`):** a device-free rule in
+   `ggml-opencl-image-limit.h` refuses an `IMAGE1D_BUFFER` above 16,384 texels only when LEO and DG2 are both true, and
+   still honours the driver's `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE`; LEO comes from `CL_DEVICE_VERSION` containing `LEO`
+   (`measured-here`, the device string reads `OpenCL 3.0 LEO`) and DG2 from the Intel name / `CL_DEVICE_ID_INTEL`
+   (`0x56a0` for the A770, `measured-here`; `code` for the id window and the name fallback). The narrow form keeps every
+   image that fits. In the Intel build the only reachable weight image is the MXFP4 SoA image (2880x2880 -> 518,400
+   texels; all other `IMAGE1D_BUFFER` creations are `GGML_OPENCL_USE_ADRENO_KERNELS`-only or only reachable through
+   `use_adreno_kernels()`, `code`), and the flash-attention image pool is guarded too; every image-kernel selection
+   already tests its image for non-null, so a skipped image takes the buffer kernel. The default driver and the B60 take
+   the false branch: same images, same kernels. Device-free test red-first on four mutations; the series build and
+   `ctest -R test-opencl-image-limit` pass (`measured-here`).
+   **Gate for 0079 (owed):** the A770 on 26.27 and on 26.35 in the fresh-host container, the reproducer still aborting
+   at 16,385 and passing 16,384; the full op suite under LEO reaching 12,867 / 12,881 with the default driver's failure
+   names and no MXFP4 abort; the coder A/B under LEO against the default driver; and the `flash_attn_f32_f16_dpas`
+   register/spill comparison (the -5.3 % prefill loss is not claimed fixed). Commands and expected values are in README
+   0079. Until that window runs, the A770 route A stays open and the B60 form is unchanged.
 2b. **Route B - a chunk pool on the default driver (if LEO falls short).** Allocate the usable VRAM once at load as a
    fixed set of large `cl_mem` chunks; a ggml buffer type hands out ranges inside them (the backend already addresses
    every tensor as buffer + offset, `data_device` set in one place, `code`); the backend's grow-only buffers and the
