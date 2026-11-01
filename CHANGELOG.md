@@ -18,6 +18,33 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.4.1 — 2026-11-02
+
+One patch dropped, nothing added: Flash-Next decodes at 1.3.0's rate again.
+
+- **0078 dropped** (the graph-input staging bound, on in 1.4.0). 1.4.0's release
+  gate measured Flash-Next's decode 2.2 % below 1.3.0 (32.97 against 33.70 t/s,
+  nine runs of each build). The bisect (`measured-here`, window 50, four rounds
+  each against the 1.4.0 package) named 0078: 1.4.0 without it decodes 33.75
+  against 32.85 t/s, back at 1.3.0; dropping 0077 as well adds nothing, and
+  dropping 0075 gains nothing. The mechanism is not measured; the likely path is
+  0078 staging the CPU-island copies (Flash-Next is the only unit with CPU
+  islands). The coder's small checkpoint-restore gain from 0078 goes with it.
+  `GGML_OPENCL_STAGE_MB` is gone; `GGML_OPENCL_STAGE_INPUTS` works as in 1.3.0.
+
+Release gate (window 51, `measured-here`, the release candidate in the same window):
+- Flash-Next (B60) against 1.3.0, four rounds: decode 34.20 against 34.15 t/s on the
+  runs with the majority answer, back at 1.3.0; prefill 534.77 against 535.45 t/s,
+  ab.py's verdict a spread FAIL (one run at 531.2), no slowdown in the mean.
+- Coder (A770) against 1.4.0: decode equal, the answers byte-identical; the
+  acceptance task 10/10 greedy x3.
+- Agent (B60) against 1.4.0: prefill at 55k / 138k 716.55 / 503.70 against
+  714.15 / 502.55 t/s, the answers byte-identical.
+
+Runtime dependency unchanged in kind: llama.cpp 3e4dfa8 with
+`contrib/llama.cpp/patches` 0001-0079 (0031, 0055, 0061, 0073, 0076, 0078 not
+carried).
+
 ## 1.4.0 — 2026-11-01
 
 Token mode for gateways, the serving-ops package and thinking replay across a

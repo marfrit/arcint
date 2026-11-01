@@ -5098,7 +5098,28 @@ The three cells are labelled `unit` for a llama tree configured with
 `LLAMA_BUILD_TESTS=ON` (`ctest -L unit`); the package recipe builds the engine
 with tests off, so they do not run there.
 
-## 0078-opencl-staging-bound.patch
+## 0078-opencl-staging-bound (dropped in 1.4.1)
+
+**Dropped from the series in 1.4.1** (operator, 2026-11-01): it cost
+Flash-Next 2.2 % of its decode. The 1.4.0 release gate measured 32.97 against
+1.3.0's 33.70 t/s, pooled over nine runs of each build in three passes on the
+B60 (window 48). The bisect in window 50 (`measured-here`, ab.py flashnext, four
+rounds each against the 1.4.0 package) named this patch:
+
+| 1.4.0 minus | decode, variant against 1.4.0 (t/s) | |
+|---|---|---|
+| 0078 | 33.75 against 32.85 (+2.7 %) | back at 1.3.0's 33.70 |
+| 0077 and 0078 | 33.42 against 32.95 (+1.4 %) | nothing beyond 0078 alone |
+| 0075 | 33.40 against 33.85 | no gain |
+
+The mechanism is not measured. The likely path is the CPU-island copies, which
+0078 sends through the same scheduler function as the graph inputs: Flash-Next
+is the only unit with CPU islands (`--llama-cpu-moe 48`), and the coder's and
+the agent's numbers did not move. The coder's checkpoint-restore gain (time to
+first token 2.07 / 2.07 s against 2.17 / 2.37 s, window 47) goes with the patch.
+A narrowed 0078 (graph inputs only, CPU-island copies on the old path) is owed
+and must clear Flash-Next's decode before it returns. The record below is the
+1.4.0 patch as it was.
 
 The graph-input staging bound. **Evidence class: `code` and `measured-here` for
 the device-free cells; the card arms are owed.**
