@@ -75,6 +75,20 @@ expect_code() {
   check "$name" "$([[ "$code" == "$expected" ]] && echo 0 || echo 1)"
 }
 
+# wait_for <pid> <log> <pattern> <seconds>: bounded, so a slow runner cannot
+# read a refusal as "kept running". Returns 0 once the pattern is in the log or
+# the process has exited, 1 on the timeout.
+wait_for() {
+  local pid="$1" log="$2" pattern="$3" seconds="${4:-5}"
+  local i
+  for ((i = 0; i < seconds * 10; i++)); do
+    grep -q "$pattern" "$log" 2>/dev/null && return 0
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 # expect_refusal <name> <keyfile> <grep>  -- the server must exit non-zero
 # before it listens, with a clear message naming the problem.
 expect_refusal() {
@@ -83,7 +97,7 @@ expect_refusal() {
   local log="$WORK/refusal-${name}.log"
   "$BIN" --stub --host 127.0.0.1 --port "$port" --n-ctx 256 --api-key-file "$keyfile" >"$log" 2>&1 &
   local pid=$!
-  sleep 0.7
+  wait_for "$pid" "$log" "$pattern" 5 || true
   if kill -0 "$pid" 2>/dev/null; then
     kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
     fail "$name: the server kept running (auth silently off)"
@@ -102,7 +116,7 @@ expect_warning() {
   local log="$WORK/warn-${name}.log"
   "$BIN" --stub --host 127.0.0.1 --port "$port" --n-ctx 256 --api-key "$key" >"$log" 2>&1 &
   local pid=$!
-  sleep 0.7
+  wait_for "$pid" "$log" "$pattern" 5 || true
   if ! kill -0 "$pid" 2>/dev/null; then
     fail "$name: the server exited instead of warning"
     return
@@ -178,6 +192,112 @@ sys.exit(rc)
 PY
 }
 
+# Expect: 100-continue is answered above routing in httplib, so an
+# unauthenticated request with that header must still see the 401 first (never
+# a 100), and the connection must close.
+expect_100_check() {
+  PORT="$PORT" python3 - <<'PY'
+import os, socket, sys
+port = int(os.environ["PORT"])
+try:
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+except OSError as e:
+    print("  FAIL could not connect:", e)
+    sys.exit(1)
+head = (b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+        b"Expect: 100-continue\r\nContent-Length: 1000000\r\n"
+        b"Content-Type: application/json\r\n\r\n")
+s.sendall(head)  # no body, no Authorization
+s.settimeout(3.0)
+data = b""
+try:
+    while b"\r\n\r\n" not in data:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+except socket.timeout:
+    pass
+header = data.split(b"\r\n\r\n", 1)[0].decode("latin1", "replace")
+rest = b""
+eof = False
+try:
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            eof = True
+            break
+        rest += chunk
+except socket.timeout:
+    eof = False
+s.close()
+checks = [
+    ("Expect: 100-continue with no key gets the 401, not a 100",
+     header.startswith("HTTP/1.1 401") and "100 continue" not in header.lower()),
+    ("the Expect connection closes after the 401", eof),
+]
+rc = 0
+for name, ok in checks:
+    print(("  ok   " if ok else "  FAIL ") + name)
+    if not ok:
+        rc = 1
+sys.exit(rc)
+PY
+}
+
+# Two requests on ONE socket, both answered: an authenticated (or key-less)
+# keep-alive connection survives. AUTH="" for the no-key server.
+keepalive_check() {
+  PORT="$PORT" AUTH="${1:-}" python3 - <<'PY'
+import os, socket, sys
+port = int(os.environ["PORT"])
+auth = os.environ.get("AUTH", "")
+req = ("GET /props HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n"
+       + ("Authorization: " + auth + "\r\n" if auth else "")
+       + "\r\n").encode()
+def read_response(s):
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = s.recv(4096)
+        if not chunk:
+            return None
+        data += chunk
+    header, _, rest = data.partition(b"\r\n\r\n")
+    length = 0
+    for line in header.split(b"\r\n")[1:]:
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":", 1)[1].strip())
+    while len(rest) < length:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        rest += chunk
+    return header
+try:
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+except OSError as e:
+    print("  FAIL could not connect:", e)
+    sys.exit(1)
+s.sendall(req)
+h1 = read_response(s)
+s.sendall(req)
+h2 = read_response(s)
+s.close()
+ok1 = bool(h1) and h1.startswith(b"HTTP/1.1 200")
+ok2 = bool(h2) and h2.startswith(b"HTTP/1.1 200")
+checks = [
+    ("the first keep-alive request is answered", ok1),
+    ("the second request on the same socket is answered", ok2),
+]
+rc = 0
+for name, ok in checks:
+    print(("  ok   " if ok else "  FAIL ") + name)
+    if not ok:
+        rc = 1
+sys.exit(rc)
+PY
+}
+
 KEY="test-key-not-real"
 AUTH="Authorization: Bearer ${KEY}"
 
@@ -189,6 +309,12 @@ wait_boot "$WORK/off.log" || { echo "off server did not boot" >&2; exit 1; }
 BASE="http://127.0.0.1:${PORT}"
 code=$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/props")
 check "GET /props is 200 without a key" "$([[ "$code" == "200" ]] && echo 0 || echo 1)"
+# No key: the response is today's -- no Connection: close, Keep-Alive as
+# before -- and a keep-alive connection survives two requests.
+hdr=$(curl -sS -D - -o /dev/null "$BASE/props" | tr -d '\r')
+check "no key: no Connection: close is sent" "$(echo "$hdr" | grep -qi '^connection: *close' && echo 1 || echo 0)"
+check "no key: Keep-Alive is advertised" "$(echo "$hdr" | grep -qi '^keep-alive:' && echo 0 || echo 1)"
+keepalive_check "" || FAILED=$((FAILED + 1))
 kill "$SRV_PID"; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
 
 echo "== --api-key"
@@ -250,6 +376,8 @@ code=$(curl -sS -o /dev/null -w '%{http_code}' -H "$AUTH" -H 'Content-Type: appl
        --data-binary @"$WORK/chat.json" "$BASE/v1/chat/completions")
 check "POST /v1/chat/completions with the key is 200" "$([[ "$code" == "200" ]] && echo 0 || echo 1)"
 
+keepalive_check "Bearer $KEY" || FAILED=$((FAILED + 1))
+expect_100_check || FAILED=$((FAILED + 1))
 body_not_read_check || FAILED=$((FAILED + 1))
 
 kill "$SRV_PID"; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
@@ -272,9 +400,15 @@ echo "== a key file that can never work is refused at boot"
 printf '' >"$WORK/empty.txt"
 printf '\n' >"$WORK/newline.txt"
 printf 'a\rb\n' >"$WORK/cr.txt"
+printf 'a\nb\n' >"$WORK/lf.txt"
+printf 'a\tb\n' >"$WORK/tab.txt"
+printf 'a\177b\n' >"$WORK/del.txt"
 expect_refusal "an empty key file" "$WORK/empty.txt" "empty"
 expect_refusal "a newline-only key file" "$WORK/newline.txt" "empty"
-expect_refusal "a CR key file" "$WORK/cr.txt" "carriage return"
+expect_refusal "a CR key file" "$WORK/cr.txt" "control character"
+expect_refusal "a key with an embedded LF" "$WORK/lf.txt" "control character"
+expect_refusal "a key with a TAB" "$WORK/tab.txt" "control character"
+expect_refusal "a key with a DEL" "$WORK/del.txt" "control character"
 
 echo "== key hygiene warnings (the key is still served)"
 expect_warning "leading whitespace warns" " spaced-key" "whitespace"

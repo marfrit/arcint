@@ -41,6 +41,32 @@ bool rejected(std::vector<const char*> args) {
     return !run(std::move(args), cfg).ok;
 }
 
+// Drop // and /* */ comments (newlines kept) before a source scan, so a
+// commented-out call cannot satisfy it. String literals are left alone; the
+// scanned files contain no comment-looking literal.
+std::string strip_comments(const std::string& src) {
+    std::string out;
+    out.reserve(src.size());
+    bool line = false, block = false;
+    for (size_t i = 0; i < src.size(); ++i) {
+        const char c = src[i];
+        const char n = i + 1 < src.size() ? src[i + 1] : '\0';
+        if (line) {
+            if (c == '\n') { line = false; out += c; }
+        } else if (block) {
+            if (c == '*' && n == '/') { block = false; ++i; }
+            else if (c == '\n') out += c;
+        } else if (c == '/' && n == '/') {
+            line = true; ++i;
+        } else if (c == '/' && n == '*') {
+            block = true; ++i;
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
 }  // namespace
 
 TEST(auth_key_file_strips_exactly_one_trailing_newline) {
@@ -120,11 +146,26 @@ TEST(auth_hygiene_refuses_an_empty_key_and_a_carriage_return) {
     err.clear();
     warn.clear();
     CHECK(!api::api_key_hygiene("a\rb", err, warn));
-    CHECK(err.find("carriage") != std::string::npos);
+    CHECK(err.find("control character") != std::string::npos);
 
     // A newline-only --api-key-file is the empty case end-to-end:
     // read_api_key_file strips the one trailing newline (and only that), so the
     // key reaches this check empty and is refused (auth.sh's file leg).
+}
+
+TEST(auth_hygiene_refuses_any_control_character) {
+    // Anything below 0x20, and DEL, can never be presented in an HTTP header
+    // (an embedded LF after read_api_key_file stripped the one trailing one, a
+    // TAB, a stray 0x01, DEL).
+    std::string err, warn;
+    const std::string cases[] = {"a\nb", "a\tb", std::string("a\x01") + "b",
+                                 std::string("a\x7f") + "b"};
+    for (const std::string& key : cases) {
+        err.clear();
+        warn.clear();
+        CHECK(!api::api_key_hygiene(key, err, warn));
+        CHECK(err.find("control character") != std::string::npos);
+    }
 }
 
 TEST(auth_hygiene_warns_on_whitespace_and_a_percent) {
@@ -160,7 +201,7 @@ TEST(auth_hashes_the_key_without_leaving_a_working_copy) {
     CHECK(sha.good());
     std::stringstream shass;
     shass << sha.rdbuf();
-    const std::string shasrc = shass.str();
+    const std::string shasrc = strip_comments(shass.str());
     CHECK(shasrc.find("sha256_hex_secure") != std::string::npos);
     CHECK(shasrc.find("volatile char*") != std::string::npos);   // the wipe
 
@@ -168,7 +209,7 @@ TEST(auth_hashes_the_key_without_leaving_a_working_copy) {
     CHECK(mainin.good());
     std::stringstream mainss;
     mainss << mainin.rdbuf();
-    CHECK(mainss.str().find("sha256_hex_secure") != std::string::npos);
+    CHECK(strip_comments(mainss.str()).find("sha256_hex_secure") != std::string::npos);
 }
 
 TEST(auth_main_checks_hygiene_and_scrubs_the_key) {
@@ -181,7 +222,7 @@ TEST(auth_main_checks_hygiene_and_scrubs_the_key) {
     CHECK(in.good());
     std::stringstream ss;
     ss << in.rdbuf();
-    const std::string src = ss.str();
+    const std::string src = strip_comments(ss.str());
     CHECK(src.find("api_key_hygiene") != std::string::npos);
     CHECK(src.find("secure_scrub") != std::string::npos);
 }
