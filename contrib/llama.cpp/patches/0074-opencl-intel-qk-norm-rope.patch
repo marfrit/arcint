@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 41de741..545ab96 100644
+index 41de741..e5b2896 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -724,6 +724,8 @@ struct ggml_backend_opencl_context {
@@ -116,7 +116,7 @@ index 41de741..545ab96 100644
  static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
  static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
  
-@@ -10000,6 +10070,124 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
+@@ -10000,6 +10070,131 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
      backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
  }
  
@@ -183,11 +183,18 @@ index 41de741..545ab96 100644
 +
 +    cl_kernel kernel = backend_ctx->kernel_rms_norm_mul_rope_multi;
 +
-+    int nth = sgs;
-+    int max_workgroup_size = backend_ctx->get_kernel_workgroup_size(kernel);
-+    while (nth < ne00 && nth < max_workgroup_size) nth *= 2;
-+    nth = MIN(nth, max_workgroup_size);
++    // The work-group is one row. The rope phase gives one lane a rotated pair, so
++    // lws = the pairs rounded up to a whole subgroup, NOT ne00: at ne00 lanes half
++    // of them would idle in the rope phase (the launch geometry that made the fused
++    // kernel slower served, window 42), and the norm's float4 loop strided by lws
++    // still covers the row. The cap keeps the number of subgroups <= sgs, which is
++    // the local `sum`'s size: a subgroup id beyond it would write past the buffer.
++    const int pairs = n_dims / 2;
++    int nth = ((pairs + (int) sgs - 1) / (int) sgs) * (int) sgs;
++    nth = MAX(nth, (int) sgs);
++    nth = MIN(nth, (int) sgs * (int) sgs);
 +    nth = MIN(nth, ne00);
++    nth = MIN(nth, backend_ctx->get_kernel_workgroup_size(kernel));
 +
 +    size_t global_work_size[] = {(size_t)ne01*nth, (size_t)ne02, (size_t)ne03};
 +    size_t local_work_size[]  = {(size_t)nth, 1, 1};
@@ -241,7 +248,7 @@ index 41de741..545ab96 100644
  // llama.cpp's MoE routing (build_moe_ffn, softmax gating, normalized weights):
  // SOFT_MAX, RESHAPE, ARGSORT, VIEW (the ids), GET_ROWS, RESHAPE, SUM_ROWS,
  // CLAMP, DIV, RESHAPE (the weights) -> one kernel, as ggml-cuda's topk_moe
-@@ -10558,6 +10746,14 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+@@ -10558,6 +10753,14 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
              i += 2;
              continue;
          }
@@ -257,10 +264,10 @@ index 41de741..545ab96 100644
              ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
              i++;
 diff --git a/ggml/src/ggml-opencl/kernels/rms_norm.cl b/ggml/src/ggml-opencl/kernels/rms_norm.cl
-index 47124be..b03922c 100644
+index 47124be..3395c11 100644
 --- a/ggml/src/ggml-opencl/kernels/rms_norm.cl
 +++ b/ggml/src/ggml-opencl/kernels/rms_norm.cl
-@@ -372,3 +372,180 @@ kernel void kernel_rms_norm_mul_add_scale(
+@@ -372,3 +372,183 @@ kernel void kernel_rms_norm_mul_add_scale(
          y[i00] = ((x[i00] * scale) * f[i00%(ne10/4)] + g[i00%(ne20/4)]) * sc;
      }
  }
@@ -394,7 +401,10 @@ index 47124be..b03922c 100644
 +
 +    global int * pos = src1;
 +
-+    const int sect_dims = sections.s0 + sections.s1 + sections.s2 + sections.s3;
++    // the host refuses a zero sections sum (the per-op path asserts it); this keeps
++    // the kernel defined if the argument ever arrives empty: ic % 0 is undefined
++    const int sect_sum = sections.s0 + sections.s1 + sections.s2 + sections.s3;
++    const int sect_dims = sect_sum > 0 ? sect_sum : 1;
 +    const float inv_ndims = -1.f/n_dims;
 +
 +    for (int i0 = 2*get_local_id(0); i0 < ne0; i0 += 2*get_local_size(0)) {

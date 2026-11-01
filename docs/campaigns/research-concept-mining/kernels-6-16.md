@@ -50,14 +50,43 @@ the answer-level bar (`CLAUDE.md`) with an md5/argmax tripwire per fusion on the
 card; `test-backend-ops`' NMSE cannot see the rounding-order mutation, because
 NMSE is a tolerance on the composed output, not the intermediate rounding.
 
-**Pricing measurement — owed, the audit's own:**
-- per-step share of the q/k norm + rope launches on the coder (A770) and
-  Flash-Next (B60), from a profiling trace or `LLAMA_DECODE_TIMING` (`code`, the
-  audit's wording: `tools/cl_timeline_steps.py` on the intercept trace gives the
-  per-kernel count and time; the ceiling is the kernels removed plus their
-  launch time at the wall, the A770's 5.9 µs an enqueue, `paper`).
-- bar (`paper`, the audit): ≥ +0.5 % decode for a bundle of 2-3 fusions, else
-  no build — and the switch stays off until the A/B clears it.
+**Window 42 — the card run, `measured-here` (the fusion FAILED; the switch
+stays off).**
+- `test-backend-ops -o RMS_NORM_MUL_ROPE`: switch off 227/227 on both cards;
+  switch on, the A770 fails 45 of 227, the B60 exits 134 after 6 failures
+  (`clWaitForEvents` error -14 = `CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST`,
+  i.e. a device-side error inside the kernel). Every failing case is `mode=40`
+  (IMROPE), `[ROPE] ERR 1.1-2.4`; all `mode=0/2` cases pass.
+- The A770's values are the **unrotated** normed row: a host mirror of the fused
+  formula equals the CPU reference to 1e-9 (`code`, not committed), and the
+  unrotated row against that reference gives NMSE 1.19-1.40 on these shapes —
+  the band the A770 log reports. So the rotation's cos/sin is not applied (theta
+  0, or the rotation window not entered); the formula is right. The B60's
+  uncorrelated output then a device fault is a device-side error.
+- Served, two rounds each (`measured-here`, the capital right everywhere, the
+  default path equal to the package binary): coder (A770) 53.27/52.90 vs
+  56.03/55.70 t/s (-5 %), MTP acceptance 35.8 -> 32.6 %; agent (B60) 39.37/39.35
+  vs 42.40/42.32 (-7 %), acceptance 39.0 -> 34.9 %; Flash-Next 33.35/34.58 vs
+  33.95/33.93, expert hits 81.2 -> 83.5/82.9 %.
+- The audit's bar (≥ +0.5 % decode) is not met on any unit, and the correctness
+  defect is **not identified** from the source: the loop text equals
+  `kernel_rope_multi_f32`'s (a mechanical diff), the host's argument list matches
+  the kernel's signature by type and index (`code`), and the formula is right by
+  the mirror. The next window's one-run diagnostic is in the README section.
+
+**Why it was slower — from the code (`inferred`, before any re-test).** The
+fused dispatch ran one work-group a row with lws = `ne00` (128), while the rope
+phase gives one lane a rotated pair: half the lanes idle in the rotation, and
+the group waits behind the norm's two barriers before the rotation starts. The
+two kernels it replaces have the same norm geometry (one group a row) and an
+all-active 64-lane rope group with no barrier; the fusion's only saving is 2
+launches a side, ~0.4 % at the wall by the audit's pricing, below its bar. The
+patch now sets lws to one lane a pair (rounded to a subgroup, capped so the
+subgroup count fits the local `sum`), which removes the idle lanes but not the
+barrier serialization. **The fusion cannot be both right and faster**: it is not
+right (above) and faster it would not be beyond ~0.4 % (inferred, `code`);
+therefore the mechanism is parked, off by default, and no correctness fix is
+claimed.
 
 **Device-free cells** (`measured-here`): `tests/python/test_fuse_qk_norm_rope.py`
 reads the patched tree — the epsilon in the scale, the weight at both rotated
@@ -115,18 +144,23 @@ task sees one expert only. The cold-page half is built as sketched.
 cell asserts level-1 parity bit-identical to level 0), and the touch reads bytes
 it does not pass on.
 
-**Pricing measurement — owed, the audit's own, on the window's terms:**
-- the miss rows' time per verify round: the cap switch's ceiling (`paper`,
-  arcint stage 3d: 49.2/50.0 t/s with the CPU computing nothing against
-  49.8/50.6 with the ceiling switch — the wait costs nothing) and
-  `LLAMA_DECODE_TIMING`'s per-decode split for the round; the prefetch's
-  possible saving is the cold/warm gap of the same six answers at
-  `GGML_OPENCL_CPU_MISS_MAX=64`.
-- the faults: `/proc/<pid>/stat`'s min_flt/maj_flt for the served process around
-  one decode (`code`: the leg host has no `perf`; the campaign's `perf` method
-  is `paper` and is replaced here by the counter file).
-- bar (`paper`, the audit): a prefetch only if major faults > ~5 % of the CPU
-  lane's time. On the prediction above, that is ~0 and level 2 stays off.
+**Pricing — window 42, `measured-here`.** Flash-Next,
+`GGML_OPENCL_CPU_MISS_MAX=64`: level 0 **34.12/34.40 t/s with 0 and 10 major
+faults** over the leg; level 1 34.28 t/s (in the run's spread); level 2 **30.12
+and 33.73**, one leg at **+479,730 major faults**. The prediction was right:
+faults ~0, level 1 buys nothing, level 2 costs. **The switch stays off.** The
+audit's bar (major faults above ~5 % of the CPU lane) is not met — there is
+nothing to prefetch.
+
+**The level-2 fault spike, from the code** (`code`): the touch addressed a
+missed expert's slices at `bptr[k] + b * bank->nb[2]`. An IQ4_NL bank is the
+SPLIT form (`ggml_cl_usm_set_tensor`: scales and quants as two arrays over every
+expert), so the tensor's `nb[2]` stride is not expert `b`'s offset there and the
+walk can run past the split's region into the following mapping — the GGUF mmap
+is file-backed, so a page of it is a major fault. The patch now addresses the
+split arrays by the block index the rows read (`split_d + b*nblk*2`,
+`split_q + b*nblk*qb`) and keeps `nb[2]` only for block/planar banks. That is a
+fix for the spike, not a reason for a default.
 
 **Device-free cells** (`measured-here`): `test-opencl-miss-cpu` gains the
 level-1 parity arm ("0 of 2 rows differ"), the ahead-distance arm and the

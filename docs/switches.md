@@ -153,7 +153,7 @@ These names are not in a table:
 | `GGML_OPENCL_FUSE_0049` | 7 | Mask: 1 rms_norm + scale, 2 ssm_conv + silu, 4 sigmoid + mul; 0 off. | 0049 | Flash-Next verify graph 12,346-12,407 -> 11,666-11,678 us; decode 32.0 -> 32.2 t/s (`measured-here`). |
 | `GGML_OPENCL_FUSE_0050` | 3 | Mask: bit 1 GDN snapshots written into the cache, bit 2 the gating fold (0051). `0` keeps the copy. | 0050 | Decode +5.1-5.3 % dense agent, +1.8-2.0 % coder, +1.2-1.9 % Flash-Next (`measured-here`). |
 | `GGML_OPENCL_FUSE_CPY_RUN` | on | `0`: runs of narrow strided f32 copies that share their layouts (the recurrent-state rollback snapshots) are not executed as one launch. | 0065 | `code`: 0065:39-41. |
-| `GGML_OPENCL_FUSE_QK_NORM_ROPE` | off | `1`: the q/k rms_norm + 1-D weight and its interleaved M-RoPE in one kernel (3 nodes, 2 launches fewer a side). | 0074 | — pricing owed (a trace's per-step `kernel_rope_multi_f32` + `kernel_rms_norm_mul`, then the served A/B; the audit's bar ≥ +0.5 % decode). |
+| `GGML_OPENCL_FUSE_QK_NORM_ROPE` | off | `1`: the q/k rms_norm + 1-D weight and its interleaved M-RoPE in one kernel (3 nodes, 2 launches fewer a side). | 0074 | **Failed on the cards, window 42 (`measured-here`)**: with it on, `RMS_NORM_MUL_ROPE` 45 of 227 fail on the A770 (mode=40, the rotation not applied) and the B60 faults in the kernel; served −5 % coder, −7 % agent, acceptance −3 points. Keep off. |
 | `GGML_OPENCL_FUSE_SCALE_ACT` | on | `0`: SCALE + SILU / SIGMOID not fused. | 0022 | Fewer launches, text identical, no decode change above the spread (`measured-here`). |
 | `GGML_OPENCL_FUSE_TOPK_MOE` | on | `0`: the MoE routing chain not fused into one kernel. | 0022 | TOPK_MOE 416/416 in test-backend-ops (`measured-here`). |
 | `GGML_OPENCL_GDN_INTEL` | on (Intel) | `0`: keeps `gated_delta_net.cl`. `Rtg,Rpp,NSG,TC` overrides the shape. | 0003 | 512 tokens, harness: B60 875 against 5,692, A770 451 against 12,042 (`measured-here`). |
@@ -174,7 +174,7 @@ These names are not in a table:
 | `LLAMA_EXPERT_CACHE_NB` | on (needs the adapt entry points) | `0`: swaps go back to the exchange on the compute queue. | 0042 | Verify input wait 2.6-6.0 -> 0.94-0.95 ms; decode 32.3 -> 33.1 t/s (`measured-here`). |
 | `GGML_OPENCL_CPU_MISS_MT` | on (AVX2, FMA, F16C) | `0`: the CPU miss path on ggml-cpu's single-token dot products, as its prototype. | 0056 | ggml-cpu's Q2_0 dot product 661 against 72 us a matrix (`measured-here`). |
 | `LLAMA_SLOT_LOAN_EVICTION_GUARD` | on (absent) | 0, off, false or no (any case) turn the loan's eviction guard off; a typo keeps it on. | 0068 | `code`: 0068:3944-3946. |
-| `GGML_OPENCL_CPU_MISS_PREFETCH` | 0 | `1`: a next-block prefetch (field 1, two blocks ahead) in the miss rows; `2`: also a synchronous page-touch pass over the missed experts' slices at publish. | 0075 | — pricing owed; the bank is USM host memory written at load, so the prediction is major faults ~0 and level 2 buying nothing (the window's `/proc` fault count decides; the audit's bar: faults > ~5 % of the CPU lane). |
+| `GGML_OPENCL_CPU_MISS_PREFETCH` | 0 | `1`: a next-block prefetch (field 1, two blocks ahead) in the miss rows; `2`: also a synchronous page-touch pass over the missed experts' slices at publish. | 0075 | **Window 42 (`measured-here`)**: level 0 34.12/34.40 t/s with 0 and 10 major faults, level 1 34.28 (spread), level 2 30.12/33.73 with one leg at +479,730 faults — faults ~0, level 1 buys nothing, level 2 costs. Keep off. |
 
 ### Red case
 

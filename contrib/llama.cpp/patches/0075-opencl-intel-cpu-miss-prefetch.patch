@@ -128,10 +128,10 @@ index 2bfbf05..eec6448 100644
  // quants as two arrays (ggml_cl_usm_set_tensor): the rows ggml-cpu's dot products read
  void   ggml_cl_miss_cpu_join_iq4nl(const void * d, const void * q, int64_t i0, int64_t n, void * dst);
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 545ab96..ab639a4 100644
+index e5b2896..1749578 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -15923,6 +15923,7 @@ struct ggml_cl_miss_layer {
+@@ -15930,6 +15930,7 @@ struct ggml_cl_miss_layer {
      ggml_type             vd_type[3] = {};
      ggml_cl_from_float_fn from_float[3] = {};
      int   n_slots = 0, n_expert = 0;
@@ -139,7 +139,7 @@ index 545ab96..ab639a4 100644
      float clamp = 0.0f;
      bool  fast  = false;         // patch 0056: all three types on the multi-token kernels (ggml-opencl-miss-cpu.cpp)
      uint32_t * pub  = nullptr;   // [0] seq, [1] CPU pairs; [16..) their pair index, [16+PMAX..) bank row; floats from 512: x
-@@ -16028,6 +16029,20 @@ static void ggml_cl_miss_fast_rows(const ggml_cl_miss_layer & L, int k, int64_t
+@@ -16035,6 +16036,37 @@ static void ggml_cl_miss_fast_rows(const ggml_cl_miss_layer & L, int k, int64_t
      ggml_cl_miss_cpu_rows(L.bank[k]->type, slice, L.planar[k], ne0, ne1, act, nt, out, r0, r1);
  }
  
@@ -152,15 +152,32 @@ index 545ab96..ab639a4 100644
 +// once a pair (redundant) — `code`.
 +static void ggml_cl_miss_touch(const ggml_cl_miss_layer & L, int64_t b) {
 +    for (int k = 0; k < 3; ++k) {
-+        if (L.bptr[k] == nullptr) continue;
-+        ggml_cl_miss_cpu_touch(L.bptr[k] + (size_t) b * L.bank[k]->nb[2], (size_t) L.bank[k]->nb[2]);
++        const ggml_tensor * t = L.bank[k];
++        if (t == nullptr || L.bptr[k] == nullptr) continue;
++        // an IQ4_NL bank is the SPLIT form: the scales and the quants as two arrays
++        // over every expert, so the tensor's own nb[2] stride is NOT expert b's
++        // offset here (`ggml_cl_usm_set_tensor`). Window 42: touching at
++        // bptr + b*nb[2] on a split bank ran past the split's region — the leg with
++        // the fault spike (+479,730 major faults). Address the split arrays with the
++        // block index `row_dot_iq4nl` reads instead.
++        if (L.split_d[k] != nullptr) {
++            const int64_t bpr = t->ne[0] / ggml_blck_size(t->type);
++            const int64_t nblk = bpr * t->ne[1];
++            const size_t  blk = ggml_type_size(t->type);
++            const size_t  qb  = blk - sizeof(ggml_fp16_t);
++            ggml_cl_miss_cpu_touch(L.split_d[k] + (size_t) b * nblk * sizeof(ggml_fp16_t),
++                                   (size_t) nblk * sizeof(ggml_fp16_t));
++            ggml_cl_miss_cpu_touch(L.split_q[k] + (size_t) b * nblk * qb, (size_t) nblk * qb);
++            continue;
++        }
++        ggml_cl_miss_cpu_touch(L.bptr[k] + (size_t) b * t->nb[2], (size_t) t->nb[2]);
 +    }
 +}
 +
  static void ggml_cl_miss_compute(const ggml_cl_miss_job & job) {
      ggml_cl_miss_layer & L = *job.L;
      const float * x = (const float *) (L.pub + 512);
-@@ -16057,6 +16072,9 @@ static void ggml_cl_miss_compute(const ggml_cl_miss_job & job) {
+@@ -16064,6 +16096,9 @@ static void ggml_cl_miss_compute(const ggml_cl_miss_job & job) {
              if (gi == grp_b.size()) { grp_b.push_back(ms[m].b); grp.emplace_back(); }
              grp[gi].push_back(m);
          }
@@ -170,7 +187,7 @@ index 545ab96..ab639a4 100644
          const ggml_type t0 = L.bank[0]->type, t1 = L.bank[1]->type, t2 = L.bank[2]->type;
          const size_t a0 = ggml_cl_miss_cpu_act_size(t0, ne_in), a1 = ggml_cl_miss_cpu_act_size(t1, ne_in);
          const size_t a2 = ggml_cl_miss_cpu_act_size(t2, ne_ff);
-@@ -16120,6 +16138,9 @@ static void ggml_cl_miss_compute(const ggml_cl_miss_job & job) {
+@@ -16127,6 +16162,9 @@ static void ggml_cl_miss_compute(const ggml_cl_miss_job & job) {
          const int RB = 32;   // rows a task
          const int tg = (int) ((ne_ff + RB - 1) / RB);
          const char * xq0p = xq0.data(); const char * xq1p = xq1.data();
@@ -180,7 +197,7 @@ index 545ab96..ab639a4 100644
          float * gp = g.data(); float * up = u.data();
          g_miss_pool->run(nm * tg * 2, [&](int task) {
              alignas(64) char scratch[4096];
-@@ -16268,6 +16289,14 @@ static void ggml_backend_opencl_miss_layer(const ggml_tensor * const * slot, con
+@@ -16275,6 +16313,14 @@ static void ggml_backend_opencl_miss_layer(const ggml_tensor * const * slot, con
          L->from_float[k] = (ggml_cl_from_float_fn) from_float[k];
      }
      L->n_slots = n_slots; L->n_expert = n_expert; L->clamp = clamp;

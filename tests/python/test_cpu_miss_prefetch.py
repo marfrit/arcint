@@ -71,6 +71,14 @@ class CpuMissPrefetch(unittest.TestCase):
         self.assertRegex(self.miss, r"o \+= 4096\)")
         self.assertIn("void   ggml_cl_miss_cpu_touch(const void * p, size_t bytes);", self.hdr)
 
+    def test_touch_split_addressing(self):
+        # an IQ4_NL bank is the split form: the touch must address its scales and
+        # quants arrays by block index, not the tensor's nb[2] stride (window 42's
+        # fault spike: bptr + b*nb[2] ran past the split's region)
+        self.assertIn("L.split_d[k] != nullptr", self.cpp)
+        self.assertRegex(self.cpp, r"b \* nblk \* sizeof\(ggml_fp16_t\)")
+        self.assertRegex(self.cpp, r"b \* nblk \* qb")
+
     def test_touch_pass_is_gated_at_level_2(self):
         # both compute paths (the grouped fast path and the single-token slow path)
         self.assertGreaterEqual(self.cpp.count("if (L.prefetch >= 2) {"), 2)

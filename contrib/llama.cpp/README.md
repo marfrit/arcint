@@ -5138,9 +5138,11 @@ kernel's shape), and the sections' sum must be positive — the per-op path
 asserts it and the fused kernel's `ic % sect_dims` would divide by zero on the
 GPU without a word (`code`).
 
-Switch: `GGML_OPENCL_FUSE_QK_NORM_ROPE=1`, **off by default** (`code`): the
-patch is a mechanism, the card A/B is owed before any default (see the audit's
-bar: >= +0.5 % decode for a bundle of two or three fusions, else no build).
+Switch: `GGML_OPENCL_FUSE_QK_NORM_ROPE=1`, **off by default** (`code`). It
+**failed on the cards (window 42, `measured-here`)** and stays off: with the
+switch on, `test-backend-ops -o RMS_NORM_MUL_ROPE` is 45 of 227 failing on the
+A770 and 45 + a device fault on the B60, and the served arms are slower on every
+unit. No correctness fix is claimed; see the record below.
 
 `code`: the patch adds the served shapes to `test-backend-ops`'s
 `RMS_NORM_MUL_ROPE` — `[128,16,1]` and `[128,16,5]` with the strided Q layout
@@ -5166,10 +5168,48 @@ not promised to agree either way. The gate is the answer-level bar
 (`CLAUDE.md`) with an md5/argmax tripwire per fusion; `test-backend-ops`' NMSE
 cannot see the rounding-order mutation, which is why the tripwire exists.
 
-`measured-here` /**owed** on the cards (Claude's window; the handover carries
-the commands): the pricing trace's per-step `kernel_rope_multi_f32` +
-`kernel_rms_norm_mul` device time and count, then the served A/B with the
-switch off and on at the same unit flags. No number is claimed here.
+**Window 42, `measured-here` (the first card run; this section is the record).**
+- Correctness: switch off 227/227 on both cards; on, the A770 fails 45 of 227 and
+  the B60 exits 134 after 6 failures (`clWaitForEvents` error -14,
+  `CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST`). Every failure is `mode=40`
+  (IMROPE) with `[ROPE] ERR 1.1-2.4`; the earlier `mode=0/2` cases pass.
+- The A770's values are the **unrotated** normed row: a host mirror of the fused
+  formula reproduces the CPU reference at 1e-9, and that reference against the
+  *unrotated* row gives NMSE 1.19-1.40 for these shapes, the same band the log
+  reports (`code`: the mirror, not committed). So the cos/sin of the fused
+  dispatch is not applied — theta lands at 0 — or the rotation's window is not
+  entered; the formula itself is right. The B60's uncorrelated output followed by
+  a device fault is a device-side error inside the kernel.
+- Served (two rounds each, the capital right everywhere; the default path equals
+  the package binary): coder (A770) 53.27/52.90 vs 56.03/55.70 t/s (-5 %), MTP
+  acceptance 35.8 -> 32.6 %; agent (B60) 39.37/39.35 vs 42.40/42.32 (-7 %),
+  acceptance 39.0 -> 34.9 %; Flash-Next 33.35/34.58 vs 33.95/33.93, expert hits
+  81.2 -> 83.5/82.9 % (`measured-here`).
+
+**Why it was slower, from the code** (`inferred`, before any re-test): the
+fused dispatch ran one work-group a row with lws = `ne00` (128 on the models)
+while the rope phase gives one lane a rotated pair — so half the lanes idle in
+the rotation, and the whole group waits behind the norm's two barriers before
+the rotation starts. The two kernels it replaces have the same norm geometry
+(`kernel_rms_norm_mul` is also one group a row) and an all-active 64-lane rope
+group, and cost no barrier in the rope phase; the fusion's only saving is 2
+launches a side, ~0.4 % at the wall by the audit's pricing — below its +0.5 %
+bar. The patch's lws is now one lane a pair (`round_up(n_dims/2, subgroup)`,
+capped so the subgroup count fits the local `sum`), which removes the idle
+lanes; the barrier serialization stays. **The fusion cannot be both right and
+faster**: right it is not (the above), faster it would not be beyond ~0.4 %, and
+the correctness defect is unidentified from the source, so the switch stays off
+and the mechanism is parked with the diagnostic below.
+
+To identify the defect in the next window (one run, then restore):
+
+    # print what the fused kernel receives and computes, for one work-item of row 0:
+    sed -i '/float2 cos_sin_theta = rope_yarn_fused/a\            if (i01 == 0 && i02 == 0 && get_local_id(0) == 0) { printf("FUSED n_dims=%d n_offs=%d sect=%d secs=%d/%d/%d/%d pos=%d/%d/%d/%d scale=%f theta=%f cos=%f sin=%f\\n", n_dims, n_offs, sect_dims, sections.s0, sections.s1, sections.s2, sections.s3, pos[0], pos[ne02], pos[2*ne02], pos[3*ne02], scale, theta_base * pow(freq_base, inv_ndims*iw), cos_sin_theta.s0, cos_sin_theta.s1); }' ggml/src/ggml-opencl/kernels/rms_norm.cl
+    # rebuild, then the suite with the switch on; the print names the defect per dispatch
+    GGML_OPENCL_DEVICES=1:0 GGML_OPENCL_FUSE_QK_NORM_ROPE=1 ./bin/test-backend-ops -b GPUOpenCL -o RMS_NORM_MUL_ROPE
+    git checkout ggml/src/ggml-opencl/kernels/rms_norm.cl
+
+The same print on the B60 (`GGML_OPENCL_DEVICES=0:0`) is the device-fault side.
 
 ## 0075-opencl-intel-cpu-miss-prefetch.patch
 
@@ -5216,9 +5256,24 @@ default-off switch, one hint in every row function, the volatile touch and the
 on, the guard removed) were each seen failing, and the C cells' two (stride,
 distance) likewise. Both cells are **source-text assertions**, not numerics.
 
-Owed on the cards (Claude's window; the handover carries the commands): the
-lane's ceiling at `GGML_OPENCL_CPU_MISS_MAX=0` against 64, the cold/warm pair,
-and the major-fault count from `/proc/<pid>/stat` on one served decode (the leg
-host has no `perf`), then the A/B at level 0 and 2. The audit's bar — faults
-above ~5 % of the CPU lane — decides. If the faults are ~0, as predicted, the
-switch stays off and the patch stays a mechanism.
+**Window 42, `measured-here` (the card run; the record).** Flash-Next,
+`GGML_OPENCL_CPU_MISS_MAX=64`: level 0 34.12/34.40 t/s with **0 and 10 major
+faults** over the leg, level 1 34.28 t/s (in the run's spread), level 2
+30.12 and 33.73 with one leg at **+479,730 major faults**. The premise holds
+(faults ~0 at level 0), level 1 buys nothing, level 2 costs, so **the switch
+stays off**.
+
+**The level-2 fault spike, from the code** (`code`): the touch addressed a
+missed expert's slices at `bptr[k] + b * bank->nb[2]`. For an IQ4_NL bank that is
+the SPLIT form — `ggml_cl_usm_set_tensor` lays the scales and the quants as two
+arrays over every expert — so the tensor's own `nb[2]` stride is not expert `b`'s
+offset and the walk can run past the split's region, into whatever mapping
+follows it (the GF mmap is file-backed: a major fault a page). The patch now
+addresses the split arrays by the block index `row_dot_iq4nl` reads
+(`split_d + b*nblk*2`, `split_q + b*nblk*qb`) and keeps `nb[2]` only for the
+block/planar banks. It is a fix for the spike, not for a default: level 2 still
+buys nothing by the premise.
+
+Owed on the cards, unchanged: the cold/warm pair at level 0 and the same A/B on
+the other units; the audit's bar — major faults above ~5 % of the CPU lane —
+decides a default. With faults ~0 already measured, it is ~0.

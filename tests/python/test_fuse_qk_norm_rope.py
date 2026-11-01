@@ -91,6 +91,11 @@ class FuseQkNormRopeTerms(unittest.TestCase):
         self.assertIn("x0*cos_sin_theta.s1 + x1*cos_sin_theta.s0", body)
         self.assertIn("rope_yarn_fused", body, "the YaRN cos/sin path, as rope.cl's")
 
+    def test_sect_dims_guarded(self):
+        # ic % sect_dims is undefined at zero: the host refuses an empty sections
+        # sum and the kernel keeps a defined divisor if the argument ever arrives so
+        self.assertRegex(self.cl, r"sect_sum > 0 \? sect_sum : 1")
+
     def test_imrope_position_layout(self):
         body = _kernel_body(self.cl)
         for s in ('pos[i02 + ne02 * 0]', 'pos[i02 + ne02 * 1]', 'pos[i02 + ne02 * 2]', 'pos[i02 + ne02 * 3]'):
@@ -117,6 +122,12 @@ class FuseQkNormRopeGate(unittest.TestCase):
         # the 2-node prefix must come after, or it swallows the same nodes
         two = self.cpp.find("ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })", fused)
         self.assertGreater(two, three, "the norm+mul pair is checked before the 3-node pattern")
+
+    def test_lws_cap(self):
+        # the work-group is one row; lws is the pairs rounded to a whole subgroup and
+        # capped at sgs*sgs, so the number of subgroups fits the local `sum` (sgs floats)
+        self.assertRegex(self.cpp, r"const int pairs = n_dims / 2;")
+        self.assertRegex(self.cpp, r"nth = MIN\(nth, \(int\) sgs \* \(int\) sgs\);")
 
     def test_kernel_is_created(self):
         self.assertIn('clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm_mul_rope_multi_f32"', self.cpp)
