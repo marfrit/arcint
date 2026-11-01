@@ -17,13 +17,10 @@ namespace lgc::api {
 // without building the material (W6a review finding 3). `/props` reads this.
 bool renderer_ready(const Context& ctx);
 
-// The hash of the already-built material, empty before the first build. Never
-// builds (W6a review finding 3: `/props` must not pay the ~13 MB body).
+// The hash of the already-built material, empty before the first build, while a
+// build holds the lock, or when not capable. Never builds and never waits
+// (W6a review finding 3 / W6 follow-up 3: `/props` pays neither).
 std::string renderer_hash(const Context& ctx);
-
-// The material JSON, built once on first use; empty when not capable or the
-// build failed. The request's hash check reads the hash from it.
-const nlohmann::json& renderer_material(const Context& ctx);
 
 // `GET /v1/responses/renderer`: the status, the cached serialized body by
 // reference (200; owned by the backend) or a serialized error envelope (404

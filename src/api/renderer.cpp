@@ -9,11 +9,7 @@ bool renderer_ready(const Context& ctx) {
 }
 
 std::string renderer_hash(const Context& ctx) {
-    return ctx.backend->renderer_hash();
-}
-
-const nlohmann::json& renderer_material(const Context& ctx) {
-    return ctx.backend->renderer_material();
+    return ctx.backend->renderer_hash_cached();   // no build, try_lock in the backend
 }
 
 RendererBundle renderer_bundle(const Context& ctx) {

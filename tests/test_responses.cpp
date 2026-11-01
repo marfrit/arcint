@@ -2875,6 +2875,7 @@ public:
     nlohmann::json    material = synthetic_material(kHashA);
     mutable int       builds   = 0;
     mutable int       hash_calls = 0;   // the build-capable hash accessor
+    mutable int       cache_reads = 0;  // the no-build, try_lock accessor
     mutable int       serializations = 0;
     mutable bool      serialized = false;
     mutable std::string serialized_body;
@@ -2883,17 +2884,18 @@ public:
     Tokenizer&         tokenizer() override { return tok_; }
     std::string        render_chat(const ChatRequest&) const override { return {}; }
     bool renderer_capable() const override { return true; }
-    const nlohmann::json& renderer_material() const override {
-        ++builds;
-        return material;
-    }
     std::string renderer_hash() const override {
+        ++builds;
         ++hash_calls;
         return material["hash"].get<std::string>();
     }
+    std::string renderer_hash_cached() const override {
+        ++cache_reads;
+        return builds > 0 ? material["hash"].get<std::string>() : std::string();
+    }
     const std::string& renderer_material_json() const override {
         if (!serialized) {
-            (void)renderer_material();
+            (void)renderer_hash();   // the one build
             serialized_body = material.dump();
             serialized      = true;
             ++serializations;
@@ -3000,6 +3002,17 @@ TEST(renderer_404_uses_the_responses_not_found_type) {
     CHECK_EQ(r.status, 404);
     if (r.status != 404 || r.error.empty()) return;
     CHECK_EQ(json::parse(r.error)["error"]["type"].get<std::string>(), std::string("not_found"));
+}
+
+// W6 follow-up 2: the load-time pre-flight that keeps /props honest before the
+// first build. A non-UTF-8 vocabulary text or template means the material can
+// never be built; the loader marks the capability off at load.
+TEST(renderer_text_probe_refuses_non_utf8_vocabulary_or_template) {
+    std::vector<std::string> texts = {"ok", std::string("\xff\xfe")};
+    auto get = [&](int i) { return std::string_view(texts[static_cast<size_t>(i)]); };
+    CHECK(!renderer_text_utf8_ok(2, get, "tmpl"));
+    CHECK(renderer_text_utf8_ok(1, get, "tmpl"));
+    CHECK(!renderer_text_utf8_ok(1, get, std::string_view("\xff")));
 }
 
 // W6a review finding 4: the material carries the served tag geometry and the

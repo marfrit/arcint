@@ -56,6 +56,7 @@ extern "C" int stbi_info_from_memory(unsigned char const* buffer, int len, int* 
 #include "exec/llama_toolgrammar.h"
 #include "exec/verify_walk.h"
 #include "util/log.h"
+#include "util/utf8.h"
 
 namespace lgc {
 namespace {
@@ -931,6 +932,23 @@ public:
         const char* bos = llama_vocab_get_text(vocab_, llama_vocab_bos(vocab_));
         const char* eos = llama_vocab_get_text(vocab_, llama_vocab_eos(vocab_));
         template_ = std::make_unique<minja::chat_template>(template_src_, bos ? bos : "", eos ? eos : "");
+        // W6 follow-up 2: the pre-flight, so /props is honest from the first
+        // second, not only after the first GET. The canonical hash and the
+        // served body's dump admit valid UTF-8 only; a vocabulary or template
+        // whose text is not will never build the material. One pass over the
+        // vocabulary's text at load; Qwen vocabularies pass it.
+        if (!cfg.tts) {
+            const int  n_text  = static_cast<int>(llama_vocab_n_tokens(vocab_));
+            const bool text_ok = renderer_text_utf8_ok(n_text, [&](int id) {
+                const char* t = llama_vocab_get_text(vocab_, id);
+                return t == nullptr ? std::string_view() : std::string_view(t);
+            }, template_src_);
+            if (!text_ok) {
+                material_failed_.store(true, std::memory_order_relaxed);
+                log::warn("load", "renderer material will not be built: the vocabulary or the chat "
+                                  "template is not valid UTF-8; token mode is off on this unit");
+            }
+        }
         if (ckpt_on_) {
             user_start_ = tokenizer_->encode(user_start_text());
             log::info("load", "context checkpoints: up to %d a lane, %zu tokens apart, user messages %s", ckpt_max_,
@@ -1120,6 +1138,7 @@ public:
     void build_if_needed_locked() const {
         if (material_built_) return;
         material_built_ = true;
+        if (material_failed_.load(std::memory_order_relaxed)) return;   // the load pre-flight refused it
         try {
             RendererMaterialParts parts;
             parts.model = {{"served_id", status_.served_id}, {"canonical_id", status_.id},
@@ -1182,17 +1201,27 @@ public:
                           why.c_str());
                 return;
             }
-            renderer_material_ = std::move(material);
+            // Follow-ups 4/5: the serialization is inside this try (a dump that
+            // refuses a string is a failed build, not an exception in the
+            // endpoint), and the json tree is dropped here — the cached body and
+            // the hash are all that stay resident; `material` dies at the end of
+            // the try block.
+            renderer_material_json_ = material.dump();
+            renderer_hash_          = material.value("hash", std::string());
             log::info("load", "renderer material: %s (%d pieces, %zu raw tokens, %zu merges, %zu template bytes)",
-                      renderer_material_["hash"].get<std::string>().c_str(), n,
+                      renderer_hash_.c_str(), n,
                       parts.encode["tokens"].size(), parts.encode["merges"].size(),
                       template_src_.size());
         } catch (const std::exception& e) {
             material_failed_.store(true, std::memory_order_relaxed);
+            renderer_material_json_.clear();
+            renderer_hash_.clear();
             log::warn("load", "renderer material: not built (%s); token mode is off on this unit",
                       e.what());
         } catch (...) {
             material_failed_.store(true, std::memory_order_relaxed);
+            renderer_material_json_.clear();
+            renderer_hash_.clear();
             log::warn("load", "renderer material: not built (unknown error); token mode is off on this unit");
         }
     }
@@ -1234,31 +1263,30 @@ public:
         return extended_tags ? think_ids_ext_ : think_ids_qwen_;
     }
 
-    // feyntalk W6a review findings 2/3: capability without a build (read by
-    // /props), the lazy material (the request's hash check), the cached hash
-    // (no build) and the cached serialized body (the endpoint).
+    // feyntalk W6a review findings 2/3 and W6 follow-ups 2/3/4/5: capability
+    // without a build (read by /props), the build-capable hash (the request),
+    // the cached hash by try_lock (props never waits a build out), and the
+    // cached serialized body (the endpoint). The json tree is not kept.
     bool renderer_capable() const override {
         return !status_.tts && !material_failed_.load(std::memory_order_relaxed);
     }
-    const nlohmann::json& renderer_material() const override {
-        std::lock_guard<std::mutex> lk(material_mu_);
-        build_if_needed_locked();
-        return renderer_material_;
-    }
     std::string renderer_hash() const override {
         std::lock_guard<std::mutex> lk(material_mu_);
-        if (!material_built_ || material_failed_.load(std::memory_order_relaxed) ||
-            !renderer_material_.is_object())
-            return {};
-        return renderer_material_.value("hash", std::string());
+        build_if_needed_locked();
+        return renderer_hash_;
+    }
+    std::string renderer_hash_cached() const override {
+        std::unique_lock<std::mutex> lk(material_mu_, std::try_to_lock);
+        if (!lk.owns_lock()) return {};   // a build holds it: /props reports null, does not wait
+        if (!material_built_ || material_failed_.load(std::memory_order_relaxed)) return {};
+        return renderer_hash_;
     }
     const std::string& renderer_material_json() const override {
         static const std::string kEmpty;
         std::lock_guard<std::mutex> lk(material_mu_);
         build_if_needed_locked();
-        if (material_failed_.load(std::memory_order_relaxed) || !renderer_material_.is_object())
+        if (material_failed_.load(std::memory_order_relaxed) || renderer_material_json_.empty())
             return kEmpty;
-        if (renderer_material_json_.empty()) renderer_material_json_ = renderer_material_.dump();
         return renderer_material_json_;
     }
 
@@ -2712,7 +2740,7 @@ private:
     mutable std::mutex                    material_mu_;
     mutable bool                          material_built_ = false;
     mutable std::atomic<bool>             material_failed_{false};
-    mutable nlohmann::json                renderer_material_;
+    mutable std::string                   renderer_hash_;         // set at build; survives the tree's drop
     mutable std::string                   renderer_material_json_;
     std::string                           gguf_path_;          // for the lazy GGUF metadata parse
     std::string                           template_source_;    // "gguf" or "chatml-fallback"

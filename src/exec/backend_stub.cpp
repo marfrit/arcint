@@ -123,10 +123,13 @@ public:
         return renderer_material_.is_object() && renderer_material_.contains("hash") &&
                renderer_material_["hash"].is_string();
     }
-    const nlohmann::json& renderer_material() const override { return renderer_material_; }
     std::string renderer_hash() const override {
         return renderer_capable() ? renderer_material_["hash"].get<std::string>() : std::string();
     }
+    // The stub's synthetic material is already built, so the cached read and
+    // the build-capable read are the same; the W6 follow-up's try_lock semantics
+    // live in the llama backend.
+    std::string renderer_hash_cached() const override { return renderer_hash(); }
     const std::string& renderer_material_json() const override {
         if (!renderer_capable()) {
             static const std::string kEmpty;
@@ -260,9 +263,12 @@ private:
         const size_t cut = piece.size() / 2;
         const Control first = on_piece(std::string_view(piece).substr(0, cut), id);
         if (first != Control::Continue) return first;
-        // The tail of ONE token carries no id, as StopMatcher's held-tail
-        // convention does: a token event is one per token id (W6b), and the
-        // UTF-8 hold-back still gets its split piece.
+        // The tail of ONE token carries no id. This is deliberately the OTHER
+        // side from StopMatcher: the stop matcher keeps the id with the LAST
+        // part of a held stop string (stop.cpp take()), while the stub announces
+        // the token on the FIRST part here — the token event must precede the
+        // token's bytes (W6b D2), and the shadow's split bytes still reach the
+        // UTF-8 hold-back. One callback with the id is one token event either way.
         return on_piece(std::string_view(piece).substr(cut), -1);
     }
 

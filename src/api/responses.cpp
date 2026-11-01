@@ -840,14 +840,15 @@ std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest r
                                      "capable (GET /props says token_mode: \"off\")",
                                      "arcint.token_mode");
         }
-        const nlohmann::json& material = ctx.backend->renderer_material();
-        if (!material.is_object() || !material.contains("hash") ||
-            !material["hash"].is_string()) {
+        // W6 follow-up 3/5: the hash accessor builds if needed and returns the
+        // cached string; the JSON tree is not kept after serialization.
+        const std::string served_hash = ctx.backend->renderer_hash();
+        if (served_hash.empty()) {
             return renderer_conflict("token mode is not served here: this unit's renderer "
                                      "material could not be built (the load log has the reason)",
                                      "arcint.token_mode");
         }
-        if (material["hash"].get<std::string>() != req.renderer_hash) {
+        if (served_hash != req.renderer_hash) {
             return renderer_conflict("arcint.renderer_hash does not name the material this unit "
                                      "serves; the gateway must refresh its renderer material",
                                      "arcint.renderer_hash");

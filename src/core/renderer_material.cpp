@@ -1,6 +1,7 @@
 #include "core/renderer_material.h"
 
 #include "util/canonical_json.h"
+#include "util/utf8.h"
 
 namespace lgc {
 
@@ -32,6 +33,15 @@ nlohmann::json assemble_renderer_material(const RendererMaterialParts& parts,
         if (why != nullptr) *why = "unknown error";
         return nlohmann::json();
     }
+}
+
+bool renderer_text_utf8_ok(int count, const std::function<std::string_view(int)>& text_of,
+                           std::string_view template_text) {
+    for (int i = 0; i < count; ++i) {
+        const std::string_view text = text_of(i);
+        if (!text.empty() && !utf8::is_valid(text)) return false;
+    }
+    return utf8::is_valid(template_text);
 }
 
 }  // namespace lgc
