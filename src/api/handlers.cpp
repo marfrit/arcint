@@ -639,11 +639,15 @@ json voices(const Context& ctx) {
 namespace {
 
 // The template render as an answer. Only the exception a template raises for
-// its own failure is the request's 400: the vendored minja throws
-// std::runtime_error (minja.hpp, throughout) and subclasses for a value it
-// cannot use or a message it rejects. An engine fault (std::bad_alloc, a
-// std::logic_error from the engine's own helpers) is not the client's and is
-// left to propagate to the route's 500.
+// its own failure is the request's 400: the vendored minja rethrows every
+// std::exception raised while rendering as a located std::runtime_error at two
+// sites - Expression::evaluate and TemplateNode::render in
+// third_party/minja/minja.hpp (re-check both on a minja bump) - so a value the
+// template cannot use (a nlohmann type_error, an out_of_range) or a message it
+// rejects (raise_exception) arrives here as a runtime_error; that includes an
+// allocation failure inside the render itself. An engine fault outside the
+// render (std::bad_alloc, a std::logic_error from the engine's own helpers) is
+// not the client's and is left to propagate to the route's 500.
 std::optional<HttpResult> render_template(const Context& ctx, const ChatRequest& req,
                                           std::string& out) {
     try {
