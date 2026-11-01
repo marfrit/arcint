@@ -306,6 +306,46 @@ struct MmFixture {
     }
 };
 
+// An mmproj unit plus a store: a continuation's stored prefix keeps its image
+// parts, so the cheap pre-check on the new input alone is not enough.
+struct MmStoreFixture {
+    Config                             cfg;
+    MmBackend                          backend;
+    SlotPool                           slots{1};
+    std::shared_ptr<api::ResponseStore> store;
+    Context                            ctx;
+    MmStoreFixture() {
+        cfg.stub    = true;
+        store       = std::make_shared<api::ResponseStore>(api::ResponseStore::Limits{});
+        ctx.cfg     = &cfg;
+        ctx.backend = &backend;
+        ctx.slots   = &slots;
+        ctx.responses = store;
+    }
+};
+
+// A stored completed turn whose user message carries an image part.
+std::shared_ptr<api::StoredResponse> store_entry_with_image(MmStoreFixture& f,
+                                                            const std::string& id) {
+    auto e       = std::make_shared<api::StoredResponse>();
+    e->id        = id;
+    e->lane      = -1;
+    e->status    = "completed";
+    e->chat.model = "stub";
+    ChatMessage u;
+    u.role    = "user";
+    u.content = "look";
+    ImagePart img;
+    img.url = "data:image/png;base64,AAAA";
+    u.images.push_back(img);
+    e->chat.messages = {u};
+    e->prompt        = f.backend.render_chat(e->chat);
+    e->prefix_hash   = api::sha256_hex(e->prompt);
+    e->prompt_tokens = 1;
+    f.store->put(e);
+    return e;
+}
+
 // The id list a body's `tokens` carries, or empty when it is absent or not an
 // integer array.
 std::vector<int> ids_of(const json& body) {
@@ -709,6 +749,20 @@ TEST(tokenize_continuation_prefix_mismatch_keeps_the_stored_entry) {
     CHECK_EQ(r.status, 400);
     CHECK_EQ(err_field(r.body, "code"), std::string("previous_response_not_found"));
     CHECK(f.store->get("resp-1", -1) != nullptr);
+}
+
+// A previous_response_id continuation merges the stored prefix inside prepare;
+// a stored message keeps its image part, so the count would be short by every
+// image token. The post-prepare refusal catches it.
+TEST(tokenize_continuation_with_a_stored_image_is_refused) {
+    MmStoreFixture f;
+    store_entry_with_image(f, "resp-img");
+    const api::HttpResult r =
+        api::tokenize_request(f.ctx, json{{"model", "stub"},
+                                          {"previous_response_id", "resp-img"},
+                                          {"input", "next"}});
+    CHECK_EQ(r.status, 400);
+    CHECK(err_field(r.body, "message").find("image") != std::string::npos);
 }
 
 // ------------------------------------------------------------ lane routing

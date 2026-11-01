@@ -105,14 +105,18 @@ TEST(llama_backend_publishes_supports_preserve_thinking) {
 }
 
 // The wire from render_chat to the shared construction: only a scan can see it
-// device-free, and the scanned string is code, not a comment.
+// device-free, and the scanned text is code, not a comment. Whitespace is
+// stripped from both sides, so a formatting pass cannot break it.
 TEST(llama_backend_render_chat_uses_the_template_context) {
     std::ifstream in(std::string(ARCINT_SOURCE_DIR) + "/src/exec/backend_llama.cpp");
     CHECK(in.good());
     std::stringstream ss;
     ss << in.rdbuf();
-    const std::string src = ss.str();
-    CHECK(src.find("const json  extra = template_context(req, ctx_error);") != std::string::npos);
+    std::string nows;
+    for (char c : ss.str())
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') nows += c;
+    CHECK(nows.find("extra=template_context(req,ctx_error)") != std::string::npos);
+    CHECK(nows.find("inputs.extra_context=extra") != std::string::npos);
 }
 
 TEST(props_reports_the_slot_loan_state) {
