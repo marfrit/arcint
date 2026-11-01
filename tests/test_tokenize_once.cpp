@@ -87,6 +87,15 @@ TEST(tokenize_once_makes_the_same_ids_as_two_passes) {
     }
 }
 
+TEST(tokenize_once_guards_the_unrepresentable_retry) {
+    // the pin returns INT32_MIN for a result above 2^31 tokens; -INT32_MIN
+    // overflows, so no vector is sized from it
+    const std::vector<int> ids = tokenize_once(
+        [](const char *, int32_t, int *, int32_t) { return INT32_MIN; },
+        "text", 8);
+    CHECK(ids.empty());
+}
+
 TEST(tokenize_once_retries_only_when_the_bound_was_short) {
     FakeVocab v;
     const std::string text = "a text whose upper bound is deliberately short";

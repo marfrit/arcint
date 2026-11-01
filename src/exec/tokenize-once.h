@@ -18,16 +18,22 @@
 static_assert(sizeof(int) == sizeof(int32_t), "the token ids are int32_t");
 
 // fn(text, len, out, cap) writes ids and returns the count, or -need when cap
-// is too small (llama_tokenize's contract with a short buffer).
+// is too small (llama_tokenize's contract with a short buffer); a retry cannot
+// represent INT32_MIN, so that result is no ids.
 template <typename Fn>
 std::vector<int> tokenize_once(Fn fn, std::string_view text, size_t initial) {
     std::vector<int> out(initial);
     int n = fn(text.data(), static_cast<int32_t>(text.size()), out.data(), static_cast<int32_t>(out.size()));
+    if (n == INT32_MIN) {
+        // the pin returns INT32_MIN for a result above 2^31 tokens; -n would
+        // overflow, and no vector can be sized from that count here
+        return {};
+    }
     if (n < 0) {
         out.resize(static_cast<size_t>(-n));
         n = fn(text.data(), static_cast<int32_t>(text.size()), out.data(), static_cast<int32_t>(out.size()));
     }
-    if (n < 0 || static_cast<size_t>(n) > out.size()) return {};
+    if (n == INT32_MIN || n < 0 || static_cast<size_t>(n) > out.size()) return {};
     out.resize(static_cast<size_t>(n));
     return out;
 }

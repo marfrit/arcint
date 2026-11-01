@@ -10,10 +10,12 @@
 // ratio. Reproducible: same GGUF, same bytes, same toolchain.
 //
 // Build (ARCINT_LLAMA=ON), run on the host with the pinned vocab:
-//   ./build/tokenize-cost models/ggml-vocab-qwen35.gguf --bytes 160000
+//   ./build/arcint-tokenize-cost models/ggml-vocab-qwen35.gguf --bytes 160000
 #include "llama.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -37,8 +39,10 @@ std::string make_text(size_t bytes) {
 
 // two llama_tokenize calls: size, then fill (the old encode)
 std::vector<int> old_encode(const llama_vocab * v, const std::string & text) {
-    const int need = -llama_tokenize(v, text.data(), static_cast<int32_t>(text.size()), nullptr, 0,
-                                     /*add_special=*/false, /*parse_special=*/true);
+    const int raw = llama_tokenize(v, text.data(), static_cast<int32_t>(text.size()), nullptr, 0,
+                                   /*add_special=*/false, /*parse_special=*/true);
+    if (raw == INT32_MIN) return {};   // -raw would overflow
+    const int need = -raw;
     std::vector<int> out(static_cast<size_t>(need > 0 ? need : 0));
     if (need > 0) {
         llama_tokenize(v, text.data(), static_cast<int32_t>(text.size()),
@@ -53,6 +57,7 @@ std::vector<int> one_pass(const llama_vocab * v, const std::string & text) {
     int n = llama_tokenize(v, text.data(), static_cast<int32_t>(text.size()),
                            reinterpret_cast<llama_token *>(out.data()),
                            static_cast<int32_t>(out.size()), false, true);
+    if (n == INT32_MIN) return {};   // -n would overflow
     if (n < 0) {
         out.resize(static_cast<size_t>(-n));
         n = llama_tokenize(v, text.data(), static_cast<int32_t>(text.size()),
@@ -125,8 +130,8 @@ int main(int argc, char ** argv) {
     }
     std::printf("tokenize-cost: %zu bytes, %zu tokens, old 2-call %.3f ms, one-pass %.3f ms, ratio %.2f\n",
                 text.size(), ids.size(), old_best, new_best, old_best / new_best);
-    std::printf("             one request: old 3 encodes = 6 calls = %.2f ms, new 1 encode = 1 call = %.2f ms\n",
-                old_best * 3.0, new_best);
+    std::printf("             one text request: old 2 encodes = 4 calls = %.2f ms, new 1 encode = 1 call = %.2f ms\n",
+                old_best * 2.0, new_best);
     llama_model_free(model);
     return 0;
 }
