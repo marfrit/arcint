@@ -81,7 +81,8 @@ int main(int argc, char** argv) {
             return 2;
         }
         if (!key_warning.empty()) lgc::log::warn("boot", "%s", key_warning.c_str());
-        cfg.api_key_sha256 = lgc::sha256_hex(cfg.api_key);
+        // sha256_hex_secure wipes its own working copy of the key too.
+        cfg.api_key_sha256 = lgc::sha256_hex_secure(cfg.api_key);
         lgc::api::secure_scrub(cfg.api_key);   // the parsed key
         lgc::log::info("boot", "%s", "an API key is configured: every route but /health needs "
                                  "`Authorization: Bearer <key>`");
