@@ -1,0 +1,271 @@
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 7a65d81..ed2a197 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -117,6 +117,14 @@ extern "C" {
+     // automatic fallback to sync copy if async is not supported
+     GGML_API void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
+ 
++    // patch 0078: whether the scheduler is copying a graph input right now. The
++    // flag is thread-local and held only across ggml_backend_sched_copy_input;
++    // a backend stages a set only when it is on, so a checkpoint restore or a
++    // state read (llama-context.cpp) takes the blocking write.
++    GGML_API void ggml_backend_sched_input_copy_begin(void);
++    GGML_API void ggml_backend_sched_input_copy_end(void);
++    GGML_API bool ggml_backend_sched_input_copy_active(void);
++
+     GGML_API ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend);
+ 
+     //
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 89e96c6..09c917a 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1822,7 +1822,19 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
+ }
+ 
+ // user_synced: patch 0047, the split backend already waited for before this split's user inputs
++// patch 0078: the graph-input marker the staging write asks. Thread-local, so
++// another thread's restore is never staged even while this scheduler copies.
++static thread_local int g_input_copy_depth = 0;
++
++void ggml_backend_sched_input_copy_begin(void) { ++g_input_copy_depth; }
++void ggml_backend_sched_input_copy_end(void)   { --g_input_copy_depth; }
++bool ggml_backend_sched_input_copy_active(void) { return g_input_copy_depth > 0; }
++
+ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, bool * user_synced) {
++    struct input_copy_guard {
++        input_copy_guard()  { ggml_backend_sched_input_copy_begin(); }
++        ~input_copy_guard() { ggml_backend_sched_input_copy_end(); }
++    } input_copy_guard_;
+     const int split_backend_id = split->backend_id;
+     ggml_backend_t split_backend = sched->backends[split_backend_id];
+     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+diff --git a/ggml/src/ggml-opencl/ggml-opencl-staging.h b/ggml/src/ggml-opencl/ggml-opencl-staging.h
+new file mode 100644
+index 0000000..d3157b2
+--- /dev/null
++++ b/ggml/src/ggml-opencl/ggml-opencl-staging.h
+@@ -0,0 +1,28 @@
++// 0078: the graph-input staging bound.
++//
++// Patch 0047 stages a graph input into a USM host ring and enqueues the write
++// without a wait; the ring is reused after a `clFinish` when it wraps. Patch
++// 0078 removes the old 4 MiB refusal only where both bounds hold: the write is
++// the scheduler's graph-input copy (not a checkpoint restore or a state read,
++// which stay blocking) and the whole input fits the ring's free space without a
++// wrap. Anything else returns false and takes the blocking write; a checkpoint
++// restore is in that class and its timing is a card arm owed before the bound is
++// called equivalent (DESIGN §3.4). An input larger than the ring is never split:
++// a split means a `clFinish` a wrap inside the write and a host memcpy where one
++// DMA was. A copy larger than the ring returns before the wrap test, so it does
++// not pay a pointless `clFinish`.
++//
++// `ggml_cl_stage_fits` is the ring bound the caller asks before it touches the
++// ring; a plan is not needed, the write is one `clEnqueueWriteBuffer` of the
++// whole input as 0047 did.
++#ifndef GGML_OPENCL_STAGING_H
++#define GGML_OPENCL_STAGING_H
++
++#include <cstddef>
++
++// whether an aligned `span` fits at `head` in a `ring` (an exact fit does)
++static inline bool ggml_cl_stage_fits(size_t head, size_t span, size_t ring) {
++    return span <= ring && head <= ring && span <= ring - head;
++}
++
++#endif  // GGML_OPENCL_STAGING_H
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 93b138a..c68f896 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -16,6 +16,7 @@
+ #include "cl-program-cache.h"
+ #include "ggml-opencl-miss-cpu.h"
+ #include "ggml-opencl-alias.h"
++#include "ggml-opencl-staging.h"
+ // 0071: the int8 DPAS expert GEMM's dispatch rule, the same text the kernel gets
+ #include "kernels/kq_i8_ops.inc"
+ // 0072: the uniform-work-group rounding rule, shared with the device-free test
+@@ -12365,23 +12366,36 @@ static void ggml_cl_usm_set_tensor(ggml_backend_opencl_buffer_context * ctx, ggm
+     memcpy(base + offset, data, size);
+ }
+ 
+-// A write of at most 4 MiB into a buffer that holds no weights (a graph's
+-// inputs: positions, masks, ids): the bytes copied into a USM host ring and the
+-// copy enqueued without a wait, so the caller may reuse `data` at once. A
+-// blocking write cost ~10.4 us an input on the B60 against ~4.1 staged
+-// (patch 0047). The ring is reused after a clFinish when it wraps.
++// A write into a buffer that holds no weights (a graph's inputs: positions,
++// masks, ids): the bytes copied into a USM host ring and the copy enqueued
++// without a wait, so the caller may reuse `data` at once. A blocking write cost
++// ~10.4 us an input on the B60 against ~4.1 staged (patch 0047). The ring is
++// reused after a clFinish when it wraps. Patch 0078: the staging is for the
++// scheduler's graph-input copy only (the thread-local marker) and only when the
++// whole input fits the ring's free space without a wrap; anything else -- an
++// input larger than the ring, a checkpoint restore, a state read -- takes the
++// blocking write, as 0047 did above 4 MiB. GGML_OPENCL_STAGE_MB sets the ring,
++// default 32 MiB.
+ // One thread writes a context's tensors (the ring head is not atomic).
+ static bool ggml_cl_stage_write(ggml_backend_opencl_context * ctx, ggml_backend_buffer_t buffer, cl_mem dst, size_t off,
+                                 const void * data, size_t size) {
+-    if (size == 0 || size > (4u << 20) || ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++    if (size == 0 || ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+         return false;
+     }
++    if (!ggml_backend_sched_input_copy_active()) {
++        return false;   // a restore or a state read: the old blocking write
++    }
+     if (ctx->stage_on < 0) {
+         const char * e = getenv("GGML_OPENCL_STAGE_INPUTS");
+         ctx->stage_on = (e == nullptr || atoi(e) != 0) && ctx->usm_host_alloc != nullptr && ctx->usm_mem_free != nullptr;
+         if (ctx->stage_on) {
++            size_t mb = 32;
++            const char * m = getenv("GGML_OPENCL_STAGE_MB");
++            if (m != nullptr && atoi(m) >= 8 && atoi(m) <= 1024) {
++                mb = (size_t) atoi(m);   // patch 0078: the ring, 8..1024 MiB
++            }
+             cl_int err = CL_SUCCESS;
+-            ctx->stage_size = 32u << 20;
++            ctx->stage_size = mb << 20;
+             ctx->stage_ring = (char *) ctx->usm_host_alloc(ctx->context, NULL, ctx->stage_size, 128, &err);
+             if (ctx->stage_ring == nullptr || err != CL_SUCCESS) {
+                 ctx->stage_ring = nullptr;
+@@ -12393,8 +12407,13 @@ static bool ggml_cl_stage_write(ggml_backend_opencl_context * ctx, ggml_backend_
+         return false;
+     }
+     const size_t a = (size + 127) & ~(size_t) 127;
+-    if (ctx->stage_head + a > ctx->stage_size) {
+-        CL_CHECK(clFinish(ctx->queue));   // every staged copy has landed
++    if (a > ctx->stage_size) {
++        return false;   // larger than the ring: one blocking DMA instead of a split
++    }
++    if (!ggml_cl_stage_fits(ctx->stage_head, a, ctx->stage_size)) {
++        // a wrap before this write is the 0047 reuse, not a split: every
++        // staged copy has landed, the ring starts over
++        CL_CHECK(clFinish(ctx->queue));
+         ctx->stage_head = 0;
+     }
+     char * p = ctx->stage_ring + ctx->stage_head;
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 69b82e7..37a357e 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -219,6 +219,15 @@ if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
+     add_test(NAME test-opencl-alias COMMAND $<TARGET_FILE:test-opencl-alias>)
+ set_tests_properties(test-opencl-alias PROPERTIES LABELS unit)
+ 
++    add_executable(test-opencl-staging test-opencl-staging.cpp)
++    target_include_directories(test-opencl-staging PRIVATE
++        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl)
++    target_compile_definitions(test-opencl-staging PRIVATE
++        GGML_OPENCL_SRC_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/ggml-opencl.cpp"
++        GGML_BACKEND_SRC_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-backend.cpp"
++        GGML_BACKEND_HDR_PATH="${PROJECT_SOURCE_DIR}/ggml/include/ggml-backend.h")
++    add_test(NAME test-opencl-staging COMMAND $<TARGET_FILE:test-opencl-staging>)
++set_tests_properties(test-opencl-staging PROPERTIES LABELS unit)
+ endif()
+ 
+ add_executable(test-expert-cache-alias test-expert-cache-alias.cpp)
+diff --git a/tests/test-opencl-staging.cpp b/tests/test-opencl-staging.cpp
+new file mode 100644
+index 0000000..f963a8d
+--- /dev/null
++++ b/tests/test-opencl-staging.cpp
+@@ -0,0 +1,96 @@
++// 0078: device-free tests for the graph-input staging bound.
++//   - the ring bound: a whole input fits exactly at the head, a smaller one fits
++//     anywhere before the end, an input larger than the ring or overrunning the
++//     head does not. The write is one DMA for the whole input; a split (the old
++//     0078 chunks, a clFinish a wrap and a 200 MiB host memcpy) is absent.
++//   - the caller rule: ggml-opencl.cpp stages only when the scheduler's
++//     thread-local graph-input marker is on and only when the whole input fits;
++//     the old 4 MiB refusal is gone, so a restore or a state read (the marker
++//     off) takes the blocking write.
++//   - the marker in ggml-backend.cpp/h: begin/end/active around
++//     ggml_backend_sched_copy_input, thread-local.
++// No GPU, no OpenCL runtime.
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <string>
++#include <vector>
++
++#include "ggml-opencl-staging.h"
++
++static int g_bad = 0;
++#define CHECK(cond, what) do { if (!(cond)) { std::printf("FAIL: %s\n", what); ++g_bad; } } while (0)
++
++static void check_fits(void) {
++    const size_t ring = 32u << 20;
++    CHECK(ggml_cl_stage_fits(0, ring, ring), "a whole ring's input fits at the start");
++    CHECK(ggml_cl_stage_fits(0, 4u << 20, ring), "4 MiB fits");
++    CHECK(ggml_cl_stage_fits(ring - (4u << 20), 4u << 20, ring), "an exact end-fit is allowed");
++    CHECK(!ggml_cl_stage_fits(ring, 1, ring), "nothing fits at the end");
++    CHECK(!ggml_cl_stage_fits(ring - 16, 32, ring), "an overrun does not fit");
++    CHECK(!ggml_cl_stage_fits(0, ring + 1, ring), "an input larger than the ring does not fit");
++    CHECK(!ggml_cl_stage_fits(0, 1, 0), "an empty ring fits no bytes");
++}
++
++static void check_staging_sites(const std::string & src) {
++    CHECK(src.find("#include \"ggml-opencl-staging.h\"") != std::string::npos,
++          "ggml-opencl.cpp includes the bound");
++    CHECK(src.find("ggml_backend_sched_input_copy_active()") != std::string::npos,
++          "staging asks the scheduler's graph-input marker");
++    // one ask after the explicit larger-than-the-ring return: the reuse wrap
++    // before the write; the old second size ask is gone with the wrap test
++    int asks = 0;
++    for (size_t at = 0; (at = src.find("ggml_cl_stage_fits(ctx->stage_head", at)) != std::string::npos; at += 1) {
++        ++asks;
++    }
++    CHECK(asks == 1, "the ring bound is asked once, after the explicit size check");
++    CHECK(src.find("size > (4u << 20)") == std::string::npos, "the old 4 MiB refusal is gone");
++    const size_t big   = src.find("if (a > ctx->stage_size)");
++    const size_t flush = src.find("CL_CHECK(clFinish(ctx->queue));");
++    CHECK(big != std::string::npos && flush != std::string::npos && big < flush,
++          "a copy larger than the ring does not finish the ring");
++    CHECK(src.find("clEnqueueWriteBuffer(ctx->queue, dst, CL_FALSE, off, size, p") != std::string::npos,
++          "the staged write is one DMA of the whole input");
++    // a chunk loop would be an input split: none in the staging write
++    CHECK(src.find("for (size_t done") == std::string::npos &&
++              src.find("GGML_OPENCL_STAGE_CHUNK") == std::string::npos,
++          "no split of an input above the ring");
++}
++
++static void check_marker(const std::string & hdr, const std::string & src) {
++    CHECK(hdr.find("ggml_backend_sched_input_copy_begin") != std::string::npos &&
++              hdr.find("ggml_backend_sched_input_copy_active") != std::string::npos,
++          "ggml-backend.h declares the marker");
++    CHECK(src.find("static thread_local int g_input_copy_depth") != std::string::npos,
++          "the marker is thread-local");
++    CHECK(src.find("input_copy_guard") != std::string::npos,
++          "the marker is held by a guard around the input copy");
++    const size_t copy = src.find("static void ggml_backend_sched_copy_input(");
++    const size_t guard = src.find("input_copy_guard", copy);
++    CHECK(copy != std::string::npos && guard != std::string::npos && guard - copy < 500,
++          "the guard is at the input copy's entry");
++}
++
++int main() {
++    check_fits();
++    const char * files[] = { GGML_OPENCL_SRC_PATH, GGML_BACKEND_SRC_PATH, GGML_BACKEND_HDR_PATH };
++    std::vector<std::string> text;
++    for (const char * p : files) {
++        std::ifstream f(p);
++        if (!f) {
++            std::printf("FAIL: cannot open %s\n", p);
++            ++g_bad;
++            text.emplace_back();
++            continue;
++        }
++        text.emplace_back((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
++    }
++    check_staging_sites(text[0]);
++    check_marker(text[2], text[1]);
++    if (g_bad) {
++        std::printf("test-opencl-staging: %d failure(s)\n", g_bad);
++        return 1;
++    }
++    std::printf("test-opencl-staging: ok\n");
++    return 0;
++}
