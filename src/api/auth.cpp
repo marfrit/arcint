@@ -109,6 +109,11 @@ bool api_key_hygiene(std::string_view key, std::string& error, std::string& warn
     return true;
 }
 
+std::string api_key_file_warning(const std::string& path) {
+    (void)path;
+    return {};
+}
+
 void secure_scrub(std::string& s) {
     if (!s.empty()) {
         // volatile: the compiler may not drop the stores as dead.

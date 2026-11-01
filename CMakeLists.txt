@@ -374,6 +374,14 @@ if(ARCINT_TESTS)
                    "$<TARGET_FILE:arcint>")
   set_tests_properties(auth PROPERTIES TIMEOUT 120 LABELS unit)
 
+  # ops-2 item 6: a bad --tls-cert/--tls-key is refused before the model load.
+  # No-op in a build without ARCINT_TLS (parse refuses the flags); the
+  # ARCINT_TLS arm (`dirac-gate tls`) runs the assertion for real.
+  add_test(NAME tls
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/tls.sh"
+                   "$<TARGET_FILE:arcint>")
+  set_tests_properties(tls PROPERTIES TIMEOUT 60 LABELS unit)
+
   # Both device-free: the generator's own consistency check, and the
   # acceptance runner's self-test against a fixture manifest. Neither needs a
   # card or ARCINT_ACCEPTANCE, so both run in every build.

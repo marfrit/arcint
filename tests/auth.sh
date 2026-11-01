@@ -22,11 +22,12 @@ free_port() {
 
 WORK=$(mktemp -d)
 SRV_PID=""
+OP_PID=""
 cleanup() {
-  if [[ -n "$SRV_PID" ]] && kill -0 "$SRV_PID" 2>/dev/null; then
-    kill "$SRV_PID" 2>/dev/null
-    wait "$SRV_PID" 2>/dev/null
-  fi
+  local pid
+  for pid in "$SRV_PID" "$OP_PID"; do
+    stop_pid "$pid"
+  done
   # A refusal-server that unexpectedly kept running is killed by the test, but
   # guard the common paths too.
   rm -rf "$WORK"
@@ -75,6 +76,28 @@ expect_code() {
   check "$name" "$([[ "$code" == "$expected" ]] && echo 0 || echo 1)"
 }
 
+# pid_alive: false once the process is gone or a zombie. `kill -0` alone is
+# true for a zombie, which made a refused server read as "kept running".
+pid_alive() {
+  local pid="$1"
+  [[ -n "$pid" && -r "/proc/$pid/stat" ]] || return 1
+  [[ "$(cut -d' ' -f3 "/proc/$pid/stat" 2>/dev/null)" != "Z" ]]
+}
+
+# stop_pid: SIGTERM, a bounded wait, then SIGKILL -- a server whose signal
+# handler raced its own listen() must not hang the test in `wait`.
+stop_pid() {
+  local pid="$1" i
+  pid_alive "$pid" || { wait "$pid" 2>/dev/null || true; return; }
+  kill "$pid" 2>/dev/null
+  for ((i = 0; i < 50; i++)); do
+    pid_alive "$pid" || break
+    sleep 0.1
+  done
+  pid_alive "$pid" && kill -9 "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null || true
+}
+
 # wait_for <pid> <log> <pattern> <seconds>: bounded, so a slow runner cannot
 # read a refusal as "kept running". Returns 0 once the pattern is in the log or
 # the process has exited, 1 on the timeout.
@@ -83,7 +106,20 @@ wait_for() {
   local i
   for ((i = 0; i < seconds * 10; i++)); do
     grep -q "$pattern" "$log" 2>/dev/null && return 0
-    kill -0 "$pid" 2>/dev/null || return 0
+    pid_alive "$pid" || return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# wait_exit <pid> <seconds>: 0 when the process is gone (or a zombie), 1 on the
+# timeout. A refusal prints its message and THEN exits, so the exit is what a
+# refusal test must confirm -- a warning line can match the grep while the
+# server keeps running.
+wait_exit() {
+  local pid="$1" seconds="${2:-3}" i
+  for ((i = 0; i < seconds * 10; i++)); do
+    pid_alive "$pid" || return 0
     sleep 0.1
   done
   return 1
@@ -98,13 +134,16 @@ expect_refusal() {
   "$BIN" --stub --host 127.0.0.1 --port "$port" --n-ctx 256 --api-key-file "$keyfile" >"$log" 2>&1 &
   local pid=$!
   wait_for "$pid" "$log" "$pattern" 5 || true
-  if kill -0 "$pid" 2>/dev/null; then
-    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
-    fail "$name: the server kept running (auth silently off)"
-  elif grep -q "$pattern" "$log"; then
-    pass "$name"
+  if wait_exit "$pid" 3; then
+    wait "$pid" 2>/dev/null || true
+    if grep -q "$pattern" "$log"; then
+      pass "$name"
+    else
+      fail "$name: exited but without the expected message"
+    fi
   else
-    fail "$name: exited but without the expected message"
+    stop_pid "$pid"
+    fail "$name: the server kept running (auth silently off)"
   fi
 }
 
@@ -117,13 +156,13 @@ expect_warning() {
   "$BIN" --stub --host 127.0.0.1 --port "$port" --n-ctx 256 --api-key "$key" >"$log" 2>&1 &
   local pid=$!
   wait_for "$pid" "$log" "$pattern" 5 || true
-  if ! kill -0 "$pid" 2>/dev/null; then
+  if ! pid_alive "$pid"; then
     fail "$name: the server exited instead of warning"
     return
   fi
   check "$name" "$(grep -q "$pattern" "$log" && echo 0 || echo 1)"
   check "$name: the warning does not echo the key" "$(grep -qF -- "$key" "$log" && echo 1 || echo 0)"
-  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  stop_pid "$pid"
 }
 
 # The pre-body refusal: a request whose headers declare a large body but send
@@ -315,7 +354,7 @@ hdr=$(curl -sS -D - -o /dev/null "$BASE/props" | tr -d '\r')
 check "no key: no Connection: close is sent" "$(echo "$hdr" | grep -qi '^connection: *close' && echo 1 || echo 0)"
 check "no key: Keep-Alive is advertised" "$(echo "$hdr" | grep -qi '^keep-alive:' && echo 0 || echo 1)"
 keepalive_check "" || FAILED=$((FAILED + 1))
-kill "$SRV_PID"; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
+stop_pid "$SRV_PID"; SRV_PID=""
 
 echo "== --api-key"
 PORT=$(free_port)
@@ -324,7 +363,9 @@ SRV_PID=$!
 wait_boot "$WORK/key.log" || { echo "key server did not boot" >&2; exit 1; }
 BASE="http://127.0.0.1:${PORT}"
 
-expect_code "/health is exempt" "200" GET "/health"
+expect_code "/health is exempt for GET" "200" GET "/health"
+expect_code "/health is exempt for HEAD" "200" HEAD "/health"
+expect_code "POST /health is not exempt (401, not 404)" "401" POST "/health"
 
 # Every route family, unauthenticated: a 401 before any body is parsed.
 expect_code "POST /v1/chat/completions needs the key" "401" POST "/v1/chat/completions"
@@ -365,8 +406,11 @@ code=$(curl -sS -o /dev/null -w '%{http_code}' -H "$AUTH" "$BASE/no-such-route")
 check "an unknown path with the key is 404" "$([[ "$code" == "404" ]] && echo 0 || echo 1)"
 
 code=$(curl -sS -o /dev/null -w '%{http_code}' -X OPTIONS "$BASE/props")
-check "CORS preflight is answered without the key (204)" "$([[ "$code" == "204" ]] && echo 0 || echo 1)"
-allow=$(curl -sS -D - -o /dev/null -X OPTIONS "$BASE/props" | tr -d '\r' | grep -i '^access-control-allow-origin:' | head -1)
+check "a bare OPTIONS is not a preflight and needs the key (401)" "$([[ "$code" == "401" ]] && echo 0 || echo 1)"
+code=$(curl -sS -o /dev/null -w '%{http_code}' -X OPTIONS \
+            -H 'Access-Control-Request-Method: POST' "$BASE/props")
+check "CORS preflight (Access-Control-Request-Method) is answered (204)" "$([[ "$code" == "204" ]] && echo 0 || echo 1)"
+allow=$(curl -sS -D - -o /dev/null -X OPTIONS -H 'Access-Control-Request-Method: POST' "$BASE/props" | tr -d '\r' | grep -i '^access-control-allow-origin:' | head -1)
 check "the preflight allows the origin" "$(echo "$allow" | grep -q '\*' && echo 0 || echo 1)"
 
 cat >"$WORK/chat.json" <<'JSON'
@@ -380,11 +424,12 @@ keepalive_check "Bearer $KEY" || FAILED=$((FAILED + 1))
 expect_100_check || FAILED=$((FAILED + 1))
 body_not_read_check || FAILED=$((FAILED + 1))
 
-kill "$SRV_PID"; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
+stop_pid "$SRV_PID"; SRV_PID=""
 check "the key never appears in the server log" "$(grep -q "$KEY" "$WORK/key.log" && echo 1 || echo 0)"
 
 echo "== --api-key-file"
 printf '%s\n' "$KEY" >"$WORK/key.txt"
+chmod 0600 "$WORK/key.txt"
 PORT=$(free_port)
 "$BIN" --stub --host 127.0.0.1 --port "$PORT" --n-ctx 256 --api-key-file "$WORK/key.txt" -v >"$WORK/file.log" 2>&1 &
 SRV_PID=$!
@@ -394,7 +439,27 @@ code=$(curl -sS -o /dev/null -w '%{http_code}' -H "$AUTH" "$BASE/props")
 check "a key read from a file authenticates" "$([[ "$code" == "200" ]] && echo 0 || echo 1)"
 code=$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/props")
 check "the file key still refuses a bare request" "$([[ "$code" == "401" ]] && echo 0 || echo 1)"
-kill "$SRV_PID"; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
+check "a private (0600) key file gets no mode warning" "$(grep -q -- '--api-key-file mode' "$WORK/file.log" && echo 1 || echo 0)"
+stop_pid "$SRV_PID"; SRV_PID=""
+
+echo "== a group/world-readable key file is warned about"
+printf '%s\n' "$KEY" >"$WORK/key-open.txt"
+chmod 0644 "$WORK/key-open.txt"
+PORT=$(free_port)
+log="$WORK/key-open.log"
+"$BIN" --stub --host 127.0.0.1 --port "$PORT" --n-ctx 256 --api-key-file "$WORK/key-open.txt" -v >"$log" 2>&1 &
+OP_PID=$!
+mode_pat='--api-key-file mode'
+wait_for "$OP_PID" "$log" "$mode_pat" 5 || true
+if ! pid_alive "$OP_PID"; then
+  fail "the group/world-readable key file made the server exit"
+else
+  check "a group/world-readable key file warns" "$(grep -q -- "$mode_pat" "$log" && echo 0 || echo 1)"
+  check "the warning names the mode (644)" "$(grep -q '644' "$log" && echo 0 || echo 1)"
+  check "the mode warning does not echo the key" "$(grep -qF -- "$KEY" "$log" && echo 1 || echo 0)"
+  stop_pid "$OP_PID"
+fi
+OP_PID=""
 
 echo "== a key file that can never work is refused at boot"
 printf '' >"$WORK/empty.txt"
@@ -403,16 +468,18 @@ printf 'a\rb\n' >"$WORK/cr.txt"
 printf 'a\nb\n' >"$WORK/lf.txt"
 printf 'a\tb\n' >"$WORK/tab.txt"
 printf 'a\177b\n' >"$WORK/del.txt"
+printf ' spaced\n' >"$WORK/lead-space.txt"
+printf 'trailing \n' >"$WORK/trail-space.txt"
 expect_refusal "an empty key file" "$WORK/empty.txt" "empty"
 expect_refusal "a newline-only key file" "$WORK/newline.txt" "empty"
 expect_refusal "a CR key file" "$WORK/cr.txt" "control character"
 expect_refusal "a key with an embedded LF" "$WORK/lf.txt" "control character"
 expect_refusal "a key with a TAB" "$WORK/tab.txt" "control character"
 expect_refusal "a key with a DEL" "$WORK/del.txt" "control character"
+expect_refusal "a key with a leading space" "$WORK/lead-space.txt" "starts or ends with a space"
+expect_refusal "a key with a trailing space" "$WORK/trail-space.txt" "starts or ends with a space"
 
 echo "== key hygiene warnings (the key is still served)"
-expect_warning "leading whitespace warns" " spaced-key" "whitespace"
-expect_warning "trailing whitespace warns" "spaced-key " "whitespace"
 expect_warning "a percent warns" "key%41" "percent"
 
 echo

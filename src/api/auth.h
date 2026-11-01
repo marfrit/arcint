@@ -33,6 +33,12 @@ bool bearer_matches(std::string_view authorization_header, std::string_view key_
 // `%xx` can never match a client that sends it verbatim).
 bool api_key_hygiene(std::string_view key, std::string& error, std::string& warning);
 
+// A boot warning when the key file is group- or world-accessible (mode & 077),
+// naming the mode; empty when the file is private or cannot be stat'd (the
+// read already reported a missing file). In a public repository no operator
+// host detail is in it, only the file's own mode.
+std::string api_key_file_warning(const std::string& path);
+
 // Overwrite a string's storage with zeros before clearing it, so a plaintext
 // key does not stay in freed memory. volatile, so the compiler cannot elide
 // the writes as dead stores.
