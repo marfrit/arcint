@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "api/handlers.h"
+#include "api/metrics.h"
 #include "api/responses_state.h"
 #include "build_info.h"
 #include "config.h"
@@ -127,7 +128,12 @@ int main(int argc, char** argv) {
     }
 
     lgc::api::SlotPool slots(cfg.parallel);
-    lgc::api::Context  ctx{.cfg = &cfg, .backend = backend.get(), .slots = &slots};
+    // --metrics owns the counters; without the flag nothing is recorded.
+    lgc::api::Metrics metrics;
+    lgc::api::Context  ctx{.cfg     = &cfg,
+                           .backend = backend.get(),
+                           .slots   = &slots,
+                           .metrics = cfg.metrics ? &metrics : nullptr};
     ctx.responses = std::make_shared<lgc::api::ResponseStore>(lgc::api::ResponseStore::Limits{
         cfg.responses_store_entries, static_cast<uint64_t>(cfg.responses_store_bytes),
         cfg.responses_store_ttl_s});

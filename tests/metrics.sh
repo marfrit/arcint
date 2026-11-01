@@ -78,7 +78,7 @@ boot "$WORK/on.log" || { echo "metrics server did not boot" >&2; exit 1; }
 BASE="http://127.0.0.1:${PORT}"
 
 curl -sS -o "$WORK/metrics.body" -w '%{http_code}' "$BASE/metrics" >"$WORK/metrics.code"
-check "GET /metrics is 200" "[[ $(cat "$WORK/metrics.code") == "200" ]] && echo 0 || echo 1"
+check "GET /metrics is 200" "$([[ "$(cat "$WORK/metrics.code")" == "200" ]] && echo 0 || echo 1)"
 ctype=$(curl -sS -o /dev/null -w '%{content_type}' "$BASE/metrics")
 check "Content-Type is the Prometheus text format" "$([[ "$ctype" == text/plain* ]] && echo 0 || echo 1)"
 check "the body carries the request counter" "$(grep -q 'arcint_requests_total' "$WORK/metrics.body" && echo 0 || echo 1)"
@@ -91,7 +91,7 @@ cat >"$WORK/chat.json" <<'JSON'
 JSON
 curl -sS -o "$WORK/chat.body" -w '%{http_code}' -H 'Content-Type: application/json' \
      --data-binary @"$WORK/chat.json" "$BASE/v1/chat/completions" >"$WORK/chat.code"
-check "chat with arcint.timings is 200" "[[ $(cat "$WORK/chat.code") == "200" ]] && echo 0 || echo 1"
+check "chat with arcint.timings is 200" "$([[ "$(cat "$WORK/chat.code")" == "200" ]] && echo 0 || echo 1)"
 check "the response carries the seven timing fields" \
   "$(jassert "$WORK/chat.body" 'all(k in d.get("timings", {}) for k in ("prompt_n","prompt_ms","predicted_n","predicted_ms","cache_n","draft_n","draft_accepted"))' && echo 0 || echo 1)"
 curl -sS "$BASE/metrics" -o "$WORK/metrics2.body"

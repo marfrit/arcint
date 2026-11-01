@@ -5,6 +5,7 @@
 #include <httplib.h>
 
 #include "api/error.h"
+#include "api/metrics.h"
 #include "api/renderer.h"
 #include "api/responses.h"
 #include "api/responses_state.h"
@@ -112,8 +113,12 @@ void HttpServer::Impl::route() {
         svr.new_task_queue = [n] { return new httplib::ThreadPool(n); };
     }
 
-    svr.set_logger([](const httplib::Request& req, const httplib::Response& res) {
+    svr.set_logger([this](const httplib::Request& req, const httplib::Response& res) {
         log::verbose("http", "%s %s -> %d", req.method.c_str(), req.path.c_str(), res.status);
+        // The request counter reads the status the route actually committed,
+        // refusals included (--metrics only).
+        if (ctx.metrics != nullptr)
+            ctx.metrics->observe_request(api::metrics_route_label(req.path), res.status);
     });
 
     svr.set_exception_handler(
@@ -148,6 +153,17 @@ void HttpServer::Impl::route() {
     svr.Get("/props", [this](const httplib::Request&, httplib::Response& res) {
         send_json(res, 200, api::props(ctx));
     });
+
+    // GET /metrics (--metrics): the Prometheus text format over what arcint
+    // already computes. Off by default: without the flag the route does not
+    // exist and the default surface is unchanged.
+    if (ctx.cfg != nullptr && ctx.cfg->metrics) {
+        svr.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
+            res.status = 200;
+            res.set_content(ctx.metrics != nullptr ? ctx.metrics->render(ctx) : std::string(),
+                            "text/plain; version=0.0.4; charset=utf-8");
+        });
+    }
 
     svr.Get("/v1/models", [this](const httplib::Request&, httplib::Response& res) {
         send_json(res, 200, api::models(ctx));

@@ -46,8 +46,17 @@ json usage_json(const GenerationStats& s) {
 }
 
 nlohmann::json timings_json(const GenerationStats& stats) {
-    (void)stats;
-    return nlohmann::json::object();
+    // llama-server's names, on this engine's own counters: prompt_n/predicted_n
+    // are the tokens, cache_n the reused prefix, draft_n/draft_accepted the
+    // speculation. The milliseconds are the wall phases the server already
+    // times and logs; nothing new is measured for this object.
+    return nlohmann::json{{"prompt_n", stats.prompt_tokens},
+                          {"prompt_ms", stats.prefill_seconds * 1000.0},
+                          {"predicted_n", stats.completion_tokens},
+                          {"predicted_ms", stats.decode_seconds * 1000.0},
+                          {"cache_n", stats.cache_hit_tokens},
+                          {"draft_n", stats.draft_proposed},
+                          {"draft_accepted", stats.draft_accepted}};
 }
 
 // One list for the two consumers: the decode line prints the counters when one

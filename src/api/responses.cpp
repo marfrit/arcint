@@ -9,6 +9,7 @@
 
 #include "api/error.h"
 #include "api/generate.h"
+#include "api/metrics.h"
 #include "api/responses_state.h"
 #include "core/chat.h"
 #include "util/log.h"
@@ -1185,6 +1186,9 @@ json response_resource(const ResponseRequest& req, const PreparedChat& prep,
     // loop guard's counters use.
     if (prep.truncation.blocks_dropped > 0) ext["truncated"] = truncation_json(prep.truncation);
     if (loop_guard_moved(gen.stats)) ext["loop_guard"] = loop_guard_json(gen.stats);
+    // arcint.timings: the per-response timing object, only when the request
+    // asked; the extension namespace is the spec-typed surface's own.
+    if (req.timings) ext["timings"] = timings_json(gen.stats);
     if (ext.size() > 1) parts.arcint_ext = std::move(ext);
     parts.output = std::move(output);
     parts.usage  = json{{"input_tokens", gen.stats.prompt_tokens},
@@ -1243,6 +1247,7 @@ HttpResult run_response(const Context& ctx, PreparedResponse& prep, int slot) {
         return HttpResult{500, responses_error(e.what(), "server_error", "internal_error")};
     }
     log_stats(slot, stats, reason);
+    if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
 
     // A cancel-by-id is a 200 with the incomplete resource (the campaign's
     // Cancel section); a stop signal is a 503 an alive client reads; a gone

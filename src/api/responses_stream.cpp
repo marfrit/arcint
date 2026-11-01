@@ -8,6 +8,7 @@
 
 #include "api/error.h"
 #include "api/generate.h"
+#include "api/metrics.h"
 #include "api/responses_state.h"
 #include "core/reasoning.h"
 #include "core/toolcall.h"
@@ -472,6 +473,13 @@ private:
         const char* status = completed ? "completed" : "incomplete";
         json resource = snapshot(req_, prep_, status, output_, usage_of(stats), nullptr,
                                  incomplete, completed);
+        // arcint.timings: the terminal resource carries the same object the
+        // non-streamed body does, only when the request asked.
+        if (req_.timings) {
+            if (!resource.contains("arcint") || !resource["arcint"].is_object())
+                resource["arcint"] = json::object();
+            resource["arcint"]["timings"] = timings_json(stats);
+        }
         if (!send(json{{"type", type}, {"response", resource}})) return false;
         // store=true retains the turn; store=false and an entries=0 store keep
         // nothing. A failed turn is not stored (the failed() path).
@@ -649,6 +657,7 @@ bool Stream::run(const Context& ctx, int slot) {
     }
 
     log_stats(slot, stats, reason);
+    if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
     if (gone_) return false;
 
     if (reason == FinishReason::Abort) {

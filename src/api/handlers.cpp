@@ -11,6 +11,7 @@
 
 #include "api/error.h"
 #include "api/generate.h"
+#include "api/metrics.h"
 #include "api/renderer.h"
 #include "api/responses_state.h"
 #include "build_info.h"
@@ -559,6 +560,8 @@ json props(const Context& ctx) {
         {"endpoints",
          json::array({"/health", "/props", "/v1/chat/completions", "/v1/completions",
                       "/v1/responses", "/v1/responses/{id}/cancel", "/v1/models", "/v1/audio/speech", "/v1/audio/voices"})}};
+    // --metrics adds GET /metrics, so it is named here only when it is served.
+    if (cfg.metrics) p["endpoints"].push_back("/metrics");
     // The Responses store's live state (docs/campaigns/feyntalk.md State):
     // what it retains now, and the limits that bound it. A process without a
     // store (a test seam) says null rather than a zero that would read as empty.
@@ -1019,6 +1022,7 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
         }))
         return *err;
     log_stats(slot, stats, reason);
+    if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
 
     // A non-streamed request commits its status before its body is built, so
     // an abort is still answerable: a stop signal is a 503 an alive client
@@ -1073,6 +1077,10 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     // loop-guard: present only when the ladder moved, so a request without the
     // switch has the response body it always had.
     if (loop_guard_moved(stats)) body["loop_guard"] = loop_guard_json(stats);
+    // arcint.timings: the per-response timing object, only when the request
+    // asked. llama-server's field name at the top level; absent keeps the body
+    // byte-identical.
+    if (prep.req.timings) body["timings"] = timings_json(stats);
     return HttpResult{200, std::move(body)};
 }
 
@@ -1086,6 +1094,7 @@ HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, in
         }))
         return *err;
     log_stats(slot, stats, reason);
+    if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
 
     // As the chat path: a stop signal is a 503, a gone client gets no body.
     if (reason == FinishReason::Abort) {
@@ -1133,6 +1142,7 @@ SpeechResult run_speech(const Context& ctx, const PreparedSpeech& prep, int slot
     }
     log::info(log::format("slot %d", slot), "speech '%s': %d frames, %zu bytes WAV in %.2f s",
               prep.input.voice.c_str(), stats.completion_tokens, wav.size(), stats.decode_seconds);
+    if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
     return SpeechResult{200, std::move(wav), json::object()};
 }
 
@@ -1267,6 +1277,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     }
 
     log_stats(slot, stats, reason);
+    if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
     // An aborted request sends nothing more: a gone client's write would fail
     // anyway, and a buffered tool call must not come back as raw content after
     // the turn was cancelled (DESIGN §3.7; the stop signal too).
@@ -1322,6 +1333,9 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
         final_delta["reasoning_closed"] = !reasoning.in_reasoning();
     json final_extra = json::object();
     if (loop_guard_moved(stats)) final_extra["loop_guard"] = loop_guard_json(stats);
+    // arcint.timings: the final chunk carries the same object the non-streamed
+    // body does, on the same opt-in condition.
+    if (prep.req.timings) final_extra["timings"] = timings_json(stats);
     if (!sse_send(write, chunk(json::array({{{"index", 0},
                                              {"delta", final_delta},
                                              {"finish_reason", finish}}}), final_extra))) {
@@ -1384,6 +1398,7 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep, int s
     }
 
     log_stats(slot, stats, reason);
+    if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
     // As the chat path: an aborted request sends nothing more.
     if (gone || reason == FinishReason::Abort) return;
 
