@@ -1179,6 +1179,38 @@ prefix hash and the token-mode `arcint.render.prompt_sha256` stay meaningful
 after-the-last-user rule and W3.5's reasoning-first fit pass keep or drop it as
 a unit, never per call (`code`).
 
+The two paths share one state machine (`AssistantRun`): the merge, the
+reasoning pairing, the message-content shapes (a string, or typed parts joined
+with a newline) and the reset rules live in one place, and an item the grammar
+does not handle closes the run on the stored path exactly as the input path's
+boundary items do — a corrupt stored `[call, <unknown>, call]` cannot merge
+across the unknown item. A table-driven test feeds the same assistant-item
+sequences through both paths and asserts identical ChatMessages (`code`).
+
+The rule is not only about several calls. A stored `[message, function_call]`
+turn — the ordinary single-call tool turn with a text preamble, which the
+engine's `response_resource` emits as a message item followed by a
+`function_call` item — now rebuilds as **one** assistant message where it used
+to be two. That is a render change for existing `previous_response_id`
+continuations, and it is correct because a template cannot have generated two
+back-to-back assistant turns: the engine's own output is one assistant turn
+with its content and its calls, and replaying it any other way shows the model
+a history it never wrote. The store is in-memory only (charter §3), so no
+persisted prefix is invalidated (`code`).
+
+On the Responses input path a duplicate `call_id` inside **one** merged run is
+refused with 400 `invalid_request` (param `input`), because the
+`function_call_output` pairing would be ambiguous. The stored-output path
+carries engine-minted ids and cannot see a duplicate. The Chat Completions
+route is a separate surface and keeps its current behaviour (`code`).
+
+A continuation whose new input replays the stored output's own
+`function_call` items is the client double-replaying: the stored turn and the
+replayed turn become **two** assistant turns, where the inline form of the same
+items is one run (and is refused, the call_ids repeat). This is named, not
+special-cased: the engine does not guess which of the two turns the client
+meant (`code`).
+
 **Fixture and tests.**
 `tests/feyntalk/fixtures/parallel-tool-calls.json` is the shared contract: a
 `schema: feyntalk-w6g/1` object of named histories, each holding the Responses
@@ -1186,10 +1218,12 @@ a unit, never per call (`code`).
 one turn; text then two calls; two separate turns split by a tool output; a
 reasoning item before the turn; the inline full history after the two-call
 turn). The engine test (`tests/test_responses.cpp`, the W6g section) reads it,
-checks the mapped messages structurally against the Chat form, and compares the
-rendered prompts byte for byte on both paths, including the continuation; the
-gateway's renderer test reads a copy of the same file later (no other
-repository is touched here). Red first, then the merge made them pass.
+pins `schema: feyntalk-w6g/1` so a drifted copy fails loudly, checks the mapped
+messages structurally against the Chat form, compares the rendered prompts
+byte for byte on both paths (including the continuation), and feeds the same
+assistant-item sequences through both paths; the gateway's renderer test reads
+a copy of the same file later (no other repository is touched here). Red first,
+then the merge made them pass.
 
 ### Work packages
 
