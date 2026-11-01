@@ -131,11 +131,19 @@ ToolSchemas tool_schemas(const std::vector<ToolSpec>& tools);
 // mtmd_tokenize() finds it (`docs/milestone-1.2.0.md §3`).
 inline constexpr const char* kMediaMarker = "<__media__>";
 
-// The keys the vendored minja's chat-template context sets itself before it
-// merges `extra_context` (third_party/minja/chat-template.hpp, apply()):
-// messages, add_generation_prompt, bos_token, eos_token, strftime_now, tools.
-// A chat_template_kwargs key that names one would let a client override the
-// engine's own value, so it is refused by name.
+// The names a chat_template_kwargs key must not take, because the vendored
+// minja already owns them in the template context:
+//   - the six keys apply() sets before it merges extra_context
+//     (third_party/minja/chat-template.hpp): messages, add_generation_prompt,
+//     bos_token, eos_token, strftime_now, tools;
+//   - the 31 builtins Context::builtins() installs (third_party/minja/
+//     minja.hpp), on a parent context, so a same-named key on the child
+//     shadows them: ==, count, default, dictsort, e, equalto, escape, in,
+//     indent, int, items, join, joiner, last, length, list, lower, map,
+//     namespace, raise_exception, range, reject, rejectattr, safe, select,
+//     selectattr, string, tojson, trim, unique, upper.
+// A key that names one would let a client override the engine's value or break
+// a template that calls the builtin, so it is refused by name.
 bool reserved_template_context_key(std::string_view key);
 
 // The `extra_context` a request produces: the typed switches

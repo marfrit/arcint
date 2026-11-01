@@ -638,15 +638,17 @@ json voices(const Context& ctx) {
 // ---------------------------------------------------------------- prepare
 namespace {
 
-// The template render as an answer: a render that throws is the request's fault
-// (a passthrough value minja cannot use, a message shape the template rejects),
-// so it is a 400. An engine fault stays guarded()'s 500; only this call is
-// wrapped, so generation and the rest of the prepare keep their own handling.
+// The template render as an answer. Only the exception a template raises for
+// its own failure is the request's 400: the vendored minja throws
+// std::runtime_error (minja.hpp, throughout) and subclasses for a value it
+// cannot use or a message it rejects. An engine fault (std::bad_alloc, a
+// std::logic_error from the engine's own helpers) is not the client's and is
+// left to propagate to the route's 500.
 std::optional<HttpResult> render_template(const Context& ctx, const ChatRequest& req,
                                           std::string& out) {
     try {
         out = ctx.backend->render_chat(req);
-    } catch (const std::exception& e) {
+    } catch (const std::runtime_error& e) {
         log::warn("req", "template render refused: %s", e.what());
         return HttpResult{400, invalid_request(log::format(
             "the chat template could not render this request: %s", e.what()))};

@@ -986,11 +986,15 @@ keep_trailing_newline=false`, context `messages`, `tools`,
 `add_generation_prompt`, `bos_token`/`eos_token`, `strftime_now`, and
 `extra_context`: the typed switches `enable_thinking` and `preserve_thinking`
 plus every non-reserved `chat_template_kwargs` key passed through unchanged.
-The context keys the engine sets itself (the six above) are reserved: a
+The six context keys the engine sets itself plus minja's 31 builtins
+(`Context::builtins()`, `third_party/minja/minja.hpp`) are reserved: a
 `chat_template_kwargs` key naming one is a 400, so a client cannot replace the
-messages, the tools or the generation prompt. The gateway must render with the
-same `extra_context`; a `render.prompt_sha256` over a different context is a
-409 `renderer_mismatch`, before any token and before the slot. Python jinja2
+messages, the tools or the generation prompt, nor shadow a builtin the
+template calls. A template that throws while rendering is a 400 too (in 1.3.0
+it surfaced as a 500); only a minja `std::runtime_error` is read that way, an
+engine fault stays a 500. The gateway must render with the same
+`extra_context`; a `render.prompt_sha256` over a different context is a 409
+`renderer_mismatch`, before any token and before the slot. Python jinja2
 matches that lexical layer with the same three options, **after** a
 compatibility layer:
 
@@ -1326,6 +1330,7 @@ and W7 (the extension's WebSocket half). W6f is not a 1.3.0 gate.
 | level | what | gate | evidence |
 |---|---|---|---|
 | unit, stub | `tests/test_responses.cpp`: request mapping (every item type, flat tools, tool_choice object, refusals, sampler, instructions, extension `v`); a required-key set test for `ResponseResource`; event writer (order, `event:`==type, `sequence_number` contiguous from 1, item/part lifecycle, reasoning→content switch, tool item added with name before arguments); terminal mapping (`Length`→incomplete last item, `Loop`→incomplete reason `loop_guard_abort`, exception→error+failed); state (32/16 MiB LRU, TTL, `store=false` not stored, `previous_response_not_found`, eviction on a failed continuation, hash mismatch); token mode (indexes contiguous from 0, span indices exact on the stub's fixed reply, shadow text == `render(tokens)` via a test renderer, `arcint.input_ids` required, images refused); cancel (stub with `prefill_ubatches=4` and `delay_ms`: cancel aborts at the next ubatch, returns incomplete, frees the slot; terminal→409, unknown→404) | `ctest -L unit`, 0 failed, red-first per case | `code` |
+| unit, stub (scope note) | the stub renderer mirrors only the coder template's `preserve_thinking` semantics (**absent = drop**); the Qwen3.8 templates' default (absent = keep) is covered by the 12-template conformance run against the engine's minja, **not** by a stub case | — | `code` |
 | round-trip | `tests/roundtrip.sh`: non-stream resource and SSE framing on `--stub` | 0 failed | `code` |
 | compliance | the spec CLI against a stub/CPU build: runnable HTTP non-stream + SSE tests | 0 failed, exit 0; skipped = the named Scope list | `paper` |
 | live, text | pi (`openai-responses`, SSE) multi-turn tool task on a test port, card host, one window | the Gate items 4/5 | `measured-here` |
