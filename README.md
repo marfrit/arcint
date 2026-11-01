@@ -345,6 +345,16 @@ service's production flags, Flash-Next's expert cache included
   token, prefill/decode, cache-hit, draft counters and per-lane
   queue/slot gauges); a request with `arcint: {timings: true}` gets the
   per-response timings back on Chat Completions and Responses.
+- `chat_template_kwargs.preserve_thinking` (Chat Completions) and
+  `arcint.preserve_thinking` (Responses) keep every assistant turn's thinking,
+  not only the turns after the last user query, so a steering message does not
+  drop a running tool loop's reasoning; absent renders exactly as before.
+  `chat_template_kwargs` is a passthrough to the template (llama-server's
+  dialect): `enable_thinking` and `preserve_thinking` are type-checked, every
+  other key reaches the template unchanged and is not refused. `/props`'
+  `chat_template_caps` reports `supports_preserve_reasoning` (the template
+  renders reasoning_content at all) and `supports_preserve_thinking` (it reads
+  the switch).
 - `POST /tokenize` and `POST /detokenize` are llama-server-compatible:
   `/tokenize` takes `{content, add_special?, with_pieces?, model?}` and
   returns `{tokens}` (or `{id, piece}` objects with `with_pieces`; a piece

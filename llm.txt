@@ -163,6 +163,15 @@
   deterministic call ids; never executed; no tools declared = raw text.
 - Reasoning: text before the bare think closer goes to reasoning_content;
   enable_thinking and reasoning_effort honoured.
+- preserve_thinking: chat_template_kwargs.preserve_thinking (Chat) or
+  arcint.preserve_thinking (Responses) keeps every assistant turn's thinking,
+  not only the turns after the last user query, so a steering message does not
+  drop a running tool loop's reasoning; absent renders exactly as before.
+  chat_template_kwargs is a passthrough to the template (llama-server's
+  dialect): enable_thinking and preserve_thinking are read and type-checked by
+  arcint, every other key reaches the template unchanged and is not refused.
+  /props' chat_template_caps carries supports_preserve_reasoning and
+  supports_preserve_thinking.
 - Sampling defaults: request > operator flags > the GGUF's defaults; /props
   names the provenance.
 - Console: one-line state/timing prints on stderr (load, expert cache,

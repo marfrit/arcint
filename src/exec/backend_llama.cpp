@@ -1313,6 +1313,10 @@ public:
                     {"supports_string_content", !c.requires_typed_content},
                     {"supports_typed_content", c.requires_typed_content},
                     {"supports_preserve_reasoning", template_src_.find("reasoning_content") != std::string::npos},
+                    // Not the same fact: the template reads the preserve_thinking
+                    // variable (the coder template's own switch), whether or not
+                    // it renders reasoning_content at all.
+                    {"supports_preserve_thinking", template_src_.find("preserve_thinking") != std::string::npos},
                     // The vocab's BOS rule: the generation prepends BOS when the
                     // rendered template did not write it, and /tokenize's count
                     // applies the same rule. A proxy reads it here.
@@ -1324,7 +1328,15 @@ public:
         inputs.messages = chat_messages_json(req, template_->original_caps().requires_object_arguments);
         inputs.tools    = chat_tools_json(req);
         inputs.add_generation_prompt = true;
-        if (req.has_enable_thinking) inputs.extra_context = json{{"enable_thinking", req.enable_thinking}};
+        // The template context: the chat_template_kwargs passthrough (llama-
+        // server's dialect; unknown keys reach the template unchanged) plus the
+        // two switches arcint reads itself. A request that sent neither leaves
+        // extra_context unset, byte-identical to the render before
+        // preserve_thinking existed.
+        json extra = req.chat_template_kwargs.is_object() ? req.chat_template_kwargs : json::object();
+        if (req.has_enable_thinking) extra["enable_thinking"] = req.enable_thinking;
+        if (req.has_preserve_thinking) extra["preserve_thinking"] = req.preserve_thinking;
+        if (!extra.empty()) inputs.extra_context = std::move(extra);
         minja::chat_template_options opts;
         opts.apply_polyfills = false;   // the GGUF's template is the contract (§3.7)
         return template_->apply(inputs, opts);

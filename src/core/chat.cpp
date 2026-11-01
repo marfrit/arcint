@@ -398,13 +398,33 @@ std::optional<std::string> parse_chat_request(const json& body, ChatRequest& out
     if (body.contains("chat_template_kwargs") && !body["chat_template_kwargs"].is_null()) {
         const json& kw = body["chat_template_kwargs"];
         if (!kw.is_object()) return "chat_template_kwargs must be an object";
-        if (kw.contains("enable_thinking") && !kw["enable_thinking"].is_null()) {
-            if (!kw["enable_thinking"].is_boolean()) {
-                return "chat_template_kwargs.enable_thinking must be a boolean";
+        // llama-server's dialect: chat_template_kwargs is a passthrough to the
+        // template, so its keys are template-specific and an unknown key is not
+        // refused. Every key reaches extra_context unchanged; the two switches
+        // arcint reads itself are type-checked here. A null value reads as
+        // absent, as it always did.
+        for (auto it = kw.begin(); it != kw.end(); ++it) {
+            if (it.key() == "enable_thinking") {
+                if (it.value().is_null()) continue;
+                if (!it.value().is_boolean())
+                    return "chat_template_kwargs.enable_thinking must be a boolean";
+                req.enable_thinking     = it.value().get<bool>();
+                req.has_enable_thinking = true;
+            } else if (it.key() == "preserve_thinking") {
+                if (it.value().is_null()) continue;
+                if (!it.value().is_boolean())
+                    return "chat_template_kwargs.preserve_thinking must be a boolean";
+                req.preserve_thinking     = it.value().get<bool>();
+                req.has_preserve_thinking = true;
+            } else {
+                log::debug("req", "chat_template_kwargs.%s is passed through to the template",
+                           it.key().c_str());
             }
-            req.enable_thinking     = kw["enable_thinking"].get<bool>();
-            req.has_enable_thinking = true;
         }
+        json passthrough = json::object();
+        for (auto it = kw.begin(); it != kw.end(); ++it)
+            if (!it.value().is_null()) passthrough[it.key()] = it.value();
+        req.chat_template_kwargs = std::move(passthrough);
     }
 
     out = std::move(req);
@@ -554,8 +574,10 @@ std::string render_chatml_stub(const ChatRequest& req) {
 
     // The Qwen3-family rule the stub mirrors so the replay path is tested: an
     // assistant turn AFTER the last user message keeps its reasoning block; an
-    // earlier turn does not. The tags come from the shared table, never spelled
-    // here.
+    // earlier turn does not -- unless preserve_thinking is set, when every
+    // assistant turn keeps it (the coder template's own rule, so a steering
+    // message does not drop the running tool loop's thinking). The tags come
+    // from the shared table, never spelled here.
     size_t last_user = req.messages.size();
     for (size_t i = 0; i < req.messages.size(); ++i)
         if (req.messages[i].role == "user") last_user = i;
@@ -565,7 +587,9 @@ std::string render_chatml_stub(const ChatRequest& req) {
         out += markers::kTurnStart;
         out += m.role == "developer" ? "system" : m.role;
         out += "\n";
-        if (m.role == "assistant" && i > last_user && !m.reasoning.empty()) {
+        const bool replay_reasoning = m.role == "assistant" && !m.reasoning.empty() &&
+                                      (req.preserve_thinking || i > last_user);
+        if (replay_reasoning) {
             const auto& pairs = think_tag_pairs(false);
             if (!pairs.empty()) {
                 out += pairs[0].first;
