@@ -394,13 +394,16 @@ class LlamaTokenizer final : public Tokenizer {
 public:
     explicit LlamaTokenizer(const llama_vocab* v) : v_(v) {}
 
-    std::vector<int> encode(std::string_view text) override {
+    std::vector<int> encode(std::string_view text) override { return encode(text, false); }
+
+    std::vector<int> encode(std::string_view text, bool add_special) override {
         // one llama_tokenize pass, an upper-bound buffer; the retry only when
-        // the vocabulary reports more (src/exec/tokenize-once.h, audit 15)
+        // the vocabulary reports more (src/exec/tokenize-once.h, audit 15).
+        // add_special is llama-server's /tokenize flag: the BOS/EOS rule.
         return tokenize_once(
             [&](const char * p, int32_t len, int * out, int32_t cap) {
                 return llama_tokenize(v_, p, len, reinterpret_cast<llama_token *>(out), cap,
-                                      /*add_special=*/false, /*parse_special=*/true);
+                                      add_special, /*parse_special=*/true);
             },
             text, text.size() + 8);
     }
