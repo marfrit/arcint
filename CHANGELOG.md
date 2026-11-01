@@ -20,65 +20,131 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
 ## 1.4.0 — unreleased
 
-The serving-ops package.
+Token mode for gateways, the serving-ops package and thinking replay across a
+steering message. Every new surface is off or inert until a request or a flag
+asks for it; without them the chat route's bytes are unchanged (golden
+captures 12/12 byte-identical, `measured-here` on the stub).
 
-- **`POST /tokenize` and `POST /detokenize`** (llama-server-compatible, behind
-  the same key as every other route): `/tokenize` takes
-  `{content, add_special?, with_pieces?, model?}` and returns `{tokens}`; with
-  `with_pieces` it returns `{id, piece}` objects, and a piece that is not valid
-  UTF-8 on its own is the array of its byte values. A chat body (`messages`,
-  `tools`, …) or a Responses body (`input`, `instructions`, `tools`, …) is
-  counted through the request's own prepare path — `finish_prepare`'s stored
-  id vector, one tokenisation, never a second encode — and returns
-  `{tokens, count}`, so the count is the prompt the same request would decode.
-  `/detokenize` takes `{tokens}` and returns `{content}`, special tokens
-  rendered as text (llama-server's default `unparse_special=true`). The `model`
-  field picks the lane exactly as the generation routes do.
+Part of the feyntalk chain, released together: llm-proxy 1.3.0 (the gateway
+that renders and translates token mode), feyntalk-render 1.0.0 (the client-side
+renderer), and `docs/feyntalk.md` (how the three fit and how to run them).
+
+**Contract change (operator decision): Chat Completions validates `arcint`
+strictly.** A non-object, an unknown key, a non-boolean `timings`, or a `v`
+other than 1 is now a 400. Before 1.4.0 the field was ignored on this route,
+so a client that sent an unrelated `arcint` object must remove it or send only
+`timings` (and optionally `v: 1`); `/v1/responses` already validated its own
+`arcint` object. The operator chose the strict behaviour over silently
+dropping unknown keys. `chat_template_kwargs` is not part of this contract (see
+thinking replay below).
+
+- **Token mode, the engine side** (`docs/campaigns/feyntalk.md`, "Token mode,
+  revised"), per request on `/v1/responses`:
+  - `GET /v1/responses/renderer` serves the unit's renderer material (decode
+    pieces, special tokens, the chat template and its source, the think-tag
+    geometry) and its canonical hash. The material is built once, on the first
+    GET; a build that fails leaves the unit serving with token mode off and
+    says why in the log.
+  - `arcint.token_mode: true` with `arcint.renderer_hash` and
+    `arcint.render.prompt_sha256`: a stale hash or a prompt the unit would
+    render differently is a 409 before a slot is taken. Token mode needs
+    `stream: true` and is text-only (an image part is refused). The stream carries
+    an `arcint:token` event per accepted output token before the unchanged text
+    event, and `arcint:span` events for thinking, tool calls, the loop guard and
+    the context guard.
+  - `/props` reports `token_mode: "ready"` on every llama unit whose material
+    pre-flight passed (no flag; the GGUF's template), `"off"` on TTS units and
+    where the build failed.
+  - `arcint.input_ids` is schema-checked and refused as not served yet.
+- **A run of function calls is one assistant turn** (W6g): Responses input and
+  the stored output behind `previous_response_id` map
+  `[reasoning]? [message]? [function_call]+` to ONE assistant message, so
+  parallel calls round-trip as the turn the model produced (no prefix-cache miss
+  from that turn on), and a continuation renders byte-identically to the same
+  history sent inline. A duplicate `call_id` inside one run is a 400.
 - **Thinking replay (`preserve_thinking`)**: `chat_template_kwargs.preserve_thinking`
   on Chat Completions and `arcint.preserve_thinking` on Responses keep every
   assistant turn's thinking, not only the turns after the last user query, so a
   steering message does not drop a running tool loop's reasoning (a UAT
-  measured a 10.6 % cache hit without it). Absent renders exactly as before;
-  the token-mode prompt hash covers the flag. The coder template reads
-  `preserve_thinking`; `/props`' `chat_template_caps` reports
-  `supports_preserve_thinking` beside `supports_preserve_reasoning`.
+  measured a 10.6 % prefix-cache hit without it, `measured-here`). Absent
+  renders exactly as before; the token-mode prompt hash covers the flag.
+  Templates differ in the default: the Qwen3.6 coder template drops replayed
+  thinking unless the flag is true, the Qwen3.8 templates keep it unless the
+  flag is false (`code`, the GGUFs' templates). `/props`' `chat_template_caps`
+  reports `supports_preserve_thinking` beside `supports_preserve_reasoning`.
   `chat_template_kwargs` stays a passthrough (llama-server's dialect):
-  `enable_thinking` and `preserve_thinking` are type-checked, every other key
-  reaches the template unchanged and is not refused.
+  `enable_thinking` and `preserve_thinking` must be booleans, the names the
+  template context sets itself (`messages`, `tools`, `add_generation_prompt`,
+  `bos_token`, `eos_token`, `strftime_now`) are a 400, and every other key
+  reaches the template unchanged (`code`, `src/core/chat.cpp`). A token-mode
+  gateway must render with the same keys, or the prompt hash is a 409.
+- **`POST /tokenize` and `POST /detokenize`** (llama-server-compatible, behind
+  the same key as every other route): `/tokenize` takes
+  `{content, add_special?, with_pieces?, model?}` and returns `{tokens}`; with
+  `with_pieces` it returns `{id, piece}` objects, and a piece that is not valid
+  UTF-8 on its own is the array of its byte values. `content` must be a
+  string: llama-server's mixed array of strings and ids is a 400. A chat body
+  (`messages`, `tools`, …) or a Responses body (`input`, `instructions`,
+  `tools`, …) is counted through the request's own prepare path, BOS included
+  where the generation adds it, and returns `{tokens, count}`, so the count is
+  the prompt the same request would decode; an image part is a 400 (the
+  generation counts image tokens through the projector, which this route does
+  not run). `/detokenize` takes `{tokens}` (integers in the vocabulary, each
+  checked) and returns `{content}`, special tokens rendered as text
+  (llama-server's default `unparse_special=true`). The `model` field picks the
+  lane exactly as the generation routes do.
+- **`--metrics`**: `GET /metrics` in the Prometheus text format (requests by
+  route and status, tokens, prefill and decode seconds, cache hits, drafts,
+  per-lane queue and slots, model loaded). `arcint: {timings: true}` returns the
+  per-response timings on Chat Completions and Responses.
+- **`--api-key` / `--api-key-file`**: a bearer key on every route except
+  `GET`/`HEAD /health` and a real CORS preflight, checked before any body is
+  read (an unknown path is 401 too, `Expect: 100-continue` is answered 401),
+  compared as SHA-256 digests in constant time; the server keeps only the
+  digest. A key that is empty, has a control character, DEL or a leading or
+  trailing space refuses to start; a group- or world-readable key file warns.
+- **`--tls-cert` / `--tls-key`** behind the CMake option `ARCINT_TLS` (default
+  OFF; the OFF build links no OpenSSL, and the Debian package is the OFF
+  build). The certificate and key are loaded before the model, so a bad pair
+  is refused before the model load. One local patch to the vendored cpp-httplib honours a
+  handler's `Connection: close` (`third_party/httplib-arcint.patch`,
+  `THIRD_PARTY.md`).
+- One tokenisation per request: the prompt count and the backend's prompt ids
+  share one encode, one pass with a bounded buffer and an exact retry; a
+  188,900-byte text costs 40.36 ms instead of about 161 ms (`measured-here`,
+  off the cards, `tools/tokenize_cost.cpp`).
+- llama.cpp series:
+  - 0077 (on, `LLAMA_EXPERT_CACHE_ALIAS=0` turns it off): Strata's
+    VRAM page-alias tripwire (`code`, Strata's source), sampled — a write/read-back over up to 16 blocks
+    of each bank-ring allocation and one whole slice of each expert-slot
+    tensor; a finding warns and the load proceeds. About 53.8 MiB written and
+    read back once on the IQ3_S Flash-Next artifact (`code`), instead of
+    Strata's full scan (about 24 GiB at a 12,000 MiB slot budget).
+  - 0078 (on): a graph input is staged only when the whole copy fits the
+    staging ring without a wrap, otherwise one blocking write; the ring size is
+    `GGML_OPENCL_STAGE_MB` (8-1024, default 32). The coder's checkpoint restore
+    does not regress: time to first token 2.07 / 2.07 s against 1.3.0's
+    2.17 / 2.37 s (A770, window 47, `measured-here`).
+  - 0079: under the compute runtime's LEO mode on a DG2 card (the A770) an
+    image1d_buffer above 16,384 texels aborts in the runtime; arcint now skips
+    such an image and takes the buffer kernel. With it the A770 runs under LEO
+    (test-backend-ops 12,867 of 12,881, the default driver's pass set); the
+    coder under LEO decodes +6 % and prefills -5.6 % against the default
+    driver, so the units stay on the default driver (`measured-here`, window 43;
+    `docs/campaigns/vram-user-space.md`). The default driver and the B60 take
+    the same images as before.
+  - 0074 (the q/k norm + IMRoPE in one kernel) and 0075 (the CPU miss rows'
+    prefetch) are in the series, off: 0074 is correct on both cards and buys no
+    decode, 0075's levels buy nothing or cost (`measured-here`, windows 42 and
+    45). 0076 is retired, 0073 (the prefill expert gather) is not in 1.4.0.
+- `docs/switches.md`: every environment switch of 0059-0079 and of the tools,
+  with its default and the code line it is read at.
+- The container image's builder stage carries diffutils (the 1.3.0 image build
+  failed on the golden compare).
 
-## Unreleased
-
-The quality instruments that shipped in 1.2.7 — `tools/capture_vs_capture.py`'s
-twin baseline (`--baseline A B --candidate C`) and its `--mask` token ranges —
-gain three things:
-
-- `--spans`: the assistant mask from a chat request's role ids
-  (`tools/kld_served.py`'s `assistant_spans`), so a served arm is scored on the
-  positions the model writes, masked beside unmasked. A plain-text corpus arm
-  has no roles, and the tool says so instead of inventing one.
-- the twin's floor as TWO numbers per metric — mean KL and argmax agreement,
-  each with the two runs' own spread — with the candidate flagged inside or
-  outside that spread per metric. `CLAUDE.md`'s answer-level bar (0.03 nats, 1
-  point) prints beside it, unchanged: a card's floor is no bar.
-- the row convention: a capture row scores the NEXT token (row position p holds
-  the prediction of token p+1), so a token range is masked as the row range
-  [start - 1, end - 1) — the reply's first token's prediction is inside, the
-  token after the reply outside.
-
-A turn's ids are tokenised with its closing marker (a merge rule, no measured
-case here), and `tools/tokenize_turn.py` writes the transcript with
-`parse_special=false`, the setting the capture tokenises at. The single mode's
-output labels its two lines `unmasked:` and `masked:` and states the row
-convention; a run without a mask prints the no-roles note.
-
-**Chat Completions `arcint` contract change (operator decision).** The Chat
-Completions route now validates the `arcint` extension object strictly: a
-non-object, an unknown key, a non-boolean `timings`, or a `v` other than 1 is a
-400. Before the ops-1 merge the field was ignored on this route, so a client
-that sent an unrelated `arcint` object must now remove it or send only
-`timings` (and optionally `v: 1`); `/v1/responses` already validated its own
-`arcint` object. The operator chose the strict behaviour over silently dropping
-unknown keys.
+Runtime dependency unchanged in kind: llama.cpp 3e4dfa8 with
+`contrib/llama.cpp/patches` 0001-0079 (0031, 0055, 0061, 0073, 0076 not
+carried).
 
 ## 1.3.0 — 2026-10-31
 
@@ -134,6 +200,29 @@ unless marked):
   --no-mtp, --prompt-max; the KL tools mask the assistant's tokens
   (`tools/capture_vs_capture.py --spans`, `tools/tokenize_turn.py`) and report the
   twin floor's verdict.
+
+The KL tools in detail: the quality instruments that shipped in 1.2.7 — `tools/capture_vs_capture.py`'s
+twin baseline (`--baseline A B --candidate C`) and its `--mask` token ranges —
+gain three things:
+
+- `--spans`: the assistant mask from a chat request's role ids
+  (`tools/kld_served.py`'s `assistant_spans`), so a served arm is scored on the
+  positions the model writes, masked beside unmasked. A plain-text corpus arm
+  has no roles, and the tool says so instead of inventing one.
+- the twin's floor as TWO numbers per metric — mean KL and argmax agreement,
+  each with the two runs' own spread — with the candidate flagged inside or
+  outside that spread per metric. `CLAUDE.md`'s answer-level bar (0.03 nats, 1
+  point) prints beside it, unchanged: a card's floor is no bar.
+- the row convention: a capture row scores the NEXT token (row position p holds
+  the prediction of token p+1), so a token range is masked as the row range
+  [start - 1, end - 1) — the reply's first token's prediction is inside, the
+  token after the reply outside.
+
+A turn's ids are tokenised with its closing marker (a merge rule, no measured
+case here), and `tools/tokenize_turn.py` writes the transcript with
+`parse_special=false`, the setting the capture tokenises at. The single mode's
+output labels its two lines `unmasked:` and `masked:` and states the row
+convention; a run without a mask prints the no-roles note.
 
 Unit changes, not defaults: the coder runs `--llama-mtp-policy cost` with the
 A770's seed; Flash-Next runs the slot loan (`--prefill-chunk 8192
