@@ -50,59 +50,40 @@ the answer-level bar (`CLAUDE.md`) with an md5/argmax tripwire per fusion on the
 card; `test-backend-ops`' NMSE cannot see the rounding-order mutation, because
 NMSE is a tolerance on the composed output, not the intermediate rounding.
 
-**Window 42 — the card run, `measured-here` (the fusion FAILED; the switch
-stays off).**
-- `test-backend-ops -o RMS_NORM_MUL_ROPE`: switch off 227/227 on both cards;
-  switch on, the A770 fails 45 of 227, the B60 exits 134 after 6 failures
-  (`clWaitForEvents` error -14 = `CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST`,
-  i.e. a device-side error inside the kernel). Every failing case is `mode=40`
-  (IMROPE), `[ROPE] ERR 1.1-2.4`; all `mode=0/2` cases pass.
-- The A770's values are the **unrotated** normed row: a host mirror of the fused
-  formula equals the CPU reference to 1e-9 (`code`, not committed), and the
-  unrotated row against that reference gives NMSE 1.19-1.40 on these shapes —
-  the band the A770 log reports. So the rotation's cos/sin is not applied (theta
-  0, or the rotation window not entered); the formula is right. The B60's
-  uncorrelated output then a device fault is a device-side error.
-- Served, two rounds each (`measured-here`, the capital right everywhere, the
-  default path equal to the package binary): coder (A770) 53.27/52.90 vs
-  56.03/55.70 t/s (-5 %), MTP acceptance 35.8 -> 32.6 %; agent (B60) 39.37/39.35
-  vs 42.40/42.32 (-7 %), acceptance 39.0 -> 34.9 %; Flash-Next 33.35/34.58 vs
-  33.95/33.93, expert hits 81.2 -> 83.5/82.9 %.
-- The audit's bar (≥ +0.5 % decode) is not met on any unit, and the correctness
-  defect is **not identified** from the source: the loop text equals
-  `kernel_rope_multi_f32`'s (a mechanical diff), the host's argument list matches
-  the kernel's signature by type and index (`code`), and the formula is right by
-  the mirror. The next window's one-run diagnostic is in the README section.
+**Window 42 — the card run, `measured-here`.** Switch off 227/227 on both
+cards; on, the A770 fails 45 of 227, the B60 exits 134 after 6 failures
+(`clWaitForEvents` error -14 = `CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST`, a
+device-side error). Every failure is `mode=40` (IMROPE), `[ROPE] ERR 1.1-2.4`;
+the A770's values are the unrotated normed row (host mirror: the reference
+against an unrotated row gives NMSE 1.19-1.40, the log's band). Served, two
+rounds each (`measured-here`, the capital right everywhere, the default path
+equal to the package binary): coder (A770) 53.27/52.90 vs 56.03/55.70 t/s
+(-5 %), MTP acceptance 35.8 -> 32.6 %; agent (B60) 39.37/39.35 vs 42.40/42.32
+(-7 %), acceptance 39.0 -> 34.9 %; Flash-Next 33.35/34.58 vs 33.95/33.93,
+expert hits 81.2 -> 83.5/82.9 %.
 
-**Why it was slower — from the code (`inferred`, before any re-test).** The
-fused dispatch ran one work-group a row with lws = `ne00` (128), while the rope
-phase gives one lane a rotated pair: half the lanes idle in the rotation, and
-the group waits behind the norm's two barriers before the rotation starts. The
-two kernels it replaces have the same norm geometry (one group a row) and an
-all-active 64-lane rope group with no barrier; the fusion's only saving is 2
-launches a side, ~0.4 % at the wall by the audit's pricing, below its bar. The
-patch now sets lws to one lane a pair (rounded to a subgroup, capped so the
+**Window 43 — the defect, found and fixed (both classes).** The round-3
+diagnostic print read **pos=0/0/0/0 for all four position streams in all 67
+dispatches** (`measured-here`, `~/w42/diag74-a770.log`), `theta=0, cos=1,
+sin=0`, while the case fills the positions with `rand() % 512` (`code`:
+`test_rms_norm_mul_rope::initialize_tensors`). The cause is the kernel's first
+line (`code`): `src1` is a `global int *`, and `src1 = src1 + offset1` stepped
+the operand offset in **elements** (x4 bytes) instead of bytes, reading a wrong,
+zeroed region — and the B60 read past the buffer and faulted. `kernel_rope_multi_f32`
+casts every offset through `global char *`; the fused kernel now does the same
+for src1. The fused-on suite on both cards and the served A/B (coder and agent,
+with the md5 tripwire) are owed to the next window.
+
+**Speed, from the code (`inferred`; no A/B re-run yet).** The fused dispatch ran
+one work-group a row with lws = `ne00` (128) while the rope phase gives one lane
+a rotated pair, so half the lanes idled and the group waited behind the norm's
+two barriers; the two kernels it replaces have the same norm geometry and an
+all-active 64-lane rope group without a barrier. The only saving is 2 launches a
+side, ~0.4 % at the wall by the audit's pricing — below the +0.5 % bar. The
+patch's lws now is one lane a pair (rounded to a subgroup, capped so the
 subgroup count fits the local `sum`), which removes the idle lanes but not the
-barrier serialization. **The fusion cannot be both right and faster**: it is not
-right (above) and faster it would not be beyond ~0.4 % (inferred, `code`);
-therefore the mechanism is parked, off by default, and no correctness fix is
-claimed.
-
-**Device-free cells** (`measured-here`): `tests/python/test_fuse_qk_norm_rope.py`
-reads the patched tree — the epsilon in the scale, the weight at both rotated
-positions, the norm-then-weight rounding order, the rotation's formula, the
-M-RoPE position layout, the switch's default and the 3-before-2 dispatch order,
-the kernel's creation, the operand-order guard and the sections guard, and the
-new `test-backend-ops` cases. Seven mutations were run and seen failing before
-restore: epsilon dropped, weight read at `w[ic]`, weight folded before the
-rounding, default flipped on, dispatch moved below the prefix, sections guard
-dropped, operand-order guard dropped; the kernel's absence fails five cells.
-**These cells are source-text assertions** — they read the patched tree, they do
-not run the kernel; the numerics are the card's. `code`: the patch also adds the
-served shapes to `test-backend-ops`'s `RMS_NORM_MUL_ROPE` (the strided Q layout
-`[128,16,1]` and `[128,16,5]`, contiguous K `[128,8,6]`), which ran green on the
-CPU backend here (`measured-here`: 227 cases OK, the two strided ones included)
-— a shapes/graph check, not the kernel's numerics.
+barrier serialization. Whether it clears the bar is the A/B's answer; the switch
+stays off until then.
 
 ## 6 — the CPU miss rows' prefetch and cold-page touch (patch 0075)
 

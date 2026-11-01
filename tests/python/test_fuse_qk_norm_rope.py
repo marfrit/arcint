@@ -91,6 +91,12 @@ class FuseQkNormRopeTerms(unittest.TestCase):
         self.assertIn("x0*cos_sin_theta.s1 + x1*cos_sin_theta.s0", body)
         self.assertIn("rope_yarn_fused", body, "the YaRN cos/sin path, as rope.cl's")
 
+    def test_positions_offset_is_bytes(self):
+        # window 43: src1 is an int pointer and `src1 + offset1` stepped the tensor
+        # offset in ELEMENTS (x4 bytes), so the kernel read zeros for every position
+        # stream. Every operand's offset is bytes, as kernel_rope_multi_f32 casts it.
+        self.assertRegex(self.cl, r"src1 = \(global int \*\)\(\(global char \*\) src1 \+ offset1\);")
+
     def test_sect_dims_guarded(self):
         # ic % sect_dims is undefined at zero: the host refuses an empty sections
         # sum and the kernel keeps a defined divisor if the argument ever arrives so

@@ -264,10 +264,10 @@ index 41de741..e5b2896 100644
              ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
              i++;
 diff --git a/ggml/src/ggml-opencl/kernels/rms_norm.cl b/ggml/src/ggml-opencl/kernels/rms_norm.cl
-index 47124be..3395c11 100644
+index 47124be..79043fe 100644
 --- a/ggml/src/ggml-opencl/kernels/rms_norm.cl
 +++ b/ggml/src/ggml-opencl/kernels/rms_norm.cl
-@@ -372,3 +372,183 @@ kernel void kernel_rms_norm_mul_add_scale(
+@@ -372,3 +372,187 @@ kernel void kernel_rms_norm_mul_add_scale(
          y[i00] = ((x[i00] * scale) * f[i00%(ne10/4)] + g[i00%(ne20/4)]) * sc;
      }
  }
@@ -365,7 +365,11 @@ index 47124be..3395c11 100644
 +) {
 +    src0 = src0 + offset0;
 +    global float * w = (global float *) (wsrc + offsetw);
-+    src1 = src1 + offset1;
++    // the offsets are BYTES on every operand, as kernel_rope_multi_f32 does it:
++    // `src1` is an int pointer, so `src1 + offset1` would step offset1 ELEMENTS
++    // (x4 bytes) and read a wrong region -- window 43's diagnostic read zeros for
++    // all four position streams (its print's offset and reads proved it)
++    src1 = (global int *)((global char *) src1 + offset1);
 +    src2 = src2 + offset2;
 +    global float * ff = (global float *) src2;
 +    dst  = dst  + offsetd;
