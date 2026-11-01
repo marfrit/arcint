@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 // The bearer key (--api-key / --api-key-file) and the TLS flag pairing. The
@@ -113,6 +114,11 @@ TEST(auth_bearer_matches_hashes_the_presented_key) {
     CHECK(!api::bearer_matches("", digest));
     CHECK(!api::bearer_matches("Bearer ", digest));
     CHECK(!api::bearer_matches("Bearer " + key + " ", digest));
+    // RFC 9110's credentials allow 1*SP between scheme and token: one or more
+    // SPACES, never a tab. Still an exact token comparison.
+    CHECK(api::bearer_matches("Bearer  " + key, digest));
+    CHECK(api::bearer_matches("Bearer   " + key, digest));
+    CHECK(!api::bearer_matches("Bearer\t" + key, digest));
 }
 
 TEST(auth_config_refuses_two_key_sources_and_an_empty_key) {
@@ -168,22 +174,39 @@ TEST(auth_hygiene_refuses_any_control_character) {
     }
 }
 
-TEST(auth_hygiene_warns_on_whitespace_and_a_percent) {
+TEST(auth_hygiene_refuses_edge_spaces_and_warns_on_a_percent) {
     std::string err, warn;
     CHECK(api::api_key_hygiene("good-key", err, warn));
     CHECK(warn.empty());
 
+    // A leading or trailing SPACE can never authenticate: cpp-httplib trims
+    // the header value, so the client's key reaches bearer_matches without it.
+    err.clear();
     warn.clear();
-    CHECK(api::api_key_hygiene(" leading", err, warn));
-    CHECK(!warn.empty());
+    CHECK(!api::api_key_hygiene(" leading", err, warn));
+    CHECK(!err.empty());
+    err.clear();
+    CHECK(!api::api_key_hygiene("trailing ", err, warn));
 
-    warn.clear();
-    CHECK(api::api_key_hygiene("trailing ", err, warn));
-    CHECK(!warn.empty());
-
+    // A percent sign is legal on the wire but cannot be presented verbatim
+    // (cpp-httplib URL-decodes header values), so it warns, does not refuse.
+    err.clear();
     warn.clear();
     CHECK(api::api_key_hygiene("k%41y", err, warn));
     CHECK(!warn.empty());
+}
+
+TEST(auth_key_file_mode_warns_when_group_or_world_readable) {
+    const std::string path = write_temp("secret-key\n");
+    ::chmod(path.c_str(), 0644);
+    const std::string warn = api::api_key_file_warning(path);
+    CHECK(!warn.empty());
+    CHECK(warn.find("644") != std::string::npos);
+
+    ::chmod(path.c_str(), 0600);
+    CHECK(api::api_key_file_warning(path).empty());
+
+    std::remove(path.c_str());
 }
 
 TEST(auth_secure_scrub_clears_and_overwrites) {

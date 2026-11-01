@@ -3378,7 +3378,8 @@ TEST(responses_two_paths_merge_identically) {
     const json fixture = load_w6g_fixture();
     for (const char* name : {"two_calls_one_turn", "text_then_two_calls",
                              "two_separate_turns", "reasoning_then_calls",
-                             "empty_reasoning_then_call", "continuation_inline"}) {
+                             "empty_reasoning_then_call", "empty_message_then_calls",
+                             "continuation_inline"}) {
         const json h   = w6g_history(fixture, name);
         const json sub = assistant_subset(h.value("items", json::array()));
         ResponseRequest r;

@@ -43,6 +43,15 @@ case here), and `tools/tokenize_turn.py` writes the transcript with
 output labels its two lines `unmasked:` and `masked:` and states the row
 convention; a run without a mask prints the no-roles note.
 
+**Chat Completions `arcint` contract change (operator decision).** The Chat
+Completions route now validates the `arcint` extension object strictly: a
+non-object, an unknown key, a non-boolean `timings`, or a `v` other than 1 is a
+400. Before the ops-1 merge the field was ignored on this route, so a client
+that sent an unrelated `arcint` object must now remove it or send only
+`timings` (and optionally `v: 1`); `/v1/responses` already validated its own
+`arcint` object. The operator chose the strict behaviour over silently dropping
+unknown keys.
+
 ## 1.3.0 — 2026-10-31
 
 The Open Responses API, an adaptive MTP window on the coder, and the prefill slot

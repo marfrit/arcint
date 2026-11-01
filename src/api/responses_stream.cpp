@@ -686,7 +686,8 @@ bool Stream::run(const Context& ctx, int slot) {
     if (prep_.parse_tool_calls) {
         ToolCallParse parsed = parse_qwen_tool_calls(content_, &prep_.schemas);
         if (parsed.truncated) {
-            log::warn("tools", "%s", "unterminated <tool_call> block; returned as raw content");
+            log::warn("tools", "unterminated %s block; returned as raw content",
+                      std::string(tool_call_tags().open).c_str());
         }
         calls = std::move(parsed.calls);
         if (parsed.content.size() > streamed_) {

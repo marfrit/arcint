@@ -1,9 +1,12 @@
 #include "api/auth.h"
 
 #include <cstddef>
+#include <cstdio>
 #include <fstream>
 #include <iterator>
 #include <string>
+
+#include <sys/stat.h>
 
 #include "util/sha256.h"
 
@@ -59,9 +62,14 @@ bool constant_time_equal(std::string_view a, std::string_view b) {
 }
 
 bool bearer_matches(std::string_view authorization_header, std::string_view key_sha256_hex) {
-    constexpr std::string_view kScheme = "Bearer ";
+    constexpr std::string_view kScheme = "Bearer";
     if (!ascii_iequal_prefix(authorization_header, kScheme)) return false;
-    const std::string_view presented = authorization_header.substr(kScheme.size());
+    size_t at = kScheme.size();
+    // RFC 9110: auth-scheme 1*SP token68 -- one or more SPACES between the
+    // scheme and the token, never a tab. The token itself is an exact compare.
+    if (at >= authorization_header.size() || authorization_header[at] != ' ') return false;
+    while (at < authorization_header.size() && authorization_header[at] == ' ') ++at;
+    const std::string_view presented = authorization_header.substr(at);
     if (presented.empty()) return false;
     const std::string digest = sha256_hex(presented);
     return constant_time_equal(digest, key_sha256_hex);
@@ -90,23 +98,32 @@ bool api_key_hygiene(std::string_view key, std::string& error, std::string& warn
             return false;
         }
     }
-    auto is_space = [](char c) {
-        return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
-    };
-    const bool edge_space = is_space(key.front()) || is_space(key.back());
-    const bool percent    = key.find('%') != std::string_view::npos;
-    if (edge_space && percent) {
-        warning = "the API key has leading or trailing whitespace and contains a percent sign "
-                  "('%'): clients must send it verbatim, and cpp-httplib URL-decodes header "
-                  "values, so neither form can be relied on";
-    } else if (edge_space) {
-        warning = "the API key has leading or trailing whitespace: clients must send it "
-                  "verbatim, and whitespace in a bearer token is easy to corrupt";
-    } else if (percent) {
+    // A leading or trailing SPACE can never authenticate: cpp-httplib trims
+    // the header value, so the client's "Bearer <key>" reaches bearer_matches
+    // without it and the digest cannot match. Only a plain space can still be
+    // at an edge here (every other whitespace byte is a control character and
+    // already refused above).
+    if (key.front() == ' ' || key.back() == ' ') {
+        error = "the API key starts or ends with a space: cpp-httplib trims header values, so a "
+                "client can never present it; remove the space from the file";
+        return false;
+    }
+    if (key.find('%') != std::string_view::npos) {
         warning = "the API key contains a percent sign ('%'): cpp-httplib URL-decodes header "
                   "values, so a %xx escape can never match a client that sends it verbatim";
     }
     return true;
+}
+
+std::string api_key_file_warning(const std::string& path) {
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0) return {};
+    const unsigned mode = static_cast<unsigned>(st.st_mode) & 0777u;
+    if ((mode & 077u) == 0) return {};
+    char buf[8];
+    std::snprintf(buf, sizeof buf, "%03o", mode);
+    return std::string("--api-key-file mode is ") + buf +
+           ", readable by group or others; chmod 600 it";
 }
 
 void secure_scrub(std::string& s) {

@@ -85,6 +85,21 @@
         ]}
       ]
     },
+    "empty_message_then_calls": {
+      "items": [
+        {"type": "message", "role": "user", "content": "read both files"},
+        {"type": "message", "role": "assistant", "content": ""},
+        {"type": "function_call", "call_id": "call_a", "name": "read_file", "arguments": "{\"path\":\"a.txt\"}"},
+        {"type": "function_call", "call_id": "call_b", "name": "read_file", "arguments": "{\"path\":\"b.txt\"}"}
+      ],
+      "messages": [
+        {"role": "user", "content": "read both files"},
+        {"role": "assistant", "content": null, "tool_calls": [
+          {"id": "call_a", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}},
+          {"id": "call_b", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"b.txt\"}"}}
+        ]}
+      ]
+    },
     "continuation_inline": {
       "items": [
         {"type": "message", "role": "user", "content": "read both files"},

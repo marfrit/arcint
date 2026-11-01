@@ -181,11 +181,13 @@ std::string Metrics::render(const Context& ctx) const {
     lane_family("arcint_slots_total", "Lanes in the pool.",
                 [](const LaneGauge& l) { return l.total; });
 
-    const ModelStatus& st = ctx.backend->status();
+    // ctx.backend can be null in a test seam (no process, no model); the
+    // scrape must still render.
+    const bool loaded = ctx.backend != nullptr && ctx.backend->status().loaded;
     add_help_type(out, "arcint_model_loaded", "1 when the backend reports a loaded model.",
                   "gauge");
     out += "arcint_model_loaded ";
-    out += (st.loaded ? '1' : '0');
+    out += (loaded ? '1' : '0');
     out += '\n';
 
     return out;
