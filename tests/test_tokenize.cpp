@@ -26,6 +26,7 @@
 #include "api/handlers.h"
 #include "api/renderer.h"
 #include "api/responses.h"
+#include "api/responses_state.h"
 #include "api/tokenize.h"
 #include "exec/backend.h"
 
@@ -114,7 +115,7 @@ struct Fixture {
     std::vector<std::unique_ptr<SlotPool>> pools;
     Context                                ctx;
 
-    explicit Fixture(bool named_lanes = false) {
+    explicit Fixture(int n_ctx = 4096, bool named_lanes = false) {
         cfg.stub = true;
         if (named_lanes) {
             cfg.served_model_name = "agent";
@@ -122,7 +123,7 @@ struct Fixture {
             cfg.lane_ctx          = {512, 256};
             cfg.parallel          = 2;
         }
-        backend     = make_stub_backend(4096);
+        backend     = make_stub_backend(n_ctx);
         ctx.cfg     = &cfg;
         ctx.backend = backend.get();
         ctx.slots   = &slots;
@@ -152,6 +153,44 @@ struct PieceFixture {
         if (named_lanes) ctx.lanes = api::make_lanes(cfg, pools);
     }
 };
+
+// The production stub backend plus an in-memory ResponseStore, for the cases
+// that pin what /tokenize does to a continuation's stored entry.
+struct StoreFixture {
+    Config                             cfg;
+    std::unique_ptr<Backend>           backend;
+    SlotPool                           slots{1};
+    std::shared_ptr<api::ResponseStore> store;
+    Context                            ctx;
+
+    explicit StoreFixture(int n_ctx = 4096) {
+        cfg.stub    = true;
+        backend     = make_stub_backend(n_ctx);
+        store       = std::make_shared<api::ResponseStore>(api::ResponseStore::Limits{});
+        ctx.cfg     = &cfg;
+        ctx.backend = backend.get();
+        ctx.slots   = &slots;
+        ctx.responses = store;
+    }
+};
+
+// A stored completed turn with one user message and a valid prefix hash.
+std::shared_ptr<api::StoredResponse> store_entry(StoreFixture& f, const std::string& id) {
+    auto e       = std::make_shared<api::StoredResponse>();
+    e->id        = id;
+    e->lane      = -1;
+    e->status    = "completed";
+    e->chat.model = "stub";
+    ChatMessage u;
+    u.role    = "user";
+    u.content = "find the port";
+    e->chat.messages = {u};
+    e->prompt        = f.backend->render_chat(e->chat);
+    e->prefix_hash   = api::sha256_hex(e->prompt);
+    e->prompt_tokens = 3;
+    f.store->put(e);
+    return e;
+}
 
 // The id list a body's `tokens` carries, or empty when it is absent or not an
 // integer array.
@@ -229,7 +268,9 @@ TEST(tokenize_with_pieces_carries_decode_one_bytes) {
         const json& t = r.body["tokens"][i];
         CHECK_EQ(t.value("id", -1), ids[i]);
         // The token mode's decode piece: what the renderer material's
-        // decode.pieces_b64[id] publishes.
+        // decode.pieces_b64[id] publishes. The piece is part of the contract,
+        // so its absence is a failure, not a skip.
+        CHECK(t.contains("piece"));
         if (t.contains("piece")) CHECK(piece_bytes(t["piece"]) == f.backend.tok.decode_one(ids[i]));
     }
 }
@@ -283,6 +324,16 @@ TEST(detokenize_rejects_a_non_integer_token) {
     const api::HttpResult r =
         api::detokenize_request(f.ctx, json{{"tokens", json::array({"x"})}});
     CHECK_EQ(r.status, 400);
+}
+
+TEST(detokenize_rejects_an_out_of_range_token) {
+    PieceFixture f;
+    // decode_one would read past the vocabulary (the llama backend throws); the
+    // route refuses the id with a 400 naming `tokens` instead.
+    const api::HttpResult r =
+        api::detokenize_request(f.ctx, json{{"tokens", json::array({1 << 20})}});
+    CHECK_EQ(r.status, 400);
+    CHECK_EQ(err_field(r.body, "param"), std::string("tokens"));
 }
 
 // ------------------------------------------------------------- the count
@@ -391,6 +442,73 @@ TEST(tokenize_chat_count_does_not_encode_twice) {
     CHECK_EQ(t.status, 200);
     CHECK(count_of(t.body) >= 0);
     CHECK_EQ(backend.tok.encodes, 1);   // prepare's one tokenisation, reused
+}
+
+TEST(tokenize_responses_truncation_auto_count_matches_the_generation) {
+    // The W3.5 `auto` fit pass renders and tokenises once, then hands the
+    // served ids to finish_prepare (N3). The count must be that vector's size,
+    // over the fit limit but under n_ctx, where the turn is served.
+    json body = json{{"model", "stub"}, {"truncation", "auto"}};
+    std::string input;
+    for (int i = 0; i < 2000; ++i) input += "x ";
+    body["input"] = input;
+
+    // The full prompt's count, from the same renderer the route uses.
+    Fixture probe;
+    api::ResponseRequest r;
+    CHECK(!api::parse_response_request(body, r));
+    const int full = static_cast<int>(
+        probe.backend->tokenizer().encode(probe.backend->render_chat(r.chat)).size());
+    CHECK(full > 0);
+
+    Fixture f(full + 128);   // fit limit = full - 128: over it, under n_ctx
+    const api::HttpResult t = api::tokenize_request(f.ctx, body);
+    CHECK_EQ(t.status, 200);
+    CHECK_EQ(count_of(t.body), full);
+
+    api::ResponseRequest req;
+    CHECK(!api::parse_response_request(body, req));
+    PreparedResponse prep;
+    CHECK(!api::prepare_response(f.ctx, std::move(req), prep));
+    CHECK_EQ(prep.chat.truncation.blocks_dropped, 0);
+    CHECK_EQ(prep.chat.truncation.tokens_after, full);
+    const api::HttpResult gen = api::run_response(f.ctx, prep, 0);
+    CHECK_EQ(gen.status, 200);
+    const int usage_prompt =
+        gen.body.contains("usage") ? gen.body["usage"].value("input_tokens", -1) : -1;
+    CHECK_EQ(count_of(t.body), usage_prompt);
+    CHECK(ids_of(t.body) == prep.chat.input.prompt_ids_text);
+}
+
+// ------------------------------------------------------- the store is untouched
+
+// A count request is not a turn: a continuation it cannot prepare must not
+// evict the entry it referenced, or learning whether the next turn fits would
+// destroy the chain.
+TEST(tokenize_continuation_overflow_keeps_the_stored_entry) {
+    StoreFixture f;
+    store_entry(f, "resp-1");
+    std::string input;
+    for (int i = 0; i < 3000; ++i) input += "x ";
+    const api::HttpResult r =
+        api::tokenize_request(f.ctx, json{{"model", "stub"},
+                                          {"previous_response_id", "resp-1"},
+                                          {"input", input}});
+    CHECK_EQ(r.status, 400);   // the lane's cap, from the same prepare path
+    CHECK(f.store->get("resp-1", -1) != nullptr);
+}
+
+TEST(tokenize_continuation_prefix_mismatch_keeps_the_stored_entry) {
+    StoreFixture f;
+    auto e        = store_entry(f, "resp-1");
+    e->prefix_hash = "sha256:0000";
+    f.store->put(e);
+    const api::HttpResult r =
+        api::tokenize_request(f.ctx, json{{"model", "stub"},
+                                          {"previous_response_id", "resp-1"},
+                                          {"input", "hi"}});
+    CHECK_EQ(r.status, 400);
+    CHECK(f.store->get("resp-1", -1) != nullptr);
 }
 
 // ------------------------------------------------------------ lane routing
