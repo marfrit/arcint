@@ -336,7 +336,8 @@ service's production flags, Flash-Next's expert cache included
   `Access-Control-Request-Method`) is answered without the key. An empty or
   newline-only key file, a key with a control character or DEL, or one that
   starts or ends with a space is a boot error; a group- or world-readable key
-  file warns. The server keeps only the key's sha256 digest. `--api-key` is
+  file warns. The server keeps only the key's sha256 digest in its long-lived
+  state. `--api-key` is
   visible to local users in `ps`, so deployments use `--api-key-file`.
   `/health` stays open and reveals the served model id. A `-DARCINT_TLS=ON`
   build adds `--tls-cert`/`--tls-key`. Built for a LAN or a reverse proxy.
@@ -347,11 +348,14 @@ service's production flags, Flash-Next's expert cache included
 - `POST /tokenize` and `POST /detokenize` are llama-server-compatible:
   `/tokenize` takes `{content, add_special?, with_pieces?, model?}` and
   returns `{tokens}` (or `{id, piece}` objects with `with_pieces`; a piece
-  that is not valid UTF-8 on its own is its array of byte values). With a
-  chat or Responses body it returns `{tokens, count}`, the prompt tokens the
-  same request would decode, counted through the request's own prepare path.
-  `/detokenize` takes `{tokens}` and returns `{content}`, special tokens as
-  text. Both are behind the same key as every other route. A prompt the lane
+  that is not valid UTF-8 on its own is its array of byte values). `content`
+  must be a string: llama-server's mixed array of strings and token ids is a
+  400 here. With a chat or Responses body it returns `{tokens, count}`, the
+  prompt tokens the same request would decode, counted through the request's
+  own prepare path; an image part is refused (the projector counts tokens this
+  route does not run). `/detokenize` takes `{tokens}` and returns `{content}`,
+  special tokens as text. Both are behind the same key as every other route. A
+  prompt the lane
   would refuse is refused by `/tokenize` too, with the count in the error
   body's `prompt_tokens`; llama-server's `parse_special` is accepted and
   ignored (specials are always parsed), and a count over a continuation does

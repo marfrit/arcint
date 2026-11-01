@@ -132,14 +132,16 @@
 - Token surface (llama-server-compatible, behind the same key as every route):
   POST /tokenize takes {content, add_special?, with_pieces?, model?} and
   returns {tokens}; with_pieces returns {id, piece} objects, a piece that is
-  not valid UTF-8 on its own being the array of its byte values. POST
-  /tokenize also takes a chat body (messages, tools) or a Responses body
+  not valid UTF-8 on its own being the array of its byte values. content must
+  be a string (llama-server's mixed array of strings and ids is a 400 here).
+  POST /tokenize also takes a chat body (messages, tools) or a Responses body
   (input, instructions, tools) and returns {tokens, count}: the prompt the
   request would decode, counted through the request's own prepare path (one
   tokenisation, never a second). A prompt the lane would refuse is refused by
   /tokenize too, the count in the error body's prompt_tokens; a count over a
   continuation does not evict the referenced stored response (it is a lookup,
-  so it refreshes that entry's LRU rank like any other read). POST /detokenize
+  so it refreshes that entry's LRU rank like any other read); an image part is
+  refused (the projector counts tokens /tokenize does not run). POST /detokenize
   takes {tokens} and returns {content}, special tokens rendered as text
   (unparse_special=true); an id outside the vocabulary is a 400 naming tokens.
   parse_special is accepted and ignored (specials are always parsed). The
@@ -249,7 +251,8 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
   key with a control character or DEL, or one that starts or ends with a space
   is a boot error; a percent sign warns (cpp-httplib URL-decodes header
   values) and a group/world-readable file warns with its mode. The server
-  keeps only the key's sha256 digest; the key is never logged and never on
+  keeps only the key's sha256 digest in its long-lived state; the key is never
+  logged and never on
   /props; --api-key is visible in ps and /proc/<pid>/cmdline (test use;
   deployments use the file). /health stays open for probes and reveals the
   served model id.
