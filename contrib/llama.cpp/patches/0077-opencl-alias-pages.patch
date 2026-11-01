@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..1a3f5ef
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/ggml-opencl-alias.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,47 @@
 +// 0077: the VRAM alias check's sampled plan, a deviation from Strata.
 +//
 +// Strata's `sycl_queue.hpp:168-206, 259-295` tags EVERY 64 KiB block of an
@@ -12,8 +12,9 @@ index 0000000..1a3f5ef
 +// the later write visible in the earlier block. This plan samples at most
 +// GGML_CL_ALIAS_BLOCKS blocks an allocation, each 64 KiB, spread evenly by
 +// `j_i = i * n / k` over the block count (unique for n >= k); a smaller
-+// allocation is one block or none. The scan runs at the bank stream ring's
-+// first allocation, i.e. the first bank-stream prefill, not at model load. The sample's
++// allocation is one block or none. The scan runs whenever the bank stream ring
++// is (re)allocated at a learned order's completion; a relearn after a reset
++// scans again, and it is not model load. The sample's
 +// hit probability is Strata's full-scan class only in part; the record names
 +// the price and the full-scan alternative. This header holds the plan and the
 +// pattern, so the device-free cell tests exactly what the backend runs.
@@ -274,7 +275,7 @@ index a24b6bb..2c40bdc 100644
      }
      n_bank_bytes = ggml_backend_buffer_get_size(bbank);
      if (b_lendbank != nullptr) n_bank_bytes += ggml_backend_buffer_get_size(b_lendbank);
-+    // patch 0077: the alias check at load, over every slot tensor in its slot
++    // patch 0077: the alias check at the cache init, over every slot tensor in its slot
 +    // buffer (the ask's bslots and b_lend, and the candidates' per-layer spares)
 +    {
 +        std::vector<ggml_tensor *> alias_slots;
@@ -298,15 +299,13 @@ diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
 index 8749cdb..69b82e7 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -205,6 +205,33 @@ if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
+@@ -205,6 +205,19 @@ if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
      add_test(NAME test-opencl-kq-i8 COMMAND $<TARGET_FILE:test-opencl-kq-i8>)
  endif()
  
-+
-+
 +# patch 0077: the sampled VRAM alias tripwire and the slot-buffer check
-+# (device-free); patch 0078: the graph-input staging bound. Both read the
-+# backend's own sources, so the cell and the call site cannot drift.
++# (device-free). Both read the backend's own sources, so the cell and the call
++# site cannot drift.
 +if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
 +    add_executable(test-opencl-alias test-opencl-alias.cpp)
 +    target_include_directories(test-opencl-alias PRIVATE
@@ -314,20 +313,8 @@ index 8749cdb..69b82e7 100644
 +    target_compile_definitions(test-opencl-alias PRIVATE
 +        GGML_OPENCL_SRC_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/ggml-opencl.cpp")
 +    add_test(NAME test-opencl-alias COMMAND $<TARGET_FILE:test-opencl-alias>)
-+set_tests_properties(test-opencl-alias PROPERTIES LABELS unit)
-+
++    set_tests_properties(test-opencl-alias PROPERTIES LABELS unit)
 +endif()
-+
-+add_executable(test-expert-cache-alias test-expert-cache-alias.cpp)
-+target_compile_features(test-expert-cache-alias PRIVATE cxx_std_17)
-+target_include_directories(test-expert-cache-alias PRIVATE
-+    ${PROJECT_SOURCE_DIR}/src
-+    ${PROJECT_SOURCE_DIR}/ggml/include)
-+target_compile_definitions(test-expert-cache-alias PRIVATE
-+    LLAMA_EXPERT_CACHE_SRC_PATH="${PROJECT_SOURCE_DIR}/src/llama-expert-cache.cpp")
-+target_link_libraries(test-expert-cache-alias PRIVATE ggml)
-+add_test(NAME test-expert-cache-alias COMMAND $<TARGET_FILE:test-expert-cache-alias>)
-+set_tests_properties(test-expert-cache-alias PROPERTIES LABELS unit)
 +
  # patch 0072: the uniform-work-group rounding rule (ggml-opencl-uniform.h,
  # the header the backend includes) and a text check that every launch site with
@@ -463,7 +450,7 @@ new file mode 100644
 index 0000000..54f6692
 --- /dev/null
 +++ b/tests/test-opencl-alias.cpp
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,122 @@
 +// 0077: device-free tests for the VRAM alias check, a sampled deviation from
 +// Strata's full scan.
 +//   - the plan: blocks are 64 KiB aligned, inside the allocation, unique and
@@ -475,7 +462,8 @@ index 0000000..54f6692
 +//     first page's physical bytes reads the first back with the second's
 +//     pattern, so the check reports it; without the alias the check is clean;
 +//   - the call sites: ggml-opencl.cpp includes the header and scans the bank
-+//     stream ring at its first allocation; the USM host staging ring is not
++//     stream ring whenever a learned order's ring is (re)allocated; a relearn
++//     scans again; the USM host staging ring is not
 +//     scanned (host RAM, not a GPU page table); findings are named per block and
 +//     every scan ends with one summary line. No host-range pre-check remains
 +//     (the old 0077 class: different USM host ranges cannot overlap, so it could
@@ -550,7 +538,7 @@ index 0000000..54f6692
 +    CHECK(src.find("#include \"ggml-opencl-alias.h\"") != std::string::npos,
 +          "ggml-opencl.cpp includes the alias check's plan");
 +    CHECK(src.find("ggml_cl_alias_scan_device(ctx->queue, b.buffer, b.size, \"bank stream ring\", &alias_blocks)") != std::string::npos,
-+          "the bank stream ring is scanned at its first allocation");
++          "the bank stream ring is scanned at each learned order's ring");
 +    CHECK(src.find("ggml_cl_alias_scan_host") == std::string::npos,
 +          "the USM host staging ring is not scanned");
 +    CHECK(src.find("clEnqueueWriteBuffer(q, mem, CL_TRUE") != std::string::npos &&

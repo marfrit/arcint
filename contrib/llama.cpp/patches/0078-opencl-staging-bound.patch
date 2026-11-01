@@ -57,8 +57,8 @@ index 0000000..d3157b2
 +// wrap. Anything else returns false and takes the blocking write; a checkpoint
 +// restore is in that class and its timing is a card arm owed before the bound is
 +// called equivalent (DESIGN §3.4). An input larger than the ring is never split:
-+// a split means a `clFinish` a wrap inside the write and a host memcpy where one
-+// DMA was. A copy larger than the ring returns before the wrap test, so it does
++// a split means a `clFinish` at the wrap inside the write and a host memcpy
++// where one DMA was. A copy larger than the ring returns before the wrap test, so it does
 +// not pay a pointless `clFinish`.
 +//
 +// `ggml_cl_stage_fits` is the ring bound the caller asks before it touches the
@@ -151,10 +151,11 @@ diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
 index 69b82e7..37a357e 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -219,6 +219,15 @@ if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
+@@ -216,6 +216,16 @@ if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
+         GGML_OPENCL_SRC_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/ggml-opencl.cpp")
      add_test(NAME test-opencl-alias COMMAND $<TARGET_FILE:test-opencl-alias>)
- set_tests_properties(test-opencl-alias PROPERTIES LABELS unit)
- 
+     set_tests_properties(test-opencl-alias PROPERTIES LABELS unit)
++
 +    add_executable(test-opencl-staging test-opencl-staging.cpp)
 +    target_include_directories(test-opencl-staging PRIVATE
 +        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl)
@@ -163,10 +164,10 @@ index 69b82e7..37a357e 100644
 +        GGML_BACKEND_SRC_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-backend.cpp"
 +        GGML_BACKEND_HDR_PATH="${PROJECT_SOURCE_DIR}/ggml/include/ggml-backend.h")
 +    add_test(NAME test-opencl-staging COMMAND $<TARGET_FILE:test-opencl-staging>)
-+set_tests_properties(test-opencl-staging PROPERTIES LABELS unit)
++    set_tests_properties(test-opencl-staging PROPERTIES LABELS unit)
  endif()
  
- add_executable(test-expert-cache-alias test-expert-cache-alias.cpp)
+ # patch 0072: the uniform-work-group rounding rule (ggml-opencl-uniform.h,
 diff --git a/tests/test-opencl-staging.cpp b/tests/test-opencl-staging.cpp
 new file mode 100644
 index 0000000..f963a8d

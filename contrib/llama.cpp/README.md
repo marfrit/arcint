@@ -4995,8 +4995,8 @@ option strings (argsort, div) and are not on the JIT builder's path (`code`).
 ## 0077-opencl-alias-pages.patch
 
 A **sampled tripwire** for VRAM page-table aliasing at the expert cache's init
-and the bank stream ring's first bank-stream prefill, a named deviation from
-Strata's full scan. **Evidence class: `code` (Strata's
+and each learned bank-stream order's ring (re)allocation (a relearn after a
+reset scans again), a named deviation from Strata's full scan. **Evidence class: `code` (Strata's
 `sycl_queue.hpp:168-206, 259-295`, `research-reference-audit.md`) and
 `measured-here` for the device-free cells; the card arm is owed.**
 
@@ -5018,19 +5018,21 @@ here); one whole slice is ~0.6 MiB on this artifact, a larger sample, so its
 hit chance is higher and is not quantified. The full-scan
 alternative is a write kernel plus a read-back kernel over every block: one
 64 KiB write and one read a block, i.e. **2 × allocation bytes of traffic** in
-one load-time pass; at the unit's 12,000 MiB slot budget that is ~24 GiB of
+one scan pass at a learned order; at the unit's 12,000 MiB slot budget that is ~24 GiB of
 traffic (formula, `code`; the seconds are the card arm's), with the same
 warn-and-proceed verdict. It is not built here; the operator can choose it
 against this sampled cost.
 
-The patch is that sampled write/read-back, at the cache's init and the bank
-stream ring's first allocation (the first bank-stream prefill, not model load):
+The patch is that sampled write/read-back, at the cache's init and each learned
+bank-stream order's ring allocation (not model load; a relearn after a reset
+scans again):
 
 - `ggml/src/ggml-opencl/ggml-opencl-alias.h` (new): the bounded plan (at most
   16 blocks an allocation, evenly spread, 64 KiB aligned) and the pattern, so
   the device-free cell tests exactly what the backend runs;
-- `ggml-opencl.cpp`: after the bank stream ring's first `allocate` (K=4) the
-  blocks are written, then all read back. The USM **host** staging ring is not
+- `ggml-opencl.cpp`: when a learned order completes and the ring is (re)allocated
+  (K=4), the blocks are written, then all read back; `ggml_cl_bank_stream_reset`
+  clears the learned state, so the next learned order scans again. The USM **host** staging ring is not
   scanned (host RAM, not a GPU page table, `code`). A finding names the block
   and a scan ends with one summary line:
   `alias check, bank stream ring: d of N sampled blocks differ`. A finding
@@ -5048,9 +5050,14 @@ stream ring's first allocation (the first bank-stream prefill, not model load):
   the planar types (IQ2_XXS, IQ2_XS, IQ2_S, Q2_0, IQ3_S) and IQ3_XXS, whose
   OpenCL set path is a plain write and accepts a whole slice; the whole-tensor
   readers (Q4_0, Q1_0, Q8_0, IQ4_NL, Q4_K) are not sampled because their set
-  path reads the whole tensor. On the IQ3_S Flash-Next artifact 94 sampled
-  expert tensors total ~53.8 MiB of whole slices, so ~54 MiB written plus
-  ~54 MiB read (~108 MiB traffic), one-time (`code`, the GGUF dims; the seconds
+  path reads the whole tensor. On the IQ3_S Flash-Next artifact the measured
+  count is 94 sampled expert tensors, ~53.8 MiB of whole slices (`code`, the
+  GGUF dims and the cache's slot tensors). The per-type slice sizes are in
+  `docs/campaigns/prefill-slot-loan-design.md:498-503` (IQ3_S 704,000 B,
+  IQ3_XXS 422,400 B, IQ4_XS 870,400 B, IQ4_NL 921,600 B, Q8_0 1,740,800 B);
+  the upper bound if all 144 slot tensors (48 layers x 3) were IQ3_S is
+  144 x 704,000 B = 101,376,000 B, ~97 MiB. The artifact's measured ~54 MiB
+  written plus ~54 MiB read (~108 MiB traffic), one-time (`code`; the seconds
   are the card arm's); the summary line reports the sampled bytes. The plan
   holds spans and ids, not expected bytes: the pattern is regenerated at each
   read-back, so the peak host transient is one region (~0.6 MiB here), not the
@@ -5085,7 +5092,7 @@ purpose (the runtime chooses the pages), so the red is the check's own mutation
 and a healthy load's zero findings.
 
 Implemented by meseeks (a private DeepSeek-V4.1-Flash quant, run locally) over 1
-review round; briefed, reviewed and measured on the cards by Claude.
+review round; briefed and reviewed by Claude.
 
 The three cells are labelled `unit` for a llama tree configured with
 `LLAMA_BUILD_TESTS=ON` (`ctest -L unit`); the package recipe builds the engine
@@ -5155,10 +5162,13 @@ GGML_SCHED_TIMING=1 GGML_OPENCL_STAGE_RED=1 arcint $UNIT_FLAGS --port 8090
   deb, same flags, before/after 0078 is called equivalent;
 - `GGML_OPENCL_STAGE_RED=1`: stale ring bytes, the path's own red.
 
-Bars: ≥ +0.5 % decode or ≥ +1 % prefill at depth.
+Adoption follows the repository's rule: any measured gain with no other target
+degrading is adoptable. The comparison is the per-graph input time with
+`STAGE_INPUTS=1` against `=0`, and the restore's TTFT on the branch against the
+baseline deb.
 
 Implemented by meseeks (a private DeepSeek-V4.1-Flash quant, run locally) over 1
-review round; briefed, reviewed and measured on the cards by Claude.
+review round; briefed and reviewed by Claude.
 
 ## 0079-opencl-dg2-leo-image-limit.patch
 

@@ -441,7 +441,9 @@ answer by design.
   input-copy time on a 100k+ agent prefill and Flash-Next's 20k needle; the diff between "inputs a
   graph" with `GGML_OPENCL_STAGE_INPUTS=1` and `=0` per graph is the ceiling (the campaign's method,
   `paper`). Then a bigger-ring arm (`GGML_OPENCL_STAGE_MB`) with `GGML_OPENCL_STAGE_INPUTS=1` only
-  if the count is nonzero. Bar: ≥+0.5 % decode or ≥+1 % prefill at depth.
+  if the count is nonzero. Adoption follows the repository's rule: any measured gain with no
+  other target degrading is adoptable; compare the per-graph input time and the restore's TTFT,
+  not a fixed bar.
 - **Implementation, built (0078, `code`).** `ggml_cl_stage_write` stages one whole input when the
   scheduler's graph-input marker is on and `ggml_cl_stage_fits(head, span, ring)` holds; a wrap
   before the write is the 0047 reuse (a `clFinish`, then the ring starts over), and an input larger
@@ -449,8 +451,9 @@ answer by design.
   MiB, default 32). Red-first cells: the marker removed (the restore case stages), the larger-than-
   the-ring return moved after the wrap (a needless `clFinish`), the 4 MiB cap restored, each seen
   failing. The card arm still owes the
-  count (`GGML_SCHED_TIMING=1`, `GGML_OPENCL_STAGE_INPUTS` 0/1 at depth, >= +0.5 % decode or
-  >= +1 % prefill) and the checkpoint-restore timing (the slot save/restore route before/after).
+  count (`GGML_SCHED_TIMING=1`, `GGML_OPENCL_STAGE_INPUTS` 0/1 at depth) and the
+  checkpoint-restore timing (the slot save/restore route before/after); the repository's rule
+  decides adoption, no fixed bar.
 
 ## 11. prefill chunk / residency dial + ring byte budget
 
@@ -615,8 +618,9 @@ answer by design.
   seven. Before the fix, a chat text request in this tree encoded twice — the handler's count
   (`code`: `src/api/handlers.cpp`, `finish_prepare`) and the backend's `prompt_tokens`
   (`code`: `backend_llama.cpp`) — so **four passes, ~161 ms** of a prefix-hit text request. The
-  image path has two encodes too: `generate_mm` returns before `prompt_tokens`, so handler +
-  `set_prompt` are both of it, not a third (`code`: `handlers.cpp`). The review's six-pass text
+  image path has two encodes too: `src/exec/backend_llama.cpp:1335` returns to `generate_mm`
+  before `:1339` calls `prompt_tokens`, so the handler and `generate_mm`'s own `set_prompt` are
+  both of it, not a third (`code`). The review's six-pass text
   count (~190 ms at the earlier 31.65 ms a pass) is the same class with a faster measurement;
   both put the tokenizer at **14.7-26.8 %** of a 0.6-1.1 s prefix-hit TTFT (161 ms) and
   **27-47 %** (190 ms), over the 20 % bar on the fast side, so the build reopens.
@@ -718,10 +722,12 @@ answer by design.
     `sycl_queue.hpp:168-206, 259-295` tags every 64 KiB block of an allocation of 32 MiB or more
     with GPU kernels and retries behind a growing spacer up to 8 times (`code`,
     `research-reference-audit.md`); two virtual blocks sharing one physical page make the later
-    write visible in the earlier block. 0077 samples: one whole slice a slot tensor (53.8 MiB over
-    the IQ3_S artifact's 94 sampled expert tensors) at the cache's init, and at most 16 blocks a
-    bank-ring allocation (4 MiB at K=4) at the ring's first allocate, i.e. the first bank-stream
-    prefill, not model load; both through blocking host<->device copies. The sampled switch covers
+    write visible in the earlier block. 0077 samples: one whole slice a slot tensor at the cache's init — the
+    IQ3_S artifact's measured count is 94 sampled expert tensors, 53.8 MiB (per-type slice sizes
+    in `prefill-slot-loan-design.md:498-503`; the upper bound if all 144 slot tensors were IQ3_S
+    is 144 x 704,000 B, ~97 MiB) — and at most 16 blocks a bank-ring allocation (4 MiB at K=4)
+    whenever a learned order's ring is (re)allocated; a relearn after a reset scans again, and it
+    is not model load; both through blocking host<->device copies. The sampled switch covers
     the planar types (IQ2_XXS, IQ2_XS, IQ2_S, Q2_0, IQ3_S) and IQ3_XXS, whose set path is a plain
     write and accepts a whole slice; the whole-tensor readers (Q4_0, Q1_0, Q8_0, IQ4_NL, Q4_K) are
     not sampled because their set path reads the whole tensor. The region's offset is a multiple of
