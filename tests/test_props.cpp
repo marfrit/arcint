@@ -112,7 +112,7 @@ TEST(llama_backend_render_chat_uses_the_template_context) {
     std::stringstream ss;
     ss << in.rdbuf();
     const std::string src = ss.str();
-    CHECK(src.find("inputs.extra_context = template_context(") != std::string::npos);
+    CHECK(src.find("const json  extra = template_context(req, ctx_error);") != std::string::npos);
 }
 
 TEST(props_reports_the_slot_loan_state) {

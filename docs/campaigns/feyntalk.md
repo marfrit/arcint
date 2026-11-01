@@ -984,8 +984,15 @@ feyntalk_render/
 false`), parser options `trim_blocks=true, lstrip_blocks=true,
 keep_trailing_newline=false`, context `messages`, `tools`,
 `add_generation_prompt`, `bos_token`/`eos_token`, `strftime_now`, and
-`extra_context` (`enable_thinking`). Python jinja2 matches that lexical layer
-with the same three options, **after** a compatibility layer:
+`extra_context`: the typed switches `enable_thinking` and `preserve_thinking`
+plus every non-reserved `chat_template_kwargs` key passed through unchanged.
+The context keys the engine sets itself (the six above) are reserved: a
+`chat_template_kwargs` key naming one is a 400, so a client cannot replace the
+messages, the tools or the generation prompt. The gateway must render with the
+same `extra_context`; a `render.prompt_sha256` over a different context is a
+409 `renderer_mismatch`, before any token and before the slot. Python jinja2
+matches that lexical layer with the same three options, **after** a
+compatibility layer:
 
 1. a `undefined` test (Jinja2 has `defined` only; the Qwen3.8-27B template
    uses `is undefined`, and minja was patched for the same reason,

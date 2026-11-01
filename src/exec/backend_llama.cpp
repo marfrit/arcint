@@ -1328,15 +1328,15 @@ public:
         inputs.messages = chat_messages_json(req, template_->original_caps().requires_object_arguments);
         inputs.tools    = chat_tools_json(req);
         inputs.add_generation_prompt = true;
-        // The template context: the chat_template_kwargs passthrough (llama-
-        // server's dialect; unknown keys reach the template unchanged) plus the
-        // two switches arcint reads itself. A request that sent neither leaves
-        // extra_context unset, byte-identical to the render before
-        // preserve_thinking existed.
-        json extra = req.chat_template_kwargs.is_object() ? req.chat_template_kwargs : json::object();
-        if (req.has_enable_thinking) extra["enable_thinking"] = req.enable_thinking;
-        if (req.has_preserve_thinking) extra["preserve_thinking"] = req.preserve_thinking;
-        if (!extra.empty()) inputs.extra_context = std::move(extra);
+        // The one construction of the template context (core/chat.cpp): the
+        // typed switches plus the chat_template_kwargs passthrough, with the
+        // keys minja's own context sets already refused by parse. A request
+        // that sent neither leaves extra_context unset, byte-identical to the
+        // render before the passthrough existed.
+        std::string ctx_error;
+        const json  extra = template_context(req, ctx_error);
+        if (!ctx_error.empty()) log::warn("req", "%s", ctx_error.c_str());
+        if (!extra.empty()) inputs.extra_context = extra;
         minja::chat_template_options opts;
         opts.apply_polyfills = false;   // the GGUF's template is the contract (§3.7)
         return template_->apply(inputs, opts);

@@ -416,15 +416,18 @@ std::optional<std::string> parse_chat_request(const json& body, ChatRequest& out
                     return "chat_template_kwargs.preserve_thinking must be a boolean";
                 req.preserve_thinking     = it.value().get<bool>();
                 req.has_preserve_thinking = true;
-            } else {
-                log::debug("req", "chat_template_kwargs.%s is passed through to the template",
-                           it.key().c_str());
             }
         }
         json passthrough = json::object();
         for (auto it = kw.begin(); it != kw.end(); ++it)
             if (!it.value().is_null()) passthrough[it.key()] = it.value();
         req.chat_template_kwargs = std::move(passthrough);
+        // One construction, one reserved-key list: the keys minja's context
+        // sets itself are refused by name (a client must not override the
+        // engine's messages, tools or generation prompt).
+        std::string ctx_error;
+        (void)template_context(req, ctx_error);
+        if (!ctx_error.empty()) return ctx_error;
     }
 
     out = std::move(req);
@@ -553,16 +556,36 @@ json tool_call_arguments_for_template(const std::string& arguments, bool templat
     return json(arguments);
 }
 
-// Red scaffolding: the predicate and the builder exist so the cases compile,
-// but no key is reserved yet and the render still builds its own context.
-bool reserved_template_context_key(std::string_view) { return false; }
+bool reserved_template_context_key(std::string_view key) {
+    // The names minja's chat-template context sets before it merges
+    // extra_context (third_party/minja/chat-template.hpp, ChatTemplate::apply):
+    // messages and add_generation_prompt from Context::make, bos_token and
+    // eos_token, strftime_now when the clock is wired, tools when the request
+    // declared any. A passthrough key that names one would override the
+    // engine's own value.
+    static constexpr std::string_view kReserved[] = {
+        "messages", "add_generation_prompt", "bos_token", "eos_token", "strftime_now", "tools",
+    };
+    for (std::string_view r : kReserved)
+        if (key == r) return true;
+    return false;
+}
 
 nlohmann::json template_context(const ChatRequest& req, std::string& error) {
     error.clear();
     nlohmann::json extra = nlohmann::json::object();
     if (req.chat_template_kwargs.is_object()) {
-        for (auto it = req.chat_template_kwargs.begin(); it != req.chat_template_kwargs.end(); ++it)
+        for (auto it = req.chat_template_kwargs.begin(); it != req.chat_template_kwargs.end(); ++it) {
+            if (reserved_template_context_key(it.key())) {
+                if (error.empty())
+                    error = "chat_template_kwargs." + it.key() +
+                            " is reserved by the template context (the engine sets it); remove it";
+                continue;
+            }
+            log::debug("req", "chat_template_kwargs.%s reaches the template context",
+                       it.key().c_str());
             extra[it.key()] = it.value();
+        }
     }
     if (req.has_enable_thinking) extra["enable_thinking"] = req.enable_thinking;
     if (req.has_preserve_thinking) extra["preserve_thinking"] = req.preserve_thinking;

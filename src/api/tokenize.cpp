@@ -116,9 +116,15 @@ HttpResult tokenize_request(const Context& ctx, const json& body) {
     // 2. a chat body: the chat route's own prepare, so the count is the prompt
     //    that would be decoded.
     if (body.contains("messages")) {
+        // Parse and refuse an image before the prepare renders the prompt: an
+        // image's tokens cannot be counted here, and the render is the work, so
+        // the cheaper refusal comes first. The 400 keeps prepare_chat's shape.
+        ChatRequest req;
+        if (auto err = parse_chat_request(body, req))
+            return HttpResult{400, invalid_request(*err)};
+        if (auto err = refuse_images(req)) return *err;
         PreparedChat prep;
-        if (auto err = prepare_chat(ctx, body, prep)) return *err;
-        if (auto err = refuse_images(prep.req)) return *err;
+        if (auto err = prepare_from_chat(ctx, std::move(req), prep)) return *err;
         return count_result(ctx, prep.input, with_pieces);
     }
 
@@ -129,9 +135,9 @@ HttpResult tokenize_request(const Context& ctx, const json& body) {
     if (body.contains("input")) {
         ResponseRequest req;
         if (auto err = parse_response_request(body, req)) return *err;
+        if (auto err = refuse_images(req.chat)) return *err;
         PreparedResponse prep;
         if (auto err = prepare_response(ctx, std::move(req), prep, /*evict_on_error=*/false)) return *err;
-        if (auto err = refuse_images(prep.chat.req)) return *err;
         return count_result(ctx, prep.chat.input, with_pieces);
     }
 
