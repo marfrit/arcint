@@ -494,6 +494,12 @@ std::optional<HttpResult> read_arcint(const json& v, ResponseRequest& req) {
             req.token_mode = it.value().get<bool>();
             continue;
         }
+        if (it.key() == "timings") {
+            if (!it.value().is_boolean())
+                return invalid("arcint.timings must be a boolean", "arcint.timings");
+            req.timings = it.value().get<bool>();
+            continue;
+        }
         if (it.key() == "renderer_hash") {
             if (!it.value().is_string())
                 return invalid("arcint.renderer_hash must be a string", "arcint.renderer_hash");

@@ -45,6 +45,11 @@ json usage_json(const GenerationStats& s) {
                   {"rejected_prediction_tokens", s.draft_proposed - s.draft_accepted}}}};
 }
 
+nlohmann::json timings_json(const GenerationStats& stats) {
+    (void)stats;
+    return nlohmann::json::object();
+}
+
 // One list for the two consumers: the decode line prints the counters when one
 // moved, and the response carries the object on the same condition. An eighth
 // counter is added here, once.

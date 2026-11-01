@@ -178,6 +178,11 @@ struct Config {
     int  llama_slot_loan_mib = 0;
     int  llama_loan_chunk    = 0;
     bool        stub = false;
+    // --metrics: serve GET /metrics in the Prometheus text format and record
+    // the per-route request counters and the generation stats behind it. Off
+    // by default: without the flag the route does not exist and the default
+    // surface is unchanged.
+    bool metrics = false;
 
     // The name this endpoint answers to on /v1/models and /props. Empty means
     // the GGUF's file name (the stub: "stub"). DESIGN.md §4.2.

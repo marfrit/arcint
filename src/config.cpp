@@ -182,6 +182,10 @@ std::string usage_text() {
         "                            with the lane's free count (default: 0, refuse at\n"
         "                            once)\n"
         "  --http-threads N          HTTP worker threads (default: library default)\n"
+        "  --metrics                 serve GET /metrics (Prometheus text format)\n"
+        "                            with the request/token/prefill/decode/spec\n"
+        "                            counters and the lane gauges. Off by default:\n"
+        "                            without it the route does not exist\n"
         "\n"
         "responses store\n"
         "  --responses-store-entries N  retained responses per lane (default: 32;\n"
@@ -418,6 +422,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             cfg.verbosity = 2;
         } else if (arg == "--stub") {
             cfg.stub = true;
+        } else if (arg == "--metrics") {
+            cfg.metrics = true;
         } else if (arg == "--engine") {
             if (!value(v)) return fail("--engine needs llama");
             if (v == "ov")

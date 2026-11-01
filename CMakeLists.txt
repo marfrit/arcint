@@ -92,6 +92,7 @@ add_library(arcint_core STATIC
   src/api/error.cpp
   src/api/handlers.cpp
   src/api/generate.cpp
+  src/api/metrics.cpp
   src/api/renderer.cpp
   src/api/responses.cpp
   src/api/responses_stream.cpp
@@ -266,6 +267,7 @@ if(ARCINT_TESTS)
     tests/test_tokenize_once.cpp
     tests/test_disconnect.cpp
     tests/test_responses.cpp
+    tests/test_metrics.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
@@ -343,6 +345,13 @@ if(ARCINT_TESTS)
            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/stress.sh"
                    "$<TARGET_FILE:arcint>" 60 12 4)
   set_tests_properties(stress PROPERTIES TIMEOUT 300 LABELS unit)
+
+  # ops item 1: GET /metrics is opt-in and arcint.timings is opt-in. The HTTP
+  # half (route presence, Content-Type, the response object) on the stub.
+  add_test(NAME metrics
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/metrics.sh"
+                   "$<TARGET_FILE:arcint>")
+  set_tests_properties(metrics PROPERTIES TIMEOUT 120 LABELS unit)
 
   # Both device-free: the generator's own consistency check, and the
   # acceptance runner's self-test against a fixture manifest. Neither needs a

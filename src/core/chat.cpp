@@ -362,6 +362,28 @@ std::optional<std::string> parse_chat_request(const json& body, ChatRequest& out
     if (auto e = read_stream(body, req.stream, req.stream_include_usage)) return e;
     if (auto e = read_sampler(body, req.sampler)) return e;
 
+    // The arcint extension namespace, as on /v1/responses. The one field the
+    // chat route serves is `timings`; anything else is refused by name rather
+    // than accepted and dropped. `v` is optional here (the Responses surface
+    // requires it); absent keeps today's body exactly.
+    if (body.contains("arcint") && !body["arcint"].is_null()) {
+        const json& a = body["arcint"];
+        if (!a.is_object()) return "arcint must be an object";
+        for (auto it = a.begin(); it != a.end(); ++it) {
+            if (it.key() == "timings") {
+                if (!it.value().is_boolean()) return "arcint.timings must be a boolean";
+                req.timings = it.value().get<bool>();
+                continue;
+            }
+            if (it.key() == "v") {
+                if (!it.value().is_number_integer() || it.value().get<int64_t>() != 1)
+                    return "arcint.v must be 1 when it is sent";
+                continue;
+            }
+            return log::format("arcint.%s is not served in this build", it.key().c_str());
+        }
+    }
+
     // OpenAI's own switch. Qwen3.6's template knows on/off and nothing in
     // between, so an effort level is "on" and "none" is "off"; a client that
     // also sends chat_template_kwargs.enable_thinking has said it more

@@ -59,6 +59,11 @@ struct ChatRequest {
     // in the final chunk, so opting out is the client's explicit choice.
     bool stream_include_usage = true;
 
+    // arcint.timings: the request asks for the per-response timing object
+    // (prompt_n/prompt_ms, predicted_n/predicted_ms, cache_n, draft_n,
+    // draft_accepted) on the response. Absent keeps the body byte-identical.
+    bool timings = false;
+
     // chat_template_kwargs.enable_thinking — the fleet standard switch (§4).
     bool enable_thinking     = true;
     bool has_enable_thinking = false;
