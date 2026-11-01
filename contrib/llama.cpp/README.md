@@ -5139,10 +5139,13 @@ asserts it and the fused kernel's `ic % sect_dims` would divide by zero on the
 GPU without a word (`code`).
 
 Switch: `GGML_OPENCL_FUSE_QK_NORM_ROPE=1`, **off by default** (`code`). It
-**failed on the cards (window 42, `measured-here`)** and stays off: with the
-switch on, `test-backend-ops -o RMS_NORM_MUL_ROPE` is 45 of 227 failing on the
-A770 and 45 + a device fault on the B60, and the served arms are slower on every
-unit. No correctness fix is claimed; see the record below.
+**failed on the cards (window 42, `measured-here`)**: with the switch on,
+`test-backend-ops -o RMS_NORM_MUL_ROPE` was 45 of 227 failing on the A770 and a
+device fault on the B60, because the kernel stepped the positions' offset in
+elements instead of bytes (round 4, `code`). **Fixed and re-run (window 45,
+`measured-here`):** fused-on 227/227 on both cards; served, off vs on, coder
+55.10/55.75 vs 53.92/55.08 t/s, agent 41.97/42.47 vs 42.05/42.40, Flash-Next
+inconclusive; no decode gain, so it stays **off**.
 
 `code`: the patch adds the served shapes to `test-backend-ops`'s
 `RMS_NORM_MUL_ROPE` — `[128,16,1]` and `[128,16,5]` with the strided Q layout

@@ -74,6 +74,8 @@ casts every offset through `global char *`; the fused kernel now does the same
 for src1. The fused-on suite on both cards and the served A/B (coder and agent,
 with the md5 tripwire) are owed to the next window.
 
+**Window 45 — the fix on the cards, `measured-here`** (Claude, 2026-11-01, a455ad7, both cards): fused-on `RMS_NORM_MUL_ROPE` **227/227 on the A770 and 227/227 on the B60** (no fault), off 227/227 on both. Served, fused off vs on, two rounds alternated, the capital right everywhere: coder (A770) 55.10/55.75 vs 53.92/55.08 t/s (about -1.7 %), MTP acceptance 35.8 -> 35.0 %; agent (B60) 41.97/42.47 vs 42.05/42.40 (equal), acceptance 39.0 -> 39.1 %; Flash-Next 33.93 vs 34.38 in round 1, 31.18 vs 25.52 in round 2 (both arms of round 2 slower, inconclusive). The answers' md5s differ between off and on on every unit (the rounding moves). Verdict: correct now, no decode gain, so the switch stays off; no KL arm was run because there is nothing to adopt.
+
 **Speed, from the code (`inferred`; no A/B re-run yet).** The fused dispatch ran
 one work-group a row with lws = `ne00` (128) while the rope phase gives one lane
 a rotated pair, so half the lanes idled and the group waited behind the norm's
