@@ -155,7 +155,7 @@ public:
                               : lane_ctx_[static_cast<size_t>(std::clamp(slot, 0, static_cast<int>(lane_ctx_.size()) - 1))];
 
         const auto prefill_start = clock::now();
-        const auto prompt_ids    = in.prompt_ids.empty() ? tokenizer_.encode(in.prompt) : in.prompt_ids;
+        const auto prompt_ids    = prompt_ids_raw(in, tokenizer_);
         stats.prompt_tokens      = static_cast<int>(prompt_ids.size());
         // The prefill in its ubatches, as the real backend's loop: one cancel
         // check a boundary, so a gone client or a stop signal is seen there

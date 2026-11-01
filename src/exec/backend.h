@@ -180,6 +180,11 @@ struct GenerationInput {
     // (CompletionRequest::prompt_ids; the KLD gate's replay of the reference
     // capture's token windows).
     std::vector<int> prompt_ids;
+    // The tokens the API already made of `prompt` (the one tokenisation of the
+    // request), so the backend does not tokenise the same text again for its
+    // sampler and its count. Empty when nothing counted the text yet; the
+    // backend then tokenises it once. `prompt_ids` wins over this.
+    std::vector<int> prompt_ids_text;
     SamplerParams sampler;
 
     // Names of the tools this request declared. A real backend ignores this —
@@ -427,6 +432,16 @@ public:
 // The stub's trained context: a plausible stand-in (the larger Qwen3 family's),
 // so n_ctx_train and the context default have something to differ from.
 inline constexpr int kStubNCtxTrain = 262144;
+
+// The prompt's ids without the backend's BOS rule: the explicit id prompt, the
+// API's already-made tokens, or one tokenisation of the text. One call per
+// request: the API stores `prompt_ids_text` when it counted the text, and the
+// backend reuses it for the sampler and the count instead of tokenising again.
+inline std::vector<int> prompt_ids_raw(const GenerationInput& in, Tokenizer& tok) {
+    if (!in.prompt_ids.empty()) return in.prompt_ids;
+    if (!in.prompt_ids_text.empty()) return in.prompt_ids_text;
+    return tok.encode(in.prompt);
+}
 
 // The stub: no weights, no card, deterministic synthetic output, with a fixed
 // identity (id "stub", `served_name` when given) and a plausible trained

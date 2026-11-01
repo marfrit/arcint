@@ -263,6 +263,7 @@ if(ARCINT_TESTS)
     tests/test_slot_loan.cpp
     tests/test_loan_book.cpp
     tests/test_toolgrammar.cpp
+    tests/test_tokenize_once.cpp
     tests/test_disconnect.cpp
     tests/test_responses.cpp
   )
@@ -289,6 +290,12 @@ if(ARCINT_TESTS)
     add_executable(arcint-tool-grammar-probe tools/tool_grammar_probe.cpp)
     target_link_libraries(arcint-tool-grammar-probe PRIVATE arcint_core)
     target_compile_options(arcint-tool-grammar-probe PRIVATE -Wall -Wextra -Wpedantic)
+    # audit 15's number: a vocab-only GGUF, the old two-call encode against the
+    # one-pass encode, on the host or the card host (tools/tokenize_cost.cpp,
+    # the campaign's command). Not a ctest case: it needs the GGUF.
+    add_executable(arcint-tokenize-cost tools/tokenize_cost.cpp)
+    target_link_libraries(arcint-tokenize-cost PRIVATE arcint_core)
+    target_compile_options(arcint-tokenize-cost PRIVATE -Wall -Wextra -Wpedantic)
   endif()
   # test_props.cpp reads src/exec/backend_llama.cpp (the KV-precision tripwire:
   # the llama backend cannot be constructed without a card).

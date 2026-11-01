@@ -592,6 +592,31 @@ answer by design.
   - The equivalence suite's prefix-reuse arm (answers right, byte tripwire reported) — mutation: the
     suffix tokenised with a different BOS, answers must change.
 
+- **Corrected and built (2026-11-01, `measured-here` + `code`).** `LlamaTokenizer::encode` called
+  `llama_tokenize` twice: a null-output sizing pass (a full tokenisation) and then the exact-sized
+  pass (`code`: `src/exec/backend_llama.cpp`, the old `encode`). On this workstation (x86_64), with
+  the pinned Qwen35 vocab (`models/ggml-vocab-qwen35.gguf`) and a 188,900-byte text that tokenises
+  to **39,945 tokens**, the tool `tools/tokenize_cost.cpp` (committed; `arcint-tokenize-cost`) took
+  **40.36 ms** for one `llama_tokenize` pass and **80.27 ms** for the old two-call encode, best of
+  seven. Before the fix, a chat text request in this tree encoded twice — the handler's count
+  (`code`: `src/api/handlers.cpp`, `finish_prepare`) and the backend's `prompt_tokens`
+  (`code`: `backend_llama.cpp`) — so **four passes, ~161 ms** of a prefix-hit request; the image
+  path's own `set_prompt` encode adds a third encode on that path (six passes there). The review's
+  six-pass text count (~190 ms at the earlier 31.65 ms a pass) is the same class with a faster
+  measurement; both put the tokenizer at **14.7-26.8 %** of a 0.6-1.1 s prefix-hit TTFT (161 ms)
+  and **27-47 %** (190 ms), over the 20 % bar on the fast side, so the build reopens.
+  **Built:** one tokenisation per request, byte-identical by construction. `finish_prepare` stores
+  the tokens it counted in `GenerationInput::prompt_ids_text`; `prompt_ids_raw` (a shared helper)
+  returns the explicit ids, the API's tokens, or one encode; `prompt_tokens` and the multimodal
+  `set_prompt` read them. `encode` is one `llama_tokenize` pass with an upper-bound buffer
+  (`src/exec/tokenize-once.h`), retried only when the vocabulary reports more; the ids are the old
+  two-pass path's. Device-free cells (`tests/test_tokenize_once.cpp`): the one-pass ids equal the
+  old path's on a mixed corpus, a retry only on a short bound, and the request path counts one
+  encode (`code`; each red — the retry removed, the handler's tokens not stored, the helper ignoring
+  them, the old sizing call restored — seen failing). A text request now pays **one** pass, ~40.4 ms
+  against ~161 ms here; tokenise-from-prefix stays unbought, W3.2 already reuses the generated
+  tokens (`paper`/`measured-here`, `docs/campaigns/feyntalk.md`).
+
 ## 16. decode launch fusions (the remaining ones)
 
 - **arcint status: partly.** Built and measured: 0004's quantize sub-group form and split GLU/mul

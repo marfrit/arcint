@@ -639,7 +639,8 @@ std::optional<HttpResult> finish_prepare(const Context& ctx, int lane, const std
                                          GenerationInput& input, int& prompt_tokens,
                                          bool nothink = false,
                                          const std::vector<int>& prompt_ids = {},
-                                         int known_prompt_tokens = -1) {
+                                         int known_prompt_tokens = -1,
+                                         const std::vector<int>& prompt_ids_text = {}) {
     // The row first: a request that resolves to thinking off starts from the
     // operator's non-thinking row when one is configured. The request's own
     // fields apply after this and still win.
@@ -648,14 +649,20 @@ std::optional<HttpResult> finish_prepare(const Context& ctx, int lane, const std
         return HttpResult{400, invalid_request(*err)};
     }
 
-    // A token-id prompt is counted as given; a text prompt is tokenised once
-    // here for the count (the backend tokenises it again for the forward). The
-    // W3.5 fit pass already encoded the prompt it served, so it hands the count
-    // in (N3) and the encode is not repeated for every auto request.
-    prompt_tokens = !prompt_ids.empty()
-                        ? static_cast<int>(prompt_ids.size())
-                        : (known_prompt_tokens >= 0 ? known_prompt_tokens
-                                                    : static_cast<int>(ctx.backend->tokenizer().encode(prompt).size()));
+    // A token-id prompt is counted as given. A text prompt is tokenised once,
+    // here, and the tokens go to the backend (`input.prompt_ids_text`), so its
+    // sampler and its count do not tokenise the same text again (audit 15: the
+    // request's one tokenisation, one llama_tokenize pass). The W3.5 fit pass
+    // already encoded the prompt it served and hands the tokens and the count
+    // in (N3), so a drop loop's last encode is not repeated either.
+    std::vector<int> text_ids = prompt_ids_text;
+    if (!prompt_ids.empty()) {
+        prompt_tokens = static_cast<int>(prompt_ids.size());
+    } else {
+        if (text_ids.empty()) text_ids = ctx.backend->tokenizer().encode(prompt);
+        prompt_tokens = known_prompt_tokens >= 0 ? known_prompt_tokens
+                                                 : static_cast<int>(text_ids.size());
+    }
 
     // DESIGN.md §3.8 — reject, with the numbers. No truncation, no shift.
     // Against the request's lane: a subagent lane's prompt over its cap is
@@ -665,9 +672,10 @@ std::optional<HttpResult> finish_prepare(const Context& ctx, int lane, const std
         return HttpResult{400, context_overflow(prompt_tokens, n_ctx)};
     }
 
-    input.prompt     = prompt;
-    input.prompt_ids = prompt_ids;
-    input.sampler    = std::move(sampler);
+    input.prompt          = prompt;
+    input.prompt_ids      = prompt_ids;
+    input.prompt_ids_text = prompt_ids.empty() ? std::move(text_ids) : std::vector<int>{};
+    input.sampler         = std::move(sampler);
     // The stop flag belongs to the request's whole life: a SIGTERM/SIGINT
     // while it runs ends it at the backend's next token or batch boundary,
     // rather than waiting out a long prefill (DESIGN §3.7).
@@ -758,6 +766,7 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
 
     std::string prompt;
     int         fit_tokens = -1;   // N3: the count the fit pass already made
+    std::vector<int> fit_ids;      // and the tokens of the prompt it served
     if (fit != nullptr && fit->drop_reasoning) {
         // feyntalk W3.5: `truncation: "auto"`, reasoning first. The render copy
         // is local: prep.req (the echo and the stored state) keeps the full
@@ -781,11 +790,12 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
         const int   n_ctx      = lane_n_ctx(ctx, lane);
         const int   limit      = n_ctx > 0 ? n_ctx - fit->reserve : 0;
         auto render = [&] { return ctx.backend->render_chat(render_req); };
-        auto count  = [&](const std::string& p) {
-            return static_cast<int>(ctx.backend->tokenizer().encode(p).size());
+        auto tokenize = [&](const std::string& p) {
+            return ctx.backend->tokenizer().encode(p);
         };
         prompt = render();
-        const int before = count(prompt);
+        fit_ids = tokenize(prompt);
+        const int before = static_cast<int>(fit_ids.size());
         int       tokens = before;
         int       blocks = 0;
         if (template_renders_reasoning) {
@@ -802,8 +812,9 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
                 // agent. A changed render is a real drop even when its token
                 // count happens to be equal.
                 if (next == prompt) continue;
-                prompt = next;
-                tokens = count(next);
+                prompt  = next;
+                fit_ids = tokenize(next);
+                tokens  = static_cast<int>(fit_ids.size());
                 ++blocks;
             }
         }
@@ -846,7 +857,7 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
     // that ends up with thinking off gets the non-thinking row.
     const bool nothink = prep.req.has_enable_thinking && !prep.req.enable_thinking;
     if (auto err = finish_prepare(ctx, lane, prompt, prep.req.sampler, prep.input, prep.prompt_tokens,
-                                  nothink, {}, fit_tokens)) {
+                                  nothink, {}, fit_tokens, fit_ids)) {
         return err;
     }
     // llava: the answer row switches only in a turn the request declared as

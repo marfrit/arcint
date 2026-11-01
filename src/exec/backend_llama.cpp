@@ -5,6 +5,7 @@
 // llama.cpp keeps the weights, the tokenizer, the attention KV and the
 // recurrent (gated delta-net) state, one sequence per lane.
 #include "exec/backend.h"
+#include "exec/tokenize-once.h"
 #include "core/renderer_material.h"
 #include "exec/mtp_trace.h"   // the MTP window trace (off by default, ARCINT_MTP_TRACE)
 #include "exec/slot_loan.h"
@@ -394,12 +395,14 @@ public:
     explicit LlamaTokenizer(const llama_vocab* v) : v_(v) {}
 
     std::vector<int> encode(std::string_view text) override {
-        const int need = -llama_tokenize(v_, text.data(), static_cast<int32_t>(text.size()), nullptr, 0,
-                                         /*add_special=*/false, /*parse_special=*/true);
-        std::vector<llama_token> t(static_cast<size_t>(std::max(need, 0)));
-        if (need > 0)
-            llama_tokenize(v_, text.data(), static_cast<int32_t>(text.size()), t.data(), need, false, true);
-        return std::vector<int>(t.begin(), t.end());
+        // one llama_tokenize pass, an upper-bound buffer; the retry only when
+        // the vocabulary reports more (src/exec/tokenize-once.h, audit 15)
+        return tokenize_once(
+            [&](const char * p, int32_t len, int * out, int32_t cap) {
+                return llama_tokenize(v_, p, len, reinterpret_cast<llama_token *>(out), cap,
+                                      /*add_special=*/false, /*parse_special=*/true);
+            },
+            text, text.size() + 8);
     }
 
     std::string decode_one(int id) override {
@@ -1551,7 +1554,7 @@ public:
             seed = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
         }
         Sampler sampler(in.sampler, seed);
-        sampler.set_prompt(tokenizer_->encode(in.prompt));
+        sampler.set_prompt(prompt_ids_raw(in, *tokenizer_));
         prepare_think_ctx(in.sampler, cap, stats.prompt_tokens, sampler);
         prepare_think_mask(in, sampler);
         prepare_loop_guard(in, sampler);
@@ -1923,7 +1926,7 @@ private:
     // tokens, so a finetune's template without {{ bos_token }} would otherwise
     // run without BOS
     std::vector<int> prompt_tokens(const GenerationInput& in) const {
-        std::vector<int> ids = in.prompt_ids.empty() ? tokenizer_->encode(in.prompt) : in.prompt_ids;
+        std::vector<int> ids = prompt_ids_raw(in, *tokenizer_);
         const llama_token bos = llama_vocab_bos(vocab_);
         if (in.prompt_ids.empty() && llama_vocab_get_add_bos(vocab_) && bos != LLAMA_TOKEN_NULL &&
             (ids.empty() || ids.front() != bos))
