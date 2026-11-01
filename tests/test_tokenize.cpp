@@ -192,6 +192,120 @@ std::shared_ptr<api::StoredResponse> store_entry(StoreFixture& f, const std::str
     return e;
 }
 
+// A vocabulary that wants BOS (add_bos true): the llama backend's prompt_tokens
+// prepends it when the rendered template did not write it, so the count must
+// too. encode() adds no special tokens (add_special false), exactly the llama
+// tokenizer's plain encode.
+class BosTokenizer final : public Tokenizer {
+public:
+    static constexpr int kBos = 7;
+    std::vector<int> encode(std::string_view text) override {
+        std::vector<int> v;
+        for (char c : text) v.push_back(static_cast<unsigned char>(c) + 1000);
+        return v;
+    }
+    std::string decode(const std::vector<int>& ids) override {
+        std::string s;
+        for (int id : ids) s += decode_one(id);
+        return s;
+    }
+    std::string decode_one(int id) override {
+        if (id == kBos) return "BOS";
+        return std::string(1, static_cast<char>(id - 1000));
+    }
+    int eos_id() const override { return 0; }
+    int bos_id() const override { return kBos; }
+    int vocab_size() const override { return 2000; }
+};
+
+class BosBackend final : public Backend {
+public:
+    BosBackend() {
+        st.id          = "stub";
+        st.served_id   = "stub";
+        st.loaded      = true;
+        st.stub        = true;
+        st.n_ctx       = 4096;
+        st.n_ctx_train = kStubNCtxTrain;
+    }
+    const ModelStatus& status() const override { return st; }
+    Tokenizer&         tokenizer() override { return tok; }
+    std::string        render_chat(const ChatRequest& req) const override {
+        std::string out;
+        for (const ChatMessage& m : req.messages) out += m.content;
+        return out;
+    }
+    // The vocab wants BOS; the material and /props say so.
+    json template_caps() const override { return json{{"add_bos", true}}; }
+    FinishReason generate(const GenerationInput& in, int, const TokenCallback&,
+                          GenerationStats& stats) override {
+        // The llama backend's own rule (backend_llama.cpp prompt_tokens).
+        std::vector<int> ids = prompt_ids_raw(in, tok);
+        if (in.prompt_ids.empty() && (ids.empty() || ids.front() != BosTokenizer::kBos))
+            ids.insert(ids.begin(), BosTokenizer::kBos);
+        stats.prompt_tokens = static_cast<int>(ids.size());
+        return FinishReason::Stop;
+    }
+    BosTokenizer tok;
+    ModelStatus  st;
+};
+
+struct BosFixture {
+    Config     cfg;
+    BosBackend backend;
+    SlotPool   slots{1};
+    Context    ctx;
+    BosFixture() {
+        cfg.stub    = true;
+        ctx.cfg     = &cfg;
+        ctx.backend = &backend;
+        ctx.slots   = &slots;
+    }
+};
+
+// An mmproj unit: the projector counts image tokens that /tokenize cannot know
+// without running it.
+class MmBackend final : public Backend {
+public:
+    MmBackend() {
+        st.id           = "stub";
+        st.served_id    = "stub";
+        st.loaded       = true;
+        st.stub         = true;
+        st.n_ctx        = 4096;
+        st.n_ctx_train  = kStubNCtxTrain;
+        st.mmproj_loaded = true;
+        st.mmproj_vision = true;
+    }
+    const ModelStatus& status() const override { return st; }
+    Tokenizer&         tokenizer() override { return tok; }
+    std::string        render_chat(const ChatRequest& req) const override {
+        std::string out;
+        for (const ChatMessage& m : req.messages) out += m.content;
+        return out;
+    }
+    FinishReason generate(const GenerationInput&, int, const TokenCallback&,
+                          GenerationStats& stats) override {
+        stats.prompt_tokens = 1;
+        return FinishReason::Stop;
+    }
+    PieceTokenizer tok;
+    ModelStatus    st;
+};
+
+struct MmFixture {
+    Config    cfg;
+    MmBackend backend;
+    SlotPool  slots{1};
+    Context   ctx;
+    MmFixture() {
+        cfg.stub    = true;
+        ctx.cfg     = &cfg;
+        ctx.backend = &backend;
+        ctx.slots   = &slots;
+    }
+};
+
 // The id list a body's `tokens` carries, or empty when it is absent or not an
 // integer array.
 std::vector<int> ids_of(const json& body) {
@@ -332,6 +446,42 @@ TEST(detokenize_rejects_an_out_of_range_token) {
     // route refuses the id with a 400 naming `tokens` instead.
     const api::HttpResult r =
         api::detokenize_request(f.ctx, json{{"tokens", json::array({1 << 20})}});
+    CHECK_EQ(r.status, 400);
+    CHECK_EQ(err_field(r.body, "param"), std::string("tokens"));
+}
+
+TEST(detokenize_rejects_a_negative_token) {
+    PieceFixture f;
+    const api::HttpResult r =
+        api::detokenize_request(f.ctx, json{{"tokens", json::array({-1})}});
+    CHECK_EQ(r.status, 400);
+    CHECK_EQ(err_field(r.body, "param"), std::string("tokens"));
+}
+
+TEST(detokenize_rejects_a_float_token) {
+    // get<std::vector<int>>() would truncate 1.5 to 1 and serve it.
+    PieceFixture f;
+    const api::HttpResult r =
+        api::detokenize_request(f.ctx, json{{"tokens", json::array({1.5})}});
+    CHECK_EQ(r.status, 400);
+    CHECK_EQ(err_field(r.body, "param"), std::string("tokens"));
+}
+
+TEST(detokenize_rejects_a_boolean_token) {
+    // get<std::vector<int>>() would convert true to 1 and serve it.
+    PieceFixture f;
+    const api::HttpResult r =
+        api::detokenize_request(f.ctx, json{{"tokens", json::array({true})}});
+    CHECK_EQ(r.status, 400);
+    CHECK_EQ(err_field(r.body, "param"), std::string("tokens"));
+}
+
+TEST(detokenize_rejects_an_integer_past_int32) {
+    // 2^32 + 5 wraps to 5 in get<std::vector<int>>(), which then passes the
+    // vocabulary range check.
+    PieceFixture f;
+    const api::HttpResult r = api::detokenize_request(
+        f.ctx, json{{"tokens", json::array({4294967301ll})}});
     CHECK_EQ(r.status, 400);
     CHECK_EQ(err_field(r.body, "param"), std::string("tokens"));
 }
@@ -478,6 +628,54 @@ TEST(tokenize_responses_truncation_auto_count_matches_the_generation) {
         gen.body.contains("usage") ? gen.body["usage"].value("input_tokens", -1) : -1;
     CHECK_EQ(count_of(t.body), usage_prompt);
     CHECK(ids_of(t.body) == prep.chat.input.prompt_ids_text);
+}
+
+// A vocabulary that wants BOS: the generation prepends it, so the count must
+// carry it too, or /tokenize would report one token fewer than the usage.
+TEST(tokenize_chat_count_carries_the_bos_the_generation_adds) {
+    BosFixture f;
+    const json body = json{{"model", "stub"},
+                           {"messages", json::array({{{"role", "user"}, {"content", "hello"}}})}};
+    const api::HttpResult t = api::tokenize_request(f.ctx, body);
+    CHECK_EQ(t.status, 200);
+
+    PreparedChat prep;
+    CHECK(!api::prepare_chat(f.ctx, body, prep));
+    const api::HttpResult gen = api::run_chat(f.ctx, prep, 0);
+    CHECK_EQ(gen.status, 200);
+    const int usage_prompt =
+        gen.body.contains("usage") ? gen.body["usage"].value("prompt_tokens", -1) : -1;
+
+    CHECK_EQ(count_of(t.body), usage_prompt);
+    CHECK_EQ(count_of(t.body), static_cast<int>(prep.input.prompt_ids_text.size()) + 1);
+    const std::vector<int> ids = ids_of(t.body);
+    CHECK(!ids.empty());
+    if (!ids.empty()) CHECK_EQ(ids.front(), BosTokenizer::kBos);
+}
+
+// An mmproj unit counts the image tokens with mtmd_tokenize, which /tokenize
+// does not run: the count cannot be exact, so the request is refused.
+TEST(tokenize_refuses_image_parts_on_an_mmproj_unit) {
+    MmFixture f;
+    const json img = json{{"type", "image_url"},
+                          {"image_url", {{"url", "data:image/png;base64,AAAA"}}}};
+    const json body = json{{"model", "stub"},
+                           {"messages", json::array({{{"role", "user"},
+                               {"content", json::array({{{"type", "text"}, {"text", "hi"}}, img})}}})}};
+    const api::HttpResult r = api::tokenize_request(f.ctx, body);
+    CHECK_EQ(r.status, 400);
+    CHECK(err_field(r.body, "message").find("image") != std::string::npos);
+}
+
+TEST(tokenize_responses_refuses_image_parts_on_an_mmproj_unit) {
+    MmFixture f;
+    const json body = json{{"model", "stub"},
+                           {"input", json::array({{{"type", "message"}, {"role", "user"},
+                               {"content", json::array({{{"type", "input_text"}, {"text", "hi"}},
+                                   {{"type", "input_image"}, {"image_url", "data:image/png;base64,AAAA"}}})}}})}};
+    const api::HttpResult r = api::tokenize_request(f.ctx, body);
+    CHECK_EQ(r.status, 400);
+    CHECK(err_field(r.body, "message").find("image") != std::string::npos);
 }
 
 // ------------------------------------------------------- the store is untouched

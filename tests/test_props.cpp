@@ -2,6 +2,7 @@
 
 #include "harness.h"
 
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 
@@ -136,6 +137,29 @@ TEST(props_reports_the_served_file_and_what_the_backend_knows) {
     CHECK_EQ(j.at("mtp").at("requested").get<std::string>(), std::string("on"));
     CHECK(j.at("mtp").at("enabled").get<bool>());
     CHECK_EQ(j.at("cache").at("kv_dtype").get<std::string>(), std::string("q8_0:q4_0"));
+}
+
+// The endpoint list must name the token routes too: a discovering client reads
+// it to know what this process serves.
+TEST(props_endpoints_lists_the_token_routes) {
+    Config      cfg;
+    FakeBackend backend;
+    backend.st.id        = "stub";
+    backend.st.served_id = "stub";
+    backend.st.loaded    = true;
+    backend.st.stub      = true;
+    backend.st.n_ctx     = 4096;
+    SlotPool slots(1);
+    Context  ctx{&cfg, &backend, &slots};
+
+    const nlohmann::json j         = lgc::api::props(ctx);
+    const nlohmann::json& endpoints = j.at("endpoints");
+    auto has = [&](const char* path) {
+        return std::find(endpoints.begin(), endpoints.end(), path) != endpoints.end();
+    };
+    CHECK(has("/tokenize"));
+    CHECK(has("/detokenize"));
+    CHECK(!has("/metrics"));   // --metrics off
 }
 
 // The projector's own halves: /props must report libmtmd's vision/audio caps,

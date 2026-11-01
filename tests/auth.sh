@@ -410,6 +410,10 @@ check "a bare OPTIONS is not a preflight and needs the key (401)" "$([[ "$code" 
 code=$(curl -sS -o /dev/null -w '%{http_code}' -X OPTIONS \
             -H 'Access-Control-Request-Method: POST' "$BASE/props")
 check "CORS preflight (Access-Control-Request-Method) is answered (204)" "$([[ "$code" == "204" ]] && echo 0 || echo 1)"
+# A whitespace-only value is not a method: it must not exempt the request.
+code=$(curl -sS -o /dev/null -w '%{http_code}' -X OPTIONS \
+            -H 'Access-Control-Request-Method:   ' "$BASE/props")
+check "a whitespace-only Access-Control-Request-Method is not a preflight (401)" "$([[ "$code" == "401" ]] && echo 0 || echo 1)"
 allow=$(curl -sS -D - -o /dev/null -X OPTIONS -H 'Access-Control-Request-Method: POST' "$BASE/props" | tr -d '\r' | grep -i '^access-control-allow-origin:' | head -1)
 check "the preflight allows the origin" "$(echo "$allow" | grep -q '\*' && echo 0 || echo 1)"
 
