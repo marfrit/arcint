@@ -1,6 +1,6 @@
 # arcint — Design
 
-State as of 2026-10-31: arcint **1.3.0** on llama.cpp **`3e4dfa8`** with the
+State as of 2026-11-01: arcint **1.4.0** on llama.cpp **`3e4dfa8`** with the
 patch series `contrib/llama.cpp/patches` 0001-0079 (74 patches; 0031, 0055,
 0061 and 0076 retired, 0073 on its own prefill-gather branch). One engine: libllama with
 ggml's OpenCL backend and arcint's Intel kernels. Three language services run

@@ -18,7 +18,7 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
-## 1.4.0 — unreleased
+## 1.4.0 — 2026-11-01
 
 Token mode for gateways, the serving-ops package and thinking replay across a
 steering message. Every new surface is off or inert until a request or a flag
@@ -141,6 +141,24 @@ thinking replay below).
   with its default and the code line it is read at.
 - The container image's builder stage carries diffutils (the 1.3.0 image build
   failed on the golden compare).
+
+Release gate (window 48, `measured-here`, the release candidate against 1.3.0 in the same
+window):
+- Coder (A770): decode 51.55 / 52.75 / 45.25 t/s on both builds, prefill at 41k 729.3 against
+  730.5 (inside the spread), the answers byte-identical; the acceptance task 10/10 greedy x3,
+  10/10/9 at 0.7. `/tokenize` ids equal `llama-tokenize` on three texts; the count equals the
+  generation's `usage.prompt_tokens` with thinking on, off and with tools. A steering turn's
+  prefix-cache hit: 13.4 % without `preserve_thinking`, 99.6 % with it (prefill 1,476 -> 229 ms).
+- Agent (B60): prefill at 55k / 138k 712.8 / 501.85 against 715.4 / 503.0 t/s (inside the
+  floor), the answers byte-identical.
+- Flash-Next (B60): prefill equal (533.75 against 535.73 t/s in four rounds); **decode 2.2 %
+  slower**, 32.97 against 33.70 t/s pooled over nine runs of each build in three passes, with the
+  same draft acceptance (each verify step slower). The cause is not isolated yet (suspects: 0078's
+  staging of CPU-island copies, 0077's bank-ring rescan on a relearn); the operator accepted it
+  for 1.4.0, the fix is owed for 1.4.1. 0077's load cost is inside load-to-load noise (alias
+  check on 61.6 / 56.6 s, off 52.1 / 64.2 s to `/health`; 60.5 MB written and read back).
+- Token mode `ready` with the renderer material served on all three (`/props`, the material's
+  hash, the load log).
 
 Runtime dependency unchanged in kind: llama.cpp 3e4dfa8 with
 `contrib/llama.cpp/patches` 0001-0079 (0031, 0055, 0061, 0073, 0076 not
