@@ -1300,6 +1300,9 @@ public:
                     {"supports_tool_responses", c.supports_tool_responses},
                     {"supports_system_role", c.supports_system_role},
                     {"supports_parallel_tool_calls", c.supports_parallel_tool_calls},
+                    // The pin's own name (common/jinja/caps.h supports_object_arguments,
+                    // chat.cpp: true -> tool-call arguments go to the template as an
+                    // object). minja calls the same fact requires_object_arguments.
                     {"supports_object_arguments", c.requires_object_arguments},
                     {"supports_string_content", !c.requires_typed_content},
                     {"supports_typed_content", c.requires_typed_content},
