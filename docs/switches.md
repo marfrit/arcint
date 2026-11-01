@@ -10,7 +10,7 @@ may change or go without notice.
 
 A switch here is an environment variable read by arcint, by one of its tools,
 or by the llama.cpp patch series in `contrib/llama.cpp/patches` (0001-0079,
-without the dropped 0031, 0055 and 0061, 0073 on its campaign branch and the
+without the dropped 0031, 0055, 0061 and 0078 (1.4.1), 0073 on its campaign branch and the
 retired 0076; 0079 reads no switch). Switches the pinned llama.cpp tree reads by itself
 (`GGML_OPENCL_PLATFORM`, `GGML_OPENCL_FUSE_RMS_ADD`, `GGML_OPENCL_F16_MROW` and
 the others in upstream's `ggml-opencl.cpp`) are upstream's and not listed;
@@ -168,8 +168,7 @@ These names are not in a table:
 | `GGML_OPENCL_KQ_Q8_1` | on (Intel with integer dot) | `0`: all K-quant x q8_1 kernels off; the experts of a K-quant MoE leave the device. | 0001 | — |
 | `GGML_OPENCL_KQ_QUANT_SG` | on | `0`: q8_1 quantization with one work-item a block. | 0004 | 7.4 us on the B60, 10 us on the A770 for the old kernel (`measured-here`). |
 | `GGML_OPENCL_KQ_ROUTE_CACHE` | on | `0`: routes every MUL_MAT_ID call. | 0006 | — |
-| `GGML_OPENCL_STAGE_INPUTS` | on (needs USM host alloc) | `0`: graph-input writes take the blocking path; on, only a copy that fits the ring's free space without a wrap is staged as one whole write (the scheduler's graph-input marker), and a larger copy blocks (0078). | 0047, 0078 | Verify input copies 926-949 -> 582-593 us; decode 31.6 -> 32.0 t/s (`measured-here`, 0047); the 0078 bounds and their reds are device-free (`code`); the card arms are in the README. |
-| `GGML_OPENCL_STAGE_MB` | 32 | `8`..`1024`: the staging ring in MiB; a value outside the range keeps 32. | 0078 | `code`; the card sweep is owed. |
+| `GGML_OPENCL_STAGE_INPUTS` | on (needs USM host alloc) | `0`: input writes up to 4 MiB are blocking again, not staged through a 32 MiB ring. | 0047 | Verify input copies 926-949 -> 582-593 us; decode 31.6 -> 32.0 t/s (`measured-here`). 1.4.0's 0078 (the staging bound, `GGML_OPENCL_STAGE_MB`) was dropped in 1.4.1: it cost Flash-Next 2.2 % decode (`contrib/llama.cpp/README.md`). |
 | `LLAMA_EXPERT_CACHE_ALIAS` | on | `0`: the slot buffers' sampled alias tripwire off; the bank stream ring's scan is separate and unconditional, each learned order and each relearn included. A finding warns and proceeds. | 0077 | `code`; the load-cost arm is owed on the card. |
 | `GGML_OPENCL_TOPK_MOE_LEGACY` | off | `1`: the fused topk-moe dispatch takes the old work-group-per-token kernel (`kernel_topk_moe_softmax_norm_legacy`, 0064's baseline); unset or 0 keeps the default dispatch. | 0064 | `code`: 0064:14-15,38,61. |
 | `GGML_SCHED_INPUT_SYNC_EACH` | off | `1`: the scheduler waits for the backend before each input copy, as upstream does. | 0047 | Same measurement as `STAGE_INPUTS`. |

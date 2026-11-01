@@ -420,6 +420,10 @@ answer by design.
     at 200K depth, ubatch 512 (~200 MiB), is that case; six finishes and a 200 MiB memcpy were the
     review's finding against the old chunk plan (`measured-here`). Device-free cells check both
     bounds and their reds; the bytes are the blocking write's.
+    **Dropped in 1.4.1 (`measured-here`, windows 48 and 50):** 0078 cost Flash-Next 2.2 % of its
+    decode, and 1.4.0 without it decodes at 1.3.0's rate (`contrib/llama.cpp/README.md`, 0078). The
+    CPU-island copies above are the likely path (Flash-Next is the only unit with CPU islands), not
+    measured. A narrowed bound (graph inputs only) is owed before the leftover is addressed again.
   - **The ceiling at depth.** Flash-Next's QSA inputs are large: the indexer's `pool_mask` is f32
     `[n_pool, n_tokens]` (`code`: `qwen4exp.cpp`) and the `mask_all` path was sized at ~1 GiB for the
     scores at 131K (`paper`, 0052's finding) — the masks and rotations are the ones the artifact's

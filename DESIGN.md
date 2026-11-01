@@ -1,8 +1,8 @@
 # arcint — Design
 
-State as of 2026-11-01: arcint **1.4.0** on llama.cpp **`3e4dfa8`** with the
-patch series `contrib/llama.cpp/patches` 0001-0079 (74 patches; 0031, 0055,
-0061 and 0076 retired, 0073 on its own prefill-gather branch). One engine: libllama with
+State as of 2026-11-02: arcint **1.4.1** on llama.cpp **`3e4dfa8`** with the
+patch series `contrib/llama.cpp/patches` 0001-0079 (73 patches; 0031, 0055,
+0061, 0076 and 0078 retired, 0073 on its own prefill-gather branch). One engine: libllama with
 ggml's OpenCL backend and arcint's Intel kernels. Three language services run
 in production on two Intel Arc cards: the dense Qwen3.8-27B agent and
 Qwen3.8-Flash-Next (125B-A6B, on demand) on the 24 GB Arc Pro B60, the MoE
@@ -210,7 +210,7 @@ measurement, KL, red case and review in `contrib/llama.cpp/README.md`
 | MoE | 0006, 0033, 0043 | tokens as the DPAS A operand, the B60 tile, the cache's GEMM threshold |
 | expert cache | 0021, 0024, 0042, 0046, 0056, 0063, 0075 | VRAM slots and a USM bank, per device, non-blocking admission on its own queue, the misses on the CPU (Strata's multi-token rows for every expert type of the served GGUFs since 0063), the miss rows' prefetch and page touch (off; the premise is not Strata's) |
 | prefill bank stream | 0032, 0044 | each bank tensor copied whole into a VRAM ring ahead of its GEMM, from 256 tokens |
-| decode launches and inputs | 0004, 0005, 0027, 0047, 0049, 0078 | small ops, few-row F32, fewer launches, inputs staged in a USM ring with one wait a split, only graph inputs that fit the ring without a wrap, everything else blocking |
+| decode launches and inputs | 0004, 0005, 0027, 0047, 0049 | small ops, few-row F32, fewer launches, inputs staged in a USM ring with one wait a split |
 | lanes and devices | 0023, 0025, 0026, 0029 | one OpenCL context per platform, a KV cell window per lane, per-sequence attention windows |
 | graph and buffers | 0010, 0036, 0052 | MTP masked rows, Q8_0 GET_ROWS, compute buffers reserved for N cells |
 | image generation | 0057-0060 | the fused `ROPE_APPLY` op (CPU and OpenCL) for sd.cpp's DiTs; `CONV_3D` (Qwen-Image's Wan VAE) and `LEAKY_RELU` (the ESRGAN upscaler) on OpenCL, neither in a language graph; the Q8_0 GEMM on the XMX units, on the B60 (it also takes the language models' Q8_0 weights in batches of 16 or more, which in the served GGUFs are only MTP draft heads) |
