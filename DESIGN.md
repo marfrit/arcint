@@ -458,6 +458,8 @@ contract `docs/imggen-service.md`.
 | `GET /v1/models` | one entry per served name with the context it is **running with** (§4.2) |
 | `GET /health` | model, loaded, slots free/total, queue depth; per lane with named lanes |
 | `GET /props` | the served file and architecture, context, KV types, MTP state, sampler defaults and provenance, build info |
+| `POST /tokenize` | llama-server-compatible: `content` → ids, `with_pieces` → `{id, piece}` (a piece that is not valid UTF-8 on its own is its array of byte values); a chat or Responses body → `{tokens, count}`, the prompt the request would decode, through the same prepare path |
+| `POST /detokenize` | llama-server-compatible: `tokens` → `content`, special tokens rendered as text |
 
 `usage.completion_tokens_details` carries `accepted_prediction_tokens` /
 `rejected_prediction_tokens`. Console output goes to stderr, one greppable

@@ -18,6 +18,23 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.4.0 — unreleased
+
+The serving-ops package.
+
+- **`POST /tokenize` and `POST /detokenize`** (llama-server-compatible, behind
+  the same key as every other route): `/tokenize` takes
+  `{content, add_special?, with_pieces?, model?}` and returns `{tokens}`; with
+  `with_pieces` it returns `{id, piece}` objects, and a piece that is not valid
+  UTF-8 on its own is the array of its byte values. A chat body (`messages`,
+  `tools`, …) or a Responses body (`input`, `instructions`, `tools`, …) is
+  counted through the request's own prepare path — `finish_prepare`'s stored
+  id vector, one tokenisation, never a second encode — and returns
+  `{tokens, count}`, so the count is the prompt the same request would decode.
+  `/detokenize` takes `{tokens}` and returns `{content}`, special tokens
+  rendered as text (llama-server's default `unparse_special=true`). The `model`
+  field picks the lane exactly as the generation routes do.
+
 ## Unreleased
 
 The quality instruments that shipped in 1.2.7 — `tools/capture_vs_capture.py`'s

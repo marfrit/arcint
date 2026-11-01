@@ -129,6 +129,16 @@
 - HTTP: POST /v1/chat/completions, POST /v1/completions (OpenAI-compatible,
   SSE streaming; /v1/completions also takes token-id prompts), GET /health,
   GET /props, GET /v1/models. No UI.
+- Token surface (llama-server-compatible, behind the same key as every route):
+  POST /tokenize takes {content, add_special?, with_pieces?, model?} and
+  returns {tokens}; with_pieces returns {id, piece} objects, a piece that is
+  not valid UTF-8 on its own being the array of its byte values. POST
+  /tokenize also takes a chat body (messages, tools) or a Responses body
+  (input, instructions, tools) and returns {tokens, count}: the prompt the
+  request would decode, counted through the request's own prepare path (one
+  tokenisation, never a second). POST /detokenize takes {tokens} and returns
+  {content}, special tokens rendered as text (unparse_special=true). The
+  model field picks the lane as the generation routes do.
 - --served-model-name NAME sets the id /v1/models and /props report. The
   model object carries id, n_ctx (running), n_ctx_train, quant, lanes.
 - Named lanes: --served-model-name A,B --lane-ctx CA,CB serves lanes of
