@@ -508,6 +508,25 @@ if(ARCINT_TESTS)
     target_compile_options(arcint-gdn-state-rows PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME gdn-state-rows COMMAND arcint-gdn-state-rows)
     set_tests_properties(gdn-state-rows PROPERTIES LABELS unit)
+    # patch 0081's source-slot cell: the GDN family takes src[6] once (the rows
+    # index; the replay's records in its own op), the mode word op_params[1]
+    # selects the state path, and the raw gating projections of patch 0051 ride
+    # src[8]/src[9]. The served graph's gate chain with those projections
+    # attached computes the plain path's bytes on the CPU backend -- with rows on
+    # and with replay on too. Before the fix the attached alpha sat on src[6] and
+    # every unit crashed (the CPU op's I32 assert).
+    add_executable(arcint-gdn-gate-slots tests/test_gdn_gate_slots.cpp)
+    target_link_libraries(arcint-gdn-gate-slots PRIVATE arcint_core)
+    target_include_directories(arcint-gdn-gate-slots PRIVATE
+        "${ARCINT_LLAMA_DIR}/ggml/include" "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/src/models")
+    target_compile_options(arcint-gdn-gate-slots PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME gdn-gate-slots COMMAND arcint-gdn-gate-slots)
+    set_tests_properties(gdn-gate-slots PROPERTIES LABELS unit)
+    add_test(NAME gdn-gate-slots-gate
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_gdn_gate_slots.py")
+    set_tests_properties(gdn-gate-slots-gate PROPERTIES LABELS unit)
     # patch 0086/0087's device-free cell: a chain of prompt steps through
     # ggml_gated_delta_net_replay equals the snapshot chain's bytes on the CPU
     # backend (attention outputs and the final base state). The cards' arm is the

@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 1dc828e..c5cd875 100644
+index 9c650a1..344662c 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -1296,6 +1296,10 @@ struct ggml_backend_opencl_context {
@@ -30,7 +30,7 @@ index 1dc828e..c5cd875 100644
                  // the kernel's own limit (a 256-GRF build halves the threads a
                  // work-group may have): a shape it does not take falls back
                  size_t wg_pp = 0;
-@@ -11560,6 +11574,20 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -11567,6 +11581,22 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                  }
                  return S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128;
              }
@@ -41,7 +41,9 @@ index 1dc828e..c5cd875 100644
 +                if (op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
 +                    return false;
 +                }
-+                if (op->src[3]->ne[0] != 1 || op->src[5]->type != GGML_TYPE_F32 ||
++                if (ggml_get_op_params_i32(op, 1) != GGML_GDN_MODE_REPLAY ||
++                    op->src[6] == nullptr || op->src[7] == nullptr ||
++                    op->src[3]->ne[0] != 1 || op->src[5]->type != GGML_TYPE_F32 ||
 +                    op->src[6]->type != GGML_TYPE_F32 || op->src[7]->type != GGML_TYPE_I32) {
 +                    return false;
 +                }
@@ -51,7 +53,7 @@ index 1dc828e..c5cd875 100644
          case GGML_OP_CONCAT:
              {
                  const ggml_type t = op->src[0]->type;
-@@ -35849,6 +35877,118 @@ static void ggml_cl_glu(ggml_backend_t backend, const ggml_tensor * src0, const
+@@ -35856,6 +35886,123 @@ static void ggml_cl_glu(ggml_backend_t backend, const ggml_tensor * src0, const
      backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
  }
  
@@ -69,6 +71,11 @@ index 1dc828e..c5cd875 100644
 +    const ggml_tensor * src_s    = dst->src[5];
 +    const ggml_tensor * src_rec  = dst->src[6];
 +    const ggml_tensor * src_ctrl = dst->src[7];
++
++    // the family's mode word (ggml.h, op_params[1]): this op's record/control
++    // slots, never the rows form's row index or an attached gating input
++    GGML_ASSERT(ggml_get_op_params_i32(dst, 1) == GGML_GDN_MODE_REPLAY);
++    GGML_ASSERT(src_rec != nullptr && src_ctrl != nullptr);
 +
 +    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
 +    if (backend_ctx->kernel_gdn_intel_rpl == nullptr) {
@@ -170,7 +177,7 @@ index 1dc828e..c5cd875 100644
  static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
      ggml_cl_gated_delta_net_impl(backend, dst, nullptr);
  }
-@@ -36447,6 +36587,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+@@ -36460,6 +36607,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
              // (src0, src1, dst) func signature. Dispatch directly and return.
              ggml_cl_gated_delta_net(backend, tensor);
              return true;
@@ -826,10 +833,10 @@ index 08489a4..e2f2103 100644
      int32_t  get_rs_z() const;
      uint32_t get_size() const;
 diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
-index daa1fec..5e4ea68 100644
+index 7e9a413..65566aa 100644
 --- a/src/models/delta-net-base.cpp
 +++ b/src/models/delta-net-base.cpp
-@@ -595,11 +595,54 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+@@ -578,11 +578,54 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
      // the op path: keep == true (gather or rows), or rows (K == 1)
      const int64_t K = keep ? cparams.n_rs_seq + 1 : 1;
  

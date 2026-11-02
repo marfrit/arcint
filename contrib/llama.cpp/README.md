@@ -3215,8 +3215,10 @@ between the steps, so the roundings are the separate kernels'.
 
 The kernel reads alpha and b when the GDN runs, later than the allocator
 keeps them: it frees alpha after the ADD. So `delta-net-base.cpp`
-(`gdn_keep_gating_inputs`) attaches them as extra sources of the GDN node
-(`src[6]` alpha, `src[7]` b), which keeps them alive; the op's meaning does
+(`gdn_keep_gating_inputs`, now `src/models/gdn-gate-inputs.h`) attaches them as
+extra sources of the GDN node (`src[6]` alpha, `src[7]` b **as originally
+written; patch 0081 moved them to `src[8]`/`src[9]`** — the family's slots, see
+0081 below), which keeps them alive; the op's meaning does
 not change and the CPU ignores them. The backend folds only when those
 sources are the chain's raw inputs, and refuses a fold if any computed node
 between the chain and the GDN writes over their bytes.
@@ -5602,9 +5604,29 @@ the same destination `build_rs` writes), and the GDN op reads this sequence's
 live row `inp->s_copy_main[0]` inside the kernel. The three served archs
 (`qwen35`, `qwen35moe`, `qwen4exp`) pass the row index.
 
+**The GDN family's source slots, one signal each** (`measured-here`, the card
+host, 2026-11-02; defect): src[6] was taken three times — 0051's alpha (on by
+default), this patch's row index, 0086's records. Served with 0051's fold on,
+src[6] held the F32 alpha: the OpenCL `supports_op` declined the node, it fell
+to the CPU, and the CPU kernel asserted `GGML_ASSERT(src_rows->type ==
+GGML_TYPE_I32)` — **every unit crashed with every new switch off**. The fix,
+which is this patch: `op_params[1]` is the family's mode word
+(`GGML_GDN_MODE_GATHERED 0`, `_ROWS 1` in `ggml.h`, `_REPLAY 2` from 0086) and
+both GATED_DELTA_NET builders set it; the CPU op, the OpenCL `supports_op` and
+the OpenCL dispatch select their state path from that word and never from
+whether src[6] is set; the rows index stays `src[6]`; the raw gating projections
+of 0051 ride `src[8]`/`src[9]` (the helper moved to
+`src/models/gdn-gate-inputs.h`, which the builders and the device-free cell
+share) and 0051's fold matches `gd->src[8] == al` / `gd->src[9] == br`. The
+replay op (0086/0087) keeps `src[6]` records / `src[7]` control and carries the
+REPLAY mode word, which its CPU and OpenCL consumers assert. Evidence class of
+the slots: `code` (the consumers' reads); of the crash: `measured-here`.
+
 **Switch `LLAMA_GDN_STATE_ROWS`, off by default** (`code`): `1` builds the rows
 form, `0` keeps the gather. With it off the graph and every op's arguments are
-as before, byte-identical. The build gate (`llama_gdn_state_rows_enabled`)
+as before, byte-identical (the slot move is liveness only: 0051's fold finds the
+same two tensors, and off-graph bytes are unchanged).
+The build gate (`llama_gdn_state_rows_enabled`)
 declines a **multi-sequence** ubatch — `s_copy` may map a live row into the
 extra relocation's destination — and any batch the fused GDN op would not take
 (the autoregressive path needs a 4D state). The gate's single-sequence condition
@@ -5620,7 +5642,22 @@ into plane 0, so the served path's rows do not overlap — the multi-sequence
 decline keeps the general case out. Confirm it in the served arm: the answers
 and the draft acceptance counters equal (below).
 
-Device-free (`measured-here`): `tests/test_gdn_state_rows.cpp` runs both forms on
+Device-free (`measured-here`): `tests/test_gdn_gate_slots.cpp` builds the served
+graph's gate chain — `beta = sigmoid(b)`, `g = reshape(mul(softplus(add(alpha,
+dt_bias)), A))` — and attaches the raw projections through the shared header
+`gdn-gate-inputs.h`: the plain node with 0051's fold active (all new switches
+off), the rows form and the replay node all compute the plain path's bytes
+(replay: its attention region, and its whole output is unchanged by the extra
+sources). Red (`measured-here`): `gdn-gate-inputs.h` writing `src[6]`/`src[7]`
+again (the served pre-fix form) makes the plain+extras arm abort in the CPU op's
+I32 assert; the plain builder announcing ROWS aborts the same way.
+`tests/python/test_gdn_gate_slots.py` asserts the mode word's definition and use
+in both builders, the CPU op, the OpenCL `supports_op` and the dispatch, the
+`src[8]`/`src[9]` slots and 0051's match, and the replay's own slots; red
+mutations run: the helper on the old slots, the plain builder's mode flipped, the
+CPU op reading `dst->src[6] != nullptr` again, 0051's prepass on the old slots.
+
+`tests/test_gdn_state_rows.cpp` runs both forms on
 the CPU backend at four shapes (one sequence with `ids[0] = 2`, two sequences
 with `ids {1, 3}` or `{2, 3}`, K = 1 and K = 3, three tokens) and requires the
 packed outputs — attention scores and snapshots — byte-identical; the cache is
@@ -5657,6 +5694,24 @@ Card arms (owed; Claude runs them in a card window, **not yet measured**):
    finding is recorded.
 3. The same with the coder on the A770 (`--device GPU.1`, `ab.py coder`, MTP 4)
    and with Flash-Next (B60, MTP 3, IQ3_XXS): answers right, decode recorded.
+4. **The defect's card check (first, before any A/B)**: the served binary with
+   **0051's fold on, the default** (`GGML_OPENCL_FUSE_0051_PART=3` is the
+   default part; unset `GGML_OPENCL_FUSE_0050` = 3) and **every new switch off**
+   (`LLAMA_GDN_STATE_ROWS` unset, `LLAMA_GDN_REPLAY` unset) must start and
+   answer at a short prompt on each unit. Before this fix it crashed at the first
+   GDN node (the CPU op's I32 assert). The ground source is the three units'
+   one-shot arm:
+
+      cd <arcint build>
+      ./bin/arcint --llama-gguf <agent.gguf> --device GPU.0 -p "<a 20-token prompt>" -n 8
+      # the coder on GPU.1, Flash-Next on GPU.0, the same line
+      # expect: exit 0, "GDN gating folded into the kernel for N of N GDN nodes"
+      # in the log, and 8 tokens out
+
+   Red on the card (the pre-fix form, not to be kept): `gdn-gate-inputs.h`'s two
+   assignments back to `src[6]`/`src[7]`; rebuild; the same line crashes with
+   `GGML_ASSERT(src_rows->type == GGML_TYPE_I32)`. Restored, it answers.
+   `test-backend-ops -o GATED_DELTA_NET` stays the kernel's own arm (1).
 
 ## 0082-llama-gdn-qk-l2-norm.patch
 
@@ -5896,6 +5951,15 @@ bit-identical to the snapshot path's per-token step: scale the state by
 `exp(g)`, then mad each value row with `k * delta`; the record stores the delta
 per value row, the key per key row and the gate per head.
 
+**The node's own slots** (`code`, patch 0081's contract): the replay builder sets
+`op_params[1] = GGML_GDN_MODE_REPLAY`; `src[6]` is this op's records and `src[7]`
+its control, and both its CPU reference and its OpenCL consumer assert the mode
+word, so a node of another GDN form (or a raw gating projection of 0051, which
+rides `src[8]`/`src[9]` since 0081) can never reach this body. src[6] was taken
+three times before 0081 (0051's alpha, the rows index, these records); the
+replay op is a different op number, so with the gating slots moved and the mode
+words in place nothing crosses.
+
 **Device-free (`measured-here`)**: `tests/test_gdn_replay.cpp` runs a three-step
 chain (5 tokens, 3 with a rollback of 2, then 1; S 16, H 4, K 5) through both
 forms on the CPU backend and requires every step's attention output and the
@@ -5947,7 +6011,8 @@ per key row, gate per head). The program is built only when the switch is on
 price is not measured here — the card arm below measures it. If the device
 refuses the build the kernel stays null and the op runs on the CPU.
 `supports_op` takes F32 state, a scalar gate, F32 records and I32 control,
-`S_v == 128`; the dispatch passes 30 arguments with `{H_v*sg, n_seqs,
+`S_v == 128` and the node's REPLAY mode word (patch 0081's contract), and the
+dispatch asserts the same before it reads `src[6]`/`src[7]`; the dispatch passes 30 arguments with `{H_v*sg, n_seqs,
 S_v/rows}` work-groups. With the switch off, the backend's programs, kernels,
 arguments and bytes are as before.
 
@@ -6062,14 +6127,46 @@ removes.
 - **Quality**: rounding-only (the Q int8 adds one rounding), as the audit
   classes it (`code`); judged at the answer-level bar, not bit equality.
 
+**The Q staging's extent — the card's defect** (`measured-here`, the card host,
+2026-11-02): `GGML_OPENCL_FA_GQA_I8=1 GGML_OPENCL_FA_GQA_MIN_ROWS=1`, head size
+256: **135 of 135 FLASH_ATTN_EXT cases failed, ERR ~0.10 NMSE** against the
+5e-4 bound (e.g. `FLASH_ATTN_EXT(hsk=256,hsv=256,nh=8,nr23=[4,1],kv=1024,
+nb=32,mask=1,...,type_K=q8_0,type_V=q8_0)`), while the f16 arm passed the same
+geometry. Cause (`code`): the staging loop enumerated `(row, block)` pairs up
+to `min((n_rows + 7) / 8, 8) * QB` — the row-**tile** count times the blocks a
+row — instead of the rows a call. It wrote only the first `tiles` rows of a
+tile (`rt_max` pairs per block, `r = e / QB`), so every other row of the a
+operand was whatever the local allocation held and its S was that garbage; a
+uniform-ish garbage S averages the V rows, which is the ~0.10. n_rows is
+`G * n_q` (the agent 6 a row, 36 at 6 rows; the coder 8 and 48), so at least
+5 of 6, and at least 7 of 8 rows, were unstaged in every routed case — the
+same ERR for all of them. 0.10 is a layout error, not int8 rounding: the
+device-free S selftest quantized every row itself and modelled no staging, so
+it stayed green. Fix: the extent is one text, `fa_gqa_i8_stage_rows(n_rows)` in
+`fa_gqa_i8_ops.inc` (the kernel and the cell read the same helper) — every row
+of every row tile, capped at the 8 tiles the a operand holds, rows past
+`n_rows` zeroed with `dq` 0 like the f16 path's zero Q row.
+
+Expected after the fix (`measured-here`, the f16 arm's own bound): the same
+cases pass at **NMSE <= 5e-4**, the f16 path's order plus the one int8 Q
+rounding; the S-level bound the cell states is max abs (int8 - f16) <= 1e-2 *
+max|S| (0.6 % measured on the model), and the case's NMSE should land at the
+f16 arm's own ~1e-4 to low-1e-4, not above 5e-4.
+
 Device-free (`measured-here`, the recipe host):
 
 - `tests/test_fa_gqa_i8.cpp` (built in the `unit` ctest): the q8_0 block
   offsets, the RNE quantizer against an independent `nearbyint` reference with
-  the .5 corners, and the (b) S selftest over one 16-key tile and 8 rows at
-  head size 256 — the int8 way against the f16 way, stated bound max abs
-  (int8 − f16) ≤ 1e-2 × max|S| over the tile (the tile prints its measured
-  value), plus the integer contraction against a double evaluation.
+  the .5 corners, and the (b) S selftest **at the operands the kernel builds**:
+  the staged a-operand tile (the helper's `(row, block)` pairs, a poison
+  pattern wherever the staging does not reach), the strided block read that
+  gives lane l dims (2l, 2l+1) of each row, the b operand as the lane's key
+  (8 ints, ascending dims), and the systolic dot4 pairing per stage d (the
+  shorts of lanes 2d, 2d+1 against the b dword d), scaled by
+  `dq[row][block] * dk[key][block]` — against the f16 form, at the agent's and
+  the coder's row counts (6, 8, 36, 48), stated bound max abs (int8 − f16) ≤
+  1e-2 × max|S| (prints the measured value), plus the staging-extent cell
+  (`fa_gqa_i8_stage_rows` covers every row of every tile the batch needs).
 - `tests/python/test_fa_gqa_i8.py` (the `unit` ctest, `LLAMA_SRC`): the switch
   defaults off, `-DGQA_I8=1` and the helper prepend only on a KT 1 arm, the
   staged form a second build only with the switch, the 1-3 row routing under
@@ -6089,9 +6186,13 @@ Device-free (`measured-here`, the recipe host):
   the stated bound 1e-2 * max|S| = 0.208869`;
   (e) `FA_GQA_I8_RINT` truncated to `(int) x` →
   `FAIL quant: 1.5 -> 1, want 2 (RNE)` (the S selftest stays inside the bound
-  at 0.6172 % — truncation alone is small, which is why the .5 corners exist).
+  at 0.6172 % — truncation alone is small, which is why the .5 corners exist);
+  (f) `fa_gqa_i8_stage_rows` returning the tile count (the pre-fix extent, no
+  `* 8`) → the S cells fail on every row the staging did not reach (the model's
+  poison), the staging-extent cell fails, and `tests/python/test_fa_gqa_i8.py`'s
+  extent cell fails — the card's 135 of 135 at ERR ~0.10.
   The card red is (d) too: every new FLASH_ATTN_EXT case at 1-6 rows fails
-  with it (owed to the card window).
+  with it. (f)'s card red is the measured defect above.
 
 Card arms (owed; Claude's announced window), the exact commands:
 - correctness and (a)/(c): the new cases are
@@ -6112,8 +6213,19 @@ Card arms (owed; Claude's announced window), the exact commands:
           ./build/bin/test-backend-ops perf -o FLASH_ATTN_EXT
       # red (a) on the switch-on arm: fa_gqa_i8_qs -> 34 * b + 18, rebuild, the
       # 1-6 row cases fail; restore.
+      # red (f) on the switch-on arm: fa_gqa_i8_stage_rows returns `tiles`
+      # (the pre-fix extent), rebuild, every routed case fails at ERR ~0.10;
+      # restore, and the same cases pass at NMSE <= 5e-4 (the f16 arm's bound).
       # A770: the same two runs; the GQA kernel is SG16-only, so both arms
       # must pass identically (0015's kernels serve).
+- **(f)'s card check is the defect's, run first**: the switch-on arm at head
+  size 256, every case of it:
+
+      GGML_OPENCL_DEVICES=0:0 GGML_OPENCL_FA_GQA_I8=1 GGML_OPENCL_FA_GQA_MIN_ROWS=1 \
+          ./build/bin/test-backend-ops test -o FLASH_ATTN_EXT -p hsk=256
+      # expect: every routed case PASS at NMSE <= 5e-4; the f16 arm
+      # (GGML_OPENCL_FA_GQA_I8 unset) is the same list's bound.
+      # before the fix: 135 of 135 FAIL, ERR ~0.10.
 - (b) on the card: the eval list's q8_0 cases already compare each arm against
   the CPU reference at the same 16-key tile geometry; the S-level comparison
   itself is the device-free cell above (the DPAS s8 product is the exact
@@ -6173,6 +6285,12 @@ and only for the q8_0 K pairs (KT 1); the program already carries
   unchanged); the Q int8 quantization of 0088 and P V's f16 DPAS are unchanged
   (`code`).
 - **Quality**: rounding-only, the same one Q rounding as 0088; no new one.
+- **The Q staging's extent is 0088's fix, shared**: both forms read the same
+  staged a operand (`fa_gqa_i8_stage_rows`, which this patch's second build
+  compiles in unchanged); the card's red hit the direct and the staged form
+  alike, and the staged form's own two defects would have shown as mismatched
+  K rows, not as 0088's uniform ~0.10. The 1-3 row cases are part of (f)'s
+  card check above.
 
 Device-free (`measured-here`): the offset cell asserts the staged row/stride
 arithmetic (68/69 at 256, 34/35 at 128, an odd stride), and the routing cell

@@ -107,13 +107,18 @@ class GdnStateRows(unittest.TestCase):
         b = _body(t, "struct ggml_tensor * ggml_gated_delta_net_rows(")
         self.assertTrue(b, "ggml_gated_delta_net_rows is absent")
         self.assertIn("result->src[6] = rows;", b)
+        self.assertIn("ggml_set_op_params_i32(result, 1, GGML_GDN_MODE_ROWS);", b,
+                      "the rows form is announced by the mode word, not by src[6] alone")
         self.assertIn("states->ne[0] == S_v * S_v * H", b, "the cache rows are D wide")
         self.assertIn("rows->ne[0] == n_seqs", b)
         self.assertIn("ggml_gated_delta_net_rows(", self.t[GGML_H])
 
     def test_cpu_reads_the_named_row(self):
         t = self.t[CPU_OPS]
-        self.assertIn("const ggml_tensor * src_rows = dst->src[6];", t)
+        self.assertIn("const int gdn_mode = ggml_get_op_params_i32(dst, 1);", t,
+                      "the mode word selects the state path")
+        self.assertIn("const bool rows_mode = gdn_mode == GGML_GDN_MODE_ROWS;", t)
+        self.assertIn("const ggml_tensor * src_rows = rows_mode ? dst->src[6] : nullptr;", t)
         self.assertIn("const int64_t state_row_stride = src_rows ? (int64_t) (src_state->nb[1] / sizeof(float))",
                       t, "the row stride is the cache's nb[1]")
         self.assertIn("state_rows ? (int64_t) state_rows[iv3] * state_row_stride : iv3 * state_seq_stride",
@@ -133,7 +138,7 @@ class GdnStateRows(unittest.TestCase):
 
     def test_dispatch_passes_rows(self):
         t = self.t[OPENCL]
-        self.assertIn("const ggml_tensor * src_rows = dst->src[6];", t)
+        self.assertIn("const ggml_tensor * src_rows = gdn_mode == GGML_GDN_MODE_ROWS ? dst->src[6] : nullptr;", t)
         self.assertIn("const cl_uint  use_rows        = src_rows != nullptr ? 1 : 0;", t)
         self.assertRegex(t, r"src_state->nb\[1\] / sizeof\(float\)", "the row stride from nb[1]")
 

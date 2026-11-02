@@ -1,5 +1,5 @@
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 4869844..c63f4f7 100644
+index cf8b7e8..a423350 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -602,6 +602,8 @@ extern "C" {
@@ -11,7 +11,7 @@ index 4869844..c63f4f7 100644
          GGML_OP_COUNT,
      };
  
-@@ -2692,6 +2694,21 @@ extern "C" {
+@@ -2704,6 +2706,21 @@ extern "C" {
              struct ggml_tensor  * rows,
              int64_t               K);
  
@@ -70,10 +70,10 @@ index 5d0e004..5b1e4ec 100644
                      {
                          GGML_ABORT("fatal error");
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index cd1f1d6..714ebf1 100644
+index 802bfa0..2d77ae6 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -11473,6 +11473,159 @@ void ggml_compute_forward_gated_delta_net(
+@@ -11478,6 +11478,164 @@ void ggml_compute_forward_gated_delta_net(
  }
  
  
@@ -94,6 +94,11 @@ index cd1f1d6..714ebf1 100644
 +    const ggml_tensor * src_state = dst->src[5];
 +    const ggml_tensor * src_rec   = dst->src[6];
 +    const ggml_tensor * src_ctrl  = dst->src[7];
++
++    // the family's mode word (ggml.h, op_params[1]): src[6]/src[7] are this op's
++    // records and control, so a node of another GDN form can never reach here
++    GGML_ASSERT(ggml_get_op_params_i32(dst, 1) == GGML_GDN_MODE_REPLAY);
++    GGML_ASSERT(src_rec != nullptr && src_ctrl != nullptr);
 +
 +    GGML_TENSOR_LOCALS(int64_t, neq, src_q, ne);
 +    GGML_TENSOR_LOCALS(size_t,  nbq, src_q, nb);
@@ -246,7 +251,7 @@ index f320c09..ca648df 100644
  void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 3187f79..421c047 100644
+index 83a349c..b0d11ed 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1111,9 +1111,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -273,7 +278,7 @@ index 3187f79..421c047 100644
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -6520,6 +6522,90 @@ struct ggml_tensor * ggml_gated_delta_net_rows(
+@@ -6522,6 +6524,91 @@ struct ggml_tensor * ggml_gated_delta_net_rows(
      return result;
  }
  
@@ -347,6 +352,7 @@ index 3187f79..421c047 100644
 +    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 +
 +    ggml_set_op_params_i32(result, 0, (int32_t) K);
++    ggml_set_op_params_i32(result, 1, GGML_GDN_MODE_REPLAY);
 +
 +    result->op     = GGML_OP_GATED_DELTA_NET_REPLAY;
 +    result->src[0] = q;
