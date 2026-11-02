@@ -7,6 +7,7 @@
 // helper the round's depth `pos0 + 1` (the lane's slot tokens at the round's
 // start, scope: the round, not the request), so a later, shorter request on
 // the same slot drafts again.
+#include "config.h"
 #include "exec/spec_depth.h"
 #include "exec/verify_walk.h"
 #include "harness.h"
@@ -21,14 +22,22 @@ using namespace lgc;
 
 namespace {
 
+ArgParse parse(std::vector<const char*> args, Config& cfg) {
+    std::vector<char*> argv;
+    argv.push_back(const_cast<char*>("arcint"));
+    for (const char* a : args) argv.push_back(const_cast<char*>(a));
+    return parse_args(static_cast<int>(argv.size()), argv.data(), cfg);
+}
+
 constexpr size_t kVocab = 16;
 
 // The target's own greedy pick at position k -- a deterministic sequence, so
 // the two arms of a run compare tokens and not a random draw.
-int target_at(size_t k) { return static_cast<int>(100 + (k * 37) % 97); }
+int target_at(size_t k) { return static_cast<int>((k * 7 + 3) % kVocab); }
 
-// Rows whose argmax is `target_at(k)` for the k-th row of the round: row 0 is
-// the token after the round's id_last, row i+1 the token after draft i.
+// Rows whose argmax is `target_at(k)`: row i is the target's pick at the
+// position draft i stands for, so row 0 is the token after the round's
+// id_last and row i is the token the walk compares draft i-1 against.
 std::vector<float> rows_at(size_t emitted, size_t n_rows) {
     std::vector<float> r(n_rows * kVocab);
     for (size_t i = 0; i < n_rows; ++i)
@@ -51,9 +60,10 @@ struct Arm {
 };
 
 // The serving loop's round arithmetic, without a context: a lane whose slot
-// holds `prompt_len` tokens and emits greedily until `gen` tokens exist, the
-// oracle drafter proposing exactly the target's own next picks (full
-// acceptance, so the tokens cannot depend on where a draft came from).
+// holds `prompt_len` tokens and emits greedily until `gen` tokens exist. The
+// oracle drafter proposes the target's own pick at every second draft and a
+// wrong token at the others, so the walk has to reject drafts from the target's
+// row alone -- what a cutoff arm emits cannot depend on where a draft came from.
 Arm run(int depth_max, size_t prompt_len, int gen, int n_draft, int budget) {
     Arm a;
     size_t emitted = 0;
@@ -64,12 +74,15 @@ Arm run(int depth_max, size_t prompt_len, int gen, int n_draft, int budget) {
         const int    room  = std::min(budget, gen - static_cast<int>(emitted));
         const int    n_max = spec_width(n_draft, room, depth_max, depth);
         std::vector<int> draft;
-        for (int i = 0; i < n_max; ++i) draft.push_back(target_at(emitted + 1 + static_cast<size_t>(i)));
+        for (int i = 0; i < n_max; ++i) {
+            const int truth = target_at(emitted + static_cast<size_t>(i));
+            draft.push_back(i % 2 == 1 ? (truth + 5) % static_cast<int>(kVocab) : truth);
+        }
         a.proposed += static_cast<int>(draft.size());
         ++a.rounds;
         Sampler sampler(greedy(), 1);
         VerifyWalk w;
-        const std::vector<float> rows = rows_at(emitted, static_cast<size_t>(n_max) + 1);
+        std::vector<float> rows = rows_at(emitted, static_cast<size_t>(n_max) + 1);
         w = walk_verify(rows.data(), static_cast<size_t>(n_max) + 1, kVocab, draft, sampler, room,
                         [](int) { return false; },
                         [&](int tok) {
@@ -91,8 +104,10 @@ TEST(mtp_depth_off_is_the_width_as_before) {
     const int budgets[] = {-2, 0, 1, 2, 4, 8, 64};
     for (int c : ceil)
         for (int b : budgets)
-            for (size_t d : {size_t(0), size_t(1), size_t(4096), size_t(212992)})
-                CHECK_EQ(spec_width(c, b, 0, d), std::max(0, std::min(c, b - 1)));
+            for (size_t d : {size_t(0), size_t(1), size_t(4096), size_t(212992)}) {
+                const int want = std::max(0, std::min(c, b - 1));
+                CHECK_EQ(spec_width(c, b, 0, d), want);
+            }
 }
 
 TEST(mtp_depth_below_the_prompt_proposes_nothing) {
@@ -105,10 +120,11 @@ TEST(mtp_depth_below_the_prompt_proposes_nothing) {
 TEST(mtp_depth_at_the_cutoff_still_drafts_one_past_it_does_not) {
     CHECK(spec_drafting_at(512, 512));   // prompt.n_tokens() > N is the reference's rule
     CHECK(!spec_drafting_at(513, 512));
-    // 500-token prompt, 5 drafts: the rounds at depth 500, 506 and 512 draft
-    // (a 6-row verify each), the round at 518 drafts nothing
+    // 500-token prompt, 5 drafts: the second draft is wrong, so a drafting
+    // round emits two tokens and the depth grows by 2; the rounds at depth
+    // 500, 502, .., 512 draft (a 6-row verify each), the next one does not
     const Arm a = run(512, 500, 40, 5, 1000);
-    CHECK_EQ(a.proposed, 3 * 5);         // 512 - 500: three rounds of depth <= 512
+    CHECK_EQ(a.proposed, 7 * 5);         // 512 - 500 in steps of 2: seven rounds
     CHECK_EQ(a.out.size(), size_t(40));
 }
 
@@ -129,6 +145,7 @@ TEST(mtp_depth_greedy_stream_is_the_arms_with_drafts) {
     const Arm below = run(512, 900, 40, 5, 1000);   // cutoff under the prompt: 1-row
     CHECK(off.proposed > 0);
     CHECK_EQ(below.proposed, 0);
+    CHECK_EQ(below.out.size(), size_t(40));   // one token a round, no stop
     CHECK(off.out == below.out);   // the target's own picks, draft or not
 }
 
@@ -142,4 +159,20 @@ TEST(mtp_depth_reads_the_round_depth_at_the_loop_site) {
     ss << in.rdbuf();
     const std::string src = ss.str();
     CHECK(src.find("spec_width(n_draft_, budget, mtp_depth_max_, pos0 + 1)") != std::string::npos);
+}
+
+// The flag: 0 default (today), a token count past --llama-mtp, and its refusals
+TEST(mtp_depth_flag_defaults_off_and_needs_mtp) {
+    Config cfg;
+    CHECK(parse({"--gguf", "/m/q.gguf", "--llama-mtp", "5"}, cfg).ok);
+    CHECK_EQ(cfg.llama_mtp_depth_max, 0);
+    Config c2;
+    CHECK(parse({"--gguf", "/m/q.gguf", "--llama-mtp", "5", "--llama-mtp-depth-max", "32768"}, c2).ok);
+    CHECK_EQ(c2.llama_mtp_depth_max, 32768);
+    Config c3;
+    CHECK(!parse({"--gguf", "/m/q.gguf", "--llama-mtp", "5", "--llama-mtp-depth-max", "-1"}, c3).ok);
+    Config c4;
+    CHECK(!parse({"--gguf", "/m/q.gguf", "--llama-mtp", "5", "--llama-mtp-depth-max", "x"}, c4).ok);
+    Config c5;
+    CHECK(!parse({"--gguf", "/m/q.gguf", "--llama-mtp-depth-max", "32768"}, c5).ok);   // needs the drafter
 }

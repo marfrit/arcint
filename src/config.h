@@ -67,6 +67,14 @@ struct Config {
     // probability under the MTP head is at least P, and a draft below P is
     // not verified (Strata's --spec-min-p); 0 drafts --llama-mtp tokens always
     double llama_mtp_min_p = 0.0;
+    // --llama-mtp-depth-max N: past N tokens of a slot's context (prompt plus
+    // generated) the slot decodes one token a round without drafting
+    // (src/exec/spec_depth.h; the reference's --spec-draft-depth-max); 0 never
+    // stops (default, today's behaviour). The depth is the round's, so a later
+    // shorter request on the slot drafts again. Greedy picks are the same token
+    // either way; under sampling the text may differ by design (operator,
+    // 2026-11-02).
+    int llama_mtp_depth_max = 0;
     // --llama-mtp-policy off|cost: cost hands the chain to Strata's cost-aware
     // window rule (src/exec/draft_policy.h, campaign research-mtp-width-policy
     // 5.2) instead of the fixed --llama-mtp ceiling; off (default) is the fixed
