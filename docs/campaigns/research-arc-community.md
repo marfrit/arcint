@@ -88,12 +88,13 @@ What is portable to arcint's OpenCL kernels, by mechanism (`code`, fattn-dec.cpp
   operand, inline vISA), P.V as f16 DPAS with V dequantized in registers; K/V tiles staged through SLM with coalesced
   loads, the next phase's keys prefetched, the 256-register file for 3+ query tokens (their measurement: 6-17 %
   faster per layer at 128K). Their scalar predecessor was f32-ALU bound at 4 tokens (Q.K 163 + P.V 121 of 436 us a
-  layer at 16K). arcint's 0015 decode already reads q8_0 / q4_0 blocks directly (no per-call dequantization), but on
-  the ALUs, per row, up to 8 rows; whether its quantized decode shares the K/V read across a GQA group is not
-  verified yet (the kernel indexes `head_kv_idx = head_idx / (n_head / n_head_kv)` per query head). Our K is q8_0, so
-  the Q.K would be an s8 x s8 DPAS (native), V q4_0 as theirs. Lead: measure the attention share of a verify step at
-  depth on the agent (MTP 5, 6-token verify, 138K) and the coder (MTP 4) before porting; a 6-token verify is exactly
-  the batch their XMX kernel was built for.
+  layer at 16K). **Corrected the same day by the concept mining (`research-concept-mining/arc-b580/`, checked against
+  `contrib/llama.cpp/README.md`):** arcint's 0016 already takes the GQA-shared DPAS form on the B60 from 4 rows (one
+  work-group per KV head and split, QK and PV on XMX, after NInfer's small-T kernel); a quantized K is staged as f16 in
+  local memory first, and 1-3 rows stay on 0015's split ALU kernel; the A770 keeps 0015. What the fork adds is the
+  int8 DPAS straight on the cache's bytes (no f16 conversion; our direct-K form measured 30.7 against 52.6 t/s staged
+  because every sub-group converted the same blocks) and a staged DPAS kernel for 1-3 rows. Our K is q8_0, so the Q.K
+  would be an s8 x s8 DPAS.
 - **Gated DeltaNet single-token fusions** (conv chain, gate block, fused state writes; `GGML_SYCL_CONV_CHAIN`,
   `GGML_SYCL_DN_GATES`): the hybrid Qwens' linear-attention layers. To compare against what 0059-0066 already fuse.
 - **Two-pass top-k for long rows**, **same-input mat-vecs in one launch** (q/k/v, gate/up), **a sync trace that
