@@ -283,6 +283,7 @@ if(ARCINT_TESTS)
     tests/test_disconnect.cpp
     tests/test_responses.cpp
     tests/test_metrics.cpp
+    tests/test_slots.cpp
     tests/test_auth.cpp
     tests/test_reqid.cpp
     tests/test_tokenize.cpp
@@ -370,6 +371,14 @@ if(ARCINT_TESTS)
            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/metrics.sh"
                    "$<TARGET_FILE:arcint>")
   set_tests_properties(metrics PROPERTIES TIMEOUT 120 LABELS unit)
+
+  # ops: GET /slots is opt-in (--slots) and state-only. The HTTP half (route
+  # presence, the 401, one entry per slot, the busy slot's request id, and that
+  # no request text reaches the body) on the stub.
+  add_test(NAME slots
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/slots.sh"
+                   "$<TARGET_FILE:arcint>")
+  set_tests_properties(slots PROPERTIES TIMEOUT 120 LABELS unit)
 
   # ops item 2: the bearer key and the TLS flag pairing. The HTTP half (401s,
   # the /health exemption, preflight, the key file) on the stub.
