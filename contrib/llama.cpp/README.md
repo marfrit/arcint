@@ -6322,3 +6322,17 @@ answer gate failed, the output md5 differed and decode fell from 51 to 21 t/s. T
 `state_base_rd` (the cache row, rows form only) for the read, `state_base` (per sequence) for every write. The generic kernel (`gated_delta_net.cl`) had the same defect in its K == 1 final write only (its snapshots already used `state_out_base`); it now writes to `state_out_base` too. Why the card cases missed it: 0081 registered its rows cases only in `make_test_cases_perf`, which times and never compares; 0090 adds them (plus a small 2-sequence case) to the eval list.
 Device-free cell: `tests/python/test_gdn_rows_write_layout.py` (text). Card arm owed: test-backend-ops
 GATED_DELTA_NET rows cases on both cards and the coder's served A/B with the switch on.
+
+
+## 0091-replay-hybrid-input.patch
+
+Fixes 0086's replay (`LLAMA_GDN_REPLAY`) on hybrid models, which are all of ours (qwen35 / qwen4exp: attention
+plus gated delta-net). The replay controls (`s_rpl_rows`, `s_rpl_ctrl`, `s_rpl_wrow`) and the record count
+(`rpl_take`, which advances `rpl_n`) were filled only by `llm_graph_input_rs::set_input`. The three hybrid inputs
+(`llm_graph_input_mem_hybrid`, `_k`, `_iswa`) carry their own copy of the recurrent part and copied only `s_copy`,
+so on a hybrid model the controls stayed unset and no records were ever counted. The first draft rollback was then
+refused (`seq_rm: cannot roll back 4 tokens, only 0 kept`, then `llama.cpp refused the draft rollback` and HTTP 500;
+window 56, the agent on the B60, `measured-here`). One helper (`rs_set_input_rpl`, and `rs_can_reuse_rpl` for graph
+reuse) now serves the recurrent input and all three hybrid inputs. The op-level replay cases (test-backend-ops
+`GATED_DELTA_NET_REPLAY` chains) could not see this: they build the op, not a model's graph input. Device-free cell:
+`tests/python/test_gdn_replay_hybrid_input.py` (text). Card arm owed: the agent's served A/B with the switch on.
