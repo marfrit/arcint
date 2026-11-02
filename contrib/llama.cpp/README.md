@@ -5576,3 +5576,84 @@ Card arms (owed; Claude runs them in a card window, **not yet measured**):
    difference moves them). A direct per-row dump is not available in either
    arm; if the accept counters differ, the switch stays off and the finding is
    recorded, not absorbed.
+
+## 0081-llama-gdn-state-rows.patch
+
+The GDN recurrent state read straight from the cache. Ours gathers each layer's
+live state rows into a temp before the gated delta-net runs
+(`src/llama-graph.cpp`'s `build_rs`: `ggml_get_rows(states, state_copy)`), and the
+kernel then reads the temp; patch 0050 folds only the snapshot *writes* into the
+cache, so the gather and its ~3 MB a layer are paid every decode and verify
+(`code`, the drawn state; the fork's price is +3.8 % TG and a dirty temp slowing
+the next GEMV ~15 %, `paper`). **Evidence class of the mechanism: `code`** (fork
+9b4be76a1c; `arc-b580/src/models/qwen35.cpp`'s `build_rs_cache_view`, the CPU
+reference's `rows` mode over `src[6]` in `ggml/src/ggml-cpu/ops.cpp:10815-10845`,
+the SYCL kernels' `s_ids` and `s_row_stride` reads). Quality class `exact`: the
+bytes are the gathered row's (`code`; the fork measured 400 greedy tokens
+identical).
+
+The patch adds the rows form of the op — `ggml_gated_delta_net_rows(ctx, q, k,
+v, g, beta, states, rows, K)` sets `src[6]` to an I32 array of cache row indices
+over the 2D cache view (`states->ne[0] == D`, `rows->ne[0] == n_seqs`; output
+layout identical to the gathered form's) — and the build side:
+`build_rs_cache_view` returns the cache view after the same zero-state hygiene,
+gathers and relocates only the *extra* rows (`inp->s_copy_tail`, `n_rs - n_seqs`,
+the same destination `build_rs` writes), and the GDN op reads this sequence's
+live row `inp->s_copy_main[0]` inside the kernel. The three served archs
+(`qwen35`, `qwen35moe`, `qwen4exp`) pass the row index.
+
+**Switch `LLAMA_GDN_STATE_ROWS`, off by default** (`code`): `1` builds the rows
+form, `0` keeps the gather. With it off the graph and every op's arguments are
+as before, byte-identical. The build gate (`llama_gdn_state_rows_enabled`)
+declines a **multi-sequence** ubatch — `s_copy` may map a live row into the
+extra relocation's destination — and any batch the fused GDN op would not take
+(the autoregressive path needs a 4D state). The gate's single-sequence condition
+is the audit's, not a kernel limit (the CPU and OpenCL row reads take any
+`n_seqs`; the multi-sequence C arm proves it).
+
+**Ordering, stated plainly** (`code`): the extra relocation's cpy is expanded
+before the GDN, so a live row that fell inside its destination would be written
+before it is read. That is the fork's own documented hazard
+(`arc-b580/src/llama-graph.cpp:3684-3694`); with `n_rs_seq > 0` the live row maps
+into `rs_idx * size + src0` (rollback plane) while a reorder-less extra row maps
+into plane 0, so the served path's rows do not overlap — the multi-sequence
+decline keeps the general case out. Confirm it in the served arm: the answers
+and the draft acceptance counters equal (below).
+
+Device-free (`measured-here`): `tests/test_gdn_state_rows.cpp` runs both forms on
+the CPU backend at four shapes (one sequence with `ids[0] = 2`, two sequences
+with `ids {1, 3}` or `{2, 3}`, K = 1 and K = 3, three tokens) and requires the
+packed outputs — attention scores and snapshots — byte-identical; the cache is
+wider than the rows used, so a stride read from `nb[3]` cannot add up.
+`tests/python/test_gdn_state_rows.py` reads the patched tree for the switch's
+default, the multi-sequence decline, the fused-op term, the extra-only gather,
+the three archs' row index, `src[6]`, the CPU's `nb[1]` stride and
+`state_rows[iv3]`, both kernels' `rows[seq]` read and the dispatch. Red
+mutations run before restore (`measured-here` on the patched tree): the switch
+flipped on, the `n_seqs != 1` decline dropped, the fused-op term dropped, the
+main rows gathered again, the CPU's row index replaced by the ordinal, the
+Intel kernel's rows term dropped, the dispatch's `use_rows` forced to 0 — each
+made its cell fail; restored, it passes. The Python cell is a source-text
+assertion; the C cell is numeric.
+
+Card arms (owed; Claude runs them in a card window, **not yet measured**):
+1. **`test-backend-ops -o GATED_DELTA_NET`** from the series build on the B60
+   and the A770: `GGML_OPENCL_DEVICES=0:0 ./bin/test-backend-ops -b GPUOpenCL -o
+   GATED_DELTA_NET` (and `1:0` on the A770). The patch adds four rows cases (TG,
+   TG with 2 sequences, verify with K = 3 and 2 sequences, PP-64) whose reference
+   is the CPU rows form, so the kernel's row read is compared directly. Record
+   the pass count with and without the rows cases; expected: every existing case
+   unchanged and the four rows cases pass.
+   Red on the card: take the Intel kernel's `state_base` rows term out
+   (`use_rows ? ... : ...` -> `((ulong)seq * H_v + head) * state_size` in
+   `gated_delta_net_intel.cl`), rebuild, and the four rows cases fail; restore.
+2. **B60 agent (dense 27B), MTP 5, 138K needle from
+   `tests/acceptance/cells/served_check.py`**, two arms in one window:
+   `printf '#!/bin/sh\nexport LLAMA_GDN_STATE_ROWS=1\nexec %s "$@"\n' <arcint-binary> > /tmp/arcint-gdnrows && chmod +x /tmp/arcint-gdnrows`
+   `python3 tests/acceptance/ab.py agent --old <arcint-binary> --new /tmp/arcint-gdnrows --gguf <agent.gguf> --device GPU.0 --assets <assets> --rounds 2 --out /tmp/ab-81-agent`.
+   Record decode, prefill-55k/138k, `draft accept` and the texts md5. Bar: decode
+   >= +2.5 % with the same texts and acceptance (`paper` price +3.8 % TG); if the
+   texts differ or the acceptance counters move, the switch stays off and the
+   finding is recorded.
+3. The same with the coder on the A770 (`--device GPU.1`, `ab.py coder`, MTP 4)
+   and with Flash-Next (B60, MTP 3, IQ3_XXS): answers right, decode recorded.

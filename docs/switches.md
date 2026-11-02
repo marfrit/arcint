@@ -127,6 +127,7 @@ These names are not in a table:
 | `LLAMA_EXPERT_CACHE_SPARES` | 4 a layer (minimum 1 when set) | Spare bank entries a layer for swaps. | 0042 | ~263 MB more pinned host memory for Flash-Next (`measured-here`). |
 | `LLAMA_EXPERT_ROUTE_TRACE_MAX_MB` | 256 | MiB ceiling the routing trace rotates past; a non-numeric or non-positive value warns and keeps the default (0 used to mean rotate every record). | 0069 | `code`: 0069:685-701,1092. |
 | `LLAMA_SLOT_LOAN_CARD_MARGIN_MIB` | 1 GiB | The loan rule's fixed card margin in MiB; a missing, unreadable or non-positive value keeps 1 GiB, capped at 16 GiB. | 0068 | `code`: 0068:3540-3549. |
+| `LLAMA_GDN_STATE_ROWS` | off | `1`: the gated delta-net reads each sequence's live recurrent state straight from the cache at its row index (no `GET_ROWS` temp); single sequence only. | 0081 | `code`; the card arms are owed (README 0081). |
 | `LLAMA_MTP_KV_ONLY` | off | `1`: the MTP head's prompt catch-up decode (no output rows) builds up to the cache store and stops, the retained K/V rows identical to the full graph's. | 0080 | `code`; the card arms are owed (README 0080). |
 | `LLAMA_SLOT_LOAN_EXIT_IDLE_MS` | 2000 (4000 the ceiling) | Idle in ms before the loan's exit watchdog bounds the drain; the off words give 0, a typo keeps the default, capped below the watchdog bound. | 0068 | `code`: 0068:4312-4324. |
 | `LLAMA_SLOT_LOAN_PREFILL_GROWTH_MIB` | 0 | The prefill's growth band in MiB the kernel rule allows (zero margin); a non-numeric value keeps 0, capped at 16 GiB. | 0068 | `code`: 0068:3885-3895. |

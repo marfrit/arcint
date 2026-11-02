@@ -480,6 +480,22 @@ if(ARCINT_TESTS)
                      "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_mtp_kv_only.py")
     set_tests_properties(mtp-kv-only PROPERTIES LABELS unit)
+    # patch 0081's device-free cell: the gated delta-net's rows form reads each
+    # sequence's own cache row, and the packed output (attention scores plus the
+    # K snapshots) is byte-identical to the gathered form's, on the CPU backend.
+    add_executable(arcint-gdn-state-rows tests/test_gdn_state_rows.cpp)
+    target_link_libraries(arcint-gdn-state-rows PRIVATE arcint_core)
+    target_include_directories(arcint-gdn-state-rows PRIVATE "${ARCINT_LLAMA_DIR}/ggml/include")
+    target_compile_options(arcint-gdn-state-rows PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME gdn-state-rows COMMAND arcint-gdn-state-rows)
+    set_tests_properties(gdn-state-rows PROPERTIES LABELS unit)
+    # patch 0081's build gate, read out of the patched tree (LLAMA_SRC): the
+    # switch defaults off, one sequence only, the fused GDN the batch takes
+    add_test(NAME gdn-state-rows-gate
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_gdn_state_rows.py")
+    set_tests_properties(gdn-state-rows-gate PROPERTIES LABELS unit)
     add_test(NAME expert-profile-save
              COMMAND "${CMAKE_COMMAND}" -E env "EXPERT_PROFILE_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
                      "${Python3_EXECUTABLE}"
