@@ -3,6 +3,8 @@
 #include <atomic>
 #include <memory>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 
 #include <httplib.h>
@@ -14,6 +16,7 @@
 #include "api/error.h"
 #include "api/metrics.h"
 #include "api/renderer.h"
+#include "api/request_id.h"
 #include "api/responses.h"
 #include "api/responses_state.h"
 #include "api/responses_stream.h"
@@ -58,11 +61,32 @@ api::PeerProbe peer_probe(socket_t sock) {
     };
 }
 
+// X-Request-Id: resolved once per request, before routing, and carried on the
+// response object from there - into the route lambda (which copies it into the
+// prepared request struct) and into the logger. A value the client sent is kept
+// only if it fits api::resolve_request_id's grammar; the bytes it sent are never
+// logged, only the fact that they were replaced.
+void apply_request_id(const httplib::Request& req, httplib::Response& res) {
+    // Once per response. The expect-100 path resolves the id before routing and
+    // routing's own pre-routing handler runs afterwards for the same response;
+    // a second pass would mint a DIFFERENT id whenever the inbound value was
+    // unusable, and would log the replacement twice.
+    if (res.has_header(api::kRequestIdHeader)) return;
+    const api::RequestId rid = api::resolve_request_id(req.get_header_value(api::kRequestIdHeader));
+    res.set_header(api::kRequestIdHeader, rid.id);
+    if (rid.replaced) {
+        log::verbose("http",
+                     "inbound X-Request-Id is not usable (1..128 of [A-Za-z0-9._:-] expected); "
+                     "replaced by the generated id rid=%s",
+                     rid.id.c_str());
+    }
+}
+
 // One req: line per refusal at parse/prepare time (nothing answers it in the
 // log today otherwise, and the live run had to reproduce a 400 by hand). The
 // response bytes are unchanged; the numbers the envelope carries
 // (prompt_tokens/n_ctx on an overflow) go on the line.
-void log_refusal(const char* surface, const api::HttpResult& err) {
+void log_refusal(const char* surface, const api::HttpResult& err, std::string_view rid) {
     const json& e = err.body["error"];
     const std::string code = (e.contains("code") && e["code"].is_string())
                                 ? e["code"].get<std::string>() : "invalid_request";
@@ -73,9 +97,9 @@ void log_refusal(const char* surface, const api::HttpResult& err) {
         numbers += log::format(" prompt_tokens=%d", err.body["prompt_tokens"].get<int>());
     if (err.body.contains("n_ctx") && err.body["n_ctx"].is_number_integer())
         numbers += log::format(" n_ctx=%d", err.body["n_ctx"].get<int>());
-    log::warn("req", "%s refused: %d code=%s%s%s", surface, err.status, code.c_str(),
+    log::warn("req", "%s refused: %d code=%s%s%s%s", surface, err.status, code.c_str(),
               param.empty() ? "" : log::format(" param=%s", param.c_str()).c_str(),
-              numbers.c_str());
+              numbers.c_str(), api::rid_suffix(rid).c_str());
 }
 
 // The in-flight registry entry's life: removed on every exit, including an
@@ -220,7 +244,12 @@ void HttpServer::Impl::route() {
     }
 
     svr->set_logger([this](const httplib::Request& req, const httplib::Response& res) {
-        log::verbose("http", "%s %s -> %d", req.method.c_str(), req.path.c_str(), res.status);
+        // The id this request was answered with: the line a gateway log line is
+        // matched against. Empty only on a response that never resolved one
+        // (the post-routing backstop below normally covers that).
+        const std::string rid = api::rid_suffix(res.get_header_value(api::kRequestIdHeader));
+        log::verbose("http", "%s %s -> %d%s", req.method.c_str(), req.path.c_str(), res.status,
+                     rid.c_str());
         // The request counter reads the status the route actually committed,
         // refusals included (--metrics only).
         if (ctx.metrics != nullptr)
@@ -252,35 +281,58 @@ void HttpServer::Impl::route() {
         }
     });
 
-    // --api-key: the check runs in httplib's pre-routing handler, before the
-    // request body is read (third_party/httplib.h's Server::routing(): the
-    // pre_routing_handler_ call sits above the expect_content() block), so an
-    // unauthenticated POST up to the 64 MiB payload cap is refused unread and
-    // an unknown path is a 401 rather than a route probe. /health stays open
-    // for probes -- it reveals the served model id, an intended trade-off --
-    // and a CORS preflight cannot carry the key.
+    // X-Request-Id, every request, with or without --api-key. httplib installs
+    // exactly ONE pre-routing handler (set_pre_routing_handler assigns), and
+    // Server::routing() calls it above the expect_content() block, so the id is
+    // resolved before the body is read and before the auth check can answer a
+    // 401 - the auth check therefore rides in this same handler.
+    svr->set_pre_routing_handler(
+        [this](const httplib::Request& req, httplib::Response& res) {
+            apply_request_id(req, res);
+            if (!cfg.api_key_sha256.empty() && !auth_exempt(req) && !authorized(req, res))
+                return httplib::Server::HandlerResponse::Handled;
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
+    // A response written without ever routing - a 414 for an over-long request
+    // URI is set in handle_request above the routing() call - still carries the
+    // header: post_routing_handler_ runs in write_response_core before the
+    // status line and headers go out, which is also what puts the id on an SSE
+    // response before its first chunk.
+    svr->set_post_routing_handler([](const httplib::Request&, httplib::Response& res) {
+        if (res.get_header_value(api::kRequestIdHeader).empty())
+            res.set_header(api::kRequestIdHeader, api::new_request_id());
+    });
+
+    // --api-key: the check itself runs in the pre-routing handler above, before
+    // the request body is read, so an unauthenticated POST up to the 64 MiB
+    // payload cap is refused unread and an unknown path is a 401 rather than a
+    // route probe. /health stays open for probes -- it reveals the served model
+    // id, an intended trade-off -- and a CORS preflight cannot carry the key.
     if (!cfg.api_key_sha256.empty()) {
         // The permissive CORS a secured browser client needs to read the
-        // responses it was allowed to send (401s included).
-        svr->set_default_headers({{"Access-Control-Allow-Origin", "*"}});
+        // responses it was allowed to send (401s included). X-Request-Id is both
+        // allowed on the way in and exposed on the way out, or a browser client
+        // could send an id but never read one back.
+        svr->set_default_headers({{"Access-Control-Allow-Origin", "*"},
+                                 {"Access-Control-Expose-Headers", api::kRequestIdHeader}});
         svr->Options(R"(.*)", [](const httplib::Request&, httplib::Response& res) {
             res.status = 204;
             res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            res.set_header("Access-Control-Allow-Headers", "Authorization, Content-Type");
+            res.set_header("Access-Control-Allow-Headers",
+                           std::string("Authorization, Content-Type, ") + api::kRequestIdHeader);
             res.set_header("Access-Control-Max-Age", "86400");
         });
-        svr->set_pre_routing_handler(
-            [this](const httplib::Request& req, httplib::Response& res) {
-                if (auth_exempt(req)) return httplib::Server::HandlerResponse::Unhandled;
-                if (!authorized(req, res)) return httplib::Server::HandlerResponse::Handled;
-                return httplib::Server::HandlerResponse::Unhandled;
-            });
         // httplib writes 100 Continue above routing, so an unauthenticated
         // request with Expect: 100-continue would be answered 100 before the
         // pre-routing 401. Answer the 401 here instead; httplib then closes
         // the connection (the default arm) without reading the body.
         svr->set_expect_100_continue_handler(
             [this](const httplib::Request& req, httplib::Response& res) -> int {
+                // Above routing() as well, so this is where the id has to be
+                // resolved when this handler is the one answering the 401: the
+                // pre-routing handler never sees the request. Resolved here, it
+                // is the same id the rest of the response would have carried.
+                apply_request_id(req, res);
                 if (auth_exempt(req)) return 100;
                 if (!authorized(req, res)) return 401;
                 return 100;
@@ -352,6 +404,9 @@ void HttpServer::Impl::route() {
         if (!read_json(req, res, body)) return;
 
         auto prep = std::make_shared<api::PreparedSpeech>();
+        // The id resolved in the pre-routing handler, off the response it is
+        // answered with: from here every log line of this request names it.
+        prep->request_id = res.get_header_value(api::kRequestIdHeader);
         if (auto err = api::prepare_speech(ctx, body, *prep)) {
             send_json(res, err->status, err->body);
             return;
@@ -380,6 +435,10 @@ void HttpServer::Impl::route() {
         if (!read_json(req, res, body)) return;
 
         auto prep = std::make_shared<api::PreparedChat>();
+        // The id resolved in the pre-routing handler, off the response it is
+        // answered with: from here every log line of this request names it. Set
+        // before prepare_*, which fills the struct's other fields.
+        prep->request_id = res.get_header_value(api::kRequestIdHeader);
         if (auto err = api::prepare_chat(ctx, body, *prep)) {
             send_json(res, err->status, err->body);
             return;
@@ -486,21 +545,24 @@ void HttpServer::Impl::route() {
             const api::HttpResult err{400, api::responses_error(
                 log::format("request body is not valid JSON: %s", e.what()),
                 "invalid_request", "invalid_request")};
-            log_refusal("responses", err);
+            log_refusal("responses", err, res.get_header_value(api::kRequestIdHeader));
             send_json(res, err.status, err.body);
             return;
         }
 
         api::ResponseRequest parsed;
         if (auto err = api::parse_response_request(body, parsed)) {
-            log_refusal("responses", *err);
+            log_refusal("responses", *err, res.get_header_value(api::kRequestIdHeader));
             send_json(res, err->status, err->body);
             return;
         }
 
         auto prep = std::make_shared<api::PreparedResponse>();
+        // The chat half of the struct carries the request id (PreparedResponse
+        // embeds PreparedChat), so the responses path logs the same id.
+        prep->chat.request_id = res.get_header_value(api::kRequestIdHeader);
         if (auto err = api::prepare_response(ctx, std::move(parsed), *prep)) {
-            log_refusal("responses", *err);
+            log_refusal("responses", *err, res.get_header_value(api::kRequestIdHeader));
             send_json(res, err->status, err->body);
             return;
         }
@@ -576,6 +638,7 @@ void HttpServer::Impl::route() {
         if (!read_json(req, res, body)) return;
 
         auto prep = std::make_shared<api::PreparedCompletion>();
+        prep->request_id = res.get_header_value(api::kRequestIdHeader);
         if (auto err = api::prepare_completion(ctx, body, *prep)) {
             send_json(res, err->status, err->body);
             return;

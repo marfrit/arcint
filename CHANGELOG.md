@@ -18,6 +18,50 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.4.2 — 2026-11-02
+
+One HTTP-surface addition: every request carries an id, so a gateway's log line
+and arcint's log lines for the same request can be matched.
+
+- **`X-Request-Id`** (`measured-here`, `tests/reqid.sh`, `tests/test_reqid.cpp`):
+  a value the caller sends is taken over when it is 1..128 characters from
+  `[A-Za-z0-9._:-]`; absent, empty or anything else becomes a generated `req-`
+  plus 16 lowercase hex characters (one 64-bit draw per thread, not a counter).
+  A replacement is not an error — the request is served — and the bytes the
+  caller sent reach neither a response header nor a log line: that is what the
+  narrow grammar buys, since CR, LF, SP, HTAB, every non-ASCII byte and every
+  log-field separator fall outside it. The header is on successes, on
+  400/401/404/409/500, on the pre-routing auth refusal, on a CORS preflight and
+  on SSE responses before the first chunk (`code`, httplib's pre-routing handler
+  runs before routing, so the id is resolved once for every request). A request
+  refused by the `Expect: 100-continue` handler -- which runs above routing, so
+  the pre-routing handler never sees it -- resolves the id there instead, so its
+  401 carries the caller's id and not a fresh one (`measured-here`).
+- **` rid=<id>` on the request's own log lines** (`measured-here`): the http
+  logger line, the refusal lines, the per-request prefill/decode summary and its
+  abort line. The id rides on the prepared request struct the handlers already
+  pass down; no globals, and the lines outside a request keep their old shape.
+  JSON bodies, the Responses objects and `/metrics` are unchanged — no new
+  field, no id label (cardinality).
+- **CORS**: with `--api-key` on, `X-Request-Id` joins `Access-Control-Allow-Headers`
+  and is named in `Access-Control-Expose-Headers`, so a browser client can read
+  it back.
+
+Implemented by Qwen3.8-Flash-Next, served by arcint itself in token mode (HTTP
+plumbing only; no generation, sampling or template path). The gateway half (llm-proxy 1.3.2:
+one id per request, sent and logged) follows this release.
+
+Release gate (window 53, `measured-here`, the release candidate against 1.4.1 in the same
+window): Flash-Next prefill 534.93 against 535.33 t/s and decode 34.03 against 32.83 t/s
+(three rounds, inside the old arm's spread); the coder's decode equal and its answers
+byte-identical, the acceptance task 10/10 greedy x3; the agent's prefill equal and its
+answers byte-identical. On the release candidate: a caller's id is echoed, an absent one
+generated, an invalid one replaced, and a chat request's id is on its prefill and decode
+lines.
+
+Runtime dependency unchanged: llama.cpp 3e4dfa8 with `contrib/llama.cpp/patches`
+0001-0079 (0031, 0055, 0061, 0073, 0076, 0078 not carried).
+
 ## 1.4.1 — 2026-11-02
 
 One patch dropped, nothing added: Flash-Next decodes at 1.3.0's rate again.
