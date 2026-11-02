@@ -51,6 +51,14 @@ Implemented by Qwen3.8-Flash-Next, served by arcint itself in token mode (HTTP
 plumbing only; no generation, sampling or template path). The gateway half (llm-proxy 1.3.2:
 one id per request, sent and logged) follows this release.
 
+Release gate (window 53, `measured-here`, the release candidate against 1.4.1 in the same
+window): Flash-Next prefill 534.93 against 535.33 t/s and decode 34.03 against 32.83 t/s
+(three rounds, inside the old arm's spread); the coder's decode equal and its answers
+byte-identical, the acceptance task 10/10 greedy x3; the agent's prefill equal and its
+answers byte-identical. On the release candidate: a caller's id is echoed, an absent one
+generated, an invalid one replaced, and a chat request's id is on its prefill and decode
+lines.
+
 Runtime dependency unchanged: llama.cpp 3e4dfa8 with `contrib/llama.cpp/patches`
 0001-0079 (0031, 0055, 0061, 0073, 0076, 0078 not carried).
 
