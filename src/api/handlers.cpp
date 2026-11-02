@@ -507,6 +507,11 @@ json props(const Context& ctx) {
                  // the table it has learned so far (null when the policy is off).
                  // Section 5.2's "/props reports the policy and the learned table".
                  {"policy", std::string(cfg.llama_mtp_policy ? "cost" : "off")},
+                 // --llama-mtp-depth-max: the active draft cutoff in tokens, 0
+                 // for none (concept-mining item 6, src/exec/spec_depth.h). A
+                 // turn that decodes slower/differently past a depth is
+                 // explained here.
+                 {"depth_max", cfg.llama_mtp_depth_max},
                  {"cost_table", [&]() {
                       const std::string t = ctx.backend->mtp_cost_table();
                       return t.empty() ? json(nullptr) : json(t);

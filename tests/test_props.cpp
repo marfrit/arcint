@@ -440,3 +440,18 @@ TEST(props_reports_the_loop_guard_switch_and_thresholds) {
     CHECK_EQ(lg.at("grace").get<int>(), 30);
     CHECK_EQ(lg.at("door_grace").get<int>(), 15);
 }
+
+// concept-mining item 6: /props names the active MTP draft cutoff, beside the
+// other MTP settings, so a turn that decodes past a depth is explained.
+TEST(props_reports_the_mtp_draft_depth_cutoff) {
+    Config     cfg;
+    cfg.llama_mtp = 5;
+    FakeBackend backend;
+    backend.st.loaded      = true;
+    backend.st.mtp_enabled = true;
+    SlotPool slots(1);
+    Context  ctx{&cfg, &backend, &slots};
+    CHECK_EQ(lgc::api::props(ctx).at("mtp").at("depth_max").get<int>(), 0);
+    cfg.llama_mtp_depth_max = 32768;
+    CHECK_EQ(lgc::api::props(ctx).at("mtp").at("depth_max").get<int>(), 32768);
+}
