@@ -71,3 +71,38 @@ The stock path is far behind ours on the B-series: 8.3 t/s for a qwen35moe
 Q8_0 on llama.cpp SYCL (`paper`) against arcint's coder at 44-79 t/s on the
 A770 (different quant, card and configuration; not a like-for-like
 comparison).
+
+## Addendum 2026-11-02: Torchit1's llama.cpp `arc-b580` branch
+
+Source: the fork's branch `arc-b580` (head `e04b0cd4`, 222 commits on upstream `5ea87dd`), its guide
+`docs/bonsai-arc-b580.md` and `ggml/src/ggml-sycl/fattn-dec.cpp` (`code`, read 2026-11-02). Target: one Arc B580
+(Xe2, the B60's family), Linux, oneAPI 2025.3, Level Zero 26.35, PrismML's ternary Bonsai 2 27B (a Qwen3.5-style hybrid
+with an MTP head) and Gemma 4 12B, 128K context, q4_0 KV cache. The guide's numbers are the fork's (`paper` for us):
+Bonsai fresh code 90 t/s with MTP drafts, 42 t/s plain, 44 t/s new code at ~115K context; Gemma 4 12B QAT q4_0 from
+~40 to ~102 t/s on new code with its drafter.
+
+What is portable to arcint's OpenCL kernels, by mechanism (`code`, fattn-dec.cpp's own comments and kernels):
+- **Decode and verify attention straight from the quantized cache on XMX** (`GGML_SYCL_FA_DEC_DPAS`, opt-in): one
+  work-group per KV head and a context slice serves all G query heads of the GQA group and all verify tokens from one
+  read (flash-decoding); Q.K as s8 x s4 DPAS (Q rows quantized to int8 once a call, the q4_0 bytes XOR 0x88 as the B
+  operand, inline vISA), P.V as f16 DPAS with V dequantized in registers; K/V tiles staged through SLM with coalesced
+  loads, the next phase's keys prefetched, the 256-register file for 3+ query tokens (their measurement: 6-17 %
+  faster per layer at 128K). Their scalar predecessor was f32-ALU bound at 4 tokens (Q.K 163 + P.V 121 of 436 us a
+  layer at 16K). arcint's 0015 decode already reads q8_0 / q4_0 blocks directly (no per-call dequantization), but on
+  the ALUs, per row, up to 8 rows; whether its quantized decode shares the K/V read across a GQA group is not
+  verified yet (the kernel indexes `head_kv_idx = head_idx / (n_head / n_head_kv)` per query head). Our K is q8_0, so
+  the Q.K would be an s8 x s8 DPAS (native), V q4_0 as theirs. Lead: measure the attention share of a verify step at
+  depth on the agent (MTP 5, 6-token verify, 138K) and the coder (MTP 4) before porting; a 6-token verify is exactly
+  the batch their XMX kernel was built for.
+- **Gated DeltaNet single-token fusions** (conv chain, gate block, fused state writes; `GGML_SYCL_CONV_CHAIN`,
+  `GGML_SYCL_DN_GATES`): the hybrid Qwens' linear-attention layers. To compare against what 0059-0066 already fuse.
+- **Two-pass top-k for long rows**, **same-input mat-vecs in one launch** (q/k/v, gate/up), **a sync trace that
+  attributes every synchronize** (`GGML_SYCL_SYNC_TRACE`): the last is a cheap diagnostic worth copying.
+- **Their MTP draft chain measured -0.2 to -0.8 % on the B580** and is off by default; "one slot per card, keep n-gram
+  drafts on" (their serving notes, B70s 31-74 % acceptance at one slot against 21-31 % at four).
+
+A record to re-test, not a mechanism: they run **SYCL on Linux on a B580, which only the xe kernel driver supports**, and
+default to the legacy Level Zero adapter (`SYCL_UR_USE_LEVEL_ZERO_V2` opt-in) as faster. arcint's record says SYCL is
+dead under xe (a memcpy abort). That negative predates this and may have been the V2 adapter or the L0 loader
+(memory: oneAPI 2026.1 needs a newer loader); by the reference-audit rule it is not settled until the legacy adapter
+is tried on the B60.
