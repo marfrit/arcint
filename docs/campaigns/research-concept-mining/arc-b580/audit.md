@@ -193,6 +193,22 @@ listed, not audited. #6 and #10 are listed with the reason.
 - **Implementation sketch**: a per-slot cutoff in the server's speculative hook and a sweep to set
   it; no kernel work. **Red-first test**: the greedy token stream before and after the cutoff is
   identical on a prompt shorter than the cutoff, and the verify hook is skipped past it.
+- **Disposition (2026-11-02, package C)** (`code`): **the verify keeps the target's distribution exactly**, so
+  the cutoff cannot change quality. `src/exec/verify_walk.h:36` samples each verified row with the
+  sampler's state as of that token (history fed at `:49`) and keeps a draft only when the drawn token
+  equals it (`:72`); call site `src/exec/backend_llama.cpp:2166`. Every emitted token is the sample the
+  plain loop would draw at that point, and a mismatch ends the walk, so the sampler's stream advances
+  once per emitted token, never over a dropped draft. That is sample-and-compare, not llama.cpp's
+  rejection sampler; it needs no importance correction, and it is not a rejection-sampling
+  approximation. Built as the arcint flag `--llama-mtp-depth-max N` (0 off = today, byte-identical),
+  `/props mtp.depth_max`, the round's width from `src/exec/spec_depth.h` at the loop's live depth
+  `pos0 + 1` (`backend_llama.cpp:2104`), so a shorter later request on the slot drafts again; the MTP
+  context stays fed. Cells `tests/test_mtp_depth.cpp` (7, plus `/props` in `tests/test_props.cpp`),
+  red cases a-e in the commit. **Not owed any more**: the distribution check. **Owed to a card window**:
+  the B60 agent MTP 5 and Flash-Next MTP 3 at 8K/64K/138K greedy, arms off/24K/32K/64K, decode t/s
+  and the answers; the coder (A770, MTP 4, 98K) at 8K/48K/90K -- the driver
+  `tests/acceptance/cells/mtp_depth_sweep.py` (one server an arm, a needle a depth, the verify count a
+  depth as the mechanism check) and the exact commands in the handover.
 
 ## 7. Sampler top-k on a long vocabulary
 

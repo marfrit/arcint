@@ -215,9 +215,10 @@
 - KV: llama.cpp's cache, --llama-kv f16 | q8_0 | q8_0:q4_0 (others refused);
   --llama-reserve-cells N reserves compute buffers for N cells.
 - Speculative decoding: the model's own MTP head (--llama-mtp N), draft 0
-  from the catch-up batch, --llama-mtp-min-p stop, verify walk in the
-  sampler's order (greedy and seeded sampled); rollback by recurrent
-  snapshot. Both lanes busy: one draft loop and one verify for both.
+  from the catch-up batch, --llama-mtp-min-p stop, --llama-mtp-depth-max
+  cutoff, verify walk in the sampler's order (greedy and seeded sampled);
+  rollback by recurrent snapshot. Both lanes busy: one draft loop and one
+  verify for both.
   Or a DFlash2 drafter (--llama-dflash-gguf FILE, --llama-dflash N up to
   7, --llama-dflash-min-p P; llama.cpp's draft-dflash on libllama): a block
   a drafter pass from the target's layer inputs, the selector's lattice
@@ -309,7 +310,9 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
   --chat-template-kwarg enable_thinking=BOOL.
 - --llama-kv K[:V]; --llama-threads N; --llama-reserve-cells N.
 - --llama-mtp N, --llama-mtp-gguf FILE, --llama-mtp-vocab FILE,
-  --llama-mtp-min-p P, --llama-mtp-card N.
+  --llama-mtp-min-p P, --llama-mtp-card N, --llama-mtp-depth-max N (0, off:
+  past N tokens of a slot's context it decodes one token a round without
+  drafting; /props mtp.depth_max).
 - --llama-dflash-gguf FILE, --llama-dflash N (7), --llama-dflash-min-p P,
   --llama-dflash-ubatch N (64).
 - --llama-checkpoints N (32), --llama-checkpoint-step T (8192).
