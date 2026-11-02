@@ -554,6 +554,21 @@ if(ARCINT_TESTS)
                      "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_expert_profile_save.py")
     set_tests_properties(expert-profile-save PROPERTIES LABELS unit)
+    # patches 0088/0089's device-free cell: the int8 Q K^T's q8_0 block
+    # offsets, its RNE Q quantizer and the S selftest against the f16 form, read
+    # out of the kernel's own .inc (the text the backend prepends). The dispatch
+    # and the switch, read out of the patched tree, are the python gate below.
+    add_executable(arcint-fa-gqa-i8 tests/test_fa_gqa_i8.cpp)
+    target_include_directories(arcint-fa-gqa-i8 PRIVATE
+        "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl/kernels")
+    target_compile_options(arcint-fa-gqa-i8 PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME fa-gqa-i8 COMMAND arcint-fa-gqa-i8)
+    set_tests_properties(fa-gqa-i8 PROPERTIES LABELS unit)
+    add_test(NAME fa-gqa-i8-gate
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_fa_gqa_i8.py")
+    set_tests_properties(fa-gqa-i8-gate PROPERTIES LABELS unit)
   endif()
 endif()
 
