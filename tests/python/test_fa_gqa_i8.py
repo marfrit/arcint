@@ -16,6 +16,9 @@ Red mutations, each run and seen failing before it was restored:
       the default-off cell fails;
   (b) the KT 1 guard dropped (`true` for the q8_0 term): the build cell fails;
   (c) the staged dispatch dropped (`n_q < 4` -> false): the routing cell fails;
+  (c2) fa_gqa_i8_stage_rows returning the tile count (the pre-fix extent, no
+       `* 8`): the staging cell and the C cell's S cells fail -- the card's 135
+       of 135 FLASH_ATTN_EXT cases at ERR ~0.10;
   (d) fa_gqa_i8_qs reads 34 * b + 18 (the block's second half): the offset
       assertion fails here and the C++ cell's S selftest fails.
 Source-text assertions, not numerics.
@@ -107,9 +110,21 @@ class FaGqaI8(unittest.TestCase):
         # P V stays the f16 DPAS: the P V loop calls DPAS(, not DPAS8(
         pv = k[k.find("for (int i = 0; i < NDH; ++i) {"):]
         self.assertIn("acc = DPAS(pa[g], b, acc);", pv, "P V must stay f16 DPAS")
+        self.assertIn("fa_gqa_i8_stage_rows(n_rows) * QB", k,
+                      "the Q staging covers every row of every row tile (the card's red)")
+        self.assertNotIn("rt_max * QB", k, "the pre-fix tile-count extent staged only some rows")
         self.assertIn("#if GQA_ST && GQA_I8 && KT == 1", k, "the staged raw K copy is 0089's")
         self.assertIn("ks8[key * KSTR + d] = ((const global uint *)(kb + kk * k_nb1))[d];", k,
                       "the staged copy is coalesced dwords of the raw row")
+
+    def test_staging_covers_every_row(self):
+        o = self.t[OPS]
+        self.assertIn("static inline int fa_gqa_i8_stage_rows(int n_rows) {", o,
+                      "the staging extent is one text the kernel and the cell read")
+        self.assertIn("return (tiles > 8 ? 8 : tiles) * 8;", o,
+                      "every row of every row tile, not the tile count")
+        self.assertNotIn("return (tiles > 8 ? 8 : tiles);", o,
+                         "the pre-fix extent returned the tile count: rows 1.. were unstaged")
 
     def test_ops_arithmetic(self):
         o = self.t[OPS]

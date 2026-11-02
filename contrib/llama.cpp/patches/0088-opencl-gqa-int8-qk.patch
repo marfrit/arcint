@@ -27,10 +27,10 @@ index 6565d38..eafa76b 100644
      add
      add_id
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 1dc828e..263548e 100644
+index 344662c..367bfda 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -4859,24 +4859,47 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -4873,24 +4873,47 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
              // for the dispatch (one value for both)
              const char * fgs_env = getenv("GGML_OPENCL_FA_GQA_SIDES");
              const int    fg_sides = fgs_env ? atoi(fgs_env) : 2;
@@ -81,7 +81,7 @@ index 1dc828e..263548e 100644
                          if (pg == nullptr) continue;
                          cl_kernel kg = clCreateKernel(pg, "flash_attn_gqa_dpas", &err);
                          if (err == CL_SUCCESS) {
-@@ -4897,6 +4920,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -4911,6 +4934,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                  if (backend_ctx->kernel_fa_gqa_dk[0][0] == nullptr) {
                      GGML_LOG_WARN("ggml_opencl: flash_attn_gqa_dpas.cl not built; flash_attn_f32_f16.cl takes decode\n");
                  }
@@ -93,10 +93,10 @@ index 1dc828e..263548e 100644
          } else if (!sg8 && !sg16) {
 diff --git a/ggml/src/ggml-opencl/kernels/fa_gqa_i8_ops.inc b/ggml/src/ggml-opencl/kernels/fa_gqa_i8_ops.inc
 new file mode 100644
-index 0000000..1d7b8c4
+index 0000000..fbfb6ce
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/kernels/fa_gqa_i8_ops.inc
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,87 @@
 +// 0088: the int8 Q K^T of `flash_attn_gqa_dpas.cl` -- the once-a-call Q
 +// quantization, the q8_0 block arithmetic and the staged row layout, one text
 +// for the kernel (prepended by the backend at build time, as 0071 does with
@@ -145,6 +145,18 @@ index 0000000..1d7b8c4
 +static inline int fa_gqa_i8_row_dw(int dk) { return (dk / 32) * 34 / 4; }
 +static inline int fa_gqa_i8_stride_dw(int dk) { return fa_gqa_i8_row_dw(dk) + 1; }
 +
++// ---- the rows the Q staging loop covers ----
++// The a operand holds 8 row tiles of 8 (head, token) rows; vertices of a tile
++// are staged here once a call. Every row of every tile the batch needs must be
++// written: a row left unwritten is whatever the local allocation held, and its
++// S is then that garbage (the card's red: 135 of 135 FLASH_ATTN_EXT cases at
++// ERR ~0.10). Rows past n_rows are staged as zeros with dq 0, which is the f16
++// path's zero Q row.
++static inline int fa_gqa_i8_stage_rows(int n_rows) {
++    const int tiles = (n_rows + 7) / 8;
++    return (tiles > 8 ? 8 : tiles) * 8;
++}
++
 +// ---- Q quantization: one RNE scale per row per 32-dim block ----
 +static inline float fa_gqa_i8_amax32(const float x[32]) {
 +    float a = 0.f;
@@ -173,7 +185,7 @@ index 0000000..1d7b8c4
 +
 +#endif
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
-index f175e14..dbca1ef 100644
+index f175e14..1df60db 100644
 --- a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
 @@ -3,6 +3,8 @@
@@ -258,7 +270,7 @@ index f175e14..dbca1ef 100644
  #endif
      local half vt[DV * BK];     // [column][key]
  #ifdef GQA_S_SPLIT
-@@ -179,6 +223,35 @@ kernel void flash_attn_gqa_dpas(
+@@ -179,6 +223,36 @@ kernel void flash_attn_gqa_dpas(
      for (int i = 0; i < NDH; ++i) o[i] = (float8)(0.f);
  
      // Q (scaled, half) as the a operand: component r = row r, lane = column
@@ -267,8 +279,9 @@ index f175e14..dbca1ef 100644
 +    // sub-group's QK^T then reads the a operand from local memory (the rows
 +    // are shared by the sides, so the quantization is done by the work-group)
 +    {
-+        const int rt_max = min((n_rows + 7) / 8, 8);
-+        for (int e = lid; e < rt_max * QB; e += nthr) {
++        // every row of every row tile the batch needs, not the tile count:
++        // (row, block) pairs a call (see fa_gqa_i8_stage_rows)
++        for (int e = lid; e < fa_gqa_i8_stage_rows(n_rows) * QB; e += nthr) {
 +            const int r = e / QB, b = e % QB;
 +            float x[32];
 +            if (r < n_rows) {
@@ -294,7 +307,7 @@ index f175e14..dbca1ef 100644
      short8 qa[KC];
      for (int c = 0; c < KC; ++c) {
          half qv[8];
-@@ -189,6 +262,7 @@ kernel void flash_attn_gqa_dpas(
+@@ -189,6 +263,7 @@ kernel void flash_attn_gqa_dpas(
          }
          qa[c] = as_short8((half8)(qv[0], qv[1], qv[2], qv[3], qv[4], qv[5], qv[6], qv[7]));
      }
@@ -302,7 +315,7 @@ index f175e14..dbca1ef 100644
      const global char * kb = (const global char *) k_void + k_offset + batch * k_nb3 + hk * k_nb2;
      const global char * vb = (const global char *) v_void + v_offset + batch * v_nb3 + hk * v_nb2;
      const global half * mrow[8];
-@@ -201,7 +275,7 @@ kernel void flash_attn_gqa_dpas(
+@@ -201,7 +276,7 @@ kernel void flash_attn_gqa_dpas(
  
      for (int k0 = kv_start; k0 < kv_end; k0 += BK) {
          barrier(CLK_LOCAL_MEM_FENCE);
@@ -311,7 +324,7 @@ index f175e14..dbca1ef 100644
          for (int u = lid; u < BK * DK / 64; u += nthr) {
              const int key = u / (DK / 64), c64 = u % (DK / 64), kk = min(k0 + key, kv_end - 1);
              const global char * krow = kb + kk * k_nb1;
-@@ -214,6 +288,7 @@ kernel void flash_attn_gqa_dpas(
+@@ -214,6 +289,7 @@ kernel void flash_attn_gqa_dpas(
          // QK^T; K direct (f16) reads global and needs none
          barrier(CLK_LOCAL_MEM_FENCE);
  #endif
@@ -319,7 +332,7 @@ index f175e14..dbca1ef 100644
          // QK^T
          float8 s[NKB];
          for (int g = 0; g < NKB; ++g) {
-@@ -221,6 +296,20 @@ kernel void flash_attn_gqa_dpas(
+@@ -221,6 +297,20 @@ kernel void flash_attn_gqa_dpas(
              if (g % GQA_SIDES != side) continue;
  #endif
              float8 acc = (float8)(0.f);
@@ -340,7 +353,7 @@ index f175e14..dbca1ef 100644
              for (int c = 0; c < KC; ++c) {
  #ifndef GQA_K_STAGED
                  const int8 b = kb16(KT, kb + min(k0 + g * 16 + lane, kv_end - 1) * k_nb1, c);
-@@ -229,6 +318,7 @@ kernel void flash_attn_gqa_dpas(
+@@ -229,6 +319,7 @@ kernel void flash_attn_gqa_dpas(
  #endif
                  acc = DPAS(qa[c], b, acc);
              }
@@ -349,10 +362,10 @@ index f175e14..dbca1ef 100644
  #ifdef GQA_S_SPLIT
              vstore8(acc, 0, sx + ((tile * NKB + g) * 16 + lane) * 8);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index a32f2ed..87945b0 100644
+index 7813dfd..e53017f 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -12321,6 +12321,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12509,6 +12509,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
              }
          }
      }
@@ -373,7 +386,7 @@ index a32f2ed..87945b0 100644
      // Mistral Small 24B's geometry (head size 128, 32 query heads on 8):
      // decode, verify rows, prompts; f16 and quantized K/V
      for (auto kv_t : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},
-@@ -12754,6 +12768,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -12953,6 +12967,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
              }
          }
      }

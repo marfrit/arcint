@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 263548e..946dd6e 100644
+index 367bfda..ab0bf91 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -1293,6 +1293,9 @@ struct ggml_backend_opencl_context {
@@ -12,7 +12,7 @@ index 263548e..946dd6e 100644
      int       fa_gqa_sides = 2;                   // sub-groups per 8 rows the kernels were built for
      int       fa_dpas_bq = 0, fa_dpas_nthr = 0;   // query rows and work-items a work-group
      cl_kernel kernel_gdn_intel_pp = nullptr;
-@@ -4917,6 +4920,44 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -4931,6 +4934,44 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                          CL_CHECK(clReleaseProgram(pg));
                      }
                  }
@@ -57,7 +57,7 @@ index 263548e..946dd6e 100644
                  if (backend_ctx->kernel_fa_gqa_dk[0][0] == nullptr) {
                      GGML_LOG_WARN("ggml_opencl: flash_attn_gqa_dpas.cl not built; flash_attn_f32_f16.cl takes decode\n");
                  }
-@@ -23222,8 +23263,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -23259,8 +23300,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      if (use_fd_intel && n_q >= fg_min_rows && fa_dki >= 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
          n_head_kv > 0 && n_head % n_head_kv == 0 && (n_head / n_head_kv) * n_q <= 64) {
          const int gi = is_mixed ? 0 : kvq >= 0 ? kvq + 1 : -1;
@@ -75,7 +75,7 @@ index 263548e..946dd6e 100644
          }
      }
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
-index dbca1ef..805e25a 100644
+index 1df60db..6c2961a 100644
 --- a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
 @@ -34,8 +34,9 @@
@@ -100,7 +100,7 @@ index dbca1ef..805e25a 100644
  #endif
      local half vt[DV * BK];     // [column][key]
  #ifdef GQA_S_SPLIT
-@@ -288,7 +292,16 @@ kernel void flash_attn_gqa_dpas(
+@@ -289,7 +293,16 @@ kernel void flash_attn_gqa_dpas(
          // QK^T; K direct (f16) reads global and needs none
          barrier(CLK_LOCAL_MEM_FENCE);
  #endif
@@ -118,7 +118,7 @@ index dbca1ef..805e25a 100644
          // QK^T
          float8 s[NKB];
          for (int g = 0; g < NKB; ++g) {
-@@ -303,9 +316,15 @@ kernel void flash_attn_gqa_dpas(
+@@ -304,9 +317,15 @@ kernel void flash_attn_gqa_dpas(
                  const short8 av = as_short8(intel_sub_group_block_read_us8(
                      (const local ushort *)(q8s + ((tile * QB + b) * 8) * 8)));
                  int8 bv; float dk;
