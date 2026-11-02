@@ -5510,6 +5510,227 @@ Owed on the cards, unchanged: the cold/warm pair at level 0 and the same A/B on
 the other units; the audit's bar — major faults above ~5 % of the CPU lane —
 decides a default. With faults ~0 already measured, it is ~0.
 
+## 0080-llama-mtp-kv-only.patch
+
+The MTP head's prompt pass computed only its K/V. A draft context's catch-up
+decode (the head's prompt fill) has no output rows: it exists so the later
+draft steps can read this layer's K/V. Ours built the whole MTP block for every
+prompt row anyway — `Qcur_full` (query + gate), attention, the gated output
+projection, the residual, FFN and the shared head — and cut only the output
+rows (patches 0010 and 0067 cut the *outputs* rows, not the graph; `code`:
+`src/models/qwen35.cpp`'s `graph_mtp` constructor, `qwen35moe.cpp`'s the same).
+**Evidence class of the mechanism: `code`** (fork 595d554c90, `LLAMA_MTP_KV_ONLY`
+in `arc-b580/src/models/qwen35.cpp:756-793`): the fork gates the graph after
+the cache store when `n_outputs == 0` and masked extraction is on, keeping the
+K/V ops identical and in the same order on the same shapes. The quality class
+is `exact`: the retained K/V rows are the full graph's (`code`; the fork's byte
+equality claim, not measured here).
+
+The patch, behind `LLAMA_MTP_KV_ONLY` (**off by default**; `1` enables it,
+`0` keeps the full graph, `code`): after the cache store the graph returns —
+K projection, reshape, K norm, RoPE, the optional cache rotations, then V, then
+`expand V`, `expand K`, `cpy_k`, `cpy_v`, the store half of `build_attn` in its
+own order. The Q projection is kept for `n_tokens <= 8`, as the fork does (its
+same-input mat-mul run's tile depends on the largest member; this OpenCL
+backend has no such run today — `code`, the only MUL_MAT fusion is 0019's
+gate+up+GLU — kept for parity with the fork's rule). The branch is taken only
+when `n_outputs == 0`, `cparams.embeddings_nextn_masked`, and the layer has no
+fused `wqkv` and no K/V bias — a fused projection would not be reproduced by
+the branch, so those layers keep the full graph (`code`). With the switch off
+the graph is byte-identical to before.
+
+**Scope (`code`)**: `qwen35` (the dense agent) and `qwen35moe` (the coder),
+both share the block shape. `qwen4exp` (Qwen3.8-Flash-Next)'s MTP graph is a
+hyper-connection graph whose K/V store sits inside `build_layer_attn`; it does
+not share the shape, so it is not in this patch. `qwen3next` shares the shape
+but is not a served unit; it is left as it is.
+
+Device-free (`code`): `tests/python/test_mtp_kv_only.py` reads the patched tree
+and asserts the branch's store half — the K mat-mul, reshape, K norm and RoPE
+the full graph's `build_qkv(reshape=false)` builds, V the same, V expanded
+before K, K stored before V, the rotations before the expands — that nothing
+follows the store (no attention, output projection, FFN or head), that the
+branch is gated on a masked no-output decode on a layer without a fused wqkv or
+K/V bias, and that the switch defaults off. Red mutations run before restore
+(`measured-here` on the patched tree): cpy_v dropped, the default flipped
+(`e == nullptr || ...`), the K norm dropped from the branch, the expand order
+swapped, the early `return;` dropped — each made its cell fail; restored, the
+cell passes. These are **source-text assertions** (they read the patched
+tree), not numerics.
+
+Card arms (owed; Claude runs them in a card window, **not yet measured**):
+1. **B60, agent (dense 27B), MTP 5**, the 18K/55K corpus prompt from
+   `tests/acceptance/cells/served_check.py`, two arms in one window, switch off
+   the old binary's arm and on the new one's:
+   `printf '#!/bin/sh\nexport LLAMA_MTP_KV_ONLY=1\nexec %s "$@"\n' <arcint-binary> > /tmp/arcint-kvonly && chmod +x /tmp/arcint-kvonly`
+   `python3 tests/acceptance/ab.py agent --old <arcint-binary> --new /tmp/arcint-kvonly --gguf <agent.gguf> --device GPU.0 --assets <assets> --rounds 2 --out /tmp/ab-80-agent`.
+   Record `prefill-55k`/`prefill-138k`, the decode rate, `draft accept` and
+   `verify` of both arms, and the texts md5; the bar is prefill up with the
+   same texts and the same accept counters (a K/V that differed would change
+   the draft's proposals and its acceptance; the audit's price is ~5 % on long
+   prompts, `paper`). The same with the coder on the A770 (`--device GPU.1`,
+   `ab.py coder`, MTP 4) — its prefill-41k is the prompt-side arm.
+2. **Draft K/V equality, stated as an observable**: three prompts served under
+   both arms in one process each; the `draft accept %` and the `verifies` of
+   the runs must be identical (the runs are the same workload, so any K/V row
+   difference moves them). A direct per-row dump is not available in either
+   arm; if the accept counters differ, the switch stays off and the finding is
+   recorded, not absorbed.
+
+## 0081-llama-gdn-state-rows.patch
+
+The GDN recurrent state read straight from the cache. Ours gathers each layer's
+live state rows into a temp before the gated delta-net runs
+(`src/llama-graph.cpp`'s `build_rs`: `ggml_get_rows(states, state_copy)`), and the
+kernel then reads the temp; patch 0050 folds only the snapshot *writes* into the
+cache, so the gather and its ~3 MB a layer are paid every decode and verify
+(`code`, the drawn state; the fork's price is +3.8 % TG and a dirty temp slowing
+the next GEMV ~15 %, `paper`). **Evidence class of the mechanism: `code`** (fork
+9b4be76a1c; `arc-b580/src/models/qwen35.cpp`'s `build_rs_cache_view`, the CPU
+reference's `rows` mode over `src[6]` in `ggml/src/ggml-cpu/ops.cpp:10815-10845`,
+the SYCL kernels' `s_ids` and `s_row_stride` reads). Quality class `exact`: the
+bytes are the gathered row's (`code`; the fork measured 400 greedy tokens
+identical).
+
+The patch adds the rows form of the op — `ggml_gated_delta_net_rows(ctx, q, k,
+v, g, beta, states, rows, K)` sets `src[6]` to an I32 array of cache row indices
+over the 2D cache view (`states->ne[0] == D`, `rows->ne[0] == n_seqs`; output
+layout identical to the gathered form's) — and the build side:
+`build_rs_cache_view` returns the cache view after the same zero-state hygiene,
+gathers and relocates only the *extra* rows (`inp->s_copy_tail`, `n_rs - n_seqs`,
+the same destination `build_rs` writes), and the GDN op reads this sequence's
+live row `inp->s_copy_main[0]` inside the kernel. The three served archs
+(`qwen35`, `qwen35moe`, `qwen4exp`) pass the row index.
+
+**Switch `LLAMA_GDN_STATE_ROWS`, off by default** (`code`): `1` builds the rows
+form, `0` keeps the gather. With it off the graph and every op's arguments are
+as before, byte-identical. The build gate (`llama_gdn_state_rows_enabled`)
+declines a **multi-sequence** ubatch — `s_copy` may map a live row into the
+extra relocation's destination — and any batch the fused GDN op would not take
+(the autoregressive path needs a 4D state). The gate's single-sequence condition
+is the audit's, not a kernel limit (the CPU and OpenCL row reads take any
+`n_seqs`; the multi-sequence C arm proves it).
+
+**Ordering, stated plainly** (`code`): the extra relocation's cpy is expanded
+before the GDN, so a live row that fell inside its destination would be written
+before it is read. That is the fork's own documented hazard
+(`arc-b580/src/llama-graph.cpp:3684-3694`); with `n_rs_seq > 0` the live row maps
+into `rs_idx * size + src0` (rollback plane) while a reorder-less extra row maps
+into plane 0, so the served path's rows do not overlap — the multi-sequence
+decline keeps the general case out. Confirm it in the served arm: the answers
+and the draft acceptance counters equal (below).
+
+Device-free (`measured-here`): `tests/test_gdn_state_rows.cpp` runs both forms on
+the CPU backend at four shapes (one sequence with `ids[0] = 2`, two sequences
+with `ids {1, 3}` or `{2, 3}`, K = 1 and K = 3, three tokens) and requires the
+packed outputs — attention scores and snapshots — byte-identical; the cache is
+wider than the rows used, so a stride read from `nb[3]` cannot add up.
+`tests/python/test_gdn_state_rows.py` reads the patched tree for the switch's
+default, the multi-sequence decline, the fused-op term, the extra-only gather,
+the three archs' row index, `src[6]`, the CPU's `nb[1]` stride and
+`state_rows[iv3]`, both kernels' `rows[seq]` read and the dispatch. Red
+mutations run before restore (`measured-here` on the patched tree): the switch
+flipped on, the `n_seqs != 1` decline dropped, the fused-op term dropped, the
+main rows gathered again, the CPU's row index replaced by the ordinal, the
+Intel kernel's rows term dropped, the dispatch's `use_rows` forced to 0 — each
+made its cell fail; restored, it passes. The Python cell is a source-text
+assertion; the C cell is numeric.
+
+Card arms (owed; Claude runs them in a card window, **not yet measured**):
+1. **`test-backend-ops -o GATED_DELTA_NET`** from the series build on the B60
+   and the A770: `GGML_OPENCL_DEVICES=0:0 ./bin/test-backend-ops -b GPUOpenCL -o
+   GATED_DELTA_NET` (and `1:0` on the A770). The patch adds four rows cases (TG,
+   TG with 2 sequences, verify with K = 3 and 2 sequences, PP-64) whose reference
+   is the CPU rows form, so the kernel's row read is compared directly. Record
+   the pass count with and without the rows cases; expected: every existing case
+   unchanged and the four rows cases pass.
+   Red on the card: take the Intel kernel's `state_base` rows term out
+   (`use_rows ? ... : ...` -> `((ulong)seq * H_v + head) * state_size` in
+   `gated_delta_net_intel.cl`), rebuild, and the four rows cases fail; restore.
+2. **B60 agent (dense 27B), MTP 5, 138K needle from
+   `tests/acceptance/cells/served_check.py`**, two arms in one window:
+   `printf '#!/bin/sh\nexport LLAMA_GDN_STATE_ROWS=1\nexec %s "$@"\n' <arcint-binary> > /tmp/arcint-gdnrows && chmod +x /tmp/arcint-gdnrows`
+   `python3 tests/acceptance/ab.py agent --old <arcint-binary> --new /tmp/arcint-gdnrows --gguf <agent.gguf> --device GPU.0 --assets <assets> --rounds 2 --out /tmp/ab-81-agent`.
+   Record decode, prefill-55k/138k, `draft accept` and the texts md5. Bar: decode
+   >= +2.5 % with the same texts and acceptance (`paper` price +3.8 % TG); if the
+   texts differ or the acceptance counters move, the switch stays off and the
+   finding is recorded.
+3. The same with the coder on the A770 (`--device GPU.1`, `ab.py coder`, MTP 4)
+   and with Flash-Next (B60, MTP 3, IQ3_XXS): answers right, decode recorded.
+
+## 0082-llama-gdn-qk-l2-norm.patch
+
+One l2_norm for the hybrid layers' adjacent q/k head groups, and the bf16 gate
+dispatch read. **Evidence class of the mechanism: `code`** (fork's form:
+`arc-b580/src/models/qwen35.cpp:548-554`, one `ggml_l2_norm` over the joint
+`[head_k_dim, 2*num_k_heads, n_seq_tokens, n_seqs]` view of the conv output,
+then q and k as views of its result). Ours normed q and k separately — two
+`build_gdn_l2_norm` pairs (`rms_norm` + `scale`) over strided views, four nodes
+a layer (`code`: `qwen35.cpp:441-442`, `qwen35moe.cpp`, `qwen4exp.cpp`); the
+fork's Metal bundle measured +7.7 % 2B / +2.6 % 27B for the hybrid bundle,
+`paper`, not separable to this node pair.
+
+The patch adds one device-free helper, `src/models/gdn-qk-l2-norm.h` (ggml.h
+only), holding `build_gdn_l2_norm` and the joint form: a `view_4d` of the conv
+output keeping its group stride (`nb1_qkv`), one `rms_norm(x, eps/n)` and
+`scale(1/sqrt(n))` over it, then q and k as views of the dense result at offsets
+`0` and `num_k_heads * nb[1]`. The same normalisation runs per row, so the bytes
+are the two separate norms' (`exact`; the fork claims byte-identical outputs for
+its fusions, `code`). The three served archs call it; `clef` and `qwen3next`
+share the two-norm form but are not served units and are left as they are.
+
+**Switch `LLAMA_FUSE_QK_L2_NORM`, off by default** (`code`): `1` builds the
+joint form, `0` the two separate norms — byte-identical to before.
+
+**Item 8's second half, the bf16 48-row gate matvec: no missing piece, and the
+dispatch read says so** (`code`). The audit's "not verified, `inferred` from the
+dispatch tables" is now read: bf16 is stored as f16 on device
+(`ggml-opencl.cpp:29086`, `src0t = BF16 ? F16 : type`), and the F16 matvec
+branch (`:29202-29227`) takes `src1->ne[1] <= 8` columns with
+`(src0->ne[1] <= 64 || (src0->ne[1] <= 1024 && src1->ne[1] >= 2))` — a
+`[5120, 48]` gate weight at 1-6 columns takes `kernel_mul_mv_f16_f32_ksplit`
+(one column) or `..._nc` (2-6), a work-group a row, **not** the tiled GEMM.
+The fork's `mmvf.cu` fix (bf16 mat-vec under 64 rows at 2-8 columns,
+10.5 -> 4.4-7.3 us) therefore has no counterpart to port here: the dispatcher
+already routes it there. No kernel work in this patch; the cell asserts the
+conditions, so a future narrowing of them fails it.
+
+Device-free (`measured-here`): `tests/test_gdn_qk_l2_norm.cpp` builds a strided
+conv mix on the CPU backend and compares the joint form's q and k bytes against
+the two separate norms at five shapes (head 4 / 2 k heads / 1 and 3 tokens / 1
+and 2 sequences; head 8 / 3 k heads / 2 tokens / 2 sequences; a compact mix
+without the v tail). The joint form's q and k are views of its dense result, so
+their token stride carries both head groups; the cell walks the views' logical
+elements with their own strides instead of copying linearly.
+`tests/python/test_gdn_qk_l2_norm.py` reads the patched tree: the switch default
+off, the two-norm arm kept in all three archs, the joint view's group stride,
+the k view's head-group offset, and the bf16 matvec conditions. Red mutations run
+before restore (`measured-here` on the patched tree): the switch flipped on, a
+model's two-norm arm dropped, the k view's `num_k_heads *` dropped, the joint
+view's group stride set contiguous, the bf16 row term narrowed to 48 — each made
+its cell fail; restored, it passes. The Python cell is source text; the C cell is
+numeric, and its numeric red was run through the recipe itself: with the joint
+view's group stride taken as the q|k row width (`nb1_qkv` ->
+`ggml_row_size(type, head_k_dim)`), the cell failed every shape whose token or
+sequence stride is exercised (3 of 5: three tokens, two tokens x two sequences,
+the compact two tokens x two sequences), and the one-token shapes passed; the
+fix (restored `nb1_qkv`) makes all five pass. The bug was in this patch's own
+first draft, found by the cell.
+
+Card arms (owed; Claude runs them in a card window, **not yet measured**):
+1. **B60 agent and A770 coder, served, switch off vs on**, two rounds:
+   `printf '#!/bin/sh\nexport LLAMA_FUSE_QK_L2_NORM=1\nexec %s "$@"\n' <arcint-binary> > /tmp/arcint-qk2 && chmod +x /tmp/arcint-qk2`
+   `python3 tests/acceptance/ab.py agent --old <arcint-binary> --new /tmp/arcint-qk2 --gguf <agent.gguf> --device GPU.0 --assets <assets> --rounds 2 --out /tmp/ab-82-agent`
+   and `ab.py coder ... --device GPU.1`. Record decode, prefill, `draft accept`
+   and the texts md5; the bar is >= +2 % bundled with identical answers (`paper`),
+   and the md5/argmax tripwire is the answer-level gate. If no gain, the switch
+   stays off.
+2. **Launch count** before/after: one GDN layer's encoded nodes a token,
+   `GGML_OPENCL_...`? there is no op-count dump; use the served `LLAMA_LOG`
+   graph lines or a counters arm. Owed, stated so.
+3. B60 Flash-Next (IQ3_XXS, MTP 3): answers right, decode recorded — the same
+   A/B form.
+
 ## 0083-round-trip-trim.patch
 
 Round-trip discipline on the decode/MTP step, the three cuts that apply to

@@ -491,6 +491,45 @@ if(ARCINT_TESTS)
                      "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_cpu_miss_prefetch.py")
     set_tests_properties(cpu-miss-prefetch PROPERTIES LABELS unit)
+    # patch 0080's device-free cell: the MTP KV-only branch's store half equals the
+    # full graph's, nothing follows it, and the switch defaults off. The K/V byte
+    # equality is the card arm (README 0080).
+    add_test(NAME mtp-kv-only
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_mtp_kv_only.py")
+    set_tests_properties(mtp-kv-only PROPERTIES LABELS unit)
+    # patch 0081's device-free cell: the gated delta-net's rows form reads each
+    # sequence's own cache row, and the packed output (attention scores plus the
+    # K snapshots) is byte-identical to the gathered form's, on the CPU backend.
+    add_executable(arcint-gdn-state-rows tests/test_gdn_state_rows.cpp)
+    target_link_libraries(arcint-gdn-state-rows PRIVATE arcint_core)
+    target_include_directories(arcint-gdn-state-rows PRIVATE "${ARCINT_LLAMA_DIR}/ggml/include")
+    target_compile_options(arcint-gdn-state-rows PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME gdn-state-rows COMMAND arcint-gdn-state-rows)
+    set_tests_properties(gdn-state-rows PROPERTIES LABELS unit)
+    # patch 0082's device-free cell: one l2_norm over the joint q/k head groups
+    # of the GDN conv output against the two separate norms, on the CPU backend,
+    # byte equality; the gate cell reads the switch and the bf16 dispatch out of
+    # the patched tree.
+    add_executable(arcint-gdn-qk-l2-norm tests/test_gdn_qk_l2_norm.cpp)
+    target_link_libraries(arcint-gdn-qk-l2-norm PRIVATE arcint_core)
+    target_include_directories(arcint-gdn-qk-l2-norm PRIVATE "${ARCINT_LLAMA_DIR}/ggml/include")
+    target_compile_options(arcint-gdn-qk-l2-norm PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME gdn-qk-l2-norm COMMAND arcint-gdn-qk-l2-norm)
+    set_tests_properties(gdn-qk-l2-norm PROPERTIES LABELS unit)
+    add_test(NAME gdn-qk-l2-norm-gate
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_gdn_qk_l2_norm.py")
+    set_tests_properties(gdn-qk-l2-norm-gate PROPERTIES LABELS unit)
+    # patch 0081's build gate, read out of the patched tree (LLAMA_SRC): the
+    # switch defaults off, one sequence only, the fused GDN the batch takes
+    add_test(NAME gdn-state-rows-gate
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_gdn_state_rows.py")
+    set_tests_properties(gdn-state-rows-gate PROPERTIES LABELS unit)
     add_test(NAME expert-profile-save
              COMMAND "${CMAKE_COMMAND}" -E env "EXPERT_PROFILE_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
                      "${Python3_EXECUTABLE}"

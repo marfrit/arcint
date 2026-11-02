@@ -1,0 +1,174 @@
+diff --git a/src/models/gdn-qk-l2-norm.h b/src/models/gdn-qk-l2-norm.h
+new file mode 100644
+index 0000000..9e48e46
+--- /dev/null
++++ b/src/models/gdn-qk-l2-norm.h
+@@ -0,0 +1,57 @@
++#pragma once
++
++// Patch 0082: one l2_norm over the joint q/k head groups of the GDN conv output.
++//
++// The gated delta-net layers' q and k norm is rms_norm(x, eps/n) * (1/sqrt(n))
++// per row (build_gdn_l2_norm, src/models/models.h), run once for q and once for
++// k. In the conv output q and k are adjacent head groups of the same width, so
++// one l2_norm over the joint view [head_k_dim, 2*num_k_heads, n_seq_tokens,
++// n_seqs] normalises both, and q and k are views into its dense result -- the
++// same normalization per row, one pair of nodes fewer a layer.
++//
++// Device-free by construction (ggml.h only), so tests/test_gdn_qk_l2_norm.cpp
++// runs it against the two separate norms on the CPU backend and compares bytes.
++//
++// This header is NOT a general API: it assumes q then k adjacent in the conv
++// output at the same width, which is what the qwen35-family builders lay out.
++
++#include "ggml.h"
++
++#include <cmath>
++
++static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * x, float eps) {
++    const float n = x->ne[0];
++
++    return ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/n), 1.0f/sqrtf(n));
++}
++
++// q_out/k_out: the normalised [head_k_dim, num_k_heads, n_seq_tokens, n_seqs] slices.
++// conv_qkv_mix: the strided conv output; nb1_qkv: its row stride in bytes.
++static inline void build_gdn_qk_l2_norm(
++        ggml_context * ctx,
++        ggml_tensor  * conv_qkv_mix,
++              int64_t   head_k_dim,
++              int64_t   num_k_heads,
++              int64_t   n_seq_tokens,
++              int64_t   n_seqs,
++              size_t    nb1_qkv,
++              float     eps,
++        ggml_tensor ** q_out,
++        ggml_tensor ** k_out) {
++    // q and k are the first 2*num_k_heads head groups of the conv output; the joint
++    // view keeps the conv output's row stride (nb[1] = head_k_dim contiguous, the
++    // group stride nb[2] = nb1_qkv), so every dim-0 row is contiguous
++    ggml_tensor * qk = ggml_view_4d(ctx, conv_qkv_mix, head_k_dim, 2 * num_k_heads, n_seq_tokens, n_seqs,
++            ggml_row_size(conv_qkv_mix->type, head_k_dim),
++            nb1_qkv,
++            nb1_qkv * n_seq_tokens,
++            0);
++    qk = build_gdn_l2_norm(ctx, qk, eps);
++
++    // the norm's result is dense: q and k are its first and second head groups
++    const size_t nb1 = qk->nb[1];
++    *q_out = ggml_view_4d(ctx, qk, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
++            nb1, qk->nb[2], qk->nb[3], 0);
++    *k_out = ggml_view_4d(ctx, qk, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
++            nb1, qk->nb[2], qk->nb[3], num_k_heads * nb1);
++}
+diff --git a/src/models/models.h b/src/models/models.h
+index b10be0e..31f0b65 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -11,11 +11,8 @@
+ class llama_memory_hybrid_idx_context;
+ 
+ // ref: https://github.com/ggml-org/llama.cpp/pull/28068
+-static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * x, float eps) {
+-    const float n = x->ne[0];
+-
+-    return ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/n), 1.0f/sqrtf(n));
+-}
++// build_gdn_l2_norm and patch 0082's joint q/k form (src/models/gdn-qk-l2-norm.h)
++#include "gdn-qk-l2-norm.h"
+ 
+ //
+ // base classes
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index bd8d748..cc569d4 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -450,8 +450,24 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+ 
+     const float eps_norm = hparams.f_norm_rms_eps;
+ 
+-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
++    // patch 0082: LLAMA_FUSE_QK_L2_NORM=1 (off by default) normalises q and k in
++    // one l2_norm over their joint head groups of the conv output; the two
++    // separate norms are the same bytes, one pair of nodes fewer a layer
++    static const bool fuse_qk_l2 = [] {
++        const char * e = getenv("LLAMA_FUSE_QK_L2_NORM");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    if (fuse_qk_l2) {
++        ggml_tensor * q_normed = nullptr;
++        ggml_tensor * k_normed = nullptr;
++        build_gdn_qk_l2_norm(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
++                nb1_qkv, eps_norm, &q_normed, &k_normed);
++        q_conv = q_normed; cb(q_conv, "q_conv_l2", il);
++        k_conv = k_normed; cb(k_conv, "k_conv_l2", il);
++    } else {
++        q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
++        k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
++    }
+ 
+     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 4567e08..815ae27 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -460,8 +460,24 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
+ 
+     const float eps_norm = hparams.f_norm_rms_eps;
+ 
+-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
++    // patch 0082: LLAMA_FUSE_QK_L2_NORM=1 (off by default) normalises q and k in
++    // one l2_norm over their joint head groups of the conv output; the two
++    // separate norms are the same bytes, one pair of nodes fewer a layer
++    static const bool fuse_qk_l2 = [] {
++        const char * e = getenv("LLAMA_FUSE_QK_L2_NORM");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    if (fuse_qk_l2) {
++        ggml_tensor * q_normed = nullptr;
++        ggml_tensor * k_normed = nullptr;
++        build_gdn_qk_l2_norm(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
++                nb1_qkv, eps_norm, &q_normed, &k_normed);
++        q_conv = q_normed; cb(q_conv, "q_conv_l2", il);
++        k_conv = k_normed; cb(k_conv, "k_conv_l2", il);
++    } else {
++        q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
++        k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
++    }
+ 
+     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 753f951..30c7d94 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1139,8 +1139,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+ 
+     const float eps_norm = hparams.f_norm_rms_eps;
+ 
+-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
++    // patch 0082: LLAMA_FUSE_QK_L2_NORM=1 (off by default) normalises q and k in
++    // one l2_norm over their joint head groups of the conv output; the two
++    // separate norms are the same bytes, one pair of nodes fewer a layer
++    static const bool fuse_qk_l2 = [] {
++        const char * e = getenv("LLAMA_FUSE_QK_L2_NORM");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    if (fuse_qk_l2) {
++        ggml_tensor * q_normed = nullptr;
++        ggml_tensor * k_normed = nullptr;
++        build_gdn_qk_l2_norm(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
++                nb1_qkv, eps_norm, &q_normed, &k_normed);
++        q_conv = q_normed; cb(q_conv, "q_conv_l2", il);
++        k_conv = k_normed; cb(k_conv, "k_conv_l2", il);
++    } else {
++        q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
++        k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
++    }
+ 
+     // repeat to match shapes when head keys != value keys; unneeded with the fused GDN
+     if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
