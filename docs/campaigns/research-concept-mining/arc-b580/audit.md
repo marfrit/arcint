@@ -176,6 +176,10 @@ listed, not audited. #6 and #10 are listed with the reason.
   `--spec-draft-depth-max` (`common/arg.cpp:4123-4128`), default 0.
 - **Quality class**: at greedy the target argmax is the same token either way, so the answer is
   unchanged; under sampling the text can diverge, by design. Audited only for the greedy path.
+- **Operator decision (2026-11-02):** in scope. "If MTP becomes a burden at some point, it is ok to let go after that
+  point. If Paris stays Paris but with a French accent, that's okay with me": a sampled text that diverges because
+  drafting stops is acceptable; the right facts are the bar. Greedy stays identical. Still owed (`code`): confirm that
+  arcint's verify keeps the target distribution under sampling.
 - **Units**: all three at depth; the agent's 245k context is the extreme.
 - **Measurement**: B60 agent MTP 5, Flash-Next MTP 3 at 8K/64K/138K greedy; arms off/24K/32K/64K;
   decode t/s, answers.
