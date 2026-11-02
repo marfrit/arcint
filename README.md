@@ -341,6 +341,14 @@ service's production flags, Flash-Next's expert cache included
   visible to local users in `ps`, so deployments use `--api-key-file`.
   `/health` stays open and reveals the served model id. A `-DARCINT_TLS=ON`
   build adds `--tls-cert`/`--tls-key`. Built for a LAN or a reverse proxy.
+- **Request ids.** Every response carries `X-Request-Id`: the caller's value
+  when it is 1..128 characters of `[A-Za-z0-9._:-]`, otherwise a generated
+  `req-` plus 16 lowercase hex characters. A value that is not usable is
+  replaced, never refused, and never echoed or logged. The same id appears as
+  `rid=<id>` on arcint's log lines for that request — the http line, the
+  refusals, the prefill/decode summary and its abort — so a gateway's line and
+  arcint's line for one request can be matched. Request and response bodies, the
+  Responses objects and `/metrics` are unchanged.
 - `--metrics` serves `GET /metrics` in the Prometheus text format (request,
   token, prefill/decode, cache-hit, draft counters and per-lane
   queue/slot gauges); a request with `arcint: {timings: true}` gets the

@@ -48,7 +48,10 @@ nlohmann::json truncation_json(const TruncationReport& truncation);
 
 void log_slot_line(int slot, const char* phase, int tokens, double seconds, double rate,
                    const std::string& suffix = {});
-void log_stats(int slot, const GenerationStats& stats, FinishReason reason);
+// The per-request prefill/decode summary. `rid` is the request's X-Request-Id:
+// the two slot lines and the abort line are matched to a caller's log line by
+// it, so it rides on all three.
+void log_stats(int slot, const GenerationStats& stats, FinishReason reason, std::string_view rid);
 
 // `emit` receives the new piece, its token id and the full text accumulated so
 // far (the piece is already appended). Returning false means the client is gone.

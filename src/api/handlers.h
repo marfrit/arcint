@@ -210,6 +210,9 @@ struct PreparedChat {
     bool            think_tags_extended = false;  // also the angle- and square-bracket think tags (ModelStatus)
     ThinkBlockIds   think_ids;                   // the artifact's per-pair tag ids
     std::string     id;
+    // X-Request-Id of the request that prepared this: the id every log line of
+    // that request carries. Not the response's `id` above, and not in any body.
+    std::string     request_id;
     int64_t         created       = 0;
     int             prompt_tokens = 0;
     int             lane          = -1;  // resolve_lane's answer
@@ -221,6 +224,7 @@ struct PreparedCompletion {
     CompletionRequest req;
     GenerationInput   input;
     std::string       id;
+    std::string       request_id;  // X-Request-Id of the request, for its log lines
     int64_t           created       = 0;
     int               prompt_tokens = 0;
     int               lane          = -1;
@@ -235,6 +239,7 @@ struct PreparedSpeech {
     SpeechInput   input;
     int           lane  = -1;
     std::string   model;
+    std::string   request_id;  // X-Request-Id of the request, for its log lines
 };
 
 // Everything that can be rejected happens here, before a single response byte

@@ -128,7 +128,8 @@ JSON
 curl -sS -o /dev/null -H 'Content-Type: application/json' -H "X-Request-Id: $CHAT_ID" \
      --data-binary @"$WORK/chat.json" "$BASE/v1/chat/completions"
 wait_log "$WORK/nokey.log" "rid=$CHAT_ID" 5 || true
-n=$(grep -cF -- "rid=$CHAT_ID" "$WORK/nokey.log" 2>/dev/null || echo 0)
+# grep -c prints 0 AND exits 1, so its output is the only source: no `|| echo`.
+n=$(grep -cF -- "rid=$CHAT_ID" "$WORK/nokey.log" 2>/dev/null); n=${n:-0}
 check "the request's log lines carry rid=$CHAT_ID (at least the http line, the prefill line and the decode line)" \
   "$([[ "$n" -ge 3 ]] && echo 0 || echo 1)"
 check "the prefill/decode summary lines carry the id" \
@@ -157,7 +158,7 @@ CASES = [
     ("a value with CR LF inside", b"X-Request-Id: ab\r\rcd"),
     ("a non-ASCII value", "X-Request-Id: abä".encode()),
     ("an empty value", b"X-Request-Id: "),
-    ("a value that is only punctuation", b"X-Request-Id: ...."),
+    ("a value that is only separators", b"X-Request-Id: ab;cd|ef"),
 ]
 
 def request(raw_header):
@@ -174,23 +175,28 @@ def request(raw_header):
     except socket.timeout:
         pass
     s.close()
-    return data.split(b"\r\n\r\n", 1)[0]
+    return data
 
 rc = 0
 for name, hdr in CASES:
     blob = request(hdr)
-    lines = [ln for ln in blob.split(b"\r\n")[1:] if ln.lower().startswith(b"x-request-id:")]
-    value = lines[0].split(b":", 1)[1].strip() if lines else None
+    lines = blob.split(b"\r\n")
+    status = lines[0].split()[1] if len(lines[0].split()) >= 2 else b"?"
+    got = [ln for ln in lines[1:] if ln.lower().startswith(b"x-request-id:")]
+    value = got[0].split(b":", 1)[1].strip() if got else None
     tail = hdr[len(b"X-Request-Id: "):]
     # Nothing of the client's value may come back, whichever way the server
-    # handled it.
-    ok_not_echoed = tail not in blob
+    # handled it. An empty value cannot be echoed, so it is not checked.
+    echoed = tail in blob if tail else False
+    refused = status.isdigit() and int(status) >= 400
     if value is None:
-        # Refused before routing: acceptable only if nothing was echoed.
-        ok = ok_not_echoed
-        verdict = "refused before routing, nothing echoed" if ok else "refused AND echoed the client's bytes"
+        # Only a refusal of the request excuses a missing header: a 2xx answer
+        # without X-Request-Id breaks the contract for every response.
+        ok = refused and not echoed
+        verdict = (f"refused ({status.decode()}), nothing echoed" if ok else
+                   f"answered {status.decode()} with no X-Request-Id at all")
     else:
-        ok = ok_not_echoed and bool(GEN.match(value))
+        ok = (not echoed) and bool(GEN.match(value))
         verdict = ("replaced by a generated id, not echoed" if ok
                    else f"echoed back verbatim or malformed: {value[:40]!r}")
     print(("  ok   " if ok else "  FAIL ") + f"{name}: {verdict}")

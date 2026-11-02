@@ -95,6 +95,7 @@ add_library(arcint_core STATIC
   src/api/generate.cpp
   src/api/metrics.cpp
   src/api/renderer.cpp
+  src/api/request_id.cpp
   src/api/responses.cpp
   src/api/responses_stream.cpp
   src/api/responses_state.cpp
@@ -283,6 +284,7 @@ if(ARCINT_TESTS)
     tests/test_responses.cpp
     tests/test_metrics.cpp
     tests/test_auth.cpp
+    tests/test_reqid.cpp
     tests/test_tokenize.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
