@@ -268,6 +268,7 @@ if(ARCINT_TESTS)
     tests/test_token_ids.cpp
     tests/test_props.cpp
     tests/test_sampler_modes.cpp
+    tests/test_fast_topk.cpp
     tests/test_loop_guard.cpp
     tests/test_context_guard.cpp
     tests/test_lanes.cpp
