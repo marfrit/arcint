@@ -137,7 +137,9 @@
 
 - HTTP: POST /v1/chat/completions, POST /v1/completions (OpenAI-compatible,
   SSE streaming; /v1/completions also takes token-id prompts), GET /health,
-  GET /props, GET /v1/models. No UI.
+  GET /props, GET /v1/models; with --slots, GET /slots (slot state only — id,
+  lane, n_ctx, is_processing, n_cache, and a busy slot's request id; no prompt,
+  completion, token ids or sampling parameters). No UI.
 - Token surface (llama-server-compatible, behind the same key as every route):
   POST /tokenize takes {content, add_special?, with_pieces?, model?} and
   returns {tokens}; with_pieces returns {id, piece} objects, a piece that is
@@ -188,8 +190,8 @@
 - Console: one-line state/timing prints on stderr (load, expert cache,
   per-slot prefill/decode rates, draft acceptance).
 - Security: no authentication by default; --api-key/--api-key-file add a
-  bearer token on every route but /health (that includes /props and /metrics;
-  the CORS preflight is answered without the key). TLS only in a build
+  bearer token on every route but /health (that includes /props, /metrics and
+  /slots; the CORS preflight is answered without the key). TLS only in a build
   configured with -DARCINT_TLS=ON (--tls-cert/--tls-key); the default build
   links no OpenSSL. LAN or a reverse proxy only.
 
@@ -262,6 +264,14 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
   request field `arcint.timings: true` adds the per-response timing object
   (llama-server's prompt_n/prompt_ms, predicted_n/predicted_ms, cache_n,
   draft_n, draft_accepted) on Chat Completions and Responses.
+- --slots (off): serve GET /slots — one entry per slot with id, lane, n_ctx,
+  is_processing, n_cache (the KV cells that slot's sequence holds) and, while
+  the slot serves a request, id_task: that request's X-Request-Id. State only:
+  no prompt, no generated text, no token ids, no sampling parameters. The prompt
+  (detokenized), the generated text and the sampling parameters are what
+  llama-server's /slots carries, and slots.sh asserts the absence with a
+  marker in the busy request's prompt. Behind --api-key like every route;
+  /props lists it only when it is served.
 - --api-key KEY | --api-key-file PATH: require `Authorization: Bearer KEY` on
   every route but /health (GET/HEAD only; a CORS preflight -- an OPTIONS with
   Access-Control-Request-Method -- is exempt). The check runs before the

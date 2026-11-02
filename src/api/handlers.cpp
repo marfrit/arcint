@@ -169,7 +169,9 @@ bool sse_send(const SseWriter& write, const json& payload) {
 }  // namespace
 
 // -------------------------------------------------------------------- slots
-SlotPool::SlotPool(int count) : busy_(static_cast<size_t>(std::max(1, count)), false) {}
+SlotPool::SlotPool(int count)
+    : busy_(static_cast<size_t>(std::max(1, count)), false),
+      rid_(static_cast<size_t>(std::max(1, count))) {}
 
 SlotPool::Lease& SlotPool::Lease::operator=(Lease&& other) noexcept {
     if (this != &other) {
@@ -186,7 +188,7 @@ SlotPool::Lease::~Lease() {
     if (pool_ != nullptr && index_ >= 0) pool_->release(index_);
 }
 
-SlotPool::Lease SlotPool::acquire_for(double timeout_seconds) {
+SlotPool::Lease SlotPool::acquire_for(double timeout_seconds, std::string_view request_id) {
     std::unique_lock<std::mutex> lock(mutex_);
     auto some_free = [this] {
         return std::find(busy_.begin(), busy_.end(), false) != busy_.end();
@@ -203,16 +205,21 @@ SlotPool::Lease SlotPool::acquire_for(double timeout_seconds) {
     const auto it    = std::find(busy_.begin(), busy_.end(), false);
     const int  index = static_cast<int>(it - busy_.begin());
     *it              = true;
+    // Bound while still under mutex_, in the same act as marking the slot busy:
+    // there is no window in which a slot is busy and carries the previous
+    // request's id.
+    rid_[static_cast<size_t>(index)].assign(request_id);
     return Lease(this, index);
 }
 
-SlotPool::Lease SlotPool::try_acquire(int index) {
+SlotPool::Lease SlotPool::try_acquire(int index, std::string_view request_id) {
     // Continuation affinity: one look, never a wait and never another index.
     // Falling back is the caller's job (acquire_slot).
     std::lock_guard<std::mutex> guard(mutex_);
     if (index < 0 || static_cast<size_t>(index) >= busy_.size() || busy_[static_cast<size_t>(index)])
         return Lease();
     busy_[static_cast<size_t>(index)] = true;
+    rid_[static_cast<size_t>(index)].assign(request_id);
     return Lease(this, index);
 }
 
@@ -221,6 +228,9 @@ void SlotPool::release(int index) {
         std::lock_guard<std::mutex> guard(mutex_);
         if (index >= 0 && static_cast<size_t>(index) < busy_.size()) {
             busy_[static_cast<size_t>(index)] = false;
+            // The id belongs to the request, not to the slot: cleared with the
+            // lease, so a finished request is never still reported.
+            rid_[static_cast<size_t>(index)].clear();
         }
     }
     cv_.notify_one();
@@ -241,12 +251,25 @@ int SlotPool::queue_depth() const {
     return waiting_;
 }
 
+std::vector<SlotPool::State> SlotPool::snapshot() const {
+    // Two vectors of trivial state copied out; no allocation beyond the result.
+    // Everything that costs more than that — the lane names, the backend's cell
+    // counts, the JSON — happens outside this lock (see api/slots.cpp).
+    std::lock_guard<std::mutex> guard(mutex_);
+    std::vector<State>          out;
+    out.reserve(busy_.size());
+    for (size_t i = 0; i < busy_.size(); ++i)
+        out.push_back(State{static_cast<int>(i), static_cast<bool>(busy_[i]), rid_[i]});
+    return out;
+}
+
 // ------------------------------------------------------------- admission
-std::optional<HttpResult> acquire_slot(const Context& ctx, SlotPool::Lease& out) {
+std::optional<HttpResult> acquire_slot(const Context& ctx, SlotPool::Lease& out,
+                                       std::string_view request_id) {
     // under named lanes every request is admitted on its lane's own pool
     if (!ctx.lanes.empty()) throw std::logic_error("acquire_slot without a lane under named lanes");
     const double timeout = ctx.cfg != nullptr ? ctx.cfg->queue_timeout_s : 0.0;
-    out = ctx.slots->acquire_for(timeout);
+    out = ctx.slots->acquire_for(timeout, request_id);
     if (out.index() >= 0) return std::nullopt;
 
     // Not "server busy": the numbers that say how many lanes there are and
@@ -347,19 +370,19 @@ int queue_depth(const Context& ctx) {
 }  // namespace
 
 std::optional<HttpResult> acquire_slot(const Context& ctx, int lane, SlotPool::Lease& out, int& slot,
-                                       int affinity_slot) {
+                                       int affinity_slot, std::string_view request_id) {
     if (lane < 0 || static_cast<size_t>(lane) >= ctx.lanes.size()) {
         // A continuation first tries the slot the referenced response ran on,
         // without waiting; a refusal there falls back to the ordinary acquire
         // (docs/campaigns/feyntalk.md State: "then falls back").
         if (affinity_slot >= 0) {
-            out = ctx.slots->try_acquire(affinity_slot);
+            out = ctx.slots->try_acquire(affinity_slot, request_id);
             if (out.index() >= 0) {
                 slot = out.index();
                 return std::nullopt;
             }
         }
-        auto err = acquire_slot(ctx, out);
+        auto err = acquire_slot(ctx, out, request_id);
         slot     = out.index();
         return err;
     }
@@ -371,13 +394,13 @@ std::optional<HttpResult> acquire_slot(const Context& ctx, int lane, SlotPool::L
     // The named lane's pool has one lease; its sequence is what the entry
     // records, so the affinity look is index 0 of that pool.
     if (affinity_slot >= 0) {
-        out = l.pool->try_acquire(0);
+        out = l.pool->try_acquire(0, request_id);
         if (out.index() >= 0) {
             slot = l.seq;
             return std::nullopt;
         }
     }
-    out                  = l.pool->acquire_for(timeout);
+    out                  = l.pool->acquire_for(timeout, request_id);
     slot                 = out.index() >= 0 ? l.seq : -1;
     if (out.index() >= 0) return std::nullopt;
 
@@ -565,6 +588,8 @@ json props(const Context& ctx) {
                       "/tokenize", "/detokenize"})}};
     // --metrics adds GET /metrics, so it is named here only when it is served.
     if (cfg.metrics) p["endpoints"].push_back("/metrics");
+    // --slots adds GET /slots, same rule: the list says what this process serves.
+    if (cfg.slots) p["endpoints"].push_back("/slots");
     // The Responses store's live state (docs/campaigns/feyntalk.md State):
     // what it retains now, and the limits that bound it. A process without a
     // store (a test seam) says null rather than a zero that would read as empty.

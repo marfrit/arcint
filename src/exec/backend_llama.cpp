@@ -1249,6 +1249,25 @@ public:
     }
 
     const ModelStatus& status() const override { return status_; }
+
+    // GET /slots (--slots): the cells each sequence holds. Under mu_ — the
+    // context is not thread-safe (one call at a time) — and this is the same
+    // lock /props reads the loan state under. One llama_memory_seq_pos_max per
+    // sequence, no traversal, and the numbers are copied out so the response's
+    // JSON is built outside the lock. A running generation holds mu_ for one
+    // llama_decode at a time (the counters move inside it), so the read waits
+    // for a batch, never for a request, and it never touches the slot pool's
+    // lock at all.
+    std::vector<int> kv_positions() const override {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::vector<int>            out;
+        if (ctx_ == nullptr) return out;
+        llama_memory_t mem = llama_get_memory(ctx_);
+        out.resize(static_cast<size_t>(std::max(0, lanes_)));
+        for (int s = 0; s < lanes_; ++s)
+            out[static_cast<size_t>(s)] = static_cast<int>(llama_memory_seq_pos_max(mem, s)) + 1;
+        return out;
+    }
 #ifdef ARCINT_LLAMA_SLOT_LOAN
     // /props reads this under the context's lock: "off"/"armed"/"out"/"poisoned"/
     // "broken". A poisoned or broken state exits the process (patch 0068's

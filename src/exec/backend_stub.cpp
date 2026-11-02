@@ -158,6 +158,10 @@ public:
         const auto prefill_start = clock::now();
         const auto prompt_ids    = prompt_ids_raw(in, tokenizer_);
         stats.prompt_tokens      = static_cast<int>(prompt_ids.size());
+        // GET /slots reads the cells a slot's sequence holds; the stub has no
+        // KV, but it keeps the count its own loop implies, so the field is
+        // testable without a card.
+        note_cells(slot, stats.prompt_tokens);
         // The prefill in its ubatches, as the real backend's loop: one cancel
         // check a boundary, so a gone client or a stop signal is seen there
         // and not only when the first token fails to write (DESIGN §3.7).
@@ -208,6 +212,7 @@ public:
 
             const std::string piece = tokenizer_.decode_one(id);
             ++stats.completion_tokens;
+            note_cells(slot, stats.prompt_tokens + stats.completion_tokens);
 
             // A byte-level detokenizer routinely hands out half of a multi-byte
             // code point. Splitting multi-byte pieces here keeps the streaming
@@ -306,6 +311,23 @@ private:
         return out;
     }
 
+    // The cells each slot's sequence holds, as generate()'s loop implies them:
+    // the prompt's, plus one per decoded token. Held after the request ends —
+    // the same shape the engine's KV has, where a released slot keeps its
+    // sequence until the next request on it clears it.
+    void note_cells(int slot, int cells) const {
+        std::lock_guard<std::mutex> guard(kv_mutex_);
+        if (slot < 0) return;
+        if (kv_cells_.size() <= static_cast<size_t>(slot))
+            kv_cells_.resize(static_cast<size_t>(slot) + 1, 0);
+        kv_cells_[static_cast<size_t>(slot)] = cells;
+    }
+
+    std::vector<int> kv_positions() const override {
+        std::lock_guard<std::mutex> guard(kv_mutex_);
+        return kv_cells_;
+    }
+
     int           delay_ms_ = 0;
     int           prefill_ubatches_ = 1;
     std::vector<int> lane_ctx_;   // --lane-ctx, by slot
@@ -314,6 +336,8 @@ private:
     mutable std::string renderer_material_json_;
     ModelStatus   status_;
     StubTokenizer tokenizer_;
+    mutable std::mutex kv_mutex_;
+    mutable std::vector<int> kv_cells_;   // by slot (the engine's sequence index)
 };
 
 }  // namespace

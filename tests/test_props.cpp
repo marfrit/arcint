@@ -189,6 +189,20 @@ TEST(props_endpoints_lists_the_token_routes) {
     CHECK(has("/tokenize"));
     CHECK(has("/detokenize"));
     CHECK(!has("/metrics"));   // --metrics off
+    CHECK(!has("/slots"));     // --slots off
+
+    // The two opt-in routes are named only once the operator asks for them:
+    // the list says what this process serves, not what it could serve.
+    cfg.metrics = true;
+    cfg.slots   = true;
+    // A value, not a reference: props() returns a temporary, and .at() into it
+    // would leave this dangling.
+    const nlohmann::json on = lgc::api::props(ctx).at("endpoints");
+    auto serves = [&](const char* path) {
+        return std::find(on.begin(), on.end(), path) != on.end();
+    };
+    CHECK(serves("/metrics"));
+    CHECK(serves("/slots"));
 }
 
 // The projector's own halves: /props must report libmtmd's vision/audio caps,

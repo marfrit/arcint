@@ -99,6 +99,7 @@ add_library(arcint_core STATIC
   src/api/responses.cpp
   src/api/responses_stream.cpp
   src/api/responses_state.cpp
+  src/api/slots.cpp
   src/api/tokenize.cpp
   src/http/server.cpp
 )

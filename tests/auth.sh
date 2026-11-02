@@ -358,7 +358,7 @@ stop_pid "$SRV_PID"; SRV_PID=""
 
 echo "== --api-key"
 PORT=$(free_port)
-"$BIN" --stub --host 127.0.0.1 --port "$PORT" --n-ctx 256 --api-key "$KEY" --metrics -v >"$WORK/key.log" 2>&1 &
+"$BIN" --stub --host 127.0.0.1 --port "$PORT" --n-ctx 256 --api-key "$KEY" --metrics --slots -v >"$WORK/key.log" 2>&1 &
 SRV_PID=$!
 wait_boot "$WORK/key.log" || { echo "key server did not boot" >&2; exit 1; }
 BASE="http://127.0.0.1:${PORT}"
@@ -378,6 +378,7 @@ expect_code "GET /v1/responses/renderer needs the key" "401" GET "/v1/responses/
 expect_code "GET /v1/models needs the key" "401" GET "/v1/models"
 expect_code "GET /props needs the key" "401" GET "/props"
 expect_code "GET /metrics needs the key" "401" GET "/metrics"
+expect_code "GET /slots needs the key" "401" GET "/slots"
 expect_code "HEAD /props needs the key" "401" HEAD "/props"
 expect_code "an unknown path 401s (no route enumeration before auth)" "401" GET "/no-such-route"
 

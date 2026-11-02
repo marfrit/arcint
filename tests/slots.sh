@@ -13,10 +13,25 @@
 #
 # The stub backend only: no model file, no GPU, so it belongs to the unit gate.
 #
-# Run standalone: BIN=/path/to/arcint PORT=8097 ./tests/slots.sh
-set -u
-BIN=${BIN:?BIN must be set to the arcint binary}
-PORT=${PORT:-8097}
+# Run standalone: ./tests/slots.sh /path/to/arcint
+set -uo pipefail
+
+BIN="${1:-}"
+if [[ -z "$BIN" || ! -x "$BIN" ]]; then
+    echo "usage: slots.sh /path/to/arcint" >&2
+    exit 2
+fi
+
+for tool in curl python3; do
+    command -v "$tool" >/dev/null || { echo "slots: $tool is required" >&2; exit 77; }
+done
+
+free_port() {
+    python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'
+}
+
+# A free port, like the other HTTP tests: the gate runs them side by side.
+PORT=${PORT:-$(free_port)}
 BASE=http://127.0.0.1:$PORT
 KEY='slots-test-key'
 RID='req-slotprobe-7'

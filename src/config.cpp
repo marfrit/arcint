@@ -204,6 +204,13 @@ std::string usage_text() {
         "                            with the request/token/prefill/decode/spec\n"
         "                            counters and the lane gauges. Off by default:\n"
         "                            without it the route does not exist\n"
+        "  --slots                   serve GET /slots: what each slot is doing right\n"
+        "                            now (id, lane, n_ctx, is_processing, the KV cells\n"
+        "                            its sequence holds, and the request id a busy\n"
+        "                            slot serves). State only - no prompt, no\n"
+        "                            generated text, no tokens, no sampling\n"
+        "                            parameters. Off by default, and behind --api-key\n"
+        "                            like every other route\n"
         "\n"
         "responses store\n"
         "  --responses-store-entries N  retained responses per lane (default: 32;\n"
@@ -442,6 +449,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             cfg.stub = true;
         } else if (arg == "--metrics") {
             cfg.metrics = true;
+        } else if (arg == "--slots") {
+            cfg.slots = true;
         } else if (arg == "--api-key") {
             if (!value(v) || v.empty()) return fail("--api-key needs a non-empty key");
             cfg.api_key = std::string(v);

@@ -425,6 +425,24 @@ public:
     virtual FinishReason generate(const GenerationInput& in, int slot,
                                   const TokenCallback& on_piece, GenerationStats& stats) = 0;
 
+    // GET /slots (--slots): the KV cells each slot's sequence holds, indexed by
+    // the same `slot` index generate() takes. The count is the position of the
+    // last cell written for that sequence plus one — the cells the sequence
+    // occupies NOW, whether or not a request is running on it: a released slot
+    // keeps its sequence until the next request on it clears it.
+    //
+    // llama-server's /slots has no field for this quantity. Its closest name,
+    // n_prompt_tokens_cache, counts the prompt tokens a task REUSED from the
+    // cache (code, the llama.cpp tree arcint builds against,
+    // tools/server/server-context.cpp:749: stats.n_prompt_cached) — a per-task
+    // statistic, not the cells held, so arcint names this one plainly instead of
+    // borrowing a name that would mean something else.
+    // Cheap by construction: the engine reads it under the same lock /props
+    // reads the loan state under (one lookup per sequence, no traversal) and
+    // copies the numbers out, so the JSON is built outside the lock. Empty: the
+    // backend has nothing to report.
+    virtual std::vector<int> kv_positions() const { return {}; }
+
     // One enrolled voice's waveform for `in.text` (docs/milestone-1.2.0.md A4).
     // `slot` is the lane. On success `wav` holds the container's bytes and
     // `error` is empty; on refusal or failure `error` says why and `wav` is

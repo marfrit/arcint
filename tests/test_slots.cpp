@@ -43,7 +43,9 @@ struct Fixture {
     SlotPool                 slots{2};
     Context                  ctx;
 
-    explicit Fixture(bool slots = true) : cfg(make_cfg(slots)), ctx{} {
+    // `with_slots` names the flag under test; the member `slots` is the pool,
+    // and a parameter of the same name would shadow it in the body.
+    explicit Fixture(bool with_slots = true) : cfg(make_cfg(with_slots)), ctx{} {
         backend     = make_stub_backend(4096);
         ctx.cfg     = &cfg;
         ctx.backend = backend.get();
@@ -94,7 +96,10 @@ TEST(slots_body_is_one_entry_per_slot_with_only_state) {
 
     CHECK(body.is_array());
     CHECK_EQ(static_cast<int>(body.size()), 2);
-    const std::vector<std::string> want = {"id", "lane", "n_ctx", "is_processing", "n_cache"};
+    // Sorted, because nlohmann's object is a std::map: the keys come back in
+    // alphabetical order whatever order they were written in. The set is the
+    // contract, not the wire order.
+    const std::vector<std::string> want = {"id", "is_processing", "lane", "n_cache", "n_ctx"};
     for (const json& e : body) {
         std::vector<std::string> k = keys(e);
         std::sort(k.begin(), k.end());
