@@ -508,6 +508,16 @@ if(ARCINT_TESTS)
     target_compile_options(arcint-gdn-state-rows PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME gdn-state-rows COMMAND arcint-gdn-state-rows)
     set_tests_properties(gdn-state-rows PROPERTIES LABELS unit)
+    # patch 0086/0087's device-free cell: a chain of prompt steps through
+    # ggml_gated_delta_net_replay equals the snapshot chain's bytes on the CPU
+    # backend (attention outputs and the final base state). The cards' arm is the
+    # replay-chain case in test-backend-ops (README 0086/0087).
+    add_executable(arcint-gdn-replay tests/test_gdn_replay.cpp)
+    target_link_libraries(arcint-gdn-replay PRIVATE arcint_core)
+    target_include_directories(arcint-gdn-replay PRIVATE "${ARCINT_LLAMA_DIR}/ggml/include")
+    target_compile_options(arcint-gdn-replay PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME gdn-replay COMMAND arcint-gdn-replay)
+    set_tests_properties(gdn-replay PROPERTIES LABELS unit)
     # patch 0082's device-free cell: one l2_norm over the joint q/k head groups
     # of the GDN conv output against the two separate norms, on the CPU backend,
     # byte equality; the gate cell reads the switch and the bf16 dispatch out of
@@ -530,6 +540,15 @@ if(ARCINT_TESTS)
                      "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_gdn_state_rows.py")
     set_tests_properties(gdn-state-rows-gate PROPERTIES LABELS unit)
+    # patch 0086/0087's wiring, read out of the patched tree (LLAMA_SRC): the
+    # switch defaults off, S gets two planes only when it is on, rollback drops
+    # pending records, a save writes base + records, replay disables the rows
+    # form, and the OpenCL kernel is built only under the switch.
+    add_test(NAME gdn-replay-gate
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_gdn_replay.py")
+    set_tests_properties(gdn-replay-gate PROPERTIES LABELS unit)
     add_test(NAME expert-profile-save
              COMMAND "${CMAKE_COMMAND}" -E env "EXPERT_PROFILE_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
                      "${Python3_EXECUTABLE}"

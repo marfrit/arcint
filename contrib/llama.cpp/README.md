@@ -5867,3 +5867,135 @@ improves. Exact commands:
 Bar: the answer-level gate (the same answers, mean KL no worse than the
 baseline arm's by 0.03 nats, argmax agreement down by at most 1 point);
 decode improves, prefill stays inside the run's spread.
+
+## 0086-ggml-gdn-replay-op.patch
+
+The gated delta-net's rollback by replay, the op and its CPU reference. Ours
+rolls a recurrent sequence back by keeping whole state snapshots (patch 0050):
+`n_rs_seq + 1` S planes per layer, and a verify's rollback reads the plane. The
+fork keeps one base state and, for each token after it, a record of the step's
+own small vectors — the value delta (`S_v * H` floats), the key (`S_v * H`) and
+the gate (`H`) — and re-applies them onto the base on rollback, so a rollback
+costs `R = H * (2 * S_v + 1)` floats per token a layer instead of a whole
+`S_v * S_v * H` plane. **Evidence class of the mechanism: `code`** (fork
+`arc-b580`: `ggml/include/ggml.h:599`, the CPU reference
+`ggml-cpu/ops.cpp:10998-11134`, "a replayed record repeats exactly its state
+update (scale by g, then mad k * delta)"); quality class `exact` (`paper`: the
+fork's replay == snapshot chain test; our device-free chain is below).
+
+The op `ggml_gated_delta_net_replay(ctx, q, k, v, g, beta, state, rec, ctrl, K)`
+appends `GGML_OP_GATED_DELTA_NET_REPLAY` to the enum (last, so no existing op
+number moves; `GGML_OP_COUNT` 103). `rec` is F32 `[R * (K - 1), 2, n_seqs]`
+(two banks), `ctrl` I32 `[2, n_seqs]` = `{n_rec, bank}`: `n_rec` records of
+that bank are replayed onto the input state before the new tokens. The packed
+output is `[attention `S_v*H*n_tokens` | base state `S_v*S_v*H` | records
+`(K-1)*R`]`; the base is the state after token `n_tokens - 1 - m`,
+`m = min(n_tokens - 1, K - 1)`, and one record per later token. `n_tokens == 0`
+replays the stored records only and returns the base. The CPU reference is
+bit-identical to the snapshot path's per-token step: scale the state by
+`exp(g)`, then mad each value row with `k * delta`; the record stores the delta
+per value row, the key per key row and the gate per head.
+
+**Device-free (`measured-here`)**: `tests/test_gdn_replay.cpp` runs a three-step
+chain (5 tokens, 3 with a rollback of 2, then 1; S 16, H 4, K 5) through both
+forms on the CPU backend and requires every step's attention output and the
+final base state byte-identical. `tests/python/test_gdn_replay.py` reads the
+patched tree for the enum's position, the packing, the prologue's operation
+order, the record write, the dispatch and the chain case. Red mutations, each
+run and failing before restore (`measured-here`): the prologue's mad dropped,
+the record's gate written as 0 — each fails the C chain; the Python cell's own
+faults are listed under 0087. The Python cell is source text; the C cell is
+numeric. The cards' arm is the replay-chain case in `test-backend-ops`
+(`exact=true` compares the replay and snapshot chains, max `|diff|` must be 0).
+
+## 0087-gdn-replay-memory-opencl.patch
+
+The memory, graph, models and the Intel OpenCL kernel for the replay. The
+decision is taken in `llama_memory_recurrent`'s constructor, before the tensors
+are created: `LLAMA_GDN_REPLAY` non-zero, `n_rs_seq > 0`, one sequence
+(`n_seq_max == 1`, `mem_size == 1`), offload, a qwen35/qwen35moe/qwen4exp model,
+F32 S, `S == 128`, `ssm_d_inner == S*H` and `n_embd_s() == S*S*H`, both banks of
+records fitting one S row, and every recurrent layer on the OpenCL backend
+(`code`). Any other model silently keeps the snapshot path. With replay on, S
+allocates `mem_size * 2` rows (plane 0 base, plane 1 two record banks); the
+snapshot planes `2..n_rs_seq` are not allocated. The conv state keeps all its
+planes in both modes.
+
+Rollback (`seq_rm`) reduces the sequence's pending record count instead of
+moving the snapshot index; a rollback beyond the kept records warns ("cannot
+roll back %d tokens, only %u kept") and declines. A whole-sequence removal
+resets the pending records with the cells, so no stale record is replayed onto
+a cleared state. Each launch takes the base
+from plane 0 at its row and toggles the record bank; a state save with pending
+records writes header `s_trans = 2` and the records after the S rows, and the
+reader takes `s_trans == 2` only in replay mode — a snapshot reader rejects it
+as incompatible rather than load a stale state (`code`).
+
+Replay and the rows form of patch **0081 combine by exclusion**: replay's
+`inp->s_rpl_ctrl` set makes the models take the replay branch and
+`llama_gdn_state_rows_enabled` is not consulted, so a replay run reads its base
+through its own row indices and does not use `s_rows`. With replay off and
+either switch as before, the rows form and the snapshot path are unchanged and
+byte-identical. With replay on and rows off, the replay is the one in use.
+
+OpenCL: `gated_delta_net_intel.cl` gets a `GDN_RPL` build of the generation
+kernel with the replay prologue (re-applying `n_rec` records in the step's own
+order: `S = fma(k, delta, g*S)` row by row, the same sub-group reduction) and
+the epilogue (base once, one record per later token: delta per value row, key
+per key row, gate per head). The program is built only when the switch is on
+(`code`: the fork's SYCL kernel has the same prologue and epilogue); the decode
+price is not measured here — the card arm below measures it. If the device
+refuses the build the kernel stays null and the op runs on the CPU.
+`supports_op` takes F32 state, a scalar gate, F32 records and I32 control,
+`S_v == 128`; the dispatch passes 30 arguments with `{H_v*sg, n_seqs,
+S_v/rows}` work-groups. With the switch off, the backend's programs, kernels,
+arguments and bytes are as before.
+
+**VRAM saved, from the shapes (`code`; the three served units)**: one S plane is
+`S_v * S_v * H * 4` bytes a layer, and replay frees `n_rs_seq - 1` of them a
+layer (conv state untouched). Agent (Qwen3.8-27B, 65 blocks, interval 4 -> 49
+recurrent layers, `S_v 128`, `H = 6144/128 = 48`, 3 MiB a plane, MTP 5 ->
+`n_rs_seq 5`): **588 MiB**. Flash-Next (`qwen4exp`, 48 blocks, interval 4 -> 36
+recurrent, `H = 6144/128 = 48`, 3 MiB, MTP 3 -> `n_rs_seq 3`): **216 MiB**.
+Coder (`qwen35moe`, 41 blocks, interval 4 -> 31 recurrent, `H = 4096/128 = 32`,
+2 MiB, MTP 4 -> `n_rs_seq 4`): **186 MiB**. The interval is the hparams default
+4 used where the GGUF does not carry `full_attention_interval`; a model that
+carries a different interval scales linearly with its recurrent-layer count.
+The audit's fork figure is 432 MiB (48 recurrent x 3 freed planes x 3 MiB at
+`n_rs_seq 4`, `paper`).
+
+**Device-free (`measured-here`)**: the C chain above plus
+`tests/python/test_gdn_replay.py` — the switch's default off and the
+`atoi(env) != 0` term, `n_rows_s = rpl ? mem_size * 2 : n_rows`, the rollback's
+pending-record bound and warp, `s_trans = 2` and the records' save/read, the
+rows exclusion in both qwen35 and qwen4exp, the replay branch's op and the
+record cpy/set-rows, the `GDN_RPL` kernel's prologue `fma`, the epilogue's
+record writes and the host's build gate. Red mutations, each run and failing
+before restore (`measured-here` on the patched tree): the CPU prologue's mad
+dropped and the record's gate written as 0 — each fails the C chain (first
+differing element 640, `FAILED: 2`) and the Python cell; `n_rows_s` left at
+`n_rows`; the kernel's prologue `fma` rewritten as `a*b + c*d`; the switch's
+comparison flipped to `== 0`; the whole-sequence pending reset dropped. Restored,
+`ctest -L unit` is 26/26. `GGML_OPENCL_DEVICES` and the recipe
+builds stay the same; nothing is built for the switch when it is off.
+
+**Card arms (owed; Claude runs them in a card window, not yet measured)**:
+1. Sequential arms on the B60 (`GGML_OPENCL_DEVICES=0:0`) and the A770
+   (`GGML_OPENCL_DEVICES=1:0`), one fresh process an arm:
+   `LLAMA_GDN_REPLAY=1 ./bin/test-backend-ops -b GPUOpenCL -o GATED_DELTA_NET_REPLAY`
+   and the same without the env for `GATED_DELTA_NET`; the replay-chain cases
+   (chains A/B, 4 shapes) must pass at max `|diff| 0`, and the existing
+   snapshot cases must be unchanged. Red on the card: rewrite the kernel's
+   prologue `fma` as `a*b + c*d`, rebuild, and the chain cases fail; restore.
+2. Served arm, agent (dense 27B), MTP 5, 138K needle:
+   `printf '#!/bin/sh\nexport LLAMA_GDN_REPLAY=1\nexec %s "$@"\n' <arcint-binary> > /tmp/arcint-gdnrpl && chmod +x /tmp/arcint-gdnrpl`
+   `python3 tests/acceptance/ab.py agent --old <arcint-binary> --new /tmp/arcint-gdnrpl --gguf <agent.gguf> --device GPU.0 --assets <assets> --rounds 2 --out /tmp/ab-87-agent`.
+   Record decode, prefill-55k/138k, `draft accept`, the texts md5, and peak
+   VRAM (fdinfo) — expected ~588 MiB lower at MTP 5 from the shapes above.
+   Bar: answers and texts equal, `draft accept` unchanged, peak VRAM lower by
+   the stated amount; decode recorded. If a text differs or the acceptance
+   moves, the switch stays off and the finding is recorded.
+3. The same with Flash-Next on the B60 (MTP 3, IQ3_XXS; expected ~216 MiB) and
+   the coder on the A770 (MTP 4, `--device GPU.1`; expected ~186 MiB). Record
+   each; a rollback-heavy verify (a long draft, repeated cuts) is the one to
+   watch.
