@@ -236,6 +236,57 @@ check "the pre-routing 401 carries a generated id" \
 h=$(curl -sS -D - -o /dev/null -H "X-Request-Id: $SUPPLIED" "$BASE/props" | tr -d '\r')
 check "the pre-routing 401 echoes a supplied id" \
   "$([[ "$(hdr "$h" 'x-request-id')" == "$SUPPLIED" ]] && echo 0 || echo 1)"
+
+# Expect: 100-continue is answered above routing: httplib calls the expect-100
+# handler before the pre-routing handler, so the auth refusal happens there and
+# the id has to be resolved there too. A caller that sent a usable id must get
+# that id back on the 401, not a generated one.
+PORT="$PORT" python3 - <<'PY' || FAILED=$((FAILED + 1))
+import os, re, socket, sys
+
+port = int(os.environ["PORT"])
+GEN = re.compile(rb"^req-[0-9a-f]{16}$")
+
+def with_expect(id_bytes):
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    s.sendall(b"POST /chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+              b"Expect: 100-continue\r\nContent-Length: 2\r\n"
+              b"X-Request-Id: " + id_bytes + b"\r\n\r\n")
+    s.settimeout(3.0)
+    blob = b""
+    try:
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            blob += chunk
+    except socket.timeout:
+        pass
+    s.close()
+    return blob
+
+rc = 0
+for name, sent, want in (("a valid id", b"abc-123", b"abc-123"),
+                        ("an invalid id", b"ab cd", None)):
+    blob = with_expect(sent)
+    lines = blob.split(b"\r\n")
+    status = lines[0].split()[1] if len(lines[0].split()) >= 2 else b"?"
+    got = [ln for ln in lines[1:] if ln.lower().startswith(b"x-request-id:")]
+    value = got[0].split(b":", 1)[1].strip() if got else None
+    ok = (status == b"401"
+          and not any(ln.startswith(b"HTTP/1.1 100") for ln in lines))
+    if want is None:
+        ok = ok and value is not None and bool(GEN.match(value))
+    else:
+        ok = ok and value == want
+    verdict = (f"401 with x-request-id: {value.decode() if value else '<none>'}"
+               if ok else f"status={status.decode()} x-request-id="
+                         f"{value.decode() if value else '<none>'} blob={blob[:80]!r}")
+    print(("  ok   " if ok else "  FAIL ") + f"Expect: 100-continue with {name}: {verdict}")
+    if not ok:
+        rc = 1
+sys.exit(rc)
+PY
 h=$(curl -sS -D - -o /dev/null -H 'Access-Control-Request-Method: POST' -X OPTIONS "$BASE/props" | tr -d '\r')
 check "a CORS preflight carries the id" "$(printf '%s' "$(hdr "$h" 'x-request-id')" | grep -Eq "$GENERIC" && echo 0 || echo 1)"
 check "the preflight allows the X-Request-Id header" \
