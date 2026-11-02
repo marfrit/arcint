@@ -10,6 +10,7 @@ filter and the order; the material is in `research-concept-mining/`:
   served series 0001-0067): what arcint has, how its build differs, the quality class, the units, the
   pricing measurement, an implementation sketch with red-first tests;
 - `design-layer-major.md`: how candidate 1 would be built in the llama engine, and why its prize here is small.
+- `arc-b580/`: the same method on one Arc inference fork (208 commits), ranked and audited against our code.
 
 Evidence classes: an engine's numbers are `paper` for us; what was read in a source tree is `code`; nothing
 in this survey was run on our cards. Every row has to be priced on the cards before it counts.
