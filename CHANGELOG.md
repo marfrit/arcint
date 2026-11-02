@@ -33,7 +33,10 @@ and arcint's log lines for the same request can be matched.
   log-field separator fall outside it. The header is on successes, on
   400/401/404/409/500, on the pre-routing auth refusal, on a CORS preflight and
   on SSE responses before the first chunk (`code`, httplib's pre-routing handler
-  runs before routing, so the id is resolved once for every request).
+  runs before routing, so the id is resolved once for every request). A request
+  refused by the `Expect: 100-continue` handler -- which runs above routing, so
+  the pre-routing handler never sees it -- resolves the id there instead, so its
+  401 carries the caller's id and not a fresh one (`measured-here`).
 - **` rid=<id>` on the request's own log lines** (`measured-here`): the http
   logger line, the refusal lines, the per-request prefill/decode summary and its
   abort line. The id rides on the prepared request struct the handlers already

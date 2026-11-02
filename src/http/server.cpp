@@ -67,6 +67,11 @@ api::PeerProbe peer_probe(socket_t sock) {
 // only if it fits api::resolve_request_id's grammar; the bytes it sent are never
 // logged, only the fact that they were replaced.
 void apply_request_id(const httplib::Request& req, httplib::Response& res) {
+    // Once per response. The expect-100 path resolves the id before routing and
+    // routing's own pre-routing handler runs afterwards for the same response;
+    // a second pass would mint a DIFFERENT id whenever the inbound value was
+    // unusable, and would log the replacement twice.
+    if (res.has_header(api::kRequestIdHeader)) return;
     const api::RequestId rid = api::resolve_request_id(req.get_header_value(api::kRequestIdHeader));
     res.set_header(api::kRequestIdHeader, rid.id);
     if (rid.replaced) {
@@ -323,6 +328,11 @@ void HttpServer::Impl::route() {
         // the connection (the default arm) without reading the body.
         svr->set_expect_100_continue_handler(
             [this](const httplib::Request& req, httplib::Response& res) -> int {
+                // Above routing() as well, so this is where the id has to be
+                // resolved when this handler is the one answering the 401: the
+                // pre-routing handler never sees the request. Resolved here, it
+                // is the same id the rest of the response would have carried.
+                apply_request_id(req, res);
                 if (auth_exempt(req)) return 100;
                 if (!authorized(req, res)) return 401;
                 return 100;
