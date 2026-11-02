@@ -100,6 +100,10 @@ class MemoryAndOpenCL(unittest.TestCase):
         self.assertIn("mem->rpl_n[seq]    = std::min(n_seq_tokens - 1, mem->n_rs_seq);", m)
         self.assertIn("mem->rpl_bank[seq] = (uint8_t) (bank ^ 1);", m)
         self.assertIn("const uint32_t s_trans = rpl_pending > 0 ? 2 : 0;", m)
+        # a whole-sequence removal clears the pending records with the cells
+        i = m.index("const bool rm_all = p0 == 0")
+        j = m.index("// models like Mamba", i)
+        self.assertIn("rpl_reset(seq_id);", m[i:j])
         self.assertIn("io.write(&rpl_pending, sizeof(rpl_pending));", m)
         self.assertIn("io.write(&rpl_R,       sizeof(rpl_R));", m)
 

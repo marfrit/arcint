@@ -40,7 +40,7 @@ int g_failures = 0;
         if (!(cond)) { printf("FAIL: %s\n", what); ++g_failures; } \
     } while (0)
 
-int64_t S = 16;
+int64_t S = 32;
 int64_t H = 4;
 int64_t K = 5;
 int64_t D = S * S * H;
@@ -132,9 +132,9 @@ run_result run_chain(bool uses_snap) {
             const size_t base_off = S * H * n * sizeof(float);
             ggml_tensor * cb = ggml_cpy(ctx, ggml_view_2d(ctx, o, D, 1, D * sizeof(float), base_off),
                                              ggml_view_2d(ctx, cache, D, 1, cache->nb[1], 0));
-            ggml_tensor * sr = ggml_set_rows(ctx,
-                ggml_view_2d(ctx, cache, RK, 2, RK * sizeof(float), cache->nb[1]),
-                ggml_view_2d(ctx, o, RK, 1, RK * sizeof(float), base_off + D * sizeof(float)), wrow);
+            ggml_tensor * dstv = ggml_view_2d(ctx, cache, RK, 2, RK * sizeof(float), D * sizeof(float));
+            ggml_tensor * srcv = ggml_view_2d(ctx, o, RK, 1, RK * sizeof(float), base_off + D * sizeof(float));
+            ggml_tensor * sr = ggml_set_rows(ctx, dstv, srcv, wrow);
             ggml_build_forward_expand(gf, cb);
             ggml_build_forward_expand(gf, sr);
             rec = ggml_reshape_3d(ctx, sr, RK, 2, 1);

@@ -5923,7 +5923,9 @@ planes in both modes.
 
 Rollback (`seq_rm`) reduces the sequence's pending record count instead of
 moving the snapshot index; a rollback beyond the kept records warns ("cannot
-roll back %d tokens, only %u kept") and declines. Each launch takes the base
+roll back %d tokens, only %u kept") and declines. A whole-sequence removal
+resets the pending records with the cells, so no stale record is replayed onto
+a cleared state. Each launch takes the base
 from plane 0 at its row and toggles the record bank; a state save with pending
 records writes header `s_trans = 2` and the records after the S rows, and the
 reader takes `s_trans == 2` only in replay mode — a snapshot reader rejects it
@@ -5941,8 +5943,9 @@ kernel with the replay prologue (re-applying `n_rec` records in the step's own
 order: `S = fma(k, delta, g*S)` row by row, the same sub-group reduction) and
 the epilogue (base once, one record per later token: delta per value row, key
 per key row, gate per head). The program is built only when the switch is on
-(`arc-b580` code, `paper` for the fork's +? % — no price measured here); if the
-device refuses the build the kernel stays null and the op runs on the CPU.
+(`code`: the fork's SYCL kernel has the same prologue and epilogue); the decode
+price is not measured here — the card arm below measures it. If the device
+refuses the build the kernel stays null and the op runs on the CPU.
 `supports_op` takes F32 state, a scalar gate, F32 records and I32 control,
 `S_v == 128`; the dispatch passes 30 arguments with `{H_v*sg, n_seqs,
 S_v/rows}` work-groups. With the switch off, the backend's programs, kernels,
@@ -5969,9 +5972,11 @@ rows exclusion in both qwen35 and qwen4exp, the replay branch's op and the
 record cpy/set-rows, the `GDN_RPL` kernel's prologue `fma`, the epilogue's
 record writes and the host's build gate. Red mutations, each run and failing
 before restore (`measured-here` on the patched tree): the CPU prologue's mad
-dropped; the record's gate written as 0; `n_rows_s` left at `n_rows`; the
-kernel's prologue `fma` rewritten as `a*b + c*d`; the switch's comparison
-flipped to `== 0`. Restored, all pass. `GGML_OPENCL_DEVICES` and the recipe
+dropped and the record's gate written as 0 — each fails the C chain (first
+differing element 640, `FAILED: 2`) and the Python cell; `n_rows_s` left at
+`n_rows`; the kernel's prologue `fma` rewritten as `a*b + c*d`; the switch's
+comparison flipped to `== 0`; the whole-sequence pending reset dropped. Restored,
+`ctest -L unit` is 26/26. `GGML_OPENCL_DEVICES` and the recipe
 builds stay the same; nothing is built for the switch when it is off.
 
 **Card arms (owed; Claude runs them in a card window, not yet measured)**:
