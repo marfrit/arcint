@@ -24,7 +24,7 @@ PKGREL=1
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
 # sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v1.4.2.tar.gz,
 # taken after the tag was pushed (recorded in the follow-up commit, as for every tag).
-ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-}
+ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-33a1923d465fc808cd2a6a56e2bf31be78a13443d1d9094b261bd75224446ce6}
 # The libllama engine (--engine llama) builds against llama.cpp at this pin
 # with contrib/llama.cpp/patches applied (contrib/llama.cpp/README.md): the
 # GitHub tarball of the commit, checked by sha256.
