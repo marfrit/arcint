@@ -472,6 +472,14 @@ if(ARCINT_TESTS)
                      "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_cpu_miss_prefetch.py")
     set_tests_properties(cpu-miss-prefetch PROPERTIES LABELS unit)
+    # patch 0080's device-free cell: the MTP KV-only branch's store half equals the
+    # full graph's, nothing follows it, and the switch defaults off. The K/V byte
+    # equality is the card arm (README 0080).
+    add_test(NAME mtp-kv-only
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_mtp_kv_only.py")
+    set_tests_properties(mtp-kv-only PROPERTIES LABELS unit)
     add_test(NAME expert-profile-save
              COMMAND "${CMAKE_COMMAND}" -E env "EXPERT_PROFILE_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
                      "${Python3_EXECUTABLE}"

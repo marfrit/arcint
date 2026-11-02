@@ -5509,3 +5509,70 @@ buys nothing by the premise.
 Owed on the cards, unchanged: the cold/warm pair at level 0 and the same A/B on
 the other units; the audit's bar — major faults above ~5 % of the CPU lane —
 decides a default. With faults ~0 already measured, it is ~0.
+
+## 0080-llama-mtp-kv-only.patch
+
+The MTP head's prompt pass computed only its K/V. A draft context's catch-up
+decode (the head's prompt fill) has no output rows: it exists so the later
+draft steps can read this layer's K/V. Ours built the whole MTP block for every
+prompt row anyway — `Qcur_full` (query + gate), attention, the gated output
+projection, the residual, FFN and the shared head — and cut only the output
+rows (patches 0010 and 0067 cut the *outputs* rows, not the graph; `code`:
+`src/models/qwen35.cpp`'s `graph_mtp` constructor, `qwen35moe.cpp`'s the same).
+**Evidence class of the mechanism: `code`** (fork 595d554c90, `LLAMA_MTP_KV_ONLY`
+in `arc-b580/src/models/qwen35.cpp:756-793`): the fork gates the graph after
+the cache store when `n_outputs == 0` and masked extraction is on, keeping the
+K/V ops identical and in the same order on the same shapes. The quality class
+is `exact`: the retained K/V rows are the full graph's (`code`; the fork's byte
+equality claim, not measured here).
+
+The patch, behind `LLAMA_MTP_KV_ONLY` (**off by default**; `1` enables it,
+`0` keeps the full graph, `code`): after the cache store the graph returns —
+K projection, reshape, K norm, RoPE, the optional cache rotations, then V, then
+`expand V`, `expand K`, `cpy_k`, `cpy_v`, the store half of `build_attn` in its
+own order. The Q projection is kept for `n_tokens <= 8`, as the fork does (its
+same-input mat-mul run's tile depends on the largest member; this OpenCL
+backend has no such run today — `code`, the only MUL_MAT fusion is 0019's
+gate+up+GLU — kept for parity with the fork's rule). The branch is taken only
+when `n_outputs == 0`, `cparams.embeddings_nextn_masked`, and the layer has no
+fused `wqkv` and no K/V bias — a fused projection would not be reproduced by
+the branch, so those layers keep the full graph (`code`). With the switch off
+the graph is byte-identical to before.
+
+**Scope (`code`)**: `qwen35` (the dense agent) and `qwen35moe` (the coder),
+both share the block shape. `qwen4exp` (Qwen3.8-Flash-Next)'s MTP graph is a
+hyper-connection graph whose K/V store sits inside `build_layer_attn`; it does
+not share the shape, so it is not in this patch. `qwen3next` shares the shape
+but is not a served unit; it is left as it is.
+
+Device-free (`code`): `tests/python/test_mtp_kv_only.py` reads the patched tree
+and asserts the branch's store half — the K mat-mul, reshape, K norm and RoPE
+the full graph's `build_qkv(reshape=false)` builds, V the same, V expanded
+before K, K stored before V, the rotations before the expands — that nothing
+follows the store (no attention, output projection, FFN or head), that the
+branch is gated on a masked no-output decode on a layer without a fused wqkv or
+K/V bias, and that the switch defaults off. Red mutations run before restore
+(`measured-here` on the patched tree): cpy_v dropped, the default flipped
+(`e == nullptr || ...`), the K norm dropped from the branch, the expand order
+swapped, the early `return;` dropped — each made its cell fail; restored, the
+cell passes. These are **source-text assertions** (they read the patched
+tree), not numerics.
+
+Card arms (owed; Claude runs them in a card window, **not yet measured**):
+1. **B60, agent (dense 27B), MTP 5**, the 18K/55K corpus prompt from
+   `tests/acceptance/cells/served_check.py`, two arms in one window, switch off
+   the old binary's arm and on the new one's:
+   `printf '#!/bin/sh\nexport LLAMA_MTP_KV_ONLY=1\nexec %s "$@"\n' <arcint-binary> > /tmp/arcint-kvonly && chmod +x /tmp/arcint-kvonly`
+   `python3 tests/acceptance/ab.py agent --old <arcint-binary> --new /tmp/arcint-kvonly --gguf <agent.gguf> --device GPU.0 --assets <assets> --rounds 2 --out /tmp/ab-80-agent`.
+   Record `prefill-55k`/`prefill-138k`, the decode rate, `draft accept` and
+   `verify` of both arms, and the texts md5; the bar is prefill up with the
+   same texts and the same accept counters (a K/V that differed would change
+   the draft's proposals and its acceptance; the audit's price is ~5 % on long
+   prompts, `paper`). The same with the coder on the A770 (`--device GPU.1`,
+   `ab.py coder`, MTP 4) — its prefill-41k is the prompt-side arm.
+2. **Draft K/V equality, stated as an observable**: three prompts served under
+   both arms in one process each; the `draft accept %` and the `verifies` of
+   the runs must be identical (the runs are the same workload, so any K/V row
+   difference moves them). A direct per-row dump is not available in either
+   arm; if the accept counters differ, the switch stays off and the finding is
+   recorded, not absorbed.
