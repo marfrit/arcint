@@ -467,6 +467,13 @@ if(ARCINT_TESTS)
     # off), a block-ahead hint in every row function, the volatile page touch and
     # its level-2 guard in both compute paths. The residency and parity arms are
     # in tests/test-opencl-miss-cpu.cpp (the patch's own C cell).
+    # patch 0083's device-free cell: LLAMA_SYNC_TRIM's default-off, the trim
+    # predicate, the device KV rotations and the one sampled-id read.
+    add_test(NAME round-trip-trim
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_round_trip_trim.py")
+    set_tests_properties(round-trip-trim PROPERTIES LABELS unit)
     add_test(NAME cpu-miss-prefetch
              COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
                      "${Python3_EXECUTABLE}"
