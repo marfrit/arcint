@@ -376,6 +376,15 @@ if(ARCINT_TESTS)
                    "$<TARGET_FILE:arcint>")
   set_tests_properties(auth PROPERTIES TIMEOUT 120 LABELS unit)
 
+  # X-Request-Id: the header contract (a valid inbound id is echoed, an absent
+  # one is generated as req-<16 hex>, an invalid one is replaced and its bytes
+  # appear nowhere) and the `rid=` carry-through of one request's own log
+  # lines. Stub-only, device-free, so it belongs to the unit gate.
+  add_test(NAME reqid
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/reqid.sh"
+                   "$<TARGET_FILE:arcint>")
+  set_tests_properties(reqid PROPERTIES TIMEOUT 240 LABELS unit)
+
   # ops-2 item 6: a bad --tls-cert/--tls-key is refused before the model load.
   # In a build without ARCINT_TLS the script reports SKIP (77), so it reads as
   # skipped rather than as a pass that asserted nothing; the ARCINT_TLS=ON gate
