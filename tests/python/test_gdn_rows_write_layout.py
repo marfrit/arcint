@@ -24,4 +24,7 @@ g = open(os.path.join(os.environ.get("LLAMA_SRC", ""), "ggml/src/ggml-opencl/ker
 check("generic kernel: the final state goes to the per-sequence base",
       "data_dst[s_off + state_out_base + col * S_V" in g and "data_dst[s_off + state_base +" not in g)
 check("generic kernel: snapshots use the per-sequence base", "target_slot * state_size_per_snap + state_out_base" in g)
+tb = open(os.path.join(os.environ.get("LLAMA_SRC", ""), "tests/test-backend-ops.cpp")).read()
+ev = tb[tb.index("make_test_cases_eval("):tb.index("make_test_cases_perf()")]
+check("test-backend-ops runs the rows cases in eval mode", ev.count("false, false, 1, true));") >= 3)
 sys.exit(1 if fail else 0)

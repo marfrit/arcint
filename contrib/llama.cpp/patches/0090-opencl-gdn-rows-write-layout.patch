@@ -63,3 +63,21 @@ index 0c6f67a..75baa31 100644
  
      // token 0's inputs; then each step fetches the next token's first
      float kn[KL], qn[KL], vn[R], gn = 0.f, bn = 0.f;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index e53017f..55f4697 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12835,6 +12835,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2, false, true));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true,  true));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 4, 2, 1, true,  true));
++    // patch 0090: the rows form (0081) in EVAL mode, against the CPU rows reference. 0081 registered these only
++    // in the perf list, which never compares, so a kernel that wrote snapshots and dst at the cache-row base passed.
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, false, 1, true)); // TG rows
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 2, 1, false, false, 1, true)); // TG rows, 2 seqs
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 3, 2, 1, false, false, 3, true)); // verify rows, K=3
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, false, 1, true)); // PP-64 rows
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, false, false, 1, true));    // small, 2 seqs
+     // chunked path: multi-chunk and non-multiple-of-chunk-size (chunk_size=64 GDN, 16 KDA)
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 127, 1));

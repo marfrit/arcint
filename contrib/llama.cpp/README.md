@@ -6319,6 +6319,6 @@ base for the WRITES: the verify snapshots (`snap_buf + slot * snap_stride + stat
 (`ggml-cpu/ops.cpp`: `s_out = state_out_base + (seq * H + head) * S_v * S_v`, `code`), so on the card the state
 landed at the wrong offset. Measured (window 57, the A770 coder, one run, `measured-here`): with the switch on an
 answer gate failed, the output md5 differed and decode fell from 51 to 21 t/s. The fix splits the base:
-`state_base_rd` (the cache row, rows form only) for the read, `state_base` (per sequence) for every write. The generic kernel (`gated_delta_net.cl`) had the same defect in its K == 1 final write only (its snapshots already used `state_out_base`); it now writes to `state_out_base` too.
+`state_base_rd` (the cache row, rows form only) for the read, `state_base` (per sequence) for every write. The generic kernel (`gated_delta_net.cl`) had the same defect in its K == 1 final write only (its snapshots already used `state_out_base`); it now writes to `state_out_base` too. Why the card cases missed it: 0081 registered its rows cases only in `make_test_cases_perf`, which times and never compares; 0090 adds them (plus a small 2-sequence case) to the eval list.
 Device-free cell: `tests/python/test_gdn_rows_write_layout.py` (text). Card arm owed: test-backend-ops
 GATED_DELTA_NET rows cases on both cards and the coder's served A/B with the switch on.
