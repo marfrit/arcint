@@ -5509,3 +5509,140 @@ buys nothing by the premise.
 Owed on the cards, unchanged: the cold/warm pair at level 0 and the same A/B on
 the other units; the audit's bar — major faults above ~5 % of the CPU lane —
 decides a default. With faults ~0 already measured, it is ~0.
+
+## 0083-round-trip-trim.patch
+
+Round-trip discipline on the decode/MTP step, the three cuts that apply to
+this stack, behind one bit mask. `LLAMA_SYNC_TRIM` defaults to **0 here** (all
+bits off, byte-identical to before); the fork's commits below default to 3.
+The mechanisms are `code` at the cited lines; the queue and per-read costs are
+the fork's `measured-here` on its SYCL stack, **not measured on the B60 here**.
+No ggml op or kernel changes, so `test-backend-ops` has no new case; the card
+arm is a served A/B.
+
+**The count, before → after** (code reading, this tree; an MTP verify of 5
+rows, the drafter's per-step read, one attention graph):
+
+| round trip | before | after (bits 1/2/4) | where |
+|---|---|---|---|
+| context synchronizes a verify (5 logit rows + the nextn row) | 6 | 1 | `src/llama-context.cpp` C getters (each `synchronize()`); verify reads at `src/exec/backend_llama.cpp:2611` and `src/exec/llama_spec.cpp:495` |
+| context synchronizes a draft step, head on | 1 | 1 | one nextn getter a step, `src/exec/llama_spec.cpp:632` |
+| context synchronizes a draft step, head off, one lane | 2 | 1 | `src/exec/llama_spec.cpp:635,636` (logits and nextn, same step) |
+| KV rotation inputs uploaded a graph (target verify and draft alike) | 2 split inputs, 2 blocking copies, ~272 KB | 0 | `src/llama-kv-cache.cpp:1692,1708` (builders), `:2066,2078` (setters) |
+| small device→host reads for a batch's sampled ids, n rows | n | 1 | `src/llama-context.cpp:3242` (one copy); per-row read stays the fallback |
+
+Bit 1 (`code`, fork 60ef575f3b): `synchronize()` returns before the device wait
+when `!sync_pending` and not under pipeline parallelism; `sync_pending` is set
+at encode, decode, graph compute and the epoch iterator, cleared at the wait
+(`llama-context.cpp:1778`, `:2573`, `:2872`, `:3846`, `:4943`). A getter after
+the first on a clean context finds its results already complete; it cannot wait
+for another context's work (the one in-order queue is shared).
+
+Bit 2 (`code`, fork 4ec75c3416): the cache allocates `attn_rot_dev` once in its
+own buffer type when there is one non-host buffer (`llama-kv-cache.cpp:389`),
+fills it once from `attn_rot_hadamard`, and `build_input_k_rot/v_rot` return
+those tensors; `set_input_*_rot` skip a non-input tensor. Same Hadamard values,
+copied once instead of uploaded a graph. `attn_inp_k_rot` is 256×256 f32,
+`attn_inp_v_rot` 64×64.
+
+Bit 4 is the form of "one id read where there are several" that applies here
+(`code`): with backend samplers, decode copied each sampled id with its own
+small async read (`copy_tensor_async_rows`). The graph now concatenates the
+batch's sampled ids into one I32 tensor after the sampler chains
+(`llama-graph.cpp:4352`, n_rows−1 tiny CONCAT kernels) and decode reads it once
+(`llama-context.cpp:3242`); the same integers in the same row order. This bit
+is **not on arcint's served path today**: arcint samples in its own `Sampler`
+and does not use backend sampling. The fork's draft-chain form (all draft ids
+of a one-graph chain, fork b0376aec39, ~0.2 ms a small read there) does not
+apply: arcint's drafter runs one graph a draft step, each step's token being
+the next step's input, and the expert-route trace's ids are already one batch
+(patch 0069).
+
+Switch-off equivalence: bits 0 leave each call as it was — the same returns,
+the same blocking copies, the same per-row reads. Bits on change only the
+number of waits and copies, never a value.
+
+Red cases, each run and seen failing before it was restored (device-free cell
+`tests/python/test_round_trip_trim.py`, `ctest -L unit`, `round-trip-trim`):
+(a) `LLAMA_SYNC_TRIM` default 0 → 3: the default-off cell fails; (b) the
+predicate's `!sync_pending` dropped: the predicate cell fails; (c) the
+device-rotation return dropped from `build_input_v_rot`: the rotation cell
+fails; (d) the sampled-id concat's bit 4 → 8: the one-read cell fails.
+
+Recipe: `~/bin/arcint-recipe.sh ~/src/ligence-gaps-b gaps-b580-b` — green,
+18/18 unit tests (2026-11-02), the patch applies on the pin.
+
+Card arm (Claude, one announced window, no GPU run here): the same-binary
+served A/B with the switch off against bits 1+2+4 on, two runs each, alternated;
+the answers and the answer-level bar (facts, needle, task), decode and prefill
+per phase. Exact commands, with the binary named by the package under test:
+
+    cp bin/arcint /tmp/arcint-trim
+    printf '#!/bin/sh\nexec env LLAMA_SYNC_TRIM=0 /tmp/arcint-trim "$@"\n' > /tmp/arm-off; chmod +x /tmp/arm-off
+    printf '#!/bin/sh\nexec env LLAMA_SYNC_TRIM=7 /tmp/arcint-trim "$@"\n' > /tmp/arm-on;  chmod +x /tmp/arm-on
+    python3 tests/acceptance/ab.py flashnext --old /tmp/arm-off --new /tmp/arm-on \
+        --gguf <model.gguf> --device GPU.<N> --assets <dir> --rounds 2
+    python3 tests/acceptance/ab.py agent     --old /tmp/arm-off --new /tmp/arm-on \
+        --gguf <model.gguf> --device GPU.<N> --assets <dir> --rounds 2
+
+Bar: decode (the target phase with MTP on) improves; prefill stays inside the
+run's spread. The fork's own numbers (2 syncs + 2 blocking copies a graph,
+~0.2 ms a small read) are its stack's; the B60 price is this window's to say.
+
+## 0084-llama-fast-topk.patch
+
+The long vocabulary's top-k, selected straight from the logits row
+(`code`, fork a3586a10d8). The top-k sampler partial-sorts a candidate array
+built over the whole vocabulary; over 248320 entries that is a full copy plus
+`std::partial_sort` per sample. `llama_top_k_from_logits` (new, declared in
+`include/llama.h`, defined in `src/llama-sampler.cpp`) starts from the k first
+entries, replaces the heap top by every strictly larger logit in index order
+and sorts the heap — the steps of libstdc++ `std::partial_sort`, so entries
+and the order of equal logits are identical, ties, NaN and inf included. No
+rounding, no reordering.
+
+**Count, before → after**: a sample's candidate work goes from 248320 entries
+built and partial-sorted to k entries' heap plus one scan. The entry count is
+`code`; the microseconds the fork measured (200K entries, k=1 241→9.6 µs,
+k=10 647→71 µs; +1.9 % greedy and +1.85 % Hermes decode with MTP) are
+`measured-here` on its stack, not on the B60 here.
+
+The patch is a library entry point; the switch lives at its caller, arcint's
+`Sampler::collect_candidates` (`src/core/sampler.cpp:1107`): with
+`LLAMA_SAMPLER_FAST_TOPK=1` (default **0**) and `top_k > 0` and the top-k
+smaller than the vocabulary, the row's top-k comes from the helper; otherwise
+the old full-array path runs unchanged, byte-identical. The probe path
+(`top_k <= 0`, 2048 candidates) and the full-sort fallback keep
+`std::partial_sort`. A future llama common-sampler caller can use the same
+entry point; the common library is not built by arcint (`LLAMA_BUILD_COMMON
+OFF`), so nothing in the product changes with the patch alone.
+
+The exactness cell is device-free: `tests/test_fast_topk.cpp` checks the
+helper against `std::partial_sort` over random arrays at 64/1024/4096/248320
+entries, k 1/2/10/128/2048, 40 arrays a shape, plus ties, all-equal, NaN and
+inf (the fork's own test shape). It runs in the `unit` ctest. Red mutation, run
+and seen failing before it was restored: the tie guard `>` made `>=` in both
+scan loops (`if (logits[i] >= heap[0].logit)`) — the tie and all-equal cells
+fail (`FAIL fast_topk_ties_keep_the_partial_sort_order`,
+`FAIL fast_topk_all_equal`). Rows with the mutation: 17 of 18 ctests passed,
+`unit` failed at `test_fast_topk.cpp:55/56`.
+
+Recipe: `~/bin/arcint-recipe.sh ~/src/ligence-gaps-b gaps-b580-b` — green,
+18/18 (2026-11-02). No `test-backend-ops` case: no ggml op changes.
+
+Card arm (Claude, one announced window): the same-binary served A/B with
+`LLAMA_SAMPLER_FAST_TOPK=0` against `1`, two runs each, alternated, on the
+agent (Hermes-style top_k 20) and greedy/MTP; answers the same bytes, decode
+improves. Exact commands:
+
+    cp bin/arcint /tmp/arcint-topk
+    printf '#!/bin/sh\nexec env LLAMA_SAMPLER_FAST_TOPK=0 /tmp/arcint-topk "$@"\n' > /tmp/arm-old; chmod +x /tmp/arm-old
+    printf '#!/bin/sh\nexec env LLAMA_SAMPLER_FAST_TOPK=1 /tmp/arcint-topk "$@"\n' > /tmp/arm-new; chmod +x /tmp/arm-new
+    python3 tests/acceptance/ab.py agent     --old /tmp/arm-old --new /tmp/arm-new \
+        --gguf <model.gguf> --device GPU.<N> --assets <dir> --rounds 2
+    python3 tests/acceptance/ab.py flashnext --old /tmp/arm-old --new /tmp/arm-new \
+        --gguf <model.gguf> --device GPU.<N> --assets <dir> --rounds 2
+
+Bar: the answer-level gate (the same answers, mean KL no worse than the
+baseline arm's by 0.03 nats, argmax agreement down by at most 1 point);
+decode improves, prefill stays inside the run's spread.

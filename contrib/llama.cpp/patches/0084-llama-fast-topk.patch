@@ -1,0 +1,94 @@
+diff --git a/include/llama.h b/include/llama.h
+index 324aaf9..0f40aed 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1571,6 +1571,12 @@ extern "C" {
+     /// Setting k <= 0 makes this a noop
+     LLAMA_API struct llama_sampler * llama_sampler_init_top_k      (int32_t k);
+ 
++    /// ARC-LAB: the k largest logits in descending order, without building the full
++    /// candidate array. Entries and the order of equal logits are identical to what
++    /// llama_sampler_init_top_k does on the full array (it repeats the heap steps of
++    /// libstdc++ std::partial_sort). out must hold k entries; n_vocab > k.
++    LLAMA_API void llama_top_k_from_logits(const float * logits, int32_t n_vocab, int32_t k, struct llama_token_data * out);
++
+     /// @details Nucleus sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
+     LLAMA_API struct llama_sampler * llama_sampler_init_top_p      (float   p, size_t min_keep);
+ 
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index 521c571..e8b7e50 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -1522,6 +1522,72 @@ static struct llama_sampler_i llama_sampler_top_k_i = {
+     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_top_k>,
+ };
+ 
++void llama_top_k_from_logits(const float * logits, int32_t n_vocab, int32_t k, llama_token_data * out) {
++    const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
++        return a.logit > b.logit;
++    };
++
++    for (int32_t i = 0; i < k; i++) {
++        out[i] = llama_token_data{ i, logits[i], 0.0f };
++    }
++    std::make_heap(out, out + k, comp);
++
++    llama_token_data * heap = out;
++
++    // std::__pop_heap(first, middle, result) with value = the new token: sift down to a leaf, then sift up
++    const auto replace_top = [&](const llama_token_data & value) {
++        ptrdiff_t hole = 0;
++        ptrdiff_t child = 0;
++        const ptrdiff_t len = k;
++        while (child < (len - 1) / 2) {
++            child = 2 * (child + 1);
++            if (comp(heap[child], heap[child - 1])) {
++                child--;
++            }
++            heap[hole] = heap[child];
++            hole = child;
++        }
++        if ((len & 1) == 0 && child == (len - 2) / 2) {
++            child = 2 * (child + 1);
++            heap[hole] = heap[child - 1];
++            hole = child - 1;
++        }
++        ptrdiff_t parent = (hole - 1) / 2;
++        while (hole > 0 && comp(heap[parent], value)) {
++            heap[hole] = heap[parent];
++            hole = parent;
++            parent = (hole - 1) / 2;
++        }
++        heap[hole] = value;
++    };
++
++    constexpr int32_t BLOCK = 16;
++    float thr = heap[0].logit;
++    int32_t i = k;
++    for (; i + BLOCK <= n_vocab; i += BLOCK) {
++        bool any = false;
++        for (int32_t j = 0; j < BLOCK; j++) {
++            any |= logits[i + j] > thr;
++        }
++        if (!any) {
++            continue;
++        }
++        for (int32_t j = 0; j < BLOCK; j++) {
++            if (logits[i + j] > heap[0].logit) {
++                replace_top(llama_token_data{ i + j, logits[i + j], 0.0f });
++            }
++        }
++        thr = heap[0].logit;
++    }
++    for (; i < n_vocab; i++) {
++        if (logits[i] > heap[0].logit) {
++            replace_top(llama_token_data{ i, logits[i], 0.0f });
++        }
++    }
++
++    std::sort_heap(out, out + k, comp);
++}
++
+ struct llama_sampler * llama_sampler_init_top_k(int32_t k) {
+     const bool is_empty = (k <= 0);
+ 

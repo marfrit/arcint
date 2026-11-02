@@ -5,6 +5,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+
+#ifdef ARCINT_LLAMA
+#include "llama.h"
+#endif
 
 namespace lgc {
 namespace {
@@ -15,6 +20,23 @@ namespace {
 // depend on it: the probe's probabilities are normalised over the whole
 // vocabulary, so a probe short of the top_p mass is seen and falls back.
 constexpr size_t kCandidateProbe = 2048;
+
+// LLAMA_SAMPLER_FAST_TOPK (default 0, off): take a row's top-k straight from
+// the logits instead of building the whole vocabulary's candidate array and
+// partial-sorting it. The selection is llama's, and it is exact: the same
+// entries and the same order of equal logits as std::partial_sort
+// (llama_top_k_from_logits, patch 0084; test_fast_topk.cpp checks it).
+bool sampler_fast_topk() {
+#ifdef ARCINT_LLAMA
+    static const bool v = [] {
+        const char* e = std::getenv("LLAMA_SAMPLER_FAST_TOPK");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return v;
+#else
+    return false;
+#endif
+}
 
 // The door's budget in tokens: a counted reasoning line costs 15-25 tokens on
 // a small model (a line counts above 20 characters, a token is 2-4 bytes), so
@@ -1087,6 +1109,16 @@ size_t Sampler::collect_candidates(const float* logits, size_t vocab, bool full,
                         : top_k > 0
                             ? std::min(static_cast<size_t>(top_k), vocab)
                             : std::min(kCandidateProbe, vocab);
+
+#ifdef ARCINT_LLAMA
+    if (top_k > 0 && want < vocab && sampler_fast_topk()) {
+        std::vector<llama_token_data> sel(want);
+        llama_top_k_from_logits(logits, static_cast<int32_t>(vocab), static_cast<int32_t>(want), sel.data());
+        scratch_.resize(want);
+        for (size_t i = 0; i < want; ++i) scratch_[i] = {sel[i].logit, static_cast<int>(sel[i].id)};
+        return want;
+    }
+#endif
 
     scratch_.clear();
     scratch_.reserve(vocab);
