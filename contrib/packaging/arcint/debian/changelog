@@ -1,3 +1,11 @@
+arcint (1.4.2-1) trixie; urgency=medium
+
+  * 1.4.2: X-Request-Id on every HTTP response (a valid caller id is kept, any
+    other value replaced by a generated one) and rid=<id> on the request's own
+    log lines. Nothing else changes.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Mon, 02 Nov 2026 12:00:00 +0100
+
 arcint (1.4.1-1) trixie; urgency=medium
 
   * 1.4.1: patch 0078 (the graph-input staging bound) dropped. It cost

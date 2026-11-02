@@ -18,7 +18,7 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
-## Unreleased
+## 1.4.2 — 2026-11-02
 
 One HTTP-surface addition: every request carries an id, so a gateway's log line
 and arcint's log lines for the same request can be matched.
@@ -46,6 +46,13 @@ and arcint's log lines for the same request can be matched.
 - **CORS**: with `--api-key` on, `X-Request-Id` joins `Access-Control-Allow-Headers`
   and is named in `Access-Control-Expose-Headers`, so a browser client can read
   it back.
+
+Implemented by Qwen3.8-Flash-Next, served by arcint itself in token mode (HTTP
+plumbing only; no generation, sampling or template path). The gateway half (llm-proxy 1.3.2:
+one id per request, sent and logged) follows this release.
+
+Runtime dependency unchanged: llama.cpp 3e4dfa8 with `contrib/llama.cpp/patches`
+0001-0079 (0031, 0055, 0061, 0073, 0076, 0078 not carried).
 
 ## 1.4.1 — 2026-11-02
 
