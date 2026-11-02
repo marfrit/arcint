@@ -5867,3 +5867,194 @@ improves. Exact commands:
 Bar: the answer-level gate (the same answers, mean KL no worse than the
 baseline arm's by 0.03 nats, argmax agreement down by at most 1 point);
 decode improves, prefill stays inside the run's spread.
+
+## 0088-opencl-gqa-int8-qk.patch
+
+The GQA decode kernel's Q Kᵀ on the XMX units straight from the quantized
+cache: Q rows quantized to int8 once a call (one RNE scale per row per 32-dim
+block), the q8_0 key block's raw 32 code bytes as the DPAS B operand, the
+integer result scaled by `dq[row][block] * dk[key][block]`; P V stays f16 DPAS.
+Opt-in, `GGML_OPENCL_FA_GQA_I8=1`; off by default, where the source compiles to
+the f16 form it was and no helper text is prepended (behaviour unchanged).
+
+The mechanism is the fork's DPAS decode attention (`code`:
+`arc-b580/ggml/src/ggml-sycl/fattn-dec.cpp:688-747`, its inline
+`xe2-dpas.hpp:15-42`): A is Q as s8, B the raw keys, one key a lane, the int
+accumulator scaled a block in float. The s8 x s8 operand packing is 0071's
+(`code`: `mul_mm_kq_i8.cl:109`, the strided `intel_sub_group_block_read_us8`
+over a row-major [row][32 codes] tile — lane l gets dims (2l, 2l+1) of each of
+8 rows), which is why Q's codes are stored in dim order; the fork's s8 x s4
+packs its nibbles as dims i and i+16 a byte, so its a short is
+`(code[l], code[l+16])` (`code`: `fattn-dec.cpp:721-731`). The local form of that read is
+`cl_intel_subgroup_local_block_io`, enabled in the kernel. The
+fork's B is s8 x s4 over q4_0 bytes; ours is the public
+`intel_sub_group_i8_i8_matrix_mad_k32` over q8_0 bytes, which is what arcint's
+agent and coder caches hold. Its premise is arcint's measured 0018 fact
+(`measured-here`: direct quantized K made every sub-group convert the same
+blocks, 30.7 t/s against 52.6 staged at 32k), which the raw-byte operand
+removes.
+
+- **Q once a call** into local memory: [tile][block][lane][row] shorts and
+  [tile][block][row] scales, by the work-group's own threads (not a
+  per-sub-group pass). The quantizer, the q8_0 block offsets and the staged
+  row stride are one text (`fa_gqa_i8_ops.inc`, the 0071 pattern: the backend
+  prepends it to the kernel program and the device-free test includes it).
+  RNE (`rint`), scale `amax / 127`, code `round(x / scale)`, clamp-free
+  because the scale is the block's amax; a zero row keeps dq 0 and codes 0.
+  The codes are written ascending dims into a row-major [row][32] tile; the
+  DPAS a operand reads that tile with the strided block read, not per lane.
+  Evidence: the fork's form (`code`) and ggml's q8_0 block layout (`code`,
+  `ggml-common.h`).
+- **B straight from the cache**: block `b` at byte `34 b`, codes at `+2`, a
+  lane's 32 bytes packed into 8 ints; the block's half `d` is `dk`. Earned
+  from the fork's same bytes-vs-conversion split (`code`).
+- **Scale order**: DPAS is integer, so the 32-block product is exact and is
+  converted to float, multiplied by the row's `dq` vector and the key's `dk`,
+  and added to the f32 S. The fork accumulates the same way (`code`).
+- **P V** is unchanged: P is S shortened to half, V is staged f16, the f16
+  DPAS chain (`code`).
+- **Which pairs**: only q8_0 K (KT 1), the 8:8 and 8:4 caches, at head sizes
+  256 and 128. A q4_0 K (the refused 4:4 pair) keeps the f16 form: the public
+  OpenCL extension has no s8 x s4 k32, and the fork's inline vISA is Xe2
+  SIMD16 only. Not taken (`code`).
+- **Sub-groups**: the kernel is built for sub-group 16 only (0016: 16 lanes are
+  a key tile's 16 keys, the 8x16x32 form), and the int8 builtin is that
+  sub-group's. The A770 (DG2, sub-group 8) cannot take this form from the
+  code: 0071's record has the s8 DPAS kernel SG16-only and the A770's path
+  f16 (`measured-here`, 0071 round 3), and the fork's own s4 vISA is
+  `dpas.s4.s8.8.8 (M1,16)`. The A770 keeps 0015's split kernels; no SG8 int8
+  form is built.
+- **Row cap**: the dispatch's `(n_head / n_head_kv) * n_q <= 64` stands. The
+  agent's 24-on-4 (G 6) takes 6 rows = 36; the coder's 16-on-2 (G 8, head 256)
+  takes 6 rows = 48. Both are inside the cap (`code`).
+- **Quality**: rounding-only (the Q int8 adds one rounding), as the audit
+  classes it (`code`); judged at the answer-level bar, not bit equality.
+
+Device-free (`measured-here`, the recipe host):
+
+- `tests/test_fa_gqa_i8.cpp` (built in the `unit` ctest): the q8_0 block
+  offsets, the RNE quantizer against an independent `nearbyint` reference with
+  the .5 corners, and the (b) S selftest over one 16-key tile and 8 rows at
+  head size 256 — the int8 way against the f16 way, stated bound max abs
+  (int8 − f16) ≤ 1e-2 × max|S| over the tile (the tile prints its measured
+  value), plus the integer contraction against a double evaluation.
+- `tests/python/test_fa_gqa_i8.py` (the `unit` ctest, `LLAMA_SRC`): the switch
+  defaults off, `-DGQA_I8=1` and the helper prepend only on a KT 1 arm, the
+  staged form a second build only with the switch, the 1-3 row routing under
+  `GGML_OPENCL_FA_GQA_MIN_ROWS`, and the kernel's `#if GQA_I8 && KT == 1`,
+  raw-code B operand and f16 P V.
+- Red mutations, each committed on a throwaway branch, built and run through
+  the recipe before restored (`measured-here`, 25 of 26 ctests, the two cells
+  red; the last full run is the green 26/26):
+  (a) the switch's default flipped on (`atoi` dropped) →
+  `FAIL test_switch_is_default_off`;
+  (b) the KT 1 guard dropped (`i8_arm = fi8_on`) → the same default-off cell
+  at its `gkv[i][0] == 1` assertion;
+  (c) the staged dispatch dropped (`n_q < 4` → `false`, 0089) →
+  `FAIL test_routing_takes_the_staged_form_for_1_to_3_rows`;
+  (d) `fa_gqa_i8_qs` reads `34 b + 18` instead of `+2` →
+  `FAIL offset: codes start` and `FAIL s-tile: max abs error 5.176399 above
+  the stated bound 1e-2 * max|S| = 0.208869`;
+  (e) `FA_GQA_I8_RINT` truncated to `(int) x` →
+  `FAIL quant: 1.5 -> 1, want 2 (RNE)` (the S selftest stays inside the bound
+  at 0.6172 % — truncation alone is small, which is why the .5 corners exist).
+  The card red is (d) too: every new FLASH_ATTN_EXT case at 1-6 rows fails
+  with it (owed to the card window).
+
+Card arms (owed; Claude's announced window), the exact commands:
+- correctness and (a)/(c): the new cases are
+  `test-backend-ops test -o FLASH_ATTN_EXT` at the agent's geometry
+  (256, 256, 4, {6, 1}) and the coder's (256, 256, 2, {8, 1}), 1/2/3/4/6 rows,
+  KV 1,013, 4,096 and 131,072, q8_0/q8_0 and q8_0/q4_0, added at the eval
+  list. Run both arms of the switch on the same binary:
+
+      cd <llama tree with 0001-0089>
+      cmake -B build -DGGML_OPENCL=ON -DLLAMA_CURL=OFF
+      cmake --build build -j --target test-backend-ops
+      GGML_OPENCL_DEVICES=0:0 ./build/bin/test-backend-ops test -o FLASH_ATTN_EXT
+      GGML_OPENCL_DEVICES=0:0 GGML_OPENCL_FA_GQA_I8=1 GGML_OPENCL_FA_GQA_MIN_ROWS=1 \
+          ./build/bin/test-backend-ops test -o FLASH_ATTN_EXT
+      # perf (us/run), both arms:
+      GGML_OPENCL_DEVICES=0:0 ./build/bin/test-backend-ops perf -o FLASH_ATTN_EXT
+      GGML_OPENCL_DEVICES=0:0 GGML_OPENCL_FA_GQA_I8=1 GGML_OPENCL_FA_GQA_MIN_ROWS=1 \
+          ./build/bin/test-backend-ops perf -o FLASH_ATTN_EXT
+      # red (a) on the switch-on arm: fa_gqa_i8_qs -> 34 * b + 18, rebuild, the
+      # 1-6 row cases fail; restore.
+      # A770: the same two runs; the GQA kernel is SG16-only, so both arms
+      # must pass identically (0015's kernels serve).
+- (b) on the card: the eval list's q8_0 cases already compare each arm against
+  the CPU reference at the same 16-key tile geometry; the S-level comparison
+  itself is the device-free cell above (the DPAS s8 product is the exact
+  integer contraction, so the only difference is Q's rounding, which that cell
+  bounds). A separate on-card DPAS-vs-f16-DPAS probe was not built.
+- served A/B: agent and coder, `GGML_OPENCL_FA_GQA_I8=0` against `1` with
+  `GGML_OPENCL_FA_GQA_MIN_ROWS=1`, two rounds each, alternated:
+
+      cp bin/arcint /tmp/arcint-gqai8
+      printf '#!/bin/sh\nexec env GGML_OPENCL_FA_GQA_I8=0 /tmp/arcint-gqai8 "$@"\n' > /tmp/arm-off; chmod +x /tmp/arm-off
+      printf '#!/bin/sh\nexec env GGML_OPENCL_FA_GQA_I8=1 GGML_OPENCL_FA_GQA_MIN_ROWS=1 /tmp/arcint-gqai8 "$@"\n' > /tmp/arm-on; chmod +x /tmp/arm-on
+      python3 tests/acceptance/ab.py agent --old /tmp/arm-off --new /tmp/arm-on \
+          --gguf <agent.gguf> --device GPU.<N> --assets <assets> --rounds 2 --out /tmp/ab-88-agent
+      python3 tests/acceptance/ab.py coder --old /tmp/arm-off --new /tmp/arm-on \
+          --gguf <coder.gguf> --device GPU.<N> --assets <assets> --rounds 2 --out /tmp/ab-88-coder
+- KL (agent, q8_0:q4_0, MTP 5's 6-row ubatches so every attention call is the
+  verify path; coder, q8_0:q4_0, MTP 4's 5-row ubatches), 16 x 512 against the
+  arm's own Q8_0 reference capture, mean KL and argmax agreement against the
+  baseline arm's, bar +0.03 nats / −1 point:
+
+      GGML_OPENCL_DEVICES=0:0 GGML_OPENCL_FA_GQA_I8=0 ./build/bin/llama-perplexity \
+          -m <agent.gguf> --no-repack -lm mmap -ctk q8_0 -ctv q4_0 -fa 1 -ub 6 -b 6 \
+          -c 512 --kl-divergence-base <agent-ref.kld> --kl-divergence /tmp/kl-off.log
+      GGML_OPENCL_DEVICES=0:0 GGML_OPENCL_FA_GQA_I8=1 GGML_OPENCL_FA_GQA_MIN_ROWS=1 \
+          ./build/bin/llama-perplexity -m <agent.gguf> --no-repack -lm mmap -ctk q8_0 -ctv q4_0 \
+          -fa 1 -ub 6 -b 6 -c 512 --kl-divergence-base <agent-ref.kld> --kl-divergence /tmp/kl-on.log
+      # the same with -ub 5 for the coder
+- Task battery: the acceptance task at T=0 with thinking off, the agent's and
+  the coder's protocols, 10 cases, answers equal or better (the task is the
+  answer-level gate; the KL arm above is the numeric one).
+
+Status (`code`, `measured-here`): built, device-free green, off by default, no
+card number yet; the defaults stay off until the operator's A/B. The gate's
+per-layer bar is the audit's: the 6-row call below 0016's 4.83 ms at 131k and
+the 1-row call below 0015's 1.91 ms, answers right, KL inside 0.03 nats.
+
+## 0089-opencl-gqa-staged-1-3-rows.patch
+
+The 1-3 row form on the same DPAS kernel: a key tile's raw q8_0 rows are
+copied into local memory once a work-group (coalesced dword loads, the row
+68 dwords at head size 256, the staged stride 69 so lane = key reads spread
+over banks) and every lane reads its own block of 32 codes from there instead
+of the direct form's per-lane global gather. It is the fork's ST mode (`code`:
+`fattn-dec.cpp:703-731`, launched for nq == 1; its measured 48K 1-token
+433 -> 244 us with the one-wave split count, `paper`). The same source, a
+second program with `-DGQA_ST=1`, built only when `GGML_OPENCL_FA_GQA_I8=1`
+and only for the q8_0 K pairs (KT 1); the program already carries
+`-cl-intel-256-GRF-per-thread`, the fork's 256-register launch.
+
+- **Routing**: rows below `GGML_OPENCL_FA_GQA_MIN_ROWS` take the staged kernel
+  when it was built (so `GGML_OPENCL_FA_GQA_I8=1 GGML_OPENCL_FA_GQA_MIN_ROWS=1`
+  routes 1-3 rows); 4+ rows and any pair without a staged form take the direct
+  kernel; a failed staged build falls back to the direct kernel and logs a
+  WARN. With the switch off the staged array is empty and `MIN_ROWS` keeps its
+  default 4, so nothing changes (`code`).
+- **What is staged**: K as raw bytes, V as f16 (0019's transposed staging,
+  unchanged); the Q int8 quantization of 0088 and P V's f16 DPAS are unchanged
+  (`code`).
+- **Quality**: rounding-only, the same one Q rounding as 0088; no new one.
+
+Device-free (`measured-here`): the offset cell asserts the staged row/stride
+arithmetic (68/69 at 256, 34/35 at 128, an odd stride), and the routing cell
+asserts the second build, the KT 1 restriction and the 1-3 row dispatch. Red
+(c): the staged dispatch dropped (`n_q < 4` → false) fails the routing cell;
+(a) the block-offset mutation also fails every new case at 1-3 rows on the
+card.
+
+Card arms: the same commands as 0088's above, with the `MIN_ROWS=1` switch-on
+arm pricing the staged rows against the switch-off arm; the new 1/2/3-row
+cases are the correctness arm, and the perf list's 1/3-row cases at 131,072
+keys price them. Bar: the 1-row call below 0015's 1.91 ms at 131k on the B60,
+answers right, KL inside 0.03 nats. Owed to Claude's window; no card number
+here yet.
+
+Status: built, device-free green, off by default; the 0088/0089 pair is the
+opt-in until the card A/B.
