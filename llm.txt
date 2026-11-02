@@ -274,6 +274,18 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
   /props; --api-key is visible in ps and /proc/<pid>/cmdline (test use;
   deployments use the file). /health stays open for probes and reveals the
   served model id.
+- X-Request-Id: every response carries one request id. A caller may supply it;
+  the value is taken over only when it is 1..128 characters of [A-Za-z0-9._:-].
+  Absent, empty or anything else is replaced by a generated req- plus 16
+  lowercase hex characters (random, not a counter) -- a replacement is not an
+  error and the bytes sent are never echoed or logged, which is what the narrow
+  grammar buys (CR, LF, SP, HTAB, non-ASCII and every log-field separator are
+  out). The id rides as rid=<id> on the request's own log lines: the http line,
+  the refusals, the per-request prefill/decode summary and its abort. It is on
+  successes, on 400/401/404/409/500, on the pre-routing auth refusal, on a CORS
+  preflight and on SSE responses before the first chunk. JSON bodies, the
+  Responses objects and /metrics are unchanged (no id label: cardinality); with
+  --api-key the header is allowed and exposed so a browser client can read it.
 - --tls-cert FILE --tls-key FILE: HTTPS through httplib's OpenSSL server;
   needs a build configured with -DARCINT_TLS=ON (the default build refuses the
   flags and does not link OpenSSL).

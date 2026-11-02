@@ -10,6 +10,7 @@
 #include "api/error.h"
 #include "api/generate.h"
 #include "api/metrics.h"
+#include "api/request_id.h"
 #include "api/responses_state.h"
 #include "core/chat.h"
 #include "util/log.h"
@@ -1017,6 +1018,10 @@ std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest r
     }
 
     PreparedResponse prep;
+    // Inherited from the caller's struct: the local replaces `out` at the end of
+    // this function, and the request id has to survive that. The route lambda
+    // set it before prepare ran, so the prepare-time refusals can log it.
+    prep.chat.request_id = out.chat.request_id;
     prep.affinity_slot = stored ? stored->slot : -1;
     // feyntalk W3.5: `truncation: "auto"` is the cheap compaction tier,
     // reasoning first. The fit reserve is the operator's --think-ctx-reserve
@@ -1069,10 +1074,11 @@ std::optional<HttpResult> prepare_response(const Context& ctx, ResponseRequest r
     // operator reading the log knows what was served and what was dropped.
     if (prep.chat.truncation.blocks_dropped > 0) {
         log::warn("req", "truncation auto: dropped %d reasoning blocks, prompt %d -> %d tokens "
-                         "(reserve %d, n_ctx %d, lane %d)",
+                         "(reserve %d, n_ctx %d, lane %d)%s",
                   prep.chat.truncation.blocks_dropped, prep.chat.truncation.tokens_before,
                   prep.chat.truncation.tokens_after, prep.chat.truncation.reserve,
-                  lane_n_ctx(ctx, prep.chat.lane), prep.chat.lane);
+                  lane_n_ctx(ctx, prep.chat.lane), prep.chat.lane,
+                  rid_suffix(prep.chat.request_id).c_str());
     }
     prep.req = std::move(req);
     // The Responses ids are resp-N; prepare_from_chat numbered it as a chat
@@ -1234,8 +1240,8 @@ HttpResult run_response(const Context& ctx, PreparedResponse& prep, int slot) {
     } catch (const ContextOverflowError& e) {
         if (prep.req.has_previous_response_id)
             evict_continuation(ctx, prep.req.previous_response_id);
-        log::warn("req", "responses refused: prompt %d tokens with its images, lane %d",
-                  e.prompt_tokens, e.n_ctx);
+        log::warn("req", "responses refused: prompt %d tokens with its images, lane %d%s",
+                  e.prompt_tokens, e.n_ctx, rid_suffix(prep.chat.request_id).c_str());
         json body = responses_error(
             log::format("prompt is %d tokens, context is %d: arcint does not truncate or shift "
                         "context; compact the history client-side and retry",
@@ -1247,16 +1253,18 @@ HttpResult run_response(const Context& ctx, PreparedResponse& prep, int slot) {
     } catch (const InputError& e) {
         if (prep.req.has_previous_response_id)
             evict_continuation(ctx, prep.req.previous_response_id);
-        log::warn("req", "responses refused: %s", e.what());
+        log::warn("req", "responses refused: %s%s", e.what(),
+                  rid_suffix(prep.chat.request_id).c_str());
         return HttpResult{400, responses_error(e.what(), "invalid_request", "invalid_request",
                                                "input")};
     } catch (const std::exception& e) {
         if (prep.req.has_previous_response_id)
             evict_continuation(ctx, prep.req.previous_response_id);
-        log::error("req", "responses generation failed: %s", e.what());
+        log::error("req", "responses generation failed: %s%s", e.what(),
+                   rid_suffix(prep.chat.request_id).c_str());
         return HttpResult{500, responses_error(e.what(), "server_error", "internal_error")};
     }
-    log_stats(slot, stats, reason);
+    log_stats(slot, stats, reason, prep.chat.request_id);
     if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
 
     // A cancel-by-id is a 200 with the incomplete resource (the campaign's

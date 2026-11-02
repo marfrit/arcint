@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <optional>
 #include <functional>
+#include <string_view>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -13,6 +14,7 @@
 #include "api/generate.h"
 #include "api/metrics.h"
 #include "api/renderer.h"
+#include "api/request_id.h"
 #include "api/responses_state.h"
 #include "build_info.h"
 #include "core/stop.h"
@@ -649,11 +651,12 @@ namespace {
 // render (std::bad_alloc, a std::logic_error from the engine's own helpers) is
 // not the client's and is left to propagate to the route's 500.
 std::optional<HttpResult> render_template(const Context& ctx, const ChatRequest& req,
-                                          std::string& out) {
+                                         std::string& out, std::string_view rid) {
     try {
         out = ctx.backend->render_chat(req);
     } catch (const std::runtime_error& e) {
-        log::warn("req", "template render refused: %s", e.what());
+        log::warn("req", "template render refused: %s%s", e.what(),
+                  rid_suffix(rid).c_str());
         return HttpResult{400, invalid_request(log::format(
             "the chat template could not render this request: %s", e.what()))};
     }
@@ -742,8 +745,9 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
     if (auto err = resolve_lane(ctx, req.model, lane)) return err;
     const ModelStatus& st = ctx.backend->status();
     if (lane < 0 && !req.model.empty() && req.model != st.served_id && req.model != st.id) {
-        log::verbose("req", "request names model '%s'; this process serves '%s'",
-                     req.model.c_str(), st.served_id.c_str());
+        log::verbose("req", "request names model '%s'; this process serves '%s'%s",
+                     req.model.c_str(), st.served_id.c_str(),
+                     rid_suffix(out.request_id).c_str());
     }
 
     // An image part needs the multimodal projector. The parser accepts the
@@ -765,6 +769,9 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
     }
 
     PreparedChat prep;
+    // The id the route lambda put on the struct before calling prepare: the
+    // local replaces `out` at the end of the function, so it has to inherit it.
+    prep.request_id = out.request_id;
     prep.req   = std::move(req);
     prep.lane  = lane;
     prep.model = lane >= 0 ? ctx.lanes[static_cast<size_t>(lane)].name : st.served_id;
@@ -815,7 +822,9 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
         ChatRequest render_req = prep.req;
         const int   n_ctx      = lane_n_ctx(ctx, lane);
         const int   limit      = n_ctx > 0 ? n_ctx - fit->reserve : 0;
-        auto render = [&](std::string& out) { return render_template(ctx, render_req, out); };
+        auto render = [&](std::string& out) {
+            return render_template(ctx, render_req, out, prep.request_id);
+        };
         auto tokenize = [&](const std::string& p) {
             return ctx.backend->tokenizer().encode(p);
         };
@@ -861,7 +870,7 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
         }
         fit_tokens = tokens;
     } else {
-        if (auto err = render_template(ctx, prep.req, prompt)) return *err;
+        if (auto err = render_template(ctx, prep.req, prompt, prep.request_id)) return *err;
     }
     // The template decides whether the answer starts inside a think block; the
     // split of reasoning from content below follows that, not a guess.
@@ -920,6 +929,7 @@ std::optional<HttpResult> prepare_completion(const Context& ctx, const json& bod
     }
 
     PreparedCompletion prep;
+    prep.request_id = out.request_id;  // inherited: the local replaces `out`
     prep.req   = std::move(req);
     prep.lane  = lane;
     prep.model = lane >= 0 ? ctx.lanes[static_cast<size_t>(lane)].name : ctx.backend->status().served_id;
@@ -998,6 +1008,7 @@ std::optional<HttpResult> prepare_speech(const Context& ctx, const json& body, P
     }
 
     PreparedSpeech prep;
+    prep.request_id = out.request_id;  // inherited: the local replaces `out`
     prep.req   = std::move(req);
     prep.lane  = lane;
     prep.model = lane >= 0 ? ctx.lanes[static_cast<size_t>(lane)].name : st.served_id;
@@ -1019,17 +1030,18 @@ std::optional<HttpResult> prepare_speech(const Context& ctx, const json& body, P
 // images, a prompt over the lane with its image tokens) is the client's 400,
 // anything else a 500. Without this an exception thrown while a streamed body
 // runs would leave httplib's worker and end the process.
-static std::optional<HttpResult> guarded(const std::function<void()>& run) {
+static std::optional<HttpResult> guarded(std::string_view rid, const std::function<void()>& run) {
     try {
         run();
     } catch (const ContextOverflowError& e) {
-        log::warn("req", "refused: prompt %d tokens with its images, lane %d", e.prompt_tokens, e.n_ctx);
+        log::warn("req", "refused: prompt %d tokens with its images, lane %d%s", e.prompt_tokens,
+                  e.n_ctx, rid_suffix(rid).c_str());
         return HttpResult{400, context_overflow(e.prompt_tokens, e.n_ctx)};
     } catch (const InputError& e) {
-        log::warn("req", "refused: %s", e.what());
+        log::warn("req", "refused: %s%s", e.what(), rid_suffix(rid).c_str());
         return HttpResult{400, invalid_request(e.what(), "messages")};
     } catch (const std::exception& e) {
-        log::error("req", "generation failed: %s", e.what());
+        log::error("req", "generation failed: %s%s", e.what(), rid_suffix(rid).c_str());
         return HttpResult{500, error_body(e.what(), "internal_error")};
     }
     return std::nullopt;
@@ -1040,12 +1052,12 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     std::string     raw;
     std::vector<std::pair<std::string, int>> pieces;
     FinishReason reason = FinishReason::Stop;
-    if (auto err = guarded([&] {
+    if (auto err = guarded(prep.request_id, [&] {
             reason = drive(*ctx.backend, prep.input, slot,
                            [](std::string_view, int, const std::string&) { return true; }, stats, raw, &pieces);
         }))
         return *err;
-    log_stats(slot, stats, reason);
+    log_stats(slot, stats, reason, prep.request_id);
     if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
 
     // A non-streamed request commits its status before its body is built, so
@@ -1112,12 +1124,12 @@ HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, in
     GenerationStats stats;
     std::string     raw;
     FinishReason reason = FinishReason::Stop;
-    if (auto err = guarded([&] {
+    if (auto err = guarded(prep.request_id, [&] {
             reason = drive(*ctx.backend, prep.input, slot,
                            [](std::string_view, int, const std::string&) { return true; }, stats, raw);
         }))
         return *err;
-    log_stats(slot, stats, reason);
+    log_stats(slot, stats, reason, prep.request_id);
     if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
 
     // As the chat path: a stop signal is a 503, a gone client gets no body.
@@ -1153,19 +1165,22 @@ SpeechResult run_speech(const Context& ctx, const PreparedSpeech& prep, int slot
     try {
         ok = ctx.backend->generate_speech(prep.input, slot, wav, err, stats);
     } catch (const ContextOverflowError& e) {
-        log::warn(log::format("slot %d", slot), "speech refused: the text and the reference take %d of %d cells",
-                  e.prompt_tokens, e.n_ctx);
+        log::warn(log::format("slot %d", slot),
+                  "speech refused: the text and the reference take %d of %d cells%s",
+                  e.prompt_tokens, e.n_ctx, rid_suffix(prep.request_id).c_str());
         return SpeechResult{400, {}, context_overflow(e.prompt_tokens, e.n_ctx)};
     }
     if (!ok) {
         // Everything a client can get wrong was refused in prepare_speech, so
         // a failure here is the server's: a profile file that vanished, a
         // pipeline that refused the input, a decode error.
-        log::error(log::format("slot %d", slot), "speech '%s': %s", prep.input.voice.c_str(), err.c_str());
+        log::error(log::format("slot %d", slot), "speech '%s': %s%s", prep.input.voice.c_str(),
+                   err.c_str(), rid_suffix(prep.request_id).c_str());
         return SpeechResult{500, {}, error_body(err, "internal_error")};
     }
-    log::info(log::format("slot %d", slot), "speech '%s': %d frames, %zu bytes WAV in %.2f s",
-              prep.input.voice.c_str(), stats.completion_tokens, wav.size(), stats.decode_seconds);
+    log::info(log::format("slot %d", slot), "speech '%s': %d frames, %zu bytes WAV in %.2f s%s",
+              prep.input.voice.c_str(), stats.completion_tokens, wav.size(), stats.decode_seconds,
+              rid_suffix(prep.request_id).c_str());
     if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
     return SpeechResult{200, std::move(wav), json::object()};
 }
@@ -1239,7 +1254,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
 
     GenerationStats stats;
     FinishReason reason = FinishReason::Stop;
-    if (auto err = guarded([&] { reason = drive(
+    if (auto err = guarded(prep.request_id, [&] { reason = drive(
         *ctx.backend, prep.input, slot,
         [&](std::string_view piece, int token_id, const std::string&) -> bool {
             const ReasoningStreamer::Step step = reasoning.push(piece, token_id);
@@ -1300,7 +1315,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
         return;
     }
 
-    log_stats(slot, stats, reason);
+    log_stats(slot, stats, reason, prep.request_id);
     if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
     // An aborted request sends nothing more: a gone client's write would fail
     // anyway, and a buffered tool call must not come back as raw content after
@@ -1320,8 +1335,9 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     if (prep.parse_tool_calls) {
         ToolCallParse parsed = parse_qwen_tool_calls(content, &prep.schemas);
         if (parsed.truncated) {
-            log::warn("tools", "unterminated %s block; returned as raw content",
-                      std::string(tool_call_tags().open).c_str());
+            log::warn("tools", "unterminated %s block; returned as raw content%s",
+                      std::string(tool_call_tags().open).c_str(),
+                      rid_suffix(prep.request_id).c_str());
         }
         calls = std::move(parsed.calls);
         if (parsed.content.size() > streamed) {
@@ -1405,7 +1421,7 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep, int s
     GenerationStats stats;
     std::string     raw;
     FinishReason reason = FinishReason::Stop;
-    if (auto err = guarded([&] { reason = drive(
+    if (auto err = guarded(prep.request_id, [&] { reason = drive(
         *ctx.backend, prep.input, slot,
         [&](std::string_view piece, int, const std::string&) -> bool {
             const std::string safe = utf8_stream.push(piece);
@@ -1426,7 +1442,7 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep, int s
         return;
     }
 
-    log_stats(slot, stats, reason);
+    log_stats(slot, stats, reason, prep.request_id);
     if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
     // As the chat path: an aborted request sends nothing more.
     if (gone || reason == FinishReason::Abort) return;

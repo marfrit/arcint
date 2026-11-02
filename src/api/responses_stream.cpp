@@ -9,6 +9,7 @@
 #include "api/error.h"
 #include "api/generate.h"
 #include "api/metrics.h"
+#include "api/request_id.h"
 #include "api/responses_state.h"
 #include "core/reasoning.h"
 #include "core/toolcall.h"
@@ -647,7 +648,8 @@ bool Stream::run(const Context& ctx, int slot) {
                        },
                        stats, raw, nullptr);
     } catch (const std::exception& e) {
-        log::error("req", "responses stream failed: %s", e.what());
+        log::error("req", "responses stream failed: %s%s", e.what(),
+                   rid_suffix(prep_.request_id).c_str());
         // Two spec MUSTs meet here: an in-stream error is followed by failed,
         // and an open item is last and incomplete. The item is closed first so
         // the client sees both.
@@ -656,7 +658,7 @@ bool Stream::run(const Context& ctx, int slot) {
         return failed("failed", e.what(), "internal_error", /*error_event=*/true);
     }
 
-    log_stats(slot, stats, reason);
+    log_stats(slot, stats, reason, prep_.request_id);
     if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
     if (gone_) return false;
 
@@ -686,8 +688,9 @@ bool Stream::run(const Context& ctx, int slot) {
     if (prep_.parse_tool_calls) {
         ToolCallParse parsed = parse_qwen_tool_calls(content_, &prep_.schemas);
         if (parsed.truncated) {
-            log::warn("tools", "unterminated %s block; returned as raw content",
-                      std::string(tool_call_tags().open).c_str());
+            log::warn("tools", "unterminated %s block; returned as raw content%s",
+                      std::string(tool_call_tags().open).c_str(),
+                      rid_suffix(prep_.request_id).c_str());
         }
         calls = std::move(parsed.calls);
         if (parsed.content.size() > streamed_) {

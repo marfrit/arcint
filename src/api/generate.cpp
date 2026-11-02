@@ -5,6 +5,7 @@
 #include <set>
 
 #include "api/handlers.h"
+#include "api/request_id.h"
 #include "core/reasoning.h"
 #include "core/toolcall.h"
 #include "util/log.h"
@@ -82,8 +83,11 @@ void log_slot_line(int slot, const char* phase, int tokens, double seconds, doub
               seconds, rate, suffix.c_str());
 }
 
-void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
-    std::string prefill_suffix;
+void log_stats(int slot, const GenerationStats& stats, FinishReason reason, std::string_view rid) {
+    // Which request this generation belongs to. The stub's line stays the line
+    // it was when there is no id (an empty rid): the suffix is "" then.
+    const std::string rid_tail = rid_suffix(rid);
+    std::string       prefill_suffix;
     if (stats.cache_hit_tokens > 0 && stats.prompt_tokens > 0) {
         prefill_suffix = log::format(" | cache hit %d tok (%.1f%%)", stats.cache_hit_tokens,
                                      100.0 * stats.cache_hit_tokens / stats.prompt_tokens);
@@ -113,10 +117,12 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
     // the client left 8 s in). rate() reads the same number.
     const int prefill_tokens = stats.prompt_tokens_prefilled >= 0 ? stats.prompt_tokens_prefilled
                                                                  : stats.prompt_tokens;
+    prefill_suffix += rid_tail;
     log_slot_line(slot, "prefill", prefill_tokens, stats.prefill_seconds,
                   stats.prefill_rate(), prefill_suffix);
 
-    const std::string decode_suffix = decode_suffix_for(stats);
+    std::string decode_suffix = decode_suffix_for(stats);
+    decode_suffix += rid_tail;
     log_slot_line(slot, "decode", stats.completion_tokens, stats.decode_seconds,
                   stats.decode_rate(), decode_suffix);
     if (reason == FinishReason::Abort) {
@@ -125,7 +131,7 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
         const char* why = stats.abort_cause == AbortCause::StopSignal  ? "stop signal"
                           : stats.abort_cause == AbortCause::Cancelled ? "cancel requested"
                                                                        : "client gone";
-        log::info(log::format("slot %d", slot), "aborted: %s", why);
+        log::info(log::format("slot %d", slot), "aborted: %s%s", why, rid_tail.c_str());
     }
 }
 
