@@ -53,21 +53,46 @@ public:
     // A lease with index() < 0 means none came free. There is deliberately no
     // unbounded variant: an admission that can wait forever is the failure this
     // milestone replaced with a numbered refusal.
-    Lease acquire_for(double timeout_seconds);
+    //
+    // `request_id` is the id the route answers this request with (1.4.2's
+    // X-Request-Id): bound to the slot for the whole life of the lease, so
+    // GET /slots can say which request a busy slot serves. It is bound where
+    // the slot is taken and cleared where it is released, which is the only
+    // place either happens — a route cannot leave the previous request's id
+    // behind. Empty: nothing is bound, and /slots reports no id for the slot.
+    Lease acquire_for(double timeout_seconds, std::string_view request_id = {});
     // Non-blocking, for a continuation's slot affinity: index < 0 = invalid, 0
     // = taken, else the lease. Never waits and never picks another index.
-    Lease try_acquire(int index);
+    Lease try_acquire(int index, std::string_view request_id = {});
     void  release(int index);
 
     int total() const;
     int free() const;
     int queue_depth() const;
 
+    // What GET /slots reads: one entry per slot, in index order — whether it is
+    // processing and, if so, the request id it serves. Copied under mutex_ and
+    // nothing else: busy_ and rid_ are two vectors of trivial state, so the lock
+    // is held for a memcpy-sized read, and the response's JSON is built outside
+    // it. Which lane a slot belongs to, and its context, is not the pool's to
+    // know — the caller reads those from the (startup-fixed) lane table, and the
+    // cells a slot's sequence holds from the backend, so no lock here is ever
+    // nested with the context's.
+    struct State {
+        int         index;
+        bool        processing;
+        std::string request_id;
+    };
+    std::vector<State> snapshot() const;
+
 private:
     mutable std::mutex      mutex_;
     std::condition_variable cv_;
     std::vector<bool>       busy_;
-    int                     waiting_ = 0;
+    // Per slot: the id of the request holding it, empty when free. Cleared by
+    // release(), so it cannot outlive the request it was bound to.
+    std::vector<std::string> rid_;
+    int                      waiting_ = 0;
 };
 
 // A named lane (DESIGN.md §4.2, amended 2026-10-07;
@@ -162,14 +187,18 @@ nlohmann::json loop_guard_json(const GenerationStats& stats);
 
 // Takes a lane for one request, or returns the 503 that says why not — with
 // the lane counts in it (slots.total, slots.free), so "busy" is a number and not a mood.
-std::optional<HttpResult> acquire_slot(const Context& ctx, SlotPool::Lease& out);
+// `request_id` is the id this request is answered with; it is bound to the slot
+// for the life of the lease (GET /slots reports it for a busy slot).
+std::optional<HttpResult> acquire_slot(const Context& ctx, SlotPool::Lease& out,
+                                       std::string_view request_id = {});
 // The same for a request resolved to `lane` (resolve_lane; -1: no named
 // lanes). `slot` is the backend sequence to generate on: the lease's index
 // without named lanes, the lane's own sequence with them. A busy lane is
 // waited for (--queue-timeout) or refused on its own; another lane is never
 // taken instead.
 std::optional<HttpResult> acquire_slot(const Context& ctx, int lane, SlotPool::Lease& out,
-                                       int& slot, int affinity_slot = -1);
+                                       int& slot, int affinity_slot = -1,
+                                       std::string_view request_id = {});
 
 nlohmann::json health(const Context& ctx);
 nlohmann::json props(const Context& ctx);

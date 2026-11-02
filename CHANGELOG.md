@@ -18,6 +18,24 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## Unreleased
+
+One HTTP-surface addition, off by default: what the slots are doing, as state.
+
+- **`GET /slots`** (`--slots`, off by default; `measured-here`, `tests/slots.sh`,
+  `tests/test_slots.cpp`): one entry per slot with `id`, `lane`, `n_ctx`,
+  `is_processing`, `n_cache` (the KV cells that slot's sequence holds) and,
+  while the slot serves a request, `id_task` carrying that request's
+  `X-Request-Id` (1.4.2's id). State only: llama-server's `/slots` also dumps
+  the prompt (detokenized), the generated text and the sampling parameters of
+  whatever is running; this route names none of it, and `slots.sh` puts a unique
+  marker in the busy request's prompt and asserts it is absent from the body.
+  Behind the same `--api-key` as every other route; `/props` lists it only when
+  it is served. The read is lock-cheap by construction: the slot pool's mutex is
+  held only to copy its busy flags and per-slot request ids, the backend's lock
+  only for the per-sequence cell high-water (the lock `/props` already takes for
+  the loan state), and the document is built outside both.
+
 ## 1.4.2 — 2026-11-02
 
 One HTTP-surface addition: every request carries an id, so a gateway's log line
