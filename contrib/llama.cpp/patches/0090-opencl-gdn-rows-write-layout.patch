@@ -1,0 +1,65 @@
+diff --git a/ggml/src/ggml-opencl/kernels/gated_delta_net.cl b/ggml/src/ggml-opencl/kernels/gated_delta_net.cl
+index 4d3234f..842a3ee 100644
+--- a/ggml/src/ggml-opencl/kernels/gated_delta_net.cl
++++ b/ggml/src/ggml-opencl/kernels/gated_delta_net.cl
+@@ -249,7 +249,7 @@ kernel void kernel_gated_delta_net(
+             const uint col = sg_col_base + cg * LANE_GROUPS_PER_SG + lane_group;
+             #pragma unroll
+             for (uint r = 0; r < ROWS_PER_LANE; r++) {
+-                data_dst[s_off + state_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[cg][r];
++                data_dst[s_off + state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[cg][r];
+             }
+         }
+     }
+diff --git a/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl b/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
+index 0c6f67a..75baa31 100644
+--- a/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
++++ b/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
+@@ -323,9 +323,12 @@ kernel void kernel_gated_delta_net_pp(
+     const uint iq1 = head % H_k;
+     const uint iq3 = seq / rq3;
+     const ulong state_size = (ulong)S_V * S_V;
+-    const ulong state_base = use_rows
++    // 0081 fix: the rows form READS the state from its cache row, but the snapshot and dst writes keep the
++    // per-sequence layout the CPU reference writes (ops.cpp: s_out = state_out_base + (seq * H + head) * S_v * S_v).
++    const ulong state_base = ((ulong)seq * H_v + head) * state_size;
++    const ulong state_base_rd = use_rows
+         ? ((ulong) ((global const int *)(rows_buf + off_rows))[seq] * state_row_stride + (ulong)head * state_size)
+-        : ((ulong)seq * H_v + head) * state_size;
++        : state_base;
+     const ulong q_base  = (ulong)iq3 * sq3 + (ulong)iq1 * sq1;
+     const ulong v_base  = (ulong)seq * sv3 + (ulong)head * sv1;
+     const ulong gb_base = (ulong)seq * sb3 + (ulong)head * sb1;
+@@ -335,7 +338,7 @@ kernel void kernel_gated_delta_net_pp(
+     for (int r = 0; r < R; ++r)
+         #pragma unroll
+         for (int m = 0; m < KL; ++m)
+-            S[r][m] = BLOCK_READ_F(data_state + state_base + (ulong)(row0 + r) * S_V + m * SG);
++            S[r][m] = BLOCK_READ_F(data_state + state_base_rd + (ulong)(row0 + r) * S_V + m * SG);
+ 
+     // chunk 0 straight into buffer 0
+     #pragma unroll
+@@ -480,9 +483,12 @@ kernel void kernel_gated_delta_net_tg(
+     const uint iq1 = head % H_k;
+     const uint iq3 = seq / rq3;
+     const ulong state_size = (ulong)S_V * S_V;
+-    const ulong state_base = use_rows
++    // 0081 fix: the rows form READS the state from its cache row, but the snapshot and dst writes keep the
++    // per-sequence layout the CPU reference writes (ops.cpp: s_out = state_out_base + (seq * H + head) * S_v * S_v).
++    const ulong state_base = ((ulong)seq * H_v + head) * state_size;
++    const ulong state_base_rd = use_rows
+         ? ((ulong) ((global const int *)(rows_buf + off_rows))[seq] * state_row_stride + (ulong)head * state_size)
+-        : ((ulong)seq * H_v + head) * state_size;
++        : state_base;
+     const ulong q_base  = (ulong)iq3 * sq3 + (ulong)iq1 * sq1;   // q and k share strides
+     const ulong v_base  = (ulong)seq * sv3 + (ulong)head * sv1;
+     const ulong gb_base = (ulong)seq * sb3 + (ulong)head * sb1;
+@@ -492,7 +498,7 @@ kernel void kernel_gated_delta_net_tg(
+     for (int r = 0; r < R; ++r)
+         #pragma unroll
+         for (int m = 0; m < KL; ++m)
+-            S[r][m] = BLOCK_READ_F(data_state + state_base + (ulong)(row0 + r) * S_V + m * SG);
++            S[r][m] = BLOCK_READ_F(data_state + state_base_rd + (ulong)(row0 + r) * S_V + m * SG);
+ 
+     // token 0's inputs; then each step fetches the next token's first
+     float kn[KL], qn[KL], vn[R], gn = 0.f, bn = 0.f;

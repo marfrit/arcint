@@ -133,7 +133,8 @@ class GdnStateRows(unittest.TestCase):
             self.assertRegex(t, r"use_rows\s*\n?\s*\?[^;]*rows_buf[^;]*state_row_stride[^;]*head",
                              f + ": state_base must take the row in rows mode")
         i = self.t[INTEL_CL]
-        self.assertEqual(i.count("const ulong state_base = use_rows"), 2,
+        # 0090: the row base is the READ base only; snapshots and dst keep the per-sequence layout.
+        self.assertEqual(i.count("const ulong state_base_rd = use_rows"), 2,
                          "both Intel kernels (tg and pp) read the row")
 
     def test_dispatch_passes_rows(self):

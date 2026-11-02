@@ -6308,3 +6308,17 @@ here yet.
 
 Status: built, device-free green, off by default; the 0088/0089 pair is the
 opt-in until the card A/B.
+
+
+## 0090-opencl-gdn-rows-write-layout.patch
+
+Fixes 0081's OpenCL rows form (`LLAMA_GDN_STATE_ROWS`). The rows form READS a sequence's state from its row of
+the 2D recurrent cache, but both Intel kernels (`kernel_gated_delta_net_pp` and `_tg`) also used that cache-row
+base for the WRITES: the verify snapshots (`snap_buf + slot * snap_stride + state_base`) and the final state in
+`dst` (`data_dst + s_off + state_base`). Those buffers have the per-sequence layout the CPU reference writes
+(`ggml-cpu/ops.cpp`: `s_out = state_out_base + (seq * H + head) * S_v * S_v`, `code`), so on the card the state
+landed at the wrong offset. Measured (window 57, the A770 coder, one run, `measured-here`): with the switch on an
+answer gate failed, the output md5 differed and decode fell from 51 to 21 t/s. The fix splits the base:
+`state_base_rd` (the cache row, rows form only) for the read, `state_base` (per sequence) for every write. The generic kernel (`gated_delta_net.cl`) had the same defect in its K == 1 final write only (its snapshots already used `state_out_base`); it now writes to `state_out_base` too.
+Device-free cell: `tests/python/test_gdn_rows_write_layout.py` (text). Card arm owed: test-backend-ops
+GATED_DELTA_NET rows cases on both cards and the coder's served A/B with the switch on.
