@@ -27,4 +27,8 @@ check("generic kernel: snapshots use the per-sequence base", "target_slot * stat
 tb = open(os.path.join(os.environ.get("LLAMA_SRC", ""), "tests/test-backend-ops.cpp")).read()
 ev = tb[tb.index("make_test_cases_eval("):tb.index("make_test_cases_perf()")]
 check("test-backend-ops runs the rows cases in eval mode", ev.count("false, false, 1, true));") >= 3)
+case = tb[tb.index("struct test_gated_delta_net : public test_case"):]
+case = case[:case.index("\n};\n")]
+check("0093: the row ids go through the backend, not t->data", "(int32_t *) t->data" not in case
+      and "ggml_backend_tensor_set(t, p.data()" in case)
 sys.exit(1 if fail else 0)

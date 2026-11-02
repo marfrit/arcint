@@ -6346,3 +6346,11 @@ of the case context's 128-tensor pool (`ggml_new_object: not enough space in the
 chain case and none of the cases after it (0090's rows cases among them) had ever completed on a card (window 58,
 the A770, `measured-here`). `test_case` gets a `max_tensors()` hook (default 128, the upstream budget) used by
 its four context sites; the chain case returns 4096.
+
+
+## 0093-tbo-gdn-rows-ids-set.patch
+
+test-backend-ops only. 0081's rows case wrote its row ids through `(int32_t *) t->data`, which is host memory only
+on the CPU backend; on a GPU backend it is a device-buffer address, so the first rows case on a card killed the
+test (SIGSEGV, exit 139; the B60 logged a copy-engine CAT error as the context died; window 58, `measured-here`).
+The ids now go through `ggml_backend_tensor_set`.
