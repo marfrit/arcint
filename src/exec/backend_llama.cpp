@@ -1256,8 +1256,11 @@ public:
     // sequence, no traversal, and the numbers are copied out so the response's
     // JSON is built outside the lock. A running generation holds mu_ for one
     // llama_decode at a time (the counters move inside it), so the read waits
-    // for a batch, never for a request, and it never touches the slot pool's
-    // lock at all.
+    // for one batch, never for a whole request, and it never touches the slot
+    // pool's lock. One batch can be long: a prefill chunk is one llama_decode
+    // (Flash-Next's 8,192-token chunks take seconds), so a /slots call made during
+    // a prefill answers when that chunk ends. For a hybrid model the value is
+    // the min of the attention and recurrent caches' maxima (the reusable prefix).
     std::vector<int> kv_positions() const override {
         std::lock_guard<std::mutex> lk(mu_);
         std::vector<int>            out;
