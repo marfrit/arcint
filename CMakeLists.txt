@@ -489,6 +489,21 @@ if(ARCINT_TESTS)
     target_compile_options(arcint-gdn-state-rows PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME gdn-state-rows COMMAND arcint-gdn-state-rows)
     set_tests_properties(gdn-state-rows PROPERTIES LABELS unit)
+    # patch 0082's device-free cell: one l2_norm over the joint q/k head groups
+    # of the GDN conv output against the two separate norms, on the CPU backend,
+    # byte equality; the gate cell reads the switch and the bf16 dispatch out of
+    # the patched tree.
+    add_executable(arcint-gdn-qk-l2-norm tests/test_gdn_qk_l2_norm.cpp)
+    target_link_libraries(arcint-gdn-qk-l2-norm PRIVATE arcint_core)
+    target_include_directories(arcint-gdn-qk-l2-norm PRIVATE "${ARCINT_LLAMA_DIR}/ggml/include")
+    target_compile_options(arcint-gdn-qk-l2-norm PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME gdn-qk-l2-norm COMMAND arcint-gdn-qk-l2-norm)
+    set_tests_properties(gdn-qk-l2-norm PROPERTIES LABELS unit)
+    add_test(NAME gdn-qk-l2-norm-gate
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_gdn_qk_l2_norm.py")
+    set_tests_properties(gdn-qk-l2-norm-gate PROPERTIES LABELS unit)
     # patch 0081's build gate, read out of the patched tree (LLAMA_SRC): the
     # switch defaults off, one sequence only, the fused GDN the batch takes
     add_test(NAME gdn-state-rows-gate

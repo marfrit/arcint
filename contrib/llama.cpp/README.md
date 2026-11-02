@@ -5657,3 +5657,76 @@ Card arms (owed; Claude runs them in a card window, **not yet measured**):
    finding is recorded.
 3. The same with the coder on the A770 (`--device GPU.1`, `ab.py coder`, MTP 4)
    and with Flash-Next (B60, MTP 3, IQ3_XXS): answers right, decode recorded.
+
+## 0082-llama-gdn-qk-l2-norm.patch
+
+One l2_norm for the hybrid layers' adjacent q/k head groups, and the bf16 gate
+dispatch read. **Evidence class of the mechanism: `code`** (fork's form:
+`arc-b580/src/models/qwen35.cpp:548-554`, one `ggml_l2_norm` over the joint
+`[head_k_dim, 2*num_k_heads, n_seq_tokens, n_seqs]` view of the conv output,
+then q and k as views of its result). Ours normed q and k separately — two
+`build_gdn_l2_norm` pairs (`rms_norm` + `scale`) over strided views, four nodes
+a layer (`code`: `qwen35.cpp:441-442`, `qwen35moe.cpp`, `qwen4exp.cpp`); the
+fork's Metal bundle measured +7.7 % 2B / +2.6 % 27B for the hybrid bundle,
+`paper`, not separable to this node pair.
+
+The patch adds one device-free helper, `src/models/gdn-qk-l2-norm.h` (ggml.h
+only), holding `build_gdn_l2_norm` and the joint form: a `view_4d` of the conv
+output keeping its group stride (`nb1_qkv`), one `rms_norm(x, eps/n)` and
+`scale(1/sqrt(n))` over it, then q and k as views of the dense result at offsets
+`0` and `num_k_heads * nb[1]`. The same normalisation runs per row, so the bytes
+are the two separate norms' (`exact`; the fork claims byte-identical outputs for
+its fusions, `code`). The three served archs call it; `clef` and `qwen3next`
+share the two-norm form but are not served units and are left as they are.
+
+**Switch `LLAMA_FUSE_QK_L2_NORM`, off by default** (`code`): `1` builds the
+joint form, `0` the two separate norms — byte-identical to before.
+
+**Item 8's second half, the bf16 48-row gate matvec: no missing piece, and the
+dispatch read says so** (`code`). The audit's "not verified, `inferred` from the
+dispatch tables" is now read: bf16 is stored as f16 on device
+(`ggml-opencl.cpp:29086`, `src0t = BF16 ? F16 : type`), and the F16 matvec
+branch (`:29202-29227`) takes `src1->ne[1] <= 8` columns with
+`(src0->ne[1] <= 64 || (src0->ne[1] <= 1024 && src1->ne[1] >= 2))` — a
+`[5120, 48]` gate weight at 1-6 columns takes `kernel_mul_mv_f16_f32_ksplit`
+(one column) or `..._nc` (2-6), a work-group a row, **not** the tiled GEMM.
+The fork's `mmvf.cu` fix (bf16 mat-vec under 64 rows at 2-8 columns,
+10.5 -> 4.4-7.3 us) therefore has no counterpart to port here: the dispatcher
+already routes it there. No kernel work in this patch; the cell asserts the
+conditions, so a future narrowing of them fails it.
+
+Device-free (`measured-here`): `tests/test_gdn_qk_l2_norm.cpp` builds a strided
+conv mix on the CPU backend and compares the joint form's q and k bytes against
+the two separate norms at five shapes (head 4 / 2 k heads / 1 and 3 tokens / 1
+and 2 sequences; head 8 / 3 k heads / 2 tokens / 2 sequences; a compact mix
+without the v tail). The joint form's q and k are views of its dense result, so
+their token stride carries both head groups; the cell walks the views' logical
+elements with their own strides instead of copying linearly.
+`tests/python/test_gdn_qk_l2_norm.py` reads the patched tree: the switch default
+off, the two-norm arm kept in all three archs, the joint view's group stride,
+the k view's head-group offset, and the bf16 matvec conditions. Red mutations run
+before restore (`measured-here` on the patched tree): the switch flipped on, a
+model's two-norm arm dropped, the k view's `num_k_heads *` dropped, the joint
+view's group stride set contiguous, the bf16 row term narrowed to 48 — each made
+its cell fail; restored, it passes. The Python cell is source text; the C cell is
+numeric, and its numeric red was run through the recipe itself: with the joint
+view's group stride taken as the q|k row width (`nb1_qkv` ->
+`ggml_row_size(type, head_k_dim)`), the cell failed every shape whose token or
+sequence stride is exercised (3 of 5: three tokens, two tokens x two sequences,
+the compact two tokens x two sequences), and the one-token shapes passed; the
+fix (restored `nb1_qkv`) makes all five pass. The bug was in this patch's own
+first draft, found by the cell.
+
+Card arms (owed; Claude runs them in a card window, **not yet measured**):
+1. **B60 agent and A770 coder, served, switch off vs on**, two rounds:
+   `printf '#!/bin/sh\nexport LLAMA_FUSE_QK_L2_NORM=1\nexec %s "$@"\n' <arcint-binary> > /tmp/arcint-qk2 && chmod +x /tmp/arcint-qk2`
+   `python3 tests/acceptance/ab.py agent --old <arcint-binary> --new /tmp/arcint-qk2 --gguf <agent.gguf> --device GPU.0 --assets <assets> --rounds 2 --out /tmp/ab-82-agent`
+   and `ab.py coder ... --device GPU.1`. Record decode, prefill, `draft accept`
+   and the texts md5; the bar is >= +2 % bundled with identical answers (`paper`),
+   and the md5/argmax tripwire is the answer-level gate. If no gain, the switch
+   stays off.
+2. **Launch count** before/after: one GDN layer's encoded nodes a token,
+   `GGML_OPENCL_...`? there is no op-count dump; use the served `LLAMA_LOG`
+   graph lines or a counters arm. Owed, stated so.
+3. B60 Flash-Next (IQ3_XXS, MTP 3): answers right, decode recorded — the same
+   A/B form.
