@@ -6336,3 +6336,13 @@ window 56, the agent on the B60, `measured-here`). One helper (`rs_set_input_rpl
 reuse) now serves the recurrent input and all three hybrid inputs. The op-level replay cases (test-backend-ops
 `GATED_DELTA_NET_REPLAY` chains) could not see this: they build the op, not a model's graph input. Device-free cell:
 `tests/python/test_gdn_replay_hybrid_input.py` (text). Card arm owed: the agent's served A/B with the switch on.
+
+
+## 0092-tbo-replay-chain-pool.patch
+
+test-backend-ops only. 0086's `test_gdn_replay_chain` builds a whole chain of launches in one graph and ran out
+of the case context's 128-tensor pool (`ggml_new_object: not enough space in the context's memory pool (needed
+130080, available 129712)`, `GGML_ASSERT(obj_new)`), which aborted the eval run at the first chain case. So no
+chain case and none of the cases after it (0090's rows cases among them) had ever completed on a card (window 58,
+the A770, `measured-here`). `test_case` gets a `max_tensors()` hook (default 128, the upstream budget) used by
+its four context sites; the chain case returns 4096.

@@ -27,4 +27,9 @@ for cls in ("llm_graph_input_mem_hybrid", "llm_graph_input_mem_hybrid_k", "llm_g
           "rs_set_input_rpl(inp_rs.get(), mctx->get_recr(), ubatch);" in body(f"void {cls}::set_input("))
     check(cls + "::can_reuse checks the replay tensors",
           "rs_can_reuse_rpl(inp_rs.get(), mctx->get_recr(), params.ubatch)" in body(f"bool {cls}::can_reuse("))
+tb = open(os.path.join(os.environ.get("LLAMA_SRC", ""), "tests/test-backend-ops.cpp")).read()
+check("0092: the case context's tensor budget is a hook", tb.count("ggml_tensor_overhead()*max_tensors()") == 4)
+ch = tb[tb.index("struct test_gdn_replay_chain"):]
+ch = ch[:ch.index("\n};\n")]
+check("0092: the replay chain raises it", "size_t max_tensors() override" in ch)
 sys.exit(1 if fail else 0)
