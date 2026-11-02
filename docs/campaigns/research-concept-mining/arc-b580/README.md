@@ -12,7 +12,7 @@ evidence and corrected five records; pass 3 read the mechanism in the fork's tre
 every kept candidate against our own source, with file:line and the patch that already holds it.
 
 Counts: **113 / 42 / 32 / 21** at score 0 / 1 / 2 / 3 (208 commits). Of the 20 merged concepts, 10
-are in the top list and 8 are audited; the ternary/PTQ1_0/PQ2_0 formats and the non-Intel backends
+are in the top list and 9 are audited in full (the next two are ruled out on shape); the ternary/PTQ1_0/PQ2_0 formats and the non-Intel backends
 score 0.
 
 Files: `records.md` (one record a commit), `candidates.md` (the ranked list), `audit.md` (against

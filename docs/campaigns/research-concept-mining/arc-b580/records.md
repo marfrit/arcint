@@ -366,7 +366,7 @@ adapter; our backend is OpenCL, so a SYCL kernel is read for what it would be as
 - `d1aababd97` **docs** · docs · kept — model links and public-model numbers (`mtp-lean 128K:
   fresh 77, rename 306, edit 205, plain 38`). `score 0`
 - `479017e7e0` **docs** · docs · kept — demo video. `score 0`
-- `acd86a2b23` **docs** · knob · kept — `GGML_SYCL_FA_ONEDNN_MAX_KV` cap for the oneDNN prompt
+- `acd86a2b23` **docs** · docs · kept (documents `GGML_SYCL_FA_ONEDNN_MAX_KV`) — cap for the oneDNN prompt
   attention path; the fast path converts the whole KV to f16 (~4 KB per token of context), and
   at ~0.5 GB of spare VRAM a ~119K-token prompt ran out of memory and took the server down.
   Above the cap (98304) a chunked path reads at ~330 t/s at 120K; shorter prompts unaffected.
@@ -386,7 +386,7 @@ adapter; our backend is OpenCL, so a SYCL kernel is read for what it would be as
 - `244c4d44c5` **gemm** · knob · lab, default stays best — `GGML_SYCL_PTQ1_T2_TILE` for the
   TernSYCL large-M tile. `B580 pp1024 (ub 1024, all on XMX): 8x128/8x2 939 t/s (default),
   8x128/16x1 949, others 480-857`. `score 0`
-- `afe4c82d51` **moe** · kernel · default on, `GGML_SYCL_TOPK_OLD=1` opt-out — two-pass top-k for
+- `afe4c82d51` **other** · kernel · default on, `GGML_SYCL_TOPK_OLD=1` opt-out — two-pass top-k for
   long rows: up to 256 groups per row with a pairwise local-memory merge, then one group merges
   the winners; ties keep the lower index. `The one-work-group top-k took ~550 us per MTP draft
   token on the B580 (248K-entry vocabulary); 200K entries: k=1 241 -> 9.6 us, k=10 647 -> 71 us;
@@ -443,7 +443,7 @@ adapter; our backend is OpenCL, so a SYCL kernel is read for what it would be as
   1062, pp512 901 -> 818; 48.6K prompt read 67.7 -> 61.6 s (719 -> 789 t/s); PPL 8.7273 ->
   8.7359 (+0.1 %, int8 rounding)`. `score 0` (our 0071 is the same mechanism for MoE experts)
 - `dd8589df8b` **docs** · docs · kept — Gemma at ~100 t/s, int8 prompt batches. `score 0`
-- `8160e3b418` **docs** · docs · kept — comparison with PrismML's SYCL path (`prompt 207 vs 895
+- `8160e3b418` **docs** · docs · kept — comparison with the format vendor's SYCL path (`prompt 207 vs 895
   t/s, plain 20.6 vs 42.3, 32K depth 8.1 vs 35.8, chat with MTP 37.6 vs 88.4`); the Claude Code
   section; a chat template whose mid-conversation system message becomes a user-turn note. This
   last one is a serving detail our units may want. `score 1`
