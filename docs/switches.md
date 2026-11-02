@@ -9,7 +9,7 @@ Tuning, off-switch, red-case and diagnostic switches are for measuring and
 may change or go without notice.
 
 A switch here is an environment variable read by arcint, by one of its tools,
-or by the llama.cpp patch series in `contrib/llama.cpp/patches` (0001-0079,
+or by the llama.cpp patch series in `contrib/llama.cpp/patches` (0001-0084,
 without the dropped 0031, 0055, 0061 and 0078 (1.4.1), 0073 on its campaign branch and the
 retired 0076; 0079 reads no switch). Switches the pinned llama.cpp tree reads by itself
 (`GGML_OPENCL_PLATFORM`, `GGML_OPENCL_FUSE_RMS_ADD`, `GGML_OPENCL_F16_MROW` and
@@ -131,6 +131,8 @@ These names are not in a table:
 | `LLAMA_SLOT_LOAN_PREFILL_GROWTH_MIB` | 0 | The prefill's growth band in MiB the kernel rule allows (zero margin); a non-numeric value keeps 0, capped at 16 GiB. | 0068 | `code`: 0068:3885-3895. |
 | `LLAMA_SLOT_LOAN_SHED_FLOOR_MIB` | 64 MiB (0 allowed) | The end guard's noise floor in MiB: a shortfall at or above it is a true one fed to the next loan's sizing, below it the guard does nothing; a non-numeric value keeps the default, capped at 16 GiB. | 0068 | `code`: 0068:3967-3976. |
 | `STRATA_PROFILE_PRIOR_ENTRIES` | 800000 | The prior mass, in routed entries, the xe save rule mixes into the start's ranking so a short conversation does not wipe the prior (Strata's constant, mirrored). | 0070 | `code`: 0070:105-107,605. |
+| `LLAMA_SYNC_TRIM` | 0 (all bits off, byte-identical to before) | Bit 1: skip a context synchronize when this context queued nothing since its last one; bit 2: keep the KV rotation matrices on the cache's device instead of uploading two graph inputs per attention graph; bit 4: one copy for a batch's backend-sampled ids instead of one small read a row. Not used with pipeline parallelism for bit 1. The fork's default is 3. | 0083 | `code`: 0083; the queue and per-read costs are the fork's `measured-here` on its stack; the B60 served A/B is owed. |
+| `LLAMA_SAMPLER_FAST_TOPK` | 0 (off) | `1`: a row's top-k is taken straight from the logits (llama_top_k_from_logits, patch 0084) instead of building the full 248k candidate array and partial-sorting it; the same entries and the same order of equal logits (ties, NaN, inf). Both arcint's sampler and any future llama common-sampler caller use it. | 0084 (arcint `src/core/sampler.cpp`) | `code` + the device-free exactness cell `tests/test_fast_topk.cpp`; the fork's +1.9 % / +1.85 % is `measured-here` on its stack, the B60 arm is owed. |
 
 ### Off switch
 

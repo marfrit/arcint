@@ -145,6 +145,13 @@ listed, not audited. #6 and #10 are listed with the reason.
   MTP draft ids into one I32 and read once. **Red-first tests**: a counter test that a getter after
   a completed decode issues no backend synchronize; the rotation tensors' buffer residency; draft
   ids equal to the per-step read.
+- **Disposition (2026-11-02, package B)** (`code`): patch 0083 carries bits 1 and 2 as the fork
+  has them, and bit 4 as the form of "one id read where there are several" that applies here
+  (backend-sampled rows; not on arcint's served path today, `src/core/sampler.cpp:1107` samples
+  host logits). The fork's draft-chain form does not apply: arcint's drafter runs one graph a
+  step (`src/exec/llama_spec.cpp:615-635`) and the route trace's ids are already one batch
+  (0069). `LLAMA_SYNC_TRIM` defaults 0 here (byte-identical off). Counts and the red cases are in
+  `contrib/llama.cpp/README.md` 0083; the B60 served A/B is owed to a card window.
 
 ## 5. The GDN recurrent-state gather folded into the kernel
 
@@ -200,6 +207,15 @@ listed, not audited. #6 and #10 are listed with the reason.
   `set_logits`; if our drafter's top-k runs on the GPU, the two-pass merge beside it.
   **Red-first test**: the direct selection against `std::partial_sort` on random arrays with ties,
   NaN and inf, plus server-output id equality.
+- **Disposition (2026-11-02, package B)** (`code`): the audit's "our MTP verify samples through
+  this chain" is corrected by the code — the served path is arcint's own `Sampler`
+  (`src/core/sampler.cpp:1107`), which builds the full 248320-entry array and partial-sorts it;
+  llama's common library is not built by arcint (`LLAMA_BUILD_COMMON OFF`). Patch 0084 adds
+  `llama_top_k_from_logits` (the fork's heap steps, exact on ties/NaN/inf), and the sampler calls
+  it under `LLAMA_SAMPLER_FAST_TOPK=1` (default 0, old path byte-identical). The GPU two-pass
+  merge is not taken: our top-k runs on the host, not on the OpenCL TOP_K kernel (the backend
+  sampler's, not served). Exactness cell `tests/test_fast_topk.cpp`; red case in README 0084; the
+  B60 A/B is owed to a card window.
 
 ## 8. Hybrid decode fusions
 
