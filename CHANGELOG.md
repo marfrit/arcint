@@ -69,6 +69,14 @@ The series 0080-0089 and `--llama-mtp-depth-max` were implemented by meseeks (a 
 DeepSeek-V4.1-Flash quant, run locally) from the concept mining; briefed and reviewed by
 Claude, who wrote the fixes 0090-0094.
 
+Release gate (window 62, `measured-here`, the release candidate against 1.4.2 in the same window):
+the coder's decode 51.50 / 52.70 / 45.25 -> 52.50 / 53.65 / 46.10 t/s and its prefill at 41k 730.25 ->
+778.10 t/s (two rounds), its answers byte-identical, the acceptance task 10/10 greedy x3; Flash-Next
+equal (three rounds); the writer and the VLM byte-identical at equal speed. The agent with replay:
+answers byte-identical, prefill 716.60 -> 695.75 t/s at 55k and 503.50 -> 494.30 at 138k (replay's
+price for the context it frees); at 262,144 tokens the needle at 254,970 right, VRAM peak 24,164 of
+24,480 MiB, nothing evicted.
+
 Runtime dependency unchanged: llama.cpp 3e4dfa8 with `contrib/llama.cpp/patches`
 0001-0094 (0031, 0055, 0061, 0073, 0076, 0078 not carried; 0085 never assigned).
 
