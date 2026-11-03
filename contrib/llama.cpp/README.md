@@ -6367,6 +6367,12 @@ md5 identical to off, no refused rollback; prefill 715.4 -> 690.5 t/s at 55k (-3
 Window 59 (the agent on the B60 at a 115,395-token prompt, one run an arm, `measured-here`): resident VRAM
 22,814 against 23,390 MiB after load and 23,725 against 24,301 after the request (-576 MiB), decode 20.96 against
 21.03 t/s, prefill 214.9 against 211.5 s; the answer opens the same, its bytes differ (KL not measured).
+Window 61 (the agent on the B60, `measured-here`): the acceptance task greedy without thinking 10/10 with
+replay and 10/10 without (a different program); at `--n-ctx 262144` (the model's trained length) with replay the
+unit loads at 23,256 MiB resident (245,760 without replay: 23,390), a needle at 40 % of a 254,970-token prompt is
+right (731.5 s, 348.6 t/s), the peak is 24,199 of 24,480 MiB and GTT stays flat (64 MiB). A verify costs the same
+124.4 ms at 245,760 off, 245,760 with replay and 262,144 with replay at a 115k prompt; the decode rates differ by
+the answers' draft acceptance only. KL by perplexity cannot see replay (it never rolls back).
 
 
 ## 0092-tbo-replay-chain-pool.patch
