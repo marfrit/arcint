@@ -5579,6 +5579,13 @@ Card arms (owed; Claude runs them in a card window, **not yet measured**):
    arm; if the accept counters differ, the switch stays off and the finding is
    recorded, not absorbed.
 
+Window 58 (`measured-here`, 2 rounds an arm, the bundle `LLAMA_MTP_KV_ONLY=1 LLAMA_SYNC_TRIM=2` against off):
+the coder (A770) PASS, texts md5 identical, decode +1.8 / +2.0 / +1.8 %, prefill-41k 729.75 -> 777.80 (+6.6 %);
+the agent (B60) PASS, md5 identical, prefill equal (55k 715.85 -> 714.95, 138k 503.25 -> 502.70); Flash-Next (B60)
+PASS, prefill equal, decode 32.40 -> 32.90 inside a 4 % run spread. Window 57 (one run each) put the coder's
+prefill gain on 0080 and its decode gain on 0083 bit 2.
+
+
 ## 0081-llama-gdn-state-rows.patch
 
 The GDN recurrent state read straight from the cache. Ours gathers each layer's
@@ -5864,6 +5871,13 @@ per phase. Exact commands, with the binary named by the package under test:
 Bar: decode (the target phase with MTP on) improves; prefill stays inside the
 run's spread. The fork's own numbers (2 syncs + 2 blocking copies a graph,
 ~0.2 ms a small read) are its stack's; the B60 price is this window's to say.
+
+Window 58 (`measured-here`, 2 rounds an arm, the bundle `LLAMA_MTP_KV_ONLY=1 LLAMA_SYNC_TRIM=2` against off):
+the coder (A770) PASS, texts md5 identical, decode +1.8 / +2.0 / +1.8 %, prefill-41k 729.75 -> 777.80 (+6.6 %);
+the agent (B60) PASS, md5 identical, prefill equal (55k 715.85 -> 714.95, 138k 503.25 -> 502.70); Flash-Next (B60)
+PASS, prefill equal, decode 32.40 -> 32.90 inside a 4 % run spread. Window 57 (one run each) put the coder's
+prefill gain on 0080 and its decode gain on 0083 bit 2.
+
 
 ## 0084-llama-fast-topk.patch
 
@@ -6320,8 +6334,12 @@ base for the WRITES: the verify snapshots (`snap_buf + slot * snap_stride + stat
 landed at the wrong offset. Measured (window 57, the A770 coder, one run, `measured-here`): with the switch on an
 answer gate failed, the output md5 differed and decode fell from 51 to 21 t/s. The fix splits the base:
 `state_base_rd` (the cache row, rows form only) for the read, `state_base` (per sequence) for every write. The generic kernel (`gated_delta_net.cl`) had the same defect in its K == 1 final write only (its snapshots already used `state_out_base`); it now writes to `state_out_base` too. Why the card cases missed it: 0081 registered its rows cases only in `make_test_cases_perf`, which times and never compares; 0090 adds them (plus a small 2-sequence case) to the eval list.
-Device-free cell: `tests/python/test_gdn_rows_write_layout.py` (text). Card arm owed: test-backend-ops
-GATED_DELTA_NET rows cases on both cards and the coder's served A/B with the switch on.
+Device-free cell: `tests/python/test_gdn_rows_write_layout.py` (text). Card arms (window 58, `measured-here`, with 0092 and 0093): test-backend-ops GATED_DELTA_NET eval 60 of 60
+on the A770 and on the B60 (rows 5 of 5); the pre-0090 kernels fail 7 cases on the A770 (rows 0 of 5) and on
+the B60 the first rows case faults the compute engine (CAT error: the writes leave the buffer), the fault that
+preceded window 56's Flash-Next abort (`the CPU misses' publish never arrived`). Served: the coder with the
+switch on, texts md5 identical to off, decode 51.5 -> 51.2 t/s (one run: no gain); Flash-Next with the exact
+bundle completes, answers right, prefill-20k 536.9 and decode 32.8 t/s (window 56 off arm 534.2 / 33.1).
 
 
 ## 0091-replay-hybrid-input.patch
@@ -6335,7 +6353,9 @@ refused (`seq_rm: cannot roll back 4 tokens, only 0 kept`, then `llama.cpp refus
 window 56, the agent on the B60, `measured-here`). One helper (`rs_set_input_rpl`, and `rs_can_reuse_rpl` for graph
 reuse) now serves the recurrent input and all three hybrid inputs. The op-level replay cases (test-backend-ops
 `GATED_DELTA_NET_REPLAY` chains) could not see this: they build the op, not a model's graph input. Device-free cell:
-`tests/python/test_gdn_replay_hybrid_input.py` (text). Card arm owed: the agent's served A/B with the switch on.
+`tests/python/test_gdn_replay_hybrid_input.py` (text). Served (window 58, the agent on the B60, one run, `measured-here`): capital and the 138k needle right, texts
+md5 identical to off, no refused rollback; prefill 715.4 -> 690.5 t/s at 55k (-3.5 %) and 501.1 -> 494.1 at
+138k (-1.4 %). The agent A/B carries no decode metric, so there is no case for a default yet.
 
 
 ## 0092-tbo-replay-chain-pool.patch
