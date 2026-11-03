@@ -6391,3 +6391,14 @@ test-backend-ops only. 0081's rows case wrote its row ids through `(int32_t *) t
 on the CPU backend; on a GPU backend it is a device-buffer address, so the first rows case on a card killed the
 test (SIGSEGV, exit 139; the B60 logged a copy-engine CAT error as the context died; window 58, `measured-here`).
 The ids now go through `ggml_backend_tensor_set`.
+
+
+## 0094-defaults-kv-only-sync-trim.patch
+
+Turns on by default the two switches that measured a gain with nothing degrading: 0080's MTP KV-only pass
+(`LLAMA_MTP_KV_ONLY`, now on unless `=0`) and 0083's bit 2, the KV-cache rotation matrices kept on the device
+(`LLAMA_SYNC_TRIM` now 2 unless set; `0` restores upstream). Window 58 (`measured-here`, 2 rounds an arm against
+off): the coder (A770) decode +1.8 / +2.0 / +1.8 %, prefill-41k +6.6 %, texts md5 identical; the agent and
+Flash-Next equal (Flash-Next's qwen4exp graph has no KV-only pass). Every other switch of the series stays off:
+0081 rows, 0082, 0083 bits 1 and 4 and 0084 gave nothing; 0088/0089 cost decode; replay (0086/0087/0091) is a
+per-unit choice where its VRAM buys context (the agent's sample unit).

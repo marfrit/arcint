@@ -31,11 +31,18 @@
 # 24,195 MiB (238 MiB margin): thin; 229,376 is the step back. Back to the
 # start: --n-ctx 131072 --llama-kv q8_0.
 #
+# Since 1.4.3: 262,144 tokens (the model's trained length) with the gated
+# delta-net's rollback by replay (LLAMA_GDN_REPLAY=1, patches 0086/0087/0091),
+# which keeps one base state and small records instead of whole state copies:
+# 576 MiB less VRAM. Window 61: the needle at 40 % of a 254,970-token prompt
+# right, VRAM peak 24,199 MiB of 24,480, nothing evicted, acceptance task 10/10,
+# a verify's cost unchanged. Back: drop the Environment line, --n-ctx 245760.
+#
 # --llama-mtp-vocab: the draft head scores a 40,960-token vocabulary
 # (HyperQwen's, docs/campaigns/research-hyperqwen.md) instead of the full one.
 
 [Unit]
-Description=arcint-agent — Qwen3.8-27B dense + MTP on libllama (q8_0:q4_0 KV, 245760 tokens), GPU.0, :8087
+Description=arcint-agent — Qwen3.8-27B dense + MTP on libllama (q8_0:q4_0 KV, 262144 tokens, replay), GPU.0, :8087
 Documentation=https://github.com/marfrit/arcint
 After=default.target
 # One card, one resident model: the units that want the same card
@@ -43,6 +50,7 @@ Conflicts=arcint-writer.service arcint-flashnext.service
 
 [Service]
 Type=simple
+Environment=LLAMA_GDN_REPLAY=1
 ExecStart=/usr/bin/arcint \
     --engine llama \
     --gguf /models/gguf/Qwen3.8-27B-Q4_K_M.gguf \
@@ -50,7 +58,7 @@ ExecStart=/usr/bin/arcint \
     --device GPU.0 \
     --host 0.0.0.0 \
     --port 8087 \
-    --n-ctx 245760 \
+    --n-ctx 262144 \
     --llama-kv q8_0:q4_0 \
     --llama-mtp 5 \
     --llama-mtp-vocab %h/.local/share/arcint/hyperqwen-40960.json \

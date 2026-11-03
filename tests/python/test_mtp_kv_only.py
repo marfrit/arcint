@@ -65,11 +65,12 @@ class MtpKvOnly(unittest.TestCase):
         start = text.find("auto [Qcur_full, Kcur, Vcur] = build_qkv(layer, cur,")
         return text[start:]
 
-    def test_switch_is_default_off(self):
+    def test_switch_is_default_on(self):
         for f, t in self.texts.items():
             self.assertIn('getenv("LLAMA_MTP_KV_ONLY")', t, f)
-            self.assertRegex(t, r"e\s*!=\s*nullptr\s*&&\s*atoi\(e\)\s*!=\s*0",
-                             f + ": the switch must be off unless LLAMA_MTP_KV_ONLY is 1")
+            # patch 0094: on by default; LLAMA_MTP_KV_ONLY=0 is the way back
+            self.assertRegex(t, r"e\s*==\s*nullptr\s*\|\|\s*atoi\(e\)\s*!=\s*0",
+                             f + ": the switch must be on unless LLAMA_MTP_KV_ONLY is 0")
 
     def test_gated_on_a_masked_no_output_decode(self):
         for f, t in self.texts.items():

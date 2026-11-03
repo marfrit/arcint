@@ -1,0 +1,63 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index bc388a8..f61c06a 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1754,14 +1754,14 @@ void llama_context::flush_draft_trace() {
+     draft_trace_pending.clear();
+ }
+ 
+-// ARC-LAB: LLAMA_SYNC_TRIM bit mask (default 0 = upstream behaviour): 1 = skip a
++// ARC-LAB: LLAMA_SYNC_TRIM bit mask (default 2 since patch 0094; 0 = upstream behaviour): 1 = skip a
+ // context synchronize when the context queued nothing since its last one,
+ // 2 = KV-cache rotation matrices kept on the device (llama-kv-cache.cpp),
+ // 4 = the backend-sampled ids of a batch read with one copy instead of one per row
+ int llama_sync_trim() {
+     static const int v = [] {
+         const char * e = getenv("LLAMA_SYNC_TRIM");
+-        return e ? atoi(e) : 0;
++        return e ? atoi(e) : 2;   // 0094: bit 2 on by default (measured gain, exact)
+     }();
+     return v;
+ }
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index a61b3f2..fb83c42 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -594,13 +594,13 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+     res->add_input(std::move(inp));
+ 
+     // a draft decode with no output rows (the head's prompt catch-up) is there to fill
+-    // this layer's K/V only: build up to the cache store and stop. LLAMA_MTP_KV_ONLY=1,
+-    // off by default; the K/V ops are the full graph's, in the same order, so the cache
++    // this layer's K/V only: build up to the cache store and stop. LLAMA_MTP_KV_ONLY=0
++    // turns it off (on by default since patch 0094); the K/V ops are the full graph's, in the same order, so the cache
+     // rows are bit-identical (cards: test-backend-ops and the served A/B in the patch
+     // record). Unmasked nextn readers copy h for every token, so they keep the full graph.
+     static const bool kv_only_on = [] {
+         const char * e = getenv("LLAMA_MTP_KV_ONLY");
+-        return e != nullptr && atoi(e) != 0;
++        return e == nullptr || atoi(e) != 0;
+     }();
+     const bool kv_only = kv_only_on && n_outputs == 0 && cparams.embeddings_nextn_masked &&
+             layer.wqkv == nullptr && layer.wk_b == nullptr && layer.wv_b == nullptr;
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 815ae27..69315e5 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -624,13 +624,13 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
+     res->add_input(std::move(inp));
+ 
+     // a draft decode with no output rows (the head's prompt catch-up) is there to fill
+-    // this layer's K/V only: build up to the cache store and stop. LLAMA_MTP_KV_ONLY=1,
+-    // off by default; the K/V ops are the full graph's, in the same order, so the cache
++    // this layer's K/V only: build up to the cache store and stop. LLAMA_MTP_KV_ONLY=0
++    // turns it off (on by default since patch 0094); the K/V ops are the full graph's, in the same order, so the cache
+     // rows are bit-identical (see the patch record). Unmasked nextn readers keep the
+     // full graph.
+     static const bool kv_only_on = [] {
+         const char * e = getenv("LLAMA_MTP_KV_ONLY");
+-        return e != nullptr && atoi(e) != 0;
++        return e == nullptr || atoi(e) != 0;
+     }();
+     const bool kv_only = kv_only_on && n_outputs == 0 && cparams.embeddings_nextn_masked &&
+             layer.wqkv == nullptr && layer.wk_b == nullptr && layer.wv_b == nullptr;

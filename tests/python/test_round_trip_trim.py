@@ -44,9 +44,10 @@ class RoundTripTrim(unittest.TestCase):
         self.graph = (root / "src" / "llama-graph.cpp").read_text()
         self.graphh = (root / "src" / "llama-graph.h").read_text()
 
-    def test_switch_defaults_off(self):
+    def test_switch_defaults_to_bit_2(self):
+        # patch 0094: bit 2 (rotations on the device) is the default; 0 restores upstream
         self.assertIn('getenv("LLAMA_SYNC_TRIM");', self.ctx)
-        self.assertRegex(self.ctx, r"return e \? atoi\(e\) : 0;")
+        self.assertRegex(self.ctx, r"return e \? atoi\(e\) : 2;")
         self.assertIn("int llama_sync_trim();", (self.root / "src" / "llama-impl.h").read_text())
 
     def test_sync_trim_predicate(self):
