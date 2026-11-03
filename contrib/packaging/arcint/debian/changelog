@@ -1,3 +1,14 @@
+arcint (1.5.0-1) trixie; urgency=medium
+
+  * 1.5.0: two speed switches on by default (the MTP head's K/V-only prompt
+    pass, the KV-cache rotation matrices kept on the card: the coder +2 %
+    decode, +6.6 % prefill, the same answers); the gated delta-net's rollback
+    by replay (LLAMA_GDN_REPLAY=1, per unit: 576 MiB less VRAM on the agent,
+    which now runs 262,144 tokens); GET /slots (--slots); the draft-depth
+    cutoff (--llama-mtp-depth-max); patches 0080-0094 (the rest opt-in).
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Tue, 03 Nov 2026 20:00:00 +0100
+
 arcint (1.4.2-1) trixie; urgency=medium
 
   * 1.4.2: X-Request-Id on every HTTP response (a valid caller id is kept, any

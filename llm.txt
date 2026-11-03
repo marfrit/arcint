@@ -28,6 +28,9 @@
 - Flash-Next's production quant is ISTA-DASLab's GSQ-RCO IQ3_S since
   2026-10-20 (operator): 33.3 t/s decode on six answers, KL 0.127 against
   Q8_0 (IQ3_XXS 38.0 t/s, 0.217, the rollback).
+- Version 1.5.0 (2026-11-03): MTP K/V-only prompt pass and on-card KV rotations on by default (coder
+  +2 % decode, +6.6 % prefill); GDN rollback by replay per unit (LLAMA_GDN_REPLAY=1; the agent at
+  262,144 tokens); GET /slots; --llama-mtp-depth-max; patches 0080-0094.
 - Version 1.4.2 (2026-11-02): X-Request-Id on every response (a caller's id kept when it is 1..128 of
   [A-Za-z0-9._:-], otherwise generated) and rid=<id> on the request's log lines.
 - Version 1.4.1 (2026-11-02): patch 0078 (the staging bound) dropped; it cost Flash-Next 2.2 %
