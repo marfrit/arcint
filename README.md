@@ -330,7 +330,7 @@ service's production flags, Flash-Next's expert cache included
   was serving that card has to stop first.
 - **No authentication by default, permissive CORS, no TLS.** `--api-key`
   (or `--api-key-file PATH`) adds a bearer token on every route but `/health`
-  (GET/HEAD only) — `/props` and `/metrics` included, an unknown path too, and
+  (GET/HEAD only) — `/props`, `/metrics` and `/slots` included, an unknown path too, and
   the check runs before the request body is read. A 401 names the scheme
   (`WWW-Authenticate: Bearer`); a CORS preflight (an OPTIONS with
   `Access-Control-Request-Method`) is answered without the key. An empty or
@@ -353,6 +353,14 @@ service's production flags, Flash-Next's expert cache included
   token, prefill/decode, cache-hit, draft counters and per-lane
   queue/slot gauges); a request with `arcint: {timings: true}` gets the
   per-response timings back on Chat Completions and Responses.
+- `--slots` serves `GET /slots`: one entry per slot with `id`, `lane`, `n_ctx`,
+  `is_processing`, `n_cache` (the KV cells that slot's sequence holds) and, for
+  a busy slot, `id_task` — the `X-Request-Id` of the request it is serving.
+  State only, never content: llama-server's `/slots` also dumps the prompt
+  (detokenized), the generated text and the sampling parameters of what runs, and
+  arcint serves other people's prompts, so this route names none of those. Off
+  by default (without the flag the route does not exist), behind `--api-key`
+  like every other route, and `/props` lists it only when it is served.
 - `chat_template_kwargs.preserve_thinking` (Chat Completions) and
   `arcint.preserve_thinking` (Responses) keep every assistant turn's thinking,
   not only the turns after the last user query, so a steering message does not

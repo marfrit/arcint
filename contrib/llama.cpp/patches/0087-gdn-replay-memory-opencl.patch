@@ -1,0 +1,947 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 9c650a1..344662c 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1296,6 +1296,10 @@ struct ggml_backend_opencl_context {
+     int       fa_gqa_sides = 2;                   // sub-groups per 8 rows the kernels were built for
+     int       fa_dpas_bq = 0, fa_dpas_nthr = 0;   // query rows and work-items a work-group
+     cl_kernel kernel_gdn_intel_pp = nullptr;
++    // LLAMA_GDN_REPLAY=1: gated_delta_net_intel.cl's replay kernel (the same
++    // generation step with a replay prologue and the record epilogue); built
++    // only when the switch asks for it, so the default build is unchanged
++    cl_kernel kernel_gdn_intel_rpl = nullptr;
+     int gdn_intel_sg = 0, gdn_intel_r_tg = 0, gdn_intel_r_pp = 0, gdn_intel_nsg = 0;
+     cl_kernel kernel_ssm_scan_f32 = nullptr;
+     cl_kernel kernel_ssm_scan_f32_mamba2_d128 = nullptr;
+@@ -4596,6 +4600,16 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+             if (tg != nullptr && pp != nullptr) {
+                 CL_CHECK((backend_ctx->kernel_gdn_intel_tg = clCreateKernel(tg, "kernel_gated_delta_net_tg", &err), err));
+                 CL_CHECK((backend_ctx->kernel_gdn_intel_pp = clCreateKernel(pp, "kernel_gated_delta_net_pp", &err), err));
++                if (getenv("LLAMA_GDN_REPLAY") != nullptr && atoi(getenv("LLAMA_GDN_REPLAY")) != 0) {
++                    cl_program rpl = build_program_from_source_optional(backend_ctx, kernel_src.c_str(),
++                        base + grf + " -DR=" + std::to_string(r_tg) + " -DGDN_RPL");
++                    if (rpl != nullptr) {
++                        CL_CHECK((backend_ctx->kernel_gdn_intel_rpl = clCreateKernel(rpl, "kernel_gated_delta_net_rpl", &err), err));
++                        CL_CHECK(clReleaseProgram(rpl));
++                    } else {
++                        GGML_LOG_WARN("ggml_opencl: gated_delta_net_intel.cl replay kernel not built; the replay op stays on the CPU\n");
++                    }
++                }
+                 // the kernel's own limit (a 256-GRF build halves the threads a
+                 // work-group may have): a shape it does not take falls back
+                 size_t wg_pp = 0;
+@@ -11567,6 +11581,22 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                 }
+                 return S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128;
+             }
++        case GGML_OP_GATED_DELTA_NET_REPLAY:
++            {
++                // the Intel generation kernel with the replay prologue: S_v 128,
++                // a scalar gate, F32 state, records and the I32 control
++                if (op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
++                    return false;
++                }
++                if (ggml_get_op_params_i32(op, 1) != GGML_GDN_MODE_REPLAY ||
++                    op->src[6] == nullptr || op->src[7] == nullptr ||
++                    op->src[3]->ne[0] != 1 || op->src[5]->type != GGML_TYPE_F32 ||
++                    op->src[6]->type != GGML_TYPE_F32 || op->src[7]->type != GGML_TYPE_I32) {
++                    return false;
++                }
++                return op->src[2]->ne[0] == 128 &&
++                       backend_ctx->kernel_gdn_intel_rpl != nullptr;
++            }
+         case GGML_OP_CONCAT:
+             {
+                 const ggml_type t = op->src[0]->type;
+@@ -35856,6 +35886,123 @@ static void ggml_cl_glu(ggml_backend_t backend, const ggml_tensor * src0, const
+     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+ }
+ 
++
++// LLAMA_GDN_REPLAY: GATED_DELTA_NET_REPLAY (rollback by replay, see
++// ggml_gated_delta_net_replay) on the Intel generation kernel with the replay
++// prologue and the record epilogue (gated_delta_net_intel.cl, GDN_RPL).
++static bool ggml_cl_gated_delta_net_replay(ggml_backend_t backend, ggml_tensor * dst) {
++    GGML_ASSERT(dst);
++    const ggml_tensor * src_q    = dst->src[0];
++    const ggml_tensor * src_k    = dst->src[1];
++    const ggml_tensor * src_v    = dst->src[2];
++    const ggml_tensor * src_g    = dst->src[3];
++    const ggml_tensor * src_beta = dst->src[4];
++    const ggml_tensor * src_s    = dst->src[5];
++    const ggml_tensor * src_rec  = dst->src[6];
++    const ggml_tensor * src_ctrl = dst->src[7];
++
++    // the family's mode word (ggml.h, op_params[1]): this op's record/control
++    // slots, never the rows form's row index or an attached gating input
++    GGML_ASSERT(ggml_get_op_params_i32(dst, 1) == GGML_GDN_MODE_REPLAY);
++    GGML_ASSERT(src_rec != nullptr && src_ctrl != nullptr);
++
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
++    if (backend_ctx->kernel_gdn_intel_rpl == nullptr) {
++        return false;
++    }
++
++    const cl_uint S_v      = (cl_uint) src_v->ne[0];
++    const cl_uint H_v      = (cl_uint) src_v->ne[1];
++    const cl_uint n_tokens = (cl_uint) src_v->ne[2];
++    const cl_uint n_seqs   = (cl_uint) src_v->ne[3];
++    const cl_uint K        = (cl_uint) ggml_get_op_params_i32(dst, 0);
++    const cl_uint RK       = (cl_uint) (H_v * (2 * S_v + 1)); // floats of one update record
++
++    const cl_uint sq1 = (cl_uint)(src_q->nb[1]    / sizeof(float));
++    const cl_uint sq2 = (cl_uint)(src_q->nb[2]    / sizeof(float));
++    const cl_uint sq3 = (cl_uint)(src_q->nb[3]    / sizeof(float));
++    const cl_uint sv1 = (cl_uint)(src_v->nb[1]    / sizeof(float));
++    const cl_uint sv2 = (cl_uint)(src_v->nb[2]    / sizeof(float));
++    const cl_uint sv3 = (cl_uint)(src_v->nb[3]    / sizeof(float));
++    const cl_uint sb1 = (cl_uint)(src_beta->nb[1] / sizeof(float));
++    const cl_uint sb2 = (cl_uint)(src_beta->nb[2] / sizeof(float));
++    const cl_uint sb3 = (cl_uint)(src_beta->nb[3] / sizeof(float));
++
++    const cl_uint H_k = (cl_uint) src_q->ne[1];
++    const cl_uint rq3 = (cl_uint)(src_v->ne[3] / src_q->ne[3]);
++    const cl_uint rec_bank_stride = (cl_uint)(src_rec->nb[1] / sizeof(float));
++    const cl_uint rec_seq_stride  = (cl_uint)(src_rec->nb[2] / sizeof(float));
++
++    const float scale = 1.0f / sqrtf((float) S_v);
++
++    ggml_tensor_extra_cl * eq  = (ggml_tensor_extra_cl *) src_q->extra;
++    ggml_tensor_extra_cl * ek  = (ggml_tensor_extra_cl *) src_k->extra;
++    ggml_tensor_extra_cl * ev  = (ggml_tensor_extra_cl *) src_v->extra;
++    ggml_tensor_extra_cl * eg  = (ggml_tensor_extra_cl *) src_g->extra;
++    ggml_tensor_extra_cl * eb  = (ggml_tensor_extra_cl *) src_beta->extra;
++    ggml_tensor_extra_cl * es  = (ggml_tensor_extra_cl *) src_s->extra;
++    ggml_tensor_extra_cl * er  = (ggml_tensor_extra_cl *) src_rec->extra;
++    ggml_tensor_extra_cl * ec  = (ggml_tensor_extra_cl *) src_ctrl->extra;
++    ggml_tensor_extra_cl * ed  = (ggml_tensor_extra_cl *) dst->extra;
++
++    const cl_ulong off_q    = eq->offset + src_q->view_offs;
++    const cl_ulong off_k    = ek->offset + src_k->view_offs;
++    const cl_ulong off_v    = ev->offset + src_v->view_offs;
++    const cl_ulong off_g    = eg->offset + src_g->view_offs;
++    const cl_ulong off_beta = eb->offset + src_beta->view_offs;
++    const cl_ulong off_s    = es->offset + src_s->view_offs;
++    const cl_ulong off_rec  = er->offset + src_rec->view_offs;
++    const cl_ulong off_ctrl = ec->offset + src_ctrl->view_offs;
++    const cl_ulong off_dst  = ed->offset + dst->view_offs;
++
++    cl_kernel kernel = backend_ctx->kernel_gdn_intel_rpl;
++    int idx = 0;
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &eq->data_device));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_q));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &ek->data_device));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_k));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &ev->data_device));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_v));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &eg->data_device));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_g));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &eb->data_device));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_beta));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &es->data_device));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_s));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &er->data_device));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_rec));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &ec->data_device));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_ctrl));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &ed->data_device));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_dst));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &H_v));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &n_tokens));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &n_seqs));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sq1));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sq2));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sq3));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sv1));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sv2));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sv3));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sb1));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sb2));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sb3));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &H_k));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &rq3));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(float),    &scale));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &K));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &RK));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &rec_bank_stride));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &rec_seq_stride));
++
++    const size_t sg   = backend_ctx->gdn_intel_sg;
++    const size_t rows = backend_ctx->gdn_intel_r_tg;
++    size_t global_work_size[3] = { (size_t) H_v * sg, (size_t) n_seqs, (size_t) S_v / rows };
++    size_t local_work_size[3]  = { sg, 1, 1 };
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++    return true;
++}
++
+ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
+     ggml_cl_gated_delta_net_impl(backend, dst, nullptr);
+ }
+@@ -36460,6 +36607,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+             // (src0, src1, dst) func signature. Dispatch directly and return.
+             ggml_cl_gated_delta_net(backend, tensor);
+             return true;
++        case GGML_OP_GATED_DELTA_NET_REPLAY:
++            if (!any_on_device) {
++                return false;
++            }
++            // 8 source tensors, dispatched directly like GATED_DELTA_NET.
++            return ggml_cl_gated_delta_net_replay(backend, tensor);
+         case GGML_OP_CONCAT:
+             if (!any_on_device) {
+                 return false;
+diff --git a/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl b/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
+index 15795de..0c6f67a 100644
+--- a/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
++++ b/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
+@@ -51,6 +51,182 @@ static inline float gdn_beta(float b, uint opaque) {
+     return as_float(as_uint(1.0f / (1.0f + exp(-b))) ^ opaque);
+ }
+ 
++
++#ifdef GDN_RPL
++
++// GATED_DELTA_NET_REPLAY (rollback by replay, see ggml_gated_delta_net_replay):
++// the generation kernel's per-token step, operation for operation, with
++//   - a replay prologue that re-applies n_rec stored records to the loaded base
++//     state with the step's own update (g*S + k*delta, fma), and
++//   - an epilogue that stores the base state (after token t_base) and one
++//     record per later token: delta per value row, k per key, g per head.
++// n_tokens == 0 replays only and stores the replayed state as the base.
++kernel void kernel_gated_delta_net_rpl(
++        global const char * q_buf,     ulong off_q,
++        global const char * k_buf,     ulong off_k,
++        global const char * v_buf,     ulong off_v,
++        global const char * g_buf,     ulong off_g,
++        global const char * beta_buf,  ulong off_beta,
++        global const char * state_buf, ulong off_state,
++        global const char * rec_buf,   ulong off_rec,
++        global const char * ctrl_buf,  ulong off_ctrl,
++        global       char * dst_buf,   ulong off_dst,
++        uint  H_v,
++        uint  n_tokens,
++        uint  n_seqs,
++        uint  sq1, uint sq2, uint sq3,
++        uint  sv1, uint sv2, uint sv3,
++        uint  sb1, uint sb2, uint sb3,
++        uint  H_k,
++        uint  rq3,
++        float scale,
++        uint  K,
++        uint  RK,
++        uint  rec_bank_stride, uint rec_seq_stride) {
++    global const float * data_q     = (global const float *)(q_buf     + off_q);
++    global const float * data_k     = (global const float *)(k_buf     + off_k);
++    global const float * data_v     = (global const float *)(v_buf     + off_v);
++    global const float * data_g     = (global const float *)(g_buf     + off_g);
++    global const float * data_beta  = (global const float *)(beta_buf  + off_beta);
++    global const float * data_state = (global const float *)(state_buf + off_state);
++    global const float * data_rec   = (global const float *)(rec_buf   + off_rec);
++    global const int   * data_ctrl  = (global const int   *)(ctrl_buf  + off_ctrl);
++    global       float * data_dst   = (global       float *)(dst_buf   + off_dst);
++
++    const uint head = get_group_id(0);
++    const uint seq  = get_group_id(1);
++    const uint row0 = get_group_id(2) * R;
++    const uint lane = get_sub_group_local_id();
++
++    const uint iq1 = head % H_k;
++    const uint iq3 = seq / rq3;
++    const ulong state_size = (ulong)S_V * S_V;
++    const ulong state_base = ((ulong)seq * H_v + head) * state_size;
++    const ulong q_base  = (ulong)iq3 * sq3 + (ulong)iq1 * sq1;
++    const ulong v_base  = (ulong)seq * sv3 + (ulong)head * sv1;
++    const ulong gb_base = (ulong)seq * sb3 + (ulong)head * sb1;
++
++    float S[R][KL];
++    #pragma unroll
++    for (int r = 0; r < R; ++r)
++        #pragma unroll
++        for (int m = 0; m < KL; ++m)
++            S[r][m] = BLOCK_READ_F(data_state + state_base + (ulong)(row0 + r) * S_V + m * SG);
++
++    // replay prologue
++    const int n_rec = data_ctrl[2 * seq + 0];
++    const int bank  = data_ctrl[2 * seq + 1];
++    global const float * rb = data_rec + (ulong)seq * rec_seq_stride + (ulong)bank * rec_bank_stride;
++    for (int j = 0; j < n_rec; ++j) {
++        global const float * r  = rb + (ulong)j * RK;
++        const float gv = r[2 * H_v * S_V + head];
++        #pragma unroll
++        for (int rr = 0; rr < R; ++rr) {
++            const float dp = r[head * S_V + row0 + rr];
++            #pragma unroll
++            for (int m = 0; m < KL; ++m)
++                S[rr][m] = fma(r[H_v * S_V + head * S_V + m * SG + lane], dp, gv * S[rr][m]);
++        }
++    }
++
++    const ulong attn_base = 0;
++    const ulong base_off  = (ulong)S_V * H_v * n_tokens * n_seqs;
++    const ulong rec_off   = base_off + state_size * H_v * n_seqs;
++    global float * base_out = data_dst + base_off + ((ulong)seq * H_v + head) * state_size;
++    const int t_base = (int)n_tokens - 1 - min((int)n_tokens - 1, (int)K - 1);
++
++    if (n_tokens == 0) {
++        #pragma unroll
++        for (int r = 0; r < R; ++r)
++            #pragma unroll
++            for (int m = 0; m < KL; ++m)
++                BLOCK_WRITE_F(base_out + (ulong)(row0 + r) * S_V + m * SG, S[r][m]);
++        return;
++    }
++
++    // token 0's inputs; then each step fetches the next token's first
++    float kn[KL], qn[KL], vn[R], gn = 0.f, bn = 0.f;
++    if (n_tokens > 0) {
++        #pragma unroll
++        for (int m = 0; m < KL; ++m) {
++            kn[m] = BLOCK_READ_F(data_k + q_base + m * SG);
++            qn[m] = BLOCK_READ_F(data_q + q_base + m * SG);
++        }
++        #pragma unroll
++        for (int r = 0; r < R; ++r) vn[r] = data_v[v_base + row0 + r];
++        gn = data_g[gb_base];
++        bn = data_beta[gb_base];
++    }
++
++    ulong attn_off = attn_base + ((ulong)seq * n_tokens * H_v + head) * S_V;
++    for (uint t = 0; t < n_tokens; ++t) {
++        float k[KL], q[KL], v[R];
++        #pragma unroll
++        for (int m = 0; m < KL; ++m) { k[m] = kn[m]; q[m] = qn[m]; }
++        #pragma unroll
++        for (int r = 0; r < R; ++r) v[r] = vn[r];
++        const float g = exp(gn), beta = bn;
++        if (t + 1 < n_tokens) {
++            const ulong qo = q_base + (ulong)(t + 1) * sq2;
++            #pragma unroll
++            for (int m = 0; m < KL; ++m) {
++                kn[m] = BLOCK_READ_F(data_k + qo + m * SG);
++                qn[m] = BLOCK_READ_F(data_q + qo + m * SG);
++            }
++            const ulong vo = v_base + (ulong)(t + 1) * sv2;
++            #pragma unroll
++            for (int r = 0; r < R; ++r) vn[r] = data_v[vo + row0 + r];
++            const ulong go = gb_base + (ulong)(t + 1) * sb2;
++            gn = data_g[go];
++            bn = data_beta[go];
++        }
++
++        float kv[R];
++        #pragma unroll
++        for (int r = 0; r < R; ++r) {
++            float p = 0.f;
++            #pragma unroll
++            for (int m = 0; m < KL; ++m) p = fma(S[r][m], k[m], p);
++            kv[r] = sub_group_reduce_add(p) * g;
++        }
++        float out[R], dl[R];
++        #pragma unroll
++        for (int r = 0; r < R; ++r) {
++            const float d = (v[r] - kv[r]) * beta;
++            dl[r] = d;
++            float p = 0.f;
++            #pragma unroll
++            for (int m = 0; m < KL; ++m) {
++                S[r][m] = fma(k[m], d, g * S[r][m]);
++                p = fma(S[r][m], q[m], p);
++            }
++            out[r] = sub_group_reduce_add(p);
++        }
++        float mine = 0.f;
++        #pragma unroll
++        for (int r = 0; r < R; ++r) mine = (lane == r) ? out[r] : mine;
++        if (lane < R) data_dst[attn_off + row0 + lane] = mine * scale;
++        attn_off += (ulong)S_V * H_v;
++
++        if ((int)t == t_base) {
++            #pragma unroll
++            for (int r = 0; r < R; ++r)
++                #pragma unroll
++                for (int m = 0; m < KL; ++m)
++                    BLOCK_WRITE_F(base_out + (ulong)(row0 + r) * S_V + m * SG, S[r][m]);
++        } else if ((int)t > t_base) {
++            global float * rt = data_dst + rec_off + (ulong)seq * rec_seq_stride +
++                                (ulong)((int)t - t_base - 1) * RK;
++            if (lane < R) rt[head * S_V + row0 + lane] = dl[lane];
++            #pragma unroll
++            for (int m = 0; m < KL; ++m) rt[H_v * S_V + head * S_V + m * SG + lane] = k[m];
++            if (lane == 0) rt[2 * H_v * S_V + head] = g;
++        }
++    }
++}
++
++#endif // GDN_RPL
++
+ #ifdef GDN_PP
+ 
+ #ifndef NSG
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 068ffb0..7693c29 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -404,6 +404,27 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
+             data[i] = mctx->s_copy(i);
+         }
+     }
++
++    if (s_rpl_ctrl) {
++        GGML_ASSERT(ggml_backend_buffer_is_host(s_rpl_rows->buffer));
++        GGML_ASSERT(ggml_backend_buffer_is_host(s_rpl_ctrl->buffer));
++        GGML_ASSERT(ggml_backend_buffer_is_host(s_rpl_wrow->buffer));
++        int32_t * rows = (int32_t *) s_rpl_rows->data;
++        int32_t * ctrl = (int32_t *) s_rpl_ctrl->data;
++        int64_t * wrow = (int64_t *) s_rpl_wrow->data;
++
++        for (uint32_t i = 0; i < n_rs; ++i) {
++            rows[i] = mctx->rpl_row(i);
++        }
++        for (uint32_t i = 0; i < ubatch->n_seqs; ++i) {
++            int32_t n_rec = 0;
++            int32_t bank  = 0;
++            mctx->rpl_take(i, ubatch->n_seq_tokens, n_rec, bank);
++            ctrl[2*i + 0] = n_rec;
++            ctrl[2*i + 1] = bank;
++            wrow[i]       = bank ^ 1;
++        }
++    }
+ }
+ 
+ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
+@@ -420,6 +441,12 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
+     res &= head == mctx->get_head();
+     res &= rs_z == mctx->get_rs_z();
+ 
++    res &= (s_rpl_ctrl != nullptr) == mctx->get_rpl();
++    if (s_rpl_ctrl) {
++        res &= s_rpl_rows->ne[0] == mctx->get_n_rs();
++        res &= s_rpl_ctrl->ne[0] == 2 * params.ubatch.n_seqs;
++    }
++
+     return res;
+ }
+ 
+@@ -3989,6 +4016,20 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
+     inp->s_copy_main = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
+     inp->s_copy_tail = ggml_view_1d(ctx0, inp->s_copy, n_rs - 1, inp->s_copy->nb[0]);
+ 
++    if (mctx_cur->get_rpl()) {
++        inp->s_rpl_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
++        ggml_set_input(inp->s_rpl_rows);
++        ggml_set_name(inp->s_rpl_rows, "rs_s_rpl_rows");
++        inp->s_rpl_main  = ggml_view_1d(ctx0, inp->s_rpl_rows, n_seqs, 0);
++        inp->s_rpl_extra = ggml_view_1d(ctx0, inp->s_rpl_rows, n_rs - n_seqs, n_seqs * inp->s_rpl_rows->nb[0]);
++        inp->s_rpl_ctrl = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 2 * n_seqs);
++        ggml_set_input(inp->s_rpl_ctrl);
++        ggml_set_name(inp->s_rpl_ctrl, "rs_s_rpl_ctrl");
++        inp->s_rpl_wrow = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_seqs);
++        ggml_set_input(inp->s_rpl_wrow);
++        ggml_set_name(inp->s_rpl_wrow, "rs_s_rpl_wrow");
++    }
++
+     inp->head = mctx_cur->get_head();
+     inp->rs_z = mctx_cur->get_rs_z();
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index d02dfc1..808aecb 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -302,6 +302,13 @@ public:
+     ggml_tensor * s_copy_main; // I32 [n_seqs]
+     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
+ 
++    // GDN rollback by replay (llama_memory_recurrent::rpl), null when off:
++    ggml_tensor * s_rpl_rows  = nullptr; // I32 [n_rs]: plane-0 S row each state is read from (no rollback plane)
++    ggml_tensor * s_rpl_main  = nullptr; // view [n_seqs]
++    ggml_tensor * s_rpl_extra = nullptr; // view [n_rs - n_seqs]
++    ggml_tensor * s_rpl_ctrl  = nullptr; // I32 [2, n_seqs]: {records to re-apply, their bank}
++    ggml_tensor * s_rpl_wrow  = nullptr; // I64 [n_seqs]: bank the new records go to
++
+     const llama_memory_recurrent_context * mctx;
+ 
+     // used in view offsets, need to match for valid graph reuse
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 2893d81..85f6eff 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <map>
+@@ -34,6 +35,8 @@ llama_memory_recurrent::llama_memory_recurrent(
+ 
+     this->n_rs_seq = n_rs_seq;
+     rs_idx.assign(n_seq_max, 0);
++    rpl_n.assign(n_seq_max, 0);
++    rpl_bank.assign(n_seq_max, 0);
+ 
+     cells.clear();
+     cells.resize(mem_size);
+@@ -70,6 +73,45 @@ llama_memory_recurrent::llama_memory_recurrent(
+         return it->second.get();
+     };
+ 
++    // GDN rollback by replay (LLAMA_GDN_REPLAY=1, default off; 0 keeps the
++    // snapshot planes of patch 0050). Applies to a single sequence of a qwen35
++    // model whose recurrent layers all run on the OpenCL backend; anything else
++    // silently keeps the snapshot path. Decided before the tensors are created:
++    // in replay mode S gets only planes 0 (base) and 1 (record banks), so the
++    // snapshot planes 2..n_rs_seq are not allocated. The conv state r keeps
++    // all its planes in both.
++    {
++        const char * env = getenv("LLAMA_GDN_REPLAY");
++        const bool qwen35 = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE ||
++                            model.arch == LLM_ARCH_QWEN4EXP;
++        bool on = env != nullptr && atoi(env) != 0 && n_rs_seq > 0 && n_seq_max == 1 && mem_size == 1 &&
++                  offload && qwen35 && type_s == GGML_TYPE_F32;
++        const uint32_t S = hparams.ssm_d_state;
++        const uint32_t H = hparams.ssm_dt_rank;
++        on = on && S == 128 && H > 0 && hparams.ssm_d_inner == S * H && hparams.n_embd_s() == S * S * H;
++        const uint32_t R = H * (2 * S + 1);
++        // both banks of n_rs_seq records must fit in one S row
++        on = on && (uint64_t) 2 * n_rs_seq * R <= (uint64_t) hparams.n_embd_s();
++        bool any = false;
++        for (int i = 0; on && i < n_layer; i++) {
++            if (filter && !filter(i)) { // same layer selection as the allocation below
++                continue;
++            }
++            any = true;
++            ggml_backend_dev_t dev = model.dev_layer(i);
++            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++            on = reg && strcmp(ggml_backend_reg_name(reg), "OpenCL") == 0;
++        }
++        rpl   = on && any;
++        rpl_R = rpl ? R : 0;
++        if (rpl) {
++            LLAMA_LOG_INFO("%s: GDN rollback by replay: on (%u records of %u floats per bank, S planes 2 of %u)\n", __func__,
++                    n_rs_seq, R, 1 + n_rs_seq);
++        } else if (n_rs_seq > 0) {
++            LLAMA_LOG_INFO("%s: GDN rollback by replay: off (snapshot planes)\n", __func__);
++        }
++    }
++
+     r_l.resize(n_layer);
+     s_l.resize(n_layer);
+     p_l.resize(n_layer);
+@@ -99,8 +141,11 @@ llama_memory_recurrent::llama_memory_recurrent(
+         }
+ 
+         const uint32_t n_rows = mem_size * (1 + n_rs_seq);
++        // replay: S needs plane 0 (base) and plane 1 (record banks) only; the
++        // conv state keeps all its planes
++        const uint32_t n_rows_s = rpl ? mem_size * 2 : n_rows;
+         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
+-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
++        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows_s);
+         ggml_format_name(r, "cache_r_l%d", i);
+         ggml_format_name(s, "cache_s_l%d", i);
+         r_l[i] = r;
+@@ -163,6 +208,7 @@ void llama_memory_recurrent::clear(bool data) {
+     }
+ 
+     std::fill(rs_idx.begin(), rs_idx.end(), 0);
++    rpl_reset(-1);
+ }
+ 
+ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -184,6 +230,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
+     if (rm_all) {
+         set_rs_idx(seq_id, 0);
++        rpl_reset(seq_id);
+     }
+ 
+     // models like Mamba or RWKV can't have a state partially erased at the end
+@@ -212,6 +259,14 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+                 // pending rollback is single-use
+                 const bool pending = rs_idx[seq_id] != 0;
+                 if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
++                    if (rpl) {
++                        // replay: only the tokens that left a record can be rolled back
++                        if ((uint32_t) rollback > rpl_n[seq_id]) {
++                            LLAMA_LOG_WARN("%s: cannot roll back %d tokens, only %u kept\n", __func__, rollback, rpl_n[seq_id]);
++                            return false;
++                        }
++                        rpl_n[seq_id] -= (uint32_t) rollback;
++                    }
+                     set_rs_idx(seq_id, (uint32_t) rollback);
+                     cell.pos = p0 - 1;
+                     return true;
+@@ -221,6 +276,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+             // invalidate tails which will be cleared
+             if (p0 <= cell.pos && cell.pos < p1) {
+                 tail_id = -1;
++                rpl_reset(seq_id);
+             }
+         }
+     } else {
+@@ -433,6 +489,18 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
+     rs_idx[seq_id] = idx;
+ }
+ 
++void llama_memory_recurrent::rpl_reset(llama_seq_id seq_id) {
++    if (seq_id < 0) {
++        std::fill(rpl_n.begin(), rpl_n.end(), 0);
++        std::fill(rpl_bank.begin(), rpl_bank.end(), 0);
++        return;
++    }
++    if ((size_t) seq_id < rpl_n.size()) {
++        rpl_n[seq_id]    = 0;
++        rpl_bank[seq_id] = 0;
++    }
++}
++
+ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
+     std::map<ggml_backend_buffer_type_t, size_t> ret;
+     for (const auto & [_, buf] : ctxs_bufs) {
+@@ -790,7 +858,10 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
+ 
+     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
+     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data; // logical source row ranges
++    std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data_s; // replay: S rows (base, plane 0)
+     uint32_t cell_count = 0;
++    uint32_t rpl_pending = 0;    // replay: records still to apply to the written base state
++    uint32_t rpl_bank_cur = 0;
+ 
+     // Count the number of cells with the specified seq_id
+     // Find all the ranges of cells with this seq id (or all, when -1)
+@@ -829,6 +900,23 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
+                 cell_ranges_data.back().second++;
+             }
+ 
++            if (rpl) {
++                // the base state lives in plane 0 whatever rs_idx says (rs_idx only picks the conv snapshot)
++                const uint32_t cell_id_s = (cell.src >= 0 ? cell.src : (int32_t) i);
++                if (cell_ranges_data_s.empty() || cell_ranges_data_s.back().second != cell_id_s) {
++                    cell_ranges_data_s.emplace_back(cell_id_s, cell_id_s + 1);
++                } else {
++                    cell_ranges_data_s.back().second++;
++                }
++                // single sequence (rpl requires n_seq_max == 1): the pending records of the cell's sequence
++                for (const llama_seq_id cell_seq_id : cell.seq_id) {
++                    if (cell_seq_id >= 0 && (size_t) cell_seq_id < rpl_n.size()) {
++                        rpl_pending  = rpl_n[cell_seq_id];
++                        rpl_bank_cur = rpl_bank[cell_seq_id];
++                    }
++                }
++            }
++
+             if (cell_range_begin == size) {
+                 cell_range_begin = i;
+             }
+@@ -863,7 +951,12 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
+     io.write(&cell_count, sizeof(cell_count));
+ 
+     state_write_meta(io, cell_ranges, seq_id);
+-    state_write_data(io, cell_ranges_data);
++    if (!rpl) {
++        state_write_data(io, cell_ranges_data, cell_ranges_data, 0, 0);
++    } else {
++        GGML_ASSERT(cell_count <= 1); // single sequence
++        state_write_data(io, cell_ranges_data, cell_ranges_data_s, rpl_pending, rpl_bank_cur);
++    }
+ }
+ 
+ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+@@ -881,6 +974,8 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
+ 
+     res = res && meta_read;
+ 
++    rpl_reset(seq_id);
++
+     try {
+         res = res && state_read_data(io, cell_count);
+     } catch (...) {
+@@ -916,8 +1011,12 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
+     }
+ }
+ 
+-void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
+-    const uint32_t s_trans = 0;
++void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
++        const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges_s, uint32_t rpl_pending, uint32_t rpl_bank_cur) const {
++    // replay: with records pending the state is base + records; the header then
++    // says 2 (a reader without replay rejects it as an incompatible S layout
++    // instead of loading a stale state), and the records follow S
++    const uint32_t s_trans = rpl_pending > 0 ? 2 : 0;
+     const uint32_t n_layer = hparams.n_layer();
+ 
+     io.write(&s_trans, sizeof(s_trans));
+@@ -957,7 +1056,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
+         }
+     }
+ 
+-    if (!s_trans) {
++    if (s_trans != 1) {
+         for (uint32_t il = 0; il < n_layer; ++il) {
+             // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
+             if (s_l[il] == nullptr) continue;
+@@ -972,7 +1071,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
+ 
+             // Write each logical cell row range. With pending recurrent rollback,
+             // the logical current state may live in a rollback snapshot plane.
+-            for (const auto & range : cell_ranges) {
++            for (const auto & range : cell_ranges_s) {
+                 const size_t range_size = range.second - range.first;
+                 const size_t buf_size = range_size * s_size_row;
+                 io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
+@@ -1009,6 +1108,19 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
+             }
+         }
+     }
++
++    if (rpl_pending > 0) {
++        // replay: the pending update records of the (single) written cell, per layer
++        GGML_ASSERT(cell_ranges_s.size() == 1 && cell_ranges_s[0].second - cell_ranges_s[0].first == 1);
++        const uint32_t cell = cell_ranges_s[0].first;
++        io.write(&rpl_pending, sizeof(rpl_pending));
++        io.write(&rpl_R,       sizeof(rpl_R));
++        for (uint32_t il = 0; il < n_layer; ++il) {
++            if (s_l[il] == nullptr) continue;
++            const size_t off = ((size_t) (size + cell) * hparams.n_embd_s() + (size_t) rpl_bank_cur * n_rs_seq * rpl_R) * sizeof(float);
++            io.write_tensor(s_l[il], off, (size_t) rpl_pending * rpl_R * sizeof(float));
++        }
++    }
+ }
+ 
+ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id) {
+@@ -1126,7 +1238,8 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
+         LLAMA_LOG_ERROR("%s: not enough cells in kv cache to restore state (%u > %u)\n", __func__, cell_count, size);
+         return false;
+     }
+-    if (false != (bool) s_trans) {
++    // replay: 2 = plain S layout followed by pending update records (written only when replay is on)
++    if (s_trans != 0 && !(s_trans == 2 && rpl)) {
+         LLAMA_LOG_ERROR("%s: incompatible s transposition\n", __func__);
+         return false;
+     }
+@@ -1174,7 +1287,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
+         }
+     }
+ 
+-    if (!s_trans) {
++    if (s_trans != 1) {
+         for (uint32_t il = 0; il < n_layer; ++il) {
+             // skip null layers
+             if (s_l[il] == nullptr) continue;
+@@ -1247,6 +1360,28 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
+         }
+     }
+ 
++    if (s_trans == 2) {
++        // replay: pending update records -> bank 0 of the restored cell
++        uint32_t n_rec = 0;
++        uint32_t R_ref = 0;
++        io.read(&n_rec, sizeof(n_rec));
++        io.read(&R_ref, sizeof(R_ref));
++        if (cell_count != 1 || R_ref != rpl_R || n_rec > n_rs_seq) {
++            LLAMA_LOG_ERROR("%s: mismatched replay records (%u cells, %u records of %u floats)\n", __func__, cell_count, n_rec, R_ref);
++            return false;
++        }
++        for (uint32_t il = 0; il < n_layer; ++il) {
++            if (s_l[il] == nullptr) continue;
++            io.read_tensor(s_l[il], (size_t) (size + head) * hparams.n_embd_s() * sizeof(float), (size_t) n_rec * rpl_R * sizeof(float));
++        }
++        for (const llama_seq_id seq : cells[head].seq_id) {
++            if (seq >= 0 && (size_t) seq < rpl_n.size()) {
++                rpl_n[seq]    = n_rec;
++                rpl_bank[seq] = 0;
++            }
++        }
++    }
++
+     return true;
+ }
+ 
+@@ -1384,3 +1519,31 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
+     }
+     return (int32_t)(idx * mem->size) + src0;
+ }
++
++bool llama_memory_recurrent_context::get_rpl() const {
++    return mem->rpl;
++}
++
++int32_t llama_memory_recurrent_context::rpl_row(int i) const {
++    return mem->cells[i + mem->head].src0;
++}
++
++void llama_memory_recurrent_context::rpl_take(int i, uint32_t n_seq_tokens, int32_t & n_rec, int32_t & bank) const {
++    const uint32_t cell_idx = i + mem->head;
++
++    n_rec = 0;
++    bank  = 0;
++    if (mem->cells[cell_idx].seq_id.empty()) {
++        return;
++    }
++    const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
++    if (seq < 0 || (size_t) seq >= mem->rpl_n.size()) {
++        return;
++    }
++    n_rec = (int32_t) mem->rpl_n[seq];
++    bank  = (int32_t) mem->rpl_bank[seq];
++
++    // this ubatch leaves a base state after token n-1-m and records for its last m tokens, in the other bank
++    mem->rpl_n[seq]    = std::min(n_seq_tokens - 1, mem->n_rs_seq);
++    mem->rpl_bank[seq] = (uint8_t) (bank ^ 1);
++}
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+index 08489a4..e2f2103 100644
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -78,6 +78,16 @@ public:
+ 
+     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+ 
++    // GDN rollback by replay (LLAMA_GDN_REPLAY=1, default off). Per layer the
++    // S tensor then has 2 plane groups only: plane 0 = base state, plane 1 =
++    // two banks of per-token update records (ggml_gated_delta_net_replay). The
++    // conv state r keeps its 1 + n_rs_seq snapshot planes.
++    bool     rpl   = false;
++    uint32_t rpl_R = 0;              // floats per record: H * (2 * S + 1)
++    std::vector<uint32_t> rpl_n;     // per seq: records still to re-apply onto the base state
++    std::vector<uint8_t>  rpl_bank;  // per seq: bank holding them
++    void rpl_reset(llama_seq_id seq_id); // seq_id < 0: all
++
+     // computed before each graph build
+     uint32_t n = 0;
+ 
+@@ -133,7 +143,8 @@ private:
+     size_t size_p_bytes() const;
+ 
+     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
+-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
++    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
++            const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges_s, uint32_t rpl_pending, uint32_t rpl_bank_cur) const;
+ 
+     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
+     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
+@@ -172,6 +183,10 @@ public:
+     //
+ 
+     uint32_t get_n_rs() const;
++    // GDN rollback by replay (see llama_memory_recurrent::rpl)
++    bool    get_rpl() const;
++    int32_t rpl_row(int i) const; // plane-0 S row the state of rs i is read from
++    void    rpl_take(int i, uint32_t n_seq_tokens, int32_t & n_rec, int32_t & bank) const;
+     uint32_t get_head() const;
+     int32_t  get_rs_z() const;
+     uint32_t get_size() const;
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index 7e9a413..65566aa 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -578,11 +578,54 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+     // the op path: keep == true (gather or rows), or rows (K == 1)
+     const int64_t K = keep ? cparams.n_rs_seq + 1 : 1;
+ 
++    if (inp->s_rpl_ctrl) {
++        // ARC-LAB: rollback by replay (independent implementation of the technique described by llamADALL). One
++        // base state in plane 0 plus the update records of the last K-1 tokens in plane 1 (two banks: this pass
++        // reads one, its records go to the other) instead of K snapshot planes; see ggml_gated_delta_net_replay.
++        GGML_ASSERT(!rows && n_seqs == 1 && g->ne[0] == 1);
++        // the memory allocates S with planes 0 and 1 only in replay mode (llama_memory_recurrent::rpl)
++        GGML_ASSERT(ssm_states_all->ne[1] == 2 * (int64_t) mem_size);
++        const int64_t R        = H_v * (2 * S_v + 1);
++        const size_t  row_size = ssm_states_all->nb[1];
++        const size_t  rec_size = ggml_row_size(ssm_states_all->type, R * (K - 1));
++
++        // both banks of this cell's records: [R*(K-1), 2, n_seqs]
++        ggml_tensor * rec = ggml_view_3d(ctx0, ssm_states_all, R * (K - 1), 2, n_seqs, rec_size, row_size,
++                (size_t) (mem_size + kv_head) * row_size);
++
++        ggml_tensor * gdn_out = ggml_gated_delta_net_replay(ctx0, q, k, v, g, b, s, rec, inp->s_rpl_ctrl, (int) K);
++        res->add_fused_node({n_seq_tokens > 1 ? LLM_FUSED_OP_GDN_CH : LLM_FUSED_OP_GDN_AR, gdn_out, il});
++
++        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
++            S_v, H_v, n_seq_tokens, n_seqs,
++            ggml_row_size(gdn_out->type, S_v),
++            ggml_row_size(gdn_out->type, S_v * H_v),
++            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
++            0);
++        cb(output, "attn_output", il);
++
++        const size_t base_off = ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens * n_seqs);
++        const size_t rec_off  = base_off + ggml_row_size(gdn_out->type, D * n_seqs);
++
++        // base state -> plane 0; records -> the bank s_rpl_wrow picks (the OpenCL backend fuses both into the op)
++        ggml_build_forward_expand(gf, ggml_cpy(ctx0,
++            ggml_view_2d(ctx0, gdn_out, D, n_seqs, ggml_row_size(gdn_out->type, D), base_off),
++            ggml_view_2d(ctx0, ssm_states_all, D, n_seqs, row_size, (size_t) kv_head * row_size)));
++
++        ggml_build_forward_expand(gf, ggml_set_rows(ctx0,
++            ggml_view_2d(ctx0, ssm_states_all, R * (K - 1), 2, rec_size, (size_t) (mem_size + kv_head) * row_size),
++            ggml_view_2d(ctx0, gdn_out, R * (K - 1), n_seqs, rec_size, rec_off),
++            inp->s_rpl_wrow));
++
++        return output;
++    }
++
+     // op writes the K snapshot slots into the output; the state read is the cache
+     // row in rows mode, the gathered 4D state otherwise
+     ggml_tensor * gdn_out = rows
+         ? ggml_gated_delta_net_rows(ctx0, q, k, v, g, b, s, s_rows, K)
+         : ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
++
+     gdn_keep_gating_inputs(gdn_out, g, b);
+     if (n_seq_tokens > 1) {
+         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index cc569d4..a61b3f2 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -398,11 +398,21 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+ 
+     // patch 0081: LLAMA_GDN_STATE_ROWS=1 (off by default) reads each sequence's
+-    // live state straight from the recurrent cache inside the GDN op, no gather
+-    const bool gdn_state_rows = llama_gdn_state_rows_enabled(cparams, n_seqs, n_seq_tokens);
++    // live state straight from the recurrent cache inside the GDN op, no gather.
++    // Replay (LLAMA_GDN_REPLAY) disables the rows form: its base state is plane 0
++    // read by its own row index, and the replay op takes the gathered state.
++    const bool gdn_rpl = inp->s_rpl_ctrl != nullptr;
++    const bool gdn_state_rows = !gdn_rpl && llama_gdn_state_rows_enabled(cparams, n_seqs, n_seq_tokens);
+     ggml_tensor * state;
+     ggml_tensor * state_rows = nullptr;
+-    if (gdn_state_rows) {
++    if (gdn_rpl) {
++        // ARC-LAB: GDN rollback by replay (the memory decides, see llama_memory_recurrent::rpl): the state is the
++        // base row in plane 0, gathered with its own row indices (s_copy carries the conv rollback plane)
++        state = build_rs(ssm_states_all, inp->s_rpl_rows, inp->s_rpl_main, hparams.n_embd_s(), n_seqs,
++                mctx_cur->get_n_rs(), mctx_cur->get_head(), mctx_cur->get_size(), mctx_cur->get_rs_z());
++        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
++        cb(state, "state_predelta", il);
++    } else if (gdn_state_rows) {
+         state      = build_rs_cache_view(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+         state_rows = inp->s_copy_main;
+         cb(state, "state_cache_view", il);
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 30c7d94..1f8f03f 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1090,10 +1090,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+ 
+     // patch 0081: LLAMA_GDN_STATE_ROWS=1 (off by default) reads each sequence's
+     // live state straight from the recurrent cache inside the GDN op, no gather
+-    const bool gdn_state_rows = llama_gdn_state_rows_enabled(cparams, n_seqs, n_seq_tokens);
++    // Replay (LLAMA_GDN_REPLAY) disables the rows form: its base state is plane 0
++    // read by its own row index, and the replay op takes the gathered state.
++    const bool gdn_rpl = inp->s_rpl_ctrl != nullptr;
++    const bool gdn_state_rows = !gdn_rpl && llama_gdn_state_rows_enabled(cparams, n_seqs, n_seq_tokens);
+     ggml_tensor * state;
+     ggml_tensor * state_rows = nullptr;
+-    if (gdn_state_rows) {
++    if (gdn_rpl) {
++        state = build_rs(ssm_states_all, inp->s_rpl_rows, inp->s_rpl_main, hparams.n_embd_s(), n_seqs,
++                mctx_cur->get_n_rs(), mctx_cur->get_head(), mctx_cur->get_size(), mctx_cur->get_rs_z());
++        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
++        cb(state, "state_predelta", il);
++    } else if (gdn_state_rows) {
+         state      = build_rs_cache_view(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+         state_rows = inp->s_copy_main;
+         cb(state, "state_cache_view", il);

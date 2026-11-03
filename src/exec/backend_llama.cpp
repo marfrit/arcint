@@ -55,6 +55,7 @@ extern "C" int stbi_info_from_memory(unsigned char const* buffer, int len, int* 
 #include "exec/llama_layer_split.h"
 #include "exec/llama_spec.h"
 #include "exec/llama_toolgrammar.h"
+#include "exec/spec_depth.h"   // --llama-mtp-depth-max
 #include "exec/verify_walk.h"
 #include "util/log.h"
 #include "util/utf8.h"
@@ -873,6 +874,7 @@ public:
             if (!spec_) throw std::runtime_error(log::format("--llama-mtp %d: %s", cfg.llama_mtp, err.c_str()));
             n_draft_ = cfg.llama_mtp;
             mtp_min_p_ = cfg.llama_mtp_min_p;   // the trace records it (exec/mtp_trace.h)
+            mtp_depth_max_ = cfg.llama_mtp_depth_max;   // --llama-mtp-depth-max (exec/spec_depth.h)
             if (windows_ && !spec_->set_kv_windows(windows.data(), lanes_))
                 log::warn("load", "named lanes: the MTP draft context takes no cell windows; its attention spans "
                                   "the pool's used cells");
@@ -1249,6 +1251,28 @@ public:
     }
 
     const ModelStatus& status() const override { return status_; }
+
+    // GET /slots (--slots): the cells each sequence holds. Under mu_ — the
+    // context is not thread-safe (one call at a time) — and this is the same
+    // lock /props reads the loan state under. One llama_memory_seq_pos_max per
+    // sequence, no traversal, and the numbers are copied out so the response's
+    // JSON is built outside the lock. A running generation holds mu_ for one
+    // llama_decode at a time (the counters move inside it), so the read waits
+    // for one batch, never for a whole request, and it never touches the slot
+    // pool's lock. One batch can be long: a prefill chunk is one llama_decode
+    // (Flash-Next's 8,192-token chunks take seconds), so a /slots call made during
+    // a prefill answers when that chunk ends. For a hybrid model the value is
+    // the min of the attention and recurrent caches' maxima (the reusable prefix).
+    std::vector<int> kv_positions() const override {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::vector<int>            out;
+        if (ctx_ == nullptr) return out;
+        llama_memory_t mem = llama_get_memory(ctx_);
+        out.resize(static_cast<size_t>(std::max(0, lanes_)));
+        for (int s = 0; s < lanes_; ++s)
+            out[static_cast<size_t>(s)] = static_cast<int>(llama_memory_seq_pos_max(mem, s)) + 1;
+        return out;
+    }
 #ifdef ARCINT_LLAMA_SLOT_LOAN
     // /props reads this under the context's lock: "off"/"armed"/"out"/"poisoned"/
     // "broken". A poisoned or broken state exits the process (patch 0068's
@@ -2069,12 +2093,17 @@ private:
             // cells never reach into the other lanes' share of the pool
             int budget = cap - static_cast<int>(have.size()) - 2;
             if (in.sampler.max_tokens >= 0) budget = std::min(budget, in.sampler.max_tokens - stats.completion_tokens);
-            const int n_max = std::max(0, std::min(n_draft_, budget - 1));
-            std::vector<int> draft;
-            std::vector<float> probs;   // exec/mtp_trace.h: filled by draft_multi when the trace is on
             // the round's own bookkeeping: its start, the depth it starts at, and
             // the start-to-start time the trace records (the doc's open question)
             const size_t pos0 = have.size();
+            // --llama-mtp-depth-max: the round's depth is the slot's tokens plus
+            // id_last, which stands in the context next; past the cutoff the
+            // width is 0 and the round is a one-row decode, no draft proposed.
+            // The depth is read here every round, so a later shorter request on
+            // the slot drafts again.
+            const int n_max = spec_width(n_draft_, budget, mtp_depth_max_, pos0 + 1);
+            std::vector<int> draft;
+            std::vector<float> probs;   // exec/mtp_trace.h: filled by draft_multi when the trace is on
             const auto   t_start = clock_type::now();
             if (pending_trace) {
                 // the previous round ran from prev_trace_start to this start
@@ -2799,6 +2828,7 @@ private:
     std::atomic<unsigned long long>       mtp_req_{0};   // requests served, the trace's `req`
 
     double                                mtp_min_p_ = 0.0;   // --llama-mtp-min-p, for the trace's line
+    int                                   mtp_depth_max_ = 0;   // --llama-mtp-depth-max (exec/spec_depth.h): 0 off
     // --llama-checkpoints: per lane, the recurrent state at token counts the
     // lane's tokens still match, oldest first
     std::vector<std::vector<Checkpoint>>  ckpts_;

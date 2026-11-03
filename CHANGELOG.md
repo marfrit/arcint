@@ -18,6 +18,68 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.5.0 — 2026-11-03
+
+Faster by default on the coder, the full trained context on the agent, and a
+batch of opt-in mechanisms from the arc-b580 fork's concept mining
+(`docs/campaigns/research-concept-mining/`, on the `qfndev` branch).
+
+- **On by default** (patch 0094; `=0` restores either): the MTP head's prompt
+  pass builds only its layer's K/V (0080, `LLAMA_MTP_KV_ONLY`), and the
+  KV-cache rotation matrices stay on the card (0083 bit 2, `LLAMA_SYNC_TRIM`
+  now 2). Window 58 (`measured-here`, 2 rounds an arm): the coder (A770)
+  decode +1.8 / +2.0 / +1.8 %, prefill at 41k +6.6 %, texts identical; the
+  agent and Flash-Next equal.
+- **Rollback by replay** (0086/0087, fixed for hybrid models in 0091;
+  `LLAMA_GDN_REPLAY=1`, per unit): the gated delta-net keeps one base state and
+  small per-token records instead of whole state copies for MTP rollbacks.
+  On the agent 576 MiB less VRAM at equal decode (prefill -1.6 to -3.5 %), which
+  buys the model's trained length: the sample `arcint-agent.service` serves
+  262,144 tokens (window 61: the needle right at 254,970, peak 24,199 of
+  24,480 MiB, nothing evicted, the acceptance task 10/10, a verify's cost
+  unchanged).
+- **`--llama-mtp-depth-max`** (default 0, off): stop drafting past a context
+  depth. Measured on the agent at 115k: drafting still doubles decode there
+  (21.0 against 10.1 t/s), so no unit sets it.
+- **Opt-in, measured without a gain** (kept for further work, off): the GDN
+  state read from cache rows (0081, fixed in 0090), the joint q/k l2_norm
+  (0082), the other round-trip trims (0083 bits 1 and 4), fast top-k (0084),
+  int8 Q Kᵀ from the q8_0 cache on DPAS (0088) and its 1-3-row staged form
+  (0089): the last two cost the agent 25 % and 9 % decode at 115k.
+- **Fixes in the series' own tests** (0092, 0093): two test-backend-ops cases
+  that could not complete on a card, which is how 0081's write-layout defect
+  passed them.
+- **`GET /slots`** (`--slots`, off by default): what the slots are doing, as state.
+
+- **`GET /slots`** (`--slots`, off by default; `measured-here`, `tests/slots.sh`,
+  `tests/test_slots.cpp`): one entry per slot with `id`, `lane`, `n_ctx`,
+  `is_processing`, `n_cache` (the KV cells that slot's sequence holds) and,
+  while the slot serves a request, `id_task` carrying that request's
+  `X-Request-Id` (1.4.2's id). State only: llama-server's `/slots` also dumps
+  the prompt (detokenized), the generated text and the sampling parameters of
+  whatever is running; this route names none of it, and `slots.sh` puts a unique
+  marker in the busy request's prompt and asserts it is absent from the body.
+  Behind the same `--api-key` as every other route; `/props` lists it only when
+  it is served. The read is lock-cheap by construction: the slot pool's mutex is
+  held only to copy its busy flags and per-slot request ids, the backend's lock
+  only for the per-sequence cell high-water (the lock `/props` already takes for
+  the loan state), and the document is built outside both.
+
+The series 0080-0089 and `--llama-mtp-depth-max` were implemented by meseeks (a private
+DeepSeek-V4.1-Flash quant, run locally) from the concept mining; briefed and reviewed by
+Claude, who wrote the fixes 0090-0094.
+
+Release gate (window 62, `measured-here`, the release candidate against 1.4.2 in the same window):
+the coder's decode 51.50 / 52.70 / 45.25 -> 52.50 / 53.65 / 46.10 t/s and its prefill at 41k 730.25 ->
+778.10 t/s (two rounds), its answers byte-identical, the acceptance task 10/10 greedy x3; Flash-Next
+equal (three rounds); the writer and the VLM byte-identical at equal speed. The agent with replay:
+answers byte-identical, prefill 716.60 -> 695.75 t/s at 55k and 503.50 -> 494.30 at 138k (replay's
+price for the context it frees); at 262,144 tokens the needle at 254,970 right, VRAM peak 24,164 of
+24,480 MiB, nothing evicted.
+
+Runtime dependency unchanged: llama.cpp 3e4dfa8 with `contrib/llama.cpp/patches`
+0001-0094 (0031, 0055, 0061, 0073, 0076, 0078 not carried; 0085 never assigned).
+
 ## 1.4.2 — 2026-11-02
 
 One HTTP-surface addition: every request carries an id, so a gateway's log line

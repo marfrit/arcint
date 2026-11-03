@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 1.4.2 LANGUAGES CXX)
+project(arcint VERSION 1.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -99,6 +99,7 @@ add_library(arcint_core STATIC
   src/api/responses.cpp
   src/api/responses_stream.cpp
   src/api/responses_state.cpp
+  src/api/slots.cpp
   src/api/tokenize.cpp
   src/http/server.cpp
 )
@@ -268,6 +269,8 @@ if(ARCINT_TESTS)
     tests/test_token_ids.cpp
     tests/test_props.cpp
     tests/test_sampler_modes.cpp
+    tests/test_fast_topk.cpp
+    tests/test_mtp_depth.cpp
     tests/test_loop_guard.cpp
     tests/test_context_guard.cpp
     tests/test_lanes.cpp
@@ -283,6 +286,7 @@ if(ARCINT_TESTS)
     tests/test_disconnect.cpp
     tests/test_responses.cpp
     tests/test_metrics.cpp
+    tests/test_slots.cpp
     tests/test_auth.cpp
     tests/test_reqid.cpp
     tests/test_tokenize.cpp
@@ -370,6 +374,14 @@ if(ARCINT_TESTS)
            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/metrics.sh"
                    "$<TARGET_FILE:arcint>")
   set_tests_properties(metrics PROPERTIES TIMEOUT 120 LABELS unit)
+
+  # ops: GET /slots is opt-in (--slots) and state-only. The HTTP half (route
+  # presence, the 401, one entry per slot, the busy slot's request id, and that
+  # no request text reaches the body) on the stub.
+  add_test(NAME slots
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/slots.sh"
+                   "$<TARGET_FILE:arcint>")
+  set_tests_properties(slots PROPERTIES TIMEOUT 120 LABELS unit)
 
   # ops item 2: the bearer key and the TLS flag pairing. The HTTP half (401s,
   # the /health exemption, preflight, the key file) on the stub.
@@ -467,16 +479,125 @@ if(ARCINT_TESTS)
     # off), a block-ahead hint in every row function, the volatile page touch and
     # its level-2 guard in both compute paths. The residency and parity arms are
     # in tests/test-opencl-miss-cpu.cpp (the patch's own C cell).
+    # patch 0083's device-free cell: LLAMA_SYNC_TRIM's default-off, the trim
+    # predicate, the device KV rotations and the one sampled-id read.
+    add_test(NAME round-trip-trim
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_round_trip_trim.py")
+    set_tests_properties(round-trip-trim PROPERTIES LABELS unit)
     add_test(NAME cpu-miss-prefetch
              COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
                      "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_cpu_miss_prefetch.py")
     set_tests_properties(cpu-miss-prefetch PROPERTIES LABELS unit)
+    # patch 0080's device-free cell: the MTP KV-only branch's store half equals the
+    # full graph's, nothing follows it, and the switch defaults off. The K/V byte
+    # equality is the card arm (README 0080).
+    add_test(NAME mtp-kv-only
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_mtp_kv_only.py")
+    set_tests_properties(mtp-kv-only PROPERTIES LABELS unit)
+    # patch 0081's device-free cell: the gated delta-net's rows form reads each
+    # sequence's own cache row, and the packed output (attention scores plus the
+    # K snapshots) is byte-identical to the gathered form's, on the CPU backend.
+    add_executable(arcint-gdn-state-rows tests/test_gdn_state_rows.cpp)
+    target_link_libraries(arcint-gdn-state-rows PRIVATE arcint_core)
+    target_include_directories(arcint-gdn-state-rows PRIVATE "${ARCINT_LLAMA_DIR}/ggml/include")
+    target_compile_options(arcint-gdn-state-rows PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME gdn-state-rows COMMAND arcint-gdn-state-rows)
+    set_tests_properties(gdn-state-rows PROPERTIES LABELS unit)
+    # patch 0081's source-slot cell: the GDN family takes src[6] once (the rows
+    # index; the replay's records in its own op), the mode word op_params[1]
+    # selects the state path, and the raw gating projections of patch 0051 ride
+    # src[8]/src[9]. The served graph's gate chain with those projections
+    # attached computes the plain path's bytes on the CPU backend -- with rows on
+    # and with replay on too. Before the fix the attached alpha sat on src[6] and
+    # every unit crashed (the CPU op's I32 assert).
+    add_executable(arcint-gdn-gate-slots tests/test_gdn_gate_slots.cpp)
+    target_link_libraries(arcint-gdn-gate-slots PRIVATE arcint_core)
+    target_include_directories(arcint-gdn-gate-slots PRIVATE
+        "${ARCINT_LLAMA_DIR}/ggml/include" "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/src/models")
+    target_compile_options(arcint-gdn-gate-slots PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME gdn-gate-slots COMMAND arcint-gdn-gate-slots)
+    set_tests_properties(gdn-gate-slots PROPERTIES LABELS unit)
+    add_test(NAME gdn-gate-slots-gate
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_gdn_gate_slots.py")
+    set_tests_properties(gdn-gate-slots-gate PROPERTIES LABELS unit)
+    # patch 0086/0087's device-free cell: a chain of prompt steps through
+    # ggml_gated_delta_net_replay equals the snapshot chain's bytes on the CPU
+    # backend (attention outputs and the final base state). The cards' arm is the
+    # replay-chain case in test-backend-ops (README 0086/0087).
+    add_executable(arcint-gdn-replay tests/test_gdn_replay.cpp)
+    target_link_libraries(arcint-gdn-replay PRIVATE arcint_core)
+    target_include_directories(arcint-gdn-replay PRIVATE "${ARCINT_LLAMA_DIR}/ggml/include")
+    target_compile_options(arcint-gdn-replay PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME gdn-replay COMMAND arcint-gdn-replay)
+    set_tests_properties(gdn-replay PROPERTIES LABELS unit)
+    # patch 0082's device-free cell: one l2_norm over the joint q/k head groups
+    # of the GDN conv output against the two separate norms, on the CPU backend,
+    # byte equality; the gate cell reads the switch and the bf16 dispatch out of
+    # the patched tree.
+    add_executable(arcint-gdn-qk-l2-norm tests/test_gdn_qk_l2_norm.cpp)
+    target_link_libraries(arcint-gdn-qk-l2-norm PRIVATE arcint_core)
+    target_include_directories(arcint-gdn-qk-l2-norm PRIVATE "${ARCINT_LLAMA_DIR}/ggml/include")
+    target_compile_options(arcint-gdn-qk-l2-norm PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME gdn-qk-l2-norm COMMAND arcint-gdn-qk-l2-norm)
+    set_tests_properties(gdn-qk-l2-norm PROPERTIES LABELS unit)
+    add_test(NAME gdn-qk-l2-norm-gate
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_gdn_qk_l2_norm.py")
+    set_tests_properties(gdn-qk-l2-norm-gate PROPERTIES LABELS unit)
+    # patch 0081's build gate, read out of the patched tree (LLAMA_SRC): the
+    # switch defaults off, one sequence only, the fused GDN the batch takes
+    add_test(NAME gdn-state-rows-gate
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_gdn_state_rows.py")
+    set_tests_properties(gdn-state-rows-gate PROPERTIES LABELS unit)
+    # patch 0086/0087's wiring, read out of the patched tree (LLAMA_SRC): the
+    # switch defaults off, S gets two planes only when it is on, rollback drops
+    # pending records, a save writes base + records, replay disables the rows
+    # form, and the OpenCL kernel is built only under the switch.
+    add_test(NAME gdn-replay-gate
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_gdn_replay.py")
+    set_tests_properties(gdn-replay-gate PROPERTIES LABELS unit)
+    add_test(NAME gdn-rows-write-layout
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_gdn_rows_write_layout.py")
+    set_tests_properties(gdn-rows-write-layout PROPERTIES LABELS unit)
+    add_test(NAME gdn-replay-hybrid-input
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_gdn_replay_hybrid_input.py")
+    set_tests_properties(gdn-replay-hybrid-input PROPERTIES LABELS unit)
     add_test(NAME expert-profile-save
              COMMAND "${CMAKE_COMMAND}" -E env "EXPERT_PROFILE_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
                      "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_expert_profile_save.py")
     set_tests_properties(expert-profile-save PROPERTIES LABELS unit)
+    # patches 0088/0089's device-free cell: the int8 Q K^T's q8_0 block
+    # offsets, its RNE Q quantizer and the S selftest against the f16 form, read
+    # out of the kernel's own .inc (the text the backend prepends). The dispatch
+    # and the switch, read out of the patched tree, are the python gate below.
+    add_executable(arcint-fa-gqa-i8 tests/test_fa_gqa_i8.cpp)
+    target_include_directories(arcint-fa-gqa-i8 PRIVATE
+        "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl/kernels")
+    target_compile_options(arcint-fa-gqa-i8 PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME fa-gqa-i8 COMMAND arcint-fa-gqa-i8)
+    set_tests_properties(fa-gqa-i8 PROPERTIES LABELS unit)
+    add_test(NAME fa-gqa-i8-gate
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_fa_gqa_i8.py")
+    set_tests_properties(fa-gqa-i8-gate PROPERTIES LABELS unit)
   endif()
 endif()
 

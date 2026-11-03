@@ -20,6 +20,7 @@
 #include "api/responses.h"
 #include "api/responses_state.h"
 #include "api/responses_stream.h"
+#include "api/slots.h"
 #include "api/tokenize.h"
 #include "util/log.h"
 
@@ -358,6 +359,17 @@ void HttpServer::Impl::route() {
         });
     }
 
+    // GET /slots (--slots): what each slot is doing right now, as state only.
+    // Off by default, and behind --api-key like every other route (the
+    // pre-routing handler answers the 401 before routing). The document names
+    // no prompt, completion, token id or sampling parameter — api/slots.h says
+    // why that is the whole contract, and slots.sh proves the marker stays out.
+    if (ctx.cfg != nullptr && ctx.cfg->slots) {
+        svr->Get("/slots", [this](const httplib::Request&, httplib::Response& res) {
+            send_json(res, 200, api::slots_json(ctx));
+        });
+    }
+
     svr->Get("/v1/models", [this](const httplib::Request&, httplib::Response& res) {
         send_json(res, 200, api::models(ctx));
     });
@@ -416,7 +428,7 @@ void HttpServer::Impl::route() {
         // before any byte of the answer is committed.
         auto lease = std::make_shared<api::SlotPool::Lease>();
         int  slot  = -1;
-        if (auto err = api::acquire_slot(ctx, prep->lane, *lease, slot)) {
+        if (auto err = api::acquire_slot(ctx, prep->lane, *lease, slot, -1, prep->request_id)) {
             send_json(res, err->status, err->body);
             return;
         }
@@ -450,7 +462,7 @@ void HttpServer::Impl::route() {
         // resolved from the model field, and only that one.
         auto lease = std::make_shared<api::SlotPool::Lease>();
         int  slot  = -1;
-        if (auto err = api::acquire_slot(ctx, prep->lane, *lease, slot)) {
+        if (auto err = api::acquire_slot(ctx, prep->lane, *lease, slot, -1, prep->request_id)) {
             send_json(res, err->status, err->body);
             return;
         }
@@ -569,7 +581,8 @@ void HttpServer::Impl::route() {
 
         auto lease = std::make_shared<api::SlotPool::Lease>();
         int  slot  = -1;
-        if (auto err = api::acquire_slot(ctx, prep->chat.lane, *lease, slot, prep->affinity_slot)) {
+        if (auto err = api::acquire_slot(ctx, prep->chat.lane, *lease, slot, prep->affinity_slot,
+                                         prep->chat.request_id)) {
             // The spec maps a busy service to 429 too_many_requests; the chat
             // route keeps its 503. The refusal's slots/lanes diagnostics ride
             // into the 429 body (review F1).
@@ -646,7 +659,7 @@ void HttpServer::Impl::route() {
 
         auto lease = std::make_shared<api::SlotPool::Lease>();
         int  slot  = -1;
-        if (auto err = api::acquire_slot(ctx, prep->lane, *lease, slot)) {
+        if (auto err = api::acquire_slot(ctx, prep->lane, *lease, slot, -1, prep->request_id)) {
             send_json(res, err->status, err->body);
             return;
         }

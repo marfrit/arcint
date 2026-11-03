@@ -28,6 +28,9 @@
 - Flash-Next's production quant is ISTA-DASLab's GSQ-RCO IQ3_S since
   2026-10-20 (operator): 33.3 t/s decode on six answers, KL 0.127 against
   Q8_0 (IQ3_XXS 38.0 t/s, 0.217, the rollback).
+- Version 1.5.0 (2026-11-03): MTP K/V-only prompt pass and on-card KV rotations on by default (coder
+  +2 % decode, +6.6 % prefill); GDN rollback by replay per unit (LLAMA_GDN_REPLAY=1; the agent at
+  262,144 tokens); GET /slots; --llama-mtp-depth-max; patches 0080-0094.
 - Version 1.4.2 (2026-11-02): X-Request-Id on every response (a caller's id kept when it is 1..128 of
   [A-Za-z0-9._:-], otherwise generated) and rid=<id> on the request's log lines.
 - Version 1.4.1 (2026-11-02): patch 0078 (the staging bound) dropped; it cost Flash-Next 2.2 %
@@ -137,7 +140,9 @@
 
 - HTTP: POST /v1/chat/completions, POST /v1/completions (OpenAI-compatible,
   SSE streaming; /v1/completions also takes token-id prompts), GET /health,
-  GET /props, GET /v1/models. No UI.
+  GET /props, GET /v1/models; with --slots, GET /slots (slot state only — id,
+  lane, n_ctx, is_processing, n_cache, and a busy slot's request id; no prompt,
+  completion, token ids or sampling parameters). No UI.
 - Token surface (llama-server-compatible, behind the same key as every route):
   POST /tokenize takes {content, add_special?, with_pieces?, model?} and
   returns {tokens}; with_pieces returns {id, piece} objects, a piece that is
@@ -188,8 +193,8 @@
 - Console: one-line state/timing prints on stderr (load, expert cache,
   per-slot prefill/decode rates, draft acceptance).
 - Security: no authentication by default; --api-key/--api-key-file add a
-  bearer token on every route but /health (that includes /props and /metrics;
-  the CORS preflight is answered without the key). TLS only in a build
+  bearer token on every route but /health (that includes /props, /metrics and
+  /slots; the CORS preflight is answered without the key). TLS only in a build
   configured with -DARCINT_TLS=ON (--tls-cert/--tls-key); the default build
   links no OpenSSL. LAN or a reverse proxy only.
 
@@ -213,9 +218,10 @@
 - KV: llama.cpp's cache, --llama-kv f16 | q8_0 | q8_0:q4_0 (others refused);
   --llama-reserve-cells N reserves compute buffers for N cells.
 - Speculative decoding: the model's own MTP head (--llama-mtp N), draft 0
-  from the catch-up batch, --llama-mtp-min-p stop, verify walk in the
-  sampler's order (greedy and seeded sampled); rollback by recurrent
-  snapshot. Both lanes busy: one draft loop and one verify for both.
+  from the catch-up batch, --llama-mtp-min-p stop, --llama-mtp-depth-max
+  cutoff, verify walk in the sampler's order (greedy and seeded sampled);
+  rollback by recurrent snapshot. Both lanes busy: one draft loop and one
+  verify for both.
   Or a DFlash2 drafter (--llama-dflash-gguf FILE, --llama-dflash N up to
   7, --llama-dflash-min-p P; llama.cpp's draft-dflash on libllama): a block
   a drafter pass from the target's layer inputs, the selector's lattice
@@ -262,6 +268,14 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
   request field `arcint.timings: true` adds the per-response timing object
   (llama-server's prompt_n/prompt_ms, predicted_n/predicted_ms, cache_n,
   draft_n, draft_accepted) on Chat Completions and Responses.
+- --slots (off): serve GET /slots — one entry per slot with id, lane, n_ctx,
+  is_processing, n_cache (the KV cells that slot's sequence holds) and, while
+  the slot serves a request, id_task: that request's X-Request-Id. State only:
+  no prompt, no generated text, no token ids, no sampling parameters. The prompt
+  (detokenized), the generated text and the sampling parameters are what
+  llama-server's /slots carries, and slots.sh asserts the absence with a
+  marker in the busy request's prompt. Behind --api-key like every route;
+  /props lists it only when it is served.
 - --api-key KEY | --api-key-file PATH: require `Authorization: Bearer KEY` on
   every route but /health (GET/HEAD only; a CORS preflight -- an OPTIONS with
   Access-Control-Request-Method -- is exempt). The check runs before the
@@ -299,7 +313,9 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
   --chat-template-kwarg enable_thinking=BOOL.
 - --llama-kv K[:V]; --llama-threads N; --llama-reserve-cells N.
 - --llama-mtp N, --llama-mtp-gguf FILE, --llama-mtp-vocab FILE,
-  --llama-mtp-min-p P, --llama-mtp-card N.
+  --llama-mtp-min-p P, --llama-mtp-card N, --llama-mtp-depth-max N (0, off:
+  past N tokens of a slot's context it decodes one token a round without
+  drafting; /props mtp.depth_max).
 - --llama-dflash-gguf FILE, --llama-dflash N (7), --llama-dflash-min-p P,
   --llama-dflash-ubatch N (64).
 - --llama-checkpoints N (32), --llama-checkpoint-step T (8192).

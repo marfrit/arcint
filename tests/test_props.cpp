@@ -189,6 +189,20 @@ TEST(props_endpoints_lists_the_token_routes) {
     CHECK(has("/tokenize"));
     CHECK(has("/detokenize"));
     CHECK(!has("/metrics"));   // --metrics off
+    CHECK(!has("/slots"));     // --slots off
+
+    // The two opt-in routes are named only once the operator asks for them:
+    // the list says what this process serves, not what it could serve.
+    cfg.metrics = true;
+    cfg.slots   = true;
+    // A value, not a reference: props() returns a temporary, and .at() into it
+    // would leave this dangling.
+    const nlohmann::json on = lgc::api::props(ctx).at("endpoints");
+    auto serves = [&](const char* path) {
+        return std::find(on.begin(), on.end(), path) != on.end();
+    };
+    CHECK(serves("/metrics"));
+    CHECK(serves("/slots"));
 }
 
 // The projector's own halves: /props must report libmtmd's vision/audio caps,
@@ -425,4 +439,19 @@ TEST(props_reports_the_loop_guard_switch_and_thresholds) {
     CHECK_EQ(lg.at("threshold").get<float>(), 0.75f);
     CHECK_EQ(lg.at("grace").get<int>(), 30);
     CHECK_EQ(lg.at("door_grace").get<int>(), 15);
+}
+
+// concept-mining item 6: /props names the active MTP draft cutoff, beside the
+// other MTP settings, so a turn that decodes past a depth is explained.
+TEST(props_reports_the_mtp_draft_depth_cutoff) {
+    Config     cfg;
+    cfg.llama_mtp = 5;
+    FakeBackend backend;
+    backend.st.loaded      = true;
+    backend.st.mtp_enabled = true;
+    SlotPool slots(1);
+    Context  ctx{&cfg, &backend, &slots};
+    CHECK_EQ(lgc::api::props(ctx).at("mtp").at("depth_max").get<int>(), 0);
+    cfg.llama_mtp_depth_max = 32768;
+    CHECK_EQ(lgc::api::props(ctx).at("mtp").at("depth_max").get<int>(), 32768);
 }

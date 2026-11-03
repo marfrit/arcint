@@ -1,0 +1,263 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index b53a936..bc388a8 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1754,11 +1754,32 @@ void llama_context::flush_draft_trace() {
+     draft_trace_pending.clear();
+ }
+ 
++// ARC-LAB: LLAMA_SYNC_TRIM bit mask (default 0 = upstream behaviour): 1 = skip a
++// context synchronize when the context queued nothing since its last one,
++// 2 = KV-cache rotation matrices kept on the device (llama-kv-cache.cpp),
++// 4 = the backend-sampled ids of a batch read with one copy instead of one per row
++int llama_sync_trim() {
++    static const int v = [] {
++        const char * e = getenv("LLAMA_SYNC_TRIM");
++        return e ? atoi(e) : 0;
++    }();
++    return v;
++}
++
+ void llama_context::synchronize() {
+     if (!sched) {
+         return;
+     }
+ 
++    // ARC-LAB: LLAMA_SYNC_TRIM bit 1: every getter (logits, sampled tokens,
++    // nextn rows, ...) synchronizes, and the device's one in-order queue is
++    // shared by all contexts. With nothing queued by this context since its
++    // last synchronize, its results are already complete: skip the device wait.
++    if ((llama_sync_trim() & 1) && !sync_pending && !cparams.pipeline_parallel) {
++        return;
++    }
++    sync_pending = false;
++
+     ggml_backend_sched_synchronize(sched.get());
+ 
+     // the MTP trace record's ids are complete now: write it beside the logits
+@@ -2549,6 +2570,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
+     sched_reserve();
+ 
+     n_queued_tokens += n_tokens;
++    sync_pending = true;
+ 
+     // reserve output buffer
+     if (output_reserve(n_tokens) < n_tokens) {
+@@ -2847,6 +2869,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         t_compute_start_us = ggml_time_us();
+     }
+     n_queued_tokens += n_tokens_all;
++    sync_pending = true;
+ 
+     output_swaps.clear();
+     embd_batch_idxs.clear();
+@@ -3216,7 +3239,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+             const auto stride = n_vocab;
+ 
+             // async copy the sampling data from the backend to the host
+-            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
++            if (res->t_sampled_ids != nullptr && sampling.sampled.has_data()) {
++                ggml_tensor *  t = res->t_sampled_ids;
++                ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), t);
++                GGML_ASSERT(b != nullptr && t->ne[0] == (int64_t) n_outputs);
++                GGML_ASSERT((size_t) n_outputs_prev + n_outputs <= sampling.sampled.size);
++                ggml_backend_tensor_get_async(b, t, sampling.sampled.data + n_outputs_prev, 0,
++                        n_outputs * sizeof(llama_token));
++            } else {
++                copy_tensor_async_rows(res->t_sampled,    sampling.sampled,    1,      n_outputs_prev, sched.get());
++            }
+             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
+             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
+             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+@@ -3811,6 +3843,7 @@ ggml_status llama_context::graph_compute(
+ 
+     copy_experts.reset();
+ 
++    sync_pending = true;
+     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+@@ -4907,6 +4940,7 @@ void llama_context::opt_epoch_iter(
+         const uint32_t n_tokens_all = balloc->get_n_tokens();
+ 
+         n_queued_tokens += n_tokens_all;
++        sync_pending = true;
+ 
+         embd_seq.clear();
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index efd64f8..9fa3787 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -497,6 +497,7 @@ private:
+     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+ 
+     bool has_evaluated_once = false;
++    bool sync_pending       = true;  // ARC-LAB: work queued since the last synchronize (LLAMA_SYNC_TRIM)
+ 
+     // env: LLAMA_GRAPH_REUSE_DISABLE
+     bool graph_reuse_disable = false;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 5a5d13b..dd23b1a 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1406,6 +1406,7 @@ void llm_graph_result::reset() {
+     t_route_ids.clear();
+ 
+     t_sampled.clear();
++    t_sampled_ids = nullptr;
+     t_sampled_probs.clear();
+     t_sampled_logits.clear();
+     t_candidates.clear();
+@@ -4346,6 +4347,28 @@ void llm_graph_context::build_sampling() const {
+         }
+     }
+ 
++    // ARC-LAB: LLAMA_SYNC_TRIM bit 4: one I32 tensor with every sampled id of the batch (n_rows-1 tiny CONCAT
++    // kernels), so the host reads them with one copy instead of one small async copy per row.
++    if ((llama_sync_trim() & 4) && n_rows > 1) {
++        bool all = true;
++        for (auto * t : res->t_sampled) {
++            if (t == nullptr || t->type != GGML_TYPE_I32) {
++                all = false;
++                break;
++            }
++        }
++        if (all) {
++            ggml_tensor * ids = res->t_sampled[0];
++            for (uint32_t i = 1; i < n_rows; ++i) {
++                ids = ggml_concat(ctx0, ids, res->t_sampled[i], 0);
++            }
++            ggml_set_name(ids, "sampled_ids");
++            ggml_set_output(ids);
++            ggml_build_forward_expand(gf, ids);
++            res->t_sampled_ids = ids;
++        }
++    }
++
+     // TODO: Call backend_accept after all samplers have been applied.
+     /*
+     for (const auto & [seq_id, sampler] : samplers) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 338f73f..3c9f05f 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -989,6 +989,7 @@ public:
+     std::vector<std::pair<int, ggml_tensor *>> t_route_ids;
+ 
+     std::vector<ggml_tensor *> t_sampled;
++    ggml_tensor *              t_sampled_ids = nullptr; // I32 [n_rows]: the same sampled ids in one tensor (one read-back), or null
+     std::vector<ggml_tensor *> t_sampled_probs;
+     std::vector<ggml_tensor *> t_sampled_logits;
+     std::vector<ggml_tensor *> t_candidates;
+diff --git a/src/llama-impl.h b/src/llama-impl.h
+index 7ccd23c..31ffd2d 100644
+--- a/src/llama-impl.h
++++ b/src/llama-impl.h
+@@ -77,6 +77,9 @@ static inline ggml_tensor * llama_mul_mat_hadamard(
+ // Prefetch the host pages needed to gather these rows.
+ void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows);
+ 
++// ARC-LAB: LLAMA_SYNC_TRIM bit mask, see llama-context.cpp
++int llama_sync_trim();
++
+ struct time_meas {
+     time_meas(int64_t & t_acc, bool disable = false);
+     ~time_meas();
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 491f0c8..a43fb7d 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -382,6 +382,33 @@ llama_kv_cache::llama_kv_cache(
+ 
+             ggml_gen_hadamard(tmp);
+         }
++
++        // ARC-LAB: keep them on the cache's device too (one buffer type only, and not host memory)
++        if ((llama_sync_trim() & 2) && ctxs_bufs.size() == 1 && !hparams.no_alloc) {
++            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(ctxs_bufs[0].second.get());
++            if (!ggml_backend_buft_is_host(buft)) {
++                ggml_init_params params = {
++                    /* .mem_size   = */ attn_rot_hadamard.size()*ggml_tensor_overhead(),
++                    /* .mem_buffer = */ nullptr,
++                    /* .no_alloc   = */ true,
++                };
++                attn_rot_dev_ctx.reset(ggml_init(params));
++                for (const auto & [n, m] : attn_rot_hadamard) {
++                    ggml_tensor * t = ggml_new_tensor_2d(attn_rot_dev_ctx.get(), GGML_TYPE_F32, n, n);
++                    ggml_format_name(t, "attn_rot_dev_%d", (int) n);
++                    attn_rot_dev[n] = t;
++                }
++                attn_rot_dev_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(attn_rot_dev_ctx.get(), buft));
++                if (attn_rot_dev_buf) {
++                    ggml_backend_buffer_set_usage(attn_rot_dev_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++                    for (const auto & [n, t] : attn_rot_dev) {
++                        ggml_backend_tensor_set(t, attn_rot_hadamard.at(n).data(), 0, ggml_nbytes(t));
++                    }
++                } else {
++                    attn_rot_dev.clear();
++                }
++            }
++        }
+     }
+ 
+     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
+@@ -1666,6 +1693,10 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
+     ggml_tensor * res = nullptr;
+ 
+     if (n_rot_k) {
++        if (const auto it = attn_rot_dev.find(n_rot_k); it != attn_rot_dev.end()) {
++            return it->second;
++        }
++
+         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rot_k, n_rot_k);
+         ggml_set_input(res);
+         ggml_set_name(res, "attn_inp_k_rot");
+@@ -1678,6 +1709,10 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
+     ggml_tensor * res = nullptr;
+ 
+     if (n_rot_v) {
++        if (const auto it = attn_rot_dev.find(n_rot_v); it != attn_rot_dev.end()) {
++            return it->second;
++        }
++
+         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rot_v, n_rot_v);
+         ggml_set_input(res);
+         ggml_set_name(res, "attn_inp_v_rot");
+@@ -2029,6 +2064,9 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch
+ }
+ 
+ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
++    if (!(dst->flags & GGML_TENSOR_FLAG_INPUT)) {
++        return;  // the device copy (attn_rot_dev), already filled
++    }
+     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+ 
+     const auto n_rot = dst->ne[0];
+@@ -2038,6 +2076,9 @@ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
+ }
+ 
+ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
++    if (!(dst->flags & GGML_TENSOR_FLAG_INPUT)) {
++        return;  // the device copy (attn_rot_dev), already filled
++    }
+     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+ 
+     const auto n_rot = dst->ne[0];
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index a4a118c..d5c3ce7 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -307,6 +307,12 @@ private:
+     // pre-computed hadamard martrices
+     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
+ 
++    // ARC-LAB: device copies of attn_rot_hadamard (LLAMA_SYNC_TRIM bit 2): graphs read these instead of an input that
++    // is uploaded (one sync + one blocking copy each) on every decode
++    ggml_context_ptr                          attn_rot_dev_ctx;
++    ggml_backend_buffer_ptr                   attn_rot_dev_buf;
++    std::unordered_map<int64_t, ggml_tensor *> attn_rot_dev;
++
+     // env: LLAMA_KV_CACHE_DEBUG
+     int debug = 0;
+ 

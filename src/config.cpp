@@ -204,6 +204,13 @@ std::string usage_text() {
         "                            with the request/token/prefill/decode/spec\n"
         "                            counters and the lane gauges. Off by default:\n"
         "                            without it the route does not exist\n"
+        "  --slots                   serve GET /slots: what each slot is doing right\n"
+        "                            now (id, lane, n_ctx, is_processing, the KV cells\n"
+        "                            its sequence holds, and the request id a busy\n"
+        "                            slot serves). State only - no prompt, no\n"
+        "                            generated text, no tokens, no sampling\n"
+        "                            parameters. Off by default, and behind --api-key\n"
+        "                            like every other route\n"
         "\n"
         "responses store\n"
         "  --responses-store-entries N  retained responses per lane (default: 32;\n"
@@ -329,6 +336,11 @@ std::string usage_text() {
         "  --llama-mtp-min-p P       stop drafting at a token the MTP head gives less\n"
         "                            than P, and leave it out of the verify (0-1; 0 off:\n"
         "                            always --llama-mtp drafts)\n"
+        "  --llama-mtp-depth-max N   past N tokens of a slot's context (prompt plus\n"
+        "                            generated) the slot decodes one token a round\n"
+        "                            without drafting (0: never, the default); the\n"
+        "                            depth is read every round, so a later shorter\n"
+        "                            request on the slot drafts again\n"
         "  --llama-mtp-policy off|cost\n"
         "                            cost: Strata's cost-aware window rule picks the\n"
         "                            kept drafts and the verify's rows from the measured\n"
@@ -442,6 +454,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             cfg.stub = true;
         } else if (arg == "--metrics") {
             cfg.metrics = true;
+        } else if (arg == "--slots") {
+            cfg.slots = true;
         } else if (arg == "--api-key") {
             if (!value(v) || v.empty()) return fail("--api-key needs a non-empty key");
             cfg.api_key = std::string(v);
@@ -513,6 +527,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--llama-mtp-min-p") {
             if (!value(v) || !parse_double(v, cfg.llama_mtp_min_p) || cfg.llama_mtp_min_p < 0.0 || cfg.llama_mtp_min_p > 1.0)
                 return fail("--llama-mtp-min-p needs a probability from 0 to 1");
+        } else if (arg == "--llama-mtp-depth-max") {
+            if (!value(v) || !parse_int(v, cfg.llama_mtp_depth_max) || cfg.llama_mtp_depth_max < 0)
+                return fail("--llama-mtp-depth-max needs a token count >= 0 (0: never stop drafting)");
         } else if (arg == "--llama-mtp-policy") {
             if (!value(v) || (std::string(v) != "off" && std::string(v) != "cost"))
                 return fail("--llama-mtp-policy takes off or cost");
@@ -934,6 +951,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (!cfg.llama_mtp_vocab.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-vocab needs --llama-mtp");
     if (!cfg.llama_mtp_gguf.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-gguf needs --llama-mtp");
     if (cfg.llama_mtp_min_p > 0.0 && cfg.llama_mtp <= 0) return fail("--llama-mtp-min-p needs --llama-mtp");
+    if (cfg.llama_mtp_depth_max > 0 && cfg.llama_mtp <= 0) return fail("--llama-mtp-depth-max needs --llama-mtp");
     if (cfg.llama_mtp_policy && cfg.llama_mtp <= 0) return fail("--llama-mtp-policy needs --llama-mtp");
     if (!cfg.llama_mtp_cost_seed.empty() && !cfg.llama_mtp_policy)
         return fail("--llama-mtp-cost-seed needs --llama-mtp-policy cost");

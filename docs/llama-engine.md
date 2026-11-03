@@ -346,6 +346,34 @@ are bounded to 1 + N per lane: unbounded, llama.cpp reserved them for a
 whole ubatch, vocabulary-wide, in both contexts, and the coder with its MTP
 layer hung the A770 (two engine resets).
 
+**Under sampling the target's distribution is kept exactly** (`code`, audited
+for the draft-depth cutoff below, 2026-11-02): the walk samples each verified
+row with the sampler's own state as of that token (`src/exec/verify_walk.h:36`,
+its history fed by `observe(tok)` at `:49`), and accepts a draft only when
+that drawn token equals it (`:72`); the call site is
+`src/exec/backend_llama.cpp:2166-2170`. An accepted draft is therefore only a
+token the target's draw already produced, and a mismatch stops the walk, so a
+round draws once per emitted token and never advances the sampler's random
+stream over an unemitted row. That is the plain loop's rule with our own
+sampler -- not llama.cpp's rejection sampling, and no importance weighting is
+owed: the emitted sequence is distributed as the plain loop's, `code`.
+
+### The draft-depth cutoff (`--llama-mtp-depth-max N`)
+
+Past N tokens of a slot's context (prompt plus generated) the slot stops
+drafting: a round is a one-row decode, no draft step, no extra verify rows
+(`src/exec/spec_depth.h`, the round's width; the reference is the fork's
+`--spec-draft-depth-max`, `code`, `arc-b580/tools/server/server-context.cpp:447,3654-3657`).
+The depth is read every round (`src/exec/backend_llama.cpp:2104`, `pos0 + 1`),
+so a later, shorter request on the same slot drafts again; the MTP context is
+still fed, which is what keeps its carried row and pending rows current.
+`0` is off and byte-identical to before. `/props` reports `mtp.depth_max`.
+At greedy the pick is the same token either way (`code`: the target argmax at
+that position; the verify's batched numerics alone differ, above); under
+sampling the text may differ by design -- the facts stay the bar (operator,
+2026-11-02). Device-free cells: `tests/test_mtp_depth.cpp`, red cases in
+`docs/campaigns/research-concept-mining/arc-b580/audit.md` item 6.
+
 Served (`measured-here`, 2026-10-03, the acceptance task through arcint):
 
 | model, card, drafts | decode, plain -> MTP | accepted | acceptance task |

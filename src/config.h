@@ -67,6 +67,14 @@ struct Config {
     // probability under the MTP head is at least P, and a draft below P is
     // not verified (Strata's --spec-min-p); 0 drafts --llama-mtp tokens always
     double llama_mtp_min_p = 0.0;
+    // --llama-mtp-depth-max N: past N tokens of a slot's context (prompt plus
+    // generated) the slot decodes one token a round without drafting
+    // (src/exec/spec_depth.h; the reference's --spec-draft-depth-max); 0 never
+    // stops (default, today's behaviour). The depth is the round's, so a later
+    // shorter request on the slot drafts again. Greedy picks are the same token
+    // either way; under sampling the text may differ by design (operator,
+    // 2026-11-02).
+    int llama_mtp_depth_max = 0;
     // --llama-mtp-policy off|cost: cost hands the chain to Strata's cost-aware
     // window rule (src/exec/draft_policy.h, campaign research-mtp-width-policy
     // 5.2) instead of the fixed --llama-mtp ceiling; off (default) is the fixed
@@ -183,6 +191,19 @@ struct Config {
     // by default: without the flag the route does not exist and the default
     // surface is unchanged.
     bool metrics = false;
+
+    // --slots: serve GET /slots, the slot STATE view (one entry per slot: id,
+    // lane, n_ctx, is_processing, the cells its sequence holds, and while it
+    // serves, the request id). State only - never a prompt, a generated text,
+    // a token list or sampling parameters, which is what llama-server's own
+    // /slots carries (code, the llama.cpp tree arcint builds against,
+    // tools/server/server-context.cpp:733-763).
+    // Off by default: without the flag the route does not exist and the default
+    // surface is unchanged. The name is llama-server's (`--slots` /
+    // `--no-slots`, code, common/arg.cpp:3626-3633 in that tree; llama-server's
+    // own default there is ON, arcint's is OFF); nothing in arcint's own option
+    // set uses it (the slot count is --parallel).
+    bool slots = false;
 
     // The name this endpoint answers to on /v1/models and /props. Empty means
     // the GGUF's file name (the stub: "stub"). DESIGN.md §4.2.

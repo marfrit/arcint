@@ -1,0 +1,143 @@
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 7693c29..89b1cab 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -390,6 +390,46 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
+     }
+ }
+ 
++// patch 0091: the replay controls (0086) are filled for every input that carries a recurrent state, the three
++// hybrid inputs included (they copied only s_copy, so on a hybrid model the controls stayed unset and rpl_take was
++// never called: no records were counted and the first draft rollback was refused). rpl_take advances the
++// sequence's record count, so this runs exactly once per ubatch, from set_input.
++static void rs_set_input_rpl(const llm_graph_input_rs * inp, const llama_memory_recurrent_context * mctx,
++                             const llama_ubatch * ubatch) {
++    if (!inp->s_rpl_ctrl) {
++        return;
++    }
++    GGML_ASSERT(ggml_backend_buffer_is_host(inp->s_rpl_rows->buffer));
++    GGML_ASSERT(ggml_backend_buffer_is_host(inp->s_rpl_ctrl->buffer));
++    GGML_ASSERT(ggml_backend_buffer_is_host(inp->s_rpl_wrow->buffer));
++    int32_t * rows = (int32_t *) inp->s_rpl_rows->data;
++    int32_t * ctrl = (int32_t *) inp->s_rpl_ctrl->data;
++    int64_t * wrow = (int64_t *) inp->s_rpl_wrow->data;
++
++    const int64_t n_rs = mctx->get_n_rs();
++    for (uint32_t i = 0; i < n_rs; ++i) {
++        rows[i] = mctx->rpl_row(i);
++    }
++    for (uint32_t i = 0; i < ubatch->n_seqs; ++i) {
++        int32_t n_rec = 0;
++        int32_t bank  = 0;
++        mctx->rpl_take(i, ubatch->n_seq_tokens, n_rec, bank);
++        ctrl[2*i + 0] = n_rec;
++        ctrl[2*i + 1] = bank;
++        wrow[i]       = bank ^ 1;
++    }
++}
++
++static bool rs_can_reuse_rpl(const llm_graph_input_rs * inp, const llama_memory_recurrent_context * mctx,
++                             const llama_ubatch & ubatch) {
++    bool res = (inp->s_rpl_ctrl != nullptr) == mctx->get_rpl();
++    if (inp->s_rpl_ctrl) {
++        res &= inp->s_rpl_rows->ne[0] == mctx->get_n_rs();
++        res &= inp->s_rpl_ctrl->ne[0] == 2 * (int64_t) ubatch.n_seqs;
++    }
++    return res;
++}
++
+ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
+     GGML_UNUSED(ubatch);
+ 
+@@ -405,26 +445,7 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
+         }
+     }
+ 
+-    if (s_rpl_ctrl) {
+-        GGML_ASSERT(ggml_backend_buffer_is_host(s_rpl_rows->buffer));
+-        GGML_ASSERT(ggml_backend_buffer_is_host(s_rpl_ctrl->buffer));
+-        GGML_ASSERT(ggml_backend_buffer_is_host(s_rpl_wrow->buffer));
+-        int32_t * rows = (int32_t *) s_rpl_rows->data;
+-        int32_t * ctrl = (int32_t *) s_rpl_ctrl->data;
+-        int64_t * wrow = (int64_t *) s_rpl_wrow->data;
+-
+-        for (uint32_t i = 0; i < n_rs; ++i) {
+-            rows[i] = mctx->rpl_row(i);
+-        }
+-        for (uint32_t i = 0; i < ubatch->n_seqs; ++i) {
+-            int32_t n_rec = 0;
+-            int32_t bank  = 0;
+-            mctx->rpl_take(i, ubatch->n_seq_tokens, n_rec, bank);
+-            ctrl[2*i + 0] = n_rec;
+-            ctrl[2*i + 1] = bank;
+-            wrow[i]       = bank ^ 1;
+-        }
+-    }
++    rs_set_input_rpl(this, mctx, ubatch);
+ }
+ 
+ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
+@@ -441,11 +462,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
+     res &= head == mctx->get_head();
+     res &= rs_z == mctx->get_rs_z();
+ 
+-    res &= (s_rpl_ctrl != nullptr) == mctx->get_rpl();
+-    if (s_rpl_ctrl) {
+-        res &= s_rpl_rows->ne[0] == mctx->get_n_rs();
+-        res &= s_rpl_ctrl->ne[0] == 2 * params.ubatch.n_seqs;
+-    }
++    res &= rs_can_reuse_rpl(this, mctx, params.ubatch);
+ 
+     return res;
+ }
+@@ -1209,6 +1226,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+             data[i] = mctx->get_recr()->s_copy(i);
+         }
+     }
++
++    rs_set_input_rpl(inp_rs.get(), mctx->get_recr(), ubatch);
+ }
+ 
+ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
+@@ -1235,6 +1254,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
+ 
+     res &= inp_rs->head == mctx->get_recr()->get_head();
+     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
++    res &= rs_can_reuse_rpl(inp_rs.get(), mctx->get_recr(), params.ubatch);
+ 
+     return res;
+ }
+@@ -1258,6 +1278,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
+             data[i] = mctx->get_recr()->s_copy(i);
+         }
+     }
++
++    rs_set_input_rpl(inp_rs.get(), mctx->get_recr(), ubatch);
+ }
+ 
+ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
+@@ -1277,6 +1299,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
+ 
+     res &= inp_rs->head == mctx->get_recr()->get_head();
+     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
++    res &= rs_can_reuse_rpl(inp_rs.get(), mctx->get_recr(), params.ubatch);
+ 
+     return res;
+ }
+@@ -1331,6 +1354,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
+             data[i] = mctx->get_recr()->s_copy(i);
+         }
+     }
++
++    rs_set_input_rpl(inp_rs.get(), mctx->get_recr(), ubatch);
+ }
+ 
+ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
+@@ -1364,6 +1389,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
+ 
+     res &= inp_rs->head == mctx->get_recr()->get_head();
+     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
++    res &= rs_can_reuse_rpl(inp_rs.get(), mctx->get_recr(), params.ubatch);
+ 
+     return res;
+ }

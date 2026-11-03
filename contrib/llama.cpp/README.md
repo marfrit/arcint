@@ -3215,8 +3215,10 @@ between the steps, so the roundings are the separate kernels'.
 
 The kernel reads alpha and b when the GDN runs, later than the allocator
 keeps them: it frees alpha after the ADD. So `delta-net-base.cpp`
-(`gdn_keep_gating_inputs`) attaches them as extra sources of the GDN node
-(`src[6]` alpha, `src[7]` b), which keeps them alive; the op's meaning does
+(`gdn_keep_gating_inputs`, now `src/models/gdn-gate-inputs.h`) attaches them as
+extra sources of the GDN node (`src[6]` alpha, `src[7]` b **as originally
+written; patch 0081 moved them to `src[8]`/`src[9]`** — the family's slots, see
+0081 below), which keeps them alive; the op's meaning does
 not change and the CPU ignores them. The backend folds only when those
 sources are the chain's raw inputs, and refuses a fold if any computed node
 between the chain and the GDN writes over their bytes.
@@ -5509,3 +5511,894 @@ buys nothing by the premise.
 Owed on the cards, unchanged: the cold/warm pair at level 0 and the same A/B on
 the other units; the audit's bar — major faults above ~5 % of the CPU lane —
 decides a default. With faults ~0 already measured, it is ~0.
+
+## 0080-llama-mtp-kv-only.patch
+
+The MTP head's prompt pass computed only its K/V. A draft context's catch-up
+decode (the head's prompt fill) has no output rows: it exists so the later
+draft steps can read this layer's K/V. Ours built the whole MTP block for every
+prompt row anyway — `Qcur_full` (query + gate), attention, the gated output
+projection, the residual, FFN and the shared head — and cut only the output
+rows (patches 0010 and 0067 cut the *outputs* rows, not the graph; `code`:
+`src/models/qwen35.cpp`'s `graph_mtp` constructor, `qwen35moe.cpp`'s the same).
+**Evidence class of the mechanism: `code`** (fork 595d554c90, `LLAMA_MTP_KV_ONLY`
+in `arc-b580/src/models/qwen35.cpp:756-793`): the fork gates the graph after
+the cache store when `n_outputs == 0` and masked extraction is on, keeping the
+K/V ops identical and in the same order on the same shapes. The quality class
+is `exact`: the retained K/V rows are the full graph's (`code`; the fork's byte
+equality claim, not measured here).
+
+The patch, behind `LLAMA_MTP_KV_ONLY` (**off by default**; `1` enables it,
+`0` keeps the full graph, `code`): after the cache store the graph returns —
+K projection, reshape, K norm, RoPE, the optional cache rotations, then V, then
+`expand V`, `expand K`, `cpy_k`, `cpy_v`, the store half of `build_attn` in its
+own order. The Q projection is kept for `n_tokens <= 8`, as the fork does (its
+same-input mat-mul run's tile depends on the largest member; this OpenCL
+backend has no such run today — `code`, the only MUL_MAT fusion is 0019's
+gate+up+GLU — kept for parity with the fork's rule). The branch is taken only
+when `n_outputs == 0`, `cparams.embeddings_nextn_masked`, and the layer has no
+fused `wqkv` and no K/V bias — a fused projection would not be reproduced by
+the branch, so those layers keep the full graph (`code`). With the switch off
+the graph is byte-identical to before.
+
+**Scope (`code`)**: `qwen35` (the dense agent) and `qwen35moe` (the coder),
+both share the block shape. `qwen4exp` (Qwen3.8-Flash-Next)'s MTP graph is a
+hyper-connection graph whose K/V store sits inside `build_layer_attn`; it does
+not share the shape, so it is not in this patch. `qwen3next` shares the shape
+but is not a served unit; it is left as it is.
+
+Device-free (`code`): `tests/python/test_mtp_kv_only.py` reads the patched tree
+and asserts the branch's store half — the K mat-mul, reshape, K norm and RoPE
+the full graph's `build_qkv(reshape=false)` builds, V the same, V expanded
+before K, K stored before V, the rotations before the expands — that nothing
+follows the store (no attention, output projection, FFN or head), that the
+branch is gated on a masked no-output decode on a layer without a fused wqkv or
+K/V bias, and that the switch defaults off. Red mutations run before restore
+(`measured-here` on the patched tree): cpy_v dropped, the default flipped
+(`e == nullptr || ...`), the K norm dropped from the branch, the expand order
+swapped, the early `return;` dropped — each made its cell fail; restored, the
+cell passes. These are **source-text assertions** (they read the patched
+tree), not numerics.
+
+Card arms (owed; Claude runs them in a card window, **not yet measured**):
+1. **B60, agent (dense 27B), MTP 5**, the 18K/55K corpus prompt from
+   `tests/acceptance/cells/served_check.py`, two arms in one window, switch off
+   the old binary's arm and on the new one's:
+   `printf '#!/bin/sh\nexport LLAMA_MTP_KV_ONLY=1\nexec %s "$@"\n' <arcint-binary> > /tmp/arcint-kvonly && chmod +x /tmp/arcint-kvonly`
+   `python3 tests/acceptance/ab.py agent --old <arcint-binary> --new /tmp/arcint-kvonly --gguf <agent.gguf> --device GPU.0 --assets <assets> --rounds 2 --out /tmp/ab-80-agent`.
+   Record `prefill-55k`/`prefill-138k`, the decode rate, `draft accept` and
+   `verify` of both arms, and the texts md5; the bar is prefill up with the
+   same texts and the same accept counters (a K/V that differed would change
+   the draft's proposals and its acceptance; the audit's price is ~5 % on long
+   prompts, `paper`). The same with the coder on the A770 (`--device GPU.1`,
+   `ab.py coder`, MTP 4) — its prefill-41k is the prompt-side arm.
+2. **Draft K/V equality, stated as an observable**: three prompts served under
+   both arms in one process each; the `draft accept %` and the `verifies` of
+   the runs must be identical (the runs are the same workload, so any K/V row
+   difference moves them). A direct per-row dump is not available in either
+   arm; if the accept counters differ, the switch stays off and the finding is
+   recorded, not absorbed.
+
+Window 58 (`measured-here`, 2 rounds an arm, the bundle `LLAMA_MTP_KV_ONLY=1 LLAMA_SYNC_TRIM=2` against off):
+the coder (A770) PASS, texts md5 identical, decode +1.8 / +2.0 / +1.8 %, prefill-41k 729.75 -> 777.80 (+6.6 %);
+the agent (B60) PASS, md5 identical, prefill equal (55k 715.85 -> 714.95, 138k 503.25 -> 502.70); Flash-Next (B60)
+PASS, prefill equal, decode 32.40 -> 32.90 inside a 4 % run spread. Window 57 (one run each) put the coder's
+prefill gain on 0080 and its decode gain on 0083 bit 2.
+
+
+## 0081-llama-gdn-state-rows.patch
+
+The GDN recurrent state read straight from the cache. Ours gathers each layer's
+live state rows into a temp before the gated delta-net runs
+(`src/llama-graph.cpp`'s `build_rs`: `ggml_get_rows(states, state_copy)`), and the
+kernel then reads the temp; patch 0050 folds only the snapshot *writes* into the
+cache, so the gather and its ~3 MB a layer are paid every decode and verify
+(`code`, the drawn state; the fork's price is +3.8 % TG and a dirty temp slowing
+the next GEMV ~15 %, `paper`). **Evidence class of the mechanism: `code`** (fork
+9b4be76a1c; `arc-b580/src/models/qwen35.cpp`'s `build_rs_cache_view`, the CPU
+reference's `rows` mode over `src[6]` in `ggml/src/ggml-cpu/ops.cpp:10815-10845`,
+the SYCL kernels' `s_ids` and `s_row_stride` reads). Quality class `exact`: the
+bytes are the gathered row's (`code`; the fork measured 400 greedy tokens
+identical).
+
+The patch adds the rows form of the op — `ggml_gated_delta_net_rows(ctx, q, k,
+v, g, beta, states, rows, K)` sets `src[6]` to an I32 array of cache row indices
+over the 2D cache view (`states->ne[0] == D`, `rows->ne[0] == n_seqs`; output
+layout identical to the gathered form's) — and the build side:
+`build_rs_cache_view` returns the cache view after the same zero-state hygiene,
+gathers and relocates only the *extra* rows (`inp->s_copy_tail`, `n_rs - n_seqs`,
+the same destination `build_rs` writes), and the GDN op reads this sequence's
+live row `inp->s_copy_main[0]` inside the kernel. The three served archs
+(`qwen35`, `qwen35moe`, `qwen4exp`) pass the row index.
+
+**The GDN family's source slots, one signal each** (`measured-here`, the card
+host, 2026-11-02; defect): src[6] was taken three times — 0051's alpha (on by
+default), this patch's row index, 0086's records. Served with 0051's fold on,
+src[6] held the F32 alpha: the OpenCL `supports_op` declined the node, it fell
+to the CPU, and the CPU kernel asserted `GGML_ASSERT(src_rows->type ==
+GGML_TYPE_I32)` — **every unit crashed with every new switch off**. The fix,
+which is this patch: `op_params[1]` is the family's mode word
+(`GGML_GDN_MODE_GATHERED 0`, `_ROWS 1` in `ggml.h`, `_REPLAY 2` from 0086) and
+both GATED_DELTA_NET builders set it; the CPU op, the OpenCL `supports_op` and
+the OpenCL dispatch select their state path from that word and never from
+whether src[6] is set; the rows index stays `src[6]`; the raw gating projections
+of 0051 ride `src[8]`/`src[9]` (the helper moved to
+`src/models/gdn-gate-inputs.h`, which the builders and the device-free cell
+share) and 0051's fold matches `gd->src[8] == al` / `gd->src[9] == br`. The
+replay op (0086/0087) keeps `src[6]` records / `src[7]` control and carries the
+REPLAY mode word, which its CPU and OpenCL consumers assert. Evidence class of
+the slots: `code` (the consumers' reads); of the crash: `measured-here`.
+
+**Switch `LLAMA_GDN_STATE_ROWS`, off by default** (`code`): `1` builds the rows
+form, `0` keeps the gather. With it off the graph and every op's arguments are
+as before, byte-identical (the slot move is liveness only: 0051's fold finds the
+same two tensors, and off-graph bytes are unchanged).
+The build gate (`llama_gdn_state_rows_enabled`)
+declines a **multi-sequence** ubatch — `s_copy` may map a live row into the
+extra relocation's destination — and any batch the fused GDN op would not take
+(the autoregressive path needs a 4D state). The gate's single-sequence condition
+is the audit's, not a kernel limit (the CPU and OpenCL row reads take any
+`n_seqs`; the multi-sequence C arm proves it).
+
+**Ordering, stated plainly** (`code`): the extra relocation's cpy is expanded
+before the GDN, so a live row that fell inside its destination would be written
+before it is read. That is the fork's own documented hazard
+(`arc-b580/src/llama-graph.cpp:3684-3694`); with `n_rs_seq > 0` the live row maps
+into `rs_idx * size + src0` (rollback plane) while a reorder-less extra row maps
+into plane 0, so the served path's rows do not overlap — the multi-sequence
+decline keeps the general case out. Confirm it in the served arm: the answers
+and the draft acceptance counters equal (below).
+
+Device-free (`measured-here`): `tests/test_gdn_gate_slots.cpp` builds the served
+graph's gate chain — `beta = sigmoid(b)`, `g = reshape(mul(softplus(add(alpha,
+dt_bias)), A))` — and attaches the raw projections through the shared header
+`gdn-gate-inputs.h`: the plain node with 0051's fold active (all new switches
+off), the rows form and the replay node all compute the plain path's bytes
+(replay: its attention region, and its whole output is unchanged by the extra
+sources). Red (`measured-here`): `gdn-gate-inputs.h` writing `src[6]`/`src[7]`
+again (the served pre-fix form) makes the plain+extras arm abort in the CPU op's
+I32 assert; the plain builder announcing ROWS aborts the same way.
+`tests/python/test_gdn_gate_slots.py` asserts the mode word's definition and use
+in both builders, the CPU op, the OpenCL `supports_op` and the dispatch, the
+`src[8]`/`src[9]` slots and 0051's match, and the replay's own slots; red
+mutations run: the helper on the old slots, the plain builder's mode flipped, the
+CPU op reading `dst->src[6] != nullptr` again, 0051's prepass on the old slots.
+
+`tests/test_gdn_state_rows.cpp` runs both forms on
+the CPU backend at four shapes (one sequence with `ids[0] = 2`, two sequences
+with `ids {1, 3}` or `{2, 3}`, K = 1 and K = 3, three tokens) and requires the
+packed outputs — attention scores and snapshots — byte-identical; the cache is
+wider than the rows used, so a stride read from `nb[3]` cannot add up.
+`tests/python/test_gdn_state_rows.py` reads the patched tree for the switch's
+default, the multi-sequence decline, the fused-op term, the extra-only gather,
+the three archs' row index, `src[6]`, the CPU's `nb[1]` stride and
+`state_rows[iv3]`, both kernels' `rows[seq]` read and the dispatch. Red
+mutations run before restore (`measured-here` on the patched tree): the switch
+flipped on, the `n_seqs != 1` decline dropped, the fused-op term dropped, the
+main rows gathered again, the CPU's row index replaced by the ordinal, the
+Intel kernel's rows term dropped, the dispatch's `use_rows` forced to 0 — each
+made its cell fail; restored, it passes. The Python cell is a source-text
+assertion; the C cell is numeric.
+
+Card arms (owed; Claude runs them in a card window, **not yet measured**):
+1. **`test-backend-ops -o GATED_DELTA_NET`** from the series build on the B60
+   and the A770: `GGML_OPENCL_DEVICES=0:0 ./bin/test-backend-ops -b GPUOpenCL -o
+   GATED_DELTA_NET` (and `1:0` on the A770). The patch adds four rows cases (TG,
+   TG with 2 sequences, verify with K = 3 and 2 sequences, PP-64) whose reference
+   is the CPU rows form, so the kernel's row read is compared directly. Record
+   the pass count with and without the rows cases; expected: every existing case
+   unchanged and the four rows cases pass.
+   Red on the card: take the Intel kernel's `state_base` rows term out
+   (`use_rows ? ... : ...` -> `((ulong)seq * H_v + head) * state_size` in
+   `gated_delta_net_intel.cl`), rebuild, and the four rows cases fail; restore.
+2. **B60 agent (dense 27B), MTP 5, 138K needle from
+   `tests/acceptance/cells/served_check.py`**, two arms in one window:
+   `printf '#!/bin/sh\nexport LLAMA_GDN_STATE_ROWS=1\nexec %s "$@"\n' <arcint-binary> > /tmp/arcint-gdnrows && chmod +x /tmp/arcint-gdnrows`
+   `python3 tests/acceptance/ab.py agent --old <arcint-binary> --new /tmp/arcint-gdnrows --gguf <agent.gguf> --device GPU.0 --assets <assets> --rounds 2 --out /tmp/ab-81-agent`.
+   Record decode, prefill-55k/138k, `draft accept` and the texts md5. Bar: decode
+   >= +2.5 % with the same texts and acceptance (`paper` price +3.8 % TG); if the
+   texts differ or the acceptance counters move, the switch stays off and the
+   finding is recorded.
+3. The same with the coder on the A770 (`--device GPU.1`, `ab.py coder`, MTP 4)
+   and with Flash-Next (B60, MTP 3, IQ3_XXS): answers right, decode recorded.
+4. **The defect's card check (first, before any A/B)**: the served binary with
+   **0051's fold on, the default** (`GGML_OPENCL_FUSE_0051_PART=3` is the
+   default part; unset `GGML_OPENCL_FUSE_0050` = 3) and **every new switch off**
+   (`LLAMA_GDN_STATE_ROWS` unset, `LLAMA_GDN_REPLAY` unset) must start and
+   answer at a short prompt on each unit. Before this fix it crashed at the first
+   GDN node (the CPU op's I32 assert). The ground source is the three units'
+   one-shot arm:
+
+      cd <arcint build>
+      ./bin/arcint --llama-gguf <agent.gguf> --device GPU.0 -p "<a 20-token prompt>" -n 8
+      # the coder on GPU.1, Flash-Next on GPU.0, the same line
+      # expect: exit 0, "GDN gating folded into the kernel for N of N GDN nodes"
+      # in the log, and 8 tokens out
+
+   Red on the card (the pre-fix form, not to be kept): `gdn-gate-inputs.h`'s two
+   assignments back to `src[6]`/`src[7]`; rebuild; the same line crashes with
+   `GGML_ASSERT(src_rows->type == GGML_TYPE_I32)`. Restored, it answers.
+   `test-backend-ops -o GATED_DELTA_NET` stays the kernel's own arm (1).
+
+## 0082-llama-gdn-qk-l2-norm.patch
+
+One l2_norm for the hybrid layers' adjacent q/k head groups, and the bf16 gate
+dispatch read. **Evidence class of the mechanism: `code`** (fork's form:
+`arc-b580/src/models/qwen35.cpp:548-554`, one `ggml_l2_norm` over the joint
+`[head_k_dim, 2*num_k_heads, n_seq_tokens, n_seqs]` view of the conv output,
+then q and k as views of its result). Ours normed q and k separately — two
+`build_gdn_l2_norm` pairs (`rms_norm` + `scale`) over strided views, four nodes
+a layer (`code`: `qwen35.cpp:441-442`, `qwen35moe.cpp`, `qwen4exp.cpp`); the
+fork's Metal bundle measured +7.7 % 2B / +2.6 % 27B for the hybrid bundle,
+`paper`, not separable to this node pair.
+
+The patch adds one device-free helper, `src/models/gdn-qk-l2-norm.h` (ggml.h
+only), holding `build_gdn_l2_norm` and the joint form: a `view_4d` of the conv
+output keeping its group stride (`nb1_qkv`), one `rms_norm(x, eps/n)` and
+`scale(1/sqrt(n))` over it, then q and k as views of the dense result at offsets
+`0` and `num_k_heads * nb[1]`. The same normalisation runs per row, so the bytes
+are the two separate norms' (`exact`; the fork claims byte-identical outputs for
+its fusions, `code`). The three served archs call it; `clef` and `qwen3next`
+share the two-norm form but are not served units and are left as they are.
+
+**Switch `LLAMA_FUSE_QK_L2_NORM`, off by default** (`code`): `1` builds the
+joint form, `0` the two separate norms — byte-identical to before.
+
+**Item 8's second half, the bf16 48-row gate matvec: no missing piece, and the
+dispatch read says so** (`code`). The audit's "not verified, `inferred` from the
+dispatch tables" is now read: bf16 is stored as f16 on device
+(`ggml-opencl.cpp:29086`, `src0t = BF16 ? F16 : type`), and the F16 matvec
+branch (`:29202-29227`) takes `src1->ne[1] <= 8` columns with
+`(src0->ne[1] <= 64 || (src0->ne[1] <= 1024 && src1->ne[1] >= 2))` — a
+`[5120, 48]` gate weight at 1-6 columns takes `kernel_mul_mv_f16_f32_ksplit`
+(one column) or `..._nc` (2-6), a work-group a row, **not** the tiled GEMM.
+The fork's `mmvf.cu` fix (bf16 mat-vec under 64 rows at 2-8 columns,
+10.5 -> 4.4-7.3 us) therefore has no counterpart to port here: the dispatcher
+already routes it there. No kernel work in this patch; the cell asserts the
+conditions, so a future narrowing of them fails it.
+
+Device-free (`measured-here`): `tests/test_gdn_qk_l2_norm.cpp` builds a strided
+conv mix on the CPU backend and compares the joint form's q and k bytes against
+the two separate norms at five shapes (head 4 / 2 k heads / 1 and 3 tokens / 1
+and 2 sequences; head 8 / 3 k heads / 2 tokens / 2 sequences; a compact mix
+without the v tail). The joint form's q and k are views of its dense result, so
+their token stride carries both head groups; the cell walks the views' logical
+elements with their own strides instead of copying linearly.
+`tests/python/test_gdn_qk_l2_norm.py` reads the patched tree: the switch default
+off, the two-norm arm kept in all three archs, the joint view's group stride,
+the k view's head-group offset, and the bf16 matvec conditions. Red mutations run
+before restore (`measured-here` on the patched tree): the switch flipped on, a
+model's two-norm arm dropped, the k view's `num_k_heads *` dropped, the joint
+view's group stride set contiguous, the bf16 row term narrowed to 48 — each made
+its cell fail; restored, it passes. The Python cell is source text; the C cell is
+numeric, and its numeric red was run through the recipe itself: with the joint
+view's group stride taken as the q|k row width (`nb1_qkv` ->
+`ggml_row_size(type, head_k_dim)`), the cell failed every shape whose token or
+sequence stride is exercised (3 of 5: three tokens, two tokens x two sequences,
+the compact two tokens x two sequences), and the one-token shapes passed; the
+fix (restored `nb1_qkv`) makes all five pass. The bug was in this patch's own
+first draft, found by the cell.
+
+Card arms (owed; Claude runs them in a card window, **not yet measured**):
+1. **B60 agent and A770 coder, served, switch off vs on**, two rounds:
+   `printf '#!/bin/sh\nexport LLAMA_FUSE_QK_L2_NORM=1\nexec %s "$@"\n' <arcint-binary> > /tmp/arcint-qk2 && chmod +x /tmp/arcint-qk2`
+   `python3 tests/acceptance/ab.py agent --old <arcint-binary> --new /tmp/arcint-qk2 --gguf <agent.gguf> --device GPU.0 --assets <assets> --rounds 2 --out /tmp/ab-82-agent`
+   and `ab.py coder ... --device GPU.1`. Record decode, prefill, `draft accept`
+   and the texts md5; the bar is >= +2 % bundled with identical answers (`paper`),
+   and the md5/argmax tripwire is the answer-level gate. If no gain, the switch
+   stays off.
+2. **Launch count** before/after: one GDN layer's encoded nodes a token,
+   `GGML_OPENCL_...`? there is no op-count dump; use the served `LLAMA_LOG`
+   graph lines or a counters arm. Owed, stated so.
+3. B60 Flash-Next (IQ3_XXS, MTP 3): answers right, decode recorded — the same
+   A/B form.
+
+## 0083-round-trip-trim.patch
+
+Round-trip discipline on the decode/MTP step, the three cuts that apply to
+this stack, behind one bit mask. `LLAMA_SYNC_TRIM` defaults to **0 here** (all
+bits off, byte-identical to before); the fork's commits below default to 3.
+The mechanisms are `code` at the cited lines; the queue and per-read costs are
+the fork's `measured-here` on its SYCL stack, **not measured on the B60 here**.
+No ggml op or kernel changes, so `test-backend-ops` has no new case; the card
+arm is a served A/B.
+
+**The count, before → after** (code reading, this tree; an MTP verify of 5
+rows, the drafter's per-step read, one attention graph):
+
+| round trip | before | after (bits 1/2/4) | where |
+|---|---|---|---|
+| context synchronizes a verify (5 logit rows + the nextn row) | 6 | 1 | `src/llama-context.cpp` C getters (each `synchronize()`); verify reads at `src/exec/backend_llama.cpp:2611` and `src/exec/llama_spec.cpp:495` |
+| context synchronizes a draft step, head on | 1 | 1 | one nextn getter a step, `src/exec/llama_spec.cpp:632` |
+| context synchronizes a draft step, head off, one lane | 2 | 1 | `src/exec/llama_spec.cpp:635,636` (logits and nextn, same step) |
+| KV rotation inputs uploaded a graph (target verify and draft alike) | 2 split inputs, 2 blocking copies, ~272 KB | 0 | `src/llama-kv-cache.cpp:1692,1708` (builders), `:2066,2078` (setters) |
+| small device→host reads for a batch's sampled ids, n rows | n | 1 | `src/llama-context.cpp:3242` (one copy); per-row read stays the fallback |
+
+Bit 1 (`code`, fork 60ef575f3b): `synchronize()` returns before the device wait
+when `!sync_pending` and not under pipeline parallelism; `sync_pending` is set
+at encode, decode, graph compute and the epoch iterator, cleared at the wait
+(`llama-context.cpp:1778`, `:2573`, `:2872`, `:3846`, `:4943`). A getter after
+the first on a clean context finds its results already complete; it cannot wait
+for another context's work (the one in-order queue is shared).
+
+Bit 2 (`code`, fork 4ec75c3416): the cache allocates `attn_rot_dev` once in its
+own buffer type when there is one non-host buffer (`llama-kv-cache.cpp:389`),
+fills it once from `attn_rot_hadamard`, and `build_input_k_rot/v_rot` return
+those tensors; `set_input_*_rot` skip a non-input tensor. Same Hadamard values,
+copied once instead of uploaded a graph. `attn_inp_k_rot` is 256×256 f32,
+`attn_inp_v_rot` 64×64.
+
+Bit 4 is the form of "one id read where there are several" that applies here
+(`code`): with backend samplers, decode copied each sampled id with its own
+small async read (`copy_tensor_async_rows`). The graph now concatenates the
+batch's sampled ids into one I32 tensor after the sampler chains
+(`llama-graph.cpp:4352`, n_rows−1 tiny CONCAT kernels) and decode reads it once
+(`llama-context.cpp:3242`); the same integers in the same row order. This bit
+is **not on arcint's served path today**: arcint samples in its own `Sampler`
+and does not use backend sampling. The fork's draft-chain form (all draft ids
+of a one-graph chain, fork b0376aec39, ~0.2 ms a small read there) does not
+apply: arcint's drafter runs one graph a draft step, each step's token being
+the next step's input, and the expert-route trace's ids are already one batch
+(patch 0069).
+
+Switch-off equivalence: bits 0 leave each call as it was — the same returns,
+the same blocking copies, the same per-row reads. Bits on change only the
+number of waits and copies, never a value.
+
+Red cases, each run and seen failing before it was restored (device-free cell
+`tests/python/test_round_trip_trim.py`, `ctest -L unit`, `round-trip-trim`):
+(a) `LLAMA_SYNC_TRIM` default 0 → 3: the default-off cell fails; (b) the
+predicate's `!sync_pending` dropped: the predicate cell fails; (c) the
+device-rotation return dropped from `build_input_v_rot`: the rotation cell
+fails; (d) the sampled-id concat's bit 4 → 8: the one-read cell fails.
+
+Recipe: `~/bin/arcint-recipe.sh ~/src/ligence-gaps-b gaps-b580-b` — green,
+18/18 unit tests (2026-11-02), the patch applies on the pin.
+
+Card arm (Claude, one announced window, no GPU run here): the same-binary
+served A/B with the switch off against bits 1+2+4 on, two runs each, alternated;
+the answers and the answer-level bar (facts, needle, task), decode and prefill
+per phase. Exact commands, with the binary named by the package under test:
+
+    cp bin/arcint /tmp/arcint-trim
+    printf '#!/bin/sh\nexec env LLAMA_SYNC_TRIM=0 /tmp/arcint-trim "$@"\n' > /tmp/arm-off; chmod +x /tmp/arm-off
+    printf '#!/bin/sh\nexec env LLAMA_SYNC_TRIM=7 /tmp/arcint-trim "$@"\n' > /tmp/arm-on;  chmod +x /tmp/arm-on
+    python3 tests/acceptance/ab.py flashnext --old /tmp/arm-off --new /tmp/arm-on \
+        --gguf <model.gguf> --device GPU.<N> --assets <dir> --rounds 2
+    python3 tests/acceptance/ab.py agent     --old /tmp/arm-off --new /tmp/arm-on \
+        --gguf <model.gguf> --device GPU.<N> --assets <dir> --rounds 2
+
+Bar: decode (the target phase with MTP on) improves; prefill stays inside the
+run's spread. The fork's own numbers (2 syncs + 2 blocking copies a graph,
+~0.2 ms a small read) are its stack's; the B60 price is this window's to say.
+
+Window 58 (`measured-here`, 2 rounds an arm, the bundle `LLAMA_MTP_KV_ONLY=1 LLAMA_SYNC_TRIM=2` against off):
+the coder (A770) PASS, texts md5 identical, decode +1.8 / +2.0 / +1.8 %, prefill-41k 729.75 -> 777.80 (+6.6 %);
+the agent (B60) PASS, md5 identical, prefill equal (55k 715.85 -> 714.95, 138k 503.25 -> 502.70); Flash-Next (B60)
+PASS, prefill equal, decode 32.40 -> 32.90 inside a 4 % run spread. Window 57 (one run each) put the coder's
+prefill gain on 0080 and its decode gain on 0083 bit 2.
+
+
+## 0084-llama-fast-topk.patch
+
+The long vocabulary's top-k, selected straight from the logits row
+(`code`, fork a3586a10d8). The top-k sampler partial-sorts a candidate array
+built over the whole vocabulary; over 248320 entries that is a full copy plus
+`std::partial_sort` per sample. `llama_top_k_from_logits` (new, declared in
+`include/llama.h`, defined in `src/llama-sampler.cpp`) starts from the k first
+entries, replaces the heap top by every strictly larger logit in index order
+and sorts the heap — the steps of libstdc++ `std::partial_sort`, so entries
+and the order of equal logits are identical, ties, NaN and inf included. No
+rounding, no reordering.
+
+**Count, before → after**: a sample's candidate work goes from 248320 entries
+built and partial-sorted to k entries' heap plus one scan. The entry count is
+`code`; the microseconds the fork measured (200K entries, k=1 241→9.6 µs,
+k=10 647→71 µs; +1.9 % greedy and +1.85 % Hermes decode with MTP) are
+`measured-here` on its stack, not on the B60 here.
+
+The patch is a library entry point; the switch lives at its caller, arcint's
+`Sampler::collect_candidates` (`src/core/sampler.cpp:1107`): with
+`LLAMA_SAMPLER_FAST_TOPK=1` (default **0**) and `top_k > 0` and the top-k
+smaller than the vocabulary, the row's top-k comes from the helper; otherwise
+the old full-array path runs unchanged, byte-identical. The probe path
+(`top_k <= 0`, 2048 candidates) and the full-sort fallback keep
+`std::partial_sort`. A future llama common-sampler caller can use the same
+entry point; the common library is not built by arcint (`LLAMA_BUILD_COMMON
+OFF`), so nothing in the product changes with the patch alone.
+
+The exactness cell is device-free: `tests/test_fast_topk.cpp` checks the
+helper against `std::partial_sort` over random arrays at 64/1024/4096/248320
+entries, k 1/2/10/128/2048, 40 arrays a shape, plus ties, all-equal, NaN and
+inf (the fork's own test shape). It runs in the `unit` ctest. Red mutation, run
+and seen failing before it was restored: the tie guard `>` made `>=` in both
+scan loops (`if (logits[i] >= heap[0].logit)`) — the tie and all-equal cells
+fail (`FAIL fast_topk_ties_keep_the_partial_sort_order`,
+`FAIL fast_topk_all_equal`). Rows with the mutation: 17 of 18 ctests passed,
+`unit` failed at `test_fast_topk.cpp:55/56`.
+
+Recipe: `~/bin/arcint-recipe.sh ~/src/ligence-gaps-b gaps-b580-b` — green,
+18/18 (2026-11-02). No `test-backend-ops` case: no ggml op changes.
+
+Card arm (Claude, one announced window): the same-binary served A/B with
+`LLAMA_SAMPLER_FAST_TOPK=0` against `1`, two runs each, alternated, on the
+agent (Hermes-style top_k 20) and greedy/MTP; answers the same bytes, decode
+improves. Exact commands:
+
+    cp bin/arcint /tmp/arcint-topk
+    printf '#!/bin/sh\nexec env LLAMA_SAMPLER_FAST_TOPK=0 /tmp/arcint-topk "$@"\n' > /tmp/arm-old; chmod +x /tmp/arm-old
+    printf '#!/bin/sh\nexec env LLAMA_SAMPLER_FAST_TOPK=1 /tmp/arcint-topk "$@"\n' > /tmp/arm-new; chmod +x /tmp/arm-new
+    python3 tests/acceptance/ab.py agent     --old /tmp/arm-old --new /tmp/arm-new \
+        --gguf <model.gguf> --device GPU.<N> --assets <dir> --rounds 2
+    python3 tests/acceptance/ab.py flashnext --old /tmp/arm-old --new /tmp/arm-new \
+        --gguf <model.gguf> --device GPU.<N> --assets <dir> --rounds 2
+
+Bar: the answer-level gate (the same answers, mean KL no worse than the
+baseline arm's by 0.03 nats, argmax agreement down by at most 1 point);
+decode improves, prefill stays inside the run's spread.
+
+## 0086-ggml-gdn-replay-op.patch
+
+The gated delta-net's rollback by replay, the op and its CPU reference. Ours
+rolls a recurrent sequence back by keeping whole state snapshots (patch 0050):
+`n_rs_seq + 1` S planes per layer, and a verify's rollback reads the plane. The
+fork keeps one base state and, for each token after it, a record of the step's
+own small vectors — the value delta (`S_v * H` floats), the key (`S_v * H`) and
+the gate (`H`) — and re-applies them onto the base on rollback, so a rollback
+costs `R = H * (2 * S_v + 1)` floats per token a layer instead of a whole
+`S_v * S_v * H` plane. **Evidence class of the mechanism: `code`** (fork
+`arc-b580`: `ggml/include/ggml.h:599`, the CPU reference
+`ggml-cpu/ops.cpp:10998-11134`, "a replayed record repeats exactly its state
+update (scale by g, then mad k * delta)"); quality class `exact` (`paper`: the
+fork's replay == snapshot chain test; our device-free chain is below).
+
+The op `ggml_gated_delta_net_replay(ctx, q, k, v, g, beta, state, rec, ctrl, K)`
+appends `GGML_OP_GATED_DELTA_NET_REPLAY` to the enum (last, so no existing op
+number moves; `GGML_OP_COUNT` 103). `rec` is F32 `[R * (K - 1), 2, n_seqs]`
+(two banks), `ctrl` I32 `[2, n_seqs]` = `{n_rec, bank}`: `n_rec` records of
+that bank are replayed onto the input state before the new tokens. The packed
+output is `[attention `S_v*H*n_tokens` | base state `S_v*S_v*H` | records
+`(K-1)*R`]`; the base is the state after token `n_tokens - 1 - m`,
+`m = min(n_tokens - 1, K - 1)`, and one record per later token. `n_tokens == 0`
+replays the stored records only and returns the base. The CPU reference is
+bit-identical to the snapshot path's per-token step: scale the state by
+`exp(g)`, then mad each value row with `k * delta`; the record stores the delta
+per value row, the key per key row and the gate per head.
+
+**The node's own slots** (`code`, patch 0081's contract): the replay builder sets
+`op_params[1] = GGML_GDN_MODE_REPLAY`; `src[6]` is this op's records and `src[7]`
+its control, and both its CPU reference and its OpenCL consumer assert the mode
+word, so a node of another GDN form (or a raw gating projection of 0051, which
+rides `src[8]`/`src[9]` since 0081) can never reach this body. src[6] was taken
+three times before 0081 (0051's alpha, the rows index, these records); the
+replay op is a different op number, so with the gating slots moved and the mode
+words in place nothing crosses.
+
+**Device-free (`measured-here`)**: `tests/test_gdn_replay.cpp` runs a three-step
+chain (5 tokens, 3 with a rollback of 2, then 1; S 16, H 4, K 5) through both
+forms on the CPU backend and requires every step's attention output and the
+final base state byte-identical. `tests/python/test_gdn_replay.py` reads the
+patched tree for the enum's position, the packing, the prologue's operation
+order, the record write, the dispatch and the chain case. Red mutations, each
+run and failing before restore (`measured-here`): the prologue's mad dropped,
+the record's gate written as 0 — each fails the C chain; the Python cell's own
+faults are listed under 0087. The Python cell is source text; the C cell is
+numeric. The cards' arm is the replay-chain case in `test-backend-ops`
+(`exact=true` compares the replay and snapshot chains, max `|diff|` must be 0).
+
+## 0087-gdn-replay-memory-opencl.patch
+
+The memory, graph, models and the Intel OpenCL kernel for the replay. The
+decision is taken in `llama_memory_recurrent`'s constructor, before the tensors
+are created: `LLAMA_GDN_REPLAY` non-zero, `n_rs_seq > 0`, one sequence
+(`n_seq_max == 1`, `mem_size == 1`), offload, a qwen35/qwen35moe/qwen4exp model,
+F32 S, `S == 128`, `ssm_d_inner == S*H` and `n_embd_s() == S*S*H`, both banks of
+records fitting one S row, and every recurrent layer on the OpenCL backend
+(`code`). Any other model silently keeps the snapshot path. With replay on, S
+allocates `mem_size * 2` rows (plane 0 base, plane 1 two record banks); the
+snapshot planes `2..n_rs_seq` are not allocated. The conv state keeps all its
+planes in both modes.
+
+Rollback (`seq_rm`) reduces the sequence's pending record count instead of
+moving the snapshot index; a rollback beyond the kept records warns ("cannot
+roll back %d tokens, only %u kept") and declines. A whole-sequence removal
+resets the pending records with the cells, so no stale record is replayed onto
+a cleared state. Each launch takes the base
+from plane 0 at its row and toggles the record bank; a state save with pending
+records writes header `s_trans = 2` and the records after the S rows, and the
+reader takes `s_trans == 2` only in replay mode — a snapshot reader rejects it
+as incompatible rather than load a stale state (`code`).
+
+Replay and the rows form of patch **0081 combine by exclusion**: replay's
+`inp->s_rpl_ctrl` set makes the models take the replay branch and
+`llama_gdn_state_rows_enabled` is not consulted, so a replay run reads its base
+through its own row indices and does not use `s_rows`. With replay off and
+either switch as before, the rows form and the snapshot path are unchanged and
+byte-identical. With replay on and rows off, the replay is the one in use.
+
+OpenCL: `gated_delta_net_intel.cl` gets a `GDN_RPL` build of the generation
+kernel with the replay prologue (re-applying `n_rec` records in the step's own
+order: `S = fma(k, delta, g*S)` row by row, the same sub-group reduction) and
+the epilogue (base once, one record per later token: delta per value row, key
+per key row, gate per head). The program is built only when the switch is on
+(`code`: the fork's SYCL kernel has the same prologue and epilogue); the decode
+price is not measured here — the card arm below measures it. If the device
+refuses the build the kernel stays null and the op runs on the CPU.
+`supports_op` takes F32 state, a scalar gate, F32 records and I32 control,
+`S_v == 128` and the node's REPLAY mode word (patch 0081's contract), and the
+dispatch asserts the same before it reads `src[6]`/`src[7]`; the dispatch passes 30 arguments with `{H_v*sg, n_seqs,
+S_v/rows}` work-groups. With the switch off, the backend's programs, kernels,
+arguments and bytes are as before.
+
+**VRAM saved, from the shapes (`code`; the three served units)**: one S plane is
+`S_v * S_v * H * 4` bytes a layer, and replay frees `n_rs_seq - 1` of them a
+layer (conv state untouched). Agent (Qwen3.8-27B, 65 blocks, interval 4 -> 49
+recurrent layers, `S_v 128`, `H = 6144/128 = 48`, 3 MiB a plane, MTP 5 ->
+`n_rs_seq 5`): **588 MiB**. Flash-Next (`qwen4exp`, 48 blocks, interval 4 -> 36
+recurrent, `H = 6144/128 = 48`, 3 MiB, MTP 3 -> `n_rs_seq 3`): **216 MiB**.
+Coder (`qwen35moe`, 41 blocks, interval 4 -> 31 recurrent, `H = 4096/128 = 32`,
+2 MiB, MTP 4 -> `n_rs_seq 4`): **186 MiB**. The interval is the hparams default
+4 used where the GGUF does not carry `full_attention_interval`; a model that
+carries a different interval scales linearly with its recurrent-layer count.
+The audit's fork figure is 432 MiB (48 recurrent x 3 freed planes x 3 MiB at
+`n_rs_seq 4`, `paper`).
+
+**Device-free (`measured-here`)**: the C chain above plus
+`tests/python/test_gdn_replay.py` — the switch's default off and the
+`atoi(env) != 0` term, `n_rows_s = rpl ? mem_size * 2 : n_rows`, the rollback's
+pending-record bound and warp, `s_trans = 2` and the records' save/read, the
+rows exclusion in both qwen35 and qwen4exp, the replay branch's op and the
+record cpy/set-rows, the `GDN_RPL` kernel's prologue `fma`, the epilogue's
+record writes and the host's build gate. Red mutations, each run and failing
+before restore (`measured-here` on the patched tree): the CPU prologue's mad
+dropped and the record's gate written as 0 — each fails the C chain (first
+differing element 640, `FAILED: 2`) and the Python cell; `n_rows_s` left at
+`n_rows`; the kernel's prologue `fma` rewritten as `a*b + c*d`; the switch's
+comparison flipped to `== 0`; the whole-sequence pending reset dropped. Restored,
+`ctest -L unit` is 26/26. `GGML_OPENCL_DEVICES` and the recipe
+builds stay the same; nothing is built for the switch when it is off.
+
+**Card arms (owed; Claude runs them in a card window, not yet measured)**:
+1. Sequential arms on the B60 (`GGML_OPENCL_DEVICES=0:0`) and the A770
+   (`GGML_OPENCL_DEVICES=1:0`), one fresh process an arm:
+   `LLAMA_GDN_REPLAY=1 ./bin/test-backend-ops -b GPUOpenCL -o GATED_DELTA_NET_REPLAY`
+   and the same without the env for `GATED_DELTA_NET`; the replay-chain cases
+   (chains A/B, 4 shapes) must pass at max `|diff| 0`, and the existing
+   snapshot cases must be unchanged. Red on the card: rewrite the kernel's
+   prologue `fma` as `a*b + c*d`, rebuild, and the chain cases fail; restore.
+2. Served arm, agent (dense 27B), MTP 5, 138K needle:
+   `printf '#!/bin/sh\nexport LLAMA_GDN_REPLAY=1\nexec %s "$@"\n' <arcint-binary> > /tmp/arcint-gdnrpl && chmod +x /tmp/arcint-gdnrpl`
+   `python3 tests/acceptance/ab.py agent --old <arcint-binary> --new /tmp/arcint-gdnrpl --gguf <agent.gguf> --device GPU.0 --assets <assets> --rounds 2 --out /tmp/ab-87-agent`.
+   Record decode, prefill-55k/138k, `draft accept`, the texts md5, and peak
+   VRAM (fdinfo) — expected ~588 MiB lower at MTP 5 from the shapes above.
+   Bar: answers and texts equal, `draft accept` unchanged, peak VRAM lower by
+   the stated amount; decode recorded. If a text differs or the acceptance
+   moves, the switch stays off and the finding is recorded.
+3. The same with Flash-Next on the B60 (MTP 3, IQ3_XXS; expected ~216 MiB) and
+   the coder on the A770 (MTP 4, `--device GPU.1`; expected ~186 MiB). Record
+   each; a rollback-heavy verify (a long draft, repeated cuts) is the one to
+   watch.
+
+## 0088-opencl-gqa-int8-qk.patch
+
+The GQA decode kernel's Q Kᵀ on the XMX units straight from the quantized
+cache: Q rows quantized to int8 once a call (one RNE scale per row per 32-dim
+block), the q8_0 key block's raw 32 code bytes as the DPAS B operand, the
+integer result scaled by `dq[row][block] * dk[key][block]`; P V stays f16 DPAS.
+Opt-in, `GGML_OPENCL_FA_GQA_I8=1`; off by default, where the source compiles to
+the f16 form it was and no helper text is prepended (behaviour unchanged).
+
+The mechanism is the fork's DPAS decode attention (`code`:
+`arc-b580/ggml/src/ggml-sycl/fattn-dec.cpp:688-747`, its inline
+`xe2-dpas.hpp:15-42`): A is Q as s8, B the raw keys, one key a lane, the int
+accumulator scaled a block in float. The s8 x s8 operand packing is 0071's
+(`code`: `mul_mm_kq_i8.cl:109`, the strided `intel_sub_group_block_read_us8`
+over a row-major [row][32 codes] tile — lane l gets dims (2l, 2l+1) of each of
+8 rows), which is why Q's codes are stored in dim order; the fork's s8 x s4
+packs its nibbles as dims i and i+16 a byte, so its a short is
+`(code[l], code[l+16])` (`code`: `fattn-dec.cpp:721-731`). The local form of that read is
+`cl_intel_subgroup_local_block_io`, enabled in the kernel. The
+fork's B is s8 x s4 over q4_0 bytes; ours is the public
+`intel_sub_group_i8_i8_matrix_mad_k32` over q8_0 bytes, which is what arcint's
+agent and coder caches hold. Its premise is arcint's measured 0018 fact
+(`measured-here`: direct quantized K made every sub-group convert the same
+blocks, 30.7 t/s against 52.6 staged at 32k), which the raw-byte operand
+removes.
+
+- **Q once a call** into local memory: [tile][block][lane][row] shorts and
+  [tile][block][row] scales, by the work-group's own threads (not a
+  per-sub-group pass). The quantizer, the q8_0 block offsets and the staged
+  row stride are one text (`fa_gqa_i8_ops.inc`, the 0071 pattern: the backend
+  prepends it to the kernel program and the device-free test includes it).
+  RNE (`rint`), scale `amax / 127`, code `round(x / scale)`, clamp-free
+  because the scale is the block's amax; a zero row keeps dq 0 and codes 0.
+  The codes are written ascending dims into a row-major [row][32] tile; the
+  DPAS a operand reads that tile with the strided block read, not per lane.
+  Evidence: the fork's form (`code`) and ggml's q8_0 block layout (`code`,
+  `ggml-common.h`).
+- **B straight from the cache**: block `b` at byte `34 b`, codes at `+2`, a
+  lane's 32 bytes packed into 8 ints; the block's half `d` is `dk`. Earned
+  from the fork's same bytes-vs-conversion split (`code`).
+- **Scale order**: DPAS is integer, so the 32-block product is exact and is
+  converted to float, multiplied by the row's `dq` vector and the key's `dk`,
+  and added to the f32 S. The fork accumulates the same way (`code`).
+- **P V** is unchanged: P is S shortened to half, V is staged f16, the f16
+  DPAS chain (`code`).
+- **Which pairs**: only q8_0 K (KT 1), the 8:8 and 8:4 caches, at head sizes
+  256 and 128. A q4_0 K (the refused 4:4 pair) keeps the f16 form: the public
+  OpenCL extension has no s8 x s4 k32, and the fork's inline vISA is Xe2
+  SIMD16 only. Not taken (`code`).
+- **Sub-groups**: the kernel is built for sub-group 16 only (0016: 16 lanes are
+  a key tile's 16 keys, the 8x16x32 form), and the int8 builtin is that
+  sub-group's. The A770 (DG2, sub-group 8) cannot take this form from the
+  code: 0071's record has the s8 DPAS kernel SG16-only and the A770's path
+  f16 (`measured-here`, 0071 round 3), and the fork's own s4 vISA is
+  `dpas.s4.s8.8.8 (M1,16)`. The A770 keeps 0015's split kernels; no SG8 int8
+  form is built.
+- **Row cap**: the dispatch's `(n_head / n_head_kv) * n_q <= 64` stands. The
+  agent's 24-on-4 (G 6) takes 6 rows = 36; the coder's 16-on-2 (G 8, head 256)
+  takes 6 rows = 48. Both are inside the cap (`code`).
+- **Quality**: rounding-only (the Q int8 adds one rounding), as the audit
+  classes it (`code`); judged at the answer-level bar, not bit equality.
+
+**The Q staging's extent — the card's defect** (`measured-here`, the card host,
+2026-11-02): `GGML_OPENCL_FA_GQA_I8=1 GGML_OPENCL_FA_GQA_MIN_ROWS=1`, head size
+256: **135 of 135 FLASH_ATTN_EXT cases failed, ERR ~0.10 NMSE** against the
+5e-4 bound (e.g. `FLASH_ATTN_EXT(hsk=256,hsv=256,nh=8,nr23=[4,1],kv=1024,
+nb=32,mask=1,...,type_K=q8_0,type_V=q8_0)`), while the f16 arm passed the same
+geometry. Cause (`code`): the staging loop enumerated `(row, block)` pairs up
+to `min((n_rows + 7) / 8, 8) * QB` — the row-**tile** count times the blocks a
+row — instead of the rows a call. It wrote only the first `tiles` rows of a
+tile (`rt_max` pairs per block, `r = e / QB`), so every other row of the a
+operand was whatever the local allocation held and its S was that garbage; a
+uniform-ish garbage S averages the V rows, which is the ~0.10. n_rows is
+`G * n_q` (the agent 6 a row, 36 at 6 rows; the coder 8 and 48), so at least
+5 of 6, and at least 7 of 8 rows, were unstaged in every routed case — the
+same ERR for all of them. 0.10 is a layout error, not int8 rounding: the
+device-free S selftest quantized every row itself and modelled no staging, so
+it stayed green. Fix: the extent is one text, `fa_gqa_i8_stage_rows(n_rows)` in
+`fa_gqa_i8_ops.inc` (the kernel and the cell read the same helper) — every row
+of every row tile, capped at the 8 tiles the a operand holds, rows past
+`n_rows` zeroed with `dq` 0 like the f16 path's zero Q row.
+
+Expected after the fix (`measured-here`, the f16 arm's own bound): the same
+cases pass at **NMSE <= 5e-4**, the f16 path's order plus the one int8 Q
+rounding; the S-level bound the cell states is max abs (int8 - f16) <= 1e-2 *
+max|S| (0.6 % measured on the model), and the case's NMSE should land at the
+f16 arm's own ~1e-4 to low-1e-4, not above 5e-4.
+
+Device-free (`measured-here`, the recipe host):
+
+- `tests/test_fa_gqa_i8.cpp` (built in the `unit` ctest): the q8_0 block
+  offsets, the RNE quantizer against an independent `nearbyint` reference with
+  the .5 corners, and the (b) S selftest **at the operands the kernel builds**:
+  the staged a-operand tile (the helper's `(row, block)` pairs, a poison
+  pattern wherever the staging does not reach), the strided block read that
+  gives lane l dims (2l, 2l+1) of each row, the b operand as the lane's key
+  (8 ints, ascending dims), and the systolic dot4 pairing per stage d (the
+  shorts of lanes 2d, 2d+1 against the b dword d), scaled by
+  `dq[row][block] * dk[key][block]` — against the f16 form, at the agent's and
+  the coder's row counts (6, 8, 36, 48), stated bound max abs (int8 − f16) ≤
+  1e-2 × max|S| (prints the measured value), plus the staging-extent cell
+  (`fa_gqa_i8_stage_rows` covers every row of every tile the batch needs).
+- `tests/python/test_fa_gqa_i8.py` (the `unit` ctest, `LLAMA_SRC`): the switch
+  defaults off, `-DGQA_I8=1` and the helper prepend only on a KT 1 arm, the
+  staged form a second build only with the switch, the 1-3 row routing under
+  `GGML_OPENCL_FA_GQA_MIN_ROWS`, and the kernel's `#if GQA_I8 && KT == 1`,
+  raw-code B operand and f16 P V.
+- Red mutations, each committed on a throwaway branch, built and run through
+  the recipe before restored (`measured-here`, 25 of 26 ctests, the two cells
+  red; the last full run is the green 26/26):
+  (a) the switch's default flipped on (`atoi` dropped) →
+  `FAIL test_switch_is_default_off`;
+  (b) the KT 1 guard dropped (`i8_arm = fi8_on`) → the same default-off cell
+  at its `gkv[i][0] == 1` assertion;
+  (c) the staged dispatch dropped (`n_q < 4` → `false`, 0089) →
+  `FAIL test_routing_takes_the_staged_form_for_1_to_3_rows`;
+  (d) `fa_gqa_i8_qs` reads `34 b + 18` instead of `+2` →
+  `FAIL offset: codes start` and `FAIL s-tile: max abs error 5.176399 above
+  the stated bound 1e-2 * max|S| = 0.208869`;
+  (e) `FA_GQA_I8_RINT` truncated to `(int) x` →
+  `FAIL quant: 1.5 -> 1, want 2 (RNE)` (the S selftest stays inside the bound
+  at 0.6172 % — truncation alone is small, which is why the .5 corners exist);
+  (f) `fa_gqa_i8_stage_rows` returning the tile count (the pre-fix extent, no
+  `* 8`) → the S cells fail on every row the staging did not reach (the model's
+  poison), the staging-extent cell fails, and `tests/python/test_fa_gqa_i8.py`'s
+  extent cell fails — the card's 135 of 135 at ERR ~0.10.
+  The card red is (d) too: every new FLASH_ATTN_EXT case at 1-6 rows fails
+  with it. (f)'s card red is the measured defect above.
+
+Card arms (owed; Claude's announced window), the exact commands:
+- correctness and (a)/(c): the new cases are
+  `test-backend-ops test -o FLASH_ATTN_EXT` at the agent's geometry
+  (256, 256, 4, {6, 1}) and the coder's (256, 256, 2, {8, 1}), 1/2/3/4/6 rows,
+  KV 1,013, 4,096 and 131,072, q8_0/q8_0 and q8_0/q4_0, added at the eval
+  list. Run both arms of the switch on the same binary:
+
+      cd <llama tree with 0001-0089>
+      cmake -B build -DGGML_OPENCL=ON -DLLAMA_CURL=OFF
+      cmake --build build -j --target test-backend-ops
+      GGML_OPENCL_DEVICES=0:0 ./build/bin/test-backend-ops test -o FLASH_ATTN_EXT
+      GGML_OPENCL_DEVICES=0:0 GGML_OPENCL_FA_GQA_I8=1 GGML_OPENCL_FA_GQA_MIN_ROWS=1 \
+          ./build/bin/test-backend-ops test -o FLASH_ATTN_EXT
+      # perf (us/run), both arms:
+      GGML_OPENCL_DEVICES=0:0 ./build/bin/test-backend-ops perf -o FLASH_ATTN_EXT
+      GGML_OPENCL_DEVICES=0:0 GGML_OPENCL_FA_GQA_I8=1 GGML_OPENCL_FA_GQA_MIN_ROWS=1 \
+          ./build/bin/test-backend-ops perf -o FLASH_ATTN_EXT
+      # red (a) on the switch-on arm: fa_gqa_i8_qs -> 34 * b + 18, rebuild, the
+      # 1-6 row cases fail; restore.
+      # red (f) on the switch-on arm: fa_gqa_i8_stage_rows returns `tiles`
+      # (the pre-fix extent), rebuild, every routed case fails at ERR ~0.10;
+      # restore, and the same cases pass at NMSE <= 5e-4 (the f16 arm's bound).
+      # A770: the same two runs; the GQA kernel is SG16-only, so both arms
+      # must pass identically (0015's kernels serve).
+- **(f)'s card check is the defect's, run first**: the switch-on arm at head
+  size 256, every case of it:
+
+      GGML_OPENCL_DEVICES=0:0 GGML_OPENCL_FA_GQA_I8=1 GGML_OPENCL_FA_GQA_MIN_ROWS=1 \
+          ./build/bin/test-backend-ops test -o FLASH_ATTN_EXT -p hsk=256
+      # expect: every routed case PASS at NMSE <= 5e-4; the f16 arm
+      # (GGML_OPENCL_FA_GQA_I8 unset) is the same list's bound.
+      # before the fix: 135 of 135 FAIL, ERR ~0.10.
+- (b) on the card: the eval list's q8_0 cases already compare each arm against
+  the CPU reference at the same 16-key tile geometry; the S-level comparison
+  itself is the device-free cell above (the DPAS s8 product is the exact
+  integer contraction, so the only difference is Q's rounding, which that cell
+  bounds). A separate on-card DPAS-vs-f16-DPAS probe was not built.
+- served A/B: agent and coder, `GGML_OPENCL_FA_GQA_I8=0` against `1` with
+  `GGML_OPENCL_FA_GQA_MIN_ROWS=1`, two rounds each, alternated:
+
+      cp bin/arcint /tmp/arcint-gqai8
+      printf '#!/bin/sh\nexec env GGML_OPENCL_FA_GQA_I8=0 /tmp/arcint-gqai8 "$@"\n' > /tmp/arm-off; chmod +x /tmp/arm-off
+      printf '#!/bin/sh\nexec env GGML_OPENCL_FA_GQA_I8=1 GGML_OPENCL_FA_GQA_MIN_ROWS=1 /tmp/arcint-gqai8 "$@"\n' > /tmp/arm-on; chmod +x /tmp/arm-on
+      python3 tests/acceptance/ab.py agent --old /tmp/arm-off --new /tmp/arm-on \
+          --gguf <agent.gguf> --device GPU.<N> --assets <assets> --rounds 2 --out /tmp/ab-88-agent
+      python3 tests/acceptance/ab.py coder --old /tmp/arm-off --new /tmp/arm-on \
+          --gguf <coder.gguf> --device GPU.<N> --assets <assets> --rounds 2 --out /tmp/ab-88-coder
+- KL (agent, q8_0:q4_0, MTP 5's 6-row ubatches so every attention call is the
+  verify path; coder, q8_0:q4_0, MTP 4's 5-row ubatches), 16 x 512 against the
+  arm's own Q8_0 reference capture, mean KL and argmax agreement against the
+  baseline arm's, bar +0.03 nats / −1 point:
+
+      GGML_OPENCL_DEVICES=0:0 GGML_OPENCL_FA_GQA_I8=0 ./build/bin/llama-perplexity \
+          -m <agent.gguf> --no-repack -lm mmap -ctk q8_0 -ctv q4_0 -fa 1 -ub 6 -b 6 \
+          -c 512 --kl-divergence-base <agent-ref.kld> --kl-divergence /tmp/kl-off.log
+      GGML_OPENCL_DEVICES=0:0 GGML_OPENCL_FA_GQA_I8=1 GGML_OPENCL_FA_GQA_MIN_ROWS=1 \
+          ./build/bin/llama-perplexity -m <agent.gguf> --no-repack -lm mmap -ctk q8_0 -ctv q4_0 \
+          -fa 1 -ub 6 -b 6 -c 512 --kl-divergence-base <agent-ref.kld> --kl-divergence /tmp/kl-on.log
+      # the same with -ub 5 for the coder
+- Task battery: the acceptance task at T=0 with thinking off, the agent's and
+  the coder's protocols, 10 cases, answers equal or better (the task is the
+  answer-level gate; the KL arm above is the numeric one).
+
+Status (`code`, `measured-here`): built, device-free green, off by default, no
+card number yet; the defaults stay off until the operator's A/B. The gate's
+per-layer bar is the audit's: the 6-row call below 0016's 4.83 ms at 131k and
+the 1-row call below 0015's 1.91 ms, answers right, KL inside 0.03 nats.
+
+Served price (windows 58 and 60, the agent on the B60, a 115,395-token prompt, one run an arm, the same answer
+in every arm, `measured-here`): decode off 21.03 t/s, `GGML_OPENCL_FA_GQA_I8=1` alone 15.83 (-25 %),
+`GGML_OPENCL_FA_GQA_MIN_ROWS=1` (0089) alone 19.05 (-9 %), both 13.27 (-37 %). Not a verdict on the fork's
+technique: its build is SYCL s8 x s4 over q4_0 keys, ours OpenCL s8 x s8 over q8_0 keys with Q quantized a call
+into local memory. test-backend-ops perf cannot price the q8_0 arms (its quantized cases rebuild the SoA every
+call); its f16 single-row case shows MIN_ROWS=1's cost alone (1.91 -> 2.29 ms at 131,072 keys).
+
+
+## 0089-opencl-gqa-staged-1-3-rows.patch
+
+The 1-3 row form on the same DPAS kernel: a key tile's raw q8_0 rows are
+copied into local memory once a work-group (coalesced dword loads, the row
+68 dwords at head size 256, the staged stride 69 so lane = key reads spread
+over banks) and every lane reads its own block of 32 codes from there instead
+of the direct form's per-lane global gather. It is the fork's ST mode (`code`:
+`fattn-dec.cpp:703-731`, launched for nq == 1; its measured 48K 1-token
+433 -> 244 us with the one-wave split count, `paper`). The same source, a
+second program with `-DGQA_ST=1`, built only when `GGML_OPENCL_FA_GQA_I8=1`
+and only for the q8_0 K pairs (KT 1); the program already carries
+`-cl-intel-256-GRF-per-thread`, the fork's 256-register launch.
+
+- **Routing**: rows below `GGML_OPENCL_FA_GQA_MIN_ROWS` take the staged kernel
+  when it was built (so `GGML_OPENCL_FA_GQA_I8=1 GGML_OPENCL_FA_GQA_MIN_ROWS=1`
+  routes 1-3 rows); 4+ rows and any pair without a staged form take the direct
+  kernel; a failed staged build falls back to the direct kernel and logs a
+  WARN. With the switch off the staged array is empty and `MIN_ROWS` keeps its
+  default 4, so nothing changes (`code`).
+- **What is staged**: K as raw bytes, V as f16 (0019's transposed staging,
+  unchanged); the Q int8 quantization of 0088 and P V's f16 DPAS are unchanged
+  (`code`).
+- **Quality**: rounding-only, the same one Q rounding as 0088; no new one.
+- **The Q staging's extent is 0088's fix, shared**: both forms read the same
+  staged a operand (`fa_gqa_i8_stage_rows`, which this patch's second build
+  compiles in unchanged); the card's red hit the direct and the staged form
+  alike, and the staged form's own two defects would have shown as mismatched
+  K rows, not as 0088's uniform ~0.10. The 1-3 row cases are part of (f)'s
+  card check above.
+
+Device-free (`measured-here`): the offset cell asserts the staged row/stride
+arithmetic (68/69 at 256, 34/35 at 128, an odd stride), and the routing cell
+asserts the second build, the KT 1 restriction and the 1-3 row dispatch. Red
+(c): the staged dispatch dropped (`n_q < 4` → false) fails the routing cell;
+(a) the block-offset mutation also fails every new case at 1-3 rows on the
+card.
+
+Card arms: the same commands as 0088's above, with the `MIN_ROWS=1` switch-on
+arm pricing the staged rows against the switch-off arm; the new 1/2/3-row
+cases are the correctness arm, and the perf list's 1/3-row cases at 131,072
+keys price them. Bar: the 1-row call below 0015's 1.91 ms at 131k on the B60,
+answers right, KL inside 0.03 nats. Owed to Claude's window; no card number
+here yet.
+
+Status: built, device-free green, off by default; the 0088/0089 pair is the
+opt-in until the card A/B.
+
+
+## 0090-opencl-gdn-rows-write-layout.patch
+
+Fixes 0081's OpenCL rows form (`LLAMA_GDN_STATE_ROWS`). The rows form READS a sequence's state from its row of
+the 2D recurrent cache, but both Intel kernels (`kernel_gated_delta_net_pp` and `_tg`) also used that cache-row
+base for the WRITES: the verify snapshots (`snap_buf + slot * snap_stride + state_base`) and the final state in
+`dst` (`data_dst + s_off + state_base`). Those buffers have the per-sequence layout the CPU reference writes
+(`ggml-cpu/ops.cpp`: `s_out = state_out_base + (seq * H + head) * S_v * S_v`, `code`), so on the card the state
+landed at the wrong offset. Measured (window 57, the A770 coder, one run, `measured-here`): with the switch on an
+answer gate failed, the output md5 differed and decode fell from 51 to 21 t/s. The fix splits the base:
+`state_base_rd` (the cache row, rows form only) for the read, `state_base` (per sequence) for every write. The generic kernel (`gated_delta_net.cl`) had the same defect in its K == 1 final write only (its snapshots already used `state_out_base`); it now writes to `state_out_base` too. Why the card cases missed it: 0081 registered its rows cases only in `make_test_cases_perf`, which times and never compares; 0090 adds them (plus a small 2-sequence case) to the eval list.
+Device-free cell: `tests/python/test_gdn_rows_write_layout.py` (text). Card arms (window 58, `measured-here`, with 0092 and 0093): test-backend-ops GATED_DELTA_NET eval 60 of 60
+on the A770 and on the B60 (rows 5 of 5); the pre-0090 kernels fail 7 cases on the A770 (rows 0 of 5) and on
+the B60 the first rows case faults the compute engine (CAT error: the writes leave the buffer), the fault that
+preceded window 56's Flash-Next abort (`the CPU misses' publish never arrived`). Served: the coder with the
+switch on, texts md5 identical to off, decode 51.5 -> 51.2 t/s (one run: no gain); Flash-Next with the exact
+bundle completes, answers right, prefill-20k 536.9 and decode 32.8 t/s (window 56 off arm 534.2 / 33.1).
+
+
+## 0091-replay-hybrid-input.patch
+
+Fixes 0086's replay (`LLAMA_GDN_REPLAY`) on hybrid models, which are all of ours (qwen35 / qwen4exp: attention
+plus gated delta-net). The replay controls (`s_rpl_rows`, `s_rpl_ctrl`, `s_rpl_wrow`) and the record count
+(`rpl_take`, which advances `rpl_n`) were filled only by `llm_graph_input_rs::set_input`. The three hybrid inputs
+(`llm_graph_input_mem_hybrid`, `_k`, `_iswa`) carry their own copy of the recurrent part and copied only `s_copy`,
+so on a hybrid model the controls stayed unset and no records were ever counted. The first draft rollback was then
+refused (`seq_rm: cannot roll back 4 tokens, only 0 kept`, then `llama.cpp refused the draft rollback` and HTTP 500;
+window 56, the agent on the B60, `measured-here`). One helper (`rs_set_input_rpl`, and `rs_can_reuse_rpl` for graph
+reuse) now serves the recurrent input and all three hybrid inputs. The op-level replay cases (test-backend-ops
+`GATED_DELTA_NET_REPLAY` chains) could not see this: they build the op, not a model's graph input. Device-free cell:
+`tests/python/test_gdn_replay_hybrid_input.py` (text). Served (window 58, the agent on the B60, one run, `measured-here`): capital and the 138k needle right, texts
+md5 identical to off, no refused rollback; prefill 715.4 -> 690.5 t/s at 55k (-3.5 %) and 501.1 -> 494.1 at
+138k (-1.4 %). The agent A/B carries no decode metric, so there is no case for a default yet.
+Window 59 (the agent on the B60 at a 115,395-token prompt, one run an arm, `measured-here`): resident VRAM
+22,814 against 23,390 MiB after load and 23,725 against 24,301 after the request (-576 MiB), decode 20.96 against
+21.03 t/s, prefill 214.9 against 211.5 s; the answer opens the same, its bytes differ (KL not measured).
+Window 61 (the agent on the B60, `measured-here`): the acceptance task greedy without thinking 10/10 with
+replay and 10/10 without (a different program); at `--n-ctx 262144` (the model's trained length) with replay the
+unit loads at 23,256 MiB resident (245,760 without replay: 23,390), a needle at 40 % of a 254,970-token prompt is
+right (731.5 s, 348.6 t/s), the peak is 24,199 of 24,480 MiB and GTT stays flat (64 MiB). A verify costs the same
+124.4 ms at 245,760 off, 245,760 with replay and 262,144 with replay at a 115k prompt; the decode rates differ by
+the answers' draft acceptance only. KL by perplexity cannot see replay (it never rolls back).
+
+
+## 0092-tbo-replay-chain-pool.patch
+
+test-backend-ops only. 0086's `test_gdn_replay_chain` builds a whole chain of launches in one graph and ran out
+of the case context's 128-tensor pool (`ggml_new_object: not enough space in the context's memory pool (needed
+130080, available 129712)`, `GGML_ASSERT(obj_new)`), which aborted the eval run at the first chain case. So no
+chain case and none of the cases after it (0090's rows cases among them) had ever completed on a card (window 58,
+the A770, `measured-here`). `test_case` gets a `max_tensors()` hook (default 128, the upstream budget) used by
+its four context sites; the chain case returns 4096.
+
+
+## 0093-tbo-gdn-rows-ids-set.patch
+
+test-backend-ops only. 0081's rows case wrote its row ids through `(int32_t *) t->data`, which is host memory only
+on the CPU backend; on a GPU backend it is a device-buffer address, so the first rows case on a card killed the
+test (SIGSEGV, exit 139; the B60 logged a copy-engine CAT error as the context died; window 58, `measured-here`).
+The ids now go through `ggml_backend_tensor_set`.
+
+
+## 0094-defaults-kv-only-sync-trim.patch
+
+Turns on by default the two switches that measured a gain with nothing degrading: 0080's MTP KV-only pass
+(`LLAMA_MTP_KV_ONLY`, now on unless `=0`) and 0083's bit 2, the KV-cache rotation matrices kept on the device
+(`LLAMA_SYNC_TRIM` now 2 unless set; `0` restores upstream). Window 58 (`measured-here`, 2 rounds an arm against
+off): the coder (A770) decode +1.8 / +2.0 / +1.8 %, prefill-41k +6.6 %, texts md5 identical; the agent and
+Flash-Next equal (Flash-Next's qwen4exp graph has no KV-only pass). Every other switch of the series stays off:
+0081 rows, 0082, 0083 bits 1 and 4 and 0084 gave nothing; 0088/0089 cost decode; replay (0086/0087/0091) is a
+per-unit choice where its VRAM buys context (the agent's sample unit).

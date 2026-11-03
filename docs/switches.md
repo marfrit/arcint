@@ -9,7 +9,7 @@ Tuning, off-switch, red-case and diagnostic switches are for measuring and
 may change or go without notice.
 
 A switch here is an environment variable read by arcint, by one of its tools,
-or by the llama.cpp patch series in `contrib/llama.cpp/patches` (0001-0079,
+or by the llama.cpp patch series in `contrib/llama.cpp/patches` (0001-0084,
 without the dropped 0031, 0055, 0061 and 0078 (1.4.1), 0073 on its campaign branch and the
 retired 0076; 0079 reads no switch). Switches the pinned llama.cpp tree reads by itself
 (`GGML_OPENCL_PLATFORM`, `GGML_OPENCL_FUSE_RMS_ADD`, `GGML_OPENCL_F16_MROW` and
@@ -94,8 +94,9 @@ These names are not in a table:
 | `GGML_OPENCL_FA_DPAS_F16KV_BLOCK` | 16384 | Keys a block when quantized K/V is converted to f16 for prompt attention. | 0037 | — |
 | `GGML_OPENCL_FA_DPAS_OPTS` | none | Extra build options for the DPAS attention programs. Carries the `-D*_RED` red cases (`FA_CARRY_RED`, `FA_QG_RED`, `FA_VBLK_RED`, `FA2_RED`, `FA2_MCLS_RED`). | 0008 | Red case: `-DBK=24` (README, 0017). |
 | `GGML_OPENCL_FA_GQA_KV_PER_SPLIT` | 512 | Keys a split in the GQA decode kernel. | 0018 | Search best 512 against 128; no effect from 131,072 keys on (`code`). |
-| `GGML_OPENCL_FA_GQA_MIN_ROWS` | 4 | Least query rows routed to the GQA decode kernel. | 0016 | 1-3 rows faster on the split kernel: 6 rows 10.3 ms against 4.83 ms the other way (`measured-here`). |
-| `GGML_OPENCL_FA_GQA_OPTS` | none | Extra build options for the GQA attention programs. Carries `GQA_K_STAGED`, `GQA_K_DIRECT`, `BK`, and the red case `-DBK=24`. | 0016 | Red case fails 41 of 53 cases at one geometry (`measured-here`, README 0017). |
+| `GGML_OPENCL_FA_GQA_I8` | off | Opt-in, not adopted on any unit until the card A/B: `1` builds 0088's int8 Q K^T from the raw q8_0 cache for the q8_0 K pairs and 0089's staged 1-3 row form; `0`/unset is the f16 form, byte-identical. With it on, `GGML_OPENCL_FA_GQA_MIN_ROWS=1` routes 1-3 rows to the staged form. | 0088, 0089 | `code`: the fork's DPAS form; card arms owed (README 0088). |
+| `GGML_OPENCL_FA_GQA_MIN_ROWS` | 4 | Least query rows routed to the GQA decode kernel. With `GGML_OPENCL_FA_GQA_I8=1`, 1-3 rows take the staged form when it was built; 4+ the direct one. | 0016, 0089 | 1-3 rows faster on the split kernel before 0089: 6 rows 10.3 ms against 4.83 ms the other way (`measured-here`); 0089's staged path is the fork's 48K 1-token 433 -> 244 us (`paper`). |
+| `GGML_OPENCL_FA_GQA_OPTS` | none | Extra build options for the GQA attention programs. Carries `GQA_K_STAGED`, `GQA_K_DIRECT`, `BK`, `GQA_ST`, and the red case `-DBK=24`. | 0016 | Red case fails 41 of 53 cases at one geometry (`measured-here`, README 0017). |
 | `GGML_OPENCL_FA_GQA_SIDES` | 2 (1, 2 or 4) | Sub-groups per 8 rows in the GQA kernel, for build and dispatch. | 0016 | — |
 | `GGML_OPENCL_FA_INTEL_KV_PER_SPLIT` | 128 | Keys a split in the per-head Intel decode kernel. | 0007 | — |
 | `GGML_OPENCL_FA_INTEL_OPTS` | none | Extra build options for Intel's FA programs (for tuning). | 0007 | — |
@@ -127,10 +128,16 @@ These names are not in a table:
 | `LLAMA_EXPERT_CACHE_SPARES` | 4 a layer (minimum 1 when set) | Spare bank entries a layer for swaps. | 0042 | ~263 MB more pinned host memory for Flash-Next (`measured-here`). |
 | `LLAMA_EXPERT_ROUTE_TRACE_MAX_MB` | 256 | MiB ceiling the routing trace rotates past; a non-numeric or non-positive value warns and keeps the default (0 used to mean rotate every record). | 0069 | `code`: 0069:685-701,1092. |
 | `LLAMA_SLOT_LOAN_CARD_MARGIN_MIB` | 1 GiB | The loan rule's fixed card margin in MiB; a missing, unreadable or non-positive value keeps 1 GiB, capped at 16 GiB. | 0068 | `code`: 0068:3540-3549. |
+| `LLAMA_FUSE_QK_L2_NORM` | off | `1`: the hybrid layers' adjacent q/k head groups are normalised in one l2_norm over their joint view (two nodes fewer a pair, one pair fewer a layer). The bf16 gate matvec needs no change: the F16 nc/ksplit matvec already takes 1-8 columns with <64 rows (`code`). | 0082 | `code`; the served A/B is owed (README 0082). |
+| `LLAMA_GDN_REPLAY` | off | `1`: a recurrent sequence rolls back by replaying per-token update records (delta, key, gate) onto one base state instead of keeping whole state snapshots; qwen35/qwen35moe/qwen4exp, one sequence, recurrent layers on OpenCL, F32 S = 128. With it on the rows form of 0081 is not used. | 0086, 0087 | `code`; exactness is the device-free replay chain and the owed `GATED_DELTA_NET_REPLAY` card arm (README 0086/0087); VRAM saved from the shapes there. |
+| `LLAMA_GDN_STATE_ROWS` | off | `1`: the gated delta-net reads each sequence's live recurrent state straight from the cache at its row index (no `GET_ROWS` temp); single sequence only. | 0081 | `code`; the card arms are owed (README 0081). |
+| `LLAMA_MTP_KV_ONLY` | off | `1`: the MTP head's prompt catch-up decode (no output rows) builds up to the cache store and stops, the retained K/V rows identical to the full graph's. | 0080 | `code`; the card arms are owed (README 0080). |
 | `LLAMA_SLOT_LOAN_EXIT_IDLE_MS` | 2000 (4000 the ceiling) | Idle in ms before the loan's exit watchdog bounds the drain; the off words give 0, a typo keeps the default, capped below the watchdog bound. | 0068 | `code`: 0068:4312-4324. |
 | `LLAMA_SLOT_LOAN_PREFILL_GROWTH_MIB` | 0 | The prefill's growth band in MiB the kernel rule allows (zero margin); a non-numeric value keeps 0, capped at 16 GiB. | 0068 | `code`: 0068:3885-3895. |
 | `LLAMA_SLOT_LOAN_SHED_FLOOR_MIB` | 64 MiB (0 allowed) | The end guard's noise floor in MiB: a shortfall at or above it is a true one fed to the next loan's sizing, below it the guard does nothing; a non-numeric value keeps the default, capped at 16 GiB. | 0068 | `code`: 0068:3967-3976. |
 | `STRATA_PROFILE_PRIOR_ENTRIES` | 800000 | The prior mass, in routed entries, the xe save rule mixes into the start's ranking so a short conversation does not wipe the prior (Strata's constant, mirrored). | 0070 | `code`: 0070:105-107,605. |
+| `LLAMA_SYNC_TRIM` | 0 (all bits off, byte-identical to before) | Bit 1: skip a context synchronize when this context queued nothing since its last one; bit 2: keep the KV rotation matrices on the cache's device instead of uploading two graph inputs per attention graph; bit 4: one copy for a batch's backend-sampled ids instead of one small read a row. Not used with pipeline parallelism for bit 1. The fork's default is 3. | 0083 | `code`: 0083; the queue and per-read costs are the fork's `measured-here` on its stack; the B60 served A/B is owed. |
+| `LLAMA_SAMPLER_FAST_TOPK` | 0 (off) | `1`: a row's top-k is taken straight from the logits (llama_top_k_from_logits, patch 0084) instead of building the full 248k candidate array and partial-sorting it; the same entries and the same order of equal logits (ties, NaN, inf). Both arcint's sampler and any future llama common-sampler caller use it. | 0084 (arcint `src/core/sampler.cpp`) | `code` + the device-free exactness cell `tests/test_fast_topk.cpp`; the fork's +1.9 % / +1.85 % is `measured-here` on its stack, the B60 arm is owed. |
 
 ### Off switch
 
