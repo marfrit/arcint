@@ -6276,6 +6276,14 @@ card number yet; the defaults stay off until the operator's A/B. The gate's
 per-layer bar is the audit's: the 6-row call below 0016's 4.83 ms at 131k and
 the 1-row call below 0015's 1.91 ms, answers right, KL inside 0.03 nats.
 
+Served price (windows 58 and 60, the agent on the B60, a 115,395-token prompt, one run an arm, the same answer
+in every arm, `measured-here`): decode off 21.03 t/s, `GGML_OPENCL_FA_GQA_I8=1` alone 15.83 (-25 %),
+`GGML_OPENCL_FA_GQA_MIN_ROWS=1` (0089) alone 19.05 (-9 %), both 13.27 (-37 %). Not a verdict on the fork's
+technique: its build is SYCL s8 x s4 over q4_0 keys, ours OpenCL s8 x s8 over q8_0 keys with Q quantized a call
+into local memory. test-backend-ops perf cannot price the q8_0 arms (its quantized cases rebuild the SoA every
+call); its f16 single-row case shows MIN_ROWS=1's cost alone (1.91 -> 2.29 ms at 131,072 keys).
+
+
 ## 0089-opencl-gqa-staged-1-3-rows.patch
 
 The 1-3 row form on the same DPAS kernel: a key tile's raw q8_0 rows are
@@ -6356,6 +6364,9 @@ reuse) now serves the recurrent input and all three hybrid inputs. The op-level 
 `tests/python/test_gdn_replay_hybrid_input.py` (text). Served (window 58, the agent on the B60, one run, `measured-here`): capital and the 138k needle right, texts
 md5 identical to off, no refused rollback; prefill 715.4 -> 690.5 t/s at 55k (-3.5 %) and 501.1 -> 494.1 at
 138k (-1.4 %). The agent A/B carries no decode metric, so there is no case for a default yet.
+Window 59 (the agent on the B60 at a 115,395-token prompt, one run an arm, `measured-here`): resident VRAM
+22,814 against 23,390 MiB after load and 23,725 against 24,301 after the request (-576 MiB), decode 20.96 against
+21.03 t/s, prefill 214.9 against 211.5 s; the answer opens the same, its bytes differ (KL not measured).
 
 
 ## 0092-tbo-replay-chain-pool.patch
