@@ -2,6 +2,7 @@
 
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -73,6 +74,10 @@ struct ChatRequest {
     // the running tool loop's thinking (measured in UAT: a 10.6 % cache hit).
     bool preserve_thinking     = false;
     bool has_preserve_thinking = false;
+    // OpenAI's top-level reasoning_effort, as the client sent it (empty when it
+    // sent none). template_context maps it to a level the model's template
+    // accepts and hands it over as the `reasoning_effort` variable.
+    std::string reasoning_effort;
     // The raw chat_template_kwargs object, passed through to the template (the
     // llama-server dialect: the keys are template-specific and a client may
     // send ones a given template ignores). `enable_thinking` and
@@ -152,7 +157,15 @@ bool reserved_template_context_key(std::string_view key);
 // a render stays byte-identical to before the passthrough existed. `error`
 // names the first reserved key found; the caller refuses with a 400.
 // Pure: the one construction the llama render_chat and the unit test share.
-nlohmann::json template_context(const ChatRequest& req, std::string& error);
+//
+// `template_src` is the model's chat template text. With it, a top-level
+// reasoning_effort reaches the template as `reasoning_effort` at a level that
+// template accepts (a template naming 'xhigh', Qwen3.8's, gets low/medium/xhigh;
+// any other gets low/medium/high), unless chat_template_kwargs sets the key
+// itself. none/off and unknown levels pass no level. Enforced by test_chat.cpp's
+// reasoning_effort_* cases.
+nlohmann::json template_context(const ChatRequest& req, std::string& error,
+                                std::string_view template_src = {});
 
 // M0 stub prompt rendering.
 //

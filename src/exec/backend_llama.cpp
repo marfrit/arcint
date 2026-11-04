@@ -1354,11 +1354,12 @@ public:
         inputs.add_generation_prompt = true;
         // The one construction of the template context (core/chat.cpp): the
         // typed switches plus the chat_template_kwargs passthrough, with the
-        // keys minja's own context sets already refused by parse. A request
+        // keys minja's own context sets already refused by parse, and the
+        // reasoning_effort level mapped to the set this template accepts. A request
         // that sent neither leaves extra_context unset, byte-identical to the
         // render before the passthrough existed.
         std::string ctx_error;
-        const json  extra = template_context(req, ctx_error);
+        const json  extra = template_context(req, ctx_error, template_src_);
         if (!ctx_error.empty()) log::warn("req", "%s", ctx_error.c_str());
         if (!extra.empty()) inputs.extra_context = extra;
         minja::chat_template_options opts;
