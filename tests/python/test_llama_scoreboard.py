@@ -81,6 +81,7 @@ class Server(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--device") + 1], "GPU.1")
         self.assertNotIn("--llama-kv", cmd)
         self.assertNotIn("--llama-mtp", cmd)
+        self.assertIn("--metrics", cmd)   # the rates come from /metrics, which is opt-in
 
     def test_an_arm_names_its_kv(self):
         cmd = sb.server_argv("arcint", "m.gguf", "GPU.0", 8095, "q8_0:q4_0")

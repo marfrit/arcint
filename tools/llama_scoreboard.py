@@ -55,7 +55,7 @@ class NotComparable(ValueError):
 
 def server_argv(arcint, model, device, port, kv):
     cmd = [arcint, "--engine", "llama", "--gguf", model, "--served-model-name", "bench", "--device", device,
-           "--host", "127.0.0.1", "--port", str(port), "--n-ctx", "4096"]
+           "--host", "127.0.0.1", "--port", str(port), "--n-ctx", "4096", "--metrics"]
     if kv != "f16":
         cmd += ["--llama-kv", kv]
     return cmd
