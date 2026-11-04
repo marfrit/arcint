@@ -259,6 +259,7 @@ if(ARCINT_TESTS)
     tests/test_sampling.cpp
     tests/test_stop.cpp
     tests/test_chat.cpp
+    tests/test_chat_render.cpp
     tests/test_text.cpp
     tests/test_config.cpp
     tests/test_verify_walk.cpp
@@ -436,6 +437,12 @@ if(ARCINT_TESTS)
            COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_mtp_width_replay.py")
   set_tests_properties(mtp-width-replay PROPERTIES LABELS unit)
+
+  # tools/llama_scoreboard.py: what makes a row of the community GPU tables comparable.
+  add_test(NAME llama-scoreboard
+           COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_llama_scoreboard.py")
+  set_tests_properties(llama-scoreboard PROPERTIES LABELS unit)
 
   # tools/fn_sweep.py's flag tables and --no-mtp (the T1 leg), device-free.
   add_test(NAME fn-sweep-flags

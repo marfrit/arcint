@@ -2,6 +2,7 @@
 
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -73,6 +74,10 @@ struct ChatRequest {
     // the running tool loop's thinking (measured in UAT: a 10.6 % cache hit).
     bool preserve_thinking     = false;
     bool has_preserve_thinking = false;
+    // OpenAI's top-level reasoning_effort, as the client sent it (empty when it
+    // sent none). template_context hands it to a template that reads the
+    // `reasoning_effort` variable, rewritten only where the template cannot take it.
+    std::string reasoning_effort;
     // The raw chat_template_kwargs object, passed through to the template (the
     // llama-server dialect: the keys are template-specific and a client may
     // send ones a given template ignores). `enable_thinking` and
@@ -152,7 +157,22 @@ bool reserved_template_context_key(std::string_view key);
 // a render stays byte-identical to before the passthrough existed. `error`
 // names the first reserved key found; the caller refuses with a 400.
 // Pure: the one construction the llama render_chat and the unit test share.
-nlohmann::json template_context(const ChatRequest& req, std::string& error);
+//
+// `template_src` is the model's chat template text. With it, a top-level
+// reasoning_effort reaches a template that reads the variable as
+// `reasoning_effort`: the client's level when the template quotes it, else the
+// nearest it takes (minimal -> low, high -> xhigh, xhigh -> high), unless
+// chat_template_kwargs sets the key itself; a null kwarg reads as absent and
+// does not suppress the level. Without a source (the parse-time reserved-key
+// check) no level is mapped. none/off and unknown levels pass no level.
+// Enforced by test_chat.cpp's and test_chat_render.cpp's reasoning_effort_* cases.
+nlohmann::json template_context(const ChatRequest& req, std::string& error,
+                                std::string_view template_src = {});
+
+// The levels of low/medium/high/xhigh a chat template takes for the
+// reasoning_effort variable: the ones it quotes as a token, and only when it
+// reads the variable at all (empty otherwise). /props publishes them.
+std::vector<std::string> template_reasoning_effort_levels(std::string_view template_src);
 
 // M0 stub prompt rendering.
 //

@@ -384,16 +384,19 @@ std::optional<std::string> parse_chat_request(const json& body, ChatRequest& out
         }
     }
 
-    // OpenAI's own switch. Qwen3.6's template knows on/off and nothing in
-    // between, so an effort level is "on" and "none" is "off"; a client that
-    // also sends chat_template_kwargs.enable_thinking has said it more
-    // precisely and wins below.
+    // OpenAI's own switch. "none"/"off" turn thinking off and every other
+    // level on, minimal included (OpenAI's lowest level, not a switch; the
+    // /v1/responses route reads it the same way, operator 2026-11-04); a client
+    // that also sends chat_template_kwargs.enable_thinking has said it more
+    // precisely and wins below. The level itself is kept: template_context
+    // hands it to the template (Qwen3.8's reads reasoning_effort).
     if (body.contains("reasoning_effort") && !body["reasoning_effort"].is_null()) {
         const json& e = body["reasoning_effort"];
         if (!e.is_string()) return "reasoning_effort must be a string";
         const std::string level = e.get<std::string>();
         req.has_enable_thinking = true;
-        req.enable_thinking     = level != "none" && level != "off" && level != "minimal";
+        req.enable_thinking     = level != "none" && level != "off";
+        req.reasoning_effort    = level;
     }
     if (body.contains("chat_template_kwargs") && !body["chat_template_kwargs"].is_null()) {
         const json& kw = body["chat_template_kwargs"];
@@ -580,7 +583,49 @@ bool reserved_template_context_key(std::string_view key) {
     return false;
 }
 
-nlohmann::json template_context(const ChatRequest& req, std::string& error) {
+namespace {
+// Whether a template quotes `tok` as a token ('xhigh' or "xhigh"): what taking a
+// level looks like in a template's source. A mention inside a sentence (Qwen3.8's
+// refusal text "Supported types are xhigh (default), ...") is not one.
+bool template_quotes(std::string_view src, std::string_view tok) {
+    for (const char q : {'\'', '"'}) {
+        const std::string t = std::string(1, q) + std::string(tok) + q;
+        if (src.find(t) != std::string_view::npos) return true;
+    }
+    return false;
+}
+
+// The level a client's reasoning_effort reaches the template at, or empty for
+// none (operator, 2026-11-04: the GGUF's template is the contract). Only a
+// template that reads the variable gets one; the parse-time call, which has no
+// template source, gets none. The client's level passes through when the
+// template takes it (the real Qwen3.8 template quotes 'high' and maps it to
+// xhigh itself); only what the template cannot take is rewritten: minimal is
+// OpenAI's lowest level (low), high goes to a template whose top level is
+// xhigh, xhigh to one that does not name it (OpenAI's high). A template that
+// quotes no list gets low/medium/high as sent. none/off and unknown levels pass
+// none, so the template's own default applies.
+std::string template_reasoning_effort(std::string_view level, std::string_view src) {
+    if (src.find("reasoning_effort") == std::string_view::npos) return {};
+    const std::string_view l = level == "minimal" ? std::string_view("low") : level;
+    if (l != "low" && l != "medium" && l != "high" && l != "xhigh") return {};
+    if (template_quotes(src, l)) return std::string(l);
+    if (l == "high" && template_quotes(src, "xhigh")) return "xhigh";
+    if (l == "xhigh") return "high";
+    return std::string(l);
+}
+}  // namespace
+
+std::vector<std::string> template_reasoning_effort_levels(std::string_view template_src) {
+    std::vector<std::string> out;
+    if (template_src.find("reasoning_effort") == std::string_view::npos) return out;
+    for (const char* l : {"low", "medium", "high", "xhigh"})
+        if (template_quotes(template_src, l)) out.emplace_back(l);
+    return out;
+}
+
+nlohmann::json template_context(const ChatRequest& req, std::string& error,
+                                std::string_view template_src) {
     error.clear();
     nlohmann::json extra = nlohmann::json::object();
     if (req.chat_template_kwargs.is_object()) {
@@ -598,6 +643,15 @@ nlohmann::json template_context(const ChatRequest& req, std::string& error) {
     }
     if (req.has_enable_thinking) extra["enable_thinking"] = req.enable_thinking;
     if (req.has_preserve_thinking) extra["preserve_thinking"] = req.preserve_thinking;
+    // The explicit kwarg wins (it is already in extra), as enable_thinking does.
+    if (!req.reasoning_effort.empty() && !extra.contains("reasoning_effort")) {
+        const std::string level = template_reasoning_effort(req.reasoning_effort, template_src);
+        if (!level.empty()) {
+            log::debug("req", "reasoning_effort %s reaches the template context as %s",
+                       req.reasoning_effort.c_str(), level.c_str());
+            extra["reasoning_effort"] = level;
+        }
+    }
     return extra;
 }
 

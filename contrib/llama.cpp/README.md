@@ -6402,3 +6402,62 @@ off): the coder (A770) decode +1.8 / +2.0 / +1.8 %, prefill-41k +6.6 %, texts md
 Flash-Next equal (Flash-Next's qwen4exp graph has no KV-only pass). Every other switch of the series stays off:
 0081 rows, 0082, 0083 bits 1 and 4 and 0084 gave nothing; 0088/0089 cost decode; replay (0086/0087/0091) is a
 per-unit choice where its VRAM buys context (the agent's sample unit).
+
+## 0095-opencl-fwht-hadamard.patch
+
+The KV cache rotations (`llama_mul_mat_hadamard`, the `attn_rot_dev_*` matrices that 0094 keeps on the device) are
+MUL_MAT nodes with `GGML_HINT_SRC0_IS_HADAMARD`: a product with the orthonormal Sylvester Hadamard matrix, which the
+CPU (`ggml_compute_forward_fwht`) and CUDA (`ggml-cuda/fwht.cu`) backends compute as a fast Walsh-Hadamard transform
+of each src1 row. The OpenCL backend ignored the hint and ran them as dense F32 products: the F32 skinny split-K path
+(GEMM + slice sum), 24,615 pairs and 750 ms of a 22.3 s B60 decode window, ~2.35 ms a verify step
+(`measured-here`, Qwen3.8-27B, q8_0:q4_0 KV, MTP 5; identified by a src0-name trace of every F32 MUL_MAT). The patch
+adds `kernel_fwht_f32_{64,128,256}` (`fwht_f32.cl`: one row per 16-wide subgroup, the stages below 16 by subgroup
+shuffles, the rest in registers, as fwht.cu does per warp) and takes the product ahead of every other MUL_MAT path
+under the conditions of the reference (a MUL_MAT; src0 / src1 / dst F32, src0 2-D, src1 and dst contiguous and the
+same shape). Intel only, and only where `cl_intel_required_subgroup_size` lets the program require the 16-wide
+subgroup its indexing assumes (the build is optional: without it every hinted product keeps the dense path). Widths
+64-256 cover every model here (`n_rot_k` doubles from 64 with the head dim, `n_rot_v` is pinned at 64); 512 and up
+keep the dense product (the 512 kernel spilled at SIMD16 on the A770, offline ocloc). F16 src1 (which the CUDA
+reference also takes) declines: the graph's rotations are F32. `GGML_OPENCL_FWHT=0` keeps the dense product.
+test-backend-ops `MUL_MAT_HADAMARD` (the upstream cases; 5 of the 14 reach the kernel, the F16-src1, 512+ and batched-src0
+cases decline to the dense path): 14/14 on the B60 and the A770 with and without the switch; a mutant (one butterfly
+sign flipped) fails exactly the 5 with the switch on and passes with it off. Reviewed by Qwen3.8-Flash-Next (the op check,
+the 2-D src0 and the subgroup-size gate came from its review).
+
+Served (`measured-here`, the same binary with `GGML_OPENCL_FWHT=0` against on, each card in one window): the dense
+Qwen3.8-27B (B60, q8_0:q4_0 KV, 262,144 tokens, replay, MTP 5) a verify step 59.5 -> 57.5 ms (-3.4 %), decode 47.7 ->
+50.0 t/s over 3 prompts x 2 rounds at temp 0 (draft acceptance 46.5 -> 47.2 %), prefill 714.8 -> 726.0 t/s at 55k and
+502.5 -> 507.4 at 138k, texts identical in the A/B tool's cells; the coder (A770, q8_0:q4_0 KV, MTP 4) a verify step
+35.0 -> 33.1 ms (-5.5 %), prefill 775.9 -> 781.1 at 41k, every answer right, draft acceptance lower on all 3 prompts
+(37.9 -> 36.2, 39.2 -> 33.7, 30.0 -> 28.8 %) so decode t/s stayed mixed (+1.1, -4.5, +3.2 %) with the texts differing;
+Flash-Next (B60, one round) prefill 534.5 -> 538.5, decode 33.1 -> 31.8 t/s at acceptance 69.3 -> 62.7 %, inconclusive.
+The answer-level KL arm is owed before a release.
+
+## 0096-opencl-intel-dense-q4_0.patch
+
+Dense Q4_0 weights on the Intel fast paths: the file of the community GPU tables (Llama 2 7B Q4_0) took upstream's float
+kernels, the tiled GEMM ~95 % of a 512-token prefill and the 8x matvec 2/3 to 4/5 of a decode step (`measured-here`,
+unitrace). Q4_0 has IQ4_NL's flat planes (16 code bytes and one f16 scale per 32 weights, low nibbles weights 0..15, high
+nibbles 16..31) with the value n - 8, so the path is IQ4_NL's: up to 4 columns `kernel_mul_mv_q4_0_q8_1` (the q8_1
+integer-dot matvec), from 16 columns `kernel_mul_mm_q4_0_f16` (the fp16 XMX GEMM, n - 8 taken in integers); 5 to 15 columns
+stay on upstream's path, unmeasured. A KV cache's Q4_0 is AoS and declines. `GGML_OPENCL_Q40_XMX=0` keeps the float kernels.
+
+Measured (`measured-here`, window 73/74, both cards, A770 GT pinned at 2000 MHz; arcint at qfndev cb8151bd, served through
+`tools/llama_scoreboard.py`, n_ctx 4096, f16 KV, 5 repetitions):
+
+| Chip | pp512 before -> after | tg128 before -> after |
+|---|---|---|
+| Arc A770 16 GB | 362.73 -> 1956.15 ± 2.93 (5.4x) | 39.48 -> 63.56 ± 0.06 (+61 %) |
+| Arc Pro B60 24 GB | 425.57 -> 2332.94 ± 3.28 (5.5x) | 76.24 -> 75.77 ± 0.02 (-0.6 %) |
+
+The answer-level bar on both cards, each arm against a CPU reference over 16 x 512 tokens: mean KL 0.000431-0.000432 nats
+with the switch on and off, at `-b 512` (the GEMM) and `-b 4` (the matvec); argmax agreement 99.07 % on, 99.09 % off (A770,
+`-b 512`, 0.02 points); 9/9 facts in all four served arms, with the same text on and off and across the cards.
+`test-backend-ops -o MUL_MAT -p type_a=q4_0`: 161/161 on both cards, switch on and off. Mutants with the switch on: `(char4)(7)`
+fails 43 (A770) and 44 (B60) cases, all at 1-4 columns and none from 16; `(char16)(7)` fails 32 on both, 28 of them from 16
+columns and none at 1-4. With the switch off the matvec mutant passes 161/161 on both cards.
+
+The B60's decode did not move because it is held elsewhere: the matvec takes 10.4 ms a token over ~3.7 GB of weights (code and
+scale bytes), about 360 GB/s against the card's ~456 GB/s of memory bandwidth (`measured-here` for the kernel time, under unitrace
+over 400 tokens; the bandwidth is the card's specification, and the bytes are computed from the shapes), and the old 8x kernel took
+10.7 ms. The A770's gain is the same kernel at 10.7 ms against the old kernel's 20.9 ms. Models without Q4_0 weights do not enter these paths (`code`).

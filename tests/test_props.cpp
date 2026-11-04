@@ -102,6 +102,9 @@ TEST(llama_backend_publishes_supports_preserve_thinking) {
     const std::string src = ss.str();
     CHECK(src.find("supports_preserve_thinking") != std::string::npos);
     CHECK(src.find("supports_preserve_reasoning") != std::string::npos);   // kept
+    // the levels the template takes, from the same scan the render maps with
+    CHECK(src.find("\"reasoning_effort_levels\", template_reasoning_effort_levels(template_src_)") !=
+          std::string::npos);
 }
 
 // The wire from render_chat to the shared construction: only a scan can see it
@@ -115,7 +118,9 @@ TEST(llama_backend_render_chat_uses_the_template_context) {
     std::string nows;
     for (char c : ss.str())
         if (c != ' ' && c != '\t' && c != '\n' && c != '\r') nows += c;
-    CHECK(nows.find("extra=template_context(req,ctx_error)") != std::string::npos);
+    // The render hands the template's own source over: the reasoning_effort
+    // level is mapped to the set that template accepts.
+    CHECK(nows.find("extra=template_context(req,ctx_error,template_src_)") != std::string::npos);
     CHECK(nows.find("inputs.extra_context=extra") != std::string::npos);
 }
 

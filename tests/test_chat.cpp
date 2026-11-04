@@ -5,6 +5,8 @@
 #include "harness.h"
 
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 using namespace lgc;
 using nlohmann::json;
@@ -334,6 +336,150 @@ TEST(template_context_carries_the_typed_switches_and_the_passthrough) {
     CHECK_EQ(ctx.value("some_template_key", json()), json(42));   // unchanged
     CHECK_EQ(ctx.value("another", json()), json("x"));
     CHECK(!ctx.contains("messages"));
+}
+
+// OpenAI's top-level reasoning_effort: the level reaches the template as the
+// variable `reasoning_effort`, at a value that template accepts. Two minimal
+// templates stand in for the two dialects: Qwen3.8's (names 'xhigh', raises on
+// anything outside xhigh/medium/low) and OpenAI's low/medium/high (gpt-oss).
+namespace {
+constexpr const char* kXhighTemplate =
+    "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}"
+    "{%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}"
+    "{{- raise_exception('bad effort') }}{%- endif %}";
+constexpr const char* kPlainTemplate = "Reasoning: {{ reasoning_effort|default('medium') }}";
+
+json effort_context(const json& body, const char* tmpl) {
+    ChatRequest req;
+    const auto  perr = parse_chat_request(body, req);
+    CHECK(!perr.has_value());
+    std::string err;
+    const json  ctx = template_context(req, err, tmpl);
+    CHECK(err.empty());
+    return ctx;
+}
+}   // namespace
+
+TEST(reasoning_effort_medium_reaches_an_xhigh_template) {
+    json body                = minimal_chat();
+    body["reasoning_effort"] = "medium";
+    const json ctx = effort_context(body, kXhighTemplate);
+    CHECK_EQ(ctx.value("reasoning_effort", json()), json("medium"));
+    CHECK_EQ(ctx.value("enable_thinking", json()), json(true));
+}
+
+TEST(reasoning_effort_high_maps_to_the_templates_top_level) {
+    json body                = minimal_chat();
+    body["reasoning_effort"] = "high";
+    // A template that takes no "high" (it quotes only xhigh/medium/low): its top level is xhigh.
+    CHECK_EQ(effort_context(body, kXhighTemplate).value("reasoning_effort", json()), json("xhigh"));
+    // A low/medium/high template must not receive "xhigh".
+    CHECK_EQ(effort_context(body, kPlainTemplate).value("reasoning_effort", json()), json("high"));
+    body["reasoning_effort"] = "xhigh";
+    CHECK_EQ(effort_context(body, kXhighTemplate).value("reasoning_effort", json()), json("xhigh"));
+    CHECK_EQ(effort_context(body, kPlainTemplate).value("reasoning_effort", json()), json("high"));
+    body["reasoning_effort"] = "minimal";
+    // minimal is OpenAI's lowest level, not a switch (operator, 2026-11-04): thinking
+    // stays on, at the template's low level, on this route as on /v1/responses.
+    const json ctx = effort_context(body, kXhighTemplate);
+    CHECK_EQ(ctx.value("reasoning_effort", json()), json("low"));
+    CHECK_EQ(ctx.value("enable_thinking", json()), json(true));
+    CHECK_EQ(effort_context(body, kPlainTemplate).value("reasoning_effort", json()), json("low"));
+}
+
+// The client's level passes through to every template that takes it, and the
+// template translates (operator, 2026-11-04: the GGUF's template is the
+// contract). Taking a level means quoting it as a token: the real Qwen3.8
+// template quotes 'high' in its own high -> xhigh step, so it gets "high"; a
+// template that names xhigh only inside a sentence does not take xhigh.
+TEST(reasoning_effort_passes_through_to_a_template_that_takes_the_level) {
+    constexpr const char* kQwen38Like =
+        "{%- set r = reasoning_effort|default('xhigh') %}"
+        "{%- if r == 'high' %}{%- set r = 'xhigh' %}{%- endif %}"
+        "{%- if r not in ('xhigh', 'medium', 'low') %}"
+        "{{- raise_exception('Unexpected reasoning effort. Supported types are xhigh (default), medium, and low.') }}"
+        "{%- endif %}";
+    constexpr const char* kProseXhigh =
+        "{%- if reasoning_effort|default('medium') not in ('low', 'medium', 'high') %}"
+        "{{- raise_exception('low, medium or high; xhigh is not a level here') }}{%- endif %}";
+    constexpr const char* kBoth =
+        "{%- if reasoning_effort|default('medium') not in ('low', 'medium', 'high', 'xhigh') %}"
+        "{{- raise_exception('bad effort') }}{%- endif %}";
+    json body                = minimal_chat();
+    body["reasoning_effort"] = "high";
+    CHECK_EQ(effort_context(body, kQwen38Like).value("reasoning_effort", json()), json("high"));
+    CHECK_EQ(effort_context(body, kProseXhigh).value("reasoning_effort", json()), json("high"));
+    CHECK_EQ(effort_context(body, kBoth).value("reasoning_effort", json()), json("high"));
+    body["reasoning_effort"] = "xhigh";
+    CHECK_EQ(effort_context(body, kBoth).value("reasoning_effort", json()), json("xhigh"));
+    CHECK_EQ(effort_context(body, kProseXhigh).value("reasoning_effort", json()), json("high"));
+}
+
+// A template that does not read the variable gets no level: the key would be
+// dead weight and its debug line would claim a level reached the template.
+TEST(reasoning_effort_skips_a_template_without_the_variable) {
+    json body                = minimal_chat();
+    body["reasoning_effort"] = "high";
+    CHECK(!effort_context(body, "{{ messages[0].content }}").contains("reasoning_effort"));
+}
+
+// The parse-time call (the reserved-key check, no template source) maps no
+// level: only the render, which has the template, decides what reaches it.
+TEST(reasoning_effort_parse_time_context_maps_no_level) {
+    json body                    = minimal_chat();
+    body["reasoning_effort"]     = "high";
+    body["chat_template_kwargs"] = json{{"some_key", 1}};
+    ChatRequest req;
+    CHECK(!parse_chat_request(body, req).has_value());
+    std::string err;
+    const json  ctx = template_context(req, err);
+    CHECK(err.empty());
+    CHECK(!ctx.contains("reasoning_effort"));
+    CHECK_EQ(ctx.value("some_key", json()), json(1));
+}
+
+// The levels a template takes, as /props publishes them: the quoted ones of
+// low/medium/high/xhigh, only for a template that reads reasoning_effort.
+TEST(reasoning_effort_levels_of_a_template) {
+    using V = std::vector<std::string>;
+    CHECK(template_reasoning_effort_levels("{{ messages }}") == V{});
+    CHECK(template_reasoning_effort_levels(
+              "{%- set r = reasoning_effort|default('xhigh') %}{%- if r == 'high' %}{%- endif %}"
+              "{%- if r not in ('xhigh', 'medium', 'low') %}{%- endif %}") ==
+          (V{"low", "medium", "high", "xhigh"}));
+    CHECK(template_reasoning_effort_levels("Reasoning: {{ reasoning_effort|default('medium') }}") ==
+          V{"medium"});
+}
+
+TEST(reasoning_effort_none_passes_no_level) {
+    json body                = minimal_chat();
+    body["reasoning_effort"] = "none";
+    const json ctx = effort_context(body, kXhighTemplate);
+    CHECK(!ctx.contains("reasoning_effort"));
+    CHECK_EQ(ctx.value("enable_thinking", json()), json(false));
+    body["reasoning_effort"] = "off";
+    CHECK(!effort_context(body, kPlainTemplate).contains("reasoning_effort"));
+}
+
+TEST(reasoning_effort_template_kwarg_wins_over_the_top_level_field) {
+    json body                    = minimal_chat();
+    body["reasoning_effort"]     = "medium";
+    body["chat_template_kwargs"] = json{{"reasoning_effort", "low"}};
+    const json ctx = effort_context(body, kXhighTemplate);
+    CHECK_EQ(ctx.value("reasoning_effort", json()), json("low"));
+    CHECK_EQ(ctx.value("enable_thinking", json()), json(true));
+}
+
+TEST(reasoning_effort_unknown_level_passes_no_level_and_no_error) {
+    json body                = minimal_chat();
+    body["reasoning_effort"] = "turbo";
+    ChatRequest req;
+    CHECK(!parse_chat_request(body, req).has_value());   // accepted, as before
+    std::string err;
+    const json  ctx = template_context(req, err, kXhighTemplate);
+    CHECK(err.empty());
+    CHECK(!ctx.contains("reasoning_effort"));   // the template's default applies
+    CHECK_EQ(ctx.value("enable_thinking", json()), json(true));
 }
 
 TEST(template_context_refuses_reserved_keys) {

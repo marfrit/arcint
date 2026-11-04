@@ -1,7 +1,7 @@
 # arcint — Design
 
 State as of 2026-11-03: arcint **1.5.0** on llama.cpp **`3e4dfa8`** with the
-patch series `contrib/llama.cpp/patches` 0001-0094 (87 patches; 0031, 0055,
+patch series `contrib/llama.cpp/patches` 0001-0096 (89 patches; 0031, 0055,
 0061, 0076 and 0078 retired, 0073 on its own prefill-gather branch, 0085 never assigned). One engine: libllama with
 ggml's OpenCL backend and arcint's Intel kernels. Three language services run
 in production on two Intel Arc cards: the dense Qwen3.8-27B agent and
@@ -106,7 +106,8 @@ All served Qwen models are hybrid GatedDeltaNet / attention transformers:
 most layers carry a fixed-size recurrent state (conv + delta-rule state), a
 minority are attention layers with a KV cache. The engine admits a GGUF by
 its own `general.architecture`: `qwen35`, `qwen35moe`, `qwen4exp`, and
-`llama` at the Mistral Small 24B geometry only (`code`:
+`llama` at two geometries only, Mistral Small 24B and Llama 2 7B (the model of
+the community llama-bench GPU tables, `tools/llama_scoreboard.py`; `code`:
 `src/exec/backend_llama.cpp`); anything else is refused at load.
 
 | service | model | architecture | served file | card |
@@ -350,8 +351,12 @@ provenance (`code`).
   chunks; stop strings and token ids; `usage` in every response (`code`,
   unit-tested).
 - **Reasoning.** When the rendered prompt ends inside the Qwen think block,
-  everything before the first bare think closer goes to `reasoning_content`; `enable_thinking`
-  and `reasoning_effort` are honoured (`code`).
+  everything before the first bare think closer goes to `reasoning_content`;
+  `enable_thinking` and `reasoning_effort` are honoured: the level reaches a
+  template that reads the variable, passed through where the template quotes
+  it and rewritten only where it cannot take it (minimal -> low, high -> xhigh,
+  xhigh -> high); `/props` publishes the levels as `reasoning_effort_levels`
+  (`code`).
 - **Tool calls.** The models' native format is parsed into OpenAI
   `tool_calls`; requests without `tools` get raw text. A template that
   iterates arguments as a mapping is handed the parsed object; minja
