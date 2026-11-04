@@ -447,9 +447,13 @@ std::optional<HttpResult> read_reasoning(const json& v, ResponseRequest& req) {
                            "reasoning.effort");
         }
         // The fleet's switch: "none" turns thinking off, every other level on.
-        // The Qwen templates know on/off only, so the level is echoed unchanged.
+        // The level itself reaches the template as the chat route's
+        // reasoning_effort does (core/chat.cpp template_context): mapped to the
+        // set the model's template accepts (Qwen3.8's reads reasoning_effort,
+        // xhigh/medium/low). The echo below stays the level as sent.
         req.chat.enable_thinking     = effort != "none";
         req.chat.has_enable_thinking = true;
+        req.chat.reasoning_effort    = effort;
         out["effort"] = effort;
     }
     if (v.contains("summary") && !v["summary"].is_null()) {
