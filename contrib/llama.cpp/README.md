@@ -6432,3 +6432,12 @@ Qwen3.8-27B (B60, q8_0:q4_0 KV, 262,144 tokens, replay, MTP 5) a verify step 59.
 (37.9 -> 36.2, 39.2 -> 33.7, 30.0 -> 28.8 %) so decode t/s stayed mixed (+1.1, -4.5, +3.2 %) with the texts differing;
 Flash-Next (B60, one round) prefill 534.5 -> 538.5, decode 33.1 -> 31.8 t/s at acceptance 69.3 -> 62.7 %, inconclusive.
 The answer-level KL arm is owed before a release.
+
+## 0096-opencl-intel-dense-q4_0.patch
+
+Dense Q4_0 weights on the Intel fast paths: the file of the community GPU tables (Llama 2 7B Q4_0) took upstream's float
+kernels, the tiled GEMM ~95 % of a 512-token prefill and the 8x matvec 2/3 to 4/5 of a decode step (`measured-here`,
+unitrace). Q4_0 has IQ4_NL's flat planes (16 code bytes and one f16 scale per 32 weights, low nibbles weights 0..15, high
+nibbles 16..31) with the value n - 8, so the path is IQ4_NL's: up to 4 columns `kernel_mul_mv_q4_0_q8_1` (the q8_1
+integer-dot matvec), from 16 columns `kernel_mul_mm_q4_0_f16` (the fp16 XMX GEMM, n - 8 taken in integers); 5 to 15 columns
+stay on upstream's path, unmeasured. A KV cache's Q4_0 is AoS and declines. `GGML_OPENCL_Q40_XMX=0` keeps the float kernels.
