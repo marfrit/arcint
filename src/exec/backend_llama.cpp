@@ -685,14 +685,23 @@ public:
                                        llama_model_n_head(model_) == 32 && llama_model_n_head_kv(model_) == 8 &&
                                        std::string(head_dim) == "128" && llama_vocab_n_tokens(vocab_) == 131072;
         mistral_small_24b_ = mistral_small_24b;
+        // 'llama' at a second geometry: Llama 2 7B, the model of the community
+        // llama-bench GPU tables (operator, 2026-11-04), so that arcint can stand in
+        // one of their rows (tools/llama_scoreboard.py). A base model: no chat
+        // template, so it takes the ChatML fallback below and is meant for the
+        // token-id /v1/completions route.
+        llama2_7b_ = a == "llama" && llama_model_n_layer(model_) == 32 && llama_model_n_embd(model_) == 4096 &&
+                     llama_model_n_head(model_) == 32 && llama_model_n_head_kv(model_) == 32 &&
+                     llama_vocab_n_tokens(vocab_) == 32000;
         // --tts admits the audio-generation backbone's own architecture (Qwen3-TTS;
         // docs/milestone-1.2.0.md D4): its gen half needs --mmproj, checked after
         // this, and its text path is not served (the asset is not a language model).
         const bool tts_arch = cfg.tts && a == "qwen3tts";
-        if (a != "qwen35" && a != "qwen35moe" && a != "qwen4exp" && a != "qwen2vl" && !mistral_small_24b && !tts_arch)
+        if (a != "qwen35" && a != "qwen35moe" && a != "qwen4exp" && a != "qwen2vl" && !mistral_small_24b && !llama2_7b_ && !tts_arch)
             throw std::runtime_error(log::format("%s is a '%s' model; --engine llama serves qwen35, qwen35moe, qwen4exp, "
                                                  "qwen2vl (vision, with --mmproj), Mistral Small 3.2 24B "
-                                                 "('llama', 40 x 5120, 32/8 heads) and, under --tts, qwen3tts",
+                                                 "('llama', 40 x 5120, 32/8 heads), Llama 2 7B ('llama', 32 x 4096, "
+                                                 "32/32 heads) and, under --tts, qwen3tts",
                                                  cfg.gguf_path.c_str(), arch));
         tokenizer_ = std::make_unique<LlamaTokenizer>(vocab_);
         n_vocab_   = static_cast<size_t>(llama_vocab_n_tokens(vocab_));
@@ -926,9 +935,11 @@ public:
             // codec language), not from these messages. Fall back to ChatML so
             // a stray chat request renders rather than crashes — the speech
             // routes are the unit's own contract.
-            if (!cfg.tts)
+            // Llama 2 7B (the GPU tables' base model) ships none either; its route is
+            // the token-id /v1/completions.
+            if (!cfg.tts && !llama2_7b_)
                 throw std::runtime_error(log::format("%s carries no chat template", cfg.gguf_path.c_str()));
-            log::warn("load", "%s carries no chat template: --tts, using the ChatML fallback for a stray chat request",
+            log::warn("load", "%s carries no chat template: using the ChatML fallback for a stray chat request",
                       cfg.gguf_path.c_str());
             // static: tmpl points into it and is copied after this block ends
             static const std::string chatml_fallback =
@@ -2795,6 +2806,7 @@ private:
     ThinkBlockIds                         think_ids_qwen_;   // the Qwen pair alone
     ThinkBlockIds                         think_ids_ext_;    // the full tag family
     bool mistral_small_24b_ = false;   // the admitted llama geometry (think tags, BOS)
+    bool llama2_7b_ = false;           // the GPU tables' model: no chat template
     std::unique_ptr<minja::chat_template> template_;
     std::string                           template_src_;
     // W6a review finding 3: the material's lazy build and caches. Never on the

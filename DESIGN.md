@@ -106,7 +106,8 @@ All served Qwen models are hybrid GatedDeltaNet / attention transformers:
 most layers carry a fixed-size recurrent state (conv + delta-rule state), a
 minority are attention layers with a KV cache. The engine admits a GGUF by
 its own `general.architecture`: `qwen35`, `qwen35moe`, `qwen4exp`, and
-`llama` at the Mistral Small 24B geometry only (`code`:
+`llama` at two geometries only, Mistral Small 24B and Llama 2 7B (the model of
+the community llama-bench GPU tables, `tools/llama_scoreboard.py`; `code`:
 `src/exec/backend_llama.cpp`); anything else is refused at load.
 
 | service | model | architecture | served file | card |
