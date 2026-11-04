@@ -455,6 +455,24 @@ a repeat on Flash-Next (one round, inconclusive); whether the coder's lower draf
 text dependence (the dense model's did not drop). Not built, because both change the numerics: `LLAMA_ATTN_ROT_DISABLE=1`
 and `n_rot_k` 64 (the code's own TODO).
 
+### arcint on the community GPU tables (`tools/llama_scoreboard.py`, 2026-11-04)
+
+Llama 2 7B Q4_0, the tables' file, measured the way llama-bench measures (a counted-out warm-up, 5 repetitions, random
+token-id prompts, rates from the engine's own counters, no MTP, n_ctx 4096; `measured-here`, the qfndev dev build, A770 GT
+clock pinned at 2000 MHz):
+
+| Chip | pp512 t/s | tg128 t/s | KV |
+|---|---|---|---|
+| Arc A770 16 GB | 362.73 ± 0.16 | 39.48 ± 0.03 | f16 (the tables') |
+| Arc A770 16 GB | 357.94 ± 0.36 | 36.03 ± 0.04 | q8_0:q4_0 |
+| Arc Pro B60 24 GB | 425.57 ± 0.33 | 76.24 ± 0.01 | f16 (the tables') |
+| Arc Pro B60 24 GB | 423.28 ± 0.27 | 68.92 ± 0.02 | q8_0:q4_0 |
+
+These rows do not show the series' gains: its integer-dot and XMX weight GEMMs are K-quant, Q8_0 and MoE paths, and dense
+Q4_0 is not a type any served model uses (`code`). The B60 prefills this 7B slower than the Q4_K_M 27B at 55k (726 t/s,
+`measured-here`), which fits that, and Llama 2 also has attention in all 32 layers where the Qwen models have it in a
+minority. Both explanations are `inferred`: no profile of this model was taken.
+
 ## Gate
 
 Per lever, against the build before it on the same card:
