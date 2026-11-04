@@ -6413,8 +6413,13 @@ of each src1 row. The OpenCL backend ignored the hint and ran them as dense F32 
 (`measured-here`, Qwen3.8-27B, q8_0:q4_0 KV, MTP 5; identified by a src0-name trace of every F32 MUL_MAT). The patch
 adds `kernel_fwht_f32_{64,128,256}` (`fwht_f32.cl`: one row per 16-wide subgroup, the stages below 16 by subgroup
 shuffles, the rest in registers, as fwht.cu does per warp) and takes the product ahead of every other MUL_MAT path
-under the conditions of the reference (src0 / src1 / dst F32, src1 and dst contiguous and the same shape). Intel
-only; widths 512 and up keep the dense product (the 512 kernel spilled at SIMD16 on the A770, offline ocloc).
-`GGML_OPENCL_FWHT=0` keeps the dense product. test-backend-ops `MUL_MAT_HADAMARD` (upstream cases): 14/14 on the B60
-and the A770 with and without the switch; a mutant (one butterfly sign flipped) fails 6 of them with the switch on
-and passes with it off.
+under the conditions of the reference (a MUL_MAT; src0 / src1 / dst F32, src0 2-D, src1 and dst contiguous and the
+same shape). Intel only, and only where `cl_intel_required_subgroup_size` lets the program require the 16-wide
+subgroup its indexing assumes (the build is optional: without it every hinted product keeps the dense path). Widths
+64-256 cover every model here (`n_rot_k` doubles from 64 with the head dim, `n_rot_v` is pinned at 64); 512 and up
+keep the dense product (the 512 kernel spilled at SIMD16 on the A770, offline ocloc). F16 src1 (which the CUDA
+reference also takes) declines: the graph's rotations are F32. `GGML_OPENCL_FWHT=0` keeps the dense product.
+test-backend-ops `MUL_MAT_HADAMARD` (the upstream cases; 5 of the 14 reach the kernel, the F16-src1, 512+ and batched-src0
+cases decline to the dense path): 14/14 on the B60 and the A770 with and without the switch; a mutant (one butterfly
+sign flipped) fails exactly the 5 with the switch on and passes with it off. Reviewed by Qwen3.8-Flash-Next (the op check,
+the 2-D src0 and the subgroup-size gate came from its review).
