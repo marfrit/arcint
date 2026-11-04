@@ -485,7 +485,7 @@ Patch 0096 puts Q4_0 on the integer-dot matvec and the XMX GEMM. The same measur
 The community rows (self-reported in llama.cpp discussions #10879 and #23313, class `paper`; other drivers and hosts) on the same
 file: the A770 under Vulkan with flash attention 1119.68/53.07, without 1073.85/52.56, under SYCL fp32 with 706.72/67.09, without
 937.24/59.03; the B60 under SYCL fp16 with 928.91/84.44, without 1869.16/80.03, under Vulkan with 274.76/70.54, without
-522.36/68.55. arcint's rows run flash attention, and leads prefill on both cards; on decode it leads Vulkan on both and sits 5 %
+522.36/68.55. arcint's rows run flash attention. arcint leads prefill on both cards; on decode it leads Vulkan on both and sits 5 %
 (A770) to 10 % (B60) under the SYCL FA rows.
 
 Other files, the same tool (`--any-model`, `measured-here`, B60, f16 KV): Qwen3.8-27B Q4_K_M 846.96 ± 4.02 / 19.78 ± 0.00 (at
@@ -493,9 +493,10 @@ Other files, the same tool (`--any-model`, `measured-here`, B60, f16 KV): Qwen3.
 Q4_K_M` 507.51/14.92 and `qwen35moe 35B.A3B Q4_K_M` 774.92/81.63: other model versions or unverified files, so a neighbourhood,
 not a like-for-like.
 
-The B60's decode gap is not in the kernel: at 75.77 t/s a token is 13.2 ms, of which the matvec takes 10.0 (about 330 GB/s of
-weights against ~456 GB/s of memory bandwidth, `measured-here` for the time, under unitrace) and the other kernels ~1.4; the
-remaining ~1.8 ms is not attributed, and the launch gaps between kernels are the candidate (`inferred`, not measured here).
+The B60's decode gap is not in the kernel: at 75.77 t/s a token is 13.2 ms, of which the matvec takes 10.4 (about 360 GB/s of
+weights against ~456 GB/s of memory bandwidth, `measured-here` for the time, under unitrace over 400 tokens) and the other kernels
+~0.9; the remaining ~1.9 ms is not attributed. Host buffer writes account for up to 0.7 of it, and the launch gaps between kernels
+are the candidate for the rest (`inferred`, not measured here).
 
 ## Gate
 

@@ -6457,7 +6457,7 @@ with the switch on and off, at `-b 512` (the GEMM) and `-b 4` (the matvec); argm
 fails 43 (A770) and 44 (B60) cases, all at 1-4 columns and none from 16; `(char16)(7)` fails 32 on both, 28 of them from 16
 columns and none at 1-4. With the switch off the matvec mutant passes 161/161 on both cards.
 
-The B60's decode did not move because it is held elsewhere: the matvec takes 10.0 ms a token at ~3.3 GB of weights, about
-330 GB/s against the card's ~456 GB/s of memory bandwidth (`measured-here` for the kernel time, under unitrace; the bandwidth is
-the card's specification, and the weight bytes are computed from the shapes), and the old 8x kernel took 10.3 ms. The A770's
-gain is the same kernel at 10.3 ms against the old kernel's 20.1 ms. Models without Q4_0 weights do not enter these paths (`code`).
+The B60's decode did not move because it is held elsewhere: the matvec takes 10.4 ms a token over ~3.7 GB of weights (code and
+scale bytes), about 360 GB/s against the card's ~456 GB/s of memory bandwidth (`measured-here` for the kernel time, under unitrace
+over 400 tokens; the bandwidth is the card's specification, and the bytes are computed from the shapes), and the old 8x kernel took
+10.7 ms. The A770's gain is the same kernel at 10.7 ms against the old kernel's 20.9 ms. Models without Q4_0 weights do not enter these paths (`code`).
