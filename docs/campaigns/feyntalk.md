@@ -184,7 +184,7 @@ scan, reasoning split, UTF-8 hold-back and tool parsing.
 | `max_output_tokens` (≥ 16) | `sampler.max_tokens` | `code` |
 | `parallel_tool_calls` | `ChatRequest::parallel_tool_calls` | `code` |
 | `reasoning.effort` `"none"` | `enable_thinking=false` | the fleet's switch `code` |
-| `reasoning.effort` low/medium/high/xhigh/minimal | `enable_thinking=true` | Qwen templates know on/off only (`src/core/chat.cpp:354` comment) `code`; echoed unchanged |
+| `reasoning.effort` low/medium/high/xhigh/minimal | `enable_thinking=true`; the level reaches a template that reads `reasoning_effort` (core/chat.cpp `template_reasoning_effort`): passed through where the template quotes it, else minimal -> low, high -> xhigh, xhigh -> high; the chat route's `reasoning_effort` the same, minimal included (operator 2026-11-04) | Qwen3.8 / Flash-Next templates take xhigh/medium/low and map high themselves; medium renders no instruction `code`; echoed unchanged |
 | `reasoning.summary` | accepted, echoed `null`; no summary is produced | 1.3.x |
 | `truncation` `"disabled"` or absent | no truncation; `§3.8` 400 only at `prompt_tokens >= n_ctx`, with the numbers | `paper`: `disabled` MUST fail; `code`, byte-identical |
 | `truncation` `"auto"` | the fit pass drops rendered replayed reasoning blocks oldest first until the prompt fits `n_ctx - reserve` (W3.5); never refuses more than `disabled`; `arcint:truncated` / `arcint.truncated` reports it | `paper`: `auto` MAY truncate, not MUST; operator decision 2026-10-31, `code` |

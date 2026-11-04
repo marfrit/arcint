@@ -1341,6 +1341,10 @@ public:
                     // variable (the coder template's own switch), whether or not
                     // it renders reasoning_content at all.
                     {"supports_preserve_thinking", template_src_.find("preserve_thinking") != std::string::npos},
+                    // The reasoning_effort levels the template takes (the ones it
+                    // quotes), from the scan the render maps a client's level with;
+                    // empty for a template that does not read the variable.
+                    {"reasoning_effort_levels", template_reasoning_effort_levels(template_src_)},
                     // The vocab's BOS rule: the generation prepends BOS when the
                     // rendered template did not write it, and /tokenize's count
                     // applies the same rule. A proxy reads it here.

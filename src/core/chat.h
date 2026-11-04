@@ -75,8 +75,8 @@ struct ChatRequest {
     bool preserve_thinking     = false;
     bool has_preserve_thinking = false;
     // OpenAI's top-level reasoning_effort, as the client sent it (empty when it
-    // sent none). template_context maps it to a level the model's template
-    // accepts and hands it over as the `reasoning_effort` variable.
+    // sent none). template_context hands it to a template that reads the
+    // `reasoning_effort` variable, rewritten only where the template cannot take it.
     std::string reasoning_effort;
     // The raw chat_template_kwargs object, passed through to the template (the
     // llama-server dialect: the keys are template-specific and a client may
@@ -159,11 +159,13 @@ bool reserved_template_context_key(std::string_view key);
 // Pure: the one construction the llama render_chat and the unit test share.
 //
 // `template_src` is the model's chat template text. With it, a top-level
-// reasoning_effort reaches the template as `reasoning_effort` at a level that
-// template accepts (a template naming 'xhigh', Qwen3.8's, gets low/medium/xhigh;
-// any other gets low/medium/high), unless chat_template_kwargs sets the key
-// itself. none/off and unknown levels pass no level. Enforced by test_chat.cpp's
-// reasoning_effort_* cases.
+// reasoning_effort reaches a template that reads the variable as
+// `reasoning_effort`: the client's level when the template quotes it, else the
+// nearest it takes (minimal -> low, high -> xhigh, xhigh -> high), unless
+// chat_template_kwargs sets the key itself; a null kwarg reads as absent and
+// does not suppress the level. Without a source (the parse-time reserved-key
+// check) no level is mapped. none/off and unknown levels pass no level.
+// Enforced by test_chat.cpp's and test_chat_render.cpp's reasoning_effort_* cases.
 nlohmann::json template_context(const ChatRequest& req, std::string& error,
                                 std::string_view template_src = {});
 
