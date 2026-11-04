@@ -102,6 +102,9 @@ TEST(llama_backend_publishes_supports_preserve_thinking) {
     const std::string src = ss.str();
     CHECK(src.find("supports_preserve_thinking") != std::string::npos);
     CHECK(src.find("supports_preserve_reasoning") != std::string::npos);   // kept
+    // the levels the template takes, from the same scan the render maps with
+    CHECK(src.find("\"reasoning_effort_levels\", template_reasoning_effort_levels(template_src_)") !=
+          std::string::npos);
 }
 
 // The wire from render_chat to the shared construction: only a scan can see it

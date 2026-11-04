@@ -63,3 +63,30 @@ TEST(reasoning_effort_renders_through_a_qwen38_style_template) {
     }
     CHECK(raw_high_raises);
 }
+
+// The real Qwen3.8 template maps "high" to "xhigh" itself, so the client's
+// level passes through unchanged and the template translates it.
+TEST(reasoning_effort_high_passes_through_a_template_that_maps_it) {
+    constexpr const char* kMapsHigh =
+        "{%- set r = reasoning_effort|default('xhigh') %}"
+        "{%- if r == 'high' %}{%- set r = 'xhigh' %}{%- endif %}"
+        "{%- if r not in ('xhigh', 'medium', 'low') %}{{- raise_exception('bad effort') }}{%- endif %}"
+        "effort={{ r }}";
+    nlohmann::json body = {{"model", "qwen3.8-27b"},
+                           {"messages", nlohmann::json::array({{{"role", "user"}, {"content", "hi"}}})},
+                           {"reasoning_effort", "high"}};
+    ChatRequest req;
+    CHECK(!parse_chat_request(body, req).has_value());
+    std::string err;
+    const nlohmann::json ctx = template_context(req, err, kMapsHigh);
+    CHECK(err.empty());
+    CHECK_EQ(ctx.value("reasoning_effort", nlohmann::json()), nlohmann::json("high"));
+    minja::chat_template tmpl(kMapsHigh, "", "");
+    minja::chat_template_inputs in;
+    in.messages              = nlohmann::ordered_json::array({{{"role", "user"}, {"content", "hi"}}});
+    in.add_generation_prompt = true;
+    in.extra_context         = ctx;
+    minja::chat_template_options opts;
+    opts.apply_polyfills = false;
+    CHECK_EQ(tmpl.apply(in, opts), std::string("effort=xhigh"));
+}

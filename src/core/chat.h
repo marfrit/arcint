@@ -167,6 +167,11 @@ bool reserved_template_context_key(std::string_view key);
 nlohmann::json template_context(const ChatRequest& req, std::string& error,
                                 std::string_view template_src = {});
 
+// The levels of low/medium/high/xhigh a chat template takes for the
+// reasoning_effort variable: the ones it quotes as a token, and only when it
+// reads the variable at all (empty otherwise). /props publishes them.
+std::vector<std::string> template_reasoning_effort_levels(std::string_view template_src);
+
 // M0 stub prompt rendering.
 //
 // This is NOT the model's chat template. DESIGN.md §3.7 makes the artifact the

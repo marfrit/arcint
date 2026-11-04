@@ -598,6 +598,10 @@ std::string template_reasoning_effort(std::string_view level, std::string_view t
 }
 }  // namespace
 
+std::vector<std::string> template_reasoning_effort_levels(std::string_view) {
+    return {};   // red stub
+}
+
 nlohmann::json template_context(const ChatRequest& req, std::string& error,
                                 std::string_view template_src) {
     error.clear();
