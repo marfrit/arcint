@@ -161,6 +161,7 @@ def main():
     p.add_argument("--port", type=int, default=8095)
     p.add_argument("--out", default=".")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--any-model", action="store_true", help="another file, measured the same way; not a row of the tables' model")
     a = p.parse_args()
     kvs = a.kv or ["f16"]
     if a.dry_run:
@@ -168,7 +169,7 @@ def main():
             for kv in kvs:
                 print(" ".join(server_argv(a.arcint, a.model, device, a.port, kv)))
         return
-    if sha256(a.model) != MODEL_SHA256:
+    if not a.any_model and sha256(a.model) != MODEL_SHA256:
         sys.exit("not the tables' file: llama-2-7b.Q4_0.gguf's sha256 differs")
     os.makedirs(a.out, exist_ok=True)
     version = subprocess.run([a.arcint, "--version"], capture_output=True, text=True).stdout.strip()
