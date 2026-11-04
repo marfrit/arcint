@@ -115,7 +115,9 @@ TEST(llama_backend_render_chat_uses_the_template_context) {
     std::string nows;
     for (char c : ss.str())
         if (c != ' ' && c != '\t' && c != '\n' && c != '\r') nows += c;
-    CHECK(nows.find("extra=template_context(req,ctx_error)") != std::string::npos);
+    // The render hands the template's own source over: the reasoning_effort
+    // level is mapped to the set that template accepts.
+    CHECK(nows.find("extra=template_context(req,ctx_error,template_src_)") != std::string::npos);
     CHECK(nows.find("inputs.extra_context=extra") != std::string::npos);
 }
 

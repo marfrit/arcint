@@ -336,6 +336,85 @@ TEST(template_context_carries_the_typed_switches_and_the_passthrough) {
     CHECK(!ctx.contains("messages"));
 }
 
+// OpenAI's top-level reasoning_effort: the level reaches the template as the
+// variable `reasoning_effort`, at a value that template accepts. Two minimal
+// templates stand in for the two dialects: Qwen3.8's (names 'xhigh', raises on
+// anything outside xhigh/medium/low) and OpenAI's low/medium/high (gpt-oss).
+namespace {
+constexpr const char* kXhighTemplate =
+    "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}"
+    "{%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}"
+    "{{- raise_exception('bad effort') }}{%- endif %}";
+constexpr const char* kPlainTemplate = "Reasoning: {{ reasoning_effort|default('medium') }}";
+
+json effort_context(const json& body, const char* tmpl) {
+    ChatRequest req;
+    const auto  perr = parse_chat_request(body, req);
+    CHECK(!perr.has_value());
+    std::string err;
+    const json  ctx = template_context(req, err, tmpl);
+    CHECK(err.empty());
+    return ctx;
+}
+}   // namespace
+
+TEST(reasoning_effort_medium_reaches_an_xhigh_template) {
+    json body                = minimal_chat();
+    body["reasoning_effort"] = "medium";
+    const json ctx = effort_context(body, kXhighTemplate);
+    CHECK_EQ(ctx.value("reasoning_effort", json()), json("medium"));
+    CHECK_EQ(ctx.value("enable_thinking", json()), json(true));
+}
+
+TEST(reasoning_effort_high_maps_to_the_templates_top_level) {
+    json body                = minimal_chat();
+    body["reasoning_effort"] = "high";
+    // Qwen3.8 has no "high": its top level is xhigh.
+    CHECK_EQ(effort_context(body, kXhighTemplate).value("reasoning_effort", json()), json("xhigh"));
+    // A low/medium/high template must not receive "xhigh".
+    CHECK_EQ(effort_context(body, kPlainTemplate).value("reasoning_effort", json()), json("high"));
+    body["reasoning_effort"] = "xhigh";
+    CHECK_EQ(effort_context(body, kXhighTemplate).value("reasoning_effort", json()), json("xhigh"));
+    CHECK_EQ(effort_context(body, kPlainTemplate).value("reasoning_effort", json()), json("high"));
+    body["reasoning_effort"] = "minimal";
+    // minimal turns thinking off (as before) and still names the lowest level.
+    const json ctx = effort_context(body, kXhighTemplate);
+    CHECK_EQ(ctx.value("reasoning_effort", json()), json("low"));
+    CHECK_EQ(ctx.value("enable_thinking", json()), json(false));
+    CHECK_EQ(effort_context(body, kPlainTemplate).value("reasoning_effort", json()), json("low"));
+}
+
+TEST(reasoning_effort_none_passes_no_level) {
+    json body                = minimal_chat();
+    body["reasoning_effort"] = "none";
+    const json ctx = effort_context(body, kXhighTemplate);
+    CHECK(!ctx.contains("reasoning_effort"));
+    CHECK_EQ(ctx.value("enable_thinking", json()), json(false));
+    body["reasoning_effort"] = "off";
+    CHECK(!effort_context(body, kPlainTemplate).contains("reasoning_effort"));
+}
+
+TEST(reasoning_effort_template_kwarg_wins_over_the_top_level_field) {
+    json body                    = minimal_chat();
+    body["reasoning_effort"]     = "medium";
+    body["chat_template_kwargs"] = json{{"reasoning_effort", "low"}};
+    const json ctx = effort_context(body, kXhighTemplate);
+    CHECK_EQ(ctx.value("reasoning_effort", json()), json("low"));
+    CHECK_EQ(ctx.value("enable_thinking", json()), json(true));
+}
+
+TEST(reasoning_effort_unknown_level_passes_no_level_and_no_error) {
+    json body                = minimal_chat();
+    body["reasoning_effort"] = "turbo";
+    ChatRequest req;
+    CHECK(!parse_chat_request(body, req).has_value());   // accepted, as before
+    std::string err;
+    const json  ctx = template_context(req, err, kXhighTemplate);
+    CHECK(err.empty());
+    CHECK(!ctx.contains("reasoning_effort"));   // the template's default applies
+    CHECK_EQ(ctx.value("enable_thinking", json()), json(true));
+}
+
 TEST(template_context_refuses_reserved_keys) {
     // The context keys minja sets itself: a client may not override them.
     static constexpr const char* kReserved[] = {"messages", "add_generation_prompt", "bos_token",
