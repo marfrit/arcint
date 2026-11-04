@@ -259,6 +259,7 @@ if(ARCINT_TESTS)
     tests/test_sampling.cpp
     tests/test_stop.cpp
     tests/test_chat.cpp
+    tests/test_chat_render.cpp
     tests/test_text.cpp
     tests/test_config.cpp
     tests/test_verify_walk.cpp

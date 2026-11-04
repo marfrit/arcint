@@ -4,6 +4,7 @@
 #include "api/responses_state.h"
 #include "api/responses_stream.h"
 
+#include "core/chat.h"
 #include "core/renderer_material.h"
 #include "util/canonical_json.h"
 
@@ -414,6 +415,36 @@ TEST(responses_maps_the_sampler_and_the_thinking_switch) {
     CHECK(r2.chat.enable_thinking);
     CHECK_EQ(r2.reasoning["effort"].get<std::string>(), std::string("high"));
     CHECK(r2.reasoning["summary"].is_null());
+}
+
+// reasoning.effort is the Responses spelling of the chat route's
+// reasoning_effort: the level reaches the template through the same mapping
+// (core/chat.cpp template_context), so a Qwen3.8 template asked "medium" does
+// not render its default xhigh, and a low/medium/high template never gets
+// "xhigh". The thinking switch keeps its derivation ("none" off, else on).
+TEST(responses_reasoning_effort_reaches_the_template_context) {
+    constexpr const char* kXhigh =
+        "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}";
+    constexpr const char* kPlain = "Reasoning: {{ reasoning_effort|default('medium') }}";
+    const auto ctx_for = [](const char* effort, const char* tmpl) {
+        json body         = base();
+        body["reasoning"] = {{"effort", effort}};
+        ResponseRequest r;
+        parse_ok(body, r);
+        std::string err;
+        const json  ctx = template_context(r.chat, err, tmpl);
+        CHECK(err.empty());
+        return ctx;
+    };
+    const json medium = ctx_for("medium", kXhigh);
+    CHECK_EQ(medium.value("reasoning_effort", json()), json("medium"));
+    CHECK_EQ(medium.value("enable_thinking", json()), json(true));
+    CHECK_EQ(ctx_for("high", kXhigh).value("reasoning_effort", json()), json("xhigh"));
+    CHECK_EQ(ctx_for("high", kPlain).value("reasoning_effort", json()), json("high"));
+    CHECK_EQ(ctx_for("xhigh", kPlain).value("reasoning_effort", json()), json("high"));
+    const json none = ctx_for("none", kXhigh);
+    CHECK(!none.contains("reasoning_effort"));
+    CHECK_EQ(none.value("enable_thinking", json()), json(false));
 }
 
 TEST(responses_accepts_text_format_text_and_verbosity) {
