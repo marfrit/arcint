@@ -437,6 +437,24 @@ quoted source, not yet read here):
 - Discarded: its top finding, an "upstream" Intel DPAS MoE kernel, was our own
   patch 0001 in the tree it read.
 
+### The KV-cache rotations as dense products (0095, 2026-11-04)
+
+Reference: llama.cpp's own `ggml-cuda/fwht.cu` and `ggml_compute_forward_fwht` (`code`): a MUL_MAT with
+`GGML_HINT_SRC0_IS_HADAMARD` is a fast Walsh-Hadamard transform of each src1 row.
+
+The profile's unidentified F32 split-K GEMM (`kernel_mul_mm_f32_f32_l4_lm` + `kernel_sum_slices_f32`, 24,615 pairs, 750 ms
+of a 22.3 s B60 decode window, ~2.35 ms a verify step, `measured-here`) is the rotation matrices 0094 keeps on the device:
+a trace of every F32 MUL_MAT names `attn_rot_dev_256` and `attn_rot_dev_64` (28,124 calls) beside `ssm_alpha` / `ssm_beta`
+(16,128 each). Rotation columns are heads x tokens, so a verify step's run at 24-576 columns (split-K), while alpha/beta
+at 6 columns are the gemv.
+
+Gate: the verify step improves on both cards, prefill does not regress, the answers stay right; the answer-level bar
+before a release. Built as patch 0095; results in `contrib/llama.cpp/README.md` (`measured-here`: about 2 ms a verify
+step on both cards). Open: the KL arm; the work-group size (one row a work-group, a local size of 64-128 not measured);
+a repeat on Flash-Next (one round, inconclusive); whether the coder's lower draft acceptance on 3 prompts is more than
+text dependence (the dense model's did not drop). Not built, because both change the numerics: `LLAMA_ATTN_ROT_DISABLE=1`
+and `n_rot_k` 64 (the code's own TODO).
+
 ## Gate
 
 Per lever, against the build before it on the same card:

@@ -6423,3 +6423,12 @@ test-backend-ops `MUL_MAT_HADAMARD` (the upstream cases; 5 of the 14 reach the k
 cases decline to the dense path): 14/14 on the B60 and the A770 with and without the switch; a mutant (one butterfly
 sign flipped) fails exactly the 5 with the switch on and passes with it off. Reviewed by Qwen3.8-Flash-Next (the op check,
 the 2-D src0 and the subgroup-size gate came from its review).
+
+Served (`measured-here`, the same binary with `GGML_OPENCL_FWHT=0` against on, each card in one window): the dense
+Qwen3.8-27B (B60, q8_0:q4_0 KV, 262,144 tokens, replay, MTP 5) a verify step 59.5 -> 57.5 ms (-3.4 %), decode 47.7 ->
+50.0 t/s over 3 prompts x 2 rounds at temp 0 (draft acceptance 46.5 -> 47.2 %), prefill 714.8 -> 726.0 t/s at 55k and
+502.5 -> 507.4 at 138k, texts identical in the A/B tool's cells; the coder (A770, q8_0:q4_0 KV, MTP 4) a verify step
+35.0 -> 33.1 ms (-5.5 %), prefill 775.9 -> 781.1 at 41k, every answer right, draft acceptance lower on all 3 prompts
+(37.9 -> 36.2, 39.2 -> 33.7, 30.0 -> 28.8 %) so decode t/s stayed mixed (+1.1, -4.5, +3.2 %) with the texts differing;
+Flash-Next (B60, one round) prefill 534.5 -> 538.5, decode 33.1 -> 31.8 t/s at acceptance 69.3 -> 62.7 %, inconclusive.
+The answer-level KL arm is owed before a release.
