@@ -6441,3 +6441,23 @@ unitrace). Q4_0 has IQ4_NL's flat planes (16 code bytes and one f16 scale per 32
 nibbles 16..31) with the value n - 8, so the path is IQ4_NL's: up to 4 columns `kernel_mul_mv_q4_0_q8_1` (the q8_1
 integer-dot matvec), from 16 columns `kernel_mul_mm_q4_0_f16` (the fp16 XMX GEMM, n - 8 taken in integers); 5 to 15 columns
 stay on upstream's path, unmeasured. A KV cache's Q4_0 is AoS and declines. `GGML_OPENCL_Q40_XMX=0` keeps the float kernels.
+
+Measured (`measured-here`, window 73/74, both cards, A770 GT pinned at 2000 MHz; arcint at qfndev cb8151bd, served through
+`tools/llama_scoreboard.py`, n_ctx 4096, f16 KV, 5 repetitions):
+
+| Chip | pp512 before -> after | tg128 before -> after |
+|---|---|---|
+| Arc A770 16 GB | 362.73 -> 1956.15 ± 2.93 (5.4x) | 39.48 -> 63.56 ± 0.06 (+61 %) |
+| Arc Pro B60 24 GB | 425.57 -> 2332.94 ± 3.28 (5.5x) | 76.24 -> 75.77 ± 0.02 (-0.6 %) |
+
+The answer-level bar on both cards, each arm against a CPU reference over 16 x 512 tokens: mean KL 0.000431-0.000432 nats
+with the switch on and off, at `-b 512` (the GEMM) and `-b 4` (the matvec); argmax agreement 99.07 % on, 99.09 % off (A770,
+`-b 512`, 0.02 points); 9/9 facts in all four served arms, with the same text on and off and across the cards.
+`test-backend-ops -o MUL_MAT -p type_a=q4_0`: 161/161 on both cards, switch on and off. Mutants with the switch on: `(char4)(7)`
+fails 43 (A770) and 44 (B60) cases, all at 1-4 columns and none from 16; `(char16)(7)` fails 32 on both, 28 of them from 16
+columns and none at 1-4. With the switch off the matvec mutant passes 161/161 on both cards.
+
+The B60's decode did not move because it is held elsewhere: the matvec takes 10.0 ms a token at ~3.3 GB of weights, about
+330 GB/s against the card's ~456 GB/s of memory bandwidth (`measured-here` for the kernel time, under unitrace; the bandwidth is
+the card's specification, and the weight bytes are computed from the shapes), and the old 8x kernel took 10.3 ms. The A770's
+gain is the same kernel at 10.3 ms against the old kernel's 20.1 ms. Models without Q4_0 weights do not enter these paths (`code`).

@@ -257,20 +257,23 @@ index df67519..f850997 100644
  MV_KERNEL(kernel_mul_mv_iq2_s_q8_1, 7)
  MV_KERNEL(kernel_mul_mv_iq1_m_q8_1, 8)
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index c35c3bf..6228f99 100644
+index c35c3bf..7bdc75e 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11315,6 +11315,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11315,6 +11315,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 4));
      test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 128, 4));
  
 +    // 0096: dense Q4_0 on the Intel fast paths: 1-4 columns the matvec, from 16 the GEMM,
 +    // K of the model's weights and rows past a tile
 +    for (int n : {1, 2, 3, 4, 8, 16, 32, 512}) {
-+        for (auto mk : std::vector<std::pair<int, int>>{{64, 32}, {4096, 4096}, {11008, 4096}, {37, 256}}) {
-+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, mk.first, n, mk.second));
++        for (auto mk : std::vector<std::pair<int, int>>{{64, 32}, {4096, 4096}, {11008, 4096}, {32000, 4096}, {37, 256}}) {
++            // a layer's operands are 2-D: bs and nr of 1, or the fast paths decline
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
 +        }
 +    }
++    // batched operands decline to the old path
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 64, 16, 32));
 +
      // FWHT tests
      test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));

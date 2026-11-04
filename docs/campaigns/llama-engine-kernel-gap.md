@@ -468,10 +468,34 @@ clock pinned at 2000 MHz):
 | Arc Pro B60 24 GB | 425.57 ± 0.33 | 76.24 ± 0.01 | f16 (the tables') |
 | Arc Pro B60 24 GB | 423.28 ± 0.27 | 68.92 ± 0.02 | q8_0:q4_0 |
 
-These rows do not show the series' gains: its integer-dot and XMX weight GEMMs are K-quant, Q8_0 and MoE paths, and dense
-Q4_0 is not a type any served model uses (`code`). The B60 prefills this 7B slower than the Q4_K_M 27B at 55k (726 t/s,
-`measured-here`), which fits that, and Llama 2 also has attention in all 32 layers where the Qwen models have it in a
-minority. Both explanations are `inferred`: no profile of this model was taken.
+These rows did not show the series' gains. Profiled afterwards (`measured-here`, unitrace): upstream's tiled Q4_0 GEMM took
+~95 % of a 512-token prefill and its 8x matvec 2/3 to 4/5 of a decode step, on both cards. RETRACTED, the second explanation
+this section gave before the profile: Llama 2's attention in all 32 layers (`inferred`, never measured). Attention is not where
+the time went; dense Q4_0 on float kernels is.
+
+Patch 0096 puts Q4_0 on the integer-dot matvec and the XMX GEMM. The same measurement afterwards (qfndev cb8151bd, `measured-here`):
+
+| Chip | pp512 t/s | tg128 t/s | KV |
+|---|---|---|---|
+| Arc A770 16 GB | 1956.15 ± 2.93 | 63.56 ± 0.06 | f16 (the tables') |
+| Arc A770 16 GB | 1829.08 ± 2.73 | 54.89 ± 0.01 | q8_0:q4_0 |
+| Arc Pro B60 24 GB | 2332.94 ± 3.28 | 75.77 ± 0.02 | f16 (the tables') |
+| Arc Pro B60 24 GB | 2262.01 ± 1.25 | 68.63 ± 0.02 | q8_0:q4_0 |
+
+The community rows (self-reported in llama.cpp discussions #10879 and #23313, class `paper`; other drivers and hosts) on the same
+file: the A770 under Vulkan with flash attention 1119.68/53.07, without 1073.85/52.56, under SYCL fp32 with 706.72/67.09, without
+937.24/59.03; the B60 under SYCL fp16 with 928.91/84.44, without 1869.16/80.03, under Vulkan with 274.76/70.54, without
+522.36/68.55. arcint's rows run flash attention, and leads prefill on both cards; on decode it leads Vulkan on both and sits 5 %
+(A770) to 10 % (B60) under the SYCL FA rows.
+
+Other files, the same tool (`--any-model`, `measured-here`, B60, f16 KV): Qwen3.8-27B Q4_K_M 846.96 ± 4.02 / 19.78 ± 0.00 (at
+13b2a457), and Qwen3.6-35B-A3B Q4_K_M 2342.51 ± 18.82 / 82.79 ± 0.02. The community's nearest rows are SYCL fp16 `qwen35 27B
+Q4_K_M` 507.51/14.92 and `qwen35moe 35B.A3B Q4_K_M` 774.92/81.63: other model versions or unverified files, so a neighbourhood,
+not a like-for-like.
+
+The B60's decode gap is not in the kernel: at 75.77 t/s a token is 13.2 ms, of which the matvec takes 10.0 (about 330 GB/s of
+weights against ~456 GB/s of memory bandwidth, `measured-here` for the time, under unitrace) and the other kernels ~1.4; the
+remaining ~1.8 ms is not attributed, and the launch gaps between kernels are the candidate (`inferred`, not measured here).
 
 ## Gate
 
