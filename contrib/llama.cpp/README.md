@@ -6402,3 +6402,19 @@ off): the coder (A770) decode +1.8 / +2.0 / +1.8 %, prefill-41k +6.6 %, texts md
 Flash-Next equal (Flash-Next's qwen4exp graph has no KV-only pass). Every other switch of the series stays off:
 0081 rows, 0082, 0083 bits 1 and 4 and 0084 gave nothing; 0088/0089 cost decode; replay (0086/0087/0091) is a
 per-unit choice where its VRAM buys context (the agent's sample unit).
+
+## 0095-opencl-fwht-hadamard.patch
+
+The KV cache rotations (`llama_mul_mat_hadamard`, the `attn_rot_dev_*` matrices that 0094 keeps on the device) are
+MUL_MAT nodes with `GGML_HINT_SRC0_IS_HADAMARD`: a product with the orthonormal Sylvester Hadamard matrix, which the
+CPU (`ggml_compute_forward_fwht`) and CUDA (`ggml-cuda/fwht.cu`) backends compute as a fast Walsh-Hadamard transform
+of each src1 row. The OpenCL backend ignored the hint and ran them as dense F32 products: the F32 skinny split-K path
+(GEMM + slice sum), 24,615 pairs and 750 ms of a 22.3 s B60 decode window, ~2.35 ms a verify step
+(`measured-here`, Qwen3.8-27B, q8_0:q4_0 KV, MTP 5; identified by a src0-name trace of every F32 MUL_MAT). The patch
+adds `kernel_fwht_f32_{64,128,256}` (`fwht_f32.cl`: one row per 16-wide subgroup, the stages below 16 by subgroup
+shuffles, the rest in registers, as fwht.cu does per warp) and takes the product ahead of every other MUL_MAT path
+under the conditions of the reference (src0 / src1 / dst F32, src1 and dst contiguous and the same shape). Intel
+only; widths 512 and up keep the dense product (the 512 kernel spilled at SIMD16 on the A770, offline ocloc).
+`GGML_OPENCL_FWHT=0` keeps the dense product. test-backend-ops `MUL_MAT_HADAMARD` (upstream cases): 14/14 on the B60
+and the A770 with and without the switch; a mutant (one butterfly sign flipped) fails 6 of them with the switch on
+and passes with it off.
