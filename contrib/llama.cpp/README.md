@@ -6430,8 +6430,21 @@ Qwen3.8-27B (B60, q8_0:q4_0 KV, 262,144 tokens, replay, MTP 5) a verify step 59.
 502.5 -> 507.4 at 138k, texts identical in the A/B tool's cells; the coder (A770, q8_0:q4_0 KV, MTP 4) a verify step
 35.0 -> 33.1 ms (-5.5 %), prefill 775.9 -> 781.1 at 41k, every answer right, draft acceptance lower on all 3 prompts
 (37.9 -> 36.2, 39.2 -> 33.7, 30.0 -> 28.8 %) so decode t/s stayed mixed (+1.1, -4.5, +3.2 %) with the texts differing;
-Flash-Next (B60, one round) prefill 534.5 -> 538.5, decode 33.1 -> 31.8 t/s at acceptance 69.3 -> 62.7 %, inconclusive.
-The answer-level KL arm is owed before a release.
+Flash-Next (B60, one round) prefill 534.5 -> 538.5, decode 33.1 -> 31.8 t/s at acceptance 69.3 -> 62.7 %, inconclusive; three
+rounds of the release A/B (window 75) gave 32.63 -> 32.67 t/s, acceptance 66-70 % in both arms, PASS.
+
+Against draft acceptance and at the answer (`measured-here`, window 76, the main-merge RC 31e021e4 with `GGML_OPENCL_FWHT=0` against
+on, the deployed unit flags, 12 greedy answers of up to 300 tokens per run, two rounds an arm). The coder (A770) 72.26 and 71.83 t/s off, 74.47
+and 75.33 on (+4.0 %), acceptance 72.0 and 72.6 % off, 72.1 and 72.6 % on, a verify step 27.4 -> 26.3 ms. The agent (B60) 46.23 and 46.38 off,
+47.59 and 47.51 on (+2.7 %), acceptance 47.0 and 47.2 % off, 46.9 and 46.5 % on, a verify step 59.1 -> 57.2 ms. KL of the agent against
+window 61's CPU reference (16 x 512, q8_0:q4_0 KV): 0.004946 -> 0.004095 nats at `-ub 512`, 0.006860 -> 0.006872 at `-ub 1`, top-1 96.96 ->
+96.94 % and 96.74 -> 96.89 %. Inside the answer-level bar on all of them.
+
+The release A/B against 1.5.0 (window 75) went red on the coder's `decode-b`: 53.75 -> 51.50 t/s, the only metric of the leg below the old arm,
+with decode-a +2.3 %, decode-c +2.6 %, prefill-41k +0.8 %. That answer's text moved with the rounding and its draft acceptance fell 39.2 -> 33.7 %
+while its verify step went 34.7 -> 32.5 ms. Three answers each carried one md5 per arm, so `ab.py` gated every run instead of a majority answer.
+The wider set above shows no acceptance cost on the coder, so this is one answer's text, not the kernel's speed. The operator accepted the
+red cell on 2026-11-05.
 
 ## 0096-opencl-intel-dense-q4_0.patch
 
