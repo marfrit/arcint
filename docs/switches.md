@@ -98,7 +98,7 @@ These names are not in a table:
 | `GGML_OPENCL_FA_GQA_MIN_ROWS` | 4 | Least query rows routed to the GQA decode kernel. With `GGML_OPENCL_FA_GQA_I8=1`, 1-3 rows take the staged form when it was built; 4+ the direct one. | 0016, 0089 | 1-3 rows faster on the split kernel before 0089: 6 rows 10.3 ms against 4.83 ms the other way (`measured-here`); 0089's staged path is the fork's 48K 1-token 433 -> 244 us (`paper`). |
 | `GGML_OPENCL_FA_GQA_OPTS` | none | Extra build options for the GQA attention programs. Carries `GQA_K_STAGED`, `GQA_K_DIRECT`, `BK`, `GQA_ST`, and the red case `-DBK=24`. | 0016 | Red case fails 41 of 53 cases at one geometry (`measured-here`, README 0017). |
 | `GGML_OPENCL_FA_GQA_SIDES` | 2 (1, 2 or 4) | Sub-groups per 8 rows in the GQA kernel, for build and dispatch. | 0016 | — |
-| `GGML_OPENCL_FA_INTEL_KV_PER_SPLIT` | 128 | Keys a split in the per-head Intel decode kernel. | 0007 | — |
+| `GGML_OPENCL_FA_INTEL_KV_PER_SPLIT` | by depth | Keys a split in the per-head Intel decode kernel; a value fixes it, 128 is the old default. Unset: n_kv/16 in 16-512 for f16 K/V, n_kv/32 in 16-128 for quantized. | 0007, 0097 | A grid of 16-512 keys a split at 0-16,384 keys on both cards (`measured-here`). |
 | `GGML_OPENCL_FA_INTEL_OPTS` | none | Extra build options for Intel's FA programs (for tuning). | 0007 | — |
 | `GGML_OPENCL_FA_SG8_NSG` | 16 (8, 16 or 32; used with the global-Q build) | Sub-groups a work-group in the sub-group-8 prompt attention. | 0039 | — |
 | `GGML_OPENCL_FUSE_0051_PART` | 3 | Which GDN gating inputs fold into the kernel: 1 gate, 2 beta, 3 both. | 0051 | Both: +0.3 % dense agent, +0.9-1.2 % coder, neutral Flash-Next (`measured-here`). |
