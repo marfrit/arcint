@@ -11,6 +11,7 @@ filter and the order; the material is in `research-concept-mining/`:
   pricing measurement, an implementation sketch with red-first tests;
 - `design-layer-major.md`: how candidate 1 would be built in the llama engine, and why its prize here is small.
 - `arc-b580/`: the same method on one Arc inference fork (208 commits), ranked and audited against our code.
+- `ipex-llm/`: the same method on Intel's IPEX-LLM (4,113 commits, plus its llama.cpp wheel read as a binary, 2026-11-05).
 
 Evidence classes: an engine's numbers are `paper` for us; what was read in a source tree is `code`; nothing
 in this survey was run on our cards. Every row has to be priced on the cards before it counts.
