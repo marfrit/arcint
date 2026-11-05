@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -11,7 +12,9 @@
 #include <httplib.h>
 
 #ifndef _WIN32
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -330,6 +333,88 @@ TEST(stop_signal_aborts_a_running_generation) {
     CHECK_EQ(r.status, 503);
     CHECK_EQ(r.body["error"]["code"].get<std::string>(), std::string("server_stopping"));
     CHECK(!r.gone);
+}
+
+// The listening socket's options, on real sockets. httplib's default on Linux
+// is SO_REUSEPORT alone: a second server of the same user then shares the port
+// and takes part of its requests, and a restart after a server that used
+// SO_REUSEADDR cannot bind while that server's connections sit in TIME_WAIT.
+namespace {
+
+int bind_test_port() { return 20000 + static_cast<int>(::getpid()) % 20000; }
+
+// Serves on a thread until its destructor; up() says whether it answered /health.
+struct RunningServer {
+    Config                      cfg;
+    std::unique_ptr<Backend>     backend;
+    api::SlotPool               slots{1};
+    api::Context                ctx;
+    std::unique_ptr<HttpServer> server;
+    std::atomic<int>            listen_result{-1};
+    std::thread                 th;
+
+    explicit RunningServer(int port) {
+        cfg.stub = true;
+        cfg.host = "127.0.0.1";
+        cfg.port = port;
+        backend  = make_stub_backend(4096, 0, {}, {}, {}, 4);
+        ctx.cfg     = &cfg;
+        ctx.backend = backend.get();
+        ctx.slots   = &slots;
+        server      = std::make_unique<HttpServer>(cfg, ctx);
+        th = std::thread([this] { listen_result = server->listen() ? 1 : 0; });
+    }
+    bool up() const {
+        httplib::Client c("127.0.0.1", cfg.port);
+        for (int i = 0; i < 200 && listen_result.load() != 0; ++i) {
+            if (auto r = c.Get("/health")) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
+    }
+    ~RunningServer() {
+        server->stop();
+        th.join();
+    }
+};
+
+}  // namespace
+
+TEST(a_second_server_on_the_port_is_refused) {
+    const int     port = bind_test_port();
+    RunningServer first(port);
+    CHECK(first.up());
+    RunningServer second(port);
+    for (int i = 0; i < 200 && second.listen_result.load() < 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK_EQ(second.listen_result.load(), 0);
+    CHECK(first.up());
+}
+
+TEST(a_server_binds_after_a_reuseaddr_servers_time_wait) {
+    const int port = bind_test_port() + 1;
+    // Another server's closed connection: its side closes first, so the port
+    // holds a TIME_WAIT socket carrying SO_REUSEADDR.
+    const int lsn = ::socket(AF_INET, SOCK_STREAM, 0);
+    int       on  = 1;
+    ::setsockopt(lsn, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+    sockaddr_in a{};
+    a.sin_family      = AF_INET;
+    a.sin_port        = htons(static_cast<uint16_t>(port));
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK_EQ(::bind(lsn, reinterpret_cast<sockaddr*>(&a), sizeof a), 0);
+    CHECK_EQ(::listen(lsn, 1), 0);
+    const int cli = ::socket(AF_INET, SOCK_STREAM, 0);
+    CHECK_EQ(::connect(cli, reinterpret_cast<sockaddr*>(&a), sizeof a), 0);
+    const int acc = ::accept(lsn, nullptr, nullptr);
+    ::close(acc);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ::close(cli);
+    ::close(lsn);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    RunningServer server(port);
+    CHECK(server.up());
 }
 
 // The cause reaches the stats: a stop signal is not logged as a gone client.
