@@ -50,8 +50,12 @@ and [FreeToken](https://github.com/FlashML-org/FreeToken)
 mechanism.
 
 **History.** Until 0.7.12 arcint also had an OpenVINO engine, on a patched
-OpenVINO runtime. It was retired in 0.8.0; its design and record are at the
-tag [`openvino-history`](https://github.com/marfrit/arcint/tree/openvino-history)
+OpenVINO runtime. It began there partly because its first design wrote SYCL off
+as broken under the xe driver. That came from a note about runtimes older than
+the xe transition, no test of a current runtime backed it, and it was wrong
+(see "Why not just use …" below). The OpenVINO engine was retired in 0.8.0; its
+design and record are at the tag
+[`openvino-history`](https://github.com/marfrit/arcint/tree/openvino-history)
 ([docs/history.md](docs/history.md)).
 
 ## arcint measured the llama-bench way
@@ -478,15 +482,31 @@ service's production flags, Flash-Next's expert cache included
 
 - **llama.cpp's own server** on Arc: its OpenCL backend is tuned for Adreno
   (the dense 27B prefilled 71 t/s and decoded 10.3 t/s on the B60, against
-  695 and the MTP decode above with the series), SYCL aborts under the xe
-  driver, and Vulkan is slow on Battlemage. arcint carries the kernels as
-  patches against upstream and keeps llama.cpp's model code, its KV and its
-  checkpoint mechanism.
+  695 and the MTP decode above with the series). That is the backend arcint
+  builds on: it carries its kernels as patches against upstream and keeps
+  llama.cpp's model code, its KV and its checkpoint mechanism.
+- **SYCL** works under the xe driver, and llama.cpp's SYCL backend is under active
+  development upstream. It is a real alternative on these cards: its rows with flash attention lead
+  arcint's Llama 2 decode on both cards (the table above), and arcint leads on prefill.
+  On the B60, `measured-here`: Strata's SYCL engine ran under xe through Level Zero
+  (2026-10-06, the numbers under "Current numbers"), and llama.cpp's SYCL backend
+  through the OpenCL adapter gave 249 / 14.2 t/s on the dense 27B at 1k (2026-09-07,
+  an older build). The A770 enumerates under Level Zero here but has not run SYCL here; Strata
+  reports runs on an A770 under xe. One trap on Debian trixie: oneAPI 2026.1
+  segfaults in every SYCL program with the distribution's Level Zero loader (`libze1`
+  1.20.6), and loader 1.34 fixes it (`measured-here`).
+- **Vulkan** depends on the card. On the B60 it trails SYCL (the table above, and
+  126 / 7.8 t/s on the dense 27B at 1k, 2026-09-07, `measured-here`); on the A770 it leads
+  SYCL on prefill; and a B70 reports 4570.29 / 112.89.
 - **OpenVINO**: arcint's first engine (0.1-0.7.12). Its GPU plugin emits good
   Xe code, but the services needed an IR export per model and a GPU-plugin
   patch series on a pinned nightly, and the libllama engine overtook it on
   every service (DESIGN §6).
-- **vLLM**: no usable Intel path for these hybrid models on Arc.
+- **vLLM** has an Intel path: Intel's `llm-scaler-vllm` image and `vllm-xpu-kernels`,
+  one of arcint's design references. Reported on a B70 for the dense 27B (`paper`, not run
+  here on these cards): stock, MTP off, 26.4 t/s decode and about 1,670 t/s prefill at 8k and 1,173 at
+  110k (arcint on the B60: 707 at 55k, 500 at 138k); with EXL3 weights and MTP, 63-91 t/s decode.
+  arcint serves GGUF files and has an expert cache for models larger than the card.
 
 [CHANGELOG.md](CHANGELOG.md) lists what each release changed and what it
 depends on.
