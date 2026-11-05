@@ -1,5 +1,28 @@
 # IPEX-LLM, mined for arcint (2026-11-05)
 
+## Measured on our cards, after the mining (`measured-here`, 2026-11-05, windows 92-94)
+
+The wheel `bigdl_core_cpp` 2.7.0b20260110, run in a test container on the card host (compute runtime 26.35, oneAPI runtime libraries 2025.0.2 from PyPI, Level Zero loader 1.34, xe). arcint's rows in the same container, the same hour: B60 2328 / 80.8, A770 1951 / 70.6, within 0.5 % of its rows at runtime 26.27. Llama 2 7B Q4_0, llama-bench, 5 repetitions. `paper` rows are a different, older build on other machines; these do not settle what those did.
+
+| Card, flash attention | pp512 | tg128 | mean KL, whole chunks | mean KL, one token a ubatch | 8 fact questions |
+|---|---|---|---|---|---|
+| B60, off | 2825.67 | 80.54 | 0.0163 | 0.0162 | 8 right |
+| B60, on | 2830.14 | 78.06 | 0.0163 | **6.72** | gibberish |
+| A770, off | 2603.55 | 82.85 | 0.0162 | **inf** | 6 right |
+| A770, on | 2618.29 | 80.96 | 0.0162 | **inf** | gibberish |
+| arcint's series, B60, on (llama-bench) | 2482.36 | 80.58 | 0.00043 | 0.00043 | 8 right |
+| arcint's series, A770, on (llama-bench) | 2074.21 | 69.71 | 0.00043 | 0.00043 | 8 right |
+
+What this changes in the text below:
+
+- **Only prefill is a real lead.** A whole-chunk KL of 0.016 nats is inside the answer-level bar, and prefill leads by 14 % on the B60 and 26 % on the A770. Decode is not one: on the B60 the valid arm equals arcint's, and every faster-looking A770 decode row in this table comes with broken logits. On this host, with this wheel, IPEX-LLM's one-token decode is right only on the B60 without flash attention.
+- **Its KL is 38 times ours.** The KV cache is 8-bit in every arm (`K (i8)`, `V (i8)` in its log), and the primitive below takes f16 weights and an f16 source. Which of them makes the 0.016 is not separated.
+- **The oneDNN hypothesis stands untested.** The primitive is what candidate 1 says (`measured-here`: `matmul jit:gemm:any`, `src:f16 wei:f16 dst:f32`, 442 calls for a 512-token prompt), so the mechanism is read right. But `GGML_SYCL_DISABLE_DNN=1` does nothing in this build: the 442 calls stay and the rate stays. "The only mechanism that explains" below is an inference. `IPEX_LLM_SYCL_USE_MKL=1` does change the route: 2767 on the B60, 2675 on the A770, which says a vendor f16 GEMM of either kind gets there and does not say what stock SYCL's fp16 build (1891) does differently.
+- **It cannot serve our models.** This wheel, the newest published, refuses the files arcint serves: `unknown model architecture: 'qwen35moe'`.
+- Under unitrace a prefill is `gemm_kernel` plus `dequantize_q4_0_kernel`, attention small; a decode is `mlp_forward_q4_0_kernel`, `qlinear_xpu_kernel_q4_0_2x16_qkv` and the matvec, which confirms that the fusions run, and on the B60's valid arm they do not beat arcint.
+
+Priced lever: the f16-operand GEMM on prefill, only on the answer-level bar, against the KL it costs. Everything else in the ranking below stays `paper` until priced.
+
 Why: IPEX-LLM's llama.cpp build reports the best Llama 2 7B Q4_0 rows for arcint's two cards
 (`paper`: B60 pp512 **2861.84** / tg128 82.24 with flash attention on, 2861.53 / 82.92 off; A770
 up to 2564.25 / 72.54, 2416.16 / 82.92 off) against arcint 1.5.1 (2482.36 / 80.58, 2074.21 /

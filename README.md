@@ -96,6 +96,8 @@ Against stock SYCL's best prefill (fp16 without flash attention), the series lea
 by 5.4 % and 4.4 %. SYCL's legacy Level Zero adapter is a little faster at decode on the B60 (85.96 t/s, a 6.3 % gap) and slower on the A770 (58.93 t/s). Other cards are in the
 threads: an Arc Pro B70 under Vulkan reports 4570.29 / 112.89, and there is no B70 here.
 
+**IPEX-LLM**, Intel's fork, reports higher rows in the same threads, so it was run here too (`measured-here`, the newest published wheel, 2.7.0b20260110, in a container on the same host, xe). Its prefill leads: 2825.67 on the B60 and 2603.55 on the A770, at a mean KL of 0.016 nats against the CPU reference (the series 0.00043), inside the answer-level bar. Its decode does not, on this host: the B60 without flash attention decodes at 80.54 with right answers, level with the series, while with flash attention (B60) or on the A770 at all, one-token decode came out wrong: KL 6.7 nats or infinite, wrong or gibberish answers, whatever the t/s says. Other builds and machines may differ. It also refuses the hybrid models arcint serves (`unknown model architecture`). What it does: [research-concept-mining/ipex-llm](docs/campaigns/research-concept-mining/ipex-llm/README.md) (on the `qfndev` branch).
+
 **The same run, not the same program.** arcint serves the rows through its own path (HTTP,
 slot, sampler), which is what a client gets. A warm-up prefill and generation go uncounted.
 Each prefill is a new prompt of 512 random token ids and a run the prompt cache helped is
