@@ -68,30 +68,33 @@ gives arcint the same run, and it refuses a file with another sha256.
 
 | Card | Engine | Flash attention | pp512 t/s | tg128 t/s |
 |---|---|---|---|---|
-| Arc A770 16 GB | **arcint** | on | **1963.96 ± 2.12** | **70.22 ± 0.28** |
+| Arc A770 16 GB | **arcint's series, llama-bench** | on | **2074.21 ± 3.42** | **69.71 ± 0.20** |
+| | arcint's series, llama-bench | off | 1833.46 ± 2.79 | 68.74 ± 0.55 |
+| | **arcint, served** | on | **1962.84 ± 2.98** | **70.50 ± 0.08** |
 | | SYCL fp16, here | on | 1457.24 ± 4.00 | 73.66 ± 0.02 |
 | | SYCL fp16, here | off | 1876.79 ± 10.29 | 68.72 ± 0.02 |
 | | SYCL fp32, here | on | 771.97 ± 1.75 | 73.06 ± 0.03 |
 | | SYCL fp32, here | off | 859.88 ± 1.66 | 68.71 ± 0.05 |
 | | Vulkan | on | 1119.68 ± 30.25 | 53.07 ± 0.09 |
 | | Vulkan | off | 1073.85 ± 29.68 | 52.56 ± 0.11 |
-| | SYCL fp32 | on | 706.72 | 67.09 |
-| | SYCL fp32 | off | 937.24 | 59.03 |
-| Arc Pro B60 24 GB | **arcint** | on | **2340.00 ± 1.87** | **80.70 ± 0.01** |
-| | SYCL fp16 | on | 928.91 | 84.44 |
-| | SYCL fp16 | off | 1869.16 | 80.03 |
+| Arc Pro B60 24 GB | **arcint's series, llama-bench** | on | **2482.36 ± 1.89** | **80.58 ± 0.11** |
+| | arcint's series, llama-bench | off | 2211.35 ± 2.19 | 79.81 ± 0.66 |
+| | **arcint, served** | on | **2329.61 ± 4.51** | **80.69 ± 0.09** |
+| | SYCL fp16, here | on | 933.23 ± 0.42 | 84.32 ± 0.08 |
+| | SYCL fp16, here | off | 1891.17 ± 2.77 | 79.98 ± 0.13 |
+| | SYCL fp32, here | on | 668.42 ± 0.11 | 84.30 ± 0.08 |
+| | SYCL fp32, here | off | 572.10 ± 0.16 | 80.22 ± 0.14 |
 | | Vulkan | on | 274.76 ± 0.27 | 70.54 ± 0.03 |
 | | Vulkan | off | 522.36 ± 3.60 | 68.55 ± 0.01 |
 
-arcint's rows are `measured-here` (2026-11-05, build 70c21931, f16 KV, MTP off, the A770's GT
-clock pinned at 2000 MHz). The rows marked "here" are `measured-here` too: stock llama-bench at the same
-llama.cpp pin (3e4dfa8, no arcint patches), oneAPI 2026.1.1, Level Zero V2, the same card, host and clock. The other
-rows are the best each backend and attention mode has reported for these cards in those threads, on other hosts and
-drivers; SYCL on the B60 has not been run here this way.
+The arcint rows are `measured-here` on 1.5.1 (2026-11-05, 77ff7456, f16 KV, MTP off, the A770's GT clock pinned at 2000 MHz): llama-bench itself built on
+arcint's llama.cpp series, and arcint's own server through the tool above. The rows marked "here" are `measured-here` too: stock llama-bench at the same
+llama.cpp pin (3e4dfa8, no arcint patches), oneAPI 2026.1.1, Level Zero V2, the same card, host and clock. The Vulkan rows are the best reported for these
+cards in those threads, on other hosts and drivers; there is no Vulkan row of ours.
 
-On the A770, arcint's prefill leads stock SYCL by 5 % and decode trails it by 5 %. On the B60, against the reported rows, prefill leads
-by 25 % and decode trails by 4 %. Other cards are in the threads: an Arc Pro B70 under Vulkan reports 4570.29 / 112.89, and
-there is no B70 here.
+Against stock SYCL's best prefill (fp16 without flash attention), the series leads by 10.5 % on the A770 and 31 % on the B60. Against its best decode (fp16 with flash attention), it trails
+by 5.4 % and 4.4 %. SYCL's legacy Level Zero adapter is a little faster at decode on the B60 (85.96 t/s, a 6.3 % gap) and slower on the A770 (58.93 t/s). Other cards are in the
+threads: an Arc Pro B70 under Vulkan reports 4570.29 / 112.89, and there is no B70 here.
 
 **The same run, not the same program.** arcint serves the rows through its own path (HTTP,
 slot, sampler), which is what a client gets. A warm-up prefill and generation go uncounted.
@@ -133,13 +136,13 @@ follow-up resume instead of re-reading: 66-76 ms each, one or two a prompt, on h
 
 **Other files on the B60** (`--any-model`, `measured-here`, f16 KV, MTP off):
 
-| File | arcint pp512 / tg128 | Nearest row in the SYCL thread (fp16, flash attention) |
-|---|---|---|
-| Qwen3.8-27B Q4_K_M | 846.96 ± 4.02 / 19.78 ± 0.00 | 507.51 / 14.92, `Qwen3.8-27B-UD-Q4_K_M`, the same model in another quant file |
-| Qwen3.6-35B-A3B Q4_K_M | 2342.51 ± 18.82 / 82.79 ± 0.02 | 965.33 / 81.84, `Ornith-1.5-35B-A3B.Q4_K_M`, another model of that size |
+| File | arcint, served | stock SYCL fp16, flash attention | stock SYCL fp16, without |
+|---|---|---|---|
+| Qwen3.6-35B-A3B Q4_K_M | 2331.85 ± 29.54 / 84.94 ± 0.16 | 1334.12 ± 3.59 / 83.41 ± 0.12 | 1330.41 ± 5.50 / 83.40 ± 0.10 |
+| Qwen3.8-27B Q4_K_M | 843.70 ± 5.02 / 19.90 ± 0.04 | 613.93 ± 0.11 / 20.82 ± 0.01 | 638.73 ± 0.35 / 20.83 ± 0.01 |
 
-These two are a neighbourhood, not a like-for-like. The services run faster than this on decode:
-MTP is off here, and the agent decodes 47.5 t/s with it (below).
+Each row is the same file on the same card (3 repetitions). arcint leads the 35B on both numbers and the 27B on prefill, and trails the 27B's decode by 4.4 %. The services run faster than this on decode:
+MTP is off here, and on 1.5.1 the agent decodes 48.4 t/s with it (CHANGELOG).
 
 ## New: loop guard for small models
 
@@ -512,11 +515,10 @@ service's production flags, Flash-Next's expert cache included
   builds on: it carries its kernels as patches against upstream and keeps
   llama.cpp's model code, its KV and its checkpoint mechanism.
 - **SYCL** works under the xe driver on both cards, and llama.cpp's SYCL backend is under active development
-  upstream. It is a real alternative: on Llama 2 on the A770 it decodes 5 % faster than arcint and is within 5 % on
-  prefill, while arcint's series prefills the coder's file at 2.1x (the tables above). `measured-here`, the A770 (2026-11-05): USM `memcpy`
-  verified up to 3 GiB and a kernel, through Level Zero V2, legacy Level Zero and OpenCL; llama-bench on V2 and the legacy adapter (V2 decodes 73.06
-  t/s against 58.93); the answers right (KL 0.00043 nats against the CPU reference, the 8 fact questions); no wedge. The B60 (2026-10-06): Strata's SYCL
-  engine through Level Zero, the numbers under "Current numbers". One trap on Debian trixie: oneAPI 2026.1
+  upstream. It is a real alternative: on Llama 2 it decodes 4-5 % faster than arcint's series on both cards, and it decodes the 27B 4.4 % faster on the B60, while the series leads
+  prefill on both (10.5 % and 31 %) and prefills the coder's file at 2.1x (the tables above). `measured-here` (2026-11-05): on the A770, USM `memcpy`
+  verified up to 3 GiB and a kernel, through Level Zero V2, legacy Level Zero and OpenCL; on both cards, llama-bench on V2 and the legacy adapter; the answers right (KL 0.00043 nats against the
+  CPU reference, the 8 fact questions); no wedge. Strata's SYCL engine ran through Level Zero on the B60 too (2026-10-06), the numbers under "Current numbers". One trap on Debian trixie: oneAPI 2026.1
   segfaults in every SYCL program with the distribution's Level Zero loader (`libze1`
   1.20.6), and loader 1.34 fixes it (`measured-here`).
 - **Vulkan** depends on the card. On the B60 it trails SYCL (the table above, and
