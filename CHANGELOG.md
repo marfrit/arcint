@@ -29,7 +29,7 @@ Faster decode on the coder, and arcint on llama.cpp's community GPU tables. The 
 - **`reasoning_effort` reaches the template** on Chat Completions and Responses, passed through where the template quotes the level; `minimal` keeps thinking on, at low; `/props` publishes `reasoning_effort_levels`.
 - **Corrected docs:** SYCL works under the xe driver on both cards. The record's "SYCL aborts under xe" came from a note on runtimes older than the xe transition and is retracted in `DESIGN.md` §2; the Vulkan and vLLM lines are corrected too.
 
-Release A/B against 1.5.0: see the window recorded below this list when the tag is cut. Two red cells are accepted by the operator: the coder's `decode-b` under 0095 alone, an answer's text, which 0097 then cleared; and Flash-Next's variance rule, its answers differing in every run with the mean equal.
+Release gate (`measured-here`, the RC against 1.5.0's package in one window): the A/B passes on all three units. The coder's decode 52.50 / 53.70 / 46.10 -> 58.75 / 59.65 / 55.85 t/s and prefill at 41k 777.75 -> 784.05; on its deployed flags over 12 answers 71.73 -> 82.99 t/s (+15.7 %), the task 10/10 x3. The agent's prefill 696.15 -> 707.10 at 55k and 494.55 -> 500.00 at 138k, decode over 12 answers 46.26 -> 48.44 t/s (+4.7 %), the needle right at 254,970 tokens, peak 24,190 of 24,480 MiB. Flash-Next's prefill 535.13 -> 538.83 and decode 32.17 -> 33.33 t/s. Writer 20.9 -> 21.93 t/s and vision 57.9 -> 62.2. Sanitizers clean; 33/33 on the recipe. One red cell on the way, accepted by the operator: against the 0095 build, Flash-Next tripped the A/B's variance rule with its mean equal, its answers differing in every run.
 
 ## 1.5.0 — 2026-11-03
 
