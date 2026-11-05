@@ -108,7 +108,8 @@ public:
     // backend computes n_ctx - prompt_tokens - reserve (the sampler knows
     // neither) and hands it here after set_prompt(), BEFORE
     // start_in_think_block(), which is what arms a prompt already inside the
-    // reserve. It is a no-op unless params.think_ctx_reserve > 0: reserve 0 is
+    // reserve. It is a no-op unless params.think_ctx_reserve > 0 or
+    // params.think_budget > 0: both 0 is
     // the switch off, byte-identical to before. Counted down per emitted token
     // while the block is open, in observe() (the verify walk's accepted drafts
     // are the emitted tokens it observes, so each counts once); at 0 the

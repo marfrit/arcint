@@ -154,7 +154,7 @@ void Sampler::observe_think(int token, std::string_view piece) { observe_think_(
 // arm is also checked here, so a caller that hands the budget after
 // start_in_think_block() still gets the prompt-inside-reserve rule.
 void Sampler::set_think_ctx_budget(int budget) {
-    if (params_.think_ctx_reserve <= 0) return;
+    if (params_.think_ctx_reserve <= 0 && params_.think_budget <= 0) return;
     ctx_budget_  = budget;
     ctx_armed_   = true;
     ctx_pending_ = false;
@@ -263,7 +263,7 @@ void Sampler::start_in_think_block(bool open) {
     // to set_think_ctx_budget() (called before this, after set_prompt); reserve
     // 0 clears it so a reused sampler cannot carry a stale one. emitted_ is the
     // accepted-stream index the event names, reset per turn.
-    if (params_.think_ctx_reserve <= 0) {
+    if (params_.think_ctx_reserve <= 0 && params_.think_budget <= 0) {
         ctx_budget_ = -1;
         ctx_armed_  = false;
     }
@@ -1199,8 +1199,10 @@ int Sampler::sample(float* logits, size_t vocab) {
                 ctx_forced_index_ = emitted_;   // the index this token takes
                 span_event_("context_guard", "", "", true, ctx_budget_);
                 loop_forced_closer_ = true;     // not the model's own draw
-                log::info("context-guard", "the context guard reached its budget (%d left); "
-                          "the think-block's closer is forced as the next token", ctx_budget_);
+                log::info("context-guard", "the %s reached its budget (%d left); "
+                          "the think-block's closer is forced as the next token",
+                          params_.think_budget > 0 ? "thinking budget or context guard" : "context guard",
+                          ctx_budget_);
                 return closer;
             }
             ++ctx_no_closer_;
