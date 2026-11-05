@@ -23,6 +23,8 @@ What this changes in the text below:
 
 Priced lever: the f16-operand GEMM on prefill, only on the answer-level bar, against the KL it costs. Everything else in the ranking below stays `paper` until priced.
 
+How from here (operator, 2026-11-05): by profiling. The kernels are not disassembled further, and the PyTorch path's kernel packages, which declare no licence, are not read at all. oneDNN's GEMM is open source and can be read upstream.
+
 Why: IPEX-LLM's llama.cpp build reports the best Llama 2 7B Q4_0 rows for arcint's two cards
 (`paper`: B60 pp512 **2861.84** / tg128 82.24 with flash attention on, 2861.53 / 82.92 off; A770
 up to 2564.25 / 72.54, 2416.16 / 82.92 off) against arcint 1.5.1 (2482.36 / 80.58, 2074.21 /

@@ -49,8 +49,6 @@ below and the message named.
   `x.numel() // x.size(-1) == 1` (`utils.py:289-302`), qtype in {SYM_INT4, FP8E5, FP4, IQ2_XXS,
   FP6, WOQ_INT4}, and a device rule for FP6. **One row only** — decode. The prefill path is the
   unfused gate/up/SiLU.
-- The PyTorch wheel `x/xe/` carries `mlp_forward_fp8_e5m2_kernel` and `mlp_forward_q4_0`-family
-  names in its SPIR-V (`code, symbol only`), matching the llama.cpp family.
 
 ## 4. Weight repack (score 7)
 
@@ -91,8 +89,7 @@ below and the message named.
 ## 7. MoE route and top-k (score 5)
 
 - **PyTorch** (`code`): the attention/MLP dispatch files are per model; no grouped-routing file
-  was read here beyond `models/deepseek.py` (commits `be1f073866`, `39e360fe9d`). The wheel's
-  `moe_group_topk_kernel` is in `xe_addons…so`'s SPIR-V (`code, symbol only`).
+  was read here beyond `models/deepseek.py` (commits `be1f073866`, `39e360fe9d`).
 - **arcint** already fuses the router (patch 0064's record: softmax, top-k, clamp, normalise in
   one kernel); the *grouped* form is for DeepSeek-style routing, which our units do not have. So
   this is "partly, and the remaining part is not our model".

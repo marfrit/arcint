@@ -123,7 +123,7 @@ table.
 ### 5. The q4_0 batch GEMM with f32 activations, selected by device and shape — score 6 (p1 3)
 - **Evidence**: `binary.md` §2 (`code`): `vec_q4_0_batch_kernel<float,8,2,16|32,{1..8},64>` (30
   instances) and `batch_forward_q4_0(float const*, unsigned char const*, float*, long,long,long,
-  queue&)`; source path `bigdl-core-xe/llama_backend/batch/int4.cpp`. Commits `00fce5c940` (new q4_0
+  queue&)`. Commits `00fce5c940` (new q4_0
   batch kernel), `3d5fbf2069`/`145e8b480f` (batch-kernel condition), `2cce89691a` (enable
   `use_batch_forward` on Battlemage, and for fp8e5), `5e967205ac` (the kernel takes the f32 input,
   no f16 cast). `paper`/`code`.
@@ -158,8 +158,7 @@ table.
 ### 7. The MoE route fused in one kernel and the grouped top-k — score 5 (p1 2)
 - **Evidence**: commits `f6441b4e3d` (moe_softmax_topk), `be1f073866` (fuse the MoE block,
   moonlight), `39e360fe9d` (grouped top-k), `5faba06409` (MoE decode forward), `019293e1b9` (fuse
-  MoE index computation); the PyTorch wheel `x/xe/` carries `moe_group_topk_kernel` (`code`:
-  SPIR-V entry point in `xe_addons…so`). `paper`/`code, symbol only` for the llama.cpp side.
+  MoE index computation). `paper`/`code, symbol only` for the llama.cpp side.
 - **Measured**: no commit number.
 - **arcint's state**: 0064 (top-k MoE by sub-group) and the router fusion (0021's record mentions
   SOFT_MAX..ARGSORT..GET_ROWS..SUM_ROWS fused); so partly. The grouped/top-k form is the missing

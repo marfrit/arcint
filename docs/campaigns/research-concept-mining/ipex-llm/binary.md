@@ -13,8 +13,7 @@ Target binaries: `libggml-sycl.so` (ELF x86-64, **not stripped**, `.text` 2.07 M
 the string is present verbatim; not orderable against our pin offline).
 
 The second tree `x/bigdl/cpp/libs/ollama/` carries the same `libggml-sycl.so` family (an Ollama
-build); it was not read further. `x/xe/` is the PyTorch path's kernels
-(`xe_linear.cpython-310-x86_64-linux-gnu.so`, `xe_addons…so`), not the llama.cpp path.
+build); it was not read further. The PyTorch path's kernel packages declare no licence and are not read here.
 
 ---
 
