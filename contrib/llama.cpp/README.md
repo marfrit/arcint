@@ -6487,4 +6487,31 @@ Unset, the switch now takes n_kv/16 in 16-512 for f16 K/V and n_kv/32 in 16-128 
 Gate (`measured-here`, against the deployed 31e021e4, one window). Served Llama 2 7B: A770 f16 63.57 -> 70.22, q8_0:q4_0 54.89 -> 66.06, B60 f16 75.77 -> 80.70, q8_0:q4_0 68.63 -> 78.87 t/s, prefill level. The coder on its deployed flags, 12 answers a run, two rounds: 74.65 -> 82.78 t/s,
 a verify step 26.2 -> 24.1 ms, draft acceptance 72.95 -> 71.9 %; the A/B's decode 53.70 / 51.50 / 47.40 -> 58.70 / 59.65 / 55.90; the task 10/10 x3. The agent equal, 47.71 -> 47.76 t/s, verify 57.2 ms, the needle right at 254,970 tokens, peak 24,190 MiB. Writer and vision equal, same md5. Flash-Next red on the
 variance rule only, accepted by the operator: 32.97 -> 33.33 t/s, the spread 10.8 against 5.5 %, verify 67-72 ms in both arms. KL against the CPU reference, Llama 2, one token a ubatch: 0.000431 in all four arms, top-1 99.09 -> 99.07 %. `test-backend-ops -o FLASH_ATTN_EXT`: B60 2880/2880; A770 2877/2880. The A770's three (head size 64, 8 heads,
-4 or 8 KV rows, ERR about 0.84) fail the same on the old binary and with 128 forced: an older defect in another path, open. A mutant that floors the split count fails 183 (A770) and 166 (B60) cases. Reviewed read-only (no code findings).
+4 or 8 KV rows, ERR about 0.84) fail the same on the old binary and with 128 forced: an older defect in another path, found and fixed in 0098. A mutant that floors the split count fails 183 (A770) and 166 (B60) cases. Reviewed read-only (no code findings).
+
+## 0098-opencl-fa-split-rules-and-q1-split-sg.patch
+
+Three changes on decode attention, all from one window of measurements.
+
+**The split by card.** Quantized K/V left 0097's rule, n_kv/32 in 16-128. The grid (`measured-here`, llama-bench, decode, 0 to 32,768 keys, q8_0:q4_0) says the cards differ: the B60 wants n_kv/32 up to 512 (Llama 2 at 16,384 keys 36.52 -> 41.26 t/s, at 8,192 50.52 -> 53.92; the 27B within 1 %), and the A770 wants shorter splits (the coder at 4,096 keys 49.64 -> 52.20, at 8,192 48.19 -> 49.88), so `dg2` takes n_kv/64 in 16-64, and 128 from 16,384 keys. f16 K/V keeps n_kv/16 in 16-512.
+
+**The GQA kernel's split at short context.** 64 keys below 2,048 keys, 512 from there. The verify step on the 27B behind ~300 tokens 57.2 -> 56.3 ms in both rounds; equal at 3,300 keys; 512 stays best at 12,400 (64.0 against 70.2 at 64). Decode over 12 answers did not show it: 48.56 -> 48.04 t/s, inside the run-to-run spread, the draft acceptance 47.4 -> 46.1 %. A small lever, adopted on the verify step's own time.
+
+**The plain K-split kernel's work-group on Intel.** `flash_attn_f32_f16_q1_split` and its q8_0 and q4_0 forms step `Q1_WG_SIZE` = FA_SG keys a work-item and size local arrays by it, and ran in a work-group of 64 at FA_SG 32 (`code`): keys past the first 32 were visited twice, local indices ran past the arrays. On Intel a work-group is now 32 items, and the f16 kernel, which reduces over its sub-group, pins a sub-group of FA_SG. Heads the Intel split kernels do not build reach these kernels from 2,048 keys: f16 K/V at 40-112, quantized at 64 and 96. No served model has such a head (`code`, the GGUF metadata; the TTS model was not read).
+
+Red, `measured-here`: of the new cases (head 64 and 96 x f16, q8_0, q4_0, 2,048 keys, one row), on 0097's kernels the A770 fails f16 at both heads (ERR 0.80, 0.83), and the older 3 cases with 4 or 8 KV rows fail with them (ERR about 0.84). The output was a near-uniform average of V. Passing on the old kernels: f16 on the B60, and the quantized forms on both cards; the wrong answer is measured only for f16 on the A770, the overrun in the others is read from the code. Green: 2886/2886 FLASH_ATTN_EXT on both cards.
+
+Gate (`measured-here`, against the 1.5.1 package, one window with the host quiet where it counts). KL against the CPU reference, Llama 2, q8_0:q4_0, one token a ubatch: 0.001890 on both cards. Answers: the task 10/10 x3, the capital and the needle right on Flash-Next. Served, deployed flags, two rounds, means:
+
+| Unit, keys | 1.5.1 t/s | 0098 t/s | Verify ms |
+|---|---|---|---|
+| coder, ~300 | 82.71 | 82.72 | 24.06 -> 24.09 |
+| coder, ~3,300 | 75.91 | 78.13 | 26.93 -> 25.80 |
+| coder, ~7,000 | 71.28 | 74.52 | 28.26 -> 27.60 |
+| agent, ~300 | 48.56 | 48.04 | 57.22 -> 56.27 |
+| agent, ~15,800 | 41.29 | 41.57 | 67.67 -> 67.61 |
+| agent, ~29,700 | 38.30 | 37.96 | 73.35 -> 73.38 |
+
+The A/Bs: coder and agent PASS, decode and prefill equal, on prompts deep enough that the rules do not differ. Flash-Next, 4 rounds on a quiet host (the first 2 rounds ran during a copy and an unpack on the same machine and are discarded): prefill 538.77 -> 538.25, decode 33.25 -> 33.45, the one text both arms produced 34.8 -> 35.2 t/s; the A/B reports FAIL on its variance rule only, 9.57 % against an allowed 9.02 %, sampled answers differing in every run. Reviewed read-only: no code defect; the review's corrections are in the comment here. The review also read the double count as a wrong answer in the quantized kernels, which the red run does not show.
+
+`GGML_OPENCL_FA_INTEL_KV_PER_SPLIT` and `GGML_OPENCL_FA_GQA_KV_PER_SPLIT` fix the sizes as before.
