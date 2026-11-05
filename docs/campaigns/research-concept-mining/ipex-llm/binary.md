@@ -81,7 +81,7 @@ dispatch. Read from the symbol list (`code`):
   `device_has_xmx`/`check_xmx`, `get_gpu_type`, `dg2_init`/`dg2_arc_init`/`dg2_bmg_init`, a
   **hybrid** buffer type and a **split** buffer type (`ggml_backend_sycl_hybrid_buffer_*`,
   `…split_buffer_*`).
-- the pin's own `fattn-onednn.cpp` (`/home/…/llama-served/ggml/src/ggml-sycl/fattn-onednn.cpp:1`)
+- the pin's own `fattn-onednn.cpp` (`llama-served/ggml/src/ggml-sycl/fattn-onednn.cpp:1`)
   is a oneDNN FA for F16 K/V with a 32-row minimum, and its `fusion.cpp` fuses RMS_NORM+MUL(+ADD),
   ADD+ADD, MUL_MAT+MUL_MAT(+GLU) and unary chains. IPEX's fusion family is a different one: a
   **custom `ggml_bigdl_*` op family in ggml core** (below), plus own kernels.
@@ -94,7 +94,7 @@ dispatch. Read from the symbol list (`code`):
 `ggml_bigdl_dequantize_kv`. Their constructors create one tensor with **op id 85** (0x55 in
 `ggml_bigdl_mlp_fusion`'s constructor, `code`) and an **output type 30 = `GGML_TYPE_BF16`**
 (`code`: the constructor sets `[tensor+0x4]` to 0x1e; compare the pin's enum,
-`/home/…/llama-served/ggml/include/ggml.h:420`). The kernel writes `half`; the op's type is BF16,
+`llama-served/ggml/include/ggml.h:420`). The kernel writes `half`; the op's type is BF16,
 so the value class is rounding-only at f16 width.
 
 `libllama.so` adds the graph-side match (`code`): `llm_graph_context::build_bigdl_qkv_fusion

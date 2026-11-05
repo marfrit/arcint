@@ -423,9 +423,9 @@ Counts at 0/1/2/3: **3059 / 914 / 131 / 9** (4113 commits).
 *Commits 301-400 (2017-12-15..2021-09-10): scores 0/1/2/3 = 100/0/0/0; areas other 66, sync 32, gemm 2.*
 
 - `9ea95100d0` `2021-09-10` **other** · other · kept — Merge pull request #4712 from yushan111/mv-orca-test; no numbers stated; `score 0`
-- `bc2ba12880` `2021-09-16` **other** · other · kept — Merge branch 'master' of /home/joy/workspace/BigDL2.0/copy/BigDL into migratekerasnn; no numbers stated; `score 0`
-- `b5b6781969` `2021-09-16` **other** · other · kept — Merge branch 'master' of /home/joy/workspace/BigDL2.0/copy/BigDL into migratekerasnn; no numbers stated; `score 0`
-- `7783d4ea3b` `2021-09-16` **other** · other · kept — Merge branch 'master' of /home/joy/workspace/BigDL2.0/copy/BigDL into migratekerasnn; no numbers stated; `score 0`
+- `bc2ba12880` `2021-09-16` **other** · other · kept — Merge branch 'master' of <path>/workspace/BigDL2.0/copy/BigDL into migratekerasnn; no numbers stated; `score 0`
+- `b5b6781969` `2021-09-16` **other** · other · kept — Merge branch 'master' of <path>/workspace/BigDL2.0/copy/BigDL into migratekerasnn; no numbers stated; `score 0`
+- `7783d4ea3b` `2021-09-16` **other** · other · kept — Merge branch 'master' of <path>/workspace/BigDL2.0/copy/BigDL into migratekerasnn; no numbers stated; `score 0`
 - `a1ac5bae4f` `2021-09-16` **other** · other · kept — Merge branch 'bigdl-2.0' into migratekerasnn; no numbers stated; `score 0`
 - `b82f5fe0ee` `2021-09-16` **other** · other · kept — Merge branch 'bigdl-2.0' into migratekerasnn; no numbers stated; `score 0`
 - `35c99119f5` `2021-09-22` **other** · other · kept — Merge pull request #4771 from yushan111/migrate-orca-context; no numbers stated; `score 0`
