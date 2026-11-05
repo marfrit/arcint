@@ -1,0 +1,21 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 3bb7e34..cd4ee4a 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -23481,8 +23481,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+         if (fd_env_kv_per_split > 0) { fd_kv_per_split = fd_env_kv_per_split; }
+         if (fd_env_max_splits   > 0) { fd_max_splits   = fd_env_max_splits; }
+         if (use_fd_intel) {
++            // the best split grows with n_kv: one sub-group walks a split's keys in
++            // order, and on the A770 and the B60 (measured-here, decode, 0 to 16,384
++            // keys) 16 keys a split beat 128 by 7-21 % on short KVs, while f16 K/V
++            // wanted 512 at 16,384 and quantized K/V stayed near 128 from 4,096 on
+             static const char * kps_env = getenv("GGML_OPENCL_FA_INTEL_KV_PER_SPLIT");
+-            fd_kv_per_split = kps_env && atoi(kps_env) > 0 ? atoi(kps_env) : 128;
++            static const int    kps_fix = kps_env ? atoi(kps_env) : 0;
++            fd_kv_per_split = kps_fix > 0 ? kps_fix
++                            : is_mixed    ? std::min(std::max(n_kv / 16, 16), 512)
++                                          : std::min(std::max(n_kv / 32, 16), 128);
+             fd_max_splits   = 256;
+         }
+         if (use_fd_gqa) {
