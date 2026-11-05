@@ -6465,7 +6465,7 @@ Measured (`measured-here`, window 73/74, both cards, A770 GT pinned at 2000 MHz;
 
 The answer-level bar on both cards, each arm against a CPU reference over 16 x 512 tokens: mean KL 0.000431-0.000432 nats
 with the switch on and off, at `-b 512` (the GEMM) and `-b 4` (the matvec); argmax agreement 99.07 % on, 99.09 % off (A770,
-`-b 512`, 0.02 points); 9/9 facts in all four served arms, with the same text on and off and across the cards.
+`-b 512`, 0.02 points); all 8 fact questions right in all four served arms, with the same text on and off and across the cards.
 `test-backend-ops -o MUL_MAT -p type_a=q4_0`: 161/161 on both cards, switch on and off. Mutants with the switch on: `(char4)(7)`
 fails 43 (A770) and 44 (B60) cases, all at 1-4 columns and none from 16; `(char16)(7)` fails 32 on both, 28 of them from 16
 columns and none at 1-4. With the switch off the matvec mutant passes 161/161 on both cards.

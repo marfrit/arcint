@@ -135,7 +135,8 @@ The cards (`measured-here` unless marked):
   engine ran on the B60 through Level Zero (2026-10-06, `measured-here`), with the Level
   Zero loader 1.34 because Debian's 1.20.6 segfaults every SYCL program under oneAPI 2026.1.
   llama.cpp's SYCL on its OpenCL adapter gave 249 / 14.2 t/s on the dense 27B at 1k against
-  Vulkan's 126 / 7.8 on the B60 (2026-09, `measured-here`). SYCL on the A770 has not been run here.
+  Vulkan's 126 / 7.8 on the B60 (2026-09, `measured-here`). On the A770, stock llama.cpp SYCL with Level Zero V2: `memcpy` verified to 3 GiB, Llama 2
+7B Q4_0 1457.24 / 73.66 t/s (fp16, flash attention), the answers right, no wedge (2026-11-05, `measured-here`).
   RETRACTED (operator, 2026-11-05): "SYCL aborts under xe (a memcpy abort)". The first design
   wrote "SYCL runtimes older than the xe transition abort on memcpy"; later copies dropped the
   condition, no test of a current runtime backed it, and it helped send arcint to OpenVINO first.
