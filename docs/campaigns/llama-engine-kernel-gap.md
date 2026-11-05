@@ -516,10 +516,10 @@ the GT clock at 2000 MHz, `measured-here`, pp512 / tg128 (flash attention off, t
 KL against the CPU reference on Llama 2: SYCL fp32 0.000431, fp16 0.000432 (flash attention on and off), top-1 99.07-99.12 %, the same as the series. `memcpy` verified to 3 GiB through
 both Level Zero adapters and OpenCL; wedged 0. The served row is the same at n_ctx 640 and 4096.
 
-Three leads (`measured-here` for the numbers, no cause measured yet):
-1. **Flash attention at small-T decode on the A770's dense path:** it speeds SYCL up 7 % on Llama 2 and slows the series down 9 %. On the coder's file it slows both.
-2. **The serving path's prefill:** 22 % under llama-bench on the coder's file, 6 % on Llama 2.
-3. **SYCL's fp16 build costs the coder's file 29 % of its prefill** and gives Llama 2 2.2x: read what `GGML_SYCL_F16` changes before comparing further.
+The leads, measured the same day (`measured-here`):
+1. **Flash attention at small-T decode: found.** The per-head kernel's fixed 128 keys a split; patch 0097 makes it follow n_kv. Served Llama 2 on the A770 63.57 -> 70.22, stock SYCL's FA row is 73.66. The coder's deployed decode +10.9 %. Absolute kernel times under unitrace do not compare across the engines, Level Zero inflates them; within an engine they do. The series' FA kernel at the old default took 73 us a layer on Llama 2, its dense attention about 26.
+2. **The serving path's prefill: flat, not a percentage.** On the coder, a context checkpoint costs 66-76 ms, one at 512 tokens and two from 1,024 on (ms with, without: 445 / 369, 853 / 721, 3,129 / 2,992), repeated within 1 ms. Past that, 14-17 ms a request against llama-bench on both files at all three sizes. Checkpoints run only on hybrid and recurrent models (`code`), which is why Llama 2 shows only the 14 ms. RETRACTED: "the serving path loses 22 % of prefill" and "this costs real users". It is a flat latency a 512-token row overstates. RETRACTED too: "5 ms a token in host writes" read off a profile: that time is the weights' upload at load.
+3. **SYCL's fp16 build** costs the coder's file 29 % of its prefill and gives Llama 2 2.2x: read what `GGML_SYCL_F16` changes before comparing further. Open.
 
 ## Gate
 

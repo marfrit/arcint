@@ -431,7 +431,7 @@ two failures (four and 75 query rows) fail the same without the patch, and
 the patch fixes a third that did (one query row, head size 128, 4,096 keys).
 
 Switches: `GGML_OPENCL_FA_INTEL_SPLIT=0` keeps the basic q1 kernel;
-`GGML_OPENCL_FA_INTEL_KV_PER_SPLIT` sets the keys per split (128);
+`GGML_OPENCL_FA_INTEL_KV_PER_SPLIT` sets the keys per split (128, by depth since 0097);
 `GGML_OPENCL_FA_INTEL_OPTS` appends build options to Intel's FA programs
 (`-D FDI_KB=`, `-cl-intel-256-GRF-per-thread`, for tuning).
 
@@ -6470,7 +6470,21 @@ with the switch on and off, at `-b 512` (the GEMM) and `-b 4` (the matvec); argm
 fails 43 (A770) and 44 (B60) cases, all at 1-4 columns and none from 16; `(char16)(7)` fails 32 on both, 28 of them from 16
 columns and none at 1-4. With the switch off the matvec mutant passes 161/161 on both cards.
 
-The B60's decode did not move because it is held elsewhere: the matvec takes 10.4 ms a token over ~3.7 GB of weights (code and
-scale bytes), about 360 GB/s against the card's ~456 GB/s of memory bandwidth (`measured-here` for the kernel time, under unitrace
-over 400 tokens; the bandwidth is the card's specification, and the bytes are computed from the shapes), and the old 8x kernel took
-10.7 ms. The A770's gain is the same kernel at 10.7 ms against the old kernel's 20.9 ms. Models without Q4_0 weights do not enter these paths (`code`).
+On the B60 the matvec takes 10.4 ms a token over ~3.7 GB of weights (code and scale bytes), about 360 GB/s of the card's specified ~456 GB/s (`measured-here` for the kernel time, under unitrace over 400
+tokens; the bytes are computed from the shapes), and the old 8x kernel took 10.7 ms, so 0096 moved its decode little. CORRECTED: this section first called that decode bound by memory; 0097 then moved it 6.5 % by attention alone.
+The A770's gain is the same kernel at 10.7 ms against the old kernel's 20.9 ms. Models without Q4_0 weights do not enter these paths (`code`).
+
+## 0097-opencl-fa-intel-split-by-depth.patch
+
+The per-head Intel decode attention kernel (0007, quantized 0015) took 128 keys a split at any depth. One sub-group walks a split's keys in order, and the switch had never been searched. A grid of 16, 32, 64, 128, 256 and 512 keys a
+split at 0, 256, 1,024, 4,096 and 16,384 keys of depth, llama-bench decode, flash attention on (`measured-here`, both cards, Llama 2 at f16 and q8_0:q4_0, the coder on the A770 and the dense 27B on the B60, both q8_0:q4_0):
+- short KVs want short splits: at depth 0, 16 keys beat 128 by 11 and 7 % (Llama 2 f16, A770 and B60), 21 and 14 % (q8_0:q4_0), 14 % on the coder and 2 % on the dense 27B;
+- deep f16 K/V wants long ones: 512 keys beat 128 by 8 and 10 % at 16,384;
+- quantized K/V stays near 128 from 4,096 on, where 256 and 512 lose up to 25 %. The coder's best at 4,096 is 32 keys (+6 %), which this rule leaves; the Llama 2 files want 64-128 there, so it depends on the model's geometry.
+
+Unset, the switch now takes n_kv/16 in 16-512 for f16 K/V and n_kv/32 in 16-128 for quantized K/V; a value fixes it, and 128 is the old default. The 256-split cap is unchanged. The GQA kernel (from 4 rows on Xe2) keeps its own 512.
+
+Gate (`measured-here`, against the deployed 31e021e4, one window). Served Llama 2 7B: A770 f16 63.57 -> 70.22, q8_0:q4_0 54.89 -> 66.06, B60 f16 75.77 -> 80.70, q8_0:q4_0 68.63 -> 78.87 t/s, prefill level. The coder on its deployed flags, 12 answers a run, two rounds: 74.65 -> 82.78 t/s,
+a verify step 26.2 -> 24.1 ms, draft acceptance 72.95 -> 71.9 %; the A/B's decode 53.70 / 51.50 / 47.40 -> 58.70 / 59.65 / 55.90; the task 10/10 x3. The agent equal, 47.71 -> 47.76 t/s, verify 57.2 ms, the needle right at 254,970 tokens, peak 24,190 MiB. Writer and vision equal, same md5. Flash-Next red on the
+variance rule only: 32.97 -> 33.33 t/s, the spread 10.8 against 5.5 %, verify 67-72 ms in both arms. KL against the CPU reference, Llama 2, one token a ubatch: 0.000431 in all four arms, top-1 99.09 -> 99.07 %. `test-backend-ops -o FLASH_ATTN_EXT`: B60 2880/2880; A770 2877/2880. The A770's three (head size 64, 8 heads,
+4 or 8 KV rows, ERR about 0.84) fail the same on the old binary and with 128 forced: an older defect in another path, open. A mutant that floors the split count fails 183 (A770) and 166 (B60) cases. Reviewed read-only (no code findings).
