@@ -500,6 +500,27 @@ weights against ~456 GB/s of memory bandwidth, `measured-here` for the time, und
 ~0.9; the remaining ~1.9 ms is not attributed. Host buffer writes account for up to 0.7 of it, and the launch gaps between kernels
 are the candidate for the rest (`inferred`, not measured here).
 
+### Stock SYCL on the A770, measured here (windows 77 and 78, 2026-11-05)
+
+The tables' A770 rows are SYCL fp32 and Vulkan; none is fp16, and the fp16 build changes the picture. Stock llama-bench at the pin, oneAPI 2026.1.1, Level Zero loader 1.34,
+the GT clock at 2000 MHz, `measured-here`, pp512 / tg128 (flash attention off, then on):
+
+| Engine | Llama 2 7B Q4_0, off | on | the coder's file, off | on |
+|---|---|---|---|---|
+| SYCL fp32, V2 | 859.88 / 68.71 | 771.97 / 73.06 | 692.11 / 57.42 | 696.06 / 55.30 |
+| SYCL fp32, legacy adapter | 839.44 / 54.95 | 757.16 / 58.93 | | |
+| SYCL fp16, V2 | 1876.79 / 68.72 | 1457.24 / 73.66 | 492.50 / 57.40 | 493.41 / 54.70 |
+| llama-bench on arcint's series | 1835.57 / 69.60 | 2072.18 / 63.66 | 1433.00 / 58.98 | 1461.22 / 54.65 |
+| arcint, served | | 1954.62 / 63.57 | | 1144.74 / 54.25 |
+
+KL against the CPU reference on Llama 2: SYCL fp32 0.000431, fp16 0.000432 (flash attention on and off), top-1 99.07-99.12 %, the same as the series. `memcpy` verified to 3 GiB through
+both Level Zero adapters and OpenCL; wedged 0. The served row is the same at n_ctx 640 and 4096.
+
+Three leads (`measured-here` for the numbers, no cause measured yet):
+1. **Flash attention at small-T decode on the A770's dense path:** it speeds SYCL up 7 % on Llama 2 and slows the series down 9 %. On the coder's file it slows both.
+2. **The serving path's prefill:** 22 % under llama-bench on the coder's file, 6 % on Llama 2.
+3. **SYCL's fp16 build costs the coder's file 29 % of its prefill** and gives Llama 2 2.2x: read what `GGML_SYCL_F16` changes before comparing further.
+
 ## Gate
 
 Per lever, against the build before it on the same card:

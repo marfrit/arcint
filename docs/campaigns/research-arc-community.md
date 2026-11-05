@@ -109,4 +109,5 @@ dead under xe (a memcpy abort). That negative predates this and may have been th
 is tried on the B60.
 CORRECTED 2026-11-05 (operator): the record was wrong. It came from a note on runtimes older than the xe transition, and Strata's
 SYCL engine ran on the B60 through Level Zero on 2026-10-06 (`strata-sycl-b60.md`, `measured-here`), before this survey. DESIGN §2 retracts it.
-The legacy adapter's speed against V2 is still untried here.
+Tried on the A770 on 2026-11-05 (`measured-here`, Llama 2 7B Q4_0, fp32): V2 859.88 / 68.71 and 771.97 / 73.06, legacy 839.44 / 54.95 and 757.16 / 58.93 (no flash
+attention, then with). V2 is the faster here, the opposite of the fork's note for its B580. The B60 is untried.

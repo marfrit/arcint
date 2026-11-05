@@ -15,7 +15,8 @@ spread over 5 repetitions. This tool puts arcint in llama-bench's place:
                                                  included, ~0.1 ms a token, measured)
     t/s from its own timers                      the engine's own /metrics counters
                                                  around each request, so no HTTP time
-    n_ctx 4096 (the model's), F16 KV             --n-ctx 4096, arcint's default F16 KV
+    n_ctx = prompt + generation (640), F16 KV    --n-ctx 4096, arcint's default F16 KV (the same
+                                                 row at 640: 1952.47 / 63.59 against 1954.62 / 63.57)
 
 Differences that stay: arcint asks for flash attention on auto, which is flash attention
 on this backend, so a row compares with the tables' FA rows; and the path is the served
