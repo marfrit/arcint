@@ -489,9 +489,11 @@ file: the A770 under Vulkan with flash attention 1119.68/53.07, without 1073.85/
 (A770) to 10 % (B60) under the SYCL FA rows.
 
 Other files, the same tool (`--any-model`, `measured-here`, B60, f16 KV): Qwen3.8-27B Q4_K_M 846.96 ± 4.02 / 19.78 ± 0.00 (at
-13b2a457), and Qwen3.6-35B-A3B Q4_K_M 2342.51 ± 18.82 / 82.79 ± 0.02. The community's nearest rows are SYCL fp16 `qwen35 27B
-Q4_K_M` 507.51/14.92 and `qwen35moe 35B.A3B Q4_K_M` 774.92/81.63: other model versions or unverified files, so a neighbourhood,
-not a like-for-like.
+13b2a457), and Qwen3.6-35B-A3B Q4_K_M 2342.51 ± 18.82 / 82.79 ± 0.02. The community's nearest rows, SYCL fp16 with flash attention:
+`Qwen3.8-27B-UD-Q4_K_M` 507.51/14.92 (the same model in another quant file) and `Ornith-1.5-35B-A3B.Q4_K_M` 965.33/81.84 (another
+model of that size). A neighbourhood, not a like-for-like. CORRECTED 2026-11-05, checked against the thread's table: this
+section first named them "other model versions" and quoted 774.92/81.63, the Ornith row at fp32. It had read llama-bench's architecture
+column (`qwen35`, `qwen35moe`) as a model version.
 
 The B60's decode gap is not in the kernel: at 75.77 t/s a token is 13.2 ms, of which the matvec takes 10.4 (about 360 GB/s of
 weights against ~456 GB/s of memory bandwidth, `measured-here` for the time, under unitrace over 400 tokens) and the other kernels

@@ -6443,7 +6443,8 @@ window 61's CPU reference (16 x 512, q8_0:q4_0 KV): 0.004946 -> 0.004095 nats at
 The release A/B against 1.5.0 (window 75) went red on the coder's `decode-b`: 53.75 -> 51.50 t/s, the only metric of the leg below the old arm,
 with decode-a +2.3 %, decode-c +2.6 %, prefill-41k +0.8 %. That answer's text moved with the rounding and its draft acceptance fell 39.2 -> 33.7 %
 while its verify step went 34.7 -> 32.5 ms. Three answers each carried one md5 per arm, so `ab.py` gated every run instead of a majority answer.
-The wider set above shows no acceptance cost on the coder, so this is one answer's text, not the kernel's speed. The red cell is reported.
+The wider set above shows no acceptance cost on the coder, so this is one answer's text, not the kernel's speed. The operator accepted the
+red cell on 2026-11-05.
 
 ## 0096-opencl-intel-dense-q4_0.patch
 

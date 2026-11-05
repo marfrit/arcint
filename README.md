@@ -39,10 +39,8 @@ to text is [whisper.cpp](https://github.com/ggml-org/whisper.cpp)'s own
 server built against the same patched ggml, its own package `arcint-stt`
 ([contrib/whisper](contrib/whisper)).
 
-The inspiration is [NInfer](https://github.com/Neroued/ninfer), a
-from-scratch engine for a closed set of checkpoints that beats every
-generalist on them. For mixture-of-experts serving beyond the card's memory
-arcint follows the expert engines [Strata](https://github.com/Niko1221/Strata)
+For mixture-of-experts serving beyond the card's memory arcint follows the
+expert engines [Strata](https://github.com/Niko1221/Strata)
 and [FreeToken](https://github.com/FlashML-org/FreeToken)
 ([docs/campaigns/research-reference-audit.md](docs/campaigns/research-reference-audit.md)).
 
@@ -55,6 +53,68 @@ mechanism.
 OpenVINO runtime. It was retired in 0.8.0; its design and record are at the
 tag [`openvino-history`](https://github.com/marfrit/arcint/tree/openvino-history)
 ([docs/history.md](docs/history.md)).
+
+## arcint measured the llama-bench way
+
+llama.cpp's community GPU tables ([Vulkan](https://github.com/ggml-org/llama.cpp/discussions/10879),
+[SYCL](https://github.com/ggml-org/llama.cpp/discussions/23313)) compare cards on one
+file, Llama 2 7B at Q4_0: every layer on the card, 512 tokens of prefill (pp512), 128
+tokens of decode (tg128), 5 repetitions. [tools/llama_scoreboard.py](tools/llama_scoreboard.py)
+gives arcint the same run, and it refuses a file with another sha256.
+
+| Card | Engine | Flash attention | pp512 t/s | tg128 t/s |
+|---|---|---|---|---|
+| Arc A770 16 GB | **arcint** | on | **1956.15 ± 2.93** | **63.56 ± 0.06** |
+| | Vulkan | on | 1119.68 ± 30.25 | 53.07 ± 0.09 |
+| | Vulkan | off | 1073.85 ± 29.68 | 52.56 ± 0.11 |
+| | SYCL fp32 | on | 706.72 | 67.09 |
+| | SYCL fp32 | off | 937.24 | 59.03 |
+| Arc Pro B60 24 GB | **arcint** | on | **2332.94 ± 3.28** | **75.77 ± 0.02** |
+| | SYCL fp16 | on | 928.91 | 84.44 |
+| | SYCL fp16 | off | 1869.16 | 80.03 |
+| | Vulkan | on | 274.76 ± 0.27 | 70.54 ± 0.03 |
+| | Vulkan | off | 522.36 ± 3.60 | 68.55 ± 0.01 |
+
+arcint's rows are `measured-here` (2026-11-05, build cb8151bd, f16 KV, MTP off, the A770's GT
+clock pinned at 2000 MHz). The other rows are the best each backend and attention mode has
+reported for these cards in those threads, on other hosts and drivers. arcint leads prefill
+on both cards. On decode it leads Vulkan on both and sits 5 % (A770) and 10 % (B60) under the
+SYCL rows with flash attention. Other cards are in the threads: an Arc Pro B70 under Vulkan
+reports 4570.29 / 112.89, and there is no B70 here.
+
+**The same run, not the same program.** arcint serves the rows through its own path (HTTP,
+slot, sampler), which is what a client gets. A warm-up prefill and generation go uncounted.
+Each prefill is a new prompt of 512 random token ids and a run the prompt cache helped is
+refused. Each generation starts from one token and runs 128 tokens greedy with `ignore_eos`.
+The rates come from the engine's `/metrics` counters around each request, so HTTP time is not
+in them, and a request that stopped short is refused. The context is 4,096 tokens.
+
+    python3 tools/llama_scoreboard.py --arcint /usr/bin/arcint \
+        --model llama-2-7b.Q4_0.gguf --card "Arc A770=16 GB=GPU.1" \
+        --card "Arc Pro B60=24 GB=GPU.0"
+
+**What moved the rows.** Dense Q4_0 is a type none of the served models use, and it ran on
+upstream's float kernels. Patch 0096 puts it on the Intel integer-dot matvec and the XMX GEMM:
+
+| Card | pp512 before -> after | tg128 before -> after |
+|---|---|---|
+| Arc A770 | 362.73 -> 1956.15 (5.4x) | 39.48 -> 63.56 (+61 %) |
+| Arc Pro B60 | 425.57 -> 2332.94 (5.5x) | 76.24 -> 75.77 (-0.6 %) |
+
+The B60's decode is limited by memory: the matvec reads ~3.7 GB of weights in 10.4 ms a token,
+about 360 GB/s of the card's specified ~456 GB/s; the old kernel took 10.7 ms. The
+answers held: on both cards the mean KL against a CPU reference over 16 x 512 tokens is 0.00043 nats with
+the patch on and off, and 9 of 9 fact questions come back right in every arm.
+
+**Other files, the same run** (`--any-model`, `measured-here`, the B60, f16 KV, MTP off):
+
+| File | arcint pp512 / tg128 | Nearest row in the SYCL thread (fp16, flash attention) |
+|---|---|---|
+| Qwen3.8-27B Q4_K_M | 846.96 ± 4.02 / 19.78 ± 0.00 | 507.51 / 14.92, `Qwen3.8-27B-UD-Q4_K_M`, the same model in another quant file |
+| Qwen3.6-35B-A3B Q4_K_M | 2342.51 ± 18.82 / 82.79 ± 0.02 | 965.33 / 81.84, `Ornith-1.5-35B-A3B.Q4_K_M`, another model of that size |
+
+These two are a neighbourhood, not a like-for-like. The services run faster than this on decode:
+MTP is off here, and the agent decodes 47.5 t/s with it (below).
 
 ## New: loop guard for small models
 
@@ -194,13 +254,26 @@ request; llama.cpp's issue for a line-based detector went stale.
 | speech in | Whisper large-v3-turbo (whisper.cpp) | whisper.cpp's `.bin` | Arc Pro B60, on demand | German first; `/v1/audio/transcriptions` |
 
 The engine admits these architectures (`qwen35`, `qwen35moe`, `qwen4exp`,
-`llama` at the Mistral Small 24B geometry, `qwen2vl` for vision, and under
+`llama` at the Mistral Small 24B and Llama 2 7B geometries, `qwen2vl` for vision, and under
 `--tts` `qwen3tts`) and refuses others at load.
 Flash-Next's other files are on-demand options on the same endpoint: IQ2_XS,
 faster and less exact, and UD-Q3_K_XL, inside the KL bar once the host has
 the RAM for its bank (DESIGN §7.2).
 
 ## Current numbers
+
+The night ladder of 2026-11-05 (`measured-here`, the build 31e021e4, 1.5.0 + patches 0095 and 0096 +
+the reasoning-effort rework, alternated with 1.5.0's binary in one window): the agent's prefill +1.6 % at
+55k (707.2 t/s) and +1.1 % at 138k (500.0), same answers; the needle right at 254,970 tokens in 725 s, peak 24,133
+of 24,480 MiB; Flash-Next passes at 537.7 t/s prefill and 32.67 t/s decode; the coder 783.9 t/s at 41k (+0.8 %) and the
+task at 10/10 three times; the writer's decode +4.9 %, the vision service's +7.4 %.
+
+One cell of that ladder is red and accepted (operator, 2026-11-05): the coder's `decode-b`, 53.75 -> 51.50 t/s. Patch
+0095 computes the KV rotations as a Walsh-Hadamard transform, which moves their rounding. That answer's text moved with
+it and drew fewer accepted drafts (39.2 -> 33.7 %) while its verify step got faster (34.7 -> 32.5 ms); `decode-a` and
+`decode-c` gained 2.3 and 2.6 %. Over 12 answers a run, two rounds an arm, with the patch off and on: the coder 72.0 -> 74.9 t/s
+(+4.0 %), acceptance 72.30 -> 72.35 %; the agent 46.3 -> 47.5 t/s (+2.7 %), acceptance 47.1 -> 46.7 %. KL
+against a CPU reference stays inside the answer-level bar: 0.0049 -> 0.0041 nats in prefill, 0.00686 -> 0.00687 in decode.
 
 1.2.3 (2026-10-24, `measured-here`, the pre-tag package): coder and agent
 equal to 1.2.2 in the same-window A/B with the switches off; the coder with
