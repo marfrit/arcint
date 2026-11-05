@@ -10,12 +10,15 @@
 #include "api/generate.h"
 #include "api/handlers.h"
 #include "config.h"
+#include "core/chat.h"
 #include "core/reasoning.h"
 #include "core/sampler.h"
 #include "core/sampling.h"
 #include "exec/backend.h"
 #include "exec/verify_walk.h"
 #include "harness.h"
+
+#include <nlohmann/json.hpp>
 
 #include <string>
 #include <vector>
@@ -125,31 +128,61 @@ TEST(a_think_budget_forces_the_closer_after_its_tokens) {
     CHECK_EQ(drive(s), 5);   // the closer, by id, instead of the row's argmax
 }
 
-TEST(a_think_budget_of_zero_forces_nothing) {
+TEST(a_think_budget_is_not_a_context_guard_close) {
     SamplerParams p = ctx_params();
-    p.think_budget = 0;
+    p.think_budget = 2;
     Sampler s(p, 1);
     s.set_prompt({1, 2});
-    s.set_think_ctx_budget(0);
+    s.set_think_ctx_budget(2, true);
+    s.start_in_think_block(true);
+    drive(s);
+    drive(s);
+    CHECK_EQ(drive(s), 5);
+    CHECK_EQ(s.loop_guard_counts().think_closes, 1);
+    CHECK_EQ(s.loop_guard_counts().ctx_closes, 0);
+}
+
+TEST(a_context_limit_still_closes_as_the_context_guard) {
+    SamplerParams p = ctx_params();
+    p.think_ctx_reserve = 8;
+    p.think_budget = 900;
+    Sampler s(p, 1);
+    s.set_prompt({1, 2});
+    s.set_think_ctx_budget(1, false);    // the context is the tighter limit
+    s.start_in_think_block(true);
+    drive(s);
+    CHECK_EQ(drive(s), 5);
+    CHECK_EQ(s.loop_guard_counts().ctx_closes, 1);
+    CHECK_EQ(s.loop_guard_counts().think_closes, 0);
+}
+
+TEST(a_think_budget_counts_nothing_with_the_switch_off) {
+    SamplerParams p = ctx_params();
+    p.think_budget = 0;
+    p.think_eog_mask = true;             // the block is tracked, the budget is not on
+    Sampler s(p, 1);
+    s.set_prompt({1, 2});
+    s.set_think_ctx_budget(1);
     s.start_in_think_block(true);
     for (int i = 0; i < 16; ++i) CHECK_EQ(drive(s), 2);
     CHECK_EQ(s.think_ctx_remaining(), -1);
 }
 
-TEST(a_think_budget_never_closes_an_answer) {
-    // The model closes by itself first: the budget has nothing left to do.
+TEST(a_think_budget_leaves_the_answer_alone) {
+    // The closer is forced at the budget; what follows is never closed again.
     SamplerParams p = ctx_params();
-    p.think_budget = 2;
+    p.think_budget = 1;
     Sampler s(p, 1);
     s.set_prompt({1, 2});
-    s.set_think_ctx_budget(p.think_budget);
+    s.set_think_ctx_budget(1, true);
     s.start_in_think_block(true);
-    CHECK_EQ(drive(s), 2);
-    std::vector<float> l = row_with_argmax(5);
+    drive(s);
+    std::vector<float> l = row_with_argmax(2);
     const int closer = s.sample(l.data(), l.size());
     CHECK_EQ(closer, 5);
     s.observe(closer, think_tag_pairs(false)[0].second);
     for (int i = 0; i < 8; ++i) CHECK_EQ(drive(s), 2);
+    CHECK_EQ(s.loop_guard_counts().think_closes, 1);
 }
 
 TEST(think_budget_flag_and_request_field) {
@@ -170,6 +203,16 @@ TEST(think_budget_flag_and_request_field) {
     o.think_budget = 64;
     CHECK(!sampler_apply(p, o).has_value());
     CHECK_EQ(p.think_budget, 64);
+    // A value past int32 is refused, never wrapped into a tiny budget.
+    const nlohmann::json huge = {{"messages", nlohmann::json::array({{{"role", "user"}, {"content", "x"}}})},
+                                 {"think_budget", 4294967297LL}};
+    ChatRequest req;
+    CHECK(parse_chat_request(huge, req).has_value());
+    const nlohmann::json ok = {{"messages", nlohmann::json::array({{{"role", "user"}, {"content", "x"}}})},
+                               {"think_budget", 64}};
+    ChatRequest req2;
+    CHECK(!parse_chat_request(ok, req2).has_value());
+    CHECK_EQ(*req2.sampler.think_budget, 64);
 }
 
 // 1. The budget arithmetic. The sampler gets n_ctx - prompt_tokens - reserve
@@ -429,6 +472,7 @@ TEST(context_guard_flag_parses_and_reaches_props) {
     const nlohmann::json sd = p.at("sampler_defaults");
     CHECK(sd.contains("think_ctx_reserve"));
     if (sd.contains("think_ctx_reserve")) CHECK_EQ(sd.at("think_ctx_reserve").get<int>(), 256);
+    CHECK(sd.contains("think_budget"));
 }
 
 // -------------------------------------------------- W3.4b review findings

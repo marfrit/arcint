@@ -117,7 +117,9 @@ public:
     // loop guard's own forced-closer seam.
     // The thinking budget (params.think_budget) arrives here too, the tighter of
     // the two limits (think_turn_budget).
-    void set_think_ctx_budget(int budget);
+    // by_think_budget says which limit won, so a budget's close is not reported
+    // as a context guard's.
+    void set_think_ctx_budget(int budget, bool by_think_budget = false);
     // Test hook: tokens still allowed inside the block, -1 when off. No
     // response key (the Responses event's numbers come from the API's own
     // prompt/completion counts and n_ctx).
@@ -165,12 +167,13 @@ public:
         // index space as arcint:token, so the event can name it.
         int ctx_closes      = 0;
         int ctx_no_closer    = 0;
+        int think_closes     = 0;
         int ctx_forced_index = -1;
     };
     LoopGuardCounts loop_guard_counts() const {
         return {loop_detections_, loop_nudges_, loop_slaps_, loop_aborts_,
                 loop_self_closes_, loop_door_masked_, loop_door_eog_masked_,
-                ctx_closes_, ctx_no_closer_, ctx_forced_index_};
+                ctx_closes_, ctx_no_closer_, think_closes_, ctx_forced_index_};
     }
     // The answer phase kept looping after a slap: the caller ends the turn on
     // FinishReason::Loop instead of emitting another token. Latching: once set
@@ -431,6 +434,8 @@ private:
     bool ctx_settled_        = false;
     int  ctx_closes_         = 0;
     int  ctx_no_closer_      = 0;
+    int  think_closes_       = 0;
+    bool ctx_by_think_       = false;  // the thinking budget is the limit counted
     int  ctx_forced_index_   = -1;
     int  emitted_            = 0;
     mutable bool ctx_warned_ = false;

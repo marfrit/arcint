@@ -113,6 +113,9 @@ std::string decode_suffix_for(const GenerationStats& stats) {
         decode_suffix += log::format(" | context guard: closed %d, no closer %d",
                                      stats.loop_context_closes, stats.loop_context_no_closer);
     }
+    if (stats.loop_think_closes) {
+        decode_suffix += log::format(" | thinking budget: closed %d", stats.loop_think_closes);
+    }
     return decode_suffix;
 }
 
@@ -131,7 +134,8 @@ nlohmann::json loop_guard_json(const GenerationStats& stats) {
                 // feyntalk W3.4: not a ladder rung -- the context guard's own
                 // counter, and the arms that had no closer id to force.
                 {"context_closes", stats.loop_context_closes},
-                {"context_no_closer", stats.loop_context_no_closer}};
+                {"context_no_closer", stats.loop_context_no_closer},
+                {"think_closes", stats.loop_think_closes}};
 }
 
 namespace {

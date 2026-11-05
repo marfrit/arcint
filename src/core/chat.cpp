@@ -176,10 +176,7 @@ std::optional<std::string> read_sampler(const json& b, SamplerOverrides& s) {
         s.tool_grammar = b["tool_grammar"].get<bool>();
     }
     // The thinking budget for this request; 0 turns the operator's off for it.
-    if (b.contains("think_budget") && !b["think_budget"].is_null()) {
-        if (!b["think_budget"].is_number_integer()) return "think_budget must be an integer";
-        s.think_budget = b["think_budget"].get<int>();
-    }
+    if (auto e = integer("think_budget", s.think_budget)) return e;
     // loop-guard: the request's own rung, overriding the operator's flag for
     // this request only. Non-standard, so it is named; absent keeps the flag.
     if (b.contains("loop_guard") && !b["loop_guard"].is_null()) {
