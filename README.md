@@ -75,8 +75,8 @@ gives arcint the same run, and it refuses a file with another sha256.
 | | SYCL fp16, here | off | 1876.79 ± 10.29 | 68.72 ± 0.02 |
 | | SYCL fp32, here | on | 771.97 ± 1.75 | 73.06 ± 0.03 |
 | | SYCL fp32, here | off | 859.88 ± 1.66 | 68.71 ± 0.05 |
-| | Vulkan | on | 1119.68 ± 30.25 | 53.07 ± 0.09 |
-| | Vulkan | off | 1073.85 ± 29.68 | 52.56 ± 0.11 |
+| | Vulkan, here | on | 1123.84 ± 2.00 | 46.90 ± 0.01 |
+| | Vulkan, here | off | 1089.27 ± 1.17 | 46.11 ± 0.01 |
 | Arc Pro B60 24 GB | **arcint's series, llama-bench** | on | **2482.36 ± 1.89** | **80.58 ± 0.11** |
 | | arcint's series, llama-bench | off | 2211.35 ± 2.19 | 79.81 ± 0.66 |
 | | **arcint, served** | on | **2329.61 ± 4.51** | **80.69 ± 0.09** |
@@ -84,13 +84,12 @@ gives arcint the same run, and it refuses a file with another sha256.
 | | SYCL fp16, here | off | 1891.17 ± 2.77 | 79.98 ± 0.13 |
 | | SYCL fp32, here | on | 668.42 ± 0.11 | 84.30 ± 0.08 |
 | | SYCL fp32, here | off | 572.10 ± 0.16 | 80.22 ± 0.14 |
-| | Vulkan | on | 274.76 ± 0.27 | 70.54 ± 0.03 |
-| | Vulkan | off | 522.36 ± 3.60 | 68.55 ± 0.01 |
+| | Vulkan, here | on | 726.81 ± 0.38 | 68.06 ± 0.01 |
+| | Vulkan, here | off | 729.87 ± 0.70 | 65.25 ± 0.01 |
 
 The arcint rows are `measured-here` on 1.5.1 (2026-11-05, 77ff7456, f16 KV, MTP off, the A770's GT clock pinned at 2000 MHz): llama-bench itself built on
 arcint's llama.cpp series, and arcint's own server through the tool above. The rows marked "here" are `measured-here` too: stock llama-bench at the same
-llama.cpp pin (3e4dfa8, no arcint patches), oneAPI 2026.1.1, Level Zero V2, the same card, host and clock. The Vulkan rows are the best reported for these
-cards in those threads, on other hosts and drivers; there is no Vulkan row of ours.
+llama.cpp pin (3e4dfa8, no arcint patches), oneAPI 2026.1.1, Level Zero V2, the same card, host and clock. The Vulkan rows are stock llama.cpp at master 45b6604b2 on Mesa 25.0.7 (the pin within 0.5 %); the A770's decode is below the 53 t/s reported in the Vulkan thread on another host, and its clock here is held at 2000 MHz.
 
 Against stock SYCL's best prefill (fp16 without flash attention), the series leads by 10.5 % on the A770 and 31 % on the B60. Against its best decode (fp16 with flash attention), it trails
 by 5.4 % and 4.4 %. SYCL's legacy Level Zero adapter is a little faster at decode on the B60 (85.96 t/s, a 6.3 % gap) and slower on the A770 (58.93 t/s). Other cards are in the
@@ -523,9 +522,8 @@ service's production flags, Flash-Next's expert cache included
   CPU reference, the 8 fact questions); no wedge. Strata's SYCL engine ran through Level Zero on the B60 too (2026-10-06), the numbers under "Current numbers". One trap on Debian trixie: oneAPI 2026.1
   segfaults in every SYCL program with the distribution's Level Zero loader (`libze1`
   1.20.6), and loader 1.34 fixes it (`measured-here`).
-- **Vulkan** depends on the card. On the B60 it trails SYCL (the table above, and
-  126 / 7.8 t/s on the dense 27B at 1k against SYCL's 249 / 14.2, 2026-09-07, `measured-here`); on the A770 its reported
-  rows trail SYCL fp16 here; and a B70 reports 4570.29 / 112.89.
+- **Vulkan** depends on the card. On the A770 and the B60 it trails SYCL and the series here (the table above, Mesa 25.0.7, and on the B60
+  126 / 7.8 t/s on the dense 27B at 1k against SYCL's 249 / 14.2, 2026-09-07, `measured-here`); a B70 reports 4570.29 / 112.89.
 - **OpenVINO**: arcint's first engine (0.1-0.7.12). Its GPU plugin emits good
   Xe code, but the services needed an IR export per model and a GPU-plugin
   patch series on a pinned nightly, and the libllama engine overtook it on
