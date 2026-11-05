@@ -21,7 +21,7 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 ## Unreleased
 
 - **`http`: the listening socket uses `SO_REUSEADDR`, not cpp-httplib's Linux default `SO_REUSEPORT`.** Two instances of one user could share a port silently and split its requests, and a start right after another server that used `SO_REUSEADDR` failed with "could not bind" for up to 60 s. Now a second instance is refused, and a restart of the same build binds at once. One transition stays: the first start after upgrading from 1.5.1 or older can fail to bind for up to 60 s if the old server just closed connections, and a unit with a restart policy recovers by itself (`measured-here`, raw sockets). `tests/test_disconnect.cpp`.
-- **Patch 0098**, `contrib/llama.cpp/README.md`: decode attention's split by card and depth (the coder +2.9 % at ~3,300 keys, +4.5 % at ~7,000; the agent level), and the plain K-split kernels' work-group on Intel, a defect at heads of 64 and 96 on the A770 that no served model reaches. Flash-Next's A/B reports FAIL on its variance rule only (9.57 % against 9.02 %), its mean up 0.6 %: not yet accepted by the operator.
+- **Patch 0098**, `contrib/llama.cpp/README.md`: decode attention's split by card and depth (the coder +2.9 % at ~3,300 keys, +4.5 % at ~7,000; the agent level), and the plain K-split kernels' work-group on Intel, a defect at heads of 64 and 96 on the A770 that no served model reaches. Flash-Next's A/B reports FAIL on its variance rule only (9.57 % against 9.02 %), its mean up 0.6 %: accepted by the operator.
 
 ## 1.5.1 — 2026-11-05
 
