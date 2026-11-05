@@ -2467,8 +2467,8 @@ private:
     // into another lane's context.
     static void prepare_think_ctx(const SamplerParams& sp, int cap, int prompt_tokens,
                                   Sampler& sampler) {
-        if (sp.think_ctx_reserve <= 0) return;
-        sampler.set_think_ctx_budget(think_ctx_budget(cap, prompt_tokens, sp.think_ctx_reserve));
+        if (sp.think_ctx_reserve <= 0 && sp.think_budget <= 0) return;
+        sampler.set_think_ctx_budget(think_turn_budget(cap, prompt_tokens, sp.think_ctx_reserve, sp.think_budget));
     }
 
     void prepare_think_mask(const GenerationInput& in, Sampler& sampler) const {
@@ -2479,7 +2479,8 @@ private:
         // feyntalk W3.4: the context guard needs the block's state and its own
         // closer id, the same pairing the slap uses.
         if (!in.sampler.think_eog_mask && !in.sampler.tool_grammar && !in.sampler.answer_configured()
-            && in.sampler.loop_guard == LoopGuardMode::Off && in.sampler.think_ctx_reserve <= 0)
+            && in.sampler.loop_guard == LoopGuardMode::Off && in.sampler.think_ctx_reserve <= 0
+            && in.sampler.think_budget <= 0)
             return;
         ThinkBlockIds ids = in.think_tags_extended ? think_ids_ext_ : think_ids_qwen_;
         ids.eog = eog_ids_;

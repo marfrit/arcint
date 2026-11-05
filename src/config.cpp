@@ -271,6 +271,10 @@ std::string usage_text() {
         "                            behaviour of every build up to this one; a request\n"
         "                            may set the same thing as think_eog_mask\n"
         "  --tool-grammar            constrain a tool call to the declared schemas\n"
+        "  --think-budget N          at most N reasoning tokens a turn (default 0: off);\n"
+        "                            at N the think-block's closer is forced and the\n"
+        "                            model answers. The request field think_budget\n"
+        "                            overrides it.\n"
         "  --think-ctx-reserve N     tokens of the lane's context reserved for what\n"
         "                            is left after the thought (default 0: off). The\n"
         "                            sampler forces the think-block's closer once\n"
@@ -700,6 +704,11 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, n) || n < 0)
                 return fail("--think-ctx-reserve needs a token count >= 0 (0: off)");
             cfg.think_ctx_reserve = n;
+        } else if (arg == "--think-budget") {
+            int n = 0;
+            if (!value(v) || !parse_int(v, n) || n < 0)
+                return fail("--think-budget needs a token count >= 0 (0: off)");
+            cfg.think_budget = n;
         } else if (arg == "--tool-grammar") {
             cfg.tool_grammar = true;
         } else if (arg == "--loop-guard") {
@@ -1008,6 +1017,7 @@ std::optional<std::string> apply_operator_defaults(const Config& cfg, SamplerDef
     o.answer_frequency_penalty = cfg.answer_frequency_penalty;
     if (cfg.think_eog_mask) o.think_eog_mask = true;
     if (cfg.think_ctx_reserve > 0) o.think_ctx_reserve = cfg.think_ctx_reserve;
+    if (cfg.think_budget > 0) o.think_budget = cfg.think_budget;
     if (cfg.tool_grammar)   o.tool_grammar   = true;
     // loop-guard: off changes nothing and does not mark the defaults operator;
     // any other rung carries its window/threshold/grace with it.

@@ -545,6 +545,7 @@ json props(const Context& ctx) {
           {"think_eog_mask", sd.think_eog_mask},
           // feyntalk W3.4: the context guard's reserve in tokens; 0 is off.
           {"think_ctx_reserve", sd.think_ctx_reserve},
+          {"think_budget", sd.think_budget},
           {"tool_grammar", sd.tool_grammar},
           // loop-guard: the served switch and its thresholds, so a turn that
           // ends differently than yesterday's is explained here.

@@ -103,6 +103,75 @@ private:
 
 }  // namespace
 
+// The thinking budget: the same seam, a limit in tokens a turn. A long reasoning
+// that never repeats is what the loop guard cannot see.
+TEST(think_turn_budget_is_the_tighter_limit) {
+    CHECK_EQ(think_turn_budget(4096, 100, 0, 50), 50);      // the budget alone
+    CHECK_EQ(think_turn_budget(4096, 100, 256, 0), 3740);   // the reserve alone
+    CHECK_EQ(think_turn_budget(4096, 100, 256, 50), 50);    // the budget is tighter
+    CHECK_EQ(think_turn_budget(4096, 4000, 256, 50), -160); // the context is
+}
+
+TEST(a_think_budget_forces_the_closer_after_its_tokens) {
+    SamplerParams p = ctx_params();
+    p.think_budget = 3;
+    Sampler s(p, 1);
+    s.set_prompt({1, 2});
+    s.set_think_ctx_budget(p.think_budget);
+    s.start_in_think_block(true);
+    CHECK_EQ(drive(s), 2);
+    CHECK_EQ(drive(s), 2);
+    CHECK_EQ(drive(s), 2);
+    CHECK_EQ(drive(s), 5);   // the closer, by id, instead of the row's argmax
+}
+
+TEST(a_think_budget_of_zero_forces_nothing) {
+    SamplerParams p = ctx_params();
+    p.think_budget = 0;
+    Sampler s(p, 1);
+    s.set_prompt({1, 2});
+    s.set_think_ctx_budget(0);
+    s.start_in_think_block(true);
+    for (int i = 0; i < 16; ++i) CHECK_EQ(drive(s), 2);
+    CHECK_EQ(s.think_ctx_remaining(), -1);
+}
+
+TEST(a_think_budget_never_closes_an_answer) {
+    // The model closes by itself first: the budget has nothing left to do.
+    SamplerParams p = ctx_params();
+    p.think_budget = 2;
+    Sampler s(p, 1);
+    s.set_prompt({1, 2});
+    s.set_think_ctx_budget(p.think_budget);
+    s.start_in_think_block(true);
+    CHECK_EQ(drive(s), 2);
+    std::vector<float> l = row_with_argmax(5);
+    const int closer = s.sample(l.data(), l.size());
+    CHECK_EQ(closer, 5);
+    s.observe(closer, think_tag_pairs(false)[0].second);
+    for (int i = 0; i < 8; ++i) CHECK_EQ(drive(s), 2);
+}
+
+TEST(think_budget_flag_and_request_field) {
+    Config cfg;
+    CHECK(run({"--stub", "--think-budget", "20000"}, cfg).ok);
+    CHECK_EQ(cfg.think_budget, 20000);
+    Config neg;
+    CHECK(!run({"--stub", "--think-budget", "-1"}, neg).ok);
+
+    SamplerOverrides o;
+    SamplerParams p;
+    o.think_budget = -1;
+    CHECK(sampler_apply(p, o).has_value());     // refused
+    p.think_budget = 900;                       // the operator's
+    o.think_budget = 0;                         // the request turns it off
+    CHECK(!sampler_apply(p, o).has_value());
+    CHECK_EQ(p.think_budget, 0);
+    o.think_budget = 64;
+    CHECK(!sampler_apply(p, o).has_value());
+    CHECK_EQ(p.think_budget, 64);
+}
+
 // 1. The budget arithmetic. The sampler gets n_ctx - prompt_tokens - reserve
 // at request start and counts it down per EMITTED token inside the block; a
 // speculative chain the verify walk accepts is the tokens it observes, so each

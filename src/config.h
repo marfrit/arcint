@@ -349,6 +349,9 @@ struct Config {
     // for what is left after the thought: the sampler forces the think block's
     // closer once n_ctx - prompt_tokens - N emitted reasoning tokens have gone.
     int         think_ctx_reserve = 0;
+    // The thinking budget in tokens a turn (--think-budget), 0 off: at the budget
+    // the think block's closer is forced and the model goes on to answer.
+    int         think_budget = 0;
 
     // Stub-only: milliseconds of artificial latency per emitted token. Exists
     // so the cancellation path (§3.7) can be demonstrated against a backend

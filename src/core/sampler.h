@@ -114,6 +114,8 @@ public:
     // are the emitted tokens it observes, so each counts once); at 0 the
     // think-block's closer id is forced as the next sampled token, through the
     // loop guard's own forced-closer seam.
+    // The thinking budget (params.think_budget) arrives here too, the tighter of
+    // the two limits (think_turn_budget).
     void set_think_ctx_budget(int budget);
     // Test hook: tokens still allowed inside the block, -1 when off. No
     // response key (the Responses event's numbers come from the API's own
@@ -210,7 +212,8 @@ private:
     int    draw(float* logits, size_t vocab);
     bool   tracks_think() const
         { return params_.think_eog_mask || params_.tool_grammar || params_.answer_configured()
-                 || params_.loop_guard != LoopGuardMode::Off || params_.think_ctx_reserve > 0; }
+                 || params_.loop_guard != LoopGuardMode::Off || params_.think_ctx_reserve > 0
+                 || params_.think_budget > 0; }
     // llava: the answer row applies only in a thinking turn, after a block
     // actually opened and closed. A non-thinking turn, or one whose block
     // never opened, keeps the thinking row.

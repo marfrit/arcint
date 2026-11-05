@@ -40,6 +40,16 @@ inline int think_ctx_budget(int n_ctx, int prompt_tokens, int reserve) {
     return n_ctx - prompt_tokens - reserve;
 }
 
+// The thinking budget beside it: at most this many tokens inside the block in
+// one turn, whatever the context says. The tighter of the two limits is the one
+// the sampler counts down; 0 is either switch off. Only call it with at least
+// one of them on.
+inline int think_turn_budget(int n_ctx, int prompt_tokens, int reserve, int think_budget) {
+    if (reserve <= 0) return think_budget;
+    const int by_ctx = think_ctx_budget(n_ctx, prompt_tokens, reserve);
+    return think_budget > 0 && think_budget < by_ctx ? think_budget : by_ctx;
+}
+
 // Whether a mode escalates by nudge/slap/abort at all (Ladder is deferred by
 // the door grace; LadderNoDoor nudges at detection as before).
 inline bool loop_guard_is_ladder(LoopGuardMode m) {
@@ -113,6 +123,12 @@ struct SamplerDefaults {
     // compaction can act. The operator's --think-ctx-reserve flag sets it; a
     // request never does.
     int think_ctx_reserve = 0;
+    // The thinking budget: at most this many reasoning tokens a turn (0, the
+    // default: off, byte-identical). At the budget the think-block's closer is
+    // forced through the same seam, so the model goes on to answer. A long
+    // reasoning that does not repeat itself is what the loop guard cannot see.
+    // --think-budget sets it; the request field think_budget overrides it.
+    int think_budget = 0;
 
     // clean-turns step 2: the operator's switch for the tool-call grammar.
     // Off keeps today's behaviour; on, a request that declared tools is
@@ -225,6 +241,7 @@ struct SamplerParams {
     // params; the sampler gets the budget itself at request start (it knows
     // neither n_ctx nor the position).
     int think_ctx_reserve = 0;
+    int think_budget = 0;   // see the operator layer's field
     ThinkBlockIds think_ids;
 
     // clean-turns step 2: constrain the tool-call form to the declared schemas
@@ -308,6 +325,8 @@ struct SamplerOverrides {
     std::optional<bool>                     tool_grammar;
     // feyntalk W3.4: the operator layer carries the context guard's reserve.
     std::optional<int>                      think_ctx_reserve;
+    // The thinking budget; a request may set it, 0 turns it off for the request.
+    std::optional<int>                      think_budget;
     // loop-guard: the request's own rung for this request only. Absent keeps
     // the operator's switch; the window/threshold/grace stay operator-side.
     std::optional<LoopGuardMode>            loop_guard;
