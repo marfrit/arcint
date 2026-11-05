@@ -107,3 +107,6 @@ default to the legacy Level Zero adapter (`SYCL_UR_USE_LEVEL_ZERO_V2` opt-in) as
 dead under xe (a memcpy abort). That negative predates this and may have been the V2 adapter or the L0 loader
 (memory: oneAPI 2026.1 needs a newer loader); by the reference-audit rule it is not settled until the legacy adapter
 is tried on the B60.
+CORRECTED 2026-11-05 (operator): the record was wrong. It came from a note on runtimes older than the xe transition, and Strata's
+SYCL engine ran on the B60 through Level Zero on 2026-10-06 (`strata-sycl-b60.md`, `measured-here`), before this survey. DESIGN §2 retracts it.
+The legacy adapter's speed against V2 is still untried here.

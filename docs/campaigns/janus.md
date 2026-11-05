@@ -302,6 +302,9 @@ of 16,384 MiB (`measured-here`, DESIGN §3.3).
   host (`measured-here`, DESIGN §2: SYCL aborts under xe with a memcpy abort;
   `research-vram-arena.md` §8.1: native OpenCL cannot see an L0 range, two
   drivers and two VMs).
+  CORRECTED 2026-11-05 (operator): "dead under xe" is retracted (DESIGN §2): SYCL runs under xe through Level Zero on the B60
+  (`strata-sycl-b60.md`, `measured-here`). `research-vram-arena.md` §8.1's OpenCL-cannot-see-an-L0-range stands, so the route
+  is a SYCL or Level Zero backend, not OpenCL; this recon did not weigh that route and it is open.
 - **What a promote therefore costs.** New device buffers for the promoted
   tensors, a rebind of every tensor's `extra` (the backend's `data_device` and
   `offset`), and then a re-reserve. The nearest existing machinery is the

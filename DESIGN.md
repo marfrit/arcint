@@ -131,9 +131,14 @@ The cards (`measured-here` unless marked):
 | random-read ceiling | 414-418 GB/s (nominal 560, `paper`) | 453 GB/s (nominal 456, `paper`) |
 
 - The xe kernel driver only; OpenCL through Intel's compute runtime is the
-  route on both cards. SYCL aborts under xe (a memcpy abort) and Vulkan is
-  slow on Battlemage (126 / 7.8 t/s against llama.cpp SYCL's 249 / 14.2 on
-  the dense 27B at 1k, 2026-09, `measured-here`).
+  route arcint serves on, on both cards. SYCL also works under xe: Strata's SYCL
+  engine ran on the B60 through Level Zero (2026-10-06, `measured-here`), with the Level
+  Zero loader 1.34 because Debian's 1.20.6 segfaults every SYCL program under oneAPI 2026.1.
+  llama.cpp's SYCL on its OpenCL adapter gave 249 / 14.2 t/s on the dense 27B at 1k against
+  Vulkan's 126 / 7.8 on the B60 (2026-09, `measured-here`). SYCL on the A770 has not been run here.
+  RETRACTED (operator, 2026-11-05): "SYCL aborts under xe (a memcpy abort)". The first design
+  wrote "SYCL runtimes older than the xe transition abort on memcpy"; later copies dropped the
+  condition, no test of a current runtime backed it, and it helped send arcint to OpenVINO first.
 - The two generations are two OpenCL platforms in Intel's runtime; a
   two-card process gives each its own context (`contrib/llama.cpp` 0023).
 - The dev host is an 8-core / 16-thread AVX2 CPU (Zen 3, no AVX-512) with
