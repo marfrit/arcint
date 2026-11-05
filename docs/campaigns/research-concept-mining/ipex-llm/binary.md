@@ -52,7 +52,7 @@ Name, template parameters as mangled (they are the block/tile geometry), ESIMD y
 | `mlp_forward_q4_0_kernel_upgate<…>` | 10, 11 | — | no | no | one weight pointer at the front (gate and up interleaved/one tensor) — the "upgate" fused form |
 | `mlp_forward_q4_k_kernel<32,16,2>` | 9 | — | **yes** (genx intrinsics) | no | the same for Q4_K |
 | `linear_forward_kernel<float,2,4,16,…>` | 0 | rows × cols tiles, 6 instantiations | **yes** | no | q4_0 linear, f32 out (the ESIMD GEMM primitive the fusions use) |
-| `vec_q4_0_batch_kernel<float,8,2,16|32,{1..8},64,…>` (30) and `vec_{q2,q3,q4,q5,q6}_K_batch_kernel` (54) | 14, 15 | 8 rows × 2 columns a tile | no | no | quantized weight × **float** activation, batch-shaped; IPEX's own quantized batch GEMM (`bigdl-core-xe/llama_backend/batch/kquants.cpp`, `int4.cpp`) |
+| `vec_q4_0_batch_kernel<float,8,2,16|32,{1..8},64,…>` (30) and `vec_{q2,q3,q4,q5,q6}_K_batch_kernel` (54) | 14, 15 | 8 rows × 2 columns a tile | no | no | quantized weight × **float** activation, batch-shaped; IPEX's own quantized batch GEMM|
 | `ggml_mul_mat_qX_q8_1_sycl` (20 instantiations) | 24 | MMQ tiles | no | no | the upstream MMQ form |
 | `mul_mat_vec_{qX,iqX}_q8_1_sycl` (22), `reorder_mul_mat_vec_*` | 23 | one row a work-item, `DMMV_X` columns | no | no | upstream MMVQ, plus reordered-weight variants |
 | `dequantize_mul_mat_vec_q4_0_kernel<32,16,2|8>` / `<64,32,8>` | host `T` | 3 geometries | no | no | **card-shaped DMMV for q4_0** — the 64/32/8 one is a B60-shaped instance beside the 32/16 ones |
