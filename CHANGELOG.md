@@ -18,6 +18,19 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.5.1 — 2026-11-05
+
+Faster decode on the coder, and arcint on llama.cpp's community GPU tables. The README's "arcint measured the llama-bench way" has the rows, next to stock SYCL measured on the same cards.
+
+- **Decode attention's keys per split follow the KV's length** (patch 0097; `GGML_OPENCL_FA_INTEL_KV_PER_SPLIT` fixes a value, 128 is the old default). `measured-here`: the coder on its deployed flags 74.65 -> 82.78 t/s (+10.9 %), the release A/B's decode 53.70 / 51.50 / 47.40 -> 58.70 / 59.65 / 55.90; the task 10/10 x3. The agent equal, because its verify rows take the GQA kernel.
+- **The KV rotations as a fast Walsh-Hadamard transform** (patch 0095, `GGML_OPENCL_FWHT=0` keeps the dense product): the coder +4.0 % and the agent +2.7 % decode, KL inside the bar. Reviewed by Qwen3.8-Flash-Next.
+- **Dense Q4_0 on the Intel integer-dot matvec and XMX GEMM** (patch 0096, `GGML_OPENCL_Q40_XMX=0` keeps the float kernels). No served model uses dense Q4_0; Llama 2 7B prefills at 5.4x on the A770 and 5.5x on the B60.
+- **Llama 2 7B is admitted**, and `tools/llama_scoreboard.py` measures arcint the way llama-bench does: 5 repetitions, random token-id prompts, rates from the engine's own counters, through the served path.
+- **`reasoning_effort` reaches the template** on Chat Completions and Responses, passed through where the template quotes the level; `minimal` keeps thinking on, at low; `/props` publishes `reasoning_effort_levels`.
+- **Corrected docs:** SYCL works under the xe driver on both cards. The record's "SYCL aborts under xe" came from a note on runtimes older than the xe transition and is retracted in `DESIGN.md` §2; the Vulkan and vLLM lines are corrected too.
+
+Release A/B against 1.5.0: see the window recorded below this list when the tag is cut. Two red cells are accepted by the operator: the coder's `decode-b` under 0095 alone, an answer's text, which 0097 then cleared; and Flash-Next's variance rule, its answers differing in every run with the mean equal.
+
 ## 1.5.0 — 2026-11-03
 
 Faster by default on the coder, the full trained context on the agent, and a

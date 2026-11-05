@@ -1,3 +1,12 @@
+arcint (1.5.1-1) trixie; urgency=medium
+
+  * Decode attention's keys per split follow the KV's length (0097); the KV
+    rotations as a fast Walsh-Hadamard transform (0095); dense Q4_0 on the
+    Intel fast paths and Llama 2 7B admitted (0096); reasoning_effort reaches
+    the template on both routes.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Thu, 05 Nov 2026 12:00:00 +0100
+
 arcint (1.5.0-1) trixie; urgency=medium
 
   * 1.5.0: two speed switches on by default (the MTP head's K/V-only prompt
