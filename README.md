@@ -289,7 +289,7 @@ the RAM for its bank (DESIGN §7.2).
 
 Patch 0097 against the deployed build (2026-11-05, `measured-here`, one window): the coder on its deployed flags, MTP on, 12 answers a run, 74.65 -> 82.78 t/s (+10.9 %), a verify step
 26.2 -> 24.1 ms, draft acceptance 72.9 -> 71.9 %; the release A/B's decode 53.70 / 51.50 / 47.40 -> 58.70 / 59.65 / 55.90; the task at 10/10 three times. The agent is equal, 47.71 -> 47.76 t/s, because its verify rows take another
-kernel; the needle right at 254,970 tokens in 725 s, peak 24,190 of 24,480 MiB; prefill, the writer and the vision service unchanged, with the same answers. Flash-Next's A/B is red on its variance rule, 32.97 -> 33.33 t/s with a spread of 10.8 % against 5.5 %: its answers
+kernel; the needle right at 254,970 tokens in 725 s, peak 24,190 of 24,480 MiB; prefill, the writer and the vision service unchanged, with the same answers. Flash-Next's A/B is red on its variance rule, accepted (operator, 2026-11-05): 32.97 -> 33.33 t/s with a spread of 10.8 % against 5.5 %: its answers
 differ in every run, and draft acceptance moved between 64 and 74 % with them.
 
 The night ladder of 2026-11-05 (`measured-here`, the build 31e021e4, 1.5.0 + patches 0095 and 0096 +
