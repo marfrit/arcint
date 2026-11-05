@@ -29,7 +29,7 @@ below and the message named.
   tensor from 10 inputs; it calls `llama_kv_cache_unified_state::get_k/get_v/get_head` (`0xaf472`,
   `0xaf486`, `0xaf491`). The op's constructor sets op id 85 and type 0x1e = **BF16**
   (`libggml-base.so` `0x232c0`). Kernels: `qlinear_xpu_kernel_q4_0_2x16_qkv{,_neox}` and
-  `…_wqkv_neox`, module 6/7 SPIR-V, ESIMD, no DPAS; the symbol's last ints are the norm eps and
+  `…_wqkv_neox`, module 6/7 SPIR-V, plain SYCL (no genx intrinsics), no DPAS; the symbol's last ints are the norm eps and
   rope parameters. Geometry 32/64 × 16/32 × 2 — small-row.
 - **PyTorch path** (`code`): no fused projection+norm+rope kernel at HEAD; the weight merge is
   `merge_quantized_qkv(q_proj, k_proj, v_proj, module)` (`models/common.py:379-412`): it moves the
@@ -41,7 +41,8 @@ below and the message named.
 ## 3. The MLP fusion (score 8)
 
 - **llama.cpp**: `ggml_bigdl_mlp_fusion` (op id 85 family), `mlp_forward_q4_0_kernel` and
-  `…_upgate`, `mlp_forward_q4_k_kernel`, ESIMD, modules 9/10/11.
+  `…_upgate` (module 10/11, plain SYCL) and `mlp_forward_q4_k_kernel` (module 9, genx
+  intrinsics).
 - **PyTorch** (`code`): `fuse_mlp_base(module, act, x)` (`models/common.py:147-160`) calls
   `xe_linear.mlp_forward_xpu(x_2d, gate, up, rows, cols, out_len, act, qtype)` after
   `mlp_fusion_check(x, qtype, training)`; that check returns false unless

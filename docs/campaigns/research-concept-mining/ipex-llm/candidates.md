@@ -59,13 +59,13 @@ table.
 - **Evidence**: `binary.md` §4 (`code`): `llm_graph_context::build_bigdl_qkv_fusion` in
   `libllama.so` (10 tensor pointers, 3 floats, an int; it fetches K/V/head from the KV-cache
   state), op constructors `ggml_bigdl_qkv_fusion` / `ggml_bigdl_wqkv_fusion` in `libggml-base.so`
-  (op id 85, output `GGML_TYPE_BF16`), and the ESIMD q4_0 bodies
-  `qlinear_xpu_kernel_q4_0_2x16_qkv{,_neox}` / `…_wqkv_neox` (modules 6/7, **no XMX**).
+  (op id 85, output `GGML_TYPE_BF16`), and the small-row q4_0 bodies
+  `qlinear_xpu_kernel_q4_0_2x16_qkv{,_neox}` / `…_wqkv_neox` (modules 6/7, plain SYCL, **no XMX**).
   Commits: `a00efa0564` (mlp & qkv fusion, FP16 Llama-7B), `53531ae4ee` (qkv fusion for fp8e5),
   `8ba57b41cd` (merge the quantized q/k/v weights into one), and the long Python chain of fused
   qkv/rope commits (records: `score 2`). `paper`/`code`.
 - **Measured**: no commit number. The reference row cannot separate it. The kernel geometry
-  (2×16 rows/cols, ESIMD, no DPAS) reads as a **small-row** kernel, so the readable part is a
+  (2×16 rows/cols, plain SYCL, no DPAS) reads as a **small-row** kernel, so the readable part is a
   decode/verify lever; whether its convergence path covers a 512-row prefill is **not readable
   from the binary** (`code, symbol only` for the shape claim).
 - **arcint's state**: norm+RoPE fused exists and is opt-in (`code`: patch 0074,
@@ -75,7 +75,7 @@ table.
   starting from scratch. At prefill the prize is the launch count and the q/k/v intermediate
   traffic; at decode it is the launch count.
 - **Units**: all three (every layer has q/k/v). On the coder the A770's small-row shapes are where
-  the ESIMD form is aimed.
+  a small-tile form is aimed.
 - **Cost**: medium — an epilogue in the XMX GEMM is not how OpenCL DPAS works here (the tile
   output is not row-resident per head); the practical form is a third kernel that reads the three
   GEMM outputs and does norm+RoPE, plus a combined-weight repack at load if the GEMMs are to be
@@ -86,8 +86,8 @@ table.
 
 ### 3. The MLP fused across gate/up/SiLU/down on the batch path — score 8 (p1 3)
 - **Evidence**: `binary.md` §2 (`code`): `mlp_forward_q4_0_kernel<64,32,2>` and
-  `mlp_forward_q4_0_kernel_upgate` beside `mlp_forward_q4_k_kernel`, ESIMD bodies in modules
-  9/10/11; graph op `ggml_bigdl_mlp_fusion` (BF16 output); commits `a00efa0564`, `11574` (silu_mul
+  `mlp_forward_q4_0_kernel_upgate` beside `mlp_forward_q4_k_kernel`; the q4_0 pair is plain
+  SYCL (modules 10/11), the q4_k one carries genx intrinsics (module 9); graph op `ggml_bigdl_mlp_fusion` (BF16 output); commits `a00efa0564`, `11574` (silu_mul
   fusion for qwen2), `11678`/`12360` (fused MLP for gemma2/glm4), `11032` (fp6 MLP fusion),
   `019293e1b9` (MoE index fuse). `paper`/`code`.
 - **Measured**: no commit number; the reference row does not separate it.
@@ -236,7 +236,7 @@ units. The few with a mechanism are folded above (softmax, top-k, qkv/rope, oneD
   **graph-level** `ggml_bigdl_*` fusions are built in `libllama` and no read path ties them to that
   switch — so "disable OPT = fusions off" is **not verified**; the isolating arm for the fusions is
   not available by environment as read.
-- The fused QKV/MLP kernels' geometries read as small-row ESIMD tiles, not prefill GEMM tiles;
+- The fused QKV/MLP kernels' geometries read as small-row tiles (plain SYCL for q4_0), not prefill GEMM tiles;
   the prefill claim for candidates 2/3 stays unproven until measured.
 - `ggml_sycl_op_mul_mat_sycl`'s dequantize step is per call into a pooled scratch buffer, not a
   persistent f16 weight copy (read in the function's calls: `pool`, `ggml_get_to_fp16_sycl`).

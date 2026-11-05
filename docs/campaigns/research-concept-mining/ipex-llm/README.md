@@ -32,7 +32,7 @@ here is `measured-here`.
    0096 dequantizes each tile inside its own XMX GEMM. This is the only mechanism that explains
    +15 % (B60) / +24 % (A770) on a dense Q4_0 prompt with attention neutral.
 2. **QKV projection fused with norm and RoPE, combined wqkv weight.** A graph-level op, BF16 out,
-   ESIMD small-row kernel; arcint has the norm+RoPE half (0074, opt-in) but not the projection or a
+   small-row q4_0 kernel (plain SYCL); arcint has the norm+RoPE half (0074, opt-in) but not the projection or a
    merged weight. A launch/intermediate lever at decode/verify first; its prefill behaviour is
    unread from the binary.
 3. **MLP fused gate/up/SiLU (and a single-weight upgate form).** IPEX fuses it for one row in the

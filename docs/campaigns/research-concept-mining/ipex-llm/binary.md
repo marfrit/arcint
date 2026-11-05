@@ -37,21 +37,21 @@ Name, template parameters as mangled (they are the block/tile geometry), ESIMD y
 
 | kernel | module | geometry read from the symbol | ESIMD | XMX | what its arguments say |
 |---|---|---|---|---|---|
-| `sdp_causal_xmx_kernel<128,64,8,16,16>` (+ 64/32, 64/64, 128/32) | 3 | Q block 64/128 × K block 32/64, sg 16, rows 8/16 | no | **yes** | 6 pointers (Q, K, V, mask, ?, ?), 19 strides, 2 ints, float `scale`; fp16 in, f32 out. A **causal prefill flash attention on DPAS** |
-| `sdp_fp8_causal_xmx_kernel<…>` (+ the same four shapes) | 4 | same tiles | no | **yes** | K/V as `void*` (fp8 bytes), plus `unsigned long` mask stride and an int for KV type; causal, fp8 KV in |
+| `sdp_causal_xmx_kernel<128,64,8,16,16>` (+ 64/32, 64/64, 128/32) | 3 | Q block 64/128 × K block 32/64, sg 16, rows 8/16 | **yes** (genx intrinsics) | **yes** | 6 pointers (Q, K, V, mask, ?, ?), 19 strides, 2 ints, float `scale`; fp16 in, f32 out. A **causal prefill flash attention on DPAS** |
+| `sdp_fp8_causal_xmx_kernel<…>` (+ the same four shapes) | 4 | same tiles | **yes** (genx) | **yes** | K/V as `void*` (fp8 bytes), plus `unsigned long` mask stride and an int for KV type; causal, fp8 KV in |
 | `reshape_fp8_{key,value}_cache_kernel<16,8|16,64|128>` | 4 | head dims 64/128, 16 keys a block | no | no | fp8 cache bytes → half out; **the fp8 cache is converted to f16 per attention call** |
-| `sdp_fp16_kernel / sdp_fp16_casual / sdp_fp16_non_casual <32,64|80|96|128|192>` | 5 | 32-row query block, head dim 64/80/96/128/192 | no | no | decode-shaped SDP (1-32 rows), causal/non-causal variants |
-| `sdp_fp8_kernel / sdp_fp8_casual <32,…>` | 5 | same | no | no | fp8 K/V decode SDP |
+| `sdp_fp16_kernel / sdp_fp16_casual / sdp_fp16_non_casual <32,64|80|96|128|192>` | 5 | 32-row query block, head dim 64/80/96/128/192 | module genx (per-entry not read) | no | decode-shaped SDP (1-32 rows), causal/non-causal variants |
+| `sdp_fp8_kernel / sdp_fp8_casual <32,…>` | 5 | same | module genx (per-entry not read) | no | fp8 K/V decode SDP |
 | `sdp_q80_kernel<32,128>` | 5 | q8_0 K/V decode SDP | no | no | `half*` Q, `signed char*` K/V, scales |
 | `quantize_key_kernel<half|float, 64|80|96|128|192>` | 12 | one work-item a key | no | no | f16/f32 key → `unsigned char` (1 byte a value, **fp8**) |
 | `quantize_key_value_kernel<half|float, 64|80|96|128>` | 12 | — | no | no | K **and** V → fp8 in one pass |
 | `quantize_key_value_kernel_q8_0<half|float,32>` | 12 | 32-value blocks | no | no | the q8_0 alternative (`signed char` + scales) |
 | `dequantize_key_kernel<64|80|96|128|192>` | 12 | — | no | no | fp8 cache → f16 |
-| `qlinear_xpu_kernel_q4_0_2x16_qkv<64,32,2>` and `…_qkv_neox<32|64,16|32,2>` | 6, 7 | 2×16 / 4×16 tiles, 2 a block | **yes** | no | f32 activation, 4 weight pointers (q4_0), 3 scale/bias pointers, an int32 pointer (dims?), 3 half outputs Q/K/V, 8 strides, 3 floats (norm eps? rope theta, freq scale), 7 ints |
-| `qlinear_xpu_kernel_q4_0_2x16_wqkv_neox<…>` | 6, 7 | same | **yes** | no | one f32 activation, one q4_0 weight, one bias, an int32 ptr, 3 half outputs — **a combined QKV weight** |
+| `qlinear_xpu_kernel_q4_0_2x16_qkv<64,32,2>` and `…_qkv_neox<32|64,16|32,2>` | 6, 7 | 2×16 / 4×16 tiles, 2 a block | **no** (plain SYCL) | no | f32 activation, 4 weight pointers (q4_0), 3 scale/bias pointers, an int32 pointer (dims?), 3 half outputs Q/K/V, 8 strides, 3 floats (norm eps? rope theta, freq scale), 7 ints |
+| `qlinear_xpu_kernel_q4_0_2x16_wqkv_neox<…>` | 6, 7 | same | **no** (plain SYCL) | no | one f32 activation, one q4_0 weight, one bias, an int32 ptr, 3 half outputs — **a combined QKV weight** |
 | `mlp_forward_q4_0_kernel<64,32,2>` / `<32,16,2|8>` | 10, 11 | — | no | no | f32 in, f32 out, q4_0 gate/up weights, 3 scale/bias, dims — gate+up+SiLU |
 | `mlp_forward_q4_0_kernel_upgate<…>` | 10, 11 | — | no | no | one weight pointer at the front (gate and up interleaved/one tensor) — the "upgate" fused form |
-| `mlp_forward_q4_k_kernel<32,16,2>` | 9 | — | no | no | the same for Q4_K |
+| `mlp_forward_q4_k_kernel<32,16,2>` | 9 | — | **yes** (genx intrinsics) | no | the same for Q4_K |
 | `linear_forward_kernel<float,2,4,16,…>` | 0 | rows × cols tiles, 6 instantiations | **yes** | no | q4_0 linear, f32 out (the ESIMD GEMM primitive the fusions use) |
 | `vec_q4_0_batch_kernel<float,8,2,16|32,{1..8},64,…>` (30) and `vec_{q2,q3,q4,q5,q6}_K_batch_kernel` (54) | 14, 15 | 8 rows × 2 columns a tile | no | no | quantized weight × **float** activation, batch-shaped; IPEX's own quantized batch GEMM (`bigdl-core-xe/llama_backend/batch/kquants.cpp`, `int4.cpp`) |
 | `ggml_mul_mat_qX_q8_1_sycl` (20 instantiations) | 24 | MMQ tiles | no | no | the upstream MMQ form |
@@ -61,8 +61,12 @@ Name, template parameters as mangled (they are the block/tile geometry), ESIMD y
 | `ggml_{q4_0,q4_K,q6_K,…}_format_convert_to_xpu(_ipex_llm_blksize)` | host `T` | — | no | no | the host-side entry of the same repack; `q4_0` has a blksize variant |
 | `dg2_{arc,bmg}_ll256_allreduce` | 38, 39 | — | no | no | multi-GPU allreduce over a peer buffer |
 
-ESIMD, therefore, is in exactly the qkv/linear/mlp fusion family and the q4_0 reorder path, not in
-the attention or the batch GEMM (`code`).
+ESIMD/genx intrinsics per module (`code`, the `.esimd` name sets): present in modules 0, 3, 4,
+5, 8, 9, 12, 13, 14, 15 and 42; **absent** in the qkv kernel modules (6/7) and the q4_0 MLP
+modules (10/11). A module's genx names prove ESIMD code in that module, not in each entry — so
+"ESIMD" is asserted here only where a module has none (a definite no) or where the whole module
+is the kernel family. The 7,392 `.esimdNN` strings are section names inside the device images,
+not ELF sections.
 
 ## 3. Host ops, and which the pin does not have
 
@@ -223,7 +227,7 @@ scheduler retry, not a kernel.
    *at kernel level* (q4_0 → f16 tiles → Intel XMX), so the gap here is the library's GEMM, not
    the idea.
 2. **Graph-level QKV/MLP fusions in `libllama`. ** One op per `[q,k,v] + norm + rope` and per
-   `gate/up/SiLU/down`, with ESIMD q4_0 bodies and a combined-wqkv form. This is the largest
+   `gate/up/SiLU/down`, with small-row q4_0 kernels (plain SYCL, no XMX) and a combined-wqkv form. This is the largest
    structural difference the binary shows; its value class is rounding-only (BF16/f16 op output).
 3. **An fp8 KV cache** with reshape/dequant on the way into attention (answer-changing by
    design, listed not audited), and a q8_0 alternative (rounding-only).
