@@ -233,6 +233,14 @@ bool tls_material_loads(const Config& cfg, std::string& error) {
 }
 
 void HttpServer::Impl::route() {
+    // httplib's default on Linux is SO_REUSEPORT alone: a second server of the
+    // same user would share the port and take part of its requests, and a
+    // restart after a server that used SO_REUSEADDR could not bind for as long
+    // as that server's connections sit in TIME_WAIT (up to 60 s).
+    svr->set_socket_options([](socket_t sock) {
+        const int on = 1;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const void*>(&on), sizeof on);
+    });
     svr->set_payload_max_length(kMaxPayloadBytes);
     svr->set_read_timeout(60, 0);
     // Decode can run for minutes at long contexts; a short write timeout would
