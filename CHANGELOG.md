@@ -18,7 +18,9 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
-## Unreleased
+## 1.5.2 — 2026-11-06
+
+The release gate is recorded below when the tag is cut.
 
 - **`--think-budget N`, request field `think_budget`** (default 0, off): at most N reasoning tokens a turn; at N the think block's closer is forced by id through the context guard's own seam and the model answers. A long reasoning that does not repeat is what the loop guard cannot see (a 20-minute block of about 41,500 tokens, repeat share 0.185 against 0.8, `measured-here`). A request on chat or completions may set its own or turn it off with 0 (not `/v1/responses`); `/props` reports the served value, and a forced close is `loop_guard.think_closes`. `tests/test_context_guard.cpp`.
 - **`http`: the listening socket uses `SO_REUSEADDR`, not cpp-httplib's Linux default `SO_REUSEPORT`.** Two instances of one user could share a port silently and split its requests, and a start right after another server that used `SO_REUSEADDR` failed with "could not bind" for up to 60 s. Now a second instance is refused, and a restart of the same build binds at once. One transition stays: the first start after upgrading from 1.5.1 or older can fail to bind for up to 60 s if the old server just closed connections, and a unit with a restart policy recovers by itself (`measured-here`, raw sockets). `tests/test_disconnect.cpp`.

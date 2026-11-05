@@ -28,6 +28,9 @@
 - Flash-Next's production quant is ISTA-DASLab's GSQ-RCO IQ3_S since
   2026-10-20 (operator): 33.3 t/s decode on six answers, KL 0.127 against
   Q8_0 (IQ3_XXS 38.0 t/s, 0.217, the rollback).
+- Version 1.5.2 (2026-11-06): --think-budget, at most N reasoning tokens a turn, off by default; decode attention's
+  split by card and depth and the plain K-split kernels' work-group on Intel (0098); the listening socket refuses a
+  second instance (SO_REUSEADDR, not SO_REUSEPORT).
 - Version 1.5.1 (2026-11-05): decode attention's keys per split follow the KV's length (0097: the coder +10.9 %
   on its deployed flags); the KV rotations as a fast Walsh-Hadamard transform (0095); dense Q4_0 on the Intel fast
   paths and Llama 2 7B admitted (0096); reasoning_effort reaches the template on both routes;
