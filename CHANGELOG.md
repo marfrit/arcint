@@ -18,6 +18,19 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.5.1 — 2026-11-05
+
+Faster decode on the coder, and arcint on llama.cpp's community GPU tables. The README's "arcint measured the llama-bench way" has the rows, next to stock SYCL measured on the same cards.
+
+- **Decode attention's keys per split follow the KV's length** (patch 0097; `GGML_OPENCL_FA_INTEL_KV_PER_SPLIT` fixes a value, 128 is the old default). `measured-here`: the coder on its deployed flags 74.65 -> 82.78 t/s (+10.9 %), the release A/B's decode 53.70 / 51.50 / 47.40 -> 58.70 / 59.65 / 55.90; the task 10/10 x3. The agent equal, because its verify rows take the GQA kernel.
+- **The KV rotations as a fast Walsh-Hadamard transform** (patch 0095, `GGML_OPENCL_FWHT=0` keeps the dense product): the coder +4.0 % and the agent +2.7 % decode, KL inside the bar. Reviewed by Qwen3.8-Flash-Next.
+- **Dense Q4_0 on the Intel integer-dot matvec and XMX GEMM** (patch 0096, `GGML_OPENCL_Q40_XMX=0` keeps the float kernels). No served model uses dense Q4_0; Llama 2 7B prefills at 5.4x on the A770 and 5.5x on the B60.
+- **Llama 2 7B is admitted**, and `tools/llama_scoreboard.py` measures arcint the way llama-bench does: 5 repetitions, random token-id prompts, rates from the engine's own counters, through the served path.
+- **`reasoning_effort` reaches the template** on Chat Completions and Responses, passed through where the template quotes the level; `minimal` keeps thinking on, at low; `/props` publishes `reasoning_effort_levels`.
+- **Corrected docs:** SYCL works under the xe driver on both cards. The record's "SYCL aborts under xe" came from a note on runtimes older than the xe transition and is retracted in `DESIGN.md` §2; the Vulkan and vLLM lines are corrected too.
+
+Release gate (`measured-here`, the RC against 1.5.0's package in one window): the A/B passes on all three units. The coder's decode 52.50 / 53.70 / 46.10 -> 58.75 / 59.65 / 55.85 t/s and prefill at 41k 777.75 -> 784.05; on its deployed flags over 12 answers 71.73 -> 82.99 t/s (+15.7 %), the task 10/10 x3. The agent's prefill 696.15 -> 707.10 at 55k and 494.55 -> 500.00 at 138k, decode over 12 answers 46.26 -> 48.44 t/s (+4.7 %), the needle right at 254,970 tokens, peak 24,190 of 24,480 MiB. Flash-Next's prefill 535.13 -> 538.83 and decode 32.17 -> 33.33 t/s. Writer 20.9 -> 21.93 t/s and vision 57.9 -> 62.2. Sanitizers clean; 33/33 on the recipe. One red cell on the way, accepted by the operator: against the 0095 build, Flash-Next tripped the A/B's variance rule with its mean equal, its answers differing in every run.
+
 ## 1.5.0 — 2026-11-03
 
 Faster by default on the coder, the full trained context on the agent, and a

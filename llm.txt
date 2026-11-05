@@ -28,6 +28,10 @@
 - Flash-Next's production quant is ISTA-DASLab's GSQ-RCO IQ3_S since
   2026-10-20 (operator): 33.3 t/s decode on six answers, KL 0.127 against
   Q8_0 (IQ3_XXS 38.0 t/s, 0.217, the rollback).
+- Version 1.5.1 (2026-11-05): decode attention's keys per split follow the KV's length (0097: the coder +10.9 %
+  on its deployed flags); the KV rotations as a fast Walsh-Hadamard transform (0095); dense Q4_0 on the Intel fast
+  paths and Llama 2 7B admitted (0096); reasoning_effort reaches the template on both routes;
+  tools/llama_scoreboard.py, the community GPU tables' measurement; patches 0095-0097.
 - Version 1.5.0 (2026-11-03): MTP K/V-only prompt pass and on-card KV rotations on by default (coder
   +2 % decode, +6.6 % prefill); GDN rollback by replay per unit (LLAMA_GDN_REPLAY=1; the agent at
   262,144 tokens); GET /slots; --llama-mtp-depth-max; patches 0080-0094.
