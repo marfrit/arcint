@@ -938,7 +938,12 @@ public:
         // state would be the whole KV
         ckpt_max_  = cfg.llama_checkpoints;
         ckpt_step_ = static_cast<size_t>(std::max(cfg.llama_checkpoint_step, 1));
-        ckpt_on_   = ckpt_max_ > 0 && (llama_model_is_hybrid(model_) || llama_model_is_recurrent(model_));
+        const bool can_snapshot = llama_model_is_hybrid(model_) || llama_model_is_recurrent(model_);
+        if (const std::string no = checkpoints_refusal(cfg.llama_checkpoints_asked, can_snapshot, a); !no.empty())
+            throw std::runtime_error(no);
+        ckpt_on_   = ckpt_max_ > 0 && can_snapshot;
+        if (ckpt_max_ > 0 && !can_snapshot)
+            log::info("load", "context checkpoints: none, a '%s' model has no recurrent memory; its attention cache trims", a.c_str());
         n_ubatch_  = static_cast<int>(cp.n_ubatch);
         ckpts_.resize(static_cast<size_t>(lanes_));
 
@@ -1026,7 +1031,15 @@ public:
         d.repetition_penalty = 1.05f;
         d.presence_penalty   = 0.0f;
         d.provenance         = "provisional";
+        if (auto err = sampler_defaults_apply_card(d, [&](const char* key) -> std::optional<std::string> {
+                char val[64] = {};
+                if (llama_model_meta_val_str(model_, key, val, sizeof(val)) < 0) return std::nullopt;
+                return std::string(val);
+            }))
+            throw std::runtime_error(cfg.gguf_path + ": " + *err);
         if (auto err = apply_operator_defaults(cfg, d)) throw std::runtime_error(*err);
+        log::info("load", "sampler defaults (%s): temp %.3g, top_p %.3g, top_k %d, repetition %.3g",
+                  d.provenance.c_str(), d.temperature, d.top_p, d.top_k, d.repetition_penalty);
         status_.sampler_defaults = d;
 #ifdef ARCINT_MTMD
         // --mmproj: the multimodal projector (libmtmd) side by side with the

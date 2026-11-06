@@ -33,6 +33,12 @@ bool is_granite_8b(std::string_view arch, const ModelGeometry& g) {
 
 }  // namespace
 
+std::string checkpoints_refusal(bool asked, bool can_snapshot, std::string_view arch) {
+    if (!asked || can_snapshot) return {};
+    return "--llama-checkpoints: a '" + std::string(arch) +
+           "' model has no recurrent memory to snapshot (its attention cache trims); drop the flag or pass 0";
+}
+
 AdmittedModel admit_model(std::string_view arch, const ModelGeometry& g, bool tts) {
     if (arch == "qwen35") return AdmittedModel::Qwen35;
     if (arch == "qwen35moe") return AdmittedModel::Qwen35Moe;

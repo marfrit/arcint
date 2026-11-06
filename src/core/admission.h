@@ -35,6 +35,12 @@ enum class AdmittedModel {
 
 AdmittedModel admit_model(std::string_view arch, const ModelGeometry& g, bool tts);
 
+// --llama-checkpoints asked for on a model with nothing to snapshot: an attention
+// cache trims, and only a recurrent memory (a hybrid's or a pure one) needs a
+// snapshot, so the flag cannot do what it says. `asked` is the operator having
+// passed a count above 0; the default of 32 is not a request. Empty when fine.
+std::string checkpoints_refusal(bool asked, bool can_snapshot, std::string_view arch);
+
 // The dialect a model speaks (think tags, tool-call form).
 ChatDialect dialect_of(AdmittedModel m);
 

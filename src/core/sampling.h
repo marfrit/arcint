@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -160,9 +161,10 @@ struct SamplerDefaults {
     std::optional<float> answer_presence_penalty;
     std::optional<float> answer_frequency_penalty;
 
-    // "provisional" -- the Qwen3-family card values, carried because no
-    //                  GGUF key is read yet; /props reports this so nobody
+    // "provisional" -- the Qwen3-family card values, for a GGUF that carries
+    //                  no general.sampling key; /props reports this so nobody
     //                  mistakes an inherited default for a measured one.
+    // "card"        -- the model card's row, from the GGUF's general.sampling keys.
     // "operator"    -- at least one --temp/--top-p/... flag set it.
     std::string provenance = "provisional";
 };
@@ -352,6 +354,16 @@ struct SamplerOverrides {
 // and the operator configured one (SamplerDefaults::nothink_row), else the
 // normal row. Unset nothink fields fall back to the normal row.
 SamplerParams sampler_from_defaults(const SamplerDefaults& d, bool nothink = false);
+
+// The model card's layer: the GGUF's general.sampling.temp, .top_p and .top_k,
+// as text (`lookup` returns nullopt for a key the file lacks). No key leaves `d`
+// alone. Any key makes the row the card's whole row: temperature and top_p as
+// given or unchanged if only the other is missing, top_k as given or 0 (the card
+// sets no limit), and no penalties, since a card that names none asks for none.
+// Returns an error for a value that does not parse or is out of range, with `d`
+// untouched. The order is request > operator flags > this > the provisional row.
+std::optional<std::string> sampler_defaults_apply_card(
+    SamplerDefaults& d, const std::function<std::optional<std::string>(const char*)>& lookup);
 
 // The operator layer (config flags): overrides only the fields it sets and
 // marks the defaults' provenance "operator". Same validation as a request,

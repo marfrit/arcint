@@ -394,8 +394,9 @@ greedy decision. min-p follows llama.cpp (`llama_sampler_min_p_apply`,
 top-p. Seeded; an unseeded request gets a logged seed. Defaults chain request
 > operator flags (`--temp`, `--top-p`, `--top-k`, `--min-p`,
 `--repetition-penalty`, `--presence-penalty`, `--chat-template-kwarg
-enable_thinking=BOOL`) > the GGUF's defaults; `/props` reports values and
-provenance (`code`).
+enable_thinking=BOOL`) > the model card's row in the GGUF (`general.sampling.*`,
+§8.8) > a provisional row for a GGUF without one; `/props` reports values and
+provenance: `operator`, `card` or `provisional` (`code`).
 
 ### 3.7 Tokenizer, templates, tool calls
 
@@ -941,14 +942,14 @@ said), and the 503 bodies lost `reservation` and `kv_blocks_free`.
   loaded and rejects every other non-text part as before. An Anthropic
   Messages adapter and a local CLI stay uncommitted. Image *output* has been
   in scope since 1.1.0 (`decision`, operator, 2026-10-18; §3.11).
-- **Gemma 4 E4B and Granite 4.2 8B, open for the operator's decision** (2026-11-06,
-  `code`; nothing changed): (a) the sampler defaults are hard-coded to Qwen's
-  0.7 / 0.8 / 20 for every model (`backend_llama.cpp`, `SamplerDefaults` at
-  load) although both GGUFs carry `general.sampling.*` (Gemma 4: top_k 64,
-  top_p 0.95, temperature 1.0; Granite: top_p 0.95, temperature 1.0), so the
-  two models answer with Qwen's sampling until `--temp` and friends say
-  otherwise. (b) `--llama-checkpoints` on a model that is neither hybrid nor
-  recurrent goes off without a word (`ckpt_on_` in `backend_llama.cpp`): the
-  option is accepted and does nothing. That is a silent fallback by the
-  operator's rule, as it already is for Mistral Small and Llama 2, and it now
-  covers these two as well; the choices are a load-time warning or a refusal.
+- **Sampler defaults and checkpoints, decided by the operator** (2026-11-06,
+  `code`): (a) the row an unset request starts from is the model card's, the
+  GGUF's `general.sampling.temp`, `.top_p` and `.top_k`, for every admitted
+  model. A card that names no top_k sets no limit and one that names no penalty
+  asks for none; a GGUF with no such key keeps the provisional row (Llama 2 7B).
+  Flash-Next's unit passes no flags, so it moved from 0.7 / 0.8 / 20 with a
+  repetition penalty of 1.05 to its card's 1.0 / 0.95 / 20 with none; the agent,
+  the coder and the writer pass their own flags and did not move. (b)
+  `--llama-checkpoints N` above 0 on a model that is neither hybrid nor recurrent
+  is refused at start, because it could not do what it says; the default of 32
+  is not a request and is logged as no checkpoints.

@@ -115,3 +115,14 @@ TEST(admission_refusal_names_the_admitted_sizes) {
     CHECK(msg.find("Mistral Small") != std::string::npos);
     CHECK(msg.find("Llama 2 7B") != std::string::npos);
 }
+
+TEST(checkpoints_the_flag_is_refused_where_nothing_can_be_snapshotted) {
+    CHECK(!checkpoints_refusal(true, false, "gemma4").empty());
+    CHECK(checkpoints_refusal(true, false, "gemma4").find("gemma4") != std::string::npos);
+    CHECK(checkpoints_refusal(true, true, "qwen35moe").empty());
+}
+
+TEST(checkpoints_the_default_is_not_a_request) {
+    CHECK(checkpoints_refusal(false, false, "llama").empty());
+    CHECK(checkpoints_refusal(false, true, "qwen35").empty());
+}

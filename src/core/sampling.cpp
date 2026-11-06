@@ -1,5 +1,7 @@
 #include "core/sampling.h"
 
+#include <cstdlib>
+
 #include "util/log.h"
 
 namespace lgc {
@@ -222,6 +224,40 @@ std::optional<std::string> sampler_apply(SamplerParams& p, const SamplerOverride
         p.seeded = true;
     }
 
+    return std::nullopt;
+}
+
+std::optional<std::string> sampler_defaults_apply_card(
+    SamplerDefaults& d, const std::function<std::optional<std::string>(const char*)>& lookup) {
+    const auto number = [&](const char* key, double& out, bool& has) -> std::optional<std::string> {
+        has = false;
+        const std::optional<std::string> v = lookup(key);
+        if (!v) return std::nullopt;
+        char* end = nullptr;
+        out = std::strtod(v->c_str(), &end);
+        if (v->empty() || end == nullptr || *end != '\0')
+            return std::string("the GGUF's ") + key + " is not a number: '" + *v + "'";
+        has = true;
+        return std::nullopt;
+    };
+    double temp = 0.0, top_p = 0.0, top_k = 0.0;
+    bool has_temp = false, has_top_p = false, has_top_k = false;
+    if (auto e = number("general.sampling.temp", temp, has_temp)) return e;
+    if (auto e = number("general.sampling.top_p", top_p, has_top_p)) return e;
+    if (auto e = number("general.sampling.top_k", top_k, has_top_k)) return e;
+    if (!has_temp && !has_top_p && !has_top_k) return std::nullopt;
+    SamplerDefaults row = d;
+    row.top_k              = 0;
+    row.repetition_penalty = 1.0f;
+    row.presence_penalty   = 0.0f;
+    row.min_p              = 0.0f;
+    SamplerOverrides o;
+    if (has_temp) o.temperature = static_cast<float>(temp);
+    if (has_top_p) o.top_p = static_cast<float>(top_p);
+    if (has_top_k) o.top_k = static_cast<int>(top_k);
+    if (auto e = sampler_defaults_apply(row, o)) return std::string("the GGUF's general.sampling row: ") + *e;
+    row.provenance = "card";
+    d = row;
     return std::nullopt;
 }
 

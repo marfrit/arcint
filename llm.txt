@@ -199,8 +199,9 @@
   31 builtins is a 400; every other key reaches the template unchanged.
   /props' chat_template_caps carries supports_preserve_reasoning and
   supports_preserve_thinking.
-- Sampling defaults: request > operator flags > the GGUF's defaults; /props
-  names the provenance.
+- Sampling defaults: request > operator flags > the model card's row in the
+  GGUF (general.sampling.*) > a provisional row; /props names the provenance
+  (operator, card, provisional).
 - Console: one-line state/timing prints on stderr (load, expert cache,
   per-slot prefill/decode rates, draft acceptance).
 - Security: no authentication by default; --api-key/--api-key-file add a

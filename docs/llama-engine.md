@@ -739,6 +739,8 @@ The dense model's 20-run sampled arm with that configuration scored 11 of
 
 ## Context checkpoints (`--llama-checkpoints N`, `--llama-checkpoint-step T`)
 
+A count above 0 on a model that is neither hybrid nor recurrent is refused at start: an attention cache trims, so there is nothing to snapshot. The default of 32 is not a request.
+
 The Qwen 3.x models are hybrid: their GatedDeltaNet layers carry a recurrent
 state that llama.cpp cannot cut back to an earlier token (it refuses the
 partial `seq_rm`). A lane always reused a follow-up that only appends to what
