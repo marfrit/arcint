@@ -14,6 +14,8 @@ HASS (arXiv 2408.15766, `paper`): ranking-distillation loss and context-aligned 
 
 Held out on generated text not used in the fit: first-draft acceptance up by at least 5 points on code and thinking, measured with `ARCINT_MTP_TRACE`; then served decode on the deployed flags per the answer-level bar in `CLAUDE.md`, acceptance task included. A verify still checks every draft, so answers cannot get worse through the head; the task runs anyway.
 
+Operator's decisions, 2026-11-06: (1) a measured gain with nothing degrading is adopted at any size; +5 points is the line at which the expensive fit is rethought, not a condition for adoption. (2) The full fit runs only if E1 shows room; a null E1 and E2 end the campaign without it, and the record must say the reference's mechanism (a top-K loss on a chain) was not tried, so that is no verdict on it. (3) A refit of the draft head's rows may add a small sidecar flag on `DraftHead`, if E1 points there, although the served path then changes.
+
 ## Current state (`measured-here`, A770, 2000 MHz, the coder's file, arcint 1.5.4 + 0101, 24 generated prompts, one run an arm, q8_0:q4_0)
 
 Kept given reached, by draft position, greedy with 4 drafts a verify:
