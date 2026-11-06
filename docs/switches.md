@@ -149,6 +149,8 @@ These names are not in a table:
 | `GGML_OPENCL_Q8_XMX` | on | `0`: q8_0 weights times 16+ columns use upstream's q8_0 kernels, not the XMX GEMM. On the B60 only (the kernel needs sub-group 16). | 0058 | 1024² image step 2.14 -> 10.95 s with it off, 512² 0.476 -> 3.03 s (`measured-here`). |
 | `GGML_OPENCL_Q8_I8` | on | `0`: on Alchemist, q8_0 weights times 16+ columns skip the int8 GEMM (0099). |
 | `GGML_OPENCL_KQ_SG8_I8` | on | `0`: on Alchemist, dense q4_K weights times 16+ columns keep the fp16 tile, not the int8 GEMM (0102). |
+| `GGML_OPENCL_KQ_ID_SG8_I8` | on | `0`: on Alchemist, the prompt's expert products (IQ4_XS, IQ4_NL, Q4_K) keep the fp16 tile, not the int8 GEMM (0103). |
+| `GGML_OPENCL_KQ_ID_NR` | `2` | Sets of 8 weight rows an Alchemist sub-group owns in that GEMM, 1 to 8; one activation read serves them all (0104). From 3 the coder's kernels exceed 256 GRF and IGC retries with rolled loops. |
 | `GGML_OPENCL_Q40_2D` | `2` | Dense q4_0 weights times 16+ columns, K a multiple of 256: `0` the 0096 tile, `1` fp16 2D-block GEMM (Xe2), `2` int8 (0099). |
 | `GGML_OPENCL_Q40_SG8_SHAPE` | `32,8` | `TMM,WG` of the Alchemist int8 GEMM: tokens a sub-group, sub-groups a work-group. |
 | `GGML_OPENCL_F32_SKINNY` | on (Intel) | `0`: skinny F32 products use ggml's paths. | 0005 | Coder router, 512-token prefill: 24.3 -> 9.0 ms, A770 (`measured-here`). |
