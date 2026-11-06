@@ -41,7 +41,7 @@ export SOURCE_DATE_EPOCH=1787990400
 
 # Fail in a second, not after the downloads: the tools and the engine's
 # build dependencies.
-for t in curl git python3 cmake objdump; do
+for t in curl git python3 cmake objdump strings; do
     command -v "$t" >/dev/null || { echo "$t is missing (build dependency)" >&2; exit 1; }
 done
 [ -f /usr/include/CL/cl.h ] || { echo "opencl-headers are missing (/usr/include/CL/cl.h)" >&2; exit 1; }
@@ -103,6 +103,8 @@ cmake -S "$SRC" -B build \
     -DARCINT_GIT_SHA="$GIT_SHA" \
     -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF \
     -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_C_FLAGS="-ffile-prefix-map=$work=." \
+    -DCMAKE_CXX_FLAGS="-ffile-prefix-map=$work=." \
     -DGGML_NATIVE=ON
 # ggml turns GGML_NATIVE off by default when SOURCE_DATE_EPOCH is set (it reads that as a reproducible
 # build), which left every package's ggml-cpu at the SSE2 baseline although docs/docker.md says the .deb is
@@ -110,6 +112,12 @@ cmake -S "$SRC" -B build \
 # 2026-10-15). Asked for explicitly, and checked.
 grep -q '^GGML_NATIVE:BOOL=ON$' build/CMakeCache.txt || { echo "GGML_NATIVE is not ON (ggml-cpu without -march=native)" >&2; exit 1; }
 cmake --build build -j"$(nproc)"
+# the package is public: no build path (with the build user's home in it) in the binary, and two builds
+# from one tarball differ no more for it
+if strings -n 8 build/arcint | grep -qF "$work"; then
+    echo "the build directory is in the binary: $(strings -n 8 build/arcint | grep -cF "$work") strings" >&2
+    exit 1
+fi
 
 # The gates are the product. A package built from a tree whose unit tests fail
 # is a package that ships a claim nobody checked. -L unit selects the whole
