@@ -155,7 +155,7 @@ class Capture:
 
 # --------------------------------------------------------- tasks and splits
 
-_LANG = re.compile(r"\s+in\s+[A-Z][\w#+.\-]*(?:\s+[A-Z][\w#+.\-]*)*(?=\s*[,.](?:\s|$))")
+_LANG = re.compile(r"\s+in\s+(?:bash|[A-Z][\w#+.\-]*(?:\s+[A-Z][\w#+.\-]*)*)(?=\s*[,.](?:\s|$))")
 
 
 def task_key(q, cls):

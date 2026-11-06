@@ -101,6 +101,10 @@ class FormatTests(unittest.TestCase):
 class TaskAndSplitTests(unittest.TestCase):
     LANGS = ["Python", "C#", "TypeScript", "Lua", "Java", "C++", "Common Lisp", "SQL"]
 
+    def test_task_key_removes_a_lower_case_language(self):
+        self.assertEqual(mf.task_key("Write a binary heap with push and pop in bash. Only the code.", "code"),
+                         mf.task_key("Write a binary heap with push and pop in C++. Only the code.", "code"))
+
     def test_task_key_removes_language_and_wording(self):
         a = mf.task_key("Write a function that base64-encodes bytes without a library in TypeScript, and explain the design briefly first.", "code")
         b = mf.task_key("Write a function that base64-encodes bytes without a library in C#. Only the code.", "code")
