@@ -18,6 +18,13 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.5.3 — 2026-11-06
+
+The release gate is recorded below when the tag is cut.
+
+- **Dense Q4_0 and Q8_0 weights on int8 DPAS without local memory** (patch 0099, found by pricing IPEX-LLM's lead on Llama 2, `docs/campaigns/research-concept-mining/ipex-llm/`). On Xe2 Q4_0 takes the K-quants' 2D-block GEMM, on Alchemist int8 DPAS with the activations packed once a graph. Q8_0 on Alchemist had no fast path at all: its XMX tile was sub-group 16 only, so the coder's shared experts ran ggml's float kernel. Served Llama 2 rows, f16 KV (`measured-here`): B60 2339 -> 3990 t/s, A770 1963 -> 2611; q8_0:q4_0 KV 2280 -> 3807, 1848 -> 2382; decode level. The coder: prefill at 41k tokens 784.5 -> 845.4 t/s, acceptance 10/10 x3, KL against the file's CPU reference 0.00554 -> 0.00572 (same top 97.01 -> 96.91 %). Its greedy text changes through the prefill's rounding, and with it the draft acceptance answer by answer: of 3 answers 1 rises, 2 fall, time per verify unchanged (30.41 against 30.48 ms); 12 answers 82.95 -> 82.42 t/s with acceptance 71.5 -> 73.0 %. The operator took the prefill with that recorded. `GGML_OPENCL_Q40_2D`, `GGML_OPENCL_Q8_I8` (`docs/switches.md`).
+- `tools/expert_cache_replay.py --curve-table-only`: the training curve's draft-id table per step, for a history that does not fit the dense arrays. Over one day of production trace it saturates at +0.12 points against the usage baseline (`docs/campaigns/expert-foresight.md`).
+
 ## 1.5.2 — 2026-11-06
 
 Release gate against 1.5.1, same window (`measured-here`, llama-bench-style rows: Llama 2 7B Q4_0, A770 GT at 2000 MHz): A770 1963.15 / 70.29, B60 2339.05 / 80.70 with f16 KV; 1848.22 / 66.10 and 2280.25 / 78.92 with q8_0:q4_0. The coder A/B PASS (prefill 41k 783.75 -> 784.25, decode level), acceptance 10/10 x3. The agent A/B PASS (prefill 55k 707.05 -> 706.65, 138k 500.05 -> 499.85), the needle right at 254,970 tokens of 262,144, peak 24,133 MiB, GTT 64 MiB. Flash-Next: prefill 20k 538.27 -> 538.65, decode mean 32.83 -> 33.33, 4 rounds; its A/B reads FAIL on one cell only, the new arm's spread above the old's (11.10 % against 4.27 %, one run at 61 % draft acceptance beside one at 73 %). Accepted by the operator as the variance rule's cell for this patch (9.57 % against 9.02 % on the quiet run before the gate); the answers' texts differ between runs of both arms there. 12 answers on the deployed flags: coder 82.72, 83.07 -> 82.88, 82.99 t/s, agent 48.52, 48.79 -> 49.37, 49.16 t/s. No reset on either card.
