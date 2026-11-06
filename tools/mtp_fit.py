@@ -890,11 +890,11 @@ def fit_distill(Z, H, W, Zv, Hv, steps, batch, lr, tau, every, seed=1, log=None)
         m2 = 0.999 * m2 + 0.001 * g * g
         A = A - (lr * (m1 / (1 - 0.9 ** t)) / (np.sqrt(m2 / (1 - 0.999 ** t)) + 1e-8)).astype(np.float32)
         if t % every == 0 or t == steps:
-            st = row_stats(Zv @ A, Hv, W)
+            st = row_stats(Zv @ A, Hv, W, None, True)
             top = float((st["dz"] == st["dh"]).mean())
             if log:
-                log("  step %5d train KL %.4f, validation top-1 against the target %.2f %%%s" %
-                    (t, loss, 100 * top, " (best)" if top > best_top else ""))
+                log("  step %5d train KL %.4f, validation KL %.4f, top-1 against the target %.2f %%%s" %
+                    (t, loss, st["kl"].mean(), 100 * top, " (best)" if top > best_top else ""))
             if top > best_top:
                 best, best_top, best_step = A.copy(), top, t
     return best, best_top, best_step
