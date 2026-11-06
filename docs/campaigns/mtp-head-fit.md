@@ -1,6 +1,6 @@
 # mtp-head-fit — refit the MTP head against what the served model writes
 
-**Open.** Step one measured (2026-11-06); recon done, E0 under way; the E1 tooling is built (capture hook, replay, eval, linear fit; section "E1 tooling"), its card window not yet run.
+**Open.** E0, E1 and E2 measured (2026-11-06/07): the unpruned base head gives +9.4 % tokens a verify with no training; serving it on the A770 is the open question, its VRAM.
 
 ## Charter
 
