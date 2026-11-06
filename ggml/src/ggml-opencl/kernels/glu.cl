@@ -30,7 +30,7 @@ kernel void kernel_geglu(
     global float * src1_row = (global float *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
     global float * dst_row  = (global float *) ((global char *) dst  + get_group_id(0)*nb1);
 
-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
         const float x0 = src0_row[i0];
         const float x1 = src1_row[i0];
 
@@ -62,7 +62,7 @@ kernel void kernel_geglu_f16(
     global half * src1_row = (global half *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
     global half * dst_row  = (global half *) ((global char *) dst  + get_group_id(0)*nb1);
 
-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
         const half x0 = src0_row[i0];
         const half x1 = src1_row[i0];
 
@@ -97,7 +97,7 @@ kernel void kernel_reglu(
     global float * src1_row = (global float *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
     global float * dst_row  = (global float *) ((global char *) dst  + get_group_id(0)*nb1);
 
-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
         const float x0 = src0_row[i0];
         const float x1 = src1_row[i0];
 
@@ -127,7 +127,7 @@ kernel void kernel_reglu_f16(
     global half * src1_row = (global half *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
     global half * dst_row  = (global half *) ((global char *) dst  + get_group_id(0)*nb1);
 
-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
         const half x0 = src0_row[i0];
         const half x1 = src1_row[i0];
 
@@ -160,7 +160,7 @@ kernel void kernel_swiglu(
     global float * src1_row = (global float *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
     global float * dst_row  = (global float *) ((global char *) dst  + get_group_id(0)*nb1);
 
-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
         const float x0 = src0_row[i0];
         const float x1 = src1_row[i0];
 
@@ -192,7 +192,7 @@ kernel void kernel_swiglu_f16(
     global half * src1_row = (global half *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
     global half * dst_row  = (global half *) ((global char *) dst  + get_group_id(0)*nb1);
 
-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
         const half x0 = src0_row[i0];
         const half x1 = src1_row[i0];
 
@@ -229,7 +229,7 @@ kernel void kernel_swiglu_oai(
     global float * src1_row = (global float *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
     global float * dst_row  = (global float *) ((global char *) dst  + get_group_id(0)*nb1);
 
-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
         float x0 = src0_row[i0];
         float x1 = src1_row[i0];
 
@@ -269,7 +269,7 @@ kernel void kernel_swiglu_clamp(
     global float * src1_row = (global float *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
     global float * dst_row  = (global float *) ((global char *) dst  + get_group_id(0)*nb1);
 
-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
         const float gate = min(src0_row[i0], limit);
         const float up = clamp(src1_row[i0], -limit, limit);
 
@@ -300,7 +300,7 @@ kernel void kernel_swiglu_clamp_f16(
     global half * src1_row = (global half *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
     global half * dst_row  = (global half *) ((global char *) dst  + get_group_id(0)*nb1);
 
-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
         const float gate = min((float) src0_row[i0], limit);
         const float up = clamp((float) src1_row[i0], -limit, limit);
 
@@ -333,7 +333,7 @@ kernel void kernel_geglu_erf(
     global float * src1_row = (global float *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
     global float * dst_row  = (global float *) ((global char *) dst  + get_group_id(0)*nb1);
 
-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
         const float x0 = src0_row[i0];
         const float x1 = src1_row[i0];
 
@@ -365,7 +365,7 @@ kernel void kernel_geglu_erf_f16(
     global half * src1_row = (global half *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
     global half * dst_row  = (global half *) ((global char *) dst  + get_group_id(0)*nb1);
 
-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
         const half x0 = src0_row[i0];
         const half x1 = src1_row[i0];
 
@@ -400,7 +400,7 @@ kernel void kernel_geglu_quick(
     global float * src1_row = (global float *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
     global float * dst_row  = (global float *) ((global char *) dst  + get_group_id(0)*nb1);
 
-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
         const float x0 = src0_row[i0];
         const float x1 = src1_row[i0];
 
@@ -432,7 +432,7 @@ kernel void kernel_geglu_quick_f16(
     global half * src1_row = (global half *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
     global half * dst_row  = (global half *) ((global char *) dst  + get_group_id(0)*nb1);
 
-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
         const half x0 = src0_row[i0];
         const half x1 = src1_row[i0];
 

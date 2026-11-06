@@ -739,7 +739,7 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
     cb(out_embd, "gen_audio_out", -1);
 
     // ---- CLIP_GEN_PROCESS_GEN_WAV: 16 RVQ codes -> raw PCM ----
-    const int n_frames = hparams.wav_tfm_swa; // frames per batch, == the attention window
+    const int n_frames = gen_n_frames > 0 ? gen_n_frames : (int) hparams.wav_tfm_swa; // GEN_WAV: the caller's valid frames, else the fixed window
 
     ggml_tensor * inp_codes = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_frames, n_codes);
     ggml_set_name(inp_codes, "inp_codes");

@@ -15,7 +15,8 @@
 #define UNARY_EXT(NAME, SEXPR, VEXPR)                                           \
 kernel void kernel_##NAME##_f32(                                               \
         global const float * src0, ulong offset0,                             \
-        global       float * dst,  ulong offsetd) {                           \
+        global       float * dst,  ulong offsetd, int n) {                    \
+    if ((int) get_global_id(0) >= n) { return; } /* 0072: rounded tail */ \
     src0 = (global float*)((global char*)src0 + offset0);                     \
     dst  = (global float*)((global char*)dst  + offsetd);                     \
     float x = src0[get_global_id(0)];                                         \
@@ -23,7 +24,8 @@ kernel void kernel_##NAME##_f32(                                               \
 }                                                                             \
 kernel void kernel_##NAME##_f32_4(                                            \
         global const float4 * src0, ulong offset0,                           \
-        global       float4 * dst,  ulong offsetd) {                         \
+        global       float4 * dst,  ulong offsetd, int n) {                   \
+    if ((int) get_global_id(0) >= n) { return; } /* 0072: rounded tail */ \
     src0 = (global float4*)((global char*)src0 + offset0);                   \
     dst  = (global float4*)((global char*)dst  + offsetd);                   \
     float4 x = src0[get_global_id(0)];                                       \
@@ -31,7 +33,8 @@ kernel void kernel_##NAME##_f32_4(                                            \
 }                                                                             \
 kernel void kernel_##NAME##_f16(                                             \
         global const half * src0, ulong offset0,                            \
-        global       half * dst,  ulong offsetd) {                          \
+        global       half * dst,  ulong offsetd, int n) {                     \
+    if ((int) get_global_id(0) >= n) { return; } /* 0072: rounded tail */ \
     src0 = (global half*)((global char*)src0 + offset0);                    \
     dst  = (global half*)((global char*)dst  + offsetd);                    \
     float x = src0[get_global_id(0)];                                       \
@@ -39,7 +42,8 @@ kernel void kernel_##NAME##_f16(                                             \
 }                                                                            \
 kernel void kernel_##NAME##_f16_4(                                          \
         global const half4 * src0, ulong offset0,                          \
-        global       half4 * dst,  ulong offsetd) {                        \
+        global       half4 * dst,  ulong offsetd, int n) {                    \
+    if ((int) get_global_id(0) >= n) { return; } /* 0072: rounded tail */ \
     src0 = (global half4*)((global char*)src0 + offset0);                  \
     dst  = (global half4*)((global char*)dst  + offsetd);                  \
     float4 x = convert_float4(src0[get_global_id(0)]);                     \

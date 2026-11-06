@@ -1771,6 +1771,16 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     const int first = n_ctx/2;
 
+    // test hook (not shipped): LLAMA_PPL_PER_SEQ=1 decodes each sequence of a batch in its own llama_decode,
+    // as arcint's lanes do, keeping each sequence's logits
+    const bool per_seq = getenv("LLAMA_PPL_PER_SEQ") != nullptr;
+    // test hook (not shipped): LLAMA_PPL_SEQ_FLIP=1 adds every other batch's sequences in
+    // reverse order (the same shapes, the sequences' rows swapped: a graph reused across
+    // the two must not keep the other order's per-sequence views)
+    const bool seq_flip = getenv("LLAMA_PPL_SEQ_FLIP") != nullptr;
+    int        n_flip   = 0;
+    std::vector<std::vector<float>> seq_logits(n_seq);
+
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;
         const int end   = start + n_ctx;
@@ -1782,14 +1792,40 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
         // clear the KV cache
         llama_memory_clear(llama_get_memory(ctx), true);
 
-        for (int j = 0; j < num_batches; ++j) {
+        if (per_seq) {
+            GGML_ASSERT(num_batches == 1);
+            for (int seq = 0; seq < n_seq_batch; seq++) {
+                const int seq_start = start + seq*n_ctx;
+                batch.clear();
+                int n_outputs = 0;
+                for (int k = 0; k < (int) n_ctx; ++k) {
+                    const bool need_logits = k >= first;
+                    llama_token t = tokens[seq_start + k];
+                    if (add_bos && k == 0) {
+                        t = llama_vocab_bos(vocab);
+                    }
+                    batch.add(t, k, seq, need_logits);
+                    n_outputs += need_logits;
+                }
+                if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+                    LOG_ERR("%s : failed to decode sequence %d\n", __func__, seq);
+                    return;
+                }
+                const float * l = llama_get_logits(ctx);
+                seq_logits[seq].assign(l, l + size_t(n_outputs) * n_vocab);
+            }
+        }
+
+        for (int j = 0; j < (per_seq ? 0 : num_batches); ++j) {
             const int batch_start = start + j * n_batch;
             const int batch_size  = std::min(end - batch_start, n_batch);
 
             int n_outputs = 0;
 
             batch.clear();
-            for (int seq = 0; seq < n_seq_batch; seq++) {
+            const bool flip = seq_flip && (n_flip++ % 2 == 1);
+            for (int sq = 0; sq < n_seq_batch; sq++) {
+                const int seq = flip ? n_seq_batch - 1 - sq : sq;
                 int seq_start = batch_start + seq*n_ctx;
 
                 // save original token and restore it after eval
@@ -1844,7 +1880,9 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
                 return;
             }
 
-            const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
+            const int     at         = (seq_flip && (n_flip - 1) % 2 == 1) ? n_seq_batch - 1 - seq : seq;
+            const float * all_logits = per_seq ? seq_logits[seq].data() :
+                num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, at*n_ctx + first);
 
             process_logits(n_vocab, all_logits, tokens.data() + start + seq*n_ctx + first, n_ctx - 1 - first,
                     workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr);
@@ -2037,6 +2075,16 @@ int llama_perplexity(int argc, char ** argv) {
     if (ctx == nullptr) {
         LOG_ERR("%s: failed to create context\n", __func__);
         return 1;
+    }
+
+    // test hook (not shipped): LLAMA_PPL_SEQ_WINDOWS=1 gives every sequence a cell window of n_ctx (0026)
+    if (getenv("LLAMA_PPL_SEQ_WINDOWS") != nullptr && params.n_parallel > 1) {
+        std::vector<uint32_t> w(params.n_parallel, (uint32_t) n_ctx);
+        if (!llama_memory_seq_windows(llama_get_memory(ctx), w.data(), params.n_parallel)) {
+            LOG_ERR("%s: llama_memory_seq_windows refused\n", __func__);
+            return 1;
+        }
+        LOG_INF("%s: %d cell windows of %d\n", __func__, params.n_parallel, n_ctx);
     }
 
     const int n_ctx_train = llama_model_n_ctx_train(model);

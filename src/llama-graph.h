@@ -27,6 +27,19 @@ class llama_moe_cache;
 struct llama_memory_context_i;
 
 class llama_kv_cache_context;
+
+// a sequence's share of a ubatch that mixes windowed sequences (llama_kv_cache::set_seq_windows):
+// its rows of the ubatch and its window's cells, so its attention runs over that window only
+struct llama_kv_win_part {
+    uint32_t kv_off = 0;
+    uint32_t n_kv   = 0;
+    uint32_t row0   = 0;
+    uint32_t n_rows = 0;
+
+    bool operator==(const llama_kv_win_part & o) const {
+        return kv_off == o.kv_off && n_kv == o.n_kv && row0 == o.row0 && n_rows == o.n_rows;
+    }
+};
 class llama_kv_cache_dsa_context;
 class llama_kv_cache_dsa_iswa_context;
 class llama_kv_cache_msa_context;
@@ -289,6 +302,13 @@ public:
     ggml_tensor * s_copy_main; // I32 [n_seqs]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
 
+    // GDN rollback by replay (llama_memory_recurrent::rpl), null when off:
+    ggml_tensor * s_rpl_rows  = nullptr; // I32 [n_rs]: plane-0 S row each state is read from (no rollback plane)
+    ggml_tensor * s_rpl_main  = nullptr; // view [n_seqs]
+    ggml_tensor * s_rpl_extra = nullptr; // view [n_rs - n_seqs]
+    ggml_tensor * s_rpl_ctrl  = nullptr; // I32 [2, n_seqs]: {records to re-apply, their bank}
+    ggml_tensor * s_rpl_wrow  = nullptr; // I64 [n_seqs]: bank the new records go to
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
@@ -358,6 +378,11 @@ public:
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    // a ubatch of several windowed sequences (llama_kv_cache::set_seq_windows): each
+    // part's rows and window, and its slice of the mask, made once for all layers
+    std::vector<llama_kv_win_part> win_parts;
+    std::vector<ggml_tensor *>     self_kq_mask_parts;
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -923,6 +948,11 @@ public:
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
 
+    // the routed ids of a traced MTP block's MoE layers (il, tensor); empty
+    // unless LLAMA_EXPERT_ROUTE_TRACE is set and this is an MTP context
+    const std::vector<std::pair<int, ggml_tensor *>> & get_route_ids() const { return t_route_ids; }
+    void set_route_ids(int il, ggml_tensor * t) { t_route_ids.emplace_back(il, t); }
+
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
@@ -963,8 +993,10 @@ public:
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
+    std::vector<std::pair<int, ggml_tensor *>> t_route_ids;
 
     std::vector<ggml_tensor *> t_sampled;
+    ggml_tensor *              t_sampled_ids = nullptr; // I32 [n_rows]: the same sampled ids in one tensor (one read-back), or null
     std::vector<ggml_tensor *> t_sampled_probs;
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
@@ -1007,6 +1039,12 @@ struct llm_graph_qkv {
     ggml_tensor * k; // [n_embd_head, n_head_kv, n_tokens]
     ggml_tensor * v; // [n_embd_head, n_head_kv, n_tokens]
 };
+
+// patch 0081's build gate for the GDN rows fold: LLAMA_GDN_STATE_ROWS=1 (off by
+// default), one sequence, and the fused GDN op the batch takes. A multi-sequence
+// ubatch declines (its s_copy rows may alias the extra relocation), as does a
+// batch the autoregressive path would serve.
+bool llama_gdn_state_rows_enabled(const llama_cparams & cparams, int64_t n_seqs, int64_t n_seq_tokens);
 
 struct llm_graph_context {
     const llm_arch arch;
@@ -1399,6 +1437,16 @@ struct llm_graph_context {
                 int32_t   state_size,
                 int32_t   n_seqs,
             const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
+
+    // patch 0081: the gated delta-net's state read straight from the recurrent
+    // cache, no gather of the live rows (LLAMA_GDN_STATE_ROWS=1, off by default).
+    // Returns the 2D cache view for ggml_gated_delta_net_rows; the row index is
+    // inp->s_copy_main. Single sequence only (see llama_gdn_state_rows_enabled).
+    ggml_tensor * build_rs_cache_view(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+                int32_t   state_size,
+                int32_t   n_seqs) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

@@ -98,6 +98,16 @@ public:
         return used.empty() ? 0 : *used.rbegin() + 1;
     }
 
+    // the index of the last used cell in [lo, hi) + 1, or lo if none is used there
+    uint32_t used_max_p1_in(uint32_t lo, uint32_t hi) const {
+        auto it = used.lower_bound(hi);
+        if (it == used.begin()) {
+            return lo;
+        }
+        --it;
+        return *it >= lo ? *it + 1 : lo;
+    }
+
     bool get_has_shift() const {
         return has_shift;
     }

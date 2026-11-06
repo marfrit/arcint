@@ -679,7 +679,7 @@ public:
     ggml_tensor * k_idxs        = nullptr; // I64 [n_tokens]
     ggml_tensor * pool_cells    = nullptr; // I32 [n_pool]         cell caching each block's pooled key
     ggml_tensor * pool_idxs     = nullptr; // I32 [kpool, n_pool]  member cells per block, n_kv sentinel for the padded blocks
-    ggml_tensor * pool_mask     = nullptr; // F16 [n_pool, n_tokens]
+    ggml_tensor * pool_mask     = nullptr; // F16 [n_pool, n_tokens] (F32 without the fused lightning indexer)
     ggml_tensor * tail_idxs     = nullptr; // I32 [kpool - 1, n_tokens]
     ggml_tensor * new_pool_idxs = nullptr; // I32 [kpool, n_new]   members of the blocks to re-pool this ubatch
     ggml_tensor * new_pool_rep  = nullptr; // I64 [n_new]          cell to write each new pooled key into
@@ -704,7 +704,8 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
     inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
     inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
-    inp->pool_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
+    // F16 for the lightning indexer; F32 for the graph a backend without it runs (patch 0052, resolve_fused_ops)
+    inp->pool_mask  = ggml_new_tensor_2d(ctx0, cparams.fused_lid ? GGML_TYPE_F16 : GGML_TYPE_F32, n_pool, n_tokens);
     inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
     ggml_set_input(inp->pool_cells);
     ggml_set_input(inp->pool_idxs);
@@ -799,11 +800,31 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(q, "indexer_q", il);
 
-    // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
-    // which is the lightning indexer with every head weight set to that scale
-    ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
-    ggml_tensor * score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
-    res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+    ggml_tensor * score = nullptr;
+    if (cparams.fused_lid) {
+        // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
+        // which is the lightning indexer with every head weight set to that scale
+        ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
+        score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
+        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+    } else {
+        // a backend without the lightning indexer (resolve_fused_ops cleared fused_lid, e.g. OpenCL): the
+        // graph before it (patch 0052). The reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim):
+        // one product for all heads, then the heads are summed as slices, so nothing is transposed
+        ggml_tensor * kq = ggml_mul_mat(ctx0,
+                ggml_reshape_2d(ctx0, pooled, idx_dim, n_pool),
+                ggml_reshape_2d(ctx0, q, idx_dim, n_idx_h*n_tokens)); // [n_pool, n_idx_h*n_tokens]
+        // in place: the product's only reader, and a separate result is as large as the product
+        // (the pools x 4 heads x the ubatch's tokens in f32: 1 GiB at 131K cells and 2,048 tokens)
+        kq = ggml_relu_inplace(ctx0, ggml_reshape_3d(ctx0, kq, n_pool, n_idx_h, n_tokens));
+
+        for (int64_t h = 0; h < n_idx_h; ++h) {
+            ggml_tensor * slice = ggml_view_2d(ctx0, kq, n_pool, n_tokens, kq->nb[2], h*kq->nb[1]);
+            score = score ? ggml_add(ctx0, score, slice) : ggml_cont(ctx0, slice);
+        }
+        score = ggml_scale(ctx0, score, 1.0f/sqrtf((float) idx_dim));
+        score = ggml_add(ctx0, score, inp_kpool->pool_mask); // [n_pool, n_tokens]
+    }
     cb(score, "indexer_score", il);
 
     const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
@@ -1067,9 +1088,28 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
             conv_kernel_size - 1, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
+    // patch 0081: LLAMA_GDN_STATE_ROWS=1 (off by default) reads each sequence's
+    // live state straight from the recurrent cache inside the GDN op, no gather
+    // Replay (LLAMA_GDN_REPLAY) disables the rows form: its base state is plane 0
+    // read by its own row index, and the replay op takes the gathered state.
+    const bool gdn_rpl = inp->s_rpl_ctrl != nullptr;
+    const bool gdn_state_rows = !gdn_rpl && llama_gdn_state_rows_enabled(cparams, n_seqs, n_seq_tokens);
+    ggml_tensor * state;
+    ggml_tensor * state_rows = nullptr;
+    if (gdn_rpl) {
+        state = build_rs(ssm_states_all, inp->s_rpl_rows, inp->s_rpl_main, hparams.n_embd_s(), n_seqs,
+                mctx_cur->get_n_rs(), mctx_cur->get_head(), mctx_cur->get_size(), mctx_cur->get_rs_z());
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+        cb(state, "state_predelta", il);
+    } else if (gdn_state_rows) {
+        state      = build_rs_cache_view(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state_rows = inp->s_copy_main;
+        cb(state, "state_cache_view", il);
+    } else {
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+        cb(state, "state_predelta", il);
+    }
 
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
@@ -1107,8 +1147,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    // patch 0082: LLAMA_FUSE_QK_L2_NORM=1 (off by default) normalises q and k in
+    // one l2_norm over their joint head groups of the conv output; the two
+    // separate norms are the same bytes, one pair of nodes fewer a layer
+    static const bool fuse_qk_l2 = [] {
+        const char * e = getenv("LLAMA_FUSE_QK_L2_NORM");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (fuse_qk_l2) {
+        ggml_tensor * q_normed = nullptr;
+        ggml_tensor * k_normed = nullptr;
+        build_gdn_qk_l2_norm(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+                nb1_qkv, eps_norm, &q_normed, &k_normed);
+        q_conv = q_normed; cb(q_conv, "q_conv_l2", il);
+        k_conv = k_normed; cb(k_conv, "k_conv_l2", il);
+    } else {
+        q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    }
 
     // repeat to match shapes when head keys != value keys; unneeded with the fused GDN
     if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
@@ -1121,7 +1177,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il, state_rows);
 
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 
@@ -1340,7 +1396,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_states_all->nb[1],
                 (slot * mem_size + kv_head) * row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        // the strided tail copied as it is, as delta-net-base.cpp's build_conv_state
+        // does: a ggml_cont first cost a second kernel a slot (patch 0049)
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
     }
 
     return conv_input;

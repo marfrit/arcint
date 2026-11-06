@@ -6,8 +6,14 @@ kernel void kernel_scale_f32(
         global float * dst,
         ulong offsetd,
         float scale,
-        float bias
+        float bias,
+        int n
 ) {
+    // 0072: exit the rounded uniform launch's tail
+    if ((int) get_global_id(0) >= n) {
+        return;
+    }
+
     src0 = (global float*)((global char*)src0 + offset0);
     dst = (global float*)((global char*)dst + offsetd);
     dst[get_global_id(0)] = src0[get_global_id(0)] * scale + bias;
@@ -19,8 +25,14 @@ kernel void kernel_scale_f32_4(
         global float4 * dst,
         ulong offsetd,
         float scale,
-        float bias
+        float bias,
+        int n
 ) {
+    // 0072: exit the rounded uniform launch's tail
+    if ((int) get_global_id(0) >= n) {
+        return;
+    }
+
     src0 = (global float4*)((global char*)src0 + offset0);
     dst = (global float4*)((global char*)dst + offsetd);
     dst[get_global_id(0)] = src0[get_global_id(0)] * scale + bias;

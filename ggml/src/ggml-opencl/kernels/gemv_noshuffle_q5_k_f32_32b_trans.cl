@@ -50,6 +50,9 @@ __kernel void gemv_noshuffle_q5_k_f32_32b_trans(
     int                     ne01
 ) {
     uint i01  = get_global_id(0);
+    // 0072: the launch rounds ne01 up to a multiple of 64; clamp the
+    // tail's index for the loads and keep every lane in the collectives
+    uint i01c = min(i01, (uint) ne01 - 1);
     uint sgid = get_local_id(1);
     uint slid = get_sub_group_local_id();
 
@@ -63,11 +66,11 @@ __kernel void gemv_noshuffle_q5_k_f32_32b_trans(
         uint j  = ib % 8;
 
         // Load d and dmin for this super-block.
-        half d_val  = src0_d[sb * ne01 + i01];
-        half dm_val = src0_dm[sb * ne01 + i01];
+        half d_val  = src0_d[sb * ne01 + i01c];
+        half dm_val = src0_dm[sb * ne01 + i01c];
 
         // Load sub-block scale and min. s is transposed [nb][12][M]; stride ne01 per code.
-        global const uchar * sc = src0_s + sb * K_SCALE_SIZE * ne01 + i01;
+        global const uchar * sc = src0_s + sb * K_SCALE_SIZE * ne01 + i01c;
         uchar sv, mn;
         get_scale_min_k4(j, sc, ne01, &sv, &mn);
 
@@ -75,7 +78,7 @@ __kernel void gemv_noshuffle_q5_k_f32_32b_trans(
         float minv  = (float)dm_val * (float)mn;
 
         // Load 4 uints of quants (32 nibbles = 32 elements), column-major stride ne01.
-        uint q_base = ib * ne01 * 4 + i01;
+        uint q_base = ib * ne01 * 4 + i01c;
 
         uint4 regQ;
         regQ.s0 = read_imageui(src0_q, q_base).x;
@@ -84,10 +87,10 @@ __kernel void gemv_noshuffle_q5_k_f32_32b_trans(
         regQ.s3 = read_imageui(src0_q, q_base + ne01 * 3).x;
 
         uint qh_grp = ib * 4;
-        uint qh_word = (uint)src0_qh[(qh_grp + 0) * ne01 + i01]
-                      | ((uint)src0_qh[(qh_grp + 1) * ne01 + i01] << 8)
-                      | ((uint)src0_qh[(qh_grp + 2) * ne01 + i01] << 16)
-                      | ((uint)src0_qh[(qh_grp + 3) * ne01 + i01] << 24);
+        uint qh_word = (uint)src0_qh[(qh_grp + 0) * ne01 + i01c]
+                      | ((uint)src0_qh[(qh_grp + 1) * ne01 + i01c] << 8)
+                      | ((uint)src0_qh[(qh_grp + 2) * ne01 + i01c] << 16)
+                      | ((uint)src0_qh[(qh_grp + 3) * ne01 + i01c] << 24);
 
         // Load activations: 32 floats = 8 float4s.
         uint y_offset = ib * 8;
@@ -136,6 +139,8 @@ __kernel void gemv_noshuffle_q5_k_f32_32b_trans(
     // 1 output per thread in subgroup 0
     if (sgid == 0) {
         dst = dst + (offsetd >> 2);
-        dst[i01] = sum;
+        if (i01 < (uint) ne01) {   // 0072: only a real row stores
+            dst[i01] = sum;
+        }
     }
 }

@@ -2539,6 +2539,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_k_img(
 
 #ifndef FA_MQ_ONLY  // q1_split + merge excluded from the MQ-only (g8) program
 #ifndef FA_VEC_ONLY
+REQD_FA_SG
 __kernel void flash_attn_f32_f16_q1_split(
     const global void * q_void, ulong q_offset,
     const global void * k_void, ulong k_offset,
@@ -2771,5 +2772,266 @@ __kernel void flash_attn_f32_merge(
     global O_DATA_TYPE4 * o_row = (global O_DATA_TYPE4 *) ((global char *) o_void + o_offset + o_row_offset);
     o_row[lane] = CONVERT_O_DATA4(o);
 }
+#if defined(cl_intel_required_subgroup_size) && (DK == DV) && (DK % 128 == 0)  /* 8 values a lane a block read */
+// Intel: flash_attn_f32_f16_q1_split's job (one query row, a KV range, a
+// partial record for flash_attn_f32_merge) with the lanes along the head
+// dimension instead of along the keys: one sub-group of 16 per (head, split),
+// DK / 16 values a lane, the query in registers, one sub-group reduction a
+// key, four keys a step so their reductions overlap and the online softmax
+// rescales once per four. The keys-along-lanes kernel keeps all DV
+// accumulators in every lane (it is limited to DK <= 128) and the basic q1
+// kernel walks every key in one sub-group per head.
+#ifndef FDI_SG
+#define FDI_SG 16
+#endif
+#ifndef FDI_KB
+#define FDI_KB 4
+#endif
+#define FDI_E  (DK / FDI_SG)
+// lane l's values i * FDI_SG + l of a row of DK halves, by sub-group block
+// reads (8 values a read)
+static inline void fdi_row(const global half * p, float * out) {
+    #pragma unroll
+    for (int b = 0; b < FDI_E / 8; ++b) {
+        const ushort8 u = intel_sub_group_block_read_us8((const global ushort *) (p + b * 8 * FDI_SG));
+        const float8 f = convert_float8(as_half8(u));
+        out[8 * b + 0] = f.s0; out[8 * b + 1] = f.s1; out[8 * b + 2] = f.s2; out[8 * b + 3] = f.s3;
+        out[8 * b + 4] = f.s4; out[8 * b + 5] = f.s5; out[8 * b + 6] = f.s6; out[8 * b + 7] = f.s7;
+    }
+}
+// K / V as f16 (0), q8_0 (1) or q4_0 (2), ggml's block layouts (34 / 18
+// bytes for 32 values): lane l's values i * FDI_SG + l of a row, i < FDI_E.
+// For the quantized types value i * 16 + l sits in block i / 2 at position
+// (i % 2) * 16 + l: one byte a lane for q8_0, the low or high nibble of byte
+// l for q4_0, the block's f16 scale broadcast. (FDI_SG 16 only.)
+static inline void fdi_load(const int t, const global char * p, float * out) {
+    if (t == 0) {
+        fdi_row((const global half *) p, out);
+    } else if (t == 1) {
+        #pragma unroll
+        for (int b = 0; b < FDI_E / 2; ++b) {
+            const global char * blk = p + b * 34;
+            const float d = vload_half(0, (const global half *) blk);
+            out[2 * b]     = d * (float) blk[2 + get_sub_group_local_id()];
+            out[2 * b + 1] = d * (float) blk[2 + 16 + get_sub_group_local_id()];
+        }
+    } else {
+        #pragma unroll
+        for (int b = 0; b < FDI_E / 2; ++b) {
+            const global uchar * blk = (const global uchar *) (p + b * 18);
+            const float d = vload_half(0, (const global half *) blk);
+            const uint  q = blk[2 + get_sub_group_local_id()];
+            out[2 * b]     = d * (float) ((int) (q & 15u) - 8);
+            out[2 * b + 1] = d * (float) ((int) (q >> 4) - 8);
+        }
+    }
+}
+#define FDI_PARAMS const global void * q_void, ulong q_offset, const global void * k_void, ulong k_offset, const global void * v_void, ulong v_offset, const float scale, const int n_q, const int n_kv, const int n_head, const ulong q_nb1, const ulong q_nb2, const ulong q_nb3, const ulong k_nb1, const ulong k_nb2, const ulong k_nb3, const ulong v_nb1, const ulong v_nb2, const ulong v_nb3, const float max_bias, const float m0, const float m1, const int n_head_log2, const float logit_softcap, const int n_head_kv, const global void * mask_void, const ulong mask_offset, const ulong mask_nb1, const ulong mask_nb2, const ulong mask_nb3, const int mask_ne2, const int mask_ne3, global float * partial_void, const int n_splits, const int kv_per_split
+#define FDI_PASS q_void, q_offset, k_void, k_offset, v_void, v_offset, scale, n_q, n_kv, n_head, q_nb1, q_nb2, q_nb3, k_nb1, k_nb2, k_nb3, v_nb1, v_nb2, v_nb3, max_bias, m0, m1, n_head_log2, logit_softcap, n_head_kv, mask_void, mask_offset, mask_nb1, mask_nb2, mask_nb3, mask_ne2, mask_ne3, partial_void, n_splits, kv_per_split
+static inline void fdi_split_body(FDI_PARAMS, const int KT, const int VT) {
+    const int lane           = get_sub_group_local_id();
+    const int head_batch_idx = get_group_id(1);
+    const int split_q_idx    = get_group_id(2);
+    const int split_idx      = split_q_idx % n_splits;
+    const int q_idx          = split_q_idx / n_splits;
+    const int batch_idx      = head_batch_idx / n_head;
+    const int head_idx       = head_batch_idx % n_head;
+    const int head_kv_idx    = head_idx / (n_head / n_head_kv);
+
+    const int kv_start = split_idx * kv_per_split;
+    const int kv_end   = min(kv_start + kv_per_split, n_kv);
+
+    const ulong record_idx = (((ulong) batch_idx * n_head + head_idx) * n_q + q_idx) * n_splits + split_idx;
+    global float * rec = partial_void + record_idx * (ulong) FA_PARTIAL_FLOATS;
+
+    float o[FDI_E];
+    #pragma unroll
+    for (int i = 0; i < FDI_E; ++i) o[i] = 0.0f;
+    float m = FA_M_INIT, l = 0.0f;
+
+    if (kv_start < kv_end) {
+        const global float * qp = (const global float *) ((const global char *) q_void + q_offset +
+                                   batch_idx * q_nb3 + head_idx * q_nb2 + (ulong) q_idx * q_nb1);
+        float q[FDI_E];
+        #pragma unroll
+        for (int i = 0; i < FDI_E; ++i) q[i] = qp[i * FDI_SG + lane] * scale;
+
+        const global char * k_base = (const global char *) k_void + k_offset + batch_idx * k_nb3 + head_kv_idx * k_nb2;
+        const global char * v_base = (const global char *) v_void + v_offset + batch_idx * v_nb3 + head_kv_idx * v_nb2;
+        const global half * mask_ptr = NULL;
+        if (mask_void != NULL) {
+            mask_ptr = (const global half *) ((const global char *) mask_void + mask_offset +
+                       (batch_idx % mask_ne3) * mask_nb3 + (head_idx % mask_ne2) * mask_nb2 + (ulong) q_idx * mask_nb1);
+        }
+        const float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
+
+        for (int k0 = kv_start; k0 < kv_end; k0 += FDI_KB) {
+            float s[FDI_KB];
+            #pragma unroll
+            for (int j = 0; j < FDI_KB; ++j) {
+                const int kj = min(k0 + j, kv_end - 1);
+                float kr[FDI_E];
+                fdi_load(KT, k_base + (ulong) kj * k_nb1, kr);
+                float d = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < FDI_E; ++i) d = fma(q[i], kr[i], d);
+                s[j] = sub_group_reduce_add(d);
+            }
+            float m_new = m;
+            #pragma unroll
+            for (int j = 0; j < FDI_KB; ++j) {
+                // softcap, then the mask (ggml-cpu's order); clamped so that
+                // exp() never sees -inf under -cl-finite-math-only
+                if (logit_softcap > 0.0f) s[j] = logit_softcap * tanh(s[j] / logit_softcap);
+                if (mask_ptr != NULL) s[j] += slope * vload_half(min(k0 + j, kv_end - 1), mask_ptr);
+                s[j] = fmax(s[j], FA_M_INIT);
+                if (k0 + j < kv_end) m_new = fmax(m_new, s[j]);
+            }
+            const float c = exp(m - m_new);
+            l *= c;
+            #pragma unroll
+            for (int i = 0; i < FDI_E; ++i) o[i] *= c;
+            #pragma unroll
+            for (int j = 0; j < FDI_KB; ++j) {
+                const float p = k0 + j < kv_end ? exp(s[j] - m_new) : 0.0f;
+                float vr[FDI_E];
+                fdi_load(VT, v_base + (ulong) min(k0 + j, kv_end - 1) * v_nb1, vr);
+                l += p;
+                #pragma unroll
+                for (int i = 0; i < FDI_E; ++i) o[i] = fma(p, vr[i], o[i]);
+            }
+            m = m_new;
+        }
+    }
+    if (lane == 0) {
+        rec[0] = m;
+        rec[1] = l;
+    }
+    #pragma unroll
+    for (int i = 0; i < FDI_E; ++i) rec[2 + i * FDI_SG + lane] = o[i];
+}
+// the f16 kernel keeps its own body: as a call of the shared one below with
+// KT = VT = 0 it decoded 4 % slower on the A770 (measured-here)
+__attribute__((intel_reqd_sub_group_size(FDI_SG)))
+__kernel void flash_attn_f32_f16_q1_split_intel(
+    const global void * q_void, ulong q_offset,
+    const global void * k_void, ulong k_offset,
+    const global void * v_void, ulong v_offset,
+    const float scale,
+    const int n_q,
+    const int n_kv,
+    const int n_head,
+    const ulong q_nb1, const ulong q_nb2, const ulong q_nb3,
+    const ulong k_nb1, const ulong k_nb2, const ulong k_nb3,
+    const ulong v_nb1, const ulong v_nb2, const ulong v_nb3,
+    const float max_bias,
+    const float m0,
+    const float m1,
+    const int n_head_log2,
+    const float logit_softcap,
+    const int n_head_kv,
+    const global void * mask_void,
+    const ulong mask_offset,
+    const ulong mask_nb1,
+    const ulong mask_nb2,
+    const ulong mask_nb3,
+    const int mask_ne2,
+    const int mask_ne3,
+    global float * partial_void,
+    const int n_splits,
+    const int kv_per_split
+) {
+    const int lane           = get_sub_group_local_id();
+    const int head_batch_idx = get_group_id(1);
+    const int split_q_idx    = get_group_id(2);
+    const int split_idx      = split_q_idx % n_splits;
+    const int q_idx          = split_q_idx / n_splits;
+    const int batch_idx      = head_batch_idx / n_head;
+    const int head_idx       = head_batch_idx % n_head;
+    const int head_kv_idx    = head_idx / (n_head / n_head_kv);
+
+    const int kv_start = split_idx * kv_per_split;
+    const int kv_end   = min(kv_start + kv_per_split, n_kv);
+
+    const ulong record_idx = (((ulong) batch_idx * n_head + head_idx) * n_q + q_idx) * n_splits + split_idx;
+    global float * rec = partial_void + record_idx * (ulong) FA_PARTIAL_FLOATS;
+
+    float o[FDI_E];
+    #pragma unroll
+    for (int i = 0; i < FDI_E; ++i) o[i] = 0.0f;
+    float m = FA_M_INIT, l = 0.0f;
+
+    if (kv_start < kv_end) {
+        const global float * qp = (const global float *) ((const global char *) q_void + q_offset +
+                                   batch_idx * q_nb3 + head_idx * q_nb2 + (ulong) q_idx * q_nb1);
+        float q[FDI_E];
+        #pragma unroll
+        for (int i = 0; i < FDI_E; ++i) q[i] = qp[i * FDI_SG + lane] * scale;
+
+        const global char * k_base = (const global char *) k_void + k_offset + batch_idx * k_nb3 + head_kv_idx * k_nb2;
+        const global char * v_base = (const global char *) v_void + v_offset + batch_idx * v_nb3 + head_kv_idx * v_nb2;
+        const global half * mask_ptr = NULL;
+        if (mask_void != NULL) {
+            mask_ptr = (const global half *) ((const global char *) mask_void + mask_offset +
+                       (batch_idx % mask_ne3) * mask_nb3 + (head_idx % mask_ne2) * mask_nb2 + (ulong) q_idx * mask_nb1);
+        }
+        const float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
+
+        for (int k0 = kv_start; k0 < kv_end; k0 += FDI_KB) {
+            float s[FDI_KB];
+            #pragma unroll
+            for (int j = 0; j < FDI_KB; ++j) {
+                const int kj = min(k0 + j, kv_end - 1);
+                float kr[FDI_E];
+                fdi_row((const global half *) (k_base + (ulong) kj * k_nb1), kr);
+                float d = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < FDI_E; ++i) d = fma(q[i], kr[i], d);
+                s[j] = sub_group_reduce_add(d);
+            }
+            float m_new = m;
+            #pragma unroll
+            for (int j = 0; j < FDI_KB; ++j) {
+                // softcap, then the mask (ggml-cpu's order); clamped so that
+                // exp() never sees -inf under -cl-finite-math-only
+                if (logit_softcap > 0.0f) s[j] = logit_softcap * tanh(s[j] / logit_softcap);
+                if (mask_ptr != NULL) s[j] += slope * vload_half(min(k0 + j, kv_end - 1), mask_ptr);
+                s[j] = fmax(s[j], FA_M_INIT);
+                if (k0 + j < kv_end) m_new = fmax(m_new, s[j]);
+            }
+            const float c = exp(m - m_new);
+            l *= c;
+            #pragma unroll
+            for (int i = 0; i < FDI_E; ++i) o[i] *= c;
+            #pragma unroll
+            for (int j = 0; j < FDI_KB; ++j) {
+                const float p = k0 + j < kv_end ? exp(s[j] - m_new) : 0.0f;
+                float vr[FDI_E];
+                fdi_row((const global half *) (v_base + (ulong) min(k0 + j, kv_end - 1) * v_nb1), vr);
+                l += p;
+                #pragma unroll
+                for (int i = 0; i < FDI_E; ++i) o[i] = fma(p, vr[i], o[i]);
+            }
+            m = m_new;
+        }
+    }
+    if (lane == 0) {
+        rec[0] = m;
+        rec[1] = l;
+    }
+    #pragma unroll
+    for (int i = 0; i < FDI_E; ++i) rec[2 + i * FDI_SG + lane] = o[i];
+}
+#if FDI_SG == 16 && DK % 32 == 0
+// the same with quantized K / V: 8:8, 8:4, 4:4
+__attribute__((intel_reqd_sub_group_size(FDI_SG)))
+__kernel void flash_attn_q8q8_q1_split_intel(FDI_PARAMS) { fdi_split_body(FDI_PASS, 1, 1); }
+__attribute__((intel_reqd_sub_group_size(FDI_SG)))
+__kernel void flash_attn_q8q4_q1_split_intel(FDI_PARAMS) { fdi_split_body(FDI_PASS, 1, 2); }
+__attribute__((intel_reqd_sub_group_size(FDI_SG)))
+__kernel void flash_attn_q4q4_q1_split_intel(FDI_PARAMS) { fdi_split_body(FDI_PASS, 2, 2); }
+#endif
+#endif
+
 #endif  // !FA_MQ_ONLY (q1_split + merge)
 #endif  // !FA_PREFILL_ONLY (decode kernels)

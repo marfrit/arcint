@@ -40,7 +40,9 @@ kernel void kernel_rms_norm(
         ulong nb02,
         ulong nb03,
         float eps,
-        local float * sum // Note, the size depends on number of subgroups
+        local float * sum, // Note, the size depends on number of subgroups
+        float post,       // a following GGML_OP_SCALE folded in (1 when none, patch 0049)
+        uint  opaque      // 0 from the host: the compiler cannot regroup (x * scale) * post through it
 ) {
     src0 = (global void*)((global char*)src0 + offset0);
     dst = (global float*)((global char*)dst + offsetd);
@@ -86,11 +88,14 @@ kernel void kernel_rms_norm(
     global float4 * y = (global float4 *) (dst + i03*ne02*ne01*ne00 + i02*ne01*ne00 + i01*ne00);
     global float * y_scalar = (global float *) y;
     for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
-        y[i00] = x[i00] * scale;
+        // rounded as the norm and the scale were: x * scale first (the norm's
+        // store), then * post (the scale's); under -cl-fast-relaxed-math IGC
+        // regrouped the plain form to x * (scale * post) and the text changed
+        y[i00] = as_float4(as_uint4(x[i00] * scale) ^ opaque) * post;
     }
     if (get_local_id(0) == 0) {
         for (int i00 = 4 * (ne00 / 4); i00 < ne00; i00++) {
-            y_scalar[i00] = x_scalar[i00] * scale;
+            y_scalar[i00] = as_float(as_uint(x_scalar[i00] * scale) ^ opaque) * post;
         }
     }
 }
@@ -365,5 +370,189 @@ kernel void kernel_rms_norm_mul_add_scale(
     global float4 * y = (global float4 *) (dst + i03*nb3 + i02*nb2 + i01*nb1);
     for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
         y[i00] = ((x[i00] * scale) * f[i00%(ne10/4)] + g[i00%(ne20/4)]) * sc;
+    }
+}
+
+//------------------------------------------------------------------------------
+// rms_norm · norm weight · interleaved M-RoPE, fused (patch 0074).
+// The q/k norm and its rotation sit adjacent on every attention layer of the
+// served models (qwen35/qwen4exp: a 1-D [head_dim] weight, mode 40). This
+// computes y = rope(rmsnorm(x) * w) in one dispatch and drops the normed row's
+// store/load between the two kernels. The epsilon, the weight factor and the
+// rotation's cos/sin are kernel_rms_norm_mul's and kernel_rope_multi_f32's
+// expressions. The normed value rounds in two steps here, (x * scale) then * w,
+// through the `opaque` guard against IGC regrouping — kernel_rms_norm_mul has no
+// such guard (`code`), so it may fold x * (scale * w) itself and the two paths'
+// bits are not promised to agree either way; the answer-level bar and the
+// md5/argmax tripwire are the gate. Only the interleaved M-RoPE form (mode
+// GGML_ROPE_TYPE_IMROPE) is handled, which is what both served models build.
+//------------------------------------------------------------------------------
+float rope_yarn_ramp_fused(float low, float high, int i0) {
+    const float y = (i0 / 2 - low) / max(0.001f, high - low);
+    return 1.0f - min(1.0f, max(0.0f, y));
+}
+
+// rope.cl's rope_yarn, rope_yarn_corr_factor and rope_yarn_corr_dims, verbatim
+// in a second program (this one needs its subgroup reduction, rope.cl's does
+// not), so the fused cos/sin is the rotation's own expression.
+float2 rope_yarn_fused(float theta_extrap, float freq_scale, float2 corr_dims, int i0, float ext_factor, float mscale) {
+    float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    if (ext_factor != 0.0f) {
+        float ramp_mix = rope_yarn_ramp_fused(corr_dims.s0, corr_dims.s1, i0) * ext_factor;
+        theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * log(1.0f / freq_scale);
+    }
+    return (float2)(cos(theta) * mscale, sin(theta) * mscale);
+}
+
+float rope_yarn_corr_factor_fused(int n_dims, int n_ctx_orig, float n_rot, float base) {
+    return n_dims * log(n_ctx_orig / (n_rot * 2 * M_PI_F)) / (2 * log(base));
+}
+
+float2 rope_yarn_corr_dims_fused(int n_dims, int n_ctx_orig, float freq_base, float beta_fast, float beta_slow) {
+    return (float2)(
+        max(0.0f,         floor(rope_yarn_corr_factor_fused(n_dims, n_ctx_orig, beta_fast, freq_base))),
+        min(n_dims - 1.0f, ceil(rope_yarn_corr_factor_fused(n_dims, n_ctx_orig, beta_slow, freq_base)))
+    );
+}
+
+#ifdef INTEL_GPU
+REQD_SUBGROUP_SIZE_32
+#elif defined (ADRENO_GPU)
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_rms_norm_mul_rope_multi_f32(
+        global char * src0,
+        ulong offset0,
+        global char * wsrc,
+        ulong offsetw,
+        global int  * src1,
+        ulong offset1,
+        global char * src2,
+        ulong offset2,
+        global char * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne03,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne0,
+        int ne1,
+        int ne2,
+        int ne3,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3,
+        int n_past,
+        int n_dims,
+        int n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow,
+        int4 sections,
+        int n_offs,
+        float eps,
+        uint opaque,
+        local float * sum
+) {
+    src0 = src0 + offset0;
+    global float * w = (global float *) (wsrc + offsetw);
+    // the offsets are BYTES on every operand, as kernel_rope_multi_f32 does it:
+    // `src1` is an int pointer, so `src1 + offset1` would step offset1 ELEMENTS
+    // (x4 bytes) and read a wrong region -- window 43's diagnostic read zeros for
+    // all four position streams (its print's offset and reads proved it)
+    src1 = (global int *)((global char *) src1 + offset1);
+    src2 = src2 + offset2;
+    global float * ff = (global float *) src2;
+    dst  = dst  + offsetd;
+
+    if (get_sub_group_id() == 0) {
+        sum[get_sub_group_local_id()] = 0.0f;
+    }
+
+    int i03 = get_group_id(2);
+    int i02 = get_group_id(1);
+    int i01 = get_group_id(0);
+
+    global float4 * x = (global float4 *) (src0 + i03*nb03 + i02*nb02 + i01*nb01);
+
+    float sumf = 0;
+    for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
+        sumf += dot(x[i00], x[i00]);
+    }
+    sumf = sub_group_reduce_add(sumf);
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (get_sub_group_local_id() == 0) {
+        sum[get_sub_group_id()] = sumf;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    sumf = sum[get_sub_group_local_id()];
+    sumf = sub_group_reduce_add(sumf);
+
+    const float scale = 1.0f/sqrt(sumf / ne00 + eps);
+
+    float2 corr_dims = rope_yarn_corr_dims_fused(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow);
+
+    global int * pos = src1;
+
+    // the host refuses a zero sections sum (the per-op path asserts it); this keeps
+    // the kernel defined if the argument ever arrives empty: ic % 0 is undefined
+    const int sect_sum = sections.s0 + sections.s1 + sections.s2 + sections.s3;
+    const int sect_dims = sect_sum > 0 ? sect_sum : 1;
+    const float inv_ndims = -1.f/n_dims;
+
+    for (int i0 = 2*get_local_id(0); i0 < ne0; i0 += 2*get_local_size(0)) {
+        if (i0 >= n_offs && i0 < n_offs + n_dims) {
+            int iw = i0 - n_offs; // relative idx
+            int ic = iw/2;
+
+            const int sector = ic % sect_dims;
+            float theta_base = 0.0f;
+
+            // the interleaved M-RoPE's position layout, kernel_rope_multi_f32's
+            // is_imrope branch (the sections' t/h/w/e positions per token)
+            if (sector % 3 == 1 && sector < 3 * sections.s1) { // h
+                theta_base = (float) pos[i02 + ne02 * 1];
+            } else if (sector % 3 == 2 && sector < 3 * sections.s2) { // w
+                theta_base = (float) pos[i02 + ne02 * 2];
+            } else if (sector % 3 == 0 && sector < 3 * sections.s0) { // t
+                theta_base = (float) pos[i02 + ne02 * 0];
+            } else { // e
+                theta_base = (float) pos[i02 + ne02 * 3];
+            }
+
+            const float theta = theta_base * pow(freq_base, inv_ndims*iw);
+
+            const float freq_factor = src2 != src0 ? ff[ic] : 1.0f;
+
+            float2 cos_sin_theta = rope_yarn_fused(theta/freq_factor, freq_scale, corr_dims, iw, ext_factor, attn_factor);
+
+            global float * src      = (global float *)((global char *) src0 + i03*nb03 + i02*nb02 + i01*nb01 + (n_offs + ic)*nb00);
+            global float * dst_data = (global float *)((global char *)  dst + i03*nb3  + i02*nb2  + i01*nb1  + (n_offs + ic)*nb0);
+
+            // the norm's store then the weight, as kernel_rms_norm_mul rounds them
+            const float x0 = as_float(as_uint(src[0] * scale) ^ opaque) * w[n_offs + ic];
+            const float x1 = as_float(as_uint(src[n_dims/2] * scale) ^ opaque) * w[n_offs + ic + n_dims/2];
+
+            dst_data[0]        = x0*cos_sin_theta.s0 - x1*cos_sin_theta.s1;
+            dst_data[n_dims/2] = x0*cos_sin_theta.s1 + x1*cos_sin_theta.s0;
+        } else {
+            global float * const src = (global float *)((global char *) src0 + i03*nb03 + i02*nb02 + i01*nb01 + i0*nb00);
+            global float * dst_data  = (global float *)((global char *)  dst + i03*nb3  + i02*nb2  + i01*nb1  + i0*nb0);
+
+            dst_data[0] = as_float(as_uint(src[0] * scale) ^ opaque) * w[i0];
+            dst_data[1] = as_float(as_uint(src[1] * scale) ^ opaque) * w[i0 + 1];
+        }
     }
 }

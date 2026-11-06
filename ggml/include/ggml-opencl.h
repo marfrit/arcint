@@ -19,6 +19,10 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_opencl_host_buffer_type
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_opencl_reg(void);
 
+// The paths taken other than the one a weight's type promises, one "key\tcount\n" a line.
+// Writes at most size bytes, NUL-terminated; returns the full length.
+GGML_BACKEND_API size_t ggml_backend_opencl_downgrades(char * buf, size_t size);
+
 #ifdef  __cplusplus
 }
 #endif

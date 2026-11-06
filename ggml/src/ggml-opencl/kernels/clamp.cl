@@ -9,8 +9,14 @@ kernel void kernel_clamp(
         global float * dst,
         ulong offsetd,
         float min,
-        float max
+        float max,
+        int n
 ) {
+    // 0072: exit the rounded uniform launch's tail
+    if ((int) get_global_id(0) >= n) {
+        return;
+    }
+
     src0 = (global float*)((global char*)src0 + offset0);
     dst = (global float*)((global char*)dst + offsetd);
 

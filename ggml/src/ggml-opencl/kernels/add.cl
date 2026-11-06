@@ -70,7 +70,8 @@ kernel void kernel_add_row(
         ulong  offset1,
         global float4 * dst,
         ulong  offsetd,
-        int ne
+        int ne,
+        int n_total
 ) {
     src0 = (global float4*)((global char*)src0 + offset0);
     src1 = (global float4*)((global char*)src1 + offset1);
@@ -78,6 +79,9 @@ kernel void kernel_add_row(
 
     // This performs better than using %.
     uint gid = get_global_id(0);
+    if (gid >= (uint) n_total) {   // 0072: exit the rounded uniform launch's tail
+        return;
+    }
     uint idx1 = gid - (gid/ne)*ne; // get_global_id(0) % ne
     dst[gid] = src0[gid] + src1[idx1];
 }
@@ -161,12 +165,16 @@ kernel void kernel_add_row_f16(
         ulong  offsetd,
         int ne,
         int type_src0,
-        int type_src1
+        int type_src1,
+        int n_total
 ) {
     dst = (global half4*)((global char*)dst + offsetd);
 
     // This performs better than using %.
     uint gid = get_global_id(0);
+    if (gid >= (uint) n_total) {   // 0072: exit the rounded uniform launch's tail
+        return;
+    }
     uint idx1 = gid - (gid/ne)*ne; // get_global_id(0) % ne
 
     half4 v0, v1;

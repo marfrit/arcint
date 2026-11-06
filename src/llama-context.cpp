@@ -1,4 +1,6 @@
 #include "llama-context.h"
+#include "llama-expert-cache.h"
+#include "llama-expert-route-trace.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -7,6 +9,9 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -16,6 +21,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -320,8 +326,10 @@ llama_context::llama_context(
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = false;
 
+    // probed (resolve_fused_ops), so a backend without the lightning indexer gets the graph before it (qwen4exp,
+    // patch 0052) instead of the op on the CPU; upstream leaves the op unconditional
     cparams.fused_lid = true;
-    cparams.auto_flid = false;
+    cparams.auto_flid = true;
 
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;
@@ -332,6 +340,9 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+    cparams.n_ubatch_reserve = std::min(cparams.n_ubatch, params.n_ubatch_reserve == 0 ? cparams.n_ubatch : params.n_ubatch_reserve);
+    reserve_ubatch = cparams.n_ubatch_reserve;
+    cparams.n_kv_reserve = params.n_kv_reserve == 0 ? 0 : GGML_PAD(params.n_kv_reserve, 256);
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
@@ -712,6 +723,13 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 }
 
+// the reservation's cell cap for the memory's full context (llama_kv_reserve_cap), restored on exit
+struct llama_kv_reserve_scope {
+    uint32_t prev;
+    explicit llama_kv_reserve_scope(uint32_t cap) : prev(llama_kv_reserve_cap) { llama_kv_reserve_cap = cap; }
+    ~llama_kv_reserve_scope() { llama_kv_reserve_cap = prev; }
+};
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -726,7 +744,7 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_tokens = std::min(cparams.n_ctx, reserve_ubatch);
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -743,7 +761,11 @@ void llama_context::sched_reserve() {
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
+        llama_kv_reserve_scope cap(cparams.n_kv_reserve);
         mctx = memory->init_full();
+        if (cparams.n_kv_reserve > 0) {
+            LLAMA_LOG_INFO("%s: compute buffers reserved for %u cache cells (n_kv_reserve)\n", __func__, cparams.n_kv_reserve);
+        }
         if (!mctx) {
             throw std::runtime_error("failed to initialize memory module");
         }
@@ -868,12 +890,903 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+// ---- the prefill-slot-loan (docs/campaigns/prefill-slot-loan-design.md) ----
+
+bool llama_context::slot_loan_out() const {
+    // finding 4 (third review): a failed resident re-reserve after sched_new left
+    // the scheduler on the loan's chunk; a request that passed here would prefill
+    // on a reserve that has none for its own shape. Refuse instead.
+    if (slot_loan_poisoned) {
+        return true;
+    }
+    for (const auto & ec : model.expert_caches) {
+        // finding 7: a lend whose undo left the tables differing (loan_broken)
+        if (ec->loan_out() || ec->loan_broken()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool llama_context::slot_loan_lent() const {
+    for (const auto & ec : model.expert_caches) {
+        if (ec->loan_out()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void llama_context::slot_loan_poison(const char * why) {
+    if (!slot_loan_poisoned) {
+        // The policy is llama_loan_book::poison_exit, one function (operator's
+        // decision 2026-10-29, design §13): one ERROR line naming the step and
+        // exit non-zero, so the unit manager restarts a clean process. A build
+        // that should stand up and refuse instead changes that body only.
+        char msg[512];
+        std::snprintf(msg, sizeof(msg), "%s: the loan's state is unusable (%s)", __func__, why);
+        slot_loan_poisoned = true;
+        llama_loan_book::poison_exit(msg);
+    }
+    slot_loan_poisoned = true;
+}
+
+const char * llama_context::slot_loan_state() const {
+    if (slot_loan_poisoned) {
+        return "poisoned";
+    }
+    for (const auto & ec : model.expert_caches) {
+        if (ec->loan_broken()) {
+            return "broken";
+        }
+    }
+    if (slot_loan_lent()) {
+        return "out";
+    }
+    for (const auto & ec : model.expert_caches) {
+        if (ec->lend_bytes() > 0) {
+            return "armed";
+        }
+    }
+    return "off";
+}
+
+// A re-reserve that reports failure instead of throwing. sched_reserve() throws
+// on a failed buffer allocation (the pp/tg reservations below), and the loan's
+// return runs from an RAII destructor: a throw there, during unwinding, is
+// std::terminate and takes the server with it (review finding 4). The state that
+// follows a failed reserve is the caller's to record -- for a failed return the
+// loan stays out and every request is refused, which is the safe side.
+bool llama_context::slot_loan_reserve(uint32_t ub) {
+    // Round 11, card finding 1: sched_reserve's sched_new replaces the live
+    // scheduler and ggml_gallocr_free frees the buffers it held. sched_reserve's
+    // own synchronize() finishes the compute and bank-stream queues but not the
+    // adapt queue; finish every queue first, so no command outlives the memory a
+    // re-reserve replaces (the exit's drain then meets an empty queue).
+    llama_loan_book::drain_now();
+    reserve_ubatch = ub;
+    sched_need_reserve = true;
+    try {
+        sched_reserve();
+    } catch (const std::exception & e) {
+        // A throw after sched_new can leave the galloc with its buffers freed and
+        // a graph enqueued; drain once more before the caller records the failure
+        // and exits, so the poison's drain never runs work against that memory.
+        llama_loan_book::drain_now();
+        LLAMA_LOG_ERROR("%s: the re-reserve at %u tokens failed (%s)\n", __func__, ub, e.what());
+        return false;
+    }
+    return true;
+}
+
+bool llama_context::slot_loan_begin(uint32_t n_tokens, llama_slot_loan_info * info) {
+    if (info) {
+        *info = {};
+    }
+    // Round 23: the previous loan's TRUE shortfall (over the guard's noise floor)
+    // feeds THIS loan's sizing as extra lend bytes, through the existing growth
+    // path -- never a refusal, and never a shed. Round 21 dropped grown lend
+    // layers for it, which only REDUCED the headroom the loan creates
+    // (`used - lend + need` falls as lend falls), so a shed could not relieve the
+    // pressure that caused the eviction; and a remainder the grown tail could not
+    // cover refused the loan for the process's lifetime. The state is TAKEN and
+    // CLEARED here, at the top: every refused begin, for any reason, leaves no
+    // shortfall behind.
+    const size_t grow_by = llama_loan_book::growth_from_shortfall(
+        slot_loan_shed, llama_loan_book::resolve_shed_floor(getenv("LLAMA_SLOT_LOAN_SHED_FLOOR_MIB")));
+    slot_loan_shed = 0;
+    if (grow_by > 0) {
+        LLAMA_LOG_WARN("%s: the eviction guard's true shortfall %.2f GiB feeds the next lend's sizing "
+                       "(the lend grows by at least that much; no refusal)\n", __func__, grow_by / 1073741824.0);
+    }
+    // one lane in stage 1: a second request must never see a lent slot
+    if (cparams.n_seq_max > 1) {
+        LLAMA_LOG_WARN("%s: the slot loan needs one sequence (n_seq_max %u)\n", __func__, cparams.n_seq_max);
+        return false;
+    }
+    if (model.expert_caches.empty()) {
+        return false;
+    }
+    if (slot_loan_out()) {
+        LLAMA_LOG_WARN("%s: a loan is out already, or a previous one left the state unusable (a request's scope did not return it)\n", __func__);
+        return false;
+    }
+    size_t lend = 0;
+    for (const auto & ec : model.expert_caches) {
+        lend += ec->lend_bytes();
+        ec->finish_pending();
+    }
+    if (lend == 0) {
+        return false;
+    }
+    synchronize();
+    const int64_t t_loan = ggml_time_us();
+
+    const uint32_t cap = std::min(cparams.n_ctx, n_tokens);
+    const size_t max_nodes = this->graph_max_nodes(cap);
+
+    // The mctx first: a refusal here must leave the live scheduler and its
+    // reserve untouched (third review's leftover: sched_new replaced it first,
+    // and the early return skipped the resident re-reserve and rebind).
+    llama_memory_context_ptr mctx;
+    if (memory) {
+        llama_kv_reserve_scope kv(cparams.n_kv_reserve);
+        mctx = memory->init_full();
+        if (!mctx) {
+            LLAMA_LOG_WARN("%s: the loan could not initialize the memory module\n", __func__);
+            return false;
+        }
+    }
+    // Round 11, review item 2: sched_new below replaces the live scheduler, and
+    // the sizing (graph_reserve -> sched_reserve_size -> gallocr) can throw (a
+    // std::bad_alloc, a failed split). That throw reached Scope::begin, which
+    // catches it and returns, leaving the context on the replacement scheduler
+    // with no reserve and every cache's owner_sched pointing at the destroyed
+    // one. The sizing runs in a try/catch that falls into the refusals' own path:
+    // the resident re-reserve and the rebind, then false.
+    size_t need = 0;
+    bool sized = true;
+    // Round 19, the card's own bound (operator's decision 2026-10-30, "Margin ok"):
+    // the fixed margin is held against the card's total, not the lend bytes. The
+    // figures are per card that hosts an expert cache: its total (OpenCL's global
+    // mem size, via the device props' memory_total -- NOT the free query, which is
+    // total - 1 GiB), the process's device-resident bytes there before the lend, its
+    // own share of the prompt's compute buffers, and the bytes the lend frees there.
+    const size_t card_margin = llama_loan_book::resolve_card_margin(getenv("LLAMA_SLOT_LOAN_CARD_MARGIN_MIB"));
+    // Round 22: the only allowance the kernel rule takes is the prefill's growth
+    // band, named for what it is, default 0 (the operator's zero margin).
+    const size_t prefill_growth = llama_loan_book::resolve_prefill_allowance(getenv("LLAMA_SLOT_LOAN_PREFILL_GROWTH_MIB"));
+    llama_loan_book::FdinfoScan fdinfo;
+    const int ring_k = llama_loan_book::resolve_bank_stream_ring(getenv("GGML_OPENCL_BANK_STREAM_RING"));
+    std::vector<std::pair<ggml_backend_dev_t, llama_loan_book::CardFacts>> cards;
+    // Round 20: the rule's resident figure is the process's own residency from its
+    // xe render fds' /proc/self/fdinfo (`drm-resident-vram0`), deduped by
+    // drm-client-id and matched to the device by drm-pdev against OpenCL's
+    // CL_DEVICE_PCI_BUS_INFO_KHR (the device props' device_id). That figure carries
+    // what the ggml buffer sum cannot: the bank-stream ring, the backend's
+    // grow-only preallocations, the runtime's kernels, scratch and heaps. The ggml
+    // sum over the backend buffers remains the fallback (several xe clients with no
+    // unique pdev match) and the tripwire (a sum below fdinfo means the process's
+    // own buffers are already evicted to GTT -- the loan is refused). The sum:
+    // the model's weights, the KV memory's buffers, the expert cache's device bytes
+    // (bslots, the tail buffer, grown layers' spares, the gather mirror's reserve),
+    // and the output rows. The main context's own compute term is NOT in it:
+    // sched_new above replaced the scheduler and freed its buffers, and `need` is
+    // what the loan's reserve will allocate in its place. The draft context is not
+    // a separate client here: its buffers are the same process's, so its VRAM is in
+    // the fdinfo figure (its model, KV and compute reserve are on the same card).
+    auto resident_on = [&](ggml_backend_dev_t dev) -> size_t {
+        size_t n = 0;
+        auto add_size = [&](const std::map<ggml_backend_buffer_type_t, size_t> & mb) {
+            for (const auto & [buft, size] : mb) {
+                if (ggml_backend_buft_get_device(buft) == dev) n += size;
+            }
+        };
+        add_size(model.memory_breakdown());
+        if (memory) add_size(memory->memory_breakdown());
+        if (moe_cache) add_size(moe_cache->memory_breakdown());
+        if (buf_output && ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf_output.get())) == dev) {
+            n += ggml_backend_buffer_get_size(buf_output.get());
+        }
+        for (const auto & ec : model.expert_caches) {
+            if (ec->device() == dev) n += ec->device_bytes();
+        }
+        return n;
+    };
+    // the freed bytes on a card: every cache on it, its own lend included
+    auto lend_on_card = [&](ggml_backend_dev_t dev) -> size_t {
+        size_t n = 0;
+        for (const auto & ec : model.expert_caches) {
+            if (ec->device() == dev) n += ec->lend_bytes();
+        }
+        return n;
+    };
+    // the card's rule, after the lend frees its slots: resident + need <= total - margin
+    auto card_ok = [&](const std::pair<ggml_backend_dev_t, llama_loan_book::CardFacts> & c) {
+        return llama_loan_book::card_fits(c.second, lend_on_card(c.first));
+    };
+    // both rules: the reserve's own sanity (lend - need) and every card's bound
+    auto loan_fits_card = [&]() {
+        const bool sane = llama_loan_book::size_fits(need, lend);   // the reserve's own sanity
+        if (!sane) return false;
+        for (const auto & c : cards) {
+            if (!card_ok(c)) return false;
+        }
+        return true;
+    };
+    try {
+        resolve_fused_ops(mctx.get(), 1);
+        // no queued command may outlive the scheduler sched_new replaces below:
+        // the backend's synchronize() (in sched_reserve_size) does not finish the
+        // adapt queue, and sched_new frees the galloc's buffers at once.
+        llama_loan_book::drain_now();
+
+        // a sched with the loan chunk's node capacity, so the sizing below can split
+        // the graph (sched_reserve_size asserts the capacity, ggml-backend.cpp:2099-2111)
+        sched_new(max_nodes, cparams.pipeline_parallel);
+
+        // Round 20: the process's fdinfo is read HERE -- after sched_new above freed
+        // the old scheduler's compute buffers, after the drain, and before the lend.
+        // Reading it earlier would count the pre-sized compute buffer the loan is
+        // about to replace.
+        llama_loan_book::scan_fdinfo("/proc/self/fdinfo", fdinfo);
+        // the cards the loan can grow on: one entry a device that hosts an expert
+        // cache. The resident figure is taken now, before the lend; `need` follows
+        // the sizing. Round 20: the process's fdinfo figure, matched to the
+        // device by drm-pdev; round 24 sums the device's distinct client ids (the
+        // runtime opens two), so the figure is every xe client on this pdev. Several
+        // xe clients with no device pdev fall back to the ggml sum with a WARN, and
+        // a fdinfo figure under that sum is the tripwire (the process's own buffers
+        // are already evicted to GTT).
+        cards.clear();
+        bool tripwire = false;
+        // Round 21: the kernel's device-wide figure per card, on any xe render fd
+        // of the device's drm-pdev (round 24: the query is device-wide, so it does
+        // not need the client the figure is summed from). `used` counts the kernel's
+        // own objects AND every other client, so it is the rule's left side with a
+        // zero margin beyond it (round 22: round 21 subtracted used - fdinfo a second
+        // time and refused a loan on a card that had room); used - fdinfo is logged
+        // as information. fdinfo stays the per-process figure and the ggml sum the
+        // fallback when the query fails. The begin records each card's GTT and host
+        // banks as the eviction guard's baseline.
+        slot_loan_sums.clear();
+        for (const auto & ec : model.expert_caches) {
+            const ggml_backend_dev_t dev = ec->device();
+            bool seen = false;
+            for (const auto & c : cards) seen = seen || c.first == dev;
+            if (seen) continue;
+            ggml_backend_dev_props props = {};
+            ggml_backend_dev_get_props(dev, &props);
+            const size_t sum = resident_on(dev);
+            const llama_loan_book::ResidentRead rd =
+                llama_loan_book::read_resident(fdinfo, props.device_id, sum);
+            if (!rd.measured) {
+                LLAMA_LOG_WARN("%s: the card's residency is not the process's fdinfo (%s); "
+                               "falling back to the ggml buffer sum %.2f GiB\n", __func__,
+                               rd.why != nullptr ? rd.why : "-", sum / 1073741824.0);
+            }
+            if (rd.evicted) {
+                tripwire = true;
+                LLAMA_LOG_WARN("%s: the loan is refused: fdinfo vram0 %.2f GiB is below the ggml buffer sum "
+                               "%.2f GiB on the card -- the process's own buffers are already evicted to GTT, "
+                               "so the loan's reserve would build on an evicted process\n", __func__,
+                               rd.bytes / 1073741824.0, sum / 1073741824.0);
+            }
+            const llama_loan_book::FdinfoAgg agg = llama_loan_book::sum_fdinfo(fdinfo, props.device_id);
+            const llama_loan_book::CardQuery q = llama_loan_book::xe_query_card(agg.fd);
+            const size_t vram0 = agg.measured ? agg.vram0 : rd.bytes;
+            const size_t gtt   = agg.measured ? agg.gtt : 0;
+            const size_t used_beyond = llama_loan_book::used_beyond_fdinfo(q.ok, q.used, vram0);
+            const size_t card_total = q.ok ? q.total : props.memory_total;
+            if (!q.ok) {
+                LLAMA_LOG_WARN("%s: the kernel's memory-regions query failed (%s); the card rule falls back to "
+                               "fdinfo %.2f GiB and the fixed card margin %.2f GiB\n", __func__,
+                               q.why.empty() ? (agg.why != nullptr ? agg.why : "-") : q.why.c_str(),
+                               vram0 / 1073741824.0, card_margin / 1073741824.0);
+            }
+            // Round 22's eviction guard at the loan's begin: this card's fdinfo GTT
+            // and host-bank bytes become the BASELINE the end is judged against, so
+            // the process's other legitimate GTT (the runtime's command buffers and
+            // heaps, the stage ring, ids_host) is not a surplus. The begin judges no
+            // GTT growth (there is none yet) and does not shed on it; the VRAM
+            // shortfall at the begin is the tripwire above, which refuses.
+            size_t host_banks = 0;
+            for (const auto & ec2 : model.expert_caches) {
+                if (ec2->device() == dev) host_banks += ec2->host_bank_bytes();
+            }
+            const llama_loan_book::EvictionGuard g =
+                llama_loan_book::eviction_guard(vram0, gtt, sum, host_banks, gtt, host_banks);
+            if (g.gtt_over > 0) {
+                // cannot fire today (base == now); kept so the ledger's one shape is
+                // visible in the begin line rather than silently assumed
+                LLAMA_LOG_WARN("%s: the eviction guard's GTT baseline %.2f GiB, host banks %.2f GiB\n",
+                               __func__, gtt / 1073741824.0, host_banks / 1073741824.0);
+            }
+            slot_loan_sums.push_back(llama_context::slot_loan_card_base{dev, sum, vram0, gtt, host_banks, 0, rd.measured});
+            size_t max_bank = 0, ring = 0;
+            for (const auto & ec2 : model.expert_caches) {
+                if (ec2->device() != dev) continue;
+                max_bank = std::max(max_bank, ec2->max_bank_tensor_bytes());
+                ring     = std::max(ring, ec2->stream_ring_bytes());
+            }
+            const size_t first_touch = llama_loan_book::first_touch_bytes(ring_k, ring, max_bank);
+            cards.emplace_back(dev, llama_loan_book::CardFacts{card_total, rd.bytes, 0, 0,
+                                                               card_margin, sum, first_touch, rd.measured,
+                                                               q.used, prefill_growth, used_beyond, q.ok, gtt});
+        }
+        if (tripwire) {
+            if (!slot_loan_reserve(cparams.n_ubatch_reserve)) {
+                char p[160]; std::snprintf(p, sizeof(p), "the resident re-reserve after the evicted tripwire failed at %u tokens", cparams.n_ubatch_reserve); slot_loan_poison(p);
+            }
+            for (const auto & ec : model.expert_caches) ec->rebind(sched.get());
+            return false;
+        }
+
+        // the prompt's compute buffers, sized without allocating: the sum over the
+        // scheduler's buffers, for the graph a loan would build -- the tail layers'
+        // lent flag on, so the lend branch's tensors are in the measurement (one
+        // more MUL_MAT_ID dst tensor a chunk, ~0.64 GiB at 8,192 x 10 x 2,048 f32).
+        // Larger than the lend bytes -> refused, and the resident reserve comes
+        // back: no allocation escapes the plan (finding 5).
+        static const int mutate_loan_ctx_measure = [] {
+            const char * m = getenv("LLAMA_SLOT_LOAN_MUTATE");
+            return m != nullptr ? atoi(m) : 0;
+        }();
+        // Round 10, card finding 2: round 8's red case 3 skipped only the lent flag,
+        // which raises need instead of lowering it (the lent branch replaces the slot
+        // branch and drops the down tables, llama-graph.cpp:2510-2521). The red case
+        // now measures the graph at the resident chunk while the reserve allocates the
+        // prompt's chunk, a real under-count that `actual <= expect` rejects.
+        const uint32_t measure_ub = llama_loan_book::measure_tokens(mutate_loan_ctx_measure, cap, cparams.n_ubatch_reserve);
+        if (!llama_loan_book::measure_lent(mutate_loan_ctx_measure)) {
+            LLAMA_LOG_WARN("%s: LLAMA_SLOT_LOAN_MUTATE=3: the prompt's graph is sized at the resident chunk (%u), not the prompt's (%u) (the red case)\n", __func__, measure_ub, cap);
+        } else {
+            for (const auto & ec : model.expert_caches) {
+                ec->set_measure_lent(true);
+            }
+        }
+        {
+            std::vector<size_t> sizes(16, 0);   // GGML_SCHED_MAX_BACKENDS, ggml-backend.cpp:905
+            const uint32_t n_outputs = std::min(measure_ub, cparams.n_outputs_max);
+            auto * gf = graph_reserve(measure_ub, 1, n_outputs, mctx.get(), true, sizes.data());
+            if (!gf) {
+                LLAMA_LOG_WARN("%s: the loan could not size the prompt's graph\n", __func__);
+                need = SIZE_MAX;
+            } else {
+                for (size_t s : sizes) {
+                    need += s;
+                }
+            }
+            // each card's own share of the prompt's compute buffers: the scheduler's
+            // size for the backend on that card (the whole sum when no backend is there)
+            for (auto & c : cards) {
+                size_t n = 0;
+                bool found = false;
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    if (ggml_backend_get_device(backend_ptrs[i]) != c.first) continue;
+                    n = i < sizes.size() ? sizes[i] : 0;
+                    found = true;
+                    break;
+                }
+                c.second.need = found ? n : need;
+                for (auto & b : slot_loan_sums) {
+                    if (b.dev != c.first) continue;
+                    b.need = c.second.need;
+                    break;
+                }
+            }
+        }
+
+        // Round 17, the fixed-margin rule (operator's decision 2026-10-30): the
+        // lend must satisfy `lend - need >= kPeakReserve + kCardMargin`, and round
+        // 19 adds the card's own bound: after the lend frees its slots, the
+        // process's resident bytes plus this card's need must stay at or below the
+        // card's total minus the margin. If the ask's pick does not hold both, grow
+        // it one candidate tail layer at a time (option a: the chunk and the depth
+        // rate stay, the lend pays ~238 MiB a layer, read once from the file per
+        // process) until both hold or the tail runs out. A card's resident figure
+        // falls with each grown layer, so one growth serves both rules. Round 18:
+        // this call is INSIDE the sizing's try. It was outside after sched_new, so
+        // a throw left the context on the unreserved sizing scheduler, owner_sched
+        // dangling and the growth's host banks leaked; the catch below now takes the
+        // resident re-reserve and the rebind.
+        // Round 23: the previous loan's true shortfall is extra demand for THIS
+        // lend. The demand is `need + grow_by`, so the growth path (the same one
+        // the rules use) grows the lend until that much more headroom exists.
+        // Round 25 makes that two steps: first the demand; when the tail cannot
+        // reach it, the tail's full growth is kept if it still meets the loan's
+        // own `need`, and the refusal checks below compare the actual `need`. So a
+        // tail that cannot cover the shortfall costs a WARN, never a refusal, and
+        // `need` alone is still what decides a refusal.
+        const size_t demand = (need == SIZE_MAX || grow_by > SIZE_MAX - need) ? SIZE_MAX : need + grow_by;
+        if (need != SIZE_MAX && demand != SIZE_MAX && (!loan_fits_card() || grow_by > 0)) {
+            for (const auto & ec : model.expert_caches) {
+                const size_t before = ec->lend_bytes();
+                const size_t beside = lend - before;
+                llama_loan_book::CardFacts card;
+                for (const auto & c : cards) {
+                    if (c.first != ec->device()) continue;
+                    card = c.second;
+                    card.lend = lend_on_card(c.first) - before;   // the other caches on the card
+                    card.need = demand;                          // the shortfall's extra lend in the rule
+                    break;
+                }
+                if (!ec->extend_lend(demand, beside, card, need)) continue;
+                lend += ec->lend_bytes() - before;
+                if (loan_fits_card() && (grow_by == 0 || llama_loan_book::size_fits(demand, lend))) break;
+            }
+            if (grow_by > 0 && !llama_loan_book::size_fits(demand, lend)) {
+                LLAMA_LOG_WARN("%s: the eviction guard's shortfall %.2f GiB could not be covered by the "
+                               "lendable tail (the lend is %.2f GiB); the demand is not a refusal term, "
+                               "the loan's own rules still decide\n", __func__, grow_by / 1073741824.0, lend / 1073741824.0);
+            }
+        }
+    } catch (const std::exception & e) {
+        sized = false;
+        LLAMA_LOG_WARN("%s: the loan could not size the prompt's graph (%s); the resident reserve comes back\n", __func__, e.what());
+    } catch (...) {
+        sized = false;
+        LLAMA_LOG_WARN("%s: the loan could not size the prompt's graph; the resident reserve comes back\n", __func__);
+    }
+    for (const auto & ec : model.expert_caches) {
+        ec->set_measure_lent(false);
+    }
+    if (!sized) {
+        // the same recovery the refused size check takes: the resident re-reserve
+        // (it drains, then sched_new replaces the unreserved sizing scheduler) and
+        // the rebind, so owner_sched is never left on the destroyed one
+        if (!slot_loan_reserve(cparams.n_ubatch_reserve)) {
+            char p[160]; std::snprintf(p, sizeof(p), "the resident re-reserve after a failed sizing failed at %u tokens", cparams.n_ubatch_reserve); slot_loan_poison(p);
+        }
+        for (const auto & ec : model.expert_caches) {
+            ec->rebind(sched.get());
+        }
+        return false;
+    }
+    // Round 19 keeps the reserve's own sanity first: the plan must fit the freed
+    // lend bytes with both fixed margins left over (384 MiB peak + the card margin).
+    if (!llama_loan_book::size_fits(need, lend)) {
+        LLAMA_LOG_WARN("%s: the loan is refused: the prompt's compute buffers need %.2f GiB at %u tokens, the "
+                       "lendable slots give %.2f GiB, the fixed margin is %.3f GiB (384 MiB peak + 1 GiB card); "
+                       "the resident reserve comes back\n", __func__,
+                       need == SIZE_MAX ? -1.0 : need / 1073741824.0, cap, lend / 1073741824.0,
+                       llama_loan_book::kLendMargin / 1073741824.0);
+        if (!slot_loan_reserve(cparams.n_ubatch_reserve)) {
+            char p[160]; std::snprintf(p, sizeof(p), "the resident re-reserve after a refused loan failed at %u tokens", cparams.n_ubatch_reserve); slot_loan_poison(p);
+        }
+        for (const auto & ec : model.expert_caches) {
+            ec->rebind(sched.get());
+        }
+        return false;
+    }
+    // Round 22: the card's rule per card, `used - lend + need + first touch +
+    // allowance <= total` (zero margin; `used` already holds every other client
+    // and the kernel's objects). The ggml sum and fdinfo vram0 are printed beside
+    // it, and used - fdinfo as the other clients' share, information. It is
+    // checked after the growth had its chance; one WARN names every figure.
+    for (const auto & c : cards) {
+        if (card_ok(c)) continue;
+        const llama_loan_book::CardFacts f = c.second;
+        const size_t freed = lend_on_card(c.first);
+        const size_t base  = f.query_ok ? f.used : f.resident;
+        const size_t after = freed >= base ? 0 : base - freed;
+        const size_t extra = (need == SIZE_MAX ? 0 : need) + f.first_touch + f.allowance;
+        LLAMA_LOG_WARN("%s: the loan is refused: the prompt's compute buffers need %.2f GiB at %u tokens, the "
+                       "lendable slots give %.2f GiB; %s %.2f GiB on the card (ggml buffer sum %.2f GiB, fdinfo "
+                       "vram0 %.2f GiB, fdinfo gtt %.2f GiB, used - fdinfo %.2f GiB%s), %.2f GiB after the lend "
+                       "frees the slots, the cold ring's first touch %.2f GiB, the prefill growth allowance "
+                       "%.2f GiB, the card's total is %.2f GiB, so %s - lend + need + first touch + allowance "
+                       "(%.2f GiB) must stay at or below the total (the resident reserve comes back)\n", __func__,
+                       need == SIZE_MAX ? -1.0 : need / 1073741824.0, cap, lend / 1073741824.0,
+                       f.query_ok ? "kernel used" : (f.measured ? "fdinfo vram0" : "fallback ggml sum"),
+                       base / 1073741824.0, f.sum / 1073741824.0, f.resident / 1073741824.0,
+                       f.gtt / 1073741824.0, f.used_beyond / 1073741824.0,
+                       f.query_ok ? " (used - fdinfo, information)" : " (query failed)",
+                       after / 1073741824.0, f.first_touch / 1073741824.0, f.allowance / 1073741824.0,
+                       f.total / 1073741824.0, f.query_ok ? "used" : "fdinfo vram0",
+                       (after + extra) / 1073741824.0);
+        if (!slot_loan_reserve(cparams.n_ubatch_reserve)) {
+            char p[160]; std::snprintf(p, sizeof(p), "the resident re-reserve after a refused loan failed at %u tokens", cparams.n_ubatch_reserve); slot_loan_poison(p);
+        }
+        for (const auto & ec : model.expert_caches) {
+            ec->rebind(sched.get());
+        }
+        return false;
+    }
+
+    // the lend: tables relayed, then the tail slot buffers freed, then the
+    // prompt chunk's reserve, then the caches rebound to the new scheduler
+    // finding 5 (third review): a cache with no lend set (lend_bytes 0 -- the
+    // other card under a layer split) is not lent; its lend() returns false and
+    // the AND below would refuse a good loan.
+    bool lent = true;
+    for (const auto & ec : model.expert_caches) {
+        if (!llama_loan_book::loan_cache(ec->lend_bytes())) continue;
+        lent = ec->lend() && lent;
+    }
+    if (!lent) {
+        LLAMA_LOG_WARN("%s: the lend failed; the resident reserve comes back\n", __func__);
+        for (const auto & ec : model.expert_caches) {
+            if (ec->loan_out()) ec->refill(false);
+            ec->rebind(sched.get());
+        }
+        if (!slot_loan_reserve(cparams.n_ubatch_reserve)) {
+            char p[160]; std::snprintf(p, sizeof(p), "the resident re-reserve after a failed lend failed at %u tokens", cparams.n_ubatch_reserve); slot_loan_poison(p);
+        }
+        for (const auto & ec : model.expert_caches) {
+            ec->rebind(sched.get());
+        }
+        return false;
+    }
+    for (const auto & ec : model.expert_caches) {
+        ec->drop_tail_buffer();
+    }
+    // the recovery every failure below shares: the resident re-reserve first (it
+    // frees the VRAM the refill's tail buffer needs), each out loan's refill
+    // without its check, the caches rebound, then a non-lent reserve again --
+    // without the last one the next prefill reallocates through the buffer type.
+    auto put_back = [&]() {
+        if (!slot_loan_reserve(cparams.n_ubatch_reserve)) {
+            char p[160]; std::snprintf(p, sizeof(p), "the resident re-reserve after a failed loan failed at %u tokens", cparams.n_ubatch_reserve); slot_loan_poison(p);
+        }
+        bool ok = true;
+        for (const auto & ec : model.expert_caches) {
+            if (ec->loan_out()) ok = ec->refill(false) && ok;
+            ec->rebind(sched.get());
+        }
+        if (ok && !slot_loan_reserve(cparams.n_ubatch_reserve)) {
+            char p[160]; std::snprintf(p, sizeof(p), "the resident re-reserve after the failed loan's refill failed at %u tokens", cparams.n_ubatch_reserve); slot_loan_poison(p);
+        }
+        return ok;
+    };
+    // Round 9, review item 1: no device FREE figure here -- OpenCL has none that
+    // is real (ggml-opencl.cpp's get_memory returns total - 1 GiB). Round 19 uses
+    // the device's TOTAL (its global mem size) and the process's own resident
+    // buffers, both logged here with the freed bytes, the prompt's need, the
+    // reserve margin and the card margin.
+    // Round 20, review low: every card, not cards.front() -- one INFO line a card.
+    if (cards.empty()) {
+        LLAMA_LOG_INFO("%s: the lend frees %.2f GiB, the prompt's buffers need %.2f GiB, the reserve margin is %.3f GiB; "
+                       "no card figure (the lend-vs-need rule alone)\n",
+                       __func__, lend / 1073741824.0, need == SIZE_MAX ? -1.0 : need / 1073741824.0,
+                       llama_loan_book::kLendMargin / 1073741824.0);
+    }
+    for (const auto & c : cards) {
+        const llama_loan_book::CardFacts f = c.second;
+        const size_t base  = f.query_ok ? f.used : f.resident;
+        LLAMA_LOG_INFO("%s: the lend frees %.2f GiB, the prompt's buffers need %.2f GiB, the reserve margin is %.3f GiB; "
+                       "%s %.2f GiB on the card (fdinfo vram0 %.2f GiB, fdinfo gtt %.2f GiB, used - fdinfo "
+                       "%.2f GiB), the ggml buffer sum %.2f GiB, the cold ring's first touch %.2f GiB, the prefill "
+                       "growth allowance %.2f GiB, the card's total is %.2f GiB, the %s is %.2f GiB%s\n", __func__,
+                       lend / 1073741824.0, need == SIZE_MAX ? -1.0 : need / 1073741824.0,
+                       llama_loan_book::kLendMargin / 1073741824.0,
+                       f.query_ok ? "kernel used" : (f.measured ? "fdinfo vram0" : "fallback ggml sum"),
+                       base / 1073741824.0, f.resident / 1073741824.0, f.gtt / 1073741824.0,
+                       f.used_beyond / 1073741824.0,
+                       f.sum / 1073741824.0, f.first_touch / 1073741824.0, f.allowance / 1073741824.0,
+                       f.total / 1073741824.0, f.query_ok ? "margin beyond used" : "card margin",
+                       f.query_ok ? 0.0 : f.margin / 1073741824.0,
+                       f.query_ok ? " (zero: used holds every client)" : " (query failed)");
+    }
+    if (!slot_loan_reserve(cap)) {
+        LLAMA_LOG_ERROR("%s: the loan's reserve failed; putting the slots back\n", __func__);
+        put_back();
+        return false;
+    }
+    // Round 8, review item 2: the reserve's actual bytes against the sizing's
+    // expectation. MUTATE=3 skips the lent measurement (need is under-counted)
+    // while lend() still sets the lent flags the reserve's graph is built from,
+    // so the actual sum is the healthy one and this line fires deterministically;
+    // without it the reserve succeeded and the red arm ran as a healthy loan.
+    {
+        size_t actual = 0;
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            actual += ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+        }
+        if (!llama_loan_book::reserve_matches(need, actual)) {
+            LLAMA_LOG_ERROR("%s: the prompt's reserve allocated %.2f GiB against the sized expectation %.2f GiB "
+                            "(LLAMA_SLOT_LOAN_MUTATE=3 sizes at the resident chunk); putting the slots back\n", __func__,
+                            actual / 1073741824.0, need == SIZE_MAX ? -1.0 : need / 1073741824.0);
+            put_back();
+            return false;
+        }
+    }
+    for (const auto & ec : model.expert_caches) {
+        ec->rebind(sched.get());
+    }
+    if (info) {
+        info->out = true;
+        info->reserve_bytes = need;
+        for (const auto & ec : model.expert_caches) {
+            info->layers += ec->lend_layers();
+            info->slots  += ec->lend_slots();
+            info->bytes  += ec->lend_bytes();
+        }
+    }
+    // Round 19: the line carries the card's own figures too -- its total, the
+    // process's resident bytes before the lend, the resident after the lend plus
+    // the prompt's need against the card's total minus the margin. That sum is the
+    // number the card rule bounds; the window reads it.
+    // Round 20, review low: every card gets its own loan out line. The rule's
+    // figures are all here -- the fdinfo vram0 figure, the ggml buffer sum, the
+    // prompt's need, the lend, the cold ring's first touch, the card's total and
+    // the margin -- so the owed window reads the rule's own arithmetic.
+    if (cards.empty()) {
+        LLAMA_LOG_WARN("%s: loan out at %u tokens: %d layers, %lld slots, %.2f GiB freed, prompt buffers %.2f GiB, "
+                       "margin %.2f GiB (lend - need, the reserve margin is %.3f GiB); "
+                       "fdinfo vram0 -, ggml buffer sum -, first touch -, card total -, margin %.2f GiB; "
+                       "size+lend+reserve took %.1f ms\n", __func__, cap, (int) (info ? info->layers : 0),
+                       (long long) (info ? info->slots : 0), lend / 1073741824.0, need / 1073741824.0,
+                       (lend - need) / 1073741824.0, llama_loan_book::kLendMargin / 1073741824.0,
+                       card_margin / 1073741824.0, (ggml_time_us() - t_loan) / 1000.0);
+    }
+    for (const auto & c : cards) {
+        const llama_loan_book::CardFacts f = c.second;
+        const size_t freed = lend_on_card(c.first);
+        const size_t base  = f.query_ok ? f.used : f.resident;
+        const size_t after = freed >= base ? 0 : base - freed;
+        const size_t extra = (need == SIZE_MAX ? 0 : need) + f.first_touch + f.allowance;
+        const size_t reserve = f.query_ok ? 0 : f.margin;
+        const size_t limit = f.total >= reserve ? f.total - reserve : 0;
+        LLAMA_LOG_WARN("%s: loan out at %u tokens: %d layers, %lld slots, %.2f GiB freed, prompt buffers %.2f GiB, "
+                       "margin %.2f GiB (lend - need, the reserve margin is %.3f GiB); "
+                       "%s %.2f GiB, ggml buffer sum %.2f GiB, fdinfo vram0 %.2f GiB, fdinfo gtt %.2f GiB, "
+                       "used - fdinfo %.2f GiB, first touch %.2f GiB, prefill growth allowance %.2f GiB, "
+                       "the card's total is %.2f GiB, %s %.2f GiB; %s after %.2f GiB + need + first touch + "
+                       "allowance = %.2f GiB <= total (%.2f GiB) by %.2f GiB; size+lend+reserve took %.1f ms\n",
+                       __func__, cap,
+                       (int) (info ? info->layers : 0), (long long) (info ? info->slots : 0),
+                       lend / 1073741824.0, need == SIZE_MAX ? -1.0 : need / 1073741824.0, (lend - need) / 1073741824.0,
+                       llama_loan_book::kLendMargin / 1073741824.0,
+                       f.query_ok ? "kernel used" : (f.measured ? "fdinfo vram0" : "fallback ggml sum"),
+                       base / 1073741824.0, f.sum / 1073741824.0, f.resident / 1073741824.0,
+                       f.gtt / 1073741824.0, f.used_beyond / 1073741824.0,
+                       f.first_touch / 1073741824.0, f.allowance / 1073741824.0,
+                       f.total / 1073741824.0,
+                       f.query_ok ? "margin beyond used (zero)" : "card margin", reserve / 1073741824.0,
+                       f.query_ok ? "used" : "fdinfo vram0", after / 1073741824.0,
+                       (after + extra) / 1073741824.0, limit / 1073741824.0,
+                       (after + extra <= limit) ? (limit - after - extra) / 1073741824.0 : 0.0,
+                       (ggml_time_us() - t_loan) / 1000.0);
+    }
+    return true;
+}
+
+bool llama_context::slot_loan_end(llama_slot_loan_info * info) {
+    if (!slot_loan_lent()) {
+        return !slot_loan_poisoned;   // nothing was lent; a poisoned state is reported
+    }
+    if (info) {
+        *info = {};
+    }
+    static const int mutate_loan_ctx = [] {
+        const char * m = getenv("LLAMA_SLOT_LOAN_MUTATE");
+        return m != nullptr ? atoi(m) : 0;
+    }();
+    // Round 22's eviction guard at the loan's end, BEFORE the resident re-reserve
+    // and the refill. The begin recorded each card's GTT and host banks; the end
+    // judges the growth since that baseline, so the process's other legitimate GTT
+    // (the runtime's command buffers and heaps, the stage ring, ids_host) is not a
+    // surplus and one unexplained surplus does not shed. The expected VRAM is the
+    // begin's ggml sum minus this card's lend, PLUS the loan's compute reserve
+    // (`need`, resident now) and the non-sum residency measured at the begin
+    // (vram0 - sum) -- round 21's sum - lend alone was blind to those (up to ~9 GiB
+    // of eviction unseen). The guard acts on that shortfall alone; the GTT growth is
+    // logged beside it. A clean loan clears the shed (round 22: round 21's one trip
+    // shrank the lend for the process's lifetime). The knob
+    // LLAMA_SLOT_LOAN_EVICTION_GUARD=0 disables the guard.
+    // Round 23: the end guard has a noise floor. Its expected VRAM is exact tensor
+    // bytes while fdinfo vram0 is BO residency; allocator rounding, reserve_matches'
+    // allowed under-run and the reserve's own rounding put vram0 a few MiB below
+    // `expected` on a healthy loan, so a sub-floor shortfall is no evidence. A true
+    // one (>= the floor) feeds the next loan's sizing as extra lend, never a shed
+    // and never a refusal; the state is cleared after a clean loan and taken (and
+    // zeroed) at every begin.
+    const size_t shed_floor = llama_loan_book::resolve_shed_floor(getenv("LLAMA_SLOT_LOAN_SHED_FLOOR_MIB"));
+    bool guard_tripped = false;
+    if (!llama_loan_book::resolve_eviction_guard(getenv("LLAMA_SLOT_LOAN_EVICTION_GUARD"))) {
+        LLAMA_LOG_WARN("%s: the eviction guard is off (LLAMA_SLOT_LOAN_EVICTION_GUARD); no shortfall is measured\n", __func__);
+        slot_loan_shed = llama_loan_book::shed_after_loan(slot_loan_shed, false);
+    } else {
+        llama_loan_book::FdinfoScan scan;
+        llama_loan_book::scan_fdinfo("/proc/self/fdinfo", scan);
+        size_t short_beyond = 0;   // the true shortfall over every card, out of the loop
+        for (const auto & base : slot_loan_sums) {
+            const ggml_backend_dev_t dev = base.dev;
+            ggml_backend_dev_props props = {};
+            ggml_backend_dev_get_props(dev, &props);
+            const llama_loan_book::FdinfoAgg agg = llama_loan_book::sum_fdinfo(scan, props.device_id);
+            if (!agg.measured) {
+                LLAMA_LOG_WARN("%s: the eviction guard has no fdinfo figure at the loan's end (%s)\n", __func__,
+                               agg.why != nullptr ? agg.why : "-");
+                continue;
+            }
+            const llama_loan_book::CardQuery q = llama_loan_book::xe_query_card(agg.fd);
+            size_t host_banks = 0, lend_card = 0;
+            for (const auto & ec : model.expert_caches) {
+                if (ec->device() != dev) continue;
+                host_banks += ec->host_bank_bytes();
+                lend_card  += ec->lend_bytes();
+            }
+            const size_t non_sum = base.vram0 > base.sum ? base.vram0 - base.sum : 0;
+            const size_t expected = (base.sum > lend_card ? base.sum - lend_card : 0) + base.need + non_sum;
+            const llama_loan_book::EvictionGuard g =
+                llama_loan_book::eviction_guard(agg.vram0, agg.gtt, expected, host_banks, base.gtt, base.banks);
+            // the true shortfall: at or above the floor, and the next lend's growth
+            const size_t short_card = llama_loan_book::growth_from_shortfall(g.vram_short, shed_floor);
+            short_beyond = std::max(short_beyond, short_card);
+            if (short_card > 0) guard_tripped = true;
+            LLAMA_LOG_WARN("%s: the eviction guard at the loan's end %s: fdinfo vram0 %.2f GiB against the "
+                           "expected %.2f GiB (the begin's ggml sum %.2f GiB minus the lend %.2f GiB, plus the "
+                           "reserve %.2f GiB and the non-sum residency %.2f GiB; short %.2f GiB, floor %.2f GiB), "
+                           "gtt %.2f GiB against the begin's baseline %.2f GiB (growth %.2f GiB, host banks "
+                           "+%.2f GiB, over %.2f GiB), kernel used %.2f GiB%s, used - fdinfo %.2f GiB%s\n", __func__,
+                           short_card > 0 ? "FEEDS THE NEXT LEND (grows it by the shortfall; no shed, no refusal)"
+                                             : "does not grow the lend (below the floor)",
+                           agg.vram0 / 1073741824.0, expected / 1073741824.0, base.sum / 1073741824.0,
+                           lend_card / 1073741824.0, base.need / 1073741824.0, non_sum / 1073741824.0,
+                           g.vram_short / 1073741824.0, shed_floor / 1073741824.0,
+                           agg.gtt / 1073741824.0, base.gtt / 1073741824.0,
+                           g.gtt_growth / 1073741824.0, g.bank_growth / 1073741824.0, g.gtt_over / 1073741824.0,
+                           q.ok ? q.used / 1073741824.0 : 0.0, q.ok ? "" : " (query failed)",
+                           q.ok ? llama_loan_book::used_beyond_fdinfo(q.ok, q.used, agg.vram0) / 1073741824.0 : 0.0,
+                           q.ok ? "" : " (query failed)");
+        }
+        slot_loan_shed = llama_loan_book::shed_after_loan(short_beyond, guard_tripped);
+    }
+    // The resident chunk's reserve first: it frees the VRAM the refill's tail
+    // buffer needs, and no decode graph runs in the loan's range. (4: skipped --
+    // the red case, the tail buffer alloc fails because the loan's reserve holds it)
+    // It can fail without throwing (finding 4): the refill then reports false and
+    // the loan stays out; the caller's request-start check refuses every request.
+    const bool back = mutate_loan_ctx != 4 && slot_loan_reserve(cparams.n_ubatch_reserve);
+    if (!back) {
+        // Round 10, card finding 1: the drain precedes every free on a path that
+        // exits. The tail buffer was freed at the lend; queued commands over it
+        // (a graph, the adapt and bank-stream copies) must finish before the
+        // poison's drain runs against memory that is already released.
+        // Round 11: the healthy return's first act is slot_loan_reserve, whose
+        // sched_reserve synchronizes the scheduler (compute and bank streams) before
+        // it frees anything. A failed return skips it, so do the scheduler's own
+        // synchronize here too, then the full drain (which adds the adapt queue):
+        // the exit's _Exit then tears down an idle device. A skipped re-reserve
+        // (MUTATE=4) leaves the loan's chunk live; nothing is freed after this
+        // drain before _Exit.
+        if (sched) {
+            try {
+                ggml_backend_sched_synchronize(sched.get());
+            } catch (...) {
+            }
+        }
+        llama_loan_book::drain_now();
+        // finding 4 (third review): a false return here is not just a slower
+        // path -- if the refill then succeeds, the loan is "returned" while the
+        // scheduler still holds the prompt's chunk reserve, and the next prefill
+        // reallocates through the buffer type. Record it and refuse.
+        char p[160]; std::snprintf(p, sizeof(p), "the resident re-reserve at the loan's return failed at %u tokens", cparams.n_ubatch_reserve); slot_loan_poison(p);
+    }
+    for (const auto & ec : model.expert_caches) {
+        ec->rebind(sched.get());
+    }
+    // round 7: "file" is on (the gate's direct form) and the cache reads the mode;
+    // "0"/"off" is off. Parsed in the loan book so a typo cannot turn it off silently.
+    static const bool verify_rows = llama_loan_book::verify_ref(getenv("LLAMA_SLOT_LOAN_VERIFY")) != llama_loan_book::VerifyRef::Off;
+    // finding 5 (third review): only a cache that lent is asked to refill; a
+    // cache with no loan returns false from refill() and would fail a good return
+    bool ok = back;
+    for (const auto & ec : model.expert_caches) {
+        if (!ec->loan_out()) continue;
+        ok = ec->refill(verify_rows) && ok;
+    }
+    // the resident reserve was sized with the lent graph (the lend branch, the
+    // slot branch left out); now that the slots are back, reserve once more so
+    // the next graph is the non-lent shape and does not reallocate through the
+    // buffer type. The re-reserve makes a new scheduler: rebind again. Not on a
+    // failed refill: the loan stays out and every request is refused until the
+    // process is restarted (the slot bytes are not the file's).
+    if (ok) {
+        // the resident reserve was sized with the lent graph (the lend branch,
+        // the slot branch left out); now that the slots are back, reserve once
+        // more so the next graph is the non-lent shape. Not on a failed refill.
+        if (!slot_loan_reserve(cparams.n_ubatch_reserve)) {
+            char p[160]; std::snprintf(p, sizeof(p), "the resident re-reserve after the refill failed at %u tokens", cparams.n_ubatch_reserve); slot_loan_poison(p);
+            ok = false;
+        } else {
+            for (const auto & ec : model.expert_caches) {
+                ec->rebind(sched.get());
+            }
+        }
+    }
+    if (info) {
+        for (const auto & ec : model.expert_caches) {
+            info->layers += ec->lend_layers();
+            info->slots  += ec->lend_slots();
+            info->bytes  += ec->lend_bytes();
+        }
+    }
+    LLAMA_LOG_INFO("%s: loan returned: %d layers, %lld slots, %.2f GiB; refill+verify %s\n", __func__,
+                   (int) (info ? info->layers : 0), (long long) (info ? info->slots : 0), info ? info->bytes / 1073741824.0 : 0.0,
+                   ok ? "ok" : "FAILED");
+    return ok;
+}
+
+bool llama_model_slot_loan_info(const llama_model * model, llama_slot_loan_info * info) {
+    if (model == nullptr || info == nullptr) {
+        return false;
+    }
+    *info = {};
+    for (const auto & ec : model->expert_caches) {
+        info->layers += ec->lend_layers();
+        info->slots  += ec->lend_slots();
+        info->bytes  += ec->lend_bytes();
+        info->out    = info->out || ec->loan_out();
+    }
+    return !model->expert_caches.empty();
+}
+
+bool llama_context_slot_loan_begin(llama_context * ctx, uint32_t n_tokens) {
+    llama_slot_loan_info info{};
+    const bool ok = ctx->slot_loan_begin(n_tokens, &info);
+    if (ok && info.out) {
+        LLAMA_LOG_INFO("%s: loan begin %u tokens, %lld slots\n", __func__, n_tokens, (long long) info.slots);
+    }
+    return ok;
+}
+
+bool llama_context_slot_loan_end(llama_context * ctx) {
+    llama_slot_loan_info info{};
+    return ctx->slot_loan_end(&info);
+}
+
+bool llama_context_slot_loan_out(llama_context * ctx) {
+    return ctx->slot_loan_out();
+}
+
+const char * llama_context_slot_loan_state(llama_context * ctx) {
+    return ctx->slot_loan_state();
+}
+
+void llama_context::flush_draft_trace() {
+    auto & t = llama_expert_route_trace::instance();
+    for (const auto & r : draft_trace_pending) {
+        t.event_graph(LLAMA_EXPERT_ROUTE_DRAFT, r.first_pos, r.n_tokens, r.tokens, r.il, r.ids);
+    }
+    draft_trace_pending.clear();
+}
+
+// ARC-LAB: LLAMA_SYNC_TRIM bit mask (default 2 since patch 0094; 0 = upstream behaviour): 1 = skip a
+// context synchronize when the context queued nothing since its last one,
+// 2 = KV-cache rotation matrices kept on the device (llama-kv-cache.cpp),
+// 4 = the backend-sampled ids of a batch read with one copy instead of one per row
+int llama_sync_trim() {
+    static const int v = [] {
+        const char * e = getenv("LLAMA_SYNC_TRIM");
+        return e ? atoi(e) : 2;   // 0094: bit 2 on by default (measured gain, exact)
+    }();
+    return v;
+}
+
 void llama_context::synchronize() {
     if (!sched) {
         return;
     }
 
+    // ARC-LAB: LLAMA_SYNC_TRIM bit 1: every getter (logits, sampled tokens,
+    // nextn rows, ...) synchronizes, and the device's one in-order queue is
+    // shared by all contexts. With nothing queued by this context since its
+    // last synchronize, its results are already complete: skip the device wait.
+    if ((llama_sync_trim() & 1) && !sync_pending && !cparams.pipeline_parallel) {
+        return;
+    }
+    sync_pending = false;
+
     ggml_backend_sched_synchronize(sched.get());
+
+    // the MTP trace record's ids are complete now: write it beside the logits
+    // copy, after the one synchronize, never a second wait
+    if (!draft_trace_pending.empty()) {
+        flush_draft_trace();
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -987,6 +1900,7 @@ bool llama_context::memory_update(bool optimize) {
 
     // if the memory module did any computation, we have to reserve a new worst-case graph
     {
+        llama_kv_reserve_scope cap(cparams.n_kv_reserve);
         const auto mctx = memory->init_full();
         if (!mctx) {
             throw std::runtime_error("failed to initialize memory context");
@@ -1504,6 +2418,28 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// LLAMA_DECODE_TIMING=1: the host's time in decode() by phase, summed per
+// context type, logged and reset every 100 decodes (measurement)
+namespace {
+struct decode_timing {
+    int64_t n = 0, reused = 0, built = 0;
+    int64_t t_total = 0, t_pre = 0, t_step = 0, t_build = 0, t_alloc = 0, t_inputs = 0, t_compute = 0, t_post = 0;
+};
+static bool decode_timing_on() {
+    static const bool on = [] { const char * e = getenv("LLAMA_DECODE_TIMING"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+static decode_timing g_dt[8];
+static decode_timing * g_dt_cur = nullptr;
+static void decode_timing_log(int type, const decode_timing & d) {
+    const double n = d.n > 0 ? (double) d.n : 1.0;
+    LLAMA_LOG_WARN("decode timing (ctx type %d): %lld decodes, %lld reused / %lld built graphs; us per decode: total %.0f, "
+                   "pre %.0f, expert step %.0f, build %.0f, alloc %.0f, inputs %.0f, compute %.0f, post %.0f\n",
+                   type, (long long) d.n, (long long) d.reused, (long long) d.built, d.t_total / n, d.t_pre / n, d.t_step / n,
+                   d.t_build / n, d.t_alloc / n, d.t_inputs / n, d.t_compute / n, d.t_post / n);
+}
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1518,6 +2454,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    decode_timing * dt = g_dt_cur;
+    int64_t dt_t = dt ? ggml_time_us() : 0;
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -1529,7 +2467,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        if (dt) dt->reused++;
     } else {
+        if (dt) dt->built++;
         gf_res_prev_active = nullptr;
         res->reset();
 
@@ -1548,11 +2488,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        if (dt) { const int64_t t = ggml_time_us(); dt->t_build += t - dt_t; dt_t = t; }
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        if (dt) { const int64_t t = ggml_time_us(); dt->t_alloc += t - dt_t; dt_t = t; }
 
         gf_res_prev_active = res;
     }
@@ -1562,12 +2504,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        if (dt) dt_t = ggml_time_us();
         res->set_inputs(&ubatch);
+        if (dt) { const int64_t t = ggml_time_us(); dt->t_inputs += t - dt_t; dt_t = t; }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (dt) dt->t_compute += ggml_time_us() - dt_t;
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1625,6 +2570,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     sched_reserve();
 
     n_queued_tokens += n_tokens;
+    sync_pending = true;
 
     // reserve output buffer
     if (output_reserve(n_tokens) < n_tokens) {
@@ -1819,6 +2765,12 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    // a previous draft graph's async ids are still in flight and this graph
+    // reuses its tensors: the caller did not synchronize (get_embeddings_nextn
+    // does), so wait once here. Normally empty, nothing extra.
+    if (!draft_trace_pending.empty() && llama_expert_route_trace_enabled()) {
+        synchronize();
+    }
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -1828,6 +2780,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
+
+    const bool    dt_on = decode_timing_on();
+    const int64_t dt_t0 = dt_on ? ggml_time_us() : 0;
+    decode_timing * dt  = dt_on ? &g_dt[(int) cparams.ctx_type & 7] : nullptr;
+    g_dt_cur = dt;
+    struct dt_end_t {
+        decode_timing * dt; int64_t t0; int type;
+        ~dt_end_t() { if (dt) { dt->t_total += ggml_time_us() - t0; if (++dt->n % 100 == 0) { decode_timing_log(type, *dt); *dt = decode_timing{}; } } }
+    } dt_end_ { dt, dt_t0, (int) cparams.ctx_type };
 
     if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
@@ -1908,6 +2869,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         t_compute_start_us = ggml_time_us();
     }
     n_queued_tokens += n_tokens_all;
+    sync_pending = true;
 
     output_swaps.clear();
     embd_batch_idxs.clear();
@@ -1921,8 +2883,38 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    // the compute buffers hold n_ubatch x n_kv_reserve token-cells: a batch that ends
+    // deeper in the cache takes smaller ubatches (the batch's last position stands
+    // for the cells its graphs reach). A prefill-slot-loan's resident ubatch caps it
+    // too: a graph larger than the reserve would reallocate through the buffer type
+    // and escape the loan (ggml-alloc.c:927-941).
+    const uint32_t ub_cap = llama_loan_book::ubatch_cap(cparams.n_ubatch, reserve_ubatch);
+    uint32_t n_ubatch_eff = ub_cap;
+    if (cparams.n_kv_reserve > 0) {
+        const llama_batch & b = balloc->get_batch();
+        llama_pos p_end = 0;
+        for (int32_t i = 0; i < b.n_tokens; ++i) {
+            p_end = std::max(p_end, b.pos[i] + 1);
+        }
+        const uint64_t cells  = GGML_PAD((uint64_t) std::max<llama_pos>(p_end, 1), 256);
+        // the reserve holds ub_cap x n_kv_reserve cells, not n_ubatch x n_kv_reserve: under a
+        // prefill-slot-loan the two differ (2048 reserved against an 8192 ubatch), and a budget
+        // sized off n_ubatch would take a graph several times the reserve -- ggml-alloc then
+        // reallocates through the buffer type with the lent slots' VRAM in the graph's range
+        const uint64_t budget = llama_loan_book::cell_budget(ub_cap, cparams.n_kv_reserve);
+        // never below a split's indivisible tail: every sequence's last n_rs_seq + 1 tokens
+        // in one ubatch (split_equal's n_keep_tail), so a small cap cannot abort the split
+        const uint64_t floor_u = std::min<uint64_t>(ub_cap, (uint64_t) cparams.n_seq_max * (cparams.n_rs_seq + 1) + 1);
+        n_ubatch_eff = (uint32_t) std::max<uint64_t>(floor_u, std::min<uint64_t>(ub_cap, budget / cells));
+        static const bool log_cut = getenv("LLAMA_KV_RESERVE_LOG") != nullptr;
+        if (log_cut && n_ubatch_eff < ub_cap && (uint32_t) b.n_tokens > n_ubatch_eff) {
+            LLAMA_LOG_INFO("%s: %d tokens to position %d: ubatches of %u (n_kv_reserve %u)\n", __func__,
+                           b.n_tokens, p_end, n_ubatch_eff, cparams.n_kv_reserve);
+        }
+    }
+
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
+        mctx = memory->init_batch(*balloc, n_ubatch_eff, embd_all);
         if (!mctx) {
             return -2;
         }
@@ -1999,7 +2991,100 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
+        // the expert cache: swaps whose bytes are staged land now, between
+        // graphs; decode tokens are counted toward the next adapt
+        if (dt && n_outputs_prev == 0) dt->t_pre += ggml_time_us() - dt_t0;   // the first ubatch: everything before it
+        const int64_t dt_s0 = dt ? ggml_time_us() : 0;
+        // one cache per card under a layer split: each counts its own layers'
+        // ids and swaps on its own queue; the first context to decode drives
+        // them all (each keeps that context's scheduler as its owner)
+        llama_expert_cache::step(model.expert_caches, sched.get(), ubatch.n_tokens);
+        if (dt) dt->t_step += ggml_time_us() - dt_s0;
+
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        if (res) {
+            const bool all_outputs = n_outputs_all == n_tokens_all && !output_all;
+            const int32_t first_pos = ubatch.pos != nullptr ? ubatch.pos[0] : -1;
+            for (const auto & ec : model.expert_caches) {
+                ec->after_graph(sched.get(), ubatch.n_tokens, ubatch.token, first_pos, all_outputs);
+            }
+            // an MTP draft context: no expert cache covers its one MoE layer,
+            // so its routed ids come from the graph's output instead. The read
+            // is issued behind the graph without a wait and the record is
+            // written at the context's synchronize (llama_get_embeddings_nextn
+            // and the logits path call it). A caller that decodes again without
+            // a synchronize gets one at decode's start, because the next graph
+            // reuses these tensors; that is the only extra wait, never one a
+            // graph.
+            //
+            // NOT ggml_backend_tensor_get_async: on this series' OpenCL backend
+            // that is not async. Its iface.get_tensor_async is the NULL slot
+            // beside an empty stub (ggml-opencl.cpp:11471 and :9043), so
+            // ggml-backend.cpp:426-428 falls back to synchronize + a blocking
+            // get, and the read would stall the draft graph. The backend's own
+            // batch entry point (patch 0032; llama-expert-cache.cpp uses it for
+            // its ids) enqueues CL_FALSE reads on the graph's queue; a backend
+            // without it keeps the blocking read, and the A/B prices it.
+            if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && llama_expert_route_trace_enabled()) {
+                auto & t = llama_expert_route_trace::instance();
+                if (t.opened && !res->get_route_ids().empty()) {
+                    draft_trace_record r;
+                    r.first_pos = first_pos;
+                    r.n_tokens  = ubatch.n_tokens;
+                    if (ubatch.token != nullptr) {
+                        r.tokens.assign(ubatch.token, ubatch.token + ubatch.n_tokens);
+                    }
+                    struct pending_read { ggml_backend_t backend; const ggml_tensor * tensor; size_t bytes; };
+                    std::vector<pending_read> reads;   // one a route id, r's order
+                    for (const auto & rt : res->get_route_ids()) {
+                        ggml_tensor * rids = rt.second;
+                        if (rids == nullptr || rids->buffer == nullptr) {
+                            continue;
+                        }
+                        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), rids);
+                        if (backend == nullptr) {
+                            continue;
+                        }
+                        r.il.push_back(rt.first);
+                        r.ids.emplace_back((size_t) ggml_nelements(rids));
+                        reads.push_back({backend, rids, r.ids.back().size() * sizeof(int32_t)});
+                    }
+                    if (!r.il.empty()) {
+                        // the dsts live in the pending record, so they stay
+                        // valid until the synchronize that writes it
+                        draft_trace_pending.push_back(std::move(r));
+                        auto & ids = draft_trace_pending.back().ids;
+                        for (size_t i = 0; i < reads.size(); ) {
+                            const ggml_backend_t backend = reads[i].backend;
+                            const ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+                            const ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                            auto batch = reg != nullptr
+                                ? (void (*)(const ggml_tensor * const *, void * const *, int))
+                                      ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_get_tensors_async")
+                                : nullptr;
+                            if (batch == nullptr) {
+                                ggml_backend_tensor_get_async(backend, reads[i].tensor, ids[i].data(), 0, reads[i].bytes);
+                                ++i;
+                                continue;
+                            }
+                            // one batch a backend: the hook reads from one queue
+                            std::vector<const ggml_tensor *> ts;
+                            std::vector<void *> dsts;
+                            size_t j = i;
+                            while (j < reads.size() && reads[j].backend == backend) {
+                                ts.push_back(reads[j].tensor);
+                                dsts.push_back(ids[j].data());
+                                ++j;
+                            }
+                            batch(ts.data(), dsts.data(), (int) ts.size());
+                            i = j;
+                        }
+                    }
+                }
+            }
+        }
+        const int64_t dt_p0 = dt ? ggml_time_us() : 0;
+        struct dt_post_t { decode_timing * dt; int64_t t0; ~dt_post_t() { if (dt) dt->t_post += ggml_time_us() - t0; } } dt_post_ { dt, dt_p0 };
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2130,7 +3215,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            if (!embd_nextn_skip && embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
@@ -2154,7 +3239,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const auto stride = n_vocab;
 
             // async copy the sampling data from the backend to the host
-            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
+            if (res->t_sampled_ids != nullptr && sampling.sampled.has_data()) {
+                ggml_tensor *  t = res->t_sampled_ids;
+                ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+                GGML_ASSERT(b != nullptr && t->ne[0] == (int64_t) n_outputs);
+                GGML_ASSERT((size_t) n_outputs_prev + n_outputs <= sampling.sampled.size);
+                ggml_backend_tensor_get_async(b, t, sampling.sampled.data + n_outputs_prev, 0,
+                        n_outputs * sizeof(llama_token));
+            } else {
+                copy_tensor_async_rows(res->t_sampled,    sampling.sampled,    1,      n_outputs_prev, sched.get());
+            }
             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
@@ -2749,6 +3843,7 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
+    sync_pending = true;
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -3845,6 +4940,7 @@ void llama_context::opt_epoch_iter(
         const uint32_t n_tokens_all = balloc->get_n_tokens();
 
         n_queued_tokens += n_tokens_all;
+        sync_pending = true;
 
         embd_seq.clear();
 
@@ -3978,6 +5074,7 @@ llama_context_params llama_context_default_params() {
         /*.n_ctx                       =*/ 512,
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
+        /*.n_ubatch_reserve            =*/ 0,
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,
@@ -4013,6 +5110,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.n_kv_reserve                =*/ 0,
     };
 
     return result;
@@ -4257,6 +5355,10 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
 }
 
+void llama_set_embeddings_nextn_skip(llama_context * ctx, bool skip) {
+    ctx->set_embeddings_nextn_skip(skip);
+}
+
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
 }
@@ -4345,6 +5447,7 @@ struct ggml_cgraph * llama_graph_reserve(
     auto memory = ctx->get_memory();
     llama_memory_context_ptr mctx;
     if (memory) {
+        llama_kv_reserve_scope cap(ctx->get_cparams().n_kv_reserve);
         mctx = memory->init_full();
     }
     return ctx->graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
@@ -4459,6 +5562,31 @@ llama_pos llama_memory_seq_pos_min(
     }
 
     return mem->seq_pos_min(seq_id);
+}
+
+bool llama_memory_seq_windows(llama_memory_t mem, const uint32_t * n_cells, int32_t n_seq) {
+    if (!mem) {
+        return false;
+    }
+
+    // the indexed hybrid (qwen4exp's QSA) selects k-pool cells by absolute index: not windowed yet
+    if (dynamic_cast<llama_memory_hybrid_idx *>(mem) != nullptr) {
+        LLAMA_LOG_WARN("%s: the indexed hybrid memory takes no cell windows\n", __func__);
+        return false;
+    }
+
+    // the attention cache of a plain or a hybrid memory; other memories keep the whole-stream views
+    llama_kv_cache * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv == nullptr) {
+        if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
+            kv = hyb->get_mem_attn();
+        }
+    }
+    if (kv == nullptr) {
+        return false;
+    }
+
+    return kv->set_seq_windows(n_cells, n_seq);
 }
 
 llama_pos llama_memory_seq_pos_max(
@@ -4712,6 +5840,15 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+// the process's pending last graph (campaign expert-foresight): at the end of
+// a request, so a continuous trace loses nothing. Nothing when the trace is off
+void llama_expert_route_trace_flush(llama_context * ctx) {
+    if (ctx == nullptr) {
+        return;
+    }
+    llama_expert_cache::flush_traces(ctx->get_model().expert_caches, ctx->get_sched());
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {

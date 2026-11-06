@@ -97,7 +97,11 @@ kernel void kernel_gated_delta_net(
         uint  H_k,
         uint  rq3,
         float scale,
-        uint K) {
+        uint K,
+        // rows mode (patch 0081): the state is the 2D recurrent cache, read at row
+        // rows[seq] (state_row_stride floats from one row to the next) instead of the
+        // gathered scratch; off_rows is in bytes. use_rows 0 keeps the gather's layout.
+        global const char * rows_buf, ulong off_rows, ulong state_row_stride, uint use_rows) {
 
     global const float * data_q     = (global const float *)(q_buf     + off_q);
     global const float * data_k     = (global const float *)(k_buf     + off_k);
@@ -123,8 +127,11 @@ kernel void kernel_gated_delta_net(
     const uint iq3 = seq_id / rq3; // seq index for Q and K
 
     const uint state_size = S_V * S_V;
-    // input state holds s0 only [S_v, S_v, H, n_seqs]: per-seq stride is H*D.
-    const uint state_base = (seq_id * H_v + head_id) * state_size;
+    // input state holds s0 only [S_v, S_v, H, n_seqs]: per-seq stride is H*D;
+    // rows mode reads the cache row rows[seq_id] instead (patch 0081).
+    const uint state_base = use_rows
+        ? (uint) ((ulong) ((global const int *)(rows_buf + off_rows))[seq_id] * state_row_stride + (ulong)head_id * state_size)
+        : (seq_id * H_v + head_id) * state_size;
     const uint q_off_base  = iq3 * sq3 + iq1 * sq1;
     const uint v_off_base  = seq_id * sv3 + head_id * sv1;
     const uint gb_off_base = seq_id * sb3 + head_id * sb1;
@@ -242,7 +249,7 @@ kernel void kernel_gated_delta_net(
             const uint col = sg_col_base + cg * LANE_GROUPS_PER_SG + lane_group;
             #pragma unroll
             for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                data_dst[s_off + state_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[cg][r];
+                data_dst[s_off + state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[cg][r];
             }
         }
     }

@@ -347,6 +347,27 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // a per-expert GPU cache for MoE layers whose experts stay in host
+        // memory (src/llama-expert-cache.h): this many bytes of slots on the
+        // card, ranked by expert_cache_profile (Strata's STRP file; NULL:
+        // round robin). 0 off.
+        // Under a layer split every GPU that runs such layers keeps its own
+        // cache of its own layers. expert_cache_bytes is the budget of the
+        // first of them (in the model's device order) and the others get
+        // none; expert_cache_bytes_dev[i] (n_expert_cache_bytes_dev > 0)
+        // overrides it with one budget per device of the model, in the order
+        // of `devices` (or of the default selection), 0 for no cache there.
+        size_t       expert_cache_bytes;
+        const char * expert_cache_profile;
+        const size_t * expert_cache_bytes_dev;
+        size_t         n_expert_cache_bytes_dev;
+        // the prefill-slot-loan (docs/campaigns/prefill-slot-loan.md): the tail
+        // layers' slots can be lent to a prompt, up to this many bytes, and the
+        // tail slot buffer is freed at the loan and re-allocated at the return.
+        // 0 off; LLAMA_SLOT_LOAN_BYTES_ENV = no parameter set, LLAMA_SLOT_LOAN_MIB
+        // (a tool's flag, or 0, always wins over the environment).
+        size_t       slot_loan_bytes;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
@@ -367,6 +388,9 @@ extern "C" {
         uint32_t n_ctx;                 // text context, 0 = from model
         uint32_t n_batch;               // logical maximum batch size that can be submitted to llama_decode
         uint32_t n_ubatch;              // physical maximum batch size
+        uint32_t n_ubatch_reserve;      // the ubatch the compute buffers are reserved for (0 = n_ubatch);
+                                        // a prefill-slot-loan's context keeps the resident chunk here and
+                                        // reserves the prompt chunk while the loan is out [EXPERIMENTAL]
         uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
@@ -425,6 +449,11 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // the cache cells the compute buffers are reserved for (0 = the whole cache). With a cap, a
+        // batch's ubatches are cut so that ubatch tokens x cells stay within n_ubatch x n_kv_reserve:
+        // a long context does not reserve a full-context prompt's buffers for the whole session
+        uint32_t n_kv_reserve;
     };
 
     struct llama_model_tensor_override {
@@ -566,6 +595,58 @@ extern "C" {
     LLAMA_API size_t llama_max_devices(void);
     LLAMA_API size_t llama_max_parallel_sequences(void);
     LLAMA_API size_t llama_max_tensor_buft_overrides(void);
+
+    // the expert caches' counters (llama_model_params.expert_cache_bytes),
+    // summed over the caches (one per GPU under a layer split); false when
+    // the model has none
+    struct llama_expert_cache_info {
+        uint64_t decode_hits;     // routed (token, expert) pairs of decode ubatches served from a slot
+        uint64_t decode_misses;   // ... read from the bank in host memory
+        uint64_t swaps;           // experts swapped into slots
+        uint64_t adapts;          // adapt steps
+        uint64_t apply_us;        // the decoding thread's time planning and enqueueing swaps
+        int64_t  slots;
+        size_t   bytes;           // on the card: slots, Q8_0 banks, tables, the gather mirror
+        size_t   bank_bytes;      // the other experts in GPU-visible host memory
+    };
+    LLAMA_API bool llama_model_expert_cache_info(const struct llama_model * model, struct llama_expert_cache_info * info);
+
+    // llama_model_params.slot_loan_bytes: "no parameter set", the only value for
+    // which LLAMA_SLOT_LOAN_MIB is read (llama_model_default_params sets it; a
+    // tool that sets 0 means off and the environment cannot turn it on)
+    #define LLAMA_SLOT_LOAN_BYTES_ENV ((size_t) -1)
+
+    // the prefill-slot-loan (docs/campaigns/prefill-slot-loan.md): a prompt
+    // borrows the expert cache's tail slots, the compute buffers are reserved
+    // at the prompt's ubatch, and the return re-reserves at the resident ubatch,
+    // takes the tail slot buffer back, refills and verifies it. One lane only.
+    struct llama_slot_loan_info {
+        int32_t  layers;      // loan-eligible (tail) layers the cache set up at load
+        int64_t  slots;       // their expert slots
+        size_t   bytes;       // their slot bytes, the most a loan can free
+        bool     out;         // a loan is out now
+        int64_t  reserve_bytes; // the prompt's compute buffers the sizing measured
+    };
+    // begin: false when refused (no cache, a loan already out, several lanes, or
+    // the prompt's buffers need more than `bytes`); ctx's ubatch reserve becomes
+    // `n_tokens`. end: the re-reserve at the resident ubatch, the refill and its
+    // verify; false when the refill could not get the slots back or differs.
+    LLAMA_API bool llama_model_slot_loan_info(const struct llama_model * model, struct llama_slot_loan_info * info);
+    LLAMA_API bool llama_context_slot_loan_begin(struct llama_context * ctx, uint32_t n_tokens);
+    LLAMA_API bool llama_context_slot_loan_end  (struct llama_context * ctx);
+    // true when a loan is out, or a loan's state was left unusable (a failed
+    // resident re-reserve after the scheduler was replaced, a lend or an undo
+    // whose tables did not reach the card). The request-start check refuses on
+    // it: only a restart clears that state.
+    LLAMA_API bool llama_context_slot_loan_out  (struct llama_context * ctx);
+    // "off", "armed", "out", "poisoned" or "broken": what /props reports and the
+    // request-start refusal names ("poisoned" exits under the 2026-10-29 policy)
+    LLAMA_API const char * llama_context_slot_loan_state(struct llama_context * ctx);
+    // the number of expert caches (one per GPU that keeps one), and cache i's
+    // counters and its device's name (NULL / false when i is out of range)
+    LLAMA_API int          llama_model_expert_cache_count (const struct llama_model * model);
+    LLAMA_API bool         llama_model_expert_cache_info_dev(const struct llama_model * model, int i, struct llama_expert_cache_info * info);
+    LLAMA_API const char * llama_model_expert_cache_device(const struct llama_model * model, int i);
 
     LLAMA_API bool llama_supports_mmap       (void);
     LLAMA_API bool llama_supports_mlock      (void);
@@ -816,6 +897,17 @@ extern "C" {
     LLAMA_API llama_pos llama_memory_seq_pos_max(
             llama_memory_t mem,
               llama_seq_id seq_id);
+
+    // Cell windows in a unified KV cache (kv_unified, no shared source cache): sequence i finds its cells in
+    // [sum of n_cells[0..i), + n_cells[i]) and its attention spans that window only, so a sequence's decode
+    // does not grow with another sequence's cells. Each size a multiple of 256; the sum at most the cache.
+    // Call on an empty memory, before the first decode; n_seq == 0 clears the windows.
+    // Returns false (and changes nothing) when the memory's attention cache cannot take windows
+    // (several streams, a shared or indexed cache, sliding-window caches).
+    LLAMA_API bool llama_memory_seq_windows(
+            llama_memory_t mem,
+            const uint32_t * n_cells,
+                   int32_t   n_seq);
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
@@ -1478,6 +1570,12 @@ extern "C" {
     /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     /// Setting k <= 0 makes this a noop
     LLAMA_API struct llama_sampler * llama_sampler_init_top_k      (int32_t k);
+
+    /// ARC-LAB: the k largest logits in descending order, without building the full
+    /// candidate array. Entries and the order of equal logits are identical to what
+    /// llama_sampler_init_top_k does on the full array (it repeats the heap steps of
+    /// libstdc++ std::partial_sort). out must hold k entries; n_vocab > k.
+    LLAMA_API void llama_top_k_from_logits(const float * logits, int32_t n_vocab, int32_t k, struct llama_token_data * out);
 
     /// @details Nucleus sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     LLAMA_API struct llama_sampler * llama_sampler_init_top_p      (float   p, size_t min_keep);

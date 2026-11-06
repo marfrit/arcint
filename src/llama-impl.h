@@ -77,6 +77,9 @@ static inline ggml_tensor * llama_mul_mat_hadamard(
 // Prefetch the host pages needed to gather these rows.
 void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows);
 
+// ARC-LAB: LLAMA_SYNC_TRIM bit mask, see llama-context.cpp
+int llama_sync_trim();
+
 struct time_meas {
     time_meas(int64_t & t_acc, bool disable = false);
     ~time_meas();

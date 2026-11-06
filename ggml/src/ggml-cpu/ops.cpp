@@ -6245,6 +6245,48 @@ void ggml_compute_forward_clamp(
     }
 }
 
+// ggml_compute_forward_rope_apply
+
+void ggml_compute_forward_rope_apply(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * x  = dst->src[0];
+    const ggml_tensor * pe = dst->src[1];
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && pe->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const bool interleaved = ggml_get_op_params_i32(dst, 0) != 0;
+    const int64_t half_dim = x->ne[0]/2;
+    const int64_t rows = x->ne[1]*x->ne[2]*x->ne[3];
+    const int64_t rows_per_thread = (rows + params->nth - 1)/params->nth;
+    const int64_t begin = rows_per_thread*params->ith;
+    const int64_t end = std::min(begin + rows_per_thread, rows);
+    for (int64_t row = begin; row < end; ++row) {
+        const int64_t token = row % x->ne[2];
+        const int64_t head  = (row / x->ne[2]) % x->ne[1];
+        const int64_t batch = row / (x->ne[2]*x->ne[1]);
+        const char * x_row = (const char *) x->data + head*x->nb[1] + token*x->nb[2] + batch*x->nb[3];
+        const char * pe_row = (const char *) pe->data + token*pe->nb[3];
+        float * out = (float *) dst->data + row*x->ne[0];
+        for (int64_t j = 0; j < half_dim; ++j) {
+            const int64_t i0 = interleaved ? 2*j : j;
+            const int64_t i1 = interleaved ? 2*j + 1 : j + half_dim;
+            const float a = *(const float *) (x_row + i0*x->nb[0]);
+            const float b = *(const float *) (x_row + i1*x->nb[0]);
+            const char * matrix = pe_row + j*pe->nb[2];
+            const float c = *(const float *) matrix;
+            const float s = *(const float *) (matrix + pe->nb[1]);
+            if (interleaved) {
+                const float neg_s = *(const float *) (matrix + pe->nb[0]);
+                const float c1 = *(const float *) (matrix + pe->nb[0] + pe->nb[1]);
+                out[i0] = a*c + b*neg_s;
+                out[i1] = a*s + b*c1;
+            } else {
+                out[i0] = a*c - b*s;
+                out[i1] = a*s + b*c;
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_rope
 
 static float rope_yarn_ramp(const float low, const float high, const int i0) {
@@ -11221,7 +11263,26 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     GGML_ASSERT(ggml_is_contiguous_rows(src_v));
     GGML_ASSERT(ggml_is_contiguous(src_g));
     GGML_ASSERT(ggml_is_contiguous(src_beta));
-    GGML_ASSERT(ggml_is_contiguous(src_state));
+
+    // rows mode (op_params[1] = GGML_GDN_MODE_ROWS): the state is the 2D recurrent
+    // cache and each sequence's live state is read at row rows[seq] -- no gathered
+    // scratch, the same bytes the gather would have handed over. The mode word, not
+    // whether src[6] is set, selects it: src[6] is the row index in this form only.
+    const int gdn_mode = ggml_get_op_params_i32(dst, 1);
+    GGML_ASSERT(gdn_mode == GGML_GDN_MODE_GATHERED || gdn_mode == GGML_GDN_MODE_ROWS);
+    const bool rows_mode = gdn_mode == GGML_GDN_MODE_ROWS;
+    const ggml_tensor * src_rows = rows_mode ? dst->src[6] : nullptr;
+    if (rows_mode) {
+        GGML_ASSERT(src_rows != nullptr);
+        GGML_ASSERT(src_state->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous_rows(src_state));
+        GGML_ASSERT(src_rows->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_is_contiguous(src_rows));
+        GGML_ASSERT(src_state->ne[0] == S_v * S_v * H);
+        GGML_ASSERT(ggml_nelements(src_rows) == n_seqs);
+    } else {
+        GGML_ASSERT(ggml_is_contiguous(src_state));
+    }
 
     GGML_ASSERT(src_g->ne[0] == 1 || src_g->ne[0] == S_v);
     GGML_ASSERT(src_beta->ne[0] == 1);
@@ -11241,8 +11302,11 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int64_t K = ggml_get_op_params_i32(dst, 0);
     GGML_ASSERT(K >= 1);
-    // per-seq stride in floats (seq s starts at state + s * seq_stride)
-    const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
+    // per-seq stride in floats: scratch mode (seq s starts at state + s * seq_stride),
+    // rows mode (state row rows[s] starts at state + rows[s] * row_stride)
+    const int64_t state_seq_stride = src_rows ? 0 : (int64_t) (src_state->nb[3] / sizeof(float));
+    const int64_t state_row_stride = src_rows ? (int64_t) (src_state->nb[1] / sizeof(float)) : 0;
+    const int32_t * state_rows     = src_rows ? (const int32_t *) src_rows->data : nullptr;
 
     const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
     const int ith = params->ith;
@@ -11287,8 +11351,11 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             : state_out_base + (iv3 * H + iv1) * S_v * S_v;
 
         // copy input state into the working buffer and operate in-place
-        // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
-        const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+        // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride;
+        // rows mode reads the cache row state_rows[iv3] instead.
+        const float * s_in = state_in_base +
+            (state_rows ? (int64_t) state_rows[iv3] * state_row_stride : iv3 * state_seq_stride) +
+            iv1 * S_v * S_v;
         memcpy(s_out, s_in, S_v * S_v * sizeof(float));
 
         // attn output pointer for first token of this (head, seq)
@@ -11402,6 +11469,164 @@ void ggml_compute_forward_gated_delta_net(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_gated_delta_net_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+
+// ggml_compute_forward_gated_delta_net_replay (rollback by replay, see
+// ggml_gated_delta_net_replay). The per-token step is the scalar-gate path of
+// ggml_compute_forward_gated_delta_net_one_chunk, operation for operation, and
+// a replayed record repeats exactly its state update (scale by g, then mad
+// k * delta), so the replayed state is bit-identical to the state that path
+// computes for the same token.
+static void ggml_compute_forward_gated_delta_net_replay_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src_q     = dst->src[0];
+    const ggml_tensor * src_k     = dst->src[1];
+    const ggml_tensor * src_v     = dst->src[2];
+    const ggml_tensor * src_g     = dst->src[3];
+    const ggml_tensor * src_beta  = dst->src[4];
+    const ggml_tensor * src_state = dst->src[5];
+    const ggml_tensor * src_rec   = dst->src[6];
+    const ggml_tensor * src_ctrl  = dst->src[7];
+
+    // the family's mode word (ggml.h, op_params[1]): src[6]/src[7] are this op's
+    // records and control, so a node of another GDN form can never reach here
+    GGML_ASSERT(ggml_get_op_params_i32(dst, 1) == GGML_GDN_MODE_REPLAY);
+    GGML_ASSERT(src_rec != nullptr && src_ctrl != nullptr);
+
+    GGML_TENSOR_LOCALS(int64_t, neq, src_q, ne);
+    GGML_TENSOR_LOCALS(size_t,  nbq, src_q, nb);
+    GGML_TENSOR_LOCALS(int64_t, nek, src_k, ne);
+    GGML_TENSOR_LOCALS(size_t,  nbk, src_k, nb);
+    GGML_TENSOR_LOCALS(int64_t, nev, src_v, ne);
+    GGML_TENSOR_LOCALS(size_t,  nbv, src_v, nb);
+    GGML_TENSOR_LOCALS(size_t,  nbg, src_g, nb);
+    GGML_TENSOR_LOCALS(size_t,  nbb, src_beta, nb);
+
+    const int64_t S_v      = nev0;
+    const int64_t H        = nev1;
+    const int64_t n_tokens = nev2;
+    const int64_t n_seqs   = nev3;
+    const int64_t K        = ggml_get_op_params_i32(dst, 0);
+    const int64_t R        = H * (2 * S_v + 1);
+    const int64_t D        = S_v * S_v * H;
+
+    // base = state after token t_base; tokens after it leave a record.
+    // n_tokens == 0: replay only, the base region holds the replayed state.
+    const int64_t m      = n_tokens > 0 ? std::min<int64_t>(n_tokens - 1, K - 1) : -1;
+    const int64_t t_base = n_tokens - 1 - m;
+
+    float * attn_out_base = (float *) dst->data;
+    float * base_out      = attn_out_base + S_v * H * n_tokens * n_seqs;
+    float * rec_out       = base_out + D * n_seqs;
+
+    const int32_t * ctrl = (const int32_t *) src_ctrl->data;
+
+    const int64_t rq3 = nev3 / neq3;
+    const int64_t rk3 = nev3 / nek3;
+
+    const float scale = 1.0f / sqrtf((float) S_v);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    float * s     = (float *) params->wdata + ith * (S_v * S_v + S_v + CACHE_LINE_SIZE_F32);
+    float * delta = s + S_v * S_v;
+
+    const int64_t nr  = H * n_seqs;
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = std::min(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t iv1 = ir % H; // head
+        const int64_t iv3 = ir / H; // sequence
+
+        const int64_t iq1 = iv1 % neq1;
+        const int64_t ik1 = iv1 % nek1;
+        const int64_t iq3 = iv3 / rq3;
+        const int64_t ik3 = iv3 / rk3;
+
+        // state layout: s[j*S_v + i] = S[i][j] (row j = value column j)
+        memcpy(s, (const char *) src_state->data + iv3 * src_state->nb[3] + iv1 * S_v * S_v * sizeof(float),
+               S_v * S_v * sizeof(float));
+
+        // replay: re-apply the stored updates of the tokens kept since the base state
+        const int32_t n_rec = ctrl[2 * iv3 + 0];
+        const int32_t bank  = ctrl[2 * iv3 + 1];
+        GGML_ASSERT(n_rec >= 0 && n_rec <= K - 1 && (bank == 0 || bank == 1));
+        const float * rec_in = (const float *) ((const char *) src_rec->data + iv3 * src_rec->nb[2] + bank * src_rec->nb[1]);
+        for (int32_t j = 0; j < n_rec; ++j) {
+            const float * r  = rec_in + j * R;
+            const float * rd = r + iv1 * S_v;
+            const float * rk = r + H * S_v + iv1 * S_v;
+            ggml_vec_scale_f32(S_v * S_v, s, r[2 * H * S_v + iv1]);
+            for (int64_t jj = 0; jj < S_v; ++jj) {
+                ggml_vec_mad_f32(S_v, &s[jj * S_v], rk, rd[jj]);
+            }
+        }
+
+        float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
+
+        for (int64_t t = 0; t < n_tokens; t++) {
+            const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
+            const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
+            const float * v_d = (const float *)((const char *)src_v->data + iv3 * nbv3 + t * nbv2 + iv1 * nbv1);
+
+            const float beta_val = *(const float *)((const char *)src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);
+            const float g0       = *(const float *)((const char *)src_g->data    + iv3 * nbg3 + t * nbg2 + iv1 * nbg1);
+            const float g_val    = expf(g0);
+
+            ggml_vec_scale_f32(S_v * S_v, s, g_val);
+
+            for (int64_t j = 0; j < S_v; ++j) {
+                float sum = 0.0f;
+                ggml_vec_dot_f32(S_v, &sum, 0, &s[j * S_v], 0, k_d, 0, 1);
+                delta[j] = (v_d[j] - sum) * beta_val;
+            }
+
+            for (int64_t j = 0; j < S_v; ++j) {
+                ggml_vec_mad_f32(S_v, &s[j * S_v], k_d, delta[j]);
+            }
+
+            for (int64_t j = 0; j < S_v; ++j) {
+                float sum = 0.0f;
+                ggml_vec_dot_f32(S_v, &sum, 0, &s[j * S_v], 0, q_d, 0, 1);
+                attn_data[j] = sum * scale;
+            }
+
+            attn_data += S_v * H;
+
+            if (t == t_base) {
+                memcpy(base_out + (iv3 * H + iv1) * S_v * S_v, s, S_v * S_v * sizeof(float));
+            } else if (t > t_base) {
+                float * r = rec_out + iv3 * (K - 1) * R + (t - t_base - 1) * R;
+                memcpy(r + iv1 * S_v,           delta, S_v * sizeof(float));
+                memcpy(r + H * S_v + iv1 * S_v, k_d,   S_v * sizeof(float));
+                r[2 * H * S_v + iv1] = g_val;
+            }
+        }
+
+        if (n_tokens == 0) {
+            memcpy(base_out + (iv3 * H + iv1) * S_v * S_v, s, S_v * S_v * sizeof(float));
+        }
+    }
+}
+
+void ggml_compute_forward_gated_delta_net_replay(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_gated_delta_net_replay_f32(params, dst);
             } break;
         default:
             {

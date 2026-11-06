@@ -382,7 +382,7 @@ cl_program cl_program_cache_try_load(
         return nullptr;
     }
 
-    err = clBuildProgram(p, 0, nullptr, compile_opts.c_str(), nullptr, nullptr);
+    err = clBuildProgram(p, 1, &device, compile_opts.c_str(), nullptr, nullptr);
     if (err != CL_SUCCESS) {
         clReleaseProgram(p);
         return nullptr;
@@ -395,7 +395,7 @@ cl_program cl_program_cache_try_load(
 void cl_program_cache_try_save(
     const cl_program_cache_state & state,
     cl_program                     program,
-    cl_device_id                   /*device*/,
+    cl_device_id                   device,
     const char *                   source,
     const std::string &            compile_opts) {
 
@@ -408,11 +408,25 @@ void cl_program_cache_try_save(
         return;
     }
 
+    // The program belongs to every device of its context, but is built for
+    // `device` only (the other devices' binaries are empty): save that one.
+    std::vector<cl_device_id> devs(n_dev);
+    if (clGetProgramInfo(program, CL_PROGRAM_DEVICES, sizeof(cl_device_id) * n_dev, devs.data(), nullptr) != CL_SUCCESS) {
+        return;
+    }
+    cl_uint idx = 0;
+    while (idx < n_dev && devs[idx] != device) {
+        ++idx;
+    }
+    if (idx == n_dev) {
+        return;
+    }
+
     std::vector<size_t> sizes(n_dev);
     if (clGetProgramInfo(program, CL_PROGRAM_BINARY_SIZES, sizeof(size_t) * n_dev, sizes.data(), nullptr) != CL_SUCCESS) {
         return;
     }
-    if (sizes.empty() || sizes[0] == 0) {
+    if (sizes[idx] == 0) {
         return;
     }
 
@@ -426,10 +440,9 @@ void cl_program_cache_try_save(
         return;
     }
 
-    // We only care about the first device's binary — that's the one we'd
-    // re-load with on a future cache hit. Multi-device contexts aren't a
-    // pattern this backend uses today.
-    const std::vector<uint8_t> & bin = binaries[0];
+    // `device`'s binary: the one a future cache hit re-loads (the key names the
+    // device, its driver and its platform, so two devices never share an entry).
+    const std::vector<uint8_t> & bin = binaries[idx];
 
     std::vector<uint8_t> file;
     file.reserve(16 + bin.size());

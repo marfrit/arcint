@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-kv-cache.h"   // get_k_idxs/cpy_k for the KV-only MTP store
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
@@ -406,9 +407,20 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
+    // patch 0081: LLAMA_GDN_STATE_ROWS=1 (off by default) reads each sequence's
+    // live state straight from the recurrent cache inside the GDN op, no gather
+    const bool gdn_state_rows = llama_gdn_state_rows_enabled(cparams, n_seqs, n_seq_tokens);
+    ggml_tensor * state;
+    ggml_tensor * state_rows = nullptr;
+    if (gdn_state_rows) {
+        state      = build_rs_cache_view(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state_rows = inp->s_copy_main;
+        cb(state, "state_cache_view", il);
+    } else {
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+        cb(state, "state_predelta", il);
+    }
 
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
@@ -448,8 +460,24 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    // patch 0082: LLAMA_FUSE_QK_L2_NORM=1 (off by default) normalises q and k in
+    // one l2_norm over their joint head groups of the conv output; the two
+    // separate norms are the same bytes, one pair of nodes fewer a layer
+    static const bool fuse_qk_l2 = [] {
+        const char * e = getenv("LLAMA_FUSE_QK_L2_NORM");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (fuse_qk_l2) {
+        ggml_tensor * q_normed = nullptr;
+        ggml_tensor * k_normed = nullptr;
+        build_gdn_qk_l2_norm(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+                nb1_qkv, eps_norm, &q_normed, &k_normed);
+        q_conv = q_normed; cb(q_conv, "q_conv_l2", il);
+        k_conv = k_normed; cb(k_conv, "k_conv_l2", il);
+    } else {
+        q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    }
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
@@ -467,7 +495,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il, state_rows);
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
@@ -595,8 +623,21 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     res->add_input(std::move(inp));
 
+    // a draft decode with no output rows (the head's prompt catch-up) is there to fill
+    // this layer's K/V only: build up to the cache store and stop. LLAMA_MTP_KV_ONLY=0
+    // turns it off (on by default since patch 0094); the K/V ops are the full graph's, in the same order, so the cache
+    // rows are bit-identical (see the patch record). Unmasked nextn readers keep the
+    // full graph.
+    static const bool kv_only_on = [] {
+        const char * e = getenv("LLAMA_MTP_KV_ONLY");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const bool kv_only = kv_only_on && n_outputs == 0 && cparams.embeddings_nextn_masked &&
+            layer.wqkv == nullptr && layer.wk_b == nullptr && layer.wv_b == nullptr;
+
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // an unread input would have no buffer
+    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -616,6 +657,47 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
+
+    if (kv_only) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LLAMA_LOG_INFO("%s: MTP KV-only pass for decodes without outputs (LLAMA_MTP_KV_ONLY=1 enables the patch; 0 is the full graph)\n", __func__);
+        }
+        // <= 8 rows: keep the unused Q projection, see qwen35.cpp's note
+        if (n_tokens <= 8) {
+            ggml_build_forward_expand(gf, build_lora_mm(layer.wq, cur, layer.wq_s));
+        }
+
+        // K/V exactly as build_qkv's separate path with reshape=false builds them
+        ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Kcur, "mtp_Kcur_normed", il);
+
+        ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+        cb(Vcur, "mtp_Vcur", il);
+
+        Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+
+        // the store half of build_attn(): same optional cache rotations, same expand
+        // order (v, k, then the copies)
+        if (inp_attn->self_k_rot) {
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot);
+        }
+        if (inp_attn->self_v_rot) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
+        }
+        ggml_build_forward_expand(gf, Vcur);
+        ggml_build_forward_expand(gf, Kcur);
+        cb(Kcur, "k_cache_in", il);
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+        return;
+    }
 
     auto [Qcur_full, Kcur, Vcur] = build_qkv(layer, cur,
             n_embd_head * 2, n_head,
@@ -724,9 +806,16 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
 
     cb(cur, "h_nextn", -1);
-    res->t_h_nextn= cur;
-
-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    // a masked context keeps the output tokens' rows (llama_context copies
+    // the first n_outputs rows): select them before the capture, as the trunk
+    // does, or a batch of several tokens with one output hands back token 0's
+    if (cparams.embeddings_nextn_masked) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        res->t_h_nextn = cur;
+    } else {
+        res->t_h_nextn = cur;
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
     cb(cur, "mtp_shared_head_norm", -1);
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;

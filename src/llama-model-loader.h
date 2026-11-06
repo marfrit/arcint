@@ -116,6 +116,7 @@ struct llama_model_loader {
     } lazy;
 
     llama_files files;
+    std::vector<std::string> file_paths; // per files[] entry, "" when opened from a handle (the expert cache reads raw expert bytes by path)
     llama_ftype ftype;
     llama_fver  fver;
 

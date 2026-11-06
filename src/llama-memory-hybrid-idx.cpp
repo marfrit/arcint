@@ -484,7 +484,9 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         mem->kpool_layout_update();
         auto st = kpool_build_sizes();
         const auto * idx = mem->get_mem_idx();
-        const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max();
+        // a reservation for fewer cells (llama_context_params::n_kv_reserve) reserves their pools only
+        const uint32_t cells = llama_kv_reserve_cap > 0 ? std::min<uint32_t>(idx->get_size(), llama_kv_reserve_cap) : idx->get_size();
+        const uint64_t n_pool_max = uint64_t(cells / mem->get_kpool()) * idx->get_n_seq_max();
         GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
         st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
         st.n_new   = st.n_pool_real;

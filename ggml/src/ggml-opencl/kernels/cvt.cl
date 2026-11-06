@@ -177,8 +177,13 @@ kernel void kernel_convert_f16_to_bf16(
 kernel void kernel_convert_block_q1_0(
     global block_q1_0 * src0,
     global uchar * dst_q,
-    global half  * dst_d
+    global half  * dst_d,
+    ulong n_blk
 ) {
+    // 0072: bound for the uniform launch's rounded tail
+    if (get_global_id(0) >= n_blk) {
+        return;
+    }
     global block_q1_0 * b = (global block_q1_0 *) src0 + get_global_id(0);
     global uchar      * q = (global uchar *) dst_q + (QK1_0/8)*get_global_id(0);
     global half       * d = (global half *) dst_d + get_global_id(0);
@@ -213,8 +218,12 @@ kernel void kernel_restore_block_q1_0(
 kernel void kernel_convert_block_q4_0(
     global struct block_q4_0 * src0,
     global uchar * dst_q,
-    global half  * dst_d
+    global half  * dst_d,
+    ulong n_blk
 ) {
+    if (get_global_id(0) >= n_blk) {
+        return;
+    }
     global struct block_q4_0 * b = (global struct block_q4_0 *) src0 + get_global_id(0);
     global uchar * q = (global uchar *) dst_q + QK4_0/2*get_global_id(0);
     global half  * d = (global half *) dst_d + get_global_id(0);
@@ -249,8 +258,12 @@ kernel void kernel_restore_block_q4_0(
 kernel void kernel_convert_block_q4_0_noshuffle(
     global struct block_q4_0 * src0,
     global uchar * dst_q,
-    global half  * dst_d
+    global half  * dst_d,
+    ulong n_blk
 ) {
+    if (get_global_id(0) >= n_blk) {
+        return;
+    }
     global struct block_q4_0 * b = (global struct block_q4_0 *) src0 + get_global_id(0);
     global uchar * q = (global uchar *) dst_q + QK4_0/2*get_global_id(0);
     global half  * d = (global half *) dst_d + get_global_id(0);
@@ -400,8 +413,12 @@ kernel void kernel_convert_block_q4_1(
     global struct block_q4_1 * src0,
     global uchar * dst_q,
     global half  * dst_d,
-    global half  * dst_m
+    global half  * dst_m,
+    ulong n_blk
 ) {
+    if (get_global_id(0) >= n_blk) {
+        return;
+    }
     global struct block_q4_1 * b = (global struct block_q4_1 *) src0 + get_global_id(0);
     global uchar * q = (global uchar *) dst_q + QK4_1/2*get_global_id(0);
     global half  * d = (global half *) dst_d + get_global_id(0);
@@ -437,8 +454,12 @@ kernel void kernel_convert_block_q4_1_noshuffle(
     global struct block_q4_1 * src0,
     global uchar * dst_q,
     global half  * dst_d,
-    global half  * dst_m
+    global half  * dst_m,
+    ulong n_blk
 ) {
+    if (get_global_id(0) >= n_blk) {
+        return;
+    }
     global struct block_q4_1 * b = (global struct block_q4_1 *) src0 + get_global_id(0);
     global uchar * q = (global uchar *) dst_q + QK4_1/2*get_global_id(0);
     global half  * d = (global half *) dst_d + get_global_id(0);
@@ -634,8 +655,12 @@ kernel void kernel_convert_block_q5_0_noshuffle(
     global struct block_q5_0 * src0,
     global uchar * dst_q,
     global uint  * dst_qh,
-    global half  * dst_d
+    global half  * dst_d,
+    ulong n_blk
 ) {
+    if (get_global_id(0) >= n_blk) {
+        return;
+    }
     global struct block_q5_0 * b = (global struct block_q5_0 *) src0 + get_global_id(0);
     global uchar * q  = (global uchar *) dst_q + QK5_0/2*get_global_id(0);
     global uint  * qh = (global uint  *) dst_qh + get_global_id(0);
@@ -841,8 +866,12 @@ kernel void kernel_convert_block_q5_1_noshuffle(
     global uchar * dst_q,
     global uint  * dst_qh,
     global half  * dst_d,
-    global half  * dst_m
+    global half  * dst_m,
+    ulong n_blk
 ) {
+    if (get_global_id(0) >= n_blk) {
+        return;
+    }
     global struct block_q5_1 * b = (global struct block_q5_1 *) src0 + get_global_id(0);
     global uchar * q  = (global uchar *) dst_q + QK5_1/2*get_global_id(0);
     global uint  * qh = (global uint  *) dst_qh + get_global_id(0);
@@ -1496,8 +1525,12 @@ struct block_mxfp4 {
 kernel void kernel_convert_block_mxfp4(
     global struct block_mxfp4 * src0,
     global uchar * dst_q,
-    global uchar * dst_e
+    global uchar * dst_e,
+    ulong n_blk
 ) {
+    if (get_global_id(0) >= n_blk) {
+        return;
+    }
     global struct block_mxfp4 * b = (global struct block_mxfp4 *) src0 + get_global_id(0);
     global uchar * q = (global uchar *) dst_q + QK_MXFP4 / 2 * get_global_id(0);
     global uchar * e = (global uchar *) dst_e + get_global_id(0);
@@ -1771,8 +1804,13 @@ typedef struct {
 kernel void kernel_convert_block_q8_0(
     global block_q8_0 * src0,
     global uchar * dst_q,
-    global half  * dst_d
+    global half  * dst_d,
+    ulong n_blk
 ) {
+    // 0072: the q8_0 convert the LEO gate aborted at (n_blocks against local 64)
+    if (get_global_id(0) >= n_blk) {
+        return;
+    }
     global block_q8_0 * b = (global block_q8_0 *) src0 + get_global_id(0);
     global uchar      * q = (global uchar *) dst_q + QK8_0*get_global_id(0);
     global half       * d = (global half *) dst_d + get_global_id(0);
@@ -1997,8 +2035,12 @@ kernel void kernel_convert_block_q4_K(
     global half  * dst_d,
     global half  * dst_dm,
     uchar mask_0F,
-    uchar mask_F0
+    uchar mask_F0,
+    ulong n_blk
 ) {
+    if (get_global_id(0) >= n_blk) {
+        return;
+    }
     global struct block_q4_K * b = (global struct block_q4_K *) src0 + get_global_id(0);
     global uchar * q  = (global uchar *) dst_q  + QK_K/2*get_global_id(0);
     global uchar * s  = (global uchar *) dst_s  + K_SCALE_SIZE*get_global_id(0);
@@ -2052,8 +2094,12 @@ kernel void kernel_convert_block_q4_K_noshuffle(
     global half  * dst_d,
     global half  * dst_dm,
     uchar mask_0F,
-    uchar mask_F0
+    uchar mask_F0,
+    ulong n_blk
 ) {
+    if (get_global_id(0) >= n_blk) {
+        return;
+    }
     global struct block_q4_K * b = (global struct block_q4_K *) src0 + get_global_id(0);
     global uchar * q  = (global uchar *) dst_q  + QK_K/2 * get_global_id(0);
     global uchar * s  = (global uchar *) dst_s  + K_SCALE_SIZE * get_global_id(0);
@@ -2122,8 +2168,12 @@ kernel void kernel_convert_block_q5_K(
     global half  * dst_d,
     global half  * dst_dm,
     uchar mask_0F,
-    uchar mask_F0
+    uchar mask_F0,
+    ulong n_blk
 ) {
+    if (get_global_id(0) >= n_blk) {
+        return;
+    }
     global struct block_q5_K * b  = (global struct block_q5_K *) src0 + get_global_id(0);
     global uchar * q  = (global uchar *) dst_q  + QK_K/2*get_global_id(0);
     global uchar * qh = (global uchar *) dst_qh + QK_K/8*get_global_id(0);
@@ -2186,8 +2236,12 @@ kernel void kernel_convert_block_q5_K_noshuffle(
     global half  * dst_d,
     global half  * dst_dm,
     uchar mask_0F,
-    uchar mask_F0
+    uchar mask_F0,
+    ulong n_blk
 ) {
+    if (get_global_id(0) >= n_blk) {
+        return;
+    }
     global struct block_q5_K * b  = (global struct block_q5_K *) src0 + get_global_id(0);
     global uchar * q  = (global uchar *) dst_q  + QK_K/2       * get_global_id(0);
     global uchar * qh = (global uchar *) dst_qh + QK_K/8       * get_global_id(0);

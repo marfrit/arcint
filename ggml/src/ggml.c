@@ -1110,9 +1110,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "ROPE_APPLY",
+    "GATED_DELTA_NET_REPLAY",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1225,9 +1227,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "rope_apply(x,pe)",
+    "gated_delta_net_replay(q, k, v, g, beta, s, rec, ctrl)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4282,6 +4286,26 @@ struct ggml_tensor * ggml_soft_max_ext_back_inplace(
     return ggml_soft_max_ext_back_impl(ctx, a, b, scale, max_bias, true);
 }
 
+// ggml_rope_apply
+
+struct ggml_tensor * ggml_rope_apply(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * pe,
+        bool                  interleaved) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && pe->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[0] % 2 == 0);
+    GGML_ASSERT(pe->ne[0] == 2 && pe->ne[1] == 2);
+    GGML_ASSERT(pe->ne[2] == a->ne[0]/2 && pe->ne[3] == a->ne[2]);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, a->type, a->ne[0], a->ne[2], a->ne[1]*a->ne[3]);
+    ggml_set_op_params_i32(result, 0, interleaved ? 1 : 0);
+    result->op     = GGML_OP_ROPE_APPLY;
+    result->src[0] = a;
+    result->src[1] = pe;
+    return result;
+}
+
 // ggml_rope
 
 static struct ggml_tensor * ggml_rope_impl(
@@ -6428,6 +6452,7 @@ struct ggml_tensor * ggml_gated_delta_net(
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     ggml_set_op_params_i32(result, 0, (int32_t) K);
+    ggml_set_op_params_i32(result, 1, GGML_GDN_MODE_GATHERED);
 
     result->op     = GGML_OP_GATED_DELTA_NET;
     result->src[0] = q;
@@ -6436,6 +6461,150 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * states,
+        struct ggml_tensor  * rows,
+        int64_t               K) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(states));
+    GGML_ASSERT(ggml_is_contiguous(rows));
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(states->type == GGML_TYPE_F32);
+    GGML_ASSERT(rows->type == GGML_TYPE_I32);
+
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
+    GGML_ASSERT(beta->ne[0] == 1);
+
+    // states is a 2D cache view (D, n_rows); each row is one sequence's full state
+    GGML_ASSERT(states->ne[0] == S_v * S_v * H);
+    GGML_ASSERT(rows->ne[0] == n_seqs);
+    GGML_ASSERT(ggml_nelements(rows) == n_seqs);
+
+    GGML_ASSERT(K >= 1);
+    const int64_t state_rows = K * S_v * n_seqs;
+    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) K);
+    ggml_set_op_params_i32(result, 1, GGML_GDN_MODE_ROWS);
+
+    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = states;
+    result->src[6] = rows;
+
+    return result;
+}
+
+// ggml_gated_delta_net_replay
+//
+// Rollback by replay: the recurrent state is kept as a base state plus the
+// small update records of the tokens after it, and a rollback re-applies the
+// records instead of reading a per-token snapshot plane.
+//
+// q, k : [S_v, H_k, n_tokens, n_seqs]
+// v    : [S_v, H, n_tokens, n_seqs]
+// g    : [1, H, n_tokens, n_seqs] scalar gate, already exp'd by the caller
+// beta : [1, H, n_tokens, n_seqs]
+// state: [S_v, S_v, H, n_seqs]              stored base state
+// rec  : F32 [R*(K-1), 2, n_seqs]           update records, two banks per seq
+//        (a pass reads one bank, the caller stores the new records in the other)
+// ctrl : I32 [2, n_seqs] = {n_rec, bank}: records 0..n_rec-1 of `bank` are
+//        first re-applied to `state`
+// R    = H*(2*S_v + 1); one record is [delta S_v*H | k S_v*H | g H].
+//
+// output, packed 1D:
+//   [ attn S_v*H*n_tokens*n_seqs | base S_v*S_v*H*n_seqs |
+//     records (K-1)*H*(2*S_v+1)*n_seqs ]
+// with m = min(n_tokens - 1, K - 1) for n_tokens > 0: base = the state after
+// token n_tokens-1-m (the oldest state a rollback of up to m tokens needs),
+// record j = token n_tokens-m+j for j < m; records m..K-2 are left unwritten.
+// Rolling back r <= m tokens = re-applying m - r records to base next call.
+// n_tokens == 0 replays the stored records only: the base region holds the
+// replayed state, no attention output and no records are written.
+struct ggml_tensor * ggml_gated_delta_net_replay(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * rec,
+        struct ggml_tensor  * ctrl,
+        int                   K) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+    GGML_ASSERT(ggml_is_contiguous(ctrl));
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32 && state->type == GGML_TYPE_F32);
+    GGML_ASSERT(rec->type == GGML_TYPE_F32);
+    GGML_ASSERT(ctrl->type == GGML_TYPE_I32);
+
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    GGML_ASSERT(K >= 2);
+    GGML_ASSERT(q->ne[0] == S_v && k->ne[0] == S_v && q->ne[1] == k->ne[1] && H % q->ne[1] == 0);
+    GGML_ASSERT(g->ne[0] == 1 && g->ne[1] == H && g->ne[2] == n_tokens && g->ne[3] == n_seqs);
+    GGML_ASSERT(beta->ne[0] == 1 && beta->ne[1] == H && beta->ne[2] == n_tokens && beta->ne[3] == n_seqs);
+    GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H && state->ne[3] == n_seqs);
+
+    const int64_t R = H * (2 * S_v + 1);
+    GGML_ASSERT(rec->ne[0] == R * (K - 1) && rec->ne[1] == 2 && rec->ne[2] == n_seqs);
+    GGML_ASSERT(rec->nb[0] == sizeof(float) && rec->nb[1] == (size_t) rec->ne[0] * sizeof(float));
+    GGML_ASSERT(ggml_nelements(ctrl) == 2 * n_seqs);
+
+    const int64_t ne[4] = { S_v * H * n_tokens * n_seqs + S_v * S_v * H * n_seqs + (K - 1) * R * n_seqs, 1, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) K);
+    ggml_set_op_params_i32(result, 1, GGML_GDN_MODE_REPLAY);
+
+    result->op     = GGML_OP_GATED_DELTA_NET_REPLAY;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[6] = rec;
+    result->src[7] = ctrl;
 
     return result;
 }

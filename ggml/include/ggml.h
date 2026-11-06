@@ -600,6 +600,9 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+        GGML_OP_ROPE_APPLY,
+
+        GGML_OP_GATED_DELTA_NET_REPLAY,
 
         GGML_OP_COUNT,
     };
@@ -1848,6 +1851,17 @@ extern "C" {
             float                 scale,
             float                 max_bias);
 
+    // Apply precomputed rotary matrices, with shapes in ne[] order:
+    // a: F32 [head_dim, heads, tokens, batch], pe: F32 [2, 2, head_dim/2, tokens].
+    // pe stores [[cos, -sin], [sin, cos]] for each pair and token, shared across heads/batches.
+    // Returns contiguous F32 [head_dim, tokens, heads*batch]. Input strides are preserved.
+    // Interleaved pairs are (2*i, 2*i+1); otherwise pairs are (i, i+head_dim/2).
+    GGML_API struct ggml_tensor * ggml_rope_apply(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * pe,
+            bool                  interleaved);
+
     // rotary position embedding
     // if (mode & 1) - skip n_past elements (NOT SUPPORTED)
     // if (mode & GGML_ROPE_TYPE_NEOX) - GPT-NeoX style
@@ -2655,6 +2669,13 @@ extern "C" {
     // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
     // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
     // when n_tokens > K only slot 0 is guaranteed; backends may leave slots 1..K-1 unwritten.
+    //
+    // One op-family contract, so that a feature's tensor can never be mistaken for another's:
+    //   op_params[1] is the state mode, one of the GGML_GDN_MODE_* values below; a consumer
+    //   selects its state path from that word, never from whether src[6] is set.
+    //   the rows form's row index is src[6] (I32), the replay's records are src[6] and its
+    //   control src[7]; src[8]/src[9] carry the raw gating projections a backend may fold
+    //   (patch 0051: alpha in src[8], b in src[9], kept alive to the node) and nothing else.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2664,6 +2685,41 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // op_params[1] of the GDN family
+#define GGML_GDN_MODE_GATHERED 0   // ggml_gated_delta_net: a 4D gathered state
+#define GGML_GDN_MODE_ROWS     1   // ggml_gated_delta_net_rows: the 2D cache, read at rows[seq]
+#define GGML_GDN_MODE_REPLAY   2   // ggml_gated_delta_net_replay: base state plus records
+
+    // rows form: the recurrent state is read straight from the cache, no gather
+    // scratch. `states` is the 2D cache view (rows of D = S_v*S_v*H_v floats) and
+    // each sequence's live state is read at row `rows[seq]` (I32, n_seqs entries).
+    // Output layout is identical to ggml_gated_delta_net with K = n_snap_slots.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * states,
+            struct ggml_tensor  * rows,
+            int64_t               K);
+
+    // Gated delta net rollback by replay: one base state plus the per-token
+    // update records of the last K-1 tokens, re-applied to the base by the
+    // next pass. See the comment in ggml.c for the layout.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_replay(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * rec,
+            struct ggml_tensor  * ctrl,
+            int                   K);
 
     // DSA lightning indexer
     //

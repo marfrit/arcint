@@ -813,6 +813,11 @@ struct llama_model {
 
     std::vector<llama_layer> layers;
 
+    // the per-expert GPU caches (llama_model_params.expert_cache_bytes[_dev]),
+    // one per GPU that runs MoE layers with experts in host memory, in the
+    // order of `devices`
+    std::vector<std::unique_ptr<struct llama_expert_cache>> expert_caches;
+
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see
     // https://sbert.net/docs/sentence_transformer/usage/custom_models.html#structure-of-sentence-transformer-models

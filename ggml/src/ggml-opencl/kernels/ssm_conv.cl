@@ -12,7 +12,9 @@ kernel void kernel_ssm_conv_f32_f32(
     ulong         nb11,
     ulong         nb0,
     ulong         nb1,
-    ulong         nb2
+    ulong         nb2,
+    int           act,    // 1: a following SILU folded in (kernel_silu's formula; patch 0049)
+    int           ne01    // 0072: the dim-0 count, the rounded tail exits at it
 ){
     src0 = src0 + offset0;
     src1 = src1 + offset1;
@@ -21,6 +23,10 @@ kernel void kernel_ssm_conv_f32_f32(
     int ir = get_global_id(0);
     int i2 = get_global_id(1);
     int i3 = get_global_id(2);
+
+    if (ir >= ne01) {   // 0072: exit the rounded uniform launch's tail
+        return;
+    }
 
     int nc  = ne10;
 
@@ -34,7 +40,7 @@ kernel void kernel_ssm_conv_f32_f32(
         sumf += s[i0] * c[i0];
     }
 
-    d[0] = sumf;
+    d[0] = act ? sumf / (1.0f + exp(-sumf)) : sumf;
 }
 
 kernel void kernel_ssm_conv_f32_f32_4(
@@ -51,7 +57,9 @@ kernel void kernel_ssm_conv_f32_f32_4(
     ulong         nb11,
     ulong         nb0,
     ulong         nb1,
-    ulong         nb2
+    ulong         nb2,
+    int           act,    // 1: a following SILU folded in (kernel_silu's formula; patch 0049)
+    int           ne01    // 0072: the dim-0 count, the rounded tail exits at it
 ) {
     src0 = src0 + offset0;
     src1 = src1 + offset1;
@@ -60,6 +68,10 @@ kernel void kernel_ssm_conv_f32_f32_4(
     int ir = get_global_id(0);
     int i2 = get_global_id(1);
     int i3 = get_global_id(2);
+
+    if (ir >= ne01) {   // 0072: exit the rounded uniform launch's tail
+        return;
+    }
 
     int nc = ne10;
 
@@ -73,5 +85,5 @@ kernel void kernel_ssm_conv_f32_f32_4(
         sumf += dot(s[i0], c[i0]);
     }
 
-    d[0] = sumf;
+    d[0] = act ? sumf / (1.0f + exp(-sumf)) : sumf;
 }

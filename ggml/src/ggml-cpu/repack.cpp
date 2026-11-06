@@ -4855,6 +4855,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     const int32_t i02 =
                         *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
 
+                    // a negative id: another device's row (an expert cache's
+                    // hit on the card); zero here, for the sum
+                    if (i02 < 0) {
+                        memset((char *) dst->data + id * dst->nb[1] + iid1 * dst->nb[2], 0, dst->ne[0] * sizeof(float));
+                        continue;
+                    }
+
                     GGML_ASSERT(i02 >= 0 && i02 < n_as);
 
                     MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = { id, iid1 };

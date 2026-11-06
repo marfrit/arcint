@@ -32,6 +32,9 @@ __kernel void kernel_gemv_noshuffle_q6_k_f32_32b_trans(
     int                     ne01
 ) {
     uint i01  = get_global_id(0);
+    // 0072: the launch rounds ne01 up to a multiple of 64; clamp the
+    // tail's index for the loads and keep every lane in the collectives
+    uint i01c = min(i01, (uint) ne01 - 1);
     uint sgid = get_local_id(1);
     uint slid = get_sub_group_local_id();
 
@@ -47,15 +50,15 @@ __kernel void kernel_gemv_noshuffle_q6_k_f32_32b_trans(
         uint j  = ib % 8;   // 32-element group within super-block (0..7)
 
         // Load d for this super-block.
-        half d_val = src0_d[sb * ne01 + i01];
+        half d_val = src0_d[sb * ne01 + i01c];
 
         // Load 2 sub-block scales (int8), one per 16 elements.
-        global const char * sc = src0_s + i01 * scales_per_row + sb * 16;
+        global const char * sc = src0_s + i01c * scales_per_row + sb * 16;
         float scale0 = (float)d_val * (float)sc[j * 2];
         float scale1 = (float)d_val * (float)sc[j * 2 + 1];
 
         // Load 4 uints of ql (32 elements, 4-bit each = 128 bits), column-major stride ne01.
-        uint ql_base = (ib * 4) * ne01 + i01;
+        uint ql_base = (ib * 4) * ne01 + i01c;
         uint4 regQL;
         regQL.s0 = read_imageui(src0_ql, ql_base).x;
         regQL.s1 = read_imageui(src0_ql, ql_base + ne01).x;
@@ -63,7 +66,7 @@ __kernel void kernel_gemv_noshuffle_q6_k_f32_32b_trans(
         regQL.s3 = read_imageui(src0_ql, ql_base + ne01 * 3).x;
 
         // Load 2 uints of qh (32 elements, 2-bit each = 64 bits), column-major stride ne01.
-        uint qh_base = (ib * 2) * ne01 + i01;
+        uint qh_base = (ib * 2) * ne01 + i01c;
         uint2 regQH;
         regQH.s0 = read_imageui(src0_qh, qh_base).x;
         regQH.s1 = read_imageui(src0_qh, qh_base + ne01).x;
@@ -123,6 +126,8 @@ __kernel void kernel_gemv_noshuffle_q6_k_f32_32b_trans(
     // 1 output per thread in subgroup 0
     if (sgid == 0) {
         dst = dst + (offsetd >> 2);
-        dst[i01] = sum;
+        if (i01 < (uint) ne01) {   // 0072: only a real row stores
+            dst[i01] = sum;
+        }
     }
 }

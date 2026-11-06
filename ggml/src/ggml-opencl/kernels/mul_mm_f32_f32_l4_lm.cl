@@ -194,3 +194,23 @@ kernel void kernel_gemv_f32_f32_mc(
     }
     if (lane == 0) dst[(ulong)n * (uint)stride_d + m] = red[0];
 }
+
+// The K slices of a split-K product summed: src holds nslices slices of n
+// floats, slice s at s * n; dst[i] = the sum over s.
+kernel void kernel_sum_slices_f32(
+    global const float * src,
+    global float * dst, ulong offsetd,
+    int n,
+    int nslices)
+{
+    dst = (global float*)((global char*)dst + offsetd);
+    const int i = get_global_id(0);
+    if (i >= n) {
+        return;
+    }
+    float s = 0.0f;
+    for (int k = 0; k < nslices; ++k) {
+        s += src[(ulong)k * n + i];
+    }
+    dst[i] = s;
+}

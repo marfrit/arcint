@@ -23,11 +23,20 @@ kernel void kernel_solve_tri_f32(
         ulong nb0,
         ulong nb1,
         ulong nb2,
-        ulong nb3
+        ulong nb3,
+        int ne2,
+        int ne3  // 0072: the launch covers dst->ne[2]/ne[3]; bound both
 ) {
     int col = get_global_id(0);
     int i2 = get_global_id(1);
     int i3 = get_global_id(2);
+
+    if (col >= k) {   // 0072: k is the launch's dim-0 count
+        return;
+    }
+    if (i2 >= ne2 || i3 >= ne3) {   // 0072: exit the rounded tail of dims 1/2
+        return;
+    }
 
     global const uchar * Lb = src0 + offset0 + i2 * nb02 + i3 * nb03;
     global const uchar * Bb = src1 + offset1 + i2 * nb12 + i3 * nb13;

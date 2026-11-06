@@ -1153,7 +1153,16 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
                 const auto  gen_process = params ? params->gen_process : CLIP_GEN_PROCESS_GEN_CODE;
                 const int   top_k = params ? params->top_k : 50;
                 const float top_p = params ? params->top_p : 1.0f;
-                builder = std::make_unique<clip_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p);
+                // GEN_WAV computes the caller's valid frames, not the padded
+                // wav_tfm_swa window: the decoder's per-call cost scales with the
+                // flushed frames instead of a fixed 72 (measured-here, C4 PASS).
+                // MTMD_TTS_WAV_PAD=1 is the red case, forcing the padded window back
+                const bool  pad   = std::getenv("MTMD_TTS_WAV_PAD") != nullptr &&
+                                    atoi(std::getenv("MTMD_TTS_WAV_PAD")) != 0;
+                const bool  valid = params && gen_process == CLIP_GEN_PROCESS_GEN_WAV && !pad;
+                const int64_t n_codes_gen = ctx->model.gen_code_head_w->ne[2] + 1;
+                const int   gen_n_frames = valid && params->codes ? (int) (params->codes->size() / n_codes_gen) : -1;
+                builder = std::make_unique<clip_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p, gen_n_frames);
             } break;
         case PROJECTOR_TYPE_YOUTUVL:
             {
@@ -5472,10 +5481,13 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                         }
                     }
 
-                    std::vector<int32_t> codes(n_frames_w * n_codes, 0);
+                    const bool    pad = std::getenv("MTMD_TTS_WAV_PAD") != nullptr &&
+                                        atoi(std::getenv("MTMD_TTS_WAV_PAD")) != 0;
+                    const int64_t use_frames = pad ? n_frames_w : n_frames;
+                    std::vector<int32_t> codes(use_frames * n_codes, 0);
                     for (int64_t f = 0; f < n_frames; f++) {
                         for (int64_t g = 0; g < n_codes; g++) {
-                            codes[g * n_frames_w + f] = (*params->codes)[f * n_codes + g];
+                            codes[g * use_frames + f] = (*params->codes)[f * n_codes + g];
                         }
                     }
                     set_input_i32("inp_codes", codes);
@@ -6003,7 +6015,9 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
 
         // drop the tail audio that comes from the code-0 rear padding
         const int64_t n_codes    = params->codes ? model.gen_code_head_w->ne[2] + 1 : 0;
-        const int64_t n_frames_w = hparams.wav_tfm_swa;
+        const bool    pad = std::getenv("MTMD_TTS_WAV_PAD") != nullptr &&
+                            atoi(std::getenv("MTMD_TTS_WAV_PAD")) != 0;
+        const int64_t n_frames_w = (params->codes && !pad) ? (int64_t) params->codes->size() / n_codes : hparams.wav_tfm_swa;
         const int64_t n_frames   = params->codes ? (int64_t) params->codes->size() / n_codes : n_frames_w;
         if (n_frames < n_frames_w) {
             const size_t hop = out_audio.size() / n_frames_w;

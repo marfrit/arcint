@@ -178,6 +178,84 @@ set(LLAMA_CONTEXT_TEST_SRC
 )
 llama_build(${LLAMA_CONTEXT_TEST_SRC})
 
+# patch 0056: the OpenCL expert cache's CPU miss rows against ggml-cpu
+if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
+    add_executable(test-opencl-miss-cpu test-opencl-miss-cpu.cpp ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/ggml-opencl-miss-cpu.cpp)
+    target_include_directories(test-opencl-miss-cpu PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl)
+    target_link_libraries(test-opencl-miss-cpu PRIVATE ggml ggml-base ggml-cpu)
+    add_test(NAME test-opencl-miss-cpu COMMAND $<TARGET_FILE:test-opencl-miss-cpu>)
+endif()
+
+# patch 0071: the int8 DPAS expert GEMM's device-free pieces (s8 decode against
+# ggml's dequantizers, the q8_1-style quantizer, the dispatch rule). The helpers
+# are the kernels' own text (kq_i8_ops.inc), prepended to the OpenCL source too.
+if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
+    add_executable(test-opencl-kq-i8 test-opencl-kq-i8.cpp)
+    target_include_directories(test-opencl-kq-i8 PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/kernels)
+    target_link_libraries(test-opencl-kq-i8 PRIVATE ggml-base)
+    # the .inc and the two kernel sources as files too: the OpenCL text checks
+    # and the assembled program's compile (as load_cl_kernels assembles it)
+    target_compile_definitions(test-opencl-kq-i8 PRIVATE
+        KQ_I8_INC_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/kernels/kq_i8_ops.inc"
+        KQ_I8_KR_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/kernels/mul_mm_kq_i8.cl"
+        KQ_I8_F16_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl"
+        KQ_I8_ASSEMBLED_PATH="${CMAKE_CURRENT_BINARY_DIR}/kq_i8_assembled.cl")
+    add_test(NAME test-opencl-kq-i8 COMMAND $<TARGET_FILE:test-opencl-kq-i8>)
+endif()
+
+# patch 0077: the sampled VRAM alias tripwire and the slot-buffer check
+# (device-free). Both read the backend's own sources, so the cell and the call
+# site cannot drift.
+if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
+    add_executable(test-opencl-alias test-opencl-alias.cpp)
+    target_include_directories(test-opencl-alias PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl)
+    target_compile_definitions(test-opencl-alias PRIVATE
+        GGML_OPENCL_SRC_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/ggml-opencl.cpp")
+    add_test(NAME test-opencl-alias COMMAND $<TARGET_FILE:test-opencl-alias>)
+    set_tests_properties(test-opencl-alias PROPERTIES LABELS unit)
+endif()
+
+# patch 0072: the uniform-work-group rounding rule (ggml-opencl-uniform.h,
+# the header the backend includes) and a text check that every launch site with
+# a local size rounds its global size before enqueueing.
+if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
+    add_executable(test-opencl-workgroups test-opencl-workgroups.cpp)
+    target_include_directories(test-opencl-workgroups PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl)
+    target_compile_definitions(test-opencl-workgroups PRIVATE
+        GGML_OPENCL_SRC_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/ggml-opencl.cpp"
+        GGML_OPENCL_KERNELS_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/kernels"
+        GGML_OPENCL_CLANG_CLEAN_PATH="${PROJECT_SOURCE_DIR}/tests/opencl_clang_clean.txt")
+    add_test(NAME test-opencl-workgroups COMMAND $<TARGET_FILE:test-opencl-workgroups>)
+    # the Adreno build of the same test: GGML_OPENCL_USE_ADRENO_KERNELS makes the
+    # rounding helper a no-op (the Adreno class keeps the pin's ragged launches),
+    # and the test asserts that in its own build
+    add_executable(test-opencl-workgroups-adreno test-opencl-workgroups.cpp)
+    target_include_directories(test-opencl-workgroups-adreno PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl)
+    target_compile_definitions(test-opencl-workgroups-adreno PRIVATE
+        GGML_OPENCL_USE_ADRENO_KERNELS
+        GGML_OPENCL_SRC_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/ggml-opencl.cpp"
+        GGML_OPENCL_KERNELS_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/kernels"
+        GGML_OPENCL_CLANG_CLEAN_PATH="${PROJECT_SOURCE_DIR}/tests/opencl_clang_clean.txt")
+    add_test(NAME test-opencl-workgroups-adreno COMMAND $<TARGET_FILE:test-opencl-workgroups-adreno>)
+endif()
+
+# patch 0079: the DG2 + LEO image1d_buffer bound (ggml-opencl-image-limit.h,
+# the header the backend includes), the two detection predicates, and a text
+# check that the weight-image site and the image pool ask it before creating.
+if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
+    add_executable(test-opencl-image-limit test-opencl-image-limit.cpp)
+    target_include_directories(test-opencl-image-limit PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl)
+    target_compile_definitions(test-opencl-image-limit PRIVATE
+        GGML_OPENCL_SRC_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/ggml-opencl.cpp")
+    add_test(NAME test-opencl-image-limit COMMAND $<TARGET_FILE:test-opencl-image-limit> ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/ggml-opencl.cpp)
+endif()
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp LINK llama)

@@ -60,6 +60,31 @@ struct llama_context {
 
     void synchronize();
 
+    // the prefill-slot-loan (docs/campaigns/prefill-slot-loan.md): measure the
+    // prompt's buffers, lend the cache's tail slots, free the tail slot buffer
+    // and re-reserve at `n_tokens`; end re-reserves at the resident ubatch,
+    // takes the slots back, refills and verifies. false on any refusal.
+    bool slot_loan_begin(uint32_t n_tokens, llama_slot_loan_info * info);
+    bool slot_loan_end(llama_slot_loan_info * info);
+    // true when a loan is out or its state was left unusable (a failed resident
+    // re-reserve, a lend or an undo whose tables did not reach the card): the
+    // request-start check refuses on it
+    bool slot_loan_out() const;
+    // the caches' loan_out alone (slot_loan_end's early return)
+    bool slot_loan_lent() const;
+    // finding 4 (third review): a re-reserve that failed after the scheduler was
+    // replaced leaves the ctx unusable; record it once with the reason and apply
+    // the operator's policy (llama_loan_book::poison_exit since 2026-10-29: one
+    // ERROR line and a non-zero exit, so the unit restarts clean)
+    void slot_loan_poison(const char * why);
+    // "off" / "armed" / "out" / "poisoned" / "broken": what /props publishes and
+    // what the request-start refusal names
+    const char * slot_loan_state() const;
+    // a re-reserve for the loan: sets reserve_ubatch, reserves, and reports a
+    // failure instead of throwing (sched_reserve throws on a failed allocation,
+    // and the loan's return runs in a destructor)
+    bool slot_loan_reserve(uint32_t ub);
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -119,6 +144,7 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+    void set_embeddings_nextn_skip(bool skip) { embd_nextn_skip = skip; }
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
@@ -325,6 +351,7 @@ private:
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
     std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
+    bool embd_nextn_skip = false;         // llama_set_embeddings_nextn_skip
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
@@ -368,9 +395,41 @@ private:
 
     bool sched_need_reserve = true;
 
+    // the ubatch the compute buffers are reserved for and the effective ubatch is
+    // capped at: cparams.n_ubatch_reserve (0: n_ubatch), raised to the prompt's
+    // chunk while a prefill-slot-loan is out
+    uint32_t reserve_ubatch = 0;
+
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved
     bool graph_has_logits = true;
+
+    // a loan's state was left unusable and only a restart clears it (finding 4)
+    bool slot_loan_poisoned = false;
+
+    // round 23: the last loan's TRUE shortfall (over the guard's noise floor),
+    // fed to the NEXT loan's sizing as extra lend bytes. Round 21 dropped grown
+    // lend layers for it -- which only reduced the loan's headroom -- and refused
+    // when the tail could not cover a remainder; round 22 decayed it after a clean
+    // loan. Here the begin takes it and zeroes it, so a refused begin leaves no
+    // state, and it is never a refusal.
+    size_t slot_loan_shed = 0;
+    // what each card's guard read at the loan's begin: the ggml sum, the
+    // process's fdinfo vram0/gtt, the cache's host-bank bytes and this card's
+    // share of the prompt's compute reserve. The end guard (before the refill)
+    // judges the end against these -- the non-sum residency at the begin
+    // (vram0 - sum) and the loan's reserve are in the expected figure, and the
+    // GTT baseline is what separates a false surplus from a real eviction.
+    struct slot_loan_card_base {
+        ggml_backend_dev_t dev   = nullptr;
+        size_t sum               = 0;
+        size_t vram0             = 0;
+        size_t gtt               = 0;
+        size_t banks             = 0;
+        size_t need              = 0;
+        bool   measured          = false;
+    };
+    std::vector<slot_loan_card_base> slot_loan_sums;
 
     // state of sched_copy_experts, reset before each graph compute
     struct copy_experts_info {
@@ -386,6 +445,20 @@ private:
     };
 
     copy_experts_info copy_experts;
+
+    // an MTP draft context's trace record while the ids read is still in
+    // flight (enqueued from the backend's batch hook, no wait): written at the
+    // next synchronize, beside the logits copy, not on the graph's path. The
+    // unused-path writer steps below only run while the trace is on.
+    struct draft_trace_record {
+        int32_t first_pos = -1;
+        uint32_t n_tokens = 0;
+        std::vector<int32_t> tokens;
+        std::vector<int> il;
+        std::vector<std::vector<int32_t>> ids;
+    };
+    std::vector<draft_trace_record> draft_trace_pending;
+    void flush_draft_trace();
 
     // graph reallocations during inference where the backend assignments did not change, split by whether the
     // graph size is the same as the previously scheduled one (unexpected) or different
@@ -424,6 +497,7 @@ private:
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
     bool has_evaluated_once = false;
+    bool sync_pending       = true;  // ARC-LAB: work queued since the last synchronize (LLAMA_SYNC_TRIM)
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

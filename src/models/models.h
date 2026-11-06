@@ -11,11 +11,8 @@
 class llama_memory_hybrid_idx_context;
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/28068
-static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * x, float eps) {
-    const float n = x->ne[0];
-
-    return ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/n), 1.0f/sqrtf(n));
-}
+// build_gdn_l2_norm and patch 0082's joint q/k form (src/models/gdn-qk-l2-norm.h)
+#include "gdn-qk-l2-norm.h"
 
 //
 // base classes
@@ -97,7 +94,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        g,
             ggml_tensor *        b,
             ggml_tensor *        s,
-            int                  il);
+            int                  il,
+            ggml_tensor *        s_rows = nullptr);   // patch 0081: rows form, s is the 2D cache
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {

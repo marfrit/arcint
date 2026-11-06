@@ -1652,6 +1652,13 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
+                // a negative id: this row is another device's (an expert
+                // cache's hit on the card); it is zero here, for the sum
+                if (i02 < 0) {
+                    memset((char *) dst->data + id*dst->nb[1] + iid1*dst->nb[2], 0, dst->ne[0]*sizeof(float));
+                    continue;
+                }
+
                 assert(i02 >= 0 && i02 < n_as);
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
@@ -1922,6 +1929,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_soft_max_ext_back(params, tensor);
             } break;
+        case GGML_OP_ROPE_APPLY:
+            {
+                ggml_compute_forward_rope_apply(params, tensor);
+            } break;
         case GGML_OP_ROPE:
             {
                 ggml_compute_forward_rope(params, tensor);
@@ -2088,6 +2099,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_GATED_DELTA_NET:
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
+            } break;
+        case GGML_OP_GATED_DELTA_NET_REPLAY:
+            {
+                ggml_compute_forward_gated_delta_net_replay(params, tensor);
             } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
@@ -2285,6 +2300,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_GATED_DELTA_NET_REPLAY:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
@@ -2387,6 +2403,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SOFT_MAX_BACK:
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
+        case GGML_OP_ROPE_APPLY:
         case GGML_OP_ADD_REL_POS:
             {
                 n_tasks = n_threads;
@@ -3027,6 +3044,12 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t S_v = node->src[2]->ne[0];
                         const int64_t K   = ggml_get_op_params_i32(node, 0);
                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
+                        cur = per_thread * sizeof(float) * n_tasks;
+                    } break;
+                case GGML_OP_GATED_DELTA_NET_REPLAY:
+                    {
+                        const int64_t S_v = node->src[2]->ne[0];
+                        const int64_t per_thread = S_v * S_v + S_v + CACHE_LINE_SIZE_F32;
                         cur = per_thread * sizeof(float) * n_tasks;
                     } break;
                 case GGML_OP_COUNT:

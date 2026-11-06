@@ -19,6 +19,10 @@ kernel void kernel_diag_mask_inf(
     int i01 = get_global_id(1);
     int i00 = get_global_id(0);
 
+    if (i00 >= ne00) {   // 0072: exit the rounded uniform launch's tail
+        return;
+    }
+
     if (i00 > n_past + i01) {
         dst[i02*ne01*ne00 + i01*ne00 + i00] = -INFINITY;
     } else {
@@ -33,12 +37,16 @@ kernel void kernel_diag_mask_inf_8(
         ulong offsetd,
         int ne00,
         int ne01,
-        int n_past
+        int n_past,
+        int n_f4     // 0072: float4 units in the tensor (the launch's true count)
 ) {
     src0 = (global float4*)((global char*)src0 + offset0);
     dst = (global float4*)((global char*)dst + offsetd);
 
     int i = 2*get_global_id(0);
+    if (i + 1 >= n_f4) {   // 0072: this item writes two float4; exit the tail
+        return;
+    }
 
     dst[i+0] = src0[i+0];
     dst[i+1] = src0[i+1];

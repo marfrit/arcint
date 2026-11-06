@@ -42,6 +42,11 @@ public:
         std::vector<llama_seq_id> strm; // [ns]
         std::vector<idx_vec_t>    idxs; // [ns]
 
+        // the sequence's cell window (set_seq_windows): the attention views start at kv_off and
+        // span at most kv_win cells; kv_win == 0: the whole stream
+        uint32_t kv_off = 0;
+        uint32_t kv_win = 0;
+
         uint32_t head() const {
             GGML_ASSERT(idxs.size() == 1);
             GGML_ASSERT(!idxs[0].empty());
@@ -186,6 +191,19 @@ public:
     // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
     void state_clear(llama_seq_id seq_id);
 
+    // a sequence's share of a ubatch that mixes windowed sequences (llama-graph.h)
+    using win_part = llama_kv_win_part;
+
+    // the parts of a ubatch whose sequences each have a window (empty: no windows, a
+    // ubatch of one sequence, or tokens not grouped by sequence)
+    std::vector<win_part> get_win_parts(const slot_info & sinfo, const llama_ubatch & ubatch) const;
+
+    // cell windows in a unified cache: sequence i gets the cells [sum of n_cells[0..i), + n_cells[i]),
+    // finds its slots there and attends over its own window only, so one sequence's attention does
+    // not span another's cells. call on an empty cache; false when it cannot apply (several streams,
+    // a shared source cache, sizes over the cache or not multiples of the padding)
+    bool set_seq_windows(const uint32_t * n_cells, int32_t n_seq);
+
     //
     // graph_build API
     //
@@ -233,8 +251,8 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
-    void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t kv_off = 0) const;
+    void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t kv_off = 0) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
@@ -289,6 +307,12 @@ private:
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
 
+    // ARC-LAB: device copies of attn_rot_hadamard (LLAMA_SYNC_TRIM bit 2): graphs read these instead of an input that
+    // is uploaded (one sync + one blocking copy each) on every decode
+    ggml_context_ptr                          attn_rot_dev_ctx;
+    ggml_backend_buffer_ptr                   attn_rot_dev_buf;
+    std::unordered_map<int64_t, ggml_tensor *> attn_rot_dev;
+
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
 
@@ -311,6 +335,14 @@ private:
 
     // maps from a sequence id to a stream id
     std::vector<uint32_t> seq_to_stream;
+
+    // set_seq_windows: per sequence id, the window's first cell, its size and its search head
+    std::vector<uint32_t> win_base;
+    std::vector<uint32_t> win_size;
+    std::vector<uint32_t> win_head;
+
+    // the window holding cell idx, -1 if none
+    int32_t win_of(uint32_t idx) const;
 
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
@@ -400,6 +432,16 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // the first cell of the current ubatch's window (set_seq_windows), 0 without windows
+    uint32_t get_kv_off() const;
+
+    // a ubatch of several windowed sequences: each sequence's rows and window (empty otherwise)
+    const std::vector<llama_kv_cache::win_part> & get_win_parts() const { return win_parts; }
+
+    // views of one part's window
+    ggml_tensor * get_k_part(ggml_context * ctx, int32_t il, const llama_kv_cache::win_part & p) const;
+    ggml_tensor * get_v_part(ggml_context * ctx, int32_t il, const llama_kv_cache::win_part & p) const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -470,4 +512,11 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // set_seq_windows: the parts of a ubatch of several windowed sequences
+    std::vector<llama_kv_cache::win_part> win_parts;
 };
+
+// the full-cache context's cell count while a llama_context reserves its compute
+// buffers (llama_context_params::n_kv_reserve), 0 outside a reservation
+extern thread_local uint32_t llama_kv_reserve_cap;

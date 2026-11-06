@@ -98,10 +98,17 @@ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llam
 // Useful for testing purposes.
 LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 
+// Write the expert cache's pending last graph to the routing trace, at a
+// request's end (campaign expert-foresight). A no-op when the trace is off.
+LLAMA_API void llama_expert_route_trace_flush(struct llama_context * ctx);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
+// skip copying the unmasked nextn rows to the host for the next decodes (the graph is unchanged): a
+// caller that knows it will not read them (a draft context's prompt catch-up) saves the transfer
+LLAMA_API void llama_set_embeddings_nextn_skip(struct llama_context * ctx, bool skip);
 
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to

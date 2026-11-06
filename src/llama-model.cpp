@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-expert-cache.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -2023,6 +2024,94 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_tensors_hadamard();
 
+    // LLAMA_EXPERT_CACHE_MIB / LLAMA_EXPERT_CACHE_PROFILE: the same for tools
+    // that do not set the parameters (llama-bench, llama-perplexity); "A,B"
+    // gives one budget per device, as expert_cache_bytes_dev
+    std::vector<size_t> ec_dev;
+    if (params.expert_cache_bytes_dev != nullptr) {
+        ec_dev.assign(params.expert_cache_bytes_dev, params.expert_cache_bytes_dev + params.n_expert_cache_bytes_dev);
+    }
+    size_t       ec_bytes   = params.expert_cache_bytes;
+    const char * ec_profile = params.expert_cache_profile;
+    size_t       ec_lend    = params.slot_loan_bytes;   // the prefill-slot-loan's lend budget
+    if (ec_bytes == 0 && ec_dev.empty() && getenv("LLAMA_EXPERT_CACHE_MIB")) {
+        const std::string v = getenv("LLAMA_EXPERT_CACHE_MIB");
+        if (v.find(',') == std::string::npos) {
+            ec_bytes = (size_t) atoll(v.c_str()) << 20;
+        } else {
+            for (size_t at = 0; at <= v.size();) {
+                const size_t comma = std::min(v.find(',', at), v.size());
+                ec_dev.push_back((size_t) atoll(v.substr(at, comma - at).c_str()) << 20);
+                at = comma + 1;
+            }
+        }
+        ec_profile = getenv("LLAMA_EXPERT_CACHE_PROFILE");
+    }
+    // one cache per GPU that runs MoE layers with experts in host memory: with
+    // per-device budgets, device i of the model takes ec_dev[i]; with one
+    // budget, the first such device takes it and the others keep none
+    bool budget_taken = false;
+    for (size_t i = 0; i < devices.size(); ++i) {
+        ggml_backend_dev_t dev = devices[i].dev;
+        if (devices[i].is_meta || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        size_t budget = 0;
+        if (!ec_dev.empty()) {
+            budget = i < ec_dev.size() ? ec_dev[i] : 0;
+        } else if (!budget_taken && ec_bytes > 0 && llama_expert_cache::has_layers(*this, ml, dev)) {
+            budget       = ec_bytes;
+            budget_taken = true;
+        }
+        if (budget == 0) {
+            continue;
+        }
+        auto ec = std::make_unique<llama_expert_cache>();
+        if (ec->init(*this, ml, dev, budget, ec_profile, ec_lend)) {
+            expert_caches.push_back(std::move(ec));
+        }
+    }
+    if (ec_bytes > 0 && ec_dev.empty() && !budget_taken) {
+        // no device qualified: init's reason (layer 0's placement) for the first GPU
+        for (const auto & d : devices) {
+            if (!d.is_meta && ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                llama_expert_cache().init(*this, ml, d.dev, ec_bytes, ec_profile);
+                break;
+            }
+        }
+    }
+
+    return true;
+}
+
+static void llama_expert_cache_info_from(const llama_expert_cache_stats & s, llama_expert_cache_info * info) {
+    info->decode_hits   = s.decode_hits;
+    info->decode_misses = s.decode_misses;
+    info->swaps         = s.swaps;
+    info->adapts        = s.adapts;
+    info->apply_us      = s.apply_us;
+    info->slots         = s.slots;
+    info->bytes         = s.bytes;
+    info->bank_bytes    = s.bank_bytes;
+}
+
+bool llama_model_expert_cache_info(const llama_model * model, llama_expert_cache_info * info) {
+    if (model == nullptr || model->expert_caches.empty() || info == nullptr) {
+        return false;
+    }
+    llama_expert_cache_stats sum;
+    for (const auto & ec : model->expert_caches) {
+        const llama_expert_cache_stats s = ec->stats();
+        sum.decode_hits   += s.decode_hits;
+        sum.decode_misses += s.decode_misses;
+        sum.swaps         += s.swaps;
+        sum.adapts         = std::max(sum.adapts, s.adapts);   // one global plan adapts every cache at once
+        sum.apply_us      += s.apply_us;
+        sum.slots         += s.slots;
+        sum.bytes         += s.bytes;
+        sum.bank_bytes    += s.bank_bytes;
+    }
+    llama_expert_cache_info_from(sum, info);
     return true;
 }
 
@@ -2355,6 +2444,26 @@ void llama_model_base::load_tensors_hadamard() {
 
     LLAMA_LOG_INFO("%s: loaded %zu Hadamard-folded weight(s) (%zu inverse-lookup) using %zu rotation(s) and %zu sign vector(s)\n",
             __func__, hdmd.rot.size() + hdmd.inv.size(), hdmd.inv.size(), rotations.size(), sign_tensors.size());
+}
+
+int llama_model_expert_cache_count(const llama_model * model) {
+    return model ? (int) model->expert_caches.size() : 0;
+}
+
+bool llama_model_expert_cache_info_dev(const llama_model * model, int i, llama_expert_cache_info * info) {
+    if (model == nullptr || info == nullptr || i < 0 || i >= (int) model->expert_caches.size()) {
+        return false;
+    }
+    llama_expert_cache_info_from(model->expert_caches[i]->stats(), info);
+    return true;
+}
+
+const char * llama_model_expert_cache_device(const llama_model * model, int i) {
+    if (model == nullptr || i < 0 || i >= (int) model->expert_caches.size()) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = model->expert_caches[i]->device();
+    return dev ? ggml_backend_dev_name(dev) : nullptr;
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -3342,6 +3451,11 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.expert_cache_bytes          =*/ 0,
+        /*.expert_cache_profile        =*/ nullptr,
+        /*.expert_cache_bytes_dev      =*/ nullptr,
+        /*.n_expert_cache_bytes_dev    =*/ 0,
+        /*.slot_loan_bytes             =*/ LLAMA_SLOT_LOAN_BYTES_ENV,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

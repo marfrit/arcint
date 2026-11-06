@@ -78,6 +78,16 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // GDN rollback by replay (LLAMA_GDN_REPLAY=1, default off). Per layer the
+    // S tensor then has 2 plane groups only: plane 0 = base state, plane 1 =
+    // two banks of per-token update records (ggml_gated_delta_net_replay). The
+    // conv state r keeps its 1 + n_rs_seq snapshot planes.
+    bool     rpl   = false;
+    uint32_t rpl_R = 0;              // floats per record: H * (2 * S + 1)
+    std::vector<uint32_t> rpl_n;     // per seq: records still to re-apply onto the base state
+    std::vector<uint8_t>  rpl_bank;  // per seq: bank holding them
+    void rpl_reset(llama_seq_id seq_id); // seq_id < 0: all
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -133,7 +143,8 @@ private:
     size_t size_p_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+            const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges_s, uint32_t rpl_pending, uint32_t rpl_bank_cur) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
@@ -172,6 +183,10 @@ public:
     //
 
     uint32_t get_n_rs() const;
+    // GDN rollback by replay (see llama_memory_recurrent::rpl)
+    bool    get_rpl() const;
+    int32_t rpl_row(int i) const; // plane-0 S row the state of rs i is read from
+    void    rpl_take(int i, uint32_t n_seq_tokens, int32_t & n_rec, int32_t & bank) const;
     uint32_t get_head() const;
     int32_t  get_rs_z() const;
     uint32_t get_size() const;

@@ -3,6 +3,10 @@
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
 
+// patch 0051/0081: the raw gating projections, kept alive to the GDN node on
+// src[8]/src[9] (the family contract, gdn-gate-inputs.h)
+#include "gdn-gate-inputs.h"
+
 // utility to get one slice from the third dimension
 // input dim:  [x, y, c, b]
 // output dim: [x, y, 1, b]
@@ -397,6 +401,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
 
     // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
     ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
+    gdn_keep_gating_inputs(result, g, b);
     if (n_tokens == 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
     } else {
@@ -530,19 +535,32 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor *        g,
         ggml_tensor *        b,
         ggml_tensor *        s,
-        int                  il) {
+        int                  il,
+        ggml_tensor *        s_rows) {
     const auto * mctx_cur   = inp->mctx;
     const auto   kv_head    = mctx_cur->get_head();
     const uint32_t mem_size = mctx_cur->get_size();
 
-    const int64_t S_v          = s->ne[0];
-    const int64_t H_v          = s->ne[2];
-    const int64_t n_seqs       = s->ne[3];
+    const int64_t S_v          = v->ne[0];
+    const int64_t H_v          = v->ne[1];
+    const int64_t n_seqs       = v->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
+
+    const int64_t D = S_v * S_v * H_v;
+
+    // rows mode (patch 0081): s is the 2D recurrent cache [D, n_rows] and each
+    // sequence's live state is read at row s_rows[seq], no gathered scratch.
+    const bool rows = s_rows != nullptr;
+    if (rows) {
+        GGML_ASSERT(s->ne[0] == D);
+        GGML_ASSERT(s_rows->type == GGML_TYPE_I32 && ggml_nelements(s_rows) == n_seqs);
+    } else {
+        GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v && s->ne[3] == n_seqs);
+    }
 
     const bool keep = cparams.n_rs_seq > 0;
 
-    if (!keep) {
+    if (!keep && !rows) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
         ggml_tensor * output    = attn_out.first;
         ggml_tensor * new_state = attn_out.second;
@@ -557,11 +575,58 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         return output;
     }
 
-    const int64_t D = S_v * S_v * H_v;
-    const int64_t K = cparams.n_rs_seq + 1;
+    // the op path: keep == true (gather or rows), or rows (K == 1)
+    const int64_t K = keep ? cparams.n_rs_seq + 1 : 1;
 
-    // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    if (inp->s_rpl_ctrl) {
+        // ARC-LAB: rollback by replay (independent implementation of the technique described by llamADALL). One
+        // base state in plane 0 plus the update records of the last K-1 tokens in plane 1 (two banks: this pass
+        // reads one, its records go to the other) instead of K snapshot planes; see ggml_gated_delta_net_replay.
+        GGML_ASSERT(!rows && n_seqs == 1 && g->ne[0] == 1);
+        // the memory allocates S with planes 0 and 1 only in replay mode (llama_memory_recurrent::rpl)
+        GGML_ASSERT(ssm_states_all->ne[1] == 2 * (int64_t) mem_size);
+        const int64_t R        = H_v * (2 * S_v + 1);
+        const size_t  row_size = ssm_states_all->nb[1];
+        const size_t  rec_size = ggml_row_size(ssm_states_all->type, R * (K - 1));
+
+        // both banks of this cell's records: [R*(K-1), 2, n_seqs]
+        ggml_tensor * rec = ggml_view_3d(ctx0, ssm_states_all, R * (K - 1), 2, n_seqs, rec_size, row_size,
+                (size_t) (mem_size + kv_head) * row_size);
+
+        ggml_tensor * gdn_out = ggml_gated_delta_net_replay(ctx0, q, k, v, g, b, s, rec, inp->s_rpl_ctrl, (int) K);
+        res->add_fused_node({n_seq_tokens > 1 ? LLM_FUSED_OP_GDN_CH : LLM_FUSED_OP_GDN_AR, gdn_out, il});
+
+        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
+            S_v, H_v, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+            0);
+        cb(output, "attn_output", il);
+
+        const size_t base_off = ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens * n_seqs);
+        const size_t rec_off  = base_off + ggml_row_size(gdn_out->type, D * n_seqs);
+
+        // base state -> plane 0; records -> the bank s_rpl_wrow picks (the OpenCL backend fuses both into the op)
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0,
+            ggml_view_2d(ctx0, gdn_out, D, n_seqs, ggml_row_size(gdn_out->type, D), base_off),
+            ggml_view_2d(ctx0, ssm_states_all, D, n_seqs, row_size, (size_t) kv_head * row_size)));
+
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0,
+            ggml_view_2d(ctx0, ssm_states_all, R * (K - 1), 2, rec_size, (size_t) (mem_size + kv_head) * row_size),
+            ggml_view_2d(ctx0, gdn_out, R * (K - 1), n_seqs, rec_size, rec_off),
+            inp->s_rpl_wrow));
+
+        return output;
+    }
+
+    // op writes the K snapshot slots into the output; the state read is the cache
+    // row in rows mode, the gathered 4D state otherwise
+    ggml_tensor * gdn_out = rows
+        ? ggml_gated_delta_net_rows(ctx0, q, k, v, g, b, s, s_rows, K)
+        : ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+
+    gdn_keep_gating_inputs(gdn_out, g, b);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {
@@ -578,6 +643,25 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
         0);
     cb(output, "attn_output", il);
+
+    if (!keep) {
+        // K == 1: the new state is the single snapshot; written back as the
+        // gather path writes it (the same destination and order)
+        ggml_tensor * new_state = ggml_view_4d(ctx0, gdn_out,
+            S_v, S_v, H_v, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * S_v),
+            ggml_row_size(gdn_out->type, S_v * S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens * n_seqs));
+        cb(new_state, "new_state", il);
+
+        ggml_build_forward_expand(gf,
+                ggml_cpy(ctx0, new_state,
+                    ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+
+        return output;
+    }
 
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 

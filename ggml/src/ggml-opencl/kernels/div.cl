@@ -59,7 +59,8 @@ kernel void kernel_div_row(
         ulong offset1,
         global float4 * dst,
         ulong offsetd,
-        int ne
+        int ne,
+        int n_total
 ) {
     src0 = (global float4*)((global char*)src0 + offset0);
     src1 = (global float4*)((global char*)src1 + offset1);
@@ -67,6 +68,9 @@ kernel void kernel_div_row(
 
     // This performs better than using %.
     uint gid = get_global_id(0);
+    if (gid >= (uint) n_total) {   // 0072: exit the rounded uniform launch's tail
+        return;
+    }
     uint idx1 = gid - (gid/ne)*ne; // get_global_id(0) % ne
     dst[gid] = src0[gid] / src1[idx1];
 }
@@ -125,7 +129,8 @@ kernel void kernel_div_row_f16(
         ulong offset1,
         global half4 * dst,
         ulong offsetd,
-        int ne
+        int ne,
+        int n_total
 ) {
     src0 = (global half4*)((global char*)src0 + offset0);
     src1 = (global half4*)((global char*)src1 + offset1);
@@ -133,6 +138,9 @@ kernel void kernel_div_row_f16(
 
     // This performs better than using %.
     uint gid = get_global_id(0);
+    if (gid >= (uint) n_total) {   // 0072: exit the rounded uniform launch's tail
+        return;
+    }
     uint idx1 = gid - (gid/ne)*ne; // get_global_id(0) % ne
     dst[gid] = src0[gid] / src1[idx1];
 }
