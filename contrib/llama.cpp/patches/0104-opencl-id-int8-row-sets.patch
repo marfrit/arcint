@@ -6,7 +6,8 @@ Subject: [PATCH] 0104-opencl-id-int8-row-sets
 ---
  ggml/src/ggml-opencl/ggml-opencl.cpp             |  18 +-
  ggml/src/ggml-opencl/kernels/mul_mm_id_i8_sg8.cl | 244 +++++++++++++++++------
- 2 files changed, 200 insertions(+), 62 deletions(-)
+ tests/test-backend-ops.cpp                       |   3 +
+ 3 files changed, 203 insertions(+), 62 deletions(-)
 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
 index f1f1010..3d931ba 100644
@@ -406,6 +407,20 @@ index 4241d7c..0654a0f 100644
              }
          }
      }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 5408727..b17a14f 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11656,6 +11656,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_mul_mat_id_dup(type_a, GGML_TYPE_F32, 8, 4, false, 64, 64, 256));
+         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 4, true, 64, 64, 256, 1.0f, 0, true));
+         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, true, 50, 33, 256));
++        // 0104: rows that end inside a sub-group's sets of 8 at NR 2 and at NR 4
++        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, true,  24, 33, 512));
++        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, false, 2040, 33, 512));
+     }
+ 
+     // Q2_0 rows of 20 and 12 sub-blocks (4 lanes a row in the OpenCL low-bit matvec) and of 10 (16 lanes):
 -- 
 2.47.3
 

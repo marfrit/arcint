@@ -58,6 +58,7 @@ primitive is also already used, on the dense Q4_K path (`code`, README 0013,
 
 ## Current state
 
+- **Alchemist, 2026-11-06 (`measured-here`, the coder's file on the A770): adopted on a dev binary.** `0103` + `0104` (`mul_mm_id_i8_sg8.cl`) carry IQ4_XS, IQ4_NL and Q4_K, with no local memory: served prefill at 41k 843.3 -> 958.5 t/s (+13.7 %), 4,096 tokens 1,915 -> 2,150; decode equal in the cost of a verify; draft acceptance equal over 24 prompts x 2 rounds; the task 10/10 x3; KL +.0022 / +.0031, top -0.74 / +0.20 points. Peak +43 MiB, 25 MiB free at a 90k prompt, no eviction. The numbers and the path there (the first form lost 15 %; half its kernel was activation reads; a sub-group now owns two sets of 8 rows on one read) are in `contrib/llama.cpp/README.md` 0103 and 0104. Named deviation from Strata (`code`): its default keeps Alchemist on FP16, and its activation scale is per 32 of K against 256 here; per 32 has not been tried and is the first lever for the KL. The Battlemage arm below (`0071`, opt-in, the argmax bar failing) is unchanged and untested against this form: the B60 has no sub-group 8.
 - Card round 8 (`measured-here`, a B60, windows 27 and 28, `cecdea0`'s build; no
   kernel change in this round): clang-18 on the assembled program at SG16 and
   SG8, 0 errors, and `tests/test-opencl-kq-i8` run with `CLANG` all OK; Intel's
