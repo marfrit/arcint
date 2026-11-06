@@ -162,7 +162,8 @@ public:
             h.dim   = i == 2 ? 3u : static_cast<uint32_t>(dim);
             h.dtype = i == 2 ? kCaptureI32 : kCaptureF32;
             kind_[i] = h;
-            if (!write_header(i)) {
+            // pwrite leaves the file offset at 0: the records start after the header
+            if (!write_header(i) || ::lseek(fd_[i], static_cast<off_t>(kMtpCaptureHeaderBytes), SEEK_SET) < 0) {
                 err = "ARCINT_MTP_CAPTURE: cannot write the header of " + path_[i];
                 abandon();
                 return false;

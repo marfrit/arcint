@@ -1,6 +1,6 @@
 # mtp-head-fit — refit the MTP head against what the served model writes
 
-**Open.** Step one measured (2026-11-06); recon done, E0 and E1 under way; no fitting tool yet.
+**Open.** Step one measured (2026-11-06); recon done, E0 under way; the E1 tooling is built (capture hook, replay, eval, linear fit; section "E1 tooling"), its card window not yet run.
 
 ## Charter
 
@@ -54,6 +54,14 @@ Planning range 0 to +8 % decode, more likely under +5 %: a judgement, which only
 - **The full fit, only after these.** CE plus top-10 and an unrolled 3-step chain, `eh_proj`, `attn_output` and norms before any experts: 92k tokens are far too few for 3.1 M weights an expert. 15-20 agent hours, 2-5 card hours.
 
 Risks: overfitting; quantization erasing the fit (the served Q4_K head is 0.075 relative from F16; measure the delta against that); wider verifies eating the gain, which is why thinking's +10 % becomes +5.8 %; prefill rows against verify rows. A rows refit needs a sidecar flag on `DraftHead`, since those rows are shared with the target, and that conflicts with "the served path does not change": the operator's call if it comes to it.
+
+## E1 tooling (`code`; built 2026-11-06, device-free tests green, no card run yet)
+
+- **Capture.** `ARCINT_MTP_CAPTURE=<base>` (`src/exec/mtp_capture.h`, wired in `llama_spec.cpp` `decode_multi`): per prompt position the target's row `h` and the head's row `z`, raw f32, plus a token index; format and alignment rule in the header file. Both rows are post-norm vectors that `output.weight` multiplies and both predict the next token: `z(p)` is the head's output for the entry `(tok p, h(p-1))`. Off: one getenv at construction and a pointer test. On: needs `--llama-mtp-vocab` (refused at start without it), holds the 0067 skip off, and the backend starts every request on an empty lane so no position is skipped by prefix reuse. Only the prompt pass is captured, not verify rows.
+- **Replay.** `tools/mtp_capture_replay.py` sends each corpus text as a token-array prompt with `max_tokens` 1, thinking text as its own class, tool class dropped, and re-tokenised counts checked against `tokens`. Rows are found afterwards by the hash of each text's ids, so stray requests and retries do not shift anything.
+- **Eval and fit.** `tools/mtp_fit.py eval|linear`; numpy only; `W_d` read from `output.weight` of the served GGUF (Q6_K on the coder; the Q6_K and Q4_K decoders agree with the F16 file at 0.019 and 0.075 relative, the latter the figure above). Splits are by task, stratified by class, ordered by a hash.
+- **What the capture cannot give.** Only depth 1 is captured: a deeper draft of the served chain feeds the head its own row, the capture holds the target's. The round-start simulation therefore reproduces the first-draft column of the served table; depths 2 to 4 are the head with a teacher-forced input, an upper bound.
+- **What the corpus allows.** After the tool class is dropped, 61 k tokens train, 14 k validate, 17 k test (by task); code 39 task keys, prose 30, thinking 16. The held-out thinking class is 3 tasks (3.6 k rows): a gate of 2 points on thinking is inside its noise until more thinking text exists.
 
 ## Where it lives
 
