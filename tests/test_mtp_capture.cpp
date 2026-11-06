@@ -7,12 +7,14 @@
 //
 // Red mutations seen failing while this was written:
 // (a) a chunk at position 0 not opening a request (req stuck at 0) -> the
-//     index bytes of the second lane differ from the fixture; (b) the count
-//     not rewritten after an append -> the header bytes differ; (c) the z rows
-//     written into the h file -> both row files differ; (d) O_EXCL dropped ->
-//     the refuses-an-existing-file case stops failing to open; (e) the off
-//     case without the unsetenv is vacuous when the caller exported
-//     ARCINT_MTP_CAPTURE (seen failing with the variable set).
+//     token index differs from the fixture; (b) the count not rewritten after
+//     an append -> the header bytes differ; (c) the z rows written into the h
+//     file -> the h file differs; (d) O_EXCL dropped -> the refuses-an-existing-
+//     file case fails; (e) the off case without its unsetenv is vacuous when
+//     the caller exported ARCINT_MTP_CAPTURE (seen failing with the variable
+//     set); (f) the file offset left at 0 after the header's pwrite -> the
+//     first records overwrite the header: this one was a real defect of the
+//     first version of the writer, found by the fixture comparison.
 #include "exec/mtp_capture.h"
 #include "harness.h"
 
