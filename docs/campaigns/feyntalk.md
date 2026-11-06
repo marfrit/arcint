@@ -1066,6 +1066,8 @@ for that backend and does not retry silently.
 
 ### D6 — Gateway integration (llm-proxy)
 
+**Amended by the operator, 2026-11-06:** a request on a token-mode model name fails when it cannot run token mode; the silent fallback to the text path below stays only for plain names. The fallback hid a defect: the gateway's render lacked the template's `reasoning_effort`, so every effort-bearing turn on Qwen3.8's template took the text path with a log line nobody read, and `token_mode: ready` on `/props` never ran a turn (`measured-here`: 409 without the level, 200 with it, on the agent; the coder's template does not read it). Gateway: llm-proxy 1.3.3.
+
 Capability, not model name: at discovery, `GET /props` says `token_mode` and
 `renderer_hash`; if `ready`, fetch `/v1/responses/renderer`, validate and cache
 by hash. `local-backends.json` may pin `feyntalk: "tokens"|"text"|"off"` as
