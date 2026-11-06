@@ -10,8 +10,15 @@ tree is that commit with the patches below applied in order:
     git -C <llama.cpp> apply <arcint>/contrib/llama.cpp/patches/*.patch
 
 A patch that does not apply cleanly to the pin is a bug in this directory, not
-a reason to move the pin. Each patch stays PR-shaped, so it can be offered
-upstream.
+a reason to move the pin. Since the fold of 0001-0096 (2026-11) the directory
+holds twelve topic patches, `0000-01-*` to `0000-12-*`, followed by 0097 and
+the later patches one by one. The patches are no longer PR-shaped: the
+repository is where the concepts are read (the sections below, the code), and
+a topic patch is the diff between two intermediate trees of the fold, which
+need not build. The sum is byte-identical to the unfolded series;
+`patches/FOLDED.md` maps every old number to its folded patch and names the
+commit that holds the unfolded files. To offer something upstream, extract
+it from the code and its section below.
 
 A patch's KL check runs two arms: one sequence a batch, and four sequences a
 batch (`llama-perplexity -b 4*c`, ubatches that mix the sequences). arcint
@@ -48,8 +55,9 @@ The procedure:
    `LLAMA_TARBALL_SHA256`), the same two ARGs in `docker/Dockerfile.arcint`
    (its build checks them against the recipe), and the pin named here.
 2. The patches ported in order, each committed and then regenerated as a
-   patch against its predecessor, so each stays PR-shaped and applies with
-   `git apply` on the new pin.
+   patch against its predecessor, so each applies with `git apply` on the new
+   pin (the folded topic patches are ported as the unfolded ones were, and
+   re-folded).
 3. Each patch's own record re-run on the port: its test-backend-ops suites on
    both cards, its red case failing and its old-form switch passing, and
    the KL arms where the patch carries one (one and four sequences a batch).
@@ -165,6 +173,10 @@ the survey of what upstream changed and what is open there is
   prefill 697.7 / 493.4 -> 695.5 / 491.9 t/s at 55k / 138k, the needle, the
   acceptance task 10/10 (the same program); the coder 51.2 / 47.5 / 44.1 ->
   51.1 / 47.6 / 44.1 t/s, the same texts (md5), the needle, the task 9/10.
+
+The numbers below 0097 are history labels: the files they name were folded into
+the `0000-NN-*` patches, and `patches/FOLDED.md` resolves each number to its
+folded patch. 0097 and later are files of their own.
 
 ## 0001-opencl-intel-kquant-integer-dot-and-xmx.patch
 

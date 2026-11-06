@@ -1,0 +1,2479 @@
+Expert-cache diagnostics
+
+Folded from the old patches: 0069, 0070, 0077.
+
+The expert routing trace, the learned-profile save and the alias-page tripwire.
+
+The old patch files (named in FOLDED.md) are history; the section for each old number
+in contrib/llama.cpp/README.md still describes its measurements. This file is the
+diff between the tree after the previous folded patch and the tree after this one;
+the sum of all folded patches is byte-identical to the old series applied in order.
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl-alias.h b/ggml/src/ggml-opencl/ggml-opencl-alias.h
+new file mode 100644
+index 0000000..cafd107
+--- /dev/null
++++ b/ggml/src/ggml-opencl/ggml-opencl-alias.h
+@@ -0,0 +1,47 @@
++// 0077: the VRAM alias check's sampled plan, a deviation from Strata.
++//
++// Strata's `sycl_queue.hpp:168-206, 259-295` tags EVERY 64 KiB block of an
++// allocation of 32 MiB or more with GPU kernels and retries behind a spacer
++// (`code`, audit item 19); two virtual blocks sharing one physical page make
++// the later write visible in the earlier block. This plan samples at most
++// GGML_CL_ALIAS_BLOCKS blocks an allocation, each 64 KiB, spread evenly by
++// `j_i = i * n / k` over the block count (unique for n >= k); a smaller
++// allocation is one block or none. The scan runs whenever the bank stream ring
++// is (re)allocated at a learned order's completion; a relearn after a reset
++// scans again, and it is not model load. The sample's
++// hit probability is Strata's full-scan class only in part; the record names
++// the price and the full-scan alternative. This header holds the plan and the
++// pattern, so the device-free cell tests exactly what the backend runs.
++#ifndef GGML_OPENCL_ALIAS_H
++#define GGML_OPENCL_ALIAS_H
++
++#include <cstddef>
++#include <cstdint>
++
++constexpr size_t GGML_CL_ALIAS_BLOCK  = 64u << 10;
++constexpr size_t GGML_CL_ALIAS_BLOCKS = 16;
++
++// the 64 KiB-aligned block offsets to check in an allocation of `bytes`
++static inline size_t ggml_cl_alias_offsets(size_t bytes, size_t * out, size_t cap) {
++    if (bytes < GGML_CL_ALIAS_BLOCK || cap == 0) {
++        return 0;
++    }
++    const size_t n = bytes / GGML_CL_ALIAS_BLOCK;
++    const size_t k = n < cap ? n : cap;
++    // evenly spread and unique: j_i = i * n / k over the block count
++    for (size_t i = 0; i < k; ++i) {
++        out[i] = ((i * n) / k) * GGML_CL_ALIAS_BLOCK;
++    }
++    return k;
++}
++
++// the block's pattern: two 64-bit words carrying its id, then repeated
++static inline void ggml_cl_alias_pattern(uint64_t id, void * block) {
++    uint64_t * w = (uint64_t *) block;
++    const size_t n = GGML_CL_ALIAS_BLOCK / sizeof(uint64_t);
++    for (size_t i = 0; i < n; ++i) {
++        w[i] = (i & 1) ? ~id : id;
++    }
++}
++
++#endif  // GGML_OPENCL_ALIAS_H
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 3ab9373..3bb7e34 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -15,6 +15,7 @@
+ 
+ #include "cl-program-cache.h"
+ #include "ggml-opencl-miss-cpu.h"
++#include "ggml-opencl-alias.h"
+ // 0071: the int8 DPAS expert GEMM's dispatch rule, the same text the kernel gets
+ #include "kernels/kq_i8_ops.inc"
+ // 0072: the uniform-work-group rounding rule, shared with the device-free test
+@@ -85,6 +86,37 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
+         }                                                           \
+     } while (0)
+ 
++// patch 0077: the VRAM alias check over one device allocation at a time, a
++// sampled deviation from Strata's full 64 KiB scan. At most
++// GGML_CL_ALIAS_BLOCKS blocks are written with a pattern carrying the block's
++// index, all writes before any read-back; two blocks sharing one physical page
++// make the earlier read-back differ. Device-free plan and pattern in
++// ggml-opencl-alias.h. Findings are named per block; every scan ends with one
++// summary line.
++static int ggml_cl_alias_scan_device(cl_command_queue q, cl_mem mem, size_t size, const char * what, size_t * n_blocks) {
++    size_t offs[GGML_CL_ALIAS_BLOCKS];
++    const size_t k = ggml_cl_alias_offsets(size, offs, GGML_CL_ALIAS_BLOCKS);
++    *n_blocks += k;
++    if (k == 0) return 0;
++    std::vector<std::vector<uint8_t>> expected(k, std::vector<uint8_t>(GGML_CL_ALIAS_BLOCK));
++    std::vector<std::vector<uint8_t>> actual(k, std::vector<uint8_t>(GGML_CL_ALIAS_BLOCK));
++    for (size_t i = 0; i < k; ++i) ggml_cl_alias_pattern((uint64_t) i, expected[i].data());
++    for (size_t i = 0; i < k; ++i) {
++        CL_CHECK(clEnqueueWriteBuffer(q, mem, CL_TRUE, offs[i], GGML_CL_ALIAS_BLOCK, expected[i].data(), 0, NULL, NULL));
++    }
++    for (size_t i = 0; i < k; ++i) {
++        CL_CHECK(clEnqueueReadBuffer(q, mem, CL_TRUE, offs[i], GGML_CL_ALIAS_BLOCK, actual[i].data(), 0, NULL, NULL));
++    }
++    int bad = 0;
++    for (size_t i = 0; i < k; ++i) {
++        if (memcmp(actual[i].data(), expected[i].data(), GGML_CL_ALIAS_BLOCK) != 0) {
++            ++bad;
++            GGML_LOG_WARN("ggml_opencl: alias check, %s: block %zu at %zu reads back differently\n", what, i, offs[i]);
++        }
++    }
++    return bad;
++}
++
+ //------------------------------------------------------------------------------
+ // OpenCL
+ //------------------------------------------------------------------------------
+@@ -10415,6 +10447,47 @@ static void ggml_cl_topk_moe_fused(ggml_backend_t backend, ggml_cgraph * cgraph,
+     const cl_ulong offl = el->offset + logits->view_offs, offi = ei->offset + ids->view_offs, offw = ew->offset + w->view_offs;
+     const cl_ulong nbl1 = logits->nb[1], nbi1 = ids->nb[1], nbw1 = w->nb[1];
+     const int n_expert = (int) logits->ne[0], k = (int) ids->ne[0], n_tok = (int) logits->ne[1];
++    // a card check's evidence that the trace-on drafter is the served drafter:
++    // the trace's MTP block names its routed ids "ffn_moe_ids_trace", a name
++    // set only in an MTP context while LLAMA_EXPERT_ROUTE_TRACE is on. The
++    // fusion is a backend decision nothing else logs, and a broken node order
++    // (the CONT before the router's ten nodes) makes can_fuse fail, so the
++    // line is absent -- which is the red state. Only the MTP trace graph, not
++    // the target graph's routers, so the log stays quiet under a trace.
++    //
++    // WARN, once per process: an INFO line is routed to verbose and dropped at
++    // the units' default level, and once per fused dispatch it floods a
++    // month-long trace (~100 lines a second of MTP decode).
++    //
++    // Trace off costs a static read-once guard and a compare; trace on scans
++    // each graph once, not each fused dispatch (a target graph's 48 routers
++    // would otherwise scan 48 nodes 48 times and price the scan as the trace).
++    static int trace_env_state = 0; // 0 unread, 1 on, -1 off
++    if (trace_env_state == 0) {
++        const char * e = getenv("LLAMA_EXPERT_ROUTE_TRACE");
++        trace_env_state = (e != nullptr && *e != '\0') ? 1 : -1;
++    }
++    if (trace_env_state == 1) {
++        static bool mtp_trace_logged = false;
++        static const ggml_cgraph * mtp_trace_scanned_graph = nullptr;
++        static bool mtp_trace_scanned = false;
++        if (!mtp_trace_logged) {
++            if (cgraph != mtp_trace_scanned_graph) {
++                mtp_trace_scanned = false;
++                // the graph callback's name is "%s-%d" (ggml_format_name), so
++                // compare the 18-byte prefix, never the NUL-terminated 18 bytes
++                for (int j = 0; j < cgraph->n_nodes && !mtp_trace_scanned; ++j) {
++                    mtp_trace_scanned = strncmp(cgraph->nodes[j]->name, "ffn_moe_ids_trace",
++                                                sizeof("ffn_moe_ids_trace") - 1) == 0;
++                }
++                mtp_trace_scanned_graph = cgraph;
++            }
++            if (mtp_trace_scanned) {
++                GGML_LOG_WARN("opencl: topk-moe fused in the MTP trace graph (n_expert %d, n_tok %d)\n", n_expert, n_tok);
++                mtp_trace_logged = true;
++            }
++        }
++    }
+     float cmin = 0.0f, cmax = 0.0f;
+     memcpy(&cmin, (const float *) n[7]->op_params + 0, sizeof(float));
+     memcpy(&cmax, (const float *) n[7]->op_params + 1, sizeof(float));
+@@ -28625,6 +28698,12 @@ static bool ggml_cl_bank_stream(ggml_backend_opencl_context * ctx, const ggml_te
+         if (bs.q == nullptr) CL_CHECK((bs.q = clCreateCommandQueue(ctx->context, ctx->device, 0, &err), err));
+         if (bs.ring.empty()) bs.ring.resize(K);   // kept across a relearn (it only grows)
+         for (auto & b : bs.ring) b.allocate(ctx->context, bs.max_bytes);
++        size_t alias_blocks = 0;
++        int alias_bad = 0;
++        for (auto & b : bs.ring) {
++            if (b.buffer != nullptr) alias_bad += ggml_cl_alias_scan_device(ctx->queue, b.buffer, b.size, "bank stream ring", &alias_blocks);
++        }
++        GGML_LOG_WARN("ggml_opencl: alias check, bank stream ring: %d of %zu sampled blocks differ\n", alias_bad, alias_blocks);
+         if (bs.copied.empty()) bs.copied.assign(K, nullptr);
+         if (bs.used.empty())   bs.used.assign(K, nullptr);
+         bs.holds.assign(K, -1);
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index d17a91b..b82ca4a 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -36,9 +36,11 @@ set(LLAMA_CORE_SOURCES
+     llama-mmap.cpp
+     llama-model-loader.cpp
+     llama-expert-cache.cpp
++    llama-expert-route-trace.cpp
+     llama-model-saver.cpp
+     llama-model.cpp
+     llama-quant.cpp
++    llama-expert-profile.cpp
+     llama-sampler.cpp
+     llama-vocab.cpp
+     unicode-data.cpp
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index e342424..f61c06a 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,5 +1,6 @@
+ #include "llama-context.h"
+ #include "llama-expert-cache.h"
++#include "llama-expert-route-trace.h"
+ 
+ #include "ggml.h"
+ #include "llama-arch.h"
+@@ -1745,6 +1746,14 @@ const char * llama_context_slot_loan_state(llama_context * ctx) {
+     return ctx->slot_loan_state();
+ }
+ 
++void llama_context::flush_draft_trace() {
++    auto & t = llama_expert_route_trace::instance();
++    for (const auto & r : draft_trace_pending) {
++        t.event_graph(LLAMA_EXPERT_ROUTE_DRAFT, r.first_pos, r.n_tokens, r.tokens, r.il, r.ids);
++    }
++    draft_trace_pending.clear();
++}
++
+ // ARC-LAB: LLAMA_SYNC_TRIM bit mask (default 2 since patch 0094; 0 = upstream behaviour): 1 = skip a
+ // context synchronize when the context queued nothing since its last one,
+ // 2 = KV-cache rotation matrices kept on the device (llama-kv-cache.cpp),
+@@ -1773,6 +1782,12 @@ void llama_context::synchronize() {
+ 
+     ggml_backend_sched_synchronize(sched.get());
+ 
++    // the MTP trace record's ids are complete now: write it beside the logits
++    // copy, after the one synchronize, never a second wait
++    if (!draft_trace_pending.empty()) {
++        flush_draft_trace();
++    }
++
+     // FIXME: if multiple single tokens are evaluated without a synchronization,
+     // the stats will be added to the prompt evaluation stats
+     // this should only happen when using batch size 1 to evaluate a batch
+@@ -2750,6 +2765,12 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+ }
+ 
+ int llama_context::decode(const llama_batch_ext & batch_inp) {
++    // a previous draft graph's async ids are still in flight and this graph
++    // reuses its tensors: the caller did not synchronize (get_embeddings_nextn
++    // does), so wait once here. Normally empty, nothing extra.
++    if (!draft_trace_pending.empty() && llama_expert_route_trace_enabled()) {
++        synchronize();
++    }
+     if (!memory) {
+         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
+         return encode(batch_inp);
+@@ -2982,8 +3003,84 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+ 
+         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+         if (res) {
++            const bool all_outputs = n_outputs_all == n_tokens_all && !output_all;
++            const int32_t first_pos = ubatch.pos != nullptr ? ubatch.pos[0] : -1;
+             for (const auto & ec : model.expert_caches) {
+-                ec->after_graph(sched.get(), ubatch.n_tokens);
++                ec->after_graph(sched.get(), ubatch.n_tokens, ubatch.token, first_pos, all_outputs);
++            }
++            // an MTP draft context: no expert cache covers its one MoE layer,
++            // so its routed ids come from the graph's output instead. The read
++            // is issued behind the graph without a wait and the record is
++            // written at the context's synchronize (llama_get_embeddings_nextn
++            // and the logits path call it). A caller that decodes again without
++            // a synchronize gets one at decode's start, because the next graph
++            // reuses these tensors; that is the only extra wait, never one a
++            // graph.
++            //
++            // NOT ggml_backend_tensor_get_async: on this series' OpenCL backend
++            // that is not async. Its iface.get_tensor_async is the NULL slot
++            // beside an empty stub (ggml-opencl.cpp:11471 and :9043), so
++            // ggml-backend.cpp:426-428 falls back to synchronize + a blocking
++            // get, and the read would stall the draft graph. The backend's own
++            // batch entry point (patch 0032; llama-expert-cache.cpp uses it for
++            // its ids) enqueues CL_FALSE reads on the graph's queue; a backend
++            // without it keeps the blocking read, and the A/B prices it.
++            if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && llama_expert_route_trace_enabled()) {
++                auto & t = llama_expert_route_trace::instance();
++                if (t.opened && !res->get_route_ids().empty()) {
++                    draft_trace_record r;
++                    r.first_pos = first_pos;
++                    r.n_tokens  = ubatch.n_tokens;
++                    if (ubatch.token != nullptr) {
++                        r.tokens.assign(ubatch.token, ubatch.token + ubatch.n_tokens);
++                    }
++                    struct pending_read { ggml_backend_t backend; const ggml_tensor * tensor; size_t bytes; };
++                    std::vector<pending_read> reads;   // one a route id, r's order
++                    for (const auto & rt : res->get_route_ids()) {
++                        ggml_tensor * rids = rt.second;
++                        if (rids == nullptr || rids->buffer == nullptr) {
++                            continue;
++                        }
++                        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), rids);
++                        if (backend == nullptr) {
++                            continue;
++                        }
++                        r.il.push_back(rt.first);
++                        r.ids.emplace_back((size_t) ggml_nelements(rids));
++                        reads.push_back({backend, rids, r.ids.back().size() * sizeof(int32_t)});
++                    }
++                    if (!r.il.empty()) {
++                        // the dsts live in the pending record, so they stay
++                        // valid until the synchronize that writes it
++                        draft_trace_pending.push_back(std::move(r));
++                        auto & ids = draft_trace_pending.back().ids;
++                        for (size_t i = 0; i < reads.size(); ) {
++                            const ggml_backend_t backend = reads[i].backend;
++                            const ggml_backend_dev_t dev = ggml_backend_get_device(backend);
++                            const ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
++                            auto batch = reg != nullptr
++                                ? (void (*)(const ggml_tensor * const *, void * const *, int))
++                                      ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_get_tensors_async")
++                                : nullptr;
++                            if (batch == nullptr) {
++                                ggml_backend_tensor_get_async(backend, reads[i].tensor, ids[i].data(), 0, reads[i].bytes);
++                                ++i;
++                                continue;
++                            }
++                            // one batch a backend: the hook reads from one queue
++                            std::vector<const ggml_tensor *> ts;
++                            std::vector<void *> dsts;
++                            size_t j = i;
++                            while (j < reads.size() && reads[j].backend == backend) {
++                                ts.push_back(reads[j].tensor);
++                                dsts.push_back(ids[j].data());
++                                ++j;
++                            }
++                            batch(ts.data(), dsts.data(), (int) ts.size());
++                            i = j;
++                        }
++                    }
++                }
+             }
+         }
+         const int64_t dt_p0 = dt ? ggml_time_us() : 0;
+@@ -5745,6 +5842,15 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
+     return ctx->memory_breakdown();
+ }
+ 
++// the process's pending last graph (campaign expert-foresight): at the end of
++// a request, so a continuous trace loses nothing. Nothing when the trace is off
++void llama_expert_route_trace_flush(llama_context * ctx) {
++    if (ctx == nullptr) {
++        return;
++    }
++    llama_expert_cache::flush_traces(ctx->get_model().expert_caches, ctx->get_sched());
++}
++
+ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
+     return ctx->get_cparams().ctx_other;
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 72dd4e3..9fa3787 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -446,6 +446,20 @@ private:
+ 
+     copy_experts_info copy_experts;
+ 
++    // an MTP draft context's trace record while the ids read is still in
++    // flight (enqueued from the backend's batch hook, no wait): written at the
++    // next synchronize, beside the logits copy, not on the graph's path. The
++    // unused-path writer steps below only run while the trace is on.
++    struct draft_trace_record {
++        int32_t first_pos = -1;
++        uint32_t n_tokens = 0;
++        std::vector<int32_t> tokens;
++        std::vector<int> il;
++        std::vector<std::vector<int32_t>> ids;
++    };
++    std::vector<draft_trace_record> draft_trace_pending;
++    void flush_draft_trace();
++
+     // graph reallocations during inference where the backend assignments did not change, split by whether the
+     // graph size is the same as the previously scheduled one (unexpected) or different
+     int32_t n_reallocs_same = 0;
+diff --git a/src/llama-expert-cache-alias.h b/src/llama-expert-cache-alias.h
+new file mode 100644
+index 0000000..be667dc
+--- /dev/null
++++ b/src/llama-expert-cache-alias.h
+@@ -0,0 +1,71 @@
++// 0077: the slot-buffer alias check, a sampled tripwire over whole slices.
++//
++// Strata's `sycl_queue.hpp:168-206, 259-295` tags every 64 KiB block of an
++// allocation of 32 MiB or more with GPU kernels, retries behind a growing
++// spacer up to 8 times and then warns and proceeds (`code`, audit item 19).
++// This check samples at most one region a slot tensor through the backend's
++// blocking set/get, a deviation from the reference named in the record.
++//
++// The region is one whole slice of the tensor's type: its offset is a multiple
++// of `nb[2]` and its size is exactly `nb[2]`, so the OpenCL set path's planar
++// conversion (`offset % nb[2] == 0 && size % nb[2] == 0`, ggml-opencl.cpp) is
++// satisfied and no per-type transform sees a partial row. One id-carrying
++// pattern a tensor, written first for every tensor and read back after all
++// writes, so a collision between any two regions shows as a differing
++// read-back. Exact: it writes no number the model computes and the expert load
++// overwrites the patterns.
++//
++// Device-free testable through the span arithmetic and the pattern
++// (tests/test-expert-cache-alias.cpp).
++#ifndef LLAMA_EXPERT_CACHE_ALIAS_H
++#define LLAMA_EXPERT_CACHE_ALIAS_H
++
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <vector>
++
++struct llama_cache_alias_span {
++    size_t offset;
++    size_t size;
++    bool   ok;
++};
++
++// one whole `slice` row inside a tensor of `bytes`, at the middle row shifted
++// by the tensor's index; not ok for an empty slice or a tensor shorter than one
++static inline llama_cache_alias_span llama_cache_alias_region(size_t bytes, size_t slice, size_t index) {
++    llama_cache_alias_span s = {0, 0, false};
++    if (slice == 0 || bytes < slice) {
++        return s;
++    }
++    const size_t rows = bytes / slice;
++    const size_t start = (rows / 2 + index) % rows;
++    s.offset = start * slice;
++    s.size   = slice;
++    s.ok     = true;
++    return s;
++}
++
++// fill `size` bytes with the region's id (two 64-bit words alternating id and
++// its complement, then the same over the tail): any two distinct regions differ
++// at byte 0, so an alias's second write is visible when the first reads back
++static inline void llama_cache_alias_pattern(uint64_t id, void * block, size_t size) {
++    uint8_t * b = (uint8_t *) block;
++    const uint64_t w[2] = {id, ~id};
++    for (size_t i = 0; i + 8 <= size; i += 8) {
++        std::memcpy(b + i, &w[(i / 8) & 1], 8);
++    }
++    for (size_t i = size & ~(size_t) 7; i < size; ++i) {
++        b[i] = (uint8_t) (id >> ((i * 8) & 63));
++    }
++}
++
++// whether a read-back equals the pattern of `id`, regenerated here: a plan
++// holds the id and the span, not hundreds of MiB of expected bytes
++static inline bool llama_cache_alias_reads_back(uint64_t id, const void * actual, size_t size) {
++    std::vector<uint8_t> expected(size);
++    llama_cache_alias_pattern(id, expected.data(), size);
++    return std::memcmp(expected.data(), actual, size) == 0;
++}
++
++#endif  // LLAMA_EXPERT_CACHE_ALIAS_H
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+index 4fba5f4..2092d49 100644
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -1,10 +1,12 @@
+ #include "llama-expert-cache.h"
+ 
+ #include "llama-loan-book.h"
+-
++#include "llama-expert-route-trace.h"
+ #include "llama-impl.h"
+ #include "llama-model.h"
+ #include "llama-model-loader.h"
++#include "llama-expert-profile.h"
++#include "llama-expert-cache-alias.h"
+ #include "ggml-cpu.h"
+ 
+ #include <algorithm>
+@@ -63,33 +65,142 @@ static bool on_cpu(const ggml_tensor * t) {
+     return ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+ }
+ 
+-// Strata's STRP profile (tools/make_profile.py): "STRP", u32 version,
+-// n_layers, n_expert, slots, n_ranked, then n_ranked (u16 layer, u16 expert)
+-static bool read_profile(const char * path, int n_layers, int n_expert, std::vector<std::pair<int, int>> & ranked) {
+-    FILE * f = fopen(path, "rb");
+-    if (!f) {
+-        return false;
++// Strata's STRP profile: the reader patch 0070 adds (llama-expert-profile.cpp)
++// patch 0077: the slot buffers' sampled alias tripwire. One whole-slice region
++// a slot tensor is written with a pattern carrying its index, all writes first
++// and all read-backs after, so two regions that share a physical page show as a
++// differing read-back of the earlier one. The sampled switch covers the planar
++// types (IQ2_XXS, IQ2_XS, IQ2_S, Q2_0, IQ3_S) and IQ3_XXS, whose set path is a
++// plain clEnqueueWriteBuffer and accepts an arbitrary whole slice. The
++// whole-tensor SOA readers (Q4_0, Q1_0, Q8_0, IQ4_NL, Q4_K) are excluded: a
++// sampled write there reads beyond the caller's buffer. The pattern an entry
++// is regenerated at its read-back, so the plan holds spans and ids, not the
++// sampled bytes; only the write's own region is transient. The patterns are
++// overwritten by the expert load; nothing the model computes changes. A
++// finding warns and the load proceeds (Strata's warn-and-proceed; its spacer
++// retry is not built).
++static int llama_cache_alias_check(const std::vector<ggml_tensor *> & slots) {
++    static const bool on = [] {
++        const char * e = getenv("LLAMA_EXPERT_CACHE_ALIAS");
++        return e == nullptr || atoi(e) != 0;   // off: LLAMA_EXPERT_CACHE_ALIAS=0
++    }();
++    if (!on) {
++        return 0;
++    }
++    struct plan_t {
++        ggml_tensor * t;
++        size_t off;
++        size_t size;
++        uint64_t id;
++    };
++    std::vector<plan_t> plan;
++    size_t sampled_bytes = 0;
++    for (size_t i = 0; i < slots.size(); ++i) {
++        ggml_tensor * t = slots[i];
++        if (t == nullptr || t->data == nullptr) continue;
++        switch (t->type) {
++            case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
++            case GGML_TYPE_Q2_0:    case GGML_TYPE_IQ3_S:  case GGML_TYPE_IQ3_XXS: break;
++            default: continue;      // the whole-tensor SOA readers
++        }
++        const size_t slice = (size_t) t->nb[2];
++        if ((t->ne[0] * t->ne[1] / ggml_blck_size(t->type)) % 2 != 0) continue;
++        const llama_cache_alias_span sp = llama_cache_alias_region(ggml_nbytes(t), slice, i);
++        if (!sp.ok) continue;
++        std::vector<uint8_t> region(sp.size);
++        llama_cache_alias_pattern((uint64_t) i, region.data(), region.size());
++        ggml_backend_tensor_set(t, region.data(), sp.offset, region.size());
++        plan.push_back({t, sp.offset, sp.size, (uint64_t) i});
++        sampled_bytes += sp.size;
+     }
+-    char     magic[4];
+-    uint32_t h[5];
+-    bool ok = fread(magic, 1, 4, f) == 4 && memcmp(magic, "STRP", 4) == 0 && fread(h, 4, 5, f) == 5 &&
+-              h[0] == 1 && (int) h[1] == n_layers && (int) h[2] == n_expert;
+-    if (ok) {
+-        ranked.resize(h[4]);
+-        for (uint32_t i = 0; ok && i < h[4]; ++i) {
+-            uint16_t p[2];
+-            ok = fread(p, 2, 2, f) == 2;
+-            ranked[i] = {p[0], p[1]};
++    int bad = 0;
++    for (const plan_t & p : plan) {
++        std::vector<uint8_t> actual(p.size);
++        ggml_backend_tensor_get(p.t, actual.data(), p.off, actual.size());
++        if (!llama_cache_alias_reads_back(p.id, actual.data(), actual.size())) {
++            ++bad;
++            LLAMA_LOG_WARN("%s: alias check, slot tensor '%s' reads back a different region\n", __func__, p.t->name);
+         }
+     }
+-    fclose(f);
+-    return ok;
++    LLAMA_LOG_WARN("%s: alias check, %d of %zu sampled slot regions differ, %zu bytes written and read back\n",
++                   __func__, bad, plan.size(), sampled_bytes);
++    return bad;
++}
++
++static bool read_profile(const char * path, int n_layers, int n_expert, std::vector<std::pair<int, int>> & ranked) {
++    std::string err;
++    return llama_expert_profile_read(path, n_layers, n_expert, ranked, err);
+ }
+ 
+ llama_expert_cache::~llama_expert_cache() {
+     if (book_.phase != 0 && adapt_finish && !layers.empty()) {
+         adapt_finish(layers[0].slot[0]);
+     }
++    // --llama-expert-cache-save F (LLAMA_EXPERT_CACHE_SAVE): the learned profile
++    // from this cache's cumulative routing. The default rule is Strata's SYCL/xe
++    // save (save_profile, generate.cpp, commit 3d6f1718): the counts mixed with
++    // the start's ranking as prior mass, so a short conversation does not wipe
++    // the prior; --llama-expert-cache-save-rule cu selects Strata's
++    // rank_learned_profile instead (the resident head). Written at teardown after
++    // adapt_finish has landed the pending copies; the host tables are still at
++    // the phase the last progress() left them in, so a pending incoming expert is
++    // marked resident here (Strata does) and a pending outgoing expert is kept
++    // only in phase 1. A layer split has one cache a card: the same variable
++    // would name one file for both cards, so it is not written then -- the WARN
++    // says what is needed.
++    if (const char * save = getenv("LLAMA_EXPERT_CACHE_SAVE"); save != nullptr && *save != '\0' && !layers.empty()) {
++        const int n_caches = model_ != nullptr ? (int) model_->expert_caches.size() : 1;
++        if (n_caches > 1) {
++            LLAMA_LOG_WARN("%s: %d expert caches (a cache a card): one save path for all of them is wrong; "
++                            "per-card files need distinct paths, nothing written\n", __func__, n_caches);
++        } else {
++            const int n_layers = model_ != nullptr ? (int) model_->layers.size() : layers.back().il + 1;
++            const int n_expert = layers[0].n_expert;
++            std::vector<uint8_t> resident((size_t) n_layers * (size_t) n_expert, 0);
++            std::vector<double>  heat    ((size_t) n_layers * (size_t) n_expert, 0.0);
++            double counted = 0.0;
++            for (const auto & L : layers) {
++                const size_t base = (size_t) L.il * (size_t) n_expert;
++                for (int e = 0; e < L.n_expert; ++e) {
++                    resident[base + (size_t) e] = L.slot_of[e] >= 0 ? 1 : 0;
++                    // the raw routing counts, one a routed pair (Strata's device counter)
++                    heat[base + (size_t) e] = L.heat.empty() ? 0.0 : L.heat[e];
++                    counted += heat[base + (size_t) e];
++                }
++            }
++            if (book_.phase != 0) {
++                std::vector<llama_expert_profile_swap> pending;
++                pending.reserve(book_.pend.size());
++                for (const auto & p : book_.pend) {
++                    pending.push_back({p.layer, p.e_in, p.e_out});
++                }
++                llama_expert_profile_mark_pending(n_expert, resident, pending, book_.phase);
++            }
++            const char * rule_env = getenv("LLAMA_EXPERT_CACHE_SAVE_RULE");
++            const bool cu = rule_env != nullptr && std::strcmp(rule_env, "cu") == 0;
++            if (rule_env != nullptr && *rule_env != '\0' && !cu && std::strcmp(rule_env, "xe") != 0) {
++                LLAMA_LOG_WARN("%s: LLAMA_EXPERT_CACHE_SAVE_RULE=%s: not xe or cu, the xe rule\n", __func__, rule_env);
++            }
++            // Strata's constant and its environment variable, mirrored
++            double prior_entries = 800000.0;
++            if (const char * pe = getenv("STRATA_PROFILE_PRIOR_ENTRIES")) {
++                prior_entries = std::max(0.0, std::atof(pe));
++            }
++            const auto ranked = cu ? llama_expert_profile_rank(n_layers, n_expert, resident, heat, profile_ranked)
++                                  : llama_expert_profile_rank_xe(n_layers, n_expert, heat, profile_ranked,
++                                                                 prior_entries, 2.0);
++            std::string err;
++            if (llama_expert_profile_write(save, n_layers, n_expert, ranked, err)) {
++                // WARN, not INFO: the units' default level drops INFO, and a save the
++                // operator asked for must say it happened (Strata writes stderr plainly)
++                LLAMA_LOG_WARN("%s: saved the expert profile to %s (%zu pairs, %s rule, %.0f routed entries counted on "
++                               "the device%s)\n", __func__, save, ranked.size(), cu ? "cu" : "xe", counted,
++                               cu ? "" : format(", prior %.0f routed entries", prior_entries).c_str());
++            } else {
++                LLAMA_LOG_WARN("%s: the expert profile was not saved: %s\n", __func__, err.c_str());
++            }
++        }
++    }
+     if (n_deferred > 0) {
+         LLAMA_LOG_INFO("%s: %s: %llu swaps put off for want of a spare bank entry in their layer\n", __func__,
+                        dev_ ? ggml_backend_dev_name(dev_) : "-", (unsigned long long) n_deferred);
+@@ -337,6 +448,7 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+         adapt_every = (uint32_t) atoi(a);   // 0: the profile's placement, never adapted
+     }
+     dev_ = dev;
++    model_ = &model;
+     layers.reserve(model.layers.size());   // the registry holds pointers into it
+     for (int il = 0; dev != nullptr && il < (int) model.layers.size(); ++il) {
+         llama_expert_cache_layer L;
+@@ -347,6 +459,11 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+         L.slot_of.assign(L.n_expert, -1);
+         L.bank_of.assign(L.n_expert, -1);
+         L.usage.assign(L.n_expert, 0.0f);
++        // the save's raw routing counts, Strata's --expert-profile-save allocates
++        // its counter only then; off, this vector stays empty and count() skips it
++        if (const char * save = getenv("LLAMA_EXPERT_CACHE_SAVE"); save != nullptr && *save != '\0') {
++            L.heat.assign(L.n_expert, 0.0);
++        }
+         layers.push_back(std::move(L));
+     }
+     if (layers.empty()) {
+@@ -442,6 +559,9 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+     if (profile && *profile && !from_profile) {
+         LLAMA_LOG_WARN("%s: profile %s unreadable or for another geometry; round robin\n", __func__, profile);
+     }
++    // the profile the run started from, for the save's prior step; empty for
++    // round robin (Strata's save test's no-prior order)
++    profile_ranked = from_profile ? ranked : std::vector<std::pair<int, int>>();
+     if (!from_profile) {
+         for (int e = 0; e < n_expert; ++e) {
+             for (auto & L : layers) {
+@@ -711,6 +831,23 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+     }
+     n_bank_bytes = ggml_backend_buffer_get_size(bbank);
+     if (b_lendbank != nullptr) n_bank_bytes += ggml_backend_buffer_get_size(b_lendbank);
++    // patch 0077: the alias check at the cache init, over every slot tensor in its slot
++    // buffer (the ask's bslots and b_lend, and the candidates' per-layer spares)
++    {
++        std::vector<ggml_tensor *> alias_slots;
++        for (const auto & L : layers) {
++            for (int k = 0; k < 3; ++k) {
++                ggml_tensor * t = L.slot[k];
++                if (t == nullptr) continue;
++                bool in_slot_buf = t->buffer == bslots || (b_lend != nullptr && t->buffer == b_lend);
++                for (size_t j = 0; !in_slot_buf && j < spare_buf.size(); ++j) {
++                    in_slot_buf = spare_buf[j] != nullptr && t->buffer == spare_buf[j];
++                }
++                if (in_slot_buf) alias_slots.push_back(t);
++            }
++        }
++        llama_cache_alias_check(alias_slots);   // warn and proceed
++    }
+     // round 20: one stream-ring slot holds one bank tensor whole; the largest
+     // bank tensor is the cold ring's first-touch slot content
+     for (const auto & L : layers) {
+@@ -884,6 +1021,20 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+             g_registry[L.src[2]] = &L;
+         }
+     }
++    // the routing trace (campaign expert-foresight): unset, one
++    // getenv and no read-back; set, one host read a graph and one write a record
++    if (const char * tp = getenv("LLAMA_EXPERT_ROUTE_TRACE")) {
++        auto & t = llama_expert_route_trace::instance();
++        if (!t.opened) {
++            if (!t.open(tp, model.hparams.n_layer(), model.hparams.n_expert, model.hparams.n_expert_used_max())) {
++                LLAMA_LOG_WARN("%s: LLAMA_EXPERT_ROUTE_TRACE: cannot open %s: %s\n", __func__, tp, strerror(errno));
++            }
++        }
++        if (t.opened) {
++            trace_on = true;
++            trace_snapshot();
++        }
++    }
+     LLAMA_LOG_WARN("%s: %s: %zu layers (%d-%d), %lld expert slots (%lld-%lld a layer), %.2f GiB on the card (with the Q8_0 banks), "
+                    "bank %.2f GiB in host memory, budget %.2f GiB, from %s; filled in %.1f s; swaps %s\n",
+                    __func__, ggml_backend_dev_name(dev), layers.size(), layers.front().il, layers.back().il, (long long) n_slots_all,
+@@ -1647,6 +1798,14 @@ void llama_expert_cache::count(uint32_t n_tokens) {
+             L.usage[e] += 1.0f;
+             (L.slot_of[e] >= 0 ? n_hits : n_misses) += 1;
+         }
++        // the save's heat, Strata's per-routing-event device counter: raw counts,
++        // unnormalized, so it is in the same unit as the prior's
++        // STRATA_PROFILE_PRIOR_ENTRIES (a decayed sum would be 1/(1-decay) larger
++        // and weigh like ~240k entries at decay 0.7). Counted here, not in adapt():
++        // LLAMA_EXPERT_CACHE_ADAPT_EVERY=0 must still accumulate it.
++        if (!L.heat.empty()) {
++            llama_expert_profile_add_heat(L.heat, L.n_expert, ids[i]);
++        }
+         if (n_tokens > 1) {
+             std::vector<int32_t> u(ids[i]);
+             std::sort(u.begin(), u.end());
+@@ -1716,6 +1875,8 @@ void llama_expert_cache::adapt(const std::vector<llama_expert_cache_swap> & all_
+         }
+     }
+     for (auto & L : layers) {
++        // no heat here: it counts in count(), one a routed pair, so it does not
++        // depend on this cadence (LLAMA_EXPERT_CACHE_ADAPT_EVERY=0 still counts)
+         for (float & u : L.usage) {
+             u *= decay;
+         }
+@@ -1777,6 +1938,10 @@ void llama_expert_cache::adapt(const std::vector<llama_expert_cache_swap> & all_
+         L.bank_of[victim]   = entry;    L.bexpert_of[entry] = victim;
+         L.slot_of[victim]   = -1;       L.bank_of[c.expert] = -1;
+         touched[c.layer] = 1;
++        if (trace_on) {
++            trace_tables.push_back({ L.il, c.expert, 1 });
++            trace_tables.push_back({ L.il, victim, 0 });
++        }
+         n_swaps++;
+     }
+     if (mutate == 1) {   // the red case: one swapped slot's bytes corrupted after the exchange
+@@ -1800,6 +1965,12 @@ void llama_expert_cache::adapt(const std::vector<llama_expert_cache_swap> & all_
+         mutate = 0;
+     }
+     flush_tables();
++    if (!trace_tables.empty()) {
++        trace_residents();   // the TABLES record's residency, for a later rotation
++        trace_prepare();
++        llama_expert_route_trace::instance().event_tables(trace_tables);
++        trace_tables.clear();
++    }
+     if (check) {
+         const auto & c   = all.front();
+         const auto & L   = layers[c.layer];
+@@ -1826,6 +1997,9 @@ void llama_expert_cache::pend_tables_out(const std::vector<pending_swap> & plan)
+         L.bexpert_of[p.x]   = p.e_out;
+         L.expert_of[p.slot] = -1;
+         touched[p.layer] = 1;
++        if (trace_on) {
++            trace_tables.push_back({ L.il, p.e_out, 0 });
++        }
+     }
+     for (size_t i = 0; i < layers.size(); ++i) {
+         if (touched[i]) {
+@@ -1833,6 +2007,12 @@ void llama_expert_cache::pend_tables_out(const std::vector<pending_swap> & plan)
+         }
+     }
+     flush_tables();
++    if (!trace_tables.empty()) {
++        trace_residents();   // the TABLES record's residency, for a later rotation
++        trace_prepare();
++        llama_expert_route_trace::instance().event_tables(trace_tables);
++        trace_tables.clear();
++    }
+ }
+ 
+ // the phase-2 tables: the newcomers are in their slots, served from them from
+@@ -1846,6 +2026,9 @@ void llama_expert_cache::pend_tables_in(const std::vector<pending_swap> & plan)
+         L.bank_of[p.e_in]   = -1;       L.bexpert_of[p.b_in] = -1;
+         L.spare.push_back(p.b_in);
+         touched[p.layer] = 1;
++        if (trace_on) {
++            trace_tables.push_back({ L.il, p.e_in, 1 });
++        }
+     }
+     if (mutate == 1) {   // the red case: one swapped slot's bytes corrupted after it landed
+         const auto & p = plan.front();
+@@ -1868,6 +2051,12 @@ void llama_expert_cache::pend_tables_in(const std::vector<pending_swap> & plan)
+         mutate = 0;
+     }
+     flush_tables();
++    if (!trace_tables.empty()) {
++        trace_residents();   // the TABLES record's residency, for a later rotation
++        trace_prepare();
++        llama_expert_route_trace::instance().event_tables(trace_tables);
++        trace_tables.clear();
++    }
+ }
+ 
+ // The swaps in flight, polled between ubatches without a wait (Strata's
+@@ -1903,6 +2092,122 @@ void llama_expert_cache::check_swap() {
+     book_.check = false;
+ }
+ 
++// Keep this cache's residents for the next LAYERS snapshot. Updated at init and
++// at every TABLES record (a residency change), so a rotation taken from ANOTHER
++// cache still writes this card's current set.
++void llama_expert_cache::trace_residents() {
++    auto & t = llama_expert_route_trace::instance();
++    if (!t.opened) {
++        return;
++    }
++    std::vector<int> il, ns;
++    std::vector<std::vector<int32_t>> res;
++    for (const auto & L : layers) {
++        il.push_back(L.il);
++        ns.push_back(L.n_slots);
++        std::vector<int32_t> r;
++        for (int s = 0; s < L.n_slots; ++s) {
++            r.push_back(s < (int) L.expert_of.size() ? L.expert_of[s] : -1);
++        }
++        res.push_back(std::move(r));
++    }
++    t.set_residents((intptr_t) this, il, ns, res);
++}
++
++// The trace's LAYERS record of every cache's residents at the moment (init, or
++// a rotation): under a layer split one record per cache would leave a rotated
++// file unable to replay alone, so the rotation writes all registered sets.
++void llama_expert_cache::trace_snapshot() {
++    auto & t = llama_expert_route_trace::instance();
++    if (!t.opened) {
++        return;
++    }
++    trace_residents();
++    t.event_layers_all();
++}
++
++// Called before every trace record: at the file's cap it opens the next file
++// (its own header) and writes the residents that file starts from. The cache
++// calls it from after_graph, BEFORE arcint writes the verify's accept line, so
++// the line and the graph record land in the same file at a rotation (round 6's
++// one-line-off defect). A graph record's rotation is taken HERE and nowhere
++// else: while a record is pending (trace_pending), its accept line already
++// sits in this file, so a rotation at advance/flush_trace or an MTP DRAFT
++// record would split the line from the record (round 7's defect) -- the
++// decision is llama_expert_route_trace_rotate_now, and the rotation then waits
++// for the next after_graph.
++void llama_expert_cache::trace_prepare() {
++    auto & t = llama_expert_route_trace::instance();
++    if (!trace_on) {
++        return;
++    }
++    if (!t.opened) {
++        trace_on = false;   // a write failed: the read-backs stop, the cost goes
++        return;
++    }
++    if (!llama_expert_route_trace_rotate_now(t)) {
++        return;
++    }
++    if (!t.rotate_next()) {
++        trace_on = false;   // a full disk: stop tracing, do not fail the run
++        return;
++    }
++    trace_snapshot();
++}
++
++// At a request's end: the pending last graph's ids are complete after one
++// sync, and the graph is written before the next request's advance would
++// count a different one. `count` keeps the usage the engine already counted
++// from this graph at the next decode, exactly once (last_n is cleared).
++void llama_expert_cache::flush_trace(ggml_backend_sched_t sched) {
++    if (!trace_on) {
++        return;
++    }
++    if (!llama_expert_route_trace::instance().opened) {
++        trace_on = false;   // a failed write: no more read-backs, the cost goes
++        if (trace_pending) {
++            llama_expert_route_trace::instance().pending_graph(false);
++        }
++        trace_pending = false;
++        trace_tokens.clear();
++        last_n = 0;
++        return;
++    }
++    if (!trace_pending || last_n == 0 || sched != owner_sched) {
++        return;
++    }
++    if (last_n <= decode_max) {
++        count(last_n);
++    } else {
++        ggml_backend_sched_synchronize(owner_sched);
++        ids_pending = 0;
++    }
++    if (ids_host.size() == layers.size() && trace_n == last_n) {
++        std::vector<int> il;
++        for (const auto & L : layers) {
++            il.push_back(L.il);
++        }
++        // no trace_prepare: this record's rotation was taken at after_graph,
++        // and rotating now (an MTP DRAFT record may have crossed the cap since,
++        // the line is already written) would split the accept line from its
++        // record
++        llama_expert_route_trace::instance().event_graph(trace_kind, trace_pos, trace_n, trace_tokens, il, ids_host);
++    }
++    if (trace_pending) {
++        llama_expert_route_trace::instance().pending_graph(false);
++    }
++    trace_pending = false;
++    trace_tokens.clear();
++    last_n = 0;
++}
++
++void llama_expert_cache::flush_traces(const std::vector<std::unique_ptr<llama_expert_cache>> & caches,
++                                      ggml_backend_sched_t sched) {
++    for (const auto & ec : caches) {
++        ec->flush_trace(sched);
++    }
++}
++
+ // The owner context's ubatch: counts the previous decode ubatch's routing;
+ // true when an adapt is due
+ bool llama_expert_cache::advance(ggml_backend_sched_t sched, uint32_t n_tokens) {
+@@ -1916,7 +2221,35 @@ bool llama_expert_cache::advance(ggml_backend_sched_t sched, uint32_t n_tokens)
+     } else if (sched != owner_sched) {
+         return false;
+     }
+-    if (last_n > 0 && last_n <= decode_max) {
++    if (trace_on && !llama_expert_route_trace::instance().opened) {
++        trace_on = false;   // a failed write: stop the read-backs at the next call
++    }
++    if (last_n > 0 && trace_pending) {
++        // the trace's graph: the ids read behind it are complete now. A decode
++        // graph's count() already waits; a prompt graph needs one wait here,
++        // only when the trace is on
++        if (last_n <= decode_max) {
++            count(last_n);   // waits for the queue; ids_host is the graph's
++        } else {
++            ggml_backend_sched_synchronize(owner_sched);
++            ids_pending = 0;
++        }
++        // as in flush_trace: no trace_prepare, the pending record's rotation
++        // was taken at after_graph and rotating here would split its accept
++        // line from it
++        if (ids_host.size() == layers.size() && trace_n == last_n) {
++            std::vector<int> il;
++            for (const auto & L : layers) {
++                il.push_back(L.il);
++            }
++            llama_expert_route_trace::instance().event_graph(trace_kind, trace_pos, trace_n, trace_tokens, il, ids_host);
++        }
++        if (trace_pending) {
++            llama_expert_route_trace::instance().pending_graph(false);
++        }
++        trace_pending = false;
++        trace_tokens.clear();
++    } else if (last_n > 0 && last_n <= decode_max) {
+         count(last_n);   // waits for the queue
+     }
+     progress();
+@@ -1950,7 +2283,8 @@ void llama_expert_cache::step(const std::vector<std::unique_ptr<llama_expert_cac
+     }
+ }
+ 
+-void llama_expert_cache::after_graph(ggml_backend_sched_t sched, uint32_t n_tokens) {
++void llama_expert_cache::after_graph(ggml_backend_sched_t sched, uint32_t n_tokens, const int32_t * tokens,
++                                     int32_t pos, bool all_outputs) {
+     if (loan_out_) {
+         return;   // no swap is issued, and a lent graph's ids are not read
+     }
+@@ -1958,6 +2292,28 @@ void llama_expert_cache::after_graph(ggml_backend_sched_t sched, uint32_t n_toke
+         ggml_backend_sched_synchronize(owner_sched);   // an unconsumed read still targets ids_host
+     }
+     ids_pending = 0;
++    if (trace_on && sched == owner_sched && n_tokens > 0) {
++        if (!llama_expert_route_trace::instance().opened) {
++            trace_on = false;   // a failed write: the read-backs below stop
++        } else {
++            // BEFORE arcint writes this verify's accept line (which follows the
++            // target decode): a rotation here puts the line and the graph record
++            // in the same file. trace_prepare also writes the new file's LAYERS.
++            trace_prepare();
++            // a prompt call outputs fewer rows than it has tokens (llama.cpp's
++            // prompt evaluation), a decode or verify call outputs every row; the
++            // count alone would call a prompt's 4-token checkpoint tail a verify.
++            // An embedding batch has no token ids at all.
++            trace_kind = llama_expert_route_graph_kind(n_tokens, decode_max, all_outputs, tokens != nullptr);
++            trace_n      = n_tokens;
++            trace_pos    = pos;
++            if (tokens != nullptr) {
++                trace_tokens.assign(tokens, tokens + n_tokens);
++            } else {
++                trace_tokens.clear();   // event_graph writes -1 a row
++            }
++        }
++    }
+     if (book_.phase != 0 && !book_.issued && sched == owner_sched) {
+         // the swaps' copies on the adapt queue, behind the fence placed before
+         // this graph (adapt for phase 1, progress for phase 2): they run while it
+@@ -1965,7 +2321,8 @@ void llama_expert_cache::after_graph(ggml_backend_sched_t sched, uint32_t n_toke
+         // (finding 3): 3x the bytes otherwise.
+         issue_phase(false);
+     }
+-    if (!async_ids || sched != owner_sched || n_tokens == 0 || n_tokens > decode_max) {
++    if ((!async_ids && !trace_on) || sched != owner_sched || n_tokens == 0 ||
++        (n_tokens > decode_max && !trace_on)) {
+         return;
+     }
+     // each id copy on this cache's card (its buffer type is the card's own
+@@ -1984,8 +2341,21 @@ void llama_expert_cache::after_graph(ggml_backend_sched_t sched, uint32_t n_toke
+         ts.push_back(layers[i].ids_out);
+         dsts.push_back(ids_host[i].data());
+     }
+-    get_tensors_async(ts.data(), dsts.data(), (int) ts.size());
+-    ids_pending = n_tokens;
++    // the switch is respected: ASYNC_IDS=0 means a read with a wait, even when
++    // the trace is on (the trace's ids are the cache's own). The wait is this
++    // graph's, as the switch asks, and the read-back then costs no extra copy.
++    if (async_ids) {
++        get_tensors_async(ts.data(), dsts.data(), (int) ts.size());
++    } else {
++        get_tensors(ts.data(), dsts.data(), (int) ts.size());
++    }
++    ids_pending = n_tokens;   // the ids are valid either way; count() takes them
++    trace_pending = trace_on;
++    if (trace_pending) {
++        // process-wide: another cache on another card must not rotate while
++        // this graph's record is still waiting for its write
++        llama_expert_route_trace::instance().pending_graph(true);
++    }
+ }
+ 
+ llama_expert_cache_stats llama_expert_cache::stats() const {
+diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
+index e4cf02d..37d9de2 100644
+--- a/src/llama-expert-cache.h
++++ b/src/llama-expert-cache.h
+@@ -34,10 +34,12 @@
+ #include "ggml.h"
+ #include "ggml-backend.h"
+ #include "llama-loan-book.h"
++#include "llama-expert-route-trace.h"
+ 
+ #include <cstdint>
+ #include <memory>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ struct llama_model;
+@@ -93,6 +95,9 @@ struct llama_expert_cache_layer {
+     llama_loan_book::DirtyTrack dirty;
+     std::vector<int32_t> bexpert_of;    // bank entry -> expert, -1 (the zero entry, a spare)
+     std::vector<float>   usage;         // decode routing counts, decayed each adapt
++    std::vector<double>  heat;          // raw routing counts for the save (--llama-expert-cache-save), one
++                                        // a routed pair in count(); empty unless the save is on. Double: a
++                                        // month at ~33 t/s passes float's 2^24 on the hottest pairs
+     ggml_tensor * ids_out = nullptr;    // the last graph's routed ids (a copy, marked output)
+     int      tab_row  = 0;              // the first of its tables' rows in the cache's tab_all
+     int      n_tab    = 0;              // its tables: 3, or 5 with the _dn pair
+@@ -136,6 +141,12 @@ struct llama_expert_cache {
+     // `dev` runs at least one layer init() would cache
+     static bool has_layers(const llama_model & model, const llama_model_loader & ml, ggml_backend_dev_t dev);
+ 
++    // The process's last graph, at the end of a request (or at shutdown): the
++    // cache writes a graph when the NEXT graph's advance runs, so without this
++    // a continuous log loses its last step. One sync, only when the trace is
++    // on and a graph is pending.
++    static void flush_traces(const std::vector<std::unique_ptr<llama_expert_cache>> & caches, ggml_backend_sched_t sched);
++
+     // Between ubatches of llama_context::decode, before the next graph, over
+     // the model's caches (one per card): each counts the previous decode
+     // ubatch's routing of its layers; every adapt_every decode tokens the
+@@ -146,7 +157,11 @@ struct llama_expert_cache {
+     // Right after a decode graph is enqueued: its routed ids are read behind
+     // it (no wait), for step() to count once the host has synchronized
+     // (LLAMA_EXPERT_CACHE_ASYNC_IDS=0: step() reads them with a wait)
+-    void after_graph(ggml_backend_sched_t sched, uint32_t n_tokens);
++    // `tokens` is the ubatch's token ids (null for an embedding batch), `pos`
++    // its first position (-1 when absent), `all_outputs` whether the call
++    // outputs every row (a decode/verify call) or a prompt call does not
++    void after_graph(ggml_backend_sched_t sched, uint32_t n_tokens, const int32_t * tokens, int32_t pos,
++                     bool all_outputs);
+ 
+     llama_expert_cache_stats stats() const;
+ 
+@@ -248,6 +263,10 @@ private:
+ 
+     bool advance(ggml_backend_sched_t sched, uint32_t n_tokens);
+     void count(uint32_t n_tokens);
++    void trace_residents();                   // keep this cache's residents for the next snapshot
++    void trace_snapshot();                    // LAYERS: every cache's residents now
++    void trace_prepare();                     // a rotation at the cap, then the snapshot
++    void flush_trace(ggml_backend_sched_t sched);
+     void candidates(std::vector<llama_expert_cache_swap> & out);
+     void adapt(const std::vector<llama_expert_cache_swap> & all);
+     static void plan(const std::vector<std::unique_ptr<llama_expert_cache>> & caches);
+@@ -322,6 +341,15 @@ private:
+     void (*get_tensors_async)(const ggml_tensor * const *, void * const *, int) = nullptr;
+     std::vector<std::vector<int32_t>> ids_host;   // after_graph's reads, per layer
+     uint32_t           ids_pending = 0;   // their graph's tokens; 0: none queued
++    // the diagnostic trace (LLAMA_EXPERT_ROUTE_TRACE): the last graph's kind,
++    // its token ids and whether their read is queued
++    bool               trace_on = false;
++    bool               trace_pending = false;
++    uint8_t            trace_kind = 0;
++    uint32_t           trace_n = 0;
++    int32_t            trace_pos = -1;
++    std::vector<int32_t> trace_tokens;
++    std::vector<llama_expert_route_trace::change> trace_tables;
+     bool               async_ids = true;
+     void (*get_slices)(const ggml_tensor *, void *, int64_t, int64_t) = nullptr;
+     void (*exchange)(ggml_tensor *, int64_t, ggml_tensor *, int64_t) = nullptr;
+@@ -349,6 +377,11 @@ private:
+     void (*bank_stream_ring)(ggml_backend_dev_t, size_t *, size_t *) = nullptr;
+     int                mutate = 0;      // LLAMA_EXPERT_CACHE_MUTATE: corrupt one swapped slot (red case for the swap check)
+     int                mutate_loan = 0; // LLAMA_SLOT_LOAN_MUTATE: 1 a tensor of the last lent layer left uncopied, 2 drop the lend's last table row, 3 the lent sizing skipped, 4 the return's re-reserve skipped (llama-context.cpp), 5 a lent layer's bank row off by one (lend, the prefill's red case)
++    // --llama-expert-cache-save: the profile loaded in init (the prior of both
++    // rules: the xe mixing's pseudo-counts and cu's tie-break), empty for round
++    // robin; and the model, to get the geometry and the cache count at teardown
++    std::vector<std::pair<int, int>> profile_ranked;
++    const llama_model * model_ = nullptr;
+ };
+ 
+ // The layer whose down projection (as loaded) is `down_exps`, or null.
+diff --git a/src/llama-expert-profile.cpp b/src/llama-expert-profile.cpp
+new file mode 100644
+index 0000000..6a8d662
+--- /dev/null
++++ b/src/llama-expert-profile.cpp
+@@ -0,0 +1,368 @@
++#include "llama-expert-profile.h"
++
++#include <algorithm>
++#include <cerrno>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++
++// The heat is Strata's xe unit: raw routing counts, one a routed pair (its device
++// counter), not a decayed sum. Strata's rank_learned_profile (src/core/expert_cache.cpp, commit 3d6f1718):
++// resident first, then by heat descending, then by the prior's own rank, then
++// by the pair's index. Written as the staged order the save test shows, which
++// is the same sequence: resident by heat, the counted non-resident pairs by
++// heat, the prior in its own order, the fill layer-major. Ties in either heat
++// group take the prior's rank before the index (Strata's comparator), which is
++// what puts a prior pair ahead of a same-heat non-prior pair.
++std::vector<std::pair<int, int>> llama_expert_profile_rank(
++    int n_layers, int n_expert, const std::vector<uint8_t> & resident,
++    const std::vector<double> & heat, const std::vector<std::pair<int, int>> & prior) {
++    std::vector<std::pair<int, int>> out;
++    if (n_layers <= 0 || n_expert <= 0) {
++        return out;
++    }
++    const size_t n = (size_t) n_layers * (size_t) n_expert;
++    auto index = [n_expert](int l, int e) { return (size_t) l * (size_t) n_expert + (size_t) e; };
++    auto is_resident = [&](const std::pair<int, int> & p) {
++        const size_t i = index(p.first, p.second);
++        return i < resident.size() && resident[i] != 0;
++    };
++    auto heat_of = [&](const std::pair<int, int> & p) {
++        const size_t i = index(p.first, p.second);
++        return i < heat.size() ? heat[i] : 0.0;
++    };
++
++    // the pairs in the fill's own enumeration: layer outer, expert inner
++    std::vector<std::pair<int, int>> all;
++    all.reserve(n);
++    for (int l = 0; l < n_layers; ++l) {
++        for (int e = 0; e < n_expert; ++e) {
++            all.emplace_back(l, e);
++        }
++    }
++
++    // prior rank: the position of a pair in the profile the run started from,
++    // INT64_MAX when the prior does not name it (Strata's comparator)
++    std::vector<int64_t> prior_rank(n, INT64_MAX);
++    for (size_t r = 0; r < prior.size(); ++r) {
++        const auto [l, e] = prior[r];
++        if (l >= 0 && l < n_layers && e >= 0 && e < n_expert) {
++            int64_t & pr = prior_rank[index(l, e)];
++            if (pr == INT64_MAX) {
++                pr = (int64_t) r;
++            }
++        }
++    }
++    auto rank_of = [&](const std::pair<int, int> & p) { return prior_rank[index(p.first, p.second)]; };
++
++    std::vector<std::pair<int, int>> hot_resident, hot_others;
++    for (const auto & p : all) {
++        if (is_resident(p)) {
++            hot_resident.push_back(p);
++        } else if (heat_of(p) > 0.0) {
++            hot_others.push_back(p);
++        }
++    }
++    // Strata's tie-break: heat descending, then the prior's rank, then the
++    // index (layer-major). Red mutations: `>` -> `<` reverses both groups; a
++    // tie-break on the index alone moves a prior pair behind a same-heat one.
++    auto by_heat_desc = [&](const std::pair<int, int> & a, const std::pair<int, int> & b) {
++        if (heat_of(a) != heat_of(b)) {
++            return heat_of(a) > heat_of(b);
++        }
++        if (rank_of(a) != rank_of(b)) {
++            return rank_of(a) < rank_of(b);
++        }
++        return index(a.first, a.second) < index(b.first, b.second);
++    };
++    std::sort(hot_resident.begin(), hot_resident.end(), by_heat_desc);
++    std::sort(hot_others.begin(), hot_others.end(), by_heat_desc);
++
++    std::vector<uint8_t> seen(n, 0);
++    auto take = [&](const std::pair<int, int> & p) {
++        if (p.first < 0 || p.first >= n_layers || p.second < 0 || p.second >= n_expert) {
++            return;
++        }
++        const size_t i = index(p.first, p.second);
++        if (seen[i]) {
++            return;
++        }
++        seen[i] = 1;
++        out.push_back(p);
++    };
++    for (const auto & p : hot_resident) take(p);
++    for (const auto & p : hot_others)   take(p);
++    // the profile the run started from, in that profile's order
++    for (const auto & p : prior) take(p);
++    // the fill: layer outer, expert inner, every pair still missing
++    for (const auto & p : all) take(p);
++    return out;
++}
++
++void llama_expert_profile_add_heat(std::vector<double> & heat, int n_expert, const std::vector<int32_t> & ids) {
++    if (n_expert <= 0) {
++        return;
++    }
++    for (int32_t e : ids) {
++        if (e < 0 || e >= n_expert) {
++            continue;
++        }
++        if ((size_t) e < heat.size()) {
++            heat[(size_t) e] += 1.0;   // raw: no decay factor, one a routed pair
++        }
++    }
++}
++
++std::vector<std::pair<int, int>> llama_expert_profile_rank_xe(
++    int n_layers, int n_expert, const std::vector<double> & heat,
++    const std::vector<std::pair<int, int>> & prior, double prior_entries, double lam) {
++    if (n_layers <= 0 || n_expert <= 0) {
++        return std::vector<std::pair<int, int>>();
++    }
++    const size_t n = (size_t) n_layers * (size_t) n_expert;
++    // Strata's SYCL/xe save (generate.cpp save_profile): the device's cumulative
++    // counts, then the prior mass by rank, exp(-lam * rank / n) worth
++    // `prior_entries` routed entries over the whole ranking. `lam` 2, the shipped
++    // ranking holds ~70 % of the routing in its first 47 % of pairs.
++    std::vector<double> mixed(n, 0.0);
++    for (size_t i = 0; i < n; ++i) {
++        mixed[i] = i < heat.size() ? heat[i] : 0.0;
++    }
++    if (prior_entries > 0.0 && lam > 0.0 && n > 0) {
++        const double norm = lam / (1.0 - std::exp(-lam)) / (double) n;
++        for (size_t r = 0; r < prior.size(); ++r) {
++            const auto [l, e] = prior[r];
++            if (l < 0 || l >= n_layers || e < 0 || e >= n_expert) {
++                continue;
++            }
++            const double x = (double) r / (double) n;
++            mixed[(size_t) l * (size_t) n_expert + (size_t) e] +=
++                prior_entries * norm * std::exp(-lam * x);
++        }
++    }
++    // Strata passes no resident vector here: every pair ranks by the mixed heat
++    const std::vector<uint8_t> none(n, 0);
++    return llama_expert_profile_rank(n_layers, n_expert, none, mixed, prior);
++}
++
++void llama_expert_profile_mark_pending(int n_expert, std::vector<uint8_t> & resident,
++                                       const std::vector<llama_expert_profile_swap> & pending, int phase) {
++    if (n_expert <= 0) {
++        return;
++    }
++    for (const auto & s : pending) {
++        if (s.layer < 0) {
++            continue;
++        }
++        const size_t base = (size_t) s.layer * (size_t) n_expert;
++        auto put = [&](int e) {
++            if (e >= 0 && e < n_expert) {
++                const size_t i = base + (size_t) e;
++                if (i < resident.size()) {
++                    resident[i] = 1;
++                }
++            }
++        };
++        auto clear = [&](int e) {
++            if (e >= 0 && e < n_expert) {
++                const size_t i = base + (size_t) e;
++                if (i < resident.size()) {
++                    resident[i] = 0;
++                }
++            }
++        };
++        // the incoming expert has landed (a copy in flight counts as done)
++        put(s.e_in);
++        // the outgoing stays resident only in phase 1; at phase 2 the host
++        // table has already freed its slot
++        if (phase >= 2) {
++            clear(s.e_out);
++        }
++    }
++}
++
++static void put_u32(std::FILE * f, uint32_t v) {
++    uint8_t b[4];
++    for (int i = 0; i < 4; ++i) {
++        b[i] = (uint8_t) ((v >> (8 * i)) & 0xff);
++    }
++    std::fwrite(b, 1, 4, f);
++}
++
++static void put_u16(std::FILE * f, uint32_t v) {
++    uint8_t b[2] = { (uint8_t) (v & 0xff), (uint8_t) ((v >> 8) & 0xff) };
++    std::fwrite(b, 1, 2, f);
++}
++
++static uint32_t get_u32(const uint8_t * b) {
++    return (uint32_t) b[0] | ((uint32_t) b[1] << 8) | ((uint32_t) b[2] << 16) | ((uint32_t) b[3] << 24);
++}
++
++static uint16_t get_u16(const uint8_t * b) {
++    return (uint16_t) ((uint16_t) b[0] | ((uint16_t) b[1] << 8));
++}
++
++bool llama_expert_profile_read(const char * path, int n_layers, int n_expert,
++                               std::vector<std::pair<int, int>> & ranked, std::string & err) {
++    ranked.clear();
++    err.clear();
++    if (path == nullptr || *path == '\0') {
++        err = "llama_expert_profile_read: no profile path";
++        return false;
++    }
++    std::FILE * f = std::fopen(path, "rb");
++    if (f == nullptr) {
++        err = std::string("llama_expert_profile_read: ") + path + ": cannot open: " + std::strerror(errno);
++        return false;
++    }
++
++    uint8_t magic[4];
++    uint8_t hb[20];
++    if (std::fread(magic, 1, 4, f) != 4 || std::fread(hb, 1, 20, f) != 20) {
++        std::fclose(f);
++        err = std::string("llama_expert_profile_read: ") + path + ": shorter than a 24-byte STRP header";
++        return false;
++    }
++    if (std::memcmp(magic, "STRP", 4) != 0) {
++        std::fclose(f);
++        err = std::string("llama_expert_profile_read: ") + path + ": not a Strata profile (magic is not STRP)";
++        return false;
++    }
++    const uint32_t version  = get_u32(hb);
++    const uint32_t n_layer  = get_u32(hb + 4);
++    const uint32_t n_exp    = get_u32(hb + 8);
++    const uint32_t slots    = get_u32(hb + 12);   // ignored: arcint ignores the hint
++    const uint32_t n_ranked = get_u32(hb + 16);
++    (void) slots;
++
++    // the version BEFORE the geometry: the fields after it are a version 1
++    // layout's, so a version 2 file of another model is refused by its number
++    // (Strata's _version_test)
++    if (version != 1) {
++        std::fclose(f);
++        err = std::string("llama_expert_profile_read: ") + path + ": profile version " +
++              std::to_string(version) + ", this reader reads version 1";
++        return false;
++    }
++    if ((int) n_layer != n_layers || (int) n_exp != n_expert) {
++        std::fclose(f);
++        err = std::string("llama_expert_profile_read: ") + path + ": " + std::to_string(n_layer) + "x" +
++              std::to_string(n_exp) + ", not " + std::to_string(n_layers) + "x" + std::to_string(n_expert);
++        return false;
++    }
++    // more pairs than the geometry has: a header claim, refused before the loop
++    // (a truncated pair is caught by the loop's own short read)
++    if (n_ranked > (uint32_t) ((size_t) n_layers * (size_t) n_expert)) {
++        std::fclose(f);
++        err = std::string("llama_expert_profile_read: ") + path + ": " + std::to_string(n_ranked) +
++              " ranked pairs, more than the geometry's " + std::to_string(n_layers * n_expert);
++        return false;
++    }
++
++    std::vector<std::pair<int, int>> got;
++    got.reserve(n_ranked);
++    for (uint32_t i = 0; i < n_ranked; ++i) {
++        uint8_t pb[4];
++        if (std::fread(pb, 1, 4, f) != 4) {
++            std::fclose(f);
++            err = std::string("llama_expert_profile_read: ") + path + ": pair " + std::to_string(i) +
++                  " of " + std::to_string(n_ranked) + " (truncated record)";
++            return false;
++        }
++        const int l = get_u16(pb);
++        const int e = get_u16(pb + 2);
++        if (l < 0 || l >= n_layers || e < 0 || e >= n_expert) {
++            std::fclose(f);
++            err = std::string("llama_expert_profile_read: ") + path + ": pair " + std::to_string(i) + " (" +
++                  std::to_string(l) + "," + std::to_string(e) + ") is out of range";
++            return false;
++        }
++        got.emplace_back(l, e);
++    }
++    if (std::fclose(f) != 0) {
++        err = std::string("llama_expert_profile_read: ") + path + ": close failed: " + std::strerror(errno);
++        return false;
++    }
++    ranked = std::move(got);
++    return true;
++}
++
++bool llama_expert_profile_write(const char * path, int n_layers, int n_expert,
++                                const std::vector<std::pair<int, int>> & ranked, std::string & err) {
++    err.clear();
++    if (path == nullptr || *path == '\0') {
++        err = "llama_expert_profile_write: no profile path";
++        return false;
++    }
++    if (n_layers < 1 || n_layers > 65535 || n_expert < 1 || n_expert > 65535) {
++        err = std::string("llama_expert_profile_write: ") + path + ": " + std::to_string(n_layers) + "x" +
++              std::to_string(n_expert) + " does not fit the u16 pair fields";
++        return false;
++    }
++    if (ranked.size() > 0xffffffffUL) {
++        err = std::string("llama_expert_profile_write: ") + path + ": too many ranked pairs";
++        return false;
++    }
++    // the range check BEFORE the file is touched: a refused save keeps an
++    // existing file (Strata's save test)
++    for (size_t i = 0; i < ranked.size(); ++i) {
++        const int l = ranked[i].first, e = ranked[i].second;
++        if (l < 0 || l >= n_layers || e < 0 || e >= n_expert) {
++            err = std::string("llama_expert_profile_write: ") + path + ": pair " + std::to_string(i) + " (" +
++                  std::to_string(l) + "," + std::to_string(e) + ") is out of range";
++            return false;
++        }
++    }
++
++    const std::string tmp = std::string(path) + ".tmp";
++    std::FILE * f = std::fopen(tmp.c_str(), "wb");
++    if (f == nullptr) {
++        err = std::string("llama_expert_profile_write: ") + tmp + ": cannot open: " + std::strerror(errno);
++        return false;
++    }
++    auto fail = [&](const std::string & why) {
++        std::fclose(f);
++        std::remove(tmp.c_str());   // never leave a `.tmp`
++        err = std::string("llama_expert_profile_write: ") + tmp + ": " + why;
++        return false;
++    };
++    std::fwrite("STRP", 1, 4, f);
++    put_u32(f, 1u);                              // version
++    put_u32(f, (uint32_t) n_layers);
++    put_u32(f, (uint32_t) n_expert);
++    put_u32(f, (uint32_t) ranked.size());        // slots = n_ranked, Strata's writer
++    put_u32(f, (uint32_t) ranked.size());        // n_ranked
++    for (const auto & p : ranked) {
++        put_u16(f, (uint32_t) p.first);
++        put_u16(f, (uint32_t) p.second);
++    }
++    // the trailing table Strata's writer appends: a layer's experts -> their
++    // rank, -1 for a pair the ranking does not hold. Its save test compares the
++    // whole file byte for byte, so a saved profile is the same file the Python
++    // writers produce; readers stop after the pairs.
++    std::vector<int32_t> table((size_t) n_layers * (size_t) n_expert, -1);
++    for (size_t i = 0; i < ranked.size(); ++i) {
++        table[(size_t) ranked[i].first * (size_t) n_expert + (size_t) ranked[i].second] = (int32_t) i;
++    }
++    for (int32_t v : table) {
++        put_u32(f, (uint32_t) v);
++    }
++    if (std::fflush(f) != 0) {
++        return fail(std::string("write failed: ") + std::strerror(errno));
++    }
++    if (std::fclose(f) != 0) {
++        const int e = errno;
++        std::remove(tmp.c_str());
++        err = std::string("llama_expert_profile_write: ") + tmp + ": close failed: " + std::strerror(e);
++        return false;
++    }
++    if (std::rename(tmp.c_str(), path) != 0) {
++        const int e = errno;
++        std::remove(tmp.c_str());
++        err = std::string("llama_expert_profile_write: ") + path + ": rename from the .tmp failed: " +
++              std::strerror(e);
++        return false;
++    }
++    return true;
++}
+diff --git a/src/llama-expert-profile.h b/src/llama-expert-profile.h
+new file mode 100644
+index 0000000..cd413f4
+--- /dev/null
++++ b/src/llama-expert-profile.h
+@@ -0,0 +1,93 @@
++#pragma once
++
++// Strata's learned expert profile (STRP), its ranking rule and its file format,
++// kept dependency-free so a device-free test compiles the .cpp alone (the same
++// rule the route trace follows, src/llama-expert-route-trace.cpp of patch 0069).
++//
++// Two ranking rules, both from Strata (commit 3d6f1718):
++//   xe  its SYCL/xe save (`save_profile`, sycl/src/program/generate.cpp): the
++//       raw routing counts (one a routed pair, its device counter's unit, not a
++//       decayed sum) mixed with the start's ranking as pseudo-counts, no
++//       resident head. `STRATA_PROFILE_PRIOR_ENTRIES` (default 800,000 routed
++//       entries), lambda 2, the prior pair rank's share exp(-2 * rank / n).
++//       A short conversation must not wipe the prior.
++//   cu  its `rank_learned_profile` (src/core/expert_cache.cpp): the resident
++//       pairs by heat, the counted non-resident pairs by heat, then the rest;
++//       ties by the prior's own rank, then the pair's index.
++//
++// The cu rule, read from Strata's source and its save test:
++//   1. the resident pairs, ordered by heat (usage) descending;
++//   2. the non-resident pairs WITH heat > 0, ordered by heat descending;
++//   3. then the remaining pairs (the prior's pairs in the prior's order, then
++//      the fill layer 0..n_layers-1 outer, expert 0..n_expert-1 inner);
++//   every group ties by the prior's rank first, then the pair's index.
++// Strata's `rank_learned_profile` sorts every pair at once with exactly that
++// comparator; the staged form here gives the same order.
++//
++// STRP file: "STRP", u32 version 1, u32 n_layer, u32 n_expert, u32 slots,
++// u32 n_ranked, then n_ranked x (u16 layer, u16 expert), little endian, then
++// the trailing layer x expert rank table (i32 expert -> rank, -1 for a pair
++// the ranking does not hold), as Strata's writer appends it. The reader stops
++// after the pairs, as arcint's does; a writer produces the whole file so it is
++// byte for byte Strata's. The `slots` field is a hint; the reader ignores it.
++
++#include <cstdint>
++#include <string>
++#include <utility>
++#include <vector>
++
++enum class llama_expert_profile_rule {
++    xe,   // Strata's SYCL/xe save: prior mixing, no resident head (the default)
++    cu,   // Strata's rank_learned_profile: resident first, prior as a tie-break
++};
++
++// a swap a cache still has in flight, as its save sees it: the incoming expert
++// has landed (a copy in flight counts as done, Strata does), the outgoing one
++// is still resident only while the host table is in phase 1
++struct llama_expert_profile_swap {
++    int layer;
++    int e_in;
++    int e_out;
++};
++
++// The version and geometry checks; a refusal names the file, the version found
++// and the one read (version before geometry, Strata's _version_test), or the
++// geometry, or why the pairs stopped. On refusal `ranked` is left empty: no
++// partial ranking. `slots` may be any value.
++bool llama_expert_profile_read(const char * path, int n_layers, int n_expert,
++                               std::vector<std::pair<int, int>> & ranked, std::string & err);
++
++// Atomic: a `.tmp` beside `path`, then a rename over it; a refusal (a pair out
++// of range, a short write, a failed rename) leaves an existing file untouched
++// and removes the `.tmp`. `slots = n_ranked`, as Strata's writer uses
++// len(ranked) for both; the trailing rank table is written after the pairs.
++bool llama_expert_profile_write(const char * path, int n_layers, int n_expert,
++                                const std::vector<std::pair<int, int>> & ranked, std::string & err);
++
++// Count one graph's routing into the save's heat: exactly one a routed id, raw
++// (Strata's per-routing-event device counter, the unit the prior is in), ids out
++// of range skipped. Double: a month at ~33 t/s passes float's 2^24 on the
++// hottest pairs. Call it in the cache's count(), never in its adapt(): the heat
++// must accumulate with adaptation off (LLAMA_EXPERT_CACHE_ADAPT_EVERY=0).
++void llama_expert_profile_add_heat(std::vector<double> & heat, int n_expert, const std::vector<int32_t> & ids);
++
++// The cu ranking above. `resident` and `heat` are indexed `layer * n_expert +
++// expert`; a short or missing vector reads as 0 (Strata's empty heat case). A
++// prior pair out of range is skipped; a pair the prior does not name ties last.
++std::vector<std::pair<int, int>> llama_expert_profile_rank(
++    int n_layers, int n_expert, const std::vector<uint8_t> & resident,
++    const std::vector<double> & heat, const std::vector<std::pair<int, int>> & prior);
++
++// The xe ranking: `heat` (the raw routing counts) mixed with the start's
++// ranking as pseudo-counts worth `prior_entries` routed entries, lambda 2, by
++// the prior pair's rank, then Strata's rank_learned_profile with no residents.
++std::vector<std::pair<int, int>> llama_expert_profile_rank_xe(
++    int n_layers, int n_expert, const std::vector<double> & heat,
++    const std::vector<std::pair<int, int>> & prior, double prior_entries, double lam);
++
++// Mark a cache's swaps still in flight, as Strata's save does: every incoming
++// expert is resident (its copy has landed). The outgoing expert stays resident
++// only in phase 1 (the host table still names its slot); at phase 2 the
++// table has already freed it, so the save clears it.
++void llama_expert_profile_mark_pending(int n_expert, std::vector<uint8_t> & resident,
++                                       const std::vector<llama_expert_profile_swap> & pending, int phase);
+diff --git a/src/llama-expert-route-trace.cpp b/src/llama-expert-route-trace.cpp
+new file mode 100644
+index 0000000..2f6a1b1
+--- /dev/null
++++ b/src/llama-expert-route-trace.cpp
+@@ -0,0 +1,331 @@
++#include "llama-expert-route-trace.h"
++
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++uint8_t llama_expert_route_graph_kind(uint32_t n_tokens, uint32_t decode_max, bool all_outputs, bool has_tokens) {
++    const bool prompt = !all_outputs || !has_tokens || n_tokens > decode_max;
++    return prompt ? LLAMA_EXPERT_ROUTE_PROMPT : (n_tokens == 1 ? LLAMA_EXPERT_ROUTE_DECODE : LLAMA_EXPERT_ROUTE_VERIFY);
++}
++
++bool llama_expert_route_trace_enabled() {
++    // once: the graph builder asks on every MTP MoE layer
++    static const bool on = [] {
++        const char * p = getenv("LLAMA_EXPERT_ROUTE_TRACE");
++        return p != nullptr && *p != '\0';
++    }();
++    return on;
++}
++
++// one WARN a process: the writer is dependency-free (a device-free test
++// compiles this file alone), so it cannot use llama's logger
++static void trace_warn(const char * what, const char * detail) {
++    std::fprintf(stderr, "WARN: expert route trace: %s%s%s\n", what,
++                 detail != nullptr ? ": " : "", detail != nullptr ? detail : "");
++}
++
++static uint64_t trace_max_bytes(bool & warned) {
++    const char * p = getenv("LLAMA_EXPERT_ROUTE_TRACE_MAX_MB");
++    // a record is a few KB; 256 MiB is a long span. Fractional values are for
++    // the device-free rotation test (a cap in bytes, not in a serving run).
++    // A non-numeric or non-positive value falls back to the default; 0 used to
++    // mean "rotate every record", the defect this check removes.
++    const double def = 256.0;
++    if (p == nullptr || *p == '\0') {
++        return (uint64_t) (def * 1048576.0);
++    }
++    char * end = nullptr;
++    errno = 0;
++    const double mb = std::strtod(p, &end);
++    if (end == p || *end != '\0' || errno != 0 || !(mb > 0)) {
++        if (!warned) {
++            warned = true;
++            char msg[96];
++            std::snprintf(msg, sizeof(msg), "LLAMA_EXPERT_ROUTE_TRACE_MAX_MB=%s is not a positive number", p);
++            trace_warn("falling back to 256 MB", msg);
++        }
++        return (uint64_t) (def * 1048576.0);
++    }
++    return (uint64_t) (mb * 1048576.0);
++}
++
++void llama_expert_route_trace::put_u32(uint32_t v) {
++    for (int i = 0; i < 4; ++i) {
++        buf.push_back((uint8_t) ((v >> (8 * i)) & 0xff));
++    }
++}
++
++void llama_expert_route_trace::put_i32(int32_t v) {
++    put_u32((uint32_t) v);
++}
++
++void llama_expert_route_trace::flush() {
++    std::lock_guard<std::recursive_mutex> lk(mu);
++    if (!opened || buf.empty()) {
++        buf.clear();
++        return;
++    }
++    // one write a record; the file was opened O_WRONLY|O_EXCL with one writer
++    // (the trace's mu), never O_APPEND, so a short write is resumed in the
++    // loop below instead of trusting a page-atomic write
++    size_t off = 0;
++    while (off < buf.size()) {
++        const ssize_t n = ::write(fd, buf.data() + off, buf.size() - off);
++        if (n <= 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            const int err = errno;
++            opened = false;   // a full disk or a closed fd: stop tracing, do not fail the run
++            buf.clear();
++            if (!warned) {
++                warned = true;
++                char msg[160];
++                std::snprintf(msg, sizeof(msg), "cannot write %s: %s; tracing stops",
++                              path.c_str(), std::strerror(err));
++                trace_warn("the file can no longer be written", msg);
++            }
++            return;
++        }
++        off += (size_t) n;
++        bytes_in_file += (uint64_t) n;
++    }
++    buf.clear();
++}
++
++static std::string trace_file_name(const std::string & base, bool dir_mode, uint32_t seq) {
++    if (dir_mode) {
++        char tail[32];
++        std::snprintf(tail, sizeof(tail), ".%03u.ert1", seq);
++        return base + tail;
++    }
++    if (seq == 0) {
++        return base;
++    }
++    char tail[32];
++    std::snprintf(tail, sizeof(tail), ".%03u", seq);
++    return base + tail;
++}
++
++std::string llama_expert_route_trace_sidecar() {
++    auto & t = llama_expert_route_trace::instance();
++    std::lock_guard<std::recursive_mutex> lk(t.mu);
++    if (!t.opened) {
++        return {};
++    }
++    return trace_file_name(t.path, t.dir_mode, t.seq) + ".accept";
++}
++
++void llama_expert_route_trace::close() {
++    std::lock_guard<std::recursive_mutex> lk(mu);
++    if (fd >= 0) {
++        ::close(fd);
++    }
++    fd = -1;
++    opened = false;
++    buf.clear();
++}
++
++// a fresh name only: O_EXCL, advance the sequence past anything already there.
++// Nothing is ever appended, so a restart cannot put a second header in an old
++// file and the replay never meets one mid-file.
++static int trace_open_fresh(const std::string & base, bool dir_mode, uint32_t & seq, uint64_t & bytes) {
++    for (uint32_t guard = 0; guard < 10000; ++guard) {
++        const std::string f = trace_file_name(base, dir_mode, seq);
++        const int fd = ::open(f.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
++        if (fd >= 0) {
++            bytes = 0;
++            return fd;
++        }
++        if (errno != EEXIST) {
++            return -1;
++        }
++        ++seq;
++    }
++    errno = EEXIST;
++    return -1;
++}
++
++bool llama_expert_route_trace::open(const char * p, uint32_t nl, uint32_t ne, uint32_t nu) {
++    std::lock_guard<std::recursive_mutex> lk(mu);
++    close();
++    path      = p;
++    seq       = 0;
++    bytes_in_file = 0;
++    n_layer   = nl;
++    n_expert  = ne;
++    n_used    = nu;
++    warned    = false;
++    max_bytes = trace_max_bytes(warned);
++    struct stat st;
++    const bool exists = ::stat(p, &st) == 0;
++    dir_mode = exists && S_ISDIR(st.st_mode);
++    if (!exists) {
++        // the flag is a DIR: a missing one is created, or refused loudly. It is
++        // never silently treated as a base file path (the round-6 defect).
++        if (::mkdir(p, 0755) != 0) {
++            trace_warn("cannot create the trace directory", p);
++            return false;
++        }
++        dir_mode = true;
++    }
++    if (dir_mode) {
++        char base[4096];
++        // the start time in the base: a reused pid after a restart opens a new
++        // family, not the previous run's sequence
++        std::snprintf(base, sizeof(base), "%s/expert-route-%d-%lld", p, (int) ::getpid(),
++                      (long long) std::time(nullptr));
++        path = base;
++    }
++    fd = trace_open_fresh(path, dir_mode, seq, bytes_in_file);
++    if (fd < 0) {
++        char msg[160];
++        std::snprintf(msg, sizeof(msg), "cannot open a fresh file for %s: %s", p, std::strerror(errno));
++        trace_warn("tracing is off", msg);
++        return false;
++    }
++    opened = true;
++    buf.clear();
++    buf.insert(buf.end(), {'E', 'R', 'T', '1'});
++    put_u32(2);   // version: a graph carries its first position
++    put_u32(n_layer);
++    put_u32(n_expert);
++    put_u32(n_used);
++    flush();
++    return opened;
++}
++
++bool llama_expert_route_trace_rotate_now(const llama_expert_route_trace & t) {
++    if (!t.opened || t.pending_graphs > 0) {
++        return false;
++    }
++    return t.at_cap();
++}
++
++bool llama_expert_route_trace::rotate_next() {
++    std::lock_guard<std::recursive_mutex> lk(mu);
++    if (!opened) {
++        return false;
++    }
++    close();
++    fd = trace_open_fresh(path, dir_mode, seq, bytes_in_file);
++    if (fd < 0) {
++        char msg[160];
++        std::snprintf(msg, sizeof(msg), "cannot open the next file for %s: %s", path.c_str(), std::strerror(errno));
++        trace_warn("tracing stops", msg);
++        return false;
++    }
++    opened = true;
++    buf.clear();
++    buf.insert(buf.end(), {'E', 'R', 'T', '1'});
++    put_u32(2);
++    put_u32(n_layer);
++    put_u32(n_expert);
++    put_u32(n_used);
++    flush();
++    return opened;
++}
++
++void llama_expert_route_trace::event_layers(const std::vector<int> & il, const std::vector<int> & n_slots,
++                                            const std::vector<std::vector<int32_t>> & residents) {
++    std::lock_guard<std::recursive_mutex> lk(mu);
++    if (!opened) {
++        return;
++    }
++    put_u8(0);
++    put_u32((uint32_t) il.size());
++    for (size_t i = 0; i < il.size(); ++i) {
++        put_i32(il[i]);
++        put_i32(n_slots[i]);
++        for (int s = 0; s < n_slots[i]; ++s) {
++            put_i32(s < (int) residents[i].size() ? residents[i][s] : -1);
++        }
++    }
++    flush();
++}
++
++void llama_expert_route_trace::set_residents(intptr_t key, const std::vector<int> & il, const std::vector<int> & n_slots,
++                                             const std::vector<std::vector<int32_t>> & residents) {
++    std::lock_guard<std::recursive_mutex> lk(mu);
++    for (auto & s : layer_sets) {
++        if (s.key == key) {
++            s.il = il;
++            s.n_slots = n_slots;
++            s.residents = residents;
++            return;
++        }
++    }
++    layer_sets.push_back({ key, il, n_slots, residents });
++}
++
++void llama_expert_route_trace::event_layers_all() {
++    std::lock_guard<std::recursive_mutex> lk(mu);
++    std::vector<int> il, ns;
++    std::vector<std::vector<int32_t>> res;
++    for (const auto & s : layer_sets) {
++        il.insert(il.end(), s.il.begin(), s.il.end());
++        ns.insert(ns.end(), s.n_slots.begin(), s.n_slots.end());
++        res.insert(res.end(), s.residents.begin(), s.residents.end());
++    }
++    event_layers(il, ns, res);   // the lock is recursive; one record either way
++}
++
++void llama_expert_route_trace::pending_graph(bool pending) {
++    std::lock_guard<std::recursive_mutex> lk(mu);
++    if (pending) {
++        ++pending_graphs;
++    } else if (pending_graphs > 0) {
++        --pending_graphs;
++    }
++}
++
++void llama_expert_route_trace::event_graph(uint8_t kind, int32_t first_pos, uint32_t n_tokens,
++                                           const std::vector<int32_t> & tokens,
++                                           const std::vector<int> & il, const std::vector<std::vector<int32_t>> & ids) {
++    std::lock_guard<std::recursive_mutex> lk(mu);
++    if (!opened) {
++        return;
++    }
++    put_u8(kind);
++    put_i32(first_pos);
++    put_u32(n_tokens);
++    for (uint32_t i = 0; i < n_tokens; ++i) {
++        put_i32(i < tokens.size() ? tokens[i] : -1);
++    }
++    put_u32((uint32_t) il.size());
++    for (size_t i = 0; i < il.size(); ++i) {
++        put_i32(il[i]);
++        put_u32((uint32_t) ids[i].size());
++        for (int32_t e : ids[i]) {
++            put_i32(e);
++        }
++    }
++    flush();
++}
++
++void llama_expert_route_trace::event_tables(const std::vector<llama_expert_route_trace::change> & changed) {
++    std::lock_guard<std::recursive_mutex> lk(mu);
++    if (!opened || changed.empty()) {
++        buf.clear();
++        return;
++    }
++    put_u8(5);
++    put_u32((uint32_t) changed.size());
++    for (const auto & c : changed) {
++        put_i32(c.il);
++        put_i32(c.expert);
++        put_u8(c.resident);
++    }
++    flush();
++}
++
++llama_expert_route_trace & llama_expert_route_trace::instance() {
++    static llama_expert_route_trace t;
++    return t;
++}
+diff --git a/src/llama-expert-route-trace.h b/src/llama-expert-route-trace.h
+new file mode 100644
+index 0000000..b8e2256
+--- /dev/null
++++ b/src/llama-expert-route-trace.h
+@@ -0,0 +1,163 @@
++#pragma once
++
++// An opt-in, binary routing trace for the expert cache (campaign
++// expert-foresight; stage 0 built it as a diagnostic, the operator made it a
++// production option on 2026-10-29). `LLAMA_EXPERT_ROUTE_TRACE=<dir or path>`
++// (arcint's `--llama-expert-route-trace DIR`) turns it on; unset it costs one
++// getenv at start-up and nothing else: no allocation, no read-back, no write.
++//
++// A file per process, rotated at a size cap: `f = dir` gives
++// `expert-route-<pid>-<unix-time>.000.ert1`, `.001.ert1`, ...; `f` an existing
++// non-directory is a file BASE, not the first file: a file that already sits
++// there is skipped (O_EXCL) and the sequence starts at `f.001`, then `.002`.
++// Every file is
++// opened with O_EXCL and a fresh name is chosen, never appended: a restarted
++// unit with a reused pid, or a path whose file already exists, gets a new base
++// or the next sequence, so no second header ever lands in an old file. A DIR
++// that does not exist is created; if that fails the trace is refused with a
++// WARN, never treated as a file path. Each file carries its own header and,
++// after a rotation, a LAYERS record of the cache's residents at that moment, so
++// every file replays alone; nothing is ever deleted by arcint. Header with the
++// model's geometry, then one record a event, little endian, no trailer. A run
++// that dies mid-write leaves a torn last record; a reader stops at it (never a
++// partial one), and resynchronises on a later "ERT1" magic so an old file with
++// an appended header still replays.
++//
++// Size: a prompt record is n_tokens x top-k x n_layer x 4 B, about 1.9 KB a
++// prompt token, so a 100k prompt is about 190 MB. DIR belongs on a dataset with
++// room, not the root filesystem.
++//
++// A trace with token ids is the prompt and the answer in another form: whoever
++// turns it on stores every request's content on the serving host.
++//
++//   header  "ERT1" u32 version u32 n_layer u32 n_expert u32 n_used
++//           version 2 adds a graph's first position; version 1 had none
++//   event   u8 kind, then
++//     0 LAYERS  u32 n, per: i32 il, i32 n_slots, n_slots i32 resident (slot ->
++//               expert, -1 for the trailing zeros slot) -- a cache's layers as
++//               loaded, so a replay starts from the run's own resident set
++//     1 PROMPT  a prompt batch of any size, including the 4-token tail a
++//               checkpoint break leaves (the cache classifies by the call:
++//               a prompt call does not output every row; a decode call does)
++//     2 DECODE  a one-token decode
++//     3 VERIFY  a decode verify (2..decode_max tokens): tokens[1..] are the
++//               drafts, tokens[0] the token before them; which of the drafts a
++//               sampler accepted is NOT in this file -- the engine's cache
++//               cannot see the sampler. arcint writes it beside the trace
++//               (`<path>.accept`: "verify <ordinal> pos <p> rows <n> accepted
++//               <a>", one a decode graph, a single lane; the replay aligns by
++//               p, a graph's first position, never by order)
++//     4 DRAFT   an MTP draft context's own decode: the MTP block's input
++//               tokens (step 0 the accepted target token, then the previous
++//               draft -- NOT the drafted tokens) and its own routed ids
++//               (Flash-Next's MTP block is a full MoE layer,
++//               llama-model.cpp/models/qwen4exp.cpp; it runs without an
++//               expert cache, so llama-context.cpp reads its
++//               selected_experts tensor when this trace is on)
++//     all four graph kinds: i32 first_pos (version 2; -1 when the ubatch has
++//      no positions), u32 n_tokens, i32 token[n_tokens] (-1 for an embedding
++//      row), u32 n_layers, per: i32 il, u32 count, i32 ids[count]
++//      (token-major, the router's top-k in rank order, exactly the ids_out the
++//      cache already reads)
++//     5 TABLES  u32 n_changes, per: i32 il, i32 expert, u8 resident (1: in a
++//               slot, 0: not) -- every residency change the cache applies, so a
++//               replay rebuilds the resident set instead of guessing it
++//
++// The writer is dependency-free on purpose: a device-free test compiles this
++// file alone and reads its bytes back with the replay's reader.
++
++#include <cstdint>
++#include <mutex>
++#include <string>
++#include <vector>
++
++// ERT1 graph kinds: the cache's decision from a call's shape, kept pure so a
++// device-free test can exercise it (a prompt call outputs fewer rows than it
++// has tokens; a decode or verify call outputs every one; a prompt's 4-token
++// checkpoint tail is a prompt).
++enum llama_expert_route_kind : uint8_t {
++    LLAMA_EXPERT_ROUTE_LAYERS = 0, LLAMA_EXPERT_ROUTE_PROMPT = 1,
++    LLAMA_EXPERT_ROUTE_DECODE = 2, LLAMA_EXPERT_ROUTE_VERIFY = 3,
++    LLAMA_EXPERT_ROUTE_DRAFT = 4, LLAMA_EXPERT_ROUTE_TABLES = 5,
++};
++
++uint8_t llama_expert_route_graph_kind(uint32_t n_tokens, uint32_t decode_max, bool all_outputs, bool has_tokens);
++
++// The variable is read once: the graph builder asks whether to mark the
++// MTP block's routed ids as an output (a no-op when the trace is off).
++bool llama_expert_route_trace_enabled();
++
++// The accept sidecar beside the CURRENT trace file (`<file>.accept`), so it
++// rotates with it; empty when the trace is off. A writer appends one line a
++// accepted graph and reopens the sidecar when this name changes.
++std::string llama_expert_route_trace_sidecar();
++
++struct llama_expert_route_trace {
++    struct change { int32_t il, expert; uint8_t resident; };
++    int  fd      = -1;
++    bool opened  = false;
++    bool warned  = false;       // one WARN a run when a write or an open fails
++    std::string path;           // `base` for the file names below
++    bool        dir_mode = false;
++    uint32_t    seq      = 0;   // the file in this process's sequence
++    uint64_t    bytes_in_file = 0;
++    uint64_t    max_bytes = 0;  // rotate past this; LLAMA_EXPERT_ROUTE_TRACE_MAX_MB (default 256)
++    uint32_t    n_layer = 0, n_expert = 0, n_used = 0;
++    std::vector<uint8_t> buf;   // the record being built
++    // the writer is shared by the cache's decode path and an MTP context's
++    // synchronize (lanes), so every public record call holds this one lock
++    std::recursive_mutex mu;
++    // process-wide, not one cache: with a cache a card (a layer split), cache A
++    // must not rotate while cache B's graph record for the same graph is still
++    // pending -- its accept line is already in A's file
++    int pending_graphs = 0;
++    // every cache's residents at its last TABLES record, so a rotation writes
++    // one LAYERS record that holds every card's layers and every file replays
++    // alone under a layer split
++    struct layer_set {
++        intptr_t key;   // the cache, stable for its life
++        std::vector<int> il, n_slots;
++        std::vector<std::vector<int32_t>> residents;
++    };
++    std::vector<layer_set> layer_sets;
++
++    // Opens the first file with O_EXCL (never appends), writes the header.
++    bool open(const char * p, uint32_t n_layer, uint32_t n_expert, uint32_t n_used);
++    // At the cap: close this file, open the next fresh one (O_EXCL) and write
++    // its header. The caller follows with event_layers_all.
++    bool at_cap() const { return opened && bytes_in_file >= max_bytes; }
++    bool rotate_next();
++    void close();
++
++    void put_u8(uint8_t v)  { buf.push_back(v); }
++    void put_u32(uint32_t v);
++    void put_i32(int32_t v);
++    void flush();   // one write() a record, resumed across short writes; the
++                    // file is opened O_WRONLY|O_EXCL (no O_APPEND)
++
++    void event_layers(const std::vector<int> & il, const std::vector<int> & n_slots,
++                      const std::vector<std::vector<int32_t>> & residents);
++    // A cache's current residents, kept for the next rotation's snapshot.
++    void set_residents(intptr_t key, const std::vector<int> & il, const std::vector<int> & n_slots,
++                       const std::vector<std::vector<int32_t>> & residents);
++    // One LAYERS record over every registered cache, in registration order.
++    void event_layers_all();
++    // Hold/release the process-wide pending count around a graph record.
++    void pending_graph(bool pending);
++    void event_graph(uint8_t kind, int32_t first_pos, uint32_t n_tokens, const std::vector<int32_t> & tokens,
++                     const std::vector<int> & il, const std::vector<std::vector<int32_t>> & ids);
++    void event_tables(const std::vector<change> & changed);
++
++    // The process's one trace: opened on the first cache's init, off when the
++    // variable is unset or the file cannot be opened (a warning a run).
++    static llama_expert_route_trace & instance();
++};
++
++// The cache's rotation decision, kept pure so a device-free test can drive the
++// cache's real call order: a rotation is taken at `after_graph`, before arcint
++// writes the verify's accept line. While ANY cache's graph record is pending
++// its accept line is already in this file, so a rotation at the next advance,
++// the request-end flush or an MTP DRAFT record would split the line from its
++// record; it waits for the next `after_graph` (round 7's defect, made
++// process-wide in round 8: a layer split has a cache a card).
++bool llama_expert_route_trace_rotate_now(const llama_expert_route_trace & t);
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 94a36ba..ab8be70 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -98,6 +98,10 @@ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llam
+ // Useful for testing purposes.
+ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
+ 
++// Write the expert cache's pending last graph to the routing trace, at a
++// request's end (campaign expert-foresight). A no-op when the trace is off.
++LLAMA_API void llama_expert_route_trace_flush(struct llama_context * ctx);
++
+ // Set whether the context outputs nextn embeddings or not
+ // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
+ // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index c46092c..89b1cab 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-graph.h"
++#include "llama-expert-route-trace.h"
+ #include "llama-expert-cache.h"
+ 
+ #include "llama-impl.h"
+@@ -1455,6 +1456,7 @@ void llm_graph_result::reset() {
+ 
+     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
+     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
++    t_route_ids.clear();
+ 
+     t_sampled.clear();
+     t_sampled_ids = nullptr;
+@@ -2352,6 +2354,44 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     //call early so that topk-moe can be used
+     ggml_build_forward_expand(gf, weights);
+ 
++    // the trace's MTP block: its routed ids as an output, read back by
++    // llama-context.cpp after the graph. Only an MTP context, only when the
++    // variable is set: off, no tensor is added, no node and no name.
++    //
++    // AFTER the weights expand, never before it: a graph's node order is the
++    // expand order, and 0064's ggml_opencl_can_fuse_topk_moe wants ten
++    // consecutive nodes from the router's SOFT_MAX (RESHAPE, ARGSORT, VIEW,
++    // GET_ROWS, RESHAPE, SUM_ROWS, CLAMP, DIV, RESHAPE -- the weights expand
++    // is what appends them). Before it, this block's expand appended SOFT_MAX,
++    // ARGSORT, VIEW, CONT first, the weights expand followed with the rest,
++    // and the scan saw ARGSORT where it wants RESHAPE: the MTP draft's router
++    // ran unfused and, per fusion-coder-night.md, a fused router's softmax sum
++    // order changes greedy texts and draft acceptance -- the trace-on drafter
++    // was not the served one. Here the CONT lands after the ten nodes and the
++    // fusion survives: ggml_can_fuse_subgraph exempts the nodes in `outs`,
++    // and the VIEW it consumes is outs[0] (the cache's own ids_out below is
++    // placed exactly that way).
++    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && llama_expert_route_trace_enabled()) {
++        ggml_tensor * ids_out = ggml_cont(ctx0, selected_experts);
++        ggml_set_output(ids_out);
++        // the cache's ids_out (below) is reachable from the graph through
++        // ids_flat, so the scheduler allocates it; this one is a dead end --
++        // marked output and nothing else. The forward walk does not reach it,
++        // so without this expand its buffer stays null, the decode's read-back
++        // skips it, and no DRAFT record is written even though the graph ran.
++        ggml_build_forward_expand(gf, ids_out);
++        // name AFTER cb, never before it: cb renames a layer's tensor
++        // "%s-%d" (llama-context.cpp's ggml_format_name), so a name set first is
++        // overwritten to "ffn_moe_ids_trace-<il>" and the backend's byte compare
++        // never matches. The backend reads the prefix, so either form would do;
++        // setting it here keeps the exact name on the node.
++        cb(ids_out, "ffn_moe_ids_trace", il);
++        // the backend's fused-router check reads this name: a card check can
++        // then say the MTP context's router ran fused while the trace was on
++        ggml_set_name(ids_out, "ffn_moe_ids_trace");
++        res->set_route_ids(il, ids_out);
++    }
++
+     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+ 
+     if (weight_before_ffn) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 6e89a39..808aecb 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -948,6 +948,11 @@ public:
+     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
+     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
+ 
++    // the routed ids of a traced MTP block's MoE layers (il, tensor); empty
++    // unless LLAMA_EXPERT_ROUTE_TRACE is set and this is an MTP context
++    const std::vector<std::pair<int, ggml_tensor *>> & get_route_ids() const { return t_route_ids; }
++    void set_route_ids(int il, ggml_tensor * t) { t_route_ids.emplace_back(il, t); }
++
+     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
+ 
+     ggml_cgraph  * get_gf()  const { return gf; }
+@@ -988,6 +993,7 @@ public:
+     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+ 
+     std::vector<ggml_tensor *> t_layer_inp;
++    std::vector<std::pair<int, ggml_tensor *>> t_route_ids;
+ 
+     std::vector<ggml_tensor *> t_sampled;
+     ggml_tensor *              t_sampled_ids = nullptr; // I32 [n_rows]: the same sampled ids in one tensor (one read-back), or null
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 6d32e41..30a8e01 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -205,6 +205,19 @@ if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
+     add_test(NAME test-opencl-kq-i8 COMMAND $<TARGET_FILE:test-opencl-kq-i8>)
+ endif()
+ 
++# patch 0077: the sampled VRAM alias tripwire and the slot-buffer check
++# (device-free). Both read the backend's own sources, so the cell and the call
++# site cannot drift.
++if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
++    add_executable(test-opencl-alias test-opencl-alias.cpp)
++    target_include_directories(test-opencl-alias PRIVATE
++        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl)
++    target_compile_definitions(test-opencl-alias PRIVATE
++        GGML_OPENCL_SRC_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/ggml-opencl.cpp")
++    add_test(NAME test-opencl-alias COMMAND $<TARGET_FILE:test-opencl-alias>)
++    set_tests_properties(test-opencl-alias PROPERTIES LABELS unit)
++endif()
++
+ # patch 0072: the uniform-work-group rounding rule (ggml-opencl-uniform.h,
+ # the header the backend includes) and a text check that every launch site with
+ # a local size rounds its global size before enqueueing.
+diff --git a/tests/test-expert-cache-alias.cpp b/tests/test-expert-cache-alias.cpp
+new file mode 100644
+index 0000000..2b0e344
+--- /dev/null
++++ b/tests/test-expert-cache-alias.cpp
+@@ -0,0 +1,120 @@
++// 0077: device-free tests for the slot-buffer sampled alias tripwire.
++//   - the region arithmetic over every planar type the OpenCL set path converts
++//     slice by slice: the offset is a multiple of the tensor's nb[2], the size is
++//     exactly nb[2], inside the tensor;
++//   - an empty slice or a tensor shorter than one slice has no region;
++//   - the pattern: two ids differ at byte 0, one id equals itself; one differing
++//     read-back is one finding;
++//   - llama-expert-cache.cpp's call: the header is included, the planar types are
++//     the ones sampled, all writes precede the read-backs, a finding warns and
++//     the load proceeds, and the env switch is present.
++// No GPU, no llama model; ggml is linked for the type sizes.
++#include <cstdio>
++#include <cstdint>
++#include <cstring>
++#include <fstream>
++#include <string>
++#include <vector>
++
++#include "ggml.h"
++#include "llama-expert-cache-alias.h"
++
++static int g_bad = 0;
++#define CHECK(cond, what) do { if (!(cond)) { std::printf("FAIL: %s\n", what); ++g_bad; } } while (0)
++
++static void check_planar_regions(void) {
++    const ggml_type types[] = { GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
++                                GGML_TYPE_Q2_0,    GGML_TYPE_IQ3_S,  GGML_TYPE_IQ3_XXS };
++    for (ggml_type type : types) {
++        // a 3-D slot tensor: ne0 = 256, ne1 = 256; nb[2] is one 2-D slice
++        const size_t row  = ggml_row_size(type, 256);
++        const size_t nb2  = row * 256;
++        CHECK((256 * 256 / ggml_blck_size(type)) % 2 == 0, "the planar type's block count is even");
++        const size_t bytes = nb2 * 8;
++        for (size_t i = 0; i < 4; ++i) {
++            const llama_cache_alias_span s = llama_cache_alias_region(bytes, nb2, i);
++            CHECK(s.ok, "a planar tensor of eight slices has a region");
++            CHECK(s.offset % nb2 == 0, "the region starts on a whole slice");
++            CHECK(s.size == nb2, "the region is one whole slice");
++            CHECK(s.offset + s.size <= bytes, "the region lies inside the tensor");
++        }
++        CHECK(llama_cache_alias_region(nb2, nb2, 0).ok, "one slice has a region");
++        CHECK(llama_cache_alias_region(nb2 - 1, nb2, 0).ok == false, "less than one slice has no region");
++    }
++    // two consecutive tensors sample distinct, still slice-aligned starts
++    const size_t nb2 = 110;
++    const llama_cache_alias_span a = llama_cache_alias_region(nb2 * 64, nb2, 0);
++    const llama_cache_alias_span b = llama_cache_alias_region(nb2 * 64, nb2, 1);
++    CHECK(a.ok && b.ok && a.offset % nb2 == 0 && b.offset % nb2 == 0, "two tensors start on whole slices");
++    CHECK(a.offset != b.offset, "consecutive tensors sample distinct regions");
++    // a large slice is still one whole slice, not a capped block
++    const size_t big = 40000;
++    const llama_cache_alias_span c = llama_cache_alias_region(big * 8, big, 0);
++    CHECK(c.ok && c.size == big, "a large slice is one whole slice");
++}
++
++static void check_pattern(void) {
++    constexpr size_t BLOCK = 64u << 10;
++    std::vector<uint8_t> a(BLOCK), b(BLOCK), c(BLOCK);
++    llama_cache_alias_pattern(3, a.data(), a.size());
++    llama_cache_alias_pattern(4, b.data(), b.size());
++    llama_cache_alias_pattern(3, c.data(), c.size());
++    CHECK(std::memcmp(a.data(), b.data(), BLOCK) != 0, "two ids' regions differ");
++    CHECK(std::memcmp(a.data(), c.data(), BLOCK) == 0, "one id's region equals itself");
++    // a slice-sized region whose tail is not a multiple of eight still fills
++    std::vector<uint8_t> d(110), e(110);
++    llama_cache_alias_pattern(5, d.data(), d.size());
++    llama_cache_alias_pattern(6, e.data(), e.size());
++    CHECK(std::memcmp(d.data(), e.data(), d.size()) != 0, "a tail-filled region differs from another id's");
++    CHECK(llama_cache_alias_reads_back(3, a.data(), a.size()), "a read-back matches its own pattern");
++    CHECK(!llama_cache_alias_reads_back(3, b.data(), b.size()), "one differing region is one finding");
++    CHECK(llama_cache_alias_reads_back(3, c.data(), c.size()), "the same id's read-back matches");
++}
++
++static void check_call_site(const std::string & src) {
++    CHECK(src.find("#include \"llama-expert-cache-alias.h\"") != std::string::npos,
++          "llama-expert-cache.cpp includes the alias check");
++    CHECK(src.find("llama_cache_alias_check(alias_slots)") != std::string::npos,
++          "the slot buffers are checked at load");
++    const size_t set = src.find("ggml_backend_tensor_set(t, region.data(), sp.offset, region.size())");
++    const size_t get = src.find("ggml_backend_tensor_get(p.t, actual.data(), p.off, actual.size())");
++    CHECK(set != std::string::npos && get != std::string::npos && set < get,
++          "all writes precede the read-backs");
++    for (const char * t : {"GGML_TYPE_IQ2_XXS", "GGML_TYPE_IQ2_XS", "GGML_TYPE_IQ2_S",
++                           "GGML_TYPE_Q2_0", "GGML_TYPE_IQ3_S", "GGML_TYPE_IQ3_XXS"}) {
++        CHECK(src.find(std::string("case ") + t + ":") != std::string::npos,
++              "the planar types are the ones sampled");
++    }
++    for (const char * t : {"GGML_TYPE_Q4_0", "GGML_TYPE_Q1_0", "GGML_TYPE_Q8_0",
++                           "GGML_TYPE_IQ4_NL", "GGML_TYPE_Q4_K"}) {
++        CHECK(src.find(std::string("case ") + t + ":") == std::string::npos,
++              "the whole-tensor SOA readers are not sampled");
++    }
++    CHECK(src.find("p.expected") == std::string::npos && src.find("sampled_bytes") != std::string::npos,
++          "the plan holds no expected bytes and the summary reports them");
++    CHECK(src.find("warn and proceed") != std::string::npos,
++          "a finding warns and the load proceeds");
++    CHECK(src.find("LLAMA_EXPERT_CACHE_ALIAS") != std::string::npos,
++          "the record's off switch is present");
++    CHECK(src.find("alias check, %d of %zu sampled slot regions differ, %zu bytes written and read back") != std::string::npos,
++          "the finding is logged with its count and the sampled bytes");
++}
++
++int main() {
++    check_planar_regions();
++    check_pattern();
++    std::ifstream f(LLAMA_EXPERT_CACHE_SRC_PATH);
++    if (!f) {
++        std::printf("FAIL: cannot open %s\n", LLAMA_EXPERT_CACHE_SRC_PATH);
++        ++g_bad;
++    } else {
++        const std::string src((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
++        check_call_site(src);
++    }
++    if (g_bad) {
++        std::printf("test-expert-cache-alias: %d failure(s)\n", g_bad);
++        return 1;
++    }
++    std::printf("test-expert-cache-alias: ok\n");
++    return 0;
++}
+diff --git a/tests/test-opencl-alias.cpp b/tests/test-opencl-alias.cpp
+new file mode 100644
+index 0000000..f57d9d4
+--- /dev/null
++++ b/tests/test-opencl-alias.cpp
+@@ -0,0 +1,122 @@
++// 0077: device-free tests for the VRAM alias check, a sampled deviation from
++// Strata's full scan.
++//   - the plan: blocks are 64 KiB aligned, inside the allocation, unique and
++//     evenly spread; a small allocation is one block, an empty one none, and an
++//     allocation larger than the sample takes GGML_CL_ALIAS_BLOCKS;
++//   - the pattern: two blocks' patterns differ at byte 0, one block's equals
++//     itself, so a read-back of an aliased block is not the expected one;
++//   - the corruption class: a two-page model whose second write lands in the
++//     first page's physical bytes reads the first back with the second's
++//     pattern, so the check reports it; without the alias the check is clean;
++//   - the call sites: ggml-opencl.cpp includes the header and scans the bank
++//     stream ring whenever a learned order's ring is (re)allocated; a relearn
++//     scans again; the USM host staging ring is not
++//     scanned (host RAM, not a GPU page table); findings are named per block and
++//     every scan ends with one summary line. No host-range pre-check remains
++//     (the old 0077 class: different USM host ranges cannot overlap, so it could
++//     never fire).
++// No GPU, no OpenCL runtime.
++#include <cstdio>
++#include <cstdint>
++#include <cstring>
++#include <fstream>
++#include <string>
++#include <vector>
++
++#include "ggml-opencl-alias.h"
++
++static int g_bad = 0;
++#define CHECK(cond, what) do { if (!(cond)) { std::printf("FAIL: %s\n", what); ++g_bad; } } while (0)
++
++static void check_plan(void) {
++    // 32 MiB, the default staging ring: 512 blocks, the 16-block sample spread
++    const size_t bytes = 32u << 20;
++    size_t offs[GGML_CL_ALIAS_BLOCKS];
++    const size_t k = ggml_cl_alias_offsets(bytes, offs, GGML_CL_ALIAS_BLOCKS);
++    CHECK(k == GGML_CL_ALIAS_BLOCKS, "a 32 MiB allocation takes the full sample");
++    for (size_t i = 0; i < k; ++i) {
++        CHECK(offs[i] % GGML_CL_ALIAS_BLOCK == 0, "a block offset is 64 KiB aligned");
++        CHECK(offs[i] + GGML_CL_ALIAS_BLOCK <= bytes, "a block lies inside the allocation");
++        for (size_t j = 0; j < i; ++j) CHECK(offs[i] != offs[j], "the blocks are unique");
++    }
++    CHECK(offs[0] == 0, "the first block is at the start");
++    // a small allocation: one block; an empty or sub-block one: none
++    CHECK(ggml_cl_alias_offsets(GGML_CL_ALIAS_BLOCK, offs, GGML_CL_ALIAS_BLOCKS) == 1,
++          "one block at one block's size");
++    CHECK(ggml_cl_alias_offsets(GGML_CL_ALIAS_BLOCK - 1, offs, GGML_CL_ALIAS_BLOCKS) == 0,
++          "no block below one block's size");
++    CHECK(ggml_cl_alias_offsets(0, offs, GGML_CL_ALIAS_BLOCKS) == 0, "no block in an empty allocation");
++    // a sample cap: the plan is bounded, not the allocation
++    CHECK(ggml_cl_alias_offsets(1u << 30, offs, 4) == 4, "a billion bytes still takes only the cap");
++}
++
++static void check_pattern(void) {
++    std::vector<uint8_t> a(GGML_CL_ALIAS_BLOCK), b(GGML_CL_ALIAS_BLOCK), c(GGML_CL_ALIAS_BLOCK);
++    ggml_cl_alias_pattern(7, a.data());
++    ggml_cl_alias_pattern(8, b.data());
++    ggml_cl_alias_pattern(7, c.data());
++    CHECK(std::memcmp(a.data(), b.data(), GGML_CL_ALIAS_BLOCK) != 0, "two ids' blocks differ");
++    CHECK(std::memcmp(a.data(), c.data(), GGML_CL_ALIAS_BLOCK) == 0, "one id's block equals itself");
++    CHECK(std::memcmp(a.data(), b.data(), 8) != 0, "two ids differ at the block's first word");
++}
++
++// two pages: page 0 and page 1; with aliasing page 1's bytes are page 0's, so a
++// write to page 1 overwrites page 0 (the class the check exists for)
++static int simulate(bool aliased) {
++    std::vector<uint8_t> page0(GGML_CL_ALIAS_BLOCK), page1(GGML_CL_ALIAS_BLOCK);
++    std::vector<uint8_t> * v0 = &page0, * v1 = aliased ? &page0 : &page1;
++    std::vector<std::vector<uint8_t>> expected(2, std::vector<uint8_t>(GGML_CL_ALIAS_BLOCK));
++    ggml_cl_alias_pattern(0, expected[0].data());
++    ggml_cl_alias_pattern(1, expected[1].data());
++    std::memcpy(v0->data(), expected[0].data(), GGML_CL_ALIAS_BLOCK);
++    std::memcpy(v1->data(), expected[1].data(), GGML_CL_ALIAS_BLOCK);
++    int bad = 0;
++    if (std::memcmp(v0->data(), expected[0].data(), GGML_CL_ALIAS_BLOCK) != 0) ++bad;
++    if (std::memcmp(v1->data(), expected[1].data(), GGML_CL_ALIAS_BLOCK) != 0) ++bad;
++    return bad;
++}
++
++static void check_corruption_class(void) {
++    CHECK(simulate(true) > 0, "an aliased block is found by the write/read-back");
++    CHECK(simulate(false) == 0, "distinct blocks read back clean");
++}
++
++static void check_call_sites(const std::string & src) {
++    CHECK(src.find("#include \"ggml-opencl-alias.h\"") != std::string::npos,
++          "ggml-opencl.cpp includes the alias check's plan");
++    CHECK(src.find("ggml_cl_alias_scan_device(ctx->queue, b.buffer, b.size, \"bank stream ring\", &alias_blocks)") != std::string::npos,
++          "the bank stream ring is scanned at each learned order's ring");
++    CHECK(src.find("ggml_cl_alias_scan_host") == std::string::npos,
++          "the USM host staging ring is not scanned");
++    CHECK(src.find("clEnqueueWriteBuffer(q, mem, CL_TRUE") != std::string::npos &&
++              src.find("clEnqueueReadBuffer(q, mem, CL_TRUE") != std::string::npos,
++          "the device scan writes all blocks and reads them back");
++    CHECK(src.find("block %zu at %zu reads back differently") != std::string::npos,
++          "a finding names the block");
++    CHECK(src.find("alias check, bank stream ring: %d of %zu sampled blocks differ") != std::string::npos,
++          "every scan ends with one summary line");
++    // the old class: a host-range registry of distinct allocations cannot overlap
++    CHECK(src.find("ggml_cl_ranges_overlap") == std::string::npos &&
++              src.find("ggml_cl_note_alloc") == std::string::npos,
++          "no host-range pre-check remains");
++}
++
++int main() {
++    check_plan();
++    check_pattern();
++    check_corruption_class();
++    std::ifstream f(GGML_OPENCL_SRC_PATH);
++    if (!f) {
++        std::printf("FAIL: cannot open %s\n", GGML_OPENCL_SRC_PATH);
++        ++g_bad;
++    } else {
++        const std::string src((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
++        check_call_sites(src);
++    }
++    if (g_bad) {
++        std::printf("test-opencl-alias: %d failure(s)\n", g_bad);
++        return 1;
++    }
++    std::printf("test-opencl-alias: ok\n");
++    return 0;
++}
