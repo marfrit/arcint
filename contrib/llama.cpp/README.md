@@ -6543,3 +6543,21 @@ The coder's own file on the A770, llama-bench, 4,096 tokens, ubatch 1,024, f16 K
 Suites: `test-backend-ops -o MUL_MAT` q4_0 161/161 on both cards, q8_0 151/151 on the A770. Red, each seen failing with the mutant compiled in: `-DQ40_RED` through `GGML_OPENCL_KQ_2D_OPTS` or `GGML_OPENCL_Q40_SG8_OPTS` 23 cases of 161 on either card and arm (25 error lines), `-DQ8_RED` 26 of 151.
 
 `GGML_OPENCL_Q8_XMX=0` no longer reaches ggml's Q8_0 kernels on Alchemist by itself; `GGML_OPENCL_Q8_I8=0` comes first there. `kq_i8` carries no layout tag: the Xe2 and sub-group 8 quantizers are built for different cards and never coexist.
+
+## 0100-opencl-downgrade-lines-and-counts.patch
+
+A path other than the one a weight's type promises now says so. The coder's Q8_0 ran ggml's float kernel at prefill for months (0099), seen only in a profile. One line, `DOWNGRADE src=opencl <key>`, at `GGML_LOG_WARN` the first time a key occurs in the process, and a count per key, read with `ggml_backend_opencl_downgrades`; arcint serves them on `/props` as `downgrades`.
+
+| Where | Key |
+|---|---|
+| an optional program not built, or not fitting a work-group (17 sites) | `path=fallback reason=not-built\|no-fit what=<kernels>` |
+| `supports_op` sending a K-quant or IQ product to the CPU | `op=MUL_MAT\|MUL_MAT_ID type= k= path=cpu reason=shape` |
+| ggml's generic tiled GEMM (Intel) | `op=MUL_MAT type= k= cols=1-4\|5-15\|16+ path=generic reason=no-fast-path` |
+| the per-column matvec at 16 or more columns (Intel): below 32 columns the generic switch breaks out to it | `op=MUL_MAT type= k= cols=16+ path=matvec reason=no-fast-path` |
+
+A matvec below 16 columns is a decode step's normal path and says nothing. The list is not complete: expert GEMM selection and flash attention's shape limits are not covered yet.
+
+Served, deployed flags, 12 short answers and prompts of 396, 621, 1,821, 6,021 and 19,521 tokens (`measured-here`): the coder none, the agent none, Flash-Next 8 keys, BF16 at 5-15 columns (K 10240, 2560, 320) and F32 (K 128, 2560). Their cost is not priced.
+
+Red, each seen reported, on the coder: `GGML_OPENCL_Q8_I8=0` 4 keys, Q8_0 at K 2048 and 512 on the generic GEMM and on the matvec; a program that does not compile, `not-built what=q40_i8_sg8`. The first version of this patch missed the matvec, and short prompts never reached the generic path, so that red run reported nothing: a card check of this kind needs long prompts.
+
