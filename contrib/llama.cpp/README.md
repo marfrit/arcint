@@ -6565,3 +6565,5 @@ Red, each seen reported, on the coder: `GGML_OPENCL_Q8_I8=0` 4 keys, Q8_0 at K 2
 
 0100's list, widened to what it left out: an expert product on ggml's generic `MUL_MAT_ID` (`op=MUL_MAT_ID type= k= path=generic reason=no-fast-path`), and a prompt's flash attention (more than 8 rows) off the XMX kernel (`op=FLASH_ATTN head= kv= n_q=9+ path=f32_f16 reason=no-dpas-kernel|shape`). Sub-group 8 has no GQA decode kernel by design, and an expert product below 16 tokens takes the matvec by design: neither reports.
 
+Served on all three units with prompts up to 19,521 tokens, nothing new (`measured-here`). Red, each seen reported: `GGML_OPENCL_FA_DPAS=0` on Llama 2 through arcint, `op=FLASH_ATTN head=128 kv=f16 n_q=9+ path=f32_f16 reason=no-dpas-kernel`, prefill 2814 -> 1461 t/s; `test-backend-ops -o MUL_MAT_ID -p type_a=q8_0`, the generic expert key at K 256 and 96. `llama-bench` installs a null log callback (`llama-bench.cpp:2286`), so it never shows these lines: check through arcint's `/props` or a tool that keeps the log.
+
