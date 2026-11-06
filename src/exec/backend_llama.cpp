@@ -16,6 +16,7 @@
 #include <CL/cl.h>
 #include <gguf.h>
 #include <llama.h>
+#include "ggml-opencl.h"
 #include <llama-ext.h>   // llama_expert_route_trace_flush (contrib/llama.cpp 0069)
 
 #ifdef ARCINT_MTMD
@@ -1289,6 +1290,14 @@ public:
     // "broken". A poisoned or broken state exits the process (patch 0068's
     // llama_loan_book::poison_exit, operator 2026-10-29), so a live server
     // reports at worst "out" for a moment or "armed".
+    std::vector<std::pair<std::string, uint64_t>> downgrades() const override {
+        const size_t need = ggml_backend_opencl_downgrades(nullptr, 0);
+        std::string text(need + 1, '\0');
+        ggml_backend_opencl_downgrades(text.data(), text.size());
+        text.resize(need);
+        return parse_downgrades(text);
+    }
+
     std::string slot_loan_state() const override {
         std::lock_guard<std::mutex> lk(mu_);
         if (ctx_ == nullptr) return "off";

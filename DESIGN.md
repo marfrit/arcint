@@ -1,7 +1,7 @@
 # arcint — Design
 
-State as of 2026-11-06: arcint **1.5.3** on llama.cpp **`3e4dfa8`** with the
-patch series `contrib/llama.cpp/patches` 0001-0099 (92 patches; 0031, 0055,
+State as of 2026-11-06: arcint **1.5.4** on llama.cpp **`3e4dfa8`** with the
+patch series `contrib/llama.cpp/patches` 0001-0100 (93 patches; 0031, 0055,
 0061, 0076 and 0078 retired, 0073 on its own prefill-gather branch, 0085 never assigned). One engine: libllama with
 ggml's OpenCL backend and arcint's Intel kernels. Three language services run
 in production on two Intel Arc cards: the dense Qwen3.8-27B agent and
@@ -468,7 +468,7 @@ contract `docs/imggen-service.md`.
 | `POST /v1/completions` | raw completion; accepts token-id prompts |
 | `GET /v1/models` | one entry per served name with the context it is **running with** (§4.2) |
 | `GET /health` | model, loaded, slots free/total, queue depth; per lane with named lanes |
-| `GET /props` | the served file and architecture, context, KV types, MTP state, sampler defaults and provenance, build info |
+| `GET /props` | the served file and architecture, context, KV types, MTP state, sampler defaults and provenance, build info, `downgrades` (paths other than the one a weight's type promises, since the process started) |
 | `POST /tokenize` | llama-server-compatible: `content` → ids, `with_pieces` → `{id, piece}` (a piece that is not valid UTF-8 on its own is its array of byte values); a chat or Responses body → `{tokens, count}`, the prompt the request would decode, through the same prepare path |
 | `POST /detokenize` | llama-server-compatible: `tokens` → `content`, special tokens rendered as text |
 

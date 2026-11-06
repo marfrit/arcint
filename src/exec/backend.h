@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+#include <utility>
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -68,6 +70,25 @@ inline std::vector<int> scan_loop_guard_door_ids(Tokenizer& tok) {
             else { only = false; break; }
         }
         if (only && newlines >= 2) out.push_back(id);
+    }
+    return out;
+}
+
+// "key\tcount\n" lines (ggml_backend_opencl_downgrades) to pairs; a line without a tab
+// or a number is dropped, and a truncated last line with it.
+inline std::vector<std::pair<std::string, uint64_t>> parse_downgrades(const std::string& text) {
+    std::vector<std::pair<std::string, uint64_t>> out;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const size_t nl = text.find('\n', pos);
+        if (nl == std::string::npos) break;
+        const std::string line = text.substr(pos, nl - pos);
+        pos = nl + 1;
+        const size_t tab = line.find('\t');
+        if (tab == std::string::npos || tab == 0 || tab + 1 >= line.size()) continue;
+        const std::string num = line.substr(tab + 1);
+        if (num.find_first_not_of("0123456789") != std::string::npos || num.size() > 19) continue;
+        out.emplace_back(line.substr(0, tab), std::stoull(num));
     }
     return out;
 }
@@ -369,6 +390,12 @@ public:
     // reports it ("off", "armed", "out", "poisoned", "broken"), for /props and
     // the request-start refusal. The stub and a backend without the loan: "off".
     virtual std::string slot_loan_state() const { return "off"; }
+
+    // The paths taken other than the one a weight's type promises, with how often
+    // (ggml_backend_opencl_downgrades, patch 0100), for /props. The log carries the
+    // same keys as "DOWNGRADE <key>" the first time each occurs. Counts reset with the
+    // process. The stub and a backend without them: none.
+    virtual std::vector<std::pair<std::string, uint64_t>> downgrades() const { return {}; }
 
     // --llama-mtp-policy cost's learned per-width round cost table (Strata's
     // log line), for /props; empty when the policy is off. Reads under the

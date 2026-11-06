@@ -38,6 +38,8 @@ public:
     Tokenizer&          tokenizer() override { return tok_; }
     std::string         slot_loan_state() const override { return loan_state; }
     std::string         loan_state = "off";
+    std::vector<std::pair<std::string, uint64_t>> downgrades() const override { return down; }
+    std::vector<std::pair<std::string, uint64_t>> down;
     std::string          render_chat(const ChatRequest&) const override { return {}; }
     // Never called: props() only reads status() and template_caps().
     FinishReason generate(const GenerationInput&, int, const TokenCallback&,
@@ -122,6 +124,32 @@ TEST(llama_backend_render_chat_uses_the_template_context) {
     // level is mapped to the set that template accepts.
     CHECK(nows.find("extra=template_context(req,ctx_error,template_src_)") != std::string::npos);
     CHECK(nows.find("inputs.extra_context=extra") != std::string::npos);
+}
+
+TEST(props_reports_the_downgrades) {
+    // The sweep reads this: an array, empty when none occurred, a key and a count each.
+    FakeBackend backend;
+    Config     cfg;
+    SlotPool   slots(1);
+    Context    ctx{&cfg, &backend, &slots};
+    const auto none = lgc::api::props(ctx).at("downgrades");
+    CHECK(none.is_array());
+    CHECK_EQ(none.size(), size_t{0});
+    backend.down = {{"src=opencl op=MUL_MAT type=q8_0 k=512 cols=1-4 path=generic reason=no-fast-path", 7}};
+    const auto one = lgc::api::props(ctx).at("downgrades");
+    CHECK_EQ(one.size(), size_t{1});
+    CHECK_EQ(one[0].at("key").get<std::string>(), backend.down[0].first);
+    CHECK_EQ(one[0].at("count").get<uint64_t>(), uint64_t{7});
+}
+
+TEST(parse_downgrades_takes_whole_lines_only) {
+    const auto got = lgc::parse_downgrades("src=opencl a=1\t3\nno tab here\n\t5\nsrc=opencl b=2\tx\nsrc=opencl c=3\t4\ntruncated\t9");
+    CHECK_EQ(got.size(), size_t{2});
+    CHECK_EQ(got[0].first, std::string("src=opencl a=1"));
+    CHECK_EQ(got[0].second, uint64_t{3});
+    CHECK_EQ(got[1].first, std::string("src=opencl c=3"));
+    CHECK_EQ(got[1].second, uint64_t{4});
+    CHECK_EQ(lgc::parse_downgrades("").size(), size_t{0});
 }
 
 TEST(props_reports_the_slot_loan_state) {
