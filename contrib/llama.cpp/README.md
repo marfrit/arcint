@@ -6561,3 +6561,7 @@ Served, deployed flags, 12 short answers and prompts of 396, 621, 1,821, 6,021 a
 
 Red, each seen reported, on the coder: `GGML_OPENCL_Q8_I8=0` 4 keys, Q8_0 at K 2048 and 512 on the generic GEMM and on the matvec; a program that does not compile, `not-built what=q40_i8_sg8`. The first version of this patch missed the matvec, and short prompts never reached the generic path, so that red run reported nothing: a card check of this kind needs long prompts.
 
+## 0101-opencl-downgrade-expert-and-fa.patch
+
+0100's list, widened to what it left out: an expert product on ggml's generic `MUL_MAT_ID` (`op=MUL_MAT_ID type= k= path=generic reason=no-fast-path`), and a prompt's flash attention (more than 8 rows) off the XMX kernel (`op=FLASH_ATTN head= kv= n_q=9+ path=f32_f16 reason=no-dpas-kernel|shape`). Sub-group 8 has no GQA decode kernel by design, and an expert product below 16 tokens takes the matvec by design: neither reports.
+
