@@ -1,6 +1,6 @@
 # mtp-head-fit — refit the MTP head against what the served model writes
 
-**Open.** Step one measured (2026-11-06); no fitting tool yet.
+**Open.** Step one measured (2026-11-06); recon done, E0 and E1 under way; no fitting tool yet.
 
 ## Charter
 
@@ -29,11 +29,31 @@ Deployed sampling with the cost policy: first draft 92, 88, 78, 71 % in the same
 
 What a fit could buy (`inferred`, arithmetic on the rows above, a verify's cost held): 10 points at every position takes thinking from 3.15 to 3.83 tokens a verify (+21 %) and prose from 2.36 to 2.81 (+19 %); code has less room. Whether a fit reaches 10 points is unknown.
 
-## Next
+## Prior art and what it leaves open
 
-1. A corpus: the coder on the battery and public code prompts, tokens and the target's hidden rows; size to be set by a learning curve, not assumed.
-2. A fitting tool outside the served path; the head's shape from the GGUF's `blk.40`. Where it trains is open: no Spark needed unless the curve says so.
-3. The first fit, on one split, against the gate. Stop there if it misses.
+HyperQwen fit its head by KL over the draft vocabulary, depth-2 chains, 7M tokens: KL halved, top-1 against the true token unchanged at 0.685, acceptance within noise (`paper`; `drafter/README.md`, `train_mtp.py`). That negative does not cover three things (`code`): its head matched its trunk; its data is sampled at model defaults and scored against the sampled token, which caps top-1 by the sampling noise; its loss has no top-K term. HASS continued DeepSeek-R1's official MTP for 2 epochs with CE plus top-10 and a feature term: +8.47 % at T=0, +8.18 % at T=1 (`paper`, repo README; `code`, `main_hass.py`). The draft vocabulary, HyperQwen's largest gain, is not our limit: coverage on the coder's own text is 97.7 %, and 525 more rows from 92k tokens reach 98.6 % for about +1 % tokens a verify (`measured-here`).
+
+Provenance (`measured-here` on samples of the coder's F16 against the base 35B's BF16; `paper` from the source's card): non-expert tensors equal the base within F16 rounding and kept experts match, so the trunk's weights did not change, only 72 experts a layer dropped and routing went to top-10. The head was presumably trained on the 256-expert, top-8 trunk (`inferred`) and now reads rows from the pruned one, with its own FFN pruned too.
+
+## What a fit could buy (`inferred`, arithmetic on the position table, which reproduces its tokens a verify)
+
+| Text | first draft for +10 %, others held | first draft 100 % | first draft +5 | all four +5 | all four +5, width re-chosen |
+|---|---:|---:|---:|---:|---:|
+| code | impossible | +8.0 % | +4.0 % | +9.9 % | +9.1 % |
+| tool | impossible | +9.0 % | +4.1 % | +10.2 % | +10.2 % |
+| thinking | 91.7 % | +17.1 % | +4.3 % | +10.0 % | +5.8 % |
+| prose | 80.9 % | +26.0 % | +4.2 % | +8.8 % | +5.5 % |
+
+Planning range 0 to +8 % decode, more likely under +5 %: a judgement, which only a run settles.
+
+## Next, cheapest falsifier first
+
+- **E0, the head's bytes.** The base 35B's MTP shard against the coder's F16 `blk.40`: is the head the base's, and which experts did it keep?
+- **E1, capture, evaluation and a linear refit.** A hook `ARCINT_MTP_CAPTURE` next to `ARCINT_MTP_TRACE` writes the target's row and the head's row per position; no llama.cpp patch (`llama_get_embeddings_nextn`, unmasked under `--llama-mtp-vocab`). Replay the corpus through it, check each re-tokenized count. Report top-1 against the sampled token and the target's argmax, at simulated round starts too (must reproduce the served table), and E[max p_T] at deployed sampling, per text class on data held out by task string, because the corpus crosses tasks with languages. Fit `A = (Z'Z + lambda I)^-1 Z'H`, `W' = W_d A` in closed form. +2 points or more held out on code or thinking means the output side is miscalibrated: continue. KL down with top-1 flat is HyperQwen's result on the output side only.
+- **E2, no-training arms on the served trace.** The pruned head at F16 (quantization's cost), the pruned head at top-8, the base head at top-8. A gain would need no training.
+- **The full fit, only after these.** CE plus top-10 and an unrolled 3-step chain, `eh_proj`, `attn_output` and norms before any experts: 92k tokens are far too few for 3.1 M weights an expert. 15-20 agent hours, 2-5 card hours.
+
+Risks: overfitting; quantization erasing the fit (the served Q4_K head is 0.075 relative from F16; measure the delta against that); wider verifies eating the gain, which is why thinking's +10 % becomes +5.8 %; prefill rows against verify rows. A rows refit needs a sidecar flag on `DraftHead`, since those rows are shared with the target, and that conflicts with "the served path does not change": the operator's call if it comes to it.
 
 ## Where it lives
 
