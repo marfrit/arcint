@@ -97,9 +97,9 @@ class GgufTests(unittest.TestCase):
         self.d = tempfile.mkdtemp()
         self.p = lambda n: os.path.join(self.d, n)
 
-    def build(self, **kw):
+    def build(self, experts_used=None, **kw):
         full_model(self.p("src.gguf"), **kw)
-        cm.build_from_gguf(self.p("src.gguf"), self.p("head.gguf"), kw.get("experts_used"))
+        cm.build_from_gguf(self.p("src.gguf"), self.p("head.gguf"), experts_used)
 
     def test_build_is_head_only_and_exact(self):
         self.build()
@@ -171,10 +171,12 @@ class GgufTests(unittest.TestCase):
         same, n = cm.compare(self.p("arm.gguf"), self.p("served.gguf"), "blk.2.", False, lines.append)
         self.assertEqual((same, n), (len(cm.head_spec(a, NE)), len(cm.head_spec(a, NE))))
         # one flipped byte is found
-        raw = bytearray(open(self.p("arm.gguf"), "rb").read())
+        with open(self.p("arm.gguf"), "rb") as f:
+            raw = bytearray(f.read())
         i = raw.index(struct.pack("<e", 0.25 * 3) * 4)
         raw[i] ^= 1
-        open(self.p("flip.gguf"), "wb").write(raw)
+        with open(self.p("flip.gguf"), "wb") as f:
+            f.write(raw)
         same, n = cm.compare(self.p("flip.gguf"), self.p("served.gguf"), "blk.2.", False, lines.append)
         self.assertEqual(n - same, 1)
 
@@ -279,7 +281,6 @@ class SafetensorsTests(unittest.TestCase):
 
     def test_f16_overflow_is_refused(self):
         s = self.shards()
-        import json
         # a BF16 value of 1e10 (0x5015) in the first shared expert matrix
         _, _, shape, start, _ = cm.Safetensors(s).t["mtp.layers.0.self_attn.k_proj.weight"]
         path = cm.Safetensors(s).t["mtp.layers.0.self_attn.k_proj.weight"][0]

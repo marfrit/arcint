@@ -487,7 +487,8 @@ def splice(into, donor, names, out):
 def quantize(inp, out, ttf, binary, threads=4):
     g = check_file(inp, floats_only=True)
     layer = head_layer(g)
-    rules = [l.strip() for l in open(ttf) if l.strip()]
+    with open(ttf) as f:
+        rules = [l.strip() for l in f if l.strip()]
     mine = [l for l in rules if l.startswith("^blk\\.%d\\." % layer)]
     pats = [re.compile(l.rsplit("=", 1)[0]) for l in mine]
     for name, dims, ty, _ in g.infos:
