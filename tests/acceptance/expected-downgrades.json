@@ -1,0 +1,14 @@
+{
+  "coder": [],
+  "agent": [],
+  "flashnext": [
+    "src=opencl op=MUL_MAT type=bf16 k=10240 cols=5-15 path=generic reason=no-fast-path",
+    "src=opencl op=MUL_MAT type=bf16 k=2560 cols=5-15 path=generic reason=no-fast-path",
+    "src=opencl op=MUL_MAT type=bf16 k=320 cols=5-15 path=generic reason=no-fast-path",
+    "src=opencl op=MUL_MAT type=f32 k=128 cols=1-4 path=generic reason=no-fast-path",
+    "src=opencl op=MUL_MAT type=f32 k=128 cols=16+ path=generic reason=no-fast-path",
+    "src=opencl op=MUL_MAT type=f32 k=128 cols=5-15 path=generic reason=no-fast-path",
+    "src=opencl op=MUL_MAT type=f32 k=2560 cols=16+ path=generic reason=no-fast-path",
+    "src=opencl op=MUL_MAT type=f32 k=2560 cols=5-15 path=generic reason=no-fast-path"
+  ]
+}

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 1.5.3 LANGUAGES CXX)
+project(arcint VERSION 1.5.4 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -443,6 +443,12 @@ if(ARCINT_TESTS)
            COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_llama_scoreboard.py")
   set_tests_properties(llama-scoreboard PROPERTIES LABELS unit)
+
+  # tools/downgrade_check.py: what fails a unit at the release gate, device-free.
+  add_test(NAME downgrade-check
+           COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_downgrade_check.py")
+  set_tests_properties(downgrade-check PROPERTIES LABELS unit)
 
   # tools/fn_sweep.py's flag tables and --no-mtp (the T1 leg), device-free.
   add_test(NAME fn-sweep-flags
