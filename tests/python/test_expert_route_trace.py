@@ -646,6 +646,44 @@ def test_train_curve_more_data_never_lowers_a_perfect_predictor(tmp_path, capsys
     assert all(h >= hits[0] - 1e-9 for h in hits), hits
 
 
+def test_train_curve_table_only_equals_the_dense_table(tmp_path, capsys):
+    """--curve-table-only computes the draft-id table per step instead of holding
+    it, and leaves the learned map out: its table column must equal the dense
+    run's, at every size, on routing the table can actually predict. Red mutation
+    (seen failing): LazyForesight returns zeros -- the column falls to the baseline."""
+    import argparse
+    nl, ne, k = 2, 16, 2
+    layers = [dict(il=0, residents=np.array([0, 1, 2, 3])),
+              dict(il=1, residents=np.array([4, 5, 6, 7]))]
+    events = []
+    for r in range(6):
+        events.append(dict(kind=ecr.K_PROMPT, first_pos=0, n_tokens=1, tokens=[r],
+                           ids={0: [r % ne, (r + 1) % ne], 1: [r % ne, (r + 1) % ne]}))
+        for j in range(12):
+            tok = 3000 + j
+            e = tok % ne
+            events.append(dict(kind=ecr.K_VERIFY, first_pos=10 + j, n_tokens=2, tokens=[tok, tok],
+                               ids={0: [e, (e + 1) % ne, e, (e + 1) % ne],
+                                    1: [e, (e + 1) % ne, e, (e + 1) % ne]}))
+    trace = tmp_path / "curve.ert1"
+    ecr.write_route(trace, nl, ne, k, [layers], events)
+    tr = ecr.load_traces([str(trace)])
+    layers, graphs, steps, _acc = ecr.route_to_steps(tr, None)
+    _gid, rid = ecr.request_of(graphs, steps)
+    def run(only):
+        a = argparse.Namespace(delay=1, cap=96, every=6, thresholds=(0.0,), weights=(10.0,),
+                               margins=(0.0,), horizon=24, curve_table_only=only)
+        ecr.train_curve(a, layers, graphs, steps, tr, rid)
+        rows = [l for l in capsys.readouterr().out.splitlines() if l.strip().startswith(tuple("0123456789"))]
+        return [(l.split()[0], l.split()[1], l.split("%")[1].split()[0]) for l in rows], rows
+    dense, _ = run(False)
+    lazy, raw = run(True)
+    assert lazy == dense
+    assert all(l.count("%") == 2 for l in raw), raw   # baseline and table: no learned column
+    base = float(raw[0].split("%")[0].split()[-1])
+    assert float(lazy[-1][2]) > base, (lazy, base)    # the table predicts here: the red case can show
+
+
 # ---------------------------------------------------------------- round 6 ----
 # The continuous log's month: a restarted unit must not append a second header,
 # a directory spanning a restart must replay, a rotation must keep a graph and

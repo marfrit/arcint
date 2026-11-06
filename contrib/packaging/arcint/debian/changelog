@@ -1,3 +1,11 @@
+arcint (1.5.3-1) trixie; urgency=medium
+
+  * Dense Q4_0 and Q8_0 weights on int8 DPAS without local memory (0099): Llama 2
+    prefill on the B60 2339 -> 3990 t/s, on the A770 1963 -> 2611; the coder's
+    prefill +7.8 % at 41k tokens through its Q8_0 shared experts.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Fri, 06 Nov 2026 12:00:00 +0100
+
 arcint (1.5.2-1) trixie; urgency=medium
 
   * A thinking budget (--think-budget, off by default); decode attention's

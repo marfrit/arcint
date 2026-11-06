@@ -1259,8 +1259,9 @@ def train_curve(a, layers, graphs, steps, tr, rid):
         sizes.append(k); k *= 2
     sizes.append(len(train_reqs))
     gid, _ = request_of(graphs, steps)
-    use = _use_matrix(layers, steps, None)
-    prior = step_prompt_prior(layers, graphs, gid, rid)
+    table_only = getattr(a, "curve_table_only", False)
+    use = None if table_only else _use_matrix(layers, steps, None)
+    prior = None if table_only else step_prompt_prior(layers, graphs, gid, rid)
     held_stream = step_stream(layers, [steps[i] for i in odd])
     base_h = simulate(layers, held_stream, "strata", delay=a.delay, max_swaps=a.cap,
                       adapt_every=a.every)[0]
@@ -1291,11 +1292,14 @@ def train_curve(a, layers, graphs, steps, tr, rid):
         train_graphs = [g for gi, g in enumerate(graphs) if gid[gi] in subset]
         train_idx = [i for i, r in enumerate(rid) if r in subset]
         table = token_expert_table(layers, graphs, train_graphs)
-        fs = step_foresight(table, layers, steps)
+        fs = LazyForesight(table, layers, steps) if table_only else step_foresight(table, layers, steps)
         thr_w = tune(fs, train_idx)
         h_f = simulate(layers, held_stream, "blend", delay=a.delay, max_swaps=a.cap,
                        adapt_every=a.every, provider=lambda si: fs[odd[si]],
                        blend_weight=thr_w[1], blend_threshold=thr_w[0], blend_margin=thr_w[2])[0]
+        if table_only:
+            print("  %-22d %8d %7.2f %% %12.2f %% (%.3f/%.2f/%.1f)" % (n, len(train_idx), 100 * base_h, 100 * h_f, thr_w[0], thr_w[1], thr_w[2]))
+            continue
         lm = LearnedMap(a.horizon, a.delay)
         lm.fit(use, prior, fs, rid, train_idx)
         thr_l = tune([lm.predict(i) for i in range(len(steps))], train_idx)
@@ -1305,6 +1309,16 @@ def train_curve(a, layers, graphs, steps, tr, rid):
         print("  %-22d %8d %7.2f %% %12.2f %% (%.3f/%.2f/%.1f) %12.2f %% (%.3f/%.2f/%.1f)" % (
             n, len(train_idx), 100 * base_h, 100 * h_f, thr_w[0], thr_w[1], thr_w[2],
             100 * h_l, thr_l[0], thr_l[1], thr_l[2]))
+
+
+class LazyForesight:
+    """step_foresight per step on demand: a dense (nl, ne) array a step does not fit a long history."""
+    def __init__(self, table, layers, steps):
+        self.table, self.layers, self.steps = table, layers, steps
+    def __len__(self):
+        return len(self.steps)
+    def __getitem__(self, si):
+        return step_foresight(self.table, self.layers, [self.steps[si]])[0]
 
 
 def fitted_row(name):
@@ -1542,6 +1556,8 @@ if __name__ == "__main__":
     ap.add_argument("--every", type=int, default=6, help="decode tokens a plan (LLAMA_EXPERT_CACHE_ADAPT_EVERY)")
     ap.add_argument("--bounds", action="store_true")
     ap.add_argument("--accept", default=None, help="the trace's accept sidecar (default <trace>.accept when it exists)")
+    ap.add_argument("--curve-table-only", action="store_true", dest="curve_table_only",
+                    help="--train-curve: only the draft-id table, computed per step: a long history does not fit the learned map's features")
     ap.add_argument("--train-curve", action="store_true", dest="train_curve",
                     help="a fixed held-out set and increasing training-set sizes: the token table and the "
                          "learned map fitted per size, blended (round 4), scored held out, against the baseline")

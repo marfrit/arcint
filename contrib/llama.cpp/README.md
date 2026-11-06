@@ -6515,3 +6515,31 @@ Gate (`measured-here`, against the 1.5.1 package, one window with the host quiet
 The A/Bs: coder and agent PASS, decode and prefill equal, on prompts deep enough that the rules do not differ. Flash-Next, 4 rounds on a quiet host (the first 2 rounds ran during a copy and an unpack on the same machine and are discarded): prefill 538.77 -> 538.25, decode 33.25 -> 33.45, the one text both arms produced 34.8 -> 35.2 t/s; the A/B reports FAIL on its variance rule only, 9.57 % against an allowed 9.02 %, sampled answers differing in every run. Accepted by the operator (2026-11-05). Reviewed read-only: no code defect; the review's corrections are in the comment here. The review also read the double count as a wrong answer in the quantized kernels, which the red run does not show.
 
 `GGML_OPENCL_FA_INTEL_KV_PER_SPLIT` and `GGML_OPENCL_FA_GQA_KV_PER_SPLIT` fix the sizes as before.
+
+## 0099-opencl-q4_0-q8_0-int8-gemm.patch
+
+Dense Q4_0 and Q8_0 weights on Intel without local memory. Priced from IPEX-LLM's lead on Llama 2 (`docs/campaigns/research-concept-mining/ipex-llm/`): its oneDNN f16 GEMM took about 95 ms of a 192 ms 512-token prefill on the B60, its dequantization about 40 ms, and the tile GEMM of 0096 about 160 ms for the same products (`measured-here`, the wheel's oneDNN verbose log and unitrace).
+
+- **Xe2 (`mul_mm_kq_2d.cl`):** 0096 put Q4_0 on the local-memory tile while the K-quants had the 2D-block GEMM. `kernel_mul_mm_kq2d_q4_0` is that shape on Q4_0's planes: `(q - 8) d` in halves with the rounding of a dequantization to f16; `kernel_mul_mm_kq2d_q4_0_i8` is one int8 DPAS per 32 weights.
+- **Alchemist (`mul_mm_q40_i8_sg8.cl`):** no 2D loads. The activations are quantized once a graph into `[k / 32][token][32 bytes]`, so an `a` operand of 8 tokens is one 256-byte block read; a lane is a weight row. Q4_0 and Q8_0. Before this, Q8_0 on sub-group 8 had no fast path at all: its XMX tile sits inside `#if SG != 8`, so the coder's shared experts ran ggml's float kernel.
+
+`GGML_OPENCL_Q40_2D` = `0` the tile, `1` fp16 (Xe2 only), `2` int8 (default). `GGML_OPENCL_Q8_I8=0` keeps the kernels below it. `GGML_OPENCL_Q40_SG8_SHAPE` = `TMM,WG` (default `32,8`). K must be a multiple of 256; otherwise the old paths take the product.
+
+`measured-here`, llama-bench, Llama 2 7B Q4_0, flash attention on, 5 repetitions, two rounds (A770 GT at 2000 MHz):
+
+| Card, arm | pp512 | tg128 | mean KL, whole chunks | mean KL, one token | same top |
+|---|---|---|---|---|---|
+| B60, 0096's tile | 2482 | 81.7 | 0.00043 | 0.00043 | 99.09 % |
+| B60, 2D fp16 | 3575 | 81.7 | 0.00043 | 0.00043 | 99.09 % |
+| B60, 2D int8 | 4389 | 81.7 | 0.00105 | 0.00043 | 98.82 % |
+| A770, 0096's tile | 2073 | 70.4 | 0.00043 | 0.00043 | 99.07 % |
+| A770, int8 (shape 32,16) | 2794 | 70.6 | 0.00104 | 0.00043 | 98.65 % |
+| A770, int8 (shape 32,8) | 2813 | | | | |
+
+The same-host IPEX-LLM wheel for comparison: B60 2826 and A770 2604 with a whole-chunk KL of 0.016. A one-token ubatch has no 16 columns, so it takes the matvec: its KL does not see these kernels. The B60's shape did not move past the spread (work-group 4 to 32 sub-groups, `KSYNC_I8` 8 to 9999).
+
+The coder's own file on the A770, llama-bench, 4,096 tokens, ubatch 1,024, f16 KV, 3 repetitions, two rounds: Q8_0's kernel off the profile's top 12 (810 ms of 6.7 s before), prefill 1,695 -> 1,866 t/s (+10.1 %), decode 58.4 both. KL against the file's CPU reference, 8 chunks: ubatch 512 0.00554 -> 0.00572, same top 97.01 -> 96.91 %; ubatch 32 0.00558 -> 0.00588, same top 96.72 -> 96.77 %.
+
+Suites: `test-backend-ops -o MUL_MAT` q4_0 161/161 on both cards, q8_0 151/151 on the A770. Red, each seen failing with the mutant compiled in: `-DQ40_RED` through `GGML_OPENCL_KQ_2D_OPTS` or `GGML_OPENCL_Q40_SG8_OPTS` 23 cases of 161 on either card and arm (25 error lines), `-DQ8_RED` 26 of 151.
+
+`GGML_OPENCL_Q8_XMX=0` no longer reaches ggml's Q8_0 kernels on Alchemist by itself; `GGML_OPENCL_Q8_I8=0` comes first there. `kq_i8` carries no layout tag: the Xe2 and sub-group 8 quantizers are built for different cards and never coexist.

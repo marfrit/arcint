@@ -68,18 +68,16 @@ gives arcint the same run, and it refuses a file with another sha256.
 
 | Card | Engine | Flash attention | pp512 t/s | tg128 t/s |
 |---|---|---|---|---|
-| Arc A770 16 GB | **arcint's series, llama-bench** | on | **2074.21 ± 3.42** | **69.71 ± 0.20** |
-| | arcint's series, llama-bench | off | 1833.46 ± 2.79 | 68.74 ± 0.55 |
-| | **arcint, served** | on | **1962.84 ± 2.98** | **70.50 ± 0.08** |
+| Arc A770 16 GB | **arcint's series, llama-bench** | on | **2816.12 ± 2.12** | **70.60 ± 0.03** |
+| | **arcint, served** | on | **2611.39 ± 1.09** | **70.45 ± 0.03** |
 | | SYCL fp16, here | on | 1457.24 ± 4.00 | 73.66 ± 0.02 |
 | | SYCL fp16, here | off | 1876.79 ± 10.29 | 68.72 ± 0.02 |
 | | SYCL fp32, here | on | 771.97 ± 1.75 | 73.06 ± 0.03 |
 | | SYCL fp32, here | off | 859.88 ± 1.66 | 68.71 ± 0.05 |
 | | Vulkan, here | on | 1123.84 ± 2.00 | 46.90 ± 0.01 |
 | | Vulkan, here | off | 1089.27 ± 1.17 | 46.11 ± 0.01 |
-| Arc Pro B60 24 GB | **arcint's series, llama-bench** | on | **2482.36 ± 1.89** | **80.58 ± 0.11** |
-| | arcint's series, llama-bench | off | 2211.35 ± 2.19 | 79.81 ± 0.66 |
-| | **arcint, served** | on | **2329.61 ± 4.51** | **80.69 ± 0.09** |
+| Arc Pro B60 24 GB | **arcint's series, llama-bench** | on | **4413.44 ± 7.98** | **81.86 ± 0.14** |
+| | **arcint, served** | on | **3986.35 ± 3.09** | **80.72 ± 0.01** |
 | | SYCL fp16, here | on | 933.23 ± 0.42 | 84.32 ± 0.08 |
 | | SYCL fp16, here | off | 1891.17 ± 2.77 | 79.98 ± 0.13 |
 | | SYCL fp32, here | on | 668.42 ± 0.11 | 84.30 ± 0.08 |
@@ -87,15 +85,15 @@ gives arcint the same run, and it refuses a file with another sha256.
 | | Vulkan, here | on | 726.81 ± 0.38 | 68.06 ± 0.01 |
 | | Vulkan, here | off | 729.87 ± 0.70 | 65.25 ± 0.01 |
 
-The arcint rows are `measured-here` on 1.5.1 (2026-11-05, 77ff7456, f16 KV, MTP off, the A770's GT clock pinned at 2000 MHz): llama-bench itself built on
+The arcint rows are `measured-here` on 1.5.3 (2026-11-06, e6c9d107, f16 KV, MTP off, the A770's GT clock pinned at 2000 MHz): llama-bench itself built on
 arcint's llama.cpp series, and arcint's own server through the tool above. The rows marked "here" are `measured-here` too: stock llama-bench at the same
 llama.cpp pin (3e4dfa8, no arcint patches), oneAPI 2026.1.1, Level Zero V2, the same card, host and clock. The Vulkan rows are stock llama.cpp at master 45b6604b2 on Mesa 25.0.7 (the pin within 0.5 %); the A770's decode is below the 53 t/s reported in the Vulkan thread on another host, and its clock here is held at 2000 MHz.
 
-Against stock SYCL's best prefill (fp16 without flash attention), the series leads by 10.5 % on the A770 and 31 % on the B60. Against its best decode (fp16 with flash attention), it trails
-by 5.4 % and 4.4 %. SYCL's legacy Level Zero adapter is a little faster at decode on the B60 (85.96 t/s, a 6.3 % gap) and slower on the A770 (58.93 t/s). Other cards are in the
+The series' prefill rows are int8 DPAS on this weight type, patch 0099: a mean KL of 0.00105 nats against the CPU reference over whole chunks, 0.00043 one token a ubatch, 8 fact questions right. Against stock SYCL's best prefill (fp16 without flash attention), the series leads by 50 % on the A770 and 133 % on the B60. Against its best decode (fp16 with flash attention), it trails
+by 4.2 % and 2.9 %. SYCL's legacy Level Zero adapter is a little faster at decode on the B60 (85.96 t/s, a 5.0 % gap) and slower on the A770 (58.93 t/s). Other cards are in the
 threads: an Arc Pro B70 under Vulkan reports 4570.29 / 112.89, and there is no B70 here.
 
-**IPEX-LLM**, Intel's fork, reports higher rows in the same threads, so it was run here too (`measured-here`, the newest published wheel, 2.7.0b20260110, in a container on the same host, xe). Its prefill leads: 2825.67 on the B60 and 2603.55 on the A770, at a mean KL of 0.016 nats against the CPU reference (the series 0.00043), inside the answer-level bar. Its decode does not, on this host: the B60 without flash attention decodes at 80.54 with right answers, level with the series, while with flash attention (B60) or on the A770 at all, one-token decode came out wrong: KL 6.7 nats or infinite, wrong or gibberish answers, whatever the t/s says. Other builds and machines may differ. It also refuses the hybrid models arcint serves (`unknown model architecture`). What it does: [research-concept-mining/ipex-llm](docs/campaigns/research-concept-mining/ipex-llm/README.md) (on the `qfndev` branch).
+**IPEX-LLM**, Intel's fork, reports higher rows in the same threads, so it was run here too (`measured-here`, the newest published wheel, 2.7.0b20260110, in a container on the same host, xe). Its prefill: 2825.67 on the B60 and 2603.55 on the A770, at a mean KL of 0.016 nats against the CPU reference, inside the answer-level bar; it led the series' 1.5.2 rows, and pricing that lead found patch 0099. Its decode, on this host: the B60 without flash attention decodes at 80.54 with right answers, while with flash attention (B60) or on the A770 at all, one-token decode came out wrong: KL 6.7 nats or infinite, wrong or gibberish answers, whatever the t/s says. Other builds and machines may differ. It also refuses the hybrid models arcint serves (`unknown model architecture`). What was learned from it: [research-concept-mining/ipex-llm](docs/campaigns/research-concept-mining/ipex-llm/README.md) (on the `qfndev` branch).
 
 **The same run, not the same program.** arcint serves the rows through its own path (HTTP,
 slot, sampler), which is what a client gets. A warm-up prefill and generation go uncounted.
