@@ -511,5 +511,47 @@ class ReplayTests(unittest.TestCase):
             self.assertFalse(json.load(open(out))["complete"])
 
 
+
+class TestDistill(unittest.TestCase):
+    def setUp(self):
+        import numpy as np
+        self.np = np
+        rng = np.random.RandomState(3)
+        self.W = rng.randn(64, 16).astype(np.float32)
+        Hall = rng.randn(1200, 16).astype(np.float32) * 2
+        self.R = np.linalg.qr(rng.randn(16, 16))[0].astype(np.float32)
+        Z = Hall @ self.R          # the head's rows are the target's, turned
+        self.Z, self.H, self.Zv, self.Hv = Z[:800], Hall[:800], Z[800:], Hall[800:]
+
+    def _top(self, A):
+        st = mtp_fit.row_stats(self.Zv @ A, self.Hv, self.W)
+        return float((st["dz"] == st["dh"]).mean())
+
+    def test_the_fit_recovers_a_turned_head(self):
+        np = self.np
+        base = self._top(np.eye(16, dtype=np.float32))
+        A, top, step = mtp_fit.fit_distill(self.Z, self.H, self.W, self.Zv, self.Hv, 300, 256, 3e-3, 1.0, 50)
+        self.assertLess(base, 0.3)
+        self.assertGreater(top, 0.8)
+        self.assertGreater(step, 0)
+        self.assertAlmostEqual(top, self._top(A), places=6)
+
+    def test_the_identity_stays_when_the_head_is_right(self):
+        np = self.np
+        A, top, step = mtp_fit.fit_distill(self.H, self.H, self.W, self.Hv, self.Hv, 50, 256, 3e-3, 1.0, 10)
+        self.assertEqual(step, 0)
+        self.assertTrue((A == np.eye(16, dtype=np.float32)).all())
+        self.assertEqual(top, 1.0)
+
+    def test_the_gradient_is_the_loss_slope(self):
+        np = self.np
+        A = np.eye(16, dtype=np.float64) + 0.01
+        Z, H, W = self.Z[:32].astype(np.float64), self.H[:32].astype(np.float64), self.W.astype(np.float64)
+        l0, g = mtp_fit.distill_grad(Z, H, W, A, 1.0)
+        e = np.zeros_like(A)
+        e[3, 5] = 1e-5
+        l1, _ = mtp_fit.distill_grad(Z, H, W, A + e, 1.0)
+        self.assertAlmostEqual((l1 - l0) / 1e-5, g[3, 5], places=3)
+
 if __name__ == "__main__":
     unittest.main()

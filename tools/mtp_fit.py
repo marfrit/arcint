@@ -848,6 +848,103 @@ def cmd_linear(args):
 
 # ---------------------------------------------------------- gguf-info / rows
 
+def distill_grad(Z, H, W, A, tau, chunk=512):
+    """Loss and d(loss)/dA of KL(q || softmax(Z A W^T)), q the target's softmax sharpened by tau
+    (1: the target's distribution; small: its argmax). Row convention: a row's logits are z A W^T."""
+    np = _np()
+    WT = W.T
+    G = np.zeros_like(A, dtype=np.float64)
+    loss = 0.0
+    n = len(Z)
+    for s0 in range(0, n, chunk):
+        z, h = Z[s0:s0 + chunk], H[s0:s0 + chunk]
+        lp = (z @ A) @ WT
+        lq = (h @ WT) / tau
+        lp = lp - lp.max(1, keepdims=True)
+        lq = lq - lq.max(1, keepdims=True)
+        p_ = np.exp(lp)
+        p_ /= p_.sum(1, keepdims=True)
+        q = np.exp(lq)
+        q /= q.sum(1, keepdims=True)
+        loss += float((q * (np.log(np.maximum(q, 1e-30)) - np.log(np.maximum(p_, 1e-30)))).sum())
+        G += z.T @ ((p_ - q) @ W)
+    return loss / n, G / n
+
+
+def fit_distill(Z, H, W, Zv, Hv, steps, batch, lr, tau, every, seed=1, log=None):
+    """Adam on A from the identity, keeping the A with the best top-1 against the target's argmax on
+    the validation rows; the identity competes, so the fit can only match or beat the head there."""
+    np = _np()
+    d = Z.shape[1]
+    A = np.eye(d, dtype=np.float32)
+    best, best_step = A.copy(), 0
+    base = row_stats(Zv, Hv, W)
+    best_top = float((base["dz"] == base["dh"]).mean())
+    m1 = np.zeros((d, d))
+    m2 = np.zeros((d, d))
+    rng = np.random.RandomState(seed)
+    for t in range(1, steps + 1):
+        idx = np.sort(rng.choice(len(Z), size=min(batch, len(Z)), replace=False))
+        loss, g = distill_grad(Z[idx], H[idx], W, A, tau)
+        m1 = 0.9 * m1 + 0.1 * g
+        m2 = 0.999 * m2 + 0.001 * g * g
+        A = A - (lr * (m1 / (1 - 0.9 ** t)) / (np.sqrt(m2 / (1 - 0.999 ** t)) + 1e-8)).astype(np.float32)
+        if t % every == 0 or t == steps:
+            st = row_stats(Zv @ A, Hv, W)
+            top = float((st["dz"] == st["dh"]).mean())
+            if log:
+                log("  step %5d train KL %.4f, validation top-1 against the target %.2f %%%s" %
+                    (t, loss, 100 * top, " (best)" if top > best_top else ""))
+            if top > best_top:
+                best, best_top, best_step = A.copy(), top, t
+    return best, best_top, best_step
+
+
+def cmd_distill(args):
+    np = _np()
+    cap, index = prepare(args)
+    ids, W = load_w(args)
+    W = W.astype(np.float32)
+    trains = train_order([r for rs in pick_records(index, "train").values() for r in rs], args.seed)
+    val = [r for rs in pick_records(index, "val").values() for r in rs]
+    tests = pick_records(index, "test")
+    if not trains:
+        raise SystemExit("no training records")
+    Z, H, _, _, _ = gather(cap, trains, args.skip_first, 0, args.train_rows)
+    Zv, Hv, _, _, _ = gather(cap, val, args.skip_first, 0, args.val_rows)
+    print("train %d rows, validation %d rows, lr %g, tau %g, %d steps of %d" % (len(Z), len(Zv), args.lr, args.tau, args.steps, args.batch), flush=True)
+    A, top, step = fit_distill(Z.astype(np.float32), H.astype(np.float32), W, Zv.astype(np.float32), Hv.astype(np.float32),
+                               args.steps, args.batch, args.lr, args.tau, args.every,
+                               log=lambda m: print(m, flush=True))
+    print("best validation top-1 against the target %.2f %% at step %d (0: the identity stayed best)" % (100 * top, step))
+    print("|A - I| / |I| = %.4f" % (np.linalg.norm(A - np.eye(cap.dim, dtype=np.float32)) / np.sqrt(cap.dim)))
+    report = {"tau": args.tau, "lr": args.lr, "best_step": step, "classes": {}}
+    sampling = {}
+    for cls, recs in sorted(tests.items()):
+        z, h, y, _, _ = gather(cap, recs, args.skip_first)
+        z = z.astype(np.float32)
+        h = h.astype(np.float32)
+        yi = next_index(y, ids)
+        smp = class_sampling(cls, args)
+        b = row_stats(z, h, W, smp, True)
+        f = row_stats(z @ A, h, W, smp, True)
+        row = {"rows": len(z)}
+        for k, st in (("base", b), ("fit", f)):
+            row[k] = {"top1_target": float((st["dz"] == st["dh"]).mean()), "top1_actual": float((st["dz"] == yi).mean()),
+                      "kl": float(st["kl"].mean()), "p_pick": float(st["ppick"].mean())}
+        row["pmax"] = float(b["pmax"].mean())
+        report["classes"][cls] = row
+        print("[%s] held out, %d rows: top-1 target %.1f -> %.1f %%, actual %.1f -> %.1f %%, KL %.4f -> %.4f, sampled pick %.1f -> %.1f %% (target's best %.1f)" %
+              (cls, len(z), 100 * row["base"]["top1_target"], 100 * row["fit"]["top1_target"], 100 * row["base"]["top1_actual"], 100 * row["fit"]["top1_actual"],
+               row["base"]["kl"], row["fit"]["kl"], 100 * row["base"]["p_pick"], 100 * row["fit"]["p_pick"], 100 * row["pmax"]), flush=True)
+    if args.json:
+        with open(args.json, "w") as f_:
+            json.dump(report, f_, indent=1)
+    if args.save_a:
+        np.save(args.save_a, A)
+    return 0
+
+
 def cmd_gguf_info(args):
     h = read_gguf_header(args.file)
     names = [args.tensor] if args.tensor else [n for n in h["tensors"] if n.startswith("blk.4") or n in ("output.weight", "token_embd.weight", "output_norm.weight")]
@@ -920,6 +1017,22 @@ def main(argv=None):
     pl.add_argument("--save-a", help="save the largest size's A here (private)")
     pl.set_defaults(fn=cmd_linear)
 
+    pd = sub.add_parser("distill", help="a correction fit to the target's distribution from the identity, stopped on validation")
+    common(pd)
+    pd.add_argument("--train-rows", type=int, default=None)
+    pd.add_argument("--val-rows", type=int, default=4096)
+    pd.add_argument("--steps", type=int, default=400)
+    pd.add_argument("--batch", type=int, default=1024)
+    pd.add_argument("--lr", type=float, default=1e-4)
+    pd.add_argument("--tau", type=float, default=1.0, help="sharpens the target's distribution; small is its argmax")
+    pd.add_argument("--every", type=int, default=50)
+    pd.add_argument("--save-a", help="save the best A here (private)")
+    pd.add_argument("--sampling-think", type=lambda s: tuple(float(x) if i < 2 else int(x) for i, x in enumerate(s.split(","))),
+                    default=SAMPLING_THINK)
+    pd.add_argument("--sampling-other", type=lambda s: tuple(float(x) if i < 2 else int(x) for i, x in enumerate(s.split(","))),
+                    default=SAMPLING_OTHER)
+    pd.set_defaults(fn=cmd_distill)
+
     pg = sub.add_parser("gguf-info", help="type and shape of the head's tensors (no numpy)")
     pg.add_argument("file")
     pg.add_argument("--tensor")
@@ -934,7 +1047,7 @@ def main(argv=None):
     pr.set_defaults(fn=cmd_rows_check)
 
     args = ap.parse_args(argv)
-    if args.cmd in ("eval", "linear") and not (args.head or args.w_npy):
+    if args.cmd in ("eval", "linear", "distill") and not (args.head or args.w_npy):
         ap.error("--head or --w-npy")
     return args.fn(args)
 
