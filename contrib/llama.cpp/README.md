@@ -6567,3 +6567,9 @@ Red, each seen reported, on the coder: `GGML_OPENCL_Q8_I8=0` 4 keys, Q8_0 at K 2
 
 Served on all three units with prompts up to 19,521 tokens, nothing new (`measured-here`). Red, each seen reported: `GGML_OPENCL_FA_DPAS=0` on Llama 2 through arcint, `op=FLASH_ATTN head=128 kv=f16 n_q=9+ path=f32_f16 reason=no-dpas-kernel`, prefill 2814 -> 1461 t/s; `test-backend-ops -o MUL_MAT_ID -p type_a=q8_0`, the generic expert key at K 256 and 96. `llama-bench` installs a null log callback (`llama-bench.cpp:2286`), so it never shows these lines: check through arcint's `/props` or a tool that keeps the log.
 
+## 0102-opencl-q4_K-int8-sg8.patch
+
+Dense Q4_K on Alchemist takes 0099's shape: int8 DPAS, the activations packed once a graph, no local memory. From 16 columns, K a multiple of 256; the quantizer also writes the integer sums per 32 for Q4_K's constant term, a k16 fp16 DPAS a block. `GGML_OPENCL_KQ_SG8_I8=0` keeps the tile.
+
+`measured-here`, the coder's file on the A770, 4,096 tokens, ubatch 1,024, f16 KV, 3 repetitions, two rounds: prefill 1,865 -> 1,919 t/s (+2.9 %), decode 58.6 both, the kernel 838 -> 632 ms over the profile's run. KL against the file's CPU reference, 8 chunks: ubatch 512 0.00572 -> 0.00585, same top 96.91 -> 97.40 %; ubatch 32 0.00588 -> 0.00600, same top 96.77 -> 96.62 %. `MUL_MAT` q4_K 129/129, with `GGML_OPENCL_KQ_SG8_I8=0` too; red (`-DQK_RED`) 117/129. Served A/B and the acceptance task are owed.
+
