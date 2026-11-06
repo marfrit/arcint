@@ -1,5 +1,39 @@
 # IPEX-LLM, mined for arcint (2026-11-05)
 
+## The result: patch 0099 (`measured-here`, 2026-11-06, windows 99-105)
+
+The lead was real, and most of it was a path arcint had not given Q4_0. The record's "the only mechanism that explains it" (below) was right about the place and wrong about the remedy: no library and no materialized f16 operand was needed.
+
+| Card, llama-bench, Llama 2 7B Q4_0, flash attention on | pp512 | tg128 | mean KL, whole chunks | same top |
+|---|---|---|---|---|
+| B60, 1.5.2 (0096's tile) | 2482 | 81.7 | 0.00043 | 99.09 % |
+| B60, 0099 fp16 | 3575 | 81.7 | 0.00043 | 99.09 % |
+| B60, 0099 int8 | 4389 | 81.7 | 0.00105 | 98.82 % |
+| B60, IPEX-LLM wheel, no flash attention | 2826 | 80.5 | 0.0163 | |
+| A770, 1.5.2 (0096's tile) | 2073 | 70.4 | 0.00043 | 99.07 % |
+| A770, 0099 int8 | 2813 | 70.6 | 0.00104 | 98.65 % |
+| A770, IPEX-LLM wheel, no flash attention | 2604 | decode broken | 0.0162 | |
+
+How it was priced, from public interfaces only. The wheel's oneDNN verbose log (1.5.1's window 93) has a time per primitive: on the B60 the f16 GEMM takes 0.28 ms for `512x4096:4096x4096`, 0.56 for `512x4096:4096x11008`, 0.74 for `512x11008:11008x4096`, about 95 ms of a 192 ms prefill, 31-41 TMAC/s; dequantization about 40 ms under unitrace. arcint's tile took about 160 ms for the same products with the dequantization inside it (20.7 TMAC/s). oneDNN's public kernel catalog (`src/gpu/intel/jit/gemm/selector/db/kernel.db`, v3.6.1, the wheel's version) lists most Xe2 f16 strategies with direct block loads from global memory, prefetch and no copies to shared local memory, and most XeHPG ones with such copies (`cab`, `code`). Which entry its selector takes for these shapes was not read.
+
+That pointed at local memory, and arcint already had a GEMM without it: `mul_mm_kq_2d.cl`, for the K-quants on Xe2. 0096 had put Q4_0 on the older tile. The 2D kernel with fp16 DPAS alone gave +44 %, with the same KL to the digit; int8 DPAS +77 %.
+
+Materialized f16 weights were tried first, and are no verdict on the idea: F16 weights through the local-memory tile ran 2073 t/s against Q4_0's 2482 (915 against 726 us a call). That build stages through `vload_half16`, half to float and back, so it measures that read path and not a dequantize-once GEMM.
+
+The A770 has no 2D loads, and the record held "sub-group 8 takes fp16" as if settled. It was an unbuilt path. Int8 DPAS with the activations packed once a graph gave +36 %. oneDNN's XeHPG strategies for this type stay on f16; this build is arcint's own, and it led on this card.
+
+**It reached a served unit.** The same search found Q8_0 on sub-group 8 with no fast path at all (`#if SG != 8` around its XMX tile), so the coder's shared experts ran ggml's float kernel: 810 ms of 6.7 s of kernel time at 4,096 tokens. Q8_0 on the same kernel: the coder's llama-bench prefill 1,695 -> 1,866 t/s (+10.1 %), decode level, KL against the file's CPU reference 0.00554 -> 0.00572, same top 97.01 -> 96.91 %. Patch README: `contrib/llama.cpp/README.md`, 0099. Reviewed by a second model; no defect found. The served A/B, the acceptance task and the 12 answers on the deployed flags are owed before it is adopted.
+
+The other candidates, on the same evidence:
+
+| Candidate | Disposition | Class |
+|---|---|---|
+| 1, prefill GEMM | Done for dense Q4_0 and Q8_0: 0099. The coder's prefill next: `kernel_mul_mm_id_iq4_xs_f16` 30 %, `kernel_mul_mm_q4_K_f16` 12 %, `kernel_mul_mm_id_q4_K_f16` 10 % of kernel time at 4,096 tokens, all on the sub-group 8 local-memory tile. Dense Q4_K on the packed int8 shape needs the activations' sums per 32 as well | `measured-here` |
+| 2, QKV fusion; 3, MLP fusion; 4, weight repack | No lead to chase on these rows. Their target is decode, and IPEX-LLM's only valid decode arm (B60, no flash attention) equals arcint's: 80.54 against 80.58. Not tried in arcint, so not settled as a technique | `measured-here` for the rows |
+| 5, q4_0 batch GEMM | Superseded from 16 columns by 0099. 5-15 columns stay on upstream's path, unmeasured | `code` |
+| 6, fp8 KV | Listed; answer-changing | `code` |
+| 7, MoE route; 10, prefill attention | No gap, as audited | `code` |
+
 ## Measured on our cards, after the mining (`measured-here`, 2026-11-05, windows 92-94)
 
 The wheel `bigdl_core_cpp` 2.7.0b20260110, run in a test container on the card host (compute runtime 26.35, oneAPI runtime libraries 2025.0.2 from PyPI, Level Zero loader 1.34, xe). arcint's rows in the same container, the same hour: B60 2328 / 80.8, A770 1951 / 70.6, within 0.5 % of its rows at runtime 26.27. Llama 2 7B Q4_0, llama-bench, 5 repetitions. `paper` rows are a different, older build on other machines; these do not settle what those did.
@@ -21,7 +55,7 @@ What this changes in the text below:
 - **It cannot serve our models.** This wheel, the newest published, refuses the files arcint serves: `unknown model architecture: 'qwen35moe'`.
 - Under unitrace a prefill is `gemm_kernel` plus `dequantize_q4_0_kernel`, attention small; a decode is `mlp_forward_q4_0_kernel`, `qlinear_xpu_kernel_q4_0_2x16_qkv` and the matvec, which confirms that the fusions run, and on the B60's valid arm they do not beat arcint.
 
-Priced lever: the f16-operand GEMM on prefill, only on the answer-level bar, against the KL it costs. Everything else in the ranking below stays `paper` until priced.
+Priced lever, as written before 0099: the f16-operand GEMM on prefill, only on the answer-level bar, against the KL it costs. Retired by the result at the top of this file.
 
 How from here (operator, 2026-11-05): by profiling. The kernels are not disassembled further, and the PyTorch path's kernel packages, which declare no licence, are not read at all. oneDNN's GEMM is open source and can be read upstream.
 

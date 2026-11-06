@@ -291,6 +291,12 @@ Device-free cells added with the round:
    row. Red mutation, seen failing: fit a size on the last `len - n` training
    requests (`max(1, ...)`) — the steps column becomes 24, 12, 12.
 
+### How much trace there is (2026-11-06, `measured-here`, a record count over the production option's files)
+
+33 files, 3.9 GB, 2026-11-01 to 11-04, Flash-Next: 428,613 accepted steps, 68,621 decode steps, 359,992 verifies (1,303,149 tokens), 1,103,341 DRAFT records (2,820,876 tokens), 359,166 prompt tokens, at least 150 requests. Round 5's curve had 806 decode steps. 11-03 holds almost nothing (4 accept lines), so a one-day subset is not a sample of the whole; 11-01 alone is two thirds of it.
+
+The replay does not scale to that: `step_foresight` holds a 192 KiB array a step and the learned map's features 1.12 MiB (`code`), so the full history would take about 82 GB for one predictor and far more for the learned map's fit. Two runs ended on their memory fence (16 and 32 GiB, the 11-04 subset of about 34,000 steps) and one on its time limit; none produced a row. So the curve over this history is still owed.
+
 ## Stage 0 — the trace, now a production option (2026-10-29, `code`)
 
 `contrib/llama.cpp/patches/0069-expert-route-trace.patch` in the served series;
