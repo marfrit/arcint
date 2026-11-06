@@ -607,7 +607,7 @@ def verify_base(h3, coder, out=print):
         ty = "<f4" if tc.type == F32 else "<f2"
         xa = np.frombuffer(ta.data(), ty).astype(np.float64)
         xc = np.frombuffer(tc.data(), ty).astype(np.float64)
-        if "_exps" in n:
+        if "_exps" in n or n.endswith("ffn_gate_inp.weight"):      # indexed by expert: keep the coder's
             per = xa.size // ga.shape[0]
             xa = xa.reshape(ga.shape[0], per)[kept].ravel()
         if xa.shape != xc.shape:
