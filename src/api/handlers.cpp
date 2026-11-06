@@ -827,6 +827,15 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
         prep.req.has_enable_thinking = true;
     }
 
+    // A request that still says nothing is the kind of turn the model's template
+    // makes of it (ChatDialect::thinks_by_default): for Gemma 4 a non-thinking
+    // one. Resolved here, before the render, so the template, the non-thinking
+    // sampler row and thinking_turn below all agree.
+    if (!prep.req.has_enable_thinking && !st.dialect.thinks_by_default()) {
+        prep.req.enable_thinking     = false;
+        prep.req.has_enable_thinking = true;
+    }
+
     // §3.7: only parse tool-call syntax when the request actually declared
     // tools. Otherwise the raw text goes back untouched.
     prep.parse_tool_calls = !prep.req.tools.empty() && prep.req.tool_choice != "none";
@@ -941,7 +950,8 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
     }
     // llava: the answer row switches only in a turn the request declared as
     // thinking (enable_thinking after the operator default above). A request
-    // that says nothing keeps the default true, matching the template; one that
+    // that says nothing is resolved above to the template's own default (true
+    // for the Qwen templates, false for Gemma 4's); one that
     // says false keeps the thinking row, whatever tags the model writes. A
     // thinking turn whose block never opened is the sampler's own guard. Set
     // after finish_prepare, which owns input.sampler.

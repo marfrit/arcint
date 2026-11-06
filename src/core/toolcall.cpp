@@ -164,6 +164,14 @@ bool read_value(Cursor& c, json& out, int depth, const std::string* type_hint);
 json bare_value(std::string_view tok, const std::string* type_hint) {
     tok = text::trim(tok);
     const std::string raw(tok);
+    // a value in ordinary quotes is the JSON string it spells, quotes off
+    if (!tok.empty() && tok.front() == '"') {
+        try {
+            json parsed = json::parse(raw);
+            if (parsed.is_string()) return parsed.get<std::string>();
+        } catch (const json::exception&) {
+        }
+    }
     if (type_hint != nullptr && *type_hint == "string") return raw;
     if (tok == "true") return true;
     if (tok == "false") return false;
@@ -236,7 +244,9 @@ bool read_value(Cursor& c, json& out, int depth, const std::string* type_hint) {
     if (c.eat(markers::kGemmaStrDelim)) {
         const size_t end = c.s.find(markers::kGemmaStrDelim, c.i);
         if (end == std::string_view::npos) return false;
-        out = std::string(c.s.substr(c.i, end - c.i));
+        // the same coercion as the Qwen form: a delimited string for a declared
+        // integer, number, boolean, object or array is read as that type
+        out = coerce(c.s.substr(c.i, end - c.i), type_hint != nullptr ? *type_hint : std::string());
         c.i = end + markers::kGemmaStrDelim.size();
         return true;
     }

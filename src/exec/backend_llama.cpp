@@ -704,7 +704,6 @@ public:
         const AdmittedModel admitted = admit_model(a, geometry, cfg.tts);
         if (admitted == AdmittedModel::None)
             throw std::runtime_error(admission_refusal(cfg.gguf_path, arch));
-        mistral_small_24b_ = admitted == AdmittedModel::MistralSmall24B;
         // 'llama' at a second geometry: Llama 2 7B, the model of the community
         // llama-bench GPU tables (operator, 2026-11-04), so that arcint can stand in
         // one of their rows (tools/llama_scoreboard.py). A base model: no chat
@@ -2857,7 +2856,6 @@ private:
     ThinkBlockIds                         think_ids_ext_;    // the full tag family
     ThinkBlockIds                         think_ids_gemma_;  // Gemma 4's channel
     ChatDialect                           dialect_;          // the admitted model's tags and call form
-    bool mistral_small_24b_ = false;   // the admitted llama geometry (think tags, BOS)
     bool llama2_7b_ = false;           // the GPU tables' model: no chat template
     std::unique_ptr<minja::chat_template> template_;
     std::string                           template_src_;

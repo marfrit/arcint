@@ -30,6 +30,12 @@ struct ChatDialect {
     // renders an object in its own key:value form and a JSON string by stripping
     // the outer braces, so the probe (which accepts a string) would have the model
     // see its earlier calls in a syntax it never writes.
+    // What the model's template does with a request that says nothing about
+    // thinking: the Qwen templates (Granite's too) think; Gemma 4's reads
+    // `enable_thinking | default(false)`. An unset request is resolved to this
+    // before the render, the sampler row and the answer-row switch read it, so
+    // the three cannot disagree.
+    constexpr bool thinks_by_default() const { return kind != Gemma4; }
     constexpr bool replays_arguments_as_object() const { return kind == Gemma4; }
     friend constexpr bool operator==(ChatDialect a, ChatDialect b) { return a.kind == b.kind; }
     friend constexpr bool operator!=(ChatDialect a, ChatDialect b) { return a.kind != b.kind; }

@@ -51,7 +51,15 @@ public:
     }
     const ModelStatus& status() const override { return status_; }
     Tokenizer&         tokenizer() override { return tok_; }
-    std::string        render_chat(const ChatRequest&) const override { return "prompt"; }
+    std::string        render_chat(const ChatRequest& r) const override {
+        seen_has_enable = r.has_enable_thinking;
+        seen_enable     = r.enable_thinking;
+        return prompt;
+    }
+    std::string        prompt = "prompt";
+    ModelStatus&       mutable_status() { return status_; }
+    mutable bool       seen_has_enable = false;
+    mutable bool       seen_enable     = true;
     // the channel-end marker is one special token; the opener is several pieces
     ThinkBlockIds think_block_ids(ChatDialect) const override {
         ThinkBlockIds ids;
@@ -553,4 +561,159 @@ TEST(gemma4_responses_route_streams_the_call_without_leaking_its_markers) {
     CHECK_EQ(calls.size(), 1u);
     if (calls.size() != 1) return;
     CHECK_EQ(calls[0]["name"].get<std::string>(), std::string("get_weather"));
+}
+
+// ---- the thinking default of an unset request -------------------------------
+// Gemma 4's template reads `enable_thinking | default(false)`; the Qwen
+// templates default to thinking. A request that says nothing must be ONE kind
+// of turn for the template, the sampler row and the answer-row switch alike.
+
+namespace {
+
+struct ThinkCase {
+    bool  enable;          // prep.req.enable_thinking
+    bool  has;             // prep.req.has_enable_thinking
+    bool  thinking_turn;   // prep.input.sampler.thinking_turn
+    float temperature;     // the sampler row chosen: 0.9 thinking, 0.11 non-thinking
+    bool  rendered_enable; // what the template saw
+    bool  rendered_has;
+};
+
+ThinkCase prepare_think(ChatDialect d, json extra_body, std::optional<bool> think_default) {
+    Config cfg;
+    cfg.think_default = think_default;
+    ScriptBackend backend({});
+    backend.mutable_status().dialect = d;
+    SamplerDefaults sd;
+    sd.temperature           = 0.9f;
+    sd.nothink_row           = true;
+    sd.nothink_temperature   = 0.11f;
+    backend.mutable_status().sampler_defaults = sd;
+    api::SlotPool slots(1);
+    api::Context  ctx{&cfg, &backend, &slots};
+    json body = {{"messages", json::array({{{"role", "user"}, {"content", "hi"}}})}};
+    for (auto& [k, v] : extra_body.items()) body[k] = v;
+    api::PreparedChat prep;
+    const auto err = api::prepare_chat(ctx, body, prep);
+    CHECK(!err.has_value());
+    return {prep.req.enable_thinking, prep.req.has_enable_thinking, prep.input.sampler.thinking_turn,
+            prep.input.sampler.temperature, backend.seen_enable, backend.seen_has_enable};
+}
+
+const json kUnset = json::object();
+const json kAsk   = {{"chat_template_kwargs", {{"enable_thinking", true}}}};
+const json kOff   = {{"chat_template_kwargs", {{"enable_thinking", false}}}};
+
+}  // namespace
+
+TEST(gemma4_unset_request_is_a_non_thinking_turn_everywhere) {
+    const ThinkCase c = prepare_think(G, kUnset, std::nullopt);
+    CHECK(!c.enable);
+    CHECK(!c.thinking_turn);
+    CHECK_EQ(c.temperature, 0.11f);           // the non-thinking row
+    CHECK(!c.rendered_enable);                // and the template is told so
+    CHECK(c.rendered_has);
+}
+
+TEST(gemma4_request_and_operator_default_still_win) {
+    const ThinkCase on = prepare_think(G, kAsk, std::nullopt);
+    CHECK(on.enable && on.thinking_turn && on.rendered_enable);
+    CHECK_EQ(on.temperature, 0.9f);
+    const ThinkCase off = prepare_think(G, kOff, std::nullopt);
+    CHECK(!off.enable && !off.thinking_turn);
+    CHECK_EQ(off.temperature, 0.11f);
+    const ThinkCase def = prepare_think(G, kUnset, true);   // --think-default on
+    CHECK(def.enable && def.thinking_turn && def.rendered_enable);
+    CHECK_EQ(def.temperature, 0.9f);
+    const ThinkCase defoff = prepare_think(G, kAsk, false);   // the request beats --think-default off
+    CHECK(defoff.enable && defoff.thinking_turn);
+}
+
+TEST(qwen_dialects_keep_thinking_as_the_unset_default) {
+    for (ChatDialect d : {ChatDialect(ChatDialect::Qwen), ChatDialect(ChatDialect::Extended)}) {
+        const ThinkCase c = prepare_think(d, kUnset, std::nullopt);
+        CHECK(c.enable);
+        CHECK(!c.has);                 // the template is not told: it defaults to thinking
+        CHECK(c.thinking_turn);
+        CHECK_EQ(c.temperature, 0.9f);
+        CHECK(!c.rendered_has);
+    }
+}
+
+// ---- review follow-ups ------------------------------------------------------
+
+TEST(gemma4_value_in_ordinary_quotes_is_the_string_it_spells) {
+    const auto r = parse_tool_calls(call("f", "city:\"Kassel\",n:1"), G);
+    CHECK_EQ(r.calls.size(), 1u);
+    if (r.calls.size() != 1u) return;
+    CHECK(args_of(r.calls[0])["city"] == "Kassel");
+    ToolSchemas schemas;
+    schemas["f"] = {{"city", "string"}};
+    const auto d = parse_tool_calls(call("f", "city:\"Kassel\""), G, &schemas);
+    CHECK_EQ(d.calls.size(), 1u);
+    if (d.calls.size() != 1u) return;
+    CHECK(args_of(d.calls[0])["city"] == "Kassel");
+}
+
+TEST(gemma4_delimited_string_is_coerced_to_the_declared_type_as_in_the_qwen_form) {
+    ToolSchemas schemas;
+    schemas["f"] = {{"n", "integer"}, {"on", "boolean"}, {"s", "string"}, {"l", "array"}};
+    const auto r = parse_tool_calls(
+        call("f", "n:" + q() + "5" + q() + ",on:" + q() + "true" + q() + ",s:" + q() + "7" + q() + ",l:" + q() + "[1,2]" + q()), G,
+        &schemas);
+    CHECK_EQ(r.calls.size(), 1u);
+    if (r.calls.size() != 1u) return;
+    const json a = args_of(r.calls[0]);
+    CHECK(a["n"] == 5);
+    CHECK(a["on"] == true);
+    CHECK(a["s"] == "7");           // a declared string stays one
+    CHECK(a["l"].is_array());
+    // undeclared: a delimited string stays a string
+    const auto u = parse_tool_calls(call("g", "n:" + q() + "5" + q()), G, &schemas);
+    CHECK_EQ(u.calls.size(), 1u);
+    if (u.calls.size() != 1u) return;
+    CHECK(args_of(u.calls[0])["n"] == "5");
+}
+
+TEST(gemma4_tool_opener_split_across_two_streamed_pieces) {
+    const std::string open = c_open();
+    const size_t      cut  = open.size() / 2;
+    std::vector<std::pair<std::string, int>> script = {
+        {t_open(), -1},           {"plan", -1},     {t_close(), kCloseId},
+        {open.substr(0, cut), -1}, {open.substr(cut) + "call:f{a:1}", -1}, {c_close(), 49}};
+    ScriptBackend backend(script);
+    const Out     o = streamed(backend, prepared(G, false));
+    CHECK_EQ(o.content, std::string(""));   // not even the first half of the marker leaks
+    CHECK_EQ(o.calls.size(), 1u);
+    if (o.calls.size() != 1u) return;
+    CHECK_EQ(o.calls[0]["function"]["name"].get<std::string>(), std::string("f"));
+}
+
+TEST(gemma4_responses_stream_with_the_prompt_already_inside_the_channel) {
+    RespFixture fx({{"check the result\n", 8}, {t_close(), kCloseId}, {"It is done.", 9}});
+    fx.backend.prompt = "turn\n" + t_open();   // the template left the channel open
+    api::PreparedResponse p = fx.prepare();
+    CHECK(p.chat.think_open);
+    std::vector<std::string> frames;
+    api::stream_response(fx.ctx, p, 0, [&](std::string_view frame) {
+        frames.emplace_back(frame);
+        return true;
+    });
+    json completed;
+    std::string text, reasoning;
+    for (const std::string& f : frames) {
+        const size_t data = f.find("data: ");
+        if (f.rfind("event: ", 0) != 0 || data == std::string::npos) continue;
+        std::string payload = f.substr(data + 6);
+        while (!payload.empty() && payload.back() == '\n') payload.pop_back();
+        const json j = json::parse(payload);
+        const std::string type = j.value("type", "");
+        if (type == "response.completed") completed = j["response"];
+        if (type == "response.output_text.delta") text += j["delta"].get<std::string>();
+        if (type.find("reasoning") != std::string::npos && type.find("delta") != std::string::npos)
+            reasoning += j.value("delta", std::string());
+    }
+    CHECK_EQ(text, std::string("It is done."));
+    CHECK_EQ(trimmed(reasoning), std::string("check the result"));
+    CHECK(!completed.is_null());
 }

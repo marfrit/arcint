@@ -133,13 +133,22 @@ claimed below is what the files and the code say.
   `src/core/dialect.h`): the channel goes to `reasoning_content`, calls to
   `tool_calls`, on the chat routes streamed and not (`measured-here`: the unit
   tests drive both through a scripted backend). `--tool-grammar` is the Qwen
-  call form: on this model it refuses at start (and a request that asks for it
-  is a 400), and the gateway's renderer material, which carries Qwen parser
+  call form: on this model it refuses at start, and a request that asks for it
+  is refused with a 400 on the non-streaming routes; on a streaming route the
+  refusal is thrown inside `generate` after the 200 and goes in the stream as
+  an error event (the existing pattern of that function, not changed here).
+  A request that says nothing about thinking is a non-thinking turn on this
+  model, as its template defaults (`enable_thinking | default(false)`):
+  `ChatDialect::thinks_by_default` resolves it before the render, so the
+  template, the non-thinking sampler row and the answer-row switch agree;
+  `--think-default` and the request still win (`code`, `tests/test_gemma4.cpp`;
+  the Qwen dialects, Granite's included, keep thinking as the unset default).
+  And the gateway's renderer material, which carries Qwen parser
   rows only, is not built (token mode off on that unit, said in the load log).
 - **Granite 4.2 8B** (`granite`; `code`, from the GGUF's metadata): 40 layers,
   `n_embd` 4096, 32 query heads over 8 KV heads (head size 128, derived: the
   file carries no key length), context trained 131,072, vocabulary 100,352,
-  BPE with the granite pre-tokenizer. Its template uses the Qwen forms (`code`:
+  BPE (`tokenizer.ggml.model = gpt2`, `tokenizer.ggml.pre = granite-docling`). Its template uses the Qwen forms (`code`:
   read from the template text): the ChatML turn framing, the plain think pair
   with the generation prompt ending inside the open block when thinking is on
   and an empty pair when it is off, and the function/parameter tool-call form
@@ -932,3 +941,14 @@ said), and the 503 bodies lost `reservation` and `kv_blocks_free`.
   loaded and rejects every other non-text part as before. An Anthropic
   Messages adapter and a local CLI stay uncommitted. Image *output* has been
   in scope since 1.1.0 (`decision`, operator, 2026-10-18; §3.11).
+- **Gemma 4 E4B and Granite 4.2 8B, open for the operator's decision** (2026-11-06,
+  `code`; nothing changed): (a) the sampler defaults are hard-coded to Qwen's
+  0.7 / 0.8 / 20 for every model (`backend_llama.cpp`, `SamplerDefaults` at
+  load) although both GGUFs carry `general.sampling.*` (Gemma 4: top_k 64,
+  top_p 0.95, temperature 1.0; Granite: top_p 0.95, temperature 1.0), so the
+  two models answer with Qwen's sampling until `--temp` and friends say
+  otherwise. (b) `--llama-checkpoints` on a model that is neither hybrid nor
+  recurrent goes off without a word (`ckpt_on_` in `backend_llama.cpp`): the
+  option is accepted and does nothing. That is a silent fallback by the
+  operator's rule, as it already is for Mistral Small and Llama 2, and it now
+  covers these two as well; the choices are a load-time warning or a refusal.
