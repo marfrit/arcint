@@ -107,8 +107,55 @@ most layers carry a fixed-size recurrent state (conv + delta-rule state), a
 minority are attention layers with a KV cache. The engine admits a GGUF by
 its own `general.architecture`: `qwen35`, `qwen35moe`, `qwen4exp`, and
 `llama` at two geometries only, Mistral Small 24B and Llama 2 7B (the model of
-the community llama-bench GPU tables, `tools/llama_scoreboard.py`; `code`:
-`src/exec/backend_llama.cpp`); anything else is refused at load.
+the community llama-bench GPU tables, `tools/llama_scoreboard.py`), `gemma4` at
+the E4B geometry and `granite` at the 8B geometry only (`code`: the decision is
+the pure function in `src/core/admission.cpp`, unit-tested with no model in
+`tests/test_admission.cpp`; the backend reads the numbers from the loaded
+model); anything else is refused at load, and an untested size of an admitted
+architecture is refused the same way, the message naming the admitted sizes.
+
+Two models admitted 2026-11-06 (operator's order: admit now, optimise later;
+card-free work only). Neither has been loaded or served by arcint: what is
+claimed below is what the files and the code say.
+
+- **Gemma 4 E4B** (`gemma4`; `code`, read from the GGUF's metadata): 42 layers,
+  `n_embd` 2560, 8 query heads over 2 KV heads, key length 512 (256 on the
+  sliding-window layers, window 512), 18 shared-KV layers, context trained
+  131,072, vocabulary 262,144, tokenizer model `gemma4`. The pinned llama.cpp
+  carries the architecture (`code`: `LLM_ARCH_GEMMA4` in `src/llama-arch.cpp`
+  of the pin). Its chat dialect differs from Qwen's: reasoning is a thought
+  channel (an opener of the channel-start marker, the word thought and a
+  newline; closed by the channel-end marker) and a tool call is its own marker
+  pair around `call:NAME{key:value,...}` with a string delimiter token around
+  string values (`code`: the template text and the token table; the markers are
+  single special tokens of the vocabulary, user-defined type). The server
+  parses both only when this model is loaded (`ChatDialect::Gemma4`,
+  `src/core/dialect.h`): the channel goes to `reasoning_content`, calls to
+  `tool_calls`, on the chat routes streamed and not (`measured-here`: the unit
+  tests drive both through a scripted backend). `--tool-grammar` is the Qwen
+  call form: on this model it refuses at start, and a request that asks for it
+  is refused with a 400 on the non-streaming routes; on a streaming route the
+  refusal is thrown inside `generate` after the 200 and goes in the stream as
+  an error event (the existing pattern of that function, not changed here).
+  A request that says nothing about thinking is a non-thinking turn on this
+  model, as its template defaults (`enable_thinking | default(false)`):
+  `ChatDialect::thinks_by_default` resolves it before the render, so the
+  template, the non-thinking sampler row and the answer-row switch agree;
+  `--think-default` and the request still win (`code`, `tests/test_gemma4.cpp`;
+  the Qwen dialects, Granite's included, keep thinking as the unset default).
+  And the gateway's renderer material, which carries Qwen parser
+  rows only, is not built (token mode off on that unit, said in the load log).
+- **Granite 4.2 8B** (`granite`; `code`, from the GGUF's metadata): 40 layers,
+  `n_embd` 4096, 32 query heads over 8 KV heads (head size 128, derived: the
+  file carries no key length), context trained 131,072, vocabulary 100,352,
+  BPE (`tokenizer.ggml.model = gpt2`, `tokenizer.ggml.pre = granite-docling`). Its template uses the Qwen forms (`code`:
+  read from the template text): the ChatML turn framing, the plain think pair
+  with the generation prompt ending inside the open block when thinking is on
+  and an empty pair when it is off, and the function/parameter tool-call form
+  of the Qwen coder; tools are declared in a JSON block, a template-side matter.
+  So it takes the Qwen dialect and needs no parser change; the think pair and
+  the call pair are single special tokens in its vocabulary (`code`: the token
+  table).
 
 | service | model | architecture | served file | card |
 |---|---|---|---|---|
@@ -367,6 +414,20 @@ provenance (`code`).
   `tool_calls`; requests without `tools` get raw text. A template that
   iterates arguments as a mapping is handed the parsed object; minja
   polyfills stay off (`code`).
+- **Chat dialects.** The think tags and the call form a model is parsed with
+  are one setting per loaded model, `ChatDialect` (`src/core/dialect.h`; set
+  once at load from the admitted model, carried by every request): Qwen (every
+  model admitted before Gemma 4, Granite 4.2 included), Extended (the Mistral
+  family's extra think pairs) and Gemma 4 (its thought channel, and its call
+  form: a marker pair around the word call, the function name and a
+  brace-delimited key:value list with a string-delimiter token around string
+  values; `code`, parsed by `parse_tool_calls`). A dialect honours only its own
+  tags: a Gemma 4 answer that starts with the Qwen pair stays content, and the
+  Qwen models never see the channel (`code`: `tests/test_gemma4.cpp`). Under
+  Gemma 4, assistant tool calls are replayed into the template as objects (its
+  template renders an object in its own form, a JSON string with the braces cut
+  off), `--tool-grammar` is refused at start and per request, and the gateway
+  renderer material is not built, so token mode is off on that unit (`code`).
 - **Cancellation.** A dropped connection and a stop signal (SIGTERM/SIGINT)
   abort at the next token or batch boundary (a prefill steps by `--prefill-chunk`) and free the lane (`code`; gated
   by the concurrency suite, §5). The boundary checks the process's stop flag
@@ -880,3 +941,14 @@ said), and the 503 bodies lost `reservation` and `kv_blocks_free`.
   loaded and rejects every other non-text part as before. An Anthropic
   Messages adapter and a local CLI stay uncommitted. Image *output* has been
   in scope since 1.1.0 (`decision`, operator, 2026-10-18; §3.11).
+- **Gemma 4 E4B and Granite 4.2 8B, open for the operator's decision** (2026-11-06,
+  `code`; nothing changed): (a) the sampler defaults are hard-coded to Qwen's
+  0.7 / 0.8 / 20 for every model (`backend_llama.cpp`, `SamplerDefaults` at
+  load) although both GGUFs carry `general.sampling.*` (Gemma 4: top_k 64,
+  top_p 0.95, temperature 1.0; Granite: top_p 0.95, temperature 1.0), so the
+  two models answer with Qwen's sampling until `--temp` and friends say
+  otherwise. (b) `--llama-checkpoints` on a model that is neither hybrid nor
+  recurrent goes off without a word (`ckpt_on_` in `backend_llama.cpp`): the
+  option is accepted and does nothing. That is a silent fallback by the
+  operator's rule, as it already is for Mistral Small and Llama 2, and it now
+  covers these two as well; the choices are a load-time warning or a refusal.

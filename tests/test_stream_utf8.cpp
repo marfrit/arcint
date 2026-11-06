@@ -109,7 +109,7 @@ std::vector<json> run_stream_with(lgc::Backend& backend, bool think_open) {
 
     lgc::api::PreparedChat prep;
     prep.think_open          = think_open;  // the prompt ended inside a think block
-    prep.think_tags_extended = false;
+    prep.dialect = false;
     prep.parse_tool_calls    = false;
     prep.id                  = "test";
     prep.model               = "stub";
@@ -353,7 +353,7 @@ json run_chat_reply(const std::string& reply, bool think_open) {
 
     lgc::api::PreparedChat prep;
     prep.think_open          = think_open;
-    prep.think_tags_extended = false;
+    prep.dialect = false;
     prep.parse_tool_calls    = false;
     prep.id                  = "test";
     prep.model               = "stub";
@@ -463,7 +463,7 @@ json run_chat_loop_stats() {
     ctx.backend = &backend;
     lgc::api::PreparedChat prep;
     prep.think_open          = false;
-    prep.think_tags_extended = false;
+    prep.dialect = false;
     prep.parse_tool_calls    = false;
     prep.id                  = "test";
     prep.model               = "stub";

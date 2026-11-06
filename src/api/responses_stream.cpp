@@ -547,17 +547,18 @@ bool Stream::run(const Context& ctx, int slot) {
     if (!send(json{{"type", "response.in_progress"}, {"response", created}})) return false;
 
     // The chat route's streamer, over the same (piece, id) sequence.
-    reasoning_ = ReasoningStreamer(prep_.think_open, prep_.think_tags_extended,
+    reasoning_ = ReasoningStreamer(prep_.think_open, prep_.dialect,
                                    prep_.think_ids.open_close_ids);
     // W6b: token mode's spans read the same ids the streamer and the parser
     // use; the off path leaves every field false/empty.
     token_mode_ = req_.token_mode;
     if (token_mode_ && prep_.parse_tool_calls) {
-        const ToolCallTags& tags = tool_call_tags();
-        tool_open_text_ = std::string(tags.open);
-        tool_close_text_ = std::string(tags.close);
-        tool_open_ids_ = ctx.backend->tokenizer().special_ids(tags.open);
-        tool_close_ids_ = ctx.backend->tokenizer().special_ids(tags.close);
+        const std::string_view open  = tool_call_open(prep_.dialect);
+        const std::string_view close = tool_call_close(prep_.dialect);
+        tool_open_text_ = std::string(open);
+        tool_close_text_ = std::string(close);
+        tool_open_ids_ = ctx.backend->tokenizer().special_ids(open);
+        tool_close_ids_ = ctx.backend->tokenizer().special_ids(close);
     }
     const bool by_ids = std::any_of(prep_.think_ids.open_close_ids.begin(),
                                     prep_.think_ids.open_close_ids.end(),
@@ -565,7 +566,7 @@ bool Stream::run(const Context& ctx, int slot) {
                                         return p.first >= 0 || p.second >= 0;
                                     });
 
-    static const std::string kToolOpen(tool_call_tags().open);
+    const std::string kToolOpen(tool_call_open(prep_.dialect));
 
     GenerationStats stats;
     std::string     raw;
@@ -686,10 +687,10 @@ bool Stream::run(const Context& ctx, int slot) {
 
     std::vector<ToolCall> calls;
     if (prep_.parse_tool_calls) {
-        ToolCallParse parsed = parse_qwen_tool_calls(content_, &prep_.schemas);
+        ToolCallParse parsed = parse_tool_calls(content_, prep_.dialect, &prep_.schemas);
         if (parsed.truncated) {
             log::warn("tools", "unterminated %s block; returned as raw content%s",
-                      std::string(tool_call_tags().open).c_str(),
+                      std::string(tool_call_open(prep_.dialect)).c_str(),
                       rid_suffix(prep_.request_id).c_str());
         }
         calls = std::move(parsed.calls);

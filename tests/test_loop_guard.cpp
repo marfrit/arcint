@@ -2027,7 +2027,7 @@ TEST(opener_start_state_is_one_helper_for_chat_and_completions) {
             st.loaded      = true;
             st.stub        = true;
             st.n_ctx       = 4096;
-            st.think_tags_extended = extended;
+            st.dialect = extended;
         }
         const ModelStatus& status() const override { return st; }
         Tokenizer&         tokenizer() override { return tok_; }

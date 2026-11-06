@@ -4,6 +4,7 @@
 #include <utility>
 #include <vector>
 
+#include "core/dialect.h"
 #include "core/markers.h"
 
 namespace lgc {
@@ -24,11 +25,11 @@ struct ReasoningSplit {
 
 // `think_open`: the rendered prompt ended inside the Qwen think block.
 // When it did not, a block the model opens itself at the very start is
-// honoured too: the same opener, and with `extended_tags` (ModelStatus::
-// think_tags_extended) also the angle-bracket opener (Cydonia 24B) or
+// honoured too: the same opener, and under the Extended dialect also the angle-bracket opener (Cydonia 24B) or
 // the square-bracket opener (Magistral tunes), each closed only by its
-// own closer.
-ReasoningSplit split_reasoning(std::string_view raw, bool think_open, bool extended_tags = false);
+// own closer. Under Gemma4 the only opener is that model's thought channel;
+// a template-opened block closes on the dialect's first pair.
+ReasoningSplit split_reasoning(std::string_view raw, bool think_open, ChatDialect dialect = {});
 
 // The lead of a generated text: everything from its first non-blank
 // character, where blank is a space or a newline. A model may pad before a
@@ -53,7 +54,7 @@ enum class TokenField { Reasoning, Text };
 
 class ReasoningStreamer {
 public:
-    explicit ReasoningStreamer(bool think_open, bool extended_tags = false,
+    explicit ReasoningStreamer(bool think_open, ChatDialect dialect = {},
                                const std::vector<std::pair<int, int>>& open_close_ids = {});
     struct Step {
         std::string reasoning;
@@ -75,7 +76,7 @@ private:
     bool             undecided_;      // not opened by the template: wait for the first bytes
     std::string      buffer_;
     std::string_view close_ = markers::kThinkClose;   // the closer of the block that is open
-    bool             extended_;
+    ChatDialect      dialect_;
     std::vector<std::pair<int, int>> ids_;
     int              close_id_ = -1;   // the closer id of the open block; -1 = text
     bool             closed_   = false;
@@ -89,15 +90,16 @@ private:
 // takes, so the two paths cannot disagree: a closer spelled from ordinary
 // tokens stays reasoning, the special-token closer ends the block.
 ReasoningSplit split_reasoning_tokens(const std::vector<std::pair<std::string, int>>& pieces,
-                                      bool think_open, bool extended_tags,
+                                      bool think_open, ChatDialect dialect,
                                       const std::vector<std::pair<int, int>>& open_close_ids);
 
-// The tag family the split honours, in the order it tries them: the Qwen pair,
-// and with `extended` also the Mistral-family pairs. This is the only place
+// The tag family the split honours, in the order it tries them: the Qwen pair;
+// for the Extended dialect also the Mistral-family pairs; for Gemma4 its
+// thought channel alone. This is the only place
 // they are spelled; anything else that needs them (the sampler's think-block
 // mask, clean-turns) asks for them here rather than writing them out. A
 // reference to a table built once: no caller copies them, and no caller needs
 // to compose one.
-const std::vector<std::pair<std::string, std::string>>& think_tag_pairs(bool extended);
+const std::vector<std::pair<std::string, std::string>>& think_tag_pairs(ChatDialect dialect);
 
 }  // namespace lgc
