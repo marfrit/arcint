@@ -1,0 +1,572 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Markus Fritsche <mfritsche@reauktion.de>
+Date: Fri, 6 Nov 2026 08:45:05 +0000
+Subject: [PATCH] 0100-opencl-downgrade-lines-and-counts
+
+---
+ ggml/include/ggml-opencl.h           |   4 +
+ ggml/src/ggml-opencl/ggml-opencl.cpp | 135 +++++++++++++++++++++++----
+ 2 files changed, 121 insertions(+), 18 deletions(-)
+
+diff --git a/ggml/include/ggml-opencl.h b/ggml/include/ggml-opencl.h
+index 6b61771..a1a3c5f 100644
+--- a/ggml/include/ggml-opencl.h
++++ b/ggml/include/ggml-opencl.h
+@@ -19,6 +19,10 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_opencl_host_buffer_type
+ 
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_opencl_reg(void);
+ 
++// The paths taken other than the one a weight's type promises, one "key\tcount\n" a line.
++// Writes at most size bytes, NUL-terminated; returns the full length.
++GGML_BACKEND_API size_t ggml_backend_opencl_downgrades(char * buf, size_t size);
++
+ #ifdef  __cplusplus
+ }
+ #endif
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 5a68d08..32cafbe 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -10,6 +10,8 @@
+ #include "ggml-opencl.h"
+ #include "ggml-backend.h"
+ #include "ggml-impl.h"
++#include <cstdarg>
++#include <cstdio>
+ #include "ggml-backend-impl.h"
+ #include "ggml.h"
+ 
+@@ -710,6 +712,40 @@ struct ggml_cl_kq_act {
+ };
+ 
+ // a K-quant fp16-DPAS GEMM tile: NSGM x NSGN sub-groups of RG*8 rows x TG*SG columns
++// ARC-LAB 0100: a path other than the one the weight's type promises. One tagged line the
++// first time a key occurs in the process and a count per key, read with
++// ggml_backend_opencl_downgrades: a slower path that only shows up in a profile went
++// unnoticed for months. A key carries no per-request value (columns go in buckets), so the
++// map stays small; the callers are on paths that already cost far more than this.
++static std::mutex g_cl_downgrade_mu;
++static std::map<std::string, uint64_t> g_cl_downgrades;
++
++static void ggml_cl_downgrade(const char * fmt, ...) {
++    char buf[256];
++    va_list args;
++    va_start(args, fmt);
++    vsnprintf(buf, sizeof(buf), fmt, args);
++    va_end(args);
++    std::lock_guard<std::mutex> lock(g_cl_downgrade_mu);
++    if (g_cl_downgrades[buf]++ == 0) {
++        GGML_LOG_WARN("DOWNGRADE src=opencl %s\n", buf);
++    }
++}
++
++size_t ggml_backend_opencl_downgrades(char * buf, size_t size) {
++    std::string out;
++    {
++        std::lock_guard<std::mutex> lock(g_cl_downgrade_mu);
++        for (const auto & kv : g_cl_downgrades) {
++            out += "src=opencl " + kv.first + "\t" + std::to_string(kv.second) + "\n";
++        }
++    }
++    if (buf != nullptr && size > 0) {
++        snprintf(buf, size, "%s", out.c_str());
++    }
++    return out.size();
++}
++
+ struct ggml_cl_kq_tile {
+     int rg = 4, tg = 4, nsgm = 2, nsgn = 8;
+     int mt() const { return nsgm * rg * 8; }
+@@ -2479,7 +2515,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                     " -DQSG=" + std::to_string(sg8 ? 8 : 16);
+                 cl_program prog = build_program_from_source_optional(backend_ctx, kernel_src.c_str(), opts);
+                 if (prog == nullptr) {
+-                    GGML_LOG_WARN("ggml_opencl: K-quant matvec for %d column(s) not built; ggml's kernels take it\n", nc);
++                    ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "kq_matvec"), GGML_LOG_WARN("ggml_opencl: K-quant matvec for %d column(s) not built; ggml's kernels take it\n", nc);
+                     continue;
+                 }
+                 for (int i = 0; i < 3; ++i) {
+@@ -2525,7 +2561,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         iq_extra_opts;   // the IQ4 codebook in local memory on every card (0035; -DIQ4_KV_SELECT: the A770's selects before)
+                     cl_program prog = build_program_from_source_optional(backend_ctx, iq_src.c_str(), opts);
+                     if (prog == nullptr) {
+-                        GGML_LOG_WARN("ggml_opencl: IQ matvec for %d column(s) not built; IQ weights go to the CPU\n", nc);
++                        ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "iq_matvec"), GGML_LOG_WARN("ggml_opencl: IQ matvec for %d column(s) not built; IQ weights go to the CPU\n", nc);
+                         continue;
+                     }
+                     CL_CHECK((backend_ctx->kernel_mul_mv_q40_q8_1[nc - 1] = clCreateKernel(prog, "kernel_mul_mv_q4_0_q8_1", &err), err));
+@@ -2582,7 +2618,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         " -DR=1 -DG=" + std::to_string(g) + " -DNK=" + std::to_string(backend_ctx->kq_few_nk);
+                     cl_program fw_prog = build_program_from_source_optional(backend_ctx, fw_src.c_str(), fw_opts);
+                     if (fw_prog == nullptr) {
+-                        GGML_LOG_WARN("ggml_opencl: few-column K-quant product (G=%d) not built\n", g);
++                        ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "kq_few"), GGML_LOG_WARN("ggml_opencl: few-column K-quant product (G=%d) not built\n", g);
+                         continue;
+                     }
+                     bool fits = true;
+@@ -2601,7 +2637,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         }
+                         CL_CHECK(clReleaseKernel(backend_ctx->kernel_mul_mm_few_prep[g - 1]));
+                         backend_ctx->kernel_mul_mm_few_prep[g - 1] = nullptr;
+-                        GGML_LOG_WARN("ggml_opencl: few-column K-quant product (G=%d) does not fit a work-group\n", g);
++                        ggml_cl_downgrade("path=fallback reason=%s what=%s", "no-fit", "kq_few"), GGML_LOG_WARN("ggml_opencl: few-column K-quant product (G=%d) does not fit a work-group\n", g);
+                     }
+                     CL_CHECK(clReleaseProgram(fw_prog));
+                     GGML_LOG_CONT(".");
+@@ -2644,11 +2680,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                     } else {
+                         if (err == CL_SUCCESS) CL_CHECK(clReleaseKernel(kg));
+                         if (e2 == CL_SUCCESS) CL_CHECK(clReleaseKernel(kq));
+-                        GGML_LOG_WARN("ggml_opencl: Q4_0 int8 sub-group 8 GEMM does not fit a work-group; the tile takes Q4_0\n");
++                        ggml_cl_downgrade("path=fallback reason=%s what=%s", "no-fit", "q40_i8_sg8"), GGML_LOG_WARN("ggml_opencl: Q4_0 int8 sub-group 8 GEMM does not fit a work-group; the tile takes Q4_0\n");
+                     }
+                     CL_CHECK(clReleaseProgram(q40_prog));
+                 } else {
+-                    GGML_LOG_WARN("ggml_opencl: Q4_0 int8 sub-group 8 GEMM not built; the tile takes Q4_0\n");
++                    ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "q40_i8_sg8"), GGML_LOG_WARN("ggml_opencl: Q4_0 int8 sub-group 8 GEMM not built; the tile takes Q4_0\n");
+                 }
+                 GGML_LOG_CONT(".");
+             }
+@@ -2720,7 +2756,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                             if (err2 == CL_SUCCESS) CL_CHECK(clReleaseKernel(backend_ctx->kernel_kq_quant_i8));
+                             backend_ctx->kernel_mul_mm_kq2d_q4_K_i8 = nullptr;
+                             backend_ctx->kernel_kq_quant_i8 = nullptr;
+-                            GGML_LOG_WARN("ggml_opencl: Q4_K int8 2D GEMM not built or does not fit a work-group; the fp16 kernel takes Q4_K\n");
++                            ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "q4k_i8_2d"), GGML_LOG_WARN("ggml_opencl: Q4_K int8 2D GEMM not built or does not fit a work-group; the fp16 kernel takes Q4_K\n");
+                         }
+                     }
+                     // Q4_0 on the same loads; a kernel that is not there leaves 0096's tile
+@@ -2750,7 +2786,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                             CL_CHECK(clReleaseKernel(backend_ctx->kernel_kq_cvt_f32_f16_p4));
+                             backend_ctx->kernel_kq_cvt_f32_f16_p4 = nullptr;
+                         }
+-                        GGML_LOG_WARN("ggml_opencl: K-quant 2D GEMM does not fit a work-group\n");
++                        ggml_cl_downgrade("path=fallback reason=%s what=%s", "no-fit", "kq_2d"), GGML_LOG_WARN("ggml_opencl: K-quant 2D GEMM does not fit a work-group\n");
+                     }
+                     backend_ctx->kq2d_tm = tm;
+                     backend_ctx->kq2d_wg = wg;
+@@ -2797,7 +2833,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         CL_CHECK(clReleaseProgram(pi));
+                     }
+                 } else {
+-                    GGML_LOG_WARN("ggml_opencl: K-quant 2D GEMM not built; mul_mm_kq_f16.cl takes the prompts\n");
++                    ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "kq_2d"), GGML_LOG_WARN("ggml_opencl: K-quant 2D GEMM not built; mul_mm_kq_f16.cl takes the prompts\n");
+                 }
+                 GGML_LOG_CONT(".");
+             }
+@@ -2842,7 +2878,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                     const std::string i8_src = read_file("mul_mm_kq_i8.cl");
+ #endif
+                     if (kq_i8_ops_src.empty() || i8_src.empty()) {
+-                        GGML_LOG_WARN("ggml_opencl: int8 DPAS expert GEMM not built (kq_i8_ops.inc or mul_mm_kq_i8.cl missing or empty)\n");
++                        ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "id_i8"), GGML_LOG_WARN("ggml_opencl: int8 DPAS expert GEMM not built (kq_i8_ops.inc or mul_mm_kq_i8.cl missing or empty)\n");
+                     } else {
+                         i8_prog_src = kq_i8_ops_src + mm_src + i8_src;
+                     }
+@@ -2911,7 +2947,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         (getenv("GGML_OPENCL_IQ_OPTS") ? std::string(" ") + getenv("GGML_OPENCL_IQ_OPTS") : std::string());
+                     cl_program mm_prog = build_program_from_source_optional(backend_ctx, mm_prog_src.c_str(), mm_opts);
+                     if (mm_prog == nullptr) {
+-                        GGML_LOG_WARN("ggml_opencl: XMX GEMM (%s) not built; ggml's kernels take the K-quants, the IQ types go to the CPU\n", pass == 0 ? "MUL_MAT" : "MUL_MAT_ID");
++                        ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "kq_xmx"), GGML_LOG_WARN("ggml_opencl: XMX GEMM (%s) not built; ggml's kernels take the K-quants, the IQ types go to the CPU\n", pass == 0 ? "MUL_MAT" : "MUL_MAT_ID");
+                         continue;
+                     }
+                     if (pass == 0) {
+@@ -2950,7 +2986,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                     const std::string i8_opts = compile_opts + " -cl-intel-256-GRF-per-thread -DSG=16";
+                     cl_program i8_prog = build_program_from_source_optional(backend_ctx, i8_prog_src.c_str(), i8_opts);
+                     if (i8_prog == nullptr) {
+-                        GGML_LOG_WARN("ggml_opencl: int8 DPAS expert GEMM not built; the int8 arm stays on the fp16 tile\n");
++                        ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "id_i8"), GGML_LOG_WARN("ggml_opencl: int8 DPAS expert GEMM not built; the int8 arm stays on the fp16 tile\n");
+                     } else {
+                         CL_CHECK((backend_ctx->kernel_kq_mm_id_quant_i8 = clCreateKernel(i8_prog, "kernel_kq_mm_id_quant_i8", &err), err));
+                         CL_CHECK((backend_ctx->kernel_mul_mm_id_iq3_s_i8 = clCreateKernel(i8_prog, "kernel_mul_mm_id_iq3_s_i8", &err), err));
+@@ -4711,7 +4747,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         CL_CHECK((backend_ctx->kernel_gdn_intel_rpl = clCreateKernel(rpl, "kernel_gated_delta_net_rpl", &err), err));
+                         CL_CHECK(clReleaseProgram(rpl));
+                     } else {
+-                        GGML_LOG_WARN("ggml_opencl: gated_delta_net_intel.cl replay kernel not built; the replay op stays on the CPU\n");
++                        ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "gdn_replay"), GGML_LOG_WARN("ggml_opencl: gated_delta_net_intel.cl replay kernel not built; the replay op stays on the CPU\n");
+                     }
+                 }
+                 // the kernel's own limit (a 256-GRF build halves the threads a
+@@ -4732,7 +4768,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                 backend_ctx->gdn_intel_r_pp = r_pp;
+                 backend_ctx->gdn_intel_nsg  = nsg;
+             } else {
+-                GGML_LOG_WARN("ggml_opencl: gated_delta_net_intel.cl not built; gated_delta_net.cl takes the op\n");
++                ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "gdn_intel"), GGML_LOG_WARN("ggml_opencl: gated_delta_net_intel.cl not built; gated_delta_net.cl takes the op\n");
+             }
+             if (tg != nullptr) {
+                 CL_CHECK(clReleaseProgram(tg));
+@@ -4886,9 +4922,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                 }
+             }
+             if (backend_ctx->kernel_fa_dpas_dk[0] == nullptr) {
+-                GGML_LOG_WARN("ggml_opencl: flash_attn_dpas.cl not built; flash_attn_f32_f16.cl takes the prompt\n");
++                ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "fa_dpas"), GGML_LOG_WARN("ggml_opencl: flash_attn_dpas.cl not built; flash_attn_f32_f16.cl takes the prompt\n");
+             } else if (backend_ctx->kernel_fa_dpas_dk[1] == nullptr) {
+-                GGML_LOG_WARN("ggml_opencl: flash_attn_dpas.cl not built at head size 128; flash_attn_f32_f16.cl takes those prompts\n");
++                ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "fa_dpas_128"), GGML_LOG_WARN("ggml_opencl: flash_attn_dpas.cl not built at head size 128; flash_attn_f32_f16.cl takes those prompts\n");
+             }
+             // the prompt kernel after vLLM's head-256 policy and sycl-tla's
+             // mainloop (flash_attn_dpas2.cl): K/V straight into registers by 2D
+@@ -5074,7 +5110,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                     }
+                 }
+                 if (backend_ctx->kernel_fa_gqa_dk[0][0] == nullptr) {
+-                    GGML_LOG_WARN("ggml_opencl: flash_attn_gqa_dpas.cl not built; flash_attn_f32_f16.cl takes decode\n");
++                    ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "fa_gqa_dpas"), GGML_LOG_WARN("ggml_opencl: flash_attn_gqa_dpas.cl not built; flash_attn_f32_f16.cl takes decode\n");
+                 }
+                 if (fi8_on) {
+                     GGML_LOG_INFO("ggml_opencl: flash_attn_gqa_dpas.cl: Q K^T int8 from the raw q8_0 cache (GGML_OPENCL_FA_GQA_I8=1)\n");
+@@ -11807,6 +11843,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                 return true;
+             }
+             if (ggml_cl_kq_type_index(op->src[0]->type) >= 3) {
++                ggml_cl_downgrade("op=MUL_MAT type=%s k=%d path=cpu reason=shape", ggml_type_name(op->src[0]->type), (int) op->src[0]->ne[0]);
+                 return false;   // IQ3_XXS / IQ4_XS / IQ4_NL: no other kernel takes this shape here
+             }
+ #endif
+@@ -11887,9 +11924,13 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                 return false;
+             }
+             if (ggml_cl_kq_type_index(op->src[0]->type) >= 0 && kq_q8_1_enabled(backend_ctx)) {
+-                return op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % ggml_cl_kq_k_unit(op->src[0]->type) == 0 &&
++                const bool id_ok = op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % ggml_cl_kq_k_unit(op->src[0]->type) == 0 &&
+                        op->src[0]->view_offs == 0 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                        ggml_cl_kq_kernels_built(backend_ctx, ggml_cl_kq_type_index(op->src[0]->type), false, true);
++                if (!id_ok) {
++                    ggml_cl_downgrade("op=MUL_MAT_ID type=%s k=%d path=cpu reason=shape", ggml_type_name(op->src[0]->type), (int) op->src[0]->ne[0]);
++                }
++                return id_ok;
+             }
+ #endif
+             // q4_0, q8_0 and mxfp4 have general MUL_MAT_ID support,
+@@ -29546,6 +29587,27 @@ static bool ggml_cl_mul_mat_fwht(ggml_backend_t backend, const ggml_tensor * src
+     return true;
+ }
+ 
++// ARC-LAB 0100: an Intel product on ggml's generic tiled GEMM
++static void ggml_cl_downgrade_gemm(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src0, const ggml_tensor * src1) {
++    if (backend_ctx->gpu_family != INTEL) {
++        return;
++    }
++    const int64_t cols = src1->ne[1] * src1->ne[2] * src1->ne[3];
++    ggml_cl_downgrade("op=MUL_MAT type=%s k=%d cols=%s path=generic reason=no-fast-path", ggml_type_name(src0->type), (int) src0->ne[0],
++                      cols <= 4 ? "1-4" : cols < 16 ? "5-15" : "16+");
++}
++
++// ... and on the per-column matvec with enough columns for a GEMM: below 32 the generic switch
++// breaks out to it. Fewer than 16 columns on it is a decode step's normal path.
++static void ggml_cl_downgrade_mv(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src0, const ggml_tensor * src1) {
++    if (backend_ctx->gpu_family != INTEL) {
++        return;
++    }
++    if (src1->ne[1] * src1->ne[2] * src1->ne[3] >= 16) {
++        ggml_cl_downgrade("op=MUL_MAT type=%s k=%d cols=16+ path=matvec reason=no-fast-path", ggml_type_name(src0->type), (int) src0->ne[0]);
++    }
++}
++
+ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_ASSERT(src0);
+     GGML_ASSERT(src0->extra);
+@@ -30289,6 +30351,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                     backend_ctx->enqueue_ndrange_kernel(kmc, 3, gws, lws, dst);
+                     return;
+                 }
++                ggml_cl_downgrade_gemm(backend_ctx, src0, src1);
+                 kernel = backend_ctx->kernel_mul_mm_f32_f32_l4_lm;
+                 nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+ 
+@@ -30362,6 +30425,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                     return;
+                 }
+ #endif
++                ggml_cl_downgrade_gemm(backend_ctx, src0, src1);
+                 kernel = backend_ctx->kernel_mul_mm_f16_f32_l4_lm;
+                 nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+ 
+@@ -30436,6 +30500,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                     break;
+                 }
+ 
++                ggml_cl_downgrade_gemm(backend_ctx, src0, src1);
+                 kernel = backend_ctx->kernel_mul_mm_q1_0_f32_l4_lm;
+                 nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+ 
+@@ -30478,6 +30543,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                     break;
+                 }
+ 
++                ggml_cl_downgrade_gemm(backend_ctx, src0, src1);
+                 kernel = backend_ctx->kernel_mul_mm_q4_0_f32_l4_lm;
+                 nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+ 
+@@ -30520,6 +30586,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                     break;
+                 }
+ 
++                ggml_cl_downgrade_gemm(backend_ctx, src0, src1);
+                 kernel = backend_ctx->kernel_mul_mm_q4_1_f32_l4_lm;
+                 nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+ 
+@@ -30563,6 +30630,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                     break;
+                 }
+ 
++                ggml_cl_downgrade_gemm(backend_ctx, src0, src1);
+                 kernel = backend_ctx->kernel_mul_mm_q5_0_f32_l4_lm;
+                 nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+ 
+@@ -30606,6 +30674,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                     break;
+                 }
+ 
++                ggml_cl_downgrade_gemm(backend_ctx, src0, src1);
+                 kernel = backend_ctx->kernel_mul_mm_q5_1_f32_l4_lm;
+                 nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+ 
+@@ -30650,6 +30719,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                     break;
+                 }
+ 
++                ggml_cl_downgrade_gemm(backend_ctx, src0, src1);
+                 kernel = backend_ctx->kernel_mul_mm_q8_0_f32_l4_lm;
+                 nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+ 
+@@ -30692,6 +30762,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                     break;
+                 }
+ 
++                ggml_cl_downgrade_gemm(backend_ctx, src0, src1);
+                 kernel = backend_ctx->kernel_mul_mm_iq4_nl_f32_l4_lm;
+                 nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+ 
+@@ -30734,6 +30805,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                     break;
+                 }
+ 
++                ggml_cl_downgrade_gemm(backend_ctx, src0, src1);
+                 kernel = backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm;
+                 // (BM*BN)/(TM*TN): Intel uses an 8x8 microtile (WG=64), others 4x8 (WG=128)
+                 nth0 = (backend_ctx->gpu_family == INTEL) ? 64 : 128;
+@@ -30779,6 +30851,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                     break;
+                 }
+ 
++                ggml_cl_downgrade_gemm(backend_ctx, src0, src1);
+                 kernel = backend_ctx->kernel_mul_mm_q5_k_f32_l4_lm;
+                 nth0 = (backend_ctx->gpu_family == INTEL) ? 64 : 128; // Intel 8x8 microtile
+ 
+@@ -30824,6 +30897,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                     break;
+                 }
+ 
++                ggml_cl_downgrade_gemm(backend_ctx, src0, src1);
+                 kernel = backend_ctx->kernel_mul_mm_q6_k_f32_l4_lm;
+                 nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+ 
+@@ -31156,6 +31230,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+             break;
+         case GGML_TYPE_Q1_0: {
+ #ifdef GGML_OPENCL_SOA_Q
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_q1_0_f32_flat;
+ 
+             // nth0 - subgroup size
+@@ -31193,6 +31268,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+             CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
+             CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
+ #else
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_q1_0_f32;
+ 
+             if (backend_ctx->gpu_family == INTEL) {
+@@ -31318,6 +31394,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                 GGML_ASSERT(false && "TODO: Unknown GPU");
+             }
+ 
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_q4_1_f32_flat;
+ 
+             CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q4_1->q));
+@@ -31349,6 +31426,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                 GGML_ASSERT(false && "TODO: Unknown GPU");
+             }
+ 
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_q4_1_f32;
+ 
+             CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+@@ -31383,6 +31461,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                 GGML_ASSERT(false && "TODO: Unknown GPU");
+             }
+ 
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_q5_0_f32_flat;
+ 
+             CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q5_0->qs));
+@@ -31414,6 +31493,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                 GGML_ASSERT(false && "TODO: Unknown GPU");
+             }
+ 
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_q5_0_f32;
+ 
+             CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+@@ -31448,6 +31528,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                 GGML_ASSERT(false && "TODO: Unknown GPU");
+             }
+ 
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_q5_1_f32_flat;
+ 
+             CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q5_1->qs));
+@@ -31480,6 +31561,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                 GGML_ASSERT(false && "TODO: Unknown GPU");
+             }
+ 
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_q5_1_f32;
+ 
+             CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+@@ -31502,6 +31584,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+         }
+         case GGML_TYPE_Q8_0: {
+ #ifdef GGML_OPENCL_SOA_Q
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_q8_0_f32_flat;
+ 
+             // nth0 - subgroup size
+@@ -31539,6 +31622,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+             CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
+             CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
+ #else
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_q8_0_f32;
+ 
+             // nth0 - subgroup size
+@@ -31580,6 +31664,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+         }
+         case GGML_TYPE_IQ4_NL: {
+ #ifdef GGML_OPENCL_SOA_Q
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_iq4_nl_f32_flat;
+ 
+             if (backend_ctx->gpu_family == INTEL) {
+@@ -31610,6 +31695,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+             CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &r2));
+             CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
+ #else
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_iq4_nl_f32;
+ 
+             if (backend_ctx->gpu_family == INTEL) {
+@@ -31646,6 +31732,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+         case GGML_TYPE_Q3_K:
+         case GGML_TYPE_Q4_K: {
+ #ifdef GGML_OPENCL_SOA_Q
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_q4_K_f32_flat;
+ 
+             if (backend_ctx->gpu_family == INTEL) {
+@@ -31682,6 +31769,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+             CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &r2));
+             CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &r3));
+ #else
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_q4_K_f32;
+ 
+             if (backend_ctx->gpu_family == INTEL) {
+@@ -31720,6 +31808,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+         }
+         case GGML_TYPE_Q5_K: {
+ #ifdef GGML_OPENCL_SOA_Q
++                ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+                 kernel = backend_ctx->kernel_mul_mv_q5_K_f32_flat;
+ 
+             if (backend_ctx->gpu_family == INTEL) {
+@@ -31757,6 +31846,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+             CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &r2));
+             CL_CHECK(clSetKernelArg(kernel, 21, sizeof(int),      &r3));
+ #else
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_q5_K_f32;
+ 
+             if (backend_ctx->gpu_family == INTEL) {
+@@ -31795,6 +31885,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+         }
+         case GGML_TYPE_Q6_K:
+ #ifdef GGML_OPENCL_SOA_Q
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_q6_K_f32_flat;
+ 
+             if (backend_ctx->gpu_family == INTEL) {
+@@ -31833,6 +31924,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                 CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_uchar), &q6k_mask));
+             }
+ #else
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_q6_K_f32;
+ 
+             if (backend_ctx->gpu_family == INTEL) {
+@@ -31866,6 +31958,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+             break;
+         case GGML_TYPE_MXFP4: {
+ #ifdef GGML_OPENCL_SOA_Q
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_mxfp4_f32_flat;
+ 
+             cl_mem q;
+@@ -31904,6 +31997,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+             CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &r2));
+             CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r3));
+ #else
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_mxfp4_f32;
+ 
+             if (backend_ctx->gpu_family == INTEL) {
+@@ -32960,6 +33054,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
+             } // fallback to generic Q4_0 MoE kernel
+ 
+ #endif // GGML_OPENCL_USE_ADRENO_KERNELS
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_id_q4_0_f32_8x_flat;
+ 
+             if (backend_ctx->gpu_family == INTEL) {
+@@ -33799,6 +33894,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
+             }
+ #endif // GGML_OPENCL_USE_ADRENO_KERNELS
+ #ifdef GGML_OPENCL_SOA_Q
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_id_q8_0_f32_flat;
+ 
+             if (backend_ctx->gpu_family == INTEL) {
+@@ -33835,6 +33931,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
+             CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &ne0));
+             CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &ne1));
+ #else
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_id_q8_0_f32;
+ 
+             if (backend_ctx->gpu_family == INTEL) {
+@@ -34926,6 +35023,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
+ #endif // GGML_OPENCL_USE_ADRENO_KERNELS
+ 
+ #ifdef GGML_OPENCL_SOA_Q
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_id_mxfp4_f32_flat;
+ 
+             cl_mem q;
+@@ -34970,6 +35068,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
+             CL_CHECK(clSetKernelArg(kernel, 22, sizeof(int),      &r2));
+             CL_CHECK(clSetKernelArg(kernel, 23, sizeof(int),      &r3));
+ #else // GGML_OPENCL_SOA_Q
++            ggml_cl_downgrade_mv(backend_ctx, src0, src1);
+             kernel = backend_ctx->kernel_mul_mv_id_mxfp4_f32;
+ 
+             if (backend_ctx->gpu_family == INTEL) {
+-- 
+2.47.3
+

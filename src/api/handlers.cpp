@@ -505,6 +505,13 @@ json props(const Context& ctx) {
         // out/poisoned/broken") is explained here. "off": no loan configured (the
         // default), "armed": the cache set one up at load, "out": lent right now.
         {"slot_loan", {{"state", ctx.backend->slot_loan_state()}}},
+        // Paths other than the one a weight's type promises, since the process
+        // started: an empty array is "none seen", not "none possible".
+        {"downgrades", [&] {
+             json arr = json::array();
+             for (const auto& d : ctx.backend->downgrades()) arr.push_back({{"key", d.first}, {"count", d.second}});
+             return arr;
+         }()},
         {"mtp", {{"requested", std::string(cfg.llama_mtp > 0 ? "on" : "off")},
                  {"enabled", st.mtp_enabled},
                  // --llama-mtp-policy: the width rule the serving path runs, and
