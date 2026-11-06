@@ -265,6 +265,7 @@ if(ARCINT_TESTS)
     tests/test_config.cpp
     tests/test_verify_walk.cpp
     tests/test_mtp_trace.cpp
+    tests/test_mtp_capture.cpp
     tests/test_draft_policy.cpp
     tests/test_dflash_walk.cpp
     tests/test_spec_state.cpp
@@ -447,6 +448,21 @@ if(ARCINT_TESTS)
            COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_mtp_width_replay.py")
   set_tests_properties(mtp-width-replay PROPERTIES LABELS unit)
+
+  # The MTP head-fit tools (campaign mtp-head-fit, E1): the capture format, the task
+  # split, the round-start simulation, the replay's HTTP flow; with numpy, also eval
+  # (its red case), the linear fit and the GGUF decoders. Device-free.
+  add_test(NAME mtp-fit
+           COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_mtp_fit.py")
+  set_tests_properties(mtp-fit PROPERTIES LABELS unit)
+
+  # tools/coder_mtp_gguf.py (campaign mtp-head-fit, E2): the head-only MTP GGUFs of the
+  # no-training arms; a tensor it cannot place fails. Synthetic files, device-free.
+  add_test(NAME coder-mtp-gguf
+           COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_coder_mtp_gguf.py")
+  set_tests_properties(coder-mtp-gguf PROPERTIES LABELS unit)
 
   # tools/llama_scoreboard.py: what makes a row of the community GPU tables comparable.
   add_test(NAME llama-scoreboard

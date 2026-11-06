@@ -7,6 +7,7 @@
 #include "exec/backend.h"
 #include "exec/tokenize-once.h"
 #include "core/renderer_material.h"
+#include "exec/mtp_capture.h"   // the MTP head-fit capture (off by default, ARCINT_MTP_CAPTURE)
 #include "exec/mtp_trace.h"   // the MTP window trace (off by default, ARCINT_MTP_TRACE)
 #include "exec/slot_loan.h"
 #include "core/admission.h"
@@ -2090,6 +2091,9 @@ private:
 #endif
             size_t common = 0;
             while (common < have.size() && common < n_pre && have[common] == prompt[common]) ++common;
+            // ARCINT_MTP_CAPTURE (exec/mtp_capture.h): every prompt token must decode, or its rows
+            // are missing from the capture; the lane starts empty (the same cut a diverging prompt takes)
+            if (mtp_capture_on()) common = 0;
             if (common < have.size()) {
                 // where the target's recurrent state cannot step back to the
                 // cut, it resumes from its newest checkpoint inside the prefix
