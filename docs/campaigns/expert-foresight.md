@@ -295,7 +295,21 @@ Device-free cells added with the round:
 
 33 files, 3.9 GB, 2026-11-01 to 11-04, Flash-Next: 428,613 accepted steps, 68,621 decode steps, 359,992 verifies (1,303,149 tokens), 1,103,341 DRAFT records (2,820,876 tokens), 359,166 prompt tokens, at least 150 requests. Round 5's curve had 806 decode steps. 11-03 holds almost nothing (4 accept lines), so a one-day subset is not a sample of the whole; 11-01 alone is two thirds of it.
 
-The replay does not scale to that: `step_foresight` holds a 192 KiB array a step and the learned map's features 1.12 MiB (`code`), so the full history would take about 82 GB for one predictor and far more for the learned map's fit. Two runs ended on their memory fence (16 and 32 GiB, the 11-04 subset of about 34,000 steps) and one on its time limit; none produced a row. So the curve over this history is still owed.
+The replay does not scale to that: `step_foresight` holds a 192 KiB array a step and the learned map's features 1.12 MiB (`code`), so the full history would take about 82 GB for one predictor and far more for the learned map's fit. Two runs ended on their memory fence (16 and 32 GiB, the 11-04 subset of about 34,000 steps) and one on its time limit; none produced a row. `--curve-table-only` computes the draft-id table per step and leaves the learned map out.
+
+The curve, 11-04, one day of Flash-Next (`measured-here`, an offline replay; 24,807 held-out decode steps of 50 odd requests, the blend rule's two cells 0.005 and 0.05 at weight 1.0, margin 1.5; 0.005 chosen at every size):
+
+| training requests | training steps | baseline | draft-id table, blended |
+|---:|---:|---:|---:|
+| 1 | 116 | 77.56 % | 77.60 % |
+| 2 | 206 | 77.56 % | 77.61 % |
+| 4 | 444 | 77.56 % | 77.63 % |
+| 8 | 1,483 | 77.56 % | 77.65 % |
+| 16 | 3,565 | 77.56 % | 77.66 % |
+| 32 | 6,951 | 77.56 % | 77.68 % |
+| 51 | 9,641 | 77.56 % | 77.68 % |
+
+**Enough trace for this predictor under this rule:** eighty times the training steps buy 0.08 points, and the last doubling none. The ceiling is +0.12 points, the same size as round 5's +0.14 on 407 steps, so collecting more of the same does not move it. This does not settle foresight: it is one predictor under the blend rule on one day, the learned map did not run, and the record's earlier finding (oracle with the rule off +6.52, blended +1.28) already names the rule as the limit. The lever is the rule or a better predictor, not more data.
 
 ## Stage 0 — the trace, now a production option (2026-10-29, `code`)
 
