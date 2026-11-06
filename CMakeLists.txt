@@ -457,6 +457,13 @@ if(ARCINT_TESTS)
                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_mtp_fit.py")
   set_tests_properties(mtp-fit PROPERTIES LABELS unit)
 
+  # tools/coder_mtp_gguf.py (campaign mtp-head-fit, E2): the head-only MTP GGUFs of the
+  # no-training arms; a tensor it cannot place fails. Synthetic files, device-free.
+  add_test(NAME coder-mtp-gguf
+           COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_coder_mtp_gguf.py")
+  set_tests_properties(coder-mtp-gguf PROPERTIES LABELS unit)
+
   # tools/llama_scoreboard.py: what makes a row of the community GPU tables comparable.
   add_test(NAME llama-scoreboard
            COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
