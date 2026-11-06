@@ -277,6 +277,7 @@ struct GenerationStats {
     // and the emitted-token index the forced closer took (-1: none).
     int    loop_context_closes    = 0;
     int    loop_context_no_closer = 0;
+    int    loop_think_closes      = 0;   // closes forced by the thinking budget
     int    loop_context_token_index = -1;
     // Wall time spent copying the whole model state so a rejected draft can be
     // rolled back. On the stateful path this is the price of speculation.

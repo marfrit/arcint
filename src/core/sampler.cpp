@@ -148,14 +148,15 @@ void Sampler::observe_think(int token, std::string_view piece) { observe_think_(
 
 // feyntalk W3.4: the context guard's budget, at request start. The backend
 // computes n_ctx - prompt_tokens - reserve and hands it over after set_prompt;
-// the sampler knows neither. reserve 0 is the switch off and no budget is
-// stored, so nothing below runs. A budget <= 0 means the prompt already sits
+// the sampler knows neither. reserve 0 and think_budget 0 are the switches off
+// and no budget is stored, so nothing below runs. A budget <= 0 means the prompt already sits
 // inside the reserve: the closer is forced at the first thinking token. The
 // arm is also checked here, so a caller that hands the budget after
 // start_in_think_block() still gets the prompt-inside-reserve rule.
-void Sampler::set_think_ctx_budget(int budget) {
-    if (params_.think_ctx_reserve <= 0) return;
+void Sampler::set_think_ctx_budget(int budget, bool by_think_budget) {
+    if (params_.think_ctx_reserve <= 0 && params_.think_budget <= 0) return;
     ctx_budget_  = budget;
+    ctx_by_think_ = by_think_budget;
     ctx_armed_   = true;
     ctx_pending_ = false;
     ctx_settled_ = false;
@@ -263,7 +264,7 @@ void Sampler::start_in_think_block(bool open) {
     // to set_think_ctx_budget() (called before this, after set_prompt); reserve
     // 0 clears it so a reused sampler cannot carry a stale one. emitted_ is the
     // accepted-stream index the event names, reset per turn.
-    if (params_.think_ctx_reserve <= 0) {
+    if (params_.think_ctx_reserve <= 0 && params_.think_budget <= 0) {
         ctx_budget_ = -1;
         ctx_armed_  = false;
     }
@@ -271,6 +272,7 @@ void Sampler::start_in_think_block(bool open) {
     ctx_settled_        = false;
     ctx_closes_         = 0;
     ctx_no_closer_      = 0;
+    think_closes_       = 0;
     ctx_forced_index_   = -1;
     emitted_            = 0;
     // The closer of a template-opened block: the first pair's close id, or the
@@ -1195,12 +1197,15 @@ int Sampler::sample(float* logits, size_t vocab) {
         if (think_state_ == ThinkState::thinking) {
             const int closer = think_close_id_;
             if (closer >= 0 && static_cast<size_t>(closer) < vocab) {
-                ++ctx_closes_;
+                if (ctx_by_think_) ++think_closes_;
+                else ++ctx_closes_;
                 ctx_forced_index_ = emitted_;   // the index this token takes
-                span_event_("context_guard", "", "", true, ctx_budget_);
+                span_event_(ctx_by_think_ ? "think_budget" : "context_guard", "", "", true, ctx_budget_);
                 loop_forced_closer_ = true;     // not the model's own draw
-                log::info("context-guard", "the context guard reached its budget (%d left); "
-                          "the think-block's closer is forced as the next token", ctx_budget_);
+                log::info(ctx_by_think_ ? "think-budget" : "context-guard",
+                          "the %s reached its budget (%d left); "
+                          "the think-block's closer is forced as the next token",
+                          ctx_by_think_ ? "thinking budget" : "context guard", ctx_budget_);
                 return closer;
             }
             ++ctx_no_closer_;

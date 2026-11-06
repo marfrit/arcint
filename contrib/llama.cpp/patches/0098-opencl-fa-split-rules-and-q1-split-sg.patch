@@ -1,0 +1,100 @@
+From 2a3d97f564d2b277e385a4e0f7b9f9557eebf626 Mon Sep 17 00:00:00 2001
+From: Markus Fritsche <mfritsche@reauktion.de>
+Date: Thu, 5 Nov 2026 14:22:20 +0000
+Subject: [PATCH] 0098-opencl-fa-split-rules-and-q1-split-sg
+
+---
+ ggml/src/ggml-opencl/ggml-opencl.cpp          | 29 ++++++++++++++-----
+ .../ggml-opencl/kernels/flash_attn_f32_f16.cl |  1 +
+ tests/test-backend-ops.cpp                    |  6 ++++
+ 3 files changed, 28 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index cd4ee4a..68424f1 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -23482,23 +23482,31 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+         if (fd_env_max_splits   > 0) { fd_max_splits   = fd_env_max_splits; }
+         if (use_fd_intel) {
+             // the best split grows with n_kv: one sub-group walks a split's keys in
+-            // order, and on the A770 and the B60 (measured-here, decode, 0 to 16,384
++            // order, and on the A770 and the B60 (measured-here, decode, 0 to 32,768
+             // keys) 16 keys a split beat 128 by 7-21 % on short KVs, while f16 K/V
+-            // wanted 512 at 16,384 and quantized K/V stayed near 128 from 4,096 on
++            // wanted 512 at 16,384. Quantized K/V differs by card: the B60 follows
++            // n_kv / 32 up to 512 (Llama 2 at 16,384: 36.52 -> 41.26 t/s; the 27B
++            // +0.5 %), and the A770 wants shorter splits up to 128 (the coder at
++            // 4,096: 49.64 -> 52.20, at 8,192: 48.19 -> 49.88)
+             static const char * kps_env = getenv("GGML_OPENCL_FA_INTEL_KV_PER_SPLIT");
+             static const int    kps_fix = kps_env ? atoi(kps_env) : 0;
+-            fd_kv_per_split = kps_fix > 0 ? kps_fix
+-                            : is_mixed    ? std::min(std::max(n_kv / 16, 16), 512)
+-                                          : std::min(std::max(n_kv / 32, 16), 128);
++            fd_kv_per_split = kps_fix > 0        ? kps_fix
++                            : is_mixed           ? std::min(std::max(n_kv / 16, 16), 512)
++                            : !backend_ctx->dg2  ? std::min(std::max(n_kv / 32, 16), 512)
++                            : n_kv >= 16384      ? 128
++                                                 : std::min(std::max(n_kv / 64, 16), 64);
+             fd_max_splits   = 256;
+         }
+         if (use_fd_gqa) {
+             // the GQA kernel's own split size: a work-group covers a whole KV
+             // head, so it wants longer splits than the per-head kernel (512
+             // against 128: the structural search's best, docs/campaigns/
+-            // kernel-autotune-ga.md); GGML_OPENCL_FA_GQA_KV_PER_SPLIT
++            // kernel-autotune-ga.md). Only a short KV prefers less: a verify on
++            // the 27B behind ~300 tokens takes 56.3 ms at 64 against 57.3 at 512,
++            // equal at 3,300 keys, and 70.2 against 64.0 at 12,400 (measured-here);
++            // GGML_OPENCL_FA_GQA_KV_PER_SPLIT
+             static const char * gkps_env = getenv("GGML_OPENCL_FA_GQA_KV_PER_SPLIT");
+-            fd_kv_per_split = gkps_env && atoi(gkps_env) > 0 ? atoi(gkps_env) : 512;
++            fd_kv_per_split = gkps_env && atoi(gkps_env) > 0 ? atoi(gkps_env) : n_kv < 2048 ? 64 : 512;
+         }
+         int n_splits = (n_kv + fd_kv_per_split - 1) / fd_kv_per_split;
+         if (n_splits < (use_fd_intel ? 1 : FD_MIN_SPLITS)) { n_splits = use_fd_intel ? 1 : FD_MIN_SPLITS; }
+@@ -23616,7 +23624,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+ 
+         // MQ split kernel uses MQ_NSG_SPLIT subgroups and one WG per (kv_head, batch, split)
+         // matches Q1_WG_SIZE * NSG (MQ_GQA=4 -> 256; MQ_GQA=8 -> 192)
+-        const size_t fd_wg = use_fd_mq ? fd_mq_wg : (use_fd_intel ? 16 : 64);
++        // the plain q1_split kernels step Q1_WG_SIZE = FA_SG keys a work-item and size
++        // their local arrays by it, so a work-group is FA_SG items: 32 on Intel. With
++        // 64, keys past the first 32 counted twice and the local arrays overran; the
++        // f16 kernel also reduces over its sub-group, so it pins one of FA_SG. Heads
++        // the Intel kernels do not build reach these: f16 K/V at 40-112, quantized at 64, 96
++        const size_t fd_wg = use_fd_mq ? fd_mq_wg : (use_fd_intel ? 16 : backend_ctx->gpu_family == INTEL ? 32 : 64);
+         const size_t fd_head_dim = use_fd_mq
+             ? (size_t)(n_head_kv * fd_head_sub * n_batch)
+             : (size_t)(n_head     * n_batch);
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_f32_f16.cl b/ggml/src/ggml-opencl/kernels/flash_attn_f32_f16.cl
+index c50f421..a2512c1 100644
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_f32_f16.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_f32_f16.cl
+@@ -2539,6 +2539,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_k_img(
+ 
+ #ifndef FA_MQ_ONLY  // q1_split + merge excluded from the MQ-only (g8) program
+ #ifndef FA_VEC_ONLY
++REQD_FA_SG
+ __kernel void flash_attn_f32_f16_q1_split(
+     const global void * q_void, ulong q_offset,
+     const global void * k_void, ulong k_offset,
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 7bdc75e..90e80af 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12679,6 +12679,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ 
+     // FLASH_ATTN_EXT MMA, swizzled K/V tiles, power-of-two stride: nbatch_K2 = 32, 64, 128, 256.
+     test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 8, {8, 1}, 4096,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    // the plain K-split kernels (2,048 keys or more, heads the Intel split kernels do not build)
++    for (int64_t hs : {64, 96}) {
++        for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
++            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {1, 1}, 2048, 1, true, false, 0, 0, GGML_PREC_F32, t, t));
++        }
++    }
+     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096,  8, true,  true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {2, 1}, 1024,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+-- 
+2.47.3
+

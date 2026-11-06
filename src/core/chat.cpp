@@ -175,6 +175,8 @@ std::optional<std::string> read_sampler(const json& b, SamplerOverrides& s) {
         if (!b["tool_grammar"].is_boolean()) return "tool_grammar must be a boolean";
         s.tool_grammar = b["tool_grammar"].get<bool>();
     }
+    // The thinking budget for this request; 0 turns the operator's off for it.
+    if (auto e = integer("think_budget", s.think_budget)) return e;
     // loop-guard: the request's own rung, overriding the operator's flag for
     // this request only. Non-standard, so it is named; absent keeps the flag.
     if (b.contains("loop_guard") && !b["loop_guard"].is_null()) {

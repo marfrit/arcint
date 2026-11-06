@@ -2467,8 +2467,11 @@ private:
     // into another lane's context.
     static void prepare_think_ctx(const SamplerParams& sp, int cap, int prompt_tokens,
                                   Sampler& sampler) {
-        if (sp.think_ctx_reserve <= 0) return;
-        sampler.set_think_ctx_budget(think_ctx_budget(cap, prompt_tokens, sp.think_ctx_reserve));
+        if (sp.think_ctx_reserve <= 0 && sp.think_budget <= 0) return;
+        const int budget = think_turn_budget(cap, prompt_tokens, sp.think_ctx_reserve, sp.think_budget);
+        sampler.set_think_ctx_budget(budget, sp.think_budget > 0 && budget == sp.think_budget
+                                                 && (sp.think_ctx_reserve <= 0
+                                                     || sp.think_budget < think_ctx_budget(cap, prompt_tokens, sp.think_ctx_reserve)));
     }
 
     void prepare_think_mask(const GenerationInput& in, Sampler& sampler) const {
@@ -2479,7 +2482,8 @@ private:
         // feyntalk W3.4: the context guard needs the block's state and its own
         // closer id, the same pairing the slap uses.
         if (!in.sampler.think_eog_mask && !in.sampler.tool_grammar && !in.sampler.answer_configured()
-            && in.sampler.loop_guard == LoopGuardMode::Off && in.sampler.think_ctx_reserve <= 0)
+            && in.sampler.loop_guard == LoopGuardMode::Off && in.sampler.think_ctx_reserve <= 0
+            && in.sampler.think_budget <= 0)
             return;
         ThinkBlockIds ids = in.think_tags_extended ? think_ids_ext_ : think_ids_qwen_;
         ids.eog = eog_ids_;
@@ -2540,6 +2544,7 @@ private:
         stats.loop_door_eog_masked = c.door_eog_masked;
         stats.loop_context_closes    = c.ctx_closes;
         stats.loop_context_no_closer = c.ctx_no_closer;
+        stats.loop_think_closes      = c.think_closes;
         stats.loop_context_token_index = c.ctx_forced_index;
         if (c.detections || c.nudges || c.slaps || c.aborts || c.self_closes || c.door_masked
             || c.door_eog_masked)

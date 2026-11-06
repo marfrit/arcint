@@ -108,13 +108,18 @@ public:
     // backend computes n_ctx - prompt_tokens - reserve (the sampler knows
     // neither) and hands it here after set_prompt(), BEFORE
     // start_in_think_block(), which is what arms a prompt already inside the
-    // reserve. It is a no-op unless params.think_ctx_reserve > 0: reserve 0 is
+    // reserve. It is a no-op unless params.think_ctx_reserve > 0 or
+    // params.think_budget > 0: both 0 is
     // the switch off, byte-identical to before. Counted down per emitted token
     // while the block is open, in observe() (the verify walk's accepted drafts
     // are the emitted tokens it observes, so each counts once); at 0 the
     // think-block's closer id is forced as the next sampled token, through the
     // loop guard's own forced-closer seam.
-    void set_think_ctx_budget(int budget);
+    // The thinking budget (params.think_budget) arrives here too, the tighter of
+    // the two limits (think_turn_budget).
+    // by_think_budget says which limit won, so a budget's close is not reported
+    // as a context guard's.
+    void set_think_ctx_budget(int budget, bool by_think_budget = false);
     // Test hook: tokens still allowed inside the block, -1 when off. No
     // response key (the Responses event's numbers come from the API's own
     // prompt/completion counts and n_ctx).
@@ -162,12 +167,13 @@ public:
         // index space as arcint:token, so the event can name it.
         int ctx_closes      = 0;
         int ctx_no_closer    = 0;
+        int think_closes     = 0;
         int ctx_forced_index = -1;
     };
     LoopGuardCounts loop_guard_counts() const {
         return {loop_detections_, loop_nudges_, loop_slaps_, loop_aborts_,
                 loop_self_closes_, loop_door_masked_, loop_door_eog_masked_,
-                ctx_closes_, ctx_no_closer_, ctx_forced_index_};
+                ctx_closes_, ctx_no_closer_, think_closes_, ctx_forced_index_};
     }
     // The answer phase kept looping after a slap: the caller ends the turn on
     // FinishReason::Loop instead of emitting another token. Latching: once set
@@ -210,7 +216,8 @@ private:
     int    draw(float* logits, size_t vocab);
     bool   tracks_think() const
         { return params_.think_eog_mask || params_.tool_grammar || params_.answer_configured()
-                 || params_.loop_guard != LoopGuardMode::Off || params_.think_ctx_reserve > 0; }
+                 || params_.loop_guard != LoopGuardMode::Off || params_.think_ctx_reserve > 0
+                 || params_.think_budget > 0; }
     // llava: the answer row applies only in a thinking turn, after a block
     // actually opened and closed. A non-thinking turn, or one whose block
     // never opened, keeps the thinking row.
@@ -427,6 +434,8 @@ private:
     bool ctx_settled_        = false;
     int  ctx_closes_         = 0;
     int  ctx_no_closer_      = 0;
+    int  think_closes_       = 0;
+    bool ctx_by_think_       = false;  // the thinking budget is the limit counted
     int  ctx_forced_index_   = -1;
     int  emitted_            = 0;
     mutable bool ctx_warned_ = false;
