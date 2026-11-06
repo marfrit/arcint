@@ -355,11 +355,12 @@ struct SamplerOverrides {
 // normal row. Unset nothink fields fall back to the normal row.
 SamplerParams sampler_from_defaults(const SamplerDefaults& d, bool nothink = false);
 
-// The model card's layer: the GGUF's general.sampling.temp, .top_p and .top_k,
-// as text (`lookup` returns nullopt for a key the file lacks). No key leaves `d`
-// alone. Any key makes the row the card's whole row: temperature and top_p as
-// given or unchanged if only the other is missing, top_k as given or 0 (the card
-// sets no limit), and no penalties, since a card that names none asks for none.
+// The model card's layer: the GGUF's general.sampling.temp, .top_p, .top_k, .min_p
+// and .penalty_repeat, as text (`lookup` returns nullopt for a key the file lacks).
+// No key leaves `d` alone. Any key makes the row the card's whole row: temperature
+// and top_p as given or unchanged if the card omits them, top_k as given or 0 (the
+// card sets no limit), min_p as given or 0, and a repetition penalty as given or
+// none, since a card that names none asks for none.
 // Returns an error for a value that does not parse or is out of range, with `d`
 // untouched. The order is request > operator flags > this > the provisional row.
 std::optional<std::string> sampler_defaults_apply_card(

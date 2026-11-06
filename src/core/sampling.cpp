@@ -1,5 +1,6 @@
 #include "core/sampling.h"
 
+#include <cmath>
 #include <cstdlib>
 
 #include "util/log.h"
@@ -235,17 +236,20 @@ std::optional<std::string> sampler_defaults_apply_card(
         if (!v) return std::nullopt;
         char* end = nullptr;
         out = std::strtod(v->c_str(), &end);
-        if (v->empty() || end == nullptr || *end != '\0')
+        if (v->empty() || end == nullptr || *end != '\0' || !std::isfinite(out))
             return std::string("the GGUF's ") + key + " is not a number: '" + *v + "'";
         has = true;
         return std::nullopt;
     };
-    double temp = 0.0, top_p = 0.0, top_k = 0.0;
-    bool has_temp = false, has_top_p = false, has_top_k = false;
+    double temp = 0.0, top_p = 0.0, top_k = 0.0, min_p = 0.0, repeat = 0.0;
+    bool has_temp = false, has_top_p = false, has_top_k = false, has_min_p = false, has_repeat = false;
     if (auto e = number("general.sampling.temp", temp, has_temp)) return e;
     if (auto e = number("general.sampling.top_p", top_p, has_top_p)) return e;
     if (auto e = number("general.sampling.top_k", top_k, has_top_k)) return e;
-    if (!has_temp && !has_top_p && !has_top_k) return std::nullopt;
+    if (auto e = number("general.sampling.min_p", min_p, has_min_p)) return e;
+    if (auto e = number("general.sampling.penalty_repeat", repeat, has_repeat)) return e;
+    if (!has_temp && !has_top_p && !has_top_k && !has_min_p && !has_repeat) return std::nullopt;
+    if (has_top_k && top_k != std::floor(top_k)) return std::string("the GGUF's general.sampling.top_k is not a whole number");
     SamplerDefaults row = d;
     row.top_k              = 0;
     row.repetition_penalty = 1.0f;
@@ -255,6 +259,8 @@ std::optional<std::string> sampler_defaults_apply_card(
     if (has_temp) o.temperature = static_cast<float>(temp);
     if (has_top_p) o.top_p = static_cast<float>(top_p);
     if (has_top_k) o.top_k = static_cast<int>(top_k);
+    if (has_min_p) o.min_p = static_cast<float>(min_p);
+    if (has_repeat) o.repetition_penalty = static_cast<float>(repeat);
     if (auto e = sampler_defaults_apply(row, o)) return std::string("the GGUF's general.sampling row: ") + *e;
     row.provenance = "card";
     d = row;

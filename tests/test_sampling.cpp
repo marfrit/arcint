@@ -337,3 +337,20 @@ TEST(card_sampling_the_operator_wins_over_the_card) {
     CHECK_NEAR(d.temperature, 0.6, 1e-6);
     CHECK_EQ(d.top_k, 64);
 }
+
+TEST(card_sampling_a_card_may_name_min_p_and_a_penalty) {
+    SamplerDefaults d;
+    CHECK(!sampler_defaults_apply_card(d, card({{"general.sampling.temp", "0.900000"},
+                                                {"general.sampling.min_p", "0.050000"},
+                                                {"general.sampling.penalty_repeat", "1.100000"}})));
+    CHECK_NEAR(d.min_p, 0.05, 1e-6);
+    CHECK_NEAR(d.repetition_penalty, 1.1, 1e-6);
+    CHECK_EQ(d.provenance, std::string("card"));
+}
+
+TEST(card_sampling_nan_and_a_fractional_top_k_are_errors) {
+    SamplerDefaults d;
+    CHECK(sampler_defaults_apply_card(d, card({{"general.sampling.temp", "nan"}})).has_value());
+    CHECK(sampler_defaults_apply_card(d, card({{"general.sampling.top_k", "20.5"}})).has_value());
+    CHECK_EQ(d.provenance, std::string("provisional"));
+}

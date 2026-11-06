@@ -30,7 +30,9 @@ ExecStart=/usr/bin/arcint \
     --n-ctx 98304 \
     --llama-mtp 4 \
     --llama-kv q8_0:q4_0 \
-    --queue-timeout 30
+    --queue-timeout 30 \
+    --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 0 --repetition-penalty 1.0 \
+    --nothink-temp 0.7 --nothink-top-p 0.8 --nothink-top-k 20
 Restart=on-failure
 RestartSec=30
 TimeoutStartSec=20min
