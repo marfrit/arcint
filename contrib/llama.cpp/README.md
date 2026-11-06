@@ -6551,11 +6551,11 @@ A path other than the one a weight's type promises now says so. The coder's Q8_0
 | Where | Key |
 |---|---|
 | an optional program not built, or not fitting a work-group (17 sites) | `path=fallback reason=not-built\|no-fit what=<kernels>` |
-| `supports_op` sending a K-quant or IQ product to the CPU | `op=MUL_MAT\|MUL_MAT_ID type= k= path=cpu reason=shape` |
+| `supports_op` sending a K-quant or IQ product to the CPU | `op=MUL_MAT\|MUL_MAT_ID type= k= path=cpu reason=shape\|kernels-missing` (its count is the scheduler's probes, not executions) |
 | ggml's generic tiled GEMM (Intel) | `op=MUL_MAT type= k= cols=1-4\|5-15\|16+ path=generic reason=no-fast-path` |
 | the per-column matvec at 16 or more columns (Intel): below 32 columns the generic switch breaks out to it | `op=MUL_MAT type= k= cols=16+ path=matvec reason=no-fast-path` |
 
-A matvec below 16 columns is a decode step's normal path and says nothing. The list is not complete: expert GEMM selection and flash attention's shape limits are not covered yet.
+A matvec below 16 columns is a decode step's normal path and says nothing; neither does the MUL_MAT_ID matvec, whose columns are experts x tokens. The list is not complete: expert GEMM selection and flash attention's shape limits are not covered yet.
 
 Served, deployed flags, 12 short answers and prompts of 396, 621, 1,821, 6,021 and 19,521 tokens (`measured-here`): the coder none, the agent none, Flash-Next 8 keys, BF16 at 5-15 columns (K 10240, 2560, 320) and F32 (K 128, 2560). Their cost is not priced.
 
