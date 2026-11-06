@@ -355,6 +355,9 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
   (3.5), the overflow invariant (3.8), the expert cache (3.9), lanes and two
   cards (3.10), serving (4), test gates (5), state of play (7), open items (8).
 - docs/llama-engine.md: the engine's record, mechanism by mechanism.
+- docs/concepts.md: the concept catalogue by mechanism (effect with card and model,
+  code location by file and symbol, switch, source of the idea, and what was tried
+  and not adopted).
 - contrib/llama.cpp/: the pin, the patch series and its README.
 - docs/switches.md: every environment switch, classified.
 - docs/campaigns/: one document per open defect or lever, plus research-*.md

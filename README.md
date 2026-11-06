@@ -48,6 +48,9 @@ and [FreeToken](https://github.com/FlashML-org/FreeToken)
 [llm.txt](llm.txt) the machine-readable summary;
 [docs/llama-engine.md](docs/llama-engine.md) the engine's record, mechanism by
 mechanism.
+[docs/concepts.md](docs/concepts.md) the concept catalogue: the engine ideas for Intel
+Arc inference by mechanism, with the measured effect, the code location and what
+was tried and not adopted.
 
 **History.** Until 0.7.12 arcint also had an OpenVINO engine, on a patched
 OpenVINO runtime. It began there partly because its first design wrote SYCL off
