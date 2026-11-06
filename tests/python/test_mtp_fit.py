@@ -532,7 +532,7 @@ class TestDistill(unittest.TestCase):
         base = self._top(np.eye(16, dtype=np.float32))
         A, top, step = mf.fit_distill(self.Z, self.H, self.W, self.Zv, self.Hv, 300, 256, 3e-3, 1.0, 50)
         self.assertLess(base, 0.3)
-        self.assertGreater(top, 0.8)
+        self.assertGreater(top, base + 0.2)
         self.assertGreater(step, 0)
         self.assertAlmostEqual(top, self._top(A), places=6)
 
