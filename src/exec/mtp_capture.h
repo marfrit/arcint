@@ -6,8 +6,8 @@
 // `tools/mtp_fit.py` can score and refit the head offline.
 //
 // ARCINT_MTP_CAPTURE=<base> turns it on. Unset or empty is OFF and costs one
-// getenv at the drafter's construction and a pointer test a decode; nothing
-// is opened and the serving path is unchanged. On, it needs the draft
+// getenv at the drafter's construction, one a request in the backend and a
+// pointer test a decode; nothing is opened and the serving path is unchanged. On, it needs the draft
 // vocabulary (--llama-mtp-vocab: the MTP context then returns a row for every
 // entry, which is what makes the head's row available at every position; the
 // drafter refuses to start without it), it holds the 0067 skip off so both
