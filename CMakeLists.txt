@@ -80,6 +80,7 @@ add_library(arcint_core STATIC
   src/util/sha256.cpp
   src/util/utf8.cpp
   src/util/text.cpp
+  src/core/admission.cpp
   src/core/reasoning.cpp
   src/core/renderer_material.cpp
   src/core/sampler.cpp
@@ -276,6 +277,8 @@ if(ARCINT_TESTS)
     tests/test_context_guard.cpp
     tests/test_lanes.cpp
     tests/test_reasoning.cpp
+    tests/test_admission.cpp
+    tests/test_gemma4.cpp
     tests/test_markers.cpp
     tests/test_stream_utf8.cpp
     tests/test_stop_think_ids.cpp
@@ -315,6 +318,13 @@ if(ARCINT_TESTS)
     add_executable(arcint-tool-grammar-probe tools/tool_grammar_probe.cpp)
     target_link_libraries(arcint-tool-grammar-probe PRIVATE arcint_core)
     target_compile_options(arcint-tool-grammar-probe PRIVATE -Wall -Wextra -Wpedantic)
+    # Renders a chat template read from a file with the engine's own minja setup,
+    # over a matrix of tools / thinking / exchange shapes (tools/template_probe.cpp).
+    # Not a ctest case: it needs a template taken from a GGUF, which is never
+    # committed.
+    add_executable(arcint-template-probe tools/template_probe.cpp)
+    target_link_libraries(arcint-template-probe PRIVATE arcint_core)
+    target_compile_options(arcint-template-probe PRIVATE -Wall -Wextra -Wpedantic)
     # audit 15's number: a vocab-only GGUF, the old two-call encode against the
     # one-pass encode, on the host or the card host (tools/tokenize_cost.cpp,
     # the campaign's command). Not a ctest case: it needs the GGUF.

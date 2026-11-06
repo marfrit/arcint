@@ -12,6 +12,7 @@
 
 #include <nlohmann/json.hpp>
 #include "core/chat.h"
+#include "core/dialect.h"
 #include "core/sampling.h"
 
 // The seam between "arcint owns the serving" and "llama.cpp owns the math"
@@ -150,7 +151,7 @@ struct ModelStatus {
     // for the Mistral Small 24B family (Cydonia 24B, Magistral tunes). The
     // Qwens keep the Qwen tag alone, so an answer of theirs that merely
     // starts with such text stays content.
-    bool think_tags_extended = false;
+    ChatDialect dialect;
 
     SamplerDefaults sampler_defaults;
 };
@@ -237,13 +238,13 @@ struct GenerationInput {
 
     // clean-turns: the rendered prompt ended inside a think block, and whether
     // this artifact answers to the wider tag family. The API knows both from the
-    // template (Prepared::think_open / think_tags_extended); the backend needs
+    // template (Prepared::think_open / dialect); the backend needs
     // them because the mask must engage before the FIRST sample, not after the
     // first emitted piece. SamplerParams::thinking_turn is the request's
     // enable_thinking after the operator default, so llava's answer row never
     // switches in a non-thinking turn.
     bool think_open          = false;
-    bool think_tags_extended = false;
+    ChatDialect dialect;
 
     // The client-liveness probe for this request: false once the peer's
     // connection is gone. Empty when nothing is watched (a direct call to the
@@ -407,8 +408,8 @@ public:
     // reasoning split and the sampler's tracker decide those roles by id; a
     // pair with -1 keeps the text behaviour. Filled once at load, not per
     // request.
-    virtual ThinkBlockIds think_block_ids(bool extended_tags) const {
-        (void)extended_tags;
+    virtual ThinkBlockIds think_block_ids(ChatDialect dialect) const {
+        (void)dialect;
         return {};
     }
 

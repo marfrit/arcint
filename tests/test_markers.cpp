@@ -38,6 +38,11 @@ std::vector<Marker> markers() {
         {"angle think closer", "</" + std::string("think") + "ing" + ">"},
         {"square think opener", "[" + std::string("THINK") + "]"},
         {"square think closer", "[" + std::string("/THINK") + "]"},
+        {"gemma thought opener", "<" + std::string("|chan") + "nel>" + "thought"},
+        {"gemma thought closer", "<" + std::string("chan") + "nel|>"},
+        {"gemma tool opener", "<" + std::string("|tool") + "_call>"},
+        {"gemma tool closer", "<" + std::string("tool") + "_call|>"},
+        {"gemma string delimiter", "<" + std::string("|\"") + "|>"},
         {"turn start", "<" + std::string("|im_") + "start" + "|" + ">"},
         {"turn end", "<" + std::string("|im_") + "end" + "|" + ">"},
     };

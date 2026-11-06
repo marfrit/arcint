@@ -14,6 +14,7 @@
 
 #include "config.h"
 #include "core/chat.h"
+#include "core/dialect.h"
 #include "exec/backend.h"
 
 namespace lgc::api {
@@ -172,11 +173,12 @@ std::string decode_suffix_for(const GenerationStats& stats);
 // Whether a rendered prompt ends inside a think block: it ends with one tag
 // family's opener and the newline the templates put after it. The chat path
 // and /v1/completions ask this one function, built on the shared tag table, so
-// they cannot disagree about the start state. With `extended_tags` every
+// they cannot disagree about the start state. Under the Extended dialect every
 // family's opener is checked -- a template that opens with a wider family's
-// tag ends inside the block the same way; with the default family only the
-// Qwen pair is checked, exactly as the chat path always did.
-bool prompt_ends_inside_think_block(std::string_view prompt, bool extended_tags);
+// tag ends inside the block the same way; with the default dialect only the
+// Qwen pair is checked, exactly as the chat path always did; Gemma 4 checks its
+// own channel opener, which carries the newline itself.
+bool prompt_ends_inside_think_block(std::string_view prompt, ChatDialect dialect);
 
 // loop-guard: the per-request counters as the response's `loop_guard` object.
 // Exposed so the stats-to-JSON wiring is unit-testable without a card. A plain
@@ -236,7 +238,7 @@ struct PreparedChat {
     ToolSchemas     schemas;
     bool            parse_tool_calls = false;
     bool            think_open       = false;  // the prompt ended inside a think block
-    bool            think_tags_extended = false;  // also the angle- and square-bracket think tags (ModelStatus)
+    ChatDialect     dialect;                     // the loaded model's think tags and tool-call form (ModelStatus)
     ThinkBlockIds   think_ids;                   // the artifact's per-pair tag ids
     std::string     id;
     // X-Request-Id of the request that prepared this: the id every log line of

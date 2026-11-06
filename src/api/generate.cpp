@@ -197,7 +197,7 @@ int reasoning_token_count(const PreparedChat& prep,
                           const std::vector<std::pair<std::string, int>>& pieces,
                           bool has_tag_ids) {
     if (!has_tag_ids) return 0;
-    ReasoningStreamer streamer(prep.think_open, prep.think_tags_extended,
+    ReasoningStreamer streamer(prep.think_open, prep.dialect,
                                prep.think_ids.open_close_ids);
     int n = 0;
     for (const auto& [piece, id] : pieces) {
@@ -223,18 +223,18 @@ void finish_chat_generation(const PreparedChat& prep,
     for (const auto& [oid, cid] : prep.think_ids.open_close_ids)
         if (oid >= 0 || cid >= 0) has_tag_ids = true;
     const ReasoningSplit split = has_tag_ids
-        ? split_reasoning_tokens(pieces, prep.think_open, prep.think_tags_extended,
+        ? split_reasoning_tokens(pieces, prep.think_open, prep.dialect,
                                  prep.think_ids.open_close_ids)
-        : split_reasoning(raw, prep.think_open, prep.think_tags_extended);
+        : split_reasoning(raw, prep.think_open, prep.dialect);
     out.reasoning        = split.reasoning;
     out.reasoning_closed = split.closed;
     out.content          = split.content;
     out.reasoning_tokens = reasoning_token_count(prep, pieces, has_tag_ids);
     if (prep.parse_tool_calls) {
-        ToolCallParse parsed = parse_qwen_tool_calls(out.content, &prep.schemas);
+        ToolCallParse parsed = parse_tool_calls(out.content, prep.dialect, &prep.schemas);
         if (parsed.truncated) {
             log::warn("tools", "unterminated %s block; returned as raw content",
-                      std::string(tool_call_tags().open).c_str());
+                      std::string(tool_call_open(prep.dialect)).c_str());
         }
         out.content = std::move(parsed.content);
         out.calls   = std::move(parsed.calls);

@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "core/markers.h"
 #include "util/log.h"
 #include "util/text.h"
 
@@ -137,7 +138,178 @@ bool parse_json_body(std::string_view body, ToolCall& out) {
     return true;
 }
 
+// ---- Gemma 4's call form ---------------------------------------------------
+//   <open>call:NAME{key:<str>value<str>,n:1,o:{a:true},l:[1,2]}<close>
+// A recursive-descent reader over the text between the markers.
+
+constexpr int kMaxDepth = 32;
+
+struct Cursor {
+    std::string_view s;
+    size_t           i = 0;
+    bool done() const { return i >= s.size(); }
+    void skip_ws() {
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\n' || s[i] == '\t' || s[i] == '\r')) ++i;
+    }
+    bool eat(std::string_view tok) {
+        if (s.substr(i, tok.size()) != tok) return false;
+        i += tok.size();
+        return true;
+    }
+};
+
+bool read_value(Cursor& c, json& out, int depth, const std::string* type_hint);
+
+// A bare literal: runs to the next separator at this level.
+json bare_value(std::string_view tok, const std::string* type_hint) {
+    tok = text::trim(tok);
+    const std::string raw(tok);
+    if (type_hint != nullptr && *type_hint == "string") return raw;
+    if (tok == "true") return true;
+    if (tok == "false") return false;
+    if (tok == "null") return nullptr;
+    try {
+        json parsed = json::parse(raw);
+        if (parsed.is_number()) return parsed;
+    } catch (const json::exception&) {
+    }
+    return raw;
+}
+
+bool read_key(Cursor& c, std::string& key) {
+    c.skip_ws();
+    if (c.eat(markers::kGemmaStrDelim)) {
+        const size_t end = c.s.find(markers::kGemmaStrDelim, c.i);
+        if (end == std::string_view::npos) return false;
+        key = std::string(c.s.substr(c.i, end - c.i));
+        c.i = end + markers::kGemmaStrDelim.size();
+        c.skip_ws();
+        return c.eat(":") && !key.empty();
+    }
+    const size_t colon = c.s.find(':', c.i);
+    if (colon == std::string_view::npos) return false;
+    key = std::string(text::trim(c.s.substr(c.i, colon - c.i)));
+    c.i = colon + 1;
+    return !key.empty() && key.find_first_of("{}[],") == std::string::npos;
+}
+
+bool read_object(Cursor& c, json& out, int depth, const ParamTypes* types) {
+    if (depth > kMaxDepth || !c.eat("{")) return false;
+    out = json::object();
+    c.skip_ws();
+    if (c.eat("}")) return true;
+    for (;;) {
+        std::string key;
+        if (!read_key(c, key)) return false;
+        const std::string* hint = nullptr;
+        if (types != nullptr) {
+            auto it = types->find(key);
+            if (it != types->end()) hint = &it->second;
+        }
+        json v;
+        if (!read_value(c, v, depth + 1, hint)) return false;
+        out[key] = std::move(v);
+        c.skip_ws();
+        if (c.eat(",")) continue;
+        return c.eat("}");
+    }
+}
+
+bool read_array(Cursor& c, json& out, int depth) {
+    if (depth > kMaxDepth || !c.eat("[")) return false;
+    out = json::array();
+    c.skip_ws();
+    if (c.eat("]")) return true;
+    for (;;) {
+        json v;
+        if (!read_value(c, v, depth + 1, nullptr)) return false;
+        out.push_back(std::move(v));
+        c.skip_ws();
+        if (c.eat(",")) continue;
+        return c.eat("]");
+    }
+}
+
+bool read_value(Cursor& c, json& out, int depth, const std::string* type_hint) {
+    c.skip_ws();
+    if (c.done()) return false;
+    if (c.eat(markers::kGemmaStrDelim)) {
+        const size_t end = c.s.find(markers::kGemmaStrDelim, c.i);
+        if (end == std::string_view::npos) return false;
+        out = std::string(c.s.substr(c.i, end - c.i));
+        c.i = end + markers::kGemmaStrDelim.size();
+        return true;
+    }
+    if (c.s[c.i] == '{') return read_object(c, out, depth, nullptr);
+    if (c.s[c.i] == '[') return read_array(c, out, depth);
+    const size_t start = c.i;
+    while (c.i < c.s.size() && c.s[c.i] != ',' && c.s[c.i] != '}' && c.s[c.i] != ']') ++c.i;
+    if (c.i == start) return false;
+    out = bare_value(c.s.substr(start, c.i - start), type_hint);
+    return true;
+}
+
+// The text between the markers: call:NAME{...}
+bool parse_gemma_body(std::string_view body, const ToolSchemas* schemas, ToolCall& out) {
+    Cursor c{text::trim(body), 0};
+    if (!c.eat("call:")) return false;
+    const size_t brace = c.s.find('{', c.i);
+    if (brace == std::string_view::npos) return false;
+    out.name = std::string(text::trim(c.s.substr(c.i, brace - c.i)));
+    if (out.name.empty()) return false;
+    c.i = brace;
+    const ParamTypes* types = nullptr;
+    if (schemas != nullptr) {
+        auto it = schemas->find(out.name);
+        if (it != schemas->end()) types = &it->second;
+    }
+    json args;
+    if (!read_object(c, args, 0, types)) return false;
+    c.skip_ws();
+    if (!c.done()) return false;   // text after the closing brace: not a call
+    out.arguments = args.dump();
+    return true;
+}
+
+ToolCallParse parse_gemma_tool_calls(std::string_view text, const ToolSchemas* schemas) {
+    ToolCallParse result;
+    const std::string_view open_m  = markers::kGemmaToolOpen;
+    const std::string_view close_m = markers::kGemmaToolClose;
+    size_t cursor = 0;
+    while (cursor <= text.size()) {
+        const size_t open = text.find(open_m, cursor);
+        if (open == std::string_view::npos) {
+            result.content.append(text.substr(cursor));
+            break;
+        }
+        result.content.append(text.substr(cursor, open - cursor));
+        const size_t body_start = open + open_m.size();
+        const size_t close      = text.find(close_m, body_start);
+        if (close == std::string_view::npos) {
+            result.truncated = true;
+            result.content.append(text.substr(open));
+            break;
+        }
+        ToolCall call;
+        call.id = log::format("call_%zu", result.calls.size());
+        if (parse_gemma_body(text.substr(body_start, close - body_start), schemas, call)) {
+            result.calls.push_back(std::move(call));
+        } else {
+            result.content.append(text.substr(open, close + close_m.size() - open));
+        }
+        cursor = close + close_m.size();
+    }
+    return result;
+}
+
 }  // namespace
+
+std::string_view tool_call_open(ChatDialect dialect) {
+    return dialect.gemma4() ? markers::kGemmaToolOpen : kOpen;
+}
+std::string_view tool_call_close(ChatDialect dialect) {
+    return dialect.gemma4() ? markers::kGemmaToolClose : kClose;
+}
 
 const ToolCallTags& tool_call_tags() {
     static const ToolCallTags t{kOpen, kClose, kFnOpen, kFnClose, kParamOpen, kParamEnd};
@@ -190,6 +362,10 @@ ToolCallParse parse_qwen_tool_calls(std::string_view text, const ToolSchemas* sc
     }
 
     return result;
+}
+
+ToolCallParse parse_tool_calls(std::string_view text, ChatDialect dialect, const ToolSchemas* schemas) {
+    return dialect.gemma4() ? parse_gemma_tool_calls(text, schemas) : parse_qwen_tool_calls(text, schemas);
 }
 
 }  // namespace lgc

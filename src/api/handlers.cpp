@@ -32,11 +32,12 @@ double decode_other_seconds(const GenerationStats& stats) {
            stats.draft_verify_seconds - stats.draft_propose_seconds;
 }
 
-bool prompt_ends_inside_think_block(std::string_view prompt, bool extended_tags) {
+bool prompt_ends_inside_think_block(std::string_view prompt, ChatDialect dialect) {
     // Built on think_tag_pairs(), the one table the split and the sampler's mask
-    // read, so no marker is written out here.
-    for (const auto& [open, close] : think_tag_pairs(extended_tags)) {
-        if (prompt.ends_with(open + "\n")) return true;
+    // read, so no marker is written out here. An opener that already ends in a
+    // newline (Gemma 4's) is the prompt's end as it stands.
+    for (const auto& [open, close] : think_tag_pairs(dialect)) {
+        if (open.ends_with('\n') ? prompt.ends_with(open) : prompt.ends_with(open + "\n")) return true;
     }
     return false;
 }
@@ -916,15 +917,15 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
     }
     // The template decides whether the answer starts inside a think block; the
     // split of reasoning from content below follows that, not a guess.
-    prep.think_tags_extended = ctx.backend->status().think_tags_extended;
-    prep.think_open = prompt_ends_inside_think_block(prompt, prep.think_tags_extended);
+    prep.dialect = ctx.backend->status().dialect;
+    prep.think_open = prompt_ends_inside_think_block(prompt, prep.dialect);
     // The split, like the backend's mask, decides the block by token id where
     // the artifact's vocabulary spells a tag as one special token.
-    prep.think_ids = ctx.backend->think_block_ids(prep.think_tags_extended);
+    prep.think_ids = ctx.backend->think_block_ids(prep.dialect);
     // The backend has to know the same thing: its mask engages before the first
     // sample, where the API's reasoning split has not seen a token yet.
     prep.input.think_open          = prep.think_open;
-    prep.input.think_tags_extended = prep.think_tags_extended;
+    prep.input.dialect = prep.dialect;
     // The rendered prompt is the one thing that decides what the model saw.
     // When an answer differs from a reference run this is the first question,
     // and reconstructing it after the fact is guesswork (§3.7).
@@ -986,9 +987,9 @@ std::optional<HttpResult> prepare_completion(const Context& ctx, const json& bod
     // masks engage before the first sample and a loop in the reasoning is
     // watched. Before this the completions path always started undecided, so a
     // prompt the template had left open was never watched.
-    prep.input.think_tags_extended = ctx.backend->status().think_tags_extended;
+    prep.input.dialect = ctx.backend->status().dialect;
     prep.input.think_open          = prompt_ends_inside_think_block(
-        prep.req.prompt, ctx.backend->status().think_tags_extended);
+        prep.req.prompt, ctx.backend->status().dialect);
 
     prep.id      = next_id("cmpl");
     prep.created = now_seconds();
@@ -1251,11 +1252,11 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     std::string         raw;
     size_t              streamed = 0;  // bytes of tool-free content already sent
     bool                gone     = false;
-    static const std::string kToolOpen(tool_call_tags().open);
+    const std::string kToolOpen(tool_call_open(prep.dialect));
     // Reasoning goes out as reasoning_content deltas until the think block
     // closes; from there `content` accumulates the answer and the tool-call
     // logic below sees only that.
-    ReasoningStreamer   reasoning(prep.think_open, prep.think_tags_extended, prep.think_ids.open_close_ids);
+    ReasoningStreamer   reasoning(prep.think_open, prep.dialect, prep.think_ids.open_close_ids);
     std::string         content;       // the answer part of the output so far
     // Reasoning has its own hold-back stream: a multi-byte code point must not
     // be split across two SSE chunks (DESIGN §3.7), and reasoning and content
@@ -1375,10 +1376,10 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
 
     std::vector<ToolCall> calls;
     if (prep.parse_tool_calls) {
-        ToolCallParse parsed = parse_qwen_tool_calls(content, &prep.schemas);
+        ToolCallParse parsed = parse_tool_calls(content, prep.dialect, &prep.schemas);
         if (parsed.truncated) {
             log::warn("tools", "unterminated %s block; returned as raw content%s",
-                      std::string(tool_call_tags().open).c_str(),
+                      std::string(tool_call_open(prep.dialect)).c_str(),
                       rid_suffix(prep.request_id).c_str());
         }
         calls = std::move(parsed.calls);

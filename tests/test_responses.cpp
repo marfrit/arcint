@@ -753,7 +753,7 @@ public:
     std::string        render_chat(const ChatRequest& req) const override {
         return render_chatml_stub(req);   // the stub's own template path
     }
-    ThinkBlockIds think_block_ids(bool) const override { return ids; }
+    ThinkBlockIds think_block_ids(ChatDialect) const override { return ids; }
 
     FinishReason generate(const GenerationInput& in, int, const TokenCallback& on_piece,
                           GenerationStats& stats) override {
