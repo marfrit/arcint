@@ -102,7 +102,7 @@ six-answer mean is the comparison.
   -5.5 %, 5 is -8.4 % (acceptance 73.5 / 66.6 / 60.3 / 54.8 % for 2 / 3 / 4 / 5). The best width per answer
   is 2 for three prose answers and 3 for the code and two others; an oracle choosing the best width per
   answer would reach 35.33 t/s, +2.5 % over width 3. A real policy collects part of that ceiling, so the
-  prize is ~1-2 % (Strata's adaptive width measured +2.0-2.1 % geomean, `paper`).
+  prize is ~1-2 % (Strata's cost-aware width measured +4.7 % on one GB10 in its first run and 0.996x and 1.02x in its own later check, which did not reproduce it; Infernix's adaptive MTP +2.0-2.1 % geomean on two models and a loss on a third; all `paper`, see `research-mtp-width-policy.md`).
 
 ## Wave 1, window 2: tile padding and the prefill chunk (2026-10-29)
 
