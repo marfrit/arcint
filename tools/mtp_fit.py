@@ -11,7 +11,7 @@ the record index this tool reads.
     mtp_fit.py eval   --capture BASE --records OUT.idx --head GGUF --vocab IDS
     mtp_fit.py linear --capture BASE --records OUT.idx --head GGUF --vocab IDS
     mtp_fit.py gguf-info FILE [--tensor NAME]
-    mtp_fit.py rows-check --head SERVED.gguf --other F16.gguf --vocab IDS
+    mtp_fit.py rows-check --head SERVED.gguf --other F16.gguf [--vocab IDS] [--tensor NAME]
 
 `eval`, per text class on one split (default: the held-out test split):
 
@@ -861,15 +861,26 @@ def cmd_gguf_info(args):
 
 
 def cmd_rows_check(args):
+    """The decoder against another file's rows of the same tensor: output.weight
+    at random draft-vocabulary ids, or another tensor (--tensor, e.g. a Q4_K
+    attention matrix of the head) at random rows."""
     np = _np()
-    ids = load_vocab(args.vocab)
     rng = np.random.RandomState(1)
-    pick = sorted(rng.choice(ids, size=min(args.n, len(ids)), replace=False).tolist())
-    a = read_gguf_rows(args.head, "output.weight", pick)
-    b = read_gguf_rows(args.other, "output.weight", pick)
+    if args.tensor == "output.weight":
+        if not args.vocab:
+            raise SystemExit("--vocab for output.weight")
+        pool = load_vocab(args.vocab)
+    else:
+        _, _, dims, _, _ = find_gguf_tensor(args.head, args.tensor)
+        pool = list(range(dims[1]))
+    pick = sorted(rng.choice(pool, size=min(args.n, len(pool)), replace=False).tolist())
+    a = read_gguf_rows(args.head, args.tensor, pick)
+    b = read_gguf_rows(args.other, args.tensor, pick)
     rel = np.linalg.norm(a - b, axis=1) / np.maximum(np.linalg.norm(b, axis=1), 1e-12)
-    print("rows %d of output.weight: relative L2 difference %s vs %s: mean %.4f, max %.4f" %
-          (len(pick), os.path.basename(args.head), os.path.basename(args.other), rel.mean(), rel.max()))
+    ta = GGML_TYPES[find_gguf_tensor(args.head, args.tensor)[3]][0]
+    tb = GGML_TYPES[find_gguf_tensor(args.other, args.tensor)[3]][0]
+    print("%s, %d rows: relative L2 difference %s (%s) vs %s (%s): mean %.4f, max %.4f" %
+          (args.tensor, len(pick), os.path.basename(args.head), ta, os.path.basename(args.other), tb, rel.mean(), rel.max()))
     return 0
 
 
@@ -917,7 +928,8 @@ def main(argv=None):
     pr = sub.add_parser("rows-check", help="the decoder against another file's rows of the same tensor")
     pr.add_argument("--head", required=True)
     pr.add_argument("--other", required=True)
-    pr.add_argument("--vocab", required=True)
+    pr.add_argument("--vocab", help="the draft vocabulary (for output.weight)")
+    pr.add_argument("--tensor", default="output.weight")
     pr.add_argument("--n", type=int, default=256)
     pr.set_defaults(fn=cmd_rows_check)
 
