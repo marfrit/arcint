@@ -147,6 +147,9 @@ These names are not in a table:
 | `GGML_OPENCL_CONV_3D` | on | `0`: CONV_3D (the Wan VAE's 3D convs, F32 input and output, weights F16 or F32) falls back to the CPU, the baseline arm. | 0059 | `code`: 0059:83-96. |
 | `GGML_OPENCL_F16_XMX` | on | `0`: F16 / BF16 weights times 16+ columns use the tiled GEMM, not the XMX one. | 0022 | Needle prefill 342.8 -> 383.4 t/s with it on (`measured-here`). |
 | `GGML_OPENCL_Q8_XMX` | on | `0`: q8_0 weights times 16+ columns use upstream's q8_0 kernels, not the XMX GEMM. On the B60 only (the kernel needs sub-group 16). | 0058 | 1024² image step 2.14 -> 10.95 s with it off, 512² 0.476 -> 3.03 s (`measured-here`). |
+| `GGML_OPENCL_Q8_I8` | on | `0`: on Alchemist, q8_0 weights times 16+ columns skip the int8 GEMM (0099). |
+| `GGML_OPENCL_Q40_2D` | `2` | Dense q4_0 weights times 16+ columns, K a multiple of 256: `0` the 0096 tile, `1` fp16 2D-block GEMM (Xe2), `2` int8 (0099). |
+| `GGML_OPENCL_Q40_SG8_SHAPE` | `32,8` | `TMM,WG` of the Alchemist int8 GEMM: tokens a sub-group, sub-groups a work-group. |
 | `GGML_OPENCL_F32_SKINNY` | on (Intel) | `0`: skinny F32 products use ggml's paths. | 0005 | Coder router, 512-token prefill: 24.3 -> 9.0 ms, A770 (`measured-here`). |
 | `GGML_OPENCL_FA_DPAS` | on (Intel with DPAS) | `0`: prompt attention keeps `flash_attn_f32_f16.cl`. | 0008 | 512 rows x 4,096 keys: B60 8.2 ms, A770 22.4 ms (`measured-here`). |
 | `GGML_OPENCL_FA_DPAS2` | on (Xe2 only) | `0`: prompt attention keeps 0008's kernel. | 0038 | — |
