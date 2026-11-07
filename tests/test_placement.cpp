@@ -19,6 +19,8 @@
 //      both_sources_reach_props
 //   P5 read_downgrade_text() without the cut of a partial last line ->
 //      a_cut_last_line_does_not_join_the_next_source
+//   P6 patch 0112 left out (LLM_TENSOR_PLE_CONV1D probed as SSM_CONV again: Flash-Next's f16
+//      kernel back in a CPU buffer, the 0111 key back) -> the_ple_conv_kernel_is_probed_as_its_cast
 #include "exec/backend.h"
 
 #include "harness.h"
@@ -170,6 +172,35 @@ TEST(the_loader_reports_only_probe_selections_after_the_mmap_swap) {
     CHECK(guard.find("probed") != std::string::npos);
     CHECK(guard.find("!no_alloc") != std::string::npos);
     CHECK(src.find("LLAMA_LOG_WARN(\"DOWNGRADE src=llama %s\\n\"", report) != std::string::npos);
+}
+
+TEST(the_ple_conv_kernel_is_probed_as_its_cast) {
+    // 0112: the loader probes a weight with its tensor's op (LLM_TENSOR_INFOS); Flash-Next's
+    // f16 PLE conv kernel was probed as SSM_CONV, which the card declines for an f16 weight,
+    // while qwen4exp's graph only takes column views of it and casts them (CONT, CPY), which the
+    // card runs. The probe must be the cast, and the graph must still read the kernel that way.
+    std::ifstream fa(std::string(ARCINT_LLAMA_SRC_DIR) + "/src/llama-arch.cpp");
+    std::ifstream fm(std::string(ARCINT_LLAMA_SRC_DIR) + "/src/models/qwen4exp.cpp");
+    CHECK(fa.good() && fm.good());
+    const std::string arch((std::istreambuf_iterator<char>(fa)), std::istreambuf_iterator<char>());
+    const std::string model((std::istreambuf_iterator<char>(fm)), std::istreambuf_iterator<char>());
+    const size_t info = arch.find("{LLM_TENSOR_PLE_CONV1D,");
+    CHECK(info != std::string::npos);
+    if (info == std::string::npos) return;
+    const std::string line = arch.substr(info, arch.find('\n', info) - info);
+    CHECK(line.find("GGML_OP_CPY") != std::string::npos);
+    // every read of the kernel in the graph is the column view, and the view is cast
+    const std::string use = "model.layers[il].ple_conv1d";
+    size_t n = 0, viewed = 0;
+    for (size_t at = model.find(use); at != std::string::npos; at = model.find(use, at + 1)) {
+        ++n;
+        const size_t view = model.rfind("ggml_view_2d(", at);
+        viewed += view != std::string::npos && at - view < 160;
+    }
+    CHECK(n >= 1);
+    CHECK_EQ(viewed, n);
+    CHECK(model.find("wk = ggml_cast(ctx0, wk, GGML_TYPE_F32);") != std::string::npos);
+    CHECK_EQ(model.find("ggml_ssm_conv(ctx0, padded"), std::string::npos);
 }
 #endif
 #endif
