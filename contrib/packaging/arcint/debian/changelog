@@ -1,3 +1,16 @@
+arcint (1.6.0-1) trixie; urgency=medium
+
+  * The prompt's expert products on Alchemist take int8 DPAS with no local memory,
+    a sub-group owning two sets of weight rows (0102-0104): the coder's prefill at
+    41k +13.8 % on the A770.
+  * An MTP head file may carry no output.weight (0105).
+  * Gemma 4 E4B and Granite 4.2 8B admitted by architecture and geometry; not yet
+    served by a unit.
+  * Sampling defaults come from the model card in the GGUF. --llama-checkpoints above
+    0 is refused on a model with no recurrent memory.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 07 Nov 2026 09:00:00 +0100
+
 arcint (1.5.4-1) trixie; urgency=medium
 
   * A path other than the one a weight's type promises says so: a DOWNGRADE line

@@ -112,6 +112,9 @@ public:
 };
 
 // model: loaded with load_mtp from `gguf`; ctx_tgt: n_rs_seq >= n_draft.
+// rows_gguf: the served file; the draft vocabulary's rows are read from it
+// when `gguf` has no output.weight (an MTP head file made without one, patch
+// 0105; exec/mtp_head_file.h refuses that without a vocabulary).
 // vocab: the file of token ids the drafts are drawn from (empty: all).
 // min_p: drafting stops at a token the head gives less than min_p, which is
 // left out (0: always n_draft; with cost_policy it stays a floor over the
@@ -128,7 +131,8 @@ std::unique_ptr<LlamaSpec> make_llama_mtp(llama_model* model, llama_context* ctx
                                           int n_batch, int n_ubatch, int threads, const std::string& gguf,
                                           const std::string& vocab, double min_p, bool cost_policy,
                                           const std::string& cost_seed, ggml_type type_k, ggml_type type_v,
-                                          bool kv_unified, uint32_t n_kv_reserve, std::string& err);
+                                          bool kv_unified, uint32_t n_kv_reserve, const std::string& rows_gguf,
+                                          std::string& err);
 
 // model_dft: a DFlash2 drafter (general.architecture "dflash" with a
 // selector), loaded on the target's card; ctx_tgt: n_rs_seq >= n_draft,
