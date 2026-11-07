@@ -188,7 +188,7 @@ F32 weights of at most 256 rows (the delta-net's `ssm_alpha` / `ssm_beta`, a MoE
 
 Some GGUFs keep 2-D weights F32 (Gemma 4 E4B's per-layer-input projections `blk.N.proj` and `blk.N.inp_gate`, 220 MB). The backend had no fast F32 product: a prompt took ggml's F32 tiled GEMM or the skinny path, and decode read F32. When such a weight is written, the backend now keeps an f16 copy beside it and `MUL_MAT` runs the F16 kernels on the copy: the XMX GEMM from 16 columns, the f16 matvecs at 1 and 2-8. Gemma's values are bf16, which f16 holds exactly from 2^-17 up.
 - **Effect:** not yet measured; `inferred` 250-300 ms off a 6,656-token prefill on the B60 (+7-10 %) and less F32 traffic at decode (110 of about 3,000 MB a token).
-- **Applies to:** Intel; F32 2-D weights of at least 256 rows and a K of at least 256, not routers (`ffn_gate_inp`); from 16 columns sub-group 16 only (the A770 has no f16 XMX GEMM).
+- **Applies to:** Intel; F32 2-D weights of at least 256 rows and a K of at least 256, not routers (`ffn_gate_inp`), Hadamard rotation matrices or vocabulary-size products (`output.weight`, `token_embd`); a 3-D activation whose columns lie back to back is flattened and takes the copy; 9-15 columns keep F32; from 16 columns sub-group 16 only (the A770 has no f16 XMX GEMM). The copies are VRAM outside the weight buffers (110 MB on Gemma 4 E4B), logged per device; a weight that should have a copy and has none reports `reason=no-f16-copy`.
 - **Default:** on (`GGML_OPENCL_F32W_F16=0` off, `=2` prompts only).
 - **Location:** `ggml_cl_f16_copy_build` and `ggml_cl_mul_mat_f16_copy` in `ggml/src/ggml-opencl/ggml-opencl.cpp`; test `test_mul_mat_weight`. (0110)
 - **Switch:** `GGML_OPENCL_F32W_F16`.
