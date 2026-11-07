@@ -949,8 +949,10 @@ said), and the 503 bodies lost `reservation` and `kv_blocks_free`.
   asks for none; a GGUF with no such key keeps the provisional row (Llama 2 7B).
   A unit that passes no flags moves to its card. The Flash-Next and TTS units stay
   on the row they have served at, 0.7 / 0.8 / 20 with a repetition penalty of 1.05,
-  by their own flags (operator, 2026-11-07), until their cards' rows have been
-  measured: 1.0 / 0.95 / 20 and 0.9 / 1.0 / 50, both with no penalty. The agent, the
+  by their own flags (operator, 2026-11-07). Their cards' rows are 1.0 / 0.95 / 20
+  and 0.9 / 1.0 / 50, both with no penalty. Flash-Next's costs drafts (`measured-here`,
+  the B60, 24 prompts, A-B-B-A): 0.0332, 0.0339 tokens a ms on the served row,
+  0.0330, 0.0323 on the card's, -2.7 %. The TTS card's row is not measured. The agent, the
   coder and the writer pass their own flags and did not move, nor do their samples. (b)
   `--llama-checkpoints N` above 0 on a model that is neither hybrid nor recurrent
   is refused at start, because it could not do what it says; the default of 32
