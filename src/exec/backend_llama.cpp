@@ -7,8 +7,11 @@
 #include "exec/backend.h"
 #include "exec/tokenize-once.h"
 #include "core/renderer_material.h"
+#include "exec/mtp_capture.h"   // the MTP head-fit capture (off by default, ARCINT_MTP_CAPTURE)
 #include "exec/mtp_trace.h"   // the MTP window trace (off by default, ARCINT_MTP_TRACE)
+#include "exec/mtp_head_file.h"   // a head file without output.weight needs --llama-mtp-vocab
 #include "exec/slot_loan.h"
+#include "core/admission.h"
 #include "core/markers.h"
 
 #ifdef ARCINT_LLAMA
@@ -62,6 +65,24 @@ extern "C" int stbi_info_from_memory(unsigned char const* buffer, int len, int* 
 #include "util/utf8.h"
 
 namespace lgc {
+
+namespace {
+
+// The tensor names of a head file, header only: no tensor data is read, no model is loaded.
+MtpHeadFile probe_mtp_head_file(const std::string& path) {
+    gguf_context* g = gguf_init_from_file(path.c_str(), gguf_init_params{ /*no_alloc=*/true, nullptr });
+    if (g == nullptr) throw std::runtime_error(log::format("cannot read %s", path.c_str()));
+    std::vector<std::string> names;
+    for (int64_t i = 0; i < gguf_get_n_tensors(g); ++i) names.emplace_back(gguf_get_tensor_name(g, i));
+    const int64_t ka = gguf_find_key(g, "general.architecture");
+    const std::string arch = ka >= 0 ? gguf_get_val_str(g, ka) : std::string();
+    gguf_free(g);
+    MtpHeadFile f = mtp_head_file_from_names(names);
+    f.arch        = arch;
+    return f;
+}
+
+}  // namespace
 namespace {
 
 using json = nlohmann::json;
@@ -675,35 +696,47 @@ public:
         // load too; their tool calls are not parsed (Qwen formats only,
         // src/core/toolcall.h). Their think blocks are split: the angle-bracket
         // tags (Cydonia) and the square-bracket tags (Magistral), see
-        // ModelStatus::think_tags_extended
+        // ModelStatus::dialect. Gemma 4 E4B and Granite 4.2 8B are admitted the same way
+        // (architecture and geometry, core/admission.cpp); Granite speaks the Qwen forms
+        // (its template was read: the plain think pair, the function/parameter call form),
+        // Gemma 4 its own (ChatDialect::Gemma4)
         char arch[64] = {};
         llama_model_meta_val_str(model_, "general.architecture", arch, sizeof(arch));
         const std::string a(arch);
         vocab_     = llama_model_get_vocab(model_);
-        char head_dim[16] = {};
-        llama_model_meta_val_str(model_, "llama.attention.key_length", head_dim, sizeof(head_dim));
-        const bool mistral_small_24b = a == "llama" && llama_model_n_layer(model_) == 40 && llama_model_n_embd(model_) == 5120 &&
-                                       llama_model_n_head(model_) == 32 && llama_model_n_head_kv(model_) == 8 &&
-                                       std::string(head_dim) == "128" && llama_vocab_n_tokens(vocab_) == 131072;
-        mistral_small_24b_ = mistral_small_24b;
+        // The architecture and the geometry go to core/admission.cpp, a pure
+        // function that is unit-tested with no model. The geometry's key length
+        // is the architecture's own metadata key (absent: 0).
+        ModelGeometry geometry;
+        geometry.n_layer   = llama_model_n_layer(model_);
+        geometry.n_embd    = llama_model_n_embd(model_);
+        geometry.n_head    = llama_model_n_head(model_);
+        geometry.n_head_kv = llama_model_n_head_kv(model_);
+        geometry.n_vocab   = llama_vocab_n_tokens(vocab_);
+        {
+            char head_dim[16] = {};
+            llama_model_meta_val_str(model_, (a + ".attention.key_length").c_str(), head_dim, sizeof(head_dim));
+            geometry.head_dim = std::atoi(head_dim);
+        }
+        // --tts admits the audio-generation backbone's own architecture (Qwen3-TTS;
+        // docs/milestone-1.2.0.md D4): its gen half needs --mmproj, checked after
+        // this, and its text path is not served (the asset is not a language model).
+        const AdmittedModel admitted = admit_model(a, geometry, cfg.tts);
+        if (admitted == AdmittedModel::None)
+            throw std::runtime_error(admission_refusal(cfg.gguf_path, arch));
         // 'llama' at a second geometry: Llama 2 7B, the model of the community
         // llama-bench GPU tables (operator, 2026-11-04), so that arcint can stand in
         // one of their rows (tools/llama_scoreboard.py). A base model: no chat
         // template, so it takes the ChatML fallback below and is meant for the
         // token-id /v1/completions route.
-        llama2_7b_ = a == "llama" && llama_model_n_layer(model_) == 32 && llama_model_n_embd(model_) == 4096 &&
-                     llama_model_n_head(model_) == 32 && llama_model_n_head_kv(model_) == 32 &&
-                     llama_vocab_n_tokens(vocab_) == 32000;
-        // --tts admits the audio-generation backbone's own architecture (Qwen3-TTS;
-        // docs/milestone-1.2.0.md D4): its gen half needs --mmproj, checked after
-        // this, and its text path is not served (the asset is not a language model).
-        const bool tts_arch = cfg.tts && a == "qwen3tts";
-        if (a != "qwen35" && a != "qwen35moe" && a != "qwen4exp" && a != "qwen2vl" && !mistral_small_24b && !llama2_7b_ && !tts_arch)
-            throw std::runtime_error(log::format("%s is a '%s' model; --engine llama serves qwen35, qwen35moe, qwen4exp, "
-                                                 "qwen2vl (vision, with --mmproj), Mistral Small 3.2 24B "
-                                                 "('llama', 40 x 5120, 32/8 heads), Llama 2 7B ('llama', 32 x 4096, "
-                                                 "32/32 heads) and, under --tts, qwen3tts",
-                                                 cfg.gguf_path.c_str(), arch));
+        llama2_7b_ = admitted == AdmittedModel::Llama2_7B;
+        dialect_   = dialect_of(admitted);
+        // Gemma 4 speaks its own reasoning channel and tool-call form. --tool-grammar
+        // constrains the Qwen call form, so on this model it would constrain the
+        // output to a syntax the model does not use: refused at start.
+        if (dialect_.gemma4() && cfg.tool_grammar)
+            throw std::runtime_error("--tool-grammar constrains the Qwen tool-call form; Gemma 4 calls tools in its own "
+                                     "form (parsed into tool_calls without it): start without --tool-grammar");
         tokenizer_ = std::make_unique<LlamaTokenizer>(vocab_);
         n_vocab_   = static_cast<size_t>(llama_vocab_n_tokens(vocab_));
         // loop-guard door: the multi-newline ids, scanned ONCE here where the
@@ -725,8 +758,9 @@ public:
         // clean-turns: the think tags' ids, once at load. A tag the vocabulary
         // holds as one special token is decided by that id; a tag it spells as
         // text stays -1 and keeps the text behaviour.
-        think_ids_qwen_ = build_think_ids(false);
-        think_ids_ext_  = build_think_ids(true);
+        think_ids_qwen_  = build_think_ids(ChatDialect::Qwen);
+        think_ids_ext_   = build_think_ids(ChatDialect::Extended);
+        think_ids_gemma_ = build_think_ids(ChatDialect::Gemma4);
         // One line, at load: what the id rule found, and where the text
         // fallback is in force. A served artifact whose tags the vocabulary
         // spells as text is then recognisable in the log, not only by its
@@ -863,6 +897,16 @@ public:
             // GGUF's own MTP layer is its last layer, on the last card
             llama_model* mtp_model = model_;
             if (!cfg.llama_mtp_gguf.empty()) {
+                // a head file without output.weight (patch 0105) has no LM head for a context that asks for
+                // logits: refused here, before the load, unless the draft vocabulary is set. Its rows are
+                // then read from the served file (DraftHead), the MTP context returns rows only
+                {
+                    const MtpHeadFile hf = probe_mtp_head_file(cfg.llama_mtp_gguf);
+                    const std::string why = mtp_head_file_refusal(hf, !cfg.llama_mtp_vocab.empty());
+                    if (!why.empty()) throw std::runtime_error(log::format("--llama-mtp-gguf %s: %s", cfg.llama_mtp_gguf.c_str(), why.c_str()));
+                    if (hf.arch == "qwen35moe" && !hf.has_output && !hf.has_shared_head)
+                        log::info("mtp", "the head file has no output.weight: the draft rows come from %s", cfg.gguf_path.c_str());
+                }
                 llama_model_params dp = llama_model_default_params();
                 dp.n_gpu_layers       = 999;
                 dp.load_mtp           = true;
@@ -880,7 +924,7 @@ public:
                                    threads, cfg.llama_mtp_gguf.empty() ? cfg.gguf_path : cfg.llama_mtp_gguf,
                                    cfg.llama_mtp_vocab, cfg.llama_mtp_min_p, cfg.llama_mtp_policy,
                                    cfg.llama_mtp_cost_seed, cp.type_k, cp.type_v, cp.kv_unified, cp.n_kv_reserve,
-                                   err);
+                                   cfg.gguf_path, err);
             if (!spec_) throw std::runtime_error(log::format("--llama-mtp %d: %s", cfg.llama_mtp, err.c_str()));
             n_draft_ = cfg.llama_mtp;
             mtp_min_p_ = cfg.llama_mtp_min_p;   // the trace records it (exec/mtp_trace.h)
@@ -924,7 +968,12 @@ public:
         // state would be the whole KV
         ckpt_max_  = cfg.llama_checkpoints;
         ckpt_step_ = static_cast<size_t>(std::max(cfg.llama_checkpoint_step, 1));
-        ckpt_on_   = ckpt_max_ > 0 && (llama_model_is_hybrid(model_) || llama_model_is_recurrent(model_));
+        const bool can_snapshot = llama_model_is_hybrid(model_) || llama_model_is_recurrent(model_);
+        if (const std::string no = checkpoints_refusal(cfg.llama_checkpoints_asked, can_snapshot, a); !no.empty())
+            throw std::runtime_error(no);
+        ckpt_on_   = ckpt_max_ > 0 && can_snapshot;
+        if (ckpt_max_ > 0 && !can_snapshot)
+            log::info("load", "context checkpoints: none, a '%s' model has no recurrent memory; its attention cache trims", a.c_str());
         n_ubatch_  = static_cast<int>(cp.n_ubatch);
         ckpts_.resize(static_cast<size_t>(lanes_));
 
@@ -960,7 +1009,13 @@ public:
         // served body's dump admit valid UTF-8 only; a vocabulary or template
         // whose text is not will never build the material. One pass over the
         // vocabulary's text at load; Qwen vocabularies pass it.
-        if (!cfg.tts) {
+        if (dialect_.gemma4()) {
+            // The gateway's renderer material carries the Qwen parser rows only
+            // ("qwen3-coder/1"); advertising them for this model would be wrong.
+            material_failed_.store(true, std::memory_order_relaxed);
+            log::warn("load", "renderer material will not be built: the gateway parser knows the Qwen tool-call "
+                              "form only, not this model's (Gemma 4); token mode is off on this unit");
+        } else if (!cfg.tts) {
             const int  n_text  = static_cast<int>(llama_vocab_n_tokens(vocab_));
             const bool text_ok = renderer_text_utf8_ok(n_text, [&](int id) {
                 const char* t = llama_vocab_get_text(vocab_, id);
@@ -998,7 +1053,7 @@ public:
             const size_t      b = a == std::string::npos ? a : d_s.find(' ', a + 1);
             status_.quant       = b == std::string::npos ? std::string() : d_s.substr(b + 1);
         }
-        status_.think_tags_extended = mistral_small_24b_;
+        status_.dialect = dialect_;
         SamplerDefaults d;
         d.temperature        = 0.7f;
         d.top_p              = 0.8f;
@@ -1006,7 +1061,15 @@ public:
         d.repetition_penalty = 1.05f;
         d.presence_penalty   = 0.0f;
         d.provenance         = "provisional";
+        if (auto err = sampler_defaults_apply_card(d, [&](const char* key) -> std::optional<std::string> {
+                char val[64] = {};
+                if (llama_model_meta_val_str(model_, key, val, sizeof(val)) < 0) return std::nullopt;
+                return std::string(val);
+            }))
+            throw std::runtime_error(cfg.gguf_path + ": " + *err);
         if (auto err = apply_operator_defaults(cfg, d)) throw std::runtime_error(*err);
+        log::info("load", "sampler defaults (%s): temp %.3g, top_p %.3g, top_k %d, repetition %.3g",
+                  d.provenance.c_str(), d.temperature, d.top_p, d.top_k, d.repetition_penalty);
         status_.sampler_defaults = d;
 #ifdef ARCINT_MTMD
         // --mmproj: the multimodal projector (libmtmd) side by side with the
@@ -1214,7 +1277,7 @@ public:
                                                    {"param_open", std::string(tags.param_open)},
                                                    {"param_end", std::string(tags.param_end)}}}};
             parts.parser = {{"reasoning", think_ids ? "ids/1" : "tags/1"},
-                            {"tag_set", status_.think_tags_extended ? "extended" : "qwen"},
+                            {"tag_set", status_.dialect.extended() ? "extended" : "qwen"},
                             {"tool_calls", "qwen3-coder/1"}};
             std::string why;
             json material = assemble_renderer_material(parts, &why);
@@ -1312,8 +1375,13 @@ public:
     Tokenizer&         tokenizer() override { return *tokenizer_; }
     // The ids read once at load; the reasoning split and the sampler's tracker
     // decide the block's roles by them.
-    ThinkBlockIds think_block_ids(bool extended_tags) const override {
-        return extended_tags ? think_ids_ext_ : think_ids_qwen_;
+    ThinkBlockIds think_block_ids(ChatDialect dialect) const override { return think_ids_for(dialect); }
+    const ThinkBlockIds& think_ids_for(ChatDialect dialect) const {
+        switch (dialect.kind) {
+            case ChatDialect::Extended: return think_ids_ext_;
+            case ChatDialect::Gemma4: return think_ids_gemma_;
+            default: return think_ids_qwen_;
+        }
     }
 
     // feyntalk W6a review findings 2/3 and W6 follow-ups 2/3/4/5: capability
@@ -1343,6 +1411,12 @@ public:
         return renderer_material_json_;
     }
 
+    // Whether tool-call arguments reach the template as an object: the template's
+    // own requirement, or the dialect's rule (ChatDialect::replays_arguments_as_object)
+    bool object_arguments() const {
+        return template_->original_caps().requires_object_arguments || dialect_.replays_arguments_as_object();
+    }
+
     json template_caps() const override {
         const minja::chat_template_caps& c = template_->original_caps();
         return json{{"supports_tools", c.supports_tools},
@@ -1353,7 +1427,7 @@ public:
                     // The pin's own name (common/jinja/caps.h supports_object_arguments,
                     // chat.cpp: true -> tool-call arguments go to the template as an
                     // object). minja calls the same fact requires_object_arguments.
-                    {"supports_object_arguments", c.requires_object_arguments},
+                    {"supports_object_arguments", object_arguments()},
                     {"supports_string_content", !c.requires_typed_content},
                     {"supports_typed_content", c.requires_typed_content},
                     {"supports_preserve_reasoning", template_src_.find("reasoning_content") != std::string::npos},
@@ -1373,7 +1447,7 @@ public:
 
     std::string render_chat(const ChatRequest& req) const override {
         minja::chat_template_inputs inputs;
-        inputs.messages = chat_messages_json(req, template_->original_caps().requires_object_arguments);
+        inputs.messages = chat_messages_json(req, object_arguments());
         inputs.tools    = chat_tools_json(req);
         inputs.add_generation_prompt = true;
         // The one construction of the template context (core/chat.cpp): the
@@ -2046,6 +2120,9 @@ private:
 #endif
             size_t common = 0;
             while (common < have.size() && common < n_pre && have[common] == prompt[common]) ++common;
+            // ARCINT_MTP_CAPTURE (exec/mtp_capture.h): every prompt token must decode, or its rows
+            // are missing from the capture; the lane starts empty (the same cut a diverging prompt takes)
+            if (mtp_capture_on()) common = 0;
             if (common < have.size()) {
                 // where the target's recurrent state cannot step back to the
                 // cut, it resumes from its newest checkpoint inside the prefix
@@ -2450,10 +2527,10 @@ private:
     // Read once at load: the per-pair ids, and the flattened sets the mask reads.
     // A tag that fails the one-special-token rule stays -1 and keeps the text
     // behaviour for its role.
-    ThinkBlockIds build_think_ids(bool extended) const {
+    ThinkBlockIds build_think_ids(ChatDialect dialect) const {
         ThinkBlockIds ids;
         ids.eog = eog_ids_;
-        for (const auto& [open, close] : think_tag_pairs(extended)) {
+        for (const auto& [open, close] : think_tag_pairs(dialect)) {
             const std::vector<int> o = tokenizer_->special_ids(open);
             const std::vector<int> c = tokenizer_->special_ids(close);
             const int oid = o.size() == 1 ? o.front() : -1;
@@ -2494,7 +2571,7 @@ private:
             && in.sampler.loop_guard == LoopGuardMode::Off && in.sampler.think_ctx_reserve <= 0
             && in.sampler.think_budget <= 0)
             return;
-        ThinkBlockIds ids = in.think_tags_extended ? think_ids_ext_ : think_ids_qwen_;
+        ThinkBlockIds ids = think_ids_for(in.dialect);
         ids.eog = eog_ids_;
         sampler.set_think_mask_ids(std::move(ids));
         sampler.start_in_think_block(in.think_open);
@@ -2516,6 +2593,10 @@ private:
     // tools whose calls are parsed: nothing, today's path exactly.
     std::unique_ptr<LlamaToolGrammar> prepare_tool_grammar(const GenerationInput& in, Sampler& sampler) const {
         if (!in.sampler.tool_grammar || in.tools.empty()) return nullptr;
+        // the grammar is the Qwen call form (core/toolgrammar.cpp): on a Gemma 4 model
+        // a request that asks for it is refused, not run against the wrong syntax
+        if (dialect_.gemma4())
+            throw InputError("tool_grammar constrains the Qwen tool-call form; this model (Gemma 4) calls tools in its own form");
         const auto t0 = clock_type::now();
         auto       g  = std::make_unique<LlamaToolGrammar>(vocab_, in.tools, in.parallel_tool_calls);
         log::verbose("grammar", "tool-call grammar: %zu tools, %zu bytes of GBNF, triggered by %s, built in %.1f ms",
@@ -2819,7 +2900,8 @@ private:
     // the text fallback for its role.
     ThinkBlockIds                         think_ids_qwen_;   // the Qwen pair alone
     ThinkBlockIds                         think_ids_ext_;    // the full tag family
-    bool mistral_small_24b_ = false;   // the admitted llama geometry (think tags, BOS)
+    ThinkBlockIds                         think_ids_gemma_;  // Gemma 4's channel
+    ChatDialect                           dialect_;          // the admitted model's tags and call form
     bool llama2_7b_ = false;           // the GPU tables' model: no chat template
     std::unique_ptr<minja::chat_template> template_;
     std::string                           template_src_;

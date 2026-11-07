@@ -593,9 +593,22 @@ TEST(config_llama_checkpoints) {
     }
     {
         Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-checkpoints", "8"};
+        CHECK(parse_args(5, const_cast<char**>(argv), cfg).ok);
+        CHECK(cfg.llama_checkpoints_asked);
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf"};
+        CHECK(parse_args(3, const_cast<char**>(argv), cfg).ok);
+        CHECK(!cfg.llama_checkpoints_asked);  // the default of 32 is not a request
+    }
+    {
+        Config cfg;
         const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-checkpoints", "0", "--llama-checkpoint-step", "4096"};
         CHECK(parse_args(7, const_cast<char**>(argv), cfg).ok);
         CHECK_EQ(cfg.llama_checkpoints, 0);   // off: a hybrid lane re-prefills when it cannot trim
+        CHECK(!cfg.llama_checkpoints_asked);  // 0 is not a request for snapshots
         CHECK_EQ(cfg.llama_checkpoint_step, 4096);
     }
     {

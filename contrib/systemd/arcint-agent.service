@@ -63,7 +63,7 @@ ExecStart=/usr/bin/arcint \
     --llama-mtp 5 \
     --llama-mtp-vocab %h/.local/share/arcint/hyperqwen-40960.json \
     --queue-timeout 30 \
-    --repetition-penalty 1.0
+    --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 0 --repetition-penalty 1.0
 Restart=on-failure
 RestartSec=30
 TimeoutStartSec=20min

@@ -126,6 +126,7 @@ struct Config {
     // a prefix with an earlier one resumes from the newest snapshot inside it
     // instead of prefilling from token 0. 0 off.
     int llama_checkpoints     = 32;
+    bool llama_checkpoints_asked = false;   // the flag was given with a count above 0
     // --llama-expert-cache MIB / --llama-expert-profile FILE: a per-expert GPU
     // cache of this many MiB for the MoE layers whose experts --llama-cpu-moe
     // keeps in host memory, ranked by a Strata STRP profile (empty: round

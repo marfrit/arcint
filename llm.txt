@@ -28,6 +28,7 @@
 - Flash-Next's production quant is ISTA-DASLab's GSQ-RCO IQ3_S since
   2026-10-20 (operator): 33.3 t/s decode on six answers, KL 0.127 against
   Q8_0 (IQ3_XXS 38.0 t/s, 0.217, the rollback).
+- Version 1.6.0 (2026-11-07): the coder's prompt expert products on int8 DPAS on Alchemist, no local memory, prefill at 41k +13.8 % (0102-0104); an MTP head file may carry no output.weight (0105); Gemma 4 E4B and Granite 4.2 8B admitted, not yet served; sampling defaults from the model card in the GGUF; `--llama-checkpoints` refused on a model with no recurrent memory; docs/concepts.md, and the branch `flattened`, the pin with the released series applied.
 - Version 1.5.4 (2026-11-06): a path other than the one a weight's type promises is logged once as `DOWNGRADE <key>` and
   counted on /props `downgrades` (0100); the release gate fails on a key not accepted for the unit.
 - Version 1.5.3 (2026-11-06): dense Q4_0 and Q8_0 weights on int8 DPAS without local memory (0099): Llama 2 prefill
@@ -199,8 +200,9 @@
   31 builtins is a 400; every other key reaches the template unchanged.
   /props' chat_template_caps carries supports_preserve_reasoning and
   supports_preserve_thinking.
-- Sampling defaults: request > operator flags > the GGUF's defaults; /props
-  names the provenance.
+- Sampling defaults: request > operator flags > the model card's row in the
+  GGUF (general.sampling.*) > a provisional row; /props names the provenance
+  (operator, card, provisional).
 - Console: one-line state/timing prints on stderr (load, expert cache,
   per-slot prefill/decode rates, draft acceptance).
 - Security: no authentication by default; --api-key/--api-key-file add a
@@ -212,8 +214,11 @@
 ## Model input
 
 - A GGUF as published (--gguf FILE; the first shard of a split file). The
-  engine admits general.architecture qwen35, qwen35moe, qwen4exp, and llama
-  at the Mistral Small 24B geometry; anything else is refused at load. No
+  engine admits general.architecture qwen35, qwen35moe, qwen4exp, qwen2vl, llama
+  at the Mistral Small 24B and Llama 2 7B geometries, gemma4 at the E4B geometry
+  and granite at the 8B geometry (code: src/core/admission.cpp); anything else,
+  an untested size included, is refused at load. Gemma 4 E4B and Granite 4.2 8B
+  are admitted but not yet served on a card. No
   allowlist (retired with the OpenVINO engine, operator 2026-10-15).
 - Flash-Next's MTP layer: an MTP-only GGUF built from the checkpoint's 31
   mtp.* tensors by tools/flash_next_mtp_gguf.sh (--llama-mtp-gguf); its
@@ -355,6 +360,9 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
   (3.5), the overflow invariant (3.8), the expert cache (3.9), lanes and two
   cards (3.10), serving (4), test gates (5), state of play (7), open items (8).
 - docs/llama-engine.md: the engine's record, mechanism by mechanism.
+- docs/concepts.md: the concept catalogue by mechanism (effect with card and model,
+  code location by file and symbol, switch, source of the idea, and what was tried
+  and not adopted).
 - contrib/llama.cpp/: the pin, the patch series and its README.
 - docs/switches.md: every environment switch, classified.
 - docs/campaigns/: one document per open defect or lever, plus research-*.md

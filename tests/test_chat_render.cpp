@@ -1,4 +1,6 @@
 #include "core/chat.h"
+#include "core/dialect.h"
+#include "exec/chat_json.h"
 #include "harness.h"
 
 #include <exception>
@@ -89,4 +91,81 @@ TEST(reasoning_effort_high_passes_through_a_template_that_maps_it) {
     minja::chat_template_options opts;
     opts.apply_polyfills = false;
     CHECK_EQ(tmpl.apply(in, opts), std::string("effort=xhigh"));
+}
+
+// A template that declares its tools the way Granite 4.2's does,
+// `value | tojson(ensure_ascii=False)`: the keyword is accepted (vendored minja,
+// third_party/minja/PATCHES.md), non-ASCII text is written as it is, and the
+// render with tools no longer throws. Synthetic fragment, same form.
+TEST(tojson_takes_the_ensure_ascii_keyword) {
+    minja::chat_template tmpl(
+        "{%- for tool in tools -%}{{ '\\n' ~ (tool | tojson(ensure_ascii=False)) }}{%- endfor -%}", "", "");
+    minja::chat_template_inputs in;
+    in.messages = nlohmann::ordered_json::array({{{"role", "user"}, {"content", "hi"}}});
+    in.tools    = nlohmann::ordered_json::parse(R"([{"name":"wetter","description":"Temperatur in M\u00fcnchen"}])");
+    in.add_generation_prompt = true;
+    minja::chat_template_options opts;
+    opts.apply_polyfills = false;
+    std::string out;
+    try {
+        out = tmpl.apply(in, opts);
+    } catch (const std::exception& e) {
+        CHECK_EQ(std::string(e.what()), std::string(""));   // a throw is a failure, not an abort
+    }
+    CHECK(out.find("\"name\": \"wetter\"") != std::string::npos);
+    CHECK(out.find("M\xc3\xbcnchen") != std::string::npos);   // not escaped
+}
+
+// Gemma 4's template shape, reduced: a macro that wraps string values in a
+// delimiter built by concatenation, dictsort over a mapping, a namespace, and a
+// reasoning field read with .get(). The delimiter is a placeholder here, not
+// the model's marker.
+TEST(gemma_style_template_shapes_render) {
+    minja::chat_template tmpl(
+        "{%- macro fmt(v) -%}{%- if v is string -%}{{- '<q>' + v + '<q>' -}}{%- elif v is mapping -%}"
+        "{{- '{' -}}{%- for k, x in v | dictsort -%}{{- k -}}:{{- fmt(x) -}}{%- if not loop.last %},{% endif -%}"
+        "{%- endfor -%}{{- '}' -}}{%- else -%}{{- v -}}{%- endif -%}{%- endmacro -%}"
+        "{%- set ns = namespace(n=0) -%}"
+        "{%- for m in messages -%}{%- set ns.n = ns.n + 1 -%}{{- m['role'] ~ ':' -}}"
+        "{{- m.get('reasoning_content') or '-' -}}{{- fmt({'b': 2, 'a': 'x'}) -}};{%- endfor -%}{{ ns.n }}",
+        "", "");
+    minja::chat_template_inputs in;
+    in.messages = nlohmann::ordered_json::array({{{"role", "user"}, {"content", "hi"}}});
+    in.add_generation_prompt = true;
+    minja::chat_template_options opts;
+    opts.apply_polyfills = false;
+    CHECK_EQ(tmpl.apply(in, opts), std::string("user:-{a:<q>x<q>,b:2};1"));
+}
+
+// Gemma 4's template renders a mapping in its own form and a string by stripping
+// braces, and minja's capability probe accepts a string: the dialect's rule is
+// what keeps the replayed call in the model's syntax. Synthetic template, same
+// branch: the first arm reads the arguments as a mapping.
+TEST(gemma4_replays_tool_call_arguments_as_an_object) {
+    minja::chat_template tmpl(
+        "{%- for m in messages -%}{%- for tc in m.tool_calls or [] -%}"
+        "{%- if tc.function.arguments is mapping -%}OBJ:{{ tc.function.arguments.city }}"
+        "{%- else -%}STR:{{ tc.function.arguments }}{%- endif -%}{%- endfor -%}{%- endfor -%}",
+        "", "");
+    ChatRequest req;
+    ChatMessage a;
+    a.role = "assistant";
+    ToolCall c;
+    c.id        = "call_0";
+    c.name      = "f";
+    c.arguments = R"({"city":"Kassel"})";
+    a.tool_calls.push_back(c);
+    req.messages.push_back(a);
+    minja::chat_template_options opts;
+    opts.apply_polyfills = false;
+    auto render = [&](ChatDialect d) {
+        minja::chat_template_inputs in;
+        in.messages = chat_messages_json(req, tmpl.original_caps().requires_object_arguments ||
+                                                  d.replays_arguments_as_object());
+        return tmpl.apply(in, opts);
+    };
+    CHECK(!tmpl.original_caps().requires_object_arguments);   // the probe alone would pass a string
+    CHECK_EQ(render(ChatDialect::Gemma4), std::string("OBJ:Kassel"));
+    CHECK_EQ(render(ChatDialect::Qwen), std::string("STR:{\"city\":\"Kassel\"}"));
+    CHECK_EQ(render(ChatDialect::Extended), std::string("STR:{\"city\":\"Kassel\"}"));
 }

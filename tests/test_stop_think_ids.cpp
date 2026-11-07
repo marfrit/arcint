@@ -68,7 +68,7 @@ private:
 lgc::api::PreparedChat prepared(bool think_open, std::vector<std::string> stop) {
     lgc::api::PreparedChat prep;
     prep.think_open                  = think_open;
-    prep.think_tags_extended         = false;
+    prep.dialect         = false;
     prep.parse_tool_calls            = false;
     prep.id                          = "test";
     prep.model                       = "stub";

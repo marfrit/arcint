@@ -48,6 +48,9 @@ and [FreeToken](https://github.com/FlashML-org/FreeToken)
 [llm.txt](llm.txt) the machine-readable summary;
 [docs/llama-engine.md](docs/llama-engine.md) the engine's record, mechanism by
 mechanism.
+[docs/concepts.md](docs/concepts.md) the concept catalogue: the engine ideas for Intel
+Arc inference by mechanism, with the measured effect, the code location and what
+was tried and not adopted.
 
 **History.** Until 0.7.12 arcint also had an OpenVINO engine, on a patched
 OpenVINO runtime. It began there partly because its first design wrote SYCL off
@@ -281,8 +284,11 @@ request; llama.cpp's issue for a line-based detector went stale.
 | speech in | Whisper large-v3-turbo (whisper.cpp) | whisper.cpp's `.bin` | Arc Pro B60, on demand | German first; `/v1/audio/transcriptions` |
 
 The engine admits these architectures (`qwen35`, `qwen35moe`, `qwen4exp`,
-`llama` at the Mistral Small 24B and Llama 2 7B geometries, `qwen2vl` for vision, and under
-`--tts` `qwen3tts`) and refuses others at load.
+`llama` at the Mistral Small 24B and Llama 2 7B geometries, `qwen2vl` for vision, `gemma4` at
+the E4B geometry, `granite` at the 8B geometry, and under `--tts` `qwen3tts`) and refuses others
+at load, an untested size of an admitted architecture included. Gemma 4 E4B and Granite 4.2 8B
+were admitted 2026-11-06 from their files' metadata and templates (`code`); neither has been
+loaded or served here yet (DESIGN §2).
 Flash-Next's other files are on-demand options on the same endpoint: IQ2_XS,
 faster and less exact, and UD-Q3_K_XL, inside the KL bar once the host has
 the RAM for its bank (DESIGN §7.2).

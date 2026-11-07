@@ -51,6 +51,7 @@
 #include <fstream>
 #include <sstream>
 
+#include "exec/mtp_capture.h"
 #include "exec/mtp_trace.h"
 #include "exec/spec_state.h"
 #include "exec/token_ids.h"
@@ -115,8 +116,12 @@ public:
     }
 
     // n_in: the row the MTP context returns (n_embd_out), n_embd: the head's
-    // input (n_embd); they differ by the hyper-connection streams
-    bool init(const std::string& gguf, const std::string& ids_path, int n_in, int n_embd, int n_vocab, std::string& err) {
+    // input (n_embd); they differ by the hyper-connection streams.
+    // rows_gguf: the served file, where output.weight is read when `gguf` (the
+    // MTP head file) has none (patch 0105: a head file without the LM head);
+    // empty or equal to `gguf`: no second place to look
+    bool init(const std::string& gguf, const std::string& rows_gguf, const std::string& ids_path, int n_in, int n_embd,
+              int n_vocab, std::string& err) {
         std::ifstream f(ids_path, std::ios::binary);
         if (!f) {
             err = "cannot read " + ids_path;
@@ -135,7 +140,13 @@ public:
         std::string     file;
         gguf_context*   g  = nullptr;
         int64_t         ti = -1;
-        if (!find_tensor(gguf, "output.weight", file, g, ti, err)) return false;
+        bool from_served = false;
+        if (!find_tensor(gguf, "output.weight", file, g, ti, err)) {
+            if (rows_gguf.empty() || rows_gguf == gguf) return false;
+            err.clear();
+            if (!find_tensor(rows_gguf, "output.weight", file, g, ti, err)) return false;
+            from_served = true;
+        }
         const ggml_type type      = gguf_get_tensor_type(g, ti);
         const size_t    row_bytes = ggml_row_size(type, n_embd);
         const size_t    off       = gguf_get_data_offset(g) + gguf_get_tensor_offset(g, ti);
@@ -166,6 +177,11 @@ public:
 
         // the stream mix's weights, from the file that holds output.weight
         const int hc = n_in / n_embd;
+        if (from_served && n_in != n_embd) {
+            err = "the hyper-connection weights are read from the file that holds output.weight: a head file "
+                  "without output.weight cannot serve a model with hyper-connection streams";
+            return false;
+        }
         std::vector<uint8_t> hc_norm, hc_down, hc_up;
         ggml_type            t_norm = GGML_TYPE_F32, t_down = GGML_TYPE_F32, t_up = GGML_TYPE_F32;
         int64_t              hc_lr  = 0;
@@ -378,7 +394,7 @@ public:
     LlamaMtp(llama_model* model, llama_context* ctx_tgt, int n_draft, int n_seq, int n_batch, int n_ubatch,
              int threads, const std::string& gguf, const std::string& vocab, double min_p, bool cost_policy,
              const std::string& cost_seed, ggml_type type_k, ggml_type type_v, bool kv_unified,
-             uint32_t n_kv_reserve, std::string& err)
+             uint32_t n_kv_reserve, const std::string& rows_gguf, std::string& err)
         : ctx_tgt_(ctx_tgt), n_draft_(n_draft), min_p_(static_cast<float>(min_p)) {
         const int n_heads = llama_model_n_layer_nextn(model);
         if (n_heads <= 0) {
@@ -446,7 +462,21 @@ public:
         }
         if (!vocab.empty()) {
             head_ = std::make_unique<DraftHead>();
-            if (!head_->init(gguf, vocab, n_embd_, llama_model_n_embd(model), n_vocab_, err)) return;
+            if (!head_->init(gguf, rows_gguf, vocab, n_embd_, llama_model_n_embd(model), n_vocab_, err)) return;
+        }
+        // ARCINT_MTP_CAPTURE (exec/mtp_capture.h): the target's and the head's rows at every
+        // prompt position. It needs the unmasked MTP context, which only the draft vocabulary gives.
+        if (mtp_capture_on()) {
+            if (!head_) {
+                err = "ARCINT_MTP_CAPTURE needs --llama-mtp-vocab: without the draft vocabulary the MTP context "
+                      "masks its rows to the output tokens, so the head's row is not available at every position";
+                return;
+            }
+            cap_ = std::make_unique<MtpCapture>();
+            if (!cap_->open(mtp_capture_path(), n_embd_, err)) return;
+            log::warn("mtp", "ARCINT_MTP_CAPTURE=%s: capturing the prompt rows, the 0067 skip is off and every "
+                             "request starts on an empty lane; this is a measurement run, not a serving mode",
+                      mtp_capture_path());
         }
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked=*/false);   // a row for every token
         // rows for the output tokens; with the draft head, every token's (the
@@ -498,6 +528,7 @@ public:
         clear_d();
         const size_t row_bytes = static_cast<size_t>(n_embd_) * sizeof(float);
         size_t       off       = 0;
+        std::vector<CapturePart> cap;   // ARCINT_MTP_CAPTURE: the prompt chunks of this step
         for (size_t k = 0; k < n_parts; ++k) {
             const SpecPart& p     = parts[k];
             Lane&           ln    = lanes_[static_cast<size_t>(p.seq)];
@@ -505,11 +536,18 @@ public:
             off += p.n;
             // the MTP context up to this part's first token: rows a previous
             // batch left pending, or, at a sequence's start, the reference's zero row
+            // first_idx: the batch index of the entry at p.pos (token 0 of this part), -1 when the
+            // MTP context already holds it
+            int first_idx = -1;
             if (ln.pending > 0 && ln.base + static_cast<size_t>(ln.pending) == p.pos) {
                 if (!add_pending(ln, p.toks[0], p.seq, false)) return -1;
+                first_idx = nd_ - 1;
             } else {
                 ln.pending = 0;
-                if (ln.mtp_end == p.pos && !add(bd_, p.toks[0], p.pos, p.seq, false, zero_.data())) return -1;
+                if (ln.mtp_end == p.pos) {
+                    if (!add(bd_, p.toks[0], p.pos, p.seq, false, zero_.data())) return -1;
+                    first_idx = nd_ - 1;
+                }
             }
             if (p.all_logits) {
                 // a verify: which rows stand is known after the walk
@@ -522,6 +560,10 @@ public:
                 for (size_t i = 0; i + 1 < p.n; ++i)
                     if (!add(bd_, p.toks[i + 1], p.pos + i + 1, p.seq, false, h_tgt + i * static_cast<size_t>(n_embd_)))
                         return -1;
+                // entries p.pos .. p.pos + n - 1 sit at batch indices first_idx ..; their rows pair with
+                // the target's rows h_tgt[0 .. n - 1] (both predict the token one position on)
+                if (cap_ && first_idx >= 0) cap.push_back(CapturePart{ p.seq, p.pos, p.toks, p.n, h_tgt, first_idx });
+                else if (cap_) log::warn("mtp", "ARCINT_MTP_CAPTURE: lane %d chunk at %zu: the MTP context already holds its first entry, not captured", p.seq, p.pos);
                 ln.rows.resize(static_cast<size_t>(n_embd_));
                 std::memcpy(ln.rows.data(), h_tgt + (p.n - 1) * static_cast<size_t>(n_embd_), row_bytes);
                 ln.next.clear();
@@ -533,10 +575,13 @@ public:
             // with the draft head the MTP context returns a row for every entry; these
             // entries (a prompt's catch-up, a verify's pending rows) are never read, so the
             // rows stay on the device (patch 0067; a prompt of 41k rows copied 335 MB)
-            if (head_) llama_set_embeddings_nextn_skip(ctx_dft_, true);
+            // (ARCINT_MTP_CAPTURE holds the skip off: the head's rows are what it records)
+            const bool skip = head_ && !cap_;
+            if (skip) llama_set_embeddings_nextn_skip(ctx_dft_, true);
             const int rd = llama_process(ctx_dft_, LLAMA_PROCESS_TYPE_DECODE, bd_);
-            if (head_) llama_set_embeddings_nextn_skip(ctx_dft_, false);
+            if (skip) llama_set_embeddings_nextn_skip(ctx_dft_, false);
             if (rd != 0) return rd;
+            if (!capture_parts(cap)) return -1;
         }
         for (size_t k = 0; k < n_parts; ++k) {
             Lane& ln   = lanes_[static_cast<size_t>(parts[k].seq)];
@@ -786,6 +831,41 @@ private:
         size_t             mtp_end = 0;
     };
 
+    // a prompt chunk the capture records: lane, first position, tokens, the target's rows, the
+    // batch index of the MTP entry at the first position
+    struct CapturePart {
+        int          seq;
+        size_t       pos0;
+        const int*   toks;
+        size_t       n;
+        const float* h;
+        int          first_idx;
+    };
+
+    // ARCINT_MTP_CAPTURE: each chunk's head rows (the MTP context's unmasked rows, by batch index)
+    // next to the target's, appended in order. Loud on a failure: a capture with a hole is worse
+    // than none, so the request fails.
+    bool capture_parts(const std::vector<CapturePart>& cap) {
+        if (!cap_) return true;
+        std::vector<float> z;
+        for (const CapturePart& c : cap) {
+            z.resize(c.n * static_cast<size_t>(n_embd_));
+            for (size_t j = 0; j < c.n; ++j) {
+                const float* r = llama_get_embeddings_nextn_ith(ctx_dft_, c.first_idx + static_cast<int>(j));
+                if (r == nullptr) {
+                    log::error("mtp", "ARCINT_MTP_CAPTURE: no head row at lane %d position %zu", c.seq, c.pos0 + j);
+                    return false;
+                }
+                std::memcpy(z.data() + j * static_cast<size_t>(n_embd_), r, static_cast<size_t>(n_embd_) * sizeof(float));
+            }
+            if (!cap_->append(c.seq, c.pos0, c.toks, c.n, c.h, z.data())) {
+                log::error("mtp", "ARCINT_MTP_CAPTURE: a write failed (lane %d, position %zu)", c.seq, c.pos0);
+                return false;
+            }
+        }
+        return true;
+    }
+
     static std::string log_heads(int n) {
         return "the GGUF has " + std::to_string(n) + " MTP layers; --llama-mtp drives a single-head MTP (qwen35, qwen35moe)";
     }
@@ -835,6 +915,7 @@ private:
     int                n_vocab_ = 0;
     int                nd_      = 0;   // entries in bd_
     std::unique_ptr<DraftHead> head_;
+    std::unique_ptr<MtpCapture> cap_;   // ARCINT_MTP_CAPTURE, null unless set
     std::vector<Lane>  lanes_;
     std::vector<float> zero_;
     std::vector<float> h_step_;
@@ -846,9 +927,11 @@ std::unique_ptr<LlamaSpec> make_llama_mtp(llama_model* model, llama_context* ctx
                                           int n_batch, int n_ubatch, int threads, const std::string& gguf,
                                           const std::string& vocab, double min_p, bool cost_policy,
                                           const std::string& cost_seed, ggml_type type_k, ggml_type type_v,
-                                          bool kv_unified, uint32_t n_kv_reserve, std::string& err) {
+                                          bool kv_unified, uint32_t n_kv_reserve, const std::string& rows_gguf,
+                                          std::string& err) {
     auto s = std::make_unique<LlamaMtp>(model, ctx_tgt, n_draft, n_seq, n_batch, n_ubatch, threads, gguf, vocab,
-                                        min_p, cost_policy, cost_seed, type_k, type_v, kv_unified, n_kv_reserve, err);
+                                        min_p, cost_policy, cost_seed, type_k, type_v, kv_unified, n_kv_reserve,
+                                        rows_gguf, err);
     if (!s->ok() || !err.empty()) return nullptr;
     if (s->head_rows() > 0) log::info("mtp", "draft head: %zu token rows", s->head_rows());
     return s;

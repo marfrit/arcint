@@ -1,0 +1,426 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Markus Fritsche <mfritsche@reauktion.de>
+Date: Fri, 6 Nov 2026 17:45:00 +0000
+Subject: [PATCH] 0104-opencl-id-int8-row-sets
+
+---
+ ggml/src/ggml-opencl/ggml-opencl.cpp             |  18 +-
+ ggml/src/ggml-opencl/kernels/mul_mm_id_i8_sg8.cl | 244 +++++++++++++++++------
+ tests/test-backend-ops.cpp                       |   3 +
+ 3 files changed, 203 insertions(+), 62 deletions(-)
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index f1f1010..3d931ba 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1216,6 +1216,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_mul_mm_id_iq4_nl_i8_sg8 = nullptr;
+     cl_kernel kernel_mul_mm_id_q4_K_i8_sg8   = nullptr;
+     cl_kernel kernel_id_pack_i8_sg8          = nullptr;
++    int       kq_id_sg8_nr            = 2;         // 0104: sets of 8 weight rows a sub-group
+     int       kq40_sg8_tm = 32, kq40_sg8_wg = 8;
+     cl_kernel kernel_mul_mm_f16w_f16      = nullptr;   // F16 / BF16 weights on the XMX tiles
+     cl_kernel kernel_mul_mm_q8_0_f16     = nullptr;   // Q8_0 code+scale on the same XMX tiles (0058)
+@@ -2717,7 +2718,16 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+ #else
+                     const std::string ids8_src = read_file("mul_mm_id_i8_sg8.cl");
+ #endif
+-                    cl_program ids8_prog = ids8_src.empty() ? nullptr : build_program_from_source_optional(backend_ctx, ids8_src.c_str(), q40_opts);
++                    // 0104: GGML_OPENCL_KQ_ID_NR sets of 8 weight rows a sub-group, 1 to 8. 2 by the A770's window 122:
++                    // 3 and up exceed 256 GRF on the coder's kernels and IGC retries with rolled loops.
++                    int ids8_nr = 2;
++                    if (const char * nr_env = getenv("GGML_OPENCL_KQ_ID_NR")) {
++                        const int v = atoi(nr_env);
++                        if (v >= 1 && v <= 8) ids8_nr = v;
++                    }
++                    backend_ctx->kq_id_sg8_nr = ids8_nr;
++                    const std::string ids8_opts = q40_opts + " -DNR=" + std::to_string(ids8_nr);
++                    cl_program ids8_prog = ids8_src.empty() ? nullptr : build_program_from_source_optional(backend_ctx, ids8_src.c_str(), ids8_opts);
+                     if (ids8_prog == nullptr) {
+                         ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "id_i8_sg8"), GGML_LOG_WARN("ggml_opencl: int8 sub-group 8 expert GEMM not built; the fp16 tile takes MUL_MAT_ID\n");
+                     } else {
+@@ -32515,6 +32525,10 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+                       backend_ctx->kernel_id_pack_i8_sg8 != nullptr && backend_ctx->kernel_quant_i8_sg8 != nullptr &&
+                       !cache_src && ((ggml_backend_opencl_buffer_context *) ids8_w->buffer->context)->usm == nullptr &&
+                       ne00 % 256 == 0 && ne01 % 8 == 0;
++    if (gemm && ids8_on && backend_ctx->kq_mm_sg == 8 && ids8_kernel != nullptr && !ids8) {
++        ggml_cl_downgrade("op=MUL_MAT_ID type=%s path=tile reason=%s", ggml_type_name(src0->type),
++                          cache_src ? "expert-cache" : ((ggml_backend_opencl_buffer_context *) ids8_w->buffer->context)->usm != nullptr ? "bank" : "shape");
++    }
+     // the tokens-as-a kernel (kernel_mul_mm_id2_*) beat the tile kernel at its
+     // old tile (the coder's prefill on an A770 1,032 -> 1,231 t/s at 512
+     // tokens). With its tile searched (2,4,2,2) the tile kernel is faster than
+@@ -32796,7 +32810,7 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+         CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne00));
+         CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01));
+         const size_t wg8 = (size_t)backend_ctx->kq40_sg8_wg * 8;
+-        size_t global_work_size[] = { (size_t)max_tiles * wg8, (size_t)CEIL_DIV(ne01, (int)wg8), 1 };
++        size_t global_work_size[] = { (size_t)max_tiles * wg8, (size_t)CEIL_DIV(ne01, (int)wg8 * backend_ctx->kq_id_sg8_nr), 1 };
+         size_t local_work_size[]  = { wg8, 1, 1 };
+         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+         return true;
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_id_i8_sg8.cl b/ggml/src/ggml-opencl/kernels/mul_mm_id_i8_sg8.cl
+index 4241d7c..0654a0f 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mm_id_i8_sg8.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_id_i8_sg8.cl
+@@ -60,6 +60,12 @@
+ #define TMM 32                // pairs a tile, a multiple of 8
+ #endif
+ #define NGM (TMM / 8)
++#ifndef NR
++#define NR 2                  // sets of 8 weight rows a sub-group: one A read serves them all
++#endif
++#ifndef ID_KEEP_AF
++#define ID_NOAF               // no 32-block accumulator: see ID_XV
++#endif
+ 
+ // ID_RED: every weight scale negated (the red case of the suite)
+ #ifdef ID_RED
+@@ -177,56 +183,103 @@ static inline int8 id_iq4_b(uint w0, uint w1, uint w2, uint w3) {
+ #endif
+ 
+ // ---- the shared parts of the three kernels ----
+-// ne01 % 8 == 0 and ne00 % 256 == 0 by the dispatch: a sub-group's 8 rows are all real. A sub-group past the rows,
+-// a work-group past the tiles return at once; nothing here synchronizes a work-group.
++// A sub-group owns NR sets of 8 weight rows and reads each A tile once, into registers, for all of them. Measured on
++// the A770 (window 120, IQ4_XS, NR 1): the A reads were 50 % of the kernel, the decode 20, the DPAS and the rest 20,
++// the weight reads 3, the stores 1. Strata's thread owns 16 rows for the same reason (esimd_moe.dp.cpp); Alchemist's
++// DPAS takes 8, so here the 16 are two DPAS on one A operand. A set past the rows is skipped, so ne01 % (8 NR) may be
++// anything: ne01 % 8 == 0 by the dispatch, and ne00 % 256 == 0. A sub-group past the rows, a work-group past the tiles
++// return at once; nothing here synchronizes a work-group.
+ #define ID_COLS                                                                                       \
+     const int ti = get_group_id(0);                                                                   \
+     if (ti >= *n_tiles) return;                                                                       \
+-    const int r0 = (get_group_id(1) * WG + get_sub_group_id()) * 8;                                   \
++    const int r0 = (get_group_id(1) * WG + get_sub_group_id()) * 8 * NR;                              \
+     if (r0 >= ne01) return;                                                                           \
+     const int4 te = tiles[ti];                                                                        \
+     const int nz = te.z, ng = (nz + 7) / 8, nb = ne00 / QK_K;                                         \
++    const int nrv = min((int)NR, (ne01 - r0) / 8);                                                    \
+     const ulong wr = (ulong)te.x * ne01 + r0 + get_sub_group_local_id();   /* the expert's row */     \
+     const ulong tb = (ulong)ti * nb;                                                                  \
+     global const char * xt = xq + tb * 8 * TMM * 32;                                                  \
+-    float8 acc[NGM];                                                                                  \
++    float8 acc[NR * NGM];                                                                             \
+     _Pragma("unroll")                                                                                 \
+-    for (int g = 0; g < NGM; ++g) acc[g] = (float8)(0.f);
++    for (int i = 0; i < NR * NGM; ++i) acc[i] = (float8)(0.f);
+ 
+-#define AREAD(kb32, g) as_int8(intel_sub_group_block_read8((global const uint *)(xt + (ulong)(kb32) * TMM * 32 + (g) * 256)))
++// the tile's A operands of a 32-block, read once
++#define ID_ALOAD(kb32)                                                                                \
++    int8 at[NGM];                                                                                     \
++    _Pragma("unroll")                                                                                 \
++    for (int g = 0; g < NGM; ++g) {                                                                   \
++        at[g] = (int8)(0);                                                                            \
++        if (g < ng) at[g] = as_int8(intel_sub_group_block_read8((global const uint *)(xt + (ulong)(kb32) * TMM * 32 + g * 256))); \
++    }
+ 
+-// the scales of a 256-block's pair groups, and its accumulators, f32
++// the scales of a 256-block's pair groups, and its accumulators, f32. A float8 at sub-group 8 is 8 GRF: acc and af
++// cost 16 GRF a set and pair group, which is the register budget of NR x NGM. ID_NOAF folds the activation's scale
++// into each 32-block's fma instead (8 GRF, one more multiply a DPAS, the same value to one more f32 rounding).
++#ifdef ID_NOAF
++#define ID_AF_DECL
++#define ID_AF_ZERO
++#else
++#define ID_AF_DECL float8 af[NR * NGM];
++#define ID_AF_ZERO _Pragma("unroll") for (int i = 0; i < NR * NGM; ++i) af[i] = (float8)(0.f);
++#endif
+ #define ID_XV                                                                                         \
+-        float8 xv[NGM], af[NGM];                                                                      \
++        float8 xv[NGM];                                                                               \
++        ID_AF_DECL                                                                                    \
+         _Pragma("unroll")                                                                             \
+         for (int g = 0; g < NGM; ++g) {                                                               \
+             xv[g] = (float8)(0.f);                                                                    \
+-            af[g] = (float8)(0.f);                                                                    \
+             if (g < ng) xv[g] = vload8(0, xd + (tb + kb) * TMM + 8 * g);                              \
+-        }
++        }                                                                                             \
++        ID_AF_ZERO
+ 
+-// one DPAS a pair group for a 32-block, k ascending
+-#define ID_DPAS(kb32, BQ, WS)                                                                         \
++#ifdef ID_NOAF
++#define ID_DPAS_ACC(nr, g, F, WS) acc[(nr) * NGM + (g)] = fma(F, (float8)(WS) * xv[g], acc[(nr) * NGM + (g)]);
++#else
++#define ID_DPAS_ACC(nr, g, F, WS) af[(nr) * NGM + (g)] = fma(F, (float8)(WS), af[(nr) * NGM + (g)]);
++#endif
++// one DPAS a pair group for a 32-block of set nr, k ascending
++#define ID_DPAS(nr, BQ, WS)                                                                           \
+                 _Pragma("unroll")                                                                     \
+                 for (int g = 0; g < NGM; ++g) {                                                       \
+                     if (g < ng) {                                                                     \
+-                        const int8 ir = intel_sub_group_i8_i8_matrix_mad_k32(AREAD(kb32, g), BQ, (int8)(0)); \
+-                        af[g] = fma(convert_float8(ir), (float8)(WS), af[g]);                         \
++                        const int8 ir = intel_sub_group_i8_i8_matrix_mad_k32(at[g], BQ, (int8)(0));   \
++                        ID_DPAS_ACC(nr, g, convert_float8(ir), WS)                                    \
+                     }                                                                                 \
+                 }
+ 
+-// a pair's 8 rows are 8 contiguous floats of its output column: one block write
++// the end of a 256-block
++#ifdef ID_NOAF
++#define ID_ACC
++#else
++#define ID_ACC                                                                                        \
++        _Pragma("unroll")                                                                             \
++        for (int nr = 0; nr < NR; ++nr) {                                                             \
++            _Pragma("unroll")                                                                         \
++            for (int g = 0; g < NGM; ++g) {                                                           \
++                if (nr < nrv && g < ng) acc[nr * NGM + g] = fma(af[nr * NGM + g], xv[g], acc[nr * NGM + g]); \
++            }                                                                                         \
++        }
++#endif
++
++// a pair's 8 rows of a set are 8 contiguous floats of its output column: one block write
+ #define ID_STORE                                                                                      \
+     _Pragma("unroll")                                                                                 \
+     for (int g = 0; g < NGM; ++g) {                                                                   \
+         if (g < ng) {                                                                                 \
+             const ulong8 ov = vload8(0, oo + (ulong)ti * TMM + 8 * g);                                \
+             const ulong oa[8] = { ov.s0, ov.s1, ov.s2, ov.s3, ov.s4, ov.s5, ov.s6, ov.s7 };           \
+-            const float v[8] = { acc[g].s0, acc[g].s1, acc[g].s2, acc[g].s3, acc[g].s4, acc[g].s5, acc[g].s6, acc[g].s7 }; \
+             _Pragma("unroll")                                                                         \
+-            for (int m = 0; m < 8; ++m) {                                                             \
+-                if (8 * g + m < nz) {                                                                 \
+-                    intel_sub_group_block_write((global uint *)(dst + offd + oa[m]) + r0, as_uint(v[m])); \
++            for (int nr = 0; nr < NR; ++nr) {                                                         \
++                if (nr < nrv) {                                                                       \
++                    const float8 av = acc[nr * NGM + g];                                              \
++                    const float v[8] = { av.s0, av.s1, av.s2, av.s3, av.s4, av.s5, av.s6, av.s7 };    \
++                    _Pragma("unroll")                                                                 \
++                    for (int m = 0; m < 8; ++m) {                                                     \
++                        if (8 * g + m < nz) {                                                         \
++                            intel_sub_group_block_write((global uint *)(dst + offd + oa[m]) + r0 + 8 * nr, as_uint(v[m])); \
++                        }                                                                             \
++                    }                                                                                 \
+                 }                                                                                     \
+             }                                                                                         \
+         }                                                                                             \
+@@ -236,29 +289,44 @@ static inline int8 id_iq4_b(uint w0, uint w1, uint w2, uint w3) {
+     global const ulong * oo, global char * dst, ulong offd, int ne00, int ne01
+ 
+ // IQ4_XS, 136-byte blocks as stored: d, scales_h, scales_l[4], qs[128]. The rolled loop over 32 code bytes keeps
+-// one copy of two decodes in the instruction cache; only sb moves in it, and no array is indexed by it.
++// one copy of the decodes in the instruction cache; only sb moves in it, and no array is indexed by it.
+ __attribute__((intel_reqd_sub_group_size(8)))
+ kernel void kernel_mul_mm_id_iq4_xs_i8_sg8(global const uchar * q, ulong offq, global const half * dp, ID_ARGS) {
+     ID_COLS
+     global const uchar * b0 = q + offq + wr * nb * 136;
+     for (int kb = 0; kb < nb; ++kb) {
+-        global const uchar * bp = b0 + (ulong)kb * 136;
+-        const uint2 hw = vload2(0, (global const uint *)bp);   // s0: d | scales_h << 16, s1: scales_l
+-        const float d = (float)as_half((ushort)hw.s0);
++        uint2 hw[NR];
++        float dv[NR];
++        _Pragma("unroll")
++        for (int nr = 0; nr < NR; ++nr) {                       // s0: d | scales_h << 16, s1: scales_l
++            hw[nr] = (uint2)(0u);
++            if (nr < nrv) hw[nr] = vload2(0, (global const uint *)(b0 + ((ulong)nr * 8 * nb + kb) * 136));
++            dv[nr] = (float)as_half((ushort)hw[nr].s0);
++        }
+         ID_XV
+         for (int j = 0; j < 4; ++j) {
+-            const uint8 w = vload8(0, (global const uint *)(bp + 8 + j * 32));
++            uint8 wv[NR];
++            _Pragma("unroll")
++            for (int nr = 0; nr < NR; ++nr) {
++                wv[nr] = (uint8)(0u);
++                if (nr < nrv) wv[nr] = vload8(0, (global const uint *)(b0 + ((ulong)nr * 8 * nb + kb) * 136 + 8 + j * 32));
++            }
+             _Pragma("unroll")
+             for (int hi = 0; hi < 2; ++hi) {
+                 const int sb = 2 * j + hi;
+-                const int ls = (int)(((hw.s1 >> (4 * sb)) & 15u) | (((hw.s0 >> (16 + 2 * sb)) & 3u) << 4));
+-                const float ws = ID_WS(d * (float)(ls - 32));
+-                const int8 bq = hi ? id_iq4_b(w.s4, w.s5, w.s6, w.s7) : id_iq4_b(w.s0, w.s1, w.s2, w.s3);
+-                ID_DPAS(kb * 8 + sb, bq, ws)
++                ID_ALOAD(kb * 8 + sb)
++                _Pragma("unroll")
++                for (int nr = 0; nr < NR; ++nr) {
++                    if (nr < nrv) {
++                        const int ls = (int)(((hw[nr].s1 >> (4 * sb)) & 15u) | (((hw[nr].s0 >> (16 + 2 * sb)) & 3u) << 4));
++                        const float ws = ID_WS(dv[nr] * (float)(ls - 32));
++                        const int8 bq = hi ? id_iq4_b(wv[nr].s4, wv[nr].s5, wv[nr].s6, wv[nr].s7) : id_iq4_b(wv[nr].s0, wv[nr].s1, wv[nr].s2, wv[nr].s3);
++                        ID_DPAS(nr, bq, ws)
++                    }
++                }
+             }
+         }
+-        _Pragma("unroll")
+-        for (int g = 0; g < NGM; ++g) if (g < ng) acc[g] = fma(af[g], xv[g], acc[g]);
++        ID_ACC
+     }
+     ID_STORE
+ }
+@@ -271,18 +339,32 @@ kernel void kernel_mul_mm_id_iq4_nl_i8_sg8(global const uchar * q, ulong offq, g
+     for (int kb = 0; kb < nb; ++kb) {
+         ID_XV
+         for (int j = 0; j < 4; ++j) {
+-            const ulong blk = rb + kb * 8 + 2 * j;
+-            const uint8 w = vload8(0, (global const uint *)(q + offq + blk * 16));
+-            const float2 dv = vload_half2(0, dp + blk);
++            uint8 wv[NR];
++            float2 ds[NR];
++            _Pragma("unroll")
++            for (int nr = 0; nr < NR; ++nr) {
++                wv[nr] = (uint8)(0u);
++                ds[nr] = (float2)(0.f);
++                if (nr < nrv) {
++                    const ulong blk = rb + (ulong)nr * 8 * nb * 8 + kb * 8 + 2 * j;
++                    wv[nr] = vload8(0, (global const uint *)(q + offq + blk * 16));
++                    ds[nr] = vload_half2(0, dp + blk);
++                }
++            }
+             _Pragma("unroll")
+             for (int hi = 0; hi < 2; ++hi) {
+-                const float ws = ID_WS(hi ? dv.s1 : dv.s0);
+-                const int8 bq = hi ? id_iq4_b(w.s4, w.s5, w.s6, w.s7) : id_iq4_b(w.s0, w.s1, w.s2, w.s3);
+-                ID_DPAS(kb * 8 + 2 * j + hi, bq, ws)
++                ID_ALOAD(kb * 8 + 2 * j + hi)
++                _Pragma("unroll")
++                for (int nr = 0; nr < NR; ++nr) {
++                    if (nr < nrv) {
++                        const float ws = ID_WS(hi ? ds[nr].s1 : ds[nr].s0);
++                        const int8 bq = hi ? id_iq4_b(wv[nr].s4, wv[nr].s5, wv[nr].s6, wv[nr].s7) : id_iq4_b(wv[nr].s0, wv[nr].s1, wv[nr].s2, wv[nr].s3);
++                        ID_DPAS(nr, bq, ws)
++                    }
++                }
+             }
+         }
+-        _Pragma("unroll")
+-        for (int g = 0; g < NGM; ++g) if (g < ng) acc[g] = fma(af[g], xv[g], acc[g]);
++        ID_ACC
+     }
+     ID_STORE
+ }
+@@ -303,46 +385,88 @@ static inline void id_scale_min_k4(int j, uint3 w, float * sc, float * m) {
+     }
+ }
+ 
++// the 6-bit scale of sub-block j alone, for the rolled K loop
++static inline float id_scale_k4(int j, uint3 w) {
++    if (j < 4) return (float)((w.s0 >> (8 * j)) & 63);
++    const int jj = j - 4;
++    return (float)(((w.s2 >> (8 * jj)) & 0xF) | ((((w.s0 >> (8 * jj)) & 0xFF) >> 6) << 4));
++}
++
+ __attribute__((intel_reqd_sub_group_size(8)))
+ kernel void kernel_mul_mm_id_q4_K_i8_sg8(global const uchar * q, global const uchar * s, global const half * d, global const half * dm,
+                                          global const half * xs, ID_ARGS) {
+     ID_COLS
+     const ulong rb = wr * nb;
+     for (int kb = 0; kb < nb; ++kb) {
+-        const ulong b = rb + kb;
+-        const uint3 sw = vload3(0, (global const uint *)(s + b * 12));
+-        const float D = vload_half(0, d + b), DM = vload_half(0, dm + b);
+-        ID_XV
+-        half mh[16];
+-        _Pragma("unroll")
+-        for (int sb = 8; sb < 16; ++sb) mh[sb] = (half)(0.f);
++        ulong bo[NR];
++        uint3 sw[NR];
++        float Dv[NR];
++        int8 bm[NR];     // the constant term's B operand of a set: its 8 scale-and-min halves, then zeros
+         _Pragma("unroll")
++        for (int nr = 0; nr < NR; ++nr) {
++            bo[nr] = rb + (ulong)nr * 8 * nb + kb;
++            sw[nr] = (uint3)(0u);
++            Dv[nr] = 0.f;
++            float DM = 0.f;
++            if (nr < nrv) {
++                sw[nr] = vload3(0, (global const uint *)(s + bo[nr] * 12));
++                Dv[nr] = vload_half(0, d + bo[nr]);
++                DM = vload_half(0, dm + bo[nr]);
++            }
++            half16 mv = (half16)(0.f);
++            _Pragma("unroll")
++            for (int sb = 0; sb < 8; ++sb) {
++                float sc, mn;
++                id_scale_min_k4(sb, sw[nr], &sc, &mn);
++                mv[sb] = (half)(8.f * Dv[nr] * sc - DM * mn);
++            }
++            bm[nr] = as_int8(mv);
++        }
++        ID_XV
+         for (int j = 0; j < 4; ++j) {
+-            const uint8 w = vload8(0, (global const uint *)(q + b * 128 + j * 32));
+-            const uint wa[8] = { w.s0, w.s1, w.s2, w.s3, w.s4, w.s5, w.s6, w.s7 };
++            uint8 wv[NR];
++            _Pragma("unroll")
++            for (int nr = 0; nr < NR; ++nr) {
++                wv[nr] = (uint8)(0u);
++                if (nr < nrv) wv[nr] = vload8(0, (global const uint *)(q + bo[nr] * 128 + j * 32));
++            }
+             _Pragma("unroll")
+             for (int hi = 0; hi < 2; ++hi) {
+                 const int sb = 2 * j + hi;
+-                float sc, mn;
+-                id_scale_min_k4(sb, sw, &sc, &mn);
+-                mh[sb] = (half)(8.f * D * sc - DM * mn);
+-                int8 bq;
++                ID_ALOAD(kb * 8 + sb)
+                 _Pragma("unroll")
+-                for (int i = 0; i < 8; ++i) bq[i] = ID_QK_S8(hi ? wa[i] >> 4 : wa[i]);
+-                const float ds = ID_WS(D * sc);
+-                ID_DPAS(kb * 8 + sb, bq, ds)
++                for (int nr = 0; nr < NR; ++nr) {
++                    if (nr < nrv) {
++                        int8 bq;
++                        bq.s0 = ID_QK_S8(hi ? wv[nr].s0 >> 4 : wv[nr].s0);
++                        bq.s1 = ID_QK_S8(hi ? wv[nr].s1 >> 4 : wv[nr].s1);
++                        bq.s2 = ID_QK_S8(hi ? wv[nr].s2 >> 4 : wv[nr].s2);
++                        bq.s3 = ID_QK_S8(hi ? wv[nr].s3 >> 4 : wv[nr].s3);
++                        bq.s4 = ID_QK_S8(hi ? wv[nr].s4 >> 4 : wv[nr].s4);
++                        bq.s5 = ID_QK_S8(hi ? wv[nr].s5 >> 4 : wv[nr].s5);
++                        bq.s6 = ID_QK_S8(hi ? wv[nr].s6 >> 4 : wv[nr].s6);
++                        bq.s7 = ID_QK_S8(hi ? wv[nr].s7 >> 4 : wv[nr].s7);
++                        const float ds = ID_WS(Dv[nr] * id_scale_k4(sb, sw[nr]));
++                        ID_DPAS(nr, bq, ds)
++                    }
++                }
+             }
+         }
+-        half16 mv;
+-        _Pragma("unroll")
+-        for (int i = 0; i < 16; ++i) mv[i] = mh[i];
+-        const int8 bm = as_int8(mv);
+         _Pragma("unroll")
+         for (int g = 0; g < NGM; ++g) {
+             if (g < ng) {
+                 const int8 sa = as_int8(intel_sub_group_block_read8((global const uint *)(xs + ((tb + kb) * TMM + 8 * g) * 16)));
+-                const float8 cst = intel_sub_group_f16_f16_matrix_mad_k16(sa, bm, (float8)(0.f));
+-                acc[g] = fma(af[g] + cst, xv[g], acc[g]);
++                _Pragma("unroll")
++                for (int nr = 0; nr < NR; ++nr) {
++                    if (nr < nrv) {
++                        const float8 cst = intel_sub_group_f16_f16_matrix_mad_k16(sa, bm[nr], (float8)(0.f));
++#ifdef ID_NOAF
++                        acc[nr * NGM + g] = fma(cst, xv[g], acc[nr * NGM + g]);
++#else
++                        acc[nr * NGM + g] = fma(af[nr * NGM + g] + cst, xv[g], acc[nr * NGM + g]);
++#endif
++                    }
++                }
+             }
+         }
+     }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 5408727..b17a14f 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11656,6 +11656,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_mul_mat_id_dup(type_a, GGML_TYPE_F32, 8, 4, false, 64, 64, 256));
+         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 4, true, 64, 64, 256, 1.0f, 0, true));
+         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, true, 50, 33, 256));
++        // 0104: rows that end inside a sub-group's sets of 8 at NR 2 and at NR 4
++        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, true,  24, 33, 512));
++        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, false, 2040, 33, 512));
+     }
+ 
+     // Q2_0 rows of 20 and 12 sub-blocks (4 lanes a row in the OpenCL low-bit matvec) and of 10 (16 lanes):
+-- 
+2.47.3
+

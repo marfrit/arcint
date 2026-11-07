@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 1.5.4 LANGUAGES CXX)
+project(arcint VERSION 1.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -80,6 +80,7 @@ add_library(arcint_core STATIC
   src/util/sha256.cpp
   src/util/utf8.cpp
   src/util/text.cpp
+  src/core/admission.cpp
   src/core/reasoning.cpp
   src/core/renderer_material.cpp
   src/core/sampler.cpp
@@ -264,10 +265,12 @@ if(ARCINT_TESTS)
     tests/test_config.cpp
     tests/test_verify_walk.cpp
     tests/test_mtp_trace.cpp
+    tests/test_mtp_capture.cpp
     tests/test_draft_policy.cpp
     tests/test_dflash_walk.cpp
     tests/test_spec_state.cpp
     tests/test_token_ids.cpp
+    tests/test_mtp_head_file.cpp
     tests/test_props.cpp
     tests/test_sampler_modes.cpp
     tests/test_fast_topk.cpp
@@ -276,6 +279,8 @@ if(ARCINT_TESTS)
     tests/test_context_guard.cpp
     tests/test_lanes.cpp
     tests/test_reasoning.cpp
+    tests/test_admission.cpp
+    tests/test_gemma4.cpp
     tests/test_markers.cpp
     tests/test_stream_utf8.cpp
     tests/test_stop_think_ids.cpp
@@ -315,6 +320,13 @@ if(ARCINT_TESTS)
     add_executable(arcint-tool-grammar-probe tools/tool_grammar_probe.cpp)
     target_link_libraries(arcint-tool-grammar-probe PRIVATE arcint_core)
     target_compile_options(arcint-tool-grammar-probe PRIVATE -Wall -Wextra -Wpedantic)
+    # Renders a chat template read from a file with the engine's own minja setup,
+    # over a matrix of tools / thinking / exchange shapes (tools/template_probe.cpp).
+    # Not a ctest case: it needs a template taken from a GGUF, which is never
+    # committed.
+    add_executable(arcint-template-probe tools/template_probe.cpp)
+    target_link_libraries(arcint-template-probe PRIVATE arcint_core)
+    target_compile_options(arcint-template-probe PRIVATE -Wall -Wextra -Wpedantic)
     # audit 15's number: a vocab-only GGUF, the old two-call encode against the
     # one-pass encode, on the host or the card host (tools/tokenize_cost.cpp,
     # the campaign's command). Not a ctest case: it needs the GGUF.
@@ -437,6 +449,21 @@ if(ARCINT_TESTS)
            COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_mtp_width_replay.py")
   set_tests_properties(mtp-width-replay PROPERTIES LABELS unit)
+
+  # The MTP head-fit tools (campaign mtp-head-fit, E1): the capture format, the task
+  # split, the round-start simulation, the replay's HTTP flow; with numpy, also eval
+  # (its red case), the linear fit and the GGUF decoders. Device-free.
+  add_test(NAME mtp-fit
+           COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_mtp_fit.py")
+  set_tests_properties(mtp-fit PROPERTIES LABELS unit)
+
+  # tools/coder_mtp_gguf.py (campaign mtp-head-fit, E2): the head-only MTP GGUFs of the
+  # no-training arms; a tensor it cannot place fails. Synthetic files, device-free.
+  add_test(NAME coder-mtp-gguf
+           COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_coder_mtp_gguf.py")
+  set_tests_properties(coder-mtp-gguf PROPERTIES LABELS unit)
 
   # tools/llama_scoreboard.py: what makes a row of the community GPU tables comparable.
   add_test(NAME llama-scoreboard

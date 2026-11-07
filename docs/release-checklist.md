@@ -9,6 +9,15 @@ Run the acceptance target before tagging a release:
 
 Every 77 (skip) must be named on that command line, or the run does not count as a release gate (docs/design-0.3.1-test-ladder.md §2).
 
+## After the tag: the flattened branch
+
+The branch `flattened` holds the pin with the series applied, so the code can be read as files: its first commit is the unmodified pin, then one commit a release. Only released series go on it. After a tag is pushed, on a worktree of that branch, with the pin tarball `build-deb.sh` checks:
+
+    contrib/llama.cpp/flatten-release.sh <worktree> <tag> <pin tarball>
+    git -C <worktree> push origin flattened    # then the mirror
+
+Scan the new commit's diff for the private-names pattern before the push.
+
 ## Speed against the last release
 
 The served cells' floors are a report; the speed gate is a same-window A/B (DESIGN.md §5). For each service on its card, with the units' flags:

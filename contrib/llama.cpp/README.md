@@ -6561,3 +6561,42 @@ Served, deployed flags, 12 short answers and prompts of 396, 621, 1,821, 6,021 a
 
 Red, each seen reported, on the coder: `GGML_OPENCL_Q8_I8=0` 4 keys, Q8_0 at K 2048 and 512 on the generic GEMM and on the matvec; a program that does not compile, `not-built what=q40_i8_sg8`. The first version of this patch missed the matvec, and short prompts never reached the generic path, so that red run reported nothing: a card check of this kind needs long prompts.
 
+## 0101-opencl-downgrade-expert-and-fa.patch
+
+0100's list, widened to what it left out: an expert product on ggml's generic `MUL_MAT_ID` (`op=MUL_MAT_ID type= k= path=generic reason=no-fast-path`), and a prompt's flash attention (more than 8 rows) off the XMX kernel (`op=FLASH_ATTN head= kv= n_q=9+ path=f32_f16 reason=no-dpas-kernel|shape`). Sub-group 8 has no GQA decode kernel by design, and an expert product below 16 tokens takes the matvec by design: neither reports.
+
+Served on all three units with prompts up to 19,521 tokens, nothing new (`measured-here`). Red, each seen reported: `GGML_OPENCL_FA_DPAS=0` on Llama 2 through arcint, `op=FLASH_ATTN head=128 kv=f16 n_q=9+ path=f32_f16 reason=no-dpas-kernel`, prefill 2814 -> 1461 t/s; `test-backend-ops -o MUL_MAT_ID -p type_a=q8_0`, the generic expert key at K 256 and 96. `llama-bench` installs a null log callback (`llama-bench.cpp:2286`), so it never shows these lines: check through arcint's `/props` or a tool that keeps the log.
+
+## 0102-opencl-q4_K-int8-sg8.patch
+
+Dense Q4_K on Alchemist takes 0099's shape: int8 DPAS, the activations packed once a graph, no local memory. From 16 columns, K a multiple of 256; the quantizer also writes the integer sums per 32 for Q4_K's constant term, a k16 fp16 DPAS a block. `GGML_OPENCL_KQ_SG8_I8=0` keeps the tile.
+
+`measured-here`, the coder's file on the A770, 4,096 tokens, ubatch 1,024, f16 KV, 3 repetitions, two rounds: prefill 1,865 -> 1,919 t/s (+2.9 %), decode 58.6 both, the kernel 838 -> 632 ms over the profile's run. KL against the file's CPU reference, 8 chunks: ubatch 512 0.00572 -> 0.00585, same top 96.91 -> 97.40 %; ubatch 32 0.00588 -> 0.00600, same top 96.77 -> 96.62 %. `MUL_MAT` q4_K 129/129, with `GGML_OPENCL_KQ_SG8_I8=0` too; red (`-DQK_RED`) 117/129. Served A/B and the acceptance task are owed.
+
+## 0103-opencl-id-int8-sg8.patch
+
+The prompt's expert products on Alchemist take int8 DPAS: IQ4_XS, IQ4_NL and Q4_K, K a multiple of 256, rows a multiple of 8. `kernels/mul_mm_id_i8_sg8.cl`, its own program, so a compile failure costs this arm only. `kernel_id_pack_i8_sg8` copies the quantized columns once per (activation, route) into the route's tile order, `[tile][k/32][TMM][32]`, so gate and up share it; no local memory and no barrier. The IQ4 weight codes are `kvalues_iq4nl`, -127..113, never rounded: `id_kv4` is a mux over the code's bit planes, with no memory read; `-DID_KV_TABLE` is Strata's byte-pair table (they tie once 0104 is in). The expert cache's slots and the bank decline to the tile, and a decline at dispatch is reported (0104). `GGML_OPENCL_KQ_ID_SG8_I8=0` keeps the tile and does not build the program.
+
+Alone it is a loss, recorded because the reason is what 0104 acts on (`measured-here`, the coder's file on the A770, 4,096 tokens, ubatch 1,024, f16 KV): prefill 1,918 -> 1,636 t/s, 1,680 with the table. Tile sizes do not rescue it: TMM 16, 32, 64, 128 give 1,490, 1,636, 1,578, 1,082. Taking the kernel apart with timing-only switches (IQ4_XS, 2,797 ms over the profile, the fp16 tile 2,042): activation reads 50 %, weight reads 3 %, the decode 20 %, stores 1 %, DPAS and the rest 20 %.
+
+Differences from Strata's form (`code`, `sycl/src/prefill/esimd_moe.dp.cpp`, `esimd_moe.hpp`): Strata runs int8 only on Battlemage by default and keeps Alchemist on FP16, so an Alchemist int8 path has no reference result; its thread owns 16 rows (sub-group 16), here 8; it picks 2, 4 or 8 row tiles per decode from the experts' mean rows, here fixed; and it scales the activations per 32 of K, here per 256 (`kernel_quant_i8_sg8`, shared with 0099), which is 8x coarser and the likely part of the KL below.
+
+## 0104-opencl-id-int8-row-sets.patch
+
+A sub-group owns `NR` sets of 8 weight rows and reads each activation tile once, into registers, for all of them, which divides the reads that were half of 0103's kernel. Alchemist's DPAS takes 8 rows, so Strata's 16-row thread is here two DPAS on one A operand. A float8 at sub-group 8 is 8 GRF, so the register budget binds: `acc` and `af` are 16 GRF a set and pair group, and NR 3 needs about 296 of 256; IGC spills and retries with rolled loops. `ID_NOAF`, the default, drops `af`, folding the activation's scale into each 32-block's fma: 8 GRF, one more multiply a DPAS, the same value to one more f32 rounding. Q4_K's constant term moves out of the K loop. `GGML_OPENCL_KQ_ID_NR` picks NR, 2 by default; `-DID_KEEP_AF` keeps `af`.
+
+`measured-here`, the same file and card, 4,096 tokens, ubatch 1,024, f16 KV, 3 repetitions, same window: off 1,916 / 1,918; NR 1 2,043; NR 2 with `af` 1,938; **NR 2 without `af` 2,151 (+12.2 %)**, table 2,149; NR 3 without `af` 2,042, table 2,092; NR 4 without `af` 1,430 (spilled). Decode 58.6 in every arm. On the exact tree, two rounds: 1,915 -> 2,150 t/s. Served on the coder's deployed flags, q8_0:q4_0 KV, against 1.5.4: prefill at 41k 843.3 -> 958.5 t/s (+13.7 %); at a 90k prompt 166.8 -> 159.2 s.
+
+Answers (`measured-here`): the acceptance task 10/10 x3, deployed 10/10; KL against the file's CPU reference, 8 chunks, off -> on: ubatch 512 .00585 -> .00803, same top 97.40 -> 96.67 %; ubatch 32 .00600 -> .00909, 96.62 -> 96.81 %. Inside the bar.
+
+The A/B's decode cells went red: answer b 58.8 -> 54.5 t/s, c 52.25 -> 51.4, a 56.35 -> 56.55, with different texts. A verify costs the same in both arms (30.6-31.1 ms), and the new texts took 389 verifies against 376. Whether quantized prefill costs draft acceptance was measured apart: 24 generated prompts, each with its own 2k-token prefix so that its prefill takes this path, deployed flags, two rounds: tokens a verify 2.45, 2.40 -> 2.43, 2.47, accepted 75, 76 % -> 75, 76 %. No loss; the red is text variation over three answers.
+
+Memory: 43 MiB more, peak 16,208 -> 16,251 MiB on these prompts and 16,220 -> 16,263 at the 90k prompt, of the A770's 16,288. GTT stayed at 32 MiB, so nothing is evicted, but the margin is 25 MiB.
+
+Suites, `-o MUL_MAT_ID` on the A770: iq4_xs 22/22, q4_K 105/105, iq4_nl 25/25, off the same; red (`-DID_RED`, a negated weight scale) 3/22, 40/105, 7/25. The first form of this patch made Q4_K spill at every NR, seen in the IGC dump, not in the suite. On the A770 only: both programs build only at sub-group 8, so the B60 does not change.
+
+## 0105-mtp-head-without-output.patch
+
+`qwen35moe.cpp` only. A head-only MTP GGUF (the trunk's probe tensor `blk.0.attn_norm.weight` absent) may carry no `output.weight`. Before, the loader made a `TENSOR_DUPLICATED` copy of `token_embd` as `output` for it, 398 MiB on the coder's card, which the draft never reads when `--llama-mtp-vocab` is set: the MTP context then returns the nextn rows and arcint scores them against rows it reads from a file (`DraftHead`). Now an MTP-only file without `output.weight` gets no fallback, and `graph_mtp` leaves `res->t_logits` null where it asserted on a missing head. A file with `output.weight` or `nextn.shared_head_head`, a trunk-only file and a full model load and build as before. A context that asks for logits from such a head has none to read: arcint refuses that combination at start (a head file without `output.weight` needs `--llama-mtp-vocab`).
+
+`code`, not yet built or run here: the head file's saving is `output` (398 MiB on the coder), the card proof is owed (`docs/campaigns/mtp-head-fit.md`).

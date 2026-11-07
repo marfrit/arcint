@@ -337,6 +337,7 @@ std::string usage_text() {
         "                            the output head\n"
         "  --llama-mtp-gguf FILE     the MTP layer from this MTP-only GGUF (llama.cpp's\n"
         "                            converter --mtp) instead of the model's own file\n"
+        "                            A file without output.weight needs --llama-mtp-vocab\n"
         "  --llama-mtp-min-p P       stop drafting at a token the MTP head gives less\n"
         "                            than P, and leave it out of the verify (0-1; 0 off:\n"
         "                            always --llama-mtp drafts)\n"
@@ -377,7 +378,8 @@ std::string usage_text() {
         "  --llama-checkpoints N     per lane, up to N snapshots of a hybrid model's\n"
         "                            recurrent state (near the prompt's end, at user\n"
         "                            messages), so a follow-up or an edited message\n"
-        "                            resumes instead of re-prefilling (default 32; 0 off)\n"
+        "                            resumes instead of re-prefilling (default 32; 0 off;\n"
+        "                            a model with no recurrent state refuses the flag)\n"
         "  --llama-checkpoint-step T the least spacing of snapshots at earlier user\n"
         "                            messages (default 8192)\n"
         "  --llama-expert-cache MIB  MIB of expert slots on the card for the MoE layers\n"
@@ -491,6 +493,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--llama-checkpoints") {
             if (!value(v) || !parse_int(v, cfg.llama_checkpoints) || cfg.llama_checkpoints < 0)
                 return fail("--llama-checkpoints needs a count >= 0 (0: off)");
+            cfg.llama_checkpoints_asked = cfg.llama_checkpoints > 0;
         } else if (arg == "--llama-checkpoint-step") {
             if (!value(v) || !parse_int(v, cfg.llama_checkpoint_step) || cfg.llama_checkpoint_step < 1)
                 return fail("--llama-checkpoint-step needs a token count >= 1");

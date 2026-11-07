@@ -5,6 +5,8 @@
 #include <string_view>
 #include <vector>
 
+#include "core/dialect.h"
+
 // DESIGN.md §3.7: the models' native tool-call output is parsed server-side
 // into OpenAI-shaped `tool_calls`. arcint parses, never executes.
 //
@@ -55,6 +57,22 @@ struct ToolCallParse {
 // are coerced to the declared JSON types; without it every value stays a
 // string, which is the honest reading of the wire format.
 ToolCallParse parse_qwen_tool_calls(std::string_view text, const ToolSchemas* schemas = nullptr);
+
+// Gemma 4's form (ChatDialect::Gemma4): its own tool-call marker pair around
+// the word call, a colon, the function name and a brace-delimited list of
+// key:value pairs. A string value sits between two string delimiters (single
+// special tokens, core/markers.h), a number, a boolean or null stands bare, and
+// an object or an array nests in the same form. Keys are bare words (a key in
+// the string delimiter is read too). Where `schemas` declares a parameter a
+// string, a bare value is kept as the string it was written as.
+// Dispatches on the dialect: Gemma4 takes the form above, every other dialect
+// the Qwen forms, so a caller passes the loaded model's dialect and nothing else.
+ToolCallParse parse_tool_calls(std::string_view text, ChatDialect dialect, const ToolSchemas* schemas = nullptr);
+
+// The marker that starts / ends a call in this dialect: the streaming callers
+// hold the text back from the opener on, and need it spelled once, from here.
+std::string_view tool_call_open(ChatDialect dialect);
+std::string_view tool_call_close(ChatDialect dialect);
 
 // The coder's call tags, written once here so the parser and the grammar
 // (clean-turns step 2) cannot drift. The open/close are single special tokens

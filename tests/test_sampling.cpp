@@ -1,6 +1,11 @@
 #include "core/sampling.h"
 #include "harness.h"
 
+#include <functional>
+#include <map>
+#include <optional>
+#include <string>
+
 using namespace lgc;
 
 TEST(sampling_defaults_come_from_the_allowlist_entry) {
@@ -272,4 +277,80 @@ TEST(sampling_answer_penalties_travel_and_the_request_overrides_them) {
     bad.answer_frequency_penalty = 3.0f;
     CHECK(sampler_apply(r, bad).has_value());
     CHECK(!r.answer_configured());   // nothing applied on refusal
+}
+
+namespace {
+std::function<std::optional<std::string>(const char*)> card(std::map<std::string, std::string> kv) {
+    return [kv](const char* key) -> std::optional<std::string> {
+        const auto it = kv.find(key);
+        if (it == kv.end()) return std::nullopt;
+        return it->second;
+    };
+}
+}  // namespace
+
+TEST(card_sampling_a_gguf_without_keys_keeps_the_provisional_row) {
+    SamplerDefaults d;
+    CHECK(!sampler_defaults_apply_card(d, card({})));
+    CHECK_EQ(d.provenance, std::string("provisional"));
+    CHECK_NEAR(d.temperature, 0.7, 1e-6);
+    CHECK_EQ(d.top_k, 20);
+    CHECK_NEAR(d.repetition_penalty, 1.05, 1e-6);
+}
+
+TEST(card_sampling_the_keys_make_the_row) {
+    SamplerDefaults d;
+    CHECK(!sampler_defaults_apply_card(d, card({{"general.sampling.temp", "1.000000"},
+                                                {"general.sampling.top_p", "0.950000"},
+                                                {"general.sampling.top_k", "64"}})));
+    CHECK_EQ(d.provenance, std::string("card"));
+    CHECK_NEAR(d.temperature, 1.0, 1e-6);
+    CHECK_NEAR(d.top_p, 0.95, 1e-6);
+    CHECK_EQ(d.top_k, 64);
+    // a card that names no penalty asks for none
+    CHECK_NEAR(d.repetition_penalty, 1.0, 1e-6);
+    CHECK_NEAR(d.presence_penalty, 0.0, 1e-6);
+}
+
+TEST(card_sampling_a_card_without_top_k_sets_no_limit) {
+    SamplerDefaults d;
+    CHECK(!sampler_defaults_apply_card(d, card({{"general.sampling.temp", "1.000000"}, {"general.sampling.top_p", "0.950000"}})));
+    CHECK_EQ(d.top_k, 0);
+    CHECK_EQ(d.provenance, std::string("card"));
+}
+
+TEST(card_sampling_a_bad_value_is_an_error_and_leaves_the_row) {
+    SamplerDefaults d;
+    CHECK(sampler_defaults_apply_card(d, card({{"general.sampling.temp", "warm"}})).has_value());
+    CHECK(sampler_defaults_apply_card(d, card({{"general.sampling.temp", "-1"}})).has_value());
+    CHECK_EQ(d.provenance, std::string("provisional"));
+    CHECK_NEAR(d.temperature, 0.7, 1e-6);
+}
+
+TEST(card_sampling_the_operator_wins_over_the_card) {
+    SamplerDefaults d;
+    CHECK(!sampler_defaults_apply_card(d, card({{"general.sampling.temp", "1.000000"}, {"general.sampling.top_k", "64"}})));
+    SamplerOverrides o;
+    o.temperature = 0.6f;
+    CHECK(!sampler_defaults_apply(d, o));
+    CHECK_EQ(d.provenance, std::string("operator"));
+    CHECK_NEAR(d.temperature, 0.6, 1e-6);
+    CHECK_EQ(d.top_k, 64);
+}
+
+TEST(card_sampling_a_card_may_name_min_p_and_a_penalty) {
+    SamplerDefaults d;
+    CHECK(!sampler_defaults_apply_card(d, card({{"general.sampling.temp", "0.900000"},
+                                                {"general.sampling.min_p", "0.050000"},
+                                                {"general.sampling.penalty_repeat", "1.100000"}})));
+    CHECK_NEAR(d.min_p, 0.05, 1e-6);
+    CHECK_NEAR(d.repetition_penalty, 1.1, 1e-6);
+    CHECK_EQ(d.provenance, std::string("card"));
+}
+
+TEST(card_sampling_nan_and_a_fractional_top_k_are_errors) {
+    SamplerDefaults d;
+    CHECK(sampler_defaults_apply_card(d, card({{"general.sampling.temp", "nan"}})).has_value());
+    CHECK(sampler_defaults_apply_card(d, card({{"general.sampling.top_k", "20.5"}})).has_value());
+    CHECK_EQ(d.provenance, std::string("provisional"));
 }

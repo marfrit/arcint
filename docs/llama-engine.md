@@ -683,6 +683,14 @@ references and every number):
   layer returns (the file's `nextn.hc_head_*` weights, as the model's graph
   does); on Flash-Next Strata's 106,299-token subset drafted 6 points fewer
   accepted tokens than the full head and decoded slower (30.6 -> 29.7 t/s).
+  A qwen35moe head file may omit `output.weight` (llama.cpp 0105;
+  `tools/coder_mtp_gguf.py strip-output`): the loader then makes no copy of
+  the embedding as the LM head (398 MiB on the coder's card), and the draft
+  head reads its vocabulary rows from the served file. That needs
+  `--llama-mtp-vocab`: without it the MTP context asks for logits and has no
+  head, so the engine refuses at start. A head file with `output.weight`
+  loads as before. Card proof and VRAM difference:
+  `docs/campaigns/mtp-head-fit.md`.
 - `--llama-mtp-min-p P` stops drafting at a token the MTP head gives less
   than P and leaves it out of the verify (Strata's `--spec-min-p`); off by
   default. On Flash-Next IQ2_XS 3 drafts with 0.5 matched 2 without it
@@ -703,6 +711,8 @@ The dense model's 20-run sampled arm with that configuration scored 11 of
 (mean 6.9), and the record's earlier plain arms 10, 11 and 15.
 
 ## Context checkpoints (`--llama-checkpoints N`, `--llama-checkpoint-step T`)
+
+A count above 0 on a model that is neither hybrid nor recurrent is refused at start: an attention cache trims, so there is nothing to snapshot. The default of 32 is not a request.
 
 The Qwen 3.x models are hybrid: their GatedDeltaNet layers carry a recurrent
 state that llama.cpp cannot cut back to an earlier token (it refuses the

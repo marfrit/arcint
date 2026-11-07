@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Markus Fritsche <mfritsche@reauktion.de>
+Date: Fri, 6 Nov 2026 14:28:31 +0000
+Subject: [PATCH] 0101-opencl-downgrade-expert-and-fa
+
+---
+ ggml/src/ggml-opencl/ggml-opencl.cpp | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index c6ee9f7..5405f30 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -22830,10 +22830,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     const int fa_dki = d_head_q == 256 && d_head_v == 256 ? 0 : d_head_q == 128 && d_head_v == 128 ? 1 : -1;
+     cl_kernel kd_sel = fa_dki < 0 ? nullptr : is_mixed ? backend_ctx->kernel_fa_dpas_dk[fa_dki]
+                                             : kvq >= 0 ? backend_ctx->kernel_fa_dpas_q_dk[fa_dki][kvq] : nullptr;
+-    if (kd_sel != nullptr && n_q > 8 &&
++    const bool fa_dpas_ok = kd_sel != nullptr && n_q > 8 &&
+         sinks == nullptr && max_bias == 0.0f && logit_softcap == 0.0f &&
+         q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
+-        (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q))) {
++        (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q));
++    if (backend_ctx->gpu_family == INTEL && n_q > 8 && !fa_dpas_ok) {
++        ggml_cl_downgrade("op=FLASH_ATTN head=%d kv=%s n_q=9+ path=f32_f16 reason=%s", (int) d_head_q, ggml_type_name(k->type),
++                          kd_sel == nullptr ? "no-dpas-kernel" : "shape");
++    }
++    if (fa_dpas_ok) {
+         cl_mem    nomask = nullptr;
+         // flash_attn_dpas2.cl: Q to f16 once a call, K/V read in place by 2D
+         // block reads, which want 64-byte aligned heads and a row pitch of a
+@@ -32773,6 +32778,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
+         return;
+     }
+ #endif
++    if (backend_ctx->gpu_family == INTEL) {
++        ggml_cl_downgrade("op=MUL_MAT_ID type=%s k=%d path=generic reason=no-fast-path", ggml_type_name(src0->type), (int) src0->ne[0]);
++    }
+     const int dst_rows = ne20*ne21; // ne20 = n_used_experts, ne21 = n_rows
+ 
+     GGML_ASSERT(ne00 == ne10);
+-- 
+2.47.3
+
