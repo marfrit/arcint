@@ -28,6 +28,13 @@
 - Flash-Next's production quant is ISTA-DASLab's GSQ-RCO IQ3_S since
   2026-10-20 (operator): 33.3 t/s decode on six answers, KL 0.127 against
   Q8_0 (IQ3_XXS 38.0 t/s, 0.217, the rollback).
+- Version 1.6.1 (2026-11-07): Gemma 4 E4B on the fast path at both KV types: flash attention at head size 512 on
+  Intel (0106), upstream's f16 one-column matvec fixed for sub-groups narrower than 64 (0107: the f16-KV decode was
+  wrong, KL 3.37 -> 0.0044), F32 weights multiplied through an f16 copy in prompts (0110, +3.7-3.9 % prefill);
+  Dory1.0-4B admitted (0108 the looped nGPT, 0109 OpenCL BF16 CPY; --llama-dory-loops, --llama-dory-kv).
+- Version 1.6.0 (2026-11-07): the coder's prompt expert products on int8 DPAS on Alchemist (0102-0104, prefill at
+  41k +13.8 %); an MTP head file without output.weight (0105); Gemma 4 E4B and Granite 4.2 8B admitted; sampling
+  defaults from the model card.
 - Version 1.5.4 (2026-11-06): a path other than the one a weight's type promises is logged once as `DOWNGRADE <key>` and
   counted on /props `downgrades` (0100); the release gate fails on a key not accepted for the unit.
 - Version 1.5.3 (2026-11-06): dense Q4_0 and Q8_0 weights on int8 DPAS without local memory (0099): Llama 2 prefill
