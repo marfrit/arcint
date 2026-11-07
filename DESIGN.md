@@ -115,8 +115,9 @@ model); anything else is refused at load, and an untested size of an admitted
 architecture is refused the same way, the message naming the admitted sizes.
 
 Two models admitted 2026-11-06 (operator's order: admit now, optimise later;
-card-free work only). Neither has been loaded or served by arcint: what is
-claimed below is what the files and the code say.
+card-free work only). The geometry and dialect claims below are what the files
+and the code say (`code`); the card results at the end of the Gemma row were
+measured on 2026-11-07.
 
 - **Gemma 4 E4B** (`gemma4`; `code`, read from the GGUF's metadata): 42 layers,
   `n_embd` 2560, 8 query heads over 2 KV heads, key length 512 (256 on the
@@ -145,6 +146,17 @@ claimed below is what the files and the code say.
   the Qwen dialects, Granite's included, keep thinking as the unset default).
   And the gateway's renderer material, which carries Qwen parser
   rows only, is not built (token mode off on that unit, said in the load log).
+  On the cards (`measured-here`, 2026-11-07, contrib/llama.cpp patches 0106,
+  0107, 0110): Gemma 4 E4B is on the fast path at both KV types, and the
+  f16-KV decode defect is fixed. B60, ctx 16,384, a 6.5k-token prompt, against
+  1.6.0: q8_0:q4_0 prefill 176-246 -> 1,905-2,053 t/s, decode about 65 -> 75.5
+  t/s; f16 prefill 1,276-1,294 -> 2,113-2,381 t/s, decode 79 -> 81 t/s, thinking
+  answers right 3 of 3 (2 of 3 broken before). KL against the CPU reference:
+  f16 ubatch 512 0.0079 (B60) and 0.0095 (A770), ubatch 1 0.0044 (both cards,
+  was 3.37 without 0107), q8_0:q4_0 0.019. The one downgrade key left is
+  `type=f32 k=512`, the K Hadamard rotation at 512 (q8_0:q4_0 only). The
+  F32-weights copy (0110) is gated on ops and KL; its served prefill gain is
+  inside the run-to-run spread and a repeated benchmark is pending.
 - **Granite 4.2 8B** (`granite`; `code`, from the GGUF's metadata): 40 layers,
   `n_embd` 4096, 32 query heads over 8 KV heads (head size 128, derived: the
   file carries no key length), context trained 131,072, vocabulary 100,352,
@@ -157,8 +169,8 @@ claimed below is what the files and the code say.
   the call pair are single special tokens in its vocabulary (`code`: the token
   table).
 - **Dory1.0-4B** (`dory`, NVIDIA's looped nGPT; admitted 2026-11-07 for the card
-  arm to measure, not yet loaded or served here; contrib/llama.cpp patches 0108
-  and 0109). `code`, read from the GGUF's metadata: 72 physical blocks (16
+  arm to measure, loaded and served on both cards since 2026-11-07;
+  contrib/llama.cpp patches 0108 and 0109). `code`, read from the GGUF's metadata: 72 physical blocks (16
   input, 40 recurrent, 16 output) of 2560 width, 16 query heads over 4 KV heads,
   key length 256, a sliding window of 1,024 on three of every four attention
   blocks, context trained 262,144, vocabulary 131,072, and the recurrent blocks
@@ -205,6 +217,18 @@ claimed below is what the files and the code say.
   holds the f16 default. The start logs a warning when weights plus cache exceed 92 % of
   the card's OpenCL global memory (`dory_fit_warning`): a forecast against the total,
   because arcint cannot read an OpenCL card's free memory; it is not a refusal.
+  Card results (`measured-here`, 2026-11-07, build 6fa32c1e, Q5_K_M; decode over
+  400 tokens including the prefill, prefill over 5.9k tokens): A770 2 loops
+  q8_0:q4_0 23.7 t/s, 512-665 t/s, peak 5.2 GiB; 2 loops f16 24.9 t/s, 727 t/s,
+  7.1 GiB; 4 loops q8_0:q4_0 14.3 t/s, 396 t/s, 6.2 GiB; 4 loops `last_loop`
+  14.3 t/s, 392 t/s, 4.7 GiB. B60 2 loops q8_0:q4_0 36.4 t/s / 1,287 t/s, 2
+  loops f16 37.9 / 1,592, 4 loops q8_0:q4_0 22.0 / 742. The cache layers counted
+  at start were 56, 96 and 36; the answers are right in every cell; KL against
+  the CPU reference on the A770 is 0.0091 at 2 loops, 0.0107 at 4 and 0.016 with
+  q8_0:q4_0; 0 DOWNGRADE lines. Patch 0109 red/green (A770, 2 loops, q8_0:q4_0):
+  decode 14.7 -> 23.7 t/s, prefill 540 -> 665 t/s; the red arm printed no
+  DOWNGRADE line, because a weight-fed op declined by `supports_op` goes to the
+  CPU without a key. That is an open gap in the downgrade accounting.
 
 | service | model | architecture | served file | card |
 |---|---|---|---|---|

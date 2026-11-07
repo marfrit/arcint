@@ -187,7 +187,7 @@ F32 weights of at most 256 rows (the delta-net's `ssm_alpha` / `ssm_beta`, a MoE
 ### F32 weights multiplied through an f16 copy made at load
 
 Some GGUFs keep 2-D weights F32 (Gemma 4 E4B's per-layer-input projections `blk.N.proj` and `blk.N.inp_gate`, 220 MB). The backend had no fast F32 product: a prompt took ggml's F32 tiled GEMM or the skinny path, and decode read F32. When such a weight is written, the backend now keeps an f16 copy beside it and `MUL_MAT` runs the F16 kernels on the copy: the XMX GEMM from 16 columns, the f16 matvecs at 1 and 2-8. Gemma's values are bf16, which f16 holds exactly from 2^-17 up.
-- **Effect:** not yet measured; `inferred` 250-300 ms off a 6,656-token prefill on the B60 (+7-10 %) and less F32 traffic at decode (110 of about 3,000 MB a token).
+- **Effect:** `measured-here`, 2026-11-07, Gemma 4 E4B: the op suites pass on both cards (full `MUL_MAT` 2,299 pass, 0 fail), the red switch fails the cases it should (B60 14, A770 8), and the key `type=f32 k=256` vanishes. KL against the CPU reference, off -> on: f16 KV ubatch 512 0.0079 -> 0.0095, ubatch 1 0.0044 -> 0.0044, q8_0:q4_0 0.0192 -> 0.0190. Served on the B60 the prefill is within the run-to-run spread (f16 KV 2,108-2,429 t/s across the arms) and decode is equal, so the `inferred` 250-300 ms off a 6,656-token prefill (+7-10 %) is not confirmed; a repeated benchmark is pending. The coder's peak VRAM on the A770 is unchanged at 16,276 MiB.
 - **Applies to:** Intel; F32 2-D weights of at least 256 rows and a K of at least 256, not routers (`ffn_gate_inp`), Hadamard rotation matrices or vocabulary-size products (`output.weight`, `token_embd`); a 3-D activation whose columns lie back to back is flattened and takes the copy; 9-15 columns keep F32; from 16 columns sub-group 16 only (the A770 has no f16 XMX GEMM). The copies are VRAM outside the weight buffers (110 MB on Gemma 4 E4B), logged per device; a weight that should have a copy and has none reports `reason=no-f16-copy`.
 - **Default:** on (`GGML_OPENCL_F32W_F16=0` off, `=2` prompts only).
 - **Location:** `ggml_cl_f16_copy_build` and `ggml_cl_mul_mat_f16_copy` in `ggml/src/ggml-opencl/ggml-opencl.cpp`; test `test_mul_mat_weight`. (0110)
@@ -540,6 +540,26 @@ The KV cache rotations are `MUL_MAT` nodes carrying a hint that src0 is the orth
 - **Switch:** `GGML_OPENCL_FWHT=0`.
 - **Source:** the CPU backend's `ggml_compute_forward_fwht` and CUDA's `ggml-cuda/fwht.cu` (`code`).
 
+### Flash attention at head size 512 on Intel, as two V halves
+
+ggml declines `FLASH_ATTN_EXT` at head size 512 on every Intel device, so Gemma 4's seven full-attention layers went to the CPU (q8_0:q4_0 KV, with their Q, K, V and mask copied) or, with an f16 cache, switched flash attention off for the whole model. The prompt kernels now take a V column split: two work-groups a head, each computing S and the softmax over all 512 dimensions and P V for 256 of V's columns, so a sub-group's accumulators stay as at head size 256. Decode and verify rows take the existing split kernel at 512.
+- **Effect:** `measured-here`, 2026-11-07, B60, Gemma 4 E4B, ctx 16,384, a 6.5k-token prompt, against 1.6.0. q8_0:q4_0 KV: prefill 176-246 -> 1,905-2,053 t/s, decode about 65 -> 75.5 t/s. f16 KV: prefill 1,276-1,294 -> 2,113-2,381 t/s, decode 79 -> 81 t/s, thinking answers broken in 2 of 3 runs before and right in 3 of 3 after. KL against the CPU reference: f16 ubatch 512 0.0079 (A770 0.0095), q8_0:q4_0 0.019 (1.6.0-era 0.0205), q8_0:q4_0 ubatch 1 0.011. The head-512 filtered op run passes 82 cases on both cards; `-DFA_DVH_RED` fails 36 head-512 prompt cases on each; the full `FLASH_ATTN_EXT` suite passes 3,078 with 0 fail on both. Granite 4.2 8B is unchanged.
+- **Applies to:** Intel; head size 512, f32 Q, f16 K/V or q8_0:q8_0, q8_0:q4_0, q4_0:q4_0, an f16 mask or none, no sinks, ALiBi or softcap.
+- **Default:** on (`GGML_OPENCL_FA_DK512=0` keeps ggml's decline).
+- **Location:** `flash_attn_dpas2.cl`, `flash_attn_dpas.cl` (the `DVH` build option), `supports_op` in `ggml/src/ggml-opencl/ggml-opencl.cpp`. (0106)
+- **Switch:** `GGML_OPENCL_FA_DK512`.
+- **Source:** the CUDA backend's head-512 configurations (`fattn-mma-f16.cuh`, `code`) compute all 512 columns in one block; here S is computed once a half, 1.5x the minimal DPAS work.
+
+### The f16 matvec's local staging, for 32-lane sub-groups
+
+`kernel_mul_mat_f16_f32_l4_x8`, the f16 matvec for one column a batch at K 128-256, staged its column with one float4 a sub-group lane, written for Adreno's 64 lanes; on Intel's 32 the second half of a K 256 column was never written. Every work-item of the work-group now stages its share. This is a defect fix in upstream's kernel, and it only bites attention without flash attention at decode.
+- **Effect:** `measured-here`, 2026-11-07. Gemma 4 E4B Q4_K_M, f16 KV, flash attention off, c 2,048, CPU reference, B60: ubatch 1 KL 3.37, top-1 35.5 %, PPL 129 against 14.1 before; 0.0044 and top-1 98.5 % after, on both cards. `test-backend-ops` on Gemma's own graph ops failed at `kq-0` with ERR 1.04 (B60) and 0.997 (A770). The tree without the patch fails the K 256 one-column cases (3 FAIL a card); with it 41/41.
+- **Applies to:** Intel; batched f16 x f32 products of one column, K 128-256.
+- **Default:** on.
+- **Location:** `mul_mv_f16_f32_l4.cl`, `kernel_mul_mat_f16_f32_l4_x8`. (0107)
+- **Switch:** none; the opt-in `GGML_OPENCL_MM_KQ_PAIR` and `GGML_OPENCL_MM_KQ_GQA` forms are refused off Adreno.
+- **Source:** arcint's own, a fix in upstream's kernel (`code`).
+
 ## 7. GatedDeltaNet and recurrent state
 
 The linear-attention layers of the Qwen3.5/3.6/3.8 hybrids: the recurrence kernel, the rollback a rejected draft needs, and the copies around it.
@@ -891,7 +911,7 @@ Models that run the same weights more than once per token. Admitted 2026-11-07; 
 ### Physical blocks and executed layers kept apart (a looped nGPT)
 
 Dory1.0-4B stores 72 blocks (16 input, 40 recurrent, 16 output) and runs the 40 recurrent ones `num_loops` times (4 in the file), so the graph has 192 layers over one set of weights. The model keeps two counts. Weight placement, the offload fit and the quantizer count the physical blocks; the graph, the KV cache and the layer count the API reports count the executed layers, and a virtual-to-physical table maps one to the other. The tensors of a recurrent block are created once and every executed layer of it points at the same ones. The recurrent KV is either one cache a loop and layer (`per_loop`) or one a layer that each loop overwrites (`last_loop`, where a token's state then depends on the chunk boundaries of its prefill). In an engine that admits models by geometry, admit on the physical count: the executed count changes with the operator's loop setting.
-- **Effect:** Not measured. `code` only: 317 added lines on the pin plus the series; the graph agrees with vLLM's implementation on the normalisation, the slerp residual, the gates and the loop seed.
+- **Effect:** `measured-here`, 2026-11-07, Dory1.0-4B Q5_K_M, build 6fa32c1e, decode over 400 tokens including the prefill. A770: 2 loops q8_0:q4_0 23.7 t/s, prefill 512-665 t/s at 5.9k tokens, peak 5.2 GiB; 2 loops f16 24.9 t/s, 727 t/s, 7.1 GiB; 4 loops 14.3 t/s, 396 t/s, 6.2 GiB; 4 loops `last_loop` 14.3 t/s, 392 t/s, 4.7 GiB. B60: 36.4 t/s / 1,287 t/s, 37.9 / 1,592 (f16), 22.0 / 742 (4 loops). The KV layers counted at start were 56, 96 and 36; the answers are right in every cell; KL against the CPU reference on the A770 is 0.0091 at 2 loops, 0.0107 at 4, 0.016 with q8_0:q4_0; 0 DOWNGRADE lines. The graph also agrees with vLLM's implementation on the normalisation, the slerp residual, the gates and the loop seed (`code`).
 - **Applies to:** Any architecture that repeats a block range; here Dory1.0-4B, 1 to 4 loops. Refused with MTP, DFlash2 and the layer split.
 - **Default:** The file's own loop count and KV mode; `--llama-dory-loops` and `--llama-dory-kv` override, and `/props` `dory` names the value that serves and its source. A start whose reported layer count disagrees with the loop count fails.
 - **Location:** `src/models/dory.cpp`, `llama_model_dory`, `n_layer_physical`, `layer_physical`; `src/llama-model.cpp` (`load_tensors`, `create_memory`'s layer filter); `llama_model_n_layer_physical` in `src/llama-ext.h`. (0108) arcint: `src/core/dory.cpp`, `dory_resolve`, `dory_check_loaded`, `dory_option_refusal`; `src/core/admission.cpp`, `is_dory_4b`; `src/exec/backend_llama.cpp` (the metadata overrides `dory.num_loops` and `dory.recurrent_kv_cache_mode`).
@@ -901,7 +921,7 @@ Dory1.0-4B stores 72 blocks (16 input, 40 recurrent, 16 output) and runs the 40 
 ### A BF16 source for the device copy, so the casts of per-channel scales stay on the card
 
 A model whose small scale vectors are stored in BF16 casts each one to F32 in the graph. If the backend refuses a BF16 source, the loader places that tensor in a CPU buffer and the scheduler splits the graph around it, once per scale (217 in Dory). On OpenCL a BF16 tensor is already held as F16 on the device (the upload converts it), so the copy kernels read it as F16 and `supports_op` lists the pair: no new kernel.
-- **Effect:** Not measured. `inferred`: the splits go from hundreds a forward to none from these tensors; CUDA's same failure cost 3.1x in the upstream discussion (`paper`). The card measurement (`GGML_SCHED_DEBUG=1` split count, served t/s, KL) is owed.
+- **Effect:** `measured-here`, 2026-11-07, A770, Dory1.0-4B, 2 loops, q8_0:q4_0, same window: without the patch decode 14.7 t/s, prefill 540 t/s; with it 23.7 and 665. CUDA's same failure cost 3.1x in the upstream discussion (`paper`). The arm without the patch printed no DOWNGRADE line: an op that `supports_op` declines goes to the CPU without a key, an open gap in the downgrade accounting.
 - **Applies to:** `CPY`, `DUP`, `CONT` from BF16 to F32 or F16 on the OpenCL backend; both cards.
 - **Default:** On.
 - **Location:** `ggml/src/ggml-opencl/ggml-opencl.cpp`, `supports_op` (`GGML_OP_CPY`) and `ggml_cl_cpy`; test `tests/test-backend-ops.cpp`, `test_cpy` with BF16 sources at 2560, 4096, 7168 and 2560 x 256. (0109)
