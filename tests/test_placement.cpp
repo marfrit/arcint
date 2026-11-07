@@ -11,7 +11,7 @@
 // Red cases (each a one-line edit; the named test then fails):
 //   P1 weight_pattern() returning the name unchanged -> a_layer_number_becomes_N
 //   P2 declined_to_host() ignoring where the list starts (token_embd and the layers left
-//      on the CPU would report) -> only_a_device_list_that_fell_to_host_reports
+//      on the CPU would report) -> the_cpu_extra_buffer_types_are_not_device_memory
 //   P3 the loader's `probed = true` moved to the override branch, or the report placed
 //      before the mmap swap (the key would name the host buffer type the swap replaces)
 //      -> the_loader_reports_only_probe_selections_after_the_mmap_swap
@@ -19,6 +19,11 @@
 //      both_sources_reach_props
 //   P5 read_downgrade_text() without the cut of a partial last line ->
 //      a_cut_last_line_does_not_join_the_next_source
+//   P7 in_device_memory() on is_host alone (0111's first form, measured on the cards: the CPU's
+//      extra buffer type CPU_REPACK leaves is_host unset, heads the input layer's list, and every
+//      token_embd and per_layer_token_embd reported) -> the_cpu_extra_buffer_types_are_not_device_memory,
+//      a_device_decline_reports_wherever_on_the_host_it_lands; the input-layer guard removed from
+//      the loader -> the_loader_reports_only_probe_selections_after_the_mmap_swap
 //   P6 patch 0112 left out (LLM_TENSOR_PLE_CONV1D probed as SSM_CONV again: Flash-Next's f16
 //      kernel back in a CPU buffer, the 0111 key back) -> the_ple_conv_kernel_is_probed_as_its_cast
 #include "exec/backend.h"
@@ -32,6 +37,8 @@
 #include <string>
 
 #ifdef ARCINT_LLAMA_PLACEMENT
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "llama-placement-report.h"
 #endif
 
@@ -113,16 +120,63 @@ TEST(a_layer_number_becomes_N) {
     CHECK_EQ(weight_pattern("odd\tname 2.1"), std::string("odd_name_2.N"));
 }
 
-TEST(only_a_device_list_that_fell_to_host_reports) {
-    using llama_placement::declined_to_host;
-    // the layer asked for the card, the card declined, a host buffer took it
-    CHECK(declined_to_host(/*first_is_host=*/false, /*chosen_is_host=*/true));
-    // the input layer (token_embd, kept on the host by design) and layers not offloaded:
-    // their list starts in host memory
-    CHECK(!declined_to_host(true, true));
-    // the device's first buffer type took it, or another device buffer type did
-    CHECK(!declined_to_host(false, false));
-    CHECK(!declined_to_host(true, false));
+TEST(only_device_memory_counts_as_the_device) {
+    using llama_placement::in_device_memory;
+    // a card's own buffer types: an OpenCL or a split buffer, an integrated GPU's
+    CHECK(in_device_memory(false, GGML_BACKEND_DEVICE_TYPE_GPU));
+    CHECK(in_device_memory(false, GGML_BACKEND_DEVICE_TYPE_IGPU));
+    CHECK(in_device_memory(false, GGML_BACKEND_DEVICE_TYPE_META));
+    // a card's pinned host buffer type is host memory
+    CHECK(!in_device_memory(true, GGML_BACKEND_DEVICE_TYPE_GPU));
+    // the CPU's buffer type, and its extra buffer types, which leave is_host unset (repacked data)
+    CHECK(!in_device_memory(true, GGML_BACKEND_DEVICE_TYPE_CPU));
+    CHECK(!in_device_memory(false, GGML_BACKEND_DEVICE_TYPE_CPU));
+    CHECK(!in_device_memory(false, GGML_BACKEND_DEVICE_TYPE_ACCEL));
+    CHECK(!in_device_memory(nullptr));
+}
+
+TEST(the_cpu_extra_buffer_types_are_not_device_memory) {
+    // the buffer types that head the input layer's list on the cards (make_cpu_buft_list with
+    // extra buffer types on): the CPU's own and its extra ones, read from the CPU backend the way
+    // the loader gets them. CPU_REPACK is among them on x86 and reports is_host false; it is the
+    // one 0111's first rule took for device memory
+    ggml_backend_reg_t cpu = ggml_backend_cpu_reg();
+    CHECK(cpu != nullptr);
+    if (cpu == nullptr) return;
+    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(cpu, 0);
+    CHECK(!llama_placement::in_device_memory(ggml_backend_cpu_buffer_type()));
+    // a proc address to a function pointer, without the object-to-function cast -Wpedantic flags
+    void*                             addr     = ggml_backend_reg_get_proc_address(cpu, "ggml_backend_dev_get_extra_bufts");
+    ggml_backend_dev_get_extra_bufts_t extra_fn = nullptr;
+    static_assert(sizeof(addr) == sizeof(extra_fn), "pointer sizes");
+    std::memcpy(&extra_fn, &addr, sizeof(addr));
+    CHECK(extra_fn != nullptr);
+    if (extra_fn == nullptr) return;
+    size_t n_extra = 0, n_not_host = 0;
+    for (ggml_backend_buffer_type_t* b = extra_fn(dev); b != nullptr && *b != nullptr; ++b) {
+        ++n_extra;
+        n_not_host += !ggml_backend_buft_is_host(*b);
+        CHECK(!llama_placement::in_device_memory(*b));
+        // the input layer's list headed by it, the CPU buffer chosen: no report
+        CHECK(!llama_placement::declined_to_host(*b, ggml_backend_cpu_buffer_type()));
+    }
+    // the case must exist in this build, or this test proves nothing about it
+    CHECK(n_extra >= 1);
+    CHECK(n_not_host >= 1);
+}
+
+TEST(a_device_decline_reports_wherever_on_the_host_it_lands) {
+    // a stand-in device buffer type: the rule reads only is_host and the owner's type, through
+    // the decisions above; with no card in a unit build the device side is the boolean form
+    using llama_placement::in_device_memory;
+    const bool dev_first = in_device_memory(false, GGML_BACKEND_DEVICE_TYPE_GPU);
+    CHECK(dev_first);
+    // the CPU buffer and an extra buffer type (CPU_REPACK takes a Q4_0 product the card declines)
+    // are both outside device memory: a decline into either reports
+    CHECK(!in_device_memory(ggml_backend_cpu_buffer_type()));
+    CHECK(!in_device_memory(false, GGML_BACKEND_DEVICE_TYPE_CPU));
+    // a list that starts outside device memory (the input layer, layers not offloaded) never does
+    CHECK(!llama_placement::declined_to_host(ggml_backend_cpu_buffer_type(), ggml_backend_cpu_buffer_type()));
 }
 
 TEST(the_key_names_op_type_weight_and_buffer) {
@@ -171,6 +225,10 @@ TEST(the_loader_reports_only_probe_selections_after_the_mmap_swap) {
     const std::string guard = src.substr(src.rfind("if (", report), report - src.rfind("if (", report));
     CHECK(guard.find("probed") != std::string::npos);
     CHECK(guard.find("!no_alloc") != std::string::npos);
+    // the input layer is the CPU list by design: never reported, whatever heads that list
+    CHECK(guard.find("info.layer != LLM_TENSOR_LAYER_INPUT") != std::string::npos);
+    // the rule gets the buffer types themselves (device memory by owner, not by is_host)
+    CHECK(src.find("llama_placement::declined_to_host(buft_list->front().second, buft)", report) == report);
     CHECK(src.find("LLAMA_LOG_WARN(\"DOWNGRADE src=llama %s\\n\"", report) != std::string::npos);
 }
 

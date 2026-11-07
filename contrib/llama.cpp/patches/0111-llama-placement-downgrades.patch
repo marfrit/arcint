@@ -5,9 +5,9 @@ Subject: [PATCH] 0111-llama-placement-downgrades
 
 ---
  src/llama-ext.h              |   9 ++++
- src/llama-model-loader.cpp   |  28 ++++++++++++
- src/llama-placement-report.h | 104 +++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 141 insertions(+)
+ src/llama-model-loader.cpp   |  28 ++++++++++
+ src/llama-placement-report.h | 125 +++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 162 insertions(+)
 
 diff --git a/src/llama-ext.h b/src/llama-ext.h
 index c64761e1c..812c4f8f0 100644
@@ -30,7 +30,7 @@ index c64761e1c..812c4f8f0 100644
  LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
  
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 2bb2f0b23..64ef3f1be 100644
+index 2bb2f0b23..98009afdf 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -1,4 +1,6 @@
@@ -67,13 +67,13 @@ index 2bb2f0b23..64ef3f1be 100644
              buft = ggml_backend_dev_buffer_type(cpu_dev);
          }
  
-+        // ARC-LAB 0111: the layer asked for a device buffer, the device declined the
-+        // weight's op, and the weight went to host memory: one DOWNGRADE line the first
-+        // time a key occurs and a count per key (llama_placement_downgrades). A memory-fit
-+        // pass (no_alloc) places nothing and does not count
-+        if (probed && !no_alloc &&
-+                llama_placement::declined_to_host(ggml_backend_buft_is_host(buft_list->front().second),
-+                                                  ggml_backend_buft_is_host(buft))) {
++        // ARC-LAB 0111: the layer asked for device memory, the device declined the weight's
++        // op, and the weight went to host memory: one DOWNGRADE line the first time a key
++        // occurs and a count per key (llama_placement_downgrades). The input layer is the CPU
++        // list by design (token_embd, per_layer_token_embd) and never reports, and a
++        // memory-fit pass (no_alloc) places nothing and does not count
++        if (probed && !no_alloc && info.layer != LLM_TENSOR_LAYER_INPUT &&
++                llama_placement::declined_to_host(buft_list->front().second, buft)) {
 +            const std::string k = llama_placement::key(ggml_op_name(op), ggml_type_name(t_meta->type), t_meta->name,
 +                                                       ggml_backend_buft_name(buft));
 +            if (llama_placement::global().add(k)) {
@@ -101,10 +101,10 @@ index 2bb2f0b23..64ef3f1be 100644
          throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
 diff --git a/src/llama-placement-report.h b/src/llama-placement-report.h
 new file mode 100644
-index 000000000..86c3f78e4
+index 000000000..502fbc8f6
 --- /dev/null
 +++ b/src/llama-placement-report.h
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,125 @@
 +#pragma once
 +
 +// ARC-LAB 0111: a weight the device declined, placed in host memory, says so.
@@ -118,7 +118,10 @@ index 000000000..86c3f78e4
 +// holds the rule and the key; llama-model-loader.cpp calls it at the decision
 +// and llama_placement_downgrades (llama-ext.h) reads the counts.
 +//
-+// Device-free on purpose: arcint's unit tests include it.
++// Device-free on purpose: arcint's unit tests include it (ggml-backend.h's queries only, no device
++// is opened).
++
++#include "ggml-backend.h"
 +
 +#include <cstdint>
 +#include <map>
@@ -159,16 +162,34 @@ index 000000000..86c3f78e4
 +    return out;
 +}
 +
-+// Whether a selection is a device decline: the layer's list asked for a device
-+// buffer first, the probe on it failed, and the buffer chosen instead is host
-+// memory. A list that starts in host memory (the input layer, which keeps
-+// token_embd on the host by design, and layers not offloaded) never reports;
-+// neither does a fall from one device buffer type to another (a split buffer
-+// to the device's own). The caller passes only selections made by the probe:
-+// a tensor_buft_override and a lazily read tensor are placements somebody asked
-+// for, and are not reported.
-+inline bool declined_to_host(bool first_is_host, bool chosen_is_host) {
-+    return !first_is_host && chosen_is_host;
++// Whether a buffer type is a device's own memory, from what ggml says of it: not a host buffer, and
++// owned by a GPU, an integrated GPU or the meta device of a split. is_host alone cannot tell: the CPU's
++// extra buffer types (CPU_REPACK, AMX) are host memory with a repacked layout and leave is_host unset,
++// which makes them "not host". They come first in the CPU list when extra buffer types are on, so a
++// rule on is_host took the input layer's list for a device list and reported every token_embd
++// (measured on the cards, 0111's first form).
++inline bool in_device_memory(bool buft_is_host, enum ggml_backend_dev_type owner) {
++    return !buft_is_host && (owner == GGML_BACKEND_DEVICE_TYPE_GPU || owner == GGML_BACKEND_DEVICE_TYPE_IGPU ||
++                             owner == GGML_BACKEND_DEVICE_TYPE_META);
++}
++
++inline bool in_device_memory(ggml_backend_buffer_type_t buft) {
++    if (buft == nullptr) {
++        return false;
++    }
++    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
++    return dev != nullptr && in_device_memory(ggml_backend_buft_is_host(buft), ggml_backend_dev_type(dev));
++}
++
++// Whether a selection is a device decline: the layer's list asked for device memory first, the probe
++// on it failed, and the buffer type chosen instead is not device memory (a CPU buffer, a CPU extra
++// buffer type, a device's pinned host buffer). A list that starts outside device memory (the input
++// layer, which is always the CPU list: token_embd, per_layer_token_embd, every LLM_TENSOR_LAYER_INPUT
++// tensor; layers and an output not offloaded) never reports; neither does a fall from one device
++// buffer type to another (a split buffer to the device's own). The caller passes only selections made
++// by the probe: a tensor_buft_override and a lazily read tensor are placements somebody asked for.
++inline bool declined_to_host(ggml_backend_buffer_type_t first, ggml_backend_buffer_type_t chosen) {
++    return in_device_memory(first) && !in_device_memory(chosen);
 +}
 +
 +// The key without the "src=llama " that the log line and the count text put in
