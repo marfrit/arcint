@@ -947,11 +947,11 @@ said), and the 503 bodies lost `reservation` and `kv_blocks_free`.
   GGUF's `general.sampling.temp`, `.top_p` and `.top_k`, for every admitted
   model. A card that names no top_k sets no limit and one that names no penalty
   asks for none; a GGUF with no such key keeps the provisional row (Llama 2 7B).
-  A unit that passes no flags moves to its card: Flash-Next from 0.7 / 0.8 / 20
-  with a repetition penalty of 1.05 to 1.0 / 0.95 / 20 with none, and the TTS unit
-  to 0.9 / 1.0 / 50 with none, for a client that sends nothing (its gate sends its
-  own row, so no gate has run this one). The agent, the coder and the writer pass
-  their own flags and did not move; the shipped coder and agent samples now do too. (b)
+  A unit that passes no flags moves to its card. The Flash-Next and TTS units stay
+  on the row they have served at, 0.7 / 0.8 / 20 with a repetition penalty of 1.05,
+  by their own flags (operator, 2026-11-07), until their cards' rows have been
+  measured: 1.0 / 0.95 / 20 and 0.9 / 1.0 / 50, both with no penalty. The agent, the
+  coder and the writer pass their own flags and did not move, nor do their samples. (b)
   `--llama-checkpoints N` above 0 on a model that is neither hybrid nor recurrent
   is refused at start, because it could not do what it says; the default of 32
   is not a request and is logged as no checkpoints.

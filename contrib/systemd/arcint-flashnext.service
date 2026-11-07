@@ -84,7 +84,8 @@ ExecStart=/usr/bin/arcint \
     --llama-slot-loan 6400 \
     --llama-loan-chunk 8192 \
     --llama-mtp-gguf /models/gguf/fn-mtp/mtp-flash-next-q8e4n-hq4k.gguf \
-    --queue-timeout 30
+    --queue-timeout 30 \
+    --temp 0.7 --top-p 0.8 --top-k 20 --repetition-penalty 1.05
 Restart=on-failure
 RestartSec=30
 TimeoutStartSec=30min
