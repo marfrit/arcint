@@ -145,12 +145,12 @@ index 257033f..5a12891 100644
 +// ssm_beta have the skinny path), views, USM-host buffers, a weight with a
 +// value outside f16's range. The copies are VRAM outside the weight buffers'
 +// size; the device's total is logged at the first graph after it changes.
-+// GGML_OPENCL_F32W_F16: 0 no copies, 1 every column count (default), 2 only
-+// 16 or more columns (the prompt). GGML_OPENCL_F32W_F16_RED=1 negates the
++// GGML_OPENCL_F32W_F16: 0 no copies, 1 every column count, 2 only 16 or
++// more columns (the prompt; default: at one column the f16 matvec cost decode). GGML_OPENCL_F32W_F16_RED=1 negates the
 +// last 16 of K in every row of a copy (the red case of its test).
 +static int ggml_cl_f16_copy_mode() {
 +    static const char * e = getenv("GGML_OPENCL_F32W_F16");
-+    static const int    v = e != nullptr ? atoi(e) : 1;
++    static const int    v = e != nullptr ? atoi(e) : 2;
 +    return v;
 +}
 +

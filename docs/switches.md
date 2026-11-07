@@ -154,7 +154,7 @@ These names are not in a table:
 | `GGML_OPENCL_Q40_2D` | `2` | Dense q4_0 weights times 16+ columns, K a multiple of 256: `0` the 0096 tile, `1` fp16 2D-block GEMM (Xe2), `2` int8 (0099). |
 | `GGML_OPENCL_Q40_SG8_SHAPE` | `32,8` | `TMM,WG` of the Alchemist int8 GEMM: tokens a sub-group, sub-groups a work-group. |
 | `GGML_OPENCL_F32_SKINNY` | on (Intel) | `0`: skinny F32 products use ggml's paths. | 0005 | Coder router, 512-token prefill: 24.3 -> 9.0 ms, A770 (`measured-here`). |
-| `GGML_OPENCL_F32W_F16` | `1` (Intel) | `0`: F32 2-D weights get no f16 copy and multiply in F32; `2`: the copy only from 16 columns (prompts). | 0110 | — |
+| `GGML_OPENCL_F32W_F16` | `2` (Intel) | `0`: F32 2-D weights get no f16 copy and multiply in F32; `1`: the copy at every column count (decode too: measured 0.7 % slower decode on Gemma 4 E4B); `2`: the copy only from 16 columns (prompts). | 0110 | — |
 | `GGML_OPENCL_FA_DPAS` | on (Intel with DPAS) | `0`: prompt attention keeps `flash_attn_f32_f16.cl`. | 0008 | 512 rows x 4,096 keys: B60 8.2 ms, A770 22.4 ms (`measured-here`). |
 | `GGML_OPENCL_FA_DPAS2` | on (Xe2 only) | `0`: prompt attention keeps 0008's kernel. | 0038 | — |
 | `GGML_OPENCL_FA_DPAS2_MCLS` | on | `0`: no mask classes (skipping all-zero and all -inf blocks). | 0038 | — |
