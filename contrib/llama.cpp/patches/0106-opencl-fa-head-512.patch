@@ -4,14 +4,14 @@ Date: Sat, 7 Nov 2026 10:00:00 +0000
 Subject: [PATCH] 0106-opencl-fa-head-512
 
 ---
- ggml/src/ggml-opencl/ggml-opencl.cpp          | 305 ++++++++++++++++--
+ ggml/src/ggml-opencl/ggml-opencl.cpp          | 319 ++++++++++++++++--
  .../ggml-opencl/kernels/flash_attn_dpas.cl    |  50 ++-
  .../ggml-opencl/kernels/flash_attn_dpas2.cl   |  59 +++-
- tests/test-backend-ops.cpp                    |  35 ++
- 4 files changed, 387 insertions(+), 62 deletions(-)
+ tests/test-backend-ops.cpp                    |  53 +++
+ 4 files changed, 416 insertions(+), 65 deletions(-)
 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 3d931ba..11db277 100644
+index 3d931ba..e90be68 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -1337,19 +1337,26 @@ struct ggml_backend_opencl_context {
@@ -69,7 +69,26 @@ index 3d931ba..11db277 100644
                          // a wave: Xe2's compute units are its vector engines, 8 a core,
                          // each with 4 threads at 256 GRF a thread, so a core holds 32
                          // sub-groups (20 work-groups of 32 on the B60's 160 engines).
-@@ -7383,6 +7395,146 @@ static bool ggml_opencl_ensure_fa_f32_f16_prefill_512(ggml_backend_opencl_contex
+@@ -7154,7 +7166,7 @@ static void ggml_opencl_log_fa_kernel_spill(ggml_backend_opencl_context * backen
+     }
+ }
+ 
+-static void ggml_opencl_ensure_fa_pre_kernels(ggml_backend_opencl_context * backend_ctx, int dk, int dv) {
++static void ggml_opencl_ensure_fa_pre_kernels(ggml_backend_opencl_context * backend_ctx, int dk, int dv, bool compile = true) {
+     const std::pair<int, int> dk_dv = {dk, dv};
+ 
+     const ggml_opencl_fa_dim * cfg = nullptr;
+@@ -7177,7 +7189,8 @@ static void ggml_opencl_ensure_fa_pre_kernels(ggml_backend_opencl_context * back
+     backend_ctx->fa.bm[{dk, dv}]              = cfg->bm;
+     backend_ctx->fa.bn[{dk, dv}]              = cfg->bn;
+ 
+-    if (backend_ctx->fa.kv_pad_f16.count(dk_dv) > 0) { return; }
++    // 0106: Intel's head-512 prompts take the DPAS kernels, which need only the metadata
++    if (!compile || backend_ctx->fa.kv_pad_f16.count(dk_dv) > 0) { return; }
+ 
+     GGML_LOG_INFO("ggml_opencl: lazy-compiling flash_attn prepass for DK=%d DV=%d\n", dk, dv);
+     cl_int err;
+@@ -7383,6 +7396,151 @@ static bool ggml_opencl_ensure_fa_f32_f16_prefill_512(ggml_backend_opencl_contex
      return true;
  }
  
@@ -86,7 +105,10 @@ index 3d931ba..11db277 100644
 +// being another 128 GRF; quantized and unaligned f16 K/V reach
 +// flash_attn_dpas2.cl through the f16 blocks of the carry path instead.
 +static void ggml_opencl_ensure_fa_dpas_512(ggml_backend_opencl_context * backend_ctx) {
-+    if (backend_ctx->fa_dpas512_tried) {
++    // the head-256 builds' options come from load_cl_kernels, which a device
++    // runs at its first buffer allocation: not latched before it (a filtered
++    // test-backend-ops run asks supports_op first)
++    if (backend_ctx->fa_dpas512_tried || !backend_ctx->kernels_loaded) {
 +        return;
 +    }
 +    backend_ctx->fa_dpas512_tried = true;
@@ -97,7 +119,7 @@ index 3d931ba..11db277 100644
 +    const char * xo_env = getenv("GGML_OPENCL_FA_DPAS_OPTS");
 +    const std::string xo = xo_env ? std::string(" ") + xo_env : std::string();
 +    cl_int err;
-+    if (backend_ctx->fa_dpas2_nsg > 0 && backend_ctx->kernel_fa_kv_to_f16 != nullptr) {
++    if (backend_ctx->fa_dpas2_nsg > 0 && backend_ctx->fa_dpas2_bq > 0 && backend_ctx->kernel_fa_kv_to_f16 != nullptr) {
 +#ifdef GGML_OPENCL_EMBED_KERNELS
 +        const std::string k2src {
 +            #include "flash_attn_dpas2.cl.h"
@@ -134,7 +156,9 @@ index 3d931ba..11db277 100644
 +            }
 +        }
 +    }
-+    if (backend_ctx->fa_dpas_sg == 8) {
++    // the dispatch divides by the head-256 build's rows a work-group: no 512
++    // build without it (fa_dpas_bq is set only when that build fits)
++    if (backend_ctx->fa_dpas_sg == 8 && backend_ctx->fa_dpas_bq > 0 && backend_ctx->fa_dpas_nthr == backend_ctx->fa_dpas_nsg * 8) {
 +#ifdef GGML_OPENCL_EMBED_KERNELS
 +        const std::string ksrc {
 +            #include "flash_attn_dpas.cl.h"
@@ -216,7 +240,7 @@ index 3d931ba..11db277 100644
  // Compile one (variant, dk, dv); memoised. false = compiler rejected.
  static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_ctx, int dk, int dv, ggml_opencl_fa_variant variant) {
      const std::pair<int, int> dk_dv = {dk, dv};
-@@ -7489,6 +7641,13 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
+@@ -7489,6 +7647,13 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
      const bool fa_decode_only = (variant == FA_VARIANT_F32_F16 && dk == 512);
      if (fa_decode_only) {
          opts += " -D FA_DECODE_ONLY -D FA_DECODE_MINIMAL";
@@ -230,7 +254,7 @@ index 3d931ba..11db277 100644
      }
  
      // c8 cluster width (GGML_OPENCL_FA_CL_C overrides): value = GQA4 cluster
-@@ -11610,6 +11769,60 @@ inline bool use_q5_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
+@@ -11610,6 +11775,62 @@ inline bool use_q5_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
  #endif
  }
  
@@ -253,6 +277,8 @@ index 3d931ba..11db277 100644
 +                       k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 ? 0 :
 +                       k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q4_0 ? 1 :
 +                       k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_Q4_0 ? 2 : -1;
++    // the head-256 builds whose options the head-512 ones take (0106 review)
++    load_cl_kernels(backend_ctx);
 +    float max_bias = 0.0f, softcap = 0.0f;
 +    memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
 +    memcpy(&softcap,  (const float *) op->op_params + 2, sizeof(float));
@@ -291,7 +317,7 @@ index 3d931ba..11db277 100644
  static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
      ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
      ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
-@@ -12180,7 +12393,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -12180,7 +12401,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
  
              if (dk == 512) {
                  if (backend_ctx->gpu_family == INTEL) {
@@ -300,7 +326,7 @@ index 3d931ba..11db277 100644
                  }
                  if (!is_f32_f16) {
                      return false;
-@@ -22611,6 +22824,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -22611,12 +22832,16 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
  
      // Compile DK512 decode separately from the prefill programs.
      const bool fa_decode_only_512 = (d_head_q == 512);
@@ -311,7 +337,14 @@ index 3d931ba..11db277 100644
  
      // per-variant lazy compile for this (dk, dv)
      // DK=512 decode (n_q==1) needs no prepass
-@@ -22646,6 +22863,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     // DK=512 prefill (n_q>1) does, so compile it only when needed
+     if (!fa_decode_only_512 || n_q > 1) {
+-        ggml_opencl_ensure_fa_pre_kernels(backend_ctx, d_head_q, d_head_v);
++        ggml_opencl_ensure_fa_pre_kernels(backend_ctx, d_head_q, d_head_v, /*compile=*/!intel512);
+     }
+ 
+     cl_kernel kernel = NULL;
+@@ -22646,6 +22871,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
  
      if (is_f16) {
          ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_F16);
@@ -321,7 +354,7 @@ index 3d931ba..11db277 100644
      } else if (is_mixed) {
          if (fa_decode_only_512 && n_q == 1) {
              GGML_ASSERT(ggml_opencl_ensure_fa_f32_f16_vec_512(backend_ctx));
-@@ -22791,7 +23011,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -22791,7 +23019,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      // KV-head-coalesced gate: gqa_ratio == compile-time MQ_GQA
      // restricts to DK=DV=256 for now due to local memory size
      const int gqa_ratio_dispatch = n_head_kv > 0 ? (n_head / n_head_kv) : 0;
@@ -332,7 +365,7 @@ index 3d931ba..11db277 100644
          if (use_native_q8_0_q1) {
              if (d_head_v >= 256 &&
                  backend_ctx->fa.f32_q8_0_q1_vec.count(dk_dv) > 0) {
-@@ -22867,7 +23089,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -22867,7 +23097,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      }
  
      // Intel goes to the basic q1 kernel
@@ -341,7 +374,7 @@ index 3d931ba..11db277 100644
          use_q1_vec = use_q1_vec_mq = use_local_tile = false;
          if (is_mixed && backend_ctx->fa.f32_f16_q1.count(dk_dv))      { kernel = backend_ctx->fa.f32_f16_q1.at(dk_dv); }
          else if (is_f16 && backend_ctx->fa.f16_q1.count(dk_dv))       { kernel = backend_ctx->fa.f16_q1.at(dk_dv); }
-@@ -22875,7 +23097,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -22875,7 +23105,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          else if (is_q4_0 && backend_ctx->fa.f32_q4_0_q1.count(dk_dv)) { kernel = backend_ctx->fa.f32_q4_0_q1.at(dk_dv); }
          else if (backend_ctx->fa.f32_q1.count(dk_dv))                 { kernel = backend_ctx->fa.f32_q1.at(dk_dv); }
      }
@@ -350,7 +383,7 @@ index 3d931ba..11db277 100644
  
      ggml_cl_flash_attn_temp_buffer temp_k;
      ggml_cl_flash_attn_temp_buffer temp_v;
-@@ -22905,24 +23127,31 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -22905,24 +23135,31 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      // Intel, a prompt: flash_attn_dpas.cl (the XMX units), f16 or quantized K/V
      // head size 256 or 128 (index 0 / 1 of the kernel arrays)
      const int fa_dki = d_head_q == 256 && d_head_v == 256 ? 0 : d_head_q == 128 && d_head_v == 128 ? 1 : -1;
@@ -389,7 +422,7 @@ index 3d931ba..11db277 100644
          // (the surface is a head's rows, d halves wide: the pitch must cover them)
          auto surf_ok = [](cl_ulong off, cl_ulong nb1, cl_ulong nb2, cl_ulong nb3, int64_t d) {
              return off % 64 == 0 && nb1 % 16 == 0 && nb1 >= 64 && nb1 >= (cl_ulong) d * 2 && nb1 < (1u << 24) &&
-@@ -23035,7 +23264,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -23035,7 +23272,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
              }
              const size_t bq   = (size_t) (v2 ? backend_ctx->fa_dpas2_bq   : backend_ctx->fa_dpas_bq);
              const size_t nthr = (size_t) (v2 ? backend_ctx->fa_dpas2_nthr : backend_ctx->fa_dpas_nthr);
@@ -398,7 +431,7 @@ index 3d931ba..11db277 100644
              size_t lws[3] = { nthr, 1, 1 };
              backend_ctx->enqueue_ndrange_kernel(kd, 3, gws, lws, dst);
          };
-@@ -23049,7 +23278,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -23049,7 +23286,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          // the agent's 512-row ubatch gives 48 of them, three waves of 20 on
          // the B60 with the last 40 % full. GGML_OPENCL_FA_DPAS2_SPLIT: at most
          // that many splits (1: none)
@@ -407,7 +440,7 @@ index 3d931ba..11db277 100644
          auto fa2_splits = [&](int nkv) {
              static const char * fs_env = getenv("GGML_OPENCL_FA_DPAS2_SPLIT");
              const int smax = std::min(fs_env ? atoi(fs_env) : 16, CEIL_DIV(nkv, 32));
-@@ -23057,7 +23286,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -23057,7 +23294,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
              if (kcomb == nullptr || k2c == nullptr || wave <= 0 || smax <= 1) {
                  return 1;
              }
@@ -416,7 +449,7 @@ index 3d931ba..11db277 100644
              int best = 1, eff_best = 0, nw_best = 0;
              for (int p = 1; p <= smax; ++p) {
                  const int nb = ntiles * p, nw = CEIL_DIV(nb, wave), eff = 100 * nb / (nw * wave);
-@@ -23071,10 +23300,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -23071,10 +23308,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
              return best;
          };
          // the states of a call's splits: split 0's in the carry, the others'
@@ -429,7 +462,7 @@ index 3d931ba..11db277 100644
              cr = &backend_ctx->scratch_buffer("fa_dpas_carry");
              cr->allocate(backend_ctx->context, slot);
              pr = &backend_ctx->scratch_buffer("fa_dpas2_parts");
-@@ -23095,7 +23324,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -23095,7 +23332,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
              CL_CHECK(clSetKernelArg(kcomb, a++, sizeof(int),      &n_batch));
              CL_CHECK(clSetKernelArg(kcomb, a++, sizeof(int),      &carry_out));
              const size_t n_g = (size_t) CEIL_DIV(n_q, backend_ctx->fa_dpas2_bq) * backend_ctx->fa_dpas2_bq / 8;
@@ -438,7 +471,7 @@ index 3d931ba..11db277 100644
              size_t lws[3] = { 16, 1, 1 };
              backend_ctx->enqueue_ndrange_kernel(kcomb, 3, gws, lws, dst);
          };
-@@ -23128,8 +23357,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -23128,8 +23365,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          // GGML_OPENCL_FA_DPAS_F16KV_BLOCK: keys a block (16384)
          static const char * f16kv_env  = getenv("GGML_OPENCL_FA_DPAS_F16KV");
          static const char * f16kvb_env = getenv("GGML_OPENCL_FA_DPAS_F16KV_BLOCK");
@@ -453,7 +486,7 @@ index 3d931ba..11db277 100644
              const int blk = std::max(32, f16kvb_env ? atoi(f16kvb_env) / 32 * 32 : 16384);
              const int nkb = std::min(blk, n_kv);
              ggml_cl_buffer & kf = backend_ctx->scratch_buffer("fa_dpas_kf16");
-@@ -23138,11 +23371,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -23138,11 +23379,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
              kf.allocate(backend_ctx->context, (size_t) d_head_q * nkb * k->ne[2] * k->ne[3] * sizeof(cl_half));
              vf.allocate(backend_ctx->context, (size_t) d_head_v * nkb * v->ne[2] * v->ne[3] * sizeof(cl_half));
              const bool v2 = fa2 && k2c != nullptr;
@@ -468,7 +501,7 @@ index 3d931ba..11db277 100644
              }
              cl_mem carry = n_kv > blk ? cr.buffer : kf.buffer;   // unread unless there are blocks to carry
              // rows [kv0, kv0 + nb) of a K/V view to [dim][key][head][batch] f16
-@@ -23150,7 +23384,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -23150,7 +23392,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                                 int kv0, int nb, cl_mem out) {
                  cl_kernel kq = backend_ctx->kernel_fa_kv_to_f16;
                  const cl_ulong soff = off + (cl_ulong) kv0 * nb1;
@@ -478,7 +511,7 @@ index 3d931ba..11db277 100644
                  CL_CHECK(clSetKernelArg(kq, 0, sizeof(cl_mem),   &src));
                  CL_CHECK(clSetKernelArg(kq, 1, sizeof(cl_ulong), &soff));
                  CL_CHECK(clSetKernelArg(kq, 2, sizeof(cl_ulong), &nb1));
-@@ -23195,8 +23430,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -23195,8 +23438,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          // kernel reads them in place of Q (q_nb* unused)
          cl_mem   q_arg  = extra_q->data_device;
          cl_ulong q_off  = offset_q;
@@ -490,7 +523,7 @@ index 3d931ba..11db277 100644
              const cl_int n_g = CEIL_DIV(n_q, backend_ctx->fa_dpas_bq) * (backend_ctx->fa_dpas_bq / 8);
              ggml_cl_buffer & qbuf = backend_ctx->scratch_buffer("fa_dpas_qblk");
              qbuf.allocate(backend_ctx->context, (size_t) n_batch * n_head * n_g * 8 * d_head_q * sizeof(cl_half));
-@@ -23246,7 +23482,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -23246,7 +23490,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          CL_CHECK(clSetKernelArg(kd, a++, sizeof(int), &k_ne3));
          CL_CHECK(clSetKernelArg(kd, a++, sizeof(int), &v_ne3));
          const size_t bq = (size_t) backend_ctx->fa_dpas_bq, nthr = (size_t) backend_ctx->fa_dpas_nthr;
@@ -499,7 +532,7 @@ index 3d931ba..11db277 100644
          size_t lws[3] = { nthr, 1, 1 };
          backend_ctx->enqueue_ndrange_kernel(kd, 3, gws, lws, dst);
          return;
-@@ -23861,6 +24097,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -23861,6 +24105,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          backend_ctx->enqueue_ndrange_kernel(k_merge, 3, merge_gws, merge_lws, dst);
          return;
      }
@@ -785,21 +818,22 @@ index 0eb4baf..484e06e 100644
          }
      }
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index b17a14f..f5d4830 100644
+index b17a14f..3eaf5ee 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -12574,6 +12574,41 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12574,6 +12574,59 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
              }
          }
      }
 +    // 0106: Gemma 4's attention geometry (8 query heads on 2): head size 512
 +    // (its full-attention layers) and 256 (its sliding-window layers), f16 and
-+    // the quantized pairs; decode and verify rows (1, 3, 8), row blocks (12),
-+    // prompts (64, 512); a KV length of 513 or 1013 leaves a partial key tile
++    // the quantized pairs; decode and verify rows (1, 3, 8), the 8-row blocks
++    // of up to 64 rows (12, 64), prompts (128, 512); a KV length of 513 or
++    // 1013 leaves a partial key tile
 +    for (auto kv_t : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},
 +                                                                  {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}}) {
 +        for (int64_t hs : {512, 256}) {
-+            for (int64_t nb : {1, 3, 8, 12, 64, 512}) {
++            for (int64_t nb : {1, 3, 8, 12, 64, 128, 512}) {
 +                for (int64_t kv : {513, 1013, 4096}) {
 +                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {4, 1}, kv, nb, true, false, 0, 0,
 +                                                                    GGML_PREC_F32, kv_t.first, kv_t.second));
@@ -807,18 +841,35 @@ index b17a14f..f5d4830 100644
 +            }
 +        }
 +    }
-+    // ... without a mask, with an all-zero one, with Q permuted (head-major)
-+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1}, 1013, 64, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-+    test_cases.emplace_back(new test_flash_attn_ext_zero_mask(512, 512, 2, {4, 1}, 1013, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1}, 1013, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
-+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1}, 1013, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
++    // ... at head size 512 and prompt rows (more than 64: the prompt kernels,
++    // not the 8-row blocks): without a mask, with an all-zero one, with Q
++    // permuted (head-major), with q4_0:q4_0, with a causal mask (diagonal
++    // blocks), and one causal prompt behind 20,000 keys: more than the carry
++    // path's 16,384-key f16 block, so a quantized cache crosses a block
++    for (int64_t nb : {128, 512}) {
++        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1}, 1013, nb, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        test_cases.emplace_back(new test_flash_attn_ext_zero_mask(512, 512, 2, {4, 1}, 1013, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1}, 1013, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
++        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1}, 1013, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
++        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1}, 1013, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
++        for (auto kv_t : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}}) {
++            test_cases.emplace_back(new test_flash_attn_ext_causal(512, 512, 2, {4, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, kv_t.first, kv_t.second));
++        }
++    }
++    for (int64_t nb : {1, 8}) {
++        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1}, 1013, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
++    }
++    for (auto kv_t : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}}) {
++        test_cases.emplace_back(new test_flash_attn_ext_causal(512, 512, 2, {4, 1}, 20000, 128, true, false, 0, 0, GGML_PREC_F32, kv_t.first, kv_t.second));
++    }
 +    // the products the same attention is without flash attention (Gemma 4 E4B
 +    // with an f16 cache before 0106, every layer): K Q with K a permuted 3-D
 +    // view of 2 KV heads broadcast to 8 query heads (ne02 2, ne12 8), and KQ V
 +    // over the transposed V cache, a strided view (rows of 2,048 keys, n_kv
 +    // 1280 / 1792 of them used). Decode (1 column a head: the f16 matvec's x8 /
 +    // y8 kernels), a verify (3) and prompts (64, 512: the generic tiled GEMM
-+    // with both sources copied to contiguous buffers first)
++    // with both sources copied to contiguous buffers first). On Intel the
++    // head-256 one-column K Q (the x8 kernel) passes only with 0107
 +    for (int64_t hs : {256, 512}) {
 +        for (int64_t n : {1, 3, 64, 512}) {
 +            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1280, n, hs, {2, 1}, {4, 1}, {0, 2, 1, 3}));

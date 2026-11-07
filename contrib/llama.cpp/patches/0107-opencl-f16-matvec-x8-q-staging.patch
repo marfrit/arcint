@@ -4,10 +4,40 @@ Date: Sat, 7 Nov 2026 11:00:00 +0000
 Subject: [PATCH] 0107-opencl-f16-matvec-x8-q-staging
 
 ---
+ ggml/src/ggml-opencl/ggml-opencl.cpp          | 15 ++++++++++++--
  .../ggml-opencl/kernels/mul_mv_f16_f32_l4.cl  | 20 +++++++++++++------
- tests/test-backend-ops.cpp                    | 15 ++++++++++++++
- 2 files changed, 29 insertions(+), 6 deletions(-)
+ tests/test-backend-ops.cpp                    | 16 +++++++++++++++
+ 3 files changed, 43 insertions(+), 8 deletions(-)
 
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index e90be68..257033f 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -31559,11 +31559,22 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                     // each V slab once per K-head and emits all r2 Q-heads
+                     static const char * mm_kqv_gqa_env = getenv("GGML_OPENCL_MM_KQV_GQA");
+                     static const bool mm_kqv_gqa_on = (mm_kqv_gqa_env != nullptr && mm_kqv_gqa_env[0] != '0');
+-                    if (can_multi_out && (ne01 % 16) == 0 && ne00 == 128 && r2 == 8 && r3 == 1 && mm_kq_gqa_on &&
++                    // 0107: _x8_pair and _x8_gqa4 split a 64-lane sub-group (sgs_lid >> 5 is the
++                    // row of a pair, sgs_lid >> 3 the query head of 8): on a 16- or 32-wide one
++                    // rows 1, 3, 5, 7 of each 8, or query heads 4-7, are never written. Adreno only
++                    const bool mm_lanes64 = backend_ctx->gpu_family == ADRENO;
++                    if (!mm_lanes64 && (mm_kq_pair_on || mm_kq_gqa_on)) {
++                        static bool warned = false;
++                        if (!warned) {
++                            warned = true;
++                            GGML_LOG_WARN("ggml_opencl: GGML_OPENCL_MM_KQ_PAIR / GGML_OPENCL_MM_KQ_GQA need 64-lane sub-groups (Adreno); ignored here\n");
++                        }
++                    }
++                    if (can_multi_out && (ne01 % 16) == 0 && ne00 == 128 && r2 == 8 && r3 == 1 && mm_kq_gqa_on && mm_lanes64 &&
+                         backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4 != nullptr) {
+                         kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4;
+                         nrows = 1;
+-                    } else if (can_multi_out && ne00 <= 256 && mm_kq_pair_on &&
++                    } else if (can_multi_out && ne00 <= 256 && mm_kq_pair_on && mm_lanes64 &&
+                         backend_ctx->kernel_mul_mat_f16_f32_l4_x8_pair != nullptr) {
+                         kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_pair;
+                         nrows = 1;
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_f16_f32_l4.cl b/ggml/src/ggml-opencl/kernels/mul_mv_f16_f32_l4.cl
 index 97148d3..03f3418 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mv_f16_f32_l4.cl
@@ -47,10 +77,10 @@ index 97148d3..03f3418 100644
      barrier(CLK_LOCAL_MEM_FENCE);
  
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index f5d4830..286dd37 100644
+index 3eaf5ee..5753410 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -12609,6 +12609,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12627,6 +12627,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
              }
          }
      }
@@ -58,12 +88,13 @@ index f5d4830..286dd37 100644
 +    // read Q from a local buffer only its first sub-group's lanes had filled
 +    // (16 or 32 float4 of 64 on Intel): K Q at head size 256 (Gemma 4's
 +    // sliding-window layers, n_kv 256 to 4,096, and 1,016 rows, not a multiple
-+    // of 64), contiguous batched sources at K 64-256, and K Q V at n_kv 256 over
-+    // the strided transposed V
++    // of 64), contiguous batched sources at K 128 (the green control: 32
++    // float4, which 32 lanes did fill) and 256, and K Q V at n_kv 256 over the
++    // strided transposed V. (K 64 never reaches x8: the host takes it from 128.)
 +    for (int64_t m : {256, 1280, 4096, 1016}) {
 +        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, m, 1, 256, {2, 1}, {4, 1}, {0, 2, 1, 3}));
 +    }
-+    for (int64_t k : {64, 128, 256}) {
++    for (int64_t k : {128, 256}) {
 +        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 512, 1, k, {2, 1}, {4, 1}));
 +    }
 +    for (int64_t hs : {256, 512}) {
