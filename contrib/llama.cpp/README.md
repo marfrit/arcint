@@ -6594,3 +6594,9 @@ The A/B's decode cells went red: answer b 58.8 -> 54.5 t/s, c 52.25 -> 51.4, a 5
 Memory: 43 MiB more, peak 16,208 -> 16,251 MiB on these prompts and 16,220 -> 16,263 at the 90k prompt, of the A770's 16,288. GTT stayed at 32 MiB, so nothing is evicted, but the margin is 25 MiB.
 
 Suites, `-o MUL_MAT_ID` on the A770: iq4_xs 22/22, q4_K 105/105, iq4_nl 25/25, off the same; red (`-DID_RED`, a negated weight scale) 3/22, 40/105, 7/25. The first form of this patch made Q4_K spill at every NR, seen in the IGC dump, not in the suite. On the A770 only: both programs build only at sub-group 8, so the B60 does not change.
+
+## 0105-mtp-head-without-output.patch
+
+`qwen35moe.cpp` only. A head-only MTP GGUF (the trunk's probe tensor `blk.0.attn_norm.weight` absent) may carry no `output.weight`. Before, the loader made a `TENSOR_DUPLICATED` copy of `token_embd` as `output` for it, 398 MiB on the coder's card, which the draft never reads when `--llama-mtp-vocab` is set: the MTP context then returns the nextn rows and arcint scores them against rows it reads from a file (`DraftHead`). Now an MTP-only file without `output.weight` gets no fallback, and `graph_mtp` leaves `res->t_logits` null where it asserted on a missing head. A file with `output.weight` or `nextn.shared_head_head`, a trunk-only file and a full model load and build as before. A context that asks for logits from such a head has none to read: arcint refuses that combination at start (a head file without `output.weight` needs `--llama-mtp-vocab`).
+
+`code`, not yet built or run here: the head file's saving is `output` (398 MiB on the coder), the card proof is owed (`docs/campaigns/mtp-head-fit.md`).

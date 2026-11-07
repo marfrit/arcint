@@ -17,7 +17,11 @@ no model load: files are read and written byte for byte.
              head); refuses a float matrix no rule covers.
   splice     take (or replace) named tensors, raw, from another GGUF, e.g. the
              served token embedding and LM head, so every arm shares them.
-  check      the file is head-only, names and shapes are the spec's.
+  strip-output  the same file without `output.weight` (patch 0105): the loader makes no copy of the
+             embedding as the LM head, 398 MiB on the coder's card. Served only with `--llama-mtp-vocab`
+             (arcint refuses it otherwise), the draft head reading its rows from the served file.
+  check      the file is head-only, names and shapes are the spec's; `output.weight` may be absent
+             (the output says which), `--no-output` requires it absent.
   compare    tensor by tensor against another file: type, shape, sha256, and
              with --rel the relative difference of the decoded values.
   verify-base  H3's non-expert tensors and the kept experts against the coder's
@@ -280,9 +284,12 @@ def head_spec(g, n_expert):
 TOP = ("token_embd.weight", "output.weight", "output_norm.weight")
 
 
-def check_file(path, n_expert=None, floats_only=False):
-    """Head-only and exactly the spec's names and shapes. Returns the Gguf."""
+def check_file(path, n_expert=None, floats_only=False, no_output=False):
+    """Head-only and exactly the spec's names and shapes; `output.weight` is optional (no_output: it must be
+    absent, the file is for --llama-mtp-vocab only). Returns the Gguf."""
     g = Gguf(path)
+    if no_output and "output.weight" in g.names:
+        raise SpecError("%s: carries output.weight, expected a head without it" % path)
     ne = g.scalar("qwen35moe.expert_count")
     if n_expert is not None and ne != n_expert:
         raise SpecError("%s: expert_count %d, expected %d" % (path, ne, n_expert))
@@ -473,6 +480,15 @@ def build_from_safetensors(shards, kv_from, out, experts_used=8):
 # -------------------------------------------------------------- splice, quantize
 
 
+def strip_output(inp, out):
+    """The head file without `output.weight`, every other tensor and the metadata raw. Refuses a file that is
+    not head-only, or has no output to drop (then the arm would not be what it is called)."""
+    g = check_file(inp)
+    if "output.weight" not in g.names:
+        raise SpecError("%s: no output.weight to strip" % inp)
+    write_gguf(out, g.kv, [g.tensor(n) for n in g.names if n != "output.weight"])
+
+
 def splice(into, donor, names, out):
     a, b = Gguf(into), Gguf(donor)
     ts = {n: a.tensor(n) for n in a.names}
@@ -642,9 +658,13 @@ def main(argv=None):
     p.add_argument("--from", dest="donor", required=True)
     p.add_argument("--tensors", nargs="+", required=True)
     p.add_argument("--out", required=True)
+    p = sub.add_parser("strip-output", help="the head file without output.weight (patch 0105)")
+    p.add_argument("--in", dest="inp", required=True)
+    p.add_argument("--out", required=True)
     p = sub.add_parser("check")
     p.add_argument("file")
     p.add_argument("--experts", type=int)
+    p.add_argument("--no-output", action="store_true", help="require that output.weight is absent")
     p = sub.add_parser("compare")
     p.add_argument("a")
     p.add_argument("b")
@@ -670,10 +690,14 @@ def main(argv=None):
             check_file(a.out)
         elif a.cmd == "splice":
             splice(a.into, a.donor, a.tensors, a.out)
+        elif a.cmd == "strip-output":
+            strip_output(a.inp, a.out)
+            check_file(a.out, no_output=True)
         elif a.cmd == "check":
-            g = check_file(a.file, a.experts)
-            print("%s: head-only, %d tensors, expert_count %d, expert_used_count %d" % (
-                a.file, len(g.names), g.scalar("qwen35moe.expert_count"), g.scalar("qwen35moe.expert_used_count")))
+            g = check_file(a.file, a.experts, no_output=a.no_output)
+            print("%s: head-only, %d tensors, expert_count %d, expert_used_count %d, %s" % (
+                a.file, len(g.names), g.scalar("qwen35moe.expert_count"), g.scalar("qwen35moe.expert_used_count"),
+                "output.weight present" if "output.weight" in g.names else "no output.weight (needs --llama-mtp-vocab)"))
         elif a.cmd == "compare":
             same, n = compare(a.a, a.b, a.prefix, a.rel)
             return 0 if same == n else 1

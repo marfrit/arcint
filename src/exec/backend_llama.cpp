@@ -9,6 +9,7 @@
 #include "core/renderer_material.h"
 #include "exec/mtp_capture.h"   // the MTP head-fit capture (off by default, ARCINT_MTP_CAPTURE)
 #include "exec/mtp_trace.h"   // the MTP window trace (off by default, ARCINT_MTP_TRACE)
+#include "exec/mtp_head_file.h"   // a head file without output.weight needs --llama-mtp-vocab
 #include "exec/slot_loan.h"
 #include "core/admission.h"
 #include "core/markers.h"
@@ -64,6 +65,24 @@ extern "C" int stbi_info_from_memory(unsigned char const* buffer, int len, int* 
 #include "util/utf8.h"
 
 namespace lgc {
+
+namespace {
+
+// The tensor names of a head file, header only: no tensor data is read, no model is loaded.
+MtpHeadFile probe_mtp_head_file(const std::string& path) {
+    gguf_context* g = gguf_init_from_file(path.c_str(), gguf_init_params{ /*no_alloc=*/true, nullptr });
+    if (g == nullptr) throw std::runtime_error(log::format("cannot read %s", path.c_str()));
+    std::vector<std::string> names;
+    for (int64_t i = 0; i < gguf_get_n_tensors(g); ++i) names.emplace_back(gguf_get_tensor_name(g, i));
+    const int64_t ka = gguf_find_key(g, "general.architecture");
+    const std::string arch = ka >= 0 ? gguf_get_val_str(g, ka) : std::string();
+    gguf_free(g);
+    MtpHeadFile f = mtp_head_file_from_names(names);
+    f.arch        = arch;
+    return f;
+}
+
+}  // namespace
 namespace {
 
 using json = nlohmann::json;
@@ -878,6 +897,16 @@ public:
             // GGUF's own MTP layer is its last layer, on the last card
             llama_model* mtp_model = model_;
             if (!cfg.llama_mtp_gguf.empty()) {
+                // a head file without output.weight (patch 0105) has no LM head for a context that asks for
+                // logits: refused here, before the load, unless the draft vocabulary is set. Its rows are
+                // then read from the served file (DraftHead), the MTP context returns rows only
+                {
+                    const MtpHeadFile hf = probe_mtp_head_file(cfg.llama_mtp_gguf);
+                    const std::string why = mtp_head_file_refusal(hf, !cfg.llama_mtp_vocab.empty());
+                    if (!why.empty()) throw std::runtime_error(log::format("--llama-mtp-gguf %s: %s", cfg.llama_mtp_gguf.c_str(), why.c_str()));
+                    if (hf.arch == "qwen35moe" && !hf.has_output && !hf.has_shared_head)
+                        log::info("mtp", "the head file has no output.weight: the draft rows come from %s", cfg.gguf_path.c_str());
+                }
                 llama_model_params dp = llama_model_default_params();
                 dp.n_gpu_layers       = 999;
                 dp.load_mtp           = true;
@@ -895,7 +924,7 @@ public:
                                    threads, cfg.llama_mtp_gguf.empty() ? cfg.gguf_path : cfg.llama_mtp_gguf,
                                    cfg.llama_mtp_vocab, cfg.llama_mtp_min_p, cfg.llama_mtp_policy,
                                    cfg.llama_mtp_cost_seed, cp.type_k, cp.type_v, cp.kv_unified, cp.n_kv_reserve,
-                                   err);
+                                   cfg.gguf_path, err);
             if (!spec_) throw std::runtime_error(log::format("--llama-mtp %d: %s", cfg.llama_mtp, err.c_str()));
             n_draft_ = cfg.llama_mtp;
             mtp_min_p_ = cfg.llama_mtp_min_p;   // the trace records it (exec/mtp_trace.h)

@@ -337,6 +337,7 @@ std::string usage_text() {
         "                            the output head\n"
         "  --llama-mtp-gguf FILE     the MTP layer from this MTP-only GGUF (llama.cpp's\n"
         "                            converter --mtp) instead of the model's own file\n"
+        "                            A file without output.weight needs --llama-mtp-vocab\n"
         "  --llama-mtp-min-p P       stop drafting at a token the MTP head gives less\n"
         "                            than P, and leave it out of the verify (0-1; 0 off:\n"
         "                            always --llama-mtp drafts)\n"

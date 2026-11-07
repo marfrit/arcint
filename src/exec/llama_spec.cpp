@@ -116,8 +116,12 @@ public:
     }
 
     // n_in: the row the MTP context returns (n_embd_out), n_embd: the head's
-    // input (n_embd); they differ by the hyper-connection streams
-    bool init(const std::string& gguf, const std::string& ids_path, int n_in, int n_embd, int n_vocab, std::string& err) {
+    // input (n_embd); they differ by the hyper-connection streams.
+    // rows_gguf: the served file, where output.weight is read when `gguf` (the
+    // MTP head file) has none (patch 0105: a head file without the LM head);
+    // empty or equal to `gguf`: no second place to look
+    bool init(const std::string& gguf, const std::string& rows_gguf, const std::string& ids_path, int n_in, int n_embd,
+              int n_vocab, std::string& err) {
         std::ifstream f(ids_path, std::ios::binary);
         if (!f) {
             err = "cannot read " + ids_path;
@@ -136,7 +140,13 @@ public:
         std::string     file;
         gguf_context*   g  = nullptr;
         int64_t         ti = -1;
-        if (!find_tensor(gguf, "output.weight", file, g, ti, err)) return false;
+        bool from_served = false;
+        if (!find_tensor(gguf, "output.weight", file, g, ti, err)) {
+            if (rows_gguf.empty() || rows_gguf == gguf) return false;
+            err.clear();
+            if (!find_tensor(rows_gguf, "output.weight", file, g, ti, err)) return false;
+            from_served = true;
+        }
         const ggml_type type      = gguf_get_tensor_type(g, ti);
         const size_t    row_bytes = ggml_row_size(type, n_embd);
         const size_t    off       = gguf_get_data_offset(g) + gguf_get_tensor_offset(g, ti);
@@ -167,6 +177,11 @@ public:
 
         // the stream mix's weights, from the file that holds output.weight
         const int hc = n_in / n_embd;
+        if (from_served && n_in != n_embd) {
+            err = "the hyper-connection weights are read from the file that holds output.weight: a head file "
+                  "without output.weight cannot serve a model with hyper-connection streams";
+            return false;
+        }
         std::vector<uint8_t> hc_norm, hc_down, hc_up;
         ggml_type            t_norm = GGML_TYPE_F32, t_down = GGML_TYPE_F32, t_up = GGML_TYPE_F32;
         int64_t              hc_lr  = 0;
@@ -379,7 +394,7 @@ public:
     LlamaMtp(llama_model* model, llama_context* ctx_tgt, int n_draft, int n_seq, int n_batch, int n_ubatch,
              int threads, const std::string& gguf, const std::string& vocab, double min_p, bool cost_policy,
              const std::string& cost_seed, ggml_type type_k, ggml_type type_v, bool kv_unified,
-             uint32_t n_kv_reserve, std::string& err)
+             uint32_t n_kv_reserve, const std::string& rows_gguf, std::string& err)
         : ctx_tgt_(ctx_tgt), n_draft_(n_draft), min_p_(static_cast<float>(min_p)) {
         const int n_heads = llama_model_n_layer_nextn(model);
         if (n_heads <= 0) {
@@ -447,7 +462,7 @@ public:
         }
         if (!vocab.empty()) {
             head_ = std::make_unique<DraftHead>();
-            if (!head_->init(gguf, vocab, n_embd_, llama_model_n_embd(model), n_vocab_, err)) return;
+            if (!head_->init(gguf, rows_gguf, vocab, n_embd_, llama_model_n_embd(model), n_vocab_, err)) return;
         }
         // ARCINT_MTP_CAPTURE (exec/mtp_capture.h): the target's and the head's rows at every
         // prompt position. It needs the unmasked MTP context, which only the draft vocabulary gives.
@@ -912,9 +927,11 @@ std::unique_ptr<LlamaSpec> make_llama_mtp(llama_model* model, llama_context* ctx
                                           int n_batch, int n_ubatch, int threads, const std::string& gguf,
                                           const std::string& vocab, double min_p, bool cost_policy,
                                           const std::string& cost_seed, ggml_type type_k, ggml_type type_v,
-                                          bool kv_unified, uint32_t n_kv_reserve, std::string& err) {
+                                          bool kv_unified, uint32_t n_kv_reserve, const std::string& rows_gguf,
+                                          std::string& err) {
     auto s = std::make_unique<LlamaMtp>(model, ctx_tgt, n_draft, n_seq, n_batch, n_ubatch, threads, gguf, vocab,
-                                        min_p, cost_policy, cost_seed, type_k, type_v, kv_unified, n_kv_reserve, err);
+                                        min_p, cost_policy, cost_seed, type_k, type_v, kv_unified, n_kv_reserve,
+                                        rows_gguf, err);
     if (!s->ok() || !err.empty()) return nullptr;
     if (s->head_rows() > 0) log::info("mtp", "draft head: %zu token rows", s->head_rows());
     return s;
