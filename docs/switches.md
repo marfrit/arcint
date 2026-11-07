@@ -154,6 +154,7 @@ These names are not in a table:
 | `GGML_OPENCL_Q40_2D` | `2` | Dense q4_0 weights times 16+ columns, K a multiple of 256: `0` the 0096 tile, `1` fp16 2D-block GEMM (Xe2), `2` int8 (0099). |
 | `GGML_OPENCL_Q40_SG8_SHAPE` | `32,8` | `TMM,WG` of the Alchemist int8 GEMM: tokens a sub-group, sub-groups a work-group. |
 | `GGML_OPENCL_F32_SKINNY` | on (Intel) | `0`: skinny F32 products use ggml's paths. | 0005 | Coder router, 512-token prefill: 24.3 -> 9.0 ms, A770 (`measured-here`). |
+| `GGML_OPENCL_F32W_F16` | `1` (Intel) | `0`: F32 2-D weights get no f16 copy and multiply in F32; `2`: the copy only from 16 columns (prompts). | 0110 | — |
 | `GGML_OPENCL_FA_DPAS` | on (Intel with DPAS) | `0`: prompt attention keeps `flash_attn_f32_f16.cl`. | 0008 | 512 rows x 4,096 keys: B60 8.2 ms, A770 22.4 ms (`measured-here`). |
 | `GGML_OPENCL_FA_DPAS2` | on (Xe2 only) | `0`: prompt attention keeps 0008's kernel. | 0038 | — |
 | `GGML_OPENCL_FA_DPAS2_MCLS` | on | `0`: no mask classes (skipping all-zero and all -inf blocks). | 0038 | — |
@@ -198,6 +199,7 @@ These names are not in a table:
 | `GGML_OPENCL_BANK_STREAM_RED` | off | Each ring slot is filled from the next bank tensor. | 0032 | The run aborts at the next synchronisation (`measured-here`). |
 | `GGML_OPENCL_CONV3D_RED` | off | The conv_3d kernel ignores its weights and every output is 0, the gross red. | 0059 | `code`: 0059:184-185,355-357. |
 | `GGML_OPENCL_F16_XMX_RED` | off | The XMX F16 GEMM runs with K shortened by 16, which also shifts its row stride: every row misread, a gross red (`code`). | 0022 | — |
+| `GGML_OPENCL_F32W_F16_RED` | off | The f16 copies of F32 weights have the last 16 of K negated in every row; logged at the first copy. | 0110 | — |
 | `GGML_OPENCL_Q8_XMX_RED` | off | The XMX q8_0 GEMM zeroes the last 16 weights of every row (those K terms left out). | 0058 | 1024² image gate cos worst 0.999926 -> 0.987219, PSNR 42.59 -> 19.56 dB; 52 of 151 Q8_0 op cases fail (`measured-here`). |
 | `GGML_OPENCL_FUSE_0049_RED` | off | The folded rms_norm scale is dropped. | 0049 | — |
 | `GGML_OPENCL_FUSE_0050_RED` | off | Every GDN snapshot slot is written over slot 0. | 0050 | Changed the Flash-Next texts (`measured-here`). |
