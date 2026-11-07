@@ -1,0 +1,418 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Markus Fritsche <mfritsche@reauktion.de>
+Date: Sat, 7 Nov 2026 12:00:00 +0000
+Subject: [PATCH] 0114-opencl-ngpt-update-fused
+
+---
+ ggml/src/ggml-opencl/ggml-opencl.cpp     | 162 +++++++++++++++++++++++++++++
+ ggml/src/ggml-opencl/kernels/rms_norm.cl |  89 ++++++++++++++++
+ tests/test-backend-ops.cpp               |  70 +++++++++++++
+ 3 files changed, 321 insertions(+)
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 5e8da87..70d2047 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -812,6 +812,11 @@ struct ggml_backend_opencl_context {
+     struct gdn_gate_src { const ggml_tensor * alpha, * dt, * a, * beta; int parts; };
+     std::unordered_map<const ggml_tensor *, gdn_gate_src> gdn_gate;
+     std::vector<uint8_t> gdn_skip;               // by node index
++    bool fuse_ngpt = true;                       // opt-out GGML_OPENCL_FUSE_NGPT=0 (patch 0114: Dory's nGPT update in one kernel)
++    int  ngpt_red = 0;                           // GGML_OPENCL_FUSE_NGPT_RED=1: the fused kernel reads alpha as 1 (the red case)
++    int  ngpt_fused = 0, ngpt_refused = 0;       // this graph's matches, fused and refused for an overlap
++    int  ngpt_inplace = 0;                       // of the fused, those whose result lies exactly over x or a
++    bool ngpt_told = false;
+     int  fuse_0049 = 7;                          // patch 0049's fusions, a bit each: 1 rms_norm + scale, 2 ssm_conv + silu,
+                                                  // 4 sigmoid + mul (GGML_OPENCL_FUSE_0049=<mask>; 0: off)
+     bool f16_mrow = true;                        // opt-out GGML_OPENCL_F16_MROW=0 (multi-row-per-WG f16 decode GEMV for attn proj + lm_head)
+@@ -1043,6 +1048,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_norm, kernel_norm_mul_add;
+     cl_kernel kernel_rms_norm, kernel_rms_norm_mul;
+     cl_kernel kernel_rms_norm_mul_add = nullptr;   // fused rms_norm(x)*w + b (residual)
++    cl_kernel kernel_ngpt_slerp = nullptr;         // Dory's nGPT residual update, 7 nodes in one (patch 0114)
+     cl_kernel kernel_rms_norm_mul_rope_multi = nullptr;   // fused rms_norm(x)*w then the interleaved M-RoPE (patch 0074)
+     cl_kernel kernel_l2_norm_f32;
+     cl_kernel kernel_group_norm, kernel_group_norm_mul_add;
+@@ -3904,6 +3910,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+         CL_CHECK((backend_ctx->kernel_rms_norm_mul = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm_mul", &err), err));
+         CL_CHECK((backend_ctx->kernel_rms_norm_mul_add = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm_mul_add", &err), err));
+         CL_CHECK((backend_ctx->kernel_rms_norm_mul_rope_multi = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm_mul_rope_multi_f32", &err), err));
++        // patch 0114: optional, the separate kernels run without it
++        backend_ctx->kernel_ngpt_slerp = clCreateKernel(backend_ctx->program_rms_norm, "kernel_ngpt_slerp_f32", &err);
++        if (err != CL_SUCCESS) {
++            backend_ctx->kernel_ngpt_slerp = nullptr;
++        }
+         GGML_LOG_CONT(".");
+     }
+ 
+@@ -8999,6 +9010,15 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
+     if (const char * env = getenv("GGML_OPENCL_FUSE_0049")) {
+         backend_ctx->fuse_0049 = atoi(env);
+     }
++    if (const char * env = getenv("GGML_OPENCL_FUSE_NGPT")) {
++        backend_ctx->fuse_ngpt = atoi(env) != 0;
++    }
++    if (const char * env = getenv("GGML_OPENCL_FUSE_NGPT_RED")) {
++        backend_ctx->ngpt_red = atoi(env) != 0;
++        if (backend_ctx->ngpt_red) {
++            GGML_LOG_WARN("ggml_opencl: GGML_OPENCL_FUSE_NGPT_RED=1: the fused nGPT update reads alpha as 1 (a red case, wrong output)\n");
++        }
++    }
+     if (const char * env = getenv("GGML_OPENCL_TOPK_MOE_LEGACY")) {
+         backend_ctx->topk_moe_legacy = atoi(env) != 0;
+     }
+@@ -11237,6 +11257,133 @@ static void ggml_cl_cpy_run_fused(ggml_backend_t backend, const ggml_opencl_cpy_
+     backend_ctx->enqueue_ndrange_kernel(kernel, 1, global_work_size, local_work_size, run.dst[run.n - 1]);
+ }
+ 
++// patch 0114: Dory's nGPT residual update (src/models/dory.cpp, the slerp of the residual a and the
++// sublayer's output x by the per-channel alpha w),
++//   y = norm(a + w * (norm(x) - a)),  norm(v) = rms_norm(v, eps) * s,
++// built as RMS_NORM SCALE SUB MUL ADD RMS_NORM SCALE: one kernel, a work-group a row, instead of
++// seven (five with 0049's rms_norm+scale). vLLM computes the same update (slerp_alpha in its
++// models/dory.py) as one torch.compile'd region. The kernel reads x, a and w until it writes y, so
++// y may lie exactly over x or a (the same rows: each element is read and written by one
++// work-item, after both reductions) and must not overlap them otherwise, nor overlap w; such a
++// placement is refused and counted, and the seven nodes run as before.
++static bool ggml_opencl_can_fuse_ngpt(ggml_backend_opencl_context * backend_ctx, const ggml_cgraph * cgraph, int i) {
++    if (backend_ctx->kernel_ngpt_slerp == nullptr || !backend_ctx->fuse_ngpt || i + 7 > cgraph->n_nodes ||
++        (backend_ctx->gpu_family != INTEL && backend_ctx->gpu_family != ADRENO)) {   // the sub-group sizes the host assumes
++        return false;
++    }
++    ggml_tensor * const * n = cgraph->nodes + i;
++    if (n[0]->op != GGML_OP_RMS_NORM || n[1]->op != GGML_OP_SCALE || n[2]->op != GGML_OP_SUB) {
++        return false;
++    }
++    static const enum ggml_op ops[7] = { GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_SUB, GGML_OP_MUL,
++                                         GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_SCALE };
++    if (!ggml_can_fuse(cgraph, i, ops, 7)) {
++        return false;
++    }
++    const ggml_tensor * x = n[0]->src[0];
++    const ggml_tensor * a = n[2]->src[1];
++    const ggml_tensor * y = n[6];
++    // b - a; the alpha either side of the mul; a + m with the same a
++    if (n[1]->src[0] != n[0] || n[2]->src[0] != n[1] || n[5]->src[0] != n[4] || n[6]->src[0] != n[5]) {
++        return false;
++    }
++    const ggml_tensor * w = n[3]->src[0] == n[2] ? n[3]->src[1] : n[3]->src[0];
++    const ggml_tensor * a2 = n[4]->src[0] == n[3] ? n[4]->src[1] : n[4]->src[0];
++    if (a2 != a || x == nullptr || a == nullptr || w == nullptr) {
++        return false;
++    }
++    for (int k = 0; k < 7; ++k) {
++        if (n[k]->type != GGML_TYPE_F32) {
++            return false;
++        }
++    }
++    if (x->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32) {
++        return false;
++    }
++    const int64_t ne00 = x->ne[0];
++    if (ne00 % 4 != 0 || !ggml_are_same_shape(x, y) || !ggml_are_same_shape(a, y) ||
++        !ggml_is_contiguous(x) || !ggml_is_contiguous(a) || !ggml_is_contiguous(y) ||
++        w->ne[0] != ne00 || ggml_nrows(w) != 1 || !ggml_is_contiguous(w)) {
++        return false;
++    }
++    float bias1, bias2;
++    memcpy(&bias1, (const float *) n[1]->op_params + 1, sizeof(float));
++    memcpy(&bias2, (const float *) n[6]->op_params + 1, sizeof(float));
++    if (bias1 != 0.0f || bias2 != 0.0f) {
++        return false;
++    }
++    if (x->extra == nullptr || a->extra == nullptr || w->extra == nullptr || y->extra == nullptr) {
++        return false;
++    }
++    auto exact = [&](const ggml_tensor * s) {
++        if (!ggml_cl_tensors_overlap(s, y)) {
++            return true;
++        }
++        const ggml_tensor_extra_cl * es = (const ggml_tensor_extra_cl *) s->extra;
++        const ggml_tensor_extra_cl * ey = (const ggml_tensor_extra_cl *) y->extra;
++        return es->offset + s->view_offs == ey->offset + y->view_offs;   // same shape, both contiguous: the same rows
++    };
++    if (!exact(x) || !exact(a) || ggml_cl_tensors_overlap(w, y)) {
++        backend_ctx->ngpt_refused++;
++        return false;
++    }
++    if (ggml_cl_tensors_overlap(x, y) || ggml_cl_tensors_overlap(a, y)) {
++        backend_ctx->ngpt_inplace++;
++    }
++    return true;
++}
++
++static void ggml_cl_ngpt_fused(ggml_backend_t backend, ggml_tensor * const * n) {
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
++    const ggml_tensor * x = n[0]->src[0];
++    const ggml_tensor * a = n[2]->src[1];
++    const ggml_tensor * w = n[3]->src[0] == n[2] ? n[3]->src[1] : n[3]->src[0];
++    ggml_tensor * y = n[6];
++    ggml_tensor_extra_cl * ex = (ggml_tensor_extra_cl *) x->extra;
++    ggml_tensor_extra_cl * ea = (ggml_tensor_extra_cl *) a->extra;
++    ggml_tensor_extra_cl * ew = (ggml_tensor_extra_cl *) w->extra;
++    ggml_tensor_extra_cl * ey = (ggml_tensor_extra_cl *) y->extra;
++    const cl_ulong ox = ex->offset + x->view_offs, oa = ea->offset + a->view_offs;
++    const cl_ulong ow = ew->offset + w->view_offs, oy = ey->offset + y->view_offs;
++    const int ne00 = (int) x->ne[0];
++    const int64_t nrows = ggml_nrows(y);
++    const cl_ulong nbx = x->nb[1], nba = a->nb[1], nby = y->nb[1];
++    float eps1, s1, eps2, s2;
++    memcpy(&eps1, n[0]->op_params, sizeof(float));
++    memcpy(&s1,   n[1]->op_params, sizeof(float));
++    memcpy(&eps2, n[5]->op_params, sizeof(float));
++    memcpy(&s2,   n[6]->op_params, sizeof(float));
++    const int red = backend_ctx->ngpt_red;
++    const int sgs = backend_ctx->gpu_family == ADRENO ? 64 : 32;
++    cl_kernel k = backend_ctx->kernel_ngpt_slerp;
++    int nth = sgs;
++    const int max_wg = (int) MIN((size_t) 256, backend_ctx->get_kernel_workgroup_size(k));
++    while (nth < ne00/4 && nth*2 <= max_wg) {
++        nth *= 2;
++    }
++    int arg = 0;
++    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_mem),   &ex->data_device));
++    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &ox));
++    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_mem),   &ea->data_device));
++    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &oa));
++    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_mem),   &ew->data_device));
++    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &ow));
++    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_mem),   &ey->data_device));
++    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &oy));
++    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int),      &ne00));
++    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nbx));
++    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nba));
++    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nby));
++    CL_CHECK(clSetKernelArg(k, arg++, sizeof(float),    &eps1));
++    CL_CHECK(clSetKernelArg(k, arg++, sizeof(float),    &s1));
++    CL_CHECK(clSetKernelArg(k, arg++, sizeof(float),    &eps2));
++    CL_CHECK(clSetKernelArg(k, arg++, sizeof(float),    &s2));
++    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int),      &red));
++    CL_CHECK(clSetKernelArg(k, arg++, sizeof(float) * (nth / sgs), NULL));
++    size_t gws[1] = { (size_t) nrows * nth }, lws[1] = { (size_t) nth };
++    backend_ctx->enqueue_ndrange_kernel(k, 1, gws, lws, y);
++}
++
+ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+     backend_ctx->graph_gen++;
+@@ -11248,6 +11395,7 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+                       backend_ctx->device_name.c_str(), (long long) backend_ctx->f16_copy_n, backend_ctx->f16_copy_bytes / (1024.0 * 1024.0));
+     }
+     ggml_cl_gdn_gate_prepass(backend_ctx, cgraph);
++    backend_ctx->ngpt_fused = backend_ctx->ngpt_refused = backend_ctx->ngpt_inplace = 0;
+ 
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_tensor * node = cgraph->nodes[i];
+@@ -11268,6 +11416,14 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+             continue;   // a gating op the GDN kernel computes itself (patch 0051)
+         }
+ 
++        // patch 0114, before the shorter rms_norm patterns its first node also starts
++        if (!backend_ctx->disable_fusion && node->op == GGML_OP_RMS_NORM && ggml_opencl_can_fuse_ngpt(backend_ctx, cgraph, i)) {
++            ggml_cl_ngpt_fused(backend, cgraph->nodes + i);
++            backend_ctx->ngpt_fused++;
++            i += 6;
++            continue;
++        }
++
+         if (!backend_ctx->disable_fusion) {
+             int act = 0; float s2 = 1.0f;
+             const int nf = ggml_opencl_can_fuse_scale_act(backend_ctx, cgraph, i, &act, &s2);
+@@ -11477,6 +11633,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+         GGML_ASSERT(ok);
+     }
+ 
++    if (!backend_ctx->ngpt_told && (backend_ctx->ngpt_fused > 0 || backend_ctx->ngpt_refused > 0)) {
++        backend_ctx->ngpt_told = true;
++        GGML_LOG_INFO("ggml_opencl: the nGPT update fused %d times in a graph (%d of them in place), %d refused (an overlap with its inputs); GGML_OPENCL_FUSE_NGPT=0 keeps the separate kernels\n",
++                      backend_ctx->ngpt_fused, backend_ctx->ngpt_inplace, backend_ctx->ngpt_refused);
++    }
++
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+diff --git a/ggml/src/ggml-opencl/kernels/rms_norm.cl b/ggml/src/ggml-opencl/kernels/rms_norm.cl
+index 79043fe..68811bb 100644
+--- a/ggml/src/ggml-opencl/kernels/rms_norm.cl
++++ b/ggml/src/ggml-opencl/kernels/rms_norm.cl
+@@ -556,3 +556,92 @@ kernel void kernel_rms_norm_mul_rope_multi_f32(
+         }
+     }
+ }
++
++//------------------------------------------------------------------------------
++// ARC-LAB 0114: the nGPT residual update of Dory's graph in one kernel,
++//   b = rms_norm(x, eps1) * s1,  t = a + (b - a) * w,  y = rms_norm(t, eps2) * s2
++// (the graph's RMS_NORM SCALE SUB MUL ADD RMS_NORM SCALE), one work-group a row,
++// w [ne00] broadcast over the rows. Each element is read and written by the same
++// work-item, after both reductions, so y may lie exactly over a or over x (the
++// allocator's in-place placement); any other overlap is refused by the host.
++// red != 0 (the test's mutation) reads w as 1.
++//------------------------------------------------------------------------------
++#ifdef INTEL_GPU
++REQD_SUBGROUP_SIZE_32
++#elif defined (ADRENO_GPU)
++REQD_SUBGROUP_SIZE_64
++#endif
++kernel void kernel_ngpt_slerp_f32(
++        global char * src_x,
++        ulong off_x,
++        global char * src_a,
++        ulong off_a,
++        global char * src_w,
++        ulong off_w,
++        global char * dst,
++        ulong off_d,
++        int ne00,
++        ulong nb_x,
++        ulong nb_a,
++        ulong nb_d,
++        float eps1,
++        float s1,
++        float eps2,
++        float s2,
++        int red,
++        local float * sum
++) {
++    const int row = get_group_id(0);
++    global const float4 * x = (global const float4 *) (src_x + off_x + row*nb_x);
++    global const float4 * a = (global const float4 *) (src_a + off_a + row*nb_a);
++    global const float4 * w = (global const float4 *) (src_w + off_w);
++    global float4 * y = (global float4 *) (dst + off_d + row*nb_d);
++    const int n4  = ne00/4;
++    const int lid = get_local_id(0);
++    const int lsz = get_local_size(0);
++    const uint sg  = get_sub_group_id();
++    const uint nsg = get_local_size(0) / get_max_sub_group_size();   // the host launches a multiple of the sub-group size
++
++    float4 acc = 0.0f;
++    for (int i = lid; i < n4; i += lsz) {
++        const float4 v = x[i];
++        acc += v*v;
++    }
++    float p = sub_group_reduce_add(acc.s0 + acc.s1 + acc.s2 + acc.s3);
++    if (get_sub_group_local_id() == 0) {
++        sum[sg] = p;
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++    float tot = 0.0f;
++    for (uint k = 0; k < nsg; ++k) {
++        tot += sum[k];
++    }
++    const float r1 = 1.0f/sqrt(tot/ne00 + eps1);
++    // every work-item has read the partial sums before they are written again
++    barrier(CLK_LOCAL_MEM_FENCE);
++
++    acc = 0.0f;
++    for (int i = lid; i < n4; i += lsz) {
++        const float4 av = a[i];
++        const float4 wv = red ? (float4)(1.0f) : w[i];
++        const float4 t  = av + ((x[i]*r1)*s1 - av)*wv;
++        acc += t*t;
++    }
++    p = sub_group_reduce_add(acc.s0 + acc.s1 + acc.s2 + acc.s3);
++    if (get_sub_group_local_id() == 0) {
++        sum[sg] = p;
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++    tot = 0.0f;
++    for (uint k = 0; k < nsg; ++k) {
++        tot += sum[k];
++    }
++    const float r2 = 1.0f/sqrt(tot/ne00 + eps2);
++
++    for (int i = lid; i < n4; i += lsz) {
++        const float4 av = a[i];
++        const float4 wv = red ? (float4)(1.0f) : w[i];
++        const float4 t  = av + ((x[i]*r1)*s1 - av)*wv;
++        y[i] = (t*r2)*s2;
++    }
++}
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index a04f4f9..1c154a5 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3974,6 +3974,64 @@ struct test_rms_norm_back : public test_case {
+ };
+ 
+ // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
++// ARC-LAB 0114: Dory's nGPT residual update, y = norm(a + w * (norm(x) - a)) with
++// norm(v) = rms_norm(v, 1e-6/n) / sqrt(n), built as the model builds it (RMS_NORM SCALE SUB MUL ADD
++// RMS_NORM SCALE): OpenCL runs it as one kernel. alpha_first puts w as the mul's first operand (one
++// row: the shapes must match); inplace builds the in-place ops (views of a), which ggml_can_fuse
++// refuses, so it is a control like a nonzero bias on the last scale: the separate kernels run. The
++// allocator's in-place placement (a result over a dead x or a) does not occur in this harness; the
++// backend's log counts it in the served graph
++struct test_ngpt_slerp : public test_case {
++    const std::array<int64_t, 4> ne;
++    const bool alpha_first;
++    const bool inplace;
++    const float bias;
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "NGPT_SLERP";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    std::string vars() override {
++        return VARS_TO_STR4(ne, alpha_first, inplace, bias);
++    }
++
++    test_ngpt_slerp(std::array<int64_t, 4> ne = {2560, 1, 1, 1}, bool alpha_first = false, bool inplace = false, float bias = 0.0f)
++        : ne(ne), alpha_first(alpha_first), inplace(inplace), bias(bias) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_set_name(x, "x");
++        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_set_name(a, "a");
++        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
++        ggml_set_name(w, "w");
++        const float n = (float) ne[0];
++        const float eps = 1e-6f / n, sc = 1.0f / sqrtf(n);
++        ggml_tensor * b = ggml_scale(ctx, ggml_rms_norm(ctx, x, eps), sc);
++        ggml_tensor * d = ggml_sub(ctx, b, a);
++        ggml_tensor * m = alpha_first ? ggml_mul(ctx, w, d) : ggml_mul(ctx, d, w);
++        ggml_tensor * t = inplace ? ggml_add_inplace(ctx, a, m) : ggml_add(ctx, a, m);
++        ggml_tensor * r = inplace ? ggml_rms_norm_inplace(ctx, t, eps) : ggml_rms_norm(ctx, t, eps);
++        ggml_tensor * out = inplace ? ggml_scale_inplace(ctx, r, sc) : ggml_scale_bias(ctx, r, sc, bias);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            // alpha as the model has it (positive, small), the vectors of either sign
++            if (strcmp(t->name, "w") == 0) {
++                init_tensor_uniform(t, 0.01f, 0.5f);
++            } else {
++                init_tensor_uniform(t, -1.0f, 1.0f);
++            }
++        }
++    }
++};
++
+ struct test_rms_norm_mul_add : public test_case {
+     const ggml_type type;
+     const std::array<int64_t, 4> ne;
+@@ -11271,6 +11329,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, false, true));
+     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, false, true));
+ 
++    // ARC-LAB 0114: Dory's width 2560 at decode, a few rows, a prompt ubatch, 3-D rows; the operand
++    // order; controls the fusion does not take: the in-place ops (views), a bias, a width not a multiple of 4
++    test_cases.emplace_back(new test_ngpt_slerp({2560, 1, 1, 1}));
++    test_cases.emplace_back(new test_ngpt_slerp({2560, 7, 1, 1}));
++    test_cases.emplace_back(new test_ngpt_slerp({2560, 512, 1, 1}));
++    test_cases.emplace_back(new test_ngpt_slerp({256, 64, 1, 1}));
++    test_cases.emplace_back(new test_ngpt_slerp({2560, 4, 3, 1}));
++    test_cases.emplace_back(new test_ngpt_slerp({2560, 1, 1, 1}, true));
++    test_cases.emplace_back(new test_ngpt_slerp({2560, 7, 1, 1}, false, true));
++    test_cases.emplace_back(new test_ngpt_slerp({2560, 7, 1, 1}, false, false, 0.5f));
++    test_cases.emplace_back(new test_ngpt_slerp({2558, 3, 1, 1}));
++
+     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
+     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
+     // the q/k norm + IMRoPE fusion (patch 0074): the served models' shapes, the

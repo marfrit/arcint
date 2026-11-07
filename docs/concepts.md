@@ -916,7 +916,7 @@ Qwen3-TTS's code predictor runs a small graph per frame. On the B60 the predicto
 
 ## 13. Weight-shared and looped architectures
 
-Models that run the same weights more than once per token. Admitted 2026-11-07; neither entry has run on a card yet.
+Models that run the same weights more than once per token. Admitted 2026-11-07.
 
 ### Physical blocks and executed layers kept apart (a looped nGPT)
 
@@ -937,6 +937,26 @@ A model whose small scale vectors are stored in BF16 casts each one to F32 in th
 - **Location:** `ggml/src/ggml-opencl/ggml-opencl.cpp`, `supports_op` (`GGML_OP_CPY`) and `ggml_cl_cpy`; test `tests/test-backend-ops.cpp`, `test_cpy` with BF16 sources at 2560, 4096, 7168 and 2560 x 256. (0109)
 - **Switch:** none.
 - **Source:** arcint's own, after the same fix on CUDA in the pull request above.
+
+### Constant chains of a model's scale vectors computed once at load
+
+A model that keeps small per-channel scale vectors and combines them with constants in the forward (Dory: `|alpha| * alpha_init / init_std`, `(sqk * sqrt(hd) / init_std)^2`, `suv * sqrt(n_embd)`, and others) spends three to six graph nodes a sublayer recomputing values that never change; in a looped model each recurrent block pays it once a loop. Compute each final vector once after the weights are loaded, in F32, from the file's own bytes, with the forward's operations in the forward's order, and put it in the buffer type the loader chose for its source, so the CPU computes the same bits as before. Move a uniform scale that sits between a norm and a per-channel multiply into the vector (here 1/sqrt(hd), a power of two, so exact), which leaves a norm-then-multiply pair the backend already fuses. A norm of a vector that is already a norm's output is a factor of 1 - 5e-7 and can go.
+- **Effect:** `measured-here`, 2026-11-07, Dory1.0-4B Q5_K_M, the graph builder on the CPU: launching nodes a forward at 2 loops, q8_0:q4_0, 3,771 -> 2,761 with the vectors folded -> 2,535 with the repeated norms dropped; 4 loops 6,461 -> 4,341; at f16 KV 3,547 -> 2,311 and 6,077 -> 3,957. On the CPU against the unchanged graph: folded vectors KL 0.000000 (the same logits); with the norms dropped KL 0.0080, top-1 95.9 %, where a control that moves every layer's output by one ulp gives 0.0090 and 95.6 % (2 loops; at 4 loops 0.0080 against the control's 0.0080): this model turns any rounding change into about 0.008-0.009 nats, the same as the A770's KL against the CPU before the change (0.0091). Card speed: owed.
+- **Applies to:** Dory (any backend; the graph changes). The vectors are about 4.3 MiB F32.
+- **Default:** On (`LLAMA_DORY_FOLD=2`); `1` folds the vectors only, `0` builds the upstream pull request's graph.
+- **Location:** `src/models/dory.cpp`, `llama_model_dory::load_tensors_post` and the graph; `src/llama-model.cpp`, `llama_model_base::load_tensors_post` (a virtual called after the weights load) and `own_buffer`. (0113)
+- **Switch:** `LLAMA_DORY_FOLD`.
+- **Source:** arcint's own, a deviation from llama.cpp pull request 30306's graph (operator, 2026-11-07); vLLM's `models/dory.py` also builds the factors in the forward, under `torch.compile`.
+
+### The nGPT residual update as one kernel
+
+An nGPT block ends with a normalised interpolation of the residual a toward the sublayer's normalised output, `h = norm(a + alpha * (norm(x) - a))`: seven graph nodes (two norms with their scale, a subtract, a per-channel multiply, an add), five kernels with an rms_norm + scale fusion. One work-group a row computes both reductions and writes h, recomputing the interpolation in the last pass instead of keeping it. The fused kernel reads its inputs after the point where the unfused graph would let the allocator reuse them, so the result may lie exactly over x or a (each element is read and written by the same work-item after both reductions) and any other overlap refuses the fusion.
+- **Effect:** `inferred` from the CPU graph: 112 updates a forward at 2 loops and 192 at 4 match the pattern; the card's launches about 2,028 -> 1,580 at 2 loops q8_0:q4_0 (after the folding above). Card speed and the op tests: owed.
+- **Applies to:** OpenCL; F32, contiguous rows, a width that is a multiple of 4, alpha one row; the pattern in the order Dory's graph builds it.
+- **Default:** On.
+- **Location:** `ggml/src/ggml-opencl/ggml-opencl.cpp`, `ggml_opencl_can_fuse_ngpt`, `ggml_cl_ngpt_fused`; `kernels/rms_norm.cl`, `kernel_ngpt_slerp_f32`; test `tests/test-backend-ops.cpp`, `test_ngpt_slerp` (`-o NGPT_SLERP`). (0114)
+- **Switch:** `GGML_OPENCL_FUSE_NGPT=0` off; `GGML_OPENCL_FUSE_NGPT_RED=1` the red case (alpha read as 1).
+- **Source:** vLLM's `slerp_alpha` (`models/dory.py`), which runs the same update inside one compiled region; here a pattern in the backend's graph loop, not a new ggml op.
 
 ## Where the ideas came from
 

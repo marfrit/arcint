@@ -165,6 +165,8 @@ These names are not in a table:
 | `GGML_OPENCL_FA_ROW_BLOCKS` | on (Intel, 9-64 rows) | `0`: one attention call, not blocks of 8 rows. | 0028 | Two lanes' verifies at 4k spent 4.3 ms an attention call without it (`measured-here`). |
 | `GGML_OPENCL_FA_SG8_QG` | on (sub-group 8) | `0`: Q stays in local memory, 8 sub-groups. | 0039 | — |
 | `GGML_OPENCL_FA_SG8_VBLK` | on (sub-group 8, f16 V) | `0`: the old V staging. | 0048 | V's transposing stores ~12 ms of 70 on the A770 (`measured-here`). |
+| `GGML_OPENCL_FUSE_NGPT` | on | `0`: Dory's nGPT residual update (`RMS_NORM SCALE SUB MUL ADD RMS_NORM SCALE`) runs as its separate kernels, not as one. | 0114 | — |
+| `LLAMA_DORY_FOLD` | `2` | Read at load. `0`: Dory's graph as the upstream pull request builds it (scale chains in the forward); `1`: the scale vectors folded at load only (the same values on the CPU); `2`: also no second norm of a residual that is already normalised. | 0113 | CPU, 2 loops: KL against the unchanged graph 0 at `1`, 0.0080 at `2`, against 0.0090 for a one-ulp control (`measured-here`). |
 | `GGML_OPENCL_FUSE_0049` | 7 | Mask: 1 rms_norm + scale, 2 ssm_conv + silu, 4 sigmoid + mul; 0 off. | 0049 | Flash-Next verify graph 12,346-12,407 -> 11,666-11,678 us; decode 32.0 -> 32.2 t/s (`measured-here`). |
 | `GGML_OPENCL_FUSE_0050` | 3 | Mask: bit 1 GDN snapshots written into the cache, bit 2 the gating fold (0051). `0` keeps the copy. | 0050 | Decode +5.1-5.3 % dense agent, +1.8-2.0 % coder, +1.2-1.9 % Flash-Next (`measured-here`). |
 | `GGML_OPENCL_FUSE_CPY_RUN` | on | `0`: runs of narrow strided f32 copies that share their layouts (the recurrent-state rollback snapshots) are not executed as one launch. | 0065 | `code`: 0065:39-41. |
@@ -202,6 +204,7 @@ These names are not in a table:
 | `GGML_OPENCL_F32W_F16_RED` | off | The f16 copies of F32 weights have the last 16 of K negated in every row; logged at the first copy. | 0110 | — |
 | `GGML_OPENCL_Q8_XMX_RED` | off | The XMX q8_0 GEMM zeroes the last 16 weights of every row (those K terms left out). | 0058 | 1024² image gate cos worst 0.999926 -> 0.987219, PSNR 42.59 -> 19.56 dB; 52 of 151 Q8_0 op cases fail (`measured-here`). |
 | `GGML_OPENCL_FUSE_0049_RED` | off | The folded rms_norm scale is dropped. | 0049 | — |
+| `GGML_OPENCL_FUSE_NGPT_RED` | off | The fused nGPT update reads alpha as 1 (the update becomes `norm(norm(x))`); logged at start. | 0114 | — |
 | `GGML_OPENCL_FUSE_0050_RED` | off | Every GDN snapshot slot is written over slot 0. | 0050 | Changed the Flash-Next texts (`measured-here`). |
 | `GGML_OPENCL_FUSE_0051_RED` | off | The gating fold reads A in place of dt. | 0051 | Changed all three Flash-Next texts and lost the needle (`measured-here`). |
 | `GGML_OPENCL_LEAKY_RELU_RED` | off | The leaky-ReLU's slope is negated. | 0060 | `code`: 0060:96-99. |

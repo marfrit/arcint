@@ -229,6 +229,19 @@ measured on 2026-11-07.
   decode 14.7 -> 23.7 t/s, prefill 540 -> 665 t/s; the red arm printed no
   DOWNGRADE line, because a weight-fed op declined by `supports_op` goes to the
   CPU without a key. That is an open gap in the downgrade accounting.
+  Patches 0113 and 0114 (2026-11-07) deviate from the PR's graph for speed, which
+  the operator allowed for Dory, judged at the answer-level bar: the scale vectors'
+  constant chains are computed once at load in F32 from the file's bytes, the q norm's
+  1/sqrt(hd) moves into its vector, the SwiGLU is one GLU node, and a residual that is
+  already a norm's output is not normalised again (`LLAMA_DORY_FOLD`, 2 by default, 1
+  the folded vectors only, 0 the PR's graph); OpenCL runs the nGPT residual update
+  as one kernel (`GGML_OPENCL_FUSE_NGPT`). Launching nodes a forward on the CPU
+  graph (`measured-here`): 3,771 -> 2,535 at 2 loops q8_0:q4_0, 6,461 -> 4,341 at
+  4; the card's launches about 3,151 -> 1,580 and 5,397 -> 2,704 (`inferred`, the
+  backend's fusions applied by op adjacency). On the CPU, KL against the PR's graph
+  is 0 with the folded vectors and 0.0080 with the norms dropped, against 0.0090
+  for a control that moves every layer's output by one ulp: this model's rounding
+  floor, the same as the A770's 0.0091 against the CPU. Card A/B and KL arms are owed.
 
 | service | model | architecture | served file | card |
 |---|---|---|---|---|
