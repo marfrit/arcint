@@ -6662,15 +6662,15 @@ Findings on the pull request (`code`, read; none run). (1) `last_loop` makes a t
 
 On the cards (`measured-here`, 2026-11-07, build 6fa32c1e, Dory1.0-4B Q5_K_M, served; decode over 400 tokens including the prefill, prefill over a 5.9k-token prompt):
 
-| card | loops / KV | decode | prefill | peak VRAM |
+| card | loops / KV | decode | prefill | VRAM resident after the requests (fdinfo) |
 |---|---|---|---|---|
 | A770 | 2, q8_0:q4_0 | 23.7 t/s | 512-665 t/s | 5.2 GiB |
 | A770 | 2, f16 | 24.9 t/s | 727 t/s | 7.1 GiB |
 | A770 | 4, q8_0:q4_0 | 14.3 t/s | 396 t/s | 6.2 GiB |
 | A770 | 4, `last_loop`, q8_0:q4_0 | 14.3 t/s | 392 t/s | 4.7 GiB |
-| B60 | 2, q8_0:q4_0 | 36.4 t/s | 1,287 t/s | not recorded |
-| B60 | 2, f16 | 37.9 t/s | 1,592 t/s | not recorded |
-| B60 | 4, q8_0:q4_0 | 22.0 t/s | 742 t/s | not recorded |
+| B60 | 2, q8_0:q4_0 | 36.4 t/s | 1,287 t/s | 4.6 GiB |
+| B60 | 2, f16 | 37.9 t/s | 1,592 t/s | 6.6 GiB |
+| B60 | 4, q8_0:q4_0 | 22.0 t/s | 742 t/s | 5.6 GiB |
 
 The KV cache layers counted at start are 56 (2 loops), 96 (4 loops, `per_loop`) and 36 (`last_loop`), as the formula says. The answers are right in every cell (a capital, a sum with thinking, a tool call). KL against the CPU reference on the A770: 2 loops 0.0091 (ubatch 1 0.0091), 4 loops 0.0107, q8_0:q4_0 at 2 loops 0.016. 0 DOWNGRADE lines. The `last_loop` row saves 1.5 GiB of peak VRAM at equal speed; the equivalence across chunk sizes in that mode is judged at the answer, as the findings above say.
 
