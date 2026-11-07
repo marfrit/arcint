@@ -285,9 +285,11 @@ request; llama.cpp's issue for a line-based detector went stale.
 
 The engine admits these architectures (`qwen35`, `qwen35moe`, `qwen4exp`,
 `llama` at the Mistral Small 24B and Llama 2 7B geometries, `qwen2vl` for vision, `gemma4` at
-the E4B geometry, `granite` at the 8B geometry, and under `--tts` `qwen3tts`) and refuses others
+the E4B geometry, `granite` at the 8B geometry, `dory` at the 1.0-4B geometry, and under `--tts`
+`qwen3tts`) and refuses others
 at load, an untested size of an admitted architecture included. Gemma 4 E4B and Granite 4.2 8B
-were admitted 2026-11-06 from their files' metadata and templates (`code`); neither has been
+were admitted 2026-11-06 from their files' metadata and templates (`code`); Dory1.0-4B (a looped
+nGPT, with `--llama-dory-loops` and `--llama-dory-kv`) on 2026-11-07; none has been
 loaded or served here yet (DESIGN §2).
 Flash-Next's other files are on-demand options on the same endpoint: IQ2_XS,
 faster and less exact, and UD-Q3_K_XL, inside the KL bar once the host has

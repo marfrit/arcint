@@ -14,7 +14,7 @@
 # (docs/history.md), and older tags are built with the recipe at their tag.
 set -euo pipefail
 
-PKGVER=1.6.0
+PKGVER=1.6.1
 UPSTREAM_TAG=v${PKGVER}
 PKGREL=1
 # The public repository, not the fleet one. The fleet repo (still named

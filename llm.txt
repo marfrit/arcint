@@ -28,6 +28,10 @@
 - Flash-Next's production quant is ISTA-DASLab's GSQ-RCO IQ3_S since
   2026-10-20 (operator): 33.3 t/s decode on six answers, KL 0.127 against
   Q8_0 (IQ3_XXS 38.0 t/s, 0.217, the rollback).
+- Version 1.6.1 (2026-11-07): Gemma 4 E4B on the fast path at both KV types: flash attention at head size 512 on
+  Intel (0106), upstream's f16 one-column matvec fixed for sub-groups narrower than 64 (0107: the f16-KV decode was
+  wrong, KL 3.37 -> 0.0044), F32 weights multiplied through an f16 copy in prompts (0110, +3.7-3.9 % prefill);
+  Dory1.0-4B admitted (0108 the looped nGPT, 0109 OpenCL BF16 CPY; --llama-dory-loops, --llama-dory-kv).
 - Version 1.6.0 (2026-11-07): the coder's prompt expert products on int8 DPAS on Alchemist, no local memory, prefill at 41k +13.8 % (0102-0104); an MTP head file may carry no output.weight (0105); Gemma 4 E4B and Granite 4.2 8B admitted, not yet served; sampling defaults from the model card in the GGUF; `--llama-checkpoints` refused on a model with no recurrent memory; docs/concepts.md, and the branch `flattened`, the pin with the released series applied.
 - Version 1.5.4 (2026-11-06): a path other than the one a weight's type promises is logged once as `DOWNGRADE <key>` and
   counted on /props `downgrades` (0100); the release gate fails on a key not accepted for the unit.
@@ -216,9 +220,10 @@
 - A GGUF as published (--gguf FILE; the first shard of a split file). The
   engine admits general.architecture qwen35, qwen35moe, qwen4exp, qwen2vl, llama
   at the Mistral Small 24B and Llama 2 7B geometries, gemma4 at the E4B geometry
-  and granite at the 8B geometry (code: src/core/admission.cpp); anything else,
-  an untested size included, is refused at load. Gemma 4 E4B and Granite 4.2 8B
-  are admitted but not yet served on a card. No
+  granite at the 8B geometry and dory at the 1.0-4B geometry (72 physical
+  blocks; --llama-dory-loops, --llama-dory-kv) (code: src/core/admission.cpp);
+  anything else, an untested size included, is refused at load. Gemma 4 E4B,
+  Granite 4.2 8B and Dory1.0-4B are admitted but not yet served on a card. No
   allowlist (retired with the OpenVINO engine, operator 2026-10-15).
 - Flash-Next's MTP layer: an MTP-only GGUF built from the checkpoint's 31
   mtp.* tensors by tools/flash_next_mtp_gguf.sh (--llama-mtp-gguf); its

@@ -1,0 +1,624 @@
+MTP and speculation
+
+Folded from the old patches: 0010, 0067, 0080, 0083, 0084, 0094.
+
+Multi-token prediction in llama.cpp: masked nextn rows, the nextn embeddings skip, KV-only drafting, round-trip trim, the fast top-k sampler, and the kv-only/sync-trim defaults.
+
+The old patch files (named in FOLDED.md) are history; the section for each old number
+in contrib/llama.cpp/README.md still describes its measurements. This file is the
+diff between the tree after the previous folded patch and the tree after this one;
+the sum of all folded patches is byte-identical to the old series applied in order.
+
+diff --git a/include/llama.h b/include/llama.h
+index 324aaf9..0f40aed 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1571,6 +1571,12 @@ extern "C" {
+     /// Setting k <= 0 makes this a noop
+     LLAMA_API struct llama_sampler * llama_sampler_init_top_k      (int32_t k);
+ 
++    /// ARC-LAB: the k largest logits in descending order, without building the full
++    /// candidate array. Entries and the order of equal logits are identical to what
++    /// llama_sampler_init_top_k does on the full array (it repeats the heap steps of
++    /// libstdc++ std::partial_sort). out must hold k entries; n_vocab > k.
++    LLAMA_API void llama_top_k_from_logits(const float * logits, int32_t n_vocab, int32_t k, struct llama_token_data * out);
++
+     /// @details Nucleus sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
+     LLAMA_API struct llama_sampler * llama_sampler_init_top_p      (float   p, size_t min_keep);
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 3b540d7..e342424 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1745,11 +1745,32 @@ const char * llama_context_slot_loan_state(llama_context * ctx) {
+     return ctx->slot_loan_state();
+ }
+ 
++// ARC-LAB: LLAMA_SYNC_TRIM bit mask (default 2 since patch 0094; 0 = upstream behaviour): 1 = skip a
++// context synchronize when the context queued nothing since its last one,
++// 2 = KV-cache rotation matrices kept on the device (llama-kv-cache.cpp),
++// 4 = the backend-sampled ids of a batch read with one copy instead of one per row
++int llama_sync_trim() {
++    static const int v = [] {
++        const char * e = getenv("LLAMA_SYNC_TRIM");
++        return e ? atoi(e) : 2;   // 0094: bit 2 on by default (measured gain, exact)
++    }();
++    return v;
++}
++
+ void llama_context::synchronize() {
+     if (!sched) {
+         return;
+     }
+ 
++    // ARC-LAB: LLAMA_SYNC_TRIM bit 1: every getter (logits, sampled tokens,
++    // nextn rows, ...) synchronizes, and the device's one in-order queue is
++    // shared by all contexts. With nothing queued by this context since its
++    // last synchronize, its results are already complete: skip the device wait.
++    if ((llama_sync_trim() & 1) && !sync_pending && !cparams.pipeline_parallel) {
++        return;
++    }
++    sync_pending = false;
++
+     ggml_backend_sched_synchronize(sched.get());
+ 
+     // FIXME: if multiple single tokens are evaluated without a synchronization,
+@@ -2534,6 +2555,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
+     sched_reserve();
+ 
+     n_queued_tokens += n_tokens;
++    sync_pending = true;
+ 
+     // reserve output buffer
+     if (output_reserve(n_tokens) < n_tokens) {
+@@ -2826,6 +2848,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         t_compute_start_us = ggml_time_us();
+     }
+     n_queued_tokens += n_tokens_all;
++    sync_pending = true;
+ 
+     output_swaps.clear();
+     embd_batch_idxs.clear();
+@@ -3095,7 +3118,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
+             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
+ 
+-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
++            if (!embd_nextn_skip && embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+                 GGML_ASSERT(backend_h != nullptr);
+ 
+@@ -3119,7 +3142,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+             const auto stride = n_vocab;
+ 
+             // async copy the sampling data from the backend to the host
+-            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
++            if (res->t_sampled_ids != nullptr && sampling.sampled.has_data()) {
++                ggml_tensor *  t = res->t_sampled_ids;
++                ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), t);
++                GGML_ASSERT(b != nullptr && t->ne[0] == (int64_t) n_outputs);
++                GGML_ASSERT((size_t) n_outputs_prev + n_outputs <= sampling.sampled.size);
++                ggml_backend_tensor_get_async(b, t, sampling.sampled.data + n_outputs_prev, 0,
++                        n_outputs * sizeof(llama_token));
++            } else {
++                copy_tensor_async_rows(res->t_sampled,    sampling.sampled,    1,      n_outputs_prev, sched.get());
++            }
+             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
+             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
+             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+@@ -3714,6 +3746,7 @@ ggml_status llama_context::graph_compute(
+ 
+     copy_experts.reset();
+ 
++    sync_pending = true;
+     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+@@ -4810,6 +4843,7 @@ void llama_context::opt_epoch_iter(
+         const uint32_t n_tokens_all = balloc->get_n_tokens();
+ 
+         n_queued_tokens += n_tokens_all;
++        sync_pending = true;
+ 
+         embd_seq.clear();
+ 
+@@ -5224,6 +5258,10 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
+     ctx->set_embeddings_nextn(value, masked);
+ }
+ 
++void llama_set_embeddings_nextn_skip(llama_context * ctx, bool skip) {
++    ctx->set_embeddings_nextn_skip(skip);
++}
++
+ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
+     ctx->set_embeddings_layer_inp(lid, value);
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 89a09d4..72dd4e3 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -144,6 +144,7 @@ struct llama_context {
+ 
+     void set_embeddings (bool value);
+     void set_embeddings_nextn(bool value, bool masked);
++    void set_embeddings_nextn_skip(bool skip) { embd_nextn_skip = skip; }
+     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+     void set_nextn_layer_offset(int32_t offset);
+     void set_causal_attn(bool value);
+@@ -350,6 +351,7 @@ private:
+     // populated when cparams.output_layer_inp[il] is true
+     std::vector<buffer_view<float>> embd_layer_inp;
+     std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
++    bool embd_nextn_skip = false;         // llama_set_embeddings_nextn_skip
+ 
+     struct sampling_info {
+         // !samplers.empty() to check if any samplers are active
+@@ -481,6 +483,7 @@ private:
+     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+ 
+     bool has_evaluated_once = false;
++    bool sync_pending       = true;  // ARC-LAB: work queued since the last synchronize (LLAMA_SYNC_TRIM)
+ 
+     // env: LLAMA_GRAPH_REUSE_DISABLE
+     bool graph_reuse_disable = false;
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index b8c5e80..94a36ba 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -102,6 +102,9 @@ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
+ // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
+ // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
+ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
++// skip copying the unmasked nextn rows to the host for the next decodes (the graph is unchanged): a
++// caller that knows it will not read them (a draft context's prompt catch-up) saves the transfer
++LLAMA_API void llama_set_embeddings_nextn_skip(struct llama_context * ctx, bool skip);
+ 
+ // Select which appended NextN block the DECODER_MTP graph runs (offset past
+ // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index b9ab061..c46092c 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1457,6 +1457,7 @@ void llm_graph_result::reset() {
+     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
+ 
+     t_sampled.clear();
++    t_sampled_ids = nullptr;
+     t_sampled_probs.clear();
+     t_sampled_logits.clear();
+     t_candidates.clear();
+@@ -4423,6 +4424,28 @@ void llm_graph_context::build_sampling() const {
+         }
+     }
+ 
++    // ARC-LAB: LLAMA_SYNC_TRIM bit 4: one I32 tensor with every sampled id of the batch (n_rows-1 tiny CONCAT
++    // kernels), so the host reads them with one copy instead of one small async copy per row.
++    if ((llama_sync_trim() & 4) && n_rows > 1) {
++        bool all = true;
++        for (auto * t : res->t_sampled) {
++            if (t == nullptr || t->type != GGML_TYPE_I32) {
++                all = false;
++                break;
++            }
++        }
++        if (all) {
++            ggml_tensor * ids = res->t_sampled[0];
++            for (uint32_t i = 1; i < n_rows; ++i) {
++                ids = ggml_concat(ctx0, ids, res->t_sampled[i], 0);
++            }
++            ggml_set_name(ids, "sampled_ids");
++            ggml_set_output(ids);
++            ggml_build_forward_expand(gf, ids);
++            res->t_sampled_ids = ids;
++        }
++    }
++
+     // TODO: Call backend_accept after all samplers have been applied.
+     /*
+     for (const auto & [seq_id, sampler] : samplers) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index f02f509..6e89a39 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -990,6 +990,7 @@ public:
+     std::vector<ggml_tensor *> t_layer_inp;
+ 
+     std::vector<ggml_tensor *> t_sampled;
++    ggml_tensor *              t_sampled_ids = nullptr; // I32 [n_rows]: the same sampled ids in one tensor (one read-back), or null
+     std::vector<ggml_tensor *> t_sampled_probs;
+     std::vector<ggml_tensor *> t_sampled_logits;
+     std::vector<ggml_tensor *> t_candidates;
+diff --git a/src/llama-impl.h b/src/llama-impl.h
+index 7ccd23c..31ffd2d 100644
+--- a/src/llama-impl.h
++++ b/src/llama-impl.h
+@@ -77,6 +77,9 @@ static inline ggml_tensor * llama_mul_mat_hadamard(
+ // Prefetch the host pages needed to gather these rows.
+ void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows);
+ 
++// ARC-LAB: LLAMA_SYNC_TRIM bit mask, see llama-context.cpp
++int llama_sync_trim();
++
+ struct time_meas {
+     time_meas(int64_t & t_acc, bool disable = false);
+     ~time_meas();
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 491f0c8..a43fb7d 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -382,6 +382,33 @@ llama_kv_cache::llama_kv_cache(
+ 
+             ggml_gen_hadamard(tmp);
+         }
++
++        // ARC-LAB: keep them on the cache's device too (one buffer type only, and not host memory)
++        if ((llama_sync_trim() & 2) && ctxs_bufs.size() == 1 && !hparams.no_alloc) {
++            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(ctxs_bufs[0].second.get());
++            if (!ggml_backend_buft_is_host(buft)) {
++                ggml_init_params params = {
++                    /* .mem_size   = */ attn_rot_hadamard.size()*ggml_tensor_overhead(),
++                    /* .mem_buffer = */ nullptr,
++                    /* .no_alloc   = */ true,
++                };
++                attn_rot_dev_ctx.reset(ggml_init(params));
++                for (const auto & [n, m] : attn_rot_hadamard) {
++                    ggml_tensor * t = ggml_new_tensor_2d(attn_rot_dev_ctx.get(), GGML_TYPE_F32, n, n);
++                    ggml_format_name(t, "attn_rot_dev_%d", (int) n);
++                    attn_rot_dev[n] = t;
++                }
++                attn_rot_dev_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(attn_rot_dev_ctx.get(), buft));
++                if (attn_rot_dev_buf) {
++                    ggml_backend_buffer_set_usage(attn_rot_dev_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++                    for (const auto & [n, t] : attn_rot_dev) {
++                        ggml_backend_tensor_set(t, attn_rot_hadamard.at(n).data(), 0, ggml_nbytes(t));
++                    }
++                } else {
++                    attn_rot_dev.clear();
++                }
++            }
++        }
+     }
+ 
+     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
+@@ -1666,6 +1693,10 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
+     ggml_tensor * res = nullptr;
+ 
+     if (n_rot_k) {
++        if (const auto it = attn_rot_dev.find(n_rot_k); it != attn_rot_dev.end()) {
++            return it->second;
++        }
++
+         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rot_k, n_rot_k);
+         ggml_set_input(res);
+         ggml_set_name(res, "attn_inp_k_rot");
+@@ -1678,6 +1709,10 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
+     ggml_tensor * res = nullptr;
+ 
+     if (n_rot_v) {
++        if (const auto it = attn_rot_dev.find(n_rot_v); it != attn_rot_dev.end()) {
++            return it->second;
++        }
++
+         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rot_v, n_rot_v);
+         ggml_set_input(res);
+         ggml_set_name(res, "attn_inp_v_rot");
+@@ -2029,6 +2064,9 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch
+ }
+ 
+ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
++    if (!(dst->flags & GGML_TENSOR_FLAG_INPUT)) {
++        return;  // the device copy (attn_rot_dev), already filled
++    }
+     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+ 
+     const auto n_rot = dst->ne[0];
+@@ -2038,6 +2076,9 @@ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
+ }
+ 
+ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
++    if (!(dst->flags & GGML_TENSOR_FLAG_INPUT)) {
++        return;  // the device copy (attn_rot_dev), already filled
++    }
+     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+ 
+     const auto n_rot = dst->ne[0];
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index a4a118c..d5c3ce7 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -307,6 +307,12 @@ private:
+     // pre-computed hadamard martrices
+     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
+ 
++    // ARC-LAB: device copies of attn_rot_hadamard (LLAMA_SYNC_TRIM bit 2): graphs read these instead of an input that
++    // is uploaded (one sync + one blocking copy each) on every decode
++    ggml_context_ptr                          attn_rot_dev_ctx;
++    ggml_backend_buffer_ptr                   attn_rot_dev_buf;
++    std::unordered_map<int64_t, ggml_tensor *> attn_rot_dev;
++
+     // env: LLAMA_KV_CACHE_DEBUG
+     int debug = 0;
+ 
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index 521c571..e8b7e50 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -1522,6 +1522,72 @@ static struct llama_sampler_i llama_sampler_top_k_i = {
+     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_top_k>,
+ };
+ 
++void llama_top_k_from_logits(const float * logits, int32_t n_vocab, int32_t k, llama_token_data * out) {
++    const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
++        return a.logit > b.logit;
++    };
++
++    for (int32_t i = 0; i < k; i++) {
++        out[i] = llama_token_data{ i, logits[i], 0.0f };
++    }
++    std::make_heap(out, out + k, comp);
++
++    llama_token_data * heap = out;
++
++    // std::__pop_heap(first, middle, result) with value = the new token: sift down to a leaf, then sift up
++    const auto replace_top = [&](const llama_token_data & value) {
++        ptrdiff_t hole = 0;
++        ptrdiff_t child = 0;
++        const ptrdiff_t len = k;
++        while (child < (len - 1) / 2) {
++            child = 2 * (child + 1);
++            if (comp(heap[child], heap[child - 1])) {
++                child--;
++            }
++            heap[hole] = heap[child];
++            hole = child;
++        }
++        if ((len & 1) == 0 && child == (len - 2) / 2) {
++            child = 2 * (child + 1);
++            heap[hole] = heap[child - 1];
++            hole = child - 1;
++        }
++        ptrdiff_t parent = (hole - 1) / 2;
++        while (hole > 0 && comp(heap[parent], value)) {
++            heap[hole] = heap[parent];
++            hole = parent;
++            parent = (hole - 1) / 2;
++        }
++        heap[hole] = value;
++    };
++
++    constexpr int32_t BLOCK = 16;
++    float thr = heap[0].logit;
++    int32_t i = k;
++    for (; i + BLOCK <= n_vocab; i += BLOCK) {
++        bool any = false;
++        for (int32_t j = 0; j < BLOCK; j++) {
++            any |= logits[i + j] > thr;
++        }
++        if (!any) {
++            continue;
++        }
++        for (int32_t j = 0; j < BLOCK; j++) {
++            if (logits[i + j] > heap[0].logit) {
++                replace_top(llama_token_data{ i + j, logits[i + j], 0.0f });
++            }
++        }
++        thr = heap[0].logit;
++    }
++    for (; i < n_vocab; i++) {
++        if (logits[i] > heap[0].logit) {
++            replace_top(llama_token_data{ i, logits[i], 0.0f });
++        }
++    }
++
++    std::sort_heap(out, out + k, comp);
++}
++
+ struct llama_sampler * llama_sampler_init_top_k(int32_t k) {
+     const bool is_empty = (k <= 0);
+ 
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 4c2278d..fb83c42 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -1,5 +1,6 @@
+ #include "models.h"
+ #include "llama-memory-recurrent.h"
++#include "llama-kv-cache.h"   // get_k_idxs/cpy_k for the KV-only MTP store
+ 
+ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
+@@ -592,8 +593,21 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+ 
+     res->add_input(std::move(inp));
+ 
++    // a draft decode with no output rows (the head's prompt catch-up) is there to fill
++    // this layer's K/V only: build up to the cache store and stop. LLAMA_MTP_KV_ONLY=0
++    // turns it off (on by default since patch 0094); the K/V ops are the full graph's, in the same order, so the cache
++    // rows are bit-identical (cards: test-backend-ops and the served A/B in the patch
++    // record). Unmasked nextn readers copy h for every token, so they keep the full graph.
++    static const bool kv_only_on = [] {
++        const char * e = getenv("LLAMA_MTP_KV_ONLY");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    const bool kv_only = kv_only_on && n_outputs == 0 && cparams.embeddings_nextn_masked &&
++            layer.wqkv == nullptr && layer.wk_b == nullptr && layer.wv_b == nullptr;
++
+     ggml_tensor * inp_pos     = build_inp_pos();
+-    ggml_tensor * inp_out_ids = build_inp_out_ids();
++    // an unread input would have no buffer
++    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
+ 
+     auto * inp_attn = build_attn_inp_kv();
+ 
+@@ -614,6 +628,49 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+     cb(cur, "mtp_attn_norm", il);
+ 
++    if (kv_only) {
++        static bool logged = false;
++        if (!logged) {
++            logged = true;
++            LLAMA_LOG_INFO("%s: MTP KV-only pass for decodes without outputs (LLAMA_MTP_KV_ONLY=1 enables the patch; 0 is the full graph)\n", __func__);
++        }
++        // <= 8 rows: keep the unused Q projection so a same-input mat-mul run groups as in
++        // the full graph (the fork's same-input tile depends on the largest member; this
++        // OpenCL backend has no such run today, kept for parity with the fork's rule)
++        if (n_tokens <= 8) {
++            ggml_build_forward_expand(gf, build_lora_mm(layer.wq, cur, layer.wq_s));
++        }
++
++        // K/V exactly as build_qkv's separate path with reshape=false would build them
++        ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
++        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
++        Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
++        cb(Kcur, "mtp_Kcur_normed", il);
++
++        ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
++        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
++        cb(Vcur, "mtp_Vcur", il);
++
++        Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
++                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
++                ext_factor, attn_factor, beta_fast, beta_slow);
++
++        // the store half of build_attn(): same optional cache rotations, same expand
++        // order (v, k, then the copies)
++        if (inp_attn->self_k_rot) {
++            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot);
++        }
++        if (inp_attn->self_v_rot) {
++            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
++        }
++        ggml_build_forward_expand(gf, Vcur);
++        ggml_build_forward_expand(gf, Kcur);
++        cb(Kcur, "k_cache_in", il);
++        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
++        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
++        return;
++    }
++
+     auto [Qcur_full, Kcur, Vcur] = build_qkv(layer, cur,
+             n_embd_head * 2, n_head,
+             n_embd_head,     n_head_kv,
+@@ -688,9 +745,16 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+     cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+ 
+     cb(cur, "h_nextn", -1);
+-    res->t_h_nextn = cur;
+-
+-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++    // a masked context keeps the output tokens' rows (llama_context copies
++    // the first n_outputs rows): select them before the capture, as the trunk
++    // does, or a batch of several tokens with one output hands back token 0's
++    if (cparams.embeddings_nextn_masked) {
++        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++        res->t_h_nextn = cur;
++    } else {
++        res->t_h_nextn = cur;
++        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++    }
+     cb(cur, "mtp_shared_head_norm", -1);
+ 
+     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 831f274..69315e5 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -1,5 +1,6 @@
+ #include "models.h"
+ #include "llama-memory-recurrent.h"
++#include "llama-kv-cache.h"   // get_k_idxs/cpy_k for the KV-only MTP store
+ 
+ void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
+@@ -622,8 +623,21 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
+ 
+     res->add_input(std::move(inp));
+ 
++    // a draft decode with no output rows (the head's prompt catch-up) is there to fill
++    // this layer's K/V only: build up to the cache store and stop. LLAMA_MTP_KV_ONLY=0
++    // turns it off (on by default since patch 0094); the K/V ops are the full graph's, in the same order, so the cache
++    // rows are bit-identical (see the patch record). Unmasked nextn readers keep the
++    // full graph.
++    static const bool kv_only_on = [] {
++        const char * e = getenv("LLAMA_MTP_KV_ONLY");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    const bool kv_only = kv_only_on && n_outputs == 0 && cparams.embeddings_nextn_masked &&
++            layer.wqkv == nullptr && layer.wk_b == nullptr && layer.wv_b == nullptr;
++
+     ggml_tensor * inp_pos     = build_inp_pos();
+-    ggml_tensor * inp_out_ids = build_inp_out_ids();
++    // an unread input would have no buffer
++    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
+ 
+     auto * inp_attn = build_attn_inp_kv();
+ 
+@@ -644,6 +658,47 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
+     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+     cb(cur, "mtp_attn_norm", il);
+ 
++    if (kv_only) {
++        static bool logged = false;
++        if (!logged) {
++            logged = true;
++            LLAMA_LOG_INFO("%s: MTP KV-only pass for decodes without outputs (LLAMA_MTP_KV_ONLY=1 enables the patch; 0 is the full graph)\n", __func__);
++        }
++        // <= 8 rows: keep the unused Q projection, see qwen35.cpp's note
++        if (n_tokens <= 8) {
++            ggml_build_forward_expand(gf, build_lora_mm(layer.wq, cur, layer.wq_s));
++        }
++
++        // K/V exactly as build_qkv's separate path with reshape=false builds them
++        ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
++        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
++        Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
++        cb(Kcur, "mtp_Kcur_normed", il);
++
++        ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
++        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
++        cb(Vcur, "mtp_Vcur", il);
++
++        Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
++                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
++                ext_factor, attn_factor, beta_fast, beta_slow);
++
++        // the store half of build_attn(): same optional cache rotations, same expand
++        // order (v, k, then the copies)
++        if (inp_attn->self_k_rot) {
++            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot);
++        }
++        if (inp_attn->self_v_rot) {
++            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
++        }
++        ggml_build_forward_expand(gf, Vcur);
++        ggml_build_forward_expand(gf, Kcur);
++        cb(Kcur, "k_cache_in", il);
++        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
++        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
++        return;
++    }
++
+     auto [Qcur_full, Kcur, Vcur] = build_qkv(layer, cur,
+             n_embd_head * 2, n_head,
+             n_embd_head,     n_head_kv,
+@@ -751,9 +806,16 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
+     cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+ 
+     cb(cur, "h_nextn", -1);
+-    res->t_h_nextn= cur;
+-
+-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++    // a masked context keeps the output tokens' rows (llama_context copies
++    // the first n_outputs rows): select them before the capture, as the trunk
++    // does, or a batch of several tokens with one output hands back token 0's
++    if (cparams.embeddings_nextn_masked) {
++        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++        res->t_h_nextn = cur;
++    } else {
++        res->t_h_nextn = cur;
++        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++    }
+     cb(cur, "mtp_shared_head_norm", -1);
+ 
+     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;

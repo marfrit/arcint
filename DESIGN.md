@@ -1,6 +1,6 @@
 # arcint — Design
 
-State as of 2026-11-06: arcint **1.5.4** on llama.cpp **`3e4dfa8`** with the
+State as of 2026-11-07: arcint **1.6.1** on llama.cpp **`3e4dfa8`** with the
 patch series `contrib/llama.cpp/patches` 0001-0100 (93 patches; 0031, 0055,
 0061, 0076 and 0078 retired, 0073 on its own prefill-gather branch, 0085 never assigned). One engine: libllama with
 ggml's OpenCL backend and arcint's Intel kernels. Three language services run
@@ -108,15 +108,16 @@ minority are attention layers with a KV cache. The engine admits a GGUF by
 its own `general.architecture`: `qwen35`, `qwen35moe`, `qwen4exp`, and
 `llama` at two geometries only, Mistral Small 24B and Llama 2 7B (the model of
 the community llama-bench GPU tables, `tools/llama_scoreboard.py`), `gemma4` at
-the E4B geometry and `granite` at the 8B geometry only (`code`: the decision is
+the E4B geometry, `granite` at the 8B geometry and `dory` at the 1.0-4B geometry only (`code`: the decision is
 the pure function in `src/core/admission.cpp`, unit-tested with no model in
 `tests/test_admission.cpp`; the backend reads the numbers from the loaded
 model); anything else is refused at load, and an untested size of an admitted
 architecture is refused the same way, the message naming the admitted sizes.
 
 Two models admitted 2026-11-06 (operator's order: admit now, optimise later;
-card-free work only). Neither has been loaded or served by arcint: what is
-claimed below is what the files and the code say.
+card-free work only). The geometry and dialect claims below are what the files
+and the code say (`code`); the card results at the end of the Gemma row were
+measured on 2026-11-07.
 
 - **Gemma 4 E4B** (`gemma4`; `code`, read from the GGUF's metadata): 42 layers,
   `n_embd` 2560, 8 query heads over 2 KV heads, key length 512 (256 on the
@@ -145,6 +146,17 @@ claimed below is what the files and the code say.
   the Qwen dialects, Granite's included, keep thinking as the unset default).
   And the gateway's renderer material, which carries Qwen parser
   rows only, is not built (token mode off on that unit, said in the load log).
+  On the cards (`measured-here`, 2026-11-07, contrib/llama.cpp patches 0106,
+  0107, 0110): Gemma 4 E4B is on the fast path at both KV types, and the
+  f16-KV decode defect is fixed. B60, ctx 16,384, a 6.5k-token prompt, against
+  1.6.0: q8_0:q4_0 prefill 176-246 -> 1,905-2,053 t/s, decode about 65 -> 75.5
+  t/s; f16 prefill 1,276-1,294 -> 2,113-2,381 t/s, decode 79 -> 81 t/s, thinking
+  answers right 3 of 3 (2 of 3 broken before). KL against the CPU reference:
+  f16 ubatch 512 0.0079 (B60) and 0.0095 (A770), ubatch 1 0.0044 (both cards,
+  was 3.37 without 0107), q8_0:q4_0 0.019. The one downgrade key left is
+  `type=f32 k=512`, the K Hadamard rotation at 512 (q8_0:q4_0 only). The
+  F32-weights copy (0110) is gated on ops and KL; its served prefill gain is
+  inside the run-to-run spread and a repeated benchmark is pending.
 - **Granite 4.2 8B** (`granite`; `code`, from the GGUF's metadata): 40 layers,
   `n_embd` 4096, 32 query heads over 8 KV heads (head size 128, derived: the
   file carries no key length), context trained 131,072, vocabulary 100,352,
@@ -156,6 +168,67 @@ claimed below is what the files and the code say.
   So it takes the Qwen dialect and needs no parser change; the think pair and
   the call pair are single special tokens in its vocabulary (`code`: the token
   table).
+- **Dory1.0-4B** (`dory`, NVIDIA's looped nGPT; admitted 2026-11-07 for the card
+  arm to measure, loaded and served on both cards since 2026-11-07;
+  contrib/llama.cpp patches 0108 and 0109). `code`, read from the GGUF's metadata: 72 physical blocks (16
+  input, 40 recurrent, 16 output) of 2560 width, 16 query heads over 4 KV heads,
+  key length 256, a sliding window of 1,024 on three of every four attention
+  blocks, context trained 262,144, vocabulary 131,072, and the recurrent blocks
+  run `dory.num_loops` times (4 in the file) over the same weights. libllama's
+  `llama_model_n_layer` reports the executed count (112 at 2 loops, 192 at 4),
+  so admission matches the physical blocks (`llama_model_n_layer_physical`, patch
+  0108) and a geometry carrying the executed count is refused; the loop count is
+  not part of the identity. Two knobs change the computation, and both are the
+  operator's: `--llama-dory-loops N` (1 to 4) and `--llama-dory-kv per_loop|last_loop`
+  reach libllama as the metadata overrides `dory.num_loops` and
+  `dory.recurrent_kv_cache_mode`. With neither flag the file's own value serves;
+  the load log line and `/props` `dory` name the value that serves and where it
+  came from (`flag`, `gguf`, or `default` for an absent KV-mode key). After the load
+  the layer count libllama reports must equal 16 + 40 x loops + 16, or the start
+  fails (an override that did not take effect is not a quiet fallback). Refused at
+  start, from the GGUF's architecture and before the load: `--llama-mtp` (no head),
+  `--llama-dflash-gguf` (no drafter) and `--llama-layer-split` (the placement counts
+  the physical and the executed layers apart, a split of that is untested), and
+  the two dory flags on any other architecture. `last_loop` makes a token's hidden
+  state depend on where the chunk boundaries of its prefill fall (loop i attends to
+  loop i's KV inside the chunk and to the last loop's KV before it; upstream's own
+  test compares such a model only against the same batch), so equivalence across
+  chunk sizes is judged at the answer; `per_loop` has no such dependence. Prefix
+  reuse is exact as `swa_full` stays at the library default (the sliding-window
+  layers keep a full-length cache); context shift is off for this architecture
+  (`code`, patch 0108). The template is ChatML framing, the plain think pair (the
+  generation prompt ends inside the open block when thinking is on, which the
+  template defaults to) and the Qwen coder's function/parameter call form with the
+  arguments rendered from an object (`code`: the template text), so it takes the
+  Qwen dialect and the capability probe replays the arguments as an object;
+  `tests/test_chat_render.cpp` and `tests/test_toolcall.cpp` run that shape and
+  `tests/test_admission.cpp` pins the dialect.
+  The KV mode is confirmed the same way the loop count is: after the context, a
+  throwaway 256-cell context reserves a graph and the start counts its cache
+  tensors, which must be 96 at 4 loops under `per_loop` (8 + 20 x 4 + 8 attention
+  blocks) and 36 under `last_loop`, or the start fails (`dory_check_kv`). A file that
+  carries per-tensor `.scale` tensors is refused by the patch (the generic scale pass
+  would read them by executed layer). Sizing (`code`, arithmetic on the GGUF's
+  numbers; 4 KV heads of 256, the sliding layers kept at full length by `swa_full`):
+  the default context of 32,768 cells costs 12.0 GiB at f16 over 96 layers, 4.9 GiB at
+  `q8_0:q4_0`, and 4.5 GiB at f16 under `last_loop` (36 layers); the Q5_K_M file is
+  3.4 GiB. On the A770 (16 GiB) f16 at 4 loops per_loop is 15.4 GiB with the weights and
+  does not fit with the compute buffers; `q8_0:q4_0` (8.3 GiB) does. The B60 (24 GiB)
+  holds the f16 default. The start logs a warning when weights plus cache exceed 92 % of
+  the card's OpenCL global memory (`dory_fit_warning`): a forecast against the total,
+  because arcint cannot read an OpenCL card's free memory; it is not a refusal.
+  Card results (`measured-here`, 2026-11-07, build 6fa32c1e, Q5_K_M; decode over
+  400 tokens including the prefill, prefill over 5.9k tokens): A770 2 loops
+  q8_0:q4_0 23.7 t/s, 512-665 t/s, peak 5.2 GiB; 2 loops f16 24.9 t/s, 727 t/s,
+  7.1 GiB; 4 loops q8_0:q4_0 14.3 t/s, 396 t/s, 6.2 GiB; 4 loops `last_loop`
+  14.3 t/s, 392 t/s, 4.7 GiB. B60 2 loops q8_0:q4_0 36.4 t/s / 1,287 t/s, 2
+  loops f16 37.9 / 1,592, 4 loops q8_0:q4_0 22.0 / 742. The cache layers counted
+  at start were 56, 96 and 36; the answers are right in every cell; KL against
+  the CPU reference on the A770 is 0.0091 at 2 loops, 0.0107 at 4 and 0.016 with
+  q8_0:q4_0; 0 DOWNGRADE lines. Patch 0109 red/green (A770, 2 loops, q8_0:q4_0):
+  decode 14.7 -> 23.7 t/s, prefill 540 -> 665 t/s; the red arm printed no
+  DOWNGRADE line, because a weight-fed op declined by `supports_op` goes to the
+  CPU without a key. That is an open gap in the downgrade accounting.
 
 | service | model | architecture | served file | card |
 |---|---|---|---|---|
@@ -950,8 +1023,10 @@ said), and the 503 bodies lost `reservation` and `kv_blocks_free`.
   asks for none; a GGUF with no such key keeps the provisional row (Llama 2 7B).
   A unit that passes no flags moves to its card. The Flash-Next and TTS units stay
   on the row they have served at, 0.7 / 0.8 / 20 with a repetition penalty of 1.05,
-  by their own flags (operator, 2026-11-07), until their cards' rows have been
-  measured: 1.0 / 0.95 / 20 and 0.9 / 1.0 / 50, both with no penalty. The agent, the
+  by their own flags (operator, 2026-11-07). Their cards' rows are 1.0 / 0.95 / 20
+  and 0.9 / 1.0 / 50, both with no penalty. Flash-Next's costs drafts (`measured-here`,
+  the B60, 24 prompts, A-B-B-A): 0.0332, 0.0339 tokens a ms on the served row,
+  0.0330, 0.0323 on the card's, -2.7 %. The TTS card's row is not measured. The agent, the
   coder and the writer pass their own flags and did not move, nor do their samples. (b)
   `--llama-checkpoints N` above 0 on a model that is neither hybrid nor recurrent
   is refused at start, because it could not do what it says; the default of 32

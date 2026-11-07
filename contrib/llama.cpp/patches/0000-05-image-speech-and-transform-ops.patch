@@ -1,0 +1,1278 @@
+Image, speech and transform ops
+
+Folded from the old patches: 0059, 0060, 0062, 0095.
+
+Ops the image and speech engines need on the OpenCL backend: 3D convolution, LEAKY_RELU, the qwen3-tts generation valid-frames fix, and the FWHT (Hadamard) transform.
+
+The old patch files (named in FOLDED.md) are history; the section for each old number
+in contrib/llama.cpp/README.md still describes its measurements. This file is the
+diff between the tree after the previous folded patch and the tree after this one;
+the sum of all folded patches is byte-identical to the old series applied in order.
+
+diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
+index ee0812f..22db2d1 100644
+--- a/ggml/src/ggml-opencl/CMakeLists.txt
++++ b/ggml/src/ggml-opencl/CMakeLists.txt
+@@ -178,6 +178,7 @@ set(GGML_OPENCL_KERNELS
+     moe_combine
+     moe_sort_by_expert
+     mul_mm_f32_f32_l4_lm
++    fwht_f32
+     mul_mm_f16_f32_l4_lm
+     mul_mm_q1_0_f32_l4_lm
+     mul_mm_q4_0_f32_l4_lm
+@@ -223,6 +224,7 @@ set(GGML_OPENCL_KERNELS
+     neg
+     norm
+     relu
++    leaky_relu
+     l2_norm
+     rms_norm
+     rope
+@@ -261,6 +263,8 @@ set(GGML_OPENCL_KERNELS
+     mul_mm_f16_f32_kq_kqv
+     conv2d
+     conv2d_f16_f32
++    conv3d
++    conv3d_f16_f32
+     flash_attn_repack
+     flash_attn_pre_f16
+     flash_attn_f32_f16
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 25b13e6..c8d8d9e 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -710,6 +710,7 @@ struct ggml_backend_opencl_context {
+     bool has_integer_dot      = false;       // cl_khr_integer_dot_product or cl_qcom_dot_product8
+     bool has_intel_dpas       = false;       // cl_intel_subgroup_matrix_multiply_accumulate
+     bool has_intel_2d_block   = false;       // cl_intel_subgroup_2d_block_io (Xe2)
++    bool has_intel_reqd_sg    = false;       // cl_intel_required_subgroup_size (0095's FWHT needs 16)
+     bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
+     bool disable_fusion;
+     bool fuse_mm_glu = true;                     // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
+@@ -890,6 +891,8 @@ struct ggml_backend_opencl_context {
+     cl_program program_conv_2d_f16;
+     cl_program program_conv_2d_f32;
+     cl_program program_conv_2d_f16_f32;
++    cl_program program_conv_3d_f32;                        // 0059: the Wan 3D VAE conv
++    cl_program program_conv_3d_f16_f32;
+     cl_program program_tsembd;
+     cl_program program_gemv_moe_mxfp4_f32, program_gemm_moe_mxfp4_f32;
+     cl_program program_mul_mv_id_q4_0_f32_8x_flat;
+@@ -1169,6 +1172,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_ceil_f32, kernel_ceil_f32_4, kernel_ceil_f32_nc, kernel_ceil_f16, kernel_ceil_f16_4, kernel_ceil_f16_nc;
+     cl_kernel kernel_round_f32, kernel_round_f32_4, kernel_round_f32_nc, kernel_round_f16, kernel_round_f16_4, kernel_round_f16_nc;
+     cl_kernel kernel_trunc_f32, kernel_trunc_f32_4, kernel_trunc_f32_nc, kernel_trunc_f16, kernel_trunc_f16_4, kernel_trunc_f16_nc;
++    cl_kernel kernel_leaky_relu_f32, kernel_leaky_relu_f32_4, kernel_leaky_relu_f32_nc, kernel_leaky_relu_f16, kernel_leaky_relu_f16_4, kernel_leaky_relu_f16_nc;  // 0060
+     cl_kernel kernel_softplus_f32, kernel_softplus_f32_4, kernel_softplus_f32_nc;
+     cl_kernel kernel_softplus_f16, kernel_softplus_f16_4, kernel_softplus_f16_nc;
+     cl_kernel kernel_upscale;
+@@ -1177,6 +1181,8 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_conv_2d_f16;
+     cl_kernel kernel_conv_2d_f32;
+     cl_kernel kernel_conv_2d_f16_f32;
++    cl_kernel kernel_conv_3d_f32;                         // 0059: f32 weights
++    cl_kernel kernel_conv_3d_f16_f32;                     // 0059: f16 weights
+     cl_kernel kernel_ssm_conv_f32_f32, kernel_ssm_conv_f32_f32_4;
+     // [size_idx][kda][tgpp] where size_idx: 0=S_V=16, 1=32, 2=64, 3=128; kda: 0 or 1.
+     // tgpp 0 = TG variant (COLS_PER_LANE_GROUP=1), tgpp 1 = prefill variant (COLS_PER_LANE_GROUP=4).
+@@ -1248,6 +1254,9 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_mul_mm_f32_f32_l4_lm;
+     cl_kernel kernel_gemv_f32_f32_mc;  // multi-column (small-N) f32 GEMV for spec/MTP verify
+     cl_kernel kernel_sum_slices_f32 = nullptr;   // split-K slices of kernel_mul_mm_f32_f32_l4_lm summed
++    // ARC-LAB 0095: fast Walsh-Hadamard transforms for MUL_MAT with GGML_HINT_SRC0_IS_HADAMARD
++    cl_kernel kernel_fwht_f32_64 = nullptr, kernel_fwht_f32_128 = nullptr;
++    cl_kernel kernel_fwht_f32_256 = nullptr;
+     cl_kernel kernel_mul_mm_f16_f32_l4_lm;
+     cl_kernel kernel_mul_mm_q1_0_f32_l4_lm;
+     cl_kernel kernel_mul_mm_q4_0_f32_l4_lm;
+@@ -3232,6 +3241,27 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+         GGML_LOG_CONT(".");
+     }
+ 
++    // fwht_f32 (ARC-LAB 0095): Intel only, and only where the 16-wide subgroup
++    // the kernels index by can be required (cl_intel_required_subgroup_size);
++    // optional: without it every hinted product keeps the dense path
++    if (backend_ctx->gpu_family == INTEL && backend_ctx->has_intel_reqd_sg) {
++#ifdef GGML_OPENCL_EMBED_KERNELS
++        const std::string kernel_src {
++            #include "fwht_f32.cl.h"
++        };
++#else
++        const std::string kernel_src = read_file("fwht_f32.cl");
++#endif
++        cl_program prog = build_program_from_source_optional(backend_ctx, kernel_src.c_str(), compile_opts);
++        if (prog != nullptr) {
++            CL_CHECK((backend_ctx->kernel_fwht_f32_64  = clCreateKernel(prog, "kernel_fwht_f32_64",  &err), err));
++            CL_CHECK((backend_ctx->kernel_fwht_f32_128 = clCreateKernel(prog, "kernel_fwht_f32_128", &err), err));
++            CL_CHECK((backend_ctx->kernel_fwht_f32_256 = clCreateKernel(prog, "kernel_fwht_f32_256", &err), err));
++            CL_CHECK(clReleaseProgram(prog));
++        }
++        GGML_LOG_CONT(".");
++    }
++
+     // mul_mm_f16_f32_l4_lm
+     {
+ #ifdef GGML_OPENCL_EMBED_KERNELS
+@@ -3987,6 +4017,30 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+         GGML_LOG_CONT(".");
+     }
+ 
++    // leaky_relu (0060, the ESRGAN upscaler's unary)
++    {
++#ifdef GGML_OPENCL_EMBED_KERNELS
++        const std::string kernel_src {
++            #include "leaky_relu.cl.h"
++        };
++#else
++        const std::string kernel_src = read_file("leaky_relu.cl");
++#endif
++        cl_program prog =
++            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
++#define CL_LEAKY_RELU_K(op) \
++        CL_CHECK((backend_ctx->kernel_##op##_f32    = clCreateKernel(prog, "kernel_" #op "_f32",    &err), err)); \
++        CL_CHECK((backend_ctx->kernel_##op##_f32_4  = clCreateKernel(prog, "kernel_" #op "_f32_4",  &err), err)); \
++        CL_CHECK((backend_ctx->kernel_##op##_f32_nc = clCreateKernel(prog, "kernel_" #op "_f32_nc", &err), err)); \
++        CL_CHECK((backend_ctx->kernel_##op##_f16    = clCreateKernel(prog, "kernel_" #op "_f16",    &err), err)); \
++        CL_CHECK((backend_ctx->kernel_##op##_f16_4  = clCreateKernel(prog, "kernel_" #op "_f16_4",  &err), err)); \
++        CL_CHECK((backend_ctx->kernel_##op##_f16_nc = clCreateKernel(prog, "kernel_" #op "_f16_nc", &err), err));
++        CL_LEAKY_RELU_K(leaky_relu)
++#undef CL_LEAKY_RELU_K
++        CL_CHECK(clReleaseProgram(prog));
++        GGML_LOG_CONT(".");
++    }
++
+     // softplus
+     {
+ #ifdef GGML_OPENCL_EMBED_KERNELS
+@@ -4152,6 +4206,41 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                 }
+     }
+ 
++    // conv3d (0059)
++    {
++        #ifdef GGML_OPENCL_EMBED_KERNELS
++                const std::string kernel_src {
++                    #include "conv3d.cl.h"
++                };
++                const std::string kernel_src_f16_f32 {
++                    #include "conv3d_f16_f32.cl.h"
++                };
++        #else
++                const std::string kernel_src = read_file("conv3d.cl");
++                const std::string kernel_src_f16_f32 = read_file("conv3d_f16_f32.cl");
++        #endif
++                if (!kernel_src.empty()) {
++                    backend_ctx->program_conv_3d_f32 =
++                        build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
++                    CL_CHECK((backend_ctx->kernel_conv_3d_f32 = clCreateKernel(backend_ctx->program_conv_3d_f32, "kernel_conv_3d", &err), err));
++                    GGML_LOG_CONT(".");
++                } else {
++                    GGML_LOG_WARN("ggml_opencl: conv3d kernel source not found or empty. This op will not be available.\n");
++                    backend_ctx->program_conv_3d_f32 = nullptr;
++                    backend_ctx->kernel_conv_3d_f32 = nullptr;
++                }
++                if (!kernel_src_f16_f32.empty()) {
++                    backend_ctx->program_conv_3d_f16_f32 =
++                        build_program_from_source(backend_ctx, kernel_src_f16_f32.c_str(), compile_opts);
++                    CL_CHECK((backend_ctx->kernel_conv_3d_f16_f32 = clCreateKernel(backend_ctx->program_conv_3d_f16_f32, "kernel_conv_3d", &err), err));
++                    GGML_LOG_CONT(".");
++                } else {
++                    GGML_LOG_WARN("ggml_opencl: conv3d_f16_f32 kernel source not found or empty. This op will not be available.\n");
++                    backend_ctx->program_conv_3d_f16_f32 = nullptr;
++                    backend_ctx->kernel_conv_3d_f16_f32 = nullptr;
++                }
++    }
++
+     // ssm_conv
+     {
+ #ifdef GGML_OPENCL_EMBED_KERNELS
+@@ -8044,6 +8133,8 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
+         strstr(ext_buffer.data(), "cl_intel_subgroups_short") != NULL;
+     backend_ctx->has_intel_2d_block =
+         strstr(ext_buffer.data(), "cl_intel_subgroup_2d_block_io") != NULL;
++    backend_ctx->has_intel_reqd_sg =
++        strstr(ext_buffer.data(), "cl_intel_required_subgroup_size") != NULL;
+ 
+     cl_uint base_align_in_bits;
+     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MEM_BASE_ADDR_ALIGN, sizeof(cl_uint), &base_align_in_bits, NULL));
+@@ -10488,6 +10579,14 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                 default:
+                     return false;
+             }
++        case GGML_OP_LEAKY_RELU:
++            // 0060: the ESRGAN upscaler's own top-level op (ggml.c sets
++            // GGML_OP_LEAKY_RELU, not a UNARY enum). f32 or f16, contiguous
++            // only: the strided _nc kernels measured wrong on a row-padded
++            // view in the op suite (1.1.1 release review, not attributed), so
++            // a strided input stays on the CPU.
++            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
++                   ggml_is_contiguous(op->src[0]);
+         case GGML_OP_GLU:
+             switch (ggml_get_glu_op(op)) {
+                 case GGML_GLU_OP_GEGLU:
+@@ -10533,6 +10632,24 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+             return (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16) ||
+                    (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) ||
+                    (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
++        case GGML_OP_CONV_3D: {
++            // 0059: the Wan VAE's 3D convs. Input is F32, output is F32
++            // (ggml_conv_3d_direct), the weights F16 or F32. The CPU's own
++            // conv_3d reads src1 as F32 too, so no other combination exists.
++            // GGML_OPENCL_CONV_3D=0 falls back to the CPU (the baseline arm).
++            static const char * xc = getenv("GGML_OPENCL_CONV_3D");
++            static const bool   c_on = xc == nullptr || atoi(xc) != 0;
++            if (!c_on) {
++                return false;
++            }
++            // The kernel indexes elements in 32 bits.
++            if (ggml_nelements(op->src[0]) > UINT32_MAX || ggml_nelements(op->src[1]) > UINT32_MAX ||
++                ggml_nelements(op) > UINT32_MAX) {
++                return false;
++            }
++            return (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) ||
++                   (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
++        }
+         case GGML_OP_SSM_CONV:
+             return (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
+         case GGML_OP_SSM_SCAN: {
+@@ -18778,6 +18895,86 @@ GGML_CL_UNARY_EXT_WRAP(ggml_cl_trunc,       trunc)
+ 
+ #undef GGML_CL_UNARY_EXT_WRAP
+ 
++// LEAKY_RELU (0060): the ESRGAN upscaler's unary, missing at the pin, where the
++// CPU fallback of a split graph segfaulted. The negative slope is the op's own
++// parameter (dst->op_params, float). GGML_OPENCL_LEAKY_RELU_RED=1 negates it, so
++// the negative branch moves -- the red case.
++static void ggml_cl_leaky_relu(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    UNUSED(src1);
++    GGML_ASSERT(src0);
++    GGML_ASSERT(src0->extra);
++    GGML_ASSERT(dst);
++    GGML_ASSERT(dst->extra);
++
++    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
++
++    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++
++    cl_ulong offset0 = extra0->offset + src0->view_offs;
++    cl_ulong offsetd = extrad->offset + dst->view_offs;
++
++    float slope;
++    memcpy(&slope, dst->op_params, sizeof(float));
++    const char * xs = getenv("GGML_OPENCL_LEAKY_RELU_RED");
++    if (xs != nullptr && atoi(xs) != 0) {
++        slope = -slope;
++    }
++
++    const bool is_f16 = (src0->type == GGML_TYPE_F16);
++    cl_kernel kernel;
++
++    if (ggml_is_contiguous(src0)) {
++        int n = ggml_nelements(dst);
++        if (n % 4 == 0) {
++            kernel = is_f16 ? backend_ctx->kernel_leaky_relu_f16_4 : backend_ctx->kernel_leaky_relu_f32_4;
++            n /= 4;
++        } else {
++            kernel = is_f16 ? backend_ctx->kernel_leaky_relu_f16 : backend_ctx->kernel_leaky_relu_f32;
++        }
++
++        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
++        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
++        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
++        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
++        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(float),    &slope));
++
++        size_t global_work_size[] = {(size_t)n, 1, 1};
++        size_t local_work_size[]  = {64, 1, 1};
++        size_t * local_work_size_ptr = local_work_size;
++        if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
++            local_work_size_ptr = nullptr;
++        }
++        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++    } else {
++        kernel = is_f16 ? backend_ctx->kernel_leaky_relu_f16_nc : backend_ctx->kernel_leaky_relu_f32_nc;
++
++        const int     ne00 = src0->ne[0], ne01 = src0->ne[1], ne02 = src0->ne[2], ne03 = src0->ne[3];
++        const cl_ulong nb00 = src0->nb[0], nb01 = src0->nb[1], nb02 = src0->nb[2], nb03 = src0->nb[3];
++        const cl_ulong nb0 = dst->nb[0], nb1 = dst->nb[1], nb2 = dst->nb[2], nb3 = dst->nb[3];
++
++        CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
++        CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
++        CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extrad->data_device));
++        CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offsetd));
++        CL_CHECK(clSetKernelArg(kernel,  4, sizeof(int),      &ne00));
++        CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &nb00));
++        CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_ulong), &nb01));
++        CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &nb02));
++        CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_ulong), &nb03));
++        CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nb0));
++        CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb1));
++        CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb2));
++        CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb3));
++        CL_CHECK(clSetKernelArg(kernel, 13, sizeof(float),    &slope));
++
++        int nth = 64;
++        size_t global_work_size[] = {(size_t)ne01*nth, (size_t)ne02, (size_t)ne03};
++        size_t local_work_size[]  = {(size_t)nth, 1, 1};
++        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++    }
++}
++
+ static void ggml_cl_softplus(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_ASSERT(src0);
+     GGML_ASSERT(src0->extra);
+@@ -22460,6 +22657,134 @@ static void ggml_cl_conv_2d(ggml_backend_t backend, const ggml_tensor * src0, co
+     backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+ }
+ 
++// CONV_3D (0059): the implicit-GEMM tiling of conv2d, with the kernel's depth
++// folded into the CRS reduction. K = OC, CRS = IC*KD*KH*KW, NPQ = N*OD*OH*OW.
++static void ggml_cl_conv_3d(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    GGML_TENSOR_BINARY_OP_LOCALS;
++    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
++
++    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
++    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++
++    cl_ulong offset0 = extra0->offset + src0->view_offs;
++    cl_ulong offset1 = extra1->offset + src1->view_offs;
++    cl_ulong offsetd = extrad->offset + dst->view_offs;
++
++    const cl_uint OC = dst->op_params[11];
++    const cl_uint IC = dst->op_params[9];
++    const cl_uint N  = dst->op_params[10];
++    const cl_uint KW = ne00;
++    const cl_uint KH = ne01;
++    const cl_uint KD = ne02;
++    const cl_uint IW = ne10;
++    const cl_uint IH = ne11;
++    const cl_uint ID = ne12;
++    const cl_uint OW = ne0;
++    const cl_uint OH = ne1;
++    const cl_uint OD = ne2;
++
++    const cl_uint s0 = dst->op_params[0];
++    const cl_uint s1 = dst->op_params[1];
++    const cl_uint s2 = dst->op_params[2];
++    const cl_uint p0 = dst->op_params[3];
++    const cl_uint p1 = dst->op_params[4];
++    const cl_uint p2 = dst->op_params[5];
++    const cl_uint d0 = dst->op_params[6];
++    const cl_uint d1 = dst->op_params[7];
++    const cl_uint d2 = dst->op_params[8];
++
++    const cl_uint cl_nb00 = nb00/ggml_type_size(src0->type);
++    const cl_uint cl_nb01 = nb01/ggml_type_size(src0->type);
++    const cl_uint cl_nb02 = nb02/ggml_type_size(src0->type);
++    const cl_uint cl_nb03 = nb03/ggml_type_size(src0->type);
++    const cl_uint cl_nb10 = nb10/ggml_type_size(src1->type);
++    const cl_uint cl_nb11 = nb11/ggml_type_size(src1->type);
++    const cl_uint cl_nb12 = nb12/ggml_type_size(src1->type);
++    const cl_uint cl_nb13 = nb13/ggml_type_size(src1->type);
++    const cl_uint cl_nb1 = nb1/ggml_type_size(dst->type);
++    const cl_uint cl_nb2 = nb2/ggml_type_size(dst->type);
++    const cl_uint cl_nb3 = nb3/ggml_type_size(dst->type);
++
++    const int64_t NPQ = (int64_t)N * OD * OH * OW;
++
++    const uint32_t BS_K = 64;
++    const uint32_t BS_NPQ = 64;
++    const uint32_t BS_CRS = 16;
++    const uint32_t VEC_SIZE = 4;
++    const uint32_t TS_K = 4;
++    const uint32_t TS_NPQ = 8;
++    const uint32_t WG_K = BS_K / TS_K;
++    const uint32_t WG_NPQ = BS_NPQ / TS_NPQ;
++
++    auto splitWork = [](uint32_t work_size, uint32_t block_size) { return (block_size + work_size - 1) / block_size; };
++    const uint32_t NB_K = splitWork(OC, BS_K);
++    const uint32_t NB_NPQ = splitWork(NPQ, BS_NPQ);
++
++    cl_kernel kernel;
++    size_t shmem_size;
++
++    if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32) {
++        kernel = backend_ctx->kernel_conv_3d_f16_f32;
++        shmem_size = (size_t)(BS_K * BS_CRS * sizeof(cl_half) + BS_CRS * (BS_NPQ / VEC_SIZE) * sizeof(cl_float4));
++    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
++        kernel = backend_ctx->kernel_conv_3d_f32;
++        shmem_size = (size_t)(BS_K * BS_CRS * sizeof(cl_float) + BS_CRS * (BS_NPQ / VEC_SIZE) * sizeof(cl_float4));
++    } else {
++        GGML_ASSERT(false && "Unsupported data type combination for conv3d");
++    }
++
++    const char * xs = getenv("GGML_OPENCL_CONV3D_RED");
++    const cl_uint cl_red = (xs != nullptr && atoi(xs) != 0) ? 1 : 0;
++
++    cl_uint idx = 0;
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem), &extra0->data_device));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offset0));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem), &extra1->data_device));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offset1));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem), &extrad->data_device));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(kernel, idx++, shmem_size, NULL));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &OC));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &IC));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &N));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &KW));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &KH));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &KD));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &IW));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &IH));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &ID));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &OW));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &OH));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &OD));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &s0));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &s1));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &s2));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &p0));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &p1));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &p2));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &d0));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &d1));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &d2));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &cl_nb00));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &cl_nb01));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &cl_nb02));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &cl_nb03));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &cl_nb10));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &cl_nb11));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &cl_nb12));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &cl_nb13));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &cl_nb1));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &cl_nb2));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &cl_nb3));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &cl_red));
++
++    size_t global_work_size[] = { (size_t)NB_K * WG_K, (size_t)NB_NPQ * WG_NPQ, 1 };
++    size_t local_work_size[] = { (size_t)WG_K, (size_t)WG_NPQ, 1 };
++
++    backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
++}
++
+ // is_kq selects which of the two products this call is, and it is decided by the
+ // CALLER -- the two admission arms in ggml_cl_mul_mat, each of which knows which
+ // one it matched. It used to be re-derived here from nb01 > nb02, i.e. "K is
+@@ -27504,6 +27829,60 @@ static bool ggml_cl_mul_mat_f32_skinny(ggml_backend_t backend, const ggml_tensor
+     return true;
+ }
+ 
++// ARC-LAB 0095: a MUL_MAT that carries GGML_HINT_SRC0_IS_HADAMARD (the KV
++// cache's attention rotations, llama_mul_mat_hadamard) multiplies by the
++// orthonormal Sylvester Hadamard matrix, so it is the fast Walsh-Hadamard
++// transform of each src1 row: O(n log n) adds, src0 never read, one launch.
++// The dense product took the F32 skinny split-K path, GEMM + slice sum, 24,615
++// pairs and 750 ms of a 22.3 s B60 window, ~2.35 ms a verify step
++// (measured-here, Qwen3.8-27B, q8_0:q4_0 KV, MTP 5). Same conditions as the
++// reference, ggml_cuda_op_mul_mat_use_fwht (ggml-cuda/fwht.cu); widths 64-256
++// (512 and up keep the dense product).
++// GGML_OPENCL_FWHT=0 keeps the dense product.
++static bool ggml_cl_mul_mat_fwht(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
++    static const char * env = getenv("GGML_OPENCL_FWHT");
++    static const bool   on  = env == nullptr || atoi(env) != 0;
++    if (!on || backend_ctx->gpu_family != INTEL || dst->op != GGML_OP_MUL_MAT ||
++        ggml_get_op_params_i32(dst, 1) != GGML_HINT_SRC0_IS_HADAMARD ||
++        src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
++        src0->ne[2] != 1 || src0->ne[3] != 1 ||
++        src0->ne[0] != src1->ne[0] || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) ||
++        !ggml_are_same_shape(src1, dst)) {
++        return false;
++    }
++    const int     n    = (int) src1->ne[0];
++    const int64_t rows = ggml_nrows(src1);
++    cl_kernel k = nullptr;
++    switch (n) {
++        case  64: k = backend_ctx->kernel_fwht_f32_64;  break;
++        case 128: k = backend_ctx->kernel_fwht_f32_128; break;
++        case 256: k = backend_ctx->kernel_fwht_f32_256; break;
++        default: break;
++    }
++    if (k == nullptr || rows > INT_MAX / 16) {
++        return false;
++    }
++    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++    cl_ulong offset1 = extra1->offset + src1->view_offs;
++    cl_ulong offsetd = extrad->offset + dst->view_offs;
++    const int   n_rows = (int) rows;
++    const float scale  = 1.0f / sqrtf((float) n);
++    CL_CHECK(clSetKernelArg(k, 0, sizeof(cl_mem),   &extra1->data_device));
++    CL_CHECK(clSetKernelArg(k, 1, sizeof(cl_ulong), &offset1));
++    CL_CHECK(clSetKernelArg(k, 2, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(k, 3, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(k, 4, sizeof(int),      &n_rows));
++    CL_CHECK(clSetKernelArg(k, 5, sizeof(float),    &scale));
++    // one row per 16-wide subgroup, one subgroup per work-group: a verify
++    // step's rotations have 24-576 rows, so small groups spread over the cores
++    size_t gws[1] = { (size_t) rows * 16 };
++    size_t lws[1] = { 16 };
++    backend_ctx->enqueue_ndrange_kernel(k, 1, gws, lws, dst);
++    return true;
++}
++
+ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_ASSERT(src0);
+     GGML_ASSERT(src0->extra);
+@@ -27522,6 +27901,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+     // [K, hc, tokens]): one product of ne11 * ne12 * ne13 columns, so every type
+     // takes its few-column kernels (a Q8_0 eh_proj at 2 tokens went through an
+     // F16 dequant and the tiled GEMM: 0.96 ms against 0.06 at one, B60, profiled)
++    if (ggml_cl_mul_mat_fwht(backend, src0, src1, dst)) {
++        return;
++    }
++
+     if (src0->ne[2] == 1 && src0->ne[3] == 1 && (src1->ne[2] > 1 || src1->ne[3] > 1)) {
+         const int fc = ggml_cl_flat_cols(src0, src1, dst);
+         if (fc > 0) {
+@@ -34376,6 +34759,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+             }
+             func = ggml_cl_mean;
+             break;
++        case GGML_OP_LEAKY_RELU:
++            if (!any_on_device) {
++                return false;
++            }
++            func = ggml_cl_leaky_relu;
++            break;
+         case GGML_OP_UNARY:
+             switch (ggml_get_unary_op(tensor)) {
+                 case GGML_UNARY_OP_GELU:
+@@ -34561,6 +34950,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+             }
+             func = ggml_cl_conv_2d;
+             break;
++        case GGML_OP_CONV_3D:
++            if (!any_on_device) {
++                return false;
++            }
++            func = ggml_cl_conv_3d;
++            break;
+         case GGML_OP_SSM_CONV:
+             if (!any_on_device) {
+                 return false;
+diff --git a/ggml/src/ggml-opencl/kernels/conv3d.cl b/ggml/src/ggml-opencl/kernels/conv3d.cl
+new file mode 100644
+index 0000000..c36b302
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/conv3d.cl
+@@ -0,0 +1,195 @@
++// CONV_3D, f32 weights x f32 input -> f32 output.
++// Same implicit-GEMM tiling as conv3d_f16_f32.cl with the weights as float.
++
++#if defined(cl_qcom_reqd_sub_group_size)
++#pragma OPENCL EXTENSION cl_qcom_reqd_sub_group_size : enable
++#define REQD_SUBGROUP_SIZE_128 __attribute__((qcom_reqd_sub_group_size("full")))
++#else
++#define REQD_SUBGROUP_SIZE_128
++#endif
++
++#define T_ACCUM float4
++#define VEC_SIZE 4
++
++#define BS_K 64
++#define BS_NPQ 64
++#define BS_CRS 16
++
++#define TS_K 4
++#define TS_NPQ 8
++
++#define WG_K (BS_K / TS_K)
++#define WG_NPQ (BS_NPQ / TS_NPQ)
++
++#define BS_NPQ_VEC (BS_NPQ / VEC_SIZE)
++#define TS_NPQ_VEC (TS_NPQ / VEC_SIZE)
++
++static inline uint splitWork(uint work_size, uint block_size){
++    return (work_size + block_size - 1) / block_size;
++}
++
++REQD_SUBGROUP_SIZE_128
++kernel void kernel_conv_3d(
++    global void* p_knl,
++    ulong off_knl,
++    global void* p_src,
++    ulong off_src,
++    global void* p_dst,
++    ulong off_dst,
++    local void* shared,
++    uint OC, uint IC, uint N,
++    uint KW, uint KH, uint KD,
++    uint IW, uint IH, uint ID,
++    uint OW, uint OH, uint OD,
++    uint s0, uint s1, uint s2,
++    uint p0, uint p1, uint p2,
++    uint d0, uint d1, uint d2,
++    uint nb00, uint nb01, uint nb02, uint nb03,
++    uint nb10, uint nb11, uint nb12, uint nb13,
++    uint nb1, uint nb2, uint nb3,
++    uint red
++) {
++    global float* knl_data = (global float*) ((global char*)p_knl + off_knl);
++    global float* src_data = (global float*) ((global char*)p_src + off_src);
++    global float* dst_data = (global float*) ((global char*)p_dst + off_dst);
++
++    const uint K = OC;
++    const uint KD_KH_KW = KD * KH * KW;
++    const uint CRS = IC * KD_KH_KW;
++    const uint OH_OW = OH * OW;
++    const uint NPQ = N * OH_OW * OD;
++
++    const uint lid_k = get_local_id(0);
++    const uint lid_npq = get_local_id(1);
++    const uint tid = lid_npq * WG_K + lid_k;
++
++    const uint B_idx_K = get_group_id(0);
++    const uint B_idx_NPQ = get_group_id(1);
++
++    const uint offset_k = B_idx_K * BS_K;
++    const uint offset_npq = B_idx_NPQ * BS_NPQ;
++
++    local float* Ash = (local float*)shared;
++    local float4* Bsh = (local float4*) &Ash[BS_K * BS_CRS];
++
++    T_ACCUM regC[TS_K][TS_NPQ_VEC];
++    for (int i = 0; i < TS_K; ++i) {
++        for (int j = 0; j < TS_NPQ_VEC; ++j) {
++            regC[i][j] = (T_ACCUM)(0.0f);
++        }
++    }
++
++    const uint NB_CRS = splitWork(CRS, BS_CRS);
++
++    for (uint B_idx_CRS = 0; B_idx_CRS < NB_CRS; ++B_idx_CRS) {
++        const uint offset_crs = B_idx_CRS * BS_CRS;
++
++        for (int i = tid; i < BS_K * BS_CRS; i += (WG_K * WG_NPQ)) {
++            const uint k_l = i / BS_CRS;
++            const uint crs_l = i % BS_CRS;
++            const uint k_g = offset_k + k_l;
++            const uint crs_g = offset_crs + crs_l;
++
++            if (k_g < K && crs_g < CRS) {
++                const uint Cin_idx = crs_g / KD_KH_KW;
++                const uint KD_idx = (crs_g - Cin_idx*KD_KH_KW) / (KH*KW);
++                const uint KH_idx = (crs_g - Cin_idx*KD_KH_KW - KD_idx*KH*KW) / KW;
++                const uint KW_idx = crs_g - Cin_idx*KD_KH_KW - KD_idx*KH*KW - KH_idx*KW;
++                const uint knl_idx = KW_idx*nb00 + KH_idx*nb01 + KD_idx*nb02 + (k_g*IC + Cin_idx)*nb03;
++                // red: the weights are ignored, every output becomes 0 -- a gross
++                // tripwire that the kernel did not run (GGML_OPENCL_CONV3D_RED=1).
++                Ash[k_l * BS_CRS + crs_l] = red ? 0.0f : knl_data[knl_idx];
++            } else {
++                Ash[k_l * BS_CRS + crs_l] = 0.0f;
++            }
++        }
++
++        for (int i = tid; i < BS_CRS * BS_NPQ_VEC; i += (WG_K * WG_NPQ)) {
++            const uint crs_l = i / BS_NPQ_VEC;
++            const uint npq_l_vec = i % BS_NPQ_VEC;
++            const uint crs_g = offset_crs + crs_l;
++
++            float4 val = (float4)(0.0f);
++            if (crs_g < CRS) {
++                const uint Cin_idx = crs_g / KD_KH_KW;
++                const uint KD_idx = (crs_g - Cin_idx*KD_KH_KW) / (KH*KW);
++                const uint KH_idx = (crs_g - Cin_idx*KD_KH_KW - KD_idx*KH*KW) / KW;
++                const uint KW_idx = crs_g - Cin_idx*KD_KH_KW - KD_idx*KH*KW - KH_idx*KW;
++                for (int v = 0; v < VEC_SIZE; ++v) {
++                    const uint npq_g = offset_npq + npq_l_vec * VEC_SIZE + v;
++                    if (npq_g < NPQ) {
++                        const uint N_idx = npq_g / (OD * OH_OW);
++                        const uint sp_idx = npq_g % (OD * OH_OW);
++                        const uint OD_idx = sp_idx / OH_OW;
++                        const uint pq_idx = sp_idx % OH_OW;
++                        const uint OH_idx = pq_idx / OW;
++                        const uint OW_idx = pq_idx % OW;
++                        const int D_idx = (int)(OD_idx * s2 + KD_idx * d2 - p2);
++                        const int H_idx = (int)(OH_idx * s1 + KH_idx * d1 - p1);
++                        const int W_idx = (int)(OW_idx * s0 + KW_idx * d0 - p0);
++
++                        if (D_idx >= 0 && D_idx < ID && H_idx >= 0 && H_idx < IH && W_idx >= 0 && W_idx < IW) {
++                            const uint src_idx = W_idx * nb10 + H_idx * nb11 + D_idx * nb12 + (N_idx * IC + Cin_idx) * nb13;
++                            ((float*)&val)[v] = src_data[src_idx];
++                        }
++                    }
++                }
++            }
++            Bsh[crs_l * BS_NPQ_VEC + npq_l_vec] = val;
++        }
++
++        barrier(CLK_LOCAL_MEM_FENCE);
++
++        #pragma unroll
++        for (uint crs_l = 0; crs_l < BS_CRS; ++crs_l) {
++            float regA[TS_K];
++            for (uint k_l_reg = 0; k_l_reg < TS_K; ++k_l_reg) {
++                regA[k_l_reg] = Ash[(lid_k * TS_K + k_l_reg) * BS_CRS + crs_l];
++            }
++
++            for (uint npq_l_vec_reg = 0; npq_l_vec_reg < TS_NPQ_VEC; ++npq_l_vec_reg) {
++                float4 regB = Bsh[crs_l * BS_NPQ_VEC + lid_npq * TS_NPQ_VEC + npq_l_vec_reg];
++                for (uint k_l_reg = 0; k_l_reg < TS_K; ++k_l_reg) {
++                    regC[k_l_reg][npq_l_vec_reg] = mad(regA[k_l_reg], regB, regC[k_l_reg][npq_l_vec_reg]);
++                }
++            }
++        }
++        barrier(CLK_LOCAL_MEM_FENCE);
++    }
++
++    for (uint k_l_reg = 0; k_l_reg < TS_K; ++k_l_reg) {
++        const uint k_g = offset_k + lid_k * TS_K + k_l_reg;
++        if (k_g >= K) continue;
++
++        for (uint npq_l_vec_reg = 0; npq_l_vec_reg < TS_NPQ_VEC; ++npq_l_vec_reg) {
++            const uint npq_g_base = offset_npq + (lid_npq * TS_NPQ_VEC + npq_l_vec_reg) * VEC_SIZE;
++
++            const uint N_idx = npq_g_base / (OD * OH_OW);
++            const uint sp_idx = npq_g_base % (OD * OH_OW);
++            const uint OD_idx = sp_idx / OH_OW;
++            const uint pq_idx = sp_idx % OH_OW;
++            const uint OH_idx = pq_idx / OW;
++            const uint OW_idx = pq_idx % OW;
++
++            if (nb1 == OW && OW_idx + VEC_SIZE <= OW && npq_g_base + VEC_SIZE <= NPQ) {
++                const uint dst_idx = OW_idx + OH_idx*nb1 + OD_idx*nb2 + (N_idx*OC + k_g)*nb3;
++                vstore4(regC[k_l_reg][npq_l_vec_reg], 0, &dst_data[dst_idx]);
++            } else {
++                T_ACCUM res = regC[k_l_reg][npq_l_vec_reg];
++                for (int v = 0; v < VEC_SIZE; ++v) {
++                    const uint npq_g = npq_g_base + v;
++                    if (npq_g < NPQ) {
++                        const uint N_idx_s = npq_g / (OD * OH_OW);
++                        const uint sp_idx_s = npq_g % (OD * OH_OW);
++                        const uint OD_idx_s = sp_idx_s / OH_OW;
++                        const uint pq_idx_s = sp_idx_s % OH_OW;
++                        const uint OH_idx_s = pq_idx_s / OW;
++                        const uint OW_idx_s = pq_idx_s % OW;
++                        const uint dst_idx_s = OW_idx_s + OH_idx_s*nb1 + OD_idx_s*nb2 + (N_idx_s*OC + k_g)*nb3;
++                        dst_data[dst_idx_s] = ((float*)&res)[v];
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/ggml/src/ggml-opencl/kernels/conv3d_f16_f32.cl b/ggml/src/ggml-opencl/kernels/conv3d_f16_f32.cl
+new file mode 100644
+index 0000000..b03bc13
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/conv3d_f16_f32.cl
+@@ -0,0 +1,200 @@
++// CONV_3D, f16 weights x f32 input -> f32 output.
++// The implicit-GEMM tiling of conv2d_f16_f32.cl, with the kernel's depth
++// (KD) folded into the CRS reduction axis: K = OC, CRS = IC*KD*KH*KW,
++// NPQ = N*OD*OH*OW. The weight tensor is [KW, KH, KD, IC*OC]; the input
++// [IW, IH, ID, IC*N]; the output [OW, OH, OD, OC*N].
++
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++
++#if defined(cl_qcom_reqd_sub_group_size)
++#pragma OPENCL EXTENSION cl_qcom_reqd_sub_group_size : enable
++#define REQD_SUBGROUP_SIZE_128 __attribute__((qcom_reqd_sub_group_size("full")))
++#else
++#define REQD_SUBGROUP_SIZE_128
++#endif
++
++#define T_ACCUM float4
++#define VEC_SIZE 4
++
++#define BS_K 64
++#define BS_NPQ 64
++#define BS_CRS 16
++
++#define TS_K 4
++#define TS_NPQ 8
++
++#define WG_K (BS_K / TS_K)
++#define WG_NPQ (BS_NPQ / TS_NPQ)
++
++#define BS_NPQ_VEC (BS_NPQ / VEC_SIZE)
++#define TS_NPQ_VEC (TS_NPQ / VEC_SIZE)
++
++static inline uint splitWork(uint work_size, uint block_size){
++    return (work_size + block_size - 1) / block_size;
++}
++
++REQD_SUBGROUP_SIZE_128
++kernel void kernel_conv_3d(
++    global void* p_knl,
++    ulong off_knl,
++    global void* p_src,
++    ulong off_src,
++    global void* p_dst,
++    ulong off_dst,
++    local void* shared,
++    uint OC, uint IC, uint N,
++    uint KW, uint KH, uint KD,
++    uint IW, uint IH, uint ID,
++    uint OW, uint OH, uint OD,
++    uint s0, uint s1, uint s2,
++    uint p0, uint p1, uint p2,
++    uint d0, uint d1, uint d2,
++    uint nb00, uint nb01, uint nb02, uint nb03,
++    uint nb10, uint nb11, uint nb12, uint nb13,
++    uint nb1, uint nb2, uint nb3,
++    uint red
++) {
++    global half* knl_data = (global half*) ((global char*)p_knl + off_knl);
++    global float* src_data = (global float*) ((global char*)p_src + off_src);
++    global float* dst_data = (global float*) ((global char*)p_dst + off_dst);
++
++    const uint K = OC;
++    const uint KD_KH_KW = KD * KH * KW;
++    const uint CRS = IC * KD_KH_KW;
++    const uint OH_OW = OH * OW;
++    const uint NPQ = N * OH_OW * OD;
++
++    const uint lid_k = get_local_id(0);
++    const uint lid_npq = get_local_id(1);
++    const uint tid = lid_npq * WG_K + lid_k;
++
++    const uint B_idx_K = get_group_id(0);
++    const uint B_idx_NPQ = get_group_id(1);
++
++    const uint offset_k = B_idx_K * BS_K;
++    const uint offset_npq = B_idx_NPQ * BS_NPQ;
++
++    local half* Ash = (local half*)shared;
++    local float4* Bsh = (local float4*) &Ash[BS_K * BS_CRS];
++
++    T_ACCUM regC[TS_K][TS_NPQ_VEC];
++    for (int i = 0; i < TS_K; ++i) {
++        for (int j = 0; j < TS_NPQ_VEC; ++j) {
++            regC[i][j] = (T_ACCUM)(0.0f);
++        }
++    }
++
++    const uint NB_CRS = splitWork(CRS, BS_CRS);
++
++    for (uint B_idx_CRS = 0; B_idx_CRS < NB_CRS; ++B_idx_CRS) {
++        const uint offset_crs = B_idx_CRS * BS_CRS;
++
++        for (int i = tid; i < BS_K * BS_CRS; i += (WG_K * WG_NPQ)) {
++            const uint k_l = i / BS_CRS;
++            const uint crs_l = i % BS_CRS;
++            const uint k_g = offset_k + k_l;
++            const uint crs_g = offset_crs + crs_l;
++
++            if (k_g < K && crs_g < CRS) {
++                const uint Cin_idx = crs_g / KD_KH_KW;
++                const uint KD_idx = (crs_g - Cin_idx*KD_KH_KW) / (KH*KW);
++                const uint KH_idx = (crs_g - Cin_idx*KD_KH_KW - KD_idx*KH*KW) / KW;
++                const uint KW_idx = crs_g - Cin_idx*KD_KH_KW - KD_idx*KH*KW - KH_idx*KW;
++                const uint knl_idx = KW_idx*nb00 + KH_idx*nb01 + KD_idx*nb02 + (k_g*IC + Cin_idx)*nb03;
++                // red: the weights are ignored, every output becomes 0 -- a gross
++                // tripwire that the kernel did not run (GGML_OPENCL_CONV3D_RED=1).
++                Ash[k_l * BS_CRS + crs_l] = red ? (half)0.0f : knl_data[knl_idx];
++            } else {
++                Ash[k_l * BS_CRS + crs_l] = (half)0.0f;
++            }
++        }
++
++        for (int i = tid; i < BS_CRS * BS_NPQ_VEC; i += (WG_K * WG_NPQ)) {
++            const uint crs_l = i / BS_NPQ_VEC;
++            const uint npq_l_vec = i % BS_NPQ_VEC;
++            const uint crs_g = offset_crs + crs_l;
++
++            float4 val = (float4)(0.0f);
++            if (crs_g < CRS) {
++                const uint Cin_idx = crs_g / KD_KH_KW;
++                const uint KD_idx = (crs_g - Cin_idx*KD_KH_KW) / (KH*KW);
++                const uint KH_idx = (crs_g - Cin_idx*KD_KH_KW - KD_idx*KH*KW) / KW;
++                const uint KW_idx = crs_g - Cin_idx*KD_KH_KW - KD_idx*KH*KW - KH_idx*KW;
++                for (int v = 0; v < VEC_SIZE; ++v) {
++                    const uint npq_g = offset_npq + npq_l_vec * VEC_SIZE + v;
++                    if (npq_g < NPQ) {
++                        const uint N_idx = npq_g / (OD * OH_OW);
++                        const uint sp_idx = npq_g % (OD * OH_OW);
++                        const uint OD_idx = sp_idx / OH_OW;
++                        const uint pq_idx = sp_idx % OH_OW;
++                        const uint OH_idx = pq_idx / OW;
++                        const uint OW_idx = pq_idx % OW;
++                        const int D_idx = (int)(OD_idx * s2 + KD_idx * d2 - p2);
++                        const int H_idx = (int)(OH_idx * s1 + KH_idx * d1 - p1);
++                        const int W_idx = (int)(OW_idx * s0 + KW_idx * d0 - p0);
++
++                        if (D_idx >= 0 && D_idx < ID && H_idx >= 0 && H_idx < IH && W_idx >= 0 && W_idx < IW) {
++                            const uint src_idx = W_idx * nb10 + H_idx * nb11 + D_idx * nb12 + (N_idx * IC + Cin_idx) * nb13;
++                            ((float*)&val)[v] = src_data[src_idx];
++                        }
++                    }
++                }
++            }
++            Bsh[crs_l * BS_NPQ_VEC + npq_l_vec] = val;
++        }
++
++        barrier(CLK_LOCAL_MEM_FENCE);
++
++        #pragma unroll
++        for (uint crs_l = 0; crs_l < BS_CRS; ++crs_l) {
++            half regA[TS_K];
++            for (uint k_l_reg = 0; k_l_reg < TS_K; ++k_l_reg) {
++                regA[k_l_reg] = Ash[(lid_k * TS_K + k_l_reg) * BS_CRS + crs_l];
++            }
++
++            for (uint npq_l_vec_reg = 0; npq_l_vec_reg < TS_NPQ_VEC; ++npq_l_vec_reg) {
++                float4 regB = Bsh[crs_l * BS_NPQ_VEC + lid_npq * TS_NPQ_VEC + npq_l_vec_reg];
++                for (uint k_l_reg = 0; k_l_reg < TS_K; ++k_l_reg) {
++                    regC[k_l_reg][npq_l_vec_reg] = mad(convert_float(regA[k_l_reg]), regB, regC[k_l_reg][npq_l_vec_reg]);
++                }
++            }
++        }
++        barrier(CLK_LOCAL_MEM_FENCE);
++    }
++
++    for (uint k_l_reg = 0; k_l_reg < TS_K; ++k_l_reg) {
++        const uint k_g = offset_k + lid_k * TS_K + k_l_reg;
++        if (k_g >= K) continue;
++
++        for (uint npq_l_vec_reg = 0; npq_l_vec_reg < TS_NPQ_VEC; ++npq_l_vec_reg) {
++            const uint npq_g_base = offset_npq + (lid_npq * TS_NPQ_VEC + npq_l_vec_reg) * VEC_SIZE;
++
++            const uint N_idx = npq_g_base / (OD * OH_OW);
++            const uint sp_idx = npq_g_base % (OD * OH_OW);
++            const uint OD_idx = sp_idx / OH_OW;
++            const uint pq_idx = sp_idx % OH_OW;
++            const uint OH_idx = pq_idx / OW;
++            const uint OW_idx = pq_idx % OW;
++
++            if (nb1 == OW && OW_idx + VEC_SIZE <= OW && npq_g_base + VEC_SIZE <= NPQ) {
++                const uint dst_idx = OW_idx + OH_idx*nb1 + OD_idx*nb2 + (N_idx*OC + k_g)*nb3;
++                vstore4(regC[k_l_reg][npq_l_vec_reg], 0, &dst_data[dst_idx]);
++            } else {
++                T_ACCUM res = regC[k_l_reg][npq_l_vec_reg];
++                for (int v = 0; v < VEC_SIZE; ++v) {
++                    const uint npq_g = npq_g_base + v;
++                    if (npq_g < NPQ) {
++                        const uint N_idx_s = npq_g / (OD * OH_OW);
++                        const uint sp_idx_s = npq_g % (OD * OH_OW);
++                        const uint OD_idx_s = sp_idx_s / OH_OW;
++                        const uint pq_idx_s = sp_idx_s % OH_OW;
++                        const uint OH_idx_s = pq_idx_s / OW;
++                        const uint OW_idx_s = pq_idx_s % OW;
++                        const uint dst_idx_s = OW_idx_s + OH_idx_s*nb1 + OD_idx_s*nb2 + (N_idx_s*OC + k_g)*nb3;
++                        dst_data[dst_idx_s] = ((float*)&res)[v];
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/ggml/src/ggml-opencl/kernels/fwht_f32.cl b/ggml/src/ggml-opencl/kernels/fwht_f32.cl
+new file mode 100644
+index 0000000..8b27bc7
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/fwht_f32.cl
+@@ -0,0 +1,79 @@
++#ifdef cl_intel_subgroups
++#pragma OPENCL EXTENSION cl_intel_subgroups : enable
++#define FWHT_SHUFFLE_XOR(v, m) intel_sub_group_shuffle_xor((v), (m))
++#else
++#pragma OPENCL EXTENSION cl_khr_subgroups : enable
++#pragma OPENCL EXTENSION cl_khr_subgroup_shuffle : enable
++#define FWHT_SHUFFLE_XOR(v, m) sub_group_shuffle_xor((v), (m))
++#endif
++
++#ifdef cl_intel_required_subgroup_size
++#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
++#define REQD_SUBGROUP_SIZE_16 __attribute__((intel_reqd_sub_group_size(16)))
++#else
++// a compile fallback only: the indexing below is right at a 16-wide subgroup
++// alone, and the host loads these kernels only where it can require one
++#define REQD_SUBGROUP_SIZE_16
++#endif
++
++// The fast Walsh-Hadamard transform for MUL_MAT nodes that carry
++// GGML_HINT_SRC0_IS_HADAMARD (the KV cache's attention rotations): dst row =
++// H_n x src1 row with H_n the orthonormal Sylvester Hadamard matrix, so src0
++// is never read. The reference is ggml-cuda/fwht.cu (one row per warp,
++// shuffle stages inside the warp, register stages above it); here one row per
++// 16-wide subgroup: element e of a row sits in lane e % 16, register e / 16.
++// The stages commute, so the order of the butterflies is free.
++#define FWHT_SG 16
++
++#define FWHT_KERNEL(N)                                                              \
++REQD_SUBGROUP_SIZE_16                                                               \
++kernel void kernel_fwht_f32_##N(                                                    \
++        global const char * src, ulong offs,                                        \
++        global char * dst, ulong offd,                                              \
++        int n_rows, float scale) {                                                  \
++    const int r = get_global_id(0) / FWHT_SG;                                       \
++    if (r >= n_rows) {                                                              \
++        return;                                                                     \
++    }                                                                               \
++    const int lane = get_sub_group_local_id();                                      \
++    global const float * s = (global const float *)(src + offs) + (long) r * N;     \
++    global float *       d = (global float *)(dst + offd) + (long) r * N;           \
++    float reg[N / FWHT_SG];                                                         \
++    _Pragma("unroll")                                                               \
++    for (int i = 0; i < N / FWHT_SG; ++i) {                                         \
++        reg[i] = s[i * FWHT_SG + lane] * scale;                                     \
++    }                                                                               \
++    _Pragma("unroll")                                                               \
++    for (int h = 1; h < FWHT_SG; h *= 2) {                                          \
++        _Pragma("unroll")                                                           \
++        for (int j = 0; j < N / FWHT_SG; ++j) {                                     \
++            const float v  = reg[j];                                                \
++            const float v2 = FWHT_SHUFFLE_XOR(v, (uint) h);                         \
++            reg[j] = (lane & h) == 0 ? v + v2 : v2 - v;                             \
++        }                                                                           \
++    }                                                                               \
++    _Pragma("unroll")                                                               \
++    for (int h = FWHT_SG; h < N; h *= 2) {                                          \
++        const int step = h / FWHT_SG;                                               \
++        _Pragma("unroll")                                                           \
++        for (int j = 0; j < N / FWHT_SG; j += 2 * step) {                           \
++            _Pragma("unroll")                                                       \
++            for (int k = 0; k < step; ++k) {                                        \
++                const float x = reg[j + k];                                         \
++                const float y = reg[j + k + step];                                  \
++                reg[j + k]        = x + y;                                          \
++                reg[j + k + step] = x - y;                                          \
++            }                                                                       \
++        }                                                                           \
++    }                                                                               \
++    _Pragma("unroll")                                                               \
++    for (int i = 0; i < N / FWHT_SG; ++i) {                                         \
++        d[i * FWHT_SG + lane] = reg[i];                                             \
++    }                                                                               \
++}
++
++FWHT_KERNEL(64)
++FWHT_KERNEL(128)
++FWHT_KERNEL(256)
++// no 512: on the A770 its 32 values a lane spill at SIMD16 (offline ocloc,
++// dg2-g10) and the retry rolls the loops; no model here rotates at 512.
+diff --git a/ggml/src/ggml-opencl/kernels/leaky_relu.cl b/ggml/src/ggml-opencl/kernels/leaky_relu.cl
+new file mode 100644
+index 0000000..bc521b7
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/leaky_relu.cl
+@@ -0,0 +1,77 @@
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++
++//------------------------------------------------------------------------------
++// LEAKY_RELU (patch 0060): the missing unary the ESRGAN upscaler's graph falls
++// back to the CPU for, where the split-graph op segfaults. Same six variants as
++// unary_ext.cl (f32, f32_4, f16, f16_4, f32_nc, f16_nc); the negative slope is
++// the op's own parameter, an extra trailing argument.
++//   x > 0: x;  x <= 0: x * slope.
++// The CPU reference (ggml-cpu/ops.cpp) computes in f32; the f16 variants read
++// and write half and convert, so they match within tolerance.
++//------------------------------------------------------------------------------
++
++#define LEAKY_RELU(NAME, SEXPR, VEXPR)                                          \
++kernel void kernel_##NAME##_f32(                                               \
++        global const float * src0, ulong offset0,                             \
++        global       float * dst,  ulong offsetd, float slope) {              \
++    src0 = (global float*)((global char*)src0 + offset0);                     \
++    dst  = (global float*)((global char*)dst  + offsetd);                     \
++    float x = src0[get_global_id(0)];                                         \
++    dst[get_global_id(0)] = (SEXPR);                                          \
++}                                                                             \
++kernel void kernel_##NAME##_f32_4(                                            \
++        global const float4 * src0, ulong offset0,                           \
++        global       float4 * dst,  ulong offsetd, float slope) {             \
++    src0 = (global float4*)((global char*)src0 + offset0);                   \
++    dst  = (global float4*)((global char*)dst  + offsetd);                   \
++    float4 x = src0[get_global_id(0)];                                       \
++    dst[get_global_id(0)] = (VEXPR);                                         \
++}                                                                             \
++kernel void kernel_##NAME##_f16(                                             \
++        global const half * src0, ulong offset0,                            \
++        global       half * dst,  ulong offsetd, float slope) {              \
++    src0 = (global half*)((global char*)src0 + offset0);                    \
++    dst  = (global half*)((global char*)dst  + offsetd);                    \
++    float x = src0[get_global_id(0)];                                       \
++    dst[get_global_id(0)] = (SEXPR);                                        \
++}                                                                            \
++kernel void kernel_##NAME##_f16_4(                                          \
++        global const half4 * src0, ulong offset0,                          \
++        global       half4 * dst,  ulong offsetd, float slope) {            \
++    src0 = (global half4*)((global char*)src0 + offset0);                  \
++    dst  = (global half4*)((global char*)dst  + offsetd);                  \
++    float4 x = convert_float4(src0[get_global_id(0)]);                     \
++    dst[get_global_id(0)] = convert_half4(VEXPR);                          \
++}                                                                           \
++kernel void kernel_##NAME##_f32_nc(                                         \
++        global const char * src0, ulong offset0,                          \
++        global       char * dst,  ulong offsetd,                          \
++        int ne00, ulong nb00, ulong nb01, ulong nb02, ulong nb03,         \
++        ulong nb0, ulong nb1, ulong nb2, ulong nb3, float slope) {        \
++    src0 = src0 + offset0; dst = dst + offsetd;                            \
++    const int i3 = get_group_id(2);                                       \
++    const int i2 = get_group_id(1);                                       \
++    const int i1 = get_group_id(0);                                       \
++    for (int i0 = get_local_id(0); i0 < ne00; i0 += get_local_size(0)) {  \
++        float x = *(global const float *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00); \
++        *(global float *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0) = (SEXPR);            \
++    }                                                                     \
++}                                                                         \
++kernel void kernel_##NAME##_f16_nc(                                       \
++        global const char * src0, ulong offset0,                          \
++        global       char * dst,  ulong offsetd,                          \
++        int ne00, ulong nb00, ulong nb01, ulong nb02, ulong nb03,         \
++        ulong nb0, ulong nb1, ulong nb2, ulong nb3, float slope) {        \
++    src0 = src0 + offset0; dst = dst + offsetd;                            \
++    const int i3 = get_group_id(2);                                       \
++    const int i2 = get_group_id(1);                                       \
++    const int i1 = get_group_id(0);                                       \
++    for (int i0 = get_local_id(0); i0 < ne00; i0 += get_local_size(0)) {  \
++        float x = *(global const half *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00); \
++        *(global half *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0) = (SEXPR);            \
++    }                                                                     \
++}
++
++#define LEAKY_RELU_BODY(NAME) LEAKY_RELU(NAME, x > 0.0f ? x : x * slope, select(x * slope, x, x > (float4)0.0f))
++
++LEAKY_RELU_BODY(leaky_relu)
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f902b42..c75ee11 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -8509,21 +8509,26 @@ struct test_leaky_relu : public test_case {
+     const ggml_type type;
+     const std::array<int64_t, 4> ne_a;
+     const float negative_slope;
++    const bool nc; // a transposed (strided) input, not in place
+ 
+     std::string vars() override {
+-        return VARS_TO_STR3(type, ne_a, negative_slope);
++        return VARS_TO_STR4(type, ne_a, negative_slope, nc);
+     }
+ 
+     test_leaky_relu(ggml_type type = GGML_TYPE_F32,
+             std::array<int64_t, 4> ne_a = {10, 5, 4, 3},
+-            float negative_slope = 0.1f)
+-        : type(type), ne_a(ne_a), negative_slope(negative_slope)  {}
++            float negative_slope = 0.1f, bool nc = false)
++        : type(type), ne_a(ne_a), negative_slope(negative_slope), nc(nc)  {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+         ggml_set_name(a, "a");
+ 
+-        ggml_tensor * out = ggml_leaky_relu(ctx, a, negative_slope, true);
++        if (nc) {
++            a = ggml_transpose(ctx, a);
++            ggml_set_name(a, "a_t");
++        }
++        ggml_tensor * out = ggml_leaky_relu(ctx, a, negative_slope, !nc);
+         ggml_set_name(out, "out");
+ 
+         return out;
+@@ -10377,6 +10382,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_conv_3d(1, 1, 2, 2, 2, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, kernel_type));
+         test_cases.emplace_back(new test_conv_3d(1, 1, 2, 2, 2, 1, 1, 0, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, kernel_type));
+         test_cases.emplace_back(new test_conv_3d(1, 1, 2, 2, 2, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, kernel_type));
++        // 0059: the Wan VAE's causal 3D convs for one frame (sd.cpp wan_vae.hpp): the
++        // time axis and the borders padded beforehand, so ID = KD = 3, p = 0, OD = 1;
++        // the decoder's 96/384-channel blocks, the 16 -> 384 conv1 and the 96 -> 3 head
++        test_cases.emplace_back(new test_conv_3d(1,  96, 3, 66, 66,  96, 3, 3, 3, 1, 1, 1, 0, 0, 0, 1, 1, 1, kernel_type));
++        test_cases.emplace_back(new test_conv_3d(1, 384, 3, 34, 34, 384, 3, 3, 3, 1, 1, 1, 0, 0, 0, 1, 1, 1, kernel_type));
++        test_cases.emplace_back(new test_conv_3d(1,  16, 3, 34, 34, 384, 3, 3, 3, 1, 1, 1, 0, 0, 0, 1, 1, 1, kernel_type));
++        test_cases.emplace_back(new test_conv_3d(1,  96, 3, 66, 66,   3, 3, 3, 3, 1, 1, 1, 0, 0, 0, 1, 1, 1, kernel_type));
+     }
+ 
+     for(uint32_t Cout : {1, 9}){
+@@ -11486,6 +11498,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_clamp     (type, {1024, 1024, 1, 1}));
+         test_cases.emplace_back(new test_leaky_relu(type, {7, 1, 5, 3}));
+         test_cases.emplace_back(new test_leaky_relu(type, {1024, 1024, 1, 1}));
++        test_cases.emplace_back(new test_leaky_relu(type, {33, 17, 3, 2}, 0.2f, true));   // 0060: the strided kernels
+         test_cases.emplace_back(new test_floor     (type, {7, 1, 5, 3}));
+         test_cases.emplace_back(new test_floor     (type, {1024, 1024, 1, 1}));
+         test_cases.emplace_back(new test_ceil      (type, {7, 1, 5, 3}));
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index fccb00c..496d681 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -1153,7 +1153,16 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const
+                 const auto  gen_process = params ? params->gen_process : CLIP_GEN_PROCESS_GEN_CODE;
+                 const int   top_k = params ? params->top_k : 50;
+                 const float top_p = params ? params->top_p : 1.0f;
+-                builder = std::make_unique<clip_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p);
++                // GEN_WAV computes the caller's valid frames, not the padded
++                // wav_tfm_swa window: the decoder's per-call cost scales with the
++                // flushed frames instead of a fixed 72 (measured-here, C4 PASS).
++                // MTMD_TTS_WAV_PAD=1 is the red case, forcing the padded window back
++                const bool  pad   = std::getenv("MTMD_TTS_WAV_PAD") != nullptr &&
++                                    atoi(std::getenv("MTMD_TTS_WAV_PAD")) != 0;
++                const bool  valid = params && gen_process == CLIP_GEN_PROCESS_GEN_WAV && !pad;
++                const int64_t n_codes_gen = ctx->model.gen_code_head_w->ne[2] + 1;
++                const int   gen_n_frames = valid && params->codes ? (int) (params->codes->size() / n_codes_gen) : -1;
++                builder = std::make_unique<clip_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p, gen_n_frames);
+             } break;
+         case PROJECTOR_TYPE_YOUTUVL:
+             {
+@@ -5472,10 +5481,13 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+                         }
+                     }
+ 
+-                    std::vector<int32_t> codes(n_frames_w * n_codes, 0);
++                    const bool    pad = std::getenv("MTMD_TTS_WAV_PAD") != nullptr &&
++                                        atoi(std::getenv("MTMD_TTS_WAV_PAD")) != 0;
++                    const int64_t use_frames = pad ? n_frames_w : n_frames;
++                    std::vector<int32_t> codes(use_frames * n_codes, 0);
+                     for (int64_t f = 0; f < n_frames; f++) {
+                         for (int64_t g = 0; g < n_codes; g++) {
+-                            codes[g * n_frames_w + f] = (*params->codes)[f * n_codes + g];
++                            codes[g * use_frames + f] = (*params->codes)[f * n_codes + g];
+                         }
+                     }
+                     set_input_i32("inp_codes", codes);
+@@ -6003,7 +6015,9 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+ 
+         // drop the tail audio that comes from the code-0 rear padding
+         const int64_t n_codes    = params->codes ? model.gen_code_head_w->ne[2] + 1 : 0;
+-        const int64_t n_frames_w = hparams.wav_tfm_swa;
++        const bool    pad = std::getenv("MTMD_TTS_WAV_PAD") != nullptr &&
++                            atoi(std::getenv("MTMD_TTS_WAV_PAD")) != 0;
++        const int64_t n_frames_w = (params->codes && !pad) ? (int64_t) params->codes->size() / n_codes : hparams.wav_tfm_swa;
+         const int64_t n_frames   = params->codes ? (int64_t) params->codes->size() / n_codes : n_frames_w;
+         if (n_frames < n_frames_w) {
+             const size_t hop = out_audio.size() / n_frames_w;
+diff --git a/tools/mtmd/models/models.h b/tools/mtmd/models/models.h
+index adb5ede..b415ff9 100644
+--- a/tools/mtmd/models/models.h
++++ b/tools/mtmd/models/models.h
+@@ -248,8 +248,8 @@ struct clip_graph_qwen3tts_spkenc : clip_graph {
+ };
+ 
+ struct clip_graph_qwen3tts_gen : clip_graph {
+-    clip_graph_qwen3tts_gen(clip_ctx * ctx, const clip_image_f32 & img, clip_gen_process_type gen_process, int top_k, float top_p)
+-        : clip_graph(ctx, img), gen_process(gen_process), top_k(top_k), top_p(top_p) {}
++    clip_graph_qwen3tts_gen(clip_ctx * ctx, const clip_image_f32 & img, clip_gen_process_type gen_process, int top_k, float top_p, int gen_n_frames = -1)
++        : clip_graph(ctx, img), gen_process(gen_process), top_k(top_k), top_p(top_p), gen_n_frames(gen_n_frames) {}
+     ggml_cgraph * build() override;
+ 
+     // which sub-graph build() constructs, fixed at graph-build time
+@@ -259,6 +259,10 @@ struct clip_graph_qwen3tts_gen : clip_graph {
+     int   top_k;
+     float top_p;
+ 
++    // GEN_WAV computes the caller's valid frames instead of the fixed
++    // wav_tfm_swa window (the padded-72 fixed per-call cost); -1 keeps the window
++    int   gen_n_frames;
++
+     //
+     // code_gen: backbone hidden state + sampled code0 -> 16 RVQ codes
+     // MTP-style code predictor, one token per codebook
+diff --git a/tools/mtmd/models/qwen3tts-gen.cpp b/tools/mtmd/models/qwen3tts-gen.cpp
+index 9826190..6429330 100644
+--- a/tools/mtmd/models/qwen3tts-gen.cpp
++++ b/tools/mtmd/models/qwen3tts-gen.cpp
+@@ -739,7 +739,7 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
+     cb(out_embd, "gen_audio_out", -1);
+ 
+     // ---- CLIP_GEN_PROCESS_GEN_WAV: 16 RVQ codes -> raw PCM ----
+-    const int n_frames = hparams.wav_tfm_swa; // frames per batch, == the attention window
++    const int n_frames = gen_n_frames > 0 ? gen_n_frames : (int) hparams.wav_tfm_swa; // GEN_WAV: the caller's valid frames, else the fixed window
+ 
+     ggml_tensor * inp_codes = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_frames, n_codes);
+     ggml_set_name(inp_codes, "inp_codes");

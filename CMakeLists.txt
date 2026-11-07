@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 1.6.0 LANGUAGES CXX)
+project(arcint VERSION 1.6.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -81,6 +81,7 @@ add_library(arcint_core STATIC
   src/util/utf8.cpp
   src/util/text.cpp
   src/core/admission.cpp
+  src/core/dory.cpp
   src/core/reasoning.cpp
   src/core/renderer_material.cpp
   src/core/sampler.cpp
@@ -183,6 +184,13 @@ if(ARCINT_LLAMA)
   # contrib/llama.cpp 0021 (the expert cache) adds llama_model_params fields;
   # without it --llama-expert-cache is refused at load
   file(READ "${ARCINT_LLAMA_DIR}/include/llama.h" ARCINT_LLAMA_H)
+  # contrib/llama.cpp 0108 (the dory architecture) adds llama_model_n_layer_physical to llama-ext.h;
+  # without it a dory file cannot load (the architecture is unknown), and the admission geometry
+  # keeps llama_model_n_layer
+  file(READ "${ARCINT_LLAMA_DIR}/src/llama-ext.h" ARCINT_LLAMA_EXT_H)
+  if(ARCINT_LLAMA_EXT_H MATCHES "llama_model_n_layer_physical")
+    target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_DORY=1)
+  endif()
   if(ARCINT_LLAMA_H MATCHES "expert_cache_bytes")
     target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_EXPERT_CACHE=1)
     # 0024: an expert cache per card under the layer split
@@ -280,6 +288,7 @@ if(ARCINT_TESTS)
     tests/test_lanes.cpp
     tests/test_reasoning.cpp
     tests/test_admission.cpp
+    tests/test_dory.cpp
     tests/test_gemma4.cpp
     tests/test_markers.cpp
     tests/test_stream_utf8.cpp

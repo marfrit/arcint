@@ -166,6 +166,12 @@ struct Config {
     // 0023). Two cards need K: there is no automatic split.
     std::vector<std::string> llama_devices;
     int llama_layer_split = 0;
+    // Dory (a looped nGPT, architecture 'dory'; core/dory.h): --llama-dory-loops N
+    // runs the recurrent blocks N times (1 to 4) and --llama-dory-kv per_loop|last_loop
+    // picks the recurrent blocks' KV layout. 0 and empty serve the GGUF's own values;
+    // either one is reported at load and in /props with where it came from.
+    int         llama_dory_loops = 0;
+    std::string llama_dory_kv;
     // --llama-mtp-card N: the card (index into llama_devices) that runs the
     // --llama-mtp-gguf model under the split; it reads only the last
     // layer's rows, through host memory. -1: unset, the first card.

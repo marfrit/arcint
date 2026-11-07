@@ -396,6 +396,12 @@ std::string usage_text() {
         "                            layer on the second (contrib/llama.cpp 0023)\n"
         "  --llama-mtp-card N        two cards: the card running the --llama-mtp-gguf\n"
         "                            model (default 0, the first)\n"
+        "  --llama-dory-loops N      a Dory model (looped nGPT): run the 40 recurrent blocks\n"
+        "                            N times, 1 to 4 (default: the GGUF's own, 4; the\n"
+        "                            value and its source are in the load log and /props)\n"
+        "  --llama-dory-kv MODE      a Dory model: per_loop (a KV a loop and layer) or\n"
+        "                            last_loop (one a layer, each loop overwriting the\n"
+        "                            last; default: the GGUF's own, per_loop)\n"
         "  --llama-expert-profile F  the expert ranking that fills the cache (Strata's\n"
         "                            STRP profile; default round robin)\n"
         "  --llama-expert-cache-save F\n"
@@ -512,6 +518,13 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--llama-layer-split") {
             if (!value(v) || !parse_int(v, cfg.llama_layer_split) || cfg.llama_layer_split < 1)
                 return fail("--llama-layer-split needs a layer index K >= 1 (layers [0, K) on the first card)");
+        } else if (arg == "--llama-dory-loops") {
+            if (!value(v) || !parse_int(v, cfg.llama_dory_loops) || cfg.llama_dory_loops < 1 || cfg.llama_dory_loops > 4)
+                return fail("--llama-dory-loops needs a loop count from 1 to 4");
+        } else if (arg == "--llama-dory-kv") {
+            if (!value(v) || (std::string(v) != "per_loop" && std::string(v) != "last_loop"))
+                return fail("--llama-dory-kv takes per_loop or last_loop");
+            cfg.llama_dory_kv = std::string(v);
         } else if (arg == "--llama-mtp-card") {
             if (!value(v) || !parse_int(v, cfg.llama_mtp_card) || cfg.llama_mtp_card < 0)
                 return fail("--llama-mtp-card needs a card index (0: the first --device card)");
@@ -916,11 +929,11 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             cfg.llama_dflash_min_p > 0.0 || cfg.llama_dflash_ubatch > 0 ||
             cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192 ||
             cfg.llama_expert_cache_on() || !cfg.llama_expert_profile.empty() || cfg.llama_layer_split > 0 || cfg.llama_mtp_card >= 0 ||
-            cfg.llama_reserve_cells > 0 || cfg.tts || !cfg.tts_profiles.empty() || cfg.tts_lang != "de" ||
+            cfg.llama_dory_loops > 0 || !cfg.llama_dory_kv.empty() || cfg.llama_reserve_cells > 0 || cfg.tts || !cfg.tts_profiles.empty() || cfg.tts_lang != "de" ||
             cfg.tts_gen_device != "gpu" || !cfg.mmproj_path.empty())
             return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab/-gguf/-min-p, --llama-dflash/-gguf/-min-p/-ubatch, "
                         "--llama-kv, --llama-checkpoints/-step, "
-                        "--llama-expert-cache/-profile, --llama-layer-split, --llama-mtp-card, --llama-reserve-cells, --mmproj and --tts "
+                        "--llama-expert-cache/-profile, --llama-layer-split, --llama-mtp-card, --llama-dory-loops/-kv, --llama-reserve-cells, --mmproj and --tts "
                         "(-profiles/-lang/-gen-device) are options of "
                         "the libllama engine (--gguf), not of --stub");
         return {};

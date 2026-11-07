@@ -1,0 +1,82 @@
+Tests
+
+Folded from the old patches: 0092, 0093.
+
+test-backend-ops cases for the GDN replay chain pool and the rows-ids set.
+
+The old patch files (named in FOLDED.md) are history; the section for each old number
+in contrib/llama.cpp/README.md still describes its measurements. This file is the
+diff between the tree after the previous folded patch and the tree after this one;
+the sum of all folded patches is byte-identical to the old series applied in order.
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index d5425d4..7bdc75e 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -1273,6 +1273,10 @@ struct test_case {
+         GGML_UNUSED(ctx);
+     }
+ 
++    // patch 0092: the tensor budget of the case's context (upstream: 128). A case that builds a
++    // whole chain of launches in one graph (test_gdn_replay_chain) needs more.
++    virtual size_t max_tensors() { return 128; }
++
+     virtual size_t op_size(ggml_tensor * t) {
+         size_t size = ggml_nbytes(t);
+         // add source tensors
+@@ -1384,7 +1388,7 @@ struct test_case {
+         mode = MODE_TEST;
+ 
+         ggml_init_params params = {
+-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead(),
++            /* .mem_size = */ ggml_tensor_overhead()*max_tensors() + ggml_graph_overhead(),
+             /* .mem_base = */ NULL,
+             /* .no_alloc = */ true,
+         };
+@@ -1575,7 +1579,7 @@ struct test_case {
+         static const size_t graph_nodes = 8192;
+ 
+         ggml_init_params params = {
+-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(graph_nodes, false),
++            /* .mem_size = */ ggml_tensor_overhead()*max_tensors() + ggml_graph_overhead_custom(graph_nodes, false),
+             /* .mem_base = */ NULL,
+             /* .no_alloc = */ true,
+         };
+@@ -1725,7 +1729,7 @@ struct test_case {
+         static const size_t graph_nodes = 8192;
+ 
+         ggml_init_params params = {
+-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(graph_nodes, false),
++            /* .mem_size = */ ggml_tensor_overhead()*max_tensors() + ggml_graph_overhead_custom(graph_nodes, false),
+             /* .mem_base = */ NULL,
+             /* .no_alloc = */ true,
+         };
+@@ -1759,7 +1763,7 @@ struct test_case {
+         const std::vector<float> expect = grad_expect();
+ 
+         ggml_init_params params = {
+-            /* .mem_size = */ ggml_tensor_overhead()*128 + 2*ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true),
++            /* .mem_size = */ ggml_tensor_overhead()*max_tensors() + 2*ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true),
+             /* .mem_base = */ NULL,
+             /* .no_alloc = */ true,
+         };
+@@ -5190,6 +5194,7 @@ struct test_gdn_replay_chain : public test_case {
+     }
+ 
+     bool   run_whole_graph() override { return true; }
++    size_t max_tensors() override { return 4096; } // patch 0092: a chain of launches in one context
+     double max_nmse_err() override { return exact ? 0.0 : 1e-7; }
+ 
+     double err(const float * a, const float * b, size_t n) override {
+@@ -5422,8 +5427,10 @@ struct test_gated_delta_net : public test_case {
+             } else if (strcmp(t->name, "ids") == 0) {
+                 // a row that is neither 0 nor the sequence's ordinal, so a read of
+                 // seq instead of ids[seq] cannot pass the reference
+-                int32_t * p = (int32_t *) t->data;
++                // patch 0093: through the backend (t->data is a device address on a GPU backend)
++                std::vector<int32_t> p(t->ne[0]);
+                 for (int64_t s = 0; s < t->ne[0]; ++s) p[s] = (int32_t) (2 + s);
++                ggml_backend_tensor_set(t, p.data(), 0, p.size() * sizeof(int32_t));
+             } else {
+                 init_tensor_uniform(t);
+             }
