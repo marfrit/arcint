@@ -184,6 +184,16 @@ F32 weights of at most 256 rows (the delta-net's `ssm_alpha` / `ssm_beta`, a MoE
 - **Switch:** `GGML_OPENCL_F32_SKINNY=0`.
 - **Source:** arcint's own.
 
+### F32 weights multiplied through an f16 copy made at load
+
+Some GGUFs keep 2-D weights F32 (Gemma 4 E4B's per-layer-input projections `blk.N.proj` and `blk.N.inp_gate`, 220 MB). The backend had no fast F32 product: a prompt took ggml's F32 tiled GEMM or the skinny path, and decode read F32. When such a weight is written, the backend now keeps an f16 copy beside it and `MUL_MAT` runs the F16 kernels on the copy: the XMX GEMM from 16 columns, the f16 matvecs at 1 and 2-8. Gemma's values are bf16, which f16 holds exactly from 2^-17 up.
+- **Effect:** not yet measured; `inferred` 250-300 ms off a 6,656-token prefill on the B60 (+7-10 %) and less F32 traffic at decode (110 of about 3,000 MB a token).
+- **Applies to:** Intel; F32 2-D weights of at least 256 rows and a K of at least 256, not routers (`ffn_gate_inp`); from 16 columns sub-group 16 only (the A770 has no f16 XMX GEMM).
+- **Default:** on (`GGML_OPENCL_F32W_F16=0` off, `=2` prompts only).
+- **Location:** `ggml_cl_f16_copy_build` and `ggml_cl_mul_mat_f16_copy` in `ggml/src/ggml-opencl/ggml-opencl.cpp`; test `test_mul_mat_weight`. (0110)
+- **Switch:** `GGML_OPENCL_F32W_F16`.
+- **Source:** llama.cpp's Vulkan backend rounds F32 weights to f16 inside `matmul_f32_f32` on fp16 devices (`code`); here the copy is made once at load.
+
 ## 3. Expert routing and expert GEMM tiles
 
 How a MoE layer's (token, expert) pairs are turned into matrix products.
