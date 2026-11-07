@@ -18,6 +18,10 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## Unreleased
+
+- **Dory1.0-4B is admitted** (`dory`, NVIDIA's looped nGPT, 72 physical blocks x 2560, 16/4 heads, key length 256), not yet loaded or served here, with no card numbers. Patch 0108 ports llama.cpp PR 30306 (the architecture); patch 0109 lets the OpenCL `CPY` read a BF16 tensor, which the model's 217 BF16 scale vectors need to stay on the card. `--llama-dory-loops N` (1 to 4) and `--llama-dory-kv per_loop|last_loop` set the loop count and the recurrent KV layout; without them the file's own values serve, and the load log and `/props` `dory` say which value and where it came from. `--llama-mtp`, `--llama-dflash-gguf` and `--llama-layer-split` are refused for it at start. The start counts the KV cache layers libllama built (96 or 36 at 4 loops) and fails when the KV mode did not take effect; a context that is forecast not to fit the card logs a warning. The Qwen dialect covers its template.
+
 ## 1.6.0 — 2026-11-07
 
 Release gate against 1.5.4, same window (`measured-here`, RC 85f21213, 0105 measured in its own windows): llama-bench-style rows, Llama 2 7B Q4_0, A770 GT at 2000 MHz: served A770 2603.70 / 70.45, 2370.99 / 66.08 at q8_0:q4_0, B60 3987.50 / 80.73, 3802.14 / 78.82. Flash-Next and the agent pass; the agent's 255k needle is right at a peak of 24,133 MiB. The coder fails one cell, by the operator's acceptance: prefill at 41k 845 -> 962 t/s; decode a +5.6 %, b -6 %, c equal, with different texts, a verify's cost level, and draft acceptance equal over 24 prompts x 2 rounds; 12 answers 82.66 -> 81.95 t/s; the task 10/10 x3. KL against the file's CPU reference .00585 -> .00803, inside the bar.

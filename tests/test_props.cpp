@@ -277,6 +277,46 @@ TEST(llama_backend_publishes_the_projectors_own_caps) {
     CHECK(src.find("status_.mmproj_audio  = mcap.inp_audio;") != std::string::npos);
 }
 
+// A Dory model: /props names the loop count and the recurrent KV mode that SERVE with where each came
+// from (a flag or the file), and the physical and executed layer counts; null for any other model.
+TEST(props_reports_the_dory_loops_and_kv_mode) {
+    {
+        Config cfg;
+        cfg.llama_dory_loops = 2;
+        FakeBackend backend;
+        backend.st.loaded       = true;
+        backend.st.arch         = "dory";
+        backend.st.n_layer      = 72;
+        backend.st.dory_present = true;
+        backend.st.dory.loops           = 2;
+        backend.st.dory.kv_mode         = "last_loop";
+        backend.st.dory.loops_source    = "flag";
+        backend.st.dory.kv_source       = "gguf";
+        backend.st.dory.physical_layers = 72;
+        backend.st.dory.executed_layers = 112;
+        backend.st.dory.kv_layers       = 36;
+        SlotPool    slots(1);
+        Context     ctx{&cfg, &backend, &slots};
+        const nlohmann::json j = lgc::api::props(ctx);
+        const auto& d = j.at("dory");
+        CHECK_EQ(d.at("loops").get<int>(), 2);
+        CHECK_EQ(d.at("loops_source").get<std::string>(), std::string("flag"));
+        CHECK_EQ(d.at("recurrent_kv").get<std::string>(), std::string("last_loop"));
+        CHECK_EQ(d.at("recurrent_kv_source").get<std::string>(), std::string("gguf"));
+        CHECK_EQ(d.at("physical_layers").get<int>(), 72);
+        CHECK_EQ(d.at("executed_layers").get<int>(), 112);
+        CHECK_EQ(d.at("kv_cache_layers").get<int>(), 36);
+        CHECK_EQ(j.at("model").at("n_layer").get<int>(), 72);   // the weights' count, not the executed one
+    }
+    {
+        Config cfg;
+        FakeBackend backend;   // any other model
+        SlotPool    slots(1);
+        Context     ctx{&cfg, &backend, &slots};
+        CHECK(lgc::api::props(ctx).at("dory").is_null());
+    }
+}
+
 // --llama-dflash-gguf: /props says which drafter serves (one a context)
 TEST(props_reports_the_dflash_drafter) {
     {

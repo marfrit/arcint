@@ -532,6 +532,21 @@ json props(const Context& ctx) {
                     {"enabled", st.dflash_enabled},
                     // the drafter's own count: --llama-dflash capped by its trained block
                     {"drafts", st.dflash_drafts > 0 ? json(st.dflash_drafts) : json(nullptr)}}},
+        // A Dory model (looped nGPT, core/dory.h): the loop count and the recurrent KV mode that SERVE,
+        // each with where it came from ("flag", "gguf", or "default" for an absent key), and the
+        // physical block count against the layers executed (model.n_layer is the weights' count).
+        // Null on every other model.
+        {"dory", [&]() {
+             if (!st.dory_present) return json(nullptr);
+             return json{{"loops", st.dory.loops},
+                         {"loops_source", st.dory.loops_source},
+                         {"recurrent_kv", st.dory.kv_mode},
+                         {"recurrent_kv_source", st.dory.kv_source},
+                         {"physical_layers", st.dory.physical_layers},
+                         {"executed_layers", st.dory.executed_layers},
+                         // the KV cache layers libllama built, counted from its graph at load
+                         {"kv_cache_layers", st.dory.kv_layers}};
+         }()},
         {"sampler_defaults",
          {{"temperature", sd.temperature},
           {"top_p", sd.top_p},

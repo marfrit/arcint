@@ -13,6 +13,7 @@
 #include <nlohmann/json.hpp>
 #include "core/chat.h"
 #include "core/dialect.h"
+#include "core/dory.h"
 #include "core/sampling.h"
 
 // The seam between "arcint owns the serving" and "llama.cpp owns the math"
@@ -139,6 +140,11 @@ struct ModelStatus {
     bool        dflash_enabled = false;   // --llama-dflash-gguf: the DFlash2 drafter loaded
     int         dflash_drafts  = 0;       // its drafts a verify: --llama-dflash capped by its block
     uint64_t    weights_bytes = 0;
+    // A Dory model (core/dory.h): the loop count and recurrent KV mode that serve, each with
+    // where it came from, and the physical and executed layer counts. present is false for
+    // every other model and the stub, which /props prints as null.
+    bool       dory_present = false;
+    DoryServed dory;
 
     // The KV precision actually served, as --llama-kv set it ("f16", "q8_0",
     // "q8_0:q4_0"; config.h's llama_kv_dtype): /props reads this instead of

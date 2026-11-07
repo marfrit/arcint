@@ -108,7 +108,7 @@ minority are attention layers with a KV cache. The engine admits a GGUF by
 its own `general.architecture`: `qwen35`, `qwen35moe`, `qwen4exp`, and
 `llama` at two geometries only, Mistral Small 24B and Llama 2 7B (the model of
 the community llama-bench GPU tables, `tools/llama_scoreboard.py`), `gemma4` at
-the E4B geometry and `granite` at the 8B geometry only (`code`: the decision is
+the E4B geometry, `granite` at the 8B geometry and `dory` at the 1.0-4B geometry only (`code`: the decision is
 the pure function in `src/core/admission.cpp`, unit-tested with no model in
 `tests/test_admission.cpp`; the backend reads the numbers from the loaded
 model); anything else is refused at load, and an untested size of an admitted
@@ -156,6 +156,55 @@ claimed below is what the files and the code say.
   So it takes the Qwen dialect and needs no parser change; the think pair and
   the call pair are single special tokens in its vocabulary (`code`: the token
   table).
+- **Dory1.0-4B** (`dory`, NVIDIA's looped nGPT; admitted 2026-11-07 for the card
+  arm to measure, not yet loaded or served here; contrib/llama.cpp patches 0108
+  and 0109). `code`, read from the GGUF's metadata: 72 physical blocks (16
+  input, 40 recurrent, 16 output) of 2560 width, 16 query heads over 4 KV heads,
+  key length 256, a sliding window of 1,024 on three of every four attention
+  blocks, context trained 262,144, vocabulary 131,072, and the recurrent blocks
+  run `dory.num_loops` times (4 in the file) over the same weights. libllama's
+  `llama_model_n_layer` reports the executed count (112 at 2 loops, 192 at 4),
+  so admission matches the physical blocks (`llama_model_n_layer_physical`, patch
+  0108) and a geometry carrying the executed count is refused; the loop count is
+  not part of the identity. Two knobs change the computation, and both are the
+  operator's: `--llama-dory-loops N` (1 to 4) and `--llama-dory-kv per_loop|last_loop`
+  reach libllama as the metadata overrides `dory.num_loops` and
+  `dory.recurrent_kv_cache_mode`. With neither flag the file's own value serves;
+  the load log line and `/props` `dory` name the value that serves and where it
+  came from (`flag`, `gguf`, or `default` for an absent KV-mode key). After the load
+  the layer count libllama reports must equal 16 + 40 x loops + 16, or the start
+  fails (an override that did not take effect is not a quiet fallback). Refused at
+  start, from the GGUF's architecture and before the load: `--llama-mtp` (no head),
+  `--llama-dflash-gguf` (no drafter) and `--llama-layer-split` (the placement counts
+  the physical and the executed layers apart, a split of that is untested), and
+  the two dory flags on any other architecture. `last_loop` makes a token's hidden
+  state depend on where the chunk boundaries of its prefill fall (loop i attends to
+  loop i's KV inside the chunk and to the last loop's KV before it; upstream's own
+  test compares such a model only against the same batch), so equivalence across
+  chunk sizes is judged at the answer; `per_loop` has no such dependence. Prefix
+  reuse is exact as `swa_full` stays at the library default (the sliding-window
+  layers keep a full-length cache); context shift is off for this architecture
+  (`code`, patch 0108). The template is ChatML framing, the plain think pair (the
+  generation prompt ends inside the open block when thinking is on, which the
+  template defaults to) and the Qwen coder's function/parameter call form with the
+  arguments rendered from an object (`code`: the template text), so it takes the
+  Qwen dialect and the capability probe replays the arguments as an object;
+  `tests/test_chat_render.cpp` and `tests/test_toolcall.cpp` run that shape and
+  `tests/test_admission.cpp` pins the dialect.
+  The KV mode is confirmed the same way the loop count is: after the context, a
+  throwaway 256-cell context reserves a graph and the start counts its cache
+  tensors, which must be 96 at 4 loops under `per_loop` (8 + 20 x 4 + 8 attention
+  blocks) and 36 under `last_loop`, or the start fails (`dory_check_kv`). A file that
+  carries per-tensor `.scale` tensors is refused by the patch (the generic scale pass
+  would read them by executed layer). Sizing (`code`, arithmetic on the GGUF's
+  numbers; 4 KV heads of 256, the sliding layers kept at full length by `swa_full`):
+  the default context of 32,768 cells costs 12.0 GiB at f16 over 96 layers, 4.9 GiB at
+  `q8_0:q4_0`, and 4.5 GiB at f16 under `last_loop` (36 layers); the Q5_K_M file is
+  3.4 GiB. On the A770 (16 GiB) f16 at 4 loops per_loop is 15.4 GiB with the weights and
+  does not fit with the compute buffers; `q8_0:q4_0` (8.3 GiB) does. The B60 (24 GiB)
+  holds the f16 default. The start logs a warning when weights plus cache exceed 92 % of
+  the card's OpenCL global memory (`dory_fit_warning`): a forecast against the total,
+  because arcint cannot read an OpenCL card's free memory; it is not a refusal.
 
 | service | model | architecture | served file | card |
 |---|---|---|---|---|

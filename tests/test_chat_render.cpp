@@ -1,5 +1,6 @@
 #include "core/chat.h"
 #include "core/dialect.h"
+#include "core/markers.h"
 #include "exec/chat_json.h"
 #include "harness.h"
 
@@ -168,4 +169,55 @@ TEST(gemma4_replays_tool_call_arguments_as_an_object) {
     CHECK_EQ(render(ChatDialect::Gemma4), std::string("OBJ:Kassel"));
     CHECK_EQ(render(ChatDialect::Qwen), std::string("STR:{\"city\":\"Kassel\"}"));
     CHECK_EQ(render(ChatDialect::Extended), std::string("STR:{\"city\":\"Kassel\"}"));
+}
+
+// Dory1.0-4B's template (read from the GGUF, not committed): ChatML framing, an assistant turn replayed
+// with its calls as `<tool_call>\n<function=NAME>\n<parameter=K>\nV\n</parameter>\n</function>\n</tool_call>`
+// from `tool_call.arguments|items` (so the arguments must reach it as an object), and a generation prompt
+// that ends inside an open think block when thinking is on (the template's default) and carries an empty
+// pair when it is off. This is its shape reduced to those branches. The Qwen dialect renders it through
+// minja's own capability probe, with no parser or dialect change.
+TEST(dory_template_shape_renders_under_the_qwen_dialect) {
+    const std::string start(markers::kTurnStart), end(markers::kTurnEnd);
+    const std::string open(markers::kThinkOpen), close(markers::kThinkClose);
+    const std::string src =
+        "{%- for message in messages -%}{%- if message.tool_calls is defined and message.tool_calls | length > 0 -%}"
+        "{{- '" + start + R"(assistant\n' -}})"
+        "{%- for tool_call in message.tool_calls -%}"
+        "{%- if tool_call.function is defined -%}{%- set tool_call = tool_call.function -%}{%- endif -%}"
+        R"({{- '<tool_call>\n<function=' ~ tool_call.name ~ '>\n' -}})"
+        "{%- if tool_call.arguments is defined -%}{%- for args_name, args_value in tool_call.arguments|items -%}"
+        R"({{- '<parameter=' ~ args_name ~ '>\n' ~ args_value | string ~ '\n</parameter>\n' -}})"
+        R"({%- endfor -%}{%- endif -%}{{- '</function>\n</tool_call>\n' -}}{%- endfor -%}{{- ')" + end + R"(\n' -}})"
+        "{%- endif -%}{%- endfor -%}"
+        "{%- if add_generation_prompt -%}{%- set enable_thinking = enable_thinking if enable_thinking is defined else True -%}"
+        "{%- if enable_thinking -%}{{- '" + start + "assistant\\n" + open + R"(\n' -}})"
+        "{%- else -%}{{- '" + start + "assistant\\n" + open + close + "' -}}{%- endif -%}{%- endif -%}";
+    minja::chat_template tmpl(src, "", "");
+    ChatRequest req;
+    ChatMessage a;
+    a.role = "assistant";
+    ToolCall c;
+    c.id        = "call_0";
+    c.name      = "get_weather";
+    c.arguments = R"({"city":"Kassel"})";
+    a.tool_calls.push_back(c);
+    req.messages.push_back(a);
+    minja::chat_template_options opts;
+    opts.apply_polyfills = false;
+    const ChatDialect d = ChatDialect::Qwen;
+    // `|items` on a string fails, so the probe finds the template wants an object, and the Qwen dialect
+    // (which does not force one) still replays it as one
+    CHECK(tmpl.original_caps().requires_object_arguments);
+    CHECK(!d.replays_arguments_as_object());
+    minja::chat_template_inputs in;
+    in.messages = chat_messages_json(req, tmpl.original_caps().requires_object_arguments || d.replays_arguments_as_object());
+    in.add_generation_prompt = true;
+    CHECK_EQ(tmpl.apply(in, opts),
+             start + "assistant\n<tool_call>\n<function=get_weather>\n<parameter=city>\nKassel\n</parameter>\n"
+             "</function>\n</tool_call>\n" + end + "\n" + start + "assistant\n" + open + "\n");
+    // thinking off: the empty pair, which the Qwen dialect's think splitter reads as an empty block
+    in.extra_context = nlohmann::ordered_json{{"enable_thinking", false}};
+    CHECK(tmpl.apply(in, opts).find(start + "assistant\n" + open + close) != std::string::npos);
+    CHECK(d.thinks_by_default());   // an unset request is the thinking branch, as this template defaults
 }

@@ -754,6 +754,41 @@ TEST(config_llama_layer_split) {
     }
 }
 
+// Dory (a looped nGPT): the loop count and the recurrent KV mode. Unset serves the GGUF's own.
+TEST(config_llama_dory_loops_and_kv) {
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/d.gguf"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dory_loops, 0);          // the file's own
+        CHECK(cfg.llama_dory_kv.empty());
+    }
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/d.gguf", "--llama-dory-loops", "2", "--llama-dory-kv", "last_loop"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dory_loops, 2);
+        CHECK_EQ(cfg.llama_dory_kv, std::string("last_loop"));
+    }
+    for (const char* n : {"1", "3", "4"}) {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/d.gguf", "--llama-dory-loops", n}, cfg).ok);
+    }
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/d.gguf", "--llama-dory-kv", "per_loop"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dory_kv, std::string("per_loop"));
+    }
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-loops", "0"}));
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-loops", "5"}));
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-loops", "-1"}));
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-loops", "x"}));
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-loops"}));
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-kv", "shared"}));
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-kv", ""}));
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-kv"}));
+    CHECK(rejected({"--stub", "--llama-dory-loops", "2"}));   // options of the libllama engine only
+    CHECK(rejected({"--stub", "--llama-dory-kv", "per_loop"}));
+}
+
 // --llama-expert-cache A,B: a cache per card, in --device order
 TEST(config_llama_expert_cache_per_card) {
     {

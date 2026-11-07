@@ -1,0 +1,681 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Markus Fritsche <mfritsche@reauktion.de>
+Date: Sat, 7 Nov 2026 12:00:00 +0000
+Subject: [PATCH] 0108-dory-looped-ngpt
+
+---
+ common/fit.cpp             |   2 +-
+ src/llama-arch.cpp         |  24 ++++++
+ src/llama-arch.h           |  17 ++++
+ src/llama-context.cpp      |   9 +-
+ src/llama-ext.h            |   3 +
+ src/llama-kv-cache.cpp     |   4 +
+ src/llama-model-loader.cpp |   5 ++
+ src/llama-model-saver.cpp  |   1 +
+ src/llama-model.cpp        |  37 +++++---
+ src/llama-model.h          |   4 +
+ src/llama-quant.cpp        |   9 ++
+ src/models/dory.cpp        | 209 +++++++++++++++++++++++++++++++++++++++++++++
+ src/models/models.h        |  29 +++++++
+ tests/test-llama-archs.cpp |   6 ++
+ 14 files changed, 344 insertions(+), 15 deletions(-)
+
+diff --git a/common/fit.cpp b/common/fit.cpp
+index 7a03008..95b54ab 100644
+--- a/common/fit.cpp
++++ b/common/fit.cpp
+@@ -137,7 +137,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
+         devs.push_back(llama_model_get_device(model, i));
+     }
+ 
+-    hp_ngl         = llama_model_n_layer(model);
++    hp_ngl         = llama_model_n_layer_physical(model);
+     if (mparams->load_mtp) {
+         hp_ngl    += llama_model_n_layer_nextn(model);
+     }
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index d1dd4cb..883ce0f 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -6,6 +6,7 @@
+ #include <vector>
+ 
+ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
++    { LLM_ARCH_DORY,             "dory"             },
+     { LLM_ARCH_CLIP,             "clip"             }, // dummy, only used by llama-quantize
+     { LLM_ARCH_LLAMA,            "llama"            },
+     { LLM_ARCH_LLAMA4,           "llama4"           },
+@@ -254,6 +255,16 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+     { LLM_KV_INTERLEAVE_MOE_LAYER_STEP,         "%s.interleave_moe_layer_step"         },
+     { LLM_KV_FULL_ATTENTION_INTERVAL,           "%s.full_attention_interval"           },
+     { LLM_KV_NUM_LOOPS,                         "%s.num_loops"                         },
++    { LLM_KV_INPUT_LAYER_COUNT,                 "%s.input_layer_count"                 },
++    { LLM_KV_RECURRENT_LAYER_COUNT,             "%s.recurrent_layer_count"             },
++    { LLM_KV_OUTPUT_LAYER_COUNT,                "%s.output_layer_count"                },
++    { LLM_KV_RECURRENT_KV_CACHE_MODE,            "%s.recurrent_kv_cache_mode"            },
++    { LLM_KV_LAYER_PATTERN,                     "%s.layer_pattern"                     },
++    { LLM_KV_ROPE_PROFILE,                      "%s.rope.profile"                      },
++    { LLM_KV_ROPE_FREQ_BASE_2,                   "%s.rope.freq_base_2"                   },
++    { LLM_KV_INIT_STD,                          "%s.init_std"                          },
++    { LLM_KV_ALPHA_INIT,                        "%s.alpha_init"                        },
++    { LLM_KV_GATE_INIT,                         "%s.gate_init"                         },
+     { LLM_KV_SKIP_LOOP_FINAL_NORM,              "%s.skip_loop_final_norm"              },
+     { LLM_KV_HRM_LAYERS_PER_STACK,              "%s.hrm.layers_per_stack"              },
+     { LLM_KV_HRM_H_CYCLES,                      "%s.hrm.h_cycles"                      },
+@@ -472,6 +483,12 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+ };
+ 
+ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
++    { LLM_TENSOR_RESIDUAL_ALPHA,                         "blk.%d.residual_alpha" },
++    { LLM_TENSOR_ATTN_QK_SCALE,                          "blk.%d.attn_qk_scale" },
++    { LLM_TENSOR_ATTN_GATE_SCALE,                        "blk.%d.attn_gate_scale" },
++    { LLM_TENSOR_FFN_GATE_SCALE,                         "blk.%d.ffn_gate_scale" },
++    { LLM_TENSOR_FFN_UP_SCALE,                           "blk.%d.ffn_up_scale" },
++    { LLM_TENSOR_OUTPUT_SCALE,                          "output_scale" },
+     { LLM_TENSOR_TOKEN_EMBD,                             "token_embd" },
+     { LLM_TENSOR_OUTPUT_NORM,                            "output_norm" },
+     { LLM_TENSOR_OUTPUT_NORM_LFM2,                       "token_embd_norm" }, // fix for wrong tensor name
+@@ -797,6 +814,12 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+ // example: https://github.com/ggml-org/llama.cpp/pull/17548
+ //
+ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
++    {LLM_TENSOR_RESIDUAL_ALPHA,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_CPY}},
++    {LLM_TENSOR_ATTN_QK_SCALE,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_CPY}},
++    {LLM_TENSOR_ATTN_GATE_SCALE,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_CPY}},
++    {LLM_TENSOR_FFN_GATE_SCALE,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_CPY}},
++    {LLM_TENSOR_FFN_UP_SCALE,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_CPY}},
++    {LLM_TENSOR_OUTPUT_SCALE,              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_CPY}},
+     {LLM_TENSOR_TOKEN_EMBD,                 {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
+     {LLM_TENSOR_POS_EMBD,                   {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
+     {LLM_TENSOR_TOKEN_TYPES,                {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
+@@ -1266,6 +1289,7 @@ bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
+ 
+ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
+     switch (arch) {
++        case LLM_ARCH_DORY:
+         case LLM_ARCH_GROK:
+         case LLM_ARCH_MPT:
+         case LLM_ARCH_PLAMO2:
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index 4e8e534..84d19c3 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -11,6 +11,7 @@
+ //
+ 
+ enum llm_arch {
++    LLM_ARCH_DORY,
+     LLM_ARCH_CLIP,
+     LLM_ARCH_LLAMA,
+     LLM_ARCH_LLAMA4,
+@@ -259,6 +260,16 @@ enum llm_kv {
+     LLM_KV_INTERLEAVE_MOE_LAYER_STEP,
+     LLM_KV_FULL_ATTENTION_INTERVAL,
+     LLM_KV_NUM_LOOPS,
++    LLM_KV_INPUT_LAYER_COUNT,
++    LLM_KV_RECURRENT_LAYER_COUNT,
++    LLM_KV_OUTPUT_LAYER_COUNT,
++    LLM_KV_RECURRENT_KV_CACHE_MODE,
++    LLM_KV_LAYER_PATTERN,
++    LLM_KV_ROPE_PROFILE,
++    LLM_KV_ROPE_FREQ_BASE_2,
++    LLM_KV_INIT_STD,
++    LLM_KV_ALPHA_INIT,
++    LLM_KV_GATE_INIT,
+     LLM_KV_SKIP_LOOP_FINAL_NORM,
+     LLM_KV_HRM_LAYERS_PER_STACK,
+     LLM_KV_HRM_H_CYCLES,
+@@ -476,6 +487,12 @@ enum llm_kv {
+ };
+ 
+ enum llm_tensor {
++    LLM_TENSOR_RESIDUAL_ALPHA,
++    LLM_TENSOR_ATTN_QK_SCALE,
++    LLM_TENSOR_ATTN_GATE_SCALE,
++    LLM_TENSOR_FFN_GATE_SCALE,
++    LLM_TENSOR_FFN_UP_SCALE,
++    LLM_TENSOR_OUTPUT_SCALE,
+     LLM_TENSOR_TOKEN_EMBD,
+     LLM_TENSOR_TOKEN_EMBD_NORM,
+     LLM_TENSOR_TOKEN_TYPES,
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index f61c06a..c9e4acb 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -527,7 +527,7 @@ llama_context::llama_context(
+         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+         bool pipeline_parallel =
+             model.n_devices() > 1 &&
+-            model.n_gpu_layers() > model.hparams.n_layer_all &&
++            model.n_gpu_layers() > model.n_layer_physical() &&
+             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
+             cparams.offload_kqv &&
+             !model.has_tensor_overrides() &&
+@@ -3600,7 +3600,10 @@ void llama_context::output_reorder() {
+ 
+ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+     uint32_t res;
+-    if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_GLM5_NEXT) {
++    if (model.arch == LLM_ARCH_DORY) {
++        // Shared weights do not reflect the expanded recurrent graph size.
++        res = std::max<uint32_t>(1024u, 128u * model.hparams.n_layer());
++    } else if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_GLM5_NEXT) {
+         // the n_tokens*40 budget below is exhausted at ubatch 3840
+         res = std::max<uint32_t>(n_tokens * 160, 64u * model.n_tensors());
+     } else if (model.arch == LLM_ARCH_HRM_TEXT) {
+@@ -3949,7 +3952,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
+         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
+         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
+         // FIXME: fix in ggml_backend_sched
+-        const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
++        const bool full_offload = model.n_gpu_layers() > model.n_layer_physical();
+         if (ubatch.n_tokens < 32 || full_offload) {
+             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
+                 const auto & dev_layer = model.dev_layer(il);
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index ab8be70..c64761e 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -17,6 +17,9 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
+         uint32_t n_seqs,
+         uint32_t n_outputs);
+ 
++// Physical weight blocks, excluding MTP, for offload fitting. Repeated executions do not add weights.
++LLAMA_API int32_t llama_model_n_layer_physical(const struct llama_model * model);
++
+ // Get the default ggml_type for a given ftype.
+ LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index a43fb7d..92ca529 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1422,6 +1422,10 @@ bool llama_kv_cache::set_seq_windows(const uint32_t * n_cells, int32_t n_seq) {
+ }
+ 
+ bool llama_kv_cache::get_can_shift() const {
++    // Dory uses physical-layer RoPE profiles and post-RoPE normalization.
++    if (model.arch == LLM_ARCH_DORY) {
++        return false;
++    }
+     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
+     if (model.arch == LLM_ARCH_STEP35) {
+         return false;
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index fbb11c2..2bb2f0b 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -414,6 +414,7 @@ namespace GGUFMeta {
+     template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
+     template bool llama_model_loader::get_arr<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, bool required);
+     template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv kid, std::vector<uint32_t> & result, bool required);
++    template bool llama_model_loader::get_arr<uint32_t>(const std::string & key, std::vector<uint32_t> & result, bool required);
+     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_NGRAM> & result, bool required);
+     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_HEADS>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_HEADS> & result, bool required);
+ 
+@@ -1049,6 +1050,10 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
+                 ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_embd_inp, w->ne[1], 1, 1);
+                 op_tensor = ggml_im2col(ctx, w, b, 1, 0, 0, 0, 1, 0, false, GGML_TYPE_F16);
+             } break;
++        case GGML_OP_CPY:
++            {
++                op_tensor = ggml_cast(ctx, w, GGML_TYPE_F32);
++            } break;
+         case GGML_OP_SCALE:
+             {
+                 op_tensor = ggml_scale(ctx, w, 1.0f);
+diff --git a/src/llama-model-saver.cpp b/src/llama-model-saver.cpp
+index e011e24..55dd45c 100644
+--- a/src/llama-model-saver.cpp
++++ b/src/llama-model-saver.cpp
+@@ -15,6 +15,7 @@
+ 
+ bool llama_model_saver_supports_arch(llm_arch arch) {
+     switch (arch) {
++        case LLM_ARCH_DORY: // physical weights and executed layers differ in count; a saved file would carry the unrolled one
+         case LLM_ARCH_GEMMA3N:
+         case LLM_ARCH_BITNET:
+         case LLM_ARCH_T5:
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 7ee95a7..d96673d 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -45,6 +45,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+     switch (arch) {
+         case LLM_ARCH_CLIP:
+             return new llama_model_clip(params);
++        case LLM_ARCH_DORY:
++            return new llama_model_dory(params);
+         case LLM_ARCH_LLAMA:
+             return new llama_model_llama(params);
+         case LLM_ARCH_LLAMA4:
+@@ -1568,6 +1570,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     const auto & tensor_split = params.tensor_split;
+ 
+     const int n_layer_all = hparams.n_layer_all;
++    const int n_layer_physical = this->n_layer_physical();
+     const int n_gpu_layers = this->n_gpu_layers();
+ 
+     const bool use_mmap_buffer = true;
+@@ -1651,8 +1654,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         splits[i] = split_sum != 0.0f ? splits[i] / split_sum : float(i + 1) / n_devices();
+     }
+ 
+-    const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
+-    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
++    const int i_gpu_start = std::max(n_layer_physical + 1 - n_gpu_layers, 0);
++    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_physical + 1);
+     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
+         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
+         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
+@@ -1670,13 +1673,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+ 
+     // assign the repeating layers to the devices according to the splits
+-    pimpl->dev_layer.resize(n_layer_all);
+-    for (int il = 0; il < n_layer_all; ++il) {
++    pimpl->dev_layer.resize(n_layer_physical);
++    for (int il = 0; il < n_layer_physical; ++il) {
+         pimpl->dev_layer[il] = get_layer_buft_list(il);
+     }
+ 
+     // assign the output layer
+-    pimpl->dev_output = get_layer_buft_list(n_layer_all);
++    pimpl->dev_output = get_layer_buft_list(n_layer_physical);
+ 
+     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
+ 
+@@ -1974,7 +1977,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     }
+ 
+     if (llama_supports_gpu_offload()) {
+-        const int n_gpu = std::min(n_gpu_layers, n_layer_all);
++        const int n_gpu = std::min(n_gpu_layers, n_layer_physical + 1);
+ 
+         int n_repeating = n_gpu;
+         if (n_repeating > 0) {
+@@ -1983,8 +1986,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+         LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_repeating);
+ 
+-        const int max_backend_supported_layers = n_layer_all + 1;
+-        const int max_offloadable_layers       = n_layer_all + 1;
++        const int max_backend_supported_layers = n_layer_physical + 1;
++        const int max_offloadable_layers       = n_layer_physical + 1;
+ 
+         LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
+     }
+@@ -2511,7 +2514,7 @@ const float * llama_model::tensor_split() const {
+ 
+ uint32_t llama_model::n_gpu_layers() const {
+     // note: plus 1 for the "output" layer
+-    return params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer_all + 1;
++    return params.n_gpu_layers >= 0 ? params.n_gpu_layers : n_layer_physical() + 1;
+ }
+ 
+ llama_split_mode llama_model::split_mode() const {
+@@ -2766,7 +2769,7 @@ void llama_model::print_info() const {
+ }
+ 
+ ggml_backend_dev_t llama_model::dev_layer(int il) const {
+-    return pimpl->dev_layer.at(il).dev;
++    return pimpl->dev_layer.at(layer_physical(il)).dev;
+ }
+ 
+ ggml_backend_dev_t llama_model::dev_output() const {
+@@ -2815,7 +2818,7 @@ static ggml_backend_buffer_type_t select_buft(const buft_list_t & buft_list, con
+ 
+ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
+     return ::select_buft(
+-            *pimpl->dev_layer.at(il).buft_list,
++            *pimpl->dev_layer.at(layer_physical(il)).buft_list,
+             [&](ggml_context * ctx) {
+                 ggml_tensor * cur = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hparams.n_embd);
+                 ggml_tensor * layer_dir = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hparams.n_embd);
+@@ -3306,6 +3309,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                     llama_memory_i::layer_reuse_cb reuse = nullptr;
+                     llama_kv_cache::layer_share_cb share = nullptr;
+ 
++                    if (arch == LLM_ARCH_DORY) {
++                        filter = [&](uint32_t il) {
++                            const auto & dory = static_cast<const llama_model_dory &>(*this);
++                            return hparams.n_head_kv(il) > 0 && dory.cache_layer[il] == (int) il;
++                        };
++                    }
++
+                     if (arch == LLM_ARCH_GEMMA3N || arch == LLM_ARCH_GEMMA4) {
+                         reuse = [&](uint32_t il) {
+                             GGML_ASSERT(hparams.n_layer_kv_from_start >= 2);
+@@ -3499,6 +3509,10 @@ int32_t llama_model_n_layer(const llama_model * model) {
+     return model->hparams.n_layer();
+ }
+ 
++int32_t llama_model_n_layer_physical(const llama_model * model) {
++    return model->n_layer_physical() - model->hparams.n_layer_nextn;
++}
++
+ int32_t llama_model_n_layer_nextn(const llama_model * model) {
+     return model->hparams.n_layer_nextn;
+ }
+@@ -3638,6 +3652,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+             return LLAMA_ROPE_TYPE_NORM;
+ 
+         // the pairs of head values are offset by n_rot/2
++        case LLM_ARCH_DORY:
+         case LLM_ARCH_FALCON:
+         case LLM_ARCH_FALCON_H1:
+         case LLM_ARCH_GROK:
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 1c72cfb..c8f9f0f 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -864,6 +864,10 @@ struct llama_model {
+     uint32_t n_gpu_layers() const;
+     llama_split_mode split_mode() const;
+ 
++    // Weight placement uses physical blocks; graph and KV indices use execution layers.
++    virtual uint32_t n_layer_physical() const { return hparams.n_layer_all; }
++    virtual int layer_physical(int il) const { return il; }
++
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+ 
+     // total number of parameters in the model
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index 9c60667..20f0d63 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -943,6 +943,15 @@ static void init_quantize_state_counters(quantize_state_impl & qs, std::vector<t
+         }
+     }
+     qs.n_ffn_down = qs.n_ffn_gate = qs.n_ffn_up = (int)qs.model.hparams.n_layer_all;
++    if (qs.model.arch == LLM_ARCH_DORY) {
++        // The mixed recipe counts physical FFNs, not recurrent cache slots.
++        qs.n_ffn_down = qs.n_ffn_gate = qs.n_ffn_up = 0;
++        for (const auto & tm : metadata) {
++            if (tm.category == tensor_category::FFN_DOWN) { ++qs.n_ffn_down; }
++            if (tm.category == tensor_category::FFN_GATE) { ++qs.n_ffn_gate; }
++            if (tm.category == tensor_category::FFN_UP)   { ++qs.n_ffn_up; }
++        }
++    }
+ }
+ 
+ //
+diff --git a/src/models/dory.cpp b/src/models/dory.cpp
+new file mode 100644
+index 0000000..e450789
+--- /dev/null
++++ b/src/models/dory.cpp
+@@ -0,0 +1,209 @@
++#include "models.h"
++
++#include <stdexcept>
++
++void llama_model_dory::load_arch_hparams(llama_model_loader & ml) {
++    ml.get_key(LLM_KV_INPUT_LAYER_COUNT, n_input);
++    ml.get_key(LLM_KV_RECURRENT_LAYER_COUNT, n_recurrent);
++    ml.get_key(LLM_KV_OUTPUT_LAYER_COUNT, n_output);
++    ml.get_key(LLM_KV_NUM_LOOPS, n_loops);
++    ml.get_key(LLM_KV_RECURRENT_KV_CACHE_MODE, recurrent_kv_cache_mode, false);
++    if (recurrent_kv_cache_mode != "per_loop" && recurrent_kv_cache_mode != "last_loop") {
++        throw std::runtime_error("Dory recurrent_kv_cache_mode must be per_loop or last_loop");
++    }
++    ml.get_key(LLM_KV_LAYER_PATTERN, pattern);
++    uint32_t n_profile = 0;
++    ml.get_arr_n(LLM_KV_ROPE_PROFILE, n_profile);
++    if (n_profile > LLAMA_MAX_LAYERS) {
++        throw std::runtime_error("Dory RoPE profile is too large");
++    }
++    ml.get_arr(LLM_KV_ROPE_PROFILE, profile);
++    ml.get_key(LLM_KV_INIT_STD, init_std);
++    ml.get_key(LLM_KV_ALPHA_INIT, alpha_init);
++    ml.get_key(LLM_KV_GATE_INIT, gate_init);
++    ml.get_key(LLM_KV_ROPE_FREQ_BASE, theta_1);
++    ml.get_key(LLM_KV_ROPE_FREQ_BASE_2, theta_2);
++    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa);
++
++    const uint64_t n_physical = uint64_t(n_input) + n_recurrent + n_output;
++    const uint64_t n_virtual = uint64_t(n_input) + uint64_t(n_recurrent)*n_loops + n_output;
++    if (!n_input || !n_recurrent || !n_output || !n_loops || n_loops > 4 ||
++            n_virtual > LLAMA_MAX_LAYERS || n_physical != hparams.n_layer_all ||
++            pattern.size() != n_physical || profile.size() != n_physical ||
++            pattern.find_first_not_of("S*-") != std::string::npos ||
++            !(init_std > 0 && std::isfinite(init_std)) ||
++            !(alpha_init > 0 && std::isfinite(alpha_init)) ||
++            !(gate_init > 0 && std::isfinite(gate_init)) ||
++            !(theta_1 > 0 && std::isfinite(theta_1)) || !(theta_2 > 0 && std::isfinite(theta_2)) ||
++            !hparams.n_swa || pattern.find('S') == std::string::npos || pattern.find('*') == std::string::npos) {
++        throw std::runtime_error("unsupported or invalid Dory recurrence metadata");
++    }
++    const auto nh = hparams.n_head(0);
++    const auto nk = hparams.n_head_kv(0);
++    if (!nh || !nk || nh % nk || !hparams.n_embd_head_k() ||
++            hparams.n_embd_head_k() != hparams.n_embd_head_v() || hparams.n_rot() != hparams.n_embd_head_k()) {
++        throw std::runtime_error("invalid Dory attention dimensions");
++    }
++    const auto nf = hparams.n_ff(0);
++    if (!nf) {
++        throw std::runtime_error("invalid Dory feed-forward dimension");
++    }
++    for (auto p : profile) {
++        if (p < 1 || p > 2) {
++            throw std::runtime_error("invalid Dory RoPE profile");
++        }
++    }
++    for (uint32_t i = 0; i < n_input; ++i) {
++        physical.push_back(i);
++    }
++    for (uint32_t k = 0; k < n_loops; ++k) {
++        for (uint32_t i = 0; i < n_recurrent; ++i) {
++            physical.push_back(n_input + i);
++        }
++    }
++    for (uint32_t i = 0; i < n_output; ++i) {
++        physical.push_back(n_input + n_recurrent + i);
++    }
++    hparams.n_layer_all = n_virtual;
++    hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
++    hparams.rope_freq_base_train_swa = theta_2;
++    for (uint32_t il = 0; il < n_virtual; ++il) {
++        const uint32_t p = physical[il];
++        const bool recurrent = p >= n_input && p < n_input + n_recurrent;
++        cache_layer.push_back(recurrent && recurrent_kv_cache_mode == "last_loop" ? p : il);
++        hparams.n_head_arr[il] = nh;
++        hparams.n_head_kv_arr[il] = pattern[p] == '-' ? 0 : nk;
++        hparams.n_ff_arr[il] = nf;
++        hparams.is_swa_impl[il] = pattern[p] == 'S';
++        hparams.rope_pattern[il] = profile[p] != 0 && pattern[p] != '-';
++    }
++    type = LLM_TYPE_UNKNOWN;
++}
++
++void llama_model_dory::load_arch_tensors(llama_model_loader & ml) {
++    LLAMA_LOAD_LOCALS;
++    // the generic pass after this function loads optional per-tensor ".scale" tensors by EXECUTED layer
++    // index, so a looped copy would pick up the scale of whichever physical block sits at that index
++    // (the output blocks' for the recurrent copies). The published file has none; one that does is refused
++    for (const auto & w : ml.weights_map) {
++        const std::string & n = w.first;
++        if (n.size() > 6 && n.compare(n.size() - 6, 6, ".scale") == 0) {
++            throw std::runtime_error("Dory does not support per-tensor .scale tensors (" + n + ")");
++        }
++    }
++    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
++    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, 0);
++    logit_scale = create_tensor(tn(LLM_TENSOR_OUTPUT_SCALE, "weight"), {n_vocab}, 0);
++    scale.resize(n_layer);
++    std::vector<int> first(pattern.size(), -1);
++    for (int il = 0; il < n_layer; ++il) {
++        const int p = physical[il];
++        if (first[p] >= 0) {
++            layers[il] = layers[first[p]];
++            scale[il] = scale[first[p]];
++            continue;
++        }
++        first[p] = il;
++        auto & l = layers[il];
++        auto & s = scale[il];
++        s.alpha = create_tensor(tn(LLM_TENSOR_RESIDUAL_ALPHA, "weight", p), {n_embd}, 0);
++        if (pattern[p] == '-') {
++            l.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", p), {n_embd, n_ff}, 0);
++            l.ffn_up = create_tensor(tn(LLM_TENSOR_FFN_UP, "weight", p), {n_embd, n_ff}, 0);
++            l.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", p), {n_ff, n_embd}, 0);
++            s.suv_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE_SCALE, "weight", p), {n_ff}, 0);
++            s.suv_up = create_tensor(tn(LLM_TENSOR_FFN_UP_SCALE, "weight", p), {n_ff}, 0);
++        } else {
++            const int64_t nq = n_head * n_embd_head_k;
++            const int64_t nkv = hparams.n_head_kv(il) * n_embd_head_k;
++            l.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", p), {n_embd, nq}, 0);
++            l.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", p), {n_embd, nkv}, 0);
++            l.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", p), {n_embd, nkv}, 0);
++            l.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", p), {nq, n_embd}, 0);
++            l.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", p), {n_embd, nq}, 0);
++            s.sqk = create_tensor(tn(LLM_TENSOR_ATTN_QK_SCALE, "weight", p), {nq}, 0);
++            s.gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE_SCALE, "weight", p), {nq}, 0);
++        }
++    }
++}
++
++std::unique_ptr<llm_graph_context> llama_model_dory::build_arch_graph(const llm_graph_params & params) const {
++    return std::make_unique<graph>(*this, params);
++}
++
++llama_model_dory::graph::graph(const llama_model_dory & model, const llm_graph_params & params) : llm_graph_context(params) {
++    ggml_tensor * cur = build_inp_embd(model.tok_embd);
++    ggml_tensor * pos = build_inp_pos();
++    ggml_tensor * out_ids = build_inp_out_ids();
++    auto * attn = build_attn_inp_kv_iswa();
++    ggml_tensor * input_h = nullptr;
++    const int recurrent_end = model.n_input + model.n_recurrent * model.n_loops;
++    const auto norm = [&](ggml_tensor * x) { return build_gdn_l2_norm(ctx0, x, 1e-6f); };
++    const auto f32 = [&](ggml_tensor * x) { return x->type == GGML_TYPE_F32 ? x : ggml_cast(ctx0, x, GGML_TYPE_F32); };
++
++    for (int il = 0; il < n_layer; ++il) {
++        const int p = model.physical[il];
++        const auto & l = model.layers[il];
++        const auto & s = model.scale[il];
++        if (il == (int) model.n_input) {
++            input_h = cur;
++        }
++        if (il >= (int) model.n_input && il < recurrent_end && (il - model.n_input) % model.n_recurrent == 0) {
++            cur = norm(ggml_add(ctx0, cur, input_h));
++        }
++        ggml_tensor * residual = cur;
++        if (model.pattern[p] == '-') {
++            auto * g = build_lora_mm(l.ffn_gate, cur);
++            auto * u = build_lora_mm(l.ffn_up, cur);
++            g = ggml_mul(ctx0, g, ggml_scale(ctx0, f32(s.suv_gate), sqrtf(n_embd)));
++            u = ggml_mul(ctx0, u, ggml_scale(ctx0, f32(s.suv_up), sqrtf(n_embd)));
++            cur = norm(ggml_mul(ctx0, ggml_silu(ctx0, g), u));
++            cur = build_lora_mm(l.ffn_down, cur);
++        } else {
++            const auto hd = hparams.n_embd_head_k(il);
++            const auto nh = hparams.n_head(il);
++            const auto nk = hparams.n_head_kv(il);
++            auto [q, k, v] = build_qkv(l, cur, hd, nh, nk, il);
++            if (model.profile[p] != 0) {
++                const float theta = model.profile[p] == 2 ? model.theta_2 : model.theta_1;
++                q = ggml_rope_ext(ctx0, q, pos, nullptr, hd, rope_type, n_ctx_orig, theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
++                k = ggml_rope_ext(ctx0, k, pos, nullptr, hd, rope_type, n_ctx_orig, theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
++            }
++            auto * sq = ggml_sqr(ctx0, ggml_scale(ctx0, f32(s.sqk), sqrtf(hd) / model.init_std));
++            q = ggml_mul(ctx0, norm(q), ggml_reshape_3d(ctx0, sq, hd, nh, 1));
++            k = norm(k);
++            auto * gate = build_lora_mm(l.wqkv_gate, cur);
++            auto * sg = ggml_sqr(ctx0, ggml_scale(ctx0, f32(s.gate), sqrtf(model.gate_init) / model.init_std));
++            gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, gate, sg));
++            // Repeated writes replace only the current chunk; older tokens retain final-loop KV.
++            cur = build_attn(attn, nullptr, nullptr, nullptr, q, k, v, nullptr, nullptr, nullptr, 1.0f / sqrtf(hd), model.cache_layer[il]);
++            cur = norm(ggml_mul(ctx0, cur, gate));
++            cur = build_lora_mm(l.wo, cur);
++        }
++        auto * a = norm(residual);
++        auto * b = norm(cur);
++        auto * alpha = ggml_abs(ctx0, ggml_scale(ctx0, f32(s.alpha), model.alpha_init / model.init_std));
++        cur = norm(ggml_add(ctx0, a, ggml_mul(ctx0, ggml_sub(ctx0, b, a), alpha)));
++        if (il >= (int) model.n_input && il < recurrent_end && (il + 1 - model.n_input) % model.n_recurrent == 0) {
++            cur = norm(cur);
++        }
++        cb(cur, "l_out", il);
++    }
++    if (out_ids) {
++        cur = ggml_get_rows(ctx0, cur, out_ids);
++    }
++    res->t_embd = cur;
++    cb(cur, "result_norm", -1);
++    cur = build_lora_mm(model.output, cur);
++    cur = ggml_mul(ctx0, cur, ggml_scale(ctx0, f32(model.logit_scale), 1.0f / model.init_std));
++    cb(cur, "result_output", -1);
++    res->t_logits = cur;
++    ggml_build_forward_expand(gf, cur);
++    // Preserve F32 inputs through recurrent normalization; BF16 and quantized weights keep their normal kernels.
++    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
++        auto * node = ggml_graph_node(gf, i);
++        if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_F32) {
++            ggml_prec_set_src(node, GGML_PREC_F32, 1);
++        }
++    }
++}
+diff --git a/src/models/models.h b/src/models/models.h
+index 31f0b65..96480cf 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -142,6 +142,35 @@ struct llm_build_rwkv7_base : public llm_graph_context {
+ // models
+ //
+ 
++struct llama_model_dory : public llama_model_base {
++    llama_model_dory(const llama_model_params & params) : llama_model_base(params) {}
++    uint32_t n_input = 0, n_recurrent = 0, n_output = 0, n_loops = 0;
++    float init_std = 0.0f, alpha_init = 0.0f, gate_init = 0.0f;
++    float theta_1 = 0.0f, theta_2 = 0.0f;
++    std::string pattern;
++    std::string recurrent_kv_cache_mode = "per_loop";
++    std::vector<uint32_t> profile;
++    std::vector<int> physical;
++    std::vector<int> cache_layer;
++    uint32_t n_layer_physical() const override { return n_input + n_recurrent + n_output; }
++    int layer_physical(int il) const override { return physical.at(il); }
++    struct scales {
++        ggml_tensor * alpha = nullptr;
++        ggml_tensor * sqk = nullptr;
++        ggml_tensor * gate = nullptr;
++        ggml_tensor * suv_gate = nullptr;
++        ggml_tensor * suv_up = nullptr;
++    };
++    std::vector<scales> scale;
++    ggml_tensor * logit_scale = nullptr;
++    void load_arch_hparams(llama_model_loader & ml) override;
++    void load_arch_tensors(llama_model_loader & ml) override;
++    struct graph : public llm_graph_context {
++        graph(const llama_model_dory & model, const llm_graph_params & params);
++    };
++    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
++};
++
+ struct llama_model_llama : public llama_model_base {
+     llama_model_llama(const struct llama_model_params & params) : llama_model_base(params) {}
+     void load_arch_hparams(llama_model_loader & ml) override;
+diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
+index 3dd8f06..0eba951 100644
+--- a/tests/test-llama-archs.cpp
++++ b/tests/test-llama-archs.cpp
+@@ -753,6 +753,9 @@ static bool arch_supported(const llm_arch arch) {
+     if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+         return false; // FIXME @ngxson
+     }
++    if (arch == LLM_ARCH_DORY) {
++        return false; // the generic fixture carries no recurrence metadata (input/recurrent/output counts, pattern, RoPE profile)
++    }
+     if (arch == LLM_ARCH_GRANITE_SWITCH) {
+         return false; // FIXME adapter fixture
+     }
+@@ -973,6 +976,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
+         if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+             continue; // FIXME: ISWA KV cache initialization needs more fixture params
+         }
++        if (arch == LLM_ARCH_DORY) {
++            continue; // needs the recurrence fixture; upstream's own Dory test is not carried (README, 0108)
++        }
+         if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
+             continue;
+         }

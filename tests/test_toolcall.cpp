@@ -132,3 +132,22 @@ TEST(toolcall_content_is_the_exact_concatenation_of_the_gaps) {
     CHECK_EQ(r.content, std::string("  before    after  "));
     CHECK_EQ(r.content.rfind("  before  ", 0), 0u);
 }
+
+// The call form Dory1.0-4B's template teaches (its own instruction text, example names kept): the Qwen
+// coder's function/parameter blocks inside one tool_call pair, with a multi-line value. The Qwen dialect's
+// parser takes it as it is, so the model needs no parser change.
+TEST(toolcall_dory_template_example_parses_under_the_qwen_dialect) {
+    const std::string text =
+        "I will call it.\n"
+        "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+        "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n"
+        "</parameter>\n</function>\n</tool_call>";
+    const auto r = parse_tool_calls(text, ChatDialect::Qwen);
+    CHECK_EQ(r.calls.size(), 1u);
+    CHECK_EQ(r.calls[0].name, std::string("example_function_name"));
+    const json args = json::parse(r.calls[0].arguments);
+    CHECK_EQ(args["example_parameter_1"].get<std::string>(), std::string("value_1"));
+    CHECK_EQ(args["example_parameter_2"].get<std::string>(),
+             std::string("This is the value for the second parameter\nthat can span\nmultiple lines"));
+    CHECK_EQ(r.content, std::string("I will call it.\n"));
+}

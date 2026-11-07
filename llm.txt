@@ -215,9 +215,10 @@
 - A GGUF as published (--gguf FILE; the first shard of a split file). The
   engine admits general.architecture qwen35, qwen35moe, qwen4exp, qwen2vl, llama
   at the Mistral Small 24B and Llama 2 7B geometries, gemma4 at the E4B geometry
-  and granite at the 8B geometry (code: src/core/admission.cpp); anything else,
-  an untested size included, is refused at load. Gemma 4 E4B and Granite 4.2 8B
-  are admitted but not yet served on a card. No
+  granite at the 8B geometry and dory at the 1.0-4B geometry (72 physical
+  blocks; --llama-dory-loops, --llama-dory-kv) (code: src/core/admission.cpp);
+  anything else, an untested size included, is refused at load. Gemma 4 E4B,
+  Granite 4.2 8B and Dory1.0-4B are admitted but not yet served on a card. No
   allowlist (retired with the OpenVINO engine, operator 2026-10-15).
 - Flash-Next's MTP layer: an MTP-only GGUF built from the checkpoint's 31
   mtp.* tensors by tools/flash_next_mtp_gguf.sh (--llama-mtp-gguf); its
