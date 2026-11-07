@@ -145,6 +145,7 @@ set(GGML_OPENCL_KERNELS
     mul_mm_kq_few
     mul_mm_kq_2d
     mul_mm_q40_i8_sg8
+    mul_mm_id_i8_sg8
     mul_mv_q5_0_f32
     mul_mv_q5_0_f32_flat
     mul_mv_q5_1_f32

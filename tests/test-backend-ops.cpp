@@ -11639,6 +11639,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 1, false, 512, 1, 256));
     }
 
+    // patch 0103: the int8 expert GEMM at sub-group 8. K and rows as a coder serves them (gate/up K 2048 x 512 with a
+    // broadcast b, down K 512 x 2048 with a column a pair), more pairs than a tile, several expert counts, repeated ids
+    // (most pairs on one expert, so several of its tiles and experts with none), ids through a view with an offset,
+    // and rows that are not a multiple of 8, which stay on the tile
+    for (ggml_type type_a : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_NL}) {
+        for (int n : {16, 33, 300}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, true,  512, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, false, 2048, n, 512));
+        }
+        for (int n_mats : {2, 16, 64, 184}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, std::min(n_mats, 8), true,  16, 64, 256));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, std::min(n_mats, 8), false, 16, 64, 256));
+        }
+        test_cases.emplace_back(new test_mul_mat_id_dup(type_a, GGML_TYPE_F32, 8, 4, true,  64, 64, 512));
+        test_cases.emplace_back(new test_mul_mat_id_dup(type_a, GGML_TYPE_F32, 8, 4, false, 64, 64, 256));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 4, true, 64, 64, 256, 1.0f, 0, true));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, true, 50, 33, 256));
+        // 0104: rows that end inside a sub-group's sets of 8 at NR 2 and at NR 4
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, true,  24, 33, 512));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, false, 2040, 33, 512));
+    }
+
     // Q2_0 rows of 20 and 12 sub-blocks (4 lanes a row in the OpenCL low-bit matvec) and of 10 (16 lanes):
     // Flash-Next's down projections are 2560 x 640 Q2_0
     for (int k : {640, 384, 320}) {

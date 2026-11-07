@@ -874,8 +874,14 @@ struct ggml_backend_opencl_context {
     // route's pair count). Its own, so the q8_1 matvec's prealloc_kq_{xq,xd} and
     // the kq_q8 dedup key are untouched.
     ggml_cl_buffer prealloc_kq_id8_q, prealloc_kq_id8_d;
+    // 0103: sub-group 8's int8 MUL_MAT_ID activations in the order of the route's tiles (mul_mm_id_i8_sg8.cl):
+    // codes, scales per 256, sums per 32, each pair's output offset
+    ggml_cl_buffer prealloc_kq_ids8_q, prealloc_kq_ids8_d, prealloc_kq_ids8_s, prealloc_kq_ids8_o;
     // what the activation buffers hold, and the graph count that dates it
-    ggml_cl_kq_act kq_q8, kq_f16, kq_few, kq_i8, kq_id8;
+    ggml_cl_kq_act kq_q8, kq_f16, kq_few, kq_i8, kq_id8, kq_ids8;
+    // kq_ids8 also holds to one route and the output's strides (the offsets it packed)
+    uint64_t       kq_ids8_route = 0;
+    cl_ulong       kq_ids8_nb1 = 0, kq_ids8_nb2 = 0;
     uint64_t       graph_gen = 0;
     cl_kernel kernel_miss_publish = nullptr, kernel_miss_wait = nullptr;   // patch 0056
     ggml_cl_buffer prealloc_kq_xh;     // f16 activation of the K-quant GEMMs
@@ -1203,7 +1209,14 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mm_kq2d_q40_i8   = nullptr;   // and on int8 DPAS
     cl_kernel kernel_mul_mm_q40_i8_sg8    = nullptr;   // Alchemist: Q4_0 on int8 DPAS, packed activations
     cl_kernel kernel_mul_mm_q8_i8_sg8     = nullptr;   // and Q8_0
+    cl_kernel kernel_mul_mm_q4k_i8_sg8    = nullptr;   // and Q4_K (0102)
     cl_kernel kernel_quant_i8_sg8         = nullptr;
+    // 0103: MUL_MAT_ID on int8 DPAS at sub-group 8 (mul_mm_id_i8_sg8.cl, its own program)
+    cl_kernel kernel_mul_mm_id_iq4_xs_i8_sg8 = nullptr;
+    cl_kernel kernel_mul_mm_id_iq4_nl_i8_sg8 = nullptr;
+    cl_kernel kernel_mul_mm_id_q4_K_i8_sg8   = nullptr;
+    cl_kernel kernel_id_pack_i8_sg8          = nullptr;
+    int       kq_id_sg8_nr            = 2;         // 0104: sets of 8 weight rows a sub-group
     int       kq40_sg8_tm = 32, kq40_sg8_wg = 8;
     cl_kernel kernel_mul_mm_f16w_f16      = nullptr;   // F16 / BF16 weights on the XMX tiles
     cl_kernel kernel_mul_mm_q8_0_f16     = nullptr;   // Q8_0 code+scale on the same XMX tiles (0058)
@@ -1228,6 +1241,7 @@ struct ggml_backend_opencl_context {
         int      tile = 0, n_expert = 0, n_used = 0, n_tok = 0;
         bool     i8 = false;   // 0071: the route cache entry also holds the arm (tile, kernel)
         uint64_t gen = 0;
+        uint64_t stamp = 0;    // 0103: counts the route's runs, so that a copy in its order can be dated
     } kq_route;
     cl_kernel kernel_moe_route_tiles = nullptr;
     cl_kernel kernel_moe_gather_experts = nullptr;   // an expert cache's bank -> a card-side mirror
@@ -2677,6 +2691,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                         cl_int e3 = CL_SUCCESS;
                         cl_kernel k8 = clCreateKernel(q40_prog, "kernel_mul_mm_q8_0_i8_sg8", &e3);
                         if (e3 == CL_SUCCESS) backend_ctx->kernel_mul_mm_q8_i8_sg8 = k8;
+                        cl_int e4 = CL_SUCCESS;
+                        cl_kernel k4 = clCreateKernel(q40_prog, "kernel_mul_mm_q4_K_i8_sg8", &e4);
+                        if (e4 == CL_SUCCESS) backend_ctx->kernel_mul_mm_q4k_i8_sg8 = k4;
+                        else ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "q4k_i8_sg8");
                         backend_ctx->kq40_sg8_tm = tm8; backend_ctx->kq40_sg8_wg = wg8;
                     } else {
                         if (err == CL_SUCCESS) CL_CHECK(clReleaseKernel(kg));
@@ -2686,6 +2704,65 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                     CL_CHECK(clReleaseProgram(q40_prog));
                 } else {
                     ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "q40_i8_sg8"), GGML_LOG_WARN("ggml_opencl: Q4_0 int8 sub-group 8 GEMM not built; the tile takes Q4_0\n");
+                }
+                // 0103: MUL_MAT_ID on int8 DPAS (mul_mm_id_i8_sg8.cl), its own program: a failure costs this arm
+                // only, the fp16 tile takes those products. It uses the quantizer built above. A set
+                // GGML_OPENCL_KQ_ID_SG8_I8=0 keeps the tile and does not build it. Same shape and options as
+                // above, so GGML_OPENCL_Q40_SG8_OPTS reaches it (-DID_RED, -DID_KV_TABLE).
+                const char * ids8_env = getenv("GGML_OPENCL_KQ_ID_SG8_I8");
+                if ((ids8_env == nullptr || atoi(ids8_env) != 0) && backend_ctx->kernel_quant_i8_sg8 != nullptr) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+                    const std::string ids8_src {
+                        #include "mul_mm_id_i8_sg8.cl.h"
+                    };
+#else
+                    const std::string ids8_src = read_file("mul_mm_id_i8_sg8.cl");
+#endif
+                    // 0104: GGML_OPENCL_KQ_ID_NR sets of 8 weight rows a sub-group, 1 to 8. 2 by the A770's window 122:
+                    // 3 and up exceed 256 GRF on the coder's kernels and IGC retries with rolled loops.
+                    int ids8_nr = 2;
+                    if (const char * nr_env = getenv("GGML_OPENCL_KQ_ID_NR")) {
+                        const int v = atoi(nr_env);
+                        if (v >= 1 && v <= 8) ids8_nr = v;
+                    }
+                    backend_ctx->kq_id_sg8_nr = ids8_nr;
+                    const std::string ids8_opts = q40_opts + " -DNR=" + std::to_string(ids8_nr);
+                    cl_program ids8_prog = ids8_src.empty() ? nullptr : build_program_from_source_optional(backend_ctx, ids8_src.c_str(), ids8_opts);
+                    if (ids8_prog == nullptr) {
+                        ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "id_i8_sg8"), GGML_LOG_WARN("ggml_opencl: int8 sub-group 8 expert GEMM not built; the fp16 tile takes MUL_MAT_ID\n");
+                    } else {
+                        const char * ids8_n[4] = { "kernel_mul_mm_id_iq4_xs_i8_sg8", "kernel_mul_mm_id_iq4_nl_i8_sg8",
+                                                   "kernel_mul_mm_id_q4_K_i8_sg8", "kernel_id_pack_i8_sg8" };
+                        cl_kernel ids8_k[4] = {};
+                        bool made = true, fits = true;
+                        for (int i = 0; i < 4; ++i) {
+                            cl_int e8 = CL_SUCCESS;
+                            ids8_k[i] = clCreateKernel(ids8_prog, ids8_n[i], &e8);
+                            if (e8 != CL_SUCCESS) {
+                                ids8_k[i] = nullptr;
+                                made = false;
+                                continue;
+                            }
+                            size_t wg = 0;
+                            CL_CHECK(clGetKernelWorkGroupInfo(ids8_k[i], backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg), &wg, NULL));
+                            fits = fits && wg >= (i == 3 ? (size_t)8 : (size_t)wg8 * 8);
+                        }
+                        if (made && fits) {
+                            backend_ctx->kernel_mul_mm_id_iq4_xs_i8_sg8 = ids8_k[0];
+                            backend_ctx->kernel_mul_mm_id_iq4_nl_i8_sg8 = ids8_k[1];
+                            backend_ctx->kernel_mul_mm_id_q4_K_i8_sg8   = ids8_k[2];
+                            backend_ctx->kernel_id_pack_i8_sg8          = ids8_k[3];
+                            GGML_LOG_INFO("ggml_opencl: int8 sub-group 8 expert GEMM (MUL_MAT_ID) built\n");
+                        } else {
+                            for (cl_kernel k8 : ids8_k) {
+                                if (k8 != nullptr) {
+                                    CL_CHECK(clReleaseKernel(k8));
+                                }
+                            }
+                            ggml_cl_downgrade("path=fallback reason=%s what=%s", made ? "no-fit" : "not-built", "id_i8_sg8"), GGML_LOG_WARN("ggml_opencl: int8 sub-group 8 expert GEMM not built or does not fit a work-group; the fp16 tile takes MUL_MAT_ID\n");
+                        }
+                        CL_CHECK(clReleaseProgram(ids8_prog));
+                    }
                 }
                 GGML_LOG_CONT(".");
             }
@@ -22830,10 +22907,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const int fa_dki = d_head_q == 256 && d_head_v == 256 ? 0 : d_head_q == 128 && d_head_v == 128 ? 1 : -1;
     cl_kernel kd_sel = fa_dki < 0 ? nullptr : is_mixed ? backend_ctx->kernel_fa_dpas_dk[fa_dki]
                                             : kvq >= 0 ? backend_ctx->kernel_fa_dpas_q_dk[fa_dki][kvq] : nullptr;
-    if (kd_sel != nullptr && n_q > 8 &&
+    const bool fa_dpas_ok = kd_sel != nullptr && n_q > 8 &&
         sinks == nullptr && max_bias == 0.0f && logit_softcap == 0.0f &&
         q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
-        (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q))) {
+        (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q));
+    if (backend_ctx->gpu_family == INTEL && n_q > 8 && !fa_dpas_ok) {
+        ggml_cl_downgrade("op=FLASH_ATTN head=%d kv=%s n_q=9+ path=f32_f16 reason=%s", (int) d_head_q, ggml_type_name(k->type),
+                          kd_sel == nullptr ? "no-dpas-kernel" : "shape");
+    }
+    if (fa_dpas_ok) {
         cl_mem    nomask = nullptr;
         // flash_attn_dpas2.cl: Q to f16 once a call, K/V read in place by 2D
         // block reads, which want 64-byte aligned heads and a row pitch of a
@@ -28709,7 +28791,7 @@ static bool ggml_cl_kq_cached(const ggml_cl_kq_act & c, const ggml_backend_openc
 // product (the slots are keyed by the tensor, its buffer, offset and size in this graph)
 static void ggml_cl_kq_forget(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * tmp) {
     for (ggml_cl_kq_act * a : { &backend_ctx->kq_q8, &backend_ctx->kq_f16, &backend_ctx->kq_few, &backend_ctx->kq_i8,
-                                &backend_ctx->kq_id8 }) {
+                                &backend_ctx->kq_id8, &backend_ctx->kq_ids8 }) {
         if (a->src1 == tmp) {
             *a = {};
         }
@@ -29126,6 +29208,79 @@ static bool ggml_cl_mul_mm_kq_few(ggml_backend_opencl_context * backend_ctx, con
     return true;
 }
 
+// ARC-LAB 0099/0102: Alchemist: the activations as int8 once a graph, packed for block reads
+static void ggml_cl_quant_i8_sg8(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src1, ggml_tensor_extra_cl * extra1,
+                                 cl_ulong offset1, int k, int ncols, int tp, const ggml_tensor * dst) {
+    if (ggml_cl_kq_cached(backend_ctx->kq_i8, backend_ctx, src1, extra1->data_device, offset1, k * ncols)) {
+        return;
+    }
+    backend_ctx->prealloc_kq2_xq.allocate(backend_ctx->context, (size_t)tp * k);
+    backend_ctx->prealloc_kq2_xd.allocate(backend_ctx->context, (size_t)(k / 256) * tp * sizeof(float));
+    backend_ctx->prealloc_kq2_xs.allocate(backend_ctx->context, (size_t)(k / 256) * tp * 16 * sizeof(cl_half));
+    cl_kernel kq = backend_ctx->kernel_quant_i8_sg8;
+    CL_CHECK(clSetKernelArg(kq, 0, sizeof(cl_mem),   &extra1->data_device));
+    CL_CHECK(clSetKernelArg(kq, 1, sizeof(cl_ulong), &offset1));
+    CL_CHECK(clSetKernelArg(kq, 2, sizeof(cl_mem),   &backend_ctx->prealloc_kq2_xq.buffer));
+    CL_CHECK(clSetKernelArg(kq, 3, sizeof(cl_mem),   &backend_ctx->prealloc_kq2_xd.buffer));
+    CL_CHECK(clSetKernelArg(kq, 4, sizeof(cl_mem),   &backend_ctx->prealloc_kq2_xs.buffer));
+    CL_CHECK(clSetKernelArg(kq, 5, sizeof(int),      &k));
+    CL_CHECK(clSetKernelArg(kq, 6, sizeof(int),      &tp));
+    size_t q_local[1]  = { 256 };
+    size_t q_global[1] = { (size_t)ncols * 256 };
+    backend_ctx->enqueue_ndrange_kernel(kq, 1, q_global, q_local, dst);
+    backend_ctx->kq_i8 = { src1, extra1->data_device, offset1, k * ncols, backend_ctx->graph_gen };
+}
+
+// ARC-LAB 0103: the activation of an expert product in the order of the route's tiles (mul_mm_id_i8_sg8.cl): its
+// columns quantized as above, once a graph per src1, then copied once per route. A layer's gate and up share
+// src1, the route and the output's strides, so they share the copy too.
+static void ggml_cl_id_pack_i8_sg8(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src1, int k, int n_cols,
+                                   int n_used, int ne11, int max_tiles, cl_mem pairs, cl_mem tiles, cl_mem ntiles,
+                                   cl_ulong nb1, cl_ulong nb2, const ggml_tensor * dst) {
+    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+    const cl_ulong offset1 = extra1->offset + src1->view_offs;
+    const uint64_t route = backend_ctx->kq_route.stamp;
+    if (ggml_cl_kq_cached(backend_ctx->kq_ids8, backend_ctx, src1, extra1->data_device, offset1, k * n_cols) &&
+        backend_ctx->kq_ids8_route == route && backend_ctx->kq_ids8_nb1 == nb1 && backend_ctx->kq_ids8_nb2 == nb2) {
+        return;
+    }
+    const int tmi = backend_ctx->kq40_sg8_tm;
+    int tpc = CEIL_DIV(n_cols, tmi) * tmi;
+    ggml_cl_quant_i8_sg8(backend_ctx, src1, extra1, offset1, k, n_cols, tpc, dst);
+    const size_t n_slots = (size_t)max_tiles * tmi;
+    backend_ctx->prealloc_kq_ids8_q.allocate(backend_ctx->context, n_slots * k);
+    backend_ctx->prealloc_kq_ids8_d.allocate(backend_ctx->context, n_slots * (k / 256) * sizeof(float));
+    backend_ctx->prealloc_kq_ids8_s.allocate(backend_ctx->context, n_slots * (k / 256) * 16 * sizeof(cl_half));
+    backend_ctx->prealloc_kq_ids8_o.allocate(backend_ctx->context, n_slots * sizeof(cl_ulong));
+    cl_kernel kp = backend_ctx->kernel_id_pack_i8_sg8;
+    cl_uint a = 0;
+    CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq2_xq.buffer));
+    CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq2_xd.buffer));
+    CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq2_xs.buffer));
+    CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &tpc));
+    CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &pairs));
+    CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &tiles));
+    CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &ntiles));
+    CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &n_used));
+    CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &ne11));
+    CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &n_cols));
+    CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_ids8_q.buffer));
+    CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_ids8_d.buffer));
+    CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_ids8_s.buffer));
+    CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_ids8_o.buffer));
+    CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &nb2));
+    CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &k));
+    // a work-group per (pair of a tile, tile), one sub-group
+    size_t gws[] = { (size_t)tmi * 8, (size_t)max_tiles, 1 };
+    size_t lws[] = { 8, 1, 1 };
+    backend_ctx->enqueue_ndrange_kernel(kp, 3, gws, lws, dst);
+    backend_ctx->kq_ids8 = { src1, extra1->data_device, offset1, k * n_cols, backend_ctx->graph_gen };
+    backend_ctx->kq_ids8_route = route;
+    backend_ctx->kq_ids8_nb1 = nb1;
+    backend_ctx->kq_ids8_nb2 = nb2;
+}
+
 // Intel: a K-quant weight times more than 4 f32 columns -- the columns as
 // f16, the weights dequantized to f16 per work-group tile, fp16 DPAS on the
 // XMX units (mul_mm_kq_f16.cl).
@@ -29135,6 +29290,40 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
     const int ncols = (int)(src1->ne[1] * src1->ne[2] * src1->ne[3]);
     if (ti < 0 || ncols <= 4 || !ggml_cl_kq_mul_mat_shape(src0, src1, dst)) {
         return false;
+    }
+    // Alchemist: Q4_K on int8 DPAS with packed activations. GGML_OPENCL_KQ_SG8_I8=0 keeps the tile below
+    {
+        static const char * ke = getenv("GGML_OPENCL_KQ_SG8_I8");
+        static const bool   k_on = ke == nullptr || atoi(ke) != 0;
+        if (k_on && ti == 0 && ncols >= 16 && backend_ctx->kernel_mul_mm_q4k_i8_sg8 != nullptr && src0->ne[0] % 256 == 0) {
+            const int ne00 = (int)src0->ne[0], ne01 = (int)src0->ne[1];
+            const int tmi = backend_ctx->kq40_sg8_tm;
+            const size_t wg8 = (size_t)backend_ctx->kq40_sg8_wg * 8;
+            const int tp = CEIL_DIV(ncols, tmi) * tmi;
+            ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+            const cl_ulong offset1 = extra1->offset + src1->view_offs;
+            ggml_cl_quant_i8_sg8(backend_ctx, src1, extra1, offset1, ne00, ncols, tp, dst);
+            ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+            const cl_ulong offsetd = extrad->offset + dst->view_offs;
+            const cl_ulong nb1 = dst->nb[1];
+            cl_kernel ki = backend_ctx->kernel_mul_mm_q4k_i8_sg8;
+            cl_uint a = 0;
+            ggml_cl_kq_weight_args(ki, src0, a);
+            CL_CHECK(clSetKernelArg(ki, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq2_xq.buffer));
+            CL_CHECK(clSetKernelArg(ki, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq2_xd.buffer));
+            CL_CHECK(clSetKernelArg(ki, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq2_xs.buffer));
+            CL_CHECK(clSetKernelArg(ki, a++, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(ki, a++, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(ki, a++, sizeof(cl_ulong), &nb1));
+            CL_CHECK(clSetKernelArg(ki, a++, sizeof(int),      &ne00));
+            CL_CHECK(clSetKernelArg(ki, a++, sizeof(int),      &ne01));
+            CL_CHECK(clSetKernelArg(ki, a++, sizeof(int),      &ncols));
+            CL_CHECK(clSetKernelArg(ki, a++, sizeof(int),      &tp));
+            size_t gws[] = { (size_t)(tp / tmi) * wg8, (size_t)CEIL_DIV(ne01, (int)wg8), 1 };
+            size_t lws[] = { wg8, 1, 1 };
+            backend_ctx->enqueue_ndrange_kernel(ki, 3, gws, lws, dst);
+            return true;
+        }
     }
     // Xe2: the 2D-block GEMM where its surfaces are wide enough (a 2D block
     // read wants at least 64 bytes a row: Q5_K's high bits are 32 bytes a
@@ -29303,21 +29492,7 @@ static bool ggml_cl_mul_mat_q4_0_xmx(ggml_backend_opencl_context * backend_ctx, 
                 const int tp = CEIL_DIV(ncols, tmi) * tmi;
                 ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
                 const cl_ulong offset1 = extra1->offset + src1->view_offs;
-                if (!ggml_cl_kq_cached(backend_ctx->kq_i8, backend_ctx, src1, extra1->data_device, offset1, ne00 * ncols)) {
-                    backend_ctx->prealloc_kq2_xq.allocate(backend_ctx->context, (size_t)tp * ne00);
-                    backend_ctx->prealloc_kq2_xd.allocate(backend_ctx->context, (size_t)(ne00 / 256) * tp * sizeof(float));
-                    cl_kernel kq = backend_ctx->kernel_quant_i8_sg8;
-                    CL_CHECK(clSetKernelArg(kq, 0, sizeof(cl_mem),   &extra1->data_device));
-                    CL_CHECK(clSetKernelArg(kq, 1, sizeof(cl_ulong), &offset1));
-                    CL_CHECK(clSetKernelArg(kq, 2, sizeof(cl_mem),   &backend_ctx->prealloc_kq2_xq.buffer));
-                    CL_CHECK(clSetKernelArg(kq, 3, sizeof(cl_mem),   &backend_ctx->prealloc_kq2_xd.buffer));
-                    CL_CHECK(clSetKernelArg(kq, 4, sizeof(int),      &ne00));
-                    CL_CHECK(clSetKernelArg(kq, 5, sizeof(int),      &tp));
-                    size_t q_local[1]  = { 256 };
-                    size_t q_global[1] = { (size_t)ncols * 256 };
-                    backend_ctx->enqueue_ndrange_kernel(kq, 1, q_global, q_local, dst);
-                    backend_ctx->kq_i8 = { src1, extra1->data_device, offset1, ne00 * ncols, backend_ctx->graph_gen };
-                }
+                ggml_cl_quant_i8_sg8(backend_ctx, src1, extra1, offset1, ne00, ncols, tp, dst);
                 cl_kernel ki = backend_ctx->kernel_mul_mm_q40_i8_sg8;
                 cl_uint a = 0;
                 CL_CHECK(clSetKernelArg(ki, a++, sizeof(cl_mem),   &e->q));
@@ -29709,21 +29884,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             const int tp = CEIL_DIV(ncols, tmi) * tmi;
             ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
             const cl_ulong offset1 = extra1->offset + src1->view_offs;
-            if (!ggml_cl_kq_cached(backend_ctx->kq_i8, backend_ctx, src1, extra1->data_device, offset1, ne00_ * ncols)) {
-                backend_ctx->prealloc_kq2_xq.allocate(backend_ctx->context, (size_t)tp * ne00_);
-                backend_ctx->prealloc_kq2_xd.allocate(backend_ctx->context, (size_t)(ne00_ / 256) * tp * sizeof(float));
-                cl_kernel kq = backend_ctx->kernel_quant_i8_sg8;
-                CL_CHECK(clSetKernelArg(kq, 0, sizeof(cl_mem),   &extra1->data_device));
-                CL_CHECK(clSetKernelArg(kq, 1, sizeof(cl_ulong), &offset1));
-                CL_CHECK(clSetKernelArg(kq, 2, sizeof(cl_mem),   &backend_ctx->prealloc_kq2_xq.buffer));
-                CL_CHECK(clSetKernelArg(kq, 3, sizeof(cl_mem),   &backend_ctx->prealloc_kq2_xd.buffer));
-                CL_CHECK(clSetKernelArg(kq, 4, sizeof(int),      &ne00_));
-                CL_CHECK(clSetKernelArg(kq, 5, sizeof(int),      &tp));
-                size_t q_local[1]  = { 256 };
-                size_t q_global[1] = { (size_t)ncols * 256 };
-                backend_ctx->enqueue_ndrange_kernel(kq, 1, q_global, q_local, dst);
-                backend_ctx->kq_i8 = { src1, extra1->data_device, offset1, ne00_ * ncols, backend_ctx->graph_gen };
-            }
+            ggml_cl_quant_i8_sg8(backend_ctx, src1, extra1, offset1, ne00_, ncols, tp, dst);
             cl_kernel ki = backend_ctx->kernel_mul_mm_q8_i8_sg8;
             cl_uint a = 0;
             CL_CHECK(clSetKernelArg(ki, a++, sizeof(cl_mem),   &e0->q));
@@ -32350,6 +32511,24 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
     const int  n_pairs = n_used * n_tok;
     const bool i8_auto = i8_mode == 2 && kq_i8_auto_use(kq_i8_mean_pairs(n_pairs, n_expert), i8_cross) != 0;
     const bool i8 = gemm && i8_kernels && i8_mode != 0 && i8_fmt_on && i8_kernel_fmt && i8_fmt && (i8_mode == 1 || i8_auto);
+    // 0103: sub-group 8's int8 DPAS for IQ4_XS, IQ4_NL and Q4_K (mul_mm_id_i8_sg8.cl), with the activations packed in
+    // the route's order. GGML_OPENCL_KQ_ID_SG8_I8=0 keeps the tile. An expert cache's slots and bank decline to the
+    // tile: their ids can be -1 and their weights can be away from the card, which this arm does not handle. K a
+    // multiple of 256 (the quantizer's scale block); rows a multiple of 8 (a pair's rows are one block write).
+    static const char * ids8_env = getenv("GGML_OPENCL_KQ_ID_SG8_I8");
+    static const bool   ids8_on  = ids8_env == nullptr || atoi(ids8_env) != 0;
+    cl_kernel ids8_kernel = ti == 4 ? backend_ctx->kernel_mul_mm_id_iq4_xs_i8_sg8 :
+                            ti == 5 ? backend_ctx->kernel_mul_mm_id_iq4_nl_i8_sg8 :
+                            ti == 0 ? backend_ctx->kernel_mul_mm_id_q4_K_i8_sg8 : nullptr;
+    const ggml_tensor * ids8_w = src0->view_src != nullptr ? src0->view_src : src0;
+    const bool ids8 = gemm && ids8_on && backend_ctx->kq_mm_sg == 8 && ids8_kernel != nullptr &&
+                      backend_ctx->kernel_id_pack_i8_sg8 != nullptr && backend_ctx->kernel_quant_i8_sg8 != nullptr &&
+                      !cache_src && ((ggml_backend_opencl_buffer_context *) ids8_w->buffer->context)->usm == nullptr &&
+                      ne00 % 256 == 0 && ne01 % 8 == 0;
+    if (gemm && ids8_on && backend_ctx->kq_mm_sg == 8 && ids8_kernel != nullptr && !ids8) {
+        ggml_cl_downgrade("op=MUL_MAT_ID type=%s path=tile reason=%s", ggml_type_name(src0->type),
+                          cache_src ? "expert-cache" : ((ggml_backend_opencl_buffer_context *) ids8_w->buffer->context)->usm != nullptr ? "bank" : "shape");
+    }
     // the tokens-as-a kernel (kernel_mul_mm_id2_*) beat the tile kernel at its
     // old tile (the coder's prefill on an A770 1,032 -> 1,231 t/s at 512
     // tokens). With its tile searched (2,4,2,2) the tile kernel is faster than
@@ -32361,7 +32540,8 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
     const bool id2_default = backend_ctx->kq_mm_sg != 8;
     const bool id2 = gemm && (id2_env == nullptr ? id2_default : atoi(id2_env) != 0) && backend_ctx->kernel_mul_mm_id2_kq_f16[ti] != nullptr;
     cl_kernel i8_kernel = ti == 10 ? backend_ctx->kernel_mul_mm_id_iq3_s_i8 : backend_ctx->kernel_mul_mm_id_iq4_nl_i8;
-    cl_kernel kernel = i8 ? i8_kernel :
+    cl_kernel kernel = ids8 ? ids8_kernel :
+                       i8 ? i8_kernel :
                        id2 ? backend_ctx->kernel_mul_mm_id2_kq_f16[ti] :
                        gemm ? backend_ctx->kernel_mul_mm_id_kq_f16[ti] : backend_ctx->kernel_mul_mv_id_kq_q8_1[ti];
     if (kernel == nullptr) {
@@ -32572,7 +32752,7 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
         return true;
     }
 
-    if (!i8) {
+    if (!i8 && !ids8) {
         ggml_cl_kq_convert_src1_f16(backend_ctx, src1, ne00, ne11 * ne12, dst);
     }
 
@@ -32581,7 +32761,7 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
     const ggml_cl_kq_tile & t = backend_ctx->kq_mm_id;
     const int sg        = backend_ctx->kq_mm_sg;
     const int id2_xt = backend_ctx->kq_id2_xt, id2_xsg = backend_ctx->kq_id2_xsg;   // XT, XSG of mul_mm_kq_f16.cl
-    const int tile      = i8 ? 32 : id2 ? id2_xt : t.nt(sg);
+    const int tile      = ids8 ? backend_ctx->kq40_sg8_tm : i8 ? 32 : id2 ? id2_xt : t.nt(sg);
     const int max_tiles = CEIL_DIV(n_pairs, tile) + std::min(n_expert, n_pairs);
     backend_ctx->prealloc_kq_pairs.allocate(backend_ctx->context, (size_t)n_pairs * sizeof(cl_int));
     backend_ctx->prealloc_kq_tiles.allocate(backend_ctx->context, (size_t)max_tiles * sizeof(cl_int4));
@@ -32611,6 +32791,29 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
         rc.ids = ids; rc.gen = backend_ctx->graph_gen; rc.mem = extra2->data_device; rc.off = offseti;
         rc.tile = tile; rc.pairs = pairs; rc.tiles = tiles; rc.ntiles = ntiles;
         rc.n_expert = n_expert; rc.n_used = n_used; rc.n_tok = n_tok; rc.i8 = i8;
+        rc.stamp++;
+    }
+
+    if (ids8) {
+        ggml_cl_id_pack_i8_sg8(backend_ctx, src1, ne00, ne11 * ne12, n_used, ne11, max_tiles, pairs, tiles, ntiles, nb1, nb2, dst);
+        ggml_cl_kq_weight_args(kernel, src0, a);
+        if (ti == 0) {
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_ids8_s.buffer));
+        }
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_ids8_q.buffer));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_ids8_d.buffer));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &tiles));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &ntiles));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_ids8_o.buffer));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extrad->data_device));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne00));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01));
+        const size_t wg8 = (size_t)backend_ctx->kq40_sg8_wg * 8;
+        size_t global_work_size[] = { (size_t)max_tiles * wg8, (size_t)CEIL_DIV(ne01, (int)wg8 * backend_ctx->kq_id_sg8_nr), 1 };
+        size_t local_work_size[]  = { wg8, 1, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+        return true;
     }
 
     if (i8) {
@@ -32773,6 +32976,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
         return;
     }
 #endif
+    if (backend_ctx->gpu_family == INTEL) {
+        ggml_cl_downgrade("op=MUL_MAT_ID type=%s k=%d path=generic reason=no-fast-path", ggml_type_name(src0->type), (int) src0->ne[0]);
+    }
     const int dst_rows = ne20*ne21; // ne20 = n_used_experts, ne21 = n_rows
 
     GGML_ASSERT(ne00 == ne10);

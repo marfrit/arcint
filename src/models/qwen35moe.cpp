@@ -47,8 +47,10 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
 
-    // if output is NULL, init from the input tok embed
-    if (output == NULL) {
+    // if output is NULL, init from the input tok embed. 0105: not in an MTP-only file (the trunk's probe
+    // tensor is absent): the head file then carries no LM head and the draft reads its rows from the
+    // served file (arcint --llama-mtp-vocab), so the copy of tok_embd on the card is not made
+    if (output == NULL && !(trunk_flags & TENSOR_NOT_REQUIRED)) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
@@ -820,7 +822,14 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
-    GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
+    if (head_w == nullptr) {
+        // 0105: a head file without an LM head (see load_arch_tensors): the context returns the nextn rows
+        // only, and the caller scores them; a context that asks for logits has nothing to read
+        // the rows are otherwise only an ancestor of the logits: expand them, or the graph computes nothing and out_ids has no buffer
+        ggml_build_forward_expand(gf, cur);
+        res->t_logits = nullptr;
+        return;
+    }
     cur = build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);
 

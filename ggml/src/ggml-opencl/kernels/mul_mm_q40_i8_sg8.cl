@@ -33,8 +33,8 @@
 // one work-group of 256 a token, eight values a work-item (k % 256 == 0): a
 // 256-block is 32 work-items, four sub-groups
 __attribute__((intel_reqd_sub_group_size(8)))
-kernel void kernel_quant_i8_sg8(global const char * src, ulong offs, global char * xq, global float * xd, int k, int tp) {
-    const int tok = get_group_id(0), sg = get_sub_group_id();
+kernel void kernel_quant_i8_sg8(global const char * src, ulong offs, global char * xq, global float * xd, global half * xs, int k, int tp) {
+    const int tok = get_group_id(0), sg = get_sub_group_id(), lane = get_sub_group_local_id();
     global const float * x = (global const float *)(src + offs) + (ulong)tok * k;
     local float sm[32];
     const int st = 8 * get_local_size(0), nr = (k + st - 1) / st;
@@ -51,6 +51,17 @@ kernel void kernel_quant_i8_sg8(global const char * src, ulong offs, global char
         // a block below 1e-30 quantizes to zeros (127 / bm would overflow)
         const float qs = bm / 127.f, iq = bm > 1e-30f ? 127.f / bm : 0.f;
         const int8 qv = convert_int8_rte(v * iq);
+        // the integer sum of each 32, f16 (exact to 2048; 4,064 at most), [k / 256][token][16 halves]
+        // so that 8 tokens are a 256-byte block read; slots 8..15 stay zero for the k16 DPAS
+        int s8 = qv.s0 + qv.s1 + qv.s2 + qv.s3 + qv.s4 + qv.s5 + qv.s6 + qv.s7;
+        s8 += intel_sub_group_shuffle_xor(s8, 1);
+        s8 += intel_sub_group_shuffle_xor(s8, 2);
+        if (i < k && (lane & 3) == 0) {
+            const ulong sb0 = (ulong)(i / 256) * tp * 16 + (ulong)tok * 16;
+            const int   sub = (i & 255) / 32;
+            xs[sb0 + sub] = (half)(float)s8;
+            xs[sb0 + 8 + sub] = 0.h;
+        }
         if (i < k) {
             vstore8(convert_char8(qv), 0, xq + (ulong)(i / 32) * tp * 32 + (ulong)tok * 32 + (i & 31));
             if ((i & 255) == 0) xd[(ulong)(i / 256) * tp + tok] = qs;
@@ -152,6 +163,99 @@ kernel void kernel_mul_mm_q8_0_i8_sg8(global const uchar * q, global const half 
         }
         _Pragma("unroll")
         for (int g = 0; g < NGM; ++g) acc[g] = fma(af[g], xv[g], acc[g]);
+    }
+    if (r0 + lane < ne01) {
+        _Pragma("unroll")
+        for (int g = 0; g < NGM; ++g) {
+            const float v[8] = { acc[g].s0, acc[g].s1, acc[g].s2, acc[g].s3, acc[g].s4, acc[g].s5, acc[g].s6, acc[g].s7 };
+            _Pragma("unroll")
+            for (int m = 0; m < 8; ++m) {
+                const int t = t0 + 8 * g + m;
+                if (t < ne11) ((global float *)(dst + offd + (ulong)t * nb1))[r0 + lane] = v[m];
+            }
+        }
+    }
+}
+
+// Q4_K: a lane's 32 bytes hold one sub-block's codes in the low nibbles and the next one's in the high
+// ones. As kernel_mul_mm_kq2d_q4_K_i8: the codes go in as s8 (code - 8), the 6-bit scale applies per
+// sub-block, and the constant part 8 D sc - DM m rides on one fp16 DPAS a block against the sums S:
+//   sum = xd (D sum_sb sc_sb ir_sb + sum_sb (8 D sc_sb - DM m_sb) S_sb)
+#ifdef QK_RED
+#define QK_S8_OFF 0x7Cu
+#else
+#define QK_S8_OFF 0x78u
+#endif
+#define QK_S8(t) as_int((((t) & 0x0F0F0F0Fu) + QK_S8_OFF * 0x01010101u) ^ 0x80808080u)
+static inline void scale_min_k4_sg8(int j, uint3 w, float * sc, float * m) {
+    if (j < 4) {
+        *sc = (float)((w.s0 >> (8 * j)) & 63);
+        *m  = (float)((w.s1 >> (8 * j)) & 63);
+    } else {
+        const int jj = j - 4;
+        const uint q8 = (w.s2 >> (8 * jj)) & 0xFF, lo = (w.s0 >> (8 * jj)) & 0xFF, hi = (w.s1 >> (8 * jj)) & 0xFF;
+        *sc = (float)((q8 & 0xF) | ((lo >> 6) << 4));
+        *m  = (float)((q8 >> 4) | ((hi >> 6) << 4));
+    }
+}
+
+__attribute__((intel_reqd_sub_group_size(8)))
+kernel void kernel_mul_mm_q4_K_i8_sg8(global const uchar * q, global const uchar * s, global const half * d, global const half * dm,
+                                      global const char * xq, global const float * xd, global const half * xs,
+                                      global char * dst, ulong offd, ulong nb1, int ne00, int ne01, int ne11, int tp) {
+    const int lane = get_sub_group_local_id(), sg = get_sub_group_id();
+    const int r0 = (get_group_id(1) * WG + sg) * 8;
+    const int t0 = get_group_id(0) * TMM;
+    const int nb = ne00 / QK_K;
+    const int n = min(r0 + lane, ne01 - 1);
+    float8 acc[NGM];
+    _Pragma("unroll")
+    for (int g = 0; g < NGM; ++g) acc[g] = (float8)(0.f);
+    for (int kb = 0; kb < nb; ++kb) {
+        if (kb % KSYNC == 0) barrier(CLK_LOCAL_MEM_FENCE);
+        const ulong b = (ulong)n * nb + kb;
+        const uint3 sw = vload3(0, (global const uint *)(s + b * 12));
+        const float D = vload_half(0, d + b), DM = vload_half(0, dm + b);
+        float8 xv[NGM], af[NGM];
+        _Pragma("unroll")
+        for (int g = 0; g < NGM; ++g) {
+            xv[g] = vload8(0, xd + (ulong)kb * tp + t0 + 8 * g);
+            af[g] = (float8)(0.f);
+        }
+        half mh[16];
+        _Pragma("unroll")
+        for (int sb = 8; sb < 16; ++sb) mh[sb] = 0.h;
+        _Pragma("unroll")
+        for (int j = 0; j < 4; ++j) {
+            const uint8 w = vload8(0, (global const uint *)(q + b * 128 + j * 32));
+            const uint wa[8] = { w.s0, w.s1, w.s2, w.s3, w.s4, w.s5, w.s6, w.s7 };
+            _Pragma("unroll")
+            for (int hi = 0; hi < 2; ++hi) {
+                const int sb = 2 * j + hi;
+                float sc, mn;
+                scale_min_k4_sg8(sb, sw, &sc, &mn);
+                mh[sb] = (half)(8.f * D * sc - DM * mn);
+                int8 bq;
+                _Pragma("unroll")
+                for (int i = 0; i < 8; ++i) bq[i] = QK_S8(hi ? wa[i] >> 4 : wa[i]);
+                const float ds = D * sc;
+                _Pragma("unroll")
+                for (int g = 0; g < NGM; ++g) {
+                    const int8 ir = intel_sub_group_i8_i8_matrix_mad_k32(AREAD(kb * 8 + sb, g), bq, (int8)(0));
+                    af[g] = fma(convert_float8(ir), (float8)(ds), af[g]);
+                }
+            }
+        }
+        half16 mv;
+        _Pragma("unroll")
+        for (int i = 0; i < 16; ++i) mv[i] = mh[i];
+        const int8 bm = as_int8(mv);
+        _Pragma("unroll")
+        for (int g = 0; g < NGM; ++g) {
+            const int8 sa = as_int8(intel_sub_group_block_read8((global const uint *)(xs + (ulong)kb * tp * 16 + (ulong)(t0 + 8 * g) * 16)));
+            const float8 cst = intel_sub_group_f16_f16_matrix_mad_k16(sa, bm, (float8)(0.f));
+            acc[g] = fma(af[g] + cst, xv[g], acc[g]);
+        }
     }
     if (r0 + lane < ne01) {
         _Pragma("unroll")
