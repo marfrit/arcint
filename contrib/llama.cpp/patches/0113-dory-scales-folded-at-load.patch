@@ -4,17 +4,61 @@ Date: Sat, 7 Nov 2026 12:00:00 +0000
 Subject: [PATCH] 0113-dory-scales-folded-at-load
 
 ---
- src/llama-model.cpp |   8 ++
- src/llama-model.h   |   8 ++
- src/models/dory.cpp | 206 +++++++++++++++++++++++++++++++++++++++++++++++---
- src/models/models.h |  14 ++++
- 4 files changed, 225 insertions(+), 11 deletions(-)
+ src/llama-model-loader.cpp |  11 ++
+ src/llama-model-loader.h   |   1 +
+ src/llama-model.cpp        |  24 +++++
+ src/llama-model.h          |  12 +++
+ src/models/dory.cpp        | 249 ++++++++++++++++++++++++++++++++++++++++---
+ src/models/models.h        |  16 +++
+ 6 files changed, 296 insertions(+), 17 deletions(-)
 
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 98009af..3fbc034 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1224,6 +1224,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+             return lazy_read::buft();
+         }
+ 
++        // ARC-LAB 0113: a tensor the graph does not read, kept only to derive others from at load,
++        // stays in the CPU's own buffer type (mapped from the file under mmap): no device memory, and
++        // no probe, so 0111 reports nothing for it (the architecture reports what it derives)
++        if (flags & TENSOR_HOST_ONLY) {
++            ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++            if (!cpu_dev) {
++                throw std::runtime_error("no CPU backend found");
++            }
++            return ggml_backend_dev_buffer_type(cpu_dev);
++        }
++
+         // select the buffer type for this tensor
+         const buft_list_t * buft_list;
+         switch (info.layer) {
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index 24cca2c..218d257 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -68,6 +68,7 @@ struct llama_model_loader {
+     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
+     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
+     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
++    static const int TENSOR_HOST_ONLY       = 1 << 6; // ARC-LAB 0113: not read by the graph, kept for a load-time derivation: the CPU's own buffer type, no probe
+ 
+     int n_kv      = 0;
+     int n_tensors = 0;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index d96673d..41d9ed6 100644
+index d96673d..a29c863 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -2027,6 +2027,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2001,6 +2001,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     }
+ 
+     if (ml.no_alloc) {
++        load_tensors_post(ml);   // ARC-LAB 0113: derived tensors count in the fit (sizes, no data)
+         return true;
+     }
+ 
+@@ -2027,6 +2028,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
  
      load_tensors_hadamard();
  
@@ -23,24 +67,46 @@ index d96673d..41d9ed6 100644
      // LLAMA_EXPERT_CACHE_MIB / LLAMA_EXPERT_CACHE_PROFILE: the same for tools
      // that do not set the parameters (llama-bench, llama-perplexity); "A,B"
      // gives one budget per device, as expert_cache_bytes_dev
-@@ -2284,6 +2286,12 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
+@@ -2282,6 +2285,12 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
+     }
+ }
  
- // make one Hadamard matrix per block size and one sign vector per width (the GGUF does not contain them)
- // each tensor goes on the buffer type of its weights (never a CPU extra type), and each transform goes in hdmd.rot or hdmd.inv
 +void llama_model_base::own_buffer(ggml_context * ctx, ggml_backend_buffer_t buf) {
 +    std::vector<ggml_backend_buffer_ptr> buffers;
 +    buffers.emplace_back(buf);
 +    pimpl->ctxs_bufs.emplace_back(ggml_context_ptr { ctx }, std::move(buffers));
 +}
 +
+ // make one Hadamard matrix per block size and one sign vector per width (the GGUF does not contain them)
+ // each tensor goes on the buffer type of its weights (never a CPU extra type), and each transform goes in hdmd.rot or hdmd.inv
  void llama_model_base::load_tensors_hadamard() {
-     if (hdmd.weight_blocks.empty() && hdmd.inverse_blocks.empty()) {
-         return;
+@@ -2826,6 +2835,21 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
+             });
+ }
+ 
++// ARC-LAB 0113: the buffer type for an F32 per-channel vector a layer multiplies its activations
++// by (il < 0: the output layer), by the probe the loader uses for weights: the first of the layer's
++// list whose device takes MUL of F32 rows by it. *first is the list's head, what the layer asked for
++ggml_backend_buffer_type_t llama_model_base::select_buft_f32_mul(int il, int64_t ne0, ggml_backend_buffer_type_t * first) const {
++    const buft_list_t & list = il < 0 ? *pimpl->dev_output.buft_list : *pimpl->dev_layer.at(layer_physical(il)).buft_list;
++    if (first) {
++        *first = list.front().second;
++    }
++    return ::select_buft(list, [&](ggml_context * ctx) {
++        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, 512);
++        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne0);
++        return ggml_mul(ctx, x, w);
++    });
++}
++
+ bool llama_model::has_tensor_overrides() const {
+     return pimpl->has_tensor_overrides;
+ }
 diff --git a/src/llama-model.h b/src/llama-model.h
-index c8f9f0f..bc81fac 100644
+index c8f9f0f..a658274 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
-@@ -959,6 +959,14 @@ struct llama_model_base : public llama_model {
+@@ -959,6 +959,18 @@ struct llama_model_base : public llama_model {
      // helper: make the prism.hadamard rotation and sign tensors for the folded weights
      void load_tensors_hadamard();
  
@@ -52,15 +118,20 @@ index c8f9f0f..bc81fac 100644
 +    // counted in memory_breakdown like the weights)
 +    void own_buffer(struct ggml_context * ctx, ggml_backend_buffer_t buf);
 +
++    // the buffer type for an F32 vector layer il (< 0: the output) multiplies its rows by, probed as
++    // the loader probes weights; *first, if given, gets what the layer's list asked for
++    ggml_backend_buffer_type_t select_buft_f32_mul(int il, int64_t ne0, ggml_backend_buffer_type_t * first) const;
++
      // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
      void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
  
 diff --git a/src/models/dory.cpp b/src/models/dory.cpp
-index e450789..58fc35f 100644
+index e450789..2871bd7 100644
 --- a/src/models/dory.cpp
 +++ b/src/models/dory.cpp
-@@ -1,5 +1,8 @@
+@@ -1,5 +1,9 @@
  #include "models.h"
++#include "llama-placement-report.h"
  
 +#include <cstdlib>
 +#include <cstring>
@@ -68,43 +139,98 @@ index e450789..58fc35f 100644
  #include <stdexcept>
  
  void llama_model_dory::load_arch_hparams(llama_model_loader & ml) {
-@@ -127,6 +130,165 @@ void llama_model_dory::load_arch_tensors(llama_model_loader & ml) {
+@@ -80,8 +84,26 @@ void llama_model_dory::load_arch_hparams(llama_model_loader & ml) {
+     type = LLM_TYPE_UNKNOWN;
+ }
+ 
++// ARC-LAB 0113: LLAMA_DORY_FOLD, read once a load: 0 the PR's graph; 1 the folded vectors only (the
++// same values on the CPU, bit for bit); 2 (the default) also no second norm of a residual that is
++// already a norm's output. Anything else warns and serves 2.
++static int dory_fold_level() {
++    const char * env = getenv("LLAMA_DORY_FOLD");
++    if (env == nullptr) {
++        return 2;
++    }
++    if (strcmp(env, "0") == 0 || strcmp(env, "1") == 0 || strcmp(env, "2") == 0) {
++        return env[0] - '0';
++    }
++    LLAMA_LOG_WARN("%s: LLAMA_DORY_FOLD=%s is not 0, 1 or 2; 2 serves\n", __func__, env);
++    return 2;
++}
++
+ void llama_model_dory::load_arch_tensors(llama_model_loader & ml) {
+     LLAMA_LOAD_LOCALS;
++    fold_level = dory_fold_level();
++    // folded, the graph never reads the BF16 sources: they stay in host memory, unprobed (0113)
++    const int src_flags = fold_level >= 1 ? llama_model_loader::TENSOR_HOST_ONLY : 0;
+     // the generic pass after this function loads optional per-tensor ".scale" tensors by EXECUTED layer
+     // index, so a looped copy would pick up the scale of whichever physical block sits at that index
+     // (the output blocks' for the recurrent copies). The published file has none; one that does is refused
+@@ -93,7 +115,7 @@ void llama_model_dory::load_arch_tensors(llama_model_loader & ml) {
+     }
+     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, 0);
+-    logit_scale = create_tensor(tn(LLM_TENSOR_OUTPUT_SCALE, "weight"), {n_vocab}, 0);
++    logit_scale = create_tensor(tn(LLM_TENSOR_OUTPUT_SCALE, "weight"), {n_vocab}, src_flags);
+     scale.resize(n_layer);
+     std::vector<int> first(pattern.size(), -1);
+     for (int il = 0; il < n_layer; ++il) {
+@@ -106,13 +128,13 @@ void llama_model_dory::load_arch_tensors(llama_model_loader & ml) {
+         first[p] = il;
+         auto & l = layers[il];
+         auto & s = scale[il];
+-        s.alpha = create_tensor(tn(LLM_TENSOR_RESIDUAL_ALPHA, "weight", p), {n_embd}, 0);
++        s.alpha = create_tensor(tn(LLM_TENSOR_RESIDUAL_ALPHA, "weight", p), {n_embd}, src_flags);
+         if (pattern[p] == '-') {
+             l.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", p), {n_embd, n_ff}, 0);
+             l.ffn_up = create_tensor(tn(LLM_TENSOR_FFN_UP, "weight", p), {n_embd, n_ff}, 0);
+             l.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", p), {n_ff, n_embd}, 0);
+-            s.suv_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE_SCALE, "weight", p), {n_ff}, 0);
+-            s.suv_up = create_tensor(tn(LLM_TENSOR_FFN_UP_SCALE, "weight", p), {n_ff}, 0);
++            s.suv_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE_SCALE, "weight", p), {n_ff}, src_flags);
++            s.suv_up = create_tensor(tn(LLM_TENSOR_FFN_UP_SCALE, "weight", p), {n_ff}, src_flags);
+         } else {
+             const int64_t nq = n_head * n_embd_head_k;
+             const int64_t nkv = hparams.n_head_kv(il) * n_embd_head_k;
+@@ -121,12 +143,181 @@ void llama_model_dory::load_arch_tensors(llama_model_loader & ml) {
+             l.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", p), {n_embd, nkv}, 0);
+             l.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", p), {nq, n_embd}, 0);
+             l.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", p), {n_embd, nq}, 0);
+-            s.sqk = create_tensor(tn(LLM_TENSOR_ATTN_QK_SCALE, "weight", p), {nq}, 0);
+-            s.gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE_SCALE, "weight", p), {nq}, 0);
++            s.sqk = create_tensor(tn(LLM_TENSOR_ATTN_QK_SCALE, "weight", p), {nq}, src_flags);
++            s.gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE_SCALE, "weight", p), {nq}, src_flags);
+         }
      }
  }
  
 +// ARC-LAB 0113: the scale vectors' constant chains folded at load. The PR's graph recomputes each one
 +// from the BF16 weight on every forward (a cast, a scale and an abs or a square a vector, 3-6 nodes a
-+// sublayer); here each final per-channel vector is computed once, in F32, from the file's own bytes,
-+// with the graph's operations in the graph's order (so the CPU backend sees the same values bit for
-+// bit), and placed in the buffer type the loader chose for its source weight:
++// sublayer); here each final per-channel vector is computed once, in F32, from the loaded source (kept
++// in host memory, TENSOR_HOST_ONLY: its exact BF16 values), with the graph's operations in the graph's
++// order, so the CPU backend sees the same values bit for bit:
 +//   alpha  |alpha * (alpha_init / init_std)|                         [n_embd]
-+//   sq     (sqk * (sqrt(hd) / init_std))^2 * (1 / sqrt(hd))           [hd, n_head]  (the q norm's
-+//          1/sqrt(hd) scale moved into it: exact when sqrt(hd) is a power of two, as at Dory's 256)
++//   sq     (sqk * (sqrt(hd) / init_std))^2 [* (1 / sqrt(hd))]         [hd, n_head]  (the q norm's
++//          1/sqrt(hd) moved into it only when sqrt(hd) is a power of two, where the product is exact)
 +//   sg     (s_gate * (sqrt(gate_init) / init_std))^2                  [n_q]
 +//   cg/cu  suv_gate/suv_up * sqrt(n_embd)                             [n_ff]
 +//   logit  logit_scale * (1 / init_std)                               [n_vocab]
-+// LLAMA_DORY_FOLD: 0 the PR's graph; 1 the folded vectors only (the same values on the CPU, bit for
-+// bit); 2 (the default) also no second norm of a residual that is already a norm's output (graph).
++// Each fold is placed by its layer's device, probed as the loader probes a weight (an F32 MUL), and a
++// fold the device declines into host memory is reported as 0111 reports a weight. The memory-fit
++// pass (no_alloc) builds them too, sizes only, so the fit counts them and plans the folded graph.
 +void llama_model_dory::load_tensors_post(llama_model_loader & ml) {
-+    const char * env = getenv("LLAMA_DORY_FOLD");
-+    int level = 2;
-+    if (env != nullptr) {
-+        if (strcmp(env, "0") == 0 || strcmp(env, "1") == 0 || strcmp(env, "2") == 0) {
-+            level = env[0] - '0';
-+        } else {
-+            LLAMA_LOG_WARN("%s: LLAMA_DORY_FOLD=%s is not 0, 1 or 2; 2 serves\n", __func__, env);
-+        }
-+    }
-+    if (level <= 0) {
++    if (fold_level <= 0) {
 +        LLAMA_LOG_INFO("%s: Dory scale chains computed in the graph (LLAMA_DORY_FOLD=0)\n", __func__);
 +        return;
 +    }
 +    const int n_layer = hparams.n_layer();
 +    const int64_t n_embd = hparams.n_embd;
 +    const int64_t hd = hparams.n_embd_head_k();
++    const float rhd = sqrtf((float) hd);
++    const bool qnorm_in_sq = rhd == floorf(rhd) && rhd >= 1.0f && (((int64_t) rhd) & (((int64_t) rhd) - 1)) == 0;
 +
 +    enum kind { K_ALPHA, K_SQ, K_SG, K_SUV, K_LOGIT };
-+    struct item { const ggml_tensor * src; ggml_tensor ** dst; kind k; };
++    struct item { const ggml_tensor * src; ggml_tensor ** dst; kind k; int il; };
 +    std::vector<item> items;
 +    std::vector<folded_scales> f(n_layer);
 +    std::vector<int> first(n_layer_physical(), -1);
@@ -115,34 +241,33 @@ index e450789..58fc35f 100644
 +        }
 +        first[p] = il;
 +        const auto & s = scale[il];
-+        items.push_back({ s.alpha, &f[il].alpha, K_ALPHA });
++        items.push_back({ s.alpha, &f[il].alpha, K_ALPHA, il });
 +        if (pattern[p] == '-') {
-+            items.push_back({ s.suv_gate, &f[il].cg, K_SUV });
-+            items.push_back({ s.suv_up,   &f[il].cu, K_SUV });
++            items.push_back({ s.suv_gate, &f[il].cg, K_SUV, il });
++            items.push_back({ s.suv_up,   &f[il].cu, K_SUV, il });
 +        } else {
-+            items.push_back({ s.sqk,  &f[il].sq, K_SQ });
-+            items.push_back({ s.gate, &f[il].sg, K_SG });
++            items.push_back({ s.sqk,  &f[il].sq, K_SQ, il });
++            items.push_back({ s.gate, &f[il].sg, K_SG, il });
 +        }
 +    }
 +    ggml_tensor * logit = nullptr;
-+    items.push_back({ logit_scale, &logit, K_LOGIT });
++    items.push_back({ logit_scale, &logit, K_LOGIT, -1 });
 +
-+    // the source weight's buffer type; a CPU extra type (CPU_REPACK) only takes what it can repack
-+    auto buft_of = [](const ggml_tensor * t) {
-+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
++    // the layer's buffer type for an F32 MUL operand; a CPU extra type (CPU_REPACK) only takes what it
++    // can repack, so a CPU choice is the CPU's own buffer type
++    std::map<ggml_backend_buffer_type_t, ggml_context *> ctxs;
++    for (auto & it : items) {
++        if (it.src == nullptr) {
++            throw std::runtime_error("Dory: a scale vector is missing");
++        }
++        const int64_t n = ggml_nelements(it.src);
++        ggml_backend_buffer_type_t asked = nullptr;
++        ggml_backend_buffer_type_t buft = select_buft_f32_mul(it.il, n, &asked);
 +        if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
 +            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
 +                buft = ggml_backend_dev_buffer_type(dev);
 +            }
 +        }
-+        return buft;
-+    };
-+    std::map<ggml_backend_buffer_type_t, ggml_context *> ctxs;
-+    for (auto & it : items) {
-+        if (it.src == nullptr || it.src->buffer == nullptr) {
-+            throw std::runtime_error("Dory: a scale vector has no buffer");
-+        }
-+        ggml_backend_buffer_type_t buft = buft_of(it.src);
 +        ggml_context *& ctx = ctxs[buft];
 +        if (ctx == nullptr) {
 +            ggml_init_params params = { ggml_tensor_overhead() * (items.size() + 1), nullptr, true };
@@ -151,74 +276,84 @@ index e450789..58fc35f 100644
 +                throw std::runtime_error("Dory: failed to create the folded-scale context");
 +            }
 +        }
-+        const int64_t n = ggml_nelements(it.src);
 +        ggml_tensor * t = it.k == K_SQ ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, n / hd)
 +                                       : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
 +        ggml_format_name(t, "%s.fold", ggml_get_name(it.src));
 +        *it.dst = t;
++        // 0111's report for what the graph reads: the layer asked for device memory, its device
++        // declined the fold's MUL, and the fold went to host memory
++        if (!ml.no_alloc && llama_placement::declined_to_host(asked, buft)) {
++            const std::string k = llama_placement::key("MUL", "f32", ggml_get_name(t), ggml_backend_buft_name(buft));
++            if (llama_placement::global().add(k)) {
++                LLAMA_LOG_WARN("DOWNGRADE src=llama %s\n", k.c_str());
++            }
++        }
 +    }
 +    size_t bytes = 0;
 +    const char * failed = nullptr;
 +    for (auto & [buft, ctx] : ctxs) {
-+        ggml_backend_buffer_t buf = failed ? nullptr : ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
++        ggml_backend_buffer_t buf = nullptr;
++        if (!failed) {
++            if (ml.no_alloc) {
++                // the loader's dummy for a fit pass: the scheduler leaves the tensors alone, and
++                // memory_breakdown sizes the context
++                buf = ggml_backend_buft_alloc_buffer(buft, 0);
++                for (ggml_tensor * t = ggml_get_first_tensor(ctx); buf != nullptr && t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++                    t->buffer = buf;
++                }
++            } else {
++                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
++            }
++        }
 +        if (buf == nullptr) {
 +            failed = failed ? failed : ggml_backend_buft_name(buft);
 +            ggml_free(ctx);   // this one and every later one: the model owns only the allocated ones
 +            continue;
 +        }
 +        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-+        bytes += ggml_backend_buffer_get_size(buf);
++        bytes += ml.no_alloc ? ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft) : ggml_backend_buffer_get_size(buf);
 +        own_buffer(ctx, buf);
 +    }
 +    if (failed) {
 +        throw std::runtime_error(format("Dory: unable to allocate the folded scales in %s", failed));
 +    }
 +
-+    // the source values as F32: the file's bytes when the loader has the file, else the loaded tensor
-+    std::vector<uint8_t> raw;
-+    std::vector<float> v, out;
-+    auto read_f32 = [&](const ggml_tensor * t) {
-+        const int64_t n = ggml_nelements(t);
-+        raw.resize(ggml_nbytes(t));
-+        ggml_type type = t->type;
-+        const auto w = ml.weights_map.find(ggml_get_name(t));
-+        if (w != ml.weights_map.end() && w->second.idx < ml.files.size() && ggml_nbytes(w->second.tensor) == raw.size()) {
-+            type = w->second.tensor->type;
-+            ml.files[w->second.idx]->seek(w->second.offs, SEEK_SET);
-+            ml.files[w->second.idx]->read_raw(raw.data(), raw.size());
-+        } else {
-+            ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
-+        }
-+        v.resize(n);
-+        switch (type) {
-+            case GGML_TYPE_F32:  memcpy(v.data(), raw.data(), n * sizeof(float)); break;
-+            case GGML_TYPE_F16:  ggml_fp16_to_fp32_row((const ggml_fp16_t *) raw.data(), v.data(), n); break;
-+            case GGML_TYPE_BF16: ggml_bf16_to_fp32_row((const ggml_bf16_t *) raw.data(), v.data(), n); break;
-+            default: throw std::runtime_error(format("Dory: scale vector %s has type %s", ggml_get_name(t), ggml_type_name(type)));
-+        }
-+    };
-+    // the factors as the graph spells them (float arithmetic, the same expressions)
-+    const float c_alpha = alpha_init / init_std;
-+    const float c_sqk   = sqrtf(hd) / init_std;
-+    const float c_qnorm = 1.0f/sqrtf((float) hd);
-+    const float c_gate  = sqrtf(gate_init) / init_std;
-+    const float c_suv   = sqrtf(n_embd);
-+    const float c_logit = 1.0f / init_std;
-+    for (auto & it : items) {
-+        read_f32(it.src);
-+        out.resize(v.size());
-+        for (size_t i = 0; i < v.size(); ++i) {
-+            float x = v[i];
-+            switch (it.k) {
-+                case K_ALPHA: x = fabsf(x * c_alpha); break;
-+                case K_SQ:    x = x * c_sqk; x = x * x; x = x * c_qnorm; break;
-+                case K_SG:    x = x * c_gate; x = x * x; break;
-+                case K_SUV:   x = x * c_suv; break;
-+                case K_LOGIT: x = x * c_logit; break;
++    if (!ml.no_alloc) {
++        // the source values as F32, read from the loaded tensor (host memory: the file's BF16 values)
++        std::vector<uint8_t> raw;
++        std::vector<float> v, out;
++        // the factors as the graph spells them (float arithmetic, the same expressions)
++        const float c_alpha = alpha_init / init_std;
++        const float c_sqk   = sqrtf(hd) / init_std;
++        const float c_qnorm = 1.0f/sqrtf((float) hd);
++        const float c_gate  = sqrtf(gate_init) / init_std;
++        const float c_suv   = sqrtf(n_embd);
++        const float c_logit = 1.0f / init_std;
++        for (auto & it : items) {
++            const int64_t n = ggml_nelements(it.src);
++            raw.resize(ggml_nbytes(it.src));
++            ggml_backend_tensor_get(it.src, raw.data(), 0, raw.size());
++            v.resize(n);
++            switch (it.src->type) {
++                case GGML_TYPE_F32:  memcpy(v.data(), raw.data(), n * sizeof(float)); break;
++                case GGML_TYPE_F16:  ggml_fp16_to_fp32_row((const ggml_fp16_t *) raw.data(), v.data(), n); break;
++                case GGML_TYPE_BF16: ggml_bf16_to_fp32_row((const ggml_bf16_t *) raw.data(), v.data(), n); break;
++                default: throw std::runtime_error(format("Dory: scale vector %s has type %s", ggml_get_name(it.src), ggml_type_name(it.src->type)));
 +            }
-+            out[i] = x;
++            out.resize(n);
++            for (int64_t i = 0; i < n; ++i) {
++                float x = v[i];
++                switch (it.k) {
++                    case K_ALPHA: x = fabsf(x * c_alpha); break;
++                    case K_SQ:    x = x * c_sqk; x = x * x; if (qnorm_in_sq) { x = x * c_qnorm; } break;
++                    case K_SG:    x = x * c_gate; x = x * x; break;
++                    case K_SUV:   x = x * c_suv; break;
++                    case K_LOGIT: x = x * c_logit; break;
++                }
++                out[i] = x;
++            }
++            ggml_backend_tensor_set(*it.dst, out.data(), 0, out.size() * sizeof(float));
 +        }
-+        ggml_backend_tensor_set(*it.dst, out.data(), 0, out.size() * sizeof(float));
 +    }
 +    for (int il = 0; il < n_layer; ++il) {
 +        f[il] = f[first[physical[il]]];
@@ -226,15 +361,22 @@ index e450789..58fc35f 100644
 +    fold = std::move(f);
 +    logit_fold = logit;
 +    folded = true;
-+    renorm_dropped = level >= 2;
-+    LLAMA_LOG_INFO("%s: Dory: %zu scale vectors folded at load, %.2f MiB F32, residual renorm %s (LLAMA_DORY_FOLD=%d; 0 keeps the graph's chains)\n",
-+                   __func__, items.size(), bytes / (1024.0 * 1024.0), renorm_dropped ? "dropped" : "kept", level);
++    renorm_dropped = fold_level >= 2;
++    sq_has_qnorm = qnorm_in_sq;
++    if (!ml.no_alloc) {
++        std::string where;
++        for (auto & [buft, ctx] : ctxs) {
++            where += (where.empty() ? "" : ", ") + std::string(ggml_backend_buft_name(buft));
++        }
++        LLAMA_LOG_INFO("%s: Dory: %zu scale vectors folded at load, %.2f MiB F32 in %s, residual renorm %s (LLAMA_DORY_FOLD=%d; 0 keeps the graph's chains)\n",
++                       __func__, items.size(), bytes / (1024.0 * 1024.0), where.c_str(), renorm_dropped ? "dropped" : "kept", fold_level);
++    }
 +}
 +
  std::unique_ptr<llm_graph_context> llama_model_dory::build_arch_graph(const llm_graph_params & params) const {
      return std::make_unique<graph>(*this, params);
  }
-@@ -140,11 +302,19 @@ llama_model_dory::graph::graph(const llama_model_dory & model, const llm_graph_p
+@@ -140,11 +331,19 @@ llama_model_dory::graph::graph(const llama_model_dory & model, const llm_graph_p
      const int recurrent_end = model.n_input + model.n_recurrent * model.n_loops;
      const auto norm = [&](ggml_tensor * x) { return build_gdn_l2_norm(ctx0, x, 1e-6f); };
      const auto f32 = [&](ggml_tensor * x) { return x->type == GGML_TYPE_F32 ? x : ggml_cast(ctx0, x, GGML_TYPE_F32); };
@@ -254,7 +396,7 @@ index e450789..58fc35f 100644
          if (il == (int) model.n_input) {
              input_h = cur;
          }
-@@ -155,9 +325,13 @@ llama_model_dory::graph::graph(const llama_model_dory & model, const llm_graph_p
+@@ -155,9 +354,13 @@ llama_model_dory::graph::graph(const llama_model_dory & model, const llm_graph_p
          if (model.pattern[p] == '-') {
              auto * g = build_lora_mm(l.ffn_gate, cur);
              auto * u = build_lora_mm(l.ffn_up, cur);
@@ -271,15 +413,17 @@ index e450789..58fc35f 100644
              cur = build_lora_mm(l.ffn_down, cur);
          } else {
              const auto hd = hparams.n_embd_head_k(il);
-@@ -169,22 +343,32 @@ llama_model_dory::graph::graph(const llama_model_dory & model, const llm_graph_p
+@@ -169,22 +372,34 @@ llama_model_dory::graph::graph(const llama_model_dory & model, const llm_graph_p
                  q = ggml_rope_ext(ctx0, q, pos, nullptr, hd, rope_type, n_ctx_orig, theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
                  k = ggml_rope_ext(ctx0, k, pos, nullptr, hd, rope_type, n_ctx_orig, theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
              }
 -            auto * sq = ggml_sqr(ctx0, ggml_scale(ctx0, f32(s.sqk), sqrtf(hd) / model.init_std));
 -            q = ggml_mul(ctx0, norm(q), ggml_reshape_3d(ctx0, sq, hd, nh, 1));
-+            if (fs) {
-+                // the norm's 1/sqrt(hd) is in sq (exact at hd 256): rms_norm then mul, the pair the backends fuse
++            if (fs && model.sq_has_qnorm) {
++                // the norm's 1/sqrt(hd) is in sq (exact: sqrt(hd) a power of two): rms_norm then mul, the pair the backends fuse
 +                q = ggml_mul(ctx0, ggml_rms_norm(ctx0, q, 1e-6f / (float) q->ne[0]), fs->sq);
++            } else if (fs) {
++                q = ggml_mul(ctx0, norm(q), fs->sq);
 +            } else {
 +                auto * sq = ggml_sqr(ctx0, ggml_scale(ctx0, f32(s.sqk), sqrtf(hd) / model.init_std));
 +                q = ggml_mul(ctx0, norm(q), ggml_reshape_3d(ctx0, sq, hd, nh, 1));
@@ -311,7 +455,7 @@ index e450789..58fc35f 100644
              cur = norm(cur);
          }
          cb(cur, "l_out", il);
-@@ -195,7 +379,7 @@ llama_model_dory::graph::graph(const llama_model_dory & model, const llm_graph_p
+@@ -195,7 +410,7 @@ llama_model_dory::graph::graph(const llama_model_dory & model, const llm_graph_p
      res->t_embd = cur;
      cb(cur, "result_norm", -1);
      cur = build_lora_mm(model.output, cur);
@@ -321,10 +465,10 @@ index e450789..58fc35f 100644
      res->t_logits = cur;
      ggml_build_forward_expand(gf, cur);
 diff --git a/src/models/models.h b/src/models/models.h
-index 96480cf..6594763 100644
+index 96480cf..1509c00 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
-@@ -163,6 +163,20 @@ struct llama_model_dory : public llama_model_base {
+@@ -163,6 +163,22 @@ struct llama_model_dory : public llama_model_base {
      };
      std::vector<scales> scale;
      ggml_tensor * logit_scale = nullptr;
@@ -341,6 +485,8 @@ index 96480cf..6594763 100644
 +    ggml_tensor * logit_fold = nullptr;
 +    bool folded = false;
 +    bool renorm_dropped = false;   // LLAMA_DORY_FOLD=2: no second norm of a residual that is a norm's output
++    bool sq_has_qnorm = false;     // the q norm's 1/sqrt(hd) is in sq (sqrt(hd) a power of two)
++    int fold_level = 0;            // LLAMA_DORY_FOLD as read at load_arch_tensors
 +    void load_tensors_post(llama_model_loader & ml) override;
      void load_arch_hparams(llama_model_loader & ml) override;
      void load_arch_tensors(llama_model_loader & ml) override;

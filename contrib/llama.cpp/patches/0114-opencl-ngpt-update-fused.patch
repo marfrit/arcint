@@ -4,13 +4,13 @@ Date: Sat, 7 Nov 2026 12:00:00 +0000
 Subject: [PATCH] 0114-opencl-ngpt-update-fused
 
 ---
- ggml/src/ggml-opencl/ggml-opencl.cpp     | 162 +++++++++++++++++++++++++++++
- ggml/src/ggml-opencl/kernels/rms_norm.cl |  89 ++++++++++++++++
- tests/test-backend-ops.cpp               |  70 +++++++++++++
- 3 files changed, 321 insertions(+)
+ ggml/src/ggml-opencl/ggml-opencl.cpp     | 169 +++++++++++++++++++++++++++++
+ ggml/src/ggml-opencl/kernels/rms_norm.cl |  89 +++++++++++++++
+ tests/test-backend-ops.cpp               |  70 ++++++++++++
+ 3 files changed, 328 insertions(+)
 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 5e8da87..70d2047 100644
+index 5e8da87..962bb08 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -812,6 +812,11 @@ struct ggml_backend_opencl_context {
@@ -21,7 +21,7 @@ index 5e8da87..70d2047 100644
 +    int  ngpt_red = 0;                           // GGML_OPENCL_FUSE_NGPT_RED=1: the fused kernel reads alpha as 1 (the red case)
 +    int  ngpt_fused = 0, ngpt_refused = 0;       // this graph's matches, fused and refused for an overlap
 +    int  ngpt_inplace = 0;                       // of the fused, those whose result lies exactly over x or a
-+    bool ngpt_told = false;
++    std::set<std::tuple<int, int, int>> ngpt_told;   // the (fused, in place, refused) counts a graph has logged
      int  fuse_0049 = 7;                          // patch 0049's fusions, a bit each: 1 rms_norm + scale, 2 ssm_conv + silu,
                                                   // 4 sigmoid + mul (GGML_OPENCL_FUSE_0049=<mask>; 0: off)
      bool f16_mrow = true;                        // opt-out GGML_OPENCL_F16_MROW=0 (multi-row-per-WG f16 decode GEMV for attn proj + lm_head)
@@ -33,7 +33,7 @@ index 5e8da87..70d2047 100644
      cl_kernel kernel_rms_norm_mul_rope_multi = nullptr;   // fused rms_norm(x)*w then the interleaved M-RoPE (patch 0074)
      cl_kernel kernel_l2_norm_f32;
      cl_kernel kernel_group_norm, kernel_group_norm_mul_add;
-@@ -3904,6 +3910,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -3904,6 +3910,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
          CL_CHECK((backend_ctx->kernel_rms_norm_mul = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm_mul", &err), err));
          CL_CHECK((backend_ctx->kernel_rms_norm_mul_add = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm_mul_add", &err), err));
          CL_CHECK((backend_ctx->kernel_rms_norm_mul_rope_multi = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm_mul_rope_multi_f32", &err), err));
@@ -41,11 +41,13 @@ index 5e8da87..70d2047 100644
 +        backend_ctx->kernel_ngpt_slerp = clCreateKernel(backend_ctx->program_rms_norm, "kernel_ngpt_slerp_f32", &err);
 +        if (err != CL_SUCCESS) {
 +            backend_ctx->kernel_ngpt_slerp = nullptr;
++            ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "ngpt_slerp"),
++                GGML_LOG_WARN("ggml_opencl: the nGPT update kernel not built (error %d); its seven nodes run as separate kernels\n", err);
 +        }
          GGML_LOG_CONT(".");
      }
  
-@@ -8999,6 +9010,15 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
+@@ -8999,6 +9012,15 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
      if (const char * env = getenv("GGML_OPENCL_FUSE_0049")) {
          backend_ctx->fuse_0049 = atoi(env);
      }
@@ -61,7 +63,7 @@ index 5e8da87..70d2047 100644
      if (const char * env = getenv("GGML_OPENCL_TOPK_MOE_LEGACY")) {
          backend_ctx->topk_moe_legacy = atoi(env) != 0;
      }
-@@ -11237,6 +11257,133 @@ static void ggml_cl_cpy_run_fused(ggml_backend_t backend, const ggml_opencl_cpy_
+@@ -11237,6 +11259,136 @@ static void ggml_cl_cpy_run_fused(ggml_backend_t backend, const ggml_opencl_cpy_
      backend_ctx->enqueue_ndrange_kernel(kernel, 1, global_work_size, local_work_size, run.dst[run.n - 1]);
  }
  
@@ -187,7 +189,10 @@ index 5e8da87..70d2047 100644
 +    CL_CHECK(clSetKernelArg(k, arg++, sizeof(float),    &eps2));
 +    CL_CHECK(clSetKernelArg(k, arg++, sizeof(float),    &s2));
 +    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int),      &red));
-+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(float) * (nth / sgs), NULL));
++    // local memory for the smallest sub-group the kernel could be built at (8): the kernel counts its
++    // sub-groups from get_max_sub_group_size(), which follows cl_intel_required_subgroup_size when the
++    // device advertises it and the compiler's choice when not
++    CL_CHECK(clSetKernelArg(k, arg++, sizeof(float) * (nth / 8), NULL));
 +    size_t gws[1] = { (size_t) nrows * nth }, lws[1] = { (size_t) nth };
 +    backend_ctx->enqueue_ndrange_kernel(k, 1, gws, lws, y);
 +}
@@ -195,7 +200,7 @@ index 5e8da87..70d2047 100644
  static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
      backend_ctx->graph_gen++;
-@@ -11248,6 +11395,7 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+@@ -11248,6 +11400,7 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                        backend_ctx->device_name.c_str(), (long long) backend_ctx->f16_copy_n, backend_ctx->f16_copy_bytes / (1024.0 * 1024.0));
      }
      ggml_cl_gdn_gate_prepass(backend_ctx, cgraph);
@@ -203,7 +208,7 @@ index 5e8da87..70d2047 100644
  
      for (int i = 0; i < cgraph->n_nodes; i++) {
          ggml_tensor * node = cgraph->nodes[i];
-@@ -11268,6 +11416,14 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+@@ -11268,6 +11421,14 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
              continue;   // a gating op the GDN kernel computes itself (patch 0051)
          }
  
@@ -218,14 +223,16 @@ index 5e8da87..70d2047 100644
          if (!backend_ctx->disable_fusion) {
              int act = 0; float s2 = 1.0f;
              const int nf = ggml_opencl_can_fuse_scale_act(backend_ctx, cgraph, i, &act, &s2);
-@@ -11477,6 +11633,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+@@ -11477,6 +11638,14 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
          GGML_ASSERT(ok);
      }
  
-+    if (!backend_ctx->ngpt_told && (backend_ctx->ngpt_fused > 0 || backend_ctx->ngpt_refused > 0)) {
-+        backend_ctx->ngpt_told = true;
-+        GGML_LOG_INFO("ggml_opencl: the nGPT update fused %d times in a graph (%d of them in place), %d refused (an overlap with its inputs); GGML_OPENCL_FUSE_NGPT=0 keeps the separate kernels\n",
-+                      backend_ctx->ngpt_fused, backend_ctx->ngpt_inplace, backend_ctx->ngpt_refused);
++    // once for each distinct (fused, in place, refused) a graph shows: the prompt's and the decode's
++    // graphs, and a later graph that refuses where an earlier one fused, each say so (at most 32 lines)
++    if ((backend_ctx->ngpt_fused > 0 || backend_ctx->ngpt_refused > 0) && backend_ctx->ngpt_told.size() < 32 &&
++        backend_ctx->ngpt_told.emplace(backend_ctx->ngpt_fused, backend_ctx->ngpt_inplace, backend_ctx->ngpt_refused).second) {
++        GGML_LOG_INFO("ggml_opencl: the nGPT update fused %d times in a graph of %d nodes (%d of them in place), %d refused (an overlap with its inputs); GGML_OPENCL_FUSE_NGPT=0 keeps the separate kernels\n",
++                      backend_ctx->ngpt_fused, cgraph->n_nodes, backend_ctx->ngpt_inplace, backend_ctx->ngpt_refused);
 +    }
 +
      return GGML_STATUS_SUCCESS;
@@ -329,13 +336,13 @@ index 79043fe..68811bb 100644
 +    }
 +}
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index a04f4f9..1c154a5 100644
+index a04f4f9..5b04891 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -3974,6 +3974,64 @@ struct test_rms_norm_back : public test_case {
+@@ -3973,6 +3973,64 @@ struct test_rms_norm_back : public test_case {
+     }
  };
  
- // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
 +// ARC-LAB 0114: Dory's nGPT residual update, y = norm(a + w * (norm(x) - a)) with
 +// norm(v) = rms_norm(v, 1e-6/n) / sqrt(n), built as the model builds it (RMS_NORM SCALE SUB MUL ADD
 +// RMS_NORM SCALE): OpenCL runs it as one kernel. alpha_first puts w as the mul's first operand (one
@@ -394,9 +401,9 @@ index a04f4f9..1c154a5 100644
 +    }
 +};
 +
+ // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
  struct test_rms_norm_mul_add : public test_case {
      const ggml_type type;
-     const std::array<int64_t, 4> ne;
 @@ -11271,6 +11329,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, false, true));
      test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, false, true));
