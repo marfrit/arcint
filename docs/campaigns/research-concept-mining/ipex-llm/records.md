@@ -1,0 +1,4251 @@
+# Pass 1 — one record a commit, intel/ipex-llm (4,113 commits)
+
+Read from `~/research/ipex-llm/ipex-commits.txt` (messages, bodies and stats, oldest first; head `de6bce27`).
+Evidence class: the numbers are the commit's own statement, `paper` for arcint; no source reading of a kernel is
+in this file (the repository holds none for the llama.cpp path) — the mechanism reading is in `binary.md`.
+Score 0-3: 3 = a mechanism our three units could gain from, 2 = plausible and needs pricing, 1 = carries only as
+background or plumbing, 0 = does not carry (docs, examples, CI, other hardware). Areas: attn, gemm, deltanet,
+moe, mtp, kv, quant, mem, sync, build, docs, other. Kinds: kernel, fusion, sched, knob, instr, fix, revert, docs.
+One record a commit; a header and a count every 100 commits.
+
+Counts at 0/1/2/3: **3059 / 914 / 131 / 9** (4113 commits).
+
+- `a21f6286a9` `2017-03-14` **other** · other · kept — refactor; no numbers stated; `score 0`
+- `ce2f8eace7` `2017-03-14` **other** · docs · kept — refactor; no numbers stated; `score 0`
+- `fa197ab132` `2017-03-21` **other** · other · kept — merge visualization; no numbers stated; `score 0`
+- `27fa496c66` `2017-03-22` **other** · docs · kept — change wiki link after code restructuring; no numbers stated; `score 0`
+- `1c38bb6a4a` `2017-03-21` **other** · docs · kept — add Tensor wrapper add CrossEntropyCriterion; no numbers stated; `score 0`
+- `926f5b99d4` `2017-03-22` **other** · knob · kept — add Merge Module to the constructor to support multi-layer BiRNN; no numbers stated; `score 0`
+- `46d8bceccd` `2017-03-22` **other** · knob · kept — add a default null for constuctor; no numbers stated; `score 0`
+- `10d960b98d` `2017-03-07` **other** · other · kept — add module.predict; no numbers stated; `score 0`
+- `66fd888294` `2017-03-09` **other** · other · kept — Add sizeAverage for TimeDistributedCriterion; no numbers stated; `score 0`
+- `8d700bbf15` `2017-02-17` **other** · other · kept — add buildHidden to LSTM; no numbers stated; `score 0`
+- `de51a6c2c7` `2017-03-24` **other** · knob · kept — add LSTMPeephole python support; no numbers stated; `score 0`
+- `e4ef14aec0` `2017-03-22` **other** · other · kept — add scala doc and python doc; no numbers stated; `score 0`
+- `3ea529007e` `2017-03-28` **other** · other · removed — delete copy; no numbers stated; `score 0`
+- `bd8ff151d4` `2017-03-03` **other** · other · kept — add Validator test; no numbers stated; `score 0`
+- `1279ddd779` `2017-03-28` **other** · other · kept — add some scala doc; no numbers stated; `score 0`
+- `654e1b979d` `2017-03-28` **other** · other · kept — add scala documentation; no numbers stated; `score 0`
+- `94f513dde5` `2017-03-28` **other** · other · kept — add some more scala doc; no numbers stated; `score 0`
+- `25c52f03c9` `2017-03-29` **other** · other · kept — meet code review; no numbers stated; `score 0`
+- `fa0de39ebc` `2017-03-28` **other** · other · kept — add some docs; no numbers stated; `score 0`
+- `70a57a22e6` `2017-03-22` **other** · other · kept — add python and scala docs; no numbers stated; `score 0`
+- `267cdfecb5` `2017-03-29` **other** · other · kept — add scala doc; no numbers stated; `score 0`
+- `dc35750ee3` `2017-03-29` **other** · other · kept — add doc; no numbers stated; `score 0`
+- `ba706ab6bf` `2017-03-30` **other** · other · kept — meet code review; no numbers stated; `score 0`
+- `afffd380f4` `2017-03-29` **other** · other · kept — add some python doc; no numbers stated; `score 0`
+- `4e5a4eed70` `2017-03-30` **other** · other · kept — add softmargincriterion change spelling of rnn; no numbers stated; `score 0`
+- `8af37fb3d1` `2017-03-30` **other** · other · kept — update mixturetable; no numbers stated; `score 0`
+- `b5667da383` `2017-03-31` **other** · other · kept — add more comments; no numbers stated; `score 0`
+- `2cb8c4733d` `2017-03-31` **other** · other · kept — add python doc; no numbers stated; `score 0`
+- `39d200138e` `2017-03-30` **other** · other · kept — Add some docs; no numbers stated; `score 0`
+- `83fe17e56d` `2017-03-31` **other** · knob · removed — modify more docs and remove unnecessary parameters; no numbers stated; `score 0`
+- `71ab6499ba` `2017-03-31` **other** · other · kept — Merge pull request #712 from psyyz10/pythongdoc; no numbers stated; `score 0`
+- `bee2c6785b` `2017-02-22` **other** · knob · kept — add accGradParameters to Sequential and test it; no numbers stated; `score 0`
+- `48f7906916` `2017-04-01` **mem** · other · kept — clear the weights then clone to save memory; no numbers stated; `score 0`
+- `a490064b84` `2017-04-01` **other** · other · kept — clear the gradWeights; no numbers stated; `score 0`
+- `7da379d25f` `2017-04-01` **other** · other · kept — cloned module weights.set(); no numbers stated; `score 0`
+- `54db853717` `2017-04-01` **other** · other · kept — add backward to sequential; no numbers stated; `score 0`
+- `a32e029750` `2017-04-07` **other** · other · removed — remove Array[Future]; make it run in single thread; no numbers stated; `score 0`
+- `c182728d84` `2017-04-11` **other** · other · kept — Merge pull request #498 from psyyz10/sequential; no numbers stated; `score 0`
+- `80db4b9ab5` `2017-03-22` **other** · knob · kept — Make Recurrent support lazy Dropout; no numbers stated; `score 0`
+- `efb7b097cf` `2017-03-22` **other** · knob · kept — Add Dropout api to LSTM; no numbers stated; `score 0`
+- `db5a34b780` `2017-03-23` **other** · other · kept — add comments to Dropout; no numbers stated; `score 0`
+- `8efdb5c653` `2017-03-23` **other** · other · kept — Add test of recurrent dropout; no numbers stated; `score 0`
+- `c6de79c903` `2017-03-23` **other** · fix · kept — fix a bug for droput when input is not contiguous; no numbers stated; `score 0`
+- `6e6262d58c` `2017-03-24` **other** · other · removed — remove isLazy and flag from Dropout and add isResampleing; no numbers stated; `score 0`
+- `d6215bff3d` `2017-03-24` **other** · other · kept — add more docuemnts to Cell class; no numbers stated; `score 0`
+- `d14969f7d8` `2017-04-06` **other** · other · kept — add dropout to lstmPeepwhole; no numbers stated; `score 0`
+- `8fa9229208` `2017-04-11` **other** · other · kept — add more comments; no numbers stated; `score 0`
+- `1ecfdad0c2` `2017-04-12` **other** · other · kept — add VolumetricConvolution; no numbers stated; `score 0`
+- `ee6adf0813` `2017-04-11` **other** · other · kept — checkin graph; no numbers stated; `score 0`
+- `790c2569c6` `2017-04-18` **other** · knob · kept — support DiceCoefficient; no numbers stated; `score 0`
+- `c225959f28` `2017-04-18` **other** · sched · kept — revise Parallel to serial in spec; no numbers stated; `score 0`
+- `069c023a50` `2017-04-05` **other** · other · kept — add evaluator; no numbers stated; `score 0`
+- `3c3bae9361` `2017-04-19` **other** · other · kept — change some vars to vals; no numbers stated; `score 0`
+- `2d917167fd` `2017-04-25` **other** · other · kept — assign updateOutput return value to output; no numbers stated; `score 0`
+- `3e95bab852` `2017-04-11` **other** · other · kept — add docs for lookuptable; no numbers stated; `score 0`
+- `080d726bd8` `2017-04-18` **other** · other · removed — remove unnecessary clone in FlattenTable; no numbers stated; `score 0`
+- `57bcf13300` `2017-04-17` **other** · knob · kept — add 4d normalize support; no numbers stated; `score 0`
+- `27b8319723` `2017-04-26` **other** · other · kept — refactor squeeze layer; no numbers stated; `score 0`
+- `bd61037ded` `2017-04-25` **other** · knob · kept — update biRecurrent and add adam optim method in python api; no numbers stated; `score 0`
+- `442ea61112` `2017-04-28` **other** · other · kept — add VolumetricMaxPooling; no numbers stated; `score 0`
+- `75c96b523d` `2017-05-04` **other** · other · kept — revise Graph and DirectedGraph; no numbers stated; `score 0`
+- `708cbe73f2` `2017-04-06` **other** · other · kept — set weights per layer; no numbers stated; `score 0`
+- `3e6e055cdc` `2017-05-05` **other** · other · kept — merge master; no numbers stated; `score 0`
+- `6548dcd66e` `2017-05-08` **other** · knob · kept — Support layerwise, weight-bias separated and multiple sorts (L1, L2 and others) of regularization; no numbers stated; `score 0`
+- `6c7506541e` `2017-05-05` **other** · other · kept — update style and set/get weights method name; no numbers stated; `score 0`
+- `d7d1f3875a` `2017-05-09` **other** · other · kept — Merge branch 'master' of https://github.com/intel-analytics/BigDL into set_weights; no numbers stated; `score 0`
+- `16eafb4e52` `2017-05-11` **other** · fix · kept — fix bug of CMul and CAdd when getParameters is called; no numbers stated; `score 0`
+- `446e774c01` `2017-05-18` **other** · fix · kept — fix the Squeeze layer for multi dimension; no numbers stated; `score 0`
+- `ba1f202d8b` `2017-05-18` **other** · fix · kept — fix the bug of SpatialDilatedConvolution; no numbers stated; `score 0`
+- `e1d987f458` `2017-05-19` **other** · other · kept — Refine model name; no numbers stated; `score 0`
+- `52cc3d2fbe` `2017-05-08` **gemm** · other · kept — linear; initialize gradWeight when running backward; no numbers stated; `score 0`
+- `00d473811a` `2017-05-24` **other** · fix · kept — fix ConcatTable.clearState() don't clear gradInput when gradInput is a table; no numbers stated; `score 0`
+- `fc15ce4521` `2017-05-25` **other** · fix · kept — fix bug in Concat layer and Add backward to ConcatTable; no numbers stated; `score 0`
+- `9c39513289` `2017-05-31` **other** · other · kept — add tensor size info when requirement failed; no numbers stated; `score 0`
+- `776009b736` `2017-06-05` **other** · fix · kept — fix BCECriterion; no numbers stated; `score 0`
+- `7b9e5cbd15` `2017-06-06` **mem** · other · kept — share memory in CAddTable for LSTM, GRU, SimpleRNN; no numbers stated; `score 0`
+- `65afa653be` `2017-06-06` **other** · fix · kept — fix add bug; no numbers stated; `score 0`
+- `8437b7b12c` `2017-06-07` **other** · other · kept — change SelectTable from Container to AbstractModule; no numbers stated; `score 0`
+- `1342865e4d` `2017-06-07` **other** · other · kept — Add isTensor and isTable method in Activity with additional test cases; no numbers stated; `score 0`
+- `f6afb611b0` `2017-06-07` **other** · other · kept — refactor InitializationMethod; no numbers stated; `score 0`
+- `17349e48d9` `2017-06-07` **other** · other · kept — some new layer and existing layer refactor; no numbers stated; `score 0`
+- `970763f895` `2017-06-08` **other** · other · removed — delete useless CriterionTable; no numbers stated; `score 0`
+- `c58a6ab420` `2017-06-08` **other** · fix · kept — refactor smoothL1Criterion and fix tensor storage usage; no numbers stated; `score 0`
+- `54c1021b0d` `2017-06-08` **other** · knob · kept — add python api; no numbers stated; `score 0`
+- `c67f7f4a76` `2017-06-09` **other** · other · kept — unchange Euclidean input; no numbers stated; `score 0`
+- `98535688fe` `2017-06-14` **other** · fix · kept — fix concat return incorrect result when output is 1D; no numbers stated; `score 0`
+- `5cf02b6bc0` `2017-06-16` **other** · fix · kept — Fix HardShrink factory method; no numbers stated; `score 0`
+- `9e94774514` `2017-06-20` **other** · other · kept — using set instead of copy for output and gradInput; no numbers stated; `score 0`
+- `016b668171` `2017-06-21` **other** · knob · kept — Support Tensorflow model file read/write; no numbers stated; `score 0`
+- `bf25d2de72` `2017-06-20` **other** · other · kept — Patch to improve error message when the target (label) value starts at 0; no numbers stated; `score 0`
+- `1525c950d0` `2017-06-21` **other** · other · kept — update some doc; no numbers stated; `score 0`
+- `f695785ab0` `2017-06-22` **other** · other · kept — Python regularizer; no numbers stated; `score 0`
+- `0730824d61` `2017-06-22` **other** · other · kept — Allow layer regulazier set after model definition, add regulazier for cadd and cmul; no numbers stated; `score 0`
+- `9a643ab0c8` `2017-06-22` **other** · other · kept — change Table to Tensor in L1HingeEmbeddingCriterion; no numbers stated; `score 0`
+- `1210ae50fe` `2017-06-23` **other** · knob · kept — Caffe Model Support - Load Caffe Dynamically from Prototxt and Binary; no numbers stated; `score 0`
+- `ff2ada5f87` `2017-06-23` **other** · other · kept — let getNamedModule also return containers, add unit test for it; no numbers stated; `score 0`
+- `ca2dce6049` `2017-06-23` **other** · knob · kept — rename apply to inputs when define connection in Graph API; no numbers stated; `score 0`
+- `df08717f07` `2017-06-23` **other** · other · kept — add L1HingeEmbeddingCriterion unit test for python; no numbers stated; `score 0`
+- `20517a36c7` `2017-06-26` **other** · other · kept — Polish InferReshape documentation; no numbers stated; `score 0`
+- `ae0ba8a35d` `2017-06-27` **other** · other · kept — Separate scale into scaleW and scaleB; no numbers stated; `score 0`
+
+*Commits 1-100 (2017-03-14..2017-06-27): scores 0/1/2/3 = 100/0/0/0; areas other 97, mem 2, gemm 1.*
+
+- `96528b334f` `2017-06-29` **other** · other · kept — add preTopology to boost performance of rnn; no numbers stated; `score 0`
+- `a75550b1da` `2017-06-28` **other** · fix · kept — fix RnnCell factory method; no numbers stated; `score 0`
+- `0fea118680` `2017-06-30` **other** · knob · kept — makedown docs for some API; no numbers stated; `score 0`
+- `6c09fdc644` `2017-06-30` **other** · fix · kept — fix some unit test; no numbers stated; `score 0`
+- `9d9ea0c2f4` `2017-06-30` **other** · fix · kept — fix VolumetricConvolution unit test, and fix bug in batch mode; no numbers stated; `score 0`
+- `44d65c765b` `2017-07-03` **other** · fix · kept — fix set bugs for fInput and fGradInput in TimeDistributed layer; no numbers stated; `score 0`
+- `4f92f58e2e` `2017-07-04` **other** · other · kept — Checkin document pages; no numbers stated; `score 0`
+- `ed95a2be0f` `2017-07-04` **other** · other · kept — revise hashCode to avoid null pointer; no numbers stated; `score 0`
+- `5e852b278c` `2017-07-05` **other** · knob · kept — Timedistributed add getParametersTable method; no numbers stated; `score 0`
+- `ffae7fa1ba` `2017-07-06` **gemm** · other · kept — optimize GRU by pre-calculating three linear operations; no numbers stated; `score 0`
+- `2f25b70660` `2017-07-06` **gemm** · other · kept — Optimize LSTMPeephole by pre-calculating the input2hidden linear; no numbers stated; `score 0`
+- `9f00c87f7d` `2017-07-06` **other** · other · kept — Make SpatialFullConvolution declare with implict numeric type; no numbers stated; `score 0`
+- `6d7f846894` `2017-07-07` **other** · other · removed — Remove unnecessary varialbe in Recurrent object construtor; no numbers stated; `score 0`
+- `7bb0d92a68` `2017-07-05` **other** · knob · kept — support spatial convultion without bias; no numbers stated; `score 0`
+- `ea6ad9dd90` `2017-07-06` **other** · fix · kept — fix comments; no numbers stated; `score 0`
+- `2b9d72caea` `2017-06-26` **other** · knob · kept — support convlstm and convolution without bias; no numbers stated; `score 0`
+- `b15db4690b` `2017-07-06` **other** · fix · kept — fix comments; no numbers stated; `score 0`
+- `f4170c89ef` `2017-07-10` **other** · fix · kept — fix bugs in convLSTM; no numbers stated; `score 0`
+- `dfc5958854` `2017-07-11` **other** · other · kept — save module weights, load (all / part) module weights; no numbers stated; `score 0`
+- `36685c3226` `2017-07-11` **other** · other · kept — Caffe persister; no numbers stated; `score 0`
+- `f1c300d730` `2017-07-10` **other** · other · kept — RNN cells do not execute preTopology in Dropout mode; no numbers stated; `score 0`
+- `01e8b8d2d8` `2017-07-11` **other** · other · kept — save/load model from s3; no numbers stated; `score 0`
+- `381a6089fe` `2017-07-10` **other** · other · kept — add optimation for convlstm; no numbers stated; `score 0`
+- `3e90228f9d` `2017-07-10` **other** · other · kept — improve perf and add md; no numbers stated; `score 0`
+- `fe05012ea9` `2017-07-12` **other** · fix · kept — Fix a bug in the MV layer; no numbers stated; `score 0`
+- `9909c1e630` `2017-07-12` **other** · other · kept — Add 1D Convolution (TemporalConvolution); no numbers stated; `score 0`
+- `98717d6d8b` `2017-07-12` **other** · fix · kept — Fix maptable bug; no numbers stated; `score 0`
+- `76411f929a` `2017-07-07` **other** · other · kept — create localModule and update local predictor; no numbers stated; `score 0`
+- `1373b79587` `2017-07-07` **other** · other · kept — update abstract module; no numbers stated; `score 0`
+- `52fc2bcba5` `2017-07-10` **other** · other · kept — update local jvm with comments; no numbers stated; `score 0`
+- `1033e735b7` `2017-07-12` **other** · other · kept — Make ClassNLL can process -1 label for padding, not update the model.; no numbers stated; `score 0`
+- `d733f90901` `2017-07-13` **other** · other · kept — Tree LSTM with Sentiment classification example; no numbers stated; `score 0`
+- `5b665b64cf` `2017-07-13` **other** · fix · kept — fix inception and xavier; no numbers stated; `score 0`
+- `df873d648c` `2017-07-13` **other** · knob · kept — BatchNormalization accepts default values; no numbers stated; `score 0`
+- `ee994fb14d` `2017-07-13` **other** · other · kept — convert back convlstm optimization; no numbers stated; `score 0`
+- `dfdb03cc17` `2017-07-13` **other** · fix · kept — fix concat when the dimension concatenated along is larger than 2; no numbers stated; `score 0`
+- `1c2d630932` `2017-07-18` **other** · fix · kept — Fix the bug of JoinTable after calling clearState(); no numbers stated; `score 0`
+- `9c449c1ac7` `2017-07-18` **other** · other · kept — optimize joinTable perf; no numbers stated; `score 0`
+- `7aa7bd16e8` `2017-07-18` **other** · knob · removed — add load caffe model doc, remove useless parameter, add python api; no numbers stated; `score 0`
+- `f658e378ce` `2017-07-18` **other** · fix · kept — fix SpatialConvolution's hashcode and clearState will throw NullPointerException; no numbers stated; `score 0`
+- `c91f5242ab` `2017-07-19` **other** · other · kept — update shared convolution; no numbers stated; `score 0`
+- `e16bfe4599` `2017-07-19` **other** · other · kept — Graph doc; no numbers stated; `score 0`
+- `7772dece03` `2017-07-18` **other** · other · kept — Refine tensorflow doc (a follow up of pr #1253 to meet code review); no numbers stated; `score 0`
+- `b51c466961` `2017-07-19` **other** · other · kept — add CosineDistanceCriterion; no numbers stated; `score 0`
+- `dc0d060505` `2017-07-20` **other** · fix · kept — fix batchSize non-consistency bug; no numbers stated; `score 0`
+- `ea3f8cf661` `2017-07-20` **other** · other · kept — Add scala tensorflow load/save examples; no numbers stated; `score 0`
+- `0ed660313a` `2017-07-20` **other** · fix · kept — Recurrent: fix clearState; no numbers stated; `score 0`
+- `13ea525adc` `2017-07-24` **other** · other · removed — remove unnecessary contiguous check in volumetricconvolution; no numbers stated; `score 0`
+- `543a3762af` `2017-07-25` **other** · other · kept — Convlstm3d; no numbers stated; `score 0`
+- `9757dbd1a7` `2017-07-26` **other** · knob · kept — Support global average pooling; no numbers stated; `score 0`
+- `61d443e51c` `2017-07-26` **other** · other · kept — add SpatialWithinChannelLRN, update the mapping of caffe lrn; no numbers stated; `score 0`
+- `4bf88dacb5` `2017-07-26` **other** · knob · kept — support get final state and cell; no numbers stated; `score 0`
+- `4e5e25662a` `2017-07-27` **other** · fix · kept — Fix temporalconv; no numbers stated; `score 0`
+- `1713f68127` `2017-07-27` **other** · other · kept — add regulaizer to volumetricconvolution; no numbers stated; `score 0`
+- `fc4fd2005b` `2017-07-27` **other** · other · kept — add regularizer for convlstmpeephole3d; no numbers stated; `score 0`
+- `2aa51233a8` `2017-08-02` **other** · other · kept — Check target size in ClassNll; no numbers stated; `score 0`
+- `3e610768be` `2017-08-03` **other** · other · kept — Add 3D de-convolution; no numbers stated; `score 0`
+- `fcdb4f0355` `2017-08-07` **other** · kernel · kept — add nhwc im2col and col2im kernel; no numbers stated; `score 0`
+- `38251491a6` `2017-08-10` **other** · other · kept — Set hiddenstate; no numbers stated; `score 0`
+- `86371f3907` `2017-08-11` **other** · other · kept — LSTM to Graph; no numbers stated; `score 0`
+- `ce22aae616` `2017-08-11` **other** · other · kept — SimpleRNN to Graph; no numbers stated; `score 0`
+- `914216b258` `2017-08-11` **other** · other · kept — GRU to Graph; no numbers stated; `score 0`
+- `59aa377c8b` `2017-08-11` **other** · other · kept — revise LSTMPeephole to Graph; no numbers stated; `score 0`
+- `7ac4bbfcc5` `2017-08-14` **other** · other · kept — add funcional model definition; no numbers stated; `score 0`
+- `78e5653d2a` `2017-08-14` **other** · fix · kept — fix copyStatus in TimeDistributed layer; no numbers stated; `score 0`
+- `7d8612d806` `2017-08-14` **attention** · kernel · kept — optimize logsoftmax; no numbers stated; `score 0`
+- `76007c1a30` `2017-08-14` **other** · knob · kept — support nhwc format in SpatialConvolution; no numbers stated; `score 0`
+- `6baef96116` `2017-08-16` **other** · other · removed — remove set operation; no numbers stated; `score 0`
+- `058a1cac5e` `2017-08-16` **other** · other · kept — add mkl.tanh; no numbers stated; `score 0`
+- `c358955cef` `2017-08-16` **other** · other · kept — Add abstract Operation, Add, Substract, Multiply and Divide operations; no numbers stated; `score 0`
+- `0f372cd19c` `2017-08-16` **other** · knob · kept — support same padding in maxpooling and avgpooling; no numbers stated; `score 0`
+- `377d90cd4d` `2017-08-17` **other** · other · kept — optimize Sigmoid; no numbers stated; `score 0`
+- `2a29808ffc` `2017-08-17` **other** · other · kept — add getTimes in recurrent and TimeDistributed layer; no numbers stated; `score 0`
+- `69fe0e2722` `2017-08-18` **other** · knob · kept — support layerwise serialization; no numbers stated; `score 0`
+- `2f75079c81` `2017-08-20` **other** · knob · kept — Support NHWC format in SpatialMaxPooling; no numbers stated; `score 0`
+- `56d4d42712` `2017-08-23` **other** · knob · kept — Disable backpropagation for general layers; no numbers stated; `score 0`
+- `f1b8f790cd` `2017-08-23` **other** · fix · kept — fix inplace layer clearstate; no numbers stated; `score 0`
+- `4586cfa84b` `2017-08-24` **other** · other · kept — Give Detailed information of nn exception; no numbers stated; `score 0`
+- `b87cf0f95d` `2017-08-24` **other** · knob · kept — support NHWC format in SpatialAveragePooling; no numbers stated; `score 0`
+- `e71a4dcf55` `2017-08-25` **other** · knob · kept — Serialization - version control & python API; no numbers stated; `score 0`
+- `9415d4f3d0` `2017-08-25` **other** · knob · kept — Recurrent supports BatchNormalization; no numbers stated; `score 0`
+- `370291a66b` `2017-08-28` **other** · other · kept — change tanh backward; no numbers stated; `score 0`
+- `daf7344ef5` `2017-08-28` **other** · other · kept — add BatchParams for BiRecurrent layer; no numbers stated; `score 0`
+- `a9ba423241` `2017-08-28` **other** · other · kept — BifurcateSplitTable; no numbers stated; `score 0`
+- `170f72c534` `2017-08-29` **other** · other · kept — add isSplitInput in BiRecurrent; no numbers stated; `score 0`
+- `391d3feaf0` `2017-08-29` **other** · other · removed — Remove the code dealing with translating tensorflow NHWC format to BigDL NCHW format; no numbers stated; `score 0`
+- `d345ad10a4` `2017-08-30` **other** · other · kept — add isInputWithBias and isHiddenWithBias for RNNCell; no numbers stated; `score 0`
+- `19737f3a6e` `2017-09-01` **other** · knob · kept — serialization - add custom data conversion support; no numbers stated; `score 0`
+- `33ab8e8fe5` `2017-09-01` **other** · other · kept — Add LogicalNot, LogicalOr and LogicalAnd; no numbers stated; `score 0`
+- `23dfc7a222` `2017-09-01` **other** · other · kept — 1D Max Pooling; no numbers stated; `score 0`
+- `6fedfc5ca1` `2017-09-01` **other** · other · kept — Add Squeeze, Prod, Sum, Reshape, Identity, ReLU; no numbers stated; `score 0`
+- `34baa6cfc4` `2017-09-04` **other** · other · kept — Allow module output multiple tensor in Graph; no numbers stated; `score 0`
+- `6f368cfa35` `2017-09-04` **other** · knob · kept — support loading a subset of tf graph and support control dependency in graph; no numbers stated; `score 0`
+- `810059432e` `2017-09-06` **other** · other · kept — Make layer suppor different input and output numeric type and Add Equal Operation as an example; no numbers stated; `score 0`
+- `416dbb4e4b` `2017-09-07` **other** · other · kept — Add Greater and Less operations; no numbers stated; `score 0`
+- `d213b4df98` `2017-09-12` **other** · other · kept — Display bigdl model in tensorboard; no numbers stated; `score 0`
+- `e16f246980` `2017-09-12` **other** · fix · kept — Fix operation logical related bugs; no numbers stated; `score 0`
+- `b4919497fc` `2017-09-14` **other** · knob · kept — Support switch and merge operation; no numbers stated; `score 0`
+- `88e2e4583b` `2017-09-15` **attention** · kernel · kept — Add Floor L2Loss RandomUniform Rank MatMul SoftMax operations; no numbers stated; `score 0`
+- `e7e78e5ea9` `2017-09-15` **other** · other · kept — Implement and test Conv2d operation; no numbers stated; `score 0`
+
+*Commits 101-200 (2017-06-29..2017-09-15): scores 0/1/2/3 = 100/0/0/0; areas other 96, gemm 2, attention 2.*
+
+- `1b5ad05658` `2017-09-15` **other** · fix · kept — Fix failed tensorflow unit test; no numbers stated; `score 0`
+- `29626d863a` `2017-09-18` **other** · knob · kept — support multi output in graph follow up; no numbers stated; `score 0`
+- `4d0aaf96ea` `2017-09-19` **other** · other · kept — optimize copy in recurrent; no numbers stated; `score 0`
+- `42fafc3ba0` `2017-09-19` **other** · knob · kept — support different type in tensorflow loader; no numbers stated; `score 0`
+- `4cb832c141` `2017-09-20` **other** · other · kept — Add assert, image decoders, parseExample operation; no numbers stated; `score 0`
+- `cc21eaf0cf` `2017-09-20` **other** · other · kept — Add slice and onehot; no numbers stated; `score 0`
+- `956593ad02` `2017-09-21` **other** · other · kept — Handle null array; no numbers stated; `score 0`
+- `f7ea6315e5` `2017-09-21` **other** · knob · kept — Support load tf unet; no numbers stated; `score 0`
+- `aa31da4797` `2017-09-21` **attention** · kernel · kept — fix Logsoftmax infinity error; no numbers stated; `score 0`
+- `08161f96ed` `2017-09-25` **other** · other · kept — Add Assign, Cast, ExpandDims, MaxPool operations; no numbers stated; `score 0`
+- `e66d7f6e8f` `2017-09-25` **other** · other · kept — Add Realdiv, BiasAdd and Pad; no numbers stated; `score 0`
+- `423027c89d` `2017-09-25` **other** · knob · kept — Support Tensorflow Preprocessing; no numbers stated; `score 0`
+- `1e1466b33d` `2017-09-26` **other** · other · kept — refactor predictor; no numbers stated; `score 0`
+- `ce4f777a39` `2017-09-27` **other** · other · kept — Refine tensorflow loader code strcuture; no numbers stated; `score 0`
+- `46a7195bbe` `2017-09-27` **other** · other · kept — 1. throw exception when ConcatTable contains no submodule; no numbers stated; `score 0`
+- `da17fa7586` `2017-09-27` **other** · knob · kept — Support feed prior prediction back into recurrent; no numbers stated; `score 0`
+- `34a3b0f5fa` `2017-09-29` **other** · sched · kept — Refine scheduler; no numbers stated; `score 0`
+- `b63bea22a6` `2017-08-13` **other** · fix · kept — fix MapTable issue; no numbers stated; `score 0`
+- `99da09f0ed` `2017-10-09` **other** · knob · kept — Tensor types support; no numbers stated; `score 0`
+- `2a23278691` `2017-10-09` **quant** · other · kept — feat: quantization methods; no numbers stated; `score 0`
+- `7a5dfa350b` `2017-10-09` **quant** · knob · kept — feat: quantized tensor support; no numbers stated; `score 0`
+- `af0aaccf68` `2017-10-10` **other** · knob · kept — support graph; no numbers stated; `score 0`
+- `8bf29dc119` `2017-10-10` **quant** · other · kept — feat: serilization for quantized modules; no numbers stated; `score 0`
+- `3470d5e205` `2017-10-10` **quant** · other · kept — feat: quantized convolution; no numbers stated; `score 0`
+- `1f5c0a5701` `2017-10-10` **gemm** · other · kept — feat: quantized linear; no numbers stated; `score 0`
+- `05283d3b60` `2017-10-10` **quant** · other · kept — feat: quantized dilated conv; no numbers stated; `score 0`
+- `1ddcaa63fc` `2017-10-11` **quant** · other · kept — feat: quantize a whole graph/modules; no numbers stated; `score 0`
+- `2c4b9d83db` `2017-10-12` **other** · other · kept — Add tile operation; no numbers stated; `score 0`
+- `39113e9a2a` `2017-10-12` **other** · other · kept — add Variational Auto Encoder; no numbers stated; `score 0`
+- `5c66b437be` `2017-10-12` **other** · fix · kept — serveral fix for preprocessing; no numbers stated; `score 0`
+- `e3b1518c41` `2017-10-12` **other** · other · kept — RecurrentDecoder enhancement; no numbers stated; `score 0`
+- `7cbfdb88d4` `2017-10-13` **other** · other · kept — throw clear exception in lookuptable; no numbers stated; `score 0`
+- `cd9c7b6cf7` `2017-10-13` **gemm** · other · kept — SparseLinear SparseJoinTable DenseToSparse; no numbers stated; `score 0`
+- `f4ccc9f754` `2017-10-16` **other** · other · kept — move model freeze to AbstractModule; no numbers stated; `score 0`
+- `ec031c72a0` `2017-10-16` **other** · other · kept — Add BroadcastGradientArgs; no numbers stated; `score 0`
+- `d48acf9ab9` `2017-10-18` **other** · fix · kept — Fix duplicated msg proto; no numbers stated; `score 0`
+- `e72e2fae82` `2017-10-19` **other** · other · kept — add more layers and operations; no numbers stated; `score 0`
+- `a1508bc7f6` `2017-10-19` **other** · fix · kept — fix decode raw and StridedSlice and Transpose serilization issue; no numbers stated; `score 0`
+- `c58cf4b348` `2017-10-19` **other** · other · kept — add ptb model example; no numbers stated; `score 0`
+- `0cebe9d5f0` `2017-10-19` **other** · knob · kept — Support load more tensorflow operations; no numbers stated; `score 0`
+- `e8244efb6c` `2017-10-20` **quant** · fix · kept — fix: make the length of weight and gradWeight in quantized conv same length; no numbers stated; `score 0`
+- `a5ae91c6d2` `2017-10-23` **other** · other · kept — add toGraph; no numbers stated; `score 0`
+- `f2018c6614` `2017-10-25` **other** · fix · kept — fix shape output tensor type from T to Int; no numbers stated; `score 0`
+- `2d593c46a2` `2017-10-27` **other** · other · kept — Clone graph keep their original prevs nodes and next nodes sequence; no numbers stated; `score 0`
+- `19c068e3c2` `2017-10-27` **other** · other · kept — MapTable: Add module back in clearstate; no numbers stated; `score 0`
+- `6656112ec8` `2017-10-31` **other** · other · kept — MSRA filler; no numbers stated; `score 0`
+- `a9a48ef47f` `2017-10-31` **other** · knob · kept — support argmax operation; no numbers stated; `score 0`
+- `fd60a000f6` `2017-11-01` **other** · other · kept — Caffe layer wise unit test; no numbers stated; `score 0`
+- `debbc93d92` `2017-11-02` **other** · other · kept — optimize MSECriterion and Adam; no numbers stated; `score 0`
+- `0bbcd78854` `2017-11-02` **other** · knob · kept — Support more tensorflow operations; no numbers stated; `score 0`
+- `7fb2dadba7` `2017-11-03` **other** · fix · kept — Fix cmul; no numbers stated; `score 0`
+- `9b24d126c3` `2017-11-03` **other** · other · kept — Add some operations; no numbers stated; `score 0`
+- `de2a9e8dac` `2017-11-03` **attention** · kernel · kept — Fix SmoothL1Criterion and SoftmaxWithCriterion; no numbers stated; `score 0`
+- `b645120771` `2017-11-06` **other** · other · kept — Add square related ops; no numbers stated; `score 0`
+- `b777c42cc9` `2017-11-06` **gemm** · other · kept — Add Maximum, Minimum, BatchMatMul; no numbers stated; `score 0`
+- `d1e162fb3c` `2017-11-09` **other** · knob · kept — Tf ParseExample add serialization support; no numbers stated; `score 0`
+- `45a62d2a12` `2017-11-10` **other** · sched · kept — time counting for paralleltable's forward/backward; no numbers stated; `score 0`
+- `a9112a8799` `2017-11-10` **other** · knob · kept — Support load more tensorflow operations; no numbers stated; `score 0`
+- `46b6b15c55` `2017-11-10` **other** · knob · kept — support SAME padding in 3d conv and allows user config padding size in convlstm and convlstm3d; no numbers stated; `score 0`
+- `9ffa8d08d1` `2017-11-14` **other** · fix · kept — fix loading ds2 module issue; no numbers stated; `score 0`
+- `7c17e0ac3d` `2017-11-07` **other** · other · kept — refator: update initialize method for serialization; no numbers stated; `score 0`
+- `bd8097b145` `2017-11-14` **other** · knob · kept — Support keras squared_hinge and sparse_categorial_crossentropy; no numbers stated; `score 0`
+- `a9b3cacd6a` `2017-11-15` **other** · knob · kept — Support keras model loading; no numbers stated; `score 0`
+- `1ff4bbc17a` `2017-11-17` **other** · knob · kept — Keras support - add Hard-sigmoid layer; no numbers stated; `score 0`
+- `f574783f77` `2017-11-21` **other** · other · kept — Add more keras layers and test; no numbers stated; `score 0`
+- `b5ef25947c` `2017-11-27` **other** · other · kept — Add serialization test for CAveTable and VolumetricAveragePooling; no numbers stated; `score 0`
+- `8654df46c6` `2017-11-27` **other** · fix · kept — fix graph missing generatebackward; no numbers stated; `score 0`
+- `c5cb592d63` `2017-11-27` **other** · other · kept — add activation for recurrent layers; no numbers stated; `score 0`
+- `a808c0aa6f` `2017-11-27` **other** · other · kept — add GaussianDropout, GaussianNoise layers; no numbers stated; `score 0`
+- `ab60cab53f` `2017-11-27` **other** · knob · kept — Keras support - add cosine proximity criterion; no numbers stated; `score 0`
+- `b233affcdf` `2017-11-28` **other** · other · kept — Add keras highway; no numbers stated; `score 0`
+- `5f8cbc7900` `2017-11-30` **other** · other · kept — Add Upsample3d; no numbers stated; `score 0`
+- `4671809646` `2017-12-04` **other** · knob · kept — Add an API to get node from graph model with given name; no numbers stated; `score 0`
+- `02d186814f` `2017-12-05` **other** · knob · kept — Support NHWC for LRN and batch normalization, and optimize batch normalization speed; no numbers stated; `score 0`
+- `3c6e08f4f7` `2017-12-05` **other** · knob · kept — Pb support bigmodel; no numbers stated; `score 0`
+- `e7ca47e837` `2017-12-05` **other** · knob · kept — feat: SReLU and ActivityRegularization support; no numbers stated; `score 0`
+- `c0202a79f9` `2017-12-05` **other** · knob · kept — add support for multiple tensornumerics; no numbers stated; `score 0`
+- `6a4d228113` `2017-12-06` **other** · knob · kept — Support Keras masking and maxoutdense; no numbers stated; `score 0`
+- `62731ce677` `2017-12-07` **other** · fix · kept — fix output allocation bug; no numbers stated; `score 0`
+- `33bc824adf` `2017-12-07` **other** · knob · kept — Add multiple rnn cell and support get/setHiddenState in Recurrent; no numbers stated; `score 0`
+- `4619ab5390` `2017-12-08` **other** · other · kept — Map newly added keras layers on python side; no numbers stated; `score 0`
+- `f48c0ed467` `2017-12-11` **other** · knob · kept — add Ser support to all tf related layers; no numbers stated; `score 0`
+- `569ee7aa97` `2017-12-11` **other** · other · kept — add MeanAbsolutePercentageCriterion & MeanSquaredLogarithmicCriterion; no numbers stated; `score 0`
+- `01be6ce1a4` `2017-12-11` **other** · other · kept — [loss] kullback_leibler_divergence and poisson; no numbers stated; `score 0`
+- `579f55b5a3` `2017-12-12` **other** · knob · kept — Support SperableConv2D and one hot crossentropy; no numbers stated; `score 0`
+- `231ff8b5e8` `2017-12-12` **other** · knob · kept — Add object detection related layers for model zoo and keras support; no numbers stated; `score 0`
+- `bcb8083824` `2017-12-12` **other** · knob · kept — support serialization unittest auto-check; no numbers stated; `score 0`
+- `bc4758b270` `2017-12-12` **other** · other · kept — Add image frame predict; no numbers stated; `score 0`
+- `46365ab6b3` `2017-12-13` **other** · other · kept — Add serialize unit test for new add layer; no numbers stated; `score 0`
+- `5a39246214` `2017-12-13` **other** · other · kept — UpSampling1D UpSampling2D; no numbers stated; `score 0`
+- `ef12a19dd4` `2017-12-13` **other** · fix · kept — Fix some issues found when save bigdl model to tensorflow format file; no numbers stated; `score 0`
+- `8961d576d1` `2017-12-13` **other** · other · kept — add more ops; no numbers stated; `score 0`
+- `ff346bc2eb` `2017-12-13` **other** · other · kept — Added Dilation2D, Dilation2DBackpropFilter, Dilation2DBackpropInput; no numbers stated; `score 0`
+- `5d6dbb4331` `2017-12-14` **other** · other · kept — Add conv3d related operations; no numbers stated; `score 0`
+- `79e95dbf8c` `2017-12-14` **other** · other · kept — add tensorflow operation SegmentSum; no numbers stated; `score 0`
+- `41b9cc70b1` `2017-12-14` **other** · fix · kept — Fix 1923: Use static graph execution when there's no control operation in graph container; no numbers stated; `score 0`
+- `c10ab1564e` `2017-12-14` **other** · other · kept — Add local model predictImage; no numbers stated; `score 0`
+- `e9e6f2e4ff` `2017-12-15` **other** · other · kept — get large model from executor; no numbers stated; `score 0`
+- `b597017810` `2017-12-15` **other** · other · kept — Concat check input size check; no numbers stated; `score 0`
+- `31d1519bbf` `2017-12-14` **other** · other · kept — Add Cropping2D and Cropping3D; no numbers stated; `score 0`
+
+*Commits 201-300 (2017-09-15..2017-12-14): scores 0/1/2/3 = 100/0/0/0; areas other 88, quant 7, gemm 3, attention 2.*
+
+- `9da2247f5a` `2017-12-15` **other** · other · kept — Refine textclassifier with data without headers and refactor to temporal convolution; no numbers stated; `score 0`
+- `e5a9fb1c52` `2017-12-15` **other** · other · kept — Add keras SpatialDropout1D, SpatialDropout2D, SpatialDropout3D; no numbers stated; `score 0`
+- `921feefcc0` `2017-12-18` **other** · other · kept — Lookup table for multivalue; no numbers stated; `score 0`
+- `29212b1f3a` `2017-12-18` **other** · other · kept — Add locallyconnected2d layer; no numbers stated; `score 0`
+- `ec716d6d85` `2017-12-18` **other** · fix · kept — fix null pointer exception in bn when affine is false; no numbers stated; `score 0`
+- `f64b92766b` `2017-12-18` **other** · other · kept — Locallyconnected1D; no numbers stated; `score 0`
+- `978a117cf1` `2017-12-21` **other** · other · kept — Map Keras LocallyConnected1D; no numbers stated; `score 0`
+- `46d64ceec7` `2017-12-21` **other** · fix · kept — Fix KLDCriterion forward; no numbers stated; `score 0`
+- `9f7d6c0a06` `2017-12-28` **other** · other · kept — optimize localpredictor for small dataset; no numbers stated; `score 0`
+- `331cc262c9` `2017-12-28` **other** · knob · kept — graph ser to support control node; no numbers stated; `score 0`
+- `f33af50bb9` `2017-12-28` **other** · other · kept — Refine KLDCriterion; no numbers stated; `score 0`
+- `417bba4dea` `2017-12-28` **gemm** · fix · kept — fix resize bilinear; no numbers stated; `score 0`
+- `66435fb69e` `2018-01-02` **other** · other · kept — Add TransformerCriterion; no numbers stated; `score 0`
+- `21dad26cbf` `2018-01-05` **other** · other · kept — Wrap layers that requires two ClassTags into TensorModuleWrapper and move to tf package; no numbers stated; `score 0`
+- `2ec0cd65aa` `2018-01-10` **other** · fix · kept — fix spatialfullconvolution bug; no numbers stated; `score 0`
+- `4b40cece51` `2018-01-14` **other** · other · kept — udpate equal; no numbers stated; `score 0`
+- `15c9662cd5` `2018-01-16` **other** · knob · kept — Module DenseToSparse support backward disable (or not) setting; no numbers stated; `score 0`
+- `39ec1ef0e3` `2018-01-16` **other** · knob · kept — Add default zeroGradParameters to AbstractModule; no numbers stated; `score 0`
+- `2f4a7732fb` `2018-01-19` **other** · fix · kept — fix recurrent; no numbers stated; `score 0`
+- `0c7f994ba8` `2018-01-22` **other** · fix · kept — fix leakyrelu; no numbers stated; `score 0`
+- `03e4f06d6f` `2018-01-22` **gemm** · knob · kept — Add NCHW support for resizebilinear; no numbers stated; `score 0`
+- `6c96b583bd` `2021-07-30` **other** · other · kept — root commit; no numbers stated; `score 0`
+- `64d78130d9` `2021-08-12` **other** · other · kept — root commit; no numbers stated; `score 0`
+- `afb83e2524` `2021-08-12` **sync** · other · kept — Merge branch 'bigdl-2.0' into upstream_bigdl-2.0; no numbers stated; `score 0`
+- `546a66dc99` `2021-08-12` **sync** · other · kept — Merge pull request #4473 from dding3/upstream_bigdl-2.0; no numbers stated; `score 0`
+- `ca613d322a` `2021-08-12` **other** · other · kept — Merge BigDL python into bigdlpython; no numbers stated; `score 0`
+- `136f0df47b` `2021-08-17` **other** · knob · kept — Support pip install in bigdl-nano; no numbers stated; `score 0`
+- `7c4de0bc15` `2021-08-17` **other** · other · kept — Merge branch 'bigdl-2.0' into move_visulazition; no numbers stated; `score 0`
+- `154730119f` `2021-08-17` **other** · other · kept — Merge branch 'bigdl-2.0' into move_visulazition; no numbers stated; `score 0`
+- `d0cb52f156` `2021-08-17` **other** · other · kept — Merge branch 'bigdl-2.0' into move_visulazition; no numbers stated; `score 0`
+- `3f216dff01` `2021-08-17` **other** · other · kept — Merge pull request #4498 from dding3/move_visulazition; no numbers stated; `score 0`
+- `259408ec4e` `2021-08-17` **other** · other · kept — Merge pull request #4498 from dding3/move_visulazition; no numbers stated; `score 0`
+- `e451cacd00` `2021-08-17` **other** · other · kept — Merge pull request #4498 from dding3/move_visulazition; no numbers stated; `score 0`
+- `62e35cae3a` `2021-08-18` **sync** · fix · kept — fix conflicts with upstream; no numbers stated; `score 0`
+- `500baab9ce` `2021-08-18` **sync** · fix · kept — fix conflicts with upstream; no numbers stated; `score 0`
+- `4396f4376a` `2021-08-18` **sync** · fix · kept — fix conflicts with upstream; no numbers stated; `score 0`
+- `42f6bd3c8d` `2021-08-18` **other** · other · kept — Merge pull request #4501 from dding3/bigdlpython-bakup; no numbers stated; `score 0`
+- `d4cbed7e1f` `2021-08-18` **other** · other · kept — Merge pull request #4501 from dding3/bigdlpython-bakup; no numbers stated; `score 0`
+- `578eec4184` `2021-08-18` **other** · other · kept — Merge pull request #4501 from dding3/bigdlpython-bakup; no numbers stated; `score 0`
+- `2e604cdd05` `2021-08-20` **sync** · other · kept — merge with upstream_bigdl_2.0; no numbers stated; `score 0`
+- `308a68007b` `2021-08-20` **sync** · other · kept — merge with upstream_bigdl_2.0; no numbers stated; `score 0`
+- `cb17823cee` `2021-08-20` **sync** · other · kept — merge with upstream_bigdl_2.0; no numbers stated; `score 0`
+- `551b376455` `2021-08-20` **sync** · other · kept — merge with upstream_bigdl_2.0; no numbers stated; `score 0`
+- `9c7b9fce1c` `2021-08-20` **sync** · other · kept — merge with upstream_bigdl_2.0; no numbers stated; `score 0`
+- `b7cd7427e4` `2021-08-20` **sync** · other · kept — merge with upstream_bigdl_2.0; no numbers stated; `score 0`
+- `80cffd5f33` `2021-08-23` **sync** · fix · kept — fix upstream_bigdl2.0 conflict; no numbers stated; `score 0`
+- `d7a4abf8e6` `2021-08-23` **sync** · fix · kept — fix upstream_bigdl2.0 conflict; no numbers stated; `score 0`
+- `15583fda1b` `2021-08-23` **sync** · fix · kept — fix upstream_bigdl2.0 conflict; no numbers stated; `score 0`
+- `e8bda3b9d8` `2021-08-23` **sync** · fix · kept — fix upstream_bigdl2.0 conflict; no numbers stated; `score 0`
+- `0bee02898a` `2021-08-23` **sync** · fix · kept — fix upstream_bigdl2.0 conflict; no numbers stated; `score 0`
+- `a9d010115d` `2021-08-23` **sync** · fix · kept — fix upstream_bigdl2.0 conflict; no numbers stated; `score 0`
+- `6da3c65d36` `2021-08-23` **other** · other · kept — Merge pull request #4546 from dding3/updatepythonstructure; no numbers stated; `score 0`
+- `dfaa3a2a02` `2021-08-23` **other** · other · kept — Merge pull request #4546 from dding3/updatepythonstructure; no numbers stated; `score 0`
+- `cc99c840b6` `2021-08-23` **other** · other · kept — Merge pull request #4546 from dding3/updatepythonstructure; no numbers stated; `score 0`
+- `eca2475156` `2021-08-23` **other** · other · kept — Merge pull request #4546 from dding3/updatepythonstructure; no numbers stated; `score 0`
+- `44e3a46a17` `2021-08-23` **other** · other · kept — Merge pull request #4546 from dding3/updatepythonstructure; no numbers stated; `score 0`
+- `5064e7210d` `2021-08-23` **other** · other · kept — Merge pull request #4546 from dding3/updatepythonstructure; no numbers stated; `score 0`
+- `9a5abb2b23` `2021-08-24` **sync** · other · kept — resolve upstream_bigdl-2.0 conflicts; no numbers stated; `score 0`
+- `a9f1722ab0` `2021-08-24` **sync** · other · kept — resolve upstream_bigdl-2.0 conflicts; no numbers stated; `score 0`
+- `a9028e4567` `2021-08-24` **sync** · other · kept — resolve upstream_bigdl-2.0 conflicts; no numbers stated; `score 0`
+- `684aab8b0c` `2021-08-24` **sync** · other · kept — resolve upstream_bigdl-2.0 conflicts; no numbers stated; `score 0`
+- `e259b4d306` `2021-08-24` **sync** · other · kept — resolve upstream_bigdl-2.0 conflicts; no numbers stated; `score 0`
+- `ad66d5bd54` `2021-08-24` **sync** · other · kept — resolve upstream_bigdl-2.0 conflicts; no numbers stated; `score 0`
+- `7b3e9b3b11` `2021-08-30` **sync** · other · kept — Merge branch 'upstream_bigdl-2.0' into zoocommon; no numbers stated; `score 0`
+- `2199bc9b27` `2021-08-30` **sync** · other · kept — Merge branch 'upstream_bigdl-2.0' into zoocommon; no numbers stated; `score 0`
+- `59c4726e23` `2021-09-08` **other** · other · kept — Merge branch 'bigdl-2.0' into keraspython; no numbers stated; `score 0`
+- `f1da84a022` `2021-09-08` **other** · other · kept — Merge branch 'bigdl-2.0' into keraspython; no numbers stated; `score 0`
+- `6a48b6009a` `2021-09-08` **other** · other · kept — Merge branch 'bigdl-2.0' into keraspython; no numbers stated; `score 0`
+- `c6e2c3f4cd` `2021-09-08` **other** · other · kept — Merge branch 'bigdl-2.0' into keraspython; no numbers stated; `score 0`
+- `c65ff27d4e` `2021-09-08` **other** · other · kept — Merge branch 'bigdl-2.0' into keraspython; no numbers stated; `score 0`
+- `e2936ecfc1` `2021-09-08` **other** · other · kept — Merge branch 'bigdl-2.0' into pythonestimator; no numbers stated; `score 0`
+- `e370d5a206` `2021-09-08` **other** · other · kept — Merge branch 'bigdl-2.0' into pythonestimator; no numbers stated; `score 0`
+- `2beef79a65` `2021-09-08` **other** · other · kept — Merge branch 'bigdl-2.0' into pythonestimator; no numbers stated; `score 0`
+- `aebe483cf3` `2021-09-08` **other** · other · kept — Merge branch 'bigdl-2.0' into pythonestimator; no numbers stated; `score 0`
+- `03e4037246` `2021-09-08` **other** · other · kept — Merge branch 'bigdl-2.0' into pythonestimator; no numbers stated; `score 0`
+- `f17bca3ca8` `2021-09-09` **other** · other · kept — Merge pull request #4689 from Le-Zheng/pythonestimator; no numbers stated; `score 0`
+- `86cdf342eb` `2021-09-09` **other** · other · kept — Merge pull request #4689 from Le-Zheng/pythonestimator; no numbers stated; `score 0`
+- `3fe4a70d97` `2021-09-09` **other** · other · kept — Merge pull request #4689 from Le-Zheng/pythonestimator; no numbers stated; `score 0`
+- `ddc015622c` `2021-09-09` **other** · other · kept — Merge pull request #4689 from Le-Zheng/pythonestimator; no numbers stated; `score 0`
+- `fb6a728b25` `2021-09-09` **other** · other · kept — Merge pull request #4689 from Le-Zheng/pythonestimator; no numbers stated; `score 0`
+- `2ebb2ad6b0` `2021-09-08` **sync** · other · kept — merge with upstream; no numbers stated; `score 0`
+- `c4390e7589` `2021-09-08` **sync** · other · kept — merge with upstream; no numbers stated; `score 0`
+- `547cbedc75` `2021-09-08` **sync** · other · kept — merge with upstream; no numbers stated; `score 0`
+- `db9f5f2fb3` `2021-09-08` **sync** · other · kept — merge with upstream; no numbers stated; `score 0`
+- `7dccb67e4c` `2021-09-08` **sync** · other · kept — merge with upstream; no numbers stated; `score 0`
+- `e7febdcba2` `2021-09-09` **sync** · other · kept — merge with upstream; no numbers stated; `score 0`
+- `e0e2a1c84b` `2021-09-09` **sync** · other · kept — merge with upstream; no numbers stated; `score 0`
+- `7edd449af6` `2021-09-09` **other** · other · kept — Merge pull request #4697 from dding3/pythonorca; no numbers stated; `score 0`
+- `20e4e1eb16` `2021-09-09` **other** · other · kept — Merge pull request #4697 from dding3/pythonorca; no numbers stated; `score 0`
+- `e760f8e941` `2021-09-10` **other** · other · kept — Merge branch 'bigdl-2.0' into kerasothers; no numbers stated; `score 0`
+- `90394d5db7` `2021-09-10` **other** · other · kept — Merge branch 'bigdl-2.0' into kerasothers; no numbers stated; `score 0`
+- `e08132c83e` `2021-09-10` **other** · other · kept — Merge branch 'bigdl-2.0' into kerasothers; no numbers stated; `score 0`
+- `fff3c9a227` `2021-09-10` **other** · other · kept — Merge branch 'bigdl-2.0' into kerasothers; no numbers stated; `score 0`
+- `9922baca36` `2021-09-10` **other** · other · kept — Merge branch 'bigdl-2.0' into kerasothers; no numbers stated; `score 0`
+- `bced0a5960` `2021-09-10` **other** · other · kept — Merge pull request #4700 from Le-Zheng/kerasothers; no numbers stated; `score 0`
+- `cc6d794b09` `2021-09-10` **other** · other · kept — Merge pull request #4700 from Le-Zheng/kerasothers; no numbers stated; `score 0`
+- `730e258fc5` `2021-09-10` **other** · other · kept — Merge pull request #4700 from Le-Zheng/kerasothers; no numbers stated; `score 0`
+- `7f5233a394` `2021-09-10` **other** · other · kept — Merge pull request #4700 from Le-Zheng/kerasothers; no numbers stated; `score 0`
+- `8918ebddbb` `2021-09-10` **other** · other · kept — Merge pull request #4700 from Le-Zheng/kerasothers; no numbers stated; `score 0`
+- `a61e18976a` `2021-09-10` **other** · other · kept — Merge pull request #4712 from yushan111/mv-orca-test; no numbers stated; `score 0`
+
+*Commits 301-400 (2017-12-15..2021-09-10): scores 0/1/2/3 = 100/0/0/0; areas other 66, sync 32, gemm 2.*
+
+- `9ea95100d0` `2021-09-10` **other** · other · kept — Merge pull request #4712 from yushan111/mv-orca-test; no numbers stated; `score 0`
+- `bc2ba12880` `2021-09-16` **other** · other · kept — Merge branch 'master' of <path>/workspace/BigDL2.0/copy/BigDL into migratekerasnn; no numbers stated; `score 0`
+- `b5b6781969` `2021-09-16` **other** · other · kept — Merge branch 'master' of <path>/workspace/BigDL2.0/copy/BigDL into migratekerasnn; no numbers stated; `score 0`
+- `7783d4ea3b` `2021-09-16` **other** · other · kept — Merge branch 'master' of <path>/workspace/BigDL2.0/copy/BigDL into migratekerasnn; no numbers stated; `score 0`
+- `a1ac5bae4f` `2021-09-16` **other** · other · kept — Merge branch 'bigdl-2.0' into migratekerasnn; no numbers stated; `score 0`
+- `b82f5fe0ee` `2021-09-16` **other** · other · kept — Merge branch 'bigdl-2.0' into migratekerasnn; no numbers stated; `score 0`
+- `35c99119f5` `2021-09-22` **other** · other · kept — Merge pull request #4771 from yushan111/migrate-orca-context; no numbers stated; `score 0`
+- `ca2723d778` `2021-09-22` **other** · other · kept — Merge pull request #4771 from yushan111/migrate-orca-context; no numbers stated; `score 0`
+- `2571d16051` `2021-09-22` **other** · other · kept — Merge pull request #4771 from yushan111/migrate-orca-context; no numbers stated; `score 0`
+- `34bfb9cb58` `2021-09-22` **other** · other · kept — Merge pull request #4771 from yushan111/migrate-orca-context; no numbers stated; `score 0`
+- `d6806e512f` `2021-09-22` **other** · other · kept — Merge pull request #4771 from yushan111/migrate-orca-context; no numbers stated; `score 0`
+- `9d50aaf61e` `2021-09-22` **other** · other · kept — Merge pull request #4771 from yushan111/migrate-orca-context; no numbers stated; `score 0`
+- `1dd704dbac` `2021-09-23` **other** · other · kept — Add more pattern in gitignore; no numbers stated; `score 0`
+- `6e73d35d9c` `2021-09-23` **other** · other · kept — Add more pattern in gitignore; no numbers stated; `score 0`
+- `760df81a51` `2021-09-27` **other** · other · kept — Add bigdl2.0 friesian grpc code; no numbers stated; `score 0`
+- `45709a2093` `2021-09-27` **other** · other · kept — Add bigdl2.0 friesian grpc code; no numbers stated; `score 0`
+- `c7d3d53e30` `2021-10-04` **sync** · other · kept — merge with upstream; no numbers stated; `score 0`
+- `fe53cd607a` `2021-10-04` **sync** · other · kept — merge with upstream; no numbers stated; `score 0`
+- `0ae7e0efd8` `2021-10-04` **sync** · other · kept — merge with upstream; no numbers stated; `score 0`
+- `2fc0e1570f` `2021-10-11` **other** · other · kept — add docs; no numbers stated; `score 0`
+- `21543a05ed` `2021-10-11` **other** · other · kept — add docs; no numbers stated; `score 0`
+- `e6aaa2b8ad` `2021-10-12` **other** · other · kept — update; no numbers stated; `score 0`
+- `2817a4a4c6` `2021-10-12` **other** · other · kept — update; no numbers stated; `score 0`
+- `d8db4ab517` `2021-10-12` **other** · other · kept — update; no numbers stated; `score 0`
+- `39e6be1428` `2021-10-12` **other** · other · kept — update; no numbers stated; `score 0`
+- `4367100a85` `2021-10-12` **other** · other · kept — update; no numbers stated; `score 0`
+- `95848e3ccd` `2021-10-12` **other** · other · kept — update; no numbers stated; `score 0`
+- `da832bc26d` `2021-10-13` **other** · other · kept — Merge pull request #4894 from sgwhat/migrate-example; no numbers stated; `score 0`
+- `60c725a084` `2021-10-13` **other** · other · kept — Merge pull request #4894 from sgwhat/migrate-example; no numbers stated; `score 0`
+- `863f868d87` `2021-10-13` **other** · other · kept — Merge pull request #4894 from sgwhat/migrate-example; no numbers stated; `score 0`
+- `95486698fb` `2021-10-13` **other** · other · kept — Merge pull request #4894 from sgwhat/migrate-example; no numbers stated; `score 0`
+- `b7426eeaa6` `2021-10-13` **sync** · other · kept — Merge branch 'upstream_bigdl-2.0' into move_image-similarity; no numbers stated; `score 0`
+- `8ecea20cd2` `2021-10-13` **sync** · other · kept — Merge branch 'upstream_bigdl-2.0' into move_image-similarity; no numbers stated; `score 0`
+- `34a6de2e16` `2021-10-13` **other** · other · kept — Merge pull request #4949 from dding3/move_image-similarity; no numbers stated; `score 0`
+- `34666a1977` `2021-10-13` **other** · other · kept — Merge pull request #4949 from dding3/move_image-similarity; no numbers stated; `score 0`
+- `71838b1977` `2021-10-14` **other** · docs · kept — Update Databricks documents; no numbers stated; `score 0`
+- `89a326e038` `2021-10-15` **other** · sched · kept — bigdl 2.0 serving doc; no numbers stated; `score 0`
+- `7031798961` `2021-10-15` **other** · other · kept — Merge branch 'bigdl-2.0' into migrate-py; no numbers stated; `score 0`
+- `929ace496e` `2021-10-18` **other** · other · kept — bigdl_logo; no numbers stated; `score 0`
+- `d8be814059` `2021-10-18` **other** · docs · kept — Create README.md; no numbers stated; `score 0`
+- `6ba418e659` `2021-10-18` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `547f88ab22` `2021-10-18` **other** · other · kept — Add files via upload; no numbers stated; `score 0`
+- `18674dde18` `2021-10-18` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `07f6f3e5dd` `2021-10-19` **other** · docs · kept — [PPML] PPML readthedocs refine; no numbers stated; `score 0`
+- `3049802582` `2021-10-20` **other** · docs · kept — Update index.rst; no numbers stated; `score 0`
+- `93207fcd37` `2021-10-20` **other** · docs · kept — Update index.rst; no numbers stated; `score 0`
+- `bea3d5e18c` `2021-10-20` **other** · docs · kept — Update index.rst; no numbers stated; `score 0`
+- `2050ea16a6` `2021-10-20` **other** · other · kept — Update conf.py; no numbers stated; `score 0`
+- `1f3a9adda9` `2021-10-20` **other** · docs · kept — update dllib readme; no numbers stated; `score 0`
+- `c876e474af` `2021-10-20` **other** · other · kept — update readthedocs conf; no numbers stated; `score 0`
+- `269b182b04` `2021-10-20` **other** · docs · kept — Update readthedocs; no numbers stated; `score 0`
+- `4c8d424bcb` `2021-10-21` **other** · docs · kept — Update document; no numbers stated; `score 0`
+- `b41ca7fb6e` `2021-10-22` **other** · docs · kept — move nncontext to bigdl.dllib.nncontext/NNContext; no numbers stated; `score 0`
+- `6137a08ddf` `2021-10-22` **other** · fix · kept — Chronos:  Fix the display problem of API doc; no numbers stated; `score 0`
+- `98ba6d5e80` `2021-10-22` **other** · other · kept — Update orca & friesian readthedocs; no numbers stated; `score 0`
+- `6555044e11` `2021-10-25` **other** · docs · kept — PPML user guide; no numbers stated; `score 0`
+- `3c316e0071` `2021-10-26` **other** · docs · kept — update hadoop/yarn user guide; no numbers stated; `score 0`
+- `a3dc9a0158` `2021-10-26` **other** · docs · kept — Update scala docs; no numbers stated; `score 0`
+- `8ba635c101` `2021-10-25` **other** · docs · kept — add dllib user guide; no numbers stated; `score 0`
+- `044cb339ce` `2021-10-27` **other** · docs · kept — Update release.md; no numbers stated; `score 0`
+- `0d0cff81fd` `2021-10-27` **other** · docs · kept — Update RayOnSpark doc; no numbers stated; `score 0`
+- `cda4102745` `2021-10-27` **other** · docs · kept — update orca automl doc with bigdl; no numbers stated; `score 0`
+- `ebc58fa419` `2021-10-27` **other** · docs · kept — Change Analytics Zoo to BigDL in python user guide; no numbers stated; `score 0`
+- `614fe693d2` `2021-10-28` **other** · docs · kept — Chronos: update chronos example in readme.md; no numbers stated; `score 0`
+- `49af13e215` `2021-10-28` **other** · docs · kept — Chronos: user guide revision/update; no numbers stated; `score 0`
+- `b622d60048` `2021-10-28` **other** · docs · kept — Add installation guide in Orca AutoML Doc; no numbers stated; `score 0`
+- `bc8d5733e8` `2021-10-28` **other** · docs · kept — Update Automl pytorch quickstart; no numbers stated; `score 0`
+- `0334eda6fe` `2021-10-28` **other** · docs · kept — Update orca docs; no numbers stated; `score 0`
+- `d92e68dd78` `2021-10-29` **other** · docs · kept — Update Chronos setup; no numbers stated; `score 0`
+- `26c087d493` `2021-10-29` **other** · docs · kept — Update AutoXGBoost and AutoEstimator Quickstart; no numbers stated; `score 0`
+- `ac96d9a35a` `2021-10-29` **other** · docs · kept — Chronos: update Chronos quickstart from az to bigdl; no numbers stated; `score 0`
+- `8b610482b7` `2021-11-01` **other** · docs · kept — Refine PPML readthedocs; no numbers stated; `score 0`
+- `f185a608ce` `2021-11-01` **other** · docs · kept — Update powered-by.md; no numbers stated; `score 0`
+- `17060f541a` `2021-11-03` **other** · docs · kept — change engine's required configuration to warning; no numbers stated; `score 0`
+- `e43a06b13a` `2021-11-04` **other** · knob · kept — Add AutoXGBoost API Guide; no numbers stated; `score 0`
+- `bff3a2250e` `2021-11-04` **other** · docs · kept — Chronos: link updates for api docs; no numbers stated; `score 0`
+- `2202949eac` `2021-11-04` **other** · docs · kept — integrate dllib.md with scala.md; no numbers stated; `score 0`
+- `0f20dabda3` `2021-11-07` **other** · docs · kept — add dllib quickstart; no numbers stated; `score 0`
+- `7abdb01c1c` `2021-11-08` **other** · docs · kept — Move AutoML API Guide to Orca API Guide; no numbers stated; `score 0`
+- `dffc40630b` `2021-11-11` **other** · docs · kept — Chronos:  Change the redownload method; no numbers stated; `score 0`
+- `829ee31f1b` `2021-11-11` **other** · docs · kept — Add document for Orca `PytorchRayEstimator` and `PytorchSparkEstimator`; no numbers stated; `score 0`
+- `453c991c19` `2021-11-12` **other** · docs · kept — Update hadoop.md; no numbers stated; `score 0`
+- `4c5a0b9729` `2021-11-15` **other** · docs · kept — BigDL2.0 colab user guide; no numbers stated; `score 0`
+- `27302a4e5f` `2021-11-16` **other** · docs · kept — Chronos: Forecaster in doc shows more friendly; no numbers stated; `score 0`
+- `b746200b35` `2021-11-16` **other** · docs · kept — update readthedoc quickstart link; no numbers stated; `score 0`
+- `238a434950` `2021-11-16` **other** · docs · kept — Update colab notebooks; no numbers stated; `score 0`
+- `c75ad40e67` `2021-11-16` **other** · docs · kept — update orca data quickstart and ray md; no numbers stated; `score 0`
+- `30b4c3d9d5` `2021-11-18` **other** · docs · kept — Add deploy_intel_sgx_device_plugin_for_kubernets in QuickStart; no numbers stated; `score 0`
+- `bee5879b24` `2021-11-19` **other** · docs · kept — update k8s docs; no numbers stated; `score 0`
+- `ee95ab6198` `2021-11-23` **other** · docs · kept — revert 3366; no numbers stated; `score 0`
+- `e5047b9cb0` `2021-11-24` **other** · docs · kept — Update orca-tf2keras-quickstart.md; no numbers stated; `score 0`
+- `6c1c0e46b1` `2021-11-26` **other** · fix · kept — Fix Kubernetes typo PPML QuickStart doc; no numbers stated; `score 0`
+- `dffeda5e1e` `2021-11-26` **other** · docs · kept — Update k8s user guide for run from remote; no numbers stated; `score 0`
+- `181e086cff` `2021-11-30` **other** · docs · kept — update Python User Guide and Scala User Guide with supported platforms info; no numbers stated; `score 0`
+- `1951149792` `2021-12-01` **other** · docs · kept — update docker use guide readthedocs; no numbers stated; `score 0`
+- `a83ab371d2` `2021-12-02` **other** · sched · kept — add serving index to readme; no numbers stated; `score 0`
+- `5a53081656` `2021-12-03` **other** · docs · removed — Remove internal ip in tests; no numbers stated; `score 0`
+- `61be6ce17a` `2021-12-06` **other** · docs · kept — Update presentations.md; no numbers stated; `score 0`
+- `c4b0697fb0` `2021-12-06` **other** · docs · kept — Update presentations.md; no numbers stated; `score 0`
+- `77073f0430` `2021-12-06` **other** · docs · kept — Add blog content in readthedocs; no numbers stated; `score 0`
+
+*Commits 401-500 (2021-09-10..2021-12-06): scores 0/1/2/3 = 100/0/0/0; areas other 95, sync 5.*
+
+- `edaef4aa4f` `2021-12-06` **other** · docs · kept — Revert "Add blog content in readthedocs"; no numbers stated; `score 0`
+- `aa157429d9` `2021-12-08` **other** · docs · kept — tf quickstart yarn integration test; no numbers stated; `score 0`
+- `18d5e6a7a0` `2021-12-09` **other** · docs · kept — Update docker.md; no numbers stated; `score 0`
+- `d58d47d2fc` `2021-12-09` **other** · fix · kept — Chronos: Fix forecaster doc; no numbers stated; `score 0`
+- `e5d2004933` `2021-12-14` **other** · docs · kept — hotfix k8s doc; no numbers stated; `score 0`
+- `d881c3885e` `2021-12-14` **other** · other · kept — Add  LICENSE and SECURITY files via upload; no numbers stated; `score 0`
+- `bbf33e96a2` `2021-12-15` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `e4c0aa4db2` `2021-12-15` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `f27f2e9d3a` `2021-12-21` **other** · docs · kept — PPML VFL evaluation and predict support; no numbers stated; `score 0`
+- `862c530685` `2021-12-21` **other** · docs · kept — add get model in nnframe doc; no numbers stated; `score 0`
+- `029216909d` `2021-12-22` **other** · docs · kept — expose getModel in pynnmodel; no numbers stated; `score 0`
+- `a677feaf60` `2021-12-23` **other** · docs · kept — Update serving-quickstart.md; no numbers stated; `score 0`
+- `4218f11379` `2021-12-23` **other** · docs · kept — Branch docs; no numbers stated; `score 0`
+- `a0ba173310` `2021-12-28` **other** · docs · kept — Chronos:  New built-in dataset (uci_electricity); no numbers stated; `score 0`
+- `837bd6a58f` `2022-01-04` **other** · docs · kept — Add save/load comments in keras docs; no numbers stated; `score 0`
+- `12dca51115` `2022-01-07` **other** · docs · kept — Update serving doc; no numbers stated; `score 0`
+- `625a8f89fe` `2022-01-08` **other** · docs · kept — Chronos: Refactor document structure; no numbers stated; `score 0`
+- `ad47a0b8e0` `2022-01-13` **other** · docs · kept — Chronos:  Move use-case to `chronos-tutorial` and modify page layout; no numbers stated; `score 0`
+- `00aa8640dd` `2022-01-14` **other** · other · kept — Merge branch 'yangw1234-ray_ctx' into ray_ctx_update; no numbers stated; `score 0`
+- `fd1fc44d9d` `2022-01-20` **other** · docs · kept — Update trusted-fl doc; no numbers stated; `score 0`
+- `0713f3db26` `2022-01-20` **other** · other · kept — Add ehms KMS client; no numbers stated; `score 0`
+- `5b226478b3` `2022-01-20` **other** · other · kept — Merge branch 'sgwhat-ray_ctx_update' into branch-2.0; no numbers stated; `score 0`
+- `ac22864d9c` `2022-01-21` **other** · other · kept — Modify Files about KMS; no numbers stated; `score 0`
+- `bc50683f07` `2022-01-21` **other** · docs · kept — Fl Server and Client Tls Support; no numbers stated; `score 0`
+- `b49e3dcec8` `2022-01-24` **other** · docs · kept — Add PPML TPC-H doc; no numbers stated; `score 0`
+- `0351f312ca` `2022-01-24` **other** · other · kept — Resolved merge conflict; no numbers stated; `score 0`
+- `cca45f8c4f` `2022-01-24` **other** · other · kept — Merge branch 'intel-analytics-branch-2.0' into branch-2.0; no numbers stated; `score 0`
+- `77d32ba140` `2022-01-24` **other** · docs · kept — Add bigdl-spark3 in doc; no numbers stated; `score 0`
+- `c887813651` `2022-01-25` **other** · other · kept — Merge branch 'branch-2.0' into branch-2.0; no numbers stated; `score 0`
+- `f560005d21` `2022-01-27` **other** · docs · kept — Chronos: add `NBEATSForecaster` API; no numbers stated; `score 0`
+- `d75bf4450a` `2022-01-27` **other** · docs · kept — Refine PPML Readthedoc User Guide; no numbers stated; `score 0`
+- `12707bb9ff` `2022-02-04` **other** · docs · kept — Update powered-by.md; no numbers stated; `score 0`
+- `965e176acc` `2022-02-04` **other** · docs · kept — Update powered-by.md; no numbers stated; `score 0`
+- `1e09804c37` `2022-02-07` **other** · docs · kept — Update powered-by.md; no numbers stated; `score 0`
+- `6846feb44e` `2022-02-09` **other** · docs · kept — Refine Trusted FL Doc; no numbers stated; `score 0`
+- `e6a04e2ed2` `2022-02-10` **other** · docs · kept — Change FL image name; no numbers stated; `score 0`
+- `a3a202e335` `2022-02-10` **other** · docs · kept — Update k8s doc; no numbers stated; `score 0`
+- `5446123cde` `2022-02-14` **other** · other · kept — Refine kms-client; no numbers stated; `score 0`
+- `cd06909e0f` `2022-02-15` **other** · docs · kept — rename to BigDL; no numbers stated; `score 0`
+- `1422e99b56` `2022-02-15` **other** · docs · kept — Rename all serving doc containing word: zoo; no numbers stated; `score 0`
+- `ce7a812623` `2022-02-16` **other** · other · kept — Upgrade Ray version to 1.9.2 in documents and setup; no numbers stated; `score 0`
+- `5500241dca` `2022-02-16` **other** · other · removed — remove tsfresh to solve doc building conflict for protobuf version; no numbers stated; `score 0`
+- `656561153c` `2022-02-16` **other** · docs · kept — Update Orca Context Readme; no numbers stated; `score 0`
+- `7f172c4df2` `2022-02-16` **other** · docs · kept — docker image jupyter; no numbers stated; `score 0`
+- `065812c675` `2022-02-16` **other** · docs · kept — update orca context readme; no numbers stated; `score 0`
+- `c9be2b979e` `2022-02-17` **other** · docs · kept — Fix Ray QuickStart doc; no numbers stated; `score 0`
+- `1375438de3` `2022-02-17` **other** · docs · kept — Chronos: add updated information about models and Nano to document; no numbers stated; `score 0`
+- `2f39947b16` `2022-02-17` **other** · docs · kept — Update Python Develop Guide; no numbers stated; `score 0`
+- `43bc582a02` `2022-02-17` **other** · docs · kept — Add getting start guidance for dllib; no numbers stated; `score 0`
+- `193a063504` `2022-02-18` **other** · docs · kept — update Scala doc; no numbers stated; `score 0`
+- `63c96a9acb` `2022-02-18` **other** · docs · kept — update zoo related doc to bigdl; no numbers stated; `score 0`
+- `e971385798` `2022-03-01` **other** · docs · kept — update docker version to 2.1.0-SNAPSHOT in docs; no numbers stated; `score 0`
+- `cb08b03fcd` `2022-03-08` **other** · docs · kept — update release link to main branch; no numbers stated; `score 0`
+- `077cc9f979` `2022-03-10` **sync** · docs · kept — Chronos: Sync file paths in doc, branch-2.0-->main; no numbers stated; `score 0`
+- `b886ee86a7` `2022-03-10` **other** · knob · kept — add python getting started and add python freeze support; no numbers stated; `score 0`
+- `a92813e710` `2022-03-14` **other** · docs · kept — Update FL Demo BigDL Version; no numbers stated; `score 0`
+- `e4830fa51d` `2022-03-15` **other** · docs · kept — Python fgboost test and some test refactor; no numbers stated; `score 0`
+- `d473177599` `2022-03-15` **other** · docs · kept — Update graphene version number on main branch; no numbers stated; `score 0`
+- `93ea53e1e4` `2022-03-16` **other** · docs · kept — Upgrade PPML image version to 2.1.0-SNAPSHOT in readthedoc; no numbers stated; `score 0`
+- `6309dbd16b` `2022-03-16` **other** · docs · kept — Upgrade Kernel version to 5.14 in build from kernel; no numbers stated; `score 0`
+- `9e118bef59` `2022-03-29` **other** · other · kept — update readthedocs config; no numbers stated; `score 0`
+- `5d4743a12a` `2022-03-30` **other** · docs · kept — Update Orca Python API Docs; no numbers stated; `score 0`
+- `23aa10345f` `2022-03-31` **other** · docs · kept — Update Documents for Tf2estimator on Pyspark Backend; no numbers stated; `score 0`
+- `39f7fd2d1f` `2022-04-06` **other** · docs · kept — Chronos: migrate from tf1.15 to tf2 (MTNetForecaster); no numbers stated; `score 0`
+- `0c0e99fee5` `2022-04-06` **other** · docs · kept — Fix spark-submit scripts and doc; no numbers stated; `score 0`
+- `71cd125837` `2022-04-12` **other** · docs · kept — Rename backend name from “torch_distributed” to “ray” in Orca Pytorch Estimator; no numbers stated; `score 0`
+- `793306c275` `2022-04-18` **other** · docs · kept — Add TPC-DS QuickStart document; no numbers stated; `score 0`
+- `658a4286f2` `2022-04-18` **other** · docs · kept — Update trusted-big-data graphene doc; no numbers stated; `score 0`
+- `0e0fbaf3d6` `2022-04-18` **other** · docs · kept — Readthedoc fix path and branch; no numbers stated; `score 0`
+- `56aee11c82` `2022-04-18` **other** · docs · kept — fix version in docs (k8s/scala); no numbers stated; `score 0`
+- `154f32ce97` `2022-04-19` **other** · docs · kept — Modify the quickstart document of TPC-DS; no numbers stated; `score 0`
+- `96fa40b4f7` `2022-04-19` **other** · docs · kept — Update the document of TPC-DS; no numbers stated; `score 0`
+- `ada7b4b978` `2022-04-24` **other** · docs · kept — Chronos: document regular update; no numbers stated; `score 0`
+- `80184dfd4f` `2022-04-26` **other** · other · kept — Update the document of graphene; no numbers stated; `score 0`
+- `359d5a6989` `2022-04-27` **other** · docs · kept — Update readthedoc of PPML; no numbers stated; `score 0`
+- `24cf032a91` `2022-04-28` **other** · docs · kept — Update powered-by.md; no numbers stated; `score 0`
+- `fd1da60251` `2022-05-09` **other** · docs · kept — Add Nano doc structure and Nano overview; no numbers stated; `score 0`
+- `05f6fd24b4` `2022-05-09` **other** · docs · kept — add error handling api guidance; no numbers stated; `score 0`
+- `cc2499aa44` `2022-05-13` **other** · docs · kept — Chronos: add chronos known issue; no numbers stated; `score 0`
+- `0656804f56` `2022-05-16` **other** · docs · kept — Add windows guide to nano overview; no numbers stated; `score 0`
+- `25982b0d16` `2022-05-16` **other** · docs · kept — Add Nano TensorFlow Training QuickStart Doc; no numbers stated; `score 0`
+- `210677a295` `2022-05-16` **other** · docs · kept — Add nano documentation for pytorch training quickstart; no numbers stated; `score 0`
+- `aabeb3fe35` `2022-05-18` **other** · docs · kept — add nano documentation pages to readthedocs site; no numbers stated; `score 0`
+- `4ab95fa3e4` `2022-05-19` **other** · docs · kept — Fix Nano TensorFlow Doc Link; no numbers stated; `score 0`
+- `993c80b427` `2022-05-23` **other** · docs · kept — user guide; no numbers stated; `score 0`
+- `353e7ffbdf` `2022-05-24` **other** · docs · kept — revised user guide; no numbers stated; `score 0`
+- `55fa3e13e6` `2022-05-25` **other** · docs · kept — Add Nano Known issues and some notebook link; no numbers stated; `score 0`
+- `db2818c8f7` `2022-05-26` **other** · docs · kept — update databrciks doc; no numbers stated; `score 0`
+- `5bc293b9c5` `2022-05-26` **other** · docs · kept — Update Chronos installation guide; no numbers stated; `score 0`
+- `0af87a18c6` `2022-05-30` **other** · fix · kept — Chronos: Fix readthedocs.io build error; no numbers stated; `score 0`
+- `08390bf464` `2022-05-30` **other** · other · kept — Refactor Nano Training to make easy upgrade; no numbers stated; `score 0`
+- `e24859c39b` `2022-05-31` **other** · docs · kept — add resume and parallel search docs; no numbers stated; `score 0`
+- `8ced71c488` `2022-05-31` **other** · docs · kept — revise hpo doc; no numbers stated; `score 0`
+- `900711f1b3` `2022-06-02` **other** · docs · kept — add pytorch inference doc; no numbers stated; `score 0`
+- `e150593602` `2022-06-07` **other** · docs · kept — Azure PPML documentation; no numbers stated; `score 0`
+- `20ad708010` `2022-06-08` **other** · knob · kept — Add  Nano PyTorch API Doc; no numbers stated; `score 0`
+- `2c4623f8da` `2022-06-09` **other** · docs · kept — Update pytorch_train.md; no numbers stated; `score 0`
+- `e480eec5b1` `2022-06-10` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `c8a07474ee` `2022-06-10` **other** · docs · kept — Update index.rst; no numbers stated; `score 0`
+- `6aeabae58b` `2022-06-12` **other** · docs · kept — Azure PPML support; no numbers stated; `score 0`
+
+*Commits 501-600 (2021-12-06..2022-06-12): scores 0/1/2/3 = 100/0/0/0; areas other 99, sync 1.*
+
+- `f687e4b684` `2022-06-12` **other** · docs · kept — Update Azure PPML doc; no numbers stated; `score 0`
+- `e7c7ab2b8e` `2022-06-13` **other** · docs · kept — add tf inference doc; no numbers stated; `score 0`
+- `04542bc6db` `2022-06-14` **other** · docs · kept — Fix code style in PyTorch QuickStart; no numbers stated; `score 0`
+- `7dcd79366f` `2022-06-15` **other** · docs · kept — doc fix; no numbers stated; `score 0`
+- `8e10bdeabd` `2022-06-21` **other** · docs · kept — Chronos: add Evaluator doc; no numbers stated; `score 0`
+- `145216bfc1` `2022-06-24` **other** · docs · kept — Update pytorch to 1.11; no numbers stated; `score 0`
+- `8f51ed4cf1` `2022-06-24` **other** · docs · kept — Add Orca Known issues; no numbers stated; `score 0`
+- `86fa1c02ab` `2022-06-27` **other** · docs · kept — Rename Orca Tensorflow Estimator backend name from "tf2" to "ray"; no numbers stated; `score 0`
+- `76608a5034` `2022-06-27` **other** · docs · kept — Orca: add dashboard.log error in known issue; no numbers stated; `score 0`
+- `500b7bbe99` `2022-06-27` **other** · other · kept — Chronos: add tf forecaster doc; no numbers stated; `score 0`
+- `18a9c2f57a` `2022-06-27` **other** · docs · kept — PPML FGBoost tutorial draft; no numbers stated; `score 0`
+- `b23f66ebbc` `2022-06-28` **other** · docs · kept — Update Readme; no numbers stated; `score 0`
+- `26ec59edf7` `2022-06-28` **other** · docs · kept — Chronos: add autoformer example on electricity and api doc; no numbers stated; `score 0`
+- `cef5359c54` `2022-06-30` **other** · docs · kept — update tpch doc; no numbers stated; `score 0`
+- `41a28c317f` `2022-06-30` **other** · other · kept — update visualization docs; no numbers stated; `score 0`
+- `b53074af53` `2022-07-01` **other** · fix · kept — fix docs; no numbers stated; `score 0`
+- `a6cab83afd` `2022-07-01` **other** · docs · kept — revise Chronos api doc; no numbers stated; `score 0`
+- `798345123f` `2022-07-04` **other** · docs · kept — Nano: Update Nano PyTorch quick start doc; no numbers stated; `score 0`
+- `df6dfc6a22` `2022-07-04` **other** · docs · kept — Application security doc; no numbers stated; `score 0`
+- `501505af0d` `2022-07-04` **other** · fix · kept — Fix typo in link; no numbers stated; `score 0`
+- `3f576e5ffa` `2022-07-04` **other** · knob · kept — Nano docs: add hpo api docs; no numbers stated; `score 0`
+- `53ba2d8279` `2022-07-04` **other** · fix · kept — fix docs; no numbers stated; `score 0`
+- `16005ada17` `2022-07-04` **other** · docs · kept — add hpo tutorial; no numbers stated; `score 0`
+- `d904070154` `2022-07-05` **other** · docs · kept — Chronos: fix some api document tag; no numbers stated; `score 0`
+- `2157af9a03` `2022-07-06` **other** · docs · kept — Add rst; no numbers stated; `score 0`
+- `01e6c62a68` `2022-07-07` **other** · docs · kept — Fix typo in nano documentation; no numbers stated; `score 0`
+- `98f1b7a406` `2022-07-08` **other** · docs · kept — add ppml cli into docker image; no numbers stated; `score 0`
+- `fa3c7f8aff` `2022-07-11` **other** · docs · kept — chronos: user guide python version note change; no numbers stated; `score 0`
+- `7232f23176` `2022-07-12` **other** · docs · kept — Chronos: installation user guide typo; no numbers stated; `score 0`
+- `3916d11780` `2022-07-13` **other** · docs · kept — PR template; no numbers stated; `score 0`
+- `3496f58575` `2022-07-20` **other** · docs · kept — Update PR template; no numbers stated; `score 0`
+- `8f177b90b7` `2022-07-22` **other** · fix · kept — Readthedoc: fix markdown version in doc; no numbers stated; `score 0`
+- `a44571f8a3` `2022-07-22` **other** · docs · kept — Chronos: Correct typo for Chronos User Guide; no numbers stated; `score 0`
+- `00a6a2a22f` `2022-07-25` **other** · other · kept — Readthedoc: update requirements version in doc; no numbers stated; `score 0`
+- `d120db025e` `2022-07-25` **other** · docs · kept — Mirgate Terminal Setup Steps into Developer Guide; no numbers stated; `score 0`
+- `f5909aee9f` `2022-07-25` **other** · docs · kept — Update Azure PPML docs; no numbers stated; `score 0`
+- `6cc1ffd521` `2022-07-26` **other** · other · kept — add CODEOWNERS; no numbers stated; `score 0`
+- `e4ca63a97f` `2022-07-26` **other** · other · kept — move current toc out of readthedocs landingpage; no numbers stated; `score 0`
+- `0ec5ef451e` `2022-07-28` **other** · docs · kept — add several shields to BigDL; no numbers stated; `score 0`
+- `9a08e6a9d0` `2022-07-28` **other** · docs · removed — remove license shields; no numbers stated; `score 0`
+- `928b016d88` `2022-07-28` **other** · other · kept — rollback tensorflow 1.15 dependency; no numbers stated; `score 0`
+- `50c180520e` `2022-07-28` **other** · other · kept — Docs: Bigdl known issues docs; no numbers stated; `score 0`
+- `a4bbadeb61` `2022-08-01` **other** · other · kept — Integrate ipynb files into ReadtheDocs; no numbers stated; `score 0`
+- `df2a7dcef0` `2022-08-01` **other** · docs · kept — Update powered-by.md; no numbers stated; `score 0`
+- `cda8967416` `2022-08-01` **other** · docs · kept — Fix libhdfs known issue doc; no numbers stated; `score 0`
+- `0f78a568c7` `2022-08-02` **other** · docs · kept — add tutorial, notebook and API doc for LightningLite; no numbers stated; `score 0`
+- `70b2070e4d` `2022-08-02` **other** · docs · kept — Update Python User Guide; no numbers stated; `score 0`
+- `7ef605b58f` `2022-08-03` **other** · docs · kept — Correct typos in ReadtheDocs; no numbers stated; `score 0`
+- `9dbe743ea4` `2022-08-05` **other** · knob · kept — Chronos: add more installation options; no numbers stated; `score 0`
+- `f682f79166` `2022-08-08` **other** · docs · kept — Chronos : add multi-objective HPO with latency tutorial; no numbers stated; `score 0`
+- `41f602fcec` `2022-08-08` **other** · other · kept — Chronos: Add a page 'Windows User Guide.md'  to ReadTheDocs; no numbers stated; `score 0`
+- `985aec4425` `2022-08-08` **other** · docs · kept — Orca: add grpc error to orca known issues; no numbers stated; `score 0`
+- `5506f60732` `2022-08-09` **other** · other · kept — Nano: Add TensorFlow step by step tutorials; no numbers stated; `score 0`
+- `99bef5579d` `2022-08-09` **other** · docs · kept — Chronos: XShardsTSDataset user guide (will be reused in how-to handle large data); no numbers stated; `score 0`
+- `b2dac661db` `2022-08-09` **other** · other · kept — Chronos: add quick tour page; no numbers stated; `score 0`
+- `19e6099483` `2022-08-10` **other** · docs · kept — supplement the doc of torchnano; no numbers stated; `score 0`
+- `c8dd8d6e5e` `2022-08-10` **other** · docs · kept — update; no numbers stated; `score 0`
+- `dfb0946075` `2022-08-11` **other** · other · kept — Chronos: Update Chronos install guide form's js and css file.; no numbers stated; `score 0`
+- `362674ee1c` `2022-08-12` **other** · docs · kept — Add a ssl/tls section of Secure Your Devices README; no numbers stated; `score 0`
+- `a440a05b0c` `2022-08-12` **other** · docs · kept — Azure PPML doc update; no numbers stated; `score 0`
+- `2c0424e964` `2022-08-15` **other** · docs · kept — Docs: update orca known issues; no numbers stated; `score 0`
+- `bdce772965` `2022-08-16` **other** · docs · kept — Update powered-by.md; no numbers stated; `score 0`
+- `611c9aefdf` `2022-08-16` **other** · docs · kept — fix Notebook issues; no numbers stated; `score 0`
+- `6af23499e7` `2022-08-16` **other** · docs · kept — Docs: add save and load model docs.; no numbers stated; `score 0`
+- `241b0f1712` `2022-08-16` **other** · docs · kept — Docs: fix typo and quickstart code branch.; no numbers stated; `score 0`
+- `b11496db60` `2022-08-17` **other** · other · kept — Chronos: How-to-Guides (How to train forecaster on single node); no numbers stated; `score 0`
+- `df75c72d91` `2022-08-17` **other** · docs · kept — Add Key generation suggestion into document; no numbers stated; `score 0`
+- `e62b8d1fc5` `2022-08-18` **other** · docs · kept — Automatically unwrap attributes access of _LiteModule; no numbers stated; `score 0`
+- `cc540d0c34` `2022-08-18` **other** · docs · kept — Update "Open in Colab" button in notebooks; no numbers stated; `score 0`
+- `dcd80805f4` `2022-08-18` **other** · other · kept — Update CODEOWNERS; no numbers stated; `score 0`
+- `c94e934068` `2022-08-23` **other** · docs · kept — Orca: update known-issues.; no numbers stated; `score 0`
+- `584ee6045c` `2022-08-23` **other** · other · kept — Chronos: update js, css and md files to add filter function in tutorial page.; no numbers stated; `score 0`
+- `57d45e5deb` `2022-08-24` **other** · docs · kept — Orca: add save and load model doc to PyTorch Estimator quick-start.; no numbers stated; `score 0`
+- `bc986f1500` `2022-08-25` **other** · other · kept — cicd: refactor the github actions workflows; no numbers stated; `score 0`
+- `d4338f3b53` `2022-08-25` **other** · fix · kept — fix issues; no numbers stated; `score 0`
+- `3df26cc9ed` `2022-08-30` **other** · docs · kept — Chronos : add [how to tune a forecaster model] notebook; no numbers stated; `score 0`
+- `692f79a1c7` `2022-08-31` **other** · docs · kept — Update powered-by.md; no numbers stated; `score 0`
+- `9e76c7e16e` `2022-08-31` **other** · docs · kept — Update powered-by.md; no numbers stated; `score 0`
+- `57e46c6160` `2022-09-01` **other** · other · kept — Add Extension nbsphinx-link; no numbers stated; `score 0`
+- `0f1cfd82ff` `2022-09-01` **other** · other · kept — Chronos: installation panel enhancement; no numbers stated; `score 0`
+- `f8f717a684` `2022-09-02` **other** · docs · kept — Doc: update hadoop document.; no numbers stated; `score 0`
+- `30dd0bd6c2` `2022-09-02` **other** · other · kept — Nano How-to Guides: Format & PyTorch Inference; no numbers stated; `score 0`
+- `2f1f3ba114` `2022-09-02` **other** · other · kept — Chronos : Penalize underestimation example; no numbers stated; `score 0`
+- `01ec6107f8` `2022-09-06` **other** · docs · kept — Chronos: make `roll=True` the default value for `to_torch_data_loader`; no numbers stated; `score 0`
+- `62b8aa8703` `2022-09-06` **other** · docs · kept — fix nano UT; no numbers stated; `score 0`
+- `46b0fda3ca` `2022-09-07` **other** · docs · kept — Chronos: how to create a forecaster; no numbers stated; `score 0`
+- `103546d8fe` `2022-09-07` **other** · docs · kept — Chronos: how to speedup inference on one node (onnx, openvino); no numbers stated; `score 0`
+- `dcff01690b` `2022-09-08` **other** · docs · kept — Add Ray arguments in init_orca_context to Doc page; no numbers stated; `score 0`
+- `c73fc9f6ad` `2022-09-09` **other** · other · kept — Chronos: train tcn model on gpu and speed up inference on cpu; no numbers stated; `score 0`
+- `6b337b92be` `2022-09-11` **other** · other · kept — Chronos: how to guide page cleaning; no numbers stated; `score 0`
+- `732850ef3a` `2022-09-13` **other** · docs · kept — change KMS appkey to apikey; no numbers stated; `score 0`
+- `3a19ebbfbf` `2022-09-14` **attention** · other · kept — Add ipython extension for rendering code blocks in excuted notebooks properly in our readthedocs project; no numbers stated; `score 0`
+- `528ff064f5` `2022-09-15` **other** · docs · removed — Remove XGBoost from PPML guide; no numbers stated; `score 0`
+- `12c12a1058` `2022-09-15` **other** · other · kept — How-To Guides: Training - PyTorch Lightning; no numbers stated; `score 0`
+- `b9186b56ef` `2022-09-15` **other** · fix · kept — Chronos: fix install cmd in Chronos User Guide document; no numbers stated; `score 0`
+- `d07e862bec` `2022-09-15` **other** · docs · kept — PPML: mod TPCH document; no numbers stated; `score 0`
+- `edcab051a9` `2022-09-15` **other** · docs · kept — Nano : add API for InferenceOptimizer and deprecated some Trainer APIs; no numbers stated; `score 0`
+- `de91a8ccd7` `2022-09-15` **other** · docs · kept — Doc: add ray port FAQ to ray overview document.; no numbers stated; `score 0`
+- `fced58a044` `2022-09-15` **other** · other · kept — Add Friesian multi task example code and readme; no numbers stated; `score 0`
+- `88faa59eb4` `2022-09-16` **other** · other · kept — Chronos: how to evaluate using forecaster; no numbers stated; `score 0`
+
+*Commits 601-700 (2022-06-12..2022-09-16): scores 0/1/2/3 = 100/0/0/0; areas other 99, attention 1.*
+
+- `c49b52a95b` `2022-09-16` **other** · other · kept — Update multi-task example; no numbers stated; `score 0`
+- `a1c9182515` `2022-09-15` **other** · docs · kept — Fix BigDL Graphene Azure scripts; no numbers stated; `score 0`
+- `5c453157de` `2022-09-16` **other** · docs · kept — update Databricks user guide; no numbers stated; `score 0`
+- `13e3137cfd` `2022-09-19` **other** · docs · kept — Fix a bug of readthedocs about get_public_dataset; no numbers stated; `score 0`
+- `56990ebb4a` `2022-09-20` **other** · other · kept — Reword "Edit on Github" Button; no numbers stated; `score 0`
+- `db2f80fbd8` `2022-09-21` **other** · docs · kept — Refine grammar of PPML readthedoc; no numbers stated; `score 0`
+- `0af2711dbf` `2022-09-23` **other** · docs · kept — update pypi/spark version; no numbers stated; `score 0`
+- `55c793c455` `2022-09-26` **other** · docs · kept — Nano : Update pytorch inference QuickStart with InferenceOptimizer; no numbers stated; `score 0`
+- `0cabc79133` `2022-09-26` **other** · docs · kept — change spark313 to spark312; no numbers stated; `score 0`
+- `331c3054d9` `2022-09-26` **other** · other · kept — How-To Guides: Training - TensorFlow; no numbers stated; `score 0`
+- `bff6795199` `2022-09-26` **other** · other · kept — update action to publish images; no numbers stated; `score 0`
+- `79f29244d8` `2022-09-27` **other** · docs · kept — Add bigdl-submit mode support; no numbers stated; `score 0`
+- `97b925e584` `2022-09-27` **other** · docs · kept — Refine install SGX driver from Kernel document; no numbers stated; `score 0`
+- `a74d08b52b` `2022-09-27` **other** · other · kept — Add Occlum-production to github action; no numbers stated; `score 0`
+- `b9c73c4c20` `2022-09-27` **other** · docs · kept — add release link on main; no numbers stated; `score 0`
+- `0d696fcf92` `2022-09-27` **other** · docs · kept — Add tensorflow known issue for inter op parallelism cannot be modified; no numbers stated; `score 0`
+- `a703ae4eba` `2022-09-28` **other** · docs · kept — Update Databricks user guide; no numbers stated; `score 0`
+- `27587b5db5` `2022-09-28` **other** · docs · kept — doc: fix TPCH markdown list number render; no numbers stated; `score 0`
+- `f3c8ae37f1` `2022-09-28` **other** · other · kept — Chronos : How to generate confidence interval for prediction; no numbers stated; `score 0`
+- `d262848421` `2022-09-30` **other** · docs · kept — Add API docs for `bigdl.nano.tf.keras.layers.Embedding` and `bigdl.nano.tf.optimizers.SparseAdam`; no numbers stated; `score 0`
+- `936f8d2adb` `2022-09-30` **other** · docs · kept — update databricks doc; no numbers stated; `score 0`
+- `b7be0c8c44` `2022-10-08` **other** · docs · kept — PPML FL document; no numbers stated; `score 0`
+- `42934c9abe` `2022-10-10` **other** · docs · kept — PPML refine keras VFL support; no numbers stated; `score 0`
+- `28acefdb7c` `2022-10-10` **other** · knob · kept — Chronos: update installation guide to reflect our work on better tensorflow support; no numbers stated; `score 0`
+- `53b9f8d958` `2022-10-11` **other** · other · kept — add new gramine image build action; no numbers stated; `score 0`
+- `fb0f9a35b9` `2022-10-11` **other** · other · removed — delete enclave key after build; no numbers stated; `score 0`
+- `fbd5a57f93` `2022-10-11` **other** · other · kept — add windows user guide; no numbers stated; `score 0`
+- `6140b81eab` `2022-10-11` **other** · other · kept — unannotated docker push; no numbers stated; `score 0`
+- `8fdd068ca0` `2022-10-11` **other** · docs · kept — Update Project Readme; no numbers stated; `score 0`
+- `0e94e70b85` `2022-10-12` **other** · other · kept — Rename base image name in docker build command; no numbers stated; `score 0`
+- `fc3fb94e23` `2022-10-12` **other** · other · kept — push base image as well; no numbers stated; `score 0`
+- `d8d4a05916` `2022-10-12` **other** · other · kept — Update manually_build.yml; no numbers stated; `score 0`
+- `4dac2606ad` `2022-10-12` **other** · other · kept — Update manually_build.yml; no numbers stated; `score 0`
+- `12330ebb7a` `2022-10-12` **other** · other · kept — Update manually_build.yml; no numbers stated; `score 0`
+- `6e9450bb9e` `2022-10-12` **other** · other · kept — Update manually_build.yml; no numbers stated; `score 0`
+- `38635d204b` `2022-10-12` **other** · other · kept — Update manually_build.yml; no numbers stated; `score 0`
+- `b31d73ca31` `2022-10-12` **other** · other · kept — Update manually_build.yml; no numbers stated; `score 0`
+- `543e06b710` `2022-10-13` **other** · other · kept — Update manually_build.yml; no numbers stated; `score 0`
+- `c40a88e8ae` `2022-10-13` **other** · fix · kept — fix: change the image name to lowercase; no numbers stated; `score 0`
+- `4d56ece258` `2022-10-13` **other** · docs · kept — Add install options in chronos-nightly docker image; no numbers stated; `score 0`
+- `bde2f0930a` `2022-10-14` **other** · docs · kept — Chronos: change import path of `get_public_dataset`; no numbers stated; `score 0`
+- `606ef2f9f6` `2022-10-14` **other** · other · kept — build gramine image with all log; no numbers stated; `score 0`
+- `daf86e9747` `2022-10-14` **other** · docs · kept — Update blogs.md; no numbers stated; `score 0`
+- `8ea2907647` `2022-10-17` **other** · docs · kept — dllib doc fix; no numbers stated; `score 0`
+- `e28edad625` `2022-10-17` **other** · docs · kept — Azure PPML on graphene update; no numbers stated; `score 0`
+- `8e0d589845` `2022-10-18` **other** · docs · kept — update spark3.1.2 to spark3.1.3; no numbers stated; `score 0`
+- `f2e4c40cee` `2022-10-18` **other** · other · kept — change the readthedocs theme and reorg the sections; no numbers stated; `score 0`
+- `6624bd1c2c` `2022-10-19` **other** · other · kept — Add build script for bigdl-ppml-gramine-base image; no numbers stated; `score 0`
+- `a0d6f860b8` `2022-10-19` **other** · other · kept — Add build script for trusted-dl-base; no numbers stated; `score 0`
+- `6a7ab76a8e` `2022-10-19` **other** · docs · kept — Nano: add a patch_torch/patch_tensorflow API for friendly usage; no numbers stated; `score 0`
+- `b688238068` `2022-10-19` **other** · fix · kept — Fix error path in trusted-dl-gramine-base; no numbers stated; `score 0`
+- `b5d7b3183c` `2022-10-19` **other** · other · kept — Refine SGX Driver installation doc; no numbers stated; `score 0`
+- `4fe2e381ec` `2022-10-19` **other** · other · kept — Update manually_build.yml; no numbers stated; `score 0`
+- `65cb3720f5` `2022-10-19` **other** · docs · kept — Revise tooltips on decision tree and small fixes; no numbers stated; `score 0`
+- `d36e7c4ff3` `2022-10-20` **other** · docs · kept — Add BIOS conf & 1 known issues for installing SGX driver; no numbers stated; `score 0`
+- `7b28b3fd20` `2022-10-20` **other** · docs · kept — Nano: Rename `strategy` parameter of `TorchNano` to `distributed_backend`; no numbers stated; `score 0`
+- `4043e361fc` `2022-10-20` **other** · other · kept — Add workflow to build trusted-deep-learning-gramine-ref image; no numbers stated; `score 0`
+- `396fde454d` `2022-10-20` **other** · fix · kept — Fix workflow path issue; no numbers stated; `score 0`
+- `8ddc5d9829` `2022-10-20` **other** · fix · kept — fix missing "\" issue in workflow; no numbers stated; `score 0`
+- `4bea11d5e8` `2022-10-20` **other** · other · kept — rename gramine images; no numbers stated; `score 0`
+- `0407ebf5c3` `2022-10-20` **other** · docs · removed — Remove manually-added bold styles for titles; no numbers stated; `score 0`
+- `a1e9b41c3e` `2022-10-20` **other** · other · kept — tag reference-32g-error:2.2.0-SNAPSHOT to reference-32g:latest; no numbers stated; `score 0`
+- `57493194e7` `2022-10-21` **other** · fix · kept — fixed docker push image; no numbers stated; `score 0`
+- `f7e07ecc69` `2022-10-21` **other** · other · kept — add no-attestation gramine images; no numbers stated; `score 0`
+- `5e4c269a49` `2022-10-21` **other** · docs · kept — TPC-DS doc upadte; no numbers stated; `score 0`
+- `f98a8612c6` `2022-10-21` **other** · docs · kept — Add YARN tutorial to docs; no numbers stated; `score 0`
+- `5ed2a33072` `2022-10-21` **other** · other · kept — Deployment with customer image; no numbers stated; `score 0`
+- `a0fa1694b5` `2022-10-22` **other** · other · kept — : Add howto guides for `InferenceOptimizer.optimize`; no numbers stated; `score 0`
+- `70468a96c6` `2022-10-22` **other** · fix · kept — Fix ra config; no numbers stated; `score 0`
+- `9576d97187` `2022-10-24` **other** · fix · kept — Fix overflow problems caused by long words; no numbers stated; `score 0`
+- `f5ef76acf3` `2022-10-24` **other** · other · kept — Add collapsing functionality to the quicklink titles in landing page; no numbers stated; `score 0`
+- `f54b9b1915` `2022-10-24` **other** · docs · kept — Nano : update installation guide to nightly-build version; no numbers stated; `score 0`
+- `6a8cdd71de` `2022-10-24` **other** · docs · kept — fix torch_nano document link error and small change; no numbers stated; `score 0`
+- `100f2df428` `2022-10-24` **other** · other · kept — update doc; no numbers stated; `score 0`
+- `a66e7adfe0` `2022-10-24` **other** · other · kept — Update README.md in `docs/readthedocs` folder; no numbers stated; `score 0`
+- `ea164651ee` `2022-10-24` **other** · other · kept — Polish Orca Doc; no numbers stated; `score 0`
+- `b4d01ac706` `2022-10-24` **other** · docs · kept — Update Orca install guide; no numbers stated; `score 0`
+- `6e32cfc215` `2022-10-25` **other** · other · kept — add gramine bigdata toolkit; no numbers stated; `score 0`
+- `89f97fed01` `2022-10-25` **other** · knob · kept — Move in-file toc to yml file except for API related toc; no numbers stated; `score 0`
+- `39bd960e2a` `2022-10-25` **other** · fix · kept — Bugfix: fix chronos installation panel cmd line overflow.; no numbers stated; `score 0`
+- `6245a4525b` `2022-10-25` **other** · other · kept — Update: make sidebars sticky.; no numbers stated; `score 0`
+- `662628f4db` `2022-10-25` **other** · knob · kept — Chronos: Add how-to guides for exporting ONNX/OpenVINO files to disk; no numbers stated; `score 0`
+- `aea43b44d4` `2022-10-26` **other** · docs · kept — update VFL  HE document; no numbers stated; `score 0`
+- `8a15a79b1a` `2022-10-26` **other** · knob · kept — Modify image to support pert model; no numbers stated; `score 0`
+- `97b5c6a813` `2022-10-27` **other** · fix · kept — fix mnist.py; no numbers stated; `score 0`
+- `df3c04199f` `2022-10-27` **other** · other · kept — Add BigDL-PPML-Azure-Occlum-Example to readthedocs; no numbers stated; `score 0`
+- `7edf650344` `2022-10-28` **other** · other · kept — : create a workflow for ppml developer to build image based on specific commit id; no numbers stated; `score 0`
+- `3751a1134c` `2022-10-28` **other** · knob · removed — remove default value for commit id; no numbers stated; `score 0`
+- `13f2557785` `2022-10-28` **other** · other · kept — CI/CD: build 64g Bigdata Toolkit; no numbers stated; `score 0`
+- `56fcec2314` `2022-10-31` **other** · fix · kept — Fix deploy in production link; no numbers stated; `score 0`
+- `ed3cc9ed64` `2022-10-31` **other** · other · kept — set no-attest flag in image build console; no numbers stated; `score 0`
+- `1aa0be32ff` `2022-10-31` **other** · other · kept — set no-attest flag in image build console; no numbers stated; `score 0`
+- `95ef573fc4` `2022-10-31` **other** · other · kept — Add contributor guide for writing new documentation; no numbers stated; `score 0`
+- `2629bb0645` `2022-10-31` **other** · docs · kept — Chronos: fix the installation guide link; no numbers stated; `score 0`
+- `4dac556c68` `2022-10-31` **other** · docs · kept — Update documentation of PPML Occlum on Azure; no numbers stated; `score 0`
+- `c9b06eb431` `2022-11-02` **other** · docs · kept — Add MP Auto and warning; no numbers stated; `score 0`
+- `654baef1a3` `2022-11-02` **other** · docs · kept — Nano: refactor inference optimizer code for better code reuse; no numbers stated; `score 0`
+- `23d79f7b7b` `2022-11-02` **other** · other · kept — Update manually_build.yml; no numbers stated; `score 0`
+- `77129f33cf` `2022-11-03` **other** · docs · kept — Fix failed link in BigDL README; no numbers stated; `score 0`
+- `250ea019bd` `2022-11-03` **other** · fix · kept — Nano: fix torch version to enable nano API doc; no numbers stated; `score 0`
+
+*Commits 701-800 (2022-09-16..2022-11-03): scores 0/1/2/3 = 100/0/0/0; areas other 100.*
+
+- `85445fdd39` `2022-11-03` **other** · docs · kept — add support for acr; no numbers stated; `score 0`
+- `d911f89b8d` `2022-11-04` **other** · other · kept — add debug log level image; no numbers stated; `score 0`
+- `1497bde87a` `2022-11-04` **other** · other · kept — add debug log level gramine images; no numbers stated; `score 0`
+- `5c5066b2c0` `2022-11-04` **other** · other · kept — add debug log level image in noattest; no numbers stated; `score 0`
+- `f9f2b9614b` `2022-11-04` **other** · fix · kept — fix bug; no numbers stated; `score 0`
+- `84f5106a73` `2022-11-04` **other** · other · kept — : Add how-to guides for exporting torchscript files to disk; no numbers stated; `score 0`
+- `29e9c18c70` `2022-11-04` **other** · docs · kept — Chronos:  Make known issue page more friendly; no numbers stated; `score 0`
+- `916fdecd27` `2022-11-04` **other** · other · kept — Orca: Document polishing; no numbers stated; `score 0`
+- `7cb86aeddd` `2022-11-04` **other** · knob · kept — Enable Mermaid diagrams in our documentation; no numbers stated; `score 0`
+- `5346ef45d8` `2022-11-04` **other** · other · kept — Orca: update orca-in-5-minutes to tf2 estimator.; no numbers stated; `score 0`
+- `1e7681325b` `2022-11-07` **other** · docs · kept — Update yarn tutorial; no numbers stated; `score 0`
+- `ff69b05616` `2022-11-08` **other** · other · kept — Update manually_build.yml; no numbers stated; `score 0`
+- `8b41130ca0` `2022-11-08` **other** · other · kept — add 16g gramine image; no numbers stated; `score 0`
+- `0a49cd03bf` `2022-11-08` **other** · other · kept — Reorg Readthedoc tutorial & menu; no numbers stated; `score 0`
+- `7302451234` `2022-11-08` **other** · other · kept — add debug image for azure; no numbers stated; `score 0`
+- `4403c7727f` `2022-11-08` **other** · other · kept — Chronos: forecaster save/load how-to guide; no numbers stated; `score 0`
+- `a46618844f` `2022-11-09` **other** · docs · kept — Add mermaid to deployment and installation doc; no numbers stated; `score 0`
+- `4f3c27bde0` `2022-11-09` **other** · other · kept — Chronos: upload prediction how-to-guide.; no numbers stated; `score 0`
+- `17fb75f8d7` `2022-11-09` **other** · docs · kept — Refine readthedoc lines and space; no numbers stated; `score 0`
+- `7da102243e` `2022-11-10` **other** · docs · kept — Update Orca install doc; no numbers stated; `score 0`
+- `9c99751288` `2022-11-10` **other** · docs · kept — Update Orca 5min; no numbers stated; `score 0`
+- `2fcf2e1fd5` `2022-11-10` **other** · other · kept — Update occlum production build; no numbers stated; `score 0`
+- `9b472e80f2` `2022-11-10` **other** · other · kept — Build image Action use cache and update production build; no numbers stated; `score 0`
+- `bd073e940a` `2022-11-10` **other** · other · kept — Update manually build work dir; no numbers stated; `score 0`
+- `25d01a16b5` `2022-11-10` **other** · other · kept — Build python toolkit image in manually build for test.; no numbers stated; `score 0`
+- `db5791fecb` `2022-11-10` **other** · other · kept — Fix syntax error of manually_build_for_testing.; no numbers stated; `score 0`
+- `d5cbc8e5b7` `2022-11-11` **other** · fix · kept — Fix the error of lacking indents.; no numbers stated; `score 0`
+- `65796ac9e7` `2022-11-11` **other** · other · kept — Modify the directory of bigdl-ppml-python-toolkit in manually_build_for_testing.; no numbers stated; `score 0`
+- `71177c3f5d` `2022-11-11` **other** · other · kept — Update manually push image name; no numbers stated; `score 0`
+- `2ecf8c5108` `2022-11-11` **other** · other · kept — Add SGX_LOG_LEVEL to bigdl_ppml_trusted_python_toolkit.; no numbers stated; `score 0`
+- `935b272c9f` `2022-11-11` **other** · other · kept — Add SGX_LOG_LEVEL to manually_build_for_testing.; no numbers stated; `score 0`
+- `a9c3c18108` `2022-11-11` **other** · other · kept — Split occlum build and run for production; no numbers stated; `score 0`
+- `dbce8f13e0` `2022-11-11` **other** · other · kept — Chronos : How to preprocess my data guide; no numbers stated; `score 0`
+- `1453e5c244` `2022-11-14` **other** · docs · kept — Doc: Update orca hadoop user guide.; no numbers stated; `score 0`
+- `93351ffd0a` `2022-11-14` **other** · other · kept — Add python toolkit image to manually_build.yml.; no numbers stated; `score 0`
+- `2904af55ed` `2022-11-14` **other** · docs · kept — Doc: update orca-in-5-mins prediction.; no numbers stated; `score 0`
+- `9cc933bb18` `2022-11-14` **other** · other · kept — Chronos: Add forecasters filter tags in tutorial page.; no numbers stated; `score 0`
+- `67a8082a4f` `2022-11-14` **other** · other · kept — Add customer action test; no numbers stated; `score 0`
+- `da7d065495` `2022-11-14` **other** · other · kept — Add customer image action selection; no numbers stated; `score 0`
+- `348c6aa092` `2022-11-14` **other** · other · kept — Add occlum manually customer image action build; no numbers stated; `score 0`
+- `1e5d51f2be` `2022-11-14` **other** · sched · kept — Chronos: add serving forecaster example in document; no numbers stated; `score 0`
+- `2d7ea756af` `2022-11-14` **other** · fix · kept — fix occlum-customer; no numbers stated; `score 0`
+- `dabea499ff` `2022-11-14` **other** · fix · kept — fix kmsutils action bug; no numbers stated; `score 0`
+- `c80bb4b876` `2022-11-14` **other** · other · kept — Expose k8s tutorial to docs; no numbers stated; `score 0`
+- `4169d8cb05` `2022-11-14` **other** · docs · kept — Doc: fix spark-submit command for yarn client and cluster mode.; no numbers stated; `score 0`
+- `eaa5110db7` `2022-11-15` **other** · other · kept — Migrate requirements file for ReadtheDocs documentation building; no numbers stated; `score 0`
+- `e85f836acc` `2022-11-15` **other** · fix · kept — Sidebar fix; no numbers stated; `score 0`
+- `f1d4fb4d37` `2022-11-15` **other** · knob · kept — cicd:add option bigdl-ppml-trusted-bigdata-gramine; no numbers stated; `score 0`
+- `aff0f55b7f` `2022-11-15` **other** · fix · kept — fix: add var base_image in bigdata build; no numbers stated; `score 0`
+- `607db04ad7` `2022-11-16` **other** · knob · kept — Openvino model inference notebook example with Nano; no numbers stated; `score 0`
+- `a5d72a34c8` `2022-11-16` **other** · other · kept — Chronos: Update Windows User Guide; no numbers stated; `score 0`
+- `225facc5af` `2022-11-16` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `34f20c01cc` `2022-11-16` **other** · docs · kept — Azure support for Gramine; no numbers stated; `score 0`
+- `b75f399038` `2022-11-17` **other** · docs · kept — Add UEFI warning; no numbers stated; `score 0`
+- `8d6c43dd09` `2022-11-17` **other** · knob · kept — Mock module cpuinfo for fixing missing Nano/Chronos api doc; no numbers stated; `score 0`
+- `62694b420e` `2022-11-17` **quant** · docs · kept — Nano: fix onnx quantization document issue; no numbers stated; `score 0`
+- `022d8d661c` `2022-11-17` **other** · knob · kept — Chronos: add a how to guide to help users replay their forecaster with pre/post processing in production env; no numbers stated; `score 0`
+- `11cc260980` `2022-11-18` **other** · docs · kept — Nano : support InferenceOptimizer for keras; no numbers stated; `score 0`
+- `8f18a235fd` `2022-11-18` **other** · other · kept — Occlum customer image build action no cache; no numbers stated; `score 0`
+- `83921263c8` `2022-11-18` **other** · fix · kept — Fix quick links; no numbers stated; `score 0`
+- `78ee9b23f6` `2022-11-21` **other** · docs · kept — Change default backend of PyTorch Estimator to spark; no numbers stated; `score 0`
+- `cdd1f8421e` `2022-11-21` **other** · docs · kept — Update k8s tutorial (part1); no numbers stated; `score 0`
+- `bb3889958c` `2022-11-21` **other** · docs · kept — Update k8s tutorial (part2); no numbers stated; `score 0`
+- `1b72f1b38f` `2022-11-21` **other** · other · kept — Upgrade PyTorch version to 1.13.0; no numbers stated; `score 0`
+- `229302b758` `2022-11-22` **other** · other · kept — Update occlum register path; no numbers stated; `score 0`
+- `e249e32c6f` `2022-11-22` **other** · docs · kept — Update K8s tutorial (part3); no numbers stated; `score 0`
+- `7f2beefb7b` `2022-11-22` **other** · docs · kept — fix: update pytorch estimator backend.; no numbers stated; `score 0`
+- `d0388cb8d8` `2022-11-22` **other** · docs · kept — Update K8s tutorial (part4); no numbers stated; `score 0`
+- `cd8d21dded` `2022-11-23` **other** · fix · kept — Fix docker rmi in manually_build; no numbers stated; `score 0`
+- `ca3b088522` `2022-11-23` **other** · other · kept — Doc: update sidebar and quickstarts order.; no numbers stated; `score 0`
+- `745aaef5df` `2022-11-23` **other** · other · kept — Orca: update doc for pytorch estimator backend.; no numbers stated; `score 0`
+- `982d3ac786` `2022-11-23` **other** · docs · kept — Update PyTorch Estimator doc; no numbers stated; `score 0`
+- `988bdc18cf` `2022-11-24` **other** · docs · removed — Remove DEFAULT_INFERENCE_ACCELERATION_METHODfor InferenceOptimizer.optimize pniapi doc; no numbers stated; `score 0`
+- `ebe75782dd` `2022-11-24` **other** · docs · kept — Doc: add download link and script in orca installation.; no numbers stated; `score 0`
+- `1b46df7e65` `2022-11-25` **other** · docs · kept — Refine readthedoc development guide; no numbers stated; `score 0`
+- `df775d172e` `2022-11-25` **other** · instr · kept — Chronos: benchmark tool user guide; no numbers stated; `score 0`
+- `621168ce2e` `2022-11-25` **other** · other · kept — Move dev guide to tutorial; no numbers stated; `score 0`
+- `cd04f7dbdc` `2022-11-25` **other** · knob · kept — Chronos: Update installation panel for inference option; no numbers stated; `score 0`
+- `bf5ccae4ef` `2022-11-25` **other** · knob · kept — add how to guide save and load jit, ipex, onnx, openvino; no numbers stated; `score 0`
+- `d25d67d3d7` `2022-11-25` **other** · fix · kept — Chronos: Fix the installation panel display error; no numbers stated; `score 0`
+- `242de02c0e` `2022-11-28` **other** · docs · kept — Update document; no numbers stated; `score 0`
+- `3571247d65` `2022-11-28` **other** · other · kept — Attestation basic; no numbers stated; `score 0`
+- `c87c01bd8d` `2022-11-28` **other** · other · kept — Update doc requirements link; no numbers stated; `score 0`
+- `bd112d6cf3` `2022-11-28` **other** · docs · kept — Add Azure Attestation part to Attestation Basic Docs; no numbers stated; `score 0`
+- `81a9f8147c` `2022-11-29` **other** · docs · kept — Azure Gramine documentation; no numbers stated; `score 0`
+- `87507ba715` `2022-11-30` **other** · docs · kept — Nano: add partial m-series chip support for tensorflow (training and installation); no numbers stated; `score 0`
+- `bf96cada20` `2022-12-01` **other** · docs · kept — Update yarn doc; no numbers stated; `score 0`
+- `536f84cc34` `2022-12-01` **other** · docs · kept — Doc: add how-to guides to navigation box.; no numbers stated; `score 0`
+- `fdcf509681` `2022-12-01` **other** · docs · kept — Update doc style; no numbers stated; `score 0`
+- `207958dbad` `2022-12-01` **other** · other · kept — cicd: add pip mirror https://pypi.python.org/simple for bigdl related package; no numbers stated; `score 0`
+- `b82975a8d1` `2022-12-02` **other** · other · kept — Update customer image readme; no numbers stated; `score 0`
+- `b96d39db4a` `2022-12-02` **other** · docs · kept — Orca: update yarn tutorial; no numbers stated; `score 0`
+- `ae7160790d` `2022-12-07` **other** · other · kept — Doc: Nano installation panel; no numbers stated; `score 0`
+- `044785173e` `2022-12-08` **other** · docs · kept — Chronos: Update chronos-nightly Dockerfile and notebook; no numbers stated; `score 0`
+- `7e2742cace` `2022-12-08` **other** · docs · kept — Nano: Update examples and tutorials; no numbers stated; `score 0`
+- `7a8bd4cee5` `2022-12-08` **other** · docs · kept — Doc: copy faq to known issues.; no numbers stated; `score 0`
+- `d90ee7e51e` `2022-12-09` **other** · docs · kept — Nano: update optimizer's examples; no numbers stated; `score 0`
+- `f52e6340af` `2022-12-09` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `eceedbe196` `2022-12-09` **other** · docs · kept — Chronos: update benchmark tool guide to demonstrate new functions; no numbers stated; `score 0`
+- `56a2d8f1cd` `2022-12-12` **other** · docs · kept — Orca docs: The mv command in the document needs to be modified; no numbers stated; `score 0`
+
+*Commits 801-900 (2022-11-03..2022-12-12): scores 0/1/2/3 = 100/0/0/0; areas other 99, quant 1.*
+
+- `7e180d028e` `2022-12-12` **other** · docs · kept — Nano: update tensorflow examples; no numbers stated; `score 0`
+- `414c220111` `2022-12-12` **other** · docs · kept — Update presentations.md and powered-by.md; no numbers stated; `score 0`
+- `9fae00dafd` `2022-12-13` **other** · docs · kept — Chronos: Update doc to illustrate deploy mode in `TSDataset`; no numbers stated; `score 0`
+- `99d6decfeb` `2022-12-13` **other** · docs · kept — Orca docs: The mv command in the document k8s.md needs to be modified; no numbers stated; `score 0`
+- `664dfbe7ef` `2022-12-13` **other** · other · kept — Nano: Add key feature and how to guide for multi-instance inference; no numbers stated; `score 0`
+- `de88f1e6b3` `2022-12-13` **other** · docs · kept — doc: add load to pytorch estimator quickstart.; no numbers stated; `score 0`
+- `b3feb53c4a` `2022-12-13` **other** · other · kept — Nano: add key feature and how to guide for context manager; no numbers stated; `score 0`
+- `12487a4c5a` `2022-12-14` **other** · docs · kept — Hide ALL_INFERENCE_ACCELERATION_METHOD in api doc rendering for bigdl.nano.tf.keras.InferenceOptimizer; no numbers stated; `score 0`
+- `6b65968e3c` `2022-12-14` **other** · docs · removed — Remove save entire model in doc; no numbers stated; `score 0`
+- `f304d33168` `2022-12-16` **other** · docs · kept — Nano: add patching function for dtype; no numbers stated; `score 0`
+- `217e8a1c2b` `2022-12-19` **other** · docs · kept — Chronos: update python3.8 support in document; no numbers stated; `score 0`
+- `dea7b8f9f2` `2022-12-19` **other** · docs · kept — Nano: update train pytorch key feature doc; no numbers stated; `score 0`
+- `0a62df22aa` `2022-12-21` **other** · docs · kept — Nano: quick fix typo; no numbers stated; `score 0`
+- `3b6c56b505` `2022-12-22` **other** · docs · kept — Nano: update nano known issue; no numbers stated; `score 0`
+- `935fc48354` `2022-12-22` **other** · docs · kept — Nano: update PyTorch inference key feature doc; no numbers stated; `score 0`
+- `6bc720d26a` `2022-12-26` **other** · docs · kept — Add API doc for `bigdl.nano.pytorch.nano` decorator; no numbers stated; `score 0`
+- `7c3d2b835d` `2022-12-26` **other** · other · kept — add 16G reference gramine images; no numbers stated; `score 0`
+- `14cf4aff72` `2022-12-26` **other** · other · kept — Nano: Troubshooting guide for BigDL-Nano; no numbers stated; `score 0`
+- `3e040d7b28` `2022-12-26` **other** · other · kept — refactor bigdata build; no numbers stated; `score 0`
+- `37b0c6fa50` `2022-12-26` **other** · other · kept — How-To Guides: Convert to TorchNano & use @nano decorator; no numbers stated; `score 0`
+- `da7b30529b` `2022-12-26` **other** · other · kept — Nano: Update the Nano installation panel; no numbers stated; `score 0`
+- `c66cca0c62` `2022-12-27` **other** · docs · kept — Add more key features regarding `TorchNano` and `@nano` for PyTorch training; no numbers stated; `score 0`
+- `6375e36f00` `2022-12-29` **other** · docs · kept — Nano: upgrade openvino to `2022.3.0` and torchmetics to `0.11.0`; no numbers stated; `score 0`
+- `264451c6bd` `2022-12-30` **other** · other · kept — Merge Orca quick starts and how to; no numbers stated; `score 0`
+- `f57e296448` `2022-12-30` **other** · docs · kept — Update Orca QuickStart links in README; no numbers stated; `score 0`
+- `189a2f5179` `2022-12-30` **other** · docs · kept — Update Orca How-to index; no numbers stated; `score 0`
+- `614d2ab289` `2023-01-03` **other** · docs · kept — Nano: fix some typos of web documentation; no numbers stated; `score 0`
+- `925874b2cd` `2023-01-03` **other** · docs · kept — Nano: improve Howto guide of InferenceOptimizer.optimize; no numbers stated; `score 0`
+- `56e94eda59` `2023-01-03` **other** · other · kept — Chronos: add forecaster alg choose guide and some cleaning for how to guide; no numbers stated; `score 0`
+- `ab9a3b69fb` `2023-01-04` **other** · other · kept — Nano: Add CUDA patch key feature; no numbers stated; `score 0`
+- `18ae409b7c` `2023-01-04` **other** · knob · kept — add how-to-guide for tensorflow inference by onnxruntime and openvino; no numbers stated; `score 0`
+- `3fd27f51a8` `2023-01-05` **other** · docs · kept — Automerge for updating the url.; no numbers stated; `score 0`
+- `bfca337d09` `2023-01-05` **other** · other · kept — Add how-to guide for TensorFlow Keras training using bf16; no numbers stated; `score 0`
+- `5e9ef7b553` `2023-01-05` **other** · sched · kept — Add a generalized how-to guide for accelerate PyTorch cv data process pipeline; no numbers stated; `score 0`
+- `1d4d65dd07` `2023-01-05` **other** · docs · kept — Nano: add Neural Coder example and document; no numbers stated; `score 0`
+- `9db2b48519` `2023-01-05` **other** · other · kept — Chronos: How to use `built-in` dataset; no numbers stated; `score 0`
+- `ac78c2f532` `2023-01-09` **other** · docs · kept — Orca download url modify; no numbers stated; `score 0`
+- `6ca8f8567f` `2023-01-09` **other** · other · kept — Chronos: Add how to guide for export_jit; no numbers stated; `score 0`
+- `19f00e80dc` `2023-01-09` **other** · docs · kept — Update download document; no numbers stated; `score 0`
+- `c4874f35c8` `2023-01-09` **other** · docs · kept — Nano: Add key feature for keras inference; no numbers stated; `score 0`
+- `af9cdc6edd` `2023-01-10` **other** · docs · kept — Update spark-submit section in yarn tutorial; no numbers stated; `score 0`
+- `d950992b91` `2023-01-10` **other** · other · kept — How-To Guides: Accelerate PyTorch Training with IPEX & Multi-instance & BF16 & Channels last; no numbers stated; `score 0`
+- `2858a1b5bf` `2023-01-10` **other** · knob · kept — Add how-to-guide of load/save API for tensorflow inference; no numbers stated; `score 0`
+- `338423bfc9` `2023-01-11` **other** · other · kept — Add bigdl-kms image build action; no numbers stated; `score 0`
+- `5ebaa3a41b` `2023-01-11` **other** · docs · kept — Nano: Updated the description of “python version”; no numbers stated; `score 0`
+- `06cb1971c7` `2023-01-11` **other** · docs · kept — Fix import path in API docs; no numbers stated; `score 0`
+- `cc6f9b4dd2` `2023-01-11` **other** · docs · kept — docs(orca-context.md): RayContext -> OrcaRayContext; no numbers stated; `score 0`
+- `3543a58723` `2023-01-12` **other** · knob · kept — How-to Guide: Inference via Openvino on Intel GPUs; no numbers stated; `score 0`
+- `8e4e643f53` `2023-01-17` **other** · docs · kept — Update k8s tutorial; no numbers stated; `score 0`
+- `73ceb1ca92` `2023-01-17` **other** · docs · kept — Update gzip command in FashionMNIST tutorial; no numbers stated; `score 0`
+- `1ae23bf068` `2023-01-19` **other** · docs · kept — update release doc main; no numbers stated; `score 0`
+- `3815595940` `2023-01-19` **other** · docs · kept — feat: update download link.; no numbers stated; `score 0`
+- `eeebdc3f5b` `2023-01-19` **other** · docs · kept — Doc: Centering style in download table.; no numbers stated; `score 0`
+- `274eddfb1a` `2023-01-28` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `6a4c40fc1f` `2023-01-29` **other** · docs · kept — Update PyTorch quickstart; no numbers stated; `score 0`
+- `6c07f95d1c` `2023-01-29` **other** · docs · kept — Update Howto guides; no numbers stated; `score 0`
+- `61f25b1a6c` `2023-01-29` **other** · docs · kept — Fix k8s tutorial style; no numbers stated; `score 0`
+- `4568403d47` `2023-01-29` **other** · docs · kept — Enhance k8s tutorial; no numbers stated; `score 0`
+- `90c76ce7a2` `2023-02-01` **other** · docs · kept — Nano: Add some user guide and warning messages according to feedback; no numbers stated; `score 0`
+- `08a556239c` `2023-02-01` **other** · other · kept — Chronos: add how to guide for forecaster.optimize; no numbers stated; `score 0`
+- `c7674f52b2` `2023-02-01` **other** · other · kept — Add how-to guide for TensorFlow Keras inference using bf16 mixed precision; no numbers stated; `score 0`
+- `4f7f9cd1ad` `2023-02-01` **other** · other · kept — Nano: Update nano installation panel; no numbers stated; `score 0`
+- `c74320db0e` `2023-02-02` **other** · other · kept — Chronos: update installation panel; no numbers stated; `score 0`
+- `bd29010854` `2023-02-02` **other** · other · kept — Nano: add libjemalloc.dylib; no numbers stated; `score 0`
+- `c31136df0b` `2023-02-03` **other** · other · kept — Improve How-to Guides Navigations; no numbers stated; `score 0`
+- `f903b78711` `2023-02-02` **other** · docs · kept — restructure tensorflow inference document; no numbers stated; `score 0`
+- `06e6935ba9` `2023-02-03` **other** · docs · kept — Nano: update troubleshooting guide; no numbers stated; `score 0`
+- `4b8b6b7d0e` `2023-02-03` **other** · fix · kept — Nano: fix stable version installation panel; no numbers stated; `score 0`
+- `8911c69302` `2023-02-06` **other** · docs · kept — Update k8s tutorial and script; no numbers stated; `score 0`
+- `f4700422e1` `2023-02-06` **other** · knob · kept — Nano: add OS support table; no numbers stated; `score 0`
+- `670c54c6d7` `2023-02-06` **other** · fix · kept — fix:add image with tag 'latest' in private dockerfile; no numbers stated; `score 0`
+- `9c129ec158` `2023-02-08` **other** · docs · kept — Revise PyTorch Inference key feature doc regarding context manager; no numbers stated; `score 0`
+- `56d699d935` `2023-02-09` **other** · docs · kept — Nano: update os support; no numbers stated; `score 0`
+- `6960c87b54` `2023-02-09` **other** · other · kept — Revise outdated info in PyTorch Inference how-to guides; no numbers stated; `score 0`
+- `13568a9aa8` `2023-02-10` **other** · docs · kept — Nano: fix multi-instance on Windows; no numbers stated; `score 0`
+- `192a4d4c68` `2023-02-14` **other** · fix · kept — fix variable typo; no numbers stated; `score 0`
+- `7727b4c9ba` `2023-02-15` **other** · docs · kept — feat: update download link; no numbers stated; `score 0`
+- `2e1d977e08` `2023-02-15` **other** · docs · kept — Update k8s command; no numbers stated; `score 0`
+- `213cfd985b` `2023-02-15` **other** · docs · kept — Update k8s tutorial; no numbers stated; `score 0`
+- `479042a93a` `2023-02-15` **other** · docs · kept — Doc: add yarn cluster running results; no numbers stated; `score 0`
+- `ec2b9c13ee` `2023-02-15` **other** · other · kept — add bigdata toolkit with debug log level; no numbers stated; `score 0`
+- `29e52af49b` `2023-02-16` **other** · docs · kept — Update yarn doc; no numbers stated; `score 0`
+- `73f6d79e8c` `2023-02-16` **other** · docs · kept — Known Issues Update; no numbers stated; `score 0`
+- `8a8fe7ff9f` `2023-02-17` **other** · docs · kept — Chronos: upgrade torch to 1.13.1 and add description about onnx in troubleshooting page; no numbers stated; `score 0`
+- `842e676ad7` `2023-02-17` **other** · sched · kept — adding new workflow for dl-serving image; no numbers stated; `score 0`
+- `de1ec0d19b` `2023-02-17` **other** · sched · kept — Update workflow for dl-serving gramine-ref; no numbers stated; `score 0`
+- `3adcb84e24` `2023-02-17` **other** · sched · kept — Update dl-serving-gramine-ref workflow; no numbers stated; `score 0`
+- `bcfcb3f12b` `2023-02-17` **other** · other · kept — Alibaba ECS Occlum CN Develop guide; no numbers stated; `score 0`
+- `d961fdee59` `2023-02-17` **other** · docs · removed — Remove 246/312/313 from script names; no numbers stated; `score 0`
+- `0e31d15f6d` `2023-02-17` **other** · docs · kept — Restructure pytorch inference documentation; no numbers stated; `score 0`
+- `2bc6e03635` `2023-02-20` **other** · docs · kept — Chronos: update dockerfile; no numbers stated; `score 0`
+- `aea71ce4d7` `2023-02-21` **other** · docs · kept — Refine Occlum Ali ECS Development Guide Doc Style; no numbers stated; `score 0`
+- `e5fb0a3315` `2023-02-22` **other** · other · kept — build bigdata toolkit with no cache; no numbers stated; `score 0`
+- `33306da4d4` `2023-02-22` **other** · docs · kept — Chronos: update how to download from dockerhub in guide; no numbers stated; `score 0`
+- `d4c46a011c` `2023-02-22` **other** · other · kept — Update installation panel to include stock TensorFlow; no numbers stated; `score 0`
+- `f997cc5d60` `2023-02-23` **other** · docs · kept — Update k8s yaml; no numbers stated; `score 0`
+- `b12f2e1902` `2023-02-23` **other** · other · kept — delete bigdata image with debug log level; no numbers stated; `score 0`
+- `ce8f11c240` `2023-02-23` **other** · docs · kept — Update K8s doc; no numbers stated; `score 0`
+- `48f5144a34` `2023-02-23` **other** · docs · removed — Nano: remove inc from [inference] option on windows; no numbers stated; `score 0`
+- `51b8ff3728` `2023-02-23` **other** · docs · removed — Update k8s doc - remove env from yaml; no numbers stated; `score 0`
+
+*Commits 901-1000 (2022-12-12..2023-02-23): scores 0/1/2/3 = 100/0/0/0; areas other 100.*
+
+- `6d174f8012` `2023-02-24` **other** · other · kept — Restyle installation panel; no numbers stated; `score 0`
+- `feacade38c` `2023-02-27` **other** · other · kept — fix: delete latest tag bigdata image built for testing; no numbers stated; `score 0`
+- `a1ee2f8b68` `2023-02-28` **other** · docs · kept — K8s Tutorial Update; no numbers stated; `score 0`
+- `528717da46` `2023-02-28` **other** · docs · kept — Chronos: `bigdl.chronos.aiops` first push; no numbers stated; `score 0`
+- `732f122711` `2023-03-01` **other** · docs · kept — Minor update on k8s tutorial; no numbers stated; `score 0`
+- `3a57b97c2b` `2023-03-01` **other** · sched · kept — Add dl-serving manually_build workflow; no numbers stated; `score 0`
+- `f0fa26a8a8` `2023-03-01` **other** · other · kept — Reduce the epc usage of bigdata; no numbers stated; `score 0`
+- `f2950e55a2` `2023-03-02` **other** · docs · kept — add notes for python version issue in databricks tutorial; no numbers stated; `score 0`
+- `67a343762e` `2023-03-02` **other** · docs · kept — Add inherited-members for TF InferenceOptimizer to make sure the methods from BaseInferenceOptimizer shown in API doc; no numbers stated; `score 0`
+- `17474d9402` `2023-03-02` **other** · docs · kept — databricks guide update; no numbers stated; `score 0`
+- `e5e5c06863` `2023-03-08` **other** · fix · kept — Mock sigfig for doc build to fix the failed rendered API doc; no numbers stated; `score 0`
+- `57125dfcd4` `2023-03-08` **other** · knob · kept — tag 8g epc bigdata as default image; no numbers stated; `score 0`
+- `a1a1f914bb` `2023-03-08` **other** · docs · kept — Fix dllib nnframes doc; no numbers stated; `score 0`
+- `633668c882` `2023-03-08` **other** · docs · kept — Update nnframes.md; no numbers stated; `score 0`
+- `144efd0748` `2023-03-14` **other** · docs · kept — Add MAA part to azure_ppml readthedocs document; no numbers stated; `score 0`
+- `522e5ae35b` `2023-03-14` **other** · other · kept — add no_proxy arg when building bigdata; no numbers stated; `score 0`
+- `eac9b088e2` `2023-03-15` **other** · docs · kept — Update Nano description; no numbers stated; `score 0`
+- `a02402e410` `2023-03-20` **other** · docs · kept — update; no numbers stated; `score 0`
+- `a6f96521af` `2023-03-31` **other** · other · kept — Chronos: AIOps User Guide; no numbers stated; `score 0`
+- `13717ee5c8` `2023-03-31` **other** · other · kept — add noattest bigdata toolkit image; no numbers stated; `score 0`
+- `e91cb31575` `2023-04-03` **other** · other · kept — set no; no numbers stated; `score 0`
+- `8a24ae76a8` `2023-04-03` **other** · fix · kept — fix image name in bigdata toolkit; no numbers stated; `score 0`
+- `f885466475` `2023-04-04` **other** · fix · kept — fix: typo in build; no numbers stated; `score 0`
+- `814f5bd915` `2023-04-06` **other** · other · kept — add no_proxy for bigdl-kms; no numbers stated; `score 0`
+- `9695ef2978` `2023-04-07` **other** · docs · kept — Updated Powered By and Blogs; no numbers stated; `score 0`
+- `2daaa6f7de` `2023-04-07` **other** · other · kept — Nano: TF multi process how-to for customized training loop; no numbers stated; `score 0`
+- `c6eccbfcc2` `2023-04-12` **other** · other · kept — add pt dgpu inference how-to-guide; no numbers stated; `score 0`
+- `a3848611e8` `2023-04-14` **other** · other · kept — Add Orca workflow image; no numbers stated; `score 0`
+- `9ffd1f6dda` `2023-04-19` **other** · other · kept — Mock prophet as doc building failed; no numbers stated; `score 0`
+- `96c9343ef2` `2023-04-21` **other** · other · kept — Update occlum production image build dir; no numbers stated; `score 0`
+- `5ebfaa9a77` `2023-04-21` **other** · docs · kept — Doc: Add known issues for Orca.; no numbers stated; `score 0`
+- `c7630f759a` `2023-04-23` **other** · other · kept — Add bigdl-kms into manually build; no numbers stated; `score 0`
+- `981bded4b3` `2023-04-23` **other** · fix · kept — fix bigdl-kms-reference; no numbers stated; `score 0`
+- `f30215a77e` `2023-04-23` **other** · other · removed — delete outdated bigdl kms; no numbers stated; `score 0`
+- `5ed3ac52c0` `2023-04-24` **other** · other · kept — Chronos: update information about python version in installation document; no numbers stated; `score 0`
+- `8b0876f238` `2023-04-23` **other** · other · kept — add tdx image in action; no numbers stated; `score 0`
+- `8719674c92` `2023-04-24` **other** · other · kept — update manually_build.yml; no numbers stated; `score 0`
+- `9fdbede632` `2023-04-24` **other** · docs · kept — update 2.4.0-snapshot readthedoc; no numbers stated; `score 0`
+- `d833a765fe` `2023-04-24` **other** · other · kept — update manually build; no numbers stated; `score 0`
+- `94f08edbb3` `2023-04-26` **other** · other · kept — Refactor BigDL Attestation Service Deployment of Docker and K8s; no numbers stated; `score 0`
+- `203753270d` `2023-05-05` **other** · docs · kept — Upgrade python to 3.8; no numbers stated; `score 0`
+- `e178692c2c` `2023-05-06` **other** · docs · kept — Support python 3.10 in nightly test; no numbers stated; `score 0`
+- `30367f5eb1` `2023-05-06` **sync** · sched · kept — Add how-to-guide for pytorch async pipeline; no numbers stated; `score 0`
+- `c0967bc143` `2023-05-09` **other** · docs · kept — Fix link of win.md; no numbers stated; `score 0`
+- `21d5108f95` `2023-05-10` **other** · other · kept — Chronos: improve prvd and nb tests with more python versions; no numbers stated; `score 0`
+- `768b15881d` `2023-05-17` **other** · other · kept — CICD: build 32g bigdata image; no numbers stated; `score 0`
+- `ea22416525` `2023-05-25` **other** · other · kept — add first round files; no numbers stated; `score 0`
+- `4638b85f3e` `2023-05-26` **quant** · knob · kept — Initial support of package and quantize; no numbers stated; `score 0`
+- `1f913a6941` `2023-05-30` **other** · other · kept — Add LLM pep8 coding style checking; no numbers stated; `score 1`
+- `fa0b0a4555` `2023-05-31` **other** · docs · kept — fix optuna version; no numbers stated; `score 0`
+- `c890609d1e` `2023-05-31` **quant** · knob · kept — Support package/quantize for llama.cpp/redpajama.cpp on Windows; no numbers stated; `score 0`
+- `8421af51ae` `2023-05-31` **other** · knob · kept — support converting to ggml format; no numbers stated; `score 1`
+- `3fd716d422` `2023-06-01` **other** · other · kept — update setup.py to add a missing data; no numbers stated; `score 0`
+- `e56f24b424` `2023-06-01` **other** · other · kept — first push llama pybinding; no numbers stated; `score 1`
+- `141febec1f` `2023-06-01` **other** · other · kept — Add dev wheel building script for LLM package on Windows; no numbers stated; `score 0`
+- `3a9aa23835` `2023-06-01` **other** · fix · kept — fix and update related license in llama pybinding; no numbers stated; `score 1`
+- `350d31a472` `2023-06-02` **other** · other · kept — first push gptneox pybinding; no numbers stated; `score 1`
+- `91a1528fce` `2023-06-02` **quant** · knob · kept — Support for linux package (llama, NeoX) & quantize (llama); no numbers stated; `score 0`
+- `286b010bf1` `2023-06-02` **mem** · other · kept — First push for Bloomz pybinding; no numbers stated; `score 1`
+- `657ea0ee50` `2023-06-02` **other** · fix · kept — Fix linux load libs for NeoX and llama; no numbers stated; `score 1`
+- `c48d5f7cff` `2023-06-02` **other** · other · kept — Enable UT workflow logics for LLM; no numbers stated; `score 0`
+- `e290660b20` `2023-06-02` **mem** · other · kept — Add so shared library for Bloom family models; no numbers stated; `score 0`
+- `2bc0e7abbb` `2023-06-03` **other** · knob · kept — Add convert_model api; no numbers stated; `score 1`
+- `8bd2992a8d` `2023-06-05` **quant** · other · kept — accelerate sample of gptneox and update quantize; no numbers stated; `score 1`
+- `38be471140` `2023-06-06` **other** · fix · kept — convert_model bug fix; no numbers stated; `score 1`
+- `2ed5842448` `2023-06-06` **other** · other · kept — add convert's python deps for LLM; no numbers stated; `score 0`
+- `64bc123dd3` `2023-06-06` **other** · knob · kept — Add transformers-like API from_pretrained; no numbers stated; `score 1`
+- `a3f353b939` `2023-06-06` **other** · other · kept — add long time loading disclaimer for LLM model converting; no numbers stated; `score 1`
+- `11cd2a07e0` `2023-06-06` **other** · other · kept — llm transformers format interface first part; no numbers stated; `score 1`
+- `2d14e593f0` `2023-06-07` **other** · knob · kept — Support `generate(max_new_tokens=...)`, `tokenize` and `decode` for transformers-like API; no numbers stated; `score 1`
+- `39ad68e786` `2023-06-07` **other** · other · kept — enhancements for `convert_model`; no numbers stated; `score 0`
+- `2c037e892b` `2023-06-07` **other** · fix · kept — fix-transformers-neox; no numbers stated; `score 1`
+- `773255e009` `2023-06-08` **other** · other · kept — Add dev wheel building and basic UT script for LLM package on Linux; no numbers stated; `score 0`
+- `aa91657019` `2023-06-08` **mem** · other · kept — add bloom dll/exe in setup; no numbers stated; `score 0`
+- `1571ba6425` `2023-06-08` **other** · other · removed — remove unused import gptneox_cpp; no numbers stated; `score 1`
+- `6990328e5c` `2023-06-08` **quant** · other · kept — Add bloom quantize in setup.py; no numbers stated; `score 0`
+- `f9e2bda04a` `2023-06-08` **mem** · other · kept — add stop words and enhance output for bloom pybinding; no numbers stated; `score 1`
+- `08bdfce2d8` `2023-06-08` **other** · other · kept — avoid unnecessary import torch except converting process; no numbers stated; `score 1`
+- `ea3cf6783e` `2023-06-08` **mem** · other · kept — Command line wrapper for llama/bloom/gptneox; no numbers stated; `score 0`
+- `637b72f2ad` `2023-06-08` **other** · knob · kept — llm transformers api support batch actions; no numbers stated; `score 1`
+- `7bfa0fcdf9` `2023-06-08` **other** · fix · kept — fix style; no numbers stated; `score 1`
+- `5d0e130605` `2023-06-09` **mem** · fix · kept — fix convert path error of gptneox and bloom on windows; no numbers stated; `score 1`
+- `5d5da7b2c7` `2023-06-09` **other** · other · removed — optimize namespace and remove unused import logic; no numbers stated; `score 1`
+- `c619315131` `2023-06-09` **mem** · knob · kept — Add examples for `gptneox`, `llama`, and `bloom` family model using transformers-like API; no numbers stated; `score 0`
+- `f41995051b` `2023-06-09` **other** · docs · kept — add new readme as first version document; no numbers stated; `score 0`
+- `c4028d507c` `2023-06-12` **other** · knob · kept — Add unified default value for cli programs; no numbers stated; `score 1`
+- `f83c48280f` `2023-06-12` **other** · knob · kept — Unify transformers-like API example for 3 different model families; no numbers stated; `score 0`
+- `02c583144c` `2023-06-12` **other** · other · kept — langchain integrations and examples; no numbers stated; `score 0`
+- `a6c4b733cb` `2023-06-13` **other** · other · kept — Update subprocess to show error message; no numbers stated; `score 1`
+- `5576679a92` `2023-06-14` **quant** · other · kept — add convert-gptq-to-ggml.py to bigdl-llama; no numbers stated; `score 1`
+- `f64e703083` `2023-06-14` **mem** · other · kept — first add `_tokenize`, `detokenize` and `_generate` for bloom pybinding; no numbers stated; `score 1`
+- `5094970175` `2023-06-15` **quant** · knob · kept — update `convert_model` to support int8; no numbers stated; `score 1`
+- `8840dadd86` `2023-06-15` **other** · other · kept — binary file version control on source forge; no numbers stated; `score 0`
+- `bc11a2b1cd` `2023-06-15` **other** · docs · kept — Update distributed-tuning.md; no numbers stated; `score 0`
+- `b30aa49c4e` `2023-06-15` **other** · other · kept — Add Actions for downloading & converting models; no numbers stated; `score 0`
+- `f7f4e65788` `2023-06-15` **quant** · knob · kept — support int8 and tmp_path for `from_pretrained`; no numbers stated; `score 1`
+- `9fda7e34f1` `2023-06-15` **other** · fix · kept — fix version control; no numbers stated; `score 0`
+- `50dd9dd1c5` `2023-06-15` **other** · other · kept — Small improve for LLM base actions; no numbers stated; `score 0`
+- `9daf543e2f` `2023-06-15` **sync** · other · kept — Update convert of gpenox to sync with new libgptneox.so; no numbers stated; `score 1`
+- `1aa33d35d5` `2023-06-16` **other** · other · kept — Refactor LLM Linux tests; no numbers stated; `score 0`
+
+*Commits 1001-1100 (2023-02-24..2023-06-16): scores 0/1/2/3 = 71/29/0/0; areas other 82, quant 8, mem 8, sync 2.*
+
+- `daae7bd4e4` `2023-06-16` **other** · other · kept — Unittest for llm-cli; no numbers stated; `score 0`
+- `ab1a833990` `2023-06-19` **other** · other · kept — add basic uts related to inference; no numbers stated; `score 0`
+- `4d177ca0a1` `2023-06-19` **quant** · other · kept — Merge convert pth/gptq model script into one shell script; no numbers stated; `score 0`
+- `d4027d7164` `2023-06-19` **other** · fix · kept — fix typos in llm_convert; no numbers stated; `score 1`
+- `c256cd136b` `2023-06-19` **other** · fix · kept — Fix ggml return value; no numbers stated; `score 1`
+- `30ac9a70f5` `2023-06-19` **other** · fix · kept — fix expected 2 blank lines; no numbers stated; `score 1`
+- `99d396c9af` `2023-06-20` **other** · knob · kept — Chronos: update tensorflow support in installation doc; no numbers stated; `score 0`
+- `066f53232d` `2023-06-20` **other** · other · kept — Small nightly tests fix; no numbers stated; `score 0`
+- `5f4f399ca7` `2023-06-20` **mem** · fix · kept — fix bugs during supporting bloom in langchain; no numbers stated; `score 1`
+- `f99d348954` `2023-06-20` **quant** · knob · kept — convert and quantize support for StarCoder; no numbers stated; `score 1`
+- `4ec46afa4f` `2023-06-20` **quant** · knob · kept — Align converting GPTQ model API with transformer style; no numbers stated; `score 1`
+- `7ef1c890eb` `2023-06-20` **quant** · knob · kept — Supports GPTQ convert in transfomers-like API, and supports folder outfile for `llm-convert`; no numbers stated; `score 0`
+- `a7d66b7342` `2023-06-21` **other** · docs · kept — README revise for `llm_convert`; no numbers stated; `score 0`
+- `50af0251e4` `2023-06-21` **other** · other · kept — First commit of StarCoder pybinding; no numbers stated; `score 0`
+- `7296453f07` `2023-06-21` **other** · knob · kept — support starcoder in llm-cli; no numbers stated; `score 1`
+- `03c5fb71a8` `2023-06-21` **other** · fix · kept — fix ModuleNotFoundError when use llm-cli; no numbers stated; `score 1`
+- `ce6d06eb0a` `2023-06-25` **quant** · knob · kept — Support directly quantizing huggingface transformers into 4bit format; no numbers stated; `score 0`
+- `446175cc05` `2023-06-25` **other** · knob · kept — transformer api refactor; no numbers stated; `score 0`
+- `c113ecb929` `2023-06-25` **mem** · other · kept — langchain bloom, UT's, default parameters; no numbers stated; `score 0`
+- `5ad5ac5356` `2023-06-26` **other** · other · kept — LightGBM Spark Readthedocs; no numbers stated; `score 0`
+- `19e19efb4c` `2023-06-26` **other** · knob · kept — raise warning instead of error when use unsupported parameters; no numbers stated; `score 1`
+- `b9eae23c79` `2023-06-26` **quant** · other · kept — add chatglm-6b example for transformer_int4 usage; LLM: add chatglm-6b example for transformer_int4 usage (#8392); `score 0`
+- `e68d631c0a` `2023-06-27` **quant** · knob · kept — gptq2ggml: support loading safetensors model.; no numbers stated; `score 1`
+- `4be784a49d` `2023-06-27` **other** · other · kept — add UT for starcoder (convert, inference)  update examples and readme; no numbers stated; `score 0`
+- `cc76ec809a` `2023-06-27` **other** · other · kept — check out dir; no numbers stated; `score 1`
+- `ca5a4b6e3a` `2023-06-28` **quant** · sched · kept — update bloom and starcoder usage in transformers_int4_pipeline; no numbers stated; `score 0`
+- `783aea3309` `2023-06-28` **other** · other · kept — LLM windows daily test; no numbers stated; `score 0`
+- `6251ad8934` `2023-06-29` **other** · other · kept — Windows unittest; no numbers stated; `score 0`
+- `146662bc0d` `2023-06-30` **other** · fix · kept — fix langchain windows failure; no numbers stated; `score 0`
+- `2fd751de7a` `2023-06-30` **other** · other · kept — add a dev tool for getting glibc/glibcxx requirement; no numbers stated; `score 0`
+- `2da21163f8` `2023-06-30` **other** · docs · kept — Update llm README.md; no numbers stated; `score 0`
+- `449aea7ffc` `2023-06-30` **quant** · other · kept — Optimize transformer int4 loading memory; no numbers stated; `score 1`
+- `f116833e42` `2023-07-03` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `fc33d70c9b` `2023-07-03` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `e5b384aaa2` `2023-07-03` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `983ea9b1f3` `2023-07-03` **other** · fix · kept — Chronos: fix installation error of prophet; no numbers stated; `score 0`
+- `c956a46c40` `2023-07-03` **other** · fix · kept — first fix example/transformers; no numbers stated; `score 0`
+- `a38f927fc0` `2023-07-03` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `edf23a95be` `2023-07-03` **other** · docs · kept — Update llm readme; no numbers stated; `score 0`
+- `372c775cb4` `2023-07-04` **other** · other · kept — Change default runner for LLM Linux tests to the ones with AVX512; no numbers stated; `score 0`
+- `e54e52b438` `2023-07-04` **mem** · fix · kept — fix n_batch in bloom pybinding; no numbers stated; `score 1`
+- `e3e95e92ca` `2023-07-04` **other** · other · kept — Add workflow for releasing TDX bigdl-llm image; no numbers stated; `score 0`
+- `1970bcf14e` `2023-07-04` **other** · other · kept — add readme for transformer examples; no numbers stated; `score 0`
+- `323b9fd6df` `2023-07-04` **other** · docs · kept — Update spark-dataframe.md; no numbers stated; `score 0`
+- `936d21635f` `2023-07-05` **other** · other · kept — Extract tests to `.github/actions` to improve reusability; no numbers stated; `score 0`
+- `f2bb469847` `2023-07-05` **other** · other · kept — LLm llm-cli chat mode; no numbers stated; `score 0`
+- `77808fa124` `2023-07-05` **other** · fix · kept — fix n_batch in starcoder pybinding; no numbers stated; `score 1`
+- `64b38e1dc8` `2023-07-06` **quant** · instr · kept — benchmark tool for transformers int4 (separate 1st token and rest); no numbers stated; `score 0`
+- `16c795158d` `2023-07-06` **other** · other · kept — Pull new deep-learning base image before build; no numbers stated; `score 0`
+- `70bc8ea8ae` `2023-07-06` **other** · knob · kept — update langchain and cpp-python style API examples; no numbers stated; `score 0`
+- `14626fe05b` `2023-07-06` **other** · other · kept — refactor transformers and langchain class name; no numbers stated; `score 0`
+- `2f77d485d8` `2023-07-06` **quant** · knob · kept — Initial support of langchain transformer int4 API; no numbers stated; `score 0`
+- `bcc1eae322` `2023-07-06` **other** · docs · kept — Llm readme update; no numbers stated; `score 0`
+- `d489775d2c` `2023-07-07` **other** · fix · kept — fix inconsistency between output token number and `max_new_token`; no numbers stated; `score 1`
+- `a4ae132ef4` `2023-07-10` **other** · other · kept — Add bigdl llm sgx image; no numbers stated; `score 0`
+- `04f2f04410` `2023-07-10` **other** · other · kept — Add workflow_dispatch for llm unittest workflow; no numbers stated; `score 0`
+- `81d655cda9` `2023-07-10` **quant** · other · kept — transformer int4 save and load; no numbers stated; `score 0`
+- `98bac815e4` `2023-07-10` **other** · other · kept — specify numpy version; no numbers stated; `score 0`
+- `254a7aa3c4` `2023-07-10` **other** · other · kept — bigdl-llm: add voice-assistant example that are migrated from langchain use-case document; no numbers stated; `score 0`
+- `52c6b057d6` `2023-07-10` **other** · other · kept — Initial LLM Transformers example refactor; no numbers stated; `score 0`
+- `db39d0a6b3` `2023-07-11` **mem** · knob · kept — disable mmap by default for better performance; no numbers stated; `score 1`
+- `cd7a980ec4` `2023-07-12` **quant** · knob · kept — Transformer int4 add qtype, support q4_1 q5_0 q5_1 q8_0; no numbers stated; `score 0`
+- `dd3f953288` `2023-07-12` **other** · knob · kept — Support vnni check; no numbers stated; `score 0`
+- `23f6a4c21f` `2023-07-12` **quant** · other · kept — Optimize transformer int4 loading; no numbers stated; `score 1`
+- `fcc352eee3` `2023-07-13` **quant** · other · kept — Add more transformers_int4 examples (MPT); no numbers stated; `score 0`
+- `86b5938075` `2023-07-13` **other** · fix · kept — fix llm pybinding; no numbers stated; `score 1`
+- `ba0da17b40` `2023-07-13` **other** · knob · kept — Support AutoModelForSeq2SeqLM transformer API; no numbers stated; `score 1`
+- `bcde8ec83e` `2023-07-13` **other** · fix · kept — Small fix to MPT Example; no numbers stated; `score 0`
+- `4f152b4e3a` `2023-07-13` **other** · other · kept — Merge the llm.cpp build and the pypi release; no numbers stated; `score 0`
+- `90e3d86bce` `2023-07-13` **gemm** · other · kept — rename low bit type name; no numbers stated; `score 0`
+- `349bcb4bae` `2023-07-13` **quant** · other · kept — Add more transformers int4 example (Dolly v1); no numbers stated; `score 0`
+- `60c2c0c3dc` `2023-07-13` **other** · fix · kept — Bug fix for merged pr #8503; no numbers stated; `score 0`
+- `6320bf201e` `2023-07-13` **mem** · fix · kept — fix memory access violation; no numbers stated; `score 1`
+- `df97d39e29` `2023-07-14` **other** · other · kept — Change thread_num in Linux inference actions; no numbers stated; `score 0`
+- `903e9aee7a` `2023-07-14` **other** · fix · kept — Fix the problem of workflow cancellation after pr merge; no numbers stated; `score 0`
+- `c87853233b` `2023-07-14` **other** · other · kept — Add windows vnni binary build step; no numbers stated; `score 0`
+- `ca6e38607c` `2023-07-14` **other** · other · kept — Add more transformers examples (ChatGLM); no numbers stated; `score 0`
+- `59b7287ef5` `2023-07-14` **quant** · other · kept — Add more transformers int4 example (Baichuan); no numbers stated; `score 0`
+- `7bf3e10415` `2023-07-14` **quant** · other · kept — Add more int4 transformers examples (MOSS); no numbers stated; `score 0`
+- `b397e40015` `2023-07-14` **quant** · other · kept — Add more transformers int4 example (RedPajama); no numbers stated; `score 0`
+- `e0f0def279` `2023-07-14` **other** · other · removed — Remove unused example for now; no numbers stated; `score 0`
+- `92d33cf35a` `2023-07-14` **quant** · other · kept — Add more transformers int4 example (phoenix); no numbers stated; `score 0`
+- `f56b5ade4c` `2023-07-14` **quant** · other · kept — Add more transformers int4 example (chatglm2); no numbers stated; `score 0`
+- `e57db777e0` `2023-07-17` **other** · other · kept — Setup.py & llm-cli update for windows vnni binary files; no numbers stated; `score 0`
+- `808a64d53a` `2023-07-17` **quant** · other · kept — Add more transformers int4 example (starcoder); no numbers stated; `score 0`
+- `fccae91461` `2023-07-17` **mem** · other · kept — Add load_low_bit save_load_bit to AutoModelForCausalLM; no numbers stated; `score 0`
+- `f1fd746722` `2023-07-17` **quant** · other · kept — Add more transformers int4 example (vicuna); no numbers stated; `score 0`
+- `de772e7a80` `2023-07-17` **other** · other · kept — Update mpt for prompt tuning; no numbers stated; `score 0`
+- `1344f50f75` `2023-07-17` **quant** · other · kept — Add more transformers int4 examples (Falcon); no numbers stated; `score 0`
+- `ee70977c07` `2023-07-17` **quant** · fix · kept — Transformers int4 example small typo fixes; no numbers stated; `score 0`
+- `1ebc43b151` `2023-07-18` **other** · other · kept — Update READMEs; no numbers stated; `score 0`
+- `4582b6939d` `2023-07-18` **other** · other · kept — llm gptneox chat; no numbers stated; `score 1`
+- `3e0e370898` `2023-07-18` **other** · other · kept — Add bigdl-llm-demo dependencies to TDX image; no numbers stated; `score 0`
+- `4f287df664` `2023-07-18` **other** · other · kept — Fix manullay_build_for_testing; no numbers stated; `score 0`
+- `9a7bc17ca1` `2023-07-18` **other** · knob · kept — llm supports vnni link on windows; no numbers stated; `score 0`
+- `49d636e295` `2023-07-19` **quant** · other · kept — whisper model transformer int4 verification and example; no numbers stated; `score 1`
+- `3dbe3bf18e` `2023-07-19` **quant** · other · kept — transformer_int4; no numbers stated; `score 0`
+- `c52ed37745` `2023-07-19` **other** · fix · kept — fix starcoder dll name; no numbers stated; `score 0`
+- `b6510fa054` `2023-07-19` **other** · fix · kept — fix move/download dll step; no numbers stated; `score 0`
+- `457571b44e` `2023-07-19` **quant** · other · kept — Add more transformers int4 example (InternLM); no numbers stated; `score 0`
+
+*Commits 1101-1200 (2023-06-16..2023-07-19): scores 0/1/2/3 = 78/22/0/0; areas other 65, quant 28, mem 6, gemm 1.*
+
+- `3bd1420b71` `2023-07-19` **other** · other · kept — use MSVC to build avx-vnni binary files; no numbers stated; `score 0`
+- `616b7cb0a2` `2023-07-19` **other** · other · kept — add more langchain examples; no numbers stated; `score 0`
+- `e680af45ea` `2023-07-19` **other** · sched · kept — Optimize Langchain Pipeline; no numbers stated; `score 1`
+- `7a9fdf74df` `2023-07-19` **quant** · other · kept — Add more transformers int4 example (Dolly v2); no numbers stated; `score 0`
+- `cad78740a7` `2023-07-20` **quant** · fix · kept — Small fixes to the Whisper transformers INT4 example; no numbers stated; `score 0`
+- `411d896636` `2023-07-20` **other** · other · kept — LLM first transformers UT; no numbers stated; `score 0`
+- `2eeb653c75` `2023-07-20` **other** · fix · kept — fix llm build workflow misspell; no numbers stated; `score 0`
+- `7b8d9c1b0d` `2023-07-20` **other** · other · kept — Add dependency file check in setup.py; no numbers stated; `score 0`
+- `2266ca7d2b` `2023-07-20` **quant** · other · kept — Small updates to transformers int4 ut; no numbers stated; `score 0`
+- `6504e31a97` `2023-07-20` **other** · docs · kept — Small fix; no numbers stated; `score 0`
+- `57e880f63a` `2023-07-21` **gemm** · other · kept — use pytorch linear for large input matrix; no numbers stated; `score 1`
+- `feb3af0567` `2023-07-21` **quant** · other · kept — Optimize transformer int4 memory footprint; no numbers stated; `score 1`
+- `bbde423349` `2023-07-21` **other** · other · kept — Add current Linux UT inference tests to nightly tests; no numbers stated; `score 0`
+- `ba42a6da63` `2023-07-21` **gemm** · knob · kept — Set torch_dtype default value to 'auto' for transformers low bit from_pretrained API; no numbers stated; `score 1`
+- `0f8201c730` `2023-07-24` **other** · docs · kept — llm readme update; no numbers stated; `score 0`
+- `3f24202e4c` `2023-07-25` **quant** · other · kept — Add more transformers int4 example (Llama 2); no numbers stated; `score 0`
+- `af201052db` `2023-07-25` **other** · other · kept — avoid malloc all missing keys in fp32; no numbers stated; `score 1`
+- `9c897ac7db` `2023-07-25` **other** · other · kept — Merge redundant code in workflow; no numbers stated; `score 0`
+- `650b82fa6e` `2023-07-25` **other** · other · kept — add CausalLM and Speech UT; no numbers stated; `score 0`
+- `07d1aee825` `2023-07-25` **other** · sched · kept — add fastchat image for tdx; no numbers stated; `score 0`
+- `7d45233825` `2023-07-26` **other** · fix · kept — fix trigger enable flag; no numbers stated; `score 0`
+- `a98b3fe961` `2023-07-26` **other** · fix · kept — Fix cancel flag causing nightly builds to fail; no numbers stated; `score 0`
+- `fcf8c085e3` `2023-07-26` **quant** · other · kept — add llama2-13b native int4 example; no numbers stated; `score 0`
+- `e3418d7e61` `2023-07-26` **other** · other · removed — Remove concurrency group for binary build workflow; no numbers stated; `score 0`
+- `919791e406` `2023-07-26` **other** · other · kept — Add needs to make sure run in order; no numbers stated; `score 0`
+- `5b484ab48d` `2023-07-26` **mem** · knob · kept — Support load_low_bit loading models in shards format; no numbers stated; `score 1`
+- `fb32fefcbe` `2023-07-27` **quant** · knob · kept — support tensor input of native int4 `generate`; no numbers stated; `score 1`
+- `3dbab9087b` `2023-07-28` **quant** · other · kept — add llama2-7b native int4 example; no numbers stated; `score 0`
+- `3361b66449` `2023-07-31` **other** · revert · reverted — Revert llm-cli to disable selecting executables on Windows; no numbers stated; `score 0`
+- `a607972c0b` `2023-07-31` **other** · knob · kept — LLM windows load -api.dll; no numbers stated; `score 1`
+- `3e10260c6d` `2023-08-01` **other** · knob · kept — llm-convert support chatglm family; no numbers stated; `score 0`
+- `d6cbfc6d2c` `2023-08-01` **other** · docs · kept — Add requirements in whisper example; no numbers stated; `score 0`
+- `cdfbe652ca` `2023-08-01` **other** · knob · kept — Add chatglm support for llm-cli; no numbers stated; `score 0`
+- `39994738d1` `2023-08-01` **quant** · other · kept — add chat & stream chat example for ChatGLM2 transformers int4; no numbers stated; `score 0`
+- `cbeae97a26` `2023-08-02` **kv** · other · kept — Optimize Llama Attention to to reduce KV cache memory copy; no numbers stated; `score 1`
+- `769209b7f0` `2023-08-02` **other** · other · kept — Chatglm unittest disable due to missing instruction; no numbers stated; `score 0`
+- `6fc31bb4cf` `2023-08-02` **quant** · docs · kept — first update descriptions for ChatGLM transformers int4 example; no numbers stated; `score 0`
+- `04c713ef06` `2023-08-02` **other** · knob · kept — Disable transformer api `pretraining_tp`; no numbers stated; `score 1`
+- `15b3adc7ec` `2023-08-02` **other** · other · kept — llm linux binary make -> cmake; no numbers stated; `score 0`
+- `ca998cc6f2` `2023-08-02` **other** · other · kept — Mute shape mismatch output; no numbers stated; `score 1`
+- `119bf6d710` `2023-08-02` **other** · knob · kept — Support linux cpp dynamic load .so; no numbers stated; `score 0`
+- `0714888705` `2023-08-03` **other** · other · kept — build windows avx dll; no numbers stated; `score 0`
+- `a15a2516e6` `2023-08-03` **other** · other · kept — add; no numbers stated; `score 1`
+- `610084e3c0` `2023-08-03` **other** · other · kept — Complete windows unittest; no numbers stated; `score 0`
+- `bd177ab612` `2023-08-03` **other** · other · kept — llm binary build linux add avx & avx2; no numbers stated; `score 0`
+- `110cfb5546` `2023-08-03` **other** · other · removed — Remove old windows nightly test code; no numbers stated; `score 0`
+- `59903ea668` `2023-08-03` **other** · knob · kept — llm linux support avx & avx2; no numbers stated; `score 0`
+- `3407f87075` `2023-08-04` **kv** · fix · kept — Fix llama kv cache bug; no numbers stated; `score 1`
+- `b6468bac43` `2023-08-04` **attention** · other · kept — optimize chatglm2 long sequence; no numbers stated; `score 1`
+- `bc4cdb07c9` `2023-08-04` **other** · other · removed — Remove conda for llm workflow; no numbers stated; `score 0`
+- `5837cc424a` `2023-08-04` **other** · other · kept — add chatglm pybinding binary file release; no numbers stated; `score 0`
+- `ef08250c21` `2023-08-04` **other** · knob · kept — chatglm pybinding support; no numbers stated; `score 0`
+- `ebcf75d506` `2023-08-04` **other** · other · kept — feat: set transformers lib version.; no numbers stated; `score 0`
+- `418cb06850` `2023-08-04` **other** · docs · kept — Renew google site verification for readthedocs; no numbers stated; `score 0`
+- `06ed70fa43` `2023-08-04` **other** · docs · kept — Update google site verification for readthedocs; no numbers stated; `score 0`
+- `6da830cf7e` `2023-08-07` **other** · other · kept — add chaglm pybinding binary file in setup.py; no numbers stated; `score 0`
+- `ea5d7aff5b` `2023-08-07` **quant** · knob · kept — add chatglm native int4 transformers API; no numbers stated; `score 1`
+- `4482ccb329` `2023-08-07` **other** · other · kept — Change build system from centos7 to ubuntu18.04; no numbers stated; `score 0`
+- `710b9b8982` `2023-08-08` **other** · other · kept — add linux chatglm pybinding binary file; no numbers stated; `score 0`
+- `4c44153584` `2023-08-08` **quant** · other · kept — add Qwen transformers int4 example; no numbers stated; `score 0`
+- `1b65288bdb` `2023-08-08` **other** · knob · kept — Add api doc for LLM; no numbers stated; `score 1`
+- `d03218674a` `2023-08-09` **other** · docs · kept — Update llm readme; no numbers stated; `score 0`
+- `1a7b698a83` `2023-08-09` **quant** · knob · kept — support ipex arc int4 & add basic llama2 example; no numbers stated; `score 0`
+- `e717e304a6` `2023-08-10` **other** · other · kept — LLM first example test and template; no numbers stated; `score 0`
+- `4573ff7ffe` `2023-08-10` **other** · docs · kept — Update llm api doc; no numbers stated; `score 0`
+- `6d1ca88aac` `2023-08-10` **other** · other · kept — add voice assistant example; no numbers stated; `score 0`
+- `7c56c39e36` `2023-08-10` **other** · docs · kept — Fix GPU examples READ to use bigdl-core-xe; no numbers stated; `score 0`
+- `02ec01cb48` `2023-08-10` **other** · other · kept — Add bigdl-core-xe dependency when installing bigdl-llm[xpu]; no numbers stated; `score 0`
+- `33d9ad234f` `2023-08-10` **other** · other · kept — Linux vnni build with ubuntu 18.04; no numbers stated; `score 0`
+- `3d5a7484a2` `2023-08-11` **mem** · fix · kept — fix bloom and starcoder memory release; no numbers stated; `score 1`
+- `e292dfd970` `2023-08-11` **other** · knob · kept — LLM transformers api for langchain; no numbers stated; `score 0`
+- `ca3e59a1dc` `2023-08-11` **quant** · knob · kept — support stop for starcoder native int4 stream; no numbers stated; `score 1`
+- `77efcf7b1d` `2023-08-11` **quant** · fix · kept — fix ChatGLM2 native int4 stream output; no numbers stated; `score 1`
+- `f91035c298` `2023-08-11` **quant** · fix · kept — fix chatglm native int4 emoji output; no numbers stated; `score 1`
+- `1cb8f5abbd` `2023-08-11` **other** · revert · reverted — Revert compile OS for llm build workflow; no numbers stated; `score 0`
+- `aceea4dc29` `2023-08-11` **other** · knob · kept — Unify Transformers and Native API; no numbers stated; `score 0`
+- `e9a1afffc5` `2023-08-14` **other** · other · kept — add internlm example on arc; no numbers stated; `score 0`
+- `b10d7e1adf` `2023-08-14` **other** · other · kept — add mpt example on arc; no numbers stated; `score 0`
+- `faaccb64a2` `2023-08-14` **other** · other · kept — add chatglm2 example for Arc; no numbers stated; `score 0`
+- `77844125f2` `2023-08-14` **other** · knob · kept — Support chatglm cache; no numbers stated; `score 1`
+- `d28ad8f7db` `2023-08-14` **quant** · other · kept — add whisper example for arc transformer int4; no numbers stated; `score 0`
+- `be2ae6eb7c` `2023-08-14` **quant** · fix · kept — fix langchain native int4 voiceasistant example; no numbers stated; `score 0`
+- `0a8db3abe0` `2023-08-15` **other** · other · kept — refactor python toolkit; no numbers stated; `score 0`
+- `8c55911308` `2023-08-15` **other** · other · kept — add baichuan-13B on arc example; no numbers stated; `score 0`
+- `97283c033c` `2023-08-15` **other** · other · kept — add falcon example on arc; no numbers stated; `score 0`
+- `8805186f2f` `2023-08-16` **other** · instr · kept — add benchmark tool for gpu; no numbers stated; `score 0`
+- `c1f9af6d97` `2023-08-16` **gemm** · other · kept — chatglm example and transformers low-bit examples; no numbers stated; `score 0`
+- `f4164e4492` `2023-08-16` **other** · knob · kept — Update readme for unifying transformers API; no numbers stated; `score 1`
+- `06609d9260` `2023-08-16` **other** · other · kept — add qwen example on arc; no numbers stated; `score 0`
+- `e9aa2bd890` `2023-08-16` **other** · instr · kept — reduce GPU 1st token latency and update example; no numbers stated; `score 0`
+- `394304b918` `2023-08-17` **other** · other · kept — Re organize llm test; no numbers stated; `score 0`
+- `4afea496ab` `2023-08-17` **quant** · knob · kept — support q8_0; no numbers stated; `score 1`
+- `548f7a6cf7` `2023-08-18` **other** · knob · kept — update convert of llama family to support llama2-70B; no numbers stated; `score 1`
+- `2ba2133613` `2023-08-18` **other** · fix · kept — fix starcoder chinese output; no numbers stated; `score 1`
+- `3d1f2b44f8` `2023-08-18` **quant** · knob · kept — change default n_threads of native int4 models; no numbers stated; `score 1`
+- `611c1fb628` `2023-08-21` **quant** · knob · kept — change default n_threads of native int4 langchain API; no numbers stated; `score 1`
+- `dcadd09154` `2023-08-21` **other** · docs · kept — Update llm document; no numbers stated; `score 0`
+- `c94bdd3791` `2023-08-23` **other** · other · kept — Merge windows & linux nightly test; no numbers stated; `score 0`
+- `a73a3e5ff9` `2023-08-23` **other** · other · kept — Fix bugs in manually_build_for_testing.yml.; no numbers stated; `score 0`
+- `bf3591e2ff` `2023-08-25` **attention** · other · kept — Optimize chatglm2 for bf16; no numbers stated; `score 1`
+
+*Commits 1201-1300 (2023-07-19..2023-08-25): scores 0/1/2/3 = 72/28/0/0; areas other 70, quant 21, gemm 3, mem 2.*
+
+- `9537194b4b` `2023-08-25` **other** · other · kept — Fix llm test workflow repeatedly download model files; no numbers stated; `score 0`
+- `7c37424a63` `2023-08-25` **other** · fix · kept — Fix voice assistant example input error on Linux; no numbers stated; `score 0`
+- `5582872744` `2023-08-25` **other** · other · kept — update chatglm example to be more friendly for beginners; no numbers stated; `score 0`
+- `d2926c7672` `2023-08-25` **other** · knob · kept — Unify Langchain Native and Transformers LLM API; no numbers stated; `score 0`
+- `9d0f6a8cce` `2023-08-25` **other** · other · kept — rename math.py in example to avoid conflict; no numbers stated; `score 0`
+- `b8b1b6888b` `2023-08-25` **other** · other · kept — Performance test; no numbers stated; `score 0`
+- `0186f3ab2f` `2023-08-25` **quant** · other · kept — update all ARC int4 examples; no numbers stated; `score 0`
+- `eae92bc7da` `2023-08-25` **other** · fix · kept — quick fix path; no numbers stated; `score 0`
+- `6a902b892e` `2023-08-28` **other** · other · kept — Add amx build step; no numbers stated; `score 0`
+- `35fdf94031` `2023-08-28` **other** · other · kept — Arc starcoder example; no numbers stated; `score 0`
+- `5d90ca2dac` `2023-08-28` **other** · docs · kept — Update MPI Estimator to support Pytorch IPEX training; no numbers stated; `score 0`
+- `bb31d4fe80` `2023-08-29` **quant** · other · kept — Implement hf `low_cpu_mem_usage` with 1xbinary file peak memory on transformer int4; no numbers stated; `score 1`
+- `67052198eb` `2023-08-29` **other** · other · kept — Build with multiprocess; no numbers stated; `score 0`
+- `ddff7a6f05` `2023-08-29` **other** · docs · kept — Update readme of GPU to specify oneapi version; no numbers stated; `score 0`
+- `7429ea0606` `2023-08-29` **quant** · knob · kept — support transformer int4 + amx int4; no numbers stated; `score 1`
+- `a386ad984e` `2023-08-30` **other** · docs · kept — Add Data Center GPU Flex Series to Readme; no numbers stated; `score 0`
+- `aab7deab1f` `2023-08-30` **other** · other · kept — Reorganize GPU examples; no numbers stated; `score 0`
+- `f42c0bad1b` `2023-08-30` **other** · docs · kept — update GPU doc; no numbers stated; `score 0`
+- `3462fd5c96` `2023-08-30` **other** · other · kept — Add arc gpt-j example; no numbers stated; `score 0`
+- `887018b0f2` `2023-08-30` **other** · other · kept — Update ut save&load; no numbers stated; `score 0`
+- `55e705a84c` `2023-08-30` **other** · knob · kept — Support the rest of AutoXXX classes in Transformers API; no numbers stated; `score 1`
+- `954ef954b6` `2023-08-30` **other** · other · kept — Add occlum llm image munually build; no numbers stated; `score 0`
+- `bba73ec9d2` `2023-08-30` **quant** · other · kept — change chatglm native int4 checkpoint name; no numbers stated; `score 1`
+- `731916c639` `2023-08-30` **other** · knob · kept — Enable attempting loading method automatically; no numbers stated; `score 1`
+- `8eca982301` `2023-08-30` **other** · knob · kept — windows add env; no numbers stated; `score 1`
+- `7b566bf686` `2023-08-30` **other** · knob · kept — add new API for optimize any pytorch models; no numbers stated; `score 0`
+- `3b4f4e1c3d` `2023-08-31` **attention** · fix · kept — Fix llama attention optimization for XPU; no numbers stated; `score 1`
+- `de6c6bb17f` `2023-08-31` **other** · other · removed — Downgrade amx build gcc version and remove avx flag display; no numbers stated; `score 0`
+- `b1ac8dc1bc` `2023-08-31` **other** · other · kept — BF16 Lora Finetuning on K8S with OneCCL and Intel MPI; no numbers stated; `score 0`
+- `a232c5aa21` `2023-08-31` **other** · other · kept — add protobuf in bigdl-llm dependency; no numbers stated; `score 0`
+- `9c652fbe95` `2023-08-31` **other** · other · kept — Whisper long segment recognize example; no numbers stated; `score 0`
+- `c06f1ca93e` `2023-09-01` **other** · instr · kept — auto perf test to output to csv; no numbers stated; `score 0`
+- `242c9d6036` `2023-09-01` **sync** · fix · kept — Fix chatglm2 multi-turn streamchat; no numbers stated; `score 1`
+- `7b3ac66e17` `2023-09-01` **other** · instr · kept — auto performance test fix specific settings to template; no numbers stated; `score 0`
+- `9760eec6de` `2023-09-03` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `5e58f698cd` `2023-09-04` **other** · docs · kept — Update readthedocs; no numbers stated; `score 0`
+- `74a2c2ddf5` `2023-09-05` **other** · other · kept — Update optimize_model=True in llama2 chatglm2 arc examples; no numbers stated; `score 0`
+- `95271f10e0` `2023-09-05` **gemm** · other · kept — Rename low bit layer; no numbers stated; `score 1`
+- `704a896e90` `2023-09-05` **other** · other · kept — Add perf test on xpu for bigdl-llm; no numbers stated; `score 0`
+- `14b95ebfb4` `2023-09-05` **other** · docs · kept — Update Databricks documentation for Pytorch Estimator issue; no numbers stated; `score 0`
+- `4a9ff050a1` `2023-09-06` **quant** · other · kept — Add qlora nf4; no numbers stated; `score 1`
+- `2d97827ec5` `2023-09-06` **other** · fix · kept — fix typo in lora entrypoint; no numbers stated; `score 0`
+- `49a39452c6` `2023-09-06` **other** · instr · kept — update benchmark; no numbers stated; `score 0`
+- `cf6a620bae` `2023-09-06` **other** · other · kept — BigDL-LLM Documentation Initial Version; no numbers stated; `score 0`
+- `7a71ced78f` `2023-09-06` **other** · knob · kept — Remain API Docs Issues Solution; no numbers stated; `score 1`
+- `db26c7b84d` `2023-09-06` **other** · docs · kept — Update readme gif & image url to the ones hosted on readthedocs; no numbers stated; `score 0`
+- `bfc71fbc15` `2023-09-07` **other** · docs · kept — Add known issue in arc voice assistant example; no numbers stated; `score 0`
+- `5d9942a3ca` `2023-09-07` **quant** · instr · kept — transformer int4 and native int4's benchmark script for 32 256 1k 2k input; no numbers stated; `score 0`
+- `8bc1d8a17c` `2023-09-07` **other** · fix · kept — Fix discards in `optimize_model` with non-hf models  and add openai whisper example; no numbers stated; `score 0`
+- `c34400e6b0` `2023-09-07` **gemm** · other · kept — Use new layout for xpu qlinear; no numbers stated; `score 1`
+- `3d1c7e7082` `2023-09-07` **other** · docs · kept — Small link fix; no numbers stated; `score 0`
+- `057e77e229` `2023-09-07` **other** · instr · kept — update benchmark_utils.py to handle do_sample=True; no numbers stated; `score 0`
+- `c152c719ea` `2023-09-07` **other** · docs · kept — Update bigdl logo url to the one hosted on readthedocs; no numbers stated; `score 0`
+- `c0797ea232` `2023-09-07` **other** · other · kept — update setup to specify bigdl-core-xe version; no numbers stated; `score 0`
+- `e9de9d9950` `2023-09-07` **quant** · instr · kept — benchmark for native int4; no numbers stated; `score 0`
+- `d8a01d7c4f` `2023-09-07` **other** · fix · kept — fix chatglm in run.pu; no numbers stated; `score 0`
+- `7897eb4b51` `2023-09-07` **other** · instr · kept — add benchmark scripts on GPU; no numbers stated; `score 0`
+- `3d2efe9608` `2023-09-07` **other** · instr · kept — update llm latency benchmark.; no numbers stated; `score 0`
+- `b209b8f7b6` `2023-09-07` **quant** · fix · kept — Fix arc qtype != q4_0 generate issue; no numbers stated; `score 1`
+- `25428b22b4` `2023-09-08` **kv** · fix · kept — Fix chatglm2 attention and kv cache; no numbers stated; `score 1`
+- `ee98cdd85c` `2023-09-08` **attention** · knob · kept — Support latest transformer version; no numbers stated; `score 1`
+- `ea6d4148e9` `2023-09-08` **other** · other · kept — Add attestation for LLM Finetuning; no numbers stated; `score 0`
+- `ea0853c0b5` `2023-09-08` **other** · docs · kept — update benchmark_utils readme; no numbers stated; `score 0`
+- `ca35c93825` `2023-09-08` **other** · other · kept — Fix langchain UT; no numbers stated; `score 0`
+- `33d75adadf` `2023-09-08` **other** · knob · kept — Support q5_0 on arc; no numbers stated; `score 1`
+- `b3f5dd5b5d` `2023-09-08` **other** · other · kept — update q8 convert xpu&cpu; no numbers stated; `score 1`
+- `4dce238867` `2023-09-08` **other** · docs · kept — Fix incorrect usage in docs of Finetuning to enable TDX; no numbers stated; `score 0`
+- `df165ad165` `2023-09-11` **other** · other · kept — init; no numbers stated; `score 1`
+- `e62eda74b8` `2023-09-11` **other** · other · kept — refine; no numbers stated; `score 1`
+- `16761c58be` `2023-09-12` **attention** · other · kept — Make llama attention stateless; no numbers stated; `score 1`
+- `f00c442d40` `2023-09-12` **other** · fix · kept — fix accelerate; no numbers stated; `score 0`
+- `2d81521019` `2023-09-12` **other** · other · kept — add `optimize_model` examples for llama2 and chatglm; no numbers stated; `score 0`
+- `dcaa4dc130` `2023-09-12` **kv** · knob · kept — Support GQA on llama kvcache; no numbers stated; `score 1`
+- `448a9e813a` `2023-09-12` **other** · docs · kept — Update Readme; no numbers stated; `score 0`
+- `cb534ed5c4` `2023-09-13` **other** · docs · kept — Add Arc demo gif to readme and readthedocs; no numbers stated; `score 0`
+- `0bf5857908` `2023-09-13` **other** · sched · kept — Integrate FastChat as a serving framework for BigDL-LLM; no numbers stated; `score 0`
+- `4de73f592e` `2023-09-13` **other** · other · kept — add gpu example of chinese-llama-2-7b; no numbers stated; `score 0`
+- `c32c260ce2` `2023-09-13` **other** · knob · kept — Add save/load API in optimize_model to support general pytorch model; no numbers stated; `score 1`
+- `7132ef6081` `2023-09-13` **other** · knob · kept — Add optimize_model doc in transformers api; no numbers stated; `score 1`
+- `cca84b0a64` `2023-09-13` **other** · instr · kept — update llm benchmark scripts.; no numbers stated; `score 0`
+- `be29c75c18` `2023-09-13` **other** · other · kept — refactor gpu examples; no numbers stated; `score 0`
+- `dd57623650` `2023-09-13` **mem** · other · kept — reduce GPU memory for `optimize_model=True`; no numbers stated; `score 1`
+- `7563b26ca9` `2023-09-14` **other** · sched · kept — Occlum fastchat build Use nocache and update order; no numbers stated; `score 0`
+- `bcf456070c` `2023-09-14` **mem** · fix · kept — fix bloom-176b int overflow; no numbers stated; `score 1`
+- `d1b62ef2f2` `2023-09-14` **other** · sched · removed — Remove serving-dep from all_requires; no numbers stated; `score 0`
+- `c12b8f24b6` `2023-09-15` **other** · other · kept — add use_cache=True for all gpu examples; no numbers stated; `score 0`
+- `16b9412e80` `2023-09-15` **other** · other · kept — tie_word_embeddings; no numbers stated; `score 1`
+- `aeef73a182` `2023-09-15` **other** · docs · kept — Tell User How to Find Fine-tuned Model in README; no numbers stated; `score 0`
+- `64ee1d7689` `2023-09-15` **quant** · other · kept — update run_transformer_int4_gpu; no numbers stated; `score 0`
+- `32716106e0` `2023-09-18` **other** · other · kept — update use_cahce=True; no numbers stated; `score 0`
+- `52878d3e5f` `2023-09-18` **other** · sched · kept — Enable TLS in Attestation API Serving for LLM finetuning; no numbers stated; `score 0`
+- `0a552d5bdc` `2023-09-18` **other** · fix · kept — fix installation on windows; no numbers stated; `score 0`
+- `7353882732` `2023-09-18` **other** · other · kept — add Dockerfile; no numbers stated; `score 0`
+- `cabe7c0358` `2023-09-18` **other** · other · kept — add baichuan2 example for arc; no numbers stated; `score 0`
+- `74338fd291` `2023-09-18` **other** · instr · kept — add auto torch dtype in benchmark.; no numbers stated; `score 0`
+- `c1d25a51a8` `2023-09-18` **other** · other · kept — add `optimize_model` example for bert; no numbers stated; `score 0`
+- `8299b68fea` `2023-09-18` **other** · docs · kept — update readme.; no numbers stated; `score 0`
+- `2a05581da7` `2023-09-18` **other** · knob · kept — Apply `low_cpu_mem_usage` algorithm on `optimize_model` API; no numbers stated; `score 1`
+- `37bb0cbf8f` `2023-09-19` **other** · instr · kept — Speed up gpt-j in gpubenchmark; no numbers stated; `score 0`
+- `004c45c2be` `2023-09-19` **attention** · knob · kept — Support optimized kv_cache for baichuan family; no numbers stated; `score 1`
+
+*Commits 1301-1400 (2023-08-25..2023-09-19): scores 0/1/2/3 = 72/28/0/0; areas other 80, quant 9, attention 4, gemm 2.*
+
+- `b6c9198d47` `2023-09-19` **other** · other · kept — Add xpu image for bigdl-llm; no numbers stated; `score 0`
+- `c389e1323d` `2023-09-19` **other** · instr · kept — fix xpu performance tests by making sure that latest bigdl-core-xe is installed; no numbers stated; `score 0`
+- `249386261c` `2023-09-19` **other** · other · kept — add Baichuan2 cpu example; no numbers stated; `score 0`
+- `51518e029d` `2023-09-19` **other** · docs · kept — Update llm readme; no numbers stated; `score 0`
+- `c88f6ec457` `2023-09-20` **other** · other · kept — Experiment XPU QLora Finetuning; no numbers stated; `score 0`
+- `94a7f8917b` `2023-09-20` **kv** · fix · kept — fix optimized kv cache for baichuan-13b; no numbers stated; `score 1`
+- `735a17f7b4` `2023-09-20` **kv** · other · kept — add kv cache to falcon family.; no numbers stated; `score 1`
+- `48b503c630` `2023-09-20` **other** · other · kept — add example of aquila; no numbers stated; `score 0`
+- `6981745fe4` `2023-09-20` **attention** · other · kept — Optimize kv_cache for gpt-neox model family; no numbers stated; `score 0`
+- `156af15d1e` `2023-09-20` **quant** · other · kept — Add NF3; no numbers stated; `score 1`
+- `b3cad7de57` `2023-09-20` **kv** · knob · kept — add bloom kv cache support; no numbers stated; `score 1`
+- `3913ba4577` `2023-09-21` **other** · docs · kept — add README.md; no numbers stated; `score 0`
+- `fa47967583` `2023-09-21` **attention** · other · kept — Optimize kv_cache for gptj model family; no numbers stated; `score 1`
+- `edb225530b` `2023-09-21` **other** · other · kept — add bark; no numbers stated; `score 0`
+- `ca0e86062e` `2023-09-21` **other** · other · kept — modify Dockerfile; no numbers stated; `score 0`
+- `8ca46d004f` `2023-09-21` **other** · docs · kept — add README.md; no numbers stated; `score 0`
+- `714884414e` `2023-09-21` **other** · fix · kept — fix error; no numbers stated; `score 1`
+- `f985068491` `2023-09-21` **other** · docs · kept — add README.md; no numbers stated; `score 0`
+- `bf51ec40b2` `2023-09-21` **mem** · fix · kept — Fix empty cache; no numbers stated; `score 0`
+- `868511cf02` `2023-09-21` **kv** · fix · kept — fix kv cache issue of bloom and falcon.; no numbers stated; `score 1`
+- `b943d73844` `2023-09-21` **kv** · other · kept — refactor kv cache; no numbers stated; `score 0`
+- `9126abdf9b` `2023-09-22` **other** · other · kept — add README.md for bigdl-llm-cpu image; no numbers stated; `score 0`
+- `028a6d9383` `2023-09-21` **attention** · other · kept — MPT model optimize for long sequence; no numbers stated; `score 1`
+- `023555fb1f` `2023-09-22` **other** · other · kept — Add one-click installer for Windows; no numbers stated; `score 0`
+- `26213a5829` `2023-09-22` **other** · instr · kept — Change benchmark bf16 load format.; no numbers stated; `score 0`
+- `4b843d1dbf` `2023-09-25` **other** · other · kept — change lora-model output behavior on k8s; no numbers stated; `score 0`
+- `975da86e00` `2023-09-25` **kv** · fix · kept — fix gptneox kv cache; no numbers stated; `score 1`
+- `e8f436453d` `2023-09-25` **sync** · other · kept — Merge remote-tracking branch 'upstream/main'; no numbers stated; `score 0`
+- `fc8bf6b0d5` `2023-09-25` **other** · other · kept — Modify Dockerfile; no numbers stated; `score 0`
+- `b4a1266ef0` `2023-09-25` **kv** · knob · kept — LLM: add kv cache support for internlm.; no numbers stated; `score 1`
+- `ceed895c31` `2023-09-25` **other** · other · kept — Add bigdl inference cpu image build; no numbers stated; `score 0`
+- `9cae4600da` `2023-09-25` **other** · other · kept — Add bigdl llm cpu image build; no numbers stated; `score 0`
+- `7f2d2a5238` `2023-09-25` **other** · other · kept — Add bigdl llm cpu image build; no numbers stated; `score 0`
+- `847af63e8e` `2023-09-25` **other** · other · kept — Add bigdl llm cpu image build; no numbers stated; `score 0`
+- `cc84ed70b3` `2023-09-25` **other** · sched · kept — Create serving images; no numbers stated; `score 0`
+- `a717352c59` `2023-09-26` **other** · docs · kept — Replace Llama 7b to Llama2-7b in README.md; no numbers stated; `score 0`
+- `a50c11d326` `2023-09-26` **other** · other · kept — Modify Dockerfile; no numbers stated; `score 0`
+- `9ac950fa52` `2023-09-26` **other** · other · kept — Add bigdl llm cpu image build; no numbers stated; `score 0`
+- `47996c29e4` `2023-09-26` **sync** · other · kept — Merge remote-tracking branch 'upstream/main'; no numbers stated; `score 0`
+- `7a69bee8d0` `2023-09-26` **other** · other · kept — Modify Dockerfile; no numbers stated; `score 0`
+- `390c90551e` `2023-09-26` **other** · other · kept — Add bigdl inference cpu image build; no numbers stated; `score 0`
+- `781bc5bc8d` `2023-09-26` **other** · other · kept — Add bigdl inference cpu image build; no numbers stated; `score 0`
+- `d0ac0941a2` `2023-09-26` **other** · other · kept — Add bigdl llm xpu image build; no numbers stated; `score 0`
+- `ecee02b34d` `2023-09-26` **other** · other · kept — Add bigdl llm xpu image build; no numbers stated; `score 0`
+- `2dc76dc358` `2023-09-26` **other** · other · kept — manually build; no numbers stated; `score 0`
+- `9e03c5c7fc` `2023-09-26` **other** · other · kept — manually build; no numbers stated; `score 0`
+- `ad62c58b33` `2023-09-26` **other** · instr · kept — Enable jemalloc in benchmark scripts.; no numbers stated; `score 0`
+- `b17e536a1b` `2023-09-26` **other** · other · kept — recover file; no numbers stated; `score 0`
+- `fdc0e838df` `2023-09-26` **sync** · other · kept — Merge remote-tracking branch 'upstream/main'; no numbers stated; `score 0`
+- `efc2158215` `2023-09-26` **other** · other · kept — manually build; no numbers stated; `score 0`
+- `9935772f24` `2023-09-26` **other** · other · kept — recover file; no numbers stated; `score 0`
+- `ddcd9e7d0a` `2023-09-27` **other** · other · kept — modify indentation; no numbers stated; `score 0`
+- `c91b2bd574` `2023-09-27` **other** · fix · kept — fix:modify indentation; no numbers stated; `score 0`
+- `760183bac6` `2023-09-27` **other** · other · kept — update key feature and installation page of document; no numbers stated; `score 0`
+- `6de2189e90` `2023-09-28` **other** · fix · kept — fix chatglm main choice; no numbers stated; `score 1`
+- `fb883100e7` `2023-09-28` **attention** · instr · kept — support chatglm-18b convert attention forward in benchmark scripts.; no numbers stated; `score 1`
+- `0cd8f1c79c` `2023-10-05` **attention** · fusion · kept — Use ipex fused rms norm for llama; no numbers stated; `score 2`
+- `88565c76f6` `2023-10-05` **other** · other · kept — add export merged model example; no numbers stated; `score 0`
+- `7506100bd5` `2023-10-05` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `d5ca1f32b6` `2023-10-05` **kv** · other · kept — Aquila KV cache optimization; no numbers stated; `score 1`
+- `aefa5a5bfe` `2023-10-05` **kv** · other · kept — Qwen kv cache; no numbers stated; `score 1`
+- `50044640c0` `2023-10-06` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `fcb1c618a0` `2023-10-07` **attention** · fusion · kept — using bigdl-llm fused rope for llama; no numbers stated; `score 2`
+- `36dd4afd61` `2023-10-07` **attention** · fix · kept — Fix llama when rope scaling is not None; no numbers stated; `score 1`
+- `b773d67dd4` `2023-10-07` **other** · sched · kept — Add Kubernetes support for BigDL-LLM-serving CPU.; no numbers stated; `score 0`
+- `4aee952b10` `2023-10-07` **sync** · other · kept — Merge remote-tracking branch 'upstream/main'; no numbers stated; `score 0`
+- `0b40ef8261` `2023-10-07` **other** · other · kept — separate trusted and native llm cpu finetune from lora; no numbers stated; `score 0`
+- `78ea7ddb1c` `2023-10-07` **attention** · other · kept — Combine apply_rotary_pos_emb for gpt-neox; no numbers stated; `score 0`
+- `b3e94a32d4` `2023-10-08` **attention** · other · kept — change log4error import; no numbers stated; `score 1`
+- `aad68100ae` `2023-10-08` **other** · sched · kept — Add trusted-bigdl-llm-serving-tdx image.; no numbers stated; `score 0`
+- `2756f9c20d` `2023-10-08` **other** · other · kept — XPU QLoRA Container; no numbers stated; `score 0`
+- `df8df751c4` `2023-10-09` **other** · docs · kept — Modify readme for bigdl-llm-serving-cpu; no numbers stated; `score 0`
+- `65373d2a8b` `2023-10-09` **other** · other · kept — adjust portable zip content; no numbers stated; `score 0`
+- `a42c25436e` `2023-10-09` **sync** · other · kept — Merge remote-tracking branch 'upstream/main'; no numbers stated; `score 0`
+- `f64257a093` `2023-10-09` **other** · kernel · kept — basic api support for esimd fp16; no numbers stated; `score 2`
+- `548e4dd5fe` `2023-10-09` **other** · other · kept — Adapt transformers models for `optimize model` SL; no numbers stated; `score 0`
+- `3814abf95a` `2023-10-09` **other** · other · kept — add instruction for chat.py; no numbers stated; `score 0`
+- `a1aefdb8f4` `2023-10-09` **other** · docs · kept — modify README; no numbers stated; `score 0`
+- `4c4f8d1663` `2023-10-09` **other** · fix · kept — Fix Arc falcon abnormal output issue; no numbers stated; `score 1`
+- `5e9962b60e` `2023-10-09` **other** · other · kept — update example layout; no numbers stated; `score 0`
+- `2c0c9fecd0` `2023-10-09` **other** · other · kept — refine LLM containers; no numbers stated; `score 0`
+- `edccfb2ed3` `2023-10-09` **other** · other · kept — Check model device type; no numbers stated; `score 1`
+- `65212451cc` `2023-10-09` **other** · other · kept — Small update to performance tests; no numbers stated; `score 0`
+- `e4d1457a70` `2023-10-10` **other** · knob · kept — improve transformers style API doc; no numbers stated; `score 1`
+- `bb3bb46400` `2023-10-10` **other** · sched · kept — add llm-serving-xpu on github action; no numbers stated; `score 0`
+- `0dbb3a283e` `2023-10-10` **other** · other · kept — amend manually_build; no numbers stated; `score 0`
+- `6264381f2e` `2023-10-10` **other** · other · kept — Merge pull request #9117 from Zhengjin-Wang/manually_build; no numbers stated; `score 0`
+- `ad7d9231f5` `2023-10-10` **other** · instr · kept — add benchmark script for Max gpu and ipex fp16 gpu; no numbers stated; `score 0`
+- `0e09dd926b` `2023-10-10` **other** · other · kept — Fix example test; no numbers stated; `score 0`
+- `1709beba5b` `2023-10-10` **other** · other · kept — Explicitly close pickle file pointer before removing temporary directory; no numbers stated; `score 1`
+- `388f688ef3` `2023-10-10` **other** · other · kept — update setup.py to add `bigdl-core-xe` package; no numbers stated; `score 0`
+- `1e78b0ac40` `2023-10-10` **other** · other · kept — Optimize LoRA Docker by Shrinking Image Size; no numbers stated; `score 0`
+- `30e3c196f3` `2023-10-10` **other** · other · kept — Merge pull request #9108 from Zhengjin-Wang/main; no numbers stated; `score 0`
+- `dc70fc7b00` `2023-10-10` **other** · kernel · kept — Update performance tests for dependency of bigdl-core-xe-esimd; no numbers stated; `score 0`
+- `e8c5645067` `2023-10-10` **other** · other · kept — add LLM example of aquila on GPU; no numbers stated; `score 0`
+- `1363e666fc` `2023-10-11` **other** · instr · kept — update benchmark_util.py for beam search; no numbers stated; `score 0`
+- `2ad67a18b1` `2023-10-11` **other** · other · kept — add mistral examples; no numbers stated; `score 0`
+- `1c8d5da362` `2023-10-11` **other** · instr · kept — fix llama tokenizer for all-in-one benchmark; no numbers stated; `score 0`
+- `995b0f119f` `2023-10-11` **other** · other · kept — update some gpu examples; no numbers stated; `score 0`
+- `4a0a3c376a` `2023-10-11` **other** · other · kept — Add stand-alone mode on cpu for finetuning; no numbers stated; `score 0`
+
+*Commits 1401-1500 (2023-09-19..2023-10-11): scores 0/1/2/3 = 77/20/3/0; areas other 75, kv 9, attention 9, sync 5.*
+
+- `eb3fb18eb4` `2023-10-11` **other** · knob · kept — improve PyTorch API doc; no numbers stated; `score 1`
+- `65dd73b62e` `2023-10-11` **other** · other · kept — Update manually_build.yml; no numbers stated; `score 0`
+- `e02fbb40cc` `2023-10-11` **other** · other · kept — add bigdl-llm-tutorial into llm-inference-cpu image; no numbers stated; `score 0`
+- `62ac7ae444` `2023-10-11` **other** · instr · kept — fix inaccurate input / output tokens of current all-in-one benchmark; no numbers stated; `score 0`
+- `4f34557224` `2023-10-12` **other** · instr · kept — support num_beams in all-in-one benchmark; no numbers stated; `score 0`
+- `d74834ff4c` `2023-10-12` **other** · other · kept — add gpu pytorch-models example llama2 and chatglm2; no numbers stated; `score 0`
+- `1a1ddc4144` `2023-10-12` **other** · other · kept — Add Replit CPU and GPU example; no numbers stated; `score 0`
+- `69942d3826` `2023-10-12` **attention** · fix · kept — fix model check before attention optimization; no numbers stated; `score 1`
+- `b8aee7bb1b` `2023-10-12` **attention** · fix · kept — Fix Qwen kv_cache optimization; no numbers stated; `score 1`
+- `f754ab3e60` `2023-10-13` **other** · other · kept — add baichuan and baichuan2 to gpu pytorch model example; no numbers stated; `score 0`
+- `e7aa67e141` `2023-10-13` **attention** · other · kept — Add rope  optimization for internlm; no numbers stated; `score 1`
+- `433f408081` `2023-10-13` **attention** · fusion · kept — Add fuse rope and norm optimization for Aquila.; no numbers stated; `score 2`
+- `259cbb4126` `2023-10-13` **other** · other · kept — add initial bigdl-llm-init; no numbers stated; `score 0`
+- `797b156a0d` `2023-10-13` **other** · other · kept — add dolly-v1 and dolly-v2 to gpu pytorch model example; no numbers stated; `score 0`
+- `db7f938fdc` `2023-10-13` **other** · other · kept — add replit and starcoder to gpu pytorch model example; no numbers stated; `score 0`
+- `51a133de56` `2023-10-13` **attention** · fusion · kept — add fuse rope and norm optimization for Baichuan.; no numbers stated; `score 2`
+- `7a2de00b48` `2023-10-15` **other** · fix · kept — Fixes for xpu Bf16 training; no numbers stated; `score 0`
+- `326ef7f491` `2023-10-16` **other** · docs · kept — add README for llm-inference-cpu; no numbers stated; `score 0`
+- `a164c24746` `2023-10-16` **attention** · other · kept — add kv_cache optimization for chatglm2-6b-32k; no numbers stated; `score 1`
+- `b192a8032c` `2023-10-16` **other** · docs · kept — Update llm-readme; no numbers stated; `score 0`
+- `49e1381c7f` `2023-10-15` **attention** · other · kept — update rope; no numbers stated; `score 1`
+- `5ca8a851e9` `2023-10-16` **attention** · fusion · kept — add fuse optimization for Mistral.; no numbers stated; `score 2`
+- `af3b575c7e` `2023-10-17` **other** · other · kept — expose modules_to_not_convert in optimize_model; no numbers stated; `score 1`
+- `77afb8796b` `2023-10-17` **other** · fix · kept — fix convert of chatglm; no numbers stated; `score 1`
+- `7160afd4d1` `2023-10-17` **gemm** · knob · kept — Support XPU DDP training and autocast for LowBitMatmul; no numbers stated; `score 1`
+- `1cd9ab15b8` `2023-10-17` **other** · fix · kept — fix ChatGLMConfig check; no numbers stated; `score 1`
+- `c0497ab41b` `2023-10-17` **attention** · knob · kept — support kv_cache optimization for Qwen-VL-Chat; no numbers stated; `score 1`
+- `d946bd7c55` `2023-10-17` **other** · other · kept — add CPU More-Data-Types and Save-Load examples; no numbers stated; `score 0`
+- `66c2e45634` `2023-10-17` **other** · other · kept — Add unit tests for optimized model correctness; no numbers stated; `score 0`
+- `330e67e2c0` `2023-10-17` **other** · docs · kept — update example doc page; no numbers stated; `score 0`
+- `d7ce78edf0` `2023-10-17` **other** · docs · kept — fix portable zip README image link; no numbers stated; `score 0`
+- `efcda3892f` `2023-10-17` **other** · docs · kept — add save & load usage in PyTorch API key feature page; no numbers stated; `score 0`
+- `09815f7064` `2023-10-17` **attention** · fix · kept — fix RMSNorm optimization of Baichuan2-13B/Baichuan-13B; no numbers stated; `score 1`
+- `b9194c5786` `2023-10-18` **other** · knob · kept — skip some model tests using certain api; no numbers stated; `score 0`
+- `2f14f53b1c` `2023-10-18` **other** · other · kept — changed '/ppml' into '/bigdl' and modified llama-7b; no numbers stated; `score 0`
+- `a3b664ed03` `2023-10-18` **other** · other · kept — add GPU More-Data-Types and Save/Load example; no numbers stated; `score 0`
+- `6dad8d16df` `2023-10-18` **other** · other · kept — optimize NormHead for Baichuan2; no numbers stated; `score 1`
+- `3555ebc148` `2023-10-18` **attention** · fix · kept — fix wrong length in gptj kv_cache optimization; no numbers stated; `score 1`
+- `0765f94770` `2023-10-18` **attention** · other · kept — Optimize kv_cache for mistral model family; no numbers stated; `score 1`
+- `942d6418e7` `2023-10-18` **kv** · fix · kept — fix chatglm kv cache; no numbers stated; `score 1`
+- `b0ddde0410` `2023-10-19` **other** · fix · kept — Fix removing convert dtype bug; no numbers stated; `score 1`
+- `160c543a26` `2023-10-19` **other** · docs · kept — README for BigDL-LLM on docker; no numbers stated; `score 0`
+- `0d62bd4adb` `2023-10-19` **other** · other · kept — Added Docker installation guide and modified link in Dockerfile; no numbers stated; `score 0`
+- `f87f67ee1c` `2023-10-19` **other** · other · kept — arc perf test for some popular models; no numbers stated; `score 0`
+- `5850241423` `2023-10-19` **other** · knob · kept — correct Readme GPU example and API docstring; no numbers stated; `score 1`
+- `9dc76f19c0` `2023-10-19` **other** · fix · kept — fix hadolint error; no numbers stated; `score 0`
+- `7e96d3e79a` `2023-10-19` **other** · knob · kept — improve gpu supports key feature doc page; no numbers stated; `score 0`
+- `118249b011` `2023-10-20` **attention** · knob · kept — support transformers 4.34+ for llama; no numbers stated; `score 1`
+- `26850ebd36` `2023-10-20` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `0383306688` `2023-10-20` **quant** · knob · kept — Add arc fp8 support; no numbers stated; `score 1`
+- `c14a61681b` `2023-10-23` **gemm** · sched · kept — Add load low-bit in model-serving for reduce EPC; no numbers stated; `score 1`
+- `2ead3f7d54` `2023-10-23` **other** · other · kept — add manually build; no numbers stated; `score 0`
+- `6cb884d82d` `2023-10-23` **other** · other · kept — Fix missing manually_build_for_testing entry; no numbers stated; `score 0`
+- `7f66bc5c14` `2023-10-23` **other** · sched · kept — Fix bigdl-llm-serving-cpu Dockerfile; no numbers stated; `score 0`
+- `0c5055d38c` `2023-10-24` **other** · fusion · kept — add position_ids and fuse embedding for falcon; no numbers stated; `score 0`
+- `db37edae8a` `2023-10-24` **other** · knob · kept — update langchain api document page; no numbers stated; `score 1`
+- `9faa2f1eef` `2023-10-24` **other** · sched · kept — Fix bigdl-llm-serving-tdx image; no numbers stated; `score 0`
+- `f37547249d` `2023-10-24` **other** · other · kept — Refine README/CICD; no numbers stated; `score 0`
+- `b15656229e` `2023-10-24` **other** · instr · kept — fix benchmark issue; no numbers stated; `score 0`
+- `bfc1e2d733` `2023-10-24` **other** · fusion · kept — add fused rms optimization for chatglm model; no numbers stated; `score 2`
+- `ed76205e0b` `2023-10-24` **other** · docs · kept — hosted k8s.png on readthedocs; no numbers stated; `score 0`
+- `ca2965fb9f` `2023-10-24` **other** · docs · kept — hosted k8s.png on readthedocs; no numbers stated; `score 0`
+- `4a19f50d16` `2023-10-24` **other** · other · kept — phi-1_5 CPU and GPU examples; no numbers stated; `score 0`
+- `5a2ce421af` `2023-10-24` **other** · other · kept — add cpu and gpu examples of flan-t5; * add examples of flan-t5 using optimize_mdoel api; `score 0`
+- `bd5215d75b` `2023-10-24` **attention** · fusion · kept — Reimplement chatglm fuse rms optimization; no numbers stated; `score 2`
+- `90162264a3` `2023-10-24` **other** · other · kept — replace torch.float32 with auto type; no numbers stated; `score 1`
+- `ec9195da42` `2023-10-24` **other** · other · kept — using html to visualize the perf result for Arc; no numbers stated; `score 0`
+- `770ac70b00` `2023-10-25` **other** · instr · kept — add `low_bit` option in benchmark scripts; no numbers stated; `score 0`
+- `f597a9d4f5` `2023-10-25` **other** · other · kept — update perf test configuration; no numbers stated; `score 0`
+- `a6a8afc47e` `2023-10-25` **other** · other · kept — Add qwen vl CPU example; no numbers stated; `score 0`
+- `067c7e8098` `2023-10-25` **attention** · sched · kept — Support deepspeed AutoTP; no numbers stated; `score 0`
+- `160a1e5ee7` `2023-10-25` **other** · other · kept — Add UT for Mistral Optimized Model; no numbers stated; `score 0`
+- `ab40607b87` `2023-10-25` **other** · other · kept — Enable unit test workflow on Arc; no numbers stated; `score 0`
+- `e2264e8845` `2023-10-25` **quant** · knob · kept — Support arc fp4; no numbers stated; `score 1`
+- `4ed7f066d3` `2023-10-26` **other** · other · kept — add bigdl-llm-finetune-xpu to manually_build; no numbers stated; `score 0`
+- `f2d1f5349c` `2023-10-26` **other** · other · kept — Merge branch 'main' of https://github.com/Jasonzzt/BigDL; no numbers stated; `score 0`
+- `37b1708d16` `2023-10-26` **other** · other · kept — Add bigdl-llm-finetune-cpu to manually_build; no numbers stated; `score 0`
+- `14a23015f8` `2023-10-26` **other** · other · kept — Update manually_build.yml; no numbers stated; `score 0`
+- `916ccc0779` `2023-10-26` **other** · other · kept — Update manually_build_for_testing.yml; no numbers stated; `score 0`
+- `f879c48f98` `2023-10-26` **quant** · other · kept — fp8 convert use ggml code; no numbers stated; `score 1`
+- `6b2a32eba2` `2023-10-26` **attention** · other · kept — add missing function for PyTorch InternLM model; no numbers stated; `score 1`
+- `44b5fcc190` `2023-10-26` **other** · fix · kept — fix pretraining_tp argument issue.; no numbers stated; `score 1`
+- `733df28a2b` `2023-10-26` **other** · other · kept — Migrate Arc UT to another runner; no numbers stated; `score 0`
+- `6c9ae420a5` `2023-10-27` **other** · other · kept — Add regression test for optimize_model on gpu; no numbers stated; `score 0`
+- `46ab0419b8` `2023-10-27` **other** · other · kept — Merge pull request #9279 from Jasonzzt/main; no numbers stated; `score 0`
+- `21631209a9` `2023-10-27` **other** · other · kept — Skip CPU performance test for now; no numbers stated; `score 0`
+- `aa319de5e8` `2023-10-27` **sync** · other · kept — Add streaming-llm using llama2 on CPU; no numbers stated; `score 0`
+- `a4a1dec064` `2023-10-27` **other** · other · kept — Add a cpu example of HuggingFace Transformers Agent (use vicuna-7b-v1.5); no numbers stated; `score 0`
+- `1bff54a378` `2023-10-27` **other** · other · kept — Display demo.jpg n the README.md of HuggingFace Transformers Agent; no numbers stated; `score 0`
+- `7f2ad182fd` `2023-10-27` **other** · docs · kept — Minor Fixes of README; no numbers stated; `score 0`
+- `f053688cad` `2023-10-27` **other** · other · kept — add cpu example of LLaVA; no numbers stated; `score 0`
+- `8838707009` `2023-10-28` **other** · sched · kept — Add deepspeed autotp example readme; no numbers stated; `score 0`
+- `163d033616` `2023-10-28` **other** · knob · kept — Support qlora in CPU; no numbers stated; `score 1`
+- `ee5becdd61` `2023-10-30` **other** · docs · kept — use coco image in Qwen-VL; no numbers stated; `score 0`
+- `cee9eaf542` `2023-10-30` **mem** · other · kept — Fix llm arc ut oom; no numbers stated; `score 0`
+- `5842f7530e` `2023-10-30` **other** · other · kept — upgrade ubuntu version in llm-inference cpu image; no numbers stated; `score 0`
+- `030edeecac` `2023-10-31` **other** · fix · kept — Ubuntu upgrade: fix installation error; no numbers stated; `score 0`
+- `d383ee8efb` `2023-10-31` **other** · docs · kept — update QLoRA example about accelerate version; no numbers stated; `score 0`
+- `2c2bc959ad` `2023-10-31` **other** · other · kept — add tools into previously built images; no numbers stated; `score 0`
+- `d638b93dfe` `2023-11-01` **other** · other · kept — Add test script and workflow for qlora fine-tuning; no numbers stated; `score 0`
+
+*Commits 1501-1600 (2023-10-11..2023-11-01): scores 0/1/2/3 = 67/28/5/0; areas other 76, attention 16, quant 3, gemm 2.*
+
+- `06447a3ef6` `2023-11-01` **other** · other · kept — add malloc and intel openmp to llm deps; no numbers stated; `score 0`
+- `c44c6dc43a` `2023-11-01` **other** · other · kept — add chatglm3 examples; no numbers stated; `score 0`
+- `96f8158fe2` `2023-11-01` **other** · docs · kept — adjust dolly v2 GPU example README; no numbers stated; `score 0`
+- `03aa368776` `2023-11-01` **other** · other · kept — add the comparison between latest arc perf test and last one; no numbers stated; `score 0`
+- `d4ab5904ef` `2023-11-01` **other** · other · kept — Add python 3.10 llm UT; no numbers stated; `score 0`
+- `8ef8e25178` `2023-11-01` **other** · other · kept — improve response speed in multi-turn chat; no numbers stated; `score 0`
+- `4f9fd0dffd` `2023-11-01` **other** · other · kept — arc-ut with 3.10 & 3.11; no numbers stated; `score 0`
+- `2262ae4d13` `2023-11-01` **other** · knob · kept — Support MoFQ4 on arc; no numbers stated; `score 1`
+- `7e73c354a6` `2023-11-01` **other** · other · kept — decoupling bigdl-llm and bigdl-nano; no numbers stated; `score 0`
+- `9f3d4676c6` `2023-11-01` **other** · other · kept — Add qwen-vl gpu example; no numbers stated; `score 0`
+- `e1bc18f8eb` `2023-11-01` **attention** · fix · kept — fix import ipex problem; no numbers stated; `score 1`
+- `7c7a7f2ec1` `2023-11-01` **other** · other · kept — spr & arc ut with python3,9&3.10&3.11; no numbers stated; `score 0`
+- `d51821e264` `2023-11-01` **other** · other · kept — test; no numbers stated; `score 0`
+- `6f1cee90a4` `2023-11-01` **other** · other · kept — test; no numbers stated; `score 0`
+- `726203d778` `2023-11-01` **other** · fix · kept — Replace Embedding layer to fix it on CPU; no numbers stated; `score 1`
+- `ba148ff3ff` `2023-11-01` **other** · other · kept — test py311; no numbers stated; `score 0`
+- `b66584f23b` `2023-11-01` **other** · other · kept — test; no numbers stated; `score 0`
+- `8f6e979fad` `2023-11-01` **other** · other · kept — test again; no numbers stated; `score 0`
+- `cb7ef38e86` `2023-11-01` **other** · other · kept — rerun; no numbers stated; `score 0`
+- `6a128aee32` `2023-11-01` **other** · other · kept — add ui for portable-zip; no numbers stated; `score 0`
+- `964a8e6dc1` `2023-11-01` **other** · other · kept — update conda; no numbers stated; `score 0`
+- `2fff0e8c21` `2023-11-01` **other** · other · kept — use runner avx2 with linux; no numbers stated; `score 0`
+- `3c3329010d` `2023-11-01` **other** · other · kept — add conda update -n base conda; no numbers stated; `score 0`
+- `9722e811be` `2023-11-01` **other** · other · kept — add more models to the arc perf test; no numbers stated; `score 0`
+- `687da21467` `2023-11-01` **other** · other · kept — test 3.11; no numbers stated; `score 0`
+- `d1bdc0ef72` `2023-11-01` **other** · other · kept — spr & arc ut with python 3.9 & 3.10 & 3.11; no numbers stated; `score 0`
+- `149146004f` `2023-11-02` **other** · other · kept — Add qlora finetunning CPU example; no numbers stated; `score 0`
+- `dd3cf2f153` `2023-11-02` **other** · other · kept — Add python 3.10 & 3.11 UT; no numbers stated; `score 0`
+- `f855a864ef` `2023-11-02` **other** · other · kept — add llava gpu example; no numbers stated; `score 0`
+- `63b2556ce2` `2023-11-02` **other** · other · kept — Add cpu examples of skywork; no numbers stated; `score 0`
+- `d4dffbdb62` `2023-11-02` **other** · other · kept — Merge harness; no numbers stated; `score 0`
+- `97a38958bd` `2023-11-02` **other** · other · kept — add CodeLlama CPU and GPU examples; no numbers stated; `score 0`
+- `2e3bfbfe1f` `2023-11-02` **other** · other · kept — Add internlm_xcomposer cpu examples; no numbers stated; `score 0`
+- `4df66f5cbc` `2023-11-02` **other** · other · kept — Update llm-finetune-lora-cpu dockerfile and readme; no numbers stated; `score 0`
+- `74a8ad32dc` `2023-11-02` **other** · sched · kept — Add entry point to llm-serving-xpu; no numbers stated; `score 0`
+- `63411dff75` `2023-11-02` **other** · other · kept — Add cpu examples of WizardCoder; no numbers stated; `score 0`
+- `8f23fb04dc` `2023-11-03` **other** · other · kept — Add inference test for Whisper model on Arc; no numbers stated; `score 0`
+- `a0150bb205` `2023-11-03` **other** · other · kept — Move embedding layer to CPU for iGPU inference; no numbers stated; `score 1`
+- `ef83c3302e` `2023-11-03` **other** · other · kept — Use to test llm-performance on spr-perf; no numbers stated; `score 0`
+- `11a05641a4` `2023-11-03` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `9377b9c5d7` `2023-11-03` **other** · other · kept — add CodeShell CPU example; no numbers stated; `score 0`
+- `833e4dbc8d` `2023-11-06` **other** · other · kept — fix llm-performance-test-on-arc bug; no numbers stated; `score 0`
+- `1420e45cc0` `2023-11-06` **attention** · other · kept — Chatglm2 rope optimization on xpu; no numbers stated; `score 1`
+- `e6b6afa316` `2023-11-06` **other** · other · kept — add aquila2 model example; no numbers stated; `score 0`
+- `f9bf5382ff` `2023-11-06` **other** · docs · kept — Fix: add aquila2 in README; no numbers stated; `score 0`
+- `af94058203` `2023-11-06` **other** · sched · kept — Support CPU deepspeed distributed inference; no numbers stated; `score 0`
+- `fae6db3ddc` `2023-11-07` **gemm** · other · kept — refactor cpu low-bit forward logic; no numbers stated; `score 1`
+- `84ab614aab` `2023-11-08` **other** · other · kept — add more models and skip runtime error; no numbers stated; `score 0`
+- `bfd9f88f0d` `2023-11-08` **quant** · other · kept — Use fp32 as dtype when batch_size <=8 and qtype is q4_0/q8_0/fp8; no numbers stated; `score 1`
+- `298b64217e` `2023-11-08` **other** · other · kept — add auto triggered acc test; no numbers stated; `score 0`
+- `7e8fb29b7c` `2023-11-08` **other** · other · kept — optimize QLoRA by reducing convert time; no numbers stated; `score 1`
+- `97316bbb66` `2023-11-08` **other** · docs · kept — highlight transformers version requirement in mistral examples; no numbers stated; `score 0`
+- `54d95e4907` `2023-11-08` **other** · other · kept — add alpaca qlora finetuning example; no numbers stated; `score 0`
+- `bfca76dfa7` `2023-11-08` **other** · other · kept — optimize QLoRA by updating lora convert logic; no numbers stated; `score 1`
+- `d4b248fcd4` `2023-11-08` **other** · other · kept — Add windows binary build label AVX_VNNI; no numbers stated; `score 0`
+- `34449cb4bb` `2023-11-09` **other** · other · kept — add remaining models to the arc perf test; no numbers stated; `score 0`
+- `40cead6b5b` `2023-11-09` **other** · fix · kept — Fix CPU qlora dtype convert issue; no numbers stated; `score 1`
+- `df8e4d7889` `2023-11-09` **gemm** · other · kept — apply allreduce and bias to training in LowBitLinear; no numbers stated; `score 1`
+- `36fbe2144d` `2023-11-09` **other** · other · kept — Add CPU examples of fuyu; no numbers stated; `score 0`
+- `3d107f6d25` `2023-11-09` **other** · other · kept — Separate windows build UT and build runner; no numbers stated; `score 0`
+- `dfb00e37e9` `2023-11-10` **other** · other · kept — Add model correctness test on ARC for llama and falcon; no numbers stated; `score 0`
+- `b23b91407c` `2023-11-10` **other** · sched · kept — fix llm-init on deepspeed missing lib; no numbers stated; `score 0`
+- `ad81b5d838` `2023-11-10` **other** · docs · kept — Update qlora README.md; no numbers stated; `score 0`
+- `0674146cfb` `2023-11-10` **other** · other · kept — Add cpu and gpu examples of distil-whisper; no numbers stated; `score 0`
+- `2cfef5ef1e` `2023-11-11` **other** · other · kept — store the nightly test and pr results separately; no numbers stated; `score 0`
+- `d7334513e1` `2023-11-12` **other** · docs · kept — codeshell: fix wrong links; no numbers stated; `score 0`
+- `ac7fbe77e2` `2023-11-12` **other** · docs · kept — Update qlora readme; no numbers stated; `score 0`
+- `2888818b3a` `2023-11-13` **quant** · knob · kept — Support mixed_fp8 on Arc; no numbers stated; `score 1`
+- `9b5d0e9c75` `2023-11-13` **other** · other · kept — Add examples for Yi-6B; no numbers stated; `score 0`
+- `5d4ec44488` `2023-11-13` **other** · instr · kept — Add all-in-one benchmark into inference-cpu docker image; no numbers stated; `score 0`
+- `4faf5af8f1` `2023-11-13` **other** · other · kept — Add perf test for core on Windows; no numbers stated; `score 0`
+- `f36d7b2d59` `2023-11-13` **other** · fix · kept — Fix harness stuck; no numbers stated; `score 0`
+- `8c603014ac` `2023-11-13` **other** · docs · kept — update 2.5.0-snapshot readthedoc; no numbers stated; `score 0`
+- `da6bbc8c11` `2023-11-13` **other** · sched · kept — fix deepspeed dependencies to install; no numbers stated; `score 0`
+- `5747e2fe69` `2023-11-13` **other** · fix · kept — fix multiple gpu usage of harness; no numbers stated; `score 0`
+- `0e5ab5ebfc` `2023-11-13` **other** · other · kept — update docker tag to 2.5.0-SNAPSHOT; no numbers stated; `score 0`
+- `ece5805572` `2023-11-13` **other** · instr · kept — add chatglm3-6b to latency benchmark test.; no numbers stated; `score 0`
+- `0ecb9efb05` `2023-11-13` **other** · knob · kept — use AutoTokenizer to enable more models; no numbers stated; `score 0`
+- `d109275333` `2023-11-13` **other** · other · kept — temporarily disable the test of some models; no numbers stated; `score 0`
+- `0f78ebe35e` `2023-11-14` **other** · other · kept — LLM : Add qlora cpu finetune docker image; no numbers stated; `score 0`
+- `b2b085550b` `2023-11-14` **other** · other · removed — Remove bigdl-nano and add ipex into inference-cpu image; no numbers stated; `score 0`
+- `51d07a9fd8` `2023-11-14` **quant** · knob · kept — Support directly loading gptq models from huggingface; no numbers stated; `score 1`
+- `d19ca21957` `2023-11-14` **other** · other · kept — patch bigdl-llm model to harness by binding instead of patch file; no numbers stated; `score 0`
+- `dbbdb53a18` `2023-11-14` **other** · fix · kept — fix multiple gpu usage; no numbers stated; `score 0`
+- `0f82b8c3a0` `2023-11-15` **other** · other · kept — update qlora example; no numbers stated; `score 0`
+- `24146d108f` `2023-11-15` **other** · other · kept — add bigdl-llm-init; no numbers stated; `score 0`
+- `170e0072af` `2023-11-15` **other** · other · kept — chatglm2 correctness test; no numbers stated; `score 0`
+- `13f6eb77b4` `2023-11-15` **other** · other · kept — Add exec bash to entrypoint.sh to keep container running after being booted.; no numbers stated; `score 0`
+- `0d55bbd9f1` `2023-11-15` **other** · other · kept — ajust the order of some models; no numbers stated; `score 0`
+- `c487b53f21` `2023-11-15` **other** · other · kept — only run arc perf test nightly; no numbers stated; `score 0`
+- `731b0aaade` `2023-11-16` **mem** · other · kept — Empty cache after embedding to cpu; no numbers stated; `score 1`
+- `d2c064124a` `2023-11-16` **attention** · knob · kept — update rms related usage to suport ipex 2.1 new api; no numbers stated; `score 1`
+- `d5263e6681` `2023-11-16` **quant** · knob · kept — Add awq load support; no numbers stated; `score 1`
+- `c0ef70df02` `2023-11-16` **attention** · fix · kept — quick fix of fast_rms_norm; no numbers stated; `score 1`
+- `bc06bec90e` `2023-11-16` **other** · other · kept — modify the script to generate html results more accurately; no numbers stated; `score 0`
+- `30abd304a7` `2023-11-16` **other** · fix · kept — Fix baichuan pre-normalize model tensor assigning issue when loading; no numbers stated; `score 1`
+- `921b263d6a` `2023-11-17` **other** · docs · kept — update deepspeed install and run guide in README; no numbers stated; `score 0`
+- `3dac21ac7b` `2023-11-17` **other** · other · kept — add more example usages about alpaca qlora on different hardware; no numbers stated; `score 0`
+- `50b01058f1` `2023-11-17` **other** · knob · kept — enable new q4_1; no numbers stated; `score 1`
+- `0f9a440b06` `2023-11-20` **other** · other · kept — doc for Multi gpu selection; no numbers stated; `score 0`
+
+*Commits 1601-1700 (2023-11-01..2023-11-20): scores 0/1/2/3 = 81/19/0/0; areas other 89, attention 4, quant 4, gemm 2.*
+
+- `96fd26759c` `2023-11-20` **other** · fix · kept — fix QLoRA finetuning example on CPU; no numbers stated; `score 0`
+- `c5cb3ab82e` `2023-11-21` **other** · other · kept — LLM : Add CPU alpaca qlora example; no numbers stated; `score 0`
+- `566ec85113` `2023-11-21` **sync** · knob · kept — add stream interval option to entrypoint; no numbers stated; `score 0`
+- `b7ae572ac3` `2023-11-21` **other** · other · kept — update Alpaca QLoRA finetuning example on GPU; no numbers stated; `score 0`
+- `40ec9f7ead` `2023-11-21` **other** · other · kept — Add qlora cpu docker manually build; no numbers stated; `score 0`
+- `2b200bf2f2` `2023-11-21` **other** · sched · kept — Add vllm_worker related arguments in docker serving image's entrypoint; no numbers stated; `score 0`
+- `3e39828420` `2023-11-21` **other** · docs · kept — Update all in one benchmark readme; no numbers stated; `score 0`
+- `076d106ef5` `2023-11-21` **other** · other · kept — GPU QLoRA update to bf16 to accelerate gradient checkpointing; no numbers stated; `score 0`
+- `c2aeb4d1e8` `2023-11-21` **other** · other · kept — del model after test; no numbers stated; `score 0`
+- `139e98aa18` `2023-11-22` **other** · instr · kept — quick fix benchmark; no numbers stated; `score 0`
+- `1a2129221d` `2023-11-22` **other** · knob · kept — support resume from checkpoint in Alpaca QLoRA; no numbers stated; `score 0`
+- `86743fb57b` `2023-11-22` **other** · docs · kept — fix transformers version in CPU finetuning example; no numbers stated; `score 0`
+- `1453046938` `2023-11-23` **other** · sched · kept — install bigdl-llm in deepspeed cpu inference example; no numbers stated; `score 0`
+- `11fa5a8a0e` `2023-11-23` **other** · docs · kept — Fix QLoRA CPU dispatch_model issue about accelerate; no numbers stated; `score 0`
+- `0f0c6bb631` `2023-11-23` **attention** · fix · kept — Fix Qwen registered_causal_mask is None; no numbers stated; `score 1`
+- `48fbb1eb94` `2023-11-23` **other** · knob · kept — support ccl (MPI) distributed mode in alpaca_qlora_finetuning_cpu; no numbers stated; `score 0`
+- `bf579507c2` `2023-11-23` **attention** · sched · kept — Integrate vllm; no numbers stated; `score 0`
+- `b63aae8a8e` `2023-11-23` **attention** · knob · kept — add flash attention support for llama; no numbers stated; `score 1`
+- `064848028f` `2023-11-23` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `82898a4203` `2023-11-23` **other** · docs · kept — Update GPU example README; no numbers stated; `score 0`
+- `b3178d449f` `2023-11-23` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `42b7a16bc5` `2023-11-24` **other** · other · kept — Replace torch.bmm with safe_bmm; no numbers stated; `score 1`
+- `3d24823cda` `2023-11-24` **attention** · fix · kept — hot-fix mistral kv_cache; no numbers stated; `score 1`
+- `914a5a5a27` `2023-11-24` **attention** · fix · kept — fix abnormal Mistral GPU accuracy by updating rms_norm; no numbers stated; `score 1`
+- `6bec0faea5` `2023-11-24` **quant** · knob · kept — support Mistral AWQ models; no numbers stated; `score 1`
+- `45820cf3b9` `2023-11-24` **other** · knob · kept — add optimize model option; no numbers stated; `score 0`
+- `11fa3de290` `2023-11-24` **other** · knob · kept — Add sutup support of win gpu for bigdl-llm; no numbers stated; `score 0`
+- `2b9c7d2a59` `2023-11-27` **other** · fix · kept — quick fix alpaca qlora finetuning script; no numbers stated; `score 0`
+- `b6c3520748` `2023-11-27` **other** · sched · removed — Remove xformers from vLLM-CPU; no numbers stated; `score 0`
+- `963a5c8d79` `2023-11-28` **attention** · sched · kept — Add vLLM-XPU version's README/examples; no numbers stated; `score 0`
+- `e7e0cd3b5e` `2023-11-28` **other** · other · kept — CPU Pinned embedding Layer; no numbers stated; `score 1`
+- `5098bc3544` `2023-11-28` **other** · knob · kept — enable previous models; no numbers stated; `score 0`
+- `916c338772` `2023-11-28` **attention** · sched · kept — fix bugs in vllm length check; no numbers stated; `score 1`
+- `32b37f3af7` `2023-11-28` **other** · docs · kept — Update gpu install.md; no numbers stated; `score 0`
+- `a86c6e0b56` `2023-11-28` **attention** · knob · kept — support loading gguf model; no numbers stated; `score 1`
+- `5f5ca38b74` `2023-11-29` **other** · fix · kept — Fix api doc rendering error; no numbers stated; `score 1`
+- `b824754256` `2023-11-29` **other** · other · kept — Update for cpu qlora mpirun; no numbers stated; `score 0`
+- `65121c7997` `2023-11-29` **quant** · knob · kept — support loading q4_1/q5_0/q5_1/q8_0 gguf model; no numbers stated; `score 1`
+- `4ff2ca9d0d` `2023-11-29` **other** · fix · kept — fix loss error on Arc; no numbers stated; `score 0`
+- `557bb6bbdb` `2023-11-29` **other** · other · kept — add judgement for running serve; no numbers stated; `score 0`
+- `34503efa6a` `2023-11-29` **other** · fix · kept — Fix cpu pinned embedding; no numbers stated; `score 1`
+- `d85a430a8c` `2023-11-30` **other** · docs · kept — Uing bigdl-llm-init instead of bigdl-nano-init; no numbers stated; `score 0`
+- `c8e0c2ed48` `2023-11-30` **other** · fix · kept — Fixed dumped logs in harness; no numbers stated; `score 0`
+- `a0a80d232e` `2023-11-30` **other** · other · kept — Add qlora cpu distributed readme; no numbers stated; `score 0`
+- `2554ba0913` `2023-11-30` **other** · sched · kept — Add usage of vllm; no numbers stated; `score 0`
+- `7f6465518a` `2023-11-30` **attention** · knob · kept — support loading llama tokenizer from gguf model; no numbers stated; `score 1`
+- `66f5b45f57` `2023-11-30` **other** · other · kept — add a llama2 gguf example; no numbers stated; `score 0`
+- `b785376f5c` `2023-11-30` **other** · sched · kept — Add vllm-example to docker inference image; no numbers stated; `score 0`
+- `69c49d21f5` `2023-11-30` **attention** · fusion · kept — use fused rms norm; no numbers stated; `score 2`
+- `bda404fc8f` `2023-11-30` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `ed0dc57c6e` `2023-12-01` **other** · knob · kept — Add cpu qlora support other models guide; no numbers stated; `score 0`
+- `74fd7077a2` `2023-12-01` **other** · other · kept — Multi-process and distributed QLoRA on CPU platform; no numbers stated; `score 0`
+- `4d7d5d4c59` `2023-12-01` **other** · other · kept — Add 3 leaderboard tasks; no numbers stated; `score 0`
+- `cb228c70ea` `2023-12-01` **other** · other · kept — Add harness nightly; no numbers stated; `score 0`
+- `5de92090b3` `2023-12-01` **other** · fix · kept — try to fix deps installation of bigdl; no numbers stated; `score 0`
+- `f7e596d85a` `2023-12-01` **other** · docs · kept — Update doc; no numbers stated; `score 0`
+- `5c03651309` `2023-12-03` **attention** · sched · kept — vLLM: Add Preempt for scheduler; no numbers stated; `score 1`
+- `9557aa9c21` `2023-12-04` **other** · fix · kept — Fix harness nightly; no numbers stated; `score 0`
+- `29d5bb8df4` `2023-12-04` **other** · other · kept — Harness workflow dispatch; no numbers stated; `score 0`
+- `3f4ad97929` `2023-12-04` **other** · other · kept — Add performance tests for windows iGPU; no numbers stated; `score 0`
+- `8c8a27ded7` `2023-12-05` **other** · other · kept — Add harness summary job; no numbers stated; `score 0`
+- `1012507a40` `2023-12-05` **other** · other · kept — Fix performance tests; no numbers stated; `score 0`
+- `f211f136b6` `2023-12-05` **gemm** · knob · kept — Configurable TORCH_LINEAR_THRESHOLD from env; no numbers stated; `score 1`
+- `8b00653039` `2023-12-05` **other** · docs · kept — fix doc; no numbers stated; `score 0`
+- `b721138132` `2023-12-05` **other** · other · kept — Add cpu and gpu examples for BlueLM; no numbers stated; `score 0`
+- `65934c9f4f` `2023-12-05` **attention** · fix · kept — Fix Qwen causal_mask and attention_mask size mismatching; no numbers stated; `score 1`
+- `a66fbedd7e` `2023-12-05` **other** · other · kept — add gpu more data types example; no numbers stated; `score 0`
+- `06febb5fa7` `2023-12-05` **quant** · other · kept — Update readme for FP8/FP4 inference examples; no numbers stated; `score 0`
+- `d154b38bf9` `2023-12-05` **mem** · other · kept — Add llama2 gpu low memory example; no numbers stated; `score 0`
+- `4e70e33934` `2023-12-06` **other** · other · kept — code and document for distributed qlora; no numbers stated; `score 0`
+- `c998f5f2ba` `2023-12-06` **other** · other · kept — iGPU long context tests; no numbers stated; `score 0`
+- `aeb77b2ab1` `2023-12-06` **other** · docs · kept — Add minimum Qwen model version; no numbers stated; `score 0`
+- `0e8f4020e5` `2023-12-06` **other** · instr · kept — Add traceback error output for win igpu test api in benchmark; no numbers stated; `score 0`
+- `89069d6173` `2023-12-06` **other** · other · kept — Add gpu gguf example; no numbers stated; `score 0`
+- `6978b2c316` `2023-12-06` **attention** · sched · kept — Change padding patterns for vLLM & clean code; no numbers stated; `score 0`
+- `404e101ded` `2023-12-06` **other** · other · kept — QALora example; no numbers stated; `score 0`
+- `a7bc89b3a1` `2023-12-06` **other** · docs · removed — remove q4_1 in gguf example; no numbers stated; `score 0`
+- `51b668f229` `2023-12-06` **other** · docs · kept — Update GGUF readme; no numbers stated; `score 0`
+- `13d47955a8` `2023-12-07` **attention** · fusion · kept — use fused rms norm in chatglm2 and baichuan; no numbers stated; `score 2`
+- `0327169b50` `2023-12-07` **mem** · sched · kept — vLLM: fix memory leak in prepare_kv_cache; no numbers stated; `score 0`
+- `48b85593b3` `2023-12-07` **other** · docs · kept — Update all-in-one benchmark readme; no numbers stated; `score 0`
+- `deee65785c` `2023-12-07` **attention** · sched · kept — vLLM: Delete last_kv_cache before prefilling; no numbers stated; `score 1`
+- `7319f2c227` `2023-12-07` **attention** · fusion · kept — use fused mlp in baichuan2; no numbers stated; `score 2`
+- `3811cf43c9` `2023-12-07` **quant** · docs · kept — update AWQ documents; no numbers stated; `score 0`
+- `d9b0c01de3` `2023-12-07` **other** · fix · kept — fix unlora module in qlora finetune; no numbers stated; `score 1`
+- `6f34978b94` `2023-12-07` **other** · other · kept — Add more performance tests for win iGPU (more in-out pairs, RWKV model); no numbers stated; `score 0`
+- `e9299adb3b` `2023-12-07` **other** · other · kept — Highlight some values in the html; no numbers stated; `score 0`
+- `6eca8a8bb5` `2023-12-08` **other** · other · kept — update transformer version; no numbers stated; `score 0`
+- `d204125e88` `2023-12-08` **other** · other · kept — Use to build a more slim docker for k8s; no numbers stated; `score 0`
+- `499100daf1` `2023-12-08` **other** · docs · kept — Add solution to fix `oneccl` related error; no numbers stated; `score 0`
+- `5636b0ba80` `2023-12-08` **gemm** · other · kept — set new linear status; no numbers stated; `score 1`
+- `0b6f29a7fc` `2023-12-08` **other** · fusion · kept — add fused rms norm for Yi and Qwen; no numbers stated; `score 2`
+- `70f5e7bf0d` `2023-12-08` **other** · knob · kept — Support peft LoraConfig; no numbers stated; `score 0`
+- `1ff4bc43a6` `2023-12-08` **other** · other · kept — degrade pandas version; no numbers stated; `score 0`
+- `972cdb9992` `2023-12-08` **mem** · other · kept — gsm8k OOM workaround; no numbers stated; `score 0`
+- `894d0aaf5e` `2023-12-08` **other** · other · kept — iGPU win perf test reorg based on in-out pairs; no numbers stated; `score 0`
+- `84a19705a6` `2023-12-09` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `82255f9726` `2023-12-11` **attention** · fusion · kept — Enable fused layernorm; no numbers stated; `score 2`
+- `9f02f96160` `2023-12-11` **quant** · knob · kept — support for Yi AWQ model; no numbers stated; `score 0`
+- `45721f3473` `2023-12-11` **other** · docs · kept — verfiy llava; no numbers stated; `score 0`
+
+*Commits 1701-1800 (2023-11-20..2023-12-11): scores 0/1/2/3 = 76/19/5/0; areas other 72, attention 17, quant 5, mem 3.*
+
+- `a04a027b4c` `2023-12-11` **other** · docs · kept — Edit gpu doc; no numbers stated; `score 0`
+- `afa895877c` `2023-12-11` **other** · fix · kept — fix the issue that may generate blank html; no numbers stated; `score 0`
+- `d272b6dc47` `2023-12-11` **other** · other · kept — Enable generation of html again for win igpu tests; no numbers stated; `score 0`
+- `1e25499de0` `2023-12-12` **other** · other · kept — test new oneapi; no numbers stated; `score 0`
+- `017932a7fb` `2023-12-12` **other** · fix · kept — Small fix for html generation; no numbers stated; `score 0`
+- `59ce86d292` `2023-12-12` **moe** · knob · kept — support `optimize_model=True` for Mixtral model; no numbers stated; `score 1`
+- `0e639b920f` `2023-12-12` **mem** · other · kept — disable test_optimized_model.py temporarily due to out of memory on A730M(pr validation machine); no numbers stated; `score 0`
+- `968d99e6f5` `2023-12-12` **mem** · other · removed — Remove empty cache between each iteration of generation; no numbers stated; `score 0`
+- `2fe38b4b9b` `2023-12-12` **moe** · other · kept — add mixtral GPU examples; no numbers stated; `score 0`
+- `8931f2eb62` `2023-12-12` **attention** · fix · kept — Fix transformer qwen size mismatch and rename causal_mask; no numbers stated; `score 1`
+- `bf1bcf4a14` `2023-12-12` **moe** · knob · kept — add official Mixtral model support; no numbers stated; `score 0`
+- `c64e2248ef` `2023-12-13` **other** · fix · kept — fix str returned by get_int_from_str rather than expected int; no numbers stated; `score 0`
+- `284e7697b1` `2023-12-13` **attention** · knob · kept — Optimize ChatGLM2 kv_cache to support beam_search on ARC; no numbers stated; `score 1`
+- `5b0e7e308c` `2023-12-13` **other** · knob · kept — Add support for empty activation; no numbers stated; `score 1`
+- `dc5b1d7e9d` `2023-12-13` **attention** · kernel · kept — integrate the SDP kernel for FP16 rest-token inference on DG2/ATSM; no numbers stated; `score 3`
+- `1c6499e880` `2023-12-13` **moe** · sched · kept — vLLM: Support Mixtral Model; no numbers stated; `score 1`
+- `503880809c` `2023-12-13` **other** · docs · kept — verfiy codeLlama; no numbers stated; `score 0`
+- `c7741c4e84` `2023-12-13` **moe** · instr · kept — update moe block convert to optimize rest token latency of Mixtral; no numbers stated; `score 1`
+- `09ca540f9b` `2023-12-13` **attention** · fusion · kept — use fuse mlp in qwen; no numbers stated; `score 2`
+- `9b9cd51de1` `2023-12-13` **other** · knob · kept — update setup to provide new install option to support ipex 2.1 & oneapi 2024; no numbers stated; `score 0`
+- `16febc949c` `2023-12-13` **other** · other · kept — Add exclude option in all-in-one performance test; no numbers stated; `score 0`
+- `cbdd49f229` `2023-12-13` **other** · knob · kept — win igpu performance for ipex 2.1 and oneapi 2024.0; no numbers stated; `score 0`
+- `1456d30765` `2023-12-13` **other** · knob · kept — add dot to option name in setup; no numbers stated; `score 0`
+- `68a4be762f` `2023-12-13` **moe** · knob · removed — remove disco mixtral, update oneapi version; no numbers stated; `score 0`
+- `877229f3be` `2023-12-14` **quant** · docs · kept — Add Yi-34B-AWQ to verified AWQ model.; no numbers stated; `score 0`
+- `5e46e0e5af` `2023-12-14` **other** · fix · kept — fix baichuan2-7b 1st token performance regression on xpu; no numbers stated; `score 1`
+- `223c9622f7` `2023-12-14` **moe** · other · kept — Mixtral CPU examples; no numbers stated; `score 0`
+- `21c7503a42` `2023-12-14` **other** · other · kept — Correct prompt format of Qwen in generate.py; no numbers stated; `score 0`
+- `3e8d198b57` `2023-12-14` **other** · other · kept — add eval func; no numbers stated; `score 0`
+- `82ac2dbf55` `2023-12-14` **other** · other · kept — Small fixes for win igpu test for ipex 2.1; no numbers stated; `score 0`
+- `9a330bfc2b` `2023-12-14` **quant** · fusion · kept — fix fuse mlp when using q5_0 or fp8; no numbers stated; `score 2`
+- `68d0c255fc` `2023-12-14` **other** · docs · kept — Update GPU installation doc; no numbers stated; `score 0`
+- `1f0245039d` `2023-12-14` **other** · other · kept — check the final csv results for arc perf test; no numbers stated; `score 0`
+- `37f509bb95` `2023-12-14` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `3afed99216` `2023-12-15` **other** · fix · kept — fix path issue; no numbers stated; `score 0`
+- `496bb2e845` `2023-12-15` **attention** · knob · kept — Support load BaiChuan model family gguf model; no numbers stated; `score 1`
+- `b8437a1c1e` `2023-12-15` **attention** · knob · kept — Add gguf mistral model support; no numbers stated; `score 1`
+- `adbef56001` `2023-12-15` **attention** · other · kept — update qwen attention forward.; no numbers stated; `score 1`
+- `d5b81af7bd` `2023-12-15` **moe** · knob · kept — Support mixtral attention optimization on transformers-v4.36.0; no numbers stated; `score 1`
+- `d57efd8eb9` `2023-12-15` **other** · other · kept — Add stop_word for Qwen model and correct qwen chat format in chat.py; no numbers stated; `score 0`
+- `0d41b7ba7b` `2023-12-15` **other** · other · kept — Correct chat format & add stop words for chatglm3 in chat.py; no numbers stated; `score 0`
+- `67cc155771` `2023-12-15` **sync** · other · kept — Correct chat format of llama and add llama_stream_chat in chat.py; no numbers stated; `score 0`
+- `c00a9144c4` `2023-12-15` **other** · docs · kept — Small fixes to llm gpu installation guide; no numbers stated; `score 0`
+- `a5c481fedd` `2023-12-18` **other** · other · kept — add chat.py denpendency in Dockerfile; no numbers stated; `score 0`
+- `320110d158` `2023-12-18` **attention** · fusion · kept — handle empty fused norm result; no numbers stated; `score 2`
+- `12df70953e` `2023-12-18` **other** · docs · kept — add resume_from_checkpoint related section; no numbers stated; `score 0`
+- `b3647507c0` `2023-12-18` **other** · fix · kept — Fix harness workflow; no numbers stated; `score 0`
+- `8ed89557e5` `2023-12-18` **moe** · other · kept — add mlp optimization of mixtral; no numbers stated; `score 1`
+- `4d22add4af` `2023-12-18` **attention** · fix · kept — fix qwen efficiency issue in perf-test.; no numbers stated; `score 1`
+- `4c112ee70c` `2023-12-18` **other** · other · kept — Rename qwen in model name for arc perf test; no numbers stated; `score 0`
+- `f4fb58d99c` `2023-12-18` **attention** · fusion · kept — fusing qkv project and rope; no numbers stated; `score 2`
+- `d0a3095b97` `2023-12-19` **other** · other · kept — IPEX auto importer; no numbers stated; `score 1`
+- `1fa7793fc0` `2023-12-19` **moe** · other · kept — Load Mixtral GGUF Model; no numbers stated; `score 1`
+- `f2e6abb563` `2023-12-19` **attention** · fix · kept — fix mlp batch size check; no numbers stated; `score 1`
+- `522cf5ed82` `2023-12-19` **attention** · other · kept — Improve chatglm2/3 rest token performance with long context; no numbers stated; `score 1`
+- `3aa8b66bc3` `2023-12-19` **other** · other · removed — remove starcoder-15.5b model temporarily; no numbers stated; `score 0`
+- `612651cb5d` `2023-12-20` **attention** · fix · kept — fix typo; no numbers stated; `score 1`
+- `e54c428d30` `2023-12-20` **attention** · fusion · kept — add bf16/fp16 fuse mlp support; no numbers stated; `score 2`
+- `cd652a1710` `2023-12-20` **quant** · knob · kept — Support fp8 e5m2 on arc; no numbers stated; `score 1`
+- `4c032a433e` `2023-12-20` **other** · other · kept — Add glibc checker; no numbers stated; `score 1`
+- `13ea6330bd` `2023-12-20` **attention** · other · kept — optimize qwen rope; no numbers stated; `score 1`
+- `e1e921f425` `2023-12-21` **attention** · other · kept — gguf other model using dtype; no numbers stated; `score 1`
+- `4bda975a3e` `2023-12-21` **gemm** · other · kept — Align lowbit model config; no numbers stated; `score 1`
+- `34bb804189` `2023-12-21` **other** · other · kept — check csv and its corresponding yaml file; no numbers stated; `score 0`
+- `d157f623b6` `2023-12-21` **moe** · other · kept — Load Mixtral gguf in a block-wise way; no numbers stated; `score 1`
+- `6c3e698bf1` `2023-12-21` **attention** · fusion · kept — mistral decoding_fast_path and fused mlp; no numbers stated; `score 2`
+- `b06a3146c8` `2023-12-21` **mem** · fix · kept — Fix 70b oom; no numbers stated; `score 0`
+- `df775cf316` `2023-12-21` **attention** · fix · kept — fix python style; no numbers stated; `score 1`
+- `984697afe2` `2023-12-21` **mem** · knob · kept — Add bloom gguf support; no numbers stated; `score 1`
+- `426660b88e` `2023-12-21` **attention** · other · kept — simplify qwen attention; no numbers stated; `score 1`
+- `474c099559` `2023-12-21` **other** · other · kept — using separate threads to do inference; no numbers stated; `score 0`
+- `d4d2ccdd9d` `2023-12-21` **other** · other · removed — remove startcorder-15.5b; no numbers stated; `score 0`
+- `bb52239e0a` `2023-12-21` **other** · other · kept — bigdl-llm stable version release & test; no numbers stated; `score 0`
+- `e4f6e43675` `2023-12-21` **other** · other · kept — safetenor to false; no numbers stated; `score 1`
+- `e36111e713` `2023-12-22` **attention** · fusion · kept — mixstral fused qkv and rope; no numbers stated; `score 2`
+- `ba0b939579` `2023-12-22` **attention** · knob · kept — Support transformers-v4.36.0 on mistral model; no numbers stated; `score 1`
+- `2f36769208` `2023-12-22` **other** · knob · kept — bigdl-llm lora support & lora example; no numbers stated; `score 0`
+- `fdf93c9267` `2023-12-22` **attention** · sched · kept — Implement selective batching for vLLM; no numbers stated; `score 1`
+- `2d1bf20309` `2023-12-22` **other** · other · kept — small fix llm_performance_tests.html; no numbers stated; `score 0`
+- `86a69e289c` `2023-12-22` **other** · fix · kept — fix harness runner label of manual trigger; no numbers stated; `score 0`
+- `1c8c104bb8` `2023-12-22` **other** · other · kept — Small fixes for igpu win perf tests; no numbers stated; `score 0`
+- `95c03765cb` `2023-12-22` **other** · docs · removed — Update install_gpu.md, remove kernel 5.19 requirement.; no numbers stated; `score 0`
+- `0284801fbd` `2023-12-22` **other** · knob · kept — IPEX auto importer turn on by default for XPU; no numbers stated; `score 0`
+- `4c487313f2` `2023-12-22` **other** · revert · reverted — Revert "[LLM] IPEX auto importer turn on by default for XPU (#9730)"; no numbers stated; `score 0`
+- `7fd7c37e1b` `2023-12-22` **quant** · knob · kept — Enable fp8e5 harness; no numbers stated; `score 0`
+- `02436c6cce` `2023-12-22` **other** · other · kept — Enable more long context in-out pairs for iGPU perf tests; no numbers stated; `score 0`
+- `4a98bfa5ae` `2023-12-22` **other** · fix · kept — fix harness manual run env typo; no numbers stated; `score 0`
+- `ed8ed76d4f` `2023-12-25` **other** · sched · kept — update deepspeed autotp usage; no numbers stated; `score 0`
+- `daf536fb2d` `2023-12-25` **attention** · sched · kept — vLLM: Apply attention optimizations for selective batching; no numbers stated; `score 1`
+- `be13b162fe` `2023-12-25` **other** · other · kept — add codeshell example; no numbers stated; `score 0`
+- `986f65cea9` `2023-12-25` **other** · other · kept — Add trust_remote_code for local renamed model in bigdl_llm_model.py; no numbers stated; `score 1`
+- `b6222404b8` `2023-12-25` **other** · other · kept — bigdl-llm stable version: let the perf test fail if the difference between perf and baseline is greater than 5%; bigdl-llm stable version: let the perf test fail if the difference between perf and baseline is greater than 5% (#9750); `score 0`
+- `449b387125` `2023-12-25` **other** · knob · kept — Support relora in bigdl-llm; no numbers stated; `score 0`
+- `30dab36f76` `2023-12-25` **kv** · sched · kept — vLLM: Fix kv cache init; no numbers stated; `score 1`
+- `1917bbe626` `2023-12-25` **gemm** · fix · kept — fix `BF16Linear` related training & inference issue; no numbers stated; `score 0`
+- `66e286a73d` `2023-12-25` **moe** · knob · kept — Support for Mixtral AWQ; no numbers stated; `score 1`
+- `11d883301b` `2023-12-26` **attention** · fix · kept — fix wrong batch output caused by flash attention; no numbers stated; `score 1`
+- `87b4100054` `2023-12-26` **other** · knob · kept — Support Yi model in chat.py; no numbers stated; `score 0`
+- `64d05e581c` `2023-12-26` **quant** · other · kept — add peak gpu mem stats in transformer_int4_gpu; no numbers stated; `score 0`
+- `0ea842231e` `2023-12-26` **other** · sched · kept — vLLM: Add api_server entrypoint; no numbers stated; `score 1`
+
+*Commits 1801-1900 (2023-12-11..2023-12-26): scores 0/1/2/3 = 56/36/7/1; areas other 51, attention 24, moe 12, quant 5.*
+
+- `44b4a0c9c5` `2023-12-26` **other** · other · kept — Correct prompt format of Yi, Llama2 and Qwen in generate.py; no numbers stated; `score 0`
+- `c05d7e1532` `2023-12-26` **other** · other · kept — add star_corder_15.5b model; no numbers stated; `score 0`
+- `c38e18f2ff` `2023-12-26` **other** · other · kept — Migrate iGPU perf tests to new machine; no numbers stated; `score 0`
+- `361781bcd0` `2023-12-26` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `689889482c` `2023-12-26` **mem** · other · kept — Reduce max_cache_pos to reduce Baichuan2-13B memory; no numbers stated; `score 1`
+- `40edb7b5d7` `2023-12-27` **other** · fix · kept — fix get environment variables setting; no numbers stated; `score 0`
+- `5cfb4c4f5b` `2023-12-27` **other** · other · kept — Arc stable version performance regression test; no numbers stated; `score 0`
+- `6c75c689ea` `2023-12-27` **other** · other · kept — bigdl-llm stress test for stable version; no numbers stated; `score 0`
+- `dfe28c58bb` `2023-12-27` **other** · other · kept — Small upload fix for igpu-perf test; no numbers stated; `score 0`
+- `40eaf76ae3` `2023-12-27` **other** · other · kept — Add baichuan2-13b to Arc perf; no numbers stated; `score 0`
+- `f6bb4ab313` `2023-12-27` **other** · other · kept — Arc stress test; no numbers stated; `score 0`
+- `a5e5c3daec` `2023-12-28` **other** · other · kept — set warm_up: 3 num_trials: 50 for cpu stress test; no numbers stated; `score 0`
+- `d299f108d0` `2023-12-28` **attention** · other · kept — update falcon attention forward.; no numbers stated; `score 1`
+- `7ed9538b9f` `2023-12-28` **attention** · knob · kept — support gguf mpt; no numbers stated; `score 1`
+- `7d9f6c6efc` `2023-12-28` **other** · fix · kept — fix cpuinfo error; no numbers stated; `score 1`
+- `99bddd3ab4` `2023-12-28` **attention** · knob · kept — better FP16 support for Intel GPUs; no numbers stated; `score 1`
+- `5857a38321` `2023-12-28` **attention** · sched · kept — Add option to adjust KV_CACHE_ALLOC_BLOCK_LENGTH; no numbers stated; `score 1`
+- `a8baf68865` `2023-12-28` **other** · fix · kept — fix csv_to_html; no numbers stated; `score 0`
+- `f0f9d45eac` `2023-12-28` **other** · knob · kept — IPEX import support bigdl-core-xe-21; no numbers stated; `score 1`
+- `a2e668a61d` `2023-12-28` **other** · other · kept — fix arc ut test; no numbers stated; `score 0`
+- `4d01069302` `2023-12-29` **other** · other · removed — Temp remove baichuan2-13b 1k from arc perf test; no numbers stated; `score 0`
+- `6584539c91` `2024-01-02` **other** · docs · kept — fix installation of codellama; no numbers stated; `score 0`
+- `f5752ead36` `2024-01-02` **other** · other · kept — Add whisper test; no numbers stated; `score 0`
+- `668c2095b1` `2024-01-03` **other** · other · removed — Remove unnecessary warning when installing llm; no numbers stated; `score 0`
+- `3ab3105bab` `2024-01-03` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `5c6543e070` `2024-01-03` **other** · docs · kept — Reorganize LLM GPU installation document; no numbers stated; `score 0`
+- `0396fafed1` `2024-01-03` **other** · other · kept — Update BigDL-LLM-inference image; no numbers stated; `score 0`
+- `a54cd767b1` `2024-01-03` **attention** · other · kept — Add gguf falcon; no numbers stated; `score 1`
+- `20e9742fa0` `2024-01-03` **attention** · fix · kept — fix chatglm3 issue; no numbers stated; `score 1`
+- `f4eb5da42d` `2024-01-03` **other** · other · kept — disable arc ut; no numbers stated; `score 0`
+- `9a14465560` `2024-01-03` **mem** · other · kept — add peak diff; no numbers stated; `score 0`
+- `4ceefc9b18` `2024-01-04` **other** · knob · kept — Support bitsandbytes config on qlora finetune; no numbers stated; `score 0`
+- `05b681fa85` `2024-01-04` **other** · knob · kept — IPEX auto importer set on by default; no numbers stated; `score 0`
+- `8504a2bbca` `2024-01-04` **other** · other · kept — update qlora alpaca example to change lora usage; no numbers stated; `score 0`
+- `38c05be1c0` `2024-01-04` **attention** · fix · kept — Fix dtype mismatch in Baichuan2-13b; no numbers stated; `score 1`
+- `ad6b182916` `2024-01-04` **mem** · other · kept — change the color of peak diff; no numbers stated; `score 0`
+- `3147ebe63d` `2024-01-05` **other** · other · kept — Add cpu and gpu examples for SOLAR-10.7B; no numbers stated; `score 0`
+- `5df31db773` `2024-01-05` **attention** · fix · kept — fix accuracy issue of chatglm3; no numbers stated; `score 1`
+- `f919f5792a` `2024-01-05` **kv** · fix · kept — fix kv cache out of bound; no numbers stated; `score 1`
+- `ad4a6b5096` `2024-01-05` **other** · other · kept — Fix langchain UT by not downgrading typing-extension; no numbers stated; `score 0`
+- `16433dd959` `2024-01-05` **attention** · fix · kept — fix first token judgement of flash attention; no numbers stated; `score 1`
+- `f25d23dfbf` `2024-01-05` **other** · other · kept — Add support for PyTorch 2.1 install in UT for GPU; no numbers stated; `score 0`
+- `a60bda3324` `2024-01-05` **other** · sched · kept — update check for deepspeed; no numbers stated; `score 1`
+- `86f86a64a2` `2024-01-05` **other** · fix · kept — Small fixes to ipex 2.1 UT support; no numbers stated; `score 0`
+- `4269a585b2` `2024-01-05` **other** · other · kept — arc perf test using ipex2.1; no numbers stated; `score 0`
+- `248ae7fad2` `2024-01-05` **attention** · knob · kept — LLama optimize_model to support transformers 4.36; no numbers stated; `score 1`
+- `afaa871144` `2024-01-08` **attention** · kernel · kept — fp8 KV cache in the transformers path: quantize+dequant attention forward; no numbers stated; `score 2`
+- `dc995006cc` `2024-01-08` **moe** · other · kept — add flash attention for mistral / mixtral; no numbers stated; `score 1`
+- `62a3c0fc16` `2024-01-08` **other** · docs · kept — Fix quick build doc; no numbers stated; `score 0`
+- `cad5c2f516` `2024-01-08` **other** · fix · kept — fixed harness deps version; no numbers stated; `score 0`
+- `1b585b0d40` `2024-01-08` **quant** · knob · kept — set fp8 default as e5m2; no numbers stated; `score 1`
+- `3b6372ab12` `2024-01-08` **attention** · fix · kept — Fix Llama transformers 4.36 support; no numbers stated; `score 1`
+- `ed81baa35e` `2024-01-08` **other** · knob · kept — Use default typing-extension in LangChain examples; no numbers stated; `score 0`
+- `5ba1dc38d4` `2024-01-08` **other** · knob · kept — Change default Linux GPU install option to PyTorch 2.1; no numbers stated; `score 0`
+- `294fd32787` `2024-01-09` **mem** · sched · kept — update DeepSpeed AutoTP example with GPU memory optimization; no numbers stated; `score 0`
+- `fea6f16057` `2024-01-09` **gemm** · fusion · kept — mlp fusion for fp8e5 with the type check; no numbers stated; `score 2`
+- `146076bdb5` `2024-01-09` **quant** · knob · kept — Support llm-awq backend; no numbers stated; `score 1`
+- `36496d60ac` `2024-01-09` **kv** · other · kept — only use quantize kv cache on MTL; no numbers stated; `score 1`
+- `a3725b0816` `2024-01-09` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `23fc888abe` `2024-01-09` **other** · docs · kept — Update llm gpu xpu default related info to PyTorch 2.1; no numbers stated; `score 0`
+- `aebed4b7bc` `2024-01-09` **other** · other · kept — Enable llm gpu tests for PyTorch 2.1; no numbers stated; `score 0`
+- `b2aa267f50` `2024-01-09` **other** · other · kept — Enhance LLM GPU installation document; no numbers stated; `score 0`
+- `023679459e` `2024-01-09` **other** · fix · kept — Small fixes for finetune related examples and UTs; no numbers stated; `score 0`
+- `3e05c9e11b` `2024-01-09` **attention** · kernel · kept — route the attention to the ESIMD SDP kernel (llama); no numbers stated; `score 3`
+- `e76d984164` `2024-01-10` **quant** · docs · kept — Support llm-awq vicuna-7b-1.5 on arc; no numbers stated; `score 0`
+- `200fc6a1ee` `2024-01-10` **other** · fix · kept — Fix llm api doc rendering failure due to ipex auto importer; no numbers stated; `score 0`
+- `cb32b985ec` `2024-01-10` **attention** · sched · kept — add mistral and chatglm support to vllm; no numbers stated; `score 1`
+- `53531ae4ee` `2024-01-10` **gemm** · fusion · kept — qkv fusion for fp8e5; no numbers stated; `score 2`
+- `33fd1f9c76` `2024-01-10` **quant** · fix · kept — fix input length logic for run_transformer_int4_gpu; no numbers stated; `score 0`
+- `b53a5cb6c9` `2024-01-10` **moe** · docs · kept — Fix Mixtral typo; no numbers stated; `score 0`
+- `5e766e8105` `2024-01-10` **moe** · docs · kept — Fix Mixtral typo; no numbers stated; `score 0`
+- `07485eff5a` `2024-01-11` **other** · other · kept — Add SOLAR-10.7B to README; no numbers stated; `score 0`
+- `0aef35a965` `2024-01-11` **other** · other · kept — Improve LLM doc regarding windows gpu related info; no numbers stated; `score 1`
+- `4af88a67b9` `2024-01-11` **other** · knob · kept — support chatglm3 with bf16; no numbers stated; `score 1`
+- `4f4ce73f31` `2024-01-11` **other** · other · kept — Add transformer_autocast_bf16 into all-in-one; no numbers stated; `score 0`
+- `d9cf55bce9` `2024-01-11` **moe** · fix · kept — fix MLP check of mixtral; no numbers stated; `score 1`
+- `0e69bfe6b0` `2024-01-12` **other** · fix · kept — fix the performance drop of starcoder; no numbers stated; `score 0`
+- `6637860ddf` `2024-01-12` **attention** · kernel · kept — change xmx condition; no numbers stated; `score 2`
+- `9f34da7cdb` `2024-01-15` **attention** · kernel · kept — Update PVC XMX condition; no numbers stated; `score 2`
+- `8d7326ae03` `2024-01-16` **mtp** · kernel · kept — fix chatglm3 sdp to support speculative decoding; no numbers stated; `score 2`
+- `05ea0ecd70` `2024-01-16` **other** · sched · kept — add pv for llm-serving k8s deployment; no numbers stated; `score 0`
+- `dee32f7d15` `2024-01-16` **attention** · fusion · kept — copy fused rms norm's reuslt to avoid <unk>; no numbers stated; `score 2`
+- `8643b62521` `2024-01-16` **other** · other · kept — Support longer context in iGPU perf tests (2048-256); no numbers stated; `score 0`
+- `b909c5c9c2` `2024-01-16` **mem** · other · kept — GGUF load memory optimization; no numbers stated; `score 1`
+- `511cbcf773` `2024-01-16` **other** · instr · kept — add Ceval benchmark test.; no numbers stated; `score 0`
+- `94767da7cf` `2024-01-17` **attention** · other · kept — optimize rwkv v4 first token performance; no numbers stated; `score 1`
+- `32c56ffc71` `2024-01-17` **other** · other · kept — pip install deps; no numbers stated; `score 0`
+- `68d78fb57e` `2024-01-17` **other** · other · kept — Small improvement to iGPU perf test #9915); no numbers stated; `score 0`
+- `427f75000b` `2024-01-17` **attention** · kernel · kept — fix sdp of chatglm3; no numbers stated; `score 2`
+- `b059a32fff` `2024-01-17` **other** · instr · kept — add benchmark api for bigdl-llm fp16 on GPU; no numbers stated; `score 0`
+- `0c498a7b64` `2024-01-17` **docs** · docs · kept — perf-test config only; ; `score 0`
+- `98b86f83d4` `2024-01-17` **attention** · knob · kept — Support fast rope for training; no numbers stated; `score 0`
+- `e403e4a8b7` `2024-01-17` **other** · docs · kept — Add APT install instructions for oneAPI; no numbers stated; `score 0`
+- `18cd1f1432` `2024-01-17` **gemm** · other · kept — Solve the problem of calling bmm operator in BF16Linear; no numbers stated; `score 1`
+- `054952f82f` `2024-01-18` **mtp** · fix · kept — Fix rope of chatglm3 to support speculative decoding on CPU; no numbers stated; `score 1`
+- `453df868c9` `2024-01-18` **attention** · kernel · kept — add rwkv v5 attention kernel; no numbers stated; `score 2`
+- `5184f400f9` `2024-01-18` **moe** · fix · kept — Fix Mixtral GGUF Wrong Output Issue; no numbers stated; `score 1`
+- `1fc9dfa265` `2024-01-18` **attention** · other · kept — Update for  Qwen n tokens inputs; no numbers stated; `score 1`
+- `7bbb98abb6` `2024-01-18` **attention** · kernel · kept — Disable fused layer norm when using XMX to fix mpt UT; no numbers stated; `score 2`
+- `9e2ac5291b` `2024-01-18` **other** · other · kept — Add rwkv v4 back for igpu perf test 32-512; no numbers stated; `score 0`
+
+*Commits 1901-2000 (2023-12-26..2024-01-18): scores 0/1/2/3 = 59/30/10/1; areas other 55, attention 23, mem 5, moe 5.*
+
+- `100e0a87e5` `2024-01-18` **other** · other · kept — add compressed chatglm3 model; no numbers stated; `score 0`
+- `a8c866c32b` `2024-01-18` **other** · instr · kept — add ppl benchmark; no numbers stated; `score 0`
+- `2e1448f08e` `2024-01-18` **other** · sched · kept — Add vllm_worker to fastchat serving framework; no numbers stated; `score 1`
+- `9a46f019d7` `2024-01-19` **mem** · other · kept — gguf memory optimization for baichuan; no numbers stated; `score 1`
+- `7032a2ad73` `2024-01-19` **mem** · other · kept — Optimize gguf load memory for mistral; no numbers stated; `score 1`
+- `610b5226be` `2024-01-19` **mem** · instr · kept — move reserved memory to benchmark_utils.py; no numbers stated; `score 0`
+- `967714bac8` `2024-01-19` **moe** · other · kept — gguf memory optimization for mixtral; no numbers stated; `score 1`
+- `bf37b3a670` `2024-01-19` **mtp** · other · kept — optimize CPU speculative decoding of chatglm3; no numbers stated; `score 1`
+- `db8e90796a` `2024-01-19` **other** · sched · kept — add avg token latency information and benchmark guide of autotp; no numbers stated; `score 0`
+- `bcaeb05272` `2024-01-19` **attention** · other · kept — Update optimize qwen; no numbers stated; `score 1`
+- `97f0cd8975` `2024-01-19` **attention** · other · kept — optimize Decilm 7b; no numbers stated; `score 1`
+- `fb91c97fe8` `2024-01-22` **mtp** · knob · kept — support for Baichuan/Baichuan2 13B Chat running speculative decoding; no numbers stated; `score 1`
+- `6fb3f40f7e` `2024-01-22` **other** · instr · kept — fix error for benchmark_util.py running on cpu; no numbers stated; `score 0`
+- `947b1e27b7` `2024-01-22` **other** · other · kept — Add readme for Whisper Test; no numbers stated; `score 0`
+- `6341c498b3` `2024-01-22` **other** · docs · kept — Fix the links of BlueLM and SOLAR; no numbers stated; `score 0`
+- `3e601f9a5d` `2024-01-22` **mtp** · knob · kept — Support speculative decoding in bigdl-llm; no numbers stated; `score 1`
+- `7b1d9ad7c0` `2024-01-23` **attention** · kernel · kept — limit esimd sdp usage for k_len < 8; no numbers stated; `score 2`
+- `dacf680294` `2024-01-23` **attention** · fusion · kept — add fused rotary pos emb for qwen; no numbers stated; `score 2`
+- `39219b7e9a` `2024-01-23` **other** · knob · kept — add default device meta  when lcmu enabled; no numbers stated; `score 1`
+- `27b19106f3` `2024-01-23` **mtp** · other · kept — add readme for speculative decoding gpu examples; no numbers stated; `score 0`
+- `301425e377` `2024-01-23` **other** · other · kept — harness tests on pvc multiple xpus; no numbers stated; `score 0`
+- `052962dfa5` `2024-01-23` **other** · sched · kept — Using original fastchat and add bigdl worker in docker image; no numbers stated; `score 0`
+- `da4687c917` `2024-01-23` **attention** · fix · kept — fix fp16; no numbers stated; `score 1`
+- `60b35db1f1` `2024-01-23` **mtp** · other · kept — add chatglm3 speculative decoding example; no numbers stated; `score 0`
+- `36c665667d` `2024-01-23` **mtp** · other · kept — Add logits processor & qwen eos stop in speculative decoding; no numbers stated; `score 1`
+- `5aa4b32c1b` `2024-01-23` **other** · other · kept — Add qwen spec gpu example; no numbers stated; `score 0`
+- `2c8a9aaf0d` `2024-01-23` **quant** · fix · kept — fix qwen causal mask when quantize_kv_cache=True; no numbers stated; `score 1`
+- `be5836bee1` `2024-01-23` **other** · fix · kept — fix outlier value; no numbers stated; `score 0`
+- `f82782cd3b` `2024-01-23` **attention** · fix · kept — fix starcoder; no numbers stated; `score 1`
+- `8d28aa8e2b` `2024-01-23` **other** · fix · kept — Fix the model.device problem when `cpu_embedding=True`; no numbers stated; `score 1`
+- `50a851e3b3` `2024-01-23` **other** · other · kept — separate arc ut for disable XMX; no numbers stated; `score 0`
+- `a2718038f7` `2024-01-24` **other** · fix · kept — Fix qwen model adapter in docker; no numbers stated; `score 0`
+- `de27ddd81a` `2024-01-24` **other** · other · kept — Update Dockerfile; no numbers stated; `score 0`
+- `e0db44dcb6` `2024-01-24` **other** · fix · kept — fix unexpected keyword argument 'device'; no numbers stated; `score 1`
+- `bc9cff51a8` `2024-01-24` **other** · knob · kept — LLM GPU Example Update for Windows Support; no numbers stated; `score 0`
+- `ec2d9de0ea` `2024-01-24` **other** · fix · kept — Fix README.md for solar; no numbers stated; `score 0`
+- `b176cad75a` `2024-01-24` **other** · other · kept — Add baichuan2 gpu spec example; no numbers stated; `score 0`
+- `d4f65a6033` `2024-01-24` **mtp** · other · kept — add mistral speculative example; no numbers stated; `score 0`
+- `b27e5a27b9` `2024-01-24` **gemm** · other · removed — Remove the check for meta device in _replace_with_low_bit_linear; no numbers stated; `score 1`
+- `3bc3d0bbcd` `2024-01-24` **mtp** · docs · kept — Update self-speculative readme; no numbers stated; `score 0`
+- `27338540c3` `2024-01-25` **other** · fix · kept — Fix repetition_penalty not activated issue; no numbers stated; `score 1`
+- `99ff6cf048` `2024-01-25` **other** · docs · kept — Update gpu spec decoding baichuan2 example dependency; no numbers stated; `score 0`
+- `51aa8b62b2` `2024-01-25` **other** · sched · kept — add gradio_web_ui to llm-serving image; no numbers stated; `score 0`
+- `9bff84e6fd` `2024-01-25` **other** · other · kept — Convert draft_model kv_cache from bf16 to fp32; no numbers stated; `score 1`
+- `86055d76d5` `2024-01-25` **other** · fix · kept — fix optimize_model not working; no numbers stated; `score 0`
+- `bf65548d29` `2024-01-25` **kv** · knob · kept — Add quantize kv cache support for chaglm2/3; no numbers stated; `score 1`
+- `093e6f8f73` `2024-01-25` **mtp** · other · kept — Add qwen CPU speculative example; no numbers stated; `score 0`
+- `8b08ad408b` `2024-01-25` **other** · other · kept — Add batch_size in all_in_one; no numbers stated; `score 0`
+- `24b34b6e46` `2024-01-25` **attention** · kernel · kept — change xmx condition; no numbers stated; `score 2`
+- `175027c90f` `2024-01-25` **other** · docs · kept — Small clarification for windows installation guide; no numbers stated; `score 0`
+- `171fb2d185` `2024-01-25` **other** · other · kept — reorganize GPU finetuning examples; no numbers stated; `score 0`
+- `762adc4f9d` `2024-01-25` **other** · other · kept — Reformat summary table; no numbers stated; `score 0`
+- `aae1870096` `2024-01-26` **kv** · fix · kept — fix qwen kv cache length; no numbers stated; `score 1`
+- `98ea3459e5` `2024-01-26` **attention** · fix · kept — LLM : Fix llama draft_model dtype error; no numbers stated; `score 1`
+- `a00efa0564` `2024-01-26` **gemm** · fusion · kept — mlp and qkv fusion for FP16 Llama-7B (mm_qkv_out); no numbers stated; `score 3`
+- `f0da0c131b` `2024-01-26` **other** · other · kept — Disable llama2 optimize model true or false test for now in Arc UTs; no numbers stated; `score 0`
+- `421e7cee80` `2024-01-26` **attention** · knob · kept — Add Text_Generation_WebUI Support; no numbers stated; `score 0`
+- `7952bbc919` `2024-01-26` **other** · other · kept — add conf batch_size to run_model; no numbers stated; `score 0`
+- `1eaaace2dc` `2024-01-26` **other** · other · kept — Update perf test all-in-one config for batch_size arg; no numbers stated; `score 0`
+- `e5ae6f2c13` `2024-01-26` **other** · fix · kept — fix truncation logic of past_key_values in chatglm multi turn chat; no numbers stated; `score 0`
+- `9e18ea187f` `2024-01-26` **kv** · other · kept — Avoid KV Cache OOM when seq len is larger than 1; no numbers stated; `score 1`
+- `a3322e2a6c` `2024-01-26` **quant** · kernel · kept — add fp8 e5 to use_xmx; no numbers stated; `score 2`
+- `d720554d43` `2024-01-29` **kv** · knob · kept — simplify quantize kv cache api; no numbers stated; `score 1`
+- `c6d4f91777` `2024-01-29` **mem** · knob · kept — Add UTs of load_low_bit for transformers-style API; no numbers stated; `score 0`
+- `440cfe18ed` `2024-01-29` **other** · other · kept — GPU Example Updates for Windows; no numbers stated; `score 0`
+- `f37e4702bc` `2024-01-29` **other** · other · kept — Use IPEX Optimization for BF16 Model; no numbers stated; `score 1`
+- `cc3f122f6a` `2024-01-29` **mtp** · other · kept — Baichuan2 CPU example of speculative decoding; no numbers stated; `score 0`
+- `824c8029d7` `2024-01-29` **attention** · fix · kept — Fix "local variable 'model' referenced before assignment"; no numbers stated; `score 1`
+- `a5c9dfdf91` `2024-01-29` **other** · docs · kept — Main readme gpu installation related updates; no numbers stated; `score 0`
+- `ccf8f613fb` `2024-01-29` **gemm** · other · kept — update fp16 Linear on ARC/FLEX; no numbers stated; `score 1`
+- `f57d0fda8b` `2024-01-30` **mtp** · other · kept — Use IPEX Optimization for Self Speculative Decoding; no numbers stated; `score 1`
+- `7dfa6dbe46` `2024-01-30` **attention** · other · kept — add rwkv time shift optimization; no numbers stated; `score 1`
+- `6b63ba23d1` `2024-01-30` **other** · other · kept — add full module name during convert; no numbers stated; `score 1`
+- `13e61738c5` `2024-01-30` **mem** · instr · kept — hide detail memory for each token in benchmark_utils.py; no numbers stated; `score 0`
+- `226f398c2a` `2024-01-30` **other** · fix · kept — fix ppl test errors; no numbers stated; `score 0`
+- `9978089796` `2024-01-30` **mtp** · knob · kept — Enable BIGDL_OPT_IPEX in speculative baichuan2 13b example; no numbers stated; `score 0`
+- `863c3f94d0` `2024-01-30` **other** · other · kept — Change nightly perf to install from pypi; no numbers stated; `score 0`
+- `2a0d65a009` `2024-01-30` **other** · docs · kept — Bump aiohttp from 3.9.0 to 3.9.2 to resolve security issues; no numbers stated; `score 0`
+- `0fcad6ce14` `2024-01-30` **other** · other · kept — add gpu example for redpajama models; no numbers stated; `score 0`
+- `b1ff28ceb6` `2024-01-31` **mtp** · other · kept — LLama2 CPU example of speculative decoding; no numbers stated; `score 0`
+- `53a5140eff` `2024-01-31` **attention** · other · kept — Optimize rwkv v5 rest token again; no numbers stated; `score 1`
+- `3685622f29` `2024-01-31` **attention** · fix · kept — fix llama 4.36 forward; no numbers stated; `score 1`
+- `fb53b994f8` `2024-01-31` **other** · other · kept — LLM : Add llama ipex optimized; no numbers stated; `score 0`
+- `7e5cd42a5c` `2024-01-31` **other** · other · kept — LLM : Update optimize ipex bf16; no numbers stated; `score 1`
+- `7284edd9b7` `2024-01-31` **mtp** · other · kept — Vicuna CPU example of speculative decoding; no numbers stated; `score 0`
+- `95636cad97` `2024-01-31` **other** · other · kept — Add AutoGen CPU and XPU Example; no numbers stated; `score 0`
+- `a9018a0e95` `2024-01-31` **other** · docs · kept — modify the GPU example for redpajama model; no numbers stated; `score 0`
+- `8c8fc148c9` `2024-01-31` **other** · other · kept — add rwkv 5; no numbers stated; `score 0`
+- `9724939499` `2024-01-31` **mem** · other · kept — temporarily disable bloom 2k input; no numbers stated; `score 0`
+- `d2d3f6b091` `2024-01-31` **other** · other · kept — ensure the result of daily arc perf test; no numbers stated; `score 0`
+- `4b92235bdb` `2024-02-01` **other** · other · kept — add initial FAQ page; no numbers stated; `score 0`
+- `72e67eedbb` `2024-02-01` **mtp** · knob · kept — Add speculative support in docker; no numbers stated; `score 0`
+- `3ca03d4e97` `2024-02-01` **mtp** · other · kept — Add deepmind sample into bigdl-llm speculative decoding; no numbers stated; `score 1`
+- `968e70544d` `2024-02-01` **mtp** · knob · kept — Enable IPEX Mistral in Speculative; no numbers stated; `score 1`
+- `601024f418` `2024-02-01` **mtp** · other · kept — Mistral CPU example of speculative decoding; no numbers stated; `score 0`
+- `aae20d728e` `2024-02-01` **other** · other · kept — Add initial DPO finetuning example; no numbers stated; `score 0`
+- `6e0f1a1e92` `2024-02-01` **moe** · other · kept — use apply_rotary_pos_emb_cache_freq_xpu in mixtral; no numbers stated; `score 1`
+- `19183ef476` `2024-02-01` **other** · knob · kept — Reset bigdl-llm loader options with default value; no numbers stated; `score 0`
+- `2927c77d7f` `2024-02-01` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `77be19bb97` `2024-02-02` **mtp** · knob · kept — Support gpt-j in speculative decoding; no numbers stated; `score 0`
+
+*Commits 2001-2100 (2024-01-18..2024-02-02): scores 0/1/2/3 = 59/36/4/1; areas other 51, mtp 19, attention 13, mem 6.*
+
+- `91cf9d41d0` `2024-02-04` **other** · docs · kept — add solutions of some frequently asked questions; no numbers stated; `score 0`
+- `428b7105f6` `2024-02-04` **attention** · other · kept — Add HF and PyTorch example InternLM2; no numbers stated; `score 0`
+- `698f84648c` `2024-02-04` **other** · other · kept — split stable version tests; no numbers stated; `score 0`
+- `738275761d` `2024-02-04` **other** · sched · kept — In llm-harness-evaluation, add new models and change schedule to nightly; no numbers stated; `score 0`
+- `8e33cb0f38` `2024-02-04` **other** · knob · kept — support speecht5_tts; no numbers stated; `score 1`
+- `f9a468a2c7` `2024-02-04` **other** · other · kept — conditionally choose python version for unit test; no numbers stated; `score 0`
+- `90f004b80b` `2024-02-04` **other** · sched · removed — remove benchmarkwrapper form deepspeed example; no numbers stated; `score 0`
+- `7e49fbc5dd` `2024-02-04` **other** · other · kept — make finetuning examples more common for other models; no numbers stated; `score 0`
+- `136f042f84` `2024-02-04` **other** · other · kept — Make sure python 310-311 tests only happen for nightly tests; no numbers stated; `score 0`
+- `c2e562d037` `2024-02-04` **other** · other · kept — add batch_size to the csv and html; no numbers stated; `score 0`
+- `9050991e4e` `2024-02-04` **other** · fix · kept — fix gradio check issue temply; no numbers stated; `score 0`
+- `f8dcaff7f4` `2024-02-05` **other** · knob · kept — use default python; no numbers stated; `score 0`
+- `ad050107b3` `2024-02-05` **mem** · fix · kept — fix mpt load_low_bit issue; no numbers stated; `score 1`
+- `676d6923f2` `2024-02-05` **other** · other · kept — modify transformersembeddings.embed() in langchain; no numbers stated; `score 0`
+- `7d2be7994f` `2024-02-05` **moe** · other · kept — add phixtral and optimize phi-moe; no numbers stated; `score 0`
+- `0aecd8637b` `2024-02-05` **other** · fix · kept — small fix for the html script; no numbers stated; `score 0`
+- `4b02ff188b` `2024-02-05` **other** · other · kept — Add prompt format and stopping words for Qwen; no numbers stated; `score 0`
+- `33b9e7744d` `2024-02-05` **attention** · fix · kept — fix dimension; no numbers stated; `score 1`
+- `36c9442c6d` `2024-02-06` **other** · other · kept — Arc Stable version test; no numbers stated; `score 0`
+- `bc92dbf7be` `2024-02-06` **other** · sched · removed — remove stableml;change schedule;change storage method; no numbers stated; `score 0`
+- `f440cb4fba` `2024-02-06` **mtp** · docs · kept — Update Self-Speculative Decoding Readme; no numbers stated; `score 0`
+- `5edefe7d8e` `2024-02-06` **other** · other · removed — remove nightly summary job; no numbers stated; `score 0`
+- `2c75b5b981` `2024-02-06` **other** · other · removed — remove mistral in pr job; no numbers stated; `score 0`
+- `94723bb0b1` `2024-02-06` **other** · other · kept — add retry in run llm install part;test arc05 with llama2; no numbers stated; `score 0`
+- `d11ef0d117` `2024-02-06` **other** · other · removed — remove retry in llm install part; no numbers stated; `score 0`
+- `d61f4905ac` `2024-02-06` **quant** · knob · kept — 2bit quantization initial support; no numbers stated; `score 1`
+- `518ef95abc` `2024-02-06` **other** · fix · kept — Small fix for Nonetype error; no numbers stated; `score 1`
+- `3a46b57253` `2024-02-06` **other** · other · kept — Add RWKV4 HF GPU Example; no numbers stated; `score 0`
+- `2aaa21c41d` `2024-02-06` **other** · other · kept — Update ppl tests; no numbers stated; `score 0`
+- `0eccb94d75` `2024-02-06` **attention** · other · removed — remove text-generation-webui from bigdl repo; no numbers stated; `score 0`
+- `e2233dddef` `2024-02-06` **other** · docs · kept — Update README; no numbers stated; `score 0`
+- `2c4e610743` `2024-02-06` **other** · other · removed — remove irrelevant code; no numbers stated; `score 0`
+- `e627727b4b` `2024-02-06` **other** · other · kept — change download path; no numbers stated; `score 0`
+- `f63eba6c5a` `2024-02-06` **other** · other · kept — change pr test machine; no numbers stated; `score 0`
+- `3f60e9df89` `2024-02-07` **other** · other · kept — Merge pull request #10101 from pengyb2001/eval_stat; no numbers stated; `score 0`
+- `8953acd7d6` `2024-02-07` **other** · fix · kept — Fix log condition for BIGDL_OPT_IPEX; no numbers stated; `score 1`
+- `2f4c754759` `2024-02-07` **other** · other · kept — add bark gpu example; no numbers stated; `score 0`
+- `d3d2ee1b63` `2024-02-07` **other** · other · kept — add speech T5 GPU example; no numbers stated; `score 0`
+- `63050c954d` `2024-02-07` **other** · docs · kept — fix; no numbers stated; `score 0`
+- `5e9710cec4` `2024-02-07` **other** · other · kept — Update threshold for cpu stable version tests; no numbers stated; `score 0`
+- `3832eb0ce0` `2024-02-07` **other** · other · kept — Add ChatGLM C-Eval Evaluator; no numbers stated; `score 0`
+- `2e80701f58` `2024-02-07` **attention** · other · kept — Unit test on final logits and the logits of the last attention layer; no numbers stated; `score 0`
+- `c1ec3d8921` `2024-02-07` **other** · docs · kept — update FAQ about too many open files; no numbers stated; `score 0`
+- `1710ecb990` `2024-02-07` **other** · other · kept — Add llm-ppl workflow; no numbers stated; `score 0`
+- `925f82107e` `2024-02-07` **other** · knob · kept — support models hosted by modelscope; no numbers stated; `score 1`
+- `9f5a86f9db` `2024-02-07` **other** · fix · kept — fix OpenSSF Token-Permissions issues; no numbers stated; `score 0`
+- `0fcfbfaf6f` `2024-02-07` **mtp** · other · kept — add rwkv5 eagle GPU HF example; no numbers stated; `score 0`
+- `76bd792ff1` `2024-02-07` **other** · fix · kept — Fix llm ppl workflow workflow_dispatch bugs; no numbers stated; `score 0`
+- `b4c327ea78` `2024-02-07` **other** · fix · kept — Llm ppl workflow bug fix; no numbers stated; `score 0`
+- `a7f9a13f6e` `2024-02-07` **other** · docs · kept — Enhance gpu doc with PIP install oneAPI; no numbers stated; `score 0`
+- `81ed65fbe7` `2024-02-07` **other** · other · kept — Add qwen1.5-7B in iGPU perf; no numbers stated; `score 0`
+- `a8450fc300` `2024-02-08` **attention** · knob · kept — Support MLP optimization for Qwen1.5; no numbers stated; `score 1`
+- `1aa0c623ce` `2024-02-08` **attention** · fusion · kept — disable fused layer norm on UHD; no numbers stated; `score 2`
+- `0cf6a12691` `2024-02-08` **other** · knob · kept — add default torch_dtype for fp16.; no numbers stated; `score 1`
+- `11fe5a87ec` `2024-02-08` **other** · other · kept — add Modelscope model example; no numbers stated; `score 0`
+- `063dc145ac` `2024-02-08` **other** · knob · kept — basic support for q2k; no numbers stated; `score 1`
+- `3f79128ed7` `2024-02-08` **attention** · knob · kept — Enable kv_cache optimization for Qwen2 on transformers-v4.37.0; no numbers stated; `score 1`
+- `d848efe17c` `2024-02-08` **kv** · knob · kept — add quantize kv cache support for qwen2; no numbers stated; `score 1`
+- `39d90839aa` `2024-02-08` **kv** · kernel · kept — quantized KV cache and quantize_qkv for llama; no numbers stated; `score 2`
+- `4d33aac7f9` `2024-02-08` **kv** · fix · kept — quick fix qwen2 fp8 kv cache; no numbers stated; `score 1`
+- `c2378a9546` `2024-02-08` **other** · fix · kept — Fix code scanning issues; no numbers stated; `score 0`
+- `b4dc33def6` `2024-02-08` **other** · other · kept — In harness-evaluation workflow, add statistical tables; no numbers stated; `score 0`
+- `b7c5104d98` `2024-02-09` **other** · other · removed — remove limit in harness run; no numbers stated; `score 0`
+- `7400401706` `2024-02-09` **other** · docs · kept — Update gpu pip install oneapi doc; no numbers stated; `score 0`
+- `1508d6b089` `2024-02-18` **kv** · fix · kept — Fix gptj kvcache & position id; no numbers stated; `score 1`
+- `c3daacec6d` `2024-02-18` **other** · fix · kept — Fix Token Permission issues; no numbers stated; `score 0`
+- `7a3a20cf5b` `2024-02-18` **other** · fix · kept — Fix: GitHub-owned GitHubAction not pinned by hash; no numbers stated; `score 0`
+- `6f38e604de` `2024-02-18` **other** · docs · kept — Fix README.md; no numbers stated; `score 0`
+- `177273c1a4` `2024-02-19` **mtp** · knob · kept — IPEX Speculative Support for Baichuan2 7B; no numbers stated; `score 0`
+- `f2417e083c` `2024-02-19` **other** · knob · kept — enable chatglm3-6b target_model ipex; no numbers stated; `score 1`
+- `d3591383d5` `2024-02-19` **mtp** · other · kept — LLM : Add CPU chatglm3 speculative example; no numbers stated; `score 0`
+- `14ba2c5135` `2024-02-19` **other** · other · removed — Harness: remove deprecated files; no numbers stated; `score 0`
+- `23c91cdce6` `2024-02-19` **mtp** · other · kept — Add min_step_draft in speculative decoding; no numbers stated; `score 1`
+- `6952847f68` `2024-02-19` **other** · docs · kept — GPU install doc - add pip install oneAPI for windows; no numbers stated; `score 0`
+- `3e2af5ec0a` `2024-02-19` **mtp** · fix · kept — Fix IPEX Baichuan Speculative; no numbers stated; `score 1`
+- `f8730e8dc1` `2024-02-19` **gemm** · other · kept — Skip rescale rwkv linear when load_low_bit; no numbers stated; `score 1`
+- `50fa004ba5` `2024-02-19` **other** · other · kept — Specify the version of pandas in harness evaluation workflow; no numbers stated; `score 0`
+- `209122559a` `2024-02-19` **other** · other · kept — Add Ceval workflow and modify the result printing; no numbers stated; `score 0`
+- `6c09aed90d` `2024-02-19` **other** · other · kept — add qwen_1.5_7b model for arc perf test; no numbers stated; `score 0`
+- `e31210ba00` `2024-02-19` **other** · other · kept — Modify html table style and add fp16.csv in harness; no numbers stated; `score 0`
+- `1f6d5b9f30` `2024-02-20` **attention** · fusion · kept — enable fused rmsnorm and rope qwen2; no numbers stated; `score 2`
+- `2bb96c775c` `2024-02-20` **other** · fix · kept — fix device setting during saving optimized model; no numbers stated; `score 1`
+- `71875ebc24` `2024-02-20` **other** · fix · kept — Fix the C-Eval nightly test trigger time; no numbers stated; `score 0`
+- `add3899311` `2024-02-20` **other** · other · kept — Add ziya CPU example; no numbers stated; `score 0`
+- `6e10d98a8d` `2024-02-20` **other** · fix · kept — Fix some typos; no numbers stated; `score 0`
+- `eca69a6022` `2024-02-20` **other** · fix · kept — Fix build error of bigdl-llm-cpu; no numbers stated; `score 0`
+- `3288acb8de` `2024-02-20` **quant** · knob · kept — LLM : Support embedding quantization (only q2k now); no numbers stated; `score 1`
+- `b55fd00fb1` `2024-02-20` **other** · knob · removed — remove include and language option, select the corresponding dataset based on the model name in Run; no numbers stated; `score 0`
+- `de3dc609ee` `2024-02-20` **other** · other · kept — Modify harness evaluation workflow; no numbers stated; `score 0`
+- `4fbf449c2d` `2024-02-21` **other** · other · kept — for rwkv4; no numbers stated; `score 1`
+- `276ef0e885` `2024-02-21` **mtp** · other · kept — Speculative Ziya on CPU; no numbers stated; `score 0`
+- `001c13243e` `2024-02-21` **other** · instr · kept — Add support for `low_low_bit` benchmark on Windows GPU; no numbers stated; `score 0`
+- `39d37bd042` `2024-02-21` **other** · other · kept — upgrade harness package version in workflow; no numbers stated; `score 0`
+- `56ad781f2f` `2024-02-21` **attention** · fix · kept — qwen2 cpu fix; no numbers stated; `score 1`
+- `c7e839e66c` `2024-02-21` **other** · other · kept — Add Qwen1.5-7B-Chat; no numbers stated; `score 0`
+- `b1a97b71a9` `2024-02-21` **other** · fix · kept — Harness eval: Add is_last parameter and fix logical operator in highlight_vals; no numbers stated; `score 0`
+- `079f2011ea` `2024-02-21` **other** · other · kept — Update bigdl-llm-finetune-qlora-xpu Docker Image; no numbers stated; `score 0`
+- `f7c96b19ef` `2024-02-21` **moe** · knob · kept — support iq2 for mixtral; no numbers stated; `score 1`
+- `4655005f24` `2024-02-21` **other** · docs · kept — Update README; no numbers stated; `score 0`
+- `9975b029c5` `2024-02-21` **other** · other · kept — add qlora finetuning example using `trl.SFTTrainer`; no numbers stated; `score 0`
+
+*Commits 2101-2200 (2024-02-04..2024-02-21): scores 0/1/2/3 = 74/23/3/0; areas other 74, attention 9, mtp 7, kv 4.*
+
+- `5b387bb71a` `2024-02-21` **other** · other · kept — Change the nightly test time of ppl and harness; no numbers stated; `score 0`
+- `94cb16fe40` `2024-02-21` **other** · docs · kept — Small updates to Win GPU Install Doc; no numbers stated; `score 0`
+- `7cbc2429a6` `2024-02-22` **other** · fix · kept — Fix C-Eval ChatGLM loading issue; no numbers stated; `score 0`
+- `34ee1aa91f` `2024-02-22` **attention** · kernel · kept — add esimd sdp support for chatglm3; no numbers stated; `score 2`
+- `ca1166a0e5` `2024-02-22` **quant** · other · kept — Add quantize kv_cache for Baichuan2-13B; no numbers stated; `score 1`
+- `60e11b6739` `2024-02-22` **other** · other · kept — Add mlp layer unit tests; no numbers stated; `score 0`
+- `21de2613ce` `2024-02-22` **other** · instr · kept — Add model loading time record for all-in-one benchmark; no numbers stated; `score 0`
+- `5e1fee5e05` `2024-02-22` **other** · other · kept — add GGUF-IQ2 examples; no numbers stated; `score 1`
+- `c876d9b5ca` `2024-02-22` **attention** · knob · kept — Support for MPT rotary embedding; no numbers stated; `score 1`
+- `f445217d02` `2024-02-22` **other** · other · kept — Update IPEX to 2.2.0+cpu and Refactor for _ipex_optimize; no numbers stated; `score 0`
+- `ce5840a8b7` `2024-02-22` **attention** · other · kept — GPT-J rope optimization on xpu; no numbers stated; `score 1`
+- `84d5f40936` `2024-02-22` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `63681af97e` `2024-02-22` **attention** · other · kept — falcon for transformers 4.36; no numbers stated; `score 1`
+- `30795bdfbc` `2024-02-23` **attention** · kernel · kept — Gemma optimization: rms_norm, kv_cache, fused_rope, fused_rope+qkv; no numbers stated; `score 2`
+- `f315c7f93a` `2024-02-23` **other** · other · kept — Move harness nightly related files to llm/test folder; no numbers stated; `score 0`
+- `40584dec6d` `2024-02-23` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `f1f4094a09` `2024-02-23` **other** · other · kept — Add CPU and GPU examples of phi-2; no numbers stated; `score 0`
+- `a2c1675546` `2024-02-23` **other** · other · kept — Add CPU and GPU examples for Yuan2-2B-hf; no numbers stated; `score 0`
+- `f7e2591f15` `2024-02-23` **other** · other · kept — change IPEX230 to IPEX220 in dockerfile; no numbers stated; `score 0`
+- `aabfc06977` `2024-02-23` **gemm** · kernel · kept — add gemma example; no numbers stated; `score 0`
+- `19260492c7` `2024-02-23` **other** · fix · kept — fix action/installation error of mpmath; no numbers stated; `score 0`
+- `e08c74f1d1` `2024-02-23` **other** · fix · kept — Fix build error of bigdl-llm-cpu; no numbers stated; `score 0`
+- `8472de90e8` `2024-02-23` **other** · other · kept — use stable lm to test pr; no numbers stated; `score 0`
+- `9c8e349196` `2024-02-23` **other** · other · removed — remove harness job output; no numbers stated; `score 0`
+- `5399343adc` `2024-02-23` **other** · fix · kept — fix harness installation; no numbers stated; `score 0`
+- `e1fcf54a0c` `2024-02-23` **other** · other · kept — reformat; no numbers stated; `score 0`
+- `02cb96e7f6` `2024-02-23` **other** · fix · kept — fix Run Harness job; no numbers stated; `score 0`
+- `bfa98666a6` `2024-02-23` **other** · other · kept — fall back to make_table.py; no numbers stated; `score 0`
+- `6fe5344fa6` `2024-02-23` **other** · other · kept — separate make_csv from the file; no numbers stated; `score 0`
+- `88f7f56980` `2024-02-23` **other** · other · kept — rewrite html visualization; no numbers stated; `score 0`
+- `e838ec9e14` `2024-02-23` **other** · other · removed — remove dependency; no numbers stated; `score 0`
+- `8ef5482da2` `2024-02-23` **gemm** · docs · kept — update Gemma readme; no numbers stated; `score 0`
+- `e511bbd8f1` `2024-02-23` **attention** · other · kept — Add basic optimization framework for Yuan2; no numbers stated; `score 1`
+- `4fdf96dc8b` `2024-02-23` **other** · fix · kept — fix ACC_FOLDER; no numbers stated; `score 0`
+- `a204337cad` `2024-02-23` **other** · other · kept — Rename results; no numbers stated; `score 0`
+- `eeecd9fc08` `2024-02-23` **attention** · fix · kept — Python style fix; no numbers stated; `score 1`
+- `28513f3978` `2024-02-23` **attention** · fusion · kept — support fp16 embedding & add mlp fusion for iq2_xxs; no numbers stated; `score 2`
+- `a55cc91e1f` `2024-02-23` **other** · fix · kept — fix make_csv.py; no numbers stated; `score 0`
+- `85d13c65de` `2024-02-24` **other** · other · kept — run one job only if triggered by pr; no numbers stated; `score 0`
+- `213ef06691` `2024-02-24` **other** · docs · kept — fix readme; no numbers stated; `score 0`
+- `0c6aef0f47` `2024-02-26` **other** · other · kept — Add einops dependency for C-Eval; no numbers stated; `score 0`
+- `85a99e13e8` `2024-02-26` **mtp** · fix · kept — Fix ChatGLM3 Speculative Example; no numbers stated; `score 0`
+- `df2f3885ba` `2024-02-26` **attention** · knob · kept — Enable kv_cache and forward_qkv optimizations for yuan2; no numbers stated; `score 1`
+- `7c236e4c6d` `2024-02-26` **other** · docs · kept — quick start for windows with gpu; no numbers stated; `score 0`
+- `62350a36f0` `2024-02-26` **other** · fix · kept — fix if in update html; no numbers stated; `score 0`
+- `ea23afc8ec` `2024-02-26` **other** · docs · kept — update ipex part in mistral example readme; no numbers stated; `score 0`
+- `5ad752bae8` `2024-02-26` **other** · other · kept — Separate llmcpp build of linux and windows; no numbers stated; `score 0`
+- `e38e29511c` `2024-02-26` **attention** · other · kept — Yuan2 MLP and Rotary optimization; no numbers stated; `score 1`
+- `3e6d188553` `2024-02-26` **other** · other · kept — add baichuan2-13b to mtl perf; no numbers stated; `score 0`
+- `f9b75f900b` `2024-02-26` **other** · knob · kept — Enable qwen target_model ipex; no numbers stated; `score 0`
+- `15ad2fd72e` `2024-02-26` **other** · other · kept — Merge pull request #10226 from zhentaocc/fix_harness; no numbers stated; `score 0`
+- `6c74b99a28` `2024-02-26` **other** · other · kept — Update qwen readme; no numbers stated; `score 0`
+- `a47989c860` `2024-02-26` **attention** · other · kept — optimize yuan 2.0 performance; no numbers stated; `score 1`
+- `36a9e88104` `2024-02-27` **mtp** · other · kept — Speculative Starcoder on CPU; no numbers stated; `score 0`
+- `38ae4b372f` `2024-02-27` **other** · other · kept — Add yuan2-2b to win igpu perf test; no numbers stated; `score 0`
+- `04a6b0040c` `2024-02-27` **other** · docs · kept — Windows GPU Install Quickstart update; no numbers stated; `score 0`
+- `843fe546b0` `2024-02-27` **other** · other · kept — Add CPU and GPU examples for DeciLM-7B; no numbers stated; `score 0`
+- `b88f447974` `2024-02-27` **other** · docs · kept — fix typo and change wording; no numbers stated; `score 0`
+- `03b9c4930a` `2024-02-27` **other** · knob · kept — UX: Script to print env info; no numbers stated; `score 0`
+- `b4fa4ab46f` `2024-02-27` **attention** · other · kept — optimize yuan 2.0 again; no numbers stated; `score 1`
+- `6d60982746` `2024-02-27` **other** · knob · kept — Env script: add license; no numbers stated; `score 0`
+- `cba61a2909` `2024-02-27` **other** · other · kept — Add html report of ppl; no numbers stated; `score 0`
+- `d85f7c78df` `2024-02-27` **other** · fix · kept — Small fix for better trail; no numbers stated; `score 0`
+- `c581c6db30` `2024-02-27` **quant** · other · kept — draft mmint4; no numbers stated; `score 1`
+- `f4a2e32106` `2024-02-27` **sync** · other · kept — Stream llm example for both GPU and CPU; no numbers stated; `score 0`
+- `308e637d0d` `2024-02-28` **moe** · other · kept — Add DeepSeek-MoE-16B-Chat; no numbers stated; `score 1`
+- `4833067489` `2024-02-28` **other** · docs · kept — fix GPU example link in README.md; no numbers stated; `score 0`
+- `937e1f7c74` `2024-02-28` **other** · other · kept — rebase; no numbers stated; `score 0`
+- `2347f611cf` `2024-02-28` **other** · other · kept — Add cpu and gpu examples of Mamba; no numbers stated; `score 0`
+- `2524273198` `2024-02-28` **other** · docs · kept — Update AutoGen README; no numbers stated; `score 0`
+- `59861f73e5` `2024-02-28` **moe** · other · kept — Add Deepseek-6.7B; no numbers stated; `score 0`
+- `6930422b42` `2024-02-28` **other** · other · kept — Add rwkv example; no numbers stated; `score 0`
+- `db0d129226` `2024-02-28` **other** · revert · reverted — Revert "Add rwkv example (#9432)"; no numbers stated; `score 0`
+- `a4de3095f3` `2024-02-28` **kv** · knob · kept — Support quantize kv cache in mistral.; no numbers stated; `score 1`
+- `7244fd1ba5` `2024-02-28` **attention** · fix · kept — Fix Arc StarCoder wrong query_shape when input is long; no numbers stated; `score 1`
+- `cccb02dad1` `2024-02-28` **attention** · fix · kept — fix baichuan2 13b 2k input; no numbers stated; `score 1`
+- `925aff730e` `2024-02-28` **other** · other · kept — Integrate the result of ppl and harness; no numbers stated; `score 0`
+- `1572b6f7c3` `2024-02-29` **other** · docs · kept — Add quickstart; no numbers stated; `score 0`
+- `07f36fbfcc` `2024-02-29` **attention** · fix · kept — Fix gptj failed to extend; no numbers stated; `score 1`
+- `4b08bc1417` `2024-02-29` **attention** · other · kept — relax batch check of flash atttention by double check attention mask; no numbers stated; `score 1`
+- `653cb500ed` `2024-02-29` **other** · docs · kept — Add webUI quickstart; no numbers stated; `score 0`
+- `43dac97e03` `2024-02-29` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `6fb65bb9d2` `2024-02-28` **other** · fix · kept — fix in transformers 4.36; no numbers stated; `score 0`
+- `a9fd20b6ba` `2024-02-29` **attention** · fusion · kept — Update qkv fusion for GGUF-IQ2; no numbers stated; `score 2`
+- `5d7243067c` `2024-02-29` **other** · other · kept — add Baichuan2-13B-Chat 2048-256 to MTL perf; no numbers stated; `score 0`
+- `4e6cc424f1` `2024-02-29` **other** · other · kept — Add LlamaIndex RAG; no numbers stated; `score 0`
+- `a2ed4d714e` `2024-02-29` **other** · sched · kept — Fix vllm service error; no numbers stated; `score 0`
+- `13b0bc9075` `2024-02-29` **quant** · other · kept — Add quantize_kv optimization for yuan2 model; no numbers stated; `score 1`
+- `2d930bdca8` `2024-02-29` **attention** · sched · kept — Add vLLM bf16 support; no numbers stated; `score 0`
+- `232273a1b5` `2024-02-29` **gemm** · kernel · kept — Enable Gemma fused mlp + Gelu; no numbers stated; `score 2`
+- `bcfad555df` `2024-02-29` **other** · docs · kept — revise llamaindex readme; no numbers stated; `score 0`
+- `14814abab8` `2024-02-29` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `90f2f82638` `2024-03-01` **other** · docs · kept — revise webui quickstart; no numbers stated; `score 0`
+- `273de341d7` `2024-03-01` **attention** · fix · kept — hot-fix silu error import; no numbers stated; `score 1`
+- `f0ff0eebe1` `2024-03-01` **kv** · knob · kept — Support quantize kv cache for Baichuan2 7B; no numbers stated; `score 1`
+- `beb9433cec` `2024-03-01` **mtp** · other · kept — Reduce speculative _ipex_optimize_model memory use; no numbers stated; `score 1`
+- `509e206de0` `2024-03-01` **gemm** · docs · kept — update doc about gemma random and unreadable output.; no numbers stated; `score 0`
+- `f4d7dbcde2` `2024-03-01` **attention** · fusion · kept — use fused qkv forward in qwen2; no numbers stated; `score 2`
+- `0ab40917fb` `2024-03-01` **gemm** · other · kept — Split merged_qk to separated q/k linear; no numbers stated; `score 1`
+- `1db20dd1d0` `2024-03-01` **other** · docs · kept — add warmup advice in quickstart; no numbers stated; `score 0`
+
+*Commits 2201-2300 (2024-02-21..2024-03-01): scores 0/1/2/3 = 71/23/6/0; areas other 64, attention 20, gemm 5, quant 3.*
+
+- `367b1db4f7` `2024-03-01` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `27d9a14989` `2024-03-01` **mem** · other · kept — all-on-one update: memory optimize and streaming output; no numbers stated; `score 0`
+- `4cb4db618d` `2024-03-03` **other** · docs · kept — Update WebUI quickstart; no numbers stated; `score 0`
+- `58208a5883` `2024-03-04` **other** · docs · kept — Update FAQ document.; no numbers stated; `score 0`
+- `57e211dab4` `2024-03-04` **other** · other · kept — topLevel 'contents' permission set to 'read'; no numbers stated; `score 0`
+- `ab9fc2485f` `2024-03-04` **quant** · knob · kept — add quantize kv support for llama transformer 4.36; no numbers stated; `score 1`
+- `bab2ee5f9e` `2024-03-04` **other** · other · kept — update nightly spr perf test; no numbers stated; `score 0`
+- `fd81d66047` `2024-03-04` **other** · other · kept — Compress some models to save space; no numbers stated; `score 0`
+- `d45e577d8c` `2024-03-04` **mem** · other · kept — Test `load_low_bit` in iGPU perf test on Windows; no numbers stated; `score 0`
+- `5dbbe1a826` `2024-03-04` **other** · other · kept — Support for new arc ut runner; no numbers stated; `score 0`
+- `fc7f10cd12` `2024-03-05` **other** · other · kept — add langchain gpu example; no numbers stated; `score 0`
+- `1e6f0c6f1a` `2024-03-05` **other** · other · kept — Add llamaindex gpu example; no numbers stated; `score 0`
+- `566e9bbb36` `2024-03-05` **other** · other · kept — Restructure; no numbers stated; `score 0`
+- `30d009bca7` `2024-03-05` **kv** · knob · kept — support quantized kv cache for Mistral in transformers >=4.36.0; no numbers stated; `score 1`
+- `178eea5009` `2024-03-05` **other** · other · kept — upload bigdl-llm wheel to sourceforge for backup; no numbers stated; `score 0`
+- `0011ff9f64` `2024-03-05` **attention** · other · kept — optimize bge large performance; no numbers stated; `score 1`
+- `af11c53473` `2024-03-05` **other** · docs · kept — Add the installation step of postgresql and pgvector on windows in LlamaIndex GPU  support; no numbers stated; `score 0`
+- `cc796848ea` `2024-03-05` **other** · fix · kept — fix typos; no numbers stated; `score 1`
+- `9ea499ca68` `2024-03-06` **mtp** · other · kept — Optimize speculative decoding PVC memory usage; no numbers stated; `score 1`
+- `267de7abc3` `2024-03-06` **other** · fix · kept — fix fschat DEP version error; no numbers stated; `score 0`
+- `fa69fed58f` `2024-03-07` **other** · docs · kept — Small fixes to oneAPI link; no numbers stated; `score 0`
+- `b7db21414e` `2024-03-07` **other** · other · kept — Update llamaindex ut; no numbers stated; `score 0`
+- `496d18ab6d` `2024-03-07` **kv** · knob · kept — add quantize kv cache support for baichuan 7b and 13b.; no numbers stated; `score 1`
+- `0c8d3c9830` `2024-03-07` **other** · other · kept — Add C-Eval HTML report; no numbers stated; `score 0`
+- `1ac193ba02` `2024-03-07` **attention** · other · kept — add rope theta argument; no numbers stated; `score 1`
+- `db00e79cdf` `2024-03-07` **other** · instr · kept — add user guide for benchmarking; no numbers stated; `score 0`
+- `7a621a4db0` `2024-03-08` **other** · fix · kept — Fix device_map bug by raise an error when using device_map=xpu; no numbers stated; `score 1`
+- `370c52090c` `2024-03-08` **other** · docs · kept — Langchain readme; no numbers stated; `score 0`
+- `f1825d7408` `2024-03-08` **other** · other · kept — Add RMSNorm unit test; no numbers stated; `score 0`
+- `2a10b53d73` `2024-03-08` **other** · other · kept — rename docqa.py->rag.py; no numbers stated; `score 0`
+- `9026c08633` `2024-03-08` **other** · fix · kept — Fix llamaindex AutoTokenizer bug; no numbers stated; `score 0`
+- `6829efd350` `2024-03-08` **other** · docs · kept — Change quickstart documentation to use oneapi offline installer; no numbers stated; `score 0`
+- `f4cef95690` `2024-03-08` **other** · docs · kept — some slight modification to benchmark user guide; no numbers stated; `score 0`
+- `be29833b2b` `2024-03-11` **attention** · fix · kept — fix qwen2; no numbers stated; `score 1`
+- `d7b765fd3f` `2024-03-11` **mem** · sched · kept — serving xpu memory opt; no numbers stated; `score 1`
+- `a425eaabfc` `2024-03-11` **other** · fix · kept — fix from_pretrained when device_map=None; no numbers stated; `score 0`
+- `fe27a6971c` `2024-03-11` **other** · docs · kept — update modelscope version; no numbers stated; `score 0`
+- `dbcfc5c2fa` `2024-03-11` **other** · fix · kept — fix error of 'AI-ModelScope/phi-2' hosted by ModelScope hub; no numbers stated; `score 1`
+- `17bdb1a60b` `2024-03-11` **other** · other · kept — add whisper models into nightly test; no numbers stated; `score 0`
+- `cc4148636d` `2024-03-12` **other** · sched · kept — Add initial implementation for loader; no numbers stated; `score 1`
+- `490cbcc897` `2024-03-12` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `cac96b00be` `2024-03-12` **other** · docs · kept — Small fix for benchmark userguide; no numbers stated; `score 0`
+- `146b77f113` `2024-03-12` **other** · fix · kept — fix qlora-finetune Dockerfile; no numbers stated; `score 0`
+- `f9c144dc4c` `2024-03-12` **other** · other · kept — Fix final logits ut failure; no numbers stated; `score 0`
+- `5d996a5caf` `2024-03-12` **other** · sched · kept — add benchmark script for deepspeed autotp on gpu; no numbers stated; `score 0`
+- `5809a3f5fe` `2024-03-12` **other** · other · kept — Add run-hbm.sh & add user guide for spr and hbm; no numbers stated; `score 0`
+- `df2b84f7de` `2024-03-12` **kv** · knob · kept — Enable kv cache on arc batch; no numbers stated; `score 1`
+- `df3bcc0e65` `2024-03-12` **other** · other · removed — remove english_quotes dataset; no numbers stated; `score 0`
+- `5d7e044dbc` `2024-03-12` **gemm** · sched · kept — add low bit option in deepspeed autotp example; no numbers stated; `score 0`
+- `0ded0b4b13` `2024-03-12` **quant** · knob · kept — Enable BigDL IPEX optimization for int4; no numbers stated; `score 0`
+- `741c2bf1df` `2024-03-12` **attention** · other · kept — use new rms norm; no numbers stated; `score 1`
+- `28c4a8cf5c` `2024-03-12` **attention** · fusion · kept — Qwen fused qkv; no numbers stated; `score 2`
+- `c2fb17bd43` `2024-03-12` **other** · docs · kept — update quickstart Windows gpu install guide & other quickstart doc style; no numbers stated; `score 0`
+- `aec83a8be6` `2024-03-13` **other** · docs · kept — Fix user guide indent; no numbers stated; `score 0`
+- `7cf01e6ec8` `2024-03-13` **sync** · other · kept — Add LangChain upstream ut test; no numbers stated; `score 0`
+- `f5d65203c0` `2024-03-13` **other** · other · kept — First token lm_head optimization; no numbers stated; `score 1`
+- `0193f29411` `2024-03-13` **attention** · knob · kept — LLM : Enable  gguf float16 and Yuan2 model; no numbers stated; `score 1`
+- `ca58a69b97` `2024-03-13` **other** · other · kept — fix arc rms norm UT; no numbers stated; `score 0`
+- `d72c0fad0d` `2024-03-13` **attention** · kernel · kept — Qwen2 SDPA forward on CPU; no numbers stated; `score 2`
+- `f158b49835` `2024-03-13` **other** · other · kept — Recover arc ut test for Falcon; no numbers stated; `score 0`
+- `e10de2c42d` `2024-03-13` **mtp** · fix · kept — LLM: Fix condition check error for speculative decoding on CPU; no numbers stated; `score 1`
+- `60043a3ae8` `2024-03-13` **attention** · sched · kept — Support Baichuan2-13b in BigDL-vLLM; no numbers stated; `score 1`
+- `b268baafd6` `2024-03-13` **attention** · kernel · kept — fp8 SDP in llama; no numbers stated; `score 2`
+- `a90e9b6ec2` `2024-03-13` **other** · fix · kept — Fix C-Eval Workflow; no numbers stated; `score 0`
+- `06a851afa9` `2024-03-13` **attention** · knob · kept — support new baichuan model; no numbers stated; `score 1`
+- `9880ddfc17` `2024-03-13` **other** · docs · kept — Update WebUI quickstart; no numbers stated; `score 0`
+- `0dbce53464` `2024-03-13` **other** · other · kept — Add decoder/layernorm unit tests; no numbers stated; `score 0`
+- `2be8bbd236` `2024-03-13` **other** · knob · kept — add cpp option in setup.py; no numbers stated; `score 0`
+- `76e30d8ec8` `2024-03-13` **mem** · other · kept — Empty cache for lm_head; no numbers stated; `score 1`
+- `f66329e35d` `2024-03-14` **other** · fix · kept — Fix multiple get_enable_ipex function error; no numbers stated; `score 1`
+- `f36224aac4` `2024-03-14` **other** · fix · kept — Fix ceval run.sh; no numbers stated; `score 0`
+- `7d29765092` `2024-03-14` **attention** · knob · kept — refactor qwen2 forward to enable XPU; no numbers stated; `score 1`
+- `1c0f7ed3fa` `2024-03-14` **other** · knob · kept — add xpu support; no numbers stated; `score 1`
+- `cda38f85a9` `2024-03-15` **attention** · kernel · kept — Qwen fp16 sdp; no numbers stated; `score 2`
+- `fe8976a00f` `2024-03-15` **other** · fix · kept — Support gguf models use low_bit and fix no json; no numbers stated; `score 0`
+- `b036205be2` `2024-03-15` **attention** · kernel · kept — add fp8 sdp for chatglm2/3; no numbers stated; `score 2`
+- `1315150e64` `2024-03-15` **other** · other · kept — Add baichuan2-13b 1k to arc nightly perf; no numbers stated; `score 0`
+- `24473e331a` `2024-03-15` **attention** · kernel · kept — Qwen2 fp16 sdp; no numbers stated; `score 2`
+- `ca372f6dab` `2024-03-15` **other** · other · kept — add save/load example for ModelScope; no numbers stated; `score 0`
+- `444b11af22` `2024-03-15` **sync** · other · kept — Add LangChain upstream ut test for ipynb; no numbers stated; `score 0`
+- `bd64488b2a` `2024-03-15` **attention** · kernel · kept — add mask support for llama/chatglm fp8 sdp; no numbers stated; `score 2`
+- `5ab52ef5b5` `2024-03-15` **other** · docs · kept — update; no numbers stated; `score 0`
+- `399843faf0` `2024-03-18` **attention** · kernel · kept — Baichuan 7b fp16 sdp and qwen2 pvc sdp; no numbers stated; `score 2`
+- `1de13ea578` `2024-03-18` **other** · other · removed — remove CPU english_quotes dataset and update docker example; no numbers stated; `score 0`
+- `a57fd52a5b` `2024-03-18` **other** · other · kept — pip install notebook; no numbers stated; `score 0`
+- `dbdeaddd6a` `2024-03-18` **other** · fix · kept — Fix log condition for BIGDL_OPT_IPEX; no numbers stated; `score 1`
+- `66b4bb5c5d` `2024-03-18` **other** · other · kept — update setup to provide cpp for windows; no numbers stated; `score 0`
+- `9e763b049c` `2024-03-18` **attention** · sched · kept — Support running pipeline parallel inference by vertically partitioning model to different devices; no numbers stated; `score 0`
+- `bbd749dceb` `2024-03-19` **quant** · other · kept — qwen2 fp8 cache; no numbers stated; `score 1`
+- `0451103a43` `2024-03-19` **quant** · instr · kept — add int4+fp16 benchmark script for windows benchmarking; no numbers stated; `score 0`
+- `74e7490fda` `2024-03-19` **other** · fix · kept — Fix Baichuan2 prompt format; no numbers stated; `score 0`
+- `e25d7413de` `2024-03-19` **other** · docs · kept — add prerequisite section in quickstart; no numbers stated; `score 0`
+- `f3fefdc9ce` `2024-03-18` **other** · fix · kept — fix pad_token_id issue; no numbers stated; `score 0`
+- `0e388f4b91` `2024-03-19` **other** · fix · kept — Fix Trivy Docker Image Vulnerabilities for BigDL Release 2.5.0; no numbers stated; `score 0`
+- `e9055c32f9` `2024-03-19` **other** · instr · kept — fix fp16 mem record in benchmark; no numbers stated; `score 0`
+- `463a86cd5d` `2024-03-19` **attention** · fix · kept — fix qwen-vl interpolation gpu abnormal results.; no numbers stated; `score 0`
+- `72bcc27da9` `2024-03-19` **other** · other · kept — Add `TransformersBgeEmbeddings` class in `bigdl.llm.langchain.embeddings`; no numbers stated; `score 1`
+- `749bedaf1e` `2024-03-20` **other** · fix · kept — fix rwkv v5 fp16; no numbers stated; `score 1`
+- `e41d556436` `2024-03-20` **other** · instr · kept — change fp16 benchmark to model.half; no numbers stated; `score 0`
+- `4581e4f17f` `2024-03-20` **other** · fix · kept — fix whiper model missing config.; no numbers stated; `score 1`
+
+*Commits 2301-2400 (2024-03-01..2024-03-20): scores 0/1/2/3 = 64/28/8/0; areas other 66, attention 18, mem 4, quant 4.*
+
+- `1d062e24db` `2024-03-20` **other** · sched · kept — Update serving doc; no numbers stated; `score 1`
+- `cbe24cc7e6` `2024-03-20` **quant** · knob · kept — Enable BigDL IPEX Int8; no numbers stated; `score 0`
+- `cfdf8ad496` `2024-03-20` **other** · fix · kept — Fix `modules_not_to_convert` argument; no numbers stated; `score 1`
+- `021d77fd22` `2024-03-20` **attention** · kernel · removed — Remove softmax upcast fp32 in llama; no numbers stated; `score 2`
+- `28c315a5b9` `2024-03-21` **other** · sched · kept — fix deepspeed error of finetuning on xpu; no numbers stated; `score 0`
+- `5a5fd5af5b` `2024-03-21` **mtp** · instr · kept — Add speculative benchmark on CPU/XPU; no numbers stated; `score 0`
+- `85ef3f1d99` `2024-03-21` **mem** · sched · kept — add empty cache in deepspeed autotp benchmark script; no numbers stated; `score 0`
+- `c672e97239` `2024-03-21` **other** · fix · kept — Fix CPU finetuning docker; no numbers stated; `score 0`
+- `a5f35757a4` `2024-03-21` **other** · other · kept — Migrate langchain rag cpu example to gpu; no numbers stated; `score 0`
+- `5b97fdb87b` `2024-03-21` **moe** · other · kept — update deepseek example readme; no numbers stated; `score 0`
+- `158a49986a` `2024-03-21` **other** · docs · kept — Add quickstart for install bigdl-llm in docker on windows with Intel GPU; no numbers stated; `score 0`
+- `2958ca49c0` `2024-03-21` **other** · other · kept — add patching function for llm finetuning; no numbers stated; `score 0`
+- `3d59c74a0b` `2024-03-21` **other** · docs · kept — Linux quick start; no numbers stated; `score 0`
+- `1579ee4421` `2024-03-21` **quant** · other · kept — Add nightly igpu perf test for INT4+FP16 1024-128; no numbers stated; `score 0`
+- `30f111cd32` `2024-03-21` **mem** · other · kept — lm_head empty_cache for more models; no numbers stated; `score 1`
+- `dba7ddaab3` `2024-03-21` **attention** · kernel · kept — add sdp fp8 for qwen llama436 baichuan mistral baichuan2; no numbers stated; `score 2`
+- `8d0ea1b9b3` `2024-03-21` **other** · other · kept — add initial QuickStart for linux cpp usage; no numbers stated; `score 0`
+- `3a3756b51d` `2024-03-21` **other** · sched · kept — Add FastChat bigdl_worker; no numbers stated; `score 1`
+- `92ee2077b3` `2024-03-21` **other** · other · kept — Update Linux Quickstart; no numbers stated; `score 0`
+- `a7d38bee94` `2024-03-21` **other** · docs · kept — WebUI quickstart: add instruct chat mode and tested models; no numbers stated; `score 0`
+- `f0f317b6cf` `2024-03-22` **attention** · fix · kept — fix a typo in yuan; no numbers stated; `score 1`
+- `b9d4280892` `2024-03-22` **quant** · fix · kept — fix baichuan7b quantize kv abnormal output.; no numbers stated; `score 1`
+- `34d0a9328c` `2024-03-22` **moe** · sched · kept — Speed-up mixtral in pipeline parallel inference; no numbers stated; `score 1`
+- `a7da61925f` `2024-03-22` **other** · docs · kept — add windows related info in llama-cpp quickstart; no numbers stated; `score 0`
+- `cc5806f4bc` `2024-03-22` **other** · other · kept — add save/load example for hf-transformers; no numbers stated; `score 0`
+- `9df70d95eb` `2024-03-22` **attention** · other · kept — Refactor bigdl.llm to  ipex_llm; no numbers stated; `score 0`
+- `a1048ca7f6` `2024-03-22` **other** · other · kept — Update setup.py and add new actions and add compatible mode; no numbers stated; `score 0`
+- `5dc121ee5e` `2024-03-22` **other** · docs · kept — Add guide for running bigdl-example using ipex-llm libs; no numbers stated; `score 0`
+- `e2d25de17d` `2024-03-25` **other** · other · kept — Update_docker by heyang; no numbers stated; `score 0`
+- `16b2ef49c6` `2024-03-25` **other** · other · kept — Update_document by heyang; no numbers stated; `score 0`
+- `c4dbd21cfc` `2024-03-25` **other** · docs · kept — update readthedocs project name; no numbers stated; `score 0`
+- `d7d0e66b18` `2024-03-25` **other** · other · kept — move migration guide to quickstart; no numbers stated; `score 0`
+- `5b76f88a8f` `2024-03-25` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `c8a1c76304` `2024-03-25` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `de5bbf83de` `2024-03-25` **other** · docs · kept — update linux quickstart and formats of migration; no numbers stated; `score 0`
+- `e0ea7b8244` `2024-03-25` **other** · other · kept — IPEX-LLM Doc Layout Update; no numbers stated; `score 0`
+- `93e6804bfe` `2024-03-25` **other** · other · kept — update nightly test; no numbers stated; `score 0`
+- `c182acef3f` `2024-03-25` **other** · other · kept — Update IPEX-LLM Index Page; no numbers stated; `score 0`
+- `9367db7f2b` `2024-03-25` **other** · docs · kept — Small typo fix; no numbers stated; `score 0`
+- `1dd40b429c` `2024-03-26` **quant** · fusion · kept — enable fp4 fused mlp and qkv; no numbers stated; `score 2`
+- `0a3e4e788f` `2024-03-26` **attention** · sched · kept — fix mistral hidden_size setting for deepspeed autotp; no numbers stated; `score 1`
+- `c563b41491` `2024-03-26` **other** · other · kept — add nightly_build workflow; no numbers stated; `score 0`
+- `bb9be70105` `2024-03-26` **other** · other · kept — replace bigdl-llm with ipex-llm; no numbers stated; `score 0`
+- `2ecd737474` `2024-03-26` **other** · docs · kept — change bigdl-llm-tutorial to ipex-llm-tutorial in README; no numbers stated; `score 0`
+- `69a28d6b4c` `2024-03-26` **attention** · fix · kept — fix chatglm; no numbers stated; `score 1`
+- `a3b007f3b1` `2024-03-26` **other** · sched · kept — Fix fastchat breaks; no numbers stated; `score 1`
+- `11550d3f25` `2024-03-26` **mtp** · other · kept — Add length check for IPEX-CPU speculative decoding; no numbers stated; `score 1`
+- `b78289a595` `2024-03-26` **other** · docs · removed — Remove ipex-llm dependency in readme; no numbers stated; `score 0`
+- `817ef2d1de` `2024-03-26` **other** · docs · kept — Add verified models in document index; no numbers stated; `score 0`
+- `ea4bc450c4` `2024-03-26` **attention** · kernel · kept — ESIMD SDP on PVC; no numbers stated; `score 2`
+- `fc8c7904f0` `2024-03-27` **other** · fix · kept — fix torch_dtype setting of apply fp16 optimization through optimize_model; no numbers stated; `score 1`
+- `04baac5a2e` `2024-03-27` **other** · sched · kept — Fix fastchat top_k; no numbers stated; `score 1`
+- `924e01b842` `2024-03-27` **other** · other · kept — Create scorecard.yml; no numbers stated; `score 0`
+- `d86477f14d` `2024-03-27` **quant** · other · removed — Remove native_int4 in LangChain examples; no numbers stated; `score 0`
+- `fbeb10c796` `2024-03-27` **other** · kernel · kept — Set different env based on different Linux kernels; no numbers stated; `score 0`
+- `f239bc329b` `2024-03-27` **other** · docs · kept — Specify oneAPI minor version in documentation; no numbers stated; `score 0`
+- `51d34ca68e` `2024-03-27` **mtp** · fix · kept — Fix wrong import in speculative; no numbers stated; `score 1`
+- `1bae5f40d2` `2024-03-27` **other** · docs · kept — Hide pip installer for windows install; no numbers stated; `score 0`
+- `08e9aeb31f` `2024-03-27` **other** · docs · kept — Update index.rst; no numbers stated; `score 0`
+- `c450c85489` `2024-03-27` **other** · docs · removed — Delete llm/readme.md; no numbers stated; `score 0`
+- `e619142a16` `2024-03-27` **other** · docs · kept — Add SYCL_CACHE_PERSISTENT in doc and explain warmup in benchmark quickstart; no numbers stated; `score 0`
+- `92dfed77be` `2024-03-28` **other** · sched · kept — fix abnormal output of fp16 deepspeed autotp; no numbers stated; `score 1`
+- `1c5eb14128` `2024-03-28` **other** · other · kept — Update pip install to use --extra-index-url for ipex package; no numbers stated; `score 0`
+- `0a2e820c9f` `2024-03-27` **other** · docs · kept — Modify install_linux_gpu.md; no numbers stated; `score 0`
+- `52a2135d83` `2024-03-28` **attention** · other · kept — Replace ipex with ipex-llm; no numbers stated; `score 0`
+- `5963239b46` `2024-03-28` **attention** · fix · kept — Fix qwen's position_ids no enough; no numbers stated; `score 1`
+- `15b8964403` `2024-03-28` **other** · docs · kept — Win install change oneapi to pip installer; no numbers stated; `score 0`
+- `e6c5a6a5e6` `2024-03-28` **other** · docs · kept — Small style fix in Install Guide; no numbers stated; `score 0`
+- `b44f7adbad` `2024-03-28` **attention** · kernel · kept — Disable esimd sdp for PVC GPU when batch size>1; no numbers stated; `score 2`
+- `f4537798c1` `2024-03-29` **kv** · knob · kept — Enable kv cache quantization by default for flex when 1 < batch <= 8; no numbers stated; `score 1`
+- `0136fad1d4` `2024-03-29` **other** · knob · kept — support iq1_s; no numbers stated; `score 1`
+- `52f1b541cf` `2024-03-29` **other** · docs · kept — refine and verify ipex-inference-cpu docker document; no numbers stated; `score 0`
+- `848fa04dd6` `2024-03-28` **other** · fix · kept — Fix typo in Baichuan2 example; no numbers stated; `score 0`
+- `856f1ace2b` `2024-03-29` **other** · docs · kept — Add linux 6.5 kernel installation; no numbers stated; `score 0`
+- `b06de94a50` `2024-03-29` **other** · docs · kept — verify xpu-inference image and refine document; no numbers stated; `score 0`
+- `c4b533f0e1` `2024-03-29` **other** · other · kept — nightly build docker images; no numbers stated; `score 0`
+- `9a83f21b86` `2024-03-29` **other** · knob · kept — check user env; no numbers stated; `score 0`
+- `437a349dd6` `2024-03-29` **attention** · fix · kept — fix rwkv with pip installer; no numbers stated; `score 1`
+- `59058bb206` `2024-04-01` **other** · other · kept — replace 2.5.0-SNAPSHOT with 2.1.0-SNAPSHOT for llm docker images; no numbers stated; `score 0`
+- `d6af4877dd` `2024-04-01` **other** · other · removed — remove ipex.optimize for gpt-j; no numbers stated; `score 0`
+- `bfc1caa5e5` `2024-04-01` **other** · knob · kept — support iq1s for llama2-70b-hf; no numbers stated; `score 1`
+- `01f491757a` `2024-04-01` **sync** · other · kept — Modify the link in Langchain-upstream ut; no numbers stated; `score 0`
+- `e567956121` `2024-04-02` **mem** · knob · kept — memory optimization for llama; no numbers stated; `score 1`
+- `0a95c556a1` `2024-04-02` **other** · fix · kept — Fix starcoder first token perf; no numbers stated; `score 1`
+- `89d780f2e9` `2024-04-02` **other** · docs · kept — Small fix to install guide; no numbers stated; `score 0`
+- `20a5e72da0` `2024-04-02` **other** · sched · kept — refine and verify ipex-llm-serving-xpu docker document; no numbers stated; `score 0`
+- `58b57177e3` `2024-04-02` **kv** · knob · kept — support bigdl quantize kv cache env and add warning.; no numbers stated; `score 1`
+- `a10f5a1b8d` `2024-04-02` **attention** · other · kept — add python style check; no numbers stated; `score 0`
+- `ba8cc6bd68` `2024-04-02` **attention** · other · kept — optimize starcoder2-3b; no numbers stated; `score 1`
+- `27be448920` `2024-04-02` **mem** · sched · kept — add `cpu_embedding` and peak memory record for deepspeed autotp script; no numbers stated; `score 0`
+- `fd384ddfb8` `2024-04-02` **attention** · other · kept — Optimize StableLM; no numbers stated; `score 1`
+- `e184c480d2` `2024-04-02` **other** · docs · kept — Update WebUI Quickstart; no numbers stated; `score 0`
+- `b8b923ed04` `2024-04-02` **other** · other · kept — move chown step to behind add script in qlora Dockerfile; no numbers stated; `score 0`
+- `654dc5ba57` `2024-04-02` **attention** · fix · kept — Fix Qwen-VL example problem; no numbers stated; `score 0`
+- `2bbd8a1548` `2024-04-03` **attention** · sched · kept — fix llama2 FP16 & bs>1 & autotp on PVC and ARC; no numbers stated; `score 1`
+- `23e33a0ca1` `2024-04-02` **attention** · fix · kept — Fix qwen-vl style; no numbers stated; `score 1`
+- `dfcf08c58a` `2024-04-03` **other** · fix · kept — update ossf/scorecard-action to fix TUF invalid key bug; no numbers stated; `score 0`
+- `4431134ec5` `2024-04-02` **other** · docs · kept — update readme; no numbers stated; `score 0`
+- `0779ca3db0` `2024-04-03` **other** · other · kept — Bump ossf/scorecard-action to v2.3.1; no numbers stated; `score 0`
+- `1aef3bc0ab` `2024-04-03` **other** · docs · kept — verify and refine ipex-llm-finetune-qlora-xpu docker document; no numbers stated; `score 0`
+
+*Commits 2401-2500 (2024-03-20..2024-04-03): scores 0/1/2/3 = 68/27/5/0; areas other 66, attention 17, quant 5, mem 4.*
+
+- `c875b3c858` `2024-04-03` **attention** · kernel · kept — Add seq len check for llama softmax upcast to fp32; no numbers stated; `score 2`
+- `330d4b4f4b` `2024-04-02` **other** · docs · kept — update readme; no numbers stated; `score 0`
+- `f6fef09933` `2024-04-03` **other** · fix · kept — fix prompt format for llama-2 in langchain; no numbers stated; `score 0`
+- `b827f534d5` `2024-04-03` **other** · other · kept — Add tokenizer_id in Langchain; no numbers stated; `score 0`
+- `97c626d76f` `2024-04-03` **other** · docs · kept — add continue quickstart; no numbers stated; `score 0`
+- `3a9ab8f1ae` `2024-04-03` **attention** · fix · kept — fix stablelm logits diff; no numbers stated; `score 1`
+- `702e686901` `2024-04-03` **kv** · other · kept — optimize starcoder normal kv cache; no numbers stated; `score 1`
+- `4f6df37805` `2024-04-03` **other** · fix · kept — fix wrong cpu core num seen by docker; no numbers stated; `score 0`
+- `d18dbfb097` `2024-04-03` **other** · other · kept — update spr perf test; no numbers stated; `score 0`
+- `6000241b10` `2024-04-03` **other** · sched · kept — Add Deepspeed Example of FLEX Mistral; no numbers stated; `score 0`
+- `cc8b3be11c` `2024-04-03` **other** · other · kept — Add GPU and CPU example for stablelm-zephyr-3b; no numbers stated; `score 0`
+- `5b096c39a6` `2024-04-03` **other** · docs · kept — Change style for video rendering; no numbers stated; `score 0`
+- `c26e06d5cf` `2024-04-03` **other** · docs · kept — update coding quickstart and webui quickstart for warmup note; no numbers stated; `score 0`
+- `45437ddc9a` `2024-04-03` **other** · other · kept — update indexes, move some sections in coding quickstart to webui; no numbers stated; `score 0`
+- `1ae519ec69` `2024-04-03` **other** · other · kept — add langchain-chatchat quickstart; no numbers stated; `score 0`
+- `f789c2eee4` `2024-04-03` **other** · docs · kept — add ollama quickstart; no numbers stated; `score 0`
+- `f84e72e7af` `2024-04-03` **other** · other · kept — revise ollama quickstart; no numbers stated; `score 0`
+- `7c08d83d9e` `2024-04-03` **other** · docs · kept — Update quickstart; no numbers stated; `score 0`
+- `22f09f618a` `2024-04-03` **other** · docs · kept — update the video demo; no numbers stated; `score 0`
+- `4c3e493b2d` `2024-04-03` **attention** · fix · kept — fix stablelm2 1.6b; no numbers stated; `score 1`
+- `8abf4da1bc` `2024-04-04` **other** · docs · kept — README: Fix typo: tansformers -> transformers; no numbers stated; `score 0`
+- `6699d86192` `2024-04-04` **other** · docs · kept — Update index.rst; no numbers stated; `score 0`
+- `ac65ab65c6` `2024-04-04` **other** · docs · kept — Update llama_cpp_quickstart.md; no numbers stated; `score 0`
+- `29d97e4678` `2024-04-05` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `69bdbf5806` `2024-04-05` **attention** · sched · kept — Fix vllm print error message issue; no numbers stated; `score 0`
+- `ab87b6ab21` `2024-04-07` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `1a9b8204a4` `2024-04-07` **quant** · knob · kept — support int4 fp16 chatglm2-6b 8k input.; no numbers stated; `score 1`
+- `08018a18df` `2024-04-07` **other** · other · removed — Remove not-imported MistralConfig; no numbers stated; `score 1`
+- `10ee786920` `2024-04-07` **other** · other · kept — Replace with IPEX-LLM in example comments; no numbers stated; `score 0`
+- `9d8ba64c0d` `2024-04-07` **other** · knob · kept — Llamaindex: add tokenizer_id and support chat; no numbers stated; `score 0`
+- `56dfcb2ade` `2024-04-07` **other** · other · kept — Migrate portable zip to ipex-llm; no numbers stated; `score 0`
+- `d9a1153b4e` `2024-04-07` **other** · sched · kept — upgrade deepspeed in AutoTP on GPU; no numbers stated; `score 0`
+- `9ad4b29697` `2024-04-07` **other** · instr · kept — CPU benchmark using tcmalloc; no numbers stated; `score 0`
+- `33f90beda0` `2024-04-07` **other** · docs · kept — fix quickstart docs; no numbers stated; `score 0`
+- `47cabe8fcc` `2024-04-07` **other** · fix · kept — Fix no return_last_logit running bigdl_ipex chatglm3; no numbers stated; `score 1`
+- `2d88bb9b4b` `2024-04-07` **quant** · knob · kept — add test api transformer_int4_fp16_gpu; no numbers stated; `score 0`
+- `a11b708135` `2024-04-07` **other** · docs · kept — Modify the .md link in chatchat readthedoc; no numbers stated; `score 0`
+- `321bc69307` `2024-04-08` **other** · other · kept — Fix llamaindex ut; no numbers stated; `score 0`
+- `db7c5cb78f` `2024-04-08` **other** · other · kept — update model path for spr perf test; no numbers stated; `score 0`
+- `c0cd238e40` `2024-04-08` **attention** · knob · kept — support llama2 8k input with w4a16.; no numbers stated; `score 1`
+- `65127622aa` `2024-04-08` **other** · other · kept — fix UT threshold; no numbers stated; `score 0`
+- `1274cba79b` `2024-04-08` **kv** · other · kept — stablelm fp8 kv cache; no numbers stated; `score 1`
+- `7c43ac0164` `2024-04-08` **attention** · kernel · kept — optimize llama natvie sdp for split qkv tensor; no numbers stated; `score 2`
+- `591bae092c` `2024-04-08` **other** · other · removed — combine english and chinese, remove nan; no numbers stated; `score 0`
+- `5a1f446d3c` `2024-04-08` **gemm** · kernel · kept — support fp8 in xetla; no numbers stated; `score 2`
+- `f03c029914` `2024-04-09` **other** · other · kept — pydantic version>=2.0.0 for llamaindex; no numbers stated; `score 0`
+- `dcb2038aad` `2024-04-09` **other** · knob · kept — Enable optimization for sentence_transformers; no numbers stated; `score 1`
+- `c7422712fc` `2024-04-09` **attention** · kernel · kept — mistral 4.36 use fp16 sdp; mistral 4.36 use fp16 sdp (#10704); `score 2`
+- `44922bb5c2` `2024-04-09` **other** · sched · kept — support baichuan2-13b using AutoTP; no numbers stated; `score 1`
+- `1e27e08322` `2024-04-09` **other** · other · kept — Modify example from fp32 to fp16; no numbers stated; `score 0`
+- `8cf26d8d08` `2024-04-09` **other** · docs · kept — Update ollama_quickstart.md; no numbers stated; `score 0`
+- `d59e0cce5c` `2024-04-09` **other** · other · kept — Migrate harness to ipexllm; no numbers stated; `score 0`
+- `d3116de0db` `2024-04-09` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `39ff586454` `2024-04-09` **other** · docs · kept — docs: update README.md; no numbers stated; `score 0`
+- `3e4fbee87c` `2024-04-09` **other** · docs · kept — Update readme & quickstart; no numbers stated; `score 0`
+- `289cc99cd6` `2024-04-09` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `6a32216269` `2024-04-09` **other** · other · kept — add llama2 8k input example.; no numbers stated; `score 0`
+- `e438f941f2` `2024-04-09` **attention** · knob · kept — disable rwkv5 fp16; no numbers stated; `score 1`
+- `e10040b7f1` `2024-04-09` **other** · other · kept — upgrade to python 3.11; no numbers stated; `score 0`
+- `8f45e22072` `2024-04-09` **attention** · fix · kept — fix llama2; no numbers stated; `score 1`
+- `f37a1f2a81` `2024-04-09` **other** · other · kept — Upgrade to python 3.11; no numbers stated; `score 0`
+- `b4147a97bb` `2024-04-09` **other** · fix · kept — Fix dtype mismatch error; no numbers stated; `score 1`
+- `97db2492c8` `2024-04-09` **other** · kernel · kept — Update setup.py for `bigdl-core-xe-esimd-21` on Windows; no numbers stated; `score 0`
+- `447f48499a` `2024-04-09` **other** · docs · kept — Init commit of open-webui quickstart; no numbers stated; `score 0`
+- `fde6ab50d0` `2024-04-09` **other** · docs · kept — Further fix to python 3.11 document; no numbers stated; `score 0`
+- `a0244527aa` `2024-04-09` **other** · docs · kept — Small updates to langchain-chatchat quickstart readme; no numbers stated; `score 0`
+- `8924dbc3f9` `2024-04-09` **other** · other · kept — revise open webui quickstart and some indexes; no numbers stated; `score 0`
+- `6e7da0d92c` `2024-04-09` **other** · docs · kept — small fix in document; no numbers stated; `score 0`
+- `1e817926ba` `2024-04-09` **mem** · fix · kept — Fix low memory generation example issue in transformers 4.36; no numbers stated; `score 0`
+- `878a97077b` `2024-04-09` **attention** · fix · kept — Fix llava example to support transformerds 4.36; no numbers stated; `score 0`
+- `d1eaea509f` `2024-04-09` **other** · docs · kept — update chatglm readme; no numbers stated; `score 0`
+- `585c174e92` `2024-04-09` **attention** · knob · kept — Read the value of KV_CACHE_ALLOC_BLOCK_LENGTH from the environment variables; no numbers stated; `score 1`
+- `c9e6d42ad1` `2024-04-10` **other** · fix · kept — Fix chatglm3-6b-32k error; no numbers stated; `score 1`
+- `a81f9e61a6` `2024-04-10` **other** · docs · kept — Revise open_webui_with_ollama_quickstart.md; no numbers stated; `score 0`
+- `0ccd7bfca9` `2024-04-10` **other** · docs · kept — revise quickstart; no numbers stated; `score 0`
+- `b727767f00` `2024-04-10` **other** · other · kept — Add axolotl v0.3.0 with ipex-llm on Intel GPU; no numbers stated; `score 0`
+- `29bf28bd6f` `2024-04-10` **other** · other · kept — Upgrade python to 3.11 in Docker Image; no numbers stated; `score 0`
+- `cd22cb8257` `2024-04-10` **other** · knob · kept — Update Env check Script; no numbers stated; `score 0`
+- `4b024b7aac` `2024-04-10` **attention** · other · kept — optimize chatglm2 8k input.; no numbers stated; `score 1`
+- `50dfcaa8fa` `2024-04-11` **other** · other · kept — Update llm-ppl-evaluation.yml -- Update llm-ppl-evaluation.yml -- Update HTML file: change from ppl/update_in_parent_folder into harness/update_in_parent_folder; no numbers stated; `score 0`
+- `63a9a736be` `2024-04-11` **other** · other · kept — Merge branch 'intel-analytics:main' into MargarettMao-parent_folder; no numbers stated; `score 0`
+- `9bec233e4d` `2024-04-11` **other** · other · removed — Delete python/llm/test/benchmark/perplexity/update_html_in_parent_folder.py; no numbers stated; `score 0`
+- `301504aa8d` `2024-04-11` **other** · fix · kept — Fix transformers version warning; no numbers stated; `score 0`
+- `2685c41318` `2024-04-11` **other** · instr · kept — Modify all-in-one benchmark; no numbers stated; `score 0`
+- `2d64630757` `2024-04-11` **other** · other · removed — Remove transformers version in axolotl example; no numbers stated; `score 0`
+- `fd473ddb1b` `2024-04-11` **other** · other · kept — Merge pull request #10730 from MargarettMao/MargarettMao-parent_folder; no numbers stated; `score 0`
+- `1256a2cc4e` `2024-04-11` **other** · other · kept — Add chatglm3 long input example; no numbers stated; `score 0`
+- `70ed9397f9` `2024-04-11` **gemm** · fix · kept — fix AttributeError of FP16Linear; no numbers stated; `score 1`
+- `b151a9b672` `2024-04-11` **other** · other · kept — edit csv_to_html to combine en & zh; no numbers stated; `score 0`
+- `019293e1b9` `2024-04-11` **moe** · fusion · kept — fuse the MoE index computation (C++ CPU side); no numbers stated; `score 2`
+- `8086554d33` `2024-04-12` **attention** · kernel · kept — use new fp16 sdp in llama and mistral; no numbers stated; `score 2`
+- `bb34c6e325` `2024-04-12` **other** · other · kept — Mark Color Modification; no numbers stated; `score 0`
+- `9bbfcaf736` `2024-04-12` **other** · other · kept — Mark Color Modification; no numbers stated; `score 0`
+- `cdbb1de972` `2024-04-12` **other** · other · kept — Mark Color Modification; no numbers stated; `score 0`
+- `1a360823ce` `2024-04-12` **other** · other · kept — Mofidy Typos; no numbers stated; `score 0`
+- `382c18e600` `2024-04-12` **other** · other · kept — Mofidy Typos; no numbers stated; `score 0`
+- `cb594e1fc5` `2024-04-12` **other** · other · kept — Mofidy Typos; no numbers stated; `score 0`
+- `7309f1ddf9` `2024-04-12` **other** · other · kept — Mofidy Typos; no numbers stated; `score 0`
+- `dd0d2df5af` `2024-04-12` **other** · other · kept — Change fp16.csv mistral-7b-v0.1 into Mistral-7B-v0.1; no numbers stated; `score 0`
+- `0d518aab8d` `2024-04-12` **other** · other · kept — Merge pull request #10697 from MargarettMao/ceval; no numbers stated; `score 0`
+
+*Commits 2501-2600 (2024-04-03..2024-04-12): scores 0/1/2/3 = 77/17/6/0; areas other 79, attention 13, kv 2, quant 2.*
+
+- `c3fc8f4b90` `2024-04-12` **attention** · kernel · kept — add bs limitation for llama softmax upcast to fp32; no numbers stated; `score 2`
+- `9e668a5bf0` `2024-04-12` **other** · fix · kept — fix_internlm-chat-7b-8k repo name in examples; no numbers stated; `score 0`
+- `a9a6b6b7af` `2024-04-12` **other** · fix · kept — Fix baichuan-13b issue on portable zip under transformers 4.36; no numbers stated; `score 0`
+- `3590e1be83` `2024-04-15` **other** · revert · reverted — revert python to 3.9 for finetune image; no numbers stated; `score 0`
+- `3d561b60ac` `2024-04-15` **gemm** · kernel · kept — add `enable_xetla` parameter for `optimize_model` API; no numbers stated; `score 2`
+- `b5209d3ec1` `2024-04-15` **other** · docs · kept — Update example/GPU/PyTorch-Models/Model/llava/README.md; no numbers stated; `score 0`
+- `486df2764a` `2024-04-15` **other** · docs · kept — Update gpu configuration; no numbers stated; `score 0`
+- `47622c6a92` `2024-04-15` **other** · docs · kept — Fix missing export typo in linux quickstart; no numbers stated; `score 0`
+- `1bd431976d` `2024-04-15` **other** · docs · kept — Update ollama quickstart; no numbers stated; `score 0`
+- `73a67804a4` `2024-04-15` **other** · docs · kept — GPU configuration update for examples (windows pip installer, etc.); no numbers stated; `score 0`
+- `1abd77507e` `2024-04-15` **other** · docs · kept — Small update for GPU configuration related doc; no numbers stated; `score 0`
+- `7297036c03` `2024-04-16` **other** · other · kept — upgrade python; no numbers stated; `score 0`
+- `3e2662c87e` `2024-04-16` **attention** · fix · kept — fix get env KV_CACHE_ALLOC_BLOCK_LENGTH type.; no numbers stated; `score 1`
+- `0a62933d36` `2024-04-16` **other** · sched · kept — fix qwen AutoTP; no numbers stated; `score 1`
+- `ea5e46c8cb` `2024-04-16` **other** · docs · kept — Small update of quickstart; no numbers stated; `score 0`
+- `a7c12020b4` `2024-04-16` **other** · sched · kept — Add fastchat quickstart; no numbers stated; `score 0`
+- `599a88db53` `2024-04-16` **other** · sched · kept — Add deepsped-autoTP-Fastapi serving; no numbers stated; `score 0`
+- `d30b22a81b` `2024-04-16` **other** · other · kept — Refine axolotl 0.3.0 documents and links; no numbers stated; `score 0`
+- `899d392e2f` `2024-04-16` **other** · knob · kept — Support prompt lookup in ipex-llm; no numbers stated; `score 1`
+- `c41730e024` `2024-04-16` **other** · other · kept — edit 'ppl_result does not exist' issue, delete useless code; no numbers stated; `score 0`
+- `26cae0a39c` `2024-04-17` **other** · docs · kept — Update FLEX in Deepspeed README; no numbers stated; `score 0`
+- `f2e923b3ca` `2024-04-17` **other** · knob · kept — Axolotl v0.4.0 support; no numbers stated; `score 0`
+- `9e5069437f` `2024-04-17` **other** · fix · kept — Fix gradio version in axolotl example; no numbers stated; `score 0`
+- `766fe45222` `2024-04-17` **other** · fix · kept — Fix spec error caused by lookup pr; no numbers stated; `score 1`
+- `7ec82c6042` `2024-04-17` **other** · docs · kept — add README.md for Long-Context examples.; no numbers stated; `score 0`
+- `0646e2c062` `2024-04-17` **mtp** · fix · kept — Fix short prompt for IPEX_CPU speculative decoding cause no_attr error; no numbers stated; `score 0`
+- `a20271ffe4` `2024-04-17` **attention** · fix · kept — Fix yi-6b fp16 error on pvc; no numbers stated; `score 1`
+- `ea5b373a97` `2024-04-17` **mtp** · other · kept — Add lookahead GPU example; no numbers stated; `score 0`
+- `e764f9b1b1` `2024-04-18` **attention** · fusion · kept — Disable fast fused rope on UHD; no numbers stated; `score 2`
+- `31ea2f9a9f` `2024-04-18` **attention** · fix · kept — Fix wrong output for Llama models on CPU; no numbers stated; `score 1`
+- `952e517db9` `2024-04-17` **attention** · other · kept — use config rope_theta; no numbers stated; `score 1`
+- `581ebf6104` `2024-04-18` **other** · other · kept — GaLore Finetuning Example; no numbers stated; `score 0`
+- `ff040c8f01` `2024-04-18` **attention** · other · kept — LISA Finetuning Example; no numbers stated; `score 0`
+- `209c3501e6` `2024-04-18` **moe** · other · kept — Optimize qwen1.5 moe model; no numbers stated; `score 1`
+- `053ec30737` `2024-04-18` **other** · other · kept — Transformers ppl evaluation on wikitext; no numbers stated; `score 0`
+- `cbe7b5753f` `2024-04-18` **other** · sched · kept — Add vLLM[xpu] related code; no numbers stated; `score 0`
+- `14ca42a048` `2024-04-18` **moe** · fix · kept — LLM：Fix moe indexs error on cpu; no numbers stated; `score 1`
+- `e90e31719f` `2024-04-18` **other** · other · kept — axolotl lora example; no numbers stated; `score 0`
+- `0e8aac19e3` `2024-04-18` **other** · other · kept — add q6k precision in ipex-llm; no numbers stated; `score 1`
+- `88463cbf47` `2024-04-18` **other** · fix · kept — fix transformer version; no numbers stated; `score 0`
+- `8796401b08` `2024-04-18` **other** · knob · kept — Support q4k in ipex-llm; no numbers stated; `score 1`
+- `439c834ed3` `2024-04-18` **other** · other · kept — add mixed precision for lm_head; no numbers stated; `score 1`
+- `754b0ffecf` `2024-04-18` **attention** · fix · kept — Fix pvc llama; no numbers stated; `score 1`
+- `8153c3008e` `2024-04-18` **other** · other · kept — Initial llama3 example; no numbers stated; `score 0`
+- `995c01367d` `2024-04-19` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `c7235e34a8` `2024-04-19` **other** · other · kept — Small update to ut; no numbers stated; `score 0`
+- `08458b4f74` `2024-04-19` **attention** · other · removed — remove rms norm copy; no numbers stated; `score 1`
+- `fbd1743b5e` `2024-04-19` **other** · docs · kept — Ollama quickstart update; no numbers stated; `score 0`
+- `07e8b045a9` `2024-04-19` **other** · other · kept — Add Meta-llama-3-8B-Instruct and Yi-6B-Chat to igpu nightly perf; no numbers stated; `score 0`
+- `1a885020ee` `2024-04-19` **other** · other · kept — Updated importing of top_k_top_p_filtering for transformers>=4.39.0; no numbers stated; `score 1`
+- `34ff07b689` `2024-04-19` **other** · docs · kept — Add CPU related info to langchain-chatchat quickstart; no numbers stated; `score 0`
+- `57edf2033c` `2024-04-19` **mtp** · fix · kept — fix lookahead with transformers >= 4.36; no numbers stated; `score 1`
+- `caf75beef8` `2024-04-19` **attention** · kernel · kept — Disable sdpa; no numbers stated; `score 2`
+- `a8df429985` `2024-04-19` **other** · other · kept — QuickStart: Run Llama 3 on Intel GPU using llama.cpp and ollama with IPEX-LLM; no numbers stated; `score 0`
+- `197f8dece9` `2024-04-19` **other** · docs · kept — Add open-webui windows document; no numbers stated; `score 0`
+- `3cd21d5105` `2024-04-19` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `61c67af386` `2024-04-22` **other** · docs · kept — Fix vLLM-v2 install instructions; no numbers stated; `score 0`
+- `1edb19c1dd` `2024-04-22` **other** · docs · kept — small fix of cpp quickstart; no numbers stated; `score 0`
+- `5f95054f97` `2024-04-22` **moe** · docs · kept — LLM：Add qwen moe example libs md; no numbers stated; `score 0`
+- `ae3b577537` `2024-04-22` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `c6e868f7ad` `2024-04-22` **other** · docs · kept — update oneapi usage in cpp quickstart; no numbers stated; `score 0`
+- `3daad242b8` `2024-04-22` **other** · fix · kept — Fix  No module named 'transformers.cache_utils' with transformers < 4.36; no numbers stated; `score 1`
+- `3b82834aaf` `2024-04-22` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `fc33aa3721` `2024-04-22` **other** · fix · kept — fix missing import; no numbers stated; `score 0`
+- `23c6a52fb0` `2024-04-22` **other** · fix · kept — Fix ipex torchscript=True error; no numbers stated; `score 0`
+- `47bd5f504c` `2024-04-22` **attention** · sched · removed — Remove vllm-v1, refactor v2; no numbers stated; `score 0`
+- `fe5a082b84` `2024-04-22` **attention** · other · kept — add phi-2 optimization; no numbers stated; `score 1`
+- `2ec45c49d3` `2024-04-22` **other** · docs · kept — fix ollama quickstart; no numbers stated; `score 0`
+- `5494aa55f6` `2024-04-23` **other** · docs · kept — Downgrade datasets in axolotl example; no numbers stated; `score 0`
+- `18c032652d` `2024-04-23` **moe** · other · kept — Add mixtral speculative CPU example; no numbers stated; `score 0`
+- `c9dee6cd0e` `2024-04-23` **other** · other · kept — Update 8192.txt; no numbers stated; `score 0`
+- `92ea54b512` `2024-04-23` **mtp** · fix · kept — Fix speculative decoding bug; no numbers stated; `score 0`
+- `5eee1976ac` `2024-04-23` **other** · other · kept — Add Axolotl v0.4.0 quickstart; no numbers stated; `score 0`
+- `bce99a5b00` `2024-04-23` **other** · docs · kept — Minior fix for quick start; no numbers stated; `score 0`
+- `763413b7e1` `2024-04-23` **attention** · knob · kept — support llama split tensor for long context in transformers>=4.36.; no numbers stated; `score 1`
+- `a017bf2981` `2024-04-23` **other** · docs · kept — add quick start for dify; no numbers stated; `score 0`
+- `36eb8b2e96` `2024-04-23` **mtp** · other · kept — Add llama3 speculative example; no numbers stated; `score 0`
+- `21bb8bd164` `2024-04-23` **other** · other · kept — Add phi-2 to igpu performance test; no numbers stated; `score 0`
+- `5c9eb5d0f5` `2024-04-23` **sync** · knob · kept — Support llama-index install option for upstreaming purposes; no numbers stated; `score 0`
+- `328b1a1de9` `2024-04-23` **other** · fix · kept — Fix the not stop issue of llama3 examples; no numbers stated; `score 0`
+- `fabf54e052` `2024-04-24` **other** · sched · kept — make pipeline parallel inference example more common; no numbers stated; `score 0`
+- `fb2a160af3` `2024-04-24` **other** · other · kept — Add phi-2 to 2048-256 test for fixes; no numbers stated; `score 0`
+- `eb39c61607` `2024-04-24` **other** · instr · kept — add min new token to perf test.; no numbers stated; `score 0`
+- `2d210817ff` `2024-04-24` **attention** · other · kept — add phi3 optimization; no numbers stated; `score 1`
+- `c9feffff9a` `2024-04-24` **moe** · sched · kept — support Qwen1.5-MoE-A2.7B-Chat pipeline parallel inference; no numbers stated; `score 1`
+- `634726211a` `2024-04-24` **other** · other · kept — Add video to axolotl quick start; no numbers stated; `score 0`
+- `844e18b1db` `2024-04-24` **other** · other · kept — Add llama3 and phi2 nightly test; no numbers stated; `score 0`
+- `dc27b3bc35` `2024-04-24` **attention** · kernel · kept — Use sdp when rest token seq_len > 1 in llama & mistral (for lookup & spec); no numbers stated; `score 2`
+- `1ce8d7bcd9` `2024-04-24` **quant** · knob · kept — Support the `desc_act` feature in GPTQ model; no numbers stated; `score 1`
+- `cd369c2715` `2024-04-25` **other** · instr · kept — add device id to benchmark utils.; no numbers stated; `score 0`
+- `ca2479be87` `2024-04-25` **other** · other · kept — Update scripts readme; no numbers stated; `score 0`
+- `0213c1c1da` `2024-04-25` **other** · other · kept — Add phi3 to the nightly test; no numbers stated; `score 0`
+- `8811f268ff` `2024-04-25` **attention** · kernel · kept — Use new fp16 sdp in Qwen and modify the constraint; no numbers stated; `score 2`
+- `fb3c268d13` `2024-04-25` **other** · other · kept — Add phi-3 to perf; no numbers stated; `score 0`
+- `3e8ed54270` `2024-04-26` **quant** · fix · kept — Fix bigdl_ipex_int8 warning; no numbers stated; `score 1`
+- `3d4950b0f0` `2024-04-26` **other** · sched · kept — Enable batch generate (world_size>1) in Deepspeed-AutoTP-FastAPI example; no numbers stated; `score 0`
+- `751f6d11d8` `2024-04-26` **other** · docs · kept — fix typos in qlora README; no numbers stated; `score 0`
+- `46ba962168` `2024-04-26` **quant** · other · kept — use new quantize kv; no numbers stated; `score 1`
+- `f51bf018eb` `2024-04-26` **other** · sched · kept — Add benchmark script for pipeline parallel inference; no numbers stated; `score 0`
+- `d058f2b403` `2024-04-26` **other** · docs · kept — Fix apt install oneapi scripts; no numbers stated; `score 0`
+
+*Commits 2601-2700 (2024-04-12..2024-04-26): scores 0/1/2/3 = 70/24/6/0; areas other 69, attention 16, mtp 5, moe 5.*
+
+- `990535b1cf` `2024-04-26` **other** · sched · kept — Add tensor parallel for vLLM; no numbers stated; `score 1`
+- `9752ffe979` `2024-04-26` **attention** · kernel · kept — update split qkv native sdp.; no numbers stated; `score 2`
+- `ea035f5e15` `2024-04-26` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `ddfdaec137` `2024-04-28` **other** · fix · kept — Fix nightly perf; no numbers stated; `score 0`
+- `7c290d3f92` `2024-04-28` **other** · other · kept — Add workflow dispatch trigger to nightly perf; no numbers stated; `score 0`
+- `1a8a93d5e0` `2024-04-28` **other** · fix · kept — Further fix nightly perf; no numbers stated; `score 0`
+- `94b4e96fa6` `2024-04-28` **other** · other · kept — Small updates for workflow-dispatch triggered nightly perf; no numbers stated; `score 0`
+- `015d07a58f` `2024-04-28` **mtp** · fix · kept — Fix lookahead sample error & add update strategy; no numbers stated; `score 1`
+- `c9fac8c26b` `2024-04-28` **attention** · kernel · kept — Fix sdp logic; no numbers stated; `score 2`
+- `fbcd7bc737` `2024-04-29` **other** · fix · kept — Fix Loader issue with dtype fp16; no numbers stated; `score 1`
+- `d884c62dc4` `2024-04-29` **attention** · knob · removed — remove new_layout parameter; no numbers stated; `score 1`
+- `c936ba3b64` `2024-04-29` **other** · fix · kept — Small fix for supporting workflow dispatch in nightly perf; no numbers stated; `score 0`
+- `1f876fd837` `2024-04-29` **other** · other · kept — Add example for phi-3; no numbers stated; `score 0`
+- `2c64754eb0` `2024-04-29` **other** · sched · kept — Add vLLM to ipex-llm serving image; no numbers stated; `score 0`
+- `71f51ce589` `2024-04-30` **other** · docs · kept — Initial Update for Continue Quickstart with Ollama backend; no numbers stated; `score 0`
+- `75dbf240ec` `2024-04-30` **attention** · knob · kept — update split tensor conditions.; no numbers stated; `score 1`
+- `282d676561` `2024-04-30` **other** · docs · kept — update continue quickstart; no numbers stated; `score 0`
+- `c78a8e3677` `2024-04-30` **other** · docs · kept — update quickstart; no numbers stated; `score 0`
+- `0edef1f94c` `2024-05-06` **other** · instr · kept — add min_new_tokens to all in one benchmark.; no numbers stated; `score 0`
+- `8379f02a74` `2024-05-06` **other** · docs · kept — Add Dify quickstart; no numbers stated; `score 0`
+- `0e0bd309e2` `2024-05-06` **mtp** · sched · kept — Enable Speculative on Fastchat; no numbers stated; `score 1`
+- `41ffe1526c` `2024-05-06` **other** · other · kept — Modify CPU finetune docker for bz2 error; no numbers stated; `score 0`
+- `3f438495e4` `2024-05-06` **other** · docs · kept — update llama.cpp and ollama quickstart; no numbers stated; `score 0`
+- `64938c2ca7` `2024-05-06` **other** · other · kept — Dify quickstart revision; no numbers stated; `score 0`
+- `d649236321` `2024-05-06` **other** · docs · kept — make images clickable; no numbers stated; `score 0`
+- `49ab5a2b0e` `2024-05-07` **other** · other · kept — Add embeddings; no numbers stated; `score 1`
+- `1de878bee1` `2024-05-07` **mtp** · docs · kept — Fix speculative llama3 long input error; no numbers stated; `score 0`
+- `13a44cdacb` `2024-05-07` **other** · sched · kept — Refine Deepspped-AutoTP-FastAPI example; no numbers stated; `score 0`
+- `191b184341` `2024-05-07` **attention** · other · kept — Optimize cohere model; no numbers stated; `score 1`
+- `33b8f524c2` `2024-05-07` **other** · other · kept — Add cpp docker manually_test; no numbers stated; `score 0`
+- `08ad40b251` `2024-05-07` **other** · other · kept — improve ipex-llm-init for Linux; no numbers stated; `score 0`
+- `245c7348bc` `2024-05-07` **gemm** · kernel · kept — Add codegemma example; no numbers stated; `score 0`
+- `0efe26c3b6` `2024-05-07` **other** · other · kept — Change order of chatglm2-6b and chatglm3-6b in iGPU perf test for more stable performance; no numbers stated; `score 0`
+- `d7ca5d935b` `2024-05-07` **other** · other · kept — Upgrade Peft version to 0.10.0 for LLM finetune; no numbers stated; `score 0`
+- `c11170b96f` `2024-05-07` **other** · other · kept — Upgrade Peft to 0.10.0 in finetune examples and docker; no numbers stated; `score 0`
+- `aa2fa9fde1` `2024-05-07` **attention** · kernel · kept — optimize phi3 again: use sdp if possible; no numbers stated; `score 2`
+- `c801c37bc6` `2024-05-07` **quant** · other · kept — optimize phi3 again: use quantize kv if possible; no numbers stated; `score 1`
+- `164e6957af` `2024-05-08` **other** · other · kept — Refine axolotl quickstart; no numbers stated; `score 0`
+- `0d6e12036f` `2024-05-08` **mem** · knob · kept — Disable fast_init_ in load_low_bit; no numbers stated; `score 1`
+- `15ee3fd542` `2024-05-08` **other** · other · kept — Update igpu perf internlm; no numbers stated; `score 0`
+- `5973d6c753` `2024-05-08` **gemm** · kernel · kept — make gemma's output better; no numbers stated; `score 0`
+- `dfa3147278` `2024-05-08` **other** · other · kept — update; no numbers stated; `score 0`
+- `2ebec0395c` `2024-05-08` **attention** · other · kept — optimize phi-3-mini-128; no numbers stated; `score 1`
+- `02870dc385` `2024-05-08` **other** · sched · kept — Refine README of AutoTP-FastAPI example; no numbers stated; `score 0`
+- `3209d6b057` `2024-05-08` **other** · fix · kept — Fix spculative llama3 no stop error; no numbers stated; `score 0`
+- `7e7d969dcb` `2024-05-08` **other** · fix · kept — a experimental for workflow abuse step1 fix a typo; no numbers stated; `score 0`
+- `f4c615b1ee` `2024-05-08` **other** · other · kept — Add cohere example; no numbers stated; `score 0`
+- `37820e1d86` `2024-05-08` **other** · other · kept — Add privateGPT quickstart; no numbers stated; `score 0`
+- `11df5f9773` `2024-05-08` **other** · fix · kept — revise private GPT quickstart and a few fixes for other quickstart; no numbers stated; `score 0`
+- `459b764406` `2024-05-09` **other** · other · removed — Remove munually_build_for_test push outside; no numbers stated; `score 0`
+- `e3159c45e4` `2024-05-09` **other** · docs · kept — update private gpt quickstart and a small fix for dify; no numbers stated; `score 0`
+- `697ca79eca` `2024-05-09` **attention** · kernel · kept — use quantize kv and sdp in phi3-mini; no numbers stated; `score 2`
+- `b7f7d05a7e` `2024-05-09` **other** · docs · kept — update llama.cpp usage of llama3; no numbers stated; `score 0`
+- `e753125880` `2024-05-09` **attention** · kernel · kept — use fp16_sdp when head_dim=96; no numbers stated; `score 2`
+- `a6342cc068` `2024-05-09` **attention** · knob · kept — Empty cache after phi first attention to support 4k input; no numbers stated; `score 1`
+- `f9615f12d1` `2024-05-10` **other** · knob · kept — Add driver related packages version check in env script; no numbers stated; `score 0`
+- `cfed76b2ed` `2024-05-10` **attention** · knob · kept — add long-context support for Qwen1.5-7B/Baichuan2-7B/Mistral-7B.; no numbers stated; `score 1`
+- `ad96f32ce0` `2024-05-10` **attention** · other · kept — optimize phi3 1st token performance; no numbers stated; `score 1`
+- `5e0872073e` `2024-05-11` **other** · docs · kept — add version for llama.cpp and ollama; no numbers stated; `score 0`
+- `9f6358e4c2` `2024-05-11` **other** · knob · kept — Deprecate support for pytorch 2.0 on Linux for `ipex-llm >= 2.1.0b20240511`; no numbers stated; `score 0`
+- `f8dd2e52ad` `2024-05-11` **sync** · other · kept — Fix Langchain upstream ut; no numbers stated; `score 0`
+- `04d5a900e1` `2024-05-13` **other** · docs · kept — update troubleshooting of llama.cpp; no numbers stated; `score 0`
+- `99255fe36e` `2024-05-13` **other** · fix · kept — fix ppl; no numbers stated; `score 0`
+- `1b3c7a6928` `2024-05-13` **mem** · other · removed — remove phi3 empty cache; no numbers stated; `score 1`
+- `74997a3ed1` `2024-05-13` **mem** · other · kept — Adding load_low_bit interface for ipex_llm_worker; no numbers stated; `score 1`
+- `a465111cf4` `2024-05-13` **other** · other · kept — Update README.md; no numbers stated; `score 1`
+- `7f8c5b410b` `2024-05-14` **other** · other · kept — Quickstart: Run PyTorch Inference on Intel GPU using Docker (on Linux or WSL); no numbers stated; `score 0`
+- `fb656fbf74` `2024-05-14` **other** · knob · kept — Add requirements for oneAPI pypi packages for windows Intel GPU users; no numbers stated; `score 0`
+- `c957ea3831` `2024-05-14` **other** · knob · kept — Add axolotl main support and axolotl Llama-3-8B QLoRA example; no numbers stated; `score 0`
+- `8010af700f` `2024-05-14` **other** · other · kept — Update igpu performance test to use pypi installed oneAPI; no numbers stated; `score 0`
+- `170e3d65e0` `2024-05-14` **attention** · kernel · kept — use new sdp and fp32 sdp; no numbers stated; `score 2`
+- `b03c859278` `2024-05-14` **attention** · other · kept — Add phi3RMS; no numbers stated; `score 1`
+- `893197434d` `2024-05-14` **quant** · knob · kept — Add fp6 support on gpu; no numbers stated; `score 1`
+- `586a151f9c` `2024-05-14` **other** · other · kept — update the README and reorganize the docker guides structure.; no numbers stated; `score 0`
+- `0b7e78b592` `2024-05-14` **other** · instr · kept — revise the benchmark part in python inference docker; no numbers stated; `score 0`
+- `0a732bebe7` `2024-05-15` **attention** · other · kept — Add phi3 cached RotaryEmbedding; no numbers stated; `score 1`
+- `7d3791c819` `2024-05-15` **other** · other · kept — Add llama3 alpaca qlora example; no numbers stated; `score 0`
+- `ee325e9cc9` `2024-05-15` **other** · fix · kept — fix phi3; no numbers stated; `score 1`
+- `1e00bd7bbe` `2024-05-15` **other** · other · kept — Re-org XPU finetune images; no numbers stated; `score 0`
+- `c34f85e7d0` `2024-05-15` **other** · docs · kept — Simplify installation on Windows for Intel GPU; no numbers stated; `score 0`
+- `fad1dbaf60` `2024-05-15` **attention** · kernel · kept — use the SDP fp8 causal kernel (phi3); no numbers stated; `score 2`
+- `4053a6ef94` `2024-05-15` **other** · sched · kept — Update environment variable setting in AutoTP with arc; no numbers stated; `score 0`
+- `86cec80b51` `2024-05-15` **other** · other · kept — Add llm inference_cpp_xpu_docker; no numbers stated; `score 0`
+- `d9f71f1f53` `2024-05-15` **other** · instr · kept — Update benchmark util for example using; no numbers stated; `score 0`
+- `1d73fc8106` `2024-05-15` **other** · docs · kept — update cpp quickstart; no numbers stated; `score 0`
+- `93d40ab127` `2024-05-15` **mtp** · other · kept — Update lookahead strategy; no numbers stated; `score 1`
+- `2084ebe4ee` `2024-05-15` **other** · sched · kept — Enable fastchat benchmark latency; no numbers stated; `score 1`
+- `ac384e0f45` `2024-05-15` **gemm** · fusion · kept — fp6 MLP fusion (qkv first removed); no numbers stated; `score 2`
+- `686f6038a8` `2024-05-15` **quant** · knob · kept — Support fp6 save & load; no numbers stated; `score 1`
+- `9942a4ba69` `2024-05-15` **attention** · knob · kept — Support llama2 with transformers==4.38.0; no numbers stated; `score 1`
+- `7e29928865` `2024-05-16` **other** · sched · kept — refactor serving docker image; no numbers stated; `score 0`
+- `59df750326` `2024-05-16` **attention** · kernel · kept — Use new sdp again; no numbers stated; `score 2`
+- `612a365479` `2024-05-16` **other** · other · kept — Install CPU version torch with extras [all]; no numbers stated; `score 0`
+- `9a96af4232` `2024-05-16` **other** · docs · removed — Remove oneAPI pip install command in related examples; no numbers stated; `score 0`
+- `4638682140` `2024-05-16` **other** · fix · kept — Fix xpu finetune image path in action; no numbers stated; `score 0`
+- `c62e828281` `2024-05-16` **other** · other · kept — Create release-ipex-llm.yaml; no numbers stated; `score 0`
+- `00d4410746` `2024-05-16` **other** · other · kept — Update cpp docker quickstart; no numbers stated; `score 0`
+- `8cae897643` `2024-05-16` **attention** · other · kept — use new rope in phi3; no numbers stated; `score 1`
+- `6be70283b7` `2024-05-16` **attention** · fix · kept — fix chatglm run error; no numbers stated; `score 1`
+- `16b2a418be` `2024-05-16` **attention** · kernel · kept — hotfix native_sdp ut; no numbers stated; `score 2`
+
+*Commits 2701-2800 (2024-04-26..2024-05-16): scores 0/1/2/3 = 63/27/10/0; areas other 65, attention 21, mtp 4, gemm 3.*
+
+- `192ae35012` `2024-05-16` **quant** · knob · kept — Add support for llama2 quantize_kv with transformers 4.38.0; no numbers stated; `score 1`
+- `3a72e5df8c` `2024-05-17` **quant** · fusion · kept — disable mlp fusion of fp6 on mtl; no numbers stated; `score 2`
+- `fff067d240` `2024-05-17` **other** · other · kept — Make install ut for cpu exactly the same as what we want for users; no numbers stated; `score 0`
+- `d963e95363` `2024-05-17` **other** · docs · kept — Modify CPU Installation Command for documentation; no numbers stated; `score 0`
+- `b3027e2d60` `2024-05-17` **other** · other · kept — Update for cpu install option in performance tests; no numbers stated; `score 0`
+- `84239d0bd3` `2024-05-17` **other** · docs · kept — Update docker image tags in Docker Quickstart; no numbers stated; `score 0`
+- `981d668be6` `2024-05-17` **attention** · other · kept — refactor baichuan2-7b; no numbers stated; `score 1`
+- `f1156e6b20` `2024-05-17` **other** · knob · kept — support gguf_q4k_m / gguf_q4k_s; no numbers stated; `score 1`
+- `56cb992497` `2024-05-17` **other** · other · kept — Modify CPU Installation Command for most examples; no numbers stated; `score 0`
+- `67db925112` `2024-05-17` **other** · sched · kept — Add vllm quickstart; no numbers stated; `score 0`
+- `31ce3e0c13` `2024-05-17` **attention** · other · kept — refactor baichuan2-13b; no numbers stated; `score 1`
+- `dfac168d5f` `2024-05-17` **other** · docs · kept — fix format/typo; no numbers stated; `score 0`
+- `f60565adc7` `2024-05-17` **other** · sched · kept — Fix toc for vllm serving quickstart; no numbers stated; `score 0`
+- `a2e1578fd9` `2024-05-20` **other** · knob · kept — Merge tgi_api_server to main; no numbers stated; `score 1`
+- `7170dd9192` `2024-05-20` **other** · sched · kept — Update guide for running qwen with AutoTP; no numbers stated; `score 0`
+- `4e97047d70` `2024-05-20` **attention** · fix · kept — fix baichuan2 13b fp16; no numbers stated; `score 1`
+- `74950a152a` `2024-05-20` **other** · fix · kept — Fix tgi_api_server error file name; no numbers stated; `score 1`
+- `d830a63bb7` `2024-05-20` **attention** · other · kept — refactor qwen; no numbers stated; `score 1`
+- `842d6dfc2d` `2024-05-21` **other** · docs · kept — Further Modify CPU example; no numbers stated; `score 0`
+- `ecb16dcf14` `2024-05-21` **other** · sched · kept — Add deepspeed autotp support for xpu docker; no numbers stated; `score 0`
+- `1210491748` `2024-05-21` **other** · other · kept — ChatGLM3, Baichuan2 and Qwen1.5 QLoRA example; no numbers stated; `score 0`
+- `492ed3fd41` `2024-05-21` **other** · docs · kept — Add verified models to GPU finetune README; no numbers stated; `score 0`
+- `f00625f9a4` `2024-05-21` **attention** · other · kept — refactor qwen2; no numbers stated; `score 1`
+- `f654f7e08c` `2024-05-21` **other** · sched · kept — Add serving docker quickstart; no numbers stated; `score 0`
+- `71bcd18f44` `2024-05-21` **attention** · fix · kept — fix qwen vl; no numbers stated; `score 1`
+- `8fdc8fb197` `2024-05-22` **other** · other · kept — Quickstart: Run/Develop PyTorch in VSCode with Docker on Intel GPU; no numbers stated; `score 0`
+- `bf0f904e66` `2024-05-22` **other** · docs · kept — Update level_zero on MTL linux; no numbers stated; `score 0`
+- `584439e498` `2024-05-22` **other** · other · kept — update homepage url for ipex-llm; no numbers stated; `score 0`
+- `4fd1df9cf6` `2024-05-22` **other** · other · kept — Add toc for docker quickstarts; no numbers stated; `score 0`
+- `1c5ed9b6cf` `2024-05-22` **other** · other · kept — Fix arc ut; no numbers stated; `score 0`
+- `f6c9ffe4dc` `2024-05-22` **other** · docs · kept — Add WANDB_MODE and HF_HUB_OFFLINE to XPU finetune README; no numbers stated; `score 0`
+- `f63172ef63` `2024-05-22` **other** · other · kept — Align ppl with llama.cpp; no numbers stated; `score 0`
+- `15d906a97b` `2024-05-22` **other** · other · kept — Update linux igpu run script; no numbers stated; `score 0`
+- `cd4dff09ee` `2024-05-22` **attention** · knob · kept — support phi-3 vision; no numbers stated; `score 1`
+- `d36b41d59e` `2024-05-22` **other** · other · kept — Add `setuptools` limitation for `ipex-llm[xpu]`; no numbers stated; `score 0`
+- `e0f401d97d` `2024-05-23` **other** · fix · kept — FIX: APT Repository not working (signatures invalid); no numbers stated; `score 0`
+- `0e53f20edb` `2024-05-23` **attention** · knob · kept — support running internlm-xcomposer2 on cpu; no numbers stated; `score 1`
+- `c5e8b90c8d` `2024-05-23` **attention** · other · kept — Add Qwen register attention implemention; no numbers stated; `score 1`
+- `37b98a531f` `2024-05-23` **attention** · kernel · kept — support running internlm xcomposer2 on gpu and add sdp optimization; no numbers stated; `score 2`
+- `797dbc48b8` `2024-05-23` **other** · fix · kept — fix phi-2 and phi-3 convert; no numbers stated; `score 1`
+- `7ed270a4d8` `2024-05-24` **other** · fix · removed — update readme docker section, fix quickstart title, remove chs figure; no numbers stated; `score 0`
+- `b3f6faa038` `2024-05-24` **other** · sched · kept — Add CPU vLLM entrypoint; no numbers stated; `score 0`
+- `1443b802cc` `2024-05-24` **other** · fix · removed — Docker：Fix building cpp_docker and remove unimportant dependencies; no numbers stated; `score 0`
+- `1291165720` `2024-05-24` **other** · sched · kept — Add quickstart for vLLM cpu; no numbers stated; `score 0`
+- `0a06a6e1d4` `2024-05-23` **other** · other · kept — Update tests for transformers 4.36; no numbers stated; `score 0`
+- `011b9faa5c` `2024-05-24` **attention** · other · kept — unify baichuan2-13b alibi mask dtype with model dtype.; no numbers stated; `score 1`
+- `9372ce87ce` `2024-05-24` **attention** · fix · kept — fix internlm xcomposer2 fp16; no numbers stated; `score 1`
+- `1db9d9a63b` `2024-05-24` **attention** · other · kept — optimize internlm2 xcomposer agin; no numbers stated; `score 1`
+- `21a1a973c1` `2024-05-24` **other** · other · removed — Remove axolotl and python3-blinker; no numbers stated; `score 0`
+- `120a0035ac` `2024-05-24` **other** · fix · kept — Fix type mismatch in eval for Baichuan2 QLora example; no numbers stated; `score 0`
+- `85491907f3` `2024-05-24` **other** · docs · kept — Update GIF link; no numbers stated; `score 0`
+- `373f9e6c79` `2024-05-24` **other** · other · kept — add ipex-llm-init.bat for Windows; no numbers stated; `score 0`
+- `65f4212f89` `2024-05-24` **attention** · fix · kept — Fix qwen 14b run into register attention fwd; no numbers stated; `score 1`
+- `7f772c5a4f` `2024-05-24` **other** · sched · kept — Add half precision for fastchat models; no numbers stated; `score 1`
+- `1dc680341b` `2024-05-24` **other** · fix · kept — fix phi-3-vision import; no numbers stated; `score 1`
+- `63e95698eb` `2024-05-24` **sync** · sched · kept — Reopen autotp generate_stream; no numbers stated; `score 0`
+- `fabc395d0d` `2024-05-24` **other** · sched · kept — add langchain vllm interface; no numbers stated; `score 0`
+- `ab476c7fe2` `2024-05-24` **mtp** · other · kept — Eagle Speculative Sampling examples; no numbers stated; `score 0`
+- `367de141f2` `2024-05-27` **moe** · fix · kept — Fix mixtral-8x7b with transformers=4.37.0; no numbers stated; `score 1`
+- `d550af957a` `2024-05-27` **mtp** · fix · kept — fix security issue of eagle; no numbers stated; `score 0`
+- `5c8ccf0ba9` `2024-05-27` **other** · sched · kept — Add Pipeline-Parallel-FastAPI example; no numbers stated; `score 0`
+- `34dab3b4ef` `2024-05-27` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `daf7b1cd56` `2024-05-27` **other** · fix · kept — Fix image using two cards error; no numbers stated; `score 0`
+- `c9168b85b7` `2024-05-27` **other** · fix · kept — Fix error during merging adapter; no numbers stated; `score 1`
+- `b6b70d1ba0` `2024-05-28` **attention** · other · kept — Divide core-xe packages; no numbers stated; `score 0`
+- `25b6402315` `2024-05-28` **other** · other · kept — Add Windows GPU unit test; no numbers stated; `score 0`
+- `3464440839` `2024-05-28` **attention** · fix · kept — fix qwen import error; no numbers stated; `score 1`
+- `d307622797` `2024-05-28` **attention** · kernel · kept — fix first token sdp with batch; no numbers stated; `score 2`
+- `b44cf405e2` `2024-05-28` **other** · sched · kept — Refine Pipeline-Parallel-Fastapi example README; no numbers stated; `score 0`
+- `83bd9cb681` `2024-05-28` **other** · docs · kept — add new version for cpp quickstart and keep an old version; no numbers stated; `score 0`
+- `62b2d8af6b` `2024-05-28` **mtp** · other · kept — Add lookahead in all-in-one; no numbers stated; `score 0`
+- `33852bd23e` `2024-05-28` **other** · sched · kept — Refactor pipeline parallel device config; no numbers stated; `score 0`
+- `bc5008f0d5` `2024-05-28` **attention** · kernel · kept — disable sdp_causal in phi-3 to fix overflow; no numbers stated; `score 2`
+- `7cc43aa67a` `2024-05-28` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `751e1a4e29` `2024-05-29` **other** · sched · kept — Fix concurrent issue in autoTP streming.; no numbers stated; `score 0`
+- `8e25de1126` `2024-05-29` **other** · other · kept — Add codegeex2 example; no numbers stated; `score 0`
+- `e29e2f1c78` `2024-05-29` **quant** · knob · kept — fp8 e4m3 as a type; no numbers stated; `score 2`
+- `9bfbf78bf4` `2024-05-29` **other** · knob · kept — update api usage of xe_batch & fp16; no numbers stated; `score 0`
+- `2299698b45` `2024-05-29` **other** · sched · kept — Refine Pipeline Parallel FastAPI example; no numbers stated; `score 0`
+- `93146b9433` `2024-05-29` **mtp** · other · kept — Reconstruct Speculative Decoding example directory; no numbers stated; `score 0`
+- `dcbf4d3d0a` `2024-05-30` **other** · other · kept — Add phi-3-vision example; no numbers stated; `score 0`
+- `50ee004ac7` `2024-05-30` **other** · sched · kept — Fix vllm condition; no numbers stated; `score 1`
+- `4127b99ed6` `2024-05-30` **other** · fix · kept — Fix null pointer dereferences error.; no numbers stated; `score 1`
+- `c0f1be6aea` `2024-05-30` **other** · fix · kept — Fix pp logic; no numbers stated; `score 0`
+- `f0aaa130a9` `2024-05-30` **other** · docs · kept — Update miniconda/anaconda -> miniforge in documentation; no numbers stated; `score 0`
+- `50b5f4476f` `2024-05-31` **other** · other · kept — update q4k convert; no numbers stated; `score 1`
+- `401013a630` `2024-05-31` **other** · other · removed — Remove chatglm_C Module to Eliminate LGPL Dependency; no numbers stated; `score 0`
+- `3eb13ccd8c` `2024-06-03` **other** · sched · kept — fix input length condition in deepspeed all-in-one benchmark.; no numbers stated; `score 0`
+- `15a6205790` `2024-06-03` **other** · fix · kept — Fix LoRA tokenizer for Llama and chatglm; no numbers stated; `score 0`
+- `ff83fad400` `2024-06-03` **other** · docs · kept — Fix typo in vLLM CPU docker guide; no numbers stated; `score 0`
+- `5f13700c9f` `2024-06-03` **attention** · fix · kept — minicpm attention correction; no numbers stated; `score 1`
+- `a644e9409b` `2024-06-04` **other** · docs · kept — Miniconda/Anaconda -> Miniforge update in examples; no numbers stated; `score 0`
+- `d90cd977d0` `2024-06-04` **attention** · other · kept — refactor stablelm; no numbers stated; `score 1`
+- `9f8074c653` `2024-06-04` **other** · other · kept — Add extra warmup for chatglm3-6b in igpu-performance test; no numbers stated; `score 0`
+- `6454655dcc` `2024-06-04` **attention** · kernel · kept — use sdp in baichuan2 13b; no numbers stated; `score 2`
+- `f02f097002` `2024-06-04` **other** · docs · kept — Fix vLLM verion in CPU/vLLM-Serving example README; no numbers stated; `score 0`
+- `711fa0199e` `2024-06-04` **quant** · fix · kept — Fix fp6k phi3 ppl core dump; no numbers stated; `score 0`
+- `ce3f08b25a` `2024-06-04` **other** · fix · kept — Fix IPEX auto importer; no numbers stated; `score 0`
+- `1dde204775` `2024-06-04` **other** · other · kept — update q6k; no numbers stated; `score 1`
+- `744042d1b2` `2024-06-04` **attention** · other · removed — remove software-properties-common from Dockerfile; no numbers stated; `score 0`
+
+*Commits 2801-2900 (2024-05-16..2024-06-04): scores 0/1/2/3 = 65/29/6/0; areas other 68, attention 22, quant 4, mtp 4.*
+
+- `3ef4aa98d1` `2024-06-04` **other** · sched · kept — Refine vllm_quickstart doc; no numbers stated; `score 0`
+- `ac3d53ff5d` `2024-06-04` **other** · sched · kept — Fix vLLM CPU version error; no numbers stated; `score 0`
+- `f93664147c` `2024-06-04` **other** · other · kept — Update config.yaml; no numbers stated; `score 0`
+- `bb83bc23fd` `2024-06-04` **attention** · fix · kept — Fix Starcoder issue on CPU on transformers 4.36+; no numbers stated; `score 1`
+- `566691c5a3` `2024-06-05` **attention** · kernel · kept — quantized attention forward for minicpm; no numbers stated; `score 2`
+- `1f2057b16a` `2024-06-05` **other** · fix · kept — Fix ipex-llm-cpu docker image; no numbers stated; `score 0`
+- `dc4fea7e3f` `2024-06-05` **other** · knob · kept — always cleanup conda env after build; no numbers stated; `score 0`
+- `231b968aba` `2024-06-05` **other** · knob · kept — Modify the check_results.py to support batch 2&4; no numbers stated; `score 0`
+- `a6674f5bce` `2024-06-05` **moe** · fusion · kept — Fix `should_use_fuse_rope` error of Qwen1.5-MoE-A2.7B-Chat; no numbers stated; `score 2`
+- `ed67435491` `2024-06-05` **quant** · knob · kept — Support Fp6 k in ipex-llm; no numbers stated; `score 1`
+- `af96579c76` `2024-06-05` **other** · docs · kept — Update installation guide for pipeline parallel inference; no numbers stated; `score 0`
+- `a27a559650` `2024-06-05` **other** · docs · kept — Add some information in FAQ to help users solve "RuntimeError: could not create a primitive" error on Windows; no numbers stated; `score 0`
+- `bfa1367149` `2024-06-05` **other** · other · kept — Add CPU and GPU example for MiniCPM; no numbers stated; `score 0`
+- `f6d5c6af78` `2024-06-05` **other** · fix · kept — fix issue 1407; no numbers stated; `score 1`
+- `09c6780d0c` `2024-06-05` **other** · docs · kept — phi-2 transformers 4.37; no numbers stated; `score 0`
+- `6be24fdd28` `2024-06-06` **other** · other · kept — OSPDT: add tpp licenses; no numbers stated; `score 0`
+- `ba27e750b1` `2024-06-06` **attention** · other · kept — refactor yuan2; no numbers stated; `score 1`
+- `c4e5806e01` `2024-06-06` **attention** · other · kept — add latest optimization in starcoder2; no numbers stated; `score 1`
+- `e738ec38f4` `2024-06-06` **quant** · knob · kept — disable quantize kv in specific qwen model; no numbers stated; `score 1`
+- `2e4ccd541c` `2024-06-06` **attention** · fix · kept — fix qwen2 cpu; no numbers stated; `score 1`
+- `c825a7e1e9` `2024-06-06` **other** · other · kept — change the workflow file to test ftp; no numbers stated; `score 0`
+- `b6234eb4e2` `2024-06-06` **other** · other · kept — Add task in allinone; no numbers stated; `score 0`
+- `8aabb5bac7` `2024-06-06` **other** · knob · kept — Enable CodeQL Check for CT39; no numbers stated; `score 0`
+- `eeffeeb2e2` `2024-06-06` **other** · instr · kept — fix benchmark script; no numbers stated; `score 0`
+- `2f809116e2` `2024-06-06` **attention** · other · kept — optimize Chatglm4; no numbers stated; `score 1`
+- `85df5e7699` `2024-06-07` **other** · instr · kept — fix nightly perf test; no numbers stated; `score 0`
+- `8c36b5bdde` `2024-06-07` **other** · other · kept — Add qwen2 example; no numbers stated; `score 0`
+- `375174af33` `2024-06-07` **other** · docs · kept — Small qwen2 link fix; no numbers stated; `score 0`
+- `b7948671de` `2024-06-07` **other** · other · kept — Add look up table in 1st token stage; no numbers stated; `score 1`
+- `7b753dc8ca` `2024-06-07` **other** · docs · kept — Update sample output for HF Qwen2 GPU and CPU; no numbers stated; `score 0`
+- `ef8e9b2ecd` `2024-06-07` **moe** · other · kept — Refactor qwen2 moe; no numbers stated; `score 1`
+- `6f2684e5c9` `2024-06-07` **mem** · other · kept — Update pp llama.py to save memory; no numbers stated; `score 0`
+- `1aa9c9597a` `2024-06-07` **other** · other · kept — Avoid duplicate import in IPEX auto importer; no numbers stated; `score 1`
+- `ea0d03fd28` `2024-06-07` **attention** · other · kept — Refactor baichuan1 7B and 13B; no numbers stated; `score 1`
+- `2623944604` `2024-06-07` **attention** · kernel · kept — qwen2 sdpa small fix; no numbers stated; `score 2`
+- `151fcf37bb` `2024-06-07` **attention** · other · kept — check devie name in use_flash_attention; no numbers stated; `score 1`
+- `dbc3c2d72d` `2024-06-07` **attention** · kernel · kept — glm4 sdp; no numbers stated; `score 2`
+- `42fab480ea` `2024-06-07` **attention** · knob · kept — support stablm2 12b; no numbers stated; `score 1`
+- `4b07712fd8` `2024-06-07` **other** · sched · kept — Fix vLLM CPU model convert mismatch; no numbers stated; `score 1`
+- `70b17c87be` `2024-06-07` **other** · other · kept — Merge multiple batches; no numbers stated; `score 0`
+- `fac49f15e3` `2024-06-11` **other** · instr · removed — Remove manual importing ipex in all-in-one benchmark; no numbers stated; `score 0`
+- `10e480ee96` `2024-06-11` **attention** · other · kept — refactor internlm and internlm2; no numbers stated; `score 1`
+- `0d9cc9c106` `2024-06-12` **other** · other · removed — Remove duplicate check for ipex; no numbers stated; `score 1`
+- `40fc8704c4` `2024-06-12` **other** · other · kept — Add GPU example for GLM-4; no numbers stated; `score 0`
+- `f224e98297` `2024-06-12` **other** · other · kept — Add GLM-4 CPU example; no numbers stated; `score 0`
+- `e7a4e2296f` `2024-06-12` **other** · fusion · kept — Add Stable Diffusion examples on GPU and CPU; no numbers stated; `score 0`
+- `d99423b75a` `2024-06-12` **other** · docs · kept — Readme demo; no numbers stated; `score 0`
+- `cffb932f05` `2024-06-12` **sync** · sched · kept — Expose timeout for streamer for fastchat worker; no numbers stated; `score 1`
+- `592f7aa61e` `2024-06-12` **attention** · kernel · kept — Refine glm1-4 sdp; no numbers stated; `score 2`
+- `2e75bbccf9` `2024-06-12` **other** · sched · kept — Add more control arguments for benchmark_vllm_throughput; no numbers stated; `score 0`
+- `b61f6e3ab1` `2024-06-12` **other** · other · kept — Add update_parent_folder for nightly_perf_test; no numbers stated; `score 0`
+- `8edcdeb0e7` `2024-06-12` **gemm** · fix · kept — Fix bug that torch.ops.torch_ipex.matmul_bias_out cannot work on Linux MTL for short input; no numbers stated; `score 1`
+- `14b1e6b699` `2024-06-12` **other** · fix · kept — Fix gguf_q4k; no numbers stated; `score 0`
+- `220151e2a1` `2024-06-13` **other** · sched · kept — Refactor pipeline parallel multi-stage implementation; no numbers stated; `score 0`
+- `986af21896` `2024-06-13` **other** · instr · kept — fix perf test; no numbers stated; `score 0`
+- `57a023aadc` `2024-06-13` **other** · sched · kept — Fix vllm tp; no numbers stated; `score 1`
+- `ea372cc472` `2024-06-13` **other** · docs · kept — update demos section; no numbers stated; `score 0`
+- `01fe0fc1a2` `2024-06-13` **attention** · other · kept — refactor chatglm2/3; no numbers stated; `score 1`
+- `84f04087fb` `2024-06-13` **other** · other · kept — Add intelanalytics/ipex-llm:sources image for OSPDT; no numbers stated; `score 0`
+- `bfab294f08` `2024-06-13` **other** · docs · kept — Update langchain-chatchat QuickStart to include Core Ultra iGPU Linux Guide; no numbers stated; `score 0`
+- `9760ffc256` `2024-06-13` **other** · fix · kept — Fix SDLe CT222 Vulnerabilities; no numbers stated; `score 0`
+- `a24666b8f3` `2024-06-13` **attention** · fix · kept — fix chatglm3-6b-32k; no numbers stated; `score 1`
+- `3682c6a979` `2024-06-13` **other** · other · kept — add glm4 and qwen2 to igpu perf; no numbers stated; `score 0`
+- `f97cce2642` `2024-06-13` **other** · sched · kept — Fix import error of ds autotp; no numbers stated; `score 0`
+- `60cb1dac7c` `2024-06-13` **attention** · knob · kept — Support PP for qwen1.5; no numbers stated; `score 0`
+- `5e25766855` `2024-06-13` **attention** · fix · kept — chatglm2-32k/3-128k attention corrections; no numbers stated; `score 1`
+- `f1410d6823` `2024-06-13` **attention** · other · kept — refactor chatglm4; no numbers stated; `score 1`
+- `1b0c4c8cb8` `2024-06-13` **attention** · other · kept — use new rotary two in chatglm4; no numbers stated; `score 1`
+- `7f65836cb9` `2024-06-14` **attention** · fix · kept — fix chatglm2/3-32k/128k fp16; no numbers stated; `score 1`
+- `91965b5d05` `2024-06-14` **attention** · kernel · kept — add glm_sdpa back to fix chatglm-6b; no numbers stated; `score 2`
+- `0e7a31a09c` `2024-06-14` **other** · docs · kept — ChatGLM Examples Restructure regarding Installation Steps; no numbers stated; `score 0`
+- `9e4d87a696` `2024-06-14` **other** · docs · kept — Langchain-chatchat QuickStart small link fix; no numbers stated; `score 0`
+- `4359ab3172` `2024-06-14` **sync** · sched · kept — Add /generate_stream endpoint for Pipeline-Parallel-FastAPI example; no numbers stated; `score 0`
+- `77809be946` `2024-06-14` **other** · sched · kept — Install packages for ipex-llm-serving-cpu docker image; no numbers stated; `score 0`
+- `f5ef94046e` `2024-06-14` **other** · other · kept — exclude dolly-v2-12b for arc perf test; no numbers stated; `score 0`
+- `e8dd8e97ef` `2024-06-14` **mtp** · fix · kept — fix chatglm lookahead on ARC; no numbers stated; `score 1`
+- `8a3247ac71` `2024-06-14` **gemm** · knob · kept — support batch forward for q4_k, q6_k; no numbers stated; `score 1`
+- `0af0102e61` `2024-06-14` **quant** · knob · kept — quantization scale search switch; no numbers stated; `score 1`
+- `be00380f1a` `2024-06-17` **other** · sched · kept — Fix pipeline parallel inference past_key_value error in Baichuan; no numbers stated; `score 0`
+- `6ea1e71af0` `2024-06-17` **other** · instr · kept — Update PP inference benchmark script; no numbers stated; `score 0`
+- `1978f63f6b` `2024-06-17` **other** · fix · kept — Fix igpu performance guide regarding html generation; no numbers stated; `score 0`
+- `a2a5890b48` `2024-06-17` **other** · other · kept — Make manually-triggered perf test able to choose which test to run; no numbers stated; `score 0`
+- `bca5cbd96c` `2024-06-17` **other** · other · kept — Modify arc nightly perf to fp16; no numbers stated; `score 0`
+- `183e0c6cf5` `2024-06-17` **attention** · knob · kept — glm-4v-9b support; no numbers stated; `score 1`
+- `5d7c9bf901` `2024-06-17` **other** · other · kept — Upgrade accelerate to 0.23.0; no numbers stated; `score 0`
+- `bc4bafffc7` `2024-06-17` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `99b309928b` `2024-06-17` **mtp** · knob · kept — Add lookahead in test_api: transformer_int4_fp16_gpu; no numbers stated; `score 0`
+- `ef4b6519fb` `2024-06-17` **attention** · sched · kept — Add phi-3 model support for pipeline parallel inference; no numbers stated; `score 0`
+- `de4bb97b4f` `2024-06-17` **other** · other · removed — Remove accelerate 0.23.0 install command in readme and docker; no numbers stated; `score 0`
+- `e50c890e1f` `2024-06-18` **other** · knob · kept — Support finishing PP inference once `eos_token_id` is found; no numbers stated; `score 0`
+- `5dad33e5af` `2024-06-18` **quant** · knob · kept — fp8 e4m3 scale search; no numbers stated; `score 1`
+- `00f322d8ee` `2024-06-18` **other** · sched · kept — Finetune ChatGLM with Deepspeed Zero3 LoRA; no numbers stated; `score 0`
+- `1f39bb84c7` `2024-06-18` **other** · docs · kept — update readthedocs perf data; no numbers stated; `score 0`
+- `44f22cba70` `2024-06-18` **other** · knob · kept — add config and default value; no numbers stated; `score 0`
+- `694912698e` `2024-06-18` **other** · fix · kept — Upgrade scikit-learn to 1.5.0 to fix dependabot issue; no numbers stated; `score 0`
+- `83082e5cc7` `2024-06-18` **other** · knob · kept — add initial support for intel npu acceleration library; no numbers stated; `score 1`
+- `c9b4cadd81` `2024-06-18` **other** · sched · kept — fix vLLM/docker issues; no numbers stated; `score 0`
+- `ef9f740801` `2024-06-18` **other** · sched · kept — Docs: Fix CPU Serving Docker README; no numbers stated; `score 0`
+- `f6cd628cd8` `2024-06-18` **other** · docs · kept — Fix script usage in vLLM CPU Quickstart; no numbers stated; `score 0`
+- `67a1e05876` `2024-06-18` **other** · other · removed — Remove zero3 context manager from LoRA; no numbers stated; `score 0`
+
+*Commits 2901-3000 (2024-06-04..2024-06-18): scores 0/1/2/3 = 62/32/6/0; areas other 64, attention 23, quant 4, moe 2.*
+
+- `c44b1942ed` `2024-06-18` **attention** · fix · kept — fix mistral for transformers>=4.39; no numbers stated; `score 1`
+- `ae7b662ed2` `2024-06-19` **gemm** · fix · kept — add fp16 NPU Linear support and fix intel_npu_acceleration_library version 1.0 support; no numbers stated; `score 1`
+- `271d82a4fc` `2024-06-19` **other** · other · kept — Update readme; no numbers stated; `score 0`
+- `1eb884a249` `2024-06-19` **other** · other · kept — IPEX Duplicate importer V2; no numbers stated; `score 1`
+- `ae452688c2` `2024-06-19` **other** · other · kept — Add NPU HF example; no numbers stated; `score 0`
+- `5283df0078` `2024-06-19` **other** · other · kept — Add RAGFlow with Ollama Example QuickStart; no numbers stated; `score 0`
+- `13727635e8` `2024-06-19` **other** · other · kept — revise ragflow quickstart; no numbers stated; `score 0`
+- `a721c1ae43` `2024-06-19` **other** · docs · kept — minor fix of ragflow_quickstart.md; no numbers stated; `score 0`
+- `b2f62a8561` `2024-06-20` **other** · other · kept — Add batch 4 perf test; no numbers stated; `score 0`
+- `05a8d051f6` `2024-06-20` **other** · fix · kept — Fix run.py run_ipex_fp16_gpu; no numbers stated; `score 0`
+- `ed4c439497` `2024-06-20` **other** · docs · kept — small fix; no numbers stated; `score 0`
+- `a5e7d93242` `2024-06-20` **gemm** · knob · kept — Add initial save/load low bit support for NPU(now only fp16 is supported); no numbers stated; `score 1`
+- `9601fae5d5` `2024-06-20` **other** · docs · kept — fix system note; no numbers stated; `score 0`
+- `769728c1eb` `2024-06-20` **other** · docs · kept — Add initial md docs; no numbers stated; `score 0`
+- `c0e86c523a` `2024-06-20` **moe** · other · kept — Add qwen-moe batch1 to nightly perf; no numbers stated; `score 0`
+- `d9dd1b70bd` `2024-06-20` **other** · docs · removed — Remove example page in mddocs; no numbers stated; `score 0`
+- `5aa3e427a9` `2024-06-20` **other** · fix · kept — Fix docker images; no numbers stated; `score 0`
+- `f0fdfa081b` `2024-06-20` **attention** · other · kept — Optimize qwen 1.5 14B batch performance; no numbers stated; `score 1`
+- `8c9f877171` `2024-06-20` **other** · docs · kept — Update part of Quickstart guide in mddocs (1/2); no numbers stated; `score 0`
+- `9a3a21e4fc` `2024-06-20` **other** · docs · kept — Update part of Quickstart guide in mddocs (2/2); no numbers stated; `score 0`
+- `4ba82191f2` `2024-06-21` **attention** · knob · kept — Support PP inference for chatglm3; no numbers stated; `score 0`
+- `33b9a9c4c9` `2024-06-21` **other** · docs · kept — Update part of Overview guide in mddocs (1/2); no numbers stated; `score 0`
+- `1a1a97c9e4` `2024-06-21` **other** · docs · kept — Update mddocs for part of Overview (2/2) and Inference; no numbers stated; `score 0`
+- `fed79f106b` `2024-06-21` **other** · docs · kept — Update mddocs for DockerGuides; no numbers stated; `score 0`
+- `9b475c07db` `2024-06-21` **other** · docs · kept — Add missing ragflow quickstart in mddocs and update legecy contents; no numbers stated; `score 0`
+- `21fc781fce` `2024-06-21` **other** · other · kept — Add GLM-4V example; no numbers stated; `score 0`
+- `b30bf7648e` `2024-06-21` **other** · sched · kept — Fix vLLM CPU api_server params; no numbers stated; `score 1`
+- `54f9d07d8f` `2024-06-21` **other** · docs · kept — Further mddocs fixes; no numbers stated; `score 0`
+- `072ce7e66d` `2024-06-21` **other** · docs · kept — update README links to mddocs; no numbers stated; `score 0`
+- `a027121530` `2024-06-21` **other** · docs · kept — Small mddoc fixed based on review; no numbers stated; `score 0`
+- `aafd6d55cd` `2024-06-21` **other** · docs · kept — Add initial python api doc in mddoc (1/2); no numbers stated; `score 0`
+- `b200e11e21` `2024-06-21` **other** · docs · kept — Add initial python api doc in mddoc (2/2); no numbers stated; `score 0`
+- `4cb9a4728e` `2024-06-21` **other** · knob · kept — Add index page for API doc & links update in mddocs; no numbers stated; `score 0`
+- `2004fe1a43` `2024-06-21` **other** · docs · kept — Small fix; no numbers stated; `score 0`
+- `0c67639539` `2024-06-21` **other** · sched · kept — Add more examples for pipeline parallel inference; no numbers stated; `score 0`
+- `475b0213d2` `2024-06-21` **other** · docs · kept — README update (API doc and FAQ and minor fixes); no numbers stated; `score 0`
+- `7507000ef2` `2024-06-21` **attention** · fix · kept — Fix 1383 Llama model on transformers=4.41[WIP]; no numbers stated; `score 1`
+- `abe53eaa4f` `2024-06-24` **mem** · other · kept — optimize qwen1.5/2 memory usage when running long input with fp16; no numbers stated; `score 1`
+- `c985912ee3` `2024-06-24` **other** · docs · kept — Add Deepspeed LoRA dependencies in document; no numbers stated; `score 0`
+- `ccb3fb357a` `2024-06-24` **other** · docs · kept — Add mddocs index; no numbers stated; `score 0`
+- `5e823ef2ce` `2024-06-24` **other** · fix · kept — Fix nightly arc perf; no numbers stated; `score 0`
+- `ecb9efde65` `2024-06-24` **other** · docs · kept — Workaround if demo preview image load slow in mddocs; no numbers stated; `score 0`
+- `75f836f288` `2024-06-24` **other** · other · kept — Add extra warmup for THUDM/glm-4-9b-chat in igpu-performance test; no numbers stated; `score 0`
+- `9e4ee61737` `2024-06-24` **other** · other · kept — rename BIGDL_OPTIMIZE_LM_HEAD to IPEX_LLM_LAST_LM_HEAD and add qwen2; no numbers stated; `score 1`
+- `34c15d3a10` `2024-06-25` **other** · docs · kept — update pp document; no numbers stated; `score 0`
+- `8ddae22cfb` `2024-06-25` **other** · sched · kept — Refactor Pipeline-Parallel-FastAPI example; no numbers stated; `score 0`
+- `3b23de684a` `2024-06-25` **other** · docs · kept — update npu examples; no numbers stated; `score 0`
+- `aacc1fd8c0` `2024-06-25` **attention** · sched · kept — Fix shape error when run qwen1.5-14b using deepspeed autotp; no numbers stated; `score 1`
+- `e473b8d946` `2024-06-25` **attention** · sched · kept — Add more qwen1.5 and qwen2 support for pipeline parallel inference; no numbers stated; `score 0`
+- `9f6e5b4fba` `2024-06-25` **other** · other · kept — optimize llama npu perf; no numbers stated; `score 1`
+- `ca0e69c3a7` `2024-06-26` **other** · other · kept — optimize npu llama perf again; no numbers stated; `score 1`
+- `40fa23560e` `2024-06-25` **other** · fix · kept — Fix LLAVA example on CPU; no numbers stated; `score 0`
+- `a45ceac4e4` `2024-06-26` **other** · docs · kept — Update main readme for missing quickstarts; no numbers stated; `score 0`
+- `99cd16ef9f` `2024-06-26` **other** · sched · kept — Fix error while using pipeline parallism; no numbers stated; `score 1`
+- `ab9f7f3ac5` `2024-06-26` **quant** · fix · kept — FIX: Qwen1.5-GPTQ-Int4 inference error; no numbers stated; `score 1`
+- `2a0f8087e3` `2024-06-26` **mem** · other · kept — optimize qwen2 gpu memory usage again; no numbers stated; `score 1`
+- `2939f1ac60` `2024-06-26` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `e9e8f9b4d4` `2024-06-26` **other** · docs · kept — Update Readme; no numbers stated; `score 0`
+- `508c364a79` `2024-06-27` **other** · knob · kept — Add precision option in PP inference examples; no numbers stated; `score 0`
+- `cf0f5c4322` `2024-06-27` **other** · docs · kept — change npu document; no numbers stated; `score 0`
+- `13f59ae6b4` `2024-06-27` **other** · fix · kept — Fix llm binary build linux-build-avxvnni failure; no numbers stated; `score 0`
+- `f89ca23748` `2024-06-27` **other** · other · kept — optimize npu llama2 perf again; no numbers stated; `score 1`
+- `c6e5ad668d` `2024-06-27` **attention** · fix · kept — fix internlm xcomposser meta-instruction typo; no numbers stated; `score 1`
+- `4e4ecd5095` `2024-06-27` **other** · other · kept — Control sys.modules ipex duplicate check with BIGDL_CHECK_DUPLICATE_IMPORT; no numbers stated; `score 1`
+- `029ff15d28` `2024-06-27` **other** · other · kept — optimize npu llama2 first token performance; no numbers stated; `score 1`
+- `987017ef47` `2024-06-27` **other** · sched · kept — Update pipeline parallel serving for more model support; no numbers stated; `score 0`
+- `d0b801d7bc` `2024-06-27` **other** · instr · kept — change write mode in all-in-one benchmark.; no numbers stated; `score 0`
+- `a414e3ff8a` `2024-06-28` **mem** · sched · kept — add pipeline parallel support with load_low_bit; no numbers stated; `score 1`
+- `86b81c09d9` `2024-06-28` **other** · docs · kept — Table of Contents in Quickstart Files; no numbers stated; `score 0`
+- `b7bc1023fb` `2024-06-28` **other** · sched · kept — Add vllm_online_benchmark.py; no numbers stated; `score 0`
+- `fd933c92d8` `2024-06-28` **other** · sched · kept — Fix: Correct num_requests in benchmark for Pipeline Parallel Serving; no numbers stated; `score 0`
+- `e000ac90c4` `2024-06-28` **other** · sched · kept — Add pp_serving example to serving image; no numbers stated; `score 0`
+- `07362ffffc` `2024-07-01` **other** · other · kept — ChatGLM3-6B LoRA Fine-tuning Demo; no numbers stated; `score 0`
+- `319a3b36b2` `2024-07-01` **other** · fix · kept — fix npu llama2; no numbers stated; `score 0`
+- `cf8eb7b128` `2024-07-01` **quant** · knob · kept — Init NPU quantize method and support q8_0_rtn; no numbers stated; `score 1`
+- `39bcb33a67` `2024-07-01` **attention** · kernel · kept — add sdp support for stablelm 3b; no numbers stated; `score 2`
+- `dbba51f455` `2024-07-01` **other** · other · kept — Enable LLM UT workflow to be called in another repo; no numbers stated; `score 0`
+- `48ad482d3d` `2024-07-01` **other** · fix · kept — Fix import error caused by pydantic on cpu; no numbers stated; `score 1`
+- `913e750b01` `2024-07-01` **other** · fix · kept — fix non-string deepseed config path bug; no numbers stated; `score 0`
+- `ec3a912ab6` `2024-07-01` **other** · other · kept — optimize npu llama long context performance; no numbers stated; `score 1`
+- `6bdc562f4c` `2024-07-01` **other** · other · kept — Enable triggering nightly tests/performance tests from another repo; no numbers stated; `score 0`
+- `ca24794dd0` `2024-07-01` **other** · other · kept — Fixes for performance test triggering; no numbers stated; `score 0`
+- `fb4774b076` `2024-07-01` **other** · docs · kept — Update pull request template for manually-ttriggered Unit tests; no numbers stated; `score 0`
+- `a1164e45b6` `2024-07-01` **other** · knob · kept — Enable Release Pypi workflow to be called in another repo; no numbers stated; `score 0`
+- `4fbb0d33ae` `2024-07-01` **other** · other · kept — Pin compute runtime version for xpu images; no numbers stated; `score 0`
+- `4390e7dc49` `2024-07-02` **other** · docs · kept — Fix codegeex2 transformers version; no numbers stated; `score 0`
+- `bb6953c19e` `2024-07-02` **other** · other · kept — Support pr validate perf test; no numbers stated; `score 0`
+- `986b10e397` `2024-07-02` **other** · other · kept — Further fix for performance tests triggered by pr; no numbers stated; `score 0`
+- `1638573f56` `2024-07-02` **other** · docs · kept — Update llama cpp quickstart regarding windows prerequisites to avoid misleading; no numbers stated; `score 0`
+- `5e967205ac` `2024-07-02` **gemm** · kernel · kept — batch forward kernel takes the f32 input (no f16 cast); no numbers stated; `score 2`
+- `6352c718f3` `2024-07-02` **other** · other · kept — merge manually build for testing function to manualy build; no numbers stated; `score 0`
+- `6a0134a9b2` `2024-07-02` **quant** · knob · kept — support q4_0_rtn; no numbers stated; `score 1`
+- `52519e07df` `2024-07-02` **other** · instr · removed — remove models we no longer need in benchmark.; no numbers stated; `score 0`
+- `4e32c92979` `2024-07-02` **other** · other · kept — Further fix for triggering perf test from commit; no numbers stated; `score 0`
+- `e53bd4401c` `2024-07-02` **other** · fix · kept — Small typo fixes in binary build workflow; no numbers stated; `score 0`
+- `18c973dc3e` `2024-07-03` **other** · other · kept — Wang jun/ipex llm workflow; no numbers stated; `score 0`
+- `d97c2664ce` `2024-07-03` **attention** · fusion · kept — use new fuse rope in stablelm family; no numbers stated; `score 2`
+- `e7ab93b55c` `2024-07-03` **other** · docs · kept — Update pull_request_template.md; no numbers stated; `score 0`
+- `9274282ef7` `2024-07-03` **attention** · sched · kept — Support pipeline parallel for glm-4-9b-chat; no numbers stated; `score 0`
+- `61c36ba085` `2024-07-03` **other** · docs · kept — Add pp_serving verified models; no numbers stated; `score 0`
+
+*Commits 3001-3100 (2024-06-18..2024-07-03): scores 0/1/2/3 = 73/24/3/0; areas other 80, attention 10, gemm 3, mem 3.*
+
+- `f84ca99b9f` `2024-07-03` **gemm** · kernel · kept — optimize gemma2 rmsnorm; no numbers stated; `score 2`
+- `932ef78131` `2024-07-03` **other** · other · kept — Update Workflow Inputs, Runner, and PR Validation Process; no numbers stated; `score 0`
+- `bb0a84044b` `2024-07-04` **other** · knob · kept — add qwen2 npu support; no numbers stated; `score 1`
+- `1a8bab172e` `2024-07-04` **attention** · knob · kept — add minicpm 1B/2B npu support; no numbers stated; `score 1`
+- `f07937945f` `2024-07-04` **other** · instr · removed — remove all useless repo-id in benchmark/igpu-perf; no numbers stated; `score 0`
+- `57b8adb189` `2024-07-04` **mem** · knob · kept — Support npu load_low_bit method; no numbers stated; `score 1`
+- `60de428b37` `2024-07-04` **attention** · sched · kept — Support pipeline parallel for qwen-vl; no numbers stated; `score 0`
+- `72b4efaad4` `2024-07-04` **other** · knob · kept — Enhanced XPU Dockerfiles: Optimized Environment Variables and Documentation; no numbers stated; `score 0`
+- `7d8bc83415` `2024-07-05` **other** · sched · kept — Partial Prefilling for Pipeline Parallel Serving; no numbers stated; `score 0`
+- `24de13fc45` `2024-07-05` **other** · other · kept — Optimize stablelm on NPU; no numbers stated; `score 1`
+- `a31f2cbe13` `2024-07-05` **attention** · other · kept — update minicpm.py; no numbers stated; `score 1`
+- `14ce058004` `2024-07-05` **other** · knob · kept — add chatglm3 npu support; no numbers stated; `score 1`
+- `f7e957aaf9` `2024-07-05` **other** · other · kept — Clean npu dtype branch; no numbers stated; `score 1`
+- `1efb6ebe93` `2024-07-05` **gemm** · knob · kept — add `transformer_int4_fp16_loadlowbit_gpu_win` api; no numbers stated; `score 0`
+- `8f376e5192` `2024-07-05` **quant** · other · kept — Change igpu perf to mainly test int4+fp16; no numbers stated; `score 0`
+- `7cb09a8eac` `2024-07-05` **mem** · other · kept — optimize qwen2 memory usage again; no numbers stated; `score 1`
+- `252426793b` `2024-07-08` **quant** · sched · kept — Fix setting of `use_quantize_kv_cache` on different GPU in pipeline parallel; no numbers stated; `score 1`
+- `64cfed602d` `2024-07-08` **other** · instr · kept — Add new models to benchmark; no numbers stated; `score 0`
+- `5a57e54400` `2024-07-08` **other** · other · kept — add 5 new models for igpu-perf; no numbers stated; `score 0`
+- `c26651f91f` `2024-07-08` **other** · knob · kept — add mistral npu support; no numbers stated; `score 1`
+- `9b37ca6027` `2024-07-08` **other** · other · removed — remove; no numbers stated; `score 0`
+- `f9a199900d` `2024-07-08` **mtp** · instr · kept — add model RWKV/v5-Eagle-7B-HF to igpu benchmark; no numbers stated; `score 0`
+- `66f6ffe4b2` `2024-07-08` **other** · other · kept — Update GPU HF-Transformers example structure; no numbers stated; `score 0`
+- `099486afb7` `2024-07-08` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `69701b3ec8` `2024-07-09` **other** · docs · kept — fix typo in python/llm/scripts/README.md; no numbers stated; `score 0`
+- `fa81dbefd3` `2024-07-09` **other** · instr · kept — update multi gpu write csv in all-in-one benchmark.; no numbers stated; `score 0`
+- `a1cede926d` `2024-07-09` **other** · sched · kept — Fix update_kv_cache in Pipeline-Parallel-Serving for glm4-9b model; no numbers stated; `score 1`
+- `2929eb262e` `2024-07-09` **attention** · knob · kept — support npu glm4; no numbers stated; `score 1`
+- `99b2802d3b` `2024-07-09` **mem** · other · kept — optimize qewn2 memory; no numbers stated; `score 1`
+- `76a5802acf` `2024-07-09` **other** · other · kept — update NPU examples; no numbers stated; `score 0`
+- `7dc6756d86` `2024-07-09` **other** · other · kept — add disk embedding; no numbers stated; `score 1`
+- `8982ab73d5` `2024-07-09` **other** · other · kept — Add Yi-6B and StableLM to iGPU perf test; no numbers stated; `score 0`
+- `3c16c9f725` `2024-07-10` **other** · other · kept — Optimize baichuan on NPU; no numbers stated; `score 0`
+- `82f9514303` `2024-07-10` **attention** · other · kept — optimize internlm xcomposer2 performance; no numbers stated; `score 1`
+- `61613b210c` `2024-07-10` **other** · other · kept — try to improve MIniCPM performance; no numbers stated; `score 0`
+- `994e49a510` `2024-07-10` **attention** · other · kept — optimize internlm xcomposser performance again; no numbers stated; `score 1`
+- `028ad4f63c` `2024-07-10` **other** · instr · kept — Add model phi-3-vision-128k-instruct to iGPU-perf benchmark; no numbers stated; `score 0`
+- `51f2effb05` `2024-07-11` **other** · other · kept — Add xpu-tgi manually_build; no numbers stated; `score 0`
+- `70ab1a6f1a` `2024-07-11` **mem** · knob · kept — unify memory optimization env variables.; no numbers stated; `score 1`
+- `105e124752` `2024-07-11` **other** · other · kept — optimize phi3-v encoder npu performance and add multimodal example; no numbers stated; `score 1`
+- `1355b2ce06` `2024-07-11` **other** · other · kept — Add model Qwen-VL-Chat to iGPU-perf; no numbers stated; `score 0`
+- `7f5111a998` `2024-07-11` **other** · sched · kept — Refine start script for Pipeline Parallel Serving; no numbers stated; `score 0`
+- `2b8ad8731e` `2024-07-11` **attention** · sched · kept — Support pipeline parallel for glm-4v; no numbers stated; `score 0`
+- `b9c66994a5` `2024-07-11` **attention** · kernel · kept — add npu sdp; no numbers stated; `score 0`
+- `a945500a98` `2024-07-11` **sync** · fix · kept — fix internlm xcomposser stream chat; no numbers stated; `score 1`
+- `0981b72275` `2024-07-12` **sync** · sched · kept — Fix /generate_stream api in Pipeline Parallel FastAPI; no numbers stated; `score 0`
+- `13a72dc51d` `2024-07-12` **other** · other · kept — Test MiniCPM performance on iGPU in a more stable way; no numbers stated; `score 0`
+- `019da6c0ab` `2024-07-13` **mem** · fusion · kept — use mlp silu_mul fusion in qwen2 to optimize memory usage; no numbers stated; `score 2`
+- `06745e5742` `2024-07-15` **other** · instr · kept — Add npu benchmark all-in-one script; no numbers stated; `score 0`
+- `50cf563a71` `2024-07-15` **other** · other · kept — Add example: MiniCPM-V; no numbers stated; `score 0`
+- `91409ffe8c` `2024-07-16` **other** · docs · kept — Add mtl AOT packages in faq.md; no numbers stated; `score 0`
+- `f06d2f72fb` `2024-07-16` **other** · docs · kept — Add GraphRAG QuickStart; no numbers stated; `score 0`
+- `79c742dfd5` `2024-07-16` **mem** · sched · kept — Add XPU Memory Optimizations for Pipeline Parallel; no numbers stated; `score 1`
+- `c279849d27` `2024-07-16` **other** · knob · kept — add disk embedding api; no numbers stated; `score 1`
+- `99c22745b2` `2024-07-16` **quant** · fix · kept — fix qwen 14b fp6 abnormal output; no numbers stated; `score 1`
+- `365adad59f` `2024-07-16` **other** · knob · kept — Support LoRA ChatGLM with Alpaca Dataset; no numbers stated; `score 0`
+- `06930ab258` `2024-07-16` **other** · knob · kept — Enable ipex-llm optimization for lm head; no numbers stated; `score 1`
+- `5837bc0014` `2024-07-16` **other** · fix · kept — fix chatglm3 npu output; no numbers stated; `score 1`
+- `373ccbbb0c` `2024-07-16` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `9c15abf825` `2024-07-17` **other** · sched · kept — Refactor fastapi-serving and add one card serving; no numbers stated; `score 0`
+- `2b17536424` `2024-07-17` **other** · fix · kept — Fix python style check: update python version to 3.11; no numbers stated; `score 0`
+- `5b6eb85b85` `2024-07-17` **other** · docs · kept — phi model readme; no numbers stated; `score 0`
+- `d64711900a` `2024-07-17` **attention** · fix · kept — Fix cohere model on transformers>=4.41; no numbers stated; `score 0`
+- `bfcdc35b04` `2024-07-17` **other** · docs · kept — phi-3 on "transformers>=4.37.0,<=4.42.3"; no numbers stated; `score 0`
+- `e5c0058c0e` `2024-07-18` **other** · fix · kept — fix baichuan; no numbers stated; `score 1`
+- `f4077fa905` `2024-07-18` **other** · fix · kept — fix llama3-8b npu long input stuck; no numbers stated; `score 1`
+- `4da93709b1` `2024-07-18` **gemm** · build · kept — docs/setup: oneDNN GEMM for the C++ path; no numbers stated; `score 1`
+- `4594a3dd6c` `2024-07-18` **other** · sched · kept — Fix DummyLayer.weight device in Pipeline Parallel; no numbers stated; `score 1`
+- `2478e2c14b` `2024-07-18` **other** · other · kept — Add check in iGPU perf workflow for results integrity; no numbers stated; `score 0`
+- `0209427cf4` `2024-07-18` **other** · knob · kept — Add disk_embedding parameter to support put Embedding layer on CPU; no numbers stated; `score 1`
+- `5a6211fd56` `2024-07-18` **attention** · fix · kept — fix minicpm for transformers>=4.39; no numbers stated; `score 0`
+- `380717f50d` `2024-07-18` **gemm** · kernel · kept — fix gemma for 4.41; no numbers stated; `score 0`
+- `d020ad6397` `2024-07-19` **other** · knob · kept — add save_low_bit support for DiskEmbedding; no numbers stated; `score 1`
+- `d27a8cd08c` `2024-07-19` **other** · sched · kept — Fix Pipeline Parallel dtype; no numbers stated; `score 1`
+- `1eed0635f2` `2024-07-19` **other** · sched · kept — Add lightweight serving and support tgi parameter; no numbers stated; `score 0`
+- `af6d406178` `2024-07-22` **other** · docs · kept — Add section title for conduct graphrag indexing; no numbers stated; `score 0`
+- `ac97b31664` `2024-07-22` **other** · docs · kept — update cpp quickstart about `ONEAPI_DEVICE_SELECTOR`; no numbers stated; `score 0`
+- `4d56ef5646` `2024-07-22` **other** · fix · kept — Fix openssf issue; no numbers stated; `score 0`
+- `060792a648` `2024-07-22` **other** · sched · kept — Refine Pipeline Parallel FastAPI; no numbers stated; `score 1`
+- `7f80db95eb` `2024-07-23` **other** · instr · kept — Change run.py in benchmark to support phi-3-vision in arc-perf; no numbers stated; `score 0`
+- `1b3b46e54d` `2024-07-23` **other** · fix · kept — fix chatglm new model; no numbers stated; `score 1`
+- `777e61d8c8` `2024-07-24` **quant** · fix · kept — Fix qwen2 & int4 on NPU; no numbers stated; `score 1`
+- `4499d25c26` `2024-07-25` **other** · sched · kept — Fix ParallelLMHead convert in vLLM cpu; no numbers stated; `score 1`
+- `2fbd375a94` `2024-07-24` **other** · other · kept — update several models for nightly perf test; no numbers stated; `score 0`
+- `0c6e0b86c0` `2024-07-25` **other** · other · kept — Refine continuation get input_str; no numbers stated; `score 0`
+- `a4d30a8211` `2024-07-25` **other** · sched · kept — Change logic for detecting if vllm is available; no numbers stated; `score 1`
+- `86fc0492f4` `2024-07-26` **other** · other · kept — Update oneccl used; no numbers stated; `score 0`
+- `23681fbf5c` `2024-07-26` **other** · sched · kept — Support codegeex4-9b for lightweight-serving; no numbers stated; `score 0`
+- `6bcdc6cc8f` `2024-07-26` **attention** · fix · kept — fix qwen2 cpu; no numbers stated; `score 1`
+- `fc7f8feb83` `2024-07-26` **kv** · knob · kept — Support compress kv; no numbers stated; `score 1`
+- `ba01b85c13` `2024-07-26` **mem** · other · kept — empty cache only for 1st token but rest token to speed up; no numbers stated; `score 1`
+- `336dfc04b1` `2024-07-26` **other** · docs · kept — fix 1482; no numbers stated; `score 0`
+- `418640e466` `2024-07-27` **other** · docs · kept — Update install_gpu.md; no numbers stated; `score 0`
+- `3e8819734b` `2024-07-29` **gemm** · kernel · kept — add basic gemma2 optimization; no numbers stated; `score 2`
+- `7f88ce23cd` `2024-07-29` **gemm** · kernel · kept — add more gemma2 optimization; no numbers stated; `score 2`
+- `c11d5301d7` `2024-07-29` **attention** · kernel · kept — add sdp fp8 for llama; no numbers stated; `score 2`
+- `6f999e6e90` `2024-07-29` **attention** · kernel · kept — add sdp for gemma2; no numbers stated; `score 2`
+- `1da1f1dd0e` `2024-07-29` **other** · other · kept — Combine two versions of run_wikitext.py; no numbers stated; `score 0`
+- `c02003925b` `2024-07-29` **gemm** · kernel · kept — add mlp for gemma2; no numbers stated; `score 2`
+- `9b36877897` `2024-07-30` **quant** · knob · kept — disable default quantize_kv of GQA on MTL; no numbers stated; `score 1`
+
+*Commits 3101-3200 (2024-07-03..2024-07-30): scores 0/1/2/3 = 53/40/7/0; areas other 64, attention 13, gemm 7, mem 7.*
+
+- `670ad887fc` `2024-07-30` **kv** · knob · kept — Qwen support compress kv; no numbers stated; `score 1`
+- `b119825152` `2024-07-30` **other** · knob · removed — Remove tgi parameter validation; no numbers stated; `score 0`
+- `a44ab32153` `2024-07-30` **other** · docs · kept — Switch to conhost when running on NPU; no numbers stated; `score 0`
+- `6e3ce28173` `2024-07-31` **other** · docs · kept — Upgrade glm-4 example transformers version; no numbers stated; `score 0`
+- `5079ed9e06` `2024-07-31` **other** · other · kept — Add Llama3.1 example; no numbers stated; `score 0`
+- `54bf3a23a6` `2024-07-31` **other** · knob · kept — add fallback for unsupported k-quants; no numbers stated; `score 1`
+- `afeca38a47` `2024-07-31` **other** · sched · kept — Fix import vllm condition; no numbers stated; `score 1`
+- `8ef4caaf5d` `2024-08-01` **other** · other · kept — add 3k and 4k input of nightly perf test on iGPU; no numbers stated; `score 0`
+- `762ad49362` `2024-08-01` **mem** · sched · kept — Add RANK_WAIT_TIME into DeepSpeed-AutoTP to avoid CPU memory OOM; no numbers stated; `score 0`
+- `45c730ff39` `2024-08-01` **attention** · knob · kept — Chatglm support compresskv; no numbers stated; `score 1`
+- `736a7ef72e` `2024-08-01` **attention** · kernel · kept — add `sdp_causal` for mistral 4.36; no numbers stated; `score 2`
+- `8d1e0bd2f4` `2024-08-02` **attention** · kernel · kept — add sdp causal support in llama; no numbers stated; `score 2`
+- `1baa3efe0e` `2024-08-02` **other** · sched · kept — Optimizations for Pipeline Parallel Serving; no numbers stated; `score 1`
+- `aa98ef96fe` `2024-08-02` **other** · other · kept — change mixed_precision to q6_k; no numbers stated; `score 1`
+- `493cbd9a36` `2024-08-05` **other** · sched · kept — Support  lightweight-serving with internlm-xcomposer2-vl-7b multimodal  input; no numbers stated; `score 0`
+- `8fb36b9f4a` `2024-08-05` **other** · instr · kept — add new benchmark_util.py; no numbers stated; `score 0`
+- `808d9a7bae` `2024-08-06` **other** · other · kept — Add MiniCPM-V-2 GPU example; no numbers stated; `score 0`
+- `7f241133da` `2024-08-06` **other** · other · kept — Add MiniCPM-Llama3-V-2_5 GPU example; no numbers stated; `score 0`
+- `f44b732aa8` `2024-08-06` **attention** · knob · kept — support internvl2-4b; no numbers stated; `score 1`
+- `bbdff6edeb` `2024-08-06` **other** · other · kept — optimize internvl2 4b performance; no numbers stated; `score 1`
+- `11650b6f81` `2024-08-06` **other** · docs · kept — upgrade glm-4v example transformers version; no numbers stated; `score 0`
+- `929675aa6b` `2024-08-06` **attention** · knob · kept — support latest phi3; no numbers stated; `score 1`
+- `985213614b` `2024-08-06` **other** · other · removed — Removed no longer needed models for Arc nightly perf; no numbers stated; `score 0`
+- `4676af2054` `2024-08-06` **gemm** · kernel · kept — add `gemma2` example; no numbers stated; `score 0`
+- `e7f7141781` `2024-08-07` **other** · instr · kept — Add benchmark util for transformers 4.42; no numbers stated; `score 1`
+- `e32d13d78c` `2024-08-07` **other** · docs · removed — Remove Out of tree Driver from GPU driver installation document; no numbers stated; `score 0`
+- `c093f7d980` `2024-08-07` **attention** · fix · kept — fix phi3; no numbers stated; `score 1`
+- `a71ae7c22b` `2024-08-07` **attention** · knob · kept — Support minicpm compresskv & modify default compresskv config & default enable compresskv on mtl 2.5k~4.5k; no numbers stated; `score 1`
+- `d2abc9711b` `2024-08-07` **attention** · fix · kept — Fix MTL 4k input qwen2 compresskv error; no numbers stated; `score 1`
+- `00a5574c8a` `2024-08-07` **attention** · fusion · kept — Use `merge_qkv` to replace `fused_qkv` for llama2; no numbers stated; `score 0`
+- `e956e71fc1` `2024-08-07` **attention** · fix · kept — fix conflict with quant kv; no numbers stated; `score 1`
+- `54cc9353db` `2024-08-07` **attention** · knob · kept — support and optimize minicpm-v-2_6; no numbers stated; `score 1`
+- `d0c89fb715` `2024-08-08` **other** · docs · kept — updated llama.cpp and ollama quickstart; no numbers stated; `score 0`
+- `7e61fa1af7` `2024-08-08` **other** · docs · kept — Revise GPU driver related guide in for Windows users; no numbers stated; `score 0`
+- `9e65cf00b3` `2024-08-08` **other** · other · kept — Add openai-whisper pytorch gpu; no numbers stated; `score 0`
+- `107f7aafd0` `2024-08-08` **other** · sched · kept — enable inference mode for deepspeed tp serving; no numbers stated; `score 0`
+- `27b4b104ed` `2024-08-08` **other** · other · kept — Add `qwen2-1.5b-instruct` into igpu performance; no numbers stated; `score 0`
+- `044e486480` `2024-08-09` **other** · sched · kept — Fix vLLM CPU /chat endpoint; no numbers stated; `score 1`
+- `d8808cc2e3` `2024-08-09` **attention** · other · kept — Mistral apply_rotary_pos_emb_no_cache_xpu use rope_theta from config; mistral-7B-instruct-v0.2 and mistral-7B-instruct-v0.1 use different rope_theta (0.2 is 1e, 0.1 is 1e5). Pass self.config; `score 1`
+- `dd46c141bd` `2024-08-09` **attention** · knob · kept — Phi3 support compresskv; no numbers stated; `score 1`
+- `7e917d6cfb` `2024-08-09` **quant** · fix · kept — fix gptq of llama; no numbers stated; `score 1`
+- `93455aac09` `2024-08-09` **attention** · fix · kept — fix minicpm V 2.6 repeat output; no numbers stated; `score 1`
+- `4b9c57cc60` `2024-08-09` **mtp** · knob · kept — Support compress kv with lookahead; no numbers stated; `score 1`
+- `66fe2ee464` `2024-08-09` **sync** · sched · kept — IPEX_LLM_PERFORMANCE_MODE; no numbers stated; `score 2`
+- `245dba0abc` `2024-08-12` **other** · sched · kept — Fix lightweight-serving codegeex error; no numbers stated; `score 1`
+- `fac4c01a6e` `2024-08-12` **other** · docs · kept — Revert to use out-of-tree GPU driver; no numbers stated; `score 0`
+- `57d177738d` `2024-08-12` **attention** · other · kept — optimize minicpm-v-2_6 repetition penalty; no numbers stated; `score 1`
+- `05989ad0f9` `2024-08-12` **other** · other · kept — Update npu example and all in one benckmark; no numbers stated; `score 0`
+- `8db34057b4` `2024-08-12` **mtp** · other · kept — optimize lookahead init time; no numbers stated; `score 0`
+- `1b05caba2b` `2024-08-12` **attention** · fusion · kept — Set mistral fuse rope to false except fp6 & fp16; no numbers stated; `score 2`
+- `f97a77ea4e` `2024-08-12` **other** · instr · kept — Update all-in-one benchmark for `continuation` task input preparation; no numbers stated; `score 0`
+- `841dbcdf3a` `2024-08-12` **mtp** · fix · kept — Fix compresskv with lookahead issue; no numbers stated; `score 1`
+- `a1eb793f70` `2024-08-13` **attention** · other · kept — optimize minicpm v 2_6 firs token perf; no numbers stated; `score 1`
+- `81824ff8c9` `2024-08-13` **other** · instr · kept — Fix stdout in all-in-one benchmark to utf-8; no numbers stated; `score 0`
+- `c28b3389e6` `2024-08-13` **other** · docs · kept — Update npu multimodal example; no numbers stated; `score 0`
+- `23d3acdc77` `2024-08-13` **other** · fusion · kept — Add experimental support of fused decoder layer for llama2; no numbers stated; `score 0`
+- `aa861df066` `2024-08-13` **attention** · kernel · kept — route softmax to the new fp32 kernel (minicpmv, phi3); no numbers stated; `score 2`
+- `a88c132e54` `2024-08-13` **attention** · kernel · kept — Reduce Mistral softmax memory only in low memory mode; no numbers stated; `score 2`
+- `ec184af243` `2024-08-13` **gemm** · other · kept — Add `gemma-2-2b-it` and `gemma-2-9b-it` to igpu nightly performance test; no numbers stated; `score 0`
+- `a184b120c9` `2024-08-13` **attention** · fix · kept — fix minicpm-v 2.5; no numbers stated; `score 1`
+- `70c828b87c` `2024-08-13` **other** · sched · kept — deepspeed zero3 QLoRA finetuning; no numbers stated; `score 1`
+- `3998de14f0` `2024-08-13` **quant** · fix · kept — Fix mistral forward_qkv in q4_0; no numbers stated; `score 1`
+- `7cd6ec9723` `2024-08-13` **attention** · knob · kept — MiniCPM-V support compresskv; no numbers stated; `score 1`
+- `cb79dcda93` `2024-08-14` **other** · fix · kept — refactor llama convert to fix minicpm-v 2.5 optimization; no numbers stated; `score 1`
+- `51bcac1229` `2024-08-13` **other** · fusion · kept — follow up on experimental support of fused decoder layer for llama2; no numbers stated; `score 0`
+- `dbd14251dd` `2024-08-14` **other** · docs · kept — Troubleshoot for sycl not found; no numbers stated; `score 0`
+- `43cca3be27` `2024-08-14` **gemm** · kernel · kept — fix gemma2 runtime error caused by sliding window; no numbers stated; `score 0`
+- `356281cb80` `2024-08-14` **other** · instr · kept — Further all-in-one benchmark update `continuation` task; no numbers stated; `score 0`
+- `3d6cfa291d` `2024-08-14` **attention** · other · kept — optimize minicpm v 2.5; no numbers stated; `score 1`
+- `d8d887edd2` `2024-08-14` **other** · other · kept — added minicpm-v-2_6; no numbers stated; `score 0`
+- `9a93808fc5` `2024-08-14` **attention** · fix · kept — fix and optimize minicpm v 2; no numbers stated; `score 1`
+- `e3c1dae619` `2024-08-14` **other** · other · kept — Fix Windows Unit Test; no numbers stated; `score 0`
+- `016e840eed` `2024-08-15` **other** · other · kept — Fix performance tests; no numbers stated; `score 0`
+- `3ac83f8396` `2024-08-15` **other** · fix · kept — fix: delete ipex extension import in ppl wikitext evaluation; no numbers stated; `score 0`
+- `07b7f13982` `2024-08-15` **attention** · knob · kept — support and optimize qwen2-audio; no numbers stated; `score 1`
+- `f43da2d455` `2024-08-15` **other** · docs · kept — deletion of specification of transformers version; no numbers stated; `score 0`
+- `2fbbb51e71` `2024-08-15` **other** · other · kept — transformers==4.37, yi & yuan2 & vicuna; no numbers stated; `score 0`
+- `447c8ed324` `2024-08-15` **other** · docs · kept — update transformers version for `replit-code-v1-3b`, `internlm2-chat-…; no numbers stated; `score 0`
+- `4e178f0c5d` `2024-08-15` **attention** · other · kept — rewrite minicpmv optimization; no numbers stated; `score 1`
+- `828ab16537` `2024-08-15` **attention** · fix · kept — fix phi3 and minicpmv cpu; no numbers stated; `score 1`
+- `28d1c972da` `2024-08-15` **other** · other · kept — add mixed_precision argument on ppl wikitext evaluation; no numbers stated; `score 0`
+- `6543321f04` `2024-08-15` **gemm** · kernel · removed — Remove 4k igpu perf on gemma-2-9b-it; no numbers stated; `score 0`
+- `750d4ad5dc` `2024-08-15` **attention** · fix · kept — fix minicpm-v-2 fp16; no numbers stated; `score 1`
+- `e70ae0638e` `2024-08-15` **other** · sched · kept — Fix vLLM not convert issues; no numbers stated; `score 1`
+- `5a80fd2633` `2024-08-16` **sync** · sched · kept — Fix lightweight-serving no streaming resp on mtl; no numbers stated; `score 1`
+- `9e9086cc2a` `2024-08-16` **sync** · knob · kept — performance-mode value update; no numbers stated; `score 1`
+- `6a8d07ddb4` `2024-08-16` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `17a0beb21f` `2024-08-16` **attention** · other · kept — optimize qwen2-audio again; no numbers stated; `score 1`
+- `f463268e36` `2024-08-16` **other** · docs · kept — fix: add run oneAPI instruction for the example of codeshell; no numbers stated; `score 0`
+- `adfbb9124a` `2024-08-16` **other** · other · kept — Reorganize MiniCPM-V-2_6 example & update others MiniCPM-V-2 exmaples; no numbers stated; `score 0`
+- `a508b0a902` `2024-08-16` **other** · docs · kept — added link to minicpm-v-2_6 example; no numbers stated; `score 0`
+- `e07a55665c` `2024-08-16` **other** · fix · kept — Codegeex2 tokenization fix; no numbers stated; `score 0`
+- `3b630fb9df` `2024-08-16` **other** · other · kept — updated ppl README; no numbers stated; `score 0`
+- `e966e85df8` `2024-08-16` **gemm** · knob · kept — force the lm_head optimization by env; no numbers stated; `score 1`
+- `96796f95cb` `2024-08-16` **other** · instr · kept — Update all-in-one benchmark prompts for `continuation` task & lookup update for minicpmv; no numbers stated; `score 0`
+- `9f17234f3b` `2024-08-16` **other** · other · kept — Add MiniCPM-V-2_6 to iGPU Perf; no numbers stated; `score 0`
+- `580c94d0e2` `2024-08-17` **gemm** · other · removed — Remove gemma-2-9b-it 3k input from igpu-perf; no numbers stated; `score 0`
+- `46a1cbfa64` `2024-08-19` **other** · other · kept — feat: add mixed_precision argument on ppl longbench evaluation; no numbers stated; `score 0`
+- `cfc959defa` `2024-08-19` **other** · instr · kept — Fixes regarding utf-8 in all-in-one benchmark; no numbers stated; `score 0`
+- `6841a9ac8f` `2024-08-19` **gemm** · fix · kept — fix load low bit com dtype; no numbers stated; `score 1`
+
+*Commits 3201-3300 (2024-07-30..2024-08-19): scores 0/1/2/3 = 52/42/6/0; areas other 55, attention 28, gemm 7, mtp 3.*
+
+- `3cd4e87168` `2024-08-19` **kv** · knob · kept — Support compress KV with quantize KV; no numbers stated; `score 1`
+- `9490781aec` `2024-08-19` **mem** · other · kept — optimize phi3 memory usage again; no numbers stated; `score 1`
+- `a0fbda5bc8` `2024-08-19` **other** · instr · kept — add MiniCPM-Llama3-V-2_5 into all-in-one benchmark; no numbers stated; `score 0`
+- `da3d7a3a53` `2024-08-19` **other** · docs · removed — delete transformers version requirement; no numbers stated; `score 0`
+- `99b05ba1dc` `2024-08-19` **other** · other · kept — separate prefill into a process; no numbers stated; `score 0`
+- `7380823f3f` `2024-08-19` **other** · other · kept — Update Llama2 multi-processes example; no numbers stated; `score 0`
+- `2946420e14` `2024-08-20` **mem** · other · kept — add minicpmv 2.6 load_low_bit workaround; no numbers stated; `score 1`
+- `ee6852c915` `2024-08-20` **other** · fix · kept — Fix typo; no numbers stated; `score 0`
+- `5b83493b1a` `2024-08-20` **other** · knob · kept — Add ipex-llm npu option in setup.py; no numbers stated; `score 0`
+- `d4ee0a89f3` `2024-08-20` **mem** · other · kept — optimize phi3 memory usage; no numbers stated; `score 1`
+- `5e8286f72d` `2024-08-20` **other** · knob · kept — Update `ipex-llm` default transformers version to 4.37.0; no numbers stated; `score 0`
+- `0d58c2fdf9` `2024-08-20` **other** · other · kept — Update performance test regarding updated default `transformers==4.37.0`; no numbers stated; `score 0`
+- `3ee194d983` `2024-08-20` **other** · other · kept — Pytorch models transformers version update; no numbers stated; `score 0`
+- `c3c058373f` `2024-08-20` **attention** · other · kept — Update compresskv model forward type logic; no numbers stated; `score 1`
+- `5df00869de` `2024-08-20` **other** · other · kept — Update local import for ppl; no numbers stated; `score 0`
+- `32f0a77846` `2024-08-20` **other** · docs · kept — feat: update readme for ppl test; no numbers stated; `score 0`
+- `bdaeee1d63` `2024-08-20` **other** · fix · kept — Fix run_decoders bug; no numbers stated; `score 1`
+- `37106a877c` `2024-08-21` **other** · other · kept — igpu performance test smal fix; no numbers stated; `score 0`
+- `eab6f6dde4` `2024-08-21` **other** · fix · kept — Spr perf small fix; no numbers stated; `score 0`
+- `bd1e490d62` `2024-08-21` **attention** · fix · kept — fix phi3; no numbers stated; `score 1`
+- `537c0d2767` `2024-08-21` **other** · sched · kept — fix vllm qwen2 models; no numbers stated; `score 1`
+- `209d42ab79` `2024-08-20` **other** · other · kept — Refactor npu mp to make it easier to integrate new models; no numbers stated; `score 1`
+- `8c5c7f32dd` `2024-08-21` **other** · other · kept — Update doc for running npu generate example with ipex-llm[npu]; no numbers stated; `score 0`
+- `0236de3ac2` `2024-08-21` **other** · knob · kept — set IPEX_LLM_LAST_LM_HEAD=1 as default; no numbers stated; `score 0`
+- `cc27321441` `2024-08-21` **other** · knob · kept — support chatglm4 in lookup; no numbers stated; `score 1`
+- `bdbe995b01` `2024-08-22` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `86248b0505` `2024-08-22` **attention** · other · kept — add compress_kv for baichuan2; no numbers stated; `score 1`
+- `6bb9035788` `2024-08-22` **attention** · fix · kept — fix typos; no numbers stated; `score 1`
+- `72a7bf624b` `2024-08-22` **other** · fusion · kept — Support qwen2-1.5b with fused decoderlayer optimization on NPU; no numbers stated; `score 0`
+- `6a5ca17afc` `2024-08-22` **attention** · fix · kept — fix typoes; no numbers stated; `score 1`
+- `bac98baab9` `2024-08-22` **other** · other · kept — Make performance test install specific ipex-llm version from pypi; no numbers stated; `score 0`
+- `4adadddbbc` `2024-08-22` **attention** · fix · kept — fix typos; no numbers stated; `score 1`
+- `2a0aa9271b` `2024-08-22` **attention** · fix · kept — fix typos; no numbers stated; `score 1`
+- `c6ed1c412d` `2024-08-22` **attention** · fix · kept — fix typos; no numbers stated; `score 1`
+- `01ed397e7a` `2024-08-22` **attention** · fix · kept — fix typos; no numbers stated; `score 1`
+- `8a5df93de2` `2024-08-22` **attention** · fix · kept — fix typos; no numbers stated; `score 1`
+- `48a827aa07` `2024-08-22` **attention** · fix · kept — fix typos; no numbers stated; `score 1`
+- `42398a0045` `2024-08-22` **attention** · other · kept — add comment; no numbers stated; `score 1`
+- `ce7de77085` `2024-08-22` **attention** · other · kept — add comment of change in model forward; no numbers stated; `score 1`
+- `a8e2573421` `2024-08-22` **other** · other · kept — added tokenization file for codegeex2-6b in pytorch-models; no numbers stated; `score 0`
+- `a2be3d7501` `2024-08-22` **kv** · other · kept — add comment of compress kv in attention forward; no numbers stated; `score 1`
+- `eb1e65f8a9` `2024-08-22` **attention** · other · kept — add comment; no numbers stated; `score 1`
+- `5c4ed00593` `2024-08-22` **other** · sched · kept — Add lightweight-serving whisper asr example; no numbers stated; `score 0`
+- `18662dca1c` `2024-08-22` **other** · other · kept — change 5 pytorch/huggingface models to fp16; no numbers stated; `score 0`
+- `c5b51d41fb` `2024-08-22` **other** · other · kept — Update pypi tag to 2.2.0.dev0; no numbers stated; `score 0`
+- `278b191dc1` `2024-08-22` **other** · fix · kept — Fix optimize lm head error; no numbers stated; `score 1`
+- `794abe2ce8` `2024-08-22` **other** · docs · kept — update npu-readme; no numbers stated; `score 0`
+- `4cf03d6212` `2024-08-22` **other** · other · kept — update baichuan-7b; no numbers stated; `score 1`
+- `420ce7d164` `2024-08-22` **other** · fix · kept — Fix non-stop at eos token problem for lookup generation; no numbers stated; `score 1`
+- `4a61f7d20d` `2024-08-22` **attention** · other · kept — update mlp of llama; no numbers stated; `score 0`
+- `650e6e6ce4` `2024-08-23` **other** · other · kept — Merge pull request #11891 from hxsz1997/baichuan2-compresskv; no numbers stated; `score 0`
+- `4cf640c548` `2024-08-23` **other** · other · kept — update docker image tag to 2.2.0-SNAPSHOT; no numbers stated; `score 0`
+- `23631cd357` `2024-08-23` **other** · knob · kept — disable lm_head opt for baichuan2-13b; no numbers stated; `score 1`
+- `303a090a6b` `2024-08-23` **other** · other · kept — Add lm_head optimization on NPU; no numbers stated; `score 1`
+- `24c279e0ae` `2024-08-23` **sync** · knob · kept — performance mode with an input-length threshold; no numbers stated; `score 1`
+- `e5dc4e9123` `2024-08-24` **other** · sched · kept — disable outdated scheduled workflow; no numbers stated; `score 0`
+- `dd303776cf` `2024-08-26` **other** · docs · kept — Add troubleshooting about transpose value setting; no numbers stated; `score 0`
+- `019f725d4d` `2024-08-26` **other** · knob · kept — Add support for running mp minicpm model on npu; no numbers stated; `score 1`
+- `a0bbd8e28d` `2024-08-26` **sync** · instr · kept — All-in-one benchmark update regarding performance mode for input length threshold; no numbers stated; `score 0`
+- `c1d07bc626` `2024-08-26` **sync** · knob · kept — Support streaming for lookup generation; no numbers stated; `score 1`
+- `5a8fc1baa2` `2024-08-26` **other** · docs · kept — update troubleshooting for llama.cpp and ollama; no numbers stated; `score 0`
+- `7ca557aada` `2024-08-27` **other** · sched · kept — Fix vLLM CPU convert error; no numbers stated; `score 1`
+- `6c3eb1e1e8` `2024-08-27` **other** · knob · kept — refactor from_pretrained API for NPU; no numbers stated; `score 0`
+- `14dddfc0d6` `2024-08-27` **other** · docs · kept — Update NPU example readme; no numbers stated; `score 0`
+- `e246f1e258` `2024-08-27` **other** · other · kept — update llama3 npu example; no numbers stated; `score 0`
+- `b11b28e9a9` `2024-08-27` **other** · other · kept — update CORE_XE_VERSION to 2.6.0; no numbers stated; `score 0`
+- `730d9ec811` `2024-08-27` **other** · other · kept — Add Qwen2-audio example; no numbers stated; `score 0`
+- `7c8c9a0670` `2024-08-27` **other** · instr · kept — Update benchmark script for NPU; no numbers stated; `score 0`
+- `a81a329a5f` `2024-08-27` **other** · other · kept — Add example for NPU multi-processing minicpm-1b model; no numbers stated; `score 0`
+- `e211a5b076` `2024-08-27` **other** · other · kept — update minicpm to meet latest refactor; no numbers stated; `score 1`
+- `b4b6ddf73c` `2024-08-27` **other** · other · kept — NPU Baichuan2 Multi- Process example; no numbers stated; `score 1`
+- `7f7f6c89f5` `2024-08-27` **other** · instr · kept — Quick fix benchmark script; no numbers stated; `score 0`
+- `90f692937d` `2024-08-27` **other** · other · kept — Update npu baichuan2; no numbers stated; `score 0`
+- `bec00e2015` `2024-08-27` **other** · other · kept — Improve baichuan2 NPU performance; no numbers stated; `score 1`
+- `460bc96d32` `2024-08-27` **other** · docs · kept — update version of llama.cpp / ollama; no numbers stated; `score 0`
+- `23f51f87f0` `2024-08-28` **other** · docs · kept — update tag to 2.2.0-SNAPSHOT; no numbers stated; `score 0`
+- `e23549f63f` `2024-08-28` **other** · other · kept — Update llamaindex examples; no numbers stated; `score 0`
+- `ec67ee7177` `2024-08-28` **other** · docs · kept — added accelerate version specification in open webui quickstart; no numbers stated; `score 0`
+- `b38fb67bec` `2024-08-28` **other** · other · kept — lm head to cpu; no numbers stated; `score 1`
+- `0a7bd274e2` `2024-08-28` **quant** · sched · kept — Add vllm awq loading logic; no numbers stated; `score 1`
+- `0fbb10259a` `2024-08-28` **attention** · kernel · kept — use sdp_causal to reduce internvl2-4b memory usage if set environment variable; no numbers stated; `score 2`
+- `5ca7390082` `2024-08-28` **other** · knob · kept — Add minicpm-2b support for npu multi-processing; no numbers stated; `score 0`
+- `63ac5f64bb` `2024-08-28` **other** · other · kept — Refactor NPU baichuan multiple-process; no numbers stated; `score 1`
+- `71f03dcc39` `2024-08-29` **other** · fusion · kept — Support qwen2-7b with fused decoderlayer optimization on NPU; no numbers stated; `score 0`
+- `882f4a5ff7` `2024-08-29` **other** · knob · kept — Add lnl npu driver recommend version and enable cpu_lm_head on llama3; no numbers stated; `score 0`
+- `5f7ff76ea5` `2024-08-29` **other** · docs · kept — update troubleshooting; no numbers stated; `score 0`
+- `6fc9340d53` `2024-08-29` **other** · docs · kept — restore ollama webui quickstart; no numbers stated; `score 0`
+- `7abe17d6f7` `2024-08-29` **other** · other · kept — Update MiniCPM-V-2_6 Example; no numbers stated; `score 0`
+- `14b2c8dc32` `2024-08-29` **other** · other · kept — Update qwen2-7b example script; no numbers stated; `score 0`
+- `431affd0a0` `2024-08-29` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `2e49e1f8e9` `2024-08-29` **other** · fix · kept — Further fix for MiniCPM-V-2_6 example; no numbers stated; `score 0`
+- `a9e485eb1b` `2024-08-29` **sync** · instr · kept — Support MiniCPM-V-2_6 multi-modal benchmarking with latency text streamer; no numbers stated; `score 1`
+- `fbf088f61e` `2024-08-29` **other** · other · removed — remove obselete npu code; no numbers stated; `score 1`
+- `77b04efcc5` `2024-08-30` **other** · docs · kept — add notes for `SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS`; no numbers stated; `score 0`
+- `7d103417b8` `2024-08-30` **other** · sched · kept — Fix glm4-9b-chat nan error on vllm 0.3.3; no numbers stated; `score 1`
+- `cd077881f1` `2024-08-30` **other** · knob · kept — Disable lm head; no numbers stated; `score 0`
+- `e895e1b4c5` `2024-08-30` **other** · docs · kept — modification on llamacpp readme after Ipex-llm latest update; no numbers stated; `score 0`
+- `1e8c87050f` `2024-08-30` **other** · fix · kept — fix model path; no numbers stated; `score 0`
+- `ae7302a654` `2024-08-30` **quant** · knob · kept — add gptq option for ppl test; no numbers stated; `score 0`
+- `158289d205` `2024-08-30` **other** · knob · kept — Add initial support for minicpm-llama-v2.5; no numbers stated; `score 1`
+
+*Commits 3301-3400 (2024-08-19..2024-08-30): scores 0/1/2/3 = 57/42/1/0; areas other 73, attention 16, sync 4, mem 3.*
+
+- `60aa1a2c0f` `2024-08-30` **other** · knob · kept — Initial NPU support for MiniCPM-V-2_6; no numbers stated; `score 1`
+- `573c20bae6` `2024-08-30` **other** · fix · kept — fix npu lm_head cpu condition; no numbers stated; `score 1`
+- `4811a490ef` `2024-08-30` **other** · fix · kept — small fix; no numbers stated; `score 0`
+- `79978e6f36` `2024-08-30` **other** · other · kept — update npu multimodal readme; no numbers stated; `score 0`
+- `65e281bb29` `2024-09-02` **other** · other · kept — Add MiniCPM-V cpu example; no numbers stated; `score 0`
+- `c48817bd43` `2024-09-01` **quant** · knob · kept — Support Qwen2-7b MLP in int4 and transpose_value_cache=True; no numbers stated; `score 1`
+- `a40ea7038d` `2024-09-02` **other** · fix · kept — Fix AttributeError of qwen2-1.5B; no numbers stated; `score 1`
+- `2f3d1bd0ec` `2024-09-02` **other** · fix · kept — hotfix qwen2-7b weight setting; no numbers stated; `score 1`
+- `659d15defc` `2024-09-02` **attention** · fix · kept — Fix wrong attention mask and garbage output for `inputs_embeds` inputs during lookup generation; no numbers stated; `score 1`
+- `01099f08ee` `2024-09-03` **other** · revert · reverted — Revert prefill logic of qwen2-7b; no numbers stated; `score 1`
+- `643458d8f0` `2024-09-03` **other** · docs · kept — Update GraphRAG QuickStart; no numbers stated; `score 0`
+- `2e54f4402b` `2024-09-03` **other** · other · kept — Rename MiniCPM-V-2_6 CPU example; no numbers stated; `score 0`
+- `164f47adbd` `2024-09-03` **other** · other · kept — MiniCPM-V-2 & MiniCPM-Llama3-V-2_5 example updates; no numbers stated; `score 0`
+- `6eb55653ba` `2024-09-03` **sync** · other · kept — Performance mode strategy update for input_embeds input; no numbers stated; `score 1`
+- `9eaff5e47d` `2024-09-03` **other** · knob · kept — add save &  load support for NPU optimized model; no numbers stated; `score 1`
+- `2b993ad479` `2024-09-04` **other** · sched · kept — vllm update for glm-4 model automatic not_convert; no numbers stated; `score 1`
+- `77cb348220` `2024-09-04` **other** · fix · kept — fix dependabot alerts; no numbers stated; `score 0`
+- `b1408a1f1c` `2024-09-04` **other** · other · kept — fix UT; no numbers stated; `score 0`
+- `c6348a4666` `2024-09-04` **other** · other · kept — Update action.yml; no numbers stated; `score 0`
+- `75b19f8522` `2024-09-04` **other** · revert · reverted — revert actions/download-artifact version to 3; no numbers stated; `score 0`
+- `b3b2cd64b4` `2024-09-05` **other** · sched · kept — Support lightweight-serving glm-4v-9b; no numbers stated; `score 0`
+- `8803242f5c` `2024-09-04` **attention** · fix · kept — fix llama on cpu; no numbers stated; `score 1`
+- `820f8a4554` `2024-09-05` **gemm** · knob · kept — add `--lowbit-path` option for NPU llama example; no numbers stated; `score 0`
+- `845e5dc89e` `2024-09-05` **other** · knob · kept — Support lm_head of minicpm-2b on NPU; no numbers stated; `score 1`
+- `5b18bb3c4a` `2024-09-05` **other** · docs · kept — Add recommend version for mtl npu; no numbers stated; `score 0`
+- `e5581e6ded` `2024-09-05` **other** · docs · kept — Select the Appropriate APT Repository Based on CPU Type; no numbers stated; `score 0`
+- `58555bd9de` `2024-09-05` **other** · other · kept — Optimize broadcast for npu llama; no numbers stated; `score 1`
+- `0d04531ae0` `2024-09-06` **other** · other · kept — update NPU readme of Qwen2; no numbers stated; `score 0`
+- `f61b1785fb` `2024-09-06` **other** · docs · kept — Small update to NPU example readme; no numbers stated; `score 0`
+- `d2e1b9aaff` `2024-09-06` **other** · other · kept — Add input padding during prefill for qwen2-7b; no numbers stated; `score 1`
+- `6cedb601e4` `2024-09-06` **attention** · other · removed — remove some useless code; no numbers stated; `score 1`
+- `16c658e732` `2024-09-09` **other** · docs · kept — add known issues to harness evaluation; no numbers stated; `score 0`
+- `048b4590aa` `2024-09-09` **attention** · other · kept — add basic minicpm3 optimization; no numbers stated; `score 1`
+- `640998edea` `2024-09-09` **other** · other · kept — update inter_pp of qwen2; no numbers stated; `score 1`
+- `f0061a9916` `2024-09-10` **other** · fix · removed — remove local import os to fix Baichuan NPU load issue; no numbers stated; `score 1`
+- `abc370728c` `2024-09-10` **attention** · other · kept — optimize minicpm3 again; no numbers stated; `score 1`
+- `dc4af02b2a` `2024-09-09` **other** · fix · kept — Fix qwen2 1.5B NPU load error; no numbers stated; `score 1`
+- `73a4360f3f` `2024-09-10` **gemm** · other · kept — update lowbit path for baichuan2, qwen2, `generate.py`; no numbers stated; `score 0`
+- `69c8d36f16` `2024-09-10` **other** · sched · kept — Switching from vLLM v0.3.3 to vLLM 0.5.4; no numbers stated; `score 0`
+- `5d3ab16a80` `2024-09-10` **other** · sched · kept — Add vllm glm and baichuan padding; no numbers stated; `score 1`
+- `d8c044e79d` `2024-09-10` **kv** · other · kept — optimize minicpm3 kv cache; no numbers stated; `score 1`
+- `52863dd567` `2024-09-11` **other** · sched · kept — fix vllm_online_benchmark.py; no numbers stated; `score 0`
+- `94dade9aca` `2024-09-11` **other** · other · kept — Fix UT of ipex_llm.llamaindex; no numbers stated; `score 0`
+- `c5fdfde1bd` `2024-09-11` **other** · fix · kept — fix npu-model prompt; no numbers stated; `score 0`
+- `30a8680645` `2024-09-11` **other** · sched · kept — Update for vllm one card padding; no numbers stated; `score 1`
+- `7e1e51d91a` `2024-09-11` **other** · sched · kept — Update vllm setting; no numbers stated; `score 0`
+- `c94032f97e` `2024-09-11` **other** · other · kept — Try to fix llamaindex ut again; no numbers stated; `score 0`
+- `649390c464` `2024-09-11` **other** · docs · kept — fix: textual and env variable adjustment; no numbers stated; `score 0`
+- `c75f3dd874` `2024-09-11` **other** · sched · kept — vllm no padding glm4 to avoid nan error; no numbers stated; `score 1`
+- `a0c73c26d8` `2024-09-11` **other** · other · kept — clean NPU code; no numbers stated; `score 1`
+- `32e8362da7` `2024-09-11` **other** · other · kept — added minicpm cpu examples; no numbers stated; `score 0`
+- `4ca330da15` `2024-09-11` **gemm** · fix · kept — Fix NPU load error message and add minicpm npu lowbit feat; no numbers stated; `score 1`
+- `e78e45ee01` `2024-09-11` **other** · docs · kept — update NPU readme: run conhost as administrator; no numbers stated; `score 0`
+- `48d9092b5a` `2024-09-11` **other** · knob · kept — upgrade OneAPI version for cpp Windows; no numbers stated; `score 0`
+- `beb876665d` `2024-09-12` **other** · fix · kept — pin gradio version to fix connection error; no numbers stated; `score 0`
+- `9b4fee8b5b` `2024-09-12` **other** · knob · kept — disable nightly release for finetune images; no numbers stated; `score 0`
+- `3f0b24ae2b` `2024-09-12` **other** · docs · kept — update cpp quickstart; no numbers stated; `score 0`
+- `a767438546` `2024-09-12` **other** · docs · kept — fix typo; no numbers stated; `score 0`
+- `d703e4f127` `2024-09-13` **other** · sched · kept — Enable vllm multimodal minicpm-v-2-6; no numbers stated; `score 0`
+- `b4b8c3e495` `2024-09-13` **gemm** · fix · kept — add `lowbit_path` for `generate.py`, fix `npu_model`; no numbers stated; `score 1`
+- `18714ceac7` `2024-09-14` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `081af41def` `2024-09-14` **quant** · other · kept — Optimize Qwen2 lm_head to use INT4; no numbers stated; `score 1`
+- `c2774e1a43` `2024-09-18` **other** · sched · kept — Update oneccl to 0.0.3 in serving-xpu image; no numbers stated; `score 0`
+- `40e463c66b` `2024-09-18` **quant** · sched · kept — Enable vllm load gptq model; no numbers stated; `score 1`
+- `ee33b93464` `2024-09-18` **other** · other · kept — Longbench: NV code to ipex-llm; no numbers stated; `score 0`
+- `f7fb3c896c` `2024-09-18` **other** · other · kept — Update lm_head optimization for Qwen2 7B; no numbers stated; `score 1`
+- `9650bf616a` `2024-09-19` **other** · instr · kept — add `transpose_value_cache` for NPU benchmark; no numbers stated; `score 0`
+- `1295898830` `2024-09-20` **other** · sched · kept — update vllm_online_benchmark script to support long input; no numbers stated; `score 0`
+- `a6cbc01911` `2024-09-20` **other** · sched · kept — Use new oneccl for ipex-llm serving image; no numbers stated; `score 0`
+- `54b973c744` `2024-09-20` **other** · fix · kept — fix ipex_llm import in transformers 4.45; no numbers stated; `score 1`
+- `b36359e2ab` `2024-09-20` **other** · sched · kept — Fix xpu serving image oneccl; no numbers stated; `score 0`
+- `db7500bfd4` `2024-09-20` **other** · other · kept — Add Qwen2.5 GPU example; no numbers stated; `score 0`
+- `09b8c80d9d` `2024-09-20` **other** · other · kept — update code for NPU qwen2; no numbers stated; `score 1`
+- `ad1fe77fe6` `2024-09-20` **other** · docs · kept — Add language switching; no numbers stated; `score 0`
+- `2269768e71` `2024-09-20` **other** · other · kept — add internvl2 example; no numbers stated; `score 0`
+- `828fa01ad3` `2024-09-20` **other** · other · kept — Add `mixed_precision` for Qwen2 7B; no numbers stated; `score 0`
+- `9239fd4f12` `2024-09-20` **attention** · knob · kept — add basic support and optimization for qwen2-vl; no numbers stated; `score 1`
+- `47a9597f24` `2024-09-20` **other** · docs · kept — Add missing link for Qwen2.5 to CN-ZH readme; no numbers stated; `score 0`
+- `02399021d6` `2024-09-20` **mem** · instr · kept — add npu load_low_bit api in all-in-one benchmark; no numbers stated; `score 0`
+- `03bd01c99c` `2024-09-20` **other** · other · kept — optimize npu qwen2; no numbers stated; `score 1`
+- `5d63aef60b` `2024-09-23` **attention** · other · kept — optimize qwen2 vl again; no numbers stated; `score 1`
+- `657889e3e4` `2024-09-24` **other** · knob · kept — use english prompt by default; no numbers stated; `score 0`
+- `2bedb17be7` `2024-09-25` **other** · other · kept — Add Qwen2.5 NPU Example; no numbers stated; `score 0`
+- `47e0b83cbf` `2024-09-25` **attention** · other · kept — optimize sd 1.5; no numbers stated; `score 1`
+- `77af9bc5fa` `2024-09-26` **other** · knob · kept — support passing None to low_bit in optimize_model; no numbers stated; `score 1`
+- `2ea13d502f` `2024-09-26` **other** · other · kept — Add minicpm3 gpu example; no numbers stated; `score 0`
+- `66f419f8b7` `2024-09-26` **attention** · fix · kept — fix qwen2 vl; no numbers stated; `score 1`
+- `584c3489e7` `2024-09-26` **attention** · knob · kept — add basic support for llama3.2; no numbers stated; `score 1`
+- `a266528719` `2024-09-26` **attention** · other · kept — optimize llama 3.2 rope; no numbers stated; `score 1`
+- `669ff1a97b` `2024-09-26` **attention** · fix · kept — fix sd1.5; no numbers stated; `score 1`
+- `f71b38a994` `2024-09-26` **other** · other · kept — Update MiniCPM_V_26 GPU example with save & load; no numbers stated; `score 0`
+- `17c23cd759` `2024-09-29` **other** · other · kept — add llama3.2 GPU example; no numbers stated; `score 0`
+- `9b75806d14` `2024-09-29` **other** · docs · kept — Update Windows GPU quickstart regarding demo; no numbers stated; `score 0`
+- `644af2a76e` `2024-10-08` **attention** · knob · kept — add basic llama 3.2 vision support; no numbers stated; `score 1`
+- `e2ef9e938e` `2024-10-08` **other** · other · removed — Delete deprecated docs/readthedocs directory; no numbers stated; `score 0`
+- `3d044dbf53` `2024-10-08` **other** · other · kept — add llama3.2-vision Pytorch example; no numbers stated; `score 0`
+- `412cf8e20c` `2024-10-09` **other** · docs · kept — update mddocs/DockerGuides/vllm_docker_quickstart.md; no numbers stated; `score 0`
+- `78d253165d` `2024-10-09` **attention** · other · kept — optimize qwen2 vl perf again; no numbers stated; `score 1`
+- `aef1f671bd` `2024-10-09` **other** · knob · kept — Support LNL Windows release; no numbers stated; `score 0`
+- `535bee5381` `2024-10-10` **attention** · fix · kept — fix qwen2 vl again; no numbers stated; `score 1`
+
+*Commits 3401-3500 (2024-08-30..2024-10-10): scores 0/1/2/3 = 56/44/0/0; areas other 75, attention 15, gemm 4, quant 3.*
+
+- `890662610b` `2024-10-10` **other** · fix · kept — Fix auto importer for LNL release; no numbers stated; `score 1`
+- `0ef7e1d101` `2024-10-10` **other** · docs · kept — fix vllm docs; no numbers stated; `score 0`
+- `ac44e98b7d` `2024-10-11` **other** · docs · kept — Update Windows guide regarding LNL support; no numbers stated; `score 0`
+- `4d93bb81fe` `2024-10-11` **other** · knob · kept — Initial support of NPU level0 Model; no numbers stated; `score 0`
+- `724b2ae66d` `2024-10-11` **other** · sched · kept — add npu-level0 pipeline.dll to ipex-llm; no numbers stated; `score 0`
+- `1daab4531f` `2024-10-11` **other** · sched · kept — Upgrade oneccl to 0.0.4 in serving-xpu image; no numbers stated; `score 0`
+- `310f18c8af` `2024-10-11` **other** · sched · kept — update NPU pipeline generate; no numbers stated; `score 0`
+- `f983f1a8f4` `2024-10-11` **other** · other · kept — Add Qwen2-VL gpu example; no numbers stated; `score 0`
+- `ddcdf47539` `2024-10-11` **other** · knob · kept — Support Windows ARL release; no numbers stated; `score 0`
+- `6ffaec66a2` `2024-10-11` **other** · docs · kept — add prefix caching document into `vllm_docker_quickstart.md`; no numbers stated; `score 0`
+- `49eb20613a` `2024-10-12` **other** · other · kept — add --blocksize to doc and script; no numbers stated; `score 0`
+- `a768d71581` `2024-10-14` **other** · docs · kept — Small fix to LNL installation guide; no numbers stated; `score 0`
+- `8e35800abe` `2024-10-14` **other** · other · kept — Add llama 3.1 in igpu perf; no numbers stated; `score 0`
+- `7d80db710e` `2024-10-14` **other** · instr · kept — Add benchmark_util for `transformers >= 4.44.0`; no numbers stated; `score 1`
+- `7da3ab7322` `2024-10-14` **other** · docs · kept — Add missing link for Llama3.2-Vision; no numbers stated; `score 0`
+- `516b578104` `2024-10-14` **other** · knob · kept — Support cpp release for ARL on Windows; no numbers stated; `score 0`
+- `f8d1adc573` `2024-10-14` **attention** · fix · kept — Fix Llama 3.2 & 3.1 on LNL; no numbers stated; `score 1`
+- `d5344587ab` `2024-10-15` **attention** · other · kept — optimize internvl2 vision model's attention; no numbers stated; `score 1`
+- `9b81236a2e` `2024-10-15` **attention** · other · kept — optimzie qwen2-vl vision; no numbers stated; `score 1`
+- `f6611f9d3a` `2024-10-15` **attention** · other · kept — optimize llama3.2 vison attention again; no numbers stated; `score 1`
+- `c9ac39fc1e` `2024-10-15` **other** · other · kept — Add Llama 3.2 to iGPU performance test (`transformers 4.45`); no numbers stated; `score 0`
+- `f17cc4fdee` `2024-10-16` **other** · other · kept — feat: add llama3.2-11b-vision in all in one; no numbers stated; `score 0`
+- `e279148aa0` `2024-10-16` **attention** · other · kept — optimize llama3.2 vision again; no numbers stated; `score 1`
+- `bb247e991b` `2024-10-16` **attention** · kernel · kept — refactor merge_qkv and attention_softmax; no numbers stated; `score 2`
+- `9104a168f6` `2024-10-16` **attention** · fusion · kept — refactor phi-2 to reduce old fuse rope usage; no numbers stated; `score 2`
+- `a4a758656a` `2024-10-16` **attention** · kernel · kept — refactor gemma to reduce old fuse rope usage; no numbers stated; `score 2`
+- `26390f9213` `2024-10-17` **other** · other · kept — Update oneccl_wks_installer to 2024.0.0.4.1; no numbers stated; `score 0`
+- `667f0db466` `2024-10-17` **mtp** · other · kept — Update Eagle example to Eagle2+ipex-llm integration; no numbers stated; `score 0`
+- `324bcb057e` `2024-10-17` **attention** · other · kept — refactor to reduce old rope usage; no numbers stated; `score 1`
+- `9ea694484d` `2024-10-17` **attention** · other · removed — refactor ot remove old rope usage; no numbers stated; `score 1`
+- `b88c1df324` `2024-10-17` **other** · other · kept — Add Llama 3.1 & 3.2 to Arc Performance test; no numbers stated; `score 0`
+- `7825dc1398` `2024-10-18` **other** · other · kept — Upgrade oneccl to 0.0.5; no numbers stated; `score 0`
+- `fe3b5cd89b` `2024-10-18` **quant** · docs · kept — mmdocs/dockerguide vllm-quick-start awq,gptq online serving document; no numbers stated; `score 0`
+- `b10fc892e1` `2024-10-18` **other** · docs · kept — Update new reference link of xpu/docker/readme.md; no numbers stated; `score 0`
+- `9d7f42fd0f` `2024-10-18` **other** · other · kept — Support manually trigger of dGPU perf test on Windows; no numbers stated; `score 0`
+- `ef659629f3` `2024-10-18` **other** · other · kept — Small update to Windows dGPU perf test; no numbers stated; `score 0`
+- `5935b25622` `2024-10-18` **other** · other · kept — Further update windows gpu perf test regarding results integrity check; no numbers stated; `score 0`
+- `da9270be2d` `2024-10-18` **other** · other · kept — Further update to Windows dGPU perf test; no numbers stated; `score 0`
+- `ea5154d85e` `2024-10-21` **other** · other · kept — Further update to Windows dGPU perf test; no numbers stated; `score 0`
+- `ac2dac857c` `2024-10-21` **other** · other · kept — Disable 4k input test for now for Windows dGPU performance test; no numbers stated; `score 0`
+- `b3df47486d` `2024-10-21` **gemm** · kernel · kept — Fix Gemma 2 on LNL; no numbers stated; `score 2`
+- `a35cf4d533` `2024-10-22` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `d8c1287335` `2024-10-22` **other** · other · kept — Further update for Windows dGPU performance tests; no numbers stated; `score 0`
+- `ec465fbcd7` `2024-10-22` **mem** · other · kept — Add lookup generate in load_low_bit; no numbers stated; `score 1`
+- `8fa98e2742` `2024-10-22` **other** · other · removed — Remove Qwen2-7b from NPU example for "Run Optimized Models (Experimental)"; no numbers stated; `score 0`
+- `aedc4edfba` `2024-10-23` **other** · docs · kept — add open webui + vllm serving; no numbers stated; `score 0`
+- `e37f951cce` `2024-10-23` **gemm** · sched · kept — Groupwise; no numbers stated; `score 0`
+- `aae2490cb8` `2024-10-23` **other** · other · kept — fix UT; no numbers stated; `score 0`
+- `e8cf7f32f5` `2024-10-23` **other** · fix · kept — npu gw small fix; no numbers stated; `score 1`
+- `88dc120a4c` `2024-10-23` **gemm** · fix · kept — fix fp16 linear; no numbers stated; `score 1`
+- `578aef245d` `2024-10-23` **attention** · kernel · kept — Fix models auto choose SdpaAttention with ipex 2.3; no numbers stated; `score 2`
+- `567b77a76b` `2024-10-23` **other** · sched · kept — Support IR and blob format for llama level0 pipeline; no numbers stated; `score 1`
+- `b685cf4349` `2024-10-23` **other** · fix · kept — Fix npu group size setting of optimize_model=False; no numbers stated; `score 1`
+- `cacc891962` `2024-10-23` **other** · fix · kept — Fix PR validation; no numbers stated; `score 1`
+- `821fd96367` `2024-10-24` **other** · other · kept — Initial integrate our L0 Llama impl into ipex-llm; no numbers stated; `score 1`
+- `f3a2b20e6b` `2024-10-24` **attention** · other · kept — Optimize gpt2; no numbers stated; `score 1`
+- `39c9d1de52` `2024-10-24` **attention** · fix · kept — fix code geex; no numbers stated; `score 1`
+- `e0a95eb2d6` `2024-10-24` **other** · docs · kept — Add llama_cpp_quickstart.zh-CN.md; no numbers stated; `score 0`
+- `48fc63887d` `2024-10-24` **other** · other · kept — use oneccl 0.0.5.1; no numbers stated; `score 0`
+- `b5e663854b` `2024-10-24` **gemm** · sched · kept — Support llama groupwise; no numbers stated; `score 1`
+- `ae57e23e4f` `2024-10-25` **other** · sched · kept — fix incompatibility between llama GW & llama pipeline; no numbers stated; `score 0`
+- `f7f62a3fef` `2024-10-25` **other** · instr · kept — Add OpenVINO performance tests to all-in-one benchmark; no numbers stated; `score 0`
+- `93895b2ac2` `2024-10-25` **other** · docs · kept — Openvino all in one benchmark small fix; no numbers stated; `score 0`
+- `94c4568988` `2024-10-25` **other** · docs · kept — Update windows installation guide regarding troubleshooting; no numbers stated; `score 0`
+- `43b25a2fe7` `2024-10-25` **other** · fix · kept — Fix llama 3.2 vision on LNL; no numbers stated; `score 1`
+- `e713296090` `2024-10-25` **other** · instr · kept — Update all-in-one benchmark; no numbers stated; `score 0`
+- `854398f6e0` `2024-10-25` **mem** · other · kept — update example to reduce peak memory usage; no numbers stated; `score 0`
+- `a0c6432899` `2024-10-25` **other** · knob · kept — Add support for loading a FunASR model; no numbers stated; `score 0`
+- `08cb065370` `2024-10-25` **other** · fix · kept — hot-fix redundant import funasr; no numbers stated; `score 1`
+- `ec362e6133` `2024-10-28` **other** · other · kept — Add llama3 level0 example; no numbers stated; `score 0`
+- `16074ae2a4` `2024-10-28` **other** · docs · kept — Update Linux prerequisites installation guide for MTL iGPU; no numbers stated; `score 0`
+- `42a528ded9` `2024-10-28` **other** · docs · kept — Small update to MTL iGPU Linux Prerequisites installation guide; no numbers stated; `score 0`
+- `3fe2ea3081` `2024-10-28` **other** · sched · kept — Reuse prefill of acc lib for pipeline; no numbers stated; `score 0`
+- `67014cb29f` `2024-10-28` **other** · sched · kept — Add benchmark_latency.py to docker serving image; no numbers stated; `score 0`
+- `1cef0c4948` `2024-10-28` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `4467645088` `2024-10-28` **gemm** · sched · kept — Support l0 Llama groupwise; no numbers stated; `score 1`
+- `821b0033ed` `2024-10-29` **other** · other · kept — update layernorm & code refactor; no numbers stated; `score 0`
+- `0bbc04b5ec` `2024-10-29` **other** · docs · kept — Add ollama_quickstart.zh-CN.md; no numbers stated; `score 0`
+- `3700e81977` `2024-10-29` **other** · sched · kept — vllm-online-benchmark first token latency error; no numbers stated; `score 0`
+- `546f455e8e` `2024-10-29` **attention** · kernel · kept — Patch sdpa check function in specific module attributes table; no numbers stated; `score 2`
+- `3feb58d1e4` `2024-10-29` **other** · sched · kept — Support baichuan2 for level0 pipeline; no numbers stated; `score 1`
+- `5a15098835` `2024-10-29` **quant** · knob · kept — Initial support for quantized forward on CPU when `quantization_group_size=0`; no numbers stated; `score 1`
+- `2b2cb9c693` `2024-10-30` **other** · sched · kept — Support save & load and update examples; no numbers stated; `score 0`
+- `540eaeb12c` `2024-10-30` **attention** · kernel · kept — refactor attention_softmax; no numbers stated; `score 2`
+- `70037ad55f` `2024-10-30` **gemm** · sched · kept — groupwise prefill optimization (lm_head excluded); no numbers stated; `score 3`
+- `46d8300f6b` `2024-10-30` **other** · other · kept — bugfix for qlora finetuning on GPU; no numbers stated; `score 0`
+- `41b8064554` `2024-10-30` **other** · sched · kept — Support minicpm-1B in level0 pipeline; no numbers stated; `score 1`
+- `0763268e4c` `2024-10-30` **gemm** · sched · kept — Qwen2 groupwise perf on NPU; no numbers stated; `score 1`
+- `6f22133efc` `2024-10-30` **quant** · docs · kept — Update AWQ and GPTQ GPU example; no numbers stated; `score 0`
+- `29400e2e75` `2024-10-31` **other** · other · kept — feat: change oneccl to internal; no numbers stated; `score 0`
+- `4cf1ccc43a` `2024-10-30` **other** · docs · kept — Update DPO EADME.md; no numbers stated; `score 0`
+- `416c19165c` `2024-10-31` **other** · sched · kept — Add Qwen pipeline and example; no numbers stated; `score 1`
+- `72605c7016` `2024-10-31` **quant** · fix · kept — fix llama3.1/3.2 quantize kv check; no numbers stated; `score 1`
+- `97a0f7fd35` `2024-10-31` **attention** · knob · kept — Codegeex support; no numbers stated; `score 1`
+- `30f668c206` `2024-10-31` **other** · docs · kept — updated transformers & accelerate requirements; no numbers stated; `score 0`
+- `4892df61c9` `2024-10-31` **other** · sched · kept — Add qwen2-1.5b in l0 pipeline example; no numbers stated; `score 0`
+- `3df6195cb0` `2024-10-31` **other** · fix · kept — Fix application quickstart; no numbers stated; `score 0`
+- `b9853f98b3` `2024-10-31` **attention** · fix · kept — fix qwen2 attention_mask slice; no numbers stated; `score 1`
+- `eda764909c` `2024-11-01` **other** · sched · kept — Add minicpm-2b in L0 pipeline; no numbers stated; `score 0`
+- `05c5d0267a` `2024-11-01` **attention** · kernel · kept — Llama2 prefill use ov sdp; no numbers stated; `score 1`
+
+*Commits 3501-3600 (2024-10-10..2024-11-01): scores 0/1/2/3 = 61/31/7/1; areas other 68, attention 18, gemm 7, quant 4.*
+
+- `126f95be80` `2024-11-01` **other** · fix · kept — Fix DPO finetuning example; no numbers stated; `score 0`
+- `d409d9d0eb` `2024-11-01` **sync** · other · kept — Update streaming mode of example; no numbers stated; `score 0`
+- `f53bb4ea0b` `2024-11-01` **other** · other · kept — Update 1st token generation; no numbers stated; `score 0`
+- `cd5e22cee5` `2024-11-01` **other** · other · kept — Update Llava GPU Example; no numbers stated; `score 0`
+- `48123af463` `2024-11-01` **quant** · instr · kept — add `npu_group_size` for `transformers_int4_npu_win` in all-in-one benchmark api; no numbers stated; `score 0`
+- `20755e8077` `2024-11-01` **other** · instr · kept — Small fix to all-in-one benchmark scripts; no numbers stated; `score 0`
+- `94ce447794` `2024-11-04` **other** · other · kept — Fix performance tests regarding `trl` version; no numbers stated; `score 0`
+- `c8679ad592` `2024-11-04` **other** · other · kept — Qwen layernorm as input; no numbers stated; `score 1`
+- `8fe01c9e4d` `2024-11-04` **other** · sched · kept — update cmake usage of pipeline; no numbers stated; `score 0`
+- `4644cb640c` `2024-11-04` **other** · other · kept — Perf test further fix regarding trl version; no numbers stated; `score 0`
+- `a01371f90b` `2024-11-04` **other** · docs · kept — Doc: update harness readme; no numbers stated; `score 0`
+- `5ee6f97d6f` `2024-11-04` **other** · other · kept — Add layernorm weight as const / input setting; no numbers stated; `score 1`
+- `e54af44ed6` `2024-11-04` **quant** · sched · kept — Add `transformers_int4_npu_pipeline_win` in all-in-one benchmark; no numbers stated; `score 0`
+- `94c4ce389f` `2024-11-04` **other** · knob · kept — Add env to disable compile opt; no numbers stated; `score 1`
+- `1b637e4477` `2024-11-04` **attention** · fusion · kept — Add chatglm2&3 fuse mlp; no numbers stated; `score 2`
+- `522cdf8e9d` `2024-11-04` **other** · other · kept — Add initial support for LNL nightly performance tests; no numbers stated; `score 0`
+- `e2adc974fd` `2024-11-04` **other** · other · kept — Small fix to LNL performance tests; no numbers stated; `score 0`
+- `45b0d371aa` `2024-11-04` **other** · docs · kept — update benchmark readme; no numbers stated; `score 0`
+- `923d696854` `2024-11-05` **other** · other · kept — Small fix to LNL performance tests; no numbers stated; `score 0`
+- `82a61b5cf3` `2024-11-05` **other** · docs · kept — Limit trl version in example; no numbers stated; `score 0`
+- `d872639395` `2024-11-05` **gemm** · sched · kept — Llama3, Qwen2 1.5b, MiniCPM 1/2B groupwise support; no numbers stated; `score 1`
+- `8e9a3a1158` `2024-11-05` **other** · other · kept — fix chatglm2 cpu ut; no numbers stated; `score 0`
+- `7240c283a3` `2024-11-05` **other** · other · kept — Add dummy model in iGPU perf; no numbers stated; `score 0`
+- `899a30331a` `2024-11-06` **other** · other · kept — Replace gradio_web_server.patch to adjust webui; no numbers stated; `score 0`
+- `69e3a56943` `2024-11-06` **mem** · fix · kept — Hot fix of load_low_bit; no numbers stated; `score 1`
+- `c8b7265359` `2024-11-06` **other** · knob · kept — Add basic glm4v support; no numbers stated; `score 1`
+- `e23ef7d088` `2024-11-06` **attention** · other · kept — optimize glm4v's vision part; no numbers stated; `score 1`
+- `d984c0672a` `2024-11-06` **other** · other · kept — Add MiniCPM-V-2_6 to arc perf test; no numbers stated; `score 0`
+- `f24352aef9` `2024-11-06` **attention** · knob · kept — llama 3.1/3.2 support compresskv; no numbers stated; `score 1`
+- `c267355b35` `2024-11-06` **other** · instr · kept — fix three NPU benchmark issues; no numbers stated; `score 0`
+- `872a74481a` `2024-11-06` **attention** · other · kept — Small optimization to glm4 models; no numbers stated; `score 1`
+- `a7b66683f1` `2024-11-06` **other** · knob · kept — Add Optimized Support for Llama3.2-1B/3B on NPU; no numbers stated; `score 0`
+- `79f2877413` `2024-11-07` **quant** · knob · kept — add minicpm-v models to `transformers_int4_npu_win` api; no numbers stated; `score 0`
+- `d880e534d2` `2024-11-07` **gemm** · sched · kept — acclib llama3.2 support groupwise; no numbers stated; `score 1`
+- `ce0c6ae423` `2024-11-07` **other** · docs · kept — Update Readme for FastChat docker demo; no numbers stated; `score 0`
+- `71ea539351` `2024-11-07` **other** · docs · kept — Add troubleshootings for ollama and llama.cpp; no numbers stated; `score 0`
+- `ad68c56573` `2024-11-07` **attention** · other · kept — small improvement; no numbers stated; `score 1`
+- `520af4e9b5` `2024-11-07` **other** · docs · kept — Update install_linux_gpu.md; no numbers stated; `score 0`
+- `1a6cbc473f` `2024-11-07` **attention** · fusion · kept — Add fused mlp optimizations to glm4 models; no numbers stated; `score 2`
+- `8fe294e01f` `2024-11-07` **other** · instr · kept — Small fix to all-in-one benchmark; no numbers stated; `score 0`
+- `7ef7696956` `2024-11-08` **other** · docs · kept — update linux installation doc; no numbers stated; `score 0`
+- `812d5cc32e` `2024-11-08` **other** · sched · kept — Support llama3.2 in L0 pipeline; no numbers stated; `score 1`
+- `b2e69a896c` `2024-11-08` **gemm** · sched · kept — Support Baichuan groupwise & gw code refactor; no numbers stated; `score 1`
+- `51f7f87768` `2024-11-08` **other** · fix · kept — fix ipex 2.3 bug; no numbers stated; `score 1`
+- `fad15c8ca0` `2024-11-08` **other** · docs · kept — Update fastchat demo script; no numbers stated; `score 0`
+- `2dfcc36825` `2024-11-08` **other** · fix · kept — Fix trl version and padding in trl qlora example; no numbers stated; `score 0`
+- `dc34e8c51f` `2024-11-08` **attention** · other · kept — optimize glm4v vision attention; no numbers stated; `score 1`
+- `e0918934c8` `2024-11-11` **other** · fusion · kept — Add fused_mlp to glm4v models; no numbers stated; `score 2`
+- `c92d76b997` `2024-11-11` **other** · other · kept — Update oneccl-binding.patch; no numbers stated; `score 0`
+- `85c9279e6e` `2024-11-12` **other** · other · kept — Update llama-cpp docker usage; no numbers stated; `score 0`
+- `7a97fbb779` `2024-11-12` **other** · knob · kept — Support vpm and resampler module of minicpm-v on NPU; no numbers stated; `score 0`
+- `6bf5a8c230` `2024-11-12` **other** · other · kept — Update qwen2 compile config; no numbers stated; `score 1`
+- `4376fdee62` `2024-11-12` **other** · other · kept — Decouple the openwebui and the ollama. in inference-cpp-xpu dockerfile; no numbers stated; `score 0`
+- `0ee54fc55f` `2024-11-12` **other** · sched · kept — Upgrade to vllm 0.6.2; no numbers stated; `score 0`
+- `dd8964ba9c` `2024-11-12` **other** · other · kept — changed inference-cpp/Dockerfile; no numbers stated; `score 0`
+- `27152476e1` `2024-11-12` **other** · fix · kept — minor fix; no numbers stated; `score 0`
+- `1158f91648` `2024-11-13` **other** · fix · kept — Fix llava with multi-image inputs; no numbers stated; `score 1`
+- `9220babaab` `2024-11-13` **other** · other · kept — qwen prefill attn_mask type fp16; no numbers stated; `score 1`
+- `d6d63d6b84` `2024-11-13` **other** · other · kept — Qwen prefill attn_mask type hotfix; no numbers stated; `score 1`
+- `00fce5c940` `2024-11-13` **gemm** · kernel · kept — select the new q4_0 batch kernel in low_bit_linear; no numbers stated; `score 3`
+- `59b01fa7d2` `2024-11-14` **other** · fix · kept — small fix; no numbers stated; `score 1`
+- `6726b198fd` `2024-11-14` **other** · docs · kept — Update readme & doc for the vllm upgrade to v0.6.2; no numbers stated; `score 0`
+- `d2cbcb060c` `2024-11-14` **other** · knob · kept — Add initial support for modeling_xlm encoder on NPU; no numbers stated; `score 0`
+- `7e50ff113c` `2024-11-14` **other** · other · kept — Add padding_token=eos_token for GPU trl QLora example; no numbers stated; `score 0`
+- `d4d949443f` `2024-11-14` **attention** · other · kept — change attention_mask to fp16; no numbers stated; `score 1`
+- `548dec5185` `2024-11-15` **other** · sched · kept — fix npu pipeline workflow; no numbers stated; `score 0`
+- `d1cde7fac4` `2024-11-15` **other** · docs · kept — Tiny doc fix; no numbers stated; `score 0`
+- `fcc0fa7316` `2024-11-15` **other** · fix · kept — fix workflow again; no numbers stated; `score 0`
+- `6c5e8fc70c` `2024-11-15` **other** · fix · kept — fix again; no numbers stated; `score 0`
+- `3d5fbf2069` `2024-11-15` **gemm** · knob · kept — the batch-kernel condition (shape/type gate); no numbers stated; `score 3`
+- `d2c821d458` `2024-11-18` **other** · sched · kept — Add missing arguments in pipeline parallel generate method; no numbers stated; `score 1`
+- `a69395f31f` `2024-11-18` **sync** · knob · kept — Support performance mode of GLM4 model; no numbers stated; `score 1`
+- `d6057f6dd2` `2024-11-19` **other** · sched · kept — Update benchmark_vllm_throughput.py; no numbers stated; `score 0`
+- `a9cb70a71c` `2024-11-19` **other** · docs · kept — Add install_windows_gpu.zh-CN.md and install_linux_gpu.zh-CN.md; no numbers stated; `score 0`
+- `ff3f7cb25f` `2024-11-18` **other** · fix · kept — Fix speech_paraformer issue with unexpected changes; no numbers stated; `score 1`
+- `1bfcbc0640` `2024-11-20` **other** · instr · kept — Add multimodal benchmark; no numbers stated; `score 0`
+- `54c62feb74` `2024-11-19` **other** · other · kept — dump prefill IR for further C++ solution; no numbers stated; `score 1`
+- `d2a37b6ab2` `2024-11-20` **other** · fusion · kept — add Stable diffusion examples; no numbers stated; `score 0`
+- `7288c759ce` `2024-11-20` **other** · other · kept — Initial NPU C++ Example; no numbers stated; `score 0`
+- `145e8b480f` `2024-11-21` **gemm** · knob · kept — batch-kernel condition update; no numbers stated; `score 3`
+- `7e0a840f74` `2024-11-21` **other** · other · kept — add optimization to openjourney; no numbers stated; `score 0`
+- `8fdc36c140` `2024-11-21` **gemm** · knob · kept — new batch kernel at batch_size=1 on LNL; no numbers stated; `score 2`
+- `2935e97610` `2024-11-21` **other** · docs · kept — small fix of cpp readme; no numbers stated; `score 0`
+- `e61ae88c5b` `2024-11-21` **other** · knob · kept — Upgrade denpendency for xpu_lnl and xpu_arl option; no numbers stated; `score 0`
+- `c089b6c10d` `2024-11-22` **other** · other · kept — Update english prompt to 34k; no numbers stated; `score 0`
+- `4ffa6c752c` `2024-11-21` **other** · knob · kept — New convert support for C++ NPU; no numbers stated; `score 1`
+- `0819fad34e` `2024-11-22` **other** · knob · kept — support Llama2-7B / Llama3-8B for NPU C++; no numbers stated; `score 1`
+- `f41405368a` `2024-11-24` **other** · knob · kept — Support minicpm for NPU C++; no numbers stated; `score 0`
+- `be132c4209` `2024-11-25` **attention** · fix · kept — fix and optimize sd; no numbers stated; `score 1`
+- `8164aed802` `2024-11-25` **attention** · other · kept — small change; no numbers stated; `score 1`
+- `b633fbf26c` `2024-11-25` **other** · docs · kept — add chinese prompt troubleshooting for npu cpp examples; no numbers stated; `score 0`
+- `b9abb8a285` `2024-11-25` **other** · knob · kept — Support qwen2.5 3B for NPU & update related examples; no numbers stated; `score 0`
+- `cdd41f5e4c` `2024-11-25` **attention** · other · kept — optimize sdxl again; no numbers stated; `score 1`
+- `0e23bd779f` `2024-11-25` **other** · knob · kept — Add support of llama3.2 for NPU C++; no numbers stated; `score 1`
+- `66bd7abae4` `2024-11-26` **attention** · other · kept — add sdxl and lora-lcm optimization; no numbers stated; `score 0`
+- `52c17fe104` `2024-11-25` **other** · other · kept — Optimize first token of C++ NPU by adding npu_dpu_groups; no numbers stated; `score 1`
+- `71e1f11aa6` `2024-11-26` **other** · sched · kept — update serving image runtime; no numbers stated; `score 0`
+- `303b104c10` `2024-11-26` **quant** · fix · kept — Fix abnormal output for Qwen2-7B when sym_int8; no numbers stated; `score 1`
+- `24b46b2b19` `2024-11-26` **quant** · sched · kept — further fix  of qwen2 int8 pipeline & C++; no numbers stated; `score 1`
+- `c2efa264d9` `2024-11-26` **sync** · other · kept — Update LangChain examples to use upstream; no numbers stated; `score 0`
+
+*Commits 3601-3700 (2024-11-01..2024-11-26): scores 0/1/2/3 = 59/34/4/3; areas other 72, attention 12, gemm 7, quant 5.*
+
+- `7b40f9b372` `2024-11-26` **other** · knob · kept — Support GW for NPU C++; no numbers stated; `score 1`
+- `cb7b08948b` `2024-11-27` **other** · docs · kept — update vllm-docker-quick-start for vllm0.6.2; no numbers stated; `score 0`
+- `8331875f34` `2024-11-27` **other** · fix · kept — Fix; no numbers stated; `score 0`
+- `f8c2bb2943` `2024-11-26` **other** · other · kept — optimize qwen2 prefill performance for C++; no numbers stated; `score 0`
+- `acd77d9e87` `2024-11-27` **other** · kernel · removed — Remove env variable `BIGDL_LLM_XMX_DISABLED` in documentation; no numbers stated; `score 0`
+- `effb9bb41c` `2024-11-27` **other** · docs · kept — Small update to LangChain examples readme; no numbers stated; `score 0`
+- `ce6fcaa9ba` `2024-11-27` **other** · docs · kept — update transformers version in example of glm4; no numbers stated; `score 0`
+- `281c9b0bb9` `2024-11-27` **other** · knob · kept — Add L0 support for NPU C++; no numbers stated; `score 0`
+- `6f3441ba4c` `2024-11-27` **attention** · fix · kept — fix glm4-9b overflow; no numbers stated; `score 1`
+- `a2272b70d3` `2024-11-27` **other** · docs · kept — Small fix in llama.cpp troubleshooting guide; no numbers stated; `score 0`
+- `b29da30205` `2024-11-27` **other** · other · kept — Update C++ L0; no numbers stated; `score 0`
+- `d272f6b471` `2024-11-28` **quant** · knob · removed — remove nf4 unsupport comment in cpu finetuning; no numbers stated; `score 0`
+- `1b533a105c` `2024-11-28` **quant** · knob · kept — Add env to enable scale search; no numbers stated; `score 1`
+- `490bb0ca53` `2024-11-28` **other** · fusion · kept — update fused layers for GW; no numbers stated; `score 1`
+- `14d8d3d8af` `2024-11-29` **other** · other · kept — Integrate NPU C++ imple into ipex-llm; no numbers stated; `score 0`
+- `c911026f03` `2024-11-29` **other** · instr · kept — Update model support & examples & benchmark; no numbers stated; `score 0`
+- `f99f188023` `2024-11-29` **other** · instr · kept — Hotfix of benchmark script; no numbers stated; `score 0`
+- `4b6c3160be` `2024-12-01` **quant** · knob · kept — Support imatrix-guided quantization for NPU CW; no numbers stated; `score 1`
+- `59bd4a214f` `2024-12-02` **other** · sched · kept — add vLLM glm4 fix; no numbers stated; `score 1`
+- `54d9a590d4` `2024-12-02` **other** · fix · kept — Fix eos_token setting; no numbers stated; `score 1`
+- `31c69a8d31` `2024-12-02` **other** · fix · kept — Fix MiniCPM-V models running on NPU; no numbers stated; `score 1`
+- `aee9acb303` `2024-12-02` **other** · docs · kept — Add NPU QuickStart & update example links; no numbers stated; `score 0`
+- `b2e56a2e03` `2024-12-02` **other** · knob · kept — Add release support for option `xpu_arc`; no numbers stated; `score 0`
+- `26adb82ee3` `2024-12-02` **other** · other · removed — Remove hard code; no numbers stated; `score 1`
+- `ab01753b1c` `2024-12-03` **other** · knob · kept — update save-load API usage; no numbers stated; `score 0`
+- `598603bea6` `2024-12-02` **quant** · fix · kept — small fix of imatrix; no numbers stated; `score 1`
+- `5fe766788e` `2024-12-03` **other** · fix · kept — Fix MiniCPM-V-2_6 running on NPU; no numbers stated; `score 1`
+- `7082844f3f` `2024-12-03` **other** · fix · kept — Fix NPU LLM example save/load tokenizer; no numbers stated; `score 0`
+- `4ac66db034` `2024-12-03` **sync** · knob · kept — Support streaming in Python (cpp backend); no numbers stated; `score 1`
+- `80f15e41f5` `2024-12-03` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `c59284418c` `2024-12-03` **other** · fix · kept — Hotfix of BCE-Emdedding model; no numbers stated; `score 1`
+- `5629fdd518` `2024-12-04` **attention** · other · kept — optimize qwen2_vl multiple image input or video input; no numbers stated; `score 1`
+- `ef4028ac2d` `2024-12-04` **other** · knob · kept — Support split `lm_head` for Qwen2 with CPP; no numbers stated; `score 0`
+- `7ff4533b39` `2024-12-04` **other** · knob · kept — Support hf generate; no numbers stated; `score 1`
+- `e0bf0054e1` `2024-12-04` **attention** · fix · kept — small fix; no numbers stated; `score 1`
+- `ae9c2154f4` `2024-12-04` **other** · docs · kept — Added cross-links; no numbers stated; `score 0`
+- `a9e3f7f14c` `2024-12-04` **attention** · other · kept — optimize minicpm; no numbers stated; `score 1`
+- `ffa9a9e1b3` `2024-12-04` **sync** · other · kept — Update streaming in npu examples; no numbers stated; `score 0`
+- `7d27f134dd` `2024-12-04` **other** · fix · kept — Fix hf generate for llama3.2; no numbers stated; `score 1`
+- `b89ea1b0cf` `2024-12-04` **other** · knob · kept — Support save/load model for hf generate; no numbers stated; `score 1`
+- `d8b14a6305` `2024-12-04` **other** · other · kept — Update save/load comments; no numbers stated; `score 1`
+- `84f1c4ad57` `2024-12-04` **other** · fix · kept — Small fix for NPU Python cpp simple generate regarding eos tokens; no numbers stated; `score 1`
+- `f56a111aa2` `2024-12-05` **gemm** · instr · kept — Fix load-low-bit benchmark script; no numbers stated; `score 0`
+- `727f29968c` `2024-12-05` **other** · docs · kept — Add NPU demo gif to main readme; no numbers stated; `score 0`
+- `5e1416c9aa` `2024-12-05` **other** · docs · kept — fix readme for npu cpp examples and llama.cpp; no numbers stated; `score 0`
+- `0a3eda06d0` `2024-12-05` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `60bafab855` `2024-12-05` **other** · docs · kept — Small fixes to main readme; no numbers stated; `score 0`
+- `49ab8974fa` `2024-12-05` **quant** · knob · kept — initial support of `asym_int4_rtn`; no numbers stated; `score 1`
+- `0918d3baca` `2024-12-05` **other** · fix · kept — Fix hf generate with save/load generation config for Python (cpp backend); no numbers stated; `score 1`
+- `12c78978dd` `2024-12-06` **other** · knob · kept — Update example with conversation mode support; no numbers stated; `score 0`
+- `ea55235cbd` `2024-12-09` **other** · knob · kept — Support glm-edge models; no numbers stated; `score 0`
+- `922958c018` `2024-12-10` **other** · sched · kept — vllm oneccl upgrade to b9; no numbers stated; `score 0`
+- `77404d2a63` `2024-12-11` **attention** · knob · kept — support new model; no numbers stated; `score 1`
+- `68f2873bd3` `2024-12-11` **other** · knob · kept — Support repetition penalty for simple generate, Python (cpp backend); no numbers stated; `score 1`
+- `588bfa24dc` `2024-12-10` **other** · knob · kept — support hqq; no numbers stated; `score 1`
+- `41ef4974ab` `2024-12-10` **other** · fix · kept — fix `transpose_value = False` for NPU `optimize_model=True`; no numbers stated; `score 1`
+- `fd9cf767ed` `2024-12-11` **other** · instr · kept — All-in-one Benchmark run.py: Ignore error if import BenchmarkWrapper failed.; no numbers stated; `score 0`
+- `509bdb4661` `2024-12-11` **other** · fix · kept — Fix minicpm-2B error; no numbers stated; `score 1`
+- `6fc27da9c1` `2024-12-12` **other** · docs · kept — Update glm-edge support in docs; no numbers stated; `score 0`
+- `2cce89691a` `2024-12-12` **gemm** · knob · kept — enable use_batch_forward on Battlemage and for fp8e5; no numbers stated; `score 3`
+- `dbaf4abcb3` `2024-12-12` **other** · other · kept — Update C++ example with repetition_penalty & update Python code accordingly; no numbers stated; `score 1`
+- `3e0823d2ae` `2024-12-12` **attention** · knob · kept — add basic glm-edge support; no numbers stated; `score 1`
+- `ffce86d69f` `2024-12-12` **attention** · knob · kept — add basic glm-edge-v support; no numbers stated; `score 1`
+- `f36c23664f` `2024-12-12` **other** · fix · kept — Fix abnormal output with latest driver; no numbers stated; `score 1`
+- `b747f3f6b8` `2024-12-13` **other** · docs · kept — Small fix to GPU installation guide; no numbers stated; `score 0`
+- `fa261b8af1` `2024-12-13` **other** · other · kept — torch 2.3 inference docker; no numbers stated; `score 0`
+- `7cc01fdc86` `2024-12-12` **other** · fix · kept — further fix of `new_value_states`; no numbers stated; `score 1`
+- `6596c18489` `2024-12-13` **other** · knob · kept — Modify IPEX_LLM_NPU_DISABLE_COMPILE_OPT setting for long input; no numbers stated; `score 1`
+- `15219944b8` `2024-12-13` **attention** · other · kept — optimize glm edge again; no numbers stated; `score 1`
+- `d20a968ce2` `2024-12-13` **other** · fix · kept — Fix generate example; no numbers stated; `score 0`
+- `5402fc65c8` `2024-12-13` **other** · docs · kept — Update ipex-llm ollama readme to v0.4.6; no numbers stated; `score 0`
+- `c090d167dc` `2024-12-13` **attention** · other · removed — remove old rope usage; no numbers stated; `score 1`
+- `caf15cc5ef` `2024-12-13` **other** · knob · kept — Add `IPEX_LLM_NPU_MTL` to enable support on mtl; no numbers stated; `score 0`
+- `0b953e61ef` `2024-12-16` **other** · other · kept — graphmode code; no numbers stated; `score 0`
+- `a86487c539` `2024-12-16` **other** · other · kept — Add GLM-Edge GPU example; no numbers stated; `score 0`
+- `5ae0006103` `2024-12-16` **attention** · other · removed — remove old rope usage; no numbers stated; `score 1`
+- `ccc18eefb5` `2024-12-16` **other** · knob · kept — Add Modelscope option for chatglm3 on GPU; no numbers stated; `score 0`
+- `680ea7e4a8` `2024-12-17` **other** · docs · kept — Update configuration for different platforms; no numbers stated; `score 0`
+- `a608f26cc8` `2024-12-17` **attention** · fusion · kept — use new fused layer norm; no numbers stated; `score 2`
+- `d127a8654c` `2024-12-17` **other** · docs · kept — Small typo fixes; no numbers stated; `score 0`
+- `fcb474820d` `2024-12-17` **quant** · knob · kept — support asym_int4 for llama; no numbers stated; `score 1`
+- `429bf1ffeb` `2024-12-17` **other** · other · kept — Change: Use cn mirror for PyTorch extension installation to resolve network issues; no numbers stated; `score 0`
+- `694d14b2b4` `2024-12-17` **other** · docs · kept — Add ARL runtime configuration; no numbers stated; `score 0`
+- `6278cafc25` `2024-12-17` **other** · other · kept — Add `setuptools` as a basic dependency; no numbers stated; `score 0`
+- `6e801bc4e1` `2024-12-18` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `1a2ab12876` `2024-12-17` **quant** · knob · kept — support asym_int4 for minicpm; no numbers stated; `score 1`
+- `a4eb561f36` `2024-12-18` **attention** · other · kept — optimize siglip attention on arc; no numbers stated; `score 1`
+- `e2ae42929a` `2024-12-18` **attention** · fix · kept — small fix; no numbers stated; `score 1`
+- `f7a2bd21cf` `2024-12-18` **other** · docs · kept — Update ollama and llama.cpp readme; no numbers stated; `score 0`
+- `28e81fda8e` `2024-12-18` **other** · docs · kept — Replace runner doc in ollama quickstart; no numbers stated; `score 0`
+- `47e90a362f` `2024-12-19` **other** · other · kept — Add `--modelscope` in GPU examples for glm4, codegeex2, qwen2 and qwen2.5; no numbers stated; `score 0`
+- `e0921f80c1` `2024-12-19` **attention** · other · kept — padding mask on torch side; no numbers stated; `score 1`
+- `4540424271` `2024-12-19` **attention** · other · kept — optimize siglip attention again; no numbers stated; `score 1`
+- `80f2fdc37b` `2024-12-19` **attention** · other · kept — optimize new minicpm model; no numbers stated; `score 1`
+- `4e7e988f70` `2024-12-19` **other** · fix · kept — Fix MTL and ARL support; no numbers stated; `score 1`
+- `3eeb02f1be` `2024-12-19` **attention** · knob · kept — support Megrez-3B-Omni; no numbers stated; `score 1`
+- `47da3c999f` `2024-12-19` **other** · other · kept — Add `--modelscope` in GPU examples for minicpm, minicpm3, baichuan2; no numbers stated; `score 0`
+- `51ff9ebd8a` `2024-12-20` **other** · other · kept — Upgrade oneccl version to 0.0.6.3; no numbers stated; `score 0`
+- `f3b5fad3be` `2024-12-20` **attention** · other · kept — refactor qwen2 and llama3; no numbers stated; `score 1`
+- `b0338c5529` `2024-12-20` **other** · knob · kept — Add --modelscope option for glm-v4 MiniCPM-V-2_6 glm-edge and internvl2; no numbers stated; `score 0`
+
+*Commits 3701-3800 (2024-11-26..2024-12-20): scores 0/1/2/3 = 51/47/1/1; areas other 71, attention 18, quant 7, sync 2.*
+
+- `6ea8033635` `2024-12-20` **attention** · other · kept — refactor glm edge; no numbers stated; `score 1`
+- `b050368efc` `2024-12-20` **attention** · fix · kept — refactor yuan2 and starcoder2 and fix; no numbers stated; `score 1`
+- `098eb335b2` `2024-12-20` **attention** · fix · kept — refactor sd 1.5 and qwen2-vl and fix; no numbers stated; `score 1`
+- `c410d9cf73` `2024-12-23` **quant** · knob · kept — support asym_int4 for baichuan; no numbers stated; `score 1`
+- `7aaf02f602` `2024-12-24` **attention** · other · kept — refactor baichuan, glm4 and minicpm3; no numbers stated; `score 1`
+- `ad2dc965c5` `2024-12-24` **attention** · other · kept — refactor mllama, gpt2 and internvl; no numbers stated; `score 1`
+- `45f8f72a28` `2024-12-24` **other** · fix · kept — Fix minicpm on MTL; no numbers stated; `score 1`
+- `073f936c37` `2024-12-24` **attention** · other · kept — refactor mistral and phi3; no numbers stated; `score 1`
+- `4135b895b3` `2024-12-24` **attention** · other · kept — refactor chatglm2, internlm, stablelm and qwen; no numbers stated; `score 1`
+- `9c9800be31` `2024-12-24` **other** · docs · kept — Update README.zh-CN.md; no numbers stated; `score 0`
+- `4e6b9d804f` `2024-12-25` **attention** · other · kept — add compresskv back for mistral; no numbers stated; `score 1`
+- `54b1d7d333` `2024-12-25` **other** · docs · kept — Update README.zh-CN.md; no numbers stated; `score 0`
+- `5f5ac8a856` `2024-12-25` **attention** · fix · kept — fix llama related import; no numbers stated; `score 0`
+- `6249c1e373` `2024-12-25` **other** · fix · kept — rewrite the llama transformers optimization (3,080 lines removed); no numbers stated; `score 1`
+- `0477fe6480` `2024-12-26` **other** · docs · kept — Update doc for latest open webui: 0.4.8; no numbers stated; `score 0`
+- `9e895f04ec` `2024-12-25` **other** · fix · kept — fix npu save; no numbers stated; `score 1`
+- `a596f1ae5f` `2024-12-26` **other** · other · removed — remove bigdl-llm test to fix langchain UT; no numbers stated; `score 0`
+- `28737c250c` `2024-12-26` **other** · other · kept — Update Dockerfile; no numbers stated; `score 0`
+- `ef585d3360` `2024-12-26` **other** · docs · kept — Polish Readme for ModelScope-related examples; no numbers stated; `score 0`
+- `d841e1dc0d` `2024-12-25` **other** · other · kept — update convert script based on latest usage; no numbers stated; `score 0`
+- `1604b4ead8` `2024-12-26` **attention** · fix · kept — small fix; no numbers stated; `score 1`
+- `ccc4055058` `2024-12-26` **other** · other · kept — Update prompt format for baichuan2; no numbers stated; `score 0`
+- `40a7d2b4f0` `2024-12-26` **other** · docs · kept — Consolidated C-Eval Benchmark Guide for Single-GPU and Multi-GPU Environments; no numbers stated; `score 0`
+- `a9abde0b5d` `2024-12-26` **attention** · kernel · kept — support passing attn_scale to sdpa; no numbers stated; `score 2`
+- `bbdbbb0d88` `2024-12-26` **other** · other · kept — Compatible with other third-party models like auto-round; no numbers stated; `score 1`
+- `796ee571a5` `2024-12-26` **other** · docs · kept — Update verified platforms; no numbers stated; `score 0`
+- `55ce091242` `2024-12-27` **other** · other · kept — Add GLM4-Edge-V GPU example; no numbers stated; `score 0`
+- `34dbdb8ee3` `2024-12-27` **attention** · fix · kept — small fix; no numbers stated; `score 1`
+- `5f04ed7254` `2024-12-27` **other** · sched · kept — NPU] Update prompt format for baichuan2-pipeline; no numbers stated; `score 0`
+- `90f6709486` `2024-12-26` **other** · sched · removed — [remove pipeline examples; no numbers stated; `score 0`
+- `46eeab4479` `2024-12-27` **other** · fix · kept — Fix regression caused by layer_norm change; no numbers stated; `score 1`
+- `c72a5db757` `2024-12-27` **attention** · other · removed — remove unused code again; no numbers stated; `score 0`
+- `f17ccfa61a` `2024-12-27` **other** · fix · kept — Fix save-load usage of minicpm models; no numbers stated; `score 1`
+- `2d08155513` `2024-12-27` **other** · other · removed — remove bmm, which is only required in ipex 2.0; no numbers stated; `score 1`
+- `f289f68d57` `2024-12-30` **attention** · fix · kept — small fix; no numbers stated; `score 1`
+- `534566e290` `2025-01-02` **other** · knob · kept — Support minicpm-v with python cpp backend; no numbers stated; `score 0`
+- `81211fd010` `2025-01-02` **attention** · other · removed — remove unused code; no numbers stated; `score 1`
+- `62318964fa` `2025-01-02` **other** · other · kept — Update llama example information; no numbers stated; `score 0`
+- `8e5328e9b4` `2025-01-02` **quant** · knob · kept — add disable opts for awq; no numbers stated; `score 1`
+- `550fa01649` `2025-01-02` **other** · docs · kept — Update ipex-llm ollama troubleshooting for v0.4.6; no numbers stated; `score 0`
+- `8fd2dcba86` `2025-01-03` **other** · instr · kept — Add benchmark_util for `transformers >= 4.47.0`; no numbers stated; `score 0`
+- `6711a48a36` `2025-01-03` **other** · sched · kept — Enable internvl2-8b on vllm; no numbers stated; `score 1`
+- `0b377100c5` `2025-01-03` **other** · other · kept — Add guide for save-load usage; no numbers stated; `score 0`
+- `9f8b134889` `2025-01-03` **other** · build · kept — ipex-llm custom kernel registration; no numbers stated; `score 1`
+- `502461d836` `2025-01-03` **other** · fix · kept — remove unnecessary ipex kernel usage; no numbers stated; `score 1`
+- `fae73eee79` `2025-01-06` **quant** · knob · kept — Support save npu quantized model without npu dependency; no numbers stated; `score 1`
+- `ea65e4fecc` `2025-01-07` **attention** · other · removed — remove falcon support and related UT; no numbers stated; `score 0`
+- `ddc0ef3993` `2025-01-07` **moe** · knob · removed — refactor device check and remove cohere/mixtral support; no numbers stated; `score 1`
+- `381d448ee2` `2025-01-07` **other** · other · kept — Example & Quickstart updates; no numbers stated; `score 0`
+- `ebdf19fa7e` `2025-01-07` **other** · fix · kept — Further fix saving of generation config; no numbers stated; `score 1`
+- `525b0ee991` `2025-01-07` **other** · docs · kept — Tiny fixes on examples; no numbers stated; `score 0`
+- `29ad5c449e` `2025-01-07` **attention** · kernel · removed — refactor codegeex to remove ipex kernel usage; no numbers stated; `score 2`
+- `f9ee7898c8` `2025-01-07` **other** · kernel · kept — fix onednn dependency bug; no numbers stated; `score 0`
+- `5db6f9dcde` `2025-01-07` **other** · knob · kept — Add option with PyTorch 2.6 RC version for testing purposes; no numbers stated; `score 0`
+- `0534d7254f` `2025-01-08` **other** · docs · kept — Update docker_cpp_xpu_quickstart.md; no numbers stated; `score 0`
+- `ccf618ff4a` `2025-01-08` **attention** · other · removed — Remove all ipex usage; no numbers stated; `score 0`
+- `7dd156d292` `2025-01-08` **other** · fix · kept — small fix and add comment; no numbers stated; `score 1`
+- `2c23ce2553` `2025-01-08` **other** · docs · kept — Create a BattleMage QuickStart; no numbers stated; `score 0`
+- `c11f5f0fcd` `2025-01-08` **attention** · fix · kept — convert SdpaAttention in optimize_model; no number stated; `score 1`
+- `a22a8c21bb` `2025-01-08` **attention** · fix · removed — small fix and remove ununsed code about ipex; no numbers stated; `score 1`
+- `5c24276fc4` `2025-01-08` **other** · fix · kept — fix custom kernel registration; no numbers stated; `score 1`
+- `2321e8d60c` `2025-01-08` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `c6f57ad6ed` `2025-01-08` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `aa9e70a347` `2025-01-08` **other** · docs · kept — Update B580 Doc; no numbers stated; `score 0`
+- `1ec40cd09e` `2025-01-09` **attention** · other · kept — refactor to simplify following upgrade; no numbers stated; `score 1`
+- `5d8081afbc` `2025-01-09` **other** · other · removed — Remove dummy model from performance tests; no numbers stated; `score 0`
+- `7234c9b27b` `2025-01-09` **kv** · knob · kept — update quantize kv cache condition; no numbers stated; `score 1`
+- `c24741584d` `2025-01-09` **other** · other · kept — Support PyTorch 2.6 RC perf test on Windows; no numbers stated; `score 0`
+- `66d4385cc9` `2025-01-09` **other** · docs · kept — Update B580 CN Doc; no numbers stated; `score 0`
+- `f9b29a4f56` `2025-01-10` **other** · docs · kept — Update B580 doc; no numbers stated; `score 0`
+- `2673792de6` `2025-01-10` **other** · other · kept — Update Dockerfile; no numbers stated; `score 0`
+- `68857494a5` `2025-01-10` **attention** · other · kept — refactor to simplify following upgrade 2; no numbers stated; `score 1`
+- `f8dc408888` `2025-01-10` **other** · fix · kept — fix user issue; no numbers stated; `score 1`
+- `cbb8e2a2d5` `2025-01-10` **other** · docs · kept — Update documents; no numbers stated; `score 0`
+- `584c1c5373` `2025-01-10` **other** · docs · kept — Update B580 CN doc; no numbers stated; `score 0`
+- `da8bcb7db1` `2025-01-10` **other** · fix · kept — fix load logic of glm-edge models; no numbers stated; `score 1`
+- `4bf93c66e8` `2025-01-10` **other** · knob · kept — Support install from source for PyTorch 2.6 RC in UT; no numbers stated; `score 0`
+- `db9db51e2c` `2025-01-10` **other** · fix · kept — fix lnl perf; no numbers stated; `score 1`
+- `e2d58f733e` `2025-01-10` **other** · docs · kept — Update ollama v0.5.1 document; no numbers stated; `score 0`
+- `a1da7908b9` `2025-01-13` **other** · fix · kept — Fix name device is not found bug; no numbers stated; `score 1`
+- `350fae285d` `2025-01-13` **other** · knob · kept — Add Qwen2-VL HF GPU example with ModelScope Support; no numbers stated; `score 1`
+- `6d03d06ebb` `2025-01-14` **other** · other · kept — Change runtime configurations for perf test on Windows; no numbers stated; `score 0`
+- `9930351112` `2025-01-15` **gemm** · kernel · kept — add new qtype woq_int4 to support gemm int4 temporary.; no numbers stated; `score 2`
+- `36bf3d8e29` `2025-01-15` **other** · docs · kept — Update ARL product in QuickStart; no numbers stated; `score 0`
+- `9d65dcd7ef` `2025-01-15` **moe** · fix · kept — Fix deepseek coder with linear rope type support on GPU; no numbers stated; `score 1`
+- `c52bdff76b` `2025-01-16` **moe** · other · kept — Update Deepseek coder GPU example; no numbers stated; `score 0`
+- `b62734748f` `2025-01-16` **other** · knob · kept — add support and optimization for minicpmo vision part; no numbers stated; `score 1`
+- `54d6328b3c` `2025-01-16` **gemm** · other · kept — woq int4 fwd; no numbers stated; `score 1`
+- `534e0e6774` `2025-01-16` **gemm** · knob · kept — Update dependency for PyTorch 2.6 RC support for woq int4; no numbers stated; `score 0`
+- `53aae24616` `2025-01-16` **other** · docs · kept — Add note about enabling Resizable BAR in BIOS for GPU setup; no numbers stated; `score 0`
+- `bda87c21eb` `2025-01-16` **attention** · knob · kept — add support and optimization for minicpmo audio part; no numbers stated; `score 1`
+- `9aa4be8ced` `2025-01-20` **other** · other · kept — Update runtime configuration on MTL; no numbers stated; `score 1`
+- `085974e307` `2025-01-21` **quant** · fix · kept — fix nf4 to cpu; no numbers stated; `score 1`
+- `716d4fe563` `2025-01-21` **other** · sched · kept — Add  vllm 0.6.2 vision offline example; no numbers stated; `score 0`
+- `412bfd6644` `2025-01-21` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `6789e5d92f` `2025-01-21` **other** · fix · kept — small fix; no numbers stated; `score 1`
+- `7e29edcc4b` `2025-01-22` **other** · docs · kept — Update Readme; no numbers stated; `score 0`
+- `78cca0a68c` `2025-01-22` **other** · other · kept — update llm-npu-cli example; no numbers stated; `score 0`
+- `c9b6c94a59` `2025-01-22` **other** · sched · kept — vLLM: Update vLLM-cpu to v0.6.6-post1; no numbers stated; `score 0`
+- `dcca522618` `2025-01-22` **attention** · kernel · removed — Remove sdpa available patch; no numbers stated; `score 2`
+
+*Commits 3801-3900 (2024-12-20..2025-01-22): scores 0/1/2/3 = 50/46/4/0; areas other 65, attention 24, quant 4, moe 3.*
+
+- `d11f257ee7` `2025-01-23` **other** · other · kept — Add GPU example for MiniCPM-o-2_6; no numbers stated; `score 0`
+- `69f13c78b8` `2025-01-23` **other** · other · kept — Update layernorm node on MTL/ARL; no numbers stated; `score 1`
+- `f924880694` `2025-01-24` **other** · sched · kept — vLLM: Fix vLLM-CPU docker image; no numbers stated; `score 0`
+- `5fb87d7486` `2025-01-26` **other** · other · removed — remove ${HF_TOKEN}; no numbers stated; `score 0`
+- `ee809e71df` `2025-01-26` **other** · docs · kept — add troubleshooting section; no numbers stated; `score 0`
+- `184adb2653` `2025-02-05` **other** · docs · kept — Small fix to MiniCPM-o-2_6 GPU example; no numbers stated; `score 0`
+- `413d6c2b66` `2025-02-05` **other** · other · kept — Update check.py removing a twice defined function; no numbers stated; `score 0`
+- `0237ffb302` `2025-02-05` **gemm** · other · kept — refactor xpu linear forward; no numbers stated; `score 1`
+- `a1e7bfc638` `2025-02-05` **other** · docs · kept — Update Readme; no numbers stated; `score 0`
+- `9c0daf6396` `2025-02-05` **other** · docs · kept — Fix readme links; no numbers stated; `score 0`
+- `094a25b740` `2025-02-06` **other** · knob · kept — Expose parameter to control blob / IR save logic; no numbers stated; `score 1`
+- `9697197f3e` `2025-02-06` **other** · fix · kept — fix qlora finetune example; no numbers stated; `score 0`
+- `2e5f2e5dda` `2025-02-06` **other** · fix · kept — fix dpo finetune; no numbers stated; `score 0`
+- `c0d6b282b8` `2025-02-06` **other** · fix · kept — fix lisa finetune example; no numbers stated; `score 0`
+- `b4c9e23f73` `2025-02-06` **other** · fix · kept — fix galore and peft finetune example; no numbers stated; `score 0`
+- `9e9b6c9f2b` `2025-02-07` **other** · sched · kept — Fix cpu serving docker image; no numbers stated; `score 0`
+- `d0d9c9d636` `2025-02-07` **other** · knob · removed — remove load_in_8bit usage as it is not supported a long time ago; no numbers stated; `score 0`
+- `b4f2be2b09` `2025-02-07` **moe** · other · kept — Update C++ example to add DeepSeek-R1; no numbers stated; `score 0`
+- `6ff7faa781` `2025-02-07` **moe** · docs · kept — Update deepseek support in python examples and quickstart; no numbers stated; `score 0`
+- `ca1d7b7c2c` `2025-02-07` **other** · knob · kept — Support qwen models with `cos_sin_input=True`; no numbers stated; `score 1`
+- `fd28cf1672` `2025-02-07` **other** · knob · kept — Upgrade `ipex-llm[cpp]` to oneAPI 2025.0 on Windows; no numbers stated; `score 0`
+- `8aea5319bb` `2025-02-08` **other** · docs · kept — update more lora example; no numbers stated; `score 0`
+- `e90a9ad196` `2025-02-08` **other** · knob · kept — Support non-const parameter for decoder layers when keep_ir=True; no numbers stated; `score 1`
+- `468d3f22fc` `2025-02-08` **other** · other · kept — Rename NPU public example to llm-cli; no numbers stated; `score 0`
+- `3fee838b14` `2025-02-10` **other** · fix · kept — Fix of c++ convert example; no numbers stated; `score 0`
+- `e4ceb722b6` `2025-02-10` **attention** · fix · kept — fix qwen2 vl; no numbers stated; `score 1`
+- `eb2df5ed70` `2025-02-10` **other** · other · kept — common.h -> npu/npu_common.h; no numbers stated; `score 0`
+- `2701a9d1e3` `2025-02-10` **other** · fusion · removed — Remove Migrated Workflows to Avoid Duplication and Confusion; no numbers stated; `score 0`
+- `b70ad902b4` `2025-02-11` **gemm** · fix · kept — Fix ipex-llm CPU linear dtype not match; no numbers stated; `score 1`
+- `d093b75aa0` `2025-02-11` **other** · docs · kept — Update driver installation in QuickStart; no numbers stated; `score 0`
+- `73cfe293fa` `2025-02-11` **attention** · knob · kept — add basic support for Baichuan-M1-14B-Instruct; no numbers stated; `score 1`
+- `bd815a4d96` `2025-02-12` **other** · knob · kept — Update the base image of inference-cpp image to oneapi 2025.0.2; no numbers stated; `score 0`
+- `f8ab833f74` `2025-02-12` **attention** · knob · kept — support and optimize janus pro; no numbers stated; `score 1`
+- `af693425f1` `2025-02-12` **other** · sched · kept — Upgrade to vLLM 0.6.6; no numbers stated; `score 0`
+- `1083fe5508` `2025-02-13` **other** · sched · kept — Reenable pp and lightweight-serving serving on 0.6.6; no numbers stated; `score 0`
+- `68414afcb9` `2025-02-13` **other** · docs · kept — Add initial QuickStart for Ollama portable zip; no numbers stated; `score 0`
+- `16e63cbc18` `2025-02-13` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `f67986021c` `2025-02-13` **other** · docs · kept — Update download link for Ollama portable zip QuickStart; no numbers stated; `score 0`
+- `a09552e59a` `2025-02-14` **other** · docs · kept — Update ollama quickstart; no numbers stated; `score 0`
+- `59e8e1e91e` `2025-02-14` **other** · docs · kept — Added ollama_portablze_zip_quickstart.zh-CN.md; no numbers stated; `score 0`
+- `eaec64baca` `2025-02-14` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `f7b5a093a7` `2025-02-17` **other** · sched · kept — Merge CPU & XPU Dockerfiles with Serving Images and Refactor; no numbers stated; `score 0`
+- `8418450300` `2025-02-17` **other** · other · kept — optimize minicpm-o's tts part; no numbers stated; `score 1`
+- `09ed96082b` `2025-02-18` **moe** · other · kept — Add DeepSeek V3/R1 CPU example; no numbers stated; `score 0`
+- `09150b6058` `2025-02-18` **moe** · other · kept — Initiate CPU-XPU Hybrid Inference for DeepSeek-R1; no numbers stated; `score 0`
+- `e1809a6295` `2025-02-19` **other** · sched · kept — Update multimodal on vllm 0.6.6; no numbers stated; `score 0`
+- `bde8acc303` `2025-02-19` **other** · docs · kept — Update doc of gguf support; no numbers stated; `score 0`
+- `637543e135` `2025-02-19` **other** · docs · kept — Update Ollama portable zip QuickStart with troubleshooting; no numbers stated; `score 0`
+- `93c10be762` `2025-02-19` **moe** · knob · kept — Support hybrid convert for DeepSeek V3/R1; no numbers stated; `score 0`
+- `aee2db30f9` `2025-02-19` **attention** · kernel · kept — update sdp support; no numbers stated; `score 2`
+- `5d041f9ebf` `2025-02-19` **other** · docs · kept — Add latest models list in ollama quickstart; no numbers stated; `score 0`
+- `b26409d53f` `2025-02-19` **moe** · instr · kept — R1 Hybrid: Add Benchmark for DeepSeek R1 transformers example; no numbers stated; `score 0`
+- `c81b7fc003` `2025-02-19` **other** · docs · kept — Add Portable zip Linux QuickStart; no numbers stated; `score 0`
+- `4eed0c7d99` `2025-02-19` **other** · sched · kept — initial implementation for low_bit_loader vLLM; no numbers stated; `score 0`
+- `38a682adb1` `2025-02-19` **other** · docs · kept — Update Readme; no numbers stated; `score 0`
+- `0f2706be42` `2025-02-20` **other** · docs · kept — Update CN Ollama portable zip QuickStart for troubleshooting & tips; no numbers stated; `score 0`
+- `a488981f3f` `2025-02-20` **other** · docs · kept — Ollama portable zip QuickStart tiny fix; no numbers stated; `score 0`
+- `348dc8056d` `2025-02-20` **quant** · sched · kept — Fix vllm gptq awq error; no numbers stated; `score 1`
+- `8077850452` `2025-02-21` **other** · other · kept — Add simple example; no numbers stated; `score 0`
+- `3ea5389a99` `2025-02-21` **other** · sched · kept — Fix vllm api_server v1/models error; no numbers stated; `score 1`
+- `21d6a78be0` `2025-02-21` **other** · docs · kept — Update Ollama portable zip QuickStart to fit new version; no numbers stated; `score 0`
+- `1e00bed001` `2025-02-21` **other** · other · kept — Add GPU example for Janus-Pro; no numbers stated; `score 0`
+- `10400abfb7` `2025-02-24` **other** · fix · kept — Fix CodeQL workflow; no numbers stated; `score 0`
+- `02ec313eab` `2025-02-24` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `afad979168` `2025-02-24` **other** · other · kept — Add Apache 2.0 License Information in Dockerfile to Comply with OSPDT Requirements; no numbers stated; `score 0`
+- `3f6ecce508` `2025-02-24` **other** · knob · kept — support using xgrammar to get json output; no numbers stated; `score 1`
+- `4f2f92afa3` `2025-02-24` **other** · other · kept — Update inference-cpp docker; no numbers stated; `score 0`
+- `a9c8e73a77` `2025-02-24` **other** · docs · kept — Update llama.cpp Prerequisites guide regarding oneAPI 2025.0; no numbers stated; `score 0`
+- `671ddfd847` `2025-02-24` **other** · other · kept — Update wrong file name for portable zip quickstart; no numbers stated; `score 0`
+- `06694ba61a` `2025-02-24` **other** · docs · kept — Further fix portable zip file link; no numbers stated; `score 0`
+- `dd30d12cb6` `2025-02-25` **other** · sched · kept — Fix serving-cpu image: setuptools-scm requires setuptools>=61; no numbers stated; `score 0`
+- `ab3fc66eb7` `2025-02-25` **attention** · kernel · kept — attention part of moonlight-14B-A3B; no numbers stated; `score 1`
+- `ae9f5320da` `2025-02-25` **other** · sched · kept — vLLM CPU: Fix Triton Version to Resolve Related Error; no numbers stated; `score 0`
+- `5faba06409` `2025-02-25` **moe** · sched · kept — MoE decode forward, one simple optimization; no numbers stated; `score 2`
+- `ad65e2b03a` `2025-02-27` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `be1f073866` `2025-02-27` **moe** · fusion · kept — fuse the MoE block for moonlight (DeepSeek-style); no numbers stated; `score 2`
+- `5c100ac105` `2025-02-27` **sync** · sched · kept — Add ENTRYPOINT to Dockerfile to auto-start vllm service on container launch (for CVTE customer); no numbers stated; `score 0`
+- `e946127613` `2025-02-28` **attention** · kernel · kept — glm 4v 1st sdp for vision; no numbers stated; `score 2`
+- `39e360fe9d` `2025-02-28` **moe** · kernel · kept — grouped top-k selection; no numbers stated; `score 2`
+- `8d94752c4b` `2025-02-28` **other** · docs · kept — Ollama portable zip QuickStart updates regarding more tips; no numbers stated; `score 0`
+- `443cb5d4e0` `2025-02-28` **other** · docs · kept — Update Janus-Pro GPU example; no numbers stated; `score 0`
+- `029480f4a8` `2025-02-28` **other** · docs · kept — llama cpp portable zip Quickstart; no numbers stated; `score 0`
+- `8351f6c455` `2025-02-28` **other** · docs · kept — Add QuickStart for llama.cpp NPU portable zip; no numbers stated; `score 0`
+- `35e5fa851c` `2025-02-28` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `b6f33d5c4d` `2025-03-03` **moe** · other · kept — optimize moonlight again; no numbers stated; `score 1`
+- `7810b8fb49` `2025-03-03` **other** · other · kept — OSPDT: update dockerfile header; no numbers stated; `score 0`
+- `f81d89d908` `2025-03-03` **other** · docs · removed — Remove Unnecessary --privileged Flag While Keeping It for WSL Users; no numbers stated; `score 0`
+- `b2d676f1c6` `2025-03-03` **other** · docs · kept — Further update Ollama portable zip quickstart; no numbers stated; `score 0`
+- `091ab2bd59` `2025-03-04` **other** · docs · kept — Add troubleshooting in portable zip doc; no numbers stated; `score 0`
+- `0b5079833c` `2025-03-04` **other** · docs · kept — llama.cpp portable Zip for Linux quickstart; no numbers stated; `score 0`
+- `69edc8b6f6` `2025-03-04` **other** · docs · kept — Update quickstart; no numbers stated; `score 0`
+- `de09590ca3` `2025-03-05` **other** · docs · kept — Update llamacpp_portable_zip_gpu_quickstart.md; no numbers stated; `score 0`
+- `33da3a3cb7` `2025-03-05` **other** · docs · kept — Update llama cpp portable zip quickstart; no numbers stated; `score 0`
+- `68a770745b` `2025-03-05` **moe** · other · kept — Add moonlight GPU example; no numbers stated; `score 0`
+- `7c0c77cce3` `2025-03-05` **other** · docs · kept — Tiny fixes; no numbers stated; `score 0`
+- `eccb5b817e` `2025-03-05` **other** · docs · kept — Add llamacpp_portable_zip_gpu_quickstart.zh-CN.md; no numbers stated; `score 0`
+- `975cf5f21f` `2025-03-06` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `32480cc8ed` `2025-03-06` **other** · docs · kept — Update llamacpp_portable_zip_gpu_quickstart; no numbers stated; `score 0`
+- `1432c5d9a0` `2025-03-06` **other** · docs · kept — Update llamacpp_portable_zip_gpu_quickstart; no numbers stated; `score 0`
+- `cb3c4b26ad` `2025-03-06` **other** · docs · kept — Update llamacpp_portable_zip_gpu_quickstart.md; no numbers stated; `score 0`
+
+*Commits 3901-4000 (2025-01-23..2025-03-06): scores 0/1/2/3 = 80/15/5/0; areas other 79, moe 11, attention 6, gemm 2.*
+
+- `015a4c8c43` `2025-03-07` **other** · docs · kept — Add CPU and GPU Frequency Locking Instructions to Documentation; no numbers stated; `score 0`
+- `5ee09b4b28` `2025-03-07` **other** · docs · kept — Small update about zip doc; no numbers stated; `score 0`
+- `2a8f624f4b` `2025-03-09` **other** · docs · kept — Update README; no numbers stated; `score 0`
+- `6a2d87e40f` `2025-03-10` **other** · docs · kept — add `--entrypoint /bin/bash`; no numbers stated; `score 0`
+- `d0e443e893` `2025-03-11` **other** · other · kept — Update issue templates; no numbers stated; `score 0`
+- `3941f322c5` `2025-03-11` **other** · other · kept — Update issue templates; no numbers stated; `score 0`
+- `c8a0462507` `2025-03-12` **other** · sched · kept — Add vllm api_server input output log; no numbers stated; `score 0`
+- `8bc41c13ab` `2025-03-13` **other** · knob · kept — Support PyTorch 2.6 with Arrow Lake-H AOT on Windows; no numbers stated; `score 0`
+- `cd109bb061` `2025-03-14` **gemm** · kernel · kept — Gemma QLoRA example; no numbers stated; `score 0`
+- `c9ecb7a113` `2025-03-14` **other** · sched · kept — Fix qwen nan value issue on vllm; no numbers stated; `score 1`
+- `6a7819f1ac` `2025-03-14` **other** · docs · kept — Update portable zip related quickstart regarding recommanded driver; no numbers stated; `score 0`
+- `03c9024209` `2025-03-14` **other** · docs · kept — Update README; no numbers stated; `score 0`
+- `760abc47aa` `2025-03-17` **other** · fix · kept — Fix Docker build failure due to outdated ipex-llm pip index URL; no numbers stated; `score 0`
+- `b0d56273a8` `2025-03-17` **other** · fix · kept — Fix Docker build failure due to outdated ipex-llm pip index URL; no numbers stated; `score 0`
+- `dd026db50b` `2025-03-17` **other** · docs · kept — Add SNC to llama.cpp portable zip quick start; no numbers stated; `score 0`
+- `6f634b41da` `2025-03-19` **gemm** · docs · kept — Update model support list regarding Gemma3 for Ollama portable zip QuickStart; no numbers stated; `score 0`
+- `5bdf57327d` `2025-03-20` **other** · sched · removed — Remove ipex import in fastchat loader; no numbers stated; `score 1`
+- `46a4f53967` `2025-03-21` **other** · other · kept — OSPDT: add tpp licenses for release 2.2.0; no numbers stated; `score 0`
+- `7a86dd0569` `2025-03-24` **other** · other · removed — Remove unused Gradio; no numbers stated; `score 0`
+- `0e0786a63c` `2025-03-25` **other** · docs · kept — update llama.cpp related quickstart with rebased llama.cpp; no numbers stated; `score 0`
+- `08f96a5139` `2025-03-25` **other** · other · kept — Rename LICENSE-Intel®-OpenMP*-Runtime-Library.txt to LICENSE-Intel®-OpenMP-Runtime-Library.txt; no numbers stated; `score 0`
+- `27d669210f` `2025-03-25` **mtp** · other · removed — remove fschat in EAGLE example; no numbers stated; `score 0`
+- `374747b492` `2025-03-25` **attention** · other · kept — Update bert optimization to fit higher transformers/torch version; no numbers stated; `score 1`
+- `f437b36678` `2025-03-26` **other** · sched · kept — Fix vllm glm edge model; no numbers stated; `score 1`
+- `7809ca9864` `2025-03-27` **other** · docs · kept — Reuse --privileged; no numbers stated; `score 0`
+- `61c2e9c271` `2025-03-28` **other** · other · kept — Refactor docker image by applying patch method; no numbers stated; `score 0`
+- `300eb01d98` `2025-03-28` **attention** · other · kept — Add basic optimization for Qwen2.5 omni; no numbers stated; `score 1`
+- `34b1b14225` `2025-03-31` **other** · sched · kept — vLLM: Fix vLLM CPU dockerfile to resolve cmake deprecated issue; no numbers stated; `score 0`
+- `633d1c72e7` `2025-04-01` **other** · docs · kept — Add PyTorch 2.6 QuickStart for Intel GPU; no numbers stated; `score 0`
+- `4427012672` `2025-04-01` **other** · docs · kept — Link updates to pytorch 2.6 quickstart; no numbers stated; `score 0`
+- `b73728c7ce` `2025-04-02` **other** · docs · kept — Small updates to Ollama portable zip Quickstart; no numbers stated; `score 0`
+- `3cb718d715` `2025-04-03` **other** · docs · kept — Small updates to Ollama portable zip quickstart; no numbers stated; `score 0`
+- `33ae52d083` `2025-04-03` **other** · docs · kept — Small doc fix; no numbers stated; `score 0`
+- `7548c12b2c` `2025-04-07` **other** · docs · kept — Update portable zip QuickStart regarding signature verification; no numbers stated; `score 0`
+- `ef852dcb4a` `2025-04-07` **attention** · other · kept — add audio optimization for qwen2.5-omni; no numbers stated; `score 1`
+- `cd0d4857b8` `2025-04-07` **other** · other · kept — `ipex-llm` 2.2.0 post-release update; no numbers stated; `score 0`
+- `1d7f4a83ac` `2025-04-09` **other** · docs · kept — Update documentation to build Docker image from Dockerfile instead of pulling from registry; no numbers stated; `score 0`
+- `3ee6dec0f8` `2025-04-10` **other** · sched · kept — update vllm patch; no numbers stated; `score 0`
+- `6693e8ab04` `2025-04-11` **moe** · kernel · kept — Deepseek kv / sdp support; no numbers stated; `score 2`
+- `10c30cdba9` `2025-04-14` **gemm** · knob · kept — set woq_int4 as default int4; no numbers stated; `score 1`
+- `7826152f5a` `2025-04-14` **other** · sched · kept — update vllm patch; no numbers stated; `score 0`
+- `e08c6bd018` `2025-04-15` **attention** · kernel · kept — Fix several models based on sdp api change; no numbers stated; `score 2`
+- `cfadf3f2f7` `2025-04-15` **other** · fix · kept — upgrade linux-libc-dev to fix CVEs; no numbers stated; `score 0`
+- `f5aaa83649` `2025-04-15` **other** · sched · kept — Update serving-xpu Dockerfile; no numbers stated; `score 0`
+- `fa56212bb3` `2025-04-15` **other** · sched · kept — Update vLLM patch; no numbers stated; `score 0`
+- `db5edba786` `2025-04-16` **other** · other · kept — Update Dockerfile; no numbers stated; `score 0`
+- `73198d5b80` `2025-04-17` **other** · other · kept — Update to b17 image; no numbers stated; `score 0`
+- `2f78afcd2a` `2025-04-18` **attention** · other · kept — Refactor some functions to `ipex_llm.transformers.models.common`; no numbers stated; `score 1`
+- `a2a35fdfad` `2025-04-21` **other** · docs · kept — Update portable zip link; no numbers stated; `score 0`
+- `0801d27a6f` `2025-04-22` **other** · knob · removed — Remove PyTorch 2.3 support for Intel GPU; no numbers stated; `score 0`
+- `14cd613fe1` `2025-04-22` **other** · docs · kept — Update vLLM docs with some new features; no numbers stated; `score 0`
+- `908fdb982e` `2025-04-22` **attention** · fix · kept — small refactor and fix; no numbers stated; `score 1`
+- `0cfdd399e7` `2025-04-24` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `9808fb1ac2` `2025-04-24` **moe** · docs · kept — update doc about flash-moe; no numbers stated; `score 0`
+- `cf97d8f1d7` `2025-04-25` **other** · sched · kept — Update start-vllm-service.sh; no numbers stated; `score 0`
+- `16fa778e65` `2025-04-27` **gemm** · kernel · kept — enable glm4v and gemma-3 on vllm 083; no numbers stated; `score 0`
+- `d222eaffd7` `2025-04-27` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `6b033f8982` `2025-04-27` **other** · docs · kept — Update readme; no numbers stated; `score 0`
+- `ad741503a9` `2025-04-27` **other** · docs · kept — Update bmg_quickstart.md; no numbers stated; `score 0`
+- `f66eee1d1d` `2025-04-28` **other** · docs · kept — Update BMG troubleshooting guides regarding PPA installation; no numbers stated; `score 0`
+- `51b41faad7` `2025-04-30` **other** · sched · kept — vLLM: update vLLM XPU to 0.8.3 version; no numbers stated; `score 0`
+- `685a749adb` `2025-04-30` **other** · docs · kept — Update ollama-release doc into v0.6.2; no numbers stated; `score 0`
+- `01bc7e9eb9` `2025-05-06` **other** · fix · kept — Fix 083 lm_head error; no numbers stated; `score 0`
+- `be76918b61` `2025-05-07` **other** · instr · kept — Update 083 multimodal benchmark; no numbers stated; `score 0`
+- `3a28b69202` `2025-05-07` **attention** · knob · kept — Add qwen3 support; no numbers stated; `score 1`
+- `e88a2aa65b` `2025-05-07` **other** · docs · kept — Modify ollama num_ctx related doc; no numbers stated; `score 0`
+- `f2598b119e` `2025-05-07` **other** · other · kept — update for bge-m3; no numbers stated; `score 1`
+- `f5d9c49a2a` `2025-05-09` **attention** · other · kept — add `rotary_half_with_cache_inplaced` to `ipex_llm.transformers.models.common`; no numbers stated; `score 1`
+- `45f7bf6688` `2025-05-09` **other** · docs · kept — Refactor vLLM Documentation: Centralize Benchmarking and Improve Readability; no numbers stated; `score 0`
+- `0438e39f3e` `2025-05-09` **other** · docs · kept — Add PyTorch 2.6 support in Latest Update; no numbers stated; `score 0`
+- `da08c9ca60` `2025-05-12` **other** · other · kept — Update Dockerfile; no numbers stated; `score 0`
+- `9da1c56fa8` `2025-05-12` **moe** · docs · kept — Create flashmoe quickstart; no numbers stated; `score 0`
+- `5df03ced2c` `2025-05-12` **other** · sched · kept — Update vllm patch for fix telechat2 and baichuan2 error; no numbers stated; `score 0`
+- `886c7632b2` `2025-05-12` **other** · sched · kept — Add IPEX_LLM_FORCE_BATCH_FORWARD for vLLM docker image; no numbers stated; `score 0`
+- `086a8b3ab9` `2025-05-13` **other** · docs · kept — Update flashmoe_quickstart; no numbers stated; `score 0`
+- `aa12f69bbf` `2025-05-13` **other** · docs · kept — Update Ollama portable zip QuickStart regarding saving VRAM; no numbers stated; `score 0`
+- `f6441b4e3d` `2025-05-13` **moe** · kernel · kept — moe_softmax_topk fused selection; no numbers stated; `score 2`
+- `bd71739e64` `2025-05-13` **other** · other · kept — Update docs and scripts to align with new Docker image release; no numbers stated; `score 0`
+- `bd45bf7584` `2025-05-15` **other** · docs · kept — Update llama_cpp_quickstart.md; no numbers stated; `score 0`
+- `35b49e4d91` `2025-05-15` **other** · other · kept — Add trl version in error message; no numbers stated; `score 1`
+- `1e4e1353a0` `2025-05-15` **other** · other · kept — Resolve messages formatting issues; no numbers stated; `score 1`
+- `8ba57b41cd` `2025-05-16` **gemm** · fusion · kept — merge the quantized q/k/v weights into oneQKV; no numbers stated; `score 3`
+- `d83e5068d2` `2025-05-19` **other** · knob · kept — Enable whisper; no numbers stated; `score 0`
+- `66eb054988` `2025-05-19` **other** · sched · kept — Update vllm patch; no numbers stated; `score 0`
+- `1576347892` `2025-05-20` **other** · other · kept — Update Dockerfile; no numbers stated; `score 0`
+- `154af7d7f7` `2025-05-21` **other** · sched · kept — vLLM: set convert_to_half to False by default; no numbers stated; `score 1`
+- `e3130a06ed` `2025-05-22` **other** · fix · kept — Fix multimodal errors; no numbers stated; `score 1`
+- `531bef2810` `2025-05-22` **other** · sched · kept — vLLM: Fix conver_to_half condition; no numbers stated; `score 1`
+- `c5d919b151` `2025-05-23` **other** · sched · kept — update vllm patch; no numbers stated; `score 0`
+- `9df610f80d` `2025-05-26` **mtp** · fix · kept — fix trl import when not running speculative; no numbers stated; `score 1`
+- `bb50cd0881` `2025-05-30` **other** · knob · kept — Update api_server.py; no numbers stated; `score 1`
+- `3accc31b86` `2025-05-30` **other** · other · kept — Update 1ccl_for_multi_arc.patch; no numbers stated; `score 0`
+- `e032156518` `2025-06-04` **quant** · knob · kept — Support torch_fp8; no numbers stated; `score 1`
+- `45864790f7` `2025-06-05` **other** · knob · kept — Enable phi-4 with vision and audio; no numbers stated; `score 0`
+- `5a1c1297e1` `2025-06-05` **other** · fix · kept — Fix internvl fp16 error; no numbers stated; `score 1`
+- `dd49368e0c` `2025-06-05` **other** · kernel · kept — only install onednn for windows when torch 2.6; no numbers stated; `score 0`
+- `ac04992278` `2025-06-06` **other** · other · kept — Update engine.py; no numbers stated; `score 1`
+- `5a629ae470` `2025-06-06` **other** · sched · kept — update vllm patch; no numbers stated; `score 0`
+- `3f6d407be4` `2025-06-09` **other** · fix · kept — Fix engine.py; no numbers stated; `score 1`
+- `6ba3138d7c` `2025-06-30` **attention** · fix · kept — Fix ambiguous boolean evaluation in bert.py; no numbers stated; `score 1`
+
+*Commits 4001-4100 (2025-03-07..2025-06-30): scores 0/1/2/3 = 72/24/3/1; areas other 79, attention 9, gemm 5, moe 4.*
+
+- `28f72123bd` `2025-07-01` **other** · docs · kept — update ollama version; no numbers stated; `score 0`
+- `f0b600da77` `2025-07-09` **other** · docs · kept — update llama.cpp version; no numbers stated; `score 0`
+- `b229e5ad60` `2025-07-18` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `68c5103a0a` `2025-07-21` **other** · docs · kept — Update quickstart reference; no numbers stated; `score 0`
+- `951c23739d` `2025-07-21` **other** · docs · kept — update quickstart md related to llama.cpp/ollama; no numbers stated; `score 0`
+- `891e1f511b` `2025-07-30` **moe** · docs · kept — Add note about avoiding sourcing oneAPI for flashmoe and llama.cpp portable zip; no numbers stated; `score 0`
+- `9cfdf143a2` `2025-08-01` **other** · other · removed — delete the deprecated llm win test; no numbers stated; `score 0`
+- `cac90a9238` `2025-08-14` **other** · other · kept — update patches; no numbers stated; `score 0`
+- `25e1709050` `2025-08-14` **other** · other · kept — To avoid errors caused by a Transformers version that is too new.; no numbers stated; `score 0`
+- `6d89c827a8` `2025-09-12` **other** · fusion · kept — Fix PSIRT Vulnerability - Dependency Confusion in oneccl_bind_pt package; no numbers stated; `score 0`
+- `13d05bd46b` `2025-09-23` **other** · docs · kept — docs: update recommended Ubuntu version from 24.10 to 25.04 with warning; no numbers stated; `score 0`
+- `197f6531bf` `2025-10-14` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+- `de6bce2713` `2026-01-28` **other** · docs · kept — Update README.md; no numbers stated; `score 0`
+
+*Commits 4014-4113 (2025-03-17..2026-01-28): scores 0/1/2/3 = 73/23/3/1; areas other 79, attention 9, moe 5, gemm 4.*
+
