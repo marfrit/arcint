@@ -753,6 +753,9 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
         return false; // FIXME @ngxson
     }
+    if (arch == LLM_ARCH_DORY) {
+        return false; // the generic fixture carries no recurrence metadata (input/recurrent/output counts, pattern, RoPE profile)
+    }
     if (arch == LLM_ARCH_GRANITE_SWITCH) {
         return false; // FIXME adapter fixture
     }
@@ -972,6 +975,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         }
         if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
+        }
+        if (arch == LLM_ARCH_DORY) {
+            continue; // needs the recurrence fixture; upstream's own Dory test is not carried (README, 0108)
         }
         if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
             continue;

@@ -15,6 +15,7 @@
 
 bool llama_model_saver_supports_arch(llm_arch arch) {
     switch (arch) {
+        case LLM_ARCH_DORY: // physical weights and executed layers differ in count; a saved file would carry the unrolled one
         case LLM_ARCH_GEMMA3N:
         case LLM_ARCH_BITNET:
         case LLM_ARCH_T5:

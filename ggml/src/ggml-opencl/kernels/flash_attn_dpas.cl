@@ -25,6 +25,14 @@
 #define DK 256
 #endif
 #define DV DK
+// DVH: the output columns a work-group computes, DV unless set (0106; the SG 8
+// kernel only). At head size 512 the pair's halves of 512 columns would be 256
+// GRF a sub-group, so the host builds DVH 256: two work-groups a head, one a
+// half of V's columns, each computing S over all DK itself
+#ifndef DVH
+#define DVH DV
+#endif
+#define NVH (DV / DVH)
 #ifndef NSG
 #define NSG 16
 #endif
@@ -49,6 +57,9 @@
 #if KC % 2 != 0
 #error "flash_attn_dpas.cl (SG 16): Q K^T runs as two chains over halves of DK / 16"
 #endif
+#if DVH != DV
+#error "flash_attn_dpas.cl (SG 16): one work-group a head, all DV columns"
+#endif
 
 #else
 // SG 8 (Xe-HPG): a pair of sub-groups shares 8 query rows, each owning half
@@ -59,7 +70,10 @@
 #define BQ (NSG / 2 * 8)
 #define KC (DK / 16)
 #define NKB (BK / 16)
-#define NDC (DV / 2 / 8)
+#define NDC (DVH / 2 / 8)
+#if DV % DVH != 0 || DVH % 32 != 0
+#error "flash_attn_dpas.cl (SG 8): DVH must divide DV in multiples of 32"
+#endif
 #define NTHR (NSG * SG)
 #endif
 
@@ -411,13 +425,14 @@ kernel void flash_attn_f32_f16_dpas(
 // V a key pair a work-item (patch 0048): two keys' dims 8 c8v .. 8 c8v + 7
 // packed into 8 uints (the P V b operand's pairs) and stored as 8 dwords
 // into the transposed tile, one a dim, instead of 16 scalar halves
-static inline void stage_v_pair(local half * vt, const global char * vb, ulong v_nb1, int t0, int n_kv, int kp, int c8v) {
+// (c8o: the first 8-value unit of this work-group's columns of V, 0106)
+static inline void stage_v_pair(local half * vt, const global char * vb, ulong v_nb1, int t0, int n_kv, int kp, int c8v, int c8o) {
     // pair kp of a 16-key group holds keys j and j + 8 (j = kp % 8): P's a
     // operand then comes from S's two 8-key halves without shuffles, and a
     // sub-group's loads read 8 consecutive rows
     const int k0 = t0 + (kp >> 3) * 16 + (kp & 7), k1 = k0 + 8;
-    half8 a = vload8(c8v, (const global half *)(vb + min(k0, n_kv - 1) * v_nb1));
-    half8 b = vload8(c8v, (const global half *)(vb + min(k1, n_kv - 1) * v_nb1));
+    half8 a = vload8(c8o + c8v, (const global half *)(vb + min(k0, n_kv - 1) * v_nb1));
+    half8 b = vload8(c8o + c8v, (const global half *)(vb + min(k1, n_kv - 1) * v_nb1));
 #ifdef FA_VBLK_RED
     { const half8 x = a; a = b; b = x; }   // the red case: the pair's keys swapped
 #endif
@@ -468,11 +483,18 @@ kernel void flash_attn_f32_f16_dpas(
     // V transposed, [dim][key] halves: a dim's uint p holds a pair of keys,
     // the P V b operand's (lane = dim reads its 16 keys as 8 uints): keys
     // 2p, 2p + 1, or with FA_VBLK keys j, j + 8 of a 16-key group
-    local half vt[DV * (BK + 16)];
+    local half vt[DVH * (BK + 16)];
 
     const int lane = get_sub_group_local_id(), sg = get_sub_group_id(), lid = get_local_id(0);
     const int rg = sg >> 1, half_dv = sg & 1;          // the pair's row group, this one's columns
-    const int head = get_group_id(1), batch = get_group_id(2);
+    // dimension 1: a head slot, the head times NVH plus this work-group's part of V
+    const int hs = get_group_id(1), batch = get_group_id(2);
+    const int head = hs / NVH, vh = hs % NVH;
+#ifdef FA_DVH_RED
+    const int vc8 = 0;                                 // the red case: every part reads V's first columns
+#else
+    const int vc8 = vh * (DVH / 8);                    // the part's first 8-value unit of a V row
+#endif
     const int hk   = head / (n_head / n_head_kv);
     const int q0   = get_group_id(0) * BQ;
 
@@ -532,16 +554,18 @@ kernel void flash_attn_f32_f16_dpas(
             // V transposed with the key fastest: neighbouring lanes store
             // neighbouring halves (key-major, they all hit one bank)
             const int keyv = u % BK, c8v = u / BK, kkv = min(t0 + keyv, n_kv - 1);
-            const half8 vv8 = load8(VT, vb + kkv * v_nb1, c8v);
-            const half vv[8] = { vv8.s0, vv8.s1, vv8.s2, vv8.s3, vv8.s4, vv8.s5, vv8.s6, vv8.s7 };
-            for (int j = 0; j < 8; ++j) vt[(8 * c8v + j) * (BK + 16) + keyv] = vv[j];
+            if (c8v < DVH / 8) {
+                const half8 vv8 = load8(VT, vb + kkv * v_nb1, vc8 + c8v);
+                const half vv[8] = { vv8.s0, vv8.s1, vv8.s2, vv8.s3, vv8.s4, vv8.s5, vv8.s6, vv8.s7 };
+                for (int j = 0; j < 8; ++j) vt[(8 * c8v + j) * (BK + 16) + keyv] = vv[j];
+            }
 #endif
         }
 #ifdef FA_VBLK
         // the pair fastest: a sub-group's stores of one dim are 8 consecutive dwords
 #pragma unroll
-        for (int u = lid; u < (BK / 2) * (DV / 8); u += NTHR) {
-            stage_v_pair(vt, vb, v_nb1, t0, n_kv, u % (BK / 2), u / (BK / 2));
+        for (int u = lid; u < (BK / 2) * (DVH / 8); u += NTHR) {
+            stage_v_pair(vt, vb, v_nb1, t0, n_kv, u % (BK / 2), u / (BK / 2), vc8);
         }
 #endif
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -673,7 +697,7 @@ kernel void flash_attn_f32_f16_dpas(
 #endif
 #pragma unroll
         for (int c = 0; c < NDC; ++c) {
-            const int col = half_dv * (DV / 2) + c * 8 + lane;
+            const int col = half_dv * (DVH / 2) + c * 8 + lane;
             float8 acc = o[c];
             for (int g = 0; g < NKB; ++g) {
                 const int8 b = as_int8(vload8(0, (local const uint *)(vt + col * (BK + 16) + g * 16)));
@@ -691,7 +715,7 @@ kernel void flash_attn_f32_f16_dpas(
             const int qr = q_sg + r;
             if (qr < n_q) {
                 global float * orow = (global float *)(o_void + o_offset + batch * o_nb3 + qr * o_nb2 + head * o_nb1);
-                orow[half_dv * (DV / 2) + c * 8 + lane] = ov[r] * linv[r];
+                orow[vh * DVH + half_dv * (DVH / 2) + c * 8 + lane] = ov[r] * linv[r];
             }
         }
     }

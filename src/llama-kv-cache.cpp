@@ -1422,6 +1422,10 @@ bool llama_kv_cache::set_seq_windows(const uint32_t * n_cells, int32_t n_seq) {
 }
 
 bool llama_kv_cache::get_can_shift() const {
+    // Dory uses physical-layer RoPE profiles and post-RoPE normalization.
+    if (model.arch == LLM_ARCH_DORY) {
+        return false;
+    }
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;

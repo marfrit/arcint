@@ -31,6 +31,18 @@
 #define DK 256
 #endif
 #define DV DK
+// DVH: the output columns a work-group computes, DV unless set (0106). At head
+// size 512 a sub-group's 8 rows of 512 f32 columns would be all 256 of its
+// registers, so the host builds DVH 256: two work-groups a head, one a half of
+// V's columns, each computing S (and the softmax) over all DK itself. The
+// halves' S, m and l are the same sums in the same order.
+#ifndef DVH
+#define DVH DV
+#endif
+#define NVH (DV / DVH)
+#if DV % DVH != 0 || DVH % 32 != 0
+#error "flash_attn_dpas2.cl: DVH must divide DV in multiples of 32"
+#endif
 #ifndef NSG
 #define NSG 32
 #endif
@@ -39,11 +51,18 @@
 #define BQ (NSG * 8)
 #define KC (DK / 16)
 #define NKB (BK / 16)
-#define NDC (DV / 16)
+#define NDC (DVH / 16)
 #define NTHR (NSG * SG)
 
 #define DPAS(a, b, c) intel_sub_group_f16_f16_matrix_mad_k16(a, b, c)
 #define M_INIT (-3.0e38f)
+// the S loop over Q's chunk pairs: fully unrolled, or FA2_SU iterations at a
+// time (0106: at head size 512 the full unroll held too many reads in flight)
+#ifdef FA2_SU
+#define FA2_S_UNROLL __attribute__((opencl_unroll_hint(FA2_SU)))
+#else
+#define FA2_S_UNROLL _Pragma("unroll")
+#endif
 
 // The reads use IGC's builtins under the cl_intel_subgroup_2d_block_io
 // functions: those write a private array, and IGC kept such arrays in
@@ -134,8 +153,15 @@ kernel void flash_attn_f32_f16_dpas2(
 #endif
         ) {
     const int lane = get_sub_group_local_id(), sg = get_sub_group_id(), lid = get_local_id(0);
-    const int head = get_group_id(1), batch = get_group_id(2);
+    // dimension 1: a head slot, the head times NVH plus this work-group's half of V
+    const int hs   = get_group_id(1), batch = get_group_id(2);
+    const int head = hs / NVH, vh = hs % NVH;
     const int hk   = head / (n_head / n_head_kv);
+#ifdef FA_DVH_RED
+    const int vhr  = 0;    // the red case: every half reads V's first columns
+#else
+    const int vhr  = vh;
+#endif
 #ifdef FA_CARRY
     // the split of the keys: dimension 0 is n_split x the row tiles
     const int n_tq = (n_q + BQ - 1) / BQ;
@@ -147,7 +173,7 @@ kernel void flash_attn_f32_f16_dpas2(
 
     global const char * qb = q_void + q_offset + batch * q_nb3 + head * q_nb2;
     global const char * kb = k_void + k_offset + (batch / (n_batch / k_ne3)) * k_nb3 + hk * k_nb2;
-    global const char * vb = v_void + v_offset + (batch / (n_batch / v_ne3)) * v_nb3 + hk * v_nb2;
+    global const char * vb = v_void + v_offset + (batch / (n_batch / v_ne3)) * v_nb3 + hk * v_nb2 + vhr * (DVH * 2);
     global const half * mb = mask_void != 0
         ? (global const half *)(mask_void + mask_offset + (batch % mask_ne3) * mask_nb3 + (head % mask_ne2) * mask_nb2)
         : 0;
@@ -161,8 +187,8 @@ kernel void flash_attn_f32_f16_dpas2(
     global const uchar * mc = mcls != 0 && mb != 0 && sg_rows
         ? mcls + ((ulong) ((batch % mask_ne3) * mask_ne2 + head % mask_ne2) * ((n_q + 7) / 8) + (q0 / 8 + sg)) * mcls_tiles + kv0 / BK
         : 0;
-    // the 2D surfaces: a row a key, DK halves wide
-    const int kw = DK * 2, vw = DV * 2, kp = (int) k_nb1, vp = (int) v_nb1, qp = (int) q_nb1;
+    // the 2D surfaces: a row a key, DK halves wide (V: this work-group's DVH)
+    const int kw = DK * 2, vw = DVH * 2, kp = (int) k_nb1, vp = (int) v_nb1, qp = (int) q_nb1;
 
     // the last key any row of the work-group sees
     int kv_end = n_kv;
@@ -186,9 +212,9 @@ kernel void flash_attn_f32_f16_dpas2(
 
 #ifdef FA_CARRY
     const int n_g = (n_q + BQ - 1) / BQ * (BQ / 8);
-    // split 0's state is the carry, split i's the parts' slot i - 1
-    const ulong cst = ((ulong) batch * n_head + head) * n_g + q_sg / 8;
-    global float * cb = (split == 0 ? carry : parts + (ulong) (split - 1) * n_batch * n_head * n_g * ((NDC + 2) * 128))
+    // split 0's state is the carry, split i's the parts' slot i - 1 (a state a head slot)
+    const ulong cst = ((ulong) batch * n_head * NVH + hs) * n_g + q_sg / 8;
+    global float * cb = (split == 0 ? carry : parts + (ulong) (split - 1) * n_batch * n_head * NVH * n_g * ((NDC + 2) * 128))
                       + cst * (ulong) ((NDC + 2) * 128) + lane * 8;
     const int t_beg = split * split_len, t_end = min(kv_end, t_beg + split_len);
     if (carry_in && split == 0) {
@@ -215,7 +241,7 @@ kernel void flash_attn_f32_f16_dpas2(
             for (int i = sg; i < (BK / 8) * (DK / 32); i += NSG) {
                 const int2 at = (int2)(32 * (i % (DK / 32)), t0 + BK + 8 * (i / (DK / 32)));
                 intel_sub_group_2d_block_prefetch_16b_8r16x2c((global void *) kb, kw, n_kv, kp, at);
-                intel_sub_group_2d_block_prefetch_16b_8r16x2c((global void *) vb, vw, n_kv, vp, at);
+                if (at.x < DVH) intel_sub_group_2d_block_prefetch_16b_8r16x2c((global void *) vb, vw, n_kv, vp, at);
             }
         }
 #endif
@@ -237,7 +263,7 @@ kernel void flash_attn_f32_f16_dpas2(
         // 31 ms at 65k keys. (Interleaving the chains instead, even chunks into
         // s0 and odd into s1, reordered the sums: KL alike, but the dense
         // agent's greedy acceptance answer flipped from 10/10 to 2/10.)
-        _Pragma("unroll")
+        FA2_S_UNROLL
         for (int j = 0; j < KC / 4; ++j) {
             const ushort16 q0 = QREAD2(j, q_sg), q1 = QREAD2(j + KC / 4, q_sg);
             _Pragma("unroll")
@@ -366,7 +392,7 @@ kernel void flash_attn_f32_f16_dpas2(
             const int qr = q_sg + r;
             if (qr < n_q) {
                 global float * orow = (global float *)(o_void + o_offset + batch * o_nb3 + qr * o_nb2 + head * o_nb1);
-                orow[c * 16 + lane] = lv[r] > 0.f ? ov[r] / lv[r] : 0.f;
+                orow[vh * DVH + c * 16 + lane] = lv[r] > 0.f ? ov[r] / lv[r] : 0.f;
             }
         }
     }
@@ -378,18 +404,19 @@ kernel void flash_attn_f32_f16_dpas2(
 // blocks' state in), state i the parts' slot i - 1, each O, m and l in the
 // attention kernel's carry layout (8 rows of an 8-row group a lane). Into the
 // carry (carry_out: more blocks of keys follow) or O, as the attention
-// kernel's epilogue writes it. Grid: (n_g sub-groups, n_head, n_batch).
+// kernel's epilogue writes it. Grid: (n_g sub-groups, n_head x NVH head slots, n_batch).
 __attribute__((intel_reqd_sub_group_size(SG)))
 __attribute__((reqd_work_group_size(SG, 1, 1)))
 kernel void flash_attn_split_combine(global float * carry, global const float * parts, int n_split,
                                      global char * o_void, ulong o_offset, ulong o_nb1, ulong o_nb2, ulong o_nb3,
                                      int n_q, int n_head, int n_batch, int carry_out) {
     const int lane = get_sub_group_local_id();
-    const int grp = get_group_id(0), head = get_group_id(1), batch = get_group_id(2);
+    const int grp = get_group_id(0), hs = get_group_id(1), batch = get_group_id(2);
+    const int head = hs / NVH, vh = hs % NVH;
     const int n_g = (n_q + BQ - 1) / BQ * (BQ / 8);
     const ulong st   = (NDC + 2) * 128;
-    const ulong slot = (ulong) n_batch * n_head * n_g * st;
-    const ulong off  = (((ulong) batch * n_head + head) * n_g + grp) * st + lane * 8;
+    const ulong slot = (ulong) n_batch * n_head * NVH * n_g * st;
+    const ulong off  = (((ulong) batch * n_head * NVH + hs) * n_g + grp) * st + lane * 8;
     global float * cb = carry + off;
 
     float8 mx = vload8(0, cb + NDC * 128);
@@ -426,7 +453,7 @@ kernel void flash_attn_split_combine(global float * carry, global const float * 
             const int qr = grp * 8 + r;
             if (qr < n_q) {
                 global float * orow = (global float *)(o_void + o_offset + batch * o_nb3 + qr * o_nb2 + head * o_nb1);
-                orow[c * 16 + lane] = lv[r] > 0.f ? ov[r] / lv[r] : 0.f;
+                orow[vh * DVH + c * 16 + lane] = lv[r] > 0.f ? ov[r] / lv[r] : 0.f;
             }
         }
     }

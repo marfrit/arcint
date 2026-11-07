@@ -767,6 +767,12 @@ struct ggml_backend_opencl_context {
     cl_device_id device;
     std::string device_name;
 
+    // ARC-LAB 0110: the f16 copies of F32 weights on this device, and the count
+    // last logged (ggml_backend_opencl_graph_compute logs a change once)
+    int64_t f16_copy_n        = 0;
+    size_t  f16_copy_bytes    = 0;
+    int64_t f16_copy_n_logged = 0;
+
     ggml_cl_version platform_version;
     ggml_cl_version opencl_c_version;
 
@@ -1337,19 +1343,26 @@ struct ggml_backend_opencl_context {
     // (one token) and prompt kernels and their shapes
     cl_kernel kernel_gdn_intel_tg = nullptr;
     // Intel, prompt attention on the XMX units (flash_attn_dpas.cl; SG 16 or 8)
-    // [0] head size 256, [1] 128
-    cl_kernel kernel_fa_dpas_dk[2] = {};
-    cl_kernel kernel_fa_dpas_q_dk[2][3] = {};     // quantized K/V: q8_0/q8_0, q8_0/q4_0, q4_0/q4_0
-    cl_kernel kernel_fa_dpas_carry_dk[2] = {};    // f16 K/V a block of keys at a time (FA_CARRY, sub-group 16)
+    // [0] head size 256, [1] 128, [2] 512 (0106: built on first use, two
+    // work-groups a head, one a half of V's columns)
+    cl_kernel kernel_fa_dpas_dk[3] = {};
+    cl_kernel kernel_fa_dpas_q_dk[3][3] = {};     // quantized K/V: q8_0/q8_0, q8_0/q4_0, q4_0/q4_0
+    cl_kernel kernel_fa_dpas_carry_dk[3] = {};    // f16 K/V a block of keys at a time (FA_CARRY, sub-group 16)
     cl_kernel kernel_fa_kv_to_f16 = nullptr;      // and the block's quantized K/V to f16
-    cl_kernel kernel_fa_q_blk_dk[2] = {};         // sub-group 8 with FA_QG: Q to f16 a-operand blocks
+    cl_kernel kernel_fa_q_blk_dk[3] = {};         // sub-group 8 with FA_QG: Q to f16 a-operand blocks
     // flash_attn_dpas2.cl (Xe2): K/V by 2D block reads, Q as f16 re-read a tile
-    cl_kernel kernel_fa_dpas2_dk[2] = {}, kernel_fa_dpas2_carry_dk[2] = {}, kernel_fa_q_to_f16_dk[2] = {};
+    cl_kernel kernel_fa_dpas2_dk[3] = {}, kernel_fa_dpas2_carry_dk[3] = {}, kernel_fa_q_to_f16_dk[3] = {};
     cl_kernel kernel_fa_mask_cls = nullptr;       // the mask by 8 x 32 blocks (flash_attn_dpas2.cl)
     int       fa_dpas2_bq = 0, fa_dpas2_nthr = 0;
+    // 0106: the build options of the head-256 prompt kernels, so that the
+    // head-512 builds made on first use match them (sub-group, sub-groups a
+    // work-group, FA_QG / FA_VBLK); attempted once a device
+    int         fa_dpas_sg = 0, fa_dpas_nsg = 0, fa_dpas2_nsg = 0;
+    std::string fa_dpas_xopts, fa_dpas_qopts;    // the f16 build's extra options, the quantized builds'
+    bool        fa_dpas512_tried = false;
     // the keys split across work-groups (llama.cpp CUDA's parallel_blocks):
     // the states' merge, and the work-groups the card runs at once
-    cl_kernel kernel_fa_dpas2_comb_dk[2] = {};
+    cl_kernel kernel_fa_dpas2_comb_dk[3] = {};
     int       fa_dpas2_wave = 0;
     // Intel Xe2, decode / verify rows on the XMX units, a KV head's query
     // heads and rows in one pass (flash_attn_gqa_dpas.cl): f16, q8q8, q8q4, q4q4
@@ -4901,7 +4914,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             const char * vblk_env = getenv("GGML_OPENCL_FA_SG8_VBLK");
             const std::string vblk_opt = sg8 && (vblk_env == nullptr || atoi(vblk_env) != 0) ? " -DFA_VBLK" : "";
             const int nthr = nsg * sg, bq = sg8 ? nsg / 2 * 8 : nsg * 8;
-            // head sizes 256 (the Qwens) and 128 (Mistral Small 24B)
+            backend_ctx->fa_dpas_sg    = sg;
+            backend_ctx->fa_dpas_nsg   = nsg;
+            backend_ctx->fa_dpas_xopts = qg_opt + vblk_opt;
+            backend_ctx->fa_dpas_qopts = qg_opt;
+            // head sizes 256 (the Qwens) and 128 (Mistral Small 24B); 512 on first use (0106)
             for (int di = 0; di < 2; ++di) {
                 const int dk = di == 0 ? 256 : 128;
                 cl_program p = build_program_from_source_optional(backend_ctx, kernel_src.c_str(),
@@ -5063,6 +5080,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                     if (ok) {
                         backend_ctx->fa_dpas2_bq = nsg2 * 8;
                         backend_ctx->fa_dpas2_nthr = nthr2;
+                        backend_ctx->fa_dpas2_nsg = nsg2;
                         // a wave: Xe2's compute units are its vector engines, 8 a core,
                         // each with 4 threads at 256 GRF a thread, so a core holds 32
                         // sub-groups (20 work-groups of 32 on the B60's 160 engines).
@@ -7154,7 +7172,7 @@ static void ggml_opencl_log_fa_kernel_spill(ggml_backend_opencl_context * backen
     }
 }
 
-static void ggml_opencl_ensure_fa_pre_kernels(ggml_backend_opencl_context * backend_ctx, int dk, int dv) {
+static void ggml_opencl_ensure_fa_pre_kernels(ggml_backend_opencl_context * backend_ctx, int dk, int dv, bool compile = true) {
     const std::pair<int, int> dk_dv = {dk, dv};
 
     const ggml_opencl_fa_dim * cfg = nullptr;
@@ -7177,7 +7195,8 @@ static void ggml_opencl_ensure_fa_pre_kernels(ggml_backend_opencl_context * back
     backend_ctx->fa.bm[{dk, dv}]              = cfg->bm;
     backend_ctx->fa.bn[{dk, dv}]              = cfg->bn;
 
-    if (backend_ctx->fa.kv_pad_f16.count(dk_dv) > 0) { return; }
+    // 0106: Intel's head-512 prompts take the DPAS kernels, which need only the metadata
+    if (!compile || backend_ctx->fa.kv_pad_f16.count(dk_dv) > 0) { return; }
 
     GGML_LOG_INFO("ggml_opencl: lazy-compiling flash_attn prepass for DK=%d DV=%d\n", dk, dv);
     cl_int err;
@@ -7383,6 +7402,151 @@ static bool ggml_opencl_ensure_fa_f32_f16_prefill_512(ggml_backend_opencl_contex
     return true;
 }
 
+// ARC-LAB 0106: the head-512 prompt kernels (Gemma 4's full-attention layers),
+// built on first use with the options of the head-256 builds: on Xe2
+// flash_attn_dpas2.cl, plain and FA_CARRY (with its combine) and its Q
+// conversion (its S loop unrolled four chunk pairs at a time, FA2_SU 4: fully
+// unrolled it spilled 448 bytes, 1,408 and an IGC retry with FA_CARRY,
+// offline, IGC 2.38.2); on Xe-HPG flash_attn_dpas.cl at sub-group 8, f16 and the three
+// quantized pairs, and its Q blocks. Both at DVH 256, two work-groups a head,
+// one a half of V's columns: a sub-group holds 8 rows of 256 f32 output
+// columns in 128 of its 256 GRF, as at head size 256. Sub-group 16 gets no
+// flash_attn_dpas.cl build at 512, its Q registers alone (DK / 16 short8)
+// being another 128 GRF; quantized and unaligned f16 K/V reach
+// flash_attn_dpas2.cl through the f16 blocks of the carry path instead.
+static void ggml_opencl_ensure_fa_dpas_512(ggml_backend_opencl_context * backend_ctx) {
+    // the head-256 builds' options come from load_cl_kernels, which a device
+    // runs at its first buffer allocation: not latched before it (a filtered
+    // test-backend-ops run asks supports_op first)
+    if (backend_ctx->fa_dpas512_tried || !backend_ctx->kernels_loaded) {
+        return;
+    }
+    backend_ctx->fa_dpas512_tried = true;
+    if (backend_ctx->gpu_family != INTEL || backend_ctx->fa_dpas_sg == 0 || backend_ctx->kernel_compile_opts.empty()) {
+        return;
+    }
+    const std::string & co = backend_ctx->kernel_compile_opts;
+    const char * xo_env = getenv("GGML_OPENCL_FA_DPAS_OPTS");
+    const std::string xo = xo_env ? std::string(" ") + xo_env : std::string();
+    cl_int err;
+    if (backend_ctx->fa_dpas2_nsg > 0 && backend_ctx->fa_dpas2_bq > 0 && backend_ctx->kernel_fa_kv_to_f16 != nullptr) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string k2src {
+            #include "flash_attn_dpas2.cl.h"
+        };
+#else
+        const std::string k2src = read_file("flash_attn_dpas2.cl");
+#endif
+        const int nsg2 = backend_ctx->fa_dpas2_nsg, nthr2 = nsg2 * 16;
+        cl_kernel * ks[4] = { &backend_ctx->kernel_fa_dpas2_dk[2], &backend_ctx->kernel_fa_q_to_f16_dk[2],
+                              &backend_ctx->kernel_fa_dpas2_carry_dk[2], &backend_ctx->kernel_fa_dpas2_comb_dk[2] };
+        bool ok = !k2src.empty();
+        for (int carry = 0; carry < 2 && ok; ++carry) {
+            cl_program p2 = build_program_from_source_optional(backend_ctx, k2src.c_str(),
+                co + " -cl-intel-256-GRF-per-thread -DDK=512 -DDVH=256 -DFA2_SU=4 -DNSG=" + std::to_string(nsg2) + (carry ? " -DFA_CARRY" : "") + xo);
+            if (p2 == nullptr) { ok = false; break; }
+            cl_kernel k2 = clCreateKernel(p2, "flash_attn_f32_f16_dpas2", &err);
+            size_t wg = 0;
+            if (err == CL_SUCCESS) {
+                CL_CHECK(clGetKernelWorkGroupInfo(k2, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg), &wg, NULL));
+            }
+            if (err != CL_SUCCESS || wg < (size_t) nthr2) {
+                if (err == CL_SUCCESS) CL_CHECK(clReleaseKernel(k2));
+                ok = false;
+            } else {
+                *ks[2 * carry] = k2;
+                *ks[2 * carry + 1] = clCreateKernel(p2, carry ? "flash_attn_split_combine" : "flash_attn_q_to_f16", &err);
+                if (err != CL_SUCCESS) { *ks[2 * carry + 1] = nullptr; ok = false; }
+            }
+            CL_CHECK(clReleaseProgram(p2));
+        }
+        if (!ok) {
+            for (cl_kernel * kk : ks) {
+                if (*kk) { CL_CHECK(clReleaseKernel(*kk)); *kk = nullptr; }
+            }
+        }
+    }
+    // the dispatch divides by the head-256 build's rows a work-group: no 512
+    // build without it (fa_dpas_bq is set only when that build fits)
+    if (backend_ctx->fa_dpas_sg == 8 && backend_ctx->fa_dpas_bq > 0 && backend_ctx->fa_dpas_nthr == backend_ctx->fa_dpas_nsg * 8) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string ksrc {
+            #include "flash_attn_dpas.cl.h"
+        };
+#else
+        const std::string ksrc = read_file("flash_attn_dpas.cl");
+#endif
+        const int nsg = backend_ctx->fa_dpas_nsg, nthr = nsg * 8;
+        const std::string base = co + " -cl-intel-256-GRF-per-thread -DDK=512 -DDVH=256 -DFA_SG=8 -DNSG=" + std::to_string(nsg) + " -DBK=32";
+        const bool qg = backend_ctx->fa_dpas_qopts.find("FA_QG") != std::string::npos;
+        // the kernel's own limits against the device's, as for the head-256 builds
+        auto fits = [&](cl_kernel k) {
+            size_t   wg = 0;
+            cl_ulong lm = 0, lm_dev = 0;
+            CL_CHECK(clGetKernelWorkGroupInfo(k, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg), &wg, NULL));
+            CL_CHECK(clGetKernelWorkGroupInfo(k, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE, sizeof(lm), &lm, NULL));
+            CL_CHECK(clGetDeviceInfo(backend_ctx->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(lm_dev), &lm_dev, NULL));
+            return wg >= (size_t) nthr && lm <= lm_dev;
+        };
+        cl_program p = ksrc.empty() ? nullptr : build_program_from_source_optional(backend_ctx, ksrc.c_str(), base + backend_ctx->fa_dpas_xopts + xo);
+        if (p != nullptr) {
+            cl_kernel k = clCreateKernel(p, "flash_attn_f32_f16_dpas", &err);
+            if (err != CL_SUCCESS) k = nullptr;
+            // the global-Q build needs its conversion kernel (as at head size 256)
+            cl_kernel kb = nullptr;
+            if (k != nullptr && qg) {
+                kb = clCreateKernel(p, "flash_attn_q_to_f16_blk", &err);
+                if (err != CL_SUCCESS) kb = nullptr;
+            }
+            if (k != nullptr && (!qg || kb != nullptr) && fits(k)) {
+                backend_ctx->kernel_fa_dpas_dk[2]  = k;
+                backend_ctx->kernel_fa_q_blk_dk[2] = kb;
+            } else {
+                if (k)  CL_CHECK(clReleaseKernel(k));
+                if (kb) CL_CHECK(clReleaseKernel(kb));
+            }
+            CL_CHECK(clReleaseProgram(p));
+        }
+        // the quantized pairs: their Q blocks are the f16 build's conversion
+        const char * fq_env = getenv("GGML_OPENCL_FA_DPAS_Q");
+        const int kvt[3][2] = { {1, 1}, {1, 2}, {2, 2} };
+        for (int i = 0; i < 3 && backend_ctx->kernel_fa_dpas_dk[2] != nullptr && (fq_env == nullptr || atoi(fq_env) != 0); ++i) {
+            cl_program pq = build_program_from_source_optional(backend_ctx, ksrc.c_str(), base + backend_ctx->fa_dpas_qopts +
+                " -DKT=" + std::to_string(kvt[i][0]) + " -DVT=" + std::to_string(kvt[i][1]) + xo);
+            if (pq == nullptr) continue;
+            cl_kernel kq = clCreateKernel(pq, "flash_attn_f32_f16_dpas", &err);
+            if (err == CL_SUCCESS) {
+                if (fits(kq)) {
+                    backend_ctx->kernel_fa_dpas_q_dk[2][i] = kq;
+                } else {
+                    CL_CHECK(clReleaseKernel(kq));
+                }
+            }
+            CL_CHECK(clReleaseProgram(pq));
+        }
+    }
+    GGML_LOG_INFO("ggml_opencl: flash attention head size 512 (0106): dpas2 %s, dpas sub-group 8 f16 %s, q8q8 %s q8q4 %s q4q4 %s\n",
+                  backend_ctx->kernel_fa_dpas2_carry_dk[2] ? "built" : "-", backend_ctx->kernel_fa_dpas_dk[2] ? "built" : "-",
+                  backend_ctx->kernel_fa_dpas_q_dk[2][0] ? "built" : "-", backend_ctx->kernel_fa_dpas_q_dk[2][1] ? "built" : "-",
+                  backend_ctx->kernel_fa_dpas_q_dk[2][2] ? "built" : "-");
+}
+
+// ARC-LAB 0106: a head-512 prompt kernel for this K/V pair (f16, or kvq 0 q8_0/q8_0,
+// 1 q8_0/q4_0, 2 q4_0/q4_0): flash_attn_dpas2.cl takes every pair (quantized
+// through f16 blocks), the sub-group-8 kernel its own builds
+static bool ggml_opencl_fa_dpas512_ready(const ggml_backend_opencl_context * backend_ctx, bool f16kv, int kvq) {
+    static const char * f2d_env = getenv("GGML_OPENCL_FA_DPAS2");
+    if ((f2d_env == nullptr || atoi(f2d_env) != 0) && backend_ctx->kernel_fa_dpas2_dk[2] != nullptr &&
+        backend_ctx->kernel_fa_dpas2_carry_dk[2] != nullptr && backend_ctx->kernel_fa_dpas2_comb_dk[2] != nullptr &&
+        backend_ctx->kernel_fa_q_to_f16_dk[2] != nullptr && backend_ctx->kernel_fa_kv_to_f16 != nullptr) {
+        return f16kv || kvq >= 0;
+    }
+    if (f16kv) {
+        return backend_ctx->kernel_fa_dpas_dk[2] != nullptr;
+    }
+    return kvq >= 0 && backend_ctx->kernel_fa_dpas_q_dk[2][kvq] != nullptr;
+}
+
 // Compile one (variant, dk, dv); memoised. false = compiler rejected.
 static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_ctx, int dk, int dv, ggml_opencl_fa_variant variant) {
     const std::pair<int, int> dk_dv = {dk, dv};
@@ -7489,6 +7653,13 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
     const bool fa_decode_only = (variant == FA_VARIANT_F32_F16 && dk == 512);
     if (fa_decode_only) {
         opts += " -D FA_DECODE_ONLY -D FA_DECODE_MINIMAL";
+        // 0106: on Xe-HPG the split decode kernels hold 32 values a lane of Q,
+        // O, K and V at head size 512 and spilled 9,024 bytes (f16) and 1,504-1,728
+        // (quantized) at 128 GRF (offline, IGC 2.38.2); none at 256. The Xe2
+        // build does not spill at 128 and keeps it
+        if (backend_ctx->gpu_family == INTEL && backend_ctx->dg2) {
+            opts += " -cl-intel-256-GRF-per-thread";
+        }
     }
 
     // c8 cluster width (GGML_OPENCL_FA_CL_C overrides): value = GQA4 cluster
@@ -8930,6 +9101,8 @@ static void transpose_2d_as_32b(
 //------------------------------------------------------------------------------
 // Tensor extra management
 //------------------------------------------------------------------------------
+struct ggml_cl_f16_copy;
+
 struct ggml_tensor_extra_cl {
     // The buffer object that holds the data.
     cl_mem data_device;
@@ -8941,11 +9114,36 @@ struct ggml_tensor_extra_cl {
     // The actual size of the cl_mem object. This is needed when returning the
     // block to the pool.
     size_t actual_size;
+    // ARC-LAB 0110: an F32 2-D weight's f16 copy (ggml_cl_f16_copy_build);
+    // the buffer context owns it
+    ggml_cl_f16_copy * f16 = nullptr;
 
     void reset() {
         data_device = nullptr;
         offset = 0;
         actual_size = 0;
+        f16 = nullptr;
+    }
+};
+
+// ARC-LAB 0110: the f16 copy of an F32 2-D weight, made once when the weight is
+// written. `t` is the weight as an F16 tensor of the same shape reading `mem`,
+// so ggml_cl_mul_mat takes its F16 paths with it.
+struct ggml_cl_f16_copy {
+    cl_mem                        mem   = nullptr;
+    ggml_tensor                   t     = {};
+    ggml_tensor_extra_cl          e     = {};
+    ggml_tensor_extra_cl *        owner = nullptr;   // the weight's extra, whose f16 points here
+    ggml_backend_opencl_context * bctx  = nullptr;   // the device's totals
+
+    ~ggml_cl_f16_copy() {
+        if (mem != nullptr) {
+            CL_CHECK(clReleaseMemObject(mem));
+        }
+        if (bctx != nullptr) {
+            bctx->f16_copy_n     -= 1;
+            bctx->f16_copy_bytes -= e.actual_size;
+        }
     }
 };
 
@@ -11043,6 +11241,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
     backend_ctx->graph_gen++;
     backend_ctx->pair_perm_t = nullptr;
+    if (backend_ctx->f16_copy_n != backend_ctx->f16_copy_n_logged) {
+        // 0110: the copies' total once the weights are loaded (the first graph), and again if it changes
+        backend_ctx->f16_copy_n_logged = backend_ctx->f16_copy_n;
+        GGML_LOG_INFO("ggml_opencl: %s: %lld F32 weights carry an f16 copy, %.1f MiB outside the weight buffers (GGML_OPENCL_F32W_F16=0 keeps F32)\n",
+                      backend_ctx->device_name.c_str(), (long long) backend_ctx->f16_copy_n, backend_ctx->f16_copy_bytes / (1024.0 * 1024.0));
+    }
     ggml_cl_gdn_gate_prepass(backend_ctx, cgraph);
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -11610,6 +11814,62 @@ inline bool use_q5_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
 #endif
 }
 
+// ARC-LAB 0106: head size 512 on Intel (Gemma 4's full-attention layers). ggml
+// declines it there, so a quantized cache ran those layers' attention on the
+// CPU (the quantized V forces flash attention on) and an f16 cache turned flash
+// attention off for the whole model, every layer's K Q and KQ V then a batched
+// MUL_MAT on the generic tiled GEMM. Taken where arcint's kernels cover the
+// call: the head-512 prompt kernels (0106) and the decode / verify split
+// kernel with its merge (0007, 0015), f32 Q, f16 K/V or a quantized pair, an
+// f16 mask, no sinks, ALiBi or softcap, K/V not broadcast over dimension 3.
+// A declined call leaves a DOWNGRADE line with the reason.
+// GGML_OPENCL_FA_DK512=0 keeps ggml's decline.
+static bool ggml_opencl_fa512_intel_supported(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * op) {
+    static const char * dk512_env = getenv("GGML_OPENCL_FA_DK512");
+    static const char * fdi_env   = getenv("GGML_OPENCL_FA_INTEL_SPLIT");
+    const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2], * mask = op->src[3], * sinks = op->src[4];
+    const bool f16kv = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
+    const int  kvq   = q->type != GGML_TYPE_F32 ? -1 :
+                       k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 ? 0 :
+                       k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q4_0 ? 1 :
+                       k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_Q4_0 ? 2 : -1;
+    // the head-256 builds whose options the head-512 ones take (0106 review)
+    load_cl_kernels(backend_ctx);
+    float max_bias = 0.0f, softcap = 0.0f;
+    memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
+    memcpy(&softcap,  (const float *) op->op_params + 2, sizeof(float));
+    const char * why = nullptr;
+    if ((dk512_env != nullptr && atoi(dk512_env) == 0) || (fdi_env != nullptr && atoi(fdi_env) == 0)) {
+        why = "switched-off";
+    } else if (v->ne[0] != 512 || op->type != GGML_TYPE_F32 || (!f16kv && kvq < 0)) {
+        why = "kv-type";
+    } else if (sinks != nullptr || max_bias != 0.0f || softcap != 0.0f) {
+        why = "sinks-alibi-softcap";
+    } else if (mask != nullptr && mask->type != GGML_TYPE_F16) {
+        why = "mask-type";
+    } else if (k->ne[3] != q->ne[3] || v->ne[3] != q->ne[3] || k->ne[2] <= 0 || q->ne[2] % k->ne[2] != 0) {
+        why = "broadcast";
+    } else {
+        ggml_opencl_ensure_fa_dpas_512(backend_ctx);
+        ggml_opencl_ensure_fa_variant(backend_ctx, 512, 512, FA_VARIANT_F32_F16);
+        const std::pair<int, int> key = {512, 512};
+        const auto & fa = backend_ctx->fa;
+        const bool dec = fa.f32_merge.count(key) > 0 &&
+            (f16kv ? fa.f32_f16_q1_split_intel.count(key) > 0
+                   : fa.q_q1_split_intel.count(key) > 0 && fa.q_q1_split_intel.at(key)[kvq] != nullptr);
+        if (!dec) {
+            why = "no-decode-kernel";
+        } else if (!ggml_opencl_fa_dpas512_ready(backend_ctx, f16kv, kvq)) {
+            why = "no-dpas-kernel";
+        }
+    }
+    if (why != nullptr) {
+        ggml_cl_downgrade("op=FLASH_ATTN head=512 kv=%s:%s path=declined reason=%s", ggml_type_name(k->type), ggml_type_name(v->type), why);
+        return false;
+    }
+    return true;
+}
+
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
@@ -11681,6 +11941,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                             return false;
                     }
                 case GGML_TYPE_F16:
+                case GGML_TYPE_BF16:    // 0109: stored as f16 on the device (the upload converts), so the f16 kernels read it
                     switch (op->type) {
                         case GGML_TYPE_F16:
                         case GGML_TYPE_F32:
@@ -12180,7 +12441,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
 
             if (dk == 512) {
                 if (backend_ctx->gpu_family == INTEL) {
-                    return false;
+                    return ggml_opencl_fa512_intel_supported(backend_ctx, op);
                 }
                 if (!is_f32_f16) {
                     return false;
@@ -12573,6 +12834,7 @@ struct ggml_backend_opencl_buffer_context {
     }
 
     void reset() {
+        drop_f16_copies();   // 0110: the extras that point at them go back to the pool
         for (ggml_tensor_extra_cl * e : temp_tensor_extras_in_use) {
             temp_tensor_extras.push_back(e);
         }
@@ -12703,6 +12965,30 @@ struct ggml_backend_opencl_buffer_context {
     // allocation are enabled.
     std::vector<cl_mem> img;
     std::string name;
+
+    // ARC-LAB 0110: the f16 copies of this buffer's F32 2-D weights
+    std::vector<std::unique_ptr<ggml_cl_f16_copy>> f16_copies;
+
+    void drop_f16_copy(ggml_cl_f16_copy * c) {
+        for (size_t i = 0; i < f16_copies.size(); ++i) {
+            if (f16_copies[i].get() == c) {
+                if (c->owner != nullptr && c->owner->f16 == c) {
+                    c->owner->f16 = nullptr;
+                }
+                f16_copies.erase(f16_copies.begin() + i);
+                return;
+            }
+        }
+    }
+
+    void drop_f16_copies() {
+        for (auto & c : f16_copies) {
+            if (c->owner != nullptr && c->owner->f16 == c.get()) {
+                c->owner->f16 = nullptr;
+            }
+        }
+        f16_copies.clear();
+    }
 };
 
 static void ggml_backend_opencl_buffer_free_buffer(ggml_backend_buffer_t buffer) {
@@ -13001,6 +13287,137 @@ static bool ggml_cl_stage_write(ggml_backend_opencl_context * ctx, ggml_backend_
     }
     CL_CHECK(clEnqueueWriteBuffer(ctx->queue, dst, CL_FALSE, off, size, p, 0, NULL, NULL));
     return true;
+}
+
+// ARC-LAB 0110: F32 2-D weights on Intel get an f16 copy when they are written,
+// and MUL_MAT takes the F16 kernels with it (ggml_cl_mul_mat_f16_copy): the
+// XMX GEMM from 16 columns (sub-group 16 only), the f16 matvecs at 1 and 2-8.
+// Gemma 4 E4B keeps its per-layer projections F32 in the GGUF (blk.N.proj
+// [256 x 2,560] and blk.N.inp_gate [2,560 x 256], 84 tensors, 220 MB), whose
+// prompt products took ggml's F32 tiled GEMM and the F32 skinny path. Its
+// values are bf16 (the low 16 bits zero in all four tensors read), so the
+// copy is exact from 2^-17 up. Upstream's Vulkan backend does the same in its
+// shader (matmul_f32_f32 on fp16 devices: FLOAT_TYPE float16_t, both
+// operands rounded to f16 in shared memory); CUDA keeps F32 (cuBLAS SGEMM,
+// TF32 mma up to 16 columns on Ampere).
+// Kept F32: by name (ggml_cl_f16_copy_name_ok) the expert routers
+// (ffn_gate_inp: llama-quant keeps them F32 and their top-k is a discrete
+// choice), the Hadamard rotation matrices and the vocabulary-size products;
+// anything under 256 rows or a K under 256 (the delta-net's ssm_alpha /
+// ssm_beta have the skinny path), views, USM-host buffers, a weight with a
+// value outside f16's range. The copies are VRAM outside the weight buffers'
+// size; the device's total is logged at the first graph after it changes.
+// GGML_OPENCL_F32W_F16: 0 no copies, 1 every column count, 2 only 16 or
+// more columns (the prompt; default: at one column the f16 matvec cost decode). GGML_OPENCL_F32W_F16_RED=1 negates the
+// last 16 of K in every row of a copy (the red case of its test).
+static int ggml_cl_f16_copy_mode() {
+    static const char * e = getenv("GGML_OPENCL_F32W_F16");
+    static const int    v = e != nullptr ? atoi(e) : 2;
+    return v;
+}
+
+// by name, kept F32: the routers; the Hadamard rotation matrices (the KV
+// cache's attn_rot_dev_N and the model's prism.hadamard.N: their products go
+// to the fast transform or carry the Hadamard hint, never to the copy); the
+// vocabulary-size products (output.weight, a tied token_embd), whose copy would
+// be hundreds of MB to GB of VRAM outside any budget
+static bool ggml_cl_f16_copy_name_ok(const char * name) {
+    return strstr(name, "ffn_gate_inp") == nullptr && strstr(name, "attn_rot_dev_") == nullptr &&
+           strstr(name, "prism.hadamard") == nullptr && strstr(name, "token_embd") == nullptr &&
+           strcmp(name, "output.weight") != 0;
+}
+
+static bool ggml_cl_f16_copy_shape(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t) {
+    return backend_ctx->gpu_family == INTEL && t->type == GGML_TYPE_F32 && t->view_src == nullptr &&
+           t->ne[2] == 1 && t->ne[3] == 1 && t->ne[0] >= 256 && t->ne[1] >= 256 && t->ne[0] % 16 == 0 &&
+           ggml_is_contiguous(t) && ggml_cl_f16_copy_name_ok(t->name);
+}
+
+// a weight the rule copies (its buffer marked as weights, its shape and name)
+// that has no copy: switched off, a failed allocation, a value outside f16, a
+// partial write. Reported at every MUL_MAT (ggml_cl_mul_mat_f16_copy).
+static bool ggml_cl_f16_copy_missing(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t) {
+    return t->type == GGML_TYPE_F32 && t->buffer != nullptr && t->extra != nullptr &&
+           ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+           ggml_cl_f16_copy_shape(backend_ctx, t) && ((const ggml_tensor_extra_cl *) t->extra)->f16 == nullptr;
+}
+
+// after a write of the weight's bytes: any earlier copy is stale, and a whole
+// write of an eligible weight makes a new one
+static void ggml_cl_f16_copy_build(ggml_backend_opencl_context * backend_ctx, ggml_backend_buffer_t buffer,
+                                   ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
+    ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
+    if (extra == nullptr || tensor->type != GGML_TYPE_F32) {
+        return;
+    }
+    if (extra->f16 != nullptr) {
+        ctx->drop_f16_copy(extra->f16);
+    }
+    if (ggml_cl_f16_copy_mode() == 0 || ctx->usm != nullptr ||
+        ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+        offset != 0 || size != ggml_nbytes(tensor) || !ggml_cl_f16_copy_shape(backend_ctx, tensor)) {
+        return;
+    }
+    const int64_t ne0 = tensor->ne[0], n = ggml_nelements(tensor);
+    const float * x = (const float *) data;
+    for (int64_t i = 0; i < n; ++i) {
+        if (!(fabsf(x[i]) <= 65504.0f)) {   // also NaN
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                GGML_LOG_WARN("ggml_opencl: F32 weight %s has a value outside f16's range; kept F32 (and any like it)\n", tensor->name);
+            }
+            return;
+        }
+    }
+    std::vector<ggml_fp16_t> h((size_t) n);
+    ggml_fp32_to_fp16_row(x, h.data(), n);
+    static const char * red_e = getenv("GGML_OPENCL_F32W_F16_RED");
+    static const bool   red   = red_e != nullptr && atoi(red_e) != 0;
+    if (red) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            GGML_LOG_WARN("ggml_opencl: GGML_OPENCL_F32W_F16_RED: the f16 copies' last 16 of K are negated (a red case)\n");
+        }
+        for (int64_t r = 0; r < n / ne0; ++r) {
+            for (int64_t c = ne0 - 16; c < ne0; ++c) {
+                h[(size_t) (r * ne0 + c)] ^= 0x8000;
+            }
+        }
+    }
+    cl_int err;
+    cl_mem m = clCreateBuffer(backend_ctx->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                              (size_t) n * sizeof(ggml_fp16_t), h.data(), &err);
+    if (err != CL_SUCCESS) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("ggml_opencl: no f16 copy of %s (clCreateBuffer %d); F32 weights stay on their F32 paths\n", tensor->name, err);
+        }
+        return;
+    }
+    std::unique_ptr<ggml_cl_f16_copy> c(new ggml_cl_f16_copy());
+    c->mem              = m;
+    c->e.data_device    = m;
+    c->e.offset         = 0;
+    c->e.actual_size    = (size_t) n * sizeof(ggml_fp16_t);
+    c->t                = *tensor;
+    c->t.type           = GGML_TYPE_F16;
+    c->t.nb[0]          = sizeof(ggml_fp16_t);
+    c->t.nb[1]          = c->t.nb[0] * tensor->ne[0];
+    c->t.nb[2]          = c->t.nb[1] * tensor->ne[1];
+    c->t.nb[3]          = c->t.nb[2] * tensor->ne[2];
+    c->t.view_src       = nullptr;
+    c->t.view_offs      = 0;
+    c->t.extra          = &c->e;
+    c->owner            = extra;
+    c->bctx             = backend_ctx;
+    backend_ctx->f16_copy_n     += 1;
+    backend_ctx->f16_copy_bytes += c->e.actual_size;
+    extra->f16          = c.get();
+    ctx->f16_copies.push_back(std::move(c));
 }
 
 static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -14705,14 +15122,12 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
     GGML_ASSERT(extra);
 
-    if (ggml_cl_stage_write(backend_ctx, buffer, extra->data_device, extra->offset + offset, data, size)) {
-        return;
+    if (!ggml_cl_stage_write(backend_ctx, buffer, extra->data_device, extra->offset + offset, data, size)) {
+        CL_CHECK(clEnqueueWriteBuffer(
+            queue, extra->data_device, CL_TRUE, extra->offset + offset,
+            size, data, 0, NULL, NULL));
     }
-    CL_CHECK(clEnqueueWriteBuffer(
-        queue, extra->data_device, CL_TRUE, extra->offset + offset,
-        size, data, 0, NULL, NULL));
-
-    GGML_UNUSED(buffer);
+    ggml_cl_f16_copy_build(backend_ctx, buffer, tensor, data, offset, size);   // 0110
 }
 
 static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -15965,6 +16380,7 @@ static void ggml_backend_opencl_buffer_clear(ggml_backend_buffer_t buffer, uint8
     cl_command_queue queue = backend_ctx->queue;
 
     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
+    ctx->drop_f16_copies();   // 0110: they would hold the old values
     for (cl_mem buf : ctx->buffer) {
         CL_CHECK(clEnqueueFillBuffer(queue, buf, &value, sizeof(value), 0, buffer->size, 0, NULL, NULL));
     }
@@ -22611,12 +23027,16 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
     // Compile DK512 decode separately from the prefill programs.
     const bool fa_decode_only_512 = (d_head_q == 512);
+    // ARC-LAB 0106: on Intel head size 512 is arcint's (the prompt kernels at
+    // DVH 256, the split decode kernel of the decode-only program); ggml's
+    // DK=512 prefill and vec programs are neither built nor picked here
+    const bool intel512 = backend_ctx->gpu_family == INTEL && d_head_q == 512 && d_head_v == 512;
 
     // per-variant lazy compile for this (dk, dv)
     // DK=512 decode (n_q==1) needs no prepass
     // DK=512 prefill (n_q>1) does, so compile it only when needed
     if (!fa_decode_only_512 || n_q > 1) {
-        ggml_opencl_ensure_fa_pre_kernels(backend_ctx, d_head_q, d_head_v);
+        ggml_opencl_ensure_fa_pre_kernels(backend_ctx, d_head_q, d_head_v, /*compile=*/!intel512);
     }
 
     cl_kernel kernel = NULL;
@@ -22646,6 +23066,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
     if (is_f16) {
         ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_F16);
+    } else if (intel512) {
+        ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_F32_F16);
+        ggml_opencl_ensure_fa_dpas_512(backend_ctx);
     } else if (is_mixed) {
         if (fa_decode_only_512 && n_q == 1) {
             GGML_ASSERT(ggml_opencl_ensure_fa_f32_f16_vec_512(backend_ctx));
@@ -22791,7 +23214,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     // KV-head-coalesced gate: gqa_ratio == compile-time MQ_GQA
     // restricts to DK=DV=256 for now due to local memory size
     const int gqa_ratio_dispatch = n_head_kv > 0 ? (n_head / n_head_kv) : 0;
-    if (n_q == 1) {
+    if (intel512) {
+        // the split decode or the prompt kernels below take the call
+    } else if (n_q == 1) {
         if (use_native_q8_0_q1) {
             if (d_head_v >= 256 &&
                 backend_ctx->fa.f32_q8_0_q1_vec.count(dk_dv) > 0) {
@@ -22867,7 +23292,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     }
 
     // Intel goes to the basic q1 kernel
-    if (backend_ctx->gpu_family == INTEL && n_q == 1) {
+    if (backend_ctx->gpu_family == INTEL && n_q == 1 && !intel512) {
         use_q1_vec = use_q1_vec_mq = use_local_tile = false;
         if (is_mixed && backend_ctx->fa.f32_f16_q1.count(dk_dv))      { kernel = backend_ctx->fa.f32_f16_q1.at(dk_dv); }
         else if (is_f16 && backend_ctx->fa.f16_q1.count(dk_dv))       { kernel = backend_ctx->fa.f16_q1.at(dk_dv); }
@@ -22875,7 +23300,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         else if (is_q4_0 && backend_ctx->fa.f32_q4_0_q1.count(dk_dv)) { kernel = backend_ctx->fa.f32_q4_0_q1.at(dk_dv); }
         else if (backend_ctx->fa.f32_q1.count(dk_dv))                 { kernel = backend_ctx->fa.f32_q1.at(dk_dv); }
     }
-    GGML_ASSERT(kernel != NULL);
+    GGML_ASSERT(kernel != NULL || intel512);
 
     ggml_cl_flash_attn_temp_buffer temp_k;
     ggml_cl_flash_attn_temp_buffer temp_v;
@@ -22905,24 +23330,31 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     // Intel, a prompt: flash_attn_dpas.cl (the XMX units), f16 or quantized K/V
     // head size 256 or 128 (index 0 / 1 of the kernel arrays)
     const int fa_dki = d_head_q == 256 && d_head_v == 256 ? 0 : d_head_q == 128 && d_head_v == 128 ? 1 : -1;
-    cl_kernel kd_sel = fa_dki < 0 ? nullptr : is_mixed ? backend_ctx->kernel_fa_dpas_dk[fa_dki]
-                                            : kvq >= 0 ? backend_ctx->kernel_fa_dpas_q_dk[fa_dki][kvq] : nullptr;
-    const bool fa_dpas_ok = kd_sel != nullptr && n_q > 8 &&
+    // 0106: the prompt kernels' index, 2 for head size 512 (two work-groups a
+    // head, fa_nvh, each a half of V's columns; the GQA decode arrays stay 0 / 1)
+    const int fa_pi  = intel512 ? 2 : fa_dki;
+    const int fa_nvh = fa_pi == 2 ? 2 : 1;
+    cl_kernel kd_sel = fa_pi < 0 ? nullptr : is_mixed ? backend_ctx->kernel_fa_dpas_dk[fa_pi]
+                                           : kvq >= 0 ? backend_ctx->kernel_fa_dpas_q_dk[fa_pi][kvq] : nullptr;
+    // Xe2 at head size 512 has flash_attn_dpas2.cl only: f16 K/V in place, or
+    // any pair through its carry path's f16 blocks
+    const bool fa_v2_512 = fa_pi == 2 && kd_sel == nullptr && ggml_opencl_fa_dpas512_ready(backend_ctx, is_mixed, kvq);
+    const bool fa_dpas_ok = (kd_sel != nullptr || fa_v2_512) && n_q > 8 &&
         sinks == nullptr && max_bias == 0.0f && logit_softcap == 0.0f &&
         q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
         (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q));
     if (backend_ctx->gpu_family == INTEL && n_q > 8 && !fa_dpas_ok) {
         ggml_cl_downgrade("op=FLASH_ATTN head=%d kv=%s n_q=9+ path=f32_f16 reason=%s", (int) d_head_q, ggml_type_name(k->type),
-                          kd_sel == nullptr ? "no-dpas-kernel" : "shape");
+                          kd_sel == nullptr && !fa_v2_512 ? "no-dpas-kernel" : "shape");
     }
     if (fa_dpas_ok) {
         cl_mem    nomask = nullptr;
         // flash_attn_dpas2.cl: Q to f16 once a call, K/V read in place by 2D
         // block reads, which want 64-byte aligned heads and a row pitch of a
         // multiple of 16 bytes
-        cl_kernel k2   = backend_ctx->kernel_fa_dpas2_dk[fa_dki];
-        cl_kernel k2c  = backend_ctx->kernel_fa_dpas2_carry_dk[fa_dki];
-        cl_kernel k2q  = backend_ctx->kernel_fa_q_to_f16_dk[fa_dki];
+        cl_kernel k2   = backend_ctx->kernel_fa_dpas2_dk[fa_pi];
+        cl_kernel k2c  = backend_ctx->kernel_fa_dpas2_carry_dk[fa_pi];
+        cl_kernel k2q  = backend_ctx->kernel_fa_q_to_f16_dk[fa_pi];
         // (the surface is a head's rows, d halves wide: the pitch must cover them)
         auto surf_ok = [](cl_ulong off, cl_ulong nb1, cl_ulong nb2, cl_ulong nb3, int64_t d) {
             return off % 64 == 0 && nb1 % 16 == 0 && nb1 >= 64 && nb1 >= (cl_ulong) d * 2 && nb1 < (1u << 24) &&
@@ -23035,7 +23467,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             }
             const size_t bq   = (size_t) (v2 ? backend_ctx->fa_dpas2_bq   : backend_ctx->fa_dpas_bq);
             const size_t nthr = (size_t) (v2 ? backend_ctx->fa_dpas2_nthr : backend_ctx->fa_dpas_nthr);
-            size_t gws[3] = { (size_t) CEIL_DIV(n_q, (int) bq) * nthr * (size_t) n_split, (size_t) n_head, (size_t) n_batch };
+            size_t gws[3] = { (size_t) CEIL_DIV(n_q, (int) bq) * nthr * (size_t) n_split, (size_t) n_head * fa_nvh, (size_t) n_batch };
             size_t lws[3] = { nthr, 1, 1 };
             backend_ctx->enqueue_ndrange_kernel(kd, 3, gws, lws, dst);
         };
@@ -23049,7 +23481,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // the agent's 512-row ubatch gives 48 of them, three waves of 20 on
         // the B60 with the last 40 % full. GGML_OPENCL_FA_DPAS2_SPLIT: at most
         // that many splits (1: none)
-        cl_kernel kcomb = backend_ctx->kernel_fa_dpas2_comb_dk[fa_dki];
+        cl_kernel kcomb = backend_ctx->kernel_fa_dpas2_comb_dk[fa_pi];
         auto fa2_splits = [&](int nkv) {
             static const char * fs_env = getenv("GGML_OPENCL_FA_DPAS2_SPLIT");
             const int smax = std::min(fs_env ? atoi(fs_env) : 16, CEIL_DIV(nkv, 32));
@@ -23057,7 +23489,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             if (kcomb == nullptr || k2c == nullptr || wave <= 0 || smax <= 1) {
                 return 1;
             }
-            const int ntiles = CEIL_DIV(n_q, backend_ctx->fa_dpas2_bq) * n_head * n_batch;
+            const int ntiles = CEIL_DIV(n_q, backend_ctx->fa_dpas2_bq) * n_head * fa_nvh * n_batch;
             int best = 1, eff_best = 0, nw_best = 0;
             for (int p = 1; p <= smax; ++p) {
                 const int nb = ntiles * p, nw = CEIL_DIV(nb, wave), eff = 100 * nb / (nw * wave);
@@ -23071,10 +23503,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             return best;
         };
         // the states of a call's splits: split 0's in the carry, the others'
-        // in slots of the same size
+        // in slots of the same size (a state a head slot: fa_nvh a head)
         auto split_state = [&](int n_split, ggml_cl_buffer *& cr, ggml_cl_buffer *& pr) {
             const size_t n_g  = (size_t) CEIL_DIV(n_q, backend_ctx->fa_dpas2_bq) * backend_ctx->fa_dpas2_bq / 8;
-            const size_t slot = (size_t) n_batch * n_head * n_g * (d_head_v / 16 + 2) * 128 * sizeof(float);
+            const size_t slot = (size_t) n_batch * n_head * fa_nvh * n_g * (d_head_v / fa_nvh / 16 + 2) * 128 * sizeof(float);
             cr = &backend_ctx->scratch_buffer("fa_dpas_carry");
             cr->allocate(backend_ctx->context, slot);
             pr = &backend_ctx->scratch_buffer("fa_dpas2_parts");
@@ -23095,7 +23527,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             CL_CHECK(clSetKernelArg(kcomb, a++, sizeof(int),      &n_batch));
             CL_CHECK(clSetKernelArg(kcomb, a++, sizeof(int),      &carry_out));
             const size_t n_g = (size_t) CEIL_DIV(n_q, backend_ctx->fa_dpas2_bq) * backend_ctx->fa_dpas2_bq / 8;
-            size_t gws[3] = { n_g * 16, (size_t) n_head, (size_t) n_batch };
+            size_t gws[3] = { n_g * 16, (size_t) n_head * fa_nvh, (size_t) n_batch };
             size_t lws[3] = { 16, 1, 1 };
             backend_ctx->enqueue_ndrange_kernel(kcomb, 3, gws, lws, dst);
         };
@@ -23128,8 +23560,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // GGML_OPENCL_FA_DPAS_F16KV_BLOCK: keys a block (16384)
         static const char * f16kv_env  = getenv("GGML_OPENCL_FA_DPAS_F16KV");
         static const char * f16kvb_env = getenv("GGML_OPENCL_FA_DPAS_F16KV_BLOCK");
-        cl_kernel kc = backend_ctx->kernel_fa_dpas_carry_dk[fa_dki];
-        if (!is_mixed && kvq >= 0 && kc != nullptr && backend_ctx->kernel_fa_kv_to_f16 != nullptr && (f16kv_env == nullptr || atoi(f16kv_env) != 0)) {
+        cl_kernel kc = backend_ctx->kernel_fa_dpas_carry_dk[fa_pi];
+        // 0106: at head size 512 on Xe2 this is the only path besides f16 in
+        // place, for the quantized pairs and for f16 K/V the 2D reads cannot
+        // take (copied to f16 blocks as they are)
+        if (((!is_mixed && kvq >= 0 && kc != nullptr && (f16kv_env == nullptr || atoi(f16kv_env) != 0)) || fa_v2_512) &&
+            backend_ctx->kernel_fa_kv_to_f16 != nullptr) {
             const int blk = std::max(32, f16kvb_env ? atoi(f16kvb_env) / 32 * 32 : 16384);
             const int nkb = std::min(blk, n_kv);
             ggml_cl_buffer & kf = backend_ctx->scratch_buffer("fa_dpas_kf16");
@@ -23138,11 +23574,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             kf.allocate(backend_ctx->context, (size_t) d_head_q * nkb * k->ne[2] * k->ne[3] * sizeof(cl_half));
             vf.allocate(backend_ctx->context, (size_t) d_head_v * nkb * v->ne[2] * v->ne[3] * sizeof(cl_half));
             const bool v2 = fa2 && k2c != nullptr;
+            GGML_ASSERT(v2 || kc != nullptr);
             if (n_kv > blk) {
-                // per 8-row group of the padded rows: (d_head_v / 16 + 2) x 16 lanes x 8 floats
+                // per 8-row group of the padded rows and head slot: (d_head_v / fa_nvh / 16 + 2) x 16 lanes x 8 floats
                 const size_t bq = (size_t) (v2 ? backend_ctx->fa_dpas2_bq : backend_ctx->fa_dpas_bq);
                 const size_t n_g = (size_t) CEIL_DIV(n_q, (int) bq) * bq / 8;
-                cr.allocate(backend_ctx->context, (size_t) n_batch * n_head * n_g * (d_head_v / 16 + 2) * 128 * sizeof(float));
+                cr.allocate(backend_ctx->context, (size_t) n_batch * n_head * fa_nvh * n_g * (d_head_v / fa_nvh / 16 + 2) * 128 * sizeof(float));
             }
             cl_mem carry = n_kv > blk ? cr.buffer : kf.buffer;   // unread unless there are blocks to carry
             // rows [kv0, kv0 + nb) of a K/V view to [dim][key][head][batch] f16
@@ -23150,7 +23587,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                                int kv0, int nb, cl_mem out) {
                 cl_kernel kq = backend_ctx->kernel_fa_kv_to_f16;
                 const cl_ulong soff = off + (cl_ulong) kv0 * nb1;
-                const cl_int tt = t->type == GGML_TYPE_Q8_0 ? 1 : 2, d = (cl_int) t->ne[0], ne2 = (cl_int) t->ne[2];
+                // load8's types: 0 f16 (0106: a copy), 1 q8_0, 2 q4_0
+                const cl_int tt = t->type == GGML_TYPE_Q8_0 ? 1 : t->type == GGML_TYPE_Q4_0 ? 2 : 0, d = (cl_int) t->ne[0], ne2 = (cl_int) t->ne[2];
                 CL_CHECK(clSetKernelArg(kq, 0, sizeof(cl_mem),   &src));
                 CL_CHECK(clSetKernelArg(kq, 1, sizeof(cl_ulong), &soff));
                 CL_CHECK(clSetKernelArg(kq, 2, sizeof(cl_ulong), &nb1));
@@ -23195,8 +23633,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // kernel reads them in place of Q (q_nb* unused)
         cl_mem   q_arg  = extra_q->data_device;
         cl_ulong q_off  = offset_q;
-        if (backend_ctx->kernel_fa_q_blk_dk[fa_dki] != nullptr) {
-            cl_kernel kq = backend_ctx->kernel_fa_q_blk_dk[fa_dki];
+        GGML_ASSERT(kd != nullptr);
+        if (backend_ctx->kernel_fa_q_blk_dk[fa_pi] != nullptr) {
+            cl_kernel kq = backend_ctx->kernel_fa_q_blk_dk[fa_pi];
             const cl_int n_g = CEIL_DIV(n_q, backend_ctx->fa_dpas_bq) * (backend_ctx->fa_dpas_bq / 8);
             ggml_cl_buffer & qbuf = backend_ctx->scratch_buffer("fa_dpas_qblk");
             qbuf.allocate(backend_ctx->context, (size_t) n_batch * n_head * n_g * 8 * d_head_q * sizeof(cl_half));
@@ -23246,7 +23685,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         CL_CHECK(clSetKernelArg(kd, a++, sizeof(int), &k_ne3));
         CL_CHECK(clSetKernelArg(kd, a++, sizeof(int), &v_ne3));
         const size_t bq = (size_t) backend_ctx->fa_dpas_bq, nthr = (size_t) backend_ctx->fa_dpas_nthr;
-        size_t gws[3] = { (size_t) CEIL_DIV(n_q, (int) bq) * nthr, (size_t) n_head, (size_t) n_batch };
+        size_t gws[3] = { (size_t) CEIL_DIV(n_q, (int) bq) * nthr, (size_t) n_head * fa_nvh, (size_t) n_batch };
         size_t lws[3] = { nthr, 1, 1 };
         backend_ctx->enqueue_ndrange_kernel(kd, 3, gws, lws, dst);
         return;
@@ -23861,6 +24300,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         backend_ctx->enqueue_ndrange_kernel(k_merge, 3, merge_gws, merge_lws, dst);
         return;
     }
+    // 0106: supports_op takes head size 512 on Intel only where the split
+    // decode or a prompt kernel above covers the call
+    GGML_ASSERT(kernel != NULL && "flash attention: no kernel for this call");
 
     cl_mem prefill_k_img = nullptr;
     if (use_prefill_k_img) {
@@ -29771,6 +30213,9 @@ static void ggml_cl_downgrade_gemm(const ggml_backend_opencl_context * backend_c
     if (backend_ctx->gpu_family != INTEL) {
         return;
     }
+    if (ggml_cl_f16_copy_missing(backend_ctx, src0)) {
+        return;   // 0110: reported as no-f16-copy at the product's start
+    }
     const int64_t cols = src1->ne[1] * src1->ne[2] * src1->ne[3];
     ggml_cl_downgrade("op=MUL_MAT type=%s k=%d cols=%s path=generic reason=no-fast-path", ggml_type_name(src0->type), (int) src0->ne[0],
                       cols <= 4 ? "1-4" : cols < 16 ? "5-15" : "16+");
@@ -29782,9 +30227,61 @@ static void ggml_cl_downgrade_mv(const ggml_backend_opencl_context * backend_ctx
     if (backend_ctx->gpu_family != INTEL) {
         return;
     }
-    if (src1->ne[1] * src1->ne[2] * src1->ne[3] >= 16) {
+    if (src1->ne[1] * src1->ne[2] * src1->ne[3] >= 16 && !ggml_cl_f16_copy_missing(backend_ctx, src0)) {
         ggml_cl_downgrade("op=MUL_MAT type=%s k=%d cols=16+ path=matvec reason=no-fast-path", ggml_type_name(src0->type), (int) src0->ne[0]);
     }
+}
+
+// ARC-LAB 0110: an F32 2-D weight with an f16 copy (ggml_cl_f16_copy_build)
+// takes the F16 paths through it where they have a kernel for the column
+// count: from 16 columns the XMX GEMM (not built at sub-group 8), 1 column the
+// f16 matvec, 2-8 the few-column f16 kernel. 9-15 columns and the Hadamard
+// rotations keep the F32 paths. A 3-D src1 is declined here; when it is
+// columns back to back, ggml_cl_mul_mat flattens it (ggml_cl_flat_cols) and
+// the flattened call comes back here as 2-D and takes the copy.
+// A weight the rule copies but that has no copy says so at any column count
+// and on any path (the F32 skinny path and the matvec report nothing else):
+// `op=MUL_MAT type=f32 k= cols=1|2-8|9-15|16+ path=f32 reason=no-f16-copy`.
+static bool ggml_cl_mul_mat_f16_copy(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+    if (src0->type != GGML_TYPE_F32 || src0->view_src != nullptr || src0->view_offs != 0 || src0->extra == nullptr) {
+        return false;
+    }
+    const ggml_cl_f16_copy * c = ((const ggml_tensor_extra_cl *) src0->extra)->f16;
+    if (c == nullptr) {
+        // once a product: a 3-D src1 that flattens is reported by its flattened call
+        if (ggml_cl_f16_copy_missing(backend_ctx, src0) &&
+            ((src1->ne[2] == 1 && src1->ne[3] == 1) || ggml_cl_flat_cols(src0, src1, dst) <= 0)) {
+            const int64_t cols = src1->ne[1] * src1->ne[2] * src1->ne[3];
+            ggml_cl_downgrade("op=MUL_MAT type=f32 k=%d cols=%s path=f32 reason=no-f16-copy", (int) src0->ne[0],
+                              cols == 1 ? "1" : cols <= 8 ? "2-8" : cols < 16 ? "9-15" : "16+");
+        }
+        return false;
+    }
+    if (!ggml_are_same_shape(src0, &c->t) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        src1->ne[2] != 1 || src1->ne[3] != 1 || dst->nb[0] != sizeof(float) ||
+        (dst->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD)) {
+        return false;
+    }
+    static const char * xe   = getenv("GGML_OPENCL_F16_XMX");
+    static const bool   x_on = xe == nullptr || atoi(xe) != 0;
+    const int     mode = ggml_cl_f16_copy_mode();
+    const int64_t nc   = src1->ne[1];
+    bool take = false;
+    if (nc >= 16) {
+        take = x_on && backend_ctx->kernel_mul_mm_f16w_f16 != nullptr && backend_ctx->kernel_kq_cvt_f32_f16 != nullptr &&
+               ggml_is_contiguous(src1);
+    } else if (nc == 1) {
+        take = mode == 1;
+    } else if (nc <= 8) {
+        take = mode == 1 && backend_ctx->kernel_mul_mv_f16_f32_nc != nullptr && src0->ne[0] % 8 == 0 &&
+               src1->nb[0] == sizeof(float) && src1->nb[1] % (8 * sizeof(float)) == 0;
+    }
+    if (!take) {
+        return false;
+    }
+    ggml_cl_mul_mat(backend, &c->t, src1, dst);
+    return true;
 }
 
 static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -29806,6 +30303,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     // takes its few-column kernels (a Q8_0 eh_proj at 2 tokens went through an
     // F16 dequant and the tiled GEMM: 0.96 ms against 0.06 at one, B60, profiled)
     if (ggml_cl_mul_mat_fwht(backend, src0, src1, dst)) {
+        return;
+    }
+    if (ggml_cl_mul_mat_f16_copy(backend, src0, src1, dst)) {
         return;
     }
 
@@ -31312,11 +31812,22 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     // each V slab once per K-head and emits all r2 Q-heads
                     static const char * mm_kqv_gqa_env = getenv("GGML_OPENCL_MM_KQV_GQA");
                     static const bool mm_kqv_gqa_on = (mm_kqv_gqa_env != nullptr && mm_kqv_gqa_env[0] != '0');
-                    if (can_multi_out && (ne01 % 16) == 0 && ne00 == 128 && r2 == 8 && r3 == 1 && mm_kq_gqa_on &&
+                    // 0107: _x8_pair and _x8_gqa4 split a 64-lane sub-group (sgs_lid >> 5 is the
+                    // row of a pair, sgs_lid >> 3 the query head of 8): on a 16- or 32-wide one
+                    // rows 1, 3, 5, 7 of each 8, or query heads 4-7, are never written. Adreno only
+                    const bool mm_lanes64 = backend_ctx->gpu_family == ADRENO;
+                    if (!mm_lanes64 && (mm_kq_pair_on || mm_kq_gqa_on)) {
+                        static bool warned = false;
+                        if (!warned) {
+                            warned = true;
+                            GGML_LOG_WARN("ggml_opencl: GGML_OPENCL_MM_KQ_PAIR / GGML_OPENCL_MM_KQ_GQA need 64-lane sub-groups (Adreno); ignored here\n");
+                        }
+                    }
+                    if (can_multi_out && (ne01 % 16) == 0 && ne00 == 128 && r2 == 8 && r3 == 1 && mm_kq_gqa_on && mm_lanes64 &&
                         backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4 != nullptr) {
                         kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4;
                         nrows = 1;
-                    } else if (can_multi_out && ne00 <= 256 && mm_kq_pair_on &&
+                    } else if (can_multi_out && ne00 <= 256 && mm_kq_pair_on && mm_lanes64 &&
                         backend_ctx->kernel_mul_mat_f16_f32_l4_x8_pair != nullptr) {
                         kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_pair;
                         nrows = 1;
@@ -35491,6 +36002,7 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
             }
             break;
         case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:    // 0109: a BF16 tensor is held as f16 on the device
             switch (src1t) {
                 case GGML_TYPE_F16:
                     kernel = backend_ctx->kernel_cpy_f16_f16;

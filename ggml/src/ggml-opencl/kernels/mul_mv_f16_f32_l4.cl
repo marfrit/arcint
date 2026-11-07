@@ -439,9 +439,13 @@ kernel void kernel_mul_mat_f16_f32_l4_x8(
     const ulong offset_src1 = (i12) * nb12 + (i13) * nb13;
     global float4 * y4 = (global float4 *)(src1 + offset_src1);
 
-    __local float4 q_loc[64];   // ne00/4 max for sub_group_size 64
-    if (sgs_lid < ne00 / 4) {
-        q_loc[sgs_lid] = y4[sgs_lid];
+    // ne00 / 4 <= 64: the host takes this kernel for ne00 <= 256 only. Every
+    // work-item stages its share (0107): staging one float4 a sub-group lane
+    // assumed a 64-wide sub-group, and Intel's 16 or 32 lanes left q_loc from
+    // 16 or 32 on unwritten, so each product over 256 values read garbage
+    __local float4 q_loc[64];
+    for (int i = get_local_id(0); i < ne00 / 4; i += get_local_size(0)) {
+        q_loc[i] = y4[i];
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -597,9 +601,13 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_pair(
     const ulong offset_src1 = (i12) * nb12 + (i13) * nb13;
     global float4 * y4 = (global float4 *)(src1 + offset_src1);
 
-    __local float4 q_loc[64];   // ne00/4 max for sub_group_size 64
-    if (sgs_lid < ne00 / 4) {
-        q_loc[sgs_lid] = y4[sgs_lid];
+    // ne00 / 4 <= 64: the host takes this kernel for ne00 <= 256 only. Every
+    // work-item stages its share (0107): staging one float4 a sub-group lane
+    // assumed a 64-wide sub-group, and Intel's 16 or 32 lanes left q_loc from
+    // 16 or 32 on unwritten, so each product over 256 values read garbage
+    __local float4 q_loc[64];
+    for (int i = get_local_id(0); i < ne00 / 4; i += get_local_size(0)) {
+        q_loc[i] = y4[i];
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 

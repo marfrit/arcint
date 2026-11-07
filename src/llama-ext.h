@@ -17,6 +17,9 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// Physical weight blocks, excluding MTP, for offload fitting. Repeated executions do not add weights.
+LLAMA_API int32_t llama_model_n_layer_physical(const struct llama_model * model);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

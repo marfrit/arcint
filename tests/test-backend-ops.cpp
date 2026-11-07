@@ -5780,6 +5780,57 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// 0110: an F32 2-D weight times F32 columns with the weight in a buffer marked
+// as weights (weights=1), as a model's loader leaves it, or in the graph's own
+// buffer (weights=0). On Intel the OpenCL backend keeps an f16 copy of such a
+// weight when it is written and multiplies with that; `name` lets a case be a
+// router (ffn_gate_inp), which keeps F32. n2 > 1 makes src1 3-D, columns
+// back to back, which the backend flattens into n * n2 columns.
+// The tolerance (NMSE 5e-4) would not catch one wrong row of 2,560 (one row
+// zeroed is about 4e-4); the red case changes every row.
+struct test_mul_mat_weight : public test_case {
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool weights;
+    const std::string name;
+    const int64_t n2;
+
+    std::string vars() override {
+        return VARS_TO_STR6(m, n, k, weights, name, n2);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * n * n2 * k;
+    }
+
+    test_mul_mat_weight(int64_t m, int64_t n, int64_t k, bool weights, const std::string & name = "a", int64_t n2 = 1)
+        : m(m), n(n), k(k), weights(weights), name(name), n2(n2) {}
+
+    bool use_weight_context() override {
+        return weights;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * a = ggml_new_tensor_2d(weights ? ctx_weights : ctx, GGML_TYPE_F32, k, m);
+        ggml_set_name(a, name.c_str());
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n, n2);
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -10953,6 +11004,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_cpy(type_src, type_dst, {256, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3})); // cpy not-contiguous
         }
     }
+    // 0109: Dory keeps its per-channel scale vectors in BF16 and casts each to F32 in the graph
+    // (a vector of the model width 2560, the head width 4096, the FFN width 7168, and an
+    // activation-shaped 2560 x 256); a BF16 source that the backend refuses puts the scale in a CPU buffer
+    for (ggml_type type_dst : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int64_t n : {2560, 4096, 7168}) {
+            test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, type_dst, {n, 1, 1, 1}));
+        }
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, type_dst, {2560, 256, 1, 1}));
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, type_dst, {2560, 256, 1, 1}, {-1,-1,-1,-1}, {1, 0, 2, 3})); // cpy not-contiguous
+    }
     // quant block count not a multiple of the kernel block size
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q4_0, {96, 1, 1, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_0, GGML_TYPE_F32, {96, 1, 1, 1}));
@@ -12574,6 +12635,91 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // 0106: Gemma 4's attention geometry (8 query heads on 2): head size 512
+    // (its full-attention layers) and 256 (its sliding-window layers), f16 and
+    // the quantized pairs; decode and verify rows (1, 3, 8), the 8-row blocks
+    // of up to 64 rows (12, 64), prompts (128, 512); a KV length of 513 or
+    // 1013 leaves a partial key tile
+    for (auto kv_t : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},
+                                                                  {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}}) {
+        for (int64_t hs : {512, 256}) {
+            for (int64_t nb : {1, 3, 8, 12, 64, 128, 512}) {
+                for (int64_t kv : {513, 1013, 4096}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {4, 1}, kv, nb, true, false, 0, 0,
+                                                                    GGML_PREC_F32, kv_t.first, kv_t.second));
+                }
+            }
+        }
+    }
+    // ... at head size 512 and prompt rows (more than 64: the prompt kernels,
+    // not the 8-row blocks): without a mask, with an all-zero one, with Q
+    // permuted (head-major), with q4_0:q4_0, with a causal mask (diagonal
+    // blocks), and one causal prompt behind 20,000 keys: more than the carry
+    // path's 16,384-key f16 block, so a quantized cache crosses a block
+    for (int64_t nb : {128, 512}) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1}, 1013, nb, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext_zero_mask(512, 512, 2, {4, 1}, 1013, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1}, 1013, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1}, 1013, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1}, 1013, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+        for (auto kv_t : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}}) {
+            test_cases.emplace_back(new test_flash_attn_ext_causal(512, 512, 2, {4, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, kv_t.first, kv_t.second));
+        }
+    }
+    for (int64_t nb : {1, 8}) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1}, 1013, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    }
+    for (auto kv_t : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}}) {
+        test_cases.emplace_back(new test_flash_attn_ext_causal(512, 512, 2, {4, 1}, 20000, 128, true, false, 0, 0, GGML_PREC_F32, kv_t.first, kv_t.second));
+    }
+    // the products the same attention is without flash attention (Gemma 4 E4B
+    // with an f16 cache before 0106, every layer): K Q with K a permuted 3-D
+    // view of 2 KV heads broadcast to 8 query heads (ne02 2, ne12 8), and KQ V
+    // over the transposed V cache, a strided view (rows of 2,048 keys, n_kv
+    // 1280 / 1792 of them used). Decode (1 column a head: the f16 matvec's x8 /
+    // y8 kernels), a verify (3) and prompts (64, 512: the generic tiled GEMM
+    // with both sources copied to contiguous buffers first). On Intel the
+    // head-256 one-column K Q (the x8 kernel) passes only with 0107
+    for (int64_t hs : {256, 512}) {
+        for (int64_t n : {1, 3, 64, 512}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1280, n, hs, {2, 1}, {4, 1}, {0, 2, 1, 3}));
+            for (int64_t kv : {1280, 1792}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, hs, n, kv, {2, 1}, {4, 1}, {0, 1, 2, 3}, 2048));
+            }
+        }
+    }
+    // 0107: one column a head at K <= 256 is the f16 matvec's x8 kernel, which
+    // read Q from a local buffer only its first sub-group's lanes had filled
+    // (16 or 32 float4 of 64 on Intel): K Q at head size 256 (Gemma 4's
+    // sliding-window layers, n_kv 256 to 4,096, and 1,016 rows, not a multiple
+    // of 64), contiguous batched sources at K 128 (the green control: 32
+    // float4, which 32 lanes did fill) and 256, and K Q V at n_kv 256 over the
+    // strided transposed V. (K 64 never reaches x8: the host takes it from 128.)
+    for (int64_t m : {256, 1280, 4096, 1016}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, m, 1, 256, {2, 1}, {4, 1}, {0, 2, 1, 3}));
+    }
+    for (int64_t k : {128, 256}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 512, 1, k, {2, 1}, {4, 1}));
+    }
+    for (int64_t hs : {256, 512}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, hs, 1, 256, {2, 1}, {4, 1}, {0, 1, 2, 3}, 2048));
+    }
+    // 0110: Gemma 4 E4B's F32 per-layer projections, blk.N.proj (K 256, 2,560
+    // rows) and blk.N.inp_gate (K 2,560, 256 rows), as weights: 1 column (the
+    // f16 matvec), 2, 3, 7 and 8 (the few-column kernel), 12 (no F16 fast path:
+    // F32), 16, 17, 64, 100 and 512 (the XMX GEMM, sub-group 16), and a 3-D src1
+    // flattened into 6 and 16 columns. Controls that keep F32: the same product
+    // from the graph's own buffer, and a router-named weight
+    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{2560, 256}, {256, 2560}}) {
+        for (int64_t n : {1, 2, 3, 7, 8, 12, 16, 17, 64, 100, 512}) {
+            test_cases.emplace_back(new test_mul_mat_weight(mk.first, n, mk.second, true));
+        }
+        for (int64_t n : {3, 8}) {
+            test_cases.emplace_back(new test_mul_mat_weight(mk.first, n, mk.second, true, "a", 2));
+        }
+        test_cases.emplace_back(new test_mul_mat_weight(mk.first, 512, mk.second, false));
+    }
+    test_cases.emplace_back(new test_mul_mat_weight(256, 64, 2048, true, "blk.0.ffn_gate_inp.weight"));
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
