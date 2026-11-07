@@ -191,6 +191,13 @@ if(ARCINT_LLAMA)
   if(ARCINT_LLAMA_EXT_H MATCHES "llama_model_n_layer_physical")
     target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_DORY=1)
   endif()
+  # contrib/llama.cpp 0111: the weights the device declined at load, placed in host memory,
+  # counted (llama_placement_downgrades in llama-ext.h); /props downgrades carries them
+  if(ARCINT_LLAMA_EXT_H MATCHES "llama_placement_downgrades")
+    target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_PLACEMENT=1)
+  else()
+    message(WARNING "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0111: a weight the card declines at load is not reported")
+  endif()
   if(ARCINT_LLAMA_H MATCHES "expert_cache_bytes")
     target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_EXPERT_CACHE=1)
     # 0024: an expert cache per card under the layer split
@@ -280,6 +287,7 @@ if(ARCINT_TESTS)
     tests/test_token_ids.cpp
     tests/test_mtp_head_file.cpp
     tests/test_props.cpp
+    tests/test_placement.cpp
     tests/test_sampler_modes.cpp
     tests/test_fast_topk.cpp
     tests/test_mtp_depth.cpp

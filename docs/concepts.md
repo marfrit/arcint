@@ -810,6 +810,16 @@ A weight's type promises a kernel path; the backend can silently take another (a
 - **Switch:** none (always on); not covered yet: expert GEMM selection and flash attention's shape limits beyond the two keys of 0101.
 - **Source:** arcint's own (operator decision).
 
+### A weight the card declines at load says so
+
+At load, libllama probes each weight's op on the buffer types its layer asks for and takes the first one the device accepts; when the device declines, the weight lands in host memory and the scheduler splits every forward around it, with no backend path taken that the downgrade keys above could count. The loader now records that decision where it is made, with the reason: one `DOWNGRADE src=llama op=<probe op> type=<type> weight=<name, layer numbers as N> buft=<buffer type> reason=device-declines` line the first time a key occurs and a count of weights per key, served on `/props` `downgrades` with the OpenCL keys, so the release gate's expected list sees it. Placements somebody asked for are not reported: buffer-type overrides (`--llama-cpu-moe`, the expert cache), lazily read tensors, the input layer (`token_embd`, on the host by design), layers left on the CPU. The case that motivated it: Dory on a build whose OpenCL `CPY` refused BF16 put its 217 BF16 scale vectors in CPU buffers, decoded at 14.7 against 23.7 t/s, and said nothing.
+- **Effect:** `code` so far: from the model files' headers and the series' `supports_op`, Dory without 0109 reports 6 keys (217 weights) and with it none; Gemma 4 E4B, Granite 4.2 8B, the coder and the 27B none; Flash-Next one, its f16 PLE conv kernel probed as `SSM_CONV` (`blk.N.ple_conv1d.weight`), which is in host memory today. The card runs are owed.
+- **Applies to:** Every weight libllama's loader places, on any backend; not the multimodal projector (libmtmd's own loader).
+- **Default:** always on; counts on `/props` `downgrades`.
+- **Location:** `src/llama-placement-report.h` and the call in `llama_model_loader::create_tensor` (`src/llama-model-loader.cpp`), `llama_placement_downgrades` in `src/llama-ext.h`; arcint side `collect_downgrades` in `src/exec/backend.h`, `tests/test_placement.cpp`. (0111)
+- **Switch:** none.
+- **Source:** arcint's own; the gap was found by 0109's red arm.
+
 ### Context checkpoints for a model whose state cannot be cut back
 
 A hybrid (delta-net) model's recurrent state cannot be trimmed to an earlier token, so each lane keeps checkpoints of that state in host memory: at the start of the batch that begins the last user message, at a user message more than 8,192 tokens past the newest checkpoint, and a few tokens before the prompt's end; at most 32 per lane; a request restores from the newest at or below the shared prefix and the attention KV is trimmed there. A thinking turn's follow-up or an edited message resumes instead of re-prefilling. Checkpoints load together with the adaptive expert cache.

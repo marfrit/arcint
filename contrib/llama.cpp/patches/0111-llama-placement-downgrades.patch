@@ -1,0 +1,211 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Markus Fritsche <mfritsche@reauktion.de>
+Date: Sat, 7 Nov 2026 12:00:00 +0000
+Subject: [PATCH] 0111-llama-placement-downgrades
+
+---
+ src/llama-ext.h              |   9 ++++
+ src/llama-model-loader.cpp   |  28 ++++++++++++
+ src/llama-placement-report.h | 104 +++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 141 insertions(+)
+
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index c64761e1c..812c4f8f0 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -20,6 +20,15 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
+ // Physical weight blocks, excluding MTP, for offload fitting. Repeated executions do not add weights.
+ LLAMA_API int32_t llama_model_n_layer_physical(const struct llama_model * model);
+ 
++// ARC-LAB 0111: the weights the loader put in host memory because the device declined their
++// op although their layer asked for a device buffer (tensor_buft_overrides, lazily read
++// tensors and the input layer excluded), as "src=llama <key>\t<count>\n" lines, keys sorted:
++// the format of ggml_backend_opencl_downgrades. Key: op=<probe op> type=<weight type>
++// weight=<name, layer numbers as N> buft=<chosen buffer type> reason=device-declines; count:
++// weights, summed over the models the process loaded. Writes at most size bytes (with the
++// terminator) and returns the full length; buf may be null.
++LLAMA_API size_t llama_placement_downgrades(char * buf, size_t size);
++
+ // Get the default ggml_type for a given ftype.
+ LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
+ 
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 2bb2f0b23..64ef3f1be 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1,4 +1,6 @@
+ #include "llama-model-loader.h"
++#include "llama-ext.h"
++#include "llama-placement-report.h"
+ 
+ #include "ggml-alloc.h"
+ #include "ggml.h"
+@@ -10,6 +12,7 @@
+ #include <array>
+ #include <cinttypes>
+ #include <cstdint>
++#include <cstdio>
+ #include <cstring>
+ #include <future>
+ #include <regex>
+@@ -1268,11 +1271,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+             }
+         }
+ 
++        // ARC-LAB 0111: set when the probe chose the buffer type (not an override)
++        bool probed = false;
+         if (!buft) {
+             buft = select_weight_buft(hparams, t_meta, op, buft_list);
+             if (!buft) {
+                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
+             }
++            probed = true;
+         }
+ 
+         // avoid using a host buffer when using mmap
+@@ -1285,6 +1291,20 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+             buft = ggml_backend_dev_buffer_type(cpu_dev);
+         }
+ 
++        // ARC-LAB 0111: the layer asked for a device buffer, the device declined the
++        // weight's op, and the weight went to host memory: one DOWNGRADE line the first
++        // time a key occurs and a count per key (llama_placement_downgrades). A memory-fit
++        // pass (no_alloc) places nothing and does not count
++        if (probed && !no_alloc &&
++                llama_placement::declined_to_host(ggml_backend_buft_is_host(buft_list->front().second),
++                                                  ggml_backend_buft_is_host(buft))) {
++            const std::string k = llama_placement::key(ggml_op_name(op), ggml_type_name(t_meta->type), t_meta->name,
++                                                       ggml_backend_buft_name(buft));
++            if (llama_placement::global().add(k)) {
++                LLAMA_LOG_WARN("DOWNGRADE src=llama %s\n", k.c_str());
++            }
++        }
++
+         if (buft != buft_list->front().second) {
+             if (n_tensors_moved == 0) {
+                 first_tensor_moved_name = t_meta->name;
+@@ -1398,6 +1418,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+     return tensor;
+ }
+ 
++size_t llama_placement_downgrades(char * buf, size_t size) {
++    const std::string out = llama_placement::global().text();
++    if (buf != nullptr && size > 0) {
++        snprintf(buf, size, "%s", out.c_str());
++    }
++    return out.size();
++}
++
+ void llama_model_loader::done_getting_tensors(bool partial) const {
+     if (n_created > n_tensors) {
+         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
+diff --git a/src/llama-placement-report.h b/src/llama-placement-report.h
+new file mode 100644
+index 000000000..86c3f78e4
+--- /dev/null
++++ b/src/llama-placement-report.h
+@@ -0,0 +1,104 @@
++#pragma once
++
++// ARC-LAB 0111: a weight the device declined, placed in host memory, says so.
++//
++// The loader probes each weight's op on the buffer types of its layer's list
++// (weight_buft_supported) and takes the first that the device accepts. When
++// the layer asked for a device buffer and the device's supports_op declines the
++// probe, the weight lands in a host buffer and the scheduler splits the graph
++// around it: no backend path is ever taken for it, so the backends' own
++// downgrade counts (ggml_backend_opencl_downgrades) never see it. This header
++// holds the rule and the key; llama-model-loader.cpp calls it at the decision
++// and llama_placement_downgrades (llama-ext.h) reads the counts.
++//
++// Device-free on purpose: arcint's unit tests include it.
++
++#include <cstdint>
++#include <map>
++#include <mutex>
++#include <string>
++
++namespace llama_placement {
++
++// The tensor name with every dot-separated part that is all digits made "N"
++// (blk.12.ffn_up.weight -> blk.N.ffn_up.weight), so a key covers every layer
++// and the key count stays small. A space or a tab (never in a GGUF name, but
++// the count text is tab-separated) becomes '_'.
++inline std::string weight_pattern(const std::string & name) {
++    std::string out;
++    out.reserve(name.size());
++    size_t i = 0;
++    while (i <= name.size()) {
++        const size_t dot  = name.find('.', i);
++        const size_t end  = dot == std::string::npos ? name.size() : dot;
++        bool         digits = end > i;
++        for (size_t j = i; j < end && digits; ++j) {
++            digits = name[j] >= '0' && name[j] <= '9';
++        }
++        if (digits) {
++            out += 'N';
++        } else {
++            for (size_t j = i; j < end; ++j) {
++                const char c = name[j];
++                out += (c == ' ' || c == '\t' || c == '\n') ? '_' : c;
++            }
++        }
++        if (dot == std::string::npos) {
++            break;
++        }
++        out += '.';
++        i = dot + 1;
++    }
++    return out;
++}
++
++// Whether a selection is a device decline: the layer's list asked for a device
++// buffer first, the probe on it failed, and the buffer chosen instead is host
++// memory. A list that starts in host memory (the input layer, which keeps
++// token_embd on the host by design, and layers not offloaded) never reports;
++// neither does a fall from one device buffer type to another (a split buffer
++// to the device's own). The caller passes only selections made by the probe:
++// a tensor_buft_override and a lazily read tensor are placements somebody asked
++// for, and are not reported.
++inline bool declined_to_host(bool first_is_host, bool chosen_is_host) {
++    return !first_is_host && chosen_is_host;
++}
++
++// The key without the "src=llama " that the log line and the count text put in
++// front, as ggml-opencl's keys: the declined probe op, the weight's type and
++// name pattern, the buffer type it got.
++inline std::string key(const char * op, const char * type, const std::string & name, const char * buft) {
++    return std::string("op=") + (op ? op : "?") + " type=" + (type ? type : "?") + " weight=" + weight_pattern(name) +
++           " buft=" + (buft ? buft : "?") + " reason=device-declines";
++}
++
++// The counts: a key's count is the number of weights placed under it, summed
++// over the models the process loaded (a draft model's weights add to the
++// target's). Reset with the process.
++struct registry {
++    std::mutex                      mu;
++    std::map<std::string, uint64_t> counts;
++
++    // true the first time a key occurs: the caller logs it then
++    bool add(const std::string & k) {
++        std::lock_guard<std::mutex> lock(mu);
++        return counts[k]++ == 0;
++    }
++
++    // "src=llama <key>\t<count>\n" a key, ggml_backend_opencl_downgrades' format
++    std::string text() {
++        std::lock_guard<std::mutex> lock(mu);
++        std::string out;
++        for (const auto & kv : counts) {
++            out += "src=llama " + kv.first + "\t" + std::to_string(kv.second) + "\n";
++        }
++        return out;
++    }
++};
++
++inline registry & global() {
++    static registry r;
++    return r;
++}
++
++} // namespace llama_placement
