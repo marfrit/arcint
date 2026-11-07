@@ -810,6 +810,16 @@ A weight's type promises a kernel path; the backend can silently take another (a
 - **Switch:** none (always on); not covered yet: expert GEMM selection and flash attention's shape limits beyond the two keys of 0101.
 - **Source:** arcint's own (operator decision).
 
+### A weight the card declines at load says so
+
+At load, libllama probes each weight's op on the buffer types its layer asks for and takes the first one the device accepts; when the device declines, the weight lands in host memory and the scheduler splits every forward around it, with no backend path taken that the downgrade keys above could count. The loader now records that decision where it is made, with the reason: one `DOWNGRADE src=llama op=<probe op> type=<type> weight=<name, layer numbers as N> buft=<buffer type> reason=device-declines` line the first time a key occurs and a count of weights per key, served on `/props` `downgrades` with the OpenCL keys, so the release gate's expected list sees it. Placements somebody asked for are not reported: buffer-type overrides (`--llama-cpu-moe`, the expert cache), lazily read tensors, the input layer (`token_embd`, `per_layer_token_embd`: the CPU list by design), layers left on the CPU. Device memory is told by the buffer type's owner (a GPU, an integrated GPU, a split's meta device) and not by `is_host`, which the CPU's repacking buffer type leaves unset: ruling on `is_host` reported every input embedding on the cards, and missed a decline that lands in the repacked buffer. The case that motivated it: Dory on a build whose OpenCL `CPY` refused BF16 put its 217 BF16 scale vectors in CPU buffers, decoded at 14.7 against 23.7 t/s, and said nothing.
+- **Effect:** `measured-here` on the card: Dory without 0109 reports exactly the 6 keys of its 217 BF16 scale vectors (counts 72, 36, 36, 36, 36, 1); the first rule's input-embedding keys are fixed and their absence is owed a card run. `code`, from the model files' headers and the series' `supports_op`: Dory with 0109 none; Gemma 4 E4B, Granite 4.2 8B, the coder and the 27B none; Flash-Next one, its f16 PLE conv kernel probed as `SSM_CONV` (`blk.N.ple_conv1d.weight`), in host memory until 0112 probed it as the cast the graph applies to it (80 KiB on the card). The card runs are owed.
+- **Applies to:** Every weight libllama's loader places, on any backend; not the multimodal projector (libmtmd's own loader).
+- **Default:** always on; counts on `/props` `downgrades`.
+- **Location:** `src/llama-placement-report.h` and the call in `llama_model_loader::create_tensor` (`src/llama-model-loader.cpp`), `llama_placement_downgrades` in `src/llama-ext.h`; arcint side `collect_downgrades` in `src/exec/backend.h`, `tests/test_placement.cpp`; the first key it found, fixed: `LLM_TENSOR_PLE_CONV1D` in `src/llama-arch.cpp`. (0111, 0112)
+- **Switch:** none.
+- **Source:** arcint's own; the gap was found by 0109's red arm.
+
 ### Context checkpoints for a model whose state cannot be cut back
 
 A hybrid (delta-net) model's recurrent state cannot be trimmed to an earlier token, so each lane keeps checkpoints of that state in host memory: at the start of the batch that begins the last user message, at a user message more than 8,192 tokens past the newest checkpoint, and a few tokens before the prompt's end; at most 32 per lane; a request restores from the newest at or below the shared prefix and the attention KV is trimmed there. A thinking turn's follow-up or an edited message resumes instead of re-prefilling. Checkpoints load together with the adaptive expert cache.
@@ -906,7 +916,7 @@ Qwen3-TTS's code predictor runs a small graph per frame. On the B60 the predicto
 
 ## 13. Weight-shared and looped architectures
 
-Models that run the same weights more than once per token. Admitted 2026-11-07; neither entry has run on a card yet.
+Models that run the same weights more than once per token. Admitted 2026-11-07.
 
 ### Physical blocks and executed layers kept apart (a looped nGPT)
 
@@ -927,6 +937,26 @@ A model whose small scale vectors are stored in BF16 casts each one to F32 in th
 - **Location:** `ggml/src/ggml-opencl/ggml-opencl.cpp`, `supports_op` (`GGML_OP_CPY`) and `ggml_cl_cpy`; test `tests/test-backend-ops.cpp`, `test_cpy` with BF16 sources at 2560, 4096, 7168 and 2560 x 256. (0109)
 - **Switch:** none.
 - **Source:** arcint's own, after the same fix on CUDA in the pull request above.
+
+### Constant chains of a model's scale vectors computed once at load
+
+A model that keeps small per-channel scale vectors and combines them with constants in the forward (Dory: `|alpha| * alpha_init / init_std`, `(sqk * sqrt(hd) / init_std)^2`, `suv * sqrt(n_embd)`, and others) spends three to six graph nodes a sublayer recomputing values that never change; in a looped model each recurrent block pays it once a loop. Compute each final vector once after the weights are loaded, in F32, from the file's own bytes, with the forward's operations in the forward's order, and put it in the buffer type the loader chose for its source, so the CPU computes the same bits as before. Move a uniform scale that sits between a norm and a per-channel multiply into the vector (here 1/sqrt(hd), a power of two, so exact), which leaves a norm-then-multiply pair the backend already fuses. A second norm of a vector that is already a norm's output moves it by a factor of about 1 + (eps/2)(1/S - 1), S the sum of squares before the first norm, and can go. Place each derived vector by the device of the layer that reads it, probed with the op that reads it, and keep the sources the graph no longer reads in host memory.
+- **Effect:** `measured-here`, 2026-11-07, Dory1.0-4B Q5_K_M, the graph builder on the CPU: launching nodes a forward at 2 loops, q8_0:q4_0, 3,771 -> 2,761 with the vectors folded -> 2,535 with the repeated norms dropped; 4 loops 6,461 -> 4,341; at f16 KV 3,547 -> 2,311 and 6,077 -> 3,957. On the CPU against the unchanged graph: folded vectors KL 0.000000 (the same logits); with the norms dropped KL 0.0080, top-1 95.9 %, where a control that moves every layer's output by one ulp gives 0.0090 and 95.6 % (2 loops; at 4 loops 0.0080 against the control's 0.0080): this model turns any rounding change into about 0.008-0.009 nats, the same as the A770's KL against the CPU before the change (0.0091). Card speed: owed.
+- **Applies to:** Dory (any backend; the graph changes). The vectors are 4.3 MiB F32 on the layers' devices (the memory-fit pass counts them); a device that declines their F32 `MUL` reports `src=llama op=MUL type=f32 weight=<name>.fold`.
+- **Default:** On (`LLAMA_DORY_FOLD=2`); `1` folds the vectors only, `0` builds the upstream pull request's graph.
+- **Location:** `src/models/dory.cpp`, `llama_model_dory::load_tensors_post` and the graph; `src/llama-model.cpp`, `llama_model_base::load_tensors_post` (a virtual called after the weights load, and in the memory-fit pass), `own_buffer` and `select_buft_f32_mul`; `src/llama-model-loader.cpp`, the `TENSOR_HOST_ONLY` flag. (0113)
+- **Switch:** `LLAMA_DORY_FOLD`.
+- **Source:** arcint's own, a deviation from llama.cpp pull request 30306's graph (operator, 2026-11-07); vLLM's `models/dory.py` also builds the factors in the forward, under `torch.compile`.
+
+### The nGPT residual update as one kernel
+
+An nGPT block ends with a normalised interpolation of the residual a toward the sublayer's normalised output, `h = norm(a + alpha * (norm(x) - a))`: seven graph nodes (two norms with their scale, a subtract, a per-channel multiply, an add), five kernels with an rms_norm + scale fusion. One work-group a row computes both reductions and writes h, recomputing the interpolation in the last pass instead of keeping it. The fused kernel reads its inputs after the point where the unfused graph would let the allocator reuse them, so the result may lie exactly over x or a (each element is read and written by the same work-item after both reductions) and any other overlap refuses the fusion.
+- **Effect:** `inferred` from the CPU graph: 112 updates a forward at 2 loops and 192 at 4 match the pattern; the card's launches about 2,028 -> 1,580 at 2 loops q8_0:q4_0 (after the folding above). Card speed and the op tests: owed.
+- **Applies to:** OpenCL; F32, contiguous rows, a width that is a multiple of 4, alpha one row; the pattern in the order Dory's graph builds it.
+- **Default:** On.
+- **Location:** `ggml/src/ggml-opencl/ggml-opencl.cpp`, `ggml_opencl_can_fuse_ngpt`, `ggml_cl_ngpt_fused`; `kernels/rms_norm.cl`, `kernel_ngpt_slerp_f32`; test `tests/test-backend-ops.cpp`, `test_ngpt_slerp` (`-o NGPT_SLERP`). (0114)
+- **Switch:** `GGML_OPENCL_FUSE_NGPT=0` off; `GGML_OPENCL_FUSE_NGPT_RED=1` the red case (alpha read as 1).
+- **Source:** vLLM's `slerp_alpha` (`models/dory.py`), which runs the same update inside one compiled region; here a pattern in the backend's graph loop, not a new ggml op.
 
 ## Where the ideas came from
 

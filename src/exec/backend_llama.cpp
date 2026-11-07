@@ -1473,11 +1473,13 @@ public:
     // llama_loan_book::poison_exit, operator 2026-10-29), so a live server
     // reports at worst "out" for a moment or "armed".
     std::vector<std::pair<std::string, uint64_t>> downgrades() const override {
-        const size_t need = ggml_backend_opencl_downgrades(nullptr, 0);
-        std::string text(need + 1, '\0');
-        ggml_backend_opencl_downgrades(text.data(), text.size());
-        text.resize(need);
-        return parse_downgrades(text);
+#ifdef ARCINT_LLAMA_PLACEMENT
+        // 0111: the weights the card declined at load, in host memory (the main model's,
+        // the MTP head's and the drafter's together: the counts are the process's)
+        return collect_downgrades({ ggml_backend_opencl_downgrades, llama_placement_downgrades });
+#else
+        return collect_downgrades({ ggml_backend_opencl_downgrades });
+#endif
     }
 
     std::string slot_loan_state() const override {
