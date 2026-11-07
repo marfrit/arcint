@@ -4,15 +4,28 @@ Date: Sat, 7 Nov 2026 15:00:00 +0000
 Subject: [PATCH] 0110-opencl-f32-weights-f16-copy
 
 ---
-  ggml/src/ggml-opencl/ggml-opencl.cpp | 232 +++++++++++++++++++++++++++++++++--
-  tests/test-backend-ops.cpp           |  59 +++++++++
-  2 files changed, 281 insertions(+), 10 deletions(-)
+  ggml/src/ggml-opencl/ggml-opencl.cpp | 268 +++++++++++++++++++++++++++++++++--
+  tests/test-backend-ops.cpp           |  67 +++++++++
+  2 files changed, 327 insertions(+), 8 deletions(-)
 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 257033f..73112ad 100644
+index 257033f..5a12891 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -9095,6 +9095,8 @@ static void transpose_2d_as_32b(
+@@ -767,6 +767,12 @@ struct ggml_backend_opencl_context {
+     cl_device_id device;
+     std::string device_name;
+ 
++    // ARC-LAB 0110: the f16 copies of F32 weights on this device, and the count
++    // last logged (ggml_backend_opencl_graph_compute logs a change once)
++    int64_t f16_copy_n        = 0;
++    size_t  f16_copy_bytes    = 0;
++    int64_t f16_copy_n_logged = 0;
++
+     ggml_cl_version platform_version;
+     ggml_cl_version opencl_c_version;
+ 
+@@ -9095,6 +9101,8 @@ static void transpose_2d_as_32b(
  //------------------------------------------------------------------------------
  // Tensor extra management
  //------------------------------------------------------------------------------
@@ -21,7 +34,7 @@ index 257033f..73112ad 100644
  struct ggml_tensor_extra_cl {
      // The buffer object that holds the data.
      cl_mem data_device;
-@@ -9106,11 +9108,31 @@ struct ggml_tensor_extra_cl {
+@@ -9106,11 +9114,36 @@ struct ggml_tensor_extra_cl {
      // The actual size of the cl_mem object. This is needed when returning the
      // block to the pool.
      size_t actual_size;
@@ -41,19 +54,37 @@ index 257033f..73112ad 100644
 +// written. `t` is the weight as an F16 tensor of the same shape reading `mem`,
 +// so ggml_cl_mul_mat takes its F16 paths with it.
 +struct ggml_cl_f16_copy {
-+    cl_mem                 mem   = nullptr;
-+    ggml_tensor            t     = {};
-+    ggml_tensor_extra_cl   e     = {};
-+    ggml_tensor_extra_cl * owner = nullptr;   // the weight's extra, whose f16 points here
++    cl_mem                        mem   = nullptr;
++    ggml_tensor                   t     = {};
++    ggml_tensor_extra_cl          e     = {};
++    ggml_tensor_extra_cl *        owner = nullptr;   // the weight's extra, whose f16 points here
++    ggml_backend_opencl_context * bctx  = nullptr;   // the device's totals
 +
 +    ~ggml_cl_f16_copy() {
 +        if (mem != nullptr) {
 +            CL_CHECK(clReleaseMemObject(mem));
 +        }
++        if (bctx != nullptr) {
++            bctx->f16_copy_n     -= 1;
++            bctx->f16_copy_bytes -= e.actual_size;
++        }
      }
  };
  
-@@ -12794,6 +12816,7 @@ struct ggml_backend_opencl_buffer_context {
+@@ -11208,6 +11241,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+     backend_ctx->graph_gen++;
+     backend_ctx->pair_perm_t = nullptr;
++    if (backend_ctx->f16_copy_n != backend_ctx->f16_copy_n_logged) {
++        // 0110: the copies' total once the weights are loaded (the first graph), and again if it changes
++        backend_ctx->f16_copy_n_logged = backend_ctx->f16_copy_n;
++        GGML_LOG_INFO("ggml_opencl: %s: %lld F32 weights carry an f16 copy, %.1f MiB outside the weight buffers (GGML_OPENCL_F32W_F16=0 keeps F32)\n",
++                      backend_ctx->device_name.c_str(), (long long) backend_ctx->f16_copy_n, backend_ctx->f16_copy_bytes / (1024.0 * 1024.0));
++    }
+     ggml_cl_gdn_gate_prepass(backend_ctx, cgraph);
+ 
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+@@ -12794,6 +12833,7 @@ struct ggml_backend_opencl_buffer_context {
      }
  
      void reset() {
@@ -61,7 +92,7 @@ index 257033f..73112ad 100644
          for (ggml_tensor_extra_cl * e : temp_tensor_extras_in_use) {
              temp_tensor_extras.push_back(e);
          }
-@@ -12924,6 +12947,30 @@ struct ggml_backend_opencl_buffer_context {
+@@ -12924,6 +12964,30 @@ struct ggml_backend_opencl_buffer_context {
      // allocation are enabled.
      std::vector<cl_mem> img;
      std::string name;
@@ -92,7 +123,7 @@ index 257033f..73112ad 100644
  };
  
  static void ggml_backend_opencl_buffer_free_buffer(ggml_backend_buffer_t buffer) {
-@@ -13224,6 +13271,117 @@ static bool ggml_cl_stage_write(ggml_backend_opencl_context * ctx, ggml_backend_
+@@ -13224,6 +13288,137 @@ static bool ggml_cl_stage_write(ggml_backend_opencl_context * ctx, ggml_backend_
      return true;
  }
  
@@ -107,10 +138,13 @@ index 257033f..73112ad 100644
 +// shader (matmul_f32_f32 on fp16 devices: FLOAT_TYPE float16_t, both
 +// operands rounded to f16 in shared memory); CUDA keeps F32 (cuBLAS SGEMM,
 +// TF32 mma up to 16 columns on Ampere).
-+// Kept F32: the expert routers (ffn_gate_inp: llama-quant keeps them F32 and
-+// their top-k is a discrete choice), anything under 256 rows or a K under
-+// 256 (the delta-net's ssm_alpha / ssm_beta have the skinny path), views,
-+// USM-host buffers, a weight with a value outside f16's range.
++// Kept F32: by name (ggml_cl_f16_copy_name_ok) the expert routers
++// (ffn_gate_inp: llama-quant keeps them F32 and their top-k is a discrete
++// choice), the Hadamard rotation matrices and the vocabulary-size products;
++// anything under 256 rows or a K under 256 (the delta-net's ssm_alpha /
++// ssm_beta have the skinny path), views, USM-host buffers, a weight with a
++// value outside f16's range. The copies are VRAM outside the weight buffers'
++// size; the device's total is logged at the first graph after it changes.
 +// GGML_OPENCL_F32W_F16: 0 no copies, 1 every column count (default), 2 only
 +// 16 or more columns (the prompt). GGML_OPENCL_F32W_F16_RED=1 negates the
 +// last 16 of K in every row of a copy (the red case of its test).
@@ -120,10 +154,30 @@ index 257033f..73112ad 100644
 +    return v;
 +}
 +
++// by name, kept F32: the routers; the Hadamard rotation matrices (the KV
++// cache's attn_rot_dev_N and the model's prism.hadamard.N: their products go
++// to the fast transform or carry the Hadamard hint, never to the copy); the
++// vocabulary-size products (output.weight, a tied token_embd), whose copy would
++// be hundreds of MB to GB of VRAM outside any budget
++static bool ggml_cl_f16_copy_name_ok(const char * name) {
++    return strstr(name, "ffn_gate_inp") == nullptr && strstr(name, "attn_rot_dev_") == nullptr &&
++           strstr(name, "prism.hadamard") == nullptr && strstr(name, "token_embd") == nullptr &&
++           strcmp(name, "output.weight") != 0;
++}
++
 +static bool ggml_cl_f16_copy_shape(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t) {
 +    return backend_ctx->gpu_family == INTEL && t->type == GGML_TYPE_F32 && t->view_src == nullptr &&
 +           t->ne[2] == 1 && t->ne[3] == 1 && t->ne[0] >= 256 && t->ne[1] >= 256 && t->ne[0] % 16 == 0 &&
-+           ggml_is_contiguous(t) && strstr(t->name, "ffn_gate_inp") == nullptr;
++           ggml_is_contiguous(t) && ggml_cl_f16_copy_name_ok(t->name);
++}
++
++// a weight the rule copies (its buffer marked as weights, its shape and name)
++// that has no copy: switched off, a failed allocation, a value outside f16, a
++// partial write. Reported at every MUL_MAT (ggml_cl_mul_mat_f16_copy).
++static bool ggml_cl_f16_copy_missing(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t) {
++    return t->type == GGML_TYPE_F32 && t->buffer != nullptr && t->extra != nullptr &&
++           ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
++           ggml_cl_f16_copy_shape(backend_ctx, t) && ((const ggml_tensor_extra_cl *) t->extra)->f16 == nullptr;
 +}
 +
 +// after a write of the weight's bytes: any earlier copy is stale, and a whole
@@ -197,20 +251,17 @@ index 257033f..73112ad 100644
 +    c->t.view_offs      = 0;
 +    c->t.extra          = &c->e;
 +    c->owner            = extra;
++    c->bctx             = backend_ctx;
++    backend_ctx->f16_copy_n     += 1;
++    backend_ctx->f16_copy_bytes += c->e.actual_size;
 +    extra->f16          = c.get();
 +    ctx->f16_copies.push_back(std::move(c));
-+    static bool said = false;
-+    if (!said) {
-+        said = true;
-+        GGML_LOG_INFO("ggml_opencl: F32 2-D weights get an f16 copy for MUL_MAT (first: %s, %lld x %lld); GGML_OPENCL_F32W_F16=0 keeps F32\n",
-+                      tensor->name, (long long) tensor->ne[0], (long long) tensor->ne[1]);
-+    }
 +}
 +
  static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
      if (((ggml_backend_opencl_buffer_context *) buffer->context)->usm) {
          ggml_cl_usm_set_tensor((ggml_backend_opencl_buffer_context *) buffer->context, tensor, data, offset, size);
-@@ -14926,14 +15084,12 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+@@ -14926,14 +15121,12 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
      ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
      GGML_ASSERT(extra);
  
@@ -230,7 +281,7 @@ index 257033f..73112ad 100644
  }
  
  static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-@@ -16186,6 +16342,7 @@ static void ggml_backend_opencl_buffer_clear(ggml_backend_buffer_t buffer, uint8
+@@ -16186,6 +16379,7 @@ static void ggml_backend_opencl_buffer_clear(ggml_backend_buffer_t buffer, uint8
      cl_command_queue queue = backend_ctx->queue;
  
      ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
@@ -238,59 +289,53 @@ index 257033f..73112ad 100644
      for (cl_mem buf : ctx->buffer) {
          CL_CHECK(clEnqueueFillBuffer(queue, buf, &value, sizeof(value), 0, buffer->size, 0, NULL, NULL));
      }
-@@ -30013,14 +30170,28 @@ static bool ggml_cl_mul_mat_fwht(ggml_backend_t backend, const ggml_tensor * src
-     return true;
- }
- 
-+// ARC-LAB 0110: an F32 weight that 0110 copies to f16 (by its shape and name)
-+// but that has no copy here (GGML_OPENCL_F32W_F16=0, a value outside f16)
-+// reports reason=no-f16-copy; with its copy it does not reach the F32 paths,
-+// except at column counts without an F16 fast path (no-fast-path, as before)
-+static const char * ggml_cl_downgrade_reason(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src0) {
-+    if (src0->type == GGML_TYPE_F32 && src0->buffer != nullptr &&
-+        ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-+        ggml_cl_f16_copy_shape(backend_ctx, src0) && src0->extra != nullptr &&
-+        ((const ggml_tensor_extra_cl *) src0->extra)->f16 == nullptr) {
-+        return "no-f16-copy";
-+    }
-+    return "no-fast-path";
-+}
-+
- // ARC-LAB 0100: an Intel product on ggml's generic tiled GEMM
- static void ggml_cl_downgrade_gemm(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src0, const ggml_tensor * src1) {
+@@ -30018,6 +30212,9 @@ static void ggml_cl_downgrade_gemm(const ggml_backend_opencl_context * backend_c
      if (backend_ctx->gpu_family != INTEL) {
          return;
      }
++    if (ggml_cl_f16_copy_missing(backend_ctx, src0)) {
++        return;   // 0110: reported as no-f16-copy at the product's start
++    }
      const int64_t cols = src1->ne[1] * src1->ne[2] * src1->ne[3];
--    ggml_cl_downgrade("op=MUL_MAT type=%s k=%d cols=%s path=generic reason=no-fast-path", ggml_type_name(src0->type), (int) src0->ne[0],
--                      cols <= 4 ? "1-4" : cols < 16 ? "5-15" : "16+");
-+    ggml_cl_downgrade("op=MUL_MAT type=%s k=%d cols=%s path=generic reason=%s", ggml_type_name(src0->type), (int) src0->ne[0],
-+                      cols <= 4 ? "1-4" : cols < 16 ? "5-15" : "16+", ggml_cl_downgrade_reason(backend_ctx, src0));
- }
- 
- // ... and on the per-column matvec with enough columns for a GEMM: below 32 the generic switch
-@@ -30030,10 +30201,48 @@ static void ggml_cl_downgrade_mv(const ggml_backend_opencl_context * backend_ctx
+     ggml_cl_downgrade("op=MUL_MAT type=%s k=%d cols=%s path=generic reason=no-fast-path", ggml_type_name(src0->type), (int) src0->ne[0],
+                       cols <= 4 ? "1-4" : cols < 16 ? "5-15" : "16+");
+@@ -30029,11 +30226,63 @@ static void ggml_cl_downgrade_mv(const ggml_backend_opencl_context * backend_ctx
+     if (backend_ctx->gpu_family != INTEL) {
          return;
      }
-     if (src1->ne[1] * src1->ne[2] * src1->ne[3] >= 16) {
--        ggml_cl_downgrade("op=MUL_MAT type=%s k=%d cols=16+ path=matvec reason=no-fast-path", ggml_type_name(src0->type), (int) src0->ne[0]);
-+        ggml_cl_downgrade("op=MUL_MAT type=%s k=%d cols=16+ path=matvec reason=%s", ggml_type_name(src0->type), (int) src0->ne[0],
-+                          ggml_cl_downgrade_reason(backend_ctx, src0));
+-    if (src1->ne[1] * src1->ne[2] * src1->ne[3] >= 16) {
++    if (src1->ne[1] * src1->ne[2] * src1->ne[3] >= 16 && !ggml_cl_f16_copy_missing(backend_ctx, src0)) {
+         ggml_cl_downgrade("op=MUL_MAT type=%s k=%d cols=16+ path=matvec reason=no-fast-path", ggml_type_name(src0->type), (int) src0->ne[0]);
      }
  }
  
 +// ARC-LAB 0110: an F32 2-D weight with an f16 copy (ggml_cl_f16_copy_build)
 +// takes the F16 paths through it where they have a kernel for the column
 +// count: from 16 columns the XMX GEMM (not built at sub-group 8), 1 column the
-+// f16 matvec, 2-8 the few-column f16 kernel. 9-15 columns, a 3-D src1 and the
-+// Hadamard rotations keep the F32 paths.
++// f16 matvec, 2-8 the few-column f16 kernel. 9-15 columns and the Hadamard
++// rotations keep the F32 paths. A 3-D src1 is declined here; when it is
++// columns back to back, ggml_cl_mul_mat flattens it (ggml_cl_flat_cols) and
++// the flattened call comes back here as 2-D and takes the copy.
++// A weight the rule copies but that has no copy says so at any column count
++// and on any path (the F32 skinny path and the matvec report nothing else):
++// `op=MUL_MAT type=f32 k= cols=1|2-8|9-15|16+ path=f32 reason=no-f16-copy`.
 +static bool ggml_cl_mul_mat_f16_copy(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
 +    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
 +    if (src0->type != GGML_TYPE_F32 || src0->view_src != nullptr || src0->view_offs != 0 || src0->extra == nullptr) {
 +        return false;
 +    }
 +    const ggml_cl_f16_copy * c = ((const ggml_tensor_extra_cl *) src0->extra)->f16;
-+    if (c == nullptr || !ggml_are_same_shape(src0, &c->t) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
++    if (c == nullptr) {
++        // once a product: a 3-D src1 that flattens is reported by its flattened call
++        if (ggml_cl_f16_copy_missing(backend_ctx, src0) &&
++            ((src1->ne[2] == 1 && src1->ne[3] == 1) || ggml_cl_flat_cols(src0, src1, dst) <= 0)) {
++            const int64_t cols = src1->ne[1] * src1->ne[2] * src1->ne[3];
++            ggml_cl_downgrade("op=MUL_MAT type=f32 k=%d cols=%s path=f32 reason=no-f16-copy", (int) src0->ne[0],
++                              cols == 1 ? "1" : cols <= 8 ? "2-8" : cols < 16 ? "9-15" : "16+");
++        }
++        return false;
++    }
++    if (!ggml_are_same_shape(src0, &c->t) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
 +        src1->ne[2] != 1 || src1->ne[3] != 1 || dst->nb[0] != sizeof(float) ||
 +        (dst->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD)) {
 +        return false;
@@ -319,7 +364,7 @@ index 257033f..73112ad 100644
  static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -30055,6 +30264,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -30055,6 +30304,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
      if (ggml_cl_mul_mat_fwht(backend, src0, src1, dst)) {
          return;
      }
@@ -330,10 +375,10 @@ index 257033f..73112ad 100644
      if (src0->ne[2] == 1 && src0->ne[3] == 1 && (src1->ne[2] > 1 || src1->ne[3] > 1)) {
          const int fc = ggml_cl_flat_cols(src0, src1, dst);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 5753410..0dd3c68 100644
+index 5753410..9e716ea 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -5780,6 +5780,53 @@ struct test_mul_mat : public test_case {
+@@ -5780,6 +5780,57 @@ struct test_mul_mat : public test_case {
      }
  };
  
@@ -341,16 +386,20 @@ index 5753410..0dd3c68 100644
 +// as weights (weights=1), as a model's loader leaves it, or in the graph's own
 +// buffer (weights=0). On Intel the OpenCL backend keeps an f16 copy of such a
 +// weight when it is written and multiplies with that; `name` lets a case be a
-+// router (ffn_gate_inp), which keeps F32.
++// router (ffn_gate_inp), which keeps F32. n2 > 1 makes src1 3-D, columns
++// back to back, which the backend flattens into n * n2 columns.
++// The tolerance (NMSE 5e-4) would not catch one wrong row of 2,560 (one row
++// zeroed is about 4e-4); the red case changes every row.
 +struct test_mul_mat_weight : public test_case {
 +    const int64_t m;
 +    const int64_t n;
 +    const int64_t k;
 +    const bool weights;
 +    const std::string name;
++    const int64_t n2;
 +
 +    std::string vars() override {
-+        return VARS_TO_STR5(m, n, k, weights, name);
++        return VARS_TO_STR6(m, n, k, weights, name, n2);
 +    }
 +
 +    double max_nmse_err() override {
@@ -359,11 +408,11 @@ index 5753410..0dd3c68 100644
 +
 +    uint64_t op_flops(ggml_tensor * t) override {
 +        GGML_UNUSED(t);
-+        return 2 * m * n * k;
++        return 2 * m * n * n2 * k;
 +    }
 +
-+    test_mul_mat_weight(int64_t m, int64_t n, int64_t k, bool weights, const std::string & name = "a")
-+        : m(m), n(n), k(k), weights(weights), name(name) {}
++    test_mul_mat_weight(int64_t m, int64_t n, int64_t k, bool weights, const std::string & name = "a", int64_t n2 = 1)
++        : m(m), n(n), k(k), weights(weights), name(name), n2(n2) {}
 +
 +    bool use_weight_context() override {
 +        return weights;
@@ -376,7 +425,7 @@ index 5753410..0dd3c68 100644
 +    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
 +        ggml_tensor * a = ggml_new_tensor_2d(weights ? ctx_weights : ctx, GGML_TYPE_F32, k, m);
 +        ggml_set_name(a, name.c_str());
-+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
++        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n, n2);
 +        ggml_set_name(b, "b");
 +        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
 +        ggml_set_name(out, "out");
@@ -387,18 +436,22 @@ index 5753410..0dd3c68 100644
  // GGML_HINT_SRC0_IS_HADAMARD
  struct test_mul_mat_hadamard : public test_mul_mat {
      test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
-@@ -12643,6 +12690,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12643,6 +12694,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      for (int64_t hs : {256, 512}) {
          test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, hs, 1, 256, {2, 1}, {4, 1}, {0, 1, 2, 3}, 2048));
      }
 +    // 0110: Gemma 4 E4B's F32 per-layer projections, blk.N.proj (K 256, 2,560
 +    // rows) and blk.N.inp_gate (K 2,560, 256 rows), as weights: 1 column (the
-+    // f16 matvec), 2 and 8 (the few-column kernel), 12 (no F16 fast path: F32),
-+    // 16, 64 and 512 (the XMX GEMM, sub-group 16). Controls that keep F32: the
-+    // same products from the graph's own buffer, and a router-named weight
++    // f16 matvec), 2, 3, 7 and 8 (the few-column kernel), 12 (no F16 fast path:
++    // F32), 16, 17, 64, 100 and 512 (the XMX GEMM, sub-group 16), and a 3-D src1
++    // flattened into 6 and 16 columns. Controls that keep F32: the same product
++    // from the graph's own buffer, and a router-named weight
 +    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{2560, 256}, {256, 2560}}) {
-+        for (int64_t n : {1, 2, 8, 12, 16, 64, 512}) {
++        for (int64_t n : {1, 2, 3, 7, 8, 12, 16, 17, 64, 100, 512}) {
 +            test_cases.emplace_back(new test_mul_mat_weight(mk.first, n, mk.second, true));
++        }
++        for (int64_t n : {3, 8}) {
++            test_cases.emplace_back(new test_mul_mat_weight(mk.first, n, mk.second, true, "a", 2));
 +        }
 +        test_cases.emplace_back(new test_mul_mat_weight(mk.first, 512, mk.second, false));
 +    }
