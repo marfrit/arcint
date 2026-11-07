@@ -22,6 +22,13 @@ Red cases (each was run red first; the mutation that turned it red is named):
     swapped in ST split -> the split test fails.
  6. splice replaces a tensor raw and refuses a shape that does not fit;
     compare finds one flipped byte.
+ 7. strip-output (patch 0105): the file without output.weight keeps every
+    other tensor byte for byte and the metadata; check accepts it and
+    --no-output requires it; a file that still has output.weight fails
+    --no-output (mutation: strip_output writes the tensor back -> the
+    names test fails); a file with no output to strip and a file that is not
+    head-only are refused. Mutation: the `not in g.names` guard removed -> a
+    no-op "strip" is written and the arm is not what it is called.
 """
 import importlib.util
 import os
@@ -179,6 +186,31 @@ class GgufTests(unittest.TestCase):
             f.write(raw)
         same, n = cm.compare(self.p("flip.gguf"), self.p("served.gguf"), "blk.2.", False, lines.append)
         self.assertEqual(n - same, 1)
+
+    def test_strip_output(self):
+        self.build()
+        full_model(self.p("served.gguf"))
+        cm.splice(self.p("head.gguf"), self.p("served.gguf"), ["token_embd.weight", "output.weight"], self.p("arm.gguf"))
+        with self.assertRaisesRegex(cm.SpecError, "carries output.weight"):     # the red: the with-output arm
+            cm.check_file(self.p("arm.gguf"), NE, no_output=True)
+        cm.check_file(self.p("arm.gguf"), NE)
+        cm.strip_output(self.p("arm.gguf"), self.p("no.gguf"))
+        g = cm.check_file(self.p("no.gguf"), NE, no_output=True)
+        a = cm.Gguf(self.p("arm.gguf"))
+        self.assertEqual(g.names, [n for n in a.names if n != "output.weight"])
+        for n in g.names:
+            self.assertEqual(g.tensor(n).data(), a.tensor(n).data(), n)
+        self.assertEqual(g.kv, a.kv)
+        cm.check_file(self.p("head.gguf"), NE, no_output=True)      # a built head has none either
+
+    def test_strip_output_refusals(self):
+        self.build()
+        with self.assertRaisesRegex(cm.SpecError, "no output.weight to strip"):
+            cm.strip_output(self.p("head.gguf"), self.p("x.gguf"))
+        full_model(self.p("served.gguf"))
+        with self.assertRaisesRegex(cm.SpecError, "trunk tensor"):
+            cm.strip_output(self.p("served.gguf"), self.p("x.gguf"))
+        self.assertFalse(os.path.exists(self.p("x.gguf")))
 
     def test_splice_refuses_a_shape_that_does_not_fit(self):
         self.build()
