@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Markus Fritsche <mfritsche@reauktion.de>
+Date: Sat, 7 Nov 2026 12:00:00 +0000
+Subject: [PATCH] 0109-opencl-cpy-bf16
+
+---
+ ggml/src/ggml-opencl/ggml-opencl.cpp |  2 ++
+ tests/test-backend-ops.cpp           | 10 ++++++++++
+ 2 files changed, 12 insertions(+)
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 3d931ba..5fe68e0 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -11681,6 +11681,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                             return false;
+                     }
+                 case GGML_TYPE_F16:
++                case GGML_TYPE_BF16:    // 0109: stored as f16 on the device (the upload converts), so the f16 kernels read it
+                     switch (op->type) {
+                         case GGML_TYPE_F16:
+                         case GGML_TYPE_F32:
+@@ -35491,6 +35492,7 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const
+             }
+             break;
+         case GGML_TYPE_F16:
++        case GGML_TYPE_BF16:    // 0109: a BF16 tensor is held as f16 on the device
+             switch (src1t) {
+                 case GGML_TYPE_F16:
+                     kernel = backend_ctx->kernel_cpy_f16_f16;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b17a14f..322d24c 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10953,6 +10953,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             test_cases.emplace_back(new test_cpy(type_src, type_dst, {256, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3})); // cpy not-contiguous
+         }
+     }
++    // 0109: Dory keeps its per-channel scale vectors in BF16 and casts each to F32 in the graph
++    // (a vector of the model width 2560, the head width 4096, the FFN width 7168, and an
++    // activation-shaped 2560 x 256); a BF16 source that the backend refuses puts the scale in a CPU buffer
++    for (ggml_type type_dst : {GGML_TYPE_F32, GGML_TYPE_F16}) {
++        for (int64_t n : {2560, 4096, 7168}) {
++            test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, type_dst, {n, 1, 1, 1}));
++        }
++        test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, type_dst, {2560, 256, 1, 1}));
++        test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, type_dst, {2560, 256, 1, 1}, {-1,-1,-1,-1}, {1, 0, 2, 3})); // cpy not-contiguous
++    }
+     // quant block count not a multiple of the kernel block size
+     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q4_0, {96, 1, 1, 1}));
+     test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_0, GGML_TYPE_F32, {96, 1, 1, 1}));
