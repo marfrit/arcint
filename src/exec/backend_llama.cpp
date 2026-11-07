@@ -12,6 +12,7 @@
 #include "exec/mtp_head_file.h"   // a head file without output.weight needs --llama-mtp-vocab
 #include "exec/slot_loan.h"
 #include "core/admission.h"
+#include "core/dory.h"
 #include "core/markers.h"
 
 #ifdef ARCINT_LLAMA
@@ -306,6 +307,7 @@ struct ClCard {
     int         platform = -1;
     int         device   = 0;
     std::string name;
+    uint64_t    mem_bytes = 0;   // CL_DEVICE_GLOBAL_MEM_SIZE: the card's total, not its free memory
 };
 
 ClCard opencl_card_for(const std::string& want) {
@@ -339,6 +341,9 @@ ClCard opencl_card_for(const std::string& want) {
             c.platform = static_cast<int>(i);
             c.device   = gpu;
             c.name     = name;
+            cl_ulong gm = 0;
+            clGetDeviceInfo(ds[static_cast<size_t>(gpu)], CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(gm), &gm, nullptr);
+            c.mem_bytes = gm;
             return c;
         }
         ++seen;
@@ -351,6 +356,17 @@ ClCard opencl_card_for(const std::string& want) {
 const char* card_desc(const char* dev_name) {
     ggml_backend_dev_t d = dev_name != nullptr ? ggml_backend_dev_by_name(dev_name) : nullptr;
     return d != nullptr ? ggml_backend_dev_description(d) : (dev_name != nullptr ? dev_name : "?");
+}
+
+// The GGUF's general.architecture, read from the header before any load; empty when unreadable.
+std::string gguf_architecture(const std::string& path) {
+    gguf_context* g = gguf_init_from_file(path.c_str(), gguf_init_params{ /*no_alloc=*/true, nullptr });
+    if (g == nullptr) return {};
+    std::string   arch;
+    const int64_t ka = gguf_find_key(g, "general.architecture");
+    if (ka >= 0 && gguf_get_kv_type(g, ka) == GGUF_TYPE_STRING) arch = gguf_get_val_str(g, ka);
+    gguf_free(g);
+    return arch;
 }
 
 // The GGUF's <arch>.block_count (MTP layers included): llama.cpp's layer
@@ -635,6 +651,34 @@ public:
             // (llama-mmap.cpp:493): its other weights are faulted on demand
             mp.lazy_mode             = LLAMA_LAZY_MODE_ON;
         }
+        // Dory (a looped nGPT, core/dory.h): refuse the options it cannot run with from the GGUF's
+        // architecture, before the load, and hand libllama the loop count and the recurrent KV
+        // mode the operator named as metadata overrides. Neither flag: the file's own values serve,
+        // read back and reported below.
+        const DoryOptions dory_opt{ cfg.llama_dory_loops, cfg.llama_dory_kv };
+        {
+            const std::string arch_pre = gguf_architecture(cfg.gguf_path);
+            if (const std::string no = dory_option_refusal(arch_pre, cfg.llama_mtp > 0 || !cfg.llama_mtp_gguf.empty(),
+                                                           cfg.llama_dflash_on(), cfg.llama_layer_split > 0, dory_opt);
+                !no.empty())
+                throw std::runtime_error(no);
+            if (arch_pre == "dory" && dory_opt.any()) {
+                auto put = [&](const char* key, llama_model_kv_override_type tag) {
+                    llama_model_kv_override o{};
+                    o.tag = tag;
+                    std::snprintf(o.key, sizeof(o.key), "%s", key);
+                    kv_overrides_.push_back(o);
+                    return &kv_overrides_.back();
+                };
+                kv_overrides_.reserve(3);
+                if (dory_opt.loops > 0) put("dory.num_loops", LLAMA_KV_OVERRIDE_TYPE_INT)->val_i64 = dory_opt.loops;
+                if (!dory_opt.kv_mode.empty())
+                    std::snprintf(put("dory.recurrent_kv_cache_mode", LLAMA_KV_OVERRIDE_TYPE_STR)->val_str,
+                                  sizeof(kv_overrides_.back().val_str), "%s", dory_opt.kv_mode.c_str());
+                kv_overrides_.push_back(llama_model_kv_override{});   // the terminator: an empty key
+                mp.kv_overrides = kv_overrides_.data();
+            }
+        }
         const auto t_load     = clock_type::now();
         model_                = llama_model_load_from_file(cfg.gguf_path.c_str(), mp);
         if (model_ == nullptr)
@@ -708,7 +752,13 @@ public:
         // function that is unit-tested with no model. The geometry's key length
         // is the architecture's own metadata key (absent: 0).
         ModelGeometry geometry;
+        // a looped model's llama_model_n_layer is the executed count (112 at 2 loops, 192 at 4):
+        // admission matches the physical blocks, the file's block_count (contrib/llama.cpp 0108)
+#ifdef ARCINT_LLAMA_DORY
+        geometry.n_layer   = a == "dory" ? llama_model_n_layer_physical(model_) : llama_model_n_layer(model_);
+#else
         geometry.n_layer   = llama_model_n_layer(model_);
+#endif
         geometry.n_embd    = llama_model_n_embd(model_);
         geometry.n_head    = llama_model_n_head(model_);
         geometry.n_head_kv = llama_model_n_head_kv(model_);
@@ -731,6 +781,36 @@ public:
         // token-id /v1/completions route.
         llama2_7b_ = admitted == AdmittedModel::Llama2_7B;
         dialect_   = dialect_of(admitted);
+#ifdef ARCINT_LLAMA_DORY
+        if (admitted == AdmittedModel::Dory1_0_4B) {
+            // the effective loop count and KV mode: the flag, else the file's value read back from
+            // the loaded model's metadata (an override is not shown there), else libllama's default
+            auto meta_str = [&](const std::string& key) {
+                char buf[512] = {};
+                return llama_model_meta_val_str(model_, key.c_str(), buf, sizeof(buf)) >= 0 ? std::string(buf) : std::string();
+            };
+            auto meta_int = [&](const std::string& key) { return std::atoi(meta_str(key).c_str()); };
+            DoryGguf dg;
+            dg.n_input     = meta_int(a + ".input_layer_count");
+            dg.n_recurrent = meta_int(a + ".recurrent_layer_count");
+            dg.n_output    = meta_int(a + ".output_layer_count");
+            dg.loops       = meta_int(a + ".num_loops");
+            dg.kv_mode     = meta_str(a + ".recurrent_kv_cache_mode");
+            dg.pattern     = meta_str(a + ".layer_pattern");
+            DoryServed ds;
+            if (const std::string no = dory_resolve(dg, dory_opt, ds); !no.empty()) throw std::runtime_error(no);
+            // the layers libllama built must be the ones the loop count implies: a loop count that
+            // did not take effect is a refusal, never a quiet fallback to the file's
+            if (const std::string no = dory_check_loaded(ds, llama_model_n_layer(model_), llama_model_n_layer_physical(model_));
+                !no.empty())
+                throw std::runtime_error(no);
+            status_.dory_present = true;
+            status_.dory         = ds;
+        }
+#else
+        if (admitted == AdmittedModel::Dory1_0_4B)
+            throw std::runtime_error("a dory model: this build's llama.cpp lacks contrib/llama.cpp patch 0108");
+#endif
         // Gemma 4 speaks its own reasoning channel and tool-call form. --tool-grammar
         // constrains the Qwen call form, so on this model it would constrain the
         // output to a syntax the model does not use: refused at start.
@@ -862,8 +942,46 @@ public:
             cp.n_ubatch_reserve  = slot_loan::floor_chunk(loan_chunk_, loan_rule_);
         }
 #endif
+#ifdef ARCINT_LLAMA_DORY
+        if (status_.dory_present) {
+            // forecast the cache against the card before the allocation: the default context of 32768
+            // cells at f16 is about 12 GiB over 96 layers, which the A770 cannot hold with the weights
+            const std::uint64_t kvb = dory_kv_bytes(status_.dory.kv_layers, 4, 256, pool, cfg.llama_kv_k, cfg.llama_kv_v);
+            if (const std::string w = dory_fit_warning(kvb, llama_model_size(model_), cards[0].mem_bytes, pool,
+                                                       status_.dory.kv_layers, cfg.llama_kv_k, cfg.llama_kv_v);
+                !w.empty())
+                log::warn("load", "%s", w.c_str());
+        }
+#endif
         ctx_               = llama_init_from_model(model_, cp);
         if (ctx_ == nullptr) throw std::runtime_error("llama.cpp could not create a context");
+#ifdef ARCINT_LLAMA_DORY
+        if (status_.dory_present) {
+            // what libllama built, counted: the KV cache layers of a throwaway 256-cell context (the
+            // layer set does not depend on the size), by the cache tensors of a reserved graph. The
+            // flag's echo is not the proof; this is
+            llama_context_params tp = llama_context_default_params();
+            tp.n_ctx           = 256;
+            tp.n_batch         = 8;
+            tp.n_ubatch        = 8;
+            tp.n_seq_max       = 1;
+            tp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+            tp.type_k          = cp.type_k;
+            tp.type_v          = cp.type_v;
+            llama_context* tctx = llama_init_from_model(model_, tp);
+            if (tctx == nullptr) throw std::runtime_error("dory: could not create the context that counts the KV cache layers");
+            int built = 0;
+            if (ggml_cgraph* gr = llama_graph_reserve(tctx, 8, 1, 8)) {
+                for (int il = 0; il < status_.dory.executed_layers; ++il) {
+                    const std::string nm = "cache_k_l" + std::to_string(il);
+                    if (ggml_graph_get_tensor(gr, nm.c_str()) != nullptr) ++built;
+                }
+            }
+            llama_free(tctx);
+            if (const std::string no = dory_check_kv(status_.dory, built); !no.empty()) throw std::runtime_error(no);
+            log::info("load", "%s", dory_boot_line(status_.dory).c_str());
+        }
+#endif
         // llama.cpp pads the context to 256 (llama-context.cpp:291); the caps
         // are multiples of 256 (config.cpp), so a pool of any other size is a
         // context this engine did not ask for
@@ -1041,7 +1159,8 @@ public:
         status_.loaded      = true;
         status_.n_ctx       = n_ctx_;
         status_.n_ctx_train = llama_model_n_ctx_train(model_);
-        status_.n_layer     = llama_model_n_layer(model_);
+        // a looped model reports the weights' blocks here and the executed layers under /props "dory"
+        status_.n_layer     = status_.dory_present ? status_.dory.physical_layers : llama_model_n_layer(model_);
         status_.weights_bytes = llama_model_size(model_);
         status_.kv_precision  = llama_kv_dtype(cfg);
         status_.arch          = arch;
@@ -2863,6 +2982,9 @@ private:
     // --llama-cpu-moe's tensor patterns, alive for the load
     std::vector<std::string>                       cpu_moe_patterns_;
     std::vector<llama_model_tensor_buft_override> buft_overrides_;
+    // --llama-dory-loops / --llama-dory-kv as metadata overrides of the load (libllama's
+    // model-loader reads them in place of the file's value); zero-terminated, kept for the load
+    std::vector<llama_model_kv_override>          kv_overrides_;
     llama_model*                          model_ = nullptr;
     llama_model*                          mtp_model_ = nullptr;   // --llama-mtp-gguf
     llama_model*                          dflash_model_ = nullptr;   // --llama-dflash-gguf

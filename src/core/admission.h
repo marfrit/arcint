@@ -30,6 +30,7 @@ enum class AdmittedModel {
     Llama2_7B,        // 'llama', 32 x 4096, 32/32 heads
     Gemma4E4B,        // 'gemma4', 42 x 2560, 8/2 heads, key length 512
     Granite8B,        // 'granite', see admission.cpp
+    Dory1_0_4B,       // 'dory', 72 physical blocks x 2560, 16/4 heads, key length 256 (core/dory.h)
     Qwen3Tts,         // only under --tts
 };
 

@@ -13,7 +13,7 @@ This is a catalogue of the engine concepts arcint implements for inference on In
 - "The unit" or "the unit's flags" is one served configuration, a service and its command-line flags and environment as shipped in [`contrib/systemd/arcint-*.service`](../contrib/systemd/) (agent, coder, Flash-Next, writer and the others); a measurement "with the unit's flags" ran those flags. A "real-time factor" (RTF) is seconds of audio produced divided by seconds of process time, so higher is better and 1.0 is real time; "the operator" is the project owner, whose decisions are dated where the source dates them. A "window" is one measurement session on the cards; numbers from a window are only compared with numbers from the same window. Each entry carries two fields beside the effect: *Applies to* (which card generation or sub-group size, which weight types and shape limits) and *Default* (on, opt-in or off, and what sets it).
 - A campaign document is cited as "(on the `qfndev` branch)"; each entry is written to be complete without following it.
 
-**Contents.** 1 Integer DPAS and dot-product kernels; 2 Low-bit and codebook weight types; 3 Expert routing and expert GEMM tiles; 4 Expert cache and bank; 5 Prefill: bank streaming, dispatch by token count, memory lending; 6 Attention at depth; 7 GatedDeltaNet and recurrent state; 8 Graph launches, placement and transfers; 9 Speculative decoding; 10 Lanes and windows in one KV pool; 11 Serving and device hygiene; 12 Image and speech; then the index of references and the section on what was tried and not adopted.
+**Contents.** 1 Integer DPAS and dot-product kernels; 2 Low-bit and codebook weight types; 3 Expert routing and expert GEMM tiles; 4 Expert cache and bank; 5 Prefill: bank streaming, dispatch by token count, memory lending; 6 Attention at depth; 7 GatedDeltaNet and recurrent state; 8 Graph launches, placement and transfers; 9 Speculative decoding; 10 Lanes and windows in one KV pool; 11 Serving and device hygiene; 12 Image and speech; 13 Weight-shared and looped architectures; then the index of references and the section on what was tried and not adopted.
 
 ## 1. Integer DPAS and dot-product kernels for quantized weights
 
@@ -873,6 +873,30 @@ Qwen3-TTS's code predictor runs a small graph per frame. On the B60 the predicto
 - **Location:** `tools/mtmd` in the pinned tree (`tools/mtmd/clip.cpp`); arcint side `--tts-gen-device`.
 - **Switch:** `--tts-gen-device cpu|gpu`.
 - **Source:** arcint's own (campaign `qwen3tts-card-real-time`, on the `qfndev` branch).
+
+## 13. Weight-shared and looped architectures
+
+Models that run the same weights more than once per token. Admitted 2026-11-07; neither entry has run on a card yet.
+
+### Physical blocks and executed layers kept apart (a looped nGPT)
+
+Dory1.0-4B stores 72 blocks (16 input, 40 recurrent, 16 output) and runs the 40 recurrent ones `num_loops` times (4 in the file), so the graph has 192 layers over one set of weights. The model keeps two counts. Weight placement, the offload fit and the quantizer count the physical blocks; the graph, the KV cache and the layer count the API reports count the executed layers, and a virtual-to-physical table maps one to the other. The tensors of a recurrent block are created once and every executed layer of it points at the same ones. The recurrent KV is either one cache a loop and layer (`per_loop`) or one a layer that each loop overwrites (`last_loop`, where a token's state then depends on the chunk boundaries of its prefill). In an engine that admits models by geometry, admit on the physical count: the executed count changes with the operator's loop setting.
+- **Effect:** Not measured. `code` only: 317 added lines on the pin plus the series; the graph agrees with vLLM's implementation on the normalisation, the slerp residual, the gates and the loop seed.
+- **Applies to:** Any architecture that repeats a block range; here Dory1.0-4B, 1 to 4 loops. Refused with MTP, DFlash2 and the layer split.
+- **Default:** The file's own loop count and KV mode; `--llama-dory-loops` and `--llama-dory-kv` override, and `/props` `dory` names the value that serves and its source. A start whose reported layer count disagrees with the loop count fails.
+- **Location:** `src/models/dory.cpp`, `llama_model_dory`, `n_layer_physical`, `layer_physical`; `src/llama-model.cpp` (`load_tensors`, `create_memory`'s layer filter); `llama_model_n_layer_physical` in `src/llama-ext.h`. (0108) arcint: `src/core/dory.cpp`, `dory_resolve`, `dory_check_loaded`, `dory_option_refusal`; `src/core/admission.cpp`, `is_dory_4b`; `src/exec/backend_llama.cpp` (the metadata overrides `dory.num_loops` and `dory.recurrent_kv_cache_mode`).
+- **Switch:** `--llama-dory-loops N`, `--llama-dory-kv per_loop|last_loop`.
+- **Source:** llama.cpp pull request 30306 (open, head `1c3cdd23`), cross-read against vLLM's `models/dory.py`.
+
+### A BF16 source for the device copy, so the casts of per-channel scales stay on the card
+
+A model whose small scale vectors are stored in BF16 casts each one to F32 in the graph. If the backend refuses a BF16 source, the loader places that tensor in a CPU buffer and the scheduler splits the graph around it, once per scale (217 in Dory). On OpenCL a BF16 tensor is already held as F16 on the device (the upload converts it), so the copy kernels read it as F16 and `supports_op` lists the pair: no new kernel.
+- **Effect:** Not measured. `inferred`: the splits go from hundreds a forward to none from these tensors; CUDA's same failure cost 3.1x in the upstream discussion (`paper`). The card measurement (`GGML_SCHED_DEBUG=1` split count, served t/s, KL) is owed.
+- **Applies to:** `CPY`, `DUP`, `CONT` from BF16 to F32 or F16 on the OpenCL backend; both cards.
+- **Default:** On.
+- **Location:** `ggml/src/ggml-opencl/ggml-opencl.cpp`, `supports_op` (`GGML_OP_CPY`) and `ggml_cl_cpy`; test `tests/test-backend-ops.cpp`, `test_cpy` with BF16 sources at 2560, 4096, 7168 and 2560 x 256. (0109)
+- **Switch:** none.
+- **Source:** arcint's own, after the same fix on CUDA in the pull request above.
 
 ## Where the ideas came from
 
