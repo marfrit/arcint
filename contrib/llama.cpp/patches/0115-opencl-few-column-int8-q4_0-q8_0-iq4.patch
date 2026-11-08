@@ -5,11 +5,11 @@ Subject: [PATCH] 0115-opencl-few-column-int8-q4_0-q8_0-iq4
 
 ---
  ggml/src/ggml-opencl/CMakeLists.txt            |   1 +
- ggml/src/ggml-opencl/ggml-opencl.cpp           | 403 ++++++++++++++++++++++++-
- ggml/src/ggml-opencl/kernels/mul_mm_few_i8.cl  | 364 ++++++++++++++++++++++
+ ggml/src/ggml-opencl/ggml-opencl.cpp           | 422 ++++++++++++++++++++++++-
+ ggml/src/ggml-opencl/kernels/mul_mm_few_i8.cl  | 364 +++++++++++++++++++++
  ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl |  53 ++++
  tests/test-backend-ops.cpp                     |  42 +++
- 5 files changed, 854 insertions(+), 9 deletions(-)
+ 5 files changed, 873 insertions(+), 9 deletions(-)
 
 diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
 index 685210db6..4f1ecc351 100644
@@ -24,7 +24,7 @@ index 685210db6..4f1ecc351 100644
      mul_mm_q40_i8_sg8
      mul_mm_id_i8_sg8
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 962bb088d..7f8fcff2f 100644
+index 962bb088d..5d25e78e6 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -889,7 +889,7 @@ struct ggml_backend_opencl_context {
@@ -68,7 +68,7 @@ index 962bb088d..7f8fcff2f 100644
      cl_kernel kernel_mul_mm_q40_f16       = nullptr;
      cl_kernel kernel_mul_mm_kq2d_q40      = nullptr;   // Xe2: Q4_0 on 2D block loads, fp16
      cl_kernel kernel_mul_mm_kq2d_q40_i8   = nullptr;   // and on int8 DPAS
-@@ -1293,6 +1300,18 @@ struct ggml_backend_opencl_context {
+@@ -1293,6 +1300,20 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_mul_mm_few_kq[2][3] = {};
      cl_kernel kernel_mul_mm_few_prep[2]  = {};
      int       kq_few_sg = 16, kq_few_nk = 4, kq_few_min = 2;
@@ -82,12 +82,14 @@ index 962bb088d..7f8fcff2f 100644
 +    int       fewq_sg = 16, fewq_nk = 4, fewq_r[2] = { 1, 1 }, fewq_min_t[4] = { 2, 2, 3, 3 }, fewq_max_t[4] = { 15, 16, 16, 16 };
 +    size_t    fewq_min_bytes = 6u << 20;
 +    int       fewq_log = 0;
-+    // per graph: the products that would share one activation prep, by its buffer and offset (ggml_cl_fewq_prepass)
-+    std::map<std::pair<cl_mem, cl_ulong>, int> fewq_uses;
++    // per graph: the products that would share one activation prep, by the activation tensor (ggml_cl_fewq_prepass);
++    // a flattened 3-D src1 is a stack copy, fewq_flat_tmp, of fewq_flat_orig
++    std::unordered_map<const ggml_tensor *, int> fewq_uses;
++    const ggml_tensor * fewq_flat_tmp = nullptr, * fewq_flat_orig = nullptr;
      cl_kernel kernel_mul_mv_q5_K_f32;
      cl_kernel kernel_mul_mv_q5_K_f32_flat;
      cl_kernel kernel_mul_mv_q6_K_f32;
-@@ -2589,9 +2608,16 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2589,9 +2610,16 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                  // GGML_OPENCL_IQ_OPTS: defines added to these builds (measurement)
                  const char * iq_opts_env = getenv("GGML_OPENCL_IQ_OPTS");
                  const std::string iq_extra_opts = iq_opts_env != nullptr ? std::string(" ") + iq_opts_env : std::string();
@@ -105,7 +107,7 @@ index 962bb088d..7f8fcff2f 100644
                          iq_extra_opts;   // the IQ4 codebook in local memory on every card (0035; -DIQ4_KV_SELECT: the A770's selects before)
                      cl_program prog = build_program_from_source_optional(backend_ctx, iq_src.c_str(), opts);
                      if (prog == nullptr) {
-@@ -2599,6 +2625,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2599,6 +2627,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                          continue;
                      }
                      CL_CHECK((backend_ctx->kernel_mul_mv_q40_q8_1[nc - 1] = clCreateKernel(prog, "kernel_mul_mv_q4_0_q8_1", &err), err));
@@ -115,7 +117,7 @@ index 962bb088d..7f8fcff2f 100644
                      for (int i = 0; i < 9; ++i) {
                          CL_CHECK((backend_ctx->kernel_mul_mv_kq_q8_1[nc - 1][3 + i] = clCreateKernel(prog, iq_n[i], &err), err));
                          if (nc == 1) {
-@@ -2678,6 +2707,89 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2678,6 +2709,89 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                  }
              }
  
@@ -205,7 +207,7 @@ index 962bb088d..7f8fcff2f 100644
              // Alchemist: Q4_0 on int8 DPAS with packed activations (mul_mm_q40_i8_sg8.cl).
              // Its own program: a failure leaves 0096's tile. GGML_OPENCL_Q40_SG8_SHAPE =
              // "TMM,WG" overrides the shape.
-@@ -11389,6 +11501,8 @@ static void ggml_cl_ngpt_fused(ggml_backend_t backend, ggml_tensor * const * n)
+@@ -11389,6 +11503,8 @@ static void ggml_cl_ngpt_fused(ggml_backend_t backend, ggml_tensor * const * n)
      backend_ctx->enqueue_ndrange_kernel(k, 1, gws, lws, y);
  }
  
@@ -214,7 +216,7 @@ index 962bb088d..7f8fcff2f 100644
  static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
      backend_ctx->graph_gen++;
-@@ -11400,6 +11514,7 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+@@ -11400,6 +11516,7 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                        backend_ctx->device_name.c_str(), (long long) backend_ctx->f16_copy_n, backend_ctx->f16_copy_bytes / (1024.0 * 1024.0));
      }
      ggml_cl_gdn_gate_prepass(backend_ctx, cgraph);
@@ -222,7 +224,7 @@ index 962bb088d..7f8fcff2f 100644
      backend_ctx->ngpt_fused = backend_ctx->ngpt_refused = backend_ctx->ngpt_inplace = 0;
  
      for (int i = 0; i < cgraph->n_nodes; i++) {
-@@ -29402,7 +29517,7 @@ static bool ggml_cl_kq_cached(const ggml_cl_kq_act & c, const ggml_backend_openc
+@@ -29402,7 +29519,7 @@ static bool ggml_cl_kq_cached(const ggml_cl_kq_act & c, const ggml_backend_openc
  // product (the slots are keyed by the tensor, its buffer, offset and size in this graph)
  static void ggml_cl_kq_forget(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * tmp) {
      for (ggml_cl_kq_act * a : { &backend_ctx->kq_q8, &backend_ctx->kq_f16, &backend_ctx->kq_few, &backend_ctx->kq_i8,
@@ -231,7 +233,7 @@ index 962bb088d..7f8fcff2f 100644
          if (a->src1 == tmp) {
              *a = {};
          }
-@@ -29721,7 +29836,7 @@ static bool ggml_cl_mul_mv_kq_q8_1(ggml_backend_opencl_context * backend_ctx, co
+@@ -29721,7 +29838,7 @@ static bool ggml_cl_mul_mv_kq_q8_1(ggml_backend_opencl_context * backend_ctx, co
      static const bool   mv_on  = mv_env == nullptr || atoi(mv_env) != 0;
      const int ti = ggml_cl_kq_type_index(src0->type);
      const int ncols = (int)(src1->ne[1] * src1->ne[2] * src1->ne[3]);
@@ -240,7 +242,7 @@ index 962bb088d..7f8fcff2f 100644
          return false;
      }
      cl_kernel kernel = backend_ctx->kernel_mul_mv_kq_q8_1[ncols - 1][ti];
-@@ -29786,7 +29901,8 @@ static bool ggml_cl_mul_mm_kq_few(ggml_backend_opencl_context * backend_ctx, con
+@@ -29786,7 +29903,8 @@ static bool ggml_cl_mul_mm_kq_few(ggml_backend_opencl_context * backend_ctx, con
          backend_ctx->prealloc_kq_fa.allocate(backend_ctx->context, (size_t)tok * ne00 * sizeof(cl_half));
          backend_ctx->prealloc_kq_fs.allocate(backend_ctx->context, (size_t)(ne00 / 16) * tok * sizeof(float));
          backend_ctx->prealloc_kq_fc.allocate(backend_ctx->context, (size_t)(ne00 / 32) * tok * sizeof(float));
@@ -250,7 +252,7 @@ index 962bb088d..7f8fcff2f 100644
          CL_CHECK(clSetKernelArg(kp, 0, sizeof(cl_mem),   &extra1->data_device));
          CL_CHECK(clSetKernelArg(kp, 1, sizeof(cl_ulong), &offset1));
          CL_CHECK(clSetKernelArg(kp, 2, sizeof(cl_ulong), &nbx));
-@@ -29819,6 +29935,254 @@ static bool ggml_cl_mul_mm_kq_few(ggml_backend_opencl_context * backend_ctx, con
+@@ -29819,6 +29937,269 @@ static bool ggml_cl_mul_mm_kq_few(ggml_backend_opencl_context * backend_ctx, con
      return true;
  }
  
@@ -276,11 +278,12 @@ index 962bb088d..7f8fcff2f 100644
 +    }
 +}
 +
-+// ARC-LAB 0115: the key of an activation prep: src1's buffer and offset (a flattened 3-D src1 is a stack copy
-+// with the same ones)
-+static std::pair<cl_mem, cl_ulong> ggml_cl_fewq_key(const ggml_tensor * src1) {
-+    const ggml_tensor_extra_cl * e = (const ggml_tensor_extra_cl *) src1->extra;
-+    return { e->data_device, e->offset + src1->view_offs };
++// ARC-LAB 0115: the key of an activation prep: the activation tensor. Not its buffer and offset: the graph
++// allocator gives every layer's activation the same offset, so a key by offset counted the coder's 40 layers'
++// gate / up as 80 products sharing one prep (measured-here: the tuned build's coder texts still moved). A
++// flattened 3-D src1 is a stack copy and maps back to the graph's tensor.
++static const ggml_tensor * ggml_cl_fewq_key(const ggml_backend_opencl_context * ctx, const ggml_tensor * src1) {
++    return src1 == ctx->fewq_flat_tmp && ctx->fewq_flat_orig != nullptr ? ctx->fewq_flat_orig : src1;
 +}
 +
 +// ARC-LAB 0115: a graph's products that would take the int8 few-column kernel, counted by the activation
@@ -294,13 +297,13 @@ index 962bb088d..7f8fcff2f 100644
 +    for (int i = 0; i < cgraph->n_nodes; ++i) {
 +        const ggml_tensor * n = cgraph->nodes[i];
 +        const ggml_tensor * a = n->src[0], * b = n->src[1];
-+        if (n->op != GGML_OP_MUL_MAT || a == nullptr || b == nullptr || b->extra == nullptr || b->type != GGML_TYPE_F32 ||
++        if (n->op != GGML_OP_MUL_MAT || a == nullptr || b == nullptr || b->type != GGML_TYPE_F32 ||
 +            ggml_cl_fewq_index(a->type) < 0 || a->ne[2] != 1 || a->ne[3] != 1) {
 +            continue;
 +        }
 +        const int64_t c = b->ne[1] * b->ne[2] * b->ne[3];
 +        if (c >= 2 && c <= 16) {
-+            ctx->fewq_uses[ggml_cl_fewq_key(b)]++;
++            ctx->fewq_uses[b]++;
 +        }
 +    }
 +}
@@ -339,26 +342,40 @@ index 962bb088d..7f8fcff2f 100644
 +    if ((src0->ne[0] / 32 + 7) / 8 < ctx->fewq_nk) {
 +        return true;
 +    }
-+    int uses = 1;
-+    if (src1->extra != nullptr) {
-+        const auto it = ctx->fewq_uses.find(ggml_cl_fewq_key(src1));
-+        uses = it != ctx->fewq_uses.end() ? std::max(1, it->second) : 1;
-+    }
++    const auto it = ctx->fewq_uses.find(ggml_cl_fewq_key(ctx, src1));
++    const int uses = it != ctx->fewq_uses.end() ? std::max(1, it->second) : 1;
 +    return (double) ggml_nbytes(src0) * uses < (double) ctx->fewq_min_bytes;
 +}
 +
-+// ARC-LAB 0115: GGML_OPENCL_FEWQ_LOG=2: each shape and the path it took, once
++// ARC-LAB 0115: GGML_OPENCL_FEWQ_LOG=2: each shape, the weight's name and the path it took, once, at warn level
++// (a server that shows ggml's info lines only when verbose, as arcint does, still shows these); and
++// GGML_OPENCL_FEWQ_TRACE=<file>: the same lines appended to that file by the backend, at any log level
 +static void ggml_cl_fewq_trace(const ggml_backend_opencl_context * ctx, const ggml_tensor * src0, int ncols, const char * path) {
-+    if (ctx->fewq_log < 2) {
++    static const char * trace_path = getenv("GGML_OPENCL_FEWQ_TRACE");
++    if (ctx->fewq_log < 2 && (trace_path == nullptr || trace_path[0] == '\0')) {
 +        return;
 +    }
 +    static std::mutex mu;
 +    static std::set<std::string> seen;
-+    char b[160];
-+    snprintf(b, sizeof(b), "%s k=%d m=%d x %d columns: %s", ggml_type_name(src0->type), (int) src0->ne[0], (int) src0->ne[1], ncols, path);
++    static FILE * trace = nullptr;
++    char b[256];
++    snprintf(b, sizeof(b), "%s k=%d m=%d x %d columns (%s): %s", ggml_type_name(src0->type), (int) src0->ne[0], (int) src0->ne[1], ncols,
++             src0->name[0] != '\0' ? src0->name : (src0->view_src != nullptr ? src0->view_src->name : "?"), path);
 +    std::lock_guard<std::mutex> lock(mu);
-+    if (seen.insert(b).second) {
-+        GGML_LOG_INFO("ggml_opencl: few-column int8 product: %s\n", b);
++    if (!seen.insert(b).second) {
++        return;
++    }
++    if (ctx->fewq_log >= 2) {
++        GGML_LOG_WARN("ggml_opencl: few-column int8 product: %s\n", b);
++    }
++    if (trace_path != nullptr && trace_path[0] != '\0') {
++        if (trace == nullptr) {
++            trace = fopen(trace_path, "a");
++        }
++        if (trace != nullptr) {
++            fprintf(trace, "%s\n", b);
++            fflush(trace);
++        }
 +    }
 +}
 +
@@ -505,7 +522,7 @@ index 962bb088d..7f8fcff2f 100644
  // ARC-LAB 0099/0102: Alchemist: the activations as int8 once a graph, packed for block reads
  static void ggml_cl_quant_i8_sg8(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src1, ggml_tensor_extra_cl * extra1,
                                   cl_ulong offset1, int k, int ncols, int tp, const ggml_tensor * dst) {
-@@ -29943,6 +30307,7 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
+@@ -29943,6 +30324,7 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
          const int ne00 = (int)src0->ne[0], ne01 = (int)src0->ne[1], nbk = ne00 / 256;
          const int narrow = ti == 0 ? 128 : ti == 1 ? 32 : 16;   // the narrowest plane's bytes a block
          if (nbk * narrow >= 64 && ne00 * 2 >= 64 && ncols < (1 << 24) && ne01 < (1 << 24) && ne00 < (1 << 23)) {
@@ -513,7 +530,7 @@ index 962bb088d..7f8fcff2f 100644
              cl_kernel k2 = backend_ctx->kernel_mul_mm_kq2d[ti];
              ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
              const cl_ulong offsetd = extrad->offset + dst->view_offs;
-@@ -30012,6 +30377,7 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
+@@ -30012,6 +30394,7 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
      if (kernel == nullptr) {
          return false;
      }
@@ -521,7 +538,7 @@ index 962bb088d..7f8fcff2f 100644
      const int ne00 = (int)src0->ne[0];
      const int ne01 = (int)src0->ne[1];
      ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-@@ -30068,7 +30434,7 @@ static bool ggml_cl_mul_mat_q4_0_xmx(ggml_backend_opencl_context * backend_ctx,
+@@ -30068,7 +30451,7 @@ static bool ggml_cl_mul_mat_q4_0_xmx(ggml_backend_opencl_context * backend_ctx,
      const cl_ulong offsetd = extrad->offset + dst->view_offs;
      const cl_ulong nb1     = dst->nb[1];
      const cl_ulong off0    = 0;
@@ -530,7 +547,7 @@ index 962bb088d..7f8fcff2f 100644
          cl_kernel k = backend_ctx->kernel_mul_mv_q40_q8_1[ncols - 1];
          if (k == nullptr) {
              return false;
-@@ -30391,13 +30757,22 @@ static void ggml_cl_downgrade_gemm(const ggml_backend_opencl_context * backend_c
+@@ -30391,13 +30774,22 @@ static void ggml_cl_downgrade_gemm(const ggml_backend_opencl_context * backend_c
  }
  
  // ... and on the per-column matvec with enough columns for a GEMM: below 32 the generic switch
@@ -554,7 +571,17 @@ index 962bb088d..7f8fcff2f 100644
      }
  }
  
-@@ -30494,6 +30869,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -30484,7 +30876,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+             ggml_tensor s1 = *src1, d = *dst;
+             s1.ne[1] = fc; s1.ne[2] = s1.ne[3] = 1; s1.nb[2] = s1.nb[3] = fc * s1.nb[1];
+             d.ne[1]  = fc; d.ne[2]  = d.ne[3]  = 1; d.nb[2]  = d.nb[3]  = fc * d.nb[1];
++            backend_ctx->fewq_flat_tmp = &s1; backend_ctx->fewq_flat_orig = src1;   // 0115: the prep count's key
+             ggml_cl_mul_mat(backend, src0, &s1, &d);
++            backend_ctx->fewq_flat_tmp = backend_ctx->fewq_flat_orig = nullptr;
+             ggml_cl_kq_forget(backend_ctx, &s1);
+             return;
+         }
+@@ -30494,6 +30888,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
          return;
      }
  
@@ -569,7 +596,7 @@ index 962bb088d..7f8fcff2f 100644
      // Intel: F16 / BF16 weights times 16 or more columns (a prompt) on the XMX
      // tiles of the K-quant GEMM; GGML_OPENCL_F16_XMX=0 keeps the tiled GEMM
      {
-@@ -31799,6 +32182,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -31799,6 +32201,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                  GGML_ASSERT(ne01 == ne0);
  
                  if (backend_ctx->gpu_family == INTEL) {
@@ -577,7 +604,7 @@ index 962bb088d..7f8fcff2f 100644
                      nth0 = 16;
                      nth1 = 1;
  
-@@ -32157,6 +32541,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -32157,6 +32560,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
  
  #ifdef GGML_OPENCL_SOA_Q
              if (backend_ctx->gpu_family == INTEL) {
