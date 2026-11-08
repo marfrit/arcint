@@ -547,7 +547,7 @@ bool Stream::run(const Context& ctx, int slot) {
     if (!send(json{{"type", "response.in_progress"}, {"response", created}})) return false;
 
     // The chat route's streamer, over the same (piece, id) sequence.
-    reasoning_ = ReasoningStreamer(prep_.think_open, prep_.dialect,
+    reasoning_ = ReasoningStreamer(prep_.think_start(), prep_.dialect,
                                    prep_.think_ids.open_close_ids);
     // W6b: token mode's spans read the same ids the streamer and the parser
     // use; the off path leaves every field false/empty.

@@ -23,13 +23,39 @@ struct ReasoningSplit {
     bool        closed = false;   // the block's closer was seen; false = the model never left the block
 };
 
-// `think_open`: the rendered prompt ended inside the Qwen think block.
-// When it did not, a block the model opens itself at the very start is
+// Where the rendered prompt leaves the model with respect to the think block.
+//   Undecided  no block at the prompt's end: the model may open one itself
+//   Open       the prompt ended inside the block (the Qwen templates, thinking on)
+//   Closed     the prompt ended right after a block the template closed (the
+//              Qwen templates' empty block with thinking off, Dory's too)
+// Converts from bool for the callers that predate Closed: true meant Open.
+//
+// After a closed block, whichever closed it (the template, or the model with
+// thinking on), the answer's lead is layout: its line breaks are dropped, and
+// so is a closer the model repeats there. A fine-tune that writes the closer
+// once more after the template's (measured: thinking off, the answer began
+// with it) would otherwise put it into content. A closer later in the answer,
+// away from the lead, is text the model wrote and stays content: the stream
+// cannot take back bytes it has sent, and both paths must agree.
+struct ThinkStart {
+    enum Kind : unsigned char { Undecided, Open, Closed };
+    Kind kind = Undecided;
+
+    constexpr ThinkStart() = default;
+    constexpr ThinkStart(Kind k) : kind(k) {}
+    constexpr ThinkStart(bool open) : kind(open ? Open : Undecided) {}
+    constexpr bool open() const { return kind == Open; }
+    constexpr bool closed() const { return kind == Closed; }
+};
+
+// `start`: where the rendered prompt left the model (ThinkStart). Open: the
+// rendered prompt ended inside the Qwen think block.
+// Otherwise a block the model opens itself at the very start is
 // honoured too: the same opener, and under the Extended dialect also the angle-bracket opener (Cydonia 24B) or
 // the square-bracket opener (Magistral tunes), each closed only by its
 // own closer. Under Gemma4 the only opener is that model's thought channel;
 // a template-opened block closes on the dialect's first pair.
-ReasoningSplit split_reasoning(std::string_view raw, bool think_open, ChatDialect dialect = {});
+ReasoningSplit split_reasoning(std::string_view raw, ThinkStart start, ChatDialect dialect = {});
 
 // The lead of a generated text: everything from its first non-blank
 // character, where blank is a space or a newline. A model may pad before a
@@ -54,7 +80,7 @@ enum class TokenField { Reasoning, Text };
 
 class ReasoningStreamer {
 public:
-    explicit ReasoningStreamer(bool think_open, ChatDialect dialect = {},
+    explicit ReasoningStreamer(ThinkStart start, ChatDialect dialect = {},
                                const std::vector<std::pair<int, int>>& open_close_ids = {});
     struct Step {
         std::string reasoning;
@@ -82,15 +108,25 @@ private:
     bool             closed_   = false;
     // The block just closed and the answer has not started: the line breaks
     // between the closer and the answer are layout and are dropped, as the
-    // non-streaming split drops them.
+    // non-streaming split drops them, and so is a repeated closer (ThinkStart).
+    // The bytes of a lead not decided yet wait in buffer_.
     bool             content_start_ = false;
+    // ThinkStart::Closed and nothing decided yet: a closer at the lead is the
+    // template's, repeated, and is dropped before the opener rule runs.
+    bool             after_close_ = false;
+    // A repeated closer was dropped before the answer: the answer's leading
+    // line breaks are layout too (the undecided path keeps them otherwise).
+    bool             drop_newlines_ = false;
+
+    Step lead_after_close_(std::string_view piece, int token_id);
+    bool is_close_id_(int token_id) const;
 };
 
 // The non-streaming split driven by the same (piece, id) sequence the streamer
 // takes, so the two paths cannot disagree: a closer spelled from ordinary
 // tokens stays reasoning, the special-token closer ends the block.
 ReasoningSplit split_reasoning_tokens(const std::vector<std::pair<std::string, int>>& pieces,
-                                      bool think_open, ChatDialect dialect,
+                                      ThinkStart start, ChatDialect dialect,
                                       const std::vector<std::pair<int, int>>& open_close_ids);
 
 // The tag family the split honours, in the order it tries them: the Qwen pair;

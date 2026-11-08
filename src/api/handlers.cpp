@@ -42,6 +42,15 @@ bool prompt_ends_inside_think_block(std::string_view prompt, ChatDialect dialect
     return false;
 }
 
+bool prompt_ends_after_think_block(std::string_view prompt, ChatDialect dialect) {
+    // The layout after the closer is the template's, not part of the tag.
+    while (!prompt.empty() && (prompt.back() == '\n' || prompt.back() == ' ')) prompt.remove_suffix(1);
+    for (const auto& [open, close] : think_tag_pairs(dialect)) {
+        if (prompt.ends_with(close)) return true;
+    }
+    return false;
+}
+
 // The decode line's conditional terms, extracted from log_stats (review B4
 // follow-up) so the stats wiring is unit-testable at the struct level: the
 // value decode_suffix_for returns is the one that lands on the line.
@@ -943,6 +952,9 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
     // split of reasoning from content below follows that, not a guess.
     prep.dialect = ctx.backend->status().dialect;
     prep.think_open = prompt_ends_inside_think_block(prompt, prep.dialect);
+    // Thinking off on the Qwen templates: the block is already closed, and a
+    // closer the model repeats at the answer's lead is dropped by the split.
+    prep.think_closed = !prep.think_open && prompt_ends_after_think_block(prompt, prep.dialect);
     // The split, like the backend's mask, decides the block by token id where
     // the artifact's vocabulary spells a tag as one special token.
     prep.think_ids = ctx.backend->think_block_ids(prep.dialect);
@@ -1281,7 +1293,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     // Reasoning goes out as reasoning_content deltas until the think block
     // closes; from there `content` accumulates the answer and the tool-call
     // logic below sees only that.
-    ReasoningStreamer   reasoning(prep.think_open, prep.dialect, prep.think_ids.open_close_ids);
+    ReasoningStreamer   reasoning(prep.think_start(), prep.dialect, prep.think_ids.open_close_ids);
     std::string         content;       // the answer part of the output so far
     // Reasoning has its own hold-back stream: a multi-byte code point must not
     // be split across two SSE chunks (DESIGN §3.7), and reasoning and content

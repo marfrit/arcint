@@ -197,7 +197,7 @@ int reasoning_token_count(const PreparedChat& prep,
                           const std::vector<std::pair<std::string, int>>& pieces,
                           bool has_tag_ids) {
     if (!has_tag_ids) return 0;
-    ReasoningStreamer streamer(prep.think_open, prep.dialect,
+    ReasoningStreamer streamer(prep.think_start(), prep.dialect,
                                prep.think_ids.open_close_ids);
     int n = 0;
     for (const auto& [piece, id] : pieces) {
@@ -223,9 +223,9 @@ void finish_chat_generation(const PreparedChat& prep,
     for (const auto& [oid, cid] : prep.think_ids.open_close_ids)
         if (oid >= 0 || cid >= 0) has_tag_ids = true;
     const ReasoningSplit split = has_tag_ids
-        ? split_reasoning_tokens(pieces, prep.think_open, prep.dialect,
+        ? split_reasoning_tokens(pieces, prep.think_start(), prep.dialect,
                                  prep.think_ids.open_close_ids)
-        : split_reasoning(raw, prep.think_open, prep.dialect);
+        : split_reasoning(raw, prep.think_start(), prep.dialect);
     out.reasoning        = split.reasoning;
     out.reasoning_closed = split.closed;
     out.content          = split.content;

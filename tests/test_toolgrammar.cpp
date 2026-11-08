@@ -431,6 +431,16 @@ TEST(toolgrammar_llama_accepts_the_well_formed_call) {
     CHECK(run_grammar(g, call("run_query", { { "limit", "10" }, { "sql", "SELECT 1" } })).complete);
 }
 
+// A string value is raw text up to the parameter closer: `<` in it is data,
+// including a `<` right before the closer and a line that starts like one.
+TEST(toolgrammar_llama_string_values_may_hold_angle_brackets) {
+    const std::string g = generate_tool_grammar(two_tools());
+    for (const std::string& v : { std::string("SELECT * FROM lines WHERE amount < 0.01 AND qty <> 0"),
+                                  std::string("<b>x</b>"), std::string("a <"), std::string("<"),
+                                  std::string("x </b"), std::string("line one\n</b> two") })
+        CHECK(run_grammar(g, call("run_query", { { "sql", v }, { "limit", "10" } })).complete);
+}
+
 TEST(toolgrammar_llama_refuses_the_malformed_calls) {
     const std::string g = generate_tool_grammar(two_tools());
     // an undeclared function
