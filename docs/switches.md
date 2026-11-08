@@ -178,6 +178,12 @@ These names are not in a table:
 | `GGML_OPENCL_KQ_2D_I8` | on | `0`: Q4_K 2D GEMM keeps the fp16 kernel. | 0013 | 1,030 / 931 against 973 / 884 (README table, columns as there); KL +0.0005 nats (`measured-here`). |
 | `GGML_OPENCL_KQ_DEDUP` | on | `0`: every activation is converted again. | 0001 | `=0` alone fixed a stale-cache defect that 0027 corrected (`measured-here`). |
 | `GGML_OPENCL_KQ_FEW` | on (DPAS) | `0`: keeps the q8_1 matvec and the GEMM for few columns. | 0009 | Coder 3-token step 104 against 96 t/s (`measured-here`). |
+| `GGML_OPENCL_FEWQ` | on (DPAS) | `0`: Q4_0, Q8_0, IQ4_XS and IQ4_NL at 2-16 columns keep the old paths (per-column matvec, tile GEMM), which then report `reason=no-few-col`. | 0115 | Before (B60, 4096 x 14336, 8 columns): Q8_0 972, Q4_0 415, IQ4_XS 974 us against Q4_K's 92 (`measured-here`); after owed. |
+| `GGML_OPENCL_FEWQ_MIN` / `_MAX` | 2 Xe2, 4 Xe-HPG (Q8_0 2) / 16 | The least / most columns the int8 few-column product takes (MIN sets both minima). | 0115 | — |
+| `GGML_OPENCL_FEWQ_R` / `_NK` | 1 / 4 Xe2, 8 Xe-HPG | Row sets a sub-group; sub-groups splitting K. | 0115 | — |
+| `GGML_OPENCL_FEWQ_OPTS` | unset | Defines for its build: `-DFEWQ_RED` (red case: every eighth block of K left out), `-DFEWQ_ONE_TERM` (one int8 activation term), `-DFEWQ_IQ4_MUX` (select-tree IQ4 decode); logs the build and each type's first product. | 0115 | — |
+| `GGML_OPENCL_FEWQ_LOG` | off | `1`: logs each type's first int8 few-column product (the proof the path ran). | 0115 | — |
+| `GGML_OPENCL_KQ_MV_NCOLS` | 4 | `5`..`8`: the IQ types' and Q4_0's q8_1 matvec built up to that many columns, a Q8_0 one added, and these types at 2 columns up to it routed there instead of the int8 few-column product (Strata's multi-column MMVQ, an arm). | 0115 | — |
 | `GGML_OPENCL_KQ_MM` | on (DPAS) | `0`: keeps ggml's GEMM. | 0001 | — |
 | `GGML_OPENCL_KQ_MM_ID2` | on for sub-group 16, off for sub-group 8 | `1` / `0` forces the ID2 MoE GEMM on / off. | 0006 | Sub-group 8: tile kernel 1,740 against ID2 1,702 t/s (`measured-here`). |
 | `GGML_OPENCL_KQ_MV` | on | `0`: K-quant short batches use ggml's float kernels. | 0001 | — |
