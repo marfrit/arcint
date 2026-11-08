@@ -1138,8 +1138,15 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
             reason = drive(*ctx.backend, prep.input, slot,
                            [](std::string_view, int, const std::string&) { return true; }, stats, raw, &pieces);
         })) {
-        // ARCINT_RAW_TRACE: the turn threw; its partial text and the message
-        raw_trace_error(prep, "chat", false, raw, err->body.value("error", json::object()).value("message", ""));
+        // ARCINT_RAW_TRACE: the turn threw; its partial text and the message.
+        // Nothing of it runs unset, and nothing of it may replace the error.
+        if (raw_trace_on()) {
+            try {
+                const std::string message = err->body.value("error", json::object()).value("message", "");
+                raw_trace_error(prep, "chat", false, raw, message.c_str());
+            } catch (...) {
+            }
+        }
         return *err;
     }
     log_stats(slot, stats, reason, prep.request_id);
@@ -1412,9 +1419,19 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
             return true;
         },
         stats, raw, nullptr); })) {
-        // ARCINT_RAW_TRACE: the turn threw; its partial text and the message
-        if (tracing)
-            raw_trace_error(prep, "chat", true, raw, err->body.value("error", json::object()).value("message", ""));
+        // ARCINT_RAW_TRACE: the turn threw; its partial text, the split so far
+        // and the message. Nothing of it may replace the error frame.
+        if (tracing) {
+            try {
+                RawTraceRecord r = raw_trace_record(prep, "chat", true, "error", raw);
+                r.reasoning      = traced_reasoning;
+                r.content        = content;
+                r.error          = err->body.value("error", json::object()).value("message", "");
+                if (r.error.empty()) r.error = "error";
+                raw_trace_write(r);
+            } catch (...) {
+            }
+        }
         // the 200 and the first chunk are out: the error goes in the stream
         sse_send(write, err->body);
         write("data: [DONE]\n\n");

@@ -2,10 +2,13 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdlib>
 #include <filesystem>
+#include <stdexcept>
 #include <fstream>
 #include <map>
 #include <regex>
+#include <unistd.h>
 #include <string>
 #include <utility>
 #include <vector>
@@ -21,7 +24,10 @@
 // taken from the streamed chat and Responses paths as they stood before the
 // raw trace reordered their last steps (fcc9e41e), so a change that moves a
 // frame's bytes or their order fails here, whatever else it passes. Only the
-// fields that differ run to run (ids, timestamps) are normalised.
+// fields that differ run to run (the response and request ids, timestamps) are
+// normalised; the deterministic call ids (call_0, ...) are pinned. Every case
+// runs with ARCINT_RAW_TRACE unset and again with it on: the frames must not
+// depend on it.
 using namespace lgc;
 using nlohmann::json;
 
@@ -46,6 +52,7 @@ struct Case {
     bool         tools    = false;
     bool         with_ids = true;
     bool         stop_end = false;                // chat only: the request stops at "END"
+    bool         throws   = false;                // the backend throws after the script
 };
 
 class GoldenBackend final : public Backend {
@@ -81,6 +88,7 @@ public:
             ++stats.completion_tokens;
             if (on_piece(piece, id) != Control::Continue) return FinishReason::Stop;
         }
+        if (c_.throws) throw std::runtime_error("backend exploded");
         return c_.end;
     }
 
@@ -140,12 +148,15 @@ std::vector<Case> cases() {
     // a text-only vocabulary: the reasoning ends on a held closer prefix
     v.push_back({"held_closer_tail", prompt_on(), {{"plan ", 5}, {c.substr(0, 4), 6}}, FinishReason::Length, true,
                  false});
+    // the generation throws mid-answer: the error frames
+    v.push_back({"throws_mid_answer", prompt_on(), {{"weigh it", 5}, {c, kCloseId}, {"\n\n", 271}, {"half an ans", 6}},
+                 FinishReason::Stop, true, true, false, true});
     return v;
 }
 
 // ids and timestamps differ run to run; nothing else may
 std::string normalise(std::string f) {
-    static const std::regex ids(R"re("(id|item_id|response_id|previous_response_id)":"[^"]*")re");
+    static const std::regex ids(R"re("(id|item_id|response_id|previous_response_id)":"(?!call_)[^"]*")re");
     static const std::regex times(R"re("(created|created_at|completed_at)":[0-9]+)re");
     f = std::regex_replace(f, ids, "\"$1\":\"X\"");
     f = std::regex_replace(f, times, "\"$1\":0");
@@ -216,15 +227,24 @@ void check_golden(const std::string& key, const std::string& got) {
 }  // namespace
 
 TEST(stream_golden_frames_are_pinned) {
-    for (const Case& c : cases()) {
-        const std::string chat = chat_frames(c);
-        CHECK_EQ(chat_frames(c), chat);   // deterministic after normalising
-        check_golden("chat_" + c.name, chat);
-        if (c.stop_end) continue;          // the Responses route takes no stop strings
-        const std::string resp = response_frames(c);
-        CHECK_EQ(response_frames(c), resp);
-        check_golden("responses_" + c.name, resp);
+    ::unsetenv("ARCINT_RAW_TRACE");
+    // the raw trace's file: the same per-process path tests/test_raw_trace.cpp
+    // uses, since the writer opens its file once a process
+    const std::string trace =
+        (std::filesystem::temp_directory_path() / ("arcint-raw-trace-" + std::to_string(::getpid()) + ".jsonl")).string();
+    for (bool traced : {false, true}) {
+        if (traced) ::setenv("ARCINT_RAW_TRACE", trace.c_str(), 1);
+        for (const Case& c : cases()) {
+            const std::string chat = chat_frames(c);
+            CHECK_EQ(chat_frames(c), chat);   // deterministic after normalising
+            check_golden("chat_" + c.name, chat);
+            if (c.stop_end) continue;          // the Responses route takes no stop strings
+            const std::string resp = response_frames(c);
+            CHECK_EQ(response_frames(c), resp);
+            check_golden("responses_" + c.name, resp);
+        }
     }
+    ::unsetenv("ARCINT_RAW_TRACE");
 }
 
 namespace {

@@ -69,7 +69,8 @@ std::string raw_trace_line(const RawTraceRecord& r, unsigned long long n);
 
 // Appends the turn's line to ARCINT_RAW_TRACE's file (opened once a process,
 // O_APPEND) with one write(). Off: returns at once. The line is built before
-// the writer's lock is taken.
+// the writer's lock is taken. A write that fails or writes nothing ends the
+// trace for the process, reported once on stderr like a failed open.
 void raw_trace_write(const RawTraceRecord& r);
 
 // The record of a turn of `prep` on `route`; the caller fills the split and
@@ -79,8 +80,10 @@ RawTraceRecord raw_trace_record(const PreparedChat& prep, const char* route, boo
                                 const std::string& raw);
 
 // A turn that threw: its partial text and the exception's message, finish
-// "error". Off: returns at once.
+// "error". Off: returns at once. Called from error paths, so it never throws:
+// a failure of the trace itself (an allocation while dumping a large text) is
+// swallowed and the error response stays the one the route builds.
 void raw_trace_error(const PreparedChat& prep, const char* route, bool stream, const std::string& raw,
-                     const std::string& message);
+                     const char* message) noexcept;
 
 }  // namespace lgc::api

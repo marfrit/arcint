@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <mutex>
 #include <unistd.h>
@@ -76,11 +77,15 @@ RawTraceRecord raw_trace_record(const PreparedChat& prep, const char* route, boo
 }
 
 void raw_trace_error(const PreparedChat& prep, const char* route, bool stream, const std::string& raw,
-                     const std::string& message) {
+                     const char* message) noexcept {
     if (!raw_trace_on()) return;
-    RawTraceRecord r = raw_trace_record(prep, route, stream, "error", raw);
-    r.error          = message.empty() ? std::string("error") : message;
-    raw_trace_write(r);
+    try {
+        RawTraceRecord r = raw_trace_record(prep, route, stream, "error", raw);
+        r.error          = message != nullptr && message[0] != '\0' ? message : "error";
+        raw_trace_write(r);
+    } catch (...) {
+        // the trace is a diagnostic: it must not replace the route's error
+    }
 }
 
 void raw_trace_write(const RawTraceRecord& r) {
@@ -110,8 +115,14 @@ void raw_trace_write(const RawTraceRecord& r) {
     size_t            done = 0;
     while (done < line.size()) {
         const ssize_t w = ::write(fd, line.data() + done, line.size() - done);
-        if (w < 0) {
-            if (errno == EINTR) continue;
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) {
+            // failed, or wrote nothing (it would only repeat while the lock
+            // is held): the trace ends here for this process
+            std::fprintf(stderr, "arcint: the raw trace's write failed (%s); ARCINT_RAW_TRACE is off from here\n",
+                         w < 0 ? std::strerror(errno) : "wrote 0 bytes");
+            ::close(fd);
+            fd = -1;
             return;
         }
         done += static_cast<size_t>(w);

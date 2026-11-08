@@ -358,3 +358,27 @@ TEST(raw_trace_turn_that_throws_still_gets_its_line) {
         if (l["error"].is_string()) CHECK(l["error"].get<std::string>().find("backend exploded") != std::string::npos);
     }
 }
+
+TEST(raw_trace_streamed_error_line_keeps_the_split_so_far) {
+    // thinking on, the turn throws mid-answer: the streamed routes' line carries
+    // the reasoning and the content they had split when it threw
+    TraceOn      on;
+    const Script sc = {{"weigh it", 5}, {s(markers::kThinkClose), kCloseId}, {"\n\n", 271}, {"half an ans", 6},
+                       {"wer", 7}};
+    for (bool responses : {false, true}) {
+        Fixture      fx(prompt_on(), sc, /*throws=*/true);
+        const size_t before = trace_lines().size();
+        if (responses) {
+            api::PreparedResponse p = fx.prepare_response(false);
+            api::stream_response(fx.ctx, p, 0, [](std::string_view) { return true; });
+        } else {
+            fx.streamed(fx.prepare(true, false));
+        }
+        const json l = last_line_since(before);
+        if (l.is_null()) continue;
+        CHECK_EQ(l["finish"].get<std::string>(), std::string("error"));
+        CHECK_EQ(l["raw"].get<std::string>(), concat(sc));
+        CHECK_EQ(l["reasoning"].get<std::string>(), std::string("weigh it"));
+        CHECK_EQ(l["content"].get<std::string>(), std::string("half an answer"));
+    }
+}

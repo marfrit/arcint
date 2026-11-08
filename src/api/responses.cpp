@@ -1243,7 +1243,7 @@ HttpResult run_response(const Context& ctx, PreparedResponse& prep, int slot) {
                        [](std::string_view, int, const std::string&) { return true; }, stats, raw,
                        &pieces);
     } catch (const ContextOverflowError& e) {
-        raw_trace_error(prep.chat, "responses", false, raw, e.what());   // ARCINT_RAW_TRACE
+        raw_trace_error(prep.chat, "responses", false, raw, e.what());   // ARCINT_RAW_TRACE; noexcept
         if (prep.req.has_previous_response_id)
             evict_continuation(ctx, prep.req.previous_response_id);
         log::warn("req", "responses refused: prompt %d tokens with its images, lane %d%s",
@@ -1257,7 +1257,7 @@ HttpResult run_response(const Context& ctx, PreparedResponse& prep, int slot) {
         body["n_ctx"]         = e.n_ctx;
         return HttpResult{400, std::move(body)};
     } catch (const InputError& e) {
-        raw_trace_error(prep.chat, "responses", false, raw, e.what());   // ARCINT_RAW_TRACE
+        raw_trace_error(prep.chat, "responses", false, raw, e.what());   // ARCINT_RAW_TRACE; noexcept
         if (prep.req.has_previous_response_id)
             evict_continuation(ctx, prep.req.previous_response_id);
         log::warn("req", "responses refused: %s%s", e.what(),
@@ -1265,7 +1265,7 @@ HttpResult run_response(const Context& ctx, PreparedResponse& prep, int slot) {
         return HttpResult{400, responses_error(e.what(), "invalid_request", "invalid_request",
                                                "input")};
     } catch (const std::exception& e) {
-        raw_trace_error(prep.chat, "responses", false, raw, e.what());   // ARCINT_RAW_TRACE
+        raw_trace_error(prep.chat, "responses", false, raw, e.what());   // ARCINT_RAW_TRACE; noexcept
         if (prep.req.has_previous_response_id)
             evict_continuation(ctx, prep.req.previous_response_id);
         log::error("req", "responses generation failed: %s%s", e.what(),

@@ -655,12 +655,17 @@ bool Stream::run(const Context& ctx, int slot) {
                        },
                        stats, raw, nullptr);
     } catch (const std::exception& e) {
-        if (tracing_) {   // ARCINT_RAW_TRACE: the turn threw; its partial text and the message
-            RawTraceRecord r = raw_trace_record(prep_, "responses", true, "error", raw);
-            r.token_mode     = token_mode_;
-            r.reasoning      = traced_reasoning_;
-            r.error          = e.what();
-            raw_trace_write(r);
+        if (tracing_) {   // ARCINT_RAW_TRACE: the turn threw; its partial text, the split so far, the message
+            try {
+                RawTraceRecord r = raw_trace_record(prep_, "responses", true, "error", raw);
+                r.token_mode     = token_mode_;
+                r.reasoning      = traced_reasoning_;
+                r.content        = content_;
+                r.error          = e.what();
+                raw_trace_write(r);
+            } catch (...) {
+                // a trace failure must not escape this catch or replace the failed event
+            }
         }
         log::error("req", "responses stream failed: %s%s", e.what(),
                    rid_suffix(prep_.request_id).c_str());
