@@ -5,11 +5,11 @@ Subject: [PATCH] 0115-opencl-few-column-int8-q4_0-q8_0-iq4
 
 ---
  ggml/src/ggml-opencl/CMakeLists.txt            |   1 +
- ggml/src/ggml-opencl/ggml-opencl.cpp           | 281 ++++++++++++++++++-
- ggml/src/ggml-opencl/kernels/mul_mm_few_i8.cl  | 364 +++++++++++++++++++++++++
+ ggml/src/ggml-opencl/ggml-opencl.cpp           | 403 ++++++++++++++++++++++++-
+ ggml/src/ggml-opencl/kernels/mul_mm_few_i8.cl  | 364 ++++++++++++++++++++++
  ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl |  53 ++++
- tests/test-backend-ops.cpp                     |  35 +++
- 5 files changed, 726 insertions(+), 8 deletions(-)
+ tests/test-backend-ops.cpp                     |  42 +++
+ 5 files changed, 854 insertions(+), 9 deletions(-)
 
 diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
 index 685210db6..4f1ecc351 100644
@@ -24,7 +24,7 @@ index 685210db6..4f1ecc351 100644
      mul_mm_q40_i8_sg8
      mul_mm_id_i8_sg8
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 962bb088d..963326692 100644
+index 962bb088d..7f8fcff2f 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -889,7 +889,7 @@ struct ggml_backend_opencl_context {
@@ -68,7 +68,7 @@ index 962bb088d..963326692 100644
      cl_kernel kernel_mul_mm_q40_f16       = nullptr;
      cl_kernel kernel_mul_mm_kq2d_q40      = nullptr;   // Xe2: Q4_0 on 2D block loads, fp16
      cl_kernel kernel_mul_mm_kq2d_q40_i8   = nullptr;   // and on int8 DPAS
-@@ -1293,6 +1300,12 @@ struct ggml_backend_opencl_context {
+@@ -1293,6 +1300,18 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_mul_mm_few_kq[2][3] = {};
      cl_kernel kernel_mul_mm_few_prep[2]  = {};
      int       kq_few_sg = 16, kq_few_nk = 4, kq_few_min = 2;
@@ -76,12 +76,18 @@ index 962bb088d..963326692 100644
 +    // [G - 1][Q4_0, Q8_0, IQ4_XS, IQ4_NL] (ggml_cl_fewq_index) and the activation's prep
 +    cl_kernel kernel_mul_mm_fewq[2][4] = {};
 +    cl_kernel kernel_mul_mm_fewq_prep[2] = {};
-+    int       fewq_sg = 16, fewq_nk = 4, fewq_r = 1, fewq_min = 2, fewq_min_q8 = 2, fewq_max = 16;
-+    bool      fewq_log = false;
++    // the column window per type on this card (ggml_cl_fewq_index order), the row sets a sub-group per token
++    // group count, the least weight bytes x products sharing the prep where the other path is ggml's
++    // per-column matvec, the log level (1 each type's first product, 2 each shape and its path once)
++    int       fewq_sg = 16, fewq_nk = 4, fewq_r[2] = { 1, 1 }, fewq_min_t[4] = { 2, 2, 3, 3 }, fewq_max_t[4] = { 15, 16, 16, 16 };
++    size_t    fewq_min_bytes = 6u << 20;
++    int       fewq_log = 0;
++    // per graph: the products that would share one activation prep, by its buffer and offset (ggml_cl_fewq_prepass)
++    std::map<std::pair<cl_mem, cl_ulong>, int> fewq_uses;
      cl_kernel kernel_mul_mv_q5_K_f32;
      cl_kernel kernel_mul_mv_q5_K_f32_flat;
      cl_kernel kernel_mul_mv_q6_K_f32;
-@@ -2589,9 +2602,16 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2589,9 +2608,16 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                  // GGML_OPENCL_IQ_OPTS: defines added to these builds (measurement)
                  const char * iq_opts_env = getenv("GGML_OPENCL_IQ_OPTS");
                  const std::string iq_extra_opts = iq_opts_env != nullptr ? std::string(" ") + iq_opts_env : std::string();
@@ -99,7 +105,7 @@ index 962bb088d..963326692 100644
                          iq_extra_opts;   // the IQ4 codebook in local memory on every card (0035; -DIQ4_KV_SELECT: the A770's selects before)
                      cl_program prog = build_program_from_source_optional(backend_ctx, iq_src.c_str(), opts);
                      if (prog == nullptr) {
-@@ -2599,6 +2619,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2599,6 +2625,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                          continue;
                      }
                      CL_CHECK((backend_ctx->kernel_mul_mv_q40_q8_1[nc - 1] = clCreateKernel(prog, "kernel_mul_mv_q4_0_q8_1", &err), err));
@@ -109,7 +115,7 @@ index 962bb088d..963326692 100644
                      for (int i = 0; i < 9; ++i) {
                          CL_CHECK((backend_ctx->kernel_mul_mv_kq_q8_1[nc - 1][3 + i] = clCreateKernel(prog, iq_n[i], &err), err));
                          if (nc == 1) {
-@@ -2678,6 +2701,74 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2678,6 +2707,89 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                  }
              }
  
@@ -133,22 +139,34 @@ index 962bb088d..963326692 100644
 +#endif
 +                const char * fq_opts = getenv("GGML_OPENCL_FEWQ_OPTS");
 +                const char * fq_log  = getenv("GGML_OPENCL_FEWQ_LOG");
-+                backend_ctx->fewq_log    = fq_opts != nullptr || (fq_log != nullptr && atoi(fq_log) != 0);
-+                backend_ctx->fewq_sg     = sg8 ? 8 : 16;
-+                backend_ctx->fewq_nk     = sg8 ? 8 : 4;
-+                backend_ctx->fewq_min    = sg8 ? 4 : 2;
-+                backend_ctx->fewq_min_q8 = 2;
++                backend_ctx->fewq_log = fq_log != nullptr ? std::max(0, atoi(fq_log)) : fq_opts != nullptr ? 1 : 0;
++                backend_ctx->fewq_sg  = sg8 ? 8 : 16;
++                backend_ctx->fewq_nk  = sg8 ? 8 : 4;
++                // the column windows, Q4_0, Q8_0, IQ4_XS, IQ4_NL, so that no width is slower than before
++                // (measured-here, 4096 x 14336, window 167/168): the B60's Q4_0 at 16 kept its GEMM (110 against
++                // 134 us), its IQ4 at 2 the q8_1 matvec (139 / 122 against 153 / 140); the A770's Q4_0 and IQ4
++                // at 4 the matvec (102 / 139 / 128 against 115 / 194 / 185), its Q8_0 at 2 ggml's matvec (173
++                // against 195)
++                const int wmin[2][4] = { { 2, 2, 3, 3 }, { 5, 3, 5, 5 } }, wmax[2][4] = { { 15, 16, 16, 16 }, { 16, 16, 16, 16 } };
++                for (int i = 0; i < 4; ++i) {
++                    backend_ctx->fewq_min_t[i] = wmin[sg8][i];
++                    backend_ctx->fewq_max_t[i] = wmax[sg8][i];
++                }
 +                if (const char * e = getenv("GGML_OPENCL_FEWQ_NK")) backend_ctx->fewq_nk = std::max(1, std::min(16, atoi(e)));
-+                if (const char * e = getenv("GGML_OPENCL_FEWQ_R"))  backend_ctx->fewq_r  = std::max(1, std::min(4, atoi(e)));
-+                if (const char * e = getenv("GGML_OPENCL_FEWQ_MIN")) backend_ctx->fewq_min = backend_ctx->fewq_min_q8 = std::max(2, atoi(e));
-+                if (const char * e = getenv("GGML_OPENCL_FEWQ_MAX")) backend_ctx->fewq_max = std::max(2, std::min(16, atoi(e)));
++                if (const char * e = getenv("GGML_OPENCL_FEWQ_R"))  backend_ctx->fewq_r[0] = backend_ctx->fewq_r[1] = std::max(1, std::min(4, atoi(e)));
++                if (const char * e = getenv("GGML_OPENCL_FEWQ_R2")) backend_ctx->fewq_r[1] = std::max(1, std::min(4, atoi(e)));
++                if (const char * e = getenv("GGML_OPENCL_FEWQ_MIN")) for (int & v : backend_ctx->fewq_min_t) v = std::max(2, atoi(e));
++                if (const char * e = getenv("GGML_OPENCL_FEWQ_MAX")) for (int & v : backend_ctx->fewq_max_t) v = std::max(2, std::min(16, atoi(e)));
++                if (const char * e = getenv("GGML_OPENCL_FEWQ_MIN_KB")) backend_ctx->fewq_min_bytes = (size_t) std::max(0, atoi(e)) << 10;
++                cl_ulong fq_lmem = 0;
++                clGetDeviceInfo(backend_ctx->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(fq_lmem), &fq_lmem, NULL);
 +                const char * fq_n[4] = { "kernel_mul_mm_fewq_q4_0", "kernel_mul_mm_fewq_q8_0", "kernel_mul_mm_fewq_iq4_xs", "kernel_mul_mm_fewq_iq4_nl" };
 +                if (fq_src.empty()) {
 +                    ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "fewq"), GGML_LOG_WARN("ggml_opencl: mul_mm_few_i8.cl missing or empty; the few-column int8 product is not built\n");
 +                }
 +                for (int g = 1; g <= 2 && !fq_src.empty(); ++g) {
 +                    const std::string fq_build = compile_opts + " -cl-intel-256-GRF-per-thread -DSG=" + std::to_string(backend_ctx->fewq_sg) +
-+                        " -DR=" + std::to_string(backend_ctx->fewq_r) + " -DG=" + std::to_string(g) + " -DNK=" + std::to_string(backend_ctx->fewq_nk) +
++                        " -DR=" + std::to_string(backend_ctx->fewq_r[g - 1]) + " -DG=" + std::to_string(g) + " -DNK=" + std::to_string(backend_ctx->fewq_nk) +
 +                        (fq_opts != nullptr ? std::string(" ") + fq_opts : std::string());
 +                    cl_program fq_prog = build_program_from_source_optional(backend_ctx, fq_src.c_str(), fq_build);
 +                    if (fq_prog == nullptr) {
@@ -160,8 +178,11 @@ index 962bb088d..963326692 100644
 +                    for (int i = 0; i < 4; ++i) {
 +                        CL_CHECK((ks[i] = clCreateKernel(fq_prog, fq_n[i], &err), err));
 +                        size_t wg = 0;
++                        cl_ulong lm = 0;
 +                        CL_CHECK(clGetKernelWorkGroupInfo(ks[i], backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg), &wg, NULL));
-+                        fits = fits && wg >= (size_t)backend_ctx->fewq_nk * backend_ctx->fewq_sg;
++                        // the local memory too: the reduction is NK x R x G x 8 x SG floats (64 KiB at NK 16, R 4, SG 16)
++                        CL_CHECK(clGetKernelWorkGroupInfo(ks[i], backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE, sizeof(lm), &lm, NULL));
++                        fits = fits && wg >= (size_t)backend_ctx->fewq_nk * backend_ctx->fewq_sg && (fq_lmem == 0 || lm <= fq_lmem);
 +                    }
 +                    cl_kernel kp = nullptr;
 +                    CL_CHECK((kp = clCreateKernel(fq_prog, "kernel_mul_mm_fewq_prep", &err), err));
@@ -184,7 +205,24 @@ index 962bb088d..963326692 100644
              // Alchemist: Q4_0 on int8 DPAS with packed activations (mul_mm_q40_i8_sg8.cl).
              // Its own program: a failure leaves 0096's tile. GGML_OPENCL_Q40_SG8_SHAPE =
              // "TMM,WG" overrides the shape.
-@@ -29402,7 +29493,7 @@ static bool ggml_cl_kq_cached(const ggml_cl_kq_act & c, const ggml_backend_openc
+@@ -11389,6 +11501,8 @@ static void ggml_cl_ngpt_fused(ggml_backend_t backend, ggml_tensor * const * n)
+     backend_ctx->enqueue_ndrange_kernel(k, 1, gws, lws, y);
+ }
+ 
++static void ggml_cl_fewq_prepass(ggml_backend_opencl_context * ctx, const ggml_cgraph * cgraph);   // 0115
++
+ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+     backend_ctx->graph_gen++;
+@@ -11400,6 +11514,7 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+                       backend_ctx->device_name.c_str(), (long long) backend_ctx->f16_copy_n, backend_ctx->f16_copy_bytes / (1024.0 * 1024.0));
+     }
+     ggml_cl_gdn_gate_prepass(backend_ctx, cgraph);
++    ggml_cl_fewq_prepass(backend_ctx, cgraph);   // 0115
+     backend_ctx->ngpt_fused = backend_ctx->ngpt_refused = backend_ctx->ngpt_inplace = 0;
+ 
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+@@ -29402,7 +29517,7 @@ static bool ggml_cl_kq_cached(const ggml_cl_kq_act & c, const ggml_backend_openc
  // product (the slots are keyed by the tensor, its buffer, offset and size in this graph)
  static void ggml_cl_kq_forget(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * tmp) {
      for (ggml_cl_kq_act * a : { &backend_ctx->kq_q8, &backend_ctx->kq_f16, &backend_ctx->kq_few, &backend_ctx->kq_i8,
@@ -193,7 +231,7 @@ index 962bb088d..963326692 100644
          if (a->src1 == tmp) {
              *a = {};
          }
-@@ -29721,7 +29812,7 @@ static bool ggml_cl_mul_mv_kq_q8_1(ggml_backend_opencl_context * backend_ctx, co
+@@ -29721,7 +29836,7 @@ static bool ggml_cl_mul_mv_kq_q8_1(ggml_backend_opencl_context * backend_ctx, co
      static const bool   mv_on  = mv_env == nullptr || atoi(mv_env) != 0;
      const int ti = ggml_cl_kq_type_index(src0->type);
      const int ncols = (int)(src1->ne[1] * src1->ne[2] * src1->ne[3]);
@@ -202,7 +240,17 @@ index 962bb088d..963326692 100644
          return false;
      }
      cl_kernel kernel = backend_ctx->kernel_mul_mv_kq_q8_1[ncols - 1][ti];
-@@ -29819,6 +29910,159 @@ static bool ggml_cl_mul_mm_kq_few(ggml_backend_opencl_context * backend_ctx, con
+@@ -29786,7 +29901,8 @@ static bool ggml_cl_mul_mm_kq_few(ggml_backend_opencl_context * backend_ctx, con
+         backend_ctx->prealloc_kq_fa.allocate(backend_ctx->context, (size_t)tok * ne00 * sizeof(cl_half));
+         backend_ctx->prealloc_kq_fs.allocate(backend_ctx->context, (size_t)(ne00 / 16) * tok * sizeof(float));
+         backend_ctx->prealloc_kq_fc.allocate(backend_ctx->context, (size_t)(ne00 / 32) * tok * sizeof(float));
+-        const cl_ulong nbx = src1->nb[1];
++        // 0115: the columns' stride of a contiguous src1 (a permuted [K, 1, n] is contiguous with nb1 = K n 4)
++        const cl_ulong nbx = (cl_ulong)ne00 * sizeof(float);
+         CL_CHECK(clSetKernelArg(kp, 0, sizeof(cl_mem),   &extra1->data_device));
+         CL_CHECK(clSetKernelArg(kp, 1, sizeof(cl_ulong), &offset1));
+         CL_CHECK(clSetKernelArg(kp, 2, sizeof(cl_ulong), &nbx));
+@@ -29819,6 +29935,254 @@ static bool ggml_cl_mul_mm_kq_few(ggml_backend_opencl_context * backend_ctx, con
      return true;
  }
  
@@ -211,9 +259,9 @@ index 962bb088d..963326692 100644
 +// reads the weight once (Q4_K: 111 us against 837 at 8 columns, 4096 x 14336, B60, measured-here). The
 +// K-quants reach it when their few-column kernel declines; IQ3_XXS, IQ2_*, IQ3_S, IQ1_M and Q2_0 have none.
 +static void ggml_cl_downgrade_few_gemm(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src0, int ncols) {
-+    if (backend_ctx->gpu_family == INTEL && ncols >= 2 && ncols < 16) {
-+        ggml_cl_downgrade("op=MUL_MAT type=%s k=%d cols=%s path=gemm reason=no-few-col", ggml_type_name(src0->type),
-+                          (int) src0->ne[0], ncols <= 4 ? "2-4" : "5-15");
++    // its callers take more than 4 columns
++    if (backend_ctx->gpu_family == INTEL && ncols >= 5 && ncols < 16) {
++        ggml_cl_downgrade("op=MUL_MAT type=%s k=%d cols=5-15 path=gemm reason=no-few-col", ggml_type_name(src0->type), (int) src0->ne[0]);
 +    }
 +}
 +
@@ -225,6 +273,92 @@ index 962bb088d..963326692 100644
 +        case GGML_TYPE_IQ4_XS: return 2;
 +        case GGML_TYPE_IQ4_NL: return 3;
 +        default:               return -1;
++    }
++}
++
++// ARC-LAB 0115: the key of an activation prep: src1's buffer and offset (a flattened 3-D src1 is a stack copy
++// with the same ones)
++static std::pair<cl_mem, cl_ulong> ggml_cl_fewq_key(const ggml_tensor * src1) {
++    const ggml_tensor_extra_cl * e = (const ggml_tensor_extra_cl *) src1->extra;
++    return { e->data_device, e->offset + src1->view_offs };
++}
++
++// ARC-LAB 0115: a graph's products that would take the int8 few-column kernel, counted by the activation
++// they share (gate / up / q / k / v share one prep). The count is an upper bound: another product in between
++// evicts the one cached prep.
++static void ggml_cl_fewq_prepass(ggml_backend_opencl_context * ctx, const ggml_cgraph * cgraph) {
++    ctx->fewq_uses.clear();
++    if (ctx->kernel_mul_mm_fewq_prep[0] == nullptr) {
++        return;
++    }
++    for (int i = 0; i < cgraph->n_nodes; ++i) {
++        const ggml_tensor * n = cgraph->nodes[i];
++        const ggml_tensor * a = n->src[0], * b = n->src[1];
++        if (n->op != GGML_OP_MUL_MAT || a == nullptr || b == nullptr || b->extra == nullptr || b->type != GGML_TYPE_F32 ||
++            ggml_cl_fewq_index(a->type) < 0 || a->ne[2] != 1 || a->ne[3] != 1) {
++            continue;
++        }
++        const int64_t c = b->ne[1] * b->ne[2] * b->ne[3];
++        if (c >= 2 && c <= 16) {
++            ctx->fewq_uses[ggml_cl_fewq_key(b)]++;
++        }
++    }
++}
++
++// ARC-LAB 0115: whether the choice of path, not a missing kernel or a layout, keeps a product off the int8
++// few-column kernel; the path it takes then is the chosen one and reports no DOWNGRADE key.
++//  - Outside the type's column window on this card (fewq_min_t / fewq_max_t: measured-here, window 167/168).
++//  - Q8_0, and Q4_0 from 5 columns, whose other path is ggml's per-column matvec: cheap while the weight sits
++//    in L2, against a prep launch the kernel needs. The coder's Q8_0 shared experts (gate / up 512 x 2048,
++//    down 2048 x 512, 1 MiB each) gained 2.7 us a product on gate / up and lost 1.8 on down in
++//    test-backend-ops (A770, 5 columns, measured-here), which repeats the op in one graph and so pays the
++//    prep once; served, a layer paid two preps and the verify +1.0 ms over 40 layers, 24.6 -> 25.6 ms
++//    (measured-here), about 14 us a prep (inferred). So: declined when the weight's bytes times the products
++//    sharing its prep are below fewq_min_bytes (6 MiB, GGML_OPENCL_FEWQ_MIN_KB), or when K has fewer chunks
++//    of 256 than NK sub-groups split it into (the 2048 x 512 loss: 2 chunks for 8 sub-groups).
++// IQ4 and Q4_0 at 2-4 columns are not declined by size: their other paths need a prep of their own (the
++// q8_1 matvec) or are the tile GEMM.
++static bool ggml_cl_fewq_chosen_off(const ggml_backend_opencl_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1) {
++    const int ti = ggml_cl_fewq_index(src0->type);
++    if (ti < 0 || ctx->gpu_family != INTEL || src0->ne[2] != 1 || src0->ne[3] != 1) {
++        return false;
++    }
++    const int ncols = (int)(src1->ne[1] * src1->ne[2] * src1->ne[3]);
++    if (ncols < 2 || ncols > 16 || ctx->kernel_mul_mm_fewq[ncols > 8 ? 1 : 0][ti] == nullptr) {
++        return false;
++    }
++    if (ncols < ctx->fewq_min_t[ti] || ncols > ctx->fewq_max_t[ti]) {
++        return true;
++    }
++    if (ti != 1 && !(ti == 0 && ncols >= 5)) {
++        return false;
++    }
++    if (ctx->fewq_min_bytes == 0) {
++        return false;   // GGML_OPENCL_FEWQ_MIN_KB=0: neither rule (the op suite's setting, so every shape reaches the kernel)
++    }
++    if ((src0->ne[0] / 32 + 7) / 8 < ctx->fewq_nk) {
++        return true;
++    }
++    int uses = 1;
++    if (src1->extra != nullptr) {
++        const auto it = ctx->fewq_uses.find(ggml_cl_fewq_key(src1));
++        uses = it != ctx->fewq_uses.end() ? std::max(1, it->second) : 1;
++    }
++    return (double) ggml_nbytes(src0) * uses < (double) ctx->fewq_min_bytes;
++}
++
++// ARC-LAB 0115: GGML_OPENCL_FEWQ_LOG=2: each shape and the path it took, once
++static void ggml_cl_fewq_trace(const ggml_backend_opencl_context * ctx, const ggml_tensor * src0, int ncols, const char * path) {
++    if (ctx->fewq_log < 2) {
++        return;
++    }
++    static std::mutex mu;
++    static std::set<std::string> seen;
++    char b[160];
++    snprintf(b, sizeof(b), "%s k=%d m=%d x %d columns: %s", ggml_type_name(src0->type), (int) src0->ne[0], (int) src0->ne[1], ncols, path);
++    std::lock_guard<std::mutex> lock(mu);
++    if (seen.insert(b).second) {
++        GGML_LOG_INFO("ggml_opencl: few-column int8 product: %s\n", b);
 +    }
 +}
 +
@@ -244,40 +378,46 @@ index 962bb088d..963326692 100644
 +    if (backend_ctx->kq_mv_arm > 4 && ncols >= 2 && ncols <= backend_ctx->kq_mv_arm) {
 +        // the arm (GGML_OPENCL_KQ_MV_NCOLS): the q8_1 matvec takes these columns; the IQ types' and Q4_0's
 +        // matvecs further down, Q8_0's here
++        if (ti != 1) {
++            return false;
++        }
 +        cl_kernel k = backend_ctx->kernel_mul_mv_q80_q8_1[ncols - 1];
-+        if (ti != 1 || k == nullptr || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
-+            src0->ne[2] != 1 || src0->ne[3] != 1 || src0->view_offs != 0 || !ggml_is_contiguous(src0) ||
-+            !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) || !ggml_cl_is_q8_0_soa(src0) || g_kq_stage_q != nullptr) {
-+            return false;
-+        }
 +        const ggml_tensor * soa0 = src0->view_src != nullptr ? src0->view_src : src0;
-+        if (((ggml_backend_opencl_buffer_context *) soa0->buffer->context)->usm) {
-+            return false;
++        // a Q8_0 product the arm's matvec cannot take goes on to the few-column kernel below
++        const bool arm_ok = k != nullptr && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
++            src0->ne[2] == 1 && src0->ne[3] == 1 && src0->view_offs == 0 && ggml_is_contiguous(src0) &&
++            ggml_is_contiguous(src1) && ggml_is_contiguous(dst) && ggml_cl_is_q8_0_soa(src0) && g_kq_stage_q == nullptr &&
++            !((ggml_backend_opencl_buffer_context *) soa0->buffer->context)->usm;
++        if (arm_ok) {
++            const ggml_tensor_extra_cl_q8_0 * e = (const ggml_tensor_extra_cl_q8_0 *) soa0->extra;
++            ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++            const cl_ulong offsetd = extrad->offset + dst->view_offs, nb1 = dst->nb[1], off0 = 0;
++            const int ne00 = (int)src0->ne[0], ne01 = (int)src0->ne[1];
++            ggml_cl_kq_quantize_src1(backend_ctx, src1, ne00 * ncols, dst);
++            cl_uint a = 0;
++            CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &e->q));
++            CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &off0));
++            CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &e->d));
++            CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xq.buffer));
++            CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xd.buffer));
++            CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &extrad->data_device));
++            CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &offsetd));
++            CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &nb1));
++            CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &ne00));
++            CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &ne01));
++            const int rows_per_wg = backend_ctx->kq_q8_1_ndst * 4;
++            size_t gws[] = { (size_t)CEIL_DIV(ne01, rows_per_wg) * 16, 4, 1 };
++            size_t lws[] = { 16, 4, 1 };
++            backend_ctx->enqueue_ndrange_kernel(k, 3, gws, lws, dst);
++            ggml_cl_fewq_trace(backend_ctx, src0, ncols, "the arm's q8_1 matvec");
++            return true;
 +        }
-+        const ggml_tensor_extra_cl_q8_0 * e = (const ggml_tensor_extra_cl_q8_0 *) soa0->extra;
-+        ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-+        const cl_ulong offsetd = extrad->offset + dst->view_offs, nb1 = dst->nb[1], off0 = 0;
-+        const int ne00 = (int)src0->ne[0], ne01 = (int)src0->ne[1];
-+        ggml_cl_kq_quantize_src1(backend_ctx, src1, ne00 * ncols, dst);
-+        cl_uint a = 0;
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &e->q));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &off0));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &e->d));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xq.buffer));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xd.buffer));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &extrad->data_device));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &offsetd));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &nb1));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &ne00));
-+        CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &ne01));
-+        const int rows_per_wg = backend_ctx->kq_q8_1_ndst * 4;
-+        size_t gws[] = { (size_t)CEIL_DIV(ne01, rows_per_wg) * 16, 4, 1 };
-+        size_t lws[] = { 16, 4, 1 };
-+        backend_ctx->enqueue_ndrange_kernel(k, 3, gws, lws, dst);
-+        return true;
 +    }
-+    const int min_cols = ti == 1 ? backend_ctx->fewq_min_q8 : backend_ctx->fewq_min;
-+    if (ncols < min_cols || ncols > backend_ctx->fewq_max || ncols > 16) {
++    if (ncols < 2 || ncols > 16) {
++        return false;
++    }
++    if (ggml_cl_fewq_chosen_off(backend_ctx, src0, src1)) {
++        ggml_cl_fewq_trace(backend_ctx, src0, ncols, "declined by choice (window, size, K)");
 +        return false;
 +    }
 +    const int g = ncols > 8 ? 2 : 1, tok = 8 * g;
@@ -286,6 +426,7 @@ index 962bb088d..963326692 100644
 +    if (kernel == nullptr || kp == nullptr || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
 +        src0->ne[2] != 1 || src0->ne[3] != 1 || src0->view_offs != 0 || !ggml_is_contiguous(src0) ||
 +        !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) || src0->ne[0] % (ti == 2 ? 256 : 32) != 0) {
++        ggml_cl_fewq_trace(backend_ctx, src0, ncols, "declined: not built or layout");
 +        return false;
 +    }
 +    const ggml_tensor * soa0 = src0->view_src != nullptr ? src0->view_src : src0;
@@ -294,6 +435,7 @@ index 962bb088d..963326692 100644
 +        // the SoA planes in VRAM (a KV cache's Q4_0 / Q8_0 stays AoS and is no 2-D weight)
 +        if ((ti == 0 ? !ggml_cl_is_q4_0_soa(src0) : !ggml_cl_is_q8_0_soa(src0)) || g_kq_stage_q != nullptr ||
 +            ((ggml_backend_opencl_buffer_context *) soa0->buffer->context)->usm) {
++            ggml_cl_fewq_trace(backend_ctx, src0, ncols, "declined: not SoA in VRAM");
 +            return false;
 +        }
 +        cl_mem mq, md;
@@ -320,7 +462,7 @@ index 962bb088d..963326692 100644
 +    if (!ggml_cl_kq_cached(backend_ctx->kq_fewq, backend_ctx, src1, extra1->data_device, offset1, ne00 * ncols)) {
 +        backend_ctx->prealloc_fewq_xq.allocate(backend_ctx->context, (size_t)g * n32 * 512);
 +        backend_ctx->prealloc_fewq_xd.allocate(backend_ctx->context, (size_t)2 * n32 * tok * sizeof(float));
-+        const cl_ulong nbx = src1->nb[1];
++        const cl_ulong nbx = (cl_ulong)ne00 * sizeof(float);   // src1 is contiguous: its nb1 may not be the column stride
 +        CL_CHECK(clSetKernelArg(kp, 0, sizeof(cl_mem),   &extra1->data_device));
 +        CL_CHECK(clSetKernelArg(kp, 1, sizeof(cl_ulong), &offset1));
 +        CL_CHECK(clSetKernelArg(kp, 2, sizeof(cl_ulong), &nbx));
@@ -344,25 +486,26 @@ index 962bb088d..963326692 100644
 +    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne00));
 +    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01));
 +    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ncols));
-+    const size_t sg = (size_t)backend_ctx->fewq_sg, nk = (size_t)backend_ctx->fewq_nk, rows = (size_t)backend_ctx->fewq_r * sg;
++    const size_t sg = (size_t)backend_ctx->fewq_sg, nk = (size_t)backend_ctx->fewq_nk, rows = (size_t)backend_ctx->fewq_r[g - 1] * sg;
 +    size_t global_work_size[] = { (size_t)CEIL_DIV(ne01, (int)rows) * nk * sg, 1, 1 };
 +    size_t local_work_size[]  = { nk * sg, 1, 1 };
 +    backend_ctx->enqueue_ndrange_kernel(kernel, 1, global_work_size, local_work_size, dst);
-+    if (backend_ctx->fewq_log) {
++    if (backend_ctx->fewq_log == 1) {
 +        // the proof that a run took this path, once a type and token group count in the process
 +        static std::atomic<bool> seen[4][2];
 +        if (!seen[ti][g - 1].exchange(true)) {
 +            GGML_LOG_INFO("ggml_opencl: few-column int8 product: %s k=%d x %d columns (G=%d, R=%d, NK=%d)\n",
-+                          ggml_type_name(src0->type), ne00, ncols, g, backend_ctx->fewq_r, backend_ctx->fewq_nk);
++                          ggml_type_name(src0->type), ne00, ncols, g, backend_ctx->fewq_r[g - 1], backend_ctx->fewq_nk);
 +        }
 +    }
++    ggml_cl_fewq_trace(backend_ctx, src0, ncols, "int8 few-column kernel");
 +    return true;
 +}
 +
  // ARC-LAB 0099/0102: Alchemist: the activations as int8 once a graph, packed for block reads
  static void ggml_cl_quant_i8_sg8(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src1, ggml_tensor_extra_cl * extra1,
                                   cl_ulong offset1, int k, int ncols, int tp, const ggml_tensor * dst) {
-@@ -29943,6 +30187,7 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
+@@ -29943,6 +30307,7 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
          const int ne00 = (int)src0->ne[0], ne01 = (int)src0->ne[1], nbk = ne00 / 256;
          const int narrow = ti == 0 ? 128 : ti == 1 ? 32 : 16;   // the narrowest plane's bytes a block
          if (nbk * narrow >= 64 && ne00 * 2 >= 64 && ncols < (1 << 24) && ne01 < (1 << 24) && ne00 < (1 << 23)) {
@@ -370,7 +513,7 @@ index 962bb088d..963326692 100644
              cl_kernel k2 = backend_ctx->kernel_mul_mm_kq2d[ti];
              ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
              const cl_ulong offsetd = extrad->offset + dst->view_offs;
-@@ -30012,6 +30257,7 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
+@@ -30012,6 +30377,7 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
      if (kernel == nullptr) {
          return false;
      }
@@ -378,7 +521,7 @@ index 962bb088d..963326692 100644
      const int ne00 = (int)src0->ne[0];
      const int ne01 = (int)src0->ne[1];
      ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-@@ -30068,7 +30314,7 @@ static bool ggml_cl_mul_mat_q4_0_xmx(ggml_backend_opencl_context * backend_ctx,
+@@ -30068,7 +30434,7 @@ static bool ggml_cl_mul_mat_q4_0_xmx(ggml_backend_opencl_context * backend_ctx,
      const cl_ulong offsetd = extrad->offset + dst->view_offs;
      const cl_ulong nb1     = dst->nb[1];
      const cl_ulong off0    = 0;
@@ -387,7 +530,7 @@ index 962bb088d..963326692 100644
          cl_kernel k = backend_ctx->kernel_mul_mv_q40_q8_1[ncols - 1];
          if (k == nullptr) {
              return false;
-@@ -30391,13 +30637,22 @@ static void ggml_cl_downgrade_gemm(const ggml_backend_opencl_context * backend_c
+@@ -30391,13 +30757,22 @@ static void ggml_cl_downgrade_gemm(const ggml_backend_opencl_context * backend_c
  }
  
  // ... and on the per-column matvec with enough columns for a GEMM: below 32 the generic switch
@@ -405,13 +548,13 @@ index 962bb088d..963326692 100644
 +        return;
 +    }
 +    const int64_t cols = src0->ne[2] == 1 && src0->ne[3] == 1 ? src1->ne[1] * src1->ne[2] * src1->ne[3] : src1->ne[1];
-+    if (cols >= 2 && cols < 16 && !ggml_cl_f16_copy_missing(backend_ctx, src0)) {
++    if (cols >= 2 && cols < 16 && !ggml_cl_f16_copy_missing(backend_ctx, src0) && !ggml_cl_fewq_chosen_off(backend_ctx, src0, src1)) {
 +        ggml_cl_downgrade("op=MUL_MAT type=%s k=%d cols=%s path=matvec-per-col reason=no-few-col", ggml_type_name(src0->type),
 +                          (int) src0->ne[0], cols <= 4 ? "2-4" : "5-15");
      }
  }
  
-@@ -30494,6 +30749,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -30494,6 +30869,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
          return;
      }
  
@@ -426,7 +569,7 @@ index 962bb088d..963326692 100644
      // Intel: F16 / BF16 weights times 16 or more columns (a prompt) on the XMX
      // tiles of the K-quant GEMM; GGML_OPENCL_F16_XMX=0 keeps the tiled GEMM
      {
-@@ -31799,6 +32062,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -31799,6 +32182,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                  GGML_ASSERT(ne01 == ne0);
  
                  if (backend_ctx->gpu_family == INTEL) {
@@ -434,7 +577,7 @@ index 962bb088d..963326692 100644
                      nth0 = 16;
                      nth1 = 1;
  
-@@ -32157,6 +32421,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -32157,6 +32541,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
  
  #ifdef GGML_OPENCL_SOA_Q
              if (backend_ctx->gpu_family == INTEL) {
@@ -877,10 +1020,10 @@ index f8509979b..b51ec80cb 100644
  MV_KERNEL(kernel_mul_mv_iq2_s_q8_1, 7)
  MV_KERNEL(kernel_mul_mv_iq1_m_q8_1, 8)
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 5b0489119..8c768b58c 100644
+index 5b0489119..3d3f46625 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11565,6 +11565,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11565,6 +11565,35 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, 4, 1024, { 1, 1 }, { 2, 1 }));
      }
  
@@ -905,11 +1048,18 @@ index 5b0489119..8c768b58c 100644
 +            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, n, 1024, { 1, 1 }, { 2, 1 }));
 +        }
 +    }
++    // a src1 [K, 1, n] permuted from [K, n, 1]: contiguous with nb1 = K n 4, so a prep that steps the columns
++    // by nb1 reads past them; also the K-quants' few-column prep (0009), which had the same stride
++    for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K }) {
++        for (int n : { 4, 8, 12 }) {
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, 1, 2048, { 1, 1 }, { n, 1 }, { 0, 2, 1, 3 }));
++        }
++    }
 +
      // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
      for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
          for (int n = 1; n <= 8; ++n) {
-@@ -13458,6 +13480,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -13458,6 +13487,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
