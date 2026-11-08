@@ -67,28 +67,7 @@ std::string_view strip_leading_newlines(std::string_view s) {
     return s;
 }
 
-// The answer's lead after a closed block (ThinkStart): a closer the model
-// repeats there, after any layout. Dropped: the pad and the closer leave the
-// front of `buf`. Hold: only layout so far, or a lead that could still grow
-// into a closer. Answer: the answer starts here.
-enum class Lead { Hold, Dropped, Answer };
-Lead repeated_closer(std::string& buf, ChatDialect d) {
-    const std::string_view lead = lead_of(buf);
-    if (lead.empty()) return Lead::Hold;
-    const TagRange r      = tag_range(d);
-    bool           loomed = false;
-    for (size_t i = 0; i < r.count; ++i) {
-        const std::string_view c = r[i].close;
-        if (lead.substr(0, c.size()) == c) {
-            buf.erase(0, buf.size() - lead.size() + c.size());
-            return Lead::Dropped;
-        }
-        if (lead.size() < c.size() && c.substr(0, lead.size()) == lead) loomed = true;
-    }
-    return loomed ? Lead::Hold : Lead::Answer;
-}
-
-// The whole-text form: every closer at the lead goes, with the pad before it.
+// The whole-text form (a vocabulary with no tag ids: the text rule throughout): every closer at the lead goes, with the pad before it.
 std::string_view drop_repeated_closers(std::string_view s, ChatDialect d, bool& dropped) {
     const TagRange r = tag_range(d);
     for (bool hit = true; hit;) {
@@ -104,6 +83,37 @@ std::string_view drop_repeated_closers(std::string_view s, ChatDialect d, bool& 
     return s;
 }
 }  // namespace
+
+LeadState repeated_closer_step(std::string& buf, std::string_view piece, int token_id,
+                               const std::vector<std::string>& closers,
+                               const std::vector<std::pair<int, int>>& ids, bool& dropped) {
+    auto has_id = [&](size_t i) { return i < ids.size() && ids[i].second >= 0; };
+    if (token_id >= 0 && lead_of(buf).empty()) {
+        for (size_t i = 0; i < closers.size(); ++i) {
+            if (!has_id(i) || ids[i].second != token_id) continue;
+            buf.clear();   // the closer token and the layout before it
+            dropped = true;
+            return LeadState::Hold;
+        }
+    }
+    buf += piece;
+    for (;;) {
+        const std::string_view lead = lead_of(buf);
+        if (lead.empty()) return LeadState::Hold;
+        bool hit = false, loomed = false;
+        for (size_t i = 0; i < closers.size() && !hit; ++i) {
+            if (has_id(i)) continue;   // decided by its id alone
+            const std::string_view c = closers[i];
+            if (lead.substr(0, c.size()) == c) {
+                buf.erase(0, buf.size() - lead.size() + c.size());
+                dropped = hit = true;
+            } else if (lead.size() < c.size() && c.substr(0, lead.size()) == lead) {
+                loomed = true;
+            }
+        }
+        if (!hit) return loomed ? LeadState::Hold : LeadState::Answer;
+    }
+}
 
 // One helper, two callers: split_reasoning below and the sampler's
 // think-block mask both strip the lead this way, so they cannot
@@ -190,6 +200,7 @@ ReasoningStreamer::ReasoningStreamer(ThinkStart start, ChatDialect dialect,
                                      const std::vector<std::pair<int, int>>& open_close_ids)
     : in_reasoning_(start.open()), undecided_(!start.open()), dialect_(dialect), ids_(open_close_ids) {
     after_close_ = start.closed();
+    for (const auto& pair : think_tag_pairs(dialect_)) closers_.push_back(pair.second);
     // a template-opened block closes on this dialect's first pair, not the Qwen one
     close_ = tag_range(dialect_)[0].close;
     // A template-opened block: its closer is the first pair's close id when the
@@ -197,29 +208,13 @@ ReasoningStreamer::ReasoningStreamer(ThinkStart start, ChatDialect dialect,
     if (in_reasoning_ && !ids_.empty() && ids_.front().second >= 0) close_id_ = ids_.front().second;
 }
 
-bool ReasoningStreamer::is_close_id_(int token_id) const {
-    if (token_id < 0) return false;
-    for (const auto& pair : ids_)
-        if (pair.second == token_id) return true;
-    return false;
-}
-
 // The answer's lead after the block closed: layout and a repeated closer are
 // held and dropped, the first byte of the answer releases the rest (its
 // leading line breaks dropped, as the whole-text split drops them).
 ReasoningStreamer::Step ReasoningStreamer::lead_after_close_(std::string_view piece, int token_id) {
     Step step;
-    // the closer as its one token, after nothing but layout: the marker again
-    if (is_close_id_(token_id) && lead_of(buffer_).empty()) {
-        buffer_.clear();
-        return step;
-    }
-    buffer_ += piece;
-    for (;;) {
-        const Lead l = repeated_closer(buffer_, dialect_);
-        if (l == Lead::Hold) return step;
-        if (l == Lead::Answer) break;
-    }
+    bool dropped = false;
+    if (repeated_closer_step(buffer_, piece, token_id, closers_, ids_, dropped) == LeadState::Hold) return step;
     step.content = std::string(strip_leading_newlines(buffer_));
     buffer_.clear();
     content_start_ = false;
@@ -250,22 +245,15 @@ ReasoningStreamer::Step ReasoningStreamer::push(std::string_view piece, int toke
             return step;
         }
         // The template closed an empty block: a closer at the lead is that
-        // closer repeated (the token after nothing but layout, or its text,
-        // also across pieces). It is dropped with the layout around it; the
-        // opener rule below then runs on what follows.
+        // closer repeated (repeated_closer_step: its token after nothing but
+        // layout, or for an id-less pair its text, also across pieces). It is
+        // dropped with the layout around it; the opener rule below then runs on
+        // what follows, exactly as the sampler's tracker does.
         if (after_close_) {
-            if (is_close_id_(token_id) && lead_of(buffer_).empty()) {
-                buffer_.clear();
-                drop_newlines_ = true;
-                return step;
-            }
-            buffer_ += piece;
-            for (;;) {
-                const Lead l = repeated_closer(buffer_, dialect_);
-                if (l == Lead::Hold) return step;
-                if (l == Lead::Answer) break;
-                drop_newlines_ = true;
-            }
+            bool dropped = false;
+            const LeadState l = repeated_closer_step(buffer_, piece, token_id, closers_, ids_, dropped);
+            if (dropped) drop_newlines_ = true;
+            if (l == LeadState::Hold) return step;
             after_close_ = false;
             piece        = {};   // already in buffer_
         }

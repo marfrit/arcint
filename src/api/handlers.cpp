@@ -961,6 +961,7 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
     // The backend has to know the same thing: its mask engages before the first
     // sample, where the API's reasoning split has not seen a token yet.
     prep.input.think_open          = prep.think_open;
+    prep.input.think_closed        = prep.think_closed;
     prep.input.dialect = prep.dialect;
     // The rendered prompt is the one thing that decides what the model saw.
     // When an answer differs from a reference run this is the first question,

@@ -57,6 +57,22 @@ struct ThinkStart {
 // a template-opened block closes on the dialect's first pair.
 ReasoningSplit split_reasoning(std::string_view raw, ThinkStart start, ChatDialect dialect = {});
 
+// The repeated-closer rule at the answer's lead after a closed block
+// (ThinkStart), one function for the split and the sampler's think tracker so
+// the two cannot disagree about where the answer starts. `buf` holds the
+// lead's bytes not decided yet; each call adds one piece. A pair whose closer
+// is one special token (its id in `ids`, aligned with `closers`) is matched by
+// that id alone, after nothing but layout: the same text from ordinary tokens
+// is answer, as everywhere else in the split. A pair without an id is matched
+// by its text, also across pieces, and the lead is held while it is still a
+// prefix of that closer. A matched closer leaves `buf` with the layout before
+// it, and `dropped` is set. Hold: only layout so far, or a prefix of an id-less
+// closer. Answer: the answer starts with what `buf` holds.
+enum class LeadState { Hold, Answer };
+LeadState repeated_closer_step(std::string& buf, std::string_view piece, int token_id,
+                               const std::vector<std::string>& closers,
+                               const std::vector<std::pair<int, int>>& ids, bool& dropped);
+
 // The lead of a generated text: everything from its first non-blank
 // character, where blank is a space or a newline. A model may pad before a
 // self-opened block; the pad is not part of the opener, so the opener rule
@@ -117,9 +133,9 @@ private:
     // A repeated closer was dropped before the answer: the answer's leading
     // line breaks are layout too (the undecided path keeps them otherwise).
     bool             drop_newlines_ = false;
+    std::vector<std::string> closers_;   // this dialect's closers, aligned with ids_
 
     Step lead_after_close_(std::string_view piece, int token_id);
-    bool is_close_id_(int token_id) const;
 };
 
 // The non-streaming split driven by the same (piece, id) sequence the streamer

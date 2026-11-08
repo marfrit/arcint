@@ -2695,7 +2695,7 @@ private:
         ThinkBlockIds ids = think_ids_for(in.dialect);
         ids.eog = eog_ids_;
         sampler.set_think_mask_ids(std::move(ids));
-        sampler.start_in_think_block(in.think_open);
+        sampler.start_in_think_block(in.think_open, in.think_closed);
     }
 
     // loop-guard: the nudge sentence's ids. The sampler forces one id a draw,

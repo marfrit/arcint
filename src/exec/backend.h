@@ -276,6 +276,9 @@ struct GenerationInput {
     // enable_thinking after the operator default, so llava's answer row never
     // switches in a non-thinking turn.
     bool think_open          = false;
+    // ... or right after a block the template closed (ThinkStart::Closed): the
+    // tracker then skips a repeated closer at the lead as the split does.
+    bool think_closed        = false;
     ChatDialect dialect;
 
     // The client-liveness probe for this request: false once the peer's

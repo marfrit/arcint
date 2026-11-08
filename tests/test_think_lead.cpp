@@ -11,6 +11,7 @@
 #include "api/responses_stream.h"
 #include "core/markers.h"
 #include "core/reasoning.h"
+#include "core/sampler.h"
 #include "core/toolcall.h"
 #include "exec/backend.h"
 
@@ -53,7 +54,10 @@ using Script = std::vector<std::pair<std::string, int>>;
 
 class LeadBackend final : public Backend {
 public:
-    LeadBackend(std::string prompt, Script script) : prompt_(std::move(prompt)), script_(std::move(script)) {
+    // `with_ids` false: a vocabulary that spells the tags as text (no single
+    // token for either), so the split's text rule decides.
+    LeadBackend(std::string prompt, Script script, bool with_ids = true)
+        : prompt_(std::move(prompt)), script_(std::move(script)), with_ids_(with_ids) {
         status_.id          = "stub";
         status_.served_id   = "stub";
         status_.n_ctx_train = kStubNCtxTrain;
@@ -67,9 +71,13 @@ public:
     std::string        render_chat(const ChatRequest&) const override { return prompt_; }
     ThinkBlockIds      think_block_ids(ChatDialect) const override {
         ThinkBlockIds ids;
-        ids.open_close_ids = {{kOpenId, kCloseId}};
-        ids.open_ids       = {kOpenId};
-        ids.close_ids      = {kCloseId};
+        if (with_ids_) {
+            ids.open_close_ids = {{kOpenId, kCloseId}};
+            ids.open_ids       = {kOpenId};
+            ids.close_ids      = {kCloseId};
+        } else {
+            ids.open_close_ids = {{-1, -1}};
+        }
         ids.open_tags      = {open_tag()};
         ids.close_tags     = {close_tag()};
         ids.eog            = {kEogId};
@@ -92,6 +100,7 @@ private:
     } tok_;
     std::string  prompt_;
     Script       script_;
+    bool         with_ids_;
     ModelStatus  status_;
 };
 
@@ -122,7 +131,8 @@ struct Fixture {
     LeadBackend   backend;
     api::SlotPool slots{1};
     api::Context  ctx;
-    Fixture(std::string prompt, Script script) : backend(std::move(prompt), std::move(script)) {
+    Fixture(std::string prompt, Script script, bool with_ids = true)
+        : backend(std::move(prompt), std::move(script), with_ids) {
         cfg.stub    = true;
         ctx.cfg     = &cfg;
         ctx.backend = &backend;
@@ -174,12 +184,12 @@ struct Fixture {
 
 // Both paths, one expectation: the streamed deltas add up to the message.
 void expect_both(const std::string& prompt, const Script& script, bool thinking, const std::string& reasoning,
-                 const std::string& content) {
-    Fixture    a(prompt, script);
+                 const std::string& content, bool with_ids = true) {
+    Fixture    a(prompt, script, with_ids);
     const Out  n = a.non_streamed(thinking);
     CHECK_EQ(n.reasoning, reasoning);
     CHECK_EQ(n.content, content);
-    Fixture    b(prompt, script);
+    Fixture    b(prompt, script, with_ids);
     const Out  st = b.streamed(thinking);
     CHECK_EQ(st.reasoning, reasoning);
     CHECK_EQ(st.content, content);
@@ -221,15 +231,30 @@ TEST(think_lead_off_a_repeated_closer_token_is_not_content) {
 }
 
 TEST(think_lead_off_a_repeated_closer_spelled_in_two_pieces) {
-    // the same closer from ordinary tokens, split inside the tag
+    // a vocabulary without a closer token: the closer's text, split inside the tag
     const std::string c = close_tag();
     expect_both(qwen_prompt_off(), {{c.substr(0, 2), 30}, {c.substr(2), 31}, {"\n\n", 271}, {"ORCHID-LANTERN-77", 1000}},
-                false, "", "ORCHID-LANTERN-77");
+                false, "", "ORCHID-LANTERN-77", /*with_ids=*/false);
 }
 
 TEST(think_lead_off_a_repeated_closer_glued_to_the_answer) {
     // one text piece carrying the closer, the layout and the answer (no ids)
-    expect_both(qwen_prompt_off(), {{close_tag() + "\n\nORCHID-LANTERN-77", -1}}, false, "", "ORCHID-LANTERN-77");
+    expect_both(qwen_prompt_off(), {{close_tag() + "\n\nORCHID-LANTERN-77", -1}}, false, "", "ORCHID-LANTERN-77",
+                /*with_ids=*/false);
+}
+
+TEST(think_lead_off_a_spelled_closer_is_text_when_the_closer_has_an_id) {
+    // the closer is one special token: its text from ordinary tokens is not it
+    const std::string c = close_tag();
+    expect_both(qwen_prompt_off(), {{c.substr(0, 2), 30}, {c.substr(2), 31}, {"\n\nok", 32}}, false, "",
+                c + "\n\nok");
+}
+
+TEST(think_lead_off_a_lead_held_before_an_opener_id_is_kept) {
+    // nothing at the lead may be lost: a `<` and then the opener token are the
+    // model's own text when the opener does not lead (the old split's content)
+    expect_both(qwen_prompt_off(), {{"<", 60}, {open_tag(), kOpenId}, {"plan", 5}, {close_tag(), kCloseId}, {"go", 6}},
+                false, "", "<" + open_tag() + "plan" + close_tag() + "go");
 }
 
 TEST(think_lead_off_dory_prompt_without_line_breaks) {
@@ -270,10 +295,19 @@ TEST(think_lead_on_a_repeated_closer_after_the_block_is_not_content) {
 }
 
 TEST(think_lead_on_a_repeated_closer_split_across_pieces) {
+    // a vocabulary without a closer token: both closers are text
     const std::string c = close_tag();
     expect_both(qwen_prompt_on(),
-                {{"check", 5}, {c, kCloseId}, {"\n", 198}, {c.substr(0, 5), 30}, {c.substr(5), 31}, {"\n\nok", 32}}, true,
-                "check", "ok");
+                {{"check", 5}, {c, 33}, {"\n", 198}, {c.substr(0, 5), 30}, {c.substr(5), 31}, {"\n\nok", 32}}, true,
+                "check", "ok", /*with_ids=*/false);
+}
+
+TEST(think_lead_on_a_spelled_closer_after_the_block_is_text) {
+    // the closer token ends the block; the same text from ordinary tokens is answer
+    const std::string c = close_tag();
+    expect_both(qwen_prompt_on(),
+                {{"plan", 5}, {c, kCloseId}, {c.substr(0, 2), 30}, {c.substr(2), 31}, {" closes the block.", 34}}, true,
+                "plan", c + " closes the block.");
 }
 
 // ---- tool calls with `<` in the arguments, around the block -----------------
@@ -413,4 +447,78 @@ TEST(think_lead_whole_text_split_agrees_with_the_stream_at_every_cut) {
             CHECK_EQ(content, c.content);
         }
     }
+}
+
+// ---- the sampler's tracker and the split agree ------------------------------
+// The mask, the loop guard and the answer row read the sampler's tracker; the
+// answer reads the split. With the template's block closed both must skip a
+// repeated closer the same way and then follow a block the model opens.
+
+namespace {
+
+constexpr int kEog = 2, kSClose = 5, kSOpen = 6;
+
+ThinkBlockIds tracker_ids(bool with_ids) {
+    ThinkBlockIds ids;
+    ids.open_close_ids = with_ids ? std::vector<std::pair<int, int>>{{kSOpen, kSClose}}
+                                  : std::vector<std::pair<int, int>>{{-1, -1}};
+    if (with_ids) {
+        ids.open_ids  = {kSOpen};
+        ids.close_ids = {kSClose};
+    }
+    ids.open_tags  = {open_tag()};
+    ids.close_tags = {close_tag()};
+    ids.eog        = {kEog};
+    return ids;
+}
+
+// Every step: the sampler's block state equals the streamer's.
+void expect_agree(const Script& script, bool with_ids, const std::string& reasoning, const std::string& content) {
+    SamplerParams p;
+    p.temperature        = 0.0f;
+    p.top_k              = 0;
+    p.top_p              = 1.0f;
+    p.repetition_penalty = 1.0f;
+    p.think_eog_mask     = true;
+    p.think_ids          = tracker_ids(with_ids);
+    Sampler           s(p, 1);
+    s.start_in_think_block(false, /*after_close=*/true);
+    ReasoningStreamer st(ThinkStart::Closed, ChatDialect::Qwen, p.think_ids.open_close_ids);
+    std::string       r, c;
+    size_t            i = 0;
+    for (const auto& [piece, id] : script) {
+        const auto step = st.push(piece, id);
+        r += step.reasoning;
+        c += step.content;
+        s.observe_think(id, piece);
+        if (s.think_block_open() != st.in_reasoning())
+            t::fail(__FILE__, __LINE__, "tracker and split disagree after step " + std::to_string(i));
+        // inside the block the turn may not end there
+        if (st.in_reasoning()) {
+            std::vector<float> l = {0.0f, 0.0f, 9.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+            CHECK(s.sample(l.data(), l.size()) != kEog);
+        }
+        ++i;
+    }
+    const auto tail = st.flush();
+    r += tail.reasoning;
+    c += tail.content;
+    CHECK_EQ(r, reasoning);
+    CHECK_EQ(c, content);
+}
+
+}  // namespace
+
+TEST(think_lead_tracker_follows_a_block_opened_after_a_repeated_closer) {
+    // ids: the repeated closer, a line break, the opener, reasoning, the closer
+    expect_agree({{close_tag(), kSClose}, {"\n", 7}, {open_tag(), kSOpen}, {"plan", 8}, {" more", 9},
+                  {close_tag(), kSClose}, {"\n\n", 10}, {"go", 11}},
+                 true, "plan more", "go");
+    // text: the same with the tags spelled, the closer split
+    const std::string c = close_tag();
+    expect_agree({{c.substr(0, 3), 7}, {c.substr(3), 8}, {"\n" + open_tag(), 9}, {"plan", 10}, {c, 11}, {"go", 12}},
+                 false, "plan", "go");
+    // no repeat: the answer as before, nothing opens
+    expect_agree({{"Paris.", 7}}, true, "", "Paris.");
+    expect_agree({{"<", 7}, {open_tag(), kSOpen}, {"x", 8}}, true, "", "<" + open_tag() + "x");
 }
