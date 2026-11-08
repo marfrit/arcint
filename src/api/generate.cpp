@@ -231,6 +231,7 @@ void finish_chat_generation(const PreparedChat& prep,
     out.content          = split.content;
     out.reasoning_tokens = reasoning_token_count(prep, pieces, has_tag_ids);
     if (prep.parse_tool_calls) {
+        if (out.keep_parse_input) out.parse_input = out.content;
         ToolCallParse parsed = parse_tool_calls(out.content, prep.dialect, &prep.schemas);
         if (parsed.truncated) {
             log::warn("tools", "unterminated %s block; returned as raw content",

@@ -4,6 +4,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <stdexcept>
 #include <fstream>
 #include <string>
 #include <unistd.h>
@@ -40,7 +41,9 @@ using Script = std::vector<std::pair<std::string, int>>;
 
 class TraceBackend final : public Backend {
 public:
-    TraceBackend(std::string prompt, Script script) : prompt_(std::move(prompt)), script_(std::move(script)) {
+    // `throws`: the backend fails after the script, as a generation that throws
+    TraceBackend(std::string prompt, Script script, bool throws = false)
+        : prompt_(std::move(prompt)), script_(std::move(script)), throws_(throws) {
         status_.id          = "stub";
         status_.served_id   = "stub";
         status_.n_ctx_train = kStubNCtxTrain;
@@ -67,6 +70,7 @@ public:
             ++stats.completion_tokens;
             if (on_piece(piece, id) != Control::Continue) return FinishReason::Stop;
         }
+        if (throws_) throw std::runtime_error("backend exploded");
         return FinishReason::Stop;
     }
 
@@ -79,6 +83,7 @@ private:
     } tok_;
     std::string prompt_;
     Script      script_;
+    bool        throws_;
     ModelStatus status_;
 };
 
@@ -97,7 +102,8 @@ struct Fixture {
     TraceBackend  backend;
     api::SlotPool slots{1};
     api::Context  ctx;
-    Fixture(std::string prompt, Script script) : backend(std::move(prompt), std::move(script)) {
+    Fixture(std::string prompt, Script script, bool throws = false)
+        : backend(std::move(prompt), std::move(script), throws) {
         cfg.stub    = true;
         ctx.cfg     = &cfg;
         ctx.backend = &backend;
@@ -200,6 +206,10 @@ void check_malformed_line(const json& l, const std::string& route, bool stream) 
     const json args = json::parse(l["tool_calls"][0]["arguments"].get<std::string>());
     CHECK_EQ(args["class"].get<std::string>(), s(tool_call_tags().param_open) + "unclear>");
     CHECK_EQ(l["content"].get<std::string>(), std::string("Classifying.\n"));
+    // the parser's input: the split's content, here the whole text (no block)
+    CHECK(l["parsed_input"].is_string());
+    if (l["parsed_input"].is_string()) CHECK_EQ(l["parsed_input"].get<std::string>(), concat(malformed_call()));
+    CHECK(l["error"].is_null());
 }
 
 }  // namespace
@@ -273,6 +283,7 @@ TEST(raw_trace_line_keeps_the_reasoning_and_the_closer_in_raw) {
         CHECK_EQ(l["content"].get<std::string>(), std::string("Paris."));
         CHECK(!l["tool_parse"].get<bool>());
         CHECK(l["tool_calls"].empty());
+        CHECK(l["parsed_input"].is_null());   // no parse ran
     }
 }
 
@@ -290,9 +301,60 @@ TEST(raw_trace_line_format_is_fixed) {
     r.tool_parse  = true;
     r.calls       = &calls;
     r.content     = "c";
+    const std::string parsed_input = "p";
+    r.parsed_input = &parsed_input;
     CHECK_EQ(api::raw_trace_line(r, 3),
              std::string("{\"trace\":\"raw1\",\"n\":3,\"request_id\":\"rid\",\"route\":\"chat\",\"stream\":false,"
                          "\"token_mode\":false,\"finish\":\"length\",\"think_start\":\"closed\",\"raw\":\"a\xef\xbf\xbd\","
-                         "\"reasoning\":\"\",\"tool_parse\":true,\"tool_calls\":[{\"name\":\"f\","
-                         "\"arguments\":\"{\\\"x\\\":1}\"}],\"content\":\"c\"}"));
+                         "\"reasoning\":\"\",\"tool_parse\":true,\"parsed_input\":\"p\",\"tool_calls\":[{\"name\":\"f\","
+                         "\"arguments\":\"{\\\"x\\\":1}\"}],\"content\":\"c\",\"error\":null}"));
+}
+
+TEST(raw_trace_line_parsed_input_is_the_split_content) {
+    // thinking on: the parser reads the split's content, not the raw text
+    TraceOn             on;
+    const ToolCallTags& t  = tool_call_tags();
+    Script              sc = {{"weigh it", 5}, {s(markers::kThinkClose), kCloseId}, {"\n\n", 271}};
+    for (const auto& p : malformed_call()) sc.push_back(p);
+    const std::string expected = "Classifying.\n" + s(t.open) + malformed_body() + s(t.close);
+    for (bool stream : {false, true}) {
+        Fixture      fx(prompt_on(), sc);
+        const size_t before = trace_lines().size();
+        const api::PreparedChat prep = fx.prepare(true, true);
+        if (stream) fx.streamed(prep);
+        else api::run_chat(fx.ctx, prep, 0);
+        const json l = last_line_since(before);
+        if (l.is_null()) continue;
+        CHECK_EQ(l["raw"].get<std::string>(), concat(sc));
+        CHECK(l["parsed_input"].is_string());
+        if (l["parsed_input"].is_string()) CHECK_EQ(l["parsed_input"].get<std::string>(), expected);
+    }
+}
+
+TEST(raw_trace_turn_that_throws_still_gets_its_line) {
+    // the generation fails after some text: the line carries that text and the error
+    TraceOn      on;
+    const Script sc = {{"half an ans", 5}, {"wer", 6}};
+    for (int route = 0; route < 4; ++route) {
+        Fixture      fx(prompt_off(), sc, /*throws=*/true);
+        const size_t before = trace_lines().size();
+        if (route == 0) api::run_chat(fx.ctx, fx.prepare(false, false), 0);
+        if (route == 1) fx.streamed(fx.prepare(false, false));
+        if (route == 2) {
+            api::PreparedResponse p = fx.prepare_response(false);
+            api::run_response(fx.ctx, p, 0);
+        }
+        if (route == 3) {
+            api::PreparedResponse p = fx.prepare_response(false);
+            api::stream_response(fx.ctx, p, 0, [](std::string_view) { return true; });
+        }
+        const json l = last_line_since(before);
+        if (l.is_null()) continue;
+        CHECK_EQ(l["route"].get<std::string>(), std::string(route < 2 ? "chat" : "responses"));
+        CHECK_EQ(l["stream"].get<bool>(), route % 2 == 1);
+        CHECK_EQ(l["raw"].get<std::string>(), concat(sc));
+        CHECK_EQ(l["finish"].get<std::string>(), std::string("error"));
+        CHECK(l["error"].is_string());
+        if (l["error"].is_string()) CHECK(l["error"].get<std::string>().find("backend exploded") != std::string::npos);
+    }
 }

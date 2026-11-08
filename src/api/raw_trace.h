@@ -19,13 +19,22 @@
 //    "raw":<the generated text: the pieces the reasoning split received, in
 //           order, concatenated exactly>,
 //    "reasoning":<the split's reasoning>,"tool_parse":<bool>,
+//    "parsed_input":<the text handed to the tool-call parser (the split's
+//                    content), null when no parse ran>,
 //    "tool_calls":[{"name":..,"arguments":<the arguments string the parser
 //                   produced>}],
-//    "content":<the content that remained after the split and the parse>}
+//    "content":<the content that remained after the split and the parse>,
+//    "error":<null, or the message of an exception that ended the turn>}
 //
 // An aborted turn (client gone, stop signal, cancel) still gets its line, with
-// the text it had and no parse. Bytes that are not UTF-8 (a turn cut inside a
-// code point) are written as U+FFFD: the line must stay JSON.
+// the text it had and no parse; so does a turn that threw, with finish
+// "error" and the exception's message. Bytes that are not UTF-8 (a turn cut
+// inside a code point) are written as U+FFFD: the line must stay JSON.
+//
+// Several processes may share one file: each line goes out as one write() on
+// an O_APPEND descriptor, so lines do not interleave inside each other (a
+// regular file on Linux). `n` counts per process; `request_id` tells turns
+// apart across processes.
 #pragma once
 
 #include <string>
@@ -48,6 +57,8 @@ struct RawTraceRecord {
     bool                         tool_parse = false;
     const std::vector<ToolCall>* calls      = nullptr;
     std::string                  content;
+    const std::string*           parsed_input = nullptr;   // the parser's input; null: no parse
+    std::string                  error;                    // empty: the turn did not throw
 };
 
 // ARCINT_RAW_TRACE=<file> set and not empty. Read per call.
@@ -56,8 +67,9 @@ bool raw_trace_on();
 // The line without its newline, `n` the turn counter.
 std::string raw_trace_line(const RawTraceRecord& r, unsigned long long n);
 
-// Appends the turn's line to ARCINT_RAW_TRACE's file (opened once a process)
-// and flushes it. Off: returns at once.
+// Appends the turn's line to ARCINT_RAW_TRACE's file (opened once a process,
+// O_APPEND) with one write(). Off: returns at once. The line is built before
+// the writer's lock is taken.
 void raw_trace_write(const RawTraceRecord& r);
 
 // The record of a turn of `prep` on `route`; the caller fills the split and
@@ -65,5 +77,10 @@ void raw_trace_write(const RawTraceRecord& r);
 struct PreparedChat;
 RawTraceRecord raw_trace_record(const PreparedChat& prep, const char* route, bool stream, const char* finish,
                                 const std::string& raw);
+
+// A turn that threw: its partial text and the exception's message, finish
+// "error". Off: returns at once.
+void raw_trace_error(const PreparedChat& prep, const char* route, bool stream, const std::string& raw,
+                     const std::string& message);
 
 }  // namespace lgc::api

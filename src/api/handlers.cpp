@@ -1137,8 +1137,11 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     if (auto err = guarded(prep.request_id, [&] {
             reason = drive(*ctx.backend, prep.input, slot,
                            [](std::string_view, int, const std::string&) { return true; }, stats, raw, &pieces);
-        }))
+        })) {
+        // ARCINT_RAW_TRACE: the turn threw; its partial text and the message
+        raw_trace_error(prep, "chat", false, raw, err->body.value("error", json::object()).value("message", ""));
         return *err;
+    }
     log_stats(slot, stats, reason, prep.request_id);
     if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
 
@@ -1163,6 +1166,7 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     // the text split is exactly today's behaviour. The shared extraction keeps
     // the Responses resource on the same bytes.
     ChatGeneration gen;
+    gen.keep_parse_input = raw_trace_on();
     finish_chat_generation(prep, pieces, raw, gen);
     if (raw_trace_on()) {
         // ARCINT_RAW_TRACE: what the model wrote next to what the split and the
@@ -1170,6 +1174,7 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
         RawTraceRecord r = raw_trace_record(prep, "chat", false, finish_reason_name(reason), raw);
         r.reasoning      = gen.reasoning;
         r.tool_parse     = prep.parse_tool_calls;
+        r.parsed_input   = prep.parse_tool_calls ? &gen.parse_input : nullptr;
         r.calls          = &gen.calls;
         r.content        = gen.content;
         raw_trace_write(r);
@@ -1407,6 +1412,9 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
             return true;
         },
         stats, raw, nullptr); })) {
+        // ARCINT_RAW_TRACE: the turn threw; its partial text and the message
+        if (tracing)
+            raw_trace_error(prep, "chat", true, raw, err->body.value("error", json::object()).value("message", ""));
         // the 200 and the first chunk are out: the error goes in the stream
         sse_send(write, err->body);
         write("data: [DONE]\n\n");
@@ -1445,6 +1453,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
         RawTraceRecord r = raw_trace_record(prep, "chat", true, finish_reason_name(reason), raw);
         r.reasoning      = traced_reasoning + last.reasoning;
         r.tool_parse     = prep.parse_tool_calls;
+        r.parsed_input   = prep.parse_tool_calls ? &content : nullptr;
         r.calls          = &parsed.calls;
         r.content        = prep.parse_tool_calls ? parsed.content : content;
         raw_trace_write(r);

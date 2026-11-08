@@ -298,6 +298,7 @@ if(ARCINT_TESTS)
     tests/test_reasoning.cpp
     tests/test_think_lead.cpp
     tests/test_raw_trace.cpp
+    tests/test_stream_golden.cpp
     tests/test_admission.cpp
     tests/test_dory.cpp
     tests/test_gemma4.cpp

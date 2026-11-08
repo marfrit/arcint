@@ -655,6 +655,13 @@ bool Stream::run(const Context& ctx, int slot) {
                        },
                        stats, raw, nullptr);
     } catch (const std::exception& e) {
+        if (tracing_) {   // ARCINT_RAW_TRACE: the turn threw; its partial text and the message
+            RawTraceRecord r = raw_trace_record(prep_, "responses", true, "error", raw);
+            r.token_mode     = token_mode_;
+            r.reasoning      = traced_reasoning_;
+            r.error          = e.what();
+            raw_trace_write(r);
+        }
         log::error("req", "responses stream failed: %s%s", e.what(),
                    rid_suffix(prep_.request_id).c_str());
         // Two spec MUSTs meet here: an in-stream error is followed by failed,
@@ -673,6 +680,7 @@ bool Stream::run(const Context& ctx, int slot) {
         r.token_mode     = token_mode_;
         r.reasoning      = traced_reasoning_;
         r.tool_parse     = parsed_now;
+        r.parsed_input   = parsed_now ? &content_ : nullptr;
         r.calls          = calls;
         r.content        = content;
         raw_trace_write(r);
