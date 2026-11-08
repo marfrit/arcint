@@ -8,6 +8,7 @@
 
 #include "api/error.h"
 #include "api/generate.h"
+#include "api/raw_trace.h"
 #include "api/metrics.h"
 #include "api/request_id.h"
 #include "api/responses_state.h"
@@ -509,6 +510,9 @@ private:
     int               reasoning_index_ = -1;
     std::string       reasoning_text_;
     int               reasoning_tokens_ = 0;   // R7, id-split only
+    // ARCINT_RAW_TRACE: on for this turn, and the split's reasoning for its line
+    bool              tracing_ = false;
+    std::string       traced_reasoning_;
 
     // content
     utf8::Streamer content_utf8_;
@@ -546,6 +550,7 @@ bool Stream::run(const Context& ctx, int slot) {
     if (!send(json{{"type", "response.created"}, {"response", created}})) return false;
     if (!send(json{{"type", "response.in_progress"}, {"response", created}})) return false;
 
+    tracing_ = raw_trace_on();
     // The chat route's streamer, over the same (piece, id) sequence.
     reasoning_ = ReasoningStreamer(prep_.think_start(), prep_.dialect,
                                    prep_.think_ids.open_close_ids);
@@ -612,6 +617,7 @@ bool Stream::run(const Context& ctx, int slot) {
                            // id-based split can say that exactly.
                            if (by_ids && token_id >= 0 && !step.reasoning.empty())
                                ++reasoning_tokens_;
+                           if (tracing_) traced_reasoning_ += step.reasoning;
                            if (!emit_reasoning(step.reasoning)) return false;
                            if (!step.content.empty()) {
                                // The block closed in this step: the reasoning
@@ -661,6 +667,17 @@ bool Stream::run(const Context& ctx, int slot) {
 
     log_stats(slot, stats, reason, prep_.request_id);
     if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
+    auto trace = [&](bool parsed_now, const std::vector<ToolCall>* calls, const std::string& content) {
+        if (!tracing_) return;
+        RawTraceRecord r = raw_trace_record(prep_, "responses", true, finish_reason_name(reason), raw);
+        r.token_mode     = token_mode_;
+        r.reasoning      = traced_reasoning_;
+        r.tool_parse     = parsed_now;
+        r.calls          = calls;
+        r.content        = content;
+        raw_trace_write(r);
+    };
+    if (gone_ || reason == FinishReason::Abort) trace(false, nullptr, content_);   // unsplit tail, unparsed
     if (gone_) return false;
 
     if (reason == FinishReason::Abort) {
@@ -677,22 +694,27 @@ bool Stream::run(const Context& ctx, int slot) {
                      /*error_event=*/false);
     }
 
+    // The split's last bytes and the parse first (both pure), so the trace's
+    // line is written before any send can fail; the sends keep their order.
     ReasoningStreamer::Step last = reasoning_.flush();
-    if (!emit_reasoning(last.reasoning)) return false;
-    if (!flush_reasoning()) return false;
-    if (!last.content.empty()) {
-        content_ += last.content;
-        if (!prep_.parse_tool_calls && !emit_content(last.content)) return false;
-    }
-
-    std::vector<ToolCall> calls;
+    if (!last.content.empty()) content_ += last.content;
+    ToolCallParse parsed;
     if (prep_.parse_tool_calls) {
-        ToolCallParse parsed = parse_tool_calls(content_, prep_.dialect, &prep_.schemas);
+        parsed = parse_tool_calls(content_, prep_.dialect, &prep_.schemas);
         if (parsed.truncated) {
             log::warn("tools", "unterminated %s block; returned as raw content%s",
                       std::string(tool_call_open(prep_.dialect)).c_str(),
                       rid_suffix(prep_.request_id).c_str());
         }
+    }
+    if (tracing_) traced_reasoning_ += last.reasoning;
+    trace(prep_.parse_tool_calls, &parsed.calls, prep_.parse_tool_calls ? parsed.content : content_);
+    if (!emit_reasoning(last.reasoning)) return false;
+    if (!flush_reasoning()) return false;
+    if (!last.content.empty() && !prep_.parse_tool_calls && !emit_content(last.content)) return false;
+
+    std::vector<ToolCall> calls;
+    if (prep_.parse_tool_calls) {
         calls = std::move(parsed.calls);
         if (parsed.content.size() > streamed_) {
             if (!emit_content(std::string_view(parsed.content).substr(streamed_))) return false;

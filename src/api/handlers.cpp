@@ -12,6 +12,7 @@
 
 #include "api/error.h"
 #include "api/generate.h"
+#include "api/raw_trace.h"
 #include "api/metrics.h"
 #include "api/renderer.h"
 #include "api/request_id.h"
@@ -1147,6 +1148,8 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     // a 200 with finish_reason "abort": that is no OpenAI reason, and a
     // half-buffered tool call would come back as raw content.
     if (reason == FinishReason::Abort) {
+        // ARCINT_RAW_TRACE: the aborted turn's text, unsplit and unparsed
+        if (raw_trace_on()) raw_trace_write(raw_trace_record(prep, "chat", false, finish_reason_name(reason), raw));
         if (stats.abort_cause == AbortCause::ClientGone)
             return HttpResult{200, json::object(), true};
         return HttpResult{503, error_body("the server is stopping; the request was cancelled "
@@ -1161,6 +1164,16 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     // the Responses resource on the same bytes.
     ChatGeneration gen;
     finish_chat_generation(prep, pieces, raw, gen);
+    if (raw_trace_on()) {
+        // ARCINT_RAW_TRACE: what the model wrote next to what the split and the
+        // parse made of it (the pieces above, concatenated, are `raw`)
+        RawTraceRecord r = raw_trace_record(prep, "chat", false, finish_reason_name(reason), raw);
+        r.reasoning      = gen.reasoning;
+        r.tool_parse     = prep.parse_tool_calls;
+        r.calls          = &gen.calls;
+        r.content        = gen.content;
+        raw_trace_write(r);
+    }
     const std::string& content = gen.content;
     const std::vector<ToolCall>& calls = gen.calls;
 
@@ -1304,6 +1317,9 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     // characters.
     utf8::Streamer      reasoning_stream;
     bool                had_reasoning = false;
+    // ARCINT_RAW_TRACE: the reasoning is kept only for the trace's line
+    const bool          tracing = raw_trace_on();
+    std::string         traced_reasoning;
     auto send_reasoning = [&](const std::string& safe) {
         had_reasoning = true;
         return sse_send(write, chunk(json::array({{{"index", 0},
@@ -1339,6 +1355,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
         *ctx.backend, prep.input, slot,
         [&](std::string_view piece, int token_id, const std::string&) -> bool {
             const ReasoningStreamer::Step step = reasoning.push(piece, token_id);
+            if (tracing) traced_reasoning += step.reasoning;
             if (!emit_reasoning(step.reasoning)) {
                 gone = true;
                 return false;
@@ -1401,25 +1418,43 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     // An aborted request sends nothing more: a gone client's write would fail
     // anyway, and a buffered tool call must not come back as raw content after
     // the turn was cancelled (DESIGN §3.7; the stop signal too).
-    if (gone || reason == FinishReason::Abort) return;
-    {
-        const ReasoningStreamer::Step last = reasoning.flush();
-        if (!emit_reasoning(last.reasoning)) return;
-        if (!flush_reasoning()) return;
-        if (!last.content.empty()) {
-            content += last.content;
-            if (!prep.parse_tool_calls && !emit_content(last.content)) return;
+    if (gone || reason == FinishReason::Abort) {
+        if (tracing) {
+            RawTraceRecord r = raw_trace_record(prep, "chat", true, finish_reason_name(reason), raw);
+            r.reasoning      = traced_reasoning;
+            r.content        = content;
+            raw_trace_write(r);
         }
+        return;
     }
-
-    std::vector<ToolCall> calls;
+    // The turn's text is complete here: the split's last bytes and the parse
+    // are computed first (both pure), so the trace's line is written before
+    // any send can fail, then everything goes out in the order it always did.
+    const ReasoningStreamer::Step last = reasoning.flush();
+    if (!last.content.empty()) content += last.content;
+    ToolCallParse parsed;
     if (prep.parse_tool_calls) {
-        ToolCallParse parsed = parse_tool_calls(content, prep.dialect, &prep.schemas);
+        parsed = parse_tool_calls(content, prep.dialect, &prep.schemas);
         if (parsed.truncated) {
             log::warn("tools", "unterminated %s block; returned as raw content%s",
                       std::string(tool_call_open(prep.dialect)).c_str(),
                       rid_suffix(prep.request_id).c_str());
         }
+    }
+    if (tracing) {
+        RawTraceRecord r = raw_trace_record(prep, "chat", true, finish_reason_name(reason), raw);
+        r.reasoning      = traced_reasoning + last.reasoning;
+        r.tool_parse     = prep.parse_tool_calls;
+        r.calls          = &parsed.calls;
+        r.content        = prep.parse_tool_calls ? parsed.content : content;
+        raw_trace_write(r);
+    }
+    if (!emit_reasoning(last.reasoning)) return;
+    if (!flush_reasoning()) return;
+    if (!last.content.empty() && !prep.parse_tool_calls && !emit_content(last.content)) return;
+
+    std::vector<ToolCall> calls;
+    if (prep.parse_tool_calls) {
         calls = std::move(parsed.calls);
         if (parsed.content.size() > streamed) {
             if (!emit_content(std::string_view(parsed.content).substr(streamed))) return;

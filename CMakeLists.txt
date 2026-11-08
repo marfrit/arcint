@@ -95,6 +95,7 @@ add_library(arcint_core STATIC
   src/api/error.cpp
   src/api/handlers.cpp
   src/api/generate.cpp
+  src/api/raw_trace.cpp
   src/api/metrics.cpp
   src/api/renderer.cpp
   src/api/request_id.cpp
@@ -296,6 +297,7 @@ if(ARCINT_TESTS)
     tests/test_lanes.cpp
     tests/test_reasoning.cpp
     tests/test_think_lead.cpp
+    tests/test_raw_trace.cpp
     tests/test_admission.cpp
     tests/test_dory.cpp
     tests/test_gemma4.cpp

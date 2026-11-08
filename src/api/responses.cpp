@@ -9,6 +9,7 @@
 
 #include "api/error.h"
 #include "api/generate.h"
+#include "api/raw_trace.h"
 #include "api/metrics.h"
 #include "api/request_id.h"
 #include "api/responses_state.h"
@@ -1275,6 +1276,9 @@ HttpResult run_response(const Context& ctx, PreparedResponse& prep, int slot) {
     // Cancel section); a stop signal is a 503 an alive client reads; a gone
     // client gets no body.
     if (reason == FinishReason::Abort && stats.abort_cause != AbortCause::Cancelled) {
+        // ARCINT_RAW_TRACE: the aborted turn's text, unsplit and unparsed
+        if (raw_trace_on())
+            raw_trace_write(raw_trace_record(prep.chat, "responses", false, finish_reason_name(reason), raw));
         if (stats.abort_cause == AbortCause::ClientGone)
             return HttpResult{200, json::object(), true};
         if (prep.req.has_previous_response_id)
@@ -1288,6 +1292,14 @@ HttpResult run_response(const Context& ctx, PreparedResponse& prep, int slot) {
     gen.stats  = stats;
     gen.reason = reason;
     finish_chat_generation(prep.chat, pieces, raw, gen);
+    if (raw_trace_on()) {
+        RawTraceRecord r = raw_trace_record(prep.chat, "responses", false, finish_reason_name(reason), raw);
+        r.reasoning      = gen.reasoning;
+        r.tool_parse     = prep.chat.parse_tool_calls;
+        r.calls          = &gen.calls;
+        r.content        = gen.content;
+        raw_trace_write(r);
+    }
     json body = response_resource(prep.req, prep.chat, gen);
     // store=true retains the turn (default true; review R4's entries=0 makes
     // this a no-op inside the store). store=false keeps nothing.
