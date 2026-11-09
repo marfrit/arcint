@@ -289,6 +289,7 @@ if(ARCINT_TESTS)
     tests/test_mtp_head_file.cpp
     tests/test_props.cpp
     tests/test_placement.cpp
+    tests/test_planes.cpp
     tests/test_sampler_modes.cpp
     tests/test_fast_topk.cpp
     tests/test_mtp_depth.cpp
@@ -336,6 +337,12 @@ if(ARCINT_TESTS)
     # LLAMA_SLOT_LOAN_BYTES_ENV and llama_model_default_params (finding 8's rule
     # lives in the pinned tree's init and its default params, not in the tool)
     target_include_directories(arcint-test PRIVATE "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/include")
+    # contrib/llama.cpp 0116: test_planes.cpp runs the OpenCL backend's planar layout (the low-bit types
+    # and Q3_K), a device-free header of the pinned tree's ggml-opencl
+    if(EXISTS "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl/ggml-opencl-planes.h")
+      target_include_directories(arcint-test PRIVATE "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl")
+      target_compile_definitions(arcint-test PRIVATE ARCINT_LLAMA_PLANES=1)
+    endif()
     # clean-turns step 2's forced-malformed gate on a real vocabulary (vocab-only
     # load, no device). Not a ctest case: it needs the GGUF; run by hand.
     add_executable(arcint-tool-grammar-probe tools/tool_grammar_probe.cpp)

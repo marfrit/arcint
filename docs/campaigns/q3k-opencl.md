@@ -91,7 +91,13 @@ is there to measure Strata's form on these cards for Q3_K itself.
   matvec's lane map and the few-column product's half codes against swapped
   activations give the reference dot product to rounding; with `--red` (the
   mutation of `-DQ3K_RED`) all three differ.
-- The card window: owed.
+- The first card window (window 186, b6d0e532, `measured-here`): the kernels built on both
+  cards; the Q3_K `MUL_MAT` cases crashed (SIGSEGV) at the permuted `[K, 1, n]` case, in
+  the tensor setup: a planar view written through its own shape (0022's conversion; the
+  patch README's section has the measurement). Fixed in the follow-up (planar IO through
+  the base, `ggml-opencl-planes.h`, `tests/test_planes.cpp`), with the review's items: the
+  per-kernel work-group fit, the Q3_K-only build fallback, the view rule, K 768 cases.
+  The card window on the fix: owed.
 
 ## Where it lives
 
