@@ -100,6 +100,16 @@ A verify of a few tokens multiplied Q8_0 weights one column at a time (no multi-
 - **Switch:** `GGML_OPENCL_FEWQ=0`, `GGML_OPENCL_FEWQ_MIN`, `GGML_OPENCL_FEWQ_MAX`, `GGML_OPENCL_FEWQ_OPTS` (`-DFEWQ_RED`, `-DFEWQ_ONE_TERM`, `-DFEWQ_IQ4_MUX`), `GGML_OPENCL_FEWQ_LOG=1`; `GGML_OPENCL_KQ_MV_NCOLS=5..8` routes these types to the integer-dot matvec built up to that many columns instead (the reference's form, an arm).
 - **Source:** arcint's own, after the previous entry; Strata serves the same types at 1-8 columns with an integer-dot MMVQ templated on the column count (`code`, `sycl/src/kernels/cuda/native_mmvq.dp.cpp`), offered here as the arm above.
 
+### Q3_K at every column count, in planes
+
+Dense Q3_K had no OpenCL kernel: a Q3_K tensor ran on the CPU. Its 110-byte block (hmask, qs, 12 bytes of 6-bit scales, d) leaves every other block 2-byte aligned, so it is stored on the card in planes per weight slice (the low-bit types' layout: d, hmask, qs, scales back to back), each field an aligned 32-bit word. Decode uses the integer-dot matvec with Q6_K's lane map (a lane 8 qs and 8 hmask bytes for 32 weights; a weight byte is `q2 | 0xFC` where its hmask bit is clear, so no carry crosses a byte), a verify the few-column fp16 DPAS product (codes as halves `1024 + u`, the chain from `-1028 S`), a prompt the dequantizing tile GEMM, and a Q3_K embedding its own GET_ROWS.
+- **Effect:** not measured yet (the card window is owed); before, "not supported" at every width (`measured-here`, B60, 4096 x 14336).
+- **Applies to:** Both cards; dense MUL_MAT and GET_ROWS; an even block count a slice; MUL_MAT_ID stays on the CPU with a DOWNGRADE key.
+- **Default:** on.
+- **Location:** `kernels/mul_mv_iq_q8_1.cl` (`mv_q3_K`, `kernel_mul_mv_q3_K_q8_1`, `kernel_get_rows_q3_K`), `kernels/mul_mm_kq_few.cl` (`kernel_mul_mm_few_q3_K_f16`), `kernels/mul_mm_kq_f16.cl` (`lb_expand` type 12, `kernel_mul_mm_q3_K_f16`); `ggml_cl_lb_fields`, `ggml_cl_mul_mm_kq_few` in `ggml-opencl.cpp`. (0116)
+- **Switch:** `GGML_OPENCL_Q3K_OPTS` (`-DQ3K_RED`, `-DQ3K_ONE_TERM`); `GGML_OPENCL_KQ_MV_NCOLS=5..8` routes 2 to that many columns to the matvec (Strata's form, an arm).
+- **Source:** Strata's `native_q3_k_mmvq` and its bf16 dequant (`code`); ggml's `dequantize_row_q3_K`.
+
 ### Dense Q4_0 on the integer-dot matvec and the XMX GEMM
 
 Dense Q4_0 weights (the community GPU tables' Llama 2 7B Q4_0) took upstream's float kernels: the tiled GEMM was about 95 % of a 512-token prefill and the 8x matvec two thirds to four fifths of a decode step. Q4_0 has IQ4_NL's flat planes (16 code bytes and one f16 scale per 32 weights) with value n - 8, so the path is IQ4_NL's: up to 4 columns the q8_1 integer-dot matvec, from 16 columns the fp16 XMX GEMM with n - 8 taken in integers. A KV cache's Q4_0 is AoS and declines; 5 to 15 columns stayed on upstream's path, measured later at about 50 us a column for 4,096 x 14,336 on the B60 and taken by the few-column int8 product since 0115.
