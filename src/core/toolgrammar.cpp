@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #include "core/toolcall.h"
@@ -75,6 +76,57 @@ class toolcall_peg_builder : public common_peg_parser_builder {
     common_peg_parser tool_arg_json_value(const common_peg_parser & p) { return tag("tool-arg-value", p); }
 };
 
+// The exact strings a property's value may be, when every branch of its schema
+// that admits a string lists its strings: an enum (its string members), a
+// const string, through anyOf / oneOf, a "type" array (the closure expands it
+// to an anyOf) and $ref. Branches that admit no string (null, a number, an
+// object, a non-string member of a mixed enum) add nothing. Returns false when
+// a branch admits a free string (a plain string, an untyped schema, allOf, a
+// $ref cycle), so the caller keeps the free value. Order is the schema's,
+// duplicates dropped (a "type" array repeats the enum in each branch).
+bool listed_strings(const common_chat_schema& s, std::vector<std::string>& out,
+                    std::unordered_set<const common_chat_schema*>& visiting) {
+    auto add = [&](const common_json& v) {
+        if (!v.is_string()) return;
+        std::string str = v.get<std::string>();
+        for (const auto& have : out)
+            if (have == str) return;
+        out.push_back(std::move(str));
+    };
+    switch (s.kind()) {
+        case common_chat_schema::KIND_CONST:
+            add(static_cast<const common_chat_schema_const&>(s).value);
+            return true;
+        case common_chat_schema::KIND_ENUM:
+            for (const auto& v : static_cast<const common_chat_schema_enum&>(s).values) add(v);
+            return true;
+        case common_chat_schema::KIND_ANY_OF:
+            for (const auto& child : static_cast<const common_chat_schema_any_of&>(s).children)
+                if (!listed_strings(*child, out, visiting)) return false;
+            return true;
+        case common_chat_schema::KIND_REF: {
+            const auto* target = static_cast<const common_chat_schema_ref&>(s).target;
+            if (target == nullptr || !visiting.insert(target).second) return false;
+            const bool ok = listed_strings(*target, out, visiting);
+            visiting.erase(target);
+            return ok;
+        }
+        case common_chat_schema::KIND_NULL:
+        case common_chat_schema::KIND_BOOLEAN:
+        case common_chat_schema::KIND_NUMBER:
+        case common_chat_schema::KIND_INTEGER:
+        case common_chat_schema::KIND_ARRAY:
+        case common_chat_schema::KIND_TUPLE:
+        case common_chat_schema::KIND_OBJECT:
+            return true;
+        case common_chat_schema::KIND_ANY:
+        case common_chat_schema::KIND_STRING:
+        case common_chat_schema::KIND_ALL_OF:
+            return false;
+    }
+    return false;
+}
+
 // Build one function's tool-call block, mirroring the reference's per-function
 // loop. `params` is the function's JSON Schema (the `parameters` object the
 // client declared). Returns the `tool-N` rule.
@@ -127,11 +179,49 @@ common_peg_parser build_function(toolcall_peg_builder & p, size_t tool_index,
 
         auto types = prop.schema->value_types();
 
+        // DEVIATION (operator decision 2026-11-09; core/toolgrammar.h): a
+        // string value whose strings are listed (enum / const) is one of those
+        // strings exactly, then the closer. A listed string is raw text, as
+        // every value in this call form: `<` and newlines are data, written as
+        // is. One that ends in a newline takes the canonical closer only (the
+        // parser strips one newline before the closer). A list holding the
+        // closer text itself cannot be read back by the parser, which ends a
+        // value at its first `</parameter>`: such a property stays free.
+        std::vector<std::string> listed;
+        bool                     is_listed = false;
+        if (types.has(common_chat_schema::TYPE_STRING)) {
+            std::unordered_set<const common_chat_schema*> visiting;
+            is_listed = listed_strings(*prop.schema, listed, visiting) && !listed.empty();
+            for (const auto& v : listed)
+                if (v.find(kParamEnd) != std::string::npos) is_listed = false;
+        }
+        auto listed_value = p.eps();
+        if (is_listed) {
+            auto alts = p.choice();
+            for (const auto& v : listed) {
+                auto closer = (!v.empty() && v.back() == '\n') ? p.literal("\n" + kParamEnd)
+                                                                 : nl_opt + p.literal(kParamEnd);
+                auto value  = v.empty() ? p.tool_arg_string_value(p.eps()) : p.tool_arg_string_value(p.literal(v));
+                alts |= value + p.tool_arg_close(closer);
+            }
+            listed_value = p.rule(rule_name + "-listed", alts + nl_opt);
+        }
+
         auto arg_value = p.eps();
         if (!types.has(common_chat_schema::TYPE_STRING)) {
             arg_value = p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", doc, *prop.schema)) + arg_close;
         } else if (types.is_only(common_chat_schema::TYPE_STRING)) {
-            arg_value = arg_string;
+            arg_value = is_listed ? listed_value : arg_string;
+        } else if (is_listed) {
+            // the non-string alternatives keep today's JSON values; the free
+            // text that subsumed them is replaced by the listed strings
+            auto json_value = p.choice();
+            if (types.has(common_chat_schema::TYPE_OBJECT)) json_value |= p.json_object();
+            if (types.has(common_chat_schema::TYPE_ARRAY))  json_value |= p.json_array();
+            if (types.has(common_chat_schema::TYPE_NUMBER) || types.has(common_chat_schema::TYPE_INTEGER)) json_value |= p.json_number();
+            if (types.has(common_chat_schema::TYPE_BOOLEAN)) json_value |= p.json_bool();
+            if (types.has(common_chat_schema::TYPE_NULL))    json_value |= p.json_null();
+            arg_value = p.atomic(p.tool_arg_json_value(json_value) + arg_close) | listed_value;
         } else {
             auto json_value = p.choice();
             if (types.has(common_chat_schema::TYPE_OBJECT)) json_value |= p.json_object();

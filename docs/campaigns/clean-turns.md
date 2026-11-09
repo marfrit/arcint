@@ -553,7 +553,10 @@ adds ~0.02 s of sample time (one full 248k-row mask).
   in the baseline sends either.
 - **Kept from the reference, so worth knowing:** a string-typed value is raw
   text up to the parameter closer, so a string `enum` is not enforced
-  (recorded in `toolgrammar_llama_refuses_the_malformed_calls`); a call opener
+  (recorded in `toolgrammar_llama_refuses_the_malformed_calls`) -- SUPERSEDED
+  2026-11-09 by an operator decision: a listed string (enum, const) is now
+  enforced, a deviation from the reference recorded in `src/core/toolgrammar.h`,
+  and that cell now asserts the refusal; a call opener
   the model spells out of several text tokens instead of the special token
   does not trigger the grammar (the reference uses the token trigger alone for
   a one-token word); once a call is complete only another call or the
