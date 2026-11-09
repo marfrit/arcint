@@ -98,6 +98,9 @@ is there to measure Strata's form on these cards for Q3_K itself.
   the base, `ggml-opencl-planes.h`, `tests/test_planes.cpp`), with the review's items: the
   per-kernel work-group fit, the Q3_K-only build fallback, the view rule, K 768 cases.
   The card window on the fix: owed.
+- Window 189 (aa0720c3, `measured-here`): green on both cards (Q3_K `MUL_MAT` 178 / 0,
+  the full `MUL_MAT` 2,725 / 0 to completion, `GET_ROWS`), the red 179 FAIL, the
+  build-break fallback costing Q3_K alone. Window 190 (a05b036e, the 2D GEMM): running.
 - Window 186's numbers (b6d0e532, B60, us, Q3_K / Q4_K, 4096 x 14336): 78 / 78 at 1
   column (the 1-column gate holds: equal time at 3.4375 against 4.5 bits a weight),
   78-79 / 85-87 at 2-8, 97-99 / 136-140 at 9-16; ffn_down at 6 columns 129 / 158; the

@@ -4,22 +4,22 @@ Date: Mon, 9 Nov 2026 12:00:00 +0000
 Subject: [PATCH] 0116-opencl-q3_K
 
 ---
- ggml/src/ggml-opencl/ggml-opencl-planes.h      | 125 +++++++++++++++
- ggml/src/ggml-opencl/ggml-opencl.cpp           | 372 +++++++++++++++++++++++++++++++++------------
+ ggml/src/ggml-opencl/ggml-opencl-planes.h      | 137 +++++++++++++++++
+ ggml/src/ggml-opencl/ggml-opencl.cpp           | 376 ++++++++++++++++++++++++++++++++-------------
  ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl   |  80 ++++++++++
  ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl  |  47 +++++-
  ggml/src/ggml-opencl/kernels/mul_mm_kq_few.cl  |  94 ++++++++++++
  ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl | 155 ++++++++++++++++++-
  src/llama-expert-cache.cpp                     |   4 +-
- tests/test-backend-ops.cpp                     | 116 ++++++++++++++
- 8 files changed, 887 insertions(+), 106 deletions(-)
+ tests/test-backend-ops.cpp                     | 123 +++++++++++++++
+ 8 files changed, 908 insertions(+), 108 deletions(-)
 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl-planes.h b/ggml/src/ggml-opencl/ggml-opencl-planes.h
 new file mode 100644
-index 000000000..3c696aafc
+index 000000000..d4f8175a9
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/ggml-opencl-planes.h
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,137 @@
 +// ARC-LAB 0022 / 0116: the planar layout of the low-bit types and Q3_K on the card, device-free (ggml.h
 +// only), so that arcint's unit tests run the same code as the backend.
 +//
@@ -71,6 +71,18 @@ index 000000000..3c696aafc
 +    ggml_cl_lb_field f[5];
 +    const ggml_tensor * b = ggml_cl_lb_base(t);
 +    return ggml_cl_lb_fields(b->type, f) > 0 && ggml_cl_lb_slice_blocks(b) % 2 == 0;
++}
++
++// 0116: t's bytes are one whole slice of a planar base, so a kernel that takes its block count from t
++// (ne0 ne1) and its planes at t's offset addresses them right: t is the base, or a view with the base's
++// ne0 ne1 at a slice-aligned offset (one 2-D slice, or the whole base reshaped with ne0 ne1 kept)
++static inline bool ggml_cl_lb_whole_slice(const ggml_tensor * t) {
++    const ggml_tensor * b = ggml_cl_lb_base(t);
++    if (!ggml_cl_lb_planar(b)) {
++        return false;
++    }
++    const size_t sb = (size_t) ggml_cl_lb_slice_blocks(b) * ggml_type_size(b->type);
++    return b == t || (t->ne[0] * t->ne[1] == b->ne[0] * b->ne[1] && t->view_offs % sb == 0);
 +}
 +
 +// n_slices slices of t's base, GGUF blocks <-> planes (to_planes)
@@ -146,7 +158,7 @@ index 000000000..3c696aafc
 +    write(s0 * sb, n * sb, (const uint8_t *) planes.get());
 +}
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 5d25e78e6..cff9d2aea 100644
+index 5d25e78e6..726cf4ea6 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -8,6 +8,7 @@
@@ -491,7 +503,7 @@ index 5d25e78e6..cff9d2aea 100644
                  case GGML_TYPE_Q4_0:
  #ifdef GGML_OPENCL_SOA_Q
                      // We do not support flattened Q4_0 (and possibly other Q's)
-@@ -12454,6 +12553,30 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -12454,6 +12553,28 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
              // (ggml_cl_mul_mv_kq_q8_1, ggml_cl_mul_mm_kq_f16), and are the only
              // path for IQ3_XXS / IQ4_XS; ahead of the Adreno rule below that
              // declines 512 or more columns without the Adreno GEMM
@@ -508,10 +520,8 @@ index 5d25e78e6..cff9d2aea 100644
 +                    static const bool   vr_red = vr_env != nullptr && atoi(vr_env) != 0;
 +                    const bool odd = op->src[0]->type == GGML_TYPE_Q3_K &&
 +                                     (op->src[0]->ne[0] * op->src[0]->ne[1] / ggml_blck_size(op->src[0]->type)) % 2 != 0;
-+                    const ggml_tensor * vs = op->src[0]->view_src;
-+                    const bool view = !vr_red && vs != nullptr &&
-+                                      (vs->ne[0] * vs->ne[1] != op->src[0]->ne[0] * op->src[0]->ne[1] ||
-+                                       !ggml_cl_lb_planar(vs) || op->src[0]->view_offs != 0);
++                    // a whole slice at a slice-aligned offset (one 2-D slice of a 3-D base) is addressed right
++                    const bool view = !vr_red && op->src[0]->view_src != nullptr && !ggml_cl_lb_whole_slice(op->src[0]);
 +                    if (odd || view) {
 +                        ggml_cl_downgrade("op=MUL_MAT type=%s k=%d path=cpu reason=%s", ggml_type_name(op->src[0]->type),
 +                                          (int) op->src[0]->ne[0], odd ? "odd-blocks" : "view");
@@ -522,7 +532,17 @@ index 5d25e78e6..cff9d2aea 100644
              // the low-bit types in planes need an even block count a slice (ggml_cl_lb_planar)
              if (ggml_cl_kq_type_index(op->src[0]->type) >= 6 && ggml_cl_kq_type_index(op->src[0]->type) != 8 &&
                  (op->src[0]->ne[0] * op->src[0]->ne[1] / ggml_blck_size(op->src[0]->type)) % 2 != 0) {
-@@ -13469,44 +13592,7 @@ static cl_mem ggml_cl_create_temp_download_buffer(
+@@ -12461,7 +12582,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+             }
+             if (ggml_cl_kq_type_index(op->src[0]->type) >= 0 && kq_q8_1_enabled(backend_ctx) &&
+                 op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % ggml_cl_kq_k_unit(op->src[0]->type) == 0 &&
+-                op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 && op->src[0]->view_offs == 0 &&
++                op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
++                (op->src[0]->view_offs == 0 || ggml_cl_lb_whole_slice(op->src[0])) &&   // 0116: a planar slice view
+                 ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op) &&
+                 ggml_cl_kq_kernels_built(backend_ctx, ggml_cl_kq_type_index(op->src[0]->type),
+                                          op->src[1]->ne[1] * op->src[1]->ne[2] * op->src[1]->ne[3] > 4, false)) {
+@@ -13469,44 +13591,7 @@ static cl_mem ggml_cl_create_temp_download_buffer(
  // block back to back (mul_mv_iq_q8_1.cl, lb_expand), so a lane reads aligned
  // 32-bit words. A slice keeps its size and place, so slot / bank copies and
  // gathers stay byte copies; reads and writes of GGUF bytes convert here.
@@ -568,7 +588,7 @@ index 5d25e78e6..cff9d2aea 100644
  
  static void ggml_cl_usm_set_tensor(ggml_backend_opencl_buffer_context * ctx, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
      ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
-@@ -13526,8 +13612,11 @@ static void ggml_cl_usm_set_tensor(ggml_backend_opencl_buffer_context * ctx, ggm
+@@ -13526,8 +13611,11 @@ static void ggml_cl_usm_set_tensor(ggml_backend_opencl_buffer_context * ctx, ggm
          return;
      }
      if (ggml_cl_lb_planar(tensor)) {
@@ -582,7 +602,7 @@ index 5d25e78e6..cff9d2aea 100644
          return;
      }
      memcpy(base + offset, data, size);
-@@ -13718,12 +13807,16 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+@@ -13718,12 +13806,16 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
      cl_command_queue queue = backend_ctx->queue;
  
      if (ggml_cl_lb_planar(tensor)) {
@@ -604,7 +624,7 @@ index 5d25e78e6..cff9d2aea 100644
          return;
      }
  
-@@ -15418,19 +15511,22 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+@@ -15418,19 +15510,22 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
  
  static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
      GGML_ASSERT(tensor->extra);
@@ -638,7 +658,7 @@ index 5d25e78e6..cff9d2aea 100644
          return;
      }
  
-@@ -17949,6 +18045,8 @@ static void ggml_cl_nop(ggml_backend_t backend, const ggml_tensor * src0, const
+@@ -17949,6 +18044,8 @@ static void ggml_cl_nop(ggml_backend_t backend, const ggml_tensor * src0, const
      UNUSED(dst);
  }
  
@@ -647,7 +667,7 @@ index 5d25e78e6..cff9d2aea 100644
  static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -18024,6 +18122,36 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
+@@ -18024,6 +18121,36 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
          return;
      }
  
@@ -684,7 +704,7 @@ index 5d25e78e6..cff9d2aea 100644
      ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
      cl_ulong offset0 = extra0->offset + src0->view_offs;
  
-@@ -29716,10 +29844,11 @@ static bool ggml_cl_bank_stream(ggml_backend_opencl_context * ctx, const ggml_te
+@@ -29716,10 +29843,11 @@ static bool ggml_cl_bank_stream(ggml_backend_opencl_context * ctx, const ggml_te
  }
  
  // blocks as the GGUF stores them (buffer, byte offset): IQ3_XXS, IQ4_XS and
@@ -698,7 +718,7 @@ index 5d25e78e6..cff9d2aea 100644
  }
  
  static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, cl_uint & a) {
-@@ -29801,6 +29930,7 @@ static int ggml_cl_kq_type_index(ggml_type t) {
+@@ -29801,6 +29929,7 @@ static int ggml_cl_kq_type_index(ggml_type t) {
          case GGML_TYPE_Q2_0:    return 9;
          case GGML_TYPE_IQ3_S:   return 10;
          case GGML_TYPE_IQ2_XS:  return 11;
@@ -706,6 +726,16 @@ index 5d25e78e6..cff9d2aea 100644
          default:                return -1;
      }
  }
+@@ -29823,7 +29952,8 @@ static bool ggml_cl_kq_needs_sums(ggml_type t) {
+ static bool ggml_cl_kq_mul_mat_shape(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+     return ggml_cl_kq_type_index(src0->type) >= 0 && src1->type == GGML_TYPE_F32 &&
+            src0->ne[0] % ggml_cl_kq_k_unit(src0->type) == 0 &&
+-           src0->ne[2] == 1 && src0->ne[3] == 1 && ggml_is_contiguous(src0) && src0->view_offs == 0 &&
++           src0->ne[2] == 1 && src0->ne[3] == 1 && ggml_is_contiguous(src0) &&
++           (src0->view_offs == 0 || ggml_cl_lb_whole_slice(src0)) &&   // 0116: a planar slice view (its planes at its offset)
+            ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
+ }
+ 
 @@ -29882,11 +30012,15 @@ static bool ggml_cl_mul_mm_kq_few(ggml_backend_opencl_context * backend_ctx, con
                                    const ggml_tensor * src1, ggml_tensor * dst) {
      const int ti = ggml_cl_kq_type_index(src0->type);
@@ -739,7 +769,7 @@ index 5d25e78e6..cff9d2aea 100644
 +        const cl_ulong offq = e0->offset + src0->view_offs;
 +        const cl_ulong nblk = (cl_ulong)ne01 * nbk;
 +        if (!usm && nbk >= 2 && (offq + nblk * 2) % 64 == 0 && (offq + nblk * 34) % 64 == 0 &&
-+            ncols < (1 << 24) && ne01 < (1 << 24)) {
++            ncols < (1 << 24) && ne01 < (1 << 24) && ne00 < (1 << 23)) {
 +            ggml_cl_downgrade_few_gemm(backend_ctx, src0, ncols);   // 0115
 +            cl_kernel k2 = backend_ctx->kernel_mul_mm_kq2d_q3_K;
 +            ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
@@ -1235,10 +1265,10 @@ index 2092d495d..444135647 100644
  //     bytes, slice size and place unchanged;
  //   - the split-extra types (IQ4_NL's d/q sub-buffers, Q8_0's SOA): two regions,
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 3d3f46625..031853ecc 100644
+index 3d3f46625..81c6ccd6f 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -5838,6 +5838,48 @@ struct test_mul_mat : public test_case {
+@@ -5838,6 +5838,54 @@ struct test_mul_mat : public test_case {
      }
  };
  
@@ -1246,13 +1276,14 @@ index 3d3f46625..031853ecc 100644
 +// [K, N E] (the elements of the parent, not its slices), or (rows > 0) the first `rows` rows of a [K, N]
 +// weight at offset 0. OpenCL keeps the low-bit types and Q3_K in planes per slice of the parent, so a
 +// kernel that took the view's block count would read the wrong planes; the backend declines both
-+// (GGML_OPENCL_LB_VIEW_RED=1 accepts them: the red case)
++// (GGML_OPENCL_LB_VIEW_RED=1 accepts them: the red case). slice >= 0: the view is slice `slice` of the
++// [K, N, E] weight at its slice-aligned offset, which the kernels address right (accepted)
 +struct test_mul_mat_reshape3d : public test_case {
 +    const ggml_type type_a;
-+    const int64_t k, n_rows, n_exp, n, rows;
++    const int64_t k, n_rows, n_exp, n, rows, slice;
 +
 +    std::string vars() override {
-+        return VARS_TO_STR6(type_a, k, n_rows, n_exp, n, rows);
++        return VARS_TO_STR7(type_a, k, n_rows, n_exp, n, rows, slice);
 +    }
 +
 +    double max_nmse_err() override {
@@ -1260,12 +1291,17 @@ index 3d3f46625..031853ecc 100644
 +    }
 +
 +    test_mul_mat_reshape3d(ggml_type type_a = GGML_TYPE_Q3_K, int64_t k = 512, int64_t n_rows = 64, int64_t n_exp = 3, int64_t n = 4,
-+                           int64_t rows = 0)
-+        : type_a(type_a), k(k), n_rows(n_rows), n_exp(n_exp), n(n), rows(rows) {}
++                           int64_t rows = 0, int64_t slice = -1)
++        : type_a(type_a), k(k), n_rows(n_rows), n_exp(n_exp), n(n), rows(rows), slice(slice) {}
 +
 +    ggml_tensor * build_graph(ggml_context * ctx) override {
 +        ggml_tensor * a2;
-+        if (rows > 0) {
++        if (slice >= 0) {
++            ggml_tensor * a = ggml_new_tensor_3d(ctx, type_a, k, n_rows, n_exp);
++            ggml_set_name(a, "a");
++            a2 = ggml_view_2d(ctx, a, k, n_rows, a->nb[1], slice * a->nb[2]);
++            ggml_set_name(a2, "a_slice");
++        } else if (rows > 0) {
 +            ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, n_rows);
 +            ggml_set_name(a, "a");
 +            a2 = ggml_view_2d(ctx, a, k, rows, a->nb[1], 0);
@@ -1287,7 +1323,7 @@ index 3d3f46625..031853ecc 100644
  // 0110: an F32 2-D weight times F32 columns with the weight in a buffer marked
  // as weights (weights=1), as a model's loader leaves it, or in the graph's own
  // buffer (weights=0). On Intel the OpenCL backend keeps an f16 copy of such a
-@@ -10542,6 +10584,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10542,6 +10590,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -1303,7 +1339,7 @@ index 3d3f46625..031853ecc 100644
      for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_0}) {
          test_cases.emplace_back(new test_get_rows(type, 300*256,   5,         4,   1,   2, false));
          test_cases.emplace_back(new test_get_rows(type,     256,   80000, 70000,   2,   1, false));
-@@ -11594,6 +11645,58 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11594,6 +11651,59 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -1338,6 +1374,7 @@ index 3d3f46625..031853ecc 100644
 +        for (int n : { 1, 4, 16 }) {
 +            test_cases.emplace_back(new test_mul_mat_reshape3d(type_a, 512, 64, 3, n));
 +            test_cases.emplace_back(new test_mul_mat_reshape3d(type_a, 512, 64, 1, n, 32));
++            test_cases.emplace_back(new test_mul_mat_reshape3d(type_a, 512, 64, 3, n, 0, 2));   // slice 2: accepted
 +        }
 +    }
 +    // a src1 broadcast over dimension 2 (flattened to 2 n columns) and a permuted [K, 1, n] src1 (the first
@@ -1362,7 +1399,7 @@ index 3d3f46625..031853ecc 100644
      // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
      for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
          for (int n = 1; n <= 8; ++n) {
-@@ -13495,6 +13598,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -13495,6 +13605,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
              test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, bs, 14336, {1, 1}, {1, 1}));
          }
      }

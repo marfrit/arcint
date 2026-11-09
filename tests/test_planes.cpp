@@ -19,6 +19,7 @@
 //      a_partial_range_is_read_modify_write, a_reshape_of_a_3d_base_converts_by_the_base_slices and
 //      a_partial_range_across_a_slice_boundary_is_exact
 //   R4 a field off in ggml_cl_lb_fields (Q3_K's d and hmask swapped, say) -> the_planes_follow_the_block_structs
+//      and a_whole_slice_range_takes_the_direct_path
 #include "harness.h"
 
 #include <cstdint>
@@ -248,8 +249,25 @@ TEST(a_whole_slice_range_takes_the_direct_path) {
                   [&](size_t, size_t, uint8_t *) { ++calls; }, [&](size_t, size_t, const uint8_t *) { ++calls; }, planes.data());
     CHECK_EQ(calls, 0);
     CHECK(memcmp(back.data(), gguf.data() + sb, sb) == 0);
-    // slice 0 untouched by a write of slice 1
-    CHECK(planes[0] == 0xEE && planes[sb - 1] == 0xEE);
+    // slice 1 holds the planes the block struct says, slice 0 is untouched by a write of slice 1
+    const std::vector<uint8_t> want = expected_planes(gguf, sizeof(block_q3_K), 12, 2,
+        { MEMBER(block_q3_K, d), MEMBER(block_q3_K, hmask), MEMBER(block_q3_K, qs), MEMBER(block_q3_K, scales) });
+    CHECK(memcmp(planes.data() + sb, want.data() + sb, sb) == 0);
+    bool untouched = true;
+    for (size_t i = 0; i < sb; ++i) untouched = untouched && planes[i] == 0xEE;
+    CHECK(untouched);
+}
+
+TEST(a_whole_slice_view_is_addressed_by_its_offset) {
+    // supports_op's view rule: a view the kernels address right is a whole slice of a planar base
+    meta_ctx m;
+    ggml_tensor * a = ggml_new_tensor_3d(m.ctx, GGML_TYPE_Q3_K, 512, 64, 3);
+    CHECK(ggml_cl_lb_whole_slice(a));
+    CHECK(ggml_cl_lb_whole_slice(ggml_view_2d(m.ctx, a, 512, 64, a->nb[1], 2 * a->nb[2])));    // slice 2
+    CHECK(!ggml_cl_lb_whole_slice(ggml_view_2d(m.ctx, a, 512, 64, a->nb[1], 5 * a->nb[1])));   // rows 5..68
+    CHECK(!ggml_cl_lb_whole_slice(ggml_view_2d(m.ctx, a, 512, 32, a->nb[1], 0)));              // half a slice
+    CHECK(!ggml_cl_lb_whole_slice(ggml_reshape_2d(m.ctx, a, 512, 64 * 3)));                   // all slices as one
+    CHECK(!ggml_cl_lb_whole_slice(ggml_new_tensor_2d(m.ctx, GGML_TYPE_Q4_K, 512, 64)));        // not planar
 }
 
 TEST(an_odd_block_count_is_not_planar_and_the_low_bit_types_keep_their_fields) {
