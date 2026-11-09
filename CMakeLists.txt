@@ -340,7 +340,7 @@ if(ARCINT_TESTS)
     # contrib/llama.cpp 0116: test_planes.cpp runs the OpenCL backend's planar layout (the low-bit types
     # and Q3_K), a device-free header of the pinned tree's ggml-opencl
     if(EXISTS "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl/ggml-opencl-planes.h")
-      target_include_directories(arcint-test PRIVATE "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl")
+      target_include_directories(arcint-test PRIVATE "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl" "${ARCINT_LLAMA_DIR}/ggml/src")
       target_compile_definitions(arcint-test PRIVATE ARCINT_LLAMA_PLANES=1)
     endif()
     # clean-turns step 2's forced-malformed gate on a real vocabulary (vocab-only

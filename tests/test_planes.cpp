@@ -13,10 +13,12 @@
 // Red cases (each a one-line edit of the header; measured on the recipe host, the test built standalone
 // against the header and libggml-base):
 //   R3 ggml_cl_lb_base returning t (every geometry from the tensor itself, as the old call sites had it) ->
-//      a_permuted_view_writes_through_its_base and a_reshape_of_a_3d_base_converts_by_the_base_slices
-//      fail, then the offset view trips the header's range assert (abort)
+//      a_permuted_view_writes_through_its_base fails, then a later view case trips the header's range
+//      assert (abort)
 //   R2 ggml_cl_lb_io skipping the read of a partly covered slice ->
-//      a_partial_range_is_read_modify_write and a_reshape_of_a_3d_base_converts_by_the_base_slices
+//      a_partial_range_is_read_modify_write, a_reshape_of_a_3d_base_converts_by_the_base_slices and
+//      a_partial_range_across_a_slice_boundary_is_exact
+//   R4 a field off in ggml_cl_lb_fields (Q3_K's d and hmask swapped, say) -> the_planes_follow_the_block_structs
 #include "harness.h"
 
 #include <cstdint>
@@ -26,6 +28,9 @@
 #ifdef ARCINT_LLAMA_PLANES
 #include "ggml.h"
 #include "ggml-opencl-planes.h"
+#include <cstddef>
+#define GGML_COMMON_DECL_CPP
+#include "ggml-common.h"   // the block structs: the expected planes from them, not from the field table
 #endif
 
 #ifdef ARCINT_LLAMA
@@ -157,6 +162,94 @@ TEST(a_reshape_of_a_3d_base_converts_by_the_base_slices) {
     dev.io(a, 0, back.data(), n, false);
     CHECK(back == gguf);
     CHECK_EQ(dev.bad, size_t{0});
+}
+
+// the planes a slice of nblk blocks should hold, from ggml-common.h's struct, not from ggml_cl_lb_fields:
+// d first, then the other members in the struct's order, each member of every block back to back
+struct member { size_t off, size; };
+std::vector<uint8_t> expected_planes(const std::vector<uint8_t> & gguf, size_t blk, int64_t nblk, int64_t n_slices,
+                                     const std::vector<member> & order) {
+    std::vector<uint8_t> out(gguf.size());
+    const size_t sb = (size_t) nblk * blk;
+    for (int64_t s = 0; s < n_slices; ++s) {
+        size_t plane = s * sb;
+        for (const member & m : order) {
+            for (int64_t i = 0; i < nblk; ++i) memcpy(out.data() + plane + i * m.size, gguf.data() + s * sb + i * blk + m.off, m.size);
+            plane += (size_t) nblk * m.size;
+        }
+    }
+    return out;
+}
+#define MEMBER(T, f) member{ offsetof(T, f), sizeof(((T *) nullptr)->f) }
+
+TEST(the_planes_follow_the_block_structs) {
+    meta_ctx m;
+    {
+        ggml_tensor * a = ggml_new_tensor_3d(m.ctx, GGML_TYPE_Q3_K, 512, 6, 2);   // 2 slices of 12 blocks
+        const size_t n = ggml_nbytes(a);
+        fake_device dev(n);
+        const std::vector<uint8_t> gguf = random_bytes(n, 6);
+        dev.io(a, 0, const_cast<uint8_t *>(gguf.data()), n, true);
+        CHECK(dev.mem == expected_planes(gguf, sizeof(block_q3_K), 12, 2,
+                                         { MEMBER(block_q3_K, d), MEMBER(block_q3_K, hmask), MEMBER(block_q3_K, qs), MEMBER(block_q3_K, scales) }));
+    }
+    {
+        // a non-Q3_K planar type through the same code: IQ2_XS
+        ggml_tensor * a = ggml_new_tensor_3d(m.ctx, GGML_TYPE_IQ2_XS, 512, 6, 2);
+        const size_t n = ggml_nbytes(a);
+        fake_device dev(n);
+        const std::vector<uint8_t> gguf = random_bytes(n, 7);
+        dev.io(a, 0, const_cast<uint8_t *>(gguf.data()), n, true);
+        CHECK(dev.mem == expected_planes(gguf, sizeof(block_iq2_xs), 12, 2,
+                                         { MEMBER(block_iq2_xs, d), MEMBER(block_iq2_xs, qs), MEMBER(block_iq2_xs, scales) }));
+        std::vector<uint8_t> back(n);
+        dev.io(a, 0, back.data(), n, false);
+        CHECK(back == gguf);
+        CHECK_EQ(dev.bad, size_t{0});
+    }
+}
+
+TEST(a_partial_range_across_a_slice_boundary_is_exact) {
+    // 3 slices; a write from inside slice 0 to inside slice 2, then reads across each boundary
+    meta_ctx m;
+    for (ggml_type type : { GGML_TYPE_Q3_K, GGML_TYPE_IQ2_XS }) {
+        ggml_tensor * a = ggml_new_tensor_3d(m.ctx, type, 512, 4, 3);
+        const size_t n = ggml_nbytes(a), sb = a->nb[2];
+        fake_device dev(n);
+        std::vector<uint8_t> gguf = random_bytes(n, 8);
+        dev.io(a, 0, gguf.data(), n, true);
+        const size_t at = sb - 37, len = sb + 100;   // slice 0's tail, all of slice 1, slice 2's head
+        const std::vector<uint8_t> patch = random_bytes(len, 9);
+        dev.io(a, at, const_cast<uint8_t *>(patch.data()), len, true);
+        memcpy(gguf.data() + at, patch.data(), len);
+        std::vector<uint8_t> back(n);
+        dev.io(a, 0, back.data(), n, false);
+        CHECK(back == gguf);
+        std::vector<uint8_t> part(80);
+        dev.io(a, 2 * sb - 40, part.data(), part.size(), false);   // across the boundary of slices 1 and 2
+        CHECK(memcmp(part.data(), gguf.data() + 2 * sb - 40, part.size()) == 0);
+        CHECK_EQ(dev.bad, size_t{0});
+    }
+}
+
+TEST(a_whole_slice_range_takes_the_direct_path) {
+    // whole slices with host planes convert in place: the read and write callbacks are not called
+    meta_ctx m;
+    ggml_tensor * a = ggml_new_tensor_3d(m.ctx, GGML_TYPE_Q3_K, 512, 6, 2);
+    const size_t n = ggml_nbytes(a), sb = a->nb[2];
+    std::vector<uint8_t> planes(n, 0xEE);
+    const std::vector<uint8_t> gguf = random_bytes(n, 10);
+    int calls = 0;
+    ggml_cl_lb_io(a, sb, const_cast<uint8_t *>(gguf.data()) + sb, sb, true,
+                  [&](size_t, size_t, uint8_t *) { ++calls; }, [&](size_t, size_t, const uint8_t *) { ++calls; }, planes.data());
+    CHECK_EQ(calls, 0);
+    std::vector<uint8_t> back(sb);
+    ggml_cl_lb_io(a, sb, back.data(), sb, false,
+                  [&](size_t, size_t, uint8_t *) { ++calls; }, [&](size_t, size_t, const uint8_t *) { ++calls; }, planes.data());
+    CHECK_EQ(calls, 0);
+    CHECK(memcmp(back.data(), gguf.data() + sb, sb) == 0);
+    // slice 0 untouched by a write of slice 1
+    CHECK(planes[0] == 0xEE && planes[sb - 1] == 0xEE);
 }
 
 TEST(an_odd_block_count_is_not_planar_and_the_low_bit_types_keep_their_fields) {

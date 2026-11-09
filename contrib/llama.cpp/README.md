@@ -6864,7 +6864,7 @@ Dense Q3_K weights on Intel at every column count. Before (`measured-here`, B60,
 
 | Where | Key |
 |---|---|
-| an odd block count a slice, or a view of a smaller tensor (`supports_op`, a probe's count) | `op=MUL_MAT type=q3_K k= path=cpu reason=odd-blocks\|view` |
+| an odd block count a slice (Q3_K), or a view that is not a whole slice of its planar parent (every planar type; `supports_op`, a probe's count) | `op=MUL_MAT type=<t> k= path=cpu reason=odd-blocks\|view` |
 | the kernels not built, or a shape they do not take (0100's IQ branch) | `op=MUL_MAT type=q3_K k= path=cpu reason=shape\|kernels-missing` |
 | 5 to 15 columns on the tile GEMM because the few-column kernel declined (0115's key) | `op=MUL_MAT type=q3_K k= cols=5-15 path=gemm reason=no-few-col` |
 | `GET_ROWS` declined | `op=GET_ROWS type=q3_K k= path=cpu reason=shape\|kernels-missing` |
@@ -6884,6 +6884,8 @@ The index math was checked without a device (`tools/q3k_layout_emul.py`, `measur
 - Kernel text: only preprocessor lines changed (the `GGML_OPENCL_NO_Q3K` guards, the `Q3K_BREAK_BUILD` error, an explicit `LB_BYTES` arm for Q3_K, 110 as before); without those defines the compiled kernels are those of b6d0e532.
 - Tests: K 768 (three super-blocks a row: the matvec's two-block step ends on a half) at 256 and 1000 rows, 1 to 512 columns.
 
+
+**The second review** (on aa0720c3). (1) The view rule covers every planar type: 0022's IQ2_XXS, IQ2_XS, IQ2_S, Q2_0 and IQ3_S accepted a contiguous offset-0 view of fewer rows, or a `[K, N, E]` reshape to `[K, N E]`, while their kernels take a slice's block count from the view (`mul_mv_iq_q8_1.cl` `mv_lb`, `nblk = ne01 nbr`) against planes laid per slice of the base; now they are declined with `op=MUL_MAT type=<t> k= path=cpu reason=view`, and `GGML_OPENCL_LB_VIEW_RED=1` accepts them again (the red case). `test_mul_mat_reshape3d` runs for all six planar types, as a reshape and as the first 32 of 64 rows. (2) A range of whole slices converts straight between the caller's bytes and the planes (on USM in place, else through one uninitialized staging buffer and one transfer: the cost before 0116); only a partial range reads, patches and writes back. (3) `tests/test_planes.cpp`: a partial range across slice boundaries, IQ2_XS through the same code, the expected planes built from `ggml-common.h`'s block structs rather than the field table, the direct path calling no transfer; red cases R2 (the partial read skipped: 3 cases fail), R3 (the base taken as the tensor: fails, then aborts) and R4 (Q3_K's d and hmask fields swapped: the struct case fails), `measured-here` on the recipe host.
 
 **The first card numbers** (window 186, b6d0e532, `measured-here`, the operator's runs). Correctness: the kernels build on both cards, `-DQ3K_RED` fails 86 cases, `GET_ROWS` green; `MUL_MAT` crashed (above). The B60's 76 MXFP4 `MUL_MAT_ID` failures occur on the tree without 0116 too. B60, us a product, Q3_K / Q4_K, 4096 x 14336: 78 / 78 at 1 column, 78-79 / 85-87 at 2-8, 97-99 / 136-140 at 9-16; at 6 columns ffn_down 129 / 158, ffn_gate / up 112 / 122. Prompts on the tile GEMM about 2x Q4_K: 4096 x 14336 at 512 columns 1,816 / 826, ffn_down 2,442 / 1,191. Arms: `GGML_OPENCL_KQ_MV_NCOLS=8` 145-475 us at 2-8 columns (far worse: the few-column kernel stays the default), `-DQ3K_ONE_TERM` about equal (75 us at 1 column; the two-term default stays).
 
