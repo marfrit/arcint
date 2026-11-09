@@ -1756,17 +1756,18 @@ TEST(a_failed_tail_allocation_leaves_no_dangling_tensor) {
 TEST(the_refill_comment_names_the_planar_types) {
     // The fifth review's nit: the comment named IQ3_XXS and IQ4_XS as planar. The
     // planar set is ggml_cl_lb_fields' cases -- IQ2_XXS, IQ2_XS, IQ2_S, Q2_0, IQ3_S,
-    // and Q3_K since 0116, which also moved the layout into ggml-opencl-planes.h --
+    // Q3_K since 0116 (which also moved the layout into ggml-opencl-planes.h) and
+    // Q2_K since 0117 --
     // and the rules below rest on it, so the comment names every one of them. Red
     // case R21: one name off (or a non-planar type added to the list) in the
     // refill's comment.
     const std::vector<std::string> planar = {"GGML_TYPE_IQ2_XXS", "GGML_TYPE_IQ2_XS", "GGML_TYPE_IQ2_S",
-                                            "GGML_TYPE_Q2_0", "GGML_TYPE_IQ3_S", "GGML_TYPE_Q3_K"};
+                                            "GGML_TYPE_Q2_0", "GGML_TYPE_IQ3_S", "GGML_TYPE_Q3_K", "GGML_TYPE_Q2_K"};
     CHECK(scan_between("ggml/src/ggml-opencl/ggml-opencl-planes.h",
                        "static inline int ggml_cl_lb_fields(ggml_type t, ggml_cl_lb_field f[5]) {",
                        "static inline const ggml_tensor * ggml_cl_lb_base", planar));
     CHECK(has_between("llama-expert-cache.cpp", "Round 7, the refill's types:", "void llama_expert_cache::set_measure_lent",
-                      {"IQ2_XXS, IQ2_XS, IQ2_S, Q2_0, IQ3_S, Q3_K --", "BF16"}));
+                      {"IQ2_XXS, IQ2_XS, IQ2_S, Q2_0, IQ3_S, Q3_K, Q2_K --", "BF16"}));
 }
 
 TEST(the_refill_writes_and_checks_the_zero_slot) {

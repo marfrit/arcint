@@ -18,6 +18,7 @@
 //   R2 ggml_cl_lb_io skipping the read of a partly covered slice ->
 //      a_partial_range_is_read_modify_write, a_reshape_of_a_3d_base_converts_by_the_base_slices and
 //      a_partial_range_across_a_slice_boundary_is_exact
+//   R5 (0117) Q2_K's dm and scales fields swapped -> the_planes_follow_the_block_structs
 //   R4 a field off in ggml_cl_lb_fields (Q3_K's d and hmask swapped, say) -> the_planes_follow_the_block_structs
 //      and a_whole_slice_range_takes_the_direct_path
 #include "harness.h"
@@ -208,12 +209,26 @@ TEST(the_planes_follow_the_block_structs) {
         CHECK(back == gguf);
         CHECK_EQ(dev.bad, size_t{0});
     }
+    {
+        // 0117: Q2_K, its d and dmin one 4-byte member (ggml-common.h's union) ahead of scales and qs
+        ggml_tensor * a = ggml_new_tensor_3d(m.ctx, GGML_TYPE_Q2_K, 512, 6, 2);
+        const size_t n = ggml_nbytes(a);
+        fake_device dev(n);
+        const std::vector<uint8_t> gguf = random_bytes(n, 11);
+        dev.io(a, 0, const_cast<uint8_t *>(gguf.data()), n, true);
+        CHECK(dev.mem == expected_planes(gguf, sizeof(block_q2_K), 12, 2,
+                                         { MEMBER(block_q2_K, data), MEMBER(block_q2_K, scales), MEMBER(block_q2_K, qs) }));
+        std::vector<uint8_t> back(n);
+        dev.io(a, 0, back.data(), n, false);
+        CHECK(back == gguf);
+        CHECK_EQ(dev.bad, size_t{0});
+    }
 }
 
 TEST(a_partial_range_across_a_slice_boundary_is_exact) {
     // 3 slices; a write from inside slice 0 to inside slice 2, then reads across each boundary
     meta_ctx m;
-    for (ggml_type type : { GGML_TYPE_Q3_K, GGML_TYPE_IQ2_XS }) {
+    for (ggml_type type : { GGML_TYPE_Q3_K, GGML_TYPE_Q2_K, GGML_TYPE_IQ2_XS }) {
         ggml_tensor * a = ggml_new_tensor_3d(m.ctx, type, 512, 4, 3);
         const size_t n = ggml_nbytes(a), sb = a->nb[2];
         fake_device dev(n);
@@ -277,7 +292,7 @@ TEST(an_odd_block_count_is_not_planar_and_the_low_bit_types_keep_their_fields) {
     CHECK(ggml_cl_lb_planar(ggml_new_tensor_2d(m.ctx, GGML_TYPE_Q3_K, 768, 130)));
     CHECK(!ggml_cl_lb_planar(ggml_new_tensor_2d(m.ctx, GGML_TYPE_Q4_K, 512, 4)));
     // every planar type's fields tile its block exactly
-    for (ggml_type t : { GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0, GGML_TYPE_IQ3_S, GGML_TYPE_Q3_K }) {
+    for (ggml_type t : { GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0, GGML_TYPE_IQ3_S, GGML_TYPE_Q3_K, GGML_TYPE_Q2_K }) {
         ggml_cl_lb_field f[5];
         const int nf = ggml_cl_lb_fields(t, f);
         CHECK(nf > 0);
