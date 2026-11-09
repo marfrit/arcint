@@ -80,8 +80,10 @@ is there to measure Strata's form on these cards for Q3_K itself.
 
 ## Current state
 
-- Built and unit-tested on the recipe host (the RECIPE line in the patch
-  README's section); no device there.
+- Built and unit-tested on the recipe host, tree `d3444fc8`
+  (`RECIPE d3444fc: 100% tests passed, 0 tests failed out of 36 EXIT 0`);
+  `test-backend-ops` with the new cases compiles. No device there: the
+  OpenCL C kernels are first compiled by the card's driver.
 - Device-free check of the index math (`tools/q3k_layout_emul.py`,
   `measured-here`, an emulation of the kernels' arithmetic in Python, not
   the kernels): the planes round-trip to the GGUF blocks; the tile GEMM's and
