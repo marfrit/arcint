@@ -14,6 +14,20 @@ namespace lgc {
 // the function name drawn from the declared set, required parameters present
 // in any order, and each parameter value typed to its declared schema.
 //
+// One deviation from that reference: the parameter closer. The reference
+// takes only the canonical "\n</parameter>\n"; here `</parameter>` closes a
+// value with or without the newline before it, and an optional newline
+// follows, so a free-text value ends at its first `</parameter>`, exactly
+// where the parser (core/toolcall.h) ends it, and cannot carry that text.
+// Reason (measured-here, a served raw trace, AREX-2 27B, --tool-grammar):
+// the model closes short values inline (`finding</parameter>`); under the
+// canonical-only closer the rest of the call stayed in the value, the grammar
+// never completed, the end of generation stayed masked, and the turn ran to
+// max_tokens or repeated the call. The canonical form is accepted as before.
+// Cells: tests/test_toolgrammar.cpp, toolgrammar_llama_inline_closer_*,
+// toolgrammar_llama_mixed_closers_in_one_call and
+// toolgrammar_llama_canonical_closer_unchanged (ARCINT_LLAMA builds).
+//
 // The grammar is a LAZY trigger on the call opener: prose before the call is
 // unconstrained, the call block is constrained, and the turn ends after the
 // call (a completed GBNF rejects everything but the turn-ending token, which

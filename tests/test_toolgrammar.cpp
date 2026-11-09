@@ -467,4 +467,131 @@ TEST(toolgrammar_llama_parallel_calls_follow_the_request) {
     CHECK(run_grammar(generate_tool_grammar(two_tools(), true), two).complete);
     CHECK(!run_grammar(generate_tool_grammar(two_tools(), false), two).accepted);
 }
+
+// The parameter closer in both forms the model writes. Served on AREX-2 with
+// --tool-grammar (measured-here, a raw trace): short values closed inline,
+// `<parameter=kind>\nfinding</parameter>`, the last one as
+// `unclear</parameter>\n</function>\n</tool_call>`. A grammar that only takes
+// the canonical `\n</parameter>\n` kept everything after an inline closer in
+// the value, never completed, and masked the end of generation.
+namespace {
+
+std::vector<ToolSpec> finding_tool() {
+    ToolSpec f;
+    f.name       = "record_finding";
+    f.parameters = nlohmann::json::parse(R"({"type":"object","properties":{
+        "kind":{"type":"string","enum":["finding","note"]},
+        "lines_sql":{"type":"string"},
+        "class":{"type":"string","enum":["clear","unclear"]}},
+        "required":["kind","lines_sql","class"]})");
+    return { f };
+}
+
+// value, then the closer on its own line (the canonical form)
+std::string arg_canon(const std::string& k, const std::string& v) {
+    const ToolCallTags& t = tool_call_tags();
+    return s(t.param_open) + k + ">\n" + v + "\n" + s(t.param_end) + "\n";
+}
+// value, then the closer on the same line (the served form), then `after`
+std::string arg_inline(const std::string& k, const std::string& v, const std::string& after = "\n") {
+    const ToolCallTags& t = tool_call_tags();
+    return s(t.param_open) + k + ">\n" + v + s(t.param_end) + after;
+}
+std::string wrap_call(const std::string& name, const std::string& body) {
+    const ToolCallTags& t = tool_call_tags();
+    return s(t.open) + "\n" + s(t.fn_open) + name + ">\n" + body + s(t.fn_close) + "\n" + s(t.close);
+}
+
+const std::string kLongSql =
+    "SELECT l.key, l.amount, l.qty\nFROM lines AS l\nJOIN heads AS h ON h.id = l.head_id\n"
+    "WHERE CAST(l.amount AS REAL) < 0 AND l.qty <> 0\nORDER BY l.key";
+
+// the measured call: short enum values inline, the SQL canonical, the last inline
+std::string served_call() {
+    return wrap_call("record_finding", arg_inline("kind", "finding") + arg_canon("lines_sql", kLongSql) +
+                                           arg_inline("class", "unclear"));
+}
+
+}  // namespace
+
+TEST(toolgrammar_llama_inline_closer_completes_the_call) {
+    const std::string g = generate_tool_grammar(finding_tool());
+    const GrammarRun  r = run_grammar(g, served_call());
+    CHECK(r.accepted);
+    CHECK(r.complete);  // the end of generation is allowed after the call
+    // the inline closer directly followed by the next tag, no newline
+    CHECK(run_grammar(g, wrap_call("record_finding", arg_inline("kind", "finding", "") +
+                                                         arg_canon("lines_sql", "SELECT 1") +
+                                                         arg_inline("class", "unclear", "")))
+              .complete);
+    // the parser reads the same call (it always ended a value at the first closer)
+    const ToolCallParse p = parse_qwen_tool_calls(served_call());
+    CHECK_EQ(p.calls.size(), size_t(1));
+    if (p.calls.size() == 1) {
+        const auto a = nlohmann::json::parse(p.calls[0].arguments);
+        CHECK_EQ(a.value("kind", ""), std::string("finding"));
+        CHECK_EQ(a.value("class", ""), std::string("unclear"));
+        CHECK_EQ(a.value("lines_sql", ""), kLongSql);
+    }
+}
+
+// canonical and inline closers mixed in one call, JSON-typed values included
+TEST(toolgrammar_llama_mixed_closers_in_one_call) {
+    const std::string g = generate_tool_grammar(two_tools());
+    CHECK(run_grammar(g, wrap_call("run_query", arg_canon("sql", "SELECT 1") + arg_inline("limit", "10"))).complete);
+    CHECK(run_grammar(g, wrap_call("run_query", arg_inline("sql", "SELECT 1") + arg_canon("limit", "10"))).complete);
+    CHECK(run_grammar(g, wrap_call("run_query", arg_inline("sql", "SELECT 1") + arg_inline("limit", "10") +
+                                                    arg_canon("meta", R"({"a":1})")))
+              .complete);
+    CHECK(run_grammar(g, wrap_call("run_query", arg_canon("sql", "SELECT 1") + arg_canon("limit", "10") +
+                                                    arg_inline("meta", R"({"a":1})", "")))
+              .complete);
+    // a JSON-typed value is still typed under the inline closer
+    CHECK(!run_grammar(g, wrap_call("run_query", arg_inline("sql", "x") + arg_inline("limit", "ten"))).accepted);
+}
+
+// `<` in a value stays data under either closer. The one text that ends a
+// value is the parameter closer itself, `</parameter>`, in either form: the
+// grammar now ends the value at its first occurrence, as the parser does
+// (core/toolcall.cpp reads a value up to the first closer), so a value cannot
+// carry that literal text; what follows it must be the next parameter or the
+// function closer.
+TEST(toolgrammar_llama_inline_closer_keeps_angle_brackets_in_values) {
+    const std::string g = generate_tool_grammar(two_tools());
+    for (const std::string& v : { std::string("SELECT key FROM t WHERE CAST(amount AS REAL) < 0 AND qty <> 0"),
+                                  std::string("x </b> y"), std::string("a </param y"), std::string("a </parameter y"),
+                                  std::string("a </parameter"), std::string("<"), std::string("line one\n</b> two") }) {
+        CHECK(run_grammar(g, wrap_call("run_query", arg_inline("sql", v) + arg_inline("limit", "10"))).complete);
+        CHECK(run_grammar(g, wrap_call("run_query", arg_canon("sql", v) + arg_canon("limit", "10"))).complete);
+    }
+    // the literal closer inside a value ends the value there: text after it is refused
+    const std::string end = s(tool_call_tags().param_end);
+    CHECK(!run_grammar(g, wrap_call("run_query", arg_canon("sql", "a" + end + "b") + arg_canon("limit", "10"))).accepted);
+    CHECK(!run_grammar(g, wrap_call("run_query", arg_canon("sql", "a\n" + end + "b") + arg_canon("limit", "10"))).accepted);
+}
+
+// the canonical form is accepted exactly as before
+TEST(toolgrammar_llama_canonical_closer_unchanged) {
+    const std::string g = generate_tool_grammar(finding_tool());
+    const std::string c = wrap_call("record_finding", arg_canon("kind", "finding") + arg_canon("lines_sql", kLongSql) +
+                                                          arg_canon("class", "unclear"));
+    CHECK(c == call("record_finding", { { "kind", "finding" }, { "lines_sql", kLongSql }, { "class", "unclear" } }));
+    const GrammarRun r = run_grammar(g, c);
+    CHECK(r.accepted);
+    CHECK(r.complete);
+}
+
+// parallel_tool_calls false: after one inline-closed call only the end of
+// generation (or trailing whitespace) is legal; true: the end or another call
+TEST(toolgrammar_llama_inline_closer_parallel_follows_the_request) {
+    const std::string one = served_call();
+    const std::string gs  = generate_tool_grammar(finding_tool(), false);
+    CHECK(run_grammar(gs, one).complete);
+    CHECK(!run_grammar(gs, one + "\nResult:").accepted);
+    CHECK(!run_grammar(gs, one + "\n" + one).accepted);
+    const std::string gp = generate_tool_grammar(finding_tool(), true);
+    CHECK(run_grammar(gp, one).complete);
+    CHECK(run_grammar(gp, one + "\n" + one).complete);
+    CHECK(!run_grammar(gp, one + "\nResult:").accepted);
+}
 #endif

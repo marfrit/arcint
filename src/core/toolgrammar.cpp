@@ -85,9 +85,24 @@ common_peg_parser build_function(toolcall_peg_builder & p, size_t tool_index,
     const std::string kFnClose   = tag_text(t.fn_close);
     const std::string kParamOpen = tag_text(t.param_open);
     const std::string kParamEnd  = tag_text(t.param_end);
-    auto arg_close  = p.tool_arg_close(p.literal("\n" + kParamEnd + "\n"));
+    // DEVIATION from the reference (qwen3-coder.cpp closes a value only with
+    // the canonical "\n</parameter>\n"): the closer is `</parameter>` with or
+    // without the newline before it, then an optional newline, and a
+    // free-text value ends at the first `</parameter>` in either form -- where
+    // the parser (core/toolcall.cpp) has always ended it. Reason, measured-here
+    // on a served raw trace: AREX-2 closes short values inline
+    // (`finding</parameter>`); under the canonical-only closer the rest of the
+    // call stayed inside the value, the grammar never completed and masked the
+    // end of generation. A value can therefore not carry the literal closer
+    // text. Cells: tests/test_toolgrammar.cpp toolgrammar_llama_inline_closer_*,
+    // toolgrammar_llama_mixed_closers_in_one_call, ..._canonical_closer_unchanged.
+    auto nl_opt     = p.optional(p.literal("\n"));
+    auto arg_close  = p.tool_arg_close(nl_opt + p.literal(kParamEnd)) + nl_opt;
     auto arg_string = p.rule("xml-arg-string",
-                             p.ac(p.tool_arg_string_value(p.until("\n" + kParamEnd + "\n")) + arg_close, "\n" + kParamEnd + "\n"));
+                             p.ac(p.tool_arg_string_value(p.until_one_of({ "\n" + kParamEnd, kParamEnd })) +
+                                      p.tool_arg_close(nl_opt + p.literal(kParamEnd)),
+                                  kParamEnd) +
+                                 nl_opt);
 
     // The client's schema: one the closure cannot read, or whose root is not
     // an object (the call form names parameters, so nothing else can be
