@@ -1,5 +1,5 @@
 # Emulates the index math of the 0116 Q3_K kernels (planes, lb_expand / get_rows, mv_q3_K's lane map,
-# the few-column kernel's half codes and swapped activations) against ggml's dequantize_row_q3_K.
+# the few-column kernel's half codes and swapped activations, the 2D GEMM's b operands in P4 order) against ggml's dequantize_row_q3_K.
 # Pure python, small sizes. Usage: python3 -I tools/q3k_layout_emul.py [--red]   (exit 0: PASS). Not the kernels: a transcription of their arithmetic.
 import random, struct, sys
 
@@ -147,6 +147,37 @@ def few_row(S, nblk, nb, r, x):
                     acc += t * D * q3k_scale(sw, s)
     return acc
 
+def q3k_scale_2d(w, is_):
+    # mul_mm_kq_2d.cl q3k_scale_2d (its own byte selection)
+    v8 = (w[0] if is_ < 4 else w[1]) if is_ < 8 else (w[0] if is_ < 12 else w[1])
+    lo = (v8 >> (8 * (is_ & 3))) & 0xF if is_ < 8 else (v8 >> (8 * (is_ & 3) + 4)) & 0xF
+    hi = 0 if RED else (w[2] >> (8 * (is_ & 3) + 2 * (is_ >> 2))) & 3
+    return (lo | (hi << 4)) - 32
+
+def gemm2d_dequant(S, nblk, bi):
+    # kernel_mul_mm_kq2d_q3_K: the weights its b operands carry, put back at their k (slot s of a
+    # 16-wide operand holds k = P4(s)); exact arithmetic for (u - 4) * D * sc
+    P4 = lambda s: (s & ~3) | ((s & 1) << 1) | ((s >> 1) & 1)
+    D = half_to_float(struct.unpack_from('<H', S, bi * 2)[0])
+    sw = [u32(S, nblk * 98 + bi * 12 + 4 * k) for k in range(3)]
+    hmw = [u32(S, nblk * 2 + bi * 32 + 4 * i) for i in range(8)]
+    out = [None] * 256
+    for nn in range(2):
+        qw = [u32(S, nblk * 34 + bi * 64 + 32 * nn + 4 * i) for i in range(8)]
+        for j in range(4):
+            sb, is_, hb = 4 * nn + j, 8 * nn + 2 * j, 4 * nn + j
+            s0, s1 = D * q3k_scale_2d(sw, is_), D * q3k_scale_2d(sw, is_ + 1)
+            halves = []
+            for i in range(8):
+                w = qw[i] >> (2 * j); h = hmw[i] >> hb
+                for pw in (((w & 0x00030003) | ((h & 0x00010001) << 2) | 0x64006400),
+                           (((w >> 8) & 0x00030003) | (((h >> 8) & 0x00010001) << 2) | 0x64006400)):
+                    sc = s0 if i < 4 else s1
+                    halves += [(half_to_float(pw & 0xFFFF) - 1028) * sc, (half_to_float(pw >> 16) - 1028) * sc]
+            for slot in range(32):
+                out[32 * sb + 16 * (slot // 16) + P4(slot % 16)] = halves[slot]
+    return out
+
 def main():
     ne01, nb = 6, 4            # 6 rows of 4 blocks: an even block count
     nblk = ne01 * nb
@@ -167,6 +198,11 @@ def main():
             got += lb_expand(S, nblk, bi, p)
         bad += sum(1 for a, b in zip(got, ref[bi]) if a != b)
     print("dequant: %d of %d weights differ" % (bad, nblk * 256))
+    bad2 = 0
+    for bi in range(nblk):
+        got = gemm2d_dequant(S, nblk, bi)
+        bad2 += sum(1 for a, b in zip(got, ref[bi]) if abs(a - b) > 1e-12 * max(1.0, abs(b)))
+    print("2D GEMM b operands: %d of %d weights differ" % (bad2, nblk * 256))
     x = [random.uniform(-1, 1) for _ in range(nb * 256)]
     worst_mv = worst_few = 0.0
     for r in range(ne01):
@@ -179,7 +215,7 @@ def main():
         worst_few = max(worst_few, abs(fw - exact) / scale)
     print("matvec lane map: worst relative error %.3g" % worst_mv)
     print("few-column codes: worst relative error %.3g" % worst_few)
-    ok = bad == 0 and worst_mv < 1e-9 and worst_few < 1e-6
+    ok = bad == 0 and bad2 == 0 and worst_mv < 1e-9 and worst_few < 1e-6
     print("RESULT", "PASS" if ok else "FAIL", "(red)" if RED else "")
     sys.exit(0 if ok else 1)
 

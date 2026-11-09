@@ -51,7 +51,7 @@ How arcint's build differs (`code`), per the reference rules:
 | 1 column | dp4a MMVQ, one q8_1 term, 16 lanes a block | dp4a matvec, two int8 terms per 32 (`kernel_quantize_q8_1`, arcint's activation since 0001: a single-term q8_1 matvec moved the dense 27B's KL by 0.0026-0.0028 nats, `llama-engine-kquant-kernels.md`), Q6_K's lane map: 8 lanes a block, a lane 8 qs and 8 hmask bytes for 32 weights; `-DQ3K_ONE_TERM` is Strata's single term, an arm |
 | 2-8 columns | the same MMVQ, `NCOLS` 2..8 | the few-column fp16 DPAS product of 0009 (Q6_K's form: a lane is a weight row, its codes the b operand as halves 1024 + u, the tokens the a operand), 2-16 on Xe2, 4-16 on Xe-HPG (the matvec keeps 2-3 there, as for the K-quants); `GGML_OPENCL_KQ_MV_NCOLS=5..8` routes 2 to that many columns to the matvec built up to it instead (Strata's form, the arm) |
 | 9-16 columns | the bf16 GEMM | the same few-column product, two token groups |
-| prompts | bf16 dequant, then a GEMM | the dequantizing tile GEMM (`mul_mm_kq_f16.cl`, `deq_lb`): the weights to f16 in local memory a super-block at a time, fp16 DPAS; a first version, as the low-bit IQ types have it. The K-quants' faster prompt paths (Xe2's 2D-block GEMM, the int8 GEMMs of 0013 / 0102) are not built for Q3_K |
+| prompts | bf16 dequant, then a GEMM | Xe2: the 2D-block GEMM of Q4_K-Q6_K (`mul_mm_kq_2d.cl`) on Q3_K's planes, fp16 DPAS; Xe-HPG and unaligned planes: the dequantizing tile GEMM (`mul_mm_kq_f16.cl`, `deq_lb`). Not the int8 GEMMs of 0013 / 0102: Q3_K's scales are per 16, the int8 DPAS sums 32 |
 
 The reason for the DPAS form at 2-16 is this backend's K-quant evidence, not
 an invariant: 0009's product held 111 us at 2, 4 and 8 columns where the q8_1
@@ -98,6 +98,14 @@ is there to measure Strata's form on these cards for Q3_K itself.
   the base, `ggml-opencl-planes.h`, `tests/test_planes.cpp`), with the review's items: the
   per-kernel work-group fit, the Q3_K-only build fallback, the view rule, K 768 cases.
   The card window on the fix: owed.
+- Window 186's numbers (b6d0e532, B60, us, Q3_K / Q4_K, 4096 x 14336): 78 / 78 at 1
+  column (the 1-column gate holds: equal time at 3.4375 against 4.5 bits a weight),
+  78-79 / 85-87 at 2-8, 97-99 / 136-140 at 9-16; ffn_down at 6 columns 129 / 158; the
+  tile GEMM at 512 columns 1,816 / 826, ffn_down 2,442 / 1,191 (about 2x: the prompt
+  path missed). Strata's NCOLS matvec arm 145-475 us at 2-8 (rejected for the default),
+  one term about equal. The B60's prompt path is now the 2D-block GEMM (Q6_K's form on
+  the planes), target Q4_K's 826 us; its card run is owed. The A770 keeps the tile
+  (no 2D block reads; int8 does not fit Q3_K's per-16 scales).
 
 ## Where it lives
 
