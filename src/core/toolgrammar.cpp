@@ -2,6 +2,7 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -127,6 +128,51 @@ bool listed_strings(const common_chat_schema& s, std::vector<std::string>& out,
     return false;
 }
 
+// The name a rule gets in the grammar: the builder maps every run of characters
+// outside [A-Za-z0-9-] to one "-" (peg-parser.cpp rule_name), so parameters
+// "a_b" and "a.b" would share a rule.
+std::string sanitized_rule_name(const std::string& name) {
+    std::string out;
+    bool        in_run = false;
+    for (const char c : name) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-';
+        if (ok) {
+            out.push_back(c);
+            in_run = false;
+        } else if (!in_run) {
+            out.push_back('-');
+            in_run = true;
+        }
+    }
+    return out;
+}
+
+// `base`, or `base-2`, `base-3`, ... : the first whose sanitized form no rule of
+// this function has taken. add_rule is last-wins, so a clash would make one
+// parameter's value silently resolve to another's rule. Without a clash the
+// name is `base` itself, so a request that never clashed gets the grammar it
+// always got.
+std::string unique_rule_name(std::unordered_set<std::string>& used, const std::string& base) {
+    std::string cand = base;
+    for (size_t n = 2; !used.insert(sanitized_rule_name(cand)).second; n++) cand = base + "-" + std::to_string(n);
+    return cand;
+}
+
+// Whether the raw schema of a property says `nullable: true`, itself or in an
+// anyOf / oneOf branch (an OpenAPI-style null the closure does not read: it is
+// not a type, so the value types stay {string} and the parent grammar took
+// `null` as free text). `$ref` targets are not followed.
+bool declares_nullable(const common_json& s, int depth = 0) {
+    if (depth > 8 || !s.is_object()) return false;
+    if (s.contains("nullable") && s.at("nullable").is_boolean() && s.at("nullable").get<bool>()) return true;
+    for (const char* key : { "anyOf", "oneOf" }) {
+        if (!s.contains(key) || !s.at(key).is_array()) continue;
+        for (size_t i = 0; i < s.at(key).size(); i++)
+            if (declares_nullable(s.at(key).at(i), depth + 1)) return true;
+    }
+    return false;
+}
+
 // Build one function's tool-call block, mirroring the reference's per-function
 // loop. `params` is the function's JSON Schema (the `parameters` object the
 // client declared). Returns the `tool-N` rule.
@@ -135,6 +181,7 @@ common_peg_parser build_function(toolcall_peg_builder & p, size_t tool_index,
     const ToolCallTags& t      = tool_call_tags();
     const std::string kFnOpen    = tag_text(t.fn_open);
     const std::string kFnClose   = tag_text(t.fn_close);
+    const std::string kCallClose = tag_text(t.close);
     const std::string kParamOpen = tag_text(t.param_open);
     const std::string kParamEnd  = tag_text(t.param_end);
     // DEVIATION from the reference (qwen3-coder.cpp closes a value only with
@@ -173,8 +220,9 @@ common_peg_parser build_function(toolcall_peg_builder & p, size_t tool_index,
     std::vector<common_peg_parser> optional_args;
 
     const auto & obj = static_cast<const common_chat_schema_object &>(*doc->root);
+    std::unordered_set<std::string> used_rules;
     for (const auto & prop : obj.properties) {
-        auto rule_name = "tool-" + std::to_string(tool_index) + "-arg-" + prop.name;
+        const auto rule_name = unique_rule_name(used_rules, "tool-" + std::to_string(tool_index) + "-arg-" + prop.name);
         auto arg_open  = p.tool_arg_open(kParamOpen + p.tool_arg_name(p.literal(prop.name)) + ">\n");
 
         auto types = prop.schema->value_types();
@@ -186,16 +234,29 @@ common_peg_parser build_function(toolcall_peg_builder & p, size_t tool_index,
         // is. One that ends in a newline takes the canonical closer only (the
         // parser strips one newline before the closer). A list holding the
         // closer text itself cannot be read back by the parser, which ends a
-        // value at its first `</parameter>`: such a property stays free.
+        // value at its first `</parameter>`: such a property stays free. So
+        // does one holding the end of the call (`</function>`, `</tool_call>`:
+        // the parser cuts the call there first) or a NUL (not representable in
+        // the grammar text, which is handed on as a C string), and one declared
+        // `nullable` (the parent grammar took `null` as free text there).
         std::vector<std::string> listed;
         bool                     is_listed = false;
         if (types.has(common_chat_schema::TYPE_STRING)) {
             std::unordered_set<const common_chat_schema*> visiting;
             is_listed = listed_strings(*prop.schema, listed, visiting) && !listed.empty();
-            for (const auto& v : listed)
-                if (v.find(kParamEnd) != std::string::npos) is_listed = false;
+            for (const auto& v : listed) {
+                if (v.find('\0') != std::string::npos) is_listed = false;
+                for (const std::string& closer_text : { kParamEnd, kFnClose, kCallClose })
+                    if (v.find(closer_text) != std::string::npos) is_listed = false;
+            }
+            if (is_listed && params.contains("properties") && params.at("properties").is_object() &&
+                params.at("properties").contains(prop.name) && declares_nullable(params.at("properties").at(prop.name)))
+                is_listed = false;
         }
-        auto listed_value = p.eps();
+        // built only for a listed value: every parser is an arena node, node
+        // ids are in the rule names, so a node made for nothing would move the
+        // names of a request that lists nothing
+        std::optional<common_peg_parser> listed_value;
         if (is_listed) {
             auto alts = p.choice();
             for (const auto& v : listed) {
@@ -204,14 +265,14 @@ common_peg_parser build_function(toolcall_peg_builder & p, size_t tool_index,
                 auto value  = v.empty() ? p.tool_arg_string_value(p.eps()) : p.tool_arg_string_value(p.literal(v));
                 alts |= value + p.tool_arg_close(closer);
             }
-            listed_value = p.rule(rule_name + "-listed", alts + nl_opt);
+            listed_value = p.rule(unique_rule_name(used_rules, rule_name + "-listed"), alts + nl_opt);
         }
 
         auto arg_value = p.eps();
         if (!types.has(common_chat_schema::TYPE_STRING)) {
-            arg_value = p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", doc, *prop.schema)) + arg_close;
+            arg_value = p.tool_arg_json_value(p.schema(p.json(), unique_rule_name(used_rules, rule_name + "-schema"), doc, *prop.schema)) + arg_close;
         } else if (types.is_only(common_chat_schema::TYPE_STRING)) {
-            arg_value = is_listed ? listed_value : arg_string;
+            arg_value = is_listed ? *listed_value : arg_string;
         } else if (is_listed) {
             // the non-string alternatives keep today's JSON values; the free
             // text that subsumed them is replaced by the listed strings
@@ -221,7 +282,7 @@ common_peg_parser build_function(toolcall_peg_builder & p, size_t tool_index,
             if (types.has(common_chat_schema::TYPE_NUMBER) || types.has(common_chat_schema::TYPE_INTEGER)) json_value |= p.json_number();
             if (types.has(common_chat_schema::TYPE_BOOLEAN)) json_value |= p.json_bool();
             if (types.has(common_chat_schema::TYPE_NULL))    json_value |= p.json_null();
-            arg_value = p.atomic(p.tool_arg_json_value(json_value) + arg_close) | listed_value;
+            arg_value = p.atomic(p.tool_arg_json_value(json_value) + arg_close) | *listed_value;
         } else {
             auto json_value = p.choice();
             if (types.has(common_chat_schema::TYPE_OBJECT)) json_value |= p.json_object();

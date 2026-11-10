@@ -77,6 +77,100 @@ std::string s(std::string_view v) { return std::string(v); }
 
 }  // namespace
 
+namespace {
+// Two tools and a tool without parameters, no enum and no const anywhere.
+std::vector<ToolSpec> plain_tools() {
+    ToolSpec weather;
+    weather.name       = "get_weather";
+    weather.parameters = nlohmann::json::parse(R"({"type":"object","properties":{
+        "city":{"type":"string"},
+        "units":{"type":"string"},
+        "note":{"type":["string","null"]},
+        "days":{"type":"integer"}},
+        "required":["city","days"]})");
+    ToolSpec query;
+    query.name       = "run_query";
+    query.parameters = nlohmann::json::parse(R"({"type":"object","properties":{
+        "sql":{"type":"string"},
+        "limit":{"type":"integer"},
+        "meta":{"type":"object"},
+        "tags":{"type":"array","items":{"type":"string"}}},
+        "required":["sql","limit"]})");
+    ToolSpec ping;
+    ping.name       = "ping";
+    ping.parameters = nlohmann::json::parse(R"({"type":"object"})");
+    return { weather, query, ping };
+}
+}  // namespace
+
+// A request that lists nothing (no enum, no const) gets the grammar text it got
+// before listed values existed. Every parser is an arena node and node ids are
+// in the rule names (ac-354, ...), so a node built for nothing shows here as a
+// moved name. The golden is the output of generate_tool_grammar(plain_tools())
+// on the parent of the listed-values change (b669f57c), taken by building that
+// tree on the recipe host and printing it; it is not written by hand. Red on
+// the listed-values change as first made (an eps() node per property), red on
+// any later change that moves a rule name or the text of an unlisted request.
+TEST(toolgrammar_unlisted_request_grammar_is_the_parents) {
+    const std::string golden = R"GBNF(ac-354 ::= [<] ac-354-01 | [^<] ac-354
+ac-354-01 ::= [<] ac-354-01 | [/] ac-354-02 | [^/<] ac-354
+ac-354-02 ::= [<] ac-354-01 | [p] ac-354-03 | [^<p] ac-354
+ac-354-03 ::= [<] ac-354-01 | [a] ac-354-04 | [^<a] ac-354
+ac-354-04 ::= [<] ac-354-01 | [r] ac-354-05 | [^<r] ac-354
+ac-354-05 ::= [<] ac-354-01 | [a] ac-354-06 | [^<a] ac-354
+ac-354-06 ::= [<] ac-354-01 | [m] ac-354-07 | [^<m] ac-354
+ac-354-07 ::= [<] ac-354-01 | [e] ac-354-08 | [^<e] ac-354
+ac-354-08 ::= [<] ac-354-01 | [t] ac-354-09 | [^<t] ac-354
+ac-354-09 ::= [<] ac-354-01 | [e] ac-354-10 | [^<e] ac-354
+ac-354-10 ::= [<] ac-354-01 | [r] ac-354-11 | [^<r] ac-354
+ac-354-11 ::= [>] | [<] ac-354-01 | [^<>] ac-354
+array ::= "[" space ( value ("," space value)* )? space "]"
+boolean ::= ("true" | "false")
+char ::= [^"\\\x7F\x00-\x1F] | [\\] (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+decimal-part ::= [0-9]{1,16}
+integer ::= ("-"? integral-part)
+integral-part ::= [0] | [1-9] [0-9]{0,15}
+json-array ::= "[" space ("]" | json-value (space "," space json-value)* space "]")
+json-bool ::= "true" | "false"
+json-null ::= "null"
+json-number ::= "-"? ("0" | [1-9] [0-9]*) ("." [0-9]+)? (("e" | "E") [+-]? [0-9]+)?
+json-object ::= "{" space ("}" | json-string space ":" space json-value (space "," space json-string space ":" space json-value)* space "}")
+json-string ::= "\"" ( [^"\\] | "\\" ( ["\\/ bfnrt] | "u" [0-9a-fA-F]{4} ) )* "\""
+json-value ::= json-object | json-array | json-string | json-number | json-bool | json-null
+null ::= "null"
+number ::= ("-"? integral-part) ("." decimal-part)? ([eE] [-+]? integral-part)?
+object ::= "{" space ( string ":" space value ("," space string ":" space value)* )? space "}"
+root ::= tool-call-root
+space ::= | " " | "\n"{1,2} [ \t]{0,20}
+string ::= "\"" char* "\""
+tool-0 ::= ("<function=" "get_weather" ">\n") (tool-0-args-3 (tool-0-arg-note | tool-0-arg-units)*) "</function>\n"
+tool-0-arg-city ::= ("<parameter=" "city" ">\n") xml-arg-string
+tool-0-arg-days ::= ("<parameter=" "days" ">\n") integer ("\n"? "</parameter>") "\n"?
+tool-0-arg-note ::= ("<parameter=" "note" ">\n") xml-arg-string
+tool-0-arg-units ::= ("<parameter=" "units" ">\n") xml-arg-string
+tool-0-args-1 ::= tool-0-arg-city
+tool-0-args-2 ::= tool-0-arg-days
+tool-0-args-3 ::= tool-0-arg-city tool-0-args-2 | tool-0-arg-days tool-0-args-1
+tool-1 ::= ("<function=" "run_query" ">\n") (tool-1-args-3 (tool-1-arg-meta | tool-1-arg-tags)*) "</function>\n"
+tool-1-arg-limit ::= ("<parameter=" "limit" ">\n") integer ("\n"? "</parameter>") "\n"?
+tool-1-arg-meta ::= ("<parameter=" "meta" ">\n") tool-1-arg-meta-schema ("\n"? "</parameter>") "\n"?
+tool-1-arg-meta-schema ::= object
+tool-1-arg-sql ::= ("<parameter=" "sql" ">\n") xml-arg-string
+tool-1-arg-tags ::= ("<parameter=" "tags" ">\n") tool-1-arg-tags-schema ("\n"? "</parameter>") "\n"?
+tool-1-arg-tags-schema ::= "[" space (string ("," space string)*)? space "]"
+tool-1-args-1 ::= tool-1-arg-limit
+tool-1-args-2 ::= tool-1-arg-sql
+tool-1-args-3 ::= tool-1-arg-limit tool-1-args-2 | tool-1-arg-sql tool-1-args-1
+tool-2 ::= ("<function=" "ping" ">\n") "</function>\n"
+tool-call ::= "<tool_call>\n" (tool-0 | tool-1 | tool-2) "</tool_call>" space
+tool-call-root ::= (tool-call tool-call*)?
+value ::= object | array | string | number | boolean | null
+xml-arg-string ::= ac-354 "\n"?
+)GBNF";
+    CHECK_EQ(golden.size(), size_t(3297));
+    CHECK(generate_tool_grammar(plain_tools()) == golden);
+}
+
 TEST(toolgrammar_no_tools_no_grammar) {
     CHECK(generate_tool_grammar({}).empty());
     CHECK_EQ(tool_grammar_trigger(), s(tool_call_tags().open));
@@ -748,5 +842,152 @@ TEST(toolgrammar_llama_enum_parallel_follows_the_request) {
     CHECK(run_grammar(gp, one).complete);
     CHECK(run_grammar(gp, one + "\n" + one).complete);
     CHECK(!run_grammar(gp, one + "\nResult:").accepted);
+}
+
+// ---------------------------------------------------------------------------
+// Review follow-up cells for the listed values. Each names the mutation that
+// turns it red.
+namespace {
+
+// one tool "t" whose parameters are optional string enums, in the order given
+// (the schema's keys are ordered by nlohmann::json, so the order is the sorted one)
+std::vector<ToolSpec> enum_params_tool(const std::vector<std::pair<std::string, nlohmann::json>>& props) {
+    nlohmann::json schema = { { "type", "object" }, { "properties", nlohmann::json::object() } };
+    for (const auto& [name, values] : props) schema["properties"][name] = { { "type", "string" }, { "enum", values } };
+    ToolSpec t;
+    t.name       = "t";
+    t.parameters = schema;
+    return { t };
+}
+
+bool takes(const std::string& g, const std::string& k, const std::string& v) {
+    return run_grammar(g, wrap_call("t", arg_canon(k, v))).complete;
+}
+bool refuses(const std::string& g, const std::string& k, const std::string& v) {
+    return !run_grammar(g, wrap_call("t", arg_canon(k, v))).accepted;
+}
+
+}  // namespace
+
+// A listed value holding a closer the parser reads first (</parameter>,
+// </function>, </tool_call>) is not enforceable: the property stays free, its
+// neighbours stay listed. Red if the guard checks only </parameter>: the
+// </function> and </tool_call> properties then take their list as a list and
+// refuse the free text.
+TEST(toolgrammar_llama_enum_closer_in_a_value_keeps_the_property_free) {
+    const std::string g = generate_tool_grammar(enum_params_tool({
+        { "p", nlohmann::json::array({ "a</parameter>b", "x" }) },
+        { "f", nlohmann::json::array({ "a</function>b", "x" }) },
+        { "c", nlohmann::json::array({ "a</tool_call>b", "x" }) },
+        { "z", nlohmann::json::array({ "x", "y" }) } }));
+    for (const char* k : { "p", "f", "c" }) {
+        CHECK(takes(g, k, "anything <at> all"));
+        CHECK(takes(g, k, "x"));
+    }
+    CHECK(takes(g, "z", "y"));
+    CHECK(refuses(g, "z", "w"));
+}
+
+// A NUL in a listed value cannot be written into the grammar text (it is
+// handed on as a C string): the property stays free. Red if NUL is not guarded:
+// the grammar text then holds a NUL and libllama refuses or truncates it.
+TEST(toolgrammar_llama_enum_nul_in_a_value_keeps_the_property_free) {
+    const std::string g = generate_tool_grammar(enum_params_tool({
+        { "n", nlohmann::json::array({ std::string("a\0b", 3), "x" }) },
+        { "z", nlohmann::json::array({ "x", "y" }) } }));
+    CHECK(g.find('\0') == std::string::npos);
+    CHECK(takes(g, "n", "anything <at> all"));
+    CHECK(takes(g, "n", "x"));
+    CHECK(takes(g, "z", "y"));
+    CHECK(refuses(g, "z", "w"));
+}
+
+// Two parameters whose rule names meet must each keep their own values: `kind`
+// and `kind-listed` (the listed rule of `kind` was named like the argument rule
+// of `kind-listed`), `a.b` and `a_b` (the builder maps both to `a-b`), `m` and
+// `m-schema` (the JSON-value rule of `m`). Red when add_rule's last-wins lets
+// one resolve to the other's rule.
+TEST(toolgrammar_llama_enum_rule_names_cannot_collide) {
+    const std::string g = generate_tool_grammar(enum_params_tool({
+        { "kind", nlohmann::json::array({ "a", "b" }) },
+        { "kind-listed", nlohmann::json::array({ "c", "d" }) },
+        { "a.b", nlohmann::json::array({ "e", "f" }) },
+        { "a_b", nlohmann::json::array({ "g", "h" }) } }));
+    for (const char* v : { "a", "b" }) CHECK(takes(g, "kind", v));
+    for (const char* v : { "c", "d" }) CHECK(takes(g, "kind-listed", v));
+    for (const char* v : { "e", "f" }) CHECK(takes(g, "a.b", v));
+    for (const char* v : { "g", "h" }) CHECK(takes(g, "a_b", v));
+    CHECK(refuses(g, "kind", "c"));
+    CHECK(refuses(g, "kind-listed", "a"));
+    CHECK(refuses(g, "a.b", "g"));
+    CHECK(refuses(g, "a_b", "e"));
+
+    // a mixed-type property has the "-schema" rule; a parameter named like it
+    ToolSpec t;
+    t.name       = "t";
+    t.parameters = nlohmann::json::parse(R"({"type":"object","properties":{
+        "m":{"type":"integer"},
+        "m-schema":{"type":"string","enum":["p","q"]}}})");
+    const std::string g2 = generate_tool_grammar({ t });
+    CHECK(takes(g2, "m", "12"));
+    CHECK(refuses(g2, "m", "p"));
+    CHECK(takes(g2, "m-schema", "q"));
+    CHECK(refuses(g2, "m-schema", "12"));
+}
+
+// `nullable: true` is not a type the closure reads, and the parent grammar
+// took `null` there as free text: not listed. Red when the enum is enforced
+// (the free-text cells then refuse).
+TEST(toolgrammar_llama_enum_nullable_stays_free) {
+    ToolSpec t;
+    t.name       = "t";
+    t.parameters = nlohmann::json::parse(R"({"type":"object","properties":{
+        "n":{"type":"string","enum":["a"],"nullable":true},
+        "o":{"anyOf":[{"type":"string","enum":["a"],"nullable":true}]},
+        "m":{"type":"string","enum":["a"],"nullable":false},
+        "l":{"type":"string","enum":["a"]}}})");
+    const std::string g = generate_tool_grammar({ t });
+    for (const char* k : { "n", "o" }) {
+        CHECK(takes(g, k, "null"));
+        CHECK(takes(g, k, "a"));
+        CHECK(takes(g, k, "something else"));
+    }
+    for (const char* k : { "m", "l" }) {
+        CHECK(takes(g, k, "a"));
+        CHECK(refuses(g, k, "null"));
+    }
+}
+
+// Listed values at the edges of the closer and of GBNF literals. Red if a value
+// ending in a newline also took the inline closer (the parser strips one
+// newline before it, so "a\n</parameter>" reads back as "a"), if the empty
+// string were dropped from the list, or if `"` or `\` went into the grammar
+// text unescaped.
+TEST(toolgrammar_llama_enum_edge_values) {
+    const std::string g = generate_tool_grammar(enum_params_tool({
+        { "nl", nlohmann::json::array({ "a\n", "b" }) },
+        { "em", nlohmann::json::array({ "", "x" }) },
+        { "q", nlohmann::json::array({ "say \"hi\"", "x" }) },
+        { "bs", nlohmann::json::array({ "a\\b", "x" }) } }));
+    // newline last: canonical closer only
+    CHECK(takes(g, "nl", "a\n"));
+    CHECK(!run_grammar(g, wrap_call("t", arg_inline("nl", "a\n"))).accepted);
+    CHECK(run_grammar(g, wrap_call("t", arg_inline("nl", "b"))).complete);
+    CHECK(refuses(g, "nl", "a"));
+    const ToolCallParse p = parse_qwen_tool_calls(wrap_call("t", arg_canon("nl", "a\n")));
+    CHECK_EQ(p.calls.size(), size_t(1));
+    if (p.calls.size() == 1) CHECK_EQ(nlohmann::json::parse(p.calls[0].arguments).value("nl", "?"), std::string("a\n"));
+    // the empty string, both closers
+    CHECK(takes(g, "em", ""));
+    CHECK(run_grammar(g, wrap_call("t", arg_inline("em", ""))).complete);
+    CHECK(takes(g, "em", "x"));
+    CHECK(refuses(g, "em", "y"));
+    // a quote, a backslash
+    CHECK(takes(g, "q", "say \"hi\""));
+    CHECK(refuses(g, "q", "say hi"));
+    CHECK(refuses(g, "q", "say \\\"hi\\\""));
+    CHECK(takes(g, "bs", "a\\b"));
+    CHECK(refuses(g, "bs", "ab"));
+    CHECK(refuses(g, "bs", "a/b"));
 }
 #endif

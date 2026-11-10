@@ -37,9 +37,11 @@ namespace lgc {
 // closer above. A listed string is raw text, as every value in this call
 // form: `<` and newlines in it are written as is, a string ending in a
 // newline takes the canonical closer only. Free stays: a schema with any
-// unlisted string branch (a plain string, allOf, no type), and a list holding
-// the closer text itself, which the parser could not read back. Non-string
-// alternatives (null, a number, ...) keep their JSON values. Reason
+// unlisted string branch (a plain string, allOf, no type), a schema declared
+// `nullable: true`, and a list holding the closer text itself (</parameter>,
+// </function>, </tool_call>) or a NUL, which the parser could not read back or
+// the grammar text cannot carry. Non-string alternatives (null, a number, ...)
+// keep their JSON values; in a mixed enum only its string members are listed. Reason
 // (measured-here, served, AREX-2, --tool-grammar): a call arrived as
 // `"kind":"<parameter=class>\nunclear"` -- the model opened `kind`, wrote no
 // value and opened the next parameter, which a free-text value takes as data.
