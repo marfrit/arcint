@@ -1217,6 +1217,22 @@ TEST(config_chat_template_kwarg_generic_refusals) {
     CHECK(rejected({"--stub", "--chat-template-kwarg", "force_nonempty_content"}));
 }
 
+// Review F5: the default of force_nonempty_content is a JSON boolean, or the start fails.
+TEST(config_chat_template_kwarg_force_nonempty_content_takes_only_booleans) {
+    Config cfg;
+    CHECK(run({"--stub", "--chat-template-kwarg", "force_nonempty_content=true"}, cfg).ok);
+    Config cfg2;
+    CHECK(run({"--stub", "--chat-template-kwarg", "force_nonempty_content=false"}, cfg2).ok);
+    for (const char* kv : {"force_nonempty_content=1", "force_nonempty_content=True",
+                           "force_nonempty_content=yes", "force_nonempty_content=\"true\"",
+                           "force_nonempty_content=0"}) {
+        Config c;
+        const ArgParse r = run({"--stub", "--chat-template-kwarg", kv}, c);
+        CHECK(!r.ok);
+        CHECK(r.error.find("true or false") != std::string::npos);
+    }
+}
+
 // Review F8: a bare value with invalid UTF-8 is a string json cannot serialise; it
 // was an uncaught exception out of parse_args, now a config error.
 TEST(config_chat_template_kwarg_invalid_utf8_is_a_config_error) {

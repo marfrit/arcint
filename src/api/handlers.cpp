@@ -1350,6 +1350,10 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     // ARCINT_RAW_TRACE: the reasoning is kept only for the trace's line
     const bool          tracing = raw_trace_on();
     std::string         traced_reasoning;
+    // force_nonempty_content (core/chat.h): the reasoning text is kept only when
+    // the trigger is on, to go out once as content if the block never closes.
+    const bool          force_content = force_nonempty_content_requested(prep.req.chat_template_kwargs);
+    std::string         forced_reasoning;
     auto send_reasoning = [&](const std::string& safe) {
         had_reasoning = true;
         return sse_send(write, chunk(json::array({{{"index", 0},
@@ -1386,6 +1390,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
         [&](std::string_view piece, int token_id, const std::string&) -> bool {
             const ReasoningStreamer::Step step = reasoning.push(piece, token_id);
             if (tracing) traced_reasoning += step.reasoning;
+            if (force_content) forced_reasoning += step.reasoning;
             if (!emit_reasoning(step.reasoning)) {
                 gone = true;
                 return false;
@@ -1475,8 +1480,28 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     // any send can fail, then everything goes out in the order it always did.
     const ReasoningStreamer::Step last = reasoning.flush();
     if (!last.content.empty()) content += last.content;
+    if (force_content) forced_reasoning += last.reasoning;
+    // force_nonempty_content, streaming (vLLM finalize_generation): the block
+    // never closed and the answer is blank, so the whole reasoning text becomes
+    // the answer. A block that closed with a blank answer is not promoted here
+    // (the reference promotes that case in the non-streaming path only). The
+    // promoted text is sent as it is and is not tool-parsed, as in the
+    // reference's stream (finalize_generation appends it to the delta's content
+    // and runs no tool parser): call markup the model wrote inside a thinking
+    // block that was cut stays text and is never a tool_calls delta (operator,
+    // 2026-11-11). The content of such a turn is blank, so there is no call in
+    // it either and the turn has no tool parse at all.
+    const bool promoted = force_content && reasoning.in_reasoning() &&
+                          promote_reasoning_to_content(prep.req.chat_template_kwargs,
+                                                       forced_reasoning, content);
+    if (promoted) {
+        log::debug("req", "force_nonempty_content: %zu streamed reasoning bytes become the content%s",
+                   forced_reasoning.size(), rid_suffix(prep.request_id).c_str());
+    }
+    const bool         parse_calls = prep.parse_tool_calls && !promoted;
+    const std::string& final_text  = promoted ? forced_reasoning : content;
     ToolCallParse parsed;
-    if (prep.parse_tool_calls) {
+    if (parse_calls) {
         parsed = parse_tool_calls(content, prep.dialect, &prep.schemas);
         if (parsed.truncated) {
             log::warn("tools", "unterminated %s block; returned as raw content%s",
@@ -1487,18 +1512,19 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     if (tracing) {
         RawTraceRecord r = raw_trace_record(prep, "chat", true, finish_reason_name(reason), raw);
         r.reasoning      = traced_reasoning + last.reasoning;
-        r.tool_parse     = prep.parse_tool_calls;
-        r.parsed_input   = prep.parse_tool_calls ? &content : nullptr;
+        r.tool_parse     = parse_calls;
+        r.parsed_input   = parse_calls ? &content : nullptr;
         r.calls          = &parsed.calls;
-        r.content        = prep.parse_tool_calls ? parsed.content : content;
+        r.content        = parse_calls ? parsed.content : final_text;
         raw_trace_write(r);
     }
     if (!emit_reasoning(last.reasoning)) return;
     if (!flush_reasoning()) return;
     if (!last.content.empty() && !prep.parse_tool_calls && !emit_content(last.content)) return;
+    if (promoted && !emit_content(forced_reasoning)) return;
 
     std::vector<ToolCall> calls;
-    if (prep.parse_tool_calls) {
+    if (parse_calls) {
         calls = std::move(parsed.calls);
         if (parsed.content.size() > streamed) {
             if (!emit_content(std::string_view(parsed.content).substr(streamed))) return;

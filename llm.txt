@@ -357,6 +357,19 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
   lists the level as configured, not as mapped. A request
   that carries the key wins (false included). All chat-preparing routes get
   it; /props chat_template_kwargs_default lists them.
+- chat_template_kwargs.force_nonempty_content=true (request or unit default;
+  only the JSON boolean true; a unit default must be true or false): non-stream,
+  an empty/blank answer takes the reasoning text as content (before the tool-call parse); stream, a think block
+  that never closed sends the reasoning once as a content delta before the
+  final chunk, as text: the stream runs no tool-call parse on it (as vLLM's
+  stream), so call markup inside a cut thinking block is never a tool_calls
+  delta / function_call item. Blank reasoning
+  (empty or ASCII whitespace only; a non-ASCII space such as U+00A0 counts as
+  text, the reference's str.strip() reads it as blank) is never promoted, on any path. A block
+  that closed with a blank answer is promoted non-stream only. On the Responses
+  stream the reasoning item closes before the message item is added; token
+  mode is exempt (its arcint:token events are the gateway's record of the
+  turn). After vLLM's nemotron_v3 parser; chat and Responses routes.
 - --llama-kv K[:V]; --llama-threads N; --llama-reserve-cells N.
 - --llama-mtp N, --llama-mtp-gguf FILE, --llama-mtp-vocab FILE,
   --llama-mtp-min-p P, --llama-mtp-card N, --llama-mtp-depth-max N (0, off:

@@ -980,3 +980,17 @@ TEST(chat_template_kwarg_parse_default_reasoning_effort_values) {
     CHECK(parse_template_kwarg_default("reasoning_effort=extreme", key, v).has_value());
     CHECK(parse_template_kwarg_default("reasoning_effort=3", key, v).has_value());
 }
+
+// Review F5: the trigger reads the JSON boolean only, so a default of anything else
+// would be accepted and never fire.
+TEST(chat_template_kwarg_parse_default_force_nonempty_content_values) {
+    std::string    key;
+    nlohmann::json v;
+    CHECK(!parse_template_kwarg_default("force_nonempty_content=true", key, v));
+    CHECK(!parse_template_kwarg_default("force_nonempty_content=false", key, v));
+    for (const char* bad : {"1", "True", "yes", "\"true\"", "0", "x"}) {
+        const auto err = parse_template_kwarg_default(std::string("force_nonempty_content=") + bad, key, v);
+        CHECK(err.has_value());
+        if (err) CHECK(err->find("true or false") != std::string::npos);
+    }
+}

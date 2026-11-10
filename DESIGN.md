@@ -499,6 +499,41 @@ provenance: `operator`, `card` or `provisional` (`code`).
   it and rewritten only where it cannot take it (minimal -> low, high -> xhigh,
   xhigh -> high); `/props` publishes the levels as `reasoning_effort_levels`
   (`code`).
+- **`force_nonempty_content`** (`chat_template_kwargs`, the request's or the unit
+  default of `--chat-template-kwarg`; `code`, `promote_reasoning_to_content` in
+  `src/core/chat.cpp`, after vLLM's Nemotron-V3 reasoning parser, main
+  1479deb0392f). The trigger is the JSON boolean `true`; a unit default of
+  anything else fails at start. Non-streaming (chat and Responses,
+  `finish_chat_generation`): after the reasoning split, empty or blank content
+  with reasoning text takes the reasoning as the content, before the tool-call
+  parse. Streaming: only a think block that never closed is promoted, at the end
+  of the turn, and the promoted text is sent as content as it is, with no
+  tool-call parse (the reference's `finalize_generation` appends it to the
+  delta's content and runs no tool parser; operator, 2026-11-11: a call quoted
+  inside a thinking block that was cut must not come back as a call). So the
+  two paths differ on a call written inside a block that never closed, as they
+  do in the reference: the non-streaming result parses it, the stream sends the
+  markup as text with the generation's own finish reason. Blank
+  reasoning (empty or ASCII whitespace only) is never promoted, on any path. On the
+  Responses stream the reasoning item is closed before the message item is added
+  (as on the closed-block path), and token mode is exempt; a promoted turn that
+  did not end with Stop (`max_output_tokens` reached inside the block) is
+  [reasoning `incomplete`, message `incomplete`], in that order. Recorded
+  differences from the reference:
+  no swap when the reasoning is blank; blankness is tested on ASCII whitespace
+  (space, \t \n \r \v \f), so text that is only a non-ASCII space (U+00A0,
+  U+3000) counts as text where the reference's `str.strip()` reads it as blank
+  (`code`, `text_is_blank`; no test pins it); the old blank content is
+  dropped, not kept as reasoning; `reasoning_tokens` is counted before the swap
+  and stays, so a non-streaming Responses resource can report reasoning tokens
+  with no reasoning item; the non-streaming content has its edge newlines
+  stripped by the split while the stream sends the reasoning as streamed; the
+  `enable_thinking is False` trigger is not built, because a non-thinking prompt
+  that ends in a closed think block already starts in content (`ThinkStart::Closed`).
+  Enforced by `tests/test_force_content.cpp` and the `responses_force_nonempty_content_*`
+  cases of `tests/test_responses.cpp`; the item order and statuses of the cut
+  promoted turn by `responses_force_nonempty_content_stream_promoted_turn_cut_by_length_is_two_incomplete_items`,
+  a by-design pin (green on the code as it stands).
 - **Tool calls.** The models' native format is parsed into OpenAI
   `tool_calls`; requests without `tools` get raw text. A template that
   iterates arguments as a mapping is handed the parsed object; minja

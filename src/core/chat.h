@@ -196,6 +196,32 @@ std::optional<std::string> parse_template_kwarg_default(std::string_view kv, std
 void apply_template_kwarg_defaults(ChatRequest& req,
                                    const std::vector<std::pair<std::string, std::string>>& defaults);
 
+// force_nonempty_content (NVIDIA's Dory1.0-4B model card tells agents to send
+// chat_template_kwargs.force_nonempty_content=true; its chat template ignores
+// the name, `measured-here`, so the server acts on it, as vLLM's Nemotron-V3
+// reasoning parser does: `code`, vllm/parser/nemotron_v3.py
+// _should_force_content / extract_reasoning, abstract_parser.py
+// finalize_generation, main 1479deb0392f).
+//
+// The trigger is the effective kwarg (the request's, else the unit default of
+// --chat-template-kwarg) being the JSON boolean true; the string "true" and the
+// number 1 do not trigger (the reference tests `is True`).
+bool force_nonempty_content_requested(const nlohmann::json& chat_template_kwargs);
+
+// true when `text` is empty or only ASCII whitespace (space, \t \n \r \v \f): the
+// ASCII part of Python's str.strip() set, the reference's blank test. A non-ASCII
+// space (U+00A0, U+3000) counts as text here; a recorded difference (DESIGN 3.7).
+bool text_is_blank(std::string_view text);
+
+// The one decision all three response paths use (non-streaming, chat stream,
+// Responses stream): true when the kwarg is set, the reasoning is not blank and
+// the content is blank (text_is_blank). Then the answer is the reasoning text.
+// Pure. Deviation from the reference: it also swaps when the reasoning is blank
+// (content=None, reasoning=whitespace); there is nothing to promote then, so this
+// does not. Enforced by test_force_content.cpp.
+bool promote_reasoning_to_content(const nlohmann::json& chat_template_kwargs,
+                                  std::string_view reasoning, std::string_view content);
+
 // The levels of low/medium/high/xhigh a chat template takes for the
 // reasoning_effort variable: the ones it quotes as a token, and only when it
 // reads the variable at all (empty otherwise). /props publishes them.

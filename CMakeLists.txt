@@ -310,6 +310,7 @@ if(ARCINT_TESTS)
     tests/test_slot_loan.cpp
     tests/test_loan_book.cpp
     tests/test_toolgrammar.cpp
+    tests/test_force_content.cpp
     tests/test_tokenize_once.cpp
     tests/test_disconnect.cpp
     tests/test_responses.cpp

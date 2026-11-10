@@ -756,6 +756,11 @@ std::optional<std::string> parse_template_kwarg_default(std::string_view kv, std
         return "--chat-template-kwarg " + k + "=null: a null reads as absent, so it is not a default";
     if (k == "preserve_thinking" && !v.is_boolean())
         return std::string("--chat-template-kwarg preserve_thinking needs true or false");
+    // The trigger reads the JSON boolean only (force_nonempty_content_requested),
+    // so a default of 1, "yes" or "True" would be accepted and never fire.
+    if (k == "force_nonempty_content" && !v.is_boolean())
+        return std::string("--chat-template-kwarg force_nonempty_content needs true or false "
+                           "(the JSON booleans; 1, yes and True do not trigger it)");
     if (k == "reasoning_effort" &&
         !(v.is_string() && reasoning_effort_level_known(v.get<std::string>())))
         return std::string("--chat-template-kwarg reasoning_effort needs one of none, off, minimal, "
@@ -803,6 +808,30 @@ void apply_template_kwarg_defaults(ChatRequest& req,
         req.chat_template_kwargs[k] = v;
         log::debug("req", "chat_template_kwargs.%s: the unit default applies", k.c_str());
     }
+}
+
+bool force_nonempty_content_requested(const json& chat_template_kwargs) {
+    if (!chat_template_kwargs.is_object()) return false;
+    const auto it = chat_template_kwargs.find("force_nonempty_content");
+    return it != chat_template_kwargs.end() && it->is_boolean() && it->get<bool>();
+}
+
+bool text_is_blank(std::string_view text) {
+    // the ASCII part of Python's str.strip() set (the reference's blank test)
+    for (const char c : text)
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != '\v' && c != '\f') return false;
+    return true;
+}
+
+bool promote_reasoning_to_content(const json& chat_template_kwargs, std::string_view reasoning,
+                                  std::string_view content) {
+    if (!force_nonempty_content_requested(chat_template_kwargs)) return false;
+    // blank reasoning (empty or whitespace only) is nothing to promote: the
+    // non-streaming split strips edge newlines, the streams send what streamed;
+    // all three paths take this one test (cells: force_content_*blank_reasoning*,
+    // *_only_reasoning_is_not_promoted)
+    if (text_is_blank(reasoning)) return false;
+    return text_is_blank(content);
 }
 
 }  // namespace lgc

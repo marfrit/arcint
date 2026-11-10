@@ -230,6 +230,19 @@ void finish_chat_generation(const PreparedChat& prep,
     out.reasoning_closed = split.closed;
     out.content          = split.content;
     out.reasoning_tokens = reasoning_token_count(prep, pieces, has_tag_ids);
+    // force_nonempty_content (core/chat.h): a turn whose answer is empty or blank
+    // gets its reasoning as the answer. Before the tool-call parse, as vLLM's
+    // parse() does (extract_reasoning, then _extract_tool_calls), so the parse
+    // sees the promoted content. The old content is blank, so the reasoning side
+    // is left empty (the reference keeps the blank text there; nothing to report).
+    // reasoning_tokens still counts the tokens that were generated as reasoning.
+    if (promote_reasoning_to_content(prep.req.chat_template_kwargs, out.reasoning, out.content)) {
+        log::debug("req", "force_nonempty_content: the %zu reasoning bytes became the content%s",
+                   out.reasoning.size(), rid_suffix(prep.request_id).c_str());
+        out.content   = std::move(out.reasoning);
+        out.reasoning.clear();
+        out.reasoning_closed = false;
+    }
     if (prep.parse_tool_calls) {
         if (out.keep_parse_input) out.parse_input = out.content;
         ToolCallParse parsed = parse_tool_calls(out.content, prep.dialect, &prep.schemas);

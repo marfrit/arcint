@@ -513,7 +513,24 @@ service's production flags, Flash-Next's expert cache included
   A request that carries the key keeps its own value (`false`
   included); the defaults apply on every route that prepares a chat turn (chat,
   Responses, the chat form of `/tokenize`) and `/props`
-  `chat_template_kwargs_default` lists them. `/props`'
+  `chat_template_kwargs_default` lists them.
+  `chat_template_kwargs.force_nonempty_content: true` (a request's, or the unit
+  default) is acted on by the server, as vLLM's Nemotron-V3 reasoning parser
+  does (NVIDIA's Dory1.0-4B card asks agents to send it; the model's template
+  ignores the name): non-streaming, an empty or blank answer after the
+  reasoning split takes the reasoning text as the content (the tool-call parse
+  then sees it, and no `reasoning_content` is sent for it); streaming, a think
+  block that never closed sends the whole reasoning text once as a `content`
+  delta before the final chunk (the reasoning deltas stay); the stream does not
+  tool-parse the promoted text, as the reference's stream does not, so call
+  markup the model wrote inside a thinking block that was cut stays text and is
+  never a `tool_calls` delta. Reasoning that is
+  blank (empty or ASCII whitespace only) is never promoted, on any path; a
+  non-ASCII space such as U+00A0 counts as text, where the reference's
+  `str.strip()` reads it as blank. Only the JSON
+  boolean `true` triggers, and a unit default of `force_nonempty_content` must be
+  `true` or `false` (anything else fails at start). Chat and Responses routes; the Responses stream in
+  token mode is exempt. `/props`'
   `chat_template_caps` reports `supports_preserve_reasoning` (the template
   renders reasoning_content at all) and `supports_preserve_thinking` (it reads
   the switch).
