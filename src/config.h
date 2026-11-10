@@ -319,10 +319,15 @@ struct Config {
 
     // --chat-template-kwarg enable_thinking=BOOL: the default a request gets
     // when it sends neither chat_template_kwargs.enable_thinking nor
-    // reasoning_effort. Only enable_thinking is accepted, because it is the
-    // only kwarg the render path implements — an accepted-but-ignored key
-    // would be a lie.
+    // reasoning_effort. It keeps its typed meaning (the render path and the
+    // sampler row read it), so it is not in the list below.
     std::optional<bool> think_default;
+    // --chat-template-kwarg KEY=VALUE for every other key, in the order given:
+    // (key, the value as canonical JSON text). A request that carries no such
+    // key in its chat_template_kwargs gets the default (core/chat.h
+    // apply_template_kwarg_defaults). Text, not nlohmann::json, so this header
+    // stays free of the JSON include.
+    std::vector<std::pair<std::string, std::string>> chat_template_kwarg_defaults;
 
     // clean-turns: turn on the think-block mask for every request. While a
     // think block is open the turn-ending token is not offered, so a turn

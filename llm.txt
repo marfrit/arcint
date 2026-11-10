@@ -334,6 +334,29 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
 - Sampler defaults: --temp, --top-p, --top-k, --min-p,
   --repetition-penalty, --presence-penalty,
   --chat-template-kwarg enable_thinking=BOOL.
+- --chat-template-kwarg KEY=VALUE (repeatable): a unit default for any
+  chat_template_kwargs key; VALUE is JSON when it parses (true, 3, "text"),
+  else a bare string; null, reserved context names (messages, tools, ...),
+  a non-boolean preserve_thinking and a repeated key fail at start. reasoning_effort=LEVEL
+  (none|off|minimal|low|medium|high|xhigh) is a level: a request's own (top-level
+  reasoning_effort, Responses reasoning.effort, or the kwarg) wins, the default
+  goes through the request-level mapping and, for a request that states neither a
+  level nor the switch, sets the switch (none/off: thinking off; every other
+  level: on, so on a template that does not think by default a non-off unit
+  level makes every silent request a thinking turn); it must agree with
+  enable_thinking=BOOL. /v1/responses has no
+  chat_template_kwargs field: a Responses client cannot turn a unit default off. Token mode: a gateway that renders the prompt
+  itself must apply /props chat_template_kwargs_default when a default names a
+  key the template reads (same for the thinking default), or its prompt hash
+  differs and the turn answers 409. A reasoning_effort default is applied as the
+  request's own top-level reasoning_effort when the request states no level by
+  any route (top-level, Responses reasoning.effort, or the kwarg): it goes
+  through the template's level mapping and sets the thinking switch, so a
+  gateway must apply it the same way (a top-level level, not a raw kwarg) or
+  the hash differs and the turn answers 409; /props chat_template_kwargs_default
+  lists the level as configured, not as mapped. A request
+  that carries the key wins (false included). All chat-preparing routes get
+  it; /props chat_template_kwargs_default lists them.
 - --llama-kv K[:V]; --llama-threads N; --llama-reserve-cells N.
 - --llama-mtp N, --llama-mtp-gguf FILE, --llama-mtp-vocab FILE,
   --llama-mtp-min-p P, --llama-mtp-card N, --llama-mtp-depth-max N (0, off:

@@ -169,6 +169,33 @@ bool reserved_template_context_key(std::string_view key);
 nlohmann::json template_context(const ChatRequest& req, std::string& error,
                                 std::string_view template_src = {});
 
+// --chat-template-kwarg KEY=VALUE for a key other than enable_thinking: the
+// unit default of one chat_template_kwargs key. VALUE is JSON when it parses as
+// JSON (true, false, a number, a quoted string, an object or array) and the
+// bare text as a string otherwise; `null` is refused (a null reads as absent
+// everywhere else, so a default of null would mean nothing). A reserved name
+// (reserved_template_context_key) is refused, and preserve_thinking must be a
+// boolean, as in a request. Returns the error message, or nullopt with `key` and
+// `value` set. Enforced by test_config.cpp's config_chat_template_kwarg_* cases.
+std::optional<std::string> parse_template_kwarg_default(std::string_view kv, std::string& key,
+                                                        nlohmann::json& value);
+
+// Adds each configured default (key, JSON text) the request does not carry in
+// its own chat_template_kwargs; the request's value always wins, an explicit
+// false included, and a null in the request was dropped at parse time so it
+// reads as absent. preserve_thinking lands in its typed field, the rest in the
+// passthrough object. reasoning_effort is the exception: it is a level, so it
+// lands in the typed ChatRequest::reasoning_effort (which template_context maps
+// for the template, as it does a request's own) unless the request stated one by
+// the top-level field, the Responses reasoning.effort or its kwargs. It also
+// sets the thinking switch when no one else has, for every level: none/off turn
+// thinking off, any other level turns it on (on a template that does not think by
+// default, a non-off unit level makes every silent request a thinking turn, as a
+// request's top-level reasoning_effort or Responses reasoning.effort does; a level
+// a request sends inside chat_template_kwargs sets no switch). Enforced by test_chat.cpp's chat_template_kwarg_default_*.
+void apply_template_kwarg_defaults(ChatRequest& req,
+                                   const std::vector<std::pair<std::string, std::string>>& defaults);
+
 // The levels of low/medium/high/xhigh a chat template takes for the
 // reasoning_effort variable: the ones it quotes as a token, and only when it
 // reads the variable at all (empty otherwise). /props publishes them.

@@ -528,3 +528,33 @@ TEST(props_reports_the_mtp_draft_depth_cutoff) {
     cfg.llama_mtp_depth_max = 32768;
     CHECK_EQ(lgc::api::props(ctx).at("mtp").at("depth_max").get<int>(), 32768);
 }
+
+// --chat-template-kwarg: /props shows the unit's configured defaults (the typed
+// enable_thinking and every generic key), next to the sampler defaults. An
+// empty object when none was given.
+TEST(props_reports_the_chat_template_kwarg_defaults) {
+    auto build = [](Config& cfg) {
+        static FakeBackend backend;
+        backend.st.id        = "model.gguf";
+        backend.st.served_id = backend.st.id;
+        backend.st.loaded    = true;
+        static SlotPool slots(1);
+        Context ctx{&cfg, &backend, &slots};
+        return lgc::api::props(ctx);
+    };
+    Config none;
+    const nlohmann::json a = build(none);
+    CHECK(a.contains("chat_template_kwargs_default"));
+    CHECK(a.contains("chat_template_kwargs_default") && a["chat_template_kwargs_default"].is_object());
+    CHECK(!a.contains("chat_template_kwargs_default") || a["chat_template_kwargs_default"].empty());
+
+    Config cfg;
+    cfg.think_default = false;
+    cfg.chat_template_kwarg_defaults = {{"force_nonempty_content", "true"}, {"tone", "\"warm\""}};
+    const nlohmann::json b = build(cfg);
+    const nlohmann::json d = b.contains("chat_template_kwargs_default") ? b["chat_template_kwargs_default"]
+                                                                         : nlohmann::json::object();
+    CHECK(d.value("enable_thinking", nlohmann::json()) == nlohmann::json(false));
+    CHECK(d.value("force_nonempty_content", nlohmann::json()) == nlohmann::json(true));
+    CHECK(d.value("tone", nlohmann::json()) == nlohmann::json("warm"));
+}

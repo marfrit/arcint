@@ -607,6 +607,12 @@ bool template_quotes(std::string_view src, std::string_view tok) {
 // xhigh, xhigh to one that does not name it (OpenAI's high). A template that
 // quotes no list gets low/medium/high as sent. none/off and unknown levels pass
 // none, so the template's own default applies.
+bool reasoning_effort_is_off(std::string_view level) { return level == "none" || level == "off"; }
+bool reasoning_effort_level_known(std::string_view level) {
+    return reasoning_effort_is_off(level) || level == "minimal" || level == "low" ||
+           level == "medium" || level == "high" || level == "xhigh";
+}
+
 std::string template_reasoning_effort(std::string_view level, std::string_view src) {
     if (src.find("reasoning_effort") == std::string_view::npos) return {};
     const std::string_view l = level == "minimal" ? std::string_view("low") : level;
@@ -730,6 +736,73 @@ std::string render_chatml_stub(const ChatRequest& req) {
         out += "\n\n";
     }
     return out;
+}
+
+std::optional<std::string> parse_template_kwarg_default(std::string_view kv, std::string& key,
+                                                        json& value) {
+    const size_t eq = kv.find('=');
+    if (eq == std::string_view::npos) return std::string("--chat-template-kwarg needs key=value");
+    const std::string k(kv.substr(0, eq));
+    if (k.empty()) return std::string("--chat-template-kwarg needs a non-empty key before '='");
+    // The same list a request's chat_template_kwargs is held to: the keys
+    // minja's context sets itself (and the builtins a key would shadow).
+    if (reserved_template_context_key(k))
+        return "--chat-template-kwarg " + k +
+               " is reserved by the template context (the engine sets it); remove it";
+    const std::string text(kv.substr(eq + 1));
+    json v = json::parse(text, nullptr, /*allow_exceptions=*/false);
+    if (v.is_discarded()) v = text;   // not JSON: the bare text is a string
+    if (v.is_null())
+        return "--chat-template-kwarg " + k + "=null: a null reads as absent, so it is not a default";
+    if (k == "preserve_thinking" && !v.is_boolean())
+        return std::string("--chat-template-kwarg preserve_thinking needs true or false");
+    if (k == "reasoning_effort" &&
+        !(v.is_string() && reasoning_effort_level_known(v.get<std::string>())))
+        return std::string("--chat-template-kwarg reasoning_effort needs one of none, off, minimal, "
+                           "low, medium, high, xhigh");
+    key   = k;
+    value = std::move(v);
+    return std::nullopt;
+}
+
+void apply_template_kwarg_defaults(ChatRequest& req,
+                                   const std::vector<std::pair<std::string, std::string>>& defaults) {
+    for (const auto& [k, text] : defaults) {
+        // enable_thinking has its own typed default (Config::think_default)
+        if (k == "enable_thinking") continue;
+        const json v = json::parse(text, nullptr, /*allow_exceptions=*/false);
+        if (v.is_discarded() || v.is_null()) continue;   // parse_template_kwarg_default never lets one in
+        if (k == "preserve_thinking") {
+            if (!req.has_preserve_thinking && v.is_boolean()) {
+                req.preserve_thinking     = v.get<bool>();
+                req.has_preserve_thinking = true;
+                log::debug("req", "chat_template_kwargs.%s: the unit default applies", k.c_str());
+            }
+            continue;
+        }
+        if (k == "reasoning_effort") {
+            // The request states its level by the top-level reasoning_effort, the
+            // Responses reasoning.effort (both land in req.reasoning_effort) or
+            // chat_template_kwargs.reasoning_effort: any of the three wins. The
+            // default is a level a request would have sent, so it takes the same
+            // road: the typed field, which template_context maps for the template,
+            // and the thinking switch when nothing else has set it (none/off turn
+            // thinking off, every other level on, as a request's top-level level does).
+            if (!req.reasoning_effort.empty() || req.chat_template_kwargs.contains(k)) continue;
+            if (!v.is_string()) continue;   // parse_template_kwarg_default never lets one in
+            req.reasoning_effort = v.get<std::string>();
+            if (!req.has_enable_thinking) {
+                req.has_enable_thinking = true;
+                req.enable_thinking     = !reasoning_effort_is_off(req.reasoning_effort);
+            }
+            log::debug("req", "chat_template_kwargs.%s: the unit default applies", k.c_str());
+            continue;
+        }
+        if (!req.chat_template_kwargs.is_object()) req.chat_template_kwargs = json::object();
+        if (req.chat_template_kwargs.contains(k)) continue;   // the request's value wins
+        req.chat_template_kwargs[k] = v;
+        log::debug("req", "chat_template_kwargs.%s: the unit default applies", k.c_str());
+    }
 }
 
 }  // namespace lgc

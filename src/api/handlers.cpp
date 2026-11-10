@@ -557,6 +557,18 @@ json props(const Context& ctx) {
                          // the KV cache layers libllama built, counted from its graph at load
                          {"kv_cache_layers", st.dory.kv_layers}};
          }()},
+        // The unit's --chat-template-kwarg defaults, next to the sampler's: the
+        // typed enable_thinking and every generic key, as the value a request
+        // that does not carry the key gets. An empty object when none was given.
+        {"chat_template_kwargs_default", [&]() {
+             json d = json::object();
+             if (cfg.think_default) d["enable_thinking"] = *cfg.think_default;
+             for (const auto& [k, text] : cfg.chat_template_kwarg_defaults) {
+                 json v = json::parse(text, nullptr, /*allow_exceptions=*/false);
+                 if (!v.is_discarded()) d[k] = std::move(v);
+             }
+             return d;
+         }()},
         {"sampler_defaults",
          {{"temperature", sd.temperature},
           {"top_p", sd.top_p},
@@ -851,6 +863,12 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
         prep.req.enable_thinking     = *ctx.cfg->think_default;
         prep.req.has_enable_thinking = true;
     }
+
+    // The operator's other chat_template_kwargs defaults (--chat-template-kwarg
+    // KEY=VALUE): added for every key the request does not carry, so the request's
+    // value wins, an explicit false included. Every route that prepares through
+    // here gets them (chat, /v1/responses, /tokenize's chat form).
+    apply_template_kwarg_defaults(prep.req, ctx.cfg->chat_template_kwarg_defaults);
 
     // A request that still says nothing is the kind of turn the model's template
     // makes of it (ChatDialect::thinks_by_default): for Gemma 4 a non-thinking

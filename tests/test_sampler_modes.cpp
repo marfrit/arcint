@@ -146,3 +146,32 @@ TEST(sampler_modes_unspecified_with_no_operator_default_gets_the_normal_row) {
     CHECK(prep.input.sampler.min_p == 0.0f);
     CHECK(prep.input.sampler.presence_penalty == 0.0f);
 }
+
+// --chat-template-kwarg KEY=VALUE defaults reach the prepared request on the
+// chat route and, through the same prepare_from_chat, on the other routes.
+// The request's own chat_template_kwargs value always wins.
+TEST(sampler_modes_template_kwarg_default_reaches_the_prepared_request) {
+    Fixture f(normal_row());
+    f.cfg.chat_template_kwarg_defaults = {{"force_nonempty_content", "true"}, {"depth", "3"}};
+    api::PreparedChat prep;
+    CHECK(!api::prepare_chat(f.ctx, chat(false, true), prep));
+    CHECK(prep.req.chat_template_kwargs.value("force_nonempty_content", json()) == json(true));
+    CHECK(prep.req.chat_template_kwargs.value("depth", json()) == json(3));
+    // the enable_thinking default is a separate, typed path and is not touched
+    CHECK(!prep.req.has_enable_thinking);
+
+    // a request that sends the key keeps its own value, false included
+    json body = chat(false, true);
+    body["chat_template_kwargs"] = json{{"force_nonempty_content", false}};
+    api::PreparedChat prep2;
+    CHECK(!api::prepare_chat(f.ctx, body, prep2));
+    CHECK(prep2.req.chat_template_kwargs["force_nonempty_content"] == json(false));
+    CHECK(prep2.req.chat_template_kwargs.value("depth", json()) == json(3));
+}
+
+TEST(sampler_modes_template_kwarg_default_without_flags_leaves_the_request_alone) {
+    Fixture f(normal_row());
+    api::PreparedChat prep;
+    CHECK(!api::prepare_chat(f.ctx, chat(false, true), prep));
+    CHECK(prep.req.chat_template_kwargs.empty());
+}

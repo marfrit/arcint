@@ -480,7 +480,40 @@ service's production flags, Flash-Next's expert cache included
   drop a running tool loop's reasoning; absent renders exactly as before.
   `chat_template_kwargs` is a passthrough to the template (llama-server's
   dialect): `enable_thinking` and `preserve_thinking` are type-checked, every
-  other key reaches the template unchanged and is not refused. `/props`'
+  other key reaches the template unchanged and is not refused.
+  `--chat-template-kwarg KEY=VALUE` (repeatable) sets a unit default for any
+  key: VALUE is JSON when it parses as JSON (`true`, `3`, `"text"`), else the
+  bare text is a string; `null`, a reserved context name (`messages`, `tools`,
+  `bos_token`, ...), a non-boolean `preserve_thinking` and a repeated key fail
+  at startup. `reasoning_effort=LEVEL` (none,
+  off, minimal, low, medium, high, xhigh) is a level, not a passthrough value:
+  a request that states its own, by the top-level `reasoning_effort`, the
+  Responses `reasoning.effort` or `chat_template_kwargs.reasoning_effort`,
+  keeps it; the default goes through the mapping a request's level gets, and
+  for a request that states neither a level nor the thinking switch it also
+  sets the switch: `none` and `off` turn thinking off, every other level turns
+  it on (on a template that does not think by default, a non-off unit level
+  therefore makes every silent request a thinking turn, as a request's own
+  top-level `reasoning_effort` or Responses `reasoning.effort` does; a level a
+  request sends inside `chat_template_kwargs` sets no switch). It must agree with `enable_thinking=BOOL` when both are given
+  (a start failure otherwise).
+  `/v1/responses` has no `chat_template_kwargs` field, so a Responses client
+  cannot turn a unit default off. **Token mode:** a gateway that renders
+  the prompt itself must apply `/props` `chat_template_kwargs_default` when a
+  default names a key the template reads (the same holds for the thinking
+  default, `enable_thinking`), or its prompt hash differs from the engine's
+  and the turn answers 409. A `reasoning_effort` default is not a raw kwarg:
+  the engine applies it as the request's own top-level `reasoning_effort` when
+  the request states no level by any route (top-level `reasoning_effort`,
+  Responses `reasoning.effort`, or the kwarg), so it goes through the
+  template's level mapping and sets the thinking switch; the gateway must apply
+  it the same way, as a top-level level, or its prompt hash differs and the
+  turn answers 409. `/props` `chat_template_kwargs_default` lists the level as
+  configured, not as mapped.
+  A request that carries the key keeps its own value (`false`
+  included); the defaults apply on every route that prepares a chat turn (chat,
+  Responses, the chat form of `/tokenize`) and `/props`
+  `chat_template_kwargs_default` lists them. `/props`'
   `chat_template_caps` reports `supports_preserve_reasoning` (the template
   renders reasoning_content at all) and `supports_preserve_thinking` (it reads
   the switch).

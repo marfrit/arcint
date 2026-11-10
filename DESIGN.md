@@ -480,7 +480,9 @@ greedy decision. min-p follows llama.cpp (`llama_sampler_min_p_apply`,
 top-p. Seeded; an unseeded request gets a logged seed. Defaults chain request
 > operator flags (`--temp`, `--top-p`, `--top-k`, `--min-p`,
 `--repetition-penalty`, `--presence-penalty`, `--chat-template-kwarg
-enable_thinking=BOOL`) > the model card's row in the GGUF (`general.sampling.*`,
+enable_thinking=BOOL`; `--chat-template-kwarg KEY=VALUE` is the same default for any
+other chat_template_kwargs key, request first, `/props` `chat_template_kwargs_default`)
+> the model card's row in the GGUF (`general.sampling.*`,
 §8.8) > a provisional row for a GGUF without one; `/props` reports values and
 provenance: `operator`, `card` or `provisional` (`code`).
 

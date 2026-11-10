@@ -3617,3 +3617,44 @@ TEST(responses_stored_output_call_ids_are_engine_minted_and_unique) {
     if (msgs.size() != 1) return;
     CHECK_EQ(msgs[0].tool_calls.size(), 2u);
 }
+
+// Review F2: a unit default reasoning_effort is a level a request would have sent.
+// The Responses route states it as reasoning.effort, which lands in the same
+// ChatRequest field the chat route's top-level reasoning_effort does, so it wins
+// over the default; without one the default is the level and goes through the
+// template mapping like a request's.
+TEST(responses_reasoning_effort_beats_the_unit_default_and_the_default_fills_the_gap) {
+    Fixture fx;
+    fx.cfg.chat_template_kwarg_defaults = {{"reasoning_effort", "\"high\""}};
+    {
+        json body = base();
+        body["reasoning"] = {{"effort", "low"}};
+        ResponseRequest r;
+        parse_ok(body, r);
+        PreparedResponse prep;
+        CHECK(!api::prepare_response(fx.ctx, std::move(r), prep).has_value());
+        CHECK_EQ(prep.chat.req.reasoning_effort, std::string("low"));
+        CHECK(!prep.chat.req.chat_template_kwargs.contains("reasoning_effort"));
+    }
+    {
+        ResponseRequest r;
+        parse_ok(base(), r);
+        PreparedResponse prep;
+        CHECK(!api::prepare_response(fx.ctx, std::move(r), prep).has_value());
+        CHECK_EQ(prep.chat.req.reasoning_effort, std::string("high"));
+        CHECK(prep.chat.req.has_enable_thinking && prep.chat.req.enable_thinking);
+    }
+}
+
+// --chat-template-kwarg KEY=VALUE: the Responses route has no chat_template_kwargs
+// of its own, but it prepares through the one prepare_from_chat, so the unit's
+// defaults reach its ChatRequest.
+TEST(responses_route_gets_the_template_kwarg_defaults) {
+    Fixture fx;
+    fx.cfg.chat_template_kwarg_defaults = {{"force_nonempty_content", "true"}};
+    ResponseRequest r;
+    parse_ok(base(), r);
+    PreparedResponse prep;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r), prep).has_value());
+    CHECK(prep.chat.req.chat_template_kwargs.value("force_nonempty_content", json()) == json(true));
+}
