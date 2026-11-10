@@ -136,6 +136,15 @@ ToolSchemas tool_schemas(const std::vector<ToolSpec>& tools);
 // mtmd_tokenize() finds it (`docs/milestone-1.2.0.md §3`).
 inline constexpr const char* kMediaMarker = "<__media__>";
 
+// --chat-template-file PATH: reads the template text verbatim (llama.cpp's
+// read_file; no trimming) and checks that it can serve: the file exists and is
+// readable, is not empty or blank, and the vendored minja parses it. Returns the
+// error message (it names the path), or nullopt with `text` set. No fallback to
+// any other template: a unit that asked for a file does not start without it.
+// What it cannot check is a template that parses but renders wrongly for the
+// model; that needs the GGUF. Enforced by test_template_file.cpp's chat_template_file_* cases.
+std::optional<std::string> load_chat_template_file(const std::string& path, std::string& text);
+
 // The names a chat_template_kwargs key must not take, because the vendored
 // minja already owns them in the template context:
 //   - the six keys apply() sets before it merges extra_context

@@ -319,6 +319,7 @@ if(ARCINT_TESTS)
     tests/test_auth.cpp
     tests/test_reqid.cpp
     tests/test_tokenize.cpp
+    tests/test_template_file.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")

@@ -553,6 +553,13 @@ service's production flags, Flash-Next's expert cache included
 
 ## Scope
 
+- `--chat-template-file PATH` replaces the GGUF's embedded chat template with
+  the jinja text of PATH, as llama.cpp's flag of the same name: the rendering,
+  the capability scan (`/props` `chat_template_caps`) and the renderer material
+  all read the file. It is read and parsed at start; a missing, empty or
+  unparsable file stops the start, and there is no fallback to the embedded
+  template. `chat_template_caps.template_source` is `gguf`, `file` or
+  `chatml-fallback`. Not with `--stub`.
 - **Models**: the table above. Other architectures are refused at load.
 - **Cards**: the Intel Arc A770 (16 GiB, Xe-HPG) and the Arc Pro B60 (24 GB,
   Xe2), under the xe kernel driver. One card per process, or two by layers

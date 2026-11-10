@@ -1,6 +1,11 @@
 #include "core/chat.h"
 
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+
+#include <minja/chat-template.hpp>
 
 #include "core/reasoning.h"
 #include "core/markers.h"
@@ -623,6 +628,30 @@ std::string template_reasoning_effort(std::string_view level, std::string_view s
     return std::string(l);
 }
 }  // namespace
+
+std::optional<std::string> load_chat_template_file(const std::string& path, std::string& text) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::is_regular_file(path, ec))
+        return "--chat-template-file " + path + ": not a readable file";
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return "--chat-template-file " + path + ": cannot be opened";
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    if (in.bad()) return "--chat-template-file " + path + ": read failed";
+    const std::string body = ss.str();
+    if (body.find_first_not_of(" \t\r\n") == std::string::npos)
+        return "--chat-template-file " + path + ": the file is empty";
+    // Parsed the way the backend will (no bos/eos text: the parse does not need
+    // them), so a syntax error fails before a model load, not after it.
+    try {
+        minja::chat_template probe(body, "", "");
+    } catch (const std::exception& e) {
+        return "--chat-template-file " + path + ": the template does not parse: " + e.what();
+    }
+    text = body;
+    return std::nullopt;
+}
 
 std::vector<std::string> template_reasoning_effort_levels(std::string_view template_src) {
     std::vector<std::string> out;

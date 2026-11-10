@@ -182,6 +182,11 @@ std::string usage_text() {
         "  --queue-timeout S         seconds a request waits for a lane before a 503\n"
         "                            with the lane's free count (default: 0, refuse at\n"
         "                            once)\n"
+        "  --chat-template-file PATH replace the GGUF's embedded chat template with the\n"
+        "                            jinja text of PATH (llama.cpp's flag); a missing,\n"
+        "                            empty or unparsable file stops the start, with no\n"
+        "                            fallback to the embedded one. /props\n"
+        "                            chat_template_caps.template_source reads \"file\"\n"
         "  --http-threads N          HTTP worker threads (default: library default)\n"
         "  --api-key KEY             require `Authorization: Bearer KEY` on every\n"
         "                            route but /health (a CORS preflight is exempt).\n"
@@ -817,6 +822,10 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
                 return fail("--served-model-name needs a non-empty name");
             }
             cfg.served_model_name = std::string(v);
+        } else if (arg == "--chat-template-file") {
+            if (!value(v) || v.empty()) return fail("--chat-template-file needs a path");
+            if (!cfg.chat_template_file.empty()) return fail("--chat-template-file given twice");
+            cfg.chat_template_file = std::string(v);
         } else if (arg == "--queue-timeout") {
             if (!value(v) || !parse_double(v, cfg.queue_timeout_s)) {
                 return fail("--queue-timeout needs a number of seconds");
@@ -867,6 +876,14 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
 
     // ------------------------------------------------------------ validation
     if (cfg.stub && !cfg.gguf_path.empty()) return fail("--gguf and --stub are mutually exclusive");
+    // llama.cpp's --chat-template-file: the file's text replaces the GGUF's. Read
+    // here, after --help/--version have returned, so a unit does not start on a
+    // template it cannot use; the stub has no template to replace, and ignoring
+    // the flag there would be a silent fallback.
+    if (!cfg.chat_template_file.empty()) {
+        if (cfg.stub) return fail("--chat-template-file needs a model (--gguf); --stub has no chat template");
+        if (auto err = load_chat_template_file(cfg.chat_template_file, cfg.chat_template_text)) return fail(*err);
+    }
     if (!cfg.stub && cfg.gguf_path.empty())
         return fail("nothing to serve: pass --gguf FILE, or --stub for the device-free stub backend");
     // The unit's thinking switch and its reasoning_effort default are one setting

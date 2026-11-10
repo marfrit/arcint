@@ -488,7 +488,11 @@ provenance: `operator`, `card` or `provisional` (`code`).
 
 ### 3.7 Tokenizer, templates, tool calls
 
-- Tokenizer and chat template come from the GGUF.
+- Tokenizer and chat template come from the GGUF. `--chat-template-file PATH`
+  replaces the template text (llama.cpp's flag; the file is read and parsed at
+  start, a bad one stops the start, there is no fallback to the embedded text);
+  `/props` `chat_template_caps.template_source` says `gguf`, `file` or
+  `chatml-fallback`.
 - Incremental detokenisation never splits a UTF-8 code point across SSE
   chunks; stop strings and token ids; `usage` in every response (`code`,
   unit-tested).

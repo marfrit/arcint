@@ -331,6 +331,10 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
 - --served-model-name NAME[,NAME2] with --lane-ctx CA,CB; --parallel N;
   --n-ctx N (default the smaller of 32,768 and the trained context);
   --queue-timeout S; --prefill-chunk N; --prefill-ubatch N (n_ubatch, default 512).
+- --chat-template-file PATH: the file's jinja text replaces the GGUF's embedded
+  chat template (llama.cpp's flag). Read and parsed at start; a missing, empty
+  or unparsable file stops the start (no fallback); not with --stub.
+  /props chat_template_caps.template_source: gguf | file | chatml-fallback.
 - Sampler defaults: --temp, --top-p, --top-k, --min-p,
   --repetition-penalty, --presence-penalty,
   --chat-template-kwarg enable_thinking=BOOL.

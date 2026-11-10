@@ -1097,7 +1097,16 @@ public:
 
         const char* tmpl = llama_model_chat_template(model_, nullptr);
         template_source_ = "gguf";
-        if (tmpl == nullptr) {
+        if (!cfg.chat_template_text.empty()) {
+            // --chat-template-file: the file's text replaces the embedded one for
+            // everything below (the render, the capabilities, the renderer
+            // material and its hash). This is the only read of the embedded
+            // template; parse_args already checked the file parses.
+            tmpl             = cfg.chat_template_text.c_str();
+            template_source_ = "file";
+            log::info("load", "chat template: %zu bytes from --chat-template-file (the embedded one is not used)",
+                      cfg.chat_template_text.size());
+        } else if (tmpl == nullptr) {
             // --tts: the audio-generation backbone (Qwen3-TTS) ships no chat
             // template; its prompt is built by libmtmd's gen pipeline (text +
             // codec language), not from these messages. Fall back to ChatML so
@@ -1563,7 +1572,10 @@ public:
                     // The vocab's BOS rule: the generation prepends BOS when the
                     // rendered template did not write it, and /tokenize's count
                     // applies the same rule. A proxy reads it here.
-                    {"add_bos", llama_vocab_get_add_bos(vocab_)}};
+                    {"add_bos", llama_vocab_get_add_bos(vocab_)},
+                    // Where the template text came from: "gguf" (embedded), "file"
+                    // (--chat-template-file) or "chatml-fallback" (none carried).
+                    {"template_source", template_source_}};
     }
 
     std::string render_chat(const ChatRequest& req) const override {
@@ -3037,7 +3049,7 @@ private:
     mutable std::string                   renderer_hash_;         // set at build; survives the tree's drop
     mutable std::string                   renderer_material_json_;
     std::string                           gguf_path_;          // for the lazy GGUF metadata parse
-    std::string                           template_source_;    // "gguf" or "chatml-fallback"
+    std::string                           template_source_;    // "gguf", "file" or "chatml-fallback"
     ModelStatus                           status_;
     size_t                                n_vocab_ = 0;
     // loop-guard door ids, scanned once at load from the vocabulary pieces

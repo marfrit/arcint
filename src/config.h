@@ -17,6 +17,13 @@ struct Config {
     // OpenAI `image_url` content parts; without it the text-only refusal
     // stands. The vision/backbone pair must come from the same family.
     std::string mmproj_path;
+    // --chat-template-file PATH: the jinja text that replaces the GGUF's embedded
+    // chat template (llama.cpp's flag of the same name). parse_args reads the file
+    // (and refuses a missing, unreadable, empty or unparsable one, so a unit does
+    // not start on a template it cannot use); the text is what the llama backend
+    // renders, detects capabilities from and publishes, as template source "file".
+    std::string chat_template_file;   // the path as given (empty: the model's own)
+    std::string chat_template_text;   // its content, set by parse_args
     // --tts: serve the audio-generation endpoints (docs/milestone-1.2.0.md
     // D4, D5; GET /v1/audio/voices, POST /v1/audio/speech). It sets the llama
     // context's embeddings=1, which llama_get_embeddings_ith needs for the
