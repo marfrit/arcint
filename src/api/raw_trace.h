@@ -68,10 +68,13 @@ bool raw_trace_on();
 std::string raw_trace_line(const RawTraceRecord& r, unsigned long long n);
 
 // Appends the turn's line to ARCINT_RAW_TRACE's file (opened once a process,
-// O_APPEND) with one write(). Off: returns at once. The line is built before
-// the writer's lock is taken. A write that fails or writes nothing ends the
-// trace for the process, reported once on stderr like a failed open.
-void raw_trace_write(const RawTraceRecord& r);
+// O_APPEND, created with mode 0600: it holds generated text) with one write().
+// Off: returns at once. The line is built before the writer's lock is taken.
+// A write that fails or writes nothing ends the trace for the process,
+// reported once on stderr like a failed open. It does not throw: a line that
+// cannot be built is dropped, so a call site outside a try block cannot turn
+// a finished turn into an error.
+void raw_trace_write(const RawTraceRecord& r) noexcept;
 
 // The record of a turn of `prep` on `route`; the caller fills the split and
 // the parse when the turn got that far.

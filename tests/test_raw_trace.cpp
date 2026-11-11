@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <fstream>
 #include <string>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -382,3 +383,23 @@ TEST(raw_trace_streamed_error_line_keeps_the_split_so_far) {
         CHECK_EQ(l["content"].get<std::string>(), std::string("half an answer"));
     }
 }
+
+// The file holds what the model generated and the calls' arguments: it is
+// created for its owner alone (an existing file keeps the mode it has).
+TEST(raw_trace_file_is_created_owner_only) {
+    TraceOn             on;
+    const std::string   raw = "x";
+    api::RawTraceRecord r;
+    r.route  = "chat";
+    r.finish = "stop";
+    r.raw    = &raw;
+    api::raw_trace_write(r);
+    struct stat st {};
+    CHECK(::stat(trace_path().c_str(), &st) == 0);
+    CHECK_EQ(static_cast<unsigned>(st.st_mode & 0777), 0600u);
+}
+
+// Three call sites sit outside a try block (the non-streamed Responses turn,
+// the end of a Responses stream): the writer must not throw there.
+static_assert(noexcept(api::raw_trace_write(std::declval<const api::RawTraceRecord&>())),
+              "raw_trace_write is called outside try blocks and must not throw");

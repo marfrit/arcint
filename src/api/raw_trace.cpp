@@ -88,8 +88,9 @@ void raw_trace_error(const PreparedChat& prep, const char* route, bool stream, c
     }
 }
 
-void raw_trace_write(const RawTraceRecord& r) {
-    if (!raw_trace_on()) return;
+namespace {
+
+void write_line(const RawTraceRecord& r) {
     static std::mutex         mu;
     static int                fd    = -1;
     static bool               tried = false;
@@ -100,8 +101,11 @@ void raw_trace_write(const RawTraceRecord& r) {
         tried            = true;
         const char* name = std::getenv("ARCINT_RAW_TRACE");
         // O_APPEND: every write lands at the end of the file, whoever else
-        // appends, so two processes on one file interleave whole lines
-        fd = ::open(name, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+        // appends, so two processes on one file interleave whole lines.
+        // 0600: the file holds generated text and call arguments, so a file
+        // this process creates is its owner's alone (an existing one keeps
+        // its mode).
+        fd = ::open(name, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
         if (fd < 0) {
             std::fprintf(stderr, "arcint: cannot open ARCINT_RAW_TRACE=%s for the raw trace\n", name);
             return;
@@ -126,6 +130,18 @@ void raw_trace_write(const RawTraceRecord& r) {
             return;
         }
         done += static_cast<size_t>(w);
+    }
+}
+
+}  // namespace
+
+void raw_trace_write(const RawTraceRecord& r) noexcept {
+    if (!raw_trace_on()) return;
+    try {
+        write_line(r);
+    } catch (...) {
+        // the trace is a diagnostic: a line that cannot be built (out of
+        // memory) is dropped, the turn's answer goes out as it would have
     }
 }
 
