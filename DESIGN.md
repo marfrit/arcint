@@ -1,8 +1,9 @@
 # arcint — Design
 
 State as of 2026-11-07: arcint **1.6.1** on llama.cpp **`3e4dfa8`** with the
-patch series `contrib/llama.cpp/patches` 0001-0100 (93 patches; 0031, 0055,
-0061, 0076 and 0078 retired, 0073 on its own prefill-gather branch, 0085 never assigned). One engine: libllama with
+patch series `contrib/llama.cpp/patches`: 33 patch files, the 12 folded ones
+(`0000-01` to `0000-12`, the former 0001-0096; `FOLDED.md` there resolves the old
+numbers) and 0097-0117. One engine: libllama with
 ggml's OpenCL backend and arcint's Intel kernels. Three language services run
 in production on two Intel Arc cards: the dense Qwen3.8-27B agent and
 Qwen3.8-Flash-Next (125B-A6B, on demand) on the 24 GB Arc Pro B60, the MoE
@@ -241,7 +242,7 @@ measured on 2026-11-07.
   backend's fusions applied by op adjacency). On the CPU, KL against the PR's graph
   is 0 with the folded vectors and 0.0080 with the norms dropped, against 0.0090
   for a control that moves every layer's output by one ulp: this model's rounding
-  floor, the same as the A770's 0.0091 against the CPU. Card A/B and KL arms are owed.
+  floor, the same as the A770's 0.0091 against the CPU. On the cards (`measured-here`, 2026-11-07, served, a 5.9k-token prompt and a 400-token greedy decode, base = the build without the fold, 2 loops q8_0:q4_0): decode 28.6 -> 39.1 t/s on the B60 and 19.1 -> 28.5 on the A770; KL against the CPU running the PR graph is unchanged within 0.0004 nats at 2 loops f16 (B60 0.00787 -> 0.00787, A770 0.00796 -> 0.00792; `contrib/llama.cpp/README.md`, sections 0113 and 0114).
 
 | service | model | architecture | served file | card |
 |---|---|---|---|---|
@@ -335,9 +336,9 @@ The cards (`measured-here` unless marked):
 
 ### 3.2 Kernels: the patch series
 
-`contrib/llama.cpp/patches` holds 74 patches against the pin (0001-0079; 0031,
-0055 and 0061 dropped earlier, 0076 retired by measurement, 0073 on its own
-prefill-gather branch), each with its
+`contrib/llama.cpp/patches` holds 33 patch files against the pin: 0001-0096
+folded into 12 (`0000-01` to `0000-12`; `FOLDED.md` there resolves the old
+numbers, which stay as labels in the record) and 0097-0117, each with its
 measurement, KL, red case and review in `contrib/llama.cpp/README.md`
 (`measured-here` throughout). By what they change:
 
