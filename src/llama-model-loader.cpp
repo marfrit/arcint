@@ -1,4 +1,6 @@
 #include "llama-model-loader.h"
+#include "llama-ext.h"
+#include "llama-placement-report.h"
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -10,6 +12,7 @@
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <future>
 #include <regex>
@@ -1221,6 +1224,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             return lazy_read::buft();
         }
 
+        // ARC-LAB 0113: a tensor the graph does not read, kept only to derive others from at load,
+        // stays in the CPU's own buffer type (mapped from the file under mmap): no device memory, and
+        // no probe, so 0111 reports nothing for it (the architecture reports what it derives)
+        if (flags & TENSOR_HOST_ONLY) {
+            ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (!cpu_dev) {
+                throw std::runtime_error("no CPU backend found");
+            }
+            return ggml_backend_dev_buffer_type(cpu_dev);
+        }
+
         // select the buffer type for this tensor
         const buft_list_t * buft_list;
         switch (info.layer) {
@@ -1268,11 +1282,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        // ARC-LAB 0111: set when the probe chose the buffer type (not an override)
+        bool probed = false;
         if (!buft) {
             buft = select_weight_buft(hparams, t_meta, op, buft_list);
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }
+            probed = true;
         }
 
         // avoid using a host buffer when using mmap
@@ -1283,6 +1300,20 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 throw std::runtime_error("no CPU backend found");
             }
             buft = ggml_backend_dev_buffer_type(cpu_dev);
+        }
+
+        // ARC-LAB 0111: the layer asked for device memory, the device declined the weight's
+        // op, and the weight went to host memory: one DOWNGRADE line the first time a key
+        // occurs and a count per key (llama_placement_downgrades). The input layer is the CPU
+        // list by design (token_embd, per_layer_token_embd) and never reports, and a
+        // memory-fit pass (no_alloc) places nothing and does not count
+        if (probed && !no_alloc && info.layer != LLM_TENSOR_LAYER_INPUT &&
+                llama_placement::declined_to_host(buft_list->front().second, buft)) {
+            const std::string k = llama_placement::key(ggml_op_name(op), ggml_type_name(t_meta->type), t_meta->name,
+                                                       ggml_backend_buft_name(buft));
+            if (llama_placement::global().add(k)) {
+                LLAMA_LOG_WARN("DOWNGRADE src=llama %s\n", k.c_str());
+            }
         }
 
         if (buft != buft_list->front().second) {
@@ -1396,6 +1427,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     return tensor;
+}
+
+size_t llama_placement_downgrades(char * buf, size_t size) {
+    const std::string out = llama_placement::global().text();
+    if (buf != nullptr && size > 0) {
+        snprintf(buf, size, "%s", out.c_str());
+    }
+    return out.size();
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {

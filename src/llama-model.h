@@ -959,6 +959,18 @@ struct llama_model_base : public llama_model {
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
 
+    // ARC-LAB 0113: after every weight is loaded, an architecture may derive tensors of its own
+    // (the file's bytes are still readable through ml); it owns them through own_buffer
+    virtual void load_tensors_post(llama_model_loader & ml) { (void) ml; }
+
+    // takes ownership of a context and the buffer its tensors live in (freed with the model,
+    // counted in memory_breakdown like the weights)
+    void own_buffer(struct ggml_context * ctx, ggml_backend_buffer_t buf);
+
+    // the buffer type for an F32 vector layer il (< 0: the output) multiplies its rows by, probed as
+    // the loader probes weights; *first, if given, gets what the layer's list asked for
+    ggml_backend_buffer_type_t select_buft_f32_mul(int il, int64_t ne0, ggml_backend_buffer_type_t * first) const;
+
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
 

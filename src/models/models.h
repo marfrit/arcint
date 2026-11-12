@@ -163,6 +163,22 @@ struct llama_model_dory : public llama_model_base {
     };
     std::vector<scales> scale;
     ggml_tensor * logit_scale = nullptr;
+    // ARC-LAB 0113: the scale chains computed once at load (F32), by executed layer (a looped copy
+    // shares its physical block's); folded is false under LLAMA_DORY_FOLD=0 (the PR's graph)
+    struct folded_scales {
+        ggml_tensor * alpha = nullptr;
+        ggml_tensor * sq = nullptr;
+        ggml_tensor * sg = nullptr;
+        ggml_tensor * cg = nullptr;
+        ggml_tensor * cu = nullptr;
+    };
+    std::vector<folded_scales> fold;
+    ggml_tensor * logit_fold = nullptr;
+    bool folded = false;
+    bool renorm_dropped = false;   // LLAMA_DORY_FOLD=2: no second norm of a residual that is a norm's output
+    bool sq_has_qnorm = false;     // the q norm's 1/sqrt(hd) is in sq (sqrt(hd) a power of two)
+    int fold_level = 0;            // LLAMA_DORY_FOLD as read at load_arch_tensors
+    void load_tensors_post(llama_model_loader & ml) override;
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
     struct graph : public llm_graph_context {

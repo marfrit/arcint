@@ -3973,6 +3973,64 @@ struct test_rms_norm_back : public test_case {
     }
 };
 
+// ARC-LAB 0114: Dory's nGPT residual update, y = norm(a + w * (norm(x) - a)) with
+// norm(v) = rms_norm(v, 1e-6/n) / sqrt(n), built as the model builds it (RMS_NORM SCALE SUB MUL ADD
+// RMS_NORM SCALE): OpenCL runs it as one kernel. alpha_first puts w as the mul's first operand (one
+// row: the shapes must match); inplace builds the in-place ops (views of a), which ggml_can_fuse
+// refuses, so it is a control like a nonzero bias on the last scale: the separate kernels run. The
+// allocator's in-place placement (a result over a dead x or a) does not occur in this harness; the
+// backend's log counts it in the served graph
+struct test_ngpt_slerp : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool alpha_first;
+    const bool inplace;
+    const float bias;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "NGPT_SLERP";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne, alpha_first, inplace, bias);
+    }
+
+    test_ngpt_slerp(std::array<int64_t, 4> ne = {2560, 1, 1, 1}, bool alpha_first = false, bool inplace = false, float bias = 0.0f)
+        : ne(ne), alpha_first(alpha_first), inplace(inplace), bias(bias) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(x, "x");
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(w, "w");
+        const float n = (float) ne[0];
+        const float eps = 1e-6f / n, sc = 1.0f / sqrtf(n);
+        ggml_tensor * b = ggml_scale(ctx, ggml_rms_norm(ctx, x, eps), sc);
+        ggml_tensor * d = ggml_sub(ctx, b, a);
+        ggml_tensor * m = alpha_first ? ggml_mul(ctx, w, d) : ggml_mul(ctx, d, w);
+        ggml_tensor * t = inplace ? ggml_add_inplace(ctx, a, m) : ggml_add(ctx, a, m);
+        ggml_tensor * r = inplace ? ggml_rms_norm_inplace(ctx, t, eps) : ggml_rms_norm(ctx, t, eps);
+        ggml_tensor * out = inplace ? ggml_scale_inplace(ctx, r, sc) : ggml_scale_bias(ctx, r, sc, bias);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // alpha as the model has it (positive, small), the vectors of either sign
+            if (strcmp(t->name, "w") == 0) {
+                init_tensor_uniform(t, 0.01f, 0.5f);
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
@@ -5777,6 +5835,54 @@ struct test_mul_mat : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
+// ARC-LAB 0116: a 2-D view of a quantized weight that is not a whole slice of it: [K, N, E] reshaped to
+// [K, N E] (the elements of the parent, not its slices), or (rows > 0) the first `rows` rows of a [K, N]
+// weight at offset 0. OpenCL keeps the low-bit types and Q3_K in planes per slice of the parent, so a
+// kernel that took the view's block count would read the wrong planes; the backend declines both
+// (GGML_OPENCL_LB_VIEW_RED=1 accepts them: the red case). slice >= 0: the view is slice `slice` of the
+// [K, N, E] weight at its slice-aligned offset, which the kernels address right (accepted)
+struct test_mul_mat_reshape3d : public test_case {
+    const ggml_type type_a;
+    const int64_t k, n_rows, n_exp, n, rows, slice;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, k, n_rows, n_exp, n, rows, slice);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_reshape3d(ggml_type type_a = GGML_TYPE_Q3_K, int64_t k = 512, int64_t n_rows = 64, int64_t n_exp = 3, int64_t n = 4,
+                           int64_t rows = 0, int64_t slice = -1)
+        : type_a(type_a), k(k), n_rows(n_rows), n_exp(n_exp), n(n), rows(rows), slice(slice) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a2;
+        if (slice >= 0) {
+            ggml_tensor * a = ggml_new_tensor_3d(ctx, type_a, k, n_rows, n_exp);
+            ggml_set_name(a, "a");
+            a2 = ggml_view_2d(ctx, a, k, n_rows, a->nb[1], slice * a->nb[2]);
+            ggml_set_name(a2, "a_slice");
+        } else if (rows > 0) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, n_rows);
+            ggml_set_name(a, "a");
+            a2 = ggml_view_2d(ctx, a, k, rows, a->nb[1], 0);
+            ggml_set_name(a2, "a_rows");
+        } else {
+            ggml_tensor * a = ggml_new_tensor_3d(ctx, type_a, k, n_rows, n_exp);
+            ggml_set_name(a, "a");
+            a2 = ggml_reshape_2d(ctx, a, k, n_rows * n_exp);
+            ggml_set_name(a2, "a_2d");
+        }
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_mul_mat(ctx, a2, b);
+        ggml_set_name(out, "out");
+        return out;
     }
 };
 
@@ -10484,6 +10590,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // ARC-LAB 0116: Q3_K rows (OpenCL): an embedding's width (AREX-2's 5120), a slice batch over dims 2 and 3,
+    // a viewed src1; 256 x 5 is an odd block count (declined)
+    for (bool v : {false, true}) {
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q3_K, 5120, 4096, 64, 1, 1, v));
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q3_K,  512,    5,  4, 1, 1, v));
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q3_K,  512,    6,  4, 3, 2, v));
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q3_K,  256,    5,  4, 1, 1, v));
+        // ARC-LAB 0117: Q2_K likewise
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q2_K, 5120, 4096, 64, 1, 1, v));
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q2_K,  512,    5,  4, 1, 1, v));
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q2_K,  512,    6,  4, 3, 2, v));
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q2_K,  256,    5,  4, 1, 1, v));
+    }
+
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_0}) {
         test_cases.emplace_back(new test_get_rows(type, 300*256,   5,         4,   1,   2, false));
         test_cases.emplace_back(new test_get_rows(type,     256,   80000, 70000,   2,   1, false));
@@ -11271,6 +11391,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, false, true));
 
+    // ARC-LAB 0114: Dory's width 2560 at decode, a few rows, a prompt ubatch, 3-D rows; the operand
+    // order; controls the fusion does not take: the in-place ops (views), a bias, a width not a multiple of 4
+    test_cases.emplace_back(new test_ngpt_slerp({2560, 1, 1, 1}));
+    test_cases.emplace_back(new test_ngpt_slerp({2560, 7, 1, 1}));
+    test_cases.emplace_back(new test_ngpt_slerp({2560, 512, 1, 1}));
+    test_cases.emplace_back(new test_ngpt_slerp({256, 64, 1, 1}));
+    test_cases.emplace_back(new test_ngpt_slerp({2560, 4, 3, 1}));
+    test_cases.emplace_back(new test_ngpt_slerp({2560, 1, 1, 1}, true));
+    test_cases.emplace_back(new test_ngpt_slerp({2560, 7, 1, 1}, false, true));
+    test_cases.emplace_back(new test_ngpt_slerp({2560, 7, 1, 1}, false, false, 0.5f));
+    test_cases.emplace_back(new test_ngpt_slerp({2558, 3, 1, 1}));
+
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
     // the q/k norm + IMRoPE fusion (patch 0074): the served models' shapes, the
@@ -11493,6 +11625,121 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 77, n, 5 * 256, { 1, 1 }, { 1, 1 }));
         }
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, 4, 1024, { 1, 1 }, { 2, 1 }));
+    }
+
+    // ARC-LAB 0115: the int8 few-column product (OpenCL, Intel): Q4_0, Q8_0, IQ4_XS and IQ4_NL at 2 to 16
+    // columns, both token groups (up to 8, 9 to 16); K 2560 (10 super-blocks: the work-group's K split
+    // uneven), 4096 and 14336; rows a multiple of both sub-group sizes and ragged; K not a multiple of 256
+    // (a tail of single blocks, none, or K below one chunk) for the flat types; a src1 broadcast over
+    // dimension 2 that the dispatch flattens into 2 x n columns
+    for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL }) {
+        for (int n : { 2, 3, 5, 6, 8, 12, 16 }) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ { 256, 2560 }, { 1001, 2560 }, { 256, 4096 },
+                                                                         { 77, 4096 }, { 512, 14336 }, { 1001, 14336 } }) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+            }
+            if (type_a != GGML_TYPE_IQ4_XS) {
+                for (int64_t k : { 2080, 96 }) {
+                    test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 129, n, k, { 1, 1 }, { 1, 1 }));
+                }
+            }
+        }
+        for (int n : { 2, 4, 8 }) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, n, 1024, { 1, 1 }, { 2, 1 }));
+        }
+    }
+    // a src1 [K, 1, n] permuted from [K, n, 1]: contiguous with nb1 = K n 4, so a prep that steps the columns
+    // by nb1 reads past them; also the K-quants' few-column prep (0009), which had the same stride
+    for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K }) {
+        for (int n : { 4, 8, 12 }) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, 1, 2048, { 1, 1 }, { n, 1 }, { 0, 2, 1, 3 }));
+        }
+    }
+
+    // ARC-LAB 0116: Q3_K (OpenCL, Intel): the q8_1 matvec (1 to 4 columns), the few-column fp16 DPAS
+    // product (2 to 16; from 4 on Xe-HPG), the dequantizing tile GEMM (more than 16); rows ragged, below a
+    // sub-group and below a work-group's tile; super-blocks below, at and around the few-column kernel's K
+    // split (4 sub-groups on Xe2, 8 on Xe-HPG: K 512, 1024, 2560); every 6-bit scale position (each block has
+    // all 16). M 129 x K 256 is an odd block count: it stays in GGUF blocks and is declined (not supported)
+    for (int n : { 1, 2, 3, 4, 5, 6, 8, 9, 12, 16, 17, 512 }) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ { 256, 2560 }, { 1001, 2560 }, { 77, 4096 }, { 129, 512 },
+                                                                     { 8, 1024 }, { 512, 14336 }, { 129, 256 } }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+        }
+    }
+    // rows of an odd number of super-blocks (K 768: the matvec's two-block step ends on a half)
+    for (int n : { 1, 2, 3, 4, 8, 16, 512 }) {
+        for (int64_t m : { 256, 1000 }) {   // 1000 rows: ragged, an even block count (1001 x 3 would be odd: declined)
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, m, n, 768, { 1, 1 }, { 1, 1 }));
+        }
+    }
+    // the 2D-block GEMM (Xe2, 0116's second step): rows ragged against the work-group's 256 and the
+    // sub-group's 16 with the planes 64-byte aligned (a slice of 8000 / 4032 blocks), token tails against
+    // its 64-token tile; 1001 x 2560 and 77 x 4096 above are the unaligned ones (the tile, keyed)
+    for (int n : { 17, 100, 512 }) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ { 1000, 2048 }, { 1008, 1024 } }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+        }
+    }
+    // a 2-D view of a 3-D Q3_K weight (declined: its planes are per slice of the parent)
+    // and of every planar type (0022's low-bit types too); the first 32 of 64 rows
+    for (ggml_type type_a : { GGML_TYPE_Q3_K, GGML_TYPE_Q2_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, GGML_TYPE_Q2_0 }) {
+        for (int n : { 1, 4, 16 }) {
+            test_cases.emplace_back(new test_mul_mat_reshape3d(type_a, 512, 64, 3, n));
+            test_cases.emplace_back(new test_mul_mat_reshape3d(type_a, 512, 64, 1, n, 32));
+            test_cases.emplace_back(new test_mul_mat_reshape3d(type_a, 512, 64, 3, n, 0, 2));   // slice 2: accepted
+        }
+    }
+    // a src1 broadcast over dimension 2 (flattened to 2 n columns) and a permuted [K, 1, n] src1 (the first
+    // run of 0116 on the cards crashed in this case's tensor setup: the permuted view of the [K, 1, M]
+    // weight was written through its own shape, test-backend-ops sets views too)
+    for (int n : { 2, 4, 8 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, 256, n, 1024, { 1, 1 }, { 2, 1 }));
+    }
+    for (int n : { 4, 8, 12 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, 256, 1, 2048, { 1, 1 }, { n, 1 }, { 0, 2, 1, 3 }));
+    }
+    // the AREX-2 roles a Q3_K mix may take (M rows x K): FFN gate / up and down, linear attention's qkv and
+    // gate, ssm_out / attn_output, full attention's q and k / v, the output head; at 1 column (decode), 2,
+    // 6 (an MTP 5 verify), 8, 16 and a prompt's 512
+    for (int n : { 1, 2, 6, 8, 16, 512 }) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 }, { 10240, 5120 }, { 6144, 5120 },
+                                                                     { 5120, 6144 }, { 12288, 5120 }, { 1024, 5120 }, { 248320, 5120 } }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+        }
+    }
+
+    // ARC-LAB 0117: Q2_K, the same paths and cases as Q3_K above (matvec with its min term, few-column,
+    // 2D-block and tile GEMMs; the 2D GEMM's qs plane is 64-byte aligned for a slice of a multiple of 16
+    // blocks: 1000 x 2048 and 1008 x 1024 take it, 1001 x 2560 and 77 x 4096 the tile); M 129 x K 256 odd
+    for (int n : { 1, 2, 3, 4, 5, 6, 8, 9, 12, 16, 17, 512 }) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ { 256, 2560 }, { 1001, 2560 }, { 77, 4096 }, { 129, 512 },
+                                                                     { 8, 1024 }, { 512, 14336 }, { 129, 256 } }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+        }
+    }
+    for (int n : { 1, 2, 3, 4, 8, 16, 512 }) {
+        for (int64_t m : { 256, 1000 }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, m, n, 768, { 1, 1 }, { 1, 1 }));
+        }
+    }
+    for (int n : { 17, 100, 512 }) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ { 1000, 2048 }, { 1008, 1024 } }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+        }
+    }
+    for (int n : { 2, 4, 8 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, 256, n, 1024, { 1, 1 }, { 2, 1 }));
+    }
+    for (int n : { 4, 8, 12 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, 256, 1, 2048, { 1, 1 }, { n, 1 }, { 0, 2, 1, 3 }));
+    }
+    // the AREX-2 roles (M rows x K) at 1, 2, 6 (an MTP 5 verify), 8, 16 and 512 columns
+    for (int n : { 1, 2, 6, 8, 16, 512 }) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 }, { 10240, 5120 }, { 6144, 5120 },
+                                                                     { 5120, 6144 }, { 12288, 5120 }, { 1024, 5120 }, { 248320, 5120 } }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+        }
     }
 
     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
@@ -13386,6 +13633,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                                                                 {12288, 5120}, {5120, 6144}, {1024, 5120}}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk.first, 512, mk.second, {1, 1}, {1, 1}));
         }
+    }
+
+    // ARC-LAB 0115: the few-column curve at the shape above (the loop above has 1, 2, 3, 4, 5 and 8 columns):
+    // the int8 few-column types against Q4_K's few-column kernel; and the coder's Q8_0 shared expert
+    // (gate / up 2048 -> 512, down 512 -> 2048) at its MTP 4 verify's 5 columns
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K}) {
+        for (int bs : {6, 7, 9, 12, 15, 16}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, bs, 14336, {1, 1}, {1, 1}));
+        }
+    }
+    // ARC-LAB 0116: Q3_K's curve at the same shape (1-5, 8 and 512 from the loop above), and Q3_K against
+    // Q4_K at the AREX-2 roles' shapes (M rows x K), decode to a prompt
+    for (int bs : {6, 7, 9, 12, 15, 16}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, 4096, bs, 14336, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, 4096, bs, 14336, {1, 1}, {1, 1}));   // 0117
+    }
+    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K}) {
+        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120},
+                                                                {5120, 6144}, {12288, 5120}, {1024, 5120}, {248320, 5120}}) {
+            for (int bs : {1, 2, 6, 8, 16, 512}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk.first, bs, mk.second, {1, 1}, {1, 1}));
+            }
+        }
+    }
+    for (int bs : {1, 5}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, bs, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, bs, 512, {1, 1}, {1, 1}));
     }
 
     // Q4_K multi-column mat-vec

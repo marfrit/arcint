@@ -143,6 +143,7 @@ set(GGML_OPENCL_KERNELS
     mul_mm_kq_f16
     mul_mm_kq_i8
     mul_mm_kq_few
+    mul_mm_few_i8
     mul_mm_kq_2d
     mul_mm_q40_i8_sg8
     mul_mm_id_i8_sg8

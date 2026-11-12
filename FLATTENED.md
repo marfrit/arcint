@@ -2,7 +2,7 @@
 
 This branch of [arcint](https://github.com/marfrit/arcint) holds llama.cpp at the
 commit arcint pins, with arcint's patch series applied, so the code can be read
-and searched as files. This is v1.6.1: 26 patches (the series was folded after 1.6.0: `contrib/llama.cpp/patches/FOLDED.md` on `main` maps the old numbers).
+and searched as files. This is v1.6.2: 33 patches.
 
 - The first commit is the unmodified pin; each later commit is one release. The
   diff between the first commit and any other is what arcint changes in llama.cpp.

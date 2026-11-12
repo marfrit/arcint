@@ -1313,8 +1313,8 @@ bool llama_expert_cache::lend() {
 // region copy a tensor from it (ggml_backend_opencl_lend_write) with no host
 // staging and no layout conversion. There is no type rule to get wrong:
 //   - the plain types: the whole slice range, byte for byte;
-//   - the planar types (ggml-opencl.cpp's ggml_cl_lb_planar, patch 0022/0030:
-//     IQ2_XXS, IQ2_XS, IQ2_S, Q2_0, IQ3_S -- NOT IQ3_XXS or IQ4_XS, which keep
+//   - the planar types (ggml-opencl-planes.h's ggml_cl_lb_planar, patches 0022/0030/0116/0117:
+//     IQ2_XXS, IQ2_XS, IQ2_S, Q2_0, IQ3_S, Q3_K, Q2_K -- NOT IQ3_XXS or IQ4_XS, which keep
 //     their own layout and are not planar): the bank's planes are the card's
 //     bytes, slice size and place unchanged;
 //   - the split-extra types (IQ4_NL's d/q sub-buffers, Q8_0's SOA): two regions,

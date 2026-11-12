@@ -2001,6 +2001,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (ml.no_alloc) {
+        load_tensors_post(ml);   // ARC-LAB 0113: derived tensors count in the fit (sizes, no data)
         return true;
     }
 
@@ -2026,6 +2027,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+
+    load_tensors_post(ml);
 
     // LLAMA_EXPERT_CACHE_MIB / LLAMA_EXPERT_CACHE_PROFILE: the same for tools
     // that do not set the parameters (llama-bench, llama-perplexity); "A,B"
@@ -2280,6 +2283,12 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
     } else if (hdmd.inverse_blocks.count("token_embd.weight") && !ml.get_weight("output.weight")) {
         throw std::runtime_error("a tied Hadamard output requires version 2 and tied_output=true");
     }
+}
+
+void llama_model_base::own_buffer(ggml_context * ctx, ggml_backend_buffer_t buf) {
+    std::vector<ggml_backend_buffer_ptr> buffers;
+    buffers.emplace_back(buf);
+    pimpl->ctxs_bufs.emplace_back(ggml_context_ptr { ctx }, std::move(buffers));
 }
 
 // make one Hadamard matrix per block size and one sign vector per width (the GGUF does not contain them)
@@ -2824,6 +2833,21 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
                 ggml_tensor * layer_dir = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hparams.n_embd);
                 return ggml_add(ctx, cur, layer_dir);
             });
+}
+
+// ARC-LAB 0113: the buffer type for an F32 per-channel vector a layer multiplies its activations
+// by (il < 0: the output layer), by the probe the loader uses for weights: the first of the layer's
+// list whose device takes MUL of F32 rows by it. *first is the list's head, what the layer asked for
+ggml_backend_buffer_type_t llama_model_base::select_buft_f32_mul(int il, int64_t ne0, ggml_backend_buffer_type_t * first) const {
+    const buft_list_t & list = il < 0 ? *pimpl->dev_output.buft_list : *pimpl->dev_layer.at(layer_physical(il)).buft_list;
+    if (first) {
+        *first = list.front().second;
+    }
+    return ::select_buft(list, [&](ggml_context * ctx) {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, 512);
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne0);
+        return ggml_mul(ctx, x, w);
+    });
 }
 
 bool llama_model::has_tensor_overrides() const {

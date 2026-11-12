@@ -20,6 +20,15 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
 // Physical weight blocks, excluding MTP, for offload fitting. Repeated executions do not add weights.
 LLAMA_API int32_t llama_model_n_layer_physical(const struct llama_model * model);
 
+// ARC-LAB 0111: the weights the loader put in host memory because the device declined their
+// op although their layer asked for a device buffer (tensor_buft_overrides, lazily read
+// tensors and the input layer excluded), as "src=llama <key>\t<count>\n" lines, keys sorted:
+// the format of ggml_backend_opencl_downgrades. Key: op=<probe op> type=<weight type>
+// weight=<name, layer numbers as N> buft=<chosen buffer type> reason=device-declines; count:
+// weights, summed over the models the process loaded. Writes at most size bytes (with the
+// terminator) and returns the full length; buf may be null.
+LLAMA_API size_t llama_placement_downgrades(char * buf, size_t size);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

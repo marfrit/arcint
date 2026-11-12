@@ -332,6 +332,157 @@ kernel void kernel_mul_mm_kq2d_q6_K(global const uchar * ql, global const uchar 
     EPILOGUE
 }
 
+#ifndef GGML_OPENCL_NO_Q3K   // 0116: built without it when the program fails with it (ggml_cl_build_program_q3k)
+#ifdef Q3K_BREAK_BUILD   // the red case of the build fallback (GGML_OPENCL_Q3K_OPTS): the Q3_K text does not compile
+#error "Q3K_BREAK_BUILD"
+#endif
+// ARC-LAB 0116: (p - 1028) * sc on the 32 halves of p: Q3_K's 1024 + u to sc (u - 4)
+static inline uint hscale3(uint p, uint sc2) {
+    uint r;
+    __asm__("{\n"
+            ".decl PH v_type=G type=hf num_elts=32 align=GRF alias=<%1, 0>\n"
+            ".decl SH v_type=G type=hf num_elts=32 align=GRF alias=<%2, 0>\n"
+            ".decl RH v_type=G type=hf num_elts=32 align=GRF alias=<%0, 0>\n"
+            "add (M1_NM, 32) RH(0,0)<1> PH(0,0)<1;1,0> 0xE404:hf\n"
+            "mul (M1_NM, 32) RH(0,0)<1> RH(0,0)<1;1,0> SH(0,0)<1;1,0>\n"
+            "}\n" : "=rw"(r) : "rw"(p), "rw"(sc2));
+    return r;
+}
+
+// scale is (0..15) of a Q3_K block's 12 scale bytes w, minus 32 (mul_mv_iq_q8_1.cl's q3k_scale; -DQ3K_RED
+// drops the top two bits: the red case)
+static inline int q3k_scale_2d(uint3 w, int is) {
+    const uint v8 = is < 8 ? (is < 4 ? w.s0 : w.s1) : (is < 12 ? w.s0 : w.s1);
+    const uint lo = is < 8 ? (v8 >> (8 * (is & 3))) & 0xFu : (v8 >> (8 * (is & 3) + 4)) & 0xFu;
+#ifdef Q3K_RED
+    const uint hi = 0;
+#else
+    const uint hi = (w.s2 >> (8 * (is & 3) + 2 * (is >> 2))) & 3u;
+#endif
+    return (int)(lo | (hi << 4)) - 32;
+}
+
+// Q3_K in the planes of mul_mv_iq_q8_1.cl (per slice d[nblk] | hmask[32 nblk] | qs[64 nblk] |
+// scales[12 nblk], at q + offq): hmask and qs are surfaces of ne01 rows of nb * 32 and nb * 64 bytes
+// (the host checks their 64-byte alignment), d and the scales are read per lane. Sub-block sb = 4 n + j
+// (32 weights at 32 sb): bits 2j of qs bytes 32 n .. + 31, bit 4n + j of hmask bytes 0 .. 31, scales
+// 8 n + 2 j (weights 0..15) and + 1 (16..31). Packed as Q6_K: the two bits (bits 0, 1) and the hmask
+// bit (bit 2) of bytes 0, 2 (1, 3) as halves 1024 + u, u - 4 the weight.
+__attribute__((intel_reqd_sub_group_size(16)))
+kernel void kernel_mul_mm_kq2d_q3_K(global const uchar * q, ulong offq, global const half * dp_unused, ARGS) {
+    PROLOGUE
+    global const uchar * S  = q + offq;
+    const ulong nblk = (ulong)ne01 * nb;
+    global const half  * dq = (global const half *)S;
+    global const uchar * hm = S + nblk * 2;
+    global const uchar * qs = S + nblk * 34;
+    global const uchar * sc = S + nblk * 98;
+    for (int kb = 0; kb < nb; ++kb) {
+        KB_SYNC(kb)
+        const ulong b = (ulong)n * nb + kb;
+        const float D = vload_half(b, dq);
+        const uint3 sw = vload3(0, (global const uint *)(sc + b * 12));
+        uint hmw[8];
+        WREAD(hm, 32, hmw, kb, 0);
+        _Pragma("unroll")
+        for (int nn = 0; nn < 2; ++nn) {
+            uint qw[8];
+            WREAD(qs, 64, qw, kb, 8 * nn);
+            _Pragma("unroll")
+            for (int j = 0; j < 4; ++j) {
+                const int sb = 4 * nn + j, is = 8 * nn + 2 * j, hb = 4 * nn + j;
+                const half s0 = (half)(D * (float)q3k_scale_2d(sw, is));
+                const half s1 = (half)(D * (float)q3k_scale_2d(sw, is + 1));
+                const uint s02 = (uint)as_ushort(s0) * 0x10001u, s12 = (uint)as_ushort(s1) * 0x10001u;
+                uint pw[16];
+                _Pragma("unroll")
+                for (int i = 0; i < 8; ++i) {
+                    const uint w = qw[i] >> (2 * j);
+                    const uint h = hmw[i] >> hb;
+                    const uint sc2 = i < 4 ? s02 : s12;
+                    pw[2 * i]     = hscale3((w & 0x00030003u) | ((h & 0x00010001u) << 2) | MAGIC, sc2);
+                    pw[2 * i + 1] = hscale3(((w >> 8) & 0x00030003u) | (((h >> 8) & 0x00010001u) << 2) | MAGIC, sc2);
+                }
+                const int8 b0 = as_int8(vload8(0, pw)), b1 = as_int8(vload8(0, pw + 8));
+                MUL32(kb * QK_K + 32 * sb)
+            }
+        }
+    }
+    EPILOGUE
+}
+#endif // GGML_OPENCL_NO_Q3K
+
+#ifndef GGML_OPENCL_NO_Q2K   // 0117: built without it when the program fails with it (ggml_cl_build_program_q3k)
+#ifdef Q2K_BREAK_BUILD   // the red case of the build fallback (GGML_OPENCL_Q2K_OPTS): the Q2_K text does not compile
+#error "Q2K_BREAK_BUILD"
+#endif
+// ARC-LAB 0117: Q2_K (kq type index 13). A slice in planes (ggml-opencl-planes.h): dm[nblk] (d and dmin, a
+// half pair) | scales[16 nblk] | qs[64 nblk]. Weight 128 n + 32 j + t of a block (n 0..1, j 0..3, t 0..31)
+// is bits 2j of qs[32 n + t], a code q in 0..3, at scale byte is = 8 n + 2 j + t / 16: d (byte & 15) q -
+// dmin (byte >> 4), ggml's dequantize_row_q2_K. -DQ2K_RED swaps the byte's two nibbles (the red case).
+#define Q2K_SC(nblk) ((ulong)(nblk) * 4)
+#define Q2K_QS(nblk) ((ulong)(nblk) * 20)
+
+static inline uint q2k_byte(uint4 w, int k) {
+    const uint v = k < 4 ? w.s0 : (k < 8 ? w.s1 : (k < 12 ? w.s2 : w.s3));
+    return (v >> (8 * (k & 3))) & 0xFFu;
+}
+
+// the scale and the min of scale byte b
+static inline void q2k_sm(uint b, float * sc, float * m) {
+#ifdef Q2K_RED
+    *sc = (float)(b >> 4); *m = (float)(b & 0xFu);
+#else
+    *sc = (float)(b & 0xFu); *m = (float)(b >> 4);
+#endif
+}
+
+// Q2_K on its planes: qs is a surface of ne01 rows of nb x 64 bytes (the host checks its 64-byte
+// alignment), dm and the 16 scale bytes are read per lane. Sub-block sb = 4 n + j (32 weights at 32 sb):
+// bits 2j of qs bytes 32 n .. + 31 as halves 1024 + q, Q4_K's (p - 1024) dl + nml with dl = d sc, nml =
+// -dmin m, per 16 weights
+__attribute__((intel_reqd_sub_group_size(16)))
+kernel void kernel_mul_mm_kq2d_q2_K(global const uchar * q, ulong offq, global const half * dp_unused, ARGS) {
+    PROLOGUE
+    global const uchar * S  = q + offq;
+    const ulong nblk = (ulong)ne01 * nb;
+    global const half  * dmp = (global const half *)S;
+    global const uchar * sc  = S + Q2K_SC(nblk);
+    global const uchar * qs  = S + Q2K_QS(nblk);
+    for (int kb = 0; kb < nb; ++kb) {
+        KB_SYNC(kb)
+        const ulong b = (ulong)n * nb + kb;
+        const float2 dm = vload_half2(b, dmp);
+        const uint4  sw = vload4(0, (global const uint *)(sc + b * 16));
+        _Pragma("unroll")
+        for (int nn = 0; nn < 2; ++nn) {
+            uint qw[8];
+            WREAD(qs, 64, qw, kb, 8 * nn);
+            _Pragma("unroll")
+            for (int j = 0; j < 4; ++j) {
+                const int sb = 4 * nn + j, is = 8 * nn + 2 * j;
+                float sc0, m0, sc1, m1;
+                q2k_sm(q2k_byte(sw, is), &sc0, &m0);
+                q2k_sm(q2k_byte(sw, is + 1), &sc1, &m1);
+                const uint dl02 = (uint)as_ushort((half)(dm.s0 * sc0)) * 0x10001u, nml02 = (uint)as_ushort((half)(-dm.s1 * m0)) * 0x10001u;
+                const uint dl12 = (uint)as_ushort((half)(dm.s0 * sc1)) * 0x10001u, nml12 = (uint)as_ushort((half)(-dm.s1 * m1)) * 0x10001u;
+                uint pw[16];
+                _Pragma("unroll")
+                for (int i = 0; i < 8; ++i) {
+                    const uint w = qw[i] >> (2 * j);
+                    const uint dl2 = i < 4 ? dl02 : dl12, nml2 = i < 4 ? nml02 : nml12;
+                    pw[2 * i]     = hscale((w & 0x00030003u) | MAGIC, dl2, nml2);
+                    pw[2 * i + 1] = hscale(((w >> 8) & 0x00030003u) | MAGIC, dl2, nml2);
+                }
+                const int8 b0 = as_int8(vload8(0, pw)), b1 = as_int8(vload8(0, pw + 8));
+                MUL32(kb * QK_K + 32 * sb)
+            }
+        }
+    }
+    EPILOGUE
+}
+#endif // GGML_OPENCL_NO_Q2K
+
 // (p - 1032) * d on the 32 halves of p: Q4_0's 1024 + code to d (code - 8),
 // with the rounding of a dequantization to f16. Q40_RED: code - 4 (the red
 // case of the suite).

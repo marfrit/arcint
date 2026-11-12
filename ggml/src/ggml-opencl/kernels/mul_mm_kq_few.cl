@@ -341,3 +341,198 @@ kernel void kernel_mul_mm_few_q6_K_f16(global const uchar * ql, global const uch
     }
     FEW_EPILOGUE
 }
+
+#ifndef GGML_OPENCL_NO_Q3K   // 0116: built without it when the program fails with it (ggml_cl_build_program_q3k)
+#ifdef Q3K_BREAK_BUILD   // the red case of the build fallback (GGML_OPENCL_Q3K_OPTS): the Q3_K text does not compile
+#error "Q3K_BREAK_BUILD"
+#endif
+// ARC-LAB 0116: Q3_K, in the planes of mul_mv_iq_q8_1.cl (d[nblk] | hmask[32 nblk] | qs[64 nblk] |
+// scales[12 nblk], at q + offq). k16 step s = 8 n + 2 j + hh of a super-block holds weights 128 n + 32 j +
+// 16 hh + i: bits 2j of qs bytes 32 n + 16 hh + i and bit 4n + j of hmask bytes 16 hh + i, as halves
+// 1024 + u with u = q2 + 4 h the code (weight u - 4), so the chain starts at -1028 S; at the 6-bit scale s.
+// -DQ3K_RED drops the scales' top two bits (the red case).
+static inline int q3k_scale(uint3 w, int is) {
+    const uint lo = is < 8 ? (kbyte(w, is) & 0xFu) : (kbyte(w, is - 8) >> 4);
+#ifdef Q3K_RED
+    const uint hi = 0;
+#else
+    const uint hi = (kbyte(w, 8 + (is & 3)) >> (2 * (is >> 2))) & 3u;
+#endif
+    return (int)(lo | (hi << 4)) - 32;
+}
+
+// 16 Q3_K codes as halves 1024 + u: byte pairs (0, 2) and (1, 3) of each word, as b16_q45_codes
+static inline int8 b16_q3_codes(uint4 w, uint4 h, int j, int hb) {
+    const uint wv[4] = { w.s0, w.s1, w.s2, w.s3 }, hv[4] = { h.s0, h.s1, h.s2, h.s3 };
+    uint r[8];
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        r[2 * u]     = ((wv[u] >> (2 * j)) & 0x00030003u) | (((hv[u] >> hb) & 0x00010001u) << 2) | 0x64006400u;
+        r[2 * u + 1] = ((wv[u] >> (8 + 2 * j)) & 0x00030003u) | (((hv[u] >> (8 + hb)) & 0x00010001u) << 2) | 0x64006400u;
+    }
+    return as_int8((uint8)(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]));
+}
+
+__attribute__((intel_reqd_sub_group_size(SG)))
+kernel void kernel_mul_mm_few_q3_K_f16(global const uchar * q, ulong offq, global const half * dp_unused,
+                                       global const half * xa, global const float * xs, global const float * xsc,
+                                       global char * dst, ulong offd, ulong nb1, int ne00, int ne01, int ncols) {
+    FEW_PROLOGUE
+    global const uchar * S  = q + offq;
+    const ulong nblk = (ulong)ne01 * nb;
+    global const half  * dq = (global const half *)S;
+    global const uchar * hm = S + nblk * 2;
+    global const uchar * qs = S + nblk * 34;
+    global const uchar * sc = S + nblk * 98;
+    for (int ib = sgk; ib < nb; ib += NK) {
+        float D[R];
+        uint3 sw[R];
+        uint8 hq[R];
+        uint16 wq[R];
+        _Pragma("unroll")
+        for (int rr = 0; rr < R; ++rr) {
+            const ulong b = rb[rr] + ib;
+            D[rr]  = vload_half(b, dq);
+            sw[rr] = vload3(0, (global const uint *)(sc + b * 12));
+            hq[rr] = vload8(0, (global const uint *)(hm + b * 32));
+            wq[rr] = vload16(0, (global const uint *)(qs + b * 64));
+        }
+        #pragma unroll
+        for (int n = 0; n < 2; ++n) {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                // hh = 0 and 1: the two k16 steps of 32-block 4n + j, one activation scale
+                const int s0 = 8 * n + 2 * j, s1 = s0 + 1;
+                a8_t a0[G], a1[G];
+                float8 S0[G], S1[G], c[G];
+                _Pragma("unroll")
+                for (int g = 0; g < G; ++g) {
+                    a0[g] = LOAD_AG(xa + (((ulong)g * k16 + ib * 16 + s0) * 8) * 16);
+                    a1[g] = LOAD_AG(xa + (((ulong)g * k16 + ib * 16 + s1) * 8) * 16);
+                    S0[g] = vload8(0, xs + (ulong)(ib * 16 + s0) * TOK + 8 * g);
+                    S1[g] = vload8(0, xs + (ulong)(ib * 16 + s1) * TOK + 8 * g);
+                    c[g]  = vload8(0, xsc + (ulong)(ib * 8 + 4 * n + j) * TOK + 8 * g);
+                }
+                _Pragma("unroll")
+                for (int rr = 0; rr < R; ++rr) {
+                    const uint4 w0 = n == 0 ? wq[rr].s0123 : wq[rr].s89ab;
+                    const uint4 w1 = n == 0 ? wq[rr].s4567 : wq[rr].scdef;
+                    const int8 b0 = b16_q3_codes(w0, hq[rr].s0123, j, 4 * n + j);
+                    const int8 b1 = b16_q3_codes(w1, hq[rr].s4567, j, 4 * n + j);
+                    const float ka0 = D[rr] * (float)q3k_scale(sw[rr], s0);
+                    const float ka1 = D[rr] * (float)q3k_scale(sw[rr], s1);
+                    _Pragma("unroll")
+                    for (int g = 0; g < G; ++g) {
+                        const float8 t0 = DPAS(a0[g], b0, -1028.f * S0[g]);
+                        const float8 t1 = DPAS(a1[g], b1, -1028.f * S1[g]);
+                        acc[rr][g] = fma(t0 * ka0, c[g], acc[rr][g]);
+                        acc[rr][g] = fma(t1 * ka1, c[g], acc[rr][g]);
+                    }
+                }
+            }
+        }
+    }
+    FEW_EPILOGUE
+}
+#endif // GGML_OPENCL_NO_Q3K
+
+#ifndef GGML_OPENCL_NO_Q2K   // 0117: built without it when the program fails with it (ggml_cl_build_program_q3k)
+#ifdef Q2K_BREAK_BUILD   // the red case of the build fallback (GGML_OPENCL_Q2K_OPTS): the Q2_K text does not compile
+#error "Q2K_BREAK_BUILD"
+#endif
+// ARC-LAB 0117: Q2_K (kq type index 13). A slice in planes (ggml-opencl-planes.h): dm[nblk] (d and dmin, a
+// half pair) | scales[16 nblk] | qs[64 nblk]. Weight 128 n + 32 j + t of a block (n 0..1, j 0..3, t 0..31)
+// is bits 2j of qs[32 n + t], a code q in 0..3, at scale byte is = 8 n + 2 j + t / 16: d (byte & 15) q -
+// dmin (byte >> 4), ggml's dequantize_row_q2_K. -DQ2K_RED swaps the byte's two nibbles (the red case).
+#define Q2K_SC(nblk) ((ulong)(nblk) * 4)
+#define Q2K_QS(nblk) ((ulong)(nblk) * 20)
+
+static inline uint q2k_byte(uint4 w, int k) {
+    const uint v = k < 4 ? w.s0 : (k < 8 ? w.s1 : (k < 12 ? w.s2 : w.s3));
+    return (v >> (8 * (k & 3))) & 0xFFu;
+}
+
+// the scale and the min of scale byte b
+static inline void q2k_sm(uint b, float * sc, float * m) {
+#ifdef Q2K_RED
+    *sc = (float)(b >> 4); *m = (float)(b & 0xFu);
+#else
+    *sc = (float)(b & 0xFu); *m = (float)(b >> 4);
+#endif
+}
+
+// 16 Q2_K codes as halves 1024 + q (bits 2j of each byte): byte pairs (0, 2) and (1, 3) of each word, as
+// b16_q45_codes; the chain starts at -1024 S and ends at sum q x, the min term from S
+static inline int8 b16_q2_codes(uint4 w, int j) {
+    const uint wv[4] = { w.s0, w.s1, w.s2, w.s3 };
+    uint r[8];
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        r[2 * u]     = ((wv[u] >> (2 * j)) & 0x00030003u) | 0x64006400u;
+        r[2 * u + 1] = ((wv[u] >> (8 + 2 * j)) & 0x00030003u) | 0x64006400u;
+    }
+    return as_int8((uint8)(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]));
+}
+
+__attribute__((intel_reqd_sub_group_size(SG)))
+kernel void kernel_mul_mm_few_q2_K_f16(global const uchar * q, ulong offq, global const half * dp_unused,
+                                       global const half * xa, global const float * xs, global const float * xsc,
+                                       global char * dst, ulong offd, ulong nb1, int ne00, int ne01, int ncols) {
+    FEW_PROLOGUE
+    global const uchar * S  = q + offq;
+    const ulong nblk = (ulong)ne01 * nb;
+    global const half  * dmp = (global const half *)S;
+    global const uchar * sc  = S + Q2K_SC(nblk);
+    global const uchar * qs  = S + Q2K_QS(nblk);
+    for (int ib = sgk; ib < nb; ib += NK) {
+        float D[R], M[R];
+        uint4 sw[R];
+        uint16 wq[R];
+        _Pragma("unroll")
+        for (int rr = 0; rr < R; ++rr) {
+            const ulong b = rb[rr] + ib;
+            const float2 dm = vload_half2(b, dmp);
+            D[rr]  = dm.s0;
+            M[rr]  = dm.s1;
+            sw[rr] = vload4(0, (global const uint *)(sc + b * 16));
+            wq[rr] = vload16(0, (global const uint *)(qs + b * 64));
+        }
+        #pragma unroll
+        for (int n = 0; n < 2; ++n) {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int s0 = 8 * n + 2 * j, s1 = s0 + 1;
+                a8_t a0[G], a1[G];
+                float8 S0[G], S1[G], c[G];
+                _Pragma("unroll")
+                for (int g = 0; g < G; ++g) {
+                    a0[g] = LOAD_AG(xa + (((ulong)g * k16 + ib * 16 + s0) * 8) * 16);
+                    a1[g] = LOAD_AG(xa + (((ulong)g * k16 + ib * 16 + s1) * 8) * 16);
+                    S0[g] = vload8(0, xs + (ulong)(ib * 16 + s0) * TOK + 8 * g);
+                    S1[g] = vload8(0, xs + (ulong)(ib * 16 + s1) * TOK + 8 * g);
+                    c[g]  = vload8(0, xsc + (ulong)(ib * 8 + 4 * n + j) * TOK + 8 * g);
+                }
+                _Pragma("unroll")
+                for (int rr = 0; rr < R; ++rr) {
+                    const uint4 w0 = n == 0 ? wq[rr].s0123 : wq[rr].s89ab;
+                    const uint4 w1 = n == 0 ? wq[rr].s4567 : wq[rr].scdef;
+                    const int8 b0 = b16_q2_codes(w0, j);
+                    const int8 b1 = b16_q2_codes(w1, j);
+                    float sc0, m0, sc1, m1;
+                    q2k_sm(q2k_byte(sw[rr], s0), &sc0, &m0);
+                    q2k_sm(q2k_byte(sw[rr], s1), &sc1, &m1);
+                    const float ka0 = D[rr] * sc0, kb0 = M[rr] * m0, ka1 = D[rr] * sc1, kb1 = M[rr] * m1;
+                    _Pragma("unroll")
+                    for (int g = 0; g < G; ++g) {
+                        const float8 t0 = DPAS(a0[g], b0, -1024.f * S0[g]);
+                        const float8 t1 = DPAS(a1[g], b1, -1024.f * S1[g]);
+                        acc[rr][g] = fma(fma(t0, (float8)(ka0), S0[g] * -kb0), c[g], acc[rr][g]);
+                        acc[rr][g] = fma(fma(t1, (float8)(ka1), S1[g] * -kb1), c[g], acc[rr][g]);
+                    }
+                }
+            }
+        }
+    }
+    FEW_EPILOGUE
+}
+#endif // GGML_OPENCL_NO_Q2K

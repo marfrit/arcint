@@ -1199,7 +1199,7 @@ constant uint iq3s_grid[512] = {
 // its scales carry the 1/8. After ggml-quants.c's dequantize_row_*. ----
 
 // bytes per block, 32-weight sub-blocks per block
-#define LB_BYTES(T) ((T) == 6 ? 66 : (T) == 7 ? 82 : (T) == 8 ? 56 : (T) == 9 ? 18 : (T) == 11 ? 74 : 110)
+#define LB_BYTES(T) ((T) == 6 ? 66 : (T) == 7 ? 82 : (T) == 8 ? 56 : (T) == 9 ? 18 : (T) == 11 ? 74 : (T) == 12 ? 110 /* Q3_K, 0116 */ : (T) == 13 ? 84 /* Q2_K, 0117 */ : 110)
 #define LB_SUBS(T)  ((T) == 9 ? 2 : 8)
 #define LB_ROW_BYTES(T, n32) ((ulong)((n32) / LB_SUBS(T)) * LB_BYTES(T))
 
@@ -1832,12 +1832,364 @@ kernel void kernel_mul_mv_q4_0_q8_1(global const uchar * q, ulong offq, global c
     mv_q4_0(q + offq, dp, (ulong)first_row * (ne00 / 32), ne00 / 32, first_row, ne01,
             xq, xd, (ulong)ne00 * NCOLS, (global float *)(dst + offd), nb1 / sizeof(float));
 }
+#ifdef MV_Q8_0
+// ARC-LAB 0115, an arm (GGML_OPENCL_KQ_MV_NCOLS): Q8_0's planes (32 code bytes and an f16 scale a block),
+// mv_q4_0 with the codes as they are
+static inline void mv_q8_0(global const uchar * q, global const half * dp, ulong blk0, int n32, int first_row, int ne01,
+                           global const char * xq, global const float * xd, ulong res,
+                           global float * out, ulong ostride) {
+    const int lane = get_sub_group_local_id();
+    const int ne00 = n32 * 32;
+    global const char  * xq2 = xq + res;
+    global const float * xd2 = xd + res / 32;
+
+    float acc[N_DST][NCOLS];
+    #pragma unroll
+    for (int r = 0; r < N_DST; ++r)
+        #pragma unroll
+        for (int c = 0; c < NCOLS; ++c) acc[r][c] = 0.f;
+
+    for (int b32 = lane; b32 < n32; b32 += 16) {
+        uint4 xa[NCOLS], xb[NCOLS], ya[NCOLS], yb[NCOLS];
+        float dx[NCOLS], dy[NCOLS];
+        #pragma unroll
+        for (int c = 0; c < NCOLS; ++c) {
+            global const char * xc = xq + c * ne00 + b32 * 32;
+            global const char * yc = xq2 + c * ne00 + b32 * 32;
+            xa[c] = vload4(0, (global const uint *)xc); xb[c] = vload4(0, (global const uint *)(xc + 16));
+            ya[c] = vload4(0, (global const uint *)yc); yb[c] = vload4(0, (global const uint *)(yc + 16));
+            dx[c] = xd[c * n32 + b32]; dy[c] = xd2[c * n32 + b32];
+        }
+        #pragma unroll
+        for (int r = 0; r < N_DST; ++r) {
+            if (first_row + r >= ne01) break;
+            const ulong blk = blk0 + (ulong)r * n32 + b32;
+            const uint8 wv = vload8(0, (global const uint *)(q + blk * 32));
+            const uint w[8] = { wv.s0, wv.s1, wv.s2, wv.s3, wv.s4, wv.s5, wv.s6, wv.s7 };
+            const float s = vload_half(blk, dp);
+            #pragma unroll
+            for (int c = 0; c < NCOLS; ++c) {
+                acc[r][c] += s * (dx[c] * (float)dot8_ss(w, xa[c], xb[c]) + dy[c] * (float)dot8_ss(w, ya[c], yb[c]));
+            }
+        }
+    }
+    reduce_store(acc, out, ostride, first_row, ne01);
+}
+__attribute__((intel_reqd_sub_group_size(16)))
+kernel void kernel_mul_mv_q8_0_q8_1(global const uchar * q, ulong offq, global const half * dp,
+                                    global const char * xq, global const float * xd,
+                                    global char * dst, ulong offd, ulong nb1, int ne00, int ne01) {
+    const int first_row = FIRST_ROW;
+    if (first_row >= ne01) return;
+    mv_q8_0(q + offq, dp, (ulong)first_row * (ne00 / 32), ne00 / 32, first_row, ne01,
+            xq, xd, (ulong)ne00 * NCOLS, (global float *)(dst + offd), nb1 / sizeof(float));
+}
+#endif
 MV_KERNEL(kernel_mul_mv_iq2_xxs_q8_1, 6)
 MV_KERNEL(kernel_mul_mv_iq2_s_q8_1, 7)
 MV_KERNEL(kernel_mul_mv_iq1_m_q8_1, 8)
 MV_KERNEL(kernel_mul_mv_q2_0_q8_1, 9)
 MV_KERNEL(kernel_mul_mv_iq3_s_q8_1, 10)
 MV_KERNEL(kernel_mul_mv_iq2_xs_q8_1, 11)
+
+#ifndef GGML_OPENCL_NO_Q3K   // 0116: built without it when the program fails with it (ggml_cl_build_program_q3k)
+#ifdef Q3K_BREAK_BUILD   // the red case of the build fallback (GGML_OPENCL_Q3K_OPTS): the Q3_K text does not compile
+#error "Q3K_BREAK_BUILD"
+#endif
+// ---- ARC-LAB 0116: Q3_K (kq type index 12). A slice is kept in planes like the low-bit types
+// (ggml-opencl's ggml_cl_lb_fields): d[nblk] | hmask[32 nblk] | qs[64 nblk] | scales[12 nblk], so every
+// field is an aligned 32-bit word (the GGUF block is 110 bytes: 2-byte aligned). Weight 128 n + 32 j + t
+// of a block (n 0..1, j 0..3, t 0..31) is bits 2j of qs[32 n + t] minus 4 where bit 4n + j of hmask[t] is
+// clear, at the 6-bit scale is = 8 n + 2 j + t / 16 (low nibbles: scales[0..7] for is < 8, the high ones
+// for is >= 8; the top two bits from scales[8 + is % 4] at 2 (is / 4)), minus 32: ggml's
+// dequantize_row_q3_K. -DQ3K_RED drops the top two bits of every scale (the red case of the tests).
+// -DQ3K_ONE_TERM drops the matvec's residual activation term (Strata's single q8_1 term, an arm). ----
+#define Q3K_HM(nblk) ((ulong)(nblk) * 2)
+#define Q3K_QS(nblk) ((ulong)(nblk) * 34)
+#define Q3K_SC(nblk) ((ulong)(nblk) * 98)
+
+static inline uint q3k_byte(uint3 w, int k) {
+    const uint v = k < 4 ? w.s0 : (k < 8 ? w.s1 : w.s2);
+    return (v >> (8 * (k & 3))) & 0xFFu;
+}
+
+// scale is (0..15) of a block's 12 scale bytes w
+static inline int q3k_scale(uint3 w, int is) {
+    const uint lo = is < 8 ? (q3k_byte(w, is) & 0xFu) : (q3k_byte(w, is - 8) >> 4);
+#ifdef Q3K_RED
+    const uint hi = 0;
+#else
+    const uint hi = (q3k_byte(w, 8 + (is & 3)) >> (2 * (is >> 2))) & 3u;
+#endif
+    return (int)(lo | (hi << 4)) - 32;
+}
+
+// four weights as signed bytes from a qs word (bits 2j) and the complement of an hmask word (bit hb):
+// q2 - 4 where the hmask bit is clear, that is q2 | 0xFC per byte (no carry crosses a byte)
+static inline uint q3k_w4(uint q, uint nh, int j, int hb) {
+    return ((q >> (2 * j)) & 0x03030303u) | (((nh >> hb) & 0x01010101u) * 0xFCu);
+}
+
+static inline int q3k_dot2(uint2 w, uint2 x) {
+    int a = 0;
+    a = dot_acc_sat_4x8packed_ss_int(w.s0, x.s0, a);
+    a = dot_acc_sat_4x8packed_ss_int(w.s1, x.s1, a);
+    return a;
+}
+
+// Q6_K's lane map (mul_mv_kq_q8_1.cl): lane l takes half n = (l%8)/4 of a block and positions t0 .. t0+7,
+// t0 = 8 (l%4), of all four 32-blocks j of that half: 8 qs bytes and 8 hmask bytes for 32 weights, at the
+// four scales 8n + t0/16 + 2j; two blocks a step for the 16 lanes, N_DST rows, NCOLS columns
+static inline void mv_q3_K(global const uchar * S, int nb, int first_row, int ne01,
+                           global const char * xq, global const float * xd, ulong res,
+                           global float * out, ulong ostride) {
+    const int lane = get_sub_group_local_id();
+    const int p = lane & 7, n = p >> 2, t0 = (p & 3) * 8, is0 = 8 * n + (t0 >> 4);
+    const ulong nblk = (ulong)ne01 * nb;
+    global const half  * dp = (global const half *)S;
+    global const uchar * hm = S + Q3K_HM(nblk);
+    global const uchar * qs = S + Q3K_QS(nblk);
+    global const uchar * sc = S + Q3K_SC(nblk);
+    global const char  * xq2 = xq + res;
+    global const float * xd2 = xd + res / 32;
+    const int ne00 = nb * QK_K, n32 = nb * 8;
+
+    float acc[N_DST][NCOLS];
+    #pragma unroll
+    for (int r = 0; r < N_DST; ++r)
+        #pragma unroll
+        for (int c = 0; c < NCOLS; ++c) acc[r][c] = 0.f;
+
+    for (int ib = lane >> 3; ib < nb; ib += 2) {
+        const int b32 = ib * 8 + 4 * n;   // the activation's 32-blocks b32 + j
+        uint2 x[4][NCOLS], y[4][NCOLS];
+        float dx[4][NCOLS], dy[4][NCOLS];
+        #pragma unroll
+        for (int c = 0; c < NCOLS; ++c) {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                x[j][c]  = vload2(0, (global const uint *)(xq + c * ne00 + (b32 + j) * 32 + t0));
+                dx[j][c] = xd[c * n32 + b32 + j];
+#ifndef Q3K_ONE_TERM
+                y[j][c]  = vload2(0, (global const uint *)(xq2 + c * ne00 + (b32 + j) * 32 + t0));
+                dy[j][c] = xd2[c * n32 + b32 + j];
+#endif
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < N_DST; ++r) {
+            if (first_row + r >= ne01) break;
+            const ulong b = (ulong)(first_row + r) * nb + ib;
+            const uint2 q  = vload2(0, (global const uint *)(qs + b * 64 + 32 * n + t0));
+            const uint2 nh = ~vload2(0, (global const uint *)(hm + b * 32 + t0));
+            const uint3 sw = vload3(0, (global const uint *)(sc + b * 12));
+            const float d  = vload_half(b, dp);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint2 w = (uint2)(q3k_w4(q.s0, nh.s0, j, 4 * n + j), q3k_w4(q.s1, nh.s1, j, 4 * n + j));
+                const float ds = d * (float)q3k_scale(sw, is0 + 2 * j);
+                #pragma unroll
+                for (int c = 0; c < NCOLS; ++c) {
+#ifdef Q3K_ONE_TERM
+                    acc[r][c] += ds * (dx[j][c] * (float)q3k_dot2(w, x[j][c]));
+#else
+                    acc[r][c] += ds * (dx[j][c] * (float)q3k_dot2(w, x[j][c]) + dy[j][c] * (float)q3k_dot2(w, y[j][c]));
+#endif
+                }
+            }
+        }
+    }
+    reduce_store(acc, out, ostride, first_row, ne01);
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
+kernel void kernel_mul_mv_q3_K_q8_1(global const uchar * q, ulong offq, global const half * dp,
+                                    global const char * xq, global const float * xd,
+                                    global char * dst, ulong offd, ulong nb1, int ne00, int ne01) {
+    const int first_row = FIRST_ROW;
+    if (first_row >= ne01) return;
+    mv_q3_K(q + offq, ne00 / QK_K, first_row, ne01, xq, xd, (ulong)ne00 * NCOLS,
+            (global float *)(dst + offd), nb1 / sizeof(float));
+}
+
+// GET_ROWS of a Q3_K tensor in planes (a Q3_K token embedding): dst row (i10, i11, i12) is row
+// rows[i10, i11, i12] of src0's slice (i11, i12), dequantized in ggml's order (d (sc - 32), then times
+// the code, in f32). A work-group a row, a work-item a 32-weight sub-block.
+kernel void kernel_get_rows_q3_K(global const uchar * q, ulong offq, global const half * dp_unused,
+                                 global const char * src1, ulong off1, global char * dst, ulong offd,
+                                 int ne00, int ne01, ulong nb02, ulong nb03, ulong nb10, ulong nb11, ulong nb12,
+                                 ulong nb1, ulong nb2, ulong nb3) {
+    const int i10 = get_group_id(0), i11 = get_group_id(1), i12 = get_group_id(2);
+    const int row = *(global const int *)(src1 + off1 + i10 * nb10 + i11 * nb11 + i12 * nb12);
+    global const uchar * S = q + offq + i11 * nb02 + i12 * nb03;
+    const int nb = ne00 / QK_K;
+    const ulong nblk = (ulong)ne01 * nb;
+    global float * out = (global float *)(dst + offd + i10 * nb1 + i11 * nb2 + i12 * nb3);
+    for (int u = get_local_id(0); u < ne00 / 32; u += get_local_size(0)) {
+        const ulong b = (ulong)row * nb + u / 8;
+        const int p = u % 8, n = p >> 2, j = p & 3;
+        const uint8 qw = vload8(0, (global const uint *)(S + Q3K_QS(nblk) + b * 64 + 32 * n));
+        const uint8 nh = ~vload8(0, (global const uint *)(S + Q3K_HM(nblk) + b * 32));
+        const uint3 sw = vload3(0, (global const uint *)(S + Q3K_SC(nblk) + b * 12));
+        const float d  = vload_half(b, (global const half *)S);
+        const float s0 = d * (float)q3k_scale(sw, 8 * n + 2 * j), s1 = d * (float)q3k_scale(sw, 8 * n + 2 * j + 1);
+        const uint qv[8] = { qw.s0, qw.s1, qw.s2, qw.s3, qw.s4, qw.s5, qw.s6, qw.s7 };
+        const uint hv[8] = { nh.s0, nh.s1, nh.s2, nh.s3, nh.s4, nh.s5, nh.s6, nh.s7 };
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const char4 c = as_char4(q3k_w4(qv[i], hv[i], j, 4 * n + j));
+            const float s = i < 4 ? s0 : s1;
+            vstore4((float4)(s * (float)c.s0, s * (float)c.s1, s * (float)c.s2, s * (float)c.s3), 0, out + 32 * u + 4 * i);
+        }
+    }
+}
+#endif // GGML_OPENCL_NO_Q3K
+
+#ifndef GGML_OPENCL_NO_Q2K   // 0117: built without it when the program fails with it (ggml_cl_build_program_q3k)
+#ifdef Q2K_BREAK_BUILD   // the red case of the build fallback (GGML_OPENCL_Q2K_OPTS): the Q2_K text does not compile
+#error "Q2K_BREAK_BUILD"
+#endif
+// ARC-LAB 0117: Q2_K (kq type index 13). A slice in planes (ggml-opencl-planes.h): dm[nblk] (d and dmin, a
+// half pair) | scales[16 nblk] | qs[64 nblk]. Weight 128 n + 32 j + t of a block (n 0..1, j 0..3, t 0..31)
+// is bits 2j of qs[32 n + t], a code q in 0..3, at scale byte is = 8 n + 2 j + t / 16: d (byte & 15) q -
+// dmin (byte >> 4), ggml's dequantize_row_q2_K. -DQ2K_RED swaps the byte's two nibbles (the red case).
+#define Q2K_SC(nblk) ((ulong)(nblk) * 4)
+#define Q2K_QS(nblk) ((ulong)(nblk) * 20)
+
+static inline uint q2k_byte(uint4 w, int k) {
+    const uint v = k < 4 ? w.s0 : (k < 8 ? w.s1 : (k < 12 ? w.s2 : w.s3));
+    return (v >> (8 * (k & 3))) & 0xFFu;
+}
+
+// the scale and the min of scale byte b
+static inline void q2k_sm(uint b, float * sc, float * m) {
+#ifdef Q2K_RED
+    *sc = (float)(b >> 4); *m = (float)(b & 0xFu);
+#else
+    *sc = (float)(b & 0xFu); *m = (float)(b >> 4);
+#endif
+}
+
+static inline int q2k_dot2us(uint2 w, uint2 x) {
+    int a = 0;
+    a = dot_acc_sat_4x8packed_us_int(w.s0, x.s0, a);
+    a = dot_acc_sat_4x8packed_us_int(w.s1, x.s1, a);
+    return a;
+}
+
+// the sum of eight int8 codes
+static inline int q2k_sum2(uint2 x) {
+    int a = 0;
+    a = dot_acc_sat_4x8packed_us_int(0x01010101u, x.s0, a);
+    a = dot_acc_sat_4x8packed_us_int(0x01010101u, x.s1, a);
+    return a;
+}
+
+// Q3_K's lane map (mv_q3_K): lane l takes half n of a block and positions t0 .. t0 + 7 of its four 32-blocks
+// j, 8 qs bytes for 32 weights at the four scale bytes 8n + t0/16 + 2j. The codes are unsigned (0..3), so the
+// dot is unsigned x signed; the min term multiplies the sum of the lane's eight activation codes (both
+// terms), as ggml's vec_dot_q2_K_q8_K does with the q8_K block sums
+static inline void mv_q2_K(global const uchar * S, int nb, int first_row, int ne01,
+                           global const char * xq, global const float * xd, ulong res,
+                           global float * out, ulong ostride) {
+    const int lane = get_sub_group_local_id();
+    const int p = lane & 7, n = p >> 2, t0 = (p & 3) * 8, is0 = 8 * n + (t0 >> 4);
+    const ulong nblk = (ulong)ne01 * nb;
+    global const half  * dmp = (global const half *)S;
+    global const uchar * sc  = S + Q2K_SC(nblk);
+    global const uchar * qs  = S + Q2K_QS(nblk);
+    global const char  * xq2 = xq + res;
+    global const float * xd2 = xd + res / 32;
+    const int ne00 = nb * QK_K, n32 = nb * 8;
+
+    float acc[N_DST][NCOLS];
+    #pragma unroll
+    for (int r = 0; r < N_DST; ++r)
+        #pragma unroll
+        for (int c = 0; c < NCOLS; ++c) acc[r][c] = 0.f;
+
+    for (int ib = lane >> 3; ib < nb; ib += 2) {
+        const int b32 = ib * 8 + 4 * n;
+        uint2 x[4][NCOLS], y[4][NCOLS];
+        float dx[4][NCOLS], dy[4][NCOLS], sx[4][NCOLS], sy[4][NCOLS];
+        #pragma unroll
+        for (int c = 0; c < NCOLS; ++c) {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                x[j][c]  = vload2(0, (global const uint *)(xq + c * ne00 + (b32 + j) * 32 + t0));
+                y[j][c]  = vload2(0, (global const uint *)(xq2 + c * ne00 + (b32 + j) * 32 + t0));
+                dx[j][c] = xd[c * n32 + b32 + j];
+                dy[j][c] = xd2[c * n32 + b32 + j];
+                sx[j][c] = (float)q2k_sum2(x[j][c]);
+                sy[j][c] = (float)q2k_sum2(y[j][c]);
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < N_DST; ++r) {
+            if (first_row + r >= ne01) break;
+            const ulong b = (ulong)(first_row + r) * nb + ib;
+            const uint2  q  = vload2(0, (global const uint *)(qs + b * 64 + 32 * n + t0));
+            const uint4  sw = vload4(0, (global const uint *)(sc + b * 16));
+            const float2 dm = vload_half2(b, dmp);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint2 w = (q >> (uint2)(2 * j)) & (uint2)(0x03030303u);
+                float scf, mf;
+                q2k_sm(q2k_byte(sw, is0 + 2 * j), &scf, &mf);
+                const float ds = dm.s0 * scf, dn = dm.s1 * mf;
+                #pragma unroll
+                for (int c = 0; c < NCOLS; ++c) {
+                    acc[r][c] += dx[j][c] * (ds * (float)q2k_dot2us(w, x[j][c]) - dn * sx[j][c]) +
+                                 dy[j][c] * (ds * (float)q2k_dot2us(w, y[j][c]) - dn * sy[j][c]);
+                }
+            }
+        }
+    }
+    reduce_store(acc, out, ostride, first_row, ne01);
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
+kernel void kernel_mul_mv_q2_K_q8_1(global const uchar * q, ulong offq, global const half * dp,
+                                    global const char * xq, global const float * xd,
+                                    global char * dst, ulong offd, ulong nb1, int ne00, int ne01) {
+    const int first_row = FIRST_ROW;
+    if (first_row >= ne01) return;
+    mv_q2_K(q + offq, ne00 / QK_K, first_row, ne01, xq, xd, (ulong)ne00 * NCOLS,
+            (global float *)(dst + offd), nb1 / sizeof(float));
+}
+
+// GET_ROWS of a Q2_K tensor in planes, as kernel_get_rows_q3_K: d (sc) q - dmin (m) in f32, ggml's order
+kernel void kernel_get_rows_q2_K(global const uchar * q, ulong offq, global const half * dp_unused,
+                                 global const char * src1, ulong off1, global char * dst, ulong offd,
+                                 int ne00, int ne01, ulong nb02, ulong nb03, ulong nb10, ulong nb11, ulong nb12,
+                                 ulong nb1, ulong nb2, ulong nb3) {
+    const int i10 = get_group_id(0), i11 = get_group_id(1), i12 = get_group_id(2);
+    const int row = *(global const int *)(src1 + off1 + i10 * nb10 + i11 * nb11 + i12 * nb12);
+    global const uchar * S = q + offq + i11 * nb02 + i12 * nb03;
+    const int nb = ne00 / QK_K;
+    const ulong nblk = (ulong)ne01 * nb;
+    global float * out = (global float *)(dst + offd + i10 * nb1 + i11 * nb2 + i12 * nb3);
+    for (int u = get_local_id(0); u < ne00 / 32; u += get_local_size(0)) {
+        const ulong b = (ulong)row * nb + u / 8;
+        const int p = u % 8, n = p >> 2, j = p & 3;
+        const uint8  qw = vload8(0, (global const uint *)(S + Q2K_QS(nblk) + b * 64 + 32 * n));
+        const uint4  sw = vload4(0, (global const uint *)(S + Q2K_SC(nblk) + b * 16));
+        const float2 dm = vload_half2(b, (global const half *)S);
+        float sc0, m0, sc1, m1;
+        q2k_sm(q2k_byte(sw, 8 * n + 2 * j), &sc0, &m0);
+        q2k_sm(q2k_byte(sw, 8 * n + 2 * j + 1), &sc1, &m1);
+        const float dl0 = dm.s0 * sc0, ml0 = dm.s1 * m0, dl1 = dm.s0 * sc1, ml1 = dm.s1 * m1;
+        const uint qv[8] = { qw.s0, qw.s1, qw.s2, qw.s3, qw.s4, qw.s5, qw.s6, qw.s7 };
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uchar4 c = as_uchar4((qv[i] >> (2 * j)) & 0x03030303u);
+            const float dl = i < 4 ? dl0 : dl1, ml = i < 4 ? ml0 : ml1;
+            vstore4((float4)(dl * (float)c.s0 - ml, dl * (float)c.s1 - ml, dl * (float)c.s2 - ml, dl * (float)c.s3 - ml),
+                    0, out + 32 * u + 4 * i);
+        }
+    }
+}
+#endif // GGML_OPENCL_NO_Q2K
 
 // ---- MUL_MAT_ID (NCOLS = 1 builds): pair k = get_group_id(2), slot
 // i = k % n_used, token t = k / n_used; expert ids[t][i], column

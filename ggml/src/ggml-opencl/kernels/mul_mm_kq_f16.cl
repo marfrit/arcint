@@ -1652,7 +1652,7 @@ constant uint iq3s_grid[512] = {
 // its scales carry the 1/8. After ggml-quants.c's dequantize_row_*. ----
 
 // bytes per block, 32-weight sub-blocks per block
-#define LB_BYTES(T) ((T) == 6 ? 66 : (T) == 7 ? 82 : (T) == 8 ? 56 : (T) == 9 ? 18 : (T) == 11 ? 74 : 110)
+#define LB_BYTES(T) ((T) == 6 ? 66 : (T) == 7 ? 82 : (T) == 8 ? 56 : (T) == 9 ? 18 : (T) == 11 ? 74 : (T) == 12 ? 110 /* Q3_K, 0116 */ : (T) == 13 ? 84 /* Q2_K, 0117 */ : 110)
 #define LB_SUBS(T)  ((T) == 9 ? 2 : 8)
 #define LB_ROW_BYTES(T, n32) ((ulong)((n32) / LB_SUBS(T)) * LB_BYTES(T))
 
@@ -1727,6 +1727,27 @@ static inline uint lb_u32(global const uchar * p) {
 // sub-block fields are aligned 32-bit words (the GGUF blocks of 18, 66, 82 or
 // 110 bytes left them at 2-byte offsets: single-byte loads). IQ1_M stays as
 // stored (its fields are aligned). Block bi of the slice, sub-block p (Q2_0: half).
+#ifndef GGML_OPENCL_NO_Q3K   // 0116: built without it when the program fails with it (ggml_cl_build_program_q3k)
+#ifdef Q3K_BREAK_BUILD   // the red case of the build fallback (GGML_OPENCL_Q3K_OPTS): the Q3_K text does not compile
+#error "Q3K_BREAK_BUILD"
+#endif
+// ARC-LAB 0116: Q3_K (index 12, mul_mv_iq_q8_1.cl has the layout): scale is of a block's 12 scale bytes,
+// minus 32 (-DQ3K_RED drops the top two bits: the red case); four weights from a qs word (bits 2j) and the
+// complement of an hmask word (bit hb), q2 - 4 where the hmask bit is clear (q2 | 0xFC per byte)
+static inline int q3k_scale(uint3 w, int is) {
+    const uint lo = is < 8 ? (kbyte(w, is) & 0xFu) : (kbyte(w, is - 8) >> 4);
+#ifdef Q3K_RED
+    const uint hi = 0;
+#else
+    const uint hi = (kbyte(w, 8 + (is & 3)) >> (2 * (is >> 2))) & 3u;
+#endif
+    return (int)(lo | (hi << 4)) - 32;
+}
+static inline uint q3k_w4(uint q, uint nh, int j, int hb) {
+    return ((q >> (2 * j)) & 0x03030303u) | (((nh >> hb) & 0x01010101u) * 0xFCu);
+}
+#endif // GGML_OPENCL_NO_Q3K
+
 static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk, ulong bi, int p,
                              uint * w, float * s0, float * s1 LB_LT_PARAM) {
     if (TYPE == 6) {          // IQ2_XXS
@@ -1816,6 +1837,20 @@ static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk,
 #endif
         }
         *s0 = *s1 = d;
+#ifndef GGML_OPENCL_NO_Q3K
+    } else if (TYPE == 12) {  // ARC-LAB 0116: Q3_K, planes d | hmask[32] | qs[64] | scales[12]; p = 4 n + j
+        const int n = p >> 2, j = p & 3;
+        const float d = vload_half(bi, (global const half *)S);
+        const uint8 qw = vload8(0, (global const uint *)(S + nblk * 34 + bi * 64 + 32 * n));
+        const uint8 nh = ~vload8(0, (global const uint *)(S + nblk * 2 + bi * 32));
+        const uint3 sw = vload3(0, (global const uint *)(S + nblk * 98 + bi * 12));
+        const uint qv[8] = { qw.s0, qw.s1, qw.s2, qw.s3, qw.s4, qw.s5, qw.s6, qw.s7 };
+        const uint hv[8] = { nh.s0, nh.s1, nh.s2, nh.s3, nh.s4, nh.s5, nh.s6, nh.s7 };
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) w[i] = q3k_w4(qv[i], hv[i], j, 4 * n + j);
+        *s0 = d * (float)q3k_scale(sw, 8 * n + 2 * j);
+        *s1 = d * (float)q3k_scale(sw, 8 * n + 2 * j + 1);
+#endif
     } else {                  // IQ3_S
         const float d = vload_half(bi, (global const half *)S);
         const uint2 q = vload2(bi * 8 + p, (global const uint *)(S + nblk * 2));
@@ -1839,11 +1874,63 @@ static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk,
 #define LB_BI(T, r, nbr, j32) ((ulong)(r) * (nbr) + (ulong)((j32) / LB_SUBS(T)))
 #define LB_P(T, j32)          ((j32) % LB_SUBS(T))
 
+#ifndef GGML_OPENCL_NO_Q2K   // 0117: built without it when the program fails with it (ggml_cl_build_program_q3k)
+#ifdef Q2K_BREAK_BUILD   // the red case of the build fallback (GGML_OPENCL_Q2K_OPTS): the Q2_K text does not compile
+#error "Q2K_BREAK_BUILD"
+#endif
+// ARC-LAB 0117: Q2_K (kq type index 13). A slice in planes (ggml-opencl-planes.h): dm[nblk] (d and dmin, a
+// half pair) | scales[16 nblk] | qs[64 nblk]. Weight 128 n + 32 j + t of a block (n 0..1, j 0..3, t 0..31)
+// is bits 2j of qs[32 n + t], a code q in 0..3, at scale byte is = 8 n + 2 j + t / 16: d (byte & 15) q -
+// dmin (byte >> 4), ggml's dequantize_row_q2_K. -DQ2K_RED swaps the byte's two nibbles (the red case).
+#define Q2K_SC(nblk) ((ulong)(nblk) * 4)
+#define Q2K_QS(nblk) ((ulong)(nblk) * 20)
+
+static inline uint q2k_byte(uint4 w, int k) {
+    const uint v = k < 4 ? w.s0 : (k < 8 ? w.s1 : (k < 12 ? w.s2 : w.s3));
+    return (v >> (8 * (k & 3))) & 0xFFu;
+}
+
+// the scale and the min of scale byte b
+static inline void q2k_sm(uint b, float * sc, float * m) {
+#ifdef Q2K_RED
+    *sc = (float)(b >> 4); *m = (float)(b & 0xFu);
+#else
+    *sc = (float)(b & 0xFu); *m = (float)(b >> 4);
+#endif
+}
+
+// the 32 weights of sub-block p = 4 n + j of block bi, d (sc) q - dmin (m) in f32 (ggml's order)
+static inline void q2k_v32(global const uchar * S, ulong nblk, ulong bi, int p, float * v) {
+    const int n = p >> 2, j = p & 3;
+    const uint8  qw = vload8(0, (global const uint *)(S + Q2K_QS(nblk) + bi * 64 + 32 * n));
+    const uint4  sw = vload4(0, (global const uint *)(S + Q2K_SC(nblk) + bi * 16));
+    const float2 dm = vload_half2(bi, (global const half *)S);
+    float sc0, m0, sc1, m1;
+    q2k_sm(q2k_byte(sw, 8 * n + 2 * j), &sc0, &m0);
+    q2k_sm(q2k_byte(sw, 8 * n + 2 * j + 1), &sc1, &m1);
+    const float dl0 = dm.s0 * sc0, ml0 = dm.s1 * m0, dl1 = dm.s0 * sc1, ml1 = dm.s1 * m1;
+    const uint qv[8] = { qw.s0, qw.s1, qw.s2, qw.s3, qw.s4, qw.s5, qw.s6, qw.s7 };
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const uchar4 c = as_uchar4((qv[i] >> (2 * j)) & 0x03030303u);
+        const float dl = i < 4 ? dl0 : dl1, ml = i < 4 ? ml0 : ml1;
+        v[4 * i] = dl * (float)c.s0 - ml; v[4 * i + 1] = dl * (float)c.s1 - ml;
+        v[4 * i + 2] = dl * (float)c.s2 - ml; v[4 * i + 3] = dl * (float)c.s3 - ml;
+    }
+}
+#endif // GGML_OPENCL_NO_Q2K
+
 // the 32 weights of sub-block j32 of global row g (expert g / ne01's slice) as floats
 static inline void lb_v32(const int TYPE, global const uchar * q, ulong g, int ne01, int n32, int j32, float * v) {
     const int   nbr  = n32 / LB_SUBS(TYPE);
     const ulong nblk = (ulong)ne01 * nbr;
     global const uchar * S = q + (g / ne01) * nblk * LB_BYTES(TYPE);
+#ifndef GGML_OPENCL_NO_Q2K
+    if (TYPE == 13) {   // 0117: Q2_K's min term is not lb_expand's form
+        q2k_v32(S, nblk, LB_BI(TYPE, g % ne01, nbr, j32), LB_P(TYPE, j32), v);
+        return;
+    }
+#endif
     uint w[8];
     float s0, s1;
     lb_expand(TYPE, S, nblk, LB_BI(TYPE, g % ne01, nbr, j32), LB_P(TYPE, j32), w, &s0, &s1);
@@ -1855,7 +1942,7 @@ static inline void lb_v32(const int TYPE, global const uchar * q, ulong g, int n
     }
 }
 
-// the low-bit types (kq type index 6..10, iq_low): unit (row r, 32-block j32),
+// the low-bit types and Q3_K (kq type index 6..12, iq_low): unit (row r, 32-block j32),
 // those past K skipped (Q2_0's K need only be a multiple of 64)
 static inline void deq_lb(const int TYPE, local half * wt, global const uchar * q, ulong wrow0, int row0, int ne01, int n32, int ib) {
 #if SG == 8
@@ -2319,6 +2406,22 @@ kernel void kernel_mul_mm_id_iq3_s_f16(global const uchar * q, ulong offq, globa
     ID_COLS
     MM_BODY(deq_lb(10, wt, q + offq, wrow0, row0, ne01, ne00 / 32, ib))
 }
+
+#ifndef GGML_OPENCL_NO_Q2K
+__attribute__((intel_reqd_sub_group_size(SG)))
+kernel void kernel_mul_mm_q2_K_f16(global const uchar * q, ulong offq, global const half * dp, PLAIN_ARGS) {
+    PLAIN_COLS
+    MM_BODY(deq_lb(13, wt, q + offq, wrow0, row0, ne01, ne00 / 32, ib))
+}
+#endif
+
+#ifndef GGML_OPENCL_NO_Q3K
+__attribute__((intel_reqd_sub_group_size(SG)))
+kernel void kernel_mul_mm_q3_K_f16(global const uchar * q, ulong offq, global const half * dp, PLAIN_ARGS) {
+    PLAIN_COLS
+    MM_BODY(deq_lb(12, wt, q + offq, wrow0, row0, ne01, ne00 / 32, ib))
+}
+#endif
 
 __attribute__((intel_reqd_sub_group_size(SG)))
 kernel void kernel_mul_mm_iq2_xs_f16(global const uchar * q, ulong offq, global const half * dp, PLAIN_ARGS) {

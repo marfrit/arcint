@@ -556,3 +556,92 @@ kernel void kernel_rms_norm_mul_rope_multi_f32(
         }
     }
 }
+
+//------------------------------------------------------------------------------
+// ARC-LAB 0114: the nGPT residual update of Dory's graph in one kernel,
+//   b = rms_norm(x, eps1) * s1,  t = a + (b - a) * w,  y = rms_norm(t, eps2) * s2
+// (the graph's RMS_NORM SCALE SUB MUL ADD RMS_NORM SCALE), one work-group a row,
+// w [ne00] broadcast over the rows. Each element is read and written by the same
+// work-item, after both reductions, so y may lie exactly over a or over x (the
+// allocator's in-place placement); any other overlap is refused by the host.
+// red != 0 (the test's mutation) reads w as 1.
+//------------------------------------------------------------------------------
+#ifdef INTEL_GPU
+REQD_SUBGROUP_SIZE_32
+#elif defined (ADRENO_GPU)
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_ngpt_slerp_f32(
+        global char * src_x,
+        ulong off_x,
+        global char * src_a,
+        ulong off_a,
+        global char * src_w,
+        ulong off_w,
+        global char * dst,
+        ulong off_d,
+        int ne00,
+        ulong nb_x,
+        ulong nb_a,
+        ulong nb_d,
+        float eps1,
+        float s1,
+        float eps2,
+        float s2,
+        int red,
+        local float * sum
+) {
+    const int row = get_group_id(0);
+    global const float4 * x = (global const float4 *) (src_x + off_x + row*nb_x);
+    global const float4 * a = (global const float4 *) (src_a + off_a + row*nb_a);
+    global const float4 * w = (global const float4 *) (src_w + off_w);
+    global float4 * y = (global float4 *) (dst + off_d + row*nb_d);
+    const int n4  = ne00/4;
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    const uint sg  = get_sub_group_id();
+    const uint nsg = get_local_size(0) / get_max_sub_group_size();   // the host launches a multiple of the sub-group size
+
+    float4 acc = 0.0f;
+    for (int i = lid; i < n4; i += lsz) {
+        const float4 v = x[i];
+        acc += v*v;
+    }
+    float p = sub_group_reduce_add(acc.s0 + acc.s1 + acc.s2 + acc.s3);
+    if (get_sub_group_local_id() == 0) {
+        sum[sg] = p;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    float tot = 0.0f;
+    for (uint k = 0; k < nsg; ++k) {
+        tot += sum[k];
+    }
+    const float r1 = 1.0f/sqrt(tot/ne00 + eps1);
+    // every work-item has read the partial sums before they are written again
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    acc = 0.0f;
+    for (int i = lid; i < n4; i += lsz) {
+        const float4 av = a[i];
+        const float4 wv = red ? (float4)(1.0f) : w[i];
+        const float4 t  = av + ((x[i]*r1)*s1 - av)*wv;
+        acc += t*t;
+    }
+    p = sub_group_reduce_add(acc.s0 + acc.s1 + acc.s2 + acc.s3);
+    if (get_sub_group_local_id() == 0) {
+        sum[sg] = p;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    tot = 0.0f;
+    for (uint k = 0; k < nsg; ++k) {
+        tot += sum[k];
+    }
+    const float r2 = 1.0f/sqrt(tot/ne00 + eps2);
+
+    for (int i = lid; i < n4; i += lsz) {
+        const float4 av = a[i];
+        const float4 wv = red ? (float4)(1.0f) : w[i];
+        const float4 t  = av + ((x[i]*r1)*s1 - av)*wv;
+        y[i] = (t*r2)*s2;
+    }
+}
