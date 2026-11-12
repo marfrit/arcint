@@ -15,7 +15,8 @@
 //   ./dory_turn_probe <dory-model.gguf> <threads> tools/dory_turn_cases.txt 4096 green [chain-max-tokens]   > probe.out
 //   LLAMA_DORY_RED_REUSE=1 ./dory_turn_probe <dory-model.gguf> <threads> tools/dory_turn_cases.txt 4096 red [chain-max-tokens] > probe-red.out
 //
-// `green` is the real run (exit 0 when it finishes; 4 = an API check failed, 6 = a probe failed). `red` stops after the
+// `green` is the real run (exit 0 when it finishes; 2 = a load, context, tokenize or decode failed or the arguments are
+// short, 3 = a state restore failed, 4 = an API check failed, 6 = a probe failed). `red` stops after the
 // PROBE section and is meant to be run with the library's red switch set: it exits 0 when at least one probe failed (the
 // switch bit) and 5 when none did (the red case proved nothing). Aggregate a green output with
 // tools/dory_turn_probe_agg.py. A run took up to about 90 minutes on 8 threads.
@@ -35,8 +36,8 @@
 //   PAIR x->y                       history cached at x, final turn at y in one context ("mixed") against a load at y,
 //                                   next to the pure-x arm; MIXED is its greedy text; TVT compares it with a state moved
 //                                   between two loads.
-// The original header of the experiment follows.
-// dturn: Dory's loop count as a per-turn choice in ONE context, tables built for 4 loops (LLAMA_DORY_MAX_LOOPS=4),
+// What it compares, section by section:
+// Dory's loop count as a per-turn choice in ONE context, tables built for 4 loops (LLAMA_DORY_MAX_LOOPS=4),
 // against the baseline: a model loaded at that count the way the server does it today (metadata override, the
 // variable unset, so the tables are the stock ones). CPU only.
 //   PROBE : one token at count X, then the same token at count Y in the same context, against the baseline at Y.
@@ -149,7 +150,7 @@ static std::vector<tok> tf_tokens(const Case & c, const std::vector<tok> & g, co
 static std::string answer(const std::string & t) { size_t i = t.find("</think>"); return i == std::string::npos ? "[no </think> in limit] ..." + t.substr(t.size() > 90 ? t.size() - 90 : 0) : t.substr(i + 8, 260); }
 
 int main(int argc, char ** argv) {
-    if (argc < 6) { fprintf(stderr, "usage: dturn model.gguf threads cases.txt n_ctx green|red [chain maxtok]\n"); return 2; }
+    if (argc < 6) { fprintf(stderr, "usage: dory_turn_probe model.gguf threads cases.txt n_ctx green|red [chain maxtok]\n"); return 2; }
     const char * path = argv[1]; int T = atoi(argv[2]); int nctx = atoi(argv[4]); const bool red = !strcmp(argv[5], "red");
     const int chain_max = argc > 6 ? atoi(argv[6]) : 400; const int nb = 2048; const int LC[3] = { 1, 2, 4 };
     llama_log_set(logcb, nullptr); ggml_backend_load_all(); llama_backend_init();

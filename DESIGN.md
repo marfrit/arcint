@@ -230,7 +230,7 @@ measured on 2026-11-07.
   section of `contrib/llama.cpp/README.md` (`measured-here`, CPU, Dory1.0-4B
   Q5_K_M, f16 cache, context 4,096, micro-batch 512, 8 threads, patch 0118). That
   is under the answer-level bar in mean KL and not in agreement for three of the
-  six transitions, which is no equivalence, while a load at N loops and a request at N
+  six transitions (1->4 -1.3, 2->1 -1.05, 4->1 -1.6 points), which is no equivalence, while a load at N loops and a request at N
   loops on tables for 4 were bit-equal in logits (18 greedy cases, 2,252 rows). The
   count is set on the context before every decode under the decode lock; one
   `llama_decode` carries one lane's rows on this path. Every answer names the count
@@ -248,8 +248,10 @@ measured on 2026-11-07.
   switch the count, rebuild the graph and re-plan the allocation on every decode
   (neither cost is measured). With the flag off nothing a request or a response
   sees changes, with two documented exceptions: a Dory start that inherits
-  `LLAMA_DORY_MAX_LOOPS` above the unit's count is refused (with patch 0118 the
-  library would build larger tables than the unit asked for), and `/props` `dory`
+  `LLAMA_DORY_MAX_LOOPS` above the unit's count is refused when the recurrent cache
+  is `last_loop` (with patch 0118 the library would build larger tables than the
+  unit asked for; with `per_loop` the library ignores the variable and the start
+  proceeds), and `/props` `dory`
   always carries `max_loops` (0 when off) and `effort_loops` (null when off).
 
   Card record (`measured-here`, 2026-11-12, the 16 GB card, OpenCL, Dory1.0-4B
@@ -258,7 +260,8 @@ measured on 2026-11-07.
   tool `tools/dory_loops_spot.py`): on the flagged process (2 loops, maximum 4)
   20 of 20 answers equal those of the process loaded at that count, but the
   reference answers differ between counts in only 2 of 5 prompts, so 3 of 5
-  could not have shown a wrong count; every route named its count; a changing
+  could not have shown a wrong count; chat, chat stream, Responses and token mode
+  named their count; a changing
   effort re-prefilled on each change and not on a repeat; card memory is equal
   to a load at 1, 2 or 4 loops (tables for 4 cost 0.0 MiB). The library's red
   switch did not fail on this route (cause by code reading, in the README); the

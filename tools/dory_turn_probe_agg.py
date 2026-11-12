@@ -1,18 +1,20 @@
 # dory_turn_probe_agg.py: aggregates the output of tools/dory_turn_probe.cpp (a green run).
 #
-#   python3 -I tools/dory_turn_probe_agg.py probe.out [earlier-probe.out] [-t]
+#   python3 -I tools/dory_turn_probe_agg.py probe.out [earlier-probe.out] [-t]     (-t may stand anywhere)
 #
 # Prints the set-up lines, the probe count, the IDENT totals per loop count (bit-equal rows, maxKL, rates), the TVT totals,
 # and the PAIR table: per count transition x->y the rows, the mixed run's mean KL and argmax agreement, the floor's (the
 # same count, batched against step by step), the pure-x arm's, dKL and dAgree (mixed minus floor, agreement in points),
 # the worst single conversation's agreement change (name and points) and the number of conversations whose greedy text
-# equals the load at y. Then the CHAIN lines. With a second file: how many EXACT texts equal that earlier run's. With -t:
+# equals the load at y. Then the CHAIN lines. With a second file (the output of an earlier probe run against the unpatched
+# library, not in the repository): how many EXACT texts equal that run's. With -t:
 # the answer tails of the exact and mixed texts per pair. It is the table of the 0118 section of contrib/llama.cpp/README.md.
 # Not part of the arcint build.
 import re,sys,collections
+FILES=[a for a in sys.argv[1:] if a!='-t']
 fl={}; pairs=collections.defaultdict(list); ex={}; mixed={}; ident=collections.defaultdict(list); tvt=collections.defaultdict(list)
 probe=[]; chain=[]; ctext=[]; pre=[]; misc=[]
-for ln in open(sys.argv[1],errors='replace'):
+for ln in open(FILES[0],errors='replace'):
     ln=ln.rstrip('\n')
     m=re.match(r'FLOOR loops=(\d+) case=(\w+) meanKL=(\S+) maxKL=(\S+) agree=(\d+)/(\d+)',ln)
     if m: fl[(m[1],m[2])]=(float(m[3]),float(m[4]),int(m[5]),int(m[6])); continue
@@ -37,7 +39,7 @@ print("\nIDENT (one context, count set per turn, vs a stock-style load at that c
 for y,rows in sorted(ident.items()):
     R=sum(r[2] for r in rows); B=sum(r[3] for r in rows)
     print(f"  loops={y}: cases {len(rows)} same_tokens {sum(r[1] for r in rows)}/{len(rows)} rows {R} bits_equal {B} maxKL {max(r[4] for r in rows):g} | t/s turn {sum(r[5] for r in rows)/len(rows):.1f} baseline {sum(r[6] for r in rows)/len(rows):.1f}")
-print("\nTVT (turn switch in one context vs state transfer between two loads, the 17:58 arm)")
+print("\nTVT (turn switch in one context vs state transfer between two loads, the state-transfer arm)")
 for k,rows in sorted(tvt.items()):
     print(f"  {k[0]}->{k[1]}: rows {sum(r[0] for r in rows)} bits_equal {sum(r[1] for r in rows)} maxabs {max(r[2] for r in rows):g}")
 print("\npair   n   | mixed meanKL agree%  | floor(Y) meanKL agree% | pure(X) meanKL agree% | dKL(mixed-floor) dAgree(pt) | worst case dAgree")
@@ -52,12 +54,12 @@ print("\nCHAIN");
 for l in chain+ctext: print("  "+l[:420])
 def tail(t):
     i=t.find('</think>'); return (t[i+8:] if i>=0 else '[no </think> in limit] ...'+t[-90:])[:230]
-if len(sys.argv)>2:
+if len(FILES)>1:
     old={}
-    for ln in open(sys.argv[2],errors='replace'):
+    for ln in open(FILES[1],errors='replace'):
         m=re.match(r'EXACT loops=(\d+) case=(\w+) n=(\d+) \S+ t/s text="(.*)"$',ln.rstrip('\n'))
         if m: old[(m[1],m[2])]=m[4]
-    same=sum(1 for k in ex if k in old and old[k]==ex[k][0]); print(f"\nEXACT texts equal to the stock build's run of 17:58: {same} of {len([k for k in ex if k in old])} (patched baseline loads vs unpatched libllama)")
+    same=sum(1 for k in ex if k in old and old[k]==ex[k][0]); print(f"\nEXACT texts equal to the earlier run of the unpatched library: {same} of {len([k for k in ex if k in old])} (patched baseline loads vs unpatched libllama)")
     for k in sorted(ex):
         if k in old and old[k]!=ex[k][0]: print("  differs:",k)
 if '-t' in sys.argv:

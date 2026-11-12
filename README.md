@@ -289,7 +289,8 @@ the E4B geometry, `granite` at the 8B geometry, `dory` at the 1.0-4B geometry, a
 `qwen3tts`) and refuses others
 at load, an untested size of an admitted architecture included. Gemma 4 E4B and Granite 4.2 8B
 were admitted 2026-11-06 from their files' metadata and templates (`code`); Dory1.0-4B (a looped
-nGPT, with `--llama-dory-loops` and `--llama-dory-kv`) on 2026-11-07; none has been
+nGPT, with `--llama-dory-loops` and `--llama-dory-kv`; since then also the opt-in
+`--llama-dory-max-loops`, a loop count per request) on 2026-11-07; none has been
 loaded or served here yet (DESIGN §2).
 Flash-Next's other files are on-demand options on the same endpoint: IQ2_XS,
 faster and less exact, and UD-Q3_K_XL, inside the KL bar once the host has

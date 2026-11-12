@@ -137,7 +137,7 @@ try:
         raw = u.urlopen(u.Request(URL + "/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"}), timeout=300).read().decode()
         sd = [json.loads(l[6:]).get("dory") for l in raw.splitlines() if l.startswith("data: {")]; sd = [x for x in sd if x]
         check(len(sd) == 1 and sd[0].get("loops") == 4, "chat stream effort high: one chunk names the count (%s)" % json.dumps(sd))
-        # token mode (the route the gateway alias uses): the prompt as the engine renders it, its hash, effort low
+        # token mode (the route a gateway uses, docs/feyntalk.md): the prompt as the engine renders it, its hash, effort low
         rb = {"model": "m", "input": [{"role": "user", "content": [{"type": "input_text", "text": "What is the capital of France? One word."}]}], "reasoning": {"effort": "low"}}
         try:
             rh = json.load(u.urlopen(URL + "/v1/responses/renderer", timeout=120)); RH = rh.get("renderer_hash") or rh.get("hash")

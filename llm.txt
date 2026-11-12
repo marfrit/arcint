@@ -228,7 +228,8 @@
   engine admits general.architecture qwen35, qwen35moe, qwen4exp, qwen2vl, llama
   at the Mistral Small 24B and Llama 2 7B geometries, gemma4 at the E4B geometry
   granite at the 8B geometry and dory at the 1.0-4B geometry (72 physical
-  blocks; --llama-dory-loops, --llama-dory-kv) (code: src/core/admission.cpp);
+  blocks; --llama-dory-loops, --llama-dory-kv, opt-in --llama-dory-max-loops:
+  a loop count per request by its reasoning effort) (code: src/core/admission.cpp);
   anything else, an untested size included, is refused at load. Dory1.0-4B
   is served on a card (a leg of the 1.6.2 gate); Gemma 4 E4B has card numbers (1.6.1) and no unit; Granite 4.2 8B is
   admitted, not yet run on a card. No
