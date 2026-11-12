@@ -2,6 +2,9 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <cstddef>
+#include <utility>
+#include <vector>
 
 namespace lgc {
 
@@ -26,6 +29,10 @@ inline bool dory_kv_mode_valid(std::string_view m) { return m == "per_loop" || m
 struct DoryOptions {
     int         loops = 0;
     std::string kv_mode;
+    // --llama-dory-max-loops (contrib/llama.cpp 0118): the largest count a request may ask for; 0 = off,
+    // every request runs `loops`. It is not a metadata override: libllama reads it from the environment
+    // (LLAMA_DORY_MAX_LOOPS), set by the backend before the load.
+    int         max_loops = 0;
     bool any() const { return loops > 0 || !kv_mode.empty(); }
 };
 
@@ -56,12 +63,38 @@ struct DoryServed {
     std::string loops_source;
     std::string kv_source;
     int         physical_layers = 0;
+    // the layers of the tables libllama built: at --llama-dory-max-loops N the tables are those of N
+    // loops, whatever count a request runs
     int         executed_layers = 0;
+    int         max_loops       = 0;   // --llama-dory-max-loops; 0 = off, every request runs `loops`
     // the layers that hold a KV cache once libllama has built the model: the attention blocks of the input
     // and output segments, and the recurrent segment's attention blocks once per loop (per_loop) or once
     // (last_loop). Derived from the pattern here and counted again from the built graph after the load.
     int         kv_layers = 0;
 };
+
+// The per-request loop count (--llama-dory-max-loops). `effort` is the request's reasoning effort as
+// typed (ChatRequest::reasoning_effort, after the unit's default); empty or a level this map does not
+// know: the unit's count. none, off, minimal, low: 1; medium: 2; high, xhigh: 4; the result is capped at
+// `max_loops` (and never below 1). `unit_loops` is --llama-dory-loops or the file's count.
+int dory_loops_for_effort(std::string_view effort, int unit_loops, int max_loops);
+
+// The map as /props prints it, in a fixed order: ("unset", unit_loops), ("none", ..), .. ("xhigh", ..),
+// each already capped at max_loops.
+std::vector<std::pair<std::string, int>> dory_effort_map(int unit_loops, int max_loops);
+
+// What a slot does with the cells it holds when a request comes at `want_loops`. A cache written at
+// another count is not continued: continuing it moved the mean KL by +0.001 to +0.006 nats over the
+// floor and cost up to 1.6 points of argmax agreement (contrib/llama.cpp 0118, measured-here), so the
+// slot is dropped and the prompt prefilled again at the new count. A slot holding nothing has nothing
+// to drop.
+enum class DoryReuse { Keep, Reprefill };
+DoryReuse dory_reuse(int slot_loops, int want_loops, std::size_t cached_tokens);
+
+// After the load: libllama's maximum (llama_model_dory_loops_max) must be the one the flag asked for.
+// A mismatch means the tables were built for another count (LLAMA_DORY_MAX_LOOPS not honoured), which
+// is a refusal, never a quiet fallback. Empty when it matches.
+std::string dory_check_max(int asked_max, unsigned lib_max);
 
 // The effective values. Returns an error text (and leaves `out` unset) for
 // metadata the port does not run; empty on success.

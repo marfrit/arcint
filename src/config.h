@@ -179,6 +179,10 @@ struct Config {
     // either one is reported at load and in /props with where it came from.
     int         llama_dory_loops = 0;
     std::string llama_dory_kv;
+    // --llama-dory-max-loops N (contrib/llama.cpp 0118): a request may run 1 to N loops, chosen by its
+    // reasoning effort (core/dory.h dory_loops_for_effort); --llama-dory-loops stays the count of a request
+    // that names none. 0: off, every request runs the unit's count. Needs --llama-dory-kv last_loop.
+    int         llama_dory_max_loops = 0;
     // --llama-mtp-card N: the card (index into llama_devices) that runs the
     // --llama-mtp-gguf model under the split; it reads only the last
     // layer's rows, through host memory. -1: unset, the first card.

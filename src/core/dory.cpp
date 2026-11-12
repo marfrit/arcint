@@ -1,5 +1,7 @@
 #include "core/dory.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -14,7 +16,19 @@ std::string dory_option_refusal(std::string_view arch, bool mtp, bool dflash, bo
             return "--llama-dory-loops is the loop count of a 'dory' model; this GGUF is a '" + std::string(arch) + "'";
         if (!opt.kv_mode.empty())
             return "--llama-dory-kv is the recurrent KV mode of a 'dory' model; this GGUF is a '" + std::string(arch) + "'";
+        if (opt.max_loops > 0)
+            return "--llama-dory-max-loops is the per-request loop count of a 'dory' model; this GGUF is a '" + std::string(arch) + "'";
         return {};
+    }
+    if (opt.max_loops > 0) {
+        if (opt.max_loops > kDoryMaxLoops)
+            return "--llama-dory-max-loops " + std::to_string(opt.max_loops) + ": the port runs 1 to " + std::to_string(kDoryMaxLoops);
+        if (opt.kv_mode != "last_loop")
+            return "--llama-dory-max-loops needs --llama-dory-kv last_loop: with per_loop a request at another count "
+                   "would read cache layers that no earlier request wrote";
+        if (opt.loops > opt.max_loops)
+            return "--llama-dory-max-loops " + std::to_string(opt.max_loops) + " is below --llama-dory-loops " +
+                   std::to_string(opt.loops);
     }
     if (mtp)
         return "--llama-mtp: a 'dory' model has no MTP head; start without --llama-mtp (and its -vocab/-gguf/-policy flags)";
@@ -66,7 +80,18 @@ std::string dory_resolve(const DoryGguf& g, const DoryOptions& opt, DoryServed& 
     s.kv_layers = attn(0, g.n_input) + attn(g.n_input, g.n_recurrent) * (s.kv_mode == "per_loop" ? s.loops : 1) +
                   attn(g.n_input + g.n_recurrent, g.n_output);
     s.physical_layers = g.n_input + g.n_recurrent + g.n_output;
-    s.executed_layers = g.n_input + g.n_recurrent * s.loops + g.n_output;
+    s.max_loops       = opt.max_loops;
+    if (s.max_loops > 0) {
+        if (s.kv_mode != "last_loop")
+            return "dory: --llama-dory-max-loops needs the last_loop recurrent KV; this model serves " + s.kv_mode;
+        if (s.max_loops > kDoryMaxLoops)
+            return "dory: --llama-dory-max-loops " + std::to_string(s.max_loops) + "; the port runs 1 to " + std::to_string(kDoryMaxLoops);
+        if (s.max_loops < s.loops)
+            return "dory: --llama-dory-max-loops " + std::to_string(s.max_loops) + " is below the unit's " +
+                   std::to_string(s.loops) + " loops (" + s.loops_source + ")";
+    }
+    // the tables libllama builds are those of the largest count a request may run
+    s.executed_layers = g.n_input + g.n_recurrent * std::max(s.loops, s.max_loops) + g.n_output;
     out               = s;
     return {};
 }
@@ -76,8 +101,8 @@ std::string dory_check_loaded(const DoryServed& s, int n_layer_reported, int n_l
         return "dory: libllama reports " + std::to_string(n_layer_physical_reported) + " physical blocks, the file's counts say " +
                std::to_string(s.physical_layers);
     if (n_layer_reported != s.executed_layers)
-        return "dory: libllama executes " + std::to_string(n_layer_reported) + " layers, " + std::to_string(s.loops) +
-               " loops imply " + std::to_string(s.executed_layers) + "; the loop count did not take effect";
+        return "dory: libllama executes " + std::to_string(n_layer_reported) + " layers, " +
+               std::to_string(std::max(s.loops, s.max_loops)) + " loops imply " + std::to_string(s.executed_layers) + "; the loop count did not take effect";
     return {};
 }
 
@@ -86,6 +111,34 @@ std::string dory_check_kv(const DoryServed& s, int kv_layers_built) {
         return "dory: libllama built " + std::to_string(kv_layers_built) + " KV cache layers, recurrent KV " + s.kv_mode + " at " +
                std::to_string(s.loops) + " loops implies " + std::to_string(s.kv_layers) + "; the KV mode did not take effect";
     return {};
+}
+
+int dory_loops_for_effort(std::string_view effort, int unit_loops, int max_loops) {
+    std::string e(effort);
+    std::transform(e.begin(), e.end(), e.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    int n = unit_loops;
+    if (e == "none" || e == "off" || e == "minimal" || e == "low") n = 1;
+    else if (e == "medium") n = 2;
+    else if (e == "high" || e == "xhigh") n = 4;
+    if (max_loops > 0) n = std::min(n, max_loops);
+    return std::max(n, 1);
+}
+
+std::vector<std::pair<std::string, int>> dory_effort_map(int unit_loops, int max_loops) {
+    std::vector<std::pair<std::string, int>> m;
+    for (const char* e : {"", "none", "off", "minimal", "low", "medium", "high", "xhigh"})
+        m.emplace_back(*e ? e : "unset", dory_loops_for_effort(e, unit_loops, max_loops));
+    return m;
+}
+
+DoryReuse dory_reuse(int slot_loops, int want_loops, std::size_t cached_tokens) {
+    return cached_tokens > 0 && slot_loops != want_loops ? DoryReuse::Reprefill : DoryReuse::Keep;
+}
+
+std::string dory_check_max(int asked_max, unsigned lib_max) {
+    if (static_cast<unsigned>(asked_max) == lib_max) return {};
+    return "dory: --llama-dory-max-loops " + std::to_string(asked_max) + ", but libllama built its tables for " +
+           std::to_string(lib_max) + " loops; the maximum did not take effect";
 }
 
 namespace {
@@ -192,7 +245,8 @@ std::string dory_fit_warning(const DoryCardForecast& f, std::uint64_t card_bytes
 }
 
 std::string dory_boot_line(const DoryServed& s) {
-    return "dory: loops " + std::to_string(s.loops) + " (" + s.loops_source + "), recurrent KV " + s.kv_mode + " (" + s.kv_source +
+    return "dory: loops " + std::to_string(s.loops) + " (" + s.loops_source + ")" +
+           (s.max_loops > 0 ? ", per request up to " + std::to_string(s.max_loops) : std::string()) + ", recurrent KV " + s.kv_mode + " (" + s.kv_source +
            "), " + std::to_string(s.physical_layers) + " blocks, " + std::to_string(s.executed_layers) + " layers executed, " +
            std::to_string(s.kv_layers) + " KV cache layers";
 }

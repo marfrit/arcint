@@ -427,6 +427,12 @@ std::string usage_text() {
         "  --llama-dory-kv MODE      a Dory model: per_loop (a KV a loop and layer) or\n"
         "                            last_loop (one a layer, each loop overwriting the\n"
         "                            last; default: the GGUF's own, per_loop)\n"
+        "  --llama-dory-max-loops N  a Dory model: let a request choose 1 to N loops by its\n"
+        "                            reasoning effort (none/off/minimal/low 1, medium 2,\n"
+        "                            high/xhigh 4, capped at N; no effort: the unit's\n"
+        "                            count). Needs --llama-dory-kv last_loop and N >=\n"
+        "                            --llama-dory-loops; a change of count re-prefills the\n"
+        "                            slot. Default 0, off (contrib/llama.cpp 0118)\n"
         "  --llama-expert-profile F  the expert ranking that fills the cache (Strata's\n"
         "                            STRP profile; default round robin)\n"
         "  --llama-expert-cache-save F\n"
@@ -550,6 +556,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || (std::string(v) != "per_loop" && std::string(v) != "last_loop"))
                 return fail("--llama-dory-kv takes per_loop or last_loop");
             cfg.llama_dory_kv = std::string(v);
+        } else if (arg == "--llama-dory-max-loops") {
+            if (!value(v) || !parse_int(v, cfg.llama_dory_max_loops) || cfg.llama_dory_max_loops < 0 || cfg.llama_dory_max_loops > 4)
+                return fail("--llama-dory-max-loops needs a loop count from 1 to 4 (0: off)");
         } else if (arg == "--llama-mtp-card") {
             if (!value(v) || !parse_int(v, cfg.llama_mtp_card) || cfg.llama_mtp_card < 0)
                 return fail("--llama-mtp-card needs a card index (0: the first --device card)");
@@ -997,14 +1006,27 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             cfg.llama_dflash_min_p > 0.0 || cfg.llama_dflash_ubatch > 0 ||
             cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192 ||
             cfg.llama_expert_cache_on() || !cfg.llama_expert_profile.empty() || cfg.llama_layer_split > 0 || cfg.llama_mtp_card >= 0 ||
-            cfg.llama_dory_loops > 0 || !cfg.llama_dory_kv.empty() || cfg.llama_reserve_cells > 0 || cfg.tts || !cfg.tts_profiles.empty() || cfg.tts_lang != "de" ||
+            cfg.llama_dory_loops > 0 || !cfg.llama_dory_kv.empty() || cfg.llama_dory_max_loops > 0 || cfg.llama_reserve_cells > 0 || cfg.tts || !cfg.tts_profiles.empty() || cfg.tts_lang != "de" ||
             cfg.tts_gen_device != "gpu" || !cfg.mmproj_path.empty())
             return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab/-gguf/-min-p, --llama-dflash/-gguf/-min-p/-ubatch, "
                         "--llama-kv, --llama-checkpoints/-step, "
-                        "--llama-expert-cache/-profile, --llama-layer-split, --llama-mtp-card, --llama-dory-loops/-kv, --llama-reserve-cells, --mmproj and --tts "
+                        "--llama-expert-cache/-profile, --llama-layer-split, --llama-mtp-card, --llama-dory-loops/-kv/-max-loops, --llama-reserve-cells, --mmproj and --tts "
                         "(-profiles/-lang/-gen-device) are options of "
                         "the libllama engine (--gguf), not of --stub");
         return {};
+    }
+    // --llama-dory-max-loops (contrib/llama.cpp 0118): a refusal here, never a quiet fallback to the
+    // unit's count. That the library has the symbol, that the model is a 'dory' one and that
+    // the tables took the count are checked at the load (exec/backend_llama.cpp).
+    if (cfg.llama_dory_max_loops > 0) {
+        if (cfg.llama_dory_kv != "last_loop")
+            return fail("--llama-dory-max-loops needs --llama-dory-kv last_loop (with per_loop a request at another "
+                        "count would read cache layers that no earlier request wrote)");
+        if (cfg.llama_dory_loops > cfg.llama_dory_max_loops)
+            return fail("--llama-dory-max-loops " + std::to_string(cfg.llama_dory_max_loops) +
+                        " is below --llama-dory-loops " + std::to_string(cfg.llama_dory_loops));
+        if (cfg.tts || !cfg.mmproj_path.empty())
+            return fail("--llama-dory-max-loops: a 'dory' model has no projector; start without --mmproj and --tts");
     }
     // --tts: a mmproj with the audio-generation half and the enrolled voices'
     // directory. The flag without either is a boot error, not a request-time

@@ -789,6 +789,48 @@ TEST(config_llama_dory_loops_and_kv) {
     CHECK(rejected({"--stub", "--llama-dory-kv", "per_loop"}));
 }
 
+// --llama-dory-max-loops N (contrib/llama.cpp 0118): opt-in, and every combination that cannot run
+// is a refusal at parse time, never a quiet fallback to the unit's count.
+TEST(config_llama_dory_max_loops) {
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/d.gguf"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dory_max_loops, 0);   // off by default
+    }
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/d.gguf", "--llama-dory-kv", "last_loop", "--llama-dory-max-loops", "4"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dory_max_loops, 4);
+    }
+    {
+        Config cfg;   // N equal to the unit's count is allowed
+        CHECK(run({"--gguf", "/m/d.gguf", "--llama-dory-kv", "last_loop", "--llama-dory-loops", "2",
+                   "--llama-dory-max-loops", "2"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dory_max_loops, 2);
+    }
+    {
+        Config cfg;   // 0 is off and needs nothing else
+        CHECK(run({"--gguf", "/m/d.gguf", "--llama-dory-max-loops", "0"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dory_max_loops, 0);
+    }
+    // the cache must be last_loop: absent, per_loop
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-max-loops", "4"}));
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-kv", "per_loop", "--llama-dory-max-loops", "4"}));
+    // N below the unit's own count
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-kv", "last_loop", "--llama-dory-loops", "3",
+                    "--llama-dory-max-loops", "2"}));
+    // out of range, not a number, no value
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-kv", "last_loop", "--llama-dory-max-loops", "5"}));
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-kv", "last_loop", "--llama-dory-max-loops", "-1"}));
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-kv", "last_loop", "--llama-dory-max-loops", "x"}));
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-kv", "last_loop", "--llama-dory-max-loops"}));
+    // a projector: not on a dory model
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--mmproj", "/m/p.gguf", "--llama-dory-kv", "last_loop",
+                    "--llama-dory-max-loops", "4"}));
+    // the libllama engine's option only
+    CHECK(rejected({"--stub", "--llama-dory-max-loops", "4"}));
+}
+
 // --llama-expert-cache A,B: a cache per card, in --device order
 TEST(config_llama_expert_cache_per_card) {
     {

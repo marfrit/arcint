@@ -410,3 +410,103 @@ TEST(dory_boot_line_names_the_values_and_their_sources) {
     CHECK(has(line, "192 layers executed"));
     CHECK(has(line, "96 KV cache layers"));
 }
+
+// --llama-dory-max-loops: the effort map (contrib/llama.cpp 0118). The unit's count serves a request that
+// names no effort; none/off/minimal/low run 1 loop, medium 2, high/xhigh 4, never above the unit's maximum.
+TEST(dory_effort_map) {
+    CHECK_EQ(dory_loops_for_effort("", 2, 4), 2);        // unset: the unit's count
+    CHECK_EQ(dory_loops_for_effort("", 4, 4), 4);
+    for (const char* e : {"none", "off", "minimal", "low"}) CHECK_EQ(dory_loops_for_effort(e, 2, 4), 1);
+    CHECK_EQ(dory_loops_for_effort("medium", 1, 4), 2);
+    CHECK_EQ(dory_loops_for_effort("high", 1, 4), 4);
+    CHECK_EQ(dory_loops_for_effort("xhigh", 1, 4), 4);
+    CHECK_EQ(dory_loops_for_effort("HIGH", 1, 4), 4);   // the level is not case-sensitive here
+    // a level this map does not know is the unit's count
+    CHECK_EQ(dory_loops_for_effort("ultra", 3, 4), 3);
+}
+
+TEST(dory_effort_map_is_capped_at_the_units_maximum) {
+    CHECK_EQ(dory_loops_for_effort("high", 2, 3), 3);
+    CHECK_EQ(dory_loops_for_effort("xhigh", 2, 3), 3);
+    CHECK_EQ(dory_loops_for_effort("medium", 1, 1), 1);
+    CHECK_EQ(dory_loops_for_effort("high", 1, 2), 2);
+    CHECK_EQ(dory_loops_for_effort("medium", 1, 4), 2);
+    CHECK_EQ(dory_loops_for_effort("low", 1, 4), 1);
+    // the unset request is capped too (a maximum below the unit's count is refused at the start, not here)
+    CHECK_EQ(dory_loops_for_effort("", 4, 3), 3);
+    // the table /props prints is the function over the levels, in a fixed order
+    const auto m = dory_effort_map(2, 3);
+    CHECK_EQ(m.size(), static_cast<size_t>(8));
+    CHECK_EQ(m[0].first, std::string("unset"));
+    CHECK_EQ(m[0].second, 2);
+    CHECK_EQ(m[1].first, std::string("none"));
+    CHECK_EQ(m[1].second, 1);
+    CHECK_EQ(m[5].first, std::string("medium"));
+    CHECK_EQ(m[5].second, 2);
+    CHECK_EQ(m[7].first, std::string("xhigh"));
+    CHECK_EQ(m[7].second, 3);
+}
+
+// A slot's cells written at one count are not continued at another: the slot is prefilled again.
+TEST(dory_reuse_decision) {
+    CHECK(dory_reuse(2, 2, 100) == DoryReuse::Keep);         // same count: the prefix serves
+    CHECK(dory_reuse(2, 4, 100) == DoryReuse::Reprefill);    // another count: dropped
+    CHECK(dory_reuse(4, 1, 1) == DoryReuse::Reprefill);
+    CHECK(dory_reuse(1, 2, 0) == DoryReuse::Keep);           // nothing cached: nothing to drop
+    CHECK(dory_reuse(0, 2, 0) == DoryReuse::Keep);
+}
+
+TEST(dory_max_loops_resolution_and_refusals) {
+    DoryOptions o;
+    o.loops     = 2;
+    o.kv_mode   = "last_loop";
+    o.max_loops = 4;
+    DoryServed s;
+    CHECK(dory_resolve(file(), o, s).empty());
+    CHECK_EQ(s.loops, 2);
+    CHECK_EQ(s.max_loops, 4);
+    // the tables are those of the maximum
+    CHECK_EQ(s.executed_layers, 192);
+    CHECK(dory_check_loaded(s, 192, 72).empty());
+    CHECK(!dory_check_loaded(s, 112, 72).empty());
+    CHECK(has(dory_boot_line(s), "per request up to 4"));
+    // off: the tables are those of the unit's count, and the boot line is unchanged
+    DoryOptions off;
+    off.loops   = 2;
+    off.kv_mode = "last_loop";
+    DoryServed s0;
+    CHECK(dory_resolve(file(), off, s0).empty());
+    CHECK_EQ(s0.max_loops, 0);
+    CHECK_EQ(s0.executed_layers, 112);
+    CHECK(!has(dory_boot_line(s0), "per request"));
+    // N below the unit's count, per_loop, a number out of range
+    DoryOptions low = o;
+    low.loops = 3;
+    low.max_loops = 2;
+    CHECK(has(dory_resolve(file(), low, s), "below the unit's"));
+    CHECK(has(dory_option_refusal("dory", false, false, false, low), "below --llama-dory-loops"));
+    DoryOptions pl = o;
+    pl.kv_mode = "per_loop";
+    CHECK(has(dory_option_refusal("dory", false, false, false, pl), "last_loop"));
+    DoryOptions nokv = o;
+    nokv.kv_mode.clear();   // the file says per_loop
+    CHECK(!dory_option_refusal("dory", false, false, false, nokv).empty());
+    DoryGguf g = file();
+    g.kv_mode = "last_loop";
+    DoryOptions viafile = o;
+    viafile.kv_mode.clear();
+    CHECK(dory_resolve(g, viafile, s).empty());   // the file's own last_loop is read back at the load
+    CHECK(has(dory_resolve(file(), viafile, s), "last_loop"));
+    DoryOptions big = o;
+    big.max_loops = 5;
+    CHECK(has(dory_option_refusal("dory", false, false, false, big), "1 to 4"));
+    // another architecture, MTP
+    CHECK(has(dory_option_refusal("qwen35", false, false, false, o), "--llama-dory-max-loops"));
+    CHECK(has(dory_option_refusal("dory", true, false, false, o), "--llama-mtp"));
+}
+
+TEST(dory_max_loops_must_take_effect) {
+    CHECK(dory_check_max(4, 4).empty());
+    CHECK(has(dory_check_max(4, 2), "did not take effect"));
+    CHECK(!dory_check_max(3, 0).empty());   // an unpatched library reports no maximum
+}
