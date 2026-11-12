@@ -864,6 +864,10 @@ Measured and left out (`measured-here`, B60):
   XVE instead of 4): spills, 37 instructions a DPAS.
 - the conversion with each column read once and held in registers: 139 ->
   136 us, not kept.
+- beyond this patch's kernels: 2026-11-12, the B60 (`measured-here`): the 2D,
+  tile and ID2 kernels at their shipped tiles rebuilt at 128 GRF: faster in
+  none of the 19 timed op-suite cases at 512 tokens; the 128 arms' outputs
+  checked only in part (`docs/campaigns/research-inferzero.md`).
 
 ## 0014-opencl-intel-searched-tiles.patch
 
