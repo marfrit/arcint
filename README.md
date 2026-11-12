@@ -480,7 +480,57 @@ service's production flags, Flash-Next's expert cache included
   drop a running tool loop's reasoning; absent renders exactly as before.
   `chat_template_kwargs` is a passthrough to the template (llama-server's
   dialect): `enable_thinking` and `preserve_thinking` are type-checked, every
-  other key reaches the template unchanged and is not refused. `/props`'
+  other key reaches the template unchanged and is not refused.
+  `--chat-template-kwarg KEY=VALUE` (repeatable) sets a unit default for any
+  key: VALUE is JSON when it parses as JSON (`true`, `3`, `"text"`), else the
+  bare text is a string; `null`, a reserved context name (`messages`, `tools`,
+  `bos_token`, ...), a non-boolean `preserve_thinking` and a repeated key fail
+  at startup. `reasoning_effort=LEVEL` (none,
+  off, minimal, low, medium, high, xhigh) is a level, not a passthrough value:
+  a request that states its own, by the top-level `reasoning_effort`, the
+  Responses `reasoning.effort` or `chat_template_kwargs.reasoning_effort`,
+  keeps it; the default goes through the mapping a request's level gets, and
+  for a request that states neither a level nor the thinking switch it also
+  sets the switch: `none` and `off` turn thinking off, every other level turns
+  it on (on a template that does not think by default, a non-off unit level
+  therefore makes every silent request a thinking turn, as a request's own
+  top-level `reasoning_effort` or Responses `reasoning.effort` does; a level a
+  request sends inside `chat_template_kwargs` sets no switch). It must agree with `enable_thinking=BOOL` when both are given
+  (a start failure otherwise).
+  `/v1/responses` has no `chat_template_kwargs` field, so a Responses client
+  cannot turn a unit default off. **Token mode:** a gateway that renders
+  the prompt itself must apply `/props` `chat_template_kwargs_default` when a
+  default names a key the template reads (the same holds for the thinking
+  default, `enable_thinking`), or its prompt hash differs from the engine's
+  and the turn answers 409. A `reasoning_effort` default is not a raw kwarg:
+  the engine applies it as the request's own top-level `reasoning_effort` when
+  the request states no level by any route (top-level `reasoning_effort`,
+  Responses `reasoning.effort`, or the kwarg), so it goes through the
+  template's level mapping and sets the thinking switch; the gateway must apply
+  it the same way, as a top-level level, or its prompt hash differs and the
+  turn answers 409. `/props` `chat_template_kwargs_default` lists the level as
+  configured, not as mapped.
+  A request that carries the key keeps its own value (`false`
+  included); the defaults apply on every route that prepares a chat turn (chat,
+  Responses, the chat form of `/tokenize`) and `/props`
+  `chat_template_kwargs_default` lists them.
+  `chat_template_kwargs.force_nonempty_content: true` (a request's, or the unit
+  default) is acted on by the server, as vLLM's Nemotron-V3 reasoning parser
+  does (NVIDIA's Dory1.0-4B card asks agents to send it; the model's template
+  ignores the name): non-streaming, an empty or blank answer after the
+  reasoning split takes the reasoning text as the content (the tool-call parse
+  then sees it, and no `reasoning_content` is sent for it); streaming, a think
+  block that never closed sends the whole reasoning text once as a `content`
+  delta before the final chunk (the reasoning deltas stay); the stream does not
+  tool-parse the promoted text, as the reference's stream does not, so call
+  markup the model wrote inside a thinking block that was cut stays text and is
+  never a `tool_calls` delta. Reasoning that is
+  blank (empty or ASCII whitespace only) is never promoted, on any path; a
+  non-ASCII space such as U+00A0 counts as text, where the reference's
+  `str.strip()` reads it as blank. Only the JSON
+  boolean `true` triggers, and a unit default of `force_nonempty_content` must be
+  `true` or `false` (anything else fails at start). Chat and Responses routes; the Responses stream in
+  token mode is exempt. `/props`'
   `chat_template_caps` reports `supports_preserve_reasoning` (the template
   renders reasoning_content at all) and `supports_preserve_thinking` (it reads
   the switch).
@@ -503,6 +553,13 @@ service's production flags, Flash-Next's expert cache included
 
 ## Scope
 
+- `--chat-template-file PATH` replaces the GGUF's embedded chat template with
+  the jinja text of PATH, as llama.cpp's flag of the same name: the rendering,
+  the capability scan (`/props` `chat_template_caps`) and the renderer material
+  all read the file. It is read and parsed at start; a missing, empty or
+  unparsable file stops the start, and there is no fallback to the embedded
+  template. `chat_template_caps.template_source` is `gguf`, `file` or
+  `chatml-fallback`. Not with `--stub`.
 - **Models**: the table above. Other architectures are refused at load.
 - **Cards**: the Intel Arc A770 (16 GiB, Xe-HPG) and the Arc Pro B60 (24 GB,
   Xe2), under the xe kernel driver. One card per process, or two by layers

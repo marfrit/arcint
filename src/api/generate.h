@@ -78,6 +78,10 @@ struct ChatGeneration {
     // textual, because a piece may carry an opener, reasoning and a closer at
     // once and the piece count is then not a token count.
     int                         reasoning_tokens = 0;
+    // ARCINT_RAW_TRACE: keep the text handed to the tool-call parser (the
+    // split's content) in parse_input. Off by default: nothing is copied.
+    bool                        keep_parse_input = false;
+    std::string                 parse_input;
 };
 
 // The split the non-streaming chat path has always used: token ids when the

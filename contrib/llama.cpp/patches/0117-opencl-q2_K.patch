@@ -1,0 +1,1002 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Markus Fritsche <mfritsche@reauktion.de>
+Date: Mon, 9 Nov 2026 16:30:00 +0000
+Subject: [PATCH] 0117-opencl-q2_K
+
+---
+ ggml/src/ggml-opencl/ggml-opencl-planes.h      |   4 +-
+ ggml/src/ggml-opencl/ggml-opencl.cpp           | 195 ++++++++++++++++++++++++++++++---------------
+ ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl   |  71 +++++++++++++++++
+ ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl  |  62 +++++++++++++-
+ ggml/src/ggml-opencl/kernels/mul_mm_kq_few.cl  | 101 +++++++++++++++++++++++
+ ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl | 148 +++++++++++++++++++++++++++++++++-
+ src/llama-expert-cache.cpp                     |   4 +-
+ tests/test-backend-ops.cpp                     |  43 +++++++++-
+ 8 files changed, 556 insertions(+), 72 deletions(-)
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl-planes.h b/ggml/src/ggml-opencl/ggml-opencl-planes.h
+index d4f8175a9..dc84e93d7 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl-planes.h
++++ b/ggml/src/ggml-opencl/ggml-opencl-planes.h
+@@ -1,7 +1,7 @@
+ // ARC-LAB 0022 / 0116: the planar layout of the low-bit types and Q3_K on the card, device-free (ggml.h
+ // only), so that arcint's unit tests run the same code as the backend.
+ //
+-// The low-bit types IQ2_XXS, IQ2_XS, IQ2_S, Q2_0, IQ3_S (0022, 0030) and Q3_K (0116) live on the card in
++// The low-bit types IQ2_XXS, IQ2_XS, IQ2_S, Q2_0, IQ3_S (0022, 0030), Q3_K (0116) and Q2_K (0117) live on the card in
+ // planes, per weight slice (one 2-D matrix, ne0 ne1 values: an expert): each field of every block back to
+ // back (mul_mv_iq_q8_1.cl, lb_expand), so a lane reads aligned 32-bit words. A slice keeps its size and
+ // place, so slot / bank copies and gathers stay byte copies; reads and writes of GGUF bytes convert here.
+@@ -27,6 +27,8 @@ static inline int ggml_cl_lb_fields(ggml_type t, ggml_cl_lb_field f[5]) {
+         case GGML_TYPE_IQ3_S:   f[0] = { 0, 2 }; f[1] = { 2, 64 }; f[2] = { 66, 8 }; f[3] = { 74, 32 }; f[4] = { 106, 4 }; return 5;
+         // 0116: Q3_K's hmask[32] | qs[64] | scales[12] | d as d | hmask | qs | scales (mul_mv_iq_q8_1.cl)
+         case GGML_TYPE_Q3_K:    f[0] = { 108, 2 }; f[1] = { 0, 32 }; f[2] = { 32, 64 }; f[3] = { 96, 12 }; return 4;
++        // 0117: Q2_K's scales[16] | qs[64] | d | dmin as dm (d, dmin: one half pair) | scales | qs
++        case GGML_TYPE_Q2_K:    f[0] = { 80, 4 }; f[1] = { 0, 16 }; f[2] = { 16, 64 }; return 3;
+         default:                return 0;
+     }
+ }
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 726cf4ea6..efd2a6e26 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1067,6 +1067,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0, kernel_get_rows_i32;
+     cl_kernel kernel_get_rows_q8_0 = nullptr, kernel_get_rows_q8_0_flat = nullptr;   // patch 0036
+     cl_kernel kernel_get_rows_q3_K = nullptr;   // 0116: Q3_K in planes (mul_mv_iq_q8_1.cl)
++    cl_kernel kernel_get_rows_q2_K = nullptr;   // 0117: Q2_K in planes
+     cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
+     cl_kernel kernel_set_rows_h16_i64 = nullptr, kernel_set_rows_h16_i32 = nullptr;   // F16 rows into F16
+     cl_kernel kernel_set_rows_q8_0_i64, kernel_set_rows_q8_0_i32;
+@@ -1170,8 +1171,8 @@ struct ggml_backend_opencl_context {
+     // IQ3_XXS, IQ4_XS, IQ4_NL, and the low-bit types IQ2_XXS, IQ2_S, IQ1_M,
+     // Q2_0, IQ3_S, IQ2_XS, and Q3_K (0116) (mul_mv_iq_q8_1.cl); [columns - 1][type],
+     // one build per column count, 1 to 4
+-    cl_kernel kernel_mul_mv_kq_q8_1[8][13] = {};   // [columns - 1][type]: the K-quants 1-4, the IQ types and Q3_K 1-4 (0115's arm: up to 8)
+-    cl_kernel kernel_mul_mv_id_kq_q8_1[13] = {};   // null for Q3_K: its MUL_MAT_ID stays on the CPU (0116)
++    cl_kernel kernel_mul_mv_kq_q8_1[8][14] = {};   // [columns - 1][type]: the K-quants 1-4, the IQ types and Q3_K 1-4 (0115's arm: up to 8)
++    cl_kernel kernel_mul_mv_id_kq_q8_1[14] = {};   // null for Q3_K and Q2_K: their MUL_MAT_ID stays on the CPU (0116, 0117)
+     // Intel: F16 (and BF16, stored as F16) weights times 2-8 columns, each
+     // weight row read once (mul_mv_iq_q8_1.cl, kernel_mul_mv_f16_f32_nc)
+     cl_kernel kernel_mul_mv_f16_f32_nc = nullptr;
+@@ -1217,9 +1218,10 @@ struct ggml_backend_opencl_context {
+     // Q5_K, Q6_K; its token tile and sub-groups a work-group
+     cl_kernel kernel_mul_mm_kq2d[3] = {};
+     cl_kernel kernel_mul_mm_kq2d_q3_K = nullptr;   // 0116: Q3_K's planes on the same loads (its own fit)
++    cl_kernel kernel_mul_mm_kq2d_q2_K = nullptr;   // 0117: Q2_K's
+     int       kq2d_tm = 64, kq2d_wg = 16;
+     int       kq2d_tm_t[3] = { 64, 64, 64 }, kq2d_wg_t[3] = { 16, 16, 16 };   // per type (GGML_OPENCL_KQ_2D_T<i>)
+-    cl_kernel kernel_mul_mm_kq_f16[13]    = {};
++    cl_kernel kernel_mul_mm_kq_f16[14]    = {};
+     // ARC-LAB 0096: dense Q4_0 on the integer-dot matvec and the XMX GEMM
+     cl_kernel kernel_mul_mv_q40_q8_1[8]   = {};
+     // 0115's arm (GGML_OPENCL_KQ_MV_NCOLS): Strata's form, the q8_1 matvec at up to 8 columns for the IQ types,
+@@ -1242,10 +1244,10 @@ struct ggml_backend_opencl_context {
+     int       kq40_sg8_tm = 32, kq40_sg8_wg = 8;
+     cl_kernel kernel_mul_mm_f16w_f16      = nullptr;   // F16 / BF16 weights on the XMX tiles
+     cl_kernel kernel_mul_mm_q8_0_f16     = nullptr;   // Q8_0 code+scale on the same XMX tiles (0058)
+-    cl_kernel kernel_mul_mm_id_kq_f16[13] = {};   // null for Q3_K (0116)
++    cl_kernel kernel_mul_mm_id_kq_f16[14] = {};   // null for Q3_K and Q2_K (0116, 0117)
+     // MUL_MAT_ID with the tokens as the DPAS a operand (kernel_mul_mm_id2_*):
+     // KQ_ID2_XT pairs x KQ_ID2_XSG sub-groups of rows per work-group
+-    cl_kernel kernel_mul_mm_id2_kq_f16[13] = {};   // null past index 5: the low-bit types and Q3_K have none
++    cl_kernel kernel_mul_mm_id2_kq_f16[14] = {};   // null past index 5: the low-bit types and Q3_K have none
+     int       kq_id2_xt = 32, kq_id2_xsg = 16;
+     // 0071: the int8 DPAS expert tile (IQ3_S gate/up, IQ4_NL down), MUL_MAT_ID
+     // only, sub-group 16 (the s8 8x16x32 DPAS). I8XT pairs a tile of the route,
+@@ -1299,8 +1301,8 @@ struct ggml_backend_opencl_context {
+     ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
+     int       kq_q8_1_ndst = 4;
+     // Intel: K-quant x a few columns on the XMX units (mul_mm_kq_few.cl),
+-    // [G - 1][Q4_K, Q5_K, Q6_K, Q3_K (0116)]: G = 1 takes up to 8 columns, G = 2 up to 16
+-    cl_kernel kernel_mul_mm_few_kq[2][4] = {};
++    // [G - 1][Q4_K, Q5_K, Q6_K, Q3_K (0116), Q2_K (0117)]: G = 1 takes up to 8 columns, G = 2 up to 16
++    cl_kernel kernel_mul_mm_few_kq[2][5] = {};
+     cl_kernel kernel_mul_mm_few_prep[2]  = {};
+     int       kq_few_sg = 16, kq_few_nk = 4, kq_few_min = 2;
+     // 0115: Q4_0, Q8_0, IQ4_XS, IQ4_NL x 2-16 columns on int8 DPAS (mul_mm_few_i8.cl),
+@@ -1965,18 +1967,50 @@ static std::string ggml_cl_q3k_opts(const char * what) {
+ // its Q3_K kernels (`path=fallback reason=not-built what=<program>:<kernels>`). *with_q3k: the Q3_K kernels
+ // are in the returned program. -DQ3K_BREAK_BUILD in GGML_OPENCL_Q3K_OPTS breaks the Q3_K text (the red
+ // case of this fallback).
+-static cl_program ggml_cl_build_program_q3k(ggml_backend_opencl_context * backend_ctx, const char * src, const std::string & opts,
+-                                            const char * what, bool * with_q3k) {
++
++// ARC-LAB 0117: GGML_OPENCL_Q2K_OPTS, Q2_K's defines for the same builds (-DQ2K_RED: the scale byte's
++// nibbles swapped, the red case; -DQ2K_BREAK_BUILD: the Q2_K text does not compile)
++static std::string ggml_cl_q2k_opts(const char * what) {
++    const char * e = getenv("GGML_OPENCL_Q2K_OPTS");
++    if (e == nullptr || e[0] == '\0') {
++        return std::string();
++    }
++    GGML_LOG_WARN("ggml_opencl: Q2_K kernels (%s) built with GGML_OPENCL_Q2K_OPTS=%s\n", what, e);
++    return std::string(" ") + e;
++}
++
++// ARC-LAB 0117: 0116's fallback for the two types the shared programs carry, Q3_K and Q2_K: a program that
++// does not build is built without Q2_K's text, then without Q3_K's, then without both; each type that
++// leaves is keyed `path=fallback reason=not-built what=<program>:<its kernels>`
++static cl_program ggml_cl_build_program_q3k_q2k(ggml_backend_opencl_context * backend_ctx, const char * src, const std::string & opts,
++                                                const char * what_q3k, const char * what_q2k, bool * with_q3k, bool * with_q2k) {
++    *with_q3k = *with_q2k = true;
+     cl_program prog = build_program_from_source_optional(backend_ctx, src, opts);
+-    *with_q3k = prog != nullptr;
+-    if (prog == nullptr) {
+-        prog = build_program_from_source_optional(backend_ctx, src, opts + " -DGGML_OPENCL_NO_Q3K");
+-        if (prog != nullptr) {
+-            ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", what);
+-            GGML_LOG_WARN("ggml_opencl: %s: the program did not build with its Q3_K kernels; built without them (Q3_K goes to the CPU there)\n", what);
++    if (prog != nullptr) {
++        return prog;
++    }
++    const struct { const char * def; bool q3k, q2k; } tries[] = {
++        { " -DGGML_OPENCL_NO_Q2K", true, false }, { " -DGGML_OPENCL_NO_Q3K", false, true },
++        { " -DGGML_OPENCL_NO_Q3K -DGGML_OPENCL_NO_Q2K", false, false } };
++    for (const auto & t : tries) {
++        prog = build_program_from_source_optional(backend_ctx, src, opts + t.def);
++        if (prog == nullptr) {
++            continue;
++        }
++        *with_q3k = t.q3k;
++        *with_q2k = t.q2k;
++        for (int k = 0; k < 2; ++k) {
++            const bool gone = k == 0 ? !t.q3k : !t.q2k;
++            const char * what = k == 0 ? what_q3k : what_q2k;
++            if (gone) {
++                ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", what);
++                GGML_LOG_WARN("ggml_opencl: %s: the program did not build with these kernels; built without them (their type goes to the CPU there)\n", what);
++            }
+         }
++        return prog;
+     }
+-    return prog;
++    *with_q3k = *with_q2k = false;
++    return nullptr;
+ }
+ 
+ static bool ggml_cl_kq_kernels_built(ggml_backend_opencl_context * backend_ctx, int ti, bool mm, bool id) {
+@@ -2636,18 +2670,18 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                 const std::string iq_src = read_file("mul_mv_iq_q8_1.cl");
+ #endif
+                 // type index 3 + i; Q3_K (0116) has no MUL_MAT_ID kernel: its experts stay on the CPU
+-                const char * iq_n[10]    = { "kernel_mul_mv_iq3_xxs_q8_1", "kernel_mul_mv_iq4_xs_q8_1", "kernel_mul_mv_iq4_nl_q8_1",
++                const char * iq_n[11]    = { "kernel_mul_mv_iq3_xxs_q8_1", "kernel_mul_mv_iq4_xs_q8_1", "kernel_mul_mv_iq4_nl_q8_1",
+                                              "kernel_mul_mv_iq2_xxs_q8_1", "kernel_mul_mv_iq2_s_q8_1", "kernel_mul_mv_iq1_m_q8_1",
+                                              "kernel_mul_mv_q2_0_q8_1", "kernel_mul_mv_iq3_s_q8_1", "kernel_mul_mv_iq2_xs_q8_1",
+-                                             "kernel_mul_mv_q3_K_q8_1" };
+-                const char * iq_id_n[10] = { "kernel_mul_mv_id_iq3_xxs_q8_1", "kernel_mul_mv_id_iq4_xs_q8_1", "kernel_mul_mv_id_iq4_nl_q8_1",
++                                             "kernel_mul_mv_q3_K_q8_1", "kernel_mul_mv_q2_K_q8_1" };
++                const char * iq_id_n[11] = { "kernel_mul_mv_id_iq3_xxs_q8_1", "kernel_mul_mv_id_iq4_xs_q8_1", "kernel_mul_mv_id_iq4_nl_q8_1",
+                                              "kernel_mul_mv_id_iq2_xxs_q8_1", "kernel_mul_mv_id_iq2_s_q8_1", "kernel_mul_mv_id_iq1_m_q8_1",
+                                              "kernel_mul_mv_id_q2_0_q8_1", "kernel_mul_mv_id_iq3_s_q8_1", "kernel_mul_mv_id_iq2_xs_q8_1",
+-                                             nullptr };
++                                             nullptr, nullptr };
+                 // GGML_OPENCL_IQ_OPTS: defines added to these builds (measurement); GGML_OPENCL_Q3K_OPTS (0116)
+                 const char * iq_opts_env = getenv("GGML_OPENCL_IQ_OPTS");
+                 const std::string iq_extra_opts = (iq_opts_env != nullptr ? std::string(" ") + iq_opts_env : std::string()) +
+-                                                  ggml_cl_q3k_opts("matvec");
++                                                  ggml_cl_q3k_opts("matvec") + ggml_cl_q2k_opts("matvec");
+                 // ARC-LAB 0115: GGML_OPENCL_KQ_MV_NCOLS=5..8 builds these up to that many columns, with a Q8_0
+                 // matvec (-DMV_Q8_0), and routes the IQ types, Q4_0 and Q8_0 at 2 columns up to it here instead of
+                 // the int8 few-column product: the reference's form (Strata, native_mmvq.dp.cpp: NCOLS 1..8) as an arm
+@@ -2659,9 +2693,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         " -DN_SIMDGROUP=4 -DNCOLS=" + std::to_string(nc) + (nc > 1 ? " -cl-intel-256-GRF-per-thread" : "") +
+                         (backend_ctx->kq_mv_arm > 4 ? " -DMV_Q8_0" : "") +
+                         iq_extra_opts;   // the IQ4 codebook in local memory on every card (0035; -DIQ4_KV_SELECT: the A770's selects before)
+-                    bool q3k = false;   // 0116: a Q3_K failure costs Q3_K alone
+-                    cl_program prog = ggml_cl_build_program_q3k(backend_ctx, iq_src.c_str(), opts,
+-                                                                "iq_matvec:kernel_mul_mv_q3_K_q8_1,kernel_get_rows_q3_K", &q3k);
++                    bool q3k = false, q2k = false;   // 0116 / 0117: a Q3_K or Q2_K failure costs that type alone
++                    cl_program prog = ggml_cl_build_program_q3k_q2k(backend_ctx, iq_src.c_str(), opts,
++                                                                    "iq_matvec:kernel_mul_mv_q3_K_q8_1,kernel_get_rows_q3_K",
++                                                                    "iq_matvec:kernel_mul_mv_q2_K_q8_1,kernel_get_rows_q2_K", &q3k, &q2k);
+                     if (prog == nullptr) {
+                         ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "iq_matvec"), GGML_LOG_WARN("ggml_opencl: IQ matvec for %d column(s) not built; IQ weights go to the CPU\n", nc);
+                         continue;
+@@ -2670,8 +2705,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                     if (backend_ctx->kq_mv_arm > 4) {
+                         CL_CHECK((backend_ctx->kernel_mul_mv_q80_q8_1[nc - 1] = clCreateKernel(prog, "kernel_mul_mv_q8_0_q8_1", &err), err));
+                     }
+-                    for (int i = 0; i < 10; ++i) {
+-                        if (3 + i == 12 && !q3k) {
++                    for (int i = 0; i < 11; ++i) {
++                        if ((3 + i == 12 && !q3k) || (3 + i == 13 && !q2k)) {
+                             continue;
+                         }
+                         CL_CHECK((backend_ctx->kernel_mul_mv_kq_q8_1[nc - 1][3 + i] = clCreateKernel(prog, iq_n[i], &err), err));
+@@ -2682,6 +2717,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                     if (nc == 1 && q3k) {
+                         CL_CHECK((backend_ctx->kernel_get_rows_q3_K = clCreateKernel(prog, "kernel_get_rows_q3_K", &err), err));
+                     }
++                    if (nc == 1 && q2k) {
++                        CL_CHECK((backend_ctx->kernel_get_rows_q2_K = clCreateKernel(prog, "kernel_get_rows_q2_K", &err), err));
++                    }
+                     if (nc == 1) {
+                         CL_CHECK((backend_ctx->kernel_mul_mv_f16_f32_nc = clCreateKernel(prog, "kernel_mul_mv_f16_f32_nc", &err), err));
+                         CL_CHECK((backend_ctx->kernel_mul_mv_f16_f32_ksplit = clCreateKernel(prog, "kernel_mul_mv_f16_f32_ksplit", &err), err));
+@@ -2723,22 +2761,23 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                 if (const char * fm = getenv("GGML_OPENCL_KQ_FEW_MIN")) {
+                     backend_ctx->kq_few_min = std::max(2, atoi(fm));
+                 }
+-                const char * fw_n[4] = { "kernel_mul_mm_few_q4_K_f16", "kernel_mul_mm_few_q5_K_f16", "kernel_mul_mm_few_q6_K_f16",
+-                                         "kernel_mul_mm_few_q3_K_f16" };   // 0116
+-                const std::string fw_q3k = ggml_cl_q3k_opts("few-column");
++                const char * fw_n[5] = { "kernel_mul_mm_few_q4_K_f16", "kernel_mul_mm_few_q5_K_f16", "kernel_mul_mm_few_q6_K_f16",
++                                         "kernel_mul_mm_few_q3_K_f16", "kernel_mul_mm_few_q2_K_f16" };   // 0116, 0117
++                const std::string fw_q3k = ggml_cl_q3k_opts("few-column") + ggml_cl_q2k_opts("few-column");
+                 for (int g = 1; g <= 2; ++g) {
+                     const std::string fw_opts = compile_opts + " -cl-intel-256-GRF-per-thread -DSG=" + std::to_string(backend_ctx->kq_few_sg) +
+                         " -DR=1 -DG=" + std::to_string(g) + " -DNK=" + std::to_string(backend_ctx->kq_few_nk) + fw_q3k;
+-                    bool q3k = false;   // 0116: a Q3_K failure costs Q3_K alone
+-                    cl_program fw_prog = ggml_cl_build_program_q3k(backend_ctx, fw_src.c_str(), fw_opts, "kq_few:kernel_mul_mm_few_q3_K_f16", &q3k);
++                    bool q3k = false, q2k = false;   // 0116 / 0117: a Q3_K or Q2_K failure costs that type alone
++                    cl_program fw_prog = ggml_cl_build_program_q3k_q2k(backend_ctx, fw_src.c_str(), fw_opts, "kq_few:kernel_mul_mm_few_q3_K_f16",
++                                                                       "kq_few:kernel_mul_mm_few_q2_K_f16", &q3k, &q2k);
+                     if (fw_prog == nullptr) {
+                         ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "kq_few"), GGML_LOG_WARN("ggml_opencl: few-column K-quant product (G=%d) not built\n", g);
+                         continue;
+                     }
+                     // 0116: the work-group fit per type, so that one kernel that misses NK x SG costs its type alone
+                     bool any_fit = false;
+-                    for (int i = 0; i < 4; ++i) {
+-                        if (i == 3 && !q3k) {
++                    for (int i = 0; i < 5; ++i) {
++                        if ((i == 3 && !q3k) || (i == 4 && !q2k)) {
+                             continue;
+                         }
+                         CL_CHECK((backend_ctx->kernel_mul_mm_few_kq[g - 1][i] = clCreateKernel(fw_prog, fw_n[i], &err), err));
+@@ -2986,10 +3025,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                 const std::string k2_opts = compile_opts + " -cl-intel-256-GRF-per-thread -DTM=" + std::to_string(tm) +
+                     " -DWG=" + std::to_string(wg) + " -DAT=" + std::to_string(at) +
+                     (getenv("GGML_OPENCL_KQ_2D_OPTS") ? std::string(" ") + getenv("GGML_OPENCL_KQ_2D_OPTS") : std::string()) +
+-                    ggml_cl_q3k_opts("2D GEMM");
+-                // 0116: the program holds Q3_K's kernel too; a Q3_K failure costs Q3_K alone
+-                bool k2_q3k = false;
+-                cl_program k2_prog = ggml_cl_build_program_q3k(backend_ctx, k2_src.c_str(), k2_opts, "kq_2d:kernel_mul_mm_kq2d_q3_K", &k2_q3k);
++                    ggml_cl_q3k_opts("2D GEMM") + ggml_cl_q2k_opts("2D GEMM");
++                // 0116 / 0117: the program holds Q3_K's and Q2_K's kernels too; a failure costs that type alone
++                bool k2_q3k = false, k2_q2k = false;
++                cl_program k2_prog = ggml_cl_build_program_q3k_q2k(backend_ctx, k2_src.c_str(), k2_opts, "kq_2d:kernel_mul_mm_kq2d_q3_K",
++                                                                   "kq_2d:kernel_mul_mm_kq2d_q2_K", &k2_q3k, &k2_q2k);
+                 if (k2_prog != nullptr) {
+                     const char * k2_n[3] = { "kernel_mul_mm_kq2d_q4_K", "kernel_mul_mm_kq2d_q5_K", "kernel_mul_mm_kq2d_q6_K" };
+                     bool fits = true;
+@@ -3020,6 +3060,21 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                             GGML_LOG_WARN("ggml_opencl: Q3_K 2D GEMM not built or does not fit a work-group; the tile GEMM takes Q3_K\n");
+                         }
+                     }
++                    // 0117: Q2_K, its fit its own (a miss costs Q2_K alone: the tile GEMM takes it)
++                    if (fits && k2_q2k) {
++                        backend_ctx->kernel_mul_mm_kq2d_q2_K = clCreateKernel(k2_prog, "kernel_mul_mm_kq2d_q2_K", &err);
++                        size_t w3 = 0;
++                        if (err == CL_SUCCESS) {
++                            CL_CHECK(clGetKernelWorkGroupInfo(backend_ctx->kernel_mul_mm_kq2d_q2_K, backend_ctx->device,
++                                                              CL_KERNEL_WORK_GROUP_SIZE, sizeof(w3), &w3, NULL));
++                        }
++                        if (err != CL_SUCCESS || w3 < (size_t)wg * 16) {
++                            if (err == CL_SUCCESS) CL_CHECK(clReleaseKernel(backend_ctx->kernel_mul_mm_kq2d_q2_K));
++                            backend_ctx->kernel_mul_mm_kq2d_q2_K = nullptr;
++                            ggml_cl_downgrade("path=fallback reason=%s what=%s", err != CL_SUCCESS ? "not-built" : "no-fit", "kq_2d:kernel_mul_mm_kq2d_q2_K");
++                            GGML_LOG_WARN("ggml_opencl: Q2_K 2D GEMM not built or does not fit a work-group; the tile GEMM takes Q2_K\n");
++                        }
++                    }
+                     // Q4_K on int8: the activations as int8 per (token, 256),
+                     // dense KL +0.0005 nats on the B60 (measured-here)
+                     static const char * i8_env = getenv("GGML_OPENCL_KQ_2D_I8");
+@@ -3067,9 +3122,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                             CL_CHECK(clReleaseKernel(backend_ctx->kernel_mul_mm_kq2d[i]));
+                             backend_ctx->kernel_mul_mm_kq2d[i] = nullptr;
+                         }
+-                        if (backend_ctx->kernel_mul_mm_kq2d_q3_K != nullptr) {   // 0116: it needs the p4 conversion
+-                            CL_CHECK(clReleaseKernel(backend_ctx->kernel_mul_mm_kq2d_q3_K));
+-                            backend_ctx->kernel_mul_mm_kq2d_q3_K = nullptr;
++                        for (cl_kernel * kq : { &backend_ctx->kernel_mul_mm_kq2d_q3_K, &backend_ctx->kernel_mul_mm_kq2d_q2_K }) {
++                            if (*kq != nullptr) {   // 0116 / 0117: they need the p4 conversion
++                                CL_CHECK(clReleaseKernel(*kq));
++                                *kq = nullptr;
++                            }
+                         }
+                         if (backend_ctx->kernel_kq_cvt_f32_f16_p4 != nullptr) {
+                             CL_CHECK(clReleaseKernel(backend_ctx->kernel_kq_cvt_f32_f16_p4));
+@@ -3200,17 +3257,17 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         }
+                     }
+                 }
+-                const char * mm_n[13] = { "kernel_mul_mm_q4_K_f16", "kernel_mul_mm_q5_K_f16", "kernel_mul_mm_q6_K_f16",
++                const char * mm_n[14] = { "kernel_mul_mm_q4_K_f16", "kernel_mul_mm_q5_K_f16", "kernel_mul_mm_q6_K_f16",
+                                           "kernel_mul_mm_iq3_xxs_f16", "kernel_mul_mm_iq4_xs_f16", "kernel_mul_mm_iq4_nl_f16",
+                                           "kernel_mul_mm_iq2_xxs_f16", "kernel_mul_mm_iq2_s_f16", "kernel_mul_mm_iq1_m_f16",
+                                           "kernel_mul_mm_q2_0_f16", "kernel_mul_mm_iq3_s_f16", "kernel_mul_mm_iq2_xs_f16",
+-                                          "kernel_mul_mm_q3_K_f16" };
++                                          "kernel_mul_mm_q3_K_f16", "kernel_mul_mm_q2_K_f16" };
+                 // Q3_K (0116): MUL_MAT only
+-                const char * id_n[13] = { "kernel_mul_mm_id_q4_K_f16", "kernel_mul_mm_id_q5_K_f16", "kernel_mul_mm_id_q6_K_f16",
++                const char * id_n[14] = { "kernel_mul_mm_id_q4_K_f16", "kernel_mul_mm_id_q5_K_f16", "kernel_mul_mm_id_q6_K_f16",
+                                           "kernel_mul_mm_id_iq3_xxs_f16", "kernel_mul_mm_id_iq4_xs_f16", "kernel_mul_mm_id_iq4_nl_f16",
+                                           "kernel_mul_mm_id_iq2_xxs_f16", "kernel_mul_mm_id_iq2_s_f16", "kernel_mul_mm_id_iq1_m_f16",
+                                           "kernel_mul_mm_id_q2_0_f16", "kernel_mul_mm_id_iq3_s_f16", "kernel_mul_mm_id_iq2_xs_f16",
+-                                          nullptr };
++                                          nullptr, nullptr };
+                 // the tokens-as-a MUL_MAT_ID kernel: pairs per tile, sub-groups per
+                 // work-group, 32 x 16 on SG 8 (measured-here, the coder's prefill on
+                 // an A770: 32 x 16, 32 x 32 and 16 x 32 within 3 %, 64 x 16 1.7x
+@@ -3229,7 +3286,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         GGML_LOG_WARN("ggml_opencl: GGML_OPENCL_KQ_MM_ID2_SHAPE=%s ignored\n", xs);
+                     }
+                 }
+-                const std::string mm_q3k = ggml_cl_q3k_opts("tile GEMM");   // 0116
++                const std::string mm_q3k = ggml_cl_q3k_opts("tile GEMM") + ggml_cl_q2k_opts("tile GEMM");   // 0116, 0117
+                 for (int pass = 0; pass < 2; ++pass) {
+                     const ggml_cl_kq_tile & t = pass == 0 ? backend_ctx->kq_mm_plain : backend_ctx->kq_mm_id;
+                     const std::string mm_opts = compile_opts + " -cl-intel-256-GRF-per-thread" + mm_q3k +
+@@ -3238,8 +3295,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         " -DTG=" + std::to_string(t.tg) + " -DNSGM=" + std::to_string(t.nsgm) + " -DNSGN=" + std::to_string(t.nsgn) +
+                         // GGML_OPENCL_IQ_OPTS reaches the low-bit GEMM's decode too (0054, measurement)
+                         (getenv("GGML_OPENCL_IQ_OPTS") ? std::string(" ") + getenv("GGML_OPENCL_IQ_OPTS") : std::string());
+-                    bool q3k = false;   // 0116: a Q3_K failure costs Q3_K alone
+-                    cl_program mm_prog = ggml_cl_build_program_q3k(backend_ctx, mm_prog_src.c_str(), mm_opts, "kq_xmx:kernel_mul_mm_q3_K_f16", &q3k);
++                    bool q3k = false, q2k = false;   // 0116 / 0117: a Q3_K or Q2_K failure costs that type alone
++                    cl_program mm_prog = ggml_cl_build_program_q3k_q2k(backend_ctx, mm_prog_src.c_str(), mm_opts, "kq_xmx:kernel_mul_mm_q3_K_f16",
++                                                                       "kq_xmx:kernel_mul_mm_q2_K_f16", &q3k, &q2k);
+                     if (mm_prog == nullptr) {
+                         ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "kq_xmx"), GGML_LOG_WARN("ggml_opencl: XMX GEMM (%s) not built; ggml's kernels take the K-quants, the IQ types go to the CPU\n", pass == 0 ? "MUL_MAT" : "MUL_MAT_ID");
+                         continue;
+@@ -3258,8 +3316,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         if (pass == 0) {
+                             CL_CHECK((backend_ctx->kernel_mul_mm_q40_f16 = clCreateKernel(mm_prog, "kernel_mul_mm_q4_0_f16", &err), err));
+                         }
+-                        for (int i = 0; i < 13; ++i) {
+-                            if ((pass == 1 && id_n[i] == nullptr) || (i == 12 && !q3k)) {
++                        for (int i = 0; i < 14; ++i) {
++                            if ((pass == 1 && id_n[i] == nullptr) || (i == 12 && !q3k) || (i == 13 && !q2k)) {
+                                 continue;
+                             }
+                             cl_kernel & k = pass == 0 ? backend_ctx->kernel_mul_mm_kq_f16[i] : backend_ctx->kernel_mul_mm_id_kq_f16[i];
+@@ -12267,16 +12325,18 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                     // before any allocation (test-backend-ops) answers no
+                     load_cl_kernels(backend_ctx);
+                     return backend_ctx->kernel_get_rows_q8_0 != nullptr;
+-                case GGML_TYPE_Q3_K: {
+-                    // 0116: a Q3_K tensor in planes (an even block count a slice), not a view of one
++                case GGML_TYPE_Q3_K:
++                case GGML_TYPE_Q2_K: {
++                    // 0116 / 0117: a Q3_K or Q2_K tensor in planes (an even block count a slice), not a view of one
+                     load_cl_kernels(backend_ctx);
+-                    const bool built = backend_ctx->kernel_get_rows_q3_K != nullptr;
++                    const bool built = (op->src[0]->type == GGML_TYPE_Q3_K ? backend_ctx->kernel_get_rows_q3_K
++                                                                           : backend_ctx->kernel_get_rows_q2_K) != nullptr;
+                     const bool ok = built && ggml_cl_lb_planar(op->src[0]) && op->src[0]->view_src == nullptr &&
+                                     op->src[0]->view_offs == 0 && ggml_is_contiguous(op->src[0]) &&
+                                     op->src[1]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32;
+                     if (!ok) {
+-                        ggml_cl_downgrade("op=GET_ROWS type=q3_K k=%d path=cpu reason=%s", (int) op->src[0]->ne[0],
+-                                          built ? "shape" : "kernels-missing");
++                        ggml_cl_downgrade("op=GET_ROWS type=%s k=%d path=cpu reason=%s", ggml_type_name(op->src[0]->type),
++                                          (int) op->src[0]->ne[0], built ? "shape" : "kernels-missing");
+                     }
+                     return ok;
+                 }
+@@ -12564,7 +12624,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                 if (ggml_cl_lb_fields(op->src[0]->type, lbf) > 0) {
+                     static const char * vr_env = getenv("GGML_OPENCL_LB_VIEW_RED");
+                     static const bool   vr_red = vr_env != nullptr && atoi(vr_env) != 0;
+-                    const bool odd = op->src[0]->type == GGML_TYPE_Q3_K &&
++                    const bool odd = (op->src[0]->type == GGML_TYPE_Q3_K || op->src[0]->type == GGML_TYPE_Q2_K) &&
+                                      (op->src[0]->ne[0] * op->src[0]->ne[1] / ggml_blck_size(op->src[0]->type)) % 2 != 0;
+                     // a whole slice at a slice-aligned offset (one 2-D slice of a 3-D base) is addressed right
+                     const bool view = !vr_red && op->src[0]->view_src != nullptr && !ggml_cl_lb_whole_slice(op->src[0]);
+@@ -18122,8 +18182,8 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
+     }
+ 
+     // 0116: Q3_K in planes (supports_op: no view, an even block count a slice)
+-    if (src0->type == GGML_TYPE_Q3_K) {
+-        cl_kernel k = backend_ctx->kernel_get_rows_q3_K;
++    if (src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_Q2_K) {   // 0117: Q2_K the same way
++        cl_kernel k = src0->type == GGML_TYPE_Q3_K ? backend_ctx->kernel_get_rows_q3_K : backend_ctx->kernel_get_rows_q2_K;
+         cl_uint a = 0;
+         ggml_cl_kq_weight_args(k, src0, a);
+         CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &extra1->data_device));
+@@ -29847,7 +29907,7 @@ static bool ggml_cl_bank_stream(ggml_backend_opencl_context * ctx, const ggml_te
+ static bool ggml_cl_kq_as_stored(ggml_type t) {
+     return t == GGML_TYPE_IQ3_XXS || t == GGML_TYPE_IQ4_XS || t == GGML_TYPE_IQ2_XXS || t == GGML_TYPE_IQ2_S ||
+            t == GGML_TYPE_IQ1_M || t == GGML_TYPE_Q2_0 || t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ2_XS ||
+-           t == GGML_TYPE_Q3_K;
++           t == GGML_TYPE_Q3_K || t == GGML_TYPE_Q2_K;
+ }
+ 
+ static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, cl_uint & a) {
+@@ -29930,6 +29990,7 @@ static int ggml_cl_kq_type_index(ggml_type t) {
+         case GGML_TYPE_IQ3_S:   return 10;
+         case GGML_TYPE_IQ2_XS:  return 11;
+         case GGML_TYPE_Q3_K:    return 12;   // 0116: in planes like the low-bit types; MUL_MAT only
++        case GGML_TYPE_Q2_K:    return 13;   // 0117: likewise
+         default:                return -1;
+     }
+ }
+@@ -30014,9 +30075,10 @@ static bool ggml_cl_mul_mm_kq_few(ggml_backend_opencl_context * backend_ctx, con
+     const int ncols = (int)(src1->ne[1] * src1->ne[2] * src1->ne[3]);
+     // 0116: Q3_K is the kernel's fourth type; under 0115's arm (GGML_OPENCL_KQ_MV_NCOLS = 5..8) its q8_1
+     // matvec takes 2 to that many columns instead (Strata's NCOLS MMVQ, for the card A/B)
+-    const int fi = ti >= 0 && ti <= 2 ? ti : ti == 12 ? 3 : -1;
++    // 0117: Q2_K the fifth
++    const int fi = ti >= 0 && ti <= 2 ? ti : ti == 12 ? 3 : ti == 13 ? 4 : -1;
+     if (fi < 0 || ncols < backend_ctx->kq_few_min || ncols > 16 || !ggml_cl_kq_mul_mat_shape(src0, src1, dst) ||
+-        (ti == 12 && backend_ctx->kq_mv_arm > 4 && ncols <= backend_ctx->kq_mv_arm)) {
++        ((ti == 12 || ti == 13) && backend_ctx->kq_mv_arm > 4 && ncols <= backend_ctx->kq_mv_arm)) {
+         return false;
+     }
+     const int g = ncols > 8 ? 2 : 1, tok = 8 * g;
+@@ -30527,17 +30589,20 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
+     // 0116: Xe2: Q3_K's planes on the 2D-block GEMM. Its hmask and qs planes are the block reads'
+     // surfaces: their starts 64-byte aligned (the slice's block count a multiple of 32 does it), and no
+     // USM bank or staged copy (a dense weight in device memory); otherwise the tile takes it, keyed
+-    if (ti == 12 && backend_ctx->kernel_mul_mm_kq2d_q3_K != nullptr && g_kq_stage_q == nullptr) {
++    // 0117: Q2_K likewise, its qs plane the one surface (at 20 nblk)
++    cl_kernel k2_new = ti == 12 ? backend_ctx->kernel_mul_mm_kq2d_q3_K : ti == 13 ? backend_ctx->kernel_mul_mm_kq2d_q2_K : nullptr;
++    if (k2_new != nullptr && g_kq_stage_q == nullptr) {
+         const int ne00 = (int)src0->ne[0], ne01 = (int)src0->ne[1], nbk = ne00 / 256;
+         const ggml_tensor * soa0 = src0->view_src != nullptr ? src0->view_src : src0;
+         const bool usm = ((ggml_backend_opencl_buffer_context *) soa0->buffer->context)->usm != nullptr;
+         ggml_tensor_extra_cl * e0 = (ggml_tensor_extra_cl *)src0->extra;
+         const cl_ulong offq = e0->offset + src0->view_offs;
+         const cl_ulong nblk = (cl_ulong)ne01 * nbk;
+-        if (!usm && nbk >= 2 && (offq + nblk * 2) % 64 == 0 && (offq + nblk * 34) % 64 == 0 &&
+-            ncols < (1 << 24) && ne01 < (1 << 24) && ne00 < (1 << 23)) {
++        const bool aligned = ti == 12 ? (offq + nblk * 2) % 64 == 0 && (offq + nblk * 34) % 64 == 0
++                                      : (offq + nblk * 20) % 64 == 0;
++        if (!usm && nbk >= 2 && aligned && ncols < (1 << 24) && ne01 < (1 << 24) && ne00 < (1 << 23)) {
+             ggml_cl_downgrade_few_gemm(backend_ctx, src0, ncols);   // 0115
+-            cl_kernel k2 = backend_ctx->kernel_mul_mm_kq2d_q3_K;
++            cl_kernel k2 = k2_new;
+             ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+             const cl_ulong offsetd = extrad->offset + dst->view_offs;
+             const cl_ulong nb1 = dst->nb[1];
+@@ -30558,7 +30623,7 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
+             backend_ctx->enqueue_ndrange_kernel(k2, 3, global_work_size, local_work_size, dst);
+             return true;
+         }
+-        ggml_cl_downgrade("op=MUL_MAT type=q3_K k=%d cols=%s path=tile reason=2d-shape", ne00, ncols >= 16 ? "16+" : "5-15");
++        ggml_cl_downgrade("op=MUL_MAT type=%s k=%d cols=%s path=tile reason=2d-shape", ggml_type_name(src0->type), ne00, ncols >= 16 ? "16+" : "5-15");
+     }
+     cl_kernel kernel = backend_ctx->kernel_mul_mm_kq_f16[ti];
+     if (kernel == nullptr) {
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
+index 8dea74bc9..7f138d6cc 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
+@@ -412,6 +412,77 @@ kernel void kernel_mul_mm_kq2d_q3_K(global const uchar * q, ulong offq, global c
+ }
+ #endif // GGML_OPENCL_NO_Q3K
+ 
++#ifndef GGML_OPENCL_NO_Q2K   // 0117: built without it when the program fails with it (ggml_cl_build_program_q3k)
++#ifdef Q2K_BREAK_BUILD   // the red case of the build fallback (GGML_OPENCL_Q2K_OPTS): the Q2_K text does not compile
++#error "Q2K_BREAK_BUILD"
++#endif
++// ARC-LAB 0117: Q2_K (kq type index 13). A slice in planes (ggml-opencl-planes.h): dm[nblk] (d and dmin, a
++// half pair) | scales[16 nblk] | qs[64 nblk]. Weight 128 n + 32 j + t of a block (n 0..1, j 0..3, t 0..31)
++// is bits 2j of qs[32 n + t], a code q in 0..3, at scale byte is = 8 n + 2 j + t / 16: d (byte & 15) q -
++// dmin (byte >> 4), ggml's dequantize_row_q2_K. -DQ2K_RED swaps the byte's two nibbles (the red case).
++#define Q2K_SC(nblk) ((ulong)(nblk) * 4)
++#define Q2K_QS(nblk) ((ulong)(nblk) * 20)
++
++static inline uint q2k_byte(uint4 w, int k) {
++    const uint v = k < 4 ? w.s0 : (k < 8 ? w.s1 : (k < 12 ? w.s2 : w.s3));
++    return (v >> (8 * (k & 3))) & 0xFFu;
++}
++
++// the scale and the min of scale byte b
++static inline void q2k_sm(uint b, float * sc, float * m) {
++#ifdef Q2K_RED
++    *sc = (float)(b >> 4); *m = (float)(b & 0xFu);
++#else
++    *sc = (float)(b & 0xFu); *m = (float)(b >> 4);
++#endif
++}
++
++// Q2_K on its planes: qs is a surface of ne01 rows of nb x 64 bytes (the host checks its 64-byte
++// alignment), dm and the 16 scale bytes are read per lane. Sub-block sb = 4 n + j (32 weights at 32 sb):
++// bits 2j of qs bytes 32 n .. + 31 as halves 1024 + q, Q4_K's (p - 1024) dl + nml with dl = d sc, nml =
++// -dmin m, per 16 weights
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_mul_mm_kq2d_q2_K(global const uchar * q, ulong offq, global const half * dp_unused, ARGS) {
++    PROLOGUE
++    global const uchar * S  = q + offq;
++    const ulong nblk = (ulong)ne01 * nb;
++    global const half  * dmp = (global const half *)S;
++    global const uchar * sc  = S + Q2K_SC(nblk);
++    global const uchar * qs  = S + Q2K_QS(nblk);
++    for (int kb = 0; kb < nb; ++kb) {
++        KB_SYNC(kb)
++        const ulong b = (ulong)n * nb + kb;
++        const float2 dm = vload_half2(b, dmp);
++        const uint4  sw = vload4(0, (global const uint *)(sc + b * 16));
++        _Pragma("unroll")
++        for (int nn = 0; nn < 2; ++nn) {
++            uint qw[8];
++            WREAD(qs, 64, qw, kb, 8 * nn);
++            _Pragma("unroll")
++            for (int j = 0; j < 4; ++j) {
++                const int sb = 4 * nn + j, is = 8 * nn + 2 * j;
++                float sc0, m0, sc1, m1;
++                q2k_sm(q2k_byte(sw, is), &sc0, &m0);
++                q2k_sm(q2k_byte(sw, is + 1), &sc1, &m1);
++                const uint dl02 = (uint)as_ushort((half)(dm.s0 * sc0)) * 0x10001u, nml02 = (uint)as_ushort((half)(-dm.s1 * m0)) * 0x10001u;
++                const uint dl12 = (uint)as_ushort((half)(dm.s0 * sc1)) * 0x10001u, nml12 = (uint)as_ushort((half)(-dm.s1 * m1)) * 0x10001u;
++                uint pw[16];
++                _Pragma("unroll")
++                for (int i = 0; i < 8; ++i) {
++                    const uint w = qw[i] >> (2 * j);
++                    const uint dl2 = i < 4 ? dl02 : dl12, nml2 = i < 4 ? nml02 : nml12;
++                    pw[2 * i]     = hscale((w & 0x00030003u) | MAGIC, dl2, nml2);
++                    pw[2 * i + 1] = hscale(((w >> 8) & 0x00030003u) | MAGIC, dl2, nml2);
++                }
++                const int8 b0 = as_int8(vload8(0, pw)), b1 = as_int8(vload8(0, pw + 8));
++                MUL32(kb * QK_K + 32 * sb)
++            }
++        }
++    }
++    EPILOGUE
++}
++#endif // GGML_OPENCL_NO_Q2K
++
+ // (p - 1032) * d on the 32 halves of p: Q4_0's 1024 + code to d (code - 8),
+ // with the rounding of a dequantization to f16. Q40_RED: code - 4 (the red
+ // case of the suite).
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
+index c0fe138a0..52978abf5 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
+@@ -1652,7 +1652,7 @@ constant uint iq3s_grid[512] = {
+ // its scales carry the 1/8. After ggml-quants.c's dequantize_row_*. ----
+ 
+ // bytes per block, 32-weight sub-blocks per block
+-#define LB_BYTES(T) ((T) == 6 ? 66 : (T) == 7 ? 82 : (T) == 8 ? 56 : (T) == 9 ? 18 : (T) == 11 ? 74 : (T) == 12 ? 110 /* Q3_K, 0116 */ : 110)
++#define LB_BYTES(T) ((T) == 6 ? 66 : (T) == 7 ? 82 : (T) == 8 ? 56 : (T) == 9 ? 18 : (T) == 11 ? 74 : (T) == 12 ? 110 /* Q3_K, 0116 */ : (T) == 13 ? 84 /* Q2_K, 0117 */ : 110)
+ #define LB_SUBS(T)  ((T) == 9 ? 2 : 8)
+ #define LB_ROW_BYTES(T, n32) ((ulong)((n32) / LB_SUBS(T)) * LB_BYTES(T))
+ 
+@@ -1874,11 +1874,63 @@ static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk,
+ #define LB_BI(T, r, nbr, j32) ((ulong)(r) * (nbr) + (ulong)((j32) / LB_SUBS(T)))
+ #define LB_P(T, j32)          ((j32) % LB_SUBS(T))
+ 
++#ifndef GGML_OPENCL_NO_Q2K   // 0117: built without it when the program fails with it (ggml_cl_build_program_q3k)
++#ifdef Q2K_BREAK_BUILD   // the red case of the build fallback (GGML_OPENCL_Q2K_OPTS): the Q2_K text does not compile
++#error "Q2K_BREAK_BUILD"
++#endif
++// ARC-LAB 0117: Q2_K (kq type index 13). A slice in planes (ggml-opencl-planes.h): dm[nblk] (d and dmin, a
++// half pair) | scales[16 nblk] | qs[64 nblk]. Weight 128 n + 32 j + t of a block (n 0..1, j 0..3, t 0..31)
++// is bits 2j of qs[32 n + t], a code q in 0..3, at scale byte is = 8 n + 2 j + t / 16: d (byte & 15) q -
++// dmin (byte >> 4), ggml's dequantize_row_q2_K. -DQ2K_RED swaps the byte's two nibbles (the red case).
++#define Q2K_SC(nblk) ((ulong)(nblk) * 4)
++#define Q2K_QS(nblk) ((ulong)(nblk) * 20)
++
++static inline uint q2k_byte(uint4 w, int k) {
++    const uint v = k < 4 ? w.s0 : (k < 8 ? w.s1 : (k < 12 ? w.s2 : w.s3));
++    return (v >> (8 * (k & 3))) & 0xFFu;
++}
++
++// the scale and the min of scale byte b
++static inline void q2k_sm(uint b, float * sc, float * m) {
++#ifdef Q2K_RED
++    *sc = (float)(b >> 4); *m = (float)(b & 0xFu);
++#else
++    *sc = (float)(b & 0xFu); *m = (float)(b >> 4);
++#endif
++}
++
++// the 32 weights of sub-block p = 4 n + j of block bi, d (sc) q - dmin (m) in f32 (ggml's order)
++static inline void q2k_v32(global const uchar * S, ulong nblk, ulong bi, int p, float * v) {
++    const int n = p >> 2, j = p & 3;
++    const uint8  qw = vload8(0, (global const uint *)(S + Q2K_QS(nblk) + bi * 64 + 32 * n));
++    const uint4  sw = vload4(0, (global const uint *)(S + Q2K_SC(nblk) + bi * 16));
++    const float2 dm = vload_half2(bi, (global const half *)S);
++    float sc0, m0, sc1, m1;
++    q2k_sm(q2k_byte(sw, 8 * n + 2 * j), &sc0, &m0);
++    q2k_sm(q2k_byte(sw, 8 * n + 2 * j + 1), &sc1, &m1);
++    const float dl0 = dm.s0 * sc0, ml0 = dm.s1 * m0, dl1 = dm.s0 * sc1, ml1 = dm.s1 * m1;
++    const uint qv[8] = { qw.s0, qw.s1, qw.s2, qw.s3, qw.s4, qw.s5, qw.s6, qw.s7 };
++    #pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        const uchar4 c = as_uchar4((qv[i] >> (2 * j)) & 0x03030303u);
++        const float dl = i < 4 ? dl0 : dl1, ml = i < 4 ? ml0 : ml1;
++        v[4 * i] = dl * (float)c.s0 - ml; v[4 * i + 1] = dl * (float)c.s1 - ml;
++        v[4 * i + 2] = dl * (float)c.s2 - ml; v[4 * i + 3] = dl * (float)c.s3 - ml;
++    }
++}
++#endif // GGML_OPENCL_NO_Q2K
++
+ // the 32 weights of sub-block j32 of global row g (expert g / ne01's slice) as floats
+ static inline void lb_v32(const int TYPE, global const uchar * q, ulong g, int ne01, int n32, int j32, float * v) {
+     const int   nbr  = n32 / LB_SUBS(TYPE);
+     const ulong nblk = (ulong)ne01 * nbr;
+     global const uchar * S = q + (g / ne01) * nblk * LB_BYTES(TYPE);
++#ifndef GGML_OPENCL_NO_Q2K
++    if (TYPE == 13) {   // 0117: Q2_K's min term is not lb_expand's form
++        q2k_v32(S, nblk, LB_BI(TYPE, g % ne01, nbr, j32), LB_P(TYPE, j32), v);
++        return;
++    }
++#endif
+     uint w[8];
+     float s0, s1;
+     lb_expand(TYPE, S, nblk, LB_BI(TYPE, g % ne01, nbr, j32), LB_P(TYPE, j32), w, &s0, &s1);
+@@ -2355,6 +2407,14 @@ kernel void kernel_mul_mm_id_iq3_s_f16(global const uchar * q, ulong offq, globa
+     MM_BODY(deq_lb(10, wt, q + offq, wrow0, row0, ne01, ne00 / 32, ib))
+ }
+ 
++#ifndef GGML_OPENCL_NO_Q2K
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_mul_mm_q2_K_f16(global const uchar * q, ulong offq, global const half * dp, PLAIN_ARGS) {
++    PLAIN_COLS
++    MM_BODY(deq_lb(13, wt, q + offq, wrow0, row0, ne01, ne00 / 32, ib))
++}
++#endif
++
+ #ifndef GGML_OPENCL_NO_Q3K
+ __attribute__((intel_reqd_sub_group_size(SG)))
+ kernel void kernel_mul_mm_q3_K_f16(global const uchar * q, ulong offq, global const half * dp, PLAIN_ARGS) {
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_few.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_few.cl
+index 171ef3ed1..a8c92ae36 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_few.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_few.cl
+@@ -435,3 +435,104 @@ kernel void kernel_mul_mm_few_q3_K_f16(global const uchar * q, ulong offq, globa
+     FEW_EPILOGUE
+ }
+ #endif // GGML_OPENCL_NO_Q3K
++
++#ifndef GGML_OPENCL_NO_Q2K   // 0117: built without it when the program fails with it (ggml_cl_build_program_q3k)
++#ifdef Q2K_BREAK_BUILD   // the red case of the build fallback (GGML_OPENCL_Q2K_OPTS): the Q2_K text does not compile
++#error "Q2K_BREAK_BUILD"
++#endif
++// ARC-LAB 0117: Q2_K (kq type index 13). A slice in planes (ggml-opencl-planes.h): dm[nblk] (d and dmin, a
++// half pair) | scales[16 nblk] | qs[64 nblk]. Weight 128 n + 32 j + t of a block (n 0..1, j 0..3, t 0..31)
++// is bits 2j of qs[32 n + t], a code q in 0..3, at scale byte is = 8 n + 2 j + t / 16: d (byte & 15) q -
++// dmin (byte >> 4), ggml's dequantize_row_q2_K. -DQ2K_RED swaps the byte's two nibbles (the red case).
++#define Q2K_SC(nblk) ((ulong)(nblk) * 4)
++#define Q2K_QS(nblk) ((ulong)(nblk) * 20)
++
++static inline uint q2k_byte(uint4 w, int k) {
++    const uint v = k < 4 ? w.s0 : (k < 8 ? w.s1 : (k < 12 ? w.s2 : w.s3));
++    return (v >> (8 * (k & 3))) & 0xFFu;
++}
++
++// the scale and the min of scale byte b
++static inline void q2k_sm(uint b, float * sc, float * m) {
++#ifdef Q2K_RED
++    *sc = (float)(b >> 4); *m = (float)(b & 0xFu);
++#else
++    *sc = (float)(b & 0xFu); *m = (float)(b >> 4);
++#endif
++}
++
++// 16 Q2_K codes as halves 1024 + q (bits 2j of each byte): byte pairs (0, 2) and (1, 3) of each word, as
++// b16_q45_codes; the chain starts at -1024 S and ends at sum q x, the min term from S
++static inline int8 b16_q2_codes(uint4 w, int j) {
++    const uint wv[4] = { w.s0, w.s1, w.s2, w.s3 };
++    uint r[8];
++    #pragma unroll
++    for (int u = 0; u < 4; ++u) {
++        r[2 * u]     = ((wv[u] >> (2 * j)) & 0x00030003u) | 0x64006400u;
++        r[2 * u + 1] = ((wv[u] >> (8 + 2 * j)) & 0x00030003u) | 0x64006400u;
++    }
++    return as_int8((uint8)(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]));
++}
++
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_mul_mm_few_q2_K_f16(global const uchar * q, ulong offq, global const half * dp_unused,
++                                       global const half * xa, global const float * xs, global const float * xsc,
++                                       global char * dst, ulong offd, ulong nb1, int ne00, int ne01, int ncols) {
++    FEW_PROLOGUE
++    global const uchar * S  = q + offq;
++    const ulong nblk = (ulong)ne01 * nb;
++    global const half  * dmp = (global const half *)S;
++    global const uchar * sc  = S + Q2K_SC(nblk);
++    global const uchar * qs  = S + Q2K_QS(nblk);
++    for (int ib = sgk; ib < nb; ib += NK) {
++        float D[R], M[R];
++        uint4 sw[R];
++        uint16 wq[R];
++        _Pragma("unroll")
++        for (int rr = 0; rr < R; ++rr) {
++            const ulong b = rb[rr] + ib;
++            const float2 dm = vload_half2(b, dmp);
++            D[rr]  = dm.s0;
++            M[rr]  = dm.s1;
++            sw[rr] = vload4(0, (global const uint *)(sc + b * 16));
++            wq[rr] = vload16(0, (global const uint *)(qs + b * 64));
++        }
++        #pragma unroll
++        for (int n = 0; n < 2; ++n) {
++            #pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                const int s0 = 8 * n + 2 * j, s1 = s0 + 1;
++                a8_t a0[G], a1[G];
++                float8 S0[G], S1[G], c[G];
++                _Pragma("unroll")
++                for (int g = 0; g < G; ++g) {
++                    a0[g] = LOAD_AG(xa + (((ulong)g * k16 + ib * 16 + s0) * 8) * 16);
++                    a1[g] = LOAD_AG(xa + (((ulong)g * k16 + ib * 16 + s1) * 8) * 16);
++                    S0[g] = vload8(0, xs + (ulong)(ib * 16 + s0) * TOK + 8 * g);
++                    S1[g] = vload8(0, xs + (ulong)(ib * 16 + s1) * TOK + 8 * g);
++                    c[g]  = vload8(0, xsc + (ulong)(ib * 8 + 4 * n + j) * TOK + 8 * g);
++                }
++                _Pragma("unroll")
++                for (int rr = 0; rr < R; ++rr) {
++                    const uint4 w0 = n == 0 ? wq[rr].s0123 : wq[rr].s89ab;
++                    const uint4 w1 = n == 0 ? wq[rr].s4567 : wq[rr].scdef;
++                    const int8 b0 = b16_q2_codes(w0, j);
++                    const int8 b1 = b16_q2_codes(w1, j);
++                    float sc0, m0, sc1, m1;
++                    q2k_sm(q2k_byte(sw[rr], s0), &sc0, &m0);
++                    q2k_sm(q2k_byte(sw[rr], s1), &sc1, &m1);
++                    const float ka0 = D[rr] * sc0, kb0 = M[rr] * m0, ka1 = D[rr] * sc1, kb1 = M[rr] * m1;
++                    _Pragma("unroll")
++                    for (int g = 0; g < G; ++g) {
++                        const float8 t0 = DPAS(a0[g], b0, -1024.f * S0[g]);
++                        const float8 t1 = DPAS(a1[g], b1, -1024.f * S1[g]);
++                        acc[rr][g] = fma(fma(t0, (float8)(ka0), S0[g] * -kb0), c[g], acc[rr][g]);
++                        acc[rr][g] = fma(fma(t1, (float8)(ka1), S1[g] * -kb1), c[g], acc[rr][g]);
++                    }
++                }
++            }
++        }
++    }
++    FEW_EPILOGUE
++}
++#endif // GGML_OPENCL_NO_Q2K
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
+index 5cb78ec1f..8c00b86fe 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
+@@ -1199,7 +1199,7 @@ constant uint iq3s_grid[512] = {
+ // its scales carry the 1/8. After ggml-quants.c's dequantize_row_*. ----
+ 
+ // bytes per block, 32-weight sub-blocks per block
+-#define LB_BYTES(T) ((T) == 6 ? 66 : (T) == 7 ? 82 : (T) == 8 ? 56 : (T) == 9 ? 18 : (T) == 11 ? 74 : (T) == 12 ? 110 /* Q3_K, 0116 */ : 110)
++#define LB_BYTES(T) ((T) == 6 ? 66 : (T) == 7 ? 82 : (T) == 8 ? 56 : (T) == 9 ? 18 : (T) == 11 ? 74 : (T) == 12 ? 110 /* Q3_K, 0116 */ : (T) == 13 ? 84 /* Q2_K, 0117 */ : 110)
+ #define LB_SUBS(T)  ((T) == 9 ? 2 : 8)
+ #define LB_ROW_BYTES(T, n32) ((ulong)((n32) / LB_SUBS(T)) * LB_BYTES(T))
+ 
+@@ -2045,6 +2045,152 @@ kernel void kernel_get_rows_q3_K(global const uchar * q, ulong offq, global cons
+ }
+ #endif // GGML_OPENCL_NO_Q3K
+ 
++#ifndef GGML_OPENCL_NO_Q2K   // 0117: built without it when the program fails with it (ggml_cl_build_program_q3k)
++#ifdef Q2K_BREAK_BUILD   // the red case of the build fallback (GGML_OPENCL_Q2K_OPTS): the Q2_K text does not compile
++#error "Q2K_BREAK_BUILD"
++#endif
++// ARC-LAB 0117: Q2_K (kq type index 13). A slice in planes (ggml-opencl-planes.h): dm[nblk] (d and dmin, a
++// half pair) | scales[16 nblk] | qs[64 nblk]. Weight 128 n + 32 j + t of a block (n 0..1, j 0..3, t 0..31)
++// is bits 2j of qs[32 n + t], a code q in 0..3, at scale byte is = 8 n + 2 j + t / 16: d (byte & 15) q -
++// dmin (byte >> 4), ggml's dequantize_row_q2_K. -DQ2K_RED swaps the byte's two nibbles (the red case).
++#define Q2K_SC(nblk) ((ulong)(nblk) * 4)
++#define Q2K_QS(nblk) ((ulong)(nblk) * 20)
++
++static inline uint q2k_byte(uint4 w, int k) {
++    const uint v = k < 4 ? w.s0 : (k < 8 ? w.s1 : (k < 12 ? w.s2 : w.s3));
++    return (v >> (8 * (k & 3))) & 0xFFu;
++}
++
++// the scale and the min of scale byte b
++static inline void q2k_sm(uint b, float * sc, float * m) {
++#ifdef Q2K_RED
++    *sc = (float)(b >> 4); *m = (float)(b & 0xFu);
++#else
++    *sc = (float)(b & 0xFu); *m = (float)(b >> 4);
++#endif
++}
++
++static inline int q2k_dot2us(uint2 w, uint2 x) {
++    int a = 0;
++    a = dot_acc_sat_4x8packed_us_int(w.s0, x.s0, a);
++    a = dot_acc_sat_4x8packed_us_int(w.s1, x.s1, a);
++    return a;
++}
++
++// the sum of eight int8 codes
++static inline int q2k_sum2(uint2 x) {
++    int a = 0;
++    a = dot_acc_sat_4x8packed_us_int(0x01010101u, x.s0, a);
++    a = dot_acc_sat_4x8packed_us_int(0x01010101u, x.s1, a);
++    return a;
++}
++
++// Q3_K's lane map (mv_q3_K): lane l takes half n of a block and positions t0 .. t0 + 7 of its four 32-blocks
++// j, 8 qs bytes for 32 weights at the four scale bytes 8n + t0/16 + 2j. The codes are unsigned (0..3), so the
++// dot is unsigned x signed; the min term multiplies the sum of the lane's eight activation codes (both
++// terms), as ggml's vec_dot_q2_K_q8_K does with the q8_K block sums
++static inline void mv_q2_K(global const uchar * S, int nb, int first_row, int ne01,
++                           global const char * xq, global const float * xd, ulong res,
++                           global float * out, ulong ostride) {
++    const int lane = get_sub_group_local_id();
++    const int p = lane & 7, n = p >> 2, t0 = (p & 3) * 8, is0 = 8 * n + (t0 >> 4);
++    const ulong nblk = (ulong)ne01 * nb;
++    global const half  * dmp = (global const half *)S;
++    global const uchar * sc  = S + Q2K_SC(nblk);
++    global const uchar * qs  = S + Q2K_QS(nblk);
++    global const char  * xq2 = xq + res;
++    global const float * xd2 = xd + res / 32;
++    const int ne00 = nb * QK_K, n32 = nb * 8;
++
++    float acc[N_DST][NCOLS];
++    #pragma unroll
++    for (int r = 0; r < N_DST; ++r)
++        #pragma unroll
++        for (int c = 0; c < NCOLS; ++c) acc[r][c] = 0.f;
++
++    for (int ib = lane >> 3; ib < nb; ib += 2) {
++        const int b32 = ib * 8 + 4 * n;
++        uint2 x[4][NCOLS], y[4][NCOLS];
++        float dx[4][NCOLS], dy[4][NCOLS], sx[4][NCOLS], sy[4][NCOLS];
++        #pragma unroll
++        for (int c = 0; c < NCOLS; ++c) {
++            #pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                x[j][c]  = vload2(0, (global const uint *)(xq + c * ne00 + (b32 + j) * 32 + t0));
++                y[j][c]  = vload2(0, (global const uint *)(xq2 + c * ne00 + (b32 + j) * 32 + t0));
++                dx[j][c] = xd[c * n32 + b32 + j];
++                dy[j][c] = xd2[c * n32 + b32 + j];
++                sx[j][c] = (float)q2k_sum2(x[j][c]);
++                sy[j][c] = (float)q2k_sum2(y[j][c]);
++            }
++        }
++        #pragma unroll
++        for (int r = 0; r < N_DST; ++r) {
++            if (first_row + r >= ne01) break;
++            const ulong b = (ulong)(first_row + r) * nb + ib;
++            const uint2  q  = vload2(0, (global const uint *)(qs + b * 64 + 32 * n + t0));
++            const uint4  sw = vload4(0, (global const uint *)(sc + b * 16));
++            const float2 dm = vload_half2(b, dmp);
++            #pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                const uint2 w = (q >> (uint2)(2 * j)) & (uint2)(0x03030303u);
++                float scf, mf;
++                q2k_sm(q2k_byte(sw, is0 + 2 * j), &scf, &mf);
++                const float ds = dm.s0 * scf, dn = dm.s1 * mf;
++                #pragma unroll
++                for (int c = 0; c < NCOLS; ++c) {
++                    acc[r][c] += dx[j][c] * (ds * (float)q2k_dot2us(w, x[j][c]) - dn * sx[j][c]) +
++                                 dy[j][c] * (ds * (float)q2k_dot2us(w, y[j][c]) - dn * sy[j][c]);
++                }
++            }
++        }
++    }
++    reduce_store(acc, out, ostride, first_row, ne01);
++}
++
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_mul_mv_q2_K_q8_1(global const uchar * q, ulong offq, global const half * dp,
++                                    global const char * xq, global const float * xd,
++                                    global char * dst, ulong offd, ulong nb1, int ne00, int ne01) {
++    const int first_row = FIRST_ROW;
++    if (first_row >= ne01) return;
++    mv_q2_K(q + offq, ne00 / QK_K, first_row, ne01, xq, xd, (ulong)ne00 * NCOLS,
++            (global float *)(dst + offd), nb1 / sizeof(float));
++}
++
++// GET_ROWS of a Q2_K tensor in planes, as kernel_get_rows_q3_K: d (sc) q - dmin (m) in f32, ggml's order
++kernel void kernel_get_rows_q2_K(global const uchar * q, ulong offq, global const half * dp_unused,
++                                 global const char * src1, ulong off1, global char * dst, ulong offd,
++                                 int ne00, int ne01, ulong nb02, ulong nb03, ulong nb10, ulong nb11, ulong nb12,
++                                 ulong nb1, ulong nb2, ulong nb3) {
++    const int i10 = get_group_id(0), i11 = get_group_id(1), i12 = get_group_id(2);
++    const int row = *(global const int *)(src1 + off1 + i10 * nb10 + i11 * nb11 + i12 * nb12);
++    global const uchar * S = q + offq + i11 * nb02 + i12 * nb03;
++    const int nb = ne00 / QK_K;
++    const ulong nblk = (ulong)ne01 * nb;
++    global float * out = (global float *)(dst + offd + i10 * nb1 + i11 * nb2 + i12 * nb3);
++    for (int u = get_local_id(0); u < ne00 / 32; u += get_local_size(0)) {
++        const ulong b = (ulong)row * nb + u / 8;
++        const int p = u % 8, n = p >> 2, j = p & 3;
++        const uint8  qw = vload8(0, (global const uint *)(S + Q2K_QS(nblk) + b * 64 + 32 * n));
++        const uint4  sw = vload4(0, (global const uint *)(S + Q2K_SC(nblk) + b * 16));
++        const float2 dm = vload_half2(b, (global const half *)S);
++        float sc0, m0, sc1, m1;
++        q2k_sm(q2k_byte(sw, 8 * n + 2 * j), &sc0, &m0);
++        q2k_sm(q2k_byte(sw, 8 * n + 2 * j + 1), &sc1, &m1);
++        const float dl0 = dm.s0 * sc0, ml0 = dm.s1 * m0, dl1 = dm.s0 * sc1, ml1 = dm.s1 * m1;
++        const uint qv[8] = { qw.s0, qw.s1, qw.s2, qw.s3, qw.s4, qw.s5, qw.s6, qw.s7 };
++        #pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            const uchar4 c = as_uchar4((qv[i] >> (2 * j)) & 0x03030303u);
++            const float dl = i < 4 ? dl0 : dl1, ml = i < 4 ? ml0 : ml1;
++            vstore4((float4)(dl * (float)c.s0 - ml, dl * (float)c.s1 - ml, dl * (float)c.s2 - ml, dl * (float)c.s3 - ml),
++                    0, out + 32 * u + 4 * i);
++        }
++    }
++}
++#endif // GGML_OPENCL_NO_Q2K
++
+ // ---- MUL_MAT_ID (NCOLS = 1 builds): pair k = get_group_id(2), slot
+ // i = k % n_used, token t = k / n_used; expert ids[t][i], column
+ // (i % ne11) + t * ne11, output dst + t * nb2 + i * nb1; res: the residual
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+index 444135647..09c8a8ab5 100644
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -1313,8 +1313,8 @@ bool llama_expert_cache::lend() {
+ // region copy a tensor from it (ggml_backend_opencl_lend_write) with no host
+ // staging and no layout conversion. There is no type rule to get wrong:
+ //   - the plain types: the whole slice range, byte for byte;
+-//   - the planar types (ggml-opencl-planes.h's ggml_cl_lb_planar, patches 0022/0030/0116:
+-//     IQ2_XXS, IQ2_XS, IQ2_S, Q2_0, IQ3_S, Q3_K -- NOT IQ3_XXS or IQ4_XS, which keep
++//   - the planar types (ggml-opencl-planes.h's ggml_cl_lb_planar, patches 0022/0030/0116/0117:
++//     IQ2_XXS, IQ2_XS, IQ2_S, Q2_0, IQ3_S, Q3_K, Q2_K -- NOT IQ3_XXS or IQ4_XS, which keep
+ //     their own layout and are not planar): the bank's planes are the card's
+ //     bytes, slice size and place unchanged;
+ //   - the split-extra types (IQ4_NL's d/q sub-buffers, Q8_0's SOA): two regions,
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 81c6ccd6f..e63eb28e0 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10597,6 +10597,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q3_K,  512,    5,  4, 1, 1, v));
+         test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q3_K,  512,    6,  4, 3, 2, v));
+         test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q3_K,  256,    5,  4, 1, 1, v));
++        // ARC-LAB 0117: Q2_K likewise
++        test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q2_K, 5120, 4096, 64, 1, 1, v));
++        test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q2_K,  512,    5,  4, 1, 1, v));
++        test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q2_K,  512,    6,  4, 3, 2, v));
++        test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q2_K,  256,    5,  4, 1, 1, v));
+     }
+ 
+     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_0}) {
+@@ -11678,7 +11683,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     }
+     // a 2-D view of a 3-D Q3_K weight (declined: its planes are per slice of the parent)
+     // and of every planar type (0022's low-bit types too); the first 32 of 64 rows
+-    for (ggml_type type_a : { GGML_TYPE_Q3_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, GGML_TYPE_Q2_0 }) {
++    for (ggml_type type_a : { GGML_TYPE_Q3_K, GGML_TYPE_Q2_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, GGML_TYPE_Q2_0 }) {
+         for (int n : { 1, 4, 16 }) {
+             test_cases.emplace_back(new test_mul_mat_reshape3d(type_a, 512, 64, 3, n));
+             test_cases.emplace_back(new test_mul_mat_reshape3d(type_a, 512, 64, 1, n, 32));
+@@ -11704,6 +11709,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // ARC-LAB 0117: Q2_K, the same paths and cases as Q3_K above (matvec with its min term, few-column,
++    // 2D-block and tile GEMMs; the 2D GEMM's qs plane is 64-byte aligned for a slice of a multiple of 16
++    // blocks: 1000 x 2048 and 1008 x 1024 take it, 1001 x 2560 and 77 x 4096 the tile); M 129 x K 256 odd
++    for (int n : { 1, 2, 3, 4, 5, 6, 8, 9, 12, 16, 17, 512 }) {
++        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ { 256, 2560 }, { 1001, 2560 }, { 77, 4096 }, { 129, 512 },
++                                                                     { 8, 1024 }, { 512, 14336 }, { 129, 256 } }) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
++        }
++    }
++    for (int n : { 1, 2, 3, 4, 8, 16, 512 }) {
++        for (int64_t m : { 256, 1000 }) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, m, n, 768, { 1, 1 }, { 1, 1 }));
++        }
++    }
++    for (int n : { 17, 100, 512 }) {
++        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ { 1000, 2048 }, { 1008, 1024 } }) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
++        }
++    }
++    for (int n : { 2, 4, 8 }) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, 256, n, 1024, { 1, 1 }, { 2, 1 }));
++    }
++    for (int n : { 4, 8, 12 }) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, 256, 1, 2048, { 1, 1 }, { n, 1 }, { 0, 2, 1, 3 }));
++    }
++    // the AREX-2 roles (M rows x K) at 1, 2, 6 (an MTP 5 verify), 8, 16 and 512 columns
++    for (int n : { 1, 2, 6, 8, 16, 512 }) {
++        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 }, { 10240, 5120 }, { 6144, 5120 },
++                                                                     { 5120, 6144 }, { 12288, 5120 }, { 1024, 5120 }, { 248320, 5120 } }) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
++        }
++    }
++
+     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
+     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
+         for (int n = 1; n <= 8; ++n) {
+@@ -13609,8 +13647,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     // Q4_K at the AREX-2 roles' shapes (M rows x K), decode to a prompt
+     for (int bs : {6, 7, 9, 12, 15, 16}) {
+         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, 4096, bs, 14336, {1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, 4096, bs, 14336, {1, 1}, {1, 1}));   // 0117
+     }
+-    for (ggml_type type_a : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K}) {
++    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K}) {
+         for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120},
+                                                                 {5120, 6144}, {12288, 5120}, {1024, 5120}, {248320, 5120}}) {
+             for (int bs : {1, 2, 6, 8, 16, 512}) {

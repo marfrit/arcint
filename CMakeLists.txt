@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 1.6.1 LANGUAGES CXX)
+project(arcint VERSION 1.6.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -95,6 +95,7 @@ add_library(arcint_core STATIC
   src/api/error.cpp
   src/api/handlers.cpp
   src/api/generate.cpp
+  src/api/raw_trace.cpp
   src/api/metrics.cpp
   src/api/renderer.cpp
   src/api/request_id.cpp
@@ -191,6 +192,13 @@ if(ARCINT_LLAMA)
   if(ARCINT_LLAMA_EXT_H MATCHES "llama_model_n_layer_physical")
     target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_DORY=1)
   endif()
+  # contrib/llama.cpp 0111: the weights the device declined at load, placed in host memory,
+  # counted (llama_placement_downgrades in llama-ext.h); /props downgrades carries them
+  if(ARCINT_LLAMA_EXT_H MATCHES "llama_placement_downgrades")
+    target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_PLACEMENT=1)
+  else()
+    message(WARNING "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0111: a weight the card declines at load is not reported")
+  endif()
   if(ARCINT_LLAMA_H MATCHES "expert_cache_bytes")
     target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_EXPERT_CACHE=1)
     # 0024: an expert cache per card under the layer split
@@ -280,6 +288,8 @@ if(ARCINT_TESTS)
     tests/test_token_ids.cpp
     tests/test_mtp_head_file.cpp
     tests/test_props.cpp
+    tests/test_placement.cpp
+    tests/test_planes.cpp
     tests/test_sampler_modes.cpp
     tests/test_fast_topk.cpp
     tests/test_mtp_depth.cpp
@@ -287,6 +297,9 @@ if(ARCINT_TESTS)
     tests/test_context_guard.cpp
     tests/test_lanes.cpp
     tests/test_reasoning.cpp
+    tests/test_think_lead.cpp
+    tests/test_raw_trace.cpp
+    tests/test_stream_golden.cpp
     tests/test_admission.cpp
     tests/test_dory.cpp
     tests/test_gemma4.cpp
@@ -297,6 +310,7 @@ if(ARCINT_TESTS)
     tests/test_slot_loan.cpp
     tests/test_loan_book.cpp
     tests/test_toolgrammar.cpp
+    tests/test_force_content.cpp
     tests/test_tokenize_once.cpp
     tests/test_disconnect.cpp
     tests/test_responses.cpp
@@ -305,6 +319,7 @@ if(ARCINT_TESTS)
     tests/test_auth.cpp
     tests/test_reqid.cpp
     tests/test_tokenize.cpp
+    tests/test_template_file.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
@@ -324,6 +339,12 @@ if(ARCINT_TESTS)
     # LLAMA_SLOT_LOAN_BYTES_ENV and llama_model_default_params (finding 8's rule
     # lives in the pinned tree's init and its default params, not in the tool)
     target_include_directories(arcint-test PRIVATE "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/include")
+    # contrib/llama.cpp 0116: test_planes.cpp runs the OpenCL backend's planar layout (the low-bit types
+    # and Q3_K), a device-free header of the pinned tree's ggml-opencl
+    if(EXISTS "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl/ggml-opencl-planes.h")
+      target_include_directories(arcint-test PRIVATE "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl" "${ARCINT_LLAMA_DIR}/ggml/src")
+      target_compile_definitions(arcint-test PRIVATE ARCINT_LLAMA_PLANES=1)
+    endif()
     # clean-turns step 2's forced-malformed gate on a real vocabulary (vocab-only
     # load, no device). Not a ctest case: it needs the GGUF; run by hand.
     add_executable(arcint-tool-grammar-probe tools/tool_grammar_probe.cpp)

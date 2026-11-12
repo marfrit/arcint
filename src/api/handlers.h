@@ -15,6 +15,7 @@
 #include "config.h"
 #include "core/chat.h"
 #include "core/dialect.h"
+#include "core/reasoning.h"
 #include "exec/backend.h"
 
 namespace lgc::api {
@@ -179,6 +180,12 @@ std::string decode_suffix_for(const GenerationStats& stats);
 // Qwen pair is checked, exactly as the chat path always did; Gemma 4 checks its
 // own channel opener, which carries the newline itself.
 bool prompt_ends_inside_think_block(std::string_view prompt, ChatDialect dialect);
+// Whether a rendered prompt ends right after a think block the template closed:
+// with a closer of the dialect's tag table, before any trailing layout (the
+// Qwen templates with thinking off render an empty block and two line breaks,
+// Dory's the bare pair). The answer then starts at the lead after a closed
+// block (ThinkStart::Closed).
+bool prompt_ends_after_think_block(std::string_view prompt, ChatDialect dialect);
 
 // loop-guard: the per-request counters as the response's `loop_guard` object.
 // Exposed so the stats-to-JSON wiring is unit-testable without a card. A plain
@@ -238,6 +245,7 @@ struct PreparedChat {
     ToolSchemas     schemas;
     bool            parse_tool_calls = false;
     bool            think_open       = false;  // the prompt ended inside a think block
+    bool            think_closed     = false;  // ... or right after one the template closed
     ChatDialect     dialect;                     // the loaded model's think tags and tool-call form (ModelStatus)
     ThinkBlockIds   think_ids;                   // the artifact's per-pair tag ids
     std::string     id;
@@ -249,6 +257,11 @@ struct PreparedChat {
     int             lane          = -1;  // resolve_lane's answer
     std::string     model;               // the name the response carries
     TruncationReport truncation;         // W3.5: zero on every non-auto path
+
+    // The split's start state, from the two flags above.
+    ThinkStart think_start() const {
+        return think_open ? ThinkStart::Open : think_closed ? ThinkStart::Closed : ThinkStart::Undecided;
+    }
 };
 
 struct PreparedCompletion {

@@ -8,6 +8,7 @@
 
 #include "api/error.h"
 #include "api/generate.h"
+#include "api/raw_trace.h"
 #include "api/metrics.h"
 #include "api/request_id.h"
 #include "api/responses_state.h"
@@ -509,6 +510,13 @@ private:
     int               reasoning_index_ = -1;
     std::string       reasoning_text_;
     int               reasoning_tokens_ = 0;   // R7, id-split only
+    // ARCINT_RAW_TRACE: on for this turn, and the split's reasoning for its line
+    bool              tracing_ = false;
+    std::string       traced_reasoning_;
+    // force_nonempty_content: the split's raw reasoning bytes, kept only when the
+    // trigger is on and the turn is not in token mode (see run())
+    bool              force_content_ = false;
+    std::string       forced_reasoning_;
 
     // content
     utf8::Streamer content_utf8_;
@@ -546,8 +554,12 @@ bool Stream::run(const Context& ctx, int slot) {
     if (!send(json{{"type", "response.created"}, {"response", created}})) return false;
     if (!send(json{{"type", "response.in_progress"}, {"response", created}})) return false;
 
+    tracing_ = raw_trace_on();
+    // Not in token mode: its arcint:token events are the gateway's record of the
+    // turn, and promoted text has no token behind it.
+    force_content_ = !req_.token_mode && force_nonempty_content_requested(prep_.req.chat_template_kwargs);
     // The chat route's streamer, over the same (piece, id) sequence.
-    reasoning_ = ReasoningStreamer(prep_.think_open, prep_.dialect,
+    reasoning_ = ReasoningStreamer(prep_.think_start(), prep_.dialect,
                                    prep_.think_ids.open_close_ids);
     // W6b: token mode's spans read the same ids the streamer and the parser
     // use; the off path leaves every field false/empty.
@@ -612,6 +624,8 @@ bool Stream::run(const Context& ctx, int slot) {
                            // id-based split can say that exactly.
                            if (by_ids && token_id >= 0 && !step.reasoning.empty())
                                ++reasoning_tokens_;
+                           if (tracing_) traced_reasoning_ += step.reasoning;
+                           if (force_content_) forced_reasoning_ += step.reasoning;
                            if (!emit_reasoning(step.reasoning)) return false;
                            if (!step.content.empty()) {
                                // The block closed in this step: the reasoning
@@ -649,6 +663,18 @@ bool Stream::run(const Context& ctx, int slot) {
                        },
                        stats, raw, nullptr);
     } catch (const std::exception& e) {
+        if (tracing_) {   // ARCINT_RAW_TRACE: the turn threw; its partial text, the split so far, the message
+            try {
+                RawTraceRecord r = raw_trace_record(prep_, "responses", true, "error", raw);
+                r.token_mode     = token_mode_;
+                r.reasoning      = traced_reasoning_;
+                r.content        = content_;
+                r.error          = e.what();
+                raw_trace_write(r);
+            } catch (...) {
+                // a trace failure must not escape this catch or replace the failed event
+            }
+        }
         log::error("req", "responses stream failed: %s%s", e.what(),
                    rid_suffix(prep_.request_id).c_str());
         // Two spec MUSTs meet here: an in-stream error is followed by failed,
@@ -661,6 +687,19 @@ bool Stream::run(const Context& ctx, int slot) {
 
     log_stats(slot, stats, reason, prep_.request_id);
     if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
+    auto trace = [&](bool parsed_now, const std::string& parse_input, const std::vector<ToolCall>* calls,
+                     const std::string& content) {
+        if (!tracing_) return;
+        RawTraceRecord r = raw_trace_record(prep_, "responses", true, finish_reason_name(reason), raw);
+        r.token_mode     = token_mode_;
+        r.reasoning      = traced_reasoning_;
+        r.tool_parse     = parsed_now;
+        r.parsed_input   = parsed_now ? &parse_input : nullptr;
+        r.calls          = calls;
+        r.content        = content;
+        raw_trace_write(r);
+    };
+    if (gone_ || reason == FinishReason::Abort) trace(false, content_, nullptr, content_);   // unsplit tail, unparsed
     if (gone_) return false;
 
     if (reason == FinishReason::Abort) {
@@ -677,22 +716,47 @@ bool Stream::run(const Context& ctx, int slot) {
                      /*error_event=*/false);
     }
 
+    // The split's last bytes and the parse first (both pure), so the trace's
+    // line is written before any send can fail; the sends keep their order.
     ReasoningStreamer::Step last = reasoning_.flush();
-    if (!emit_reasoning(last.reasoning)) return false;
-    if (!flush_reasoning()) return false;
-    if (!last.content.empty()) {
-        content_ += last.content;
-        if (!prep_.parse_tool_calls && !emit_content(last.content)) return false;
+    if (!last.content.empty()) content_ += last.content;
+    if (force_content_) forced_reasoning_ += last.reasoning;
+    // force_nonempty_content (core/chat.h), as the chat stream does it: the block
+    // never closed and the answer is blank, so the reasoning text becomes the
+    // answer item's text, as it is: the promoted text is not tool-parsed (the
+    // reference's stream runs no tool parser on it), so call markup inside a
+    // block that was cut stays text and is never a function_call item.
+    const bool promoted = force_content_ && reasoning_.in_reasoning() &&
+                          promote_reasoning_to_content(prep_.req.chat_template_kwargs,
+                                                       forced_reasoning_, content_);
+    if (promoted) {
+        log::debug("req", "force_nonempty_content: %zu streamed reasoning bytes become the output_text%s",
+                   forced_reasoning_.size(), rid_suffix(prep_.request_id).c_str());
     }
-
-    std::vector<ToolCall> calls;
-    if (prep_.parse_tool_calls) {
-        ToolCallParse parsed = parse_tool_calls(content_, prep_.dialect, &prep_.schemas);
+    const bool         parse_calls = prep_.parse_tool_calls && !promoted;
+    const std::string& final_text  = promoted ? forced_reasoning_ : content_;
+    ToolCallParse parsed;
+    if (parse_calls) {
+        parsed = parse_tool_calls(content_, prep_.dialect, &prep_.schemas);
         if (parsed.truncated) {
             log::warn("tools", "unterminated %s block; returned as raw content%s",
                       std::string(tool_call_open(prep_.dialect)).c_str(),
                       rid_suffix(prep_.request_id).c_str());
         }
+    }
+    if (tracing_) traced_reasoning_ += last.reasoning;
+    trace(parse_calls, final_text, &parsed.calls, parse_calls ? parsed.content : final_text);
+    if (!emit_reasoning(last.reasoning)) return false;
+    if (!flush_reasoning()) return false;
+    if (!last.content.empty() && !prep_.parse_tool_calls && !emit_content(last.content)) return false;
+    // The reasoning item closes before the answer item is added, as on the
+    // closed-block path (a block that closes mid-stream closes its item first).
+    if (promoted && !close_reasoning(reason == FinishReason::Stop ? "completed" : "incomplete"))
+        return false;
+    if (promoted && !emit_content(forced_reasoning_)) return false;
+
+    std::vector<ToolCall> calls;
+    if (parse_calls) {
         calls = std::move(parsed.calls);
         if (parsed.content.size() > streamed_) {
             if (!emit_content(std::string_view(parsed.content).substr(streamed_))) return false;

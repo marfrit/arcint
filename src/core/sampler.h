@@ -87,7 +87,12 @@ public:
     // engages when the model opens the block itself. Both are
     // inert unless params.think_eog_mask or params.tool_grammar is set (the
     // grammar needs the block's state; only think_eog_mask masks anything).
-    void start_in_think_block(bool open);
+    // `after_close`: the template closed an empty block at the prompt's end
+    // (ThinkStart::Closed). The tracker then skips a closer the model repeats
+    // at the lead, by the split's own rule (repeated_closer_step), and stays
+    // undecided, so a block the model opens after it is tracked as the split
+    // tracks it.
+    void start_in_think_block(bool open, bool after_close = false);
     // Text-only feed, for a caller that has no token id (the tests; a
     // backend always calls observe(id, piece)). It is the text fallback: a
     // known id still governs its role, so ordinary text cannot close or open
@@ -327,6 +332,11 @@ private:
     std::string think_tail_;   // the newest characters, to see a closer land
     std::string think_lead_;   // the first non-blank characters, until the
                                // block's opening is settled
+    // ThinkStart::Closed: the lead may still carry a repeated closer. Its
+    // undecided bytes, and the per-pair ids the rule matches by.
+    bool        think_after_close_ = false;
+    std::string think_close_lead_;
+    std::vector<std::pair<int, int>> think_close_pairs_;
     size_t      think_max_tag_ = 0;   // the longest tag: the closer tail's bound
     size_t      think_max_open_ = 0;  // the longest opener: the lead's bound
                                       // (N1: the look-ahead is bounded by it)

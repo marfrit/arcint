@@ -66,7 +66,54 @@ std::string_view strip_leading_newlines(std::string_view s) {
     while (!s.empty() && s.front() == '\n') s.remove_prefix(1);
     return s;
 }
+
+// The whole-text form (a vocabulary with no tag ids: the text rule throughout): every closer at the lead goes, with the pad before it.
+std::string_view drop_repeated_closers(std::string_view s, ChatDialect d, bool& dropped) {
+    const TagRange r = tag_range(d);
+    for (bool hit = true; hit;) {
+        hit = false;
+        const std::string_view lead = lead_of(s);
+        for (size_t i = 0; i < r.count && !hit; ++i) {
+            if (lead.substr(0, r[i].close.size()) != r[i].close) continue;
+            s       = lead.substr(r[i].close.size());
+            hit     = true;
+            dropped = true;
+        }
+    }
+    return s;
+}
 }  // namespace
+
+LeadState repeated_closer_step(std::string& buf, std::string_view piece, int token_id,
+                               const std::vector<std::string>& closers,
+                               const std::vector<std::pair<int, int>>& ids, bool& dropped) {
+    auto has_id = [&](size_t i) { return i < ids.size() && ids[i].second >= 0; };
+    if (token_id >= 0 && lead_of(buf).empty()) {
+        for (size_t i = 0; i < closers.size(); ++i) {
+            if (!has_id(i) || ids[i].second != token_id) continue;
+            buf.clear();   // the closer token and the layout before it
+            dropped = true;
+            return LeadState::Hold;
+        }
+    }
+    buf += piece;
+    for (;;) {
+        const std::string_view lead = lead_of(buf);
+        if (lead.empty()) return LeadState::Hold;
+        bool hit = false, loomed = false;
+        for (size_t i = 0; i < closers.size() && !hit; ++i) {
+            if (has_id(i)) continue;   // decided by its id alone
+            const std::string_view c = closers[i];
+            if (lead.substr(0, c.size()) == c) {
+                buf.erase(0, buf.size() - lead.size() + c.size());
+                dropped = hit = true;
+            } else if (lead.size() < c.size() && c.substr(0, lead.size()) == lead) {
+                loomed = true;
+            }
+        }
+        if (!hit) return loomed ? LeadState::Hold : LeadState::Answer;
+    }
+}
 
 // One helper, two callers: split_reasoning below and the sampler's
 // think-block mask both strip the lead this way, so they cannot
@@ -89,15 +136,19 @@ const std::vector<std::pair<std::string, std::string>>& think_tag_pairs(ChatDial
     }
 }
 
-ReasoningSplit split_reasoning(std::string_view raw, bool think_open, ChatDialect dialect) {
+ReasoningSplit split_reasoning(std::string_view raw, ThinkStart start, ChatDialect dialect) {
     ReasoningSplit out;
     std::string_view body  = raw;
     std::string_view close = tag_range(dialect)[0].close;   // the template opened it: this dialect's first pair
-    if (!think_open) {
+    if (!start.open()) {
+        // The template closed the block: a closer the model repeats at the
+        // lead is the template's, and goes with the layout after it.
+        bool dropped = false;
+        if (start.closed()) raw = drop_repeated_closers(raw, dialect, dropped);
         const std::string_view lead = lead_of(raw);
         const ThinkTags*       tags = opened_by(lead, dialect);
         if (tags == nullptr) {
-            out.content = std::string(raw);
+            out.content = std::string(dropped ? strip_leading_newlines(raw) : raw);
             return out;
         }
         body  = lead.substr(tags->open.size());
@@ -112,17 +163,19 @@ ReasoningSplit split_reasoning(std::string_view raw, bool think_open, ChatDialec
     }
     out.closed    = true;
     out.reasoning = std::string(strip_edge_newlines(body.substr(0, at)));
-    out.content   = std::string(strip_leading_newlines(body.substr(at + close.size())));
+    bool repeated = false;   // a closer repeated at the answer's lead is layout too
+    out.content   = std::string(
+        strip_leading_newlines(drop_repeated_closers(body.substr(at + close.size()), dialect, repeated)));
     return out;
 }
 
 ReasoningSplit split_reasoning_tokens(const std::vector<std::pair<std::string, int>>& pieces,
-                                      bool think_open, ChatDialect dialect,
+                                      ThinkStart start, ChatDialect dialect,
                                       const std::vector<std::pair<int, int>>& open_close_ids) {
     // One implementation with the streaming path: run the streamer over the
     // same sequence and concatenate its steps. A spelled closer stays reasoning
     // and the special-token closer closes the block in both, by construction.
-    ReasoningStreamer streamer(think_open, dialect, open_close_ids);
+    ReasoningStreamer streamer(start, dialect, open_close_ids);
     ReasoningSplit    out;
     for (const auto& [piece, id] : pieces) {
         const ReasoningStreamer::Step step = streamer.push(piece, id);
@@ -143,14 +196,29 @@ ReasoningSplit split_reasoning_tokens(const std::vector<std::pair<std::string, i
     return out;
 }
 
-ReasoningStreamer::ReasoningStreamer(bool think_open, ChatDialect dialect,
+ReasoningStreamer::ReasoningStreamer(ThinkStart start, ChatDialect dialect,
                                      const std::vector<std::pair<int, int>>& open_close_ids)
-    : in_reasoning_(think_open), undecided_(!think_open), dialect_(dialect), ids_(open_close_ids) {
+    : in_reasoning_(start.open()), undecided_(!start.open()), dialect_(dialect), ids_(open_close_ids) {
+    after_close_ = start.closed();
+    for (const auto& pair : think_tag_pairs(dialect_)) closers_.push_back(pair.second);
     // a template-opened block closes on this dialect's first pair, not the Qwen one
     close_ = tag_range(dialect_)[0].close;
     // A template-opened block: its closer is the first pair's close id when the
     // vocabulary spells it as one token; -1 keeps the text fallback.
     if (in_reasoning_ && !ids_.empty() && ids_.front().second >= 0) close_id_ = ids_.front().second;
+}
+
+// The answer's lead after the block closed: layout and a repeated closer are
+// held and dropped, the first byte of the answer releases the rest (its
+// leading line breaks dropped, as the whole-text split drops them).
+ReasoningStreamer::Step ReasoningStreamer::lead_after_close_(std::string_view piece, int token_id) {
+    Step step;
+    bool dropped = false;
+    if (repeated_closer_step(buffer_, piece, token_id, closers_, ids_, dropped) == LeadState::Hold) return step;
+    step.content = std::string(strip_leading_newlines(buffer_));
+    buffer_.clear();
+    content_start_ = false;
+    return step;
 }
 
 TokenField ReasoningStreamer::field_for(int token_id) const {
@@ -175,6 +243,19 @@ ReasoningStreamer::Step ReasoningStreamer::push(std::string_view piece, int toke
             close_id_     = ids_[i].second;
             buffer_.clear();
             return step;
+        }
+        // The template closed an empty block: a closer at the lead is that
+        // closer repeated (repeated_closer_step: its token after nothing but
+        // layout, or for an id-less pair its text, also across pieces). It is
+        // dropped with the layout around it; the opener rule below then runs on
+        // what follows, exactly as the sampler's tracker does.
+        if (after_close_) {
+            bool dropped = false;
+            const LeadState l = repeated_closer_step(buffer_, piece, token_id, closers_, ids_, dropped);
+            if (dropped) drop_newlines_ = true;
+            if (l == LeadState::Hold) return step;
+            after_close_ = false;
+            piece        = {};   // already in buffer_
         }
         // Not opened by the template. Hold the first bytes until they either
         // spell an opener or cannot: anything else is plain content. Only a
@@ -205,7 +286,7 @@ ReasoningStreamer::Step ReasoningStreamer::push(std::string_view piece, int toke
             // come, exactly as the sampler's mask stays undecided on it.
             if (loomed || lead.empty()) return step;   // could still be a tag
             undecided_ = false;
-            step.content = buffer_;
+            step.content = drop_newlines_ ? std::string(strip_leading_newlines(buffer_)) : buffer_;
             buffer_.clear();
             return step;
         }
@@ -221,13 +302,9 @@ ReasoningStreamer::Step ReasoningStreamer::push(std::string_view piece, int toke
         // The line breaks between the closer and the answer are layout, not
         // answer: the non-streaming split (the reference) drops them, so the
         // stream drops them too -- otherwise the two paths disagree on the same
-        // token stream.
-        std::string text(piece);
-        if (content_start_) {
-            text = std::string(strip_leading_newlines(text));
-            if (!text.empty()) content_start_ = false;
-        }
-        step.content = std::move(text);
+        // token stream. A closer repeated there is dropped the same way.
+        if (content_start_) return lead_after_close_(piece, token_id);
+        step.content = std::string(piece);
         return step;
     }
     // The block is open. With a closer id known, only that id closes it: no
@@ -255,12 +332,11 @@ ReasoningStreamer::Step ReasoningStreamer::push(std::string_view piece, int toke
         return step;
     }
     step.reasoning = buffer_.substr(0, at);
-    std::string_view rest(buffer_);
-    rest.remove_prefix(at + close_.size());
-    step.content = std::string(strip_leading_newlines(rest));
-    content_start_ = step.content.empty();
+    const std::string rest = buffer_.substr(at + close_.size());
     buffer_.clear();
-    in_reasoning_ = false;
+    in_reasoning_  = false;
+    content_start_ = true;
+    step.content   = lead_after_close_(rest, -1).content;
     return step;
 }
 
@@ -268,6 +344,8 @@ ReasoningStreamer::Step ReasoningStreamer::flush() {
     Step step;
     if (buffer_.empty()) return step;
     if (in_reasoning_) step.reasoning = buffer_;   // never closed: it stays reasoning
+    // a lead still held after a closed block: its line breaks are layout
+    else if (content_start_ || drop_newlines_) step.content = std::string(strip_leading_newlines(buffer_));
     else step.content = buffer_;
     buffer_.clear();
     return step;

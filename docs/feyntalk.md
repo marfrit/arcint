@@ -50,7 +50,14 @@ template's own switch `preserve_thinking` keeps it:
   names the template context owns (`messages`, `tools`, `add_generation_prompt`, `bos_token`, `eos_token`,
   `strftime_now`) and the template engine's builtins (`namespace`, `range`, `tojson`, …): those are a 400. A
   template that fails on what the request sent is a 400 too; an engine fault stays a 500. The gateway must
-  render with exactly the same keys, or the token-mode hash is a 409.
+  render with exactly the same keys, or the token-mode hash is a 409. That includes the unit's own defaults: a gateway
+  must apply `/props` `chat_template_kwargs_default` when a default names a key the template reads (and the thinking
+  default, `enable_thinking`), as the engine adds them to a request that does not carry the key. The exception
+  is a `reasoning_effort` default: the engine applies it as the request's own top-level `reasoning_effort` when the
+  request states no level by any route (top-level `reasoning_effort`, Responses `reasoning.effort`, or the kwarg), so it
+  goes through the template's level mapping and sets the thinking switch. A gateway must apply it the same way (a
+  top-level level, not a raw kwarg), or its prompt hash differs and the turn answers 409. `/props`
+  `chat_template_kwargs_default` lists the level as configured, not as mapped.
 - gateway policy: keep thinking by default; drop it only as the first compaction stage once the prompt passes
   `FEYNTALK_THINK_DROP_FRACTION` (0.7) of the context window. The request log shows `think=kept|dropped|off`.
 - templates differ in their default, which is why the gateway always sends the flag explicitly: the Qwen3.6

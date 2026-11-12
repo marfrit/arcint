@@ -16,8 +16,8 @@
 > Qwen3.8-Flash-Next (512-expert MoE on one card plus host RAM), plus
 > Cydonia 24B (llama architecture) for writing. One engine: libllama
 > (llama.cpp at pinned commit 3e4dfa8) with ggml's OpenCL backend and
-> arcint's Intel kernel series (contrib/llama.cpp/patches, 0001-0063
-> without 0031, 0055 and 0061).
+> arcint's Intel kernel series (contrib/llama.cpp/patches: 0001-0096
+> folded into 12 files, then 0097-0117; FOLDED.md resolves old numbers).
 > arcint owns the HTTP surface, chat templates, tool calls, the sampler,
 > named lanes, MTP speculative decoding, context checkpoints and the expert
 > cache's policy. The OpenVINO engine of 0.1-0.7.12 was retired in 0.8.0;
@@ -28,6 +28,11 @@
 - Flash-Next's production quant is ISTA-DASLab's GSQ-RCO IQ3_S since
   2026-10-20 (operator): 33.3 t/s decode on six answers, KL 0.127 against
   Q8_0 (IQ3_XXS 38.0 t/s, 0.217, the rollback).
+- Version 1.6.2 (2026-11-12): --chat-template-kwarg KEY=VALUE and --chat-template-file; force_nonempty_content as
+  vLLM's Nemotron-V3 parser acts on it (a stream sends the promoted reasoning as text, no tool-call parse);
+  --tool-grammar enforces listed string values and takes an inline parameter closer; ARCINT_RAW_TRACE; OpenCL: Q4_0,
+  Q8_0, IQ4_XS, IQ4_NL at 2 to 16 columns on one weight read (0115), dense Q3_K (0116) and Q2_K (0117) on the card,
+  Dory's graph a third smaller (0113, 0114), a declined weight reported at load (0111).
 - Version 1.6.1 (2026-11-07): Gemma 4 E4B on the fast path at both KV types: flash attention at head size 512 on
   Intel (0106), upstream's f16 one-column matvec fixed for sub-groups narrower than 64 (0107: the f16-KV decode was
   wrong, KL 3.37 -> 0.0044), F32 weights multiplied through an f16 copy in prompts (0110, +3.7-3.9 % prefill);
@@ -222,8 +227,9 @@
   at the Mistral Small 24B and Llama 2 7B geometries, gemma4 at the E4B geometry
   granite at the 8B geometry and dory at the 1.0-4B geometry (72 physical
   blocks; --llama-dory-loops, --llama-dory-kv) (code: src/core/admission.cpp);
-  anything else, an untested size included, is refused at load. Gemma 4 E4B,
-  Granite 4.2 8B and Dory1.0-4B are admitted but not yet served on a card. No
+  anything else, an untested size included, is refused at load. Dory1.0-4B
+  is served on a card (a leg of the 1.6.2 gate); Gemma 4 E4B has card numbers (1.6.1) and no unit; Granite 4.2 8B is
+  admitted, not yet run on a card. No
   allowlist (retired with the OpenVINO engine, operator 2026-10-15).
 - Flash-Next's MTP layer: an MTP-only GGUF built from the checkpoint's 31
   mtp.* tensors by tools/flash_next_mtp_gguf.sh (--llama-mtp-gguf); its
@@ -329,9 +335,49 @@ exists). Moving the pin: contrib/llama.cpp/README.md "Moving the pin".
 - --served-model-name NAME[,NAME2] with --lane-ctx CA,CB; --parallel N;
   --n-ctx N (default the smaller of 32,768 and the trained context);
   --queue-timeout S; --prefill-chunk N; --prefill-ubatch N (n_ubatch, default 512).
+- --chat-template-file PATH: the file's jinja text replaces the GGUF's embedded
+  chat template (llama.cpp's flag). Read and parsed at start; a missing, empty
+  or unparsable file stops the start (no fallback); not with --stub.
+  /props chat_template_caps.template_source: gguf | file | chatml-fallback.
 - Sampler defaults: --temp, --top-p, --top-k, --min-p,
   --repetition-penalty, --presence-penalty,
   --chat-template-kwarg enable_thinking=BOOL.
+- --chat-template-kwarg KEY=VALUE (repeatable): a unit default for any
+  chat_template_kwargs key; VALUE is JSON when it parses (true, 3, "text"),
+  else a bare string; null, reserved context names (messages, tools, ...),
+  a non-boolean preserve_thinking and a repeated key fail at start. reasoning_effort=LEVEL
+  (none|off|minimal|low|medium|high|xhigh) is a level: a request's own (top-level
+  reasoning_effort, Responses reasoning.effort, or the kwarg) wins, the default
+  goes through the request-level mapping and, for a request that states neither a
+  level nor the switch, sets the switch (none/off: thinking off; every other
+  level: on, so on a template that does not think by default a non-off unit
+  level makes every silent request a thinking turn); it must agree with
+  enable_thinking=BOOL. /v1/responses has no
+  chat_template_kwargs field: a Responses client cannot turn a unit default off. Token mode: a gateway that renders the prompt
+  itself must apply /props chat_template_kwargs_default when a default names a
+  key the template reads (same for the thinking default), or its prompt hash
+  differs and the turn answers 409. A reasoning_effort default is applied as the
+  request's own top-level reasoning_effort when the request states no level by
+  any route (top-level, Responses reasoning.effort, or the kwarg): it goes
+  through the template's level mapping and sets the thinking switch, so a
+  gateway must apply it the same way (a top-level level, not a raw kwarg) or
+  the hash differs and the turn answers 409; /props chat_template_kwargs_default
+  lists the level as configured, not as mapped. A request
+  that carries the key wins (false included). All chat-preparing routes get
+  it; /props chat_template_kwargs_default lists them.
+- chat_template_kwargs.force_nonempty_content=true (request or unit default;
+  only the JSON boolean true; a unit default must be true or false): non-stream,
+  an empty/blank answer takes the reasoning text as content (before the tool-call parse); stream, a think block
+  that never closed sends the reasoning once as a content delta before the
+  final chunk, as text: the stream runs no tool-call parse on it (as vLLM's
+  stream), so call markup inside a cut thinking block is never a tool_calls
+  delta / function_call item. Blank reasoning
+  (empty or ASCII whitespace only; a non-ASCII space such as U+00A0 counts as
+  text, the reference's str.strip() reads it as blank) is never promoted, on any path. A block
+  that closed with a blank answer is promoted non-stream only. On the Responses
+  stream the reasoning item closes before the message item is added; token
+  mode is exempt (its arcint:token events are the gateway's record of the
+  turn). After vLLM's nemotron_v3 parser; chat and Responses routes.
 - --llama-kv K[:V]; --llama-threads N; --llama-reserve-cells N.
 - --llama-mtp N, --llama-mtp-gguf FILE, --llama-mtp-vocab FILE,
   --llama-mtp-min-p P, --llama-mtp-card N, --llama-mtp-depth-max N (0, off:

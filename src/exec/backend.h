@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
+#include <initializer_list>
 #include <utility>
 #include <atomic>
 #include <functional>
@@ -93,6 +95,30 @@ inline std::vector<std::pair<std::string, uint64_t>> parse_downgrades(const std:
         out.emplace_back(line.substr(0, tab), std::stoull(num));
     }
     return out;
+}
+
+// One source's "key\tcount\n" text read the way its function asks (a length query, then
+// the read): ggml_backend_opencl_downgrades (0100) and llama_placement_downgrades (0111).
+// A text that grew between the two calls is cut at the buffer; its cut last line is
+// dropped here, so that the next source's first line cannot join it.
+using DowngradeTextFn = size_t (*)(char*, size_t);
+inline std::string read_downgrade_text(DowngradeTextFn fn) {
+    if (fn == nullptr) return {};
+    const size_t need = fn(nullptr, 0);
+    std::string  text(need + 1, '\0');
+    fn(text.data(), text.size());
+    text.resize(std::strlen(text.c_str()));
+    const size_t nl = text.rfind('\n');
+    text.resize(nl == std::string::npos ? 0 : nl + 1);
+    return text;
+}
+
+// The keys and counts of every source, in source order (each source's keys are its own,
+// "src=opencl ..." or "src=llama ...").
+inline std::vector<std::pair<std::string, uint64_t>> collect_downgrades(std::initializer_list<DowngradeTextFn> fns) {
+    std::string all;
+    for (DowngradeTextFn fn : fns) all += read_downgrade_text(fn);
+    return parse_downgrades(all);
 }
 
 struct ModelStatus {
@@ -250,6 +276,9 @@ struct GenerationInput {
     // enable_thinking after the operator default, so llava's answer row never
     // switches in a non-thinking turn.
     bool think_open          = false;
+    // ... or right after a block the template closed (ThinkStart::Closed): the
+    // tracker then skips a repeated closer at the lead as the split does.
+    bool think_closed        = false;
     ChatDialect dialect;
 
     // The client-liveness probe for this request: false once the peer's
@@ -399,9 +428,10 @@ public:
     virtual std::string slot_loan_state() const { return "off"; }
 
     // The paths taken other than the one a weight's type promises, with how often
-    // (ggml_backend_opencl_downgrades, patch 0100), for /props. The log carries the
-    // same keys as "DOWNGRADE <key>" the first time each occurs. Counts reset with the
-    // process. The stub and a backend without them: none.
+    // (ggml_backend_opencl_downgrades, patch 0100), and the weights the card declined at
+    // load, placed in host memory (llama_placement_downgrades, patch 0111), for /props.
+    // The log carries the same keys as "DOWNGRADE <key>" the first time each occurs.
+    // Counts reset with the process. The stub and a backend without them: none.
     virtual std::vector<std::pair<std::string, uint64_t>> downgrades() const { return {}; }
 
     // --llama-mtp-policy cost's learned per-width round cost table (Strata's

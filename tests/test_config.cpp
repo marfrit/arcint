@@ -294,9 +294,9 @@ TEST(config_chat_template_kwarg) {
     CHECK(cfg2.think_default && *cfg2.think_default == true);
 }
 
-TEST(config_chat_template_kwarg_rejects_unknown_keys) {
-    // Only enable_thinking exists in the render path; accepting another key
-    // and ignoring it would be a lie.
+TEST(config_chat_template_kwarg_rejects_reserved_and_malformed) {
+    // enable_thinking keeps its typed true/false; a reserved context name is
+    // refused (the same list a request's chat_template_kwargs is held to).
     CHECK(rejected({"--stub", "--chat-template-kwarg", "add_generation_prompt=false"}));
     CHECK(rejected({"--stub", "--chat-template-kwarg", "enable_thinking=maybe"}));
     CHECK(rejected({"--stub", "--chat-template-kwarg", "enable_thinking"}));
@@ -1150,4 +1150,118 @@ TEST(config_answer_penalty_flags_reject_out_of_range_and_are_in_help) {
     const std::string help = usage_text();
     for (const char* flag : {"--answer-presence-penalty", "--answer-frequency-penalty"})
         CHECK(help.find(flag) != std::string::npos);
+}
+
+// The generic form (any key other than enable_thinking): the value is JSON when
+// it parses as JSON, the bare text as a string otherwise. The list keeps the
+// order given and stores canonical JSON text (core/chat.h parse_template_kwarg_default).
+TEST(config_chat_template_kwarg_generic_keys_are_typed_by_their_json) {
+    Config cfg;
+    const ArgParse r = run({"--stub",
+                            "--chat-template-kwarg", "force_nonempty_content=true",
+                            "--chat-template-kwarg", "depth=3",
+                            "--chat-template-kwarg", "tone=\"warm day\"",
+                            "--chat-template-kwarg", "mood=calm",
+                            "--chat-template-kwarg", "off=false",
+                            "--chat-template-kwarg", "preserve_thinking=true"}, cfg);
+    CHECK(r.ok);
+    CHECK_EQ(cfg.chat_template_kwarg_defaults.size(), static_cast<size_t>(6));
+    if (cfg.chat_template_kwarg_defaults.size() != 6) return;
+    const auto& d = cfg.chat_template_kwarg_defaults;
+    CHECK_EQ(d[0].first, std::string("force_nonempty_content"));
+    CHECK_EQ(d[0].second, std::string("true"));
+    CHECK_EQ(d[1].first, std::string("depth"));
+    CHECK_EQ(d[1].second, std::string("3"));
+    CHECK_EQ(d[2].first, std::string("tone"));
+    CHECK_EQ(d[2].second, std::string("\"warm day\""));   // a quoted string is the string warm day
+    CHECK_EQ(d[3].first, std::string("mood"));
+    CHECK_EQ(d[3].second, std::string("\"calm\""));        // bare text is a string
+    CHECK_EQ(d[4].second, std::string("false"));
+    CHECK_EQ(d[5].first, std::string("preserve_thinking"));
+    CHECK(!cfg.think_default);   // enable_thinking has its own typed field
+}
+
+TEST(config_chat_template_kwarg_enable_thinking_stays_typed) {
+    Config cfg;
+    CHECK(run({"--stub", "--chat-template-kwarg", "enable_thinking=false",
+               "--chat-template-kwarg", "force_nonempty_content=true"}, cfg).ok);
+    CHECK(cfg.think_default && *cfg.think_default == false);
+    CHECK_EQ(cfg.chat_template_kwarg_defaults.size(), static_cast<size_t>(1));
+    // the typed key takes true/false (and 1/0) only, as before
+    CHECK(rejected({"--stub", "--chat-template-kwarg", "enable_thinking=\"true\""}));
+    CHECK(rejected({"--stub", "--chat-template-kwarg", "enable_thinking=2"}));
+}
+
+TEST(config_chat_template_kwarg_generic_refusals) {
+    // null reads as absent everywhere else: a default of null would mean nothing
+    CHECK(rejected({"--stub", "--chat-template-kwarg", "x=null"}));
+    // reserved context names, by name
+    for (const char* kv : {"messages=1", "tools=[]", "bos_token=x", "eos_token=x", "strftime_now=1",
+                           "add_generation_prompt=true", "tojson=1", "namespace=1"}) {
+        Config cfg;
+        const ArgParse r = run({"--stub", "--chat-template-kwarg", kv}, cfg);
+        CHECK(!r.ok);
+        const std::string key = std::string(kv).substr(0, std::string(kv).find('='));
+        CHECK(r.error.find(key) != std::string::npos);
+        CHECK(r.error.find("reserved") != std::string::npos);
+    }
+    // preserve_thinking is a boolean, as in a request
+    CHECK(rejected({"--stub", "--chat-template-kwarg", "preserve_thinking=1"}));
+    CHECK(rejected({"--stub", "--chat-template-kwarg", "preserve_thinking=yes"}));
+    // a duplicate key, generic or typed, fails at startup
+    CHECK(rejected({"--stub", "--chat-template-kwarg", "a=1", "--chat-template-kwarg", "a=2"}));
+    CHECK(rejected({"--stub", "--chat-template-kwarg", "enable_thinking=true",
+                    "--chat-template-kwarg", "enable_thinking=false"}));
+    // an empty key, and no '='
+    CHECK(rejected({"--stub", "--chat-template-kwarg", "=1"}));
+    CHECK(rejected({"--stub", "--chat-template-kwarg", "force_nonempty_content"}));
+}
+
+// Review F5: the default of force_nonempty_content is a JSON boolean, or the start fails.
+TEST(config_chat_template_kwarg_force_nonempty_content_takes_only_booleans) {
+    Config cfg;
+    CHECK(run({"--stub", "--chat-template-kwarg", "force_nonempty_content=true"}, cfg).ok);
+    Config cfg2;
+    CHECK(run({"--stub", "--chat-template-kwarg", "force_nonempty_content=false"}, cfg2).ok);
+    for (const char* kv : {"force_nonempty_content=1", "force_nonempty_content=True",
+                           "force_nonempty_content=yes", "force_nonempty_content=\"true\"",
+                           "force_nonempty_content=0"}) {
+        Config c;
+        const ArgParse r = run({"--stub", "--chat-template-kwarg", kv}, c);
+        CHECK(!r.ok);
+        CHECK(r.error.find("true or false") != std::string::npos);
+    }
+}
+
+// Review F8: a bare value with invalid UTF-8 is a string json cannot serialise; it
+// was an uncaught exception out of parse_args, now a config error.
+TEST(config_chat_template_kwarg_invalid_utf8_is_a_config_error) {
+    Config cfg;
+    const ArgParse r = run({"--stub", "--chat-template-kwarg", "tone=\xff\xfe bad"}, cfg);
+    CHECK(!r.ok);
+    CHECK(r.error.find("UTF-8") != std::string::npos);
+}
+
+// Review F2: a unit default reasoning_effort is one of the levels, and it must not
+// contradict the typed thinking switch (none/off are thinking off, the rest on).
+TEST(config_chat_template_kwarg_reasoning_effort_default) {
+    Config cfg;
+    CHECK(run({"--stub", "--chat-template-kwarg", "reasoning_effort=high"}, cfg).ok);
+    CHECK_EQ(cfg.chat_template_kwarg_defaults.size(), static_cast<size_t>(1));
+    CHECK(rejected({"--stub", "--chat-template-kwarg", "reasoning_effort=extreme"}));
+    CHECK(rejected({"--stub", "--chat-template-kwarg", "reasoning_effort=3"}));
+    // agreeing pairs start; contradicting pairs do not
+    Config a;
+    CHECK(run({"--stub", "--chat-template-kwarg", "enable_thinking=false",
+               "--chat-template-kwarg", "reasoning_effort=none"}, a).ok);
+    Config b;
+    CHECK(run({"--stub", "--chat-template-kwarg", "reasoning_effort=low",
+               "--chat-template-kwarg", "enable_thinking=true"}, b).ok);
+    Config c;
+    const ArgParse r1 = run({"--stub", "--chat-template-kwarg", "enable_thinking=true",
+                             "--chat-template-kwarg", "reasoning_effort=none"}, c);
+    CHECK(!r1.ok);
+    CHECK(r1.error.find("contradicts") != std::string::npos);
+    CHECK(rejected({"--stub", "--chat-template-kwarg", "enable_thinking=false",
+                    "--chat-template-kwarg", "reasoning_effort=high"}));
 }

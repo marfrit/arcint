@@ -151,3 +151,24 @@ TEST(toolcall_dory_template_example_parses_under_the_qwen_dialect) {
              std::string("This is the value for the second parameter\nthat can span\nmultiple lines"));
     CHECK_EQ(r.content, std::string("I will call it.\n"));
 }
+
+// `<` inside a value is data, not markup: a comparison, an inequality, markup
+// and a value that ends in `<`. Only the parameter closer ends a value.
+TEST(toolcall_values_keep_angle_brackets) {
+    const std::string sql = "SELECT * FROM lines WHERE amount < 0.01 AND qty <> 0";
+    const auto        r   = parse_qwen_tool_calls(
+        "<tool_call>\n<function=run_query>\n<parameter=sql>\n" + sql + "\n</parameter>\n"
+        "<parameter=html>\n<b>x</b>\n</parameter>\n<parameter=tail>\na <\n</parameter>\n</function>\n</tool_call>");
+    CHECK_EQ(r.calls.size(), 1u);
+    if (r.calls.size() != 1) return;
+    const json args = json::parse(r.calls[0].arguments);
+    CHECK_EQ(args["sql"].get<std::string>(), sql);
+    CHECK_EQ(args["html"].get<std::string>(), std::string("<b>x</b>"));
+    CHECK_EQ(args["tail"].get<std::string>(), std::string("a <"));
+    CHECK_EQ(r.content, std::string(""));
+    // the JSON form carries the same value
+    const auto j = parse_qwen_tool_calls("<tool_call>\n{\"name\": \"run_query\", \"arguments\": {\"sql\": \"" + sql +
+                                         "\"}}\n</tool_call>");
+    CHECK_EQ(j.calls.size(), 1u);
+    if (j.calls.size() == 1) CHECK_EQ(json::parse(j.calls[0].arguments)["sql"].get<std::string>(), sql);
+}

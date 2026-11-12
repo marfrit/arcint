@@ -12,6 +12,7 @@
 
 #include "api/error.h"
 #include "api/generate.h"
+#include "api/raw_trace.h"
 #include "api/metrics.h"
 #include "api/renderer.h"
 #include "api/request_id.h"
@@ -38,6 +39,15 @@ bool prompt_ends_inside_think_block(std::string_view prompt, ChatDialect dialect
     // newline (Gemma 4's) is the prompt's end as it stands.
     for (const auto& [open, close] : think_tag_pairs(dialect)) {
         if (open.ends_with('\n') ? prompt.ends_with(open) : prompt.ends_with(open + "\n")) return true;
+    }
+    return false;
+}
+
+bool prompt_ends_after_think_block(std::string_view prompt, ChatDialect dialect) {
+    // The layout after the closer is the template's, not part of the tag.
+    while (!prompt.empty() && (prompt.back() == '\n' || prompt.back() == ' ')) prompt.remove_suffix(1);
+    for (const auto& [open, close] : think_tag_pairs(dialect)) {
+        if (prompt.ends_with(close)) return true;
     }
     return false;
 }
@@ -547,6 +557,18 @@ json props(const Context& ctx) {
                          // the KV cache layers libllama built, counted from its graph at load
                          {"kv_cache_layers", st.dory.kv_layers}};
          }()},
+        // The unit's --chat-template-kwarg defaults, next to the sampler's: the
+        // typed enable_thinking and every generic key, as the value a request
+        // that does not carry the key gets. An empty object when none was given.
+        {"chat_template_kwargs_default", [&]() {
+             json d = json::object();
+             if (cfg.think_default) d["enable_thinking"] = *cfg.think_default;
+             for (const auto& [k, text] : cfg.chat_template_kwarg_defaults) {
+                 json v = json::parse(text, nullptr, /*allow_exceptions=*/false);
+                 if (!v.is_discarded()) d[k] = std::move(v);
+             }
+             return d;
+         }()},
         {"sampler_defaults",
          {{"temperature", sd.temperature},
           {"top_p", sd.top_p},
@@ -842,6 +864,12 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
         prep.req.has_enable_thinking = true;
     }
 
+    // The operator's other chat_template_kwargs defaults (--chat-template-kwarg
+    // KEY=VALUE): added for every key the request does not carry, so the request's
+    // value wins, an explicit false included. Every route that prepares through
+    // here gets them (chat, /v1/responses, /tokenize's chat form).
+    apply_template_kwarg_defaults(prep.req, ctx.cfg->chat_template_kwarg_defaults);
+
     // A request that still says nothing is the kind of turn the model's template
     // makes of it (ChatDialect::thinks_by_default): for Gemma 4 a non-thinking
     // one. Resolved here, before the render, so the template, the non-thinking
@@ -943,12 +971,16 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
     // split of reasoning from content below follows that, not a guess.
     prep.dialect = ctx.backend->status().dialect;
     prep.think_open = prompt_ends_inside_think_block(prompt, prep.dialect);
+    // Thinking off on the Qwen templates: the block is already closed, and a
+    // closer the model repeats at the answer's lead is dropped by the split.
+    prep.think_closed = !prep.think_open && prompt_ends_after_think_block(prompt, prep.dialect);
     // The split, like the backend's mask, decides the block by token id where
     // the artifact's vocabulary spells a tag as one special token.
     prep.think_ids = ctx.backend->think_block_ids(prep.dialect);
     // The backend has to know the same thing: its mask engages before the first
     // sample, where the API's reasoning split has not seen a token yet.
     prep.input.think_open          = prep.think_open;
+    prep.input.think_closed        = prep.think_closed;
     prep.input.dialect = prep.dialect;
     // The rendered prompt is the one thing that decides what the model saw.
     // When an answer differs from a reference run this is the first question,
@@ -1123,8 +1155,18 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     if (auto err = guarded(prep.request_id, [&] {
             reason = drive(*ctx.backend, prep.input, slot,
                            [](std::string_view, int, const std::string&) { return true; }, stats, raw, &pieces);
-        }))
+        })) {
+        // ARCINT_RAW_TRACE: the turn threw; its partial text and the message.
+        // Nothing of it runs unset, and nothing of it may replace the error.
+        if (raw_trace_on()) {
+            try {
+                const std::string message = err->body.value("error", json::object()).value("message", "");
+                raw_trace_error(prep, "chat", false, raw, message.c_str());
+            } catch (...) {
+            }
+        }
         return *err;
+    }
     log_stats(slot, stats, reason, prep.request_id);
     if (ctx.metrics != nullptr) ctx.metrics->observe_generation(stats);
 
@@ -1134,6 +1176,8 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     // a 200 with finish_reason "abort": that is no OpenAI reason, and a
     // half-buffered tool call would come back as raw content.
     if (reason == FinishReason::Abort) {
+        // ARCINT_RAW_TRACE: the aborted turn's text, unsplit and unparsed
+        if (raw_trace_on()) raw_trace_write(raw_trace_record(prep, "chat", false, finish_reason_name(reason), raw));
         if (stats.abort_cause == AbortCause::ClientGone)
             return HttpResult{200, json::object(), true};
         return HttpResult{503, error_body("the server is stopping; the request was cancelled "
@@ -1147,7 +1191,19 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     // the text split is exactly today's behaviour. The shared extraction keeps
     // the Responses resource on the same bytes.
     ChatGeneration gen;
+    gen.keep_parse_input = raw_trace_on();
     finish_chat_generation(prep, pieces, raw, gen);
+    if (raw_trace_on()) {
+        // ARCINT_RAW_TRACE: what the model wrote next to what the split and the
+        // parse made of it (the pieces above, concatenated, are `raw`)
+        RawTraceRecord r = raw_trace_record(prep, "chat", false, finish_reason_name(reason), raw);
+        r.reasoning      = gen.reasoning;
+        r.tool_parse     = prep.parse_tool_calls;
+        r.parsed_input   = prep.parse_tool_calls ? &gen.parse_input : nullptr;
+        r.calls          = &gen.calls;
+        r.content        = gen.content;
+        raw_trace_write(r);
+    }
     const std::string& content = gen.content;
     const std::vector<ToolCall>& calls = gen.calls;
 
@@ -1281,7 +1337,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     // Reasoning goes out as reasoning_content deltas until the think block
     // closes; from there `content` accumulates the answer and the tool-call
     // logic below sees only that.
-    ReasoningStreamer   reasoning(prep.think_open, prep.dialect, prep.think_ids.open_close_ids);
+    ReasoningStreamer   reasoning(prep.think_start(), prep.dialect, prep.think_ids.open_close_ids);
     std::string         content;       // the answer part of the output so far
     // Reasoning has its own hold-back stream: a multi-byte code point must not
     // be split across two SSE chunks (DESIGN §3.7), and reasoning and content
@@ -1291,6 +1347,13 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     // characters.
     utf8::Streamer      reasoning_stream;
     bool                had_reasoning = false;
+    // ARCINT_RAW_TRACE: the reasoning is kept only for the trace's line
+    const bool          tracing = raw_trace_on();
+    std::string         traced_reasoning;
+    // force_nonempty_content (core/chat.h): the reasoning text is kept only when
+    // the trigger is on, to go out once as content if the block never closes.
+    const bool          force_content = force_nonempty_content_requested(prep.req.chat_template_kwargs);
+    std::string         forced_reasoning;
     auto send_reasoning = [&](const std::string& safe) {
         had_reasoning = true;
         return sse_send(write, chunk(json::array({{{"index", 0},
@@ -1326,6 +1389,8 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
         *ctx.backend, prep.input, slot,
         [&](std::string_view piece, int token_id, const std::string&) -> bool {
             const ReasoningStreamer::Step step = reasoning.push(piece, token_id);
+            if (tracing) traced_reasoning += step.reasoning;
+            if (force_content) forced_reasoning += step.reasoning;
             if (!emit_reasoning(step.reasoning)) {
                 gone = true;
                 return false;
@@ -1377,6 +1442,19 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
             return true;
         },
         stats, raw, nullptr); })) {
+        // ARCINT_RAW_TRACE: the turn threw; its partial text, the split so far
+        // and the message. Nothing of it may replace the error frame.
+        if (tracing) {
+            try {
+                RawTraceRecord r = raw_trace_record(prep, "chat", true, "error", raw);
+                r.reasoning      = traced_reasoning;
+                r.content        = content;
+                r.error          = err->body.value("error", json::object()).value("message", "");
+                if (r.error.empty()) r.error = "error";
+                raw_trace_write(r);
+            } catch (...) {
+            }
+        }
         // the 200 and the first chunk are out: the error goes in the stream
         sse_send(write, err->body);
         write("data: [DONE]\n\n");
@@ -1388,25 +1466,65 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     // An aborted request sends nothing more: a gone client's write would fail
     // anyway, and a buffered tool call must not come back as raw content after
     // the turn was cancelled (DESIGN §3.7; the stop signal too).
-    if (gone || reason == FinishReason::Abort) return;
-    {
-        const ReasoningStreamer::Step last = reasoning.flush();
-        if (!emit_reasoning(last.reasoning)) return;
-        if (!flush_reasoning()) return;
-        if (!last.content.empty()) {
-            content += last.content;
-            if (!prep.parse_tool_calls && !emit_content(last.content)) return;
+    if (gone || reason == FinishReason::Abort) {
+        if (tracing) {
+            RawTraceRecord r = raw_trace_record(prep, "chat", true, finish_reason_name(reason), raw);
+            r.reasoning      = traced_reasoning;
+            r.content        = content;
+            raw_trace_write(r);
         }
+        return;
     }
-
-    std::vector<ToolCall> calls;
-    if (prep.parse_tool_calls) {
-        ToolCallParse parsed = parse_tool_calls(content, prep.dialect, &prep.schemas);
+    // The turn's text is complete here: the split's last bytes and the parse
+    // are computed first (both pure), so the trace's line is written before
+    // any send can fail, then everything goes out in the order it always did.
+    const ReasoningStreamer::Step last = reasoning.flush();
+    if (!last.content.empty()) content += last.content;
+    if (force_content) forced_reasoning += last.reasoning;
+    // force_nonempty_content, streaming (vLLM finalize_generation): the block
+    // never closed and the answer is blank, so the whole reasoning text becomes
+    // the answer. A block that closed with a blank answer is not promoted here
+    // (the reference promotes that case in the non-streaming path only). The
+    // promoted text is sent as it is and is not tool-parsed, as in the
+    // reference's stream (finalize_generation appends it to the delta's content
+    // and runs no tool parser): call markup the model wrote inside a thinking
+    // block that was cut stays text and is never a tool_calls delta (operator,
+    // 2026-11-11). The content of such a turn is blank, so there is no call in
+    // it either and the turn has no tool parse at all.
+    const bool promoted = force_content && reasoning.in_reasoning() &&
+                          promote_reasoning_to_content(prep.req.chat_template_kwargs,
+                                                       forced_reasoning, content);
+    if (promoted) {
+        log::debug("req", "force_nonempty_content: %zu streamed reasoning bytes become the content%s",
+                   forced_reasoning.size(), rid_suffix(prep.request_id).c_str());
+    }
+    const bool         parse_calls = prep.parse_tool_calls && !promoted;
+    const std::string& final_text  = promoted ? forced_reasoning : content;
+    ToolCallParse parsed;
+    if (parse_calls) {
+        parsed = parse_tool_calls(content, prep.dialect, &prep.schemas);
         if (parsed.truncated) {
             log::warn("tools", "unterminated %s block; returned as raw content%s",
                       std::string(tool_call_open(prep.dialect)).c_str(),
                       rid_suffix(prep.request_id).c_str());
         }
+    }
+    if (tracing) {
+        RawTraceRecord r = raw_trace_record(prep, "chat", true, finish_reason_name(reason), raw);
+        r.reasoning      = traced_reasoning + last.reasoning;
+        r.tool_parse     = parse_calls;
+        r.parsed_input   = parse_calls ? &content : nullptr;
+        r.calls          = &parsed.calls;
+        r.content        = parse_calls ? parsed.content : final_text;
+        raw_trace_write(r);
+    }
+    if (!emit_reasoning(last.reasoning)) return;
+    if (!flush_reasoning()) return;
+    if (!last.content.empty() && !prep.parse_tool_calls && !emit_content(last.content)) return;
+    if (promoted && !emit_content(forced_reasoning)) return;
+
+    std::vector<ToolCall> calls;
+    if (parse_calls) {
         calls = std::move(parsed.calls);
         if (parsed.content.size() > streamed) {
             if (!emit_content(std::string_view(parsed.content).substr(streamed))) return;

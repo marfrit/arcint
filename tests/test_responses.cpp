@@ -3617,3 +3617,283 @@ TEST(responses_stored_output_call_ids_are_engine_minted_and_unique) {
     if (msgs.size() != 1) return;
     CHECK_EQ(msgs[0].tool_calls.size(), 2u);
 }
+
+// Review F2: a unit default reasoning_effort is a level a request would have sent.
+// The Responses route states it as reasoning.effort, which lands in the same
+// ChatRequest field the chat route's top-level reasoning_effort does, so it wins
+// over the default; without one the default is the level and goes through the
+// template mapping like a request's.
+TEST(responses_reasoning_effort_beats_the_unit_default_and_the_default_fills_the_gap) {
+    Fixture fx;
+    fx.cfg.chat_template_kwarg_defaults = {{"reasoning_effort", "\"high\""}};
+    {
+        json body = base();
+        body["reasoning"] = {{"effort", "low"}};
+        ResponseRequest r;
+        parse_ok(body, r);
+        PreparedResponse prep;
+        CHECK(!api::prepare_response(fx.ctx, std::move(r), prep).has_value());
+        CHECK_EQ(prep.chat.req.reasoning_effort, std::string("low"));
+        CHECK(!prep.chat.req.chat_template_kwargs.contains("reasoning_effort"));
+    }
+    {
+        ResponseRequest r;
+        parse_ok(base(), r);
+        PreparedResponse prep;
+        CHECK(!api::prepare_response(fx.ctx, std::move(r), prep).has_value());
+        CHECK_EQ(prep.chat.req.reasoning_effort, std::string("high"));
+        CHECK(prep.chat.req.has_enable_thinking && prep.chat.req.enable_thinking);
+    }
+}
+
+// --chat-template-kwarg KEY=VALUE: the Responses route has no chat_template_kwargs
+// of its own, but it prepares through the one prepare_from_chat, so the unit's
+// defaults reach its ChatRequest.
+TEST(responses_route_gets_the_template_kwarg_defaults) {
+    Fixture fx;
+    fx.cfg.chat_template_kwarg_defaults = {{"force_nonempty_content", "true"}};
+    ResponseRequest r;
+    parse_ok(base(), r);
+    PreparedResponse prep;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r), prep).has_value());
+    CHECK(prep.chat.req.chat_template_kwargs.value("force_nonempty_content", json()) == json(true));
+}
+
+// force_nonempty_content (core/chat.h): the Responses route shares the
+// non-streaming extraction (finish_chat_generation) and its own stream promotes
+// the same way the chat stream does: a block that never closed, the reasoning
+// text goes out once as the message item's output_text.
+namespace {
+std::string item_text(const json& output, const char* type) {
+    for (const json& item : output) {
+        if (item.value("type", std::string()) != type) continue;
+        if (item["content"].empty()) return {};
+        return item["content"][0].value("text", std::string());
+    }
+    return "<no item>";
+}
+}  // namespace
+
+TEST(responses_force_nonempty_content_stream_promotes_an_unclosed_block) {
+    StreamFixture fx(/*think_open=*/true);
+    fx.backend.pieces = {{"deep ", 1}, {"thought", 2}};
+    fx.prep.chat.req.chat_template_kwargs = json{{"force_nonempty_content", true}};
+    const Sse s = parse_sse(fx.run());
+    CHECK(!s.events.empty());
+    if (s.events.empty()) return;
+    const json& term = s.events.back().second["response"];
+    CHECK_EQ(item_text(term["output"], "message"), std::string("deep thought"));
+    CHECK_EQ(item_text(term["output"], "reasoning"), std::string("deep thought"));   // the deltas stay
+}
+
+TEST(responses_force_nonempty_content_stream_without_the_trigger_has_no_message) {
+    StreamFixture fx(/*think_open=*/true);
+    fx.backend.pieces = {{"deep ", 1}, {"thought", 2}};
+    const Sse s = parse_sse(fx.run());
+    CHECK(!s.events.empty());
+    if (s.events.empty()) return;
+    const json& term = s.events.back().second["response"];
+    CHECK_EQ(item_text(term["output"], "message"), std::string("<no item>"));
+}
+
+TEST(responses_force_nonempty_content_nonstream_swaps_a_blank_answer) {
+    StreamFixture fx(/*think_open=*/true);
+    fx.backend.pieces = {{"deep thought", 1}, {think_close_tag(), 2}, {"  ", 3}};
+    fx.prep.chat.req.chat_template_kwargs = json{{"force_nonempty_content", true}};
+    const auto lease = fx.slots.acquire_for(0);
+    const api::HttpResult res = api::run_response(fx.ctx, fx.prep, lease.index());
+    CHECK_EQ(res.status, 200);
+    CHECK_EQ(item_text(res.body["output"], "message"), std::string("deep thought"));
+    CHECK_EQ(item_text(res.body["output"], "reasoning"), std::string("<no item>"));
+}
+
+// Review F4 and the missing cases of the force_nonempty_content review. The
+// Responses stream promotes the reasoning of a block that never closed as text
+// (no tool parse of it, as the reference's stream), closes the reasoning item
+// before the message item is added, and stays out of token mode.
+namespace {
+std::string kForceCall() {
+    return std::string(tool_call_tags().open) + "\n{\"name\": \"read_file\", \"arguments\": {}}\n" +
+           std::string(tool_call_tags().close);
+}
+
+bool sse_has_text(const Sse& s, const std::string& needle) {
+    for (const auto& [name, body] : s.events)
+        if (name == "response.output_text.delta" && body.value("delta", std::string()).find(needle) != std::string::npos)
+            return true;
+    return false;
+}
+}  // namespace
+
+TEST(responses_force_nonempty_content_stream_a_call_in_the_unclosed_block_stays_text) {
+    StreamFixture fx(/*think_open=*/true, /*by_ids=*/false, /*tools=*/true);
+    fx.backend.pieces = {{"planning ", 1}, {kForceCall(), 2}};
+    fx.prep.chat.req.chat_template_kwargs = json{{"force_nonempty_content", true}};
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    CHECK(!s.events.empty());
+    if (s.events.empty()) return;
+    // the stream does not tool-parse the promoted text: no function_call item,
+    // the markup is the message item's text as the model wrote it
+    const json& term = s.events.back().second["response"];
+    int calls = 0;
+    for (const json& item : term["output"])
+        if (item.value("type", "") == "function_call") ++calls;
+    CHECK_EQ(calls, 0);
+    CHECK_EQ(item_text(term["output"], "message"), "planning " + kForceCall());
+    CHECK(sse_has_text(s, std::string(tool_call_tags().open)));
+    for (const auto& [name, body] : s.events) CHECK(name.rfind("response.function_call_arguments.", 0) != 0);
+    // the non-streaming resource parses the promoted content, as the reference's
+    // parse() does (extract_reasoning, then _extract_tool_calls)
+    StreamFixture ns(/*think_open=*/true, /*by_ids=*/false, /*tools=*/true);
+    ns.backend.pieces = {{"planning ", 1}, {kForceCall(), 2}};
+    ns.prep.chat.req.chat_template_kwargs = json{{"force_nonempty_content", true}};
+    const auto lease = ns.slots.acquire_for(0);
+    const api::HttpResult res = api::run_response(ns.ctx, ns.prep, lease.index());
+    int ns_calls = 0;
+    for (const json& item : res.body["output"])
+        if (item.value("type", "") == "function_call") ++ns_calls;
+    CHECK_EQ(ns_calls, 1);
+}
+
+// The control: with the kwarg set, a call in the answer after a block that closed
+// is still a function_call item on the stream.
+TEST(responses_force_nonempty_content_stream_a_call_after_a_closed_block_is_still_a_call) {
+    StreamFixture fx(/*think_open=*/true, /*by_ids=*/false, /*tools=*/true);
+    fx.backend.pieces = {{"planning", 1}, {think_close_tag(), 2}, {kForceCall(), 3}};
+    fx.prep.chat.req.chat_template_kwargs = json{{"force_nonempty_content", true}};
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    CHECK(!s.events.empty());
+    if (s.events.empty()) return;
+    const json& term = s.events.back().second["response"];
+    int calls = 0;
+    for (const json& item : term["output"])
+        if (item.value("type", "") == "function_call") ++calls;
+    CHECK_EQ(calls, 1);
+    CHECK(!sse_has_text(s, std::string(tool_call_tags().open)));
+}
+
+TEST(responses_force_nonempty_content_stream_tools_declared_without_markup_promotes_as_before) {
+    StreamFixture fx(/*think_open=*/true, /*by_ids=*/false, /*tools=*/true);
+    fx.backend.pieces = {{"deep ", 1}, {"thought", 2}};
+    fx.prep.chat.req.chat_template_kwargs = json{{"force_nonempty_content", true}};
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    CHECK(!s.events.empty());
+    if (s.events.empty()) return;
+    const json& term = s.events.back().second["response"];
+    CHECK_EQ(item_text(term["output"], "message"), std::string("deep thought"));
+}
+
+TEST(responses_force_nonempty_content_stream_closes_the_reasoning_item_before_the_message_is_added) {
+    StreamFixture fx(/*think_open=*/true);
+    fx.backend.pieces = {{"deep ", 1}, {"thought", 2}};
+    fx.prep.chat.req.chat_template_kwargs = json{{"force_nonempty_content", true}};
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    int reasoning_done = -1, message_added = -1, message_done = -1;
+    int reasoning_index = -1, message_index = -1;
+    for (size_t i = 0; i < s.events.size(); ++i) {
+        const auto& [name, body] = s.events[i];
+        if (name == "response.output_item.done" && body["item"].value("type", "") == "reasoning")
+            reasoning_done = static_cast<int>(i), reasoning_index = body["output_index"].get<int>();
+        if (name == "response.output_item.added" && body["item"].value("type", "") == "message")
+            message_added = static_cast<int>(i), message_index = body["output_index"].get<int>();
+        if (name == "response.output_item.done" && body["item"].value("type", "") == "message")
+            message_done = static_cast<int>(i);
+    }
+    CHECK(reasoning_done >= 0 && message_added >= 0 && message_done >= 0);
+    CHECK(reasoning_done < message_added);   // was: the message was added while the reasoning was in_progress
+    CHECK(message_added < message_done);
+    CHECK_EQ(reasoning_index, 0);
+    CHECK_EQ(message_index, 1);
+    // the reasoning item is completed, and the response is too
+    const json& term = s.events.back().second["response"];
+    CHECK_EQ(term["output"][0]["status"].get<std::string>(), std::string("completed"));
+    CHECK_EQ(term["output"][1]["status"].get<std::string>(), std::string("completed"));
+}
+
+// blank reasoning is never promoted: the stream adds no message item for it.
+TEST(responses_force_nonempty_content_stream_newline_only_reasoning_is_not_promoted) {
+    StreamFixture fx(/*think_open=*/true);
+    fx.backend.pieces = {{"\n\n", 1}};
+    fx.prep.chat.req.chat_template_kwargs = json{{"force_nonempty_content", true}};
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    CHECK(!s.events.empty());
+    if (s.events.empty()) return;
+    const json& term = s.events.back().second["response"];
+    CHECK_EQ(item_text(term["output"], "message"), std::string("<no item>"));
+}
+
+// R2, a by-design pin (green on the code as it stands): a promoted turn that
+// did not end with Stop (max_output_tokens reached inside the think block)
+// is [reasoning incomplete, message incomplete], in that order.
+TEST(responses_force_nonempty_content_stream_promoted_turn_cut_by_length_is_two_incomplete_items) {
+    StreamFixture fx(/*think_open=*/true);
+    fx.backend.pieces = {{"deep ", 1}, {"thought", 2}};
+    fx.backend.reason = FinishReason::Length;
+    fx.prep.chat.req.chat_template_kwargs = json{{"force_nonempty_content", true}};
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    CHECK(!s.events.empty());
+    if (s.events.empty()) return;
+    const json& term = s.events.back().second["response"];
+    CHECK_EQ(term["status"].get<std::string>(), std::string("incomplete"));
+    CHECK_EQ(term["output"].size(), size_t(2));
+    if (term["output"].size() != 2) return;
+    CHECK_EQ(term["output"][0]["type"].get<std::string>(), std::string("reasoning"));
+    CHECK_EQ(term["output"][0]["status"].get<std::string>(), std::string("incomplete"));
+    CHECK_EQ(term["output"][1]["type"].get<std::string>(), std::string("message"));
+    CHECK_EQ(term["output"][1]["status"].get<std::string>(), std::string("incomplete"));
+    CHECK_EQ(item_text(term["output"], "message"), std::string("deep thought"));
+}
+
+TEST(responses_force_nonempty_content_token_mode_stream_is_not_promoted) {
+    StreamFixture fx(/*think_open=*/true);
+    fx.req.token_mode = true;
+    fx.prep.req       = fx.req;
+    fx.backend.pieces = {{"deep ", 1}, {"thought", 2}};
+    fx.prep.chat.req.chat_template_kwargs = json{{"force_nonempty_content", true}};
+    const Sse s = parse_sse(fx.run());
+    check_framing(s);
+    CHECK(!s.events.empty());
+    if (s.events.empty()) return;
+    const json& term = s.events.back().second["response"];
+    CHECK_EQ(item_text(term["output"], "message"), std::string("<no item>"));
+    CHECK_EQ(item_text(term["output"], "reasoning"), std::string("deep thought"));
+    CHECK(!sse_has_text(s, "deep"));
+}
+
+// The recorded behaviour: reasoning_tokens is counted before the swap and stays,
+// so the resource can report reasoning tokens with no reasoning item.
+TEST(responses_force_nonempty_content_reasoning_tokens_stay_after_the_swap) {
+    StreamFixture fx(/*think_open=*/true, /*by_ids=*/true);
+    fx.backend.pieces = {{"a", 10}, {"b", 11}, {think_close_tag(), 248069}, {"  ", 12}};
+    fx.prep.chat.req.chat_template_kwargs = json{{"force_nonempty_content", true}};
+    const auto lease = fx.slots.acquire_for(0);
+    const api::HttpResult r = api::run_response(fx.ctx, fx.prep, lease.index());
+    CHECK_EQ(r.status, 200);
+    if (r.status != 200) return;
+    CHECK_EQ(item_text(r.body["output"], "message"), std::string("ab"));
+    CHECK_EQ(item_text(r.body["output"], "reasoning"), std::string("<no item>"));
+    CHECK_EQ(r.body["usage"]["output_tokens_details"]["reasoning_tokens"].get<int>(), 2);
+}
+
+// The unit default (--chat-template-kwarg force_nonempty_content=true) reaches a
+// Responses turn through prepare_response and promotes it end to end.
+TEST(responses_force_nonempty_content_unit_default_promotes_end_to_end) {
+    ReplayFixture fx;
+    fx.cfg.chat_template_kwarg_defaults = {{"force_nonempty_content", "true"}};
+    fx.backend.pieces = {{"deep thought", 1}};
+    ResponseRequest r;
+    parse_ok(base(), r);
+    PreparedResponse prep;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r), prep).has_value());
+    prep.chat.think_open = true;   // the stub render does not open a think block
+    const api::HttpResult res = api::run_response(fx.ctx, prep, 0);
+    CHECK_EQ(res.status, 200);
+    if (res.status != 200) return;
+    CHECK_EQ(item_text(res.body["output"], "message"), std::string("deep thought"));
+}

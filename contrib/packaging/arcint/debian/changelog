@@ -1,3 +1,19 @@
+arcint (1.6.2-1) trixie; urgency=medium
+
+  * --chat-template-kwarg KEY=VALUE (a unit default for chat_template_kwargs)
+    and --chat-template-file PATH. chat_template_kwargs.force_nonempty_content
+    is acted on as vLLM's Nemotron-V3 parser does; a stream sends the promoted
+    reasoning as text, with no tool-call parse.
+  * --tool-grammar enforces a string parameter's listed values and lets a call
+    end on an inline parameter closer; a think closer the model repeats no
+    longer reaches content; ARCINT_RAW_TRACE writes the generated text a turn.
+  * OpenCL: Q4_0, Q8_0, IQ4_XS and IQ4_NL at 2 to 16 columns read each weight
+    once (0115); dense Q3_K (0116) and Q2_K (0117) run on the card; Dory's
+    forward with a third fewer graph nodes (0113, 0114); a weight the card
+    declines at load is reported (0111, 0112).
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Thu, 12 Nov 2026 11:00:00 +0100
+
 arcint (1.6.1-1) trixie; urgency=medium
 
   * Gemma 4 E4B on the fast path at both KV types: flash attention at head size

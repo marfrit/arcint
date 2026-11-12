@@ -1,8 +1,9 @@
 # arcint — Design
 
-State as of 2026-11-07: arcint **1.6.1** on llama.cpp **`3e4dfa8`** with the
-patch series `contrib/llama.cpp/patches` 0001-0100 (93 patches; 0031, 0055,
-0061, 0076 and 0078 retired, 0073 on its own prefill-gather branch, 0085 never assigned). One engine: libllama with
+State as of 2026-11-12: arcint **1.6.2** on llama.cpp **`3e4dfa8`** with the
+patch series `contrib/llama.cpp/patches`: 33 patch files, the 12 folded ones
+(`0000-01` to `0000-12`, the former 0001-0096; `FOLDED.md` there resolves the old
+numbers) and 0097-0117. One engine: libllama with
 ggml's OpenCL backend and arcint's Intel kernels. Three language services run
 in production on two Intel Arc cards: the dense Qwen3.8-27B agent and
 Qwen3.8-Flash-Next (125B-A6B, on demand) on the 24 GB Arc Pro B60, the MoE
@@ -229,6 +230,19 @@ measured on 2026-11-07.
   decode 14.7 -> 23.7 t/s, prefill 540 -> 665 t/s; the red arm printed no
   DOWNGRADE line, because a weight-fed op declined by `supports_op` goes to the
   CPU without a key. That is an open gap in the downgrade accounting.
+  Patches 0113 and 0114 (2026-11-07) deviate from the PR's graph for speed, which
+  the operator allowed for Dory, judged at the answer-level bar: the scale vectors'
+  constant chains are computed once at load in F32 from the file's bytes, the q norm's
+  1/sqrt(hd) moves into its vector, the SwiGLU is one GLU node, and a residual that is
+  already a norm's output is not normalised again (`LLAMA_DORY_FOLD`, 2 by default, 1
+  the folded vectors only, 0 the PR's graph); OpenCL runs the nGPT residual update
+  as one kernel (`GGML_OPENCL_FUSE_NGPT`). Launching nodes a forward on the CPU
+  graph (`measured-here`): 3,771 -> 2,535 at 2 loops q8_0:q4_0, 6,461 -> 4,341 at
+  4; the card's launches about 3,151 -> 1,580 and 5,397 -> 2,704 (`inferred`, the
+  backend's fusions applied by op adjacency). On the CPU, KL against the PR's graph
+  is 0 with the folded vectors and 0.0080 with the norms dropped, against 0.0090
+  for a control that moves every layer's output by one ulp: this model's rounding
+  floor, the same as the A770's 0.0091 against the CPU. On the cards (`measured-here`, 2026-11-07, served, a 5.9k-token prompt and a 400-token greedy decode, base = the build without the fold, 2 loops q8_0:q4_0): decode 28.6 -> 39.1 t/s on the B60 and 19.1 -> 28.5 on the A770; KL against the CPU running the PR graph is unchanged within 0.0004 nats at 2 loops f16 (B60 0.00787 -> 0.00787, A770 0.00796 -> 0.00792; `contrib/llama.cpp/README.md`, sections 0113 and 0114).
 
 | service | model | architecture | served file | card |
 |---|---|---|---|---|
@@ -322,9 +336,9 @@ The cards (`measured-here` unless marked):
 
 ### 3.2 Kernels: the patch series
 
-`contrib/llama.cpp/patches` holds 74 patches against the pin (0001-0079; 0031,
-0055 and 0061 dropped earlier, 0076 retired by measurement, 0073 on its own
-prefill-gather branch), each with its
+`contrib/llama.cpp/patches` holds 33 patch files against the pin: 0001-0096
+folded into 12 (`0000-01` to `0000-12`; `FOLDED.md` there resolves the old
+numbers, which stay as labels in the record) and 0097-0117, each with its
 measurement, KL, red case and review in `contrib/llama.cpp/README.md`
 (`measured-here` throughout). By what they change:
 
@@ -467,13 +481,19 @@ greedy decision. min-p follows llama.cpp (`llama_sampler_min_p_apply`,
 top-p. Seeded; an unseeded request gets a logged seed. Defaults chain request
 > operator flags (`--temp`, `--top-p`, `--top-k`, `--min-p`,
 `--repetition-penalty`, `--presence-penalty`, `--chat-template-kwarg
-enable_thinking=BOOL`) > the model card's row in the GGUF (`general.sampling.*`,
+enable_thinking=BOOL`; `--chat-template-kwarg KEY=VALUE` is the same default for any
+other chat_template_kwargs key, request first, `/props` `chat_template_kwargs_default`)
+> the model card's row in the GGUF (`general.sampling.*`,
 §8.8) > a provisional row for a GGUF without one; `/props` reports values and
 provenance: `operator`, `card` or `provisional` (`code`).
 
 ### 3.7 Tokenizer, templates, tool calls
 
-- Tokenizer and chat template come from the GGUF.
+- Tokenizer and chat template come from the GGUF. `--chat-template-file PATH`
+  replaces the template text (llama.cpp's flag; the file is read and parsed at
+  start, a bad one stops the start, there is no fallback to the embedded text);
+  `/props` `chat_template_caps.template_source` says `gguf`, `file` or
+  `chatml-fallback`.
 - Incremental detokenisation never splits a UTF-8 code point across SSE
   chunks; stop strings and token ids; `usage` in every response (`code`,
   unit-tested).
@@ -484,6 +504,41 @@ provenance: `operator`, `card` or `provisional` (`code`).
   it and rewritten only where it cannot take it (minimal -> low, high -> xhigh,
   xhigh -> high); `/props` publishes the levels as `reasoning_effort_levels`
   (`code`).
+- **`force_nonempty_content`** (`chat_template_kwargs`, the request's or the unit
+  default of `--chat-template-kwarg`; `code`, `promote_reasoning_to_content` in
+  `src/core/chat.cpp`, after vLLM's Nemotron-V3 reasoning parser, main
+  1479deb0392f). The trigger is the JSON boolean `true`; a unit default of
+  anything else fails at start. Non-streaming (chat and Responses,
+  `finish_chat_generation`): after the reasoning split, empty or blank content
+  with reasoning text takes the reasoning as the content, before the tool-call
+  parse. Streaming: only a think block that never closed is promoted, at the end
+  of the turn, and the promoted text is sent as content as it is, with no
+  tool-call parse (the reference's `finalize_generation` appends it to the
+  delta's content and runs no tool parser; operator, 2026-11-11: a call quoted
+  inside a thinking block that was cut must not come back as a call). So the
+  two paths differ on a call written inside a block that never closed, as they
+  do in the reference: the non-streaming result parses it, the stream sends the
+  markup as text with the generation's own finish reason. Blank
+  reasoning (empty or ASCII whitespace only) is never promoted, on any path. On the
+  Responses stream the reasoning item is closed before the message item is added
+  (as on the closed-block path), and token mode is exempt; a promoted turn that
+  did not end with Stop (`max_output_tokens` reached inside the block) is
+  [reasoning `incomplete`, message `incomplete`], in that order. Recorded
+  differences from the reference:
+  no swap when the reasoning is blank; blankness is tested on ASCII whitespace
+  (space, \t \n \r \v \f), so text that is only a non-ASCII space (U+00A0,
+  U+3000) counts as text where the reference's `str.strip()` reads it as blank
+  (`code`, `text_is_blank`; no test pins it); the old blank content is
+  dropped, not kept as reasoning; `reasoning_tokens` is counted before the swap
+  and stays, so a non-streaming Responses resource can report reasoning tokens
+  with no reasoning item; the non-streaming content has its edge newlines
+  stripped by the split while the stream sends the reasoning as streamed; the
+  `enable_thinking is False` trigger is not built, because a non-thinking prompt
+  that ends in a closed think block already starts in content (`ThinkStart::Closed`).
+  Enforced by `tests/test_force_content.cpp` and the `responses_force_nonempty_content_*`
+  cases of `tests/test_responses.cpp`; the item order and statuses of the cut
+  promoted turn by `responses_force_nonempty_content_stream_promoted_turn_cut_by_length_is_two_incomplete_items`,
+  a by-design pin (green on the code as it stands).
 - **Tool calls.** The models' native format is parsed into OpenAI
   `tool_calls`; requests without `tools` get raw text. A template that
   iterates arguments as a mapping is handed the parsed object; minja

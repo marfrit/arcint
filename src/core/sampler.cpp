@@ -232,12 +232,23 @@ void Sampler::build_think_id_table() {
     }
 }
 
-void Sampler::start_in_think_block(bool open) {
+void Sampler::start_in_think_block(bool open, bool after_close) {
     measure_think_tags();
     build_think_id_table();
     // The template wrote the opener as the lead of the turn: the block is
     // already open before the first token. Otherwise the first tokens decide.
     think_state_ = (tracks_think() && open) ? ThinkState::thinking : ThinkState::undecided;
+    // The template closed an empty block: a closer repeated at the lead is
+    // skipped as the split skips it. The ids per pair, aligned with the close
+    // tags: the paired table, or the flattened one when that is all there is.
+    think_after_close_ = think_state_ == ThinkState::undecided && after_close;
+    think_close_lead_.clear();
+    think_close_pairs_ = params_.think_ids.open_close_ids;
+    if (think_close_pairs_.empty() && params_.think_ids.close_ids.size() == params_.think_ids.close_tags.size()) {
+        for (size_t i = 0; i < params_.think_ids.close_ids.size(); ++i)
+            think_close_pairs_.emplace_back(i < params_.think_ids.open_ids.size() ? params_.think_ids.open_ids[i] : -1,
+                                            params_.think_ids.close_ids[i]);
+    }
     // llava: the answer row needs a block that actually opened, not merely a
     // request that declared thinking.
     think_block_ever_open_ = think_state_ == ThinkState::thinking;
@@ -437,6 +448,21 @@ void Sampler::observe_think_(std::string_view piece, int token) {
             think_tail_.clear();
             return;   // the opener token's whole piece is the marker
         }
+    }
+
+    // ThinkStart::Closed: a closer the model repeats at the lead is the
+    // template's, skipped with its layout by the split's own rule; the state
+    // stays undecided until the answer starts, and the opener rules below then
+    // see what follows it.
+    std::string after_close_rest;
+    if (think_state_ == ThinkState::undecided && think_after_close_) {
+        bool dropped = false;
+        if (repeated_closer_step(think_close_lead_, piece, token, params_.think_ids.close_tags, think_close_pairs_,
+                                 dropped) == LeadState::Hold)
+            return;
+        think_after_close_ = false;
+        after_close_rest.swap(think_close_lead_);
+        piece = after_close_rest;
     }
 
     if (think_state_ == ThinkState::undecided) {

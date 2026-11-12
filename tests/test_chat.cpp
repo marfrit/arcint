@@ -831,3 +831,166 @@ TEST(stub_render_keeps_reasoning_only_after_the_last_user_message) {
     const std::string block = pairs[0].first + "\n" + "LATE-REASONING" + "\n" + pairs[0].second;
     CHECK(prompt.find(block) != std::string::npos);
 }
+
+// ---------------------------------------------------------------------------
+// --chat-template-kwarg defaults applied where the request is prepared
+// (apply_template_kwarg_defaults). The request's own value always wins.
+namespace {
+ChatRequest parsed_chat(const nlohmann::json& extra) {
+    nlohmann::json body{{"messages", nlohmann::json::array({{{"role", "user"}, {"content", "hi"}}})}};
+    for (auto it = extra.begin(); it != extra.end(); ++it) body[it.key()] = it.value();
+    ChatRequest req;
+    const auto  err = parse_chat_request(body, req);
+    if (err) t::fail(__FILE__, __LINE__, "parse_chat_request: " + *err);
+    return req;
+}
+}  // namespace
+
+TEST(chat_template_kwarg_default_fills_an_absent_key) {
+    ChatRequest req = parsed_chat(nlohmann::json::object());
+    apply_template_kwarg_defaults(req, {{"force_nonempty_content", "true"}, {"depth", "3"}, {"tone", "\"warm\""}});
+    CHECK(req.chat_template_kwargs.value("force_nonempty_content", nlohmann::json()) == nlohmann::json(true));
+    CHECK(req.chat_template_kwargs.value("depth", nlohmann::json()) == nlohmann::json(3));
+    CHECK(req.chat_template_kwargs.value("tone", nlohmann::json()) == nlohmann::json("warm"));
+    // ... and it reaches the template context like a request's own key
+    std::string err;
+    const nlohmann::json extra = template_context(req, err);
+    CHECK(err.empty());
+    CHECK(extra.value("depth", nlohmann::json()) == nlohmann::json(3));
+}
+
+TEST(chat_template_kwarg_default_loses_to_the_request) {
+    // an explicit false beats a default true; a different value beats it too
+    ChatRequest req = parsed_chat({{"chat_template_kwargs", {{"force_nonempty_content", false}, {"depth", 9}}}});
+    apply_template_kwarg_defaults(req, {{"force_nonempty_content", "true"}, {"depth", "3"}});
+    CHECK(req.chat_template_kwargs["force_nonempty_content"] == nlohmann::json(false));
+    CHECK(req.chat_template_kwargs["depth"] == nlohmann::json(9));
+}
+
+TEST(chat_template_kwarg_default_treats_a_request_null_as_absent) {
+    ChatRequest req = parsed_chat({{"chat_template_kwargs", {{"force_nonempty_content", nullptr}}}});
+    apply_template_kwarg_defaults(req, {{"force_nonempty_content", "true"}});
+    CHECK(req.chat_template_kwargs["force_nonempty_content"] == nlohmann::json(true));
+}
+
+TEST(chat_template_kwarg_default_preserve_thinking_is_the_typed_field) {
+    ChatRequest a = parsed_chat(nlohmann::json::object());
+    apply_template_kwarg_defaults(a, {{"preserve_thinking", "true"}});
+    CHECK(a.has_preserve_thinking);
+    CHECK(a.preserve_thinking);
+    // the request's own false wins
+    ChatRequest b = parsed_chat({{"chat_template_kwargs", {{"preserve_thinking", false}}}});
+    apply_template_kwarg_defaults(b, {{"preserve_thinking", "true"}});
+    CHECK(b.has_preserve_thinking);
+    CHECK(!b.preserve_thinking);
+}
+
+TEST(chat_template_kwarg_default_none_configured_changes_nothing) {
+    ChatRequest req = parsed_chat({{"chat_template_kwargs", {{"x", 1}}}});
+    const nlohmann::json before = req.chat_template_kwargs;
+    apply_template_kwarg_defaults(req, {});
+    CHECK(req.chat_template_kwargs == before);
+    CHECK(!req.has_enable_thinking);
+}
+
+TEST(chat_template_kwarg_parse_default_forms) {
+    std::string    key;
+    nlohmann::json v;
+    CHECK(!parse_template_kwarg_default("a=true", key, v));
+    CHECK_EQ(key, std::string("a"));
+    CHECK(v == nlohmann::json(true));
+    CHECK(!parse_template_kwarg_default("a=1.5", key, v));
+    CHECK(v == nlohmann::json(1.5));
+    CHECK(!parse_template_kwarg_default("a=\"x\"", key, v));
+    CHECK(v == nlohmann::json("x"));
+    CHECK(!parse_template_kwarg_default("a=bare words", key, v));
+    CHECK(v == nlohmann::json("bare words"));
+    CHECK(!parse_template_kwarg_default("a={\"k\":[1,2]}", key, v));
+    CHECK(v.is_object());
+    // an unterminated JSON-looking value is bare text, not half a parse
+    CHECK(!parse_template_kwarg_default("a=[1,", key, v));
+    CHECK(v == nlohmann::json("[1,"));
+    // the first '=' splits; the value may hold more
+    CHECK(!parse_template_kwarg_default("a=b=c", key, v));
+    CHECK(v == nlohmann::json("b=c"));
+    CHECK(parse_template_kwarg_default("a=null", key, v).has_value());
+    CHECK(parse_template_kwarg_default("tools=1", key, v).has_value());
+    CHECK(parse_template_kwarg_default("preserve_thinking=0", key, v).has_value());
+}
+
+// Review F2: a unit default reasoning_effort is a level a request would have
+// sent. A request that states its own level (top-level reasoning_effort, the
+// Responses reasoning.effort, or the kwarg) keeps it, and the default goes through
+// the mapping a request's level gets.
+namespace {
+// A template that reads the variable and quotes low and xhigh (no 'high').
+const char* kEffortTemplate =
+    "{% if reasoning_effort == 'low' %}L{% elif reasoning_effort == 'xhigh' %}X{% endif %}";
+
+nlohmann::json effort_context(ChatRequest& req) {
+    std::string err;
+    const nlohmann::json extra = template_context(req, err, kEffortTemplate);
+    CHECK(err.empty());
+    return extra;
+}
+}  // namespace
+
+TEST(chat_template_kwarg_default_reasoning_effort_loses_to_the_requests_top_level_level) {
+    ChatRequest req = parsed_chat({{"reasoning_effort", "low"}});
+    apply_template_kwarg_defaults(req, {{"reasoning_effort", "\"high\""}});
+    const nlohmann::json extra = effort_context(req);
+    CHECK(extra.value("reasoning_effort", nlohmann::json()) == nlohmann::json("low"));
+}
+
+TEST(chat_template_kwarg_default_reasoning_effort_loses_to_the_requests_kwarg) {
+    ChatRequest req = parsed_chat({{"chat_template_kwargs", {{"reasoning_effort", "low"}}}});
+    apply_template_kwarg_defaults(req, {{"reasoning_effort", "\"high\""}});
+    const nlohmann::json extra = effort_context(req);
+    CHECK(extra.value("reasoning_effort", nlohmann::json()) == nlohmann::json("low"));
+}
+
+TEST(chat_template_kwarg_default_reasoning_effort_goes_through_the_mapping) {
+    // no request level: the default high reaches a template that names xhigh as xhigh
+    ChatRequest req = parsed_chat(nlohmann::json::object());
+    apply_template_kwarg_defaults(req, {{"reasoning_effort", "\"high\""}});
+    const nlohmann::json extra = effort_context(req);
+    CHECK(extra.value("reasoning_effort", nlohmann::json()) == nlohmann::json("xhigh"));
+    CHECK(req.has_enable_thinking && req.enable_thinking);   // a level other than none is thinking on
+}
+
+TEST(chat_template_kwarg_default_reasoning_effort_none_is_thinking_off_without_a_level) {
+    ChatRequest req = parsed_chat(nlohmann::json::object());
+    apply_template_kwarg_defaults(req, {{"reasoning_effort", "\"none\""}});
+    CHECK(req.has_enable_thinking);
+    CHECK(!req.enable_thinking);
+    const nlohmann::json extra = effort_context(req);
+    CHECK(!extra.contains("reasoning_effort"));   // none passes no level, as a request's none
+    CHECK(extra.value("enable_thinking", nlohmann::json()) == nlohmann::json(false));
+    // a request that states thinking keeps it
+    ChatRequest on = parsed_chat({{"chat_template_kwargs", {{"enable_thinking", true}}}});
+    apply_template_kwarg_defaults(on, {{"reasoning_effort", "\"none\""}});
+    CHECK(on.enable_thinking);
+}
+
+TEST(chat_template_kwarg_parse_default_reasoning_effort_values) {
+    std::string    key;
+    nlohmann::json v;
+    for (const char* l : {"none", "off", "minimal", "low", "medium", "high", "xhigh"})
+        CHECK(!parse_template_kwarg_default(std::string("reasoning_effort=") + l, key, v));
+    CHECK(parse_template_kwarg_default("reasoning_effort=extreme", key, v).has_value());
+    CHECK(parse_template_kwarg_default("reasoning_effort=3", key, v).has_value());
+}
+
+// Review F5: the trigger reads the JSON boolean only, so a default of anything else
+// would be accepted and never fire.
+TEST(chat_template_kwarg_parse_default_force_nonempty_content_values) {
+    std::string    key;
+    nlohmann::json v;
+    CHECK(!parse_template_kwarg_default("force_nonempty_content=true", key, v));
+    CHECK(!parse_template_kwarg_default("force_nonempty_content=false", key, v));
+    for (const char* bad : {"1", "True", "yes", "\"true\"", "0", "x"}) {
+        const auto err = parse_template_kwarg_default(std::string("force_nonempty_content=") + bad, key, v);
+        CHECK(err.has_value());
+        if (err) CHECK(err->find("true or false") != std::string::npos);
+    }
+}

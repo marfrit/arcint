@@ -1,5 +1,6 @@
 #include "config.h"
 
+#include "core/chat.h"
 #include "core/sampling.h"
 
 #include <cerrno>
@@ -181,6 +182,11 @@ std::string usage_text() {
         "  --queue-timeout S         seconds a request waits for a lane before a 503\n"
         "                            with the lane's free count (default: 0, refuse at\n"
         "                            once)\n"
+        "  --chat-template-file PATH replace the GGUF's embedded chat template with the\n"
+        "                            jinja text of PATH (llama.cpp's flag); a missing,\n"
+        "                            empty or unparsable file stops the start, with no\n"
+        "                            fallback to the embedded one. /props\n"
+        "                            chat_template_caps.template_source reads \"file\"\n"
         "  --http-threads N          HTTP worker threads (default: library default)\n"
         "  --api-key KEY             require `Authorization: Bearer KEY` on every\n"
         "                            route but /health (a CORS preflight is exempt).\n"
@@ -315,10 +321,29 @@ std::string usage_text() {
         "  --loop-guard-door-grace K more counted lines after detection before the\n"
         "                            ladder's nudge, while the door is open (default\n"
         "                            20)\n"
-        "  --chat-template-kwarg enable_thinking=BOOL\n"
-        "                            template default when the request sends neither\n"
+        "  --chat-template-kwarg KEY=VALUE\n"
+        "                            unit default of one chat_template_kwargs key; repeat\n"
+        "                            for more. VALUE is JSON when it parses as JSON (true,\n"
+        "                            3, \"text\"), else the bare text is a string; null is\n"
+        "                            refused, as are the engine's own context names\n"
+        "                            (messages, tools, bos_token, ...) and a repeated key.\n"
+        "                            reasoning_effort=LEVEL (none, off, minimal, low,\n"
+        "                            medium, high, xhigh) is the level a request gets that\n"
+        "                            states none, by its top-level reasoning_effort, its\n"
+        "                            Responses reasoning.effort or its kwargs; it goes\n"
+        "                            through the mapping a request's level gets, and it\n"
+        "                            also sets the thinking switch (none or off: off, any\n"
+        "                            other level: on), so it must agree with\n"
+        "                            enable_thinking=BOOL when both are given.\n"
+        "                            A request that carries the key keeps its own value\n"
+        "                            (false included). enable_thinking=BOOL keeps its\n"
+        "                            meaning: the default when the request sends neither\n"
         "                            chat_template_kwargs.enable_thinking nor\n"
-        "                            reasoning_effort; only enable_thinking exists\n"
+        "                            reasoning_effort. preserve_thinking must be BOOL.\n"
+        "                            force_nonempty_content must be true or false (the JSON\n"
+        "                            booleans; 1, yes, True stop the start): true makes a\n"
+        "                            turn whose answer is empty answer with its reasoning\n"
+        "                            (also as a request's chat_template_kwargs; see docs).\n"
         "\n"
         "misc\n"
         "  -v, -vv                   raise console verbosity\n"
@@ -761,16 +786,32 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (eq == std::string_view::npos) return fail("--chat-template-kwarg needs key=value");
             const std::string_view key = kv.substr(0, eq);
             const std::string_view val = kv.substr(eq + 1);
-            if (key != "enable_thinking") {
-                return fail("--chat-template-kwarg understands only enable_thinking; an "
-                            "accepted-but-ignored key would be a lie");
-            }
-            if (val == "true" || val == "1") {
-                cfg.think_default = true;
-            } else if (val == "false" || val == "0") {
-                cfg.think_default = false;
+            if (key == "enable_thinking") {
+                // The typed switch: the render path and the sampler row read it.
+                if (cfg.think_default)
+                    return fail("--chat-template-kwarg enable_thinking given twice");
+                if (val == "true" || val == "1") {
+                    cfg.think_default = true;
+                } else if (val == "false" || val == "0") {
+                    cfg.think_default = false;
+                } else {
+                    return fail("--chat-template-kwarg enable_thinking needs true or false");
+                }
             } else {
-                return fail("--chat-template-kwarg enable_thinking needs true or false");
+                std::string    k;
+                nlohmann::json jv;
+                if (auto err = parse_template_kwarg_default(kv, k, jv)) return fail(*err);
+                for (const auto& d : cfg.chat_template_kwarg_defaults)
+                    if (d.first == k) return fail("--chat-template-kwarg " + k + " given twice");
+                // A bare value with invalid UTF-8 is a string json cannot serialise
+                // (dump throws type_error 316): a config error, not an abort.
+                std::string text;
+                try {
+                    text = jv.dump();
+                } catch (const std::exception&) {
+                    return fail("--chat-template-kwarg " + k + ": the value is not valid UTF-8");
+                }
+                cfg.chat_template_kwarg_defaults.emplace_back(std::move(k), std::move(text));
             }
         } else if (arg == "--served-model-name") {
             // An empty value is refused rather than folded into "not given":
@@ -781,6 +822,10 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
                 return fail("--served-model-name needs a non-empty name");
             }
             cfg.served_model_name = std::string(v);
+        } else if (arg == "--chat-template-file") {
+            if (!value(v) || v.empty()) return fail("--chat-template-file needs a path");
+            if (!cfg.chat_template_file.empty()) return fail("--chat-template-file given twice");
+            cfg.chat_template_file = std::string(v);
         } else if (arg == "--queue-timeout") {
             if (!value(v) || !parse_double(v, cfg.queue_timeout_s)) {
                 return fail("--queue-timeout needs a number of seconds");
@@ -831,8 +876,31 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
 
     // ------------------------------------------------------------ validation
     if (cfg.stub && !cfg.gguf_path.empty()) return fail("--gguf and --stub are mutually exclusive");
+    // llama.cpp's --chat-template-file: the file's text replaces the GGUF's. Read
+    // here, after --help/--version have returned, so a unit does not start on a
+    // template it cannot use; the stub has no template to replace, and ignoring
+    // the flag there would be a silent fallback.
+    if (!cfg.chat_template_file.empty()) {
+        if (cfg.stub) return fail("--chat-template-file needs a model (--gguf); --stub has no chat template");
+        if (auto err = load_chat_template_file(cfg.chat_template_file, cfg.chat_template_text)) return fail(*err);
+    }
     if (!cfg.stub && cfg.gguf_path.empty())
         return fail("nothing to serve: pass --gguf FILE, or --stub for the device-free stub backend");
+    // The unit's thinking switch and its reasoning_effort default are one setting
+    // in a request (none/off turn thinking off, every other level on): two
+    // defaults that disagree would contradict each other on every request.
+    if (cfg.think_default) {
+        for (const auto& d : cfg.chat_template_kwarg_defaults) {
+            if (d.first != "reasoning_effort") continue;
+            const nlohmann::json lv = nlohmann::json::parse(d.second, nullptr, false);
+            const bool off = lv.is_string() && (lv.get<std::string>() == "none" || lv.get<std::string>() == "off");
+            if (off == *cfg.think_default)
+                return fail("--chat-template-kwarg enable_thinking=" +
+                            std::string(*cfg.think_default ? "true" : "false") +
+                            " contradicts reasoning_effort=" + lv.get<std::string>() +
+                            " (none/off mean thinking off, every other level thinking on)");
+        }
+    }
     // --tts (docs/milestone-1.2.0.md D4/D5): the operator-local profile
     // directory may come from the environment instead of the flag.
     if (cfg.tts && cfg.tts_profiles.empty()) {

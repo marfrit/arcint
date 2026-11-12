@@ -136,6 +136,15 @@ ToolSchemas tool_schemas(const std::vector<ToolSpec>& tools);
 // mtmd_tokenize() finds it (`docs/milestone-1.2.0.md §3`).
 inline constexpr const char* kMediaMarker = "<__media__>";
 
+// --chat-template-file PATH: reads the template text verbatim (llama.cpp's
+// read_file; no trimming) and checks that it can serve: the file exists and is
+// readable, is not empty or blank, and the vendored minja parses it. Returns the
+// error message (it names the path), or nullopt with `text` set. No fallback to
+// any other template: a unit that asked for a file does not start without it.
+// What it cannot check is a template that parses but renders wrongly for the
+// model; that needs the GGUF. Enforced by test_template_file.cpp's chat_template_file_* cases.
+std::optional<std::string> load_chat_template_file(const std::string& path, std::string& text);
+
 // The names a chat_template_kwargs key must not take, because the vendored
 // minja already owns them in the template context:
 //   - the six keys apply() sets before it merges extra_context
@@ -168,6 +177,59 @@ bool reserved_template_context_key(std::string_view key);
 // Enforced by test_chat.cpp's and test_chat_render.cpp's reasoning_effort_* cases.
 nlohmann::json template_context(const ChatRequest& req, std::string& error,
                                 std::string_view template_src = {});
+
+// --chat-template-kwarg KEY=VALUE for a key other than enable_thinking: the
+// unit default of one chat_template_kwargs key. VALUE is JSON when it parses as
+// JSON (true, false, a number, a quoted string, an object or array) and the
+// bare text as a string otherwise; `null` is refused (a null reads as absent
+// everywhere else, so a default of null would mean nothing). A reserved name
+// (reserved_template_context_key) is refused, and preserve_thinking must be a
+// boolean, as in a request. Returns the error message, or nullopt with `key` and
+// `value` set. Enforced by test_config.cpp's config_chat_template_kwarg_* cases.
+std::optional<std::string> parse_template_kwarg_default(std::string_view kv, std::string& key,
+                                                        nlohmann::json& value);
+
+// Adds each configured default (key, JSON text) the request does not carry in
+// its own chat_template_kwargs; the request's value always wins, an explicit
+// false included, and a null in the request was dropped at parse time so it
+// reads as absent. preserve_thinking lands in its typed field, the rest in the
+// passthrough object. reasoning_effort is the exception: it is a level, so it
+// lands in the typed ChatRequest::reasoning_effort (which template_context maps
+// for the template, as it does a request's own) unless the request stated one by
+// the top-level field, the Responses reasoning.effort or its kwargs. It also
+// sets the thinking switch when no one else has, for every level: none/off turn
+// thinking off, any other level turns it on (on a template that does not think by
+// default, a non-off unit level makes every silent request a thinking turn, as a
+// request's top-level reasoning_effort or Responses reasoning.effort does; a level
+// a request sends inside chat_template_kwargs sets no switch). Enforced by test_chat.cpp's chat_template_kwarg_default_*.
+void apply_template_kwarg_defaults(ChatRequest& req,
+                                   const std::vector<std::pair<std::string, std::string>>& defaults);
+
+// force_nonempty_content (NVIDIA's Dory1.0-4B model card tells agents to send
+// chat_template_kwargs.force_nonempty_content=true; its chat template ignores
+// the name, `measured-here`, so the server acts on it, as vLLM's Nemotron-V3
+// reasoning parser does: `code`, vllm/parser/nemotron_v3.py
+// _should_force_content / extract_reasoning, abstract_parser.py
+// finalize_generation, main 1479deb0392f).
+//
+// The trigger is the effective kwarg (the request's, else the unit default of
+// --chat-template-kwarg) being the JSON boolean true; the string "true" and the
+// number 1 do not trigger (the reference tests `is True`).
+bool force_nonempty_content_requested(const nlohmann::json& chat_template_kwargs);
+
+// true when `text` is empty or only ASCII whitespace (space, \t \n \r \v \f): the
+// ASCII part of Python's str.strip() set, the reference's blank test. A non-ASCII
+// space (U+00A0, U+3000) counts as text here; a recorded difference (DESIGN 3.7).
+bool text_is_blank(std::string_view text);
+
+// The one decision all three response paths use (non-streaming, chat stream,
+// Responses stream): true when the kwarg is set, the reasoning is not blank and
+// the content is blank (text_is_blank). Then the answer is the reasoning text.
+// Pure. Deviation from the reference: it also swaps when the reasoning is blank
+// (content=None, reasoning=whitespace); there is nothing to promote then, so this
+// does not. Enforced by test_force_content.cpp.
+bool promote_reasoning_to_content(const nlohmann::json& chat_template_kwargs,
+                                  std::string_view reasoning, std::string_view content);
 
 // The levels of low/medium/high/xhigh a chat template takes for the
 // reasoning_effort variable: the ones it quotes as a token, and only when it
