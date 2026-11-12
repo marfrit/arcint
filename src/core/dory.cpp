@@ -1,7 +1,9 @@
 #include "core/dory.h"
 
-#include <string>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 
 namespace lgc {
 
@@ -100,19 +102,92 @@ std::uint64_t dory_kv_bytes(int kv_layers, int n_kv_heads, int head_dim, std::in
     return static_cast<std::uint64_t>(per_token_layer * kv_layers * static_cast<double>(tokens));
 }
 
-std::string dory_fit_warning(std::uint64_t kv_bytes, std::uint64_t weights_bytes, std::uint64_t card_bytes,
-                             std::int64_t tokens, int kv_layers, std::string_view k_type, std::string_view v_type) {
-    if (card_bytes == 0) return {};
-    const double gib = 1024.0 * 1024.0 * 1024.0;
-    if (static_cast<double>(kv_bytes + weights_bytes) <= 0.92 * static_cast<double>(card_bytes)) return {};
-    char buf[320];
+std::uint64_t dory_compute_bytes(std::int64_t mask_cells, int n_ubatch) {
+    if (mask_cells <= 0 || n_ubatch <= 0) return 0;
+    return static_cast<std::uint64_t>(n_ubatch) *
+           (kDoryComputeRowBytes + kDoryMaskBytesPerCellRow * static_cast<std::uint64_t>(mask_cells));
+}
+
+std::uint64_t dory_card_weight_bytes(std::string_view load_log) {
+    static constexpr std::string_view key = " model buffer size =";
+    std::uint64_t sum = 0;
+    size_t at = 0;
+    while (at < load_log.size()) {
+        size_t eol = load_log.find('\n', at);
+        if (eol == std::string_view::npos) eol = load_log.size();
+        const std::string_view line = load_log.substr(at, eol - at);
+        at = eol + 1;
+        const size_t k = line.find(key);
+        if (k == std::string_view::npos) continue;
+        // the buffer's name is the word before the key
+        size_t ne = k;
+        while (ne > 0 && line[ne - 1] == ' ') --ne;
+        size_t ns = ne;
+        while (ns > 0 && line[ns - 1] != ' ' && line[ns - 1] != ':') --ns;
+        const std::string_view name = line.substr(ns, ne - ns);
+        if (name.empty() || name.substr(0, 3) == "CPU") continue;
+        const std::string rest(line.substr(k + key.size()));
+        char* end = nullptr;
+        const double mib = std::strtod(rest.c_str(), &end);
+        if (end == rest.c_str() || !std::isfinite(mib) || mib <= 0.0) continue;
+        while (*end == ' ') ++end;
+        if (std::string_view(end).substr(0, 3) != "MiB") continue;
+        sum += static_cast<std::uint64_t>(mib * 1024.0 * 1024.0 + 0.5);
+    }
+    return sum;
+}
+
+DoryCardForecast dory_card_forecast(std::uint64_t weights_on_card, std::uint64_t kv_bytes, std::int64_t mask_cells,
+                                    int n_ubatch) {
+    DoryCardForecast f;
+    f.weights = weights_on_card;
+    f.kv      = kv_bytes;
+    f.compute = dory_compute_bytes(mask_cells, n_ubatch);
+    f.backend = kDoryBackendPeakBytes;
+    return f;
+}
+
+DoryStartForecast dory_start_forecast(std::uint64_t weights_on_card, int kv_layers, std::string_view k_type,
+                                      std::string_view v_type, std::int64_t pool, int lanes, bool unified,
+                                      std::int64_t reserve_cells, int n_ubatch) {
+    DoryStartForecast s;
+    s.cells      = dory_pool_cells(pool, lanes, unified);
+    s.mask_cells = dory_mask_cells(pool, lanes, unified, reserve_cells);
+    s.card = dory_card_forecast(weights_on_card, dory_kv_bytes(kv_layers, kDoryKvHeads, kDoryHeadDim, s.cells, k_type, v_type),
+                                s.mask_cells, n_ubatch);
+    return s;
+}
+
+namespace {
+double mib(std::uint64_t b) { return static_cast<double>(b) / (1024.0 * 1024.0); }
+}  // namespace
+
+std::string dory_forecast_line(const DoryCardForecast& f, std::uint64_t card_bytes, int n_ubatch, bool weights_from_load) {
+    char card[96];
+    if (card_bytes > 0) std::snprintf(card, sizeof(card), " of the card's %.0f MiB (OpenCL's figure)", mib(card_bytes));
+    else card[0] = '\0';
+    char buf[512];
     std::snprintf(buf, sizeof(buf),
-                  "dory: the KV cache (%.1f GiB: %d layers x %lld cells, %.*s:%.*s) and the weights (%.1f GiB) are forecast "
-                  "past the card's %.1f GiB with room for the compute buffers; lower --n-ctx, use --llama-kv q8_0:q4_0, "
-                  "fewer --llama-dory-loops, or --llama-dory-kv last_loop",
-                  static_cast<double>(kv_bytes) / gib, kv_layers, static_cast<long long>(tokens),
-                  static_cast<int>(k_type.size()), k_type.data(), static_cast<int>(v_type.size()), v_type.data(),
-                  static_cast<double>(weights_bytes) / gib, static_cast<double>(card_bytes) / gib);
+                  "dory: card memory forecast %.0f MiB at the peak%s: weights %.0f (%s), KV %.0f, compute %.0f at micro-batch %d, "
+                  "backend %.0f (measured on an A770)",
+                  mib(f.total()), card, mib(f.weights),
+                  weights_from_load ? "libllama's card buffers" : "the whole file: no card buffer line was read", mib(f.kv),
+                  mib(f.compute), n_ubatch, mib(f.backend));
+    return buf;
+}
+
+std::string dory_fit_warning(const DoryCardForecast& f, std::uint64_t card_bytes, std::int64_t tokens, int kv_layers,
+                             std::string_view k_type, std::string_view v_type) {
+    if (card_bytes == 0) return {};
+    if (f.total() <= card_bytes) return {};
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+                  "dory: %.0f MiB are forecast past the card's %.0f MiB (OpenCL's figure): the KV cache %.0f MiB (%d layers x "
+                  "%lld cells, %.*s:%.*s), the weights %.0f, the compute buffer %.0f, the backend %.0f; lower --n-ctx, use "
+                  "--llama-kv q8_0:q4_0, fewer --llama-dory-loops, --llama-dory-kv last_loop, or a smaller --prefill-ubatch",
+                  mib(f.total()), mib(card_bytes), mib(f.kv), kv_layers, static_cast<long long>(tokens),
+                  static_cast<int>(k_type.size()), k_type.data(), static_cast<int>(v_type.size()), v_type.data(), mib(f.weights),
+                  mib(f.compute), mib(f.backend));
     return buf;
 }
 

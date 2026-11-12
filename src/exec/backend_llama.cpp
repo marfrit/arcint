@@ -398,10 +398,17 @@ int gguf_block_count(const std::string& path, int* nextn = nullptr) {
     return n;
 }
 
+// The target model's load: libllama logs one "<buffer> model buffer size = X MiB" line per weight
+// buffer (load_tensors), the only place it says how much of the file went to the card. The Dory
+// forecast reads its weight term from those lines (core/dory.h); captured on the loading thread only.
+thread_local std::string* g_model_buffer_capture = nullptr;
+
 void route_llama_log(ggml_log_level level, const char* text, void*) {
     std::string s(text != nullptr ? text : "");
     while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
     if (s.empty()) return;
+    if (g_model_buffer_capture != nullptr && s.find(" model buffer size =") != std::string::npos)
+        g_model_buffer_capture->append(s).append("\n");
     if (level == GGML_LOG_LEVEL_ERROR) log::error("llama", "%s", s.c_str());
     else if (level == GGML_LOG_LEVEL_WARN) log::warn("llama", "%s", s.c_str());
     else log::verbose("llama", "%s", s.c_str());
@@ -680,7 +687,17 @@ public:
             }
         }
         const auto t_load     = clock_type::now();
-        model_                = llama_model_load_from_file(cfg.gguf_path.c_str(), mp);
+        std::string model_buffer_lines;
+        {
+            // cleared on every way out of the load, a throw included: the pointer names a local
+            struct CaptureScope {
+                explicit CaptureScope(std::string* to) { g_model_buffer_capture = to; }
+                ~CaptureScope() { g_model_buffer_capture = nullptr; }
+                CaptureScope(const CaptureScope&)            = delete;
+                CaptureScope& operator=(const CaptureScope&) = delete;
+            } capture(&model_buffer_lines);
+            model_ = llama_model_load_from_file(cfg.gguf_path.c_str(), mp);
+        }
         if (model_ == nullptr)
             throw std::runtime_error(log::format("llama.cpp could not load %s", cfg.gguf_path.c_str()));
 #ifdef ARCINT_LLAMA_EXPERT_CACHE
@@ -944,11 +961,22 @@ public:
 #endif
 #ifdef ARCINT_LLAMA_DORY
         if (status_.dory_present) {
-            // forecast the cache against the card before the allocation: the default context of 32768
-            // cells at f16 is about 12 GiB over 96 layers, which the A770 cannot hold with the weights
-            const std::uint64_t kvb = dory_kv_bytes(status_.dory.kv_layers, 4, 256, pool, cfg.llama_kv_k, cfg.llama_kv_v);
-            if (const std::string w = dory_fit_warning(kvb, llama_model_size(model_), cards[0].mem_bytes, pool,
-                                                       status_.dory.kv_layers, cfg.llama_kv_k, cfg.llama_kv_v);
+            // forecast the card memory before the allocation, term by term (core/dory.h), log it for every
+            // start and warn when it passes the card's OpenCL figure. The weight term is what libllama
+            // said it placed on the card; without such a line the whole file's tensor bytes stand in.
+            // The cells are libllama's own (the pool and a lane's share padded to 256). The mask of the compute
+            // term spans one sequence's cells: the pool under a unified cache or one lane, a lane's share
+            // otherwise (libllama's n_ctx_seq), and --llama-reserve-cells caps it (the buffer stays at the
+            // reserve and deeper batches take smaller micro-batches). dory_start_forecast composes all of it
+            const std::uint64_t wcard = dory_card_weight_bytes(model_buffer_lines);
+            const DoryStartForecast st =
+                dory_start_forecast(wcard > 0 ? wcard : llama_model_size(model_), status_.dory.kv_layers, cfg.llama_kv_k,
+                                    cfg.llama_kv_v, pool, lanes_, cp.kv_unified, cfg.llama_reserve_cells,
+                                    static_cast<int>(cp.n_ubatch));
+            log::info("load", "%s",
+                      dory_forecast_line(st.card, cards[0].mem_bytes, static_cast<int>(cp.n_ubatch), wcard > 0).c_str());
+            if (const std::string w = dory_fit_warning(st.card, cards[0].mem_bytes, st.cells, status_.dory.kv_layers,
+                                                       cfg.llama_kv_k, cfg.llama_kv_v);
                 !w.empty())
                 log::warn("load", "%s", w.c_str());
         }
