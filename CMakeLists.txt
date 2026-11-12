@@ -196,6 +196,9 @@ if(ARCINT_LLAMA)
   # without it --llama-dory-max-loops is refused at start
   if(ARCINT_LLAMA_H MATCHES "llama_set_dory_loops")
     target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_DORY_TURN_LOOPS=1)
+    message(STATUS "contrib/llama.cpp 0118 present: --llama-dory-max-loops is built")
+  else()
+    message(WARNING "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0118: --llama-dory-max-loops is refused at start")
   endif()
   # contrib/llama.cpp 0111: the weights the device declined at load, placed in host memory,
   # counted (llama_placement_downgrades in llama-ext.h); /props downgrades carries them
