@@ -86,11 +86,12 @@ int prepared(DoryUnit& u, const json& body, std::string* msg = nullptr) {
     return prep.input.dory_loops;
 }
 
-// the 400's error object for the body, or null when it is prepared
-json refusal(DoryUnit& u, const json& body) {
+// the 400's `param` for the body, or "(prepared)" when it is not refused: a request that is wrongly
+// accepted fails the comparison instead of throwing out of the case
+std::string refusal_param(DoryUnit& u, const json& body) {
     lgc::api::PreparedChat prep;
     const auto             err = lgc::api::prepare_chat(u.ctx, body, prep);
-    return err ? err->body.at("error") : json();
+    return err ? err->body.at("error").value("param", std::string("(none)")) : std::string("(prepared)");
 }
 
 }  // namespace
@@ -135,8 +136,8 @@ TEST(dory_request_refuses_what_is_not_an_effort_level) {
     CHECK(msg.find("none, off, minimal, low, medium, high, xhigh") != std::string::npos);
     CHECK_EQ(prepared(u, chat_body({{"reasoning_effort", "ultra"}})), -1);
     // the 400 names the field the bad value came from
-    CHECK_EQ(refusal(u, chat_body({{"reasoning_effort", "ultra"}})).at("param").get<std::string>(), std::string("reasoning_effort"));
-    CHECK_EQ(refusal(u, chat_body({{"chat_template_kwargs", {{"reasoning_effort", "ultra"}}}})).at("param").get<std::string>(),
+    CHECK_EQ(refusal_param(u, chat_body({{"reasoning_effort", "ultra"}})), std::string("reasoning_effort"));
+    CHECK_EQ(refusal_param(u, chat_body({{"chat_template_kwargs", {{"reasoning_effort", "ultra"}}}})),
              std::string("chat_template_kwargs.reasoning_effort"));
     CHECK_EQ(prepared(u, chat_body({{"chat_template_kwargs", {{"reasoning_effort", "High"}}}})), -1);
     CHECK_EQ(prepared(u, chat_body({{"chat_template_kwargs", {{"reasoning_effort", 3}}}}), &msg), -1);
