@@ -890,6 +890,25 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
     // here gets them (chat, /v1/responses, /tokenize's chat form).
     apply_template_kwarg_defaults(prep.req, ctx.cfg->chat_template_kwarg_defaults);
 
+    // --llama-dory-max-loops: this request's loop count from the same source as the template's
+    // effort (effective_reasoning_effort: chat_template_kwargs.reasoning_effort, else the typed field, which
+    // the unit's --chat-template-kwarg default has filled in above). The template may receive a mapped name
+    // (minimal -> low, high <-> xhigh) while the count comes from the unmapped one; each mapped pair has the
+    // same count. Decided before the render and the fit pass, so an effort 400 wins over a template or
+    // context-overflow error. A level outside the seven names, or a non-string kwarg, is a 400. With the
+    // flag off none of this runs and input.dory_loops stays 0. A typed empty string and a kwarg null
+    // read as no effort, as for the template.
+    if (const ModelStatus& dst = ctx.backend->status(); dst.dory_present && dst.dory.max_loops > 0) {
+        const EffectiveEffort eff = effective_reasoning_effort(prep.req);
+        int                   loops = 0;
+        if (const std::string no = dory_request_loops(eff.present, eff.is_string, eff.level, dst.dory.loops,
+                                                      dst.dory.max_loops, loops);
+            !no.empty())
+            return HttpResult{400, invalid_request(no, eff.present && prep.req.chat_template_kwargs.contains("reasoning_effort")
+                                                           ? "chat_template_kwargs.reasoning_effort"
+                                                           : "reasoning_effort")};
+        prep.input.dory_loops = loops;
+    }
     // A request that still says nothing is the kind of turn the model's template
     // makes of it (ChatDialect::thinks_by_default): for Gemma 4 a non-thinking
     // one. Resolved here, before the render, so the template, the non-thinking
@@ -1002,22 +1021,6 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
     prep.input.think_open          = prep.think_open;
     prep.input.think_closed        = prep.think_closed;
     prep.input.dialect = prep.dialect;
-    // --llama-dory-max-loops: this request's loop count from the SAME effective effort the template is
-    // rendered with (effective_reasoning_effort: chat_template_kwargs.reasoning_effort, else the typed
-    // field, which the unit's --chat-template-kwarg default has filled in above). A level outside the
-    // seven names, or a non-string kwarg, is a 400. With the flag off none of this runs and
-    // input.dory_loops stays 0.
-    if (const ModelStatus& dst = ctx.backend->status(); dst.dory_present && dst.dory.max_loops > 0) {
-        const EffectiveEffort eff = effective_reasoning_effort(prep.req);
-        int                   loops = 0;
-        if (const std::string no = dory_request_loops(eff.present, eff.is_string, eff.level, dst.dory.loops,
-                                                      dst.dory.max_loops, loops);
-            !no.empty())
-            return HttpResult{400, invalid_request(no, eff.present && prep.req.chat_template_kwargs.contains("reasoning_effort")
-                                                           ? "chat_template_kwargs.reasoning_effort"
-                                                           : "reasoning_effort")};
-        prep.input.dory_loops = loops;
-    }
     // The rendered prompt is the one thing that decides what the model saw.
     // When an answer differs from a reference run this is the first question,
     // and reconstructing it after the fact is guesswork (§3.7).

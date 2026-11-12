@@ -1675,7 +1675,7 @@ public:
         const std::vector<int> prompt = prompt_tokens(in);
         stats.prompt_tokens = static_cast<int>(prompt.size());
         // the count this request is served at, named in the response even where it ends before a decode
-        if (dory_turn_) stats.dory_loops = in.dory_loops > 0 ? in.dory_loops : status_.dory.loops;
+        if (dory_turn_) stats.dory_loops = dory_run_loops(in.dory_loops, status_.dory.loops);
         if (prompt.empty()) return FinishReason::Stop;
         if (static_cast<int>(prompt.size()) >= cap) {
             log::warn("slot", "lane %d: prompt of %zu tokens does not fit n_ctx %d", seq, prompt.size(), cap);
@@ -2999,7 +2999,7 @@ private:
     void dory_prepare_locked(int seq, const GenerationInput& in, std::vector<int>& have, GenerationStats& stats) {
         if (!dory_turn_) return;
         const int unit = status_.dory.loops;
-        const int want = in.dory_loops > 0 ? in.dory_loops : unit;
+        const int want = dory_run_loops(in.dory_loops, unit);
         if (want < 1 || want > status_.dory.max_loops)
             throw std::runtime_error(log::format("dory: a request for %d loops; this unit serves 1 to %d", want, status_.dory.max_loops));
         int&         cur       = slot_loops_[static_cast<size_t>(seq)];

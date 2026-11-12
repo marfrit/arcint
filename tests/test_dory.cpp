@@ -1,4 +1,5 @@
 #include "core/dory.h"
+#include "core/chat.h"
 #include "harness.h"
 
 #include <cmath>
@@ -477,7 +478,9 @@ TEST(dory_request_loops_each_level_and_every_refusal) {
     // the cap
     CHECK(dory_request_loops(true, true, "xhigh", 1, 3, n).empty());
     CHECK_EQ(n, 3);
-    // wrong case, an unknown level, an empty string: refused, naming the accepted levels
+    // wrong case, an unknown level, and a kwarg that is the empty string (present, so a level is wanted;
+    // a TYPED empty string never reaches here, effective_reasoning_effort reports it as not present):
+    // refused, naming the accepted levels
     for (const char* bad : {"HIGH", "High", "ultra", ""}) {
         n = -1;
         const std::string e = dory_request_loops(true, true, bad, 2, 4, n);
@@ -490,6 +493,39 @@ TEST(dory_request_loops_each_level_and_every_refusal) {
     CHECK(has(ns, "must be a string"));
     CHECK(has(ns, "none, off, minimal, low, medium, high, xhigh"));
     CHECK_EQ(n, 0);
+}
+
+// "0 means the unit's count" is one helper, used by the backend where it names and where it sets the count
+TEST(dory_run_loops_zero_means_the_units_count) {
+    CHECK_EQ(dory_run_loops(0, 2), 2);
+    CHECK_EQ(dory_run_loops(0, 4), 4);
+    CHECK_EQ(dory_run_loops(1, 2), 1);
+    CHECK_EQ(dory_run_loops(4, 2), 4);
+}
+
+// The effort names are listed in three places (the chat route's unit-default check, the loop map, the
+// Responses reader). The two that take all seven are held against each other here: every name the map
+// knows is accepted as a unit default, and a name outside the list is refused by both.
+TEST(dory_effort_names_agree_with_the_unit_default_check) {
+    std::string names = kDoryEffortNames, key;
+    nlohmann::json v;
+    size_t from = 0;
+    int    seen = 0;
+    while (from < names.size()) {
+        size_t to = names.find(", ", from);
+        if (to == std::string::npos) to = names.size();
+        const std::string n = names.substr(from, to - from);
+        from = to + 2;
+        ++seen;
+        CHECK(dory_effort_known(n));
+        CHECK(!parse_template_kwarg_default("reasoning_effort=" + n, key, v).has_value());
+        CHECK(dory_loops_for_effort(n, 2, 4) > 0);
+    }
+    CHECK_EQ(seen, 7);
+    for (const char* bad : {"max", "ultra", "HIGH", "Medium"}) {
+        CHECK(!dory_effort_known(bad));
+        CHECK(parse_template_kwarg_default(std::string("reasoning_effort=") + bad, key, v).has_value());
+    }
 }
 
 // A slot's cells written at one count are not continued at another: the slot is prefilled again.

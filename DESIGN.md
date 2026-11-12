@@ -195,16 +195,22 @@ measured on 2026-11-07.
   **A loop count per request** (`--llama-dory-max-loops N`, contrib/llama.cpp
   0118, off by default). With N the load builds libllama's tables for N loops
   (`LLAMA_DORY_MAX_LOOPS`, read back with `llama_model_dory_loops_max`, a mismatch
-  refuses the start) and a request runs 1 to N. The count comes from the one
-  effective reasoning effort the chat template is rendered with
+  refuses the start) and a request runs 1 to N. The count comes from the same
+  source as the effort the chat template is rendered with
   (`effective_reasoning_effort`, `src/core/chat.cpp`: an explicit
   `chat_template_kwargs.reasoning_effort` wins over the typed `reasoning_effort` /
   Responses `reasoning.effort`, which holds the unit's `--chat-template-kwarg
-  reasoning_effort` default when the request names none). The seven names are exact
+  reasoning_effort` default when the request names none). The template may
+  receive a mapped name (minimal as low, high and xhigh swapped by what the
+  template quotes) while the count comes from the unmapped one; each mapped pair
+  has the same count. The seven names are exact
   and lower case: none, off, minimal, low map to 1, medium to 2, high, xhigh to 4,
   capped at N. An effective effort that is present and is not one of them, or a
   kwarg that is not a string, is a 400 (`dory_request_loops`, `src/core/dory.cpp`),
-  never a fallback to the unit's count. A request that names no effort runs the
+  never a fallback to the unit's count. A typed `reasoning_effort` that is the
+  empty string and a `chat_template_kwargs.reasoning_effort` that is `null` read
+  as no effort, as they do for the template (the flag does not change how a request
+  is read); a kwarg that is the empty string is present and is a 400. A request that names no effort runs the
   count of the unit's default effort when `--chat-template-kwarg reasoning_effort=...`
   is set (a default outside the seven names is refused at the start, with or without
   this flag), else `--llama-dory-loops` (the file's count without it);
@@ -218,9 +224,13 @@ measured on 2026-11-07.
   `--tts`. A slot whose cells were
   written at another count is dropped and the prompt prefilled again at the new
   one, never continued: continuing moved the mean KL by +0.001 to +0.006 nats over
-  the floor and cost up to 1.6 points of argmax agreement (`measured-here`, CPU,
-  Dory1.0-4B Q5_K_M, f16 cache, context 4,096, micro-batch 512, 8 threads, patch
-  0118), which is no equivalence, while a load at N loops and a request at N
+  the floor and cost 0 to 1.6 points of argmax agreement over six count
+  transitions of 724-765 rows each on six conversations, the worst single
+  conversation losing 5.0 points (1->4); the table with its floor is in the 0118
+  section of `contrib/llama.cpp/README.md` (`measured-here`, CPU, Dory1.0-4B
+  Q5_K_M, f16 cache, context 4,096, micro-batch 512, 8 threads, patch 0118). That
+  is under the answer-level bar in mean KL and not in agreement for three of the
+  six transitions, which is no equivalence, while a load at N loops and a request at N
   loops on tables for 4 were bit-equal in logits (18 greedy cases, 2,252 rows). The
   count is set on the context before every decode under the decode lock; one
   `llama_decode` carries one lane's rows on this path. Every answer names the count
@@ -236,8 +246,25 @@ measured on 2026-11-07.
   slot a request can land on a slot written at another count and re-prefill
   where another slot would have served it; and two lanes at different counts
   switch the count, rebuild the graph and re-plan the allocation on every decode
-  (neither cost is measured). A card run of this feature is owed; with the flag
-  off nothing changes.
+  (neither cost is measured). With the flag off nothing a request or a response
+  sees changes, with two documented exceptions: a Dory start that inherits
+  `LLAMA_DORY_MAX_LOOPS` above the unit's count is refused (with patch 0118 the
+  library would build larger tables than the unit asked for), and `/props` `dory`
+  always carries `max_loops` (0 when off) and `effort_loops` (null when off).
+
+  Card record (`measured-here`, 2026-11-12, the 16 GB card, OpenCL, Dory1.0-4B
+  Q5_K_M, the served unit's arguments, greedy, five fresh processes, made-up
+  prompts; figures and arms in the 0118 section of `contrib/llama.cpp/README.md`,
+  tool `tools/dory_loops_spot.py`): on the flagged process (2 loops, maximum 4)
+  20 of 20 answers equal those of the process loaded at that count, but the
+  reference answers differ between counts in only 2 of 5 prompts, so 3 of 5
+  could not have shown a wrong count; every route named its count; a changing
+  effort re-prefilled on each change and not on a repeat; card memory is equal
+  to a load at 1, 2 or 4 loops (tables for 4 cost 0.0 MiB). The library's red
+  switch did not fail on this route (cause by code reading, in the README); the
+  served check has no red run of its own. Not measured: a deep prompt (a level
+  change deep in a session costs a full prefill), the B60, KL on the card, any
+  sampled run. No served unit carries the flag.
 
   `last_loop` makes a token's hidden
   state depend on where the chunk boundaries of its prefill fall (loop i attends to

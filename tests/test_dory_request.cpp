@@ -1,4 +1,5 @@
 #include "api/handlers.h"
+#include "api/responses.h"
 
 #include <algorithm>
 #include <string>
@@ -85,6 +86,13 @@ int prepared(DoryUnit& u, const json& body, std::string* msg = nullptr) {
     return prep.input.dory_loops;
 }
 
+// the 400's error object for the body, or null when it is prepared
+json refusal(DoryUnit& u, const json& body) {
+    lgc::api::PreparedChat prep;
+    const auto             err = lgc::api::prepare_chat(u.ctx, body, prep);
+    return err ? err->body.at("error") : json();
+}
+
 }  // namespace
 
 TEST(dory_request_each_level_reaches_the_input) {
@@ -126,6 +134,10 @@ TEST(dory_request_refuses_what_is_not_an_effort_level) {
     CHECK(msg.find("'HIGH'") != std::string::npos);
     CHECK(msg.find("none, off, minimal, low, medium, high, xhigh") != std::string::npos);
     CHECK_EQ(prepared(u, chat_body({{"reasoning_effort", "ultra"}})), -1);
+    // the 400 names the field the bad value came from
+    CHECK_EQ(refusal(u, chat_body({{"reasoning_effort", "ultra"}})).at("param").get<std::string>(), std::string("reasoning_effort"));
+    CHECK_EQ(refusal(u, chat_body({{"chat_template_kwargs", {{"reasoning_effort", "ultra"}}}})).at("param").get<std::string>(),
+             std::string("chat_template_kwargs.reasoning_effort"));
     CHECK_EQ(prepared(u, chat_body({{"chat_template_kwargs", {{"reasoning_effort", "High"}}}})), -1);
     CHECK_EQ(prepared(u, chat_body({{"chat_template_kwargs", {{"reasoning_effort", 3}}}}), &msg), -1);
     CHECK(msg.find("must be a string") != std::string::npos);
@@ -160,4 +172,57 @@ TEST(dory_completions_run_the_units_count) {
     lgc::api::PreparedCompletion prep;
     CHECK(!lgc::api::prepare_completion(u.ctx, json{{"prompt", "hi"}, {"max_tokens", 1}}, prep));
     CHECK_EQ(prep.input.dory_loops, 0);
+}
+
+// the effort is decided before the render and the fit pass: its 400 wins over a context-overflow 400
+TEST(dory_request_effort_400_wins_over_a_later_error) {
+    DoryUnit    u(4);
+    const std::string big(2000, 'x');   // the fake renders the content as is: far past n_ctx 512
+    json        long_body = chat_body();
+    long_body["messages"][0]["content"] = big;
+    // without a bad effort the overflow is what is refused
+    std::string msg;
+    CHECK_EQ(prepared(u, long_body, &msg), -1);
+    CHECK(msg.find("reasoning effort") == std::string::npos);
+    long_body["reasoning_effort"] = "HIGH";
+    CHECK_EQ(prepared(u, long_body, &msg), -1);
+    CHECK(msg.find("reasoning effort 'HIGH'") != std::string::npos);
+}
+
+// a typed empty string and a kwarg null read as no effort, as for the template (the flag must not change
+// how a request is read); a kwarg that is the empty string is present and is not a level
+TEST(dory_request_empty_and_null_efforts_read_as_unset) {
+    DoryUnit u(4);
+    CHECK_EQ(prepared(u, chat_body({{"reasoning_effort", ""}})), 2);
+    CHECK_EQ(prepared(u, chat_body({{"chat_template_kwargs", {{"reasoning_effort", nullptr}}}})), 2);
+    DoryUnit d(4, "high");
+    CHECK_EQ(prepared(d, chat_body({{"reasoning_effort", ""}})), 4);   // the unit default's count
+    CHECK_EQ(prepared(u, chat_body({{"chat_template_kwargs", {{"reasoning_effort", ""}}}})), -1);
+}
+
+// Responses: reasoning.effort is the typed effort of the same request path
+TEST(dory_response_reasoning_effort_reaches_the_input) {
+    DoryUnit u(4);
+    const struct { const char* effort; int want; } rows[] = {{"none", 1}, {"minimal", 1}, {"low", 1}, {"medium", 2}, {"high", 4}, {"xhigh", 4}};
+    for (const auto& r : rows) {
+        lgc::api::ResponseRequest req;
+        CHECK(!lgc::api::parse_response_request(
+                  json{{"model", "dory"}, {"input", "hi"}, {"max_output_tokens", 1}, {"reasoning", {{"effort", r.effort}}}}, req));
+        lgc::api::PreparedResponse prep;
+        CHECK(!lgc::api::prepare_response(u.ctx, std::move(req), prep));
+        CHECK_EQ(prep.chat.input.dory_loops, r.want);
+    }
+    lgc::api::ResponseRequest none;
+    CHECK(!lgc::api::parse_response_request(json{{"model", "dory"}, {"input", "hi"}, {"max_output_tokens", 1}}, none));
+    lgc::api::PreparedResponse prep;
+    CHECK(!lgc::api::prepare_response(u.ctx, std::move(none), prep));
+    CHECK_EQ(prep.chat.input.dory_loops, 2);
+    // the flag off: no count
+    DoryUnit off(0);
+    lgc::api::ResponseRequest hi;
+    CHECK(!lgc::api::parse_response_request(
+              json{{"model", "dory"}, {"input", "hi"}, {"max_output_tokens", 1}, {"reasoning", {{"effort", "high"}}}}, hi));
+    lgc::api::PreparedResponse p2;
+    CHECK(!lgc::api::prepare_response(off.ctx, std::move(hi), p2));
+    CHECK_EQ(p2.chat.input.dory_loops, 0);
 }

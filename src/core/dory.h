@@ -89,6 +89,10 @@ constexpr const char* kDoryEffortNames = "none, off, minimal, low, medium, high,
 // what that means (the request path refuses it). `unit_loops` is --llama-dory-loops or the file's count.
 int dory_loops_for_effort(std::string_view effort, int unit_loops, int max_loops);
 
+// The count a request runs at: GenerationInput::dory_loops, where 0 means the unit's own count
+// (a request that carries none, /v1/completions, the flag off).
+inline int dory_run_loops(int requested, int unit_loops) { return requested > 0 ? requested : unit_loops; }
+
 // The decision for one request with --llama-dory-max-loops on: the count it runs at, or an error text
 // (the 400's message; `loops` is then 0). `present`, `is_string` and `level` are the request's effective
 // effort (core/chat.h effective_reasoning_effort: the explicit chat_template_kwargs.reasoning_effort,
@@ -106,7 +110,8 @@ std::vector<std::pair<std::string, int>> dory_effort_map(int unit_loops, int max
 
 // What a slot does with the cells it holds when a request comes at `want_loops`. A cache written at
 // another count is not continued: continuing it moved the mean KL by +0.001 to +0.006 nats over the
-// floor and cost up to 1.6 points of argmax agreement (contrib/llama.cpp 0118, measured-here), so the
+// floor and cost up to 1.6 points of argmax agreement over six count transitions (the table is in the
+// 0118 section of contrib/llama.cpp/README.md, measured-here, CPU; worst single conversation 5.0), so the
 // slot is dropped and the prompt prefilled again at the new count. A slot holding nothing has nothing
 // to drop.
 enum class DoryReuse { Keep, Reprefill };
