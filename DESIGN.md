@@ -1,9 +1,9 @@
 # arcint — Design
 
 State as of 2026-11-12: arcint **1.6.2** on llama.cpp **`3e4dfa8`** with the
-patch series `contrib/llama.cpp/patches`: 33 patch files, the 12 folded ones
+patch series `contrib/llama.cpp/patches`: 34 patch files, the 12 folded ones
 (`0000-01` to `0000-12`, the former 0001-0096; `FOLDED.md` there resolves the old
-numbers) and 0097-0117. One engine: libllama with
+numbers) and 0097-0118. One engine: libllama with
 ggml's OpenCL backend and arcint's Intel kernels. Three language services run
 in production on two Intel Arc cards: the dense Qwen3.8-27B agent and
 Qwen3.8-Flash-Next (125B-A6B, on demand) on the 24 GB Arc Pro B60, the MoE
@@ -415,9 +415,9 @@ The cards (`measured-here` unless marked):
 
 ### 3.2 Kernels: the patch series
 
-`contrib/llama.cpp/patches` holds 33 patch files against the pin: 0001-0096
+`contrib/llama.cpp/patches` holds 34 patch files against the pin: 0001-0096
 folded into 12 (`0000-01` to `0000-12`; `FOLDED.md` there resolves the old
-numbers, which stay as labels in the record) and 0097-0117, each with its
+numbers, which stay as labels in the record) and 0097-0118, each with its
 measurement, KL, red case and review in `contrib/llama.cpp/README.md`
 (`measured-here` throughout). By what they change:
 
