@@ -1,0 +1,132 @@
+@@@H
+<|im_start|>system
+# Tools
+
+You have access to the following functions:
+
+<tools>
+<function>
+<name>get_weather</name>
+<description>Get the weather for a city.</description>
+<parameters>
+<parameter>
+<name>city</name>
+<type>string</type>
+</parameter>
+<required>["city"]</required>
+</parameters>
+</function>
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT><|im_end|>
+<|im_start|>user
+Compare the weather in Paris and Berlin.<|im_end|>
+<|im_start|>assistant
+<think></think>
+<tool_call>
+<function=get_weather>
+<parameter=city>
+Paris
+</parameter>
+</function>
+</tool_call>
+<|im_end|>
+<|im_start|>user
+<tool_response>
+{"temp_c": 14, "sky": "cloudy"}
+</tool_response>
+<|im_end|>
+<|im_start|>assistant
+<think></think>
+<tool_call>
+<function=get_weather>
+<parameter=city>
+Berlin
+</parameter>
+</function>
+</tool_call>
+<|im_end|>
+<|im_start|>user
+<tool_response>
+{"temp_c": 9, "sky": "rain"}
+</tool_response>
+<|im_end|>
+<|im_start|>assistant
+<think></think>Paris is warmer: 14 degrees Celsius and cloudy, against 9 degrees and rain in Berlin.<|im_end|>
+<|im_start|>user
+Please remember two things for later: the workshop is on Thursday at 14:30 in room B217, and my locker code is 4417.<|im_end|>
+<|im_start|>assistant
+<think></think>Noted: the workshop is on Thursday at 14:30 in room B217, and your locker code is 4417.<|im_end|>
+<|im_start|>user
+Here is a text. Summarise it in two sentences.
+
+The lighthouse at Cape Varn was built in 1871 after three cargo ships were lost on the reef in a single winter. Its tower is 34 metres tall and made of grey granite that was cut in a quarry eleven kilometres inland and hauled to the coast by ox cart. For its first forty years the lamp burned rapeseed oil, and the keeper had to trim the wick every four hours through the night. In 1912 the oil lamp was replaced by a pressurised paraffin burner, which was three times as bright and needed attention only twice a night. Electricity reached the cape in 1938, and with it came a rotating lens driven by a small motor instead of a clockwork weight. The last keeper, a woman named Idun Marek, left in 1984 when the light was automated; she had lived at the station for twenty-six years. Today the tower is run from a control room two hundred kilometres away, and a technician visits four times a year. The keeper's house is a small museum that opens from May to September, and the old paraffin burner is its most photographed exhibit. Local fishermen still say that the light is the first thing they look for when they come home, even though every boat carries satellite navigation. A storm in 2003 broke two of the lantern panes, and the replacement glass had to be made by a workshop that normally restores church windows.<|im_end|>
+<|im_start|>assistant
+<think></think>The Cape Varn lighthouse, built in 1871 after a winter of shipwrecks, went from a rapeseed oil lamp to paraffin, then electricity, and was automated in 1984 when its last keeper left. It is now run remotely, and the keeper's house is a seasonal museum.<|im_end|>
+<|im_start|>user
+Write a Lua function that counts the lines of a file.<|im_end|>
+<|im_start|>assistant
+<think></think>```lua
+function count_lines(path)
+  local n = 0
+  for _ in io.lines(path) do
+    n = n + 1
+  end
+  return n
+end
+```<|im_end|>
+<|im_start|>user
+Which year did electricity reach the cape?<|im_end|>
+<|im_start|>assistant
+<think></think>Electricity reached the cape in 1938.<|im_end|>
+@@@F needle 160
+<|im_start|>user
+What is my locker code? Answer with the number only.<|im_end|>
+<|im_start|>assistant
+<think>
+@@@F weather 160
+<|im_start|>user
+Which of the two cities was colder, and by how many degrees?<|im_end|>
+<|im_start|>assistant
+<think>
+@@@F tool 160
+<|im_start|>user
+And what is the weather in Madrid right now?<|im_end|>
+<|im_start|>assistant
+<think>
+@@@F german 160
+<|im_start|>user
+Fasse den Text über den Leuchtturm in einem deutschen Satz zusammen.<|im_end|>
+<|im_start|>assistant
+<think>
+@@@F fact 160
+<|im_start|>user
+What is the capital of France?<|im_end|>
+<|im_start|>assistant
+<think>
+@@@F code 160
+<|im_start|>user
+Change the Lua function so that it does not count empty lines.<|im_end|>
+<|im_start|>assistant
+<think>
