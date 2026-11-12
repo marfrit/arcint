@@ -341,7 +341,8 @@ TEST(props_reports_the_dory_max_loops_and_the_effort_map) {
         dory_backend(backend, 2, 0);
         SlotPool slots(1);
         Context  ctx{&cfg, &backend, &slots};
-        const auto& d = lgc::api::props(ctx).at("dory");
+        const nlohmann::json j = lgc::api::props(ctx);
+        const auto&          d = j.at("dory");
         CHECK_EQ(d.at("max_loops").get<int>(), 0);
         CHECK(d.at("effort_loops").is_null());
         CHECK_EQ(d.at("executed_layers").get<int>(), 112);
@@ -352,7 +353,8 @@ TEST(props_reports_the_dory_max_loops_and_the_effort_map) {
         dory_backend(backend, 2, 4);
         SlotPool slots(1);
         Context  ctx{&cfg, &backend, &slots};
-        const auto& d = lgc::api::props(ctx).at("dory");
+        const nlohmann::json j = lgc::api::props(ctx);
+        const auto&          d = j.at("dory");
         CHECK_EQ(d.at("max_loops").get<int>(), 4);
         CHECK_EQ(d.at("executed_layers").get<int>(), 112);   // the unit's own count, not the table's 192
         const auto& m = d.at("effort_loops");
@@ -373,7 +375,8 @@ TEST(props_reports_the_dory_max_loops_and_the_effort_map) {
         dory_backend(backend, 2, 4);
         SlotPool slots(1);
         Context  ctx{&cfg, &backend, &slots};
-        const auto& m = lgc::api::props(ctx).at("dory").at("effort_loops");
+        const nlohmann::json j = lgc::api::props(ctx);
+        const auto&          m = j.at("dory").at("effort_loops");
         CHECK_EQ(m.at("unset").get<int>(), 4);
         CHECK_EQ(m.at("low").get<int>(), 1);
     }
