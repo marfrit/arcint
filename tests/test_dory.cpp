@@ -501,7 +501,9 @@ TEST(dory_max_loops_resolution_and_refusals) {
     big.max_loops = 5;
     CHECK(has(dory_option_refusal("dory", false, false, false, big), "1 to 4"));
     // another architecture, MTP
-    CHECK(has(dory_option_refusal("qwen35", false, false, false, o), "--llama-dory-max-loops"));
+    DoryOptions only;
+    only.max_loops = 4;
+    CHECK(has(dory_option_refusal("qwen35", false, false, false, only), "--llama-dory-max-loops"));
     CHECK(has(dory_option_refusal("dory", true, false, false, o), "--llama-mtp"));
 }
 
