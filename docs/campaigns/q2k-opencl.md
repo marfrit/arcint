@@ -1,7 +1,7 @@
 # q2k-opencl — Q2_K weights on the OpenCL backend, decode to prompt
 
 **Open (2026-11-09).** Patch `0117` of `contrib/llama.cpp` (on top of 0116) is written, built and
-unit-tested on the recipe host (no device there); the card window is owed. The operator's decision of
+unit-tested on the recipe host (no device there). Its card runs are the 1.6.2 release gate's (2026-11-12, `measured-here`, RC 9c0c730e): the op suite 193 of 193 on both cards, the red build 0 of 193 on both (the B60 in the gate window, the A770 the evening before), the break build declined on the card with its `not-built` keys, mean KL on Llama 2 7B Q2_K 0.18746-0.18749 against the CPU's 0.18828 on the same file, llama-bench 1952.29 / 77.95 (A770) and 3491.61 / 98.54 t/s (B60, pp512 / tg128). The 1-16 column curve against Q4_K is not measured and no Q2_K model was run through the server. The operator's decision of
 2026-11-09: Q2_K too, in 0116's structure and with its gates.
 
 ## Charter
@@ -52,7 +52,7 @@ a weight, 45 us at Q4_K's 427 GB/s on 4096 x 14336, `inferred`).
   reference dot to rounding (1e-15, 3e-13); `--red` breaks all four.
 - `tests/test_planes.cpp`: the Q2_K planes against `ggml-common.h`'s `block_q2_K`, a range across slice
   boundaries; the red R5 (Q2_K's dm and scales fields swapped) fails it.
-- The card window: owed.
+- The card window: the 1.6.2 release gate (above; the record is `contrib/llama.cpp/README.md`, patch 0117). Not measured: the per-column curve, a served Q2_K model.
 
 ## Where it lives
 

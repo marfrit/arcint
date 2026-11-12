@@ -1,6 +1,6 @@
 # arcint — Design
 
-State as of 2026-11-07: arcint **1.6.1** on llama.cpp **`3e4dfa8`** with the
+State as of 2026-11-12: arcint **1.6.2** on llama.cpp **`3e4dfa8`** with the
 patch series `contrib/llama.cpp/patches`: 33 patch files, the 12 folded ones
 (`0000-01` to `0000-12`, the former 0001-0096; `FOLDED.md` there resolves the old
 numbers) and 0097-0117. One engine: libllama with

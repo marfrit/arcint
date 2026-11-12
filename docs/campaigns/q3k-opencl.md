@@ -103,14 +103,14 @@ is there to measure Strata's form on these cards for Q3_K itself.
 - Window 189 (aa0720c3, `measured-here`): green on both cards (Q3_K `MUL_MAT` 178 / 0,
   the full `MUL_MAT` 2,725 / 0 to completion, `GET_ROWS`), the red 179 FAIL, the
   build-break fallback costing Q3_K alone. Window 190 (a05b036e, the 2D GEMM): only its dry runs are recorded (clean: the 2D case
-  without a fallback key, the crash case declined `reason=view`); its results are owed.
+  without a fallback key, the crash case declined `reason=view`); its results were not recorded. The 1.6.2 release gate (2026-11-12, `measured-here`, RC 9c0c730e) ran the 2D GEMM's build on the B60: the op suite 186 of 186 on both cards, the red build 0 of 186, mean KL on Llama 2 7B Q3_K_S 0.08300-0.08304 against the CPU's 0.08416 on the same file, llama-bench 3389.67 / 79.64 (B60) and 1928.99 / 74.86 t/s (A770).
 - Window 186's numbers (b6d0e532, B60, us, Q3_K / Q4_K, 4096 x 14336): 78 / 78 at 1
   column (the 1-column gate holds: equal time at 3.4375 against 4.5 bits a weight),
   78-79 / 85-87 at 2-8, 97-99 / 136-140 at 9-16; ffn_down at 6 columns 129 / 158; the
   tile GEMM at 512 columns 1,816 / 826, ffn_down 2,442 / 1,191 (about 2x: the prompt
   path missed). Strata's NCOLS matvec arm 145-475 us at 2-8 (rejected for the default),
   one term about equal. The B60's prompt path is now the 2D-block GEMM (Q6_K's form on
-  the planes), target Q4_K's 826 us; its card run is owed. The A770 keeps the tile
+  the planes), target Q4_K's 826 us; its per-shape time is not measured (the 1.6.2 gate has llama-bench only, above). The A770 keeps the tile
   (no 2D block reads; int8 does not fit Q3_K's per-16 scales).
 
 ## Where it lives
