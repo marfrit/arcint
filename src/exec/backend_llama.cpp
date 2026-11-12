@@ -666,7 +666,8 @@ public:
         {
             const std::string arch_pre = gguf_architecture(cfg.gguf_path);
             if (const std::string no = dory_option_refusal(arch_pre, cfg.llama_mtp > 0 || !cfg.llama_mtp_gguf.empty(),
-                                                           cfg.llama_dflash_on(), cfg.llama_layer_split > 0, dory_opt);
+                                                           cfg.llama_dflash_on(), cfg.llama_layer_split > 0, dory_opt,
+                                                           cfg.tts || !cfg.mmproj_path.empty());
                 !no.empty())
                 throw std::runtime_error(no);
             if (dory_opt.max_loops > 0) {
@@ -828,15 +829,16 @@ public:
             if (const std::string no = dory_resolve(dg, dory_opt, ds); !no.empty()) throw std::runtime_error(no);
             // the layers libllama built must be the ones the loop count implies: a loop count that
             // did not take effect is a refusal, never a quiet fallback to the file's
+#ifdef ARCINT_LLAMA_DORY_TURN_LOOPS
+            // with the flag on the tables are those of N loops; with it off they are the unit's, and an
+            // inherited LLAMA_DORY_MAX_LOOPS that built larger ones is named here, before the layer count
+            // check reports it as a loop count that did not take effect
+            if (const std::string no = dory_check_max(ds.max_loops, ds.loops, llama_model_dory_loops_max(model_)); !no.empty())
+                throw std::runtime_error(no);
+#endif
             if (const std::string no = dory_check_loaded(ds, llama_model_n_layer(model_), llama_model_n_layer_physical(model_));
                 !no.empty())
                 throw std::runtime_error(no);
-#ifdef ARCINT_LLAMA_DORY_TURN_LOOPS
-            if (ds.max_loops > 0) {
-                if (const std::string no = dory_check_max(ds.max_loops, llama_model_dory_loops_max(model_)); !no.empty())
-                    throw std::runtime_error(no);
-            }
-#endif
             status_.dory_present = true;
             status_.dory         = ds;
         }
@@ -1016,7 +1018,7 @@ public:
             if (tctx == nullptr) throw std::runtime_error("dory: could not create the context that counts the KV cache layers");
             int built = 0;
             if (ggml_cgraph* gr = llama_graph_reserve(tctx, 8, 1, 8)) {
-                for (int il = 0; il < status_.dory.executed_layers; ++il) {
+                for (int il = 0; il < status_.dory.table_layers; ++il) {
                     const std::string nm = "cache_k_l" + std::to_string(il);
                     if (ggml_graph_get_tensor(gr, nm.c_str()) != nullptr) ++built;
                 }
@@ -2992,8 +2994,8 @@ private:
 
     // --llama-dory-max-loops: the request's loop count for this lane. A re-prefill is decided here, before
     // the prefix match (the sites that can reuse cached cells: generate's match, generate_spec_lane's, the
-    // multimodal and speech paths, which clear the lane; the last two and the drafter are refused with the
-    // flag). Caller holds mu_.
+    // multimodal and speech paths, which clear the lane; a projector and the speech path are refused with
+    // the flag at the start by dory_option_refusal, a drafter at the context below). Caller holds mu_.
     void dory_prepare_locked(int seq, const GenerationInput& in, std::vector<int>& have, GenerationStats& stats) {
         if (!dory_turn_) return;
         const int unit = status_.dory.loops;

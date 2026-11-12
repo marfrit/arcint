@@ -178,6 +178,19 @@ bool reserved_template_context_key(std::string_view key);
 nlohmann::json template_context(const ChatRequest& req, std::string& error,
                                 std::string_view template_src = {});
 
+// The reasoning effort a request is rendered with, as the client (or the unit's default, which
+// apply_template_kwarg_defaults has put into the request) stated it, before the template maps it:
+// chat_template_kwargs.reasoning_effort when the key is there, else the typed reasoning_effort, else
+// none. template_context follows this same decision, and --llama-dory-max-loops takes its loop count
+// from it, so the template and the count never read two different values. `is_string` is false for a
+// kwarg that is not a string (the template gets it unchanged; the loop count refuses it).
+struct EffectiveEffort {
+    bool        present   = false;
+    bool        is_string = true;
+    std::string level;
+};
+EffectiveEffort effective_reasoning_effort(const ChatRequest& req);
+
 // --chat-template-kwarg KEY=VALUE for a key other than enable_thinking: the
 // unit default of one chat_template_kwargs key. VALUE is JSON when it parses as
 // JSON (true, false, a number, a quoted string, an object or array) and the

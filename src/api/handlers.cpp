@@ -558,12 +558,22 @@ json props(const Context& ctx) {
                          {"kv_cache_layers", st.dory.kv_layers},
                          // --llama-dory-max-loops: the most loops a request may run (0: off, every request
                          // runs "loops"); with it on, the effort -> loops map ("unset" is a request
-                         // that names no effort)
+                         // that names no effort: the unit's default effort's count, else "loops").
+                         // "executed_layers" stays what a request at the unit's own count executes.
+                         // /v1/completions has no effort: it runs the unit's count.
                          {"max_loops", st.dory.max_loops},
                          {"effort_loops", [&]() {
                               if (st.dory.max_loops <= 0) return json(nullptr);
                               json m = json::object();
-                              for (const auto& [e, n] : dory_effort_map(st.dory.loops, st.dory.max_loops)) m[e] = n;
+                              // "unset": the unit's default effort's count when --chat-template-kwarg
+                              // reasoning_effort=... is set, else --llama-dory-loops
+                              std::string unit_effort;
+                              for (const auto& [k, text] : cfg.chat_template_kwarg_defaults) {
+                                  if (k != "reasoning_effort") continue;
+                                  const json v = json::parse(text, nullptr, /*allow_exceptions=*/false);
+                                  if (v.is_string()) unit_effort = v.get<std::string>();
+                              }
+                              for (const auto& [e, n] : dory_effort_map(st.dory.loops, st.dory.max_loops, unit_effort)) m[e] = n;
                               return m;
                           }()}};
          }()},
@@ -992,17 +1002,21 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
     prep.input.think_open          = prep.think_open;
     prep.input.think_closed        = prep.think_closed;
     prep.input.dialect = prep.dialect;
-    // --llama-dory-max-loops: this request's loop count from its effort, the typed field (the request's
-    // reasoning_effort or Responses reasoning.effort, or the unit's --chat-template-kwarg default, which
-    // apply_template_kwarg_defaults above has put there) else chat_template_kwargs.reasoning_effort.
-    // With the flag off the function is not consulted and input.dory_loops stays 0.
+    // --llama-dory-max-loops: this request's loop count from the SAME effective effort the template is
+    // rendered with (effective_reasoning_effort: chat_template_kwargs.reasoning_effort, else the typed
+    // field, which the unit's --chat-template-kwarg default has filled in above). A level outside the
+    // seven names, or a non-string kwarg, is a 400. With the flag off none of this runs and
+    // input.dory_loops stays 0.
     if (const ModelStatus& dst = ctx.backend->status(); dst.dory_present && dst.dory.max_loops > 0) {
-        std::string effort = prep.req.reasoning_effort;
-        if (effort.empty() && prep.req.chat_template_kwargs.is_object()) {
-            const auto it = prep.req.chat_template_kwargs.find("reasoning_effort");
-            if (it != prep.req.chat_template_kwargs.end() && it->is_string()) effort = it->get<std::string>();
-        }
-        prep.input.dory_loops = dory_loops_for_effort(effort, dst.dory.loops, dst.dory.max_loops);
+        const EffectiveEffort eff = effective_reasoning_effort(prep.req);
+        int                   loops = 0;
+        if (const std::string no = dory_request_loops(eff.present, eff.is_string, eff.level, dst.dory.loops,
+                                                      dst.dory.max_loops, loops);
+            !no.empty())
+            return HttpResult{400, invalid_request(no, eff.present && prep.req.chat_template_kwargs.contains("reasoning_effort")
+                                                           ? "chat_template_kwargs.reasoning_effort"
+                                                           : "reasoning_effort")};
+        prep.input.dory_loops = loops;
     }
     // The rendered prompt is the one thing that decides what the model saw.
     // When an answer differs from a reference run this is the first question,

@@ -10,22 +10,25 @@
 namespace lgc {
 
 std::string dory_option_refusal(std::string_view arch, bool mtp, bool dflash, bool layer_split,
-                                const DoryOptions& opt) {
+                                const DoryOptions& opt, bool projector) {
     if (arch != "dory") {
+        if (opt.max_loops > 0)
+            return "--llama-dory-max-loops is the per-request loop count of a 'dory' model; this GGUF is a '" + std::string(arch) + "'";
         if (opt.loops > 0)
             return "--llama-dory-loops is the loop count of a 'dory' model; this GGUF is a '" + std::string(arch) + "'";
         if (!opt.kv_mode.empty())
             return "--llama-dory-kv is the recurrent KV mode of a 'dory' model; this GGUF is a '" + std::string(arch) + "'";
-        if (opt.max_loops > 0)
-            return "--llama-dory-max-loops is the per-request loop count of a 'dory' model; this GGUF is a '" + std::string(arch) + "'";
         return {};
     }
     if (opt.max_loops > 0) {
         if (opt.max_loops > kDoryMaxLoops)
             return "--llama-dory-max-loops " + std::to_string(opt.max_loops) + ": the port runs 1 to " + std::to_string(kDoryMaxLoops);
-        if (opt.kv_mode != "last_loop")
-            return "--llama-dory-max-loops needs --llama-dory-kv last_loop: with per_loop a request at another count "
+        // the recurrent KV mode is the resolved one (the flag, else the file's own): checked in dory_resolve
+        if (!opt.kv_mode.empty() && opt.kv_mode != "last_loop")
+            return "--llama-dory-max-loops needs the last_loop recurrent KV: with per_loop a request at another count "
                    "would read cache layers that no earlier request wrote";
+        if (projector)
+            return "--llama-dory-max-loops: a 'dory' model has no projector; start without --mmproj and --tts";
         if (opt.loops > opt.max_loops)
             return "--llama-dory-max-loops " + std::to_string(opt.max_loops) + " is below --llama-dory-loops " +
                    std::to_string(opt.loops);
@@ -90,8 +93,9 @@ std::string dory_resolve(const DoryGguf& g, const DoryOptions& opt, DoryServed& 
             return "dory: --llama-dory-max-loops " + std::to_string(s.max_loops) + " is below the unit's " +
                    std::to_string(s.loops) + " loops (" + s.loops_source + ")";
     }
+    s.executed_layers = g.n_input + g.n_recurrent * s.loops + g.n_output;
     // the tables libllama builds are those of the largest count a request may run
-    s.executed_layers = g.n_input + g.n_recurrent * std::max(s.loops, s.max_loops) + g.n_output;
+    s.table_layers = g.n_input + g.n_recurrent * std::max(s.loops, s.max_loops) + g.n_output;
     out               = s;
     return {};
 }
@@ -100,9 +104,9 @@ std::string dory_check_loaded(const DoryServed& s, int n_layer_reported, int n_l
     if (n_layer_physical_reported != s.physical_layers)
         return "dory: libllama reports " + std::to_string(n_layer_physical_reported) + " physical blocks, the file's counts say " +
                std::to_string(s.physical_layers);
-    if (n_layer_reported != s.executed_layers)
+    if (n_layer_reported != s.table_layers)
         return "dory: libllama executes " + std::to_string(n_layer_reported) + " layers, " +
-               std::to_string(std::max(s.loops, s.max_loops)) + " loops imply " + std::to_string(s.executed_layers) + "; the loop count did not take effect";
+               std::to_string(std::max(s.loops, s.max_loops)) + " loops imply " + std::to_string(s.table_layers) + "; the loop count did not take effect";
     return {};
 }
 
@@ -113,21 +117,46 @@ std::string dory_check_kv(const DoryServed& s, int kv_layers_built) {
     return {};
 }
 
-int dory_loops_for_effort(std::string_view effort, int unit_loops, int max_loops) {
-    std::string e(effort);
-    std::transform(e.begin(), e.end(), e.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+bool dory_effort_known(std::string_view e) {
+    return e == "none" || e == "off" || e == "minimal" || e == "low" || e == "medium" || e == "high" || e == "xhigh";
+}
+
+int dory_loops_for_effort(std::string_view e, int unit_loops, int max_loops) {
     int n = unit_loops;
-    if (e == "none" || e == "off" || e == "minimal" || e == "low") n = 1;
-    else if (e == "medium") n = 2;
-    else if (e == "high" || e == "xhigh") n = 4;
+    if (e.empty()) {
+    } else if (e == "none" || e == "off" || e == "minimal" || e == "low") {
+        n = 1;
+    } else if (e == "medium") {
+        n = 2;
+    } else if (e == "high" || e == "xhigh") {
+        n = 4;
+    } else {
+        return 0;
+    }
     if (max_loops > 0) n = std::min(n, max_loops);
     return std::max(n, 1);
 }
 
-std::vector<std::pair<std::string, int>> dory_effort_map(int unit_loops, int max_loops) {
+std::string dory_request_loops(bool present, bool is_string, std::string_view level, int unit_loops,
+                               int max_loops, int& loops) {
+    loops = 0;
+    if (present && !is_string)
+        return std::string("chat_template_kwargs.reasoning_effort must be a string, one of ") + kDoryEffortNames +
+               " (this unit chooses the Dory loop count by the reasoning effort)";
+    if (present && !dory_effort_known(level))
+        return "reasoning effort '" + std::string(level) + "' is not one of " + kDoryEffortNames +
+               " (exact, lower case; this unit chooses the Dory loop count by the reasoning effort)";
+    loops = dory_loops_for_effort(present ? level : std::string_view(), unit_loops, max_loops);
+    return {};
+}
+
+std::vector<std::pair<std::string, int>> dory_effort_map(int unit_loops, int max_loops, std::string_view unit_default_effort) {
     std::vector<std::pair<std::string, int>> m;
-    for (const char* e : {"", "none", "off", "minimal", "low", "medium", "high", "xhigh"})
-        m.emplace_back(*e ? e : "unset", dory_loops_for_effort(e, unit_loops, max_loops));
+    for (const char* e : {"", "none", "off", "minimal", "low", "medium", "high", "xhigh"}) {
+        int n = dory_loops_for_effort(*e ? std::string_view(e) : unit_default_effort, unit_loops, max_loops);
+        if (n == 0) n = dory_loops_for_effort({}, unit_loops, max_loops);   // a default outside the names: refused at the start
+        m.emplace_back(*e ? e : "unset", n);
+    }
     return m;
 }
 
@@ -135,10 +164,16 @@ DoryReuse dory_reuse(int slot_loops, int want_loops, std::size_t cached_tokens) 
     return cached_tokens > 0 && slot_loops != want_loops ? DoryReuse::Reprefill : DoryReuse::Keep;
 }
 
-std::string dory_check_max(int asked_max, unsigned lib_max) {
-    if (static_cast<unsigned>(asked_max) == lib_max) return {};
-    return "dory: --llama-dory-max-loops " + std::to_string(asked_max) + ", but libllama built its tables for " +
-           std::to_string(lib_max) + " loops; the maximum did not take effect";
+std::string dory_check_max(int asked_max, int unit_loops, unsigned lib_max) {
+    if (asked_max > 0) {
+        if (static_cast<unsigned>(asked_max) == lib_max) return {};
+        return "dory: --llama-dory-max-loops " + std::to_string(asked_max) + ", but libllama built its tables for " +
+               std::to_string(lib_max) + " loops; the maximum did not take effect";
+    }
+    if (static_cast<unsigned>(unit_loops) == lib_max) return {};
+    return "dory: libllama built its tables for " + std::to_string(lib_max) + " loops, the unit runs " +
+           std::to_string(unit_loops) + ": LLAMA_DORY_MAX_LOOPS is set in the environment; unset it, or pass "
+           "--llama-dory-max-loops to serve per-request counts";
 }
 
 namespace {

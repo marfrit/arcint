@@ -429,8 +429,13 @@ std::string usage_text() {
         "                            last; default: the GGUF's own, per_loop)\n"
         "  --llama-dory-max-loops N  a Dory model: let a request choose 1 to N loops by its\n"
         "                            reasoning effort (none/off/minimal/low 1, medium 2,\n"
-        "                            high/xhigh 4, capped at N; no effort: the unit's\n"
-        "                            count). Needs --llama-dory-kv last_loop and N >=\n"
+        "                            high/xhigh 4, capped at N; exact lower-case names, any\n"
+        "                            other effort is a 400). A request without an effort\n"
+        "                            runs the count of this unit's --chat-template-kwarg\n"
+        "                            reasoning_effort default when one is set, else\n"
+        "                            --llama-dory-loops; /v1/completions has no effort and\n"
+        "                            runs --llama-dory-loops. Needs the last_loop recurrent\n"
+        "                            KV (--llama-dory-kv, or the file's own) and N >=\n"
         "                            --llama-dory-loops; a change of count re-prefills the\n"
         "                            slot. Default 0, off (contrib/llama.cpp 0118)\n"
         "  --llama-expert-profile F  the expert ranking that fills the cache (Strata's\n"
@@ -1019,8 +1024,11 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     // unit's count. That the library has the symbol, that the model is a 'dory' one and that
     // the tables took the count are checked at the load (exec/backend_llama.cpp).
     if (cfg.llama_dory_max_loops > 0) {
-        if (cfg.llama_dory_kv != "last_loop")
-            return fail("--llama-dory-max-loops needs --llama-dory-kv last_loop (with per_loop a request at another "
+        // the mode that decides is the resolved one: --llama-dory-kv, else the file's own, which is read
+        // at the load (dory_resolve refuses a file whose mode is per_loop). Only a given per_loop is
+        // known here.
+        if (!cfg.llama_dory_kv.empty() && cfg.llama_dory_kv != "last_loop")
+            return fail("--llama-dory-max-loops needs the last_loop recurrent KV (with per_loop a request at another "
                         "count would read cache layers that no earlier request wrote)");
         if (cfg.llama_dory_loops > cfg.llama_dory_max_loops)
             return fail("--llama-dory-max-loops " + std::to_string(cfg.llama_dory_max_loops) +

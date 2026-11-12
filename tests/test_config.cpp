@@ -813,8 +813,13 @@ TEST(config_llama_dory_max_loops) {
         CHECK(run({"--gguf", "/m/d.gguf", "--llama-dory-max-loops", "0"}, cfg).ok);
         CHECK_EQ(cfg.llama_dory_max_loops, 0);
     }
-    // the cache must be last_loop: absent, per_loop
-    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-max-loops", "4"}));
+    {
+        Config cfg;   // the mode is the resolved one: none given, the file's own decides at the load
+        CHECK(run({"--gguf", "/m/d.gguf", "--llama-dory-max-loops", "4"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dory_max_loops, 4);
+        CHECK(cfg.llama_dory_kv.empty());
+    }
+    // a given per_loop is refused here (a file whose own mode is per_loop is refused at the load)
     CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-kv", "per_loop", "--llama-dory-max-loops", "4"}));
     // N below the unit's own count
     CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-kv", "last_loop", "--llama-dory-loops", "3",
@@ -827,6 +832,18 @@ TEST(config_llama_dory_max_loops) {
     // a projector: not on a dory model
     CHECK(rejected({"--gguf", "/m/d.gguf", "--mmproj", "/m/p.gguf", "--llama-dory-kv", "last_loop",
                     "--llama-dory-max-loops", "4"}));
+    // the speech path: --tts is a projector too. The same line without the flag is fine, so the
+    // refusal is the flag's and names it.
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/d.gguf", "--mmproj", "/m/p.gguf", "--tts", "--tts-profiles", "/m/voices"}, cfg).ok);
+        Config cfg2;
+        const ArgParse r = run({"--gguf", "/m/d.gguf", "--mmproj", "/m/p.gguf", "--tts", "--tts-profiles", "/m/voices",
+                                "--llama-dory-kv", "last_loop", "--llama-dory-max-loops", "4"}, cfg2);
+        CHECK(!r.ok);
+        CHECK(r.error.find("--llama-dory-max-loops") != std::string::npos);
+        CHECK(r.error.find("--tts") != std::string::npos);
+    }
     // the libllama engine's option only
     CHECK(rejected({"--stub", "--llama-dory-max-loops", "4"}));
 }

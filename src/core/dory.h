@@ -42,8 +42,9 @@ struct DoryOptions {
 //   --llama-mtp / --llama-dflash: Dory has no MTP head and no DFlash2 drafter.
 //   --llama-layer-split: the layer placement counts the physical blocks and the
 //   executed ones apart (patch 0108), and a split of that has not been run.
+//   --mmproj / --tts with --llama-dory-max-loops: the multimodal and speech decodes do not set the count.
 std::string dory_option_refusal(std::string_view arch, bool mtp, bool dflash, bool layer_split,
-                                const DoryOptions& opt);
+                                const DoryOptions& opt, bool projector = false);
 
 // The GGUF's own metadata, read from the loaded model; 0 / empty = absent.
 struct DoryGguf {
@@ -63,9 +64,13 @@ struct DoryServed {
     std::string loops_source;
     std::string kv_source;
     int         physical_layers = 0;
-    // the layers of the tables libllama built: at --llama-dory-max-loops N the tables are those of N
-    // loops, whatever count a request runs
+    // the layers a request at the unit's own count executes (16 + 40 * loops + 16); reported on /props
+    // and in the boot line, and the same with the flag off as before it existed
     int         executed_layers = 0;
+    // the layers of the tables libllama built (llama_model_n_layer): at --llama-dory-max-loops N those
+    // of N loops, whatever count a request runs. Equal to executed_layers with the flag off. Sizing and
+    // the load checks read this one; nothing sized reads executed_layers.
+    int         table_layers    = 0;
     int         max_loops       = 0;   // --llama-dory-max-loops; 0 = off, every request runs `loops`
     // the layers that hold a KV cache once libllama has built the model: the attention blocks of the input
     // and output segments, and the recurrent segment's attention blocks once per loop (per_loop) or once
@@ -73,15 +78,31 @@ struct DoryServed {
     int         kv_layers = 0;
 };
 
-// The per-request loop count (--llama-dory-max-loops). `effort` is the request's reasoning effort as
-// typed (ChatRequest::reasoning_effort, after the unit's default); empty or a level this map does not
-// know: the unit's count. none, off, minimal, low: 1; medium: 2; high, xhigh: 4; the result is capped at
-// `max_loops` (and never below 1). `unit_loops` is --llama-dory-loops or the file's count.
+// The seven reasoning-effort names the map knows, exact and case-sensitive (the chat template reads the
+// same strings): none off minimal low medium high xhigh.
+bool dory_effort_known(std::string_view effort);
+constexpr const char* kDoryEffortNames = "none, off, minimal, low, medium, high, xhigh";
+
+// The loop count of one effort level (--llama-dory-max-loops). Empty: the unit's count. none, off,
+// minimal, low: 1; medium: 2; high, xhigh: 4; the result is capped at `max_loops` (never below 1).
+// A level that is not one of the seven names (any other case included) gives 0: the caller decides
+// what that means (the request path refuses it). `unit_loops` is --llama-dory-loops or the file's count.
 int dory_loops_for_effort(std::string_view effort, int unit_loops, int max_loops);
 
-// The map as /props prints it, in a fixed order: ("unset", unit_loops), ("none", ..), .. ("xhigh", ..),
-// each already capped at max_loops.
-std::vector<std::pair<std::string, int>> dory_effort_map(int unit_loops, int max_loops);
+// The decision for one request with --llama-dory-max-loops on: the count it runs at, or an error text
+// (the 400's message; `loops` is then 0). `present`, `is_string` and `level` are the request's effective
+// effort (core/chat.h effective_reasoning_effort: the explicit chat_template_kwargs.reasoning_effort,
+// else the typed field, else the unit's --chat-template-kwarg default). Not present: the unit's count.
+// Present and not a string, or a string outside the seven names: refused, never a fallback.
+std::string dory_request_loops(bool present, bool is_string, std::string_view level, int unit_loops,
+                               int max_loops, int& loops);
+
+// The map as /props prints it, in a fixed order: ("unset", n), ("none", ..), .. ("xhigh", ..), each
+// already capped at max_loops. "unset" is what a request that names no effort runs on THIS unit: the
+// count of `unit_default_effort` (the unit's --chat-template-kwarg reasoning_effort) when there is one,
+// else `unit_loops`.
+std::vector<std::pair<std::string, int>> dory_effort_map(int unit_loops, int max_loops,
+                                                         std::string_view unit_default_effort = {});
 
 // What a slot does with the cells it holds when a request comes at `want_loops`. A cache written at
 // another count is not continued: continuing it moved the mean KL by +0.001 to +0.006 nats over the
@@ -91,10 +112,12 @@ std::vector<std::pair<std::string, int>> dory_effort_map(int unit_loops, int max
 enum class DoryReuse { Keep, Reprefill };
 DoryReuse dory_reuse(int slot_loops, int want_loops, std::size_t cached_tokens);
 
-// After the load: libllama's maximum (llama_model_dory_loops_max) must be the one the flag asked for.
-// A mismatch means the tables were built for another count (LLAMA_DORY_MAX_LOOPS not honoured), which
-// is a refusal, never a quiet fallback. Empty when it matches.
-std::string dory_check_max(int asked_max, unsigned lib_max);
+// After the load: libllama's maximum (llama_model_dory_loops_max) must be the one the flag asked for, or
+// with the flag off (`asked_max` 0) the unit's own count. A mismatch means the tables were built for
+// another count: LLAMA_DORY_MAX_LOOPS not honoured with the flag on, or set in the environment with the
+// flag off. Either is a refusal, never a quiet fallback; the second names the variable and the flag.
+// Empty when it matches.
+std::string dory_check_max(int asked_max, int unit_loops, unsigned lib_max);
 
 // The effective values. Returns an error text (and leaves `out` unset) for
 // metadata the port does not run; empty on success.

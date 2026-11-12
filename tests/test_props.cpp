@@ -317,6 +317,68 @@ TEST(props_reports_the_dory_loops_and_kv_mode) {
     }
 }
 
+// --llama-dory-max-loops: /props names the largest count a request may run and, with it on, the
+// effort -> loops map. Off: max_loops 0 and effort_loops null, nothing else moves.
+TEST(props_reports_the_dory_max_loops_and_the_effort_map) {
+    auto dory_backend = [](FakeBackend& b, int loops, int max_loops) {
+        b.st.loaded                  = true;
+        b.st.arch                    = "dory";
+        b.st.n_layer                 = 72;
+        b.st.dory_present            = true;
+        b.st.dory.loops              = loops;
+        b.st.dory.kv_mode            = "last_loop";
+        b.st.dory.loops_source       = "flag";
+        b.st.dory.kv_source          = "flag";
+        b.st.dory.physical_layers    = 72;
+        b.st.dory.executed_layers    = 16 + 40 * loops + 16;
+        b.st.dory.table_layers       = 16 + 40 * std::max(loops, max_loops) + 16;
+        b.st.dory.kv_layers          = 36;
+        b.st.dory.max_loops          = max_loops;
+    };
+    {   // off
+        Config cfg;
+        FakeBackend backend;
+        dory_backend(backend, 2, 0);
+        SlotPool slots(1);
+        Context  ctx{&cfg, &backend, &slots};
+        const auto& d = lgc::api::props(ctx).at("dory");
+        CHECK_EQ(d.at("max_loops").get<int>(), 0);
+        CHECK(d.at("effort_loops").is_null());
+        CHECK_EQ(d.at("executed_layers").get<int>(), 112);
+    }
+    {   // on, no unit default effort: "unset" runs --llama-dory-loops
+        Config cfg;
+        FakeBackend backend;
+        dory_backend(backend, 2, 4);
+        SlotPool slots(1);
+        Context  ctx{&cfg, &backend, &slots};
+        const auto& d = lgc::api::props(ctx).at("dory");
+        CHECK_EQ(d.at("max_loops").get<int>(), 4);
+        CHECK_EQ(d.at("executed_layers").get<int>(), 112);   // the unit's own count, not the table's 192
+        const auto& m = d.at("effort_loops");
+        CHECK_EQ(m.size(), size_t{8});
+        CHECK_EQ(m.at("unset").get<int>(), 2);
+        CHECK_EQ(m.at("none").get<int>(), 1);
+        CHECK_EQ(m.at("off").get<int>(), 1);
+        CHECK_EQ(m.at("minimal").get<int>(), 1);
+        CHECK_EQ(m.at("low").get<int>(), 1);
+        CHECK_EQ(m.at("medium").get<int>(), 2);
+        CHECK_EQ(m.at("high").get<int>(), 4);
+        CHECK_EQ(m.at("xhigh").get<int>(), 4);
+    }
+    {   // on, with --chat-template-kwarg reasoning_effort=high: "unset" is the default effort's count
+        Config cfg;
+        cfg.chat_template_kwarg_defaults.emplace_back("reasoning_effort", "\"high\"");
+        FakeBackend backend;
+        dory_backend(backend, 2, 4);
+        SlotPool slots(1);
+        Context  ctx{&cfg, &backend, &slots};
+        const auto& m = lgc::api::props(ctx).at("dory").at("effort_loops");
+        CHECK_EQ(m.at("unset").get<int>(), 4);
+        CHECK_EQ(m.at("low").get<int>(), 1);
+    }
+}
+
 // --llama-dflash-gguf: /props says which drafter serves (one a context)
 TEST(props_reports_the_dflash_drafter) {
     {
