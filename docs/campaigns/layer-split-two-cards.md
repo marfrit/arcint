@@ -146,6 +146,23 @@ V = `src/core/verify.cpp`, P = `src/prefill/prefill.cpp`.
 
 - **Path:** the split is in the CUDA/HIP path. This checkout carries no SYCL
   sources.
+  - **Later** (2026-11-12, checkout `5f0ae5b5`, `code`): the tree carries a
+    SYCL port (`sycl/`, its first commit dated 2026-09-29), and the port
+    carries the split. So the line above may have been wrong when it was
+    written; that day's checkout was not re-checked. On exactly two
+    Battlemage cards the port overlaps one conversation's windows by default
+    (`--pipeline-windows 2`): stage 0 runs window K+1 while stage 1 still
+    checks window K, two verifiers a stage, one per window parity
+    (`sycl/include/strata/core/verify.hpp`, "PIPELINED WINDOWS"). The default
+    holds only for `--serve` with the MTP drafter and `--spec` 2 or more, and
+    without `--batch`, `--peer-device` or the helper caches
+    (`sycl/include/strata/pipeline_auto.hpp`, `pipeline_auto_on`). A single
+    card, an Alchemist card, a mixed pair and three or more stages stay
+    serial, so the B60 + A770 pair of this campaign would run serial there.
+    The reference's numbers (`paper`, `docs/INTEL_ARC.md`): 2x Arc Pro B65,
+    17 to 23 % faster decode than the serial `--spec 4` setup, chat 71-74
+    against 60-63 t/s. Nothing of it was run here. The line numbers in the
+    list below are the earlier checkout's CUDA path.
 - **Stages:**
   - one `GpuStage` per card (G:690-708);
   - a chain of `Verifier`s (verify.hpp:111-118, G:4139-4170);

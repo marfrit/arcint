@@ -182,3 +182,9 @@ levers that do not trade quality for speed): an answer-changing lever is opt-in 
 passes the answer-level bar and the task battery before it can become a default.
 Strata's reference checkout here is at 4b9e05a2 (2026-10-25); upstream was at
 870aedd9 (2026-10-29) when this was written.
+
+Later (2026-11-12): the checkout is at 5f0ae5b5 (2026-11-11). The SYCL port (`sycl/`,
+`docs/INTEL.md`, `docs/INTEL_ARC.md`) was already in the 4b9e05a2 tree and was not read
+for this history. Nor was the history re-read for the commits in between; one change was
+read on its own, the mixed-IQ3 decode kernels (pull request #4185), in
+`research-concept-mining.md`.
