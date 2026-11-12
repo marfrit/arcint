@@ -40,6 +40,13 @@ nlohmann::json timings_json(const GenerationStats& stats);
 // once.
 bool loop_guard_moved(const GenerationStats& stats);
 
+// --llama-dory-max-loops: the loop count the request ran at and whether a change of count made the
+// slot's prompt be prefilled again. Present in a response on this one condition (the flag is on, so
+// the backend named a count), as loop_guard is present when it moved: with the flag off no body
+// changes. {"loops": N, "reprefill": bool}.
+bool           dory_named(const GenerationStats& stats);
+nlohmann::json dory_json(const GenerationStats& stats);
+
 // feyntalk W3.5: the `truncation: "auto"` fit pass's numbers, once, for the
 // non-streamed `arcint.truncated` object and the stream's arcint:truncated
 // event: blocks dropped, tokens freed, prompt tokens before/after and the
