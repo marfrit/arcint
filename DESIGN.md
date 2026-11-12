@@ -190,7 +190,30 @@ measured on 2026-11-07.
   start, from the GGUF's architecture and before the load: `--llama-mtp` (no head),
   `--llama-dflash-gguf` (no drafter) and `--llama-layer-split` (the placement counts
   the physical and the executed layers apart, a split of that is untested), and
-  the two dory flags on any other architecture. `last_loop` makes a token's hidden
+  the two dory flags on any other architecture.
+
+  **A loop count per request** (`--llama-dory-max-loops N`, contrib/llama.cpp
+  0118, off by default). With N the load builds libllama's tables for N loops
+  (`LLAMA_DORY_MAX_LOOPS`, read back with `llama_model_dory_loops_max`, a mismatch
+  refuses the start) and a request runs 1 to N: its reasoning effort (the typed
+  field, which holds the unit's `--chat-template-kwarg reasoning_effort` default,
+  else `chat_template_kwargs.reasoning_effort`) maps none, off, minimal, low to 1,
+  medium to 2, high, xhigh to 4, capped at N; no effort runs `--llama-dory-loops`
+  (the file's count without it). It needs `--llama-dory-kv last_loop` (with
+  `per_loop` a request at another count would read cache layers no earlier request
+  wrote), N at least the unit's count, a build with the 0118 symbol, and no
+  drafter or projector; anything else refuses the start. A slot whose cells were
+  written at another count is dropped and the prompt prefilled again at the new
+  one, never continued: continuing moved the mean KL by +0.001 to +0.006 nats over
+  the floor and cost up to 1.6 points of argmax agreement (`measured-here`, CPU,
+  patch 0118), which is no equivalence, while a load at N loops and a request at N
+  loops on tables for 4 were bit-equal in logits (18 greedy cases, 2,252 rows). The
+  count is set on the context before every decode under the decode lock; one
+  `llama_decode` carries one lane's rows on this path. Every answer names the count
+  (`dory: {loops, reprefill}`), `/props` `dory` carries `max_loops` and the map. A card
+  run of this feature is owed; with the flag off nothing changes.
+
+  `last_loop` makes a token's hidden
   state depend on where the chunk boundaries of its prefill fall (loop i attends to
   loop i's KV inside the chunk and to the last loop's KV before it; upstream's own
   test compares such a model only against the same batch), so equivalence across
