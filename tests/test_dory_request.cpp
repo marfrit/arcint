@@ -207,13 +207,13 @@ TEST(dory_response_reasoning_effort_reaches_the_input) {
     for (const auto& r : rows) {
         lgc::api::ResponseRequest req;
         CHECK(!lgc::api::parse_response_request(
-                  json{{"model", "dory"}, {"input", "hi"}, {"max_output_tokens", 1}, {"reasoning", {{"effort", r.effort}}}}, req));
+                  json{{"model", "dory"}, {"input", "hi"}, {"max_output_tokens", 16}, {"reasoning", {{"effort", r.effort}}}}, req));
         lgc::api::PreparedResponse prep;
         CHECK(!lgc::api::prepare_response(u.ctx, std::move(req), prep));
         CHECK_EQ(prep.chat.input.dory_loops, r.want);
     }
     lgc::api::ResponseRequest none;
-    CHECK(!lgc::api::parse_response_request(json{{"model", "dory"}, {"input", "hi"}, {"max_output_tokens", 1}}, none));
+    CHECK(!lgc::api::parse_response_request(json{{"model", "dory"}, {"input", "hi"}, {"max_output_tokens", 16}}, none));
     lgc::api::PreparedResponse prep;
     CHECK(!lgc::api::prepare_response(u.ctx, std::move(none), prep));
     CHECK_EQ(prep.chat.input.dory_loops, 2);
@@ -221,7 +221,7 @@ TEST(dory_response_reasoning_effort_reaches_the_input) {
     DoryUnit off(0);
     lgc::api::ResponseRequest hi;
     CHECK(!lgc::api::parse_response_request(
-              json{{"model", "dory"}, {"input", "hi"}, {"max_output_tokens", 1}, {"reasoning", {{"effort", "high"}}}}, hi));
+              json{{"model", "dory"}, {"input", "hi"}, {"max_output_tokens", 16}, {"reasoning", {{"effort", "high"}}}}, hi));
     lgc::api::PreparedResponse p2;
     CHECK(!lgc::api::prepare_response(off.ctx, std::move(hi), p2));
     CHECK_EQ(p2.chat.input.dory_loops, 0);
