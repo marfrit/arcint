@@ -236,6 +236,10 @@ struct ContextOverflowError : InputError {
 };
 
 struct GenerationInput {
+    // --llama-dory-max-loops: the loop count this request runs at, from its reasoning effort
+    // (core/dory.h dory_loops_for_effort). 0: the unit's count (and every request with the flag off).
+    int dory_loops = 0;
+
     // OpenAI image_url parts of this request, in the order their markers appear
     // in `prompt` (`docs/milestone-1.2.0.md §3`). Empty on a text request; the
     // backend's multimodal branch reads the bytes and encodes them.
@@ -307,6 +311,10 @@ struct GenerationInput {
 };
 
 struct GenerationStats {
+    // --llama-dory-max-loops: the loop count the request ran at (0: the flag is off) and whether
+    // the change from its slot's count made the backend prefill the prompt again
+    int    dory_loops        = 0;
+    bool   dory_reprefill    = false;
     int    prompt_tokens     = 0;
     int    completion_tokens = 0;
     int    cache_hit_tokens  = 0;

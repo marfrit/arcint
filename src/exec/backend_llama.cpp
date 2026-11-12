@@ -662,13 +662,23 @@ public:
         // architecture, before the load, and hand libllama the loop count and the recurrent KV
         // mode the operator named as metadata overrides. Neither flag: the file's own values serve,
         // read back and reported below.
-        const DoryOptions dory_opt{ cfg.llama_dory_loops, cfg.llama_dory_kv };
+        const DoryOptions dory_opt{ cfg.llama_dory_loops, cfg.llama_dory_kv, cfg.llama_dory_max_loops };
         {
             const std::string arch_pre = gguf_architecture(cfg.gguf_path);
             if (const std::string no = dory_option_refusal(arch_pre, cfg.llama_mtp > 0 || !cfg.llama_mtp_gguf.empty(),
                                                            cfg.llama_dflash_on(), cfg.llama_layer_split > 0, dory_opt);
                 !no.empty())
                 throw std::runtime_error(no);
+            if (dory_opt.max_loops > 0) {
+                // contrib/llama.cpp 0118: libllama builds the tables for the maximum at the load and reads it
+                // from the environment; the flag is refused where the library cannot take it, and the
+                // tables' maximum is read back below (llama_model_dory_loops_max)
+#ifdef ARCINT_LLAMA_DORY_TURN_LOOPS
+                setenv("LLAMA_DORY_MAX_LOOPS", std::to_string(dory_opt.max_loops).c_str(), 1);
+#else
+                throw std::runtime_error("--llama-dory-max-loops: this build's llama.cpp lacks contrib/llama.cpp patch 0118");
+#endif
+            }
             if (arch_pre == "dory" && dory_opt.any()) {
                 auto put = [&](const char* key, llama_model_kv_override_type tag) {
                     llama_model_kv_override o{};
@@ -821,6 +831,12 @@ public:
             if (const std::string no = dory_check_loaded(ds, llama_model_n_layer(model_), llama_model_n_layer_physical(model_));
                 !no.empty())
                 throw std::runtime_error(no);
+#ifdef ARCINT_LLAMA_DORY_TURN_LOOPS
+            if (ds.max_loops > 0) {
+                if (const std::string no = dory_check_max(ds.max_loops, llama_model_dory_loops_max(model_)); !no.empty())
+                    throw std::runtime_error(no);
+            }
+#endif
             status_.dory_present = true;
             status_.dory         = ds;
         }
@@ -1106,6 +1122,15 @@ public:
         status_.dflash_enabled = dflash_;
         status_.dflash_drafts  = dflash_ ? n_draft_ : 0;
         slot_tokens_.resize(static_cast<size_t>(lanes_));
+        // --llama-dory-max-loops: the count each lane's cells were written at, and the one the context
+        // is set to. Every request is served at one count (generate), a decode sets it under mu_
+        if (status_.dory_present && status_.dory.max_loops > 0) {
+            if (spec_)
+                throw std::runtime_error("--llama-dory-max-loops: a drafter shares the context's decodes; start without --llama-mtp/-dflash");
+            dory_turn_       = true;
+            dory_ctx_loops_  = status_.dory.loops;
+            slot_loops_.assign(static_cast<size_t>(lanes_), status_.dory.loops);
+        }
         comb_decoding_.assign(static_cast<size_t>(lanes_), false);
         comb_stalled_.assign(static_cast<size_t>(lanes_), false);
         // context checkpoints only where llama.cpp makes them: a memory that
@@ -1647,6 +1672,8 @@ public:
         const int cap = cap_[static_cast<size_t>(seq)];   // the lane's context
         const std::vector<int> prompt = prompt_tokens(in);
         stats.prompt_tokens = static_cast<int>(prompt.size());
+        // the count this request is served at, named in the response even where it ends before a decode
+        if (dory_turn_) stats.dory_loops = in.dory_loops > 0 ? in.dory_loops : status_.dory.loops;
         if (prompt.empty()) return FinishReason::Stop;
         if (static_cast<int>(prompt.size()) >= cap) {
             log::warn("slot", "lane %d: prompt of %zu tokens does not fit n_ctx %d", seq, prompt.size(), cap);
@@ -1685,6 +1712,9 @@ public:
             // always run, for its logits. A recurrent state cannot step back:
             // where llama.cpp refuses the partial removal the lane resumes from
             // its newest checkpoint inside the prefix, else it starts over.
+            // --llama-dory-max-loops: a slot whose cells were written at another count is dropped before the
+            // match, so the whole prompt is prefilled at this request's count
+            dory_prepare_locked(seq, in, have, stats);
             size_t common = 0;
             while (common < have.size() && common < prompt.size() && have[common] == prompt[common]) ++common;
             if (common == prompt.size()) --common;
@@ -2960,7 +2990,50 @@ private:
         return r.rc;
     }
 
+    // --llama-dory-max-loops: the request's loop count for this lane. A re-prefill is decided here, before
+    // the prefix match (the sites that can reuse cached cells: generate's match, generate_spec_lane's, the
+    // multimodal and speech paths, which clear the lane; the last two and the drafter are refused with the
+    // flag). Caller holds mu_.
+    void dory_prepare_locked(int seq, const GenerationInput& in, std::vector<int>& have, GenerationStats& stats) {
+        if (!dory_turn_) return;
+        const int unit = status_.dory.loops;
+        const int want = in.dory_loops > 0 ? in.dory_loops : unit;
+        if (want < 1 || want > status_.dory.max_loops)
+            throw std::runtime_error(log::format("dory: a request for %d loops; this unit serves 1 to %d", want, status_.dory.max_loops));
+        int&         cur       = slot_loops_[static_cast<size_t>(seq)];
+        const size_t held      = have.size();
+        const int    was       = cur;
+        const bool   reprefill = dory_reuse(cur, want, held) == DoryReuse::Reprefill;
+        if (reprefill) {
+            llama_memory_seq_rm(llama_get_memory(ctx_), seq, -1, -1);
+            have.clear();
+            ckpts_[static_cast<size_t>(seq)].clear();
+        }
+        cur                  = want;
+        stats.dory_loops     = want;
+        stats.dory_reprefill = reprefill;
+        if (reprefill)
+            log::info("slot", "lane %d: dory %d loop%s, the slot held %zu tokens written at %d: re-prefill", seq, want,
+                      want == 1 ? "" : "s", held, was);
+        else
+            log::info("slot", "lane %d: dory %d loop%s, no re-prefill (%zu tokens held)", seq, want, want == 1 ? "" : "s", held);
+    }
+
     bool decode_locked(int seq, const int* toks, size_t n, size_t pos, bool want_last) {
+#ifdef ARCINT_LLAMA_DORY_TURN_LOOPS
+        // the count is the context's, and another lane's request may have set it since: set it before
+        // every decode, under the lock that serialises them (one llama_decode carries one lane's rows here)
+        if (dory_turn_) {
+            const int want = slot_loops_[static_cast<size_t>(seq)];
+            if (want != dory_ctx_loops_) {
+                if (!llama_set_dory_loops(ctx_, static_cast<uint32_t>(want))) {
+                    log::error("llama", "llama_set_dory_loops(%d) refused", want);
+                    return false;
+                }
+                dory_ctx_loops_ = want;
+            }
+        }
+#endif
         llama_batch b = llama_batch_init(static_cast<int32_t>(n), 0, 1);
         for (size_t i = 0; i < n; ++i) {
             b.token[i]     = toks[i];
@@ -3100,6 +3173,9 @@ private:
     uint64_t                              n_uneven_      = 0;   // of them, verifies of different lengths
     std::chrono::microseconds             comb_wait_{ 20000 };
     std::vector<std::vector<int>>         slot_tokens_;
+    bool                                  dory_turn_      = false;   // --llama-dory-max-loops is on
+    int                                   dory_ctx_loops_ = 0;       // the count the context is set to
+    std::vector<int>                      slot_loops_;               // per lane: the count its cached cells were written at
     std::unique_ptr<LlamaSpec>            spec_;      // --llama-mtp, --llama-dflash-gguf
     int                                   n_draft_ = 0;
     std::atomic<unsigned long long>       mtp_req_{0};   // requests served, the trace's `req`
