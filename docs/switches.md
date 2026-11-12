@@ -72,6 +72,7 @@ These names are not in a table:
 
 | switch | default | what it does | patch | evidence |
 |---|---|---|---|---|
+| `LLAMA_DORY_MAX_LOOPS` | unset: the tables are those of the file's (or `--llama-dory-loops`) count | `1`..`4`: at load, the Dory model builds its executed-layer tables for that many loops, so a context may choose any count up to it (`llama_set_dory_loops`). Above the file's count it needs the `last_loop` cache; with `per_loop`, or out of range, the library warns and the file's count serves. arcint sets it from `--llama-dory-max-loops` and reads `llama_model_dory_loops_max` back, refusing the start on a mismatch; with the flag off, a value in the environment that builds larger tables than the unit runs is a refused start naming the variable and the flag. | 0118 | `measured-here`, CPU: bit-equal to a load at the count, 18 of 18 greedy cases; no card run yet. |
 | `GGML_OPENCL_BANK_STREAM` | off | Copies each expert-bank tensor whole into a VRAM ring on a second queue during prefill. | 0032 | Flash-Next needle prefill 416.1 -> 497.6 t/s, B60 (`measured-here`). The Flash-Next unit sets it. |
 | `GGML_OPENCL_DEVICES` | unset: one platform, as before | `P:D[,P:D...]` picks OpenCL devices by platform and device index, across platforms. Overrides `GGML_OPENCL_PLATFORM` / `GGML_OPENCL_DEVICE`. | 0023 | `0:0,1:0` lists both cards; unset lists the B60 alone (`measured-here`). |
 | `LLAMA_EXPERT_CACHE_MIB` | unset: no cache unless the API sets a budget | Expert-cache budget in MiB, `A,B` for one budget a device. Used only when the API gives none. | 0021, 0024 | — |
@@ -225,6 +226,8 @@ These names are not in a table:
 | `GGML_OPENCL_CPU_MISS_SPLIT_RED` | off | The slow path reads an IQ4_NL bank's split scales and quants as GGUF blocks (the defect fixed in 0.8.0). | 0056 | IQ3_XXS: a fault at the first request (`measured-here`). |
 | `MTMD_TTS_WAV_PAD` | off | Forces Qwen3-TTS's `GEN_WAV` graph and its input back to the padded 72-frame `wav_tfm_swa` window, the pre-patch behaviour. | 0062 | On the patch binary all 8 sentences are identical to the production padded arm (0.7285), where the default differs at <=191/32768 (0.8006) (`measured-here`). |
 | `LLAMA_SLOT_LOAN_MUTATE` | 0 | A value-coded red mutation of the loan: `1` a tensor of the last lent layer left uncopied, `2` the lend's last table row dropped, `3` the lent sizing skipped (the lend branch's dst tensor, about 0.64 GiB a chunk, measured in the resident chunk), `4` the return's re-reserve skipped, `5` a lent layer's bank row off by one (the KL gate's red). | 0068 | `code`: 0068:968-971,1299-1302. |
+| `LLAMA_DORY_RED_REUSE` | off | `1`: the loop count is left out of the graph-reuse key, so a graph built for one count is reused at another: a request is then served at a wrong count with no error. The red case of the per-count graph. Test only; never set it on a unit. | 0118 | `measured-here`, CPU: 6 of 9 probes fail with it. |
+| `LLAMA_DORY_RESERVE_DEFAULT` | off | `1`: the compute buffers are reserved at the file's count instead of the maximum, so a request at more loops than the first one grows the buffer. Breaks the no-growth property of the reserve (the test of it), not the output. Test only; never set it on a unit. | 0118 | `code`: the `graph_reserve` hunk of 0118. |
 
 ### Diagnostic
 

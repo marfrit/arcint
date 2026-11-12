@@ -195,23 +195,49 @@ measured on 2026-11-07.
   **A loop count per request** (`--llama-dory-max-loops N`, contrib/llama.cpp
   0118, off by default). With N the load builds libllama's tables for N loops
   (`LLAMA_DORY_MAX_LOOPS`, read back with `llama_model_dory_loops_max`, a mismatch
-  refuses the start) and a request runs 1 to N: its reasoning effort (the typed
-  field, which holds the unit's `--chat-template-kwarg reasoning_effort` default,
-  else `chat_template_kwargs.reasoning_effort`) maps none, off, minimal, low to 1,
-  medium to 2, high, xhigh to 4, capped at N; no effort runs `--llama-dory-loops`
-  (the file's count without it). It needs `--llama-dory-kv last_loop` (with
-  `per_loop` a request at another count would read cache layers no earlier request
-  wrote), N at least the unit's count, a build with the 0118 symbol, and no
-  drafter or projector; anything else refuses the start. A slot whose cells were
+  refuses the start) and a request runs 1 to N. The count comes from the one
+  effective reasoning effort the chat template is rendered with
+  (`effective_reasoning_effort`, `src/core/chat.cpp`: an explicit
+  `chat_template_kwargs.reasoning_effort` wins over the typed `reasoning_effort` /
+  Responses `reasoning.effort`, which holds the unit's `--chat-template-kwarg
+  reasoning_effort` default when the request names none). The seven names are exact
+  and lower case: none, off, minimal, low map to 1, medium to 2, high, xhigh to 4,
+  capped at N. An effective effort that is present and is not one of them, or a
+  kwarg that is not a string, is a 400 (`dory_request_loops`, `src/core/dory.cpp`),
+  never a fallback to the unit's count. A request that names no effort runs the
+  count of the unit's default effort when `--chat-template-kwarg reasoning_effort=...`
+  is set (a default outside the seven names is refused at the start, with or without
+  this flag), else `--llama-dory-loops` (the file's count without it);
+  `/props` `dory.effort_loops.unset` says which. `/v1/completions` has no effort and
+  always runs the unit's `--llama-dory-loops` count, whatever default effort the
+  unit has. The recurrent KV must resolve to `last_loop` (`--llama-dory-kv`, or the
+  file's own mode; with `per_loop`, either way, the start is refused: a request at
+  another count would read cache layers no earlier request wrote). The start is also
+  refused for N below the unit's count, a build without the 0118 symbol, a GGUF that
+  is not a Dory model (the message names the flag), and a drafter, a projector or
+  `--tts`. A slot whose cells were
   written at another count is dropped and the prompt prefilled again at the new
   one, never continued: continuing moved the mean KL by +0.001 to +0.006 nats over
   the floor and cost up to 1.6 points of argmax agreement (`measured-here`, CPU,
-  patch 0118), which is no equivalence, while a load at N loops and a request at N
+  Dory1.0-4B Q5_K_M, f16 cache, context 4,096, micro-batch 512, 8 threads, patch
+  0118), which is no equivalence, while a load at N loops and a request at N
   loops on tables for 4 were bit-equal in logits (18 greedy cases, 2,252 rows). The
   count is set on the context before every decode under the decode lock; one
   `llama_decode` carries one lane's rows on this path. Every answer names the count
-  (`dory: {loops, reprefill}`), `/props` `dory` carries `max_loops` and the map. A card
-  run of this feature is owed; with the flag off nothing changes.
+  (`dory: {loops, reprefill}`). `reprefill: true` is exactly what the code computes
+  (`dory_reuse`): the slot held at least one cached token, written at a count other
+  than this request's. It is also true when the new prompt shares no prefix with
+  those tokens, where nothing would have been reused anyway; a slot that held nothing,
+  or held cells at this count, reports false. `/props` `dory` carries `max_loops`
+  and the map; its `executed_layers` stays what a request at the unit's own count
+  executes, with the flag on or off (the tables of the maximum are `table_layers`
+  internally and are what the load checks and the cache-layer count read).
+  Known limit: slot choice does not look at the count, so with more than one
+  slot a request can land on a slot written at another count and re-prefill
+  where another slot would have served it; and two lanes at different counts
+  switch the count, rebuild the graph and re-plan the allocation on every decode
+  (neither cost is measured). A card run of this feature is owed; with the flag
+  off nothing changes.
 
   `last_loop` makes a token's hidden
   state depend on where the chunk boundaries of its prefill fall (loop i attends to

@@ -958,6 +958,16 @@ Dory1.0-4B stores 72 blocks (16 input, 40 recurrent, 16 output) and runs the 40 
 - **Switch:** `--llama-dory-loops N`, `--llama-dory-kv per_loop|last_loop`.
 - **Source:** llama.cpp pull request 30306 (open, head `1c3cdd23`), cross-read against vLLM's `models/dory.py`.
 
+### A loop count per request, chosen by the reasoning effort
+
+A looped model's depth is a run-time quantity, so a request can buy fewer or more iterations of the recurrent blocks. The tables of the per-layer arrays are built once for a maximum number of loops; a context then sets the count it decodes at (`llama_set_dory_loops`), the graph skips the unused copies, the output blocks keep one cache index at every count (the `last_loop` cache), and the count is part of the graph-reuse key so a graph built for one count is never reused at another. The server maps the effort a request already states (none, off, minimal, low: 1; medium: 2; high, xhigh: 4; exact names, anything else a 400) to the count, sets it under the lock that serialises decodes, and prefills a slot again when it held cells written at another count: continuing such a cache is not exact (mean KL +0.001 to +0.006 nats over the floor).
+- **Effect:** `measured-here`, CPU, Dory1.0-4B Q5_K_M, f16 cache, context 4,096, micro-batch 512, 8 threads, tables for 4 loops: 18 of 18 greedy cases the same tokens and 2,252 logit rows bit-equal to a model loaded at that count; weight, cache and compute buffer sizes equal to the unpatched library at 1, 2 and 4 loops; 6 of 9 probes fail with the reuse key bent. No card run yet.
+- **Applies to:** Dory1.0-4B with the `last_loop` recurrent KV, one lane's rows a decode, no drafter, no projector.
+- **Default:** Off; every request runs the unit's count.
+- **Location:** `contrib/llama.cpp/patches/0118-dory-loops-per-context.patch` (`llama_set_dory_loops`, `llama_model_dory_loops_max`, `llm_graph_params::allow_reuse`, `graph_reserve`). arcint: `src/core/dory.cpp`, `dory_request_loops`, `dory_loops_for_effort`, `dory_reuse`, `dory_check_max`; `src/core/chat.cpp`, `effective_reasoning_effort`; `src/api/handlers.cpp`, `prepare_from_chat`; `src/exec/backend_llama.cpp`, `dory_prepare_locked`, `decode_locked`.
+- **Switch:** `--llama-dory-max-loops N`; the library's `LLAMA_DORY_MAX_LOOPS`.
+- **Source:** arcint's own.
+
 ### A BF16 source for the device copy, so the casts of per-channel scales stay on the card
 
 A model whose small scale vectors are stored in BF16 casts each one to F32 in the graph. If the backend refuses a BF16 source, the loader places that tensor in a CPU buffer and the scheduler splits the graph around it, once per scale (217 in Dory). On OpenCL a BF16 tensor is already held as F16 on the device (the upload converts it), so the copy kernels read it as F16 and `supports_op` lists the pair: no new kernel.
