@@ -126,9 +126,9 @@ replaced it at no measured decode cost on either card.
 ## Flash-Next
 
 Qwen3.8-Flash-Next (`qwen4exp`) serves on the B60 from ISTA-DASLab's GGUFs
-(`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`, revision `ed59f920`): IQ3_XXS by
-default since 2026-10-15, IQ2_XS before and as the faster option ("Flash-Next quant
-options" below). The record below is mostly IQ2_XS's. It serves
+(`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`): IQ3_S by default since 2026-10-20,
+IQ3_XXS from 2026-10-15 to then and kept as the rollback, IQ2_XS before that and as the
+faster option ("Flash-Next quant options" below). The record below is mostly IQ2_XS's. It serves
 its experts through an expert cache (the hot ones in VRAM, the others in host RAM, read over the link or, with `LLAMA_EXPERT_CACHE_CPU_MISSES=1`, computed on the CPU) and its MTP layer drafting:
 
     arcint --engine llama --gguf Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
@@ -340,15 +340,18 @@ GGUF's MTP layers count only when this GGUF's MTP block is loaded
 ### Flash-Next quant options
 
 The operator settled the serving shape on 2026-10-15 (charter A2) and made
-IQ3_XXS the default the same day, for its accuracy; the KL shortfall against
-unsloth's Q8_0 is accepted. The other quants stay available on demand, on the
+IQ3_XXS the default the same day, for its accuracy, then IQ3_S on 2026-10-20
+("IQ3_S is the new Qwen Flash-Next model"; the record is in
+`docs/campaigns/flash-next-llama-engine.md`, on the `qfndev` branch); the KL shortfall
+against unsloth's Q8_0 is accepted. The other quants stay available on demand, on the
 same endpoint and served name, one at a time (`measured-here` unless
 marked):
 
 | GGUF | KL / top-1 vs unsloth's Q8_0 on the CPU (16 x 512) | host bank at the unit's slots | state |
 |---|---|---|---|
 | ISTA-DASLab GSQ-RCO IQ2_XS (shard 1 39.2 GB) | 0.294 / 87.1 % | 20.32 GiB at 13,400 MiB | on demand, the faster option (the Flash-Next unit with this `--gguf` and 13,400 MiB of slots): 665.6 t/s at the 20k needle, 42.3 t/s (0.8.0's served check) |
-| ISTA-DASLab GSQ-RCO IQ3_XXS (shard 1 47.0 GB) | 0.218 / 89.7 % (served) | 28.72 GiB at 12,000 MiB | the default (`arcint-flashnext`), 12,000 MiB of slots with the CPU misses: 595.1 t/s at the 20k needle and 35.1 t/s in 0.8.0's served check; 597.9 t/s at the 20k needle, 33.9 / 37.5 / 37.3 / 33.5 / 30.6 / 30.9 t/s on six answers (20.7 / 26.2 / 28.9 / 18.7 / 21.2 / 18.5 without), KL 0.2910 against 0.2866 without (8 x 512), peak 23,306 MiB (13,400 MiB from ZFS thrashed: 6.4-11.7 t/s at peak 24,440) |
+| ISTA-DASLab GSQ-RCO IQ3_S | 0.127 / 92.1 % (served) | 36.06 GiB at 11,600 MiB | the default (`arcint-flashnext`) since 2026-10-20, 11,600 MiB of slots (the card-side weights 0.37 GiB larger than IQ3_XXS's): 33.3 t/s decode on the six answers (IQ3_XXS 38.1 on the same package, 1.2.1), 535.5 t/s at the 20k needle (622), VRAM peak 23,478 MiB without eviction |
+| ISTA-DASLab GSQ-RCO IQ3_XXS (shard 1 47.0 GB) | 0.218 / 89.7 % (served) | 28.72 GiB at 12,000 MiB | the rollback, the default from 2026-10-15 to 2026-10-20, 12,000 MiB of slots with the CPU misses: 595.1 t/s at the 20k needle and 35.1 t/s in 0.8.0's served check; 597.9 t/s at the 20k needle, 33.9 / 37.5 / 37.3 / 33.5 / 30.6 / 30.9 t/s on six answers (20.7 / 26.2 / 28.9 / 18.7 / 21.2 / 18.5 without), KL 0.2910 against 0.2866 without (8 x 512), peak 23,306 MiB (13,400 MiB from ZFS thrashed: 6.4-11.7 t/s at peak 24,440) |
 | unsloth UD-Q3_K_XL (3 shards, 90 GB) | 0.100 / 93.3 %, inside the bar | ~39 GiB | 235 t/s prefill, 12-13 t/s decode without MTP (2026-10-06, before the bank stream and the CPU misses); needs the planned 96 GB host |
 
 The IQ3_XXS file mixes its expert types by layer: gate/up IQ2_S in 10
