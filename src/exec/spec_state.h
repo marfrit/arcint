@@ -9,10 +9,11 @@
 // round trip is testable without a card (tests/test_spec_state.cpp).
 #pragma once
 
+#include "exec/bytes.h"   // Bytes: allocated, not written (the state call fills the payload)
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <vector>
 
 namespace lgc {
 
@@ -24,10 +25,10 @@ enum class SpecStateKind : uint32_t {
 constexpr uint32_t kSpecStateMagic  = 0x53505341;   // "ASPS"
 constexpr size_t   kSpecStateHeader = 4 + 4 + 8 + 8;   // magic, kind, n_tokens, payload size
 
-// A state of `size` payload bytes for `kind` at n_tokens, the payload zeroed
-// at data() + kSpecStateHeader for the caller to fill
-inline std::vector<uint8_t> spec_state_alloc(SpecStateKind kind, uint64_t n_tokens, size_t size) {
-    std::vector<uint8_t> s(kSpecStateHeader + size, 0);
+// A state of `size` payload bytes for `kind` at n_tokens, the payload left as
+// it was allocated (Bytes, exec/bytes.h) for the caller to fill
+inline Bytes spec_state_alloc(SpecStateKind kind, uint64_t n_tokens, size_t size) {
+    Bytes s(kSpecStateHeader + size);
     const uint32_t       magic = kSpecStateMagic, k = static_cast<uint32_t>(kind);
     const uint64_t       sz    = size;
     std::memcpy(s.data(), &magic, 4);
@@ -37,8 +38,8 @@ inline std::vector<uint8_t> spec_state_alloc(SpecStateKind kind, uint64_t n_toke
     return s;
 }
 
-inline std::vector<uint8_t> spec_state_pack(SpecStateKind kind, uint64_t n_tokens, const void* data, size_t size) {
-    std::vector<uint8_t> s = spec_state_alloc(kind, n_tokens, size);
+inline Bytes spec_state_pack(SpecStateKind kind, uint64_t n_tokens, const void* data, size_t size) {
+    Bytes s = spec_state_alloc(kind, n_tokens, size);
     if (size > 0) std::memcpy(s.data() + kSpecStateHeader, data, size);
     return s;
 }
@@ -51,7 +52,7 @@ struct SpecStateView {
     size_t         size = 0;
 };
 
-inline bool spec_state_view(const std::vector<uint8_t>& s, SpecStateKind kind, uint64_t n_tokens, SpecStateView& out) {
+inline bool spec_state_view(const Bytes& s, SpecStateKind kind, uint64_t n_tokens, SpecStateView& out) {
     out = {};
     if (s.size() < kSpecStateHeader) return false;
     uint32_t magic = 0, k = 0;

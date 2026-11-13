@@ -324,7 +324,7 @@ public:
     // the drafter's window K/V (its sliding-window cache: PARTIAL_ONLY
     // writes the SWA caches only, llama-kv-cache.cpp:2280), as the server's
     // checkpoint.update_dft (server-context.cpp:2597)
-    std::vector<uint8_t> carried_state(int seq, size_t n) override {
+    Bytes carried_state(int seq, size_t n) override {
 #if ARCINT_DFLASH_RED == 6
         (void) seq;
         (void) n;
@@ -333,7 +333,7 @@ public:
         if (n == 0) return {};
         const size_t size = llama_state_seq_get_size_ext(ctx_dft_, seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         if (size == 0) return {};
-        std::vector<uint8_t> s = spec_state_alloc(SpecStateKind::DflashWindow, n, size);
+        Bytes s = spec_state_alloc(SpecStateKind::DflashWindow, n, size);
         if (llama_state_seq_get_data_ext(ctx_dft_, s.data() + kSpecStateHeader, size, seq,
                                          LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != size)
             return {};
@@ -344,7 +344,7 @@ public:
     // after a checkpoint's restore: its window back (the server's load_dft,
     // server-context.cpp:3770-3771), cut to n; without one the drafter's
     // sequence starts empty and the next injections refill it
-    void set_carried_state(int seq, size_t n, const std::vector<uint8_t>& state) override {
+    void set_carried_state(int seq, size_t n, const Bytes& state) override {
         llama_memory_t md = llama_get_memory(ctx_dft_);
         SpecStateView  v;
         if (n == 0 || !spec_state_view(state, SpecStateKind::DflashWindow, n, v)) {

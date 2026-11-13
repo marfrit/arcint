@@ -778,7 +778,7 @@ public:
         return true;
     }
 
-    std::vector<uint8_t> carried_state(int seq, size_t n) override {
+    Bytes carried_state(int seq, size_t n) override {
         const Lane& ln = lanes_[static_cast<size_t>(seq)];
         if (ln.pending <= 0 || ln.base + static_cast<size_t>(ln.pending) != n) return {};
         const float* at = ln.rows.data() + static_cast<size_t>(ln.pending - 1) * static_cast<size_t>(n_embd_);
@@ -806,7 +806,7 @@ public:
     }
     std::string mtp_cost_table() const override { return policy_ ? policy_->cost_table_text() : std::string(); }
 
-    void set_carried_state(int seq, size_t n, const std::vector<uint8_t>& state) override {
+    void set_carried_state(int seq, size_t n, const Bytes& state) override {
         SpecStateView v;
         if (n == 0 || !spec_state_view(state, SpecStateKind::MtpRow, n, v) ||
             v.size != static_cast<size_t>(n_embd_) * sizeof(float))

@@ -293,6 +293,7 @@ if(ARCINT_TESTS)
     tests/test_draft_policy.cpp
     tests/test_dflash_walk.cpp
     tests/test_spec_state.cpp
+    tests/test_bytes.cpp
     tests/test_token_ids.cpp
     tests/test_mtp_head_file.cpp
     tests/test_props.cpp

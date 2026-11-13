@@ -56,6 +56,7 @@ extern "C" int stbi_info_from_memory(unsigned char const* buffer, int len, int* 
 #include "config.h"
 #include "core/reasoning.h"
 #include "core/sampler.h"
+#include "exec/bytes.h"   // Bytes: a checkpoint's state, allocated and not written
 #include "exec/chat_json.h"
 #include "exec/llama_layer_split.h"
 #include "exec/llama_spec.h"
@@ -503,10 +504,10 @@ class LlamaBackend final : public Backend {
     // A context checkpoint (--llama-checkpoints): what a lane holds after
     // n_tokens tokens
     struct Checkpoint {
-        size_t               n_tokens = 0;
-        uint64_t             req      = 0;   // the prefill that made it
-        std::vector<uint8_t> state;          // the memory's PARTIAL_ONLY state
-        std::vector<uint8_t> dft_state;      // the drafter's (exec/spec_state.h): MTP's carried row, DFlash2's window
+        size_t n_tokens = 0;
+        uint64_t req    = 0;   // the prefill that made it
+        Bytes    state;        // the memory's PARTIAL_ONLY state (exec/bytes.h: allocated, not written)
+        Bytes    dft_state;    // the drafter's (exec/spec_state.h): MTP's carried row, DFlash2's window
     };
 
 public:

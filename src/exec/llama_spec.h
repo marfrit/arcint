@@ -6,6 +6,8 @@
 
 #ifdef ARCINT_LLAMA
 
+#include "exec/bytes.h"   // Bytes: the drafter's state a checkpoint carries
+
 #include <cstddef>
 #include <cstdint>
 #include <ggml.h>
@@ -80,8 +82,8 @@ public:
     // llama.cpp's server stashes the draft side with each checkpoint
     // (common_speculative_get_state and the draft context's partial state).
     // A state that is not this drafter's at n is not loaded.
-    virtual std::vector<uint8_t> carried_state(int seq, size_t n) = 0;
-    virtual void                 set_carried_state(int seq, size_t n, const std::vector<uint8_t>& state) = 0;
+    virtual Bytes carried_state(int seq, size_t n) = 0;
+    virtual void  set_carried_state(int seq, size_t n, const Bytes& state) = 0;
     // A prefill of the sequence is about to run up to n_end tokens and save
     // context checkpoints at the token counts `ckpts`: a drafter may leave
     // out prompt rows neither the drafts after n_end nor those checkpoints'
