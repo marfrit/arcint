@@ -587,6 +587,15 @@ if(ARCINT_TESTS)
     target_compile_options(arcint-gdn-state-rows PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME gdn-state-rows COMMAND arcint-gdn-state-rows)
     set_tests_properties(gdn-state-rows PROPERTIES LABELS unit)
+    # patch 0119's device-free cell: a paged FLASH_ATTN_EXT over a shuffled pool,
+    # a ring and a two-row page table is byte-equal to the unpaged op on the CPU
+    # backend. Design: docs/campaigns/kv-streaming-design.md, increment I1.
+    add_executable(arcint-fa-paged tests/test_fa_paged.cpp)
+    target_link_libraries(arcint-fa-paged PRIVATE arcint_core)
+    target_include_directories(arcint-fa-paged PRIVATE "${ARCINT_LLAMA_DIR}/ggml/include")
+    target_compile_options(arcint-fa-paged PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME fa-paged COMMAND arcint-fa-paged)
+    set_tests_properties(fa-paged PROPERTIES LABELS unit)
     # patch 0081's source-slot cell: the GDN family takes src[6] once (the rows
     # index; the replay's records in its own op), the mode word op_params[1]
     # selects the state path, and the raw gating projections of patch 0051 ride

@@ -6953,3 +6953,66 @@ Over the floor, across six count transitions of 724-765 rows each on six convers
 6. The library's red switch did not fail on the served route: with `LLAMA_DORY_RED_REUSE=1` (the count left out of the graph-reuse key) 5 of 5 answers of the high group still equalled the 4-loop reference. Reason, evidence class `code`, not measured: `allow_reuse` in `llama-graph.h` compares the micro-batch shape (`n_tokens`, `n_seqs` and the rest) and returns false on a difference before it reaches the count check this patch adds. A count change makes the server re-prefill, the first batch after it has another shape than the last decode batch, so the graph is rebuilt whatever the key says. The red case that fails stays the CPU probe (6 of 9 probes with that switch). The served spot check has no red run of its own; its ability to fail rests on point 1's "2 of 5".
 
 **Not measured:** a deep prompt (the re-prefill cost at depth is the prefill cost; the unit's prefill at 98k-177k tokens was 51 t/s at 2 loops in an earlier run the same day on the same card with the same unit arguments, `measured-here`, so a level change deep in a session costs a full prefill), the B60, KL on the card, any sampled run. No served unit carries the flag. The patch does not touch the kernels.
+
+## 0119-ggml-fa-paged-kv.patch
+
+Paged K/V for `GGML_OP_FLASH_ATTN_EXT`, its CPU reference, and the backend
+refusal that keeps an unported backend from reading a pool as if it were the
+whole layer (design: `docs/campaigns/kv-streaming-design.md`, increment I1;
+reference: the fork's `1f6e1fccc`, `ggml/include/ggml.h:2528-2560`). Evidence
+class `code` for the mechanism (`~/src/achyudh-ref` at `b540a4b9b`), `code`
+for arcint; the cell below is the only number and it is not a rate.
+
+- **API** (`ggml/include/ggml.h`): `ggml_flash_attn_ext_set_pages(a, pages,
+  table, page_size, ring_k, ring_v)`: `k`/`v` hold a pool of `page_size`-row
+  pages (`[n_embd, n_pool_rows, n_head_kv, 1]`, the cache's row layout), the
+  attended sequence is `pages->ne[0]*page_size` rows, `pages` is `I32
+  [n_pages, n_tables]` with row `table` used, entry `>= 0` is a pool page and
+  entry `< 0` is page `-1 - entry` of the ring (same row layout). It asserts
+  the mask's `ne[0]` is the attended length, the pool's and the ring's rows are
+  whole pages, and the ring's types and head counts equal the pool's.
+  `ggml_flash_attn_ext_set_sync(a, tag, ready, consumed)` carries the
+  cross-queue flags (`I32 [1]` tag in device memory, host-visible `ready` and
+  `consumed`); `ggml_flash_attn_ext_set_page_runs(a, runs)` carries the table
+  as runs of consecutive pool or ring pages, which a backend may split on. The
+  last two are plumbing for increments I2/I4: nothing reads them here.
+- **Op state** (`ggml/src/ggml-impl.h`): the op params `GGML_FA_PARAM_*`
+  (page size 5, ready 6-7, consumed 8-9, page table row 10, page runs 11-12,
+  per-row log-sum-exp 13-14, the backend-internal one) and the src slots
+  `GGML_FA_SRC_PAGES` 5, `RING_K` 6, `RING_V` 7, `TAG` 8, appended after the
+  mask src so the existing kernels' indices do not move; the getters
+  `ggml_flash_attn_ext_n_kv` / `mask_col0` / `get_pages` / `get_ready` /
+  `get_consumed` / `get_page_runs`.
+- **CPU reference** (`ggml/src/ggml-cpu/ops.cpp`, `..._flash_attn_ext_paged`):
+  wait for `ready >= tag[0]` if a tag is set (one thread, then a barrier), copy
+  each logical row from `table[i/page_size]`'s pool page or ring page into
+  contiguous K/V and widen a narrower mask into visible columns first, run the
+  existing contiguous path on those copies, then store `consumed = tag[0]`. The
+  copies are plain memory moves, so the output is byte-equal to the unpaged
+  path's on the same bytes. `ggml/src/ggml-cpu/ggml-cpu.c` reserves the copies
+  and the widened mask in the graph plan's work buffer.
+- **Refusal** (`ggml/src/ggml-opencl/ggml-opencl.cpp`, `supports_op`): a
+  `FLASH_ATTN_EXT` with a page table or a sync tag is declined. Its kernels do
+  not take pages yet (that is the design's I3), and a backend returning true
+  would read the pool as the whole layer. The scheduler then places the node
+  on the CPU reference; no backend reads a table it does not understand.
+- **Test** (`tests/test_fa_paged.cpp`, arcint's `arcint-fa-paged`, ctest
+  `fa-paged`, LABELS unit): four cases over the same bytes, unpaged against
+  paged with shuffled pool slots, unused slots filled `0x5a`, a ring for every
+  second/third/all page in reverse order, a two-row table with a garbage row 0,
+  a causal mask, 1 thread: f16 at 1,024 keys / 6 rows with 4 KV heads x 6
+  queries; q8_0:q4_0 at 2,048 keys / 6 rows with a ring every 3 pages; q8_0:q4_0
+  at 1,024 keys / 2 rows without a ring; f16 at 512 keys / 1 row, one KV head,
+  a ring every page. The f32 outputs are compared with `memcmp` -- the gather is
+  a copy, so equality is expected, not an NMSE -- and the reference must be
+  finite, so a read of the fill shows.
+- **Red case** (branch `kv-stream-red`): the gather's `e >= 0 ? pool : ring`
+  becomes `pool`, so a ring page reads a pool row. It compiles and fails 3 of
+  the 4 cases (all three ring arms; the no-ring arm cannot fail on this
+  mutation). Restored, all four pass.
+- **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host, the patched
+  tree's own `arcint-fa-paged`, 1 thread): 4 of 4 cases byte-equal, the red
+  build 3 of 4 failing. Not a rate and not on a card.
+- **Not measured:** any card; any speed of the CPU gather; the cross-queue
+  flags' paths (`set_sync`, `set_page_runs`) and the OpenCL kernels, which this
+  patch deliberately does not touch (I3/I4).

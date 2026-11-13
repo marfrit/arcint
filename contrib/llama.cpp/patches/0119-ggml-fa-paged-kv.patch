@@ -1,0 +1,359 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arcint <dev@arcint.invalid>
+Date: Sat, 14 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0119-ggml-fa-paged-kv
+
+---
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index a423350..c2074ec 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2531,6 +2531,47 @@ extern "C" {
+             struct ggml_tensor * a,
+             struct ggml_tensor * sinks);
+ 
++    // Paged K/V: k and v hold a pool of pages of page_size rows ([n_embd, n_pool_rows, n_head_kv, 1]), and the attended
++    // sequence is pages->ne[0]*page_size rows long (the mask's ne[0]). pages (I32 [n_pages, n_tables]) holds page tables,
++    // of which row `table` is used (e.g. one table per layer in one input). In it, entry i >= 0 is the pool page that
++    // holds logical page i, and entry i < 0 means logical page i is page -1 - entry of ring_k/ring_v (same row layout as
++    // k/v). ring_k and ring_v may be NULL if no entry is negative.
++    GGML_API void ggml_flash_attn_ext_set_pages(
++            struct ggml_tensor * a,
++            struct ggml_tensor * pages,
++            int32_t              table,
++            int32_t              page_size,
++            struct ggml_tensor * ring_k,
++            struct ggml_tensor * ring_v);
++
++    // A run of consecutive logical pages that are also consecutive in the pool (pool != 0) or in the ring
++    struct ggml_fa_page_run {
++        int32_t page; // first logical page
++        int32_t pos;  // its page in the pool or the ring
++        int32_t n;    // pages
++        int32_t pool;
++    };
++
++    struct ggml_fa_page_runs {
++        int32_t                   n;
++        struct ggml_fa_page_run * runs;
++    };
++
++    // Paged K/V: the page table as runs, in host memory that the caller keeps current until the graph is computed.
++    // Lets a backend split the attention into contiguous parts (and keeps the graph from being captured).
++    GGML_API void ggml_flash_attn_ext_set_page_runs(
++            struct ggml_tensor             * a,
++            const struct ggml_fa_page_runs * runs);
++
++    // K/V written by another queue (e.g. a copy engine): the op waits until *ready >= tag[0] before it reads them (only
++    // the ring when pages are set) and stores *consumed = tag[0] once it no longer needs them. ready and consumed must be
++    // visible to the host and the backend (e.g. pinned host memory). tag: I32 [1].
++    GGML_API void ggml_flash_attn_ext_set_sync(
++            struct ggml_tensor * a,
++            struct ggml_tensor * tag,
++            const uint32_t     * ready,
++            uint32_t           * consumed);
++
+     // TODO: needs to be adapted to ggml_flash_attn_ext
+     GGML_API struct ggml_tensor * ggml_flash_attn_back(
+            struct ggml_context * ctx,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 5b1e4ec..9fc1d17 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -3017,6 +3017,22 @@ struct ggml_cplan ggml_graph_plan(
+                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
+ 
+                         cur += MAX(prefill, decode);
++
++                        // paged K/V are gathered into contiguous copies at the end of the work buffer
++                        const struct ggml_tensor * pages = node->src[GGML_FA_SRC_PAGES];
++                        if (pages) {
++                            const struct ggml_tensor * k = node->src[1];
++                            const struct ggml_tensor * v = node->src[2];
++                            const int64_t n_kv = pages->ne[0]*ggml_get_op_params_i32(node, GGML_FA_PARAM_PAGE_SIZE);
++                            cur += n_kv*(ggml_row_size(k->type, k->ne[0])*k->ne[2] + ggml_row_size(v->type, v->ne[0])*v->ne[2]);
++                            // a mask narrower than the attended K/V is widened into visible columns first
++                            const int64_t col0 = ggml_flash_attn_ext_mask_col0(node);
++                            if (col0 > 0) {
++                                const struct ggml_tensor * mask = node->src[3];
++                                cur += (size_t)n_kv*mask->ne[1]*mask->ne[2]*mask->ne[3]*sizeof(ggml_fp16_t);
++                            }
++                            cur += 2*CACHE_LINE_SIZE;
++                        }
+                     } break;
+                 case GGML_OP_FLASH_ATTN_BACK:
+                     {
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 2d77ae6..47332a0 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -9,6 +9,7 @@
+ #include "vec.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cfloat>
+ #include <cmath>
+ 
+@@ -9693,7 +9694,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+     }
+ }
+ 
+-void ggml_compute_forward_flash_attn_ext(
++static void ggml_compute_forward_flash_attn_ext_prec(
+         const ggml_compute_params * params,
+         ggml_tensor * dst) {
+     switch (dst->op_params[3]) {
+@@ -9710,6 +9711,106 @@ void ggml_compute_forward_flash_attn_ext(
+     }
+ }
+ 
++// Paged K/V and cross-queue sync (ggml_flash_attn_ext_set_pages, ggml_flash_attn_ext_set_sync): wait for the producer,
++// gather the logical rows into the end of the work buffer, run the contiguous path on them, then release.
++static void ggml_compute_forward_flash_attn_ext_paged(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * k     = dst->src[1];
++    const ggml_tensor * v     = dst->src[2];
++    const ggml_tensor * pages = dst->src[GGML_FA_SRC_PAGES];
++    const ggml_tensor * tag   = dst->src[GGML_FA_SRC_TAG];
++
++    const uint32_t t = tag ? (uint32_t) *(const int32_t *) tag->data : 0;
++    if (tag && params->ith == 0) {
++        const volatile uint32_t * ready = ggml_flash_attn_ext_get_ready(dst);
++        while (*ready < t) {
++        }
++        std::atomic_thread_fence(std::memory_order_acquire);
++    }
++
++    ggml_tensor d = *dst;
++    for (int i = GGML_FA_SRC_PAGES; i <= GGML_FA_SRC_TAG; ++i) {
++        d.src[i] = nullptr;
++    }
++
++    ggml_tensor kg;
++    ggml_tensor vg;
++    if (pages) {
++        const ggml_tensor * ring_k = dst->src[GGML_FA_SRC_RING_K];
++        const ggml_tensor * ring_v = dst->src[GGML_FA_SRC_RING_V];
++        const int64_t page_size = ggml_get_op_params_i32(dst, GGML_FA_PARAM_PAGE_SIZE);
++        const int64_t n_kv = pages->ne[0]*page_size;
++        const int32_t * table = ggml_flash_attn_ext_get_pages(dst);
++
++        // contiguous [D, n_kv, H, 1] copies at the end of the work buffer (ggml_graph_plan reserves the space)
++        const size_t row_k = ggml_row_size(k->type, k->ne[0]);
++        const size_t row_v = ggml_row_size(v->type, v->ne[0]);
++        const size_t size_k = n_kv*row_k*k->ne[2];
++        const size_t size_v = n_kv*row_v*v->ne[2];
++        char * base = (char *) (((uintptr_t) params->wdata + params->wsize - size_k - size_v) & ~(uintptr_t) (CACHE_LINE_SIZE - 1));
++
++        kg = *k;
++        vg = *v;
++        kg.view_src = vg.view_src = nullptr;
++        kg.ne[1] = vg.ne[1] = n_kv;
++        kg.nb[1] = row_k; kg.nb[2] = n_kv*row_k; kg.nb[3] = size_k;
++        vg.nb[1] = row_v; vg.nb[2] = n_kv*row_v; vg.nb[3] = size_v;
++        kg.data = base;
++        vg.data = base + size_k;
++
++        auto gather = [&](const ggml_tensor * pool, const ggml_tensor * ring, ggml_tensor & out, size_t row, int64_t r) {
++            const int64_t h = r / n_kv;
++            const int64_t i = r % n_kv;
++            const int64_t e = table[i / page_size];
++            const ggml_tensor * src_t = e >= 0 ? pool : ring;
++            const int64_t src_row = (e >= 0 ? e : -1 - e)*page_size + i % page_size;
++            GGML_ASSERT(src_t && src_row < src_t->ne[1]);
++            const char * src = (const char *) src_t->data + src_row*src_t->nb[1] + h*src_t->nb[2];
++            memcpy((char *) out.data + i*out.nb[1] + h*out.nb[2], src, row);
++        };
++
++        if (tag) {
++            ggml_barrier(params->threadpool);
++        }
++        const int64_t n_rows_k = n_kv*k->ne[2];
++        const int64_t n_rows   = n_rows_k + n_kv*v->ne[2];
++        for (int64_t r = params->ith; r < n_rows; r += params->nth) {
++            if (r < n_rows_k) {
++                gather(k, ring_k, kg, row_k, r);
++            } else {
++                gather(v, ring_v, vg, row_v, r - n_rows_k);
++            }
++        }
++        ggml_barrier(params->threadpool);
++
++        d.src[1] = &kg;
++        d.src[2] = &vg;
++    } else if (tag) {
++        ggml_barrier(params->threadpool);
++    }
++
++    ggml_compute_forward_flash_attn_ext_prec(params, &d);
++
++    if (tag) {
++        ggml_barrier(params->threadpool);
++        if (params->ith == 0) {
++            std::atomic_thread_fence(std::memory_order_release);
++            *(volatile uint32_t *) ggml_flash_attn_ext_get_consumed(dst) = t;
++        }
++    }
++}
++
++void ggml_compute_forward_flash_attn_ext(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    if (dst->src[GGML_FA_SRC_PAGES] || dst->src[GGML_FA_SRC_TAG]) {
++        ggml_compute_forward_flash_attn_ext_paged(params, dst);
++        return;
++    }
++    ggml_compute_forward_flash_attn_ext_prec(params, dst);
++}
++
+ // ggml_compute_forward_flash_attn_back
+ 
+ static void ggml_compute_forward_flash_attn_back_f32(
+diff --git a/ggml/src/ggml-impl.h b/ggml/src/ggml-impl.h
+index ae26e0c..8f9775c 100644
+--- a/ggml/src/ggml-impl.h
++++ b/ggml/src/ggml-impl.h
+@@ -182,6 +182,55 @@ static void ggml_set_op_params_f32(struct ggml_tensor * tensor, uint32_t i, floa
+     ((float *)(tensor->op_params))[i] = value;
+ }
+ 
++// GGML_OP_FLASH_ATTN_EXT with paged K/V and cross-queue sync (ggml_flash_attn_ext_set_pages, ggml_flash_attn_ext_set_sync)
++//   op_params: 0 scale, 1 max_bias, 2 logit_softcap, 3 prec, 4 n_kv_max, 5 page size, 6-7 ready, 8-9 consumed,
++//              10 page table row, 11-12 page runs (host), 13-14 per-row log-sum-exp output (backend-internal)
++#define GGML_FA_PARAM_PAGE_SIZE 5
++#define GGML_FA_PARAM_READY     6
++#define GGML_FA_PARAM_CONSUMED  8
++#define GGML_FA_PARAM_PAGES_ROW 10
++#define GGML_FA_PARAM_RUNS      11
++#define GGML_FA_SRC_PAGES       5
++#define GGML_FA_SRC_RING_K      6
++#define GGML_FA_SRC_RING_V      7
++#define GGML_FA_SRC_TAG         8
++
++static inline const uint32_t * ggml_flash_attn_ext_get_ready(const struct ggml_tensor * t) {
++    const uint32_t * p;
++    memcpy(&p, t->op_params + GGML_FA_PARAM_READY, sizeof(p));
++    return p;
++}
++
++static inline uint32_t * ggml_flash_attn_ext_get_consumed(const struct ggml_tensor * t) {
++    uint32_t * p;
++    memcpy(&p, t->op_params + GGML_FA_PARAM_CONSUMED, sizeof(p));
++    return p;
++}
++
++static inline const struct ggml_fa_page_runs * ggml_flash_attn_ext_get_page_runs(const struct ggml_tensor * t) {
++    const struct ggml_fa_page_runs * p;
++    memcpy(&p, t->op_params + GGML_FA_PARAM_RUNS, sizeof(p));
++    return p;
++}
++
++// the attended K/V length of a GGML_OP_FLASH_ATTN_EXT: the logical rows when paged
++static inline int64_t ggml_flash_attn_ext_n_kv(const struct ggml_tensor * t) {
++    const struct ggml_tensor * pages = t->src[GGML_FA_SRC_PAGES];
++    return pages ? pages->ne[0]*t->op_params[GGML_FA_PARAM_PAGE_SIZE] : t->src[1]->ne[1];
++}
++
++// a mask narrower than the K/V covers its last mask->ne[0] columns; the columns before this one are visible (0)
++static inline int64_t ggml_flash_attn_ext_mask_col0(const struct ggml_tensor * t) {
++    const struct ggml_tensor * mask = t->src[3];
++    return mask ? ggml_flash_attn_ext_n_kv(t) - mask->ne[0] : 0;
++}
++
++// the page table of a paged GGML_OP_FLASH_ATTN_EXT, in pages->data
++static inline const int32_t * ggml_flash_attn_ext_get_pages(const struct ggml_tensor * t) {
++    const struct ggml_tensor * pages = t->src[GGML_FA_SRC_PAGES];
++    return (const int32_t *) ((const char *) pages->data + t->op_params[GGML_FA_PARAM_PAGES_ROW]*pages->nb[1]);
++}
++
+ struct ggml_map_custom1_op_params {
+     ggml_custom1_op_t  fun;
+     int                n_tasks;
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index efd2a6e..a26f9b6 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -12821,6 +12821,12 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+         case GGML_OP_MEAN:
+             return op->src[0]->type == GGML_TYPE_F32;
+         case GGML_OP_FLASH_ATTN_EXT: {
++            // paged K/V (ggml_flash_attn_ext_set_pages) and a cross-queue sync are the CPU reference's
++            // mechanism only until patch 0119's follow-up teaches the kernels; decline, so the scheduler
++            // never runs a kernel that would read the pool as if it were the whole layer.
++            if (op->src[GGML_FA_SRC_PAGES] || op->src[GGML_FA_SRC_TAG]) {
++                return false;
++            }
+ #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+             if (use_fa_bin_kernels_prefill(backend_ctx, op->src[0], op->src[1], op->src[2])) {
+                 return true;
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index b0d11ed..525cc91 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5629,6 +5629,64 @@ void ggml_flash_attn_ext_add_sinks(
+     a->src[4] = sinks;
+ }
+ 
++void ggml_flash_attn_ext_set_pages(
++        struct ggml_tensor * a,
++        struct ggml_tensor * pages,
++        int32_t              table,
++        int32_t              page_size,
++        struct ggml_tensor * ring_k,
++        struct ggml_tensor * ring_v) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
++    GGML_ASSERT(pages->type == GGML_TYPE_I32 && ggml_is_contiguous(pages) && pages->ne[2] == 1 && pages->ne[3] == 1);
++    GGML_ASSERT(table >= 0 && table < pages->ne[1]);
++    GGML_ASSERT(page_size > 0);
++    GGML_ASSERT((ring_k == NULL) == (ring_v == NULL));
++
++    const struct ggml_tensor * k    = a->src[1];
++    const struct ggml_tensor * v    = a->src[2];
++    const struct ggml_tensor * mask = a->src[3];
++
++    GGML_ASSERT(k->ne[3] == 1 && v->ne[3] == 1);
++    GGML_ASSERT(k->ne[1] % page_size == 0 && v->ne[1] == k->ne[1]);
++    if (mask) {
++        GGML_ASSERT(mask->ne[0] == pages->ne[0]*page_size);
++    }
++    if (ring_k) {
++        GGML_ASSERT(ring_k->type == k->type && ring_k->ne[0] == k->ne[0] && ring_k->ne[2] == k->ne[2]);
++        GGML_ASSERT(ring_v->type == v->type && ring_v->ne[0] == v->ne[0] && ring_v->ne[2] == v->ne[2]);
++        GGML_ASSERT(ring_k->ne[1] % page_size == 0 && ring_v->ne[1] == ring_k->ne[1]);
++    }
++
++    ggml_set_op_params_i32(a, GGML_FA_PARAM_PAGE_SIZE, page_size);
++    ggml_set_op_params_i32(a, GGML_FA_PARAM_PAGES_ROW, table);
++
++    a->src[GGML_FA_SRC_PAGES]  = pages;
++    a->src[GGML_FA_SRC_RING_K] = ring_k;
++    a->src[GGML_FA_SRC_RING_V] = ring_v;
++}
++
++void ggml_flash_attn_ext_set_page_runs(
++        struct ggml_tensor             * a,
++        const struct ggml_fa_page_runs * runs) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT && a->src[GGML_FA_SRC_PAGES]);
++    memcpy(a->op_params + GGML_FA_PARAM_RUNS, &runs, sizeof(runs));
++}
++
++void ggml_flash_attn_ext_set_sync(
++        struct ggml_tensor * a,
++        struct ggml_tensor * tag,
++        const uint32_t     * ready,
++        uint32_t           * consumed) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
++    GGML_ASSERT(tag->type == GGML_TYPE_I32 && ggml_nelements(tag) == 1);
++    GGML_ASSERT(ready && consumed);
++
++    memcpy(a->op_params + GGML_FA_PARAM_READY,    &ready,    sizeof(ready));
++    memcpy(a->op_params + GGML_FA_PARAM_CONSUMED, &consumed, sizeof(consumed));
++
++    a->src[GGML_FA_SRC_TAG] = tag;
++}
++
+ // ggml_flash_attn_back
+ 
+ struct ggml_tensor * ggml_flash_attn_back(
