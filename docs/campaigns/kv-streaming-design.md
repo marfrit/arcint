@@ -659,6 +659,61 @@ are deferred and named above. Recipe green `294844e5` (40 of 40); red4
 `487e82b1` for the pool-write cell; red5 `381660e9` for the refusal. The served
 legs below are Claude's card window, not run here.
 
+**I5 built: the page moves are per layer** (patch 0123zzzzz3, 2026-11-14).
+The window-255 defect is gone: `llama_kv_stream::prepare()` no longer copies
+any page into the ring (`src/llama-kv-stream.cpp:prepare()` after the plan
+loop; `code`), it only packs the streamed pages' ring rows into the `plan`
+tensor `I32 [n_pages]` (a row `>= 0` is the ring row, `-1` a resident page) and
+the table. The copies happen **inside the attention call of each layer**:
+`ggml_compute_forward_flash_attn_ext_paged` (ggml-cpu, `code`) and
+`ggml_cl_fa_kv_stream_pages` (`ggml-opencl.cpp`, `code`) read
+`host_k/host_v` at the plan's pages and write them into the K/V ring slot
+`row*page_size*row_size` before the kernels (OpenCL: `clEnqueueWriteBuffer` at
+the top of `ggml_cl_flash_attn`, on the in-order compute queue and before the
+SoA reconstruction). A slot is shared by every second layer (`ikv % 2`); layer
+i+2 overwrites it only after layer i's commands were enqueued, so in-order
+execution gives each layer its own pages. This is **form (a) as step one**:
+correct, not hidden; the second queue, the events and the ready/consumed flags
+are the overlap, unchanged and still deferred.
+
+What changed against the fork, each with its reason:
+- **Host store layout**: one USM host-memory tensor per attention layer and
+  direction, `[n_embd_gqa, page_size, n_pages]`, allocated through
+  `ggml_backend_opencl_set_alloc_host(true)` around the stream's own context
+  and read/written by the slice entry points (`host_set_page/host_get_page`,
+  `code`). Reason: a tensor, not a byte range, gives the graph a src the
+  scheduler can place on the card backend without a copy; the fork's raw host
+  pointers need the copier thread, which step one does not build. On a CPU
+  buffer type the same class uses host memory, so the device-free cell runs
+  the whole path (`code`).
+- **No copier/publisher threads, no copy queue, no flags** (fork
+  `src/llama-kv-stream.cpp`, `code`): the copy is enqueued inline per layer,
+  so ordering is the queue's; the fork's `ready/consumed` is only needed when
+  producer and consumer are different queues (`paper`, design §1.3).
+- **Slots sized by the caller** (`n_ring = n_pages - n_slots`), not by the
+  backend probe: the probe is I3's remaining item.
+- **Prefill**: the copies are issued once per FA call for the plan's pages;
+  the paged gather converts each page once (`code`), so bytes over the link
+  equal the copies'. A prefetch ahead of the graph (0042's placement) is not
+  in this step.
+- **The refusal is removed** (0123zzzzz2 added
+  `LLAMA_KV_STREAM_UNSAFE=1`): a budget below the context now serves instead
+  of refusing (`src/llama-kv-cache.cpp`, `code`), because the defect it
+  guarded is fixed; the start refusal stays where it belongs, arcint's
+  `src/exec/kv_stream_refusal.h` (§4.3, probe and card rules).
+
+Tests: `tests/test_kv_stream_layers.cpp` (arcint's `arcint-kv-stream-layers`)
+is device-free: three layers, one pool page, two ring pages, one slot shared by
+all layers; each layer's output is byte-equal to a contiguous attention over
+its own 512 cells, and the slot ends with the last layer's pages
+(`measured-here`, CPU backend). Red arm: the copy guarded off
+(`if (false && plan)`) fails 4 checks, including all three layers' outputs.
+`tests/test-backend-ops.cpp` (patch 0123zzzzz5) gains a two-layer case sharing
+one ring and one plan, each layer with its own pool and host store, joined by
+an ADD at decode and 6 rows; the CPU arm does the same per-layer copy, so a
+backend that copies up front reads the last layer's pages and differs. **Not
+compiled or run on a card**: the first OpenCL build is Claude's window.
+
 **I3 kernels and cases built** 2026-11-14 (patch 0122, cases 0123): 0016's
 `flash_attn_gqa_dpas.cl`, with 0088's int8 Q K^T and 0089's staged 1-3 rows,
 resolves K/V rows through the page table and the ring; the backend takes a

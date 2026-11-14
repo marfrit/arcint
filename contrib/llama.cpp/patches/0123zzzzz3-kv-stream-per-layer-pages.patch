@@ -1,0 +1,611 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arcint <dev@arcint.invalid>
+Date: Sat, 14 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0123zzzzz3-kv-stream-per-layer-pages
+
+---
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index c2074ec..6319c6e 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2544,6 +2544,17 @@ extern "C" {
+             struct ggml_tensor * ring_k,
+             struct ggml_tensor * ring_v);
+ 
++    // Paged K/V with the streamed pages in a host store: host_k/host_v are the attention layer's pages
++    // as USM host memory ([n_embd, page_size, n_pages], host memory on a CPU backend), and plan is I32
++    // [n_pages]: the ring row of each streamed logical page, or -1 for a resident one. A backend moves
++    // the plan's pages into ring_k/ring_v per attention call (OpenCL: on its in-order queue before the
++    // kernels), so no two layers share a ring slot's content while their attention reads it.
++    GGML_API void ggml_flash_attn_ext_set_host(
++            struct ggml_tensor * a,
++            struct ggml_tensor * host_k,
++            struct ggml_tensor * host_v,
++            struct ggml_tensor * plan);
++
+     // A run of consecutive logical pages that are also consecutive in the pool (pool != 0) or in the ring
+     struct ggml_fa_page_run {
+         int32_t page; // first logical page
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 8fe0e22..1aef1e8 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -9731,7 +9731,7 @@ static void ggml_compute_forward_flash_attn_ext_paged(
+     }
+ 
+     ggml_tensor d = *dst;
+-    for (int i = GGML_FA_SRC_PAGES; i <= GGML_FA_SRC_TAG; ++i) {
++    for (int i = GGML_FA_SRC_PAGES; i <= GGML_FA_SRC_PLAN; ++i) {
+         d.src[i] = nullptr;
+     }
+ 
+@@ -9751,6 +9751,40 @@ static void ggml_compute_forward_flash_attn_ext_paged(
+         const int64_t n_kv = pages->ne[0]*page_size;
+         const int32_t * table = ggml_flash_attn_ext_get_pages(dst);
+ 
++        // 0123zzzzz3: this attention layer's streamed pages, from its host store into the ring
++        // slots, here and now rather than for every layer up front: whatever the ring held at
++        // the previous layer's attention is replaced before this one reads it, so the two
++        // slots can be shared by later layers. On the CPU backend the host store, the plan and
++        // the ring are host memory (the device-free arm); OpenCL moves them in its dispatch.
++        {
++            const ggml_tensor * host_k = dst->src[GGML_FA_SRC_HOST_K];
++            const ggml_tensor * host_v = dst->src[GGML_FA_SRC_HOST_V];
++            const ggml_tensor * plan   = dst->src[GGML_FA_SRC_PLAN];
++            if (plan) {
++                GGML_ASSERT(host_k && host_v && host_k->buffer && host_v->buffer && plan->buffer);
++                GGML_ASSERT(ggml_backend_buffer_is_host(host_k->buffer) &&
++                            ggml_backend_buffer_is_host(host_v->buffer) &&
++                            ggml_backend_buffer_is_host(plan->buffer));
++                if (params->ith == 0) {
++                    const int32_t * pl = (const int32_t *) plan->data;
++                    const char * hk = (const char *) host_k->data;
++                    const char * hv = (const char *) host_v->data;
++                    const char * rk = (const char *) ring_k->data;
++                    const char * rv = (const char *) ring_v->data;
++                    const size_t kb = (size_t) host_k->nb[2];   // a page of K: page_size rows
++                    const size_t vb = (size_t) host_v->nb[2];
++                    const size_t rb = (size_t) ring_k->nb[1];   // the slot's row (all heads of a cell)
++                    for (int64_t p = 0; p < plan->ne[0]; ++p) {
++                        const int32_t row = pl[p];
++                        if (row < 0) continue;   // a resident page: the pool holds it
++                        memcpy((char *) rk + (size_t) row*page_size*rb, hk + (size_t) p*kb, kb);
++                        memcpy((char *) rv + (size_t) row*page_size*rb, hv + (size_t) p*vb, vb);
++                    }
++                }
++                ggml_barrier(params->threadpool);
++            }
++        }
++
+         // contiguous [D, n_kv, H, 1] copies at the end of the work buffer (ggml_graph_plan reserves the space)
+         const size_t row_k = ggml_row_size(k->type, k->ne[0]);
+         const size_t row_v = ggml_row_size(v->type, v->ne[0]);
+diff --git a/ggml/src/ggml-impl.h b/ggml/src/ggml-impl.h
+index 8f9775c..34bc169 100644
+--- a/ggml/src/ggml-impl.h
++++ b/ggml/src/ggml-impl.h
+@@ -194,6 +194,9 @@ static void ggml_set_op_params_f32(struct ggml_tensor * tensor, uint32_t i, floa
+ #define GGML_FA_SRC_RING_K      6
+ #define GGML_FA_SRC_RING_V      7
+ #define GGML_FA_SRC_TAG         8
++#define GGML_FA_SRC_HOST_K      9   // the host store of this attention layer: [n_embd, page_size, n_pages]
++#define GGML_FA_SRC_HOST_V      10
++#define GGML_FA_SRC_PLAN        11  // I32 [n_pages]: the ring row of each streamed page, -1 for a resident one
+ 
+ static inline const uint32_t * ggml_flash_attn_ext_get_ready(const struct ggml_tensor * t) {
+     const uint32_t * p;
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index f0e8c6b..92ec575 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -12831,6 +12831,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+             if (op->src[GGML_FA_SRC_TAG]) {
+                 return false;
+             }
++            if (op->src[GGML_FA_SRC_PLAN] &&
++                (!op->src[GGML_FA_SRC_HOST_K] || !op->src[GGML_FA_SRC_HOST_V])) {
++                return false;
++            }
+             if (op->src[GGML_FA_SRC_PAGES]) {
+                 const ggml_tensor * q = op->src[0];
+                 const ggml_tensor * k = op->src[1];
+@@ -23531,6 +23535,56 @@ static ggml_cl_fa_table ggml_cl_fa_table_row(ggml_backend_opencl_context * backe
+     return t;
+ }
+ 
++// 0123zzzzz3: the streamed pages of this attention layer, from the host store (USM host memory)
++// into the two ring slots, on this device's in-order compute queue right before the kernels below
++// read them. Layer i's copies therefore run while layer i's own attention runs, and the slot layer
++// i+2 reuses is only overwritten after layer i's kernels were enqueued, so no two layers share a
++// slot's content at the time of their attention. The host store is read once per attention call.
++static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * dst) {
++    const ggml_tensor * plan = dst->src[GGML_FA_SRC_PLAN];
++    if (!plan) {
++        return;
++    }
++    const ggml_tensor * host_k = dst->src[GGML_FA_SRC_HOST_K];
++    const ggml_tensor * host_v = dst->src[GGML_FA_SRC_HOST_V];
++    const ggml_tensor * ring_k = dst->src[GGML_FA_SRC_RING_K];
++    const ggml_tensor * ring_v = dst->src[GGML_FA_SRC_RING_V];
++    GGML_ASSERT(host_k && host_v && ring_k && ring_v);
++
++    const char * hk = (const char *) ggml_backend_opencl_usm_ptr(host_k);
++    const char * hv = (const char *) ggml_backend_opencl_usm_ptr(host_v);
++    const int32_t * pl = (const int32_t *) ggml_backend_opencl_usm_ptr(plan);
++    if (hk == nullptr || hv == nullptr || pl == nullptr) {
++        GGML_ABORT("ggml_opencl: a paged attention with a host store that is not USM host memory");
++    }
++
++    ggml_cl_region rk[2], rv[2];
++    const int nrk = ggml_cl_regions(ring_k, rk);
++    const int nrv = ggml_cl_regions(ring_v, rv);
++    GGML_ASSERT(nrk == 1 && nrv == 1 && rk[0].mem && rv[0].mem);
++
++    const int ps = ggml_get_op_params_i32(dst, GGML_FA_PARAM_PAGE_SIZE);
++    const size_t kb = (size_t) host_k->nb[2];   // a page of K: page_size rows
++    const size_t vb = (size_t) host_v->nb[2];
++    const size_t rb = (size_t) ring_k->nb[1];   // the K slot's row (all its heads of a cell)
++    const size_t rvb = (size_t) ring_v->nb[1];
++    const int64_t n_pages = plan->ne[0];
++
++    cl_command_queue queue = backend_ctx->queue;
++    for (int64_t p = 0; p < n_pages; ++p) {
++        const int32_t row = pl[p];
++        if (row < 0) {
++            continue;   // a resident page: the kernel reads it from the pool
++        }
++        const cl_ulong off_k = rk[0].off + (cl_ulong) ring_k->view_offs;
++        const cl_ulong off_v = rv[0].off + (cl_ulong) ring_v->view_offs;
++        CL_CHECK(clEnqueueWriteBuffer(queue, rk[0].mem, CL_FALSE, off_k + (cl_ulong) row*ps*rb, (size_t) kb,
++                                      hk + (size_t) p*kb, 0, NULL, NULL));
++        CL_CHECK(clEnqueueWriteBuffer(queue, rv[0].mem, CL_FALSE, off_v + (cl_ulong) row*ps*rvb, (size_t) vb,
++                                      hv + (size_t) p*vb, 0, NULL, NULL));
++    }
++}
++
+ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
+     const ggml_tensor * v = dst->src[2];
+     const ggml_tensor * mask = dst->src[3];
+@@ -23550,6 +23604,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+ 
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+ 
++    // 0123zzzzz3: this layer's streamed pages into its ring slot, before anything reads it
++    ggml_cl_fa_kv_stream_pages(backend_ctx, dst);
++
+     const int n_q = q->ne[1];
+     // paged K/V (0119): the attended length is the page table's pages * page_size,
+     // not the pool's rows; 0122's GQA kernel resolves every row through the table
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 0c6b3cd..63ee87d 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5665,6 +5665,25 @@ void ggml_flash_attn_ext_set_pages(
+     a->src[GGML_FA_SRC_RING_V] = ring_v;
+ }
+ 
++void ggml_flash_attn_ext_set_host(
++        struct ggml_tensor * a,
++        struct ggml_tensor * host_k,
++        struct ggml_tensor * host_v,
++        struct ggml_tensor * plan) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT && a->src[GGML_FA_SRC_PAGES] && a->src[GGML_FA_SRC_RING_K]);
++    GGML_ASSERT(host_k && host_v && plan);
++    GGML_ASSERT(plan->type == GGML_TYPE_I32 && ggml_is_contiguous(plan) && plan->ne[0] >= a->src[GGML_FA_SRC_PAGES]->ne[0]);
++    // a host page is the ring's row layout: all KV heads of a cell contiguous
++    GGML_ASSERT(host_k->type == a->src[1]->type && host_k->ne[1] == (int64_t) ggml_get_op_params_i32(a, GGML_FA_PARAM_PAGE_SIZE) &&
++                host_k->ne[2] >= a->src[GGML_FA_SRC_PAGES]->ne[0] && host_k->nb[0] == ggml_type_size(host_k->type));
++    GGML_ASSERT(host_v->type == a->src[2]->type && host_v->ne[1] == (int64_t) ggml_get_op_params_i32(a, GGML_FA_PARAM_PAGE_SIZE) &&
++                host_v->ne[2] >= a->src[GGML_FA_SRC_PAGES]->ne[0] && host_v->nb[0] == ggml_type_size(host_v->type));
++
++    a->src[GGML_FA_SRC_HOST_K] = host_k;
++    a->src[GGML_FA_SRC_HOST_V] = host_v;
++    a->src[GGML_FA_SRC_PLAN]   = plan;
++}
++
+ void ggml_flash_attn_ext_set_page_runs(
+         struct ggml_tensor             * a,
+         const struct ggml_fa_page_runs * runs) {
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 4cf648d..3be9906 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3305,12 +3305,17 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
+         inp->kv_layout     = mctx_cur->kv_stream_layout();
+         inp->self_kv_ring_k.assign(hparams.n_layer_all, nullptr);
+         inp->self_kv_ring_v.assign(hparams.n_layer_all, nullptr);
++        inp->self_kv_host_k.assign(hparams.n_layer_all, nullptr);
++        inp->self_kv_host_v.assign(hparams.n_layer_all, nullptr);
++        inp->self_kv_plan = mctx_cur->kv_stream_plan();
+         for (int32_t il = 0; il < (int32_t) hparams.n_layer_all; ++il) {
+             // only the layers this cache holds: has_kv() is true for a hybrid model's
+             // recurrent layers too, which live in the recurrent memory
+             if (!hparams.has_kv(il) || !mctx_cur->kv_has_layer(il)) continue;
+             inp->self_kv_ring_k[il] = mctx_cur->build_ring_k(ctx0, il);
+             inp->self_kv_ring_v[il] = mctx_cur->build_ring_v(ctx0, il);
++            inp->self_kv_host_k[il] = mctx_cur->kv_stream_host_k(il);
++            inp->self_kv_host_v[il] = mctx_cur->kv_stream_host_v(il);
+         }
+     }
+ 
+@@ -3430,9 +3435,14 @@ ggml_tensor * llm_graph_context::build_attn(
+         GGML_ASSERT(fa.op == LLM_FUSED_OP_FLASH_ATTN && fa.il == il);
+         ggml_flash_attn_ext_set_pages(fa.tensor, inp->self_kv_pages, mctx_cur->kv_layer_index(il),
+                 llama_kv_stream::page_size, inp->self_kv_ring_k[(size_t) il], inp->self_kv_ring_v[(size_t) il]);
++        ggml_flash_attn_ext_set_host(fa.tensor, inp->self_kv_host_k[(size_t) il],
++                inp->self_kv_host_v[(size_t) il], inp->self_kv_plan);
+         ggml_build_forward_expand(gf, inp->self_kv_pages);
+         ggml_build_forward_expand(gf, inp->self_kv_ring_k[(size_t) il]);
+         ggml_build_forward_expand(gf, inp->self_kv_ring_v[(size_t) il]);
++        ggml_build_forward_expand(gf, inp->self_kv_host_k[(size_t) il]);
++        ggml_build_forward_expand(gf, inp->self_kv_host_v[(size_t) il]);
++        ggml_build_forward_expand(gf, inp->self_kv_plan);
+     }
+ 
+     if (inp->self_v_rot) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index b9abd0d..57d5933 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -393,6 +393,9 @@ public:
+     ggml_tensor * self_kv_pages = nullptr;
+     std::vector<ggml_tensor *> self_kv_ring_k;
+     std::vector<ggml_tensor *> self_kv_ring_v;
++    std::vector<ggml_tensor *> self_kv_host_k;   // the stream's host store, per attention layer
++    std::vector<ggml_tensor *> self_kv_host_v;
++    ggml_tensor * self_kv_plan = nullptr;        // I32 [n_pages]: ring row per streamed page, -1 resident
+     uint64_t kv_layout = 0;
+ 
+     // note: these have to be copies because in order to be able to reuse a graph, its inputs
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 4e77b3f..1a35c36 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1,7 +1,5 @@
+ #include "llama-kv-cache.h"
+ 
+-#include <cstdlib>
+-
+ #include "llama-impl.h"
+ #include "llama-io.h"
+ #include "llama-model.h"
+@@ -128,15 +126,9 @@ llama_kv_cache::llama_kv_cache(
+             throw std::runtime_error("KV streaming: the resident budget holds " + std::to_string(stream_n_slots) +
+                                      " pages, at least 8 are needed");
+         }
+-        // a context the pool cannot hold would stream pages, and the stream's per-layer copy (I5: layer i's
+-        // pages into a ring slot while layer i-1 computes) is not built: prepare() fills the two ring slots
+-        // for every layer before the graph, so each layer but the last two would read another layer's pages.
+-        // Refused until it is; LLAMA_KV_STREAM_UNSAFE=1 lets the stream run for its development
+-        if (stream_n_slots < n_pages && !(getenv("LLAMA_KV_STREAM_UNSAFE") && atoi(getenv("LLAMA_KV_STREAM_UNSAFE")) != 0)) {
+-            throw std::runtime_error("KV streaming: the resident budget holds " + std::to_string(stream_n_slots) + " of " +
+-                                     std::to_string(n_pages) + " pages; streaming the rest needs the per-layer copy (I5), "
+-                                     "which is not built: raise the budget or shorten the context");
+-        }
++        // a context the pool cannot hold streams the rest of the pages: each attention layer's pages are
++        // moved into its ring slot just before that layer's attention reads them (I5, per layer, not for
++        // every layer up front), so a budget below the context is served, not refused
+         stream_n_rows = stream_n_slots*llama_kv_stream::page_size;
+         stream_n_ring = std::max<uint32_t>(1, n_pages > stream_n_slots ? n_pages - stream_n_slots : 1);
+         this->stream_n_slots = stream_n_slots;
+@@ -3314,6 +3306,18 @@ ggml_tensor * llama_kv_cache_context::build_ring_v(ggml_context * ctx, int32_t i
+     return kv->build_ring_v(ctx, il);
+ }
+ 
++ggml_tensor * llama_kv_cache_context::kv_stream_host_k(int32_t il) const {
++    return kv->get_kv_stream()->host_k(kv->kv_layer_index(il));
++}
++
++ggml_tensor * llama_kv_cache_context::kv_stream_host_v(int32_t il) const {
++    return kv->get_kv_stream()->host_v(kv->kv_layer_index(il));
++}
++
++ggml_tensor * llama_kv_cache_context::kv_stream_plan() const {
++    return kv->get_kv_stream()->plan();
++}
++
+ void llama_kv_cache_context::set_input_kv_pages(ggml_tensor * dst) const {
+     kv->get_kv_stream()->set_input_pages(dst);
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index e454a37..891cf74 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -227,6 +227,12 @@ public:
+     // a layer's ring slot as the attention reads it: [head, n_ring*256, kv heads, 1]
+     ggml_tensor * build_ring_k(ggml_context * ctx, int32_t il) const;
+     ggml_tensor * build_ring_v(ggml_context * ctx, int32_t il) const;
++
++    // the stream's host store of a layer and its plan (no graph allocation: they live
++    // in the stream's own context and buffer, filled by prepare)
++    ggml_tensor * kv_stream_host_k(int32_t il) const;
++    ggml_tensor * kv_stream_host_v(int32_t il) const;
++    ggml_tensor * kv_stream_plan() const;
+     // place the ubatch's pages and copy the streamed ones into the slots, before the graph
+     void prepare_stream(const std::vector<uint32_t> & cells, uint32_t n_kv);
+     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+@@ -477,6 +483,12 @@ public:
+     ggml_tensor * build_input_kv_pages(ggml_context * ctx) const;
+     ggml_tensor * build_ring_k(ggml_context * ctx, int32_t il) const;
+     ggml_tensor * build_ring_v(ggml_context * ctx, int32_t il) const;
++
++    // the stream's host store of a layer and its plan (no graph allocation: they live
++    // in the stream's own context and buffer, filled by prepare)
++    ggml_tensor * kv_stream_host_k(int32_t il) const;
++    ggml_tensor * kv_stream_host_v(int32_t il) const;
++    ggml_tensor * kv_stream_plan() const;
+     void         set_input_kv_pages(ggml_tensor * dst) const;
+ 
+     ggml_type type_k() const;
+diff --git a/src/llama-kv-stream.cpp b/src/llama-kv-stream.cpp
+index c5deeb6..7eb2add 100644
+--- a/src/llama-kv-stream.cpp
++++ b/src/llama-kv-stream.cpp
+@@ -25,15 +25,36 @@ llama_kv_stream::llama_kv_stream(const std::vector<layer> & layers, uint32_t n_s
+     dirty.assign(n_pages, 0);
+     saved.assign(n_pages, 0);
+ 
+-    // the host store: per layer K pages then V pages, in page order
+-    size_t bytes = 0;
+-    host_offs.resize(layers.size());
+-    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+-        host_offs[ikv] = bytes;
+-        bytes += 2*(size_t) n_pages*page_size*row_size((int32_t) ikv, false);
+-    }
+-    if (bytes > 0) {
+-        host_buf.reset(ggml_backend_buft_alloc_buffer(buft, bytes));
++    // the host store: a K and a V tensor per attention layer, [n_embd_gqa,
++    // page_size, n_pages]; on OpenCL in USM host memory (the backend's
++    // set_alloc_host entry point), on a CPU buffer type in host memory
++    host_t.assign(layers.size()*2, nullptr);
++    {
++        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
++        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++        auto set_alloc_host = reg ? (void (*)(bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_set_alloc_host") : nullptr;
++        slices_set = reg ? (decltype(slices_set)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_set_tensor_slices") : nullptr;
++        slices_get = reg ? (decltype(slices_get)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_get_tensor_slices") : nullptr;
++        const bool gpu = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
++        if (gpu && set_alloc_host == nullptr) {
++            throw std::runtime_error("llama_kv_stream: the device lacks the USM host allocation entry point; "
++                                     "a host store on the card would not stream");
++        }
++        ggml_init_params hp = { (size_t) (2*layers.size() + 1)*ggml_tensor_overhead(), nullptr, true };
++        host_ctx.reset(ggml_init(hp));
++        if (!host_ctx) throw std::runtime_error("llama_kv_stream: no host store context");
++        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
++            const layer & l = layers[ikv];
++            host_t[ikv*2 + 0] = ggml_new_tensor_3d(host_ctx.get(), l.k->type, l.k->ne[0], page_size, n_pages);
++            host_t[ikv*2 + 1] = ggml_new_tensor_3d(host_ctx.get(), l.v->type, l.v->ne[0], page_size, n_pages);
++            ggml_format_name(host_t[ikv*2 + 0], "kv_stream_host_k%zu", ikv);
++            ggml_format_name(host_t[ikv*2 + 1], "kv_stream_host_v%zu", ikv);
++        }
++        plan_t = ggml_new_tensor_2d(host_ctx.get(), GGML_TYPE_I32, n_pages, 1);
++        ggml_set_name(plan_t, "kv_stream_plan");
++        if (set_alloc_host) set_alloc_host(true);
++        host_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(host_ctx.get(), buft));
++        if (set_alloc_host) set_alloc_host(false);
+         if (!host_buf) throw std::runtime_error("llama_kv_stream: failed to allocate the host store");
+         ggml_backend_buffer_clear(host_buf.get(), 0);
+     }
+@@ -69,20 +90,33 @@ size_t llama_kv_stream::row_size(int32_t ikv, bool is_v) const {
+     return ggml_row_size(t->type, t->ne[0]);
+ }
+ 
+-char * llama_kv_stream::host(int32_t ikv, bool is_v, uint32_t page) const {
+-    char * base = (char *) ggml_backend_buffer_get_base(host_buf.get()) + host_offs[ikv];
+-    if (is_v) {
+-        base += (size_t) n_pages*page_size*row_size(ikv, false);
++void llama_kv_stream::host_set_page(int32_t ikv, bool is_v, uint32_t page, const void * src) {
++    ggml_tensor * t = is_v ? host_t[(size_t) ikv*2 + 1] : host_t[(size_t) ikv*2 + 0];
++    if (slices_set) {
++        slices_set(t, src, (int64_t) page, 1);
++    } else {
++        ggml_backend_tensor_set(t, src, (size_t) page*t->nb[2], (size_t) t->nb[2]);
++    }
++}
++
++void llama_kv_stream::host_get_page(int32_t ikv, bool is_v, uint32_t page, void * dst) {
++    ggml_tensor * t = is_v ? host_t[(size_t) ikv*2 + 1] : host_t[(size_t) ikv*2 + 0];
++    if (slices_get) {
++        slices_get(t, dst, (int64_t) page, 1);
++    } else {
++        ggml_backend_tensor_get(t, dst, (size_t) page*t->nb[2], (size_t) t->nb[2]);
+     }
+-    return base + (size_t) page*page_size*row_size(ikv, is_v);
+ }
+ 
+ void llama_kv_stream::zero_host(uint32_t page) {
+     // a page nobody wrote is masked in attention, but must not hold NaNs (0*NaN
+     // in P*V would poison a row)
++    std::vector<char> zero(page_bytes((int32_t) layers.size() - 1, false));
+     for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+-        memset(host((int32_t) ikv, false, page), 0, page_size*row_size((int32_t) ikv, false));
+-        memset(host((int32_t) ikv, true,  page), 0, page_size*row_size((int32_t) ikv, true));
++        for (bool is_v : { false, true }) {
++            zero.assign(page_bytes((int32_t) ikv, is_v), 0);
++            host_set_page((int32_t) ikv, is_v, page, zero.data());
++        }
+     }
+     saved[page] = 1;
+ }
+@@ -97,11 +131,14 @@ void llama_kv_stream::assign(uint32_t page, uint32_t slot) {
+ 
+     if (saved[page]) {
+         // a page returning to the pool is read back: synchronous here, a copy on
+-        // the second queue with an event in I3/I5
++        // the second queue with an event in step two of I5
++        std::vector<char> tmp;
+         for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+             for (bool is_v : { false, true }) {
+-                const size_t bytes = page_size*row_size((int32_t) ikv, is_v);
+-                ggml_backend_tensor_set(is_v ? layers[ikv].v : layers[ikv].k, host((int32_t) ikv, is_v, page),
++                const size_t bytes = page_bytes((int32_t) ikv, is_v);
++                tmp.resize(bytes);
++                host_get_page((int32_t) ikv, is_v, page, tmp.data());
++                ggml_backend_tensor_set(is_v ? layers[ikv].v : layers[ikv].k, tmp.data(),
+                         (size_t) slot*bytes, bytes);
+             }
+         }
+@@ -115,11 +152,14 @@ void llama_kv_stream::evict(uint32_t page) {
+     if (dirty[page]) {
+         // an evicted page with writes goes back to the host store: exact bytes
+         // (integrity, DESIGN section 3.4)
++        std::vector<char> tmp;
+         for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+             for (bool is_v : { false, true }) {
+-                const size_t bytes = page_size*row_size((int32_t) ikv, is_v);
+-                ggml_backend_tensor_get(is_v ? layers[ikv].v : layers[ikv].k, host((int32_t) ikv, is_v, page),
++                const size_t bytes = page_bytes((int32_t) ikv, is_v);
++                tmp.resize(bytes);
++                ggml_backend_tensor_get(is_v ? layers[ikv].v : layers[ikv].k, tmp.data(),
+                         (size_t) slot*bytes, bytes);
++                host_set_page((int32_t) ikv, is_v, page, tmp.data());
+             }
+         }
+         saved[page] = 1;
+@@ -188,19 +228,14 @@ void llama_kv_stream::prepare(const std::vector<uint32_t> & cells, uint32_t n_kv
+ 
+     GGML_ASSERT((int64_t) n_streamed*page_size <= slots[0].k->ne[1]);
+ 
+-    // copy each layer's streamed pages into its slot, host store -> slot; the
+-    // fork queues these on the copy engine beside the graph (I3/I5)
+-    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+-        const int s = (int) ikv % 2;
+-        for (uint32_t p = 0; p < n_att; ++p) {
+-            if (page_ring[p] < 0) continue;
+-            const uint32_t dst_page = (uint32_t) page_ring[p];
+-            for (bool is_v : { false, true }) {
+-                const size_t bytes = page_size*row_size((int32_t) ikv, is_v);
+-                ggml_backend_tensor_set(is_v ? slots[s].v : slots[s].k, host((int32_t) ikv, is_v, p),
+-                        (size_t) dst_page*bytes, bytes);
+-            }
+-        }
++    // the plan: the ring row of each streamed page, -1 for a resident one. The
++    // slots are filled per layer just before that layer's attention (copy_layer,
++    // or the OpenCL FA dispatch), so no two layers share a slot's content at the
++    // time of their attention
++    {
++        std::vector<int32_t> pl(n_pages, -1);
++        for (uint32_t p = 0; p < n_pages; ++p) pl[p] = page_ring[p];
++        ggml_backend_tensor_set(plan_t, pl.data(), 0, (size_t) n_pages*sizeof(int32_t));
+     }
+ }
+ 
+@@ -259,7 +294,9 @@ void llama_kv_stream::get_rows(int32_t ikv, bool is_v, uint32_t c0, uint32_t c1,
+         if (page_slot[page] >= 0) {
+             ggml_backend_tensor_get(pool, out, (size_t) (page_slot[page]*page_size + c % page_size)*row, n*row);
+         } else if (saved[page]) {
+-            memcpy(out, host(ikv, is_v, page) + (size_t) (c % page_size)*row, n*row);
++            std::vector<char> tmp(page_bytes(ikv, is_v));
++            host_get_page(ikv, is_v, page, tmp.data());
++            memcpy(out, tmp.data() + (size_t) (c % page_size)*row, n*row);
+         } else {
+             memset(out, 0, n*row);
+         }
+@@ -280,7 +317,10 @@ void llama_kv_stream::set_rows(int32_t ikv, bool is_v, uint32_t c0, uint32_t c1,
+             dirty[page] = 1;
+         } else {
+             if (!saved[page]) zero_host(page);
+-            memcpy(host(ikv, is_v, page) + (size_t) (c % page_size)*row, in, n*row);
++            std::vector<char> tmp(page_bytes(ikv, is_v));
++            host_get_page(ikv, is_v, page, tmp.data());
++            memcpy(tmp.data() + (size_t) (c % page_size)*row, in, n*row);
++            host_set_page(ikv, is_v, page, tmp.data());
+         }
+         c += n;
+     }
+diff --git a/src/llama-kv-stream.h b/src/llama-kv-stream.h
+index 5345c09..ce824d0 100644
+--- a/src/llama-kv-stream.h
++++ b/src/llama-kv-stream.h
+@@ -5,9 +5,11 @@
+ // mechanism follows llama.cpp's adaptive-KV-stream fork (src/llama-kv-stream.h
+ // there), restricted to what a device-free test can drive:
+ //  - no copier or publisher thread, no copy engine, no ready/consumed flags:
+-//    page moves are synchronous tensor writes/reads on the owning backend
+-//    (I3/I5 put them on the second in-order OpenCL queue with events, and add
+-//    the kernel-side wait);
++//    page moves into the pool are synchronous tensor writes/reads on the owning
++//    backend; the streamed pages are copied into the two ring slots per attention
++//    layer, on the in-order compute queue immediately before that layer's kernel
++//    (OpenCL FA dispatch, patch 0123zzzzz3). Step one of I5 is correct but not
++//    hidden; the second queue, events and the kernel-side wait are step two;
+ //  - slots are sized by the caller (n_ring pages), not by a probe of the
+ //    backend's paged attention (I3 adds the probe and the packed sizing).
+ // What does not change: pages of page_size cells, a pool of resident pages, a
+@@ -17,8 +19,11 @@
+ // runs of consecutive pages for a gather form.
+ //
+ // The pool tensors are the KV cache's (a layer's K and V, [n_embd_gqa,
+-// n_slots*page_size]); the host store and the two ring slots are buffers of the
+-// pool's buffer type, so a CPU test runs the whole class on host memory.
++// n_slots*page_size]); the host store is one USM host-memory K and V tensor per
++// attention layer, [n_embd_gqa, page_size, n_pages] (GGUF blocks, one slice a
++// page), and the plan is a USM host I32 [n_pages]: the ring row of a streamed
++// page, -1 for a resident one. On a CPU buffer type the same class runs on host
++// memory, so a device-free test drives it.
+ 
+ #include "ggml.h"
+ #include "ggml-backend.h"
+@@ -54,10 +59,13 @@ public:
+     static uint32_t slots_for(size_t bytes, size_t bytes_per_cell);
+ 
+     // a ubatch writes `cells` and attends [0, n_kv): place the pages, write back
+-    // the evicted ones, read back the returning ones, and copy the attended
+-    // pages that are not resident into the layer's ring slot (packed)
++    // the evicted ones, read back the returning ones, pack the attended pages that
++    // are not resident into ring rows, and fill the plan. The ring slots are filled
++    // per attention layer, just before that layer's kernel (copy_layer below or the
++    // OpenCL FA dispatch), never for every layer up front
+     void prepare(const std::vector<uint32_t> & cells, uint32_t n_kv);
+ 
++
+     // pool row of a cell whose page is resident
+     int64_t row(uint32_t cell) const;
+ 
+@@ -74,6 +82,12 @@ public:
+     // the attended resident pages as runs, for a gather built into a graph
+     std::vector<run> runs(uint32_t n_kv) const;
+ 
++    // the host store of a layer: [n_embd_gqa, page_size, n_pages] in GGUF blocks
++    ggml_tensor * host_k(int32_t ikv) const { return host_t[(size_t) ikv*2 + 0]; }
++    ggml_tensor * host_v(int32_t ikv) const { return host_t[(size_t) ikv*2 + 1]; }
++    // the plan: I32 [n_pages], the ring row of each streamed page or -1 (filled by prepare)
++    ggml_tensor * plan() const { return plan_t; }
++
+     // device slot of layer ikv (two slots, alternating by layer parity)
+     ggml_tensor * slot_k(int32_t ikv) const { return slots[ikv % 2].k; }
+     ggml_tensor * slot_v(int32_t ikv) const { return slots[ikv % 2].v; }
+@@ -102,7 +116,11 @@ public:
+ private:
+     void alloc_slots(int64_t rows);
+     size_t row_size(int32_t ikv, bool is_v) const;
+-    char * host(int32_t ikv, bool is_v, uint32_t page) const;
++    size_t page_bytes(int32_t ikv, bool is_v) const { return page_size*row_size(ikv, is_v); }
++    // host store page access: slices through the OpenCL host-memory entry points
++    // (a USM tensor has no host data pointer), tensor reads/writes on a CPU buffer
++    void host_set_page(int32_t ikv, bool is_v, uint32_t page, const void * src);
++    void host_get_page(int32_t ikv, bool is_v, uint32_t page, void * dst);
+ 
+     void assign(uint32_t page, uint32_t slot);
+     void evict(uint32_t page);
+@@ -115,9 +133,16 @@ private:
+ 
+     ggml_backend_buffer_type_t buft;
+ 
+-    // host store: per layer, K pages then V pages, in page order
+-    ggml_backend_buffer_ptr host_buf;
+-    std::vector<size_t>     host_offs;
++    // host store: per layer a K and a V tensor, [n_embd_gqa, page_size, n_pages];
++    // in USM host memory on OpenCL, host memory on a CPU buffer type
++    std::vector<ggml_tensor *> host_t;
++    ggml_context_ptr           host_ctx;
++    ggml_backend_buffer_ptr    host_buf;
++    ggml_tensor *              plan_t = nullptr;
++
++    // the backend's slice entry points (OpenCL: USM reads/writes), null elsewhere
++    void (*slices_set)(ggml_tensor *, const void *, int64_t, int64_t) = nullptr;
++    void (*slices_get)(const ggml_tensor *, void *, int64_t, int64_t) = nullptr;
+ 
+     ggml_context_ptr        slots_ctx;
+     ggml_backend_buffer_ptr slots_buf;

@@ -7468,6 +7468,63 @@ Streaming beyond the pool stays refused until I5.
 
 ## 0124-opencl-fa-wide-verify.patch
 
+## 0123zzzzz3-kv-stream-per-layer-pages.patch
+
+Fixes the second defect of 0123zzzzz2: the stream's page moves are now per
+attention layer, so a KV window beyond its pool serves correctly (`code`). The
+refusal 0123zzzzz2 added is removed with it; a budget below the context streams
+and serves.
+
+- **The stream.** `llama_kv_stream::prepare()` no longer copies any page into
+  the ring; it fills the plan `I32 [n_pages]` (the ring row of each streamed
+  page, `-1` for a resident one). The host store is now one USM host-memory K
+  and V tensor per attention layer, `[n_embd_gqa, page_size, n_pages]`, made
+  through `ggml_backend_opencl_set_alloc_host(true)` and accessed by the slice
+  entry points (`host_set_page/host_get_page`); the whole class still runs on a
+  CPU buffer type for the device-free arm. A device without the USM entry point
+  refuses at construction instead of putting the host store on the card.
+- **The API** (`0123zzzzz3`, ggml): `ggml_flash_attn_ext_set_host(a, host_k,
+  host_v, plan)` adds the stream's tensors as FA srcs 9/10/11. They are leaves
+  in the stream's own buffer, expanded in the graph so the scheduler places
+  the FA node on their backend.
+- **The copies.** Each FA dispatch reads the plan and enqueues, before its own
+  kernels, one `clEnqueueWriteBuffer` per streamed page from the USM host store
+  into the K/V ring slot at `row*page_size*row_size`, on the in-order compute
+  queue. Layer i+2 reuses slot `ikv % 2` only after layer i's commands were
+  enqueued, so in-order execution gives every layer its own pages. The CPU
+  paged op does the same copy (host memory), so the CPU reference is
+  self-consistent and the graph can be tested device-free. This is step one
+  of I5: correct, not hidden. The second queue, per-slot events,
+  ready/consumed flags and the after-graph prefetch are the overlap, still
+  deferred (design §1.5, §4.3).
+- **Not built**: the backend probe that sizes the slots (I3's item); bytes over
+  the link equal the copies' (each page is read once per attention call), but
+  they are not hidden behind compute.
+
+Test: `tests/test_kv_stream_layers.cpp` in arcint's suite
+(`arcint-kv-stream-layers`, device-free): three layers share one ring slot, one
+pool page and two streamed pages; each layer's output is byte-equal to a
+contiguous attention over its own cells and the slot ends with the last
+layer's pages. The CPU arm is green; the red arm guards the copy off
+(`if (false && plan)`) and fails all three layers' outputs and the slot check.
+Not compiled on a card: the OpenCL dispatch's first build is Claude's window.
+
+## 0123zzzzz5-test-backend-ops-paged-layers.patch
+
+`test-backend-ops` gains `test_flash_attn_ext_paged_layers`: two attention
+layers in one graph, sharing one ring and one plan (the stream's
+`slots[ikv % 2]` are shared across layers), each with its own pool, host store
+and table row; the two outputs are joined by an ADD, so one output covers both
+layers. Decode (1 row) and a 6-row verify at kv 8,192 with a pool of 16 pages
+and every second page in the ring. The CPU reference performs the same
+per-layer copy, so a backend that copies every layer up front reads the last
+layer's pages and the summed output differs; a correct backend passes.
+The previous paged cases used ONE attention layer, which is how the defect
+above was missed. Added but not yet run on a card; the CPU-side shapes are
+compiled (`code`), the card run is Claude's window.
+
+
+
 A verify of 9 to 64 query rows (more than 8 drafts, several lanes' verifies in
 one ubatch, a short prompt tail) runs as one call of the GQA decode kernel
 (`flash_attn_gqa_dpas.cl`) when its (head, token) rows fit the kernel's 8 row
