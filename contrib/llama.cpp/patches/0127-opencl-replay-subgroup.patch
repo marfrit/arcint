@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Markus Fritsche <mfritsche@reauktion.de>
 Date: Sat, 14 Nov 2026 18:15:00 +0000
-Subject: [PATCH] 0125-opencl-replay-subgroup
+Subject: [PATCH] 0127-opencl-replay-subgroup
 
 ---
  ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl | 3 +++

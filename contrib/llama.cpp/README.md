@@ -6790,7 +6790,7 @@ What it does to the numbers on the CPU (`measured-here`, 2026-11-07, recipe host
 
 So the folded vectors and the GLU change nothing on the CPU, and dropping the two norms costs what any one-ulp change costs this model: the control, which moves every layer's output by at most one ulp and nothing else, gives slightly more KL and a lower top-1 than the patch. Dory amplifies a rounding difference through its 112 (192) layers to about 0.008-0.009 nats against a fixed reference; the A770's KL against the CPU reference was 0.0091 at 2 loops before this patch (0108's section), which is the same floor. A CPU-against-itself comparison has a floor of 0, which is no bar (CLAUDE.md, the answer-level bar), so the card arms decide: base deb and this deb against the same CPU reference, on the same card and in the same window, at ubatch 512 and 1. At 4 loops (the same text and settings, PPL 12.0318): `LLAMA_DORY_FOLD=0` 0.000000 (top-1 99.975 %: two near-ties that the logit file's rounding flips, the PR graph against its own logits gives the same), `1` 0.000000 (99.975 %), `2` 0.008032 +- 0.000483 (95.515 %), and the one-ulp control 0.008028 +- 0.000376 (95.686 %).
 
-On the cards (`measured-here`, 2026-11-07, arcint served, a 5.9k-token prompt and a 400-token greedy decode, decode from the slot's own timing; base = 0111 + 0112, two rounds interleaved): B60 2 loops q8_0:q4_0 decode 28.6 -> 39.1 t/s (+37 %), prefill 2,522 -> 2,731 (+8 %); 4 loops q8_0:q4_0 17.2 -> 23.6 (+37 %), 1,474 -> 1,609; 2 loops f16 30.5 -> 42.8 (+40 %, the same answer's md5), 2,637 -> 2,874. A770 2 loops q8_0:q4_0 19.1 -> 28.5 (+49 %), 1,054 -> 1,121; 4 loops 11.5 -> 17.2 (+50 %), 624 -> 663. Priced apart at 2 loops q8_0:q4_0: `LLAMA_DORY_FOLD=1` 38.4 t/s (B60) and 27.7 (A770), `GGML_OPENCL_FUSE_NGPT=0` 38.1 and 27.3, so the fold carries most of the gain and the fused update 2-3 % more. KL against the CPU running the PR graph (`LLAMA_DORY_FOLD=0`), 16 chunks of 512, base -> new: B60 2 loops f16 0.00787 -> 0.00787 (top-1 96.47 -> 96.42 %), ubatch 1 0.00792 -> 0.00792, 4 loops 0.01128 -> 0.01153; A770 0.00796 -> 0.00792, ubatch 1 0.00792 -> 0.00791, 4 loops 0.01126 -> 0.01125; q8_0:q4_0 new 0.0126 (B60) and 0.0123 (A770). The review fixes (placement by an F32 `MUL` probe, the sources host-only) served the same text at the same speed (B60 39.2, A770 28.5 t/s) and the same KL.
+On the cards (`measured-here`, 2026-11-07, arcint served, a 5.9k-token prompt and a 400-token greedy decode, decode from the slot's own timing; base = 0111 + 0112, two rounds interleaved): B60 2 loops q8_0:q4_0 decode 28.6 -> 39.1 t/s (+37 %), prefill 2,522 -> 2,731 (+8 %); 4 loops q8_0:q4_0 17.2 -> 23.6 (+37 %), 1,474 -> 1,609; 2 loops f16 30.5 -> 42.8 (+40 %, the same answer's md5), 2,637 -> 2,874. A770 2 loops q8_0:q4_0 19.1 -> 28.5 (+49 %), 1,054 -> 1,121; 4 loops 11.5 -> 17.2 (+50 %), 624 -> 663. Priced apart at 2 loops q8_0:q4_0: `LLAMA_DORY_FOLD=1` 38.4 t/s (B60) and 27.7 (A770), `GGML_OPENCL_FUSE_NGPT=0` 38.1 and 27.3, so the fold carries most of the gain and the fused update 2-3 % more. KL against the CPU running the PR graph (`LLAMA_DORY_FOLD=0`), 16 chunks of 512, base -> new: B60 2 loops f16 0.00787 -> 0.00787 (top-1 96.47 -> 96.42 %), ubatch 1 0.00792 -> 0.00792, 4 loops 0.01128 -> 0.01153; A770 0.00796 -> 0.00792, ubatch 1 0.00792 -> 0.00791, 4 loops 0.01126 -> 0.01125; q8_0:q4_0 new 0.0128 (B60) and 0.0123 (A770). The review fixes (placement by an F32 `MUL` probe, the sources host-only) served the same text at the same speed (B60 39.2, A770 28.5 t/s) and the same KL.
 
 The PR graph stays one switch away: `LLAMA_DORY_FOLD=0` (read at load) builds exactly 0108's graph (KL 0 above), `1` the folded vectors only. With 0 the OpenCL fusion of 0114 finds nothing to fuse (its pattern has the alpha chain in the middle). The memory-fit pass (`no_alloc`) builds the PR graph, which needs slightly more compute buffer, so the fit stays conservative.
 
@@ -7525,7 +7525,7 @@ call, so the blocks pay it once per block. Its 24-tile builds measured the
 first launches on wide rows crashed on a base that read the page table of an
 unpaged call (fixed in kv-ringaos).
 
-## 0125-opencl-replay-subgroup.patch
+## 0127-opencl-replay-subgroup.patch
 
 Fixes 0086/0087's OpenCL replay kernel (`GDN_RPL`, `kernel_gated_delta_net_rpl`): it carried no
 `__attribute__((intel_reqd_sub_group_size(SG)))`, while the generation (`tg`) and prompt (`pp`)
@@ -7549,8 +7549,8 @@ the earlier card arms used it.
 
 **Red before, green after**: the same two commands, A770 then B60 (`GGML_OPENCL_DEVICES=0:0`),
 must go 66/66 with the exact arms at max `|diff| 0.0`; the no-replay cases stay green. The
-device-free cell is `tests/python/test_gdn_replay_model_branches.py`'s 0125 checks: the replay
+device-free cell is `tests/python/test_gdn_replay_model_branches.py`'s 0127 checks: the replay
 kernel declares the sub-group size, as the other two kernels do (red on the pre-patch tree).
-0126 adds the coder's chain geometry (16 key heads, 2 v repeats = 32 value heads, K 5) beside
+0128 adds the coder's chain geometry (16 key heads, 2 v repeats = 32 value heads, K 5) beside
 the existing shapes, so the served unit's head counts are in the op suite. The served coder arm
 with `LLAMA_GDN_REPLAY=1` is still owed and is the one to run next.
