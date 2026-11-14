@@ -579,11 +579,11 @@ public:
         // through the device's supports_op before any model loads; a flag it cannot
         // honour is refused, never run on the CPU reference.
         if (cfg.llama_kv_resident_mib > 0 || cfg.llama_kv_resident_decode_mib > 0) {
-            const KvStreamAsk ask{ cfg.llama_kv_resident_mib, cfg.llama_kv_resident_decode_mib,
+            const arcint::KvStreamAsk ask{ cfg.llama_kv_resident_mib, cfg.llama_kv_resident_decode_mib,
                                    kv_stream_probe(/*n_head_kv*/ 4, /*n_head*/ 24, /*rows*/ 6),
                                    cards[0].name.find("B60") != std::string::npos,
                                    /*flash attention*/ true, /* --llama-kv */ llama_kv_dtype(cfg) };
-            const std::string no = kv_stream_refusal(ask);
+            const std::string no = arcint::kv_stream_refusal(ask);
             if (!no.empty()) throw std::runtime_error(no);
             kv_stream_paged_ = ask.has_paged_fa;
         }
