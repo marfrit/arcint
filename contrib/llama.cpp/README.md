@@ -7092,8 +7092,11 @@ into the KV cache yet -- that is I3's prerequisite, named below.
   the third and fourth ubatch's attention (an evicted page streams what the host
   store last held). Restored, every check passes.
 - **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host, the patch's
-  own cell, 1 thread): green all checks, the red build 6 failing. The recipe:
-  recorded with the section's result line below.
+  own cell, 1 thread): green all checks, the red build 6 failing. The recipe at
+  the green tree (`99d94fe0`): 38 of 38 unit tests, EXIT 0, the .deb built,
+  `kv-stream-map` among them and `kv-stream-refuse` reported Not Run (Disabled);
+  at the red tree (`kv-stream-red2`, `5a01de69`): 38 with 1 failure,
+  `kv-stream-map` failing, EXIT 8, no .deb.
 - **Not measured:** any card; the copier/publisher threads, the second queue,
   the sync flags and the pool sizing (I3/I5); a served model (the CPU arm is
   the cell; arcint's llama engine requires an OpenCL card at start).

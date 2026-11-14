@@ -433,7 +433,8 @@ zombie sweep by pid; never run outside the window).
   and the paged output **bit-identical** to the stream off, because the CPU
   path gathers exact bytes.
 - Card: none.
-- **Built in 0120** (`measured-here`, CPU): the class has the page map, the host
+- **Built in 0120** (`measured-here`, CPU; recipe green `99d94fe0` 38 of 38,
+  EXIT 0; red tree `5a01de69` 38 with 1 failure, EXIT 8): the class has the page map, the host
   store, write-back/read-back, the table, the runs, the rotation debug switch
   and `get_rows`/`set_rows`; its cell is `kv-stream-map` (part 1 the map, part 2
   four ubatches through 0119's paged attention, `memcmp`-equal to the contiguous
