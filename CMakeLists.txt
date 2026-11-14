@@ -713,6 +713,15 @@ if(ARCINT_TESTS)
                      "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_gdn_replay_hybrid_input.py")
     set_tests_properties(gdn-replay-hybrid-input PROPERTIES LABELS unit)
+    # 0086/0087's model list, read out of the patched tree (LLAMA_SRC): every
+    # architecture the replay gate admits builds its GDN state with s_rpl_rows;
+    # qwen35moe stayed on the snapshot gather and rs_s_rpl_rows was an unread
+    # input with no buffer (the first decode's GGML_ASSERT(buffer)).
+    add_test(NAME gdn-replay-model-branches
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_gdn_replay_model_branches.py")
+    set_tests_properties(gdn-replay-model-branches PROPERTIES LABELS unit)
     add_test(NAME expert-profile-save
              COMMAND "${CMAKE_COMMAND}" -E env "EXPERT_PROFILE_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
                      "${Python3_EXECUTABLE}"
