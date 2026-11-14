@@ -3,6 +3,7 @@
 #include "exec/llama_layer_split.h"
 #include "harness.h"
 
+#include <cstdlib>
 #include <cstdio>
 #include <vector>
 
@@ -1323,4 +1324,27 @@ TEST(config_chat_template_kwarg_reasoning_effort_default) {
     CHECK(r1.error.find("contradicts") != std::string::npos);
     CHECK(rejected({"--stub", "--chat-template-kwarg", "enable_thinking=false",
                     "--chat-template-kwarg", "reasoning_effort=high"}));
+}
+
+TEST(config_kv_resident_is_refused_for_serving_until_its_page_moves_exist) {
+    // the KV stream's per-layer page moves (I5) are not built: a budget is refused unless the development
+    // switch is set, and 4096 MiB or more never fits the 32-bit byte count libllama takes
+    // (red: drop the LLAMA_KV_STREAM_UNSAFE check in config.cpp, and the first CHECK passes the budget)
+    unsetenv("LLAMA_KV_STREAM_UNSAFE");
+    Config cfg;
+    ArgParse r = run({"--gguf", "/m/q.gguf", "--llama-kv-resident", "3584"}, cfg);
+    CHECK(!r.ok);
+    CHECK(r.error.find("under development") != std::string::npos);
+    setenv("LLAMA_KV_STREAM_UNSAFE", "1", 1);
+    Config cfg2;
+    CHECK(run({"--gguf", "/m/q.gguf", "--llama-kv-resident", "3584"}, cfg2).ok);
+    CHECK_EQ(cfg2.llama_kv_resident_mib, 3584);
+    Config cfg3;
+    r = run({"--gguf", "/m/q.gguf", "--llama-kv-resident", "4096"}, cfg3);
+    CHECK(!r.ok);
+    CHECK(r.error.find("4095 MiB") != std::string::npos);
+    unsetenv("LLAMA_KV_STREAM_UNSAFE");
+    Config cfg4;
+    CHECK(run({"--gguf", "/m/q.gguf"}, cfg4).ok);   // no budget: nothing changes
+    CHECK_EQ(cfg4.llama_kv_resident_mib, 0);
 }
