@@ -7093,7 +7093,9 @@ into the KV cache yet -- that is I3's prerequisite, named below.
   `prepare`; the cell evicts after a second ubatch takes its slot, and the host
   store must return the bytes it wrote. The no-op mutation of
   `for (uint32_t c : cells) dirty[c/page_size] = 1;` fails that cell (4 checks)
-  and nothing else -- the section is the only place the graph's write is made.
+  and nothing else -- the section is the only place the graph's write is made. The branch `kv-stream-red4`
+  (`487e82b1`) is that no-op: recipe EXIT 8, 1 of 40 failing, `kv-stream-map`
+  the one, its four graph-write checks red.
 - **Red case** (branch `kv-stream-red2`): `evict` drops the write-back
   (`dirty[page]` -> `false`). It compiles and fails 6 checks -- the rotation
   cell (a dirty page evicted without its write-back reads different bytes) and

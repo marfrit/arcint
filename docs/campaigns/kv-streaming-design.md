@@ -582,10 +582,13 @@ kv 8,192/4,096, q8_0:q4_0 and f16, 5 of 5 with `n_slots=16` on the CPU
 (`measured-here`, plumbing). **Not compiled on a card** (the kernel text).
 
 **I5 partial** 2026-11-14: `--llama-kv-resident` and its refusal at start,
-`/props`'s `kv_stream`, the refusal cell enabled with its red arm; the decode
-phase budget is refused (not built), the copy queue, the ready/consumed flags
-and the prefetch are deferred and named above. The served legs below are
-Claude's card window, not run here.
+`/props`'s `kv_stream`, the refusal cell enabled with its red arm
+(`kv-stream-red5`, `381660e9`: the kill switch accepts every ask, recipe EXIT 8,
+`kv-stream-refusal` failing all refusal checks); the decode phase budget is
+refused (not built), the copy queue, the ready/consumed flags and the prefetch
+are deferred and named above. Recipe green `0a550911` (40 of 40); red4
+`487e82b1` for the pool-write cell; red5 `381660e9` for the refusal. The served
+legs below are Claude's card window, not run here.
 
 **I3 kernels and cases built** 2026-11-14 (patch 0122, cases 0123): 0016's
 `flash_attn_gqa_dpas.cl`, with 0088's int8 Q K^T and 0089's staged 1-3 rows,
