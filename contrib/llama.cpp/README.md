@@ -7263,3 +7263,39 @@ is 0037's block (`GGML_OPENCL_FA_DPAS_F16KV_BLOCK`), not the fork's
   the CPU. **Not compiled or measured on a card**: the OpenCL C++ builds
   (recipe), the kernel text's first build is Claude's window, and the gather
   path's speed is unmeasured.
+
+## 0123zz-opencl-fa-paged-predicate.patch
+
+The paged `FLASH_ATTN_EXT` predicate as tested logic, and the kernel fix that
+window 226 exposed: every paged case reported "not supported [OpenCL]" on the
+B60, 0 of 10 run, because the GQA program failed its optional build and the
+kernel stayed null. Evidence `code` (the source order) + `measured-here`
+(window 226: unpaged agent shapes supported and passing on the same tree).
+
+- **The kernel** (`flash_attn_gqa_dpas.cl`): 0122 put `fa_gqa_page_row` between
+  `__attribute__((intel_reqd_sub_group_size(16)))` and `kernel void
+  flash_attn_gqa_dpas`. An intervening declaration takes the attribute for
+  itself, so the kernel compiled without a required sub-group size, the DPAS
+  builtins failed, `build_program_from_source_optional` returned null, and
+  `supports_op`'s `kernels_decode` was false for every pair. The helper now
+  sits before the attribute; nothing is between the attribute and the kernel.
+- **The predicate** (`ggml-opencl-fa-paged.h`, new): the supports_op logic as
+  plain data -- `ggml_cl_fa_paged_shape`, `_kv_ok`, `_shape_ok`, `_ok`. True
+  exactly where the kernels handle a paged case: I32 contiguous table with a
+  valid row and page size 256, the four KV pairs, head 256, one stream, GQA
+  divisibility; a full-width mask; a whole-page ring (or no ring); and the
+  kernel of the shape (GQA for `(q heads/kv heads)*rows <= 64`, the conversion
+  + f16 prompt kernel for a prompt). `ggml_opencl_supports_op` fills it from the
+  tensors and calls it.
+- **Diagnostic**: `GGML_OPENCL_FA_PAGED_DEBUG=1` logs the clauses (table, kv,
+  shape, mask, ring, the two kernel flags) and the verdict as one INFO line, so
+  a declined paged case names its clause on the card.
+- **Tests**: arcint's `tests/test_fa_paged_predicate.cpp` (`fa-paged-predicate`,
+  ctest LABELS unit) drives `ggml_cl_fa_paged_ok` over the agent's decode shape
+  (true) and flips every clause (each must refuse), plus prompts and 1-row
+  decode; `tests/python/test_fa_gqa_i8.py` asserts the attribute is immediately
+  followed by the kernel (nothing between).
+- **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host): the
+  predicate cell passes, the source-text gate passes, the recipe is green. **Not
+  compiled on a card**: the kernel's next build is Claude's window; the
+  diagnostic line is the clause evidence to collect there.
