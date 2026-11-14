@@ -378,11 +378,11 @@ fallback.
      (`kv_stream.deferred = "cpu-reference: no paged kernel"` when it would
      have fallen back), so a build that cannot serve the flag says so before a
      request.
-  The disabled cell `tests/test_kv_stream_refuse_todo.cpp` (ctest
-  `kv-stream-refuse`, `DISABLED TRUE`) is the placeholder: I5 turns it on with
-  the refusal's real message, and its red arm is a build whose OpenCL
-  `supports_op` says true for pages (I3's kernel present, the refusal check
-  removed).
+  **Built in I5**: the rules are `src/exec/kv_stream_refusal.h`, driven by the
+  enabled cell `tests/test_kv_stream_refusal.cpp` (ctest `kv-stream-refusal`);
+  its red arm is `ARCINT_KV_STREAM_REFUSE_OFF=1` (branch `kv-stream-red5`,
+  `381660e9`), which accepts an ask the card cannot honour and fails every
+  refusal check.
 - **/props**: a `kv_stream` object, `phase`, `pool_mib`, `slots_mib`,
   `resident_pages`, `context_pages`, `streamed_pages_last_round`, and
   `downgrades()` gains `kv-stream:<n> pages read from host` so nothing is
@@ -606,7 +606,7 @@ kv 8,192/4,096, q8_0:q4_0 and f16, 5 of 5 with `n_slots=16` on the CPU
 (`kv-stream-red5`, `381660e9`: the kill switch accepts every ask, recipe EXIT 8,
 `kv-stream-refusal` failing all refusal checks); the decode phase budget is
 refused (not built), the copy queue, the ready/consumed flags and the prefetch
-are deferred and named above. Recipe green `0a550911` (40 of 40); red4
+are deferred and named above. Recipe green `294844e5` (40 of 40); red4
 `487e82b1` for the pool-write cell; red5 `381660e9` for the refusal. The served
 legs below are Claude's card window, not run here.
 
@@ -644,8 +644,8 @@ review's two items are in: a compact mask (last `mask->ne[0]` keys, earlier
 columns visible) equals the unpaged full-mask run, its red (the widening's
 copy without the `col0` offset, branch `kv-stream-red-widen`) fails exactly
 those two cases (recipe EXIT 8, `b4a8cd98`); and §4.3 names
-where I5's probe refusal stops the scheduler's silent CPU placement, with the
-disabled `kv-stream-refuse` cell as its marker. Green: 6 of 6 cases, recipe
+where I5's probe refusal stops the scheduler's silent CPU placement; its cell
+`kv-stream-refusal` is enabled in I5 with the red arm `kv-stream-red5`. Green: 6 of 6 cases, recipe
 37 of 37 (EXIT 0). Red: ring mutation 3 of 4, widening mutation 2 of 2
 compact-mask cases, recipe EXIT 8. Everything else is as below.
 
