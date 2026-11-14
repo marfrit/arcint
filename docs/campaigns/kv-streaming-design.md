@@ -524,6 +524,26 @@ zombie sweep by pid; never run outside the window).
 - The per-phase budgets and the -2 path (§4.2), the prefetch (fork
   `cpp:490-530`) placed **after** the graph (0042), the refusal set (§4.3),
   the /props line and the logs.
+
+- **Card (Claude), the I5 gate, one announced window, B60, SOP first:** two
+  arms, one process an arm, the same requests. Baseline: the agent on
+  UD-Q4_K_M, unpaged (`--n-ctx 262144 --llama-kv q8_0:q4_0 --llama-mtp 5`,
+  no `--llama-kv-resident`). Candidate: UD-Q5_K_M with
+  `--llama-kv-resident 4096` (the pool at half the context, ring every 2).
+  ```
+  arcint --model <...UD-Q4_K_M.gguf> --n-ctx 262144 --llama-kv q8_0:q4_0 --llama-mtp 5 ...
+  arcint --model <...UD-Q5_K_M.gguf> --n-ctx 262144 --llama-kv q8_0:q4_0 --llama-mtp 5 \
+         --llama-kv-resident 4096 ...
+  ```
+  Per arm: `/props`'s `kv_stream` (`requested`, `resident_mib`, `paged_fa`);
+  the capital; a needle at ~250k; twelve 300-token answers; decode t/s at
+  32k, 128k and 250k depth; prefill t/s at both depths; peak VRAM and GTT from
+  the sampler (per the SOP's 2 s recording); the copy queue's busy share
+  (`GGML_SCHED_TIMING`) **only once I5's queue lands** — today the moves are on
+  the compute queue, so the gate's shape is correctness and the wall, not
+  overlap. Red: the same candidate with `ARCINT_KV_STREAM_REFUSE_OFF=1` is
+  accepted at start and then fails at the cache's construction (the shapes) --
+  it must not serve.
 - **Device-free red/green**: the refusal matrix as a unit (each arm's message;
   red: a flag accepted by a build that cannot honour it must fail — that is
   the red case) and the -2 mapping (unit test on the decode return path, no
