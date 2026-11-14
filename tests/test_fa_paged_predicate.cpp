@@ -98,30 +98,31 @@ int main() {
 
     // the GQA work-group's cap: (query heads / KV heads) * rows <= tiles * 8. The
     // agent has 6 (head, token) rows a token, so 10 tokens fill 60 rows on 8 tiles
-    { auto s = agent_decode(); s.q_ne1 = 10; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 1, "a 10-token (60-row) verify takes the wide GQA call"); }
-    { auto s = agent_decode(); s.q_ne1 = 11; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "11 tokens (66 rows) exceed the cap and take the conversion"); }
+    { auto s = agent_decode(); s.q_ne1 = 10; s.mask_ne1 = 10; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 1, "a 10-token (60-row) verify takes the wide GQA call"); }
+    { auto s = agent_decode(); s.q_ne1 = 11; s.mask_ne1 = 11; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "11 tokens (66 rows) exceed the cap and take the conversion"); }
     { auto s = agent_decode(); auto c = agent_caps(); c.tiles = 4;
       CHECK(ggml_cl_fa_paged_form(s, c) == 1, "6 rows stay on the split kernel whatever the tiles"); }
-    { auto s = agent_decode(); s.q_ne1 = 11; auto c = agent_caps(); c.tiles = 4; c.kernels_prefill = false;
+    { auto s = agent_decode(); s.q_ne1 = 11; s.mask_ne1 = 11; auto c = agent_caps(); c.tiles = 4; c.kernels_prefill = false;
       CHECK(!ggml_cl_fa_paged_ok(s, c), "rows beyond the cap with no conversion are refused"); }
 
     // 9-64 rows: the wide GQA call needs one batch and one stream's mask
-    { auto s = agent_decode(); s.q_ne1 = 9; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 1, "9 tokens (54 rows) take the wide GQA call"); }
-    { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne2 = 2;
+    { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 1, "9 tokens (54 rows) take the wide GQA call"); }
+    { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; s.mask_ne2 = 2;
       CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "9 tokens over two mask heads take the conversion"); }
-    { auto s = agent_decode(); s.q_ne1 = 9; s.n_batch = 2;
+    { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; s.n_batch = 2;
       CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "9 tokens on two K/V batches take the conversion"); }
-    { auto s = agent_decode(); s.q_ne1 = 9; auto c = agent_caps(); c.wide_on = false;
+    { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; auto c = agent_caps(); c.wide_on = false;
       CHECK(ggml_cl_fa_paged_form(s, c) == 2, "with the wide verify off, 9 tokens take the conversion"); }
-    { auto s = agent_decode(); s.q_ne1 = 9; auto c = agent_caps(); c.split_decode = false;
+    { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; auto c = agent_caps(); c.split_decode = false;
       CHECK(ggml_cl_fa_paged_form(s, c) == 1, "without the split kernel the wide call still decodes"); }
 
     // prefill: the conversion + f16 prompt kernels carry every row count
-    { auto s = agent_decode(); s.q_ne1 = 512; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "a 512-row prompt takes the conversion"); }
-    { auto s = agent_decode(); s.q_ne1 = 512; auto c = agent_caps(); c.kernels_prefill = false;
+    { auto s = agent_decode(); s.q_ne1 = 512; s.mask_ne1 = 512; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "a 512-row prompt takes the conversion"); }
+    { auto s = agent_decode(); s.q_ne1 = 512; s.mask_ne1 = 512; auto c = agent_caps(); c.kernels_prefill = false;
       CHECK(!ggml_cl_fa_paged_ok(s, c), "a prompt without the conversion+f16 kernel is refused"); }
     { auto s = agent_decode(); auto c = agent_caps();
       c.kernels_gqa_direct = false; c.kernels_gqa_staged = false; c.kernels_prefill = false;
+      c.split_decode = false;
       CHECK(!ggml_cl_fa_paged_ok(s, c), "no kernel at all is refused"); }
 
     // 1 row: the staged 1-3-row form is the decode kernel's, so it is accepted
