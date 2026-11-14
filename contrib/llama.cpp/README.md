@@ -7559,7 +7559,12 @@ ring's row stride equals a row of all its heads. A mismatch aborts with the
 message instead of faulting the device; the layers cell checks the same three
 relations device-free at the reserve shapes.
 
-Red arms, device-free here: the `memset` arm and the copy arm are both
+Red arm, run device-free here (`measured-here`): the layers cell with a plan
+row shifted by two pages fails `FAIL layers copy geometry: a page copy runs
+outside its ring view or the page bytes differ`; at its real rows it prints
+`OK: every attention layer reads its own streamed pages`.
+
+Red arm, device-free here: the `memset` arm and the copy arm are both
 reachable only through the OpenCL path, so the red evidence is the card's log
 above (the placeholder fill and the dispatcher abort); the guard is that a
 non-USM store with a split region (SoA) aborts rather than byte-copying.
