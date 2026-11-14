@@ -174,6 +174,24 @@ int main() {
               "layers sources", "the host store and the plan landed inside src[]");
         ggml_set_name(out[(size_t) l], "op_out");
 
+        // 0127: every offset and size the stream's page copy uses, at this shape:
+        // the host store's page bytes equal the ring's page span, and each plan row's
+        // destination stays inside the ring view it is written through
+        {
+            const int ps = (int) llama_kv_stream::page_size;
+            const int32_t * pl = (const int32_t *) s.plan()->data;
+            const size_t kb = (size_t) s.host_k((int32_t) l)->nb[2], vb = (size_t) s.host_v((int32_t) l)->nb[2];
+            const size_t rb = (size_t) rk->nb[1],             rvb = (size_t) rv->nb[1];
+            bool fits = kb == vb && rb == rvb;
+            for (int64_t p = 0; p < s.n_pages(); ++p) {
+                const int32_t row = pl[p];
+                if (row < 0) continue;
+                fits = fits && (size_t) row*ps*rb + kb <= ggml_nbytes(rk) &&
+                              (size_t) row*ps*rvb + vb <= ggml_nbytes(rv);
+            }
+            CHECK(fits, "layers copy geometry", "a page copy runs outside its ring view or the page bytes differ");
+        }
+
         // the reference: this layer's contiguous cache cut at n_kv
         ggml_tensor * kc = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, hs*nh, n_att);
         ggml_tensor * vc = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, hs*nh, n_att);
