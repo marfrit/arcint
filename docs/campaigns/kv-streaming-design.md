@@ -513,17 +513,32 @@ zombie sweep by pid; never run outside the window).
 - **Deferred, and why:** `--llama-kv-resident-decode` is parsed and **refused**
   at start (the phase resize/re-reserve is not built; the single budget
   serves); the copier/publisher threads and the ready/consumed flags are not
-  built -- the stream's page moves are `ggml_backend_tensor_set/get` on the
-  in-order compute queue, which is **unhidden** -- and, as built, **not correct**
-  beyond the pool (correction, 2026-11-14, `code`: `prepare()` fills the two
-  ring slots for every layer before the graph, so each layer but the last two
-  reads another layer's pages; contrib/llama.cpp README, 0123zzzzz2; the cache
-  refuses a budget that would stream until the per-layer copy exists) (0032's second
-  queue, 0042's after-graph placement and the prefetch are the overlap, and
-  they need a card to validate); the -2 pool-does-not-fit path is the cache's
-  construction refusal plus the prepare assert (a phase resize can be refused
-  only after I5's queue). A start that asks for the decode budget or a device
-  without paged FA is refused, not silently degraded.
+  built -- the stream's page moves are `clEnqueueWriteBuffer` per layer on the
+  in-order compute queue, which is **unhidden** (0032's second queue, 0042's
+  after-graph placement and the prefetch are the overlap, and they need a card
+  to validate); the -2 pool-does-not-fit path is the cache's construction
+  refusal plus the prepare assert (a phase resize can be refused only after
+  I5's queue). A start that asks for the decode budget or a device without
+  paged FA is refused, not silently degraded.
+
+**Review round, 2026-11-14 (`code`):** the per-layer move (0123zzzzz3) copies
+each attention layer's streamed pages into its ring slot inside its own FA
+dispatch, so a KV window beyond the pool no longer reads another layer's pages;
+the cache's cross-layer refusal is gone (~`if (pages)` prepare path). An outside
+review of the stream then found four defects, fixed in 0123zzzzz6 with the
+device-free arms named there: the store indices map through
+`llama_kv_stream::row()` in both K and V (beyond the pool a cell index would
+write past the pool), with the state save/restore and `clear()` wired and KV
+windows/streams/transposed V refused; one paged predicate (`ggml_cl_fa_paged_form`)
+shared by `supports_op` and the dispatcher, carrying the rows, mask heads, op
+params and the built kernels the dispatcher actually needs; the CPU plan's
+widened mask reserved whenever `mask_col0 > 0`; and a stream-on graph whose
+fused node is not `LLM_FUSED_OP_FLASH_ATTN` throwing instead of asserting, with
+the refusal red switch no longer compiled into the served binary. The host store
+is a USM tensor and its page access goes through the slices entry points, never
+`->data` arithmetic on an OpenCL buffer; the cache sets `stream_buft = buft`
+only when the caller gave none, and the stream's construction throws when that
+buffer type's device lacks the USM host entry point.
 
 - The per-phase budgets and the -2 path (§4.2), the prefetch (fork
   `cpp:490-530`) placed **after** the graph (0042), the refusal set (§4.3),
