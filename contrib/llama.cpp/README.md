@@ -7381,7 +7381,19 @@ work-group for all rows, where the blocks stage it once per block.
 - **Switches:** `GGML_OPENCL_FA_WIDE_VERIFY=0` keeps the blocks;
   `GGML_OPENCL_FA_DEBUG=1` logs each call's form, rows and tiles.
 - **Tests:** `test-backend-ops` cases at the agent's geometry, 9, 10, 17, 21 and
-  32 tokens, f16 and q8_0 / q4_0, and two paged verifies (10 and 17 rows).
+  32 tokens, f16 (4,096 and 8,192 keys) and q8_0 / q4_0 (8,192 and 65,536), and
+  two paged verifies (10 and 17 rows).
+- **Card** (`measured-here`, B60, 2026-11-14, window 242, trees of 38f96336 with
+  f16 arms at 8,192 and 32,768): `GGML_OPENCL_FA_DEBUG` shows `form=gqa` for the
+  wide calls (9-10 rows at 8 tiles, 9-21 at 16; the 16-tile kernel builds). Every
+  q8_0 / q4_0 case and every paged case passes at 8 tiles, 16 tiles and with the
+  switch off. The red copy (a wide call launches one tile fewer) fails exactly
+  the cases that go wide: at 8 tiles 9 and 10 rows and the paged 10 (ERR
+  0.07-0.23), at 16 tiles also 17, 21 and the paged 17 (ERR 0.05-0.32); 32 rows
+  (the blocks) stay green. f16 at 32,768 keys misses the 5e-4 bound (0.0007) on
+  every route, the switch-off blocks included, hence the 4,096 / 8,192 arms. The
+  full `FLASH_ATTN_EXT` suite at 8 tiles: 3,109 of 3,115, the failures those f16
+  cases and the f16 paged prefill with a ring (0123's open case).
 
 History (`measured-here`, B60, 2026-11-14). The first form of this patch never
 ran its kernel. Wide calls reached the prompt kernel first, and its two red

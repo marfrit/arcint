@@ -265,19 +265,20 @@
  // ---- Q quantization: one RNE scale per row per 32-dim block ----
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -12975,6 +12975,20 @@
+@@ -12975,6 +12975,21 @@
              }
          }
      }
 +    // 0124: 9 to 64 verify rows in one call on the GQA kernel when they fit its tiles
 +    // (8 tiles = 64 (head, token) rows, 16 = 128): at the agent's geometry 9 and 10
 +    // tokens fit 8 tiles, 17 and 21 need 16, 32 (192 rows) always takes the blocks
-+    // of 8. f16 K/V at 65536 keys misses the 5e-4 bound on every route (0.0014,
-+    // measured-here, B60), so its arms stop at 32768
++    // of 8. f16 K/V misses the 5e-4 bound from 32768 keys on every route, the
++    // blocks of 8 included (0.0007 at 32768, 0.0014 at 65536, measured-here, B60),
++    // so its arms are 4096 and 8192
 +    for (auto kv_t : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_F16, GGML_TYPE_F16},
 +                                                                  {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}}) {
 +        for (int64_t nb : {9, 10, 17, 21, 32}) {
-+            for (int64_t kv : {8192, kv_t.first == GGML_TYPE_F16 ? 32768 : 65536}) {
++            for (int64_t kv : {kv_t.first == GGML_TYPE_F16 ? 4096 : 8192, kv_t.first == GGML_TYPE_F16 ? 8192 : 65536}) {
 +                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0,
 +                                                                GGML_PREC_F32, kv_t.first, kv_t.second));
 +            }
@@ -286,7 +287,7 @@
      // 0119/0122: paged K/V at the agent's geometry (head 256, 4 KV heads x 6,
  // q8_0 K / q4_0 V), decode and 6-row verify, kv 1k to 262k, pools smaller than
      // the context with every second page in the ring. The last two arms are all-ring
-@@ -12986,6 +13000,9 @@
+@@ -12986,6 +13001,9 @@
          test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, kv, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 1, 4));
      }
      test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, 8192, 6, GGML_TYPE_F16, GGML_TYPE_F16, 2, 16));
