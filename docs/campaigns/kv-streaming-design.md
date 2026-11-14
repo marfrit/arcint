@@ -502,6 +502,25 @@ zombie sweep by pid; never run outside the window).
 
 ### I5 — budgets, refusal, /props, prefetch; the served agent
 
+**Built this round, and what is deferred, named:**
+- `--llama-kv-resident MIB` (arcint's config → `cparams.kv_resident_size`),
+  the start refusal (`src/exec/kv_stream_refusal.h`: flash attention, the 24 GB
+  card, the device's paged-`supports_op` probe, `--llama-kv q8_0:q4_0`), the
+  `/props` `kv_stream` object, and the table's device upload (0123a: the used
+  row to a device buffer on the compute queue, released after the queued
+  command). The refusal cell is enabled (`kv-stream-refusal`) with its red arm
+  `ARCINT_KV_STREAM_REFUSE_OFF=1`.
+- **Deferred, and why:** `--llama-kv-resident-decode` is parsed and **refused**
+  at start (the phase resize/re-reserve is not built; the single budget
+  serves); the copier/publisher threads and the ready/consumed flags are not
+  built -- the stream's page moves are `ggml_backend_tensor_set/get` on the
+  in-order compute queue, which is **correct and unhidden** (0032's second
+  queue, 0042's after-graph placement and the prefetch are the overlap, and
+  they need a card to validate); the -2 pool-does-not-fit path is the cache's
+  construction refusal plus the prepare assert (a phase resize can be refused
+  only after I5's queue). A start that asks for the decode budget or a device
+  without paged FA is refused, not silently degraded.
+
 - The per-phase budgets and the -2 path (§4.2), the prefetch (fork
   `cpp:490-530`) placed **after** the graph (0042), the refusal set (§4.3),
   the /props line and the logs.
@@ -551,6 +570,22 @@ zombie sweep by pid; never run outside the window).
      layers, not a full re-stream every round.
 
 ## Current state
+
+**I4 built** 2026-11-14 (patch 0123a): a paged prompt's pages are gathered into
+0037's f16 blocks by the conversion kernel (its table and ring args) and the
+f16 prompt kernel runs with the carry -- the fork's gather form, the chunked
+page-runs merge deferred; the backend forces that path for a paged prompt and
+`supports_op` accepts up to 512 rows, so a stream-on prefill cannot slip to the
+CPU. The decode path's table is uploaded to a device buffer (4 KiB a ubatch at
+262k) and released after the queued command. Cases: paged prefill at 512 rows,
+kv 8,192/4,096, q8_0:q4_0 and f16, 5 of 5 with `n_slots=16` on the CPU
+(`measured-here`, plumbing). **Not compiled on a card** (the kernel text).
+
+**I5 partial** 2026-11-14: `--llama-kv-resident` and its refusal at start,
+`/props`'s `kv_stream`, the refusal cell enabled with its red arm; the decode
+phase budget is refused (not built), the copy queue, the ready/consumed flags
+and the prefetch are deferred and named above. The served legs below are
+Claude's card window, not run here.
 
 **I3 kernels and cases built** 2026-11-14 (patch 0122, cases 0123): 0016's
 `flash_attn_gqa_dpas.cl`, with 0088's int8 Q K^T and 0089's staged 1-3 rows,
