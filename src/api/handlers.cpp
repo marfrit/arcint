@@ -512,6 +512,14 @@ json props(const Context& ctx) {
         // leaves it empty on purpose, which is what lets this print null
         // instead of guessing.
         {"cache", {{"kv_dtype", st.kv_precision.empty() ? json(nullptr) : json(st.kv_precision)}}},
+        // The KV stream (0119-0122, docs/campaigns/kv-streaming-design.md): what was asked
+        // and what the card's start probe answered. `requested` false is off; `paged_fa`
+        // false with requested true can only be seen under the red switch, because the
+        // start refuses that combination.
+        {"kv_stream", {{"requested", st.kv_stream.requested},
+                       {"resident_mib", st.kv_stream.resident_mib},
+                       {"decode_mib", st.kv_stream.decode_mib},
+                       {"paged_fa", st.kv_stream.paged_fa}}},
         // The prefill-slot-loan's live state, so a refused request ("state is
         // out/poisoned/broken") is explained here. "off": no loan configured (the
         // default), "armed": the cache set one up at load, "out": lent right now.

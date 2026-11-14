@@ -619,15 +619,16 @@ if(ARCINT_TESTS)
     target_compile_options(arcint-kv-stream-cache PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME kv-stream-cache COMMAND arcint-kv-stream-cache)
     set_tests_properties(kv-stream-cache PROPERTIES LABELS unit)
-    # TODO(I5), design section 4.3: the start refusal that stops the scheduler's
-    # silent CPU placement of a paged FA (0119's OpenCL supports_op declines the
-    # op). The marker is DISABLED until I5 builds the probe and the refusal;
-    # tests/test_kv_stream_refuse_todo.cpp says what the cell asserts.
-    add_executable(arcint-kv-stream-refuse-todo tests/test_kv_stream_refuse_todo.cpp)
-    target_link_libraries(arcint-kv-stream-refuse-todo PRIVATE arcint_core)
-    target_compile_options(arcint-kv-stream-refuse-todo PRIVATE -Wall -Wextra -Wpedantic)
-    add_test(NAME kv-stream-refuse COMMAND arcint-kv-stream-refuse-todo)
-    set_tests_properties(kv-stream-refuse PROPERTIES LABELS unit DISABLED TRUE)
+    # I5, design section 4.3: the start refusal that stops the scheduler's silent CPU
+    # placement of a paged FA. The rules are src/exec/kv_stream_refusal.h; the red
+    # branch sets ARCINT_KV_STREAM_REFUSE_OFF=1 in the cell's main, which accepts an
+    # ask the card cannot honour and fails the refusals.
+    add_executable(arcint-kv-stream-refusal tests/test_kv_stream_refusal.cpp)
+    target_link_libraries(arcint-kv-stream-refusal PRIVATE arcint_core)
+    target_include_directories(arcint-kv-stream-refusal PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_options(arcint-kv-stream-refusal PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME kv-stream-refusal COMMAND arcint-kv-stream-refusal)
+    set_tests_properties(kv-stream-refusal PROPERTIES LABELS unit)
     # patch 0081's source-slot cell: the GDN family takes src[6] once (the rows
     # index; the replay's records in its own op), the mode word op_params[1]
     # selects the state path, and the raw gating projections of patch 0051 ride
