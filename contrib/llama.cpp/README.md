@@ -7414,6 +7414,14 @@ tokens and then ended in a page fault: xe reset the compute and copy engines
   serving wrong attention; `LLAMA_KV_STREAM_UNSAFE=1` lets the stream run for
   its development.
 
+Measured on the B60 (`measured-here`, 2026-11-14, window 257, UD-Q5_K_M at
+262,144 with a 3,584 MiB budget): the start is refused ("the resident budget
+holds 551 of 1024 pages; streaming the rest needs the per-layer copy (I5)").
+With `LLAMA_KV_STREAM_UNSAFE=1` the server answers the capital and then ends
+inside a 150k prompt with another page fault, this time the copy engine alone
+(`engine_class=bcs`): the planar split was one fault source, not the only one.
+Streaming beyond the pool stays refused until I5.
+
 ## 0124-opencl-fa-wide-verify.patch
 
 A verify of 9 to 64 query rows (more than 8 drafts, several lanes' verifies in
