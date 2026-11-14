@@ -7012,7 +7012,10 @@ for arcint; the cell below is the only number and it is not a rate.
   mutation). Restored, all four pass.
 - **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host, the patched
   tree's own `arcint-fa-paged`, 1 thread): 4 of 4 cases byte-equal, the red
-  build 3 of 4 failing. Not a rate and not on a card.
+  build 3 of 4 failing. The recipe at the green tree: 37 of 37 unit tests
+  pass, EXIT 0, the .deb built; at the red tree (`kv-stream-red`, `fcbbfe90`):
+  36 of 37, `fa-paged` the one failure, EXIT 8, no .deb -- it compiles and
+  fails. Not a rate and not on a card.
 - **Not measured:** any card; any speed of the CPU gather; the cross-queue
   flags' paths (`set_sync`, `set_page_runs`) and the OpenCL kernels, which this
   patch deliberately does not touch (I3/I4).

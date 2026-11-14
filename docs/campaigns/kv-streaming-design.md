@@ -492,6 +492,11 @@ zombie sweep by pid; never run outside the window).
 
 ## Current state
 
+**I1 built** 2026-11-14 (patch 0119): the paged op, the CPU gather reference,
+and the OpenCL backend's refusal; the device-free cell is `fa-paged`, 4 of 4
+byte-equal, its red build 3 of 4 failing, the recipe 37 of 37 green and the
+red tree 36 of 37 (EXIT 8). Everything else is as below.
+
 Design note only, 2026-11-14. Nothing built, nothing measured on a card. The
 prior art read is `research-achyudh.md` §2 (`code`, `paper`); the fork is at
 `b540a4b9b`; arcint is at 1.6.2 + the folded series. Owed: the operator's
