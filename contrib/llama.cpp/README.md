@@ -7373,6 +7373,21 @@ cases pass on the series through this patch (pin + 8658e830); the tree without
 it (03fcccd9) fails exactly the f16 ring prefill (17 of 18). The full
 `FLASH_ATTN_EXT` suite on the fixed tree: 3,115 of 3,115.
 
+## 0123zzzzz1-llama-kv-stream-hybrid-layers.patch
+
+The KV stream's ring views were built for every layer with `has_kv(il)`, over
+`n_layer_all`. On a hybrid model (the dense 27B, `LLM_ARCH_QWEN35`: gated
+delta-net and attention layers) `has_kv` is true for the recurrent layers too,
+while the attention cache holds only `il < n_layer() && !is_recr(il)`; the
+cache's `map_layer_ids.at()` then threw at context creation
+(`llama_init_from_model: failed to initialize the context: unordered_map::at`,
+`measured-here`, B60, windows 252 and 253: the agent's command line with
+UD-Q5_K_M and `--llama-kv-resident 3584`, with and without MTP). The ring
+views are now built only for the layers the cache holds
+(`llama_kv_cache::kv_has_layer`); the page table is set on those layers' FA
+nodes as before, and the recurrent layers stay in their own memory. Until now
+the stream ran only in op tests and unit cases, none of them on a hybrid model.
+
 ## 0124-opencl-fa-wide-verify.patch
 
 A verify of 9 to 64 query rows (more than 8 drafts, several lanes' verifies in

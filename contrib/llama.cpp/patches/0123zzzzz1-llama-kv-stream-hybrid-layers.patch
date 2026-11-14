@@ -1,0 +1,45 @@
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3306,7 +3306,9 @@
+         inp->self_kv_ring_k.assign(hparams.n_layer_all, nullptr);
+         inp->self_kv_ring_v.assign(hparams.n_layer_all, nullptr);
+         for (int32_t il = 0; il < (int32_t) hparams.n_layer_all; ++il) {
+-            if (!hparams.has_kv(il)) continue;
++            // only the layers this cache holds: has_kv() is true for a hybrid model's
++            // recurrent layers too, which live in the recurrent memory
++            if (!hparams.has_kv(il) || !mctx_cur->kv_has_layer(il)) continue;
+             inp->self_kv_ring_k[il] = mctx_cur->build_ring_k(ctx0, il);
+             inp->self_kv_ring_v[il] = mctx_cur->build_ring_v(ctx0, il);
+         }
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -3283,6 +3283,10 @@
+     return kv->kv_layer_index(il);
+ }
+ 
++bool llama_kv_cache_context::kv_has_layer(int32_t il) const {
++    return kv->kv_has_layer(il);
++}
++
+ uint64_t llama_kv_cache_context::kv_stream_layout() const {
+     return kv->kv_stream_on() ? kv->get_kv_stream()->layout() : 0;
+ }
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -219,6 +219,8 @@
+     // KV streaming (0119-0122, docs/campaigns/kv-streaming-design.md, I3)
+     bool kv_stream_on() const { return stream != nullptr; }
+     int32_t kv_layer_index(int32_t il) const { return map_layer_ids.at(il); }
++    // the layers this cache holds: a hybrid model's recurrent layers are in its other memory
++    bool    kv_has_layer(int32_t il) const { return map_layer_ids.count(il) > 0; }
+     llama_kv_stream * get_kv_stream() const { return stream.get(); }
+     // the page table as a host I32 graph input: [n_kv/page_size, n_layer]
+     ggml_tensor * build_input_kv_pages(ggml_context * ctx, uint32_t n_kv) const;
+@@ -470,6 +472,7 @@
+     // KV streaming (I3): the page table input and the ring views the attention reads
+     bool         kv_stream_on() const;
+     int32_t      kv_layer_index(int32_t il) const;
++    bool         kv_has_layer(int32_t il) const;
+     uint64_t     kv_stream_layout() const;
+     ggml_tensor * build_input_kv_pages(ggml_context * ctx) const;
+     ggml_tensor * build_ring_k(ggml_context * ctx, int32_t il) const;
