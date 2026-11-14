@@ -7552,6 +7552,13 @@ Two defects the round-3 build hit on the B60, window 269 (`measured-here`).
    at most 1024 pages) and keeps the USM write path for serving. A host store
    that is neither USM nor one AOS region aborts with its own message.
 
+The copy geometry is now asserted where the offsets are built (`measured-here`,
+reasoned from window 269's fault): the plan's page count equals both host
+stores' page counts, a host page's bytes equal the ring's page row span, and the
+ring's row stride equals a row of all its heads. A mismatch aborts with the
+message instead of faulting the device; the layers cell checks the same three
+relations device-free at the reserve shapes.
+
 Red arms, device-free here: the `memset` arm and the copy arm are both
 reachable only through the OpenCL path, so the red evidence is the card's log
 above (the placeholder fill and the dispatcher abort); the guard is that a
