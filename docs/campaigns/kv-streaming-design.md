@@ -599,9 +599,17 @@ the kernel null, and `supports_op`'s kernel clause was false for every pair. The
 helper now precedes the attribute, the predicate is tested logic in
 `ggml-opencl-fa-paged.h` (`fa-paged-predicate`, every clause flipped), and
 `GGML_OPENCL_FA_PAGED_DEBUG=1` logs the clauses so a declined case names one.
-Recipe green `48defadd` (41 of 41); red `kv-stream-red6` `7683bf7b` (the kernel
-clause dropped, 2 checks). The card's next build decides whether the kernel
-compiles now -- that is Claude's window, not run here.
+**Window 228's two bugs, fixed:** the KV clause compared enum literals (`Q4_0`
+is 2, not 4), declining exactly the agent's q8_0:q4_0 pair while f16 passed; the
+header now names `GGML_TYPE_*`. The f16 case that was accepted crashed
+(CL_EXEC_STATUS_ERROR) because the backend passed a device table tensor's base
+and ignored the used row: the kernel read row 0, `INT32_MAX`, and a pool row of
+2^31 rows went out of bounds. The used row is now passed with its byte offset
+(`ulong table_off`), or a host row uploaded; the conversion kernel takes the same
+offset. Recipe green `b3d290fe` (41 of 41); red `kv-stream-red6` `7683bf7b`
+(the kernel clause dropped, 2 checks); a safe decline red is the KV clause's
+literal `4`. The card's next run decides whether the kernel compiles and the
+paged cases pass -- that is Claude's window, not run here.
 
 **I4 built** 2026-11-14 (patch 0123z): a paged prompt's pages are gathered into
 0037's f16 blocks by the conversion kernel (its table and ring args) and the

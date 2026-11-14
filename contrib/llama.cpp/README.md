@@ -7295,10 +7295,21 @@ kernel stayed null. Evidence `code` (the source order) + `measured-here`
   (true) and flips every clause (each must refuse), plus prompts and 1-row
   decode; `tests/python/test_fa_gqa_i8.py` asserts the attribute is immediately
   followed by the kernel (nothing between).
+- **Window 228's two bugs, fixed:** the KV clause compared enum *literals*
+  (`Q4_0` is 2 in ggml.h, not 4), so the agent's q8_0:q4_0 pair was declined
+  while f16 passed; the header now names `GGML_TYPE_*`. And the table row: the
+  backend passed a device tensor's base and ignored the used row, so the kernel
+  read row 0 -- `INT32_MAX` in the paged case -- and a pool row of 2^31 rows went
+  out of bounds (the CL_EXEC_STATUS_ERROR and the assertion in window 228). The
+  used row is now passed with its byte offset (`ulong table_off`, a device
+  tensor's row), or a host row is uploaded; the conversion kernel takes the same
+  offset. The debug line reports both: `kv` and the kernel-clause flags.
 - **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host): the
   predicate cell passes, the source-text gate passes, the recipe is green
-  (`48defadd`: 41 of 41, EXIT 0); the red branch `kv-stream-red6` (`7683bf7b`,
+  (`b3d290fe`: 41 of 41, EXIT 0); the red branch `kv-stream-red6` (`7683bf7b`,
   the `kernels_ok` clause dropped) fails 2 checks -- a prompt without its
-  kernels and no-kernel-at-all -- recipe EXIT 8. **Not compiled on a card**: the
+  kernels and no-kernel-at-all -- recipe EXIT 8. A second, safe red (no kernel
+  executes): the KV clause's `GGML_TYPE_Q4_0` written as the literal `4` -- the
+  predicate logs `kv 0` and declines the agent's pair. **Not compiled on a card**: the
   kernel's next build is Claude's window; the diagnostic line is the clause
   evidence to collect there.
