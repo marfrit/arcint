@@ -591,6 +591,18 @@ zombie sweep by pid; never run outside the window).
 
 ## Current state
 
+**Window 226's finding, fixed** (`0123zz`, 2026-11-14): all 10 paged cases were
+"not supported [OpenCL]" because 0122 put the page-row helper between the GQA
+kernel's `intel_reqd_sub_group_size(16)` attribute and `kernel void`; the helper
+took the attribute, the DPAS builtins failed, the optional program build left
+the kernel null, and `supports_op`'s kernel clause was false for every pair. The
+helper now precedes the attribute, the predicate is tested logic in
+`ggml-opencl-fa-paged.h` (`fa-paged-predicate`, every clause flipped), and
+`GGML_OPENCL_FA_PAGED_DEBUG=1` logs the clauses so a declined case names one.
+Recipe green `48defadd` (41 of 41); red `kv-stream-red6` `7683bf7b` (the kernel
+clause dropped, 2 checks). The card's next build decides whether the kernel
+compiles now -- that is Claude's window, not run here.
+
 **I4 built** 2026-11-14 (patch 0123z): a paged prompt's pages are gathered into
 0037's f16 blocks by the conversion kernel (its table and ring args) and the
 f16 prompt kernel runs with the carry -- the fork's gather form, the chunked

@@ -7296,6 +7296,9 @@ kernel stayed null. Evidence `code` (the source order) + `measured-here`
   decode; `tests/python/test_fa_gqa_i8.py` asserts the attribute is immediately
   followed by the kernel (nothing between).
 - **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host): the
-  predicate cell passes, the source-text gate passes, the recipe is green. **Not
-  compiled on a card**: the kernel's next build is Claude's window; the
-  diagnostic line is the clause evidence to collect there.
+  predicate cell passes, the source-text gate passes, the recipe is green
+  (`48defadd`: 41 of 41, EXIT 0); the red branch `kv-stream-red6` (`7683bf7b`,
+  the `kernels_ok` clause dropped) fails 2 checks -- a prompt without its
+  kernels and no-kernel-at-all -- recipe EXIT 8. **Not compiled on a card**: the
+  kernel's next build is Claude's window; the diagnostic line is the clause
+  evidence to collect there.
