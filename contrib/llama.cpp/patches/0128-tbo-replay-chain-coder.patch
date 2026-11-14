@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Markus Fritsche <mfritsche@reauktion.de>
+Date: Sat, 14 Nov 2026 18:30:00 +0000
+Subject: [PATCH] 0128-tbo-replay-chain-coder
+
+---
+ tests/test-backend-ops.cpp | 2 ++
+ 1 file changed, 2 insertions(+), 0 deletions(-)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b0f18c5..c5227a5 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -13404,6 +13404,8 @@
+         test_cases.emplace_back(new test_gdn_replay_chain(4, 1, 5, chain_a, exact));
+         test_cases.emplace_back(new test_gdn_replay_chain(2, 3, 5, chain_b, exact));
+         test_cases.emplace_back(new test_gdn_replay_chain(16, 3, 5, chain_a, exact));
++        // 0127: the coder's geometry (16 key heads, 2 v repeats = 32 value heads, MTP 4 -> K 5)
++        test_cases.emplace_back(new test_gdn_replay_chain(16, 2, 5, chain_a, exact));
+         test_cases.emplace_back(new test_gdn_replay_chain(2, 2, 3, { {7, 1}, {3, 2}, {3, 0}, {1, 0} }, exact));
+     }
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));

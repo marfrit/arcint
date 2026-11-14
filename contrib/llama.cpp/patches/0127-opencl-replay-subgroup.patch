@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Markus Fritsche <mfritsche@reauktion.de>
+Date: Sat, 14 Nov 2026 18:15:00 +0000
+Subject: [PATCH] 0127-opencl-replay-subgroup
+
+---
+ ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl | 3 +++
+ 1 file changed, 3 insertions(+), 0 deletions(-)
+
+diff --git a/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl b/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
+index 75baa31..fedbc05 100644
+--- a/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
++++ b/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
+@@ -61,6 +61,9 @@
+ //   - an epilogue that stores the base state (after token t_base) and one
+ //     record per later token: delta per value row, k per key, g per head.
+ // n_tokens == 0 replays only and stores the replayed state as the base.
++// The sub-group size is the block I/O's and every `m*SG` index's; without the
++// attribute the compiler need not choose SG (the tg and pp kernels carry it).
++__attribute__((intel_reqd_sub_group_size(SG)))
+ kernel void kernel_gated_delta_net_rpl(
+         global const char * q_buf,     ulong off_q,
+         global const char * k_buf,     ulong off_k,
