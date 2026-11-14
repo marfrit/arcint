@@ -7524,3 +7524,33 @@ call, so the blocks pay it once per block. Its 24-tile builds measured the
 `flash_attn_f32_f16` fallback (the kernel does not build at 256 GRF), and its
 first launches on wide rows crashed on a base that read the page table of an
 unpaged call (fixed in kv-ringaos).
+
+## 0125-opencl-replay-subgroup.patch
+
+Fixes 0086/0087's OpenCL replay kernel (`GDN_RPL`, `kernel_gated_delta_net_rpl`): it carried no
+`__attribute__((intel_reqd_sub_group_size(SG)))`, while the generation (`tg`) and prompt (`pp`)
+kernels do. The replay body is the generation kernel's per-token step with a replay prologue and
+a record epilogue, and its `intel_sub_group_block_read/write` and `sub_group_reduce_add` work over
+one sub-group of SG work-items with every index `m*SG` (SG 8 on the A770, 16 on the B60). Without
+the declaration the compiler's sub-group size is not SG: a smaller SIMD size leaves gaps in the
+state rows and overlaps in the block reads, so the replay state is wrong from the first launch.
+
+**Measured (`measured-here`, 2026-11-14, window 267, the replay-coder tree before this patch,
+`test-backend-ops -b GPUOpenCL -o 'GATED_DELTA_NET.*'`, `LLAMA_GDN_REPLAY=1`, one process an
+arm)**: 58/66 on the A770 **and** 58/66 on the B60, the same 8 `GATED_DELTA_NET_REPLAY` chain
+cases failing on both (4 shapes × exact/precision). The exact arms, `[replay != snapshot: max
+|diff| 1.54019 / 1.54458 / 1.47103 / 1.31309]` (A770) and 1.381 / 1.537 / 1.645 / 1.393 (B60);
+the precision arms `[CONCAT] ERR 0.10-0.24`. Every non-replay `GATED_DELTA_NET` case passed. So
+the op is wrong on the cards and not only on the A770's SG 8; the dense agent's served replay
+arms passed the answer-level bar without this (their KL/needle did not see the state), which is
+why the defect survived: the chain cases had never run on a card — the plain `-o
+GATED_DELTA_NET` matches that name exactly and excludes every `GATED_DELTA_NET_REPLAY` case, and
+the earlier card arms used it.
+
+**Red before, green after**: the same two commands, A770 then B60 (`GGML_OPENCL_DEVICES=0:0`),
+must go 66/66 with the exact arms at max `|diff| 0.0`; the no-replay cases stay green. The
+device-free cell is `tests/python/test_gdn_replay_model_branches.py`'s 0125 checks: the replay
+kernel declares the sub-group size, as the other two kernels do (red on the pre-patch tree).
+0126 adds the coder's chain geometry (16 key heads, 2 v repeats = 32 value heads, K 5) beside
+the existing shapes, so the served unit's head counts are in the op suite. The served coder arm
+with `LLAMA_GDN_REPLAY=1` is still owed and is the one to run next.
