@@ -7388,6 +7388,32 @@ views are now built only for the layers the cache holds
 nodes as before, and the recurrent layers stay in their own memory. Until now
 the stream ran only in op tests and unit cases, none of them on a hybrid model.
 
+## 0123zzzzz2-kv-stream-partial-writes-refusal.patch
+
+The first served run of the KV stream beyond its pool (window 255, the dense 27B
+as UD-Q5_K_M at 262,144 with `--llama-kv-resident 3584`, B60) served to 131,072
+tokens and then ended in a page fault: xe reset the compute and copy engines
+(`measured-here`, no wedge). Two defects, both in the stream's page moves
+(`code`):
+
+- **The fault.** The OpenCL `set_tensor` splits every contiguous q8_0 / q4_0
+  tensor into SoA planes, writing `ggml_nbytes(tensor)` from `data` at `offset`
+  whatever `size` is. The stream moves single pages into its pool and ring
+  slots with `ggml_backend_tensor_set(slot, page, offset, bytes)`, so its first
+  move read past the host page and wrote planes past the slot. A partial write
+  of a q8_0 / q4_0 tensor that is not a weight now takes the plain copy (the
+  attention reads these as blocks); a partial write into a tensor that was
+  split is an assert. The cache itself never met this: `SET_ROWS` writes it.
+- **The page moves are not per layer.** The stream has two ring slots, a layer
+  using `slots[ikv % 2]`, and `prepare()` fills them for every layer before the
+  graph runs, so each layer but the last two would read another layer's pages.
+  The design copies layer i's pages while layer i-1 computes (I5's copy queue),
+  which is not built. The cache now refuses a budget that does not hold the
+  context ("the resident budget holds N of M pages; streaming the rest needs the
+  per-layer copy (I5)"), so a start that would stream is refused instead of
+  serving wrong attention; `LLAMA_KV_STREAM_UNSAFE=1` lets the stream run for
+  its development.
+
 ## 0124-opencl-fa-wide-verify.patch
 
 A verify of 9 to 64 query rows (more than 8 drafts, several lanes' verifies in
