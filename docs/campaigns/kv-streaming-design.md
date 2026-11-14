@@ -538,7 +538,10 @@ the refusal red switch no longer compiled into the served binary. The card
 window 266 then found `GGML_MAX_SRC` at 10 with the three stream sources at
 9/10/11: `set_host` wrote past `src[]` and every FA node read garbage as its
 plan; 0126 raises it to 12 with a `static_assert`, and the layers cell reads the
-node's sources back. The host store
+node's sources back. Window 269 then found the stream's USM buffer filled through
+its 64-byte placeholder (a device page fault in the cache's constructor) and the
+op test's host store outside USM; 0127 clears the host bytes by `memset` and has
+the dispatcher copy a regular host store on the device. The host store
 is a USM tensor and its page access goes through the slices entry points, never
 `->data` arithmetic on an OpenCL buffer; the cache sets `stream_buft = buft`
 only when the caller gave none, and the stream's construction throws when that

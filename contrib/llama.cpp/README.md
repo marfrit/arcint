@@ -7532,6 +7532,31 @@ Red arm, run here (`measured-here`, device-free): a translation unit with
 ("static assertion failed: GGML_MAX_SRC must hold every paged FA source"); the
 layers cell's source read would then read outside `src[]`.
 
+## 0127-kv-stream-usm-clear-and-test-host-store.patch
+
+Two defects the round-3 build hit on the B60, window 269 (`measured-here`).
+
+1. The served start never came up: the stream's USM host buffer is a placeholder
+   `cl_mem` of 64 bytes beside host bytes, and `buffer_clear` filled
+   `buffer->size` (the pool's MiB) into that placeholder. The device logged
+   `Fault response: Unsuccessful -ENOENT` three times, coredumped, and
+   `clFinish(queue)` returned -5. `buffer_clear` now `memset`s the USM bytes and
+   returns; the placeholder is never filled. The earlier arm passed because
+   below the pool the stream's host store is small or untouched by graph fill.
+
+2. The op suite's two-layer paged case aborted on "a paged attention with a host
+   store that is not USM host memory": test-backend-ops allocates the host store
+   in the backend's ordinary buffer, while the serving stream uses USM. The
+   dispatcher now copies a regular host store on the device (`clEnqueueCopyBuffer`
+   from the host store's one AOS region, the plan through `clEnqueueReadBuffer`,
+   at most 1024 pages) and keeps the USM write path for serving. A host store
+   that is neither USM nor one AOS region aborts with its own message.
+
+Red arms, device-free here: the `memset` arm and the copy arm are both
+reachable only through the OpenCL path, so the red evidence is the card's log
+above (the placeholder fill and the dispatcher abort); the guard is that a
+non-USM store with a split region (SoA) aborts rather than byte-copying.
+
 ## 0124-opencl-fa-wide-verify.patch
 
 ## 0123zzzzz3-kv-stream-per-layer-pages.patch

@@ -1,0 +1,79 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 6c8eb09..c54a900 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -16918,6 +16918,12 @@ static void ggml_backend_opencl_buffer_clear(ggml_backend_buffer_t buffer, uint8
+ 
+     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
+     ctx->drop_f16_copies();   // 0110: they would hold the old values
++    if (ctx->usm != nullptr) {
++        // 0127: a USM host buffer's bytes are host memory (the placeholder cl_mem is 64
++        // bytes); fillBuffer(buffer->size) on it faulted the device (window 269, ENOENT)
++        memset(ctx->usm, value, buffer->size);
++        return;
++    }
+     for (cl_mem buf : ctx->buffer) {
+         CL_CHECK(clEnqueueFillBuffer(queue, buf, &value, sizeof(value), 0, buffer->size, 0, NULL, NULL));
+     }
+@@ -23579,8 +23585,26 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
+     const char * hk = (const char *) ggml_backend_opencl_usm_ptr(host_k);
+     const char * hv = (const char *) ggml_backend_opencl_usm_ptr(host_v);
+     const int32_t * pl = (const int32_t *) ggml_backend_opencl_usm_ptr(plan);
+-    if (hk == nullptr || hv == nullptr || pl == nullptr) {
+-        GGML_ABORT("ggml_opencl: a paged attention with a host store that is not USM host memory");
++    // 0127: the op test allocates its host store in the backend's ordinary buffer (the
++    // serving stream uses USM host memory). A regular host store is copied on the device
++    // instead; its layout is AOS (regions() returns one region for it), so the bytes are
++    // a byte copy. The plan is tiny and read on the host, so it is copied to host memory.
++    ggml_cl_region hk_r[2], hv_r[2];
++    const bool hk_dev = hk == nullptr, hv_dev = hv == nullptr;
++    if (hk == nullptr || hv == nullptr) {
++        if (ggml_cl_regions(host_k, hk_r) != 1 || ggml_cl_regions(host_v, hv_r) != 1 || hk_dev != hv_dev) {
++            GGML_ABORT("ggml_opencl: a paged attention with a host store that is neither USM nor one AOS region");
++        }
++    }
++    const int64_t n_pages = plan->ne[0];
++    cl_command_queue queue = backend_ctx->queue;
++    int32_t plan_rows[1024];
++    if (pl == nullptr) {
++        GGML_ASSERT(n_pages <= 1024);
++        CL_CHECK(clEnqueueReadBuffer(queue, ((ggml_tensor_extra_cl *) plan->extra)->data_device, CL_TRUE,
++                                      ((ggml_tensor_extra_cl *) plan->extra)->offset, (size_t) n_pages * sizeof(int32_t),
++                                      plan_rows, 0, NULL, NULL));
++        pl = plan_rows;
+     }
+ 
+     ggml_cl_region rk[2], rv[2];
+@@ -23593,9 +23617,6 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
+     const size_t vb = (size_t) host_v->nb[2];
+     const size_t rb = (size_t) ring_k->nb[1];   // the K slot's row (all its heads of a cell)
+     const size_t rvb = (size_t) ring_v->nb[1];
+-    const int64_t n_pages = plan->ne[0];
+-
+-    cl_command_queue queue = backend_ctx->queue;
+     for (int64_t p = 0; p < n_pages; ++p) {
+         const int32_t row = pl[p];
+         if (row < 0) {
+@@ -23603,10 +23624,18 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
+         }
+         const cl_ulong off_k = rk[0].off + (cl_ulong) ring_k->view_offs;
+         const cl_ulong off_v = rv[0].off + (cl_ulong) ring_v->view_offs;
+-        CL_CHECK(clEnqueueWriteBuffer(queue, rk[0].mem, CL_FALSE, off_k + (cl_ulong) row*ps*rb, (size_t) kb,
+-                                      hk + (size_t) p*kb, 0, NULL, NULL));
+-        CL_CHECK(clEnqueueWriteBuffer(queue, rv[0].mem, CL_FALSE, off_v + (cl_ulong) row*ps*rvb, (size_t) vb,
+-                                      hv + (size_t) p*vb, 0, NULL, NULL));
++        if (hk_dev) {
++            // a regular host store: device-to-device, same bytes (AOS both sides)
++            CL_CHECK(clEnqueueCopyBuffer(queue, hk_r[0].mem, rk[0].mem, hk_r[0].off + (cl_ulong) p*kb,
++                                         off_k + (cl_ulong) row*ps*rb, (size_t) kb, 0, NULL, NULL));
++            CL_CHECK(clEnqueueCopyBuffer(queue, hv_r[0].mem, rv[0].mem, hv_r[0].off + (cl_ulong) p*vb,
++                                         off_v + (cl_ulong) row*ps*rvb, (size_t) vb, 0, NULL, NULL));
++        } else {
++            CL_CHECK(clEnqueueWriteBuffer(queue, rk[0].mem, CL_FALSE, off_k + (cl_ulong) row*ps*rb, (size_t) kb,
++                                          hk + (size_t) p*kb, 0, NULL, NULL));
++            CL_CHECK(clEnqueueWriteBuffer(queue, rv[0].mem, CL_FALSE, off_v + (cl_ulong) row*ps*rvb, (size_t) vb,
++                                          hv + (size_t) p*vb, 0, NULL, NULL));
++        }
+     }
+ }
+ 
