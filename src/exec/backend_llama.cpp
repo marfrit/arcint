@@ -21,6 +21,9 @@
 #include <gguf.h>
 #include <llama.h>
 #include "ggml-opencl.h"
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "exec/kv_stream_refusal.h"
 #include <llama-ext.h>   // llama_expert_route_trace_flush (contrib/llama.cpp 0069)
 
 #ifdef ARCINT_MTMD
@@ -297,6 +300,36 @@ bool peer_gone(const GenerationInput& in, clock_type::time_point& last_check) {
     return !in.peer_alive();
 }
 
+// The KV stream's start probe (I5): one paged FLASH_ATTN_EXT node at the agent's
+// geometry, asked of the first GPU device through supports_op. The node is the one
+// llama_kv_cache builds -- 0119's page table, 0122's kernel -- so the answer is the
+// answer the graph will get. No allocation: the tensors live in a no_alloc context.
+static bool kv_stream_probe(int64_t n_head_kv, int64_t n_head, int64_t rows) {
+    ggml_init_params ip = { /*.mem_size =*/ 8*ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+    ggml_context * ctx = ggml_init(ip);
+    if (ctx == nullptr) return false;
+
+    ggml_tensor * k = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 256*n_head_kv, 256);
+    ggml_tensor * v = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 256*n_head_kv, 256);
+    ggml_tensor * k4 = ggml_view_4d(ctx, k, 256, 256, n_head_kv, 1, k->nb[1], ggml_row_size(k->type, 256), ggml_nbytes(k), 0);
+    ggml_tensor * v4 = ggml_view_4d(ctx, v, 256, 256, n_head_kv, 1, v->nb[1], ggml_row_size(v->type, 256), ggml_nbytes(v), 0);
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, rows, n_head, 1);
+    ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 256, rows, 1, 1);
+    ggml_tensor * pages = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 1);
+    ggml_tensor * fa = ggml_flash_attn_ext(ctx, q, k4, v4, mask, 1.0f/std::sqrt(256.0f), 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_pages(fa, pages, 0, 256, nullptr, nullptr);
+
+    bool ok = false;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+        ok = ggml_backend_dev_supports_op(dev, fa);
+        break;
+    }
+    ggml_free(ctx);
+    return ok;
+}
+
 // The OpenCL card --device names: its platform, its index among the
 // platform's devices as ggml-opencl numbers them (every device type, as
 // GGML_OPENCL_DEVICES takes it), and its name. "GPU.N" is the N-th platform
@@ -541,6 +574,21 @@ public:
         }
         llama_log_set(route_llama_log, nullptr);
         llama_backend_init();
+
+        // KV streaming (I5): does the selected device take a paged FLASH_ATTN_EXT? The
+        // probe is the node the cache will build (0119's API, 0122's kernel), asked
+        // through the device's supports_op before any model loads; a flag it cannot
+        // honour is refused, never run on the CPU reference.
+        if (cfg.llama_kv_resident_mib > 0 || cfg.llama_kv_resident_decode_mib > 0) {
+            const arcint::KvStreamAsk ask{ cfg.llama_kv_resident_mib, cfg.llama_kv_resident_decode_mib,
+                                   kv_stream_probe(/*n_head_kv*/ 4, /*n_head*/ 24, /*rows*/ 6),
+                                   cards[0].name.find("B60") != std::string::npos,
+                                   /*flash attention*/ true, /* --llama-kv */ llama_kv_dtype(cfg) };
+            const std::string no = arcint::kv_stream_refusal(ask);
+            if (!no.empty()) throw std::runtime_error(no);
+            kv_stream_paged_ = ask.has_paged_fa;
+        }
+
         // --llama-expert-route-trace: set before the model's load, which reads
         // it once at the expert cache's init. Empty unsets, so an inherited
         // variable cannot turn the trace on behind the operator's back.
@@ -933,6 +981,8 @@ public:
         if (cfg.prefill_ubatch > 0) cp.n_ubatch = static_cast<uint32_t>(std::min(n_batch_, cfg.prefill_ubatch));
         cp.n_kv_reserve    = cfg.llama_reserve_cells;
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        // 0121b: the KV stream's resident budget, bytes; 0 = the whole cache in VRAM
+        cp.kv_resident_size = cfg.llama_kv_resident_mib > 0 ? (uint32_t) cfg.llama_kv_resident_mib * 1024u * 1024u : 0;
         cp.type_k          = kv_type(cfg.llama_kv_k);
         cp.type_v          = kv_type(cfg.llama_kv_v);
         // CPU threads: the CPU-side experts' decode is memory-bound, and the
@@ -1228,6 +1278,10 @@ public:
         status_.n_layer     = status_.dory_present ? status_.dory.physical_layers : llama_model_n_layer(model_);
         status_.weights_bytes = llama_model_size(model_);
         status_.kv_precision  = llama_kv_dtype(cfg);
+        status_.kv_stream.resident_mib = cfg.llama_kv_resident_mib;
+        status_.kv_stream.decode_mib   = cfg.llama_kv_resident_decode_mib;
+        status_.kv_stream.paged_fa     = kv_stream_paged_;
+        status_.kv_stream.requested    = cfg.llama_kv_stream_on();
         status_.arch          = arch;
         {
             // llama_model_desc is "<arch> <size label> <file type>"; the file
@@ -3189,6 +3243,7 @@ private:
     // lane's tokens still match, oldest first
     std::vector<std::vector<Checkpoint>>  ckpts_;
     bool                                  ckpt_on_   = false;   // a hybrid or recurrent model, N > 0
+    bool                                  kv_stream_paged_ = false;   // the start probe: the card takes paged FA
     int                                   ckpt_max_  = 32;
     size_t                                ckpt_step_ = 8192;
     uint64_t                              ckpt_req_  = 0;

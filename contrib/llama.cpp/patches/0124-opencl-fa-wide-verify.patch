@@ -1,0 +1,201 @@
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1404,6 +1404,7 @@
+     // 1-3 row form; only the q8_0 K pairs have one
+     cl_kernel kernel_fa_gqa_st_dk[2][4] = {};
+     int       fa_gqa_sides = 2;                   // sub-groups per 8 rows the kernels were built for
++    int       fa_gqa_tiles = 8;                   // 8-row tiles a work-group holds (64 rows; 0124's wide cap)
+     int       fa_dpas_bq = 0, fa_dpas_nthr = 0;   // query rows and work-items a work-group
+     cl_kernel kernel_gdn_intel_pp = nullptr;
+     // LLAMA_GDN_REPLAY=1: gated_delta_net_intel.cl's replay kernel (the same
+@@ -23544,35 +23545,6 @@
+     const int n_head_kv = k->ne[2];
+     const int n_batch = q->ne[3];
+ 
+-    // Intel: 9 to 64 query rows (a verify of several sequences in one ubatch, as
+-    // llama.cpp's server batches its slots: two lanes of 1 + 5 drafts are 12) in
+-    // blocks of up to 8. The small-row kernels (the q1 split ones and the GQA one)
+-    // take at most 8 rows, and the prefill kernel they would fall to costs a call
+-    // its K/V conversion: two lanes' verifies at 4k spent 4.3 ms an attention call
+-    // there (measured-here, B60). Rows are independent, so each block attends as
+-    // the whole call would. GGML_OPENCL_FA_ROW_BLOCKS=0 keeps one call
+-    {
+-        static const char * rb_env = getenv("GGML_OPENCL_FA_ROW_BLOCKS");
+-        static const bool   rb_on  = rb_env == nullptr || atoi(rb_env) != 0;
+-        if (rb_on && backend_ctx->gpu_family == INTEL && n_q > 8 && n_q <= 64 && n_batch == 1 &&
+-            q->type == GGML_TYPE_F32 && mask != nullptr && mask->ne[2] == 1) {
+-            for (int r0 = 0; r0 < n_q; r0 += 8) {
+-                const int nr = std::min(8, n_q - r0);
+-                ggml_tensor qv = *q, dv = *dst, mv;
+-                qv.ne[1]     = nr;
+-                qv.view_offs = q->view_offs + (size_t) r0 * q->nb[1];
+-                dv.ne[2]     = nr;
+-                dv.view_offs = dst->view_offs + (size_t) r0 * dst->nb[2];
+-                dv.src[0]    = &qv;
+-                mv           = *mask;
+-                mv.ne[1]     = nr;
+-                mv.view_offs = mask->view_offs + (size_t) r0 * mask->nb[1];
+-                dv.src[3]    = &mv;
+-                ggml_cl_flash_attn(backend, &qv, k, &dv);
+-            }
+-            return;
+-        }
+-    }
+ 
+ #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+     if (ggml_cl_adreno_xmem_attn_can_use(backend_ctx, q, k, dst)) {
+@@ -23763,6 +23735,55 @@
+     max_bias      = params[1];
+     logit_softcap = params[2];
+ 
++    // 0124: 9 to 64 rows (a verify of more than 8 drafts, several lanes' verifies, a
++    // short prompt tail) take the GQA decode kernel in one call when they fit its
++    // 8 tiles (64 (head, token) rows: 10 tokens at 6 query heads a KV head): K/V is staged once a
++    // work-group for all rows instead of once per block of 8. Calls that do not fit
++    // keep the blocks. GGML_OPENCL_FA_WIDE_VERIFY=0 turns it off
++    bool gqa_wide = false;
++    {
++        static const char * wv_env = getenv("GGML_OPENCL_FA_WIDE_VERIFY");
++        static const bool   wv_on  = wv_env == nullptr || atoi(wv_env) != 0;
++        const int  dki_w = d_head_q == 256 && d_head_v == 256 ? 0 : d_head_q == 128 && d_head_v == 128 ? 1 : -1;
++        const int  gi_w  = is_mixed ? 0 : kvq >= 0 ? kvq + 1 : -1;
++        const int  G_w   = n_head_kv > 0 && n_head % n_head_kv == 0 ? n_head / n_head_kv : 0;
++        gqa_wide = wv_on && backend_ctx->gpu_family == INTEL && n_q > 8 && n_q <= 64 && n_batch == 1 &&
++            G_w > 0 && G_w * n_q <= backend_ctx->fa_gqa_tiles * 8 && dki_w >= 0 && gi_w >= 0 &&
++            backend_ctx->kernel_fa_gqa_dk[dki_w][gi_w] != nullptr && max_bias == 0.0f && logit_softcap == 0.0f &&
++            q->type == GGML_TYPE_F32 && mask != nullptr && mask->ne[2] == 1;
++    }
++    static const char * fdbg_env = getenv("GGML_OPENCL_FA_DEBUG");
++    static const bool   fdbg_on  = fdbg_env != nullptr && atoi(fdbg_env) != 0;
++    // Intel: 9 to 64 query rows (a verify of several sequences in one ubatch, as
++    // llama.cpp's server batches its slots: two lanes of 1 + 5 drafts are 12) in
++    // blocks of up to 8. The small-row kernels (the q1 split ones and the GQA one)
++    // take at most 8 rows, and the prefill kernel they would fall to costs a call
++    // its K/V conversion: two lanes' verifies at 4k spent 4.3 ms an attention call
++    // there (measured-here, B60). Rows are independent, so each block attends as
++    // the whole call would. GGML_OPENCL_FA_ROW_BLOCKS=0 keeps one call
++    {
++        static const char * rb_env = getenv("GGML_OPENCL_FA_ROW_BLOCKS");
++        static const bool   rb_on  = rb_env == nullptr || atoi(rb_env) != 0;
++        if (rb_on && !gqa_wide && backend_ctx->gpu_family == INTEL && n_q > 8 && n_q <= 64 && n_batch == 1 &&
++            q->type == GGML_TYPE_F32 && mask != nullptr && mask->ne[2] == 1) {
++            for (int r0 = 0; r0 < n_q; r0 += 8) {
++                const int nr = std::min(8, n_q - r0);
++                ggml_tensor qv = *q, dv = *dst, mv;
++                qv.ne[1]     = nr;
++                qv.view_offs = q->view_offs + (size_t) r0 * q->nb[1];
++                dv.ne[2]     = nr;
++                dv.view_offs = dst->view_offs + (size_t) r0 * dst->nb[2];
++                dv.src[0]    = &qv;
++                mv           = *mask;
++                mv.ne[1]     = nr;
++                mv.view_offs = mask->view_offs + (size_t) r0 * mask->nb[1];
++                dv.src[3]    = &mv;
++                ggml_cl_flash_attn(backend, &qv, k, &dv);
++            }
++            return;
++        }
++    }
++
+ 
+     bool use_q1_vec = false;
+     bool use_q1_vec_mq = false;
+@@ -23905,11 +23926,11 @@
+     // Xe2 at head size 512 has flash_attn_dpas2.cl only: f16 K/V in place, or
+     // any pair through its carry path's f16 blocks
+     const bool fa_v2_512 = fa_pi == 2 && kd_sel == nullptr && ggml_opencl_fa_dpas512_ready(backend_ctx, is_mixed, kvq);
+-    const bool fa_dpas_ok = (kd_sel != nullptr || fa_v2_512) && n_q > 8 &&
++    const bool fa_dpas_ok = (kd_sel != nullptr || fa_v2_512) && n_q > 8 && !gqa_wide &&
+         sinks == nullptr && max_bias == 0.0f && logit_softcap == 0.0f &&
+         q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
+         (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q));
+-    if (backend_ctx->gpu_family == INTEL && n_q > 8 && !fa_dpas_ok) {
++    if (backend_ctx->gpu_family == INTEL && n_q > 8 && !fa_dpas_ok && !gqa_wide) {
+         ggml_cl_downgrade("op=FLASH_ATTN head=%d kv=%s n_q=9+ path=f32_f16 reason=%s", (int) d_head_q, ggml_type_name(k->type),
+                           kd_sel == nullptr && !fa_v2_512 ? "no-dpas-kernel" : "shape");
+     }
+@@ -24324,7 +24345,7 @@
+     // For q4_0 or q8_0 cases that fail kernel compilation, dequant happens in GPU;
+     // for types that do not have FA kernels, dequant happens on host.
+     if (!use_native_q8_0_q1 && !use_native_q8_0 &&
+-        !use_native_q4_0_q1 && !use_native_q4_0 && !intel_q_decode) {
++        !use_native_q4_0_q1 && !use_native_q4_0 && !intel_q_decode && !gqa_wide) {
+         // for q4_0, q8_0 FA kernels that fail to compile
+         bool k_done = false;
+         bool v_done = false;
+@@ -24590,8 +24611,8 @@
+     // the whole layer
+     const int fg_min_rows_paged = kv_pages ? 1 : fg_min_rows;
+     bool use_fd_gqa = false;
+-    if (use_fd_intel && n_q >= fg_min_rows_paged && fa_dki >= 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
+-        n_head_kv > 0 && n_head % n_head_kv == 0 && (n_head / n_head_kv) * n_q <= 64) {
++    if ((use_fd_intel || (gqa_wide && !is_causal)) && n_q >= fg_min_rows_paged && fa_dki >= 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
++        n_head_kv > 0 && n_head % n_head_kv == 0 && (n_head / n_head_kv) * n_q <= backend_ctx->fa_gqa_tiles * 8) {
+         const int gi = is_mixed ? 0 : kvq >= 0 ? kvq + 1 : -1;
+         // 0089: 1-3 rows take the staged form when the int8 switch built it
+         // (GGML_OPENCL_FA_GQA_MIN_ROWS=1 routes them here); 4+ rows and any
+@@ -24602,6 +24623,9 @@
+         if (kg != nullptr) {
+             fd_k_split = kg;
+             use_fd_gqa = true;
++            // a wide call runs as the 4-8 row GQA calls do: the Intel split size,
++            // one split at least, the kept partial buffer, the work-group form
++            use_fd_intel = true;
+         }
+     }
+     // a paged op must end up on the GQA kernel; any other kernel would read the
+@@ -24622,6 +24646,13 @@
+         }
+     }
+     const bool use_fd = (fd_k_split != NULL);
++    // 0124: GGML_OPENCL_FA_DEBUG=1 names the form a call takes, with its rows and tiles
++    if (fdbg_on) {
++        GGML_LOG_INFO("ggml_opencl: FA call form=%s rows=%d (head,token)=%d tiles=%d tiles_built=%d wide=%d n_kv=%d kvq=%d mixed=%d\n",
++                      use_fd_gqa ? "gqa" : use_fd_mq ? "mq" : use_fd_intel ? "intel_split" : use_fd ? "split" : "other",
++                      n_q, n_head_kv > 0 ? (n_head / n_head_kv) * n_q : 0, n_head_kv > 0 ? (int) CEIL_DIV((n_head / n_head_kv) * n_q, 8) : 0,
++                      backend_ctx->fa_gqa_tiles, (int) gqa_wide, n_kv, kvq, (int) is_mixed);
++    }
+ 
+     const int n_q_blocks = n_q > 1 ? (n_q + block_m - 1) / block_m : 0;
+     const int n_kv_blocks = (n_kv > 0 && block_n > 0) ? (n_kv + block_n - 1) / block_n : 0;
+@@ -24964,6 +24995,7 @@
+         if (use_fd_gqa) {
+             // a work-group per (KV head, batch, split): two sub-groups per 8 rows
+             const size_t n_tiles = (size_t) CEIL_DIV((n_head / n_head_kv) * n_q, 8);
++            GGML_ASSERT(n_tiles <= (size_t) backend_ctx->fa_gqa_tiles && "the GQA kernel cannot hold these rows");
+             fd_lws[0] = fd_gws[0] = (size_t) backend_ctx->fa_gqa_sides * n_tiles * 16;
+             fd_gws[1] = (size_t)(n_head_kv * n_batch);
+             fd_gws[2] = (size_t) n_splits;
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12975,6 +12975,20 @@
+             }
+         }
+     }
++    // 0124: 9 to 64 verify rows in one call on the GQA kernel when they fit its 8
++    // tiles (64 (head, token) rows): at the agent's geometry 9 and 10 tokens go wide,
++    // 17, 21 and 32 keep the blocks of 8. f16 K/V misses the 5e-4 bound from 32768 keys on every route, the
++    // blocks of 8 included (0.0007 at 32768, 0.0014 at 65536, measured-here, B60),
++    // so its arms are 4096 and 8192
++    for (auto kv_t : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_F16, GGML_TYPE_F16},
++                                                                  {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}}) {
++        for (int64_t nb : {9, 10, 17, 21, 32}) {
++            for (int64_t kv : {kv_t.first == GGML_TYPE_F16 ? 4096 : 8192, kv_t.first == GGML_TYPE_F16 ? 8192 : 65536}) {
++                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0,
++                                                                GGML_PREC_F32, kv_t.first, kv_t.second));
++            }
++        }
++    }
+     // 0119/0122: paged K/V at the agent's geometry (head 256, 4 KV heads x 6,
+ // q8_0 K / q4_0 V), decode and 6-row verify, kv 1k to 262k, pools smaller than
+     // the context with every second page in the ring. The last two arms are all-ring
+@@ -12986,6 +13000,9 @@
+         test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, kv, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 1, 4));
+     }
+     test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, 8192, 6, GGML_TYPE_F16, GGML_TYPE_F16, 2, 16));
++    // 0124: paged verifies of 10 and 17 rows (one GQA call when they fit the tiles, else the blocks of 8)
++    test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, 8192, 10, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 16));
++    test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, 8192, 17, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 16));
+     test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, 8192, 6, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 0, 32));
+     // I4: a paged prefill -- 512 rows, the gather path (the pages into f16 blocks,
+     // then the f16 prompt kernel), pools half the context or the whole one

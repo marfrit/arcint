@@ -1,0 +1,453 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arcint <dev@arcint.invalid>
+Date: Sat, 14 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0120-llama-kv-stream-map
+
+---
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index b82ca4a..d27ee2a 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -22,6 +22,7 @@ set(LLAMA_CORE_SOURCES
+     llama-impl.cpp
+     llama-io.cpp
+     llama-kv-cache.cpp
++    llama-kv-stream.cpp
+     llama-kv-cache-iswa.cpp
+     llama-kv-cache-dsa.cpp
+     llama-kv-cache-dsa-iswa.cpp
+diff --git a/src/llama-kv-stream.cpp b/src/llama-kv-stream.cpp
+new file mode 100644
+index 0000000..c5deeb6
+--- /dev/null
++++ b/src/llama-kv-stream.cpp
+@@ -0,0 +1,287 @@
++// KV streaming, increment I2: the page map, the host store, eviction/write-back
++// and the page table. See llama-kv-stream.h for what this build leaves to
++// I3/I5 (the copier/publisher threads, the copy queue, the sync flags, the
++// backend probe).
++
++#include "llama-kv-stream.h"
++
++#include <algorithm>
++#include <cstring>
++#include <stdexcept>
++
++uint32_t llama_kv_stream::slots_for(size_t bytes, size_t bytes_per_cell) {
++    return (uint32_t) std::min<size_t>(bytes/(bytes_per_cell*page_size), UINT32_MAX);
++}
++
++llama_kv_stream::llama_kv_stream(const std::vector<layer> & layers, uint32_t n_slots, uint32_t n_ring,
++        uint32_t kv_size, ggml_backend_buffer_type_t buft) :
++        layers(layers), n_slots(n_slots), kv_size(kv_size),
++        n_pages((kv_size + page_size - 1)/page_size), buft(buft) {
++    if (layers.empty()) throw std::runtime_error("llama_kv_stream: no attention layer");
++
++    page_slot.assign(n_pages, -1);
++    slot_page.assign(n_slots, -1);
++    page_ring.assign(n_pages, -1);
++    dirty.assign(n_pages, 0);
++    saved.assign(n_pages, 0);
++
++    // the host store: per layer K pages then V pages, in page order
++    size_t bytes = 0;
++    host_offs.resize(layers.size());
++    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
++        host_offs[ikv] = bytes;
++        bytes += 2*(size_t) n_pages*page_size*row_size((int32_t) ikv, false);
++    }
++    if (bytes > 0) {
++        host_buf.reset(ggml_backend_buft_alloc_buffer(buft, bytes));
++        if (!host_buf) throw std::runtime_error("llama_kv_stream: failed to allocate the host store");
++        ggml_backend_buffer_clear(host_buf.get(), 0);
++    }
++
++    alloc_slots((int64_t) n_ring*page_size);
++}
++
++llama_kv_stream::~llama_kv_stream() = default;
++
++void llama_kv_stream::alloc_slots(int64_t rows) {
++    slots_buf.reset();
++    ggml_init_params params = {
++        /*.mem_size   =*/ 4*ggml_tensor_overhead(),
++        /*.mem_buffer =*/ nullptr,
++        /*.no_alloc   =*/ true,
++    };
++    slots_ctx.reset(ggml_init(params));
++    if (!slots_ctx) throw std::runtime_error("llama_kv_stream: no slot context");
++
++    for (int s = 0; s < 2; ++s) {
++        slots[s].k = ggml_new_tensor_2d(slots_ctx.get(), layers[0].k->type, layers[0].k->ne[0], rows);
++        slots[s].v = ggml_new_tensor_2d(slots_ctx.get(), layers[0].v->type, layers[0].v->ne[0], rows);
++        ggml_format_name(slots[s].k, "kv_stream_slot_k%d", s);
++        ggml_format_name(slots[s].v, "kv_stream_slot_v%d", s);
++    }
++    slots_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(slots_ctx.get(), buft));
++    if (!slots_buf) throw std::runtime_error("llama_kv_stream: failed to allocate the ring slots");
++    ggml_backend_buffer_clear(slots_buf.get(), 0);
++}
++
++size_t llama_kv_stream::row_size(int32_t ikv, bool is_v) const {
++    const ggml_tensor * t = is_v ? layers[ikv].v : layers[ikv].k;
++    return ggml_row_size(t->type, t->ne[0]);
++}
++
++char * llama_kv_stream::host(int32_t ikv, bool is_v, uint32_t page) const {
++    char * base = (char *) ggml_backend_buffer_get_base(host_buf.get()) + host_offs[ikv];
++    if (is_v) {
++        base += (size_t) n_pages*page_size*row_size(ikv, false);
++    }
++    return base + (size_t) page*page_size*row_size(ikv, is_v);
++}
++
++void llama_kv_stream::zero_host(uint32_t page) {
++    // a page nobody wrote is masked in attention, but must not hold NaNs (0*NaN
++    // in P*V would poison a row)
++    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
++        memset(host((int32_t) ikv, false, page), 0, page_size*row_size((int32_t) ikv, false));
++        memset(host((int32_t) ikv, true,  page), 0, page_size*row_size((int32_t) ikv, true));
++    }
++    saved[page] = 1;
++}
++
++void llama_kv_stream::assign(uint32_t page, uint32_t slot) {
++    GGML_ASSERT(page_slot[page] < 0 && slot_page[slot] < 0);
++
++    page_slot[page] = (int32_t) slot;
++    slot_page[slot] = (int32_t) page;
++    dirty[page] = 0;
++    layout_id++;
++
++    if (saved[page]) {
++        // a page returning to the pool is read back: synchronous here, a copy on
++        // the second queue with an event in I3/I5
++        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
++            for (bool is_v : { false, true }) {
++                const size_t bytes = page_size*row_size((int32_t) ikv, is_v);
++                ggml_backend_tensor_set(is_v ? layers[ikv].v : layers[ikv].k, host((int32_t) ikv, is_v, page),
++                        (size_t) slot*bytes, bytes);
++            }
++        }
++    }
++}
++
++void llama_kv_stream::evict(uint32_t page) {
++    const int32_t slot = page_slot[page];
++    GGML_ASSERT(slot >= 0);
++
++    if (dirty[page]) {
++        // an evicted page with writes goes back to the host store: exact bytes
++        // (integrity, DESIGN section 3.4)
++        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
++            for (bool is_v : { false, true }) {
++                const size_t bytes = page_size*row_size((int32_t) ikv, is_v);
++                ggml_backend_tensor_get(is_v ? layers[ikv].v : layers[ikv].k, host((int32_t) ikv, is_v, page),
++                        (size_t) slot*bytes, bytes);
++            }
++        }
++        saved[page] = 1;
++        dirty[page] = 0;
++    }
++
++    page_slot[page] = -1;
++    slot_page[slot] = -1;
++    layout_id++;
++}
++
++void llama_kv_stream::prepare(const std::vector<uint32_t> & cells, uint32_t n_kv) {
++    GGML_ASSERT(n_kv % page_size == 0);
++    const uint32_t n_att = std::min(n_kv/page_size, n_pages);
++
++    std::vector<uint8_t> written(n_pages, 0);
++    for (uint32_t c : cells) written[c/page_size] = 1;
++
++    if (debug_rotate) {
++        rotation++;
++        for (uint32_t p = 0; p < n_pages; ++p) {
++            if (page_slot[p] >= 0) evict(p);
++        }
++        for (uint32_t p = 0; p < n_pages; ++p) {
++            if (p < n_att || written[p]) assign(p, (p + rotation) % n_slots);
++        }
++    } else {
++        uint32_t free_slot = 0;
++        auto next_free = [&]() {
++            while (free_slot < n_slots && slot_page[free_slot] >= 0) free_slot++;
++            return free_slot;
++        };
++
++        // the written pages are resident: evict the oldest other page when there
++        // is no free slot
++        for (uint32_t p = 0; p < n_pages; ++p) {
++            if (!written[p] || page_slot[p] >= 0) continue;
++            uint32_t slot = next_free();
++            if (slot == n_slots) {
++                uint32_t victim = 0;
++                while (victim < n_pages && (page_slot[victim] < 0 || written[victim])) victim++;
++                GGML_ASSERT(victim < n_pages && "llama_kv_stream: the pool is smaller than a ubatch");
++                slot = (uint32_t) page_slot[victim];
++                evict(victim);
++            }
++            assign(p, slot);
++        }
++
++        // free slots take the newest attended pages
++        for (uint32_t p = n_att; p-- > 0 && next_free() < n_slots; ) {
++            if (page_slot[p] < 0) assign(p, next_free());
++        }
++    }
++
++    for (uint32_t c : cells) dirty[c/page_size] = 1;
++
++    // the attended pages that are not resident stream: packed at the start of
++    // the layer's slot (their logical order across the attended pages)
++    std::fill(page_ring.begin(), page_ring.end(), -1);
++    n_streamed = 0;
++    for (uint32_t p = 0; p < n_att; ++p) {
++        if (page_slot[p] >= 0) continue;
++        if (!saved[p]) zero_host(p);
++        page_ring[p] = (int32_t) n_streamed++;
++    }
++
++    GGML_ASSERT((int64_t) n_streamed*page_size <= slots[0].k->ne[1]);
++
++    // copy each layer's streamed pages into its slot, host store -> slot; the
++    // fork queues these on the copy engine beside the graph (I3/I5)
++    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
++        const int s = (int) ikv % 2;
++        for (uint32_t p = 0; p < n_att; ++p) {
++            if (page_ring[p] < 0) continue;
++            const uint32_t dst_page = (uint32_t) page_ring[p];
++            for (bool is_v : { false, true }) {
++                const size_t bytes = page_size*row_size((int32_t) ikv, is_v);
++                ggml_backend_tensor_set(is_v ? slots[s].v : slots[s].k, host((int32_t) ikv, is_v, p),
++                        (size_t) dst_page*bytes, bytes);
++            }
++        }
++    }
++}
++
++int64_t llama_kv_stream::row(uint32_t cell) const {
++    const int32_t slot = page_slot[cell/page_size];
++    GGML_ASSERT(slot >= 0);
++    return (int64_t) slot*page_size + cell % page_size;
++}
++
++void llama_kv_stream::set_input_pages(ggml_tensor * dst) const {
++    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
++    GGML_ASSERT(dst->type == GGML_TYPE_I32 && dst->ne[1] == (int64_t) layers.size());
++
++    int32_t * data = (int32_t *) dst->data;
++    for (int64_t p = 0; p < dst->ne[0]; ++p) {
++        GGML_ASSERT(page_slot[p] >= 0 || page_ring[p] >= 0);
++        data[p] = page_slot[p] >= 0 ? page_slot[p] : -1 - page_ring[p];
++    }
++    for (int64_t l = 1; l < dst->ne[1]; ++l) {
++        std::copy(data, data + dst->ne[0], data + l*dst->ne[0]);
++    }
++}
++
++std::vector<llama_kv_stream::run> llama_kv_stream::runs(uint32_t n_kv) const {
++    std::vector<run> res;
++    for (uint32_t p = 0; p < std::min(n_kv/page_size, n_pages); ++p) {
++        const int32_t slot = page_slot[p];
++        if (slot < 0) continue; // streamed
++        if (!res.empty() && res.back().page + res.back().n == p && res.back().slot + res.back().n == (uint32_t) slot) {
++            res.back().n++;
++        } else {
++            res.push_back({ p, (uint32_t) slot, 1 });
++        }
++    }
++    return res;
++}
++
++void llama_kv_stream::clear() {
++    page_slot.assign(n_pages, -1);
++    slot_page.assign(n_slots, -1);
++    page_ring.assign(n_pages, -1);
++    dirty.assign(n_pages, 0);
++    saved.assign(n_pages, 0);
++    n_streamed = 0;
++    layout_id++;
++}
++
++void llama_kv_stream::get_rows(int32_t ikv, bool is_v, uint32_t c0, uint32_t c1, void * dst) {
++    const size_t row = row_size(ikv, is_v);
++    ggml_tensor * pool = is_v ? layers[ikv].v : layers[ikv].k;
++
++    for (uint32_t c = c0; c < c1; ) {
++        const uint32_t page = c/page_size;
++        const uint32_t n    = std::min(c1, (page + 1)*page_size) - c;
++        char * out = (char *) dst + (size_t) (c - c0)*row;
++        if (page_slot[page] >= 0) {
++            ggml_backend_tensor_get(pool, out, (size_t) (page_slot[page]*page_size + c % page_size)*row, n*row);
++        } else if (saved[page]) {
++            memcpy(out, host(ikv, is_v, page) + (size_t) (c % page_size)*row, n*row);
++        } else {
++            memset(out, 0, n*row);
++        }
++        c += n;
++    }
++}
++
++void llama_kv_stream::set_rows(int32_t ikv, bool is_v, uint32_t c0, uint32_t c1, const void * src) {
++    const size_t row = row_size(ikv, is_v);
++    ggml_tensor * pool = is_v ? layers[ikv].v : layers[ikv].k;
++
++    for (uint32_t c = c0; c < c1; ) {
++        const uint32_t page = c/page_size;
++        const uint32_t n    = std::min(c1, (page + 1)*page_size) - c;
++        const char * in = (const char *) src + (size_t) (c - c0)*row;
++        if (page_slot[page] >= 0) {
++            ggml_backend_tensor_set(pool, in, (size_t) (page_slot[page]*page_size + c % page_size)*row, n*row);
++            dirty[page] = 1;
++        } else {
++            if (!saved[page]) zero_host(page);
++            memcpy(host(ikv, is_v, page) + (size_t) (c % page_size)*row, in, n*row);
++        }
++        c += n;
++    }
++}
+diff --git a/src/llama-kv-stream.h b/src/llama-kv-stream.h
+new file mode 100644
+index 0000000..5345c09
+--- /dev/null
++++ b/src/llama-kv-stream.h
+@@ -0,0 +1,136 @@
++#pragma once
++
++// KV streaming, increment I2 (docs/campaigns/kv-streaming-design.md section 5):
++// the page map, the host store, eviction/write-back and the table. The
++// mechanism follows llama.cpp's adaptive-KV-stream fork (src/llama-kv-stream.h
++// there), restricted to what a device-free test can drive:
++//  - no copier or publisher thread, no copy engine, no ready/consumed flags:
++//    page moves are synchronous tensor writes/reads on the owning backend
++//    (I3/I5 put them on the second in-order OpenCL queue with events, and add
++//    the kernel-side wait);
++//  - slots are sized by the caller (n_ring pages), not by a probe of the
++//    backend's paged attention (I3 adds the probe and the packed sizing).
++// What does not change: pages of page_size cells, a pool of resident pages, a
++// host store of the rest, the written pages always resident, the oldest page
++// evicted to a write-back, a page returning to the pool read back, the page
++// table [n_kv/page_size, n_layer] with -1-ring for a streamed page, and the
++// runs of consecutive pages for a gather form.
++//
++// The pool tensors are the KV cache's (a layer's K and V, [n_embd_gqa,
++// n_slots*page_size]); the host store and the two ring slots are buffers of the
++// pool's buffer type, so a CPU test runs the whole class on host memory.
++
++#include "ggml.h"
++#include "ggml-backend.h"
++#include "ggml-cpp.h"
++
++#include <cstdint>
++#include <vector>
++
++class llama_kv_stream {
++public:
++    static constexpr uint32_t page_size = 256;
++
++    // a pool tensor of one attention layer: [n_embd_gqa, n_slots*page_size]
++    struct layer {
++        ggml_tensor * k;
++        ggml_tensor * v;
++    };
++
++    // a run of logical pages held by consecutive pool slots
++    struct run {
++        uint32_t page;
++        uint32_t slot;
++        uint32_t n;
++    };
++
++    // n_ring: the pages each device slot holds (the streamed pages of a ubatch,
++    // packed); kv_size: cells of the sequence, so n_pages = ceil(kv_size/256)
++    llama_kv_stream(const std::vector<layer> & layers, uint32_t n_slots, uint32_t n_ring, uint32_t kv_size,
++            ggml_backend_buffer_type_t buft);
++    ~llama_kv_stream();
++
++    // pool pages that fit in `bytes` when a cell takes bytes_per_cell
++    static uint32_t slots_for(size_t bytes, size_t bytes_per_cell);
++
++    // a ubatch writes `cells` and attends [0, n_kv): place the pages, write back
++    // the evicted ones, read back the returning ones, and copy the attended
++    // pages that are not resident into the layer's ring slot (packed)
++    void prepare(const std::vector<uint32_t> & cells, uint32_t n_kv);
++
++    // pool row of a cell whose page is resident
++    int64_t row(uint32_t cell) const;
++
++    // whether a logical page is resident in the pool
++    bool resident(uint32_t page) const { return page < page_slot.size() && page_slot[page] >= 0; }
++
++    // the current ubatch attends pages that are not resident
++    bool synced() const { return n_streamed > 0; }
++
++    // page table input: I32 [n_kv/page_size, n_layer], slots of resident pages,
++    // -1 - ring index of streamed ones; needs a host buffer
++    void set_input_pages(ggml_tensor * dst) const;
++
++    // the attended resident pages as runs, for a gather built into a graph
++    std::vector<run> runs(uint32_t n_kv) const;
++
++    // device slot of layer ikv (two slots, alternating by layer parity)
++    ggml_tensor * slot_k(int32_t ikv) const { return slots[ikv % 2].k; }
++    ggml_tensor * slot_v(int32_t ikv) const { return slots[ikv % 2].v; }
++
++    // changes whenever a page moves; a graph built around the layout is not reused
++    uint64_t layout() const { return layout_id; }
++
++    // forget every page (the cache was cleared); pages that were written stay in
++    // the host store only if they were written back first
++    void clear();
++
++    uint32_t n_pool() const { return n_slots; }
++    uint32_t n_ring() const { return slots[0].k ? (uint32_t) (slots[0].k->ne[1]/page_size) : 0; }
++    uint32_t n_context_pages() const { return (uint32_t) page_slot.size(); }
++    uint32_t n_streamed_pages() const { return n_streamed; }
++
++    // rows [c0, c1) of layer ikv, wherever they live; for state save/restore and
++    // for a test's integrity probe. The backend must be idle.
++    void get_rows(int32_t ikv, bool is_v, uint32_t c0, uint32_t c1, void * dst);
++    void set_rows(int32_t ikv, bool is_v, uint32_t c0, uint32_t c1, const void * src);
++
++    // the fork's debug rotation: every resident page goes through the host store
++    // into a rotated slot before every ubatch (the streamed-pages path by force)
++    void set_debug_rotate(bool on) { debug_rotate = on; }
++
++private:
++    void alloc_slots(int64_t rows);
++    size_t row_size(int32_t ikv, bool is_v) const;
++    char * host(int32_t ikv, bool is_v, uint32_t page) const;
++
++    void assign(uint32_t page, uint32_t slot);
++    void evict(uint32_t page);
++    void zero_host(uint32_t page);
++
++    const std::vector<layer> layers;
++    uint32_t       n_slots;
++    const uint32_t kv_size;
++    const uint32_t n_pages;
++
++    ggml_backend_buffer_type_t buft;
++
++    // host store: per layer, K pages then V pages, in page order
++    ggml_backend_buffer_ptr host_buf;
++    std::vector<size_t>     host_offs;
++
++    ggml_context_ptr        slots_ctx;
++    ggml_backend_buffer_ptr slots_buf;
++    layer                   slots[2] = {};
++
++    std::vector<int32_t> page_slot; // pool slot of a page, -1 if not resident
++    std::vector<int32_t> slot_page; // page a slot holds, -1 if free
++    std::vector<int32_t> page_ring; // ring index of a streamed page in this ubatch
++    std::vector<uint8_t> dirty;     // a resident page written since it was loaded
++    std::vector<uint8_t> saved;     // the host store holds the page
++
++    uint64_t layout_id  = 0;
++    uint32_t n_streamed = 0;
++    uint32_t rotation   = 0;
++    bool     debug_rotate = false;
++};

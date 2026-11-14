@@ -1,0 +1,17 @@
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -24097,8 +24097,12 @@
+             size_t lws[3] = { 16, 1, 1 };
+             backend_ctx->enqueue_ndrange_kernel(kcomb, 3, gws, lws, dst);
+         };
+-        // f16 K/V in place
+-        if (fa2 && is_mixed && surf_ok(offset_k, k_nb1, k_nb2, k_nb3, d_head_q) && surf_ok(offset_v, v_nb1, v_nb2, v_nb3, d_head_v)) {
++        // f16 K/V in place. Not for paged K/V: the in-place reads would take the
++        // pool's rows as the attended sequence (past the pool, too, once the
++        // table names more pages than it holds) and miss the table and the ring;
++        // a paged f16 prompt takes the gather below like the quantized pairs
++        if (fa2 && is_mixed && kv_pages == nullptr &&
++            surf_ok(offset_k, k_nb1, k_nb2, k_nb3, d_head_q) && surf_ok(offset_v, v_nb1, v_nb2, v_nb3, d_head_v)) {
+             prep_q16();
+             prep_mcls();
+             const int ns = fa2_splits(n_kv);

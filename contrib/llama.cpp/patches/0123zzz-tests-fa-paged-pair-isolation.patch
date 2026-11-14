@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arcint <dev@arcint.invalid>
+Date: Sat, 14 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0123zzz-tests-fa-paged-pair-isolation
+
+---
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 724cf8f..f0fc7ab 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12992,6 +12992,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, 8192, 512, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 16));
+     test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, 8192, 512, GGML_TYPE_F16, GGML_TYPE_F16, 2, 16));
+     test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, 4096, 512, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 0, 16));
++    // window 232's pair isolation: q8_0 K / q8_0 V and q4_0 / q4_0 over a ring, decode 6
++    // rows and a 512-row prefill -- a pass on q8_0/q8_0 with q8_0/q4_0 failing names the
++    // q4_0 V staging (or the conversion for V), a failure on both names the K side.
++    test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, 8192, 6, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2, 16));
++    test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, 8192, 6, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, 2, 16));
++    test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, 8192, 512, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2, 16));
+     // Mistral Small 24B's geometry (head size 128, 32 query heads on 8):
+     // decode, verify rows, prompts; f16 and quantized K/V
+     for (auto kv_t : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},

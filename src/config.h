@@ -144,6 +144,10 @@ struct Config {
     // --device order (patch 0024); 0 keeps none on that card. One value is
     // the one card's. llama_expert_cache_mib is the first entry.
     int         llama_expert_cache_mib = 0;
+    // KV streaming (0119-0122, docs/campaigns/kv-streaming-design.md): MiB of resident KV
+    // pages; 0 = off. The decode budget is parsed and refused while phase resizing is not built.
+    int         llama_kv_resident_mib         = 0;
+    int         llama_kv_resident_decode_mib  = 0;
     std::vector<int> llama_expert_cache_mib_dev;
     std::string llama_expert_profile;
     // --llama-expert-cache-save F: at teardown, write the cache's learned STRP
@@ -188,6 +192,8 @@ struct Config {
     // --llama-mtp-gguf model under the split; it reads only the last
     // layer's rows, through host memory. -1: unset, the first card.
     int llama_mtp_card = -1;
+    bool llama_kv_stream_on() const { return llama_kv_resident_mib > 0; }
+
     bool llama_expert_cache_on() const {
         for (int m : llama_expert_cache_mib_dev)
             if (m > 0) return true;

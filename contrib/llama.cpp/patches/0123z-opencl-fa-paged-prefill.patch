@@ -1,0 +1,235 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arcint <dev@arcint.invalid>
+Date: Sat, 14 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0123a-opencl-fa-paged-prefill
+
+---
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 063bb6a..2b69429 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -12847,7 +12847,6 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                 const bool shape_ok = q->type == GGML_TYPE_F32 && q->ne[0] == 256 && v->ne[0] == 256 &&
+                                       k->ne[0] == 256 && k->ne[3] == 1 && v->ne[3] == 1 && q->ne[3] == 1 &&
+                                       k->ne[2] > 0 && v->ne[2] == k->ne[2] && q->ne[2] % k->ne[2] == 0 &&
+-                                      (q->ne[2]/k->ne[2]) * q->ne[1] <= 64 &&
+                                       (op->src[GGML_FA_SRC_RING_K] == nullptr ||
+                                        (op->src[GGML_FA_SRC_RING_K]->ne[1] % 256 == 0 &&
+                                         op->src[GGML_FA_SRC_RING_V] != nullptr));
+@@ -12856,8 +12855,16 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                 load_cl_kernels(backend_ctx);
+                 const int gi = k->type == GGML_TYPE_Q8_0 ? (v->type == GGML_TYPE_Q8_0 ? 1 : 2)
+                              : k->type == GGML_TYPE_Q4_0 ? 3 : 0;
+-                const bool kernel_ok = backend_ctx->kernel_fa_gqa_dk[0][gi] != nullptr ||
+-                                       backend_ctx->kernel_fa_gqa_st_dk[0][gi] != nullptr;
++                // a prompt's rows take the gather path (I4): the conversion kernel reads
++                // the pages and the f16 prompt kernel runs on the blocks
++                const bool prefill_ok = backend_ctx->kernel_fa_kv_to_f16 != nullptr &&
++                                        (backend_ctx->kernel_fa_dpas_carry_dk[0] != nullptr ||
++                                         backend_ctx->kernel_fa_dpas_q_dk[0] != nullptr);
++                const bool rows_gqa = (q->ne[2]/k->ne[2]) * q->ne[1] <= 64;
++                const bool kernel_ok = rows_gqa
++                                     ? (backend_ctx->kernel_fa_gqa_dk[0][gi] != nullptr ||
++                                        backend_ctx->kernel_fa_gqa_st_dk[0][gi] != nullptr)
++                                     : prefill_ok;
+                 return page_table_ok && kv_ok && shape_ok && mask_ok && kernel_ok;
+             }
+ #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+@@ -24080,7 +24087,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+         // 0106: at head size 512 on Xe2 this is the only path besides f16 in
+         // place, for the quantized pairs and for f16 K/V the 2D reads cannot
+         // take (copied to f16 blocks as they are)
+-        if (((!is_mixed && kvq >= 0 && kc != nullptr && (f16kv_env == nullptr || atoi(f16kv_env) != 0)) || fa_v2_512) &&
++        // paged K/V (I4): a prompt's pages are gathered into f16 blocks by the
++        // conversion kernel below (each key's row from the pool or the ring), then the
++        // f16 prompt kernel runs on the blocks -- the fork's gather form, with the
++        // chunked page-runs merge left to I5's card round
++        if (((!is_mixed && kvq >= 0 && kc != nullptr && (f16kv_env == nullptr || atoi(f16kv_env) != 0)) || fa_v2_512 ||
++             kv_pages != nullptr) &&
+             backend_ctx->kernel_fa_kv_to_f16 != nullptr) {
+             const int blk = std::max(32, f16kvb_env ? atoi(f16kvb_env) / 32 * 32 : 16384);
+             const int nkb = std::min(blk, n_kv);
+@@ -24098,11 +24110,30 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+                 cr.allocate(backend_ctx->context, (size_t) n_batch * n_head * fa_nvh * n_g * (d_head_v / fa_nvh / 16 + 2) * 128 * sizeof(float));
+             }
+             cl_mem carry = n_kv > blk ? cr.buffer : kf.buffer;   // unread unless there are blocks to carry
++            // the page table is a host input: one row uploaded for all the blocks, on the
++            // compute queue before the conversions, released after the launch
++            cl_mem conv_table = NULL;
++            const int conv_ps = kv_page_size;
++            const ggml_tensor * conv_ring_k = kv_pages ? dst->src[GGML_FA_SRC_RING_K] : nullptr;
++            const ggml_tensor * conv_ring_v = kv_pages ? dst->src[GGML_FA_SRC_RING_V] : nullptr;
++            if (kv_pages) {
++                ggml_tensor_extra_cl * ep = (ggml_tensor_extra_cl *) kv_pages->extra;
++                const size_t tn = (size_t) kv_pages->nb[1];
++                const int32_t tr = ggml_get_op_params_i32(dst, GGML_FA_PARAM_PAGES_ROW);
++                cl_int werr = CL_SUCCESS;
++                conv_table = clCreateBuffer(backend_ctx->context, CL_MEM_READ_ONLY, tn, NULL, &werr);
++                CL_CHECK(werr);
++                CL_CHECK(clEnqueueWriteBuffer(backend_ctx->queue, conv_table, CL_FALSE, 0, tn,
++                        (const char *) kv_pages->data + (size_t) tr*kv_pages->nb[1], 0, NULL, NULL));
++                GGML_UNUSED(ep);
++            }
+             // rows [kv0, kv0 + nb) of a K/V view to [dim][key][head][batch] f16
+             auto dequant = [&](const ggml_tensor * t, cl_mem src, cl_ulong off, cl_ulong nb1, cl_ulong nb2, cl_ulong nb3,
+-                               int kv0, int nb, cl_mem out) {
++                               int kv0, int nb, cl_mem out, bool is_v) {
+                 cl_kernel kq = backend_ctx->kernel_fa_kv_to_f16;
+-                const cl_ulong soff = off + (cl_ulong) kv0 * nb1;
++                // paged: the logical key is kv0 + key and the row comes from the table;
++                // the pool's base is `off`, the ring's is passed beside it
++                const cl_ulong soff = kv_pages ? off : off + (cl_ulong) kv0 * nb1;
+                 // load8's types: 0 f16 (0106: a copy), 1 q8_0, 2 q4_0
+                 const cl_int tt = t->type == GGML_TYPE_Q8_0 ? 1 : t->type == GGML_TYPE_Q4_0 ? 2 : 0, d = (cl_int) t->ne[0], ne2 = (cl_int) t->ne[2];
+                 CL_CHECK(clSetKernelArg(kq, 0, sizeof(cl_mem),   &src));
+@@ -24115,6 +24146,32 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+                 CL_CHECK(clSetKernelArg(kq, 7, sizeof(cl_int),   &nb));
+                 CL_CHECK(clSetKernelArg(kq, 8, sizeof(cl_int),   &ne2));
+                 CL_CHECK(clSetKernelArg(kq, 9, sizeof(cl_mem),   &out));
++                if (kv_pages) {
++                    const ggml_tensor * rt = is_v ? conv_ring_v : conv_ring_k;
++                    ggml_tensor_extra_cl * er = rt ? (ggml_tensor_extra_cl *) rt->extra : nullptr;
++                    cl_mem   rbuf = er ? er->data_device : NULL;
++                    const cl_ulong roff = er ? er->offset + rt->view_offs : 0;
++                    const cl_ulong rnb1 = rt ? rt->nb[1] : 0, rnb2 = rt ? rt->nb[2] : 0, rnb3 = rt ? rt->nb[3] : 0;
++                    CL_CHECK(clSetKernelArg(kq, 10, sizeof(cl_mem),   &conv_table));
++                    CL_CHECK(clSetKernelArg(kq, 11, sizeof(cl_int),   &conv_ps));
++                    CL_CHECK(clSetKernelArg(kq, 12, sizeof(cl_int),   &kv0));
++                    CL_CHECK(clSetKernelArg(kq, 13, sizeof(cl_mem),   &rbuf));
++                    CL_CHECK(clSetKernelArg(kq, 14, sizeof(cl_ulong), &roff));
++                    CL_CHECK(clSetKernelArg(kq, 15, sizeof(cl_ulong), &rnb1));
++                    CL_CHECK(clSetKernelArg(kq, 16, sizeof(cl_ulong), &rnb2));
++                    CL_CHECK(clSetKernelArg(kq, 17, sizeof(cl_ulong), &rnb3));
++                } else {
++                    const cl_mem nul = NULL; const cl_int z = 0; const cl_ulong u = 0;
++                    const cl_int kv0_arg = kv0;
++                    CL_CHECK(clSetKernelArg(kq, 10, sizeof(cl_mem),   &nul));
++                    CL_CHECK(clSetKernelArg(kq, 11, sizeof(cl_int),   &z));
++                    CL_CHECK(clSetKernelArg(kq, 12, sizeof(cl_int),   &kv0_arg));
++                    CL_CHECK(clSetKernelArg(kq, 13, sizeof(cl_mem),   &nul));
++                    CL_CHECK(clSetKernelArg(kq, 14, sizeof(cl_ulong), &u));
++                    CL_CHECK(clSetKernelArg(kq, 15, sizeof(cl_ulong), &u));
++                    CL_CHECK(clSetKernelArg(kq, 16, sizeof(cl_ulong), &u));
++                    CL_CHECK(clSetKernelArg(kq, 17, sizeof(cl_ulong), &u));
++                }
+                 size_t lws[3] = { (size_t) d / 8, 4, 1 };
+                 size_t gws[3] = { (size_t) d / 8, (size_t) CEIL_DIV(nb, 4) * 4, (size_t) ne2 * (size_t) t->ne[3] };
+                 backend_ctx->enqueue_ndrange_kernel(kq, 3, gws, lws, dst);
+@@ -24125,8 +24182,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+             }
+             for (int kv0 = 0; kv0 < n_kv; kv0 += blk) {
+                 const int nb = std::min(blk, n_kv - kv0);
+-                dequant(k, k_data_device, offset_k, k_nb1, k_nb2, k_nb3, kv0, nb, kf.buffer);
+-                dequant(v, v_data_device, offset_v, v_nb1, v_nb2, v_nb3, kv0, nb, vf.buffer);
++                dequant(k, k_data_device, offset_k, k_nb1, k_nb2, k_nb3, kv0, nb, kf.buffer, false);
++                dequant(v, v_data_device, offset_v, v_nb1, v_nb2, v_nb3, kv0, nb, vf.buffer, true);
+                 const cl_ulong fk1 = (cl_ulong) d_head_q * sizeof(cl_half), fk2 = fk1 * nb, fk3 = fk2 * k->ne[2];
+                 const cl_ulong fv1 = (cl_ulong) d_head_v * sizeof(cl_half), fv2 = fv1 * nb, fv3 = fv2 * v->ne[2];
+                 const int ns = v2 ? fa2_splits(nb) : 1;
+@@ -24142,6 +24199,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+                 run_fa(v2 ? k2c : kc, v2, kf.buffer, 0, fk1, fk2, fk3, vf.buffer, 0, fv1, fv2, fv3, nb,
+                        true, carry, kv0, kv0 > 0, kv0 + nb < n_kv);
+             }
++            if (conv_table != NULL) {
++                // a queued conversion keeps the upload alive until it runs
++                clReleaseMemObject(conv_table);
++            }
+             return;
+         }
+         cl_kernel kd = kd_sel;
+@@ -24714,6 +24775,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+ 
+         cl_kernel k_split = fd_k_split;
+         int argi = 0;
++        cl_mem kv_tmp_table = NULL;   // a host page table uploaded for a paged FA launch
+         CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &extra_q->data_device));
+         CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &offset_q));
+         if (use_fa_k_img) {
+@@ -24788,9 +24850,24 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+             const ggml_tensor * rv = dst->src[GGML_FA_SRC_RING_V];
+             ggml_tensor_extra_cl * extra_rk = rk ? (ggml_tensor_extra_cl *)rk->extra : NULL;
+             ggml_tensor_extra_cl * extra_rv = rv ? (ggml_tensor_extra_cl *)rv->extra : NULL;
+-            cl_mem   table_buffer = extra_pages ? extra_pages->data_device : NULL;
+-            const cl_ulong offset_table = extra_pages ? extra_pages->offset + kv_pages->view_offs : 0;
+-            GGML_UNUSED(offset_table);
++            // the table is a host graph input: upload the used row on the compute queue
++            // (in order, so the kernel reads it after the write) and release the buffer
++            // after the launch (a queued command keeps the object alive). The row is
++            // n_pages I32 entries: 4 KiB at 262,144 cells, per ubatch.
++            const int32_t table_row = ggml_get_op_params_i32(dst, GGML_FA_PARAM_PAGES_ROW);
++            const size_t table_nbytes = (size_t) kv_pages->nb[1];
++            cl_mem table_buffer = NULL;
++            if (extra_pages && extra_pages->data_device != NULL) {
++                table_buffer = extra_pages->data_device;
++            } else {
++                cl_int werr = CL_SUCCESS;
++                table_buffer = clCreateBuffer(backend_ctx->context, CL_MEM_READ_ONLY, table_nbytes, NULL, &werr);
++                kv_tmp_table = table_buffer;
++                CL_CHECK(werr);
++                CL_CHECK(clEnqueueWriteBuffer(backend_ctx->queue, table_buffer, CL_FALSE, 0, table_nbytes,
++                        (const char *) kv_pages->data + (size_t) table_row*kv_pages->nb[1], 0, NULL, NULL));
++            }
++            GGML_UNUSED(extra_pages);
+             cl_mem   rk_buffer = extra_rk ? extra_rk->data_device : NULL;
+             const cl_ulong offset_rk = extra_rk ? extra_rk->offset + rk->view_offs : 0;
+             const cl_ulong rk_nb1 = rk ? rk->nb[1] : 0, rk_nb2 = rk ? rk->nb[2] : 0, rk_nb3 = rk ? rk->nb[3] : 0;
+@@ -24834,6 +24911,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+             fd_gws[2] = (size_t) n_splits;
+         }
+         backend_ctx->enqueue_ndrange_kernel(k_split, 3, fd_gws, fd_lws, dst);
++        if (kv_tmp_table != NULL) {
++            // a temporary upload buffer: a queued kernel keeps it alive until it runs
++            clReleaseMemObject(kv_tmp_table);
++        }
+ 
+         cl_kernel k_merge = backend_ctx->fa.f32_merge.at(dk_dv);
+         argi = 0;
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
+index 61ab4a7..44929d3 100644
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
+@@ -125,11 +125,26 @@ static inline half8 load8(const int t, const global char * row, const int c8) {
+ // [dim][key][head][batch]: a work-item per 8 values, the attention kernel's
+ // own conversion (load8), one 16-byte store
+ kernel void flash_attn_kv_to_f16(global const char * src, ulong off, ulong nb1, ulong nb2, ulong nb3,
+-                                 int t, int d, int nkeys, int ne2, global half * dst) {
++                                 int t, int d, int nkeys, int ne2, global half * dst,
++                                 // paged K/V (0119/0124): logical key = kv0 + key; a null table reads
++                                 // `key` rows from `off` as before, else the pool page or the ring page
++                                 global const int * table, int ps, int kv0,
++                                 global const char * rsrc, ulong roff, ulong rnb1, ulong rnb2, ulong rnb3) {
+     const int c8 = get_global_id(0), key = get_global_id(1);
+     const int h = get_global_id(2) % ne2, b = get_global_id(2) / ne2;
+     if (c8 >= d / 8 || key >= nkeys) return;
+-    const half8 x = load8(t, src + off + (ulong) key * nb1 + (ulong) h * nb2 + (ulong) b * nb3, c8);
++    const int lkey = kv0 + key;
++    if (table != 0) {
++        const int e = table[lkey / ps];
++        const int row = (e >= 0 ? e : -1 - e) * ps + (lkey % ps);
++        const global char * base = e >= 0 ? src + off : rsrc + roff;
++        const ulong b1 = e >= 0 ? nb1 : rnb1, b2 = e >= 0 ? nb2 : rnb2, b3 = e >= 0 ? nb3 : rnb3;
++        const half8 x = load8(t, base + (ulong) row * b1 + (ulong) h * b2 + (ulong) b * b3, c8);
++        vstore8(x, 0, dst + (((ulong) b * ne2 + h) * nkeys + key) * d + 8 * c8);
++        return;
++    }
++    const global char * base = src + off;
++    const half8 x = load8(t, base + (ulong) key * nb1 + (ulong) h * nb2 + (ulong) b * nb3, c8);
+     vstore8(x, 0, dst + (((ulong) b * ne2 + h) * nkeys + key) * d + 8 * c8);
+ }
+ #endif
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 3168fec..724cf8f 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12987,6 +12987,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     }
+     test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, 8192, 6, GGML_TYPE_F16, GGML_TYPE_F16, 2, 16));
+     test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, 8192, 6, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 0, 32));
++    // I4: a paged prefill -- 512 rows, the gather path (the pages into f16 blocks,
++    // then the f16 prompt kernel), pools half the context or the whole one
++    test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, 8192, 512, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 16));
++    test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, 8192, 512, GGML_TYPE_F16, GGML_TYPE_F16, 2, 16));
++    test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, 4096, 512, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 0, 16));
+     // Mistral Small 24B's geometry (head size 128, 32 query heads on 8):
+     // decode, verify rows, prompts; f16 and quantized K/V
+     for (auto kv_t : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},

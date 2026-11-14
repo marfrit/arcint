@@ -588,6 +588,61 @@ if(ARCINT_TESTS)
     target_compile_options(arcint-gdn-state-rows PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME gdn-state-rows COMMAND arcint-gdn-state-rows)
     set_tests_properties(gdn-state-rows PROPERTIES LABELS unit)
+    # patch 0119's device-free cell: a paged FLASH_ATTN_EXT over a shuffled pool,
+    # a ring and a two-row page table is byte-equal to the unpaged op on the CPU
+    # backend. Design: docs/campaigns/kv-streaming-design.md, increment I1.
+    add_executable(arcint-fa-paged tests/test_fa_paged.cpp)
+    target_link_libraries(arcint-fa-paged PRIVATE arcint_core)
+    target_include_directories(arcint-fa-paged PRIVATE "${ARCINT_LLAMA_DIR}/ggml/include")
+    target_compile_options(arcint-fa-paged PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME fa-paged COMMAND arcint-fa-paged)
+    set_tests_properties(fa-paged PROPERTIES LABELS unit)
+    # patch 0120's device-free cell: the KV stream's page map, host store,
+    # eviction/write-back and table, and the pages through 0119's CPU paged
+    # attention over four ubatches. Design: docs/campaigns/kv-streaming-design.md,
+    # increment I2.
+    add_executable(arcint-kv-stream-map tests/test_kv_stream_map.cpp)
+    target_link_libraries(arcint-kv-stream-map PRIVATE arcint_core)
+    target_include_directories(arcint-kv-stream-map PRIVATE
+        "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/ggml/include")
+    target_compile_options(arcint-kv-stream-map PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME kv-stream-map COMMAND arcint-kv-stream-map)
+    set_tests_properties(kv-stream-map PROPERTIES LABELS unit)
+    # patch 0121's device-free cell: the stream reaches llama_kv_cache and the graph and
+    # stays off by default; reads the patched tree's source (a GGUF and a card are not
+    # available here). Design: increment I3's prerequisite.
+    add_executable(arcint-kv-stream-cache tests/test_kv_stream_cache.cpp)
+    target_link_libraries(arcint-kv-stream-cache PRIVATE arcint_core)
+    target_include_directories(arcint-kv-stream-cache PRIVATE
+        "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/ggml/include")
+    target_compile_definitions(arcint-kv-stream-cache PRIVATE
+        ARCINT_KV_STREAM_SRC_DIR="${ARCINT_LLAMA_DIR}/src")
+    target_compile_options(arcint-kv-stream-cache PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME kv-stream-cache COMMAND arcint-kv-stream-cache)
+    set_tests_properties(kv-stream-cache PROPERTIES LABELS unit)
+    # 0123zz's device-free cell: the paged FLASH_ATTN_EXT predicate's logic, over the
+    # agent's shapes with every clause flipped. The header lives in the pinned tree's
+    # ggml-opencl, built only when the patch is present.
+    if(EXISTS "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl/ggml-opencl-fa-paged.h")
+      add_executable(arcint-fa-paged-predicate tests/test_fa_paged_predicate.cpp)
+      target_link_libraries(arcint-fa-paged-predicate PRIVATE arcint_core)
+      target_include_directories(arcint-fa-paged-predicate PRIVATE
+          "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl" "${ARCINT_LLAMA_DIR}/ggml/src"
+          "${ARCINT_LLAMA_DIR}/ggml/include")
+      target_compile_options(arcint-fa-paged-predicate PRIVATE -Wall -Wextra -Wpedantic)
+      add_test(NAME fa-paged-predicate COMMAND arcint-fa-paged-predicate)
+      set_tests_properties(fa-paged-predicate PROPERTIES LABELS unit)
+    endif()
+    # I5, design section 4.3: the start refusal that stops the scheduler's silent CPU
+    # placement of a paged FA. The rules are src/exec/kv_stream_refusal.h; the red
+    # branch sets ARCINT_KV_STREAM_REFUSE_OFF=1 in the cell's main, which accepts an
+    # ask the card cannot honour and fails the refusals.
+    add_executable(arcint-kv-stream-refusal tests/test_kv_stream_refusal.cpp)
+    target_link_libraries(arcint-kv-stream-refusal PRIVATE arcint_core)
+    target_include_directories(arcint-kv-stream-refusal PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_options(arcint-kv-stream-refusal PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME kv-stream-refusal COMMAND arcint-kv-stream-refusal)
+    set_tests_properties(kv-stream-refusal PROPERTIES LABELS unit)
     # patch 0081's source-slot cell: the GDN family takes src[6] once (the rows
     # index; the replay's records in its own op), the mode word op_params[1]
     # selects the state path, and the raw gating projections of patch 0051 ride

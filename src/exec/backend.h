@@ -178,6 +178,16 @@ struct ModelStatus {
     // which is what lets /props print null rather than a default that was
     // never served.
     std::string kv_precision;
+    // The KV stream as served (--llama-kv-resident, docs/campaigns/kv-streaming-design.md):
+    // the resident budget in MiB, whether the card's attention takes paged K/V at start,
+    // and the state the stream is in. /props reads this, so a refused or inert flag is
+    // visible before a request.
+    struct KvServed {
+        int  resident_mib   = 0;
+        int  decode_mib     = 0;
+        bool paged_fa       = false;   // the card took a paged FLASH_ATTN_EXT at the start probe
+        bool requested      = false;   // --llama-kv-resident was given with a budget
+    } kv_stream;
     // The model may open a think block with the angle-bracket or the
     // square-bracket tag as well as the Qwen tag: set by the llama engine
     // for the Mistral Small 24B family (Cydonia 24B, Magistral tunes). The

@@ -469,6 +469,8 @@ std::string usage_text() {
         "                            1.9 KB a prompt token (100k: ~190 MB), so DIR\n"
         "                            belongs on a dataset with room\n"
         "  --llama-kv K[:V]          the attention cache types, f16, q8_0 or q8_0:q4_0\n"
+        "  --llama-kv-resident MiB    KV streaming: resident K/V pages in VRAM, the rest from host RAM\n"
+        "  --llama-kv-resident-decode MiB  the decode phase's budget (not built: refused)\n"
         "                            (default f16): q8_0 takes the cache to 53 %,\n"
         "                            q8_0:q4_0 to 41 %\n";
 }
@@ -553,6 +555,12 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
                 cfg.llama_expert_cache_mib_dev.push_back(mib);
             }
             cfg.llama_expert_cache_mib = cfg.llama_expert_cache_mib_dev.front();
+        } else if (arg == "--llama-kv-resident") {
+            if (!value(v) || !parse_int(v, cfg.llama_kv_resident_mib) || cfg.llama_kv_resident_mib < 0)
+                return fail("--llama-kv-resident needs a size in MiB >= 0 (0: off; the rest of the KV streams from host RAM)");
+        } else if (arg == "--llama-kv-resident-decode") {
+            if (!value(v) || !parse_int(v, cfg.llama_kv_resident_decode_mib) || cfg.llama_kv_resident_decode_mib < 0)
+                return fail("--llama-kv-resident-decode needs a size in MiB >= 0 (0: off)");
         } else if (arg == "--llama-layer-split") {
             if (!value(v) || !parse_int(v, cfg.llama_layer_split) || cfg.llama_layer_split < 1)
                 return fail("--llama-layer-split needs a layer index K >= 1 (layers [0, K) on the first card)");

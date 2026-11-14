@@ -6953,3 +6953,548 @@ Over the floor, across six count transitions of 724-765 rows each on six convers
 6. The library's red switch did not fail on the served route: with `LLAMA_DORY_RED_REUSE=1` (the count left out of the graph-reuse key) 5 of 5 answers of the high group still equalled the 4-loop reference. Reason, evidence class `code`, not measured: `allow_reuse` in `llama-graph.h` compares the micro-batch shape (`n_tokens`, `n_seqs` and the rest) and returns false on a difference before it reaches the count check this patch adds. A count change makes the server re-prefill, the first batch after it has another shape than the last decode batch, so the graph is rebuilt whatever the key says. The red case that fails stays the CPU probe (6 of 9 probes with that switch). The served spot check has no red run of its own; its ability to fail rests on point 1's "2 of 5".
 
 **Not measured:** a deep prompt (the re-prefill cost at depth is the prefill cost; the unit's prefill at 98k-177k tokens was 51 t/s at 2 loops in an earlier run the same day on the same card with the same unit arguments, `measured-here`, so a level change deep in a session costs a full prefill), the B60, KL on the card, any sampled run. No served unit carries the flag. The patch does not touch the kernels.
+
+## 0119-ggml-fa-paged-kv.patch
+
+Paged K/V for `GGML_OP_FLASH_ATTN_EXT`, its CPU reference, and the backend
+refusal that keeps an unported backend from reading a pool as if it were the
+whole layer (design: `docs/campaigns/kv-streaming-design.md`, increment I1;
+reference: the fork's `1f6e1fccc`, `ggml/include/ggml.h:2528-2560`). Evidence
+class `code` for the mechanism (the fork's checkout at `b540a4b9b`), `code`
+for arcint; the cell below is the only number and it is not a rate.
+
+- **API** (`ggml/include/ggml.h`): `ggml_flash_attn_ext_set_pages(a, pages,
+  table, page_size, ring_k, ring_v)`: `k`/`v` hold a pool of `page_size`-row
+  pages (`[n_embd, n_pool_rows, n_head_kv, 1]`, the cache's row layout), the
+  attended sequence is `pages->ne[0]*page_size` rows, `pages` is `I32
+  [n_pages, n_tables]` with row `table` used, entry `>= 0` is a pool page and
+  entry `< 0` is page `-1 - entry` of the ring (same row layout). It asserts
+  the mask's `ne[0]` is at most the attended length -- a narrow mask covers the
+  last `mask->ne[0]` keys, the keys before it count as visible (the fork's
+  `1ca44251c` form, `ggml_flash_attn_ext_mask_col0`) -- that the pool's and the
+  ring's rows are whole pages, and that the ring's types and head counts equal
+  the pool's.
+  `ggml_flash_attn_ext_set_sync(a, tag, ready, consumed)` carries the
+  cross-queue flags (`I32 [1]` tag in device memory, host-visible `ready` and
+  `consumed`); `ggml_flash_attn_ext_set_page_runs(a, runs)` carries the table
+  as runs of consecutive pool or ring pages, which a backend may split on. The
+  last two are plumbing for increments I2/I4: nothing reads them here.
+- **Op state** (`ggml/src/ggml-impl.h`): the op params `GGML_FA_PARAM_*`
+  (page size 5, ready 6-7, consumed 8-9, page table row 10, page runs 11-12,
+  per-row log-sum-exp 13-14, the backend-internal one) and the src slots
+  `GGML_FA_SRC_PAGES` 5, `RING_K` 6, `RING_V` 7, `TAG` 8, appended after the
+  mask src so the existing kernels' indices do not move; the getters
+  `ggml_flash_attn_ext_n_kv` / `mask_col0` / `get_pages` / `get_ready` /
+  `get_consumed` / `get_page_runs`.
+- **CPU reference** (`ggml/src/ggml-cpu/ops.cpp`, `..._flash_attn_ext_paged`):
+  wait for `ready >= tag[0]` if a tag is set (one thread, then a barrier), copy
+  each logical row from `table[i/page_size]`'s pool page or ring page into
+  contiguous K/V and widen a narrower mask into the attended length (its first
+  `col0` columns zero, its mask columns copied at `col0`), run the existing
+  contiguous path on those copies, then store `consumed = tag[0]`. A node with a
+  narrow mask but no page table takes the same entry point (`mask_col0 > 0`),
+  which is how the compact-mask case without a ring exercises the widening. The
+  copies are plain memory moves, so the output is byte-equal to the unpaged
+  path's on the same bytes. `ggml/src/ggml-cpu/ggml-cpu.c` reserves the copies
+  and the widened mask in the graph plan's work buffer.
+- **Refusal** (`ggml/src/ggml-opencl/ggml-opencl.cpp`, `supports_op`): a
+  `FLASH_ATTN_EXT` with a page table or a sync tag is declined. Its kernels do
+  not take pages yet (that is the design's I3), and a backend returning true
+  would read the pool as the whole layer. The scheduler then places the node
+  on the CPU reference; no backend reads a table it does not understand.
+- **Test** (`tests/test_fa_paged.cpp`, arcint's `arcint-fa-paged`, ctest
+  `fa-paged`, LABELS unit): four cases over the same bytes, unpaged against
+  paged with shuffled pool slots, unused slots filled `0x5a`, a ring for every
+  second/third/all page in reverse order, a two-row table with a garbage row 0,
+  a causal mask, 1 thread: f16 at 1,024 keys / 6 rows with 4 KV heads x 6
+  queries; q8_0:q4_0 at 2,048 keys / 6 rows with a ring every 3 pages; q8_0:q4_0
+  at 1,024 keys / 2 rows without a ring; f16 at 512 keys / 1 row, one KV head,
+  a ring every page; q8_0:q4_0 at 1,024 keys with a compact mask covering the
+  last 768 keys (`col0=256`) and a ring every 2 pages; f16 at 1,024 keys with a
+  compact mask covering the last 512 keys (`col0=512`) and no ring. The f32 outputs are compared with `memcmp` -- the gather is
+  a copy, so equality is expected, not an NMSE -- and the reference must be
+  finite, so a read of the fill shows.
+- **Red cases** (each run and seen failing before the patch was restored): the
+  gather's `e >= 0 ? pool : ring` becomes `pool`, so a ring page reads a pool
+  row -- 3 of 4 cases fail then (the ring arms; the no-ring arm cannot fail on
+  it); and the widening's `memcpy(out + col0, ...)` becomes `memcpy(out, ...)`,
+  so the visible columns sit at the wrong keys -- the two compact-mask cases
+  fail and the four full-mask cases stay green, which is what shows the
+  widening runs. Restored, all 6 cases pass.
+- **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host, the patched
+  tree's own `arcint-fa-paged`, 1 thread): 6 of 6 cases byte-equal (full and
+  compact masks), the ring red build 3 of 4 failing, the widening red build 2
+  of the 2 compact-mask cases failing. The recipe at the widening's red tree
+  (`kv-stream-red-widen`, `b4a8cd98`): 38 with 1 failure, `fa-paged` failing
+  exactly those two cases, EXIT 8. The recipe at the green tree: 37 of 37 unit tests
+  pass, EXIT 0, the .deb built; at the red tree (`kv-stream-red`, `fcbbfe90`):
+  36 of 37, `fa-paged` the one failure, EXIT 8, no .deb -- it compiles and
+  fails. Not a rate and not on a card.
+- **Not measured:** any card; any speed of the CPU gather; the cross-queue
+  flags' paths (`set_sync`, `set_page_runs`) and the OpenCL kernels, which this
+  patch deliberately does not touch (I3/I4).
+
+## 0120-llama-kv-stream-map.patch
+
+The adaptive KV stream's page map, host store, eviction/write-back and page
+table (design: `docs/campaigns/kv-streaming-design.md`, increment I2; reference:
+the fork's `src/llama-kv-stream.{h,cpp}` at `b540a4b9b`). Evidence class `code`
+for the mechanism; the I1 paged op (`0119`) is what reads the pages. Not wired
+into the KV cache yet -- that is I3's prerequisite, named below.
+
+- **What** (`src/llama-kv-stream.{h,cpp}`, added to `src/CMakeLists.txt`): one
+  sequence's attention layers keep their K/V in pages of 256 cells. The pool
+  tensors are the cache's (`[n_embd_gqa, n_slots*page_size]`); a host store
+  buffer of the pool's buffer type holds every page that left the pool, per
+  layer K pages then V pages in page order. `prepare(cells, n_kv)`:
+  - makes the pages a ubatch writes resident, evicting the oldest non-written
+    page when no slot is free and asserting the pool holds at least a ubatch;
+  - gives free slots to the newest attended pages;
+  - marks the written pages dirty;
+  - packs the attended pages that are not resident into the layer's ring slot
+    (two slots, alternating by layer parity) and records the ring index, so
+    `synced()` reports a ubatch that streams;
+  - `assign` reads a returning page back from the host store, `evict` writes a
+    dirty page back exactly; `set_input_pages` fills the `I32
+    [n_kv/page_size, n_layer]` table (slot >= 0, or `-1 - ring index`), `runs`
+    gives the resident attended pages as runs for a gather, `row` maps a cell,
+    `layout()` changes whenever a page moves (a graph built around the layout is
+    not reused), `get_rows`/`set_rows` read and write wherever the rows live
+    (the checkpoint path and the cell's integrity probe), and
+    `set_debug_rotate(true)` moves every resident page through the host store
+    before every ubatch (the fork's `LLAMA_KV_STREAM_DEBUG=rotate`, which needs
+    the pool to hold the context).
+- **Deviations from the fork, named**: no copier or publisher thread, no copy
+  engine, no `ready`/`consumed` flags, no prefetch -- page moves are synchronous
+  `ggml_backend_tensor_set/get` on the owning backend; I3/I5 put them on the
+  second in-order OpenCL queue with events and add the kernel-side wait
+  (0032/0044's form, 0056's doorbell). Slots are sized by the caller (`n_ring`
+  pages), not by a probe of the backend's paged attention or by the streamed
+  pages a phase needs -- I3 adds the probe and that sizing. No phase budgets and
+  no pool resize (I5). Nothing is wired into `llama_kv_cache` yet: the pool
+  views, the graph inputs and the prepare call are I3's, because the CPU arm is
+  a cell, not a served model.
+- **Test** (`tests/test_kv_stream_map.cpp`, arcint's `arcint-kv-stream-map`,
+  ctest `kv-stream-map`, LABELS unit, CPU backend, 1 thread):
+  - the map: written pages resident, the newest attended pages take free slots,
+    a full pool evicts the oldest non-written page, an attended page reads the
+    bytes that were written, rotation writes every page back and reads the same
+    bytes, a two-page pool over four pages streams pages 1 and 2 packed at ring
+    rows 0 and 256, a written page outside the attended range is resident while
+    an unattended one is not, table rows agree;
+  - the pages through attention: four ubatches of 256 cells over a 1,024-cell
+    f16 cache with a two-page pool and a four-page ring; each ubatch prepares,
+    writes its cells through `set_rows`, and runs a 6-row causal paged
+    attention over the pool and the ring; its f32 output is `memcmp`-equal to
+    the same attention over a contiguous cache holding the same bytes. At the
+    fourth ubatch two of four pages stream.
+- **The graph's write** (review of 0120): a cell written straight into the pool
+  tensor (as `cpy_k`/`cpy_v` write it on the device) is marked dirty only by
+  `prepare`; the cell evicts after a second ubatch takes its slot, and the host
+  store must return the bytes it wrote. The no-op mutation of
+  `for (uint32_t c : cells) dirty[c/page_size] = 1;` fails that cell (4 checks)
+  and nothing else -- the section is the only place the graph's write is made. The branch `kv-stream-red4`
+  (`487e82b1`) is that no-op: recipe EXIT 8, 1 of 40 failing, `kv-stream-map`
+  the one, its four graph-write checks red.
+- **Red case** (branch `kv-stream-red2`): `evict` drops the write-back
+  (`dirty[page]` -> `false`). It compiles and fails 6 checks -- the rotation
+  cell (a dirty page evicted without its write-back reads different bytes) and
+  the third and fourth ubatch's attention (an evicted page streams what the host
+  store last held). Restored, every check passes.
+- **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host, the patch's
+  own cell, 1 thread): green all checks, the red build 6 failing. The recipe at
+  the green tree (`99d94fe0`): 38 of 38 unit tests, EXIT 0, the .deb built,
+  `kv-stream-map` among them and `kv-stream-refuse` reported Not Run (Disabled);
+  at the red tree (`kv-stream-red2`, `5a01de69`): 38 with 1 failure,
+  `kv-stream-map` failing, EXIT 8, no .deb.
+- **Not measured:** any card; the copier/publisher threads, the second queue,
+  the sync flags and the pool sizing (I3/I5); a served model (the CPU arm is
+  the cell; arcint's llama engine requires an OpenCL card at start).
+
+## 0122-opencl-fa-paged-decode.patch
+
+The B60's GQA decode kernel learns 0119's page table and ring, and the backend
+accepts a paged `FLASH_ATTN_EXT` exactly for the shapes it now handles (design:
+`docs/campaigns/kv-streaming-design.md`, increment I3; reference: the fork's
+`1f6e1fccc`/`2a5beae21` page addressing at `b540a4b9b`, `code`).
+
+- **Kernel** (`ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl`): one
+  helper, `fa_gqa_page_row(table, ps, key, pool, pool_nb1, ring, ring_nb1)`:
+  `table[key/ps] >= 0` reads row `e*ps + key%ps` of the pool, `e < 0` reads
+  `(-1-e)*ps + key%ps` of the ring; a null table reads `key` rows as before. The
+  kernel gains 12 trailing args (table, page size, and the two ring slots'
+  pointer, offset and nb1/nb2/nb3). Its five K/V row reads go through the
+  helper: staging (`GQA_K_STAGED`), the int8 staged rows (0089), the int8 Q K^T's
+  direct and staged b operands (0088), and the V staging. **Deviation from the
+  fork, named:** the fork makes paging a compile-time `PAGED` switch; here one
+  build carries the helper with a `table == 0` runtime check, so an unpaged call
+  pays one uniform compare per key row (the rows are 544 B and up for K, so the
+  read dominates; the cost is to be measured, not inferred). A separate build
+  per switch is not taken because arcint's kernels are built once per type pair.
+- **Dispatch** (`ggml/src/ggml-opencl/ggml-opencl.cpp`): `n_kv` of a paged op
+  is `pages->ne[0]*page_size` (the attended length), not the pool's rows; a
+  paged op routes to the GQA kernel from **1** row (the 0089 staged form for
+  1-3 instead of the split kernel, which would attend the pool as the whole
+  layer); the 12 args are set for that launch only; a paged op that would reach
+  another kernel aborts with a message (`GGML_ABORT`, no silent path).
+- **`supports_op`**: true for a paged `FLASH_ATTN_EXT` only when the page table
+  is `I32`, contiguous, `[n_pages, n_tables]` with a valid row and page size
+  256; K/V is q8_0/q4_0, q8_0/q8_0, q4_0/q4_0 or f16/f16; head size 256, GQA
+  `(q heads/kv heads)*rows <= 64`, `q` f32; a full-width mask (the compact mask
+  is I5's); the ring rows are whole pages; and the GQA kernel of that pair is
+  built. A **sync tag** (`ready`/`consumed`) is still declined (I5's queue);
+  every other paged shape is declined. No CPU fallback is relied on: a served
+  start must refuse before this point (design §4.3, I5's marker cell).
+- **Test** (`0123`): paged cases in `test-backend-ops`, the agent's geometry.
+- **Not compiled here**: the recipe host builds the OpenCL C++ (EXIT 0) but has
+  no `ocloc`/driver, so the kernel text is compiled only in Claude's card
+  window. **Not measured:** any card, any speed, KL. The card commands are in
+  the handover and the design's I3.
+
+## 0123-tests-fa-paged-backend.patch
+
+Paged `FLASH_ATTN_EXT` cases in `test-backend-ops`, so the card window runs
+0122's kernel over the agent's shapes (design: increment I3).
+
+- **Case** `test_flash_attn_ext_paged`: head 256, `nh` KV heads, `nr` query
+  heads a KV head, `kv` keys, `nb` rows, K/V types, `ring_every`, `n_slots`.
+  The pool is the KV cache's layout (`[hs*nh, rows]`, all heads of a token in a
+  row) with `n_slots` resident pages in shuffled slots and unused pages between
+  them; every `ring_every`-th page from page 0 is in the ring, in reverse order
+  behind an unused page. The table is row 1 of two; row 0 is garbage. `n_slots`
+  smaller than `kv/256` is what makes pages stream.
+- **Registered**: at the agent's geometry (24 query heads on 4 KV heads, G 6),
+  6-row verify at kv 1,024 / 8,192 / 65,536 / 262,144 with the pool half the
+  context (ring every 2), and 1-row decode at the same kv with every page in
+  the ring and a 4-page pool; f16 K/V at 8,192; and the all-resident arm
+  (`ring_every=0`) at 8,192. 10 cases.
+- **Run**: `test-backend-ops test -o FLASH_ATTN_EXT -p 'n_slots=' -b <card>`,
+  and `perf` with the same filter (the case's `op_flops` prices a paged run).
+- **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host, the patched
+  tree's `test-backend-ops`, `-p 'n_slots='`): 10 of 10 OK, including the
+  262,144-key arms, against the CPU paged reference. That is the case plumbing
+  and the CPU path; it is **not** a card result and says nothing about 0122's
+  kernel.
+- **Not measured:** the card (Claude's window; the commands are in the
+  handover), paged against unpaged time, KL.
+
+## 0121-llama-kv-stream-cache.patch
+
+The KV stream reaches `llama_kv_cache` and the graph, off by default (design:
+`docs/campaigns/kv-streaming-design.md`, increment I3's prerequisite; reference:
+the fork's `143b62090`/`c68455740` cache and graph wiring at `b540a4b9b`,
+`code`). Not wired to the copy queue or the phase budgets (I5), and the graph
+reuse check is conservative (below).
+
+- **Parameter** (`include/llama.h`, `src/llama-cparams.h`): `kv_resident_size`,
+  device bytes of the resident KV pages, default **0 = off**, copied into
+  cparams (`llama-context.cpp`). arcint does not yet set it (the unit flags and the
+  refusal are I5).
+- **Cache** (`llama-kv-cache.cpp`): with the flag on, the cache validates the
+  paged kernel's shapes -- one stream (or unified), no V transpose, no shared
+  source cache, no SWA, no windows, q8_0 K / q4_0 V, head 256 -- refusing
+  otherwise at construction, never falling back. It sizes `n_slots` from the
+  bytes (`slots_for`, at least 8 pages), shrinks the K/V tensors to
+  `n_slots*256` rows, and constructs `llama_kv_stream` with the pool tensors, a
+  ring of `n_pages-n_slots` pages and the pool's buffer type. `get_k`/`get_v`
+  return the whole pool's view under streaming (the attention reads it through
+  the table). `apply_ubatch` calls `prepare(idxs[0], get_n_kv(sinfo))` before
+  the graph, so the written pages are resident before the graph's store and the
+  streamed pages are in the ring slots before its attention.
+- **Graph** (`llama-graph.cpp/.h`): the KV input carries the page table
+  (`I32 [n_kv/256, n_layer]`, a host input filled in `set_input`) and every
+  attention layer's ring views; `build_attn` sets them on the fused
+  `FLASH_ATTN` node with the layer's table row and expands the inputs.
+  **Deviation, named:** a stream-on graph is never reused
+  (`llm_graph_input_attn_kv::can_reuse` returns false), because a page move
+  changes what the views mean; the fork compares its `layout_id` instead. The
+  cost is one graph build per ubatch, to be measured with the stream on.
+- **Not in this patch**: the copy queue and the ready/consumed flags (I5), the
+  phase budgets and the pool resize, the table's device upload for OpenCL (the
+  scheduler places the host input; the OpenCL kernel argument takes the tensor's
+  extra, which I5's queue path owns), and any served run.
+- **Test** (`tests/test_kv_stream_cache.cpp`, `arcint-kv-stream-cache`, ctest
+  `kv-stream-cache`): reads the patched tree's source and checks the wiring's
+  shape (default 0, the validation strings, the shrunk rows, the stream's
+  construction, `prepare` in `apply_ubatch`, the table and ring views on the FA
+  node, the fill in `set_input`, the reuse refusal, the pool views in `get_k`).
+  Red: the default set to 1 fails the first check; a normal start would then
+  ask for a stream nobody requested.
+- **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host): the cell
+  passes at the green tree (`5886672e`: 39 of 39 unit tests, EXIT 0, deb built;
+  `kv-stream-cache` among them); the patched library builds.
+  **Not measured:** a stream-on model run -- no GGUF and no card on the recipe
+  host, and arcint's llama engine needs an OpenCL card at start. The device-free
+  behavioural evidence stays `kv-stream-map` (green) with its reds
+  `kv-stream-red2` (eviction) and `kv-stream-red3` (a one-page table shift).
+
+## 0123z-opencl-fa-paged-prefill.patch
+
+I4: a paged prompt's pages are gathered into f16 blocks and the f16 prompt
+kernel runs on them; the decode path's page table is uploaded to the device
+(I5's table upload). Design: increment I4; reference: the fork's `9e9e46f86`
+chunked paged prefill at `b540a4b9b` (`code`) -- **deviation, named**: the fork
+attends page runs as chunks merged by log-sum-exp; here the rows are gathered
+by 0037's conversion kernel into its two 32 MiB blocks and the existing f16
+kernel runs with its carry, which is the fork's own gather form. The chunk size
+is 0037's block (`GGML_OPENCL_FA_DPAS_F16KV_BLOCK`), not the fork's
+`GGML_CUDA_PREFILL_CHUNK`; the page-runs merge is left to I5's card round.
+
+- **Conversion kernel** (`flash_attn_dpas.cl`): `flash_attn_kv_to_f16` gains
+  eight trailing args (the table, page size, the logical key base `kv0`, and the
+  ring's pointer, offset and nb1/nb2/nb3). With a table, logical key `kv0+key`
+  reads pool page `e` (entry >= 0) or ring page `-1-e` with the ring's own
+  strides; a null table reads the contiguous view as before.
+- **Dispatch** (`ggml-opencl.cpp`): a paged op with more than 64 GQA rows (a
+  prompt) forces the 0037 gather path; the table row is uploaded once to a
+  device buffer on the compute queue and released after the queued conversions
+  (a queued command holds it). The 0038 f16 kernel then reads the blocks. The
+  decode path's table is uploaded the same way when the page tensor is not
+  already a device buffer. Cost: 4 KiB per ubatch at 262,144 cells.
+- **`supports_op`**: a paged prefill is accepted when the conversion kernel and
+  the f16 prompt kernel are built; the GQA row cap now applies only to the
+  decode shape, so a 512-row prompt is not declined (and cannot slip to the CPU
+  reference).
+- **Cases** (`test-backend-ops`): paged prefill at the agent's geometry, 512
+  rows, kv 8,192 and 4,096, q8_0:q4_0 and f16, pools half the context and the
+  whole one (3 cases, next to 0123's).
+- **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host): the five
+  paged cases with `n_slots=16` (the three prefill arms among them) 5 of 5 OK on
+  the CPU. **Not compiled or measured on a card**: the OpenCL C++ builds
+  (recipe), the kernel text's first build is Claude's window, and the gather
+  path's speed is unmeasured.
+
+## 0123zz-opencl-fa-paged-predicate.patch
+
+The paged `FLASH_ATTN_EXT` predicate as tested logic, and the kernel fix that
+window 226 exposed: every paged case reported "not supported [OpenCL]" on the
+B60, 0 of 10 run, because the GQA program failed its optional build and the
+kernel stayed null. Evidence `code` (the source order) + `measured-here`
+(window 226: unpaged agent shapes supported and passing on the same tree).
+
+- **The kernel** (`flash_attn_gqa_dpas.cl`): 0122 put `fa_gqa_page_row` between
+  `__attribute__((intel_reqd_sub_group_size(16)))` and `kernel void
+  flash_attn_gqa_dpas`. An intervening declaration takes the attribute for
+  itself, so the kernel compiled without a required sub-group size, the DPAS
+  builtins failed, `build_program_from_source_optional` returned null, and
+  `supports_op`'s `kernels_decode` was false for every pair. The helper now
+  sits before the attribute; nothing is between the attribute and the kernel.
+- **The predicate** (`ggml-opencl-fa-paged.h`, new): the supports_op logic as
+  plain data -- `ggml_cl_fa_paged_shape`, `_kv_ok`, `_shape_ok`, `_ok`. True
+  exactly where the kernels handle a paged case: I32 contiguous table with a
+  valid row and page size 256, the four KV pairs, head 256, one stream, GQA
+  divisibility; a full-width mask; a whole-page ring (or no ring); and the
+  kernel of the shape (GQA for `(q heads/kv heads)*rows <= 64`, the conversion
+  + f16 prompt kernel for a prompt). `ggml_opencl_supports_op` fills it from the
+  tensors and calls it.
+- **Diagnostics**: `GGML_OPENCL_FA_PAGED_DEBUG=1` logs the clauses (table, kv,
+  shape, mask, ring, the two kernel flags) and the verdict as one INFO line, so
+  a declined paged case names its clause on the card.
+  `GGML_OPENCL_FA_PAGED_DUMP=1` logs what a paged launch is handed: `n_kv`,
+  page size, the table row and its byte offset, the pool's and the ring's row
+  counts and nb1/nb2 for K and V, and the table row's entries read back.
+- **Window 232's bindings are right and the failure is inside one type path.**
+  The dump shows, for a failing q8_0:q4_0 ring case and the passing f16 ring case
+  at the same shape, the same table, the same pool/ring row counts and the
+  strides the tensors have (q8_0 K 1088/272, q4_0 V 576/144; f16 2048/512); the
+  table row maps every ring page to a small `-1-e` and every resident page to a
+  slot within the pool. The row formula therefore indexes inside the pool and
+  the ring, and no stride is wrong. What is left is a *type path*: the staged K
+  loader for q8_0 (`GQA_K_STAGED`), the q4_0 V staging, or the 0088 int8 b
+  operand -- f16 reads the ring through `kb16`/`load16(VT=0)` and passes.
+  Isolation runs, one per arm, same line (no kernel change between them):
+  - `GGML_OPENCL_FA_GQA_OPTS=-DGQA_K_DIRECT` -- q8_0 K read per lane instead of
+    staged: a pass names the staged loader, a NaN keeps it in V/int8.
+  - `GGML_OPENCL_FA_GQA_I8=0` explicitly -- excludes 0088's int8 b operand.
+  - `GGML_OPENCL_FA_DPAS_F16KV_BLOCK=4096` on the prefill cases -- moves the
+    conversion's block boundary; a NaN that moves with the block names the
+    conversion, one that stays at the same output index is the row read.
+  **The fix is owed after those three lines**; this patch carries no kernel
+  change for window 232.
+- **Tests**: arcint's `tests/test_fa_paged_predicate.cpp` (`fa-paged-predicate`,
+  ctest LABELS unit) drives `ggml_cl_fa_paged_ok` over the agent's decode shape
+  (true) and flips every clause (each must refuse), plus prompts and 1-row
+  decode; `tests/python/test_fa_gqa_i8.py` asserts the attribute is immediately
+  followed by the kernel (nothing between).
+- **Window 228's two bugs, fixed:** the KV clause compared enum *literals*
+  (`Q4_0` is 2 in ggml.h, not 4), so the agent's q8_0:q4_0 pair was declined
+  while f16 passed; the header now names `GGML_TYPE_*`. And the table row: the
+  backend passed a device tensor's base and ignored the used row, so the kernel
+  read row 0 -- `INT32_MAX` in the paged case -- and a pool row of 2^31 rows went
+  out of bounds (the CL_EXEC_STATUS_ERROR and the assertion in window 228). The
+  used row is now passed with its byte offset (`ulong table_off`, a device
+  tensor's row), or a host row is uploaded; the conversion kernel takes the same
+  offset. The debug line reports both: `kv` and the kernel-clause flags.
+- **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host): the
+  predicate cell passes, the source-text gate passes, the recipe is green
+  (`b3d290fe`: 41 of 41, EXIT 0); the red branch `kv-stream-red6` (`7683bf7b`,
+  the `kernels_ok` clause dropped) fails 2 checks -- a prompt without its
+  kernels and no-kernel-at-all -- recipe EXIT 8. A second, safe red (no kernel
+  executes): the KV clause's `GGML_TYPE_Q4_0` written as the literal `4` -- the
+  predicate logs `kv 0` and declines the agent's pair. **Not compiled on a card**: the
+  kernel's next build is Claude's window; the diagnostic line is the clause
+  evidence to collect there.
+
+## 0123zzz-tests-fa-paged-pair-isolation.patch
+
+Window 232's pair isolation, three paged cases next to 0123's (design: increment
+I3; no kernel change). The bindings were cleared by the dump: a failing
+q8_0:q4_0 ring case and the passing f16 ring case at the same shape get the same
+table, pool/ring row counts and the strides those tensors have. So the failure
+is inside one type path, and two pair arms name it in one run:
+
+- `q8_0 / q8_0`, 8,192 keys, 6 rows, ring every 2, a 16-page pool;
+- `q4_0 / q4_0`, the same shape;
+- `q8_0 / q8_0`, 512 rows (prefill), the same shape.
+
+If `q8_0 / q8_0` passes while `q8_0 / q4_0` fails, the defect is the q4_0 V
+staging (decode) or V's conversion (prefill); if both quantized pairs fail, it
+is the K side; if `q4_0 / q4_0` alone fails, it is the q4_0 K staged loader.
+
+**Measured, CPU** (`measured-here`, 2026-11-14, the recipe host): the three
+cases with a ring pass on the CPU (3 of 3), so the case data and table are
+well-formed. **Not on a card:** the next window's run.
+
+## 0123zzzzz-opencl-fa-paged-f16-in-place.patch
+
+A paged f16 prompt took the f16 in-place branch of the prompt kernel
+(`flash_attn_dpas2.cl` reading K/V in place). That branch reads the K/V view
+row after row over the call's `n_kv` keys, so with paged K/V it attended the
+pool's rows as the sequence: it missed the page table and the ring, and when
+the table names more pages than the pool holds it read past the pool (the open
+case `kv=8192, nb=512, f16, ring_every=2, n_slots=16`: 8,192 keys over a
+4,096-row pool). The quantized pairs already took the gather (each key's row
+from the pool or the ring into f16 blocks, then the f16 kernel); paged f16 now
+takes it too. One condition, `kv_pages == nullptr`, on the in-place branch
+(`code`).
+
+Measured on the B60 (`measured-here`, 2026-11-14, window 250): all 18 paged
+cases pass on the series through this patch (pin + 8658e830); the tree without
+it (03fcccd9) fails exactly the f16 ring prefill (17 of 18). The full
+`FLASH_ATTN_EXT` suite on the fixed tree: 3,115 of 3,115.
+
+## 0123zzzzz1-llama-kv-stream-hybrid-layers.patch
+
+The KV stream's ring views were built for every layer with `has_kv(il)`, over
+`n_layer_all`. On a hybrid model (the dense 27B, `LLM_ARCH_QWEN35`: gated
+delta-net and attention layers) `has_kv` is true for the recurrent layers too,
+while the attention cache holds only `il < n_layer() && !is_recr(il)`; the
+cache's `map_layer_ids.at()` then threw at context creation
+(`llama_init_from_model: failed to initialize the context: unordered_map::at`,
+`measured-here`, B60, windows 252 and 253: the agent's command line with
+UD-Q5_K_M and `--llama-kv-resident 3584`, with and without MTP). The ring
+views are now built only for the layers the cache holds
+(`llama_kv_cache::kv_has_layer`); the page table is set on those layers' FA
+nodes as before, and the recurrent layers stay in their own memory. Until now
+the stream ran only in op tests and unit cases, none of them on a hybrid model.
+
+## 0123zzzzz2-kv-stream-partial-writes-refusal.patch
+
+The first served run of the KV stream beyond its pool (window 255, the dense 27B
+as UD-Q5_K_M at 262,144 with `--llama-kv-resident 3584`, B60) served to 131,072
+tokens and then ended in a page fault: xe reset the compute and copy engines
+(`measured-here`, no wedge). Two defects, both in the stream's page moves
+(`code`):
+
+- **The fault.** The OpenCL `set_tensor` splits every contiguous q8_0 / q4_0
+  tensor into SoA planes, writing `ggml_nbytes(tensor)` from `data` at `offset`
+  whatever `size` is. The stream moves single pages into its pool and ring
+  slots with `ggml_backend_tensor_set(slot, page, offset, bytes)`, so its first
+  move read past the host page and wrote planes past the slot. A partial write
+  of a q8_0 / q4_0 tensor that is not a weight now takes the plain copy (the
+  attention reads these as blocks); a partial write into a tensor that was
+  split is an assert. The cache itself never met this: `SET_ROWS` writes it.
+- **The page moves are not per layer.** The stream has two ring slots, a layer
+  using `slots[ikv % 2]`, and `prepare()` fills them for every layer before the
+  graph runs, so each layer but the last two would read another layer's pages.
+  The design copies layer i's pages while layer i-1 computes (I5's copy queue),
+  which is not built. The cache now refuses a budget that does not hold the
+  context ("the resident budget holds N of M pages; streaming the rest needs the
+  per-layer copy (I5)"), so a start that would stream is refused instead of
+  serving wrong attention; `LLAMA_KV_STREAM_UNSAFE=1` lets the stream run for
+  its development.
+
+Measured on the B60 (`measured-here`, 2026-11-14, window 257, UD-Q5_K_M at
+262,144 with a 3,584 MiB budget): the start is refused ("the resident budget
+holds 551 of 1024 pages; streaming the rest needs the per-layer copy (I5)").
+With `LLAMA_KV_STREAM_UNSAFE=1` the server answers the capital and then ends
+inside a 150k prompt with another page fault, this time the copy engine alone
+(`engine_class=bcs`): the planar split was one fault source, not the only one.
+Streaming beyond the pool stays refused until I5.
+
+## 0124-opencl-fa-wide-verify.patch
+
+A verify of 9 to 64 query rows (more than 8 drafts, several lanes' verifies in
+one ubatch, a short prompt tail) runs as one call of the GQA decode kernel
+(`flash_attn_gqa_dpas.cl`) when its (head, token) rows fit the kernel's 8 row
+tiles (64 rows: 10 tokens at the dense 27B's 6 query heads a KV head), instead
+of 0028's blocks of 8 rows. K/V is then staged once per work-group for all
+rows, where the blocks stage it once per block. The kernel is unchanged.
+
+- **Routing:** the decision is made after the op parameters are read (it needs
+  the K/V pair, ALiBi and softcap) and only when the GQA kernel for the pair is
+  built. A wide call skips the prompt kernel (`flash_attn_dpas.cl`) and the K/V
+  dequantization, and runs with the Intel decode settings of the 4-8-row GQA
+  calls (split size, partial buffer). Calls that do not fit keep the blocks;
+  4-8-row calls route as before. Paged K/V takes the same call (the kernel reads
+  the page table). The A770 builds no GQA kernel (it has 8-wide sub-groups), so
+  nothing changes there (`code`).
+- **Switches:** `GGML_OPENCL_FA_WIDE_VERIFY=0` keeps the blocks;
+  `GGML_OPENCL_FA_DEBUG=1` logs each call's form, rows and tiles (test-backend-ops
+  shows it; the server's log does not).
+- **Tests:** `test-backend-ops` cases at the agent's geometry, 9, 10, 17, 21 and
+  32 tokens, f16 (4,096 and 8,192 keys) and q8_0 / q4_0 (8,192 and 65,536), and
+  two paged verifies (10 and 17 rows).
+
+Measured on the B60 (`measured-here`, 2026-11-14):
+
+- **Op suite** (window 242, trees of 38f96336): wide calls take `form=gqa`; every
+  q8_0 / q4_0 and paged case passes, wide and switched off. The red copy (a wide
+  call launches one tile fewer) fails exactly the wide cases (9 and 10 rows,
+  the paged 10; ERR 0.07-0.23); the block cases stay green. f16 at 32,768 keys
+  misses the 5e-4 bound (0.0007) on every route, the switch-off blocks included,
+  hence the 4,096 / 8,192 arms. Full `FLASH_ATTN_EXT` suite: 3,109 of 3,115, the
+  failures those f16 cases and the f16 paged prefill with a ring (0123's open
+  case).
+- **Served** (window 243, dev binary of f165bf9c at 8 tiles, the agent's
+  command line, a 122,880-token prefix, 16 follow-up tails each, arms in
+  A B C C B A order): a 10-token tail took 561 / 560 ms against 653 / 652 with
+  the switch off (-14 %); a 20-token tail (120 rows, the blocks) 851 ms on both;
+  prefill 232.4-232.7 s on every arm. Decode's 4-8-row verify keeps its kernel and
+  route (`code`); at 8 tiles it took 144.5-147.5 ms a verify step (window 245).
+- **Answers** (window 244, `llama-perplexity`, the agent's Q4_K_M with q8_0 /
+  q4_0 KV and FA against the Q8_0 CPU reference, 32 chunks of 512 at ubatch 10,
+  so 60-row calls): mean KLD 0.009329 against 0.009322 switched off, same top
+  96.752 % against 96.777 % (bar: 0.03 nats, 1 point). The red build gives
+  0.888 / 78.63 %, so the arm runs the path.
+
+**16 tiles (128 rows): left out, open.** A 16-tile build passes the op suite
+(wide calls to 21 tokens, the red fails them), served a 20-token tail in 747 ms
+against 851 (-12 %, window 243), and at ubatch 20 gives the switched-off KL
+bit for bit (window 244). Its 4-8-row verify step, which runs the same kernel
+built with larger local arrays, took 147.7-148.7 ms against 144.5-147.5 at 8
+tiles (window 245, on greedy texts that diverged), so the trade between those
+tails and every decode step is not measured yet. It needs the tile switch and
+the tile-sized kernel arrays back (wide-verify3 f165bf9c has them).
+
+*Retracted* (2026-11-14, windows 245-249). A first reading called the 16-tile
+build defective: one greedy 256-token answer after a 22-token question over
+122,880 tokens came back empty in all five 16-tile arms. Window 248 then gave
+the same empty answer at 8 tiles, and window 249 measured the position: the
+package 1.6.2 itself answers it empty, and 30 samples at temperature 1 end at
+once 16 times on the package, 12 on this patch and 11 with it switched off.
+The model puts about 40-50 % on ending there, so the greedy pick flips with the
+B60's rounding on any build; it is no defect of the kernel or the route.
+
+History. The first form of this patch never ran its kernel. Wide calls reached
+the prompt kernel first, and its two red cases mutated dead code. Its perf
+figures (32 rows at 64k keys: 44.5 ms against 139) were the prompt kernel in one
+call. Served, that one call is slower than the blocks: a 20-23-token tail over
+122,880 tokens took 1,178 ms against 845 ms (window 240, package 1.6.2 with
+`GGML_OPENCL_FA_ROW_BLOCKS=0`), which confirms 0028's own measurement.
+`test-backend-ops` perf is no basis for that comparison with quantized K/V: its
+K/V tensors are flattened, and the dispatcher rebuilds them to blocks once per
+call, so the blocks pay it once per block. Its 24-tile builds measured the
+`flash_attn_f32_f16` fallback (the kernel does not build at 256 GRF), and its
+first launches on wide rows crashed on a base that read the page table of an
+unpaged call (fixed in kv-ringaos).
