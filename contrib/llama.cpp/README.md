@@ -6095,6 +6095,30 @@ builds stay the same; nothing is built for the switch when it is off.
    each; a rollback-heavy verify (a long draft, repeated cuts) is the one to
    watch.
 
+**0086/0087 fix (2026-11-14): qwen35moe had no replay branch** (`measured-here`, the
+coder on the A770 with `LLAMA_GDN_REPLAY=1`, the separate MTP head file; then
+device-free on the CPU backend). The gate in `llama_memory_recurrent` admits
+qwen35, qwen35moe and qwen4exp, and `build_recurrent_attn` takes the replay
+when `inp->s_rpl_ctrl` is set, but 0086/0087 added the state branch to
+`src/models/qwen35.cpp` and `qwen4exp.cpp` only. `qwen35moe.cpp`'s
+`build_layer_attn_linear` stayed on the snapshot gather `build_rs(inp, ...)`,
+which reads `s_copy`, so `rs_s_rpl_rows` was an input object no node consumed.
+The graph allocator gives an unread input no buffer, and the first decode's
+`rs_set_input_rpl` (`src/llama-graph.cpp:402`) asked
+`ggml_backend_buffer_is_host(s_rpl_rows->buffer)`: `GGML_ASSERT(buffer)` in
+`ggml_backend_buffer_get_type` (`ggml/src/ggml-backend.cpp:346` at the pin plus
+the series; 346 is get_type, get_usage's assert is at 341). The same command
+without the variable served, because the branch is never taken then. The fix
+is the hunk in `0000-07-gdn-and-fusions.patch` that qwen35moe's state builder
+already carried for the rows form: it gains the `gdn_rpl` branch (state
+`build_rs(ssm_states_all, s_rpl_rows, s_rpl_main, ...)`, rows form off under
+replay), the text qwen35 and qwen4exp have. With it, `rs_s_rpl_rows` is read by
+the gather (13 input tensors, 12 before), the decode passes, and the
+checkpoint's partial state save (base + pending records) writes. Device-free
+cell: `tests/python/test_gdn_replay_model_branches.py` (text, red on the fault
+with the qwen35moe branch dropped, green with it). Card arms unchanged; the
+coder's replay arm still owes its served record.
+
 ## 0088-opencl-gqa-int8-qk.patch
 
 The GQA decode kernel's Q Kᵀ on the XMX units straight from the quantized
