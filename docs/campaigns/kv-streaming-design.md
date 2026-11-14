@@ -607,8 +607,13 @@ row counts and the strides those tensors have; every table entry indexes inside
 the pool or the ring. The failure is inside one *type path* (staged K for q8_0,
 q4_0 V staging, or 0088's int8 b operand); f16 reads the ring per lane and
 passes. Three isolation runs are named in README 0123zz
-(`-DGQA_K_DIRECT`, `GQA_I8=0`, `F16KV_BLOCK=4096`) and the fix is owed after
-them. No kernel change this round.
+(`-DGQA_K_DIRECT`, `GQA_I8=0`, `F16KV_BLOCK=4096`), and `0123zzz` adds the pair
+arms that name the defect's side in one run: `q8_0/q8_0` and `q4_0/q4_0` at a
+ring (6 rows) and `q8_0/q8_0` prefill (512 rows) -- 3 of 3 on the CPU
+(`measured-here`; recipe green `ff547dc0`, 41 of 41). A pass on `q8_0/q8_0`
+with `q8_0/q4_0` failing names the q4_0 V side; both quantized pairs failing
+names the K side. No kernel change this round; the fix is owed after those
+lines.
 
 
 **Window 226's finding, fixed** (`0123zz`, 2026-11-14): all 10 paged cases were
