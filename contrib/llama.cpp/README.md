@@ -7393,8 +7393,8 @@ Measured on the B60 (`measured-here`, 2026-11-14):
   command line, a 122,880-token prefix, 16 follow-up tails each, arms in
   A B C C B A order): a 10-token tail took 561 / 560 ms against 653 / 652 with
   the switch off (-14 %); a 20-token tail (120 rows, the blocks) 851 ms on both;
-  prefill 232.4-232.7 s on every arm. Decode (window 245): 144.5-147.5 ms a
-  verify step, unchanged.
+  prefill 232.4-232.7 s on every arm. Decode's 4-8-row verify keeps its kernel and
+  route (`code`); at 8 tiles it took 144.5-147.5 ms a verify step (window 245).
 - **Answers** (window 244, `llama-perplexity`, the agent's Q4_K_M with q8_0 /
   q4_0 KV and FA against the Q8_0 CPU reference, 32 chunks of 512 at ubatch 10,
   so 60-row calls): mean KLD 0.009329 against 0.009322 switched off, same top
