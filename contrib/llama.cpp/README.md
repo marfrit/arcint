@@ -6960,7 +6960,7 @@ Paged K/V for `GGML_OP_FLASH_ATTN_EXT`, its CPU reference, and the backend
 refusal that keeps an unported backend from reading a pool as if it were the
 whole layer (design: `docs/campaigns/kv-streaming-design.md`, increment I1;
 reference: the fork's `1f6e1fccc`, `ggml/include/ggml.h:2528-2560`). Evidence
-class `code` for the mechanism (`~/src/achyudh-ref` at `b540a4b9b`), `code`
+class `code` for the mechanism (the fork's checkout at `b540a4b9b`), `code`
 for arcint; the cell below is the only number and it is not a rate.
 
 - **API** (`ggml/include/ggml.h`): `ggml_flash_attn_ext_set_pages(a, pages,
