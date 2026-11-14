@@ -7366,7 +7366,12 @@ case `kv=8192, nb=512, f16, ring_every=2, n_slots=16`: 8,192 keys over a
 4,096-row pool). The quantized pairs already took the gather (each key's row
 from the pool or the ring into f16 blocks, then the f16 kernel); paged f16 now
 takes it too. One condition, `kv_pages == nullptr`, on the in-place branch
-(`code`). Card result: see the next window's record.
+(`code`).
+
+Measured on the B60 (`measured-here`, 2026-11-14, window 250): all 18 paged
+cases pass on the series through this patch (pin + 8658e830); the tree without
+it (03fcccd9) fails exactly the f16 ring prefill (17 of 18). The full
+`FLASH_ATTN_EXT` suite on the fixed tree: 3,115 of 3,115.
 
 ## 0124-opencl-fa-wide-verify.patch
 
