@@ -125,10 +125,10 @@ int main() {
     // several streams or a transposed V are refused rather than mapped wrong.
     CHECK(count(cache_c, "stream ? stream->row((uint32_t) c) : c") == 2,
           "set_input_k_idxs and set_input_v_idxs map the cell through the page map");
-    CHECK(has(cache_c, "stream->get_rows(map_layer_ids[il], false"), "the state save reads K rows where they live");
-    CHECK(has(cache_c, "stream->get_rows(map_layer_ids[il], true"), "the state save reads V rows where they live");
-    CHECK(has(cache_c, "stream->set_rows(map_layer_ids[il], false"), "the state restore writes K rows where they live");
-    CHECK(has(cache_c, "stream->set_rows(map_layer_ids[il], true"), "the state restore writes V rows where they live");
+    CHECK(has(cache_c, "stream->get_rows(map_layer_ids.at(il), false"), "the state save reads K rows where they live");
+    CHECK(has(cache_c, "stream->get_rows(map_layer_ids.at(il), true"), "the state save reads V rows where they live");
+    CHECK(has(cache_c, "stream->set_rows(map_layer_ids.at(il), false"), "the state restore writes K rows where they live");
+    CHECK(has(cache_c, "stream->set_rows(map_layer_ids.at(il), true"), "the state restore writes V rows where they live");
     CHECK(has(cache_c, "stream->clear();"), "clear() forgets the page map");
     CHECK(has(cache_c, "KV streaming does not support a KV window (kv_win > 0)"),
           "a KV window with the stream on is refused");
