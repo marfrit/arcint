@@ -1,6 +1,6 @@
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -13929,6 +13929,17 @@
+@@ -13929,6 +13929,24 @@
      }
  
  #ifdef GGML_OPENCL_SOA_Q
@@ -14,28 +14,17 @@
 +    if (cl_plain_part) {
 +        GGML_ASSERT(!(tensor->type == GGML_TYPE_Q8_0 ? ggml_cl_is_q8_0_soa(tensor) : ggml_cl_is_q4_0_soa(tensor)) &&
 +                    "a partial write into a flattened tensor");
++        ggml_tensor_extra_cl * extra_plain = (ggml_tensor_extra_cl *) tensor->extra;
++        GGML_ASSERT(extra_plain);
++        if (!ggml_cl_stage_write(backend_ctx, buffer, extra_plain->data_device, extra_plain->offset + offset, data, size)) {
++            CL_CHECK(clEnqueueWriteBuffer(queue, extra_plain->data_device, CL_TRUE, extra_plain->offset + offset,
++                                          size, data, 0, NULL, NULL));
++        }
++        return;
 +    }
      if (tensor->type == GGML_TYPE_Q1_0) {
          ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
          GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
-@@ -14013,7 +14024,7 @@
-     // original weights into a temporary buffer, then create two separate
-     // buffers for quantized bits and scales, which are then populated by the
-     // conversion kernel.
--    if (tensor->type == GGML_TYPE_Q4_0) {
-+    if (tensor->type == GGML_TYPE_Q4_0 && !cl_plain_part) {
-         // Views can't SoA-ify here — parent owns the layout (see q8_0 guard).
-         if (tensor->view_src != nullptr || !ggml_is_contiguous(tensor)) {
-             return;
-@@ -14749,7 +14760,7 @@
- 
-         return;
-     }
--    if (tensor->type == GGML_TYPE_Q8_0) {
-+    if (tensor->type == GGML_TYPE_Q8_0 && !cl_plain_part) {
-         // Views share the parent's buffer; parent owns SoA conversion.
-         if (tensor->view_src != nullptr || !ggml_is_contiguous(tensor)) {
-             return;
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -1,5 +1,7 @@
