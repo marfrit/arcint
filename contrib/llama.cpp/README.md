@@ -7354,3 +7354,42 @@ is the K side; if `q4_0 / q4_0` alone fails, it is the q4_0 K staged loader.
 **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host): the three
 cases with a ring pass on the CPU (3 of 3), so the case data and table are
 well-formed. **Not on a card:** the next window's run.
+
+## 0124-opencl-fa-wide-verify.patch
+
+A verify of 9 to 64 query rows (more than 8 drafts, several lanes' verifies in
+one ubatch, a short prompt tail) runs as one call of the GQA decode kernel
+(`flash_attn_gqa_dpas.cl`) when its (head, token) rows fit the kernel's row
+tiles, instead of 0028's blocks of 8 rows. K/V is then staged once per
+work-group for all rows, where the blocks stage it once per block.
+
+- **Tiles:** `GGML_OPENCL_FA_GQA_TILES` = 8 (default, 64 rows: 10 tokens at the
+  dense 27B's 6 query heads a KV head) or 16 (128 rows, 21 tokens). The kernel
+  is built at 256 GRF a thread; its work-group is sides x tiles x 16
+  work-items and must fit `CL_KERNEL_WORK_GROUP_SIZE`. 24 and 32 tiles do not
+  build on the B60 (`measured-here`: the kernel is refused at load and the
+  decode falls back to `flash_attn_f32_f16`).
+- **Routing:** the decision is made after the op parameters are read (it needs
+  the K/V pair, ALiBi and softcap) and only when the GQA kernel for the pair is
+  built. A wide call skips the prompt kernel (`flash_attn_dpas.cl`) and the K/V
+  dequantization, and runs with the Intel decode settings of the 4-8-row GQA
+  calls (split size, partial buffer). Calls that do not fit keep the blocks.
+  4-8-row calls route as before. Paged K/V takes the same call (the kernel
+  reads the page table).
+- **Kernel:** the local arrays sized for 8 tiles (the S exchange, the int8 Q
+  operand and its scales, `fa_gqa_i8_stage_rows`) follow `GQA_TILES`.
+- **Switches:** `GGML_OPENCL_FA_WIDE_VERIFY=0` keeps the blocks;
+  `GGML_OPENCL_FA_DEBUG=1` logs each call's form, rows and tiles.
+- **Tests:** `test-backend-ops` cases at the agent's geometry, 9, 10, 17, 21 and
+  32 tokens, f16 and q8_0 / q4_0, and two paged verifies (10 and 17 rows).
+
+History (`measured-here`, B60, 2026-11-14). The first form of this patch never
+ran its kernel. Wide calls reached the prompt kernel first, and its two red
+cases mutated dead code. Its perf figures (32 rows at 64k keys: 44.5 ms against
+139) were the prompt kernel in one call. Served, that one call is slower than
+the blocks: a 20-23-token tail over 122,880 tokens took 1,178 ms against
+845 ms (window 240, package 1.6.2 with `GGML_OPENCL_FA_ROW_BLOCKS=0`), which
+confirms 0028's own measurement. `test-backend-ops` perf is no basis for that
+comparison with quantized K/V: its K/V tensors are flattened, and the
+dispatcher rebuilds them to blocks once per call, so the blocks pay it once
+per block. This form is the first to launch the GQA kernel on wide rows.
