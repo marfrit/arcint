@@ -1,0 +1,498 @@
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 9fc1d17..8ca15f7 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -3025,14 +3025,19 @@ struct ggml_cplan ggml_graph_plan(
+                             const struct ggml_tensor * v = node->src[2];
+                             const int64_t n_kv = pages->ne[0]*ggml_get_op_params_i32(node, GGML_FA_PARAM_PAGE_SIZE);
+                             cur += n_kv*(ggml_row_size(k->type, k->ne[0])*k->ne[2] + ggml_row_size(v->type, v->ne[0])*v->ne[2]);
+-                            // a mask narrower than the attended K/V is widened into visible columns first
+-                            const int64_t col0 = ggml_flash_attn_ext_mask_col0(node);
+-                            if (col0 > 0) {
+-                                const struct ggml_tensor * mask = node->src[3];
+-                                cur += (size_t)n_kv*mask->ne[1]*mask->ne[2]*mask->ne[3]*sizeof(ggml_fp16_t);
+-                            }
+                             cur += 2*CACHE_LINE_SIZE;
+                         }
++                        // a mask narrower than the attended K/V is widened into visible
++                        // columns first. The paged path runs whenever the mask is
++                        // offset, with or without a page table (0119 review E): the
++                        // reservation must not hang on `pages`
++                        const int64_t col0 = ggml_flash_attn_ext_mask_col0(node);
++                        if (col0 > 0) {
++                            const struct ggml_tensor * mask = node->src[3];
++                            const int64_t n_kv = pages ? pages->ne[0]*ggml_get_op_params_i32(node, GGML_FA_PARAM_PAGE_SIZE)
++                                                        : node->src[1]->ne[1];
++                            cur += (size_t)n_kv*mask->ne[1]*mask->ne[2]*mask->ne[3]*sizeof(ggml_fp16_t);
++                        }
+                     } break;
+                 case GGML_OP_FLASH_ATTN_BACK:
+                     {
+diff --git a/ggml/src/ggml-opencl/ggml-opencl-fa-paged.h b/ggml/src/ggml-opencl/ggml-opencl-fa-paged.h
+index 8a64801..b253808 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl-fa-paged.h
++++ b/ggml/src/ggml-opencl/ggml-opencl-fa-paged.h
+@@ -2,9 +2,17 @@
+ 
+ // The paged FLASH_ATTN_EXT predicate (0119's page table, 0122/0123z's kernels),
+ // as plain data so a device-free test drives the same logic the backend's
+-// supports_op runs (arcint's tests/test_fa_paged_predicate.cpp). The kernel
+-// improvements live in flash_attn_gqa_dpas.cl (decode) and flash_attn_dpas.cl's
+-// conversion (prefill); a false here must mean the kernel cannot read the case.
++// supports_op runs and the dispatcher aborts on (arcint's
++// tests/test_fa_paged_predicate.cpp). The kernel improvements live in
++// flash_attn_gqa_dpas.cl (decode) and flash_attn_dpas.cl's conversion
++// (prefill); a false here must mean the kernel cannot read the case, and a
++// true must mean the dispatcher takes the GQA decode kernel or the f16-block
++// prefill conversion -- the two forms that read a page table.
++//
++// Patch 0123zzzzz6 (I5 review C/D): one predicate for both sides. The shape's
++// rows, mask and op params and the caps' built kernels and switches decide the
++// form; the dispatcher calls it before choosing, so supports_op cannot accept a
++// shape the dispatcher would abort on.
+ 
+ #include "ggml.h"
+ 
+@@ -13,20 +21,35 @@
+ struct ggml_cl_fa_paged_shape {
+     // tensor types, as enum ggml_type values
+     int q_type, k_type, v_type;
+-    // dimensions of q, k, v at the index positions (0 the head width, 1 the
+-    // cells, 2 the heads, 3 the streams)
++    // q rows, heads, streams; k/v head width, heads, streams
+     int64_t q_ne1, q_ne2, q_ne3;
+     int64_t k_ne0, k_ne2, k_ne3;
+     int64_t v_ne0, v_ne2, v_ne3;
+-    // the page table: I32, contiguous, [n_pages, n_tables]
++    // the attention mask beside the op: type, rows, columns, heads, streams
++    bool    mask_present;
++    int     mask_type;
++    int64_t mask_ne0, mask_ne1, mask_ne2, mask_ne3;
++    // the op's params: ALiBi slope, logit softcap, sinks present
++    float   max_bias, logit_softcap;
++    bool    sinks_present;
++    // causal attention, the batch of K/V batches, the page table's shape
++    bool    causal;
++    int64_t n_batch;
+     bool    table_ok;
+-    // a full-width mask (a compact mask is I5's)
+-    bool    mask_ok;
+     // the ring rows are whole pages and its K/V pair is present or absent together
+     bool    ring_ok;
+-    // the kernels that read the shape are built: the GQA decode kernel for rows
+-    // within its cap, the conversion + f16 prompt kernel for a prompt
+-    bool    kernels_decode, kernels_prefill;
++};
++
++struct ggml_cl_fa_paged_caps {
++    // the GQA decode kernels (direct and staged) and the f16 conversion and
++    // carry prefill kernels are built, for this K/V pair at head size 256
++    bool kernels_gqa_direct, kernels_gqa_staged, kernels_prefill;
++    // the Intel split decode kernel for this pair is built (0123's q1 split)
++    bool split_decode;
++    // one work-group holds `tiles` 8-row (head, token) tiles
++    int  tiles;
++    // GGML_OPENCL_FA_WIDE_VERIFY and GGML_OPENCL_FA_INTEL_SPLIT switches
++    bool wide_on, intel_split_on;
+ };
+ 
+ // the KV pair the kernels were built for
+@@ -50,10 +73,63 @@ static inline bool ggml_cl_fa_paged_shape_ok(const ggml_cl_fa_paged_shape & s) {
+            s.k_ne2 > 0 && s.v_ne2 == s.k_ne2 && s.q_ne2 % s.k_ne2 == 0;
+ }
+ 
++// the mask the kernels read: an f16 mask a page wide per query row; a call
++// without a mask attends the whole page table
++static inline bool ggml_cl_fa_paged_mask_ok(const ggml_cl_fa_paged_shape & s) {
++    return !s.mask_present ||
++           (s.mask_type == GGML_TYPE_F16 && s.mask_ne1 >= s.q_ne1 && s.mask_ne2 >= 1);
++}
++
++// no ALiBi, no softcap, no sinks: the paged kernels take plain attention
++static inline bool ggml_cl_fa_paged_params_ok(const ggml_cl_fa_paged_shape & s) {
++    return !s.sinks_present && s.max_bias == 0.0f && s.logit_softcap == 0.0f;
++}
++
++// the form the dispatcher takes for this shape: 1 = GQA decode (one work-group
++// per KV head and split), 2 = f16-block prefill conversion, 0 = no paged form
++static inline int ggml_cl_fa_paged_form(const ggml_cl_fa_paged_shape & s, const ggml_cl_fa_paged_caps & c) {
++    if (!s.table_ok || !ggml_cl_fa_paged_kv_ok(s) || !ggml_cl_fa_paged_shape_ok(s) ||
++        !ggml_cl_fa_paged_mask_ok(s) || !ggml_cl_fa_paged_params_ok(s) || !s.ring_ok) {
++        return 0;
++    }
++    const int64_t G = s.q_ne2 / s.k_ne2;
++    const bool gqa_kernel = c.kernels_gqa_direct || c.kernels_gqa_staged;
++    // decode, non-causal only: 1-8 rows on the split kernel (its own work-group
++    // shape, not the GQA tiles), 9-64 rows on the wide GQA call (one batch, one
++    // stream's mask, fitting the 8-row (head, token) tiles) -- the dispatcher's
++    // intel_q_decode / gqa_wide split
++    if (!s.causal) {
++        const bool rows8  = s.q_ne1 >= 1 && s.q_ne1 <= 8 && c.split_decode && c.intel_split_on;
++        const bool rows64 = s.q_ne1 > 8 && s.q_ne1 <= 64 && gqa_kernel && c.wide_on &&
++                            s.n_batch == 1 && s.mask_present && s.mask_ne2 == 1 &&
++                            G*s.q_ne1 <= (int64_t) c.tiles*8;
++        if (rows8 || rows64) {
++            return 1;
++        }
++    }
++    // prefill, or any rows the split decode does not take: the f16 conversion
++    // reads the table for every row count
++    if (c.kernels_prefill) {
++        return 2;
++    }
++    return 0;
++}
++
+ // true exactly where the kernels handle a paged case
+-static inline bool ggml_cl_fa_paged_ok(const ggml_cl_fa_paged_shape & s) {
+-    const bool gqa_rows = (s.q_ne2 / s.k_ne2) * s.q_ne1 <= 64;   // the decode kernel's cap
+-    const bool kernels_ok = gqa_rows ? s.kernels_decode : s.kernels_prefill;
+-    return s.table_ok && ggml_cl_fa_paged_kv_ok(s) && ggml_cl_fa_paged_shape_ok(s) &&
+-           s.mask_ok && s.ring_ok && kernels_ok;
++static inline bool ggml_cl_fa_paged_ok(const ggml_cl_fa_paged_shape & s, const ggml_cl_fa_paged_caps & c) {
++    return ggml_cl_fa_paged_form(s, c) != 0;
++}
++
++// the reason a shape was declined, for the DOWNGRADE line and the debug print
++static inline const char * ggml_cl_fa_paged_reason(const ggml_cl_fa_paged_shape & s, const ggml_cl_fa_paged_caps & c) {
++    if (!s.table_ok)             return "page-table";
++    if (!ggml_cl_fa_paged_kv_ok(s)) return "kv-type";
++    if (!ggml_cl_fa_paged_shape_ok(s)) return "shape";
++    if (!ggml_cl_fa_paged_mask_ok(s)) return "mask";
++    if (!ggml_cl_fa_paged_params_ok(s)) return "sinks-alibi-softcap";
++    if (!s.ring_ok)               return "ring";
++    if (s.q_ne1 > 8 && (s.q_ne2/s.k_ne2)*s.q_ne1 > (int64_t) c.tiles*8) return "rows";
++    if (!c.kernels_gqa_direct && !c.kernels_gqa_staged &&
++        !c.kernels_prefill)       return "no-kernel";
++    return "no-form";
+ }
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index efa9e9d..fa51979 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -12841,18 +12841,29 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                 const ggml_tensor * k = op->src[1];
+                 const ggml_tensor * v = op->src[2];
+                 const ggml_tensor * pages = op->src[GGML_FA_SRC_PAGES];
++                const ggml_tensor * mask = op->src[3];
+                 const int32_t table_row = ggml_get_op_params_i32(op, GGML_FA_PARAM_PAGES_ROW);
+                 ggml_cl_fa_paged_shape sh{};
+                 sh.q_type = (int) q->type; sh.k_type = (int) k->type; sh.v_type = (int) v->type;
+                 sh.q_ne1 = q->ne[1]; sh.q_ne2 = q->ne[2]; sh.q_ne3 = q->ne[3];
+                 sh.k_ne0 = k->ne[0]; sh.k_ne2 = k->ne[2]; sh.k_ne3 = k->ne[3];
+                 sh.v_ne0 = v->ne[0]; sh.v_ne2 = v->ne[2]; sh.v_ne3 = v->ne[3];
++                sh.mask_present = mask != nullptr;
++                if (mask) {
++                    sh.mask_type = (int) mask->type;
++                    sh.mask_ne0 = mask->ne[0]; sh.mask_ne1 = mask->ne[1];
++                    sh.mask_ne2 = mask->ne[2]; sh.mask_ne3 = mask->ne[3];
++                }
++                memcpy(&sh.max_bias,      (const float *) op->op_params + 1, sizeof(float));
++                memcpy(&sh.logit_softcap, (const float *) op->op_params + 2, sizeof(float));
++                sh.sinks_present = op->src[4] != nullptr;
++                // the dispatcher takes is_causal = 0 for every call (mask-shaped)
++                sh.causal = false;
++                sh.n_batch = k->ne[3];
+                 sh.table_ok = pages->type == GGML_TYPE_I32 && ggml_is_contiguous(pages) &&
+                               pages->ne[2] == 1 && pages->ne[3] == 1 &&
+                               table_row >= 0 && table_row < pages->ne[1] &&
+                               ggml_get_op_params_i32(op, GGML_FA_PARAM_PAGE_SIZE) == 256;
+-                sh.mask_ok = op->src[3] == nullptr ||
+-                             (op->src[3]->type == GGML_TYPE_F16 && op->src[3]->ne[0] == pages->ne[0]*256);
+                 sh.ring_ok = op->src[GGML_FA_SRC_RING_K] == nullptr ||
+                              (op->src[GGML_FA_SRC_RING_K]->ne[1] % 256 == 0 &&
+                               op->src[GGML_FA_SRC_RING_V] != nullptr &&
+@@ -12861,17 +12872,30 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                 load_cl_kernels(backend_ctx);
+                 const int gi = k->type == GGML_TYPE_Q8_0 ? (v->type == GGML_TYPE_Q8_0 ? 1 : 2)
+                              : k->type == GGML_TYPE_Q4_0 ? 3 : 0;
+-                sh.kernels_decode = backend_ctx->kernel_fa_gqa_dk[0][gi] != nullptr ||
+-                                    backend_ctx->kernel_fa_gqa_st_dk[0][gi] != nullptr;
+-                sh.kernels_prefill = backend_ctx->kernel_fa_kv_to_f16 != nullptr &&
+-                                     (backend_ctx->kernel_fa_dpas_carry_dk[0] != nullptr ||
+-                                      backend_ctx->kernel_fa_dpas_q_dk[0] != nullptr);
+-                const bool ok = ggml_cl_fa_paged_ok(sh);
++                ggml_cl_fa_paged_caps cp{};
++                // head size 256: the GQA arrays' index 0 (the paged shape check refuses others)
++                cp.kernels_gqa_direct = backend_ctx->kernel_fa_gqa_dk[0][gi] != nullptr;
++                cp.kernels_gqa_staged = backend_ctx->kernel_fa_gqa_st_dk[0][gi] != nullptr;
++                cp.kernels_prefill    = backend_ctx->kernel_fa_kv_to_f16 != nullptr &&
++                                        backend_ctx->kernel_fa_dpas_carry_dk[0] != nullptr;
++                const std::pair<int, int> dk_dv = {256, 256};
++                cp.split_decode = backend_ctx->fa.f32_merge.count(dk_dv) > 0 &&
++                                  backend_ctx->fa.q_q1_split_intel.count(dk_dv) > 0 &&
++                                  backend_ctx->fa.q_q1_split_intel.at(dk_dv)[gi] != nullptr;
++                cp.tiles = backend_ctx->fa_gqa_tiles;
++                static const char * wv_env2 = getenv("GGML_OPENCL_FA_WIDE_VERIFY");
++                cp.wide_on = wv_env2 == nullptr || atoi(wv_env2) != 0;
++                static const char * fd_env2 = getenv("GGML_OPENCL_FA_INTEL_SPLIT");
++                cp.intel_split_on = fd_env2 == nullptr || atoi(fd_env2) != 0;
++                const bool ok = ggml_cl_fa_paged_ok(sh, cp);
+                 if (getenv("GGML_OPENCL_FA_PAGED_DEBUG")) {
+-                    GGML_LOG_INFO("ggml_opencl: paged FA: table %d kv %d shape %d mask %d ring %d "
+-                                  "gqa-kernel %d prefill-kernel %d -> %d\n",
+-                                  sh.table_ok, ggml_cl_fa_paged_kv_ok(sh), ggml_cl_fa_paged_shape_ok(sh),
+-                                  sh.mask_ok, sh.ring_ok, sh.kernels_decode, sh.kernels_prefill, ok);
++                    GGML_LOG_INFO("ggml_opencl: paged FA: form %d (reason %s) kv %d shape %d mask %d params %d ring %d "
++                                  "gqa %d/%d prefill %d split %d -> %d\n",
++                                  ggml_cl_fa_paged_form(sh, cp), ggml_cl_fa_paged_reason(sh, cp),
++                                  ggml_cl_fa_paged_kv_ok(sh), ggml_cl_fa_paged_shape_ok(sh),
++                                  ggml_cl_fa_paged_mask_ok(sh), ggml_cl_fa_paged_params_ok(sh),
++                                  sh.ring_ok, cp.kernels_gqa_direct, cp.kernels_gqa_staged, cp.kernels_prefill,
++                                  cp.split_decode, ok);
+                 }
+                 return ok;
+             }
+@@ -24689,6 +24713,56 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     // form (0089) rather than the split kernel, which would attend the pool as
+     // the whole layer
+     const int fg_min_rows_paged = kv_pages ? 1 : fg_min_rows;
++    // the paged predicate (the same one supports_op runs) decides the form: 1 the
++    // GQA decode kernel, 2 the f16-block prefill conversion; 0 must never reach
++    // here, since supports_op declines it and the scheduler sends it elsewhere
++    int paged_form = 0;
++    if (kv_pages) {
++        ggml_cl_fa_paged_shape sh{};
++        sh.q_type = (int) q->type; sh.k_type = (int) k->type; sh.v_type = (int) v->type;
++        sh.q_ne1 = q->ne[1]; sh.q_ne2 = q->ne[2]; sh.q_ne3 = q->ne[3];
++        sh.k_ne0 = k->ne[0]; sh.k_ne2 = k->ne[2]; sh.k_ne3 = k->ne[3];
++        sh.v_ne0 = v->ne[0]; sh.v_ne2 = v->ne[2]; sh.v_ne3 = v->ne[3];
++        sh.mask_present = mask != nullptr;
++        if (mask) {
++            sh.mask_type = (int) mask->type;
++            sh.mask_ne0 = mask->ne[0]; sh.mask_ne1 = mask->ne[1];
++            sh.mask_ne2 = mask->ne[2]; sh.mask_ne3 = mask->ne[3];
++        }
++        sh.max_bias = max_bias;
++        sh.logit_softcap = logit_softcap;
++        sh.sinks_present = dst->src[4] != nullptr;
++        sh.causal = is_causal;
++        sh.n_batch = k->ne[3];
++        const int32_t table_row = ggml_get_op_params_i32(dst, GGML_FA_PARAM_PAGES_ROW);
++        sh.table_ok = kv_pages->type == GGML_TYPE_I32 && ggml_is_contiguous(kv_pages) &&
++                      kv_pages->ne[2] == 1 && kv_pages->ne[3] == 1 &&
++                      table_row >= 0 && table_row < kv_pages->ne[1] && kv_page_size == 256;
++        const ggml_tensor * pk = dst->src[GGML_FA_SRC_RING_K];
++        const ggml_tensor * pv = dst->src[GGML_FA_SRC_RING_V];
++        sh.ring_ok = pk == nullptr || (pk->ne[1] % 256 == 0 && pv != nullptr && pv->ne[1] == pk->ne[1]);
++        const int pgi = k->type == GGML_TYPE_Q8_0 ? (v->type == GGML_TYPE_Q8_0 ? 1 : 2)
++                      : k->type == GGML_TYPE_Q4_0 ? 3 : 0;
++        ggml_cl_fa_paged_caps cp{};
++        cp.kernels_gqa_direct = backend_ctx->kernel_fa_gqa_dk[0][pgi] != nullptr;
++        cp.kernels_gqa_staged = backend_ctx->kernel_fa_gqa_st_dk[0][pgi] != nullptr;
++        cp.kernels_prefill    = backend_ctx->kernel_fa_kv_to_f16 != nullptr &&
++                                backend_ctx->kernel_fa_dpas_carry_dk[0] != nullptr;
++        const std::pair<int, int> pdk = {256, 256};
++        cp.split_decode = backend_ctx->fa.f32_merge.count(pdk) > 0 &&
++                          backend_ctx->fa.q_q1_split_intel.count(pdk) > 0 &&
++                          backend_ctx->fa.q_q1_split_intel.at(pdk)[pgi] != nullptr;
++        cp.tiles = backend_ctx->fa_gqa_tiles;
++        static const char * wv_env2 = getenv("GGML_OPENCL_FA_WIDE_VERIFY");
++        cp.wide_on = wv_env2 == nullptr || atoi(wv_env2) != 0;
++        static const char * fd_env2 = getenv("GGML_OPENCL_FA_INTEL_SPLIT");
++        cp.intel_split_on = fd_env2 == nullptr || atoi(fd_env2) != 0;
++        paged_form = ggml_cl_fa_paged_form(sh, cp);
++        if (paged_form == 0) {
++            GGML_ABORT("ggml_opencl: a paged FLASH_ATTN_EXT reached the dispatcher with a declined shape (%s)",
++                       ggml_cl_fa_paged_reason(sh, cp));
++        }
++    }
+     bool use_fd_gqa = false;
+     if ((use_fd_intel || (gqa_wide && !is_causal)) && n_q >= fg_min_rows_paged && fa_dki >= 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
+         n_head_kv > 0 && n_head % n_head_kv == 0 && (n_head / n_head_kv) * n_q <= backend_ctx->fa_gqa_tiles * 8) {
+@@ -24707,10 +24781,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+             use_fd_intel = true;
+         }
+     }
+-    // a paged op must end up on the GQA kernel; any other kernel would read the
+-    // pool rows as the attended sequence (supports_op declines those shapes)
+-    if (kv_pages && !use_fd_gqa && n_q <= 8) {
+-        GGML_ABORT("ggml_opencl: a paged FLASH_ATTN_EXT reached a kernel without a page table");
++    // a paged decode (form 1) must end up on the GQA kernel; any other kernel
++    // would read the pool rows as the attended sequence. Form 2 (anything the
++    // split decode does not take) goes through the f16 conversion below
++    if (kv_pages && paged_form == 1 && !use_fd_gqa) {
++        GGML_ABORT("ggml_opencl: a paged decode FLASH_ATTN_EXT reached a kernel without a page table");
+     }
+     if (fd_k_split == NULL &&
+         n_q >= 1 && n_q <= fd_max_n_q && n_kv >= FD_MIN_N_KV && !is_causal &&
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 3be9906..f7885cc 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3432,7 +3432,14 @@ ggml_tensor * llm_graph_context::build_attn(
+     // the streamed pages from its ring slot; build_attn_mha already expanded the node
+     if (inp->self_kv_pages && inp->self_kv_ring_k[(size_t) il] != nullptr) {
+         const auto & fa = res->get_fused_nodes().back();
+-        GGML_ASSERT(fa.op == LLM_FUSED_OP_FLASH_ATTN && fa.il == il);
++        // the kqv node must be the fused flash attention: the streamed pages are read
++        // by the paged FLASH_ATTN_EXT kernel and nothing else. A build that resolved
++        // flash attention off is refused here, before the graph runs (0119 review G)
++        if (fa.op != LLM_FUSED_OP_FLASH_ATTN || fa.il != il) {
++            throw std::runtime_error("KV streaming needs flash attention; this build's attention "
++                                     "is not the fused FLASH_ATTN_EXT, so the streamed pages have no "
++                                     "kernel to read them");
++        }
+         ggml_flash_attn_ext_set_pages(fa.tensor, inp->self_kv_pages, mctx_cur->kv_layer_index(il),
+                 llama_kv_stream::page_size, inp->self_kv_ring_k[(size_t) il], inp->self_kv_ring_v[(size_t) il]);
+         ggml_flash_attn_ext_set_host(fa.tensor, inp->self_kv_host_k[(size_t) il],
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 1a35c36..1e91a3e 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -477,6 +477,11 @@ void llama_kv_cache::clear(bool data) {
+         win_head[i] = win_base[i];
+     }
+ 
++    if (stream) {
++        // forget the page map and the ring assignment: a cleared cache has no pages
++        stream->clear();
++    }
++
+     if (data) {
+         for (auto & [_, buf] : ctxs_bufs) {
+             ggml_backend_buffer_clear(buf.get(), 0);
+@@ -1292,7 +1297,12 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch &
+     // with its write-back) and copy the attended pages that stream into the ring slots,
+     // before the graph's store writes and its attention reads them
+     if (stream) {
+-        GGML_ASSERT(sinfo.n_stream() == 1);
++        if (sinfo.n_stream() != 1) {
++            throw std::runtime_error("KV streaming requires one sequence per ubatch");
++        }
++        if (sinfo.kv_win != 0) {
++            throw std::runtime_error("KV streaming does not support a KV window (kv_win > 0)");
++        }
+         stream->prepare(sinfo.idxs[0], get_n_kv(sinfo));
+     }
+ 
+@@ -1838,7 +1848,10 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
+         const int64_t offs = sinfo.strm[s]*get_size();
+ 
+         for (uint32_t i = 0; i < sinfo.size(); ++i) {
+-            data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
++            // KV streaming: SET_ROWS writes into the pool row of the cell's page,
++            // not the cell index (beyond the pool a cell index would land past it)
++            const int64_t c = offs + sinfo.idxs[s][i];
++            data[s*sinfo.size() + i] = stream ? stream->row((uint32_t) c) : c;
+         }
+     }
+ }
+@@ -1855,7 +1868,8 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
+             const int64_t offs = sinfo.strm[s]*get_size();
+ 
+             for (uint32_t i = 0; i < sinfo.size(); ++i) {
+-                data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
++                const int64_t c = offs + sinfo.idxs[s][i];
++                data[s*sinfo.size() + i] = stream ? stream->row((uint32_t) c) : c;
+             }
+         }
+     } else {
+@@ -2633,7 +2647,14 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
+         for (const auto & range : cr.data) {
+             const size_t range_size = range.second - range.first;
+             const size_t buf_size = range_size * k_size_row;
+-            io.write_tensor(k, range.first * k_size_row, buf_size);
++            if (stream) {
++                // the slot rows are the pool, not the cells: gather the cells where they live
++                std::vector<char> tmp(buf_size);
++                stream->get_rows(map_layer_ids.at(il), false, range.first, range.second, tmp.data());
++                io.write(tmp.data(), buf_size);
++            } else {
++                io.write_tensor(k, range.first * k_size_row, buf_size);
++            }
+         }
+     }
+ 
+@@ -2660,7 +2681,13 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
+             for (const auto & range : cr.data) {
+                 const size_t range_size = range.second - range.first;
+                 const size_t buf_size = range_size * v_size_row;
+-                io.write_tensor(v, range.first * v_size_row, buf_size);
++                if (stream) {
++                    std::vector<char> tmp(buf_size);
++                    stream->get_rows(map_layer_ids.at(il), true, range.first, range.second, tmp.data());
++                    io.write(tmp.data(), buf_size);
++                } else {
++                    io.write_tensor(v, range.first * v_size_row, buf_size);
++                }
+             }
+         }
+     } else {
+@@ -2969,7 +2996,15 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
+         }
+ 
+         for (const auto & r : runs) {
+-            io.read_tensor(k, (size_t) r.from * k_size_row, (size_t) (r.to - r.from) * k_size_row);
++            const size_t buf_size = (size_t) (r.to - r.from) * k_size_row;
++            if (stream) {
++                // scatter the cells where they live; a written page comes back resident
++                std::vector<char> tmp(buf_size);
++                io.read(tmp.data(), buf_size);
++                stream->set_rows(map_layer_ids.at(il), false, r.from, r.to, tmp.data());
++            } else {
++                io.read_tensor(k, (size_t) r.from * k_size_row, buf_size);
++            }
+         }
+     }
+ 
+@@ -3003,7 +3038,14 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
+             }
+ 
+             for (const auto & r : runs) {
+-                io.read_tensor(v, (size_t) r.from * v_size_row, (size_t) (r.to - r.from) * v_size_row);
++                const size_t buf_size = (size_t) (r.to - r.from) * v_size_row;
++                if (stream) {
++                    std::vector<char> tmp(buf_size);
++                    io.read(tmp.data(), buf_size);
++                    stream->set_rows(map_layer_ids.at(il), true, r.from, r.to, tmp.data());
++                } else {
++                    io.read_tensor(v, (size_t) r.from * v_size_row, buf_size);
++                }
+             }
+         }
+     } else {
+diff --git a/src/llama-kv-stream.cpp b/src/llama-kv-stream.cpp
+index 7eb2add..7f459ef 100644
+--- a/src/llama-kv-stream.cpp
++++ b/src/llama-kv-stream.cpp
+@@ -99,7 +99,7 @@ void llama_kv_stream::host_set_page(int32_t ikv, bool is_v, uint32_t page, const
+     }
+ }
+ 
+-void llama_kv_stream::host_get_page(int32_t ikv, bool is_v, uint32_t page, void * dst) {
++void llama_kv_stream::host_get_page(int32_t ikv, bool is_v, uint32_t page, void * dst) const {
+     ggml_tensor * t = is_v ? host_t[(size_t) ikv*2 + 1] : host_t[(size_t) ikv*2 + 0];
+     if (slices_get) {
+         slices_get(t, dst, (int64_t) page, 1);
+@@ -283,7 +283,7 @@ void llama_kv_stream::clear() {
+     layout_id++;
+ }
+ 
+-void llama_kv_stream::get_rows(int32_t ikv, bool is_v, uint32_t c0, uint32_t c1, void * dst) {
++void llama_kv_stream::get_rows(int32_t ikv, bool is_v, uint32_t c0, uint32_t c1, void * dst) const {
+     const size_t row = row_size(ikv, is_v);
+     ggml_tensor * pool = is_v ? layers[ikv].v : layers[ikv].k;
+ 
+diff --git a/src/llama-kv-stream.h b/src/llama-kv-stream.h
+index ce824d0..bba09f3 100644
+--- a/src/llama-kv-stream.h
++++ b/src/llama-kv-stream.h
+@@ -106,7 +106,7 @@ public:
+ 
+     // rows [c0, c1) of layer ikv, wherever they live; for state save/restore and
+     // for a test's integrity probe. The backend must be idle.
+-    void get_rows(int32_t ikv, bool is_v, uint32_t c0, uint32_t c1, void * dst);
++    void get_rows(int32_t ikv, bool is_v, uint32_t c0, uint32_t c1, void * dst) const;
+     void set_rows(int32_t ikv, bool is_v, uint32_t c0, uint32_t c1, const void * src);
+ 
+     // the fork's debug rotation: every resident page goes through the host store
+@@ -120,7 +120,7 @@ private:
+     // host store page access: slices through the OpenCL host-memory entry points
+     // (a USM tensor has no host data pointer), tensor reads/writes on a CPU buffer
+     void host_set_page(int32_t ikv, bool is_v, uint32_t page, const void * src);
+-    void host_get_page(int32_t ikv, bool is_v, uint32_t page, void * dst);
++    void host_get_page(int32_t ikv, bool is_v, uint32_t page, void * dst) const;
+ 
+     void assign(uint32_t page, uint32_t slot);
+     void evict(uint32_t page);
