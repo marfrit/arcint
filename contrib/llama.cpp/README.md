@@ -7334,3 +7334,23 @@ kernel stayed null. Evidence `code` (the source order) + `measured-here`
   predicate logs `kv 0` and declines the agent's pair. **Not compiled on a card**: the
   kernel's next build is Claude's window; the diagnostic line is the clause
   evidence to collect there.
+
+## 0123zzz-tests-fa-paged-pair-isolation.patch
+
+Window 232's pair isolation, three paged cases next to 0123's (design: increment
+I3; no kernel change). The bindings were cleared by the dump: a failing
+q8_0:q4_0 ring case and the passing f16 ring case at the same shape get the same
+table, pool/ring row counts and the strides those tensors have. So the failure
+is inside one type path, and two pair arms name it in one run:
+
+- `q8_0 / q8_0`, 8,192 keys, 6 rows, ring every 2, a 16-page pool;
+- `q4_0 / q4_0`, the same shape;
+- `q8_0 / q8_0`, 512 rows (prefill), the same shape.
+
+If `q8_0 / q8_0` passes while `q8_0 / q4_0` fails, the defect is the q4_0 V
+staging (decode) or V's conversion (prefill); if both quantized pairs fail, it
+is the K side; if `q4_0 / q4_0` alone fails, it is the q4_0 K staged loader.
+
+**Measured, CPU** (`measured-here`, 2026-11-14, the recipe host): the three
+cases with a ring pass on the CPU (3 of 3), so the case data and table are
+well-formed. **Not on a card:** the next window's run.
