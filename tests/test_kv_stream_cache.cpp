@@ -60,6 +60,14 @@ bool has(const std::string & text, const std::string & needle) {
     return text.find(needle) != std::string::npos;
 }
 
+size_t count(const std::string & text, const std::string & needle) {
+    size_t n = 0;
+    for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) {
+        ++n;
+    }
+    return n;
+}
+
 } // namespace
 
 int main() {
@@ -76,6 +84,11 @@ int main() {
     const std::string cache_h   = read_file(dir + "/llama-kv-cache.h");
     const std::string graph_c   = read_file(dir + "/llama-graph.cpp");
     const std::string graph_h   = read_file(dir + "/llama-graph.h");
+#ifdef ARCINT_KV_STREAM_LLAMA_DIR
+    const std::string cpu_plan  = read_file(ARCINT_KV_STREAM_LLAMA_DIR "/ggml/src/ggml-cpu/ggml-cpu.c");
+#else
+    const std::string cpu_plan;
+#endif
 
     // 1. the parameter exists and defaults off
     CHECK(has(llama_h, "uint32_t kv_resident_size"), "include/llama.h has kv_resident_size");
@@ -106,6 +119,31 @@ int main() {
 
     // 5. the decode views read the pool, not the logical context
     CHECK(has(cache_c, "if (stream) {\n        n_kv = k->ne[1];"), "get_k reads the whole pool");
+
+    // 6. 0119 review C: the store indices go through the page map, in both K and V,
+    // and every path that reads or writes rows by cell does the same; a window,
+    // several streams or a transposed V are refused rather than mapped wrong.
+    CHECK(count(cache_c, "stream ? stream->row((uint32_t) c) : c") == 2,
+          "set_input_k_idxs and set_input_v_idxs map the cell through the page map");
+    CHECK(has(cache_c, "stream->get_rows(map_layer_ids[il], false"), "the state save reads K rows where they live");
+    CHECK(has(cache_c, "stream->get_rows(map_layer_ids[il], true"), "the state save reads V rows where they live");
+    CHECK(has(cache_c, "stream->set_rows(map_layer_ids[il], false"), "the state restore writes K rows where they live");
+    CHECK(has(cache_c, "stream->set_rows(map_layer_ids[il], true"), "the state restore writes V rows where they live");
+    CHECK(has(cache_c, "stream->clear();"), "clear() forgets the page map");
+    CHECK(has(cache_c, "KV streaming does not support a KV window (kv_win > 0)"),
+          "a KV window with the stream on is refused");
+
+    // 7. 0119 review G: a stream-on graph whose attention is not the fused flash
+    // attention is refused rather than asserted, and the served rule has no red switch
+    CHECK(has(graph_c, "KV streaming needs flash attention"), "a stream-on graph without fused FA is refused");
+
+    // 8. 0119 review E: the CPU plan reserves the widened mask whenever the paged
+    // path can run, not only under `if (pages)`
+    CHECK(has(cpu_plan, "const int64_t col0 = ggml_flash_attn_ext_mask_col0(node);") &&
+          has(cpu_plan, "cur += (size_t)n_kv*mask->ne[1]*mask->ne[2]*mask->ne[3]*sizeof(ggml_fp16_t);"),
+          "the CPU plan reserves the widened mask beside the page table");
+    CHECK(has(cpu_plan, "pages ? pages->ne[0]*ggml_get_op_params_i32(node, GGML_FA_PARAM_PAGE_SIZE)\n"),
+          "the mask's width comes from the page table or the plain K rows");
 
     if (g_failures != 0) {
         printf("FAILED: %d\n", g_failures);

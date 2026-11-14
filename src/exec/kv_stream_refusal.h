@@ -8,7 +8,9 @@
 // the rule before a model loads (src/exec/backend_llama.cpp).
 //
 // Red switch (a test build only): ARCINT_KV_STREAM_REFUSE_OFF=1 makes the rule
-// return no refusal -- the arm the unit must fail on.
+// return no refusal -- the arm the unit must fail on. The switch exists only
+// when the unit target defines ARCINT_KV_STREAM_REFUSE_RED (0119 review G); a
+// served build has no such path, so the env cannot lift the refusal there.
 
 #include <cstdlib>
 #include <string>
@@ -27,9 +29,11 @@ struct KvStreamAsk {
 // the message a start must be refused with; empty = the flag may proceed
 inline std::string kv_stream_refusal(const KvStreamAsk& ask) {
     if (ask.resident_mib <= 0 && ask.decode_mib <= 0) return {};   // off: nothing to check
+#ifdef ARCINT_KV_STREAM_REFUSE_RED
     if (const char* off = std::getenv("ARCINT_KV_STREAM_REFUSE_OFF"); off != nullptr && off[0] == '1') {
         return {};   // RED: the rule accepts the flag it cannot honour
     }
+#endif
     if (!ask.flash_attn) {
         return "--llama-kv-resident needs flash attention: the streamed pages are read by the "
                "paged FLASH_ATTN_EXT kernel";

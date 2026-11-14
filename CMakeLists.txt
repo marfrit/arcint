@@ -627,7 +627,8 @@ if(ARCINT_TESTS)
     target_include_directories(arcint-kv-stream-cache PRIVATE
         "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/ggml/include")
     target_compile_definitions(arcint-kv-stream-cache PRIVATE
-        ARCINT_KV_STREAM_SRC_DIR="${ARCINT_LLAMA_DIR}/src")
+        ARCINT_KV_STREAM_SRC_DIR="${ARCINT_LLAMA_DIR}/src"
+        ARCINT_KV_STREAM_LLAMA_DIR="${ARCINT_LLAMA_DIR}")
     target_compile_options(arcint-kv-stream-cache PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME kv-stream-cache COMMAND arcint-kv-stream-cache)
     set_tests_properties(kv-stream-cache PROPERTIES LABELS unit)
@@ -652,6 +653,8 @@ if(ARCINT_TESTS)
     target_link_libraries(arcint-kv-stream-refusal PRIVATE arcint_core)
     target_include_directories(arcint-kv-stream-refusal PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_compile_options(arcint-kv-stream-refusal PRIVATE -Wall -Wextra -Wpedantic)
+    # the unit's red switch; the served binary compiles the rule without it
+    target_compile_definitions(arcint-kv-stream-refusal PRIVATE ARCINT_KV_STREAM_REFUSE_RED=1)
     add_test(NAME kv-stream-refusal COMMAND arcint-kv-stream-refusal)
     set_tests_properties(kv-stream-refusal PROPERTIES LABELS unit)
     # patch 0081's source-slot cell: the GDN family takes src[6] once (the rows
