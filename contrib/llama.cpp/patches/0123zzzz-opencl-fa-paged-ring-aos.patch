@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Markus Fritsche <mfritsche@reauktion.de>
+From: arcint <dev@arcint.invalid>
 Subject: [PATCH] 0123zzzz-opencl-fa-paged-ring-aos
 
 Paged FLASH_ATTN_EXT: a ring tensor of q8_0 or q4_0 that the OpenCL buffer

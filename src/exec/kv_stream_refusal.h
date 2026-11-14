@@ -36,7 +36,7 @@ inline std::string kv_stream_refusal(const KvStreamAsk& ask) {
     }
     if (ask.decode_mib > 0) {
         return "--llama-kv-resident-decode: the phase budget is not built in this round's patch "
-               "(contrib/llama.cpp 0121b); the single --llama-kv-resident budget serves";
+               "(contrib/llama.cpp 0121); the single --llama-kv-resident budget serves";
     }
     if (!ask.card_is_b60) {
         return "--llama-kv-resident: KV streaming is served on the 24 GB card only; this device's "

@@ -7188,8 +7188,8 @@ reuse check is conservative (below).
 
 - **Parameter** (`include/llama.h`, `src/llama-cparams.h`): `kv_resident_size`,
   device bytes of the resident KV pages, default **0 = off**, copied into
-  cparams (`llama-context.cpp`). arcint does not yet set it (the unit flags and the
-  refusal are I5).
+  cparams (`llama-context.cpp`). arcint sets it from `--llama-kv-resident`
+  (`src/exec/backend_llama.cpp`, I5): a 32-bit byte count, so at most 4095 MiB.
 - **Cache** (`llama-kv-cache.cpp`): with the flag on, the cache validates the
   paged kernel's shapes -- one stream (or unified), no V transpose, no shared
   source cache, no SWA, no windows, q8_0 K / q4_0 V, head 256 -- refusing
@@ -7354,6 +7354,21 @@ is the K side; if `q4_0 / q4_0` alone fails, it is the q4_0 K staged loader.
 **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host): the three
 cases with a ring pass on the CPU (3 of 3), so the case data and table are
 well-formed. **Not on a card:** the next window's run.
+
+## 0123zzzz-opencl-fa-paged-ring-aos.patch
+
+The paged kernels read the ring slots as q8_0 / q4_0 blocks, but a ring slot
+written through `set_tensor` as a whole tensor (the op suite's ring inputs) is
+split into SoA planes by the OpenCL upload. The FA dispatcher now rebuilds a
+flattened ring K and V to blocks before the paged decode and the paged prefill
+gather read them (`ggml_cl_flash_attn_reconstruct_aos` on
+`GGML_FA_SRC_RING_K/V`), as it already did for K and V. The prefill
+conversion released its page-table row unconditionally, and a device-resident
+table row is not its to release: only an uploaded row is released now (the
+op suite's heap corruption, "corrupted double-linked list"). Measured on the
+B60 (`measured-here`, 2026-11-13): 15 of 16 paged cases passed with it, every
+q8_0 / q4_0 case among them; the 16th, f16 prefill with a ring, is
+0123zzzzz's.
 
 ## 0123zzzzz-opencl-fa-paged-f16-in-place.patch
 

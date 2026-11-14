@@ -514,7 +514,11 @@ zombie sweep by pid; never run outside the window).
   at start (the phase resize/re-reserve is not built; the single budget
   serves); the copier/publisher threads and the ready/consumed flags are not
   built -- the stream's page moves are `ggml_backend_tensor_set/get` on the
-  in-order compute queue, which is **correct and unhidden** (0032's second
+  in-order compute queue, which is **unhidden** -- and, as built, **not correct**
+  beyond the pool (correction, 2026-11-14, `code`: `prepare()` fills the two
+  ring slots for every layer before the graph, so each layer but the last two
+  reads another layer's pages; contrib/llama.cpp README, 0123zzzzz2; the cache
+  refuses a budget that would stream until the per-layer copy exists) (0032's second
   queue, 0042's after-graph placement and the prefetch are the overlap, and
   they need a card to validate); the -2 pool-does-not-fit path is the cache's
   construction refusal plus the prepare assert (a phase resize can be refused

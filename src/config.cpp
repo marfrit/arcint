@@ -469,10 +469,12 @@ std::string usage_text() {
         "                            1.9 KB a prompt token (100k: ~190 MB), so DIR\n"
         "                            belongs on a dataset with room\n"
         "  --llama-kv K[:V]          the attention cache types, f16, q8_0 or q8_0:q4_0\n"
-        "  --llama-kv-resident MiB    KV streaming: resident K/V pages in VRAM, the rest from host RAM\n"
-        "  --llama-kv-resident-decode MiB  the decode phase's budget (not built: refused)\n"
         "                            (default f16): q8_0 takes the cache to 53 %,\n"
-        "                            q8_0:q4_0 to 41 %\n";
+        "                            q8_0:q4_0 to 41 %\n"
+        "  --llama-kv-resident MiB    KV streaming: resident K/V pages in VRAM, the rest from host RAM\n"
+        "                            (under development: refused unless LLAMA_KV_STREAM_UNSAFE=1;\n"
+        "                            below 4096)\n"
+        "  --llama-kv-resident-decode MiB  the decode phase's budget (not built: refused)\n";
 }
 
 ArgParse parse_args(int argc, char** argv, Config& cfg) {
@@ -558,6 +560,15 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--llama-kv-resident") {
             if (!value(v) || !parse_int(v, cfg.llama_kv_resident_mib) || cfg.llama_kv_resident_mib < 0)
                 return fail("--llama-kv-resident needs a size in MiB >= 0 (0: off; the rest of the KV streams from host RAM)");
+            // the budget reaches libllama as a 32-bit byte count (llama_context_params::kv_resident_size)
+            if (cfg.llama_kv_resident_mib >= 4096)
+                return fail("--llama-kv-resident takes at most 4095 MiB in this build (the budget is a 32-bit byte count)");
+            // KV streaming serves only once its per-layer page moves exist (I5, docs/campaigns/kv-streaming-design.md):
+            // until then a budget is refused for serving; the environment switch lets it run for its development
+            if (cfg.llama_kv_resident_mib > 0 &&
+                !(std::getenv("LLAMA_KV_STREAM_UNSAFE") && std::atoi(std::getenv("LLAMA_KV_STREAM_UNSAFE")) != 0))
+                return fail("--llama-kv-resident: KV streaming is under development (its per-layer page moves, I5, are not "
+                            "built) and is refused for serving; LLAMA_KV_STREAM_UNSAFE=1 enables it for development");
         } else if (arg == "--llama-kv-resident-decode") {
             if (!value(v) || !parse_int(v, cfg.llama_kv_resident_decode_mib) || cfg.llama_kv_resident_decode_mib < 0)
                 return fail("--llama-kv-resident-decode needs a size in MiB >= 0 (0: off)");

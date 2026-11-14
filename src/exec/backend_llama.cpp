@@ -981,7 +981,7 @@ public:
         if (cfg.prefill_ubatch > 0) cp.n_ubatch = static_cast<uint32_t>(std::min(n_batch_, cfg.prefill_ubatch));
         cp.n_kv_reserve    = cfg.llama_reserve_cells;
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
-        // 0121b: the KV stream's resident budget, bytes; 0 = the whole cache in VRAM
+        // 0121: the KV stream's resident budget, bytes; 0 = the whole cache in VRAM
         cp.kv_resident_size = cfg.llama_kv_resident_mib > 0 ? (uint32_t) cfg.llama_kv_resident_mib * 1024u * 1024u : 0;
         cp.type_k          = kv_type(cfg.llama_kv_k);
         cp.type_v          = kv_type(cfg.llama_kv_v);

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: arcint <dev@arcint.invalid>
 Date: Sat, 14 Nov 2026 00:00:00 +0000
-Subject: [PATCH] 0123a-opencl-fa-paged-prefill
+Subject: [PATCH] 0123z-opencl-fa-paged-prefill
 
 ---
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
