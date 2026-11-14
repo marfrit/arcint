@@ -6,8 +6,9 @@
 // Part 1, the map (no attention): written pages become resident, free slots take
 // the newest attended pages, the pool-full case evicts the oldest non-written
 // page and writes it back, a page returning to the pool is read back exactly,
-// the table and the runs agree with the residency, a streamed page is packed in
-// the layer's ring slot in host-store bytes, and the fork's debug rotation moves
+// the table and the runs agree with the residency, a streamed page is in the
+// layer's host store and the plan names its ring row (I5: prepare packs the plan,
+// not the slot), and the fork's debug rotation moves
 // every page through the host store without changing a byte.
 //
 // Part 2, the pages as attention sees them: four ubatches of 256 tokens over a
@@ -218,13 +219,23 @@ void part_map() {
         CHECK(memcmp(got.data(), cb.k.data(), got.size()) == 0, "map streamed read", "a streamed page does not read its written bytes");
         CHECK(s3.n_streamed_pages() == 2 && s3.synced(), "map streamed read", "two pages of four do not stream with a two-page pool");
         // with a two-page pool: the written page 0 and the newest attended page
-        // 3 are resident, pages 1 and 2 stream, packed at ring rows 0 and 256
+        // 3 are resident, pages 1 and 2 stream. I5: prepare fills the PLAN, not the
+        // ring; the pages are copied into the slot by each attention call
+        const size_t hk_nb = (size_t) s3.host_k(0)->nb[2];
+        const int32_t * pl = (const int32_t *) s3.plan()->data;
+        CHECK(pl[1] >= 0 && pl[2] >= 0 && pl[1] != pl[2], "map ring plan",
+              "the streamed pages do not hold distinct ring rows");
+        CHECK(pl[0] < 0 && pl[3] < 0, "map ring plan", "a resident page has a ring row");
         for (int64_t l = 0; l < f3.n_layers; ++l) {
-            char * slot = (char *) s3.slot_k((int32_t) l)->data;
-            CHECK(memcmp(slot, cb.k.data() + (size_t) 1*256*cb.row_k, (size_t) 256*cb.row_k) == 0,
-                  "map ring pack", "logical page 1 is not at the slot start");
-            CHECK(memcmp(slot + (size_t) 256*cb.row_k, cb.k.data() + (size_t) 2*256*cb.row_k, (size_t) 256*cb.row_k) == 0,
-                  "map ring pack", "logical page 2 is not at ring row 256");
+            const char * hk = (const char *) s3.host_k((int32_t) l)->data;
+            CHECK(memcmp(hk + (size_t) 1*hk_nb, cb.k.data() + (size_t) 1*256*cb.row_k, (size_t) 256*cb.row_k) == 0,
+                  "map ring host", "logical page 1 is not in the layer's host store");
+            CHECK(memcmp(hk + (size_t) 2*hk_nb, cb.k.data() + (size_t) 2*256*cb.row_k, (size_t) 256*cb.row_k) == 0,
+                  "map ring host", "logical page 2 is not in the layer's host store");
+            // and prepare itself made no copy: the slot still holds what the buffer clear left
+            const char * slot = (const char *) s3.slot_k((int32_t) l)->data;
+            CHECK(memcmp(slot, cb.k.data() + (size_t) 1*256*cb.row_k, (size_t) 256*cb.row_k) != 0,
+                  "map ring pack", "prepare copied the pages into the slot up front");
         }
     }
 
@@ -333,6 +344,8 @@ void part_attention() {
         ggml_tensor * ring_v = view_of(s.slot_v(0), "op_ring_v");
         ggml_tensor * out_paged = ggml_flash_attn_ext(ctx.get(), q, op_k, op_v, mask, scale, 0.0f, 0.0f);
         ggml_flash_attn_ext_set_pages(out_paged, table_buf, 0, (int32_t) llama_kv_stream::page_size, ring_k, ring_v);
+        // I5: the pages move into the slot per attention call; the CPU arm does that copy
+        ggml_flash_attn_ext_set_host(out_paged, s.host_k(0), s.host_v(0), s.plan());
         ggml_set_name(out_paged, "out_paged");
 
         {
