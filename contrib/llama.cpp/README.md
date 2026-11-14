@@ -7292,10 +7292,25 @@ kernel stayed null. Evidence `code` (the source order) + `measured-here`
   a declined paged case names its clause on the card.
   `GGML_OPENCL_FA_PAGED_DUMP=1` logs what a paged launch is handed: `n_kv`,
   page size, the table row and its byte offset, the pool's and the ring's row
-  counts and nb1/nb2 for K and V, and the table row's entries read back. Window
-  229's split -- f16 decode over a ring correct, q8_0:q4_0 decode NaN over a
-  ring, and both types' prefill conversion NaN -- is read from those lines
-  before the kernel's loaders are changed.
+  counts and nb1/nb2 for K and V, and the table row's entries read back.
+- **Window 232's bindings are right and the failure is inside one type path.**
+  The dump shows, for a failing q8_0:q4_0 ring case and the passing f16 ring case
+  at the same shape, the same table, the same pool/ring row counts and the
+  strides the tensors have (q8_0 K 1088/272, q4_0 V 576/144; f16 2048/512); the
+  table row maps every ring page to a small `-1-e` and every resident page to a
+  slot within the pool. The row formula therefore indexes inside the pool and
+  the ring, and no stride is wrong. What is left is a *type path*: the staged K
+  loader for q8_0 (`GQA_K_STAGED`), the q4_0 V staging, or the 0088 int8 b
+  operand -- f16 reads the ring through `kb16`/`load16(VT=0)` and passes.
+  Isolation runs, one per arm, same line (no kernel change between them):
+  - `GGML_OPENCL_FA_GQA_OPTS=-DGQA_K_DIRECT` -- q8_0 K read per lane instead of
+    staged: a pass names the staged loader, a NaN keeps it in V/int8.
+  - `GGML_OPENCL_FA_GQA_I8=0` explicitly -- excludes 0088's int8 b operand.
+  - `GGML_OPENCL_FA_DPAS_F16KV_BLOCK=4096` on the prefill cases -- moves the
+    conversion's block boundary; a NaN that moves with the block names the
+    conversion, one that stays at the same output index is the row read.
+  **The fix is owed after those three lines**; this patch carries no kernel
+  change for window 232.
 - **Tests**: arcint's `tests/test_fa_paged_predicate.cpp` (`fa-paged-predicate`,
   ctest LABELS unit) drives `ggml_cl_fa_paged_ok` over the agent's decode shape
   (true) and flips every clause (each must refuse), plus prompts and 1-row
