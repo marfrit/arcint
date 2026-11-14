@@ -7527,6 +7527,11 @@ Device-free arms: the predicate cell checks every index, and the layers cell
 reads the node's sources back (`src[HOST_K/V] == host store`, `src[PLAN] == plan`)
 after `set_host` -- at 10 that read is outside the array.
 
+Red arm, run here (`measured-here`, device-free): a translation unit with
+`GGML_MAX_SRC` forced to 10 before ggml-impl.h fails to compile
+("static assertion failed: GGML_MAX_SRC must hold every paged FA source"); the
+layers cell's source read would then read outside `src[]`.
+
 ## 0124-opencl-fa-wide-verify.patch
 
 ## 0123zzzzz3-kv-stream-per-layer-pages.patch
