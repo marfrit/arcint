@@ -7355,6 +7355,19 @@ is the K side; if `q4_0 / q4_0` alone fails, it is the q4_0 K staged loader.
 cases with a ring pass on the CPU (3 of 3), so the case data and table are
 well-formed. **Not on a card:** the next window's run.
 
+## 0123zzzzz-opencl-fa-paged-f16-in-place.patch
+
+A paged f16 prompt took the f16 in-place branch of the prompt kernel
+(`flash_attn_dpas2.cl` reading K/V in place). That branch reads the K/V view
+row after row over the call's `n_kv` keys, so with paged K/V it attended the
+pool's rows as the sequence: it missed the page table and the ring, and when
+the table names more pages than the pool holds it read past the pool (the open
+case `kv=8192, nb=512, f16, ring_every=2, n_slots=16`: 8,192 keys over a
+4,096-row pool). The quantized pairs already took the gather (each key's row
+from the pool or the ring into f16 blocks, then the f16 kernel); paged f16 now
+takes it too. One condition, `kv_pages == nullptr`, on the in-place branch
+(`code`). Card result: see the next window's record.
+
 ## 0124-opencl-fa-wide-verify.patch
 
 A verify of 9 to 64 query rows (more than 8 drafts, several lanes' verifies in
