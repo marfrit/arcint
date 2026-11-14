@@ -10,9 +10,19 @@ tensor no node consumed. The graph allocator gives an unread input no buffer, an
 decode: GGML_ASSERT(buffer) in ggml_backend_buffer_get_type (measured-here, the coder on the
 A770, LLAMA_GDN_REPLAY=1; device-free the same abort on the CPU backend).
 
+The sub-group contract (0125): `kernel_gated_delta_net_rpl` is the generation kernel's body
+with a replay prologue and a record epilogue, and its `intel_sub_group_block_read/write` and
+`sub_group_reduce_add` work over one sub-group of SG work-items, with every index `m*SG`. The
+tg and pp kernels carry `intel_reqd_sub_group_size(SG)`; the replay kernel did not, so the
+compiler need not choose SG (a smaller SIMD size leaves gaps and overlaps in the state rows).
+The chain cases were red on the A770 and the B60 (max |diff| 1.3-1.6) while every no-replay
+GATED_DELTA_NET case passed; the card arm is test-backend-ops with `-o 'GATED_DELTA_NET.*'`.
+
 Red case, run before the fix: the qwen35moe branch dropped (the pre-fix tree) -> "qwen35moe
 builds the replay state" fails, and the `s_rpl_rows` count is 0 in that file. The mutation is
-the fix's own hunk removed from 0000-07-gdn-and-fusions.patch.
+the fix's own hunk removed from 0000-07-gdn-and-fusions.patch. Without 0125 the view-chain
+checks fail (no helper, no nested-view case) and the pre-fix chain cases leave the record
+bank in the parent's base.
 """
 import os
 import sys
@@ -54,5 +64,17 @@ for model in ("qwen35", "qwen35moe", "qwen4exp"):
     check(model + " reads s_rpl_rows (an unread input has no buffer)", "s_rpl_rows" in src)
     # the rows form stays off under replay
     check(model + " keeps the rows form off under replay", "!gdn_rpl && llama_gdn_state_rows_enabled" in src)
+
+# 0125: the replay kernel's block I/O and its m*SG indices need the sub-group size pinned,
+# as the tg and pp kernels do; without it the compiler's SIMD size need not be SG.
+cl = read("ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl")
+tbo = read("tests/test-backend-ops.cpp")
+rpl = cl[cl.index("kernel void kernel_gated_delta_net_rpl(") - 400:]
+rpl = rpl[:rpl.index("kernel_gated_delta_net_rpl(")]
+check("0125: the replay kernel declares the sub-group size",
+      "__attribute__((intel_reqd_sub_group_size(SG)))" in rpl)
+check("0125: the generation kernel keeps its declaration",
+      cl.count("__attribute__((intel_reqd_sub_group_size(SG)))") >= 3)
+check("0125: the card chain runs the coder's geometry", "test_gdn_replay_chain(16, 2, 5, chain_a" in tbo)
 
 sys.exit(1 if fail else 0)
