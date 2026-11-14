@@ -596,6 +596,17 @@ if(ARCINT_TESTS)
     target_compile_options(arcint-fa-paged PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME fa-paged COMMAND arcint-fa-paged)
     set_tests_properties(fa-paged PROPERTIES LABELS unit)
+    # patch 0120's device-free cell: the KV stream's page map, host store,
+    # eviction/write-back and table, and the pages through 0119's CPU paged
+    # attention over four ubatches. Design: docs/campaigns/kv-streaming-design.md,
+    # increment I2.
+    add_executable(arcint-kv-stream-map tests/test_kv_stream_map.cpp)
+    target_link_libraries(arcint-kv-stream-map PRIVATE arcint_core)
+    target_include_directories(arcint-kv-stream-map PRIVATE
+        "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/ggml/include")
+    target_compile_options(arcint-kv-stream-map PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME kv-stream-map COMMAND arcint-kv-stream-map)
+    set_tests_properties(kv-stream-map PROPERTIES LABELS unit)
     # TODO(I5), design section 4.3: the start refusal that stops the scheduler's
     # silent CPU placement of a paged FA (0119's OpenCL supports_op declines the
     # op). The marker is DISABLED until I5 builds the probe and the refusal;

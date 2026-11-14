@@ -7031,3 +7031,69 @@ for arcint; the cell below is the only number and it is not a rate.
 - **Not measured:** any card; any speed of the CPU gather; the cross-queue
   flags' paths (`set_sync`, `set_page_runs`) and the OpenCL kernels, which this
   patch deliberately does not touch (I3/I4).
+
+## 0120-llama-kv-stream-map.patch
+
+The adaptive KV stream's page map, host store, eviction/write-back and page
+table (design: `docs/campaigns/kv-streaming-design.md`, increment I2; reference:
+the fork's `src/llama-kv-stream.{h,cpp}` at `b540a4b9b`). Evidence class `code`
+for the mechanism; the I1 paged op (`0119`) is what reads the pages. Not wired
+into the KV cache yet -- that is I3's prerequisite, named below.
+
+- **What** (`src/llama-kv-stream.{h,cpp}`, added to `src/CMakeLists.txt`): one
+  sequence's attention layers keep their K/V in pages of 256 cells. The pool
+  tensors are the cache's (`[n_embd_gqa, n_slots*page_size]`); a host store
+  buffer of the pool's buffer type holds every page that left the pool, per
+  layer K pages then V pages in page order. `prepare(cells, n_kv)`:
+  - makes the pages a ubatch writes resident, evicting the oldest non-written
+    page when no slot is free and asserting the pool holds at least a ubatch;
+  - gives free slots to the newest attended pages;
+  - marks the written pages dirty;
+  - packs the attended pages that are not resident into the layer's ring slot
+    (two slots, alternating by layer parity) and records the ring index, so
+    `synced()` reports a ubatch that streams;
+  - `assign` reads a returning page back from the host store, `evict` writes a
+    dirty page back exactly; `set_input_pages` fills the `I32
+    [n_kv/page_size, n_layer]` table (slot >= 0, or `-1 - ring index`), `runs`
+    gives the resident attended pages as runs for a gather, `row` maps a cell,
+    `layout()` changes whenever a page moves (a graph built around the layout is
+    not reused), `get_rows`/`set_rows` read and write wherever the rows live
+    (the checkpoint path and the cell's integrity probe), and
+    `set_debug_rotate(true)` moves every resident page through the host store
+    before every ubatch (the fork's `LLAMA_KV_STREAM_DEBUG=rotate`, which needs
+    the pool to hold the context).
+- **Deviations from the fork, named**: no copier or publisher thread, no copy
+  engine, no `ready`/`consumed` flags, no prefetch -- page moves are synchronous
+  `ggml_backend_tensor_set/get` on the owning backend; I3/I5 put them on the
+  second in-order OpenCL queue with events and add the kernel-side wait
+  (0032/0044's form, 0056's doorbell). Slots are sized by the caller (`n_ring`
+  pages), not by a probe of the backend's paged attention or by the streamed
+  pages a phase needs -- I3 adds the probe and that sizing. No phase budgets and
+  no pool resize (I5). Nothing is wired into `llama_kv_cache` yet: the pool
+  views, the graph inputs and the prepare call are I3's, because the CPU arm is
+  a cell, not a served model.
+- **Test** (`tests/test_kv_stream_map.cpp`, arcint's `arcint-kv-stream-map`,
+  ctest `kv-stream-map`, LABELS unit, CPU backend, 1 thread):
+  - the map: written pages resident, the newest attended pages take free slots,
+    a full pool evicts the oldest non-written page, an attended page reads the
+    bytes that were written, rotation writes every page back and reads the same
+    bytes, a two-page pool over four pages streams pages 1 and 2 packed at ring
+    rows 0 and 256, a written page outside the attended range is resident while
+    an unattended one is not, table rows agree;
+  - the pages through attention: four ubatches of 256 cells over a 1,024-cell
+    f16 cache with a two-page pool and a four-page ring; each ubatch prepares,
+    writes its cells through `set_rows`, and runs a 6-row causal paged
+    attention over the pool and the ring; its f32 output is `memcmp`-equal to
+    the same attention over a contiguous cache holding the same bytes. At the
+    fourth ubatch two of four pages stream.
+- **Red case** (branch `kv-stream-red2`): `evict` drops the write-back
+  (`dirty[page]` -> `false`). It compiles and fails 6 checks -- the rotation
+  cell (a dirty page evicted without its write-back reads different bytes) and
+  the third and fourth ubatch's attention (an evicted page streams what the host
+  store last held). Restored, every check passes.
+- **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host, the patch's
+  own cell, 1 thread): green all checks, the red build 6 failing. The recipe:
+  recorded with the section's result line below.
+- **Not measured:** any card; the copier/publisher threads, the second queue,
+  the sync flags and the pool sizing (I3/I5); a served model (the CPU arm is
+  the cell; arcint's llama engine requires an OpenCL card at start).

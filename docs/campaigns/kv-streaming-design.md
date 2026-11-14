@@ -433,6 +433,25 @@ zombie sweep by pid; never run outside the window).
   and the paged output **bit-identical** to the stream off, because the CPU
   path gathers exact bytes.
 - Card: none.
+- **Built in 0120** (`measured-here`, CPU): the class has the page map, the host
+  store, write-back/read-back, the table, the runs, the rotation debug switch
+  and `get_rows`/`set_rows`; its cell is `kv-stream-map` (part 1 the map, part 2
+  four ubatches through 0119's paged attention, `memcmp`-equal to the contiguous
+  cache; the fourth ubatch streams 2 of 4 pages). Red `kv-stream-red2`: `evict`
+  without the write-back, 6 checks failing.
+- **Deviations from the fork, named:** no copier/publisher threads, no copy
+  engine, no ready/consumed flags, no prefetch -- page moves are synchronous
+  `ggml_backend_tensor_set/get` on the owning backend (I3/I5 move them to the
+  second in-order queue with events, and add the kernel-side wait); slots are
+  sized by the caller, not by a backend probe or the phase's streamed pages
+  (I3); no phase budgets or pool resize (I5); and **no `llama_kv_cache`
+  wiring** in this increment: the pool views, the graph inputs and the prepare
+  call are I3's prerequisite. The reason it is not here: arcint's llama engine
+  constructs its OpenCL cards at start and throws without one
+  (`backend_llama.cpp:505-520`, `code`), so a CPU-backend served leg does not
+  exist in this tree; the CPU arm is the four-ubatch cell above, which is the
+  path the design's I2 asks to be byte-identical. The served leg at 8k/32k
+  moves to I5's window as part of its gate.
 
 ### I3 — OpenCL paged decode: 0016 and 0088
 
@@ -517,6 +536,12 @@ zombie sweep by pid; never run outside the window).
      layers, not a full re-stream every round.
 
 ## Current state
+
+**I2 built** 2026-11-14 (patch 0120): the stream class's page map, host store,
+eviction/write-back and table, the device-free `kv-stream-map` cell green and
+its red `kv-stream-red2` failing 6 checks; the deviations above. The
+`llama_kv_cache` wiring and the served CPU arm are I3's prerequisite (the
+engine requires a card at start). Everything else as below.
 
 **I1 built** 2026-11-14 (patch 0119): the paged op, the CPU gather reference,
 and the OpenCL backend's refusal; the device-free cell is `fa-paged`. The
