@@ -356,6 +356,32 @@ fallback.
     accepted, logged, not refused);
   - with the MTP drafter: supported (6-row verify is the paged kernel's row
     tile), but the draft context's KV stays unpaged (a separate context).
+- **The paged op's fallback, and where I5 stops it.** ggml's scheduler places a
+  node on any backend whose `supports_op` says true. 0119 makes the OpenCL
+  backend **decline** a `FLASH_ATTN_EXT` carrying a page table or a sync tag
+  (its kernels do not take pages until I3), so a graph with pages would be
+  placed on the **CPU reference** -- correct, and for I1's tests the intended
+  arm; for serving it would be a silent collapse, one host thread gathering
+  every page. I5's start refusal is what catches it:
+  1. before the load, the backend probes exactly what the fork's
+     `set_backend` probes -- one `FLASH_ATTN_EXT` node with a 1-page table,
+     the pool views and a dummy run, through
+     `ggml_backend_supports_op(graph_backend, probe)` -- and caches the answer
+     (`prefill_paged` / `decode_paged` in the fork, `llama-context.cpp:156-199`);
+  2. `--llama-kv-resident` is honoured only when the node's owning backend
+     says true for the **paged decode shape** (head 256, q8_0/q4_0, 6 rows);
+     otherwise the start is **refused** with a message naming what is missing
+     (the build's patch, or the kernels of I3), and no session runs. The flag
+     never degrades to the CPU reference;
+  3. the same probe result is stored in `status_` and shown under /props
+     (`kv_stream.deferred = "cpu-reference: no paged kernel"` when it would
+     have fallen back), so a build that cannot serve the flag says so before a
+     request.
+  The disabled cell `tests/test_kv_stream_refuse_todo.cpp` (ctest
+  `kv-stream-refuse`, `DISABLED TRUE`) is the placeholder: I5 turns it on with
+  the refusal's real message, and its red arm is a build whose OpenCL
+  `supports_op` says true for pages (I3's kernel present, the refusal check
+  removed).
 - **/props**: a `kv_stream` object, `phase`, `pool_mib`, `slots_mib`,
   `resident_pages`, `context_pages`, `streamed_pages_last_round`, and
   `downgrades()` gains `kv-stream:<n> pages read from host` so nothing is
@@ -493,9 +519,14 @@ zombie sweep by pid; never run outside the window).
 ## Current state
 
 **I1 built** 2026-11-14 (patch 0119): the paged op, the CPU gather reference,
-and the OpenCL backend's refusal; the device-free cell is `fa-paged`, 4 of 4
-byte-equal, its red build 3 of 4 failing, the recipe 37 of 37 green and the
-red tree 36 of 37 (EXIT 8). Everything else is as below.
+and the OpenCL backend's refusal; the device-free cell is `fa-paged`. The
+review's two items are in: a compact mask (last `mask->ne[0]` keys, earlier
+columns visible) equals the unpaged full-mask run, its red (the widening's
+copy without the `col0` offset) fails exactly those two cases; and §4.3 names
+where I5's probe refusal stops the scheduler's silent CPU placement, with the
+disabled `kv-stream-refuse` cell as its marker. Green: 6 of 6 cases, recipe
+37 of 37 (EXIT 0). Red: ring mutation 3 of 4, widening mutation 2 of 2
+compact-mask cases, recipe EXIT 8. Everything else is as below.
 
 Design note only, 2026-11-14. Nothing built, nothing measured on a card. The
 prior art read is `research-achyudh.md` §2 (`code`, `paper`); the fork is at

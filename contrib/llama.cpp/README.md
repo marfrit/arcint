@@ -6969,8 +6969,11 @@ for arcint; the cell below is the only number and it is not a rate.
   attended sequence is `pages->ne[0]*page_size` rows, `pages` is `I32
   [n_pages, n_tables]` with row `table` used, entry `>= 0` is a pool page and
   entry `< 0` is page `-1 - entry` of the ring (same row layout). It asserts
-  the mask's `ne[0]` is the attended length, the pool's and the ring's rows are
-  whole pages, and the ring's types and head counts equal the pool's.
+  the mask's `ne[0]` is at most the attended length -- a narrow mask covers the
+  last `mask->ne[0]` keys, the keys before it count as visible (the fork's
+  `1ca44251c` form, `ggml_flash_attn_ext_mask_col0`) -- that the pool's and the
+  ring's rows are whole pages, and that the ring's types and head counts equal
+  the pool's.
   `ggml_flash_attn_ext_set_sync(a, tag, ready, consumed)` carries the
   cross-queue flags (`I32 [1]` tag in device memory, host-visible `ready` and
   `consumed`); `ggml_flash_attn_ext_set_page_runs(a, runs)` carries the table
@@ -6986,8 +6989,11 @@ for arcint; the cell below is the only number and it is not a rate.
 - **CPU reference** (`ggml/src/ggml-cpu/ops.cpp`, `..._flash_attn_ext_paged`):
   wait for `ready >= tag[0]` if a tag is set (one thread, then a barrier), copy
   each logical row from `table[i/page_size]`'s pool page or ring page into
-  contiguous K/V and widen a narrower mask into visible columns first, run the
-  existing contiguous path on those copies, then store `consumed = tag[0]`. The
+  contiguous K/V and widen a narrower mask into the attended length (its first
+  `col0` columns zero, its mask columns copied at `col0`), run the existing
+  contiguous path on those copies, then store `consumed = tag[0]`. A node with a
+  narrow mask but no page table takes the same entry point (`mask_col0 > 0`),
+  which is how the compact-mask case without a ring exercises the widening. The
   copies are plain memory moves, so the output is byte-equal to the unpaged
   path's on the same bytes. `ggml/src/ggml-cpu/ggml-cpu.c` reserves the copies
   and the widened mask in the graph plan's work buffer.
@@ -7003,16 +7009,22 @@ for arcint; the cell below is the only number and it is not a rate.
   a causal mask, 1 thread: f16 at 1,024 keys / 6 rows with 4 KV heads x 6
   queries; q8_0:q4_0 at 2,048 keys / 6 rows with a ring every 3 pages; q8_0:q4_0
   at 1,024 keys / 2 rows without a ring; f16 at 512 keys / 1 row, one KV head,
-  a ring every page. The f32 outputs are compared with `memcmp` -- the gather is
+  a ring every page; q8_0:q4_0 at 1,024 keys with a compact mask covering the
+  last 768 keys (`col0=256`) and a ring every 2 pages; f16 at 1,024 keys with a
+  compact mask covering the last 512 keys (`col0=512`) and no ring. The f32 outputs are compared with `memcmp` -- the gather is
   a copy, so equality is expected, not an NMSE -- and the reference must be
   finite, so a read of the fill shows.
-- **Red case** (branch `kv-stream-red`): the gather's `e >= 0 ? pool : ring`
-  becomes `pool`, so a ring page reads a pool row. It compiles and fails 3 of
-  the 4 cases (all three ring arms; the no-ring arm cannot fail on this
-  mutation). Restored, all four pass.
+- **Red cases** (each run and seen failing before the patch was restored): the
+  gather's `e >= 0 ? pool : ring` becomes `pool`, so a ring page reads a pool
+  row -- 3 of 4 cases fail then (the ring arms; the no-ring arm cannot fail on
+  it); and the widening's `memcpy(out + col0, ...)` becomes `memcpy(out, ...)`,
+  so the visible columns sit at the wrong keys -- the two compact-mask cases
+  fail and the four full-mask cases stay green, which is what shows the
+  widening runs. Restored, all 6 cases pass.
 - **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host, the patched
-  tree's own `arcint-fa-paged`, 1 thread): 4 of 4 cases byte-equal, the red
-  build 3 of 4 failing. The recipe at the green tree: 37 of 37 unit tests
+  tree's own `arcint-fa-paged`, 1 thread): 6 of 6 cases byte-equal (full and
+  compact masks), the ring red build 3 of 4 failing, the widening red build 2
+  of the 2 compact-mask cases failing. The recipe at the green tree: 37 of 37 unit tests
   pass, EXIT 0, the .deb built; at the red tree (`kv-stream-red`, `fcbbfe90`):
   36 of 37, `fa-paged` the one failure, EXIT 8, no .deb -- it compiles and
   fails. Not a rate and not on a card.

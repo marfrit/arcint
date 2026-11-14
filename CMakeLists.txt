@@ -596,6 +596,15 @@ if(ARCINT_TESTS)
     target_compile_options(arcint-fa-paged PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME fa-paged COMMAND arcint-fa-paged)
     set_tests_properties(fa-paged PROPERTIES LABELS unit)
+    # TODO(I5), design section 4.3: the start refusal that stops the scheduler's
+    # silent CPU placement of a paged FA (0119's OpenCL supports_op declines the
+    # op). The marker is DISABLED until I5 builds the probe and the refusal;
+    # tests/test_kv_stream_refuse_todo.cpp says what the cell asserts.
+    add_executable(arcint-kv-stream-refuse-todo tests/test_kv_stream_refuse_todo.cpp)
+    target_link_libraries(arcint-kv-stream-refuse-todo PRIVATE arcint_core)
+    target_compile_options(arcint-kv-stream-refuse-todo PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME kv-stream-refuse COMMAND arcint-kv-stream-refuse-todo)
+    set_tests_properties(kv-stream-refuse PROPERTIES LABELS unit DISABLED TRUE)
     # patch 0081's source-slot cell: the GDN family takes src[6] once (the rows
     # index; the replay's records in its own op), the mode word op_params[1]
     # selects the state path, and the raw gating projections of patch 0051 ride

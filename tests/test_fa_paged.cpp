@@ -14,10 +14,15 @@
 // is expected, and the mutation of one table entry or of the ring order is what
 // the comparison can fail on.
 //
-// Red case (branch kv-stream-red, compiled in): the CPU gather takes the pool
-// for every entry (`e >= 0 ? pool : ring` -> `pool`), so a ring page reads
-// pool rows that hold other pages or unused data. The cases with ring_every > 0
-// fail; the commands are in the patch README section 0119.
+// Red cases (each run before the patch was accepted):
+//  - the CPU gather takes the pool for every entry (`e >= 0 ? pool : ring` ->
+//    `pool`), so a ring page reads pool rows that hold other pages or unused
+//    data. The cases with ring_every > 0 fail.
+//  - the compact-mask widening copies the mask's columns without the col0
+//    offset (`out + col0` -> `out`), so the visible columns sit at the wrong
+//    keys. The col0 cases fail, the full-mask cases do not -- that pair is what
+//    shows the widening runs.
+// The commands are in the patch README section 0119.
 //
 // Not covered here: the OpenCL backend declines the op until its kernels learn
 // the page table (patch 0119's ggml-opencl supports_op), and the cross-queue
@@ -75,6 +80,7 @@ struct kase {
     ggml_type    tk;
     ggml_type    tv;
     int64_t      ring_every; // every i-th logical page is in the ring; 0: none
+    int64_t      col0;       // the paged run's mask covers the last n_kv-col0 columns (compact form); 0: the full mask
 };
 
 struct buffers {
@@ -154,8 +160,16 @@ void run(const kase & c) {
     ggml_tensor * pages = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_pages, 2);
     ggml_set_name(pages, "pages");
 
-    ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, c.n_kv, c.n_q, 1, 1);
-    ggml_set_name(mask, "mask");
+    // the reference covers all keys; the paged run's mask is the compact form
+    // when col0 > 0: its columns are the last n_kv-col0 keys, the columns before
+    // them count as visible (the CPU gather widens it back to the attended
+    // length, visible columns first)
+    const int64_t mask_cols = c.n_kv - c.col0;
+    ggml_tensor * mask_ref  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, c.n_kv, c.n_q, 1, 1);
+    ggml_tensor * mask_page = c.col0 ? ggml_new_tensor_4d(ctx, GGML_TYPE_F16, mask_cols, c.n_q, 1, 1)
+                                     : mask_ref;
+    ggml_set_name(mask_ref, "mask");
+    ggml_set_name(mask_page, "mask_paged");
 
     // bytes: the pool and the ring carry the logical rows at their physical
     // rows, and everything else carries a constant so a wrong read is visible
@@ -196,17 +210,22 @@ void run(const kase & c) {
     // causal mask: key j is visible to query row i when j <= n_kv - n_q + i
     for (int64_t i = 0; i < c.n_q; ++i) {
         for (int64_t j = 0; j < c.n_kv; ++j) {
-            ((ggml_fp16_t *) mask->data)[(size_t) (i*c.n_kv + j)] =
+            ((ggml_fp16_t *) mask_ref->data)[(size_t) (i*c.n_kv + j)] =
                 j <= c.n_kv - c.n_q + i ? ggml_fp32_to_fp16(0.0f) : ggml_fp32_to_fp16(-INFINITY);
+        }
+        for (int64_t j = 0; j < mask_cols; ++j) {
+            const int64_t key = c.col0 + j;
+            ((ggml_fp16_t *) mask_page->data)[(size_t) (i*mask_cols + j)] =
+                key <= c.n_kv - c.n_q + i ? ggml_fp32_to_fp16(0.0f) : ggml_fp32_to_fp16(-INFINITY);
         }
     }
 
     const float scale = 1.0f/std::sqrt((float) c.hs);
 
-    ggml_tensor * out_ref = ggml_flash_attn_ext(ctx, q, kc, vc, mask, scale, 0.0f, 0.0f);
+    ggml_tensor * out_ref = ggml_flash_attn_ext(ctx, q, kc, vc, mask_ref, scale, 0.0f, 0.0f);
     ggml_set_name(out_ref, "out_ref");
 
-    ggml_tensor * out_paged = ggml_flash_attn_ext(ctx, q, kp, vp, mask, scale, 0.0f, 0.0f);
+    ggml_tensor * out_paged = ggml_flash_attn_ext(ctx, q, kp, vp, mask_page, scale, 0.0f, 0.0f);
     ggml_flash_attn_ext_set_pages(out_paged, pages, /*table =*/ 1, (int32_t) kPage, kr, vr);
     ggml_set_name(out_paged, "out_paged");
 
@@ -250,13 +269,18 @@ void run(const kase & c) {
 
 int main() {
     // f16 K/V, the tiled path: 4 KV heads, 6 query heads a KV head, a 6-row verify
-    run({ "f16 f16, 1024 keys, 6 rows, 4 KV heads x 6, ring every 2", 256, 4, 6, 1024, 6, GGML_TYPE_F16, GGML_TYPE_F16, 2 });
+    run({ "f16 f16, 1024 keys, 6 rows, 4 KV heads x 6, ring every 2", 256, 4, 6, 1024, 6, GGML_TYPE_F16, GGML_TYPE_F16, 2, 0 });
     // the agent's cache pair, the vec path: q8_0 K / q4_0 V
-    run({ "q8_0 q4_0, 2048 keys, 6 rows, 4 KV heads x 6, ring every 3", 256, 4, 6, 2048, 6, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 3 });
+    run({ "q8_0 q4_0, 2048 keys, 6 rows, 4 KV heads x 6, ring every 3", 256, 4, 6, 2048, 6, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 3, 0 });
     // no ring: every attended page is resident (the shallow-depth arm)
-    run({ "q8_0 q4_0, 1024 keys, 2 rows, no ring", 256, 4, 6, 1024, 2, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 0 });
+    run({ "q8_0 q4_0, 1024 keys, 2 rows, no ring", 256, 4, 6, 1024, 2, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 0, 0 });
     // one KV head, no GQA, the smallest geometry, ring every page
-    run({ "f16 f16, 512 keys, 1 row, 1 KV head, ring every page", 64, 1, 1, 512, 1, GGML_TYPE_F16, GGML_TYPE_F16, 1 });
+    run({ "f16 f16, 512 keys, 1 row, 1 KV head, ring every page", 64, 1, 1, 512, 1, GGML_TYPE_F16, GGML_TYPE_F16, 1, 0 });
+    // the compact mask: the paged run's mask covers the last 768 of 1,024 keys,
+    // the first 256 count as visible; equal to the unpaged run over the full mask
+    run({ "q8_0 q4_0, 1024 keys, 6 rows, compact mask col0=256, ring every 2", 256, 4, 6, 1024, 6, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 256 });
+    // compact mask with no ring, the widening alone
+    run({ "f16 f16, 1024 keys, 6 rows, compact mask col0=512, no ring", 256, 4, 6, 1024, 6, GGML_TYPE_F16, GGML_TYPE_F16, 0, 512 });
 
     if (g_failures != 0) {
         printf("FAILED: %d\n", g_failures);
