@@ -608,6 +608,17 @@ if(ARCINT_TESTS)
     target_compile_options(arcint-kv-stream-map PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME kv-stream-map COMMAND arcint-kv-stream-map)
     set_tests_properties(kv-stream-map PROPERTIES LABELS unit)
+    # patch 0123zzzzz3's device-free cell: the stream's page moves are per attention
+    # layer. Three layers share one ring slot (the stream's slots[ikv % 2]); every
+    # attention call copies its own host-store pages into the slot before it reads
+    # them, and the CPU paged op does that copy too. Design: increment I5.
+    add_executable(arcint-kv-stream-layers tests/test_kv_stream_layers.cpp)
+    target_link_libraries(arcint-kv-stream-layers PRIVATE arcint_core)
+    target_include_directories(arcint-kv-stream-layers PRIVATE
+        "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/ggml/include")
+    target_compile_options(arcint-kv-stream-layers PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME kv-stream-layers COMMAND arcint-kv-stream-layers)
+    set_tests_properties(kv-stream-layers PROPERTIES LABELS unit)
     # patch 0121's device-free cell: the stream reaches llama_kv_cache and the graph and
     # stays off by default; reads the patched tree's source (a GGUF and a card are not
     # available here). Design: increment I3's prerequisite.
