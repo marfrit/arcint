@@ -626,7 +626,8 @@ if(ARCINT_TESTS)
       add_executable(arcint-fa-paged-predicate tests/test_fa_paged_predicate.cpp)
       target_link_libraries(arcint-fa-paged-predicate PRIVATE arcint_core)
       target_include_directories(arcint-fa-paged-predicate PRIVATE
-          "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl" "${ARCINT_LLAMA_DIR}/ggml/src")
+          "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl" "${ARCINT_LLAMA_DIR}/ggml/src"
+          "${ARCINT_LLAMA_DIR}/ggml/include")
       target_compile_options(arcint-fa-paged-predicate PRIVATE -Wall -Wextra -Wpedantic)
       add_test(NAME fa-paged-predicate COMMAND arcint-fa-paged-predicate)
       set_tests_properties(fa-paged-predicate PROPERTIES LABELS unit)

@@ -14,9 +14,17 @@
 // tests/python/test_fa_gqa_i8.py's source-text cell (the kernel is not compiled
 // on the recipe host).
 //
+// Window 228 exposed two wrong values: the KV pair compared literals (Q4_0 is 2 in
+// ggml.h, not 4), so the agent's q8_0:q4_0 was declined while f16 passed; the test
+// now names the enums. The companion crash was the device-side page table: the
+// backend passed the tensor's base and ignored the used row, row 0 held INT32_MAX,
+// and the kernel read a pool row of 2^31 rows out of bounds -- the table row's
+// byte offset is passed now (or a host row is uploaded), see 0123zz.
+//
 // Red case (branch kv-stream-red6): the predicate's `kernels_ok` clause dropped,
 // so a shape without its kernel passes; the "no kernel" checks fail.
 
+#include "ggml.h"
 #include "ggml-opencl-fa-paged.h"
 
 #include <cstdio>
@@ -37,7 +45,7 @@ int g_failures = 0;
 // q4_0 V, a whole-page ring and a full-width mask
 ggml_cl_fa_paged_shape agent_decode() {
     ggml_cl_fa_paged_shape s{};
-    s.q_type = 0; s.k_type = 8; s.v_type = 4;          // F32, Q8_0, Q4_0
+    s.q_type = GGML_TYPE_F32; s.k_type = GGML_TYPE_Q8_0; s.v_type = GGML_TYPE_Q4_0;
     s.q_ne1 = 6; s.q_ne2 = 24; s.q_ne3 = 1;
     s.k_ne0 = 256; s.k_ne2 = 4; s.k_ne3 = 1;
     s.v_ne0 = 256; s.v_ne2 = 4; s.v_ne3 = 1;
@@ -56,9 +64,10 @@ int main() {
 
     // each clause, flipped on its own, must refuse
     { auto s = agent_decode(); s.table_ok = false; CHECK(!ggml_cl_fa_paged_ok(s), "a broken page table is refused"); }
-    { auto s = agent_decode(); s.k_type = 4; s.v_type = 8; CHECK(!ggml_cl_fa_paged_ok(s), "a q4_0 K / q8_0 V pair is refused"); }
+    { auto s = agent_decode(); s.k_type = GGML_TYPE_Q4_0; s.v_type = GGML_TYPE_Q8_0;
+      CHECK(!ggml_cl_fa_paged_ok(s), "a q4_0 K / q8_0 V pair is refused"); }
     { auto s = agent_decode(); s.k_ne0 = 128; CHECK(!ggml_cl_fa_paged_ok(s), "head 128 is refused"); }
-    { auto s = agent_decode(); s.q_type = 1; CHECK(!ggml_cl_fa_paged_ok(s), "q f16 is refused"); }
+    { auto s = agent_decode(); s.q_type = GGML_TYPE_F16; CHECK(!ggml_cl_fa_paged_ok(s), "q f16 is refused"); }
     { auto s = agent_decode(); s.mask_ok = false; CHECK(!ggml_cl_fa_paged_ok(s), "a compact mask is refused until I5"); }
     { auto s = agent_decode(); s.ring_ok = false; CHECK(!ggml_cl_fa_paged_ok(s), "a ring whose K/V pair is half present is refused"); }
     { auto s = agent_decode(); s.k_ne3 = 2; CHECK(!ggml_cl_fa_paged_ok(s), "a multi-stream K view is refused"); }
