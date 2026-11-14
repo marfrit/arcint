@@ -183,7 +183,7 @@ int main() {
             const size_t kb = (size_t) s.host_k((int32_t) l)->nb[2], vb = (size_t) s.host_v((int32_t) l)->nb[2];
             const size_t rb = (size_t) rk->nb[1],             rvb = (size_t) rv->nb[1];
             bool fits = kb == vb && rb == rvb;
-            for (int64_t p = 0; p < s.n_pages(); ++p) {
+            for (uint32_t p = 0; p < s.n_context_pages(); ++p) {
                 const int32_t row = pl[p];
                 if (row < 0) continue;
                 fits = fits && (size_t) row*ps*rb + kb <= ggml_nbytes(rk) &&
