@@ -6119,7 +6119,7 @@ run with replay off and on, a rollback of 4 after 22 tokens then 4 new tokens,
 gives the same logits (`after 22` and the 64-logit sum equal, `measured-here`).
 Device-free cell: `tests/python/test_gdn_replay_model_branches.py` (text, red
 on the fault with the qwen35moe branch dropped, green with it). Card arms
-unchanged; the coder's replay arm still owes its served record.
+unchanged; the coder's served replay arm is recorded under 0127 (window 270).
 
 ## 0088-opencl-gqa-int8-qk.patch
 
@@ -6790,7 +6790,7 @@ What it does to the numbers on the CPU (`measured-here`, 2026-11-07, recipe host
 
 So the folded vectors and the GLU change nothing on the CPU, and dropping the two norms costs what any one-ulp change costs this model: the control, which moves every layer's output by at most one ulp and nothing else, gives slightly more KL and a lower top-1 than the patch. Dory amplifies a rounding difference through its 112 (192) layers to about 0.008-0.009 nats against a fixed reference; the A770's KL against the CPU reference was 0.0091 at 2 loops before this patch (0108's section), which is the same floor. A CPU-against-itself comparison has a floor of 0, which is no bar (CLAUDE.md, the answer-level bar), so the card arms decide: base deb and this deb against the same CPU reference, on the same card and in the same window, at ubatch 512 and 1. At 4 loops (the same text and settings, PPL 12.0318): `LLAMA_DORY_FOLD=0` 0.000000 (top-1 99.975 %: two near-ties that the logit file's rounding flips, the PR graph against its own logits gives the same), `1` 0.000000 (99.975 %), `2` 0.008032 +- 0.000483 (95.515 %), and the one-ulp control 0.008028 +- 0.000376 (95.686 %).
 
-On the cards (`measured-here`, 2026-11-07, arcint served, a 5.9k-token prompt and a 400-token greedy decode, decode from the slot's own timing; base = 0111 + 0112, two rounds interleaved): B60 2 loops q8_0:q4_0 decode 28.6 -> 39.1 t/s (+37 %), prefill 2,522 -> 2,731 (+8 %); 4 loops q8_0:q4_0 17.2 -> 23.6 (+37 %), 1,474 -> 1,609; 2 loops f16 30.5 -> 42.8 (+40 %, the same answer's md5), 2,637 -> 2,874. A770 2 loops q8_0:q4_0 19.1 -> 28.5 (+49 %), 1,054 -> 1,121; 4 loops 11.5 -> 17.2 (+50 %), 624 -> 663. Priced apart at 2 loops q8_0:q4_0: `LLAMA_DORY_FOLD=1` 38.4 t/s (B60) and 27.7 (A770), `GGML_OPENCL_FUSE_NGPT=0` 38.1 and 27.3, so the fold carries most of the gain and the fused update 2-3 % more. KL against the CPU running the PR graph (`LLAMA_DORY_FOLD=0`), 16 chunks of 512, base -> new: B60 2 loops f16 0.00787 -> 0.00787 (top-1 96.47 -> 96.42 %), ubatch 1 0.00792 -> 0.00792, 4 loops 0.01128 -> 0.01153; A770 0.00796 -> 0.00792, ubatch 1 0.00792 -> 0.00791, 4 loops 0.01126 -> 0.01125; q8_0:q4_0 new 0.0128 (B60) and 0.0123 (A770). The review fixes (placement by an F32 `MUL` probe, the sources host-only) served the same text at the same speed (B60 39.2, A770 28.5 t/s) and the same KL.
+On the cards (`measured-here`, 2026-11-07, arcint served, a 5.9k-token prompt and a 400-token greedy decode, decode from the slot's own timing; base = 0111 + 0112, two rounds interleaved): B60 2 loops q8_0:q4_0 decode 28.6 -> 39.1 t/s (+37 %), prefill 2,522 -> 2,731 (+8 %); 4 loops q8_0:q4_0 17.2 -> 23.6 (+37 %), 1,474 -> 1,609; 2 loops f16 30.5 -> 42.8 (+40 %, the same answer's md5), 2,637 -> 2,874. A770 2 loops q8_0:q4_0 19.1 -> 28.5 (+49 %), 1,054 -> 1,121; 4 loops 11.5 -> 17.2 (+50 %), 624 -> 663. Priced apart at 2 loops q8_0:q4_0: `LLAMA_DORY_FOLD=1` 38.4 t/s (B60) and 27.7 (A770), `GGML_OPENCL_FUSE_NGPT=0` 38.1 and 27.3, so the fold carries most of the gain and the fused update 2-3 % more. KL against the CPU running the PR graph (`LLAMA_DORY_FOLD=0`), 16 chunks of 512, base -> new: B60 2 loops f16 0.00787 -> 0.00787 (top-1 96.47 -> 96.42 %), ubatch 1 0.00792 -> 0.00792, 4 loops 0.01128 -> 0.01153; A770 0.00796 -> 0.00792, ubatch 1 0.00792 -> 0.00791, 4 loops 0.01126 -> 0.01125; q8_0:q4_0 new 0.0126 (B60) and 0.0123 (A770). The review fixes (placement by an F32 `MUL` probe, the sources host-only) served the same text at the same speed (B60 39.2, A770 28.5 t/s) and the same KL.
 
 The PR graph stays one switch away: `LLAMA_DORY_FOLD=0` (read at load) builds exactly 0108's graph (KL 0 above), `1` the folded vectors only. With 0 the OpenCL fusion of 0114 finds nothing to fuse (its pattern has the alpha chain in the middle). The memory-fit pass (`no_alloc`) builds the PR graph, which needs slightly more compute buffer, so the fit stays conservative.
 
@@ -7550,8 +7550,10 @@ Fixes 0086/0087's OpenCL replay kernel (`GDN_RPL`, `kernel_gated_delta_net_rpl`)
 kernels do. The replay body is the generation kernel's per-token step with a replay prologue and
 a record epilogue, and its `intel_sub_group_block_read/write` and `sub_group_reduce_add` work over
 one sub-group of SG work-items with every index `m*SG` (SG 8 on the A770, 16 on the B60). Without
-the declaration the compiler's sub-group size is not SG: a smaller SIMD size leaves gaps in the
-state rows and overlaps in the block reads, so the replay state is wrong from the first launch.
+the declaration the compiler's sub-group size is not pinned to SG, and the kernel's indexing holds
+only at SG; which size the compiler picked was not read back (`inferred`). The card result below
+is the evidence: the replay state is wrong from the first launch without the declaration and
+right with it.
 
 **Measured (`measured-here`, 2026-11-14, window 267, the replay-coder tree before this patch,
 `test-backend-ops -b GPUOpenCL -o 'GATED_DELTA_NET.*'`, `LLAMA_GDN_REPLAY=1`, one process an
@@ -7565,10 +7567,13 @@ why the defect survived: the chain cases had never run on a card — the plain `
 GATED_DELTA_NET` matches that name exactly and excludes every `GATED_DELTA_NET_REPLAY` case, and
 the earlier card arms used it.
 
-**Red before, green after**: the same two commands, A770 then B60 (`GGML_OPENCL_DEVICES=0:0`),
-must go 66/66 with the exact arms at max `|diff| 0.0`; the no-replay cases stay green. The
+**Red before, green after** (`measured-here`, 2026-11-14, window 270, the tree with 0127 and
+0128): 68/68 on the A770 and 68/68 on the B60; the same tree without 0127 (the red) 58/68 on the
+A770, the 8 chain cases failing again (max `|diff|` 1.50). The no-replay cases stay green. The
 device-free cell is `tests/python/test_gdn_replay_model_branches.py`'s 0127 checks: the replay
 kernel declares the sub-group size, as the other two kernels do (red on the pre-patch tree).
 0128 adds the coder's chain geometry (16 key heads, 2 v repeats = 32 value heads, K 5) beside
-the existing shapes, so the served unit's head counts are in the op suite. The served coder arm
-with `LLAMA_GDN_REPLAY=1` is still owed and is the one to run next.
+the existing shapes, so the served unit's head counts are in the op suite. Served (window 270):
+the coder with `LLAMA_GDN_REPLAY=1` on the A770 answers the capital, prefills 32k at 1031.5 t/s
+(1065.9 without replay), decodes at 65k at 34.6-39.7 t/s and scores the acceptance task 10/10;
+the dense agent with replay on the B60 answers the capital, no assert.
