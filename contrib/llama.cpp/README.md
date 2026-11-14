@@ -7102,3 +7102,70 @@ into the KV cache yet -- that is I3's prerequisite, named below.
 - **Not measured:** any card; the copier/publisher threads, the second queue,
   the sync flags and the pool sizing (I3/I5); a served model (the CPU arm is
   the cell; arcint's llama engine requires an OpenCL card at start).
+
+## 0122-opencl-fa-paged-decode.patch
+
+The B60's GQA decode kernel learns 0119's page table and ring, and the backend
+accepts a paged `FLASH_ATTN_EXT` exactly for the shapes it now handles (design:
+`docs/campaigns/kv-streaming-design.md`, increment I3; reference: the fork's
+`1f6e1fccc`/`2a5beae21` page addressing at `b540a4b9b`, `code`).
+
+- **Kernel** (`ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl`): one
+  helper, `fa_gqa_page_row(table, ps, key, pool, pool_nb1, ring, ring_nb1)`:
+  `table[key/ps] >= 0` reads row `e*ps + key%ps` of the pool, `e < 0` reads
+  `(-1-e)*ps + key%ps` of the ring; a null table reads `key` rows as before. The
+  kernel gains 12 trailing args (table, page size, and the two ring slots'
+  pointer, offset and nb1/nb2/nb3). Its five K/V row reads go through the
+  helper: staging (`GQA_K_STAGED`), the int8 staged rows (0089), the int8 Q K^T's
+  direct and staged b operands (0088), and the V staging. **Deviation from the
+  fork, named:** the fork makes paging a compile-time `PAGED` switch; here one
+  build carries the helper with a `table == 0` runtime check, so an unpaged call
+  pays one uniform compare per key row (the rows are 544 B and up for K, so the
+  read dominates; the cost is to be measured, not inferred). A separate build
+  per switch is not taken because arcint's kernels are built once per type pair.
+- **Dispatch** (`ggml/src/ggml-opencl/ggml-opencl.cpp`): `n_kv` of a paged op
+  is `pages->ne[0]*page_size` (the attended length), not the pool's rows; a
+  paged op routes to the GQA kernel from **1** row (the 0089 staged form for
+  1-3 instead of the split kernel, which would attend the pool as the whole
+  layer); the 12 args are set for that launch only; a paged op that would reach
+  another kernel aborts with a message (`GGML_ABORT`, no silent path).
+- **`supports_op`**: true for a paged `FLASH_ATTN_EXT` only when the page table
+  is `I32`, contiguous, `[n_pages, n_tables]` with a valid row and page size
+  256; K/V is q8_0/q4_0, q8_0/q8_0, q4_0/q4_0 or f16/f16; head size 256, GQA
+  `(q heads/kv heads)*rows <= 64`, `q` f32; a full-width mask (the compact mask
+  is I5's); the ring rows are whole pages; and the GQA kernel of that pair is
+  built. A **sync tag** (`ready`/`consumed`) is still declined (I5's queue);
+  every other paged shape is declined. No CPU fallback is relied on: a served
+  start must refuse before this point (design §4.3, I5's marker cell).
+- **Test** (`0123`): paged cases in `test-backend-ops`, the agent's geometry.
+- **Not compiled here**: the recipe host builds the OpenCL C++ (EXIT 0) but has
+  no `ocloc`/driver, so the kernel text is compiled only in Claude's card
+  window. **Not measured:** any card, any speed, KL. The card commands are in
+  the handover and the design's I3.
+
+## 0123-tests-fa-paged-backend.patch
+
+Paged `FLASH_ATTN_EXT` cases in `test-backend-ops`, so the card window runs
+0122's kernel over the agent's shapes (design: increment I3).
+
+- **Case** `test_flash_attn_ext_paged`: head 256, `nh` KV heads, `nr` query
+  heads a KV head, `kv` keys, `nb` rows, K/V types, `ring_every`, `n_slots`.
+  The pool is the KV cache's layout (`[hs*nh, rows]`, all heads of a token in a
+  row) with `n_slots` resident pages in shuffled slots and unused pages between
+  them; every `ring_every`-th page from page 0 is in the ring, in reverse order
+  behind an unused page. The table is row 1 of two; row 0 is garbage. `n_slots`
+  smaller than `kv/256` is what makes pages stream.
+- **Registered**: at the agent's geometry (24 query heads on 4 KV heads, G 6),
+  6-row verify at kv 1,024 / 8,192 / 65,536 / 262,144 with the pool half the
+  context (ring every 2), and 1-row decode at the same kv with every page in
+  the ring and a 4-page pool; f16 K/V at 8,192; and the all-resident arm
+  (`ring_every=0`) at 8,192. 10 cases.
+- **Run**: `test-backend-ops test -o FLASH_ATTN_EXT -p 'n_slots=' -b <card>`,
+  and `perf` with the same filter (the case's `op_flops` prices a paged run).
+- **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host, the patched
+  tree's `test-backend-ops`, `-p 'n_slots='`): 10 of 10 OK, including the
+  262,144-key arms, against the CPU paged reference. That is the case plumbing
+  and the CPU path; it is **not** a card result and says nothing about 0122's
+  kernel.
+- **Not measured:** the card (Claude's window; the commands are in the
+  handover), paged against unpaged time, KL.

@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arcint <dev@arcint.invalid>
+Date: Sat, 14 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0123-tests-fa-paged-backend
+
+---
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index e63eb28..3168fec 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9264,6 +9264,110 @@ struct test_flash_attn_ext : public test_case {
+ };
+ 
+ // large Q values, so the online softmax has to rescale the partial results
++// GGML_OP_FLASH_ATTN_EXT over paged K/V (0119/0122, ggml_flash_attn_ext_set_pages):
++// a pool laid out like the KV cache (all heads of a token in one row) holds the
++// resident logical pages in shuffled slots with unused pages between them; the
++// pages a small pool cannot hold are in the ring, every ring_every-th page
++// starting with page 0, in reverse order behind an unused page. The table is row
++// 1 of two, row 0 is garbage. n_slots pages are resident, so n_slots < kv/page
++// makes the pool smaller than the context and pages stream.
++struct test_flash_attn_ext_paged : public test_case {
++    static constexpr int64_t page = 256;
++
++    const int64_t hs;
++    const int64_t nh;
++    const int64_t nr;
++    const int64_t kv;
++    const int64_t nb;
++    const ggml_type type_K;
++    const ggml_type type_V;
++    const int ring_every;
++    const int64_t n_slots;
++
++    std::string vars() override {
++        return VARS_TO_STR9(hs, nh, nr, kv, nb, type_K, type_V, ring_every, n_slots);
++    }
++
++    double max_nmse_err() override {
++        return 5e-4;
++    }
++
++    uint64_t op_flops(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return 2 * nh*nr * nb * (2*hs) * kv;
++    }
++
++    test_flash_attn_ext_paged(int64_t hs = 256, int64_t nh = 4, int64_t nr = 6, int64_t kv = 1024, int64_t nb = 6,
++            ggml_type type_K = GGML_TYPE_Q8_0, ggml_type type_V = GGML_TYPE_Q4_0, int ring_every = 2, int64_t n_slots = 2)
++        : hs(hs), nh(nh), nr(nr), kv(kv), nb(nb), type_K(type_K), type_V(type_V), ring_every(ring_every), n_slots(n_slots) {}
++
++    int64_t n_pages() const { return kv / page; }
++    int64_t n_ring()  const { return ring_every ? (n_pages() + ring_every - 1) / ring_every : 0; }
++    int64_t n_res()   const { return n_pages() - n_ring(); } // resident pages the table maps
++    int64_t pool_rows() const { return (n_slots + 3) * page; }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        GGML_ASSERT(kv % page == 0);
++        GGML_ASSERT(n_res() <= n_slots && "the paged case's pool cannot hold its resident pages");
++
++        auto heads = [&](ggml_type type, int64_t rows, const char * name) {
++            ggml_tensor * t = ggml_new_tensor_2d(ctx, type, hs*nh, rows);
++            ggml_set_name(t, name);
++            return ggml_view_4d(ctx, t, hs, rows, nh, 1, t->nb[1], ggml_row_size(type, hs), ggml_nbytes(t), 0);
++        };
++
++        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*nr, 1);
++        ggml_set_name(q, "q");
++
++        ggml_tensor * k = heads(type_K, pool_rows(), "k_pool");
++        ggml_tensor * v = heads(type_V, pool_rows(), "v_pool");
++
++        ggml_tensor * rk = n_ring() ? heads(type_K, (n_ring() + 1) * page, "k_ring") : nullptr;
++        ggml_tensor * rv = n_ring() ? heads(type_V, (n_ring() + 1) * page, "v_ring") : nullptr;
++
++        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
++        ggml_set_name(m, "m");
++
++        ggml_tensor * pages = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_pages(), 2);
++        ggml_set_name(pages, "pages");
++
++        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
++        ggml_flash_attn_ext_set_pages(out, pages, 1, page, rk, rv);
++        ggml_prec_set_acc(out, GGML_PREC_F32);
++        ggml_set_name(out, "out");
++
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (strcmp(t->name, "pages") == 0) {
++                // resident pages take shuffled pool slots; the ring pages go behind
++                // an unused page, in reverse logical order
++                std::vector<int32_t> slots(n_slots);
++                std::iota(slots.begin(), slots.end(), 0);
++                std::shuffle(slots.begin(), slots.end(), std::mt19937(1234));
++                std::vector<int32_t> table(2*n_pages(), INT32_MAX);
++                int32_t res = 0, ring = 0;
++                for (int64_t i = 0; i < n_pages(); ++i) {
++                    if (ring_every && i % ring_every == 0) {
++                        table[n_pages() + i] = -1 - (int32_t) (n_ring() - 1 - ring);
++                        ring++;
++                    } else {
++                        table[n_pages() + i] = slots[(size_t) res];
++                        res++;
++                    }
++                }
++                ggml_backend_tensor_set(t, table.data(), 0, ggml_nbytes(t));
++            } else if (strcmp(t->name, "m") == 0) {
++                init_tensor_kq_mask(t);
++            } else {
++                init_tensor_uniform(t);
++            }
++        }
++    }
++};
++
+ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
+     static constexpr int q_range = 20;
+ 
+@@ -12871,6 +12975,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             }
+         }
+     }
++    // 0119/0122: paged K/V at the agent's geometry (head 256, 4 KV heads x 6,
++// q8_0 K / q4_0 V), decode and 6-row verify, kv 1k to 262k, pools smaller than
++    // the context with every second page in the ring. The last two arms are all-ring
++    // (a pool that holds nothing of the attended range) and f16 K/V.
++    for (int64_t kv : {1024, 8192, 65536, 262144}) {
++        const int64_t n_pages = kv/256;
++        const int64_t n_res   = n_pages - (n_pages + 1)/2; // ring every 2
++        test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, kv, 6, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, n_res));
++        test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, kv, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 1, 4));
++    }
++    test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, 8192, 6, GGML_TYPE_F16, GGML_TYPE_F16, 2, 16));
++    test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, 8192, 6, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 0, 32));
+     // Mistral Small 24B's geometry (head size 128, 32 query heads on 8):
+     // decode, verify rows, prompts; f16 and quantized K/V
+     for (auto kv_t : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},
