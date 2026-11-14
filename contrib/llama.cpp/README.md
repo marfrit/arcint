@@ -7532,7 +7532,7 @@ Red arm, run here (`measured-here`, device-free): a translation unit with
 ("static assertion failed: GGML_MAX_SRC must hold every paged FA source"); the
 layers cell's source read would then read outside `src[]`.
 
-## 0127-kv-stream-usm-clear-and-test-host-store.patch
+## 0129-kv-stream-usm-clear-and-test-host-store.patch
 
 Two defects the round-3 build hit on the B60, window 269 (`measured-here`).
 

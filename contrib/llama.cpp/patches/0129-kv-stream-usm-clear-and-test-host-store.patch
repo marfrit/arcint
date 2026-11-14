@@ -7,7 +7,7 @@ index 6c8eb09..c54a900 100644
      ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
      ctx->drop_f16_copies();   // 0110: they would hold the old values
 +    if (ctx->usm != nullptr) {
-+        // 0127: a USM host buffer's bytes are host memory (the placeholder cl_mem is 64
++        // 0129: a USM host buffer's bytes are host memory (the placeholder cl_mem is 64
 +        // bytes); fillBuffer(buffer->size) on it faulted the device (window 269, ENOENT)
 +        memset(ctx->usm, value, buffer->size);
 +        return;
@@ -21,7 +21,7 @@ index 6c8eb09..c54a900 100644
      const int32_t * pl = (const int32_t *) ggml_backend_opencl_usm_ptr(plan);
 -    if (hk == nullptr || hv == nullptr || pl == nullptr) {
 -        GGML_ABORT("ggml_opencl: a paged attention with a host store that is not USM host memory");
-+    // 0127: the op test allocates its host store in the backend's ordinary buffer (the
++    // 0129: the op test allocates its host store in the backend's ordinary buffer (the
 +    // serving stream uses USM host memory). A regular host store is copied on the device
 +    // instead; its layout is AOS (regions() returns one region for it), so the bytes are
 +    // a byte copy. The plan is tiny and read on the host, so it is copied to host memory.
