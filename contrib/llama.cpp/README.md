@@ -7417,8 +7417,11 @@ tokens and then ended in a page fault: xe reset the compute and copy engines
   slots with `ggml_backend_tensor_set(slot, page, offset, bytes)`, so its first
   move read past the host page and wrote planes past the slot. A partial write
   of a q8_0 / q4_0 tensor that is not a weight now takes the plain copy (the
-  attention reads these as blocks); a partial write into a tensor that was
-  split is an assert. The cache itself never met this: `SET_ROWS` writes it.
+  attention reads these as blocks), when the tensor is not a view and was
+  never split; every other write keeps the old paths. The cache itself never
+  met this: `SET_ROWS` writes it. (A first form asserted on a partial write
+  into a split tensor; `test-backend-ops` initializes such tensors in parts
+  and stopped on it, window 266, so the old paths stay for them.)
 - **The page moves are not per layer.** The stream has two ring slots, a layer
   using `slots[ikv % 2]`, and `prepare()` fills them for every layer before the
   graph runs, so each layer but the last two would read another layer's pages.

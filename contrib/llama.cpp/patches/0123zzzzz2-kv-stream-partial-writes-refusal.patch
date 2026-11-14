@@ -4,16 +4,16 @@
      }
  
  #ifdef GGML_OPENCL_SOA_Q
-+    // 0123zzzzz2: a partial write of a q8_0 / q4_0 tensor that is not a weight takes the plain copy at the end.
-+    // The KV stream moves single pages into its pool and ring slots, which the attention reads as blocks;
-+    // the SoA split below converts a whole tensor (it writes ggml_nbytes from `data` at `offset`, so a page
-+    // move ran past the slot: a B60 page fault, window 255)
++    // 0123zzzzz2: a partial write of a q8_0 / q4_0 tensor that is not a weight, not a view and never split
++    // takes a plain copy. The KV stream moves single pages into its pool and ring slots, which the attention
++    // reads as blocks; the SoA split below converts a whole tensor (it writes ggml_nbytes from `data` at
++    // `offset`, so a page move ran past the slot: a B60 page fault, window 255). Every other write keeps the
++    // paths below as they were (a view returns there, a split tensor is split again).
 +    const bool cl_plain_part = (tensor->type == GGML_TYPE_Q8_0 || tensor->type == GGML_TYPE_Q4_0) &&
 +        ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-+        (offset != 0 || size != ggml_nbytes(tensor));
++        (offset != 0 || size != ggml_nbytes(tensor)) && tensor->view_src == nullptr &&
++        !(tensor->type == GGML_TYPE_Q8_0 ? ggml_cl_is_q8_0_soa(tensor) : ggml_cl_is_q4_0_soa(tensor));
 +    if (cl_plain_part) {
-+        GGML_ASSERT(!(tensor->type == GGML_TYPE_Q8_0 ? ggml_cl_is_q8_0_soa(tensor) : ggml_cl_is_q4_0_soa(tensor)) &&
-+                    "a partial write into a flattened tensor");
 +        ggml_tensor_extra_cl * extra_plain = (ggml_tensor_extra_cl *) tensor->extra;
 +        GGML_ASSERT(extra_plain);
 +        if (!ggml_cl_stage_write(backend_ctx, buffer, extra_plain->data_device, extra_plain->offset + offset, data, size)) {
