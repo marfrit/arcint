@@ -7359,49 +7359,67 @@ well-formed. **Not on a card:** the next window's run.
 
 A verify of 9 to 64 query rows (more than 8 drafts, several lanes' verifies in
 one ubatch, a short prompt tail) runs as one call of the GQA decode kernel
-(`flash_attn_gqa_dpas.cl`) when its (head, token) rows fit the kernel's row
-tiles, instead of 0028's blocks of 8 rows. K/V is then staged once per
-work-group for all rows, where the blocks stage it once per block.
+(`flash_attn_gqa_dpas.cl`) when its (head, token) rows fit the kernel's 8 row
+tiles (64 rows: 10 tokens at the dense 27B's 6 query heads a KV head), instead
+of 0028's blocks of 8 rows. K/V is then staged once per work-group for all
+rows, where the blocks stage it once per block. The kernel is unchanged.
 
-- **Tiles:** `GGML_OPENCL_FA_GQA_TILES` = 8 (default, 64 rows: 10 tokens at the
-  dense 27B's 6 query heads a KV head) or 16 (128 rows, 21 tokens). The kernel
-  is built at 256 GRF a thread; its work-group is sides x tiles x 16
-  work-items and must fit `CL_KERNEL_WORK_GROUP_SIZE`. 24 and 32 tiles do not
-  build on the B60 (`measured-here`: the kernel is refused at load and the
-  decode falls back to `flash_attn_f32_f16`).
 - **Routing:** the decision is made after the op parameters are read (it needs
   the K/V pair, ALiBi and softcap) and only when the GQA kernel for the pair is
   built. A wide call skips the prompt kernel (`flash_attn_dpas.cl`) and the K/V
   dequantization, and runs with the Intel decode settings of the 4-8-row GQA
-  calls (split size, partial buffer). Calls that do not fit keep the blocks.
-  4-8-row calls route as before. Paged K/V takes the same call (the kernel
-  reads the page table).
-- **Kernel:** the local arrays sized for 8 tiles (the S exchange, the int8 Q
-  operand and its scales, `fa_gqa_i8_stage_rows`) follow `GQA_TILES`.
+  calls (split size, partial buffer). Calls that do not fit keep the blocks;
+  4-8-row calls route as before. Paged K/V takes the same call (the kernel reads
+  the page table). The A770 builds no GQA kernel (it has 8-wide sub-groups), so
+  nothing changes there (`code`).
 - **Switches:** `GGML_OPENCL_FA_WIDE_VERIFY=0` keeps the blocks;
-  `GGML_OPENCL_FA_DEBUG=1` logs each call's form, rows and tiles.
+  `GGML_OPENCL_FA_DEBUG=1` logs each call's form, rows and tiles (test-backend-ops
+  shows it; the server's log does not).
 - **Tests:** `test-backend-ops` cases at the agent's geometry, 9, 10, 17, 21 and
   32 tokens, f16 (4,096 and 8,192 keys) and q8_0 / q4_0 (8,192 and 65,536), and
   two paged verifies (10 and 17 rows).
-- **Card** (`measured-here`, B60, 2026-11-14, window 242, trees of 38f96336 with
-  f16 arms at 8,192 and 32,768): `GGML_OPENCL_FA_DEBUG` shows `form=gqa` for the
-  wide calls (9-10 rows at 8 tiles, 9-21 at 16; the 16-tile kernel builds). Every
-  q8_0 / q4_0 case and every paged case passes at 8 tiles, 16 tiles and with the
-  switch off. The red copy (a wide call launches one tile fewer) fails exactly
-  the cases that go wide: at 8 tiles 9 and 10 rows and the paged 10 (ERR
-  0.07-0.23), at 16 tiles also 17, 21 and the paged 17 (ERR 0.05-0.32); 32 rows
-  (the blocks) stay green. f16 at 32,768 keys misses the 5e-4 bound (0.0007) on
-  every route, the switch-off blocks included, hence the 4,096 / 8,192 arms. The
-  full `FLASH_ATTN_EXT` suite at 8 tiles: 3,109 of 3,115, the failures those f16
-  cases and the f16 paged prefill with a ring (0123's open case).
 
-History (`measured-here`, B60, 2026-11-14). The first form of this patch never
-ran its kernel. Wide calls reached the prompt kernel first, and its two red
-cases mutated dead code. Its perf figures (32 rows at 64k keys: 44.5 ms against
-139) were the prompt kernel in one call. Served, that one call is slower than
-the blocks: a 20-23-token tail over 122,880 tokens took 1,178 ms against
-845 ms (window 240, package 1.6.2 with `GGML_OPENCL_FA_ROW_BLOCKS=0`), which
-confirms 0028's own measurement. `test-backend-ops` perf is no basis for that
-comparison with quantized K/V: its K/V tensors are flattened, and the
-dispatcher rebuilds them to blocks once per call, so the blocks pay it once
-per block. This form is the first to launch the GQA kernel on wide rows.
+Measured on the B60 (`measured-here`, 2026-11-14):
+
+- **Op suite** (window 242, trees of 38f96336): wide calls take `form=gqa`; every
+  q8_0 / q4_0 and paged case passes, wide and switched off. The red copy (a wide
+  call launches one tile fewer) fails exactly the wide cases (9 and 10 rows,
+  the paged 10; ERR 0.07-0.23); the block cases stay green. f16 at 32,768 keys
+  misses the 5e-4 bound (0.0007) on every route, the switch-off blocks included,
+  hence the 4,096 / 8,192 arms. Full `FLASH_ATTN_EXT` suite: 3,109 of 3,115, the
+  failures those f16 cases and the f16 paged prefill with a ring (0123's open
+  case).
+- **Served** (window 243, dev binary of f165bf9c at 8 tiles, the agent's
+  command line, a 122,880-token prefix, 16 follow-up tails each, arms in
+  A B C C B A order): a 10-token tail took 561 / 560 ms against 653 / 652 with
+  the switch off (-14 %); a 20-token tail (120 rows, the blocks) 851 ms on both;
+  prefill 232.4-232.7 s on every arm. Decode (window 245): 144.5-147.5 ms a
+  verify step, unchanged.
+- **Answers** (window 244, `llama-perplexity`, the agent's Q4_K_M with q8_0 /
+  q4_0 KV and FA against the Q8_0 CPU reference, 32 chunks of 512 at ubatch 10,
+  so 60-row calls): mean KLD 0.009329 against 0.009322 switched off, same top
+  96.752 % against 96.777 % (bar: 0.03 nats, 1 point). The red build gives
+  0.888 / 78.63 %, so the arm runs the path.
+
+**16 tiles (128 rows), measured and left out.** A 16-tile build passes the op
+suite (wide calls to 21 tokens, the red fails them) and served a 20-token tail
+in 747 ms against 851 (-12 %). Served, one greedy 256-token answer after a
+22-token question over 122,880 tokens came back empty (0 tokens) in all five
+16-tile arms of windows 245 and 247, including one with the wide route switched
+off, so the defect lies in the 16-tile kernel build, which also runs the
+4-8-row MTP verify, not in the wide call. The same question at 8 tiles answers
+normally, and asked alone for 32 tokens it answers at 16 tiles too (window
+246). Not found; the patch builds only the 8 tiles.
+
+History. The first form of this patch never ran its kernel. Wide calls reached
+the prompt kernel first, and its two red cases mutated dead code. Its perf
+figures (32 rows at 64k keys: 44.5 ms against 139) were the prompt kernel in one
+call. Served, that one call is slower than the blocks: a 20-23-token tail over
+122,880 tokens took 1,178 ms against 845 ms (window 240, package 1.6.2 with
+`GGML_OPENCL_FA_ROW_BLOCKS=0`), which confirms 0028's own measurement.
+`test-backend-ops` perf is no basis for that comparison with quantized K/V: its
+K/V tensors are flattened, and the dispatcher rebuilds them to blocks once per
+call, so the blocks pay it once per block. Its 24-tile builds measured the
+`flash_attn_f32_f16` fallback (the kernel does not build at 256 GRF), and its
+first launches on wide rows crashed on a base that read the page table of an
+unpaged call (fixed in kv-ringaos).
