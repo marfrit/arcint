@@ -7225,3 +7225,39 @@ reuse check is conservative (below).
   host, and arcint's llama engine needs an OpenCL card at start. The device-free
   behavioural evidence stays `kv-stream-map` (green) with its reds
   `kv-stream-red2` (eviction) and `kv-stream-red3` (a one-page table shift).
+
+## 0123a-opencl-fa-paged-prefill.patch
+
+I4: a paged prompt's pages are gathered into f16 blocks and the f16 prompt
+kernel runs on them; the decode path's page table is uploaded to the device
+(I5's table upload). Design: increment I4; reference: the fork's `9e9e46f86`
+chunked paged prefill at `b540a4b9b` (`code`) -- **deviation, named**: the fork
+attends page runs as chunks merged by log-sum-exp; here the rows are gathered
+by 0037's conversion kernel into its two 32 MiB blocks and the existing f16
+kernel runs with its carry, which is the fork's own gather form. The chunk size
+is 0037's block (`GGML_OPENCL_FA_DPAS_F16KV_BLOCK`), not the fork's
+`GGML_CUDA_PREFILL_CHUNK`; the page-runs merge is left to I5's card round.
+
+- **Conversion kernel** (`flash_attn_dpas.cl`): `flash_attn_kv_to_f16` gains
+  eight trailing args (the table, page size, the logical key base `kv0`, and the
+  ring's pointer, offset and nb1/nb2/nb3). With a table, logical key `kv0+key`
+  reads pool page `e` (entry >= 0) or ring page `-1-e` with the ring's own
+  strides; a null table reads the contiguous view as before.
+- **Dispatch** (`ggml-opencl.cpp`): a paged op with more than 64 GQA rows (a
+  prompt) forces the 0037 gather path; the table row is uploaded once to a
+  device buffer on the compute queue and released after the queued conversions
+  (a queued command holds it). The 0038 f16 kernel then reads the blocks. The
+  decode path's table is uploaded the same way when the page tensor is not
+  already a device buffer. Cost: 4 KiB per ubatch at 262,144 cells.
+- **`supports_op`**: a paged prefill is accepted when the conversion kernel and
+  the f16 prompt kernel are built; the GQA row cap now applies only to the
+  decode shape, so a 512-row prompt is not declined (and cannot slip to the CPU
+  reference).
+- **Cases** (`test-backend-ops`): paged prefill at the agent's geometry, 512
+  rows, kv 8,192 and 4,096, q8_0:q4_0 and f16, pools half the context and the
+  whole one (3 cases, next to 0123's).
+- **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host): the five
+  paged cases with `n_slots=16` (the three prefill arms among them) 5 of 5 OK on
+  the CPU. **Not compiled or measured on a card**: the OpenCL C++ builds
+  (recipe), the kernel text's first build is Claude's window, and the gather
+  path's speed is unmeasured.
