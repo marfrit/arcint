@@ -7088,6 +7088,12 @@ into the KV cache yet -- that is I3's prerequisite, named below.
     attention over the pool and the ring; its f32 output is `memcmp`-equal to
     the same attention over a contiguous cache holding the same bytes. At the
     fourth ubatch two of four pages stream.
+- **The graph's write** (review of 0120): a cell written straight into the pool
+  tensor (as `cpy_k`/`cpy_v` write it on the device) is marked dirty only by
+  `prepare`; the cell evicts after a second ubatch takes its slot, and the host
+  store must return the bytes it wrote. The no-op mutation of
+  `for (uint32_t c : cells) dirty[c/page_size] = 1;` fails that cell (4 checks)
+  and nothing else -- the section is the only place the graph's write is made.
 - **Red case** (branch `kv-stream-red2`): `evict` drops the write-back
   (`dirty[page]` -> `false`). It compiles and fails 6 checks -- the rotation
   cell (a dirty page evicted without its write-back reads different bytes) and

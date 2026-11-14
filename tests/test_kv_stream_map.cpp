@@ -239,6 +239,33 @@ void part_map() {
         CHECK(t[0] >= 0 && s4.resident(3) && !s4.resident(1), "map outside attended",
               "a written page, an attended page or an unattended page has the wrong residency");
     }
+
+    // 6: a cell written the way the graph writes it -- into the pool tensor on the
+    // backend, not through set_rows -- still goes back to the host store when its
+    // page is evicted. In serving only prepare's written-page marking makes the page
+    // dirty, so a no-op there loses the write-back.
+    {
+        fixture f5(2, 4);
+        llama_kv_stream s5(f5.layers(), 2, 4, 1024, ggml_backend_cpu_buffer_type());
+        s5.prepare(cells_of(1*256, 1*256 + 8), 1024); // page 1 written; pages 1 and 3 resident
+        // the graph's store: 256 rows straight into the layer's pool tensor at the
+        // rows stream->row gives, exactly as cpy_k/cpy_v write them on the device
+        for (int64_t l = 0; l < f5.n_layers; ++l) {
+            ggml_backend_tensor_set(f5.k[(size_t) l], cb.k.data() + (size_t) 1*256*cb.row_k,
+                    (size_t) s5.row(1*256)*cb.row_k, (size_t) 256*cb.row_k);
+            ggml_backend_tensor_set(f5.v[(size_t) l], cb.v.data() + (size_t) 1*256*cb.row_v,
+                    (size_t) s5.row(1*256)*cb.row_v, (size_t) 256*cb.row_v);
+        }
+        // a ubatch that needs page 1's slot: the pool is full, so page 1 is evicted
+        s5.prepare(cells_of(0, 8), 1024);
+        CHECK(!s5.resident(1), "map graph write-back", "page 1 was not evicted");
+        for (int64_t l = 0; l < f5.n_layers; ++l) {
+            std::vector<char> got((size_t) 256*cb.row_k);
+            s5.get_rows((int32_t) l, false, 1*256, 2*256, got.data());
+            CHECK(memcmp(got.data(), cb.k.data() + (size_t) 1*256*cb.row_k, got.size()) == 0,
+                  "map graph write-back", "bytes the graph wrote into the pool were lost at the eviction");
+        }
+    }
 }
 
 // part 2: the pages through a paged attention, compared with a contiguous cache
