@@ -7414,15 +7414,23 @@ Measured on the B60 (`measured-here`, 2026-11-14):
   96.752 % against 96.777 % (bar: 0.03 nats, 1 point). The red build gives
   0.888 / 78.63 %, so the arm runs the path.
 
-**16 tiles (128 rows), measured and left out.** A 16-tile build passes the op
-suite (wide calls to 21 tokens, the red fails them) and served a 20-token tail
-in 747 ms against 851 (-12 %). Served, one greedy 256-token answer after a
-22-token question over 122,880 tokens came back empty (0 tokens) in all five
-16-tile arms of windows 245 and 247, including one with the wide route switched
-off, so the defect lies in the 16-tile kernel build, which also runs the
-4-8-row MTP verify, not in the wide call. The same question at 8 tiles answers
-normally, and asked alone for 32 tokens it answers at 16 tiles too (window
-246). Not found; the patch builds only the 8 tiles.
+**16 tiles (128 rows): left out, open.** A 16-tile build passes the op suite
+(wide calls to 21 tokens, the red fails them), served a 20-token tail in 747 ms
+against 851 (-12 %, window 243), and at ubatch 20 gives the switched-off KL
+bit for bit (window 244). Its 4-8-row verify step, which runs the same kernel
+built with larger local arrays, took 147.7-148.7 ms against 144.5-147.5 at 8
+tiles (window 245, on greedy texts that diverged), so the trade between those
+tails and every decode step is not measured yet. It needs the tile switch and
+the tile-sized kernel arrays back (wide-verify3 f165bf9c has them).
+
+*Retracted* (2026-11-14, windows 245-249). A first reading called the 16-tile
+build defective: one greedy 256-token answer after a 22-token question over
+122,880 tokens came back empty in all five 16-tile arms. Window 248 then gave
+the same empty answer at 8 tiles, and window 249 measured the position: the
+package 1.6.2 itself answers it empty, and 30 samples at temperature 1 end at
+once 16 times on the package, 12 on this patch and 11 with it switched off.
+The model puts about 40-50 % on ending there, so the greedy pick flips with the
+B60's rounding on any build; it is no defect of the kernel or the route.
 
 History. The first form of this patch never ran its kernel. Wide calls reached
 the prompt kernel first, and its two red cases mutated dead code. Its perf
