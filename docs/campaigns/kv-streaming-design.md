@@ -235,9 +235,10 @@ at `k_offset + key*k_nb1 + h*k_nb2 + b*k_nb3` (e.g.
 key `t`, `e = table[t/256]`; source = `e >= 0 ? pool : ring`, row =
 `(e >= 0 ? e : -1-e)*256 + t%256`; the pool and the ring share `nb1/nb2`.
 The kernel gains a page-table pointer, the ring pointer with its strides, and
-`page_size`, and one packed literal covers it (`PAGED` compile switch, as the
-fork's `fattn-paged-decode-kernel.cuh:119`), so the unpaged build carries no
-table logic.
+`page_size`. **Built in 0122** as one helper with a `table == 0` runtime check
+rather than the fork's `PAGED` compile switch (one build per type pair; an
+unpaged call pays one uniform compare per key row; the cost is measured on the
+card, not inferred here).
 
 1. **0016, `flash_attn_gqa_dpas.cl`** (`0000-04:2705`): a work-group per (KV
    head, split), up to 8 (head, token) rows, 512-key splits of the KV head —
@@ -461,16 +462,29 @@ zombie sweep by pid; never run outside the window).
   is on; otherwise the existing kernel as before).
 - **Device-free**: the kernel-source compile check (ocloc/IGC on the recipe
   host) and the arg-count unit; the CPU reference stays I1's.
-- **Card (Claude)**, in one window, B60:
+- **Built in 0122/0123** (`code`; the recipe host compiles the OpenCL C++ only,
+  the kernel text had no `ocloc`/driver there). The kernel resolves rows in its
+  five K/V load sites (staging, 0089's int8 staged rows, 0088's int8 Q K^T
+  direct and staged b operands, the V staging); a paged op's attended length is
+  `pages->ne[0]*page_size`, it routes to this kernel from 1 row, and
+  `supports_op` accepts only head 256, the four type pairs, GQA rows <= 64, a
+  full mask and whole-page rings; anything else (a sync tag included) is
+  declined. Paged `test-backend-ops` cases: 10 of 10 OK on the CPU
+  (`measured-here`, the case plumbing; no card).
+- **Card (Claude)**, in one window, B60, with 0122/0123 applied:
   ```
   cmake --build build --target test-backend-ops
-  ./build/bin/test-backend-ops test -o FLASH_ATTN_EXT 2>&1 | tail -n 40   # paged + unpaged cases
-  GGML_OPENCL_FA_GQA_RED=1 ./build/bin/test-backend-ops test -o FLASH_ATTN_EXT 2>&1 | grep -c FAIL
-  ./build/bin/test-backend-ops perf -o FLASH_ATTN_EXT                            # 6 rows, 8k/131k/262k, q8_0:q4_0
+  ./build/bin/test-backend-ops test -o FLASH_ATTN_EXT -p 'n_slots=' -b OpenCL0
+  ./build/bin/test-backend-ops perf -o FLASH_ATTN_EXT -p 'n_slots=' -b OpenCL0
+  ./build/bin/test-backend-ops test -o FLASH_ATTN_EXT -p 'kv=8192,nb=6' -b OpenCL0
   ```
-  The red switch flips a ring entry's sign or shifts a table page; the paged
-  cases must FAIL red and PASS green. Report the paged/unpaged ms at each
-  depth and the ring-page-mid-split case.
+  The first is the 10 paged cases (1k/8k/65k/262k keys, 1 and 6 rows, pools
+  half the context or 4 pages all-ring, f16 and q8_0:q4_0); the second prices
+  them; the third the unpaged twin at 8,192/6 rows for the A/B. A red arm flips
+  one ring entry's sign in the case's `initialize_tensors` (a private tree):
+  the paged cases must fail. Report whether the kernel builds at all, and
+  paged against unpaged ms at each depth; a table load and one uniform compare
+  per key row are the only kernel changes.
 - Served leg: the agent at 131k, stream on against off in one window, MTP 5,
   answers + the capital + the needle; prefill and decode both.
 
@@ -537,6 +551,27 @@ zombie sweep by pid; never run outside the window).
      layers, not a full re-stream every round.
 
 ## Current state
+
+**I3 kernels and cases built** 2026-11-14 (patch 0122, cases 0123): 0016's
+`flash_attn_gqa_dpas.cl`, with 0088's int8 Q K^T and 0089's staged 1-3 rows,
+resolves K/V rows through the page table and the ring; the backend takes a
+paged op's attended length from the table, routes it to that kernel from 1 row,
+and `supports_op` accepts only the shapes the kernel now handles (sync tags
+still declined, I5). Paged `test-backend-ops` cases: 10 of 10 OK on the CPU
+(`measured-here`, plumbing only). **Not compiled or run on a card**: the
+kernel text's first build is Claude's window. **The wiring landed** in 0121:
+`cparams.kv_resident_size` (0 = off, arcint sets it only in I5), the cache's
+validation, pool sizing, shrunk tensors, the stream's construction,
+`prepare` in `apply_ubatch`, the page table and per-layer ring views built in
+the graph and set on the fused FA node, filled in `set_input`; the structural
+cell `kv-stream-cache` passes. **A stream-on model run is not possible here**:
+no GGUF is committed and arcint's llama engine throws at start without an
+OpenCL card (`backend_llama.cpp:505-520`), so the behavioural evidence stays
+`kv-stream-map` (green) with reds `kv-stream-red2` and `kv-stream-red3` (the
+one-page table shift). Named deviations in 0121: a stream-on graph is never
+reused (the fork compares `layout_id`; here `can_reuse` returns false, cost to
+measure), and the table's device upload for OpenCL is I5's queue path.
+Everything else as below.
 
 **I2 built** 2026-11-14 (patch 0120): the stream class's page map, host store,
 eviction/write-back and table, the device-free `kv-stream-map` cell green and

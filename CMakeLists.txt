@@ -607,6 +607,18 @@ if(ARCINT_TESTS)
     target_compile_options(arcint-kv-stream-map PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME kv-stream-map COMMAND arcint-kv-stream-map)
     set_tests_properties(kv-stream-map PROPERTIES LABELS unit)
+    # patch 0121's device-free cell: the stream reaches llama_kv_cache and the graph and
+    # stays off by default; reads the patched tree's source (a GGUF and a card are not
+    # available here). Design: increment I3's prerequisite.
+    add_executable(arcint-kv-stream-cache tests/test_kv_stream_cache.cpp)
+    target_link_libraries(arcint-kv-stream-cache PRIVATE arcint_core)
+    target_include_directories(arcint-kv-stream-cache PRIVATE
+        "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/ggml/include")
+    target_compile_definitions(arcint-kv-stream-cache PRIVATE
+        ARCINT_KV_STREAM_SRC_DIR="${ARCINT_LLAMA_DIR}/src")
+    target_compile_options(arcint-kv-stream-cache PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME kv-stream-cache COMMAND arcint-kv-stream-cache)
+    set_tests_properties(kv-stream-cache PROPERTIES LABELS unit)
     # TODO(I5), design section 4.3: the start refusal that stops the scheduler's
     # silent CPU placement of a paged FA (0119's OpenCL supports_op declines the
     # op). The marker is DISABLED until I5 builds the probe and the refusal;

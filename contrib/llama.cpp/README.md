@@ -7169,3 +7169,52 @@ Paged `FLASH_ATTN_EXT` cases in `test-backend-ops`, so the card window runs
   kernel.
 - **Not measured:** the card (Claude's window; the commands are in the
   handover), paged against unpaged time, KL.
+
+## 0121-llama-kv-stream-cache.patch
+
+The KV stream reaches `llama_kv_cache` and the graph, off by default (design:
+`docs/campaigns/kv-streaming-design.md`, increment I3's prerequisite; reference:
+the fork's `143b62090`/`c68455740` cache and graph wiring at `b540a4b9b`,
+`code`). Not wired to the copy queue or the phase budgets (I5), and the graph
+reuse check is conservative (below).
+
+- **Parameter** (`include/llama.h`, `src/llama-cparams.h`): `kv_resident_size`,
+  device bytes of the resident KV pages, default **0 = off**, copied into
+  cparams (`llama-context.cpp`). arcint does not yet set it (the unit flags and the
+  refusal are I5).
+- **Cache** (`llama-kv-cache.cpp`): with the flag on, the cache validates the
+  paged kernel's shapes -- one stream (or unified), no V transpose, no shared
+  source cache, no SWA, no windows, q8_0 K / q4_0 V, head 256 -- refusing
+  otherwise at construction, never falling back. It sizes `n_slots` from the
+  bytes (`slots_for`, at least 8 pages), shrinks the K/V tensors to
+  `n_slots*256` rows, and constructs `llama_kv_stream` with the pool tensors, a
+  ring of `n_pages-n_slots` pages and the pool's buffer type. `get_k`/`get_v`
+  return the whole pool's view under streaming (the attention reads it through
+  the table). `apply_ubatch` calls `prepare(idxs[0], get_n_kv(sinfo))` before
+  the graph, so the written pages are resident before the graph's store and the
+  streamed pages are in the ring slots before its attention.
+- **Graph** (`llama-graph.cpp/.h`): the KV input carries the page table
+  (`I32 [n_kv/256, n_layer]`, a host input filled in `set_input`) and every
+  attention layer's ring views; `build_attn` sets them on the fused
+  `FLASH_ATTN` node with the layer's table row and expands the inputs.
+  **Deviation, named:** a stream-on graph is never reused
+  (`llm_graph_input_attn_kv::can_reuse` returns false), because a page move
+  changes what the views mean; the fork compares its `layout_id` instead. The
+  cost is one graph build per ubatch, to be measured with the stream on.
+- **Not in this patch**: the copy queue and the ready/consumed flags (I5), the
+  phase budgets and the pool resize, the table's device upload for OpenCL (the
+  scheduler places the host input; the OpenCL kernel argument takes the tensor's
+  extra, which I5's queue path owns), and any served run.
+- **Test** (`tests/test_kv_stream_cache.cpp`, `arcint-kv-stream-cache`, ctest
+  `kv-stream-cache`): reads the patched tree's source and checks the wiring's
+  shape (default 0, the validation strings, the shrunk rows, the stream's
+  construction, `prepare` in `apply_ubatch`, the table and ring views on the FA
+  node, the fill in `set_input`, the reuse refusal, the pool views in `get_k`).
+  Red: the default set to 1 fails the first check; a normal start would then
+  ask for a stream nobody requested.
+- **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host): the cell
+  passes at the green tree; the patched library builds and the recipe is green.
+  **Not measured:** a stream-on model run -- no GGUF and no card on the recipe
+  host, and arcint's llama engine needs an OpenCL card at start. The device-free
+  behavioural evidence stays `kv-stream-map` (green) with its reds
+  `kv-stream-red2` (eviction) and `kv-stream-red3` (a one-page table shift).
