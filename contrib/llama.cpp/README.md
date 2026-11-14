@@ -7287,9 +7287,15 @@ kernel stayed null. Evidence `code` (the source order) + `measured-here`
   kernel of the shape (GQA for `(q heads/kv heads)*rows <= 64`, the conversion
   + f16 prompt kernel for a prompt). `ggml_opencl_supports_op` fills it from the
   tensors and calls it.
-- **Diagnostic**: `GGML_OPENCL_FA_PAGED_DEBUG=1` logs the clauses (table, kv,
+- **Diagnostics**: `GGML_OPENCL_FA_PAGED_DEBUG=1` logs the clauses (table, kv,
   shape, mask, ring, the two kernel flags) and the verdict as one INFO line, so
   a declined paged case names its clause on the card.
+  `GGML_OPENCL_FA_PAGED_DUMP=1` logs what a paged launch is handed: `n_kv`,
+  page size, the table row and its byte offset, the pool's and the ring's row
+  counts and nb1/nb2 for K and V, and the table row's entries read back. Window
+  229's split -- f16 decode over a ring correct, q8_0:q4_0 decode NaN over a
+  ring, and both types' prefill conversion NaN -- is read from those lines
+  before the kernel's loaders are changed.
 - **Tests**: arcint's `tests/test_fa_paged_predicate.cpp` (`fa-paged-predicate`,
   ctest LABELS unit) drives `ggml_cl_fa_paged_ok` over the agent's decode shape
   (true) and flips every clause (each must refuse), plus prompts and 1-row

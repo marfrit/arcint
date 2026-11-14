@@ -70,7 +70,7 @@ index 0000000..8a64801
 +           s.mask_ok && s.ring_ok && kernels_ok;
 +}
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 2b69429..7f070c0 100644
+index 2b69429..55209b5 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -11,6 +11,7 @@
@@ -280,14 +280,36 @@ index 2b69429..7f070c0 100644
              }
              GGML_UNUSED(extra_pages);
              cl_mem   rk_buffer = extra_rk ? extra_rk->data_device : NULL;
-@@ -24876,6 +24899,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -24876,7 +24899,29 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
              const cl_ulong rv_nb1 = rv ? rv->nb[1] : 0, rv_nb2 = rv ? rv->nb[2] : 0, rv_nb3 = rv ? rv->nb[3] : 0;
              const int page_size_arg = kv_page_size;
              CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &table_buffer));
 +            CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &table_off));
              CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(int),      &page_size_arg));
++            if (kv_pages && getenv("GGML_OPENCL_FA_PAGED_DUMP")) {
++                // what the kernel is handed: the table row, the pool's and the ring's
++                // strides and row counts -- the numbers a wrong ring read turns on
++                const int32_t tr = ggml_get_op_params_i32(dst, GGML_FA_PARAM_PAGES_ROW);
++                std::vector<int32_t> entries((size_t) kv_pages->ne[0]);
++                ggml_cl_fa_table tb = ggml_cl_fa_table_row(backend_ctx, kv_pages, tr);
++                CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, tb.mem, CL_TRUE, tb.off,
++                        entries.size()*sizeof(int32_t), entries.data(), 0, NULL, NULL));
++                if (tb.uploaded) CL_CHECK(clReleaseMemObject(tb.mem));
++                std::string list;
++                for (int32_t e : entries) { list += std::to_string(e); list += ' '; }
++                GGML_LOG_INFO("ggml_opencl: paged FA dump: n_kv %d ps %d table_row %d table_off %llu\n",
++                        n_kv, page_size_arg, tr, (unsigned long long) table_off);
++                GGML_LOG_INFO("ggml_opencl: paged FA dump: k_rows %lld k_nb1 %llu k_nb2 %llu | rk_rows %lld rk_nb1 %llu rk_nb2 %llu\n",
++                        (long long) k->ne[1], (unsigned long long) k_nb1, (unsigned long long) k_nb2,
++                        (long long) (rk ? rk->ne[1] : 0), (unsigned long long) rk_nb1, (unsigned long long) rk_nb2);
++                GGML_LOG_INFO("ggml_opencl: paged FA dump: v_rows %lld v_nb1 %llu v_nb2 %llu | rv_rows %lld rv_nb1 %llu rv_nb2 %llu\n",
++                        (long long) v->ne[1], (unsigned long long) v_nb1, (unsigned long long) v_nb2,
++                        (long long) (rv ? rv->ne[1] : 0), (unsigned long long) rv_nb1, (unsigned long long) rv_nb2);
++                GGML_LOG_INFO("ggml_opencl: paged FA dump: table [%s]\n", list.c_str());
++            }
              CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &rk_buffer));
              CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &offset_rk));
+             CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &rk_nb1));
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
 index 44929d3..43212a6 100644
 --- a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
