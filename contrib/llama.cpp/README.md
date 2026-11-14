@@ -6114,10 +6114,12 @@ already carried for the rows form: it gains the `gdn_rpl` branch (state
 `build_rs(ssm_states_all, s_rpl_rows, s_rpl_main, ...)`, rows form off under
 replay), the text qwen35 and qwen4exp have. With it, `rs_s_rpl_rows` is read by
 the gather (13 input tensors, 12 before), the decode passes, and the
-checkpoint's partial state save (base + pending records) writes. Device-free
-cell: `tests/python/test_gdn_replay_model_branches.py` (text, red on the fault
-with the qwen35moe branch dropped, green with it). Card arms unchanged; the
-coder's replay arm still owes its served record.
+checkpoint's partial state save (base + pending records) writes. The same CPU
+run with replay off and on, a rollback of 4 after 22 tokens then 4 new tokens,
+gives the same logits (`after 22` and the 64-logit sum equal, `measured-here`).
+Device-free cell: `tests/python/test_gdn_replay_model_branches.py` (text, red
+on the fault with the qwen35moe branch dropped, green with it). Card arms
+unchanged; the coder's replay arm still owes its served record.
 
 ## 0088-opencl-gqa-int8-qk.patch
 
