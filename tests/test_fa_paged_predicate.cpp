@@ -21,7 +21,7 @@
 // and the kernel read a pool row of 2^31 rows out of bounds -- the table row's
 // byte offset is passed now (or a host row is uploaded), see 0123zz.
 //
-// 0123zzzzz6 (I5 review D): the shape and the caps are one pair of plain structs,
+// 0125 (I5 review D): the shape and the caps are one pair of plain structs,
 // and `ggml_cl_fa_paged_form` returns the form the dispatcher takes -- 1 the GQA
 // decode kernel, 2 the f16-block prefill conversion, 0 none. The dispatcher asks
 // the same function before choosing, so supports_op cannot accept a shape the

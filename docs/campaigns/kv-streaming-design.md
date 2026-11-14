@@ -525,7 +525,7 @@ zombie sweep by pid; never run outside the window).
 each attention layer's streamed pages into its ring slot inside its own FA
 dispatch, so a KV window beyond the pool no longer reads another layer's pages;
 the cache's cross-layer refusal is gone (~`if (pages)` prepare path). An outside
-review of the stream then found four defects, fixed in 0123zzzzz6 with the
+review of the stream then found four defects, fixed in 0125 with the
 device-free arms named there: the store indices map through
 `llama_kv_stream::row()` in both K and V (beyond the pool a cell index would
 write past the pool), with the state save/restore and `clear()` wired and KV

@@ -7466,7 +7466,11 @@ inside a 150k prompt with another page fault, this time the copy engine alone
 (`engine_class=bcs`): the planar split was one fault source, not the only one.
 Streaming beyond the pool stays refused until I5.
 
-## 0123zzzzz6-kv-stream-review-fixes.patch
+## 0125-kv-stream-review-fixes.patch
+
+Applies after 0124, not before: its dispatcher hunks sit beside the wide-verify
+block 0124 adds, so the glob order of `patches/*.patch` puts it last of the
+series. (0123zzzzz3 and 0123zzzzz5 still apply before 0124.)
 
 Fixes the four defects an outside review of the KV stream found on qfndev, each
 with a device-free arm (`code`):
