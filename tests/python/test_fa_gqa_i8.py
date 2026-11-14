@@ -88,7 +88,9 @@ class FaGqaI8(unittest.TestCase):
         self.assertTrue(i >= 0)
         block = t[i:t.find("    if (fd_k_split == NULL &&", i)]
         self.assertIn("n_q >= fg_min_rows", block, "GGML_OPENCL_FA_GQA_MIN_ROWS still routes")
-        self.assertIn("(n_head / n_head_kv) * n_q <= 64", block, "the 8-tile cap")
+        self.assertIn("(n_head / n_head_kv) * n_q <= backend_ctx->fa_gqa_tiles * 8", block, "the tile cap (0124)")
+        self.assertIn("if ((use_fd_intel || (gqa_wide && !is_causal)) && n_q >= fg_min_rows_paged", block,
+                      "0124: 4-8 rows route as before, wide rows reach the kernel")
         self.assertIn("n_q < 4", block, "1-3 rows take the staged form")
         self.assertIn("kernel_fa_gqa_st_dk[fa_dki][gi]", block)
         self.assertIn("if (kg == nullptr && gi >= 0) kg = backend_ctx->kernel_fa_gqa_dk[fa_dki][gi];", block,
