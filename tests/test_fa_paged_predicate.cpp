@@ -35,6 +35,7 @@
 
 #include "ggml.h"
 #include "ggml-opencl-fa-paged.h"
+#include "ggml-impl.h"   // GGML_FA_SRC_* and GGML_MAX_SRC (0126)
 
 #include <cstdio>
 
