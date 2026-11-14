@@ -7024,7 +7024,9 @@ for arcint; the cell below is the only number and it is not a rate.
 - **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host, the patched
   tree's own `arcint-fa-paged`, 1 thread): 6 of 6 cases byte-equal (full and
   compact masks), the ring red build 3 of 4 failing, the widening red build 2
-  of the 2 compact-mask cases failing. The recipe at the green tree: 37 of 37 unit tests
+  of the 2 compact-mask cases failing. The recipe at the widening's red tree
+  (`kv-stream-red-widen`, `b4a8cd98`): 38 with 1 failure, `fa-paged` failing
+  exactly those two cases, EXIT 8. The recipe at the green tree: 37 of 37 unit tests
   pass, EXIT 0, the .deb built; at the red tree (`kv-stream-red`, `fcbbfe90`):
   36 of 37, `fa-paged` the one failure, EXIT 8, no .deb -- it compiles and
   fails. Not a rate and not on a card.

@@ -548,7 +548,8 @@ engine requires a card at start). Everything else as below.
 and the OpenCL backend's refusal; the device-free cell is `fa-paged`. The
 review's two items are in: a compact mask (last `mask->ne[0]` keys, earlier
 columns visible) equals the unpaged full-mask run, its red (the widening's
-copy without the `col0` offset) fails exactly those two cases; and §4.3 names
+copy without the `col0` offset, branch `kv-stream-red-widen`) fails exactly
+those two cases (recipe EXIT 8, `b4a8cd98`); and §4.3 names
 where I5's probe refusal stops the scheduler's silent CPU placement, with the
 disabled `kv-stream-refuse` cell as its marker. Green: 6 of 6 cases, recipe
 37 of 37 (EXIT 0). Red: ring mutation 3 of 4, widening mutation 2 of 2
