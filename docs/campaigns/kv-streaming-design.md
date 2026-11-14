@@ -601,8 +601,14 @@ logs, under `GGML_OPENCL_FA_PAGED_DUMP=1`, what a paged launch is handed --
 counts and nb1/nb2 for K and V, and the table row's entries read back -- so the
 next window names the wrong number rather than guessing. Recipe green
 `31a3b121` (41 of 41); the red line is the ring-ignore kernel copy (Claude's).
-The fix is owed: the window's dump lines are the evidence, and the loaders'
-quantized/`conversion` paths are unchanged from the unpaged forms that work.
+Window 232's dump cleared the bindings: a failing q8_0:q4_0 ring case and the
+passing f16 ring case at the same shape get the same table, the same pool/ring
+row counts and the strides those tensors have; every table entry indexes inside
+the pool or the ring. The failure is inside one *type path* (staged K for q8_0,
+q4_0 V staging, or 0088's int8 b operand); f16 reads the ring per lane and
+passes. Three isolation runs are named in README 0123zz
+(`-DGQA_K_DIRECT`, `GQA_I8=0`, `F16KV_BLOCK=4096`) and the fix is owed after
+them. No kernel change this round.
 
 
 **Window 226's finding, fixed** (`0123zz`, 2026-11-14): all 10 paged cases were
