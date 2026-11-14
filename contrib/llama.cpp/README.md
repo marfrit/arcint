@@ -7502,6 +7502,13 @@ with a device-free arm (`code`):
   the unit target (`ARCINT_KV_STREAM_REFUSE_RED`), never into the served
   binary.
 
+Red arms, run on this host (`measured-here`, device-free): the cache cell's
+mapping removed (`data[...] = c`) fails its page-map check; the predicate's
+`ggml_cl_fa_paged_params_ok` clause dropped accepts ALiBi, softcap and sinks
+(three checks fail); the CPU plan's `n_kv` taken from the page table alone
+fails the mask-width check. The per-layer red (the copy guarded off) is the
+kv-stream-layers cell from 0123zzzzz3.
+
 ## 0124-opencl-fa-wide-verify.patch
 
 ## 0123zzzzz3-kv-stream-per-layer-pages.patch
