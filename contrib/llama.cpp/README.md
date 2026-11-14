@@ -7213,7 +7213,8 @@ reuse check is conservative (below).
   Red: the default set to 1 fails the first check; a normal start would then
   ask for a stream nobody requested.
 - **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host): the cell
-  passes at the green tree; the patched library builds and the recipe is green.
+  passes at the green tree (`5886672e`: 39 of 39 unit tests, EXIT 0, deb built;
+  `kv-stream-cache` among them); the patched library builds.
   **Not measured:** a stream-on model run -- no GGUF and no card on the recipe
   host, and arcint's llama engine needs an OpenCL card at start. The device-free
   behavioural evidence stays `kv-stream-map` (green) with its reds

@@ -564,11 +564,12 @@ kernel text's first build is Claude's window. **The wiring landed** in 0121:
 validation, pool sizing, shrunk tensors, the stream's construction,
 `prepare` in `apply_ubatch`, the page table and per-layer ring views built in
 the graph and set on the fused FA node, filled in `set_input`; the structural
-cell `kv-stream-cache` passes. **A stream-on model run is not possible here**:
+cell `kv-stream-cache` passes (recipe green `5886672e`: 39 of 39, EXIT 0). **A stream-on model run is not possible here**:
 no GGUF is committed and arcint's llama engine throws at start without an
 OpenCL card (`backend_llama.cpp:505-520`), so the behavioural evidence stays
-`kv-stream-map` (green) with reds `kv-stream-red2` and `kv-stream-red3` (the
-one-page table shift). Named deviations in 0121: a stream-on graph is never
+`kv-stream-map` (green) with reds `kv-stream-red2` and `kv-stream-red3`
+(`2d309ae6`, the one-page table shift: recipe EXIT 8, the four ubatches'
+attention differ). Named deviations in 0121: a stream-on graph is never
 reused (the fork compares `layout_id`; here `can_reuse` returns false, cost to
 measure), and the table's device upload for OpenCL is I5's queue path.
 Everything else as below.
