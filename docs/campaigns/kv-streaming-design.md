@@ -591,6 +591,20 @@ zombie sweep by pid; never run outside the window).
 
 ## Current state
 
+**Window 229's split, open:** f16 decode over a ring is correct; q8_0:q4_0
+decode over a ring returns NaN (the no-ring q8_0 arm passes), and both types'
+prefill conversion returns NaN. The predicate accepts every case, the table is
+now read at its used row, and the row formula matches the test's table and
+strides exactly (checked against pool and ring row counts). The backend now
+logs, under `GGML_OPENCL_FA_PAGED_DUMP=1`, what a paged launch is handed --
+`n_kv`, page size, the table row and its byte offset, the pool's/ring's row
+counts and nb1/nb2 for K and V, and the table row's entries read back -- so the
+next window names the wrong number rather than guessing. Recipe green
+`31a3b121` (41 of 41); the red line is the ring-ignore kernel copy (Claude's).
+The fix is owed: the window's dump lines are the evidence, and the loaders'
+quantized/`conversion` paths are unchanged from the unpaged forms that work.
+
+
 **Window 226's finding, fixed** (`0123zz`, 2026-11-14): all 10 paged cases were
 "not supported [OpenCL]" because 0122 put the page-row helper between the GQA
 kernel's `intel_reqd_sub_group_size(16)` attribute and `kernel void`; the helper
