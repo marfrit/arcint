@@ -506,7 +506,7 @@ zombie sweep by pid; never run outside the window).
 - `--llama-kv-resident MIB` (arcint's config → `cparams.kv_resident_size`),
   the start refusal (`src/exec/kv_stream_refusal.h`: flash attention, the 24 GB
   card, the device's paged-`supports_op` probe, `--llama-kv q8_0:q4_0`), the
-  `/props` `kv_stream` object, and the table's device upload (0123a: the used
+  `/props` `kv_stream` object, and the table's device upload (0123z: the used
   row to a device buffer on the compute queue, released after the queued
   command). The refusal cell is enabled (`kv-stream-refusal`) with its red arm
   `ARCINT_KV_STREAM_REFUSE_OFF=1`.
@@ -591,7 +591,7 @@ zombie sweep by pid; never run outside the window).
 
 ## Current state
 
-**I4 built** 2026-11-14 (patch 0123a): a paged prompt's pages are gathered into
+**I4 built** 2026-11-14 (patch 0123z): a paged prompt's pages are gathered into
 0037's f16 blocks by the conversion kernel (its table and ring args) and the
 f16 prompt kernel runs with the carry -- the fork's gather form, the chunked
 page-runs merge deferred; the backend forces that path for a paged prompt and

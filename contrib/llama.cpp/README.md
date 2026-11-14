@@ -7228,7 +7228,7 @@ reuse check is conservative (below).
   behavioural evidence stays `kv-stream-map` (green) with its reds
   `kv-stream-red2` (eviction) and `kv-stream-red3` (a one-page table shift).
 
-## 0123a-opencl-fa-paged-prefill.patch
+## 0123z-opencl-fa-paged-prefill.patch
 
 I4: a paged prompt's pages are gathered into f16 blocks and the f16 prompt
 kernel runs on them; the decode path's page table is uploaded to the device
