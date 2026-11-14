@@ -534,7 +534,11 @@ shared by `supports_op` and the dispatcher, carrying the rows, mask heads, op
 params and the built kernels the dispatcher actually needs; the CPU plan's
 widened mask reserved whenever `mask_col0 > 0`; and a stream-on graph whose
 fused node is not `LLM_FUSED_OP_FLASH_ATTN` throwing instead of asserting, with
-the refusal red switch no longer compiled into the served binary. The host store
+the refusal red switch no longer compiled into the served binary. The card
+window 266 then found `GGML_MAX_SRC` at 10 with the three stream sources at
+9/10/11: `set_host` wrote past `src[]` and every FA node read garbage as its
+plan; 0126 raises it to 12 with a `static_assert`, and the layers cell reads the
+node's sources back. The host store
 is a USM tensor and its page access goes through the slices entry points, never
 `->data` arithmetic on an OpenCL buffer; the cache sets `stream_buft = buft`
 only when the caller gave none, and the stream's construction throws when that

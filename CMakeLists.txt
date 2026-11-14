@@ -615,7 +615,7 @@ if(ARCINT_TESTS)
     add_executable(arcint-kv-stream-layers tests/test_kv_stream_layers.cpp)
     target_link_libraries(arcint-kv-stream-layers PRIVATE arcint_core)
     target_include_directories(arcint-kv-stream-layers PRIVATE
-        "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/ggml/include")
+        "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/ggml/include" "${ARCINT_LLAMA_DIR}/ggml/src")
     target_compile_options(arcint-kv-stream-layers PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME kv-stream-layers COMMAND arcint-kv-stream-layers)
     set_tests_properties(kv-stream-layers PROPERTIES LABELS unit)

@@ -75,6 +75,11 @@ ggml_cl_fa_paged_caps agent_caps() {
 } // namespace
 
 int main() {
+    // 0126: every paged FA source index fits ggml_tensor::src[] (the static_assert
+    // in ggml-impl.h is the compile-time arm; this is the value the test sees)
+    CHECK(GGML_FA_SRC_HOST_K < GGML_MAX_SRC && GGML_FA_SRC_HOST_V < GGML_MAX_SRC &&
+          GGML_FA_SRC_PLAN < GGML_MAX_SRC, "every paged FA source index is inside src[]");
+
     // the arm that must proceed: the agent's 6-row decode shape on the split kernel
     CHECK(ggml_cl_fa_paged_ok(agent_decode(), agent_caps()), "the agent's 6-row decode shape is accepted");
     CHECK(ggml_cl_fa_paged_form(agent_decode(), agent_caps()) == 1, "its form is the GQA decode");

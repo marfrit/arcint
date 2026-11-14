@@ -27,6 +27,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "llama-kv-stream.h"
+#include "ggml-impl.h"   // GGML_FA_SRC_* and GGML_MAX_SRC: the sources must fit src[]
 
 #include <cmath>
 #include <cstdio>
@@ -162,6 +163,15 @@ int main() {
         out[(size_t) l] = ggml_flash_attn_ext(ctx.get(), q, kp, vp, mask, scale, 0.0f, 0.0f);
         ggml_flash_attn_ext_set_pages(out[(size_t) l], pages, (int32_t) l, (int32_t) llama_kv_stream::page_size, rk, rv);
         ggml_flash_attn_ext_set_host(out[(size_t) l], s.host_k((int32_t) l), s.host_v((int32_t) l), s.plan());
+        // 0126 (B60 window 266): a source index past GGML_MAX_SRC wrote into the
+        // tensor's following fields and the node read garbage as its plan. The
+        // node's sources are readable at their indices and the last one is the plan
+        CHECK(GGML_FA_SRC_PLAN < GGML_MAX_SRC, "layers sources", "the plan's index fits src[]");
+        CHECK(out[(size_t) l]->src[GGML_FA_SRC_HOST_K]  == s.host_k((int32_t) l) &&
+              out[(size_t) l]->src[GGML_FA_SRC_HOST_V]  == s.host_v((int32_t) l) &&
+              out[(size_t) l]->src[GGML_FA_SRC_PLAN]    == s.plan() &&
+              out[(size_t) l]->src[GGML_FA_SRC_TAG]     == nullptr,
+              "layers sources", "the host store and the plan landed inside src[]");
         ggml_set_name(out[(size_t) l], "op_out");
 
         // the reference: this layer's contiguous cache cut at n_kv

@@ -7509,6 +7509,24 @@ mapping removed (`data[...] = c`) fails its page-map check; the predicate's
 fails the mask-width check. The per-layer red (the copy guarded off) is the
 kv-stream-layers cell from 0123zzzzz3.
 
+## 0126-ggml-max-src-paged-attention.patch
+
+`GGML_MAX_SRC` 10 -> 12. `ggml_tensor::src[]` had 10 entries while 0123zzzzz3's
+KV stream puts three sources at 9/10/11 (`GGML_FA_SRC_HOST_K/HOST_V/PLAN`,
+ggml-impl.h), so `ggml_flash_attn_ext_set_host` wrote past the array into the
+tensor's following fields and every FA node read garbage as its plan. Measured
+on the B60, window 266 (`measured-here`): the first `FLASH_ATTENTION_EXT` op case
+asserted `host_k && host_v && ring_k && ring_v` at ggml-opencl.cpp:23577 before
+any OK; the CPU arm passed because its nodes did not reach the OpenCL check.
+`ggml-impl.h` now carries a `static_assert(GGML_FA_SRC_PLAN < GGML_MAX_SRC)` for
+C and C++. The constant's users (`ggml.c`'s graph loops, `ggml-backend.cpp`'s
+scheduling, the RPC structs, the Vulkan/SYCL loops and Vulkan's debug `srci_name`
+table) are all sized by the macro and grow with it; `srci_name` lists ten names
+and zero-fills the rest, and no reader indexes past the ten in debug output.
+Device-free arms: the predicate cell checks every index, and the layers cell
+reads the node's sources back (`src[HOST_K/V] == host store`, `src[PLAN] == plan`)
+after `set_host` -- at 10 that read is outside the array.
+
 ## 0124-opencl-fa-wide-verify.patch
 
 ## 0123zzzzz3-kv-stream-per-layer-pages.patch
