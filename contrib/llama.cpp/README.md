@@ -7466,6 +7466,38 @@ inside a 150k prompt with another page fault, this time the copy engine alone
 (`engine_class=bcs`): the planar split was one fault source, not the only one.
 Streaming beyond the pool stays refused until I5.
 
+## 0123zzzzz6-kv-stream-review-fixes.patch
+
+Fixes the four defects an outside review of the KV stream found on qfndev, each
+with a device-free arm (`code`):
+
+- C, the store indices: `set_input_k_idxs` and `set_input_v_idxs` write
+  `llama_kv_stream::row(cell)` once the stream is on, so `SET_ROWS` writes a
+  cell's pool row instead of its cell index; beyond the pool that index would
+  land past the pool (`k->ne[1]` is the resident rows). The state save and
+  restore go through `get_rows`/`set_rows` for the same reason, `clear()`
+  calls `stream->clear()`, and a KV window, several streams in an ubatch or a
+  transposed V are refused at `apply_ubatch` / the cache's construction rather
+  than mapped wrong. The V-transposed branch is unreachable with the stream on
+  because the cache refuses `v_trans` at construction.
+- D, one paged predicate: `ggml-opencl-fa-paged.h` now carries the shape's
+  rows, mask heads, op params (ALiBi, softcap, sinks) and the caps' built
+  kernels, and `ggml_cl_fa_paged_form` names the form the dispatcher takes (1
+  the GQA decode kernel, 2 the f16-block prefill conversion, 0 none). The
+  dispatcher calls the same function before choosing and aborts on a declined
+  shape; supports_op calls it too, so the two cannot disagree. The old
+  `kernel_fa_dpas_q_dk[0] != nullptr` (always true, an array's address) is
+  gone, and the prefill half asks for the conversion and carry kernels it
+  actually uses.
+- E, the CPU plan's widened mask: `ggml-cpu.c` reserves it whenever
+  `ggml_flash_attn_ext_mask_col0(node) > 0`, with or without a page table, so
+  a non-paged call with an offset mask no longer runs past the work buffer.
+- G, the refusal: a stream-on graph whose fused node is not
+  `LLM_FUSED_OP_FLASH_ATTN` throws instead of asserting, and arcint's refusal
+  rule's red switch (`ARCINT_KV_STREAM_REFUSE_OFF=1`) is compiled only into
+  the unit target (`ARCINT_KV_STREAM_REFUSE_RED`), never into the served
+  binary.
+
 ## 0124-opencl-fa-wide-verify.patch
 
 ## 0123zzzzz3-kv-stream-per-layer-pages.patch
