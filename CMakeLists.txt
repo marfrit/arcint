@@ -619,6 +619,18 @@ if(ARCINT_TESTS)
     target_compile_options(arcint-kv-stream-cache PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME kv-stream-cache COMMAND arcint-kv-stream-cache)
     set_tests_properties(kv-stream-cache PROPERTIES LABELS unit)
+    # 0123zz's device-free cell: the paged FLASH_ATTN_EXT predicate's logic, over the
+    # agent's shapes with every clause flipped. The header lives in the pinned tree's
+    # ggml-opencl, built only when the patch is present.
+    if(EXISTS "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl/ggml-opencl-fa-paged.h")
+      add_executable(arcint-fa-paged-predicate tests/test_fa_paged_predicate.cpp)
+      target_link_libraries(arcint-fa-paged-predicate PRIVATE arcint_core)
+      target_include_directories(arcint-fa-paged-predicate PRIVATE
+          "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl" "${ARCINT_LLAMA_DIR}/ggml/src")
+      target_compile_options(arcint-fa-paged-predicate PRIVATE -Wall -Wextra -Wpedantic)
+      add_test(NAME fa-paged-predicate COMMAND arcint-fa-paged-predicate)
+      set_tests_properties(fa-paged-predicate PROPERTIES LABELS unit)
+    endif()
     # I5, design section 4.3: the start refusal that stops the scheduler's silent CPU
     # placement of a paged FA. The rules are src/exec/kv_stream_refusal.h; the red
     # branch sets ARCINT_KV_STREAM_REFUSE_OFF=1 in the cell's main, which accepts an

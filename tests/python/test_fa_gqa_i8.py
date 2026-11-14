@@ -122,6 +122,17 @@ class FaGqaI8(unittest.TestCase):
         self.assertIn("static inline const global char * fa_gqa_page_row(const global int * table, const int ps, "
                       "const int key,", k,
                       "0122's page-row helper resolves the pool or the ring")
+        # 0123zz: the helper must sit BEFORE the kernel's attribute. A declaration
+        # between `__attribute__((intel_reqd_sub_group_size(16)))` and `kernel void`
+        # takes the attribute for itself; the DPAS builtins then fail to compile, the
+        # optional program build leaves the kernel null, and every paged case is
+        # declined on the card (window 226: 0 of 10 paged cases supported).
+        i_attr = k.find("__attribute__((intel_reqd_sub_group_size(16)))")
+        i_kern = k.find("kernel void flash_attn_gqa_dpas(")
+        self.assertGreater(i_attr, 0, "the GQA kernel keeps its reqd sub-group size")
+        self.assertGreater(i_kern, i_attr, "the kernel follows its attribute")
+        self.assertEqual(k[i_attr + len("__attribute__((intel_reqd_sub_group_size(16)))") : i_kern].strip(), "",
+                         "nothing sits between the attribute and the kernel")
 
     def test_staging_covers_every_row(self):
         o = self.t[OPS]
