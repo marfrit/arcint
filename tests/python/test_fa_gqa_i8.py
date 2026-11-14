@@ -114,8 +114,14 @@ class FaGqaI8(unittest.TestCase):
                       "the Q staging covers every row of every row tile (the card's red)")
         self.assertNotIn("rt_max * QB", k, "the pre-fix tile-count extent staged only some rows")
         self.assertIn("#if GQA_ST && GQA_I8 && KT == 1", k, "the staged raw K copy is 0089's")
-        self.assertIn("ks8[key * KSTR + d] = ((const global uint *)(kb + kk * k_nb1))[d];", k,
-                      "the staged copy is coalesced dwords of the raw row")
+        # 0122: the row pointer comes from the page-table helper (a null table reads
+        # kk * k_nb1 as before), so the copy is still one coalesced dword run per key
+        self.assertIn("ks8[key * KSTR + d] = ((const global uint *)fa_gqa_page_row(ptable, page_size, kk, kb, k_nb1, "
+                      "rkb, rk_nb1))[d];", k,
+                      "the staged copy is coalesced dwords of the raw row, through the page table")
+        self.assertIn("static inline const global char * fa_gqa_page_row(const global int * table, const int ps, "
+                      "const int key,", k,
+                      "0122's page-row helper resolves the pool or the ring")
 
     def test_staging_covers_every_row(self):
         o = self.t[OPS]
