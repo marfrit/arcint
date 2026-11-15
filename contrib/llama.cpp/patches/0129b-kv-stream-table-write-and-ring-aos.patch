@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 7c07d1c..d904b3d 100644
+index 7c07d1c..6f90e2f 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -23571,7 +23571,9 @@ static ggml_cl_fa_table ggml_cl_fa_table_row(ggml_backend_opencl_context * backe
@@ -13,7 +13,7 @@ index 7c07d1c..d904b3d 100644
      const ggml_tensor * plan = dst->src[GGML_FA_SRC_PLAN];
      if (!plan) {
          return;
-@@ -23624,36 +23626,62 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
+@@ -23624,36 +23626,60 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
      ggml_cl_region rk[2], rv[2];
      const int nrk = ggml_cl_regions(ring_k, rk);
      const int nrv = ggml_cl_regions(ring_v, rv);
@@ -23,14 +23,12 @@ index 7c07d1c..d904b3d 100644
 +    // before the check so the next window's log carries the cause.
 +    if (nrk != 1 || nrv != 1 || (rk[0].mem == nullptr && rk_aos_buf == nullptr) ||
 +        (rv[0].mem == nullptr && rv_aos_buf == nullptr)) {
-+        GGML_LOG_WARN("%s: paged FA ring: nrk %d nrv %d k %s%s v %s%s (aos %d/%d)\n", __func__, nrk, nrv,
++        GGML_LOG_WARN("%s: paged FA ring: nrk %d nrv %d k %s v %s (aos %d/%d)\n", __func__, nrk, nrv,
 +                ring_k->buffer && ((ggml_backend_opencl_buffer_context *) ring_k->buffer->context)->usm ? "USM" : "device",
-+                ((ggml_tensor_extra_cl *) ring_k->extra) && ring_k->type == GGML_TYPE_Q8_0 ? " q8_0" : "",
 +                ring_v->buffer && ((ggml_backend_opencl_buffer_context *) ring_v->buffer->context)->usm ? "USM" : "device",
-+                ((ggml_tensor_extra_cl *) ring_v->extra) && ring_v->type == GGML_TYPE_Q4_0 ? " q4_0" : "",
 +                (int) (rk_aos_buf != nullptr), (int) (rv_aos_buf != nullptr));
 +    }
-+    GGML_ASSERT(nrk == 1 && rv != nullptr);
++    GGML_ASSERT(nrk == 1 && nrv == 1);
 +    // the ring's write target: the reconstructed AOS buffer when the ring is SoA (the
 +    // kernel reads that buffer too), else the single AOS region
 +    cl_mem k_buf = rk_aos_buf ? rk_aos_buf : rk[0].mem;
@@ -85,7 +83,7 @@ index 7c07d1c..d904b3d 100644
      // the restore buffers live until their queued copies run (OpenCL's retain)
      if (hk_aos) clReleaseMemObject(hk_buf);
      if (hv_aos) clReleaseMemObject(hv_buf);
-@@ -23679,7 +23707,6 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -23679,7 +23705,6 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
  
      // 0123zzzzz3: this layer's streamed pages into its ring slot, before anything reads it
@@ -93,7 +91,7 @@ index 7c07d1c..d904b3d 100644
  
      const int n_q = q->ne[1];
      // paged K/V (0119): the attended length is the page table's pages * page_size,
-@@ -24057,6 +24084,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -24057,6 +24082,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      const bool rv_aos = ggml_cl_flash_attn_reconstruct_aos(backend_ctx, dst->src[GGML_FA_SRC_RING_V], temp_rv_aos,
                                                             rv_aos_buf, rv_aos_off, rv_aos_nb1, rv_aos_nb2, rv_aos_nb3);
  
@@ -108,7 +106,7 @@ index 7c07d1c..d904b3d 100644
      // The Intel kernels read K/V as they are (f16, or q8_0 / q4_0 blocks:
      // after the reconstruction above a SoA tensor is a block copy too), so
      // the dequantization below is skipped when one of them takes the call.
-@@ -25168,6 +25203,17 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -25168,6 +25201,17 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                          (long long) v->ne[1], (unsigned long long) v_nb1, (unsigned long long) v_nb2,
                          (long long) (rv ? rv->ne[1] : 0), (unsigned long long) rv_nb1, (unsigned long long) rv_nb2);
                  GGML_LOG_INFO("ggml_opencl: paged FA dump: table [%s]\n", list.c_str());
@@ -169,7 +167,7 @@ index 79bd30c..7ff7754 100644
  }
  
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 431985b..ccf4657 100644
+index 431985b..8e06c57 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -9395,7 +9395,10 @@ struct test_flash_attn_ext_paged_layers : public test_case {
@@ -184,12 +182,3 @@ index 431985b..ccf4657 100644
      }
      double max_nmse_err() override {
          return 5e-4;
-@@ -13541,8 +13544,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
-         test_cases.emplace_back(new test_gdn_replay_chain(4, 1, 5, chain_a, exact));
-         test_cases.emplace_back(new test_gdn_replay_chain(2, 3, 5, chain_b, exact));
-         test_cases.emplace_back(new test_gdn_replay_chain(16, 3, 5, chain_a, exact));
--        // 0127: the coder's geometry (16 key heads, 2 v repeats = 32 value heads, MTP 4 -> K 5)
--        test_cases.emplace_back(new test_gdn_replay_chain(16, 2, 5, chain_a, exact));
-         test_cases.emplace_back(new test_gdn_replay_chain(2, 2, 3, { {7, 1}, {3, 2}, {3, 0}, {1, 0} }, exact));
-     }
-     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
