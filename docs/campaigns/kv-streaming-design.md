@@ -594,12 +594,80 @@ last ubatch of a request (the 261k one) is logged. The ring's capacity question:
 the second KV buffer measures 416 MiB, i.e. two `slots[]` tensors of 473 pages
 each (2 x 473 x 425,984 B), so the double buffer for overlap exists already; the
 GTT peak 6,722 MiB is the host store of all 1024 pages x 16 attention layers.
-Overlap (item 7) is designed, not built: the fork's per-layer copier with
-ready/consumed flags and an event ring (`~/src/achyudh-ref
-src/llama-kv-stream.cpp:428-561`, `code`), arcint's measured lesson that
-background copies paid only when enqueued right after a graph's kernels, not
-before (`docs/campaigns`, 0042 entry, `measured-here`); first the split of one
-261k decode step into copies and kernels has to be measured on the card.
+Overlap (item 7) has been built since round 10 (below).
+**I5.2 — the overlap (round 10, `code` + window 284 `measured-here`).** Window 284
+measured the price: 0.579 ms per streamed page per decode step (pool 3584 511.3
+ms/step, pool 2560 602.8, 631 - 473 pages), ~11.8 GB/s, close to the link's
+14.3 GB/s, so 274 of the 511 ms at 261k was page traffic and the rest compute.
+If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate).
+
+- **Every page move today, by direction and when (`code`, round 10):**
+  - host->device, per layer, at that layer's FA dispatch: the streamed pages of
+    this attention layer from the USM host store into its ring slot
+    (`ggml_cl_fa_kv_stream_pages`, `ggml/src/ggml-opencl/ggml-opencl.cpp:23574ff`,
+    `clEnqueueWriteBuffer` on `backend_ctx->queue`); a regular (non-USM) host
+    store, as the op test uses, is the same bytes device->device.
+  - device->device, per layer: the page table's used row
+    (`set_input_kv_pages`, 0123z) and the ring's AOS reconstruction
+    (`ggml_cl_flash_attn_reconstruct_aos`) -- the latter only when the ring was
+    uploaded SoA (the op test, not the served slots).
+  - device->host: the host store's write-back when a resident page is evicted
+    (`llama_kv_stream::evict` -> `ggml_backend_tensor_get` from the pool slot,
+    `src/llama-kv-stream.cpp:150-168`, then `host_set_page`), and the stream's
+    `assign()` read-back (`llama-kv-stream.cpp:142-148`). Both run inside
+    `prepare()`: at prefill (`set_rows` stores the pages the prefill wrote) and
+    when a page is being replaced; **not per decode step** with a steady page
+    map. They stay synchronous (`clEnqueueReadBuffer` CL_TRUE) this round: their
+    cost is not in the 261k decode step, so moving them to the copy queue would
+    change nothing that has been measured, and the host store has to be
+    consistent before any read-back (the drain orders it).
+- **What the references do and what is followed (`code`, read at their
+  checkouts):** Strata's chunk streamer keeps a copy stream per device and a
+  ring of halves: `copy_ahead` waits a `freed[half]` event before refilling a
+  half and records `filled[half]` after the copies; the compute stream waits
+  `filled[half]` and records `freed[half]` after the kernels that read it
+  (`src/dsv41/ds4_model.cu:4868-4888, 4934-4939, 11806-11811`). FreeToken's
+  prefill double buffer: one staging buffer per layer parity, copies on
+  `prefill_copy_stream` waiting the buffer's release event, a ready event
+  recorded after the copies, the compute stream waiting it, the release event
+  recorded on the compute stream after the GEMMs
+  (`python/freetoken/moe/offload_cache.py:887-918, 1055-1068`), and the caller
+  prefetches layer L and L+1 at L's start (`python/freetoken/layers/moe.py:390-395`).
+  Both are the same choreography this build follows: two parities, one ready and
+  one consumed event each, copies on a second in-order queue. The fork
+  (`~/src/achyudh-ref src/llama-kv-stream.cpp:428-561`, `code`, read round 9)
+  does the same with copier threads and per-layer atomics.
+- **Deviations:** no copier threads and no per-layer atomics -- the host walks
+  the graph in dispatch order already, so one layer ahead is enqueued from the
+  dispatch itself and the two queues order the rest (`code`); the copies wait a
+  marker of the compute queue taken when the copy is enqueued (0032's `gmark`
+  pattern) rather than a per-layer fence, which also keeps the measured lesson
+  (0042, `measured-here`: background copies pay only when enqueued with the
+  graph's kernels) -- the copy of layer L is enqueued at L's dispatch, behind
+  L-1's kernels. A deviation the fork cannot be blamed for: the fork's copier
+  hid the move behind the previous layer's compute by a second queue as well; no
+  DESIGN invariant rejects this form (it adds no cross-stream writer: a slot is
+  written only by its own copy and read only by its own FA, ordered by the two
+  events).
+- **Built (0129l, `code`):** `GGML_OPENCL_FA_PAGED_OVERLAP=1`, default off. The
+  copies go to a second in-order queue `ctx->fa_paged.q`; parity per dispatch in
+  the graph (`fa_paged.next`, reset at `graph_gen` change); a copy waits the
+  parity's `consumed` event (recorded on the compute queue after the kernels of
+  the FA two dispatches earlier) and a compute-queue marker; after the copies a
+  `ready` marker is recorded on the copy queue and, unless NOWAIT, the compute
+  queue takes a barrier on it before the FA kernels; after the FA kernels the
+  parity's `consumed` marker is recorded for the next copy. `synchronize` drains
+  the copy queue. Unset: every copy stays on the compute queue exactly as
+  0123zzzzz3 had it, so the served bytes are the same.
+- **Red (0129l, development only):** `GGML_OPENCL_FA_PAGED_OVERLAP_NOWAIT=1`
+  keeps the copies on the copy queue but drops the FA's ready wait. Expected:
+  at 261k the kernel reads a slot mid-copy -- wrong answers (needle or Paris) or
+  a failing check; if an arm reads right, the device finished the copies early
+  and the arm proves nothing.
+- **Connection to `--llama-kv-resident`:** the ring's double buffer is the two
+  `slots[]` tensors (2 x n_ring pages, 384 MiB at pool 3584, window 284's
+  416 MiB second KV buffer), so the overlap needs no new VRAM.
+
 - The ring's capacity is `n_ring` pages = the configured context's non-resident
   pages (llama-kv-cache.cpp's construction from the pool), not two slots: the plan
   names one row per streamed page of the whole context, so the worst case is that
