@@ -20,7 +20,7 @@ index 7c07d1c..43e137f 100644
 -    GGML_ASSERT(nrk == 1 && nrv == 1 && rk[0].mem && rv[0].mem);
 +    // 0129b: window 275 aborted here on the op suite's 2-layer nb=1 case -- its ring is
 +    // uploaded whole and split into SoA planes, while the serving slots are plain. Named
-+    // before the check so the next window's log carries the cause.
++    // before the check so the next window's log carries the cause (window 278: nrk 2 with its AOS buffer).
 +    if (nrk != 1 || nrv != 1 || (rk[0].mem == nullptr && rk_aos_buf == nullptr) ||
 +        (rv[0].mem == nullptr && rv_aos_buf == nullptr)) {
 +        GGML_LOG_WARN("%s: paged FA ring: nrk %d nrv %d k %s v %s (aos %d/%d)\n", __func__, nrk, nrv,
@@ -28,7 +28,7 @@ index 7c07d1c..43e137f 100644
 +                ring_v->buffer && ((ggml_backend_opencl_buffer_context *) ring_v->buffer->context)->usm ? "USM" : "device",
 +                (int) (rk_aos_buf != nullptr), (int) (rv_aos_buf != nullptr));
 +    }
-+    GGML_ASSERT(nrk == 1 && nrv == 1);
++    GGML_ASSERT((nrk == 1 || rk_aos_buf != nullptr) && (nrv == 1 || rv_aos_buf != nullptr));   // a SoA ring writes its AOS buffer
 +    // the ring's write target: the reconstructed AOS buffer when the ring is SoA (the
 +    // kernel reads that buffer too), else the single AOS region
 +    cl_mem k_buf = rk_aos_buf ? rk_aos_buf : rk[0].mem;
