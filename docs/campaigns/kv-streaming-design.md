@@ -582,6 +582,24 @@ descended while the plan ascended, so the kernel read another pair's rows).
 0129g logs attended/resident-attended/streamed for the request's prefix beside the
 context totals, and makes `GGML_OPENCL_FA_PAGED_SYNC` OFF by default (window 279's
 A/B arms were identical because the old default drained every layer).
+Round 9 (window 283, `measured-here`): SYNC off by default passes the answer bar
+at pool 3584 (4k 49.92 t/s, 65k 32.90, 261k 6.09, needle at 104k of 261k found,
+Paris after; the drain costs 0.1 ms/step at 261k, so the 261k cost is not the
+per-layer `clFinish`). 0129h prints what the FA kernel will READ under DEBUG --
+this layer's table row's largest ring index and slot against the ring pages in
+its view and the pool's pages -- and aborts if either points outside, because
+window 283's `-5` surfaced after the copies returned clean and the copy bounds
+cannot see kernel reads; it also prints a request-end line from `clear()` so the
+last ubatch of a request (the 261k one) is logged. The ring's capacity question:
+the second KV buffer measures 416 MiB, i.e. two `slots[]` tensors of 473 pages
+each (2 x 473 x 425,984 B), so the double buffer for overlap exists already; the
+GTT peak 6,722 MiB is the host store of all 1024 pages x 16 attention layers.
+Overlap (item 7) is designed, not built: the fork's per-layer copier with
+ready/consumed flags and an event ring (`~/src/achyudh-ref
+src/llama-kv-stream.cpp:428-561`, `code`), arcint's measured lesson that
+background copies paid only when enqueued right after a graph's kernels, not
+before (`docs/campaigns`, 0042 entry, `measured-here`); first the split of one
+261k decode step into copies and kernels has to be measured on the card.
 - The ring's capacity is `n_ring` pages = the configured context's non-resident
   pages (llama-kv-cache.cpp's construction from the pool), not two slots: the plan
   names one row per streamed page of the whole context, so the worst case is that
