@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 6c8eb09..c54a900 100644
+index 6c8eb09..7c07d1c 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -16918,6 +16918,12 @@ static void ggml_backend_opencl_buffer_clear(ggml_backend_buffer_t buffer, uint8
@@ -7,7 +7,7 @@ index 6c8eb09..c54a900 100644
      ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
      ctx->drop_f16_copies();   // 0110: they would hold the old values
 +    if (ctx->usm != nullptr) {
-+        // 0129: a USM host buffer's bytes are host memory (the placeholder cl_mem is 64
++        // 0127: a USM host buffer's bytes are host memory (the placeholder cl_mem is 64
 +        // bytes); fillBuffer(buffer->size) on it faulted the device (window 269, ENOENT)
 +        memset(ctx->usm, value, buffer->size);
 +        return;
@@ -15,21 +15,35 @@ index 6c8eb09..c54a900 100644
      for (cl_mem buf : ctx->buffer) {
          CL_CHECK(clEnqueueFillBuffer(queue, buf, &value, sizeof(value), 0, buffer->size, 0, NULL, NULL));
      }
-@@ -23579,8 +23585,26 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
+@@ -23579,8 +23585,40 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
      const char * hk = (const char *) ggml_backend_opencl_usm_ptr(host_k);
      const char * hv = (const char *) ggml_backend_opencl_usm_ptr(host_v);
      const int32_t * pl = (const int32_t *) ggml_backend_opencl_usm_ptr(plan);
 -    if (hk == nullptr || hv == nullptr || pl == nullptr) {
 -        GGML_ABORT("ggml_opencl: a paged attention with a host store that is not USM host memory");
-+    // 0129: the op test allocates its host store in the backend's ordinary buffer (the
++    // 0127: the op test allocates its host store in the backend's ordinary buffer (the
 +    // serving stream uses USM host memory). A regular host store is copied on the device
 +    // instead; its layout is AOS (regions() returns one region for it), so the bytes are
 +    // a byte copy. The plan is tiny and read on the host, so it is copied to host memory.
++    // 0129a: the op test uploads its host store whole, which the backend splits into
++    // SoA planes (set_tensor of a contiguous q8_0/q4_0 tensor not a weight); the
++    // restore kernel rebuilds the AOS bytes into a temporary buffer, as the ring's
++    // reconstruct does. A plain (non-SoA) store is copied from its one region.
++    ggml_cl_flash_attn_temp_buffer temp_hk, temp_hv;
++    cl_mem       hk_buf = NULL, hv_buf = NULL;
++    cl_ulong     hk_off = 0, hv_off = 0;
++    cl_ulong     hk_nb1 = 0, hv_nb1 = 0, hk_nb2 = 0, hv_nb2 = 0, hk_nb3 = 0, hv_nb3 = 0;
++    bool hk_aos = false, hv_aos = false;
 +    ggml_cl_region hk_r[2], hv_r[2];
-+    const bool hk_dev = hk == nullptr, hv_dev = hv == nullptr;
 +    if (hk == nullptr || hv == nullptr) {
-+        if (ggml_cl_regions(host_k, hk_r) != 1 || ggml_cl_regions(host_v, hv_r) != 1 || hk_dev != hv_dev) {
-+            GGML_ABORT("ggml_opencl: a paged attention with a host store that is neither USM nor one AOS region");
++        hk_aos = ggml_cl_flash_attn_reconstruct_aos(backend_ctx, host_k, temp_hk, hk_buf, hk_off, hk_nb1, hk_nb2, hk_nb3);
++        hv_aos = ggml_cl_flash_attn_reconstruct_aos(backend_ctx, host_v, temp_hv, hv_buf, hv_off, hv_nb1, hv_nb2, hv_nb3);
++        if (!hk_aos && !hv_aos) {
++            if (ggml_cl_regions(host_k, hk_r) != 1 || ggml_cl_regions(host_v, hv_r) != 1 || (hk == nullptr) != (hv == nullptr)) {
++                GGML_ABORT("ggml_opencl: a paged attention with a host store that is neither USM nor one AOS region");
++            }
++        } else if (!(hk_aos == hv_aos)) {
++            GGML_ABORT("ggml_opencl: a paged attention whose K and V host stores differ in layout");
 +        }
 +    }
 +    const int64_t n_pages = plan->ne[0];
@@ -44,7 +58,7 @@ index 6c8eb09..c54a900 100644
      }
  
      ggml_cl_region rk[2], rv[2];
-@@ -23593,9 +23617,6 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
+@@ -23593,9 +23631,6 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
      const size_t vb = (size_t) host_v->nb[2];
      const size_t rb = (size_t) ring_k->nb[1];   // the K slot's row (all its heads of a cell)
      const size_t rvb = (size_t) ring_v->nb[1];
@@ -54,7 +68,7 @@ index 6c8eb09..c54a900 100644
      for (int64_t p = 0; p < n_pages; ++p) {
          const int32_t row = pl[p];
          if (row < 0) {
-@@ -23603,10 +23624,18 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
+@@ -23603,11 +23638,25 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
          }
          const cl_ulong off_k = rk[0].off + (cl_ulong) ring_k->view_offs;
          const cl_ulong off_v = rv[0].off + (cl_ulong) ring_v->view_offs;
@@ -62,11 +76,14 @@ index 6c8eb09..c54a900 100644
 -                                      hk + (size_t) p*kb, 0, NULL, NULL));
 -        CL_CHECK(clEnqueueWriteBuffer(queue, rv[0].mem, CL_FALSE, off_v + (cl_ulong) row*ps*rvb, (size_t) vb,
 -                                      hv + (size_t) p*vb, 0, NULL, NULL));
-+        if (hk_dev) {
-+            // a regular host store: device-to-device, same bytes (AOS both sides)
-+            CL_CHECK(clEnqueueCopyBuffer(queue, hk_r[0].mem, rk[0].mem, hk_r[0].off + (cl_ulong) p*kb,
++        if (hk == nullptr) {
++            // a regular host store: device-to-device, AOS both sides (SoA rebuilt by
++            // the restore kernel above into hk_buf/hv_buf, a plain store from its region)
++            cl_mem sk = hk_aos ? hk_buf : hk_r[0].mem, sv = hv_aos ? hv_buf : hv_r[0].mem;
++            const cl_ulong so = hk_aos ? hk_off : hk_r[0].off, sv_off = hv_aos ? hv_off : hv_r[0].off;
++            CL_CHECK(clEnqueueCopyBuffer(queue, sk, rk[0].mem, so + (cl_ulong) p*kb,
 +                                         off_k + (cl_ulong) row*ps*rb, (size_t) kb, 0, NULL, NULL));
-+            CL_CHECK(clEnqueueCopyBuffer(queue, hv_r[0].mem, rv[0].mem, hv_r[0].off + (cl_ulong) p*vb,
++            CL_CHECK(clEnqueueCopyBuffer(queue, sv, rv[0].mem, sv_off + (cl_ulong) p*vb,
 +                                         off_v + (cl_ulong) row*ps*rvb, (size_t) vb, 0, NULL, NULL));
 +        } else {
 +            CL_CHECK(clEnqueueWriteBuffer(queue, rk[0].mem, CL_FALSE, off_k + (cl_ulong) row*ps*rb, (size_t) kb,
@@ -75,5 +92,9 @@ index 6c8eb09..c54a900 100644
 +                                          hv + (size_t) p*vb, 0, NULL, NULL));
 +        }
      }
++    // the restore buffers live until their queued copies run (OpenCL's retain)
++    if (hk_aos) clReleaseMemObject(hk_buf);
++    if (hv_aos) clReleaseMemObject(hv_buf);
  }
  
+ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {

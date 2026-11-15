@@ -7549,8 +7549,13 @@ Two defects the round-3 build hit on the B60, window 269 (`measured-here`).
    in the backend's ordinary buffer, while the serving stream uses USM. The
    dispatcher now copies a regular host store on the device (`clEnqueueCopyBuffer`
    from the host store's one AOS region, the plan through `clEnqueueReadBuffer`,
-   at most 1024 pages) and keeps the USM write path for serving. A host store
-   that is neither USM nor one AOS region aborts with its own message.
+   at most 1024 pages) and keeps the USM write path for serving. Window 273 then
+   showed the same case aborting on "neither USM nor one AOS region": the op test
+   uploads its host store whole, and a whole q8_0/q4_0 write splits it into SoA
+   planes (`measured-here`, 2026-11-14, window 273, facet 2). The dispatcher now
+   rebuilds a SoA store with the restore kernel into a temporary AOS buffer (the
+   same form the ring's reconstruct uses) and copies pages from it; a store whose
+   K and V layouts differ aborts with its own message.
 
 The copy geometry is now asserted where the offsets are built (`measured-here`,
 reasoned from window 269's fault): the plan's page count equals both host

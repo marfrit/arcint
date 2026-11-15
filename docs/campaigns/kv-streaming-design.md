@@ -541,7 +541,12 @@ plan; 0126 raises it to 12 with a `static_assert`, and the layers cell reads the
 node's sources back. Window 269 then found the stream's USM buffer filled through
 its 64-byte placeholder (a device page fault in the cache's constructor) and the
 op test's host store outside USM; 0129 clears the host bytes by `memset` and has
-the dispatcher copy a regular host store on the device. The host store
+the dispatcher copy a regular host store on the device (and rebuild a whole-upload
+SoA store to AOS). Window 273 then served right at 4096/65536/131072 and garbage
+at 261000, the only streaming depth; 0129a fixes the CPU arm's V row stride (K's
+stride was used for V, unlike the card's dispatch) and adds the per-request
+stream line, and the new `test_kv_stream_deep` compares streamed attention with
+the all-resident run at four streamed pages, two layers, q8_0:q4_0 and f16. The host store
 is a USM tensor and its page access goes through the slices entry points, never
 `->data` arithmetic on an OpenCL buffer; the cache sets `stream_buft = buft`
 only when the caller gave none, and the stream's construction throws when that

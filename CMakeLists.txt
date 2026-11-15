@@ -619,6 +619,15 @@ if(ARCINT_TESTS)
     target_compile_options(arcint-kv-stream-layers PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME kv-stream-layers COMMAND arcint-kv-stream-layers)
     set_tests_properties(kv-stream-layers PROPERTIES LABELS unit)
+    # 0129b: the stream beyond its pool has to read right -- two layers, four pages
+    # streaming, q8_0:q4_0 and f16, compared byte for byte with the all-resident run
+    add_executable(arcint-kv-stream-deep tests/test_kv_stream_deep.cpp)
+    target_link_libraries(arcint-kv-stream-deep PRIVATE arcint_core)
+    target_include_directories(arcint-kv-stream-deep PRIVATE
+        "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/ggml/include" "${ARCINT_LLAMA_DIR}/ggml/src")
+    target_compile_options(arcint-kv-stream-deep PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME kv-stream-deep COMMAND arcint-kv-stream-deep)
+    set_tests_properties(kv-stream-deep PROPERTIES LABELS unit)
     # patch 0121's device-free cell: the stream reaches llama_kv_cache and the graph and
     # stays off by default; reads the patched tree's source (a GGUF and a card are not
     # available here). Design: increment I3's prerequisite.
