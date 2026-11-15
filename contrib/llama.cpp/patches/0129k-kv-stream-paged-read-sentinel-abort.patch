@@ -1,0 +1,22 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -23683,15 +23683,19 @@
+                     entries.size()*sizeof(int32_t), entries.data(), 0, NULL, NULL));
+             if (tb.uploaded) CL_CHECK(clReleaseMemObject(tb.mem));
+             int32_t max_ring = -1, max_slot = -1;
++            bool sentinel = false;
+             for (int32_t e : entries) {
+                 if (e >= 0) max_slot = std::max(max_slot, e);
+                 else        max_ring = std::max(max_ring, -1 - e);
++                // 0129k: INT32_MAX is the table's "unwritten row" fill; window 284 printed
++                // it and the check did not fire, so it is named here and aborts too
++                if (e == INT32_MAX) sentinel = true;
+             }
+             const int64_t ring_pages = ring_k->ne[1]/ps, pool_pages = kpool->ne[1]/ps;
+             GGML_LOG_WARN("%s: paged FA reads: layer row %d entries %d max ring %d of ring pages %lld, "
+                     "max slot %d of pool pages %lld\n", __func__, tr, (int) entries.size(),
+                     (int) max_ring, (long long) ring_pages, (int) max_slot, (long long) pool_pages);
+-            if (max_ring >= ring_pages || max_slot >= pool_pages) {
++            if (sentinel || max_ring >= ring_pages || max_slot >= pool_pages) {
+                 GGML_ABORT("ggml_opencl: a paged FA kernel would read past its ring or pool "
+                            "(layer row %d: max ring %d of %lld, max slot %d of %lld)", tr,
+                            (int) max_ring, (long long) ring_pages, (int) max_slot, (long long) pool_pages);

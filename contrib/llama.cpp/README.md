@@ -7742,3 +7742,63 @@ the existing shapes, so the served unit's head counts are in the op suite. Serve
 the coder with `LLAMA_GDN_REPLAY=1` on the A770 answers the capital, prefills 32k at 1031.5 t/s
 (1065.9 without replay), decodes at 65k at 34.6-39.7 t/s and scores the acceptance task 10/10;
 the dense agent with replay on the B60 answers the capital, no assert.
+
+## 0129h-kv-stream-paged-read-bounds-and-request-end-log.patch
+
+Two follow-ups of window 283 (`measured-here`). The paged FA's copy bounds
+(0129f) cover what the copies write, not what the kernel reads: under
+`GGML_OPENCL_FA_PAGED_DEBUG=1` the dispatch now reads this layer's table row
+(`GGML_FA_PARAM_PAGES_ROW`), prints its largest ring index and slot against
+the ring pages in the layer's view and the pool's pages, and aborts on either
+out of range. The stream's second line: `clear()` prints the previous
+request's last ubatch counts (`KV streaming (request end)`) before it resets,
+so a served request that never prints a second prepare line still shows what
+it streamed.
+
+## 0129j-kv-stream-paged-layers-table-both-rows.patch
+
+Window 284 (`measured-here`) read `max slot 2147483647 of pool pages 19, max
+ring -1` for the 2-layer op case: its `initialize_tensors` filled only one
+table row (`table[n_pages() + i]`), so row 0 held the `INT32_MAX` fill and
+layer 0's kernel read slot `INT32_MAX` / no ring entry, and the queue failed
+at the next synchronize (`-5`). Both rows are now filled (each with ascending
+ring entries, 0129f). Red first: the pre-patch case printed that line; the
+throwaway arm that only raises the pool pages passes, the real fix removes
+the sentinel.
+
+## 0129k-kv-stream-paged-read-sentinel-abort.patch
+
+`INT32_MAX` (an unwritten table row's fill) now aborts under
+`GGML_OPENCL_FA_PAGED_DEBUG=1` beside the range checks: window 284's arm
+printed a violation and continued, and a check that prints and continues is
+not a check. It cannot fire on a correct table; the sentinel is named in the
+abort message.
+
+## 0129l-kv-stream-paged-overlap-copy-queue.patch
+
+I5's step two, Intel, opt-in (`GGML_OPENCL_FA_PAGED_OVERLAP=1`): the paged
+FA's page moves leave the compute queue for their own in-order queue, so
+layer L's copies run while layer L-1's kernels do. Two parities (one per
+slot), as FreeToken's prefill double buffer orders its staging copies
+(`python/freetoken/moe/offload_cache.py`, `prefetch_prefill_layer` and
+`release_prefill_layer`) and Strata's chunk ring its halves
+(`src/dsv41/ds4_model.cu`, `copy_ahead` and the flow's waits): a copy into a
+slot waits for the FA that last read it (`consumed`, a marker on the compute
+queue after the layer's kernels), a copy also waits for a marker of the
+compute queue taken when it is enqueued (0032's `gmark` pattern), and the FA
+waits for its copy (`ready`). It deviates from the fork: no copier threads
+and no per-layer atomics; the host enqueues one layer ahead and the two
+queues order the rest. Default off, unset leaves every copy on the compute
+queue as 0129zzzzz3 had it. `GGML_OPENCL_FA_PAGED_OVERLAP_NOWAIT=1` is the
+development red arm: the copies stay on the copy queue, the FA does not wait
+for its ready event, so a race can show as wrong bytes or a failing check; a
+red arm that reads right proves nothing. `synchronize` drains the copy queue.
+
+## 0129m-kv-stream-request-end-on-seq-rm.patch
+
+Window 284's served log: seven requests, two prepare lines, no request-end
+line. The served path ends a request by removing its sequence from the cache
+(`llama_kv_cache::seq_rm`), not by `clear()`. The stream's `request_end()` is
+now called there when the removal covers the whole sequence (`p0 < 0 &&
+p1 < 0`); `clear()` calls it too, so a cleared cache logs its last counts
+once and not twice.

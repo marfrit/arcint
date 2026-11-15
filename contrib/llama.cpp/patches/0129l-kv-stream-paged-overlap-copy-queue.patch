@@ -1,0 +1,221 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1298,6 +1298,17 @@
+         std::vector<cl_event> marks;                          // per ticket: the queue's marker, null once released
+                                                               // (emptied whenever none is outstanding)
+     } astream;
++    // 0129l (I5, step two): the paged FA's page moves on their own in-order queue, a layer's
++    // copies running while the previous layer's kernels do (two slots, one parity each: a
++    // slot's copy waits for the FA that last read it, that FA waits for its copy).
++    struct fa_paged_overlap_state {
++        cl_command_queue q = nullptr;
++        cl_event ready[2]    = { nullptr, nullptr };   // per parity: its copy is done
++        cl_event consumed[2] = { nullptr, nullptr };   // per parity: the FA that last read the slot
++        int next = 0;                                   // the parity of the next dispatch in this graph
++        uint64_t gen = 0;                               // the graph next/ready/consumed belong to
++        int logged = 0;
++    } fa_paged;
+     int             kq_mm_sg = 16;
+     ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
+     int       kq_q8_1_ndst = 4;
+@@ -10014,6 +10025,8 @@
+     auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+     // patch 0032: a copy not consumed by a GEMM (a deviation from the learnt order) still reads host memory
+     if (backend_ctx->bstream.q) CL_CHECK(clFinish(backend_ctx->bstream.q));
++    // 0129l: a paged FA's copies still in flight read host memory; drain before the caller frees it
++    if (backend_ctx->fa_paged.q) CL_CHECK(clFinish(backend_ctx->fa_paged.q));
+ 
+     cl_event evt;
+     CL_CHECK(clEnqueueBarrierWithWaitList(backend_ctx->queue, 0, nullptr, &evt));
+@@ -23566,6 +23579,75 @@
+     return t;
+ }
+ 
++// 0129l (I5, step two): GGML_OPENCL_FA_PAGED_OVERLAP=1 moves a paged FA's page copies to their
++// own in-order queue, so layer L's copies run while layer L-1's kernels do. Two parities, one
++// slot each, as FreeToken's prefill double buffer (python/freetoken/moe/offload_cache.py:887-918,
++// 1055-1068) and Strata's chunk ring (src/dsv41/ds4_model.cu:4868-4939, 11806-11811) order theirs:
++// a copy into slot p waits for the FA that last read it (consumed), and that FA waits for its copy
++// (ready). A copy also waits for a marker of the compute queue taken when it is enqueued
++// (GGML_OPENCL_BANK_STREAM's gmark, patch 0032, ggml-opencl.cpp:30422-30429), so it sees the
++// host store's writes and the page table as they stand at this layer. Default off: unset leaves
++// every copy on the compute queue, exactly as 0123zzzzz3 did.
++static bool ggml_cl_fa_paged_overlap_on() {
++    static const char * e = getenv("GGML_OPENCL_FA_PAGED_OVERLAP");
++    static const bool   on = e != nullptr && atoi(e) != 0;
++    return on;
++}
++// GGML_OPENCL_FA_PAGED_OVERLAP_NOWAIT=1, development only: the red arm. The copies stay on the
++// copy queue, but the FA no longer waits for its ready event, so the kernel reads a slot
++// mid-copy. A race with the copies has to show as wrong answers or a failing check; if an arm
++// with NOWAIT reads right, the arm proves nothing (the device finished the copy early).
++static bool ggml_cl_fa_paged_overlap_nowait() {
++    static const char * e = getenv("GGML_OPENCL_FA_PAGED_OVERLAP_NOWAIT");
++    static const bool   on = e != nullptr && atoi(e) != 0;
++    return on;
++}
++// the copy queue and this graph's per-parity events; returns the parity this dispatch takes
++static int ggml_cl_fa_paged_overlap_begin(ggml_backend_opencl_context * ctx, cl_event * mark) {
++    auto & o = ctx->fa_paged;
++    if (o.gen != ctx->graph_gen) {
++        // a new graph: release what the last one left, start at parity 0
++        for (int i = 0; i < 2; ++i) {
++            if (o.ready[i])    { CL_CHECK(clReleaseEvent(o.ready[i]));    o.ready[i] = nullptr; }
++            if (o.consumed[i]) { CL_CHECK(clReleaseEvent(o.consumed[i])); o.consumed[i] = nullptr; }
++        }
++        o.gen  = ctx->graph_gen;
++        o.next = 0;
++    }
++    if (o.q == nullptr) {
++        cl_int err;
++        o.q = clCreateCommandQueue(ctx->context, ctx->device, 0, &err);
++        CL_CHECK(err);
++    }
++    const int parity = o.next % 2;
++    o.next++;
++    CL_CHECK(clEnqueueMarkerWithWaitList(ctx->queue, 0, nullptr, mark));
++    CL_CHECK(clFlush(ctx->queue));   // the marker the copy queue waits for
++    return parity;
++}
++// after the copies: their ready event, and (unless NOWAIT) the FA's wait for it
++static void ggml_cl_fa_paged_overlap_ready(ggml_backend_opencl_context * ctx, int parity, cl_event mark) {
++    auto & o = ctx->fa_paged;
++    if (o.ready[parity]) { CL_CHECK(clReleaseEvent(o.ready[parity])); o.ready[parity] = nullptr; }
++    CL_CHECK(clEnqueueMarkerWithWaitList(o.q, 0, nullptr, &o.ready[parity]));
++    CL_CHECK(clFlush(o.q));
++    if (!ggml_cl_fa_paged_overlap_nowait()) {
++        CL_CHECK(clEnqueueBarrierWithWaitList(ctx->queue, 1, &o.ready[parity], nullptr));
++    }
++    if (mark) CL_CHECK(clReleaseEvent(mark));
++    o.logged++;
++    if (o.logged == 1) {
++        GGML_LOG_WARN("ggml_opencl: paged FA overlap: the page copies on their own queue%s\n",
++                ggml_cl_fa_paged_overlap_nowait() ? " (NOWAIT: the FA does not wait for its copy)" : "");
++    }
++}
++// after a layer's FA kernels: the slot's read is done, a later copy may overwrite it
++static void ggml_cl_fa_paged_overlap_consume(ggml_backend_opencl_context * ctx, int parity) {
++    auto & o = ctx->fa_paged;
++    if (o.consumed[parity]) { CL_CHECK(clReleaseEvent(o.consumed[parity])); o.consumed[parity] = nullptr; }
++    CL_CHECK(clEnqueueMarkerWithWaitList(ctx->queue, 0, nullptr, &o.consumed[parity]));
++}
++
+ // 0123zzzzz3: the streamed pages of this attention layer, from the host store (USM host memory)
+ // into the two ring slots, on this device's in-order compute queue right before the kernels below
+ // read them. Layer i's copies therefore run while layer i's own attention runs, and the slot layer
+@@ -23573,7 +23655,9 @@
+ // slot's content at the time of their attention. The host store is read once per attention call.
+ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * dst,
+         cl_mem rk_aos_buf, cl_ulong rk_aos_off, cl_ulong rk_aos_nb1,
+-        cl_mem rv_aos_buf, cl_ulong rv_aos_off, cl_ulong rv_aos_nb1) {
++        cl_mem rv_aos_buf, cl_ulong rv_aos_off, cl_ulong rv_aos_nb1, int * overlap_parity, bool * overlap_copied) {
++    if (overlap_parity) *overlap_parity = -1;
++    if (overlap_copied) *overlap_copied = false;
+     const ggml_tensor * plan = dst->src[GGML_FA_SRC_PLAN];
+     if (!plan) {
+         return;
+@@ -23623,6 +23707,20 @@
+         pl = plan_rows;
+     }
+ 
++    // 0129l: the copies on their own queue (overlap), or on the compute queue as before
++    const bool ov = ggml_cl_fa_paged_overlap_on() && ((ggml_tensor_extra_cl *) plan->extra) != nullptr;
++    cl_command_queue cq = queue;
++    cl_uint nw = 0;
++    cl_event wl[2] = { nullptr, nullptr };
++    cl_event ov_mark = nullptr;
++    int ov_parity = -1;
++    if (ov) {
++        ov_parity = ggml_cl_fa_paged_overlap_begin(backend_ctx, &ov_mark);
++        auto & o = backend_ctx->fa_paged;
++        if (o.consumed[ov_parity]) wl[nw++] = o.consumed[ov_parity];   // the FA that last read the slot
++        wl[nw++] = ov_mark;                                            // the compute queue as it stands
++        cq = o.q;
++    }
+     ggml_cl_region rk[2], rv[2];
+     const int nrk = ggml_cl_regions(ring_k, rk);
+     const int nrv = ggml_cl_regions(ring_v, rv);
+@@ -23683,15 +23781,19 @@
+                     entries.size()*sizeof(int32_t), entries.data(), 0, NULL, NULL));
+             if (tb.uploaded) CL_CHECK(clReleaseMemObject(tb.mem));
+             int32_t max_ring = -1, max_slot = -1;
++            bool sentinel = false;
+             for (int32_t e : entries) {
+                 if (e >= 0) max_slot = std::max(max_slot, e);
+                 else        max_ring = std::max(max_ring, -1 - e);
++                // 0129k: INT32_MAX is the table's "unwritten row" fill; window 284 printed
++                // it and the check did not fire, so it is named here and aborts too
++                if (e == INT32_MAX) sentinel = true;
+             }
+             const int64_t ring_pages = ring_k->ne[1]/ps, pool_pages = kpool->ne[1]/ps;
+             GGML_LOG_WARN("%s: paged FA reads: layer row %d entries %d max ring %d of ring pages %lld, "
+                     "max slot %d of pool pages %lld\n", __func__, tr, (int) entries.size(),
+                     (int) max_ring, (long long) ring_pages, (int) max_slot, (long long) pool_pages);
+-            if (max_ring >= ring_pages || max_slot >= pool_pages) {
++            if (sentinel || max_ring >= ring_pages || max_slot >= pool_pages) {
+                 GGML_ABORT("ggml_opencl: a paged FA kernel would read past its ring or pool "
+                            "(layer row %d: max ring %d of %lld, max slot %d of %lld)", tr,
+                            (int) max_ring, (long long) ring_pages, (int) max_slot, (long long) pool_pages);
+@@ -23722,17 +23824,22 @@
+                            (unsigned long long) (so + (cl_ulong) p*kb), kb, hk_size,
+                            (unsigned long long) (sv_off + (cl_ulong) p*vb), vb, hv_size);
+             }
+-            CL_CHECK(clEnqueueCopyBuffer(queue, sk, k_buf, so + (cl_ulong) p*kb,
+-                                         dk, (size_t) kb, 0, NULL, NULL));
+-            CL_CHECK(clEnqueueCopyBuffer(queue, sv, v_buf, sv_off + (cl_ulong) p*vb,
+-                                         dv, (size_t) vb, 0, NULL, NULL));
++            CL_CHECK(clEnqueueCopyBuffer(cq, sk, k_buf, so + (cl_ulong) p*kb,
++                                         dk, (size_t) kb, nw, nw ? wl : NULL, NULL));
++            CL_CHECK(clEnqueueCopyBuffer(cq, sv, v_buf, sv_off + (cl_ulong) p*vb,
++                                         dv, (size_t) vb, nw, nw ? wl : NULL, NULL));
+         } else {
+-            CL_CHECK(clEnqueueWriteBuffer(queue, k_buf, CL_FALSE, dk, (size_t) kb,
+-                                          hk + (size_t) p*kb, 0, NULL, NULL));
+-            CL_CHECK(clEnqueueWriteBuffer(queue, v_buf, CL_FALSE, dv, (size_t) vb,
+-                                          hv + (size_t) p*vb, 0, NULL, NULL));
++            CL_CHECK(clEnqueueWriteBuffer(cq, k_buf, CL_FALSE, dk, (size_t) kb,
++                                          hk + (size_t) p*kb, nw, nw ? wl : NULL, NULL));
++            CL_CHECK(clEnqueueWriteBuffer(cq, v_buf, CL_FALSE, dv, (size_t) vb,
++                                          hv + (size_t) p*vb, nw, nw ? wl : NULL, NULL));
+         }
+     }
++    if (ov) {
++        *overlap_parity = ov_parity;
++        *overlap_copied = true;
++        ggml_cl_fa_paged_overlap_ready(backend_ctx, ov_parity, ov_mark);   // its ready event, the FA's wait
++    }
+     // 0129b/0129g: the moves and the kernels share the in-order compute queue, so the
+     // queue order alone is the barrier; GGML_OPENCL_FA_PAGED_SYNC=1 adds a clFinish after
+     // each layer's copies for a race-vs-layout arm. OFF by default (window 279's A/B arms
+@@ -23740,6 +23847,7 @@
+     static const char * sync_env = getenv("GGML_OPENCL_FA_PAGED_SYNC");
+     if (sync_env && atoi(sync_env) != 0) {
+         CL_CHECK(clFinish(queue));
++        if (ov) CL_CHECK(clFinish(backend_ctx->fa_paged.q));
+     }
+     // the restore buffers are temp_hk/temp_hv's: their destructors release them, and the
+     // queued copies keep them alive (OpenCL's retain). 0129e: a second release here was
+@@ -24147,9 +24255,12 @@
+     // above, because a SoA ring's reconstructed AOS buffer is what both the copies and
+     // the kernel have to use (window 275: the op suite's 2-layer ring is SoA; the copy
+     // ran before the reconstruction and wrote the split planes)
++    int  paged_overlap_parity = -1;
++    bool paged_overlap_copied = false;
+     ggml_cl_fa_kv_stream_pages(backend_ctx, dst,
+             rk_aos ? rk_aos_buf : NULL, rk_aos ? rk_aos_off : 0, rk_aos ? rk_aos_nb1 : 0,
+-            rv_aos ? rv_aos_buf : NULL, rv_aos ? rv_aos_off : 0, rv_aos ? rv_aos_nb1 : 0);
++            rv_aos ? rv_aos_buf : NULL, rv_aos ? rv_aos_off : 0, rv_aos ? rv_aos_nb1 : 0,
++            &paged_overlap_parity, &paged_overlap_copied);
+ 
+     // The Intel kernels read K/V as they are (f16, or q8_0 / q4_0 blocks:
+     // after the reconstruction above a SoA tensor is a block copy too), so
+@@ -25455,6 +25566,10 @@
+         size_t global_work_size[] = { (size_t)((n_q + block_m - 1) / block_m) * wg_size, (size_t)(n_head * n_batch) };
+         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+     }
++    // 0129l: this layer's kernels are enqueued, so a later copy may reuse the slot it read
++    if (paged_overlap_copied && paged_overlap_parity >= 0) {
++        ggml_cl_fa_paged_overlap_consume(backend_ctx, paged_overlap_parity);
++    }
+ }
+ 
+ static void ggml_cl_mul_mat_f16_f32_tiled(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
