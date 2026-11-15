@@ -1,7 +1,19 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -11667,6 +11667,17 @@
+@@ -1308,6 +1308,11 @@
+         int next = 0;                                   // the parity of the next dispatch in this graph
+         uint64_t gen = 0;                               // the graph next/ready/consumed belong to
+         int logged = 0;
++        // 0129n: this graph's paged FA nodes in dispatch order, whether each node's copies are
++        // queued, and the dispatch index (the lead needs the next node's plan and ring)
++        std::vector<const ggml_tensor *> chain;
++        std::vector<char>   issued;
++        int cur = 0;
+     } fa_paged;
+     int             kq_mm_sg = 16;
+     ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
+@@ -11667,6 +11672,17 @@
  static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
      backend_ctx->graph_gen++;
@@ -19,7 +31,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      backend_ctx->pair_perm_t = nullptr;
      if (backend_ctx->f16_copy_n != backend_ctx->f16_copy_n_logged) {
          // 0110: the copies' total once the weights are loaded (the first graph), and again if it changes
-@@ -23579,73 +23590,160 @@
+@@ -23579,73 +23595,160 @@
      return t;
  }
  
@@ -212,7 +224,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  }
  
  // 0123zzzzz3: the streamed pages of this attention layer, from the host store (USM host memory)
-@@ -23707,20 +23805,23 @@
+@@ -23707,20 +23810,23 @@
          pl = plan_rows;
      }
  
@@ -247,7 +259,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      ggml_cl_region rk[2], rv[2];
      const int nrk = ggml_cl_regions(ring_k, rk);
      const int nrv = ggml_cl_regions(ring_v, rv);
-@@ -23800,7 +23901,26 @@
+@@ -23800,7 +23906,26 @@
              }
          }
      }
@@ -275,7 +287,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          const int32_t row = pl[p];
          if (row < 0) {
              continue;   // a resident page: the kernel reads it from the pool
-@@ -23836,9 +23956,12 @@
+@@ -23836,9 +23961,12 @@
          }
      }
      if (ov) {
@@ -290,7 +302,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      }
      // 0129b/0129g: the moves and the kernels share the in-order compute queue, so the
      // queue order alone is the barrier; GGML_OPENCL_FA_PAGED_SYNC=1 adds a clFinish after
-@@ -25566,9 +25689,10 @@
+@@ -25566,9 +25694,10 @@
          size_t global_work_size[] = { (size_t)((n_q + block_m - 1) / block_m) * wg_size, (size_t)(n_head * n_batch) };
          backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
      }
